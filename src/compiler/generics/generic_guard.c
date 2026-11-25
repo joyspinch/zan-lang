@@ -801,13 +801,14 @@ static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     if (read_ok) LLVMBuildCondBr(g->builder, read_ok, probe, miss);
     else LLVMBuildBr(g->builder, probe);
     LLVMPositionBuilderAtEnd(g->builder, probe);
-    LLVMValueRef word = LLVMBuildLoad2(
-        g->builder, i64,
-        LLVMBuildGEP2(g->builder, i8, p,
-                      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1, "hdrp"),
-        "hdr");
+    LLVMValueRef word =
+        LLVMBuildLoad2(g->builder, i64, zan_hdr_word_ptr(g, g->builder, p, "hdrp"), "hdr");
+    /* 长度在 [-12]（docs/OBJECT_LAYOUT.md），标签在头字高 32 位 */
     LLVMValueRef cached =
-        LLVMBuildAnd(g->builder, word, LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "cached");
+        LLVMBuildZExt(g->builder,
+                      LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx),
+                                     zan_str_len_ptr(g, g->builder, p, "lenp"), "len32"),
+                      i64, "cached");
     LLVMValueRef known = zan_and(g->builder, zan_hdr_is_string(g, word, "isstr"),
                                  zan_icmp(g->builder, LLVMIntNE, cached,
                                           LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "measured"),
@@ -868,9 +869,9 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
     LLVMBasicBlockRef raw_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.raw");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.done");
 
-    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
-        "strbuf.hdrp");
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload, &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1)},
+        1, "strbuf.hdrp");
     LLVMValueRef probe_ok = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strbuf.nonnull");
     /* 非空但头字不可读（外来指针贴页首）：不探测、不盖戳，直接 strlen */
@@ -896,8 +897,10 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
                                              "strbuf.hdrip");
     LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strbuf.hdr");
     LLVMValueRef is_str = zan_hdr_is_string(g, word, "strbuf.isstr");
-    LLVMValueRef cached = LLVMBuildAnd(g->builder, word,
-        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strbuf.cached");
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef len_ptr = zan_str_len_ptr(g, g->builder, payload, "strbuf.lenp");
+    LLVMValueRef cached = LLVMBuildZExt(
+        g->builder, LLVMBuildLoad2(g->builder, i32, len_ptr, "strbuf.len32"), i64, "strbuf.cached");
     LLVMValueRef measured = zan_icmp(g->builder, LLVMIntNE, cached,
         LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.measured");
     LLVMValueRef known = zan_and(g->builder, is_str, measured, "strbuf.known");
@@ -948,10 +951,8 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
         stamp_do_bb, slow_end_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, stamp_do_bb);
-    LLVMBuildStore(g->builder, LLVMBuildOr(g->builder,
-            LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0), string_len,
-            "strbuf.newhdr"),
-        hdr_iptr);
+    LLVMBuildStore(g->builder, LLVMBuildTrunc(g->builder, string_len, i32, "strbuf.newlen"),
+                   len_ptr);
     LLVMBuildBr(g->builder, slow_end_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, slow_end_bb);
@@ -1008,9 +1009,9 @@ void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.probe");
     LLVMBasicBlockRef clear_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.clear");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.done");
-    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
-        "strinv.hdrp");
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload, &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1)},
+        1, "strinv.hdrp");
     LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
     LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.hdrchk");
@@ -1024,12 +1025,12 @@ void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
                                              "strinv.hdrip");
     LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strinv.hdr");
-    LLVMValueRef stale = zan_and(g->builder,
-        zan_hdr_is_string(g, word, "strinv.isstr"),
-        zan_icmp(g->builder, LLVMIntNE,
-                 LLVMBuildAnd(g->builder, word,
-                     LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strinv.cached"),
-                 LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strinv.measured"),
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef len_ptr = zan_str_len_ptr(g, g->builder, payload, "strinv.lenp");
+    LLVMValueRef stale = zan_and(
+        g->builder, zan_hdr_is_string(g, word, "strinv.isstr"),
+        zan_icmp(g->builder, LLVMIntNE, LLVMBuildLoad2(g->builder, i32, len_ptr, "strinv.cached"),
+                 LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0), "strinv.measured"),
         "strinv.stale");
     LLVMBuildCondBr(g->builder, stale, clear_bb, done_bb);
 
@@ -1044,9 +1045,7 @@ void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
                  "strinv.writable"),
         store_bb, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, store_bb);
-    LLVMBuildStore(g->builder,
-                   LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
-                   hdr_iptr);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0), len_ptr);
     LLVMBuildBr(g->builder, done_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
@@ -1062,15 +1061,17 @@ void emit_string_len_set(zan_irgen_t *g, LLVMValueRef payload,
         zan_icmp(g->builder, LLVMIntNE, len,
                  LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.notunk"),
         "strset.ok");
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef half = LLVMBuildSelect(g->builder, fits, len,
         LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.half");
-    LLVMValueRef word = LLVMBuildOr(g->builder,
-        LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0), half, "strset.hdr");
-    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
-        "strset.hdrp");
-    LLVMBuildStore(g->builder, word,
-        LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "strset.hdrip"));
+    /* 长度在 [-12]；同时补写 [-4] 的 ZANS 标签（不碰 [-8] 的 rc） */
+    LLVMBuildStore(g->builder, LLVMBuildTrunc(g->builder, half, i32, "strset.len32"),
+                   zan_str_len_ptr(g, g->builder, payload, "strset.lenp"));
+    LLVMValueRef tag_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload, &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_OFF, 1)}, 1,
+        "strset.tagp");
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, ZAN_STRING_TAG, 0), tag_ptr);
+    (void)i64p;
 }
 bool sym_declares_extern(zan_symbol_t *sym) {
     if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return false;

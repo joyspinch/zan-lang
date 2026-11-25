@@ -146,7 +146,7 @@ static uintptr_t g_mem_secret;
  * 奇数倍 8（24..120），只经 zan_mem_obj_malloc 取用——编译器的 zan_rt_alloc
  * 给 Zan 对象/闭包/装箱分配时调它。块 8 字节对齐（页首 + 40*i），比 malloc
  * 契约的 16 弱，所以绝不进 g_size_class（通用 malloc 永远拿不到）。两指针
- * 字段的类：16 头 + vptr + 2 字段 = 40 字节一块（通用类得 48）。 */
+ * 字段的无多态类：8 字节头 + 2 字段 = 24 字节一块（docs/OBJECT_LAYOUT.md）。 */
 #define ZAN_MEM_CLASS_SIZES(X)                                                                     \
     X(16)                                                                                          \
     X(32) X(48) X(64) X(80) X(96) X(112) X(128) X(160) X(192) X(224) X(256) X(320) X(384) X(448)   \
@@ -775,8 +775,8 @@ void *zan_mem_str_malloc(size_t n) {
     return __wrap_malloc(n + ZAN_MEM_STR_SKEW);
 }
 
-/* Zan 对象分配（编译器的 zan_rt_alloc 在链了本对象时调它）：n = 16 字节对象
- * 头 + 载荷。n 是 16 的奇数倍 8 时进 8 字节粒度的对象页类，否则同 malloc。
+/* Zan 对象分配（编译器的 zan_rt_alloc 在链了本对象时调它）：n = 8 字节对象
+ * 头 + 载荷（对齐 16 的类再前垫 8）。n 是 16 的奇数倍 8 时进 8 字节粒度的对象页类，否则同 malloc。
  * 8 字节对齐只在 n % 16 == 8 时出现，而 LLVM 里对齐要求 16 的类型尺寸必是
  * 16 的倍数——含这类字段的对象 n % 16 == 0，照旧拿 16 对齐的通用类块。 */
 void *zan_mem_obj_malloc(size_t n) {

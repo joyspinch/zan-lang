@@ -124,13 +124,14 @@
             LLVMValueRef trc_new = LLVMBuildZExt(g->builder,
                 zan_add(g->builder, rc_pre, LLVMConstInt(rc_ty, 1, 0), "trcnew32"),
                 i64, "trcnew");
-            LLVMValueRef tneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef tneg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
             LLVMValueRef tsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 obj, &tneg8, 1, "trsp");
             LLVMValueRef tsite = LLVMBuildLoad2(g->builder, i64,
                 LLVMBuildBitCast(g->builder, tsp, LLVMPointerType(i64, 0), "trsip"),
                 "trsite");
-            emit_arc_trace_call(g, arc_trace_ev, "R", obj, trc_new, tsite);
+            emit_arc_trace_call(g, arc_trace_ev, "R", obj, trc_new,
+                                zan_hdr_site(g, g->builder, tsite, "trsite.n"));
         }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
@@ -155,7 +156,7 @@
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_release);
         LLVMPositionBuilderAtEnd(g->builder, do_release);
         LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
-        LLVMValueRef neg8  = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
         LLVMValueRef rc_iptr = zan_rc_ptr(g, g->builder, obj, "rcptr");
         /* 读一次引用计数：既是 immortal 判定，也是 freed 守卫的输入。 */
         LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, rc_ty, rc_iptr, "rcnow");
@@ -189,14 +190,15 @@
         }
         LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(rc_ty, 1, 0), "rc1");
         if (arc_trace_ev) {
-            LLVMValueRef rsneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef rsneg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
             LLVMValueRef rsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 obj, &rsneg8, 1, "rrsp");
             LLVMValueRef rsite = LLVMBuildLoad2(g->builder, i64,
                 LLVMBuildBitCast(g->builder, rsp, LLVMPointerType(i64, 0), "rrsip"),
                 "rrsite");
             emit_arc_trace_call(g, arc_trace_ev, "r", obj,
-                LLVMBuildSExt(g->builder, rc1, i64, "rc1w"), rsite);
+                                LLVMBuildSExt(g->builder, rc1, i64, "rc1w"),
+                                zan_hdr_site(g, g->builder, rsite, "rrsite.n"));
         }
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(rc_ty, 0, 0), "iszero");
@@ -249,26 +251,34 @@
                 LLVMBuildLoad2(g->builder, rc32,
                     zan_rc_ptr(g, g->builder, obj, "drcp"), "drc32"),
                 i64, "drc");
-            LLVMValueRef dneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef dneg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
             LLVMValueRef dsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 obj, &dneg8, 1, "ddsp");
             LLVMValueRef dsite = LLVMBuildLoad2(g->builder, i64,
                 LLVMBuildBitCast(g->builder, dsp, LLVMPointerType(i64, 0), "ddsip"),
                 "dsite");
-            emit_arc_trace_call(g, arc_trace_ev, "D", obj, drc, dsite);
+            emit_arc_trace_call(g, arc_trace_ev, "D", obj, drc,
+                                zan_hdr_site(g, g->builder, dsite, "dsite.n"));
         }
-        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef dpp;
+        /* 快路径的"计数 > 1"只对对象头成立：数组头字里的描述符指针低半不是 rc */
+        LLVMValueRef fast_ok = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0);
         if (!g->desc_hdr) {
             LLVMValueRef raw_site = LLVMBuildLoad2(g->builder, i64, siptr, "site.raw");
-            LLVMValueRef site = zan_and(g->builder, raw_site,
-                LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "site");
+            LLVMValueRef site = zan_hdr_site(g, g->builder, raw_site, "site");
+            LLVMValueRef is_obj = zan_icmp(
+                g->builder, LLVMIntNE,
+                zan_and(g->builder, raw_site, LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_MARK << 32, 0),
+                        "site.mark"),
+                LLVMConstInt(i64, 0, 0), "site.isobj");
             LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
                 g->g_site_count, "bound");
-            LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,
-                bound, "inrange");
+            LLVMValueRef inrange =
+                zan_and(g->builder, is_obj,
+                        zan_icmp(g->builder, LLVMIntULT, site, bound, "site.lt"), "inrange");
             LLVMBuildCondBr(g->builder, inrange, lookup, fb);
             LLVMPositionBuilderAtEnd(g->builder, lookup);
             LLVMValueRef dtbl = LLVMBuildLoad2(g->builder,
@@ -282,6 +292,40 @@
             LLVMValueRef raw_desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc.raw");
             LLVMValueRef desc = zan_and(g->builder, raw_desc,
                 LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "desc");
+            /* 对象头（带对象标记）先判：站点号查 __zan_desc_tbl，越界（串、
+             * soft scratch 前缀）走兜底；其余是数组头字：魔数/秩走数组释放，
+             * 大值是数组描述符指针。 */
+            LLVMBasicBlockRef obj_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "dobj");
+            LLVMBasicBlockRef objtbl_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "dobj.tbl");
+            LLVMBasicBlockRef arrw_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "darr");
+            LLVMBasicBlockRef dsel_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "dsel");
+            LLVMValueRef is_obj = zan_icmp(
+                g->builder, LLVMIntNE,
+                zan_and(g->builder, desc, LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_MARK << 32, 0),
+                        "desc.mark"),
+                LLVMConstInt(i64, 0, 0), "desc.isobj");
+            LLVMBuildCondBr(g->builder, is_obj, obj_bb, arrw_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, obj_bb);
+            LLVMValueRef dcount = NULL;
+            LLVMValueRef dtbl = zan_desc_tbl_global(g, &dcount);
+            LLVMValueRef osite = zan_hdr_site(g, g->builder, desc, "desc.site");
+            LLVMBuildCondBr(g->builder,
+                            zan_icmp(g->builder, LLVMIntULT, osite,
+                                     LLVMBuildLoad2(g->builder, i64, dcount, "desc.n"),
+                                     "desc.inrange"),
+                            objtbl_bb, fb);
+            LLVMPositionBuilderAtEnd(g->builder, objtbl_bb);
+            LLVMValueRef odesc = LLVMBuildLoad2(
+                g->builder, i8ptr, LLVMBuildGEP2(g->builder, i8ptr, dtbl, &osite, 1, "desc.slot"),
+                "desc.tbl");
+            LLVMBuildBr(g->builder, dsel_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, arrw_bb);
             LLVMValueRef is_arr_magic = zan_icmp(g->builder, LLVMIntEQ, desc,
                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrmagic");
             LLVMValueRef is_rank = zan_and(g->builder,
@@ -299,12 +343,25 @@
             LLVMBuildBr(g->builder, ret_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, not_raw);
-            LLVMValueRef dnz = zan_icmp(g->builder, LLVMIntNE, desc,
-                LLVMConstInt(i64, 0, 0), "descnz");
+            LLVMValueRef adesc = LLVMBuildIntToPtr(g->builder, desc, i8ptr, "desc.arr");
+            LLVMBuildBr(g->builder, dsel_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, dsel_bb);
+            LLVMValueRef desc_p = LLVMBuildPhi(g->builder, i8ptr, "desc.p");
+            LLVMAddIncoming(desc_p, (LLVMValueRef[]){odesc, adesc},
+                            (LLVMBasicBlockRef[]){objtbl_bb, not_raw}, 2);
+            /* 快路径的"计数 > 1"只对对象头成立 */
+            LLVMValueRef fphi =
+                LLVMBuildPhi(g->builder, LLVMInt1TypeInContext(g->ctx), "desc.isobjp");
+            LLVMAddIncoming(fphi,
+                            (LLVMValueRef[]){LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+                                             LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0)},
+                            (LLVMBasicBlockRef[]){objtbl_bb, not_raw}, 2);
+            fast_ok = fphi;
+            LLVMValueRef dnz =
+                zan_icmp(g->builder, LLVMIntNE, desc_p, LLVMConstNull(i8ptr), "descnz");
             LLVMBuildCondBr(g->builder, dnz, lookup, fb);
             LLVMPositionBuilderAtEnd(g->builder, lookup);
-            LLVMValueRef desc_p = LLVMBuildIntToPtr(g->builder, desc,
-                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "desc.p");
             dpp = LLVMBuildLoad2(g->builder, i8ptr, desc_p, "dtor");
             LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dpp,
                 LLVMConstNull(i8ptr), "hasd");
@@ -324,9 +381,11 @@
             LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_release_dyn, "rel.slow");
             LLVMBuildCondBr(g->builder,
-                zan_icmp(g->builder, LLVMIntSGT, sent_rc,
-                         LLVMConstInt(i64, 1, 0), "rel.shared"),
-                fast_bb, slow_bb);
+                            zan_and(g->builder, fast_ok,
+                                    zan_icmp(g->builder, LLVMIntSGT, sent_rc,
+                                             LLVMConstInt(i64, 1, 0), "rel.shared"),
+                                    "rel.fastok"),
+                            fast_bb, slow_bb);
             LLVMPositionBuilderAtEnd(g->builder, fast_bb);
             zan_mark_nounwind(g, zan_call2(g->builder, dfnty, dfn, &obj, 1, ""));
             LLVMBuildBr(g->builder, ret_bb);
@@ -443,11 +502,22 @@
         LLVMValueRef size = LLVMGetParam(g->rt_alloc, 0);
         LLVMValueRef site = LLVMGetParam(g->rt_alloc, 1);
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
-        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
+        /* 对齐 16 的类（站点实参带 ZAN_OBJ_TW_PAD16）：块前垫 8 字节，p = 块 + 16 */
+        LLVMValueRef pad = LLVMBuildSelect(
+            g->builder,
+            zan_icmp(g->builder, LLVMIntNE,
+                     zan_and(g->builder, site, LLVMConstInt(i64, ZAN_OBJ_TW_PAD16, 0), "pad16"),
+                     LLVMConstInt(i64, 0, 0), "haspad"),
+            LLVMConstInt(i64, 8, 0), LLVMConstInt(i64, 0, 0), "pad");
+        LLVMValueRef site_idx =
+            zan_and(g->builder, site, LLVMConstInt(i64, ZAN_OBJ_TW_SITE_MASK, 0), "siteidx");
+        LLVMValueRef total = zan_add(
+            g->builder, size,
+            zan_add(g->builder, pad, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "hdrsz"), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         /* 链了 rt_mem（同 str_pages 的口径）：对象走 zan_mem_obj_malloc，
-         * total 为 16 的奇数倍 8 时进 8 字节粒度的对象页（40 字节对象不再
-         * 占 48 字节块）。对齐 16 的字段让 LLVM 尺寸成为 16 的倍数，自动
+         * total 为 16 的奇数倍 8 时进 8 字节粒度的对象页（两指针无多态类
+         * 8 头 + 16 = 24 字节一块）。对齐 16 的字段让 LLVM 尺寸成为 16 的倍数，自动
          * 落回通用类。 */
         LLVMValueRef obj_malloc = g->fn_malloc;
         if (g->str_pages) {
@@ -463,14 +533,18 @@
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, obj_malloc, &total, 1, "raw");
         zan_irgen_emit_oom_check(g, g->rt_alloc, raw);
         emit_rt_alloc_add(g, total);
-        /* raw[0..3] 空位清零、raw[4..7]（= obj-12）refcount = 1：一次 64 位写 */
-        LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
-        LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_OBJ_RC_INIT_WORD, 0), rc_ptr);
-        LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-        LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
-        LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
-        LLVMBuildStore(g->builder, site, site_iptr);
-        LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+        /* 头字一次 64 位写：raw[0..3]（= obj-8）rc = 1，raw[4..7] tw = 对象标记 | 站点号 */
+        LLVMValueRef hdr_word = LLVMBuildOr(
+            g->builder,
+            LLVMBuildShl(g->builder,
+                         LLVMBuildOr(g->builder, site, LLVMConstInt(i64, ZAN_OBJ_TW_MARK, 0), "tw"),
+                         LLVMConstInt(i64, 32, 0), "tw.hi"),
+            LLVMConstInt(i64, 1, 0), "hdrword");
+        LLVMBuildStore(
+            g->builder, hdr_word,
+            LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &pad, 1, "hdrp"));
+        LLVMValueRef hdr_off =
+            zan_add(g->builder, pad, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "usroff");
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->rt_live_register) {
             LLVMValueRef zan_emit_live_on(zan_irgen_t *);
@@ -483,14 +557,13 @@
             emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
                 LLVMPointerType(i64, 0), g->g_site_live, "ltbl");
-            LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, i64, ltbl, &site, 1, "scptr");
+            LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, i64, ltbl, &site_idx, 1, "scptr");
             emit_leak_counter_add(g, sc_ptr, 1);
             LLVMValueRef ntbl = LLVMBuildLoad2(g->builder,
                 LLVMPointerType(i8ptr, 0), g->g_site_names, "ntbl");
-            LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, i8ptr, ntbl, &site, 1, "nmptr");
+            LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, i8ptr, ntbl, &site_idx, 1, "nmptr");
             LLVMBuildStore(g->builder, name, nm_ptr);
-            emit_arc_trace_call(g, arc_trace_ev, "A", user_ptr,
-                LLVMConstInt(i64, 1, 0), site);
+            emit_arc_trace_call(g, arc_trace_ev, "A", user_ptr, LLVMConstInt(i64, 1, 0), site_idx);
         }
         LLVMBuildRet(g->builder, user_ptr);
     }
@@ -501,7 +574,7 @@
         g->rt_str_alloc = LLVMAddFunction(g->mod, "zan_rt_str_alloc", str_alloc_type);
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_alloc, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
-        /* 串头 12 字节：[-12] u32 rc、[-8] (ZANS<<32)|len，负载紧随其后。
+        /* 串头 12 字节：[-12] u32 len、[-8] 头字 (ZANS<<32)|rc，负载紧随其后。
          * 返回的 raw 是"虚基址"（用户指针 - 16，free 传它）：
          *  - 链了 rt_mem（str_pages）：zan_mem_str_malloc(n) 从 8 字节粒度的
          *    串页里切 n 字节、块起点在 raw+4（4 mod 8），于是 [-8] 头字
@@ -532,23 +605,20 @@
             raw = zan_call2(g->builder, malloc_fn_type, sm, &need, 1, "raw");
         } else {
             total = zan_add(g->builder, need,
-                LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE - ZAN_STR_HDR_SIZE, 0), "total");
+                            LLVMConstInt(i64, ZAN_STR_VBASE - ZAN_STR_HDR_SIZE, 0), "total");
             raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         }
         zan_irgen_emit_oom_check(g, g->rt_str_alloc, raw);
         emit_rt_alloc_add(g, total);
-        LLVMValueRef rc_ptr = zan_rc_ptr(g, g->builder,
+        LLVMValueRef usr0 =
             LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw,
-                (LLVMValueRef[]){ LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0) }, 1, "usr0"),
-            "rcptr");
-        LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0), rc_ptr);
-        LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-        LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "magicp");
-        LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0), "magicip");
+                          (LLVMValueRef[]){LLVMConstInt(i64, ZAN_STR_VBASE, 0)}, 1, "usr0");
         LLVMBuildStore(g->builder,
-                       LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
-                       magic_iptr);
-        LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                       LLVMConstInt(LLVMInt32TypeInContext(g->ctx), ZAN_STR_LEN_UNKNOWN, 0),
+                       zan_str_len_ptr(g, g->builder, usr0, "lenp"));
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_STR_TAG_WORD(1), 0),
+                       zan_hdr_word_ptr(g, g->builder, usr0, "magicp"));
+        LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_STR_VBASE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->rt_live_register) {
             LLVMValueRef zan_emit_live_on(zan_irgen_t *);
@@ -655,7 +725,7 @@
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_HDR_WORD_OFF, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
         emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
@@ -703,7 +773,7 @@
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_HDR_WORD_OFF, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
         emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
@@ -717,7 +787,7 @@
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, rel_bb);
         LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
-        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)-(int64_t)ZAN_OBJ_HDR_SIZE, 1);
+        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)-(int64_t)ZAN_STR_VBASE, 1);
         LLVMValueRef rc_iptr = zan_rc_ptr(g, g->builder, obj, "rcptr");
         LLVMValueRef rc = LLVMBuildLoad2(g->builder, rc_ty, rc_iptr, "rc");
         LLVMValueRef is_sent = zan_icmp(g->builder, LLVMIntEQ, rc,

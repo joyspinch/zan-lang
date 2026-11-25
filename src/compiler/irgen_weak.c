@@ -588,6 +588,19 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, rfg_entry);
     LLVMBuildRetVoid(g->builder);
 
+    /* 默认模式的站点号 → 描述符表登记（docs/OBJECT_LAYOUT.md）；无运行时
+     * GC 走图的目标（wasm/bare）由这个弱空实现兜底 */
+    LLVMValueRef reg_dt_fn = LLVMGetNamedFunction(g->mod, "zan_rt_register_desc_table");
+    if (!reg_dt_fn) {
+        LLVMTypeRef rdt_args[] = {LLVMPointerType(i8p, 0), i64t};
+        reg_dt_fn =
+            LLVMAddFunction(g->mod, "zan_rt_register_desc_table",
+                            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rdt_args, 2, 0));
+    }
+    LLVMSetLinkage(reg_dt_fn, LLVMWeakAnyLinkage);
+    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(g->ctx, reg_dt_fn, "entry"));
+    LLVMBuildRetVoid(g->builder);
+
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 }
 void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,

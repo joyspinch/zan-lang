@@ -586,9 +586,20 @@ LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
         LLVMBuildIsNull(g->builder, obj, "refl.objnull"), fb, tbl);
 
     LLVMPositionBuilderAtEnd(g->builder, tbl);
-    LLVMValueRef raw_site = refl_hdr_i64(g, obj, ZAN_OBJ_SITE_OFF, "refl.site.raw");
-    LLVMValueRef site = LLVMBuildAnd(g->builder, raw_site,
-        LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "refl.site");
+    LLVMValueRef raw_site = refl_hdr_i64(g, obj, ZAN_HDR_WORD_OFF, "refl.site.raw");
+    LLVMValueRef word =
+        LLVMBuildAnd(g->builder, raw_site, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0), "refl.word");
+    /* 对象头才有站点号：对象标记在、且不是字符串（ZANS 也带这一位） */
+    LLVMValueRef is_obj = LLVMBuildAnd(
+        g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntNE,
+                      LLVMBuildAnd(g->builder, word,
+                                   LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_MARK << 32, 0),
+                                   "refl.mark"),
+                      LLVMConstInt(i64, 0, 0), "refl.hasmark"),
+        LLVMBuildNot(g->builder, zan_hdr_is_string(g, word, "refl.isstr"), "refl.notstr"),
+        "refl.isobj");
+    LLVMValueRef site = zan_hdr_site(g, g->builder, word, "refl.site");
     LLVMValueRef in_range;
     if (!g->desc_hdr) {
         LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64, g->g_site_count,
@@ -596,9 +607,8 @@ LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
         LLVMValueRef is_arr = LLVMBuildICmp(g->builder, LLVMIntEQ,
             refl_hdr_i64(g, obj, ZAN_ARR_RC_MAGIC_OFF, "refl.rcm"),
             LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "refl.is_arrmagic");
-        LLVMValueRef is_not_obj = zan_or(g->builder,
-            zan_hdr_is_string(g, site, "refl.isstr"),
-            is_arr, "refl.not_obj");
+        LLVMValueRef is_not_obj = zan_or(
+            g->builder, LLVMBuildNot(g->builder, is_obj, "refl.notobj"), is_arr, "refl.not_obj");
         in_range = LLVMBuildAnd(g->builder,
             LLVMBuildAnd(g->builder,
                 LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
@@ -606,19 +616,13 @@ LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
                 "refl.sok"),
             LLVMBuildNot(g->builder, is_not_obj, "refl.not_tag"), "refl.in_range");
     } else {
-        LLVMValueRef is_tag = zan_or(g->builder,
-            zan_or(g->builder,
-                zan_hdr_is_string(g, site, "refl.isstr"),
-                LLVMBuildICmp(g->builder, LLVMIntEQ, site,
-                              LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "refl.isarr"),
-                "refl.istag"),
-            LLVMBuildICmp(g->builder, LLVMIntULT, site,
-                          LLVMConstInt(i64, 4096, 0), "refl.istiny"),
-            "refl.notdsc");
         LLVMBasicBlockRef dsc = LLVMAppendBasicBlockInContext(g->ctx, fn, "dsc");
-        LLVMBuildCondBr(g->builder, is_tag, fb, dsc);
+        LLVMBasicBlockRef dsc2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "dsc2");
+        LLVMBuildCondBr(g->builder, is_obj, dsc, fb);
         LLVMPositionBuilderAtEnd(g->builder, dsc);
-        LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, site, i8ptr, "refl.dsc");
+        LLVMValueRef dp = zan_hdr_desc(g, g->builder, word, "refl.dsc");
+        LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, dp, "refl.dnull"), fb, dsc2);
+        LLVMPositionBuilderAtEnd(g->builder, dsc2);
         LLVMValueRef m_off = LLVMConstInt(i64, 16, 0);
         LLVMValueRef m_p = LLVMBuildGEP2(g->builder, i8, dp, &m_off, 1, "refl.mp");
         LLVMValueRef m = LLVMBuildLoad2(g->builder, i8ptr, m_p, "refl.m");

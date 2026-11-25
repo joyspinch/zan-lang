@@ -1119,7 +1119,7 @@ void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur) {
     emit_closure_release(g, cur);
     LLVMBuildBr(g->builder, cbb);
     LLVMPositionBuilderAtEnd(g->builder, probe);
-    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
     LLVMValueRef hp = LLVMBuildGEP2(g->builder, i8t, cur, &neg8, 1, "obj.hp");
     LLVMValueRef w = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, hp, LLVMPointerType(i64, 0), "obj.hi"),

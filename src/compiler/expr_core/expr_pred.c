@@ -282,10 +282,9 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
     if (elem_type && is_rc_managed_type(elem_type)) {
         LLVMValueRef desc = get_array_desc(g, elem_type);
         LLVMValueRef desc_i64 = LLVMBuildPtrToInt(g->builder, desc, i64, "arr.desci");
-        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
-                          desc_i64, "arr.desc");
+        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF, desc_i64, "arr.desc");
     } else {
-        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF,
                           LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
     }
     LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
@@ -361,8 +360,8 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                       LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "md.rcmagic");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_COUNT_OFF, total, "md.count");
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
-                      LLVMConstInt(i64, rank, 0), "md.rank");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF, LLVMConstInt(i64, rank, 0),
+                      "md.rank");
     for (int d = 0; d < rank; d++) {
         LLVMValueRef off = LLVMConstInt(i64,
             ZAN_ARR_HDR_SIZE / 8 + (unsigned long long)d, 0);

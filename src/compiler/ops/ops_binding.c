@@ -272,7 +272,7 @@ LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     }
     LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
         (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
-    LLVMValueRef alloc_args[] = { LLVMSizeOf(st), site_val, site_name };
+    LLVMValueRef alloc_args[] = {LLVMSizeOf(st), arc_class_site_val(g, site_val, st), site_name};
     LLVMValueRef raw = zan_call2(g->builder, alloc_fn_type, g->rt_alloc,
         alloc_args, 3, "bindobj");
     LLVMValueRef objp = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "bindp");

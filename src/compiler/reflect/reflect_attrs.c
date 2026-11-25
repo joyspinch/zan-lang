@@ -561,22 +561,19 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     for (int i = 0; i < sn; i++)
         chars[i] = LLVMConstInt(i8, (unsigned char)shortbuf[i], 0);
     chars[sn] = LLVMConstInt(i8, 0, 0);
-    LLVMSetInitializer(gv, LLVMConstNamedStruct(rec_ty, (LLVMValueRef[]){
-        refl_const_string(g, disp, disp_len), /* FullName（B-ID107） */
-        tattr_val,
-        tbl_val,
-        methods,
-        LLVMConstInt(i64, (unsigned long long)method_count, 0),
-        ctors,
-        LLVMConstInt(i64, (unsigned long long)ctor_count, 0),
-        elem,
-        targs,
-        fields,
-        LLVMConstInt(i64, (unsigned long long)field_count, 0),
-        LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
-        LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMConstInt(i64, ZAN_STR_HDR_WORD(sn), 0),
-        LLVMConstArray(i8, chars, (unsigned)(sn + 1)) }, 15));
+    LLVMSetInitializer(
+        gv, LLVMConstNamedStruct(
+                rec_ty,
+                (LLVMValueRef[]){refl_const_string(g, disp, disp_len), /* FullName（B-ID107） */
+                                 tattr_val, tbl_val, methods,
+                                 LLVMConstInt(i64, (unsigned long long)method_count, 0), ctors,
+                                 LLVMConstInt(i64, (unsigned long long)ctor_count, 0), elem, targs,
+                                 fields, LLVMConstInt(i64, (unsigned long long)field_count, 0),
+                                 LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
+                                 LLVMConstInt(i64, ZAN_STR_LIT_W0(sn), 0),
+                                 LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
+                                 LLVMConstArray(i8, chars, (unsigned)(sn + 1))},
+                15));
     free(chars);
     return rec;
 }

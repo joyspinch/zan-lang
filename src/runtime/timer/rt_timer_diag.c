@@ -102,7 +102,11 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
  * ZAN_SOFT_ARR_BASE_OFF in zan_abi.h). hdr = start of the prefix:
  *   empty array A = P + ZAN_SOFT_ARR_BASE_OFF: rc, rc magic, count 0, magic,
  *   then ZAN_SOFT_ARR_SPAN zero bytes;
- *   object at P: rc/magic at P-32/P-24, object rc at P-16, discriminator P-8. */
+ *   object at P: rc/magic at P-32/P-24, array length (and the self-host
+ *   object rc) at P-16, discriminator P-8. The C host's object/string rc is
+ *   the low half of P-8 (docs/OBJECT_LAYOUT.md): ARRAY_MAGIC's low word is
+ *   huge, so it never reaches zero, and its high word decodes to an
+ *   out-of-range allocation site, so descriptor lookups miss. */
 static void soft_scratch_init_header(unsigned char *hdr) {
     store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* A-32: array rc */
     store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
@@ -111,7 +115,7 @@ static void soft_scratch_init_header(unsigned char *hdr) {
     hdr += ZAN_SOFT_PREFIX_SIZE - 32;
     store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
     store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
-    store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
+    store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: length / self-host rc */
     store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC); /* P-8:  discriminator */
 }
 

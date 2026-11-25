@@ -22,13 +22,12 @@ typedef struct {
 typedef void (*zan_leak_edge_cb_t)(void *from, void *to, int kind, uint32_t index, void *ctx);
 
 static zan_field_graph_t *zan_leak_object_graph(void *obj, uint64_t *site_out) {
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
+    uint64_t word = zan_hdr_word(obj);
+    uint64_t site = zan_word_site(word);
     *site_out = site;
-    if ((site >> 32) == ZAN_STRING_TAG) return NULL;
-    if (site >= 4096) {
-        zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
-        return desc ? desc->field_graph : NULL;
-    }
+    if (zan_word_is_string(word)) return NULL;
+    zan_arc_desc_t *desc = zan_word_desc(word);
+    if (desc) return desc->field_graph;
     if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count)
         return (zan_field_graph_t *)g_site_field_graphs_reg[site];
     return NULL;
@@ -37,9 +36,9 @@ static zan_field_graph_t *zan_leak_object_graph(void *obj, uint64_t *site_out) {
 /* zan_walk_object_edges 的带标签版本：额外给出边来自哪个字段/元素下标 */
 static void zan_leak_walk_edges(void *obj, zan_leak_edge_cb_t cb, void *ctx) {
     uint64_t site = 0;
-    if (*(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF) == ZAN_ARRAY_RC_MAGIC) {
-        site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
-        if (site == ZAN_ARRAY_MAGIC) return;
+    if (*(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF) == ZAN_ARRAY_RC_MAGIC &&
+        !ZAN_HDR_IS_OBJ(zan_hdr_word(obj))) {
+        if (zan_hdr_word(obj) == ZAN_ARRAY_MAGIC) return;
         int64_t count = *(int64_t *)((char *)obj + ZAN_ARR_COUNT_OFF);
         void **elems = (void **)obj;
         for (int64_t i = 0; i < count; i++)
@@ -127,7 +126,7 @@ static void zan_leak_emit(zan_leak_out_t *o, const char *fmt, const char *a, con
 }
 
 static void zan_leak_emit_node(zan_leak_out_t *o, void *obj) {
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
+    uint64_t site = zan_word_site(zan_hdr_word(obj));
     const char *ty = zan_get_object_tyname(obj);
     const char *where = NULL;
     if (o->site_names && site > 0 && site < (uint64_t)o->site_count)
@@ -153,7 +152,7 @@ static void zan_leak_emit_node(zan_leak_out_t *o, void *obj) {
 static void zan_leak_emit_edge(zan_leak_out_t *o, void *from, const zan_leak_edge_t *e) {
     char buf[32];
     if (e->kind == 0) {
-        uint64_t site = *(uint64_t *)((char *)from + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
+        uint64_t site = zan_word_site(zan_hdr_word(from));
         const char *name = NULL;
         if (o->field_names && site > 0 && site < (uint64_t)o->site_count) {
             const char **names = (const char **)o->field_names[site];

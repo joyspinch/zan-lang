@@ -2190,32 +2190,35 @@ zan_escape_stats_t zan_opt_escape(zan_irgen_t *g) {
                                 LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
                                 insert_entry_alloca(b_entry, fn);
 
-                                LLVMValueRef total_val = LLVMBuildAdd(b_entry, size_val,
-                                    LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "stk.total");
+                                /* 栈对象一律按 16 对齐放：块 16 对齐、头字在 +8、p = 块 + 16
+                                 * （对齐 16 的类也满足；栈对象从不 free，前垫不用记） */
+                                LLVMValueRef total_val = LLVMBuildAdd(
+                                    b_entry, size_val, LLVMConstInt(i64, 16, 0), "stk.total");
                                 LLVMValueRef alloca_buf = LLVMBuildArrayAlloca(b_entry,
                                     LLVMInt8TypeInContext(ctx), total_val, "stk.raw");
+                                LLVMSetAlignment(alloca_buf, 16);
                                 LLVMDisposeBuilder(b_entry);
 
                                 LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
                                 LLVMPositionBuilderBefore(b_inst, inst);
 
-                                /* raw[0..3] 清零、raw[4..7]（obj-12）rc = 1 */
-                                LLVMValueRef rc_ptr = LLVMBuildBitCast(b_inst, alloca_buf,
-                                    LLVMPointerType(i64, 0), "stk.rcp");
-                                LLVMBuildStore(b_inst, LLVMConstInt(i64, ZAN_OBJ_RC_INIT_WORD, 0), rc_ptr);
-
-                                /* site = site | ZAN_OBJ_STACK_FLAG at raw[8..15] */
-                                LLVMValueRef site_marked = LLVMBuildOr(b_inst, site_val,
-                                    LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stk.site");
-                                LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-                                LLVMValueRef site_ptr = LLVMBuildGEP2(b_inst,
-                                    LLVMInt8TypeInContext(ctx), alloca_buf, &eight, 1, "stk.sptr");
-                                LLVMValueRef site_iptr = LLVMBuildBitCast(b_inst, site_ptr,
-                                    LLVMPointerType(i64, 0), "stk.siptr");
-                                LLVMBuildStore(b_inst, site_marked, site_iptr);
+                                /* 头字一次写：raw[0..3]（obj-8）rc = 1，raw[4..7] tw =
+                                 * 栈标记 | 对象标记 | 站点号（docs/OBJECT_LAYOUT.md） */
+                                LLVMValueRef hdr_word = LLVMBuildOr(
+                                    b_inst,
+                                    LLVMBuildShl(b_inst,
+                                                 LLVMBuildOr(b_inst, site_val,
+                                                             LLVMConstInt(i64, ZAN_OBJ_TW_MARK, 0),
+                                                             "stk.tw"),
+                                                 LLVMConstInt(i64, 32, 0), "stk.tw.hi"),
+                                    LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG | 1u, 0), "stk.hdr");
+                                LLVMValueRef hdr8 = LLVMConstInt(i64, 16 - ZAN_OBJ_HDR_SIZE, 0);
+                                LLVMBuildStore(b_inst, hdr_word,
+                                               LLVMBuildGEP2(b_inst, LLVMInt8TypeInContext(ctx),
+                                                             alloca_buf, &hdr8, 1, "stk.hdrp"));
 
                                 /* user_ptr = raw + 16 */
-                                LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                                LLVMValueRef hdr_off = LLVMConstInt(i64, 16, 0);
                                 LLVMValueRef stk_user_ptr = LLVMBuildGEP2(b_inst,
                                     LLVMInt8TypeInContext(ctx), alloca_buf, &hdr_off, 1, "stk.usr");
                                 LLVMDisposeBuilder(b_inst);

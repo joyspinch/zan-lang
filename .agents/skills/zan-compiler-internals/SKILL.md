@@ -499,23 +499,21 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      份代码 10 次编译崩 1 次）。
    - 边界：任何"先记下元素指针、递归之后再解引用"的写法都要复查；**间歇性**
      崩溃（同样输入时好时坏）优先怀疑缓存/表条目的生命周期，而不是随机性。
-23. **类布局的 vptr 槽必须整条继承链统一**：
-   - 动作：`class_vptr_offset`（`src/compiler/irgen.c`）对**所有类**一律返回
-     1（0 号槽留指针位），结构体返回 0，显式布局类型自己给偏移也不留；
-     虚表仍然只在"本类或祖先多态"时才发（`class_has_virtual_methods`），
-     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen/irgen.zan` 的
-     `FieldBase` 与 `EmitStruct` 同样按"类一律留槽"改。
-   - 理由：vptr 槽以前只在多态类里留，于是 `Base`（无接口无虚方法）与
-     `Derived : Base, IFace`（实现了接口）给**同一个字段**两套下标
-     （0 vs 1）：基类构造器把字段写进了派生对象的 vptr 槽，派生类读到的
-     却是垃圾（实测 `d.count=-724564432`），ARC 释放也漏掉基类那份字段
-     （泄漏报告指向基类的 `new`）。派生类一继承基类就坏。
-   - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），
-     结构体类型注册（`register_struct_type`）、调试信息、ARC 释放函数
-     （`irgen_arc.c`）、反射（`irgen_reflect.c`）都必须跟着它走；漏一处
-     就又是一处错位。判定器：`tests/conformance/inherit_interface_layout.zan`
-     （基类字段在派生实例上的读写 + 基类方法 + 接口分派），泄漏档与
-     arcguard 档同源覆盖。
+23. **类布局的 vptr 槽必须整条继承**树**统一**（2026-11-25 起按树条件化）：
+   - 动作：`class_vptr_offset`（`src/compiler/irgen/irgen_type_map.c`）对"树根（最上层
+     非 object 祖先）的所有后代里有任一多态类（虚/抽象/覆写方法或接口）"的类返回 1，
+     否则 0；结构体与显式布局类型返回 0。计划由 `class_vptr_plan_compute` 在
+     `zan_irgen_emit` 注册任何类布局之前扫全部类型声明算出，计划外的类按旧口径留槽；
+     `ZAN_VPTR_ALWAYS=1` 退回一律留槽（二分用）。自举后端有自己的布局（`FieldBase`
+     一律留槽），与 C 宿主无须一致。
+   - 理由：曾按"本类或祖先多态"逐类决定，`Base`（无多态）与 `Derived : Base, IFace`
+     给同一字段两套下标（0 vs 1），派生类一继承就坏；后来一律留槽，又让 binary-trees
+     这类无多态节点白占 8 字节（槽恒 null）。按整棵树决定两头都对：同树同答案。
+   - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），类型注册、
+     调试信息、ARC 释放、反射、字段走图都跟着它走。按首字比对身份的分派（接口分派、
+     object.ToString 候选链）只在有 vptr 的对象上命中，无 vptr 对象首字是字段值，
+     走兜底。判定器：`tests/conformance/inherit_interface_layout.zan`、
+     `tests/conformance/object_header_compact.zan`。
 24. **泛型类的每个实例化必须有自己的 vtable**：
    - 动作：泛型类不能只发一张共享 vtable。`get_vtable_global_inst`
      （`src/compiler/irgen_arc.c`）按实例实参生成 `__zan_vtable_<Class>$<token>`，
@@ -757,8 +755,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 36. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
    - 动作：字符串字面量等编译期常量不是堆对象，它们的引用计数用哨兵值
      `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写计数头
-     （2026-11-24 起：`ZAN_RC_OFF = -12` 的 **u32**，immortal = `ZAN_RC_IMMORTAL`
-     0xffffffff；静态数据仍在 [-16] 写 i64 -1，小端下 [-12] 恰是它）的 ARC
+     （2026-11-25 起：`ZAN_RC_OFF = -8` 的 **u32**，immortal = `ZAN_RC_IMMORTAL`
+     0xffffffff；静态串前缀是 `ZAN_STR_LIT_W0/W1`）的 ARC
      路径——通用 retain / 通用 release、字符串 retain、动态释放——都必须
      **先判哨兵再动计数**。静态对象在只读段，对它做原子加一/减一就是访问冲突。
    - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
@@ -772,10 +770,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      先读它再决定要不要上调试器；最小探针二分（`object o = "字面量"` vs
      `string s = "字面量"`）通常一步就切到根因。
 
-**ARC 头：RC 是 [p-12] 的 u32，字符串头只有 12 字节——绝不碰串的 [p-16]**（实证，2026-11-24）：
-- 布局（`src/common/zan_abi.h`）：对象 `[-16]` 4 字节空位 | `[-12]` u32 rc | `[-8]` 站点字；
-  字符串 `[-12]` u32 rc | `[-8]` `(ZANS<<32)|len`。对象与串 RC 同址同宽，通用
-  retain/release 不分辨种类。数组不变（i64 rc 在 -32、计数 `ZAN_ARR_COUNT_OFF` -16）。
+**ARC 头：对象头 8 字节、RC 是 [p-8] 的 u32，字符串头 12 字节——绝不碰串的 [p-16]**（实证，2026-11-25，设计 `docs/OBJECT_LAYOUT.md`）：
+- 布局（`src/common/zan_abi.h`）：对象 `[-8]` u32 rc | `[-4]` u32 tw（bit31 栈提升、
+  bit30 对象标记、bit29 前垫 8 字节、低 29 位站点号）；字符串 `[-12]` u32 len |
+  `[-8]` u32 rc | `[-4]` "ZANS"。[-8] 的 u64 头字：对象 `(tw<<32)|rc`、串
+  `(ZANS<<32)|rc`，"高 32 位 == ZANS 即串""头字 < 0 即栈对象"照旧。数组不变。
+- 描述符不再在头里：默认模式 `zan_hdr_desc` 按站点号查 `__zan_desc_tbl`（收尾定型，
+  须早于 `refl_compact_member_tables`，否则只经表引用的反射记录被当死记录清零——
+  GetType().Name 变空）；C 运行时经 `zan_rt_register_desc_table` 查。读头字取站点号
+  一律用 `zan_hdr_site` / `ZAN_HDR_SITE` 且先看对象标记（数组头字里可能是描述符指针）。
+- 对齐 16 的类（decimal/i128/SIMD 字段）：站点实参带 `ZAN_OBJ_TW_PAD16`，块前垫 8 字节
+  让 p 16 对齐，`__zan_arc_free` 按这一位传 p-16；漏了它 decimal 字段落在 8 mod 16 上。
+- 串长度读写走 `zan_str_len_ptr`（[-12] 的 u32），`emit_string_len_set` 只写 [-12] 与
+  [-4] 标签、不碰 rc；旧式整写 `[-8] = ZANS<<32|len` 会把 rc 改成长度。
+- 收益：两指针节点 40 → 24 字节，binary-trees 43 → 28 MB（C 18 MB）。
 - 链了 rt_mem（`g->str_pages`，Apple/ELF/Windows 原生且非 `--emit-lib`）时串经
   `zan_mem_str_malloc` 进 8 字节粒度"串页"：块真起点在 4 mod 8，交出的是虚基址
   V = 用户指针 - 16（释放照旧传 p-16）。**V[0..3] 是相邻串的尾巴**：任何对串写
@@ -835,9 +843,8 @@ binary-trees（`new Node(Make(d-1), Make(d-1))`）1.86 s → 0.9 s（C malloc/fr
 - **对象 40 字节进 48 字节类**：rt_mem 加 8 字节粒度"对象页"类（24..120 的奇数倍 8），
   只经 `zan_mem_obj_malloc`（`g->str_pages` 时 zan_rt_alloc 调它）。判据靠 LLVM 不变式：
   对齐 16 的类型尺寸必是 16 的倍数，`n % 16 == 8` 的对象天然只要 8 对齐。
-- 内存余量是 ABI 地板：16 字节头（4 空位 + u32 rc + 描述符）+ 每个类都有的 vptr 槽
-  （`class_vptr_offset` 恒 1，无虚方法的类该槽恒 null）+ 载荷。两指针节点 40 字节 vs
-  C 16 字节；去 vptr 槽要改所有经 offset 0 做 object 虚分派的路径，未做。
+- 内存地板（2026-11-25 已降）：8 字节头（u32 rc + u32 站点号）+ 仅多态树才有的 vptr 槽
+  + 载荷，两指针节点 24 字节 vs C 16 字节（见上文"ARC 头"条）。
 - 顺带修了 `zan_rt_defer_push` IR 弱回退把 (fn, obj) 调反成 obj(fn) 的潜伏崩溃。
 - 钉子用例 `tests/conformance/arc_new_args_first.zan`（实参/构造体抛异常的释放）、
   `tests/runtime/rt_mem_apple_zone_test.c`（对象页）。排查手法：`ZAN_DUMP_LATE_ARC_IR`

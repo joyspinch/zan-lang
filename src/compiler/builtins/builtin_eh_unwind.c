@@ -530,7 +530,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
         rel_arr_null, rel_arr_work);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_arr_work);
-    LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_HDR_WORD_OFF, 1);
     LLVMValueRef site_p = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), vobj, &neg8, 1, "arr.sitep");
     LLVMValueRef raw_site = LLVMBuildLoad2(g->builder, i64t,
         LLVMBuildBitCast(g->builder, site_p, LLVMPointerType(i64t, 0), "arr.siteip"), "arr.site.raw");

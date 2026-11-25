@@ -64,15 +64,15 @@ const char* zan_embed_list(const char* prefix) {
         static const struct {
             uint64_t rc, magic;
             char data[1];
-        } empty = { ZAN_STRING_SENTINEL_RC, ZAN_STR_HDR_WORD(0), { 0 } };
-        char* nb = (char*)realloc(buf ? buf - ZAN_OBJ_HDR_SIZE : 0,
-                                 need + ZAN_OBJ_HDR_SIZE);
+        } empty = {ZAN_STR_LIT_W0(0), ZAN_STR_LIT_W1, {0}};
+        char *nb = (char *)realloc(buf ? buf - ZAN_STR_VBASE : 0, need + ZAN_STR_VBASE);
         if (!nb) return empty.data;
         /* ARC and string length may inspect the words before the data. */
         uint64_t* hdr = (uint64_t*)nb;
-        hdr[0] = ZAN_STRING_SENTINEL_RC;
-        hdr[1] = ZAN_STRING_MAGIC;
-        buf = nb + ZAN_OBJ_HDR_SIZE; cap = need;
+        hdr[0] = ZAN_STR_LIT_W0(ZAN_STR_LEN_UNKNOWN);
+        hdr[1] = ZAN_STR_LIT_W1;
+        buf = nb + ZAN_STR_VBASE;
+        cap = need;
     }
     {
         size_t o = 0;

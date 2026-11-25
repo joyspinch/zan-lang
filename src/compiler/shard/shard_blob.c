@@ -5,9 +5,9 @@
  * 本模块在 shard 发射前把全模块的 immortal 托管字符串收口为单个确定性
  * blob + 常量偏移引用：
  *   - 收录两类字节映像（均为纯数据叶子，零重定位）：
- *       flat  [N x i8]  常量数据数组，前 8 字节为 RC sentinel 0xFF..FF
- *                       （__zan.strlit.* 托管串）；
- *       struct{i64,i64,[N x i8]} 且 field0 == -1（__zan.refl.str.pool.*）。
+ *       flat  [N x i8]  常量数据数组，前 16 字节为静态串前缀 W0/W1
+ *                       （__zan.strlit.* 托管串，zan_abi.h ZAN_STR_LIT_W0/W1）；
+ *       struct{i64,i64,[N x i8]} 且 field0/1 是同一前缀（__zan.refl.str.pool.*）。
  *   - 唯一化按（映像字节序）排序后线性分配 8 对齐偏移，同输入必同布局；
  *   - blob 为 external 常量，定义留在协调器（主 object），分片经
  *     sh_refs_note_global 的 SH_G_DECL 路径自动获得 extern 声明；
@@ -129,16 +129,20 @@ static bool sh_blob_i64_le(LLVMValueRef c, uint8_t out[8]) {
     return true;
 }
 
-/* 平头形态：[N x i8] 常量数据数组，前 8 字节 = RC sentinel（全 FF）。
+/* 平头形态：[N x i8] 常量数据数组，前 16 字节 = 静态串前缀。
  * 必须先验 ConstantDataSequential：zeroinitializer（空串池项）非 CDS，
  * LLVMGetAsString 对其直接 cast 会崩（S4 首探即触雷）。 */
 static bool sh_blob_flat_image(LLVMValueRef init, uint8_t **img, size_t *len) {
     if (!LLVMIsAConstantDataSequential(init)) return false;
     size_t n = 0;
     const char *raw = LLVMGetAsString(init, &n);
-    if (!raw || n < 8) return false;
-    for (int i = 0; i < 8; i++)
+    if (!raw || n < 16) return false;
+    /* 静态串前缀（docs/OBJECT_LAYOUT.md）：W0 低 4 字节填充全 1，W1 = ZANS|immortal */
+    for (int i = 0; i < 4; i++)
         if ((uint8_t)raw[i] != 0xFF) return false;
+    uint64_t w1 = 0;
+    for (int i = 0; i < 8; i++) w1 |= (uint64_t)(uint8_t)raw[8 + i] << (8 * i);
+    if (w1 != ZAN_STR_LIT_W1) return false;
     uint8_t *buf = (uint8_t *)malloc(n);
     if (!buf) return false;
     memcpy(buf, raw, n);
@@ -147,7 +151,7 @@ static bool sh_blob_flat_image(LLVMValueRef init, uint8_t **img, size_t *len) {
     return true;
 }
 
-/* 结构体形态：{i64, i64, [N x i8]} 且 field0 == -1（refl pool）。
+/* 结构体形态：{i64, i64, [N x i8]} 且 field0/1 是静态串前缀（refl pool）。
  * 映像 = LE(field0) + LE(field1) + payload，补齐到 8 的倍数。 */
 static bool sh_blob_struct_image(LLVMValueRef init, uint8_t **img,
                                  size_t *len) {
@@ -174,10 +178,12 @@ static bool sh_blob_struct_image(LLVMValueRef init, uint8_t **img,
     LLVMValueRef v2 = LLVMGetAggregateElement(init, 2);
     uint8_t h0[8], h1[8];
     if (!sh_blob_i64_le(v0, h0) || !sh_blob_i64_le(v1, h1)) return false;
-    /* immortal 判据：RC sentinel == -1 */
-    static const uint8_t sentinel[8] = {0xFF, 0xFF, 0xFF, 0xFF,
-                                        0xFF, 0xFF, 0xFF, 0xFF};
-    if (memcmp(h0, sentinel, 8) != 0) return false;
+    /* immortal 判据：静态串前缀（W0 低 4 字节填充全 1，W1 = ZANS|immortal） */
+    static const uint8_t pad[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    if (memcmp(h0, pad, 4) != 0) return false;
+    uint64_t w1 = 0;
+    for (int i = 0; i < 8; i++) w1 |= (uint64_t)h1[i] << (8 * i);
+    if (w1 != ZAN_STR_LIT_W1) return false;
     size_t n = 0;
     if (!LLVMIsAConstantDataSequential(v2)) return false;
     const char *raw = LLVMGetAsString(v2, &n);

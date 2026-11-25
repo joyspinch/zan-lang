@@ -215,33 +215,64 @@ void zan_rt_register_site_dtors(void **dtors, int64_t count) {
     g_site_dtors_count = count;
 }
 
+/* 默认（描述符）模式：站点号 → 描述符表（编译器在 main 入口登记）。
+ * 对象头字 = (tw<<32)|rc，tw = 栈标记 | 对象标记 | 站点号（docs/OBJECT_LAYOUT.md）。 */
+static void **g_desc_tbl_reg = NULL;
+static int64_t g_desc_tbl_count = 0;
+
+void zan_rt_register_desc_table(void **tbl, int64_t count) {
+    g_desc_tbl_reg = tbl;
+    g_desc_tbl_count = count;
+}
+
+/* 读头字（去掉栈标记） */
+static inline uint64_t zan_hdr_word(void *obj) {
+    return *(uint64_t *)((char *)obj + ZAN_HDR_WORD_OFF) & ~ZAN_OBJ_STACK_FLAG;
+}
+static inline int zan_word_is_string(uint64_t word) { return (word >> 32) == ZAN_STRING_TAG; }
+/* 对象头字的站点号；不是对象头（串、数组、外来指针）给 0（哨兵站点） */
+static inline uint64_t zan_word_site(uint64_t word) {
+    if (zan_word_is_string(word) || !ZAN_HDR_IS_OBJ(word)) return 0;
+    return ZAN_HDR_SITE(word);
+}
+/* 头字 → 描述符：对象按站点号查登记的描述符表；数组头字里的大值是数组
+ * 描述符指针（没有对象标记）；其余（串、魔数、秩、越界站点）为 NULL */
+static zan_arc_desc_t *zan_word_desc(uint64_t word) {
+    if (zan_word_is_string(word)) return NULL;
+    if (ZAN_HDR_IS_OBJ(word)) {
+        uint64_t site = ZAN_HDR_SITE(word);
+        if (g_desc_tbl_reg && site > 0 && (int64_t)site < g_desc_tbl_count)
+            return (zan_arc_desc_t *)g_desc_tbl_reg[site];
+        return NULL;
+    }
+    if (word >= 4096 && word != ZAN_ARRAY_MAGIC) return (zan_arc_desc_t *)(uintptr_t)word;
+    return NULL;
+}
+
 static const char *zan_get_object_tyname(void *obj) {
     if (!obj) return "null";
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
-    if ((site >> 32) == ZAN_STRING_TAG) {
-        return "string";
-    }
+    uint64_t word = zan_hdr_word(obj);
+    if (zan_word_is_string(word)) { return "string"; }
+    zan_arc_desc_t *desc = zan_word_desc(word);
     uint64_t arr_rc_magic = *(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF);
-    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC) {
-        if (site == ZAN_ARRAY_MAGIC) return "Array";
-        if (site >= 4096) {
-            zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
-            if (desc && desc->tynames_arr) {
-                const char **tns = (const char **)desc->tynames_arr;
-                if (tns[0]) return tns[0];
-            }
-        }
-        return "Array";
-    }
-    if (site >= 4096) {
-        zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
+    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC && !ZAN_HDR_IS_OBJ(word)) {
         if (desc && desc->tynames_arr) {
             const char **tns = (const char **)desc->tynames_arr;
             if (tns[0]) return tns[0];
         }
-    } else if (g_site_tynames_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
-        const char **tns = (const char **)g_site_tynames_reg[site];
-        if (tns && tns[0]) return tns[0];
+        return "Array";
+    }
+    if (desc) {
+        if (desc->tynames_arr) {
+            const char **tns = (const char **)desc->tynames_arr;
+            if (tns[0]) return tns[0];
+        }
+    } else {
+        uint64_t site = zan_word_site(word);
+        if (g_site_tynames_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
+            const char **tns = (const char **)g_site_tynames_reg[site];
+            if (tns && tns[0]) return tns[0];
+        }
     }
     return "object";
 }
@@ -256,13 +287,11 @@ static inline void *zan_edge_untag(void *p) {
 
 static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
     if (!obj) return;
-    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
-    if ((site >> 32) == ZAN_STRING_TAG) {
-        return;
-    }
+    uint64_t word = zan_hdr_word(obj);
+    if (zan_word_is_string(word)) { return; }
     uint64_t arr_rc_magic = *(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF);
-    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC) {
-        if (site == ZAN_ARRAY_MAGIC) return;
+    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC && !ZAN_HDR_IS_OBJ(word)) {
+        if (word == ZAN_ARRAY_MAGIC) return;
         int64_t count = *(int64_t *)((char *)obj + ZAN_ARR_COUNT_OFF);
         if (count <= 0) return;
         void **elems = (void **)obj;
@@ -273,9 +302,10 @@ static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
         return;
     }
     zan_field_graph_t *fg = NULL;
-    if (site >= 4096) {
-        zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
-        if (desc) fg = desc->field_graph;
+    zan_arc_desc_t *desc = zan_word_desc(word);
+    uint64_t site = zan_word_site(word);
+    if (desc) {
+        fg = desc->field_graph;
     } else if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
         fg = (zan_field_graph_t *)g_site_field_graphs_reg[site];
     }
@@ -484,7 +514,7 @@ int64_t zan_gc_detect_cycles(void) {
         for (size_t i = 0; i < actual_count && printed < 20; i++) {
             if (!nodes[i].marked) {
                 const char *tyname = zan_get_object_tyname(nodes[i].obj);
-                uint64_t site = *(uint64_t *)((char *)nodes[i].obj + ZAN_OBJ_SITE_OFF);
+                uint64_t site = zan_word_site(zan_hdr_word(nodes[i].obj));
                 fprintf(stderr, "  - [%s] at %p (rc=%lld, internal_rc=%lld, size=%zu, site=%llu)\n",
                         tyname, nodes[i].obj, (long long)nodes[i].rc, (long long)nodes[i].internal_rc,
                         nodes[i].size, (unsigned long long)site);
@@ -538,21 +568,21 @@ typedef void (*zan_slot_cb_t)(void *from, void **slot, void *ctx);
 
 /* 可回收对象返回其字段图并经 *dtor 给出类型化释放函数；否则 NULL（视为根） */
 static zan_field_graph_t *zan_gc_collectable_graph(void *obj, void **dtor) {
-    uint64_t raw = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF);
+    uint64_t raw = *(uint64_t *)((char *)obj + ZAN_HDR_WORD_OFF);
     if (raw & ZAN_OBJ_STACK_FLAG) return NULL;
-    if ((raw >> 32) == ZAN_STRING_TAG) return NULL;
-    if (*(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF) == ZAN_ARRAY_RC_MAGIC) return NULL;
-    if (raw < 4096) {
+    if (zan_word_is_string(raw) || !ZAN_HDR_IS_OBJ(raw)) return NULL; /* 串、数组 */
+    uint64_t site = ZAN_HDR_SITE(raw);
+    if (!g_desc_tbl_reg) {
         /* 站点表模式；0 号是未知站点。闭包记录等非类站点在析构表里为空，自然排除 */
-        if (raw == 0 || !g_site_dtors_reg || !g_site_field_graphs_reg ||
-            (int64_t)raw >= g_site_dtors_count || (int64_t)raw >= g_site_reg_count)
+        if (site == 0 || !g_site_dtors_reg || !g_site_field_graphs_reg ||
+            (int64_t)site >= g_site_dtors_count || (int64_t)site >= g_site_reg_count)
             return NULL;
-        *dtor = g_site_dtors_reg[raw];
-        zan_field_graph_t *fg = (zan_field_graph_t *)g_site_field_graphs_reg[raw];
+        *dtor = g_site_dtors_reg[site];
+        zan_field_graph_t *fg = (zan_field_graph_t *)g_site_field_graphs_reg[site];
         return (*dtor && fg) ? fg : NULL;
     }
-    zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)raw;
-    if (!desc->dtor_fn || !desc->field_graph) return NULL;
+    zan_arc_desc_t *desc = zan_word_desc(raw);
+    if (!desc || !desc->dtor_fn || !desc->field_graph) return NULL;
     *dtor = desc->dtor_fn;
     return desc->field_graph;
 }

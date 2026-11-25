@@ -116,6 +116,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         }
     }
 
+    class_vptr_plan_compute(g, unit);
     discover_generic_insts(g, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -480,6 +481,9 @@ done:
         if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     }
     sinit_register_library_startup(g, get_static_init_coordinator(g));
+    /* 站点号 → 描述符表定型：此后不再登记分配点。须在反射成员表压缩之前——
+     * 描述符（及其反射记录）只经这张表被引用，占位表看不到它们会被当成死记录 */
+    emit_desc_table(g);
     refl_compact_member_tables(g);
     char *error = NULL;
     if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {

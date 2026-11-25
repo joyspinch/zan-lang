@@ -61,7 +61,7 @@ static LLVMValueRef emit_new_storage(zan_irgen_t *g, zan_symbol_t *sym,
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
         LLVMValueRef sz = LLVMSizeOf(st);
-        LLVMValueRef site_val = site.val, site_name = site.name;
+        LLVMValueRef site_val = arc_class_site_val(g, site.val, st), site_name = site.name;
         LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
             (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
         LLVMValueRef alloc_args3[] = { sz, site_val, site_name };

@@ -465,8 +465,8 @@ static LLVMValueRef embed_emit_text_view(zan_irgen_t *g, struct embed_api_ctx *c
     LLVMBuildStore(b, source, LLVMBuildStructGEP2(b, node, raw, 0, "source.p"));
     LLVMBuildStore(b, len, LLVMBuildStructGEP2(b, node, raw, 1, "len.p"));
     LLVMBuildStore(b, first, LLVMBuildStructGEP2(b, node, raw, 2, "next.p"));
-    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMBuildStructGEP2(b, node, raw, 3, "rc.p"));
+    /* 串前缀两字（docs/OBJECT_LAYOUT.md）：W0 = len<<32 | 填充，W1 = ZANS|immortal rc；
+     * 长度在下面算出 textlen 后回填 */
     /* Text preserves the C-string NUL contract; bytes retain full length. */
     LLVMTypeRef ca[] = { c->i8p, c->i32, c->i64 }, cty;
     LLVMValueRef memchr_fn = embed_libc(g, "memchr", c->i8p, ca, 3, &cty);
@@ -475,8 +475,17 @@ static LLVMValueRef embed_emit_text_view(zan_irgen_t *g, struct embed_api_ctx *c
     LLVMValueRef textlen = LLVMBuildSelect(b, LLVMBuildIsNull(b, nul, "no.nul"), len,
         LLVMBuildSub(b, LLVMBuildPtrToInt(b, nul, c->i64, "nul.i"),
             LLVMBuildPtrToInt(b, source, c->i64, "source.i"), "prefix"), "textlen");
-    LLVMBuildStore(b, LLVMBuildOr(b, LLVMConstInt(c->i64, ZAN_STRING_TAG << 32, 0), textlen, "word"),
-        LLVMBuildStructGEP2(b, node, raw, 4, "word.p"));
+    LLVMBuildStore(
+        b,
+        LLVMBuildOr(b,
+                    LLVMBuildShl(b,
+                                 LLVMBuildAnd(b, textlen, LLVMConstInt(c->i64, ZAN_STR_LEN_MASK, 0),
+                                              "len32"),
+                                 LLVMConstInt(c->i64, 32, 0), "len.hi"),
+                    LLVMConstInt(c->i64, 0xffffffffu, 0), "w0"),
+        LLVMBuildStructGEP2(b, node, raw, 3, "rc.p"));
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STR_LIT_W1, 0),
+                   LLVMBuildStructGEP2(b, node, raw, 4, "word.p"));
     LLVMValueRef text = LLVMBuildGEP2(b, c->i8, raw, &skip, 1, "text");
     LLVMTypeRef cp[] = { c->i8p, c->i8p, c->i64 }, cpty;
     LLVMValueRef memcpy_fn = embed_libc(g, "memcpy", c->i8p, cp, 3, &cpty);
@@ -648,19 +657,18 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, buf0, "nobuf"), alloc, ready);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    LLVMValueRef cap = LLVMConstInt(c->i64,
-        (unsigned long long)c->buf_cap + ZAN_OBJ_HDR_SIZE, 0);
+    LLVMValueRef cap = LLVMConstInt(c->i64, (unsigned long long)c->buf_cap + ZAN_STR_VBASE, 0);
     LLVMValueRef nb = LLVMBuildCall2(b, mal_ty, malloc_fn, &cap, 1, "nb");
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, nb, "failed"), oom, init);
 
     LLVMPositionBuilderAtEnd(b, init);
     /* The reusable borrowed buffer still needs a readable Zan string header. */
     LLVMValueRef hdr = LLVMBuildBitCast(b, nb, LLVMPointerType(c->i64, 0), "hdr");
-    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_SENTINEL_RC, 0), hdr);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STR_LIT_W0(ZAN_STR_LEN_UNKNOWN), 0), hdr);
     LLVMValueRef one = LLVMConstInt(c->i64, 1, 0);
     LLVMValueRef magic = LLVMBuildGEP2(b, c->i64, hdr, &one, 1, "magic");
-    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_MAGIC, 0), magic);
-    LLVMValueRef skip = LLVMConstInt(c->i64, ZAN_OBJ_HDR_SIZE, 0);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STR_LIT_W1, 0), magic);
+    LLVMValueRef skip = LLVMConstInt(c->i64, ZAN_STR_VBASE, 0);
     LLVMBuildStore(b, LLVMBuildGEP2(b, c->i8, nb, &skip, 1, "data"), c->gbuf);
     LLVMBuildBr(b, ready);
 
@@ -1048,11 +1056,9 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     LLVMSetLinkage(c.gbuf, LLVMInternalLinkage);
     LLVMTypeRef empty_fields[] = { i64, i64, LLVMArrayType(c.i8, 1) };
     LLVMTypeRef empty_ty = LLVMStructTypeInContext(g->ctx, empty_fields, 3, 0);
-    LLVMValueRef empty_vals[] = {
-        LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMConstInt(i64, ZAN_STR_HDR_WORD(0), 0),
-        LLVMConstStringInContext(g->ctx, "", 0, 0)
-    };
+    LLVMValueRef empty_vals[] = {LLVMConstInt(i64, ZAN_STR_LIT_W0(0), 0),
+                                 LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
+                                 LLVMConstStringInContext(g->ctx, "", 0, 0)};
     LLVMValueRef empty_gv = LLVMAddGlobal(g->mod, empty_ty, "zan.embed.empty");
     LLVMSetInitializer(empty_gv, LLVMConstNamedStruct(empty_ty, empty_vals, 3));
     LLVMSetGlobalConstant(empty_gv, 1);

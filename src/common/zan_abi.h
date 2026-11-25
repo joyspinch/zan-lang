@@ -6,28 +6,59 @@
 #include <stdint.h>
 
 
-/* ARC 头（2026-11-24 起）：引用计数是 32 位，住在 [p-12]——对象与字符串
- * 同址同宽，通用 retain/release 不必先分辨是哪一种。
- *   对象：[-16] 4 字节空位（分配时清零）| [-12] u32 rc | [-8] 站点/析构字
- *   字符串：[-12] u32 rc | [-8] (ZANS<<32)|len —— 串头实占 12 字节
- * 静态（immortal）对象/字面量仍按旧写法在 [-16] 放 i64 -1：小端下 [-12]
- * 的 u32 恰是 0xffffffff，即 ZAN_RC_IMMORTAL，静态数据布局不用改。
- * 字符串从 [-16] 起的 4 字节可能不属于它（--fast-alloc 的串页把串块排在
- * 4 mod 8 地址上，好让 [-8] 头字仍 8 字节对齐），故绝不能读写串的 [-16]；
- * 释放仍传 p-16（分配器认得这个"虚基址"）。 */
-#define ZAN_OBJ_HDR_SIZE  16
+/* ARC 头（2026-11-24 第二版，设计见 docs/OBJECT_LAYOUT.md）：引用计数是
+ * 32 位，住在 [p-8]——对象与字符串同址同宽，通用 retain/release 不必先
+ * 分辨是哪一种。[p-8] 的 u64 叫"头字"：
+ *   对象：  [-8] u32 rc | [-4] u32 tw          头 8 字节，块基址 p-8
+ *           头字 = (tw<<32)|rc；tw = bit 31 栈标记 | bit 30 对象标记 |
+ *           bit 29 前垫 8 字节（对齐 16 的类，块基址 p-16）| 站点号（bit 0..28）
+ *   字符串：[-12] u32 len | [-8] u32 rc | [-4] "ZANS"   头 12 字节
+ *           头字 = (ZANS<<32)|rc
+ *   数组：  不变；[-8] 是 ZAN_ARRAY_MAGIC、秩（1..4095）或数组描述符指针
+ * 对象标记让四种头字互不混淆：用户态指针高 32 位 < 0x8000，ZANS/数组魔数
+ * 的高 32 位解出的站点号（0x1a41xxxx）远超任何程序的站点数，按表长比界即
+ * 查不中。于是"头字高 32 位 == ZANS 即字符串""头字 < 0 即栈上提升对象"
+ * 两条判定对新旧代码都成立。静态（immortal）数据的 rc 是 0xffffffff。
+ * 字符串从 [-16] 起的 4 字节可能不属于它（串页把串块排在 4 mod 8 地址上，
+ * 好让 [-8] 头字仍 8 字节对齐），故绝不能读写串的 [-16]；释放串仍传
+ * p-16（分配器认得这个"虚基址"），释放对象传 p-8。 */
+#define ZAN_OBJ_HDR_SIZE 8
 #define ZAN_STR_HDR_SIZE  12
+#define ZAN_STR_VBASE 16 /* 串的虚基址 = p - 16（free 的实参） */
 
-#define ZAN_RC_OFF        (-12)
+#define ZAN_RC_OFF (-8)
 #define ZAN_RC_IMMORTAL   UINT32_C(0xffffffff)
-/* 新对象 [-16] 处的 64 位初值：低 32 位空位清零，高 32 位（即 [-12] 的 rc）= 1 */
-#define ZAN_OBJ_RC_INIT_WORD (UINT64_C(1) << 32)
 /* C 侧读对象/字符串 RC：有符号读出，immortal 读作 -1（与旧 i64 哨兵同口径） */
 #define ZAN_RC_PTR(obj)   ((uint32_t *)((char *)(obj) + ZAN_RC_OFF))
 #define ZAN_RC_LOAD(obj)  ((int64_t)(int32_t)*ZAN_RC_PTR(obj))
 
-#define ZAN_OBJ_SITE_OFF  (-8)
-#define ZAN_OBJ_STACK_FLAG     UINT64_C(0x8000000000000000) /* 栈上提升对象标记 (免 free) */
+/* 头字（u64）所在偏移；对象的 tw 是它的高 32 位 */
+#define ZAN_HDR_WORD_OFF (-8)
+#define ZAN_OBJ_TW_OFF (-4)
+#define ZAN_OBJ_TW_MARK UINT32_C(0x40000000)
+/* 对齐 16 的类（i128/decimal/SIMD 字段）：块前多垫 8 字节让 p 16 对齐，
+ * 块基址 = p-16；释放按这一位算基址 */
+#define ZAN_OBJ_TW_PAD16 UINT32_C(0x20000000)
+#define ZAN_OBJ_TW_SITE_MASK UINT32_C(0x1fffffff)
+#define ZAN_OBJ_STACK_FLAG UINT64_C(0x8000000000000000) /* 头字里的栈上提升标记 (免 free) */
+/* 新对象的头字：对象标记 + 站点号在高 32 位，rc = 1 */
+#define ZAN_OBJ_HDR_INIT(site)                                                                     \
+    ((((uint64_t)(ZAN_OBJ_TW_MARK | (uint32_t)(site))) << 32) | UINT64_C(1))
+/* 头字是不是对象头（去掉栈标记后看对象标记；字符串的 ZANS 也带这一位，先判串） */
+#define ZAN_HDR_IS_OBJ(word) ((((word) >> 32) & ZAN_OBJ_TW_MARK) != 0)
+/* 头字 → 站点号（去掉栈标记与对象标记） */
+#define ZAN_HDR_SITE(word) ((uint64_t)(((word) >> 32) & ZAN_OBJ_TW_SITE_MASK))
+
+/* 字符串长度：[-12] 的 u32；ZAN_STR_LEN_UNKNOWN 表示超 32 位、回退 strlen */
+#define ZAN_STR_LEN_OFF (-12)
+/* 静态字符串字面量/哨兵串的两个前缀 i64（从 p-16 起）：
+ *   W0 = (len<<32)|0xffffffff（[-16] 4 字节填充写全 1，[-12] len），
+ *   W1 = (ZANS<<32)|immortal rc。填充全 1 是静态串的可辨认前缀（分片常量
+ *   blob 据此收录），运行期没有代码读它。 */
+#define ZAN_STR_LIT_W0(len) ((((uint64_t)(len) & ZAN_STR_LEN_MASK) << 32) | UINT64_C(0xffffffff))
+#define ZAN_STR_LIT_W1 ((ZAN_STRING_TAG << 32) | UINT64_C(0xffffffff))
+/* 堆字符串的头字（[-8] u64）：ZANS 标签 + rc */
+#define ZAN_STR_TAG_WORD(rc) ((ZAN_STRING_TAG << 32) | ((uint64_t)(rc) & UINT64_C(0xffffffff)))
 
 #define ZAN_STRING_MAGIC       UINT64_C(0x5a414e5354524d47) /* "ZANSTRMG" */
 #define ZAN_STRING_SENTINEL_RC UINT64_C(0xffffffffffffffff)
@@ -35,8 +66,6 @@
 #define ZAN_STRING_TAG         UINT64_C(0x5a414e53)         /* "ZANS" */
 #define ZAN_STR_LEN_UNKNOWN    UINT64_C(0x54524d47)         /* "TRMG" */
 #define ZAN_STR_LEN_MASK       UINT64_C(0xffffffff)
-#define ZAN_STR_HDR_WORD(len)  (((ZAN_STRING_TAG) << 32) | \
-                                ((uint64_t)(len) & ZAN_STR_LEN_MASK))
 
 #define ZAN_ARRAY_MAGIC        UINT64_C(0x5a414e4152524159) /* "ZANARRAY" */
 

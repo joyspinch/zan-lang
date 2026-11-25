@@ -20,7 +20,12 @@ __declspec(dllimport) void __stdcall Sleep(unsigned long);
 extern void zan_rt_release_dyn(void *);
 extern int zan_rt_defer_pending(void);
 extern void zan_rt_defer_drain(void);
-typedef struct Object { uint64_t rc, descriptor; int remaining; } Object;
+/* [-8] 头字放描述符指针本身（无对象标记 = 数组式描述符指针，docs/OBJECT_LAYOUT.md）：
+ * release_dyn 经它取析构函数，且不把指针低半当 rc 走"计数 > 1"快路径 */
+typedef struct Object {
+    uint64_t descriptor;
+    int remaining;
+} Object;
 static void (*descriptor)(void *);
 static atomic_int phase;
 static int mode, stack_released, heap_released, failures;
@@ -44,8 +49,7 @@ static void wait_phase(int value) {
         yield_thread();
 }
 static Object object(int remaining, int stack) {
-    Object value = {1, (uintptr_t)&descriptor |
-        (stack ? ZAN_OBJ_STACK_FLAG : 0), remaining};
+    Object value = {(uintptr_t)&descriptor | (stack ? ZAN_OBJ_STACK_FLAG : 0), remaining};
     return value;
 }
 static void destructor(void *payload) {

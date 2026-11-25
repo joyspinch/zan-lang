@@ -470,7 +470,7 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     }
     LLVMBuildBr(g->builder, freebb);
     LLVMPositionBuilderAtEnd(g->builder, freebb);
-    LLVMValueRef freefn = get_arc_free_decl(g);
+    LLVMValueRef freefn = get_arc_free_obj_decl(g);
     zan_call2(g->builder, LLVMGlobalGetValueType(freefn), freefn, &rec, 1, "");
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, dec);

@@ -25,6 +25,7 @@
 |---|---|---|
 | [`ZAN_STANDARD.md`](ZAN_STANDARD.md) | 立项（2026-11-24） | 生产级语言标准：AI 写、机器验（S1–S33，P1–P5 路线图） |
 | [`GUI_REFACTOR.md`](GUI_REFACTOR.md) | 进行中（2026-11-22） | Zan.Gui 深度改造：类型化、唯一事实来源、拆包 |
+| [`OBJECT_LAYOUT.md`](OBJECT_LAYOUT.md) | 进行中（2026-11-24） | 对象头 16+8 → 8 字节：rc+站点号同字、vptr 按继承树条件化 |
 | [`BUILD_CACHE.md`](BUILD_CACHE.md) | 进行中（2026-11-24） | 构建缓存：阶段 1 LLVM 后端记忆化已落地；阶段 2 按来源分区 ThinLTO、阶段 3 前端缓存（B-ID227） |
 | [`GUI_CONTROL_CATALOG.md`](GUI_CONTROL_CATALOG.md) | 已落地（2026-11-23） | 编译器生成的控件清单；按 §7 下次涉及时并入规范后删除 |
 

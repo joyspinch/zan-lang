@@ -263,6 +263,21 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                        &g->fn_report_leaks, 1, "");
     }
 
+    if (g->desc_hdr && g->rt_live_register) {
+        /* 运行时 GC 走图/泄漏报告按站点号查描述符：登记模块的描述符表
+         * （表与表长在 zan_irgen_emit 收尾时定型，这里引用的是占位全局） */
+        LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef rdt_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                              (LLVMTypeRef[]){LLVMPointerType(i8p, 0), i64t}, 2, 0);
+        LLVMValueRef rdt_fn = LLVMGetNamedFunction(g->mod, "zan_rt_register_desc_table");
+        if (!rdt_fn) rdt_fn = LLVMAddFunction(g->mod, "zan_rt_register_desc_table", rdt_ty);
+        LLVMValueRef dcount = NULL;
+        LLVMValueRef dtbl = zan_desc_tbl_global(g, &dcount);
+        zan_call2(g->builder, rdt_ty, rdt_fn,
+                  (LLVMValueRef[]){dtbl, LLVMBuildLoad2(g->builder, i64t, dcount, "desc.cnt")}, 2,
+                  "");
+    }
     if (!g->desc_hdr && g->g_site_field_graphs) {
         LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -407,18 +422,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 (LLVMValueRef[]){ buf, cstr, len }, 3, "");
             LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &len, 1, "ma.ep");
             zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
-            LLVMTypeRef i64p = LLVMPointerType(i64t, 0);
-            LLVMValueRef fits = zan_icmp(g->builder, LLVMIntULE, len,
-                LLVMConstInt(i64t, ZAN_STR_LEN_MASK, 0), "ma.fits");
-            LLVMValueRef half = LLVMBuildSelect(g->builder, fits, len,
-                LLVMConstInt(i64t, ZAN_STR_LEN_UNKNOWN, 0), "ma.half");
-            LLVMValueRef word = LLVMBuildOr(g->builder,
-                LLVMConstInt(i64t, ZAN_STRING_TAG << 32, 0), half, "ma.hdr");
-            LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, buf,
-                &(LLVMValueRef){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
-                "ma.hdrp");
-            LLVMBuildStore(g->builder, word,
-                LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "ma.hdrip"));
+            emit_string_len_set(g, buf, len);
             LLVMValueRef elem = LLVMBuildGEP2(g->builder, i8ptr, arr, &iv, 1, "ma.ep.slot");
             zan_store_fit(g, buf, elem);
             zan_store_fit(g, iv1, lp);

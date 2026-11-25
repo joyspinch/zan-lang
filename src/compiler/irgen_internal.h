@@ -271,6 +271,7 @@ LLVMTypeRef arc_desc_type(zan_irgen_t *g);
 LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx);
 bool class_has_virtual_methods(zan_symbol_t *sym);
 int class_vptr_offset(zan_symbol_t *sym);
+void class_vptr_plan_compute(zan_irgen_t *g, zan_ast_node_t *unit);
 int count_virtual_methods(zan_symbol_t *sym);
 bool decl_is_explicit_layout(zan_symbol_t *sym);
 unsigned long di_align_up(unsigned long v, unsigned long a);
@@ -289,6 +290,15 @@ void zan_mark_nounwind(zan_irgen_t *g, LLVMValueRef v);
 /* 对象/字符串的 32 位 RC 槽地址：obj + ZAN_RC_OFF（见 zan_abi.h） */
 LLVMValueRef zan_rc_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
                         const char *name);
+/* 字符串长度槽（u32）地址：str + ZAN_STR_LEN_OFF */
+LLVMValueRef zan_str_len_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef str, const char *name);
+LLVMValueRef zan_hdr_word_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj, const char *name);
+LLVMValueRef zan_hdr_site(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word, const char *name);
+/* 默认（描述符）模式：头字 → 描述符指针（站点号越界 → null）；见 arc_tables.c */
+LLVMValueRef zan_hdr_desc(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word, const char *name);
+LLVMValueRef zan_desc_tbl_global(zan_irgen_t *g, LLVMValueRef *count_out);
+LLVMValueRef arc_class_site_val(zan_irgen_t *g, LLVMValueRef site_val, LLVMTypeRef st);
+void emit_desc_table(zan_irgen_t *g);
 LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty);
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap, LLVMValueRef v);
 LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name);
@@ -448,6 +458,9 @@ LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym, zan_ast_n
 LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym, zan_type_t **args, int argc, LLVMTypeRef *out_fn_type);
 zan_type_t * generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym, zan_ast_node_t *call, local_scope_t *locals);
 LLVMValueRef get_arc_free_decl(zan_irgen_t *g);
+LLVMValueRef get_arc_free_obj_decl(zan_irgen_t *g);
+LLVMValueRef get_arc_free_obj16_decl(zan_irgen_t *g);
+bool zan_class_needs_pad16(LLVMTypeRef st);
 LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type);
 LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type, int rect);
 LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst);

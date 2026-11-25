@@ -419,8 +419,8 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     LLVMSetUnnamedAddr(global, LLVMGlobalUnnamedAddr);
     unsigned char *blob = (unsigned char *)calloc(total, 1);
     if (!blob) return LLVMConstNull(LLVMPointerType(i8, 0));
-    memcpy(blob + 0, &((uint64_t){ ZAN_STRING_SENTINEL_RC }), 8);
-    memcpy(blob + 8, &((uint64_t){ ZAN_STR_HDR_WORD(text.len) }), 8);
+    memcpy(blob + 0, &((uint64_t){ZAN_STR_LIT_W0(text.len)}), 8);
+    memcpy(blob + 8, &((uint64_t){ZAN_STR_LIT_W1}), 8);
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
     bool obf = g->obfuscate_strings && text.len > 0;

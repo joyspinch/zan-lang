@@ -1,0 +1,110 @@
+// 8 字节对象头（[-8] u32 rc | [-4] u32 tw = 对象标记 | 站点号）与"vptr 槽按
+// 继承树"的钉子用例（docs/OBJECT_LAYOUT.md）：
+//   - 无多态的树（Pair、Base/Mid/Plain）不留 vptr 槽，字段从 +0 起；
+//   - 基类无多态、派生类实现接口时整棵树留槽，基类字段在派生实例上读写一致；
+//   - 对齐 16 的类（decimal 字段）前垫 8 字节，块基址 p-16；
+//   - object 槽里混放对象/字符串/数组，经 is/GetType/通用释放（release_dyn）；
+//   - 弱引用在对象释放时置空。
+using System;
+using System.Collections.Generic;
+
+class Pair {
+    public Pair l;
+    public Pair r;
+    public int v;
+    public Pair(Pair a, Pair b, int x) { l = a; r = b; v = x; }
+}
+
+class Base { public int a; public string s; }
+class Mid : Base { public long b; }
+class Plain : Base { public int z; }
+interface IShow { string Show(); }
+class Leaf : Mid, IShow {
+    public int c;
+    public string Show() { return "leaf " + a + " " + b + " " + c + " " + s; }
+}
+
+class Money {
+    public int tag;
+    public decimal amount;
+    public Money(decimal d, int t) { amount = d; tag = t; }
+}
+
+class Animal { public virtual string Name() { return "animal"; } }
+class Dog : Animal { public override string Name() { return "dog"; } }
+
+class Probe { public weak Pair target; }
+
+class P {
+    static Pair Make(int d) {
+        if (d == 0) return new Pair(null, null, 1);
+        return new Pair(Make(d - 1), Make(d - 1), d);
+    }
+
+    static int Count(Pair p) {
+        if (p == null) return 0;
+        return 1 + Count(p.l) + Count(p.r);
+    }
+
+    static void Watch(Probe p) {
+        Pair x = new Pair(null, null, 5);
+        p.target = x;
+        Console.WriteLine("weak live=" + (p.target != null) + " v=" + p.target.v);
+    }
+
+    static void Main() {
+        Pair t = Make(10);
+        Console.WriteLine("tree=" + Count(t));
+
+        Leaf lf = new Leaf();
+        lf.a = 1; lf.b = 2; lf.c = 3; lf.s = "x";
+        Base bb = lf;
+        IShow sh = lf;
+        Console.WriteLine(sh.Show());
+        Console.WriteLine("base.a=" + bb.a + " leaf=" + (bb is Leaf) + " mid=" + (bb is Mid)
+            + " show=" + (bb is IShow) + " plain=" + (bb is Plain));
+
+        Plain pl = new Plain();
+        pl.a = 9; pl.s = "p"; pl.z = 4;
+        Base pb = pl;
+        Console.WriteLine("plain " + pb.a + pb.s + pl.z + " " + (pb is Plain) + " " + (pb is Leaf));
+
+        object o = new Pair(null, null, 7);
+        object os = "str";
+        object oa = new int[3];
+        Console.WriteLine("o: " + (o is Pair) + " " + (o is Base) + " " + o.GetType().Name);
+        Console.WriteLine("os: " + (os is string) + " " + (os is Pair));
+        Console.WriteLine("oa: " + (oa is Pair));
+
+        List<object> mixed = new List<object>();
+        for (int i = 0; i < 200; i++) {
+            mixed.Add(new Pair(null, null, i));
+            mixed.Add("s" + i);
+            mixed.Add(new Money(1.5m, i));
+            mixed.Add(new int[i % 5 + 1]);
+            mixed.Add(lf);
+        }
+        int pairs = 0;
+        foreach (object m in mixed) { if (m is Pair) pairs++; }
+        Console.WriteLine("mixed=" + mixed.Count + " pairs=" + pairs);
+        mixed.Clear();
+
+        List<Money> bank = new List<Money>();
+        decimal sum = 0m;
+        for (int i = 0; i < 300; i++) {
+            Money m = new Money(1.25m * i, i);
+            bank.Add(m);
+        }
+        foreach (Money m in bank) { m.amount = m.amount + 0.5m; sum = sum + m.amount; }
+        Console.WriteLine("money sum=" + sum + " last tag=" + bank[299].tag);
+        bank.Clear();
+
+        Animal an = new Dog();
+        Console.WriteLine("animal=" + an.Name());
+
+        Probe probe = new Probe();
+        Watch(probe);
+        Console.WriteLine("weak cleared=" + (probe.target == null));
+        Console.WriteLine("done");
+    }
+}

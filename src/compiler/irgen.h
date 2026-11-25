@@ -470,6 +470,11 @@ struct zan_irgen {
     LLVMValueRef *desc_gv;
     int          desc_gv_cap;    /* capacity of desc_gv */
     bool         desc_hdr;
+    /* 默认模式的站点号 → 描述符表（docs/OBJECT_LAYOUT.md）：irgen 期间是
+     * 占位全局，zan_irgen_emit 收尾时按 desc_gv 定型（RAUW）。 */
+    LLVMValueRef g_desc_tbl;
+    LLVMValueRef g_desc_n;
+    bool desc_tbl_frozen;
     zan_str_intern_t **str_intern;
     int          str_intern_cap;
     bool         rt_guard_split;

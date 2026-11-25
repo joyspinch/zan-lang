@@ -10,12 +10,12 @@
 /* Text views of embedded bytes are borrowed for the lifetime of the image.
  * Raw decode/bytes pointers keep their original allocation and byte contract. */
 static unsigned char *zan_embed_string_alloc(size_t len) {
-    if (len > UINT32_MAX || len > SIZE_MAX - ZAN_OBJ_HDR_SIZE - 1) return NULL;
-    uint64_t *raw = (uint64_t *)malloc(ZAN_OBJ_HDR_SIZE + len + 1);
+    if (len > UINT32_MAX || len > SIZE_MAX - ZAN_STR_VBASE - 1) return NULL;
+    uint64_t *raw = (uint64_t *)malloc(ZAN_STR_VBASE + len + 1);
     if (!raw) return NULL;
-    raw[0] = ZAN_STRING_SENTINEL_RC;
-    raw[1] = ZAN_STR_HDR_WORD(len);
-    unsigned char *data = (unsigned char *)raw + ZAN_OBJ_HDR_SIZE;
+    raw[0] = ZAN_STR_LIT_W0(len);
+    raw[1] = ZAN_STR_LIT_W1;
+    unsigned char *data = (unsigned char *)raw + ZAN_STR_VBASE;
     data[len] = 0;
     return data;
 }
@@ -24,7 +24,7 @@ static const char *zan_embed_string_empty(void) {
     static const struct {
         uint64_t rc, word;
         char data[1];
-    } empty = { ZAN_STRING_SENTINEL_RC, ZAN_STR_HDR_WORD(0), { 0 } };
+    } empty = {ZAN_STR_LIT_W0(0), ZAN_STR_LIT_W1, {0}};
     return empty.data;
 }
 
@@ -61,7 +61,7 @@ static const char *zan_embed_string_view(const unsigned char *source, uint64_t l
     if (len) {
         memcpy(text, source, (size_t)len);
         const unsigned char *nul = (const unsigned char *)memchr(source, 0, (size_t)len);
-        ((uint64_t *)text)[-1] = ZAN_STR_HDR_WORD(nul ? (size_t)(nul - source) : len);
+        ((uint32_t *)(text + ZAN_STR_LEN_OFF))[0] = (uint32_t)(nul ? (size_t)(nul - source) : len);
     }
     entry->source = source;
     entry->len = len;

@@ -798,7 +798,7 @@ LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMPositionBuilderAtEnd(b, relel);
     LLVMValueRef data = arr;
     if (rect) {
-        LLVMValueRef rkoff = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef rkoff = LLVMConstInt(i64, (unsigned long long)ZAN_HDR_WORD_OFF, 1);
         LLVMValueRef rank = LLVMBuildLoad2(b, i64,
             LLVMBuildBitCast(b, LLVMBuildGEP2(b, i8, arr, &rkoff, 1, "rankp"),
                              LLVMPointerType(i64, 0), "rankip"), "rank");
@@ -854,15 +854,26 @@ static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v)
         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
         fn, &a, 1, "");
 }
-LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
-    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, "__zan_arc_free");
+/* mode 0：通用（object 槽里的字符串、前垫位都看头字）；1：已知对象、块基址
+ * p-8；2：已知前垫过的对齐 16 对象、块基址 p-16 */
+static LLVMValueRef build_arc_free_decl(zan_irgen_t *g, int mode);
+/* 通用 release（zan_rt_release）用：object 槽里的字符串也会走到这里 */
+LLVMValueRef get_arc_free_decl(zan_irgen_t *g) { return build_arc_free_decl(g, 0); }
+/* 类/集合/闭包释放函数用：实参必是对象，基址静态已知 */
+LLVMValueRef get_arc_free_obj_decl(zan_irgen_t *g) { return build_arc_free_decl(g, 1); }
+LLVMValueRef get_arc_free_obj16_decl(zan_irgen_t *g) { return build_arc_free_decl(g, 2); }
+static LLVMValueRef build_arc_free_decl(zan_irgen_t *g, int mode) {
+    const char *fname = mode == 0   ? "__zan_arc_free"
+                        : mode == 1 ? "__zan_arc_free_obj"
+                                    : "__zan_arc_free_obj16";
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, fname);
     if (existing) return existing;
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
     LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
-    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_arc_free", ft);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, fname, ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     zan_mark_nounwind(g, fn);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(b);
@@ -872,13 +883,19 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, entry);
     g->current_fn = fn;
     LLVMValueRef obj = LLVMGetParam(fn, 0);
-    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
-    LLVMValueRef site_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg8, 1, "sptr");
-    LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
-    LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
-    LLVMValueRef is_stack = zan_icmp(b, LLVMIntNE,
-        zan_and(b, site, LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stkbit"),
-        LLVMConstInt(i64, 0, 0), "is_stack");
+    LLVMValueRef word = LLVMBuildLoad2(b, i64, zan_hdr_word_ptr(g, b, obj, "sptr"), "hdrword");
+    LLVMValueRef is_stack =
+        zan_icmp(b, LLVMIntNE, zan_and(b, word, LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stkbit"),
+                 LLVMConstInt(i64, 0, 0), "is_stack");
+    /* 通用 release 也会把装在 object 槽里的字符串送到这里：串的块基址是
+     * p-16（虚基址），对象是 p-8，且串没有站点号。 */
+    LLVMValueRef is_str =
+        mode == 0
+            ? zan_icmp(b, LLVMIntEQ, LLVMBuildLShr(b, word, LLVMConstInt(i64, 32, 0), "hdr.tag"),
+                       LLVMConstInt(i64, ZAN_STRING_TAG, 0), "is_str")
+            : LLVMConstInt(LLVMInt1TypeInContext(c), 0, 0);
+    LLVMValueRef site = LLVMBuildSelect(b, is_str, LLVMConstInt(i64, 0, 0),
+                                        zan_hdr_site(g, b, word, "site.n"), "site");
     LLVMBasicBlockRef do_free_bb = LLVMAppendBasicBlockInContext(c, fn, "do_free");
     LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(c, fn, "ret");
     LLVMBuildCondBr(b, is_stack, ret_bb, do_free_bb);
@@ -901,9 +918,20 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         emit_arc_quarantine(g, obj, zan_rc_ptr(g, b, obj, "rcp"),
                             LLVMInt32TypeInContext(c));
     } else {
-        /* 释放传虚基址 obj-16（对象的真块起点；串页的串分配器也认它） */
-        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-(long long)ZAN_OBJ_HDR_SIZE, 1);
-        LLVMValueRef header_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "hdr");
+        /* 对象传块基址 obj-8（前垫过的对齐 16 类是 obj-16）；字符串传虚基址
+         * obj-16（串页分配器认它） */
+        LLVMValueRef padded =
+            mode == 0
+                ? zan_icmp(b, LLVMIntNE,
+                           zan_and(b, word, LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_PAD16 << 32, 0),
+                                   "pad16"),
+                           LLVMConstInt(i64, 0, 0), "padded")
+                : LLVMConstInt(LLVMInt1TypeInContext(c), mode == 2, 0);
+        LLVMValueRef hoff = LLVMBuildSelect(
+            b, zan_or(b, is_str, padded, "base16"),
+            LLVMConstInt(i64, (unsigned long long)-(long long)ZAN_STR_VBASE, 1),
+            LLVMConstInt(i64, (unsigned long long)-(long long)ZAN_OBJ_HDR_SIZE, 1), "hoff");
+        LLVMValueRef header_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &hoff, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
         zan_call2(b, free_fn_type, g->fn_free, &header_ptr, 1, "");
     }

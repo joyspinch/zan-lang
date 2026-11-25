@@ -106,7 +106,9 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBuildBr(b, freebb);
     LLVMPositionBuilderAtEnd(b, freebb);
-    LLVMValueRef freefn = get_arc_free_decl(g);
+    LLVMValueRef freefn =
+        ((sym->kind == SYM_CLASS && zan_class_needs_pad16(structT)) ? get_arc_free_obj16_decl(g)
+                                                                    : get_arc_free_obj_decl(g));
     zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
     LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, dorel);
@@ -174,7 +176,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBuildBr(b, freebb);
     LLVMPositionBuilderAtEnd(b, freebb);
-    LLVMValueRef freefn = get_arc_free_decl(g);
+    LLVMValueRef freefn = get_arc_free_obj_decl(g);
     zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
     LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, dorel);
@@ -241,6 +243,79 @@ void emit_all_class_releases(zan_irgen_t *g) {
         if (fn) build_class_release_body(g, sym, NULL, fn);
     }
 }
+/* ---- 站点号 → 描述符表（默认模式）-------------------------------------
+ * 对象头字的高 32 位是 tw = 对象标记 | 站点号（docs/OBJECT_LAYOUT.md）。
+ * 默认模式下按站点号查 __zan_desc_tbl 得描述符；表在 irgen 期间是占位，
+ * 收尾时 emit_desc_table 按 desc_gv 定型。没有对象标记（字符串、数组描述符
+ * 指针、soft scratch 前缀）或站点号越界的头字一律查出 null。 */
+static void desc_tbl_ensure(zan_irgen_t *g) {
+    if (g->g_desc_tbl) return;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    /* 占位是外部声明（无初值）：发布模式的逐函数压缩器会提前优化已完成的
+     * 函数，占位若是带初值的常量，表长/表项会被折成占位值（表长 1 → 全部
+     * 越界）。定型时换成内部常量并 RAUW。 */
+    g->g_desc_tbl = LLVMAddGlobal(g->mod, LLVMArrayType(i8p, 1), "__zan_desc_tbl.ph");
+    g->g_desc_n = LLVMAddGlobal(g->mod, i64t, "__zan_desc_n.ph");
+}
+LLVMValueRef zan_desc_tbl_global(zan_irgen_t *g, LLVMValueRef *count_out) {
+    desc_tbl_ensure(g);
+    if (count_out) *count_out = g->g_desc_n;
+    return g->g_desc_tbl;
+}
+LLVMValueRef zan_hdr_desc(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word, const char *name) {
+    desc_tbl_ensure(g);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef tw = LLVMBuildLShr(b, word, LLVMConstInt(i64t, 32, 0), "desc.tw");
+    LLVMValueRef site =
+        LLVMBuildAnd(b, tw, LLVMConstInt(i64t, ZAN_OBJ_TW_SITE_MASK, 0), "desc.site");
+    LLVMValueRef is_obj = LLVMBuildICmp(
+        b, LLVMIntNE, LLVMBuildAnd(b, tw, LLVMConstInt(i64t, ZAN_OBJ_TW_MARK, 0), "desc.mark"),
+        LLVMConstInt(i64t, 0, 0), "desc.isobj");
+    LLVMValueRef n = LLVMBuildLoad2(b, i64t, g->g_desc_n, "desc.n");
+    LLVMValueRef ok =
+        LLVMBuildAnd(b, is_obj, LLVMBuildICmp(b, LLVMIntULT, site, n, "desc.inrange"), "desc.ok");
+    LLVMValueRef idx = LLVMBuildSelect(b, ok, site, LLVMConstInt(i64t, 0, 0), "desc.idx");
+    LLVMValueRef slot = LLVMBuildGEP2(b, i8p, g->g_desc_tbl, &idx, 1, "desc.slot");
+    return LLVMBuildLoad2(b, i8p, slot, name);
+}
+void emit_desc_table(zan_irgen_t *g) {
+    if (!g->desc_hdr) return;
+    desc_tbl_ensure(g);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    unsigned n = g->leak_site_count > 0 ? (unsigned)g->leak_site_count : 1u;
+    LLVMValueRef *elems = (LLVMValueRef *)calloc(n, sizeof(LLVMValueRef));
+    if (!elems) {
+        fprintf(stderr, "zanc: out of memory building the ARC descriptor table\n");
+        exit(1);
+    }
+    for (unsigned i = 0; i < n; i++) {
+        LLVMValueRef dg = (g->desc_gv && (int)i < g->leak_site_count) ? g->desc_gv[i] : NULL;
+        elems[i] = dg ? LLVMConstBitCast(dg, i8p) : LLVMConstNull(i8p);
+    }
+    elems[0] = LLVMConstNull(i8p); /* 0 号站点是哨兵：未跟踪对象 */
+    LLVMTypeRef at = LLVMArrayType(i8p, n);
+    LLVMValueRef newg = LLVMAddGlobal(g->mod, at, "__zan_desc_tbl.final");
+    LLVMSetLinkage(newg, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(newg, 1);
+    LLVMSetInitializer(newg, LLVMConstArray(i8p, elems, n));
+    free(elems);
+    LLVMReplaceAllUsesWith(g->g_desc_tbl, newg);
+    LLVMDeleteGlobal(g->g_desc_tbl);
+    LLVMSetValueName2(newg, "__zan_desc_tbl", strlen("__zan_desc_tbl"));
+    g->g_desc_tbl = newg;
+    LLVMValueRef newn = LLVMAddGlobal(g->mod, i64t, "__zan_desc_n");
+    LLVMSetLinkage(newn, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(newn, 1);
+    LLVMSetInitializer(newn, LLVMConstInt(i64t, n, 0));
+    LLVMReplaceAllUsesWith(g->g_desc_n, newn);
+    LLVMDeleteGlobal(g->g_desc_n);
+    g->g_desc_n = newn;
+    g->desc_tbl_frozen = true;
+}
+
 void emit_site_live_tables(zan_irgen_t *g) {
     if (g->desc_hdr || !g->g_site_live || !g->g_site_count) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
