@@ -537,6 +537,7 @@ typedef struct {
 } zgl_tile_slot;
 
 #define ZGL_TILES 4096
+#define ZGL_TILES_MASK (ZGL_TILES - 1)
 static zgl_tile_slot g_zgl_tiles[ZGL_TILES];
 static struct { int x, y, row_h; } g_zgl_shelf[2];   /* [0] = R8, [1] = RGBA8 */
 
@@ -548,7 +549,7 @@ static void zgl_atlas_reset(void) {
 static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     if (!tile || tile->w <= 0 || tile->h <= 0 || !tile->cov) return NULL;
     if (tile->w > ZGL_ATLAS_DIM || tile->h > ZGL_ATLAS_DIM) return NULL;
-    zgl_tile_slot *slot = &g_zgl_tiles[tile->id % ZGL_TILES];
+    zgl_tile_slot *slot = &g_zgl_tiles[tile->id & ZGL_TILES_MASK];
     if (slot->id == tile->id && slot->rev == tile->rev &&
         slot->w == tile->w && slot->h == tile->h) {
         return slot;
@@ -574,7 +575,10 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     g_zgl_shelf[shelf].x += tile->w;
     if (tile->h > g_zgl_shelf[shelf].row_h) g_zgl_shelf[shelf].row_h = tile->h;
 
-    zgl_flush();
+    /* Shelf allocation is strictly monotonic until zgl_atlas_reset() (which already
+     * flushes), so this TexSubImage2D writes into disjoint unused texels and does not
+     * need to break the active text draw batch. */
+    gl.ActiveTexture(ZGL_TEXTURE0);
     gl.BindTexture(ZGL_TEXTURE_2D, shelf ? g_zgl.atlas4 : g_zgl.atlas1);
     gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, slot->x, slot->y, slot->w, slot->h,
                      shelf ? ZGL_BGRA : ZGL_RED, ZGL_UNSIGNED_BYTE, tile->cov);
@@ -586,25 +590,25 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     if (!zgl_begin(s, ZGL_MODE_TEXT)) { cpu_glyph_run(s, run); return; }
     u32 color = run->color;
     if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;
+    const float inv_dim = 1.0f / (float)ZGL_ATLAS_DIM;
     for (int i = 0; i < run->count; i++) {
         const zan_glyph_tile *tile = run->items[i].tile;
         zgl_tile_slot *slot = zgl_tile_upload(tile);
         if (!slot) continue;
-        if (!zgl_begin(s, ZGL_MODE_TEXT)) return;
         zgl_quad q;
         memset(&q, 0, sizeof(q));
         q.kind = (tile->flags & ZAN_TILE_RGBA) ? ZGL_K_TEXTRGBA
                : (tile->bpp == 4) ? ZGL_K_TEXT4 : ZGL_K_TEXT1;
         float x0 = (float)run->items[i].x, y0 = (float)run->items[i].y;
         float x1 = x0 + (float)tile->w, y1 = y0 + (float)tile->h;
-        q.cx = (x0 + x1) / 2.0f;
-        q.cy = (y0 + y1) / 2.0f;
-        q.hw = (x1 - x0) / 2.0f;
-        q.hh = (y1 - y0) / 2.0f;
-        q.u0 = (float)slot->x / (float)ZGL_ATLAS_DIM;
-        q.v0 = (float)slot->y / (float)ZGL_ATLAS_DIM;
-        q.u1 = (float)(slot->x + slot->w) / (float)ZGL_ATLAS_DIM;
-        q.v1 = (float)(slot->y + slot->h) / (float)ZGL_ATLAS_DIM;
+        q.cx = (x0 + x1) * 0.5f;
+        q.cy = (y0 + y1) * 0.5f;
+        q.hw = (x1 - x0) * 0.5f;
+        q.hh = (y1 - y0) * 0.5f;
+        q.u0 = (float)slot->x * inv_dim;
+        q.v0 = (float)slot->y * inv_dim;
+        q.u1 = (float)(slot->x + slot->w) * inv_dim;
+        q.v1 = (float)(slot->y + slot->h) * inv_dim;
         zgl_color(q.col0, color, 0);
         zgl_push(s, &q, x0, y0, x1, y1);
     }
@@ -878,9 +882,9 @@ static zgl_uint zgl_bitmap_tex(const zan_bitmap *img) {
         if (victim < 0) break;
         zgl_bitmap_drop(victim);
     }
-    zgl_flush();
     if (!zan_gl_ctx_make_current()) return 0;
     zgl_uint tex = 0;
+    gl.ActiveTexture(ZGL_TEXTURE0);
     gl.GenTextures(1, &tex);
     gl.BindTexture(ZGL_TEXTURE_2D, tex);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);

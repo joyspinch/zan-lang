@@ -56,10 +56,3 @@ static void zan_shape_fill_rect(zan_surface_t *s, int x, int y, int w, int h,
     if (initial) zan_initial_fill_rect(s, x, y, w, h, c);
     else cpu_fill_rect(s, x, y, w, h, c);
 }
-
-static void zan_shape_fill_pixel(zan_surface_t *s, int x, int y, u32 c,
-                                 int coverage, int initial) {
-    if (initial) zan_initial_fill_pixel(s, x, y, c, coverage);
-    else if (coverage >= 255) set_pixel(s, x, y, c);
-    else set_pixel_aa(s, x, y, c, coverage);
-}

@@ -56,22 +56,60 @@ static void zan_shape_fill_round(zan_surface_t *s, int x, int y, int w, int h,
   int zx[4] = {ix, xr, ix, xr};
   int zy[4] = {iy, iy, yb, yb};
   int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
+  double rout = (double)r + 0.5;
+  double rout2 = rout * rout;
+  double rin = (double)r - 0.5;
+  double rin2 = rin > 0.0 ? rin * rin : -1.0;
+  u32 sa = (c >> 24) & 0xFFu;
+  u32 rgb = c & 0x00FFFFFFu;
   for (int ci = 0; ci < 4; ci++) {
     if (!(m & bit[ci])) {
       zan_shape_fill_rect(s, zx[ci], zy[ci], r, r, c, initial);
       continue;
     }
+    int cx0 = clamp_i(zx[ci], s->clip_x0, s->clip_x1);
+    int cy0 = clamp_i(zy[ci], s->clip_y0, s->clip_y1);
+    int cx1 = clamp_i(zx[ci] + r, s->clip_x0, s->clip_x1);
+    int cy1 = clamp_i(zy[ci] + r, s->clip_y0, s->clip_y1);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      continue;
     double ccx = cc[ci][0], ccy = cc[ci][1];
-    for (int py = zy[ci]; py < zy[ci] + r; py++) {
-      for (int px = zx[ci]; px < zx[ci] + r; px++) {
+    for (int py = cy0; py < cy1; py++) {
+      double ddy = (double)py + 0.5 - ccy;
+      double ddy2 = ddy * ddy;
+      if (ddy2 >= rout2)
+        continue;
+      u32 *row = s->pixels + py * s->stride;
+      for (int px = cx0; px < cx1; px++) {
         double ddx = (double)px + 0.5 - ccx;
-        double ddy = (double)py + 0.5 - ccy;
-        double dist = sqrt(ddx * ddx + ddy * ddy);
-        double cov = (double)r - dist + 0.5;
-        if (cov >= 1.0)
-          zan_shape_fill_pixel(s, px, py, c, 255, initial);
-        else if (cov > 0.0)
-          zan_shape_fill_pixel(s, px, py, c, (int)(cov * 255.0), initial);
+        double d2 = ddx * ddx + ddy2;
+        if (d2 >= rout2)
+          continue;
+        if (d2 <= rin2) {
+          if (initial)
+            zan_initial_fill_pixel(s, px, py, c, 255);
+          else
+            row[px] = blend_over(row[px], c);
+          continue;
+        }
+        double cov = (double)r - sqrt(d2) + 0.5;
+        if (cov >= 1.0) {
+          if (initial)
+            zan_initial_fill_pixel(s, px, py, c, 255);
+          else
+            row[px] = blend_over(row[px], c);
+        } else if (cov > 0.0) {
+          int cov_i = (int)(cov * 255.0);
+          if (cov_i > 0) {
+            if (initial) {
+              zan_initial_fill_pixel(s, px, py, c, cov_i);
+            } else {
+              u32 a = (sa * (u32)cov_i) / 255u;
+              if (a)
+                row[px] = blend_over(row[px], (a << 24) | rgb);
+            }
+          }
+        }
       }
     }
   }
@@ -287,6 +325,16 @@ static void cpu_draw_round(zan_surface_t *s, int x, int y, int w, int h,
   int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
   int hx[4] = {ix, xr, ix, xr};
   double rin = (double)r - (double)th;
+  double rout = (double)r + 0.5;
+  double rout2 = rout * rout;
+  double rin_lo = rin - 0.5;
+  double rin_lo2 = rin_lo > 0.0 ? rin_lo * rin_lo : -1.0;
+  double solid_hi = (double)r - 0.5;
+  double solid_lo = rin + 0.5;
+  double solid_hi2 = solid_hi > solid_lo ? solid_hi * solid_hi : -1.0;
+  double solid_lo2 = solid_hi > solid_lo ? solid_lo * solid_lo : 1e30;
+  u32 sa = (c >> 24) & 0xFFu;
+  u32 rgb = c & 0x00FFFFFFu;
   for (int ci = 0; ci < 4; ci++) {
     if (!(m & bit[ci])) {
       int cy = (ci < 2) ? zy[ci] : zy[ci] + r - th;
@@ -295,21 +343,44 @@ static void cpu_draw_round(zan_surface_t *s, int x, int y, int w, int h,
       cpu_fill_rect(s, cx, zy[ci], th, r, c);
       continue;
     }
+    int cx0 = clamp_i(zx[ci], s->clip_x0, s->clip_x1);
+    int cy0 = clamp_i(zy[ci], s->clip_y0, s->clip_y1);
+    int cx1 = clamp_i(zx[ci] + r, s->clip_x0, s->clip_x1);
+    int cy1 = clamp_i(zy[ci] + r, s->clip_y0, s->clip_y1);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      continue;
     double ccx = cc[ci][0], ccy = cc[ci][1];
-    for (int py = zy[ci]; py < zy[ci] + r; py++) {
-      for (int px = zx[ci]; px < zx[ci] + r; px++) {
+    for (int py = cy0; py < cy1; py++) {
+      double ddy = (double)py + 0.5 - ccy;
+      double ddy2 = ddy * ddy;
+      if (ddy2 >= rout2)
+        continue;
+      u32 *row = s->pixels + py * s->stride;
+      for (int px = cx0; px < cx1; px++) {
         double ddx = (double)px + 0.5 - ccx;
-        double ddy = (double)py + 0.5 - ccy;
-        double dist = sqrt(ddx * ddx + ddy * ddy);
-        double outerCov = (double)r + 0.5 - dist;
-        double innerCov = dist - (rin - 0.5);
+        double d2 = ddx * ddx + ddy2;
+        if (d2 >= rout2 || d2 <= rin_lo2)
+          continue;
+        if (d2 >= solid_lo2 && d2 <= solid_hi2) {
+          row[px] = blend_over(row[px], c);
+          continue;
+        }
+        double dist = sqrt(d2);
+        double outerCov = rout - dist;
+        double innerCov = dist - rin_lo;
         double cov = outerCov < innerCov ? outerCov : innerCov;
         if (cov <= 0.0)
           continue;
-        if (cov >= 1.0)
-          set_pixel(s, px, py, c);
-        else
-          set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+        if (cov >= 1.0) {
+          row[px] = blend_over(row[px], c);
+        } else {
+          int cov_i = (int)(cov * 255.0);
+          if (cov_i > 0) {
+            u32 a = (sa * (u32)cov_i) / 255u;
+            if (a)
+              row[px] = blend_over(row[px], (a << 24) | rgb);
+          }
+        }
       }
     }
   }
@@ -590,6 +661,10 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
   double rin2 = rin * rin, rout2 = rout * rout;
 
   ZAN_STAT(g_st_round, (long long)(2 * r + 3) * (long long)(2 * r + 3));
+  u32 sa = (c >> 24) & 0xFFu;
+  if (sa == 0)
+    return;
+  u32 rgb = c & 0x00FFFFFFu;
   int ext = r + 2;
   int ylo = cy - ext, yhi = cy + ext;
   if (ylo < s->clip_y0)
@@ -602,29 +677,70 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
     if (wy2 > rout2)
       continue;
     u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
-    double hs = (rin2 > wy2) ? sqrt(rin2 - wy2) : -1.0;
-    int L = cx + (int)ceil(-hs - 0.5);
-    int Rr = cx + (int)floor(hs - 0.5);
-    if (L < cx - ext)
-      L = cx - ext;
-    if (Rr > cx + ext)
-      Rr = cx + ext;
-    int xlo = cx - ext, xhi = cx + ext;
+    double out_hs = sqrt(rout2 - wy2);
+    int xlo = cx + (int)floor(-out_hs - 0.5);
+    int xhi = cx + (int)ceil(out_hs - 0.5);
+    if (xlo < cx - ext)
+      xlo = cx - ext;
+    if (xhi > cx + ext)
+      xhi = cx + ext;
     if (xlo < s->clip_x0)
       xlo = s->clip_x0;
     if (xhi >= s->clip_x1)
       xhi = s->clip_x1 - 1;
-    for (int px = xlo; px <= xhi; px++) {
-      if (px >= L && px <= Rr) {
-        row[px] = blend_over(row[px], c);
+    if (xlo > xhi)
+      continue;
+
+    if (rin2 > wy2) {
+      double hs = sqrt(rin2 - wy2);
+      int L = cx + (int)ceil(-hs - 0.5);
+      int Rr = cx + (int)floor(hs - 0.5);
+      int sL = L > xlo ? L : xlo;
+      int sR = Rr < xhi ? Rr : xhi;
+      if (sL <= sR) {
+        for (int px = xlo; px < sL; px++) {
+          double wx = (double)px + 0.5 - (double)cx;
+          double cov = rout - sqrt(wx * wx + wy2);
+          if (cov > 0.0) {
+            int cov_i = (int)(cov * 255.0);
+            if (cov_i > 0) {
+              u32 a = (sa * (u32)cov_i) / 255u;
+              if (a)
+                row[px] = blend_over(row[px], (a << 24) | rgb);
+            }
+          }
+        }
+        shadow_fill_span(row + sL, sR - sL + 1, c);
+        for (int px = sR + 1; px <= xhi; px++) {
+          double wx = (double)px + 0.5 - (double)cx;
+          double cov = rout - sqrt(wx * wx + wy2);
+          if (cov > 0.0) {
+            int cov_i = (int)(cov * 255.0);
+            if (cov_i > 0) {
+              u32 a = (sa * (u32)cov_i) / 255u;
+              if (a)
+                row[px] = blend_over(row[px], (a << 24) | rgb);
+            }
+          }
+        }
         continue;
       }
+    }
+    for (int px = xlo; px <= xhi; px++) {
       double wx = (double)px + 0.5 - (double)cx;
-      double dist = sqrt(wx * wx + wy2);
-      double cov = rout - dist;
+      double cov = rout - sqrt(wx * wx + wy2);
       if (cov <= 0.0)
         continue;
-      set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+      if (cov >= 1.0) {
+        row[px] = blend_over(row[px], c);
+      } else {
+        int cov_i = (int)(cov * 255.0);
+        if (cov_i > 0) {
+          u32 a = (sa * (u32)cov_i) / 255u;
+          if (a)
+            row[px] = blend_over(row[px], (a << 24) | rgb);
+        }
+      }
     }
   }
 }

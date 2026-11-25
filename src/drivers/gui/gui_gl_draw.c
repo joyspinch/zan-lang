@@ -2,10 +2,13 @@
 
 static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     if (w <= 0 || h <= 0) return;
-    if (!zgl_begin(s, ZGL_MODE_REPLACE)) { cpu_clear_rect(s, x, y, w, h, c); return; }
+    int opaque = (((c >> 24) & 0xFF) == 255);
+    zgl_mode want = (opaque && g_zgl.count && g_zgl.target == s && g_zgl.mode == ZGL_MODE_BLEND)
+                    ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE;
+    if (!zgl_begin(s, want)) { cpu_clear_rect(s, x, y, w, h, c); return; }
     zgl_target *t = zgl_target_of(s);
     if (t) {
-        if (((c >> 24) & 0xFF) < 255) {
+        if (!opaque) {
             t->opaque_dst = 0;
         } else if (x <= 0 && y <= 0 && x + w >= s->width && y + h >= s->height
                    && s->clip_x0 <= 0 && s->clip_y0 <= 0
@@ -72,8 +75,9 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
 
 static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 top, u32 bottom) {
-    int rounded = (radius > 0 && (corners & 15) != 0);
-    if (!zgl_begin(s, rounded ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE)) {
+    /* opaque=1 forces src.a=1.0, so ZGL_MODE_BLEND produces bit-identical output
+     * to ZGL_MODE_REPLACE while preserving batching with neighboring primitives. */
+    if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         cpu_fill_vgrad(s, x, y, w, h, radius, corners, top, bottom); return;
     }
     zgl_rect_quad(s, x, y, w, h, radius, corners, 0, ZAN_GRAD_VERTICAL,

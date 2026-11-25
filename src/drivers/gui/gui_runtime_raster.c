@@ -93,6 +93,9 @@ static void cpu_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
   ZAN_STAT(g_st_grad, (long long)rw * (long long)rh);
   int tr = (ct >> 16) & 0xFF, tg = (ct >> 8) & 0xFF, tb = ct & 0xFF;
   int mr = (cb >> 16) & 0xFF, mg = (cb >> 8) & 0xFF, mb = cb & 0xFF;
+  int lx1 = r > 0 ? clamp_i(x + r, x0, x1) : x0;
+  int rx0 = r > 0 ? clamp_i(x + w - r, lx1, x1) : x1;
+  int mid_w = rx0 - lx1;
   for (int py = y0; py < y1; py++) {
     int num = py - y;
     if (num < 0)
@@ -104,13 +107,22 @@ static void cpu_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
     int bb = tb + (mb - tb) * num / denom;
     u32 c = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
     u32 *row = s->pixels + py * s->stride;
-    if (r <= 0) {
-      for (int px = x0; px < x1; px++)
-        row[px] = c;
+    int j = py - y;
+    if (r <= 0 || (j >= r && j < h - r)) {
+      fill_run_const(row + x0, rw, c);
       continue;
     }
-    for (int px = x0; px < x1; px++) {
-      int cov = zan_round_cov(px - x, py - y, w, h, r, m);
+    for (int px = x0; px < lx1; px++) {
+      int cov = zan_round_cov(px - x, j, w, h, r, m);
+      if (cov >= 255)
+        row[px] = c;
+      else if (cov > 0)
+        set_pixel_aa(s, px, py, c, cov);
+    }
+    if (mid_w > 0)
+      fill_run_const(row + lx1, mid_w, c);
+    for (int px = rx0; px < x1; px++) {
+      int cov = zan_round_cov(px - x, j, w, h, r, m);
       if (cov >= 255)
         row[px] = c;
       else if (cov > 0)
@@ -192,34 +204,178 @@ static void cpu_fill_grad(zan_surface_t *s, int x, int y, int w, int h,
     span = 1;
   int denom = span > 1 ? span - 1 : 1;
   ZAN_STAT(g_st_grad, (long long)(x1 - x0) * (long long)(y1 - y0));
-  for (int py = y0; py < y1; py++) {
-    u32 *row = s->pixels + py * s->stride;
-    u32 c = 0;
-    if (d == 0) {
-      c = grad_sample(cf, cv, ct, clamp_i(py - y, 0, denom) * 1000 / denom);
+  int lx1 = r > 0 ? clamp_i(x + r, x0, x1) : x0;
+  int rx0 = r > 0 ? clamp_i(x + w - r, lx1, x1) : x1;
+  int mid_w = rx0 - lx1;
+
+  if (d == 0) {
+    for (int py = y0; py < y1; py++) {
+      u32 *row = s->pixels + py * s->stride;
       int j = py - y;
+      u32 c = grad_sample(cf, cv, ct, clamp_i(j, 0, denom) * 1000 / denom);
+      if ((c >> 24) == 0)
+        continue;
       if (r <= 0 || (j >= r && j < h - r)) {
         blend_run_const(row + x0, x1 - x0, c);
         continue;
       }
-    }
-    for (int px = x0; px < x1; px++) {
-      if (d != 0) {
-        int i = px - x;
-        int pos = i;
-        if (d == 2)
-          pos = i + (py - y);
-        else if (d == 3)
-          pos = (w - 1 - i) + (py - y);
-        c = grad_sample(cf, cv, ct, clamp_i(pos, 0, denom) * 1000 / denom);
+      for (int px = x0; px < lx1; px++) {
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
       }
-      int cov = r <= 0 ? 255 : zan_round_cov(px - x, py - y, w, h, r, m);
-      if (cov <= 0)
+      if (mid_w > 0)
+        blend_run_const(row + lx1, mid_w, c);
+      for (int px = rx0; px < x1; px++) {
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+    }
+    return;
+  }
+
+  /* Precompute 1D gradient palette of length `span` once: O(w+h) instead of O(w*h). */
+  static u32 *grad_lut = NULL;
+  static int grad_lut_cap = 0;
+  if (span > grad_lut_cap) {
+    u32 *nl = (u32 *)realloc(grad_lut, (size_t)span * sizeof(u32));
+    if (!nl)
+      return;
+    grad_lut = nl;
+    grad_lut_cap = span;
+  }
+  int all_opaque = 1;
+  for (int pos = 0; pos < span; pos++) {
+    u32 col = grad_sample(cf, cv, ct, clamp_i(pos, 0, denom) * 1000 / denom);
+    grad_lut[pos] = col;
+    if ((col >> 24) != 255u)
+      all_opaque = 0;
+  }
+
+  for (int py = y0; py < y1; py++) {
+    u32 *row = s->pixels + py * s->stride;
+    int j = py - y;
+    int corner_row = (r > 0 && (j < r || j >= h - r));
+    if (d == 1) {
+      if (!corner_row) {
+        const u32 *src = grad_lut + (x0 - x);
+        int n = x1 - x0;
+        if (all_opaque) {
+          memcpy(row + x0, src, (size_t)n * sizeof(u32));
+        } else {
+          for (int k = 0; k < n; k++)
+            row[x0 + k] = blend_over(row[x0 + k], src[k]);
+        }
         continue;
-      if (cov >= 255)
-        row[px] = blend_over(row[px], c);
-      else
-        set_pixel_aa(s, px, py, c, cov);
+      }
+      for (int px = x0; px < lx1; px++) {
+        u32 c = grad_lut[clamp_i(px - x, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+      if (mid_w > 0) {
+        const u32 *src = grad_lut + (lx1 - x);
+        if (all_opaque) {
+          memcpy(row + lx1, src, (size_t)mid_w * sizeof(u32));
+        } else {
+          for (int k = 0; k < mid_w; k++)
+            row[lx1 + k] = blend_over(row[lx1 + k], src[k]);
+        }
+      }
+      for (int px = rx0; px < x1; px++) {
+        u32 c = grad_lut[clamp_i(px - x, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+    } else if (d == 2) {
+      int base = (x0 - x) + j;
+      if (!corner_row) {
+        int n = x1 - x0;
+        const u32 *src = grad_lut + base;
+        if (all_opaque) {
+          memcpy(row + x0, src, (size_t)n * sizeof(u32));
+        } else {
+          for (int k = 0; k < n; k++)
+            row[x0 + k] = blend_over(row[x0 + k], src[k]);
+        }
+        continue;
+      }
+      for (int px = x0; px < lx1; px++) {
+        u32 c = grad_lut[clamp_i((px - x) + j, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+      if (mid_w > 0) {
+        const u32 *src = grad_lut + (lx1 - x) + j;
+        if (all_opaque) {
+          memcpy(row + lx1, src, (size_t)mid_w * sizeof(u32));
+        } else {
+          for (int k = 0; k < mid_w; k++)
+            row[lx1 + k] = blend_over(row[lx1 + k], src[k]);
+        }
+      }
+      for (int px = rx0; px < x1; px++) {
+        u32 c = grad_lut[clamp_i((px - x) + j, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+    } else {
+      /* dir == 3: pos = (w - 1 - (px - x)) + j, decreasing by 1 per px */
+      int pos0 = (w - 1 - (x0 - x)) + j;
+      if (!corner_row) {
+        int n = x1 - x0;
+        if (all_opaque) {
+          for (int k = 0; k < n; k++)
+            row[x0 + k] = grad_lut[pos0 - k];
+        } else {
+          for (int k = 0; k < n; k++)
+            row[x0 + k] = blend_over(row[x0 + k], grad_lut[pos0 - k]);
+        }
+        continue;
+      }
+      for (int px = x0; px < lx1; px++) {
+        u32 c = grad_lut[clamp_i((w - 1 - (px - x)) + j, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
+      if (mid_w > 0) {
+        int mpos0 = (w - 1 - (lx1 - x)) + j;
+        if (all_opaque) {
+          for (int k = 0; k < mid_w; k++)
+            row[lx1 + k] = grad_lut[mpos0 - k];
+        } else {
+          for (int k = 0; k < mid_w; k++)
+            row[lx1 + k] = blend_over(row[lx1 + k], grad_lut[mpos0 - k]);
+        }
+      }
+      for (int px = rx0; px < x1; px++) {
+        u32 c = grad_lut[clamp_i((w - 1 - (px - x)) + j, 0, span - 1)];
+        int cov = zan_round_cov(px - x, j, w, h, r, m);
+        if (cov >= 255)
+          row[px] = all_opaque ? c : blend_over(row[px], c);
+        else if (cov > 0)
+          set_pixel_aa(s, px, py, c, cov);
+      }
     }
   }
 }
