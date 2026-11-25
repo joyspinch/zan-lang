@@ -95,6 +95,10 @@ typedef struct zan_gui_backend_s {
                         int sx, int sy, int sw, int sh);
     void (*blit_pixels_batch)(struct zan_surface_s *s, const zan_bitmap *bitmap,
                               const float *quads, int count);
+    void (*composite_surface)(struct zan_surface_s *dst,
+                              struct zan_surface_s *src,
+                              int x, int y, int w, int h,
+                              int scale_pm, int deg_tenths, int opacity_pm);
 
     void (*set_clip)(struct zan_surface_s *s, int x0, int y0, int x1, int y1);
     void (*flush)(struct zan_surface_s *s);

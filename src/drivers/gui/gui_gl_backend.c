@@ -34,6 +34,7 @@ typedef enum {
 #define ZGL_K_BITMAP  10
 #define ZGL_K_SHADOW  11
 #define ZGL_K_SURFACE_FAST 12
+#define ZGL_K_LAYER   13
 
 #define ZGL_TILE 64
 
@@ -938,6 +939,92 @@ static void zgl_blit_pixels(zan_surface_t *s, const zan_bitmap *img,
     zgl_blit_pixels_batch(s, img, quad, 1);
 }
 
+static void gl_composite_surface(zan_surface_t *dst, zan_surface_t *src,
+                                 int x, int y, int w, int h,
+                                 int scale_pm, int deg_tenths,
+                                 int opacity_pm) {
+    if (!dst || !src || dst == src) return;
+    if (w > src->width) w = src->width;
+    if (h > src->height) h = src->height;
+    if (opacity_pm > 1000) opacity_pm = 1000;
+    if (w <= 0 || h <= 0 || scale_pm <= 0 || opacity_pm <= 0) return;
+    if (g_gl_state <= 0 || !zan_gl_ctx_make_current()) {
+        gl_sync_to_cpu(src);
+        gl_sync_to_cpu(dst);
+        cpu_composite_surface(dst, src, x, y, w, h, scale_pm, deg_tenths, opacity_pm);
+        return;
+    }
+    /* Ensure pending draws on src are flushed and CPU edits uploaded to src->tex. */
+    zgl_flush();
+    zgl_target *src_t = zgl_target_of(src);
+    if (!src_t) {
+        gl_sync_to_cpu(src);
+        gl_sync_to_cpu(dst);
+        cpu_composite_surface(dst, src, x, y, w, h, scale_pm, deg_tenths, opacity_pm);
+        return;
+    }
+    zgl_upload(src, src_t);
+    if (!zgl_begin(dst, ZGL_MODE_BLEND)) {
+        gl_sync_to_cpu(src);
+        gl_sync_to_cpu(dst);
+        cpu_composite_surface(dst, src, x, y, w, h, scale_pm, deg_tenths, opacity_pm);
+        return;
+    }
+
+    int deg = deg_tenths % 3600;
+    if (deg < 0) deg += 3600;
+    int is_exact = (deg == 0 && scale_pm == 1000);
+
+    float hw = (float)w * 0.5f;
+    float hh = (float)h * 0.5f;
+    float dst_cx = (float)x + hw;
+    float dst_cy = (float)y + hh;
+    float out_x0, out_y0, out_x1, out_y1;
+
+    zgl_quad q;
+    memset(&q, 0, sizeof(q));
+    q.kind = ZGL_K_LAYER;
+    q.cx = dst_cx;
+    q.cy = dst_cy;
+    q.hw = hw;
+    q.hh = hh;
+    q.radius = (float)w;
+    q.stroke = (float)h;
+    q.p0 = (float)src_t->h;
+    q.p1 = (float)opacity_pm / 1000.0f;
+    q.p2 = is_exact ? 1.0f : 0.0f;
+
+    if (is_exact) {
+        out_x0 = (float)x;
+        out_y0 = (float)y;
+        out_x1 = (float)(x + w);
+        out_y1 = (float)(y + h);
+    } else {
+        float scale = (float)scale_pm / 1000.0f;
+        float inv_scale = 1.0f / scale;
+        float rad = ((float)deg * 0.1f) * (3.14159265358979323846f / 180.0f);
+        float c = cosf(rad);
+        float s = sinf(rad);
+        q.seg[0] = c * inv_scale;
+        q.seg[1] = s * inv_scale;
+        q.seg[2] = -s * inv_scale;
+        q.seg[3] = c * inv_scale;
+        float half_bw = (fabsf(c) * (float)w + fabsf(s) * (float)h) * 0.5f * scale;
+        float half_bh = (fabsf(s) * (float)w + fabsf(c) * (float)h) * 0.5f * scale;
+        out_x0 = floorf(dst_cx - half_bw) - 1.0f;
+        out_y0 = floorf(dst_cy - half_bh) - 1.0f;
+        out_x1 = ceilf(dst_cx + half_bw) + 1.0f;
+        out_y1 = ceilf(dst_cy + half_bh) + 1.0f;
+    }
+
+    zgl_flush();
+    g_zgl.bitmap_tex = src_t->tex;
+    zgl_push(dst, &q, out_x0, out_y0, out_x1, out_y1);
+    zgl_flush();
+    g_zgl.bitmap_tex = 0;
+    dst->painted = 1;
+}
+
 static int zgl_ensure_blur_targets(int need_w, int need_h) {
     if (need_w <= 0 || need_h <= 0) return 0;
     if (g_zgl.blur_fbo[0] && g_zgl.blur_fbo[1]
@@ -1130,6 +1217,7 @@ static const zan_gui_backend zan_gl_backend = {
     .glyph_run    = gl_glyph_run,
     .blit_pixels  = zgl_blit_pixels,
     .blit_pixels_batch = zgl_blit_pixels_batch,
+    .composite_surface = gl_composite_surface,
     .set_clip     = gl_set_clip,
     .flush        = gl_flush,
     .read_pixels  = gl_read_pixels,

@@ -1229,3 +1229,238 @@ EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
     off += n * 2;
   }
 }
+
+static void cpu_composite_surface(zan_surface_t *d, zan_surface_t *s,
+                                  int x, int y, int w, int h,
+                                  int scale_pm, int deg_tenths,
+                                  int opacity_pm) {
+  if (!d || !s || !d->pixels || !s->pixels || d == s)
+    return;
+  if (w > s->width)
+    w = s->width;
+  if (h > s->height)
+    h = s->height;
+  if (opacity_pm > 1000)
+    opacity_pm = 1000;
+  if (w <= 0 || h <= 0 || scale_pm <= 0 || opacity_pm <= 0)
+    return;
+
+  int deg = deg_tenths % 3600;
+  if (deg < 0)
+    deg += 3600;
+
+  if (deg == 0 && scale_pm == 1000) {
+    int sx0 = 0, sy0 = 0, dx0 = x, dy0 = y, cw = w, ch = h;
+    if (dx0 < d->clip_x0) {
+      int cut = d->clip_x0 - dx0;
+      dx0 += cut;
+      sx0 += cut;
+      cw -= cut;
+    }
+    if (dy0 < d->clip_y0) {
+      int cut = d->clip_y0 - dy0;
+      dy0 += cut;
+      sy0 += cut;
+      ch -= cut;
+    }
+    if (dx0 + cw > d->clip_x1)
+      cw = d->clip_x1 - dx0;
+    if (dy0 + ch > d->clip_y1)
+      ch = d->clip_y1 - dy0;
+    if (cw <= 0 || ch <= 0)
+      return;
+    region_read(s, sx0, sy0, sx0 + cw, sy0 + ch);
+    region_write(d, dx0, dy0, dx0 + cw, dy0 + ch);
+    for (int row = 0; row < ch; row++) {
+      const u32 *src_row =
+          s->pixels + (size_t)(sy0 + row) * (size_t)s->stride + (size_t)sx0;
+      u32 *dst_row =
+          d->pixels + (size_t)(dy0 + row) * (size_t)d->stride + (size_t)dx0;
+      for (int col = 0; col < cw; col++) {
+        u32 sp = src_row[col];
+        u32 sa = sp >> 24;
+        if (sa == 0)
+          continue;
+        if (opacity_pm < 1000)
+          sa = (sa * (u32)opacity_pm + 500u) / 1000u;
+        if (sa == 0)
+          continue;
+        if (sa == 255u) {
+          dst_row[col] = 0xFF000000u | (sp & 0x00FFFFFFu);
+        } else {
+          dst_row[col] = blend_over(dst_row[col], (sa << 24) | (sp & 0x00FFFFFFu));
+        }
+      }
+    }
+    return;
+  }
+
+  double scale = (double)scale_pm / 1000.0;
+  double inv_scale = 1.0 / scale;
+  double rad = ((double)deg * 0.1) * (3.14159265358979323846 / 180.0);
+  double cosA = cos(rad);
+  double sinA = sin(rad);
+  double absC = fabs(cosA);
+  double absS = fabs(sinA);
+  double cx = (double)w * 0.5;
+  double cy = (double)h * 0.5;
+  double dstCx = (double)x + cx;
+  double dstCy = (double)y + cy;
+  double halfW = (absC * (double)w + absS * (double)h) * 0.5 * scale;
+  double halfH = (absS * (double)w + absC * (double)h) * 0.5 * scale;
+
+  int ox0 = (int)floor(dstCx - halfW) - 1;
+  int oy0 = (int)floor(dstCy - halfH) - 1;
+  int ox1 = (int)ceil(dstCx + halfW) + 1;
+  int oy1 = (int)ceil(dstCy + halfH) + 1;
+  if (ox0 < d->clip_x0)
+    ox0 = d->clip_x0;
+  if (oy0 < d->clip_y0)
+    oy0 = d->clip_y0;
+  if (ox1 > d->clip_x1)
+    ox1 = d->clip_x1;
+  if (oy1 > d->clip_y1)
+    oy1 = d->clip_y1;
+  if (ox1 <= ox0 || oy1 <= oy0)
+    return;
+
+  region_read(s, 0, 0, w, h);
+  region_write(d, ox0, oy0, ox1, oy1);
+
+  double invA = cosA * inv_scale;
+  double invB = sinA * inv_scale;
+  double invC = -sinA * inv_scale;
+  double invD = cosA * inv_scale;
+
+  int64_t dsdx = (int64_t)llround(invA * 65536.0);
+  int64_t dsdy = (int64_t)llround(invB * 65536.0);
+  int64_t dtdx = (int64_t)llround(invC * 65536.0);
+  int64_t dtdy = (int64_t)llround(invD * 65536.0);
+
+  double startDx = (double)ox0 + 0.5 - dstCx;
+  double startDy = (double)oy0 + 0.5 - dstCy;
+  int64_t rowSx =
+      (int64_t)llround((startDx * invA + startDy * invB + cx - 0.5) * 65536.0);
+  int64_t rowSy =
+      (int64_t)llround((startDx * invC + startDy * invD + cy - 0.5) * 65536.0);
+
+  int sStride = s->stride;
+  const u32 *srcPix = s->pixels;
+  u32 opU = (u32)opacity_pm;
+
+  for (int py = oy0; py < oy1; py++) {
+    int64_t sxFp = rowSx;
+    int64_t syFp = rowSy;
+    rowSx += dsdy;
+    rowSy += dtdy;
+    u32 *dstRow = d->pixels + (size_t)py * (size_t)d->stride;
+    for (int px = ox0; px < ox1; px++) {
+      int ix = (int)((sxFp + 0x40000000LL) >> 16) - 16384;
+      int iy = (int)((syFp + 0x40000000LL) >> 16) - 16384;
+      int fx = (int)((sxFp - ((int64_t)ix << 16) + 128) >> 8);
+      int fy = (int)((syFp - ((int64_t)iy << 16) + 128) >> 8);
+      sxFp += dsdx;
+      syFp += dtdx;
+      if (ix < -1 || iy < -1 || ix >= w || iy >= h)
+        continue;
+      int omx = 256 - fx;
+      int omy = 256 - fy;
+      u32 w00 = (u32)(omx * omy) >> 4;
+      u32 w10 = (u32)(fx * omy) >> 4;
+      u32 w01 = (u32)(omx * fy) >> 4;
+      u32 w11 = (u32)(fx * fy) >> 4;
+      u32 sumA = 0, sumR = 0, sumG = 0, sumB = 0;
+
+      if (ix >= 0 && iy >= 0) {
+        u32 p = srcPix[(size_t)iy * (size_t)sStride + (size_t)ix];
+        u32 a = p >> 24;
+        if (a) {
+          u32 wa = a * w00;
+          sumA += wa;
+          sumR += ((p >> 16) & 255u) * wa;
+          sumG += ((p >> 8) & 255u) * wa;
+          sumB += (p & 255u) * wa;
+        }
+      }
+      if (ix + 1 >= 0 && ix + 1 < w && iy >= 0) {
+        u32 p = srcPix[(size_t)iy * (size_t)sStride + (size_t)(ix + 1)];
+        u32 a = p >> 24;
+        if (a) {
+          u32 wa = a * w10;
+          sumA += wa;
+          sumR += ((p >> 16) & 255u) * wa;
+          sumG += ((p >> 8) & 255u) * wa;
+          sumB += (p & 255u) * wa;
+        }
+      }
+      if (ix >= 0 && iy + 1 >= 0 && iy + 1 < h) {
+        u32 p = srcPix[(size_t)(iy + 1) * (size_t)sStride + (size_t)ix];
+        u32 a = p >> 24;
+        if (a) {
+          u32 wa = a * w01;
+          sumA += wa;
+          sumR += ((p >> 16) & 255u) * wa;
+          sumG += ((p >> 8) & 255u) * wa;
+          sumB += (p & 255u) * wa;
+        }
+      }
+      if (ix + 1 >= 0 && ix + 1 < w && iy + 1 >= 0 && iy + 1 < h) {
+        u32 p = srcPix[(size_t)(iy + 1) * (size_t)sStride + (size_t)(ix + 1)];
+        u32 a = p >> 24;
+        if (a) {
+          u32 wa = a * w11;
+          sumA += wa;
+          sumR += ((p >> 16) & 255u) * wa;
+          sumG += ((p >> 8) & 255u) * wa;
+          sumB += (p & 255u) * wa;
+        }
+      }
+      if (sumA < 2048u)
+        continue;
+      u32 oa = (u32)(((uint64_t)sumA * opU + 2048000ULL) / 4096000ULL);
+      if (oa == 0)
+        continue;
+      if (oa > 255u)
+        oa = 255u;
+      u32 halfA = sumA >> 1;
+      u32 or_ = (sumR + halfA) / sumA;
+      u32 og = (sumG + halfA) / sumA;
+      u32 ob = (sumB + halfA) / sumA;
+      if (or_ > 255u)
+        or_ = 255u;
+      if (og > 255u)
+        og = 255u;
+      if (ob > 255u)
+        ob = 255u;
+      u32 outPx = (oa << 24) | (or_ << 16) | (og << 8) | ob;
+      dstRow[px] = (oa == 255u) ? outPx : blend_over(dstRow[px], outPx);
+    }
+  }
+}
+
+EXPORT void zan_gui_composite_surface(i32 dst_id, i32 src_id, i32 x, i32 y,
+                                      i32 w, i32 h, i32 scale_pm,
+                                      i32 deg_tenths, i32 opacity_pm) {
+  if (dst_id < 0 || dst_id >= g_surface_count)
+    return;
+  if (src_id < 0 || src_id >= g_surface_count)
+    return;
+  zan_surface_t *d = g_surfaces[dst_id];
+  zan_surface_t *s = g_surfaces[src_id];
+  if (!d || !s || d == s || w <= 0 || h <= 0 || scale_pm <= 0 ||
+      opacity_pm <= 0)
+    return;
+  if (d->be && d->be->composite_surface && s->be == d->be) {
+    d->be->composite_surface(d, s, (int)x, (int)y, (int)w, (int)h,
+                             (int)scale_pm, (int)deg_tenths, (int)opacity_pm);
+    return;
+  }
+  if (s->be && s->be->sync_to_cpu)
+    s->be->sync_to_cpu(s);
+  if (d->be && d->be->sync_to_cpu)
+    d->be->sync_to_cpu(d);
+  cpu_composite_surface(d, s, (int)x, (int)y, (int)w, (int)h, (int)scale_pm,
+                        (int)deg_tenths, (int)opacity_pm);
+  if (d->be && d->be->sync_from_cpu)
+    d->be->sync_from_cpu(d);
+}

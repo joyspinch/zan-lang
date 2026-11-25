@@ -17,8 +17,9 @@
   @import 指不到磁盘文件)。`@supports (prop: value)` 是静态可判定的——条件
   成立把内层规则照常解析,判假只跳过这一块并按条件原文报出;取值不在引擎
   取值表就判假(`@supports (display: grid)` 为假),这是刻意的兜底保护。
-  `@layer` 没有层叠优先级模型,按文档顺序摊平。`@keyframes`/`@font-face`
-  仍整块跳过并计数(`animation` 只能引用内置 8 条曲线)。
+  `@layer` 没有层叠优先级模型,按文档顺序摊平。`@keyframes` 原生解析生效
+  (支持百分比、`from`/`to`、`var(...)` 变量与多停止点插值);仅 `@font-face`
+  仍整块跳过并计数。
 - **选择器是复合块链**:type/`.class`/`#id`/`::part` 可用后代(空格)、`>`、`+`、
   `~` 组合成链(`panel > title`、`row > label + label`),复合块内可带状态伪类、
   结构性伪类(`:first-child`/`:last-child`/`:only-child`/`:nth-child(2)`/
@@ -48,11 +49,18 @@
   shorthand 里也认;写 `color: currentColor` 等于保持主题前景)。
 - **`var(--x, fallback)` 支持回退值**,未定义或空值时用回退;定义了就永远
   赢不了回退(CSS 语义)。所以"少给一个 token 整条声明消失"已经不是问题。
-- **动效系是真属性,整链生效**:`transform: translate(...)/scale(...)/rotate(...)`
-  (可多函数串联)、`transition`/`transition-duration`(属性级时长) +
-  `transition-timing-function`(内置 8 曲线)、`animation: <name> <dur> <easing>`
-  (只认内置曲线,@keyframes 不解析)。现代独立写法同样认:
-  `rotate: 90`/`scale: 1.2`/`translate: 10px 20px` 可脱离 transform 单发。
+- **动效系与物理弹簧是真属性,整链生效**:`transform: translate(...)/scale(...)/rotate(...)`
+  (可多函数串联)、`transition`/`transition-duration`/`transition-property`/`transition-delay` +
+  `transition-timing-function`(内置 8 曲线 + `cubic-bezier(...)` + `steps(...)` +
+  **物理弹簧 `spring(bounce)` / `spring(k, c[, m])` / `spring-snappy|smooth|bouncy|gentle`**,
+  且位移/缩放/旋转支持过冲安全混合,颜色/圆角/透明度自动钳位)、
+  `animation: <name> <dur> <easing> <delay> <iter> <dir> <fill>`
+  (支持 `@keyframes` 自定义帧与内置 `spin/pulse/breath/shimmer/float/glow/orbit/skeleton`)。
+  现代独立写法 `rotate`/`scale`/`translate` 同样生效;程序化高频动效可直接调
+  `Control.Translate/ScalePct/Rotate/Opacity/SetMotionTransform`(走零分配瞬态通道,
+  不膨胀 `inlineStyleCss`),布局重排/入退场用 `Gui.Animation.FlipGroup` / `Spring2D`,
+  交互反馈/骨架/渐变框用 `Fx.Ripple` / `Fx.ShimmerSkeleton` / `Fx.GradientBorder`,
+  `Canvas.PushLayer` 走原生 GPU 单 DrawCall / CPU 定点零回读合成。
 - **视觉效果与现代材质原语**:`backdrop-filter`/`filter` 认 `blur(Npx)`(玻璃拟态主通道)、
   `opacity`、`aspect-ratio`(定宽推高/定高推宽)、`text-shadow`(取第一层
   几何,≥3 层零模糊)、`border` 的 `dashed/dotted` 走虚线描边。
