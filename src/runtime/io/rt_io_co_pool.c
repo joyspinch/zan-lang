@@ -73,11 +73,11 @@ typedef struct {
 } __attribute__((aligned(64))) zan_co_worker_t;
 
 static CRITICAL_SECTION g_co_lock;
-static volatile LONG g_co_running;
-static volatile LONG g_co_parked;
+static _Alignas(64) volatile LONG g_co_running;
+static _Alignas(64) volatile LONG g_co_parked;
 static volatile LONG g_co_searching;
 static volatile LONG g_co_stop;
-static int g_co_inited;
+static _Alignas(64) int g_co_inited;
 static int g_co_workers;
 static _Thread_local zan_co_worker_t *t_co_self;
 static zan_co_worker_t *g_wk;
@@ -88,11 +88,11 @@ static int g_co_pool_gen;
 static volatile LONG g_co_pool_out;
 static void co_pool_ensure(void);
 
-static CRITICAL_SECTION g_inj_lock;
+static _Alignas(64) CRITICAL_SECTION g_inj_lock;
 static zan_co_node *g_inj_head, *g_inj_tail, *g_inj_free;
 static volatile LONG g_inj_len;
 static volatile LONG g_inj_push_ext;
-static volatile unsigned long long g_co_nonempty[4];
+static _Alignas(64) volatile unsigned long long g_co_nonempty[4];
 
 static inline void co_mark_nonempty(int idx) {
   unsigned w = (unsigned)idx >> 6;
@@ -127,8 +127,8 @@ static inline int co_worker_has_work(int idx) {
   return (__atomic_load_n(&g_co_nonempty[w], __ATOMIC_ACQUIRE) & bit) != 0;
 }
 
-static LONG co_load(volatile LONG *p) {
-  return InterlockedCompareExchange(p, 0, 0);
+static inline LONG co_load(volatile LONG *p) {
+  return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
 
 static volatile LONG g_timer_owner;
@@ -335,9 +335,10 @@ static int inj_pop_batch(zan_co_task *out, int max) {
     out[n].step = nd->step;
     nd->next = g_inj_free;
     g_inj_free = nd;
-    InterlockedDecrement(&g_inj_len);
     n++;
   }
+  if (n > 0)
+    InterlockedExchangeAdd(&g_inj_len, -(LONG)n);
   LeaveCriticalSection(&g_inj_lock);
   return n;
 }
@@ -363,8 +364,7 @@ static void lq_spill(zan_co_worker_t *w) {
   LeaveCriticalSection(&w->queue_lock);
   if (n <= 0)
     return;
-  for (long long i = 0; i < n; i++)
-    inj_push(tmp[i]);
+  inj_push_batch(tmp, (size_t)n);
   w->st.spill++;
   w->st.inj_push += (unsigned long long)n;
 }
@@ -391,6 +391,31 @@ static void lq_push(zan_co_worker_t *w, zan_co_task task) {
   co_mark_nonempty(w->index);
   LeaveCriticalSection(&w->queue_lock);
   w->st.lq_push++;
+}
+
+static void lq_push_batch(zan_co_worker_t *w, const zan_co_task *tasks,
+                          long long count) {
+  if (count <= 0)
+    return;
+  EnterCriticalSection(&w->queue_lock);
+  long long tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+  long long head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+  long long avail = (long long)ZAN_LQ_CAP - (tail - head);
+  long long fit = (avail > 0) ? ((count < avail) ? count : avail) : 0;
+  for (long long i = 0; i < fit; i++)
+    w->buf[(unsigned long long)(tail + i) & ZAN_LQ_MASK] = tasks[i];
+  if (fit > 0) {
+    __atomic_store_n(&w->tail, tail + fit, __ATOMIC_RELEASE);
+    co_mark_nonempty(w->index);
+  }
+  LeaveCriticalSection(&w->queue_lock);
+  if (fit > 0)
+    w->st.lq_push += (unsigned long long)fit;
+  if (fit < count) {
+    long long rem = count - fit;
+    inj_push_batch(tasks + fit, (size_t)rem);
+    w->st.inj_push += (unsigned long long)rem;
+  }
 }
 
 static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
@@ -437,8 +462,8 @@ static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
     co_clear_empty(v->index);
   LeaveCriticalSection(&v->queue_lock);
   *out = tmp[0];
-  for (long long i = 1; i < take; i++)
-    lq_push(w, tmp[i]);
+  if (take > 1)
+    lq_push_batch(w, tmp + 1, take - 1);
   return 1;
 }
 
@@ -576,8 +601,8 @@ static void co_submit_batch(const zan_co_task *tasks, size_t count) {
     w->st.lifo_put++;
     i++;
   }
-  for (; i < count; i++) {
-    lq_push(w, tasks[i]);
+  if (i < count) {
+    lq_push_batch(w, tasks + i, (long long)(count - i));
   }
   co_notify();
 }

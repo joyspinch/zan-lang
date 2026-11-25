@@ -246,8 +246,8 @@ static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
     if (n > 0) {
       w->lifo_budget = ZAN_LIFO_BUDGET;
       w->st.inj_pop += (unsigned long long)n;
-      for (int i = 1; i < n; i++)
-        lq_push(w, batch[i]);
+      if (n > 1)
+        lq_push_batch(w, batch + 1, (long long)(n - 1));
       *out = batch[0];
       return 1;
     }

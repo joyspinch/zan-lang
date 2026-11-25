@@ -224,11 +224,14 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
                                            rc_iptr, LLVMConstInt(i64, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
   {
-    LLVMValueRef sp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
-                                    obj, &neg8, 1, "arcsp");
-    LLVMValueRef sip =
-        LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64, 0), "arcsip");
-    LLVMValueRef s = LLVMBuildLoad2(g->builder, i64, sip, "arcsite");
+    LLVMValueRef s = NULL;
+    if (g->arc_guard && g->runtime_checks) {
+      LLVMValueRef sp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                                      obj, &neg8, 1, "arcsp");
+      LLVMValueRef sip =
+          LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64, 0), "arcsip");
+      s = LLVMBuildLoad2(g->builder, i64, sip, "arcsite");
+    }
     emit_arc_underflow_check(g, g->rt_release, rc_old, obj, s,
                              ZAN_ARC_FAULT_RELEASE,
                              "release of an already-freed object");
@@ -477,12 +480,11 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
         LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "atail");
     /* Escape analysis treats release_dyn as non-escaping. A promoted
      * object's storage belongs to its caller's frame, so even at the
-     * depth limit its destructor must finish before this call returns. */
-    LLVMValueRef raw_header =
-        LLVMBuildLoad2(g->builder, i64, siptr, "adefer.header");
+     * depth limit its destructor must finish before this call returns.
+     * Reuse raw_hdr already loaded from siptr above instead of reloading. */
     LLVMValueRef is_heap = zan_icmp(
         g->builder, LLVMIntEQ,
-        zan_and(g->builder, raw_header,
+        zan_and(g->builder, raw_hdr,
                 LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "adefer.stack"),
         LLVMConstInt(i64, 0, 0), "adefer.heap");
     LLVMValueRef is_deep =
@@ -545,6 +547,13 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
 LLVMTypeRef alloc_args[] = {i64, i64, i8ptr};
 LLVMTypeRef alloc_type = LLVMFunctionType(i8ptr, alloc_args, 3, 0);
 g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
+{
+  unsigned nonnull_kind = LLVMGetEnumAttributeKindForName("nonnull", 7);
+  if (nonnull_kind) {
+    LLVMAddAttributeAtIndex(g->rt_alloc, LLVMAttributeReturnIndex,
+                            LLVMCreateEnumAttribute(g->ctx, nonnull_kind, 0));
+  }
+}
 
 {
   LLVMBasicBlockRef bb =
@@ -604,6 +613,13 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
   LLVMTypeRef str_alloc_args[] = {i64};
   LLVMTypeRef str_alloc_type = LLVMFunctionType(i8ptr, str_alloc_args, 1, 0);
   g->rt_str_alloc = LLVMAddFunction(g->mod, "zan_rt_str_alloc", str_alloc_type);
+  {
+    unsigned nonnull_kind = LLVMGetEnumAttributeKindForName("nonnull", 7);
+    if (nonnull_kind) {
+      LLVMAddAttributeAtIndex(g->rt_str_alloc, LLVMAttributeReturnIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nonnull_kind, 0));
+    }
+  }
   LLVMBasicBlockRef bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_alloc, "entry");
   LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -723,8 +739,10 @@ for (int rel = 0; rel < 2; rel++) {
     LLVMPositionBuilderAtEnd(g->builder, free_bb);
     LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
     if (g->rt_live_unregister) {
-      zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
-                g->rt_live_unregister, &obj, 1, "");
+      LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+      void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                            LLVMValueRef *, unsigned);
+      zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_unregister, &obj, 1);
     }
     if (g->arc_guard) {
       emit_arc_quarantine(g, obj, rc_iptr);
@@ -876,8 +894,10 @@ for (int rel = 0; rel < 2; rel++) {
   LLVMPositionBuilderAtEnd(g->builder, free_bb);
   LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
   if (g->rt_live_unregister) {
-    zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
-              g->rt_live_unregister, &obj, 1, "");
+    LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+    void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                          LLVMValueRef *, unsigned);
+    zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_unregister, &obj, 1);
   }
   LLVMValueRef header_ptr = LLVMBuildGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
