@@ -43,4 +43,5 @@ static ZAN_TLS int g_type_name_slot;
 #include "checker/checker_expr_adv.c"
 #include "checker/checker_stmt.c"
 #include "checker/checker_decl.c"
+#include "checker/checker_cycles.c"
 #include "checker/checker_unit.c"

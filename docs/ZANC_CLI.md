@@ -346,6 +346,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
+| `ZAN_CYCLE_AUDIT` | **编译期**：设为非 `0` 时 S11 类型图强环检查（W2111）连标准库与 packages 里的类一起报，用于库审计；默认只报用户代码 |
 | `ZAN_LEAK_LOG` | `--check-leaks` 产物退出时把泄漏报表副本追加到此路径（默认工作目录下 `zan_leaks.log`；设为空串只打印不落盘）。测试驱动指向 `build/test-out/leaks/<用例>.log`，不再污染仓库根 |
 | `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |
 | `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |

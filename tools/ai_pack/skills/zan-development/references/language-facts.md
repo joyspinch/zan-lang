@@ -209,6 +209,8 @@
   这一形状不再成环，直接写 `btn.Click += () => Save();` 即可；目标是局部量/
   形参（`Button b = …; b.Click += …`）仍是强捕获，照旧成环——先存进字段再订阅。
   委托存进自己普通字段（非 `+=`）的环不受影响，仍按上面的办法拆。
+  **S11 起**：类之间经字段（直接或经集合）声明出来的强环，编译器报 W2111 并给
+  回指针加 `weak` 的 fix-it（`--diag=json` 里可直接应用）；见到 W2111 照改即可。
 * **`object.ToString()` 调不通**（实证，2026-10-21）：在 `object` 静态类型的
   接收者上调 `ToString()` 报 "this call could not be resolved to any callable"。
   用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进

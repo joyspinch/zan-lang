@@ -1851,6 +1851,21 @@ add_test(NAME diag_json_fixit
     -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
 set_tests_properties(diag_json_fixit PROPERTIES TIMEOUT 120)
 
+# S11（docs/ZAN_STANDARD.md §3）：类型图强环 W2111——--deny-warnings 下报错，
+# fix-it 在回指针 TreeNode.Owner 的类型前插入 "weak "，应用后告警消失、编译通过。
+add_test(NAME diag_json_class_cycle
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/diag_json_class_cycle.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_json_class_cycle${_exe_ext}
+    -DFIXED_SRC=${CMAKE_BINARY_DIR}/test-out/diag_json_class_cycle/fixed.zan
+    "-DZANC_EXTRA=--auto-stdlib;--deny-warnings"
+    -DEXPECT_CODE=W2111 -DEXPECT_LINE=12 -DEXPECT_COL=12
+    -DEXPECT_FIX_LINE=12 -DEXPECT_FIX_COL=12
+    "-DEXPECT_FIX_TEXT_ASCII=119;101;97;107;32"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
+set_tests_properties(diag_json_class_cycle PROPERTIES TIMEOUT 180)
+
 # S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出报告——孤儿环逐条打印路径；
 # Environment.Exit 时栈帧/静态字段持有的对象是根，不误报。
 foreach(_leak_case leak_cycle_report leak_exit_roots)

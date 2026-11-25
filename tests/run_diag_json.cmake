@@ -5,7 +5,10 @@
 #   4. 把 fix-it 应用回源码后重新编译必须成功——补丁可机器直接应用。
 # 参数：ZANC SRC OUT_EXE FIXED_SRC EXPECT_CODE EXPECT_LINE EXPECT_COL
 #       EXPECT_FIX_LINE EXPECT_FIX_COL EXPECT_FIX_TEXT_ASCII
-# 补丁文本以 ASCII 码传入（';' = 59）：分号穿过 add_test/-D 会被当成列表分隔符。
+# 补丁文本以 ASCII 码列表传入（';' = 59，"weak " = 119;101;97;107;32）：分号
+# 字符本身穿过 add_test/-D 会被当成列表分隔符，-D 还会吃掉尾部空格。
+# 可选 ZANC_EXTRA（列表）：两次编译都追加，如 S11 用 --auto-stdlib;--deny-warnings
+# 把告警升为错误，并验证补丁应用后告警消失。
 foreach(_v ZANC SRC OUT_EXE FIXED_SRC EXPECT_CODE EXPECT_LINE EXPECT_COL
            EXPECT_FIX_LINE EXPECT_FIX_COL EXPECT_FIX_TEXT_ASCII)
   if(NOT DEFINED ${_v})
@@ -17,7 +20,7 @@ get_filename_component(_fixed_dir "${FIXED_SRC}" DIRECTORY)
 file(MAKE_DIRECTORY "${_fixed_dir}")
 
 execute_process(
-  COMMAND "${ZANC}" "${SRC}" --diag=json -o "${OUT_EXE}"
+  COMMAND "${ZANC}" "${SRC}" ${ZANC_EXTRA} --diag=json -o "${OUT_EXE}"
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(rc EQUAL 0)
   message(FATAL_ERROR "expected compilation to fail:\n${out}\n${err}")
@@ -81,7 +84,7 @@ string(SUBSTRING "${src_text}" ${fix_off} -1 tail_text)
 file(WRITE "${FIXED_SRC}" "${head_text}${EXPECT_FIX_TEXT}${tail_text}")
 
 execute_process(
-  COMMAND "${ZANC}" "${FIXED_SRC}" --diag=json -o "${OUT_EXE}"
+  COMMAND "${ZANC}" "${FIXED_SRC}" ${ZANC_EXTRA} --diag=json -o "${OUT_EXE}"
   RESULT_VARIABLE rc2 OUTPUT_VARIABLE out2 ERROR_VARIABLE err2)
 if(NOT rc2 EQUAL 0)
   message(FATAL_ERROR "applying the fix-it did not make the source compile:\n${err2}")

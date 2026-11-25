@@ -571,6 +571,8 @@ static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file
     checker_collect_table_entities(c, unit);
     checker_collect_controllers(c, unit);
     check_all_struct_cycles(c, unit);
+    /* S11：类型图强环检查（checker_cycles.c）；单文件复检（LSP）不跑全图 */
+    if (only_file_id < 0) check_class_ref_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
