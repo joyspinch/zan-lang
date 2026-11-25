@@ -640,6 +640,30 @@ class Child {
 }
 ```
 
+**Event subscriptions are bound to the subscriber's lifetime.** When the target
+of `+=` is rooted at `this` — `Click`, `this.saveBtn.Click`, `saveBtn.Click`
+with `saveBtn` an instance field, `items[i].Changed` — and the right-hand side
+is a lambda that uses `this`, the lambda captures `this` **weakly**. The usual
+owner → publisher → handler → owner cycle never forms; once the subscriber is
+released the handler does nothing (a non-void untyped handler returns zero).
+Nothing changes in how you write it:
+
+```csharp
+class EditorForm : Form {
+    Button saveBtn = new Button();
+    public EditorForm() {
+        saveBtn.Click += () => Save();   // no cycle, no unsubscribe needed
+    }
+    void Save() { ... }
+}
+```
+
+Subscriptions on anything else — a parameter, a local, a static member — keep
+the C# strong capture, so an object kept alive only by the event it subscribed
+to still receives it (`public Logger(Button b) { b.Click += () => Log(); }`).
+Handlers with a typed non-void return and lambdas in struct methods are also
+captured strongly. Method groups (`b.Click += OnClick;`) are unchanged.
+
 ### 6.5 Native Memory (no raw pointers)
 
 Zan 没有 `T*` 指针类型。低层内存操作经 `nint` 与 `NativeMemory` 完成：

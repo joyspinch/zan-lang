@@ -485,6 +485,9 @@ struct zan_irgen {
      * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
      * every body and a thunk for every method. Set by zan_irgen_emit. */
     bool closed_world;
+    /* S12：`x.Event += lambda` 且订阅目标以 this 为根时，赋值发射把右侧
+     * lambda 节点记在这里；lambda 发射按节点身份取走，改为弱捕获 this。 */
+    struct zan_ast_node *weak_this_lambda;
     /* Set by the driver for native, non-cross executable builds: object
      * emission may split a large module across threads (codegen_split.h).
      * The extra partition objects are listed here for the linker. */

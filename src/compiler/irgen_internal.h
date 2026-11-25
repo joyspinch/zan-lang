@@ -411,6 +411,8 @@ void emit_site_dtor_table(zan_irgen_t *g);
 void emit_site_field_graph_table(zan_irgen_t *g);
 LLVMValueRef zan_site_field_names_global(zan_irgen_t *g);
 LLVMValueRef zan_leak_main_done_global(zan_irgen_t *g);
+int zan_subscription_rooted_at_this(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals);
 void emit_site_live_tables(zan_irgen_t *g);
 void emit_site_tyname_table(zan_irgen_t *g);
 void emit_string_release(zan_irgen_t *g, LLVMValueRef v);

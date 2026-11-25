@@ -82,6 +82,33 @@ static int name_is_instance_member(zan_irgen_t *g, zan_istr_t name) {
     return 0;
 }
 
+/* S12（docs/ZAN_STANDARD.md §3）：事件订阅目标是否以 this 为根——
+ * `Click`、`this.Click`、`btn.Click`（btn 为实例字段）、`items[i].Changed`。
+ * 这正是会成环的形状：this 持有发布者，发布者的处理器列表持有闭包，闭包
+ * 再强捕获 this。局部变量、形参、静态成员为根的订阅保持强捕获（C# 语义：
+ * 只靠事件存活的订阅者仍然有效）。 */
+int zan_subscription_rooted_at_this(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals) {
+    while (e) {
+        switch (e->kind) {
+        case AST_THIS_EXPR:
+            return 1;
+        case AST_IDENTIFIER:
+            if (locals && local_find(locals, e->ident.name)) return 0;
+            return name_is_instance_member(g, e->ident.name);
+        case AST_MEMBER_ACCESS:
+            e = e->member.object;
+            break;
+        case AST_INDEX:
+            e = e->index.object;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static void cap_use(capture_scan_t *cs, zan_istr_t name) {
     if (!name.len || cap_is_shadowed(cs, name)) return;
     for (int i = 0; i < cs->count; i++)
@@ -431,7 +458,12 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
             emit_collection_value_release(g, caps[i].type, v, 0);
         else emit_rc_release_for_type(g, caps[i].type, v);
     }
-    if (has_this) {
+    if (has_this == 2) {
+        /* S12 弱捕获：没有引用可放，注销弱槽（订阅者先死时槽已被置空） */
+        LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "tp");
+        emit_weak_store(g, p, LLVMConstPointerNull(i8ptr));
+    } else if (has_this) {
         LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
             (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "tp");
         LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "tv");
@@ -532,10 +564,17 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     if (has_this && self) {
         if (LLVMTypeOf(self) != i8ptr)
             self = LLVMBuildBitCast(g->builder, self, i8ptr, "cap.self8");
-        emit_arc_retain(g, self);
-        LLVMBuildStore(g->builder, self,
-            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
-                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp"));
+        LLVMValueRef selfp = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp");
+        if (has_this == 2) {
+            /* S12：事件订阅闭包弱捕获订阅者——槽先清零（弱存储会先摘旧值），
+             * 再登记进弱引用表，订阅者释放时自动置空。 */
+            LLVMBuildStore(g->builder, LLVMConstPointerNull(i8ptr), selfp);
+            emit_weak_store(g, selfp, self);
+        } else {
+            emit_arc_retain(g, self);
+            LLVMBuildStore(g->builder, self, selfp);
+        }
     }
     LLVMValueRef tagged = LLVMBuildOr(g->builder,
         LLVMBuildPtrToInt(g->builder, rec, i64, "clo.i"),

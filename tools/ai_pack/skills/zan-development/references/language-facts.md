@@ -204,6 +204,11 @@
   `packages/Zan.Gui/src/Gui/Widget/Models/TabsAction.zan` 的 `weak Tabs owner`。
   验收同时真实触发 select/close/add 三条 Click 并断言行为，再做泄漏检查；
   `case_tabs_set_label` 已通过，不能只验证创建/销毁或编译通过。
+  **S12 起**（2026-11-24）：`+=` 目标以 `this` 为根（`Click`、`btn.Click` 中
+  btn 是实例字段、`this.x.Click`）时，右侧 lambda 由编译器**弱捕获** `this`，
+  这一形状不再成环，直接写 `btn.Click += () => Save();` 即可；目标是局部量/
+  形参（`Button b = …; b.Click += …`）仍是强捕获，照旧成环——先存进字段再订阅。
+  委托存进自己普通字段（非 `+=`）的环不受影响，仍按上面的办法拆。
 * **`object.ToString()` 调不通**（实证，2026-10-21）：在 `object` 静态类型的
   接收者上调 `ToString()` 报 "this call could not be resolved to any callable"。
   用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进

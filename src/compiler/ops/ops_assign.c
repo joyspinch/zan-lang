@@ -9,6 +9,15 @@ LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
                 return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
             }
             check_readonly_store(g, expr->binary.left, locals);
+            /* S12：`发布者.事件 += lambda` 且发布者以 this 为根——lambda 弱捕获
+             * this，订阅随订阅者释放自动失效。须在左值提升（ca_hoist_spine 把
+             * 左值换成临时量）之前判定。 */
+            if (expr->binary.compound_base == TK_PLUS && g->current_this &&
+                expr->binary.right && expr->binary.right->kind == AST_BINARY &&
+                expr->binary.right->binary.right &&
+                expr->binary.right->binary.right->kind == AST_LAMBDA &&
+                zan_subscription_rooted_at_this(g, expr->binary.left, locals))
+                g->weak_this_lambda = expr->binary.right->binary.right;
             /* 复合赋值左值子树单次求值防护 */
             if (expr->binary.compound_base != TK_EOF)
                 ca_hoist_spine(g, &expr->binary.left, locals, 1);

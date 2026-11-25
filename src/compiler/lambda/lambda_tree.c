@@ -381,6 +381,18 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     int capc = cs.count;
     int has_this = cs.needs_this ? 1 : 0;
+    /* S12：事件订阅闭包弱捕获 this（标记见 emit_expr_assignment）。只做
+     * 无返回值处理器（作为 op_add 实参发射时没有期望委托类型，返回位按
+     * 未定型 i64 发射，同样视作无返回值）——订阅者已释放时调用直接返回
+     * 零值；结构体 this 不是引用计数对象，不适用。 */
+    int weak_this = 0;
+    if (g->weak_this_lambda == expr) {
+        g->weak_this_lambda = NULL;
+        if (has_this && (ret_void || !rett) && g->current_type_sym &&
+            g->current_type_sym->type &&
+            g->current_type_sym->type->kind == TYPE_CLASS)
+            weak_this = 1;
+    }
     /* wasm32 平台下 Lambda 统一按带环境闭包形式发射 */
     bool is_closure = (capc + has_this) > 0 || target_is_wasm32(g);
 
@@ -579,7 +591,28 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildStore(g->builder, v, alloc);
             local_add(&lambda_locals, cs.caps[i].name, alloc, cs.caps[i].type);
         }
-        if (has_this) {
+        if (has_this && weak_this) {
+            /* 弱槽取出 +1 引用；订阅者已释放（槽被置空）则处理器什么都不做。
+             * 取到的引用登记为隐藏的拥有局部量，正常返回与异常展开都会释放。 */
+            LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.wthisp");
+            LLVMValueRef v = emit_weak_field_load(g, p, i8ptr);
+            LLVMBasicBlockRef dead_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                lambda_fn, "weak.this.dead");
+            LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                lambda_fn, "weak.this.live");
+            LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, v, "weak.this.gone"),
+                            dead_bb, live_bb);
+            LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+            if (ret_void) LLVMBuildRetVoid(g->builder);
+            else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
+            LLVMPositionBuilderAtEnd(g->builder, live_bb);
+            LLVMValueRef alloc = emit_entry_alloca(g, i8ptr, "this.slot");
+            LLVMBuildStore(g->builder, v, alloc);
+            g->current_this = alloc;
+            local_add(&lambda_locals, (zan_istr_t){"", 0}, alloc, g->binder->type_object);
+            arc_own_local(g, &lambda_locals);
+        } else if (has_this) {
             LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
                 (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.thisp");
             LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "cap.this");
@@ -725,7 +758,7 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         : NULL;
     LLVMValueRef clo = emit_closure_record(g, expr->loc, lname, rec_ty,
                                            lambda_fn, NULL, cs.caps, capc,
-                                           has_this, self, true);
+                                           weak_this ? 2 : has_this, self, true);
     cap_scan_free(&cs);
     return clo;
 }
