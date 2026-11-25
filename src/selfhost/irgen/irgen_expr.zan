@@ -374,11 +374,14 @@ partial class Irgen {
             }
             string ti = NT();
             string iop = e.op == TK.PlusPlus() ? "add" : "sub";
-            L("  " + ti + " = " + iop + " i64 " + v.op + ", 1");
             // the host increments in the PLACE's width: an int counter wraps
             // at 32 bits, a long one does not
             int pw = ValWidth(v);
-            if (pw > 0 && pw < 64) { ti = WrapArith(ti, pw, false); }
+            if (e.chk) { ti = CheckedIntOp(e, iop, v.op, "1", pw); }
+            else {
+                L("  " + ti + " = " + iop + " i64 " + v.op + ", 1");
+                if (pw > 0 && pw < 64) { ti = WrapArith(ti, pw, false); }
+            }
             StoreTo(e.a, new ExprVal(ti, MkType("int")));
             ExprVal pr = new ExprVal(ti, MkType("int"));
             pr.wbits = pw;
@@ -443,11 +446,14 @@ partial class Irgen {
                 return new ExprVal(t, MkType("double"));
             }
             string t = NT();
-            L("  " + t + " = sub i64 0, " + v.op);
             // the host negates in the OPERAND's width: negating the most
-            // negative int wraps back to it
+            // negative int wraps back to it (checked: -MIN throws)
             int nw = ValWidth(v);
-            if (nw > 0 && nw < 64) { t = WrapArith(t, nw, false); }
+            if (e.chk) { t = CheckedIntOp(e, "sub", "0", v.op, nw); }
+            else {
+                L("  " + t + " = sub i64 0, " + v.op);
+                if (nw > 0 && nw < 64) { t = WrapArith(t, nw, false); }
+            }
             ExprVal r = new ExprVal(t, MkType("int"));
             r.wbits = nw;
             return r;
@@ -512,7 +518,8 @@ partial class Irgen {
         string t = NT();
         string opn = "add";
         if (e.op == TK.MinusMinus()) { opn = "sub"; }
-        L("  " + t + " = " + opn + " i64 " + cur.op + ", 1");
+        if (e.chk) { t = CheckedIntOp(e, opn, cur.op, "1", ValWidth(cur)); }
+        else { L("  " + t + " = " + opn + " i64 " + cur.op + ", 1"); }
         StoreTo(e.a, new ExprVal(t, MkType("int")));
         return cur;
     }
@@ -691,14 +698,14 @@ partial class Irgen {
             L("  " + r + " = call i64 @strtoll(i8* " + s + ", i8** " + endp + ", i32 10)");
             string ep = NT();
             L("  " + ep + " = load i8*, i8** " + endp);
+            // format -> FormatException, range -> OverflowException (two
+            // checks, the host's builtin_str.c split)
             string bad = ParseBadPred(s, ep);
+            EmitRuntimeCheckIf(at, bad, "Convert.ToInt*: input is not a valid integer");
             string erl = NT();
             L("  " + erl + " = load i32, i32* " + errp);
             string erb = NT();
             L("  " + erb + " = icmp eq i32 " + erl + ", 34");
-            string ber = NT();
-            L("  " + ber + " = or i1 " + bad + ", " + erb);
-            bad = ber;
             if (!int64) {
                 string lo = NT();
                 L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
@@ -706,12 +713,14 @@ partial class Irgen {
                 L("  " + hi + " = icmp sgt i64 " + r + ", 2147483647");
                 string ov = NT();
                 L("  " + ov + " = or i1 " + lo + ", " + hi);
-                string b2 = NT();
-                L("  " + b2 + " = or i1 " + bad + ", " + ov);
-                bad = b2;
+                string eo = NT();
+                L("  " + eo + " = or i1 " + erb + ", " + ov);
+                erb = eo;
             }
-            EmitRuntimeCheckIf(at, bad,
-                "Convert.ToInt*: input is not a valid integer (or out of range)");
+            EmitRuntimeCheckIf(at, erb, "Convert.ToInt*: value is outside the range of the target type");
+            string ber = NT();
+            L("  " + ber + " = or i1 " + bad + ", " + erb);
+            bad = ber;
             string safe = NT();
             L("  " + safe + " = select i1 " + bad + ", i64 0, i64 " + r);
             return safe;
@@ -1026,6 +1035,10 @@ partial class Irgen {
             L("  " + ism1 + " = icmp eq i64 " + b.op + ", -1");
             string ovf = NT();
             L("  " + ovf + " = and i1 " + ismin + ", " + ism1);
+            // checked: MIN / -1 throws instead of normalizing (C# semantics)
+            if (e != null && e.chk && op == TK.Slash()) {
+                EmitRuntimeCheckIf(e, ovf, "integer overflow in checked operation");
+            }
             string u2 = NT();
             L("  " + u2 + " = or i1 " + isz + ", " + ovf);
             unsf = u2;

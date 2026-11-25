@@ -17,6 +17,21 @@ partial class Irgen {
     // ---- cast ----
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
+        ExprVal r = GenCastFrom(e, v);
+        // checked narrowing integer cast: the value must survive the
+        // narrowing (the wrapped/zero-extended result equals the source)
+        Node ct = e.type;
+        if (e.chk && r != null && v != null && v.ty != null && ct != null && ct.ival == 0
+            && IntBits(ct) > 0 && IntBits(ct) < 64 && !IsDbl(v.ty) && !IsDbl(ct)
+            && MapType(v.ty) == "i64" && MapType(ct) == "i64" && ct.sval != "bool") {
+            string ov = NT();
+            L("  " + ov + " = icmp ne i64 " + r.op + ", " + v.op);
+            EmitRuntimeCheckIf(e, ov, "integer overflow in checked operation");
+        }
+        return r;
+    }
+
+    ExprVal GenCastFrom(Node e, ExprVal v) {
         Node tgt = e.type;
         if (DynamicReferenceType(tgt) && IsDelegate(v.ty)) {
             ExprVal erased = EraseDelegateReference(v, tgt);
@@ -81,6 +96,13 @@ partial class Irgen {
                 L("  " + below + " = icmp slt i64 " + g64 + ", " + tmin);
                 string above = NT();
                 L("  " + above + " = icmp sgt i64 " + g64 + ", " + tmax);
+                // checked: outside the target width throws (like the integer
+                // narrowing cast) instead of saturating
+                if (e.chk) {
+                    string fo = NT();
+                    L("  " + fo + " = or i1 " + below + ", " + above);
+                    EmitRuntimeCheckIf(e, fo, "integer overflow in checked operation");
+                }
                 string hs = NT();
                 L("  " + hs + " = select i1 " + above + ", i64 " + tmax + ", i64 " + g64);
                 string cl = NT();
@@ -172,6 +194,16 @@ partial class Irgen {
                 string ok;
                 if (tn == "string") { ok = EmitStringIdTest(v); }
                 else { ok = EmitClassIdTest(v, tn); }
+                // null converts to any reference type (C#; the host's cast
+                // test passes a null object): only an unboxed struct needs a
+                // payload
+                if (!isStruct) {
+                    string isn = NT();
+                    L("  " + isn + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
+                    string okn = NT();
+                    L("  " + okn + " = or i1 " + ok + ", " + isn);
+                    ok = okn;
+                }
                 int lok = NL();
                 int lbad = NL();
                 L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
