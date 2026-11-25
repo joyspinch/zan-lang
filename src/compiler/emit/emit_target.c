@@ -1033,6 +1033,10 @@ static bool zan_codegen_split_plan(zan_irgen_t *g, int *parts, int *threads) {
     return true;
 }
 
+static void prepare_sections_cb(void *ctx, LLVMModuleRef part) {
+    zan_irgen_prepare_object_sections((zan_irgen_t *)ctx, part);
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
@@ -1186,8 +1190,6 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     }
     zan_irgen_init_llvm_targets();
 
-    zan_irgen_prepare_object_sections(g, g->mod);
-
     LLVMTargetMachineRef tm;
     if (zan_bind_target_layout(g, &tm) != ZAN_OK) return ZAN_ERROR;
 
@@ -1196,6 +1198,17 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         LLVMDisposeTargetMachine(tm);
         return ZAN_ERROR;
     }
+    /* The finish half of the optimizer, if zan_optimize left it pending, and
+     * section preparation (which must see the final IR: fast-alloc routing
+     * renames libc allocators the pipeline reasons about) run per partition
+     * when the module splits, else here on the whole module. */
+    zan_split_opts_t sopts;
+    memset(&sopts, 0, sizeof(sopts));
+    sopts.finish_level = g->opt_finish_level;
+    sopts.vectorize = g->opt_finish_vectorize;
+    sopts.prepare = prepare_sections_cb;
+    sopts.prepare_ctx = g;
+    g->opt_finish_level = 0;
     char *error = NULL;
     int parts = 0, threads = 1;
     /* Build cache (docs/BUILD_CACHE.md): the key is this exact module plus
@@ -1225,8 +1238,8 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         if (ok) {
             LLVMModuleRef mod = g->mod;
             g->mod = NULL; /* owned and disposed by the splitter */
-            int rc =
-                zan_codegen_split_emit(mod, tm, parts, threads, (const char *const *)paths, &error);
+            int rc = zan_codegen_split_emit(mod, tm, parts, threads, &sopts,
+                                            (const char *const *)paths, &error);
             LLVMDisposeTargetMachine(tm);
             if (rc != 0) {
                 zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
@@ -1254,6 +1267,14 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         LLVMDisposeTargetMachine(tm);
         return ZAN_OK;
     }
+    if (sopts.finish_level > 0) {
+        zan_opt_finish_module(g->mod, tm, sopts.finish_level, sopts.vectorize);
+        if (zan_opt_verify_module(g->mod, "after optimization pipeline") != ZAN_OK) {
+            LLVMDisposeTargetMachine(tm);
+            return ZAN_ERROR;
+        }
+    }
+    zan_irgen_prepare_object_sections(g, g->mod);
     if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path,
                                      LLVMObjectFile, &error)) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,

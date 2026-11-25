@@ -569,8 +569,12 @@
                         target.arch == ZAN_ARCH_AARCH64);
     bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                          (no_shard_env && no_shard_env[0] == '1');
-    bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
-                      ((shard_env && shard_env[0] == '1') || publish_mode);
+    /* Pre-optimization sharding is opt-in (ZAN_SHARD=1): it bounds memory
+     * but loses cross-shard inlining (the self-hosted compiler ran 20-45%
+     * slower). --publish optimizes the whole module like any build; object
+     * emission splits and parallelizes after inlining (codegen_split.h). */
+    bool want_shard =
+        native_arch && !cross_compiling && !shard_opt_out && shard_env && shard_env[0] == '1';
 
     irgen.split_codegen_ok = native_arch && !cross_compiling;
     zan_irgen_bind_target(&irgen);

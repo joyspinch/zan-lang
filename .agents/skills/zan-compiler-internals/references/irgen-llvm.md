@@ -900,3 +900,36 @@ retain 在 Make 里、release 在调用方；内联后 retain/release 自己也�
   区域块只从区域内进入，才可消。
 - 守卫（软失败 phi(x, scratch) 让 LLVM 无法证明非空）、Dictionary、Array.Sort、
   分配器是独立根因，各自另开任务。
+
+## 41. 发布档提速与优化并行：切在内联之后，别切在内联之前（2026-11-24 Mac arm64 实证）
+
+`--publish` 比 `-O2` 慢有两个独立原因，要分开量：默认 `-Os`（全函数 optsize）和
+优化**前**分片（shard，跨分片不内联）。自举编译器编自身（CPU 秒，同一时段）：`-O2`
+3.54；旧 publish 4.28；publish 不分片仍 `-Os` 4.37；publish `-O2` 仍分片 4.49。
+修法：publish 默认 `-O2`、不再默认分片（`ZAN_SHARD=1` 仍可显式开，换内存/编译时间），
+产物与 `-O2` 同速（12.8–13.2G），代价是体积 4.6MB → 8.1MB、编译 22s → ~34s、峰值
+~1.4GB（整模块内联本身就要 ~600MB，分片的 ~400MB 做不到）。
+
+优化并行（`codegen_split.cpp`）：`buildPerModuleDefaultPipeline` = 模块化简半段
+（CGSCC 内联 + 函数化简，需整模块）+ 模块优化半段（向量化/展开/收尾，函数局部）。
+优化阶段只跑前半段，后半段随 SplitModule 分区在各线程里跑完再发射。两段拼起来与
+`default<O2>` 逐函数相同（`ZAN_CODEGEN_SPLIT=0` 下对比 `otool -tv`）。优化阶段
+22.4s → 18.5s，总 30.5s → 27.6s（交替 5 轮取最小）。坑：
+- 分区后半段末尾的 GlobalDCE 会删掉本分区不再引用、但别的分区还在引用的
+  `linkonce[_odr]` 定义（虚表）→ 链接缺符号。切分前把它们改成 `weak[_odr]`。
+- 节准备（Apple fast-alloc 改名 malloc→zan_mem_*、COFF 函数节）必须在后半段之后，
+  改为每分区优化完回调 `zan_irgen_prepare_object_sections`。
+- 需要整模块的 pass 只能放在两半之间：§39 的内联后 ARC 收尾要把 ARC 辅助函数再内联
+  回去，分区里它们只是声明，所以它跑在前半段之后、切分之前。
+- 构建缓存（§38）缓存的是前半段后的模块：键里区分"后半段待跑"，命中时用
+  `zan_opt_plan_finish` 恢复同样的待跑状态，否则命中会静默跳过后半段。
+
+ThinLTO（试过，没落地）：llvm-split → 各分区 `thinlto-pre-link<O2>` → `llvm-lto2`
+进程内后端，编译 ~16s，但产物指令数 +17–22%、cycles +6%；调大
+`-import-instr-limit` 更差。整模块化简贵（单独 opt 24s，而 12 个分区各自化简合计
+<10s）恰恰因为跨分区内联多——这正是运行速度的来源，ThinLTO 补不回来。
+
+度量坑：同一份 IR 只换代码布局（不同切分份数）的自举编译器，`time -l` 的
+instructions retired 就能差 10%（程序行为依赖地址）。单个二进制 A/B 无效：每种
+配置至少编 3–4 个不同切分份数的二进制、各跑多轮取均值；机器负载 >20 时 wall time
+没有意义，用 cycles。

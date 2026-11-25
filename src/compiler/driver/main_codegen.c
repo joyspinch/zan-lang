@@ -135,9 +135,9 @@
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;
     if (opt_level >= 0) {
         effective_opt = (zan_opt_level_t)opt_level;
-    } else if (publish_mode) {
-        effective_opt = ZAN_OPT_SIZE;
     } else if (!debug_info) {
+        /* --publish too: a release build is built for speed; -Os/-Oz opt
+         * into size explicitly. */
         effective_opt = ZAN_OPT_FULL;
     }
     if (debug_info && effective_opt > ZAN_OPT_NONE) {
@@ -212,6 +212,11 @@
         mf_built = false;
     }
 
+    /* Native object output: the optimizer may leave the finish half of the
+     * LLVM pipeline to zan_irgen_write_obj (parallel per partition). Cross
+     * targets keep the one-piece pipeline: their write_obj rewrites libc
+     * names (wasm/riscv32 adapters, iOS main) that the pipeline must see. */
+    irgen.defer_opt_finish_ok = !do_emit_ir && irgen.split_codegen_ok;
     if (effective_opt > ZAN_OPT_NONE) {
         /* Build cache (docs/BUILD_CACHE.md): the optimizer is a pure function
          * of this module and the options, so a hit swaps in the optimized
@@ -224,7 +229,12 @@
         char *opt_log = NULL;
         LLVMModuleRef cached_mod = NULL;
         /* --emit-ir prints the optimized module itself: keep its type names. */
-        if (!do_emit_ir && zan_bcache_opt_key(irgen.mod, (int)effective_opt, &opt_key)) {
+        /* A split build caches the module between the pipeline halves (the
+         * finish half runs at object emission): key it apart, and a hit
+         * restores the same pending finish state. */
+        bool split_opt = zan_opt_plan_finish(&irgen, effective_opt);
+        if (!do_emit_ir &&
+            zan_bcache_opt_key(irgen.mod, (int)effective_opt + (split_opt ? 64 : 0), &opt_key)) {
             if (irgen.builder) LLVMClearInsertionPosition(irgen.builder);
             cached_mod = zan_bcache_opt_load(&opt_key, irgen.mod, &opt_log);
         }

@@ -4,6 +4,7 @@
 #include "irgen.h"
 #include "binder.h"
 #include "zan_abi.h"
+#include "codegen_split.h"
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Transforms/PassBuilder.h>
@@ -1129,16 +1130,6 @@ fail:
     return 0;
 }
 
-zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
-    if (level == ZAN_OPT_NONE) return ZAN_OK;
-
-    LLVMTargetMachineRef tm = NULL;
-    if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
-    zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level);
-    if (tm) LLVMDisposeTargetMachine(tm);
-    return status;
-}
-
 /* ===================== Late ARC pass: pairs exposed by inlining =====================
  * The early zan_opt_arc only sees a retain and its release when both sit in
  * one function before inlining. The common shape -- a callee returns +1
@@ -1580,41 +1571,127 @@ static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, 
                               "verify-fixpoint>,simplifycfg)");
 }
 
-zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
-    if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
-    if (level == ZAN_OPT_NONE) return ZAN_OK;
+/* Level-dependent attribute marking shared by the one-piece and split
+ * pipelines. Returns the default<ON> text pipeline, or NULL for a bad level;
+ * *ol gets N and *vec whether the vectorizer tuning flags are on. */
+static const char *zan_opt_prepare_level(LLVMModuleRef mod, zan_opt_level_t level, int *ol,
+                                         int *vec) {
     /* S-UNWIND（全局 pass ②）：在 LLVM
      * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
      * ZAN_NO_UNWIND_SHRINK=1 关断（红绿对照用）。 */
     if (!getenv("ZAN_NO_UNWIND_SHRINK")) {
         zan_shrink_collapse_invokes(mod);
     }
-    const char *passes = NULL;
+    *vec = level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE;
     switch (level) {
-    case ZAN_OPT_BASIC: passes = "default<O1>"; break;
-    case ZAN_OPT_FULL:
-        zan_opt_mark_huge(mod);
-        passes = "default<O2>";
-        break;
+        case ZAN_OPT_BASIC: *ol = 1; return "default<O1>";
+        case ZAN_OPT_FULL:
+            zan_opt_mark_huge(mod);
+            *ol = 2;
+            return "default<O2>";
 #if ZAN_LLVM_MAJOR >= 23
     case ZAN_OPT_SIZE:
         zan_opt_mark_size(mod, false);
-        passes = "default<O2>";
-        break;
+        *ol = 2;
+        return "default<O2>";
     case ZAN_OPT_SIZE_MIN:
         zan_opt_mark_size(mod, true);
-        passes = "default<O2>";
-        break;
+        *ol = 2;
+        return "default<O2>";
 #else
-    case ZAN_OPT_SIZE: passes = "default<Os>"; break;
-    case ZAN_OPT_SIZE_MIN: passes = "default<Oz>"; break;
+        case ZAN_OPT_SIZE: *ol = 0; return "default<Os>";
+        case ZAN_OPT_SIZE_MIN: *ol = 0; return "default<Oz>";
 #endif
     case ZAN_OPT_AGGRESSIVE:
         zan_opt_mark_huge(mod);
-        passes = "default<O3>";
-        break;
-    default: return ZAN_ERROR;
+        *ol = 3;
+        return "default<O3>";
+    default: return NULL;
     }
+}
+
+/* Split pipeline (codegen_split.h): run the simplification half -- every
+ * inlining decision -- on the whole module now, and leave the finish half to
+ * object emission, which runs it per partition in parallel with codegen
+ * (or on the whole module when it does not split). Only for native
+ * executable builds that go straight to an object file; the debug knobs that
+ * want the final IR here keep the one-piece pipeline. */
+static bool zan_opt_can_defer_finish(zan_irgen_t *g, zan_opt_level_t level) {
+#if ZAN_LLVM_MAJOR < 23
+    /* default<Os>/<Oz> have no split form here. */
+    if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) return false;
+#else
+    (void)level;
+#endif
+    const char *e = getenv("ZAN_OPT_SPLIT");
+    if (e && e[0] == '0') return false;
+    if (!g->defer_opt_finish_ok) return false;
+    if ((e = getenv("ZAN_OPT_PIPELINE")) && e[0]) return false;
+    if ((e = getenv("ZAN_DUMP_OPT_IR")) && e[0]) return false;
+    return true;
+}
+
+bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level) {
+    g->opt_finish_level = 0;
+    g->opt_finish_vectorize = false;
+    if (level == ZAN_OPT_NONE || !zan_opt_can_defer_finish(g, level)) return false;
+    switch (level) {
+        case ZAN_OPT_BASIC: g->opt_finish_level = 1; break;
+        case ZAN_OPT_FULL:
+        case ZAN_OPT_SIZE:
+        case ZAN_OPT_SIZE_MIN: g->opt_finish_level = 2; break;
+        case ZAN_OPT_AGGRESSIVE: g->opt_finish_level = 3; break;
+        default: return false;
+    }
+    g->opt_finish_vectorize = level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE;
+    return true;
+}
+
+static bool late_arc_wanted(zan_opt_level_t level) {
+    return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE || level == ZAN_OPT_SIZE ||
+            level == ZAN_OPT_SIZE_MIN) &&
+           !getenv("ZAN_NO_LATE_ARC") && !getenv("ZAN_OPT_PIPELINE");
+}
+
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
+    if (level == ZAN_OPT_NONE) return ZAN_OK;
+
+    LLVMTargetMachineRef tm = NULL;
+    if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
+    zan_status_t status;
+    if (zan_opt_plan_finish(g, level)) {
+        status = zan_opt_verify_module(g->mod, "before optimization");
+        int ol = 0, vec = 0;
+        if (status == ZAN_OK && !zan_opt_prepare_level(g->mod, level, &ol, &vec))
+            status = ZAN_ERROR;
+        /* The late ARC pass needs the whole module (it re-inlines the ARC
+         * helpers), and only needs inlining to be done: run it between the
+         * halves instead of after the full pipeline. */
+        unsigned late_mask = 0;
+        if (status == ZAN_OK && late_arc_wanted(level)) late_mask = late_arc_outline(g->mod);
+        if (status == ZAN_OK) {
+            zan_opt_simplify_module(g->mod, tm, ol, vec);
+            status = zan_opt_verify_module(g->mod, "after simplification pipeline");
+        }
+        if (status == ZAN_OK && late_mask) status = late_arc_finish(g->mod, tm, late_mask);
+        /* Drop bodies the inliner left dead now, so extern-library pruning
+         * between here and object emission sees the final call graph. */
+        if (status == ZAN_OK) status = run_checked_passes(g->mod, NULL, "globaldce");
+        if (status != ZAN_OK) g->opt_finish_level = 0;
+    } else {
+        status = zan_opt_run_passes_on_module(g->mod, tm, level);
+    }
+    if (tm) LLVMDisposeTargetMachine(tm);
+    return status;
+}
+
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+                                          zan_opt_level_t level) {
+    if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
+    if (level == ZAN_OPT_NONE) return ZAN_OK;
+    int ol = 0, vec = 0;
+    const char *passes = zan_opt_prepare_level(mod, level, &ol, &vec);
+    if (!passes) return ZAN_ERROR;
 
     /* 调试旋钮：ZAN_OPT_PIPELINE 覆盖默认管线文本（如 "sroa" 逐 pass
      * 二分），"none" 完全跳过 LLVM 管线——定位优化缺陷用（A595）。 */
@@ -1632,16 +1709,14 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
     LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
 
-    if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
+    if (vec) {
         LLVMPassBuilderOptionsSetLoopInterleaving(opts, 1);
         LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
         LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
         LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
     }
 
-    bool late_arc = (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE ||
-                     level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) &&
-                    !getenv("ZAN_NO_LATE_ARC") && !getenv("ZAN_OPT_PIPELINE");
+    bool late_arc = late_arc_wanted(level);
     unsigned late_mask = late_arc ? late_arc_outline(mod) : 0;
     late_arc = late_mask != 0;
     LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);

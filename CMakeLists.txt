@@ -8442,8 +8442,8 @@ add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
 set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
 
 # ---- publish shard closure completeness (B-ID49) ----
-# A Gui design-doc program compiles with auto-stdlib, so --publish takes the
-# SHARDED main path: its reflection metadata graph nests ~90 globals deep and
+# A Gui design-doc program compiles with auto-stdlib and ZAN_SHARD=1 (SHARD=1),
+# so --publish takes the SHARDED main path: its reflection metadata graph nests ~90 globals deep and
 # the old 32-level closure-walk cap silently truncated nested travel globals'
 # dependency walks, leaving a fragment referencing an undefined
 # @__zan.refl.str.N (LLVM parse reject). Requires --auto-stdlib: without it
@@ -8455,6 +8455,7 @@ add_test(NAME conformance_shard_deep_refl COMMAND ${CMAKE_COMMAND}
   -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_shard_deep_refl${_exe_ext}
   -DWORKDIR=${CMAKE_BINARY_DIR}/test-out
   -DEXTRA_FLAGS=--auto-stdlib
+  -DSHARD=1
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_shard_deep_refl PROPERTIES TIMEOUT 240)
 

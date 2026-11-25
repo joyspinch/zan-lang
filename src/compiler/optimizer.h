@@ -74,6 +74,11 @@ typedef struct {
 } zan_opt_report_t;
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level);
+/* Decides whether this build leaves the finish half of the LLVM pipeline to
+ * object emission (codegen_split.h) and records it in g->opt_finish_level /
+ * opt_finish_vectorize. zan_optimize calls it; a build-cache hit on the
+ * optimized module calls it to restore the same pending state. */
+bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level);
 void zan_opt_report_print(const zan_opt_report_t *report);
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
