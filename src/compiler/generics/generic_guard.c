@@ -792,31 +792,17 @@ LLVMValueRef emit_string_base_guard(zan_irgen_t *g, LLVMValueRef payload,
 
 /* 软失败暂存区只在真的遇到空引用时才用到。曾在函数入口无条件取一次（入口
  * 缓存），递归/热调用函数每次进入都白付一次运行时调用（对象树基准 ~3% 采样）。
- * 现在只在冷的空值分支里就地调用。 */
+ * 现在只在冷的空值分支里就地调用，并标记 cold/nounwind 防止优化器反向提升。 */
 static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
-  LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
-  LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
   LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  if (!g->soft_scratch_slot || g->soft_scratch_fn != fn) {
-    g->soft_scratch_slot = emit_entry_alloca(g, i8p, "soft.scratch.slot");
-    zan_builder_point_t pt = zan_builder_save(g);
-    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
-    LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
-    if (term)
-      LLVMPositionBuilderBefore(g->builder, term);
-    else
-      LLVMPositionBuilderAtEnd(g->builder, entry);
-    LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
-    LLVMValueRef sf = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
-    if (!sf)
-      sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
-    LLVMValueRef scratch =
-        zan_call2(g->builder, fn_ty, sf, NULL, 0, "soft.scratch.init");
-    LLVMBuildStore(g->builder, scratch, g->soft_scratch_slot);
-    zan_builder_restore(g, pt);
-    g->soft_scratch_fn = fn;
+  LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
+  LLVMValueRef sf = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
+  if (!sf) {
+    sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
+    guard_add_attr(g, sf, "cold");
+    guard_add_attr(g, sf, "nounwind");
   }
-  return LLVMBuildLoad2(g->builder, i8p, g->soft_scratch_slot, "soft.scratch");
+  return zan_call2(g->builder, fn_ty, sf, NULL, 0, "soft.scratch");
 }
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                    LLVMValueRef isnull, zan_loc_t loc);

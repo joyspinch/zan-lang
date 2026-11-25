@@ -589,7 +589,12 @@ void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym, LLVMValueRef fn,
   g->functions[g->function_count].fn = fn;
   g->functions[g->function_count].fn_type = fn_type;
   g->functions[g->function_count].modifiers = sym ? sym->modifiers : 0;
-  zan_opt_note_zan_fn_name(LLVMGetValueName(fn));
+  bool is_native_extern =
+      sym && ((sym->modifiers & MOD_EXTERN) != 0 ||
+              (sym->decl && sym->decl->kind == AST_METHOD_DECL &&
+               (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0));
+  if (!is_native_extern)
+    zan_opt_note_zan_fn_name(LLVMGetValueName(fn));
   if ((g->function_count + 1) * 2 >= g->fn_index_cap)
     fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);
   if (sym)

@@ -123,8 +123,10 @@ g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
                                       obj, &neg16, 1, "rcptr");
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64, 0), "rciptr");
-  /* 读一次引用计数：既是 immortal 判定，也是 freed 守卫的输入。 */
+  /* 原子读一次引用计数（monotonic, align 8）：既是 immortal 判定，也是 freed 守卫的输入。 */
   LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
+  LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(rc_now, 8);
   if (g->arc_guard) {
     emit_arc_freed_use_check(g, g->rt_retain, rc_now, obj,
                              ZAN_ARC_FAULT_USE_OBJ,
@@ -195,8 +197,10 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
                                       obj, &neg16, 1, "rcptr");
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64, 0), "rciptr");
-  /* 读一次引用计数：既是 immortal 判定，也是 freed 守卫的输入。 */
+  /* 原子读一次引用计数（monotonic, align 8）：既是 immortal 判定，也是 freed 守卫的输入。 */
   LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
+  LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(rc_now, 8);
   if (g->arc_guard) {
     emit_arc_freed_use_check(g, g->rt_release, rc_now, obj,
                              ZAN_ARC_FAULT_USE_OBJ,
@@ -218,7 +222,7 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
   LLVMPositionBuilderAtEnd(g->builder, sub_bb);
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub,
                                            rc_iptr, LLVMConstInt(i64, 1, 0),
-                                           LLVMAtomicOrderingAcquireRelease, 0);
+                                           LLVMAtomicOrderingRelease, 0);
   {
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                                     obj, &neg8, 1, "arcsp");
@@ -247,6 +251,7 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
   LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
   LLVMPositionBuilderAtEnd(g->builder, free_bb);
+  LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
   {
     LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
     void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
@@ -300,6 +305,8 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
                                      obj, &sent16, 1, "sentp"),
                        LLVMPointerType(i64, 0), "sentip"),
       "sentrc");
+  LLVMSetOrdering(sent_rc, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(sent_rc, 8);
   LLVMBasicBlockRef literal =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "islit");
   LLVMBuildCondBr(g->builder,
@@ -557,13 +564,14 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
   /* refcount = 1 at raw[0..7] */
   LLVMValueRef rc_ptr =
       LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
-  LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
+  LLVMSetAlignment(LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr),
+                   8);
   LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
   LLVMValueRef site_ptr = LLVMBuildGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
   LLVMValueRef site_iptr =
       LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
-  LLVMBuildStore(g->builder, site, site_iptr);
+  LLVMSetAlignment(LLVMBuildStore(g->builder, site, site_iptr), 8);
   LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
   LLVMValueRef user_ptr = LLVMBuildGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
@@ -610,15 +618,18 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
   emit_rt_alloc_add(g, total);
   LLVMValueRef rc_ptr =
       LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
-  LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
+  LLVMSetAlignment(LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr),
+                   8);
   LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
   LLVMValueRef magic_ptr = LLVMBuildGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "magicp");
   LLVMValueRef magic_iptr = LLVMBuildBitCast(
       g->builder, magic_ptr, LLVMPointerType(i64, 0), "magicip");
-  LLVMBuildStore(g->builder,
-                 LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
-                 magic_iptr);
+  LLVMSetAlignment(
+      LLVMBuildStore(g->builder,
+                     LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
+                     magic_iptr),
+      8);
   LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
   LLVMValueRef user_ptr = LLVMBuildGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
@@ -680,6 +691,8 @@ for (int rel = 0; rel < 2; rel++) {
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
   LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
+  LLVMSetOrdering(rc, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(rc, 8);
   emit_arc_freed_use_check(
       g, fn, rc, obj, ZAN_ARC_FAULT_USE_ARR,
       rel ? "release through a stale reference (array was already freed)"
@@ -695,7 +708,7 @@ for (int rel = 0; rel < 2; rel++) {
   } else {
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(
         g->builder, LLVMAtomicRMWBinOpSub, rc_iptr, LLVMConstInt(i64t, 1, 0),
-        LLVMAtomicOrderingAcquireRelease, 0);
+        LLVMAtomicOrderingRelease, 0);
     emit_arc_underflow_check(g, fn, rc_old, obj, NULL,
                              ZAN_ARC_FAULT_ARR_RELEASE,
                              "release of an already-freed array");
@@ -708,6 +721,7 @@ for (int rel = 0; rel < 2; rel++) {
                              LLVMConstInt(i64t, 0, 0), "iszero"),
                     free_bb, ret_bb);
     LLVMPositionBuilderAtEnd(g->builder, free_bb);
+    LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
     if (g->rt_live_unregister) {
       zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
                 g->rt_live_unregister, &obj, 1, "");
@@ -767,6 +781,8 @@ for (int rel = 0; rel < 2; rel++) {
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
   LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
+  LLVMSetOrdering(rc, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(rc, 8);
   LLVMValueRef is_sent =
       zan_icmp(g->builder, LLVMIntEQ, rc,
                LLVMConstInt(i64t, ZAN_STRING_SENTINEL_RC, 0), "issent");
@@ -832,6 +848,8 @@ for (int rel = 0; rel < 2; rel++) {
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
   LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
+  LLVMSetOrdering(rc, LLVMAtomicOrderingMonotonic);
+  LLVMSetAlignment(rc, 8);
   LLVMValueRef is_sent =
       zan_icmp(g->builder, LLVMIntEQ, rc,
                LLVMConstInt(i64t, ZAN_STRING_SENTINEL_RC, 0), "issent");
@@ -844,7 +862,7 @@ for (int rel = 0; rel < 2; rel++) {
                            "(string was already freed)");
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub,
                                            rc_iptr, LLVMConstInt(i64t, 1, 0),
-                                           LLVMAtomicOrderingAcquireRelease, 0);
+                                           LLVMAtomicOrderingRelease, 0);
   emit_arc_underflow_check(g, g->rt_str_release, rc_old, obj, NULL,
                            ZAN_ARC_FAULT_STR_RELEASE,
                            "release of an already-freed string");
@@ -856,6 +874,7 @@ for (int rel = 0; rel < 2; rel++) {
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
   LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
   LLVMPositionBuilderAtEnd(g->builder, free_bb);
+  LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
   if (g->rt_live_unregister) {
     zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
               g->rt_live_unregister, &obj, 1, "");

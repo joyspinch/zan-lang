@@ -400,9 +400,9 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), rec, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    /* 析构防重入：原子声明防止并发二次释放 */
+    /* 析构防重入：release 原子减 + 末次释放路径 acquire 栅栏 */
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingRelease, 0);
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(c, fn, "done");
@@ -412,6 +412,7 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1"),
                     drop, done_bb);
     LLVMPositionBuilderAtEnd(b, drop);
+    LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
     /* 方法组绑定的接收者引用释放 */
     if (release_target) {
         LLVMValueRef p = LLVMBuildStructGEP2(b, rec_ty, rec, 2, "tgp");

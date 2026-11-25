@@ -1475,10 +1475,12 @@ static void shrink_map_free(shrink_map_t *m) {
   m->mask = 0;
 }
 
-/* raise 源（Zan EH 仅由这两个符号及 guard 抛异常助手发起）。 */
+/* raise 源（Zan EH 仅由这些符号及 guard/rethrow 抛异常助手发起）。 */
 static bool shrink_is_raise_source(const char *n) {
   return strcmp(n, "RaiseException") == 0 || strcmp(n, "__cxa_throw") == 0 ||
-         strcmp(n, "__zan_throw_guard") == 0;
+         strcmp(n, "__cxa_rethrow") == 0 ||
+         strcmp(n, "__zan_throw_guard") == 0 ||
+         strcmp(n, "__zan_guard_raise") == 0;
 }
 
 /* ---- Zan 函数名注册表（irgen_register_function 逐个喂入）----
@@ -1552,17 +1554,24 @@ void zan_opt_note_zan_fn_name(const char *name) {
  * MAYTHROW，只损失塌缩不损失正确性）。均为 OS/CRT 函数：其 SEH 为
  * OS 层，__gxx personality 拒收非 C++ code，无 Zan landing pad 可达。 */
 static const char *const shrink_native_names[] = {
+    "abort",
     "calloc",
     "malloc",
     "free",
     "realloc",
     "exit",
+    "_exit",
     "fflush",
     "printf",
     "puts",
     "setvbuf",
     "strlen",
+    "strcmp",
     "strncmp",
+    "memcpy",
+    "memmove",
+    "memset",
+    "memcmp",
     "_setmode",
     "__acrt_iob_func",
     "_ZSt13set_terminatePFvvE",
@@ -1572,6 +1581,12 @@ static const char *const shrink_native_names[] = {
     "ReleaseSRWLockExclusive",
     "InitializeSRWLock",
     "GetCurrentThreadId",
+    "Sleep",
+    "usleep",
+    "nanosleep",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "pthread_self",
     "CancelIoEx",
     "DestroyWindow",
     "GetWindowLongPtrW",
@@ -1580,6 +1595,44 @@ static const char *const shrink_native_names[] = {
     "ShowWindow",
     "UpdateWindow",
 };
+
+static bool shrink_is_native_leaf(const char *n) {
+  for (unsigned i = 0;
+       i < sizeof(shrink_native_names) / sizeof(shrink_native_names[0]); i++) {
+    if (strcmp(n, shrink_native_names[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
+/* 可安全向 LLVM 声明附加 nounwind 属性的纯叶子声明（无用户回调、非内建、非 EH 抛出源）。 */
+static bool shrink_decl_safe_nounwind(const char *n) {
+  if (!n || !*n || shrink_is_raise_source(n))
+    return false;
+  if (strcmp(n, "__zan_eh_tmp_unwind") == 0 ||
+      shrink_strset_has(&shrink_zan_set, n))
+    return false;
+  if (shrink_is_native_leaf(n))
+    return true;
+  if (strcmp(n, "zan_rt_soft_scratch") == 0 ||
+      strcmp(n, "zan_rt_soft_is_hard") == 0 ||
+      strcmp(n, "zan_rt_soft_report") == 0 ||
+      strcmp(n, "zan_rt_live_register") == 0 ||
+      strcmp(n, "zan_rt_live_register_named") == 0 ||
+      strcmp(n, "zan_rt_live_unregister") == 0 ||
+      strcmp(n, "zan_rt_now_ms") == 0 ||
+      strcmp(n, "zan_rt_tick_us") == 0 ||
+      strcmp(n, "zan_rt_str_len") == 0 ||
+      strcmp(n, "zan_rt_str_compare") == 0 ||
+      strcmp(n, "zan_rt_str_equal") == 0 ||
+      strcmp(n, "zan_rt_str_hash") == 0 ||
+      strcmp(n, "zan_rt_str_bytes") == 0 ||
+      strcmp(n, "zan_rt_arr_len") == 0 ||
+      strcmp(n, "zan_rt_bound_check") == 0 ||
+      strcmp(n, "zan_bound_check") == 0)
+    return true;
+  return false;
+}
 
 /* declaration 的 nothrow 白名单（严格，宁漏勿错）：
  * - raise 源（RaiseException/__cxa_throw）与重抛助手
@@ -1607,11 +1660,7 @@ static bool shrink_extern_nothrow(const char *n) {
       strncmp(n, "llvm.", 5) == 0 || strncmp(n, "zan_", 4) == 0 ||
       strncmp(n, "__zan_", 6) == 0)
     return true;
-  for (unsigned i = 0;
-       i < sizeof(shrink_native_names) / sizeof(shrink_native_names[0]); i++)
-    if (strcmp(n, shrink_native_names[i]) == 0)
-      return true;
-  return false;
+  return shrink_is_native_leaf(n);
 }
 
 /* 调用站点的直接被调者（穿透常量 bitcast 到 Function），无则 NULL */
@@ -1755,7 +1804,7 @@ static void shrink_collapse_invoke(LLVMBuilderRef b, LLVMValueRef inv) {
   LLVMBuildBr(b, norm);
 }
 
-int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
+static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
   unsigned nfn = 0;
   for (LLVMValueRef f = LLVMGetFirstFunction(mod); f;
        f = LLVMGetNextFunction(f))
@@ -1766,16 +1815,12 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
   shrink_map_t idx; /* Function -> 下标 + 1；0 = 未登记 */
   if (!shrink_map_init(&idx, nfn))
     return 0;
-  shrink_map_t st; /* Function -> shrink_state_t */
-  if (!shrink_map_init(&st, nfn)) {
-    shrink_map_free(&idx);
-    return 0;
-  }
 
   LLVMValueRef *fns = (LLVMValueRef *)calloc(nfn, sizeof(LLVMValueRef));
-  shrink_uvec_t *callees = (shrink_uvec_t *)calloc(nfn, sizeof(shrink_uvec_t));
-  bool *has_raise = (bool *)calloc(nfn, sizeof(bool));
-  if (!fns || !callees || !has_raise)
+  shrink_uvec_t *callers = (shrink_uvec_t *)calloc(nfn, sizeof(shrink_uvec_t));
+  bool *may_throw = (bool *)calloc(nfn, sizeof(bool));
+  unsigned *queue = (unsigned *)malloc(nfn * sizeof(unsigned));
+  if (!fns || !callers || !may_throw || !queue)
     goto fail;
   {
     unsigned fi = 0;
@@ -1786,18 +1831,13 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
       int *slot = shrink_map_slot(&idx, f, &fresh);
       *slot = (int)(fi + 1);
       (void)fresh;
-      const char *n = LLVMGetValueName(f);
-      *shrink_map_slot(&st, f, NULL) =
-          LLVMIsDeclaration(f)
-              ? (shrink_is_raise_source(n)
-                     ? SHRINK_MAYTHROW
-                     : (shrink_extern_nothrow(n) ? SHRINK_NOTHROW
-                                                 : SHRINK_MAYTHROW))
-              : SHRINK_UNKNOWN;
+      if (LLVMIsDeclaration(f)) {
+        const char *n = LLVMGetValueName(f);
+        may_throw[fi] = shrink_is_raise_source(n) || !shrink_extern_nothrow(n);
+      }
     }
-    /* 边收集：caller -> callee（模块内定义）+ raise 源标记。
-     * 模块外被调者按名字规则直接惩罚 caller（保守：未知 extern
-     * 视为可抛——宁漏勿错）。 */
+    /* 反向边收集：callee -> caller（模块内定义）+ 直接 may_throw 种子标记。
+     * 未知间接调用或可抛 extern 声明直接将 caller 标为 may_throw。 */
     for (unsigned i = 0; i < nfn; i++) {
       LLVMValueRef f = fns[i];
       if (LLVMIsDeclaration(f))
@@ -1819,56 +1859,75 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
             /* Unknown indirect targets may unwind. Skipping the
              * edge without this mark incorrectly proves wrappers
              * (reflection/delegates/vtables) nothrow. */
-            has_raise[i] = true;
+            may_throw[i] = true;
             continue;
           }
+          const char *callee_name = LLVMGetValueName(c);
           bool fresh = false;
           int ci1 = *shrink_map_slot(&idx, c, &fresh);
           if (ci1 == 0) {
-            if (!shrink_extern_nothrow(LLVMGetValueName(c)) ||
-                shrink_is_raise_source(LLVMGetValueName(c)))
-              has_raise[i] = true;
+            if (!shrink_extern_nothrow(callee_name) ||
+                shrink_is_raise_source(callee_name))
+              may_throw[i] = true;
             continue;
           }
           unsigned ci = (unsigned)ci1 - 1;
-          if (shrink_is_raise_source(LLVMGetValueName(c)))
-            has_raise[i] = true;
-          if (!shrink_uvec_push(&callees[i], ci))
+          if (shrink_is_raise_source(callee_name)) {
+            may_throw[i] = true;
+            continue;
+          }
+          if (ci != i && !shrink_uvec_push(&callers[ci], i))
             goto oom;
         }
       }
     }
-    /* 不动点（round-robin）：nothrow ⇔ 无 raise 源 ∧ 全部被调者
-     * nothrow。extern 种子已定，传播至闭包。 */
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (unsigned i = 0; i < nfn; i++) {
-        LLVMValueRef f = fns[i];
-        if (LLVMIsDeclaration(f))
-          continue;
-        int *sp = shrink_map_slot(&st, f, NULL);
-        if (*sp == SHRINK_NOTHROW || has_raise[i])
-          continue;
-        bool all_nt = true;
-        for (unsigned k = 0; k < callees[i].n; k++) {
-          int cs = *shrink_map_slot(&st, fns[callees[i].v[k]], NULL);
-          if (cs != SHRINK_NOTHROW) {
-            all_nt = false;
-            break;
-          }
-        }
-        if (all_nt) {
-          *sp = SHRINK_NOTHROW;
-          changed = true;
+    /* O(V+E) 乐观反向可达性：仅从 may_throw 种子沿 callers[] 反向传播。
+     * 任何无法抵达 raise 源 / 间接调用 / 可抛外部声明的函数（包括纯递归
+     * 与互递归 SCC）均精确证为 nothrow。 */
+    unsigned qhead = 0, qtail = 0;
+    for (unsigned i = 0; i < nfn; i++) {
+      if (may_throw[i])
+        queue[qtail++] = i;
+    }
+    while (qhead < qtail) {
+      unsigned u = queue[qhead++];
+      for (unsigned k = 0; k < callers[u].n; k++) {
+        unsigned caller = callers[u].v[k];
+        if (!may_throw[caller]) {
+          may_throw[caller] = true;
+          queue[qtail++] = caller;
         }
       }
     }
+
+    /* 将证明结果落地为 LLVM nounwind 属性：让后续 default<O2/O3> 的内联器、
+     * DSE、LICM、SimplifyCFG 和 SEH 代码生成不再把安全辅助函数重写成 invoke。 */
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    unsigned nounwind_kind = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    LLVMAttributeRef nounwind_attr =
+        nounwind_kind ? LLVMCreateEnumAttribute(ctx, nounwind_kind, 0) : NULL;
+    if (nounwind_attr) {
+      for (unsigned i = 0; i < nfn; i++) {
+        if (may_throw[i])
+          continue;
+        LLVMValueRef f = fns[i];
+        if (LLVMIsDeclaration(f) &&
+            !shrink_decl_safe_nounwind(LLVMGetValueName(f)))
+          continue;
+        if (!LLVMGetEnumAttributeAtIndex(
+                f, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                nounwind_kind)) {
+          LLVMAddAttributeAtIndex(
+              f, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, nounwind_attr);
+        }
+      }
+    }
+
     /* 塌缩：被调者 nothrow 且可解析为 Function 的 invoke → call+br。
      * 先取后继再迭代（擦除只动 invoke 自己，插入的 call/br 不含
      * invoke，按 next 指针继续安全）。 */
     int collapsed = 0, total_inv = 0, nthr = 0;
-    LLVMBuilderRef b = LLVMCreateBuilderInContext(LLVMGetModuleContext(mod));
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
     for (unsigned i = 0; i < nfn; i++) {
       LLVMValueRef f = fns[i];
       if (LLVMIsDeclaration(f))
@@ -1881,8 +1940,14 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
           if (LLVMGetInstructionOpcode(inst) == LLVMInvoke) {
             total_inv++;
             LLVMValueRef c = shrink_callee_fn(inst);
-            int cs = c ? *shrink_map_slot(&st, c, NULL) : SHRINK_MAYTHROW;
-            if (cs == SHRINK_NOTHROW) {
+            bool c_nothrow = false;
+            if (c) {
+              bool fresh = false;
+              int ci1 = *shrink_map_slot(&idx, c, &fresh);
+              if (ci1 > 0)
+                c_nothrow = !may_throw[(unsigned)ci1 - 1];
+            }
+            if (c_nothrow) {
               /* invoke 无 tail 语义（musttail 仅 CallInst），
                * 无需检查——C API LLVMIsTailCall 会按 CallInst
                * 强转 InvokeInst，不可用。 */
@@ -1895,24 +1960,41 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
       }
     }
     for (unsigned i = 0; i < nfn; i++) {
-      if (*shrink_map_slot(&st, fns[i], NULL) == SHRINK_NOTHROW)
+      if (!may_throw[i])
         nthr++;
     }
     LLVMDisposeBuilder(b);
     zan_opt_verify_module(mod, "after shrink collapse");
-    fprintf(stderr,
-            "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
-            collapsed, total_inv, nthr, nfn);
+    if (verbose) {
+      fprintf(stderr,
+              "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
+              collapsed, total_inv, nthr, nfn);
+    }
+    for (unsigned i = 0; i < nfn; i++)
+      free(callers[i].v);
+    free(fns);
+    free(callers);
+    free(may_throw);
+    free(queue);
+    shrink_map_free(&idx);
+    return collapsed;
   }
 oom:
 fail:
-  for (unsigned i = 0; i < nfn; i++)
-    free(callees[i].v);
+  if (callers) {
+    for (unsigned i = 0; i < nfn; i++)
+      free(callers[i].v);
+  }
   free(fns);
-  free(callees);
-  free(has_raise);
+  free(callers);
+  free(may_throw);
+  free(queue);
   shrink_map_free(&idx);
-  shrink_map_free(&st);
+  return 0;
+}
+
+int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
+  (void)zan_shrink_collapse_invokes_impl(mod, true);
   return 0;
 }
 
@@ -2095,7 +2177,8 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
             LLVMValueRef callee = LLVMGetCalledValue(inst);
             const char *callee_name = callee ? LLVMGetValueName(callee) : NULL;
             if (callee_name && (strcmp(callee_name, "zan_rt_alloc") == 0 ||
-                                strcmp(callee_name, "zan_alloc") == 0)) {
+                                strcmp(callee_name, "zan_alloc") == 0) &&
+                LLVMGetNumArgOperands(inst) >= 2) {
               stats.objects_analyzed++;
               LLVMValueRef size_val = LLVMGetOperand(inst, 0);
               LLVMValueRef site_val = LLVMGetOperand(inst, 1);
@@ -2230,12 +2313,14 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
   }
 
   /* 在主 LLVM O* 管线期间暂时给运行时 ARC/alloc 辅助函数加上 noinline，
-   * 让用户函数先行内联并暴露出完整逃逸/ARC 配对/常量特征，再在后续清理中按需放行内联。 */
+   * 让用户函数先行内联并暴露出完整逃逸/ARC 配对/常量特征，再在后续清理中按需放行内联。
+   * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
+   * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
   static const char *const k_rt_defer_inline[] = {
       "zan_rt_alloc",       "zan_rt_retain",     "zan_rt_release",
       "zan_rt_release_dyn", "zan_rt_str_retain", "zan_rt_str_release",
   };
-  LLVMValueRef marked_rt[6] = {0};
+  bool marked_rt[6] = {false};
   int marked_count = 0;
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   unsigned noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
@@ -2249,7 +2334,8 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
               noinline_kind)) {
         LLVMAddAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinl_attr);
-        marked_rt[marked_count++] = fn;
+        marked_rt[i] = true;
+        marked_count++;
       }
     }
   }
@@ -2268,10 +2354,14 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
   LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
   LLVMDisposePassBuilderOptions(opts);
   if (err) {
-    for (int i = 0; i < marked_count; i++) {
-      LLVMRemoveEnumAttributeAtIndex(
-          marked_rt[i], (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-          noinline_kind);
+    for (int i = 0; i < 6; i++) {
+      if (!marked_rt[i])
+        continue;
+      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
+      if (fn && !LLVMIsDeclaration(fn)) {
+        LLVMRemoveEnumAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
+      }
     }
     char *msg = LLVMGetErrorMessage(err);
     fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
@@ -2320,16 +2410,29 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
         report_out->dce.dead_stores += ds2.dead_stores;
     }
 
-    for (int i = 0; i < marked_count; i++) {
-      LLVMRemoveEnumAttributeAtIndex(
-          marked_rt[i], (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-          noinline_kind);
+    if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
+      if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
+        post_changed = true;
     }
+
+    bool rt_unmarked = false;
+    for (int i = 0; i < 6; i++) {
+      if (!marked_rt[i])
+        continue;
+      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
+      if (fn && !LLVMIsDeclaration(fn)) {
+        LLVMRemoveEnumAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
+        rt_unmarked = true;
+      }
+    }
+    (void)marked_count;
 
     const char *cleanup = NULL;
     if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
-      if (post_changed)
+      if (rt_unmarked || post_changed)
         cleanup =
+            "cgscc(inline),"
             "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
             "globaldce";
     } else if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {

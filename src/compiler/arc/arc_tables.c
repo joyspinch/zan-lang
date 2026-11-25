@@ -24,7 +24,7 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
                                            LLVMConstInt(i64, 1, 0),
-                                           LLVMAtomicOrderingAcquireRelease, 0);
+                                           LLVMAtomicOrderingRelease, 0);
   LLVMValueRef is1 =
       zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
   LLVMValueRef over =
@@ -35,6 +35,7 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMBasicBlockRef begin_bb = LLVMAppendBasicBlockInContext(c, fn, "begin");
   LLVMBuildCondBr(b, is1, begin_bb, ret);
   LLVMPositionBuilderAtEnd(b, begin_bb);
+  LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
   /* 弱引用表为空时 destroy_begin 恒返回真：内联判空，不付调用 */
   LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
   LLVMBasicBlockRef wcall_bb =
@@ -163,7 +164,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
                                            LLVMConstInt(i64, 1, 0),
-                                           LLVMAtomicOrderingAcquireRelease, 0);
+                                           LLVMAtomicOrderingRelease, 0);
   LLVMValueRef is1 =
       zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
   LLVMValueRef over =
@@ -173,6 +174,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMPositionBuilderAtEnd(b, last_bb);
   LLVMBuildCondBr(b, is1, relf, ret);
   LLVMPositionBuilderAtEnd(b, relf);
+  LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
   LLVMTypeRef free_ty =
       LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
   if (coll_kind == 1) {
