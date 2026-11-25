@@ -3,6 +3,16 @@
 static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     if (w <= 0 || h <= 0) return;
     if (!zgl_begin(s, ZGL_MODE_REPLACE)) { cpu_clear_rect(s, x, y, w, h, c); return; }
+    zgl_target *t = zgl_target_of(s);
+    if (t) {
+        if (((c >> 24) & 0xFF) < 255) {
+            t->opaque_dst = 0;
+        } else if (x <= 0 && y <= 0 && x + w >= s->width && y + h >= s->height
+                   && s->clip_x0 <= 0 && s->clip_y0 <= 0
+                   && s->clip_x1 >= s->width && s->clip_y1 >= s->height) {
+            t->opaque_dst = 1;
+        }
+    }
     zgl_rect_quad(s, x, y, w, h, 0, ZAN_CORNERS_ALL, 0, -1, c, c, 0, 0);
 }
 
@@ -40,10 +50,12 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         cpu_surface_round(s, x, y, w, h, radius, corners, fill, border, thickness);
         return;
     }
-    if (g_zgl.count) zgl_flush();
+    zgl_target *t = zgl_target_of(s);
+    int fast_blend = (t && t->opaque_dst);
+    if (!fast_blend && g_zgl.count) zgl_flush();
     zgl_quad q;
     memset(&q, 0, sizeof(q));
-    q.kind = ZGL_K_SURFACE;
+    q.kind = fast_blend ? ZGL_K_SURFACE_FAST : ZGL_K_SURFACE;
     q.cx = (float)x + (float)w * 0.5f;
     q.cy = (float)y + (float)h * 0.5f;
     q.hw = (float)w * 0.5f; q.hh = (float)h * 0.5f;
@@ -55,7 +67,7 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
     q.p0 = (float)(corners & 15);
     zgl_color(q.col0, fill, 0); zgl_color(q.col1, border, 0);
     zgl_push(s, &q, (float)x, (float)y, (float)x + (float)w, (float)y + (float)h);
-    zgl_flush();
+    if (!fast_blend) zgl_flush();
 }
 
 static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,

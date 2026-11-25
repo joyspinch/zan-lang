@@ -146,7 +146,7 @@ ZGL_FS_COMMON
     "        if (v_kind.y > 0.5) cov = floor(cov * 255.0) / 255.0;\n"
     "    }\n"
     "    if (kind == 7) cov = texelFetch(uCoverage, ivec2(gl_FragCoord.xy), 0).r;\n"
-"    if (kind == 8) {\n"
+"    if (kind == 8 || kind == 12) {\n"
 "        int mask = int(v_kind.y + 0.5);\n"
 "        float outer = clamp(0.5 - sd_round(lp, v_shape.xy, v_shape.z, mask), 0.0, 1.0);\n"
 "        float inner = outer;\n"
@@ -159,7 +159,8 @@ ZGL_FS_COMMON
 "        float fill = v_col0.a * (outer - border);\n"
 "        float alpha = fill + border;\n"
 "        if (alpha <= 0.0) discard;\n"
-"        o_color = over(vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha));\n"
+"        vec4 src = vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha);\n"
+"        o_color = (kind == 8) ? over(src) : src;\n"
 "        return;\n"
 "    }\n"
 "    if (kind == 10) {\n"
@@ -454,10 +455,15 @@ static int zgl_init(void) {
     }
 
     gl.GenVertexArrays(1, &g_zgl.vao);
+    gl.GenVertexArrays(1, &g_zgl.vao_text);
     gl.GenBuffers(1, &g_zgl.vbo);
     gl.BindVertexArray(g_zgl.vao);
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
     zgl_bind_attribs(g_zgl.prog_shape);
+    gl.BindVertexArray(g_zgl.vao_text);
+    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
+    zgl_bind_attribs(g_zgl.prog_text);
+    gl.BindVertexArray(g_zgl.vao);
 
     g_zgl.u_viewport_shape = gl.GetUniformLocation(g_zgl.prog_shape, "uViewport");
     g_zgl.u_viewport_text = gl.GetUniformLocation(g_zgl.prog_text, "uViewport");

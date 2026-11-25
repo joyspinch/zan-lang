@@ -4,26 +4,95 @@ public partial class StyleSheet {
     List<StyleRuleEntry> contextRules;
     int contextMediaCount;
     int contextDependency;
-    int ContextDependency() {
+    List<Selector> contextLiveRules;
+    List<Selector> contextRelRules;
+    Dict<string, int> contextScopeDep;
+    void RefreshContextCache() {
         this.Index();
         int mediaSize = mediaEntries == null ? 0 : mediaEntries.Count;
-        if (contextRules == ruleEntries && contextMediaCount == mediaSize) { return contextDependency; }
+        if (contextRules == ruleEntries && contextMediaCount == mediaSize) { return; }
         int dependency = 0;
+        if (contextLiveRules == null) { contextLiveRules = new List<Selector>(); } else { contextLiveRules.Clear(); }
+        if (contextRelRules == null) { contextRelRules = new List<Selector>(); } else { contextRelRules.Clear(); }
         if (ruleEntries != null) {
             for (int i = 0; i < ruleEntries.Count; i = i + 1) {
                 Selector selector = ruleEntries[i].selector;
-                if (selector.NeedsLiveContext()) { dependency = 2; break; }
-                if (selector.Relational()) { dependency = 1; }
+                if (selector.NeedsLiveContext()) {
+                    dependency = 2;
+                    contextLiveRules.Add(selector);
+                } else if (selector.Relational()) {
+                    if (dependency < 1) { dependency = 1; }
+                    contextRelRules.Add(selector);
+                }
             }
         }
-        for (int i = 0; i < mediaSize && dependency < 2; i = i + 1) {
+        for (int i = 0; i < mediaSize; i = i + 1) {
             Selector selector = mediaEntries[i].selector;
-            if (selector.NeedsLiveContext()) { dependency = 2; break; }
-            if (selector.Relational()) { dependency = 1; }
+            if (selector.NeedsLiveContext()) {
+                dependency = 2;
+                contextLiveRules.Add(selector);
+            } else if (selector.Relational()) {
+                if (dependency < 1) { dependency = 1; }
+                contextRelRules.Add(selector);
+            }
         }
         contextRules = ruleEntries;
         contextMediaCount = mediaSize;
         contextDependency = dependency;
-        return dependency;
+        if (contextScopeDep == null) {
+            contextScopeDep = new Dict<string, int>();
+        } else {
+            contextScopeDep.Clear();
+        }
+    }
+    static bool SelectorCanMatch(Selector s, string type, string cls, string id) {
+        if (s == null) { return false; }
+        if (s.type != "" && !s.universal && s.type != "*" && type != "" && s.type != type) {
+            return false;
+        }
+        if (s.id != "" && id != s.id) { return false; }
+        if (s.classList != null && s.classList.Count > 0) {
+            if (cls == "") { return false; }
+            for (int i = 0; i < s.classList.Count; i = i + 1) {
+                if (!Style.Has(cls, s.classList[i])) { return false; }
+            }
+        }
+        return true;
+    }
+    int ContextDependency() {
+        this.RefreshContextCache();
+        return contextDependency;
+    }
+    int ContextDependencyFor(string type, string cls, string id) {
+        this.RefreshContextCache();
+        if (contextDependency == 0) { return 0; }
+        bool cacheKeyed = id == "" && contextScopeDep != null;
+        string key = "";
+        if (cacheKeyed) {
+            key = type + "|" + cls;
+            int cached = 0;
+            if (contextScopeDep.TryGetValue(key, out cached)) { return cached; }
+        }
+        int dep = 0;
+        if (contextLiveRules != null) {
+            for (int i = 0; i < contextLiveRules.Count; i = i + 1) {
+                if (StyleSheet.SelectorCanMatch(contextLiveRules[i], type, cls, id)) {
+                    dep = 2;
+                    break;
+                }
+            }
+        }
+        if (dep < 2 && contextRelRules != null) {
+            for (int i = 0; i < contextRelRules.Count; i = i + 1) {
+                if (StyleSheet.SelectorCanMatch(contextRelRules[i], type, cls, id)) {
+                    dep = 1;
+                    break;
+                }
+            }
+        }
+        if (cacheKeyed && contextScopeDep.Count < 512) {
+            contextScopeDep.Add(key, dep);
+        }
+        return dep;
     }
 }

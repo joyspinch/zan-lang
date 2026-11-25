@@ -133,6 +133,53 @@ static u32 surface_round_color(u32 fill, u32 border, int outer, int inner) {
   return (alpha << 24) | rgb;
 }
 
+static void cpu_blend_clamped_rect(zan_surface_t *s, int rx0, int ry0,
+                                   int rx1, int ry1, u32 col) {
+  if ((col >> 24) == 0)
+    return;
+  if (rx0 < s->clip_x0)
+    rx0 = s->clip_x0;
+  if (ry0 < s->clip_y0)
+    ry0 = s->clip_y0;
+  if (rx1 > s->clip_x1)
+    rx1 = s->clip_x1;
+  if (ry1 > s->clip_y1)
+    ry1 = s->clip_y1;
+  int rw = rx1 - rx0;
+  if (rw <= 0 || ry1 <= ry0)
+    return;
+  for (int py = ry0; py < ry1; py++)
+    blend_run_const(s->pixels + py * s->stride + rx0, rw, col);
+}
+
+static void cpu_surface_round_box(zan_surface_t *s, int x, int y, int w, int h,
+                                  int r, int t, int iw, int ih, int ir,
+                                  int mask, u32 fill, u32 border, int bx0,
+                                  int by0, int bx1, int by1) {
+  if (bx1 <= bx0 || by1 <= by0)
+    return;
+  for (int py = by0; py < by1; py++) {
+    u32 *row = s->pixels + py * s->stride;
+    int j = py - y;
+    for (int px = bx0; px < bx1; px++) {
+      int i = px - x;
+      int outer = zan_round_cov(i, j, w, h, r, mask);
+      if (!outer)
+        continue;
+      int inner = 0;
+      if (iw > 0 && ih > 0 && i >= t && j >= t && i - t < iw && j - t < ih)
+        inner = zan_round_cov(i - t, j - t, iw, ih, ir, mask);
+      if (inner > outer)
+        inner = outer;
+      u32 c =
+          inner == outer
+              ? ((fill & 0xFFFFFFu) | ((u32)((fill >> 24) * outer / 255) << 24))
+              : surface_round_color(fill, border, outer, inner);
+      row[px] = blend_over(row[px], c);
+    }
+  }
+}
+
 static void cpu_surface_round(zan_surface_t *s, int x, int y, int w, int h,
                               int radius, int mask, u32 fill, u32 border,
                               int thickness) {
@@ -153,25 +200,37 @@ static void cpu_surface_round(zan_surface_t *s, int x, int y, int w, int h,
     return;
   region_write(s, x0, y0, x1, y1);
   ZAN_STAT(g_st_round, (long long)(x1 - x0) * (y1 - y0));
-  for (int py = y0; py < y1; py++) {
-    u32 *row = s->pixels + py * s->stride;
-    for (int px = x0; px < x1; px++) {
-      int i = px - x, j = py - y;
-      int outer = zan_round_cov(i, j, w, h, r, mask);
-      if (!outer)
-        continue;
-      int inner = 0;
-      if (iw > 0 && ih > 0 && i >= t && j >= t && i - t < iw && j - t < ih)
-        inner = zan_round_cov(i - t, j - t, iw, ih, ir, mask);
-      if (inner > outer)
-        inner = outer;
-      u32 c =
-          inner == outer
-              ? ((fill & 0xFFFFFFu) | ((u32)((fill >> 24) * outer / 255) << 24))
-              : surface_round_color(fill, border, outer, inner);
-      row[px] = blend_over(row[px], c);
+  int m = r > t ? r : t;
+  if (iw > 0 && ih > 0 && 2 * m < w && 2 * m < h) {
+    u32 edge_col = surface_round_color(fill, border, 255, 0);
+    /* 4 straight border edges (outer=255, inner=0) */
+    cpu_blend_clamped_rect(s, x + m, y, x + w - m, y + t, edge_col);
+    cpu_blend_clamped_rect(s, x + m, y + h - t, x + w - m, y + h, edge_col);
+    cpu_blend_clamped_rect(s, x, y + m, x + t, y + h - m, edge_col);
+    cpu_blend_clamped_rect(s, x + w - t, y + m, x + w, y + h - m, edge_col);
+    /* 3 pure interior fill strips (outer=255, inner=255) */
+    if (m > t) {
+      cpu_blend_clamped_rect(s, x + m, y + t, x + w - m, y + m, fill);
+      cpu_blend_clamped_rect(s, x + m, y + h - m, x + w - m, y + h - t, fill);
     }
+    cpu_blend_clamped_rect(s, x + t, y + m, x + w - t, y + h - m, fill);
+    /* 4 corner squares (m x m) run exact AA loop */
+    cpu_surface_round_box(s, x, y, w, h, r, t, iw, ih, ir, mask, fill, border,
+                          x0, y0, x + m < x1 ? x + m : x1,
+                          y + m < y1 ? y + m : y1);
+    cpu_surface_round_box(s, x, y, w, h, r, t, iw, ih, ir, mask, fill, border,
+                          x + w - m > x0 ? x + w - m : x0, y0, x1,
+                          y + m < y1 ? y + m : y1);
+    cpu_surface_round_box(s, x, y, w, h, r, t, iw, ih, ir, mask, fill, border,
+                          x0, y + h - m > y0 ? y + h - m : y0,
+                          x + m < x1 ? x + m : x1, y1);
+    cpu_surface_round_box(s, x, y, w, h, r, t, iw, ih, ir, mask, fill, border,
+                          x + w - m > x0 ? x + w - m : x0,
+                          y + h - m > y0 ? y + h - m : y0, x1, y1);
+    return;
   }
+  cpu_surface_round_box(s, x, y, w, h, r, t, iw, ih, ir, mask, fill, border,
+                        x0, y0, x1, y1);
 }
 
 EXPORT void zan_gui_surface_rounded_rect_mask(i32 surface_id, i32 x, i32 y,

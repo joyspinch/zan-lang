@@ -33,6 +33,7 @@ typedef enum {
 #define ZGL_K_SURFACE 8
 #define ZGL_K_BITMAP  10
 #define ZGL_K_SHADOW  11
+#define ZGL_K_SURFACE_FAST 12
 
 #define ZGL_TILE 64
 
@@ -42,6 +43,7 @@ typedef struct {
     int w, h;
     int gpu_ahead;
     int cpu_ahead;
+    int opaque_dst;
     unsigned char *shadow;
     int shadow_valid;
 } zgl_target;
@@ -51,7 +53,7 @@ static zgl_target g_zgl_targets[64];
 /* Like the CPU cache, slots are global and the latest capture owns the slot. */
 typedef struct {
     zgl_uint tex, fbo;
-    int sid, x, y, w, h;
+    int sid, x, y, w, h, opaque;
 } zgl_snapshot;
 static zgl_snapshot g_zgl_snapshots[ZAN_SNAP_CACHE_MAX_SLOTS];
 
@@ -69,7 +71,7 @@ static void zgl_snapshots_drop_surface(int sid) {
 }
 
 static struct {
-    zgl_uint prog_shape, prog_text, vao, vbo;
+    zgl_uint prog_shape, prog_text, vao, vao_text, vbo;
     zgl_uint prog_blur, prog_blur_comp, blur_vao;
     zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
              u_destination;
@@ -163,6 +165,7 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
                              s->pixels + (size_t)y * (size_t)s->stride);
         }
         t->cpu_ahead = 0;
+        t->opaque_dst = 0;
         return;
     }
     u32 tile[ZGL_TILE * ZGL_TILE];
@@ -182,6 +185,7 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     }
     t->shadow_valid = 1;
     t->cpu_ahead = 0;
+    t->opaque_dst = 0;
 }
 
 static unsigned char *g_zgl_rb = NULL;
@@ -260,7 +264,7 @@ static void zgl_flush(void) {
         gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->cov_fbo);
     zgl_blend_equation(g_zgl.mode == ZGL_MODE_UNION ? ZGL_MAX : ZGL_FUNC_ADD);
     gl.Viewport(0, 0, t->w, t->h);
-    gl.BindVertexArray(g_zgl.vao);
+    gl.BindVertexArray(g_zgl.mode == ZGL_MODE_TEXT ? g_zgl.vao_text : g_zgl.vao);
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
     gl.BufferData(ZGL_ARRAY_BUFFER,
                   (zgl_sizeiptr)(g_zgl.count * sizeof(float)),
@@ -274,7 +278,6 @@ static void zgl_flush(void) {
 
     if (g_zgl.mode == ZGL_MODE_TEXT) {
         gl.UseProgram(g_zgl.prog_text);
-        zgl_bind_attribs(g_zgl.prog_text);
         gl.Uniform2f(g_zgl.u_viewport_text, (float)t->w, (float)t->h);
         gl.ActiveTexture(ZGL_TEXTURE0);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas1);
@@ -292,7 +295,6 @@ static void zgl_flush(void) {
         }
     } else {
         gl.UseProgram(g_zgl.prog_shape);
-        zgl_bind_attribs(g_zgl.prog_shape);
         gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
         gl.ActiveTexture(ZGL_TEXTURE0);
         if (g_zgl.mode == ZGL_MODE_UNION) {
@@ -632,7 +634,7 @@ static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) 
             return;
         }
     }
-    c->sid = s->id; c->x = x0; c->y = y0; c->w = rw; c->h = rh;
+    c->sid = s->id; c->x = x0; c->y = y0; c->w = rw; c->h = rh; c->opaque = t->opaque_dst;
     /* Snapshot and patch ignore the drawing clip; restore applies it below. */
     gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
@@ -652,6 +654,7 @@ static void gl_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h, int 
     int x1 = zgl_snap_edge(x, w, s->width), y1 = zgl_snap_edge(y, h, s->height);
     if (x1 <= x0 || y1 <= y0 || x0 < c->x || y0 < c->y
         || x1 > c->x + c->w || y1 > c->y + c->h) return;
+    if (!t->opaque_dst) c->opaque = 0;
     gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
     gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, c->fbo);
@@ -694,14 +697,15 @@ static int gl_restore(zan_surface_t *s, int x, int y, int w, int h, int slot, in
                        x0, t->h - y1, x1, t->h - y0,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    if (!c->opaque) t->opaque_dst = 0;
     t->gpu_ahead = 1;
     t->cpu_ahead = 0;
     return 1;
 }
 
 static void gl_set_clip(zan_surface_t *s, int x0, int y0, int x1, int y1) {
-    (void)x0; (void)y0; (void)x1; (void)y1;
-    if (g_zgl.target == s) zgl_flush();
+    /* Quads embed s->clip_* per-vertex at push time; non-quad ops flush themselves. */
+    (void)s; (void)x0; (void)y0; (void)x1; (void)y1;
 }
 
 static void gl_flush(zan_surface_t *s) {
@@ -1198,6 +1202,7 @@ EXPORT void zan_gui_gpu_end(i32 surface_id) {
                           ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
     gl.BindVertexArray(0);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    t->opaque_dst = 0;
     t->gpu_ahead = 1;
     s->painted = 1;
 }
