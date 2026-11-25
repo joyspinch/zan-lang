@@ -1007,10 +1007,22 @@ mandel 的 1.28× 全是 FMA：C 去掉 `-ffp-contract` 正好与 Zan 同速。�
 generic 基准 1.01 → 0.04s。非 leaf 被调者（会改写字段数组）照旧钉住——新用例
 `elem_receiver_field_array` 两种都覆盖并开泄漏检查。
 
-另记：异常基准内存随抛出次数线性增长（150k → 10MB，1.5M → 39MB）而泄漏检查
-无报告——编译器从不调用 `__cxa_begin_catch/__cxa_end_catch`，每个被 Zan catch 的
-C++ 异常对象都没释放。修法要区分"匹配的 catch 进入"与"同函数直接跳 catch"、
-重抛走新对象、外来 C++ 异常，另案处理。
+另记（已修，2026-11-25）：异常基准内存随抛出次数线性增长（1.5M 迭代峰值
+83MB，C++ 2MB）而泄漏检查无报告——Zan 异常本体在 EH 状态里，`__cxa_throw` 的原生
+对象只驱动展开，却从没人释放。所有权规则：**落地后不会再被原样重抛的原生对象，
+在 landing pad 块里当场 `__cxa_begin_catch` + `__cxa_end_catch`**（`emit_eh_native_delete`，
+即 C++ `catch (...) {}` 的做法）。
+只有 `emit_eh_propagate_tail_lpad` 的"同步、无 catch、函数内无外层 lpad"分支
+原样重抛（`_Unwind_RaiseException`/`resume`），由 `eh_lpad_reraises_native` 判定、
+与尾部同一规则；其余（有 catch 的 try.lpad、catch.cleanup.lpad、async 协程根
+co.lpad）要么被 Zan catch 收下、要么尾部抛新对象，一律当场删。放在 lpad 块里
+天然只作用于"真有原生对象"的入口，同函数直接跳 catch（async rearm）不经过它。
+不用 `_Unwind_DeleteException`：它也能释放，但 `std::uncaught_exceptions()` 只在
+begin_catch 时 −1，会随抛出次数永久增长，进程里依赖它的 C++ 析构逻辑会误判。
+同步 finally 用 return 吞掉异常的那一条（外层无 lpad）仍不释放，罕见未处理。
+回归：`eh_native_exception_reclaim`（10 种抛出形状 ×6.2 万轮，RSS 增长 <8MB 且
+uncaught_exceptions()==0；未修时 +151MB）。坑：用例模式带 `--arc-guard`，释放的 Zan
+对象进检疫区永不回收，每次 `new Exception` 本身就涨 RSS——用例改抛共享对象。
 
 ## 46. foreach 不被向量化：两条管线的 List 槽宽外提差异（2026-11-25）
 

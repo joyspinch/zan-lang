@@ -1,0 +1,150 @@
+using System;
+using System.IO;
+
+// Every Zan throw allocates a native C++ exception object that only drives the
+// unwinder. A catch that takes the exception, or a path that raises a fresh
+// native object instead of re-raising the landed one, must delete the landed
+// object; otherwise each throw leaks ~130 bytes of C++ runtime memory that
+// --check-leaks cannot see. Hundreds of thousands of throws through every
+// catch/finally/async shape must keep the resident set flat.
+class ArgErr : Exception {
+    public ArgErr(string m) : base(m) { }
+}
+
+class Program {
+    // Preallocated: --arc-guard quarantines freed objects for good, so a
+    // fresh Exception per throw would grow the resident set by itself.
+    static Exception Shared = new Exception("x");
+
+    // __cxa_throw counts +1, only __cxa_begin_catch counts -1: a caught Zan
+    // exception whose native object is never taken leaves it above zero.
+    [DllImport("crt", EntryPoint = "_ZSt19uncaught_exceptionsv")]
+    private static extern int UncaughtExceptions();
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    private static extern nint GetCurrentProcess();
+    [DllImport("psapi", EntryPoint = "GetProcessMemoryInfo")]
+    private static extern int GetProcessMemoryInfo(nint h, string counters, int cb);
+    #elif MACOS
+    [DllImport("crt", EntryPoint = "getpid")]
+    private static extern int getpid();
+    [DllImport("crt", EntryPoint = "proc_pid_rusage")]
+    private static extern int proc_pid_rusage(int pid, int flavor, string buffer);
+    #endif
+
+    static long LeInt(byte[] buf, int off, int n) {
+        long v = 0;
+        long mul = 1;
+        for (int k = 0; k < n; k = k + 1) {
+            v = v + (buf[off + k] & 255) * mul;
+            mul = mul * 256;
+        }
+        return v;
+    }
+
+    // Current resident set in bytes, or -1 where unsupported.
+    static long Rss() {
+        #if WINDOWS
+        byte[] c = new byte[72];
+        if (GetProcessMemoryInfo(GetCurrentProcess(), c, 72) == 0) { return 0 - 1; }
+        return LeInt(c, 16, 8);
+        #elif MACOS
+        byte[] info = new byte[256];
+        if (proc_pid_rusage(getpid(), 0, info) != 0) { return 0 - 1; }
+        return LeInt(info, 64, 8);
+        #elif LINUX
+        if (!File.Exists("/proc/self/statm")) { return 0 - 1; }
+        string[] f = File.ReadAllText("/proc/self/statm").Split(" ");
+        if (f.Length < 2) { return 0 - 1; }
+        return Convert.ToInt64(f[1]) * 4096;
+        #else
+        return 0 - 1;
+        #endif
+    }
+
+    static int Fail(int i) {
+        if (i >= 0) throw Shared;
+        return i;
+    }
+
+    // Catch matches in the throwing function's caller.
+    static int Direct(int i) {
+        try { return Fail(i); } catch (Exception e) { return 1; }
+    }
+
+    // No catch matches here: the exception leaves through a fresh raise.
+    static int Unmatched(int i) {
+        try { return Fail(i); } catch (ArgErr e) { return 100; }
+    }
+
+    // A throw inside the catch body leaves through the catch cleanup pad.
+    static int CatchThrows(int i) {
+        try { return Fail(i); } catch (Exception e) { throw Shared; }
+    }
+
+    static int Rethrows(int i) {
+        try { return Fail(i); } catch (Exception e) { throw e; }
+    }
+
+    // Outermost finally-only try re-raises the same native object.
+    static int FinallyOnly(int i, int[] fin) {
+        try { return Fail(i); } finally { fin[0] = fin[0] + 1; }
+    }
+
+    // Finally-only try nested in a catching try of the same function.
+    static int NestedFinally(int i, int[] fin) {
+        try {
+            try { return Fail(i); } finally { fin[0] = fin[0] + 1; }
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    static int Guard(int[] a, int i) {
+        try { return a[i]; } catch (Exception e) { return 1; }
+    }
+
+    static async int AsyncFail(int i) {
+        if (i >= 0) throw Shared;
+        return i;
+    }
+
+    static async int AsyncCatch(int i) {
+        try { return await AsyncFail(i); } catch (Exception e) { return 1; }
+    }
+
+    static int Round(int i, int[] fin, int[] small) {
+        int hits = Direct(i) + NestedFinally(i, fin) + Guard(small, i + 5);
+        try { Unmatched(i); } catch (Exception e) { hits = hits + 1; }
+        try { CatchThrows(i); } catch (Exception e) { hits = hits + 1; }
+        try { Rethrows(i); } catch (Exception e) { hits = hits + 1; }
+        try { FinallyOnly(i, fin); } catch (Exception e) { hits = hits + 1; }
+        return hits;
+    }
+
+    static async void Main() {
+        int[] fin = new int[1];
+        int[] small = new int[2];
+        long hits = 0;
+        for (int i = 0; i < 2000; i = i + 1) {
+            int a = await AsyncCatch(i);
+            hits = hits + Round(i, fin, small) + a;
+        }
+        long before = Rss();
+        int n = 60000;
+        for (int i = 0; i < n; i = i + 1) {
+            int a = await AsyncCatch(i);
+            hits = hits + Round(i, fin, small) + a;
+        }
+        long after = Rss();
+        Console.WriteLine("hits " + Convert.ToString(hits));
+        Console.WriteLine("finally " + Convert.ToString(fin[0]));
+        Console.WriteLine("uncaught " + Convert.ToString(UncaughtExceptions()));
+        // 62000 rounds x 10 throws: a per-throw leak would grow RSS by ~80 MB.
+        long grown = after - before;
+        bool bounded = before < 0 || after < 0 || grown < 8 * 1024 * 1024;
+        Console.WriteLine("bounded " + Convert.ToString(bounded));
+        if (!bounded) Console.WriteLine("grew " + Convert.ToString(grown / 1024) + " KiB");
+    }
+}

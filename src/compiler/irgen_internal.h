@@ -922,6 +922,8 @@ void emit_eh_disarm_from(zan_irgen_t *g, int base);
 void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals, const zan_irgen_finally_entry_t *entry);
 void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals);
+bool eh_lpad_reraises_native(zan_irgen_t *g, LLVMValueRef fn, bool has_catch);
+void emit_eh_native_delete(zan_irgen_t *g, LLVMValueRef lp_val);
 void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
 void emit_static_cleanup_call(zan_irgen_t *g);
 void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);

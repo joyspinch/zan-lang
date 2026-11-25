@@ -183,6 +183,9 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 1, "lp");
     LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
     LLVMSetCleanup(lp_val, 1);
+    /* The coroutine root stores the Zan exception in its frame and never
+     * re-raises this native object. */
+    emit_eh_native_delete(g, lp_val);
     LLVMBuildBr(g->builder, exc_bb);
     zan_builder_restore(g, lpad_pt);
 

@@ -157,6 +157,8 @@
         }
         LLVMSetCleanup(lp_val, 1);
         LLVMBuildStore(g->builder, lp_val, lp_slot);
+        /* Unless the tail re-raises this same object, nothing reads it again. */
+        if (!eh_lpad_reraises_native(g, fn, ncatch > 0)) emit_eh_native_delete(g, lp_val);
         LLVMBuildBr(g->builder, catch_bb);
         zan_builder_restore(g, lpad_pt);
 
@@ -423,6 +425,8 @@
                     if (catches_cleanup) LLVMAddClause(lp, LLVMConstNull(i8ptr));
                     LLVMSetCleanup(lp, 1);
                     LLVMBuildStore(g->builder, lp, lp_slot);
+                    /* Leaving a catch always raises a fresh native object. */
+                    emit_eh_native_delete(g, lp);
                     LLVMBuildBr(g->builder, cleanup_bb);
                     zan_builder_restore(g, pt);
                     zan_lpad_entry_t *entry = &g->lpad_stack[g->lpad_depth++];
