@@ -211,6 +211,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
     g->cur_mtps = w->mtps;
     g->cur_mbind = w->mbind;
     g->cur_inst = w->cur_inst;
+    zan_irgen_note_origin(g, w->resume_fn, member, w->cur_inst, w->mbind,
+                          w->mtps ? w->mtps->count : 0);
         LLVMValueRef ramp_fn = fn;
         LLVMValueRef resume_fn = w->resume_fn;
         LLVMTypeRef frame_type = w->frame_type;

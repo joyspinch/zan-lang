@@ -1041,6 +1041,62 @@ static void prepare_sections_cb(void *ctx, LLVMModuleRef part) {
     zan_irgen_prepare_object_sections((zan_irgen_t *)ctx, part);
 }
 
+static int zan_online_cpus(void) {
+    long cpus = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cpus = (long)si.dwNumberOfProcessors;
+#else
+    cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (cpus < 1) cpus = 1;
+    if (cpus > 16) cpus = 16;
+    return (int)cpus;
+}
+
+int zan_irgen_partition(zan_irgen_t *g, int opt_level, const char *obj_base) {
+    if (zan_diag_has_errors(g->diag)) return -1;
+    LLVMTargetMachineRef tm;
+    if (zan_bind_target_layout(g, &tm) != ZAN_OK) return -1;
+    zan_part_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.fn_names = (const char *const *)g->origin_fn_names;
+    o.fn_units = g->origin_fn_unit;
+    o.fn_count = g->origin_count;
+    o.units = (const char *const *)g->origin_units;
+    o.unit_count = g->origin_unit_count;
+    o.optimize = zan_opt_run_passes_on_unit;
+    o.prelude = zan_opt_unit_prelude;
+    o.level = opt_level;
+    o.prepare = prepare_sections_cb;
+    o.prepare_ctx = g;
+    o.threads = zan_online_cpus();
+    o.obj_base = obj_base;
+    zan_part_result_t r;
+    char *error = NULL;
+    int rc = zan_part_run(g->mod, tm, &o, &r, &error);
+    LLVMDisposeTargetMachine(tm);
+    g->part_stats.units = r.count;
+    g->part_stats.hit = r.units_hit;
+    g->part_stats.miss = r.units_miss;
+    g->part_stats.moved_insns = r.moved_insns;
+    g->part_stats.residual_insns = r.residual_insns;
+    g->part_stats.ms_split = r.ms_split;
+    g->part_stats.ms_compile = r.ms_compile;
+    if (rc < 0) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
+                           "partitioned backend failed: %s", error ? error : "?");
+        free(error);
+        return -1;
+    }
+    if (rc > 0) {
+        g->part_objs = r.objs;
+        g->part_obj_count = r.count;
+    }
+    return rc;
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;

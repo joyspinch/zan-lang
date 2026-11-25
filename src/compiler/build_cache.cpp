@@ -61,7 +61,7 @@ struct state_t {
     bool warned_untrusted = false;
     bool capturing = false;
     std::string capture;
-    int opt_hit = 0, opt_miss = 0, obj_hit = 0, obj_miss = 0;
+    int opt_hit = 0, opt_miss = 0, obj_hit = 0, obj_miss = 0, unit_hit = 0, unit_miss = 0;
     double ms_key = 0, ms_load = 0, ms_store = 0;
 };
 
@@ -251,6 +251,20 @@ void prune() {
     if (!pruned) llvm::consumeError(pruned.takeError());
 }
 
+/* Everything about the target machine that changes generated code. */
+void hash_tm(llvm::BLAKE3 &h, const llvm::TargetMachine *tm) {
+    hash_str(h, tm->getTargetTriple().str());
+    hash_str(h, tm->getTargetCPU());
+    hash_str(h, tm->getTargetFeatureString());
+    hash_u64(h, (uint64_t)tm->getOptLevel());
+    hash_u64(h, (uint64_t)tm->getRelocationModel());
+    hash_u64(h, (uint64_t)tm->getCodeModel());
+    hash_u64(h, (uint64_t)tm->Options.FunctionSections);
+    hash_u64(h, (uint64_t)tm->Options.DataSections);
+    hash_u64(h, (uint64_t)tm->Options.EmulatedTLS);
+    hash_u64(h, (uint64_t)tm->Options.ExceptionModel);
+}
+
 void finish_key(llvm::BLAKE3 &h, zan_bcache_key_t *key) {
     auto r = h.final();
     memcpy(key->bytes, r.data(), sizeof(key->bytes));
@@ -296,7 +310,7 @@ extern "C" void zan_bcache_init(int argc, char **argv) {
     for (char **e = ZAN_BCACHE_ENVIRON; e && *e; e++) {
         if (strncmp(*e, "ZAN_", 4) != 0) continue;
         if (!strncmp(*e, "ZAN_CACHE_DIR=", 14) || !strncmp(*e, "ZAN_BUILD_CACHE=", 16) ||
-            !strncmp(*e, "ZAN_CACHE_PRUNE=", 16))
+            !strncmp(*e, "ZAN_CACHE_PRUNE=", 16) || !strncmp(*e, "ZAN_PART_DUMP=", 14))
             continue;
         env.emplace_back(*e);
     }
@@ -431,16 +445,7 @@ extern "C" bool zan_bcache_obj_key(LLVMModuleRef mod, LLVMTargetMachineRef tm_re
     llvm::BLAKE3 h;
     h.update(llvm::ArrayRef<uint8_t>(g_bc.context.data(), g_bc.context.size()));
     hash_str(h, "object");
-    hash_str(h, tm->getTargetTriple().str());
-    hash_str(h, tm->getTargetCPU());
-    hash_str(h, tm->getTargetFeatureString());
-    hash_u64(h, (uint64_t)tm->getOptLevel());
-    hash_u64(h, (uint64_t)tm->getRelocationModel());
-    hash_u64(h, (uint64_t)tm->getCodeModel());
-    hash_u64(h, (uint64_t)tm->Options.FunctionSections);
-    hash_u64(h, (uint64_t)tm->Options.DataSections);
-    hash_u64(h, (uint64_t)tm->Options.EmulatedTLS);
-    hash_u64(h, (uint64_t)tm->Options.ExceptionModel);
+    hash_tm(h, tm);
     hash_u64(h, (uint64_t)parts);
     {
         hash_ostream os(h);
@@ -493,6 +498,81 @@ extern "C" void zan_bcache_obj_store(const zan_bcache_key_t *key, int parts,
     g_bc.ms_store += now_ms() - t0;
 }
 
+extern "C" bool zan_bcache_unit_key(const void *bitcode, size_t size, LLVMTargetMachineRef tm_ref,
+                                    int opt_level, zan_bcache_key_t *key) {
+    key->valid = false;
+    if (!g_bc.enabled || !bitcode || !tm_ref) return false;
+    double t0 = now_ms();
+    llvm::BLAKE3 h;
+    h.update(llvm::ArrayRef<uint8_t>(g_bc.context.data(), g_bc.context.size()));
+    hash_str(h, "unit");
+    hash_tm(h, reinterpret_cast<llvm::TargetMachine *>(tm_ref));
+    hash_u64(h, (uint64_t)opt_level);
+    h.update(llvm::ArrayRef<uint8_t>(static_cast<const uint8_t *>(bitcode), size));
+    finish_key(h, key);
+    g_bc.ms_key += now_ms() - t0;
+    return true;
+}
+
+/* An entry is <key>.u.refs then <key>.u.o; the object is written last and
+ * is the commit marker. */
+extern "C" bool zan_bcache_unit_load(const zan_bcache_key_t *key, const char *obj_path,
+                                     char **refs) {
+    *refs = nullptr;
+    if (!g_bc.enabled || !key->valid || !ensure_dir()) return false;
+    double t0 = now_ms();
+    std::string obj = entry_path(key, ".u.o"), list = entry_path(key, ".u.refs");
+    bool ok = entry_trusted(obj) && entry_trusted(list);
+    if (ok) {
+        auto buf = llvm::MemoryBuffer::getFile(list, /*IsText=*/false,
+                                               /*RequiresNullTerminator=*/false);
+        ok = (bool)buf;
+        if (ok) {
+            llvm::StringRef text = (*buf)->getBuffer();
+            *refs = static_cast<char *>(malloc(text.size() + 1));
+            ok = *refs != nullptr;
+            if (ok) {
+                memcpy(*refs, text.data(), text.size());
+                (*refs)[text.size()] = '\0';
+            }
+        }
+    }
+    if (ok) ok = !llvm::sys::fs::copy_file(obj, obj_path);
+    if (ok) {
+        touch(obj);
+        touch(list);
+        g_bc.unit_hit++;
+    } else {
+        free(*refs);
+        *refs = nullptr;
+        g_bc.unit_miss++;
+    }
+    g_bc.ms_load += now_ms() - t0;
+    return ok;
+}
+
+extern "C" void zan_bcache_unit_store(const zan_bcache_key_t *key, const char *obj_path,
+                                      const char *refs) {
+    if (!g_bc.enabled || !key->valid || !ensure_dir()) return;
+    double t0 = now_ms();
+    auto buf = llvm::MemoryBuffer::getFile(obj_path, /*IsText=*/false,
+                                           /*RequiresNullTerminator=*/false);
+    if (!buf) return;
+    llvm::StringRef bytes = (*buf)->getBuffer();
+    llvm::StringRef list(refs ? refs : "");
+    if (!write_atomic(entry_path(key, ".u.refs"), [&](llvm::raw_fd_ostream &os) {
+            os << list;
+            return true;
+        }))
+        return;
+    if (!write_atomic(entry_path(key, ".u.o"), [&](llvm::raw_fd_ostream &os) {
+            os << bytes;
+            return true;
+        }))
+        return;
+    g_bc.ms_store += now_ms() - t0;
+}
+
 extern "C" void zan_bcache_logf(const char *fmt, ...) {
     char small[512];
     va_list ap;
@@ -535,8 +615,8 @@ extern "C" void zan_bcache_print_stats(void) {
         return;
     }
     fprintf(stderr,
-            "build cache: optimize %d hit/%d miss, object %d hit/%d miss; "
+            "build cache: optimize %d hit/%d miss, object %d hit/%d miss, unit %d hit/%d miss; "
             "key %.1f ms, load %.1f ms, store %.1f ms (%s)\n",
-            g_bc.opt_hit, g_bc.opt_miss, g_bc.obj_hit, g_bc.obj_miss, g_bc.ms_key, g_bc.ms_load,
-            g_bc.ms_store, g_bc.dir_ready ? g_bc.dir.c_str() : "-");
+            g_bc.opt_hit, g_bc.opt_miss, g_bc.obj_hit, g_bc.obj_miss, g_bc.unit_hit, g_bc.unit_miss,
+            g_bc.ms_key, g_bc.ms_load, g_bc.ms_store, g_bc.dir_ready ? g_bc.dir.c_str() : "-");
 }

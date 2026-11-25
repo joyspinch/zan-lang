@@ -1703,6 +1703,10 @@ typedef struct {
     int nrels;
     LLVMValueRef comps[LATE_REGION_COMPS]; /* re-issue the retain before these */
     int ncomps;
+    /* blocks[i]'s scan reached its branch and went on to the successors; a
+     * block whose path ended (at a release or a compensation point) must not
+     * lead back into the region, or a path would lose or double a release. */
+    bool cont[LATE_REGION_BLOCKS];
     int insts;
 } late_region_t;
 
@@ -1722,7 +1726,6 @@ static bool late_region_comp(late_region_t *r, LLVMValueRef c) {
 /* Scan `bb` from `start`; returns false to abort. Successors are queued. */
 static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRef start,
                              LLVMValueRef obj, zan_arc_call_kind_t want) {
-    (void)bb;
     for (LLVMValueRef c = start; c; c = LLVMGetNextInstruction(c)) {
         if (++r->insts > LATE_REGION_INSTS) return false;
         zan_arc_call_kind_t ck = get_arc_call_kind(c);
@@ -1739,6 +1742,8 @@ static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRe
             bool branch = op == LLVMBr || op == LLVMSwitch;
 #endif
             if (!branch) return late_region_comp(r, c);
+            int self = late_region_index(r, bb);
+            if (self >= 0) r->cont[self] = true;
             unsigned ns = LLVMGetNumSuccessors(c);
             for (unsigned i = 0; i < ns; i++) {
                 LLVMBasicBlockRef sb = LLVMGetSuccessor(c, i);
@@ -1771,10 +1776,15 @@ static bool late_try_region(LLVMValueRef retain, shrink_map_t *preds) {
         if (!late_region_scan(&r, r.blocks[bi], LLVMGetFirstInstruction(r.blocks[bi]), obj, want))
             return false;
     if (r.nrels == 0 || r.nblocks < 2) return false; /* single-block cases: passes 2/2b */
-    /* Every non-entry region block is entered only from inside the region. */
+    /* Every non-entry region block is entered only from region blocks whose
+     * path continues into it: an edge out of a block that ended at a release
+     * or a compensation point (an invoke's normal successor, say) would reach
+     * a dropped release with the retain already re-issued -- a leak -- or
+     * drop a second release on one path. */
     for (int bi = 1; bi < r.nblocks; bi++) {
         int inside = 0;
         for (int pj = 0; pj < r.nblocks; pj++) {
+            if (!r.cont[pj]) continue;
             LLVMValueRef t = LLVMGetBasicBlockTerminator(r.blocks[pj]);
             unsigned ns = t ? LLVMGetNumSuccessors(t) : 0;
             for (unsigned k = 0; k < ns; k++)
@@ -1857,11 +1867,13 @@ static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, 
  * pipelines. Returns the default<ON> text pipeline, or NULL for a bad level;
  * *ol gets N and *vec whether the vectorizer tuning flags are on. */
 static const char *zan_opt_prepare_level(LLVMModuleRef mod, zan_opt_level_t level, int *ol,
-                                         int *vec) {
+                                         int *vec, bool shrink) {
     /* S-UNWIND（全局 pass ②）：在 LLVM
      * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
-     * ZAN_NO_UNWIND_SHRINK=1 关断（红绿对照用）。 */
-    if (!getenv("ZAN_NO_UNWIND_SHRINK")) {
+     * ZAN_NO_UNWIND_SHRINK=1 关断（红绿对照用）。分区单元（build_partition.h）
+     * 不跑：被调者多是声明，`__zan_`/`zan_` 前缀声明会被当成不抛——整模块
+     * 在切分前已跑过一遍。 */
+    if (shrink && !getenv("ZAN_NO_UNWIND_SHRINK")) {
         zan_shrink_collapse_invokes(mod);
     }
     *vec = level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE;
@@ -1962,7 +1974,7 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
     if (zan_opt_plan_finish(g, level)) {
         status = zan_opt_verify_module(g->mod, "before optimization");
         int ol = 0, vec = 0;
-        if (status == ZAN_OK && !zan_opt_prepare_level(g->mod, level, &ol, &vec))
+        if (status == ZAN_OK && !zan_opt_prepare_level(g->mod, level, &ol, &vec, true))
             status = ZAN_ERROR;
         /* The late ARC pass needs the whole module (it re-inlines the ARC
          * helpers), and only needs inlining to be done: run it between the
@@ -1998,12 +2010,30 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
     return status;
 }
 
+static zan_status_t run_passes(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level,
+                               bool shrink);
+
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm,
                                           zan_opt_level_t level) {
+    return run_passes(mod, tm, level, true);
+}
+
+void zan_opt_unit_prelude(LLVMModuleRef mod) {
+    /* The nothrow collapse needs every callee body: run it on the whole
+     * module before it is split, never on a unit. */
+    if (!getenv("ZAN_NO_UNWIND_SHRINK")) zan_shrink_collapse_invokes(mod);
+}
+
+int zan_opt_run_passes_on_unit(LLVMModuleRef mod, LLVMTargetMachineRef tm, int level) {
+    return run_passes(mod, tm, (zan_opt_level_t)level, false) == ZAN_OK ? 0 : -1;
+}
+
+static zan_status_t run_passes(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level,
+                               bool shrink) {
     if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
     if (level == ZAN_OPT_NONE) return ZAN_OK;
     int ol = 0, vec = 0;
-    const char *passes = zan_opt_prepare_level(mod, level, &ol, &vec);
+    const char *passes = zan_opt_prepare_level(mod, level, &ol, &vec, shrink);
     if (!passes) return ZAN_ERROR;
 
     /* 调试旋钮：ZAN_OPT_PIPELINE 覆盖默认管线文本（如 "sroa" 逐 pass
@@ -2407,7 +2437,13 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
     if (!getenv("ZAN_NO_OPT_CONSTFOLD")) report.constfold = zan_opt_const_fold(g);
     if (!getenv("ZAN_NO_OPT_DCE")) report.dce = zan_opt_dce(g);
     if (!getenv("ZAN_NO_OPT_INLINE")) report.inlining = zan_opt_inline(g, level);
-    report.success = zan_opt_configure_llvm_passes(g, level) == ZAN_OK;
+    if (g->opt_zan_passes_only) {
+        /* Partitioned backend: the LLVM pipeline runs per unit (or, when the
+         * module is not split, through zan_opt_configure_llvm_passes). */
+        report.success = zan_opt_verify_module(g->mod, "after Zan passes") == ZAN_OK;
+    } else {
+        report.success = zan_opt_configure_llvm_passes(g, level) == ZAN_OK;
+    }
 
     double t1 = get_time_ms();
     report.time_ms = t1 - t0;

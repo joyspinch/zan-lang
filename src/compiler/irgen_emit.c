@@ -3,6 +3,7 @@
 #include "irgen_compact.h"
 #include "codegen_split.h"
 #include "build_cache.h"
+#include "build_partition.h"
 #ifndef _WIN32
 #include <unistd.h>
 #endif

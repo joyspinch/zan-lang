@@ -4,9 +4,14 @@ LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload,
                                        zan_loc_t loc) {
     return emit_string_len_ex(g, payload, 1, loc);
 }
-LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
+LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t caller_loc) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_ocmp");
     if (fn) return fn;
+    /* One helper serves every comparison: it must not carry the location of
+     * whichever site happened to create it (that made its body, and every
+     * partitioned unit it is copied into, change with an unrelated edit). */
+    (void)caller_loc;
+    zan_loc_t loc = zan_loc(0, 0, 0, 0);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

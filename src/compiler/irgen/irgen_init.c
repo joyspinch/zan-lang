@@ -823,6 +823,7 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     if (!g) return;
     if (s_current_irgen == g) s_current_irgen = NULL;
     if (g_di_emit_ctx == g) g_di_emit_ctx = NULL;
+    zan_irgen_origin_free(g);
     zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
     g->function_compactor = NULL;
     if (g->builder) {

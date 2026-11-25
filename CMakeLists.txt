@@ -190,6 +190,7 @@ add_executable(zanc
     src/compiler/irgen_compact.cpp
     src/compiler/codegen_split.cpp
     src/compiler/build_cache.cpp
+    src/compiler/build_partition.cpp
     src/compiler/list_width_hoist.cpp
     src/compiler/guard_version.cpp
     src/compiler/optimizer.c

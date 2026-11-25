@@ -42,6 +42,13 @@ typedef struct {
 } zan_lpad_entry_t;
 
 /* 编译器生成的保护文本驻留表项 */
+/* Partitioned backend counters (build_partition.h), printed by --time. */
+typedef struct {
+    int units, hit, miss;
+    long moved_insns, residual_insns;
+    double ms_split, ms_compile;
+} zan_part_stats_t;
+
 typedef struct zan_str_intern {
     char *text;
     LLVMValueRef gv;
@@ -512,6 +519,22 @@ struct zan_irgen {
     struct refl_inst_index *refl_inst_index; /* reflect_fields.c, lazily built */
     char **split_objs;
     int split_obj_count;
+    /* Partitioned backend (build_partition.h): zan_optimize runs only the
+     * Zan passes; zan_irgen_partition moves the unit bodies out and lists
+     * their objects here for the linker. */
+    bool opt_zan_passes_only;
+    char **part_objs;
+    int part_obj_count;
+    zan_part_stats_t part_stats; /* for --time */
+    /* Source unit of each emitted method body, by function name
+     * (irgen_origin.c; consumed by the partitioned backend). */
+    char **origin_fn_names;
+    int *origin_fn_unit;
+    int origin_count, origin_cap;
+    char **origin_units;
+    int origin_unit_count;
+    int *origin_file_unit;
+    int origin_file_cap;
     bool         publish_instance_prune; /* closed-world instance callable roots */
     bool         publish_vslot_demand;
     zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */
@@ -960,6 +983,14 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
 int zan_irgen_prune_extern_libs(zan_irgen_t *g);
+/* irgen_origin.c: record which source unit `fn`'s body comes from (decl's
+ * file; "user" for a generic instance over a user-declared type). */
+void zan_irgen_note_origin(zan_irgen_t *g, LLVMValueRef fn, struct zan_ast_node *decl,
+                           zan_type_t *inst, zan_type_t **bind, int nbind);
+void zan_irgen_origin_free(zan_irgen_t *g);
+/* emit_target.c: split the module into per-unit objects (build_partition.h).
+ * Returns 1 when split, 0 when not worth it, -1 on error. */
+int zan_irgen_partition(zan_irgen_t *g, int opt_level, const char *obj_base);
 
 /* 检查模块中是否存在以指定前缀开头的方法实现 */
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix);

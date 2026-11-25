@@ -338,7 +338,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `--no-icon` | — | 不嵌入任何图标（跳过 `--icon` 与内建默认）；仅 Windows PE |
 | `--default-icon` | — | 显式嵌入内建图标；只有 `--publish` 需要它（非发布档本来就嵌内建图标） |
 | `--quiet, -q` | — | 静默 stdout 进度行（驱动装运、APK 打包、`Compiled N files` 汇总） |
-| `--time` | — | 打印各阶段耗时与规模统计（含一行 `build cache:` 命中/未命中与耗时） |
+| `--time` | — | 打印各阶段耗时与规模统计（含一行 `build cache:` 命中/未命中与耗时；分区后端另有一行 `partition:`：单元数、命中/编译数、搬出与留在剩余模块的指令数） |
 | `--no-build-cache` | 缓存**开** | 关闭 LLVM 后端构建缓存（[`BUILD_CACHE.md`](BUILD_CACHE.md)）：优化前模块与最终模块按内容哈希记忆化优化结果和目标文件，重复构建跳过优化与后端，产物与关缓存逐字节相同。键含 zanc 二进制（路径/大小/mtime）、除 `-o`/`--emit-deps`/`--time` 外的全部参数与全部 `ZAN_*` 环境变量；`ZAN_BUILD_CACHE=0` 等效；`--emit-ir` 不走优化表 |
 | `-D<name>[=v]` | — | 预处理符号 |
 | `@<file>` | — | 响应文件（一行一个或空白分隔，带空格路径用引号，`#` 起注释，最多嵌套 8 层）——**超长命令行/含空格路径用它** |
@@ -452,6 +452,9 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |
 | `ZAN_CACHE_DIR` | 构建缓存根目录（条目在其下 `backend/`；`backend/` 建为 0700，条目 0600；POSIX 上 `backend/` 必须归当前用户且不可被组/他人写（自己的会被收紧），其父目录须归当前用户或 root 且不可被他人写（带粘滞位的如 `/tmp` 除外），否则告警并关缓存；读取时条目不是当前用户所有的普通文件或可被他人写即视为未命中重建）；缺省为平台用户缓存目录下 `zan/backend`（macOS `~/Library/Caches`、Linux `$XDG_CACHE_HOME` 或 `~/.cache`、Windows `%LOCALAPPDATA%`） |
 | `ZAN_CACHE_PRUNE` | 构建缓存清理策略（LLVM `pruneCache` 语法），缺省 `prune_interval=20m:prune_after=168h:cache_size_bytes=4g` |
+| `ZAN_PARTITION` | `=0` 关闭分区后端（[`BUILD_CACHE.md`](BUILD_CACHE.md) 阶段 2）。缺省开：本机原生、非 `--publish`、`-O1` 及以上的可执行构建，单元函数体合计不少于 `ZAN_PART_MIN_INSNS` 条指令时，按来源单元（stdlib/包目录、每个用户源文件）切成独立模块并行优化、出码，按单元内容缓存；改用户代码只重编该文件的单元与剩余模块。`ZAN_OPT_PIPELINE`、`ZAN_DUMP_OPT_IR`、`ZAN_SHARD=1`、`-g`、库输出自动走整模块 |
+| `ZAN_PART_MIN_INSNS` | 分区门槛（单元函数体合计指令数），缺省 20000；`=0` 小程序也分区（测试用） |
+| `ZAN_PART_DUMP` | 调试：把每个单元的规范模块以 `<序号>-<单元>.ll` 写进该目录，对比两次构建哪个单元变了（不进缓存键） |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |
 | `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |

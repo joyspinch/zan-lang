@@ -15,6 +15,7 @@
 #include "irgen.h"
 #include "optimizer.h"
 #include "build_cache.h"
+#include "build_partition.h"
 #include "procmem.h"
 #include "crosscomp.h"
 #include "winres.h"

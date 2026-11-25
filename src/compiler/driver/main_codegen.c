@@ -217,7 +217,70 @@
      * targets keep the one-piece pipeline: their write_obj rewrites libc
      * names (wasm/riscv32 adapters, iOS main) that the pipeline must see. */
     irgen.defer_opt_finish_ok = !do_emit_ir && irgen.split_codegen_ok;
-    if (effective_opt > ZAN_OPT_NONE) {
+    /* Partitioned backend (build_partition.h, docs/BUILD_CACHE.md stage 2):
+     * development builds of native executables compile each source unit's
+     * bodies as a module of its own, cached per unit, so a user edit
+     * recompiles only what changed. Release builds (--publish) keep the
+     * whole-module pipeline; ZAN_PARTITION=0 turns it off. */
+    bool part_ok = false;
+    if (effective_opt > ZAN_OPT_NONE && !do_emit_ir && shard_n == 0 && irgen.split_codegen_ok &&
+        !publish_mode && !irgen.emit_lib && !irgen.emit_debug) {
+        const char *pe = getenv("ZAN_PARTITION");
+        const char *pipe = getenv("ZAN_OPT_PIPELINE");
+        const char *dump = getenv("ZAN_DUMP_OPT_IR");
+        part_ok = !(pe && pe[0] == '0') && !(pipe && pipe[0]) && !(dump && dump[0]);
+    }
+    if (part_ok) {
+        irgen.opt_zan_passes_only = true;
+        zan_opt_report_t zrep = zan_optimize(&irgen, NULL, effective_opt);
+        irgen.opt_zan_passes_only = false;
+        if (!zrep.success) goto codegen_failed;
+        zan_opt_report_print(&zrep);
+        phase("zan passes");
+        if (irgen.builder) LLVMClearInsertionPosition(irgen.builder);
+        int prc = zan_irgen_partition(&irgen, (int)effective_opt, obj_path);
+        if (prc < 0) goto codegen_failed;
+        if (g_time_phases)
+            fprintf(stderr,
+                    "partition: %s; %d units (%d cached, %d compiled), %ld insns moved, "
+                    "%ld left; split %.1f ms, units %.1f ms\n",
+                    prc > 0 ? "on" : "off (too small)", irgen.part_stats.units,
+                    irgen.part_stats.hit, irgen.part_stats.miss, irgen.part_stats.moved_insns,
+                    irgen.part_stats.residual_insns, irgen.part_stats.ms_split,
+                    irgen.part_stats.ms_compile);
+        phase("partition");
+        probe_phase_mem("partition");
+    }
+    if (part_ok) {
+        /* The residual (helpers, tables, main) -- or the whole module when it
+         * was too small to split: the LLVM pipeline only, the Zan passes
+         * already ran. Same pass order as the one-piece path below. */
+        zan_bcache_key_t opt_key = {{0}, false};
+        char *opt_log = NULL;
+        LLVMModuleRef cached_mod = NULL;
+        bool split_opt = zan_opt_plan_finish(&irgen, effective_opt);
+        if (zan_bcache_opt_key(irgen.mod, (int)effective_opt + (split_opt ? 64 : 0) + 128,
+                               &opt_key))
+            cached_mod = zan_bcache_opt_load(&opt_key, irgen.mod, &opt_log);
+        if (cached_mod) {
+            irgen.mod = cached_mod;
+            if (opt_log) fputs(opt_log, stderr);
+        } else {
+            if (opt_key.valid) zan_bcache_capture_begin();
+            zan_status_t ost = zan_opt_configure_llvm_passes(&irgen, effective_opt);
+            if (opt_key.valid) opt_log = zan_bcache_capture_end();
+            if (ost != ZAN_OK) {
+                free(opt_log);
+                goto codegen_failed;
+            }
+            if (opt_key.valid)
+                irgen.mod = zan_bcache_opt_store(&opt_key, irgen.mod, opt_log ? opt_log : "");
+        }
+        free(opt_log);
+        phase("optimize");
+        probe_phase_mem("optimize");
+        zan_irgen_prune_extern_libs(&irgen);
+    } else if (effective_opt > ZAN_OPT_NONE) {
         /* Build cache (docs/BUILD_CACHE.md): the optimizer is a pure function
          * of this module and the options, so a hit swaps in the optimized
          * module the same input produced before and replays its report. A
@@ -984,6 +1047,13 @@ codegen_ready:
         generated_object_vec_add(&generated_objects, obj_tmp);
         for (int si = 1; si < irgen.split_obj_count; si++)
             generated_object_vec_add(&generated_objects, irgen.split_objs[si]);
+        for (int pi = 0; pi < irgen.part_obj_count; pi++) {
+            generated_object_vec_add(&generated_objects, irgen.part_objs[pi]);
+            free(irgen.part_objs[pi]);
+        }
+        free(irgen.part_objs);
+        irgen.part_objs = NULL;
+        irgen.part_obj_count = 0;
         for (int si = 0; si < irgen.split_obj_count; si++) free(irgen.split_objs[si]);
         free(irgen.split_objs);
         irgen.split_objs = NULL;

@@ -52,6 +52,15 @@ bool zan_bcache_obj_key(LLVMModuleRef mod, LLVMTargetMachineRef tm, int parts,
 bool zan_bcache_obj_load(const zan_bcache_key_t *key, int parts, const char *const *paths);
 void zan_bcache_obj_store(const zan_bcache_key_t *key, int parts, const char *const *paths);
 
+/* Unit table (build_partition.h): canonical bitcode of one source unit's
+ * module + target machine + optimization level -> its object and the
+ * symbols the optimized unit still references (newline-separated). Not
+ * thread-safe: callers serialize. */
+bool zan_bcache_unit_key(const void *bitcode, size_t size, LLVMTargetMachineRef tm, int opt_level,
+                         zan_bcache_key_t *key);
+bool zan_bcache_unit_load(const zan_bcache_key_t *key, const char *obj_path, char **refs);
+void zan_bcache_unit_store(const zan_bcache_key_t *key, const char *obj_path, const char *refs);
+
 /* Optimizer report text: printed to stderr and, between capture_begin and
  * capture_end, also recorded so a cache hit can replay it. */
 void zan_bcache_logf(const char *fmt, ...)

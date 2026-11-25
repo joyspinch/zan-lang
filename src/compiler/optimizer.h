@@ -82,6 +82,11 @@ bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level);
 void zan_opt_report_print(const zan_opt_report_t *report);
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
+/* The same pipeline for one partitioned unit module (build_partition.h):
+ * no whole-module-only steps. Thread-safe per module; returns 0 on success. */
+int zan_opt_run_passes_on_unit(LLVMModuleRef mod, LLVMTargetMachineRef tm, int level);
+/* Whole-module steps the unit pipeline leaves out; run once before splitting. */
+void zan_opt_unit_prelude(LLVMModuleRef mod);
 
 /* 收缩 pass（S-UNWIND）：nothrow 闭包后将可证
  * 不抛的 invoke 塌缩为 call（personality/语义不变）。返回塌缩数。 */

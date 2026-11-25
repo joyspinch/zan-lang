@@ -216,6 +216,8 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         zan_type_t *ret_type = work[w].ret_type;
         LLVMValueRef this_alloca = NULL;
         g->cur_inst = work[w].cur_inst;
+        zan_irgen_note_origin(g, fn, member, work[w].cur_inst, work[w].mbind,
+                              work[w].mtps ? work[w].mtps->count : 0);
 
         if (work[w].is_async) {
             emit_async_method_ir(g, &work[w]);
@@ -958,6 +960,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     struct zan_method_spec sp = g->method_specs[idx];
     zan_ast_node_t *member = sp.member;
     zan_ast_list_t *tps = &member->method_decl.type_params;
+    zan_irgen_note_origin(g, sp.fn, member, sp.owner_inst, sp.bind, tps->count);
 
     if (sp.is_async) {
         emit_async_method_ir(g, (method_body_work_t *)sp.async_ir);
