@@ -1,0 +1,93 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace Sdk.Taobao;
+
+public static class TaobaoSign {
+    public static const string SignMethodHmacSha256 = "hmac-sha256";
+    public static const string SignMethodHmac = "hmac";
+    public static const string SignMethodMd5 = "md5";
+
+    public static string Compute(Dictionary<string, string> parameters, string secret, string signMethod) {
+        return TaobaoSign.ComputeWithBody(parameters, "", secret, signMethod);
+    }
+
+    public static string ComputeWithBody(Dictionary<string, string> parameters, string body,
+                                         string secret, string signMethod) {
+        if (parameters == null || secret == null || secret.Length == 0) {
+            throw new TaobaoException("client.invalidArguments", "签名需要参数和应用密钥", 0, "");
+        }
+        string method = (signMethod == null || signMethod.Length == 0)
+            ? TaobaoSign.SignMethodHmacSha256
+            : signMethod.ToLower();
+        if (method != TaobaoSign.SignMethodHmacSha256
+            && method != TaobaoSign.SignMethodHmac
+            && method != TaobaoSign.SignMethodMd5) {
+            throw new TaobaoException("client.invalidArguments", "不支持的签名方式: " + signMethod, 0, "");
+        }
+
+        // Dictionary.Keys 返回内部 List，复制后排序以免打乱原字典状态。
+        List<string> rawKeys = parameters.Keys;
+        List<string> sorted = new List<string>();
+        for (int i = 0; i < rawKeys.Count; i = i + 1) {
+            string key = rawKeys[i];
+            if (key != null && key.Length > 0 && key != "sign") {
+                string val = parameters[key];
+                if (val != null && val.Length > 0) {
+                    sorted.Add(key);
+                }
+            }
+        }
+        sorted.Sort();
+
+        StringBuilder query = new StringBuilder();
+        if (method == TaobaoSign.SignMethodMd5) {
+            query.Append(secret);
+        }
+        for (int i = 0; i < sorted.Count; i = i + 1) {
+            string key = sorted[i];
+            query.Append(key);
+            query.Append(parameters[key]);
+        }
+        if (body != null && body.Length > 0) {
+            query.Append(body);
+        }
+
+        byte[] digest;
+        if (method == TaobaoSign.SignMethodHmac) {
+            digest = Hmac.Md5(Encoding.GetBytes(secret), Encoding.GetBytes(query.ToString()));
+        } else if (method == TaobaoSign.SignMethodHmacSha256) {
+            digest = Hmac.Sha256(Encoding.GetBytes(secret), Encoding.GetBytes(query.ToString()));
+        } else {
+            query.Append(secret);
+            digest = Md5.Hash(query.ToString());
+        }
+        return Convert.ToHexString(digest).ToUpperAscii();
+    }
+
+    public static string FormEncode(Dictionary<string, string> fields) {
+        if (fields == null || fields.Count == 0) { return ""; }
+        StringBuilder body = new StringBuilder();
+        List<string> keys = fields.Keys;
+        bool first = true;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string key = keys[i];
+            string val = fields[key];
+            if (key == null || key.Length == 0 || val == null) { continue; }
+            if (!first) { body.Append("&"); }
+            first = false;
+            body.Append(Encoding.UrlEncode(key));
+            body.Append("=");
+            body.Append(Encoding.UrlEncode(val));
+        }
+        return body.ToString();
+    }
+
+    public static string BuildUrlWithQuery(string basePath, Dictionary<string, string> queryParams) {
+        string q = TaobaoSign.FormEncode(queryParams);
+        if (q.Length == 0) { return basePath; }
+        if (basePath.Contains("?")) { return basePath + "&" + q; }
+        return basePath + "?" + q;
+    }
+}

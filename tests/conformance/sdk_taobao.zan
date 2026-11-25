@@ -1,0 +1,193 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using Sdk.Taobao;
+using Sdk.Taobao.Api.Fuwu;
+
+class Program {
+    static int PORT = 9529;
+    static string APPKEY = "test_app_key";
+    static string SECRET = "test_app_secret";
+    static int rateHits = 0;
+
+    static Dictionary<string, string> ParseQuery(string qs) {
+        Dictionary<string, string> map = new Dictionary<string, string>();
+        if (qs == null || qs.Length == 0) { return map; }
+        string s = qs.StartsWith("?") ? qs.Substring(1) : qs;
+        List<string> pairs = s.Split("&");
+        for (int i = 0; i < pairs.Count; i = i + 1) {
+            string p = pairs[i];
+            int eq = p.IndexOf("=");
+            if (eq > 0) {
+                string k = Encoding.UrlDecode(p.Substring(0, eq));
+                string v = Encoding.UrlDecode(p.Substring(eq + 1));
+                if (map.ContainsKey(k)) { map[k] = v; } else { map.Add(k, v); }
+            }
+        }
+        return map;
+    }
+
+    static bool VerifyTopSign(Dictionary<string, string> query, Dictionary<string, string> bodyForm, string bodyRaw) {
+        if (!query.ContainsKey("sign")) { return false; }
+        string got = query["sign"];
+        string method = query.ContainsKey("sign_method") ? query["sign_method"] : "hmac-sha256";
+        Dictionary<string, string> all = new Dictionary<string, string>();
+        List<string> qKeys = query.Keys;
+        for (int i = 0; i < qKeys.Count; i = i + 1) {
+            string k = qKeys[i];
+            if (k != "sign") { all.Add(k, query[k]); }
+        }
+        if (bodyForm != null) {
+            List<string> bKeys = bodyForm.Keys;
+            for (int i = 0; i < bKeys.Count; i = i + 1) {
+                string k = bKeys[i];
+                if (!all.ContainsKey(k)) { all.Add(k, bodyForm[k]); }
+            }
+        }
+        string expected = TaobaoSign.ComputeWithBody(all, bodyRaw, SECRET, method);
+        return expected == got;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        Dictionary<string, string> query = ParseQuery(req.queryString);
+
+        if (req.path == "/router/rest") {
+            bool isMultipart = req.contentType != null && req.contentType.Contains("multipart/form-data");
+            Dictionary<string, string> form = isMultipart ? null : ParseQuery(req.body);
+            string apiMethod = query.ContainsKey("method") ? query["method"] : "";
+
+            if (apiMethod == "taobao.upload.test") {
+                bool hasBoundary = req.contentType != null && req.contentType.Contains("boundary=ZanTaobao");
+                bool hasFile = req.body != null && req.body.Contains("filename=\"demo.png\"") && req.body.Contains("PNGDATA");
+                return HttpResponse.Json("{\"uploaded\":" + (hasBoundary && hasFile ? "true" : "false") + ",\"request_id\":\"req-up\"}");
+            }
+
+            if (!VerifyTopSign(query, form, "")) {
+                return HttpResponse.Json("{\"error_response\":{\"code\":25,\"msg\":\"Invalid signature\",\"request_id\":\"req-bad-sign\"}}");
+            }
+
+            if (apiMethod == "taobao.ratelimit.test") {
+                rateHits = rateHits + 1;
+                if (rateHits <= 2) {
+                    return HttpResponse.Json("{\"error_response\":{\"code\":15,\"msg\":\"Remote service error\",\"sub_code\":\"isp.limited\",\"sub_msg\":\"限流\",\"request_id\":\"req-rl\"}}");
+                }
+                return HttpResponse.Json("{\"ok\":true,\"request_id\":\"req-rl-ok\"}");
+            }
+
+            if (apiMethod == "taobao.session.expired") {
+                return HttpResponse.Json("{\"error_response\":{\"code\":27,\"msg\":\"Invalid session\",\"sub_code\":\"invalid-sessionkey\",\"request_id\":\"req-sess\"}}");
+            }
+
+            if (apiMethod == "taobao.appstore.subscribe.get") {
+                bool simplified = query.ContainsKey("simplify") && query["simplify"] == "true";
+                if (simplified) {
+                    return HttpResponse.Json("{\"user_subscribe\":{\"status\":\"subscribeUser\",\"start_date\":\"2026-01-01 00:00:00\",\"end_date\":\"2026-12-31 23:59:59\",\"version_no\":3},\"request_id\":\"req-sub-s\"}");
+                }
+                return HttpResponse.Json("{\"appstore_subscribe_get_response\":{\"user_subscribe\":{\"status\":\"subscribeUser\",\"version_no\":3},\"request_id\":\"req-ns\"}}");
+            }
+
+            string sess = query.ContainsKey("session") ? query["session"] : "";
+            string nick = (form != null && form.ContainsKey("nick")) ? form["nick"] : "";
+            return HttpResponse.Json("{\"nick\":\"" + nick + "\",\"session\":\"" + sess + "\",\"request_id\":\"req-1\"}");
+        }
+
+        if (req.path == "/router/batch") {
+            if (!VerifyTopSign(query, null, req.body)) {
+                return HttpResponse.Json("{\"error_response\":{\"code\":25,\"msg\":\"Invalid batch signature\",\"request_id\":\"req-batch-bad\"}}");
+            }
+            return HttpResponse.Text("{\"item_id\":101,\"request_id\":\"b1\"}\r\n-S-\r\n{\"item_id\":202,\"request_id\":\"b2\"}");
+        }
+
+        return HttpResponse.ServerError("unexpected");
+    }
+
+    static async int RunAsync() {
+        Socket.Initialize();
+        HttpServer srv = new HttpServer("127.0.0.1", PORT);
+        srv.OnRequest(Handle);
+        Task.Spawn(srv.Start());
+        await Task.Delay(50);
+        try {
+            // 1. Offline deterministic signature vectors
+            Dictionary<string, string> sv = new Dictionary<string, string>();
+            sv.Add("app_key", APPKEY);
+            sv.Add("method", "taobao.appstore.subscribe.get");
+            sv.Add("timestamp", "2026-11-25 14:00:00");
+            sv.Add("v", "2.0");
+            string s256 = TaobaoSign.Compute(sv, SECRET, TaobaoSign.SignMethodHmacSha256);
+            string shmac = TaobaoSign.Compute(sv, SECRET, TaobaoSign.SignMethodHmac);
+            string smd5 = TaobaoSign.Compute(sv, SECRET, TaobaoSign.SignMethodMd5);
+            string s256Repeat = TaobaoSign.Compute(sv, SECRET, TaobaoSign.SignMethodHmacSha256);
+            Console.WriteLine("sign=" + Convert.ToString(s256 == s256Repeat) + "|" + Convert.ToString(s256.Length) + "/" + Convert.ToString(shmac.Length) + "/" + Convert.ToString(smd5.Length));
+
+            // 2. CallAsync + WithSession
+            TaobaoClient baseClient = new TaobaoClient(APPKEY, SECRET)
+                .Server("http://127.0.0.1:" + Convert.ToString(PORT) + "/router/rest")
+                .PlainHttpMode()
+                .WithCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp())
+                .Timeout(5000)
+                .MaxRetries(2);
+
+            TaobaoClient tenantA = baseClient.WithSession("sess-a");
+            Dictionary<string, string> p = new Dictionary<string, string>();
+            p.Add("nick", "tb_user_1");
+            TaobaoResponse r1 = await tenantA.CallAsync("taobao.demo.get", p);
+            Console.WriteLine("call1=" + TaobaoJson.GetString(r1.Data, "nick") + "|" + TaobaoJson.GetString(r1.Data, "session") + "|" + r1.RequestId);
+
+            // 3. MD5 + simplify=false envelope unwrapping via typed Facade
+            TaobaoClient legacyMode = baseClient.WithSession("sess-b").SignMethod(TaobaoSign.SignMethodMd5).Simplify(false);
+            FuwuApi fuwuLegacy = new FuwuApi(legacyMode);
+            TaobaoAppstoreSubscribeGetRequest subReq = new TaobaoAppstoreSubscribeGetRequest()
+                .Nick("tb_user_1")
+                .LeaseId(1001L);
+            TaobaoAppstoreSubscribeGetResponse subResp = await fuwuLegacy.TaobaoAppstoreSubscribeGetAsync(subReq);
+            Console.WriteLine("facade=" + (subResp.UserSubscribe != null ? subResp.UserSubscribe.Status : "") + "|" + Convert.ToString(subResp.UserSubscribe != null ? subResp.UserSubscribe.VersionNo : 0L));
+
+            // 4. Missing required parameter validation
+            string valErr = "";
+            try {
+                new TaobaoAppstoreSubscribeGetRequest().Validate();
+            } catch (TaobaoException ex) {
+                valErr = ex.Code;
+            }
+            Console.WriteLine("validate=" + valErr);
+
+            // 5. Session expired classification
+            string sessErr = "";
+            try {
+                await tenantA.CallAsync("taobao.session.expired", null);
+            } catch (TaobaoException ex) {
+                sessErr = ex.Code + "|" + Convert.ToString(ex.IsSessionExpired);
+            }
+            Console.WriteLine("sessionErr=" + sessErr);
+
+            // 6. Rate limit retry recovery
+            TaobaoResponse r3 = await tenantA.CallAsync("taobao.ratelimit.test", null);
+            Console.WriteLine("retry=" + Convert.ToString(TaobaoJson.GetBool(r3.Data, "ok")) + "|hits=" + Convert.ToString(rateHits));
+
+            // 7. Multipart byte upload
+            Dictionary<string, TaobaoFileItem> files = new Dictionary<string, TaobaoFileItem>();
+            files.Add("image", TaobaoFileItem.FromBytes("demo.png", Encoding.GetBytes("PNGDATA"), "image/png"));
+            TaobaoResponse r4 = await tenantA.CallAsync("taobao.upload.test", p, files, "");
+            Console.WriteLine("upload=" + Convert.ToString(TaobaoJson.GetBool(r4.Data, "uploaded")));
+
+            // 8. Batch API
+            TaobaoBatchRequest batch = new TaobaoBatchRequest()
+                .Add("taobao.item.get", null, "sess-1")
+                .Add("taobao.item.get", null, "sess-2");
+            TaobaoBatchResponse br = await tenantA.ExecuteBatchAsync(batch);
+            Console.WriteLine("batch=" + Convert.ToString(br.Count) + "|" + Convert.ToString(TaobaoJson.GetLong(br.Get(0).Data, "item_id")) + "|" + Convert.ToString(TaobaoJson.GetLong(br.Get(1).Data, "item_id")));
+        } finally {
+            srv.Stop();
+        }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await RunAsync();
+        Console.WriteLine("sdk_taobao_ok");
+    }
+}

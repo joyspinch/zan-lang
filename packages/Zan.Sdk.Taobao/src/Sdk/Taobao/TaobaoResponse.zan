@@ -1,0 +1,86 @@
+using System;
+using System.Json;
+
+namespace Sdk.Taobao;
+
+public class TaobaoResponse {
+    public JsonValue Value;
+    public JsonValue Data;
+    public int StatusCode;
+    public string RequestId;
+    public string RawBody;
+
+    public TaobaoResponse(JsonValue value, JsonValue data, int statusCode, string requestId, string rawBody) {
+        this.Value = value;
+        this.Data = data;
+        this.StatusCode = statusCode;
+        this.RequestId = requestId == null ? "" : requestId;
+        this.RawBody = rawBody == null ? "" : rawBody;
+    }
+
+    public string DataJson {
+        get { return this.Data == null ? "null" : this.Data.ToJson(); }
+    }
+
+    public static TaobaoResponse Parse(int statusCode, string body) {
+        return TaobaoResponse.Parse(statusCode, body, true);
+    }
+
+    public static TaobaoResponse Parse(int statusCode, string body, bool simplify) {
+        if (statusCode < 200 || statusCode >= 300) {
+            throw new TaobaoException("http." + Convert.ToString(statusCode),
+                "淘宝开放平台 HTTP 请求失败", statusCode, body);
+        }
+        if (body == null || body.Length == 0) {
+            throw new TaobaoException("client.invalidResponse", "淘宝开放平台返回空响应", statusCode, "");
+        }
+        JsonValue value;
+        try {
+            value = JsonValue.Parse(body);
+        } catch (Exception e) {
+            throw new TaobaoException("client.invalidResponse", "淘宝开放平台响应不是有效 JSON", statusCode, body);
+        }
+        if (value == null || !value.IsObject()) {
+            throw new TaobaoException("client.invalidResponse", "淘宝开放平台响应必须是 JSON 对象", statusCode, body);
+        }
+
+        // 标准非精简格式与旧版误差包装：{"error_response": {...}}
+        JsonValue? errObj = value.Get("error_response");
+        if (errObj != null && errObj.IsObject()) {
+            TaobaoResponse.ThrowFromErrorObject((JsonValue)errObj, statusCode, body);
+        }
+
+        // Topsdk simplify=true 扁平报错：直接位于根对象上（含 sub_code 或非零 int code + msg）
+        if (simplify) {
+            string rootSubCode = TaobaoJson.GetString(value, "sub_code", "");
+            if (rootSubCode.Length > 0) {
+                TaobaoResponse.ThrowFromErrorObject(value, statusCode, body);
+            }
+            JsonValue? rootCode = value.Get("code");
+            if (rootCode != null && !rootCode.IsNull() && rootCode.IsInt() && rootCode.AsLong(0L) != 0L
+                && value.Has("msg")) {
+                TaobaoResponse.ThrowFromErrorObject(value, statusCode, body);
+            }
+        }
+
+        JsonValue data = value;
+        if (!simplify && value.Count() == 1) {
+            JsonValue? first = value.ValAt(0);
+            if (first != null && first.IsObject()) {
+                data = (JsonValue)first;
+            }
+        }
+        string reqId = TaobaoJson.GetString(data, "request_id", TaobaoJson.GetString(value, "request_id", ""));
+        return new TaobaoResponse(value, data, statusCode, reqId, body);
+    }
+
+    private static void ThrowFromErrorObject(JsonValue errObj, int statusCode, string body) {
+        string code = TaobaoJson.GetString(errObj, "code", "unknown");
+        string msg = TaobaoJson.GetString(errObj, "msg", "淘宝接口返回错误");
+        string subCode = TaobaoJson.GetString(errObj, "sub_code", "");
+        string subMsg = TaobaoJson.GetString(errObj, "sub_msg", "");
+        string reqId = TaobaoJson.GetString(errObj, "request_id", "");
+        string fullMsg = subMsg.Length > 0 ? msg + ": " + subMsg : msg;
+        throw new TaobaoException(code, fullMsg, subCode, subMsg, reqId, statusCode, body);
+    }
+}

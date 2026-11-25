@@ -1,0 +1,475 @@
+using System;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Text;
+using System.Threading;
+
+namespace Sdk.Taobao;
+
+// 淘宝开放平台（TOP）异步客户端（支持 WithSession 多商家派生、HMAC-SHA256/HMAC-MD5/MD5 签名与限流重试）。
+public class TaobaoClient {
+    public static const string ProductionGateway = "https://eco.taobao.com/router/rest";
+    public static const string SandboxGateway = "https://gw.api.tbsandbox.com/router/rest";
+    public static const string SdkPartnerId = "zan-sdk-taobao-1.0.0";
+    private static const string DefaultBatchSplit = "\r\n-S-\r\n";
+    private static const string FormContentType = "application/x-www-form-urlencoded;charset=utf-8";
+
+    private string appKey;
+    private string appSecret;
+    private string session;
+    private string targetAppKey;
+    private string signMethod;
+    private string serverHost;
+    private int serverPort;
+    private string serverPath;
+    private bool useTls;
+    private string batchPathOverride;
+    private bool simplify;
+    private int timeoutMs;
+    private int maxRetries;
+    private int tzOffsetMinutes;
+    private bool plainHttp;
+    private ExternalCallPolicy policy;
+    private Dictionary<string, string> sharedSystemParams;
+
+    public TaobaoClient(string appKey, string appSecret)
+        : this(appKey, appSecret, TaobaoClient.ProductionGateway, ExternalCallPolicy.Default()) {}
+
+    public TaobaoClient(string appKey, string appSecret, string gatewayUrl, ExternalCallPolicy policy) {
+        TaobaoClient.RequireValue(appKey, "app_key");
+        TaobaoClient.RequireValue(appSecret, "app_secret");
+        this.appKey = appKey;
+        this.appSecret = appSecret;
+        this.session = "";
+        this.targetAppKey = "";
+        this.signMethod = TaobaoSign.SignMethodHmacSha256;
+        this.simplify = true;
+        this.timeoutMs = 30000;
+        this.maxRetries = 2;
+        this.tzOffsetMinutes = 480;
+        this.plainHttp = false;
+        this.batchPathOverride = "";
+        this.sharedSystemParams = new Dictionary<string, string>();
+        this.WithCallPolicy(policy);
+        this.Server(gatewayUrl == null || gatewayUrl.Length == 0 ? TaobaoClient.ProductionGateway : gatewayUrl);
+    }
+
+    public string AppKey { get { return this.appKey; } }
+    public string Session { get { return this.session; } }
+    public bool IsSimplify { get { return this.simplify; } }
+
+    public TaobaoClient SetSession(string session) {
+        this.session = session == null ? "" : session;
+        return this;
+    }
+
+    // 派生携带独立商家 session 的轻量会话实例，共享底层应用配置与策略。
+    public TaobaoClient WithSession(string session) {
+        TaobaoClient.RequireValue(session, "session");
+        TaobaoClient copy = new TaobaoClient(this.appKey, this.appSecret);
+        copy.session = session;
+        copy.targetAppKey = this.targetAppKey;
+        copy.signMethod = this.signMethod;
+        copy.serverHost = this.serverHost;
+        copy.serverPort = this.serverPort;
+        copy.serverPath = this.serverPath;
+        copy.useTls = this.useTls;
+        copy.batchPathOverride = this.batchPathOverride;
+        copy.simplify = this.simplify;
+        copy.timeoutMs = this.timeoutMs;
+        copy.maxRetries = this.maxRetries;
+        copy.tzOffsetMinutes = this.tzOffsetMinutes;
+        copy.plainHttp = this.plainHttp;
+        copy.policy = this.policy;
+        copy.sharedSystemParams = TaobaoClient.CopyDict(this.sharedSystemParams);
+        return copy;
+    }
+
+    public TaobaoClient Server(string gatewayUrl) {
+        ExternalTarget target = ExternalTarget.Parse(gatewayUrl);
+        if (target == null || target.Query().Length > 0) {
+            throw new TaobaoException("client.invalidGateway", "淘宝网关地址格式无效", 0, "");
+        }
+        if (!target.IsTls() && !target.IsLoopback()) {
+            throw new TaobaoException("client.invalidGateway", "非环回地址必须使用 HTTPS 网关", 0, "");
+        }
+        this.serverHost = target.Host();
+        this.serverPort = target.Port();
+        this.serverPath = target.Path();
+        this.useTls = target.IsTls();
+        return this;
+    }
+
+    public TaobaoClient BatchPath(string batchPath) {
+        if (batchPath != null && batchPath.Length > 0) {
+            this.batchPathOverride = batchPath.StartsWith("/") ? batchPath : "/" + batchPath;
+        }
+        return this;
+    }
+
+    public TaobaoClient UseProduction() {
+        return this.Server(TaobaoClient.ProductionGateway);
+    }
+
+    public TaobaoClient UseSandbox() {
+        return this.Server(TaobaoClient.SandboxGateway);
+    }
+
+    public TaobaoClient SignMethod(string method) {
+        string m = method == null ? "" : method.ToLower();
+        if (m != TaobaoSign.SignMethodHmacSha256
+            && m != TaobaoSign.SignMethodHmac
+            && m != TaobaoSign.SignMethodMd5) {
+            throw new TaobaoException("client.invalidArguments", "不支持的签名方式: " + method, 0, "");
+        }
+        this.signMethod = m;
+        return this;
+    }
+
+    public TaobaoClient Simplify(bool simplify) {
+        this.simplify = simplify;
+        return this;
+    }
+
+    public TaobaoClient TargetAppKey(string targetAppKey) {
+        this.targetAppKey = targetAppKey == null ? "" : targetAppKey;
+        return this;
+    }
+
+    public TaobaoClient TimeZoneOffset(int minutes) {
+        this.tzOffsetMinutes = minutes;
+        return this;
+    }
+
+    public TaobaoClient Timeout(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+        return this;
+    }
+
+    public TaobaoClient MaxRetries(int count) {
+        this.maxRetries = count < 0 ? 0 : count;
+        return this;
+    }
+
+    public TaobaoClient PlainHttpMode() {
+        this.plainHttp = true;
+        return this;
+    }
+
+    public TaobaoClient AddSystemParam(string key, string value) {
+        if (key != null && key.Length > 0 && value != null) {
+            this.sharedSystemParams.Add(key, value);
+        }
+        return this;
+    }
+
+    public TaobaoClient WithCallPolicy(ExternalCallPolicy callPolicy) {
+        ExternalCallPolicy next = callPolicy == null ? ExternalCallPolicy.Default() : callPolicy;
+        if (next.MaxRedirects() != 0 || next.RetryAttempts() != 0) {
+            throw new TaobaoException("client.invalidPolicy", "淘宝 TOP 请求需要关闭重定向和传输层自动重试", 0, "");
+        }
+        this.policy = next;
+        return this;
+    }
+
+    public async TaobaoResponse CallAsync(string apiMethod, Dictionary<string, string>? parameters = null) {
+        return await this.CallAsync(apiMethod, parameters, null, this.session, null, "");
+    }
+
+    public async TaobaoResponse CallAsync(string apiMethod, Dictionary<string, string>? parameters, string session) {
+        return await this.CallAsync(apiMethod, parameters, null, session, null, "");
+    }
+
+    public async TaobaoResponse CallAsync(string apiMethod, Dictionary<string, string>? parameters,
+                                          Dictionary<string, TaobaoFileItem>? files, string session) {
+        return await this.CallAsync(apiMethod, parameters, files, session, null, "");
+    }
+
+    public async TaobaoResponse CallAsync(string apiMethod, Dictionary<string, string>? parameters,
+                                          Dictionary<string, TaobaoFileItem>? files, string session,
+                                          Dictionary<string, string>? headers, string targetAppKeyOverride) {
+        TaobaoClient.RequireValue(apiMethod, "method");
+        this.EnsurePolicyAndTarget();
+
+        string effectiveSession = (session != null && session.Length > 0) ? session : this.session;
+        string effectiveTarget = (targetAppKeyOverride != null && targetAppKeyOverride.Length > 0)
+            ? targetAppKeyOverride
+            : this.targetAppKey;
+
+        int attempt = 0;
+        while (true) {
+            Dictionary<string, string> sysParams = this.BuildSystemParams(apiMethod, effectiveSession, effectiveTarget);
+            Dictionary<string, string> bizParams = TaobaoClient.CleanDict(parameters);
+
+            Dictionary<string, string> signParams = TaobaoClient.CopyDict(sysParams);
+            TaobaoClient.PutAll(signParams, bizParams);
+            sysParams.Add("sign", TaobaoSign.Compute(signParams, this.appSecret, this.signMethod));
+
+            string reqPath = TaobaoSign.BuildUrlWithQuery(this.serverPath, sysParams);
+
+            try {
+                HttpResponse response;
+                using (HttpClient http = this.NewHttpClient()) {
+                    this.ApplyHeaders(http, headers);
+                    if (files != null && files.Count > 0) {
+                        TaobaoMultipart mp = new TaobaoMultipart();
+                        List<string> bKeys = bizParams.Keys;
+                        for (int i = 0; i < bKeys.Count; i = i + 1) {
+                            string k = bKeys[i];
+                            mp.AddField(k, bizParams[k]);
+                        }
+                        List<string> fKeys = files.Keys;
+                        for (int i = 0; i < fKeys.Count; i = i + 1) {
+                            string fk = fKeys[i];
+                            mp.AddFile(fk, files[fk]);
+                        }
+                        byte[] bodyBytes = mp.Body(64 * 1024 * 1024);
+                        http.SetHeader("Content-Type", mp.ContentType());
+                        try {
+                            response = await http.SendBytesAsync("POST", reqPath, bodyBytes, bodyBytes.Length);
+                        } catch (Exception e) {
+                            throw new TaobaoException("client.networkError", e.Message, 0, "");
+                        }
+                    } else {
+                        http.SetHeader("Content-Type", TaobaoClient.FormContentType);
+                        string formBody = TaobaoSign.FormEncode(bizParams);
+                        try {
+                            response = await http.SendAsync("POST", reqPath, formBody);
+                        } catch (Exception e) {
+                            throw new TaobaoException("client.networkError", e.Message, 0, "");
+                        }
+                    }
+
+                    if (response == null || response.statusCode == 0) {
+                        throw new TaobaoException("client.networkError", "淘宝网关未返回 HTTP 响应", 0, "");
+                    }
+                    using (response) {
+                        return TaobaoResponse.Parse(response.statusCode, response.body, this.simplify);
+                    }
+                }
+            } catch (TaobaoException e) {
+                if (!e.IsRateLimited || attempt >= this.maxRetries) {
+                    throw e;
+                }
+            }
+            attempt = attempt + 1;
+            await Task.Delay(attempt * 500);
+        }
+    }
+
+    public async TaobaoBatchResponse ExecuteBatchAsync(TaobaoBatchRequest batch) {
+        if (batch == null || batch.Items == null || batch.Items.Count == 0) {
+            throw new TaobaoException("client.invalidArguments", "批量请求列表不能为空", 0, "");
+        }
+        this.EnsurePolicyAndTarget();
+
+        string batchPath = this.ResolveBatchPath();
+        string separator = (batch.SeparatorValue == null || batch.SeparatorValue.Length == 0)
+            ? TaobaoClient.DefaultBatchSplit
+            : batch.SeparatorValue;
+
+        string effectiveTarget = (batch.TargetAppKeyValue != null && batch.TargetAppKeyValue.Length > 0)
+            ? batch.TargetAppKeyValue
+            : this.targetAppKey;
+
+        // 对齐 BatchTopClient：同方法且未显式指定 PublicMethod 时自动提取公共 method。
+        string pubMethod = batch.PublicMethodValue;
+        if (pubMethod.Length == 0 && batch.Items.Count > 1) {
+            string firstMethod = batch.Items[0].Method;
+            bool allSame = firstMethod.Length > 0;
+            for (int i = 1; i < batch.Items.Count; i = i + 1) {
+                if (batch.Items[i].Method != firstMethod) {
+                    allSame = false;
+                    break;
+                }
+            }
+            if (allSame) { pubMethod = firstMethod; }
+        }
+
+        Dictionary<string, string> pubParams = TaobaoClient.CopyDict(batch.PublicParams);
+        if (pubMethod.Length > 0 && !pubParams.ContainsKey("method")) {
+            pubParams.Add("method", pubMethod);
+        }
+
+        StringBuilder bodyBuilder = new StringBuilder();
+        string pubStr = TaobaoSign.FormEncode(pubParams);
+        if (pubStr.Length > 0) {
+            bodyBuilder.Append("#PUBLIC#");
+            bodyBuilder.Append(pubStr);
+            bodyBuilder.Append(separator);
+        }
+        for (int i = 0; i < batch.Items.Count; i = i + 1) {
+            TaobaoBatchItem item = batch.Items[i];
+            Dictionary<string, string> itemParams = TaobaoClient.CleanDict(item.Parameters);
+            if (item.Method.Length > 0 && item.Method != pubMethod) {
+                itemParams.Add("method", item.Method);
+            }
+            if (item.Session.Length > 0) {
+                itemParams.Add("session", item.Session);
+            }
+            if (item.TargetAppKey.Length > 0) {
+                itemParams.Add("target_app_key", item.TargetAppKey);
+            }
+            string itemStr = TaobaoSign.FormEncode(itemParams);
+            if (itemStr.Length == 0) { itemStr = "N"; }
+            bodyBuilder.Append(itemStr);
+            if (i + 1 < batch.Items.Count) {
+                bodyBuilder.Append(separator);
+            }
+        }
+        string apiBody = bodyBuilder.ToString();
+
+        int attempt = 0;
+        while (true) {
+            Dictionary<string, string> sysParams = this.BuildSystemParams("", this.session, effectiveTarget);
+            sysParams.Add("sign", TaobaoSign.ComputeWithBody(sysParams, apiBody, this.appSecret, this.signMethod));
+            string reqPath = TaobaoSign.BuildUrlWithQuery(batchPath, sysParams);
+
+            try {
+                HttpResponse response;
+                using (HttpClient http = this.NewHttpClient()) {
+                    this.ApplyHeaders(http, batch.HeaderParams);
+                    if (separator != TaobaoClient.DefaultBatchSplit) {
+                        http.SetHeader("top-api-separator", separator);
+                    }
+                    http.SetHeader("Content-Type", "text/plain;charset=utf-8");
+                    try {
+                        response = await http.SendAsync("POST", reqPath, apiBody);
+                    } catch (Exception e) {
+                        throw new TaobaoException("client.networkError", e.Message, 0, "");
+                    }
+                    if (response == null || response.statusCode == 0) {
+                        throw new TaobaoException("client.networkError", "淘宝批量网关未返回 HTTP 响应", 0, "");
+                    }
+                    using (response) {
+                        return TaobaoBatchResponse.Parse(
+                            response.statusCode, response.body, separator, batch.Items.Count, this.simplify);
+                    }
+                }
+            } catch (TaobaoException e) {
+                if (!e.IsRateLimited || attempt >= this.maxRetries) {
+                    throw e;
+                }
+            }
+            attempt = attempt + 1;
+            await Task.Delay(attempt * 500);
+        }
+    }
+
+    private void EnsurePolicyAndTarget() {
+        if (this.policy.MaxRedirects() != 0 || this.policy.RetryAttempts() != 0) {
+            throw new TaobaoException("client.invalidPolicy", "淘宝 TOP 请求需要关闭重定向和传输层自动重试", 0, "");
+        }
+        if (!this.useTls && (!this.policy.AllowsLoopback() || (!this.plainHttp && !this.policy.AllowsHttp()))) {
+            throw new TaobaoException("client.invalidGateway", "请提供 HTTPS 网关地址，或使用 PlainHttpMode 并放行环回策略", 0, "");
+        }
+    }
+
+    private HttpClient NewHttpClient() {
+        HttpClient http = new HttpClient(this.serverHost, this.serverPort);
+        if (this.useTls && !this.plainHttp) { http.UseTls(); }
+        http.SetTimeout(this.timeoutMs);
+        http.SetCallPolicy(this.policy);
+        return http;
+    }
+
+    private void ApplyHeaders(HttpClient http, Dictionary<string, string>? headers) {
+        if (headers == null) { return; }
+        List<string> keys = headers.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            string v = headers[k];
+            if (k != null && k.Length > 0 && v != null) {
+                http.SetHeader(k, v);
+            }
+        }
+    }
+
+    private Dictionary<string, string> BuildSystemParams(string apiMethod, string effectiveSession, string effectiveTarget) {
+        Dictionary<string, string> sys = new Dictionary<string, string>();
+        sys.Add("app_key", this.appKey);
+        sys.Add("v", "2.0");
+        sys.Add("sign_method", this.signMethod);
+        sys.Add("format", "json");
+        sys.Add("partner_id", TaobaoClient.SdkPartnerId);
+        sys.Add("timestamp", this.CurrentTimestamp());
+        if (this.simplify) {
+            sys.Add("simplify", "true");
+        }
+        if (apiMethod != null && apiMethod.Length > 0) {
+            sys.Add("method", apiMethod);
+        }
+        if (effectiveSession != null && effectiveSession.Length > 0) {
+            sys.Add("session", effectiveSession);
+        }
+        if (effectiveTarget != null && effectiveTarget.Length > 0) {
+            sys.Add("target_app_key", effectiveTarget);
+        }
+        TaobaoClient.PutAll(sys, this.sharedSystemParams);
+        return sys;
+    }
+
+    private string CurrentTimestamp() {
+        long unixSeconds = DateTime.UtcNow().ToUnixSeconds();
+        DateTime wall = DateTime.FromUnixSeconds(unixSeconds + (long)this.tzOffsetMinutes * 60L);
+        return wall.ToString();
+    }
+
+    private string ResolveBatchPath() {
+        if (this.batchPathOverride.Length > 0) {
+            return this.batchPathOverride;
+        }
+        if (this.serverPath.Contains("/router/rest")) {
+            return this.serverPath.Replace("/router/rest", "/router/batch");
+        }
+        return "/router/batch";
+    }
+
+    private static Dictionary<string, string> CleanDict(Dictionary<string, string>? src) {
+        Dictionary<string, string> dst = new Dictionary<string, string>();
+        if (src == null) { return dst; }
+        List<string> keys = src.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            string v = src[k];
+            if (k != null && k.Length > 0 && v != null) {
+                dst.Add(k, v);
+            }
+        }
+        return dst;
+    }
+
+    private static Dictionary<string, string> CopyDict(Dictionary<string, string>? src) {
+        Dictionary<string, string> dst = new Dictionary<string, string>();
+        if (src == null) { return dst; }
+        List<string> keys = src.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            dst.Add(k, src[k]);
+        }
+        return dst;
+    }
+
+    private static void PutAll(Dictionary<string, string> dst, Dictionary<string, string>? src) {
+        if (src == null) { return; }
+        List<string> keys = src.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            string v = src[k];
+            if (k != null && k.Length > 0 && v != null) {
+                if (dst.ContainsKey(k)) {
+                    dst[k] = v;
+                } else {
+                    dst.Add(k, v);
+                }
+            }
+        }
+    }
+
+    private static void RequireValue(string value, string field) {
+        if (value == null || value.Length == 0) {
+            throw new TaobaoException("client.invalidArguments", field + " 不能为空", 0, "");
+        }
+    }
+}
