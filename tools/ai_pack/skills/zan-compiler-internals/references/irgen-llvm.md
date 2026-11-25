@@ -809,3 +809,23 @@ gui_tabs 全程 21.6s/1.34GB → 11.9s/760MB。谓词从"只在发布跑"变成"
 诊断补发现仅限用户源码：封闭世界下未达的 stdlib/`packages/` 方法不再生成
 （`from_stdlib`/`from_package` 看 `type_sym->decl`）；`-g` 等全量构建不能跳过——
 那里补发的方法体会以 live=3 保留给反射。`ZAN_DIAG_LIB_BODIES=1` 恢复库覆盖。
+
+## 37. 每次调用都付的税：入口 EH 簿记要按"本函数是否压过临时"省掉（2026-11-24 Mac arm64 实证）
+
+跨语言基准 fib(40)：Zan 0.24s，C/Rust 0.18s。-O2 IR 里每个方法入口都取一次线程
+EH 状态（TSD `mrs TPIDRRO_EL0` + 判空 + 慢路径）、读 `tmps.top` 存入 `fn.tmp.mark`，
+递归调用全是 invoke + 落地垫调 `__zan_eh_tmp_unwind`——哪怕函数一个临时都不压。
+`__zan_eh_tmp_unwind` 恒 MAYTHROW，LLVM 删不掉这套东西，连尾递归消除都做不成。
+
+修法：`g->eh_tmp_push_seq` 在 `emit_eh_tmp_push[_slot]` 处自增；`init_fn_lpad` 记起点，
+`finish_fn_lpad` 时没变就不发 unwind，并用 `eh_drop_tmp_mark` 删掉入口 alloca/store/
+load 及无人用的字段 GEP 与状态取址（同步清 `eh_state_cached`/`eh_state_fields`）。
+无需释放局部的落地垫只剩 cleanup+resume，LLVM 折成普通 call。依据：本帧 mark 之上的
+临时只能来自本帧——压过临时的被调帧各自回卷，没有函数级落地垫的帧（async 体）由
+awaiter 或最近的 catch 回卷到更低的 mark。fib 0.24s → 0.18s（与 C 持平），字符串
+构建 0.32 → 0.30s。`ZAN_EH_FN_MARK=1` 恢复旧行为做 A/B。
+
+连带暴露：macOS `CLOCK_MONOTONIC` 只按整微秒走，而 `Stopwatch.Frequency()` 报
+1GHz——调用变快后 `case_bench_suite` 的"measured time is positive"大概率读到 0。
+Apple 上改用 `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)`（41.7ns 分辨率，含睡眠）。
+测试"变快后才失败"先怀疑测量工具的分辨率，别回退优化。

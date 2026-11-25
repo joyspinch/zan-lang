@@ -604,6 +604,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
 }
 void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
     if (!obj || LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) return;
+    g->eh_tmp_push_seq++;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(obj) != i8ptr)
         obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "eh.tmp");
@@ -612,6 +613,7 @@ void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
 }
 void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
+    g->eh_tmp_push_seq++;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(slot) != i8ptr)

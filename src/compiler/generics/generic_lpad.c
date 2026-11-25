@@ -771,6 +771,7 @@ typedef struct fn_cleanup_variant {
 struct zan_fn_cleanup_state {
     local_scope_t *locals;
     LLVMValueRef tmp_mark;
+    unsigned push_seq0;
     fn_cleanup_variant_t *variants;
     local_var_t *active;
     int active_cap;
@@ -782,6 +783,7 @@ void init_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry,
     memset(state, 0, sizeof(*state));
     state->locals = locals;
     state->tmp_mark = tmp_mark;
+    state->push_seq0 = g->eh_tmp_push_seq;
     entry->fn_cleanup = state;
 }
 
@@ -848,14 +850,31 @@ void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef lp_type = LLVMStructTypeInContext(g->ctx,
         (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
+    /* Temps above the entry mark can only come from pushes this body emitted:
+     * every callee that pushes unwinds its own on the way out, and frames
+     * without a function landing pad (async bodies) are drained by their
+     * awaiter or the nearest catch, which unwind to a lower mark anyway. A
+     * body with no pushes therefore skips the per-call state lookup on entry
+     * and leaves a bare cleanup pad that LLVM folds away when no locals need
+     * releasing -- recursive and leaf calls become plain calls. */
+    static int force_mark = -1;
+    if (force_mark < 0) {
+        const char *e = getenv("ZAN_EH_FN_MARK");
+        force_mark = e && *e == '1';
+    }
+    bool keep_mark = force_mark || g->eh_tmp_push_seq != state->push_seq0;
+    if (!keep_mark) eh_drop_tmp_mark(g, state->tmp_mark);
     for (fn_cleanup_variant_t *v = state->variants; v; v = v->next) {
         LLVMPositionBuilderAtEnd(g->builder, v->landing.lpad_bb);
         ensure_function_personality(g, entry->fn);
         LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_type,
             get_eh_personality_fn(g), 0, "fn.lp");
         LLVMSetCleanup(lp, 1);
-        LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
-        emit_eh_tmp_unwind_to(g, mark);
+        if (keep_mark) {
+            LLVMValueRef mark =
+                LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
+            emit_eh_tmp_unwind_to(g, mark);
+        }
         emit_lpad_cleanups(g, &v->landing);
         LLVMBuildResume(g->builder, lp);
     }

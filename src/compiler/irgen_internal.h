@@ -523,6 +523,7 @@ void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top, LLVMValueRef *bufs, LLVMV
 LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g);
 LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g);
 LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g);
+void eh_drop_tmp_mark(zan_irgen_t *g, LLVMValueRef mark);
 LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g);
 LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym, zan_symbol_t *fsym, zan_type_t *inst);

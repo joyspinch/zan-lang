@@ -324,6 +324,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `ZAN_CODEGEN_SPLIT` | 优化后的模块 ≥20 万条指令时，目标文件代码生成按 `llvm::SplitModule` 切成多份、多线程并行发射（各线程独立 LLVMContext/TargetMachine，额外分区 `<out>.o.p<N>.o` 一并链接）；只影响本机、非交叉、非 `-g`、非库构建，不影响内联与运行速度。`=0` 关闭，`=N` 强制 N 份（上限 16，保持链接命令行短于 cmd.exe 的 8191 字符） |
 | `ZAN_HUGE_FN` | `-O2`/`-O3` 时，优化前指令数超过此值（默认 4000，`0` 关闭）的函数加 `optsize`，降低往超大分派函数里内联的阈值 |
 | `ZAN_DIAG_LIB_BODIES` | `=1` 时普通（封闭世界）构建也为未达到的标准库/`packages/` 方法生成一遍代码以报代码生成诊断（默认只诊断用户源码里未达到的方法；库由自身构建与测试覆盖） |
+| `ZAN_EH_FN_MARK` | `=1` 时每个方法/lambda 入口都记临时栈标记、落地垫都回卷到它（旧行为）。默认只有函数体压过临时（`__zan_eh_tmp_push`）的函数才记，其余函数省掉入口线程 EH 状态读取与回卷调用，仅供 A/B |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |

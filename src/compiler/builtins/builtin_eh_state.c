@@ -552,6 +552,40 @@ static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
     g->eh_state_fields[field] = p;
     return p;
 }
+/* Remove a function's unused temp-stack entry mark (alloca + store of the
+ * loaded top) and, when nothing else in the function needs it, the field
+ * address and the EH state lookup feeding it. finish_fn_lpad calls this for
+ * bodies that pushed no temps. */
+static bool eh_erase_if_dead(LLVMValueRef v) {
+    if (!v || !LLVMIsAInstruction(v) || LLVMGetFirstUse(v)) return false;
+    LLVMInstructionEraseFromParent(v);
+    return true;
+}
+void eh_drop_tmp_mark(zan_irgen_t *g, LLVMValueRef mark) {
+    if (!mark || !LLVMIsAAllocaInst(mark)) return;
+    LLVMUseRef u = LLVMGetFirstUse(mark);
+    if (!u || LLVMGetNextUse(u)) return;
+    LLVMValueRef st = LLVMGetUser(u);
+    if (!LLVMIsAStoreInst(st) || LLVMGetOperand(st, 1) != mark) return;
+    LLVMValueRef ld = LLVMGetOperand(st, 0);
+    LLVMInstructionEraseFromParent(st);
+    LLVMInstructionEraseFromParent(mark);
+    if (!LLVMIsALoadInst(ld)) return;
+    LLVMValueRef field = LLVMGetOperand(ld, 0);
+    if (!eh_erase_if_dead(ld) || !LLVMIsAGetElementPtrInst(field) || LLVMGetFirstUse(field)) return;
+    LLVMValueRef st_ptr = LLVMGetOperand(field, 0);
+    for (int i = 0; i < EH_F_COUNT; i++)
+        if (g->eh_state_fields[i] == field) g->eh_state_fields[i] = NULL;
+    LLVMInstructionEraseFromParent(field);
+    if (!LLVMIsAInstruction(st_ptr) || LLVMGetFirstUse(st_ptr)) return;
+    if (st_ptr == g->eh_state_cached) {
+        g->eh_state_cached = NULL;
+        g->eh_state_owner = NULL;
+    }
+    LLVMValueRef inner = LLVMIsABitCastInst(st_ptr) ? LLVMGetOperand(st_ptr, 0) : NULL;
+    LLVMInstructionEraseFromParent(st_ptr);
+    eh_erase_if_dead(inner);
+}
 void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
                            LLVMValueRef *bufs, LLVMValueRef *exc) {
     *top = emit_eh_field_ptr(g, EH_F_TOP, "eh.topp");
