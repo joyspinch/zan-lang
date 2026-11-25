@@ -38,6 +38,12 @@ typedef struct {
     zan_loc_t        loc;
     int              code;   /* 诊断编号（A382 编号规范），0 = 未编号 */
     char             message[1024];
+    /* S1：capture 模式（LSP）携带 fix-it——把 [fix_loc, fix_loc + fix_len) 换成
+     * fix_text；has_fix 为 false 时其余字段无意义 */
+    bool             has_fix;
+    zan_loc_t        fix_loc;
+    uint32_t         fix_len;
+    char             fix_text[128];
 } zan_diag_entry_t;
 
 /* #pragma warning disable/restore 记下的生效区间（A382③） */
@@ -135,6 +141,10 @@ void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 void zan_diag_emit_fix(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                        int code, const zan_diag_fixit_t *fix, const char *fmt, ...);
 bool zan_diag_has_errors(zan_diag_t *diag);
+
+/* S1：诊断所在 token 的结束位置（不含）。按源码就地量 token 长度；跨行或
+ * 量不出时返回 false。JSON 诊断的 "end" 与 LSP 的 range 都用它。 */
+bool zan_diag_token_end(const zan_diag_t *diag, zan_loc_t loc, zan_loc_t *end);
 
 /* S1：--diag=text|json。解析失败返回 -1。 */
 int  zan_diag_parse_format(const char *name);

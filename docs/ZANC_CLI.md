@@ -200,6 +200,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `code` | 诊断编号如 `E0032` / `W2072`，字母按**发射时**级别；未编号为 `null` |
 | `message` | 不含 `[E####]` 前缀的消息正文 |
 | `file` `line` `col` `offset` | 位置：`line`/`col` 1 起，**`col` 按字节计**；`offset` 0 起字节偏移 |
+| `end` | 诊断所在 token 的结束位置（不含）`{line, col, offset}`：按源码就地量出的标识符/数字/字面量/运算符长度；成员诊断落在 `.` 上时延到后面的成员名（区间覆盖 `.名字`）；量不出（跨行）时省略 |
 | `fixits[]` | 机器可应用补丁：把 `[offset, offset+length)` 字节替换为 `text`，`length = 0` 即插入；可能为空数组 |
 | summary `errors` `warnings` `suppressed` | 计数；`suppressed` = 错误上限与单行级联帽丢弃的条数；进程退出前输出 |
 
@@ -212,6 +213,11 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | E1005 未定义的类型 | 换成作用域里拼写最近的类型名（类/结构/接口/枚举/委托） |
 | E2073 条件里写成赋值 | 普通 `=` 换成 `==`（复合赋值不给） |
 | W2111 类之间的强引用环（S11） | 在回指针字段的类型前插入 `weak ` |
+
+zan-lsp 同口径：诊断的 range 用同一个结束位置，带 `code`（如 `E2085`）；有补丁的
+诊断在 `data.fix` 里带上补丁的 LSP range 与 `newText`，`textDocument/codeAction`
+据客户端带回的诊断给出首选 quickfix（标题 "Change to 'X'" / "Insert …" /
+"Replace with …"）。钉：`lsp_diag_fixit_quickfix`。
 
 拼写建议取编辑距离最小的候选（相邻换位算一次；名字 ≤4 字符最多差 1 处，
 更长最多 2 处），**最近的候选有两个就不给补丁**——猜错的补丁比没有更糟；

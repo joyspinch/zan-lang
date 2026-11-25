@@ -934,6 +934,13 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
 
 ---
 
+**新增编译器 .c 文件要同时进 zan-lsp 的源文件表**（实证，2026-11-24）：
+`zan-lsp` 内嵌同一套前端（lexer/parser/binder/checker/diag），但在 CMakeLists 里
+是**另一份**源文件表。前端新调用了新文件里的函数，只加进 `zanc` 的表，`zanc` 照常
+通过而 `zan-lsp` 链接失败（Undefined symbols），失败的链接还会删掉旧的
+`build/zan-lsp`。改前端后验证要 `cmake --build build --target zanc zan-lsp`，
+LSP 用例必须用**新编**的 zan-lsp 跑——旧产物照样"通过"，什么也证明不了。
+
 ## 五、内建类型成员表与代码生成的一致性契约
 
 43. **内建成员表签名必须与实际发射的返回类型一致**：

@@ -1,6 +1,7 @@
 """S1（docs/ZAN_STANDARD.md §1）：诊断 fix-it 的端到端契约。
 
-每个夹具用 --diag=json 编译：核对诊断码与补丁文本，然后把全部补丁按 offset
+每个夹具用 --diag=json 编译：核对诊断码、补丁文本与结束位置（end，成员诊断的
+区间覆盖 ".名字"），然后把全部补丁按 offset
 （从后往前，保证前面的 offset 不失效）应用回源码再编译——必须成功，证明补丁
 可以机器直接应用。反例夹具（两个同样近的候选）必须只报错、不给补丁。"""
 import argparse
@@ -49,6 +50,11 @@ def main():
         got = [(d['code'], f['text']) for d in diags for f in d.get('fixits', [])]
         assert got == want, (name, got, [d['message'] for d in diags])
         text = open(src, 'rb').read()
+        for d in diags:   # S1 结束位置：每条诊断都量得出所在 token 的区间
+            assert d['end']['offset'] > d['offset'] and d['end']['line'] == d['line'], d
+        if name == 'fixit_member_typo.zan':
+            d = diags[0]
+            assert text[d['offset']:d['end']['offset']] == b'.Incremnt', d
         fixes = sorted((f for d in diags for f in d.get('fixits', [])),
                        key=lambda f: f['offset'], reverse=True)
         for f in fixes:

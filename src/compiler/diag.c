@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdlib.h>
 
 #include "../common/host_oom.h"
@@ -226,6 +227,9 @@ static zan_diag_entry_t *diag_capture_entry(zan_diag_t *diag, zan_diag_level_t l
     e->loc = loc;
     e->code = 0;
     e->message[0] = '\0';
+    e->has_fix = false;
+    e->fix_len = 0;
+    e->fix_text[0] = '\0';
     return e;
 }
 
@@ -282,6 +286,61 @@ static void diag_json_loc(FILE *f, const zan_diag_t *diag, zan_loc_t loc) {
     fprintf(f, ",\"line\":%u,\"col\":%u,\"offset\":%u", loc.line, loc.col, loc.offset);
 }
 
+/* S1 结束位置：诊断位置总落在某个 token 的首字节上，词法器不记 token 长度，
+ * 这里按源码就地量出该 token 的末尾（不含）：标识符/关键字、数字、字符串与
+ * 字符字面量（含 $"…" @"…"）、两字符运算符、其余单字符。跨行或越界不给。 */
+bool zan_diag_token_end(const zan_diag_t *diag, zan_loc_t loc, zan_loc_t *end) {
+    if (!diag || !diag->file_sources || (int)loc.file_id >= diag->file_count) return false;
+    const char *src = diag->file_sources[loc.file_id];
+    if (!src) return false;
+    size_t n = strlen(src);
+    if (loc.offset >= n) return false;
+    const unsigned char *p = (const unsigned char *)src + loc.offset;
+    size_t rest = n - loc.offset, len = 0;
+    #define DIAG_IDENT(c) (isalnum(c) || (c) == '_' || (c) >= 0x80)
+    if (*p == '\n' || *p == '\r') return false;
+    if (DIAG_IDENT(*p) && !isdigit(*p)) {
+        while (len < rest && DIAG_IDENT(p[len])) len++;
+    } else if (isdigit(*p)) {
+        while (len < rest && (DIAG_IDENT(p[len]) || p[len] == '.')) len++;
+    } else if (*p == '"' || *p == '\'' ||
+               ((*p == '$' || *p == '@') && rest > 1 && p[1] == '"')) {
+        size_t q = (*p == '"' || *p == '\'') ? 0 : 1;
+        unsigned char quote = p[q];
+        len = q + 1;
+        while (len < rest && p[len] != quote && p[len] != '\n') {
+            if (p[len] == '\\' && *p != '@' && len + 1 < rest) len++;
+            len++;
+        }
+        if (len >= rest || p[len] != quote) return false;
+        len++;
+    } else {
+        static const char *const two[] = { "==", "!=", "<=", ">=", "&&", "||", "++",
+            "--", "+=", "-=", "*=", "/=", "%=", "=>", "??", "?.", "::", "<<", ">>",
+            "&=", "|=", "^=", "->", NULL };
+        len = 1;
+        for (int i = 0; two[i]; i++)
+            if (rest >= 2 && p[0] == (unsigned char)two[i][0] && p[1] == (unsigned char)two[i][1]) {
+                len = 2;
+                break;
+            }
+    }
+    /* 成员诊断落在 '.' / '?.' 上：区间延到后面的成员名，编辑器下划线落在名字上 */
+    if ((len == 1 && *p == '.') || (len == 2 && p[0] == '?' && p[1] == '.')) {
+        size_t k = len;
+        while (k < rest && (p[k] == ' ' || p[k] == '\t')) k++;
+        if (k < rest && DIAG_IDENT(p[k]) && !isdigit(p[k])) {
+            while (k < rest && DIAG_IDENT(p[k])) k++;
+            len = k;
+        }
+    }
+    #undef DIAG_IDENT
+    *end = loc;
+    end->offset = loc.offset + (uint32_t)len;
+    end->col = loc.col + (uint32_t)len;
+    return true;
+}
+
 /* prefix 是 vemit 按发射时级别拼好的 "[E0032] "（无编号为空串）；编号字母
  * 跟发射时级别走，severity 跟升级后的最终级别走——与文本格式同口径。 */
 static void diag_json_print(const zan_diag_t *diag, zan_diag_level_t level,
@@ -301,6 +360,10 @@ static void diag_json_print(const zan_diag_t *diag, zan_diag_level_t level,
     diag_json_str(f, message);
     fputc(',', f);
     diag_json_loc(f, diag, loc);
+    zan_loc_t end;
+    if (zan_diag_token_end(diag, loc, &end))
+        fprintf(f, ",\"end\":{\"line\":%u,\"col\":%u,\"offset\":%u}",
+                end.line, end.col, end.offset);
     fputs(",\"fixits\":[", f);
     if (fix && fix->text) {
         fputc('{', f);
@@ -520,6 +583,12 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
         if (e) {
             e->code = code;
             snprintf(e->message, sizeof(e->message), "%s", msgbuf);
+            if (fix && fix->text && strlen(fix->text) < sizeof(e->fix_text)) {
+                e->has_fix = true;
+                e->fix_loc = fix->loc;
+                e->fix_len = fix->len;
+                snprintf(e->fix_text, sizeof(e->fix_text), "%s", fix->text);
+            }
         }
         return;
     }

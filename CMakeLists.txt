@@ -8820,6 +8820,12 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lsp/run_lsp_diag_suppress_test.py
       --exe $<TARGET_FILE:zan-lsp>)
   set_tests_properties(lsp_diag_external_types PROPERTIES TIMEOUT 150)
+  # S1（docs/ZAN_STANDARD.md §1）：编译器 fix-it 经 diagnostic.data 下发、codeAction
+  # 给出 quickfix（标题取 "did you mean" 的建议名，WorkspaceEdit 精确替换）。
+  add_test(NAME lsp_diag_fixit_quickfix
+    COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/lsp/run_lsp_fixit_test.py
+      --exe $<TARGET_FILE:zan-lsp>)
+  set_tests_properties(lsp_diag_fixit_quickfix PROPERTIES TIMEOUT 150)
 endif()
 
 # ---- zanfmt (code formatter, written in Zan) ----
