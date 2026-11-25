@@ -162,6 +162,7 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef count_field = LLVMBuildStructGEP2(
         g->builder, g->list_struct_type, list_ptr, 0, "countf");
     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_field, "count");
+    zan_tbaa_tag_cnt(g, count);
     LLVMValueRef oob =
         emit_index_bounds_check(g, idx, count, expr->loc, "list");
     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
@@ -181,7 +182,8 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
           LLVMAppendBasicBlockInContext(g->ctx, fn, "listidx.load");
       LLVMBasicBlockRef done_bb =
           LLVMAppendBasicBlockInContext(g->ctx, fn, "listidx.done");
-      LLVMBuildCondBr(g->builder, oob, done_bb, load_bb);
+      LLVMValueRef oob_br = LLVMBuildCondBr(g->builder, oob, done_bb, load_bb);
+      zan_set_branch_weights(g, oob_br, 1, 2000);
       LLVMPositionBuilderAtEnd(g->builder, load_bb);
       /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
       LLVMValueRef data = list_data_for(g, list_ptr, et, "data");

@@ -1072,6 +1072,9 @@ LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     add_enum_attr(g, fn, NULL, "noinline");
     add_enum_attr(g, fn, NULL, "cold");
+    unsigned mk = LLVMGetEnumAttributeKindForName("memory", 6);
+    if (mk) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, mk, 0x0Fu));
 
     zan_builder_point_t pt = zan_builder_save(g);
     if (g->emit_debug) LLVMSetCurrentDebugLocation2(g->builder, NULL);
@@ -1121,7 +1124,13 @@ LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, soft);
     LLVMTypeRef fail_ty = LLVMFunctionType(voidt, (LLVMTypeRef[]){i8ptr, i32t, i32t, i8ptr}, 4, 0);
     LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail3");
-    if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+    if (!fail_fn) {
+        fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+        add_enum_attr(g, fail_fn, NULL, "noinline");
+        add_enum_attr(g, fail_fn, NULL, "cold");
+        if (mk) LLVMAddAttributeAtIndex(fail_fn, LLVMAttributeFunctionIndex,
+                                        LLVMCreateEnumAttribute(g->ctx, mk, 0x0Du));
+    }
     zan_call2(g->builder, fail_ty, fail_fn,
               (LLVMValueRef[]){LLVMGetParam(fn, 4), LLVMGetParam(fn, 5), LLVMGetParam(fn, 6),
                                LLVMGetParam(fn, 7)},

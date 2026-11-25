@@ -80,6 +80,116 @@ static bool stmt_contains_label(zan_ast_node_t *st, zan_istr_t name) {
   return false;
 }
 
+/* 收集循环体内被下标访问的 List<T> 局部/形参，供循环 preheader 预做一次
+ * 槽宽守卫，打破循环内 __zan_list_repack 与越界检查的循环依赖。 */
+#define ZAN_LOOP_LIST_GUARD_MAX 4
+static void collect_loop_indexed_lists(zan_ast_node_t *n, local_scope_t *locals,
+                                       local_var_t **out, int *count, int depth) {
+  if (!n || *count >= ZAN_LOOP_LIST_GUARD_MAX || depth > 16)
+    return;
+  switch (n->kind) {
+  case AST_BLOCK:
+    for (int i = 0; i < n->block.stmts.count && *count < ZAN_LOOP_LIST_GUARD_MAX; i++)
+      collect_loop_indexed_lists(n->block.stmts.items[i], locals, out, count, depth + 1);
+    break;
+  case AST_EXPR_STMT:
+    collect_loop_indexed_lists(n->expr_stmt.expr, locals, out, count, depth + 1);
+    break;
+  case AST_VAR_DECL:
+    collect_loop_indexed_lists(n->var_decl.initializer, locals, out, count, depth + 1);
+    break;
+  case AST_IF_STMT:
+    collect_loop_indexed_lists(n->if_stmt.cond, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->if_stmt.then_body, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->if_stmt.else_body, locals, out, count, depth + 1);
+    break;
+  case AST_WHILE_STMT:
+  case AST_DO_WHILE_STMT:
+    collect_loop_indexed_lists(n->while_stmt.cond, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->while_stmt.body, locals, out, count, depth + 1);
+    break;
+  case AST_FOR_STMT:
+    collect_loop_indexed_lists(n->for_stmt.cond, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->for_stmt.step, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->for_stmt.body, locals, out, count, depth + 1);
+    break;
+  case AST_RETURN_STMT:
+    collect_loop_indexed_lists(n->ret.value, locals, out, count, depth + 1);
+    break;
+  case AST_BINARY:
+  case AST_ASSIGNMENT:
+    collect_loop_indexed_lists(n->binary.left, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->binary.right, locals, out, count, depth + 1);
+    break;
+  case AST_UNARY:
+  case AST_POSTFIX_UNARY:
+    collect_loop_indexed_lists(n->unary.operand, locals, out, count, depth + 1);
+    break;
+  case AST_CONDITIONAL:
+    collect_loop_indexed_lists(n->conditional.cond, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->conditional.then_expr, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->conditional.else_expr, locals, out, count, depth + 1);
+    break;
+  case AST_CAST_EXPR:
+    collect_loop_indexed_lists(n->cast.expr, locals, out, count, depth + 1);
+    break;
+  case AST_CALL:
+    collect_loop_indexed_lists(n->call.callee, locals, out, count, depth + 1);
+    for (int i = 0; i < n->call.args.count && *count < ZAN_LOOP_LIST_GUARD_MAX; i++)
+      collect_loop_indexed_lists(n->call.args.items[i], locals, out, count, depth + 1);
+    break;
+  case AST_MEMBER_ACCESS:
+    collect_loop_indexed_lists(n->member.object, locals, out, count, depth + 1);
+    break;
+  case AST_INDEX:
+    if (n->index.object && n->index.object->kind == AST_IDENTIFIER) {
+      local_var_t *lv = local_find(locals, n->index.object->ident.name);
+      if (lv && !lv->byref_slot && !lv->box_cell && lv->alloca &&
+          lv->type && type_named(lv->type, "List", 4)) {
+        bool dup = false;
+        for (int i = 0; i < *count; i++) {
+          if (out[i] == lv) { dup = true; break; }
+        }
+        if (!dup && *count < ZAN_LOOP_LIST_GUARD_MAX)
+          out[(*count)++] = lv;
+      }
+    }
+    collect_loop_indexed_lists(n->index.object, locals, out, count, depth + 1);
+    collect_loop_indexed_lists(n->index.index, locals, out, count, depth + 1);
+    break;
+  default:
+    break;
+  }
+}
+
+static void emit_loop_preheader_list_guards(zan_irgen_t *g, zan_ast_node_t *body,
+                                            local_scope_t *locals) {
+  if (!body || !locals || !g->current_fn)
+    return;
+  local_var_t *lists[ZAN_LOOP_LIST_GUARD_MAX];
+  int nlists = 0;
+  collect_loop_indexed_lists(body, locals, lists, &nlists, 0);
+  if (nlists == 0)
+    return;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  for (int i = 0; i < nlists; i++) {
+    local_var_t *lv = lists[i];
+    LLVMTypeRef st = local_slot_type(g, lv);
+    if (!st || LLVMGetTypeKind(st) != LLVMPointerTypeKind)
+      continue;
+    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, lv->alloca, "lp.lraw");
+    LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, raw, LLVMConstNull(i8ptr), "lp.lnn");
+    LLVMBasicBlockRef guard_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lp.lguard");
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lp.lcont");
+    LLVMValueRef br = LLVMBuildCondBr(g->builder, nn, guard_bb, cont_bb);
+    zan_set_branch_weights(g, br, 2000, 1);
+    LLVMPositionBuilderAtEnd(g->builder, guard_bb);
+    (void)list_data_for(g, raw, container_elem_type(lv->type), "lp.d0");
+    LLVMBuildBr(g->builder, cont_bb);
+    LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+  }
+}
+
 static zan_irgen_pending_scope_t *goto_label_owner(zan_irgen_t *g,
                                                    zan_istr_t name) {
   for (zan_irgen_pending_scope_t *scope = g->pending.scope; scope;

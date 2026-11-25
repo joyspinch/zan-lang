@@ -19,21 +19,25 @@
                     (void)list_data_for(g, list_ptr, add_et, "d0");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
+                    zan_tbaa_tag_cnt(g, count);
                     LLVMValueRef cap_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 1, "capp");
                     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, cap_ptr, "cap");
+                    zan_tbaa_tag_meta(g, cap);
                     LLVMValueRef need_grow = zan_icmp(g->builder, LLVMIntUGE, count, cap, "grow");
                     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "list.grow");
                     LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "list.add");
-                    LLVMBuildCondBr(g->builder, need_grow, grow_bb, add_bb);
+                    LLVMValueRef grow_br = LLVMBuildCondBr(g->builder, need_grow, grow_bb, add_bb);
+                    zan_set_branch_weights(g, grow_br, 1, 2000);
                     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
                     LLVMValueRef cap_zero = zan_icmp(g->builder, LLVMIntEQ, cap,
                         LLVMConstInt(i64, 0, 0), "cap.zero");
                     LLVMValueRef dbl_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "ncap");
                     LLVMValueRef new_cap = LLVMBuildSelect(g->builder, cap_zero,
                         LLVMConstInt(i64, 8, 0), dbl_cap, "new_cap");
-                    LLVMBuildStore(g->builder, new_cap, cap_ptr);
+                    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, new_cap, cap_ptr));
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef old_data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "od");
+                    zan_tbaa_tag_meta(g, old_data);
                     LLVMValueRef old_data_raw = LLVMBuildBitCast(g->builder, old_data, i8ptr, "odr");
                     LLVMValueRef new_size = zan_mul(g->builder, new_cap,
                         LLVMConstInt(i64, (unsigned long long)list_elem_bytes(g, add_et), 0), "nsz");
@@ -43,18 +47,19 @@
                         g->fn_realloc, realloc_args, 2, "nd");
                     zan_irgen_emit_oom_check(g, g->current_fn, new_data_raw);
                     LLVMValueRef new_data = LLVMBuildBitCast(g->builder, new_data_raw, LLVMPointerType(i64, 0), "ndt");
-                    LLVMBuildStore(g->builder, new_data, data_field);
+                    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, new_data, data_field));
                     LLVMBuildBr(g->builder, add_bb);
                     LLVMPositionBuilderAtEnd(g->builder, add_bb);
                     LLVMValueRef val = emit_expr(g, expr->call.args.items[0], locals);
                     /* 实参求值之后再取数据指针并过宽度守卫：实参可能改动该表 */
                     LLVMValueRef data = list_data_for(g, list_ptr, add_et, "d");
                     LLVMValueRef count2 = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt2");
+                    zan_tbaa_tag_cnt(g, count2);
                     LLVMValueRef elem_ptr = list_elem_ptr(g, data, count2, add_et, "ep");
                     emit_collection_slot_store(g, add_et, list_slot_type(g, add_et), elem_ptr,
                         val, expr->call.args.items[0], locals, 0);
                     LLVMValueRef new_count = zan_add(g->builder, count2, LLVMConstInt(i64, 1, 0), "nc");
-                    LLVMBuildStore(g->builder, new_count, count_ptr);
+                    zan_tbaa_tag_cnt(g, LLVMBuildStore(g->builder, new_count, count_ptr));
                     emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }

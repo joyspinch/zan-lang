@@ -18,6 +18,75 @@
 #endif
 #define ZAN_ESZ_SIGNED 0x10
 
+static void zan_tbaa_init(zan_irgen_t *g) {
+    if (g->tbaa_tag_cnt) return;
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMMetadataRef zero = LLVMValueAsMetadata(LLVMConstInt(i64, 0, 0));
+    LLVMMetadataRef root_s = LLVMMDStringInContext2(c, "Zan TBAA", 8);
+    LLVMMetadataRef root = LLVMMDNodeInContext2(c, &root_s, 1);
+
+    LLVMMetadataRef cnt_f[3] = {
+        LLVMMDStringInContext2(c, "Zan Container Count", 19), root, zero
+    };
+    LLVMMetadataRef cnt_ty = LLVMMDNodeInContext2(c, cnt_f, 3);
+    LLVMMetadataRef cnt_tag[3] = { cnt_ty, cnt_ty, zero };
+
+    LLVMMetadataRef meta_f[3] = {
+        LLVMMDStringInContext2(c, "Zan Container Meta", 18), root, zero
+    };
+    LLVMMetadataRef meta_ty = LLVMMDNodeInContext2(c, meta_f, 3);
+    LLVMMetadataRef meta_tag[3] = { meta_ty, meta_ty, zero };
+
+    LLVMMetadataRef elem_f[3] = {
+        LLVMMDStringInContext2(c, "Zan Container Elem", 18), root, zero
+    };
+    LLVMMetadataRef elem_ty = LLVMMDNodeInContext2(c, elem_f, 3);
+    LLVMMetadataRef elem_tag[3] = { elem_ty, elem_ty, zero };
+
+    g->tbaa_md_kind = LLVMGetMDKindIDInContext(c, "tbaa", 4);
+    g->tbaa_tag_cnt = LLVMMetadataAsValue(c, LLVMMDNodeInContext2(c, cnt_tag, 3));
+    g->tbaa_tag_meta = LLVMMetadataAsValue(c, LLVMMDNodeInContext2(c, meta_tag, 3));
+    g->tbaa_tag_elem = LLVMMetadataAsValue(c, LLVMMDNodeInContext2(c, elem_tag, 3));
+}
+void zan_tbaa_tag_cnt(zan_irgen_t *g, LLVMValueRef inst) {
+    if (!inst) return;
+    zan_tbaa_init(g);
+    LLVMSetMetadata(inst, g->tbaa_md_kind, g->tbaa_tag_cnt);
+    if (LLVMIsALoadInst(inst) &&
+        LLVMTypeOf(inst) == LLVMInt64TypeInContext(g->ctx)) {
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMValueRef r_elems[2] = {
+            LLVMConstInt(i64, 0, 0),
+            LLVMConstInt(i64, 2147483648ULL, 0),
+        };
+        unsigned rk = LLVMGetMDKindIDInContext(g->ctx, "range", 5);
+        LLVMSetMetadata(inst, rk, LLVMMDNodeInContext(g->ctx, r_elems, 2));
+    }
+}
+void zan_tbaa_tag_meta(zan_irgen_t *g, LLVMValueRef inst) {
+    if (!inst) return;
+    zan_tbaa_init(g);
+    LLVMSetMetadata(inst, g->tbaa_md_kind, g->tbaa_tag_meta);
+}
+void zan_tbaa_tag_elem(zan_irgen_t *g, LLVMValueRef inst) {
+    if (!inst) return;
+    zan_tbaa_init(g);
+    LLVMSetMetadata(inst, g->tbaa_md_kind, g->tbaa_tag_elem);
+}
+void zan_set_branch_weights(zan_irgen_t *g, LLVMValueRef br,
+                            uint32_t true_w, uint32_t false_w) {
+    if (!br) return;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef md_elems[3] = {
+        LLVMMDStringInContext(g->ctx, "branch_weights", 14),
+        LLVMConstInt(i32t, true_w, 0),
+        LLVMConstInt(i32t, false_w, 0),
+    };
+    unsigned prof_kind = LLVMGetMDKindIDInContext(g->ctx, "prof", 4);
+    LLVMSetMetadata(br, prof_kind, LLVMMDNodeInContext(g->ctx, md_elems, 3));
+}
+
 int list_elem_tag(zan_irgen_t *g, zan_type_t *et) {
     (void)g;
 #if ZAN_LIST_NARROW
@@ -85,9 +154,13 @@ static LLVMValueRef list_repack_fn(zan_irgen_t *g) {
     LLVMValueRef datap = LLVMBuildStructGEP2(b, lt, lp, 2, "datap");
     LLVMValueRef eszp = LLVMBuildStructGEP2(b, lt, lp, 3, "eszp");
     LLVMValueRef cur = LLVMBuildLoad2(b, i64, eszp, "cur");
+    zan_tbaa_tag_meta(g, cur);
     LLVMValueRef n = LLVMBuildLoad2(b, i64, cntp, "n");
+    zan_tbaa_tag_cnt(g, n);
     LLVMValueRef cap = LLVMBuildLoad2(b, i64, capp, "cap");
+    zan_tbaa_tag_meta(g, cap);
     LLVMValueRef data = LLVMBuildLoad2(b, ptr, datap, "data");
+    zan_tbaa_tag_meta(g, data);
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, data, "nodata"), settag, work);
     /* 宽度：tag==0 → 8，否则 tag & 0xF */
     LLVMPositionBuilderAtEnd(b, work);
@@ -177,11 +250,11 @@ static LLVMValueRef list_repack_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, done);
     LLVMBuildCall2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &ptr, 1, 0),
         g->fn_free, &data, 1, "");
-    LLVMBuildStore(b, nd, datap);
-    LLVMBuildStore(b, ncap, capp);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, nd, datap));
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, ncap, capp));
     LLVMBuildBr(b, settag);
     LLVMPositionBuilderAtEnd(b, settag);
-    LLVMBuildStore(b, want, eszp);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, want, eszp));
     LLVMBuildRetVoid(b);
     LLVMDisposeBuilder(b);
     return fn;
@@ -195,41 +268,41 @@ LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr,
     LLVMValueRef lp = LLVMBuildBitCast(g->builder, list_ptr,
         LLVMPointerType(g->list_struct_type, 0), "lw.lp");
     LLVMValueRef want = LLVMConstInt(i64, (unsigned long long)list_elem_tag(g, et), 0);
-    LLVMValueRef esz = LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 3, "lw.eszp"), "lw.esz");
+    LLVMValueRef eszp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 3, "lw.eszp");
+    LLVMValueRef esz = LLVMBuildLoad2(g->builder, i64, eszp, "lw.esz");
+    zan_tbaa_tag_meta(g, esz);
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     LLVMBasicBlockRef fix = LLVMAppendBasicBlockInContext(g->ctx, fn, "lw.fix");
     LLVMBasicBlockRef ok = LLVMAppendBasicBlockInContext(g->ctx, fn, "lw.ok");
     LLVMValueRef same = LLVMBuildICmp(g->builder, LLVMIntEQ, esz, want, "lw.same");
     LLVMValueRef br = LLVMBuildCondBr(g->builder, same, ok, fix);
-    {
-        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        LLVMValueRef md_elems[3] = {
-            LLVMMDStringInContext(g->ctx, "branch_weights", 14),
-            LLVMConstInt(i32t, 2000, 0),
-            LLVMConstInt(i32t, 1, 0),
-        };
-        unsigned prof_kind = LLVMGetMDKindIDInContext(g->ctx, "prof", 4);
-        LLVMSetMetadata(br, prof_kind, LLVMMDNodeInContext(g->ctx, md_elems, 3));
-    }
+    zan_set_branch_weights(g, br, 2000, 1);
     LLVMPositionBuilderAtEnd(g->builder, fix);
+    LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 0, "lw.cntp");
+    LLVMValueRef saved_cnt = LLVMBuildLoad2(g->builder, i64, cntp, "lw.cnt");
+    zan_tbaa_tag_cnt(g, saved_cnt);
     LLVMValueRef rfn = list_repack_fn(g);
     LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(rfn), rfn,
         (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, lp, ptr, "lw.lp8"), want }, 2, "");
+    /* 显式向调用方暴露 repack 后置条件：esz == want 且 count 不变，便于外提守卫与消越界 */
+    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, want, eszp));
+    zan_tbaa_tag_cnt(g, LLVMBuildStore(g->builder, saved_cnt, cntp));
     LLVMBuildBr(g->builder, ok);
     LLVMPositionBuilderAtEnd(g->builder, ok);
-    return LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
         LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "lw.df"),
         nm ? nm : "data");
+    zan_tbaa_tag_meta(g, data);
+    return data;
 }
 /* 新建 List 的表头宽度标签（各建表点在写 count/cap/data 时一并调用）。 */
 void list_header_init_esz(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef lp = LLVMBuildBitCast(g->builder, list_ptr,
         LLVMPointerType(g->list_struct_type, 0), "lh.lp");
-    LLVMBuildStore(g->builder,
+    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder,
         LLVMConstInt(i64, (unsigned long long)list_elem_tag(g, et), 0),
-        LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 3, "lh.eszp"));
+        LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 3, "lh.eszp")));
 }
 /* 元素地址：窄槽按字节步长，宽槽沿用槽字索引。 */
 LLVMValueRef list_elem_ptr(zan_irgen_t *g, LLVMValueRef data, LLVMValueRef idx,
@@ -248,8 +321,13 @@ LLVMValueRef list_slot_load_word(zan_irgen_t *g, LLVMValueRef ep, zan_type_t *et
                                  const char *nm) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int tag = list_elem_tag(g, et);
-    if (!tag) return LLVMBuildLoad2(g->builder, i64, ep, nm ? nm : "elem");
+    if (!tag) {
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, i64, ep, nm ? nm : "elem");
+        zan_tbaa_tag_elem(g, v);
+        return v;
+    }
     LLVMValueRef v = LLVMBuildLoad2(g->builder, list_slot_type(g, et), ep, "elem.n");
+    zan_tbaa_tag_elem(g, v);
     return (tag & ZAN_ESZ_SIGNED) ? LLVMBuildSExt(g->builder, v, i64, nm ? nm : "elem")
                                   : LLVMBuildZExt(g->builder, v, i64, nm ? nm : "elem");
 }
@@ -273,5 +351,5 @@ void list_slot_store_word(zan_irgen_t *g, LLVMValueRef word, LLVMValueRef ep,
                           zan_type_t *et) {
     int tag = list_elem_tag(g, et);
     if (tag) word = LLVMBuildTrunc(g->builder, word, list_slot_type(g, et), "slot.n");
-    LLVMBuildStore(g->builder, word, ep);
+    zan_tbaa_tag_elem(g, LLVMBuildStore(g->builder, word, ep));
 }

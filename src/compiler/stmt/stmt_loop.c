@@ -211,6 +211,10 @@
                 LLVMValueRef cnt_ptr0 = LLVMBuildStructGEP2(g->builder,
                     g->list_struct_type, col0, 0, "cnt_ptr");
                 c0 = LLVMBuildLoad2(g->builder, i64, cnt_ptr0, "cnt0");
+                zan_tbaa_tag_cnt(g, c0);
+                if (col_type && type_named(col_type, "List", 4)) {
+                    (void)list_data_for(g, col0, container_elem_type(col_type), "fe.d0");
+                }
             }
             zan_store_fit(g, c0, fe_snap_alloc);
         }
@@ -319,6 +323,7 @@
             LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                 col_cond, 0, "cnt_ptr");
             LLVMValueRef live = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+            zan_tbaa_tag_cnt(g, live);
             LLVMValueRef snap = LLVMBuildLoad2(g->builder, i64, fe_snap_alloc,
                                                "fe.snap");
             LLVMValueRef mutated = zan_icmp(g->builder, LLVMIntNE, live, snap,
@@ -327,7 +332,8 @@
                                                                      "fe.mut");
             LLVMBasicBlockRef iter_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
                                                                       "fe.iter");
-            LLVMBuildCondBr(g->builder, mutated, mut_bb, iter_bb);
+            LLVMValueRef mut_br = LLVMBuildCondBr(g->builder, mutated, mut_bb, iter_bb);
+            zan_set_branch_weights(g, mut_br, 1, 2000);
             LLVMPositionBuilderAtEnd(g->builder, mut_bb);
             emit_runtime_check(g,
                 LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0), stmt->loc,

@@ -686,6 +686,12 @@ LLVMValueRef get_char_case_fn(zan_irgen_t *g);
 LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym);
 LLVMValueRef get_dict_remove_fn(zan_irgen_t *g);
 LLVMValueRef get_dict_set_fn(zan_irgen_t *g);
+LLVMValueRef get_dict_append_fn(zan_irgen_t *g);
+void zan_tbaa_tag_cnt(zan_irgen_t *g, LLVMValueRef inst);
+void zan_tbaa_tag_meta(zan_irgen_t *g, LLVMValueRef inst);
+void zan_tbaa_tag_elem(zan_irgen_t *g, LLVMValueRef inst);
+void zan_set_branch_weights(zan_irgen_t *g, LLVMValueRef br,
+                            uint32_t true_w, uint32_t false_w);
 LLVMValueRef get_eh_exc_owned_global(zan_irgen_t *g);
 LLVMValueRef get_eh_exc_tid_global(zan_irgen_t *g);
 void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top, LLVMValueRef *bufs,

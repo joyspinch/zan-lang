@@ -18,6 +18,11 @@ LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
         unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
         if (nw) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
                                         LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) {
+            LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+            LLVMAddAttributeAtIndex(fn, 2, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+        }
     }
     LLVMTypeRef memcmp_ty = LLVMFunctionType(i32t,
         (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
@@ -25,7 +30,9 @@ LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMValueRef saved_fn = g->current_fn;
+    int saved_split = g->rt_guard_split;
     g->current_fn = fn;
+    g->rt_guard_split = 0;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef ret0 = LLVMAppendBasicBlockInContext(g->ctx, fn, "same");
     LLVMBasicBlockRef nullbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "null");
@@ -45,8 +52,9 @@ LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
         LLVMConstNull(i8ptr), "an");
     LLVMValueRef bn = zan_icmp(g->builder, LLVMIntEQ, b2,
         LLVMConstNull(i8ptr), "bn");
-    LLVMBuildCondBr(g->builder, zan_or(g->builder, an, bn, "en"),
+    LLVMValueRef null_br = LLVMBuildCondBr(g->builder, zan_or(g->builder, an, bn, "en"),
         retneg, body);
+    zan_set_branch_weights(g, null_br, 1, 2000);
     LLVMPositionBuilderAtEnd(g->builder, retneg);
     LLVMBuildRet(g->builder, LLVMConstInt(i32t, (uint64_t)-1, 1));
     LLVMPositionBuilderAtEnd(g->builder, body);
@@ -66,17 +74,90 @@ LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
         zan_icmp(g->builder, LLVMIntEQ, la, lb, "leq"), mr, inner, "ocmp");
     LLVMBuildRet(g->builder, r);
 
+    g->rt_guard_split = saved_split;
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     return fn;
 }
-LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
-    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_eq");
+static LLVMValueRef get_str_eq_slow_fn(zan_irgen_t *g, zan_loc_t loc) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_eq_slow");
     if (fn) return fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(i1t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_str_eq_slow", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    {
+        static const char *const attrs[] = { "noinline", "cold", "nounwind" };
+        for (size_t i = 0; i < 3; i++) {
+            unsigned k = LLVMGetEnumAttributeKindForName(attrs[i], strlen(attrs[i]));
+            if (k) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                           LLVMCreateEnumAttribute(g->ctx, k, 0));
+        }
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) {
+            LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+            LLVMAddAttributeAtIndex(fn, 2, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+        }
+    }
+    LLVMTypeRef memcmp_ty = LLVMFunctionType(i32t,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+    LLVMValueRef memcmp_fn = get_libc_fn(g, "memcmp", memcmp_ty);
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    int saved_split = g->rt_guard_split;
+    g->current_fn = fn;
+    g->rt_guard_split = 0;
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef ret0 = LLVMAppendBasicBlockInContext(g->ctx, fn, "neq");
+    LLVMBasicBlockRef ret1 = LLVMAppendBasicBlockInContext(g->ctx, fn, "eq0");
+    LLVMBasicBlockRef zerobb = LLVMAppendBasicBlockInContext(g->ctx, fn, "zchk");
+    LLVMBasicBlockRef cmpbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cmp");
+    LLVMValueRef a = LLVMGetParam(fn, 0);
+    LLVMValueRef b2 = LLVMGetParam(fn, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef la = emit_string_len_ex(g, a, 1, loc);
+    LLVMValueRef lb = emit_string_len_ex(g, b2, 1, loc);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, la, lb, "leq"),
+        zerobb, ret0);
+
+    LLVMPositionBuilderAtEnd(g->builder, ret0);
+    LLVMBuildRet(g->builder, LLVMConstInt(i1t, 0, 0));
+
+    LLVMPositionBuilderAtEnd(g->builder, ret1);
+    LLVMBuildRet(g->builder, LLVMConstInt(i1t, 1, 0));
+
+    LLVMPositionBuilderAtEnd(g->builder, zerobb);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, la, LLVMConstInt(i64, 0, 0), "lz"),
+        ret1, cmpbb);
+
+    LLVMPositionBuilderAtEnd(g->builder, cmpbb);
+    LLVMValueRef mr = zan_call2(g->builder, memcmp_ty, memcmp_fn,
+        (LLVMValueRef[]){ a, b2, la }, 3, "eq.memcmp");
+    LLVMBuildRet(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, mr, LLVMConstInt(i32t, 0, 0), "eq"));
+
+    g->rt_guard_split = saved_split;
+    g->current_fn = saved_fn;
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    return fn;
+}
+
+LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_eq");
+    if (fn) return fn;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
     LLVMTypeRef fnty = LLVMFunctionType(i1t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
     fn = LLVMAddFunction(g->mod, "__zan_str_eq", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -84,10 +165,19 @@ LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
         unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
         if (nw) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
                                         LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+        if (ih) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                        LLVMCreateEnumAttribute(g->ctx, ih, 0));
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) {
+            LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+            LLVMAddAttributeAtIndex(fn, 2, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+        }
     }
     LLVMTypeRef memcmp_ty = LLVMFunctionType(i32t,
         (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
     LLVMValueRef memcmp_fn = get_libc_fn(g, "memcmp", memcmp_ty);
+    LLVMValueRef slow_fn = get_str_eq_slow_fn(g, loc);
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMValueRef saved_fn = g->current_fn;
@@ -96,9 +186,10 @@ LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
     LLVMBasicBlockRef ret1 = LLVMAppendBasicBlockInContext(g->ctx, fn, "same");
     LLVMBasicBlockRef nullbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "null");
     LLVMBasicBlockRef ret0 = LLVMAppendBasicBlockInContext(g->ctx, fn, "neq");
-    LLVMBasicBlockRef lenbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "len");
-    LLVMBasicBlockRef zerobb = LLVMAppendBasicBlockInContext(g->ctx, fn, "zchk");
+    LLVMBasicBlockRef fastbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fast");
+    LLVMBasicBlockRef eqlenbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eqlen");
     LLVMBasicBlockRef cmpbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cmp");
+    LLVMBasicBlockRef slowbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
     LLVMValueRef a = LLVMGetParam(fn, 0);
     LLVMValueRef b2 = LLVMGetParam(fn, 1);
 
@@ -115,29 +206,64 @@ LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
         LLVMConstNull(i8ptr), "an");
     LLVMValueRef bn = zan_icmp(g->builder, LLVMIntEQ, b2,
         LLVMConstNull(i8ptr), "bn");
-    LLVMBuildCondBr(g->builder, zan_or(g->builder, an, bn, "en"),
-        ret0, lenbb);
+    LLVMValueRef any_null = zan_or(g->builder, an, bn, "en");
+    LLVMBasicBlockRef hdrchk = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdrchk");
+    zan_set_branch_weights(g,
+        LLVMBuildCondBr(g->builder, any_null, ret0, hdrchk), 1, 2000);
+
+    LLVMPositionBuilderAtEnd(g->builder, hdrchk);
+    LLVMValueRef ok_a = zan_hdr_read_ok(g, a);
+    LLVMValueRef ok_b = zan_hdr_read_ok(g, b2);
+    if (ok_a && ok_b) {
+        zan_set_branch_weights(g,
+            LLVMBuildCondBr(g->builder, zan_and(g->builder, ok_a, ok_b, "hdr.ok"),
+                fastbb, slowbb), 2000, 1);
+    } else {
+        LLVMBuildBr(g->builder, fastbb);
+    }
 
     LLVMPositionBuilderAtEnd(g->builder, ret0);
     LLVMBuildRet(g->builder, LLVMConstInt(i1t, 0, 0));
 
-    LLVMPositionBuilderAtEnd(g->builder, lenbb);
-    LLVMValueRef la = emit_string_len_ex(g, a, 1, loc);
-    LLVMValueRef lb = emit_string_len_ex(g, b2, 1, loc);
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, la, lb, "leq"),
-        zerobb, ret0);
+    /* 热路径：双 ZANS 缓存头（约 12 条指令，-O2 与 --publish 均可稳定内联） */
+    LLVMPositionBuilderAtEnd(g->builder, fastbb);
+    LLVMValueRef off8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef ha = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder,
+            LLVMBuildGEP2(g->builder, i8, a, &off8, 1, "ha.p"), i64p, "ha.ip"),
+        "ha");
+    LLVMValueRef hb = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder,
+            LLVMBuildGEP2(g->builder, i8, b2, &off8, 1, "hb.p"), i64p, "hb.ip"),
+        "hb");
+    LLVMValueRef la = LLVMBuildAnd(g->builder, ha,
+        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "la");
+    LLVMValueRef lb = LLVMBuildAnd(g->builder, hb,
+        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "lb");
+    LLVMValueRef unk = LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0);
+    LLVMValueRef va = zan_and(g->builder, zan_hdr_is_string(g, ha, "sa"),
+        zan_icmp(g->builder, LLVMIntNE, la, unk, "ma"), "va");
+    LLVMValueRef vb = zan_and(g->builder, zan_hdr_is_string(g, hb, "sb"),
+        zan_icmp(g->builder, LLVMIntNE, lb, unk, "mb"), "vb");
+    LLVMBuildCondBr(g->builder, zan_and(g->builder, va, vb, "vab"), eqlenbb, slowbb);
 
-    LLVMPositionBuilderAtEnd(g->builder, zerobb);
+    /* 双 ZANS 头合法时：ha == hb 等价于长度相等 */
+    LLVMPositionBuilderAtEnd(g->builder, eqlenbb);
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, la, LLVMConstInt(i64, 0, 0), "lz"),
-        ret1, cmpbb);
+        zan_icmp(g->builder, LLVMIntEQ, ha, hb, "heq"),
+        cmpbb, ret0);
 
     LLVMPositionBuilderAtEnd(g->builder, cmpbb);
     LLVMValueRef mr = zan_call2(g->builder, memcmp_ty, memcmp_fn,
         (LLVMValueRef[]){ a, b2, la }, 3, "eq.memcmp");
     LLVMBuildRet(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, mr, LLVMConstInt(i32t, 0, 0), "eq"));
+
+    LLVMPositionBuilderAtEnd(g->builder, slowbb);
+    LLVMValueRef sr = zan_call2(g->builder, fnty, slow_fn,
+        (LLVMValueRef[]){ a, b2 }, 2, "eq.slow");
+    LLVMSetTailCall(sr, 1);
+    LLVMBuildRet(g->builder, sr);
 
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);

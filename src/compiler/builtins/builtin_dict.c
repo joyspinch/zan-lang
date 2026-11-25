@@ -945,6 +945,74 @@ LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }
+/* 字典尾部追加新键（调用方已确认键不存在，避免 __zan_dict_set 二次哈希查找）。 */
+LLVMValueRef get_dict_append_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_append");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+    LLVMTypeRef fnty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_dict_append", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    dict_add_fn_attr(g, fn, "nounwind");
+    LLVMTypeRef realloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "grow");
+    LLVMBasicBlockRef put_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "put");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef draw = LLVMGetParam(fn, 0);
+    LLVMValueRef key = LLVMGetParam(fn, 1);
+    LLVMValueRef dp = LLVMBuildBitCast(g->builder, draw,
+        LLVMPointerType(g->dict_struct_type, 0), "dp");
+    LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
+    LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
+    zan_tbaa_tag_cnt(g, cnt);
+    LLVMValueRef capp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 1, "capp");
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capp, "cap");
+    zan_tbaa_tag_meta(g, cap);
+    LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
+    LLVMValueRef full = zan_icmp(g->builder, LLVMIntSGE, cnt, cap, "full");
+    LLVMValueRef full_br = LLVMBuildCondBr(g->builder, full, grow_bb, put_bb);
+    dict_set_branch_weights(g, full_br, 1, 2000);
+    LLVMPositionBuilderAtEnd(g->builder, grow_bb);
+    LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
+    LLVMValueRef vwp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 7, "vwp");
+    LLVMValueRef ks = LLVMBuildLoad2(g->builder, i8pp, kp, "ks");
+    LLVMValueRef vs = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs");
+    LLVMValueRef value_words = LLVMBuildLoad2(g->builder, i64, vwp, "vw");
+    LLVMValueRef cap0 = zan_icmp(g->builder, LLVMIntEQ, cap,
+        LLVMConstInt(i64, 0, 0), "cap0");
+    LLVMValueRef ncap = LLVMBuildSelect(g->builder, cap0,
+        LLVMConstInt(i64, 16, 0),
+        zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "cap2"), "ncap");
+    LLVMValueRef key_bytes = zan_mul(g->builder, ncap, LLVMConstInt(i64, 8, 0), "kbytes");
+    LLVMValueRef value_bytes = zan_mul(g->builder, key_bytes, value_words, "vbytes");
+    LLVMValueRef ks8 = LLVMBuildBitCast(g->builder, ks, i8ptr, "ks8");
+    LLVMValueRef nks8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
+        (LLVMValueRef[]){ ks8, key_bytes }, 2, "nks8");
+    zan_irgen_emit_oom_check(g, fn, nks8);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nks8, i8pp, "nks"), kp));
+    LLVMValueRef vs8 = LLVMBuildBitCast(g->builder, vs, i8ptr, "vs8");
+    LLVMValueRef nvs8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
+        (LLVMValueRef[]){ vs8, value_bytes }, 2, "nvs8");
+    zan_irgen_emit_oom_check(g, fn, nvs8);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nvs8, i64ptr, "nvs"), vp));
+    zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, ncap, capp));
+    LLVMBuildBr(g->builder, put_bb);
+    LLVMPositionBuilderAtEnd(g->builder, put_bb);
+    LLVMValueRef ks2 = LLVMBuildLoad2(g->builder, i8pp, kp, "ks2");
+    zan_tbaa_tag_meta(g, ks2);
+    LLVMValueRef kslot2 = LLVMBuildInBoundsGEP2(g->builder, i8ptr, ks2, &cnt, 1, "ksl2");
+    LLVMBuildStore(g->builder, key, kslot2);
+    zan_tbaa_tag_cnt(g, LLVMBuildStore(g->builder,
+        zan_add(g->builder, cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp));
+    LLVMBuildRet(g->builder, cnt);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
 
 /* 异常展开栈与处理器栈存储：每线程独立状态块 */
 

@@ -570,6 +570,11 @@ struct zan_irgen {
   LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
   LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64*
                                    values } */
+  /* 容器 TBAA 元数据缓存（计数 / 头元数据 / 元素槽 三路互斥） */
+  unsigned tbaa_md_kind;
+  LLVMValueRef tbaa_tag_cnt;
+  LLVMValueRef tbaa_tag_meta;
+  LLVMValueRef tbaa_tag_elem;
   LLVMTypeRef
       sb_struct_type; /* StringBuilder { i64 count, i64 capacity, i8* data } */
   LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64

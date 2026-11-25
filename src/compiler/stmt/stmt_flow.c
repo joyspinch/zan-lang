@@ -285,6 +285,7 @@ case AST_WHILE_STMT: {
   int saved_loop_ehbase = g->eh_armed_loop_base;
   g->eh_armed_loop_base = g->eh_armed_count;
 
+  emit_loop_preheader_list_guards(g, stmt->while_stmt.body, locals);
   LLVMBuildBr(g->builder, cond_bb);
   LLVMPositionBuilderAtEnd(g->builder, cond_bb);
   LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
@@ -362,6 +363,7 @@ case AST_FOR_STMT: {
   int saved_loop_ehbase = g->eh_armed_loop_base;
   g->eh_armed_loop_base = g->eh_armed_count;
 
+  emit_loop_preheader_list_guards(g, stmt->for_stmt.body, locals);
   LLVMBuildBr(g->builder, cond_bb);
   LLVMPositionBuilderAtEnd(g->builder, cond_bb);
   if (stmt->for_stmt.cond) {

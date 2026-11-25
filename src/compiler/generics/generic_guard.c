@@ -966,14 +966,16 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
   /* 非空但头字不可读（外来指针贴页首）：不探测、不盖戳，直接 strlen */
   LLVMBasicBlockRef chk_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.hdrchk");
-  LLVMBuildCondBr(g->builder, probe_ok, chk_bb, raw_bb);
+  LLVMValueRef nn_br = LLVMBuildCondBr(g->builder, probe_ok, chk_bb, raw_bb);
+  zan_set_branch_weights(g, nn_br, 2000, 1);
   LLVMPositionBuilderAtEnd(g->builder, chk_bb);
   LLVMBasicBlockRef foreign_bb = NULL;
   LLVMValueRef foreign_len = NULL;
   LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
   if (read_ok) {
     foreign_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.foreign");
-    LLVMBuildCondBr(g->builder, read_ok, probe_bb, foreign_bb);
+    LLVMValueRef rok_br = LLVMBuildCondBr(g->builder, read_ok, probe_bb, foreign_bb);
+    zan_set_branch_weights(g, rok_br, 2000, 1);
     LLVMPositionBuilderAtEnd(g->builder, foreign_bb);
     foreign_len = zan_call2(g->builder, strlen_ty, g->fn_strlen, &payload, 1,
                             "strbuf.foreignlen");
@@ -994,7 +996,8 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
       zan_icmp(g->builder, LLVMIntNE, cached,
                LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.measured");
   LLVMValueRef known = zan_and(g->builder, is_str, measured, "strbuf.known");
-  LLVMBuildCondBr(g->builder, known, done_bb, arr_bb ? arr_bb : slow_bb);
+  LLVMValueRef kn_br = LLVMBuildCondBr(g->builder, known, done_bb, arr_bb ? arr_bb : slow_bb);
+  zan_set_branch_weights(g, kn_br, 2000, 1);
 
   LLVMValueRef count = NULL;
   LLVMValueRef phi_raw = NULL;

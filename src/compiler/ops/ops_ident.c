@@ -128,6 +128,7 @@ LLVMValueRef load_collection_slot_value(zan_irgen_t *g,
     if (kind == LLVMStructTypeKind)
         return load_struct_from_slot(g, slot_ptr, elem_llvm);
     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, slot_ptr, "slot.raw");
+    zan_tbaa_tag_elem(g, raw);
     if (kind == LLVMPointerTypeKind)
         return LLVMBuildIntToPtr(g->builder, raw, elem_llvm, "slot.ptr");
     if (kind == LLVMDoubleTypeKind)
@@ -154,36 +155,42 @@ void emit_dict_value_set(zan_irgen_t *g, zan_type_t *dict_type,
     LLVMValueRef existing = emit_dict_find(g, dict_type, raw, key);
     LLVMValueRef was_hit = zan_icmp(g->builder, LLVMIntSGE, existing,
         LLVMConstInt(i64, 0, 0), "dset.hit");
-    LLVMValueRef is_str = LLVMConstInt(i64,
-        (key_type && key_type->kind == TYPE_STRING) ? 1 : 0, 0);
-    LLVMValueRef set_fn = get_dict_set_fn(g);
-    LLVMValueRef index = zan_call2(g->builder, LLVMGlobalGetValueType(set_fn),
-        set_fn, (LLVMValueRef[]){ raw, key, is_str }, 3, "dset.ix");
     LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
         LLVMPointerType(g->dict_struct_type, 0), "dset.dp");
     LLVMValueRef values_ptr = LLVMBuildStructGEP2(g->builder,
         g->dict_struct_type, dp, 3, "dset.vp");
-    LLVMValueRef values = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
-        values_ptr, "dset.vals");
-    LLVMValueRef word = zan_mul(g->builder, index, value_words,
-        "dset.word");
-    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, values, &word, 1,
-        "dset.slot");
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dset.old");
     LLVMBasicBlockRef append_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dset.new");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dset.done");
     LLVMBuildCondBr(g->builder, was_hit, hit_bb, append_bb);
     LLVMPositionBuilderAtEnd(g->builder, hit_bb);
+    LLVMValueRef hit_values = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+        values_ptr, "dset.vals");
+    zan_tbaa_tag_meta(g, hit_values);
+    LLVMValueRef hit_word = zan_mul(g->builder, existing, value_words,
+        "dset.word");
+    LLVMValueRef hit_slot = LLVMBuildInBoundsGEP2(g->builder, i64, hit_values,
+        &hit_word, 1, "dset.slot");
     emit_release_owned_call_temp(g, key_expr, key, locals);
-    emit_collection_slot_store(g, value_type, i64, slot, value,
+    emit_collection_slot_store(g, value_type, i64, hit_slot, value,
         value_expr, locals, 1);
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, append_bb);
+    LLVMValueRef app_fn = get_dict_append_fn(g);
+    LLVMValueRef new_idx = zan_call2(g->builder, LLVMGlobalGetValueType(app_fn),
+        app_fn, (LLVMValueRef[]){ raw, key }, 2, "dset.ix");
+    LLVMValueRef app_values = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+        values_ptr, "dset.vals.new");
+    zan_tbaa_tag_meta(g, app_values);
+    LLVMValueRef app_word = zan_mul(g->builder, new_idx, value_words,
+        "dset.word.new");
+    LLVMValueRef app_slot = LLVMBuildInBoundsGEP2(g->builder, i64, app_values,
+        &app_word, 1, "dset.slot.new");
     if (key_type && is_rc_managed_type(key_type) &&
         !expr_yields_owned_rc_value(g, key_expr, locals))
         emit_rc_retain_for_type(g, key_type, key);
-    emit_collection_slot_store(g, value_type, i64, slot, value,
+    emit_collection_slot_store(g, value_type, i64, app_slot, value,
         value_expr, locals, 0);
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);

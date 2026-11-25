@@ -345,6 +345,7 @@ binding_lowered:
                         g->list_struct_type, list_ptr, 0, "countf");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder,
                         LLVMInt64TypeInContext(g->ctx), count_field, "count");
+                    zan_tbaa_tag_cnt(g, count);
                     LLVMValueRef ls_oob = emit_index_bounds_check(g, idx, count, expr->loc, "list");
                     LLVMBasicBlockRef ls_do = NULL, ls_end = NULL;
                     emit_oob_store_split(g, ls_oob, &ls_do, &ls_end);
@@ -487,6 +488,7 @@ binding_lowered:
                                 g->list_struct_type, list_ptr, 0, "countf");
                             LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                                 count_field, "count");
+                            zan_tbaa_tag_cnt(g, count);
                             LLVMValueRef lf_oob = emit_index_bounds_check(g, idx, count, expr->loc, "list");
                             LLVMBasicBlockRef lf_do = NULL, lf_end = NULL;
                             emit_oob_store_split(g, lf_oob, &lf_do, &lf_end);
@@ -607,6 +609,7 @@ binding_lowered:
                         LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                             LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                                 list_ptr, 0, "countf"), "count");
+                        zan_tbaa_tag_cnt(g, count);
                         LLVMValueRef lm_oob = emit_index_bounds_check(g, idx, count, expr->loc, "list");
                         LLVMBasicBlockRef lm_do = NULL, lm_end = NULL;
                         emit_oob_store_split(g, lm_oob, &lm_do, &lm_end);
@@ -743,6 +746,7 @@ binding_lowered:
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                         LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                             list_ptr, 0, "countf"), "count");
+                    zan_tbaa_tag_cnt(g, count);
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                     LLVMValueRef le_oob = emit_index_bounds_check(g, idx, count, expr->loc, "list");
                     LLVMBasicBlockRef le_do = NULL, le_end = NULL;

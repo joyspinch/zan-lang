@@ -265,6 +265,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
                 LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
                 LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
+                zan_tbaa_tag_cnt(g, count);
                 emit_release_owned_call_temp(g, expr->member.object, raw_ptr, locals);
                 return count;
             }
@@ -281,6 +282,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
                 LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "dcnt");
+                zan_tbaa_tag_cnt(g, cnt);
                 emit_release_owned_call_temp(g, expr->member.object, raw, locals);
                 return cnt;
             }

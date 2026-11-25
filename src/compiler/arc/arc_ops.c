@@ -535,9 +535,12 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
   value = emit_implicit_box(g, elem_type, value, rhs, locals);
   LLVMValueRef old = NULL;
   if (overwrite_old) {
-    old = elem_kind == LLVMStructTypeKind
-              ? load_struct_from_slot(g, slot_ptr, elem_llvm)
-              : LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "arc.old");
+    if (elem_kind == LLVMStructTypeKind) {
+      old = load_struct_from_slot(g, slot_ptr, elem_llvm);
+    } else {
+      old = LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "arc.old");
+      zan_tbaa_tag_elem(g, old);
+    }
   }
   if (!expr_yields_owned_rc_value(g, rhs, locals))
     emit_collection_value_retain(g, elem_type, value, 0);
@@ -601,7 +604,7 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                     stored = LLVMBuildTrunc(g->builder, stored, slot_ty, "slot.narrow");
             }
     }
-    LLVMBuildStore(g->builder, stored, slot_ptr);
+    zan_tbaa_tag_elem(g, LLVMBuildStore(g->builder, stored, slot_ptr));
   }
   if (overwrite_old) {
     LLVMValueRef old_value = old;

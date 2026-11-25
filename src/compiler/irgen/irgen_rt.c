@@ -26,6 +26,20 @@ static LLVMValueRef hdr_readable_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
     /* 弱兜底：实现在 rt_timer.o；wasm/bare 或旧的预编译交叉运行时对象里
      * 没有它，退回「可读」即旧行为，保证符号完备不报链接错误。 */
     LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+    unsigned nk = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    if (nk) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nk, 0));
+    unsigned ck = LLVMGetEnumAttributeKindForName("cold", 4);
+    if (ck) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, ck, 0));
+    unsigned ik = LLVMGetEnumAttributeKindForName("noinline", 8);
+    if (ik) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, ik, 0));
+    unsigned mk = LLVMGetEnumAttributeKindForName("memory", 6);
+    if (mk) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, mk, 0x15u));
+    unsigned nck = LLVMGetEnumAttributeKindForName("nocapture", 9);
+    if (nck) LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(g->ctx, nck, 0));
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
     LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
     LLVMBuildRet(b, LLVMConstInt(i32t, 1, 0));
@@ -47,7 +61,8 @@ static LLVMValueRef zan_hdr_page_ok(zan_irgen_t *g, LLVMValueRef obj,
         LLVMConstInt(i64t, (uint64_t)need, 0), "hdr.samepage");
     LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdr.pgslow");
     LLVMBasicBlockRef join_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdr.pgjoin");
-    LLVMBuildCondBr(g->builder, fast, join_bb, slow_bb);
+    LLVMValueRef pbr = LLVMBuildCondBr(g->builder, fast, join_bb, slow_bb);
+    zan_set_branch_weights(g, pbr, 2000, 1);
     LLVMPositionBuilderAtEnd(g->builder, slow_bb);
     LLVMTypeRef rty = NULL;
     LLVMValueRef rfn = hdr_readable_fn(g, &rty);
