@@ -4,6 +4,50 @@ namespace Zan;
 
 partial class Irgen {
     // ---- indexing (string char / list element / array) ----
+    // Append every element of a rank-1 array to list `lst`: a loop over the
+    // ordinary element read (`arr[i]`, bounds-checked) through two borrowed
+    // `__qdot` locals -- the array and the index are never owned here.
+    void CopyArrayIntoList(string lst, ExprVal arr, Node elemTy, Node at) {
+        string ot = MapType(arr.ty);
+        qdotSeq = qdotSeq + 1;
+        string an = "__qdot" + qdotSeq;
+        string areg = AddLocal(an, arr.ty);
+        EA(areg, ot);
+        L("  store " + ot + " " + arr.op + ", " + ot + "* " + areg);
+        qdotSeq = qdotSeq + 1;
+        string inm = "__qdot" + qdotSeq;
+        Node lty = MkType("long");
+        string ireg = AddLocal(inm, lty);
+        EA(ireg, "i64");
+        L("  store i64 0, i64* " + ireg);
+        string ap = NT();
+        L("  " + ap + " = bitcast " + ot + " " + arr.op + " to i64*");
+        string len = NT();
+        L("  " + len + " = call i64 @zarr_len(i64* " + ap + ")");
+        int lc = NL(); int lb = NL(); int le = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string iv = NT();
+        L("  " + iv + " = load i64, i64* " + ireg);
+        string more = NT();
+        L("  " + more + " = icmp slt i64 " + iv + ", " + len);
+        L("  br i1 " + more + ", label %L" + lb + ", label %L" + le);
+        Label(lb);
+        Node ai = new Node(AK.Ident()); ai.sval = an; ai.line = at.line; ai.col = at.col;
+        Node ii = new Node(AK.Ident()); ii.sval = inm; ii.line = at.line; ii.col = at.col;
+        Node ix = new Node(AK.Index()); ix.a = ai; ix.b = ii; ix.line = at.line; ix.col = at.col;
+        ExprVal ev = GenExpr(ix);
+        string slot = StructElemSlot(ev, elemTy);
+        L("  call void @zlist_add(i8* " + lst + ", i64 " + slot + ")");
+        string iv2 = NT();
+        L("  " + iv2 + " = load i64, i64* " + ireg);
+        string nx = NT();
+        L("  " + nx + " = add i64 " + iv2 + ", 1");
+        L("  store i64 " + nx + ", i64* " + ireg);
+        L("  br label %L" + lc);
+        Label(le);
+    }
+
     ExprVal GenIndex(Node e) {
         ExprVal obj = GenExpr(e.a);
         ExprVal idx = GenExpr(e.b);
@@ -383,6 +427,12 @@ partial class Irgen {
                 ExprVal sv = GenExpr(e.kids[0]);
                 if (IsListType(sv.ty)) {
                     L("  call void @zlist_copy(i8* " + t + ", i8* " + sv.op + ")");
+                }
+                else if (sv.ty != null && sv.ty.ival >= 1 && ArrRankOf(sv.ty) <= 1) {
+                    // `new List<T>(array)`: the array copy constructor (the
+                    // host's construct_new) -- every element is added; an
+                    // array is not one item
+                    CopyArrayIntoList(t, sv, ListElem(ty), e);
                 }
                 else {
                     string ss = StructElemSlot(sv, ListElem(ty));

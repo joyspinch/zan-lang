@@ -1,0 +1,202 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+namespace Zan;
+
+// Compile-time synthesized declarations (the C host's driver/main_synth.c).
+// Each pass renders Zan source text from the parsed unit and parses it back
+// in, before the namespace resolution that QualifyTypes runs, so the
+// generated type references resolve like hand-written ones.
+public partial class Parser {
+
+    // ---- control catalog (B-ID172, docs/GUI_CONTROL_CATALOG.md) ----------
+    //
+    // The host's zan_synth_control_catalog: every non-abstract, non-static,
+    // non-internal class whose base chain reaches `Gui.Control` enters
+    // `__ZanControlCatalog` under its class name; [ControlKind(Name, Factory,
+    // Of)] declares aliases, static factories and closed generic controls.
+    // Gui.ControlFactory calls the synthesized Create(kind)/Kinds().
+    void SynthControlCatalog(Node unit) {
+        Node factory = SynthFindClass(unit, "ControlFactory");
+        if (factory == null || factory.nsName != "Gui") { return; }
+        StringBuilder create = new StringBuilder();
+        StringBuilder list = new StringBuilder();
+        List<string> kinds = new List<string>();
+        create.Append("class __ZanControlCatalog {\n");
+        create.Append("    public static Gui.Control Create(string kind) {\n");
+        list.Append("    public static List<string> Kinds() {\n");
+        list.Append("        List<string> k = new List<string>();\n");
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            i = i + 1;
+            if (d == null || d.kind != AK.ClassDecl() || d.sval == null) { continue; }
+            if ((d.mods & (MOD.Abstract() | MOD.Static() | MOD.Internal() | MOD.Private())) != 0) { continue; }
+            if (!SynthIsControl(unit, d, 0)) { continue; }
+            string full = d.nsName != null && d.nsName != "" ? d.nsName + "." + d.sval : d.sval;
+            bool generic = SynthIsGeneric(d);
+            bool constructible = SynthDefaultConstructible(d);
+            bool declaredDefault = false;
+            List<string> groups = SynthAttrGroups(d.attrBlob, "ControlKind");
+            int g = 0;
+            while (g < groups.Count) {
+                string grp = groups[g];
+                g = g + 1;
+                string name = SynthGroupArg(grp, "Name");
+                if (name == "") { name = d.sval; }
+                string fac = SynthGroupArg(grp, "Factory");
+                string of = SynthGroupArg(grp, "Of");
+                if (kinds.Contains(name)) { continue; }
+                if (fac != "") {
+                    create.Append("        if (kind == \"" + name + "\") { return " + full + "." + fac + "(); }\n");
+                } else if (generic && of != "") {
+                    create.Append("        if (kind == \"" + name + "\") { return new " + full + "<" + of + ">(); }\n");
+                } else if (!generic && constructible) {
+                    create.Append("        if (kind == \"" + name + "\") { return new " + full + "(); }\n");
+                } else {
+                    continue;
+                }
+                kinds.Add(name);
+                list.Append("        k.Add(\"" + name + "\");\n");
+                if (name == d.sval) { declaredDefault = true; }
+            }
+            if (generic || !constructible || declaredDefault) { continue; }
+            if (kinds.Contains(d.sval)) { continue; }
+            kinds.Add(d.sval);
+            create.Append("        if (kind == \"" + d.sval + "\") { return new " + full + "(); }\n");
+            list.Append("        k.Add(\"" + d.sval + "\");\n");
+        }
+        create.Append("        return null;\n    }\n");
+        list.Append("        return k;\n    }\n}\n");
+        create.Append(list.ToString());
+        SynthAppendSource(unit, create.ToString());
+    }
+
+    // Parse generated source into the unit as global-namespace declarations
+    // (the host lexes it as its own "<control-catalog>" file).
+    void SynthAppendSource(Node unit, string src) {
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        Parser sub = new Parser(toks, diags);
+        Node part = sub.ParseSourceDecls();
+        int i = 0;
+        while (i < part.kids.Count) {
+            Node d = part.kids[i];
+            if (d.nsName == null) { d.nsName = ""; }
+            if (d.nsUsings == null) { d.nsUsings = new List<string>(); }
+            unit.Add(d);
+            i = i + 1;
+        }
+    }
+
+    // The first class declaration with this simple name (zd_find_class).
+    Node SynthFindClass(Node unit, string name) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d != null && d.kind == AK.ClassDecl() && d.sval == name) { return d; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Does the base chain reach `Control` declared in namespace `Gui`?
+    bool SynthIsControl(Node unit, Node d, int depth) {
+        if (d == null || depth > 32) { return false; }
+        string b = d.sval2;
+        if (b == null || b == "") { return false; }
+        int dot = b.LastIndexOf(".");
+        if (dot >= 0) { b = b.Substring(dot + 1); }
+        Node bd = SynthFindClass(unit, b);
+        if (bd == null) { return false; }
+        if (b == "Control" && bd.nsName == "Gui") { return true; }
+        return SynthIsControl(unit, bd, depth + 1);
+    }
+
+    bool SynthIsGeneric(Node d) {
+        int i = 0;
+        while (i < d.kids.Count) {
+            if (d.kids[i] != null && d.kids[i].kind == AK.TypeParam()) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // An accessible parameterless instance constructor, or none declared.
+    bool SynthDefaultConstructible(Node d) {
+        bool any = false;
+        int i = 0;
+        while (i < d.kids.Count) {
+            Node m = d.kids[i];
+            i = i + 1;
+            if (m == null || m.kind != AK.CtorDecl()) { continue; }
+            if ((m.mods & MOD.Static()) != 0) { continue; }
+            any = true;
+            if ((m.mods & (MOD.Private() | MOD.Protected() | MOD.Internal())) != 0) { continue; }
+            if (SynthParamCount(m) == 0) { return true; }
+        }
+        return !any;
+    }
+
+    int SynthParamCount(Node m) {
+        int n = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i] != null && m.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Split an attribute blob ("A.k=v;A=v;A=true;") into one entry string per
+    // [A(...)] occurrence: a positional value or a repeated key opens the
+    // next occurrence. Each group is "k=v;k=v;" with the positional value
+    // stored as Name (the host's first-positional-is-Name rule).
+    List<string> SynthAttrGroups(string blob, string attr) {
+        List<string> groups = new List<string>();
+        if (blob == null || blob == "") { return groups; }
+        string cur = "";
+        List<string> keys = new List<string>();
+        bool open = false;
+        List<string> parts = blob.Split(';');
+        int i = 0;
+        while (i < parts.Count) {
+            string p = parts[i];
+            i = i + 1;
+            if (p == "") { continue; }
+            int eq = p.IndexOf("=");
+            if (eq < 0) { continue; }
+            string lhs = p.Substring(0, eq);
+            string val = p.Substring(eq + 1);
+            string key;
+            if (lhs == attr) {
+                // positional (or bare `[A]` / `[A()]` = "true"): a new occurrence
+                if (open) { groups.Add(cur); }
+                cur = val == "true" ? "" : "Name=" + val + ";";
+                keys = new List<string>();
+                if (val != "true") { keys.Add("Name"); }
+                open = true;
+                continue;
+            }
+            if (!lhs.StartsWith(attr + ".")) { continue; }
+            key = lhs.Substring(attr.Length + 1);
+            if (open && keys.Contains(key)) { groups.Add(cur); cur = ""; keys = new List<string>(); }
+            cur = cur + key + "=" + val + ";";
+            keys.Add(key);
+            open = true;
+        }
+        if (open) { groups.Add(cur); }
+        return groups;
+    }
+
+    string SynthGroupArg(string grp, string key) {
+        List<string> parts = grp.Split(';');
+        int i = 0;
+        while (i < parts.Count) {
+            string p = parts[i];
+            if (p.StartsWith(key + "=")) { return p.Substring(key.Length + 1); }
+            i = i + 1;
+        }
+        return "";
+    }
+}

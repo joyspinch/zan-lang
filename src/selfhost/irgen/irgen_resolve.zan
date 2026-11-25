@@ -1112,7 +1112,7 @@ Node MethodGroupReceiver(Node e) {
         return CurThisTy();
     }
     if (e.kind != AK.MemberAccess() || e.a == null) { return null; }
-    if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
+    if (e.a.kind == AK.Ident() && (e.a.typeName || LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval))) {
         Node cls = binder.FindType(e.a.sval);
         if (cls != null) {
             Node ty = MkType(cls.sval);
@@ -1126,8 +1126,8 @@ Node MethodGroupReceiver(Node e) {
 
 int MethodGroupForm(Node e) {
     if (e.kind == AK.Ident()) { return curHasThis ? 0 : 1; }
-    if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
-    && !ShadowsTypeName(e.a.sval) && binder.FindType(e.a.sval) != null) { return 1; }
+    if (e.a != null && e.a.kind == AK.Ident() && (e.a.typeName || LocalIdx(e.a.sval) < 0
+    && !ShadowsTypeName(e.a.sval)) && binder.FindType(e.a.sval) != null) { return 1; }
     return 2;
 }
 
@@ -1281,6 +1281,15 @@ int ScoreCand(Node m, Node e, int argc, bool wantStatic, Node recvTy) {
             a = a + 1;
             continue;
         }
+        // a null literal binds only to a reference or nullable parameter:
+        // `Of(null)` picks Of(string) over Of(int) -- untyped, it used to tie
+        // every overload and the first (value-typed) one won
+        if (arg != null && arg.kind == AK.NullLit() && pt != null) {
+            if (NullRejectingParam(pt)) { return -1000000; }
+            score = score + 2;
+            a = a + 1;
+            continue;
+        }
         Node atn = ArgTypeNode(arg);
         if (atn != null) {
             if (MentionsTypeParam(pt)) {
@@ -1297,6 +1306,16 @@ int ScoreCand(Node m, Node e, int argc, bool wantStatic, Node recvTy) {
         a = a + 1;
     }
     return score;
+}
+
+// A parameter type `null` cannot convert to: a non-nullable scalar, enum
+// or struct (a type parameter stays open -- it may be a reference type).
+bool NullRejectingParam(Node pt) {
+    if (pt == null || pt.ival > 0 || IsNullableValue(pt) || MentionsTypeParam(pt)) { return false; }
+    if (pt.sval == "string" || pt.sval == "object") { return false; }
+    if (binder.IsPrimitive(pt.sval)) { return true; }
+    Node d = binder.FindType(pt.sval);
+    return d != null && (d.kind == AK.StructDecl() || d.kind == AK.EnumDecl());
 }
 
 // A float and a double convert into each other implicitly (the C host

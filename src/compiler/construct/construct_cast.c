@@ -353,8 +353,29 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (tw > sw) return zan_iwiden(g->builder, val, target);
             return val;
         }
-        if (src_fp && tk == LLVMIntegerTypeKind)
+        if (src_fp && tk == LLVMIntegerTypeKind) {
+            /* 无符号窄目标（byte/ushort/uint）按 [0, 2^w-1] 饱和：
+             * emit_fptosi_guarded 的窄化饱和只认 LLVM 位宽、按有符号域钳，
+             * (byte)200.9 会被钳成 127。这里先在 i64 上守卫转换，再按
+             * 无符号域钳位截断（checked 上下文越界抛溢出，同口径）。 */
+            unsigned uw = LLVMGetIntTypeWidth(target);
+            if (tt && uw < 64 && (tt->kind == TYPE_BYTE ||
+                    tt->kind == TYPE_USHORT || tt->kind == TYPE_UINT)) {
+                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef w = emit_fptosi_guarded(g, val, i64t, expr->loc, NULL);
+                LLVMValueRef zero = LLVMConstInt(i64t, 0, 0);
+                LLVMValueRef umax = LLVMConstInt(i64t, (1ULL << uw) - 1, 0);
+                LLVMValueRef below = zan_icmp(g->builder, LLVMIntSLT, w, zero, "f2u.lo");
+                LLVMValueRef above = zan_icmp(g->builder, LLVMIntSGT, w, umax, "f2u.hi");
+                if (g->irgen_checked_depth > 0)
+                    emit_runtime_check(g, LLVMBuildOr(g->builder, below, above, "f2u.ovf"),
+                        expr->loc, "integer overflow in checked operation");
+                LLVMValueRef hs = LLVMBuildSelect(g->builder, above, umax, w, "f2u.hs");
+                LLVMValueRef cl = LLVMBuildSelect(g->builder, below, zero, hs, "f2u.cl");
+                return LLVMBuildTrunc(g->builder, cl, target, "f2u.trunc");
+            }
             return emit_fptosi_guarded(g, val, target, expr->loc, NULL);
+        }
         if (sk == LLVMIntegerTypeKind && tgt_fp)
             return LLVMBuildSIToFP(g->builder, val, target, "cast");
         if (src_fp && tgt_fp) {

@@ -64,7 +64,14 @@
                 (LLVMValueRef[]){ a, b }, 2, "ordcmp");
             emit_release_owned_call_temp(g, a_ast, a, locals);
             emit_release_owned_call_temp(g, b_ast, b, locals);
-            return LLVMBuildSExt(g->builder, r, i64t, "ordcmp64");
+            /* strcmp 的幅值随平台（Apple libc 返回字节差，MSVCRT 返回 ±1）；
+             * 序号比较的结果取其符号，跨平台一致（自举孪生同口径）。 */
+            LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
+            LLVMValueRef gt = zan_icmp(g->builder, LLVMIntSGT, r, zero, "ordcmp.gt");
+            LLVMValueRef lt = zan_icmp(g->builder, LLVMIntSLT, r, zero, "ordcmp.lt");
+            return LLVMBuildSub(g->builder,
+                LLVMBuildZExt(g->builder, gt, i64t, "ordcmp.g"),
+                LLVMBuildZExt(g->builder, lt, i64t, "ordcmp.l"), "ordcmp64");
         }
 
         /* Math.Sqrt(expr) → llvm.sqrt */

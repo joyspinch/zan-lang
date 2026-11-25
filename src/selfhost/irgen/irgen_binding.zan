@@ -123,7 +123,8 @@ partial class Irgen {
         Node src = rhs;
         if (rhs.kind == AK.Ident() && LocalIdx(rhs.sval) < 0 && curClass != "") {
             Node own = binder.FindType(curClass);
-            if (own != null && FieldIndex(own, rhs.sval) >= 0) {
+            if (own != null && (FieldIndex(own, rhs.sval) >= 0
+                || (FindMethodUp(own, "get_" + rhs.sval) != null && curHasThis))) {
                 Node ma = new Node(AK.MemberAccess());
                 ma.a = new Node(AK.ThisExpr());
                 ma.sval = rhs.sval;
@@ -138,9 +139,20 @@ partial class Irgen {
             Node c = ClassOf(ArgTypeNode(src.a));
             if (c != null && FieldIndex(c, src.sval) >= 0) {
                 Node fty = FieldType(c, src.sval);
-                if (fty != null && elem != null && TypeTag(fty) == TypeTag(elem)) {
+                // a readonly field or a setter-less auto-property never
+                // exports a writable alias: the binding is a snapshot (a
+                // Binding can escape even from a constructor)
+                Node fd = binder.FindField(c, src.sval);
+                bool writable = fd == null || (!HasMod(fd, MOD.Readonly()) && !fd.autoNoSet);
+                // Binding.target is a borrowed slot: it never exports a
+                // writable accessor (an owned temp could be Set through it)
+                if (BindingTargetField(c, src.sval)) { writable = false; }
+                fty = InstMemberType(c, fty, ArgTypeNode(src.a));
+                if (writable && fty != null && elem != null && TypeTag(fty) == TypeTag(elem)) {
                     fcls = c;
                 }
+            } else if (c != null && LiveProperty(c, src.sval, elem, ArgTypeNode(src.a))) {
+                fcls = c;
             }
         }
         if (fcls != null && YieldsOwnedTemp(src.a)) { fcls = null; }
@@ -158,8 +170,9 @@ partial class Irgen {
         string tgt = ToI8Ptr(recv.op, MapType(recv.ty));
         StoreBindingField(obj, bcls, "target", tgt);
         // the accessor pair: the getter reads the field, the setter writes it
-        string gfn = BindingAccFn(fcls, src.sval, false);
-        string sfn = BindingAccFn(fcls, src.sval, true);
+        Node recvTy = ArgTypeNode(src.a);
+        string gfn = BindingAccFn(fcls, src.sval, false, recvTy);
+        string sfn = BindingAccFn(fcls, src.sval, true, recvTy);
         StoreBindingField(obj, bcls, "getter", AccDelegate(gfn, "i64 (i8*, i8*)*"));
         StoreBindingField(obj, bcls, "setter", AccDelegate(sfn, "void (i8*, i8*, i64)*"));
         StoreBindingField(obj, bcls, "live", "1");
@@ -216,9 +229,13 @@ partial class Irgen {
 
     // The accessor function for a live binding of `cls.field`; one shared
     // function per (class, field, direction).
-    string BindingAccFn(Node cls, string field, bool isSet) {
+    string BindingAccFn(Node cls, string field, bool isSet, Node recvTy) {
         InitBinding();
         string key = cls.sval + "#" + field + (isSet ? "#s" : "#g");
+        // a property accessor calls through the receiver's instantiation:
+        // one accessor pair per instantiation (the host keys its cache on
+        // recv_type/value_type too)
+        if ((FieldIndex(cls, field) < 0 || TParams(cls).Count > 0) && recvTy != null) { key = key + "#" + TypeTag(recvTy); }
         int i = 0;
         while (i < bindAccKeys.Count) {
             if (bindAccKeys[i] == key) { return bindAccFns[i]; }
@@ -227,14 +244,41 @@ partial class Irgen {
         string fn = "__zbind_" + (isSet ? "set" : "get") + "_" + bindAccKeys.Count;
         bindAccKeys.Add(key);
         bindAccFns.Add(fn);
-        EmitBindingAcc(cls, field, isSet, fn);
+        EmitBindingAcc(cls, field, isSet, fn, recvTy);
         return fn;
+    }
+
+    // A read-write instance property is a live binding source (the C host's
+    // emit_binding_value: getter-only and init-only properties stay value
+    // snapshots), when its type matches the binding's element.
+    bool LiveProperty(Node c, string name, Node elem, Node recvTy) {
+        Node pg = FindMethodUp(c, "get_" + name);
+        Node ps = FindMethodUp(c, "set_" + name);
+        if (pg == null || ps == null || elem == null || pg.type == null) { return false; }
+        if (HasMod(pg, MOD.Static()) || HasMod(ps, MOD.Static())) { return false; }
+        return TypeTag(InstMemberType(c, pg.type, recvTy)) == TypeTag(elem);
+    }
+
+    // A generic class' member is typed by the RECEIVER's instantiation
+    // (`GenericBox<int>.Value` is an int) -- the host's field_store_type.
+    Node InstMemberType(Node c, Node t, Node recvTy) {
+        List<string> ctps = TParams(c);
+        if (t != null && ctps.Count > 0 && recvTy != null && recvTy.kids.Count == ctps.Count) {
+            return SubstTP(t, ctps, recvTy.kids);
+        }
+        return t;
     }
 
     // Emit the accessor function: the delegate invoke ABI (the env pointer
     // first, then the declared arguments), the field word moved through the
     // erased i64 slot.
-    void EmitBindingAcc(Node cls, string field, bool isSet, string fn) {
+    void EmitBindingAcc(Node cls, string field, bool isSet, string fn, Node recvTy) {
+        // a property, or a field of a generic class (an erased slot whose
+        // ownership follows the instantiation): the ordinary member codegen
+        if (FieldIndex(cls, field) < 0 || TParams(cls).Count > 0) {
+            EmitBindingPropAcc(cls, field, isSet, fn, recvTy);
+            return;
+        }
         int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
         string ft = MapType(fty);
@@ -276,6 +320,102 @@ partial class Irgen {
         deferred.Append(body.ToString());
         body = savedBody; entryAllocas = sEa; eaActive = sEaAct;
         tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
+    }
+
+    // The accessor pair over a PROPERTY: the getter/setter run through the
+    // ordinary instance-call dispatch (a virtual property reaches the
+    // override -- the C host's emit_property_getter_call/setter_call). The
+    // getter hands back +1 like any delegate body (the lambda convention);
+    // the setter borrows the incoming slot value.
+    void EmitBindingPropAcc(Node cls, string field, bool isSet, string fn, Node recvTy) {
+        bool isField = FieldIndex(cls, field) >= 0;
+        Node pg = FindMethodUp(cls, "get_" + field);
+        Node pty = isField ? FieldType(cls, field) : (pg != null ? pg.type : null);
+        pty = InstMemberType(cls, pty, recvTy);
+        string cname = cls.sval;
+        StringBuilder savedBody = body;
+        StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
+        int sTmp = tmp; int sLbl = lbl; bool sTerm = term; string sCurLbl = curLbl;
+        string sClass = curClass; bool sHasThis = curHasThis;
+        List<string> sLocName = locName; List<Node> sLocType = locType;
+        List<string> sLocReg = locReg; int sLocSeq = locSeq;
+        List<bool> sLocRef = locRef; List<bool> sLocOpaque = locOpaque;
+        List<bool> sLocBox = locBox; List<bool> sLocIter = locIter; List<string> sLocCell = locCell;
+        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
+        tmp = 0; lbl = 0; term = false; curLbl = "entry";
+        curClass = cname; curHasThis = false;
+        locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
+        locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        locRef = new List<bool>(); locOpaque = new List<bool>();
+        stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+        string obj = NT();
+        L("  " + obj + " = bitcast i8* %target to %" + cname + "*");
+        Node rty = recvTy != null && recvTy.sval == cname ? CopyType(recvTy) : MkType(cname);
+        ExprVal recv = new ExprVal(obj, rty);
+        Node call = new Node(AK.Call());
+        // a field reads/writes through `__zbind_t.<field>`: the receiver is a
+        // local of the instantiated type, so the member codegen applies the
+        // instantiation's slot conversion and ARC (retained like any local)
+        Node fma = null;
+        if (isField) {
+            string treg = AddLocal("__zbind_t", rty);
+            EA(treg, MapType(rty));
+            L("  store " + MapType(rty) + " " + obj + ", " + MapType(rty) + "* " + treg);
+            EmitArcRetain(obj, rty);
+            Node tid = new Node(AK.Ident());
+            tid.sval = "__zbind_t";
+            fma = new Node(AK.MemberAccess());
+            fma.a = tid;
+            fma.sval = field;
+        }
+        if (isSet) {
+            ExprVal nv = FromSlot("%v", pty);
+            string lt = MapType(pty);
+            string reg = AddLocal("__zbind_v", pty);
+            EA(reg, lt);
+            L("  store " + lt + " " + nv.op + ", " + lt + "* " + reg);
+            // the local owns a reference like any local: it is armed for
+            // unwinding (EA) and released with the locals before returning
+            EmitArcRetain(nv.op, pty);
+            Node arg = new Node(AK.Ident());
+            arg.sval = "__zbind_v";
+            if (isField) {
+                Node asg = new Node(AK.Assignment());
+                asg.op = TK.Eq();
+                asg.a = fma;
+                asg.b = arg;
+                GenExpr(asg);
+            } else {
+                call.Add(arg);
+                EmitInstanceCall(recv, cname, "set_" + field, call);
+            }
+            EmitTempReleases();
+            ReleaseLocalsFrom(0);
+            L("  ret void");
+        } else {
+            ExprVal rv = isField ? GenExpr(fma) : EmitInstanceCall(recv, cname, "get_" + field, call);
+            if (ArcManaged(rv.ty)) { EmitArcRetain(rv.op, rv.ty); }
+            string slot = ToSlot(rv, pty);
+            EmitTempReleases();
+            ReleaseLocalsFrom(0);
+            L("  ret i64 " + slot);
+        }
+        L("}");
+        string sig = isSet ? "define void @" + fn + "(i8* %env, i8* %target, i64 %v) {"
+                           : "define i64 @" + fn + "(i8* %env, i8* %target) {";
+        deferred.Append(sig + "\nentry:\n");
+        deferred.Append(entryAllocas.ToString());
+        deferred.Append(body.ToString());
+        body = savedBody; entryAllocas = sEa; eaActive = sEaAct;
+        tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
+        curClass = sClass; curHasThis = sHasThis;
+        locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
+        locRef = sLocRef; locOpaque = sLocOpaque;
+        locBox = sLocBox; locIter = sLocIter; locCell = sLocCell;
+        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
     }
 
     // The erased (i64) slot value of a concrete field value.

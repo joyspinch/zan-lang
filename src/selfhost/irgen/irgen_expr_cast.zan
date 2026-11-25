@@ -3,6 +3,17 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
+    // The bit width the C host converts a floating value to for a narrow
+    // integer target (0 = the full 64-bit slot, no extra saturation).
+    int FloatCastWidth(Node t) {
+        if (t == null || t.ival > 0) { return 0; }
+        string n = t.sval;
+        if (n == "byte" || n == "sbyte") { return 8; }
+        if (n == "short" || n == "ushort") { return 16; }
+        if (n == "int" || n == "uint") { return 32; }
+        return 0;
+    }
+
     // ---- cast ----
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
@@ -54,7 +65,30 @@ partial class Irgen {
         // double -> int (truncating toward zero); B-ID180 poison 收口:
         // 越界/NaN 守卫 + clamp,镜像 C 宿主 emit_fptosi_guarded
         if (fromD && !toD && MapType(tgt) == "i64") {
-            return new ExprVal(EmitFptosiGuarded(e, v.op), tgt);
+            string g64 = EmitFptosiGuarded(e, v.op);
+            // ④ a narrow target saturates at ITS OWN width before the wrap
+            // (the host's emit_fptosi_guarded: (int)3e9 is int.MaxValue, not
+            // the low 32 bits of long.MaxValue). The host's LLVM widths:
+            // byte/sbyte 8, short/ushort 16, int/uint 32 (char is i64).
+            int tw = FloatCastWidth(tgt);
+            if (tw > 0) {
+                // signed targets clamp to [-2^(w-1), 2^(w-1)-1], unsigned
+                // ones (byte/ushort/uint) to [0, 2^w-1]: (byte)200.9 is 200
+                bool uns = tgt.sval == "byte" || tgt.sval == "ushort" || tgt.sval == "uint";
+                long tmax = uns ? (1L << tw) - 1 : (1L << (tw - 1)) - 1;
+                long tmin = uns ? 0 : -tmax - 1;
+                string below = NT();
+                L("  " + below + " = icmp slt i64 " + g64 + ", " + tmin);
+                string above = NT();
+                L("  " + above + " = icmp sgt i64 " + g64 + ", " + tmax);
+                string hs = NT();
+                L("  " + hs + " = select i1 " + above + ", i64 " + tmax + ", i64 " + g64);
+                string cl = NT();
+                L("  " + cl + " = select i1 " + below + ", i64 " + tmin + ", i64 " + hs);
+                // the wrap to the target's width (unsigned zero-extends)
+                return NarrowToDeclared(new ExprVal(cl, MkType("long")), tgt);
+            }
+            return new ExprVal(g64, tgt);
         }
         // -> float: the single-precision rounding (the host narrows to f32)
         if (IsFloatTy(tgt) && fromD) {
