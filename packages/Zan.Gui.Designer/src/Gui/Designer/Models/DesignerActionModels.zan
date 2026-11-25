@@ -1,0 +1,330 @@
+using Gui.Backend;
+using Gui.Component;
+using Gui.Widget;
+using Gui;
+using System.Collections.Generic;
+using System.Json;
+using System;
+
+namespace Gui.Designer;
+
+// The shared legacy dialog can keep its subscription without retaining Designer.
+public class DesignerAssetPickerAction {
+    internal weak Designer owner;
+
+    public void Run() {
+        Designer current = owner;
+        if (current != null) { current.OnAssetPicked(); }
+    }
+}
+
+// Borrows the designer; the App only retains the input adapter, never the business owner.
+class DesignerCanvasInput : Control {
+    public weak Designer owner;
+    public bool ready;
+    public int inX; public int inY; public int inW; public int inH;
+    public int ox; public int oy; public int ps; public int viewW; public int viewH;
+
+    public DesignerCanvasInput() : base("designer_canvas_input") { }
+
+    public override int InputFocusCapabilities() {
+        Designer current = owner;
+        return current != null ? 3 : 0;
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        Designer current = owner;
+        if (!ready || current == null || current.CanvasInputLocked()
+                || !current.InRect(x, y, inX, inY, inW, inH)) { return null; }
+        return this;
+    }
+}
+
+// Standard buttons/list rows retain only a weak owner. The visual tree owns the
+// action; the action never keeps the document or its editor alive through ARC.
+public class DesignerCommandAction {
+    internal weak Designer owner;
+    internal weak Control control;
+    internal string command = "";
+    internal string text = "";
+    internal int value;
+    internal int seen;
+
+    public void Run() {
+        Designer current = owner;
+        if (current != null) { current.RunDesignerCommand(command, value, text); }
+    }
+
+    public void Pointer(Control sender, RoutedEventArgs args) {
+        if (args == null) { return; }
+        Designer current = owner;
+        if (current != null && current.DesignerCommandPointer(command, value, sender, args)) { return; }
+        if (args.eventName != "Click") { return; }
+        this.Run();
+        args.Handle();
+    }
+}
+
+// Body content for Layer's retained dialog host. Chrome, modal input and lifetime
+// belong to Layer; the designer only lays out and paints its editor body.
+public class DesignerDialogBody : Control {
+    internal weak Designer owner;
+    internal int editorKind;
+
+    public DesignerDialogBody(Designer owner, int kind) {
+        this.owner = owner; editorKind = kind;
+        this.InitControl("designer-dialog-body");
+        this.ClassName = "designer-dialog-body";
+    }
+
+    public override bool ChildControlsRenderedByOwner() { return true; }
+    public override int InputFocusCapabilities() { return 3; }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        base.OnRoutedEvent(e);
+        Designer current = owner;
+        if (!e.handled && current != null) { current.DesignerDialogInput(editorKind, this, e); }
+    }
+
+    public override void OnPaint(App app) {
+        Designer current = owner;
+        if (current == null) { return; }
+        Rect body = new Rect(bx, by, bw, bh);
+        if (editorKind == 0) { current.RenderRowsEditor(app, app.canvas, app.theme, body); }
+        else if (editorKind == 1) { current.RenderPropsEditor(app, app.canvas, app.theme, body); }
+        else { current.RenderIconPicker(app, app.canvas, app.theme, body); }
+    }
+}
+
+// Like UiViewActions, a persistent subscription borrows its view and sender.
+// The Cards generation additionally fences target/selection changes within that view.
+public class DesignerInspectorCardAction {
+    internal weak Designer owner;
+    internal weak UiViewScope view;
+    internal weak FormField target;
+    internal weak Button sender;
+    internal int generation;
+    internal int keySequence;
+    internal string command;
+    internal int value;
+
+    public void Run() {
+        Designer current = owner;
+        UiViewScope scope = view;
+        if (current != null && scope != null && scope.IsActive()) {
+            current.InvokeInspectorCardAction(this);
+        }
+    }
+}
+
+// Controls belong to the Inspector tree; the model target is borrowed and checked at dispatch.
+public class DesignerInspectorEventRow {
+    public EventEditRow edit;
+    public weak FormField target;
+    public Flex root;
+    public Label label;
+    public SelectBox picker;
+    public List<string> values;
+    public string optionsKey;
+
+    public DesignerInspectorEventRow(EventEditRow edit, FormField target, UiViewActions text,
+            UiViewActions pick, UiViewActions jump, UiViewActions open, UiViewActions close) {
+        this.edit = edit; this.target = target;
+        root = Flex.Row(); root.Gap(InspectorMetrics.GapMicro);
+        root.name = "inspector-event-" + edit.key;
+        root.Prefer(0, InspectorMetrics.RowHeight);
+        label = new Label(edit.title); label.Class = "secondary small";
+        label.Prefer(96, InspectorMetrics.RowHeight);
+        label.SetProp("style", "width:38%;flex-shrink:1;min-width:0;");
+        edit.input.name = "inspector-handler-" + edit.key; edit.input.Grow();
+        edit.input.SetProp("style", "flex:1;min-width:0;");
+        picker = new SelectBox("", false); picker.name = "inspector-handler-pick-" + edit.key;
+        picker.Prefer(InspectorMetrics.DropdownButtonWidth, InspectorMetrics.RowHeight);
+        picker.SetProp("style", "flex-shrink:0;min-width:0;");
+        picker.Size = "small"; picker.filterable = true;
+        picker.OnChange(pick.Send);
+        picker.BindEvent("Open", open.Send);
+        picker.BindEvent("Close", close.Send);
+        edit.input.OnChange(text.Send);
+        edit.input.OnDoubleClick(jump.Send);
+        label.OnDoubleClick(jump.Send);
+        root.Add(label); root.Add(edit.input); root.Add(picker);
+        values = new List<string>(); optionsKey = "";
+    }
+}
+
+// Subscriptions and delayed actions borrow every endpoint, including their sender.
+public class DesignerInspectorExtraAction {
+    internal weak Designer owner;
+    internal weak UiViewScope scope;
+    internal weak FormField target;
+    internal weak Control sender;
+    internal weak Control section;
+    internal int epoch;
+    internal int keySequence;
+    internal int category;
+    internal int sectionEpoch;
+    internal int index;
+    internal string command;
+    internal string value;
+
+    public void Run() {
+        Designer current = owner;
+        UiViewScope view = scope;
+        if (current != null && view != null && view.IsActive()) {
+            current.InvokeInspectorExtraAction(this);
+        }
+    }
+}
+
+// Component declarations and builtin picker bridges have their own retained editors.
+// Builtin typed property values remain exclusively owned by FieldSpecs/PropertyGrid.
+public class DesignerInspectorExtraProp {
+    internal string key;
+    internal string fallback;
+    internal string shadow;
+    internal Flex root;
+    internal Input input;
+    internal Switch toggle;
+    internal SelectBox select;
+    internal ColorPicker color;
+    internal bool builtin;
+    internal int colorShadow;
+    internal bool iconPickerPending;
+    internal DesignerInspectorExtraAction action;
+}
+
+// Menu configuration borrows its business owner; each instance keeps its opening target.
+class DesignerMenu : ContextMenu {
+    // 按父类种类上报：序列化与自动化以 "ContextMenu" 识别本控件。
+    public override string Kind() { return "ContextMenu"; }
+    public weak Designer Owner;
+    public int MenuKind;
+    public weak App Host;
+    public FormField Target;
+    public List<FormField> Targets;
+    public List<string> Commands;
+
+    public DesignerMenu() {
+        DesignerMenuAction action = new DesignerMenuAction();
+        action.Owner = this;
+        ActionSelected.Add(action.Run);
+    }
+
+    public override void OnPopupDismissed() {
+        base.OnPopupDismissed();
+        Designer owner = Owner;
+        if (owner != null) { owner.DesignerMenuClosed(this); }
+    }
+}
+
+class DesignerMenuAction {
+    public weak DesignerMenu Owner;
+    public void Run(Control sender) {
+        DesignerMenu menu = Owner;
+        if (menu == null) { return; }
+        Designer designer = menu.Owner;
+        if (designer != null) { designer.DesignerMenuSelected(menu); }
+    }
+}
+
+class DesignerRibbonAction {
+    public weak Designer Owner;
+    public weak Ribbon Ribbon;
+    public weak App Host;
+    public List<string> Commands;
+    public void Run() {
+        Designer designer = Owner;
+        Ribbon ribbon = Ribbon;
+        App app = Host;
+        if (designer == null || ribbon == null || app == null) { return; }
+        int index = ribbon.lastAct;
+        if (index >= 0 && index < Commands.Count) { designer.RunRibbon(app, Commands[index]); }
+    }
+}
+
+public class DesignerSourceCopy {
+    public JsonValue source;
+    public JsonValue copy;
+    public DesignerSourceCopy(JsonValue source, JsonValue copy) {
+        this.source = source;
+        this.copy = copy;
+    }
+}
+
+// The designer owns canvas painting; ordinary commands remain standard retained
+// children. Host dock panels may live outside the canvas rectangle, so hit testing
+// visits visible children directly instead of clipping them to the surface bounds.
+public class DesignerSurface : Control {
+    internal weak Designer owner;
+
+    public DesignerSurface(Designer owner) {
+        this.owner = owner;
+        this.InitControl("designer-surface");
+        this.ClassName = "designer-surface";
+    }
+
+    public override bool ChildControlsRenderedByOwner() { return true; }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        bx = px; by = py; bw = pw; bh = ph;
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!this.StyleVisible()) { return null; }
+        for (int i = this.ChildCount() - 1; i >= 0; i = i - 1) {
+            Control hit = this.ChildAt(i).HitTest(x, y, pointerType, excludedSubtrees);
+            if (hit != null) { return hit; }
+        }
+        return null;
+    }
+
+    public override void OnPaint(App app) {
+        Designer current = owner;
+        if (current != null) { current.RenderPinned(app, bx, by, bw, bh); }
+    }
+}
+
+public class RibbonAlignCommand {
+    public string icon;
+    public string label;
+    public string tip;
+    public string act;
+    public bool requiresFree; // 是否需要自由浮动布局 (layoutMode == 1)
+
+    public RibbonAlignCommand(string icon, string label, string tip, string act, bool requiresFree) {
+        this.icon = icon != null ? icon : "";
+        this.label = label != null ? label : "";
+        this.tip = tip != null ? tip : "";
+        this.act = act != null ? act : "";
+        this.requiresFree = requiresFree;
+    }
+}
+
+public class PaletteItem {
+    public int kind;
+    public string custom;
+
+    public PaletteItem(int kind, string custom) {
+        this.kind = kind;
+        this.custom = custom;
+    }
+}
+
+public class TabHeaderHit {
+    public FormField tabs;
+    public int page;
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+
+    public TabHeaderHit(FormField tabs, int page, int x, int y, int w, int h) {
+        this.tabs = tabs;
+        this.page = page;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+    }
+}

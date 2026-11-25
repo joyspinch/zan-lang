@@ -1,0 +1,378 @@
+using Gui.Widget;
+using Gui;
+using System.Collections.Generic;
+using System;
+
+namespace Gui.Component.DataTable;
+
+// 多级表头中的一个跨列单元格：组自身的标签、所在的
+// 表头行（0 = 最外层），以及它覆盖的可见顺序的
+// 半开区间 [from, to)。`path` 是完整的斜杠分隔键，
+// 折叠状态即以此为键存储——仅用标签会在不同父级下的
+// 两个同名叶节点分组之间发生冲突。
+public class BandSpan {
+    string label;
+    string path;
+    int level;
+    int from;
+    int to;
+
+    BandSpan(string l, string p, int lv, int f, int tt) {
+        label = l;
+        path = p;
+        level = lv;
+        from = f;
+        to = tt;
+    }
+}
+
+// 单元格合并跨度描述符（对标 DevExpress CellMerge / AG Grid colSpan & rowSpan）
+public class CellSpan {
+    int rowSpan;
+    int colSpan;
+
+    CellSpan(int rSpan, int cSpan) {
+        this.rowSpan = rSpan;
+        this.colSpan = cSpan;
+    }
+
+    public bool IsMaster() {
+        return this.rowSpan > 1 || this.colSpan > 1;
+    }
+
+    public bool IsCovered() {
+        return this.rowSpan == 0 || this.colSpan == 0;
+    }
+
+    public static CellSpan None() {
+        return new CellSpan(1, 1);
+    }
+
+    public static CellSpan Covered() {
+        return new CellSpan(0, 0);
+    }
+
+    public static CellSpan Make(int rSpan, int cSpan) {
+        int r = rSpan > 1 ? rSpan : 1;
+        int c = cSpan > 1 ? cSpan : 1;
+        return new CellSpan(r, c);
+    }
+}
+
+// 业务级动态单元格跨行与跨列提供器
+public class CellSpanProvider {
+    // 获取指定行/列单元格的跨度。
+    // - 主格：返回 CellSpan.Make(rSpan, cSpan)（rSpan 或 cSpan > 1）
+    // - 从属被覆盖格：返回 CellSpan.Covered()
+    // - 无合并独立格：返回 CellSpan.None()
+    virtual CellSpan GetSpan(DataSource src, int row, int col) {
+        return CellSpan.None();
+    }
+}
+
+// 基于显式区域配置的单元格合并模型
+public class TableSpanModel : CellSpanProvider {
+    Dictionary<string, CellSpan> spans;
+
+    TableSpanModel() {
+        this.spans = new Dictionary<string, CellSpan>();
+    }
+
+    public void AddSpan(int row, int col, int rowSpan, int colSpan) {
+        if (rowSpan < 1) { rowSpan = 1; }
+        if (colSpan < 1) { colSpan = 1; }
+        if (rowSpan == 1 && colSpan == 1) { return; }
+
+        string masterKey = Convert.ToString(row) + "," + Convert.ToString(col);
+        this.spans[masterKey] = new CellSpan(rowSpan, colSpan);
+
+        for (int r = row; r < row + rowSpan; r = r + 1) {
+            for (int c = col; c < col + colSpan; c = c + 1) {
+                if (r == row && c == col) { continue; }
+                string covKey = Convert.ToString(r) + "," + Convert.ToString(c);
+                this.spans[covKey] = CellSpan.Covered();
+            }
+        }
+    }
+
+    public void Clear() {
+        this.spans.Clear();
+    }
+
+    override CellSpan GetSpan(DataSource src, int row, int col) {
+        string key = Convert.ToString(row) + "," + Convert.ToString(col);
+        if (this.spans.ContainsKey(key)) {
+            return this.spans[key];
+        }
+        return CellSpan.None();
+    }
+}
+
+// 开箱即用相邻相同内容自动合并模型（对标 DevExpress AllowCellMerge）：
+// 针对指定的列，自动扫描上下连续相同内容的相邻行，
+// 动态将首行视为主格（Make(K, 1)），后续相同行自动标记为覆盖格（Covered），
+// 无需业务侧手工计算行列坐标，排序和过滤后动态自适应对齐。
+public class AutoCellSpanModel : CellSpanProvider {
+    public List<int> mergeCols;
+
+    public AutoCellSpanModel() {
+        this.mergeCols = new List<int>();
+    }
+
+    public void AddColumn(int colIndex) {
+        if (colIndex >= 0 && this.mergeCols.IndexOf(colIndex) < 0) {
+            this.mergeCols.Add(colIndex);
+        }
+    }
+
+    public bool IsMergeCol(int colIndex) {
+        return this.mergeCols.IndexOf(colIndex) >= 0;
+    }
+
+    public override CellSpan GetSpan(DataSource src, int row, int col) {
+        if (src == null || row < 0 || col < 0) { return CellSpan.None(); }
+        if (this.mergeCols.IndexOf(col) < 0) { return CellSpan.None(); }
+
+        int total = src.RowCount();
+        if (row >= total) { return CellSpan.None(); }
+
+        string curVal = src.CellText(row, col);
+
+        // 如果与上一行值相同，则属于被覆盖格（从属从格，由首行合并绘制）
+        if (row > 0 && src.CellText(row - 1, col) == curVal) {
+            return CellSpan.Covered();
+        }
+
+        // 当前行为连续相同值的首行，向下探测连续相同行数
+        int spanCount = 1;
+        int nextRow = row + 1;
+        while (nextRow < total && src.CellText(nextRow, col) == curVal) {
+            spanCount = spanCount + 1;
+            nextRow = nextRow + 1;
+        }
+
+        if (spanCount > 1) {
+            return CellSpan.Make(spanCount, 1);
+        }
+        return CellSpan.None();
+    }
+}
+
+// 条件格式清除项实体（消除 cfClearCols/cfClearSel 平行列表反模式）。
+public class CfClearItem {
+    public int column;
+    public bool selected;
+
+    public CfClearItem(int column, bool selected) {
+        this.column = column;
+        this.selected = selected;
+    }
+}
+
+// 逐列过滤器，由三个协作阶段组成（均可选）：
+// 1. 集合筛选 \u2014 剔除 `hidden` 中存在的值（Values 标签页）；
+// 2. 文本筛选 \u2014 `textMode`（1 包含 / 2 等于 / 3 开头 / 4 结尾）
+// 对 `textQuery` 进行匹配（Text Filters 标签页）；
+// 3. 批量筛选 \u2014 匹配 `batchTerms` 中的每一项（按 `batchExact`
+// 精确或子串匹配）；`batchKeep` 保留匹配项，否则排除。
+public class ColFilter {
+    List<string> hidden;
+    int textMode;
+    string textQuery;
+    List<string> batchTerms;
+    bool batchExact;
+    bool batchKeep;
+
+    // ---- 比较筛选（第 4 阶段） ----
+    // 使用列自身的排序规则将单元格与 cmpA 比较（双边模式还用 cmpB），
+    // 因此数值列按值比较，日期
+    // 列按天、bool 列按真值比较——从不按字典序。
+    // cmpMode：0 关闭，1 >，2 >=，3 <，4 <=，5 ==，6 !=，7 介于（含端点），
+    // 8 不介于，9 为空，10 不为空
+    int cmpMode;
+    string cmpA;
+    string cmpB;
+
+    // ---- 日期预设（第 5 阶段） ----
+    // 筛选时相对“今天”解析的窗口，因此保存的
+    // 布局明天依然有效。解析为包含端点的日期范围。
+    // 0 关闭，1 今天，2 昨天，3 本周（从周日算起），4 最近 7 天，
+    // 5 本月，6 最近 30 天，7 本季度，8 今年，9 年初至今，
+    // 10 过去（今天之前），11 未来（今天之后）
+    int datePreset;
+
+    // ---- Top-N（第 6 阶段，作用于整个集合而非逐行） ----
+    // 0 关闭，1 前 N，2 后 N，3 前 N%，4 后 N%，
+    // 5 高于平均值，6 低于平均值
+    int topMode;
+    int topN;
+
+    ColFilter() {
+        this.hidden = new List<string>();
+        this.textMode = 1;
+        this.textQuery = "";
+        this.batchTerms = new List<string>();
+        this.batchExact = false;
+        this.batchKeep = true;
+        this.cmpMode = 0;
+        this.cmpA = "";
+        this.cmpB = "";
+        this.datePreset = 0;
+        this.topMode = 0;
+        this.topN = 10;
+    }
+
+    public bool IsHidden(string v) {
+        return hidden.Contains(v);
+    }
+
+    public void Toggle(string v) {
+        int idx = hidden.IndexOf(v);
+        if (idx >= 0) {
+            hidden.RemoveAt(idx);
+        } else {
+            hidden.Add(v);
+        }
+    }
+
+    public bool Active() {
+        if (hidden.Count > 0) { return true; }
+        if (textQuery.Length > 0) { return true; }
+        if (batchTerms.Count > 0) { return true; }
+        if (cmpMode != 0) { return true; }
+        if (datePreset != 0) { return true; }
+        if (topMode != 0) { return true; }
+        return false;
+    }
+
+    // 此过滤器是否需要在决定前取得整个过滤集合
+    // （Top-N 和高于/低于平均值），而不是逐行判断。
+    bool NeedsSetPass() { return topMode != 0; }
+
+    // 移除所有阶段，恢复列为不过滤状态。
+    public void Reset() {
+        hidden.Clear();
+        textMode = 1;
+        textQuery = "";
+        batchTerms.Clear();
+        batchExact = false;
+        batchKeep = true;
+        cmpMode = 0;
+        cmpA = "";
+        cmpB = "";
+        datePreset = 0;
+        topMode = 0;
+        topN = 10;
+    }
+}
+
+// 列汇总聚合状态强类型实体（消除 aggMode/aggValue/aggReal/summaryText 平行列表反模式）。
+public class ColumnAggregateState {
+    public int mode;
+    public int value;
+    public double realValue;
+    public string summaryText;
+
+    public ColumnAggregateState() {
+        this.mode = 0;
+        this.value = 0;
+        this.realValue = 0.0;
+        this.summaryText = "";
+    }
+
+    public ColumnAggregateState(int mode, int value, double realValue, string summaryText) {
+        this.mode = mode;
+        this.value = value;
+        this.realValue = realValue;
+        this.summaryText = summaryText != null ? summaryText : "";
+    }
+}
+
+// 列条件格式范围与极值统计实体（消除 cfMin/cfMax 与 cfMinR/cfMaxR 平行列表反模式）。
+public class ColumnCfExtents {
+    public int min;
+    public int max;
+    public double minReal;
+    public double maxReal;
+
+    public ColumnCfExtents() {
+        this.min = 0;
+        this.max = 0;
+        this.minReal = 0.0;
+        this.maxReal = 0.0;
+    }
+
+    public ColumnCfExtents(int min, int max, double minReal, double maxReal) {
+        this.min = min;
+        this.max = max;
+        this.minReal = minReal;
+        this.maxReal = maxReal;
+    }
+}
+
+// DataTable 列级条件格式规则实体（消除 menuCfMode/menuCfColor 等平行列表反模式）。
+public class ColumnCfRule {
+    public int mode;
+    public int color;
+    public int color2;
+    public int threshold;
+    public bool rankPct;
+    public bool off;
+
+    public ColumnCfRule() {
+        this.mode = 0;
+        this.color = 0;
+        this.color2 = 0;
+        this.threshold = 0;
+        this.rankPct = false;
+        this.off = false;
+    }
+
+    public static ColumnCfRule Create() {
+        return new ColumnCfRule();
+    }
+}
+
+// 当前渲染中一个可见列的几何信息。`column` 是
+// DataColumn 索引；`band` 为 0 左侧冻结、1 滚动或 2 右侧冻结。
+public class FrameColumn {
+    int column;
+    int x;
+    int band;
+
+    FrameColumn(int c, int xx, int b) {
+        column = c;
+        x = xx;
+        band = b;
+    }
+}
+
+// DataTable 列的稳定身份和类型描述。DataColumn 仍是现有渲染/编辑
+// 配置的兼容入口；SchemaColumn 用于新查询、缓存和扩展能力。
+public class SchemaColumn {
+    string id;
+    string field;
+    int valueType;
+    string rendererId;
+    string editorId;
+    bool nullable;
+
+    // 构造列描述：渲染器/编辑器默认 "text"，默认可空。
+    SchemaColumn(string columnId, string fieldName, int kind) {
+        this.id = columnId;
+        this.field = fieldName;
+        this.valueType = kind;
+        this.rendererId = "text";
+        this.editorId = "text";
+        this.nullable = true;
+    }
+
+    // 列稳定标识。
+    string Id() { return this.id; }
+    // 数据字段名（cell 增量按名寻址）。
+    string Field() { return this.field; }
+    // 值类型，按 TableValue 的 kind 编号（0 null、1 text、2 int、3 real、4 bool、5 day）。
+    int ValueType() { return this.valueType; }
+    // 列是否允许空值。
+    bool Nullable() { return this.nullable; }
+}

@@ -1,0 +1,625 @@
+using Gui.Component.DataTable;
+using Gui.Widget;
+using Gui;
+using System.Data.Excel;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System;
+
+namespace Gui.Component.DataTable;
+
+// 页缓存条目：页键、结果与估算字节占用。pinned 的页不参与
+// 淘汰；lastUse 记录最近使用的时钟值，供 LRU 比较。
+public class DataPageCacheEntry {
+    DataPageKey key;
+    QueryResult result;
+    int bytes;
+    bool pinned;
+    int lastUse;
+
+    // 构造条目；pinned 初始为 false，lastUse 取时钟 stamp。
+    DataPageCacheEntry(DataPageKey pageKey, QueryResult page,
+                       int byteSize, int stamp) {
+        this.key = pageKey;
+        this.result = page;
+        this.bytes = byteSize;
+        this.pinned = false;
+        this.lastUse = stamp;
+    }
+
+    // 页键。
+    DataPageKey Key() { return this.key; }
+    // 缓存的页结果。
+    QueryResult Result() { return this.result; }
+    // 估算字节占用。
+    int Bytes() { return this.bytes; }
+    // 是否被固定（不参与淘汰）。
+    bool Pinned() { return this.pinned; }
+    // 最近使用的时钟值。
+    int LastUse() { return this.lastUse; }
+}
+
+// 页缓存的完整身份。仅使用 start 会把不同查询的同一页错误复用；
+// query/schema/server revision 均属于内容身份。
+public class DataPageKey {
+    string dataset;
+    string queryText;
+    int queryHash;
+    int schemaVersion;
+    int serverRevision;
+    int generation;
+    int start;
+    int size;
+    string cursor;
+
+    // 内部构造；文本字段 null 记空串。
+    DataPageKey(string name, string canonical, int hash, int schema, int server,
+                int gen, int at, int pageSize, string token) {
+        this.dataset = name;
+        if (this.dataset == null) { this.dataset = ""; }
+        this.queryText = canonical;
+        if (this.queryText == null) { this.queryText = ""; }
+        this.queryHash = hash;
+        this.schemaVersion = schema;
+        this.serverRevision = server;
+        this.generation = gen;
+        this.start = at;
+        this.size = pageSize;
+        this.cursor = token;
+        if (this.cursor == null) { this.cursor = ""; }
+    }
+
+    // 以 token 携带的 generation/schema/server 身份构造页键；
+    // token 为 null 时三者取 0。
+    public static DataPageKey Of(QueryDescriptor query, QueryViewport viewport,
+                          QueryRequestToken token) {
+        int gen = 0;
+        int schema = 0;
+        int server = 0;
+        if (token != null) {
+            gen = token.Generation();
+            schema = token.SchemaVersion();
+            server = token.ServerRevision();
+        }
+        return DataPageKey.For(query, viewport, gen, schema, server);
+    }
+
+    // 以显式身份字段构造页键；query/viewport 为 null 时相应字段取零值。
+    public static DataPageKey For(QueryDescriptor query, QueryViewport viewport,
+                           int gen, int schema, int server) {
+        string name = "";
+        string canonical = "";
+        int hash = 0;
+        if (query != null) {
+            name = query.Dataset();
+            canonical = query.QueryJson();
+            hash = query.QueryFingerprint();
+        }
+        int at = 0;
+        int size = 1;
+        string cursor = "";
+        if (viewport != null) {
+            at = viewport.Start();
+            size = viewport.Count();
+            cursor = viewport.Cursor();
+        }
+        return new DataPageKey(name, canonical, hash, schema, server,
+            gen, at, size, cursor);
+    }
+
+    // 数据集名。
+    string Dataset() { return this.dataset; }
+    // canonical 查询文本。
+    string QueryText() { return this.queryText; }
+    // 查询指纹。
+    int QueryHash() { return this.queryHash; }
+    // schema 版本。
+    int SchemaVersion() { return this.schemaVersion; }
+    // 服务端 revision。
+    int ServerRevision() { return this.serverRevision; }
+    // 源 generation。
+    int Generation() { return this.generation; }
+    // 页起始行。
+    int Start() { return this.start; }
+    // 页大小。
+    int Size() { return this.size; }
+    // 续页 token。
+    string Cursor() { return this.cursor; }
+
+    // 九个身份字段全部相等才算同一页；other 为 null 返回 false。
+    public bool Same(DataPageKey other) {
+        if (other == null) { return false; }
+        return this.dataset == other.dataset
+            && this.queryText == other.queryText
+            && this.queryHash == other.queryHash
+            && this.schemaVersion == other.schemaVersion
+            && this.serverRevision == other.serverRevision
+            && this.generation == other.generation
+            && this.start == other.start
+            && this.size == other.size
+            && this.cursor == other.cursor;
+    }
+}
+
+// 稀疏页服务端数据源：与旧的连续前缀 ServerDataSource 并存，
+// 允许已知总数时直接请求中间或尾部页，不把未加载区域误当成
+// 空字符串数据。每个页独立记录 Empty/Loading/Ready/Error 状态，
+// 同一时刻最多一个 in-flight 请求；generation 变化后旧响应直接丢弃。
+// 同步子类只需实现 FillPage；真正异步的子类重写 FetchPage，
+// 在完成路径调用 FinishPage(rows, count, total, generation)。
+public class SparseServerPage {
+    int start;
+    int count;
+    int total;
+    int generation;
+    int state;  // 0 empty, 1 loading, 2 ready, 3 error
+    List<DataRow> rows;
+
+    // 构造空页（state=0），total 未知。
+    SparseServerPage(int at, int gen) {
+        this.start = at;
+        this.count = 0;
+        this.total = -1;
+        this.generation = gen;
+        this.state = 0;
+        this.rows = new List<DataRow>();
+    }
+
+    // 页处于 Ready 且覆盖 row 时为 true。
+    public bool Covers(int row) {
+        return this.state == 2 && row >= this.start
+            && row < this.start + this.count;
+    }
+}
+
+// DataTable 导出的进度/取消钩子。回调都在后台写盘线程上发生：
+// OnStart 一次、OnProgress 约每 512 行一次、OnDone 一次；
+// Cancelled() 每行都会问一次（请保持便宜，例如读一个原子标志）。
+// 要更新 UI 控件，在回调里用 App.Post 把工作切回 UI 线程——不要
+// 直接碰控件。不需要进度/取消时传 null 即可（同步导出就是这么
+// 用的）。
+public class DataTableExportProgress {
+    // 开始写盘。`totalRows` 为总行数（含表头行）。
+    virtual void OnStart(int totalRows) { }
+
+    // 进度：已完成 `doneRows` / `totalRows` 行。
+    virtual void OnProgress(int doneRows, int totalRows) { }
+
+    // 结束。`ok` 为 false 时 `error` 给出原因
+    // （"已取消" / "已有导出在运行" / I/O 错误消息）。
+    virtual void OnDone(bool ok, string error) { }
+
+    // 返回 true 中止导出：半成品文件被删除，随后
+    // OnDone(false, "已取消")。
+    virtual bool Cancelled() { return false; }
+}
+
+// 导出行集快照：UI 线程上一次性冻结的列区间与行序。
+public class DataTableExportSnapshot {
+    public List<int> rows;
+    public int c0;
+    public int c1;
+    public CellSpanProvider spanProvider;
+}
+
+// DataTable 导出进度弹层：ExportToXlsxAsyncUi / ExportToCsvAsyncUi
+// 启动后台导出时在表格上叠一个居中模态卡片——进度条 + 百分比 +
+// 行数计数，运行中可取消，结束给出结果与关闭按钮。
+// `DataTableExportUi` 是弹层的全部状态，挂在 <c>st.exportUi</c>，
+// 只在 UI 线程读写。后台写盘线程不触碰它：进度回调只写
+// <see cref="DataTableUiExportProgress"/> 的静态暂存，渲染循环
+// 每帧开头经 <see cref="DataTableUiExportProgress.SyncUi"/> 拉取
+// 同步——与画廊此前手搓的静态镜像同纪律，只是收进了组件。
+// <c>cancel</c> 是唯一的反向通道：UI 线程写、写盘线程每行询问。
+public class DataTableExportUi {
+    public bool visible;  // 弹层显示中（运行中，或完成待关闭）
+    public bool finished;  // 写盘已结束（ok/message 有效）
+    public bool ok;  // finished 时的结果
+    public string message;  // 失败/取消原因（ok 时为空）
+    public string path;  // 目标文件路径
+    public int done;  // 已完成行数
+    public int total;  // 总行数（含表头行，OnStart 给出）
+    public weak App app;  // 宿主应用（进度推进时请求重绘）
+    public AtomicInt cancel = new AtomicInt(0);
+}
+
+// 内置进度实现：后台回调只写静态暂存，UI 线程每帧拉取。
+// 进程内同一时刻至多一个导出（Export.zan 的 sExportBusy 原子门），
+// 静态槽因此安全。
+public class DataTableUiExportProgress : DataTableExportProgress {
+    // 当前弹层状态（包装入口 Bind；Cancelled 在后台线程读取）。
+    public static DataTableExportUi ui;
+    static int sDone;
+    static int sTotal;
+    static bool sOk;
+    static string sMsg;
+    static bool sFinished;
+
+    // 包装入口在启动导出前登记状态对象并复位暂存。
+    public static void Bind(DataTableExportUi target) {
+        DataTableUiExportProgress.ui = target;
+        DataTableUiExportProgress.sDone = 0;
+        DataTableUiExportProgress.sTotal = 0;
+        DataTableUiExportProgress.sOk = false;
+        DataTableUiExportProgress.sMsg = "";
+        DataTableUiExportProgress.sFinished = false;
+    }
+
+    public override void OnStart(int totalRows) {
+        DataTableUiExportProgress.sDone = 0;
+        DataTableUiExportProgress.sTotal = totalRows;
+    }
+
+    public override void OnProgress(int doneRows, int totalRows) {
+        DataTableUiExportProgress.sDone = doneRows;
+        DataTableUiExportProgress.sTotal = totalRows;
+    }
+
+    public override void OnDone(bool ok, string error) {
+        DataTableUiExportProgress.sOk = ok;
+        DataTableUiExportProgress.sMsg = error;
+        DataTableUiExportProgress.sFinished = true;
+    }
+
+    public override bool Cancelled() {
+        return DataTableUiExportProgress.ui != null
+            && DataTableUiExportProgress.ui.cancel.Load() != 0;
+    }
+
+    // UI 线程：渲染弹层前把后台暂存拉取进弹层状态。完成态只在
+    // 首次到达时提交（message/ok 不被后续帧改写）。
+    public static void SyncUi() {
+        DataTableExportUi u = DataTableUiExportProgress.ui;
+        if (u == null) { return; }
+        u.done = DataTableUiExportProgress.sDone;
+        u.total = DataTableUiExportProgress.sTotal;
+        if (DataTableUiExportProgress.sFinished && !u.finished) {
+            u.finished = true;
+            u.ok = DataTableUiExportProgress.sOk;
+            u.message = DataTableUiExportProgress.sMsg;
+        }
+    }
+}
+
+// 后台导出任务。Zan 的委托不能捕获局部变量或绑定 this，线程
+// 入口必须是静态方法——任务本体放在 <see cref="DataTable"/>
+// 的静态槽里（进程内同一时刻至多一个导出），Worker 从槽里取。
+// 与 DownloadJob 同一范式。
+public class ExportJob {
+    // 1 = xlsx，2 = csv。
+    public int kind;
+    public DataTableExportSnapshot snap;
+    public List<DataColumn> cols;
+    public DataSource src;
+    public string path;
+    public DataTableExportProgress progress;
+
+    // 线程入口：从静态槽取任务按 kind 分派写盘，结束后清槽并
+    // 释放忙标志。异常经 OnDone(false, 异常消息) 上报。
+    // 注意：这里绝不能拼 DataTableXlsx/Xlsx* 类型——本文件随
+    // partial 家族进每个放表格的程序，一拼就把 XlsxBook/Zip/
+    // Deflate 写盘家族拖回去。xlsx 分派经 vtable 化的
+    // 委托槽走：DataTableXlsx.ExportToXlsxAsync 启动任务时把
+    // 写盘核心装进 sXlsxCore，未装 = xlsx 支路不在图，走 null
+    // 报错路径（调用方是 ExportToXlsx*，自身即证明已拉入）。
+    public static void Worker() {
+        ExportJob j = DataTable.sExportJob;
+        try {
+            if (j.kind == 1) {
+                Func<bool> core = DataTable.sXlsxCore;
+                if (core != null) { core(); }
+                else if (j.progress != null) { j.progress.OnDone(false, "no xlsx writer"); }
+            } else {
+                DataTable.ExportCsvSnapshot(j.snap, j.cols, j.src, j.path, j.progress);
+            }
+        } catch (Exception ex) {
+            if (j.progress != null) { j.progress.OnDone(false, ex.Message); }
+        }
+        DataTable.sExportJob = null;
+        DataTable.sExportBusy.Store(0);
+    }
+}
+
+// Excel 式选区填充柄（Fill Handle）拖拽状态聚类实体。
+// 收敛原平铺在 DataTableState 中的 fill* 状态字段。
+public class DataTableFillState {
+    public bool drag;
+    public int hx;
+    public int hy;
+    public int sr0;
+    public int sc0;
+    public int sr1;
+    public int sc1;
+    public int tr0;
+    public int tc0;
+    public int tr1;
+    public int tc1;
+
+    public DataTableFillState() {
+        this.drag = false;
+        this.hx = -1;
+        this.hy = -1;
+        this.sr0 = -1;
+        this.sc0 = -1;
+        this.sr1 = -1;
+        this.sc1 = -1;
+        this.tr0 = 0;
+        this.tc0 = 0;
+        this.tr1 = -1;
+        this.tc1 = -1;
+    }
+
+    public void Reset() {
+        this.drag = false;
+        this.hx = -1;
+        this.hy = -1;
+        this.sr0 = -1;
+        this.sc0 = -1;
+        this.sr1 = -1;
+        this.sc1 = -1;
+        this.tr0 = 0;
+        this.tc0 = 0;
+        this.tr1 = -1;
+        this.tc1 = -1;
+    }
+}
+
+// 透视表（Pivot View）运行时状态聚类实体。
+// 收敛原平铺在 DataTableState 中的 pv* 状态字段，提升内聚性并支持独立重置。
+public class DataTablePivotState {
+    public int rowCol;
+    public int colDim;
+    public int valueCol;
+    public List<string> rowKeys;
+    public List<string> colKeys;
+    public List<double> cells;
+    public List<double> rowTot;
+    public List<double> cellSum;
+    public List<int> cellCnt;
+    public List<double> cellMx;
+    public List<double> cellMn;
+    public List<DataColumn> viewCols;
+    public DataSource inner;
+    public PivotDataSource source;
+    public bool dirty;
+    public int origCols;
+    public List<DataColumn> origColsList;
+    public List<ColFilter> savedFilters;
+    public List<string> savedFilterRowText;
+    public List<int> savedGroupCols;
+    public List<SortKey> savedSortKeys;
+    public bool savedSummary;
+    public string rowTitle;
+    public string colTitle;
+    public string valTitle;
+
+    public DataTablePivotState() {
+        this.rowCol = -1;
+        this.colDim = -1;
+        this.valueCol = -1;
+        this.rowKeys = new List<string>();
+        this.colKeys = new List<string>();
+        this.cells = new List<double>();
+        this.rowTot = new List<double>();
+        this.cellSum = new List<double>();
+        this.cellCnt = new List<int>();
+        this.cellMx = new List<double>();
+        this.cellMn = new List<double>();
+        this.viewCols = new List<DataColumn>();
+        this.inner = null;
+        this.source = null;
+        this.dirty = false;
+        this.origCols = 0;
+        this.origColsList = null;
+        this.savedFilters = null;
+        this.savedFilterRowText = null;
+        this.savedGroupCols = null;
+        this.savedSortKeys = null;
+        this.savedSummary = false;
+        this.rowTitle = "";
+        this.colTitle = "";
+        this.valTitle = "";
+    }
+
+    public void Reset() {
+        this.rowCol = -1;
+        this.colDim = -1;
+        this.valueCol = -1;
+        this.rowKeys.Clear();
+        this.colKeys.Clear();
+        this.cells.Clear();
+        this.rowTot.Clear();
+        this.cellSum.Clear();
+        this.cellCnt.Clear();
+        this.cellMx.Clear();
+        this.cellMn.Clear();
+        this.viewCols.Clear();
+        this.inner = null;
+        this.source = null;
+        this.dirty = false;
+        this.origCols = 0;
+        this.origColsList = null;
+        this.savedFilters = null;
+        this.savedFilterRowText = null;
+        this.savedGroupCols = null;
+        this.savedSortKeys = null;
+        this.savedSummary = false;
+        this.rowTitle = "";
+        this.colTitle = "";
+        this.valTitle = "";
+    }
+}
+
+// <see cref="XlsxRowSource"/> 适配器：把快照 + DataSource 逐行喂给
+// 流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
+// CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
+// 数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
+public class DataTableRowSource : XlsxRowSource {
+    public DataSource src;
+    public List<DataColumn> cols;
+    public DataTableExportSnapshot snap;
+    public DataTableExportProgress progress;
+    public int headerRows;
+
+    public int GetHeaderRows() {
+        if (this.headerRows > 0) { return this.headerRows; }
+        return 1;
+    }
+
+    // 行数 = 快照行数 + 表头行数（支持多级表头）。
+    override int RowCount() { return this.snap.rows.Count + this.GetHeaderRows(); }
+
+    public void FillHeaderRow(int index, List<XlsxCell> row) {
+        int hRows = this.GetHeaderRows();
+        for (int cc = this.snap.c0; cc <= this.snap.c1 && cc < this.cols.Count; cc = cc + 1) {
+            DataColumn col = this.cols[cc];
+            string path = col.band;
+            int d = DataTable.BandDepth(path);
+            if (d == 0) {
+                if (index == 0) {
+                    row.Add(XlsxCell.Str(col.title));
+                } else {
+                    row.Add(XlsxCell.Str(""));
+                }
+            } else {
+                if (index < d) {
+                    string pCur = DataTable.BandPrefix(path, index + 1);
+                    bool isSecondary = false;
+                    if (cc > this.snap.c0) {
+                        string pPrev = DataTable.BandPrefix(this.cols[cc - 1].band, index + 1);
+                        if (pCur == pPrev && pCur != "") {
+                            isSecondary = true;
+                        }
+                    }
+                    if (isSecondary) {
+                        row.Add(XlsxCell.Str(""));
+                    } else {
+                        List<string> parts = path.Split("/");
+                        string seg = index < parts.Count ? parts[index] : "";
+                        row.Add(XlsxCell.Str(seg));
+                    }
+                } else if (index == d) {
+                    row.Add(XlsxCell.Str(col.title));
+                } else {
+                    row.Add(XlsxCell.Str(""));
+                }
+            }
+        }
+    }
+
+    // index < headerRows 写表头，其余按快照行序逐格写出数据行。
+    override bool FillRow(int index, List<XlsxCell> row) {
+        int hRows = this.GetHeaderRows();
+        if (index < hRows) {
+            this.FillHeaderRow(index, row);
+            return true;
+        }
+        int ri = this.snap.rows[index - hRows];
+        for (int cc = this.snap.c0; cc <= this.snap.c1 && cc < this.cols.Count; cc = cc + 1) {
+            row.Add(DataTableXlsx.ExportCell(cc, this.cols, this.cols[cc], this.src, ri));
+        }
+        return true;
+    }
+
+    // 把写盘进度转发给调用方钩子；未挂接 progress 时忽略。
+    override void OnProgress(int done, int total) {
+        if (this.progress != null) { this.progress.OnProgress(done, total); }
+    }
+
+    // 把取消询问转发给调用方钩子；未挂接 progress 时恒不取消。
+    override bool Cancelled() {
+        return this.progress != null && this.progress.Cancelled();
+    }
+}
+
+// 帧级样式快照（Style Snapshot）：
+// 一次性解析并缓存当前主题下 DataTable 绘制所需的全部 StyleBox，
+// 避免在虚拟滚动行循环与各管道子阶段中重复触发样式表查找与字典哈希计算。
+public class DataTableStyleSnapshot {
+    public StyleBox surface;
+    public StyleBox header;
+    public StyleBox icon;
+    public StyleBox iconSel;
+    public StyleBox bandHdr;
+    public StyleBox accent;
+    public StyleBox row;
+    public StyleBox rowStriped;
+    public StyleBox rowHover;
+    public StyleBox rowSel;
+    public StyleBox groupRow;
+    public StyleBox detail;
+    public StyleBox hint;
+    public StyleBox cellBox;
+    public StyleBox grid;
+    public StyleBox toast;
+
+    public DataTableStyleSnapshot() { }
+
+    public static DataTableStyleSnapshot Create(App app) {
+        DataTableStyleSnapshot ss = new DataTableStyleSnapshot();
+        ss.surface = Style.Full(app, "datatable", "", "", Style.SNormal());
+        ss.header = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
+        ss.icon = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
+        ss.iconSel = Style.Part(app, "datatable", "icon", "", "", "", Style.SSelected());
+        ss.bandHdr = Style.Part(app, "datatable", "band", "", "", "", Style.SNormal());
+        ss.accent = Style.Part(app, "datatable", "accent", "", "", "", Style.SNormal());
+        ss.row = Style.Part(app, "datatable", "row", "", "", "", Style.SNormal());
+        ss.rowStriped = Style.Part(app, "datatable", "row", "", "striped", "", Style.SNormal());
+        ss.rowHover = Style.Part(app, "datatable", "row", "", "", "", Style.SHover());
+        ss.rowSel = Style.Part(app, "datatable", "row", "", "", "", Style.SSelected());
+        ss.groupRow = Style.Part(app, "datatable", "group-row", "", "", "", Style.SNormal());
+        ss.detail = Style.Part(app, "datatable", "detail", "", "", "", Style.SNormal());
+        ss.hint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
+        ss.cellBox = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+        ss.grid = Style.Part(app, "datatable", "grid", "", "", "", Style.SNormal());
+        ss.toast = Style.Part(app, "datatable", "toast", "", "", "", Style.SNormal());
+        return ss;
+    }
+}
+
+// 撤销/重做日志与行事务编辑状态聚类实体。
+// 收敛原平铺在 DataTableState 中的 undo* / redo* 状态字段。
+public class DataTableUndoState {
+    public List<RowEdit> undoLog;
+    public List<RowEdit> redoLog;
+    public int undoLimit;
+    public bool undoing;
+    public int lastAddedRow;
+    public int undoGroup;
+    public int undoGroupSeq;
+
+    public DataTableUndoState() {
+        this.undoLog = new List<RowEdit>();
+        this.redoLog = new List<RowEdit>();
+        this.undoLimit = 100;
+        this.undoing = false;
+        this.lastAddedRow = -1;
+        this.undoGroup = 0;
+        this.undoGroupSeq = 0;
+    }
+
+    public void Clear() {
+        this.undoLog.Clear();
+        this.redoLog.Clear();
+        this.undoing = false;
+        this.lastAddedRow = -1;
+        this.undoGroup = 0;
+        this.undoGroupSeq = 0;
+    }
+}
+
+// 控件池槽位实体（消除 poolKeys / poolCtl 平行列表反模式，并将行级列定义与状态与槽位实例绑定，消除单例脏状态）。
+public class WidgetPoolSlot {
+    public string key;
+    public Control ctl;
+    public DataColumn col;
+    public string lastVal;
+
+    public WidgetPoolSlot(string key, Control ctl) {
+        this.key = key != null ? key : "";
+        this.ctl = ctl;
+        this.col = null;
+        this.lastVal = "";
+    }
+}

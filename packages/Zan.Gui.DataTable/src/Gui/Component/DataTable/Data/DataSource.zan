@@ -112,4 +112,64 @@ public class DataSource {
     // 服务端缓存源）重写它；应用完成后源自行刷新页与缓存，
     // 网格经由 Poll 感知变化。见 DataTable.Realtime.zan。
     public virtual DeltaResult ApplyDeltas(DeltaBatch batch) { return null; }
+
+    protected virtual int ResolveDeltaRow(List<DataRow> list, string canonical) {
+        for (int r = 0; r < list.Count; r = r + 1) {
+            if (RowKey.Legacy(r).Canonical() == canonical) { return r; }
+        }
+        return -1;
+    }
+
+    protected DeltaResult ApplyDeltasToRows(List<DataRow> list, DeltaBatch batch,
+                                            CellFieldLookup fieldLookup, bool numericFallback) {
+        if (batch == null) { return null; }
+        batch.Compress();
+        DeltaResult result = DeltaResult.Create();
+        for (int i = 0; i < batch.Count(); i = i + 1) {
+            DeltaOp op = batch.At(i);
+            int at = this.ResolveDeltaRow(list, op.Key());
+            if (op.Kind() == DeltaOp.Remove) {
+                if (at >= 0) {
+                    list.RemoveAt(at);
+                    result.removed = result.removed + 1;
+                }
+            } else if (op.Kind() == DeltaOp.Upsert) {
+                List<string> values = op.Cells();
+                if (at >= 0) {
+                    DataRow existing = list[at];
+                    for (int c = 0; c < values.Count; c = c + 1) { existing.Set(c, values[c]); }
+                    result.updated = result.updated + 1;
+                } else {
+                    DataRow fresh = new DataRow();
+                    for (int c = 0; c < values.Count; c = c + 1) { fresh.Set(c, values[c]); }
+                    list.Add(fresh);
+                    result.inserted = result.inserted + 1;
+                }
+            } else if (op.Kind() == DeltaOp.Cell) {
+                if (at < 0) { result.missing = result.missing + 1; continue; }
+                int col = -1;
+                int rowCols = list[at].Count();
+                if (fieldLookup != null) {
+                    for (int c = 0; c < rowCols; c = c + 1) {
+                        if (fieldLookup(c) == op.Field()) { col = c; break; }
+                    }
+                } else if (numericFallback) {
+                    string fld = op.Field();
+                    bool numeric = fld.Length > 0;
+                    for (int k = 0; k < fld.Length; k = k + 1) {
+                        int cc = (int)fld[k];
+                        if (cc < 48 || cc > 57) { numeric = false; break; }
+                    }
+                    if (numeric) {
+                        col = DataTable.ParseInt(fld);
+                        if (col >= rowCols) { col = -1; }
+                    }
+                }
+                if (col < 0) { result.missing = result.missing + 1; continue; }
+                list[at].Set(col, op.Value());
+                result.cells = result.cells + 1;
+            }
+        }
+        return result;
+    }
 }

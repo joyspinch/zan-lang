@@ -1,0 +1,184 @@
+using Gui;
+using System.Json;
+using System;
+
+namespace Gui.Component.Chart;
+
+internal class ChartTimelineLayout {
+    internal Rect play;
+    internal Rect previous;
+    internal Rect next;
+    internal Rect track;
+    internal List<Rect> dots;
+    internal int dotRadius;
+    internal int dotY;
+
+    internal static ChartTimelineLayout Create(App app, int x, int y, int w, int count) {
+        ChartTimelineLayout layout = new ChartTimelineLayout();
+        int height = ChartTimeline.Height(app);
+        int button = app.Scale(18);
+        int gap = app.Scale(2);
+        int by = y + (height - button) / 2;
+        layout.play = new Rect(x, by, button, button);
+        layout.previous = new Rect(x + button + gap, by, button, button);
+        int trackX = x + button * 2 + gap * 3;
+        int trackWidth = x + w - button - gap * 2 - app.Scale(56) - trackX;
+        layout.dotRadius = app.Scale(3);
+        int diameter = layout.dotRadius * 2 + app.Scale(4);
+        if (trackWidth < diameter && count > 0) { trackWidth = diameter; }
+        layout.dotY = y + height / 2;
+        layout.track = new Rect(trackX, layout.dotY - app.Scale(1), trackWidth, app.Scale(2));
+        layout.next = new Rect(trackX + trackWidth + gap * 2, by, button, button);
+        layout.dots = new List<Rect>();
+        for (int i = 0; i < count; i = i + 1) {
+            int cx = trackX + i * trackWidth / (count > 1 ? count - 1 : 1);
+            layout.dots.Add(new Rect(cx - diameter / 2, layout.dotY - diameter / 2, diameter, diameter));
+        }
+        return layout;
+    }
+}
+
+// App 持有参与者，参与者只弱借时间轴，避免控件与循环票据成环。
+internal class ChartTimelinePlayback : AppLoopParticipant, AppPreparationParticipant, AppLoopStopped {
+    internal weak ChartTimeline owner;
+
+    internal ChartTimelinePlayback(ChartTimeline timeline) { owner = timeline; }
+
+    public int NextDeadline() {
+        ChartTimeline timeline = owner;
+        return timeline != null ? timeline.PlaybackDeadline() : -1;
+    }
+
+    public void Tick(App app, int now) {
+        ChartTimeline timeline = owner;
+        if (timeline != null) { timeline.TickPlayback(app, now); }
+    }
+
+    public void BeforeInput(App app, int kind) { this.Prepare(app); }
+    public void BeforePaint(App app, int sequence) { this.Prepare(app); }
+
+    void Prepare(App app) {
+        ChartTimeline timeline = owner;
+        if (timeline != null) { timeline.PrepareTimeline(app); }
+    }
+
+    public void Stopped(App app) {
+        ChartTimeline timeline = owner;
+        if (timeline != null) { timeline.StopPlayback(app); }
+    }
+}
+
+internal class ChartToolboxLayout {
+    internal List<int> actions;
+    internal int x;
+    internal int y;
+    internal int width;
+    internal int button;
+    internal int gap;
+
+    internal static ChartToolboxLayout Create(App app, ChartOption option, int x, int y, int width) {
+        ChartToolboxLayout layout = new ChartToolboxLayout();
+        layout.actions = ChartToolbox.Actions(option);
+        layout.button = ChartToolbox.Btn(app);
+        layout.gap = ChartToolbox.Gap(app);
+        int count = layout.actions.Count;
+        layout.width = count > 0 ? count * layout.button + (count - 1) * layout.gap : 0;
+        layout.x = x + width - ChartToolbox.Pad(app) - layout.width;
+        layout.y = y + ChartToolbox.Pad(app);
+        return layout;
+    }
+}
+
+internal class ChartGeoJsonTape {
+    public static List<ChartMapRegion> Parse(JsonDoc doc) {
+        // The lenient reader can stop before a value even when the tape accepts it.
+        if (doc.MaxValueDepth() > JsonReader.MaxDepth) { return null; }
+        List<ChartMapRegion> regions = new List<ChartMapRegion>();
+        int root = doc.root;
+        if (doc.KindAt(root) != 5) { return regions; }
+        int flag = doc.Get(root, "UTF8Encoding");
+        bool encoded = doc.KindAt(flag) == 2 && doc.ViewAt(flag).Length > 0
+        ? JsonValue.LongOf(doc.StrAt(flag, "")) != 0L : doc.BoolAt(flag, false);
+        int scale = ChartGeoJsonTape.IntAt(doc, doc.Get(root, "UTF8Scale"), 1024);
+        if (scale < 1) { scale = 1024; }
+
+        int features = doc.Get(root, "features");
+        if (doc.KindAt(features) == 4) {
+            int end = doc.NextSibling(features);
+            for (int f = doc.FirstChild(features); f < end; f = doc.NextSibling(f)) {
+                ChartGeoJsonTape.Feature(doc, f, encoded, scale, regions);
+            }
+        } else if (doc.StrEquals(doc.Get(root, "type"), "Feature")) {
+            ChartGeoJsonTape.Feature(doc, root, encoded, scale, regions);
+        }
+        return regions;
+    }
+
+    private static void Feature(JsonDoc doc, int f, bool encoded, int scale, List<ChartMapRegion> regions) {
+        int geo = doc.Get(f, "geometry");
+        int coords = doc.Get(geo, "coordinates");
+        if (doc.KindAt(coords) != 4 || doc.Count(coords) == 0) { return; }
+        int type = doc.Get(geo, "type");
+        int offsets = encoded ? doc.Get(geo, "encodeOffsets") : -1;
+        List<ChartMapRing> rings = new List<ChartMapRing>();
+        if (doc.StrEquals(type, "Polygon")) {
+            ChartGeoJsonTape.Polygon(doc, coords, offsets, encoded, scale, rings);
+        } else if (doc.StrEquals(type, "MultiPolygon")) {
+            int end = doc.NextSibling(coords);
+            int offEnd = doc.KindAt(offsets) == 4 ? doc.NextSibling(offsets) : -1;
+            int off = doc.FirstChild(offsets);
+            for (int p = doc.FirstChild(coords); p < end; p = doc.NextSibling(p)) {
+                ChartGeoJsonTape.Polygon(doc, p, off < offEnd ? off : -1, encoded, scale, rings);
+                if (off < offEnd) { off = doc.NextSibling(off); }
+            }
+        }
+        if (rings.Count == 0) { return; }
+        int props = doc.Get(f, "properties");
+        string name = doc.StrAt(doc.Get(props, "name"), "");
+        int value = ChartGeoJsonTape.IntAt(doc, doc.Get(props, "value"), 0);
+        regions.Add(ChartMapRegion.Of(name, value, rings));
+    }
+
+    private static void Polygon(JsonDoc doc, int rings, int offsets, bool encoded, int scale, List<ChartMapRing> into) {
+        if (doc.KindAt(rings) != 4) { return; }
+        int first = doc.FirstChild(rings);
+        int end = doc.NextSibling(rings);
+        int offEnd = doc.KindAt(offsets) == 4 ? doc.NextSibling(offsets) : -1;
+        int off = doc.FirstChild(offsets);
+        for (int r = first; r < end; r = doc.NextSibling(r)) {
+            List<ChartMapPoint> points = null;
+            if (doc.KindAt(r) == 4) {
+                points = ChartGeoJsonTape.ReadPoints(doc, r);
+            } else if (encoded && off < offEnd && doc.KindAt(off) == 4 && doc.Count(off) >= 2) {
+                int x = doc.FirstChild(off);
+                int y = doc.NextSibling(x);
+                points = ChartGeoJson.DecodeRing(doc.StrAt(r, ""),
+                ChartGeoJsonTape.IntAt(doc, x, 0), ChartGeoJsonTape.IntAt(doc, y, 0), scale);
+            }
+            if (points != null && points.Count >= 3) { into.Add(ChartMapRing.Of(points, r != first)); }
+            if (off < offEnd) { off = doc.NextSibling(off); }
+        }
+    }
+
+    private static List<ChartMapPoint> ReadPoints(JsonDoc doc, int ring) {
+        List<ChartMapPoint> points = new List<ChartMapPoint>();
+        int end = doc.NextSibling(ring);
+        for (int p = doc.FirstChild(ring); p < end; p = doc.NextSibling(p)) {
+            if (doc.KindAt(p) != 4 || doc.Count(p) < 2) { continue; }
+            int x = doc.FirstChild(p);
+            int y = doc.NextSibling(x);
+            ChartGeoJson.PushPoint(points, ChartGeoJson.QuantDeg(doc.DoubleAt(x, 0.0)),
+            0 - ChartGeoJson.QuantDeg(doc.DoubleAt(y, 0.0)));
+        }
+        return points;
+    }
+
+    private static int IntAt(JsonDoc doc, int at, int dflt) {
+        int kind = doc.KindAt(at);
+        // Preserve the DOM's integer-prefix coercion for decimals, exponents and long tokens.
+        if (kind == 3 || (kind == 2 && doc.ViewAt(at).Length > 0)) {
+            return JsonValue.IntOf(doc.StrAt(at, ""));
+        }
+        return doc.IntAt(at, dflt);
+    }
+}

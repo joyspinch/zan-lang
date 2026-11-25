@@ -261,75 +261,10 @@ public class ServerDataSource : DataSource {
     // 行数即 RowCount；已知时按需抬高。行键为 legacy 前缀源
     // 用 legacy:<row> 匹配。
     public override DeltaResult ApplyDeltas(DeltaBatch batch) {
-        if (batch == null) { return null; }
-        batch.Compress();
-        DeltaResult result = DeltaResult.Create();
-        bool changed = false;
-        for (int i = 0; i < batch.Count(); i = i + 1) {
-            DeltaOp op = batch.At(i);
-            string canonical = op.Key();
-            int at = -1;
-            for (int r = 0; r < this.cache.Count; r = r + 1) {
-                if (RowKey.Legacy(r).Canonical() == canonical) { at = r; r = this.cache.Count; }
-            }
-            if (op.Kind() == DeltaOp.Remove) {
-                if (at >= 0) {
-                    this.cache.RemoveAt(at);
-                    result.removed = result.removed + 1;
-                    changed = true;
-                }
-            } else if (op.Kind() == DeltaOp.Upsert) {
-                List<string> values = op.Cells();
-                if (at >= 0) {
-                    DataRow existing = this.cache[at];
-                    for (int c = 0; c < values.Count; c = c + 1) {
-                        existing.Set(c, values[c]);
-                    }
-                    result.updated = result.updated + 1;
-                } else {
-                    DataRow fresh = new DataRow();
-                    for (int c = 0; c < values.Count; c = c + 1) {
-                        fresh.Set(c, values[c]);
-                    }
-                    this.cache.Add(fresh);
-                    result.inserted = result.inserted + 1;
-                }
-                changed = true;
-            } else if (op.Kind() == DeltaOp.Cell) {
-                if (at < 0) { result.missing = result.missing + 1; continue; }
-                int col = -1;
-                if (this.cellFieldOf != null) {
-                    for (int c = 0; c < this.cache[at].Count(); c = c + 1) {
-                        if (this.cellFieldOf(c) == op.Field()) { col = c; c = this.cache[at].Count(); }
-                    }
-                } else {
-                    // 未安装查找时按"Field 是纯数字"解释为列索引。
-                    bool numeric = true;
-                    for (int k = 0; k < op.Field().Length; k = k + 1) {
-                        int cc = (int)op.Field()[k];
-                        if (cc < 48 || cc > 57) { numeric = false; k = op.Field().Length; }
-                    }
-                    if (numeric && op.Field().Length > 0) {
-                        col = DataTable.ParseInt(op.Field());
-                        if (col >= this.cache[at].Count()) { col = -1; }
-                    }
-                }
-                if (col < 0) { result.missing = result.missing + 1; continue; }
-                this.cache[at].Set(col, op.Value());
-                result.cells = result.cells + 1;
-                changed = true;
-            }
-        }
-        if (changed) {
-            if (this.knownTotal >= 0 && this.cache.Count > this.knownTotal) {
-                this.knownTotal = this.cache.Count;
-            }
-            if (this.knownTotal >= 0 && this.cache.Count < this.knownTotal) {
-                // 移除使前缀短于声明总数：总数跟随缓存，避免把
-                // 已删除区域当作未加载。服务器有新权威总数时应
-                // 显式 SetKnownTotal 覆盖。
-                this.knownTotal = this.cache.Count;
-            }
+        DeltaResult result = this.ApplyDeltasToRows(this.cache, batch, this.cellFieldOf, true);
+        if (result != null && result.inserted + result.updated + result.removed + result.cells > 0
+            && this.knownTotal >= 0) {
+            this.knownTotal = this.cache.Count;
         }
         return result;
     }

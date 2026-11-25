@@ -1,0 +1,905 @@
+using Gui;
+using System;
+
+namespace Gui.Component.Chart;
+
+internal class ChartPieGeometry {
+    internal PieLayout layout;
+    internal ChartLegendLayout legend;
+    internal int bodyY;
+    internal int areaW;
+    internal int areaH;
+    internal int rOuter;
+    internal int cx;
+    internal int cy;
+    internal int band;
+    internal int ringGap;
+    internal int[] geoX;
+    internal int[] geoY;
+    internal int[] geoRi;
+    internal int[] geoRo;
+
+    internal static ChartPieGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartPieGeometry geometry = new ChartPieGeometry();
+        geometry.Build(app, o, x, y, w, h);
+        return geometry;
+    }
+
+    void Build(App app, ChartOption o, int x, int y, int w, int h) {
+        int pad = app.theme.paddingMedium;
+        int top = o.overlay ? y + pad : Chart.HeadBandBottom(app, y, o.title);
+        layout = PieLayout.Of(app.theme, o);
+        legend = ChartLegendLayout.Pie(app, o, x, y, w, h, top);
+        bodyY = legend.bodyY;
+        int ringCount = layout.ringCount > 0 ? layout.ringCount : 1;
+        bool sliceLabels = o.pieLabels;
+        areaW = w - pad * 2;
+        areaH = (y + h - pad) - bodyY;
+        int pct = 72;
+        if (sliceLabels) { pct = 52; }
+        if (ringCount > 1) { pct = 64; }
+        rOuter = ChartView.RadialRadius(areaW, areaH, pct);
+        cx = x + pad + areaW / 2;
+        cy = bodyY + areaH / 2;
+
+        band = 0;
+        if (ringCount > 1) { band = rOuter / ringCount; }
+        if (band < app.Scale(2)) { band = app.Scale(2); }
+        if (ringCount > 1 && band * ringCount > rOuter) {
+            band = rOuter / ringCount;
+            if (band < 1) { band = 1; }
+        }
+        ringGap = app.Scale(2);
+        if (ringGap < 1) { ringGap = 1; }
+
+        // 逐环几何：有 center/radius 覆盖的环按自身圆心与内外径解析
+        // （% 相对面板 w/h 与 min(w,h)/2，px 走 GaugeScalar，ECharts
+        // 容器语义），其余环共享默认圆心与均分带边界。绘制、悬停、
+        // 标签、markPoint、中心标注、命中、emphasis 全部取自这里，
+        // 保证无覆盖路径与原 PieRingBounds 结果逐位一致。
+        geoX = new int[ringCount];
+        geoY = new int[ringCount];
+        geoRi = new int[ringCount];
+        geoRo = new int[ringCount];
+        int radExt = (w < h ? w : h) / 2;
+        for (int rg = 0; rg < ringCount; rg = rg + 1) {
+            int riG = 0;
+            int roG = 0;
+            ChartView.PieRingBounds(layout, rg, ringCount, rOuter, band,
+            ringGap, out riG, out roG);
+            int gxG = cx;
+            int gyG = cy;
+            if (layout.ringCenter != null && rg < layout.ringCenter.Count
+            && layout.ringCenter[rg] != null) {
+                gxG = x + ChartView.GaugeScalar(app, layout.ringCenter[rg].x, w);
+                gyG = y + ChartView.GaugeScalar(app, layout.ringCenter[rg].y, h);
+            }
+            if (layout.ringRadius != null && rg < layout.ringRadius.Count
+            && layout.ringRadius[rg] != null) {
+                roG = ChartView.GaugeScalar(app, layout.ringRadius[rg], radExt);
+                if (roG < 1) { roG = 1; }
+                int riN = 0;
+                if (layout.ringRadiusIn != null
+                && rg < layout.ringRadiusIn.Count
+                && layout.ringRadiusIn[rg] != null) {
+                    riN = ChartView.GaugeScalar(app, layout.ringRadiusIn[rg], radExt);
+                }
+                if (riN < 0) { riN = 0; }
+                if (riN >= roG) { riN = roG - 1; }
+                riG = riN;
+            }
+            geoX[rg] = gxG;
+            geoY[rg] = gyG;
+            geoRi[rg] = riG;
+            geoRo[rg] = roG;
+        }
+
+    }
+
+    internal int HitIndex(App app, ChartOption o, int mx, int my, int growth) {
+        if (my < bodyY) { return -1; }
+        int ringCount = geoX.Length;
+        for (int i = layout.slices.Count - 1; i >= 0; i = i - 1) {
+            PieSlice slice = layout.slices[i];
+            int ring = slice.ring;
+            if (ring < 0) { ring = 0; }
+            if (ring >= ringCount) { ring = ringCount - 1; }
+            int hx = geoX[ring]; int hy = geoY[ring];
+            if (slice.selected && slice.seriesIndex >= 0 && slice.seriesIndex < o.series.Count) {
+                int offset = app.Scale(ChartView.PieSelectedOffset(o.series[slice.seriesIndex].selectedOffset));
+                int middle = layout.rot + (slice.a0 + slice.a1) / 2;
+                hx = hx + ChartView.FillDx(middle) * offset / 1000;
+                hy = hy + ChartView.FillDy(middle) * offset / 1000;
+            }
+            int dx = mx - hx; int dy = my - hy;
+            int distance = ChartView.ISqrt(dx * dx + dy * dy);
+            int angle = ((ChartView.AngleOf(dx, dy) - layout.rot) % 360 + 360) % 360;
+            int end = slice.a1 < 360 * growth / 1000 ? slice.a1 : 360 * growth / 1000;
+            if (distance >= geoRi[ring] && distance < ChartView.PieSliceRo(geoRi[ring], geoRo[ring], slice.roseP)
+            && angle >= slice.a0 && angle < end) { return i; }
+        }
+        return -1;
+    }
+}
+
+internal class ChartGaugeGeometry {
+    internal List<int> xs = new List<int>();
+    internal List<int> ys = new List<int>();
+    internal List<int> radii = new List<int>();
+    internal List<int> seriesIndices = new List<int>();
+
+    internal static ChartGaugeGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartGaugeGeometry geometry = new ChartGaugeGeometry();
+        int pad = app.theme.paddingMedium;
+        int top = o.overlay ? y + pad : Chart.HeadBandBottom(app, y, o.title);
+        int bodyW = w - pad * 2;
+        int bodyH = y + h - pad - top;
+        int baseSize = bodyW < bodyH ? bodyW : bodyH;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            if (series.hidden || series.silent || series.type != ChartType.Gauge) { continue; }
+            GaugeOption gauge = series.gauge;
+            int radius = ChartView.GaugeScalar(app, gauge.radius, baseSize / 2);
+            if (radius < app.Scale(12)) { radius = app.Scale(12); }
+            geometry.xs.Add(x + pad + ChartView.GaugeScalar(app, gauge.center.x, bodyW));
+            geometry.ys.Add(top + ChartView.GaugeScalar(app, gauge.center.y, bodyH));
+            geometry.radii.Add(radius); geometry.seriesIndices.Add(i);
+        }
+        return geometry;
+    }
+
+    internal ChartHit Hit(ChartOption o, int x, int y, int growth) {
+        if (growth <= 0) { return null; }
+        for (int i = radii.Count - 1; i >= 0; i = i - 1) {
+            long dx = x - xs[i]; long dy = y - ys[i];
+            if (dx * dx + dy * dy > (long)radii[i] * radii[i]) { continue; }
+            int si = seriesIndices[i];
+            ChartSeries series = o.series[si];
+            return ChartView.MakeDataHit(series, si, 0, series.name, ChartElementType.Gauge,
+            x, y, series.Count() > 0 ? series.Value(0) : series.gauge.min);
+        }
+        return null;
+    }
+}
+
+internal class ChartFunnelGeometry {
+    internal List<ChartFunnelPanel> panels = new List<ChartFunnelPanel>();
+
+    internal static ChartFunnelGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartFunnelGeometry geometry = new ChartFunnelGeometry();
+        int pad = app.theme.paddingMedium;
+        int top = o.overlay ? y + pad : Chart.HeadBandBottom(app, y, o.title);
+        int count = 0;
+        bool multi = false;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries series = o.series[i];
+            if (!series.hidden && series.type == ChartType.Funnel) {
+                count = count + 1;
+                if (series.data.Count > 1) { multi = true; }
+            }
+        }
+        if (multi && count > 1) {
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                ChartSeries series = o.series[i];
+                if (series.hidden || series.silent || series.type != ChartType.Funnel) { continue; }
+                geometry.AddPanel(app, o, series, i, ChartView.GatherStagesForSeries(app, series, i),
+                x, y, w, h, top);
+            }
+        } else {
+            ChartSeries series = ChartView.LeadSeries(o);
+            if (series != null && !series.silent) {
+                geometry.AddPanel(app, o, series, ChartView.SeriesIndexOf(o, series),
+                ChartView.GatherStages(app, o.series), x, y, w, h, top);
+            }
+        }
+        return geometry;
+    }
+
+    void AddPanel(App app, ChartOption o, ChartSeries series, int si, List<ChartStage> stages,
+    int x, int y, int w, int h, int top) {
+        if (stages.Count < 1) { return; }
+        ChartFunnelPanel panel = new ChartFunnelPanel();
+        int pad = app.theme.paddingMedium;
+        panel.x = series.boxLeft != null ? x + ChartView.GaugeScalar(app, series.boxLeft, w) : x + pad;
+        panel.y = series.boxTop != null ? y + ChartView.GaugeScalar(app, series.boxTop, h) : top;
+        panel.w = series.boxWidth != null ? ChartView.GaugeScalar(app, series.boxWidth, w)
+        : w - pad * 2 - (o.showLegend ? app.Scale(120) : 0);
+        panel.h = series.boxHeight != null ? ChartView.GaugeScalar(app, series.boxHeight, h) : y + h - pad - top;
+        panel.stages = stages; panel.seriesIndex = si;
+        panels.Add(panel);
+    }
+
+    internal ChartHit Hit(ChartOption o, int x, int y, int growth) {
+        if (growth <= 0) { return null; }
+        for (int i = panels.Count - 1; i >= 0; i = i - 1) {
+            ChartFunnelPanel panel = panels[i];
+            if (x < panel.x || x >= panel.x + panel.w || y < panel.y || y >= panel.y + panel.h) { continue; }
+            int rowH = panel.h / panel.stages.Count;
+            if (rowH < 1) { rowH = 1; }
+            int index = (y - panel.y) / rowH;
+            if (index >= panel.stages.Count) { index = panel.stages.Count - 1; }
+            ChartSeries series = o.series[panel.seriesIndex];
+            if (series.sort == "ascending") { index = panel.stages.Count - 1 - index; }
+            ChartStage stage = panel.stages[index];
+            string name = stage.name.Length > 0 ? stage.name : ChartView.StageName(index);
+            ChartHit hit = ChartView.MakeDataHit(series, stage.seriesIndex, stage.dataIndex, name,
+            ChartElementType.FunnelStage, x, y, stage.val);
+            hit.dataName = name;
+            return hit;
+        }
+        return null;
+    }
+}
+
+internal class ChartFunnelPanel {
+    internal int x; internal int y; internal int w; internal int h;
+    internal int seriesIndex;
+    internal List<ChartStage> stages;
+}
+
+internal class ChartRadarGeometry {
+    internal List<int> centersX = new List<int>();
+    internal List<int> centersY = new List<int>();
+    internal List<int> radii = new List<int>();
+    internal List<int> counts = new List<int>();
+    internal List<int> starts = new List<int>();
+    internal List<List<string>> labels = new List<List<string>>();
+    internal List<int> seriesIndices = new List<int>();
+
+    internal static ChartRadarGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartRadarGeometry geometry = new ChartRadarGeometry();
+        int pad = app.theme.paddingMedium;
+        int top = Chart.PanelContentTop(app, x, y, w, o.title, o.series, o.showLegend);
+        int areaW = w - pad * 2;
+        int areaH = y + h - pad - Chart.legendBottomReserve - top;
+        int baseSize = areaW < areaH ? areaW : areaH;
+        int count = o.polars.Count > 0 ? o.polars.Count : 1;
+        for (int pi = 0; pi < count; pi = pi + 1) {
+            RadarPolar polar = o.polars.Count > 0 ? o.polars[pi] : null;
+            List<string> names = new List<string>();
+            if (polar != null && polar.indicators.Count > 0) {
+                for (int i = 0; i < polar.indicators.Count; i = i + 1) { names.Add(polar.indicators[i].text); }
+            } else if (polar == null && o.radarIndicators != null && o.radarIndicators.Count > 0) {
+                for (int i = 0; i < o.radarIndicators.Count; i = i + 1) { names.Add(o.radarIndicators[i].name); }
+            } else { names = o.radarNames.Count > 0 ? o.radarNames : o.XCategories(); }
+            int axes = names.Count;
+            if (axes < 1 && o.series.Count > 0) { axes = o.series[0].Count(); }
+            if (axes < 1 && polar != null) { axes = 1; }
+            int cx = x + pad + areaW / 2;
+            int cy = top + areaH / 2;
+            int radius = ChartView.RadialRadius(areaW, areaH, 62);
+            if (polar != null) {
+                if (polar.center != null) {
+                    cx = x + ChartView.GaugeScalar(app, polar.center.x, w);
+                    cy = y + ChartView.GaugeScalar(app, polar.center.y, h);
+                }
+                if (polar.radius.amount != 0) { radius = ChartView.GaugeScalar(app, polar.radius, baseSize / 2); }
+            }
+            if (radius < app.Scale(10)) { radius = app.Scale(10); }
+            int si = -1;
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                ChartSeries series = o.series[i];
+                int own = series.polarIndex;
+                if (own < 0 || own >= count) { own = 0; }
+                if (!series.hidden && !series.silent && (polar == null || own == pi)) { si = i; break; }
+            }
+            geometry.centersX.Add(cx); geometry.centersY.Add(cy); geometry.radii.Add(radius);
+            geometry.counts.Add(axes); geometry.labels.Add(names); geometry.seriesIndices.Add(si);
+            geometry.starts.Add(polar != null ? 90 - polar.startAngle : 0);
+        }
+        return geometry;
+    }
+
+    internal ChartHit Hit(App app, ChartOption o, int x, int y, int growth) {
+        int near = -1;
+        long distance = 0;
+        for (int i = 0; i < radii.Count; i = i + 1) {
+            if (counts[i] < 1 || seriesIndices[i] < 0) { continue; }
+            long dx = x - centersX[i]; long dy = y - centersY[i];
+            long d2 = dx * dx + dy * dy;
+            int radius = ChartView.RadarTooltipRadius(radii[i], growth, app.Scale(8));
+            if (radius >= 0 && d2 <= (long)radius * radius && (near < 0 || d2 < distance)) {
+                near = i; distance = d2;
+            }
+        }
+        if (near < 0) { return null; }
+        int axis = ChartView.RadarAxisAt(ChartView.AngleOf(x - centersX[near], y - centersY[near])
+        - starts[near], counts[near]);
+        ChartSeries series = o.series[seriesIndices[near]];
+        string name = axis < labels[near].Count ? labels[near][axis] : "";
+        ChartHit hit = ChartHit.Of(ChartElementType.RadarAxis, seriesIndices[near], series.name,
+        axis, name, axis < series.Count() ? series.Value(axis) : 0, x, y);
+        hit.axisIndex = series.axisIndex;
+        return hit;
+    }
+}
+
+public class ChartSunburstHit {
+    public ChartNode node;
+    public int value;
+    public int depth;
+    public int start;
+    public int end;
+}
+
+internal class ChartSunburstGeometry {
+    internal int cx; internal int cy; internal int radius; internal int ringHeight; internal int sweep;
+    internal ChartSeries series;
+    internal int seriesIndex;
+    internal ChartSunburstHit hovered;
+
+    internal static ChartSunburstGeometry Create(App app, ChartOption option, int x, int y, int w, int h, int growth) {
+        ChartSeries series = ChartView.LeadSeries(option);
+        if (series == null || series.tree == null || series.tree.Count < 1) { return null; }
+        ChartSunburstGeometry geometry = new ChartSunburstGeometry();
+        geometry.series = series; geometry.seriesIndex = ChartView.SeriesIndexOf(option, series);
+        int top = Chart.HeadBandBottom(app, y, option.title);
+        int pad = app.theme.paddingMedium;
+        int height = y + h - pad - top;
+        if (height < app.Scale(16)) { height = app.Scale(16); }
+        geometry.cx = x + w / 2; geometry.cy = top + height / 2;
+        geometry.radius = (w - pad * 2) / 2;
+        if (height / 2 < geometry.radius) { geometry.radius = height / 2; }
+        if (geometry.radius < app.Scale(10)) { geometry.radius = app.Scale(10); }
+        int rings = 1;
+        for (int i = 0; i < series.tree.Count; i = i + 1) {
+            int count = ChartView.TreeDepth(series.tree[i]);
+            if (count > rings) { rings = count; }
+        }
+        geometry.ringHeight = ChartView.SunburstRingHeight(geometry.radius, rings);
+        geometry.sweep = 360 * growth / 1000;
+        return geometry;
+    }
+
+    internal ChartHit Hit(App app, int px, int py) {
+        hovered = null;
+        if (series.hidden || series.silent) { return null; }
+        hovered = ChartView.SunburstHit(app, series, cx, cy, radius, ringHeight,
+        series.tree, 1, 0, 360, sweep, px, py);
+        if (hovered == null) { return null; }
+        ChartHit hit = ChartHit.Of(ChartElementType.Node, seriesIndex, series.name,
+        ChartView.TmNodeIndex(series.tree, hovered.node), hovered.node.name, hovered.value, px, py);
+        hit.axisIndex = series.axisIndex;
+        return hit;
+    }
+}
+
+internal class ChartHeatmapGeometry {
+    internal HeatGridGeom grid;
+    internal bool cartesian;
+    internal int top;
+    internal int rowLabelW;
+    internal int colHeadH;
+    internal int gap;
+    Dict<int, ChartHit> cells = new Dict<int, ChartHit>();
+
+    internal static ChartHeatmapGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        ChartHeatmapGeometry geometry = new ChartHeatmapGeometry();
+        geometry.top = Chart.HeadBandBottom(app, y, o.title);
+        geometry.cartesian = ChartView.HeatmapGridDetect(o);
+        if (geometry.cartesian) {
+            int maxX = -1; int maxY = -1; double lo = 0.0; double hi = 0.0;
+            ChartView.HeatFactsScan(o, out maxX, out maxY, out lo, out hi);
+            geometry.grid = ChartView.HeatmapGridGeomFromFacts(app, x, y, w, h, o,
+            geometry.top, maxX, maxY, lo, hi);
+        } else {
+            HeatGridGeom grid = HeatGridGeom.Of();
+            geometry.grid = grid;
+            grid.rows = o.series.Count;
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                if (o.series[si].Count() > grid.cols) { grid.cols = o.series[si].Count(); }
+            }
+            grid.xCats = o.XCategories();
+            geometry.rowLabelW = app.Scale(56); geometry.colHeadH = app.Scale(16);
+            geometry.gap = app.Scale(2);
+            grid.gx = x + app.theme.paddingMedium + geometry.rowLabelW;
+            grid.gy = geometry.top + geometry.colHeadH;
+            grid.gw = w - app.theme.paddingMedium * 2 - geometry.rowLabelW;
+            grid.gh = y + h - app.theme.paddingMedium - grid.gy;
+        }
+        if (geometry.grid == null || geometry.grid.rows < 1 || geometry.grid.cols < 1) { return geometry; }
+        if (geometry.cartesian) {
+            HeatGridGeom grid = geometry.grid;
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries series = o.series[si];
+                if (series.hidden || series.silent) { continue; }
+                for (int di = 0; di < series.data.Count; di = di + 1) {
+                    ChartData data = series.data[di];
+                    if (data.gap || data.heatX < 0 || data.heatX >= grid.cols
+                    || data.heatY < 0 || data.heatY >= grid.rows) { continue; }
+                    int key = data.heatY * grid.cols + data.heatX;
+                    if (geometry.cells.ContainsKey(key)) { continue; }
+                    string label = data.heatX < grid.xCats.Count ? grid.xCats[data.heatX]
+                    : "#" + Convert.ToString(data.heatX + 1);
+                    ChartHit hit = ChartView.MakeDataHit(series, si, di, label,
+                    ChartElementType.HeatmapCell,
+                    grid.gx + ChartView.HeatmapCellStart(grid.gw, data.heatX, grid.cols),
+                    grid.gy + ChartView.HeatmapCellStart(grid.gh, data.heatY, grid.rows), series.Value(di));
+                    geometry.cells[key] = hit;
+                }
+            }
+        }
+        return geometry;
+    }
+
+    internal ChartHit Hit(ChartOption o, int x, int y) {
+        HeatGridGeom g = grid;
+        if (g == null || g.rows < 1 || g.cols < 1 || x < g.gx || y < g.gy
+        || x >= g.gx + g.gw || y >= g.gy + g.gh) { return null; }
+        int col = ChartView.HeatmapIndexAt(x - g.gx, g.gw, g.cols);
+        int row = ChartView.HeatmapIndexAt(y - g.gy, g.gh, g.rows);
+        if (col < 0 || row < 0) { return null; }
+        if (cartesian) {
+            int key = row * g.cols + col;
+            return cells.ContainsKey(key) ? cells[key] : null;
+        }
+        ChartSeries series = o.series[row];
+        if (series.hidden || series.silent || col >= series.Count()) { return null; }
+        int px = g.gx + ChartView.HeatmapCellStart(g.gw, col, g.cols);
+        int py = g.gy + ChartView.HeatmapCellStart(g.gh, row, g.rows);
+        int width = ChartView.HeatmapCellSize(g.gw, col, g.cols) - gap;
+        int height = ChartView.HeatmapCellSize(g.gh, row, g.rows) - gap;
+        if (width < 1) { width = 1; } if (height < 1) { height = 1; }
+        if (x >= px + width || y >= py + height) { return null; }
+        string label = col < g.xCats.Count ? g.xCats[col] : "#" + Convert.ToString(col + 1);
+        return ChartView.MakeDataHit(series, row, col, label, ChartElementType.HeatmapCell,
+        px, py, series.Value(col));
+    }
+}
+
+internal class ChartMatrixGeometry {
+    internal MatGeom layout;
+
+    internal static ChartMatrixGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        if (o.matrix == null) { return null; }
+        ChartMatrixGeometry geometry = new ChartMatrixGeometry();
+        int maxX = -1; int maxY = -1; double low = 0.0; double high = 0.0;
+        ChartView.HeatFactsScan(o, out maxX, out maxY, out low, out high);
+        geometry.layout = ChartView.MatLayout(app, x, y, w, h,
+        Chart.HeadBandBottom(app, y, o.title), o, low, high);
+        return geometry;
+    }
+
+    internal ChartHit Hit(ChartOption o, int x, int y) {
+        MatGeom geo = layout;
+        ChartMatrixSpec matrix = o.matrix;
+        if (geo == null || matrix == null || x < geo.bodyL || x >= geo.rx + geo.rw
+        || y < geo.bodyT || y >= geo.ry + geo.rh) { return null; }
+        int col = ChartView.HeatmapIndexAt(x - geo.bodyL, geo.rx + geo.rw - geo.bodyL, geo.xLeaves);
+        int row = ChartView.HeatmapIndexAt(y - geo.bodyT, geo.ry + geo.rh - geo.bodyT, geo.yLeaves);
+        if (col < 0 || row < 0) { return null; }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries series = o.series[si];
+            if (series.hidden || series.silent || series.type != ChartType.Heatmap) { continue; }
+            for (int di = 0; di < series.data.Count; di = di + 1) {
+                ChartData data = series.data[di];
+                if (data.gap || data.heatX < 0 || data.heatY < 0
+                || data.heatX >= matrix.xNodes.Count || data.heatY >= matrix.yNodes.Count) { continue; }
+                ChartMatrixBandNode xn = matrix.xNodes[data.heatX];
+                ChartMatrixBandNode yn = matrix.yNodes[data.heatY];
+                if (col < xn.first || col >= xn.first + xn.span || row < yn.first || row >= yn.first + yn.span) { continue; }
+                int cx; int cy; int cw; int ch;
+                ChartView.MatXCellRect(geo, matrix, data.heatX, out cx, out cy, out cw, out ch);
+                int px; int py; int pw; int ph;
+                ChartView.MatYCellRect(geo, matrix, data.heatY, out px, out py, out pw, out ph);
+                return ChartView.MakeDataHit(series, si, di, xn.text,
+                ChartElementType.HeatmapCell, cx, py, data.val);
+            }
+        }
+        return null;
+    }
+}
+
+internal class ChartMapGeometry {
+    internal ChartSeries series;
+    internal ChartMapEntry entry;
+    internal MapLayout layout;
+    internal int x;
+    internal int y;
+    internal int w;
+    internal int h;
+    internal int barWidth;
+    internal int pad;
+    internal int zoom;
+    internal int panX;
+    internal int panY;
+    internal bool svg;
+    internal ChartGeoOverlayGeometry overlay;
+
+    internal static ChartMapGeometry Create(App app, ChartOption o, int x, int y, int w, int h) {
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        // 迷你面板（matrix 锚格 ~40px）：主题 pad 上下各吃一行后
+        // 绘图区只剩几像素，地图退化成细条——格内留白收缩。
+        if (h < app.Scale(60)) { pad = app.Scale(2); }
+        int top = Chart.HeadBandBottom(app, y, o.title);
+        // 底图几何的载体必须显式选，不能用 LeadSeries：geo 组件形态
+        // 的首个可见系列是挂在 geo 上的 scatter，它没有 regions，取它
+        // 会在下一行直接 return，底图与投影点全丢。底图载体是合成出来
+        // 的 isGeoBase 系列（ChartModel 的 geo 合成块），没有它时退回
+        // 首个"真的带几何"的 map 系列（用户直接写 series[].type=map）。
+        ChartSeries lead = ChartView.MapBaseSeries(o);
+        // SVG 地图：底图纹理 + 按名覆盖填充（见 DrawSvgMode 语义）。
+        ChartMapEntry mapEntry = lead != null && lead.mapName.Length > 0
+        ? ChartMaps.Find(lead.mapName) : null;
+        bool svgMode = mapEntry != null && mapEntry.svg.Length > 0;
+        if (svgMode) { ChartMaps.EnsureScanned(mapEntry); }
+        // SVG 底图零命名区域（纯装饰素材）也要画光栅底图——官方
+        // 语义是 SVG 原样渲染、区域只叠加交互；矢量地图才依赖
+        // regions，空表直接退。
+        if (lead == null || (!svgMode && lead.regions.Count < 1)) { return null; }
+
+        int plotX = x;
+        int plotY = top;
+        int plotW = w;
+        int plotH = y + h - top;
+        int barW = 0;
+        if (o.rampColors != null && o.rampColors.Count >= 2) {
+            barW = app.Scale(18);
+            plotX = x + barW + app.Scale(8);
+            plotW = w - barW - app.Scale(8);
+        }
+
+        int zoom = 100;
+        int panX = 0;
+        int panY = 0;
+        if (o.roam && o.iwid != 0) {
+            zoom = app.StateGet(Chart.MapZoomKey(o.iwid), 100);
+            if (zoom < 40) { zoom = 100; }
+            panX = app.StateGet(Chart.MapPanXKey(o.iwid), 0);
+            panY = app.StateGet(Chart.MapPanYKey(o.iwid), 0);
+        }
+
+        MapLayout layout;
+        if (svgMode) {
+            // SVG 地图：源框取 viewBox——光栅底图（nanosvg 对整个
+            // viewBox contain-fit）与折线覆盖共用同一仿射，像素对齐。
+            layout = MapLayout.OfRoamBox((int)mapEntry.vx, (int)mapEntry.vy,
+            (int)(mapEntry.vx + mapEntry.vw), (int)(mapEntry.vy + mapEntry.vh),
+            lead.regions, plotX, plotY, plotW, plotH, pad, zoom, panX, panY);
+        } else {
+            layout = MapLayout.OfRoam(lead.regions, plotX, plotY, plotW, plotH,
+            pad, zoom, panX, panY);
+        }
+        ChartMapGeometry geometry = new ChartMapGeometry();
+        geometry.series = lead; geometry.entry = mapEntry; geometry.layout = layout;
+        geometry.x = plotX; geometry.y = plotY; geometry.w = plotW; geometry.h = plotH;
+        geometry.barWidth = barW; geometry.pad = pad; geometry.svg = svgMode;
+        geometry.zoom = zoom; geometry.panX = panX; geometry.panY = panY;
+        return geometry;
+    }
+
+    internal ChartHit Hit(ChartOption o, int px, int py) {
+        if (px < x || px >= x + w || py < y || py >= y + h) { return null; }
+        ChartHit overlayHit = overlay != null ? overlay.Hit(px, py) : null;
+        if (overlayHit != null) { return overlayHit; }
+        if (series.silent || series.hidden) { return null; }
+        int region = MapLayout.RegionAt(layout, px, py);
+        if (region < 0 || region >= series.regions.Count) { return null; }
+        ChartMapRegion item = series.regions[region];
+        return ChartHit.Of(ChartElementType.MapRegion, ChartView.SeriesIndexOf(o, series),
+        series.name, region, item.name, item.value, px, py);
+    }
+}
+
+internal class ChartGeoPath {
+    internal List<int> xs = new List<int>();
+    internal List<int> ys = new List<int>();
+    internal int index;
+    internal string name;
+}
+
+internal class ChartGeoPoint {
+    internal int x; internal int y; internal int radius; internal int hitRadius;
+    internal int color; internal int index; internal int value;
+    internal string name;
+}
+
+internal class ChartGeoSeries {
+    internal ChartSeries series;
+    internal int index;
+    internal int color; internal int alpha; internal int width;
+    internal int dash; internal int gap;
+    internal bool large;
+    internal List<ChartGeoPath> paths = new List<ChartGeoPath>();
+    internal List<int> vertices = new List<int>();
+    internal List<int> counts = new List<int>();
+    internal List<ChartGeoPoint> points = new List<ChartGeoPoint>();
+}
+
+internal class ChartGeoOverlayGeometry {
+    internal List<ChartGeoSeries> series = new List<ChartGeoSeries>();
+    internal int x; internal int y; internal int w; internal int h;
+    internal int alpha; internal int font; internal int labelColor; internal int labelGap;
+    internal int hitPadding;
+
+    internal static ChartGeoOverlayGeometry Create(App app, ChartOption option, ChartMapGeometry map, int growth) {
+        ChartGeoOverlayGeometry result = new ChartGeoOverlayGeometry();
+        result.x = map.x; result.y = map.y; result.w = map.w; result.h = map.h;
+        result.alpha = growth < 1000 ? 60 + 195 * growth / 1000 : 255;
+        result.font = ChartFonts.SeriesLabel(app); result.labelGap = app.Scale(4); result.hitPadding = app.Scale(6);
+        result.labelColor = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
+        MapLayout layout = map.layout;
+        if (layout.scale <= 0) { return result; }
+        int userIndex = 0;
+        for (int si = 0; si < option.series.Count; si = si + 1) {
+            ChartSeries source = option.series[si];
+            if (source.hidden || source.coordSys != "geo" || source.isGeoBase) { continue; }
+            ChartGeoSeries item = new ChartGeoSeries(); item.series = source; item.index = si;
+            item.color = source.color != 0 ? source.color : ChartColor.Palette(app.theme, si);
+            ChartLineStyle style = source.itemStyle.normal.lineStyle;
+            if (style.color != 0) { item.color = style.color; }
+            item.width = style.width > 0 ? style.width : 1;
+            if (style.transparent) { item.width = 0; }
+            item.alpha = result.alpha;
+            if (style.alpha > 0) { item.alpha = item.alpha * style.alpha / 255; if (item.alpha < 1) { item.alpha = 1; } }
+            int threshold = source.largeThreshold > 0 ? source.largeThreshold : 400;
+            item.large = source.large && source.geoLines.Count > threshold;
+            if (style.type == "dotted") { item.dash = app.Scale(2); item.gap = app.Scale(2); }
+            if (style.type == "dashed") { item.dash = app.Scale(5); item.gap = app.Scale(3); }
+            if (item.width > 0) {
+                for (int li = 0; li < source.geoLines.Count; li = li + 1) {
+                    List<ChartPoint> line = source.geoLines[li];
+                    if (line.Count < 2) { continue; }
+                    ChartGeoPath path = new ChartGeoPath(); path.index = li;
+                    path.name = line[0].name.Length > 0 ? line[0].name
+                    : (line[line.Count - 1].name.Length > 0 ? line[line.Count - 1].name : source.name);
+                    if (item.dash == 0 && source.forceCurveness > 0 && line.Count == 2) {
+                        int x0 = ChartView.ProjX(layout, line[0].x, map.svg); int y0 = ChartView.ProjY(layout, line[0].y, map.svg);
+                        int x1 = ChartView.ProjX(layout, line[1].x, map.svg); int y1 = ChartView.ProjY(layout, line[1].y, map.svg);
+                        int cx = (x0 + x1) / 2 - (y1 - y0) * source.forceCurveness / 1000;
+                        int cy = (y0 + y1) / 2 + (x1 - x0) * source.forceCurveness / 1000;
+                        int segments = item.large ? 8 : 24;
+                        path.xs.Add(x0); path.ys.Add(y0);
+                        for (int q = 1; q <= segments; q = q + 1) {
+                            int t = q * 100 / segments; int inverse = 100 - t;
+                            path.xs.Add((inverse * inverse * x0 + 2 * inverse * t * cx + t * t * x1) / 10000);
+                            path.ys.Add((inverse * inverse * y0 + 2 * inverse * t * cy + t * t * y1) / 10000);
+                        }
+                    } else {
+                        for (int p = 0; p < line.Count; p = p + 1) {
+                            path.xs.Add(ChartView.ProjX(layout, line[p].x, map.svg));
+                            path.ys.Add(ChartView.ProjY(layout, line[p].y, map.svg));
+                        }
+                    }
+                    item.paths.Add(path);
+                    if (item.dash == 0) {
+                        for (int p = 0; p < path.xs.Count; p = p + 1) { item.vertices.Add(path.xs[p]); item.vertices.Add(path.ys[p]); }
+                        item.counts.Add(path.xs.Count);
+                    }
+                }
+            }
+            ChartVisualMap sizeMap = null; ChartVisualMap colorMap = null;
+            for (int vi = 0; vi < option.visualMaps.Count; vi = vi + 1) {
+                ChartVisualMap mapOption = option.visualMaps[vi];
+                if (mapOption.type != 0 || (mapOption.seriesIndex >= 0 && mapOption.seriesIndex != userIndex)) { continue; }
+                if (mapOption.hasSize) { sizeMap = mapOption; }
+                if (mapOption.rangeColors.Count >= 2) { colorMap = mapOption; }
+            }
+            int low = 0; int high = 0; bool hasRange = false;
+            ChartVisualMap domain = sizeMap != null && sizeMap.hasMin && sizeMap.hasMax
+            && sizeMap.minRaw != ChartOption.Auto() && sizeMap.maxRaw != ChartOption.Auto() ? sizeMap : colorMap;
+            if (domain != null && domain.hasMin && domain.hasMax && domain.minRaw != ChartOption.Auto() && domain.maxRaw != ChartOption.Auto()) {
+                low = domain.minRaw; high = domain.maxRaw; hasRange = true;
+            } else {
+                for (int pi = 0; pi < source.points.Count; pi = pi + 1) {
+                    int value = source.points[pi].z;
+                    if (!hasRange) { low = value; high = value; hasRange = true; }
+                    else { if (value < low) { low = value; } if (value > high) { high = value; } }
+                }
+            }
+            for (int pi = 0; pi < source.points.Count; pi = pi + 1) {
+                ChartPoint point = source.points[pi];
+                ChartGeoPoint p = new ChartGeoPoint(); p.index = pi; p.name = point.name; p.value = point.z;
+                p.x = ChartView.ProjX(layout, point.x, map.svg); p.y = ChartView.ProjY(layout, point.y, map.svg);
+                int margin = app.Scale(20);
+                if (p.x < map.x - margin || p.x >= map.x + map.w + margin || p.y < map.y - margin || p.y >= map.y + map.h + margin) { continue; }
+                p.color = point.color != 0 ? point.color : item.color;
+                int fraction = 0;
+                if (hasRange && high > low) { fraction = (int)((long)(point.z - low) * 1000 / (long)(high - low)); }
+                if (fraction < 0) { fraction = 0; } if (fraction > 1000) { fraction = 1000; }
+                if (colorMap != null && point.z != 0 && high > low) { p.color = ChartColor.RampAt(colorMap.rangeColors, fraction); }
+                p.radius = point.sizeSet && point.size > 0 ? app.Scale(point.size) / 2 : app.Scale(4);
+                if (point.z != 0) {
+                    if (sizeMap != null && hasRange && high > low) {
+                        p.radius = app.Scale(sizeMap.sizeLo + (int)((long)(sizeMap.sizeHi - sizeMap.sizeLo) * fraction / 1000)) / 2;
+                    } else if (source.type != ChartType.Heatmap) { p.radius = app.Scale(3) + (int)((long)point.z * app.Scale(14) / 100); }
+                }
+                if (source.type == ChartType.Heatmap && !point.sizeSet) { p.radius = app.Scale(10); }
+                if (p.radius < app.Scale(2)) { p.radius = app.Scale(2); } if (p.radius > app.Scale(60)) { p.radius = app.Scale(60); }
+                p.hitRadius = source.symbolSize > 0 && point.sizeSet ? app.Scale(point.size) / 2 : p.radius;
+                item.points.Add(p);
+            }
+            result.series.Add(item); userIndex = userIndex + 1;
+        }
+        return result;
+    }
+
+    internal ChartHit Hit(int px, int py) {
+        for (int si = series.Count - 1; si >= 0; si = si - 1) {
+            ChartGeoSeries item = series[si];
+            if (item.series.silent) { continue; }
+            for (int pi = item.points.Count - 1; pi >= 0; pi = pi - 1) {
+                ChartGeoPoint p = item.points[pi]; int radius = p.hitRadius;
+                if (px >= p.x - radius && px < p.x + radius && py >= p.y - radius && py < p.y + radius) {
+                    ChartHit hit = ChartHit.Of(ChartElementType.ScatterPoint, item.index, item.series.name, p.index, p.name, p.value, p.x, p.y);
+                    hit.numberValueSet = true; hit.numberValue = p.value; return hit;
+                }
+            }
+            if (item.large) { continue; }
+            for (int li = item.paths.Count - 1; li >= 0; li = li - 1) {
+                ChartGeoPath path = item.paths[li];
+                for (int pi = 0; pi + 1 < path.xs.Count; pi = pi + 1) {
+                    if (ChartView.DistToSeg(px, py, path.xs[pi], path.ys[pi], path.xs[pi + 1], path.ys[pi + 1]) < hitPadding) {
+                        return ChartHit.Of(ChartElementType.LinePoint, item.index, item.series.name, path.index, path.name, 0, px, py);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    internal void Draw(App app, ChartOption option) {
+        Canvas canvas = app.canvas;
+        ChartHit hit = ChartView.PaintHit(app, ChartElementType.ScatterPoint);
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartGeoSeries item = series[si]; int lineColor = ChartColor.WithAlpha(item.color, item.alpha);
+            if (item.dash > 0) {
+                for (int li = 0; li < item.paths.Count; li = li + 1) {
+                    ChartGeoPath path = item.paths[li]; ChartView.DrawDashed(canvas, path.xs, path.ys, lineColor, item.width, item.dash, item.gap);
+                }
+            } else { canvas.DrawPolyBatch(item.vertices, item.counts, lineColor, item.width); }
+            for (int pi = 0; pi < item.points.Count; pi = pi + 1) {
+                ChartGeoPoint p = item.points[pi];
+                canvas.FillCircle(p.x, p.y, p.radius, ChartColor.WithAlpha(p.color, alpha));
+                if (hit != null && hit.seriesIndex == item.index && hit.dataIndex == p.index && option.showTooltip) {
+                    List<TooltipRow> rows = new List<TooltipRow>();
+                    if (p.name.Length > 0) { rows.Add(TooltipRow.Of(0, p.name)); }
+                    rows.Add(TooltipRow.Of(p.color, item.series.name.Length > 0 ? item.series.name + "  " + Convert.ToString(p.value) : Convert.ToString(p.value)));
+                    ChartView.TooltipCard(app, ChartView.PointerX(app), ChartView.PointerY(app), x + w, rows);
+                }
+                if (item.series.labelShow && p.name.Length > 0 && (item.series.labelPos == "right" || item.series.labelPos.Length == 0)) {
+                    ChartView.DrawTextClamped(canvas, p.x + p.hitRadius + labelGap, Canvas.CenterTextYAt(p.y, font), p.name, labelColor, font, x, y, w, h);
+                }
+            }
+        }
+    }
+}
+
+internal class ChartVennGeometry {
+    internal int pad;
+    internal int top;
+    internal ChartSeries lead;
+    internal int areaW;
+    internal int areaH;
+    internal int minGap;
+    internal int rMax;
+    internal int gap;
+    internal int cx0;
+    internal int cy0;
+    internal VennLayout layout;
+    internal VennCircle A;
+    internal VennCircle B;
+    int x; int w;
+
+    internal static ChartVennGeometry Create(App app, ChartOption o, int x, int y, int w, int h, int g) {
+        ChartVennGeometry geometry = new ChartVennGeometry(); geometry.Build(app, o, x, y, w, h, g); return geometry;
+    }
+    void Build(App app, ChartOption o, int x, int y, int w, int h, int g) {
+        Theme t = app.theme;
+        this.x = x; this.w = w;
+        pad = t.paddingMedium;
+        top = Chart.HeadBandBottom(app, y, o.title);
+        lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.data.Count < 1) { return; }
+
+        areaW = w - pad * 2;
+        areaH = (y + h - pad) - top;
+        minGap = app.Scale(2);
+        rMax = ChartView.VennRadius(areaW, areaH, minGap);
+        if (rMax < 1) { return; }
+        gap = rMax / 8;
+        if (gap < minGap) { gap = minGap; }
+        cx0 = x + pad + areaW / 2;
+        cy0 = top + areaH / 2;
+
+        // 动画：整个图形按 g 从中心等比放大。
+        layout = VennLayout.Of(lead.data, rMax * g / 1000, gap, cx0, cy0);
+        A = layout.a;
+        B = layout.b;
+        if (A.r < 1 && B.r < 1) { return; }
+
+    }
+    internal ChartHit Hit(App app, ChartOption o, int mx, int my, int g) {
+        if (lead == null || lead.silent || layout == null) { return null; }
+        bool insideVenn = mx >= x + pad && mx < x + w - pad
+        && my >= top && my < top + areaH;
+        bool inA = insideVenn && ChartView.InCircle(mx, my, A);
+        bool inB = insideVenn && ChartView.InCircle(mx, my, B);
+        // 命中身份取 data 下标：0=A、1=B、2=交集（与 tooltip 一致）。
+        int hitIdx = 0 - 1;
+        int hitVal = 0;
+        if (inA && inB) {
+            hitIdx = 2;
+            if (lead.data.Count > 2) { hitVal = lead.data[2].val; }
+        } else if (inA) {
+            hitIdx = 0;
+            hitVal = A.value;
+        } else if (inB) {
+            hitIdx = 1;
+            hitVal = B.value;
+        }
+        if (hitIdx >= 0 && true) {
+            string nm = ChartView.VennName(lead, hitIdx, hitIdx == 2 ? "A∩B" : "");
+            ChartHit vh = ChartHit.Of(ChartElementType.VennCircle,
+            ChartView.SeriesIndexOf(o, lead), lead.name,
+            hitIdx, nm, hitVal, mx, my);
+            vh.axisIndex = lead.axisIndex;
+            return vh;
+        }
+        return null;
+    }
+}
+
+internal class ChartWordCloudGeometry {
+    internal int x; internal int y; internal int w; internal int h;
+    internal ChartSeries series;
+    internal int seriesIndex;
+    internal List<WordCloudItem> items;
+    int fingerprint;
+
+    internal static ChartWordCloudGeometry Create(App app, ChartOption o, int x, int y, int w, int h,
+    ChartWordCloudGeometry previous) {
+        ChartWordCloudGeometry geometry = new ChartWordCloudGeometry();
+        ChartSeries lead = ChartView.LeadSeries(o);
+        geometry.series = lead; geometry.seriesIndex = ChartView.SeriesIndexOf(o, lead);
+        geometry.items = new List<WordCloudItem>();
+        int top = Chart.PanelContentTop(app, x, y, w, o.title, o.series, o.showLegend);
+        int pad = app.Scale(10);
+        geometry.x = x + pad; geometry.y = top + app.Scale(2);
+        geometry.w = w - pad * 2; geometry.h = y + h - pad - geometry.y;
+        if (lead == null || lead.data.Count == 0 || geometry.w < app.Scale(24) || geometry.h < app.Scale(24)) { return geometry; }
+        int maximum = 1;
+        for (int i = 0; i < lead.data.Count; i = i + 1) {
+            if (lead.data[i].val > maximum) { maximum = lead.data[i].val; }
+        }
+        int minFs = lead.wcMinFontSize > 0 ? app.Scale(lead.wcMinFontSize) : app.Scale(11);
+        int maxFs = lead.wcMaxFontSize > 0 ? app.Scale(lead.wcMaxFontSize) : app.Scale(36);
+        if (maxFs > geometry.h / 3) { maxFs = geometry.h / 3; }
+        if (maxFs > geometry.w / 6) { maxFs = geometry.w / 6; }
+        if (maxFs < minFs) { maxFs = minFs; }
+        string rotations = lead.wcRotateList;
+        if (rotations == "0") { rotations = ""; }
+        bool vary = lead.wcRotate == "vary" && rotations.Length == 0;
+        geometry.fingerprint = ChartView.WordCloudFingerprint(lead.data, geometry.w, geometry.h,
+        minFs, maxFs, (vary ? 1 : 0) + ChartView.WordCloudRotListKey(rotations));
+        for (int i = 0; i < lead.data.Count; i = i + 1) {
+            geometry.fingerprint = (geometry.fingerprint * 31 + lead.data[i].color) % 2000000000;
+        }
+        geometry.fingerprint = (geometry.fingerprint * 31 + app.bgThemeGen + app.ThemeMenuIndex()) % 2000000000;
+        if (previous != null && previous.series != null && previous.series.data == lead.data
+        && previous.fingerprint == geometry.fingerprint) {
+            geometry.items = previous.items;
+        } else {
+            geometry.items = ChartView.PlaceWordCloud(app, app.theme, lead.data, geometry.w, geometry.h,
+            minFs, maxFs, maximum, vary, rotations);
+        }
+        return geometry;
+    }
+
+    internal ChartHit Hit(int px, int py, int growth) {
+        if (series == null || series.hidden || series.silent || growth <= 0
+        || px < x || px >= x + w || py < y || py >= y + h) { return null; }
+        for (int i = items.Count - 1; i >= 0; i = i - 1) {
+            WordCloudItem item = items[i];
+            if (px < x + item.x || px >= x + item.x + item.w || py < y + item.y || py >= y + item.y + item.h) { continue; }
+            for (int di = 0; di < series.data.Count; di = di + 1) {
+                if (series.data[di] == item.data) {
+                    return ChartView.MakeDataHit(series, seriesIndex, di, item.data.name,
+                    ChartElementType.WordTag, px, py, item.data.val);
+                }
+            }
+        }
+        return null;
+    }
+}

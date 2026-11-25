@@ -1,0 +1,754 @@
+using Gui.Widget;
+using Gui;
+using System.Json;
+using System;
+
+namespace Gui.Component.DataTable;
+
+// 一张筛选条件芯片。kind：0 逐列 ColFilter，1 筛选行
+// 文本，2 组合筛选树，3 透视视图（常驻首张），4 透视
+// 视图下“进入前”的原始逐列筛选（已烘进聚合，× 触发
+// 重物化）。`col` 仅对 0/1/4 有意义。纯数据投影，
+// 测试可直接断言。
+public class FilterChip {
+    int kind;
+    int col;
+    string text;
+
+    FilterChip(int chipKind, int chipCol, string chipText) {
+        this.kind = chipKind;
+        this.col = chipCol;
+        this.text = chipText;
+    }
+
+    public static FilterChip Make(int kind, int col, string text) {
+        return new FilterChip(kind, col, text);
+    }
+
+    // 芯片类别（0 逐列 / 1 筛选行 / 2 组合树 / 3 透视 / 4 原始逐列）。
+    int Kind() { return this.kind; }
+    // 所属列索引（kind 0/1/4），其余 -1。
+    int Col() { return this.col; }
+    // 显示文本。
+    string Text() { return this.text; }
+}
+
+// 程序化组合筛选（Filter Builder）。与每列独立的 ColFilter
+// 弹层筛选正交：FilterGroup 是一棵 AND/OR 嵌套树，挂到
+// state 上后 Recompute 在逐列筛选之外整体求值——同组条件
+// 按组连接词合并，子组作为单个操作数递归参与。
+// 典型用法：
+// ```zan
+// FilterGroup or = FilterGroup.Or();
+// root.Groups().Add(or);
+// DataTable.SetFilterTree(st, root);
+// ```
+// 条件按列 field 名寻址（列重排/插删后仍指向同一业务列）；
+// 未注册 field 的条件视为不匹配（该行被拒），防止拼写错误
+// 静默放行全部数据。
+public class FilterCondition {
+    // 条件运算：0 Contains，1 Equals（不区分大小写），
+    // 6 LessOrEqual，7 Between（含端点），8 IsEmpty，
+    // 9 IsNotEmpty，10 StartsWith，11 EndsWith
+    int op;
+    string field;
+    string valueA;
+    string valueB;
+
+    // 内部构造；请使用各具名工厂（Contains/Equals/…）。
+    FilterCondition(int conditionOp, string fieldName, string a, string b) {
+        this.op = conditionOp;
+        this.field = fieldName;
+        this.valueA = a;
+        this.valueB = b;
+    }
+
+    // 通用构造；null 比较值一律按空文本处理。
+    public static FilterCondition Of(int op, string field, string a, string b) {
+        if (a == null) { a = ""; }
+        if (b == null) { b = ""; }
+        return new FilterCondition(op, field, a, b);
+    }
+
+    // 文本包含（不区分大小写）。
+    public static FilterCondition Contains(string field, string value) {
+        return FilterCondition.Of(0, field, value, "");
+    }
+
+    // 相等（不区分大小写）。
+    public static FilterCondition Equals(string field, string value) {
+        return FilterCondition.Of(1, field, value, "");
+    }
+
+    // 不相等（不区分大小写）。
+    public static FilterCondition NotEquals(string field, string value) {
+        return FilterCondition.Of(2, field, value, "");
+    }
+
+    // 数值大于（非法数值按 0 处理）。
+    public static FilterCondition Greater(string field, string value) {
+        return FilterCondition.Of(3, field, value, "");
+    }
+
+    // 数值大于等于（非法数值按 0 处理）。
+    public static FilterCondition GreaterOrEqual(string field, string value) {
+        return FilterCondition.Of(4, field, value, "");
+    }
+
+    // 数值小于（非法数值按 0 处理）。
+    public static FilterCondition Less(string field, string value) {
+        return FilterCondition.Of(5, field, value, "");
+    }
+
+    // 数值小于等于（非法数值按 0 处理）。
+    public static FilterCondition LessOrEqual(string field, string value) {
+        return FilterCondition.Of(6, field, value, "");
+    }
+
+    // 数值区间，含两端。
+    public static FilterCondition Between(string field, string lo, string hi) {
+        return FilterCondition.Of(7, field, lo, hi);
+    }
+
+    // 文本为空（Trim 后）。
+    public static FilterCondition IsEmpty(string field) {
+        return FilterCondition.Of(8, field, "", "");
+    }
+
+    // 文本非空（Trim 后）。
+    public static FilterCondition IsNotEmpty(string field) {
+        return FilterCondition.Of(9, field, "", "");
+    }
+
+    // 文本前缀匹配（不区分大小写）。
+    public static FilterCondition StartsWith(string field, string value) {
+        return FilterCondition.Of(10, field, value, "");
+    }
+
+    // 文本后缀匹配（不区分大小写）。
+    public static FilterCondition EndsWith(string field, string value) {
+        return FilterCondition.Of(11, field, value, "");
+    }
+
+    // 条件运算编号（0–11，见类头注释）。
+    int Op() { return this.op; }
+    // 目标列的 field 名；未注册 field 的条件恒不匹配。
+    string Field() { return this.field; }
+    // 第一个比较值；语义随条件运算而定。
+    string ValueA() { return this.valueA; }
+    // 第二个比较值；仅 Between（op 7）使用。
+    string ValueB() { return this.valueB; }
+}
+
+// AND/OR 组：`and` 为 true 时子条件与子组全部通过才通过，
+// 为 false 时任一通过即通过。空组恒通过（AND 的单位元），
+// 因此空 AND 组外层不会误杀全部行。
+public class FilterGroup {
+    bool and;
+    List<FilterCondition> conditions;
+    List<FilterGroup> groups;
+
+    // 内部构造；使用 And()/Or() 创建。
+    FilterGroup(bool isAnd) {
+        this.and = isAnd;
+        this.conditions = new List<FilterCondition>();
+        this.groups = new List<FilterGroup>();
+    }
+
+    // 全部条件与子组取交集。
+    public static FilterGroup And() { return new FilterGroup(true); }
+
+    // 任一条件或子组通过即通过。
+    public static FilterGroup Or() { return new FilterGroup(false); }
+
+    // 组连接词：true = AND，false = OR。
+    bool IsAnd() { return this.and; }
+
+    // 本组的直接条件列表，按声明顺序求值。
+    List<FilterCondition> Conditions() { return this.conditions; }
+
+    // 子组列表，每个子组作为单个操作数递归求值。
+    List<FilterGroup> Groups() { return this.groups; }
+}
+
+// 过滤键的查询内缓存。列值只在 Execute 开始时解析一次，比较器
+// 只读取 primitive 数组；Empty/NotEmpty 仍依据原始文本判断。
+public class LocalFilterColumn {
+    int kind;
+    int mode;
+    string aText;
+    string bText;
+    int aInt;
+    int bInt;
+    double aReal;
+    double bReal;
+    bool aBool;
+    bool bBool;
+    List<int> ints;
+    List<double> reals;
+    List<bool> bools;
+
+    // 构造过滤列：类型化（kind 1–3）的两个比较值在构造时解析一次。
+    LocalFilterColumn(int valueKind, int op, string a, string b) {
+        this.kind = valueKind;
+        this.mode = op;
+        this.aText = a;
+        this.bText = b;
+        if (this.aText == null) { this.aText = ""; }
+        if (this.bText == null) { this.bText = ""; }
+        this.aInt = 0;
+        this.bInt = 0;
+        this.aReal = 0.0;
+        this.bReal = 0.0;
+        this.aBool = false;
+        this.bBool = false;
+        if (this.kind == 1) {
+            this.aInt = DataTable.ParseInt(this.aText);
+            this.bInt = DataTable.ParseInt(this.bText);
+        } else if (this.kind == 2) {
+            this.aReal = DataTable.ParseReal(this.aText);
+            this.bReal = DataTable.ParseReal(this.bText);
+        } else if (this.kind == 3) {
+            this.aBool = DataTable.ParseBool(this.aText);
+            this.bBool = DataTable.ParseBool(this.bText);
+        }
+        this.ints = new List<int>();
+        this.reals = new List<double>();
+        this.bools = new List<bool>();
+    }
+
+    // 追加一行的预解析值：按 kind 解析文本；kind=0（文本）不缓存。
+    public void Add(string value) {
+        if (value == null) { value = ""; }
+        if (this.kind == 1) { this.ints.Add(DataTable.ParseInt(value)); }
+        else if (this.kind == 2) { this.reals.Add(DataTable.ParseReal(value)); }
+        else if (this.kind == 3) { this.bools.Add(DataTable.ParseBool(value)); }
+    }
+
+    // 第 row 行是否通过本列过滤。类型化操作按预解析值比较
+    // （Between 为闭区间；bool 只支持 Equals），Empty/NotEmpty
+    // 始终按原始文本判断，其余模式回退 PassText 的文本语义。
+    public bool Pass(string raw, int row) {
+        if (raw == null) { raw = ""; }
+        if (this.kind == 1) {
+            int value = this.ints[row];
+            if (this.mode == QueryFilterMode.Equals) { return value == this.aInt; }
+            if (this.mode == QueryFilterMode.Greater) { return value > this.aInt; }
+            if (this.mode == QueryFilterMode.GreaterOrEqual) { return value >= this.aInt; }
+            if (this.mode == QueryFilterMode.Less) { return value < this.aInt; }
+            if (this.mode == QueryFilterMode.LessOrEqual) { return value <= this.aInt; }
+            if (this.mode == QueryFilterMode.Between) { return value >= this.aInt && value <= this.bInt; }
+        } else if (this.kind == 2) {
+            double value = this.reals[row];
+            if (this.mode == QueryFilterMode.Equals) { return value == this.aReal; }
+            if (this.mode == QueryFilterMode.Greater) { return value > this.aReal; }
+            if (this.mode == QueryFilterMode.GreaterOrEqual) { return value >= this.aReal; }
+            if (this.mode == QueryFilterMode.Less) { return value < this.aReal; }
+            if (this.mode == QueryFilterMode.LessOrEqual) { return value <= this.aReal; }
+            if (this.mode == QueryFilterMode.Between) { return value >= this.aReal && value <= this.bReal; }
+        } else if (this.kind == 3) {
+            bool value = this.bools[row];
+            if (this.mode == QueryFilterMode.Equals) { return value == this.aBool; }
+        }
+        return this.mode == QueryFilterMode.Empty ? raw.Length == 0
+            : (this.mode == QueryFilterMode.NotEmpty ? raw.Length > 0
+            : this.PassText(raw));
+    }
+
+    // 对原始文本执行文本语义比较：Contains/StartsWith/EndsWith、
+    // 字典序比较（Equals/Greater/Less 及组合）与闭区间 Between；
+    // 未识别的模式放行。
+    public bool PassText(string value) {
+        int cmp = DataTable.CompareStr(value, this.aText);
+        if (this.mode == QueryFilterMode.Contains) {
+            if (this.aText.Length == 0) { return true; }
+            for (int i = 0; i + this.aText.Length <= value.Length; i = i + 1) {
+                if (value.Substring(i, this.aText.Length) == this.aText) { return true; }
+            }
+            return false;
+        }
+        if (this.mode == QueryFilterMode.StartsWith) {
+            return value.Length >= this.aText.Length
+                && value.Substring(0, this.aText.Length) == this.aText;
+        }
+        if (this.mode == QueryFilterMode.EndsWith) {
+            return value.Length >= this.aText.Length
+                && value.Substring(value.Length - this.aText.Length, this.aText.Length) == this.aText;
+        }
+        if (this.mode == QueryFilterMode.Equals) { return cmp == 0; }
+        if (this.mode == QueryFilterMode.Greater) { return cmp > 0; }
+        if (this.mode == QueryFilterMode.GreaterOrEqual) { return cmp >= 0; }
+        if (this.mode == QueryFilterMode.Less) { return cmp < 0; }
+        if (this.mode == QueryFilterMode.LessOrEqual) { return cmp <= 0; }
+        if (this.mode == QueryFilterMode.Between) {
+            return cmp >= 0 && DataTable.CompareStr(value, this.bText) <= 0;
+        }
+        return true;
+    }
+}
+
+// 单个排序键的预计算值。文本仍直接读取源行；数值和 bool 只在
+// 查询开始时解析一次，避免稳定归并排序的比较热路径反复转换。
+public class LocalSortColumn {
+    int kind;
+    List<int> ints;
+    List<double> reals;
+    List<bool> bools;
+
+    // 以值类型 kind（0 文本、1 整数、2 实数、3 bool）建列，键数组为空。
+    LocalSortColumn(int valueKind) {
+        this.kind = valueKind;
+        this.ints = new List<int>();
+        this.reals = new List<double>();
+        this.bools = new List<bool>();
+    }
+
+    // 追加一行的预解析键：按 kind 解析文本；kind=0（文本）不缓存。
+    public void Add(string value) {
+        if (value == null) { value = ""; }
+        if (this.kind == 1) { this.ints.Add(DataTable.ParseInt(value)); }
+        else if (this.kind == 2) { this.reals.Add(DataTable.ParseReal(value)); }
+        else if (this.kind == 3) { this.bools.Add(DataTable.ParseBool(value)); }
+    }
+
+    // 第 row 行的预解析整数键。
+    int IntAt(int row) { return this.ints[row]; }
+    // 第 row 行的预解析实数键。
+    double RealAt(int row) { return this.reals[row]; }
+    // 第 row 行的预解析 bool 键。
+    bool BoolAt(int row) { return this.bools[row]; }
+}
+
+// 表达式编译缓存的载体：一组列的编译结果。
+public class FormulaCacheEntry {
+    public List<DataColumn> cols;
+    public List<DataTable.FormulaExpr> exprs;
+}
+
+// 逆波兰 token：0 数字，1 列引用，2 +，3 -，4 *，5 /，
+    // 6 一元负号，7 min，8 max，9 abs，10 round，11 floor，
+    // 12 ceil，13 sqrt。
+    public class FormulaExpr {
+        public List<int> ops;
+        public List<double> nums;
+        public List<int> colIdx;
+        // 变参函数的实参个数（min/max）；其余函数不使用。
+        public List<int> argc;
+        public bool err;
+
+        // 编译表达式；畸形输入置 err=true（整列显示空）。
+        public FormulaExpr(string src, List<DataColumn> cols) {
+            this.ops = new List<int>();
+            this.nums = new List<double>();
+            this.colIdx = new List<int>();
+            this.argc = new List<int>();
+            this.err = false;
+            this.Compile(src, cols);
+        }
+
+        // ---- 编译：递归下降 → 逆波兰 ----
+
+        string src;
+        int pos;
+        int depth;
+        List<DataColumn> cols;
+
+        // 标记编译失败并清空已生成的全部 token。
+        public void Fail() {
+            this.err = true;
+            this.ops.Clear();
+            this.nums.Clear();
+            this.colIdx.Clear();
+            this.argc.Clear();
+        }
+
+        // 每个 token 在四个平行数组里各占一格：运算符的
+        // nums/colIdx/argc 只是占位 0，保证 ops[i] 与其余
+        // 数组同索引对齐。
+        public void Emit(int op) {
+            this.ops.Add(op);
+            this.nums.Add(0.0);
+            this.colIdx.Add(0);
+            this.argc.Add(0);
+        }
+
+        // 递归下降解析入口；成功后必须恰好消费到串尾，
+        // 否则视为畸形并失败。
+        public void Compile(string src, List<DataColumn> cols) {
+            this.src = src;
+            this.pos = 0;
+            this.depth = 0;
+            this.cols = cols;
+            this.ParseExpr();
+            if (this.err) { return; }
+            this.SkipWs();
+            if (this.pos < this.src.Length) { this.Fail(); }
+        }
+
+        // 跳过空格与制表符。
+        public void SkipWs() {
+            while (this.pos < this.src.Length) {
+                int c = (int)this.src[this.pos];
+                if (c != 32 && c != 9) { break; }
+                this.pos = this.pos + 1;
+            }
+        }
+
+        // 加减层：term (('+' | '-') term)*。
+        public void ParseExpr() {
+            this.ParseTerm();
+            while (!this.err) {
+                this.SkipWs();
+                if (this.pos >= this.src.Length) { break; }
+                int c = (int)this.src[this.pos];
+                if (c != 43 && c != 45) { break; }
+                this.pos = this.pos + 1;
+                this.ParseTerm();
+                if (this.err) { break; }
+                this.Emit(c == 43 ? 2 : 3);
+            }
+        }
+
+        // 乘除层：unary (('*' | '/') unary)*。
+        public void ParseTerm() {
+            this.ParseUnary();
+            while (!this.err) {
+                this.SkipWs();
+                if (this.pos >= this.src.Length) { break; }
+                int c = (int)this.src[this.pos];
+                if (c != 42 && c != 47) { break; }
+                this.pos = this.pos + 1;
+                this.ParseUnary();
+                if (this.err) { break; }
+                this.Emit(c == 42 ? 4 : 5);
+            }
+        }
+
+        // 一元层：'-' unary | primary。
+        public void ParseUnary() {
+            this.SkipWs();
+            if (this.pos < this.src.Length && (int)this.src[this.pos] == 45) {
+                this.pos = this.pos + 1;
+                this.ParseUnary();
+                if (this.err) { return; }
+                this.Emit(6);
+                return;
+            }
+            this.ParsePrimary();
+        }
+
+        // 数字字面量、括号子表达式（深度上限 32）、
+        // 函数调用或列引用（先 field 名，回退 title）。
+        public void ParsePrimary() {
+            this.SkipWs();
+            if (this.pos >= this.src.Length) { this.Fail(); return; }
+            int c = (int)this.src[this.pos];
+            // 括号子表达式
+            if (c == 40) {
+                this.pos = this.pos + 1;
+                if (this.depth >= 32) { this.Fail(); return; }
+                this.depth = this.depth + 1;
+                this.ParseExpr();
+                this.depth = this.depth - 1;
+                if (this.err) { return; }
+                this.SkipWs();
+                if (this.pos < this.src.Length && (int)this.src[this.pos] == 41) {
+                    this.pos = this.pos + 1;
+                    return;
+                }
+                this.Fail();
+                return;
+            }
+            // 数字字面量
+            if ((c >= 48 && c <= 57) || c == 46) {
+                int start = this.pos;
+                while (this.pos < this.src.Length) {
+                    int d = (int)this.src[this.pos];
+                    if (d < 48 || d > 57) { break; }
+                    this.pos = this.pos + 1;
+                }
+                if (this.pos < this.src.Length && (int)this.src[this.pos] == 46) {
+                    this.pos = this.pos + 1;
+                    while (this.pos < this.src.Length) {
+                        int d = (int)this.src[this.pos];
+                        if (d < 48 || d > 57) { break; }
+                        this.pos = this.pos + 1;
+                    }
+                }
+                this.Emit(0);
+                this.nums[this.nums.Count - 1] = DataTable.ParseReal(this.src.Substring(start, this.pos - start));
+                return;
+            }
+            // 标识符：函数调用或列引用
+            if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+                int start = this.pos;
+                while (this.pos < this.src.Length) {
+                    int d = (int)this.src[this.pos];
+                    bool alnum = (d >= 48 && d <= 57) || (d >= 65 && d <= 90) || (d >= 97 && d <= 122) || d == 95;
+                    if (!alnum) { break; }
+                    this.pos = this.pos + 1;
+                }
+                string ident = this.src.Substring(start, this.pos - start);
+                int save = this.pos;
+                this.SkipWs();
+                if (this.pos < this.src.Length && (int)this.src[this.pos] == 40) {
+                    this.pos = this.pos + 1;
+                    string fn = DataTable.LowerAscii(ident);
+                    this.SkipWs();
+                    // 零实参调用：仅 min/max 有意义地失败，其他函数
+                    // 在求值层统一检查实参个数。
+                    if (this.pos < this.src.Length && (int)this.src[this.pos] == 41) {
+                        this.pos = this.pos + 1;
+                        this.PushFunc(fn, 0);
+                        return;
+                    }
+                    int count = 0;
+                    while (!this.err) {
+                        this.ParseExpr();
+                        if (this.err) { break; }
+                        count = count + 1;
+                        this.SkipWs();
+                        if (this.pos < this.src.Length && (int)this.src[this.pos] == 44) {
+                            this.pos = this.pos + 1;
+                        } else {
+                            if (this.pos < this.src.Length && (int)this.src[this.pos] == 41) {
+                                this.pos = this.pos + 1;
+                            } else { this.Fail(); }
+                            break;
+                        }
+                    }
+                    if (this.err) { return; }
+                    this.PushFunc(fn, count);
+                    return;
+                }
+                this.pos = save;
+                // 列引用：先按 field 名，回退按 title。
+                int ci = DataTable.Col(this.cols, ident);
+                if (ci < 0) {
+                    for (int k = 0; k < this.cols.Count; k = k + 1) {
+                        if (this.cols[k].title == ident) { ci = k; break; }
+                    }
+                }
+                if (ci < 0) { this.Fail(); return; }
+                this.Emit(1);
+                this.colIdx[this.colIdx.Count - 1] = ci;
+                return;
+            }
+            this.Fail();
+        }
+        // 函数的逆波兰约定：先依次求值全部实参，然后函数 token
+        // 弹出 argc 个操作数。这里把函数 token 压在实参之后输出，
+        // 并记录实参个数（min/max 变参需要；固定元数函数求值层
+        // 自行检查栈深）。
+        public void PushFunc(string fn, int count) {
+            int op = 0;
+            if (fn == "min") { op = 7; }
+            else if (fn == "max") { op = 8; }
+            else if (fn == "abs") { op = 9; }
+            else if (fn == "round") { op = 10; }
+            else if (fn == "floor") { op = 11; }
+            else if (fn == "ceil") { op = 12; }
+            else if (fn == "sqrt") { op = 13; }
+            else { this.Fail(); return; }
+            // 实参个数合法性：min/max ≥1；其余恰为 1（round 可 +1）。
+            if (op == 7 || op == 8) {
+                if (count < 1) { this.Fail(); return; }
+            } else if (op == 10) {
+                if (count < 1 || count > 2) { this.Fail(); return; }
+            } else {
+                if (count != 1) { this.Fail(); return; }
+            }
+            this.Emit(op);
+            this.argc[this.argc.Count - 1] = count;
+        }
+    }
+
+// 稳定的数据行身份。
+// 新的 DataTable 能力应使用 RowKey，而不是把当前显示位置或源数组
+// 下标当成业务身份。文本形式采用调用方提供的规范化键；旧列表源
+// 可通过 Legacy() 获得临时键，但临时键不承诺跨刷新或跨会话稳定。
+public class RowKey {
+    public string value;
+    public bool temporary;
+
+    // 内部构造；优先经 Of()/Legacy() 创建。
+    public RowKey(string v, bool temp) {
+        this.value = v;
+        this.temporary = temp;
+    }
+
+    // 以业务键文本构造稳定身份；空文本退化为临时 legacy 键。
+    public static RowKey Of(string value) {
+        if (value.Length == 0) { return RowKey.Legacy(""); }
+        return new RowKey(value, false);
+    }
+
+    // 为没有业务主键的旧位置数据生成兼容键。
+    // 该键只在当前源实例中有意义。
+    public static RowKey Legacy(int row) {
+        return new RowKey("legacy:" + Convert.ToString(row), true);
+    }
+
+    // 以任意文本（非行号）生成临时 legacy 键。
+    public static RowKey Legacy(string value) {
+        return new RowKey("legacy:" + value, true);
+    }
+
+    // 规范化键文本，用作字典键与相等比较依据。
+    public string Canonical() { return this.value; }
+    // 是否为位置派生的临时键（Legacy() 产物）。
+    public bool IsTemporary() { return this.temporary; }
+    // 与另一键按规范化文本比较；other 为 null 时返回 false。
+    public bool Same(RowKey other) {
+        if (other == null) { return false; }
+        return this.value == other.value;
+    }
+}
+
+// 行键与当前数据源位置的短期映射。
+// locator 会随排序、过滤和页缓存变化，不能持久化为身份。
+public class RowRef {
+    RowKey key;
+    int locator;
+    int revision;
+
+    // 内部构造。
+    RowRef(RowKey k, int at, int rev) {
+        this.key = k;
+        this.locator = at;
+        this.revision = rev;
+    }
+}
+
+// 业务整行样式描述模型（用于告警行、状态行、逾期行整行高亮等，对标 AG Grid getRowStyle & DevExpress RowStyle）
+public class RowStyle {
+    int bg;       // 背景填充色（0 = 默认透明/隔行色）
+    int fg;       // 文本前景色（0 = 默认）
+    bool bold;    // 文本加粗
+    int border;   // 整行边框色（0 = 默认行线）
+
+    RowStyle() {
+        this.bg = 0;
+        this.fg = 0;
+        this.bold = false;
+        this.border = 0;
+    }
+
+    public static RowStyle Create(int bg, int fg) {
+        RowStyle s = new RowStyle();
+        s.bg = bg;
+        s.fg = fg;
+        return s;
+    }
+
+    public static RowStyle Bg(int bg) {
+        RowStyle s = new RowStyle();
+        s.bg = bg;
+        return s;
+    }
+
+    public static RowStyle Warning() {
+        return RowStyle.Create(0x28FFAA00, (int)0xFFD48800);
+    }
+
+    public static RowStyle Danger() {
+        return RowStyle.Create(0x30FF4D4F, (int)0xFFCF1322);
+    }
+
+    public static RowStyle Success() {
+        return RowStyle.Create(0x2852C41A, (int)0xFF389E0D);
+    }
+
+    public static RowStyle Muted() {
+        return RowStyle.Create(0x18000000, (int)0xFF8C8C8C);
+    }
+}
+
+// 整行样式判断委托：(src, rowIdx) => RowStyle (为 null 表示走默认行样式)
+public delegate RowStyle RowStyleFunc(DataSource src, int rowIdx);
+
+// 选择粒度。Row 是默认的数据行选择模式；Cell/Range 为后续
+// 单元格命令保留明确的协议值。
+public class SelectionMode {
+    // 数据行选择（默认）。
+    static const int Row = 1;
+    // 单元格选择（协议保留值）。
+    static const int Cell = 2;
+    // 区域选择（协议保留值）。
+    static const int Range = 3;
+}
+
+// Render owns one instance: both displays consume the same selection snapshot.
+// Never retain this on DataTableState; edits and ranges can change without a revision.
+internal class SelectionStatistics {
+    public SelectionSummary summary;
+    public int footerSum;
+    public int footerCount;
+    bool includeFooter;
+    bool includeSummary;
+    bool collected;
+
+    public SelectionStatistics(bool footer, bool textSummary) {
+        includeFooter = footer;
+        includeSummary = textSummary;
+        summary = new SelectionSummary();
+    }
+
+    public void Read(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (collected) { return; }
+        collected = true;
+        DataTable.CollectSelectionStatistics(st, cols, src, this, includeFooter, includeSummary);
+    }
+}
+
+// 类型化查询/编辑值的最小兼容表示。
+public class TableValue {
+    int kind;
+    string text;
+    int integer;
+    double real;
+    bool truth;
+
+    // kind=0 的空值，其余字段取零值。
+    public static TableValue Null() {
+        TableValue v = new TableValue();
+        v.kind = 0; v.text = ""; v.integer = 0; v.real = 0.0; v.truth = false;
+        return v;
+    }
+    // kind=1 的文本值。
+    public static TableValue Text(string s) {
+        TableValue v = TableValue.Null();
+        v.kind = 1; v.text = s; return v;
+    }
+    // kind=2 的整数值。
+    public static TableValue Int(int n) {
+        TableValue v = TableValue.Null();
+        v.kind = 2; v.integer = n; return v;
+    }
+    // kind=3 的实数值。
+    public static TableValue Real(double n) {
+        TableValue v = TableValue.Null();
+        v.kind = 3; v.real = n; return v;
+    }
+    // kind=4 的布尔值。
+    public static TableValue Bool(bool b) {
+        TableValue v = TableValue.Null();
+        v.kind = 4; v.truth = b; return v;
+    }
+    // kind=5 的日期值，integer 存日号（自 1970-01-01 起）。
+    public static TableValue Day(int n) {
+        TableValue v = TableValue.Null();
+        v.kind = 5; v.integer = n; return v;
+    }
+
+    // 值类型 kind（0 null、1 text、2 int、3 real、4 bool、5 day）。
+    int Kind() { return this.kind; }
+    // 文本字段（kind=1 有效）。
+    string AsText() { return this.text; }
+    // 整数字段（kind=2/5 有效）。
+    int AsInt() { return this.integer; }
+    // 实数字段（kind=3 有效）。
+    double AsReal() { return this.real; }
+    // 布尔字段（kind=4 有效）。
+    bool AsBool() { return this.truth; }
+}

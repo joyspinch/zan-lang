@@ -132,231 +132,106 @@ public class QueryPlan {
         return false;
     }
 
-    // 按 schema 校验并构建计划：在无 schema 版本（列数校验、能力检查）
-    // 通过后，追加“子句值 kind 与列 ValueType 匹配”检查，过滤/排序/
-    // 分组/聚合逐类检查，首个不匹配即以 SchemaValueKindMismatch 失败返回。
+    static QueryPlan FromQuery(QueryDescriptor query, int supportedMask, QueryPlanIssue issue) {
+        return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+            query.DataRevision(), query.QueryRevision(), supportedMask,
+            query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(), issue);
+    }
+
+    static QueryPlan FromQueryError(QueryDescriptor query, int supportedMask,
+            int code, string message, int column, int clause) {
+        return QueryPlan.FromQuery(query, supportedMask,
+            new QueryPlanIssue(code, message, column, clause));
+    }
+
+    static QueryPlan CheckSchemaClause(QueryPlan plan, List<SchemaColumn> schema,
+            int columnIndex, int kind, int clauseIndex, string clauseRole) {
+        SchemaColumn column = schema[columnIndex];
+        if (column == null || !QueryPlan.SchemaKindMatches(column.ValueType(), kind)) {
+            return QueryPlan.Fail(plan, new QueryPlanIssue(
+                QueryPlan.SchemaValueKindMismatch,
+                "query " + clauseRole + " value kind does not match schema", columnIndex, clauseIndex));
+        }
+        return null;
+    }
+
+    // 按 schema 校验并构建计划：追加“子句值 kind 与列 ValueType 匹配”检查。
     public static QueryPlan Build(QueryDescriptor query, List<SchemaColumn> schema,
                            QueryCapabilities supported) {
-        int columnCount = -1;
-        if (schema != null) { columnCount = schema.Count; }
+        int columnCount = schema != null ? schema.Count : -1;
         QueryPlan plan = QueryPlan.Build(query, columnCount, supported);
         if (!plan.IsValid() || schema == null) { return plan; }
         for (int i = 0; i < plan.FilterCount(); i = i + 1) {
-            int columnIndex = plan.FilterColumnAt(i);
-            SchemaColumn column = schema[columnIndex];
-            if (column == null || !QueryPlan.SchemaKindMatches(column.ValueType(),
-                    plan.FilterKindAt(i))) {
-                return QueryPlan.Fail(plan, new QueryPlanIssue(
-                    QueryPlan.SchemaValueKindMismatch,
-                    "query filter value kind does not match schema", columnIndex, i));
-            }
+            QueryPlan bad = QueryPlan.CheckSchemaClause(plan, schema, plan.FilterColumnAt(i), plan.FilterKindAt(i), i, "filter");
+            if (bad != null) { return bad; }
         }
         for (int i = 0; i < plan.SortCount(); i = i + 1) {
-            int columnIndex = plan.SortColumnAt(i);
-            SchemaColumn column = schema[columnIndex];
-            if (column == null || !QueryPlan.SchemaKindMatches(column.ValueType(),
-                    plan.SortKindAt(i))) {
-                return QueryPlan.Fail(plan, new QueryPlanIssue(
-                    QueryPlan.SchemaValueKindMismatch,
-                    "query sort value kind does not match schema", columnIndex, i));
-            }
+            QueryPlan bad = QueryPlan.CheckSchemaClause(plan, schema, plan.SortColumnAt(i), plan.SortKindAt(i), i, "sort");
+            if (bad != null) { return bad; }
         }
         for (int i = 0; i < plan.GroupCount(); i = i + 1) {
-            int columnIndex = plan.GroupColumnAt(i);
-            SchemaColumn column = schema[columnIndex];
-            if (column == null || !QueryPlan.SchemaKindMatches(column.ValueType(),
-                    plan.GroupKindAt(i))) {
-                return QueryPlan.Fail(plan, new QueryPlanIssue(
-                    QueryPlan.SchemaValueKindMismatch,
-                    "query group value kind does not match schema", columnIndex, i));
-            }
+            QueryPlan bad = QueryPlan.CheckSchemaClause(plan, schema, plan.GroupColumnAt(i), plan.GroupKindAt(i), i, "group");
+            if (bad != null) { return bad; }
         }
         for (int i = 0; i < plan.AggregateCount(); i = i + 1) {
-            int columnIndex = plan.AggregateColumnAt(i);
-            SchemaColumn column = schema[columnIndex];
-            if (column == null || !QueryPlan.SchemaKindMatches(column.ValueType(),
-                    plan.AggregateKindAt(i))) {
-                return QueryPlan.Fail(plan, new QueryPlanIssue(
-                    QueryPlan.SchemaValueKindMismatch,
-                    "query aggregate value kind does not match schema", columnIndex, i));
-            }
+            QueryPlan bad = QueryPlan.CheckSchemaClause(plan, schema, plan.AggregateColumnAt(i), plan.AggregateKindAt(i), i, "aggregate");
+            if (bad != null) { return bad; }
         }
         return plan;
     }
 
-    // 校验查询并构建计划：检查 revision 非负、各类子句非空且列索引/
-    // 操作符/方向/kind 合法，并确认所需能力在 supported 掩码内；
-    // 首个问题即作为 issue 返回（子句列表仍原样复制进计划）。
-    // columnCount<0 表示列数未知，跳过列越界检查。
+    // 校验查询并构建计划；columnCount<0 表示列数未知，跳过列越界检查。
     public static QueryPlan Build(QueryDescriptor query, int columnCount,
                            QueryCapabilities supported) {
         if (query == null) {
             return new QueryPlan("", "", 0, 0, 0, 0, null, null, null, null,
                 new QueryPlanIssue(QueryPlan.InvalidQuery, "query descriptor is null", -1, -1));
         }
-        int supportedMask = 0;
-        if (supported != null) { supportedMask = supported.Mask(); }
-        if (query.DataRevision() < 0 || query.QueryRevision() < 0
-            || query.ViewRevision() < 0) {
-            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                query.DataRevision(), query.QueryRevision(), supportedMask,
-                query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                new QueryPlanIssue(QueryPlan.InvalidRevision,
-                    "query revision must be non-negative", -1, -1));
+        int supportedMask = supported != null ? supported.Mask() : 0;
+        if (query.DataRevision() < 0 || query.QueryRevision() < 0 || query.ViewRevision() < 0) {
+            return QueryPlan.FromQueryError(query, supportedMask,
+                QueryPlan.InvalidRevision, "query revision must be non-negative", -1, -1);
         }
         for (int i = 0; i < query.Filters().Count; i = i + 1) {
             QueryFilterClause f = query.Filters()[i];
-            if (f == null) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidQuery,
-                        "query filter clause is null", -1, i));
-            }
-            if (f.Column() < 0 || (columnCount >= 0 && f.Column() >= columnCount)) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidFilterColumn,
-                        "query filter column is outside schema", f.Column(), i));
-            }
-            if (f.Mode() < QueryFilterMode.Equals
-                || f.Mode() > QueryFilterMode.NotEmpty) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidFilterOperator,
-                        "query filter operator is invalid", f.Column(), i));
-            }
-            if (f.Kind() < 0 || f.Kind() > 3) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
-                        "query filter value kind is invalid", f.Column(), i));
-            }
+            if (f == null) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidQuery, "query filter clause is null", -1, i); }
+            if (f.Column() < 0 || (columnCount >= 0 && f.Column() >= columnCount)) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidFilterColumn, "query filter column is outside schema", f.Column(), i); }
+            if (f.Mode() < QueryFilterMode.Equals || f.Mode() > QueryFilterMode.NotEmpty) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidFilterOperator, "query filter operator is invalid", f.Column(), i); }
+            if (f.Kind() < 0 || f.Kind() > 3) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidValueKind, "query filter value kind is invalid", f.Column(), i); }
         }
-        if (query.Filters().Count > 0
-            && (supportedMask & QueryCapabilities.Filter) == 0) {
-            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                query.DataRevision(), query.QueryRevision(), supportedMask,
-                query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                new QueryPlanIssue(QueryPlan.UnsupportedFilter,
-                    "query source does not support filtering", -1, -1));
+        if (query.Filters().Count > 0 && (supportedMask & QueryCapabilities.Filter) == 0) {
+            return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.UnsupportedFilter, "query source does not support filtering", -1, -1);
         }
         for (int i = 0; i < query.Sorts().Count; i = i + 1) {
             QuerySortClause s = query.Sorts()[i];
-            if (s == null) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidQuery,
-                        "query sort clause is null", -1, i));
-            }
-            if (s.Column() < 0 || (columnCount >= 0 && s.Column() >= columnCount)) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidSortColumn,
-                        "query sort column is outside schema", s.Column(), i));
-            }
-            if (s.Direction() != 1 && s.Direction() != 2) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidSortDirection,
-                        "query sort direction is invalid", s.Column(), i));
-            }
-            if (s.Kind() < 0 || s.Kind() > 3) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
-                        "query sort value kind is invalid", s.Column(), i));
-            }
+            if (s == null) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidQuery, "query sort clause is null", -1, i); }
+            if (s.Column() < 0 || (columnCount >= 0 && s.Column() >= columnCount)) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidSortColumn, "query sort column is outside schema", s.Column(), i); }
+            if (s.Direction() != 1 && s.Direction() != 2) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidSortDirection, "query sort direction is invalid", s.Column(), i); }
+            if (s.Kind() < 0 || s.Kind() > 3) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidValueKind, "query sort value kind is invalid", s.Column(), i); }
         }
-        if (query.Sorts().Count > 0
-            && (supportedMask & QueryCapabilities.Sort) == 0) {
-            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                query.DataRevision(), query.QueryRevision(), supportedMask,
-                query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                new QueryPlanIssue(QueryPlan.UnsupportedSort,
-                    "query source does not support sorting", -1, -1));
+        if (query.Sorts().Count > 0 && (supportedMask & QueryCapabilities.Sort) == 0) {
+            return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.UnsupportedSort, "query source does not support sorting", -1, -1);
         }
         for (int i = 0; i < query.Groups().Count; i = i + 1) {
             QueryGroupClause g = query.Groups()[i];
-            if (g == null) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidQuery,
-                        "query group clause is null", -1, i));
-            }
-            if (g.Column() < 0 || (columnCount >= 0 && g.Column() >= columnCount)) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidSortColumn,
-                        "query group column is outside schema", g.Column(), i));
-            }
-            if (g.Kind() < 0 || g.Kind() > 3) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
-                        "query group value kind is invalid", g.Column(), i));
-            }
+            if (g == null) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidQuery, "query group clause is null", -1, i); }
+            if (g.Column() < 0 || (columnCount >= 0 && g.Column() >= columnCount)) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidSortColumn, "query group column is outside schema", g.Column(), i); }
+            if (g.Kind() < 0 || g.Kind() > 3) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidValueKind, "query group value kind is invalid", g.Column(), i); }
         }
-        if (query.Groups().Count > 0
-            && (supportedMask & QueryCapabilities.Group) == 0) {
-            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                query.DataRevision(), query.QueryRevision(), supportedMask,
-                query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                new QueryPlanIssue(QueryPlan.UnsupportedGroup,
-                    "query source does not support grouping", -1, -1));
+        if (query.Groups().Count > 0 && (supportedMask & QueryCapabilities.Group) == 0) {
+            return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.UnsupportedGroup, "query source does not support grouping", -1, -1);
         }
         for (int i = 0; i < query.Aggregates().Count; i = i + 1) {
             QueryAggregateClause a = query.Aggregates()[i];
-            if (a == null) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidQuery,
-                        "query aggregate clause is null", -1, i));
-            }
-            if (a.Column() < 0 || (columnCount >= 0 && a.Column() >= columnCount)) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidSortColumn,
-                        "query aggregate column is outside schema", a.Column(), i));
-            }
-            if (a.Mode() < 1 || a.Mode() > 5) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidAggregateMode,
-                        "query aggregate mode is invalid", a.Column(), i));
-            }
-            if (a.Kind() < 0 || a.Kind() > 3) {
-                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                    query.DataRevision(), query.QueryRevision(), supportedMask,
-                    query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
-                        "query aggregate value kind is invalid", a.Column(), i));
-            }
+            if (a == null) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidQuery, "query aggregate clause is null", -1, i); }
+            if (a.Column() < 0 || (columnCount >= 0 && a.Column() >= columnCount)) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidSortColumn, "query aggregate column is outside schema", a.Column(), i); }
+            if (a.Mode() < 1 || a.Mode() > 5) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidAggregateMode, "query aggregate mode is invalid", a.Column(), i); }
+            if (a.Kind() < 0 || a.Kind() > 3) { return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.InvalidValueKind, "query aggregate value kind is invalid", a.Column(), i); }
         }
-        if (query.Aggregates().Count > 0
-            && (supportedMask & QueryCapabilities.Aggregate) == 0) {
-            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-                query.DataRevision(), query.QueryRevision(), supportedMask,
-                query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(),
-                new QueryPlanIssue(QueryPlan.UnsupportedAggregate,
-                    "query source does not support aggregation", -1, -1));
+        if (query.Aggregates().Count > 0 && (supportedMask & QueryCapabilities.Aggregate) == 0) {
+            return QueryPlan.FromQueryError(query, supportedMask, QueryPlan.UnsupportedAggregate, "query source does not support aggregation", -1, -1);
         }
-        return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
-            query.DataRevision(), query.QueryRevision(), supportedMask,
-            query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(), null);
+        return QueryPlan.FromQuery(query, supportedMask, null);
     }
 
     // 计划无校验问题时为 true。
@@ -463,42 +338,10 @@ public class QueryPlan {
         return new QuerySortClause(s.Column(), s.Direction(), s.Kind());
     }
 
-    // 单个过滤子句的 JSON 形式（col/op/kind/a/b，均为声明式标量）。
-    public JsonValue FilterJson(QueryFilterClause clause) {
-        JsonValue value = JsonValue.NewObject();
-        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
-        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
-        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
-        value.Put("a", JsonValue.NewStr(clause.Value()));
-        value.Put("b", JsonValue.NewStr(clause.Value2()));
-        return value;
-    }
-
-    // 单个排序子句的 JSON 形式（col/dir/kind）。
-    public JsonValue SortJson(QuerySortClause clause) {
-        JsonValue value = JsonValue.NewObject();
-        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
-        value.Put("dir", JsonValue.NewNum(Convert.ToString(clause.Direction())));
-        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
-        return value;
-    }
-
-    // 单个分组子句的 JSON 形式（col/kind）。
-    public JsonValue GroupJson(QueryGroupClause clause) {
-        JsonValue value = JsonValue.NewObject();
-        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
-        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
-        return value;
-    }
-
-    // 单个聚合子句的 JSON 形式（col/op/kind）。
-    public JsonValue AggregateJson(QueryAggregateClause clause) {
-        JsonValue value = JsonValue.NewObject();
-        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
-        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
-        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
-        return value;
-    }
+    public JsonValue FilterJson(QueryFilterClause clause) { return QueryDescriptor.MakeFilterJson(clause); }
+    public JsonValue SortJson(QuerySortClause clause) { return QueryDescriptor.MakeSortJson(clause); }
+    public JsonValue GroupJson(QueryGroupClause clause) { return QueryDescriptor.MakeGroupJson(clause); }
+    public JsonValue AggregateJson(QueryAggregateClause clause) { return QueryDescriptor.MakeAggregateJson(clause); }
 
     // 计划的 canonical JSON：版本、完整查询身份、四类子句数组，以及失败时的 issue 对象。
     public JsonValue ToJsonValue() {
@@ -510,26 +353,7 @@ public class QueryPlan {
         root.Put("data", JsonValue.NewNum(Convert.ToString(this.dataRevision)));
         root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
         root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
-        JsonValue fs = JsonValue.NewArray();
-        for (int i = 0; i < this.filters.Count; i = i + 1) {
-            fs.Append(this.FilterJson(this.filters[i]));
-        }
-        root.Put("filters", fs);
-        JsonValue ss = JsonValue.NewArray();
-        for (int i = 0; i < this.sorts.Count; i = i + 1) {
-            ss.Append(this.SortJson(this.sorts[i]));
-        }
-        root.Put("sorts", ss);
-        JsonValue gs = JsonValue.NewArray();
-        for (int i = 0; i < this.groups.Count; i = i + 1) {
-            gs.Append(this.GroupJson(this.groups[i]));
-        }
-        root.Put("groups", gs);
-        JsonValue aggs = JsonValue.NewArray();
-        for (int i = 0; i < this.aggregates.Count; i = i + 1) {
-            aggs.Append(this.AggregateJson(this.aggregates[i]));
-        }
-        root.Put("aggregates", aggs);
+        QueryDescriptor.WriteClausesJson(root, true, this.filters, this.sorts, this.groups, this.aggregates);
         if (this.issue != null) {
             JsonValue problem = JsonValue.NewObject();
             problem.Put("code", JsonValue.NewNum(Convert.ToString(this.issue.Code())));

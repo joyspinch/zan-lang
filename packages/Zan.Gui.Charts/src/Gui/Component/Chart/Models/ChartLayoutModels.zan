@@ -1,0 +1,481 @@
+using Gui;
+using System.Json;
+using System.Text;
+using System;
+
+namespace Gui.Component.Chart;
+
+// 已变换到屏幕坐标的一条环（外环或洞），带 bbox 与质心。
+public class MapPolygon {
+    public int region;  // 所属区域下标
+    public bool hole;  // 洞环（回填背景挖空）
+    public List<ChartMapPoint> points;
+    public int minX; public int minY; public int maxX; public int maxY;  // 变换后 bbox（命中加速）
+    public int cx; public int cy;  // 环质心（外环用作标签锚点）
+
+    // 构造一条已变换的环：points 为屏幕坐标（非空），据此计算
+    // bbox 与顶点均值质心。
+    public static MapPolygon Of(int region, bool hole, List<ChartMapPoint> points) {
+        MapPolygon p = new MapPolygon();
+        p.region = region; p.hole = hole; p.points = points;
+        int n = points.Count;
+        long sx = 0; long sy = 0;
+        p.minX = points[0].x; p.maxX = points[0].x;
+        p.minY = points[0].y; p.maxY = points[0].y;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartMapPoint pt = points[i];
+            if (pt.x < p.minX) { p.minX = pt.x; }
+            if (pt.x > p.maxX) { p.maxX = pt.x; }
+            if (pt.y < p.minY) { p.minY = pt.y; }
+            if (pt.y > p.maxY) { p.maxY = pt.y; }
+            sx = sx + (long)pt.x; sy = sy + (long)pt.y;
+        }
+        p.cx = (int)(sx / n); p.cy = (int)(sy / n);
+        return p;
+    }
+}
+
+// 地图布局：全局数据边界等比 fit 到绘图区（居中），输出变换
+// 后的环、缩放（千分比像素/单位）与变换原点。纯几何，不碰
+// Canvas，命中走 bbox + 整数 point-in-polygon。
+public class MapLayout {
+    public List<MapPolygon> polys;
+    public int regionCount;  // 区域数（RegionAt 用）
+    public int scale;  // 千分比像素/单位
+    public int minX; public int minY; public int maxX; public int maxY;  // 数据范围
+    public int offX; public int offY;  // 变换原点（居中后）
+
+    // 静态布局：等价 OfRoam(zoom=100, pan=(0,0))。
+    public static MapLayout Of(List<ChartMapRegion> regions, int x, int y, int w, int h, int pad) {
+        return MapLayout.OfRoam(regions, x, y, w, h, pad, 100, 0, 0);
+    }
+
+    // 全局数据边界等比 fit 进 (w-2pad)×(h-2pad) 并居中，再按
+    // zoom（百分比，钳 40..280）放大、平移 (panX,panY)。输出
+    // 变换后的环列表与 scale（千分比像素/单位）；所有环都退化
+    // （<3 点）时 scale=0 且 polys 为空。
+    public static MapLayout OfRoam(List<ChartMapRegion> regions, int x, int y, int w, int h,
+                            int pad, int zoom, int panX, int panY) {
+        // 全局数据边界（所有环的所有点；<3 点的退化环忽略）。
+        bool any = false;
+        int mnX = 0; int mnY = 0; int mxX = 0; int mxY = 0;
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    int px = ps[i].x; int py = ps[i].y;
+                    if (!any) { mnX = px; mxX = px; mnY = py; mxY = py; any = true; }
+                    else {
+                        if (px < mnX) { mnX = px; }
+                        if (px > mxX) { mxX = px; }
+                        if (py < mnY) { mnY = py; }
+                        if (py > mxY) { mxY = py; }
+                    }
+                }
+            }
+        }
+        if (!any) { MapLayout empty = new MapLayout(); empty.polys = new List<MapPolygon>(); empty.scale = 0; return empty; }
+        return MapLayout.OfRoamBox(mnX, mnY, mxX, mxY, regions, x, y, w, h,
+            pad, zoom, panX, panY);
+    }
+
+    // 显式源框（minX..maxX）版布局：数据边界由调用方给定
+    // （SVG 地图传 viewBox 框，让折线覆盖与光栅底图共用同一
+    // contain-fit 仿射）。其余语义同 OfRoam。
+    public static MapLayout OfRoamBox(int mnX, int mnY, int mxX, int mxY,
+                               List<ChartMapRegion> regions, int x, int y, int w, int h,
+                               int pad, int zoom, int panX, int panY) {
+        MapLayout l = new MapLayout();
+        l.polys = new List<MapPolygon>();
+        l.regionCount = regions.Count;
+        int pw = w - pad * 2;
+        int ph = h - pad * 2;
+        if (pw < 1) { pw = 1; }
+        if (ph < 1) { ph = 1; }
+        if (zoom < 40) { zoom = 40; }
+        if (zoom > 280) { zoom = 280; }
+        l.minX = mnX; l.minY = mnY; l.maxX = mxX; l.maxY = mxY;
+
+        long bw = (long)mxX - (long)mnX;
+        long bh = (long)mxY - (long)mnY;
+        if (bw < 1) { bw = 1; }
+        if (bh < 1) { bh = 1; }
+        int sc = (int)((long)pw * 1000 / bw);
+        int scH = (int)((long)ph * 1000 / bh);
+        if (scH < sc) { sc = scH; }
+        if (sc < 1) { sc = 1; }
+        sc = sc * zoom / 100;
+        if (sc < 1) { sc = 1; }
+        l.scale = sc;
+
+        // 变换后实际像素宽高，居中偏移，再减漫游平移。
+        int ow = (int)(bw * (long)sc / 1000);
+        int oh = (int)(bh * (long)sc / 1000);
+        int ox = x + pad + (pw - ow) / 2 - panX;
+        int oy = y + pad + (ph - oh) / 2 - panY;
+        l.offX = ox; l.offY = oy;
+
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            List<ChartMapRing> rings = regions[r].rings;
+            for (int k = 0; k < rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = rings[k].points;
+                if (ps.Count < 3) { continue; }
+                List<ChartMapPoint> tr = new List<ChartMapPoint>();
+                for (int i = 0; i < ps.Count; i = i + 1) {
+                    long dx = (long)ps[i].x - (long)mnX;
+                    long dy = (long)ps[i].y - (long)mnY;
+                    int sx = ox + (int)(dx * (long)sc / 1000);
+                    int sy = oy + (int)(dy * (long)sc / 1000);
+                    tr.Add(ChartMapPoint.Of(sx, sy));
+                }
+                l.polys.Add(MapPolygon.Of(r, rings[k].hole, tr));
+            }
+        }
+        return l;
+    }
+
+    // 命中：返回包含 (px,py) 的区域下标（在任一外环内且不在
+    // 任何洞内；区域从后往前先到先得），否则 -1。
+    public static int RegionAt(MapLayout l, int px, int py) {
+        for (int r = l.regionCount - 1; r >= 0; r = r - 1) {
+            bool hit = false;
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = true; break; }
+            }
+            if (!hit) { continue; }
+            for (int i = 0; i < l.polys.Count; i = i + 1) {
+                MapPolygon p = l.polys[i];
+                if (p.region != r || !p.hole) { continue; }
+                if (px < p.minX || px > p.maxX || py < p.minY || py > p.maxY) { continue; }
+                if (Chart.PointInPoly(p.points, px, py)) { hit = false; break; }
+            }
+            if (hit) { return r; }
+        }
+        return 0 - 1;
+    }
+}
+
+// 极坐标轴规格（angleAxis / radiusAxis）
+public class PolarAxisSpec {
+    public bool isAngle;
+    public ChartAxisType type;
+    public int polarIndex;
+    public int min;
+    public int max;
+    public bool minSet;
+    public bool maxSet;
+    public int startAngle;
+    public int endAngle;
+    public bool endAngleSet;
+    public bool clockwise;
+    public bool boundaryGap;
+    public List<string> cats;
+
+    public static PolarAxisSpec Of(bool angle) {
+        PolarAxisSpec a = new PolarAxisSpec();
+        a.isAngle = angle;
+        a.type = ChartAxisType.Value;
+        a.polarIndex = 0;
+        a.min = ChartOption.Auto();
+        a.max = ChartOption.Auto();
+        a.minSet = false; a.maxSet = false;
+        a.startAngle = 90;
+        a.endAngle = 0;
+        a.endAngleSet = false;
+        a.clockwise = true;
+        a.boundaryGap = true;
+        a.cats = new List<string>();
+        return a;
+    }
+
+    public PolarAxisSpec Clone() {
+        PolarAxisSpec a = PolarAxisSpec.Of(this.isAngle);
+        a.type = this.type;
+        a.polarIndex = this.polarIndex;
+        a.min = this.min; a.max = this.max;
+        a.minSet = this.minSet; a.maxSet = this.maxSet;
+        a.startAngle = this.startAngle;
+        a.endAngle = this.endAngle;
+        a.endAngleSet = this.endAngleSet;
+        a.clockwise = this.clockwise;
+        a.boundaryGap = this.boundaryGap;
+        if (this.cats != null) {
+            for (int i = 0; i < this.cats.Count; i = i + 1) { a.cats.Add(this.cats[i]); }
+        }
+        return a;
+    }
+
+    public static PolarAxisSpec Clone(PolarAxisSpec src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class RadarIndicator {
+    public string text;
+    public string name;
+    public int max;
+
+    public RadarIndicator(string text, int max) {
+        this.text = text != null ? text : "";
+        this.name = this.text;
+        this.max = max;
+    }
+
+    public static RadarIndicator Of(string text, int max) {
+        return new RadarIndicator(text, max);
+    }
+}
+
+// 雷达极坐标指示器样式实体（消除 pnameCol / pnameFmt 平行列表反模式）。
+public class PolarNameStyle {
+    public int color;
+    public string format;
+
+    public PolarNameStyle(int color, string format) {
+        this.color = color;
+        this.format = format;
+    }
+}
+
+public class RadarPolar {
+    public List<RadarIndicator> indicators;  // 每轴指示器强类型实体列表（主表示）
+    public List<string> indicatorText;  // 指示器名称投影列表
+    public List<int> indicatorMax;  // 指示器最大值投影列表
+    public ChartPosition center;  // 圆心（% 相对面板宽高 / px）；null = 单 polar 自动居中
+    public ChartScalar radius;  // 外径（% 相对 min(areaW,areaH)/2 / px）；0 = 自动
+    public ChartScalar radiusInner;  // 内径（polar.radius:[30,'80%'] 的首元）；
+                                // Px(0) = 从圆心起（ECharts 缺省 [0,'80%']）
+    public int startAngle;  // 第一轴的数学角（90 = 正上，ECharts 默认）
+    public int splitNumber;  // 环数；0 = 4（与单 polar 现状一致）
+    public string type;  // "" / "circle" / "polygon"；"" = 跟全局 radarShape
+    public int nameColor;  // 指示器名颜色；0 = 主主题轴色
+    public string nameFormat;  // 指示器名模板（ECharts name.formatter 字符串版，
+                                // "{value}" 占位；"" = 原名）
+    public int axisLineColor;  // 轴线颜色；0 = 主题网格色
+    public int axisLineWidth;  // 轴线宽；0 = 1
+    public int splitLineColor;  // 分隔环线颜色；0 = 主题网格色
+    public int splitLineWidth;  // 分隔环线宽；0 = 1
+    public List<int> splitAreaColors;  // 环带交替色（约 30% 透明绘制）；空 = 跟全局
+
+    public static RadarPolar Create() {
+        RadarPolar p = new RadarPolar {
+            indicators = new List<RadarIndicator>(),
+            indicatorText = new List<string>(),
+            indicatorMax = new List<int>(),
+            center = null, radius = ChartScalar.Px(0),
+            radiusInner = ChartScalar.Px(0), startAngle = 90,
+            splitNumber = 0, type = "", nameColor = 0, nameFormat = "",
+            axisLineColor = 0, axisLineWidth = 0, splitLineColor = 0,
+            splitLineWidth = 0, splitAreaColors = new List<int>()
+        };
+        return p;
+    }
+
+    // 面向对象深复制实例方法。
+    public RadarPolar Clone() {
+        RadarPolar p = new RadarPolar {
+            indicators = new List<RadarIndicator>(),
+            indicatorText = new List<string>(),
+            indicatorMax = new List<int>(),
+            center = this.center != null ? this.center.Clone() : null,
+            radius = this.radius != null ? this.radius.Clone() : null,
+            radiusInner = this.radiusInner != null ? this.radiusInner.Clone() : null,
+            startAngle = this.startAngle, splitNumber = this.splitNumber,
+            type = this.type, nameColor = this.nameColor, nameFormat = this.nameFormat,
+            axisLineColor = this.axisLineColor, axisLineWidth = this.axisLineWidth,
+            splitLineColor = this.splitLineColor, splitLineWidth = this.splitLineWidth,
+            splitAreaColors = new List<int>()
+        };
+        if (this.indicators != null) {
+            for (int i = 0; i < this.indicators.Count; i = i + 1) {
+                p.indicators.Add(new RadarIndicator(this.indicators[i].text, this.indicators[i].max));
+            }
+        }
+        if (this.indicatorText != null) {
+            for (int i = 0; i < this.indicatorText.Count; i = i + 1) {
+                p.indicatorText.Add(this.indicatorText[i]);
+            }
+        }
+        if (this.indicatorMax != null) {
+            for (int i = 0; i < this.indicatorMax.Count; i = i + 1) {
+                p.indicatorMax.Add(this.indicatorMax[i]);
+            }
+        }
+        if (this.splitAreaColors != null) {
+            for (int i = 0; i < this.splitAreaColors.Count; i = i + 1) {
+                p.splitAreaColors.Add(this.splitAreaColors[i]);
+            }
+        }
+        return p;
+    }
+
+    public static RadarPolar Clone(RadarPolar src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 单个源系列的只读绘制快照。保留 source 引用，使渲染器
+// 无需复制数据，同时把继承值和交互状态隔离在当前帧。
+public class ResolvedSeries {
+    public ChartSeries source;
+    public int color;
+    public int lineColor;
+    public int lineWidth;
+    public int areaColor;
+    public int labelColor;
+    public int labelFontSize;
+    public int emphColor;  // itemStyle.emphasis.color（0 = 同 normal）
+    public int emphBorderColor;  // 强调描边色
+    public int emphBorderWidth;  // 强调描边宽（0 = 无强调描边）
+    public bool hidden;
+    public int wid;
+    public bool animate;
+    public bool visBlocked;  // 源系列显式声明了 lineStyle.color
+
+    // 解析单个系列：主色/线色/线宽/面积色/标签字号按
+    // 系列值 -> itemStyle.normal -> 调色板/theme 依次回退；
+    // emphasis 强调 paint 同步解析（缺省回退 normal）。
+    // hidden/wid/animate 原样记录。
+    public static ResolvedSeries Of(ChartSeries source, Theme theme, int index,
+                             int wid, bool animate, bool hidden, List<int> pal) {
+        ResolvedSeries r = new ResolvedSeries();
+        r.source = source;
+        r.color = source.color;
+        if (r.color == 0) { r.color = source.itemStyle.normal.color; }
+        // ECharts 根级 color 调色板：优先于官方缺省 9 档，按绘制序
+        // 取模循环（官方 paletteSwap 同语义）。
+        if (r.color == 0 && pal != null && pal.Count > 0) {
+            r.color = pal[index % pal.Count];
+        }
+        if (r.color == 0) { r.color = ChartColor.Palette(theme, index); }
+        r.lineColor = source.itemStyle.normal.lineStyle.color;
+        r.visBlocked = r.lineColor != 0;
+        if (r.lineColor == 0) { r.lineColor = r.color; }
+        r.lineWidth = source.itemStyle.normal.lineStyle.width;
+        if (r.lineWidth <= 0) { r.lineWidth = 2; }
+        r.areaColor = source.itemStyle.normal.areaStyle.color;
+        if (r.areaColor == 0) { r.areaColor = r.color; }
+        r.labelColor = source.label.color;
+        r.labelFontSize = source.label.fontSize;
+        if (r.labelFontSize <= 0) { r.labelFontSize = theme.fontSizeSmall; }
+        // 强调（hover）paint：解析到 ResolvedSeries，命中时
+        // 渲染器用 Effective* 取色，源系列永不被改写。
+        r.emphColor = source.itemStyle.emphasis.color;
+        if (r.emphColor == 0) { r.emphColor = r.color; }
+        r.emphBorderColor = source.itemStyle.emphasis.borderColor;
+        if (r.emphBorderColor == 0) { r.emphBorderColor = source.itemStyle.normal.borderColor; }
+        r.emphBorderWidth = source.itemStyle.emphasis.borderWidth;
+        if (r.emphBorderWidth < 0) { r.emphBorderWidth = 0; }
+        r.hidden = hidden;
+        r.wid = wid;
+        r.animate = animate;
+        return r;
+    }
+
+    // 第 index 个数据项的绘制色：数据项自带 color 非零时优先，
+    // 否则回退系列解析主色。
+    public int DataColor(int index) {
+        if (index >= 0 && index < this.source.data.Count
+            && this.source.data[index].color != 0) {
+            return this.source.data[index].color;
+        }
+        return this.color;
+    }
+
+    // CSS 覆写入口（chart::series-N）：替换系列主色并同步
+    // 未被显式指定的派生色（线/面积/强调色跟随主色）。
+    public void OverrideColor(int cssColor) {
+        if (cssColor == 0) { return; }
+        this.color = cssColor;
+        if (this.source.itemStyle.normal.lineStyle.color == 0) { this.lineColor = cssColor; }
+        if (this.source.itemStyle.normal.areaStyle.color == 0) { this.areaColor = cssColor; }
+        if (this.source.itemStyle.emphasis.color == 0) { this.emphColor = cssColor; }
+    }
+
+    // 命中（hover）后的有效 paint：强调色优先；普通状态
+    // 返回解析色。三者都只读，不触碰源系列。
+    public int EffectiveColor(bool hovered) {
+        if (hovered) { return this.emphColor; }
+        return this.color;
+    }
+    // 有效边框色：hovered 取 emphasis.borderColor（解析时缺省
+    // 已回退 normal），普通状态取 normal.borderColor。
+    public int EffectiveBorderColor(bool hovered) {
+        if (hovered) { return this.emphBorderColor; }
+        return this.source.itemStyle.normal.borderColor;
+    }
+    // 有效边框宽：hovered 取 emphasis.borderWidth（解析时负值
+    // 已钳为 0），普通状态取 normal.borderWidth。
+    public int EffectiveBorderWidth(bool hovered) {
+        if (hovered) { return this.emphBorderWidth; }
+        return this.source.itemStyle.normal.borderWidth;
+    }
+
+    // 把解析结果物化回一份源系列的深复制：外壳样式字段（主色/
+    // hidden/线色/线宽/面积色/标签色与字号）用解析值覆盖，数据
+    // 集合与其余字段原样保留。供仍按 ChartSeries 绘制的路径使用。
+    // allowShare（阶段 B 克隆税豁免）：本帧渲染路径对数据集合
+    // 只读时，data/points/candles 等逐项大集合与源系列只读共享
+    // （ChartSeries.Clone(src, true)），不逐项深拷。凡可能经
+    // ApplyDataLegend 写 data[].hidden/selected 的系列（pie/rose/
+    // funnel 面板与 pie/funnel 覆盖层）必须保持全量克隆，否则
+    // 交互态会漏写进长寿缓存的源 option。
+    public ChartSeries Materialize(bool allowShare) {
+        ChartSeries src = this.source;
+        bool share = allowShare && src.type != ChartType.Pie
+            && src.type != ChartType.Funnel;
+        ChartSeries s = src != null ? src.Clone(share) : null;
+        if (s == null) { return null; }
+        s.color = this.color; s.hidden = this.hidden;
+        ChartItemStyle style = ChartItemStyle.Create();
+        style.normal.color = src.itemStyle.normal.color;
+        style.normal.color0 = src.itemStyle.normal.color0;
+        style.normal.borderColor = src.itemStyle.normal.borderColor;
+        style.normal.borderWidth = src.itemStyle.normal.borderWidth;
+        style.normal.lineStyle.color = this.lineColor;
+        s.visBlocked = this.visBlocked;
+        style.normal.lineStyle.color0 = src.itemStyle.normal.lineStyle.color0;
+        style.normal.lineStyle.width = this.lineWidth;
+        style.normal.lineStyle.type = src.itemStyle.normal.lineStyle.type;
+        style.normal.lineStyle.shadowColor = src.itemStyle.normal.lineStyle.shadowColor;
+        style.normal.lineStyle.shadowBlur = src.itemStyle.normal.lineStyle.shadowBlur;
+        // __grad 渐变 stops（只读共享引用）。
+        style.normal.lineStyle.gradStops = src.itemStyle.normal.lineStyle.gradStops;
+        style.normal.lineStyle.transparent = src.itemStyle.normal.lineStyle.transparent;
+        style.normal.areaStyle.color = this.areaColor;
+        style.normal.areaStyle.type = src.itemStyle.normal.areaStyle.type;
+        style.normal.areaStyle.gradStops = src.itemStyle.normal.areaStyle.gradStops;
+        style.normal.areaStyle.alpha = src.itemStyle.normal.areaStyle.alpha;
+        style.normal.borderRadius = new List<int>();
+        for (int bri = 0; bri < src.itemStyle.normal.borderRadius.Count; bri = bri + 1) {
+            style.normal.borderRadius.Add(src.itemStyle.normal.borderRadius[bri]);
+        }
+        style.emphasis = ChartItemStyle.CloneState(src.itemStyle.emphasis);
+        s.itemStyle = style;
+        ChartTextStyle label = ChartTextStyle.Create();
+        label.color = this.labelColor; label.fontSize = this.labelFontSize;
+        label.fontStyle = src.label.fontStyle; label.fontWeight = src.label.fontWeight;
+        label.fontFamily = src.label.fontFamily; label.shadowColor = src.label.shadowColor;
+        label.shadowBlur = src.label.shadowBlur; s.label = label;
+        // 富文本表与整块底板随行（rich 表只读共享——解析后渲染期
+        // 不可变，不必逐样式深拷）。
+        label.rich = src.label.rich;
+        label.lineHeight = src.label.lineHeight;
+        label.boxBg = src.label.boxBg;
+        label.boxBorder = src.label.boxBorder;
+        label.boxBorderW = src.label.boxBorderW;
+        label.boxRadius = src.label.boxRadius;
+        label.padT = src.label.padT;
+        label.padR = src.label.padR;
+        label.padB = src.label.padB;
+        label.padL = src.label.padL;
+        return s;
+    }
+}

@@ -178,55 +178,15 @@ public class LocalDataSource : QueryDataSource {
     // cell 用稳定 Field 名寻址单列，未知 Field 计入 missing。
     // 应用完成即 Refresh——页缓存与查询 revision 一起失效，
     // 网格在下一帧 Poll 到并重算显示模型。
+    protected override int ResolveDeltaRow(List<DataRow> list, string canonical) {
+        return this.RowOfKey(canonical);
+    }
+
     override DeltaResult ApplyDeltas(DeltaBatch batch) {
-        if (batch == null) { return null; }
-        batch.Compress();
-        DeltaResult result = DeltaResult.Create();
-        bool changed = false;
-        for (int i = 0; i < batch.Count(); i = i + 1) {
-            DeltaOp op = batch.At(i);
-            string canonical = op.Key();
-            int at = this.RowOfKey(canonical);
-            if (op.Kind() == DeltaOp.Remove) {
-                if (at >= 0) {
-                    this.rows.RemoveAt(at);
-                    result.removed = result.removed + 1;
-                    changed = true;
-                }
-            } else if (op.Kind() == DeltaOp.Upsert) {
-                List<string> values = op.Cells();
-                if (at >= 0) {
-                    DataRow existing = this.rows[at];
-                    for (int c = 0; c < values.Count; c = c + 1) {
-                        existing.Set(c, values[c]);
-                    }
-                    result.updated = result.updated + 1;
-                } else {
-                    DataRow fresh = new DataRow();
-                    for (int c = 0; c < values.Count; c = c + 1) {
-                        fresh.Set(c, values[c]);
-                    }
-                    this.rows.Add(fresh);
-                    result.inserted = result.inserted + 1;
-                }
-                changed = true;
-            } else if (op.Kind() == DeltaOp.Cell) {
-                if (at < 0) { result.missing = result.missing + 1; continue; }
-                int col = -1;
-                for (int c = 0; c < this.rows[at].Count(); c = c + 1) {
-                    // cell 操作的 field 在应用时按列 Field 名解析：
-                    // 列列表属于网格，源这里只按名称缓存查找。
-                    if (this.cellFieldOf != null && this.cellFieldOf(c) == op.Field()) {
-                        col = c; c = this.rows[at].Count();
-                    }
-                }
-                if (col < 0) { result.missing = result.missing + 1; continue; }
-                this.rows[at].Set(col, op.Value());
-                result.cells = result.cells + 1;
-                changed = true;
-            }
+        DeltaResult result = this.ApplyDeltasToRows(this.rows, batch, this.cellFieldOf, false);
+        if (result != null && result.inserted + result.updated + result.removed + result.cells > 0) {
+            this.Refresh();
         }
-        if (changed) { this.Refresh(); }
         return result;
     }
 

@@ -1,0 +1,271 @@
+using Gui;
+using System.Collections.Generic;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Json;
+using System;
+
+namespace Gui.Component.Chart;
+
+// Canvas is borrowed: retaining a pixel-cache entry must not retain its window.
+public class ChartCacheOwner {
+    public weak Canvas canvas;
+    public bool scoped;
+    public int key;
+    public ChartView view;
+    public int renderRevision;
+    internal bool prepared;
+    internal int preparedFingerprint;
+}
+
+internal class ChartDataRangeLayout {
+    internal int x;
+    internal int y;
+    internal int w;
+    internal int h;
+    internal int lo;
+    internal int hi;
+    internal int loX;
+    internal int hiX;
+    internal int handle;
+    internal List<ChartLegendEntry> splits = new List<ChartLegendEntry>();
+
+    internal static ChartDataRangeLayout Create(App app, ChartOption o, int x, int y, int w, int h) {
+        if (!o.dataRangeShow || o.iwid == 0) { return null; }
+        ChartDataRangeLayout layout = new ChartDataRangeLayout();
+        int pad = ChartViewDataRange.Pad(app);
+        layout.x = x + pad; layout.w = w - pad * 2;
+        layout.y = y + app.Scale(2); layout.h = app.Scale(12);
+        if (layout.w < app.Scale(24)) { return null; }
+        ChartViewDataRange.DataSpan(o, out int lo, out int hi);
+        layout.lo = o.dataRangeLo != ChartOption.Auto() ? o.dataRangeLo : lo;
+        layout.hi = o.dataRangeHi != ChartOption.Auto() ? o.dataRangeHi : hi;
+        if (layout.hi <= layout.lo) { layout.hi = layout.lo + 1; }
+        layout.loX = layout.x + app.StateGet(Chart.DRangeLoKey(o.iwid), 0) * layout.w / 1000;
+        layout.hiX = layout.x + app.StateGet(Chart.DRangeHiKey(o.iwid), 1000) * layout.w / 1000;
+        layout.handle = app.Scale(6);
+        int fs = ChartFonts.SeriesLabel(app);
+        int sw = app.Scale(10);
+        int gap = app.Scale(6);
+        int rowH = Canvas.FontHeight(fs) + app.Scale(4);
+        int cx = x + pad;
+        int cy = y + (h - rowH) / 2;
+        for (int i = 0; i < o.dataRangeList.Count; i = i + 1) {
+            string label = o.dataRangeList[i].label;
+            int width = sw + app.Scale(4) + Canvas.MeasureText(label, fs);
+            if (cx > x + pad && cx + width + gap > x + w - pad) {
+                cx = x + pad; cy = cy + rowH + app.Scale(2);
+            }
+            layout.splits.Add(ChartLegendEntry.Of(23, i, cx, cy, width, rowH, label));
+            cx = cx + width + gap;
+        }
+        return layout;
+    }
+}
+
+internal class ChartToolboxSave {
+    internal weak App app;
+    internal int wid;
+    internal int x; internal int y; internal int w; internal int h;
+}
+
+public partial class ChartView {
+    static List<ChartToolboxSave> toolboxSaves;
+
+    internal static void EnsurePresentTail() {
+        if (ChartView.tailHooked) { return; }
+        ChartView.tailHooked = true;
+        App.AddPresentTail(ChartView.FlushPresentation);
+    }
+
+    static void FlushPresentation(App app) {
+        ChartView.FlushTooltips(app);
+        ChartParallelGeometry.Flush(app);
+        if (ChartView.toolboxSaves == null) { return; }
+        for (int i = ChartView.toolboxSaves.Count - 1; i >= 0; i = i - 1) {
+            ChartToolboxSave request = ChartView.toolboxSaves[i];
+            App owner = request.app;
+            if (owner == null || !owner.isRunning) { ChartView.toolboxSaves.RemoveAt(i); continue; }
+            if (owner != app) { continue; }
+            ChartView.toolboxSaves.RemoveAt(i);
+            ChartView.SaveToolboxImage(app, request);
+        }
+        if (ChartView.toolboxSaves.Count == 0) { ChartView.toolboxSaves = null; }
+    }
+
+    static void SaveToolboxImage(App app, ChartToolboxSave request) {
+        int x = request.x; int y = request.y; int w = request.w; int h = request.h;
+        if (x < 0 || y < 0 || w <= 0 || h <= 0 || (long)x + w > app.canvas.Width()
+        || (long)y + h > app.canvas.Height() || (long)w * h > int.MaxValue / 4
+        || (long)w * h * 4 + h > int.MaxValue) {
+            throw new ArgumentException("Chart save rectangle is outside the canvas");
+        }
+        byte[] rgba = new byte[w * h * 4];
+        int at = 0;
+        for (int py = 0; py < h; py = py + 1) {
+            for (int px = 0; px < w; px = px + 1) {
+                int argb = app.canvas.GetPixel(x + px, y + py);
+                rgba[at] = (byte)(argb >> 16); rgba[at + 1] = (byte)(argb >> 8);
+                rgba[at + 2] = (byte)argb; rgba[at + 3] = (byte)(argb >> 24);
+                at = at + 4;
+            }
+        }
+        File.WriteAllBytes("chart_" + Convert.ToString(request.wid) + ".png", Png.Encode(w, h, rgba));
+    }
+
+    public static void QueueToolboxSave(App app, int wid, int x, int y, int w, int h) {
+        if (app == null || !app.isRunning || w <= 0 || h <= 0) { return; }
+        ChartView.EnsurePresentTail();
+        if (ChartView.toolboxSaves == null) { ChartView.toolboxSaves = new List<ChartToolboxSave>(); }
+        ChartToolboxSave request = null;
+        for (int i = 0; i < ChartView.toolboxSaves.Count; i = i + 1) {
+            ChartToolboxSave item = ChartView.toolboxSaves[i];
+            if (item.app == app && item.wid == wid) { request = item; break; }
+        }
+        if (request == null) {
+            request = new ChartToolboxSave(); request.app = app; request.wid = wid;
+            ChartView.toolboxSaves.Add(request);
+        }
+        request.x = x; request.y = y; request.w = w; request.h = h;
+        app.RequestRedraw();
+    }
+}
+
+// 图表系列渲染器策略契约（Strategy Pattern）。
+// 解耦 ChartView 巨型分发，使各类图表具备独立的渲染与交互职责，
+// 并支持第三方/插件扩展自定义系列渲染器。
+public interface ISeriesRenderer {
+    // 判定该渲染器是否能够处理指定的系列类型 / 调度标记（如 "pie", "bar", "line" 等）
+    bool CanRender(string kind);
+
+    // 执行系列主体的排版与绘制
+    void Render(App app, int x, int y, int w, int h, ChartOption option, int g);
+}
+
+// 图表系列扩展渲染器注册中心。
+// 支持第三方或自定义图表类型通过 SeriesRendererRegistry.Register 注册扩展渲染策略。
+public class SeriesRendererRegistry {
+    static List<ISeriesRenderer> renderers;
+
+    public static void Register(ISeriesRenderer renderer) {
+        if (renderer == null) { return; }
+        if (SeriesRendererRegistry.renderers == null) {
+            SeriesRendererRegistry.renderers = new List<ISeriesRenderer>();
+        }
+        SeriesRendererRegistry.renderers.Insert(0, renderer);
+    }
+
+    public static ISeriesRenderer Find(string kind) {
+        if (SeriesRendererRegistry.renderers == null) { return null; }
+        for (int i = 0; i < SeriesRendererRegistry.renderers.Count; i = i + 1) {
+            ISeriesRenderer r = SeriesRendererRegistry.renderers[i];
+            if (r != null && r.CanRender(kind)) {
+                return r;
+            }
+        }
+        return null;
+    }
+}
+
+// 树形图布局的中间记录：节点 + 深度 + 叶子 span 起点
+// （见 ChartView.TreeAssign）。
+public class TreeLayoutNode {
+    public ChartNode node;
+    public int depth;
+    public int lo;
+    public int count;
+
+    // 构造布局记录：node/depth/lo/count 全按参数记录
+    // （count = 子树叶子槽位数，由调用方传入）。
+    public static TreeLayoutNode Of(ChartNode node, int depth, int lo, int count) {
+        TreeLayoutNode layout = new TreeLayoutNode();
+        layout.node = node;
+        layout.depth = depth;
+        layout.lo = lo;
+        layout.count = count;
+        return layout;
+    }
+}
+
+// 桑基图节点布局：按最长路径分层的层号 + 累计流量决定的
+// 高度与 x/y 落点（见 ChartView.DrawSankey）。
+public class SankeyNodeLayout {
+    public string name;
+    public int layer;
+    public int flowOut;
+    public int flowIn;
+    public int x;
+    public int y;
+    public int h;
+
+    // 构造桑基节点：仅记名字，layer/flow/x/y/h 由布局阶段填充。
+    public static SankeyNodeLayout Of(string name) {
+        SankeyNodeLayout node = new SankeyNodeLayout();
+        node.name = name;
+        node.layer = 0;
+        node.flowOut = 0;
+        node.flowIn = 0;
+        node.x = 0;
+        node.y = 0;
+        node.h = 0;
+        return node;
+    }
+}
+
+// 词云单个词条的放置结果：内容（ChartData 引用）+ 轴对齐
+// 包围盒 + 字号/颜色/旋转角。坐标相对绘图区。
+public class WordCloudItem {
+    public ChartData data;
+    // 包围盒左上角（rot != 0 时为旋转后的包围盒）。
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public int fontSize;
+    public int color;
+    // 旋转角（度，0/90 来自 ECharts rotateRange 的两态，自定义角度集
+    // 由 wcRotateList 提供）；旋转项的 x/y/w/h 存的是旋转后的包围盒。
+    public int rot;
+
+    // 构造词条放置项：内容引用与几何/样式全按参数记录。
+    public static WordCloudItem Of(ChartData data, int x, int y, int w, int h,
+                            int fontSize, int color, int rot) {
+        WordCloudItem item = new WordCloudItem();
+        item.data = data;
+        item.x = x;
+        item.y = y;
+        item.w = w;
+        item.h = h;
+        item.fontSize = fontSize;
+        item.color = color;
+        item.rot = rot;
+        return item;
+    }
+}
+
+// 词云放置结果的逐帧记忆化条目：螺旋放置只依赖词条内容与
+// 盒子几何，即时模式调用方每帧重建 option 对象，按内容指纹
+// 复用同一次放置搜索（见 ChartView.DrawWordCloud）。
+internal class WordCloudCacheEntry {
+    public int fp;
+    public List<WordCloudItem> items;
+    // 按内容指纹查找缓存的放置结果；未命中返回 null。
+    public static WordCloudCacheEntry Lookup(List<WordCloudCacheEntry> cache, int fp) {
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            if (cache[i].fp == fp) { return cache[i]; }
+        }
+        return null;
+    }
+    // 存入放置结果（同指纹去重；超出容量时挤掉最旧的一条）。
+    public static void Store(List<WordCloudCacheEntry> cache, int fp,
+                             List<WordCloudItem> items, int capacity) {
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            if (cache[i].fp == fp) { return; }
+        }
+        WordCloudCacheEntry e = new WordCloudCacheEntry();
+        e.fp = fp;
+        e.items = items;
+        if (cache.Count >= capacity) { cache.RemoveAt(0); }
+        cache.Add(e);
+    }
+}

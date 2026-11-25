@@ -1,0 +1,431 @@
+using Gui.Widget;
+using Gui;
+using System.Collections.Generic;
+using System;
+
+namespace Gui.Component;
+
+public class ChatBubble {
+    // 消息在 `data` 里的下标；-1 表示这不是一条消息（busy 提示行）。
+    public int idx;
+    // 内容坐标里的顶边，以及这块占的高度（含名字行与时刻分隔）。
+    public int top;
+    public int h;
+    // 顶部为时刻分隔预留的高度（0 = 这条不画分隔）与要画的文本。
+    public int divH;
+    public string divText;
+    // 名字行高度（群聊里别人的消息才有）与名字。
+    public int nameH;
+    public string name;
+    // 引用块高度（这条消息是「引用某条消息」的回复时非 0）与内容：
+    // 被引人的显示名 + 原文摘要。IM 客户端把引用画在正文上方那一条，
+    // 与名字行占的是同一段纵向空间的两个位置（引用在下、名字在上）。
+    public int quoteH;
+    public string quoteWho;
+    public string quoteText;
+    // 已经省略号截好的引用行（`引用者: 摘要`），绘制时直接画它，
+    // 免得每帧在一段长摘要上做一次二分。
+    public string quoteShown;
+    // 气泡正文的换行结果与最长行宽（图片气泡为空 / 0）。
+    public List<string> lines;
+    // 展示行 → 正文的字节偏移账（与 `lines` 同长）：鼠标落点换算成
+    // 正文偏移、选区高亮反算每行的像素区间都要它。图片气泡为空。
+    public WrappedText linesAt;
+    public int textW;
+    // 图片气泡的画面尺寸（0 = 文本气泡）。
+    public int imgW;
+    public int imgH;
+    // 图片气泡的图片路径（`imgW > 0` 时有效）。
+    public string imgPath;
+    // 头像首字与配色类名（busy 行没有头像）。
+    public string initial;
+    public string avaCls;
+    // 这条是「我」发的（右对齐、头像在右）。
+    public bool mine;
+    // 气泡自身的宽高（含内边距）。
+    public int bw;
+    public int bh;
+    // busy 提示行：气泡用弱色画、不跟任何消息关联。
+    public bool waiting;
+
+    // 全部字段显式归零：`new` 出来的实例不依赖语言对未赋值字段的默认值。
+    public ChatBubble() {
+        idx = 0 - 1;
+        top = 0;
+        h = 0;
+        divH = 0;
+        divText = "";
+        nameH = 0;
+        name = "";
+        quoteH = 0;
+        quoteWho = "";
+        quoteText = "";
+        quoteShown = "";
+        lines = new List<string>();
+        linesAt = null;
+        textW = 0;
+        imgW = 0;
+        imgH = 0;
+        imgPath = "";
+        initial = "";
+        avaCls = "";
+        mine = false;
+        bw = 0;
+        bh = 0;
+        waiting = false;
+    }
+}
+
+public class ChatHit {
+    public int msg;
+    public int off;
+
+    public ChatHit() {
+        this.msg = 0 - 1;
+        this.off = 0;
+    }
+}
+
+public class ChatMessage {
+    public string role;
+    public string text;
+    public string reason;
+    public string agent;
+    public string to;
+    public string kind;
+    public string taskId;
+    public int progress;
+    // 这一拍实际发出的工具调用（宿主自己的格式，原样留档）。它不进聊天区
+    // 的正文——那是给人看的；宿主把请求发回模型时带上它，模型才看得到自己
+    // 上一拍真正的调用长什么样。
+    public string call;
+    // 这条消息产生的时刻（Unix 秒，UTC）。0 = 不知道（旧存档里没有这个
+    // 字段），头行就不显示时刻。流式那条气泡在建出来时定下这个值，后面
+    // 每一拍只改正文，因此显示的是「这一轮开始说话的时间」。
+    public long at;
+    // 图片附件路径（本地文件 / http(s) / data URI，交给 `Gui.Widget.Image`
+    // 解码）。非空时这一轮在气泡模式里画成一张图片气泡；正文仍然保留，
+    // 供记录模式（ChatStyle.Log）与复制使用。
+    public string img;
+    // 宿主的消息 id（IM/服务端场景按 id 对账增量流；"" = 本地消息）。
+    public string msgId;
+    // 回执位（IM 用）：0 发出 / 1 送达 / 2 已读 / -1 别人的消息。
+    // 渲染走 kind（宿主把 mark 翻成 "wx-acked" 一类的节拍串）。
+    public int mark;
+    // 引用回复：被引消息的发送者显示名与原文摘要（"" = 这条不是回复）。
+    // 引用块画在自己气泡内、正文之上，与 IM 客户端的观感一致。
+    public string quoteWho;
+    public string quoteText;
+    // 被引消息的宿主 id（发送时原样回给服务端，对端才能还原引用关系）。
+    public string quoteId;
+    // 卡片消息（任务卡片一类「整体即入口」的消息）：左键单击（未拖动）
+    // 交给宿主 OnBubbleActivate，不进文本选区——卡片没有可选中正文，
+    // IM 惯例里单击选区对它没有意义。默认 false。
+    public bool card;
+
+    // 一条普通消息：无思考、无信封，时间戳取当前 UTC 时刻。
+    public static ChatMessage Create(string role, string text) {
+        ChatMessage m = new ChatMessage();
+        m.role = role;
+        m.text = text;
+        m.reason = "";
+        m.agent = "";
+        m.to = "";
+        m.kind = "";
+        m.taskId = "";
+        m.progress = 0;
+        m.call = "";
+        m.at = DateTime.UtcNow().ToUnixSeconds();
+        m.img = "";
+        m.msgId = "";
+        m.mark = -1;
+        m.quoteWho = "";
+        m.quoteText = "";
+        m.quoteId = "";
+        return m;
+    }
+
+    // 一条带图片的消息（气泡模式画图片，记录模式画正文）。
+    public static ChatMessage CreateImage(string role, string path, string text) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.img = path;
+        return m;
+    }
+
+    // 带思考过程的普通消息。
+    public static ChatMessage CreateWithReason(string role, string text, string reason) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.reason = reason;
+        return m;
+    }
+
+    // 一条带信封的团队消息。
+    public static ChatMessage CreateFrom(string role, string text, string agent,
+            string to, string kind, string taskId, int progress) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.agent = agent;
+        m.to = to;
+        m.kind = kind;
+        m.taskId = taskId;
+        m.progress = progress;
+        return m;
+    }
+}
+
+public class ChatSpeaker {
+    public string name;
+    public int tint;
+    public string tagCls;
+
+    // 组装一位发言者外观。
+    public static ChatSpeaker Of(string name, int tint, string tagCls) {
+        ChatSpeaker s = new ChatSpeaker();
+        s.name = name;
+        s.tint = tint;
+        s.tagCls = tagCls;
+        return s;
+    }
+}
+
+public class ChatStrings {
+    public string you;
+    public string assistant;
+    public string tool;
+    public string error;
+    public string thinkShow;
+    public string thinkHide;
+    public string codeMorePre;
+    public string codeMorePost;
+    public string codeCollapse;
+    public string busy;
+    public string empty;
+
+    // 英文默认文案；宿主按需覆盖字段即可。
+    public static ChatStrings Default() {
+        ChatStrings s = new ChatStrings();
+        s.you = "You";
+        s.assistant = "Assistant";
+        s.tool = "Tool";
+        s.error = "Error";
+        s.thinkShow = "Thinking (click to show)";
+        s.thinkHide = "Thinking (click to hide)";
+        s.codeMorePre = "show ";
+        s.codeMorePost = " more code lines";
+        s.codeCollapse = "collapse code";
+        s.busy = "Thinking...";
+        s.empty = "";
+        return s;
+    }
+}
+
+public class ChatStyle {
+    // 工具调用式记录（默认）：整宽行、轮次色块、头行横幅。适合助手/工具
+    // 会话——那里每一条背后都跟着一大段工件，气泡会把它挤成窄柱。
+    public static int Log() { return 0; }
+    // IM 气泡：左右分置的圆角气泡、头像、时刻与发送者名字在外的聊天记录。
+    // 适合人对人的会话（微信/QQ 那种一次一两句的往来）。
+    public static int Bubble() { return 1; }
+}
+
+public class ChatToggleTarget {
+    public int position;
+    public int msgIndex;
+
+    public ChatToggleTarget(int position, int msgIndex) {
+        this.position = position;
+        this.msgIndex = msgIndex;
+    }
+}
+
+// 共享同一区域的面板堆栈：顶部是标签条，
+// 下方是活动面板的内容。同一侧的分组沿该侧的
+// 交叉轴排列（left/right 垂直堆叠，bottom/center 并排），
+// 相邻分组之间有可拖拽的分隔条。
+public class DockGroup {
+    // 在列表变动中保持稳定的身份（停靠时分组会被移动和移除），
+    // 代码可以跨一次变更持有一个分组。
+    public int key;
+    private static int nextKey;
+
+    public int side;
+    public List<string> ids;
+    public int active;
+    // 交叉轴尺寸（像素）。首次布局得出实际值前 <= 0
+    // `weight`；此后由拖拽分隔手柄决定。
+    public int extent;
+    public int weight;
+    public Rect bounds;
+    public Rect header;
+    public Rect body;
+
+    // `weight` 是交叉轴的初始占比（各组具体化尺寸前生效）。
+    public DockGroup(int side, int weight) {
+        DockGroup.nextKey = DockGroup.nextKey + 1;
+        this.key = DockGroup.nextKey;
+        this.side = side;
+        this.ids = new List<string>();
+        this.active = 0;
+        this.extent = 0;
+        this.weight = weight;
+        this.bounds = new Rect(0, 0, 0, 0);
+        this.header = new Rect(0, 0, 0, 0);
+        this.body = new Rect(0, 0, 0, 0);
+    }
+}
+
+// 一个可停靠面板：稳定 id（用于持久化和查找）、
+// 标签页上显示的标题，以及上次布局解析出的内容矩形。
+// `headerless` 面板（如 IDE 的文档区）不绘制标签页，也不能被
+// 拖拽或关闭——其他面板围绕它们停靠。
+public class DockPanel {
+    public string id;
+    public string title;
+    // 宿主面板切换器的图标名（见 DockHost.AddSwitches）。
+    public string icon;
+    // 一行说明面板用途的文字，显示在其切换器的悬停提示中。
+    public string tip;
+    public bool closable;
+    public bool headerless;
+    // 不进宿主的通用面板开关列表（见 DockHost.AddSwitchGroup）：
+    // 宿主给它准备了更显眼的专属入口（功能区大按钮 / 快捷键）时，
+    // 再在通用列表里列一遍只会让人犯迷糊。
+    public bool noSwitch;
+    public bool hidden;
+    // 面板上次停靠的边——Show() 将其放回的地方。
+    public int home;
+    // 关闭时所在分组的 key、在该分组里的标签序号，以及该分组
+    // 在同侧分组中的序号——Show() 据此把面板放回原来的位置，
+    // 而不是简单地并到该侧最后一个分组的末尾。
+    public int homeKey;
+    public int homeAt;
+    public int homeSideIdx;
+    public Rect body;
+
+    // 图标默认 "grid"，初始停靠边为左侧。
+    public DockPanel(string id, string title, bool closable) {
+        this.id = id;
+        this.title = title;
+        this.icon = "grid";
+        this.tip = "";
+        this.closable = closable;
+        this.headerless = false;
+        this.noSwitch = false;
+        this.hidden = false;
+        this.home = DockSide.Left();
+        this.homeKey = 0;
+        this.homeAt = 0;
+        this.homeSideIdx = 0;
+        this.body = new Rect(0, 0, 0, 0);
+    }
+}
+
+// 具名停靠边，布局中写 `DockSide.Left()` 而不是魔法整数。
+// Left/Right 是通高列，Bottom 是中央区域下方的条，
+// Center 是其他所有面板围绕停靠的区域。
+public class DockSide {
+    // 左侧通高列。
+    public static int Left() { return 0; }
+    // 右侧通高列。
+    public static int Right() { return 1; }
+    // 中央区域下方的横向条。
+    public static int Bottom() { return 2; }
+    // 其他面板围绕停靠的中央区域。
+    public static int Center() { return 3; }
+}
+
+// 结构化日志单行实体（文本 + 可选颜色，消除 lines/colors 平行列表反模式）。
+public class LogLine {
+    public string text;
+    public int color;  // 0 = 主题默认
+
+    public LogLine(string text, int color) {
+        this.text = text != null ? text : "";
+        this.color = color;
+    }
+
+    public static LogLine Of(string text, int color) {
+        return new LogLine(text, color);
+    }
+
+    public static LogLine OfText(string text) {
+        return new LogLine(text, 0);
+    }
+}
+
+// Each editor owns a token which borrows its grid and row. Retirement invalidates
+// the row epoch; rebuilding also changes the binding epoch.
+public class PropertyGridAction {
+    weak PropertyGrid owner;
+    weak PropertyGridRow row;
+    int bindingEpoch;
+    int rowEpoch;
+    int kind;
+    int value;
+    public PropertyGridAction(PropertyGrid grid, PropertyGridRow record, int binding, int epoch, int action, int argument) {
+        owner = grid; row = record; bindingEpoch = binding; rowEpoch = epoch; kind = action; value = argument;
+    }
+    public void Invoke() {
+        PropertyGrid grid = owner;
+        PropertyGridRow record = row;
+        if (grid != null && record != null) { grid.ApplyRowAction(record, bindingEpoch, rowEpoch, kind, value); }
+    }
+}
+
+// PropertyGrid 属性行编辑器强类型实体（消除平行列表索引对齐反模式）。
+public class PropertyGridRow {
+    public Input text;
+    public Switch flag;
+    public SelectBox pick;
+    public int index;
+    public int epoch;
+    public string schema;
+    public Control root;
+    public Label label;
+    public Button reset;
+    public Button minus;
+    public Button plus;
+    public Button group;
+    public List<Button> segments;
+    public string shadow;
+
+    public PropertyGridRow() {
+        this.text = null;
+        this.flag = null;
+        this.pick = null;
+        this.index = 0 - 1;
+        this.epoch = 0;
+        this.schema = "";
+        this.segments = new List<Button>();
+        this.shadow = "";
+    }
+}
+
+// SessionList 在单帧内报告的内容：切换、删除或新建聊天点击中至多一个。
+// 索引指向调用方自己的标题列表，
+// 宿主可直接将它们映射回自己的会话。
+public class SessionListAction {
+    public int selected;  // 用户点击以切换到的索引，或 -1
+    public int deleted;  // 其删除按钮 (x) 被点击的索引，或 -1
+    public int archived;  // 其归档框被点击的索引，或 -1
+    public bool created;  // "新建"按钮被点击
+    public int renamed;  // 用户刚为其输入新名称的索引，或 -1
+    public string title;  // 该新名称（仅与 `renamed` 一起有意义）
+
+    // 无任何交互发生（所有索引 -1、created=false）。
+    public static SessionListAction None() {
+        SessionListAction a = new SessionListAction();
+        a.selected = 0 - 1;
+        a.deleted = 0 - 1;
+        a.archived = 0 - 1;
+        a.created = false;
+        a.renamed = 0 - 1;
+        a.title = "";
+        return a;
+    }
+
+    // 本帧有交互需要宿主处理时为 true。
+    public bool Any() {
+        return selected >= 0 || deleted >= 0 || archived >= 0 || created
+            || renamed >= 0;
+    }
+}

@@ -1,0 +1,471 @@
+using Gui.Widget;
+using Gui;
+using System;
+
+namespace Gui.Component.DataTable;
+
+// 单元格悬浮编辑器契约（CellEditor / 编辑态插槽）：
+// 当用户通过双击、敲击键盘（Type-to-Edit）、按 F2 或 Enter 激活单元格编辑时，
+// 表格通过此接口获取或重用一个真实 Control 实例，将其悬浮停靠在单元格绝对坐标上。
+// 全局单例/按列类型单例，全表同一时刻只激活 1 个 Editor，避免控件树爆炸。
+public class CellEditor {
+    // 获取或创建用于编辑该列的真实控件（如 Input、SelectBox、DatePicker 或用户自定义控件）
+    public virtual Control CreateWidget(App app, DataTableState st, DataColumn col) {
+        return null;
+    }
+
+    // 激活编辑：将数据源当前值绑定到控件，并重置校验状态
+    public virtual void BeginEdit(Control ctl, string initValue, DataColumn col) {
+    }
+
+    // 读取编辑后的文本值（准备提交）
+    public virtual string GetValue(Control ctl, DataColumn col) {
+        return "";
+    }
+
+    // 将输入焦点移入该控件（选中文字、展开下拉或弹窗等）
+    public virtual void Focus(App app, Control ctl) {
+    }
+
+    // 键盘按键预处理（返回 true 表示已被编辑器处理，不触发 DataTable 的格间跳转）
+    public virtual bool OnKeyDown(Control ctl, int key, DataTableState st) {
+        return false;
+    }
+
+    // 编辑结束清理
+    public virtual void EndEdit(Control ctl) {
+    }
+}
+
+// DataTable 的外观 + 自定义绘制钩子（DevExpress 风格
+// RowStyle / CustomDrawCell）。
+// Zan 的委托不能捕获局部变量或绑定 `this`，因此逐单元格回调
+// 不能是视图模型上的 lambda——而是*子类*，
+// 就像 <see cref="DataSource"/> 一样。赋一个实例给 <c>st.styler</c>；
+// 每个方法都可选，默认保持网格的默认外观。
+// 颜色为打包的 ARGB。**0 表示“不覆盖”**——它是完全
+// 透明的黑色，永远不会与任何人想绘制的颜色冲突。
+public class CellStyler {
+    // 整行数据行的背景，0 则保留网格的斑马纹。
+    // 选中和悬停依然可见：它们与此颜色混合
+    // 而非替换它，行在激活时仍可辨认。
+    virtual int RowBg(DataSource src, int row) { return 0; }
+
+    // 整行数据行的文本颜色，0 用主题默认色。
+    virtual int RowFg(DataSource src, int row) { return 0; }
+
+    // 单个单元格的背景，0 则继承行背景。
+    virtual int CellBg(DataSource src, int row, int col) { return 0; }
+
+    // 单个单元格的文本颜色，0 则继承 <see cref="RowFg"/>。
+    virtual int CellFg(DataSource src, int row, int col) { return 0; }
+
+    // Preparation decides custom content ownership independently of painting.
+    virtual bool OwnsCell(DataSource src, int row, int col) { return false; }
+
+    // Called only for cells claimed by OwnsCell, clipped to the prepared rectangle.
+    virtual void PaintCell(App app, DataSource src, int row, int col,
+    int x, int y, int w, int h) { }
+}
+
+// 单元格数据校验器抽象基类与通用实现（对标 DevExpress GridColumn.AddRule / AG Grid Cell Validation）
+// 校验不通过时返回错误描述；通过时返回空字符串 "" 或 null。
+public class CellValidator {
+    public virtual string Validate(DataColumn col, string value, int row, int colIdx) {
+        return "";
+    }
+}
+
+public delegate string CellValidateFunc(DataColumn col, string value, int row, int colIdx);
+
+public class CustomCellValidator : CellValidator {
+    public CellValidateFunc fn;
+
+    public CustomCellValidator(CellValidateFunc f) {
+        this.fn = f;
+    }
+
+    public override string Validate(DataColumn col, string value, int row, int colIdx) {
+        if (this.fn != null) {
+            return this.fn(col, value, row, colIdx);
+        }
+        return "";
+    }
+}
+
+// 单元格数据通道委托：允许调用方对任意复杂复合组件自由定制赋值/取值（彻底杜绝硬编码）
+public delegate void CellValueSetter(Control ctl, string value);
+public delegate string CellValueGetter(Control ctl);
+
+// 万能 Gui 控件悬浮编辑器适配器（纯协议驱动 + 开放委托定制）：
+// 1. 契约驱动（Protocol-Driven）：任意 Gui.Control 默认走统一的标准 "value" 属性通道（SetProp("value") / GetProp("value")）；
+// 2. 委托开放（Open-Closed）：支持注入自定义 Setter/Getter 委托，无需在表格核心代码里硬编码任何具体控件类型；
+// 3. 焦点收敛：依托 Control.WidgetId() 统一将键盘输入焦点授予组件内部交互内核。
+public class ControlCellEditor : CellEditor {
+    Control widget;
+    CellValueSetter customSetter;
+    CellValueGetter customGetter;
+
+    ControlCellEditor(Control ctl) {
+        this.widget = ctl;
+    }
+
+    ControlCellEditor(Control ctl, CellValueSetter setter, CellValueGetter getter) {
+        this.widget = ctl;
+        this.customSetter = setter;
+        this.customGetter = getter;
+    }
+
+    override Control CreateWidget(App app, DataTableState st, DataColumn col) {
+        return this.widget;
+    }
+
+    override void BeginEdit(Control ctl, string initValue, DataColumn col) {
+        if (ctl == null) { return; }
+        if (this.customSetter != null) {
+            this.customSetter(ctl, initValue);
+            return;
+        }
+        ctl.SetProp("value", initValue);
+        if (ctl is Input) {
+            Input inp = (Input)ctl;
+            inp.SelectAll();
+        }
+    }
+
+    override string GetValue(Control ctl, DataColumn col) {
+        if (ctl == null) { return ""; }
+        if (this.customGetter != null) {
+            return this.customGetter(ctl);
+        }
+        string val = ctl.GetProp("selectedValue");
+        if (val != "") { return val; }
+        return ctl.GetProp("value");
+    }
+
+    override void Focus(App app, Control ctl) {
+        if (ctl == null || app == null) { return; }
+        int wid = ctl.WidgetId();
+        if (wid > 0) {
+            app.focus.SetFocused(wid);
+        } else if (ctl.commonId > 0) {
+            app.focus.SetFocused(ctl.commonId);
+        }
+    }
+
+    override bool OnKeyDown(Control ctl, int key, DataTableState st) {
+        if (key == 13 || key == 9 || key == 27) {
+            return false;
+        }
+        return true;
+    }
+
+    override void EndEdit(Control ctl) {
+    }
+}
+
+// 标准文本悬浮编辑器（基于标准 Gui.Widget.Input）
+// 拥有原生的文本选区、IME 输入、双击选词、光标拖动、系统剪贴板支持（Ctrl+C/V/X/Z）。
+public class TextCellEditor : CellEditor {
+    Input inp;
+
+    TextCellEditor() {
+        this.inp = null;
+    }
+
+    override Control CreateWidget(App app, DataTableState st, DataColumn col) {
+        if (this.inp == null) {
+            this.inp = new Input();
+            this.inp.Autoselect = true;
+        }
+        return this.inp;
+    }
+
+    override void BeginEdit(Control ctl, string initValue, DataColumn col) {
+        Input input = (Input)ctl;
+        input.SetText(initValue);
+        input.SelectAll();
+    }
+
+    override string GetValue(Control ctl, DataColumn col) {
+        Input input = (Input)ctl;
+        return input.GetText();
+    }
+
+    override void Focus(App app, Control ctl) {
+        if (app != null && ctl != null) {
+            Input inp = (Input)ctl;
+            app.focus.SetFocused(inp.wid);
+        }
+    }
+
+    override bool OnKeyDown(Control ctl, int key, DataTableState st) {
+        // Tab (9), Enter (13), Esc (27) 交给 DataTable 外层处理提交、跳转与取消
+        if (key == 13 || key == 9 || key == 27) {
+            return false;
+        }
+        return true;
+    }
+
+    override void EndEdit(Control ctl) {
+    }
+}
+
+// 一条可逆更改，记录后 Ctrl+Z 可将其还原。
+// `kind` 为 0 单元格编辑、1 行插入、2 行删除。删除把整行
+// 文本保存在 `cells` 中，因为源在 RemoveRow 返回的
+// 那一刻就可以丢弃存储——
+// 让行可恢复的是日志，而非源。
+public class RowEdit {
+    int kind;
+    int row;  // 更改所作用的数据行索引
+    int col;  // 单元格编辑：列；否则为 -1
+    string before;  // 单元格编辑：原有的值
+    string after;  // 单元格编辑：写入的值
+    List<string> cells;  // 行删除：被删除的行，逐单元格
+
+    // 同组条目一起撤销。一次粘贴涉及五十个
+    // 单元格，必须一次 Ctrl+Z 全部回退，而不是五十次——
+    // 因此撤销的单位是组而非条目。0 表示“单独成组”。
+    int group;
+
+    public static RowEdit Cell(int row, int col, string before, string after) {
+        RowEdit e = new RowEdit();
+        e.kind = 0;
+        e.row = row;
+        e.col = col;
+        e.before = before;
+        e.after = after;
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    public static RowEdit Insert(int row) {
+        RowEdit e = new RowEdit();
+        e.kind = 1;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
+
+    public static RowEdit Delete(int row, List<string> cells) {
+        RowEdit e = new RowEdit();
+        e.kind = 2;
+        e.row = row;
+        e.col = -1;
+        e.before = "";
+        e.after = "";
+        e.cells = cells;
+        e.group = 0;
+        return e;
+    }
+}
+
+// DataTable 模块：单元格内编辑——开始/提交/取消、日历与
+// 选项选择器、布尔切换和数值步进。
+public partial class DataTable {
+
+    // 在 (rowIdx, col) 打开行内编辑器：预填当前单元格文本并把
+    // 光标置于末尾。下拉/日历编辑器（editorKind 1/2）立即展开
+    // 弹层并定位高亮项；日期解析失败或为空时日历定位到当前月。
+    // 列不可编辑或位置非法时不动作。
+    public static void BeginEdit(DataTableState st, List<DataColumn> cols,
+    DataSource src, int rowIdx, int col) {
+        if (col < 0 || col >= cols.Count) { return; }
+        if (!cols[col].editable) { return; }
+        if (rowIdx < 0 || rowIdx >= src.RowCount()) { return; }
+        DataColumn c = cols[col];
+        st.editing = true;
+        st.editorFocusPending = true;
+        st.editRow = rowIdx;
+        st.editCol = col;
+        st.editBuf = src.CellText(rowIdx, col);
+        st.editCur = st.editBuf.Length;
+        st.editError = "";
+        st.editRejected = false;
+
+        CellEditor ed = c.editor;
+        if (ed == null) { ed = st.cellEditor; }
+        if (ed != null) {
+            Control ctl = ed.CreateWidget(null, st, c);
+            st.activeEditorWidget = ctl;
+            ed.BeginEdit(ctl, st.editBuf, c);
+        }
+
+        // 下拉和日历编辑器打开时弹层已显示——
+        // 选择它们就是为了让选项立即可见。
+        st.edPopOpen = false;
+        st.edPopSel = -1;
+        st.edPopScroll = 0;
+        st.edPopItems = new List<int>();
+        if (c.editorKind == 1) {
+            st.edPopOpen = true;
+            st.edPopItems = DataTable.FilterChoices(c, "");
+            st.edPopSel = DataTable.IndexOfChoice(c, st.editBuf);
+        } else if (c.editorKind == 2) {
+            st.edPopOpen = true;
+            int day = DataTable.ParseDate(st.editBuf, c.dateOrder);
+            // 无法解析或为空的日期单元格定位到当前月，
+            // 使选择器仍可用于填入空白。
+            if (day == DataTable.NoDate()) { day = DataTable.Today(); }
+            DateTime dt = DateTime.FromUnixSeconds(day * 86400);
+            st.edCalMonth = DataTable.YearMonth(dt.Year(), dt.Month());
+            st.edPopSel = day;
+        }
+    }
+
+    // 把日历选择移动 `days` 天，显示月份跟随，
+    // 跨月时自动翻页，并把新日期
+    // 写入缓冲区。
+    public static void CalendarStep(DataTableState st, DataColumn c, int days) {
+        int d = st.edPopSel;
+        if (d == DataTable.NoDate() || d == -1) { d = DataTable.Today(); }
+        else { d = d + days; }
+        st.edPopSel = d;
+        DateTime dt = DateTime.FromUnixSeconds(d * 86400);
+        st.edCalMonth = DataTable.YearMonth(dt.Year(), dt.Month());
+        st.editBuf = DataTable.FormatDate(d, DataTable.DateStoreFormat(c));
+        st.editCur = st.editBuf.Length;
+        st.editError = "";
+    }
+
+    // `v` 在列选项中的位置（不区分大小写），否则返回 -1。
+    public static int IndexOfChoice(DataColumn c, string v) {
+        string q = DataTable.TrimSpace(v);
+        for (int i = 0; i < c.choices.Count; i = i + 1) {
+            if (DataTable.EqCI(c.choices[i], q)) { return i; }
+        }
+        return -1;
+    }
+
+    // 按键后重新筛选下拉列表，高亮保持在
+    // 仍在列表中的输入值上，否则落在第一个匹配项。
+    public static void RefreshChoices(DataTableState st, DataColumn c) {
+        st.edPopItems = DataTable.FilterChoices(c, st.editBuf);
+        st.edPopScroll = 0;
+        int exact = DataTable.IndexOfChoice(c, st.editBuf);
+        if (exact >= 0) { st.edPopSel = exact; }
+        else if (st.edPopItems.Count > 0) { st.edPopSel = st.edPopItems[0]; }
+        else { st.edPopSel = -1; }
+    }
+
+    // 在筛选后的列表中移动下拉高亮 `step` 个位置，
+    // 两端钳制。
+    public static void MoveChoice(DataTableState st, int step) {
+        if (st.edPopItems.Count == 0) { return; }
+        int at = 0;
+        int i = 0;
+        while (i < st.edPopItems.Count) {
+            if (st.edPopItems[i] == st.edPopSel) { at = i; i = st.edPopItems.Count; }
+            else { i = i + 1; }
+        }
+        at = at + step;
+        if (at < 0) { at = 0; }
+        if (at >= st.edPopItems.Count) { at = st.edPopItems.Count - 1; }
+        st.edPopSel = st.edPopItems[at];
+    }
+
+    // 关闭编辑器并丢弃未提交的缓冲区，同时收起弹层、
+    // 清空错误与拒绝标记。
+    public static void CancelEdit(DataTableState st) {
+        if (st.activeEditorWidget != null) {
+            if (st.cellEditor != null) { st.cellEditor.EndEdit(st.activeEditorWidget); }
+            st.activeEditorWidget = null;
+        }
+        st.editing = false;
+        st.editRow = -1;
+        st.editCol = -1;
+        st.editError = "";
+        st.editRejected = false;
+        st.edPopOpen = false;
+    }
+
+    // 翻转布尔单元格并记为已提交的编辑。布尔列没有
+    // 可输入的文本，因此点击或 F2/Enter 就地切换，
+    // 而非打开行内编辑器。
+    public static void ToggleBoolCell(DataTableState st, List<DataColumn> cols, DataSource src,
+    int row, int col) {
+        if (col < 0 || col >= cols.Count) { return; }
+        if (row < 0 || row >= src.RowCount()) { return; }
+        DataColumn c = cols[col];
+        if (!c.isBool || !c.editable) { return; }
+        string nv = c.boolTrue;
+        if (src.CellBool(row, col)) { nv = c.boolFalse; }
+        DataTable.Journal(st, RowEdit.Cell(row, col, src.CellText(row, col), nv));
+        src.SetCell(row, col, nv);
+        st.editRow = row;
+        st.editCol = col;
+        st.editVal = nv;
+        st.hitRow = row;
+        st.hitCol = col;
+        st.dirty = true;
+        st.CellEdit.Raise(st.host);
+    }
+
+    // 校验缓冲区并写回行。值必须通过
+    // 列的声明式规则，并在 `CellValidating` 事件中存活，
+    // 处理器可调用 `Reject(msg)`。被拒绝的值保持编辑器
+    // 打开并显示消息，让用户修正而非
+    // 丢失输入。
+    public static void CommitEdit(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!st.editing) { return; }
+        int rr = st.editRow;
+        int cc = st.editCol;
+        if (rr < 0 || rr >= src.RowCount() || cc < 0 || cc >= cols.Count) {
+            DataTable.CancelEdit(st);
+            return;
+        }
+        DataColumn c = cols[cc];
+
+        CellEditor ed = c.editor;
+        if (ed == null) { ed = st.cellEditor; }
+        if (ed != null && st.activeEditorWidget != null) {
+            st.editBuf = ed.GetValue(st.activeEditorWidget, c);
+        }
+
+        // 严格下拉框提交高亮项而非输入的
+        // 前缀，因此从列表选"Ship"会存储"Shipping"。
+        if (c.editorKind == 1 && st.edPopSel >= 0 && st.edPopSel < c.choices.Count
+        && DataTable.IndexOfChoice(c, st.editBuf) < 0) {
+            st.editBuf = c.choices[st.edPopSel];
+        }
+
+        string err = DataTable.ValidateCellEx(c, st.editBuf, st.editRow, st.editCol);
+        if (err.Length > 0) {
+            st.editError = err;
+            return;
+        }
+
+        // 把最终决定权交给应用。editVal 携带候选值，
+        // 处理器可在决定前通过 EditValue() 检查。
+        st.editVal = st.editBuf;
+        st.editRejected = false;
+        st.editError = "";
+        st.CellValidating.Raise(st.host);
+        if (st.editRejected) {
+            if (st.editError.Length == 0) { st.editError = "Invalid value"; }
+            return;
+        }
+
+        DataTable.Journal(st, RowEdit.Cell(rr, cc, src.CellText(rr, cc), st.editBuf));
+        src.SetCell(rr, cc, st.editBuf);
+        st.hitRow = rr;
+        st.hitCol = cc;
+        st.CellEdit.Raise(st.host);
+        st.dirty = true;
+        if (ed != null && st.activeEditorWidget != null) {
+            ed.EndEdit(st.activeEditorWidget);
+            st.activeEditorWidget = null;
+        }
+        st.editing = false;
+        st.editRow = -1;
+        st.editCol = -1;
+        st.edPopOpen = false;
+    }
+
+}

@@ -1,0 +1,837 @@
+using Gui;
+using System.Json;
+using System.Text;
+using System;
+
+namespace Gui.Component.Chart;
+
+public class ChartData {
+    int val;
+    double number;
+    bool numberSet;
+    string name;  // "" = 继承系列名称
+    int color;  // 0 = 继承系列颜色
+    bool hidden;  // 饼图扇区隐藏（不进 total/角度/tooltip）
+    bool selected;  // 饼图扇区静态选中：沿中角外偏 selectedOffset
+    int size;  // ECharts symbolSize 逐项覆盖；sizeSet=false 时忽略
+    bool sizeSet;
+    int offX;  // ECharts symbolOffset 逐项横向偏移（px，支持百分比折算）
+    int offY;  // ECharts symbolOffset 逐项纵向偏移（px）
+    bool offSet;  // 是否声明了 symbolOffset
+    bool gap;  // ECharts data 项 '-'（断线）：不画点/不连线/不进极值
+    string symbol;  // ECharts 逐项 symbol 覆盖（"" = 继承系列）
+    string labelText;  // ECharts data[i].label.formatter 结果覆盖：非空时数值
+                      // 标签直接显示该文本（bar10 Forecast 的标签是两系
+                      // 列之和，模板无法表达）
+    int labelSide;  // ECharts label.position 逐项覆盖：0 = 继承系列，
+                      // 1 = 左、2 = 右（bar8 正负交错标签）
+    bool labelHide;  // ECharts data[i].label.show=false：graph 节点标签
+                      // 逐点隐藏（les-miserables 仅 5 个枢纽节点显标）
+    string labelFmtT;  // ECharts data[i].label.formatter **模板**（含 {a}{b}
+                      // {c}{d} 或 rich 标记，pie-rich-text 的 {title|{b}}
+                      // 多行底板标签）；"" = 跟随系列模板。与 labelText
+                      // 区分：那是无令牌的成品文本（bar10 两系列之和）。
+    ChartTextStyle dlabel;  // ECharts data[i].label 完整文本样式（color/
+                      // fontSize/rich/盒底板），非 null 时饼标签按它
+                      // 渲染（覆盖系列级 label）；null = 跟随系列。
+    bool hasCat;  // graph 节点声明了 category（下文 cat 生效）
+    int cat;  // graph 节点类别下标（颜色 = 类别调色板）
+    ChartItemStyle itemStyle;  // ECharts data 项逐根 itemStyle（bar-data-color
+                              // 的逐柱颜色、bar-stack-borderRadius 的逐柱
+                              // 圆角）；null = 跟随系列 itemStyle。渲染器
+                              // 只读 normal 态，读前须判空。
+    int calDay;  // calendar 坐标系：该项的日期（1970 起天序）；-1 = 无
+                      // （series.coordinateSystem == "calendar" 时由解析器
+                      // 从 [[日期串,值],...] 或 {value:[日期串,值]} 解出）
+    int heatX;  // 直角坐标系热力图三元组 [x类目下标, y类目下标, 值]
+                      // 的列/行下标；-1 = 非热力格（表格热力图与其它
+                      // 系列的 data 不写）。值在 number（保留小数，
+                      // heatmap-large 是 0.5..1.0 连续域），"-" 缺格走 gap。
+    int heatY;
+
+    // 以整数值构造数据点（名称空、继承系列色、不隐藏、无逐项尺寸）。
+    public static ChartData Of(int v) {
+        ChartData d = new ChartData();
+        d.val = v;
+        d.number = (double)v;
+        d.numberSet = true;
+        d.name = "";
+        d.color = 0;
+        d.hidden = false;
+        d.selected = false;
+        d.size = 0;
+        d.sizeSet = false;
+        d.offX = 0;
+        d.offY = 0;
+        d.offSet = false;
+        d.gap = false;
+        d.symbol = "";
+        d.labelText = "";
+        d.labelSide = 0;
+        d.labelFmtT = "";
+        d.dlabel = null;
+        d.calDay = 0 - 1;
+        d.heatX = 0 - 1;
+        d.heatY = 0 - 1;
+        return d;
+    }
+
+    // ECharts data 项 '-'：该类目缺数据，折线在此断开。
+    public static ChartData Gap() {
+        ChartData d = ChartData.Of(0);
+        d.gap = true;
+        return d;
+    }
+
+    // 以 double 值构造数据点；整数字段 val 同步取截断值。
+    public static ChartData Numeric(double v) {
+        ChartData d = ChartData.Of((int)v);
+        d.number = v;
+        return d;
+    }
+
+    // 带 double 值与名称（扇区/分类标签）的数据点。
+    public static ChartData NamedNumber(double v, string name) {
+        ChartData d = ChartData.Numeric(v);
+        d.name = name;
+        return d;
+    }
+
+    // 带整数值与名称的数据点。
+    public static ChartData Named(int v, string name) {
+        ChartData d = ChartData.Of(v);
+        d.name = name;
+        return d;
+    }
+
+    // 带整数值与显式颜色的数据点。
+    public static ChartData Colored(int v, int color) {
+        ChartData d = ChartData.Of(v);
+        d.color = color;
+        return d;
+    }
+
+    // 同时带值、名称与颜色的数据点。
+    public static ChartData Full(int v, string name, int color) {
+        ChartData d = ChartData.Of(v);
+        d.name = name;
+        d.color = color;
+        return d;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartData Clone() {
+        ChartData d = new ChartData();
+        d.val = this.val; d.number = this.number; d.numberSet = this.numberSet;
+        d.name = this.name; d.color = this.color; d.hidden = this.hidden;
+        d.selected = this.selected; d.size = this.size; d.sizeSet = this.sizeSet;
+        d.offX = this.offX; d.offY = this.offY; d.offSet = this.offSet;
+        d.gap = this.gap; d.symbol = this.symbol;
+        d.labelText = this.labelText; d.labelSide = this.labelSide;
+        d.labelFmtT = this.labelFmtT;
+        d.dlabel = this.dlabel != null ? this.dlabel.Clone() : null;
+        d.labelHide = this.labelHide;
+        d.calDay = this.calDay;
+        d.heatX = this.heatX; d.heatY = this.heatY;
+        d.itemStyle = this.itemStyle != null ? this.itemStyle.Clone() : null;
+        return d;
+    }
+
+    public static ChartData Clone(ChartData src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartMarkArea {
+    public bool xMode;
+    public int v0; public int v1;
+    public int color;
+    public string name;
+
+    public static ChartMarkArea Of() {
+        return new ChartMarkArea { xMode = true, v0 = 0, v1 = 0,
+            color = 0, name = "" };
+    }
+}
+
+public class ChartMarkLine {
+    public string kind;
+    public string name;  // ECharts data 项的 name（平均值/…），tooltip 用
+    public int xValue;
+    public int yValue;
+    public bool hasPoint;
+    public string label;
+    public string lineType;
+    public int color;
+    public bool labelShow;  // markLine.label.show（默认 true；area-pieces 关）
+    public bool startArrow;  // markLine.symbol[0]："arrow" 才画（默认 none）
+    public bool endArrow;  // markLine.symbol[1]：ECharts 默认 ['none','arrow']
+    public bool hasEnd;  // 两点斜线（coord 对）：回归/趋势线（anscombe 等）
+    public int x2Value;  // 终点 x（原始值域，x 为数值轴时按值映射）
+    public int y2Value;  // 终点 y
+
+    // 按 kind 构造阈值线（"average"/"min"/"max" 或 "" = 显式线）。
+    public int valueIndex;  // ECharts valueIndex：-1 = 值轴(y 水平线)，0 = x 轴(竖线)
+
+    public static ChartMarkLine Of(string kind) {
+        return ChartMarkLine.Of(kind, "");
+    }
+    // 带 name 的版本（ECharts data 项 {type:'average', name:'平均值'}）。
+    public static ChartMarkLine Of(string kind, string name) {
+        return new ChartMarkLine { kind = kind, name = name, xValue = 0, yValue = 0,
+            hasPoint = false, label = "", lineType = "", color = 0,
+            valueIndex = 0 - 1, labelShow = true, startArrow = false,
+            endArrow = true, hasEnd = false, x2Value = 0, y2Value = 0 };
+    }
+    // 平均线：窗口数据的算术平均。
+    public static ChartMarkLine Average() { return ChartMarkLine.Of("average"); }
+    // 带 name 的平均线。
+    public static ChartMarkLine Average(string name) { return ChartMarkLine.Of("average", name); }
+    // 最小值线。
+    public static ChartMarkLine Min() { return ChartMarkLine.Of("min"); }
+    // 最大值线。
+    public static ChartMarkLine Max() { return ChartMarkLine.Of("max"); }
+    // 显式水平线：y = yValue 处，label 支持 {value} 占位。
+    public static ChartMarkLine At(int yValue, string label) {
+        ChartMarkLine m = ChartMarkLine.Of("");
+        m.yValue = yValue;
+        m.label = label;
+        return m;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartMarkLine Clone() {
+        ChartMarkLine m = ChartMarkLine.Of(this.kind, this.name);
+        m.xValue = this.xValue; m.yValue = this.yValue; m.hasPoint = this.hasPoint;
+        m.label = this.label; m.lineType = this.lineType; m.color = this.color;
+        m.valueIndex = this.valueIndex;
+        m.labelShow = this.labelShow; m.startArrow = this.startArrow;
+        m.endArrow = this.endArrow;
+        m.hasEnd = this.hasEnd; m.x2Value = this.x2Value; m.y2Value = this.y2Value;
+        return m;
+    }
+
+    public static ChartMarkLine Clone(ChartMarkLine src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartMarkPoint {
+    public string kind;
+    public string name;  // ECharts data 项的 name（最大值/最小值/…），tooltip 用
+    public int dataIndex;
+    public int xValue;
+    public int yValue;
+    public string label;
+    public int color;  // 0 = 继承系列颜色
+    public string symbol;  // ECharts symbol（"emptyCircle"/"star"/…）；"" = 默认实心圆
+    public int size;  // ECharts symbolSize；sizeSet=false 时用引擎默认
+    public int offX;  // ECharts symbolOffset 逐项横向偏移（px）
+    public int offY;  // ECharts symbolOffset 逐项纵向偏移（px）
+    public bool offSet;  // 是否声明了 symbolOffset
+
+    // 构造"最大值"标记点（渲染时从系列窗口数据推导位置）。
+    public int valueIndex;  // ECharts valueIndex：-1 = 值轴(y)，0 = x 轴标注
+    public bool sizeSet;
+
+    public static ChartMarkPoint Max() {
+        return ChartMarkPoint.Max("");
+    }
+    // 带 name 的版本（ECharts data 项 {type:'max', name:'最大值'}）。
+    public static ChartMarkPoint Max(string name) {
+        return new ChartMarkPoint { kind = "max", name = name, dataIndex = 0 - 1, xValue = 0, yValue = 0, label = "", color = 0, valueIndex = 0 - 1, symbol = "", size = 0, sizeSet = false, offX = 0, offY = 0, offSet = false };
+    }
+    // 构造"最小值"标记点（渲染时从系列窗口数据推导位置）。
+    public static ChartMarkPoint Min() {
+        return ChartMarkPoint.Min("");
+    }
+    // 带 name 的版本（ECharts data 项 {type:'min', name:'最小值'}）。
+    public static ChartMarkPoint Min(string name) {
+        return new ChartMarkPoint { kind = "min", name = name, dataIndex = 0 - 1, xValue = 0, yValue = 0, label = "", color = 0, valueIndex = 0 - 1, symbol = "", size = 0, sizeSet = false, offX = 0, offY = 0, offSet = false };
+    }
+    // 构造显式坐标 (xValue,yValue) 的标记点并附标签。
+    public static ChartMarkPoint Point(int xValue, int yValue, string label) {
+        return new ChartMarkPoint { kind = "point", name = "", dataIndex = 0 - 1, xValue = xValue, yValue = yValue, label = label, color = 0, valueIndex = 0 - 1, symbol = "", size = 0, sizeSet = false, offX = 0, offY = 0, offSet = false };
+    }
+
+    // 面向对象深复制实例方法。
+    public ChartMarkPoint Clone() {
+        return new ChartMarkPoint { kind = this.kind, name = this.name, dataIndex = this.dataIndex,
+            xValue = this.xValue, yValue = this.yValue, label = this.label,
+            color = this.color, valueIndex = this.valueIndex,
+            symbol = this.symbol, size = this.size, sizeSet = this.sizeSet,
+            offX = this.offX, offY = this.offY, offSet = this.offSet };
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    public static ChartMarkPoint Clone(ChartMarkPoint src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 图/树节点二维坐标
+public class ChartNodeCoord {
+    public int x;
+    public int y;
+
+    public ChartNodeCoord(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    public static ChartNodeCoord Of(int x, int y) {
+        return new ChartNodeCoord(x, y);
+    }
+}
+
+// 图/关系流转链接（Sankey、Graph、Chord 等）
+public class ChartLink {
+    public string from;
+    public string to;
+    public int val;
+
+    // 构造一条流转链接；val 为链接粗细。
+    public static ChartLink Of(string from, string to, int val) {
+        ChartLink l = new ChartLink();
+        l.from = from;
+        l.to = to;
+        l.val = val;
+        return l;
+    }
+
+    public ChartLink Clone() {
+        return ChartLink.Of(this.from, this.to, this.val);
+    }
+
+    public static ChartLink Clone(ChartLink src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartNode {
+    public string name;
+    public int val;
+    public string id;  // ECharts data 节点 id（treemap colorMappingBy:'id' 的
+                     // 映射键 = DFS 序号，官方 mapIdToIndex）
+    public int color;  // 逐节点 itemStyle.color（0 = 继承级样式）
+    public List<int> vals;  // value 数组形态（obama 的多维 value），null = 标量
+    public string symbol;  // ECharts force symbol 逐节点形状（"" = 圆）
+    public int size;  // 逐节点尺寸（直径像素；0 = 自动）
+    public bool collapsed;  // ECharts data 节点 collapsed:true = 折叠子树
+    public List<ChartNode> children;
+
+    // 构造叶子节点（自带值，无子节点）。
+    public static ChartNode Leaf(string name, int val) {
+        ChartNode n = new ChartNode();
+        n.name = name;
+        n.val = val;
+        n.id = "";
+        n.color = 0;
+        n.symbol = "";
+        n.size = 0;
+        n.children = new List<ChartNode>();
+        return n;
+    }
+
+    // 构造组节点（值由子节点推导，val 置 0）。
+    public static ChartNode Group(string name, List<ChartNode> children) {
+        ChartNode n = new ChartNode();
+        n.name = name;
+        n.val = 0;
+        n.id = "";
+        n.color = 0;
+        n.symbol = "";
+        n.size = 0;
+        n.children = children;
+        return n;
+    }
+
+    // 带显式 value 的组节点（ECharts data 节点的 value 字段，
+    // 不等于子树累计时以显式值为准，tooltip 用）。
+    public static ChartNode GroupVal(string name, int val, List<ChartNode> children) {
+        ChartNode n = ChartNode.Group(name, children);
+        n.val = val;
+        return n;
+    }
+
+    // 形状 + 尺寸变体（force 分类符号：diamond/triangle/rectangle…）。
+    public static ChartNode Shaped(string name, int val, string symbol, int size) {
+        ChartNode n = ChartNode.Leaf(name, val);
+        n.symbol = ChartKinds.SymbolSanitize(symbol);
+        n.size = size;
+        return n;
+    }
+
+    // value 维度取值（visualDimension 缺省 0 = val；数组形态取
+    // 对应维，越界退 val）。
+    public int ValueOf(int dim) {
+        if (dim > 0 && vals != null && dim < vals.Count) { return vals[dim]; }
+        return val;
+    }
+
+    // 深复制整棵子树；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartNode Clone() {
+        ChartNode n = new ChartNode();
+        n.name = this.name; n.val = this.val; n.symbol = this.symbol; n.size = this.size;
+        n.id = this.id; n.color = this.color;
+        if (this.vals != null) {
+            n.vals = new List<int>();
+            for (int i = 0; i < this.vals.Count; i = i + 1) { n.vals.Add(this.vals[i]); }
+        }
+        n.collapsed = this.collapsed;
+        n.children = new List<ChartNode>();
+        int childCount = this.children == null ? 0 : this.children.Count;
+        for (int i = 0; i < childCount; i = i + 1) {
+            ChartNode child = this.children[i];
+            if (child != null) { n.children.Add(child.Clone()); }
+        }
+        return n;
+    }
+
+    public static ChartNode Clone(ChartNode src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+
+    // 此节点下所有叶子值的总和（组的总量）。
+    public int Total() {
+        if (this.children == null || this.children.Count == 0) { return this.val; }
+        int sum = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            if (this.children[i] != null) { sum = sum + this.children[i].Total(); }
+        }
+        return sum;
+    }
+}
+
+public class ChartPoint {
+    public int x;
+    public int y;
+    public int z;  // 第三维（ECharts data [x,y,z] 的末维）：dataRange/
+                 // 色带按它映射（非 0 时），散点气泡值等用
+    public int size;  // 逐点 symbolSize；sizeSet=false 时忽略
+    public bool sizeSet;
+    public int color;  // 逐点颜色；0 = 继承系列颜色
+    public string name;  // ECharts data[i].name——系列 labelShow 时的逐点
+                 // 标签文本（formatter {b}，散点省名标注等用）
+
+    // 构造一个点（无逐点尺寸，继承系列颜色）。
+    public static ChartPoint Of(int x, int y) {
+        return new ChartPoint { x = x, y = y, z = 0, size = 0, sizeSet = false, color = 0, name = "" };
+    }
+
+    // 构造带逐点尺寸（直径像素）的点。
+    public static ChartPoint Sized(int x, int y, int size) {
+        ChartPoint p = ChartPoint.Of(x, y);
+        p.size = size;
+        p.sizeSet = true;
+        return p;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartPoint Clone() {
+        return new ChartPoint { x = this.x, y = this.y, z = this.z, size = this.size,
+            sizeSet = this.sizeSet, color = this.color, name = this.name };
+    }
+
+    public static ChartPoint Clone(ChartPoint src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartScalar {
+    public int amount;
+    public bool percent;
+
+    // 固定像素标量。
+    public static ChartScalar Px(int amount) { return new ChartScalar { amount = amount, percent = false }; }
+    // 百分比标量（amount = 百分数）。
+    public static ChartScalar Pct(int amount) { return new ChartScalar { amount = amount, percent = true }; }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartScalar Clone() {
+        return new ChartScalar { amount = this.amount, percent = this.percent };
+    }
+
+    public static ChartScalar Clone(ChartScalar src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartPosition {
+    public ChartScalar x;
+    public ChartScalar y;
+
+    // 构造一个 (x,y) 标量坐标。
+    public static ChartPosition Of(ChartScalar x, ChartScalar y) {
+        return new ChartPosition { x = x, y = y };
+    }
+
+    // 面向对象深复制实例方法。
+    public ChartPosition Clone() {
+        return ChartPosition.Of(this.x != null ? this.x.Clone() : null,
+                                this.y != null ? this.y.Clone() : null);
+    }
+
+    public static ChartPosition Clone(ChartPosition src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class Candle {
+    public int open;
+    public int high;
+    public int low;
+    public int close;
+    // ECharts data 项逐根 itemStyle 覆盖（k1 首根蓝色阴线）；
+    // null = 跟随系列 itemStyle。渲染器只读 normal 态。
+    public ChartItemStyle itemStyle;
+    // 构造一根 OHLC 柱。
+    public static Candle Of(int open, int high, int low, int close) {
+        Candle c = new Candle();
+        c.open = open;
+        c.high = high;
+        c.low = low;
+        c.close = close;
+        return c;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public Candle Clone() {
+        Candle c = Candle.Of(this.open, this.high, this.low, this.close);
+        c.itemStyle = this.itemStyle != null ? this.itemStyle.Clone() : null;
+        return c;
+    }
+
+    public static Candle Clone(Candle src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class BoxItem {
+    public string label;
+    public int lo;
+    public int q1;
+    public int med;
+    public int q3;
+    public int hi;
+    // 构造一个箱线统计项（五数概括 + 分类标签）。
+    public static BoxItem Of(string label, int lo, int q1, int med, int q3, int hi) {
+        BoxItem b = new BoxItem();
+        b.label = label;
+        b.lo = lo;
+        b.q1 = q1;
+        b.med = med;
+        b.q3 = q3;
+        b.hi = hi;
+        return b;
+    }
+
+    // 面向对象深复制实例方法。
+    public BoxItem Clone() {
+        return BoxItem.Of(this.label, this.lo, this.q1, this.med, this.q3, this.hi);
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    public static BoxItem Clone(BoxItem src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ErrorItem {
+    public string label;
+    public int y;
+    public int err;
+    // 构造一个误差条项（值 y、对称误差 ±err、分类标签）。
+    public static ErrorItem Of(string label, int y, int err) {
+        ErrorItem e = new ErrorItem();
+        e.label = label;
+        e.y = y;
+        e.err = err;
+        return e;
+    }
+
+    // 面向对象深复制实例方法。
+    public ErrorItem Clone() {
+        return ErrorItem.Of(this.label, this.y, this.err);
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    public static ErrorItem Clone(ErrorItem src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class Bubble {
+    public int x;
+    public int y;
+    public int weight;
+    // 构造一个加权散点。
+    public static Bubble Of(int x, int y, int weight) {
+        Bubble b = new Bubble();
+        b.x = x;
+        b.y = y;
+        b.weight = weight;
+        return b;
+    }
+
+    public Bubble Clone() {
+        return Bubble.Of(this.x, this.y, this.weight);
+    }
+
+    public static Bubble Clone(Bubble src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// Builds the ordinary option tree with empty markers for arrays consumed directly by the model.
+internal class ChartOptionTape {
+    internal const int MinTextBytes = 32 * 1024;
+    private const int MinArrayItems = 1024;
+    private JsonDoc doc;
+    private Dict<int, JsonValue> markers = new Dict<int, JsonValue>();
+    private Dict<JsonValue, int> slots = new Dict<JsonValue, int>();
+
+    internal ChartOptionTape(JsonDoc doc) { this.doc = doc; }
+
+    internal JsonValue ReadOption() {
+        int root = this.doc.root;
+        if (this.doc.MaxValueDepth() > JsonReader.MaxDepth || this.doc.KindAt(root) != 5) { return null; }
+        this.Select(this.doc.Get(root, "series"), true);
+        // Once a bar payload justifies the tape, category axes can share it.
+        if (this.markers.Count == 0) { return null; }
+        this.Select(this.doc.Get(root, "xAxis"), false);
+        this.Select(this.doc.Get(root, "yAxis"), false);
+        return this.ReadValue(root);
+    }
+
+    private void Select(int at, bool series) {
+        if (this.doc.KindAt(at) == 4) {
+            int end = this.doc.NextSibling(at);
+            for (int child = this.doc.FirstChild(at); child < end; child = this.doc.NextSibling(child)) {
+                this.SelectData(child, series);
+            }
+        } else {
+            this.SelectData(at, series);
+        }
+    }
+
+    private void SelectData(int at, bool series) {
+        int data = this.doc.Get(at, "data");
+        if (this.doc.KindAt(data) != 4 || this.doc.Count(data) < ChartOptionTape.MinArrayItems) { return; }
+        if (series) {
+            if (this.doc.StrAt(this.doc.Get(at, "type"), "") != "bar"
+            || this.doc.StrAt(this.doc.Get(at, "custom"), "") != "") { return; }
+            // Keep legacy axis-index handling for series that could address an invalid axis.
+            int y = this.doc.Get(at, "yAxisIndex");
+            int kind = this.doc.KindAt(y);
+            if (kind == 0 || kind >= 4) { y = this.doc.Get(at, "axisIndex"); }
+            if (y >= 0 && JsonValue.FromDoc(this.doc, y).AsInt(0) < 0) { return; }
+            int end = this.doc.NextSibling(data);
+            // Scalar tape slots occupy one entry. Tuples and objects go through the series parser.
+            for (int child = this.doc.FirstChild(data); child < end; child = child + 1) {
+                if (this.doc.KindAt(child) >= 4) { return; }
+            }
+        } else {
+            string type = this.doc.StrAt(this.doc.Get(at, "type"), "");
+            if (type.Length > 0 && ChartKinds.AxisOf(type) != ChartAxisType.Category) { return; }
+        }
+        JsonValue marker = JsonValue.NewArray();
+        this.markers[data] = marker;
+        this.slots[marker] = data;
+    }
+
+    private JsonValue ReadValue(int at) {
+        int kind = this.doc.KindAt(at);
+        if (kind == 4) {
+            if (this.markers.ContainsKey(at)) { return this.markers[at]; }
+            JsonValue array = JsonValue.NewArray();
+            array.items.Reserve(this.doc.Count(at));
+            int end = this.doc.NextSibling(at);
+            for (int child = this.doc.FirstChild(at); child < end; child = this.doc.NextSibling(child)) {
+                array.items.Add(this.ReadValue(child));
+            }
+            return array;
+        }
+        if (kind == 5) {
+            JsonValue obj = JsonValue.NewObject();
+            int count = this.doc.Count(at);
+            obj.keys.Reserve(count);
+            obj.vals.Reserve(count);
+            for (int p = this.doc.FirstProperty(at); p >= 0; p = this.doc.NextProperty(p)) {
+                JsonPair pair = this.doc.pairs[p];
+                obj.keys.Add(JsonValue.InternKey(this.doc, pair.keyStart, pair.keyLen));
+                obj.vals.Add(this.ReadValue(pair.valueSlot));
+            }
+            return obj;
+        }
+        // Materialize scalar tokens individually so remaining arrays retain number text.
+        return JsonValue.FromDoc(this.doc, at);
+    }
+
+    internal List<string> Categories(JsonValue marker) {
+        if (marker == null || !this.slots.ContainsKey(marker)) { return null; }
+        int at = this.slots[marker];
+        List<string> cats = new List<string>();
+        cats.Reserve(this.doc.Count(at));
+        int end = this.doc.NextSibling(at);
+        for (int child = this.doc.FirstChild(at); child < end; child = this.doc.NextSibling(child)) {
+            cats.Add(this.doc.StrAt(child, ""));
+        }
+        return cats;
+    }
+
+    internal bool AppendScalars(JsonValue marker, ChartSeries series) {
+        if (marker == null || !this.slots.ContainsKey(marker)) { return false; }
+        int at = this.slots[marker];
+        series.data.Reserve(series.data.Count + this.doc.Count(at));
+        int end = this.doc.NextSibling(at);
+        for (int child = this.doc.FirstChild(at); child < end; child = child + 1) {
+            int kind = this.doc.KindAt(child);
+            if (kind == 2) {
+                series.data.Add(ChartData.Numeric(this.doc.DoubleAt(child, 0.0)));
+            } else if (kind == 3) {
+                string text = this.doc.StrOfSlot(child);
+                series.data.Add(text == "-" ? ChartData.Gap() : ChartData.Of(JsonValue.IntOf(text)));
+            } else {
+                series.data.Add(ChartData.Of(this.doc.IntAt(child, 0)));
+            }
+        }
+        return true;
+    }
+}
+
+// 文本区间数字游标：SVG 属性/路径里的十进制数流（分隔符任意，
+// 负号直接拼在前一个数后也是新数，如 "10-5" = [10, -5]）。
+public class ChartSvgCursor {
+    public string s;
+    public int i;
+    public int to;
+    public bool any;  // 最近一次 NextNum 是否真的读到数字
+
+    public static ChartSvgCursor Of(string s, int from, int to) {
+        ChartSvgCursor c = new ChartSvgCursor();
+        c.s = s;
+        c.i = from;
+        c.to = to;
+        return c;
+    }
+
+    // 是否还有非分隔符字符可读。
+    public bool HasMore() {
+        this.SkipSep();
+        return this.i < this.to;
+    }
+
+    // 越过空白/逗号后返回下一个字符（到尾返回 0），不推进。
+    public int Peek() {
+        this.SkipSep();
+        if (this.i < this.to) { return this.s[this.i]; }
+        return 0;
+    }
+
+    // 读一个带符号十进制数（含指数），推进游标；无数字时
+    // any=false 并返回 0（游标原地不动）。
+    public double NextNum() {
+        this.SkipSep();
+        this.any = false;
+        int n = this.to;
+        int start = this.i;
+        if (this.i < n && (this.s[this.i] == 43 || this.s[this.i] == 45)) {
+            this.i = this.i + 1;
+        }
+        while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+            this.i = this.i + 1;
+            this.any = true;
+        }
+        if (this.i < n && this.s[this.i] == 46) {
+            this.i = this.i + 1;
+            while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+                this.i = this.i + 1;
+                this.any = true;
+            }
+        }
+        if (this.any && this.i < n && (this.s[this.i] == 101 || this.s[this.i] == 69)) {
+            int save = this.i;
+            this.i = this.i + 1;
+            if (this.i < n && (this.s[this.i] == 43 || this.s[this.i] == 45)) {
+                this.i = this.i + 1;
+            }
+            bool expAny = false;
+            while (this.i < n && this.s[this.i] >= 48 && this.s[this.i] <= 57) {
+                this.i = this.i + 1;
+                expAny = true;
+            }
+            if (!expAny) { this.i = save; }
+        }
+        if (!this.any) { return 0.0; }
+        return ChartSvgCursor.ParseDouble(this.s, start, this.i);
+    }
+
+    public void SkipSep() {
+        while (this.i < this.to) {
+            int ch = this.s[this.i];
+            if (ch == 32 || ch == 44 || ch == 9 || ch == 10 || ch == 13) {
+                this.i = this.i + 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    // [start,end) 十进制串 → double（手写，免逐数 JSON 开销；
+    // 1e308 内安全，指数钳 300）。
+    public static double ParseDouble(string s, int start, int end) {
+        long ip = 0;
+        int i = start;
+        bool neg = false;
+        if (i < end && (s[i] == 43 || s[i] == 45)) { neg = s[i] == 45; i = i + 1; }
+        while (i < end && s[i] >= 48 && s[i] <= 57) {
+            ip = ip * 10 + (s[i] - 48);
+            i = i + 1;
+        }
+        double frac = 0.0;
+        double scale = 1.0;
+        if (i < end && s[i] == 46) {
+            i = i + 1;
+            while (i < end && s[i] >= 48 && s[i] <= 57) {
+                scale = scale * 10.0;
+                frac = frac * 10.0 + (s[i] - 48);
+                i = i + 1;
+            }
+        }
+        double v = ip + frac / scale;
+        if (i < end && (s[i] == 101 || s[i] == 69)) {
+            i = i + 1;
+            bool eneg = false;
+            if (i < end && (s[i] == 43 || s[i] == 45)) { eneg = s[i] == 45; i = i + 1; }
+            int ex = 0;
+            while (i < end && s[i] >= 48 && s[i] <= 57) {
+                ex = ex * 10 + (s[i] - 48);
+                i = i + 1;
+            }
+            if (ex > 300) { ex = 300; }
+            double m = 1.0;
+            for (int k = 0; k < ex; k = k + 1) { m = m * 10.0; }
+            v = eneg ? v / m : v * m;
+        }
+        return neg ? 0.0 - v : v;
+    }
+}

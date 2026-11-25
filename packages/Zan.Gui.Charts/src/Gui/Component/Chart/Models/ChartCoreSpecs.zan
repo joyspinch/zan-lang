@@ -1,0 +1,836 @@
+using Gui;
+using System.Json;
+using System.Text;
+using System;
+
+namespace Gui.Component.Chart;
+
+public class ChartBreak {
+    // ECharts axis.breaks 一项（axisCommonTypes.ts AxisBreakOption）：
+    // [start,end] 是数据空间声明域（time 轴 = epoch 毫秒），gap 是断带
+    // 占据的像素份额——'1.5%' 字符串 = tpPrct（占比），数值 = tpAbs
+    // （绝对数据单位）。gapReal 在量程定型后解算（breakImpl.ts
+    // updateAxisBreakGapReal）：占比断带按 Σprct / (1-Σprct) × S 分摊，
+    // S = 外层数据跨度 − Σ(断带数据跨度)。
+    public double startD;  // epoch-ms / 数据值（double：类目序号也可能小数）
+    public double endD;
+    public bool gapPrct;  // gapParsed.type == 'tpPrct'
+    public double gapVal;  // prct = 0..1；abs = 数据单位
+
+    public static ChartBreak Of() {
+        ChartBreak b = new ChartBreak();
+        b.startD = 0.0; b.endD = 0.0;
+        b.gapPrct = false; b.gapVal = 0.0;
+        return b;
+    }
+
+    // 面向对象深复制实例方法。
+    public ChartBreak Clone() {
+        ChartBreak b = new ChartBreak();
+        b.startD = this.startD; b.endD = this.endD;
+        b.gapPrct = this.gapPrct; b.gapVal = this.gapVal;
+        return b;
+    }
+
+    public static ChartBreak Clone(ChartBreak src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartBreakResolved {
+    public ChartBreak item;
+    public double gapReal;
+
+    public ChartBreakResolved(ChartBreak item, double gapReal) {
+        this.item = item;
+        this.gapReal = gapReal;
+    }
+
+    public static ChartBreakResolved Of(ChartBreak item, double gapReal) {
+        return new ChartBreakResolved(item, gapReal);
+    }
+}
+
+// 强类型断轴解算项实体：将单断带配置与其实际 gapReal 像素/数据跨度绑定，消除平行列表反模式。
+public class ChartBreakResolvedItem {
+    public ChartBreak brk;
+    public double gapReal;
+
+    public ChartBreakResolvedItem(ChartBreak brk, double gapReal) {
+        this.brk = brk;
+        this.gapReal = gapReal;
+    }
+
+    public static ChartBreakResolvedItem Of(ChartBreak brk, double gapReal) {
+        return new ChartBreakResolvedItem(brk, gapReal);
+    }
+}
+
+public class ChartCalendarSpec {
+    public int rangeT0;  // 起始天序
+    public int rangeT1;  // 结束天序（含）
+    public bool vertical;  // orient == "vertical"
+    public int cellW;  // 单元格宽 px；-1 = auto（按容器等分）
+    public int cellH;  // 单元格高 px；-1 = auto
+    public int leftPx; public int rightPx; public int topPx; public int bottomPx;
+    public bool hasLeft; public bool hasRight; public bool hasTop; public bool hasBottom;
+    public bool leftCenter; public bool rightCenter; public bool topCenter; public bool bottomCenter;
+    public int widthPx; public int heightPx;  // 显式 width/height（-1 = 未声明）
+
+    // ---- 三种刻度文字（官方默认全部 show:true）----
+    public bool showDayLabel;    public int dayMargin;    public string dayPos;  // "start"/"end"
+    public int dayFirstDay;      public string dayNameMap;  public int dayColor;   public int dayFontSize;
+    public bool showMonthLabel;  public int monthMargin;  public string monthPos;  public string monthAlign;
+    public string monthNameMap;  public int monthColor;   public int monthFontSize;
+    public bool showYearLabel;   public int yearMargin;   public string yearPos;
+    public string yearFormatter; public int yearColor;    public int yearFontSize;
+
+    // ---- 网格/格线 ----
+    public bool showSplitLine;   public int splitColor;   public int splitWidth;
+    public int itemColor;        public int itemBorderWidth; public int itemBorderColor;
+
+    public static ChartCalendarSpec Of() {
+        ChartCalendarSpec c = new ChartCalendarSpec();
+        c.rangeT0 = 0; c.rangeT1 = 0;
+        c.vertical = false;
+        c.cellW = 0 - 1; c.cellH = 0 - 1;
+        // 官方 CalendarModel.defaultOption: left 80, top 60
+        c.leftPx = 80; c.rightPx = 0 - 1; c.topPx = 60; c.bottomPx = 0 - 1;
+        c.hasLeft = true; c.hasRight = false; c.hasTop = true; c.hasBottom = false;
+        c.leftCenter = false; c.rightCenter = false;
+        c.topCenter = false; c.bottomCenter = false;
+        c.widthPx = 0 - 1; c.heightPx = 0 - 1;
+
+        c.showDayLabel = true; c.dayMargin = 10; c.dayPos = "start";
+        c.dayFirstDay = 0; c.dayNameMap = ""; c.dayColor = 0; c.dayFontSize = 12;
+        c.showMonthLabel = true; c.monthMargin = 10; c.monthPos = "start";
+        c.monthAlign = "center"; c.monthNameMap = ""; c.monthColor = 0;
+        c.monthFontSize = 12;
+        c.showYearLabel = true; c.yearMargin = 30; c.yearPos = "";
+        c.yearFormatter = ""; c.yearColor = 0; c.yearFontSize = 20;
+
+        c.showSplitLine = true; c.splitColor = 0; c.splitWidth = 1;
+        c.itemColor = 0; c.itemBorderWidth = 1; c.itemBorderColor = 0;
+        return c;
+    }
+}
+
+public class ChartGeo {
+    public string map;  // 注册表地图名
+    public bool roam;  // 漫游（缩放/平移）
+    public bool labelShow;  // label.show：区域名标签
+    public ChartTextStyle labelSt;  // geo.label 文本样式（textBorder*/textShadow*，
+    public string selectedMode;  // ""/"single" | "multiple" | "false"
+    public int areaColor;  // itemStyle.areaColor；0 = 不覆盖
+    public int borderColor;  // itemStyle.borderColor；0 = 不覆盖
+    public int borderWidth;  // itemStyle.borderWidth（官方缺省 0.5）；
+                         // -1 = 未声明（渲染器落官方缺省）
+    public List<ChartMapRegion> regions;  // regions[] 覆盖（stub 或带 ring）
+    public double aspectScale;  // 纵横比映射（官方缺省 0.75）
+    public double zoom;  // 地图初始缩放比例（官方缺省 1.0）
+    public string layoutCenter;  // 相对容器定位中心（如 ['50%', '50%']）
+    public string layoutSize;  // 地图大小（如 '100%' 或数值）
+    // matrix 锚定（mini-bar-geo 的 10 面州地图逐格落位）。
+    public bool matAnchor;
+    public int mx0; public int mx1;
+    public int my0; public int my1;
+
+    public static ChartGeo Of() {
+        ChartGeo g = new ChartGeo();
+        g.map = "";
+        g.roam = false;
+        g.labelShow = false;
+        g.labelSt = null;
+        g.selectedMode = "";
+        g.areaColor = 0;
+        g.borderColor = 0;
+        g.borderWidth = 0 - 1;
+        g.regions = new List<ChartMapRegion>();
+        g.aspectScale = 0.75;
+        g.zoom = 1.0;
+        g.layoutCenter = "";
+        g.layoutSize = "";
+        g.matAnchor = false;
+        g.mx0 = 0; g.mx1 = 0;
+        g.my0 = 0; g.my1 = 0;
+        return g;
+    }
+
+    // 面向对象深复制实例方法。
+
+    public ChartGeo Clone() {
+        ChartGeo g = ChartGeo.Of();
+        g.map = this.map;
+        // matrix 锚格（coordinateSystem:"matrix" + coord）：resolved
+        // drawOption 的 geos 走本克隆过河——漏拷等于锚格全灭（
+        // matrix-mini-bar-geo 10 个 map 只剩骨架的根因）。
+        g.matAnchor = this.matAnchor;
+        g.mx0 = this.mx0; g.mx1 = this.mx1;
+        g.my0 = this.my0; g.my1 = this.my1;
+        g.roam = this.roam;
+        g.labelShow = this.labelShow;
+        g.labelSt = this.labelSt != null ? this.labelSt.Clone() : null;
+        g.selectedMode = this.selectedMode;
+        g.areaColor = this.areaColor;
+        g.borderColor = this.borderColor;
+        g.borderWidth = this.borderWidth;
+        g.aspectScale = this.aspectScale;
+        g.zoom = this.zoom;
+        g.layoutCenter = this.layoutCenter;
+        g.layoutSize = this.layoutSize;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            ChartMapRegion r = this.regions[i];
+            g.regions.Add(r != null ? r.Clone() : null);
+        }
+        return g;
+    }
+
+    public static ChartGeo Clone(ChartGeo src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartGraphic {
+    public string type;
+    public string id;
+    public int x;
+    public int y;
+    public string left;
+    public string top;
+    public string right;
+    public string bottom;
+    public int shapeX;
+    public int shapeY;
+    public int shapeW;
+    public int shapeH;
+    public int shapeR;
+    public int fill;
+    public bool hasFill;
+    public int stroke;
+    public int strokeWidth;
+    public string text;
+    public int fontSize;
+    public string fontWeight;
+    public int z;
+    public List<ChartGraphic> children;
+
+    public static ChartGraphic Create() {
+        ChartGraphic g = new ChartGraphic();
+        g.type = "rect";
+        g.id = "";
+        g.x = 0;
+        g.y = 0;
+        g.left = "";
+        g.top = "";
+        g.right = "";
+        g.bottom = "";
+        g.shapeX = 0;
+        g.shapeY = 0;
+        g.shapeW = 0;
+        g.shapeH = 0;
+        g.shapeR = 0;
+        g.fill = 0;
+        g.hasFill = false;
+        g.stroke = 0;
+        g.strokeWidth = 1;
+        g.text = "";
+        g.fontSize = 14;
+        g.fontWeight = "normal";
+        g.z = 0;
+        g.children = new List<ChartGraphic>();
+        return g;
+    }
+}
+
+public class ChartGridSpec {
+    public int lPct; public int lPx;
+    public int tPct; public int tPx;
+    public int rPct; public int rPx;
+    public int bPct; public int bPx;
+    public int wPct; public int wPx;
+    public int hPct; public int hPx;
+    public bool containLabel;
+    // A16：原始声明（parsePercent 语义的 px / "N%" / 关键字）。
+    // 多宫格与 DrawFrame 家族走 GridRawRect 精确解算；lPct/lPx 等
+    // 旧字段保留给 scatter-matrix 快路径与缓存指纹。
+    public ChartBoxParam lRaw;
+    public ChartBoxParam tRaw;
+    public ChartBoxParam rRaw;
+    public ChartBoxParam bRaw;
+    public ChartBoxParam wRaw;
+    public ChartBoxParam hRaw;
+    // matrix 锚定（coordinateSystem:"matrix"）：coord 归一成叶子域
+    // [mx0..mx1] × [my0..my1]，格矩形即 grid 矩形（再按自身六参内缩）。
+    public string id;  // grid.id：轴/系列的 gridId 串接引用
+    public bool matAnchor;
+    public int mx0; public int mx1;
+    public int my0; public int my1;
+
+    public static ChartGridSpec Of() {
+        ChartGridSpec gs = new ChartGridSpec();
+        gs.lPct = 0 - 1; gs.lPx = 0 - 1;
+        gs.tPct = 0 - 1; gs.tPx = 0 - 1;
+        gs.rPct = 0 - 1; gs.rPx = 0 - 1;
+        gs.bPct = 0 - 1; gs.bPx = 0 - 1;
+        gs.wPct = 0 - 1; gs.wPx = 0 - 1;
+        gs.hPct = 0 - 1; gs.hPx = 0 - 1;
+        gs.containLabel = false;
+        gs.id = "";
+        gs.matAnchor = false;
+        gs.mx0 = 0; gs.mx1 = 0;
+        gs.my0 = 0; gs.my1 = 0;
+        return gs;
+    }
+}
+
+public class ChartLevel {
+    public List<int> color;  // 级调色板 / 渐变档（空 = 继承全局调色板）
+    public int hasColorSat;  // colorSaturation [lo,hi] 已声明（千分值饱和度域）
+    public int satLo;
+    public int satHi;
+    public int colorMappingBy;  // 0 index | 1 value | 2 id（官方缺省 index）
+    public int borderWidth;  // 官方缺省 0
+    public int borderColor;  // 0 = 未声明（官方缺省 neutral00 #fff）
+    public int gapWidth;  // 官方缺省 0
+    public int borderColorSat;  // borderColorSaturation 千分值；-1 未声明
+    public int upperShow;  // 0/1；-1 未声明（官方缺省 false）
+    public int upperHeight;  // 官方缺省 20
+    public int r0;  // sunburst 环带内半径 px；-1 未声明
+    public int r;  // sunburst 环带外半径 px；-1 未声明
+    public int labelMode;  // 0 未声明 | 1 radial | 2 tangential | 3 角度
+    public int labelRotate;  // labelMode==3 的角度
+    public int r0Pct;  // sunburst 环带内半径百分比（千分值）；-1 未声明
+    public int rPct;  // sunburst 环带外半径百分比（千分值）；-1 未声明
+    public int colorOne;  // 级 itemStyle.color 单色（0 未声明）
+    public int labelColor;  // 级 label.color（0 未声明）
+
+    public static ChartLevel Of() {
+        ChartLevel lv = new ChartLevel();
+        lv.color = null;
+        lv.hasColorSat = 0;
+        lv.satLo = 0;
+        lv.satHi = 0;
+        lv.colorMappingBy = 0;
+        lv.borderWidth = 0 - 1;
+        lv.borderColor = 0;
+        lv.gapWidth = 0 - 1;
+        lv.borderColorSat = 0 - 1;
+        lv.upperShow = 0 - 1;
+        lv.upperHeight = 0 - 1;
+        lv.r0 = 0 - 1;
+        lv.r = 0 - 1;
+        lv.labelMode = 0;
+        lv.labelRotate = 0;
+        lv.r0Pct = 0 - 1;
+        lv.rPct = 0 - 1;
+        lv.colorOne = 0;
+        lv.labelColor = 0;
+        return lv;
+    }
+
+    // 面向对象深复制实例方法。
+
+    public ChartLevel Clone() {
+        ChartLevel lv = ChartLevel.Of();
+        if (this.color != null) {
+            lv.color = new List<int>();
+            for (int i = 0; i < this.color.Count; i = i + 1) { lv.color.Add(this.color[i]); }
+        }
+        lv.hasColorSat = this.hasColorSat;
+        lv.satLo = this.satLo;
+        lv.satHi = this.satHi;
+        lv.colorMappingBy = this.colorMappingBy;
+        lv.borderWidth = this.borderWidth;
+        lv.borderColor = this.borderColor;
+        lv.gapWidth = this.gapWidth;
+        lv.borderColorSat = this.borderColorSat;
+        lv.upperShow = this.upperShow;
+        lv.upperHeight = this.upperHeight;
+        lv.r0 = this.r0;
+        lv.r = this.r;
+        lv.labelMode = this.labelMode;
+        lv.labelRotate = this.labelRotate;
+        lv.r0Pct = this.r0Pct;
+        lv.rPct = this.rPct;
+        lv.colorOne = this.colorOne;
+        lv.labelColor = this.labelColor;
+        return lv;
+    }
+
+    public static ChartLevel Clone(ChartLevel src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartMapPoint {
+    public int x;
+    public int y;
+
+    // 构造一个地图多边形顶点。
+    public static ChartMapPoint Of(int x, int y) { return new ChartMapPoint { x = x, y = y }; }
+}
+
+public class ChartMapRing {
+    public List<ChartMapPoint> points;
+    public bool hole;
+
+    // 构造一条环；points 至少 3 个才被 JSON 解析接受。
+    public static ChartMapRing Of(List<ChartMapPoint> points, bool hole) {
+        return new ChartMapRing { points = points, hole = hole };
+    }
+}
+
+public class ChartMapRegion {
+    public string name;
+    public int value;
+    public int color;  // 0 = 由 value 映射到连续色域
+    public List<ChartMapRing> rings;
+
+    // 构造地图区域（颜色由 value 映射到连续色域）。
+    public static ChartMapRegion Of(string name, int value, List<ChartMapRing> rings) {
+        ChartMapRegion r = new ChartMapRegion();
+        r.name = name; r.value = value; r.color = 0; r.rings = rings;
+        return r;
+    }
+    // 构造带显式颜色的地图区域（不参与值→色映射）。
+    public static ChartMapRegion Colored(string name, int value, int color, List<ChartMapRing> rings) {
+        ChartMapRegion r = ChartMapRegion.Of(name, value, rings);
+        r.color = color;
+        return r;
+    }
+
+    // 深复制全部环与顶点；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartMapRegion Clone() {
+        List<ChartMapRing> rings = new List<ChartMapRing>();
+        if (this.rings != null) {
+            for (int i = 0; i < this.rings.Count; i = i + 1) {
+                ChartMapRing sr = this.rings[i];
+                List<ChartMapPoint> points = new List<ChartMapPoint>();
+                if (sr.points != null) {
+                    for (int j = 0; j < sr.points.Count; j = j + 1) {
+                        points.Add(ChartMapPoint.Of(sr.points[j].x, sr.points[j].y));
+                    }
+                }
+                rings.Add(ChartMapRing.Of(points, sr.hole));
+            }
+        }
+        return ChartMapRegion.Colored(this.name, this.value, this.color, rings);
+    }
+
+    public static ChartMapRegion Clone(ChartMapRegion src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 已注册地图：echarts registerMap 的对应物。
+public class ChartMapEntry {
+    public string name;
+    public string svg;
+    public double vx;
+    public double vy;
+    public double vw;
+    public double vh;
+    public bool scanned;
+    public List<ChartMapRegion> regions;
+
+    public static ChartMapEntry Of(string name) {
+        ChartMapEntry e = new ChartMapEntry();
+        e.name = name;
+        e.svg = "";
+        e.scanned = false;
+        e.regions = new List<ChartMapRegion>();
+        return e;
+    }
+}
+
+public class ChartParAxis {
+    public string name;
+    public int dim;  // parallelAxis.dim：绑定的数据列下标（缺省 = 数组槽位）
+    public int min;  // 显式下界；minSet=false 时取数据维最小
+    public int max;  // 显式上界；maxSet=false 时取数据维最大
+    public bool minSet;
+    public bool maxSet;
+    public bool inverse;  // parallelAxis.inverse：反向刻度
+    public List<string> cats;  // type:"category" 的类目表（值取下标）
+
+    public static ChartParAxis Of() {
+        ChartParAxis a = new ChartParAxis();
+        a.name = "";
+        a.dim = 0 - 1;  // -1 = 未声明，渲染按数组槽位取列
+        a.min = 0; a.max = 0;
+        a.minSet = false; a.maxSet = false;
+        a.inverse = false;
+        a.cats = new List<string>();
+        return a;
+    }
+
+    // 面向对象深复制实例方法。
+    public ChartParAxis Clone() {
+        ChartParAxis a = ChartParAxis.Of();
+        a.name = this.name;
+        a.dim = this.dim;
+        a.min = this.min; a.max = this.max;
+        a.minSet = this.minSet; a.maxSet = this.maxSet;
+        a.inverse = this.inverse;
+        if (this.cats != null) {
+            for (int i = 0; i < this.cats.Count; i = i + 1) { a.cats.Add(this.cats[i]); }
+        }
+        return a;
+    }
+
+    public static ChartParAxis Clone(ChartParAxis src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 平行坐标数据行实体
+public class ChartParallelRow {
+    public List<int> values;
+
+    public ChartParallelRow() {
+        this.values = new List<int>();
+    }
+
+    public ChartParallelRow(List<int> values) {
+        this.values = values != null ? values : new List<int>();
+    }
+
+    public static ChartParallelRow Of(List<int> values) {
+        return new ChartParallelRow(values);
+    }
+
+    public ChartParallelRow Clone() {
+        List<int> cp = new List<int>();
+        if (this.values != null) {
+            for (int i = 0; i < this.values.Count; i = i + 1) {
+                cp.Add(this.values[i]);
+            }
+        }
+        return new ChartParallelRow(cp);
+    }
+
+    public static ChartParallelRow Clone(ChartParallelRow src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartTitleSpec {
+    public string text;
+    public string sub;
+    public string link;
+    public int topPct; public int topPx;
+    public int leftPct; public int leftPx;
+    public string align;  // "center"/"left"/"right"（left 值为关键词时）
+    public string id;  // title.id（media 缺省项按 id 覆盖 coord）
+    public int itemGap;  // 主副标题间距（官方缺省 10）
+    public bool matAnchor;  // coordinateSystem:"matrix"：锚定到格矩形
+    public int mx0; public int mx1;
+    public int my0; public int my1;
+
+    public static ChartTitleSpec Of() {
+        ChartTitleSpec t = new ChartTitleSpec();
+        t.text = ""; t.sub = "";
+        t.link = "";
+        t.topPct = 0 - 1; t.topPx = 0 - 1;
+        t.leftPct = 0 - 1; t.leftPx = 0 - 1;
+        t.align = "";
+        t.id = "";
+        t.itemGap = 10;
+        t.matAnchor = false;
+        t.mx0 = 0; t.mx1 = 0;
+        t.my0 = 0; t.my1 = 0;
+        return t;
+    }
+}
+
+public class ChartZoom {
+    public bool slider;  // type=='slider'（缺省）；inside = false（纯交互无条）
+    public bool show;  // show（缺省 true；false = 整条隐藏，窗口仍生效）
+    public bool realtime;  // 拖拽时是否实时更新（缺省 true）
+    public bool showDetail;  // showDetail（缺省 true；拖拽时手柄侧标签开关）
+    public bool zoomLock;  // zoomLock：窗口跨度锁定，只能平移
+    public bool brushSelect;  // brushSelect（缺省 true）：底部 moveHandle 拖带
+    public int start;  // 窗口起点百分比 0..100（缺省 0）
+    public int end;  // 窗口终点百分比（缺省 100）
+    public int axisIndex;  // 靶向轴下标（xAxisIndex/yAxisIndex 首项）；-1 = 缺省 0
+    public bool isY;  // yAxisIndex 靶向（纵向条）；false = x（横向条）
+    public int shadowMode;  // showDataShadow：0 'auto'（缺省）| 1 true | 2 false
+    public int handleSize;  // handleSize 百分比（100 缺省；0 = 无手柄）；数值 px 另记
+    public int handleSizePx;  // handleSize 数值形态（px；-1 = 未声明，走百分比）
+    public int minValueSpan;  // 数据单位最小窗口；0 = 未声明
+    public int minSpan;  // 百分比最小窗口；0 = 未声明
+    public int height;  // height px；-1 = 缺省 30（DEFAULT_FILLER_SIZE）
+    public int heightPct;  // height 'N%'；-1 = 未声明
+    public int width;  // width px（纵向）；-1 = 缺省 30
+    public int widthPct;  // width 'N%'；-1 = 未声明
+    public int top;  // top px；-1 未声明
+    public int topPct;  // top 'N%'；-1 未声明
+    public int bottom;  // bottom px；-1 未声明（缺省贴 edgeGap 15）
+    public int bottomPct;  // bottom 'N%'；-1 未声明
+    public int left;  // left px；-1 未声明
+    public int leftPct;  // left 'N%'；-1 未声明
+    public int right;  // right px；-1 未声明
+    public int rightPct;  // right 'N%'；-1 未声明
+    public int borderColor;  // borderColor；0 = 缺省 accent10 #e0e4f2
+    public int fillerColor;  // fillerColor；0 = 缺省 rgba(135,175,274,.2)
+    public int textStyleColor;  // textStyle.color；0 = 缺省 neutral60 #6d6e73
+    public int dbAreaColor;  // dataBackground.areaStyle.color；0 = 缺省 accent20
+    public int dbLineColor;  // dataBackground.lineStyle.color；0 = 缺省 accent30
+    public int selDbAreaColor;  // selectedDataBackground.areaStyle.color；0 = 缺省
+    public int selDbLineColor;  // selectedDataBackground.lineStyle.color；0 = 缺省 accent40
+    public string startValue;  // 类目定位窗口起点（"" = 未声明）
+    public string endValue;  // 类目定位窗口终点
+    public string labelFormatter;  // null = 未声明；"" = 抑制标签；含 {value} 占位
+    public string handleIcon;  // null = 官方缺省 grip；声明 path 时引擎仍画缺省形
+    public string filterMode;  // 过滤模式："filter"（缺省）| "weakFilter" | "empty" | "none"
+    public bool zoomOnMouseWheel;  // 滚轮缩放控制（缺省 true）
+    public bool moveOnMouseMove;  // 鼠标移动平移控制（缺省 true）
+    public bool moveOnMouseWheel;  // 滚轮平移控制（缺省 false）
+    public int throttle;  // 交互防抖节流间隔 ms（缺省 100）
+
+    public static ChartZoom Of() {
+        ChartZoom c = new ChartZoom();
+        c.slider = true;
+        c.show = true;
+        c.realtime = true;
+        c.showDetail = true;
+        c.zoomLock = false;
+        c.brushSelect = true;
+        c.start = 0;
+        c.end = 100;
+        c.axisIndex = 0 - 1;
+        c.isY = false;
+        c.shadowMode = 0;
+        c.handleSize = 100;
+        c.handleSizePx = 0 - 1;
+        c.minValueSpan = 0;
+        c.minSpan = 0;
+        c.height = 0 - 1; c.heightPct = 0 - 1;
+        c.width = 0 - 1; c.widthPct = 0 - 1;
+        c.top = 0 - 1; c.topPct = 0 - 1;
+        c.bottom = 0 - 1; c.bottomPct = 0 - 1;
+        c.left = 0 - 1; c.leftPct = 0 - 1;
+        c.right = 0 - 1; c.rightPct = 0 - 1;
+        c.borderColor = 0; c.fillerColor = 0; c.textStyleColor = 0;
+        c.dbAreaColor = 0; c.dbLineColor = 0;
+        c.selDbAreaColor = 0; c.selDbLineColor = 0;
+        c.startValue = ""; c.endValue = "";
+        c.labelFormatter = null;
+        c.handleIcon = null;
+        c.filterMode = "filter";
+        c.zoomOnMouseWheel = true;
+        c.moveOnMouseMove = true;
+        c.moveOnMouseWheel = false;
+        c.throttle = 100;
+        return c;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartZoom Clone() {
+        ChartZoom c = new ChartZoom();
+        c.slider = this.slider; c.show = this.show;
+        c.realtime = this.realtime;
+        c.showDetail = this.showDetail; c.zoomLock = this.zoomLock;
+        c.brushSelect = this.brushSelect;
+        c.start = this.start; c.end = this.end;
+        c.axisIndex = this.axisIndex; c.isY = this.isY;
+        c.shadowMode = this.shadowMode;
+        c.handleSize = this.handleSize; c.handleSizePx = this.handleSizePx;
+        c.minValueSpan = this.minValueSpan; c.minSpan = this.minSpan;
+        c.height = this.height; c.heightPct = this.heightPct;
+        c.width = this.width; c.widthPct = this.widthPct;
+        c.top = this.top; c.topPct = this.topPct;
+        c.bottom = this.bottom; c.bottomPct = this.bottomPct;
+        c.left = this.left; c.leftPct = this.leftPct;
+        c.right = this.right; c.rightPct = this.rightPct;
+        c.borderColor = this.borderColor; c.fillerColor = this.fillerColor;
+        c.textStyleColor = this.textStyleColor;
+        c.dbAreaColor = this.dbAreaColor; c.dbLineColor = this.dbLineColor;
+        c.selDbAreaColor = this.selDbAreaColor; c.selDbLineColor = this.selDbLineColor;
+        c.startValue = this.startValue; c.endValue = this.endValue;
+        c.labelFormatter = this.labelFormatter; c.handleIcon = this.handleIcon;
+        c.filterMode = this.filterMode;
+        c.zoomOnMouseWheel = this.zoomOnMouseWheel;
+        c.moveOnMouseMove = this.moveOnMouseMove;
+        c.moveOnMouseWheel = this.moveOnMouseWheel;
+        c.throttle = this.throttle;
+        return c;
+    }
+
+    public static ChartZoom Clone(ChartZoom src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartVisualMap {
+    public int type;  // 0 = continuous，1 = piecewise
+    public bool show;  // 是否绘制控件面板
+    public bool realtime;  // 拖拽时是否实时更新（缺省 true）
+    public bool hasMin; public bool hasMax;
+    public int minV; public int maxV;  // ×1000 定点域
+    public int dimension;  // -1 = 默认（按 0 处理）
+    public int seriesIndex;  // -1 = 全部系列
+    public List<int> rangeColors;  // inRange.color 渐变 stop（continuous）
+    // 显式声明过 inRange.color。rangeColors 在
+    // "continuous 且未声明颜色"时会填官方缺省彩虹带，那不是用户的
+    // 着色意图——接线到全局 o.rampColors 时只能认显式声明，否则
+    // scatter-nutrients 的 symbolSize-only visualMap 会把分组色
+    // 覆盖成按值彩虹（官方是 piecewise 分组色）。
+    public bool colorsExplicit;
+    // 声明的边界按**原始数据单位**另存一份：minV/maxV 是 ×1000 定点，
+    // 大数（map-usa max:38000000 → 3.8e10）强转会溢出成 INT_MIN；
+    // 而 o.rampLo/Hi 的消费者（ChartViewMap/Heatmap/Scatter）都按
+    // 原值比较，需要原值。超出 int 范围时记 Auto() 按未声明处理。
+    public int minRaw; public int maxRaw;
+    public List<ChartVisualPiece> pieces;
+    // piecewise 类目模式（官方 nutrients）：categories 列出数据列里
+    // 出现过的字符串类目，inRange.color 同序一一对应；行按该列的
+    // 字符串值查下标取色，找不到的类目走 outOfRange（#ccc）。
+    public List<string> vmCats;
+    // inRange.opacity（0..1000 千分位）：官方 lunar 的 heatmap 是 0.3，
+    // 让底下的日历格与叠在上面的农历日名都透出来。0 = 未声明（不透明）。
+    public int inOpacity;
+    // inRange.symbolSize [lo,hi]（px 直径）：geo 投影散点按值线性映射
+    // 符号大小（官方 scatter-world-population [6,60]）。hasSize=false =
+    // 未声明（渲染器走旧启发式 + 硬帽）。
+    public int sizeLo; public int sizeHi;
+    public bool hasSize;
+    // piecewise 等分桶数（ECharts splitNumber，缺省 5）：值域 [min,max]
+    // 均分成 N 桶，热力格取所在桶中点经色带取色（heatmap-large-
+    // piecewise 声明 8 桶）。0 = 未声明（按缺省 5）。
+    public int splitNumber;
+
+    public static ChartVisualMap Of() {
+        ChartVisualMap vm = new ChartVisualMap();
+        vm.type = 0; vm.show = true; vm.realtime = true; vm.hasMin = false; vm.hasMax = false;
+        vm.minV = 0; vm.maxV = 0; vm.dimension = 0 - 1; vm.seriesIndex = 0 - 1;
+        vm.rangeColors = new List<int>();
+        vm.colorsExplicit = false;
+        vm.minRaw = ChartOption.Auto(); vm.maxRaw = ChartOption.Auto();
+        vm.pieces = new List<ChartVisualPiece>();
+        vm.vmCats = new List<string>();
+        vm.inOpacity = 0;
+        vm.sizeLo = 0; vm.sizeHi = 0; vm.hasSize = false;
+        vm.splitNumber = 0;
+        return vm;
+    }
+
+    // 面向对象深复制实例方法。
+    public ChartVisualMap Clone() {
+        ChartVisualMap vm = ChartVisualMap.Of();
+        vm.type = this.type; vm.show = this.show; vm.realtime = this.realtime;
+        vm.hasMin = this.hasMin; vm.hasMax = this.hasMax;
+        vm.minV = this.minV; vm.maxV = this.maxV;
+        vm.dimension = this.dimension; vm.seriesIndex = this.seriesIndex;
+        if (this.rangeColors != null) {
+            for (int i = 0; i < this.rangeColors.Count; i = i + 1) {
+                vm.rangeColors.Add(this.rangeColors[i]);
+            }
+        }
+        vm.colorsExplicit = this.colorsExplicit;
+        vm.minRaw = this.minRaw; vm.maxRaw = this.maxRaw;
+        if (this.pieces != null) {
+            for (int i = 0; i < this.pieces.Count; i = i + 1) { vm.pieces.Add(this.pieces[i]); }
+        }
+        if (this.vmCats != null) {
+            for (int i = 0; i < this.vmCats.Count; i = i + 1) { vm.vmCats.Add(this.vmCats[i]); }
+        }
+        vm.inOpacity = this.inOpacity;
+        vm.sizeLo = this.sizeLo; vm.sizeHi = this.sizeHi; vm.hasSize = this.hasSize;
+        vm.splitNumber = this.splitNumber;
+        return vm;
+    }
+
+    public static ChartVisualMap Clone(ChartVisualMap src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+
+    // inRange.color 多 stop 线性插值；tF 为 0..1000 归一位置。
+    public static int Lerp(List<int> stops, int tF) {
+        int k = stops.Count;
+        if (k < 1) { return 0; }
+        if (k == 1 || tF <= 0) { return stops[0]; }
+        if (tF >= 1000) { return stops[k - 1]; }
+        int seg = tF * (k - 1);
+        int i = seg / 1000;
+        if (i > k - 2) { return stops[k - 1]; }
+        int f = seg - i * 1000;
+        int a = stops[i]; int b = stops[i + 1];
+        int rr = ((a >> 16) & 255) * (1000 - f) / 1000 + ((b >> 16) & 255) * f / 1000;
+        int gg = ((a >> 8) & 255) * (1000 - f) / 1000 + ((b >> 8) & 255) * f / 1000;
+        int bb = (a & 255) * (1000 - f) / 1000 + (b & 255) * f / 1000;
+        int aa = ((a >> 24) & 255) * (1000 - f) / 1000 + ((b >> 24) & 255) * f / 1000;
+        return (aa << 24) | (rr << 16) | (gg << 8) | bb;
+    }
+}
+
+public class ChartVisualPiece {
+    public bool hasLo; public int lo; public bool loIncl;
+    public bool hasHi; public int hi; public bool hiIncl;
+    public bool hasEq; public int eq;
+    public int color;
+    public string label;
+
+    public static ChartVisualPiece Of() {
+        return new ChartVisualPiece { hasLo = false, lo = 0, loIncl = true,
+            hasHi = false, hi = 0, hiIncl = true, hasEq = false, eq = 0,
+            color = 0, label = "" };
+    }
+    // probe 是否落在本段内。
+    public bool Hit(int probe) {
+        if (hasEq) { return probe == eq; }
+        if (!hasLo && !hasHi) { return false; }
+        if (hasLo) {
+            if (loIncl && probe < lo) { return false; }
+            if (!loIncl && probe <= lo) { return false; }
+        }
+        if (hasHi) {
+            if (hiIncl && probe > hi) { return false; }
+            if (!hiIncl && probe >= hi) { return false; }
+        }
+        return true;
+    }
+}
+
+// visualMap 取色带与值域的一次推导结果（直角热力图 / 矩阵图
+// 共用车道，由 ChartView.VisualRampDomain 产出）。
+public class RampDomainResult {
+    public List<int> ramp;  // 取色带；<2 色时调用方回退系列色
+    public int split;       // piecewise 等分桶数；0 = 连续
+    public double dLo; public double dHi;  // 值域
+}
+
+// visualMap splitList 命名区间实体
+public class ChartRangeSplit {
+    public string label;
+    public int lo;
+    public int hi;
+
+    // 构造一个命名区间；lo/hi 可为 ChartOption.Auto() 表示开口。
+    public static ChartRangeSplit Of(string label, int lo, int hi) {
+        ChartRangeSplit s = new ChartRangeSplit();
+        s.label = label;
+        s.lo = lo;
+        s.hi = hi;
+        return s;
+    }
+
+    public ChartRangeSplit Clone() {
+        return ChartRangeSplit.Of(this.label, this.lo, this.hi);
+    }
+
+    public static ChartRangeSplit Clone(ChartRangeSplit src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}

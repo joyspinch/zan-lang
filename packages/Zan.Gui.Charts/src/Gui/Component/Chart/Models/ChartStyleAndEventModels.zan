@@ -1,0 +1,797 @@
+using Gui;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using System;
+
+namespace Gui.Component.Chart;
+
+public class ChartEvent {
+    public string name;
+    public int start;
+    public int end;
+    public int value;
+    public int color;  // 0 = 继承系列颜色
+
+    // 构造一个事件；color 为 0 表示继承系列颜色。
+    public static ChartEvent Of(string name, int start, int end, int value) {
+        ChartEvent e = new ChartEvent();
+        e.name = name; e.start = start; e.end = end; e.value = value; e.color = 0;
+        return e;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartEvent Clone() {
+        ChartEvent e = ChartEvent.Of(this.name, this.start, this.end, this.value);
+        e.color = this.color;
+        return e;
+    }
+
+    public static ChartEvent Clone(ChartEvent src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 一条订阅记录：事件类型与处理器的配对（仅 ChartEventHub 内部使用）。
+public class ChartEventSubscription {
+    public ChartEventType type;
+    public ChartInteractionHandler handler;
+
+    // 构造一条订阅。
+    public ChartEventSubscription(ChartEventType type, ChartInteractionHandler handler) {
+        this.type = type;
+        this.handler = handler;
+    }
+}
+
+// 渲染器提供给 ChartView 的当前几何命中。命中身份不包含
+// 像素坐标，指针在同一数据点内移动时不会重复触发 Hover。
+public class ChartHit {
+    // 指针当前命中的数据图元类型（命中空白区域时为 Chart）。
+    public ChartElementType elementType;
+    // 命中的系列下标/名称；未命中具体数据时为 -1/空串。
+    public int seriesIndex;
+    public string seriesName;
+    // 命中的数据项下标/名称（饼图为扇区、地图为区域）。
+    public int dataIndex;
+    public string dataName;
+    // 整数值（value 字段未数值化时有效）。
+    public int value;
+    public bool numberValueSet;
+    public double numberValue;
+    // 命中点的 x/y 数值（直角坐标系中有意义；散点/折线为数据坐标）。
+    public bool xValueSet;
+    public double xValue;
+    public bool yValueSet;
+    public double yValue;
+    // 命中点的像素坐标（画自定义 tooltip 用）。
+    public int pixelX;
+    public int pixelY;
+    // 命中的轴下标（0 = 左/下轴，1 = 右轴）。
+    public int axisIndex;
+
+    // 构造基础命中：图元类型/系列/数据项身份、整数值与像素
+    // 坐标按参数记录；number/x/y 数值字段未置位，axisIndex = 0。
+    public static ChartHit Of(ChartElementType elementType, int seriesIndex,
+                       string seriesName, int dataIndex, string dataName,
+                       int value, int pixelX, int pixelY) {
+        ChartHit h = new ChartHit();
+        h.elementType = elementType;
+        h.seriesIndex = seriesIndex;
+        h.seriesName = seriesName;
+        h.dataIndex = dataIndex;
+        h.dataName = dataName;
+        h.value = value;
+        h.numberValueSet = false;
+        h.numberValue = 0.0;
+        h.xValueSet = false;
+        h.xValue = 0.0;
+        h.yValueSet = false;
+        h.yValue = 0.0;
+        h.pixelX = pixelX;
+        h.pixelY = pixelY;
+        h.axisIndex = 0;
+        return h;
+    }
+
+    // 同一数据点命中判断（类型+系列+数据下标），指针在
+    // 同一点内移动时用于抑制重复 Hover。
+    public bool Same(ChartHit other) {
+        if (other == null) { return false; }
+        return this.elementType == other.elementType
+            && this.seriesIndex == other.seriesIndex
+            && this.dataIndex == other.dataIndex;
+    }
+
+    public static bool Same(ChartHit a, ChartHit b) {
+        if (a == null || b == null) { return a == b; }
+        return a.Same(b);
+    }
+
+    // 深复制命中（含全部数值扩展字段与轴下标）。
+    public ChartHit Clone() {
+        return this.Copy();
+    }
+    public static ChartHit Clone(ChartHit src) {
+        return ChartHit.Copy(src);
+    }
+    public ChartHit Copy() {
+        return ChartHit.Copy(this);
+    }
+
+    // 深复制命中（含全部数值扩展字段与轴下标）；src 为 null
+    // 时返回 null。
+    public static ChartHit Copy(ChartHit src) {
+        if (src == null) { return null; }
+        ChartHit h = ChartHit.Of(src.elementType, src.seriesIndex,
+            src.seriesName, src.dataIndex, src.dataName, src.value,
+            src.pixelX, src.pixelY);
+        h.numberValueSet = src.numberValueSet;
+        h.numberValue = src.numberValue;
+        h.xValueSet = src.xValueSet;
+        h.xValue = src.xValue;
+        h.yValueSet = src.yValueSet;
+        h.yValue = src.yValue;
+        h.axisIndex = src.axisIndex;
+        return h;
+    }
+}
+
+// 图表元素分类。Chart 表示整图空白区域，其余类型表示具体数据图元
+public enum ChartElementType {
+    Chart,
+    LinePoint,
+    Bar,
+    ScatterPoint,
+    HeatmapCell,
+    PieSlice,
+    MapRegion,
+    FunnelStage,
+    Node,
+    Link,
+    VennCircle,
+    EventBand,
+    RadarAxis,
+    Candlestick,
+    BoxPlot,
+    ErrorBar,
+    Gauge,
+    WordTag
+}
+
+// ECharts 标准图表交互事件类型。
+// 类型使用独立枚举，避免与 Event River 的 ChartEvent 数据实体重名。
+public enum ChartEventType {
+    Click,
+    DoubleClick,
+    Hover,
+    MouseOut,
+    LegendSelected,
+    PieSelected,
+    MapSelected,
+    MapRoam,
+    DataZoom,
+    DataRange,
+    TimelineChanged,
+    MagicTypeChanged,
+    Restore,
+    Resize,
+    DataChanged,
+    Refresh,
+    ForceLayoutEnd
+}
+
+// 图表交互回调签名：所有事件类型共用，handler 按载荷的
+// type 与字段自行分流。
+public delegate void ChartInteractionHandler(ChartInteractionEvent e);
+
+// 图表交互事件的稳定载荷。未适用的字段使用 -1/空串/false，
+// 这样同一 handler 可以按 type 选择需要的 ECharts 风格字段。
+public class ChartInteractionEvent {
+    public ChartEventType type;
+    public ChartElementType elementType;
+    public bool dataHit;
+    public int chartWid;
+    public int seriesIndex;
+    public string seriesName;
+    public int dataIndex;
+    public string dataName;
+    public int value;
+    public bool numberValueSet;
+    public double numberValue;
+    public bool xValueSet;
+    public double xValue;
+    public bool yValueSet;
+    public double yValue;
+    public int x;
+    public int y;
+    public int axisIndex;
+    public bool selected;
+    public int zoomStart;
+    public int zoomEnd;
+
+    // 基础载荷：仅事件类型与图表 wid，其余字段为默认值
+    // （下标 -1、空串、坐标 0）。
+    public static ChartInteractionEvent Of(ChartEventType type, int chartWid) {
+        ChartInteractionEvent e = new ChartInteractionEvent();
+        e.type = type;
+        e.elementType = ChartElementType.Chart;
+        e.dataHit = false;
+        e.chartWid = chartWid;
+        e.seriesIndex = 0 - 1;
+        e.seriesName = "";
+        e.dataIndex = 0 - 1;
+        e.dataName = "";
+        e.value = 0;
+        e.numberValueSet = false;
+        e.numberValue = 0.0;
+        e.xValueSet = false;
+        e.xValue = 0.0;
+        e.yValueSet = false;
+        e.yValue = 0.0;
+        e.x = 0;
+        e.y = 0;
+        e.axisIndex = 0;
+        e.selected = false;
+        e.zoomStart = 0;
+        e.zoomEnd = 1000;
+        return e;
+    }
+
+    // 系列级载荷：在基础载荷上补 seriesIndex/seriesName
+    // （图例开关等针对整条系列的事件用）。
+    public static ChartInteractionEvent Series(ChartEventType type, int wid,
+                                        int seriesIndex, string seriesName) {
+        ChartInteractionEvent e = ChartInteractionEvent.Of(type, wid);
+        e.seriesIndex = seriesIndex;
+        e.seriesName = seriesName;
+        return e;
+    }
+
+    // 数据点命中的完整载荷：dataHit=true 且 elementType 指明图元类型。
+    public static ChartInteractionEvent DataPoint(ChartEventType type, int wid,
+                                           int seriesIndex, string seriesName,
+                                           int dataIndex, string dataName,
+                                           ChartElementType elementType) {
+        ChartInteractionEvent e = ChartInteractionEvent.Series(
+            type, wid, seriesIndex, seriesName);
+        e.dataHit = true;
+        e.elementType = elementType;
+        e.dataIndex = dataIndex;
+        e.dataName = dataName;
+        return e;
+    }
+
+    // 图元类型的稳定字符串名（ECharts 风格小驼峰）；Chart 与
+    // 未列出的值一律返回 "chart"。
+    public static string ElementName(ChartElementType type) {
+        if (type == ChartElementType.LinePoint) { return "linePoint"; }
+        if (type == ChartElementType.Bar) { return "bar"; }
+        if (type == ChartElementType.ScatterPoint) { return "scatterPoint"; }
+        if (type == ChartElementType.HeatmapCell) { return "heatmapCell"; }
+        if (type == ChartElementType.PieSlice) { return "pieSlice"; }
+        if (type == ChartElementType.MapRegion) { return "mapRegion"; }
+        if (type == ChartElementType.FunnelStage) { return "funnelStage"; }
+        if (type == ChartElementType.Node) { return "node"; }
+        if (type == ChartElementType.Link) { return "link"; }
+        if (type == ChartElementType.VennCircle) { return "vennCircle"; }
+        if (type == ChartElementType.EventBand) { return "eventBand"; }
+        if (type == ChartElementType.RadarAxis) { return "radarAxis"; }
+        if (type == ChartElementType.Candlestick) { return "candlestick"; }
+        if (type == ChartElementType.BoxPlot) { return "boxPlot"; }
+        if (type == ChartElementType.ErrorBar) { return "errorBar"; }
+        if (type == ChartElementType.Gauge) { return "gauge"; }
+        if (type == ChartElementType.WordTag) { return "wordTag"; }
+        return "chart";
+    }
+
+    // 本事件类型的字符串名（见 TypeNameOf）。
+    public string TypeName() {
+        return ChartInteractionEvent.TypeNameOf(this.type);
+    }
+
+    // 事件类型的稳定字符串名（ECharts 风格小驼峰）；未知值
+    // 返回 "unknown"。
+    public static string TypeNameOf(ChartEventType type) {
+        if (type == ChartEventType.Click) { return "click"; }
+        if (type == ChartEventType.DoubleClick) { return "doubleClick"; }
+        if (type == ChartEventType.Hover) { return "hover"; }
+        if (type == ChartEventType.MouseOut) { return "mouseOut"; }
+        if (type == ChartEventType.LegendSelected) { return "legendSelected"; }
+        if (type == ChartEventType.PieSelected) { return "pieSelected"; }
+        if (type == ChartEventType.MapSelected) { return "mapSelected"; }
+        if (type == ChartEventType.MapRoam) { return "mapRoam"; }
+        if (type == ChartEventType.DataZoom) { return "dataZoom"; }
+        if (type == ChartEventType.DataRange) { return "dataRange"; }
+        if (type == ChartEventType.TimelineChanged) { return "timelineChanged"; }
+        if (type == ChartEventType.MagicTypeChanged) { return "magicTypeChanged"; }
+        if (type == ChartEventType.Restore) { return "restore"; }
+        if (type == ChartEventType.Resize) { return "resize"; }
+        if (type == ChartEventType.DataChanged) { return "dataChanged"; }
+        if (type == ChartEventType.Refresh) { return "refresh"; }
+        if (type == ChartEventType.ForceLayoutEnd) { return "forceLayoutEnd"; }
+        return "unknown";
+    }
+}
+
+public class ChartLineStyle {
+    public int color;
+    public int color0;  // ECharts K线：阴线影线/边框色（与 color 配对）
+    public int width;
+    public string type;
+    public int shadowColor;
+    public int shadowBlur;
+    public int shadowOffsetX;
+    public int shadowOffsetY;
+    public List<int> gradStops;
+    public bool transparent;
+    public int alpha;
+
+    public static ChartLineStyle Of(int color, int width) {
+        ChartLineStyle ls = new ChartLineStyle {
+            color = color, width = width, type = "solid", shadowColor = 0, shadowBlur = 0
+        };
+        ls.color0 = 0;
+        ls.shadowOffsetX = 0;
+        ls.shadowOffsetY = 0;
+        return ls;
+    }
+
+    public ChartLineStyle Clone() {
+        ChartLineStyle ls = new ChartLineStyle { color = this.color, color0 = this.color0,
+            width = this.width, type = this.type, shadowColor = this.shadowColor,
+            shadowBlur = this.shadowBlur, transparent = this.transparent,
+            alpha = this.alpha };
+        ls.shadowOffsetX = this.shadowOffsetX;
+        ls.shadowOffsetY = this.shadowOffsetY;
+        if (this.gradStops != null) {
+            ls.gradStops = new List<int>();
+            for (int i = 0; i < this.gradStops.Count; i = i + 1) {
+                ls.gradStops.Add(this.gradStops[i]);
+            }
+        }
+        return ls;
+    }
+
+    public static ChartLineStyle Clone(ChartLineStyle src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class ChartAreaStyle {
+    public int color;
+    public string type;
+    public int alpha;
+    public List<int> gradStops;
+
+    public static ChartAreaStyle Create() {
+        return new ChartAreaStyle { color = 0, type = "default", gradStops = null, alpha = 0 };
+    }
+}
+
+public class ChartItemStateStyle {
+    public int color;
+    public int color0;  // ECharts K线：阴线填充色（与 color 配对）
+    public int borderColor;
+    public int borderColor0;  // ECharts K线：阴线边框/影线色（与 borderColor 配对）
+    public int borderWidth;
+    public List<int> borderRadius;
+    public List<int> gradStops;
+    public ChartLineStyle lineStyle;
+    public ChartAreaStyle areaStyle;
+
+    public static ChartItemStateStyle Create() {
+        ChartItemStateStyle st = new ChartItemStateStyle {
+            color = 0, borderColor = 0, borderWidth = 0,
+            lineStyle = ChartLineStyle.Of(0, 0), areaStyle = ChartAreaStyle.Create()
+        };
+        st.borderRadius = new List<int>();
+        return st;
+    }
+}
+
+public class ChartItemStyle {
+    public ChartItemStateStyle normal;
+    public ChartItemStateStyle emphasis;
+
+    // 构造 normal/emphasis 均为空样式的项样式。
+    public static ChartItemStyle Create() {
+        return new ChartItemStyle {
+            normal = ChartItemStateStyle.Create(), emphasis = ChartItemStateStyle.Create()
+        };
+    }
+
+    // 深复制单个状态（含 borderRadius 列表与线/面积子样式）；
+    // src 为 null 时返回 null。
+    public static ChartItemStateStyle CloneState(ChartItemStateStyle src) {
+        if (src == null) { return null; }
+        ChartItemStateStyle st = ChartItemStateStyle.Create();
+        st.color = src.color; st.color0 = src.color0;
+        st.borderColor = src.borderColor; st.borderColor0 = src.borderColor0; st.borderWidth = src.borderWidth;
+        st.lineStyle = ChartLineStyle.Of(src.lineStyle.color, src.lineStyle.width);
+        st.lineStyle.color0 = src.lineStyle.color0; st.lineStyle.type = src.lineStyle.type;
+        st.lineStyle.transparent = src.lineStyle.transparent;
+        st.lineStyle.alpha = src.lineStyle.alpha;
+        st.lineStyle.shadowColor = src.lineStyle.shadowColor;
+        st.lineStyle.shadowBlur = src.lineStyle.shadowBlur;
+        st.areaStyle = ChartAreaStyle.Create(); st.areaStyle.color = src.areaStyle.color;
+        st.areaStyle.type = src.areaStyle.type;
+        st.areaStyle.alpha = src.areaStyle.alpha;
+        if (src.areaStyle.gradStops != null) {
+            st.areaStyle.gradStops = new List<int>();
+            for (int gsi = 0; gsi < src.areaStyle.gradStops.Count; gsi = gsi + 1) {
+                st.areaStyle.gradStops.Add(src.areaStyle.gradStops[gsi]);
+            }
+        }
+        st.borderRadius = new List<int>();
+        for (int i = 0; i < src.borderRadius.Count; i = i + 1) { st.borderRadius.Add(src.borderRadius[i]); }
+        return st;
+    }
+
+    // 深复制 normal/emphasis 两套状态；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartItemStyle Clone() {
+        return new ChartItemStyle { normal = ChartItemStyle.CloneState(this.normal),
+            emphasis = ChartItemStyle.CloneState(this.emphasis) };
+    }
+
+    public static ChartItemStyle Clone(ChartItemStyle src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+public class RichBlock {
+    public List<RichSeg> segs;
+    public ChartTextStyle st;
+    public int w;
+    public int h;
+    public int lines;
+}
+
+public class RichSeg {
+    public string text;
+    public int line;  // 行号 0..
+    public ChartRichStyle st;  // null = 纯文本段
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public int fsPx;
+    public int tw;
+    public int lh;
+
+    public static RichSeg Create() {
+        RichSeg s = new RichSeg();
+        s.text = "";
+        s.line = 0;
+        s.st = null;
+        s.x = 0;
+        s.y = 0;
+        s.w = 0;
+        s.h = 0;
+        s.fsPx = 0;
+        s.tw = 0;
+        s.lh = 0;
+        return s;
+    }
+}
+
+public class ChartRichStyle {
+    public string name;
+    public int color;
+    public int fontSize;
+    public string fontWeight;
+    public string fontFamily;
+    // A14 rich 段的 textBorder*/textShadow*（ECharts labelStyle.ts:522,550
+    // ——zrender stroke 文本 = 先描边后填充，paint-order:stroke）。
+    // borderColor 0 = 无；borderWidth -1 = 未声明；shadowColor 0 = 无。
+    public int tbColor;
+    public int tbWidth;
+    public int tsColor;
+    public int tsBlur;
+    public int tsDx;
+    public int tsDy;
+    public int align;  // 0 left / 1 center / 2 right；-1 未声明（左）
+    public int lineHeight;
+    public int backgroundColor;
+    public int bgIsImage;
+    public int borderColor;
+    public int borderWidth;  // 官方可 0.5（pie-rich-text/treemap hr）：四舍五入存 px
+    public int radTL;  // borderRadius：数字 = 四角同值；数组 [左上,右上,
+    public int radTR;  // 右下,左下]（pie-rich-text abg 的 [4,4,0,0] 只
+    public int radBR;  // 圆上面两角）。-1 未声明。
+    public int radBL;
+    public int padT;
+    public int padR;
+    public int padB;
+    public int padL;
+    public int width;  // -2 = '100%'（随富文本整块宽）；≥0 像素
+    public int height;
+
+    // 构造默认：全未声明。
+    public static ChartRichStyle Create() {
+        ChartRichStyle r = new ChartRichStyle();
+        r.name = "";
+        r.color = 0;
+        r.fontSize = 0 - 1;
+        r.fontWeight = "";
+        r.fontFamily = "";
+        r.tbColor = 0;
+        r.tbWidth = 0 - 1;
+        r.tsColor = 0;
+        r.tsBlur = 0 - 1;
+        r.tsDx = 0;
+        r.tsDy = 0;
+        r.align = 0 - 1;
+        r.lineHeight = 0 - 1;
+        r.backgroundColor = 0;
+        r.bgIsImage = 0;
+        r.borderColor = 0;
+        r.borderWidth = 0 - 1;
+        r.radTL = 0 - 1;
+        r.radTR = 0 - 1;
+        r.radBR = 0 - 1;
+        r.radBL = 0 - 1;
+        r.padT = 0 - 1;
+        r.padR = 0 - 1;
+        r.padB = 0 - 1;
+        r.padL = 0 - 1;
+        r.width = 0 - 1;
+        r.height = 0 - 1;
+        return r;
+    }
+}
+
+public class ChartTextStyle {
+    public int color;
+    public int fontSize;
+    public string fontStyle;
+    public string fontWeight;
+    public string fontFamily;
+    public int shadowColor;
+    public int shadowBlur;
+    public int shadowOffsetX;
+    public int shadowOffsetY;
+    public string align;
+    public string verticalAlign;
+    // -1 = 未声明；颜色 0 = 无。offset/blur 与 Canvas 无模糊的现实下
+    // 按描边渲染（见 ChartView.DrawTextStyled）。
+    public int tbColor;
+    public int tbWidth;
+    public int tsColor;
+    public int tsBlur;
+    public int tsDx;
+    public int tsDy;
+    public int lineHeight;  // label 级 lineHeight：段未声明自身 lineHeight 时的
+                    // 行高缺省（gauge-speed detail.lineHeight 40）；
+                    // -1 = 未声明
+    public List<ChartRichStyle> rich;
+    public int boxBg;  // label.backgroundColor（整块底板）；0 = 无
+    public int boxBorder;  // label.borderColor；0 = 无
+    public int boxBorderW;  // label.borderWidth；-1 未声明
+    public int boxRadius;  // label.borderRadius；-1 未声明
+    public int padT;  // label.padding；-1 未声明
+    public int padR;
+    public int padB;
+    public int padL;
+
+    // 构造默认样式：颜色 0（跟随主题）、字号 0（渲染器缺省）。
+    public static ChartTextStyle Create() {
+        ChartTextStyle s = new ChartTextStyle {
+            color = 0, fontSize = 0, fontStyle = "normal", fontWeight = "normal",
+            fontFamily = "", shadowColor = 0, shadowBlur = 0
+        };
+        s.tbColor = 0;
+        s.tbWidth = 0 - 1;
+        s.tsColor = 0;
+        s.tsBlur = 0 - 1;
+        s.tsDx = 0;
+        s.tsDy = 0;
+        s.lineHeight = 0 - 1;
+        s.rich = null;
+        s.boxBg = 0;
+        s.boxBorder = 0;
+        s.boxBorderW = 0 - 1;
+        s.boxRadius = 0 - 1;
+        s.padT = 0 - 1;
+        s.padR = 0 - 1;
+        s.padB = 0 - 1;
+        s.padL = 0 - 1;
+        s.shadowOffsetX = 0;
+        s.shadowOffsetY = 0;
+        s.align = "";
+        s.verticalAlign = "";
+        return s;
+    }
+
+    // 深复制；src 为 null 时返回 null。
+    // 面向对象深复制实例方法。
+    public ChartTextStyle Clone() {
+        ChartTextStyle s = new ChartTextStyle { color = this.color, fontSize = this.fontSize,
+            fontStyle = this.fontStyle, fontWeight = this.fontWeight,
+            fontFamily = this.fontFamily, shadowColor = this.shadowColor,
+            shadowBlur = this.shadowBlur };
+        s.shadowOffsetX = this.shadowOffsetX;
+        s.shadowOffsetY = this.shadowOffsetY;
+        s.align = this.align;
+        s.verticalAlign = this.verticalAlign;
+        s.tbColor = this.tbColor;
+        s.tbWidth = this.tbWidth;
+        s.tsColor = this.tsColor;
+        s.tsBlur = this.tsBlur;
+        s.tsDx = this.tsDx;
+        s.tsDy = this.tsDy;
+        s.lineHeight = this.lineHeight;
+        s.boxBg = this.boxBg;
+        s.boxBorder = this.boxBorder;
+        s.boxBorderW = this.boxBorderW;
+        s.boxRadius = this.boxRadius;
+        s.padT = this.padT;
+        s.padR = this.padR;
+        s.padB = this.padB;
+        s.padL = this.padL;
+        if (this.rich != null) {
+            s.rich = new List<ChartRichStyle>();
+            for (int i = 0; i < this.rich.Count; i = i + 1) {
+                ChartRichStyle a = this.rich[i];
+                ChartRichStyle b = new ChartRichStyle();
+                b.name = a.name;
+                b.color = a.color;
+                b.fontSize = a.fontSize;
+                b.fontWeight = a.fontWeight;
+                b.fontFamily = a.fontFamily;
+                b.tbColor = a.tbColor;
+                b.tbWidth = a.tbWidth;
+                b.tsColor = a.tsColor;
+                b.tsBlur = a.tsBlur;
+                b.tsDx = a.tsDx;
+                b.tsDy = a.tsDy;
+                b.align = a.align;
+                b.lineHeight = a.lineHeight;
+                b.backgroundColor = a.backgroundColor;
+                b.bgIsImage = a.bgIsImage;
+                b.borderColor = a.borderColor;
+                b.borderWidth = a.borderWidth;
+                b.radTL = a.radTL;
+                b.radTR = a.radTR;
+                b.radBR = a.radBR;
+                b.radBL = a.radBL;
+                b.padT = a.padT;
+                b.padR = a.padR;
+                b.padB = a.padB;
+                b.padL = a.padL;
+                b.width = a.width;
+                b.height = a.height;
+                s.rich.Add(b);
+            }
+        }
+        return s;
+    }
+
+    public static ChartTextStyle Clone(ChartTextStyle src) {
+        if (src == null) { return null; }
+        return src.Clone();
+    }
+}
+
+// 高性能图表路径的缓存 min/max 抽取。每个大图表
+// 持有一个（类似 DataTableState）；底层数据变化时
+// 调用 Invalidate()。ChartBig 惰性填充并在帧间复用。
+public class ChartState {
+    public int version;  // 数据变化时调用方递增（通过 Invalidate）
+    public int builtVersion;  // 构建缓存时的数据版本
+    public int builtW;  // 构建缓存时的控件宽度
+    public int builtSeries;  // 构建缓存时的系列数量
+    public int cols;  // 缓存中每个系列最宽的列数
+    public int axisLo;  // 解析后的数值轴边界
+    public int axisHi;
+    public List<List<ChartBigColExtents>> seriesCols;  // 每系列：每个抽取列的强类型 [min, max] 实体（主表示）
+    public List<List<int>> colMin;  // 每列极小值投影矩阵
+    public List<List<int>> colMax;  // 每列极大值投影矩阵
+    public int animationKey;  // 显式实例键（0 = legacy fallback）
+    public bool animationKeySet;
+
+    // 默认构造：入场动画基于控件宽派生 Hash 键。
+    public ChartState() {
+        this.version = 1;
+        this.builtVersion = 0;
+        this.builtW = -1;
+        this.builtSeries = -1;
+        this.cols = 0;
+        this.axisLo = 0;
+        this.axisHi = 0;
+        this.seriesCols = new List<List<ChartBigColExtents>>();
+        this.colMin = new List<List<int>>();
+        this.colMax = new List<List<int>>();
+        this.animationKey = 0;
+        this.animationKeySet = false;
+    }
+
+    // 显式实例键构造；key != 0 时入场动画键与控件宽度解耦。
+    public ChartState(int key) {
+        this.version = 1; this.builtVersion = 0; this.builtW = -1;
+        this.builtSeries = -1; this.cols = 0; this.axisLo = 0; this.axisHi = 0;
+        this.seriesCols = new List<List<ChartBigColExtents>>();
+        this.colMin = new List<List<int>>(); this.colMax = new List<List<int>>();
+        this.animationKey = key; this.animationKeySet = key != 0;
+    }
+
+    // 入场动画键：显式键 > 0 时用 AnimationKey(key)，否则基于宽度派生 Hash 键。
+    public int IntroKey(int w) {
+        if (this.animationKeySet) { return ChartBig.AnimationKey(this.animationKey); }
+        return IdHash.HashInt(w, 520);
+    }
+
+    // 将缓存标记为过期，使下次渲染重新抽取源数据。
+    public void Invalidate() { this.version = this.version + 1; }
+}
+
+// A383 第一步：未知/未实现 option 键的告警（廉价可见层）。
+//
+// 口径与 scripts/chart_gap_audit.py 同源：注册表 = 引擎源码里
+// .Get/.Int/.Str/.Bool/.Num/.Double/.Has 访问器读到的全部键名
+// （访问器字面量按键名收集，与审计的 read 集同一 blind spot——
+// 经变量间接取的键审计看不见，这里也看不见），外加 GeoJson 的
+// UTF8Encoding/UTF8Scale 与数据载荷子树键。用户 option 里出现
+// 注册表之外的键 = 引擎没有任何代码读过它 = 静默丢弃——本类在
+// 解析后走树对账，Console.ErrorWriteLine 到 stderr（不进 stdout
+// 黄金），同名键去重只报一次。
+public class ChartOptionWarn {
+    // 与 DATA_STOP 同名单的载荷子树：不下钻（里面是点，不是 option）。
+    static bool IsPayload(string k) {
+        return k == "data" || k == "children" || k == "nodes"
+            || k == "links" || k == "edges" || k == "source"
+            || k == "target" || k == "coords" || k == "regions"
+            || k == "styleJson" || k == "stylers" || k == "features"
+            || k == "geometry" || k == "coordinates" || k == "matrix"
+            || k == "points" || k == "nameMap" || k == "colorStops";
+    }
+
+    static string KNOWN = "|!=|<|<=|=|==|>|>=|UTF8Encoding|UTF8Scale|__grad|align|alignTicks|alignTo|alignWithLabel|anchor|and|angleAxis|animation|animationDuration|animationDurationUpdate|animationEasing|animationEasingUpdate|animationThreshold|areaColor|areaStyle|aspectScale|autoPlay|avoidLabelOverlap|axisIndex|axisLabel|axisLine|axisName|axisPointer|axisTick|backgroundColor|backgroundStyle|barCategoryGap|barGap|barHeight|barMaxWidth|barMinAngle|barMinHeight|barMinWidth|barWidth|baseOption|blendMode|bmap|body|borderColor|borderColor0|borderColorSaturation|borderRadius|borderWidth|bottom|boundIQR|boundaryGap|bounding|boxes|breakArea|breakLabelLayout|breaks|brush|brushLink|brushMode|brushSelect|brushType|bubbles|calculable|calendar|calendarIndex|candles|categories|category|cellSize|center|children|chord|clip|clockWise|clockwise|close|clusterCount|collapsed|color|color0|colorAlpha|colorMappingBy|colorSaturation|colorStops|config|confine|connectGroup|constantSpeed|containLabel|controller|coord|coordinateSystem|coordinates|coords|corner|curveness|custom|data|dataBackground|dataGroupId|dataIndex|dataRange|dataView|dataZoom|dataset|datasetId|datasetIndex|dayLabel|detail|dim|dimension|dimensions|distance|distanceToLabelLine|divideShape|dx|dy|edgeDistance|edgeLength|edgeSymbol|edgeSymbolSize|edges|effect|elements|emphasis|enabled|encode|encodeOffsets|end|endAngle|endLabel|endValue|eq|err|errors|events|expandAndCollapse|feature|features|fill|fillerColor|filterMode|firstDay|focus|font|fontFamily|fontSize|fontStyle|fontWeight|force|forceCurveness|formatter|from|fromDatasetId|fromDatasetIndex|fromTransformResult|funnelAlign|funnelGap|funnelLabelOut|funnelPercent|gap|gapWidth|geo|geoIndex|geometry|graphic|gravity|grid|gridId|gridIndex|groupBy|gt|gte|handle|handleIcon|handleSize|hbar|height|hidden|hideDelay|hideOverlap|high|hole|hoverLink|icon|id|inBrush|inRange|indicator|initialTreeDepth|innerPct|inside|interval|inverse|isExpanded|itemGap|itemHeight|itemName|itemNameFormatter|itemStyle|itemWidth|kind|label|labelFormatter|labelLayout|labelLine|labelShow|labels|large|largeThreshold|layout|layoutCenter|layoutSize|leafDepth|leaves|left|legend|legendHoverLink|length|length2|levelSize|levels|lineDash|lineDashOffset|lineHeight|lineStyle|lineWidth|link|linkStyle|linkSymbol|links|loop|low|lt|lte|magicType|map|mapType|margin|mark|markArea|markLabel|markLine|markPoint|matrix|max|maxInterval|maxRadius|maxSize|maxSizePct|media|method|min|minInterval|minMargin|minRadius|minSpan|minValueSpan|minorSplitLine|minorTick|monthLabel|moveOnMouseMove|moveOnMouseWheel|moveOverlap|name|nameGap|nameLocation|nameMap|nameTextStyle|ne|nodeAlign|nodeStyle|nodes|normal|offset|offsetCenter|onZero|opacity|open|option|options|or|order|orient|outOfBrush|outOfRange|outerBounds|overlap|padAngle|padding|parallel|parallelAxis|period|pieLabels|pieces|playInterval|pointer|points|polar|polarIndex|polyline|position|precision|progress|progressive|progressiveThreshold|properties|query|r|r0|radar|radarIndex|radius|radiusAxis|range|readOnly|realtime|realtimeSort|regions|repulsion|restore|resultDimensions|ribbonType|rich|right|ringWidth|rings|rippleEffect|roam|roamWheelMode|roseType|rotate|roundCap|sampling|saveAsImage|scale|scaling|select|selected|selectedDataBackground|selectedMode|selectedOffset|series|seriesIndex|seriesKey|seriesLayoutBy|shadowBlur|shadowColor|shadowOffsetX|shadowOffsetY|shape|show|showAbove|showAllSymbol|showBackground|showDataShadow|showDelay|showDetail|showEffectOn|showMaxLabel|showMinLabel|showSymbol|silent|singleAxis|singleAxisIndex|size|sizeRange|smooth|snap|sort|sortSub|source|splitArea|splitLine|splitNumber|stack|stackStrategy|start|startAngle|startValue|step|stops|stroke|style|styleJson|stylers|sublink|subtext|subtextStyle|symbol|symbolBoundingData|symbolClip|symbolOffset|symbolPosition|symbolRepeat|symbolSize|symbolSizeFn|target|text|textAlign|textBorderColor|textBorderWidth|textRotation|textShadowBlur|textShadowColor|textShadowOffsetX|textShadowOffsetY|textStyle|throttle|title|to|toolbox|tooltip|top|trailLength|transform|transitionDuration|trigger|triggerOn|type|universalTransition|upperLabel|useUTC|val|value|valueAnimation|valueIndex|values|verticalAlign|visibleMin|visualDimension|visualMap|visualMax|visualMin|weight|width|x|x1|x2|xAxis|xAxisId|xAxisIndex|xValue|y|y1|y2|yAxis|yAxisId|yAxisIndex|yValue|yearLabel|z|zigzagAmplitude|zigzagMaxSpan|zigzagZ|zlevel|zoom|zoomLock|zoomOnMouseWheel|";
+
+    static bool Known(string k) {
+        return KNOWN.IndexOf("|" + k + "|") >= 0;
+    }
+
+    static HashSet<string> warned = new HashSet<string>();
+
+    // 对账入口：从 ChartOption.FromJsonValue 顶部调用（在分支之前，
+    // 覆盖 timeline/baseOption 的全部提前返回路径；嵌套解析会重复进
+    // 来，warned 集合去重）。
+    public static void WarnUnknown(JsonValue v) {
+        if (v == null) { return; }
+        Walk(v, "", 0);
+    }
+
+    static void Walk(JsonValue v, string path, int depth) {
+        if (v == null || depth > 24) { return; }
+        if (v.IsArray()) {
+            int n = v.Count();
+            for (int i = 0; i < n; i = i + 1) {
+                Walk(v.At(i), path, depth + 1);
+            }
+            return;
+        }
+        if (!v.IsObject()) { return; }
+        List<string> ks = v.keys;
+        if (ks == null) { return; }
+        int ki = 0;
+        while (ki < ks.Count) {
+            string k = ks[ki];
+            string sub = path.Length > 0 ? path + "." + k : k;
+            if (!Known(k) && !warned.Contains(k)) {
+                warned.Add(k);
+                Console.ErrorWriteLine("chart option: key '" + sub
+                    + "' is never read by the engine (silently dropped)");
+            }
+            if (!IsPayload(k)) {
+                Walk(v.Get(k), sub, depth + 1);
+            }
+            ki = ki + 1;
+        }
+    }
+}

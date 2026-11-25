@@ -1,0 +1,558 @@
+using Gui;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using System;
+
+namespace Gui.Component.Chart;
+
+// 图表字号（ChartFonts）：ECharts 6 各组件默认字号的唯一出处。
+// 此前图表各处一律用 Style.FontFallback(app, "small")（= 主题
+// fontSizeSmall 13），而官方默认是分档的：
+// * 轴标签   12（src/coord/axisDefault.ts axisLabel.textStyle.fontSize）
+// * 图例     12（src/component/legend/LegendModel.ts textStyle.fontSize）
+// * 系列标签 12（src/label/labelStyle.ts 兜底 '(opt.fontSize || 12)'）
+// * tooltip  14（src/component/tooltip/TooltipModel.ts 默认 textStyle）
+// 13 这个"万能小字号"让轴/图例/标签整体偏大 1px、tooltip 偏小 1px。
+// 图表是契约兼容：这些数值必须与官方一致，不跟随 IDE 主题字号档
+// （主题换肤改的是配色，不是图表度量）。按官方 px 经 app.Scale
+// 缩放，高 DPI 下仍取整到设备像素。
+// 例外（有意不迁移）：ChartView.DrawEmptyState / DrawStatusState 的
+// "(no data)" / "Loading..." 文案走 Style.FontFallback(app,"small")。
+// 那是 Zan 自己的空状态与状态覆盖层提示，不对应任何 ECharts 组件，
+// 没有"官方 px"可对标——改用这里的常量反而是在伪造契约一致性。
+// 同样理由，本文件是唯一的字号出处，图表目录内不得再内联
+// Style.FontFallback(app,"small") 作为组件字号。
+public static class ChartFonts {
+    // 轴标签（axisLabel）字号。官方 12。
+    public static int AxisLabel(App app) { return app.Scale(12); }
+
+    // 图例（legend）字号。官方 12。
+    public static int Legend(App app) { return app.Scale(12); }
+
+    // 系列标签（label / markLine.label 等）兜底字号。官方 12。
+    public static int SeriesLabel(App app) { return app.Scale(12); }
+
+    // tooltip 字号。官方 14。
+    public static int Tooltip(App app) { return app.Scale(14); }
+
+}
+
+// 图表颜色与调色板基元计算（ChartColor）。
+// 包含 RGB/Alpha 打包、感知对比度计算、系列聚焦渐隐、色带插值与调色板解析。
+public class ChartColor {
+    // 不透明 0xFFRRGGBB 打包为正 int（Canvas 转 u32）。
+    // r/g/b 各 0..255。
+    public static int Rgb(int r, int g, int b) {
+        return (int)4278190080 + r * 65536 + g * 256 + b;
+    }
+
+    // 与打包不透明颜色相同的 RGB，但替换 alpha（0 透明..255 不透明，
+    // 用于面积/扇区填充）。
+    public static int WithAlpha(int packed, int a) {
+        return (packed - (int)4278190080) + a * 16777216;
+    }
+
+    // ECharts 'transparent'：alpha 1/255 的白色——合成后每通道
+    // 偏移 <=1，视觉不可见；取非 0 值是为了不与"0 = 继承系列色"
+    // 的图表着色语义冲突（瀑布图透明占位柱）。
+    public static int Transparent() {
+        return ChartColor.WithAlpha(ChartColor.Rgb(255, 255, 255), 1);
+    }
+
+    // 在 `bg` 上对比足够的前景：浅底深字、深底白字。
+    // 饼图扇区 / 地图填色上的标签用它，避免白字画在黄块上。
+    public static int ContrastFg(int bg) {
+        int r = bg >> 16 & 255;
+        int g = bg >> 8 & 255;
+        int b = bg & 255;
+        int lum = (r * 299 + g * 587 + b * 114) / 1000;
+        if (lum > 155) { return ChartColor.Rgb(32, 36, 42); }
+        return ChartColor.Rgb(255, 255, 255);
+    }
+
+    // 官方 blur 残透明：ECharts focus 聚焦时非聚焦系列乘默认
+    // blur opacity 0.1（bump 图悬停其余线淡出的量）。
+    public static int FadeFocusAlpha() { return 26; }
+
+    public static int fadeFocusIdx = -1;
+
+    // 聚焦渐隐取色：无聚焦或 si 即聚焦系列时原色返回，其余系列乘残透明。
+    public static int FadeFocusColor(int si, int color) {
+        if (ChartColor.fadeFocusIdx < 0 || si == ChartColor.fadeFocusIdx) { return color; }
+        return ChartColor.WithAlpha(color, ChartColor.FadeFocusAlpha());
+    }
+
+    public static int FadeFocusColor(int si, int color, int currentFocusIdx) {
+        if (currentFocusIdx < 0 || si == currentFocusIdx) { return color; }
+        return ChartColor.WithAlpha(color, ChartColor.FadeFocusAlpha());
+    }
+
+    // 多段线性色带插值（visualMap inRange）：t in [0,1000] 均匀映射
+    // 到 colors 首尾之间，段内线性混合。colors 少于 2 个时取首色。
+    public static int RampAt(List<int> colors, int t) {
+        int n = colors.Count;
+        if (n < 1) { return 0; }
+        if (n == 1 || t <= 0) { return colors[0]; }
+        if (t >= 1000) { return colors[n - 1]; }
+        int seg = (n - 1) * t / 1000;
+        int f = ((n - 1) * t) % 1000;
+        int a = colors[seg];
+        int b = colors[seg + 1];
+        int r = (a >> 16 & 255) + ((b >> 16 & 255) - (a >> 16 & 255)) * f / 1000;
+        int g = (a >> 8 & 255) + ((b >> 8 & 255) - (a >> 8 & 255)) * f / 1000;
+        int bl = (a & 255) + ((b & 255) - (a & 255)) * f / 1000;
+        return ChartColor.Rgb(r, g, bl);
+    }
+
+    // 定性调色板第 i 档：图表皮肤（ChartSkin）优先——图表配色是
+    // 独立板块，不占全局皮肤主题的 token；当前皮肤 8 档齐全，
+    // 命中即返回。皮肤之后依次是主题的 --chart-1 .. --chart-8
+    // token（Theme.chart1..8，0 = 该槽位未定义）与 ECharts 6.1
+    // 默认主题调色板（src/visual/tokens.ts，9 档）兜底。
+    public static int Palette(Theme t, int i) {
+        int skc = ChartSkin.ColorAt(ChartSkin.Current(), i);
+        if (skc != 0) { return skc; }
+        int m = i % 8;
+        if (t != null) {
+            if (m == 0 && t.chart1 != 0) { return t.chart1; }
+            if (m == 1 && t.chart2 != 0) { return t.chart2; }
+            if (m == 2 && t.chart3 != 0) { return t.chart3; }
+            if (m == 3 && t.chart4 != 0) { return t.chart4; }
+            if (m == 4 && t.chart5 != 0) { return t.chart5; }
+            if (m == 5 && t.chart6 != 0) { return t.chart6; }
+            if (m == 6 && t.chart7 != 0) { return t.chart7; }
+            if (m == 7 && t.chart8 != 0) { return t.chart8; }
+        }
+        int m9 = i % 9;
+        if (m9 == 0) { return ChartColor.Rgb(80, 112, 221); }  // #5070DD
+        if (m9 == 1) { return ChartColor.Rgb(182, 214, 52); }  // #B6D634
+        if (m9 == 2) { return ChartColor.Rgb(80, 83, 114); }  // #505372
+        if (m9 == 3) { return ChartColor.Rgb(255, 153, 77); }  // #FF994D
+        if (m9 == 4) { return ChartColor.Rgb(12, 168, 223); }  // #0CA8DF
+        if (m9 == 5) { return ChartColor.Rgb(255, 209, 10); }  // #FFD10A
+        if (m9 == 6) { return ChartColor.Rgb(251, 98, 139); }  // #FB628B
+        if (m9 == 7) { return ChartColor.Rgb(120, 93, 176); }  // #785DB0
+        return ChartColor.Rgb(63, 190, 149);  // #3FBE95
+    }
+
+    // 系列普通状态的统一颜色回退：显式系列色、normal.color、调色板。
+    public static int SeriesPaintColor(ChartSeries s, Theme t, int index) {
+        if (s != null) {
+            if (s.color != 0) { return s.color; }
+            if (s.itemStyle != null && s.itemStyle.normal != null
+                && s.itemStyle.normal.color != 0) {
+                return s.itemStyle.normal.color;
+            }
+        }
+        return ChartColor.Palette(t, index);
+    }
+}
+
+// 图表皮肤（ChartSkin）：图表配色的独立板块，与全局皮肤主题
+// （Theme）解耦——一套皮肤就是一份命名的定性调色板：default 取
+// ECharts 6.1 默认主题色板（src/visual/tokens.ts color.theme 9 档），
+// infographic/shine/macarons2 取官方主题包各前 8 档。Chart.Palette
+// 在主题 chart token 未定义时回落到当前皮肤，换肤一次即生效于
+// 全部图型（折/柱/饼/漏斗……）。未知名一律按 default 处理。
+public static class ChartSkin {
+    // 当前全局图表皮肤名。null = "default"。
+    public static string current;
+
+    // 当前皮肤名（规范化：null / 未知名都归 default）。
+    public static string Current() {
+        if (ChartSkin.current == null) { return ChartSkin.Name(0); }
+        if (ChartSkin.IndexOf(ChartSkin.current) >= 0) { return ChartSkin.current; }
+        return ChartSkin.Name(0);
+    }
+
+    // 切换当前图表皮肤；未知名回退 default。
+    public static void SetCurrent(string name) {
+        if (ChartSkin.IndexOf(name) >= 0) {
+            ChartSkin.current = name;
+            return;
+        }
+        ChartSkin.current = null;
+    }
+
+    // 内置皮肤数量；选择器按 Name(i)/Label(i) 枚举。
+    public static int Count() { return 4; }
+
+    // 第 i 套内置皮肤名。
+    public static string Name(int i) {
+        if (i == 1) { return "infographic"; }
+        if (i == 2) { return "shine"; }
+        if (i == 3) { return "macarons2"; }
+        return "default";
+    }
+
+    // 第 i 套皮肤的显示名。
+    public static string Label(int i, bool en) {
+        if (i == 1) { return en ? "Info" : "信息图"; }
+        if (i == 2) { return en ? "Shine" : "绚丽"; }
+        if (i == 3) { return en ? "Macaron" : "马卡龙"; }
+        return en ? "Default" : "默认";
+    }
+
+    // 皮肤名转下标；未知名 -1。
+    public static int IndexOf(string name) {
+        for (int i = 0; i < ChartSkin.Count(); i = i + 1) {
+            if (name == ChartSkin.Name(i)) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // 皮肤第 i 档定性色（ARGB，i 自动取模 8 循环）。8 档齐全；
+    // 返回 0 仅当皮肤名未知，由调用方走自己的默认兜底。
+    public static int ColorAt(string name, int i) {
+        int m = i % 8;
+        if (name == "infographic") {
+            if (m == 0) { return (int)0xFFC1232B; }  // #C1232B
+            if (m == 1) { return (int)0xFFB5C334; }  // #B5C334
+            if (m == 2) { return (int)0xFFFCCE10; }  // #FCCE10
+            if (m == 3) { return (int)0xFFE87C25; }  // #E87C25
+            if (m == 4) { return (int)0xFF27727B; }  // #27727B
+            if (m == 5) { return (int)0xFFFE8463; }  // #FE8463
+            if (m == 6) { return (int)0xFF9BCA63; }  // #9BCA63
+            return (int)0xFFFAD860;  // #FAD860
+        }
+        if (name == "shine") {
+            if (m == 0) { return (int)0xFFC12E34; }  // #C12E34
+            if (m == 1) { return (int)0xFFE6B600; }  // #E6B600
+            if (m == 2) { return (int)0xFF0098D9; }  // #0098D9
+            if (m == 3) { return (int)0xFF2B821D; }  // #2B821D
+            if (m == 4) { return (int)0xFF005EAA; }  // #005EAA
+            if (m == 5) { return (int)0xFF339CA8; }  // #339CA8
+            if (m == 6) { return (int)0xFFCDA819; }  // #CDA819
+            return (int)0xFF32A487;  // #32A487
+        }
+        if (name == "macarons2") {
+            if (m == 0) { return (int)0xFFED9678; }  // #ED9678
+            if (m == 1) { return (int)0xFFE7DAC9; }  // #E7DAC9
+            if (m == 2) { return (int)0xFFCB8E85; }  // #CB8E85
+            if (m == 3) { return (int)0xFFF3F39D; }  // #F3F39D
+            if (m == 4) { return (int)0xFFC8E49C; }  // #C8E49C
+            if (m == 5) { return (int)0xFFF16D7A; }  // #F16D7A
+            if (m == 6) { return (int)0xFFF3D999; }  // #F3D999
+            return (int)0xFFD3758F;  // #D3758F
+        }
+        if (name == "default") {
+            // 全 9 档，官方示例页不注册主题时的实际取色）。
+            int m9 = ((i % 9) + 9) % 9;
+            if (m9 == 0) { return (int)0xFF5070DD; }  // #5070DD
+            if (m9 == 1) { return (int)0xFFB6D634; }  // #B6D634
+            if (m9 == 2) { return (int)0xFF505372; }  // #505372
+            if (m9 == 3) { return (int)0xFFFF994D; }  // #FF994D
+            if (m9 == 4) { return (int)0xFF0CA8DF; }  // #0CA8DF
+            if (m9 == 5) { return (int)0xFFFFD10A; }  // #FFD10A
+            if (m9 == 6) { return (int)0xFFFB628B; }  // #FB628B
+            if (m9 == 7) { return (int)0xFF785DB0; }  // #785DB0
+            return (int)0xFF3FBE95;  // #3FBE95
+        }
+        return 0;
+    }
+}
+
+// 图表主题包（图表自己的皮肤层）：`themes/<名>.css` 纯 CSS 配置，
+// 调色板走 `chart::series-N`，轴线/网格/图例/缩放柄等走
+// `chart::<part>`，深色包另带 `chart` 画布底色。由
+// `ChartTheme.Use(app, name)` 按名叠加到样式表顶层，与 Gui 皮肤
+// 相互独立、分层生效——换 Gui 皮肤不动图表配色，换图表主题
+// 不动界面。基线包由 <see cref="EnsureDefault"/> 在首个 ChartHost
+// 布局/绘制时懒装载（App 编译图不背 Chart 家族，不再构造即装载）。
+// 本类只负责发现与读取（磁盘优先、exe 内嵌兜底），不含任何
+// 色值：图表的颜色全部在 CSS 包里，改主题请改包，不要把色值
+// 写进代码。包的属性映射见各包文件头注释。
+public class ChartTheme {
+    // 读取主题包 `themes/<name>.css` 的文本。name 为 ""（= 完全卸
+    // 载，图表跟随 Gui 皮肤 token 回落）或找不到包时返回 ""；
+    // "default" = ECharts 6.1 官方基线包 echarts6.css——首个
+    // ChartHost 布局时懒装载，Use(app, "default") 随时回到它。
+    // 搜索根：exe 旁与自解包布局、包根副本；磁盘优先（用户可整包覆盖），
+    // 编译进 exe 的内嵌资源 `chartthemes/<name>.css` 兜底（zanc 对用到 Chart
+    // 符号的程序自动内嵌该目录；发布后的单文件程序靠它找到
+    // 内建包）。
+    public static string Css(string name) {
+        string key = name == "default" ? "echarts6" : name;
+        if (key == "") { return ""; }
+        List<string> roots = ChartTheme.Roots();
+        int i = 0;
+        while (i < roots.Count) {
+            string cand = roots[i] + "/" + key + ".css";
+            i = i + 1;
+            if (File.Exists(cand)) { return File.ReadAllText(cand); }
+        }
+        return Skin.EmbedRead("chartthemes/" + key + ".css");
+    }
+
+    // 安装图表主题包 `Gui.Component.Chart/themes/<name>.css`（原
+    // App.UseChartTheme，App 编译图不背 Chart 家族后挪到这里）。
+    // 主题包编译成一块独立的样式表，解析时垫在内置基线之上、
+    // Gui 皮肤之下：皮肤写过的 chart 规则优先，主题包只补基线
+    // 没定义的部分，与皮肤/appCss 互不合并。名称为 "default" =
+    // ECharts 6.1 官方基线包 echarts6.css（随时回到它）；"" =
+    // 完全卸载（图表跟随 Gui 皮肤 token 回落）。找不到主题包时
+    // 保持现状并返回 false。
+    public static bool Use(App app, string name) {
+        string css = ChartTheme.Css(name);
+        if (name != "" && css == "") { return false; }
+        // 记解析后的实际包名："default" 的载体是 echarts6.css。
+        app.SetChartSheet(css == "" ? null : StyleSheet.FromCss(css),
+            css == "" ? "" : (name == "default" ? "echarts6" : name));
+        return true;
+    }
+
+    // 基线主题懒装载：每个 App 首次进到图表布局/绘制时补装一次
+    // echarts6（行为对齐旧版"构造即装载"，但只在真用图表的程序
+    // 里发生）。宿主已显式 Use 过（含卸载）就不再覆盖。
+    public static void EnsureDefault(App app) {
+        if (app == null || app.ChartThemeInited()) { return; }
+        app.MarkChartThemeInited();
+        if (app.ChartThemeName() != "") { return; }
+        ChartTheme.Use(app, "echarts6");
+    }
+
+    // 可发现的主题包名（各搜索根下 `*.css` 的文件名 + exe 内嵌
+    // 的 `chartthemes/*.css` 资源），去重、字典序。
+    public static List<string> Names() {
+        List<string> names = new List<string>();
+        List<string> roots = ChartTheme.Roots();
+        int i = 0;
+        while (i < roots.Count) {
+            if (Directory.Exists(roots[i])) {
+                List<string> files = Directory.GetFiles(roots[i]);
+                int k = 0;
+                while (k < files.Count) {
+                    string f = Skin.Leaf(files[k]);
+                    k = k + 1;
+                    if (!f.EndsWith(".css")) { continue; }
+                    string nm = f.Substring(0, f.Length - 4);
+                    if (!Skin.Contains(names, nm)) { names.Add(nm); }
+                }
+            }
+            i = i + 1;
+        }
+        // 内嵌资源名形如 "chartthemes/<name>.css"。
+        string emb = Skin.EmbedList("chartthemes/");
+        int start = 0;
+        for (int p = 0; p <= emb.Length; p = p + 1) {
+            bool brk = false;
+            if (p == emb.Length) { brk = true; }
+            else if (emb[p] == '\n') { brk = true; }
+            if (brk) {
+                if (p > start) {
+                    string nm = Skin.Leaf(emb.Substring(start, p - start));
+                    if (nm.EndsWith(".css")) {
+                        nm = nm.Substring(0, nm.Length - 4);
+                        if (nm != "" && !Skin.Contains(names, nm)) { names.Add(nm); }
+                    }
+                }
+                start = p + 1;
+            }
+        }
+        // 插入排序：包数量少（十几个），无泛型 Sort 依赖。
+        for (int a = 1; a < names.Count; a = a + 1) {
+            string key = names[a];
+            int b = a - 1;
+            while (b >= 0 && names[b].CompareTo(key) > 0) {
+                names[b + 1] = names[b];
+                b = b - 1;
+            }
+            names[b + 1] = key;
+        }
+        return names;
+    }
+
+    // 主题包搜索根：exe 所在位置与自解包/发布布局、源码树的包内副本。
+    public static List<string> Roots() {
+        List<string> r = new List<string>();
+        string exe = Skin.ExeDir();
+        if (exe != "") {
+            r.Add(exe + "/chartthemes");
+            r.Add(exe + "/themes");
+            r.Add(exe + "/packages/Zan.Gui.Charts/src/Gui/Component/Chart/themes");
+        }
+        r.Add("chartthemes");
+        r.Add("packages/Zan.Gui.Charts/src/Gui/Component/Chart/themes");
+        return r;
+    }
+}
+
+// 图表主类型枚举：对应 ECharts series.type
+public enum ChartType {
+    Line, Bar, Pie, Scatter, K, Radar, Chord, Force, Map, Gauge,
+    Funnel, EventRiver, Treemap, Tree, WordCloud, Heatmap, Custom
+}
+
+public class ChartKinds {
+    // ECharts type 字符串转 ChartType；未知名（含扩展渲染器标签）
+    // 返回 ChartType.Custom。
+    public static ChartType TypeOf(string s) {
+        if (s == "line") { return ChartType.Line; }
+        if (s == "bar") { return ChartType.Bar; }
+        if (s == "pie") { return ChartType.Pie; }
+        if (s == "scatter") { return ChartType.Scatter; }
+        // effectScatter 涟漪强调散点：本引擎按普通散点渲染。
+        if (s == "effectScatter") { return ChartType.Scatter; }
+        if (s == "k" || s == "candlestick") { return ChartType.K; }
+        if (s == "radar") { return ChartType.Radar; }
+        if (s == "chord") { return ChartType.Chord; }
+        if (s == "force") { return ChartType.Force; }
+        // ECharts v5/v6 关系图：layout 字段选 force/none/circular，
+        // 复用力导向渲染器（DrawForce 按布局分支）。
+        if (s == "graph") { return ChartType.Force; }
+        if (s == "map") { return ChartType.Map; }
+        if (s == "gauge") { return ChartType.Gauge; }
+        if (s == "funnel") { return ChartType.Funnel; }
+        if (s == "eventRiver") { return ChartType.EventRiver; }
+        if (s == "treemap") { return ChartType.Treemap; }
+        if (s == "tree") { return ChartType.Tree; }
+        if (s == "wordCloud") { return ChartType.WordCloud; }
+        if (s == "heatmap") { return ChartType.Heatmap; }
+        return ChartType.Custom;
+    }
+
+    // 扩展渲染器标签（"box"、"error"、
+    // ECharts boxplot 折算为 "box"（同一箱线渲染器）；原生类型为 ""。
+    public static string CustomOf(string s) {
+        if (s == "boxplot") { return "box"; }
+        if (s == "box" || s == "error" || s == "sankey" || s == "waterfall"
+            || s == "sunburst" || s == "radialBars" || s == "venn") { return s; }
+        if (s == "pictorialBar" || s == "themeRiver" || s == "parallel"
+            || s == "lines") { return s; }
+        return "";
+    }
+
+    // ChartType 转回 ECharts type 字符串；Custom 返回 "custom"。
+    public static string TypeName(ChartType t) {
+        if (t == ChartType.Line) { return "line"; }
+        if (t == ChartType.Bar) { return "bar"; }
+        if (t == ChartType.Pie) { return "pie"; }
+        if (t == ChartType.Scatter) { return "scatter"; }
+        if (t == ChartType.K) { return "k"; }
+        if (t == ChartType.Radar) { return "radar"; }
+        if (t == ChartType.Chord) { return "chord"; }
+        if (t == ChartType.Force) { return "force"; }
+        if (t == ChartType.Map) { return "map"; }
+        if (t == ChartType.Gauge) { return "gauge"; }
+        if (t == ChartType.Funnel) { return "funnel"; }
+        if (t == ChartType.EventRiver) { return "eventRiver"; }
+        if (t == ChartType.Treemap) { return "treemap"; }
+        if (t == ChartType.Tree) { return "tree"; }
+        if (t == ChartType.WordCloud) { return "wordCloud"; }
+        if (t == ChartType.Heatmap) { return "heatmap"; }
+        return "custom";
+    }
+
+    // ECharts series.symbol 形状族规范化：全部标准符号形状
+    // （该点不画符号，系列级与数据级都合法；渲染器入口统一跳过）。
+    // 未知名返回 ""（渲染器按族默认圆点）。star5 是 star 的
+    // ECharts 别名（五角星），归一到 star。
+    public static string SymbolSanitize(string s) {
+        if (s == "star5") { return "star"; }
+        // rect 是 ECharts5 标准名（radar-custom 的逐项 symbol），
+        // rectangle 是旧名——归一到渲染器认的那个。
+        if (s == "rect") { return "rectangle"; }
+        if (s == "emptyCircle" || s == "rectangle" || s == "diamond"
+            || s == "triangle" || s == "circle" || s == "star"
+            || s == "star6" || s == "arrow" || s == "droplet"
+            || s == "pin" || s == "emptypin" || s == "none") { return s; }
+        if (s == "heart") { return "heart"; }
+        if (s == "emptyHeart") { return "emptyheart"; }
+        return "";
+    }
+
+    // ECharts map.selectedMode 白名单："" 与 "single" 同义（单区域）；
+    // "multiple" 多选；"false" 禁用点击选中。其余回落 ""。
+    public static string SelectedModeSanitize(string s) {
+        if (s == "multiple" || s == "false") { return s; }
+        return "";
+    }
+
+    // selectedMode seam：是否允许点击选中（"false" 关闭）。
+    public static bool SelectedModeEnabled(string s) { return s != "false"; }
+
+    // 地图滚轮策略：zoom（默认消费并缩放）或 pass/none（交给外层滚动容器）。
+    public static string RoamWheelModeSanitize(string s) {
+        if (s == "pass" || s == "none") { return "pass"; }
+        return "zoom";
+    }
+
+    // legend.selectedMode 白名单："single" | "false" | 其余（含
+    // "multiple"）归一为 ""（多选 = 现状默认）。
+    public static string LegendModeSanitize(string s) {
+        if (s == "single" || s == "false") { return s; }
+        return "";
+    }
+
+    // ECharts axis.type 字符串转 ChartAxisType；未知名返回 Category。
+    public static ChartAxisType AxisOf(string s) {
+        if (s == "value") { return ChartAxisType.Value; }
+        if (s == "time") { return ChartAxisType.Time; }
+        if (s == "log") { return ChartAxisType.Log; }
+        return ChartAxisType.Category;
+    }
+
+}
+
+// 按类型分发带载荷图表事件的保留式多播表。由 ChartController
+// 持有；Off/Clear 在派发过程中调用是安全的（派发基于快照）。
+public class ChartEventHub {
+    public List<ChartEventSubscription> subscriptions;
+
+    // 构造空的多播表。
+    public ChartEventHub() {
+        this.subscriptions = new List<ChartEventSubscription>();
+    }
+
+    // 注册处理器（不查重——同一处理器注册两次会收到两次回调）。
+    public void On(ChartEventType type, ChartInteractionHandler handler) {
+        if (handler == null) { return; }
+        this.subscriptions.Add(new ChartEventSubscription(type, handler));
+    }
+
+    // 注销最近一个 type 与 handler 都匹配的订阅；无匹配时
+    // 静默返回。
+    public void Off(ChartEventType type, ChartInteractionHandler handler) {
+        int i = this.subscriptions.Count - 1;
+        while (i >= 0) {
+            ChartEventSubscription s = this.subscriptions[i];
+            if (s.type == type && s.handler == handler) {
+                this.subscriptions.RemoveAt(i);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+
+    // 某类型当前订阅的处理器数量（HasEvent 用）。
+    public int Count(ChartEventType type) {
+        int n = 0;
+        for (int i = 0; i < this.subscriptions.Count; i = i + 1) {
+            if (this.subscriptions[i].type == type) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 清空全部订阅（整体换新列表；正在派发的快照不受影响）。
+    public void Clear() {
+        this.subscriptions = new List<ChartEventSubscription>();
+    }
+
+    // 派发事件给所有匹配类型的处理器。取订阅快照遍历，
+    // 处理器在回调中 Off/Clear 不影响本次派发。
+    public void Raise(ChartInteractionEvent eventArgs) {
+        if (eventArgs == null) { return; }
+        // 处理器可以在回调中 Off/ClearEvents；对当前派发取快照，
+        // 避免就地删除导致后一个订阅被跳过。
+        List<ChartEventSubscription> snapshot =
+            new List<ChartEventSubscription>(this.subscriptions);
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            ChartEventSubscription s = snapshot[i];
+            if (s.type == eventArgs.type) {
+                ChartInteractionHandler h = s.handler;
+                if (h != null) { h(eventArgs); }
+            }
+        }
+    }
+}

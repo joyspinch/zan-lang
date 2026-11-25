@@ -1,0 +1,667 @@
+using Gui.Backend;
+using Gui.Widget;
+using Gui;
+using System.Collections.Generic;
+using System;
+
+namespace Gui.Component.DataTable;
+
+// 键值卡片详情：把主行（或任意键值对）渲染为
+// label: value 两列卡片。子类持有数据，本类只管绘制
+// 与尺寸（每对一行，clamp 到 maxSlots）。
+public class CardDetail : DetailProvider {
+    // 强类型键值项列表（唯一主表示，消除旧 labels/values 平行列表）。
+    public List<CardDetailItem> items;
+    public int maxSlots;
+
+    // 内部构造；使用 Of() 创建。
+    CardDetail() {
+        this.items = new List<CardDetailItem>();
+        this.maxSlots = 0;
+    }
+
+    // 创建空卡片，随后用 Add() 链式填充。
+    public static CardDetail Of() {
+        return new CardDetail();
+    }
+
+    public List<CardDetailItem> Items {
+        get { return this.items; }
+    }
+
+    public int MaxSlots {
+        get { return this.maxSlots; }
+        set { this.maxSlots = value; }
+    }
+
+    // 装配一对标签/值。
+    public void Add(string label, string value) {
+        CardDetailItem it = new CardDetailItem(label, value);
+        this.items.Add(it);
+    }
+
+    // 详情带行槽数 = 键值对数，夹取到 [1, maxSlots]。
+    override int Slots(DataSource src, int row) {
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int n = this.items.Count + 0;
+        if (n > cap) { n = cap; }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    // 逐行绘制 label: value 两列；超出详情带高度的行不再绘制。
+    override void Paint(App app, DataSource src, int row,
+                        int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int pad = app.Scale(8);
+        int fs = app.Scale(12);
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int n = this.items.Count;
+        if (n > cap) { n = cap; }
+        int lw = app.Scale(120);
+        for (int i = 0; i < n; i = i + 1) {
+            int ry = y + pad + i * rowH;
+            if (ry + rowH > y + h) { break; }
+            CardDetailItem it = this.items[i];
+            c.DrawText(x + pad, Canvas.CenterTextY(ry, rowH, fs),
+                       it.label, Style.Part(app, "datatable", "label", "", "", "",
+                                            Style.SNormal()).FgOr(0), fs);
+            c.DrawText(x + pad + lw, Canvas.CenterTextY(ry, rowH, fs),
+                       it.value, Style.Part(app, "datatable", "cell", "", "", "",
+                                            Style.SNormal()).FgOr(0), fs);
+        }
+    }
+}
+
+// 卡片详情键值项实体（消除 labels/values 平行列表反模式）。
+public class CardDetailItem {
+    public string label;
+    public string value;
+
+    public CardDetailItem(string label, string value) {
+        this.label = label != null ? label : "";
+        this.value = value != null ? value : "";
+    }
+}
+
+// 详情带内渲染完整子表格的 DetailProvider。
+public class ChildGridDetail : DetailProvider {
+    // 子表列 schema（决定表头与列宽）。
+    public List<DataColumn> childCols;
+    // 子表数据源。
+    public DataSource childSrc;
+    // 子表中指向主行键的列。
+    public int childKeyCol;
+    // 主表中键列（默认 0）。
+    public int masterKeyCol;
+    // 详情带最多占用的行槽数（0 = 8）。
+    public int maxSlots;
+
+    // 子行读取钩子：默认从 `childSrc` 文本相等匹配取。
+    // 返回 false 表示该主行无子行（拒绝展开）。
+    // Zan 委托不能捕获局部变量，复杂子集请子类化重写
+    // `Rows`/`CanExpand`，本字段保持简单场景。
+    public List<int> rows = new List<int>();
+
+    // 构造子表格详情：masterKeyCol 默认 0，maxSlots 默认 0（=8）。
+    ChildGridDetail(List<DataColumn> cols, DataSource src, int keyCol) {
+        this.childCols = cols;
+        this.childSrc = src;
+        this.childKeyCol = keyCol;
+        this.masterKeyCol = 0;
+        this.maxSlots = 0;
+        this.rows = new List<int>();
+    }
+
+    // 创建子表格详情。
+    public static ChildGridDetail Of(List<DataColumn> cols, DataSource src, int keyCol) {
+        return new ChildGridDetail(cols, src, keyCol);
+    }
+
+    // 该主行的子行数（按文本相等匹配）。
+    public int ChildCount(DataSource src, int row) {
+        List<int> idx = new List<int>();
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol,
+                              src.CellText(row, this.masterKeyCol), idx);
+        return idx.Count;
+    }
+
+    // 主行是否有可显示的子行（槽位数 > 1）才允许展开。
+    override bool CanExpand(DataSource src, int row) {
+        return DataTable.ChildGridSlots(this.childSrc, this.childKeyCol,
+                                        src.CellText(row, this.masterKeyCol),
+                                        this.maxSlots) > 1;
+    }
+
+    // 详情带行槽数 = 表头 1 + 子行数，夹取到 [1, maxSlots]。
+    override int Slots(DataSource src, int row) {
+        return DataTable.ChildGridSlots(this.childSrc, this.childKeyCol,
+                                        src.CellText(row, this.masterKeyCol),
+                                        this.maxSlots);
+    }
+
+    // 在详情带内绘制子表格：内缩留边后画表头行与最多
+    // maxSlots-1 行斑马纹数据；子行为空时画 "(no records)" 占位。
+    override void Paint(App app, DataSource src, int row,
+                        int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        string masterKey = src.CellText(row, this.masterKeyCol);
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol, masterKey, this.rows);
+
+        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "",
+                                      Style.SNormal());
+        StyleBox sCell = Style.Part(app, "datatable", "cell", "", "", "",
+                                    Style.SNormal());
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        int rowH = t.heightMedium;
+        int pad = app.Scale(6);
+
+        // 内缩一档，与详情带区视觉分离；再留出子表边框。
+        int tx = x + pad;
+        int ty = y + pad;
+        int tw = w - pad * 2;
+        int th = h - pad * 2;
+
+        int visible = this.childCols.Count;
+        // 表头行
+        int hx = tx;
+        int cw = tw / (visible > 0 ? visible : 1);
+        for (int i = 0; i < visible; i = i + 1) {
+            int w_i = cw;
+            if (i == visible - 1) { w_i = tx + tw - hx; }
+            c.FillRect(hx, ty, w_i, rowH, sHeader.BgOr(0));
+            c.DrawText(hx + t.paddingSmall, Canvas.CenterTextY(ty, rowH, app.Scale(12)),
+                       this.childCols[i].title, sHeader.FgOr(0), app.Scale(12));
+            hx = hx + w_i;
+        }
+        c.FillRect(tx, ty + rowH, tw, 1, sGrid.BgOr(0));
+
+        // 数据行（槽位数 - 1）：空子集时画占位说明
+        int n = this.rows.Count;
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int maxRows = cap - 1;
+        if (n == 0) {
+            c.DrawText(tx + t.paddingSmall, ty + rowH + app.Scale(6),
+                       DataTable.T("(no records)", "(no records)"), Style.Part(app, "datatable", "hint", "", "", "",
+                                                  Style.SNormal()).FgOr(0), app.Scale(12));
+            return;
+        }
+        for (int r = 0; r < n && r < maxRows; r = r + 1) {
+            int ry = ty + (r + 1) * rowH;
+            if (ry + rowH > ty + th) { break; }
+            if (r % 2 == 1) {
+                c.FillRect(tx, ry, tw, rowH,
+                           Style.Part(app, "datatable", "panel", "", "", "",
+                                      Style.SNormal()).BgOr(0));
+            }
+            int cx = tx;
+            for (int i = 0; i < visible; i = i + 1) {
+                int w_i = cw;
+                if (i == visible - 1) { w_i = tx + tw - cx; }
+                string v = this.childSrc.CellText(this.rows[r], i);
+                c.DrawText(cx + t.paddingSmall, Canvas.CenterTextY(ry, rowH, app.Scale(12)),
+                           v, sCell.FgOr(0), app.Scale(12));
+                cx = cx + w_i;
+            }
+        }
+    }
+}
+
+public delegate Control GridTemplate<T>(T row);
+
+public class GridCellTemplateProvider<T> : CellWidgetProvider {
+    private GridTemplate<T> builder;
+    private Dictionary<string, Control> pool;
+
+    public GridCellTemplateProvider(GridTemplate<T> fn) {
+        this.builder = fn;
+        this.pool = new Dictionary<string, Control>();
+    }
+
+    override Control Provide(App app, DataSource src, int row, int col,
+                             int x, int y, int w, int h) {
+        if (this.builder == null || src == null || !(src is GridSource<T>)) { return null; }
+        GridSource<T> gs = (GridSource<T>)src;
+        if (!gs.Row(row)) { return null; }
+        T item = gs.data[row];
+        RowKey rk = src.GetRowKey(row);
+        if (rk == null) { rk = RowKey.Legacy(row); }
+        string k = rk.Canonical() + ":" + Convert.ToString(col);
+        if (this.pool.ContainsKey(k)) {
+            Control cached = this.pool[k];
+            if (cached != null) {
+                cached.DataContext = item;
+                return cached;
+            }
+        }
+        if (this.pool.Count >= 2048) { this.pool.Clear(); }
+        WidgetId.Push("datatable_cell_template");
+        Control built = null;
+        try {
+            built = this.builder(item);
+        } finally {
+            WidgetId.Pop();
+        }
+        if (built != null) {
+            built.DataContext = item;
+            this.pool[k] = built;
+        }
+        return built;
+    }
+
+    override void Reset() {
+        this.pool.Clear();
+    }
+}
+
+// `DataGrid<T>` 的声明式列描述符：直接通过属性与对象初始化器声明列元数据、
+// 类型化实体访问器及单元格组件树模板（`Template = row => new ...`）。
+public class GridColumn<T> {
+    public DataColumn desc;
+    public GridText<T> text;
+    public GridInt<T> num;
+    public GridReal<T> real;
+    public GridBool<T> truth;
+    public GridSet<T> setter;
+    private GridTemplate<T> template;
+
+    public GridColumn(DataColumn d) {
+        this.desc = d;
+        this.text = null;
+        this.num = null;
+        this.real = null;
+        this.truth = null;
+        this.setter = null;
+        this.template = null;
+    }
+
+    public GridColumn() : this(new DataColumn("", 100)) { }
+
+    public GridColumn(string title, int width) : this(new DataColumn(title, width)) { }
+
+    public string Title {
+        get { return this.desc.title; }
+        set { this.desc.title = value; }
+    }
+
+    public int Width {
+        get { return this.desc.width; }
+        set { this.desc.width = value; }
+    }
+
+    public string FieldName {
+        get { return this.desc.field; }
+        set { this.desc.field = value != null ? value : ""; }
+    }
+
+    public int CellType {
+        get { return this.desc.cellType; }
+        set { this.desc.cellType = value; }
+    }
+
+    public int Alignment {
+        get { return this.desc.align; }
+        set { this.desc.align = value; }
+    }
+
+    public bool IsSortable {
+        get { return this.desc.sortable; }
+        set { this.desc.sortable = value; }
+    }
+
+    public bool IsFilterable {
+        get { return this.desc.filterable; }
+        set { this.desc.filterable = value; }
+    }
+
+    public bool IsResizable {
+        get { return this.desc.resizable; }
+        set { this.desc.resizable = value; }
+    }
+
+    public bool IsEditable {
+        get { return this.desc.editable; }
+        set { this.desc.editable = value; }
+    }
+
+    public bool IsNumeric {
+        get { return this.desc.numeric; }
+        set { this.desc.numeric = value; }
+    }
+
+    public bool IsBool {
+        get { return this.desc.isBool; }
+        set { this.desc.isBool = value; }
+    }
+
+    public bool IsDate {
+        get { return this.desc.isDate; }
+        set { this.desc.isDate = value; }
+    }
+
+    public int DateOrder {
+        get { return this.desc.dateOrder; }
+        set {
+            this.desc.isDate = true;
+            this.desc.dateOrder = value;
+        }
+    }
+
+    public int Decimals {
+        get { return this.desc.decimals; }
+        set {
+            this.desc.decimals = value;
+            if (value > 0) { this.desc.numeric = true; }
+        }
+    }
+
+    public bool IsGrouped {
+        get { return this.desc.grouped; }
+        set {
+            this.desc.grouped = value;
+            if (value) { this.desc.fmt = 1; }
+        }
+    }
+
+    public string Prefix {
+        get { return this.desc.prefix; }
+        set {
+            this.desc.prefix = value != null ? value : "";
+            if (this.desc.prefix != "" || this.desc.suffix != "") { this.desc.fmt = 1; }
+        }
+    }
+
+    public string Suffix {
+        get { return this.desc.suffix; }
+        set {
+            this.desc.suffix = value != null ? value : "";
+            if (this.desc.prefix != "" || this.desc.suffix != "") { this.desc.fmt = 1; }
+        }
+    }
+
+    public string CurrencySymbol {
+        get { return this.desc.prefix; }
+        set { DataColumn.Money(this.desc, value); }
+    }
+
+    public bool IsPercent {
+        get { return this.desc.suffix == "%"; }
+        set {
+            if (value) { DataColumn.Percent(this.desc); }
+        }
+    }
+
+    public int Freeze {
+        get { return this.desc.freeze; }
+        set { this.desc.freeze = value; }
+    }
+
+    public string BandPath {
+        get { return this.desc.band; }
+        set { this.desc.band = value != null ? value : ""; }
+    }
+
+    public int SummaryKind {
+        get { return this.desc.summary; }
+        set { this.desc.summary = value; }
+    }
+
+    public string ButtonIcon {
+        get { return this.desc.btnIcon; }
+        set { this.desc.btnIcon = value; }
+    }
+
+    public string ButtonClass {
+        get { return this.desc.btnClass; }
+        set { this.desc.btnClass = value; }
+    }
+
+    public bool SparkArea {
+        get { return this.desc.sparkArea; }
+        set { this.desc.sparkArea = value; }
+    }
+
+    public GridText<T> Text {
+        get { return this.text; }
+        set { this.text = value; }
+    }
+
+    public GridInt<T> Num {
+        get { return this.num; }
+        set {
+            this.num = value;
+            if (value != null) {
+                this.desc.numeric = true;
+                this.desc.align = 2;
+            }
+        }
+    }
+
+    public GridReal<T> Real {
+        get { return this.real; }
+        set {
+            this.real = value;
+            if (value != null) {
+                this.desc.numeric = true;
+                this.desc.align = 2;
+                if (this.desc.decimals <= 0) { this.desc.decimals = 2; }
+            }
+        }
+    }
+
+    public GridBool<T> Truth {
+        get { return this.truth; }
+        set {
+            this.truth = value;
+            if (value != null) {
+                this.desc.isBool = true;
+                this.desc.align = 1;
+            }
+        }
+    }
+
+    public GridSet<T> Setter {
+        get { return this.setter; }
+        set {
+            this.setter = value;
+            if (value != null) { this.desc.editable = true; }
+        }
+    }
+
+    public GridTemplate<T> Template {
+        get { return this.template; }
+        set {
+            this.template = value;
+            if (value != null) {
+                this.desc.widgetProvider = new GridCellTemplateProvider<T>(value);
+                this.desc.sortable = false;
+                this.desc.filterable = false;
+                this.desc.editable = false;
+            } else {
+                this.desc.widgetProvider = null;
+            }
+        }
+    }
+
+    public CellEditor CellEditor {
+        get { return this.desc.editor; }
+        set { DataColumn.Editor(this.desc, value); }
+    }
+
+    public Control EditorControl {
+        set { DataColumn.ControlEditor(this.desc, value); }
+    }
+
+    public CellRenderer CellRenderer {
+        get { return this.desc.renderer; }
+        set { this.desc.renderer = value; }
+    }
+
+    public string SlotName {
+        get { return this.desc.slot; }
+        set { this.desc.slot = value != null ? value : ""; }
+    }
+
+    public void SyncDesc() {
+        if (this.template != null && this.desc.widgetProvider == null) {
+            this.desc.widgetProvider = new GridCellTemplateProvider<T>(this.template);
+        }
+    }
+
+    public string Raw(T row) {
+        if (this.text != null) { return this.text(row); }
+        if (this.real != null) { return DataTable.FormatReal(this.real(row), this.desc.decimals); }
+        if (this.num != null) { return Convert.ToString(this.num(row)); }
+        if (this.truth != null) {
+            if (this.truth(row)) { return this.desc.boolTrue; }
+            return this.desc.boolFalse;
+        }
+        if (row != null && this.desc != null && this.desc.field != null && this.desc.field != "") {
+            object obj = (object)row;
+            string fname = this.desc.field;
+            if (obj.HasField(fname)) {
+                if (this.desc.numeric) {
+                    if (this.desc.decimals > 0) {
+                        return DataTable.FormatReal(obj.GetFieldDouble(fname), this.desc.decimals);
+                    }
+                    return Convert.ToString(obj.GetFieldInt(fname));
+                }
+                if (this.desc.isBool) {
+                    if (obj.GetFieldBool(fname)) { return this.desc.boolTrue; }
+                    return this.desc.boolFalse;
+                }
+                string sval = obj.GetFieldString(fname);
+                if (sval != null) { return sval; }
+                return "";
+            }
+        }
+        return "";
+    }
+}
+
+// 将 `List<T>` 及各列访问器适配为引擎的 `DataSource`，
+// 使强大的 DataTable 引擎（排序 / 筛选 / 分组 / 聚合 / 编辑 /
+// 虚拟化）能原样作用于调用方自己的对象。不复制任何数据：
+// 每帧都从活动列表读取单元格。
+public class GridSource<T> : DataSource {
+    public List<T> data;
+    public List<GridColumn<T>> cols;
+    // 空白行实体工厂；null 使数据源保持只读。
+    public GridNew<T> factory;
+    // 领域实体的稳定键读取器；null 时回退到临时位置键。
+    public GridKey<T> key;
+
+    public override int RowCount() {
+        if (this.data == null) { return 0; }
+        return this.data.Count;
+    }
+
+    // 行号在当前这份数据里有效。引擎按上一次重算出来的行号集合
+    // （`st.order`）取单元格，绑定的列表在那之后缩短过的话行号就会越界；
+    // 读单元格是每帧的事，越界一次就是整个程序退出，所以这里按列一样挡住。
+    public bool Row(int row) {
+        if (this.data == null) { return false; }
+        return row >= 0 && row < this.data.Count;
+    }
+
+    public override string CellText(int row, int col) {
+        if (col < 0 || col >= this.cols.Count) { return ""; }
+        if (!this.Row(row)) { return ""; }
+        return this.cols[col].Raw(this.data[row]);
+    }
+
+    public override RowKey GetRowKey(int row) {
+        if (!this.Row(row)) { return null; }
+        if (this.key != null) { return this.key(this.data[row]); }
+        return RowKey.Legacy(row);
+    }
+
+    public override int CellNum(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return 0; }
+        GridColumn<T> gc = this.cols[col];
+        if (gc.num != null) { return gc.num(this.data[row]); }
+        if (this.data[row] != null && gc.desc != null && gc.desc.field != null && gc.desc.field != "") {
+            object obj = (object)this.data[row];
+            if (obj.HasField(gc.desc.field)) {
+                return obj.GetFieldInt(gc.desc.field);
+            }
+        }
+        return DataTable.ParseInt(this.CellText(row, col));
+    }
+
+    public override double CellReal(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return 0.0; }
+        GridColumn<T> gc = this.cols[col];
+        if (gc.real != null) { return gc.real(this.data[row]); }
+        if (this.data[row] != null && gc.desc != null && gc.desc.field != null && gc.desc.field != "") {
+            object obj = (object)this.data[row];
+            if (obj.HasField(gc.desc.field)) {
+                return obj.GetFieldDouble(gc.desc.field);
+            }
+        }
+        return DataTable.ParseReal(this.CellText(row, col));
+    }
+
+    public override bool CellBool(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return false; }
+        GridColumn<T> gc = this.cols[col];
+        if (gc.truth != null) { return gc.truth(this.data[row]); }
+        if (this.data[row] != null && gc.desc != null && gc.desc.field != null && gc.desc.field != "") {
+            object obj = (object)this.data[row];
+            if (obj.HasField(gc.desc.field)) {
+                return obj.GetFieldBool(gc.desc.field);
+            }
+        }
+        return DataTable.ParseBool(this.CellText(row, col));
+    }
+
+    public override void SetCell(int row, int col, string v) {
+        if (col < 0 || col >= this.cols.Count) { return; }
+        if (!this.Row(row)) { return; }
+        GridColumn<T> gc = this.cols[col];
+        if (gc.setter != null) {
+            gc.setter(this.data[row], v);
+            return;
+        }
+        if (this.data[row] != null && gc.desc != null && gc.desc.field != null && gc.desc.field != "") {
+            object obj = (object)this.data[row];
+            string fname = gc.desc.field;
+            if (obj.HasField(fname)) {
+                if (gc.desc.numeric) {
+                    if (gc.desc.decimals > 0) {
+                        obj.SetFieldDouble(fname, DataTable.ParseReal(v));
+                    } else {
+                        obj.SetFieldInt(fname, DataTable.ParseInt(v));
+                    }
+                } else if (gc.desc.isBool) {
+                    obj.SetFieldBool(fname, DataTable.ParseBool(v));
+                } else {
+                    obj.SetFieldString(fname, v);
+                }
+            }
+        }
+    }
+
+    // 含回写访问器的列使网格可编辑；
+    // 没有此类列的源保持只读。行插入/删除由
+    // `DataGrid.RowFactory` 开启，它提供泛型前端无法
+    // 合成的空白实体构造函数。
+    public override bool CanInsert() { return this.factory != null; }
+
+    public override bool InsertRow(int at) {
+        if (this.factory == null) { return false; }
+        if (at < 0 || at > this.data.Count) { return false; }
+        this.data.Insert(at, this.factory());
+        return true;
+    }
+
+    public override bool RemoveRow(int at) {
+        if (at < 0 || at >= this.data.Count) { return false; }
+        this.data.RemoveAt(at);
+        return true;
+    }
+}
