@@ -825,14 +825,26 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      真实返回类型（`List<AiMessage>`），不是 `Task`——类型上看不出来，只能
      看方法原型上的 `MOD_ASYNC`。同理接口方法、类名静态接收者也都推不出来，
      必须各自走一条路。
-   - **运行时新增全局符号，必须过全部链接形态门**：rt_mem.o 只在原生 exe
-     与跨端 linux exe 链入——Windows DLL（ld.exe -shared）、macOS dylib
+   - **运行时新增全局符号，必须过全部链接形态门**：rt_mem.o 只在原生 exe、
+     跨端 linux exe 与 Apple（本机/交叉 bundle 有 zanrt_mem.o 时，发射期
+     改名 zan_mem_*）链入——Windows DLL（ld.exe -shared）、macOS dylib
      （ld64.lld）、Android 静态链（bionic 上 --wrap=malloc 崩，刻意不链
      mem）、selfhost zanrt_sh 束都拿不到它。B-ID78 把 defer 队列落进
      rt_mem.c 后这些形态全部断链（ELF .so 靠默认容忍未定义符号**静音带
      病**，dlopen 才炸——比响的更危险）。修法沿 zan_io_pump 先例：
      irgen 对已建声明补 WeakAnyLinkage + 函数体（emit_defer_fallback），
      链入强定义覆盖、未链入退化 fail-open。
+   - **Apple 体积与"静默弱桩"**：ld64 按整对象链入，Mach-O 只有
+     `-dead_strip` 才按符号剥（本机/交叉 Apple 现一律带；hello 176→58 KB）。
+     但 main 无条件调用的运行时入口会把整个子系统钉住、dead-strip 救不了
+     ——`zan_co_sched_init` 曾让每个 exe 带全套 M:N 调度器（~20 KB 代码）。
+     这类"启动即调"的入口要在**优化后**按模块引用面裁掉
+     （`zan_strip_unused_co_sched_init`；优化前死 stdlib 函数还挂着引用，
+     判不准），回归由 `size_budget_dev_macos` 的 FORBID_SYMBOLS 守。
+     反面：rt_timer.o 的 `zan_mem_slabs/trim` 是恒 0 弱桩，分配器对象没链上
+     时程序照跑、只是 GC 统计悄悄失真——只查"不崩、非负"的用例
+     （gc_trim_memory）看不出，必须断言强实现的可观察效果
+     （`case_gc_fast_alloc_linked`）。验证落点用 `nm`/`ld -why_live`。
    - **LLVMAddFunction 不查重名**：先建同名函数，后建者不会返回已有的，
      而是并存，发射时被 mangler 加 `.N` 后缀（如 `zan_rt_defer_push.5`）
      ——调用指空、链接 undefined reference。要给"延迟建的声明"补体/改

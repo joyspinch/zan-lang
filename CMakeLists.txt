@@ -8532,6 +8532,25 @@ if(_size_tool)
     -DWORKDIR=${_size_dir}
     -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
   set_tests_properties(size_budget_publish_linux_x64 PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")
+  # macOS default (non-publish) build: ld64 links whole runtime objects, so
+  # hello was 176 KB until the host link got -dead_strip and main stopped
+  # calling zan_co_sched_init when nothing async is reachable (now ~58 KB,
+  # __text ~13 KB). The forbidden symbols are the M:N scheduler and timer
+  # dispatch: either one back in a hello means an always-on reference
+  # regressed, even when the page-rounded file size does not move.
+  if(APPLE AND EXISTS ${LLVM_TOOLS_BINARY_DIR}/llvm-nm)
+    add_test(NAME size_budget_dev_macos COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc> -DSRC=${_size_src}
+      -DOUT=${_size_dir}/hello_dev_macos
+      -DPUBLISH=OFF
+      -DSIZE_TOOL=${_size_tool}
+      -DNM_TOOL=${LLVM_TOOLS_BINARY_DIR}/llvm-nm
+      "-DFORBID_SYMBOLS=_co_worker\;_io_poll_shard_ex\;_zan_timer_dispatch_due"
+      -DMAX_TEXT=24000 -DMAX_FILE=90000
+      -DWORKDIR=${_size_dir}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
+    set_tests_properties(size_budget_dev_macos PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")
+  endif()
 else()
   message(STATUS "llvm-size not found beside LLVM; published-size budget tests skipped")
 endif()

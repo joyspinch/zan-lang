@@ -1,0 +1,36 @@
+using System;
+using System.Runtime.InteropServices;
+
+// 回归：小对象分配器（rt_mem.c，--fast-alloc 默认开）必须真的链进 exe。
+// zanrt_timer.o 里 zan_mem_slabs / zan_mem_trim 是恒 0 的弱桩：分配器对象
+// 没链上（Apple 曾经如此：ld64 无 --wrap、rt_mem.o 被跳过）时程序照常跑，
+// GC.GetTotalMemory 悄悄退回累计字节、TrimMemory 永远 0——gc_trim_memory
+// 那样只查"不崩、非负"的用例看不出来。这里直接要求 slab 计数为正。
+class Node {
+    public long V;
+    public Node Next;
+}
+
+class Program {
+    [DllImport("crt", EntryPoint = "zan_mem_slabs")]
+    static extern long MemSlabs();
+
+    static void Main() {
+        Node head = null;
+        for (int i = 0; i < 20000; i++) {
+            Node n = new Node();
+            n.V = i;
+            n.Next = head;
+            head = n;
+        }
+        long slabs = MemSlabs();
+        Console.WriteLine("allocator linked: " + (slabs > 0));
+        long total = GC.GetTotalMemory(false);
+        Console.WriteLine("total is slab bytes: " + (total == slabs * 1048576));
+        long sum = 0;
+        for (Node p = head; p != null; p = p.Next) sum += p.V;
+        Console.WriteLine("sum ok: " + (sum == 199990000L));
+        head = null;
+        Console.WriteLine("trim non-negative: " + (GC.TrimMemory() >= 0));
+    }
+}

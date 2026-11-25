@@ -91,15 +91,19 @@
             if (target.os == ZAN_OS_IOS) {
                 snprintf(cmd, sizeof(cmd),
                          "ld64.lld -arch arm64 -platform_version ios 14.0 14.0 -adhoc_codesign"
-                         "%s -o \"%s\" \"%s\"",
-                         (publish_mode || strip_symbols) ? " -dead_strip" : "",
+                         " -dead_strip -o \"%s\" \"%s\"",
                          obj_path, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
                          "ld64.lld -arch %s -platform_version macos 11.0 11.0 -adhoc_codesign"
-                         "%s -o \"%s\" \"%s\"",
-                         march, (publish_mode || strip_symbols) ? " -dead_strip" : "",
-                         obj_path, obj_tmp);
+                         " -dead_strip -o \"%s\" \"%s\"",
+                         march, obj_path, obj_tmp);
+            }
+            /* -dead_strip 不再只限 --publish：运行时对象整份链入，不剥则
+             * 每个 exe 带全套 timer/io/crash 代码（见本机分支同注）。 */
+            if (rt_mem_obj) {
+                /* 发射期已把分配调用改名为 zan_mem_*（route_fast_alloc） */
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_mem_obj);
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
@@ -498,6 +502,13 @@
             } else {
                 snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm", obj_tmp, obj_path);
             }
+#ifdef __APPLE__
+        /* ld64 只链整对象：不加 -dead_strip，zanrt_timer/io/crash/mem 的每个
+         * 函数都进 exe（hello 曾 176 KB）。Mach-O 对象自带
+         * SUBSECTIONS_VIA_SYMBOLS，按符号剥即可；驱动 dylib 不回调 exe 符号
+         * （nm -u 已核），注册表/构造器经 __mod_init_func 根保留。 */
+        cmd_appendf(link_cmd, sizeof(link_cmd), " -Wl,-dead_strip");
+#endif
         /* Publish sharding (shard_emit.c) moves most functions into extra
          * objects; they were never on this host link line, so every sharded
          * Unix publish failed with undefined symbols. */

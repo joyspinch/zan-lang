@@ -230,6 +230,11 @@
         }
     }
 
+    /* 优化后再判：未优化模块里还挂着死掉的 stdlib 异步函数的引用。分片发射
+     * 时函数已搬进别的对象，主模块看不全引用面，保守不删。 */
+    if (shard_n == 0)
+        zan_strip_unused_co_sched_init(&irgen);
+
     goto codegen_ready;
 codegen_failed:
     fprintf(stderr, "error: code generation stopped after optimization failure\n");

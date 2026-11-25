@@ -291,7 +291,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `--auto-stdlib` | **开** | 自动定位 stdlib 与已安装包，**按需拉入**用到的命名空间；显式传等于重申默认 |
 | `--no-stdlib` | — | 关自动 stdlib **和**包发现；`--no-packages` 只关包 |
 | `--no-packages` | — | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
-| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）。ELF/PE 以 `--wrap=malloc/free/calloc/realloc` 接管全镜像；Apple（ld64 无 `--wrap`）改为把 Zan 生成代码的分配调用改名指向 `zan_mem_*`，C 运行时/驱动仍用 libc，跨界的 `free`/`realloc` 由注册的 `zan_mem` malloc zone 回送。交叉目标不链；目标无分配器对象时告警并回退 CRT |
+| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）。ELF/PE 以 `--wrap=malloc/free/calloc/realloc` 接管全镜像；Apple（ld64 无 `--wrap`）改为把 Zan 生成代码的分配调用改名指向 `zan_mem_*`，C 运行时/驱动仍用 libc，跨界的 `free`/`realloc` 由注册的 `zan_mem` malloc zone 回送（交叉 macOS/iOS 在 `<zanc>/macos/<arch>/`、`ios/arm64/` 有 `zanrt_mem.o` 时同样改名链入）。其余交叉目标不链；目标无分配器对象时告警并回退 CRT |
 | `--no-fast-alloc` | — | 原生回退 CRT malloc——排查堆问题、或块需交还外部 CRT/驱动边界时用；与 `--fast-alloc` 同现时后写的生效 |
 | `-L<dir>` / `--libpath <dir>` | — | 追加原生库搜索目录（可重复） |
 | `--driver-dir <d>` | 内建目录 | 覆盖内建原生驱动目录（测试门指向新编的 zan_gui） |
@@ -307,7 +307,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `@<file>` | — | 响应文件（一行一个或空白分隔，带空格路径用引号，`#` 起注释，最多嵌套 8 层）——**超长命令行/含空格路径用它** |
 | （位置参数，文件/目录） | — | `.zan` 文件，或**目录**（递归展开 `*.zan`，按路径排序）。目录输入跳过 `.` 前缀与 `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` 等目录；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 会被 "the compile-time HTML channel has been removed" 拒绝——界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
 | （无旗标，按目标自动） | — | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
-| （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生不链（ld64 无 `--wrap`）；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
+| （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生与交叉（bundle 有对象时）经发射期改名 `zan_mem_*` 链入（ld64 无 `--wrap`）；Apple 链接一律 `-dead_strip`，未用到异步的程序不再调 `zan_co_sched_init`、不带 M:N 调度器；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
 | `--version, -v` / `--help, -h` | — | 版本 / 帮助；`--version` 输出 `zanc X.Y.Z (gen0)`——代次标记（B-ID189）由自举差分门盖进报告指纹；自举驱动（gen1）同旗标输出 `(gen1)`，字面量由 `bump_version.ps1` 与 VERSION 同步，漂移即门失败 |
 
 ### 2.2 发布（Publish）

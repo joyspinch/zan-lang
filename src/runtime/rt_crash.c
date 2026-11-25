@@ -55,6 +55,14 @@ WINBASEAPI ULONGLONG WINAPI GetTickCount64(VOID);
 /* POSIX 组合分发器（Composite Dispatcher）子模块拓扑引入：
  * crash/rt_crash_posix.c: sigaltstack、信号安全写日志与帧回溯解析
  */
+/* 整段是冷路径（启动装一次信号处理 + 崩溃时写日志），按体积而非速度
+ * 编译：Mac hello 的 __text 因此少 ~1.3 KB，__TEXT 段塞回单个 16 KB 页。 */
+#if defined(__clang__)
+#pragma clang attribute push (__attribute__((minsize)), apply_to = function)
+#endif
 #include "crash/rt_crash_posix.c"
+#if defined(__clang__)
+#pragma clang attribute pop
+#endif
 
 #endif

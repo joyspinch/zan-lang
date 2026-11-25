@@ -7,7 +7,13 @@
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DOUT=<artifact>
 #         -DSIZE_TOOL=<llvm-size> -DMAX_TEXT=<bytes> -DMAX_FILE=<bytes>
 #         [-DTARGET=<zan target>] [-DWORKDIR=<dir>]
+#         [-DPUBLISH=OFF]   (measure a default dev build instead of --publish)
+#         [-DNM_TOOL=<llvm-nm> -DFORBID_SYMBOLS=<sym;sym>]
 #         -P run_size_budget.cmake
+#
+# FORBID_SYMBOLS names runtime pieces a minimal program must not carry (for
+# example the M:N scheduler's _co_worker): a size ceiling with page-rounded
+# Mach-O segments cannot see a 15 KB regression that still fits the padding.
 #
 # Ceilings live in the registering CMakeLists block next to this script and
 # carry ~1.5x headroom over the measured baseline, so LLVM-version drift does
@@ -20,6 +26,11 @@ if(NOT ZANC OR NOT SRC OR NOT OUT OR NOT SIZE_TOOL OR NOT MAX_TEXT OR NOT MAX_FI
   message(FATAL_ERROR "run_size_budget.cmake: ZANC, SRC, OUT, SIZE_TOOL, MAX_TEXT, MAX_FILE are required")
 endif()
 
+set(_publish_args --publish)
+if(DEFINED PUBLISH AND NOT PUBLISH)
+  set(_publish_args "")
+endif()
+
 set(_target_args "")
 if(TARGET)
   set(_target_args --target ${TARGET})
@@ -30,7 +41,7 @@ endif()
 # catch a reintroduced fixed static table or a lost --gc-sections, so the
 # measurement must not move when the icon is regenerated.
 execute_process(
-  COMMAND ${ZANC} ${SRC} --auto-stdlib --publish --no-icon ${_target_args} -o ${OUT}
+  COMMAND ${ZANC} ${SRC} --auto-stdlib ${_publish_args} --no-icon ${_target_args} -o ${OUT}
   RESULT_VARIABLE _rc
   OUTPUT_VARIABLE _out
   ERROR_VARIABLE _err)
@@ -44,10 +55,10 @@ execute_process(COMMAND ${SIZE_TOOL} -A ${OUT} OUTPUT_VARIABLE _sz)
 set(_text_size "")
 string(REPLACE "\n" ";" _lines "${_sz}")
 foreach(_line ${_lines})
-  # llvm-size -A prints the same decimal shape for ELF and PE:
-  #   .text       44336   5368713216
-  if(_line MATCHES "^\\.text[ \t]+([0-9]+)[ \t]+[0-9]+")
-    set(_text_size ${CMAKE_MATCH_1})
+  # llvm-size -A prints the same decimal shape for ELF, PE and Mach-O:
+  #   .text       44336   5368713216     (Mach-O: __text)
+  if(_line MATCHES "^(\\.text|__text)[ \t]+([0-9]+)[ \t]+[0-9]+")
+    set(_text_size ${CMAKE_MATCH_2})
   endif()
 endforeach()
 if(_text_size STREQUAL "")
@@ -60,6 +71,20 @@ if(_text_size GREATER MAX_TEXT)
 endif()
 if(_file_size GREATER MAX_FILE)
   string(APPEND _verdict "  file ${_file_size} > budget ${MAX_FILE}\n")
+endif()
+if(FORBID_SYMBOLS)
+  if(NOT NM_TOOL)
+    message(FATAL_ERROR "size_budget: FORBID_SYMBOLS needs NM_TOOL")
+  endif()
+  execute_process(COMMAND ${NM_TOOL} ${OUT} OUTPUT_VARIABLE _syms RESULT_VARIABLE _nm_rc)
+  if(NOT _nm_rc EQUAL 0)
+    message(FATAL_ERROR "size_budget: ${NM_TOOL} failed on ${OUT}")
+  endif()
+  foreach(_sym ${FORBID_SYMBOLS})
+    if(_syms MATCHES "[ \t]${_sym}\n")
+      string(APPEND _verdict "  links ${_sym} (runtime piece the program never uses)\n")
+    endif()
+  endforeach()
 endif()
 if(NOT _verdict STREQUAL "")
   message(FATAL_ERROR "size_budget: ${OUT} over budget\n${_verdict}(measured: .text=${_text_size} file=${_file_size}; icon excluded via --no-icon)")

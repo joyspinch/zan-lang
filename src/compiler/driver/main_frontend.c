@@ -505,13 +505,11 @@
      * zan_mem_*；只有分配器对象确实在场才改，链接段（linker_setup.c）同判。
      * --emit-lib 不改：静态库只装用户对象、由外部宿主链接，拿不到 rt_mem.o。 */
 #ifdef ZAN_RT_MEM_OBJ
-    if (fast_alloc_opt >= 0 && !cross_compiling && !emit_lib &&
+    if (fast_alloc_opt >= 0 && !emit_lib &&
         (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-        char fa_dir[1024], fa_obj[1200];
-        zan_exe_dir(fa_dir, sizeof(fa_dir));
-        snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
-                 zan_path_basename(ZAN_RT_MEM_OBJ));
-        irgen.route_fast_alloc = zan_file_exists(fa_obj);
+        char fa_obj[1200];
+        irgen.route_fast_alloc =
+            zan_apple_rt_mem_path(&target, cross_compiling, fa_obj, sizeof(fa_obj));
     }
 #endif
     if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {

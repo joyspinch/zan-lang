@@ -182,6 +182,7 @@ ARTIFACTS = [
     ("toolchain/macos/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/macos/arm64/zanrt_crash.o", RT_CRASH, "runtime"),
     ("toolchain/macos/arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/macos/arm64/zanrt_mem.o", RT_MEM, "runtime"),
     ("toolchain/macos/arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
@@ -191,6 +192,7 @@ ARTIFACTS = [
     ("toolchain/macos/x64/zanrt_timer.o", RT_TIMER, "runtime"),
     ("toolchain/macos/x64/zanrt_crash.o", RT_CRASH, "runtime"),
     ("toolchain/macos/x64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/macos/x64/zanrt_mem.o", RT_MEM, "runtime"),
     ("toolchain/macos/x64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/x64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/arm64/zan_embed_api.o", EMBED, "runtime"),
@@ -212,6 +214,7 @@ ARTIFACTS = [
     ("toolchain/ios/arm64/zanrt_decimal.o", RT_DECIMAL, "manual"),
     ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "manual"),
     ("toolchain/ios/arm64/zanrt_crash.o", RT_CRASH, "manual"),
+    ("toolchain/ios/arm64/zanrt_mem.o", RT_MEM, "manual"),
     ("toolchain/ios/arm64/zan_embed_api.o", EMBED, "manual"),
     ("toolchain/ios/arm64/zan_inflate.o", INFLATE, "manual"),
     ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
@@ -804,7 +807,7 @@ def do_rebuild():
         print("Building ios/arm64...")
         subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-DZAN_IO_STACKLESS_ONLY", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_io.c", "-o", "toolchain/ios/arm64/zanrt_io.o"], check=True)
         subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-DZAN_IO_STACKLESS_ONLY", "-DZAN_CO_DRIVER", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_io.c", "-o", "toolchain/ios/arm64/zanrt_io_mt.o"], check=True)
-        for src in ["rt_sync.c", "rt_file.c", "rt_timer.c"]:
+        for src in ["rt_sync.c", "rt_file.c", "rt_timer.c", "rt_mem.c"]:
             obj = "zanrt_" + src[3:-2] + ".o"
             subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/{src}", "-o", f"toolchain/ios/arm64/{obj}"], check=True)
 

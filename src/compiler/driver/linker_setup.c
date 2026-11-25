@@ -138,8 +138,12 @@
         /* Apple 没有 --wrap：只在发射期已把分配调用改指 zan_mem_* 时才链
          * （irgen.route_fast_alloc，main_frontend.c 同一判据）。 */
         bool apple_target = target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS;
-        if (fast_alloc && !cross_compiling &&
-            (!apple_target || irgen.route_fast_alloc)) {
+        if (apple_target) {
+            if (fast_alloc && irgen.route_fast_alloc &&
+                zan_apple_rt_mem_path(&target, cross_compiling, rt_mem_buf,
+                                      sizeof(rt_mem_buf)))
+                rt_mem_obj = rt_mem_buf;
+        } else if (fast_alloc && !cross_compiling) {
             snprintf(rt_mem_buf, sizeof(rt_mem_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_MEM_OBJ));
             if (zan_file_exists(rt_mem_buf)) rt_mem_obj = rt_mem_buf;
@@ -270,7 +274,21 @@
         }
 
 #ifdef __APPLE__
-        {
+        /* Homebrew 目录只为 [DllImport] 第三方库（sqlite3 等）服务；程序没有
+         * 这类导入时不加 -L/-rpath：否则每个 exe 都带指向用户可写目录的
+         * LC_RPATH（多余的 dyld 搜索面，也占头部字节）。 */
+        bool want_brew_dirs = false;
+        for (int li = 0; li < irgen.extern_lib_count && !want_brew_dirs; li++) {
+            const char *ln = irgen.extern_libs[li].str;
+            int ll = (int)irgen.extern_libs[li].len;
+            if (ll > 3 && memcmp(ln, "lib", 3) == 0) { ln += 3; ll -= 3; }
+            if ((ll == 3 && memcmp(ln, "crt", 3) == 0) ||
+                (ll == 6 && memcmp(ln, "msvcrt", 6) == 0) ||
+                (ll == 1 && (ln[0] == 'c' || ln[0] == 'm')))
+                continue;
+            want_brew_dirs = true;
+        }
+        if (want_brew_dirs) {
             char home_lib[512]; home_lib[0] = '\0';
             const char *home = getenv("HOME");
             if (home && *home) {
