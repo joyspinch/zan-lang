@@ -216,18 +216,26 @@ partial class Irgen {
         }
         L("  call void @zan_monitor_enter(i8* " + obj + ")");
         int mark = finBodies.Count;
-        int cleanup = 0;
-        if (!curAsync) {
-            cleanup = NL();
-            int body = NL();
-            EmitExcBranch(EmitExcPush(), body, cleanup);
-            Label(body);
+        // An exception leaving the body must release the monitor, in an async
+        // method too: the coroutine arms the region like an async try (handler
+        // count + landing label), or a throw inside `lock` left it held for
+        // good (http2_server_security hung in Http2ServerConnection.Dispose).
+        int cleanup = NL();
+        int body = NL();
+        string lockBuf = EmitExcPush();
+        if (curAsync) {
+            EmitAsyncHcAdd(1);
+            EmitAsyncSaveSlots();
         }
+        EmitExcBranch(lockBuf, body, cleanup);
+        Label(body);
+        if (curAsync) { asyncTryLbl.Add(cleanup); }
         syncFlow.scopes.Add(s);
         finBodies.Add(null);
-        finLive.Add(cleanup == 0 ? 0 : 1);
+        finLive.Add(1);
         finMonSlot.Add(slot);
         if (s.b != null) { GenStmt(s.b); }
+        if (curAsync) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
         if (!term) { EmitExitFins(mark); }
         if (cleanup != 0) {
             bool bodyTerm = term;
@@ -238,6 +246,9 @@ partial class Irgen {
             }
             finLive[mark] = 0;
             Label(cleanup);
+            // the throw popped the region's EH frame on its way here
+            if (curAsync) { EmitAsyncHcAdd(-1); }
+            finMonSlot[mark] = slot;
             EmitExitFins(mark);
             EmitRaise();
             if (!bodyTerm) { Label(next); }

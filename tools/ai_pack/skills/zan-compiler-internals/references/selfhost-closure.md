@@ -3360,3 +3360,17 @@ Thread.Sleep）冻住整个程序"正是旧网络挂死簇的根因。
 再 `-fsanitize=address` 链接，heap-use-after-free 的分配/释放线程一目了然。
 测试里 `x = x + 1` / 共享 `List.Add` 在 M:N 下是真数据竞争（宿主同样偶发），
 修测试加锁而不是让编译器背锅；判据是宿主多轮循环也能复现。
+
+## 协程里的求值序与异常区（B-ID199 round 7，2026-11-25）
+
+- **await 提升不能改求值序**：ANF 把嵌入 await 提到语句前的临时量时，
+  ①`x OP await f()` 的左操作数（字段/成员/调用——局部与常量除外）先快照进
+  临时量；②`&&`/`||`/`?:` 臂里的 await 只在该臂被取时执行（降为
+  `bool t = a; if (t) { …; t = b; }` 与 if/else 赋临时量），无条件提升会让
+  死臂的生产者也跑（async_await_string_operator）。
+- **协程里的 `lock` 也是异常区**：体内抛出必须 `zan_monitor_exit`。异步方法
+  按 async try 同样布防（EmitExcPush + 处理器计数 + asyncTryLbl 落点），并让
+  `AsyncExceptionNesting` 把 LockStmt 计入嵌套层（帧上 owner-mark 槽按它分配）。
+  漏了它锁永不释放，下一个加锁者（常在另一 worker）永久阻塞。
+- 判定先看宿主：本轮扫描里 timezone_info、yaml_values、firefox_browser_model 等
+  "红案"宿主同红——先在本机跑宿主再归因，别对着陈旧 golden 改编译器。

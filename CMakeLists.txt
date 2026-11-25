@@ -3668,7 +3668,7 @@ foreach(_src ${_conf_srcs})
     set(_extra_args "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/runtime_generic_collection_identity_item.zan")
   elseif(_name STREQUAL "task_action_selected_public")
     set(_extra_args "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/task_action_selected_public.zan")
-  elseif(_name MATCHES "^(qualified_receiver_ns_tail|qualified_receiver_field_shadow|nested_type_shadows_import)$")
+  elseif(_name MATCHES "^(qualified_receiver_ns_tail|qualified_receiver_field_shadow|nested_type_shadows_import|ctor_initializer_collision)$")
     # The qualified receivers name a type declared in a second namespace
     # (one namespace per file), so the helper file carries it.
     set(_extra_args "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/${_name}.zan")

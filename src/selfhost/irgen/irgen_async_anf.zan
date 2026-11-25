@@ -445,11 +445,133 @@ partial class Irgen {
         return id;
     }
 
+    // Helpers of the lazy (short-circuit / conditional) await lowering.
+    Node MkTypeNode(string name) {
+        Node t = new Node(AK.TypeRef());
+        t.sval = name;
+        return t;
+    }
+    Node IdentOf(string name, Node at) {
+        Node id = new Node(AK.Ident());
+        id.sval = name;
+        id.line = at.line; id.col = at.col;
+        return id;
+    }
+    Node LazyTemp(Node ty, Node init, Node at, List<Node> pre) {
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = CopyType(ty);
+        d.b = init;
+        d.line = at.line; d.col = at.col;
+        pre.Add(d);
+        return d;
+    }
+    // `{ <arm's hoisted temps>; tmp = <arm>; }`
+    Node LazyArm(Node cls, Node m, Node arm, string tmp) {
+        List<Node> inner = new List<Node>();
+        Node v = HoistExpr(cls, m, arm, inner);
+        Node asg = new Node(AK.Assignment());
+        asg.op = TK.Eq(); asg.a = IdentOf(tmp, arm); asg.b = v;
+        asg.line = arm.line; asg.col = arm.col;
+        Node st = new Node(AK.ExprStmt());
+        st.a = asg;
+        st.line = arm.line; st.col = arm.col;
+        Node blk = new Node(AK.Block());
+        int i = 0;
+        while (i < inner.Count) { blk.Add(inner[i]); i = i + 1; }
+        blk.Add(st);
+        return blk;
+    }
+    // The static type of a conditional arm: an awaited call's result type, or
+    // the plain expression's type. Null when unknowable now.
+    Node ArmType(Node cls, Node m, Node arm) {
+        if (arm == null) { return null; }
+        if (arm.kind == AK.AwaitExpr()) { return AwaitCallTy(cls, m, arm.a); }
+        if (ExprHasAwait(arm)) { return null; }
+        Node t = ArgTypeNode(arm);
+        if (t == null || t.sval == null || t.sval == "" || t.sval == "var" || t.sval == "null") { return null; }
+        return t;
+    }
+
+    // Evaluate an operand into a fresh temp now (appended to `pre` ahead of a
+    // later operand's hoisted await). Constants, locals and parameters are
+    // left in place -- the awaited call cannot change them -- and so is an
+    // operand whose type is not knowable yet (no temp beats a wrong one).
+    Node SnapshotOperand(Node m, Node e, List<Node> pre) {
+        if (e == null) { return e; }
+        int k = e.kind;
+        if (k == AK.IntLit() || k == AK.FloatLit() || k == AK.StringLit() || k == AK.CharLit()
+                || k == AK.BoolLit() || k == AK.NullLit() || k == AK.Lambda()) { return e; }
+        if (k == AK.Ident() && (e.sval == null || e.sval.StartsWith("__aw$") || DeclTypeOf(m, e.sval) != null)) {
+            return e;
+        }
+        Node t = ArgTypeNode(e);
+        if (t == null || t.sval == null || t.sval == "" || t.sval == "var" || t.sval == "void") { return e; }
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = CopyType(t);
+        d.b = e;
+        d.line = e.line; d.col = e.col;
+        pre.Add(d);
+        Node id = new Node(AK.Ident());
+        id.sval = d.sval;
+        id.line = e.line; id.col = e.col;
+        return id;
+    }
+
     // Rewrite an expression tree: hoist every embedded await into `pre` and
     // replace it with a reference to the hoisted temp.
     Node HoistExpr(Node cls, Node m, Node e, List<Node> pre) {
         if (e == null) { return null; }
         if (e.kind == AK.Lambda()) { return e; }
+        // An await in a short-circuit or conditional arm runs only when that
+        // arm is taken (the C host's order): `a && await f()` lowers to
+        // `bool t = a; if (t) { <f's temps>; t = <right>; }`, `||` tests
+        // `!t`, and `c ? x : y` assigns a temp in an if/else. Hoisting the
+        // arm's await unconditionally ran dead producers
+        // (async_await_string_operator: "dead arms never invoke").
+        if (e.kind == AK.Binary() && (e.op == TK.AmpAmp() || e.op == TK.PipePipe()) && ExprHasAwait(e.b)) {
+            Node left = HoistExpr(cls, m, e.a, pre);
+            Node tv = LazyTemp(MkTypeNode("bool"), left, e, pre);
+            Node cond = IdentOf(tv.sval, e);
+            if (e.op == TK.PipePipe()) {
+                Node neg = new Node(AK.Unary());
+                neg.op = TK.Bang(); neg.a = cond;
+                neg.line = e.line; neg.col = e.col;
+                cond = neg;
+            }
+            Node ifs = new Node(AK.IfStmt());
+            ifs.a = cond;
+            ifs.b = LazyArm(cls, m, e.b, tv.sval);
+            ifs.line = e.line; ifs.col = e.col;
+            pre.Add(ifs);
+            return IdentOf(tv.sval, e);
+        }
+        if (e.kind == AK.Conditional() && (ExprHasAwait(e.b) || ExprHasAwait(e.c))) {
+            Node ty = ArmType(cls, m, e.b);
+            if (ty == null) { ty = ArmType(cls, m, e.c); }
+            if (ty != null) {
+                Node cond = HoistExpr(cls, m, e.a, pre);
+                Node tv = LazyTemp(ty, null, e, pre);
+                Node ifs = new Node(AK.IfStmt());
+                ifs.a = cond;
+                ifs.b = LazyArm(cls, m, e.b, tv.sval);
+                ifs.c = LazyArm(cls, m, e.c, tv.sval);
+                ifs.line = e.line; ifs.col = e.col;
+                pre.Add(ifs);
+                return IdentOf(tv.sval, e);
+            }
+        }
+        // `x OP await f()`: the left operand is evaluated BEFORE the await
+        // (the C host's order). Hoisting only the await would read `x` after
+        // the suspension and see whatever f() wrote to it
+        // (async_await_string_operator: `current == await Mutate(..)`).
+        if (e.kind == AK.Binary() && e.op != TK.AmpAmp() && e.op != TK.PipePipe()
+                && !ExprHasAwait(e.a) && ExprHasAwait(e.b)) {
+            e.a = SnapshotOperand(m, HoistExpr(cls, m, e.a, pre), pre);
+        }
         e.a = HoistExpr(cls, m, e.a, pre);
         e.b = HoistExpr(cls, m, e.b, pre);
         e.c = HoistExpr(cls, m, e.c, pre);
