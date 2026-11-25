@@ -252,6 +252,12 @@ struct zan_irgen {
   } *struct_types;
   int struct_type_count;
   int struct_type_cap;
+  /* 结构体符号至 struct_types 下标的 O(1) 查找表 */
+  struct zan_struct_index_slot {
+    zan_symbol_t *sym;
+    int idx;
+  } *struct_type_index;
+  int struct_type_index_cap;
 
   /* 类级 ARC 字段级联释放函数表 */
   struct zan_class_release_entry {
@@ -586,9 +592,12 @@ struct zan_irgen {
   struct {
     zan_istr_t text;
     LLVMValueRef value;
+    uint32_t hash;
   } *string_literals;
   int string_literal_count;
   int string_literal_cap;
+  int *string_literal_index; /* 1-based index into string_literals (0 = empty) */
+  int string_literal_index_cap;
 
   /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
   struct {

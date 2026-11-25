@@ -63,6 +63,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
   g->string_literals = NULL;
   g->string_literal_count = 0;
   g->string_literal_cap = 0;
+  g->string_literal_index = NULL;
+  g->string_literal_index_cap = 0;
+  g->struct_type_index = NULL;
+  g->struct_type_index_cap = 0;
   g->hide_diagnostics = false;
   g->site_map_path = NULL;
   g->site_map_fp = NULL;
@@ -1002,12 +1006,18 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
   free(g->struct_types);
   g->struct_types = NULL;
   g->struct_type_count = g->struct_type_cap = 0;
+  free(g->struct_type_index);
+  g->struct_type_index = NULL;
+  g->struct_type_index_cap = 0;
   free(g->obf_literals);
   g->obf_literals = NULL;
   g->obf_literal_count = g->obf_literal_cap = 0;
   free(g->string_literals);
   g->string_literals = NULL;
   g->string_literal_count = g->string_literal_cap = 0;
+  free(g->string_literal_index);
+  g->string_literal_index = NULL;
+  g->string_literal_index_cap = 0;
   if (g->site_map_fp) {
     fclose(g->site_map_fp);
     g->site_map_fp = NULL;
@@ -1082,6 +1092,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
   free(g->string_literals);
   g->string_literals = NULL;
   g->string_literal_count = g->string_literal_cap = 0;
+  free(g->string_literal_index);
+  g->string_literal_index = NULL;
+  g->string_literal_index_cap = 0;
   zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
   g->function_compactor = NULL;
   if (g->builder)
@@ -1101,6 +1114,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
   free(g->struct_types);
   g->struct_types = NULL;
   g->struct_type_count = g->struct_type_cap = 0;
+  free(g->struct_type_index);
+  g->struct_type_index = NULL;
+  g->struct_type_index_cap = 0;
   free(g->body_write_memo);
   g->body_write_memo = NULL;
   g->body_write_memo_cap = g->body_write_memo_count = 0;

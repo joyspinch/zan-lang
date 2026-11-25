@@ -260,7 +260,7 @@ if (!do_emit_ir) {
       goto codegen_failed;
     zan_irgen_prune_extern_libs(&irgen);
   }
-  zan_discover_drivers(resolved_stdlib_root, &driver_reg);
+  zan_discover_drivers(resolved_stdlib_root, &driver_reg, &irgen);
   zan_driver_capture_conditions(&irgen, ir_arena, &driver_reg, &target,
                                 driver_dir_override, &driver_prefixes);
 }

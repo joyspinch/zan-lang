@@ -540,10 +540,12 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
 }
 
 static zan_pkg_source_index_t *package_source_index;
+static int package_sources_matched;
 
 static void package_sources_destroy(void) {
   zan_pkg_source_index_destroy(package_source_index);
   package_source_index = NULL;
+  package_sources_matched = 0;
 }
 
 static int package_visit_namespace(const char *subdir,
@@ -552,12 +554,15 @@ static int package_visit_namespace(const char *subdir,
   if (!package_project_root[0])
     return 0;
   if (!package_source_index) {
-    package_source_index =
-        zan_pkg_source_index_create(package_project_root, probe_file_namespace);
+    package_source_index = zan_pkg_source_index_create_lazy(
+        package_project_root, probe_file_namespace);
     atexit(package_sources_destroy);
   }
-  return zan_pkg_source_index_visit(package_source_index, subdir, visitor,
-                                    context, hierarchical);
+  int matched = zan_pkg_source_index_visit(package_source_index, subdir,
+                                           visitor, context, hierarchical);
+  if (matched > 0)
+    package_sources_matched += matched;
+  return matched;
 }
 
 typedef struct {

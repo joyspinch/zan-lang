@@ -227,21 +227,71 @@ int class_vptr_offset(zan_symbol_t *sym) {
     return 0;
   return 1;
 }
-LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
-  for (int i = 0; i < g->struct_type_count; i++) {
-    if (g->struct_types[i].sym == sym)
-      return g->struct_types[i].llvm_type;
+static inline size_t struct_sym_hash(const zan_symbol_t *sym) {
+  uintptr_t x = (uintptr_t)sym;
+  x ^= x >> 17;
+  x *= (uintptr_t)0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 31;
+  return (size_t)x;
+}
+
+static void struct_index_insert(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
+  if (!sym)
+    return;
+  if ((g->struct_type_count + 1) * 10 >= g->struct_type_index_cap * 7) {
+    int ncap = g->struct_type_index_cap ? g->struct_type_index_cap * 2 : 64;
+    struct zan_struct_index_slot *nt = (struct zan_struct_index_slot *)calloc(
+        (size_t)ncap, sizeof(*nt));
+    if (!nt)
+      return;
+    size_t mask = (size_t)(ncap - 1);
+    for (int i = 0; i < g->struct_type_count; i++) {
+      zan_symbol_t *s = g->struct_types[i].sym;
+      if (!s)
+        continue;
+      size_t h = struct_sym_hash(s) & mask;
+      while (nt[h].sym)
+        h = (h + 1) & mask;
+      nt[h].sym = s;
+      nt[h].idx = i;
+    }
+    free(g->struct_type_index);
+    g->struct_type_index = nt;
+    g->struct_type_index_cap = ncap;
+    return;
   }
-  return NULL;
+  size_t mask = (size_t)(g->struct_type_index_cap - 1);
+  size_t h = struct_sym_hash(sym) & mask;
+  while (g->struct_type_index[h].sym && g->struct_type_index[h].sym != sym)
+    h = (h + 1) & mask;
+  g->struct_type_index[h].sym = sym;
+  g->struct_type_index[h].idx = idx;
 }
 
 struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g,
                                                zan_symbol_t *sym) {
+  if (!sym)
+    return NULL;
+  if (g->struct_type_index && g->struct_type_index_cap > 0) {
+    size_t mask = (size_t)(g->struct_type_index_cap - 1);
+    size_t h = struct_sym_hash(sym) & mask;
+    while (g->struct_type_index[h].sym) {
+      if (g->struct_type_index[h].sym == sym)
+        return &g->struct_types[g->struct_type_index[h].idx];
+      h = (h + 1) & mask;
+    }
+    return NULL;
+  }
   for (int i = 0; i < g->struct_type_count; i++) {
     if (g->struct_types[i].sym == sym)
       return &g->struct_types[i];
   }
   return NULL;
+}
+
+LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
+  struct zan_struct_type_entry *e = get_struct_entry(g, sym);
+  return e ? e->llvm_type : NULL;
 }
 
 /* Address a field of an instance */
@@ -505,11 +555,8 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
   g->struct_types[g->struct_type_count].sym = sym;
   g->struct_types[g->struct_type_count].llvm_type = st;
   g->struct_types[g->struct_type_count].base_struct_idx = -1;
-  g->struct_type_count++;
-  /* 本结构体在表里的下标：下面算字段类型时可能**递归**注册别的结构体，
-   * 那会让 g->struct_types 扩容搬家——事后不能再用"最后一个"当下标，
-   * 也不能缓存 &g->struct_types[...] 指针（那是野指针）。 */
-  int my_index = g->struct_type_count - 1;
+  int my_index = g->struct_type_count++;
+  struct_index_insert(g, sym, my_index);
 
   int field_count = 0;
   for (int i = 0; i < sym->member_count; i++) {

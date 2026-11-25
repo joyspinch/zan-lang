@@ -41,10 +41,10 @@ static const keyword_entry_t s_keywords[] = {
     {"finally",   TK_FINALLY},
     {"fixed",     TK_FIXED},
     {"float",     TK_FLOAT},
-    {"goto",      TK_GOTO},
     {"for",       TK_FOR},
     {"foreach",   TK_FOREACH},
     {"get",       TK_GET},
+    {"goto",      TK_GOTO},
     {"if",        TK_IF},
     {"in",        TK_IN},
     {"int",       TK_INT},
@@ -98,6 +98,48 @@ static const keyword_entry_t s_keywords[] = {
 };
 
 #define KEYWORD_COUNT (sizeof(s_keywords) / sizeof(s_keywords[0]))
+
+/* 首字母分桶索引（s_keywords 按首字母有序分组）+ 预计算长度，
+ * 使词法识别从 81 次 strlen 线性扫描降为 0~6 次定长 memcmp。 */
+static uint8_t s_kw_start[26];
+static uint8_t s_kw_end[26];
+static uint8_t s_kw_len[KEYWORD_COUNT];
+static uint8_t s_kw_min_len = 255;
+static uint8_t s_kw_max_len = 0;
+static bool s_kw_index_ready = false;
+
+static void lexer_ensure_kw_index(void) {
+    if (s_kw_index_ready) return;
+    memset(s_kw_start, 0, sizeof(s_kw_start));
+    memset(s_kw_end, 0, sizeof(s_kw_end));
+    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
+        size_t l = strlen(s_keywords[i].name);
+        s_kw_len[i] = (uint8_t)l;
+        if (l < s_kw_min_len) s_kw_min_len = (uint8_t)l;
+        if (l > s_kw_max_len) s_kw_max_len = (uint8_t)l;
+        int b = (unsigned char)s_keywords[i].name[0] - 'a';
+        if (b >= 0 && b < 26) {
+            if (s_kw_end[b] == 0) s_kw_start[b] = (uint8_t)i;
+            s_kw_end[b] = (uint8_t)(i + 1);
+        }
+    }
+    s_kw_index_ready = true;
+}
+
+static inline zan_token_kind_t lexer_lookup_keyword(const char *text, size_t len) {
+    if (len < s_kw_min_len || len > s_kw_max_len) return TK_IDENT;
+    unsigned c0 = (unsigned char)text[0] - (unsigned)'a';
+    if (c0 >= 26u) return TK_IDENT;
+    uint8_t lo = s_kw_start[c0];
+    uint8_t hi = s_kw_end[c0];
+    for (uint8_t i = lo; i < hi; i++) {
+        if ((size_t)s_kw_len[i] == len &&
+            memcmp(s_keywords[i].name, text, len) == 0) {
+            return s_keywords[i].kind;
+        }
+    }
+    return TK_IDENT;
+}
 
 static const char *s_token_names[TK__COUNT] = {
     [TK_INVALID]     = "INVALID",
@@ -183,14 +225,13 @@ const char *zan_lexer_keyword_text(zan_token_kind_t kind) {
 
 bool zan_is_keyword(const char *name) {
     if (!name) return false;
-    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
-        if (strcmp(s_keywords[i].name, name) == 0) return true;
-    }
-    return false;
+    lexer_ensure_kw_index();
+    return lexer_lookup_keyword(name, strlen(name)) != TK_IDENT;
 }
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag) {
+    lexer_ensure_kw_index();
     memset(lex, 0, sizeof(*lex));
     if (source && len >= 3 &&
         (unsigned char)source[0] == 0xEF &&

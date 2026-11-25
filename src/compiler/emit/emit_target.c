@@ -882,11 +882,12 @@ done:;
 
 /* ---- output ---- */
 
-static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage);
+static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage,
+                                          bool verify);
 
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
   if (zan_bind_target_layout(g, NULL) != ZAN_OK ||
-      prepare_target_output(g, "before IR output") != ZAN_OK)
+      prepare_target_output(g, "before IR output", true) != ZAN_OK)
     return ZAN_ERROR;
   char *ir = LLVMPrintModuleToString(g->mod);
   char *owned = NULL; /* 自述头 + IR 的拼接缓冲（malloc 释放） */
@@ -1515,7 +1516,8 @@ void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
   }
 }
 
-static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage) {
+static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage,
+                                          bool verify) {
   abi_pending_report(g);
   if (zan_diag_has_errors(g->diag))
     return ZAN_ERROR;
@@ -1696,7 +1698,7 @@ static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage) {
     }
   }
   if (zan_opt_validate_cpu(g, g->mod) != ZAN_OK ||
-      zan_opt_verify_module(g->mod, stage) != ZAN_OK)
+      (verify && zan_opt_verify_module(g->mod, stage) != ZAN_OK))
     return ZAN_ERROR;
   return ZAN_OK;
 }
@@ -1737,7 +1739,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
   if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
     return ZAN_ERROR;
 
-  if (prepare_target_output(g, "before object output") != ZAN_OK) {
+  if (prepare_target_output(g, "before object output", false) != ZAN_OK) {
     LLVMDisposeTargetMachine(tm);
     return ZAN_ERROR;
   }

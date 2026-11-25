@@ -533,10 +533,24 @@ typedef struct pkg_index_namespace {
   struct pkg_index_namespace *next;
 } pkg_index_namespace_t;
 
+typedef struct {
+  char *dir;
+  char *src_root;
+  char prefix[128];
+  pkg_index_package_t *package;
+  int project_owned;
+  int expanded;
+} pkg_index_pending_dir_t;
+
 struct zan_pkg_source_index {
   pkg_index_namespace_t *namespaces[PKG_NAMESPACE_BUCKETS];
   pkg_index_package_t *packages;
   pkg_index_source_t *sources;
+  zan_pkg_namespace_probe_t probe;
+  pkg_index_pending_dir_t *pending_dirs;
+  int pending_count;
+  int pending_cap;
+  int all_expanded;
 };
 
 static char *pkg_index_copy(const char *s) {

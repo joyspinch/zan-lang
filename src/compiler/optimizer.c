@@ -1371,6 +1371,15 @@ zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod) {
   return ZAN_OK;
 }
 
+static bool zan_verify_ir_strict(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *env = getenv("ZAN_VERIFY_IR");
+    cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+  }
+  return cached != 0;
+}
+
 zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage) {
   if (!mod) {
     fprintf(stderr, "error: missing LLVM module %s\n", stage);
@@ -1386,11 +1395,14 @@ zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage) {
   return failed ? ZAN_ERROR : ZAN_OK;
 }
 
-/* All LLVM pipelines share the same fail-closed protocol. */
+/* All LLVM pipelines share the same fail-closed protocol.
+ * Boundary verifications run at IRgen exit and pre-codegen; intermediate
+ * per-pass verifications are opt-in via ZAN_VERIFY_IR=1. */
 static zan_status_t run_checked_passes(LLVMModuleRef mod,
                                        LLVMTargetMachineRef tm,
                                        const char *passes) {
-  if (zan_opt_verify_module(mod, "before pass pipeline") != ZAN_OK)
+  if (zan_verify_ir_strict() &&
+      zan_opt_verify_module(mod, "before pass pipeline") != ZAN_OK)
     return ZAN_ERROR;
   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
   LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
@@ -1403,7 +1415,9 @@ static zan_status_t run_checked_passes(LLVMModuleRef mod,
     LLVMDisposeErrorMessage(msg);
     return ZAN_ERROR;
   }
-  return zan_opt_verify_module(mod, "after pass pipeline");
+  if (zan_verify_ir_strict())
+    return zan_opt_verify_module(mod, "after pass pipeline");
+  return ZAN_OK;
 }
 
 /* ===================== 收缩 pass：nothrow 闭包 + invoke 塌缩
@@ -1973,7 +1987,8 @@ static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
         nthr++;
     }
     LLVMDisposeBuilder(b);
-    zan_opt_verify_module(mod, "after shrink collapse");
+    if (zan_verify_ir_strict())
+      zan_opt_verify_module(mod, "after shrink collapse");
     if (verbose) {
       fprintf(stderr,
               "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
@@ -2268,7 +2283,8 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
   static const zan_opt_knobs_t default_knobs;
   if (!knobs)
     knobs = &default_knobs;
-  if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK)
+  if (zan_verify_ir_strict() &&
+      zan_opt_verify_module(mod, "before optimization") != ZAN_OK)
     return ZAN_ERROR;
   if (level == ZAN_OPT_NONE)
     return ZAN_OK;
@@ -2464,7 +2480,8 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
       return ZAN_ERROR;
   }
 
-  if (zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
+  if (zan_verify_ir_strict() &&
+      zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
     return ZAN_ERROR;
   /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
   {

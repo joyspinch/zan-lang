@@ -131,7 +131,7 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
                                  void *ctx) {
   if (depth > 8)
     return;
-  visit(dir_full, rel, ctx);
+  bool has_drivers = false;
 #ifdef _WIN32
   char glob[1200];
   snprintf(glob, sizeof(glob), "%s\\*", dir_full);
@@ -144,7 +144,11 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
       const char *nm = fd.cFileName;
       if (nm[0] == '.')
         continue;
-      if (strcmp(nm, "drivers") == 0 || strcmp(nm, "native") == 0)
+      if (strcmp(nm, "drivers") == 0) {
+        has_drivers = true;
+        continue;
+      }
+      if (strcmp(nm, "native") == 0)
         continue;
       char sub[1200];
       snprintf(sub, sizeof(sub), "%s\\%s", dir_full, nm);
@@ -165,7 +169,15 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
       const char *nm = ent->d_name;
       if (nm[0] == '.')
         continue;
-      if (strcmp(nm, "drivers") == 0 || strcmp(nm, "native") == 0)
+      if (strcmp(nm, "drivers") == 0) {
+        char drv[1200];
+        snprintf(drv, sizeof(drv), "%s/%s", dir_full, nm);
+        struct stat dst;
+        if (stat(drv, &dst) == 0 && S_ISDIR(dst.st_mode))
+          has_drivers = true;
+        continue;
+      }
+      if (strcmp(nm, "native") == 0)
         continue;
       char sub[1200];
       snprintf(sub, sizeof(sub), "%s/%s", dir_full, nm);
@@ -182,6 +194,8 @@ static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
     closedir(d);
   }
 #endif
+  if (has_drivers)
+    visit(dir_full, rel, ctx);
 }
 
 typedef struct {
@@ -226,8 +240,80 @@ static zan_package_source_root_t *zan_collect_package_source_roots(int *count) {
   }
 }
 
+static bool zan_path_has_prefix(const char *path, const char *prefix) {
+  if (!path || !prefix || !prefix[0])
+    return false;
+  size_t i = 0;
+  for (; prefix[i]; i++) {
+    char a = path[i];
+    char b = prefix[i];
+    if (!a)
+      return false;
+    if (a == '\\')
+      a = '/';
+    if (b == '\\')
+      b = '/';
+#ifdef _WIN32
+    if (a >= 'A' && a <= 'Z')
+      a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z')
+      b = (char)(b - 'A' + 'a');
+#endif
+    if (a != b)
+      return false;
+  }
+  return path[i] == '\0' || path[i] == '/' || path[i] == '\\';
+}
+
+static bool zan_is_standard_os_lib(const char *name, int len) {
+  static const char *const k_os_libs[] = {
+      "kernel32", "user32",   "gdi32",    "advapi32", "shell32",  "ole32",
+      "oleaut32", "ws2_32",   "msvcrt",   "ucrtbase", "ntdll",    "bcrypt",
+      "crypt32",  "opengl32", "dwmapi",   "uxtheme",  "comdlg32", "imm32",
+      "winmm",    "shlwapi",  "comctl32", "psapi",    "dbghelp",  "iphlpapi",
+      "winhttp",  "wininet",  "secur32",  "netapi32", "version",  "setupapi",
+      "powrprof", "dxgi",     "d3d11",    "d2d1",     "dwrite",   "rpcrt4",
+      "msimg32",  "glu32",    "crt",      "__Internal", "zan_rt",  "c",
+      "m",        "pthread",  "dl",       "rt",         "z",       "System",
+  };
+  /* 去掉末尾 .dll / .so / .dylib 后缀匹配 */
+  int base_len = len;
+  if (base_len > 4 &&
+      ((name[base_len - 4] == '.' &&
+        (name[base_len - 3] == 'd' || name[base_len - 3] == 'D') &&
+        (name[base_len - 2] == 'l' || name[base_len - 2] == 'L') &&
+        (name[base_len - 1] == 'l' || name[base_len - 1] == 'L')))) {
+    base_len -= 4;
+  }
+  for (size_t i = 0; i < sizeof(k_os_libs) / sizeof(k_os_libs[0]); i++) {
+    const char *s = k_os_libs[i];
+    if ((int)strlen(s) != base_len)
+      continue;
+    bool eq = true;
+    for (int j = 0; j < base_len; j++) {
+      char a = name[j];
+      char b = s[j];
+      if (a >= 'A' && a <= 'Z')
+        a = (char)(a - 'A' + 'a');
+      if (b >= 'A' && b <= 'Z')
+        b = (char)(b - 'A' + 'a');
+      if (a != b) {
+        eq = false;
+        break;
+      }
+    }
+    if (eq)
+      return true;
+  }
+  return false;
+}
+
+static int zan_driver_find(const zan_driver_registry_t *reg, const char *lname,
+                           int len);
+
 static void zan_discover_drivers(const char *stdlib_root,
-                                 zan_driver_registry_t *reg) {
+                                 zan_driver_registry_t *reg,
+                                 const zan_irgen_t *g) {
   reg->count = 0;
   zan_driver_root_scan_t scan;
   if (stdlib_root && stdlib_root[0]) {
@@ -235,14 +321,56 @@ static void zan_discover_drivers(const char *stdlib_root,
     scan.root = stdlib_root;
     zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, &scan);
   }
-  int pkg_n;
+  int pkg_n = 0;
   zan_package_source_root_t *pkg_roots =
       zan_collect_package_source_roots(&pkg_n);
-  for (int i = 0; i < pkg_n; i++) {
-    scan.reg = reg;
-    scan.root = pkg_roots[i];
-    zan_walk_stdlib_dirs(pkg_roots[i], "", 0, zan_scan_driver_module, &scan);
+  if (pkg_n <= 0) {
+    free(pkg_roots);
+    return;
   }
+  unsigned char *walked = (unsigned char *)calloc((size_t)pkg_n, 1);
+  if (walked && g && g->diag) {
+    /* 第一遍：只扫描实际贡献了已编译源文件的包，零无关包走树。 */
+    for (int i = 0; i < pkg_n; i++) {
+      bool matched = false;
+      for (int f = 0; f < g->diag->file_count; f++) {
+        if (zan_path_has_prefix(g->diag->file_names[f], pkg_roots[i])) {
+          matched = true;
+          break;
+        }
+      }
+      if (matched) {
+        walked[i] = 1;
+        scan.reg = reg;
+        scan.root = pkg_roots[i];
+        zan_walk_stdlib_dirs(pkg_roots[i], "", 0, zan_scan_driver_module,
+                             &scan);
+      }
+    }
+  }
+  /* 第二遍保底：若仍有未匹配的非常规系统 [DllImport] 库（例如用户代码直接
+   * DllImport 某包驱动而未 using 该包），再补扫剩余包。 */
+  bool need_fallback = false;
+  if (g && g->extern_lib_count > 0) {
+    for (int k = 0; k < g->extern_lib_count; k++) {
+      const char *ln = g->extern_libs[k].str;
+      int ll = (int)g->extern_libs[k].len;
+      if (zan_driver_find(reg, ln, ll) < 0 && !zan_is_standard_os_lib(ln, ll)) {
+        need_fallback = true;
+        break;
+      }
+    }
+  }
+  if (need_fallback || !walked) {
+    for (int i = 0; i < pkg_n; i++) {
+      if (walked && walked[i])
+        continue;
+      scan.reg = reg;
+      scan.root = pkg_roots[i];
+      zan_walk_stdlib_dirs(pkg_roots[i], "", 0, zan_scan_driver_module, &scan);
+    }
+  }
+  free(walked);
   free(pkg_roots);
 }
 
@@ -626,6 +754,17 @@ static void zan_driver_capture_conditions(
   if (mdirs) {
     int mcnt = zan_pkg_all_manifest_dirs(package_project_root, mdirs, mcap);
     for (int m = 0; m < mcnt; m++) {
+      if (g && g->diag) {
+        bool pkg_used = false;
+        for (int f = 0; f < g->diag->file_count; f++) {
+          if (zan_path_has_prefix(g->diag->file_names[f], mdirs[m])) {
+            pkg_used = true;
+            break;
+          }
+        }
+        if (!pkg_used)
+          continue;
+      }
       char mpath[1200];
       snprintf(mpath, sizeof(mpath), "%s/zan.pkg", mdirs[m]);
       zan_package_t pkg;

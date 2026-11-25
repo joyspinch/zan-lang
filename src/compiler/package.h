@@ -172,6 +172,10 @@ typedef struct zan_pkg_source_index zan_pkg_source_index_t;
 zan_pkg_source_index_t *
 zan_pkg_source_index_create(const char *project_dir,
                             zan_pkg_namespace_probe_t probe);
+/* 惰性前缀包索引：仅按查询的命名空间前缀按需展开子目录，未命中非 stdlib 时回退全扫 */
+zan_pkg_source_index_t *
+zan_pkg_source_index_create_lazy(const char *project_dir,
+                                 zan_pkg_namespace_probe_t probe);
 int zan_pkg_source_index_visit(const zan_pkg_source_index_t *index,
                                const char *namespace_path,
                                zan_pkg_source_visitor_t visitor, void *context,

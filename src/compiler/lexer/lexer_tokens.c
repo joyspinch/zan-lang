@@ -61,11 +61,9 @@ static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
     size_t len = lex->pos - start;
     const char *text = lex->source + start;
 
-    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
-        if (strlen(s_keywords[i].name) == len &&
-            memcmp(s_keywords[i].name, text, len) == 0) {
-            return lexer_make(lex, s_keywords[i].kind, loc);
-        }
+    zan_token_kind_t kw = lexer_lookup_keyword(text, len);
+    if (kw != TK_IDENT) {
+        return lexer_make(lex, kw, loc);
     }
 
     zan_token_t tok = lexer_make(lex, TK_IDENT, loc);

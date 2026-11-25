@@ -596,16 +596,69 @@ void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp,
     LLVMValueRef ncount = zan_add(g->builder, count, slen, "sbncount");
     LLVMBuildStore(g->builder, ncount, cptr);
 }
+static uint32_t strlit_fnv1a(const char *s, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void strlit_index_insert(zan_irgen_t *g, int idx, uint32_t hash) {
+    if ((g->string_literal_count + 1) * 10 >= g->string_literal_index_cap * 7) {
+        int ncap = g->string_literal_index_cap ? g->string_literal_index_cap * 2 : 256;
+        int *nt = (int *)calloc((size_t)ncap, sizeof(int));
+        if (!nt) return;
+        uint32_t mask = (uint32_t)(ncap - 1);
+        for (int i = 0; i < g->string_literal_count; i++) {
+            uint32_t h = g->string_literals[i].hash & mask;
+            while (nt[h]) h = (h + 1u) & mask;
+            nt[h] = i + 1;
+        }
+        free(g->string_literal_index);
+        g->string_literal_index = nt;
+        g->string_literal_index_cap = ncap;
+        return;
+    }
+    uint32_t mask = (uint32_t)(g->string_literal_index_cap - 1);
+    uint32_t h = hash & mask;
+    while (g->string_literal_index[h]) h = (h + 1u) & mask;
+    g->string_literal_index[h] = idx + 1;
+}
+
 LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
-    for (int i = 0; i < g->string_literal_count; i++) {
-        if ((size_t)g->string_literals[i].text.len == (size_t)text.len &&
-            memcmp(g->string_literals[i].text.str, text.str, (size_t)text.len) == 0) {
-            LLVMValueRef global = g->string_literals[i].value;
-            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-            LLVMTypeRef lit_ty = LLVMArrayType(i8, (unsigned)(16u + (size_t)text.len + 1u));
-            LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
-            return LLVMBuildGEP2(g->builder, lit_ty, global, idxs, 2, "str.lit.ptr");
+    uint32_t hash = strlit_fnv1a(text.str, (size_t)text.len);
+    if (g->string_literal_index && g->string_literal_index_cap > 0) {
+        uint32_t mask = (uint32_t)(g->string_literal_index_cap - 1);
+        uint32_t h = hash & mask;
+        while (g->string_literal_index[h]) {
+            int i = g->string_literal_index[h] - 1;
+            if (g->string_literals[i].hash == hash &&
+                (size_t)g->string_literals[i].text.len == (size_t)text.len &&
+                (text.len == 0 ||
+                 memcmp(g->string_literals[i].text.str, text.str, (size_t)text.len) == 0)) {
+                LLVMValueRef global = g->string_literals[i].value;
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                LLVMTypeRef lit_ty = LLVMArrayType(i8, (unsigned)(16u + (size_t)text.len + 1u));
+                LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
+                return LLVMBuildGEP2(g->builder, lit_ty, global, idxs, 2, "str.lit.ptr");
+            }
+            h = (h + 1u) & mask;
+        }
+    } else {
+        for (int i = 0; i < g->string_literal_count; i++) {
+            if ((size_t)g->string_literals[i].text.len == (size_t)text.len &&
+                (text.len == 0 ||
+                 memcmp(g->string_literals[i].text.str, text.str, (size_t)text.len) == 0)) {
+                LLVMValueRef global = g->string_literals[i].value;
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                LLVMTypeRef lit_ty = LLVMArrayType(i8, (unsigned)(16u + (size_t)text.len + 1u));
+                LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
+                return LLVMBuildGEP2(g->builder, lit_ty, global, idxs, 2, "str.lit.ptr");
+            }
         }
     }
 
@@ -618,10 +671,15 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     LLVMValueRef global = LLVMAddGlobal(g->mod, lit_ty, name);
     LLVMSetLinkage(global, LLVMPrivateLinkage);
     LLVMSetUnnamedAddr(global, LLVMGlobalUnnamedAddr);
-    unsigned char *blob = (unsigned char *)calloc(total, 1);
+    unsigned char stack_blob[256];
+    unsigned char *blob = total <= sizeof(stack_blob)
+        ? stack_blob
+        : (unsigned char *)malloc(total);
     if (!blob) return LLVMConstNull(LLVMPointerType(i8, 0));
-    memcpy(blob + 0, &((uint64_t){ ZAN_STRING_SENTINEL_RC }), 8);
-    memcpy(blob + 8, &((uint64_t){ ZAN_STR_HDR_WORD(text.len) }), 8);
+    uint64_t rc_word = ZAN_STRING_SENTINEL_RC;
+    uint64_t hdr_word = ZAN_STR_HDR_WORD(text.len);
+    memcpy(blob + 0, &rc_word, 8);
+    memcpy(blob + 8, &hdr_word, 8);
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
     bool obf = g->obfuscate_strings && text.len > 0;
@@ -644,18 +702,10 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
         g->obf_literal_count++;
     }
     LLVMSetGlobalConstant(global, obf ? 0 : 1);
-    LLVMValueRef *init_elems = (LLVMValueRef *)calloc(total, sizeof(LLVMValueRef));
-    if (!init_elems) {
-        free(blob);
-        return LLVMConstNull(LLVMPointerType(i8, 0));
-    }
-    for (size_t i = 0; i < total; i++) {
-        init_elems[i] = LLVMConstInt(i8, blob[i], 0);
-    }
-    LLVMValueRef init = LLVMConstArray(i8, init_elems, (unsigned)total);
+    LLVMValueRef init = LLVMConstStringInContext(
+        g->ctx, (const char *)blob, (unsigned)total, /*DontNullTerminate=*/1);
     LLVMSetInitializer(global, init);
-    free(init_elems);
-    free(blob);
+    if (blob != stack_blob) free(blob);
 
     LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
     LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, lit_ty, global, idxs, 2, "str.lit.ptr");
@@ -664,10 +714,13 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
                        g->string_literal_cap, 512)) {
         /* Guard messages can come from reusable stack buffers. The cache key
            must outlive their callers just like the emitted literal does. */
-        g->string_literals[g->string_literal_count].text = (zan_istr_t){
+        int idx = g->string_literal_count;
+        g->string_literals[idx].text = (zan_istr_t){
             zan_arena_strdup(g->arena, text.str, (size_t)text.len), text.len };
-        g->string_literals[g->string_literal_count].value = global;
+        g->string_literals[idx].value = global;
+        g->string_literals[idx].hash = hash;
         g->string_literal_count++;
+        strlit_index_insert(g, idx, hash);
     }
     return user_ptr;
 }
