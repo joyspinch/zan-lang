@@ -272,23 +272,27 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
      * error. */
     arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
 
-    LLVMValueRef elem_ptr, oob;
+    LLVMValueRef elem_ptr = NULL, oob;
+    LLVMValueRef idx_1d = NULL;
     if (arr_type->array_rank > 1) {
       elem_ptr =
           emit_mdarray_elem_ptr(g, arr_ptr, expr, elem_llvm, locals, &oob);
     } else {
-      LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+      idx_1d = emit_expr(g, expr->index.index, locals);
       LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
-      oob = emit_index_bounds_check(g, idx, arr_len, expr->loc, "array");
-      LLVMValueRef typed_arr = LLVMBuildBitCast(
-          g->builder, arr_ptr, LLVMPointerType(elem_llvm, 0), "arrp");
-      elem_ptr =
-          LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+      oob = emit_index_bounds_check(g, idx_1d, arr_len, expr->loc, "array");
     }
-    if (!g->runtime_checks || !g->current_fn)
+    if (!g->runtime_checks || !g->current_fn) {
+      if (!elem_ptr) {
+        LLVMValueRef typed_arr = LLVMBuildBitCast(
+            g->builder, arr_ptr, LLVMPointerType(elem_llvm, 0), "arrp");
+        elem_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr,
+                                         &idx_1d, 1, "eidx");
+      }
       return promote_loaded(
           g, LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
           arr_type->element_type);
+    }
 
     /* Only the valid edge may load an element, even on an empty array. */
     LLVMValueRef invalid =
@@ -301,6 +305,12 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMAppendBasicBlockInContext(g->ctx, fn, "arridx.done");
     LLVMBuildCondBr(g->builder, invalid, done_bb, load_bb);
     LLVMPositionBuilderAtEnd(g->builder, load_bb);
+    if (!elem_ptr) {
+      LLVMValueRef typed_arr = LLVMBuildBitCast(
+          g->builder, arr_ptr, LLVMPointerType(elem_llvm, 0), "arrp");
+      elem_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr,
+                                       &idx_1d, 1, "eidx");
+    }
     LLVMValueRef elem = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);

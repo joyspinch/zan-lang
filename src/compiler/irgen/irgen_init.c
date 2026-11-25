@@ -318,6 +318,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
   LLVMTypeRef malloc_args[] = {i64};
   LLVMTypeRef malloc_type = LLVMFunctionType(i8ptr, malloc_args, 1, 0);
   g->fn_malloc = LLVMAddFunction(g->mod, "malloc", malloc_type);
+  {
+    unsigned na = LLVMGetEnumAttributeKindForName("noalias", 7);
+    if (na)
+      LLVMAddAttributeAtIndex(g->fn_malloc, LLVMAttributeReturnIndex,
+                              LLVMCreateEnumAttribute(g->ctx, na, 0));
+  }
 
   LLVMTypeRef free_args[] = {i8ptr};
   LLVMTypeRef free_type =

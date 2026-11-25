@@ -309,8 +309,12 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
       g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
       get_calloc_fn(g), (LLVMValueRef[]){bytes, LLVMConstInt(i64, 1, 0)}, 2,
       "arr.raw");
-  LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
-  emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+  if (g->current_fn) {
+    zan_irgen_emit_oom_check(g, g->current_fn, raw);
+  } else {
+    LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
+    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+  }
   emit_rt_alloc_add(g, bytes);
   zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
                     LLVMConstInt(i64, 1, 0), "arr.rc");
@@ -329,7 +333,8 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
                       LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
   }
   LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
-  LLVMValueRef arr_ptr = LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
+  LLVMValueRef arr_ptr =
+      LLVMBuildInBoundsGEP2(g->builder, i8, raw, &off, 1, "arr");
   zan_register_array(g, arr_ptr, bytes, 0, elem_type);
   return arr_ptr;
 }
@@ -346,10 +351,15 @@ LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
   LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
   LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
   LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
-  return LLVMBuildLoad2(
+  LLVMValueRef ld = LLVMBuildLoad2(
       g->builder, i64,
       LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
       "arr.len");
+  LLVMSetAlignment(ld, 8);
+  /* 数组长度在分配后终生不可变，标 invariant.load 供 GVN/LICM/BCE 折叠与外提 */
+  unsigned inv_kind = LLVMGetMDKindIDInContext(g->ctx, "invariant.load", 14);
+  LLVMSetMetadata(ld, inv_kind, LLVMMDNodeInContext(g->ctx, NULL, 0));
+  return ld;
 }
 LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
                                LLVMTypeRef elem_llvm, zan_type_t *elem_type) {
@@ -380,8 +390,12 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
       g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
       get_calloc_fn(g), (LLVMValueRef[]){bytes, LLVMConstInt(i64, 1, 0)}, 2,
       "md.raw");
-  LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "md.null");
-  emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+  if (g->current_fn) {
+    zan_irgen_emit_oom_check(g, g->current_fn, raw);
+  } else {
+    LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "md.null");
+    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+  }
   emit_rt_alloc_add(g, bytes);
   LLVMValueRef hdri64 =
       LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "md.hdr");
@@ -396,12 +410,13 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
   for (int d = 0; d < rank; d++) {
     LLVMValueRef off =
         LLVMConstInt(i64, ZAN_ARR_HDR_SIZE / 8 + (unsigned long long)d, 0);
-    LLVMBuildStore(g->builder, dims[d],
-                   LLVMBuildGEP2(g->builder, i64, hdri64, &off, 1, "md.dim"));
+    LLVMBuildStore(
+        g->builder, dims[d],
+        LLVMBuildInBoundsGEP2(g->builder, i64, hdri64, &off, 1, "md.dim"));
   }
   LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
   LLVMValueRef arr_ptr =
-      LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
+      LLVMBuildInBoundsGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
   zan_register_array(g, arr_ptr, bytes, (uint64_t)rank * 8, elem_type);
   return arr_ptr;
 }

@@ -81,6 +81,7 @@ static _Alignas(64) int g_co_inited;
 static int g_co_workers;
 static _Thread_local zan_co_worker_t *t_co_self;
 static zan_co_worker_t *g_wk;
+static int g_wk_cap;
 
 static volatile LONG g_co_pool_live;
 static volatile LONG g_co_pool_fg;

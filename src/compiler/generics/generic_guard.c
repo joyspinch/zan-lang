@@ -711,7 +711,7 @@ void emit_oob_store_split(zan_irgen_t *g, LLVMValueRef oob,
   *end_bb = NULL;
   if (!g->runtime_checks || !g->current_fn)
     return;
-  if (LLVMIsConstant(oob))
+  if (!oob || (LLVMIsConstant(oob) && LLVMConstIntGetZExtValue(oob) == 0))
     return; /* 恒假：不切块 */
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
   *do_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sto.do");

@@ -576,13 +576,13 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
   LLVMSetAlignment(LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr),
                    8);
   LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-  LLVMValueRef site_ptr = LLVMBuildGEP2(
+  LLVMValueRef site_ptr = LLVMBuildInBoundsGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
   LLVMValueRef site_iptr =
       LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
   LLVMSetAlignment(LLVMBuildStore(g->builder, site, site_iptr), 8);
   LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
-  LLVMValueRef user_ptr = LLVMBuildGEP2(
+  LLVMValueRef user_ptr = LLVMBuildInBoundsGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
   if (g->rt_live_register_named) {
     LLVMValueRef zan_emit_live_on(zan_irgen_t *);
@@ -637,7 +637,7 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
   LLVMSetAlignment(LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr),
                    8);
   LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-  LLVMValueRef magic_ptr = LLVMBuildGEP2(
+  LLVMValueRef magic_ptr = LLVMBuildInBoundsGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "magicp");
   LLVMValueRef magic_iptr = LLVMBuildBitCast(
       g->builder, magic_ptr, LLVMPointerType(i64, 0), "magicip");
@@ -647,7 +647,7 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
                      magic_iptr),
       8);
   LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
-  LLVMValueRef user_ptr = LLVMBuildGEP2(
+  LLVMValueRef user_ptr = LLVMBuildInBoundsGEP2(
       g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
   if (g->rt_live_register) {
     LLVMValueRef zan_emit_live_on(zan_irgen_t *);
@@ -706,14 +706,16 @@ for (int rel = 0; rel < 2; rel++) {
   LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8t, obj, &rcoff, 1, "rcptr");
   LLVMValueRef rc_iptr =
       LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
-  LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
-  LLVMSetOrdering(rc, LLVMAtomicOrderingMonotonic);
-  LLVMSetAlignment(rc, 8);
-  emit_arc_freed_use_check(
-      g, fn, rc, obj, ZAN_ARC_FAULT_USE_ARR,
-      rel ? "release through a stale reference (array was already freed)"
-          : "retain through a stale reference (array was freed: missing "
-            "retain when stored)");
+  if (g->arc_guard && g->runtime_checks) {
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
+    LLVMSetOrdering(rc, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(rc, 8);
+    emit_arc_freed_use_check(
+        g, fn, rc, obj, ZAN_ARC_FAULT_USE_ARR,
+        rel ? "release through a stale reference (array was already freed)"
+            : "retain through a stale reference (array was freed: missing "
+              "retain when stored)");
+  }
   if (!rel) {
     LLVMValueRef rc_pre = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd,
                                              rc_iptr, LLVMConstInt(i64t, 1, 0),

@@ -140,14 +140,21 @@ void zan_co_sched_init(void) {
     atexit(co_stats_dump);
     g_co_inited = 1;
   }
-  if (!g_wk) {
-    g_wk = (zan_co_worker_t *)calloc(ZAN_CO_MAXW, sizeof(zan_co_worker_t));
+  int nw = co_worker_count();
+  if (nw > g_wk_cap) {
+    if (g_wk) {
+      for (int i = 0; i < g_wk_cap; i++)
+        DeleteCriticalSection(&g_wk[i].queue_lock);
+      free(g_wk);
+    }
+    g_wk = (zan_co_worker_t *)calloc((size_t)nw, sizeof(zan_co_worker_t));
     if (!g_wk)
       zan_rt_fatal("oom", "co_sched: worker table alloc failed");
-    for (int i = 0; i < ZAN_CO_MAXW; i++)
+    for (int i = 0; i < nw; i++)
       InitializeCriticalSection(&g_wk[i].queue_lock);
+    g_wk_cap = nw;
   }
-  g_co_workers = co_worker_count();
+  g_co_workers = nw;
   g_rq_head = g_rq_tail = NULL;
   zan_timer_runtime_reset();
   zan_timer_set_ready_hook(zan_co_ready);
@@ -172,7 +179,7 @@ void zan_co_sched_init(void) {
   g_inj_len = 0;
   g_inj_push_ext = 0;
   LeaveCriticalSection(&g_inj_lock);
-  for (int i = 0; i < ZAN_CO_MAXW; i++) {
+  for (int i = 0; i < g_co_workers; i++) {
     zan_co_worker_t *w = &g_wk[i];
     w->head = w->tail = 0;
     __atomic_store_n(&w->lifo_full, 0, __ATOMIC_RELEASE);

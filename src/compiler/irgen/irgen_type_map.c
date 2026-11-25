@@ -991,6 +991,10 @@ LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0);
     f = LLVMAddFunction(g->mod, "calloc", ft);
+    unsigned na = LLVMGetEnumAttributeKindForName("noalias", 7);
+    if (na)
+      LLVMAddAttributeAtIndex(f, LLVMAttributeReturnIndex,
+                              LLVMCreateEnumAttribute(g->ctx, na, 0));
   }
   return f;
 }

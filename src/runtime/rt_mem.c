@@ -142,10 +142,17 @@ void *__real_realloc(void *p, size_t n);
 #define ZAN_MEM_PAGE_SHIFT  14
 #define ZAN_MEM_PAGE        (1u << ZAN_MEM_PAGE_SHIFT)       /* 16 KiB */
 #define ZAN_MEM_PAGES       (ZAN_MEM_SLAB / ZAN_MEM_PAGE)    /* 64 */
+#define ZAN_MEM_COMMIT_CHUNK (4u * ZAN_MEM_PAGE)             /* 64 KiB */
 
-typedef struct {
+typedef struct zan_mem_slab_meta {
   struct zan_mem_cache *owner[ZAN_MEM_PAGES];
-  uint8_t cls1[ZAN_MEM_PAGES]; /* 尺寸类 + 1；0 = 页未分配 */
+  uint8_t cls1[ZAN_MEM_PAGES];       /* 尺寸类 + 1；0 = 页未分配/已回收 */
+  uint16_t trim_cnt[ZAN_MEM_PAGES];  /* 仅在 g_trim_lock 下由 zan_mem_trim 使用 */
+  uint64_t trim_touched;             /* 本轮 trim 触及的页位图 */
+  uint64_t reclaimed_mask;           /* 仅在 zan_mem_lock 下：已反提交、可跨类复用的空页 */
+  struct zan_mem_slab_meta *trim_next;
+  struct zan_mem_slab_meta *reclaimed_next;
+  uint8_t in_reclaimed_list;
 } zan_mem_slab_meta;
 
 _Static_assert(sizeof(zan_mem_slab_meta) <= ZAN_MEM_PAGE,
@@ -198,6 +205,7 @@ typedef struct zan_mem_cache {
   char *page_end[ZAN_MEM_NCLASS];
   char *bump;             /* owner-only: 当前 slab 未分出的页区间 */
   char *bump_end;         /* owner-only */
+  char *bump_committed;   /* owner-only: Windows 已提交上界（按 64 KiB 块按需提交） */
   int bump_decommitted;   /* unallocated bump pages decommitted to OS */
   uint32_t alloc_batch;   /* owner-only: 批次累计后刷入 g_small_alloc_count */
   uint32_t remote_mask;   /* 非空远端释放条带位图，免去空条带 8 次 XCHG */
@@ -209,6 +217,8 @@ typedef struct zan_mem_cache {
 } zan_mem_cache;
 
 static zan_mem_cache *g_cache_pool;
+static zan_mem_slab_meta *g_reclaimed_head;
+static volatile int g_trim_lock;
 
 static unsigned g_remote_rr;
 
@@ -293,6 +303,17 @@ static void zan_mem_lock(void) {
 }
 
 static void zan_mem_unlock(void) { __sync_lock_release(&g_slab_lock); }
+
+static void zan_mem_trim_lock(void) {
+  for (int spins = 0;; spins++) {
+    if (!__atomic_load_n(&g_trim_lock, __ATOMIC_RELAXED) &&
+        !__sync_lock_test_and_set(&g_trim_lock, 1))
+      return;
+    zan_mem_backoff(spins);
+  }
+}
+
+static void zan_mem_trim_unlock(void) { __sync_lock_release(&g_trim_lock); }
 
 static void zan_mem_build_classes(void) {
   int c = 0;
@@ -489,11 +510,16 @@ static void zan_mem_retire(zan_mem_cache *c) {
   zan_mem_drain_remote_all(c);
   if (c->bump && c->bump_end && !c->bump_decommitted) {
     uintptr_t start = ((uintptr_t)c->bump + 4095) & ~(uintptr_t)4095;
+#if defined(_WIN32)
+    uintptr_t end = (uintptr_t)c->bump_committed & ~(uintptr_t)4095;
+#else
     uintptr_t end = (uintptr_t)c->bump_end & ~(uintptr_t)4095;
+#endif
     if (end > start && (end - start) >= 65536) {
       size_t bytes = end - start;
 #if defined(_WIN32)
       VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+      c->bump_committed = c->bump;
 #elif defined(ZAN_MEM_HAVE_MMAP)
       madvise((void *)start, bytes, MADV_DONTNEED);
 #endif
@@ -558,9 +584,11 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     if ((size_t)(rc->bump_end - rc->bump) >= need) {
       c->bump = rc->bump;
       c->bump_end = rc->bump_end;
+      c->bump_committed = rc->bump_committed;
       c->bump_decommitted = rc->bump_decommitted;
       rc->bump = NULL;
       rc->bump_end = NULL;
+      rc->bump_committed = NULL;
       rc->bump_decommitted = 0;
       zan_mem_unlock();
       return 1;
@@ -629,6 +657,11 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
   /* 第 0 页是页表（mmap/VirtualAlloc 交来即为零：全部页未分配） */
   c->bump = (char *)base + ZAN_MEM_PAGE;
   c->bump_end = (char *)base + ZAN_MEM_SLAB;
+#if defined(_WIN32)
+  c->bump_committed = c->bump;
+#else
+  c->bump_committed = c->bump_end;
+#endif
   c->bump_decommitted = 0;
   return 1;
 }
@@ -641,7 +674,9 @@ static int zan_mem_new_slab(zan_mem_cache *c) {
     return 0;
   uintptr_t base =
       ((uintptr_t)raw + (ZAN_MEM_SLAB - 1)) & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
-  if (!VirtualAlloc((void *)base, ZAN_MEM_SLAB, MEM_COMMIT, PAGE_READWRITE)) {
+  /* 仅先提交第 0 页（slab 页表），数据页在切页时按 64 KiB 块按需提交，
+   * 避免多 worker 线程少量小分配就预占整块 1 MiB 提交配额。 */
+  if (!VirtualAlloc((void *)base, ZAN_MEM_PAGE, MEM_COMMIT, PAGE_READWRITE)) {
     VirtualFree(raw, 0, MEM_RELEASE);
     return 0;
   }
@@ -681,6 +716,46 @@ static int zan_mem_new_slab(zan_mem_cache *c) {
 #endif
 }
 
+static char *zan_mem_pop_reclaimed_page(void) {
+  if (!__atomic_load_n(&g_reclaimed_head, __ATOMIC_ACQUIRE))
+    return NULL;
+  zan_mem_lock();
+  zan_mem_slab_meta *m = g_reclaimed_head;
+  while (m && m->reclaimed_mask == 0) {
+    m->in_reclaimed_list = 0;
+    m = m->reclaimed_next;
+    __atomic_store_n(&g_reclaimed_head, m, __ATOMIC_RELEASE);
+  }
+  if (!m) {
+    zan_mem_unlock();
+    return NULL;
+  }
+  unsigned pi = (unsigned)__builtin_ctzll(m->reclaimed_mask);
+  m->reclaimed_mask &= ~(1ull << pi);
+  if (m->reclaimed_mask == 0) {
+    m->in_reclaimed_list = 0;
+    __atomic_store_n(&g_reclaimed_head, m->reclaimed_next, __ATOMIC_RELEASE);
+    m->reclaimed_next = NULL;
+  }
+  zan_mem_unlock();
+
+  char *page = (char *)m + (size_t)pi * ZAN_MEM_PAGE;
+#if defined(_WIN32)
+  if (!VirtualAlloc((void *)page, ZAN_MEM_PAGE, MEM_COMMIT, PAGE_READWRITE)) {
+    zan_mem_lock();
+    m->reclaimed_mask |= (1ull << pi);
+    if (!m->in_reclaimed_list) {
+      m->reclaimed_next = g_reclaimed_head;
+      m->in_reclaimed_list = 1;
+      __atomic_store_n(&g_reclaimed_head, m, __ATOMIC_RELEASE);
+    }
+    zan_mem_unlock();
+    return NULL;
+  }
+#endif
+  return page;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
@@ -692,29 +767,32 @@ static void *zan_mem_small_slow(zan_mem_cache *c, int cls, size_t sz) {
     return p;
   }
   if (!zan_mem_adopt_retired_page(c, cls)) {
-    /* 从当前 slab 的未分出页区间切一整页给这个类 */
-    if ((size_t)(c->bump_end - c->bump) < ZAN_MEM_PAGE) {
-      if (!zan_mem_adopt_retired_bump(c, ZAN_MEM_PAGE)) {
-        if (!zan_mem_new_slab(c))
-          return NULL;
+    char *page = zan_mem_pop_reclaimed_page();
+    if (!page) {
+      /* 从当前 slab 的未分出页区间切一整页给这个类 */
+      if ((size_t)(c->bump_end - c->bump) < ZAN_MEM_PAGE) {
+        if (!zan_mem_adopt_retired_bump(c, ZAN_MEM_PAGE)) {
+          if (!zan_mem_new_slab(c))
+            return NULL;
+        }
       }
-    }
 #if defined(_WIN32)
-    if (c->bump_decommitted) {
-      uintptr_t start = ((uintptr_t)c->bump + 4095) & ~(uintptr_t)4095;
-      uintptr_t end = (uintptr_t)c->bump_end & ~(uintptr_t)4095;
-      if (end > start) {
-        if (!VirtualAlloc((void *)start, end - start, MEM_COMMIT,
-                          PAGE_READWRITE))
+      if (c->bump_decommitted ||
+          c->bump_committed <= c->bump ||
+          (size_t)(c->bump_committed - c->bump) < ZAN_MEM_PAGE) {
+        size_t avail = (size_t)(c->bump_end - c->bump);
+        size_t chunk = avail < ZAN_MEM_COMMIT_CHUNK ? avail : ZAN_MEM_COMMIT_CHUNK;
+        if (!VirtualAlloc((void *)c->bump, chunk, MEM_COMMIT, PAGE_READWRITE))
           return NULL;
+        c->bump_committed = c->bump + chunk;
+        c->bump_decommitted = 0;
       }
-      c->bump_decommitted = 0;
-    }
 #else
-    c->bump_decommitted = 0;
+      c->bump_decommitted = 0;
 #endif
-    char *page = c->bump;
-    c->bump += ZAN_MEM_PAGE;
+      page = c->bump;
+      c->bump += ZAN_MEM_PAGE;
+    }
     unsigned pi;
     zan_mem_slab_meta *m = zan_mem_meta_of(page, &pi);
     __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELAXED);
@@ -769,18 +847,139 @@ static void *zan_mem_small(size_t n) {
   return zan_mem_small_slow(c, cls, sz);
 }
 
+/* 在 g_trim_lock 保护下扫描缓存的各尺寸类空闲链：若某个 16 KiB 页的全部
+ * cap 个块都在空闲链中（零活对象），将其摘链、清页表并反提交给 OS，挂入
+ * slab 的 reclaimed_mask 供后续任意尺寸类跨类复用（热路径零开销）。 */
+static size_t zan_mem_trim_cache_pages(zan_mem_cache *c, int lock_held) {
+  size_t trimmed = 0;
+  zan_mem_drain_remote_all(c);
+  for (int cls = 0; cls < ZAN_MEM_NCLASS; cls++) {
+    void *head = c->free_list[cls];
+    if (!head)
+      continue;
+    size_t sz = k_class_size[cls];
+    uint16_t cap = (uint16_t)(ZAN_MEM_PAGE / sz);
+    uintptr_t partial_page = 0;
+    if (c->page_bump[cls] &&
+        (size_t)(c->page_end[cls] - c->page_bump[cls]) >= sz) {
+      partial_page =
+          (uintptr_t)c->page_bump[cls] & ~(uintptr_t)(ZAN_MEM_PAGE - 1);
+    }
+
+    zan_mem_slab_meta *touched = NULL;
+    int found_empty = 0;
+    for (void *p = head; p; p = *(void **)p) {
+      unsigned pi;
+      zan_mem_slab_meta *m = zan_mem_meta_of(p, &pi);
+      if (m->trim_touched == 0) {
+        m->trim_next = touched;
+        touched = m;
+      }
+      m->trim_touched |= (1ull << pi);
+      uint16_t cnt = ++m->trim_cnt[pi];
+      if (cnt == cap) {
+        uintptr_t paddr = (uintptr_t)m + (size_t)pi * ZAN_MEM_PAGE;
+        if (paddr != partial_page)
+          found_empty = 1;
+      }
+    }
+
+    if (found_empty) {
+      void **pp = &c->free_list[cls];
+      while (*pp) {
+        void *cur = *pp;
+        unsigned pi;
+        zan_mem_slab_meta *m = zan_mem_meta_of(cur, &pi);
+        uintptr_t paddr = (uintptr_t)m + (size_t)pi * ZAN_MEM_PAGE;
+        if (m->trim_cnt[pi] == cap && paddr != partial_page) {
+          *pp = *(void **)cur;
+        } else {
+          pp = (void **)cur;
+        }
+      }
+      if (c->page_bump[cls] && !partial_page) {
+        unsigned pi;
+        zan_mem_slab_meta *m = zan_mem_meta_of(c->page_end[cls] - 1, &pi);
+        if (m->trim_cnt[pi] == cap) {
+          c->page_bump[cls] = NULL;
+          c->page_end[cls] = NULL;
+        }
+      }
+      for (zan_mem_slab_meta *m = touched; m;) {
+        zan_mem_slab_meta *next = m->trim_next;
+        uint64_t mask = m->trim_touched;
+        uint64_t reclaimed = 0;
+        while (mask) {
+          unsigned pi = (unsigned)__builtin_ctzll(mask);
+          mask &= mask - 1ull;
+          uintptr_t paddr = (uintptr_t)m + (size_t)pi * ZAN_MEM_PAGE;
+          if (m->trim_cnt[pi] == cap && paddr != partial_page) {
+            __atomic_store_n(&m->cls1[pi], 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&m->owner[pi], NULL, __ATOMIC_RELEASE);
+#if defined(_WIN32)
+            VirtualFree((void *)paddr, ZAN_MEM_PAGE, MEM_DECOMMIT);
+#elif defined(ZAN_MEM_HAVE_MMAP)
+            madvise((void *)paddr, ZAN_MEM_PAGE, MADV_DONTNEED);
+#endif
+            reclaimed |= (1ull << pi);
+            trimmed += ZAN_MEM_PAGE;
+          }
+          m->trim_cnt[pi] = 0;
+        }
+        m->trim_touched = 0;
+        m->trim_next = NULL;
+        if (reclaimed) {
+          if (!lock_held)
+            zan_mem_lock();
+          m->reclaimed_mask |= reclaimed;
+          if (!m->in_reclaimed_list) {
+            m->reclaimed_next = g_reclaimed_head;
+            m->in_reclaimed_list = 1;
+            __atomic_store_n(&g_reclaimed_head, m, __ATOMIC_RELEASE);
+          }
+          if (!lock_held)
+            zan_mem_unlock();
+        }
+        m = next;
+      }
+    } else {
+      for (zan_mem_slab_meta *m = touched; m;) {
+        zan_mem_slab_meta *next = m->trim_next;
+        uint64_t mask = m->trim_touched;
+        while (mask) {
+          unsigned pi = (unsigned)__builtin_ctzll(mask);
+          mask &= mask - 1ull;
+          m->trim_cnt[pi] = 0;
+        }
+        m->trim_touched = 0;
+        m->trim_next = NULL;
+        m = next;
+      }
+    }
+  }
+  return trimmed;
+}
+
 size_t zan_mem_trim(void) {
   size_t total_trimmed = 0;
+  /* 锁顺序固定：g_trim_lock -> zan_mem_lock，杜绝死锁。 */
+  zan_mem_trim_lock();
   zan_mem_lock();
   for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
+    total_trimmed += zan_mem_trim_cache_pages(rc, 1);
     if (!rc->bump || !rc->bump_end || rc->bump_decommitted)
       continue;
     uintptr_t start = ((uintptr_t)rc->bump + 4095) & ~(uintptr_t)4095;
+#if defined(_WIN32)
+    uintptr_t end = (uintptr_t)rc->bump_committed & ~(uintptr_t)4095;
+#else
     uintptr_t end = (uintptr_t)rc->bump_end & ~(uintptr_t)4095;
+#endif
     if (end > start) {
       size_t bytes = end - start;
 #if defined(_WIN32)
       VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+      rc->bump_committed = rc->bump;
 #elif defined(ZAN_MEM_HAVE_MMAP)
       madvise((void *)start, bytes, MADV_DONTNEED);
 #endif
@@ -791,20 +990,29 @@ size_t zan_mem_trim(void) {
   zan_mem_unlock();
 
   zan_mem_cache *self = t_cache;
-  if (self && self->bump && self->bump_end && !self->bump_decommitted) {
-    uintptr_t start = ((uintptr_t)self->bump + 4095) & ~(uintptr_t)4095;
-    uintptr_t end = (uintptr_t)self->bump_end & ~(uintptr_t)4095;
-    if (end > start && (end - start) >= 65536) {
-      size_t bytes = end - start;
+  if (self) {
+    total_trimmed += zan_mem_trim_cache_pages(self, 0);
+    if (self->bump && self->bump_end && !self->bump_decommitted) {
+      uintptr_t start = ((uintptr_t)self->bump + 4095) & ~(uintptr_t)4095;
 #if defined(_WIN32)
-      VirtualFree((void *)start, bytes, MEM_DECOMMIT);
-#elif defined(ZAN_MEM_HAVE_MMAP)
-      madvise((void *)start, bytes, MADV_DONTNEED);
+      uintptr_t end = (uintptr_t)self->bump_committed & ~(uintptr_t)4095;
+#else
+      uintptr_t end = (uintptr_t)self->bump_end & ~(uintptr_t)4095;
 #endif
-      self->bump_decommitted = 1;
-      total_trimmed += bytes;
+      if (end > start && (end - start) >= 65536) {
+        size_t bytes = end - start;
+#if defined(_WIN32)
+        VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+        self->bump_committed = self->bump;
+#elif defined(ZAN_MEM_HAVE_MMAP)
+        madvise((void *)start, bytes, MADV_DONTNEED);
+#endif
+        self->bump_decommitted = 1;
+        total_trimmed += bytes;
+      }
     }
   }
+  zan_mem_trim_unlock();
 
   if (total_trimmed > 0) {
     __atomic_fetch_add(&g_trimmed_bytes, total_trimmed, __ATOMIC_RELAXED);
