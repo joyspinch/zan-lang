@@ -466,6 +466,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
+| `ZAN_UI_DUMP` | GUI 程序**运行期**（仅以 `-DZAN_UI_AUTOMATION` 编译的程序认）：设为文件路径时，首帧完整呈现后把当前窗口的语义树写成 JSON 并退出（S21）。每个节点：`kind`（角色）、`name`、`text`、`value`、`isChecked`、`enabled`（按祖先链折算）、`visible`、`focused`、`x/y/w/h` 与首选尺寸、`kids`。普通与发布构建不带 UiDriver，此变量无效。`ZAN_UI_SCRIPT`（UiDriver 脚本）同样只在这类构建里生效 |
 | `ZAN_CYCLE_AUDIT` | **编译期**：设为非 `0` 时 S11 类型图强环检查（W2111）连标准库与 packages 里的类一起报，用于库审计；默认只报用户代码 |
 | `ZAN_LEAK_LOG` | `--check-leaks` 产物退出时把泄漏报表副本追加到此路径（默认工作目录下 `zan_leaks.log`；设为空串只打印不落盘）。测试驱动指向 `build/test-out/leaks/<用例>.log`，不再污染仓库根 |
 | `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |

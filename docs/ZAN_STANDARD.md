@@ -191,7 +191,9 @@ S11 + S12 预计覆盖 GUI 场景绝大部分泄漏来源（父子节点、事�
 - 与 GUI_REFACTOR 保留的「元数据驱动按名路径」兼容：设计器仍可按名操作，但编译期
   已验证名字存在。
 
-**S21 语义树为唯一事实来源。** 每个控件暴露 role / name / state / bounds / enabled：
+**S21 语义树为唯一事实来源。**（已落地：以 `-DZAN_UI_AUTOMATION` 编译的程序在
+`ZAN_UI_DUMP=<文件>` 下首帧后导出，字段见 docs/ZANC_CLI.md 环境变量表；`zan run` 子命令
+尚不存在，以环境变量代替。）每个控件暴露 role / name / state / bounds / enabled：
 
 ```bash
 zan run app.zan --ui-dump json   # 输出当前窗口语义树快照

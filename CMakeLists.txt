@@ -8780,6 +8780,13 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/diag-fixits)
   set_tests_properties(diag_fixits_apply PROPERTIES TIMEOUT 600)
+  # S21（docs/ZAN_STANDARD.md §5）：-DZAN_UI_AUTOMATION 编译的 GUI 程序在
+  # ZAN_UI_DUMP=<文件> 下首帧后导出语义树（角色/名字/文本/值/勾选/enabled/区间）并退出。
+  add_test(NAME gui_ui_dump_semantic_tree
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_ui_dump.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR} --drivers ${CMAKE_BINARY_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out/ui-dump)
+  set_tests_properties(gui_ui_dump_semantic_tree PROPERTIES TIMEOUT 600)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
