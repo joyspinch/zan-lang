@@ -60,6 +60,16 @@ static LLVMValueRef list_repack_fn(zan_irgen_t *g) {
         (LLVMTypeRef[]){ ptr, i64 }, 2, 0);
     fn = LLVMAddFunction(g->mod, "__zan_list_repack", fty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
+    {
+        static const char *const attrs[] = { "noinline", "cold", "nounwind" };
+        for (size_t i = 0; i < 3; i++) {
+            unsigned k = LLVMGetEnumAttributeKindForName(attrs[i], strlen(attrs[i]));
+            if (k) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                           LLVMCreateEnumAttribute(c, k, 0));
+        }
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(c, nc, 0));
+    }
     LLVMBuilderRef b = LLVMCreateBuilderInContext(c);
     LLVMValueRef lp = LLVMGetParam(fn, 0), want = LLVMGetParam(fn, 1);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
@@ -191,7 +201,17 @@ LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr,
     LLVMBasicBlockRef fix = LLVMAppendBasicBlockInContext(g->ctx, fn, "lw.fix");
     LLVMBasicBlockRef ok = LLVMAppendBasicBlockInContext(g->ctx, fn, "lw.ok");
     LLVMValueRef same = LLVMBuildICmp(g->builder, LLVMIntEQ, esz, want, "lw.same");
-    LLVMBuildCondBr(g->builder, same, ok, fix);
+    LLVMValueRef br = LLVMBuildCondBr(g->builder, same, ok, fix);
+    {
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef md_elems[3] = {
+            LLVMMDStringInContext(g->ctx, "branch_weights", 14),
+            LLVMConstInt(i32t, 2000, 0),
+            LLVMConstInt(i32t, 1, 0),
+        };
+        unsigned prof_kind = LLVMGetMDKindIDInContext(g->ctx, "prof", 4);
+        LLVMSetMetadata(br, prof_kind, LLVMMDNodeInContext(g->ctx, md_elems, 3));
+    }
     LLVMPositionBuilderAtEnd(g->builder, fix);
     LLVMValueRef rfn = list_repack_fn(g);
     LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(rfn), rfn,
@@ -217,11 +237,11 @@ LLVMValueRef list_elem_ptr(zan_irgen_t *g, LLVMValueRef data, LLVMValueRef idx,
     int tag = list_elem_tag(g, et);
     if (!tag) {
         LLVMValueRef widx = slot_word_index(g, idx, elem_slot_words(g, et));
-        return LLVMBuildGEP2(g->builder, LLVMInt64TypeInContext(g->ctx), data,
-                             &widx, 1, nm ? nm : "ep");
+        return LLVMBuildInBoundsGEP2(g->builder, LLVMInt64TypeInContext(g->ctx), data,
+                                     &widx, 1, nm ? nm : "ep");
     }
-    return LLVMBuildGEP2(g->builder, list_slot_type(g, et), data, &idx, 1,
-                         nm ? nm : "ep");
+    return LLVMBuildInBoundsGEP2(g->builder, list_slot_type(g, et), data, &idx, 1,
+                                 nm ? nm : "ep");
 }
 /* 读槽并还原成规范 8 字节槽字（窄槽按类型符号扩展/零扩展）。 */
 LLVMValueRef list_slot_load_word(zan_irgen_t *g, LLVMValueRef ep, zan_type_t *et,

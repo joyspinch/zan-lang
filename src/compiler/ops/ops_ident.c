@@ -234,13 +234,11 @@ LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
         }
         LLVMValueRef lc = emit_str_nonnull(g, left);
         LLVMValueRef rc = emit_str_nonnull(g, right);
-        /* 带长度感知的字符串字典序比对（防止嵌入 0 截断） */
-        LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, (zan_loc_t){0});
-        LLVMValueRef cmp = zan_call2(
-            g->builder, LLVMGlobalGetValueType(ocmp), ocmp,
-            (LLVMValueRef[]){lc, rc}, 2, "eq.str");
-        return zan_icmp(g->builder, LLVMIntEQ, cmp,
-                        LLVMConstInt(i32, 0, 0), "eq.s");
+        /* 带长度感知的字符串等值比对（长度不等短路跳过 memcmp，防嵌入 0 截断） */
+        LLVMValueRef eqfn = get_str_eq_fn(g, (zan_loc_t){0});
+        return zan_call2(
+            g->builder, LLVMGlobalGetValueType(eqfn), eqfn,
+            (LLVMValueRef[]){lc, rc}, 2, "eq.s");
     }
     if (type && type->kind == TYPE_STRUCT) {
         LLVMTypeRef st = map_type(g, type);

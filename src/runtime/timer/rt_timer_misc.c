@@ -168,20 +168,46 @@ __attribute__((weak)) size_t zan_mem_trim(void) { return 0; }
  * bare 编译（ZAN_BARE_METAL）走本文件确定性盐分支。SipHash 本体共享于
  * rt_siphash.h （性质探针：雪崩 0.4999、10^6 键 2^16 桶
  * max/mean=2.23、跨盐同桶率 ≈1/256）。 */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZAN_RT_NOINLINE __attribute__((noinline))
+#define ZAN_RT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define ZAN_RT_NOINLINE
+#define ZAN_RT_UNLIKELY(x) (x)
+#endif
+
+/* O(1) 读取 Zan 字符串头部缓存长度，失败时回退扫描/strlen。
+ * 与 IR 侧 zan_hdr_page_ok 对齐：仅当地址距离 4 KiB 页首 >= 16 字节时
+ * 才安全读取 [-8] 头部字，防止外来 C 串贴页首时跨页读缺页。 */
+static inline size_t zan_dict_str_len_fast(const char *s, int use_strlen) {
+  if ((((uintptr_t)s) & 4080u) != 0) {
+    uint64_t hdr;
+    memcpy(&hdr, s - 8, sizeof(hdr));
+    if ((hdr >> 32) == (uint64_t)ZAN_STRING_TAG) {
+      uint32_t cached = (uint32_t)(hdr & (uint64_t)ZAN_STR_LEN_MASK);
+      if (cached != (uint32_t)ZAN_STR_LEN_UNKNOWN)
+        return (size_t)cached;
+    }
+  }
+  if (use_strlen)
+    return strlen(s);
+  size_t n = 0;
+  while (s[n])
+    n++;
+  return n;
+}
+
 #if defined(ZAN_BARE_METAL)
 
 /* bare：无 OS 熵源，确定性盐（行为可复现，威胁模型同 wasm 说明） */
 int64_t __zan_dict_hash(const void *key, int64_t is_str) {
-  if (key == NULL)
+  if (ZAN_RT_UNLIKELY(key == NULL))
     return 0;
   const uint64_t k0 = 0x5a4e483153344801ull; /* "ZNH1S4H" */
   const uint64_t k1 = 0x9e3779b97f4a7c15ull;
   if (is_str) {
-    size_t n = 0;
-    const char *c = (const char *)key;
-    while (c[n])
-      n++;
-    return (int64_t)zan_siphash13(key, n, k0, k1);
+    return (int64_t)zan_siphash13(key, zan_dict_str_len_fast((const char *)key, 0),
+                                  k0, k1);
   }
   return (int64_t)zan_siphash13(&key, sizeof(key), k0, k1);
 }
@@ -232,25 +258,31 @@ static void zan_hash_salt_fill(uint64_t *k0, uint64_t *k1) {
 #endif
 }
 
-int64_t __zan_dict_hash(const void *key, int64_t is_str) {
-  if (key == NULL)
-    return 0;
-  if (!__atomic_load_n(&zan_hash_salt_ready, __ATOMIC_ACQUIRE)) {
-    while (__atomic_exchange_n(&zan_hash_salt_lock, 1L, __ATOMIC_ACQUIRE)) {
-    }
-    if (!__atomic_load_n(&zan_hash_salt_ready, __ATOMIC_RELAXED)) {
-      zan_hash_salt_fill(&zan_hash_salt_k0, &zan_hash_salt_k1);
-      __atomic_store_n(&zan_hash_salt_ready, 1, __ATOMIC_RELEASE);
-    }
-    __atomic_store_n(&zan_hash_salt_lock, 0L, __ATOMIC_RELEASE);
+static ZAN_RT_NOINLINE void zan_hash_salt_init_slow(void) {
+  while (__atomic_exchange_n(&zan_hash_salt_lock, 1L, __ATOMIC_ACQUIRE)) {
   }
+  if (!__atomic_load_n(&zan_hash_salt_ready, __ATOMIC_RELAXED)) {
+    zan_hash_salt_fill(&zan_hash_salt_k0, &zan_hash_salt_k1);
+    __atomic_store_n(&zan_hash_salt_ready, 1, __ATOMIC_RELEASE);
+  }
+  __atomic_store_n(&zan_hash_salt_lock, 0L, __ATOMIC_RELEASE);
+}
+
+int64_t __zan_dict_hash(const void *key, int64_t is_str) {
+  if (ZAN_RT_UNLIKELY(key == NULL))
+    return 0;
+  if (ZAN_RT_UNLIKELY(
+          !__atomic_load_n(&zan_hash_salt_ready, __ATOMIC_ACQUIRE))) {
+    zan_hash_salt_init_slow();
+  }
+  uint64_t k0 = zan_hash_salt_k0;
+  uint64_t k1 = zan_hash_salt_k1;
   if (is_str) {
-    return (int64_t)zan_siphash13(key, strlen((const char *)key),
-                                  zan_hash_salt_k0, zan_hash_salt_k1);
+    return (int64_t)zan_siphash13(key, zan_dict_str_len_fast((const char *)key, 1),
+                                  k0, k1);
   }
   /* 非字符串键走引用同一性：哈希指针 8 字节（同进程内稳定） */
-  return (int64_t)zan_siphash13(&key, sizeof(key), zan_hash_salt_k0,
-                                zan_hash_salt_k1);
+  return (int64_t)zan_siphash13(&key, sizeof(key), k0, k1);
 }
 
 #endif /* !ZAN_BARE_METAL */

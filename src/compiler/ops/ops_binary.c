@@ -235,22 +235,20 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             return out;
         }
 
-        /* 托管字符串内容判等 */
+        /* 托管字符串内容判等：走长度短路 __zan_str_eq，长度不等直接跳过 memcmp */
         if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) &&
             both_ptr && str_operand &&
             expr->binary.left->kind != AST_NULL_LITERAL &&
             expr->binary.right->kind != AST_NULL_LITERAL) {
-            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
             LLVMValueRef lc = emit_str_nonnull(g, left);
             LLVMValueRef rc = emit_str_nonnull(g, right);
-            /* 带长度的托管字符串字典序比对 */
-            LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
-            LLVMValueRef r = zan_call2(g->builder,
-                LLVMGlobalGetValueType(ocmp), ocmp,
-                (LLVMValueRef[]){ lc, rc }, 2, "scmp");
-            LLVMValueRef seq = zan_icmp(g->builder,
-                expr->binary.op == TK_EQ_EQ ? LLVMIntEQ : LLVMIntNE,
-                r, LLVMConstInt(i32t, 0, 0), "seq");
+            LLVMValueRef eqfn = get_str_eq_fn(g, expr->loc);
+            LLVMValueRef eq = zan_call2(g->builder,
+                LLVMGlobalGetValueType(eqfn), eqfn,
+                (LLVMValueRef[]){ lc, rc }, 2, "seq");
+            LLVMValueRef seq = expr->binary.op == TK_EQ_EQ
+                ? eq
+                : LLVMBuildNot(g->builder, eq, "sne");
             if (is_string_expr(g, expr->binary.left, locals) &&
                 expr_yields_owned_rc_value(g, expr->binary.left, locals)) {
                 emit_string_release(g, left);

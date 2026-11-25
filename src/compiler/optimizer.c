@@ -1637,7 +1637,8 @@ static bool shrink_decl_safe_nounwind(const char *n) {
       strcmp(n, "zan_rt_str_bytes") == 0 ||
       strcmp(n, "zan_rt_arr_len") == 0 ||
       strcmp(n, "zan_rt_bound_check") == 0 ||
-      strcmp(n, "zan_bound_check") == 0)
+      strcmp(n, "zan_bound_check") == 0 ||
+      strcmp(n, "__zan_dict_hash") == 0)
     return true;
   return false;
 }

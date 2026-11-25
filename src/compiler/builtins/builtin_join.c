@@ -155,19 +155,17 @@ static LLVMValueRef emit_dict_key_eq(zan_irgen_t *g, zan_type_t *dict_type,
                    (LLVMValueRef[]){kv, search, is_str}, 3, "keq");
 }
 
-/* 发射`__zan_dict_find(dict, key, is_str)` for a dict of type `dict_type` */
+/* 发射特化版 `__zan_dict_find_str / __zan_dict_find_raw(dict, key)` */
 LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                             LLVMValueRef draw, LLVMValueRef key) {
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   zan_type_t *kt = dict_key_type(g, dict_type);
-  LLVMValueRef is_str =
-      LLVMConstInt(i64, (!kt || kt->kind == TYPE_STRING) ? 1 : 0, 0);
-  LLVMValueRef fn = get_dict_find_fn(g);
+  int is_str = (!kt || kt->kind == TYPE_STRING) ? 1 : 0;
+  LLVMValueRef fn = get_dict_find_spec_fn(g, is_str);
   if (LLVMTypeOf(draw) != i8ptr)
     draw = LLVMBuildBitCast(g->builder, draw, i8ptr, "d8");
   return zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn,
-                   (LLVMValueRef[]){draw, key, is_str}, 3, "dfind");
+                   (LLVMValueRef[]){draw, key}, 2, "dfind");
 }
 zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
   if (!obj_expr || !obj_expr->ident.inst_type_ref)

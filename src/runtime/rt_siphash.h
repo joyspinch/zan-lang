@@ -40,7 +40,16 @@ static inline uint64_t zan_siphash_cd(const void *data, size_t len,
         p += 8; left -= 8;
     }
     uint64_t b = ((uint64_t)len) << 56;
-    for (size_t i = 0; i < left; i++) b |= ((uint64_t)p[i]) << (8 * i);
+    switch (left) {
+    case 7: b |= ((uint64_t)p[6]) << 48; /* fallthrough */
+    case 6: b |= ((uint64_t)p[5]) << 40; /* fallthrough */
+    case 5: b |= ((uint64_t)p[4]) << 32; /* fallthrough */
+    case 4: b |= ((uint64_t)p[3]) << 24; /* fallthrough */
+    case 3: b |= ((uint64_t)p[2]) << 16; /* fallthrough */
+    case 2: b |= ((uint64_t)p[1]) << 8;  /* fallthrough */
+    case 1: b |= ((uint64_t)p[0]); break;
+    default: break;
+    }
     v3 ^= b;
     for (int r = 0; r < c; r++) zan_sipround(&v0, &v1, &v2, &v3);
     v0 ^= b;

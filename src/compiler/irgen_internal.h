@@ -1252,6 +1252,7 @@ LLVMValueRef emit_task_token(zan_irgen_t *g, LLVMValueRef frame);
 void emit_task_discard_config(zan_irgen_t *g, LLVMValueRef frame,
                               zan_type_t *rt);
 LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc);
+LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc);
 zan_type_t *ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e);
 int irgen_expr_was_boxed(zan_irgen_t *g, zan_ast_node_t *e);
 void irgen_note_boxed_expr(zan_irgen_t *g, zan_ast_node_t *e);

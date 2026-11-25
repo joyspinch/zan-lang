@@ -185,9 +185,22 @@ _Static_assert(sizeof(k_class_inv) / sizeof(k_class_inv[0]) == ZAN_MEM_NCLASS,
 static unsigned char g_size_class[ZAN_MEM_MAX_SMALL + 1];
 static int g_class_ready;
 
-#define ZAN_MEM_SET_SIZE (1u << 14)
-#define ZAN_MEM_SET_MASK (ZAN_MEM_SET_SIZE - 1u)
-static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
+/* 512 槽内联初表仅占 4 KiB 静态 .bss（覆盖 256 MiB 小对象堆才需首次扩容），
+ * 取代原 128 KiB 静态数组并消除 16384 slab 硬上限；扩容时锁外分配新表并以
+ * release/acquire 原子指针切换，旧表永不释放以保持 zan_mem_owns() 完全无锁。 */
+#define ZAN_MEM_INIT_SET_SIZE (1u << 9)
+typedef struct zan_slab_table {
+  uint32_t mask;
+  uint32_t cap;
+  uintptr_t *slots;
+  struct zan_slab_table *prev;
+} zan_slab_table;
+
+static uintptr_t g_slab_init_slots[ZAN_MEM_INIT_SET_SIZE];
+static zan_slab_table g_slab_init_tbl = {ZAN_MEM_INIT_SET_SIZE - 1u,
+                                         ZAN_MEM_INIT_SET_SIZE,
+                                         g_slab_init_slots, NULL};
+static zan_slab_table *g_slab_tbl = &g_slab_init_tbl;
 static size_t g_slab_count;
 static size_t g_small_alloc_count;
 static size_t g_trimmed_bytes;
@@ -335,19 +348,33 @@ static void zan_mem_ensure_classes(void) {
   zan_mem_unlock();
 }
 
-static unsigned zan_mem_hash(uintptr_t base) {
+static unsigned zan_mem_hash(uintptr_t base, uint32_t mask) {
   uint64_t h = (uint64_t)(base >> 20) * 0x9E3779B97F4A7C15ull;
-  return (unsigned)(h >> 40) & ZAN_MEM_SET_MASK;
+  return (unsigned)(h >> 40) & mask;
+}
+
+static zan_slab_table *zan_mem_alloc_slab_table(uint32_t cap) {
+  size_t bytes = sizeof(zan_slab_table) + (size_t)cap * sizeof(uintptr_t);
+  zan_slab_table *t = (zan_slab_table *)__real_calloc(1, bytes);
+  if (!t)
+    return NULL;
+  t->mask = cap - 1u;
+  t->cap = cap;
+  t->slots = (uintptr_t *)(t + 1);
+  t->prev = NULL;
+  return t;
 }
 
 static int zan_mem_owns(const void *p) {
   if (!__atomic_load_n(&g_slab_count, __ATOMIC_ACQUIRE))
     return 0;
   uintptr_t base = (uintptr_t)p & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
-  unsigned i = zan_mem_hash(base);
+  zan_slab_table *tbl = __atomic_load_n(&g_slab_tbl, __ATOMIC_ACQUIRE);
+  uint32_t mask = tbl->mask;
+  uintptr_t *slots = tbl->slots;
+  unsigned i = zan_mem_hash(base, mask);
   for (unsigned n = 0; n < 64; n++) {
-    uintptr_t v = __atomic_load_n(&g_slab_set[(i + n) & ZAN_MEM_SET_MASK],
-                                  __ATOMIC_ACQUIRE);
+    uintptr_t v = __atomic_load_n(&slots[(i + n) & mask], __ATOMIC_ACQUIRE);
     if (v == base)
       return 1;
     if (v == 0)
@@ -641,17 +668,77 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     __atomic_store_n(&g_mem_secret, (uintptr_t)x | (uintptr_t)1,
                      __ATOMIC_RELEASE);
   }
-  unsigned i = zan_mem_hash(base);
-  unsigned n = 0;
-  while (n < 64 && g_slab_set[(i + n) & ZAN_MEM_SET_MASK] != 0)
-    n++;
-  if (n == 64) {
+  uint32_t min_cap = 0;
+  for (;;) {
+    zan_slab_table *tbl = g_slab_tbl;
+    uint32_t want_cap = 0;
+    if (tbl->cap < min_cap) {
+      want_cap = min_cap;
+    } else if ((g_slab_count + 1) * 2 > tbl->cap) {
+      want_cap = tbl->cap * 2u;
+    } else {
+      unsigned i = zan_mem_hash(base, tbl->mask);
+      unsigned n = 0;
+      while (n < 64 && tbl->slots[(i + n) & tbl->mask] != 0)
+        n++;
+      if (n < 64) {
+        __atomic_store_n(&tbl->slots[(i + n) & tbl->mask], base,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&g_slab_count, g_slab_count + 1, __ATOMIC_RELEASE);
+        break;
+      }
+      want_cap = tbl->cap * 2u;
+    }
+    if (want_cap == 0 || want_cap > (1u << 24)) {
+      zan_mem_unlock();
+      return 0;
+    }
+    /* 在锁外分配新表，避免持有全局自旋锁时重入 CRT allocator */
     zan_mem_unlock();
-    return 0;
+    zan_slab_table *nt = zan_mem_alloc_slab_table(want_cap);
+    if (!nt)
+      return 0;
+    zan_mem_lock();
+    if (g_slab_tbl->cap >= want_cap) {
+      zan_mem_unlock();
+      __real_free(nt);
+      zan_mem_lock();
+      continue;
+    }
+    zan_slab_table *old = g_slab_tbl;
+    int ok = 1;
+    for (uint32_t k = 0; k < old->cap; k++) {
+      uintptr_t v = old->slots[k];
+      if (!v)
+        continue;
+      unsigned j = zan_mem_hash(v, nt->mask);
+      unsigned m = 0;
+      while (m < 64 && nt->slots[(j + m) & nt->mask] != 0)
+        m++;
+      if (m == 64) {
+        ok = 0;
+        break;
+      }
+      nt->slots[(j + m) & nt->mask] = v;
+    }
+    if (ok) {
+      unsigned i = zan_mem_hash(base, nt->mask);
+      unsigned n = 0;
+      while (n < 64 && nt->slots[(i + n) & nt->mask] != 0)
+        n++;
+      if (n < 64) {
+        nt->slots[(i + n) & nt->mask] = base;
+        nt->prev = old;
+        __atomic_store_n(&g_slab_tbl, nt, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_slab_count, g_slab_count + 1, __ATOMIC_RELEASE);
+        break;
+      }
+    }
+    min_cap = want_cap * 2u;
+    zan_mem_unlock();
+    __real_free(nt);
+    zan_mem_lock();
   }
-  __atomic_store_n(&g_slab_set[(i + n) & ZAN_MEM_SET_MASK], base,
-                   __ATOMIC_RELEASE);
-  __atomic_store_n(&g_slab_count, g_slab_count + 1, __ATOMIC_RELEASE);
   zan_mem_unlock();
 
   /* 第 0 页是页表（mmap/VirtualAlloc 交来即为零：全部页未分配） */

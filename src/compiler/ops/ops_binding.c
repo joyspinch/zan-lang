@@ -780,7 +780,6 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
         g->builder, i64,
         LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cf"),
         "cnt");
-    emit_index_bounds_check(g, idx, count, expr->loc, "list");
     idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
     LLVMValueRef data =
         list_data_for(g, list_ptr, container_elem_type(bt), "data");
@@ -792,7 +791,6 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef sv = emit_expr(g, base, locals);
     LLVMValueRef sbase = LLVMBuildExtractValue(g->builder, sv, 0, "spb");
     LLVMValueRef slen = LLVMBuildExtractValue(g->builder, sv, 1, "spl");
-    emit_index_bounds_check(g, idx, slen, expr->loc, "span");
     idx = emit_index_safe_bounds(g, idx, slen, expr->loc, "span");
     zan_type_t *et = container_elem_type(bt);
     LLVMTypeRef etl = span_elem_storage_type(g, et);

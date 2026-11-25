@@ -162,20 +162,53 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef count_field = LLVMBuildStructGEP2(
         g->builder, g->list_struct_type, list_ptr, 0, "countf");
     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_field, "count");
-    emit_index_bounds_check(g, idx, count, expr->loc, "list");
+    LLVMValueRef oob =
+        emit_index_bounds_check(g, idx, count, expr->loc, "list");
     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
       idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
     }
-    idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-    /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
-    LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
-    LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
     LLVMTypeRef em = et ? map_type(g, et) : NULL;
-    if (em && LLVMGetTypeKind(em) == LLVMStructTypeKind)
+    int is_struct_elem = (em && LLVMGetTypeKind(em) == LLVMStructTypeKind);
+    LLVMTypeRef res_ty = is_struct_elem ? em : i64;
+    LLVMValueRef raw_or_struct = NULL;
+    if (g->runtime_checks && g->current_fn && oob) {
+      /* 单次越界检查 + 安全分支：避免重复 __zan_guard_raise，并在软检查模式下
+       * 跳过空表 data==NULL 的解引用。 */
+      LLVMBasicBlockRef fail_bb = LLVMGetInsertBlock(g->builder);
+      LLVMValueRef fn = LLVMGetBasicBlockParent(fail_bb);
+      LLVMBasicBlockRef load_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, fn, "listidx.load");
+      LLVMBasicBlockRef done_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, fn, "listidx.done");
+      LLVMBuildCondBr(g->builder, oob, done_bb, load_bb);
+      LLVMPositionBuilderAtEnd(g->builder, load_bb);
+      /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
+      LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
+      LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
+      LLVMValueRef loaded = is_struct_elem
+                                ? load_struct_from_slot(g, elem_ptr, em)
+                                : list_slot_load_word(g, elem_ptr, et, "elem");
+      LLVMBasicBlockRef load_end = LLVMGetInsertBlock(g->builder);
+      LLVMBuildBr(g->builder, done_bb);
+      LLVMPositionBuilderAtEnd(g->builder, done_bb);
+      LLVMValueRef phi = LLVMBuildPhi(g->builder, res_ty, "listidx.val");
+      LLVMValueRef vals[] = {LLVMConstNull(res_ty), loaded};
+      LLVMBasicBlockRef bbs[] = {fail_bb, load_end};
+      LLVMAddIncoming(phi, vals, bbs, 2);
+      raw_or_struct = phi;
+    } else {
+      /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
+      LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
+      LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
+      raw_or_struct = is_struct_elem
+                          ? load_struct_from_slot(g, elem_ptr, em)
+                          : list_slot_load_word(g, elem_ptr, et, "elem");
+    }
+    if (is_struct_elem)
       return finish_index_of_temp(g, expr, locals, arr_type, et, arr_ptr,
-                                  load_struct_from_slot(g, elem_ptr, em));
-    LLVMValueRef raw = list_slot_load_word(g, elem_ptr, et, "elem");
+                                  raw_or_struct);
+    LLVMValueRef raw = raw_or_struct;
     /* 集合物理 i64 槽与非整型元素间的重解释转换 */
     LLVMValueRef out = raw;
     if (em) {
@@ -227,7 +260,8 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMPositionBuilderAtEnd(g->builder, hit_bb);
     LLVMValueRef word = zan_mul(g->builder, found,
                                 load_dict_value_words(g, arr_ptr), "di.word");
-    LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &word, 1, "vsl");
+    LLVMValueRef vslot =
+        LLVMBuildInBoundsGEP2(g->builder, i64, vs, &word, 1, "vsl");
     zan_store_fit(g, load_collection_slot_value(g, dvt, vslot), res);
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
@@ -241,7 +275,6 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     if (expr_has_reliable_string_bounds(expr->index.object, locals)) {
       arr_ptr = emit_string_base_guard(g, arr_ptr, expr->loc);
       LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, expr->loc);
-      emit_index_bounds_check(g, idx, str_len, expr->loc, "string");
       idx = emit_index_safe_bounds(g, idx, str_len, expr->loc, "string");
     } else {
       idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
@@ -253,7 +286,7 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
     LLVMValueRef ch_ptr =
-        LLVMBuildGEP2(g->builder, i8t, arr_ptr, &idx, 1, "chp");
+        LLVMBuildInBoundsGEP2(g->builder, i8t, arr_ptr, &idx, 1, "chp");
     LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8t, ch_ptr, "ch");
     LLVMValueRef chz =
         LLVMBuildZExt(g->builder, ch, LLVMInt64TypeInContext(g->ctx), "chz");
