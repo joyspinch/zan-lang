@@ -1014,8 +1014,14 @@ LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef soft = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMTypeRef st_ty = get_eh_state_ty(g);
-    LLVMValueRef st =
-        LLVMBuildBitCast(g->builder, LLVMGetParam(fn, 0), LLVMPointerType(st_ty, 0), "st");
+    /* The helper looks up the EH state itself (param 0 is ignored; sites pass
+     * null). Passing it from the site made every checked site compute it on
+     * the hot path: the lookup is an atomic TSD-key load LLVM will not sink
+     * into the cold branch, so inlined struct methods in a loop paid two
+     * thread-state lookups per iteration (structs bench 2.2x C). */
+    LLVMValueRef st_raw = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
+                                    get_eh_state_fast_fn(g), NULL, 0, "st.raw");
+    LLVMValueRef st = LLVMBuildBitCast(g->builder, st_raw, LLVMPointerType(st_ty, 0), "st");
     LLVMValueRef top = LLVMBuildLoad2(
         g->builder, i32t, LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_TOP, "topp"), "top");
     LLVMBuildCondBr(g->builder,

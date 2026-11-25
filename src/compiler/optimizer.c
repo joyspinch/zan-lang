@@ -2304,6 +2304,46 @@ static int zan_opt_fp_contract(LLVMModuleRef mod) {
     return n;
 }
 
+/* Each function looks its EH state up once at entry (emit_eh_state) for
+ * whatever needs it; when every user disappeared (guard sites no longer pass
+ * it, an elided temp mark, ...) the lookup stays: its atomic TSD-key load and
+ * lazy-init call count as side effects, so no LLVM pass deletes it, and once
+ * the function is inlined into a loop it runs every iteration (structs bench:
+ * two lookups per iteration). Remove unused lookups (and unused field
+ * addresses derived from them) before optimizing; a later use simply performs
+ * the lookup again. */
+static int zan_opt_drop_dead_eh_state(LLVMModuleRef mod) {
+    LLVMValueRef sf = LLVMGetNamedFunction(mod, "__zan_eh_state_fast");
+    if (!sf) return 0;
+    int n = 0;
+    LLVMUseRef u = LLVMGetFirstUse(sf);
+    while (u) {
+        LLVMValueRef call = LLVMGetUser(u);
+        u = LLVMGetNextUse(u);
+        if (!LLVMIsACallInst(call) || LLVMGetCalledValue(call) != sf) continue;
+        /* drop unused GEPs/bitcasts hanging off the result first */
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (LLVMUseRef cu = LLVMGetFirstUse(call); cu; cu = LLVMGetNextUse(cu)) {
+                LLVMValueRef user = LLVMGetUser(cu);
+                if ((LLVMIsAGetElementPtrInst(user) || LLVMIsABitCastInst(user)) &&
+                    !LLVMGetFirstUse(user)) {
+                    LLVMInstructionEraseFromParent(user);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!LLVMGetFirstUse(call)) {
+            if (u && LLVMGetUser(u) == call) u = LLVMGetNextUse(u);
+            LLVMInstructionEraseFromParent(call);
+            n++;
+        }
+    }
+    return n;
+}
+
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
     zan_opt_report_t report;
     memset(&report, 0, sizeof(report));
@@ -2315,6 +2355,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 
     /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
     zan_opt_tbaa(g->mod);
+    if (!getenv("ZAN_KEEP_DEAD_EH_STATE")) zan_opt_drop_dead_eh_state(g->mod);
     if (g->fp_contract) zan_opt_fp_contract(g->mod);
     if (!getenv("ZAN_NO_OPT_EARLY") && zan_opt_early_mem2reg(g) != ZAN_OK) {
         report.success = false;

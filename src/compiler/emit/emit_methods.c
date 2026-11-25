@@ -1,3 +1,37 @@
+/* A struct constructor arms a temp-stack mark (A528) so field owners pushed
+ * by its stores are released if it throws; every exit restores the top from
+ * the mark. When the body pushed nothing, each restore writes back the value
+ * the top already has. Remove the mark (entry load, slot, and the restores)
+ * when every reader of the slot only stores it back; anything else (an unwind
+ * call taking the mark) keeps it. An inlined `new Vec(...)` in a loop
+ * otherwise reloads the thread's EH state every iteration. */
+static void drop_unused_ctor_mark(LLVMValueRef slot) {
+    if (!slot || !LLVMIsAAllocaInst(slot)) return;
+    for (LLVMUseRef u = LLVMGetFirstUse(slot); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsAStoreInst(user) && LLVMGetOperand(user, 1) == slot) continue;
+        if (!LLVMIsALoadInst(user)) return;
+        for (LLVMUseRef lu = LLVMGetFirstUse(user); lu; lu = LLVMGetNextUse(lu)) {
+            LLVMValueRef st = LLVMGetUser(lu);
+            if (!LLVMIsAStoreInst(st) || LLVMGetOperand(st, 0) != user) return;
+        }
+    }
+    LLVMValueRef base = NULL;
+    while (LLVMGetFirstUse(slot)) {
+        LLVMValueRef user = LLVMGetUser(LLVMGetFirstUse(slot));
+        if (LLVMIsAStoreInst(user)) {
+            base = LLVMGetOperand(user, 0);
+        } else {
+            while (LLVMGetFirstUse(user))
+                LLVMInstructionEraseFromParent(LLVMGetUser(LLVMGetFirstUse(user)));
+        }
+        LLVMInstructionEraseFromParent(user);
+    }
+    LLVMInstructionEraseFromParent(slot);
+    if (base && LLVMIsALoadInst(base) && !LLVMGetFirstUse(base))
+        LLVMInstructionEraseFromParent(base);
+}
+
 static uint64_t work_fn_hash(LLVMValueRef fn) {
     uint64_t h = (uint64_t)(uintptr_t)fn;
     h ^= h >> 33;
@@ -260,6 +294,8 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         int saved_lpad_depth = g->lpad_depth;
         LLVMBasicBlockRef fn_cleanup_bb = NULL;
         LLVMValueRef fn_tmp_mark = NULL;
+        LLVMValueRef ctor_base_slot = NULL; /* struct ctor temp-stack mark (A528) */
+        unsigned ctor_push_seq0 = 0;
         if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
             fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fn.lpad");
             g->lpad_stack[g->lpad_depth].fn = fn;
@@ -305,6 +341,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             if (type_sym->type && type_sym->type->kind == TYPE_STRUCT &&
                 !g->current_async_frame &&
                 ZAN_TAB_ENSURE(g->eh_armed, g->eh_armed_count, g->eh_armed_cap, 16)) {
+                ctor_push_seq0 = g->eh_tmp_push_seq;
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef tt = get_eh_tmp_top_global(g);
                 LLVMValueRef base = LLVMBuildLoad2(g->builder, i32t, tt,
@@ -312,6 +349,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 LLVMValueRef base_slot = emit_entry_alloca(g, i32t,
                     "ctor.eh.base.slot");
                 zan_store_fit(g, base, base_slot);
+                ctor_base_slot = base_slot;
                 g->eh_armed[g->eh_armed_count].old_top_slot = base_slot;
                 g->eh_armed[g->eh_armed_count].restore_tmps = true;
                 g->eh_armed_count++;
@@ -459,6 +497,8 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         if (fn_cleanup_bb) {
             finish_fn_lpad(g, &g->lpad_stack[saved_lpad_depth]);
         }
+        if (ctor_base_slot && g->eh_tmp_push_seq == ctor_push_seq0)
+            drop_unused_ctor_mark(ctor_base_slot);
 
         g->current_fn = saved_fn;
         g->current_fn_ret_type = saved_fn_ret;

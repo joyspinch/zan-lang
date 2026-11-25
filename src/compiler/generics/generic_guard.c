@@ -284,8 +284,7 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
         LLVMValueRef tid = LLVMConstBitCast(get_class_tid_global(g, sym), i8ptr);
         char mbuf[320];
         snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
-        LLVMValueRef st = LLVMBuildBitCast(g->builder, zan_eh_state_ptr(g), i8ptr, "");
-        LLVMValueRef args[] = {st,
+        LLVMValueRef args[] = {LLVMConstNull(i8ptr), /* helper looks up the EH state */
                                vt,
                                ex_msg,
                                tid,
