@@ -36,10 +36,29 @@ static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
             LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
             g->rt_release, &v, 1, "");
 }
+static bool is_immortal_string_const(LLVMValueRef v) {
+  if (!v)
+    return false;
+  if (LLVMIsAConstantPointerNull(v))
+    return true;
+  if (LLVMIsAConstantExpr(v) && LLVMGetConstOpcode(v) == LLVMGetElementPtr) {
+    LLVMValueRef base = LLVMGetOperand(v, 0);
+    if (base && LLVMIsAGlobalVariable(base)) {
+      const char *nm = LLVMGetValueName(base);
+      if (nm && (strncmp(nm, "__zan.strlit.", 13) == 0 ||
+                 strcmp(nm, "__zan.ascii128") == 0))
+        return true;
+    }
+  }
+  return false;
+}
+
 void emit_string_retain(zan_irgen_t *g, LLVMValueRef v) {
   if (g->current_fn_no_runtime)
     return;
   if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
+    return;
+  if (is_immortal_string_const(v))
     return;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (LLVMTypeOf(v) != i8ptr)
@@ -52,6 +71,8 @@ void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
   if (g->current_fn_no_runtime)
     return;
   if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
+    return;
+  if (is_immortal_string_const(v))
     return;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (LLVMTypeOf(v) != i8ptr)

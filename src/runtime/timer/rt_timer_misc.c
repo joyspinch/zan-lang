@@ -25,9 +25,17 @@ int32_t zan_async_cfg_sync_fast(void) {
   return (int32_t)__atomic_load_n(&g_cfg_sync_fast, __ATOMIC_ACQUIRE);
 }
 
+static int zan_rt_dbl_roundtrips(const char *m, double v, int is_flt) {
+  if (is_flt)
+    return strtof(m, NULL) == (float)v;
+  return strtod(m, NULL) == v;
+}
+
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
   int is_flt = (cap & 0x8000000000000000ULL) != 0;
   size_t actual_cap = (size_t)(cap & ~0x8000000000000000ULL);
+  if (actual_cap == 0)
+    return;
   if (v != v) {
     snprintf(buf, actual_cap, "NaN");
     return;
@@ -42,21 +50,102 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     snprintf(buf, actual_cap, "%sInfinity", sign);
     return;
   }
-  char m[40];
-  int p;
-  int max_p = is_flt ? 10 : 17;
-  for (p = 1; p < max_p; p++) {
-    snprintf(m, sizeof m, "%.*e", p - 1, v);
-    if (is_flt) {
-      if (strtof(m, NULL) == (float)v)
-        break;
-    } else {
-      if (strtod(m, NULL) == v)
-        break;
+  /* 精确整数快路径（|v| < 1e15 且无小数，float 限于 2^24 内避免尾部非零精度差）：
+   * 跳过 snprintf/strtod，直接双位写十进制。 */
+  double int_limit = is_flt ? 16777216.0 : 1000000000000000.0;
+  if (a < int_limit) {
+    unsigned long long iv = (unsigned long long)a;
+    if ((double)iv == a) {
+      static const char d200[200] =
+          "0001020304050607080910111213141516171819"
+          "2021222324252627282930313233343536373839"
+          "4041424344454647484950515253545556575859"
+          "6061626364656667686970717273747576777879"
+          "8081828384858687888990919293949596979899";
+      char tmp[24];
+      int pos = 24;
+      while (iv >= 100) {
+        unsigned r = (unsigned)(iv % 100);
+        iv /= 100;
+        pos -= 2;
+        tmp[pos] = d200[r * 2];
+        tmp[pos + 1] = d200[r * 2 + 1];
+      }
+      if (iv >= 10) {
+        pos -= 2;
+        tmp[pos] = d200[(unsigned)iv * 2];
+        tmp[pos + 1] = d200[(unsigned)iv * 2 + 1];
+      } else {
+        tmp[--pos] = (char)('0' + (unsigned)iv);
+      }
+      if (sign[0])
+        tmp[--pos] = '-';
+      size_t nlen = (size_t)(24 - pos);
+      if (nlen >= actual_cap)
+        nlen = actual_cap - 1;
+      memcpy(buf, tmp + pos, nlen);
+      buf[nlen] = '\0';
+      return;
     }
   }
-  if (p == max_p)
+
+  /* 最短精确往返精度搜索：先探查常见短精度上限（double:15 / float:7），
+   * 命中即按去掉尾零后的有效位数下界二分，否则仅查剩余 1..2 档。
+   * 将原 1..16 线性扫描（最坏 16 次 snprintf+strtod）降至 1~4 次且输出逐字节一致。 */
+  char m[40];
+  int max_p = is_flt ? 10 : 17;
+  int probe_p = is_flt ? 7 : 15;
+  int lo = 1, hi = max_p;
+  char best[40];
+  int have_best = 0;
+
+  snprintf(m, sizeof m, "%.*e", probe_p - 1, v);
+  if (zan_rt_dbl_roundtrips(m, v, is_flt)) {
+    memcpy(best, m, sizeof m);
+    have_best = 1;
+    /* 统计去尾零后的有效数字数作为紧上界 */
+    char *q0 = (*m == '-') ? m + 1 : m;
+    char *e0 = strchr(q0, 'e');
+    int nz = 0;
+    int last_nz = 0;
+    for (char *c = q0; c < e0; c++) {
+      if (*c >= '0' && *c <= '9') {
+        nz++;
+        if (*c != '0')
+          last_nz = nz;
+      }
+    }
+    hi = last_nz > 0 ? last_nz : 1;
+    if (hi > 1) {
+      /* 快速验证 hi-1 是否不能往返：常见短小数（3.14 / 0.1）一次即锁定最小 p */
+      snprintf(m, sizeof m, "%.*e", hi - 2, v);
+      if (!zan_rt_dbl_roundtrips(m, v, is_flt)) {
+        lo = hi;
+      } else {
+        memcpy(best, m, sizeof m);
+        hi = hi - 1;
+      }
+    }
+  } else {
+    lo = probe_p + 1;
+  }
+
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    snprintf(m, sizeof m, "%.*e", mid - 1, v);
+    if (zan_rt_dbl_roundtrips(m, v, is_flt)) {
+      memcpy(best, m, sizeof m);
+      have_best = 1;
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  if (have_best) {
+    memcpy(m, best, sizeof m);
+  } else {
     snprintf(m, sizeof m, is_flt ? "%.9e" : "%.16e", v);
+  }
 
   /* split "-d */
   char *q = (*m == '-') ? m + 1 : m;

@@ -1121,8 +1121,11 @@ void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e);
 void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit);
 LLVMValueRef emit_bool_cond(zan_irgen_t *g, LLVMValueRef val,
                             zan_ast_node_t *ast, local_scope_t *locals);
+LLVMValueRef emit_ascii_char_ptr(zan_irgen_t *g, LLVMValueRef idx_i64);
 LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v);
 LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val);
+LLVMValueRef emit_char_to_stack(zan_irgen_t *g, LLVMValueRef val,
+                                LLVMValueRef buf8);
 void emit_clear_owned_locals_range(zan_irgen_t *g, local_scope_t *locals,
                                    int start);
 LLVMValueRef emit_cstr_len_of(zan_irgen_t *g, LLVMValueRef s,

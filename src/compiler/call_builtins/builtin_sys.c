@@ -467,10 +467,17 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             s = emit_entry_scratch(g, 40, "sb.i2s");
             slen = emit_itoa_into(g, s, emit_widen_i64_for_print(g, v),
                                   expr_is_ulong(g, arg0, locals) ? 1 : 0);
+          } else if (char_arg) {
+            /* char 直接在 8B 栈缓冲完成 UTF-8 编码，零堆分配/释放 */
+            s = emit_entry_scratch(g, 8, "sb.c2s");
+            slen = emit_char_to_stack(g, v, s);
+          } else if (arg0->kind == AST_STRING_LITERAL) {
+            /* 字符串字面量直接用编译期常量长度，免去运行期长度读取与空判 */
+            s = v;
+            slen = LLVMConstInt(i64, (uint64_t)arg0->str_val.len, 0);
           } else {
-            s = char_arg ? emit_char_to_cstr(g, v) : emit_value_as_cstr(g, v);
+            s = emit_value_as_cstr(g, v);
             int str_arg =
-                !char_arg &&
                 LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
                 is_string_expr(g, arg0, locals);
             if (str_arg) {
@@ -481,9 +488,8 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             }
           }
           emit_sb_append_bytes(g, sbp, s, slen);
-          if (char_arg)
-            emit_string_release(g, s);
-          else if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+          if (!char_arg && arg0->kind != AST_STRING_LITERAL &&
+              LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
             emit_release_owned_call_temp(g, arg0, v, locals);
         }
       }
@@ -500,6 +506,22 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
       LLVMValueRef cptr =
           LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
       LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cptr, "sbcv");
+      LLVMBasicBlockRef bb_empty =
+          LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.empty");
+      LLVMBasicBlockRef bb_copy =
+          LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.copy");
+      LLVMBasicBlockRef bb_done =
+          LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.done");
+      LLVMValueRef is_empty =
+          zan_icmp(g->builder, LLVMIntEQ, count, LLVMConstInt(i64, 0, 0), "sb.isz");
+      zan_set_branch_weights(g,
+          LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_copy), 1, 2000);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_empty);
+      LLVMValueRef empty_str = emit_string_literal_rc(g, (zan_istr_t){"", 0});
+      LLVMBuildBr(g->builder, bb_done);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_copy);
       LLVMValueRef dptr =
           LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
       LLVMValueRef data = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbdv");
@@ -520,9 +542,16 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
           LLVMBuildGEP2(g->builder, i8, buf, &count, 1, "sbend");
       LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
       emit_string_len_set(g, buf, count);
+      LLVMBasicBlockRef copy_end = LLVMGetInsertBlock(g->builder);
+      LLVMBuildBr(g->builder, bb_done);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_done);
+      LLVMValueRef res = LLVMBuildPhi(g->builder, i8ptr, "sb.res");
+      LLVMAddIncoming(res, (LLVMValueRef[]){empty_str, buf},
+                      (LLVMBasicBlockRef[]){bb_empty, copy_end}, 2);
       emit_intrinsic_drop_recv(g, sbcallee->member.object, raw, locals,
                                sb_recv_own);
-      return buf;
+      return res;
     }
   }
 }

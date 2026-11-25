@@ -30,20 +30,12 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
           return emit_bool_to_cstr(g, bc);
       }
       if (vk == LLVMPointerTypeKind) {
-        LLVMTypeRef strlen_ty =
-            LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr}, 1, 0);
-        LLVMTypeRef memcpy_ty =
-            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i8ptr, i8ptr, i64}, 3, 0);
-        LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
-        LLVMValueRef n =
-            zan_call2(g->builder, strlen_ty, g->fn_strlen, &v, 1, "n");
-        LLVMValueRef bufsz =
-            zan_add(g->builder, n, LLVMConstInt(i64, 1, 0), "bsz");
-        LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
-        LLVMValueRef mcargs[] = {buf, v, bufsz};
-        zan_call2(g->builder, memcpy_ty, memcpy_fn, mcargs, 3, "");
-        emit_release_owned_call_temp(g, sc->member.object, v, locals);
-        return buf;
+        /* string 是不可变托管串，s.ToString() 零分配：
+         * 若接收者已是临时所有权则直接移交，否则仅 retain 后返回。 */
+        LLVMValueRef s = emit_str_nonnull(g, v);
+        if (!expr_yields_owned_rc_value(g, sc->member.object, locals))
+          emit_string_retain(g, s);
+        return s;
       }
       if (rt_ty->kind == TYPE_ENUM && rt_ty->sym &&
           rt_ty->sym->member_count > 0) {
@@ -167,14 +159,39 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
       }
       LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
       LLVMTypeRef i8pt = LLVMPointerType(i8t, 0);
+      LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
       LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
       LLVMValueRef pfmt_lit = zan_irgen_intern_string(g, pfmt);
-      LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64t, 640, 0));
-      LLVMValueRef snp_args[] = {buf, LLVMConstInt(i64t, 640, 0), pfmt_lit,
+      /* 先在栈上格式化再按实际长度精确分配托管串 + 记 ZANS 长度，
+       * 将 ToString("F2") 单串堆占用从 768B slab 压至 32B slab（24× 降幅）。 */
+      LLVMValueRef tmp = emit_entry_scratch(g, 640, "tos.fmt.tmp");
+      LLVMValueRef snp_args[] = {tmp, LLVMConstInt(i64t, 640, 0), pfmt_lit,
                                  arg};
       LLVMTypeRef snp_ty =
-          LLVMFunctionType(i8pt, (LLVMTypeRef[]){i8pt, i64t, i8pt}, 3, 1);
-      zan_call2(g->builder, snp_ty, g->fn_snprintf, snp_args, 4, "");
+          LLVMFunctionType(i32t, (LLVMTypeRef[]){i8pt, i64t, i8pt}, 3, 1);
+      LLVMValueRef wn =
+          zan_call2(g->builder, snp_ty, g->fn_snprintf, snp_args, 4, "tos.wn");
+      LLVMValueRef wn64 = LLVMBuildSExt(g->builder, wn, i64t, "tos.wn64");
+      LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+      LLVMValueRef max639 = LLVMConstInt(i64t, 639, 0);
+      LLVMValueRef len0 = LLVMBuildSelect(
+          g->builder, LLVMBuildICmp(g->builder, LLVMIntSLT, wn64, zero64, "tos.lt0"),
+          zero64, wn64, "tos.l0");
+      LLVMValueRef len = LLVMBuildSelect(
+          g->builder, LLVMBuildICmp(g->builder, LLVMIntSGT, len0, max639, "tos.gt"),
+          max639, len0, "tos.len");
+      LLVMValueRef bufsz =
+          zan_add(g->builder, len, LLVMConstInt(i64t, 1, 0), "tos.bsz");
+      LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
+      LLVMTypeRef memcpy_ty =
+          LLVMFunctionType(i8pt, (LLVMTypeRef[]){i8pt, i8pt, i64t}, 3, 0);
+      LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
+      zan_call2(g->builder, memcpy_ty, memcpy_fn,
+                (LLVMValueRef[]){buf, tmp, len}, 3, "");
+      LLVMValueRef endp =
+          LLVMBuildGEP2(g->builder, i8t, buf, &len, 1, "tos.end");
+      LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
+      emit_string_len_set(g, buf, len);
       return buf;
     }
   }

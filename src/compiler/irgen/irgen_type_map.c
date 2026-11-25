@@ -1096,6 +1096,159 @@ int eh_slot_kind_of(zan_type_t *t) {
   return ZAN_EH_SLOT_OBJ;
 }
 
+/* 200B 双十进制数字查找表 ("000102...99")：每次迭代 /100 出两位，
+ * 将整数格式化除法次数减半并与 LLVM 魔数乘法优化配合。 */
+static LLVMValueRef get_digits200_table(zan_irgen_t *g) {
+  LLVMValueRef tbl = LLVMGetNamedGlobal(g->mod, "__zan.digits200");
+  if (tbl)
+    return tbl;
+  static const char k_digits200[200] =
+      "0001020304050607080910111213141516171819"
+      "2021222324252627282930313233343536373839"
+      "4041424344454647484950515253545556575859"
+      "6061626364656667686970717273747576777879"
+      "8081828384858687888990919293949596979899";
+  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+  LLVMTypeRef ty = LLVMArrayType(i8, 200);
+  tbl = LLVMAddGlobal(g->mod, ty, "__zan.digits200");
+  LLVMSetLinkage(tbl, LLVMPrivateLinkage);
+  LLVMSetUnnamedAddr(tbl, LLVMGlobalUnnamedAddr);
+  LLVMSetGlobalConstant(tbl, 1);
+  LLVMSetInitializer(tbl, LLVMConstStringInContext(g->ctx, k_digits200, 200, 1));
+  return tbl;
+}
+
+/* 在调用方 24B 栈缓冲 tmp24 末尾反向写入十进制数字（含负号），返回 [start, len]。 */
+static void emit_itoa64_digits_into_tmp(zan_irgen_t *g, LLVMValueRef fn,
+                                        LLVMValueRef tmp24, LLVMValueRef v,
+                                        LLVMValueRef uns,
+                                        LLVMValueRef *out_start,
+                                        LLVMValueRef *out_len) {
+  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+  LLVMTypeRef i16 = LLVMInt16TypeInContext(g->ctx);
+  LLVMTypeRef i16p = LLVMPointerType(i16, 0);
+  LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef d200_ty = LLVMArrayType(i8, 200);
+  LLVMValueRef d200 = get_digits200_table(g);
+
+  LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+  LLVMValueRef one = LLVMConstInt(i64, 1, 0);
+  LLVMValueRef two = LLVMConstInt(i64, 2, 0);
+  LLVMValueRef ten = LLVMConstInt(i64, 10, 0);
+  LLVMValueRef hundred = LLVMConstInt(i64, 100, 0);
+  LLVMValueRef cap = LLVMConstInt(i64, 24, 0);
+
+  LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+  LLVMBasicBlockRef loop2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.l2");
+  LLVMBasicBlockRef tail = LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.tail");
+  LLVMBasicBlockRef two_d = LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.d2");
+  LLVMBasicBlockRef one_d = LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.d1");
+  LLVMBasicBlockRef sign_chk =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.schk");
+  LLVMBasicBlockRef sign_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.sign");
+  LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "itoa.done");
+
+  LLVMValueRef is_neg = LLVMBuildAnd(
+      g->builder, LLVMBuildICmp(g->builder, LLVMIntSLT, v, zero64, "itoa.slt"),
+      LLVMBuildICmp(g->builder, LLVMIntEQ, uns, LLVMConstInt(i32, 0, 0),
+                    "itoa.signed"),
+      "itoa.neg");
+  LLVMValueRef mag =
+      LLVMBuildSelect(g->builder, is_neg,
+                      LLVMBuildNeg(g->builder, v, "itoa.negv"), v, "itoa.mag");
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntUGE, mag, hundred, "itoa.ge100"),
+                  loop2, tail);
+
+  /* 双位循环：rest >= 100 时每次 UDiv/URem 100 写 2 字节 */
+  LLVMPositionBuilderAtEnd(g->builder, loop2);
+  LLVMValueRef rest = LLVMBuildPhi(g->builder, i64, "itoa.rest");
+  LLVMValueRef pos = LLVMBuildPhi(g->builder, i64, "itoa.pos");
+  LLVMValueRef q = LLVMBuildUDiv(g->builder, rest, hundred, "itoa.q");
+  LLVMValueRef r = LLVMBuildURem(g->builder, rest, hundred, "itoa.r");
+  LLVMValueRef r2 = LLVMBuildShl(g->builder, r, one, "itoa.r2");
+  LLVMValueRef d2_src = LLVMBuildInBoundsGEP2(
+      g->builder, d200_ty, d200, (LLVMValueRef[]){zero64, r2}, 2, "itoa.s2");
+  LLVMValueRef pair = LLVMBuildLoad2(
+      g->builder, i16, LLVMBuildBitCast(g->builder, d2_src, i16p, "itoa.s2p"),
+      "itoa.pair");
+  LLVMSetAlignment(pair, 1);
+  LLVMValueRef next_pos = LLVMBuildSub(g->builder, pos, two, "itoa.pos.n");
+  LLVMValueRef d2_dst =
+      LLVMBuildInBoundsGEP2(g->builder, i8, tmp24, &next_pos, 1, "itoa.d2");
+  LLVMValueRef st2 = LLVMBuildStore(
+      g->builder, pair, LLVMBuildBitCast(g->builder, d2_dst, i16p, "itoa.d2p"));
+  LLVMSetAlignment(st2, 1);
+  LLVMAddIncoming(rest, (LLVMValueRef[]){mag, q},
+                  (LLVMBasicBlockRef[]){cur_bb, loop2}, 2);
+  LLVMAddIncoming(pos, (LLVMValueRef[]){cap, next_pos},
+                  (LLVMBasicBlockRef[]){cur_bb, loop2}, 2);
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntUGE, q, hundred, "itoa.more"),
+                  loop2, tail);
+
+  /* 尾数 (0..99)：>=10 写 2 字节，否则写 1 字节 */
+  LLVMPositionBuilderAtEnd(g->builder, tail);
+  LLVMValueRef rem_v = LLVMBuildPhi(g->builder, i64, "itoa.rv");
+  LLVMValueRef rem_pos = LLVMBuildPhi(g->builder, i64, "itoa.rp");
+  LLVMAddIncoming(rem_v, (LLVMValueRef[]){mag, q},
+                  (LLVMBasicBlockRef[]){cur_bb, loop2}, 2);
+  LLVMAddIncoming(rem_pos, (LLVMValueRef[]){cap, next_pos},
+                  (LLVMBasicBlockRef[]){cur_bb, loop2}, 2);
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntUGE, rem_v, ten, "itoa.ge10"),
+                  two_d, one_d);
+
+  LLVMPositionBuilderAtEnd(g->builder, two_d);
+  LLVMValueRef tr2 = LLVMBuildShl(g->builder, rem_v, one, "itoa.tr2");
+  LLVMValueRef ts2 = LLVMBuildInBoundsGEP2(
+      g->builder, d200_ty, d200, (LLVMValueRef[]){zero64, tr2}, 2, "itoa.ts2");
+  LLVMValueRef tpair = LLVMBuildLoad2(
+      g->builder, i16, LLVMBuildBitCast(g->builder, ts2, i16p, "itoa.ts2p"),
+      "itoa.tpair");
+  LLVMSetAlignment(tpair, 1);
+  LLVMValueRef p2 = LLVMBuildSub(g->builder, rem_pos, two, "itoa.p2");
+  LLVMValueRef td2 =
+      LLVMBuildInBoundsGEP2(g->builder, i8, tmp24, &p2, 1, "itoa.td2");
+  LLVMValueRef tst2 = LLVMBuildStore(
+      g->builder, tpair, LLVMBuildBitCast(g->builder, td2, i16p, "itoa.td2p"));
+  LLVMSetAlignment(tst2, 1);
+  LLVMBuildBr(g->builder, sign_chk);
+
+  LLVMPositionBuilderAtEnd(g->builder, one_d);
+  LLVMValueRef p1 = LLVMBuildSub(g->builder, rem_pos, one, "itoa.p1");
+  LLVMValueRef ch1 = LLVMBuildTrunc(
+      g->builder,
+      LLVMBuildAdd(g->builder, rem_v, LLVMConstInt(i64, '0', 0), "itoa.dc1"), i8,
+      "itoa.ch1");
+  LLVMBuildStore(
+      g->builder, ch1,
+      LLVMBuildInBoundsGEP2(g->builder, i8, tmp24, &p1, 1, "itoa.dp1"));
+  LLVMBuildBr(g->builder, sign_chk);
+
+  LLVMPositionBuilderAtEnd(g->builder, sign_chk);
+  LLVMValueRef dpos = LLVMBuildPhi(g->builder, i64, "itoa.dpos");
+  LLVMAddIncoming(dpos, (LLVMValueRef[]){p2, p1},
+                  (LLVMBasicBlockRef[]){two_d, one_d}, 2);
+  LLVMBuildCondBr(g->builder, is_neg, sign_bb, done);
+
+  LLVMPositionBuilderAtEnd(g->builder, sign_bb);
+  LLVMValueRef spos = LLVMBuildSub(g->builder, dpos, one, "itoa.sp");
+  LLVMBuildStore(
+      g->builder, LLVMConstInt(i8, '-', 0),
+      LLVMBuildInBoundsGEP2(g->builder, i8, tmp24, &spos, 1, "itoa.spp"));
+  LLVMBuildBr(g->builder, done);
+
+  LLVMPositionBuilderAtEnd(g->builder, done);
+  LLVMValueRef start = LLVMBuildPhi(g->builder, i64, "itoa.start");
+  LLVMAddIncoming(start, (LLVMValueRef[]){dpos, spos},
+                  (LLVMBasicBlockRef[]){sign_chk, sign_bb}, 2);
+  *out_start = start;
+  *out_len = LLVMBuildSub(g->builder, cap, start, "itoa.len");
+}
+
 static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
   if (g->fn_itoa64)
     return g->fn_itoa64;
@@ -1107,72 +1260,51 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
       LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i64, i32}, 3, 0);
   LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_itoa64", fn_ty);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
+  {
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    if (nw)
+      LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nw, 0));
+    unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+    if (ih)
+      LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, ih, 0));
+  }
   g->fn_itoa64 = fn;
 
   LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-  LLVMBasicBlockRef digit = LLVMAppendBasicBlockInContext(g->ctx, fn, "digit");
-  LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
-  LLVMBasicBlockRef sign = LLVMAppendBasicBlockInContext(g->ctx, fn, "sign");
-  LLVMBasicBlockRef copy = LLVMAppendBasicBlockInContext(g->ctx, fn, "copy");
+  LLVMBasicBlockRef fast1 = LLVMAppendBasicBlockInContext(g->ctx, fn, "fast1");
+  LLVMBasicBlockRef full = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
 
   LLVMValueRef buf = LLVMGetParam(fn, 0);
   LLVMValueRef v = LLVMGetParam(fn, 1);
   LLVMValueRef uns = LLVMGetParam(fn, 2);
-  LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
-  LLVMValueRef ten = LLVMConstInt(i64, 10, 0);
   LLVMValueRef one = LLVMConstInt(i64, 1, 0);
   LLVMValueRef cap = LLVMConstInt(i64, 24, 0);
 
   LLVMPositionBuilderAtEnd(g->builder, entry);
-  LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, cap, "itoa.tmp");
-  LLVMValueRef is_neg = LLVMBuildAnd(
-      g->builder, LLVMBuildICmp(g->builder, LLVMIntSLT, v, zero64, "itoa.slt"),
-      LLVMBuildICmp(g->builder, LLVMIntEQ, uns, LLVMConstInt(i32, 0, 0),
-                    "itoa.signed"),
-      "itoa.neg");
-  LLVMValueRef mag =
-      LLVMBuildSelect(g->builder, is_neg,
-                      LLVMBuildNeg(g->builder, v, "itoa.negv"), v, "itoa.mag");
-  LLVMBuildBr(g->builder, digit);
-
-  LLVMPositionBuilderAtEnd(g->builder, digit);
-  LLVMValueRef rest = LLVMBuildPhi(g->builder, i64, "itoa.rest");
-  LLVMValueRef pos = LLVMBuildPhi(g->builder, i64, "itoa.pos");
-  LLVMValueRef next_pos = LLVMBuildSub(g->builder, pos, one, "itoa.pos.n");
-  LLVMValueRef d = LLVMBuildURem(g->builder, rest, ten, "itoa.d");
-  LLVMValueRef ch = LLVMBuildTrunc(
-      g->builder,
-      LLVMBuildAdd(g->builder, d, LLVMConstInt(i64, '0', 0), "itoa.dc"), i8,
-      "itoa.ch");
-  LLVMBuildStore(
-      g->builder, ch,
-      LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &next_pos, 1, "itoa.dp"));
-  LLVMValueRef next_rest = LLVMBuildUDiv(g->builder, rest, ten, "itoa.rest.n");
-  LLVMAddIncoming(rest, (LLVMValueRef[]){mag, next_rest},
-                  (LLVMBasicBlockRef[]){entry, digit}, 2);
-  LLVMAddIncoming(pos, (LLVMValueRef[]){cap, next_pos},
-                  (LLVMBasicBlockRef[]){entry, digit}, 2);
+  /* 0..9 单数字快路径（无符号比较对 signed/unsigned 均成立） */
   LLVMBuildCondBr(
       g->builder,
-      LLVMBuildICmp(g->builder, LLVMIntEQ, next_rest, zero64, "itoa.last"),
-      done, digit);
+      LLVMBuildICmp(g->builder, LLVMIntULT, v, LLVMConstInt(i64, 10, 0),
+                    "itoa.lt10"),
+      fast1, full);
 
-  LLVMPositionBuilderAtEnd(g->builder, done);
-  LLVMBuildCondBr(g->builder, is_neg, sign, copy);
+  LLVMPositionBuilderAtEnd(g->builder, fast1);
+  LLVMValueRef d0 = LLVMBuildTrunc(
+      g->builder,
+      LLVMBuildAdd(g->builder, v, LLVMConstInt(i64, '0', 0), "itoa.f0"), i8,
+      "itoa.fc");
+  LLVMBuildStore(g->builder, d0, buf);
+  LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+                 LLVMBuildInBoundsGEP2(g->builder, i8, buf, &one, 1, "itoa.fn"));
+  LLVMBuildRet(g->builder, one);
 
-  LLVMPositionBuilderAtEnd(g->builder, sign);
-  LLVMValueRef sign_pos = LLVMBuildSub(g->builder, next_pos, one, "itoa.sp");
-  LLVMBuildStore(
-      g->builder, LLVMConstInt(i8, '-', 0),
-      LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &sign_pos, 1, "itoa.spp"));
-  LLVMBuildBr(g->builder, copy);
-
-  LLVMPositionBuilderAtEnd(g->builder, copy);
-  LLVMValueRef start = LLVMBuildPhi(g->builder, i64, "itoa.start");
-  LLVMAddIncoming(start, (LLVMValueRef[]){next_pos, sign_pos},
-                  (LLVMBasicBlockRef[]){done, sign}, 2);
-  LLVMValueRef len = LLVMBuildSub(g->builder, cap, start, "itoa.len");
+  LLVMPositionBuilderAtEnd(g->builder, full);
+  LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, cap, "itoa.tmp");
+  LLVMValueRef start = NULL, len = NULL;
+  emit_itoa64_digits_into_tmp(g, fn, tmp, v, uns, &start, &len);
   LLVMValueRef src =
       LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &start, 1, "itoa.src");
   LLVMTypeRef memcpy_ty =
@@ -1202,10 +1334,8 @@ LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v,
   LLVMValueRef args[] = {buf, v, LLVMConstInt(i32, is_unsigned ? 1 : 0, 0)};
   return zan_call2(g->builder, fn_ty, fn, args, 3, "itoa");
 }
-/* 整数 → 托管串，按实际位数精确分配。旧路径先分配固定 24/40 字节缓冲再
- * itoa 进去，串的整个寿命都背着这块空闲尾巴（1e6 个 int.ToString() 在 Mac
- * 上 ~86 B/串，精确分配后 ~32 B）。__zan_itoa64 本就先在栈上出数字再拷贝，
- * 这里把"分配"挪到知道长度之后：栈上出数字 → 分配 len+1 → 拷贝 → 记长度。 */
+/* 整数 → 托管串：0..9 直接返回不朽 ASCII 表（零堆分配），其余直接从
+ * digits200 栈缓冲单次 memcpy 到精确分配的托管串（消除双拷贝 + 函数调用）。 */
 LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -1214,21 +1344,39 @@ LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned) {
     LLVMTypeRef fn_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i32 }, 2, 0);
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_itoa_str");
     if (!fn) {
-        LLVMValueRef itoa = get_itoa64_fn(g);
         fn = LLVMAddFunction(g->mod, "__zan_itoa_str", fn_ty);
         LLVMSetLinkage(fn, LLVMInternalLinkage);
+        {
+            unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+            if (nw)
+                LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                        LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        }
         LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
         LLVMValueRef saved_fn = g->current_fn;
         g->current_fn = fn;
-        LLVMPositionBuilderAtEnd(g->builder,
-            LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+        LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+        LLVMBasicBlockRef fast1 = LLVMAppendBasicBlockInContext(g->ctx, fn, "fast1");
+        LLVMBasicBlockRef full = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
+
+        LLVMValueRef pv = LLVMGetParam(fn, 0);
+        LLVMValueRef puns = LLVMGetParam(fn, 1);
+
+        LLVMPositionBuilderAtEnd(g->builder, entry);
+        LLVMBuildCondBr(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntULT, pv, LLVMConstInt(i64, 10, 0), "s.lt10"),
+            fast1, full);
+
+        LLVMPositionBuilderAtEnd(g->builder, fast1);
+        LLVMValueRef asc_idx = LLVMBuildAdd(g->builder, pv, LLVMConstInt(i64, '0', 0), "s.d0");
+        LLVMBuildRet(g->builder, emit_ascii_char_ptr(g, asc_idx));
+
+        LLVMPositionBuilderAtEnd(g->builder, full);
         LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8,
             LLVMConstInt(i64, 24, 0), "itoa.s.tmp");
-        LLVMTypeRef itoa_ty = LLVMFunctionType(i64,
-            (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0);
-        LLVMValueRef len = zan_call2(g->builder, itoa_ty, itoa,
-            (LLVMValueRef[]){ tmp, LLVMGetParam(fn, 0), LLVMGetParam(fn, 1) },
-            3, "itoa.s.len");
+        LLVMValueRef start = NULL, len = NULL;
+        emit_itoa64_digits_into_tmp(g, fn, tmp, pv, puns, &start, &len);
+        LLVMValueRef src = LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &start, 1, "itoa.s.src");
         LLVMValueRef n1 = LLVMBuildAdd(g->builder, len,
             LLVMConstInt(i64, 1, 0), "itoa.s.n1");
         LLVMValueRef str = emit_string_alloc_rc(g, n1);
@@ -1237,7 +1385,9 @@ LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned) {
         LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
         if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_ty);
         zan_call2(g->builder, memcpy_ty, memcpy_fn,
-                  (LLVMValueRef[]){ str, tmp, n1 }, 3, "");
+                  (LLVMValueRef[]){ str, src, len }, 3, "");
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+            LLVMBuildInBoundsGEP2(g->builder, i8, str, &len, 1, "itoa.s.end"));
         emit_string_len_set(g, str, len);
         LLVMBuildRet(g->builder, str);
         g->current_fn = saved_fn;

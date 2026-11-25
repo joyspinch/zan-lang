@@ -65,6 +65,75 @@ int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
     }
     return 0;
 }
+static void emit_interp_snprintf_part(zan_irgen_t *g, LLVMTypeRef snprintf_type,
+                                      const char *fbuf, LLVMValueRef arg,
+                                      bool allow_stack, unsigned stack_cap,
+                                      LLVMValueRef *out_str,
+                                      LLVMValueRef *out_len,
+                                      unsigned char *out_own) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef fmt = zan_irgen_intern_string(g, fbuf);
+    if (allow_stack && stack_cap > 0) {
+        LLVMValueRef sbuf = emit_entry_scratch(g, stack_cap, "interp.fmt.s");
+        LLVMValueRef cap_v = LLVMConstInt(i64, (uint64_t)stack_cap, 0);
+        LLVMValueRef snp_args[] = { sbuf, cap_v, fmt, arg };
+        LLVMValueRef wn = zan_call2(g->builder, snprintf_type, g->fn_snprintf,
+                                    snp_args, 4, "wn");
+        LLVMValueRef wn64 = LLVMBuildSExt(g->builder, wn, i64, "wn64");
+        LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
+        LLVMValueRef maxl = LLVMConstInt(i64, (uint64_t)(stack_cap - 1), 0);
+        LLVMValueRef l0 = LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSLT, wn64, zero, "wlt0"),
+            zero, wn64, "wl0");
+        LLVMValueRef len = LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGT, l0, maxl, "wgt"),
+            maxl, l0, "wlen");
+        *out_str = sbuf;
+        *out_len = len;
+        *out_own = 0;
+        return;
+    }
+    LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
+    LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, arg };
+    LLVMValueRef needed = zan_call2(g->builder, snprintf_type, g->fn_snprintf,
+                                    snp_args1, 4, "needed");
+    LLVMValueRef needed64 = LLVMBuildSExt(g->builder, needed, i64, "n64");
+    LLVMValueRef buf_size = zan_add(g->builder, needed64,
+                                    LLVMConstInt(i64, 1, 0), "bsz");
+    LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
+    LLVMValueRef snp_args2[] = { buf, buf_size, fmt, arg };
+    zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args2, 4, "");
+    *out_str = buf;
+    *out_len = needed64;
+    *out_own = 1;
+}
+
+static unsigned interp_spec_stack_cap(const zan_istr_t *spec, bool is_float_arg) {
+    if (!spec || spec->len == 0) return 0;
+    char code = spec->str[0];
+    int digits = 0;
+    for (int i = 1; i < (int)spec->len; i++) {
+        if (spec->str[i] >= '0' && spec->str[i] <= '9') {
+            if (digits <= 9999) digits = digits * 10 + (spec->str[i] - '0');
+        }
+    }
+    if (code == 'D' || code == 'd' || code == 'X' || code == 'x')
+        return (digits <= 40) ? 64u : 0u;
+    if (code == 'E' || code == 'e' || code == 'G' || code == 'g')
+        return (digits <= 40) ? 64u : 0u;
+    if (code == 'F' || code == 'f') {
+        if (!is_float_arg) return (digits <= 32) ? 64u : 0u;
+        return (digits <= 32) ? 384u : 0u;
+    }
+    if (code == '0' || code == '#') {
+        if ((int)spec->len <= 32)
+            return is_float_arg ? 384u : 64u;
+    }
+    return 0u;
+}
+
 LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 字符串插值：将各子表达式格式化为字符串后统一拼接 */
@@ -132,26 +201,22 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMDoubleTypeInContext(g->ctx), "f2d")
                         : val;
                     if (flen <= 0) {
-                        LLVMValueRef buf = emit_string_alloc_rc(g,
-                            LLVMConstInt(i64, 40, 0));
+                        bool on_stack = !g->current_async_frame;
+                        LLVMValueRef buf = on_stack
+                            ? emit_entry_scratch(g, 40, "interp.d2s")
+                            : emit_string_alloc_rc(g, LLVMConstInt(i64, 40, 0));
                         emit_dbl_str(g, buf, LLVMConstInt(i64, 40, 0), val);
                         strs[i] = buf;
-                        lens[i] = emit_string_length(g, buf, expr->loc);
-                        owns[i] = 1;
+                        lens[i] = on_stack
+                            ? zan_call2(g->builder, strlen_type, g->fn_strlen,
+                                        &buf, 1, "interp.dlen")
+                            : emit_string_length(g, buf, expr->loc);
+                        owns[i] = on_stack ? 0 : 1;
                     } else {
-                    LLVMValueRef fmt = zan_irgen_intern_string(g, fbuf);
-                    LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
-                    LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
-                    LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, fval };
-                    LLVMValueRef needed = zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args1, 4, "needed");
-                    LLVMValueRef needed64 = LLVMBuildSExt(g->builder, needed, i64, "n64");
-                    LLVMValueRef buf_size = zan_add(g->builder, needed64, LLVMConstInt(i64, 1, 0), "bsz");
-                    LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-                    LLVMValueRef snp_args2[] = { buf, buf_size, fmt, fval };
-                    zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args2, 4, "");
-                    strs[i] = buf;
-                    lens[i] = needed64;
-                    owns[i] = 1;
+                        emit_interp_snprintf_part(g, snprintf_type, fbuf, fval,
+                            !g->current_async_frame,
+                            interp_spec_stack_cap(&spec, true),
+                            &strs[i], &lens[i], &owns[i]);
                     }
                 } else if (vtk == LLVMIntegerTypeKind &&
                            LLVMGetIntTypeWidth(vt) == 1) {
@@ -167,11 +232,18 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                         "blen");
                     owns[i] = 0;
                 } else if (expr_is_char(g, part, locals)) {
-                    /* char 类型插值为字符本身而非数值编码 */
-                    LLVMValueRef buf = emit_char_to_cstr(g, val);
-                    strs[i] = buf;
-                    lens[i] = emit_string_length(g, buf, expr->loc);
-                    owns[i] = 1;
+                    /* char 类型插值为字符本身而非数值编码（非 async 走 8B 栈零堆分配） */
+                    if (!g->current_async_frame) {
+                        LLVMValueRef sbuf = emit_entry_scratch(g, 8, "interp.c2s");
+                        strs[i] = sbuf;
+                        lens[i] = emit_char_to_stack(g, val, sbuf);
+                        owns[i] = 0;
+                    } else {
+                        LLVMValueRef buf = emit_char_to_cstr(g, val);
+                        strs[i] = buf;
+                        lens[i] = emit_string_length(g, buf, expr->loc);
+                        owns[i] = 1;
+                    }
                 } else if (llvm_is_nullable(vt)) {
                     /* 可空类型插值：与字符串拼接使用一致的强制转换 */
                     zan_type_t *st = infer_expr_type(g, part, locals);
@@ -214,20 +286,10 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                                 LLVMDoubleTypeInContext(g->ctx), "f2d")
                             : LLVMBuildSIToFP(g->builder, val64,
                                 LLVMDoubleTypeInContext(g->ctx), "i2d");
-                        LLVMValueRef fmt = zan_irgen_intern_string(g,
-                            fbuf);
-                        LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
-                        LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
-                        LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, as_d };
-                        LLVMValueRef needed = zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args1, 4, "needed");
-                        LLVMValueRef needed64 = LLVMBuildSExt(g->builder, needed, i64, "n64");
-                        LLVMValueRef buf_size = zan_add(g->builder, needed64, LLVMConstInt(i64, 1, 0), "bsz");
-                        LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-                        LLVMValueRef snp_args2[] = { buf, buf_size, fmt, as_d };
-                        zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args2, 4, "");
-                        strs[i] = buf;
-                        lens[i] = needed64;
-                        owns[i] = 1;
+                        emit_interp_snprintf_part(g, snprintf_type, fbuf, as_d,
+                            !g->current_async_frame,
+                            interp_spec_stack_cap(&spec, false),
+                            &strs[i], &lens[i], &owns[i]);
                         continue;
                     }
                     if (flen <= 0) {
@@ -243,20 +305,10 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                         owns[i] = on_stack ? 0 : 1;
                         continue;
                     }
-                    LLVMValueRef fmt = zan_irgen_intern_string(g,
-                        fbuf);
-                    LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
-                    LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
-                    LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, val64 };
-                    LLVMValueRef needed = zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args1, 4, "needed");
-                    LLVMValueRef needed64 = LLVMBuildSExt(g->builder, needed, i64, "n64");
-                    LLVMValueRef buf_size = zan_add(g->builder, needed64, LLVMConstInt(i64, 1, 0), "bsz");
-                    LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-                    LLVMValueRef snp_args2[] = { buf, buf_size, fmt, val64 };
-                    zan_call2(g->builder, snprintf_type, g->fn_snprintf, snp_args2, 4, "");
-                    strs[i] = buf;
-                    lens[i] = needed64;
-                    owns[i] = 1;
+                    emit_interp_snprintf_part(g, snprintf_type, fbuf, val64,
+                        !g->current_async_frame,
+                        interp_spec_stack_cap(&spec, false),
+                        &strs[i], &lens[i], &owns[i]);
                 }
             }
         }

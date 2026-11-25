@@ -410,6 +410,9 @@
                 }
 
                 LLVMContextRef c = g->ctx;
+                LLVMBasicBlockRef bb_chk1 = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.chk1");
+                LLVMBasicBlockRef bb_chk_asc = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.chkasc");
+                LLVMBasicBlockRef bb_ascii1 = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.asc1");
                 LLVMBasicBlockRef bb_slice = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.slice");
                 LLVMBasicBlockRef bb_full = total ? LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.full") : NULL;
                 LLVMBasicBlockRef bb_empty = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.empty");
@@ -424,15 +427,32 @@
                     LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_chk_full);
 
                     LLVMPositionBuilderAtEnd(g->builder, bb_chk_full);
-                    LLVMBuildCondBr(g->builder, is_full, bb_full, bb_slice);
+                    LLVMBuildCondBr(g->builder, is_full, bb_full, bb_chk1);
 
                     LLVMPositionBuilderAtEnd(g->builder, bb_full);
-                    LLVMTypeRef str_rel_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                    zan_call2(g->builder, str_rel_type, g->rt_str_retain, &s, 1, "");
+                    emit_string_retain(g, s);
                     LLVMBuildBr(g->builder, bb_join);
                 } else {
-                    LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_slice);
+                    LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_chk1);
                 }
+
+                /* 单字节 ASCII 切片直接返回不朽表槽位（零堆分配） */
+                LLVMPositionBuilderAtEnd(g->builder, bb_chk1);
+                LLVMValueRef is_len1 = zan_icmp(g->builder, LLVMIntEQ, slen, LLVMConstInt(i64, 1, 0), "sub.is1");
+                LLVMBuildCondBr(g->builder, is_len1, bb_chk_asc, bb_slice);
+
+                LLVMPositionBuilderAtEnd(g->builder, bb_chk_asc);
+                LLVMValueRef c1_ptr = LLVMBuildGEP2(g->builder, i8, s, &start, 1, "sub.c1p");
+                LLVMValueRef c1_b = LLVMBuildLoad2(g->builder, i8, c1_ptr, "sub.c1");
+                LLVMValueRef c1_i64 = LLVMBuildZExt(g->builder, c1_b, i64, "sub.c1.64");
+                LLVMValueRef c1_asc = zan_icmp(g->builder, LLVMIntULT, c1_i64,
+                    LLVMConstInt(i64, 128, 0), "sub.c1.asc");
+                zan_set_branch_weights(g,
+                    LLVMBuildCondBr(g->builder, c1_asc, bb_ascii1, bb_slice), 2000, 1);
+
+                LLVMPositionBuilderAtEnd(g->builder, bb_ascii1);
+                LLVMValueRef ascii1_str = emit_ascii_char_ptr(g, c1_i64);
+                LLVMBuildBr(g->builder, bb_join);
 
                 LLVMPositionBuilderAtEnd(g->builder, bb_empty);
                 /* Substring returns an ARC-compatible string on every path.
@@ -459,18 +479,20 @@
                 LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
                 /* 无 \0 范围内的切片：slen 为切片结果字符串长度 */
                 emit_string_len_set(g, buf, slen);
+                LLVMBasicBlockRef slice_end = LLVMGetInsertBlock(g->builder);
                 LLVMBuildBr(g->builder, bb_join);
 
                 LLVMPositionBuilderAtEnd(g->builder, bb_join);
                 LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "sub.res");
-                LLVMValueRef phi_in_vals[3];
-                LLVMBasicBlockRef phi_in_bbs[3];
+                LLVMValueRef phi_in_vals[4];
+                LLVMBasicBlockRef phi_in_bbs[4];
                 int np = 0;
                 phi_in_vals[np] = empty_str; phi_in_bbs[np] = bb_empty; np++;
+                phi_in_vals[np] = ascii1_str; phi_in_bbs[np] = bb_ascii1; np++;
                 if (total) {
                     phi_in_vals[np] = s; phi_in_bbs[np] = bb_full; np++;
                 }
-                phi_in_vals[np] = buf; phi_in_bbs[np] = bb_slice; np++;
+                phi_in_vals[np] = buf; phi_in_bbs[np] = slice_end; np++;
                 LLVMAddIncoming(phi, phi_in_vals, phi_in_bbs, (unsigned)np);
 
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);

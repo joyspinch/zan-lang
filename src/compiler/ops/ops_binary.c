@@ -240,8 +240,10 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             both_ptr && str_operand &&
             expr->binary.left->kind != AST_NULL_LITERAL &&
             expr->binary.right->kind != AST_NULL_LITERAL) {
-            LLVMValueRef lc = emit_str_nonnull(g, left);
-            LLVMValueRef rc = emit_str_nonnull(g, right);
+            LLVMValueRef lc = expr->binary.left->kind == AST_STRING_LITERAL
+                ? left : emit_str_nonnull(g, left);
+            LLVMValueRef rc = expr->binary.right->kind == AST_STRING_LITERAL
+                ? right : emit_str_nonnull(g, right);
             LLVMValueRef eqfn = get_str_eq_fn(g, expr->loc);
             LLVMValueRef eq = zan_call2(g->builder,
                 LLVMGlobalGetValueType(eqfn), eqfn,
@@ -267,8 +269,10 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             expr->binary.left->kind != AST_NULL_LITERAL &&
             expr->binary.right->kind != AST_NULL_LITERAL) {
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef lc = emit_str_nonnull(g, left);
-            LLVMValueRef rc = emit_str_nonnull(g, right);
+            LLVMValueRef lc = expr->binary.left->kind == AST_STRING_LITERAL
+                ? left : emit_str_nonnull(g, left);
+            LLVMValueRef rc = expr->binary.right->kind == AST_STRING_LITERAL
+                ? right : emit_str_nonnull(g, right);
             LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, expr->loc);
             LLVMValueRef r = zan_call2(g->builder,
                 LLVMGlobalGetValueType(ocmp), ocmp,
