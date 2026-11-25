@@ -198,6 +198,13 @@ typedef struct {
     zan_ast_node_t *body;
 } async_scan_t;
 
+/* Frame-header SCHED word bits shared with the M:N runtime
+ * (rt_io_co_pool.c CO_RUNNING); the in-module driver keeps SCHED at 0. */
+#define ZAN_CO_RUNNING_BIT 2LL
+/* Max coroutines started inline (await site, construct_await.c) nested on
+ * one thread before the await falls back to the scheduler. */
+#define ZAN_CO_INLINE_DEPTH_MAX 64
+
 enum {
     ASYNC_FRAME_SCHED = 0,
     ASYNC_FRAME_SCHED_STEP = 1,
@@ -256,6 +263,7 @@ void emit_raise_exception(zan_irgen_t *g);
 void emit_raise_exception_through_cleanups(zan_irgen_t *g);
 LLVMBasicBlockRef zan_raise_unwind_dest(zan_irgen_t *g, bool include_cleanups);
 LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g);
+LLVMValueRef zan_eh_co_depth_ptr(zan_irgen_t *g);
 LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g);
 void zan_emit_raise_call(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef *args, unsigned n,
                          LLVMBasicBlockRef cont_bb, bool include_cleanups);

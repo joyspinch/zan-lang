@@ -831,7 +831,7 @@ enum {
     EH_F_TOP = 0,
     EH_F_TMPS_TOP,
     EH_F_EXC_OWNED,
-    EH_F_PAD,
+    EH_F_CO_DEPTH, /* inline coroutine starts nested on this thread */
     EH_F_EXC,
     EH_F_EXC_TID,
     EH_F_BUFS,

@@ -1157,33 +1157,177 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBasicBlockRef probe_bb = LLVMGetInsertBlock(g->builder);
                 LLVMBuildCondBr(g->builder, fast_cond, cont_bb, prep_bb);
 
+                /* 同步优先启动（C# 语义）：子协程在调用方线程上内联跑到第一个
+                 * 真挂起点；同步完成的 await 不进调度器、不过线程。
+                 *
+                 * 内联期间子帧的 sched 置 RUNNING，与 co_run 的约定一致：子协程
+                 * 挂起后若在本调用返回前就被别的线程唤醒，唤醒只记 NOTIFIED，
+                 * 由这里返回后补交调度器，绝不会两个线程同跑一帧。
+                 *
+                 * 完成判据是 awaiter == 1（子协程收尾的最后一次 xchg），不是
+                 * DONE：DONE 先于收尾发布，子协程若挂起后在别的 worker 上完成，
+                 * 看见 DONE 时它可能还没碰完帧。awaiter 交换之后完成方不再触帧。
+                 *
+                 * 子协程真挂起时，父帧的 sub/child/state 必须在 CAS 登记 awaiter
+                 * **之前**写好：CAS 一成功子协程就可能在别处完成并唤醒父帧。
+                 *
+                 * 嵌套深度按线程计（EH 状态块里的 EH_F_CO_DEPTH），超限退回旧路径
+                 * 交调度器，深的同步完成递归不会吃穿 worker 的原生栈。 */
                 LLVMPositionBuilderAtEnd(g->builder, prep_bb);
                 di_set_loc(g, expr->loc);
-                zan_store_fit(g, g->current_async_resume_fn,
-                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
+                LLVMTypeRef hdr_i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMBasicBlockRef inl_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inline");
+                LLVMBasicBlockRef run_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inl.run");
+                LLVMBasicBlockRef ntf_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inl.notified");
+                LLVMBasicBlockRef chk_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inl.chk");
+                LLVMBasicBlockRef sched_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.sched");
+                LLVMBasicBlockRef reg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.reg");
+                LLVMBasicBlockRef unreg_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "await.unreg");
                 LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                     ASYNC_FRAME_AWAITER, "sub.aw");
                 LLVMTypeRef aw_target_pty = LLVMPointerType(ptr_int_ty, 0);
                 LLVMValueRef aw_iptr = (LLVMTypeOf(aw_ptr) == aw_target_pty) ? aw_ptr :
                     LLVMBuildBitCast(g->builder, aw_ptr, aw_target_pty, "sub.aw.iptr");
+                LLVMValueRef sched_p =
+                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_SCHED, "sub.sched.p");
+                LLVMValueRef depth_p = zan_eh_co_depth_ptr(g);
+                LLVMValueRef depth = LLVMBuildLoad2(g->builder, i32, depth_p, "co.depth");
+                LLVMValueRef depth_ok =
+                    zan_icmp(g->builder, LLVMIntULT, depth,
+                             LLVMConstInt(i32, ZAN_CO_INLINE_DEPTH_MAX, 0), "co.depth.ok");
+                LLVMBuildCondBr(g->builder, depth_ok, inl_bb, sched_bb);
+
+                LLVMPositionBuilderAtEnd(g->builder, inl_bb);
+                di_set_loc(g, expr->loc);
+                LLVMValueRef claim = LLVMBuildAtomicCmpXchg(
+                    g->builder, sched_p, LLVMConstInt(hdr_i64, 0, 0),
+                    LLVMConstInt(hdr_i64, ZAN_CO_RUNNING_BIT, 0), LLVMAtomicOrderingAcquireRelease,
+                    LLVMAtomicOrderingAcquire, 0);
+                LLVMBuildCondBr(g->builder,
+                                LLVMBuildExtractValue(g->builder, claim, 1, "sub.claimed"), run_bb,
+                                sched_bb);
+
+                LLVMPositionBuilderAtEnd(g->builder, run_bb);
+                di_set_loc(g, expr->loc);
+                /* 已取消的父帧：与旧路径 zan_task_child 先传播取消再启动等价 */
+                {
+                    LLVMValueRef self_cancel_p = get_async_cancel_ptr(g);
+                    LLVMValueRef self_cancel =
+                        LLVMBuildLoad2(g->builder, i32, self_cancel_p, "self.cancelled");
+                    LLVMValueRef sub_cancel_p = LLVMBuildStructGEP2(
+                        g->builder, hdr, sub_i8, ASYNC_FRAME_CANCEL, "sub.cancel.p");
+                    LLVMBasicBlockRef cprop_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inl.cancel");
+                    LLVMBasicBlockRef go_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, fn, "await.inl.go");
+                    LLVMBuildCondBr(g->builder,
+                                    zan_icmp(g->builder, LLVMIntNE, self_cancel,
+                                             LLVMConstInt(i32, 0, 0), "self.cancelled.nz"),
+                                    cprop_bb, go_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, cprop_bb);
+                    LLVMValueRef cst =
+                        LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), sub_cancel_p);
+                    LLVMSetOrdering(cst, LLVMAtomicOrderingRelease);
+                    LLVMSetAlignment(cst, 4);
+                    LLVMBuildBr(g->builder, go_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, go_bb);
+                    di_set_loc(g, expr->loc);
+                }
+                LLVMBuildStore(
+                    g->builder,
+                    LLVMBuildAdd(g->builder, depth, LLVMConstInt(i32, 1, 0), "co.depth.in"),
+                    depth_p);
+                zan_call2(g->builder, g->co_step_type, sub_resume, &sub_i8, 1, "");
+                LLVMBuildStore(g->builder, depth, depth_p);
+                LLVMValueRef release = LLVMBuildAtomicCmpXchg(
+                    g->builder, sched_p, LLVMConstInt(hdr_i64, ZAN_CO_RUNNING_BIT, 0),
+                    LLVMConstInt(hdr_i64, 0, 0), LLVMAtomicOrderingAcquireRelease,
+                    LLVMAtomicOrderingAcquire, 0);
+                LLVMBuildCondBr(g->builder,
+                                LLVMBuildExtractValue(g->builder, release, 1, "sub.released"),
+                                chk_bb, ntf_bb);
+
+                /* 内联期间被唤醒（NOTIFIED，可能带 SELFQ）：清回空闲再按记下的
+                 * 入口正常交调度器。唤醒只有这一份，中间不会有第二个唤醒者。 */
+                LLVMPositionBuilderAtEnd(g->builder, ntf_bb);
+                di_set_loc(g, expr->loc);
+                {
+                    LLVMValueRef pend_p = LLVMBuildStructGEP2(
+                        g->builder, hdr, sub_i8, ASYNC_FRAME_SCHED_STEP, "sub.pending.p");
+                    LLVMValueRef pend =
+                        LLVMBuildLoad2(g->builder, g->co_step_ptr, pend_p, "sub.pending");
+                    LLVMSetOrdering(pend, LLVMAtomicOrderingMonotonic);
+                    LLVMValueRef has_pend =
+                        zan_icmp(g->builder, LLVMIntNE, pend, LLVMConstNull(g->co_step_ptr),
+                                 "sub.pending.nz");
+                    LLVMValueRef step =
+                        LLVMBuildSelect(g->builder, has_pend, pend, sub_resume, "sub.pending.step");
+                    LLVMValueRef clr =
+                        LLVMBuildStore(g->builder, LLVMConstInt(hdr_i64, 0, 0), sched_p);
+                    LLVMSetOrdering(clr, LLVMAtomicOrderingSequentiallyConsistent);
+                    LLVMSetAlignment(clr, 8);
+                    LLVMValueRef ready_args[] = {sub_i8, step};
+                    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, ready_args, 2, "");
+                    LLVMBuildBr(g->builder, chk_bb);
+                }
+
+                LLVMPositionBuilderAtEnd(g->builder, chk_bb);
+                di_set_loc(g, expr->loc);
+                LLVMValueRef aw_now = LLVMBuildLoad2(g->builder, ptr_int_ty, aw_iptr, "sub.aw.now");
+                LLVMSetOrdering(aw_now, LLVMAtomicOrderingAcquire);
+                LLVMBuildCondBr(g->builder,
+                                zan_icmp(g->builder, LLVMIntEQ, aw_now,
+                                         LLVMConstInt(ptr_int_ty, 1, 0), "sub.finished"),
+                                cont_bb, reg_bb);
+
+                /* 深度超限（或子帧不在空闲态）：照旧交调度器，随后与真挂起同路登记 */
+                LLVMPositionBuilderAtEnd(g->builder, sched_bb);
+                di_set_loc(g, expr->loc);
+                {
+                    LLVMValueRef sched_args[] = {sub_i8, sub_resume};
+                    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+                    LLVMBuildBr(g->builder, reg_bb);
+                }
+
+                LLVMPositionBuilderAtEnd(g->builder, reg_bb);
+                di_set_loc(g, expr->loc);
+                zan_store_fit(g, g->current_async_resume_fn,
+                              LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP,
+                                                  "sub.aws"));
+                LLVMValueRef sub_slot = get_async_sub_slot_ptr(g);
+                zan_store_fit(g, sub_i8, sub_slot);
+                zan_store_fit(g, sub_i8, get_async_child_ptr(g));
+                LLVMValueRef edge_args[] = {get_async_self_i8(g), sub_i8};
+                emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx),
+                                       edge_args, 2);
+                zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMValueRef self_int = get_async_self_int(g, ptr_int_ty);
                 LLVMValueRef cas_res = LLVMBuildAtomicCmpXchg(g->builder, aw_iptr,
                     LLVMConstInt(ptr_int_ty, 0, 0), self_int,
                     LLVMAtomicOrderingSequentiallyConsistent,
                     LLVMAtomicOrderingSequentiallyConsistent, 0);
                 LLVMValueRef won = LLVMBuildExtractValue(g->builder, cas_res, 1, "cas.won");
-                LLVMBuildCondBr(g->builder, won, suspend_bb, cont_bb);
+                LLVMBuildCondBr(g->builder, won, suspend_bb, unreg_bb);
+
+                /* 登记前子协程已在别处完成：撤掉刚建的取消边，直接取结果 */
+                LLVMPositionBuilderAtEnd(g->builder, unreg_bb);
+                di_set_loc(g, expr->loc);
+                zan_store_fit(g, LLVMConstNull(i8ptr), get_async_child_ptr(g));
+                {
+                    LLVMValueRef unedge_args[] = {get_async_self_i8(g), LLVMConstNull(i8ptr)};
+                    emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx),
+                                           unedge_args, 2);
+                }
+                LLVMBuildBr(g->builder, cont_bb);
 
                 LLVMPositionBuilderAtEnd(g->builder, suspend_bb);
                 di_set_loc(g, expr->loc);
-                LLVMValueRef sub_slot = get_async_sub_slot_ptr(g);
-                zan_store_fit(g, sub_i8, sub_slot);
-                zan_store_fit(g, sub_i8, get_async_child_ptr(g));
-                LLVMValueRef edge_args[] = { get_async_self_i8(g), sub_i8 };
-                emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx), edge_args, 2);
-                zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
-                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
-                zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMPositionBuilderAtEnd(g->builder, rk);
@@ -1194,9 +1338,9 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMPositionBuilderAtEnd(g->builder, cont_bb);
                 di_set_loc(g, expr->loc);
                 LLVMValueRef completed_sub = LLVMBuildPhi(g->builder, i8ptr, "sub.completed");
-                LLVMValueRef sub_vals[] = { sub_i8, sub_i8, sub_rl };
-                LLVMBasicBlockRef sub_bbs[] = { probe_bb, prep_bb, rk };
-                LLVMAddIncoming(completed_sub, sub_vals, sub_bbs, 3);
+                LLVMValueRef sub_vals[] = {sub_i8, sub_i8, sub_i8, sub_rl};
+                LLVMBasicBlockRef sub_bbs[] = {probe_bb, chk_bb, unreg_bb, rk};
+                LLVMAddIncoming(completed_sub, sub_vals, sub_bbs, 4);
                 emit_async_check_sub_exc(g, completed_sub, NULL);
                 LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, completed_sub,
                     ASYNC_FRAME_RESULT, "sub.result");

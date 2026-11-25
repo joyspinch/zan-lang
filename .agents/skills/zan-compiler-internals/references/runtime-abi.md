@@ -360,3 +360,28 @@ POSIX `StartProgram` 用 CLOEXEC 错误管道确认最终 exec，重定向或 ex
   （SIGTRAP）。以 0 创建再 signal n 次。
 - **自写 LSP 帧要显式 flush**：POSIX 管道上 stdout 行缓冲，JSON 体末尾没有换行，
   不 flush 则客户端与服务端互等。
+
+## 16. await 同步优先启动：内联跑子协程的三条不变量（2026-11-25 macOS 验证）
+
+`await f()`（async 方法里的直接异步调用）在调用方线程上内联跑子协程到第一个真
+挂起点（`construct_await.c` 的 `await.inline`），同步完成的 await 不进调度器——
+asyncchain（2M 次 await 一个不挂起的 `Step`）3.3 s 墙钟 / 5.3 s sys → 0.08 s /
+0 sys（约 40 ns/await）。旧做法每次 await 都 `zan_co_ready(child)` 交 worker、父
+帧挂起等回交，两次调度跳 + kevent/pipe 唤醒，约 1.7 µs。改这段时守住：
+
+- **内联期间子帧 sched 置 RUNNING**（CAS 0→`ZAN_CO_RUNNING_BIT`，返回后 CAS 回
+  0）：子协程挂起后可能在本调用返回前就被别的线程唤醒，RUNNING 让唤醒只记
+  NOTIFIED，这里返回后清零再按 `SCHED_STEP` 里记下的入口 `zan_co_ready`——与
+  `co_run` 的约定相同，否则两个线程同跑一帧。in-module 驱动 sched 恒 0，同一段 IR
+  照样成立；不新增运行时导出符号，预编译交叉 bundle 无需刷新。
+- **完成判据是 awaiter == 1，不是 DONE**：DONE 在收尾早段发布，子协程挂起后在别
+  的 worker 上完成时，看见 DONE 它可能还在碰帧；awaiter 的最后一次 xchg 之后完成方
+  不再触帧，才能取结果并释放。
+- **真挂起时先写后登记**：父帧的 sub_slot / child / state 与 `zan_task_child` 边
+  必须在 CAS 登记 awaiter **之前**写好——子协程已是活的，CAS 一成功它就可能完成并
+  唤醒父帧；CAS 落败（已在别处完成）要撤掉刚建的取消边。
+- 嵌套深度按线程计在 EH 状态块（`EH_F_CO_DEPTH`，原 PAD 槽），超过
+  `ZAN_CO_INLINE_DEPTH_MAX`(64) 退回调度器，深的同步完成递归不吃穿 worker 栈；父帧
+  已取消时先把取消写进子帧再内联（等价旧路径 `zan_task_child` 先传播）。
+  `Task.Spawn` / `Task.Run` / 非 async 调用方的根 await 不变（仍并发 / 根驱动）。
+  回归：`tests/conformance/async_inline_start.zan`。

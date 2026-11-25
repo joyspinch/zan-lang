@@ -23,7 +23,7 @@ static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
     fields[EH_F_TOP] = i32t;
     fields[EH_F_TMPS_TOP] = i32t;
     fields[EH_F_EXC_OWNED] = i32t;
-    fields[EH_F_PAD] = i32t;
+    fields[EH_F_CO_DEPTH] = i32t;
     fields[EH_F_EXC] = i8ptr;
     fields[EH_F_EXC_TID] = i8ptr;
     fields[EH_F_BUFS] = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
@@ -993,6 +993,12 @@ static unsigned eh_tmp_shift(zan_irgen_t *g) {
  * are unchanged: inside a try (eh.top >= 0) it throws through the caller's
  * landing pad (the site invokes it), otherwise it reports and returns. */
 LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g) { return emit_eh_state(g); }
+
+/* Per-thread nesting depth of coroutines started inline at an await site
+ * (construct_await.c). Lives in the calloc'd per-thread EH state block. */
+LLVMValueRef zan_eh_co_depth_ptr(zan_irgen_t *g) {
+    return emit_eh_field_ptr(g, EH_F_CO_DEPTH, "eh.codepth");
+}
 
 LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_guard_raise");
