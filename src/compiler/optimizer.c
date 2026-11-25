@@ -294,7 +294,7 @@ static bool is_safe_pure_function(const char *fn_name) {
     return true;
   }
 
-  /* 边界检查与只读运行时探针（不修改目标对象引用计数或内存布局） */
+  /* 边界检查、只读运行时探针与不释放既有对象的分配/EH 助手（不修改目标对象引用计数） */
   if (strcmp(fn_name, "zan_bound_check") == 0 ||
       strcmp(fn_name, "zan_rt_bound_check") == 0 ||
       strcmp(fn_name, "zan_rt_str_len") == 0 ||
@@ -304,7 +304,15 @@ static bool is_safe_pure_function(const char *fn_name) {
       strcmp(fn_name, "zan_rt_str_bytes") == 0 ||
       strcmp(fn_name, "zan_rt_arr_len") == 0 ||
       strcmp(fn_name, "zan_rt_now_ms") == 0 ||
-      strcmp(fn_name, "zan_rt_tick_us") == 0) {
+      strcmp(fn_name, "zan_rt_tick_us") == 0 ||
+      strcmp(fn_name, "zan_rt_alloc") == 0 ||
+      strcmp(fn_name, "zan_rt_str_alloc") == 0 ||
+      strcmp(fn_name, "zan_rt_soft_is_hard") == 0 ||
+      strcmp(fn_name, "zan_rt_soft_scratch") == 0 ||
+      strcmp(fn_name, "__zan_eh_state") == 0 ||
+      strcmp(fn_name, "__zan_eh_state_fast") == 0 ||
+      strcmp(fn_name, "GetCurrentThreadId") == 0 ||
+      strcmp(fn_name, "pthread_self") == 0) {
     return true;
   }
 
@@ -2091,6 +2099,13 @@ static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
           strcmp(name, "zan_release") == 0 ||
           strcmp(name, "zan_rt_str_retain") == 0 ||
           strcmp(name, "zan_rt_str_release") == 0 ||
+          strcmp(name, "zan_rt_arr_retain") == 0 ||
+          strcmp(name, "zan_rt_arr_release") == 0 ||
+          strcmp(name, "zan_rt_str_len") == 0 ||
+          strcmp(name, "zan_rt_str_compare") == 0 ||
+          strcmp(name, "zan_rt_str_equal") == 0 ||
+          strcmp(name, "zan_rt_str_hash") == 0 ||
+          strcmp(name, "zan_rt_str_bytes") == 0 ||
           strcmp(name, "zan_rt_arr_len") == 0 ||
           strcmp(name, "zan_bound_check") == 0 ||
           strcmp(name, "zan_rt_bound_check") == 0 ||

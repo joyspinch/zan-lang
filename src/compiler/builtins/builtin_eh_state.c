@@ -303,6 +303,15 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
 static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name);
 
+static void add_ret_enum_attr(zan_irgen_t *g, LLVMValueRef fn,
+                              const char *name) {
+  unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+  if (kind && fn) {
+    LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeReturnIndex,
+                            LLVMCreateEnumAttribute(g->ctx, kind, 0));
+  }
+}
+
 /* ---- Apple arm64: thread-specific data instead of a TLV slot ----------
  * On Mach-O a thread_local access is a call through its TLV descriptor
  * (_tlv_get_addr) whatever the TLS model; every function that touches the
@@ -436,6 +445,8 @@ static LLVMValueRef get_eh_tsd_state_fn(zan_irgen_t *g) {
     fn = LLVMAddFunction(g->mod, "__zan_eh_state_tsd", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     add_enum_attr(g, fn, NULL, "noinline");
+    add_enum_attr(g, fn, NULL, "nounwind");
+    add_ret_enum_attr(g, fn, "nonnull");
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef init = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
@@ -495,6 +506,8 @@ static LLVMValueRef get_eh_state_fast_tsd_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_eh_state_fast", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     add_enum_attr(g, fn, NULL, "alwaysinline");
+    add_enum_attr(g, fn, NULL, "nounwind");
+    add_ret_enum_attr(g, fn, "nonnull");
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef rd = LLVMAppendBasicBlockInContext(g->ctx, fn, "tsd");
@@ -546,6 +559,8 @@ static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g) {
   fn = LLVMAddFunction(g->mod, "__zan_eh_state_fast", fnty);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
   add_enum_attr(g, fn, NULL, "alwaysinline");
+  add_enum_attr(g, fn, NULL, "nounwind");
+  add_ret_enum_attr(g, fn, "nonnull");
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
   LLVMBasicBlockRef slowbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
@@ -771,6 +786,8 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
   LLVMSetLinkage(fn, LLVMInternalLinkage);
   add_enum_attr(g, fn, NULL, "noinline");
   add_enum_attr(g, fn, NULL, "cold");
+  add_enum_attr(g, fn, NULL, "nounwind");
+  add_ret_enum_attr(g, fn, "nonnull");
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMTypeRef caty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64t, i64t}, 2, 0);
   LLVMValueRef calloc_fn = get_libc_fn(g, "calloc", caty);
