@@ -513,6 +513,15 @@ LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
 /* --- From irgen_builtins.c (36 functions) --- */
 LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key, zan_type_t *kt);
 LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef draw, LLVMValueRef key);
+/* 字典键种类（__zan_dict_find/set/remove 的第三参）：0 = 其余原始键（引用
+ * 同一性、浮点位型等，种子哈希）；1 = 字符串（运行时 SipHash）；
+ * ZAN_DICT_KEY_INT = 整数类键——索引先用恒等定位（顺序/稠密键访问连续），
+ * 任一插入探测超过 ZAN_DICT_IDENT_MAX_PROBE 组即整表退回种子哈希。
+ * 种类只决定新索引的起始模式，此后哈希一律以索引里的 plim 为准。 */
+#define ZAN_DICT_KEY_INT 2
+#define ZAN_DICT_PLIM_SEEDED 0x7FFFFFFFFFFFFFFFull
+#define ZAN_DICT_IDENT_MAX_PROBE 4
+long long dict_key_hash_kind(zan_type_t *kt, int unknown_is_str);
 LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx);
 void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp);
 LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx);

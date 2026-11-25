@@ -146,14 +146,16 @@ void emit_dict_value_set(zan_irgen_t *g, zan_type_t *dict_type,
     zan_type_t *key_type = dict_key_type(g, dict_type);
     zan_type_t *value_type = dict_value_type(dict_type);
     LLVMValueRef value_words = load_dict_value_words(g, raw);
-    LLVMValueRef existing = emit_dict_find(g, dict_type, raw, key);
-    LLVMValueRef was_hit = zan_icmp(g->builder, LLVMIntSGE, existing,
-        LLVMConstInt(i64, 0, 0), "dset.hit");
-    LLVMValueRef is_str = LLVMConstInt(i64,
-        (key_type && key_type->kind == TYPE_STRING) ? 1 : 0, 0);
+    /* __zan_dict_set 一次探测同时给出命中与否：命中返回条目下标，新追加
+     * 返回 ~下标。曾先单独 find 判命中、set 内再 find 一遍，每次写入探两次。 */
+    LLVMValueRef is_str = LLVMConstInt(i64, dict_key_hash_kind(key_type, 1), 0);
     LLVMValueRef set_fn = get_dict_set_fn(g);
-    LLVMValueRef index = zan_call2(g->builder, LLVMGlobalGetValueType(set_fn),
-        set_fn, (LLVMValueRef[]){ raw, key, is_str }, 3, "dset.ix");
+    LLVMValueRef sres = zan_call2(g->builder, LLVMGlobalGetValueType(set_fn), set_fn,
+                                  (LLVMValueRef[]){raw, key, is_str}, 3, "dset.r");
+    LLVMValueRef was_hit =
+        zan_icmp(g->builder, LLVMIntSGE, sres, LLVMConstInt(i64, 0, 0), "dset.hit");
+    LLVMValueRef index = LLVMBuildSelect(g->builder, was_hit, sres,
+                                         LLVMBuildNot(g->builder, sres, "dset.app"), "dset.ix");
     LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
         LLVMPointerType(g->dict_struct_type, 0), "dset.dp");
     LLVMValueRef values_ptr = LLVMBuildStructGEP2(g->builder,

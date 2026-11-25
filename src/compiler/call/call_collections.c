@@ -816,6 +816,13 @@
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), res_a);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, miss_bb);
+                        /* 显式 `out` 实参未命中按 C# 语义置 default(TValue)——曾
+                         * 原样留下未初始化的局部，`TryGetValue(k, out v);
+                         * d[k] = v + 1` 计数写法读到栈垃圾。不带 out 的裸标识符
+                         * 写法保持旧约定（未命中不动原值，case_tryget_pinyin 钉住）。 */
+                        if (out_ptr && value_type && out_arg->kind == AST_REF_ARG &&
+                            out_arg->ref_arg.is_out)
+                            emit_typed_out_store(g, value_type, out_ptr, LLVMConstNull(value_llvm));
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res_a);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
@@ -914,9 +921,8 @@
                         LLVMBuildCondBr(g->builder, nonempty, body_bb, miss_bb);
                         LLVMPositionBuilderAtEnd(g->builder, body_bb);
                         LLVMValueRef rmfn = get_dict_remove_fn(g);
-                        LLVMValueRef is_str = LLVMConstInt(i64,
-                            (dict_key_type(g, dict_type) &&
-                             dict_key_type(g, dict_type)->kind == TYPE_STRING) ? 1 : 0, 0);
+                        LLVMValueRef is_str = LLVMConstInt(
+                            i64, dict_key_hash_kind(dict_key_type(g, dict_type), 0), 0);
                         LLVMValueRef fi = zan_call2(g->builder,
                             LLVMGlobalGetValueType(rmfn), rmfn,
                             (LLVMValueRef[]){ raw, search, is_str }, 3, "dr.rm");

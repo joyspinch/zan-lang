@@ -691,9 +691,10 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 
 ## 三、运行时数据布局与内存所有权（Runtime / ARC）
 
-27. **Dict 内建内存布局与保序约束**：
-   - 动作：Dict 的 keys/values 并行缓冲区必须严格保持插入顺序；元素删除（Remove）使用 memmove 整体向前搬移并置 `indexed_count = 0` 使索引表整体失效。
-   - 理由：枚举顺序与析构顺序依赖插入序；防止增量哈希索引修复引发探测链死循环。
+27. **Dict 内建内存布局、保序约束与整数键自适应哈希**：
+   - 动作：Dict 的 keys/values 并行缓冲区必须严格保持插入顺序；Remove 整体前移条目并就地修索引（墓碑 + 下标减一），墓碑到负载上限才整表重建。索引 = `ctrl[cap+16] | slots[cap] | tomb | plim`（`builtin_dict.c`）。整数类键（`ZAN_DICT_KEY_INT`）的索引先用**恒等定位**（h1 = 键），`plim` 记任一插入的最大探测组序号，查找探过 `plim` 组即判缺失；某次插入超过 `ZAN_DICT_IDENT_MAX_PROBE` 组就整表改用种子哈希重建（`plim = ZAN_DICT_PLIM_SEEDED`，扩容继承）。哈希种类永远以索引的 `plim` 为准，调用点传的种类只定新索引起始模式；`__zan_dict_key_eq` 只认种类 1 为字符串。
+   - 理由：枚举顺序与析构顺序依赖插入序。种子哈希把顺序整数键打散成随机访存，`Dict<int,int>` 200 万键 + 1000 万查找比 `std::unordered_map`（恒等哈希、顺序流式访存）慢 4–6×——恒等实验证明表结构本身只差 1.3×，差距全在定位策略。纯恒等在 2 的幂表上会被步长 2^k / 打包键打成长链、缺失查找扫整段稠密跑道，所以必须带 plim 截断 + 探测超限回退，HashDoS 下每次操作代价仍有常数上界（`case_dict_int_identity_fallback`）。
+   - 边界：`d[k] = v` 只调一次 `__zan_dict_set`（命中返回下标、追加返回 ~下标），不要在外面再 find 判命中；显式 `out` 的 TryGetValue 未命中写 default，裸标识符旧写法未命中保留原值（`case_tryget_pinyin`）。
 28. **FFI 外部指针借用与内建所有权白名单**：
    - 动作：从 `DllImport` 外部返回的字符串是借用指针，运行时不释放、不下标；内建 API 若返回借用或托管字符串必须显式在借用白名单中登记。
    - 理由：防止跨 FFI 边界的野指针析构或托管堆内存泄漏。

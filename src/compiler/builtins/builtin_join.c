@@ -130,13 +130,31 @@ static LLVMValueRef emit_dict_key_eq(zan_irgen_t *g, zan_type_t *dict_type,
         (LLVMValueRef[]){ kv, search, is_str }, 3, "keq");
 }
 
+long long dict_key_hash_kind(zan_type_t *kt, int unknown_is_str) {
+    if (!kt) return unknown_is_str ? 1 : 0;
+    switch (kt->kind) {
+        case TYPE_STRING: return 1;
+        case TYPE_BYTE:
+        case TYPE_SHORT:
+        case TYPE_INT:
+        case TYPE_LONG:
+        case TYPE_SBYTE:
+        case TYPE_USHORT:
+        case TYPE_UINT:
+        case TYPE_ULONG:
+        case TYPE_CHAR:
+        case TYPE_ENUM: return ZAN_DICT_KEY_INT;
+        default: return 0;
+    }
+}
+
 /* 发射`__zan_dict_find(dict, key, is_str)` for a dict of type `dict_type` */
 LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                                    LLVMValueRef draw, LLVMValueRef key) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     zan_type_t *kt = dict_key_type(g, dict_type);
-    LLVMValueRef is_str = LLVMConstInt(i64, (!kt || kt->kind == TYPE_STRING) ? 1 : 0, 0);
+    LLVMValueRef is_str = LLVMConstInt(i64, dict_key_hash_kind(kt, 1), 0);
     LLVMValueRef fn = get_dict_find_fn(g);
     if (LLVMTypeOf(draw) != i8ptr)
         draw = LLVMBuildBitCast(g->builder, draw, i8ptr, "d8");
