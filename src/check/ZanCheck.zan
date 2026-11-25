@@ -1,0 +1,257 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Collections.Generic;
+
+// zan-check：S5（docs/ZAN_STANDARD.md §1）的原生命令——一条命令跑完，输出单份
+// JSON 报告。用 Zan 写、随工具链发布，不依赖 Python。
+//
+//   zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run]
+//             [--zanc-arg <参数>]... [--out <report.json>] [-- 程序参数...]
+//
+// 步骤（失败步骤之后依赖它的步骤记 skipped，报告照样完整）：
+//   compile  zanc <输入> --auto-stdlib --check-leaks --diag=json：诊断原样收进报告
+//            （JSON Lines，含 fix-it 与 end），summary 的 errors/warnings 计数；
+//   leaks    运行产物（带超时），解析退出时的泄漏报告（S10/S13）：残留数、按站点
+//            计数、孤儿环路径、判定口径 strict / early-exit；有泄漏、退出码非 0、
+//            超时即失败；
+//   ui       zan ui check（S22，P2）未实现，恒 skipped；
+//   replay   回放比对与不变量（S26/S27，P3）未实现，恒 skipped。
+// 退出码：0 没有失败步骤（skipped 不算失败）；1 有失败；2 参数问题。
+public class ZanCheck {
+    static string Esc(string s) {
+        if (s == null) { return ""; }
+        return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n")
+                .Replace("\r", "\\r").Replace("\t", "\\t");
+    }
+
+    static string Str(string s) {
+        return "\"" + ZanCheck.Esc(s) + "\"";
+    }
+
+    // "key":N —— 从一行 JSON 里取整数字段（summary 行用；不引入 JSON 库）
+    static int IntField(string line, string key) {
+        string pat = "\"" + key + "\":";
+        int at = line.IndexOf(pat);
+        if (at < 0) { return 0; }
+        int i = at + pat.Length;
+        int j = i;
+        while (j < line.Length && line.Substring(j, 1) >= "0" && line.Substring(j, 1) <= "9") {
+            j = j + 1;
+        }
+        if (j == i) { return 0; }
+        return line.Substring(i, j - i).ToInt32();
+    }
+
+    static string StrList(List<string> items, int tail) {
+        int from = items.Count > tail ? items.Count - tail : 0;
+        string s = "[";
+        for (int i = from; i < items.Count; i = i + 1) {
+            if (i > from) { s = s + ","; }
+            s = s + ZanCheck.Str(items[i]);
+        }
+        return s + "]";
+    }
+
+    static string Skipped(string name, string reason) {
+        return "{\"name\":" + ZanCheck.Str(name) + ",\"status\":\"skipped\",\"reason\":"
+            + ZanCheck.Str(reason) + "}";
+    }
+
+    // compile 步：返回步骤 JSON，ok 经 outOk 带出
+    static string Compile(string zanc, List<string> inputs, List<string> extra, string exe,
+                          out bool ok) {
+        List<string> args = new List<string>();
+        for (int i = 0; i < inputs.Count; i = i + 1) { args.Add(inputs[i]); }
+        args.Add("--auto-stdlib");
+        args.Add("--check-leaks");
+        args.Add("--diag=json");
+        args.Add("-o");
+        args.Add(exe);
+        for (int i = 0; i < extra.Count; i = i + 1) { args.Add(extra[i]); }
+        ProcessResult r = Process.CaptureSafe(zanc, args, 600000);
+        string diags = "";
+        int ndiag = 0;
+        int errors = 0;
+        int warnings = 0;
+        bool haveSummary = false;
+        List<string> other = new List<string>();
+        List<string> lines = r.lines != null ? r.lines : new List<string>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string l = lines[i].Trim();
+            if (l.StartsWith("{\"kind\":\"diagnostic\"")) {
+                if (ndiag > 0) { diags = diags + ","; }
+                diags = diags + l;
+                ndiag = ndiag + 1;
+                if (!haveSummary) {
+                    if (l.Contains("\"severity\":\"error\"")) { errors = errors + 1; }
+                    if (l.Contains("\"severity\":\"warning\"")) { warnings = warnings + 1; }
+                }
+            } else if (l.StartsWith("{\"kind\":\"summary\"")) {
+                errors = ZanCheck.IntField(l, "errors");
+                warnings = ZanCheck.IntField(l, "warnings");
+                haveSummary = true;
+            } else if (l != "") {
+                other.Add(l);
+            }
+        }
+        ok = r.exitCode == 0 && File.Exists(exe);
+        string s = "{\"name\":\"compile\",\"status\":" + (ok ? "\"pass\"" : "\"fail\"")
+            + ",\"exit_code\":" + Convert.ToString(r.exitCode)
+            + ",\"errors\":" + Convert.ToString(errors)
+            + ",\"warnings\":" + Convert.ToString(warnings)
+            + ",\"diagnostics\":[" + diags + "]";
+        if (!ok && other.Count > 0) {
+            s = s + ",\"other_output\":" + ZanCheck.StrList(other, 20);
+        }
+        return s + "}";
+    }
+
+    // leaks 步：运行产物并解析退出报告
+    static string Leaks(string exe, List<string> progArgs, int timeoutMs, out bool ok) {
+        Environment.SetEnvironmentVariable("ZAN_LEAK_LOG", "");   // 只要 stdout 里的报告
+        long t0 = Stopwatch.GetMilliseconds();
+        ProcessResult r = Process.CaptureSafe(exe, progArgs, timeoutMs);
+        long elapsed = Stopwatch.GetMilliseconds() - t0;
+        if (r.exitCode == 0 - 1 && elapsed >= timeoutMs - 50) {
+            ok = false;
+            return "{\"name\":\"leaks\",\"status\":\"fail\",\"reason\":"
+                + ZanCheck.Str("program did not exit within "
+                               + Convert.ToString(timeoutMs / 1000)
+                               + "s (pass --timeout or --no-run)") + "}";
+        }
+        List<string> lines = r.lines != null ? r.lines : new List<string>();
+        int head = -1;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (lines[i].StartsWith("zan: memory leak detected:")) { head = i; break; }
+        }
+        string s = "{\"name\":\"leaks\",\"exit_code\":" + Convert.ToString(r.exitCode);
+        bool leaked = head >= 0;
+        if (leaked) {
+            string h = lines[head];
+            string count = "null";
+            int at = h.IndexOf("detected: ");
+            if (at >= 0) {
+                int i = at + 10;
+                int j = i;
+                while (j < h.Length && h.Substring(j, 1) >= "0" && h.Substring(j, 1) <= "9") {
+                    j = j + 1;
+                }
+                if (j > i) { count = h.Substring(i, j - i); }
+            }
+            string mode = h.Contains("unreachable cycles at exit") ? "early-exit" : "strict";
+            string sites = "";
+            string cycles = "";
+            int nsite = 0;
+            int ncyc = 0;
+            for (int k = head + 1; k < lines.Count; k = k + 1) {
+                string l = lines[k].Trim();
+                int ob = l.IndexOf(" object(s) leaked, allocated at ");
+                if (ob > 0) {
+                    if (nsite > 0) { sites = sites + ","; }
+                    sites = sites + "{\"count\":" + l.Substring(0, ob) + ",\"site\":"
+                        + ZanCheck.Str(l.Substring(ob + 32, l.Length - ob - 32)) + "}";
+                    nsite = nsite + 1;
+                } else if (l.StartsWith("cycle: ")) {
+                    if (ncyc > 0) { cycles = cycles + ","; }
+                    cycles = cycles + ZanCheck.Str(l.Substring(7, l.Length - 7));
+                    ncyc = ncyc + 1;
+                }
+            }
+            s = s + ",\"leaked\":" + count + ",\"mode\":" + ZanCheck.Str(mode)
+                + ",\"header\":" + ZanCheck.Str(h)
+                + ",\"sites\":[" + sites + "],\"cycles\":[" + cycles + "]";
+        } else {
+            s = s + ",\"leaked\":0";
+        }
+        ok = !leaked && r.exitCode == 0;
+        if (r.exitCode != 0) {
+            s = s + ",\"output_tail\":" + ZanCheck.StrList(lines, 20);
+        }
+        return s + ",\"status\":" + (ok ? "\"pass\"" : "\"fail\"") + "}";
+    }
+
+    static void Usage() {
+        Console.WriteLine("usage: zan-check <entry.zan|dir...> [--zanc <path>] [--timeout <seconds>]");
+        Console.WriteLine("                 [--no-run] [--zanc-arg <arg>]... [--out <report.json>]");
+        Console.WriteLine("                 [-- program args...]");
+    }
+
+    static int Main() {
+        List<string> inputs = new List<string>();
+        List<string> extra = new List<string>();
+        List<string> progArgs = new List<string>();
+        string zanc = "";
+        string outPath = "";
+        int timeoutSec = 60;
+        bool noRun = false;
+        int i = 0;
+        bool rest = false;
+        while (i < Environment.ArgCount()) {
+            string a = Environment.ArgAt(i);
+            i = i + 1;
+            if (rest) { progArgs.Add(a); continue; }
+            if (a == "--") { rest = true; }
+            else if (a == "--no-run") { noRun = true; }
+            else if (a == "--help" || a == "-h") { ZanCheck.Usage(); return 0; }
+            else if ((a == "--zanc" || a == "--timeout" || a == "--zanc-arg" || a == "--out")
+                     && i >= Environment.ArgCount()) {
+                Console.WriteLine("error: " + a + " needs a value");
+                return 2;
+            }
+            else if (a == "--zanc") { zanc = Environment.ArgAt(i); i = i + 1; }
+            else if (a == "--timeout") { timeoutSec = Environment.ArgAt(i).ToInt32(); i = i + 1; }
+            else if (a == "--zanc-arg") { extra.Add(Environment.ArgAt(i)); i = i + 1; }
+            else if (a == "--out") { outPath = Environment.ArgAt(i); i = i + 1; }
+            else if (a.StartsWith("--")) {
+                Console.WriteLine("error: unknown option " + a);
+                return 2;
+            }
+            else { inputs.Add(a); }
+        }
+        if (inputs.Count == 0) {
+            ZanCheck.Usage();
+            return 2;
+        }
+        if (timeoutSec <= 0) { timeoutSec = 60; }
+        string exeSuffix = "";
+        #if WINDOWS
+        exeSuffix = ".exe";
+        #endif
+        if (zanc == "") {
+            // 缺省用与 zan-check 同目录的 zanc（工具链布局），其次 PATH 上的 zanc
+            string sibling = Path.Combine(ProcessHost.AppDir(), "zanc" + exeSuffix);
+            zanc = File.Exists(sibling) ? sibling : "zanc";
+        }
+
+        string work = Path.Combine(Path.GetTempPath(),
+            "zan-check-" + Convert.ToString(Stopwatch.GetMilliseconds()));
+        Directory.CreateDirectory(work);
+        string exe = Path.Combine(work, "app" + exeSuffix);
+
+        bool compiled = false;
+        string steps = ZanCheck.Compile(zanc, inputs, extra, exe, out compiled);
+        bool ok = compiled;
+        if (!compiled) {
+            steps = steps + "," + ZanCheck.Skipped("leaks", "compile failed");
+        } else if (noRun) {
+            steps = steps + "," + ZanCheck.Skipped("leaks", "--no-run");
+        } else {
+            bool leaksOk = false;
+            steps = steps + "," + ZanCheck.Leaks(exe, progArgs, timeoutSec * 1000, out leaksOk);
+            ok = ok && leaksOk;
+        }
+        steps = steps + "," + ZanCheck.Skipped("ui",
+            "zan ui check (S22, ZAN_STANDARD P2) is not implemented yet");
+        steps = steps + "," + ZanCheck.Skipped("replay",
+            "replay and invariants (S26/S27, ZAN_STANDARD P3) are not implemented yet");
+
+        string report = "{\"version\":1,\"ok\":" + (ok ? "true" : "false")
+            + ",\"inputs\":" + ZanCheck.StrList(inputs, inputs.Count)
+            + ",\"steps\":[" + steps + "]}";
+        Console.WriteLine(report);
+        if (outPath != "") { File.WriteAllText(outPath, report + "\n"); }
+        Directory.DeleteRecursive(work);
+        return ok ? 0 : 1;
+    }
+}

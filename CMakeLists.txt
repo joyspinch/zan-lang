@@ -8755,11 +8755,12 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/affected)
   set_tests_properties(affected_selection PROPERTIES TIMEOUT 300)
-  # S5（docs/ZAN_STANDARD.md §1）：scripts/zan_check.py——编译诊断 + 泄漏门禁
-  # （+ ui/replay 占位）合成单份 JSON 报告。
+  # S5（docs/ZAN_STANDARD.md §1）：原生 zan-check（src/check/ZanCheck.zan）——编译
+  # 诊断 + 泄漏门禁（+ ui/replay 占位）合成单份 JSON 报告，含超时路径。
   add_test(NAME zan_check_report
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_zan_check.py
-      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR})
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
+      --exe ${CMAKE_BINARY_DIR}/zan-check${_exe_ext})
   set_tests_properties(zan_check_report PROPERTIES TIMEOUT 600)
   # S2（docs/ZAN_STANDARD.md §1）：zanc --query——分配、捕获、可能抛出、能力、调用者。
   add_test(NAME query_symbol_facts
@@ -8857,6 +8858,17 @@ add_custom_command(OUTPUT ${_zandoc_exe}
     DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/doc/ZanDoc.zan ${CMAKE_SOURCE_DIR}/src/doc/DocMember.zan
     COMMENT "Building zandoc from Zan source")
 add_custom_target(zandoc_tool ALL DEPENDS ${_zandoc_exe})
+
+# ---- zan-check (S5 one-command check report, written in Zan) ----
+# 编译诊断（--diag=json）+ 运行期泄漏门禁合成单份 JSON 报告；随工具链发布，
+# 不依赖 Python。契约用例 zan_check_report（tests/test_zan_check.py）。
+set(_zancheck_exe ${CMAKE_BINARY_DIR}/zan-check${_exe_ext})
+add_custom_command(OUTPUT ${_zancheck_exe}
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/check/ZanCheck.zan
+            --auto-stdlib --package-project ${CMAKE_SOURCE_DIR} -o ${_zancheck_exe}
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/check/ZanCheck.zan
+    COMMENT "Building zan-check from Zan source")
+add_custom_target(zancheck_tool ALL DEPENDS ${_zancheck_exe})
 
 # ---- GenIndex (project semantic index, written in Zan) ----
 # The .zanmap index is what AI clients query instead of reading source, so its

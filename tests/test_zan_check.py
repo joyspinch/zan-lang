@@ -1,8 +1,9 @@
-"""S5（docs/ZAN_STANDARD.md §1）：scripts/zan_check.py 单份 JSON 报告的契约。
+"""S5（docs/ZAN_STANDARD.md §1）：原生 zan-check（src/check/ZanCheck.zan）单份 JSON 报告的契约。
 
 复用已有夹具：干净程序全过；孤儿环程序在 leaks 步失败并带出环路径（strict）；
 缺分号程序在 compile 步失败、带 E0032 与 fix-it，后续 leaks 记 skipped；
-Environment.Exit 时栈帧/静态持有不算泄漏；--no-run 跳过运行。ui/replay 恒为
+Environment.Exit 时栈帧/静态持有不算泄漏；--no-run 跳过运行；永不退出的程序在
+--timeout 到点后判失败。ui/replay 恒为
 skipped（P2/P3 未实现），报告形状从第一天起稳定。"""
 import argparse
 import json
@@ -10,11 +11,12 @@ import os
 import subprocess
 import sys
 
+CHECK_EXE = None
+
 
 def check(root, zanc, *args):
-    r = subprocess.run([sys.executable, '-I', '-B', os.path.join(root, 'scripts', 'zan_check.py'),
-                        '--zanc', zanc, *args], cwd=root, capture_output=True, text=True,
-                       timeout=600)
+    r = subprocess.run([CHECK_EXE, '--zanc', zanc, *args], cwd=root, capture_output=True,
+                       text=True, timeout=600)
     report = json.loads(r.stdout)
     steps = {s['name']: s for s in report['steps']}
     assert [s['name'] for s in report['steps']] == ['compile', 'leaks', 'ui', 'replay'], report
@@ -27,7 +29,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--zanc', required=True)
     ap.add_argument('--root', required=True)
+    ap.add_argument('--exe', required=True)
     a = ap.parse_args()
+    global CHECK_EXE
+    CHECK_EXE = os.path.realpath(a.exe)
+    a.zanc = os.path.realpath(a.zanc)
     root = os.path.realpath(a.root)
 
     rep, st = check(root, a.zanc, 'tests/affected/affected_fixture.zan')
@@ -50,6 +56,10 @@ def main():
 
     rep, st = check(root, a.zanc, '--no-run', 'tests/leak/leak_cycle_report.zan')
     assert rep['ok'] and st['leaks']['status'] == 'skipped', rep
+
+    rep, st = check(root, a.zanc, '--timeout', '2', 'tests/check/zan_check_hang.zan')
+    assert not rep['ok'] and st['leaks']['status'] == 'fail', st['leaks']
+    assert 'did not exit within 2s' in st['leaks']['reason'], st['leaks']
     print('zan check: report contracts passed')
 
 

@@ -63,7 +63,7 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 | S2 | `zanc query <符号>` | 已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a（catch 扣除、override/接口实现展开、方法组）；经委托变量的调用目标运行期才定，不展开 |
 | S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
 | S4 | `zanc --summary <包>` | 已落地，见 docs/ZANC_CLI.md §1.7：公开签名 + 效果列（S2 的 throws/能力）+ 一行文档；余：契约列（P4） |
-| S5 | `zan check` | 第一刀已落地为 `scripts/zan_check.py`，见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；余：ui/replay 步骤（随 P2/P3）、SDK 原生命令形态 |
+| S5 | `zan check` | 已落地为随工具链发布的原生 `zan-check`（Zan 写成），见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；ui/replay 步骤随 P2/P3 接入 |
 
 AI 工作循环收敛为：**改代码 → `zan check` → 应用 fix-it**。
 
