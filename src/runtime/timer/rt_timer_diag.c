@@ -85,7 +85,7 @@ void zan_rt_set_strict(void) { g_soft_strict = 1; }
 #define ZAN_SOFT_SCRATCH_RC  (UINT64_C(1) << 62)
 #define ZAN_SOFT_SCRATCH_PAYLOAD 4096
 static union {
-    unsigned char bytes[40 + ZAN_SOFT_SCRATCH_PAYLOAD];
+    unsigned char bytes[ZAN_SOFT_PREFIX_SIZE + 8 + ZAN_SOFT_SCRATCH_PAYLOAD];
     long double align_it;
 } g_soft_scratch_store;
 static unsigned char *g_soft_scratch;
@@ -98,9 +98,17 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
  * 只需首次初始化。曾每次都拿全局 timer_lock——Web 压测下多 worker 在这把锁
  * 上排队，锁等待占 CPU 采样的四成以上（psynch_mutexwait 归因 ~6000/19000）。
  * 改为 acquire 读快路径；未发布时进锁双检、初始化后 release 发布。 */
-/* Prefix the generated code reads in front of a soft scratch base: array
- * rc/magic at P-32/P-24, object rc at P-16, discriminator at P-8. */
+/* Prefix the generated code reads in front of a soft scratch base P (see
+ * ZAN_SOFT_ARR_BASE_OFF in zan_abi.h). hdr = start of the prefix:
+ *   empty array A = P + ZAN_SOFT_ARR_BASE_OFF: rc, rc magic, count 0, magic,
+ *   then ZAN_SOFT_ARR_SPAN zero bytes;
+ *   object at P: rc/magic at P-32/P-24, object rc at P-16, discriminator P-8. */
 static void soft_scratch_init_header(unsigned char *hdr) {
+    store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* A-32: array rc */
+    store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
+    store_u64_le(hdr + 16, 0); /* A-16: count 0 */
+    store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);
+    hdr += ZAN_SOFT_PREFIX_SIZE - 32;
     store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
     store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
     store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
@@ -116,7 +124,7 @@ static unsigned char *soft_scratch_shared(void) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
         soft_scratch_init_header(hdr);
-        scratch = hdr + 32;
+        scratch = hdr + ZAN_SOFT_PREFIX_SIZE;
         __atomic_store_n(&g_soft_scratch, scratch, __ATOMIC_RELEASE);
     }
     timer_unlock();
@@ -156,7 +164,7 @@ static size_t soft_page(void) {
 }
 
 static size_t soft_map_len(size_t page) {
-    size_t body = (32 + ZAN_SOFT_TLS_PAYLOAD + page - 1) / page * page;
+    size_t body = (ZAN_SOFT_PREFIX_SIZE + ZAN_SOFT_TLS_PAYLOAD + page - 1) / page * page;
     return page + body + page;
 }
 
@@ -173,7 +181,7 @@ static void soft_scratch_init_header(unsigned char *hdr);
 
 static int soft_wipe(unsigned char *scratch) {
     size_t page = soft_page();
-    unsigned char *map = scratch - 32 - page;
+    unsigned char *map = scratch - ZAN_SOFT_PREFIX_SIZE - page;
     size_t body = soft_map_len(page) - 2 * page;
 #if defined(_WIN32)
     if (!VirtualFree(map + page, body, MEM_DECOMMIT)) return 0;
@@ -221,7 +229,7 @@ static unsigned char *soft_map(void) {
     }
 #endif
     soft_scratch_init_header(map + page);
-    return map + page + 32;
+    return map + page + ZAN_SOFT_PREFIX_SIZE;
 }
 
 static _Thread_local unsigned char *t_soft_scratch;
@@ -485,7 +493,6 @@ void zan_rt_guard_fail2(const char *prefix, const char *msg) {
 void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
                         const char *msg) {
     if (zan_soft_is_hard()) {
-#if defined(_WIN32)
         char buf[1400];
         snprintf(buf, sizeof buf, "%s:%u:%u: runtime error: %s",
                  file ? file : "<unknown>", line, col, msg ? msg : "");
@@ -496,6 +503,7 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
         }
         fprintf(stderr, "%s", buf);
         fflush(stderr);
+#if defined(_WIN32)
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
         unsigned long code = 0xE0A2C010u; 

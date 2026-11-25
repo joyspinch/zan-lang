@@ -392,6 +392,10 @@ binding_lowered:
                         }
                         LLVMValueRef elem_ptr;
                         LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                        if (local->type && local->type->kind == TYPE_ARRAY)
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                         if (local->type && local->type->kind == TYPE_ARRAY &&
                             local->type->array_rank > 1) {
                             /* 多维矩形数组槽位：多维越界检查与行优先平铺寻址 */
@@ -476,6 +480,9 @@ binding_lowered:
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                             ar_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
                             idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
                                                          expr->loc, "array");
@@ -661,6 +668,10 @@ binding_lowered:
                             elem_llvm = map_type(g, at->element_type);
                         }
                         LLVMValueRef elem_ptr;
+                        if (at->kind == TYPE_ARRAY)
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                         if (at->kind == TYPE_ARRAY && at->array_rank > 1) {
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                                 expr->binary.left, elem_llvm, locals, &ar_oob);
@@ -767,6 +778,9 @@ binding_lowered:
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef elem_ptr;
                     LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                    arr_ptr = emit_array_null_guard(
+                        g, arr_ptr, expr->loc,
+                        "null reference where an array is required (element store)");
                     if (at->array_rank > 1) {
                         elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                             expr->binary.left, elem_llvm, locals, &ar_oob);
@@ -882,7 +896,8 @@ binding_lowered:
                                 expr->binary.right, locals);
                             stored = true;
                         } else if (st) {
-                            LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+                            LLVMValueRef struct_ptr =
+                                struct_recv_ptr_guarded(g, local, st, obj_expr);
                             LLVMValueRef fptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;

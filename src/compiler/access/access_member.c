@@ -368,8 +368,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstNull(LLVMTypeOf(arr)), "arr.null");
                     emit_runtime_check(g, isnull, expr->member.object->loc,
                         "null reference where an array is required (.Count)");
-                    arr = emit_soft_base_select(g, arr, isnull,
-                                                expr->member.object->loc);
+                    arr = emit_soft_array_base_select(g, arr, isnull);
                 }
                 LLVMValueRef len = zan_array_len(g, arr);
                 emit_release_owned_call_temp(g, expr->member.object, arr, locals);
@@ -386,8 +385,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstNull(LLVMTypeOf(arr)), "arr.null");
                     emit_runtime_check(g, isnull, expr->member.object->loc,
                         "null reference where an array is required (.Length)");
-                    arr = emit_soft_base_select(g, arr, isnull,
-                                                expr->member.object->loc);
+                    arr = emit_soft_array_base_select(g, arr, isnull);
                 }
                 LLVMValueRef len = zan_array_len(g, arr);
                 emit_release_owned_call_temp(g, expr->member.object, arr, locals);
@@ -529,23 +527,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeRef st = get_struct_llvm_type(g, type_sym);
                         if (st) {
                             /* 结构体字段访问：获取指针并通过 GEP 寻址目标字段 */
-                            LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
-                            if (local->type->kind == TYPE_CLASS &&
-                                LLVMGetTypeKind(LLVMTypeOf(struct_ptr)) == LLVMPointerTypeKind) {
-                                LLVMValueRef isnull = zan_icmp(g->builder,
-                                    LLVMIntEQ, struct_ptr,
-                                    LLVMConstNull(LLVMTypeOf(struct_ptr)),
-                                    "recv.null");
-                                char recv_msg[256];
-                                snprintf(recv_msg, sizeof(recv_msg),
-                                    "null reference: receiver '%.*s' is null",
-                                    (int)expr->member.object->ident.name.len,
-                                    expr->member.object->ident.name.str);
-                                emit_runtime_check(g, isnull,
-                                    expr->member.object->loc, recv_msg);
-                                struct_ptr = emit_soft_base_select(g, struct_ptr,
-                                    isnull, expr->member.object->loc);
-                            }
+                            LLVMValueRef struct_ptr =
+                                struct_recv_ptr_guarded(g, local, st, expr->member.object);
                             LLVMValueRef field_ptr = emit_field_ptr(g, type_sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             zan_type_t *fty = fsym

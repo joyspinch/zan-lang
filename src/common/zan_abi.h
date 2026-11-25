@@ -46,6 +46,18 @@
 #define ZAN_ARR_RC_MAGIC_OFF   (-24)
 #define ZAN_ARRAY_RC_MAGIC     UINT64_C(0x5a414e41525243) /* "ZANARRC" */
 
+/* Soft-failure scratch (zan_rt_soft_scratch, rt_timer_diag.c). Outside a try a
+ * null receiver continues on scratch memory: an object at the returned base P
+ * (object header at P-32..P), and an empty array at P + ZAN_SOFT_ARR_BASE_OFF.
+ * They cannot share a base: an array's i64 count at [-16] overlaps an object's
+ * u32 rc at [-12], and the rc must stay large (a retained scratch object must
+ * never be freed) while a null array must read count 0. The array's header and
+ * ZAN_SOFT_ARR_SPAN zero bytes (element 0 of a clamped read) sit below the
+ * object header, out of reach of object field writes (always >= P). */
+#define ZAN_SOFT_ARR_SPAN 4064
+#define ZAN_SOFT_ARR_BASE_OFF (-(ZAN_SOFT_ARR_SPAN + ZAN_ARR_HDR_SIZE))
+#define ZAN_SOFT_PREFIX_SIZE (ZAN_ARR_HDR_SIZE + ZAN_SOFT_ARR_SPAN + 32)
+
 #define ZAN_CLOSURE_TAG        1
 #define ZAN_CLOSURE_FN_OFF     0
 #define ZAN_CLOSURE_DTOR_OFF   8

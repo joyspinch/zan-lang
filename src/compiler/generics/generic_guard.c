@@ -694,6 +694,48 @@ LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
     return phi;
 }
 
+/* Array flavour of emit_soft_base_select: a null array continues on the
+ * scratch's empty array (count 0, zero element bytes; ZAN_SOFT_ARR_BASE_OFF in
+ * zan_abi.h), so its Length is 0 and every index is out of range. The object
+ * scratch cannot serve: its [-16] word carries the object rc, which reads as a
+ * 2^62 array count. */
+LLVMValueRef emit_soft_array_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull) {
+    if (!g->runtime_checks || !g->current_fn) return base;
+    if (LLVMGetTypeKind(LLVMTypeOf(base)) != LLVMPointerTypeKind) return base;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    if (!fn) return base;
+    LLVMBasicBlockRef fast_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.nullarr");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.arrdone");
+    LLVMBuildCondBr(g->builder, isnull, slow_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+    LLVMValueRef off = LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                    (unsigned long long)(long long)ZAN_SOFT_ARR_BASE_OFF, 1);
+    LLVMValueRef arr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                                     emit_soft_scratch_cached(g), &off, 1, "soft.arr");
+    arr = LLVMBuildBitCast(g->builder, arr, LLVMTypeOf(base), "soft.arr.bc");
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, LLVMTypeOf(base), "soft.arrbase");
+    LLVMValueRef vals[2] = {base, arr};
+    LLVMBasicBlockRef bbs[2] = {fast_bb, slow_end};
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
+}
+
+/* Null guard for an array about to be indexed, read or written: try ->
+ * NullReferenceException; outside a try report once and continue on the
+ * empty scratch array (stores then fall out of range and are skipped). */
+LLVMValueRef emit_array_null_guard(zan_irgen_t *g, LLVMValueRef arr, zan_loc_t loc,
+                                   const char *msg) {
+    if (!g->runtime_checks || !g->current_fn || !arr) return arr;
+    if (LLVMGetTypeKind(LLVMTypeOf(arr)) != LLVMPointerTypeKind) return arr;
+    LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr, "arr.null");
+    emit_runtime_check(g, isnull, loc, msg);
+    return emit_soft_array_base_select(g, arr, isnull);
+}
+
 /* Outlined-helper context: the null report reads file/line/col from the
  * helper's parameters instead of baking the call site's constants. */
 typedef struct {

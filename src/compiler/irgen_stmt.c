@@ -51,8 +51,11 @@ static void emit_stmt_impl(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *
     if (arc_nested) g->arc_stmt_depth--;
 }
 
-void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
-    (void)unit;
+/* Release static fields without claiming Main returned: the unhandled-
+ * exception terminate path abandons every frame (no unwinding), so objects
+ * those frames still own are not leaks -- the exit report must stay in the
+ * Environment.Exit mode (orphan cycles only, S13). */
+void emit_static_cleanup_call(zan_irgen_t *g) {
     if (!g->static_init_cleanup) {
         LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         g->static_init_cleanup = LLVMAddFunction(g->mod, "__zan_static_cleanup", ty);
@@ -60,6 +63,11 @@ void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
     zan_call2(g->builder, LLVMGlobalGetValueType(g->static_init_cleanup),
               g->static_init_cleanup, NULL, 0, "");
+}
+
+void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
+    (void)unit;
+    emit_static_cleanup_call(g);
     /* 只有主函数退出路径会释放静态字段：此后的退出报告按严格口径计数（S13） */
     if (g->check_leaks)
         LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0),

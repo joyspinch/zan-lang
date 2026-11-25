@@ -132,6 +132,25 @@ LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st)
     }
     return base;
 }
+/* A class-typed local used as a field receiver (read, store, compound store,
+ * ++/--): null check plus the soft-failure scratch, so a store through a null
+ * local fails softly like a read instead of writing near address 0. */
+LLVMValueRef struct_recv_ptr_guarded(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st,
+                                     zan_ast_node_t *obj_expr) {
+    LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+    if (!local->type || local->type->kind != TYPE_CLASS ||
+        LLVMGetTypeKind(LLVMTypeOf(struct_ptr)) != LLVMPointerTypeKind)
+        return struct_ptr;
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, struct_ptr,
+                                   LLVMConstNull(LLVMTypeOf(struct_ptr)), "recv.null");
+    char recv_msg[256];
+    if (obj_expr->kind == AST_IDENTIFIER)
+        snprintf(recv_msg, sizeof(recv_msg), "null reference: receiver '%.*s' is null",
+                 (int)obj_expr->ident.name.len, obj_expr->ident.name.str);
+    else snprintf(recv_msg, sizeof(recv_msg), "null reference: receiver is null");
+    emit_runtime_check(g, isnull, obj_expr->loc, recv_msg);
+    return emit_soft_base_select(g, struct_ptr, isnull, obj_expr->loc);
+}
 void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
     LLVMTypeRef ta = LLVMTypeOf(*a), tb = LLVMTypeOf(*b);
     /* 浮点二元运算提升规则：float 与 double 运算提升至 double 精度计算 */

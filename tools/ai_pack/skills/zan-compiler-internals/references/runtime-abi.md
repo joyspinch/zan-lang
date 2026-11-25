@@ -334,3 +334,29 @@ POSIX `StartProgram` 用 CLOEXEC 错误管道确认最终 exec，重定向或 ex
 - **所有生产配方共用 TU 集合**：主机、两套 selfhost 归档及 shell/cmd 跨平台入口
   都枚举 `rt_hw_*.c`；selfhost 仍使用各自编译器，不能混用宿主对象的 CRT/ABI。
   三份实际归档十成员与脚本语法检查不构成其他平台已编译、运行的证据。
+
+## 15. 软失败暂存：对象与数组各用一个基址，写路径同样要守（2026-11-24 macOS 验证）
+
+- **两种头不能共址**：对象 RC 是 `[-12]` 的 u32，数组个数是 `[-16]` 的 i64——后者
+  覆盖前者。暂存区对象 RC 必须很大（逃逸被 retain 的暂存对象绝不能释放），于是同
+  基址的数组长度读成 2^62，`a[5000000]` 远越暂存区撞保护页。数组一律走
+  `emit_soft_array_base_select` / `emit_array_null_guard`（基址
+  `P + ZAN_SOFT_ARR_BASE_OFF`，头在对象头之下：count 0 + 4064 零字节），null 数组
+  = 长度 0、所有下标越界、写被 `emit_oob_store_split` 跳过。改暂存布局要同改
+  `zan_abi.h` 常量、`rt_timer_diag.c` 三处（映射长度、wipe 反推、共享静态区）与
+  selfhost `zarr_len`（null → 0），交叉 bundle 的预编译运行时需刷新。
+- **读守了不等于写守了**：成员读（access_member）有 null 接收者守卫，字段写/复合写/
+  `++`（ops_assign、ops_incdec 的局部接收者分支）与数组元素写曾直接用裸指针 →
+  SIGSEGV。接收者取址统一走 `struct_recv_ptr_guarded`；新增写路径先问"null 时落哪"。
+- **POSIX hard 模式也要先打印**：`zan_rt_guard_fail3` 的消息曾包在 `#if _WIN32`
+  里，Mac/Linux strict 模式静默 exit 70。
+- **未处理异常的终止路径不展开栈**：terminate 处理器只释放静态字段，不能置
+  `main_done`（那表示 Main 正常返回、按严格口径数泄漏）；否则活帧持有的对象全被
+  误报为泄漏。用 `emit_static_cleanup_call`。
+- **内建表缺条目 = 推断不出类型 = 临时量不释放**：`Convert.ToString` 走内建
+  （无 `using System`）时 `infer_expr_type` 查 `builtin_api.c` 的成员表，缺项返回
+  NULL，`emit_release_owned_call_temp` 因而跳过释放（每次调用漏一个串）。
+- **libdispatch 信号量**：以初值 n 创建、销毁时计数 < n 会 `EXC_BREAKPOINT`
+  （SIGTRAP）。以 0 创建再 signal n 次。
+- **自写 LSP 帧要显式 flush**：POSIX 管道上 stdout 行缓冲，JSON 体末尾没有换行，
+  不 flush 则客户端与服务端互等。

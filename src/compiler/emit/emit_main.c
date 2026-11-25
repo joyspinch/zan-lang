@@ -96,7 +96,8 @@ static void emit_eh_terminate_setup(zan_irgen_t *g, bool define_body) {
             g->rt_str_release, &exc, 1, "");
         LLVMBuildBr(g->builder, cleanup_bb);
         LLVMPositionBuilderAtEnd(g->builder, cleanup_bb);
-        emit_release_static_rc_fields(g, NULL);
+        /* Frames were abandoned, not unwound: no strict leak count. */
+        emit_static_cleanup_call(g);
         LLVMValueRef exit_fn = get_libc_fn(g, "exit", LLVMFunctionType(void_ty, &i32t, 1, 0));
         LLVMValueRef code1 = LLVMConstInt(i32t, 1, 0);
         zan_call2(g->builder, LLVMFunctionType(void_ty, &i32t, 1, 0), exit_fn, &code1, 1, "");

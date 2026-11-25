@@ -150,6 +150,8 @@ public class LspInlayHint {
 public partial class LspServer {
     [DllImport("crt")] public static extern int getchar();
     [DllImport("crt")] public static extern int putchar(int c);
+    // fflush(NULL) flushes every output stream (no FILE* needed from Zan).
+    [DllImport("crt")] public static extern int fflush(nint stream);
 
     static List<LspDocument> documents;
     static List<LspSymbol> symbols;
@@ -532,13 +534,29 @@ public partial class LspServer {
 
     /// Diags.items → LSP diagnostics 数组 JSON（行列 1-based → 0-based；
     /// 列出站转 UTF-16 口径，text 为该文档正文）。
+    /// 完全相同的诊断（同消息、同位置、同级别）只发一次：前端按宿主口径把
+    /// 方法签名里的坏类型报两遍（binder 一遍、checker 方法作用域一遍），
+    /// 编辑器里同一位置不该出现两条一样的错误。
     static string DiagArray(Diags dg, string text) {
         StringBuilder sb = new StringBuilder();
         sb.Append('[');
         int i = 0;
+        int emitted = 0;
         while (i < dg.items.Count) {
             Diag d = dg.items[i];
-            if (i > 0) { sb.Append(','); }
+            bool dup = false;
+            int j = 0;
+            while (j < i && !dup) {
+                Diag p = dg.items[j];
+                dup = p.line == d.line && p.col == d.col && p.warn == d.warn && p.msg == d.msg;
+                j = j + 1;
+            }
+            if (dup) {
+                i = i + 1;
+                continue;
+            }
+            if (emitted > 0) { sb.Append(','); }
+            emitted = emitted + 1;
             int dl = d.line > 0 ? d.line - 1 : 0;
             int dc = d.col > 0 ? Utf16ColOf(text, dl, d.col - 1) : 0;
             sb.Append("{\"severity\":");
@@ -725,6 +743,10 @@ public partial class LspServer {
         string header = "Content-Length: " + len.ToString() + "\r\n\r\n";
         WriteRaw(header);
         WriteRaw(jsonBody);
+        // The body ends without a newline: on POSIX a piped stdout is line
+        // buffered, so without a flush the client never sees the message
+        // (it waits for the response, the server waits for the next request).
+        fflush(0);
     }
 
     static void WriteRaw(string s) {

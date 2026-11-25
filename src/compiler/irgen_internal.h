@@ -842,6 +842,9 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg);
 LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val, LLVMTypeRef target, zan_loc_t loc, LLVMValueRef arm_mask);
 void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef s, LLVMValueRef slen);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull, zan_loc_t loc);
+LLVMValueRef emit_soft_array_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull);
+LLVMValueRef emit_array_null_guard(zan_irgen_t *g, LLVMValueRef arr, zan_loc_t loc,
+                                   const char *msg);
 void emit_runtime_check_noreturn(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
                                  const char *msg);
 LLVMValueRef emit_checked_elem_gep(zan_irgen_t *g, LLVMTypeRef elem_ty, LLVMValueRef base,
@@ -885,6 +888,8 @@ zan_type_t * member_owned_field_type(zan_irgen_t *g, zan_ast_node_t *e, local_sc
 void release_boxed_local(zan_irgen_t *g, local_var_t *v);
 LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty, zan_symbol_t *method_sym, LLVMValueRef erased_fn, LLVMTypeRef erased_ty, LLVMTypeRef *out_ty);
 LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st);
+LLVMValueRef struct_recv_ptr_guarded(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st,
+                                     zan_ast_node_t *obj_expr);
 bool sym_declares_extern(zan_symbol_t *sym);
 void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
@@ -918,6 +923,7 @@ void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals, const zan_irgen_finally_entry_t *entry);
 void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals);
 void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
+void emit_static_cleanup_call(zan_irgen_t *g);
 void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 /* --- From irgen_weak.c (4 functions) --- */

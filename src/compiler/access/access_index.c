@@ -254,11 +254,9 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             if (arr_type->array_rank > 1) {
                 /* B-ID183：多维同款 null 守卫（emit_mdarray_elem_ptr 读维度
                  * 头，null 直接崩），口径与一维一致。 */
-                LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr,
-                    "mdarridx.null");
-                emit_runtime_check(g, isnull, expr->loc,
+                arr_ptr = emit_array_null_guard(
+                    g, arr_ptr, expr->loc,
                     "null reference where a string/byte buffer is required (element access)");
-                arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
                 elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr, expr,
                                                  elem_llvm, locals, NULL);
             } else {
@@ -266,12 +264,10 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                  * null 头直接段错误（探针 _scratch/arrprobe：try 内也崩）。
                  * 对齐字符串分支（emit_string_base_guard）与 C# 语义：try 内
                  * 抛 NullReferenceException，try 外 soft 报告后落 scratch 页
-                 * （len 读 0 → 越界钳 0 → 读 0，定义行为）。 */
-                LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr,
-                    "arridx.null");
-                emit_runtime_check(g, isnull, expr->loc,
+                 * （空数组 scratch：len 读 0 → 越界钳 0 → 读 0，定义行为）。 */
+                arr_ptr = emit_array_null_guard(
+                    g, arr_ptr, expr->loc,
                     "null reference where a string/byte buffer is required (element access)");
-                arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
                 LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
                 LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
                 idx = emit_index_safe_bounds(g, idx, arr_len, expr->loc, "array");

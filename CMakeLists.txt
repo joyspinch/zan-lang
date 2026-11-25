@@ -8907,6 +8907,7 @@ set(_lspzan_srcs
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/lexer.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_scan.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_synth.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_decl.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_member.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_stmt.zan
