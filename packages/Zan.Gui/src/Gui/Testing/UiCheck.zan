@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Testing;
+
+// S22（docs/ZAN_STANDARD.md §5）：布局不变量检查。
+//
+// 窗体离屏装配（不建系统窗口），按设计尺寸在给定 DPI 下排一帧，再对控件树查：
+//   offscreen     可见控件超出窗口（起点在窗外即算，不论尺寸；滚动容器内的内容不算）
+//   collapsed     可交互控件被挤成 0 宽或 0 高——标记里有，用户却用不了
+//   truncated     带文本的叶子控件比它的首选尺寸窄/矮——文字被截
+//   small_target  可交互控件小于 24 逻辑像素（按当前 DPI 折算）
+//   overlap       两个可交互控件相交且互不包含——点击会落到错的那个
+// pseudo=true 时先把静态文本拉长 40%（伪本地化，模拟译文变长）。绑定的文本在同步时会
+// 被模型覆盖，伪本地化只作用于静态文本。
+//
+//   List<UiIssue> issues = UiCheck.Run(new LoginForm(), 150, true);
+//   string json = UiCheck.Json("LoginForm", issues);
+public class UiIssue {
+    public string kind;
+    public string control;   // 控件名（无名时为种类）
+    public string detail;
+    public int scale;
+    public bool pseudo;
+}
+
+public class UiCheck {
+    const int MinTarget = 24;
+
+    // 装配窗体、按 scale% 排一帧并检查；同一窗体实例只用一次。
+    public static List<UiIssue> Run(Form form, int scale, bool pseudo) {
+        form.ShowOffscreen();
+        App app = form.GetApp();
+        Control root = form.docRoot != null ? form.docRoot : (Control)form;
+        int w = app != null ? app.designW : 480;
+        int h = app != null ? app.designH : 520;
+        if (app != null) { app.SetOffscreenViewport(w, h, scale); }
+        form.CaptureSnapshot();
+        if (pseudo) {
+            UiCheck.PseudoLocalize(root);
+            form.CaptureSnapshot();
+        }
+        List<UiIssue> issues = new List<UiIssue>();
+        Control top = form;
+        UiCheck.Walk(top, top, false, scale, pseudo, issues);
+        List<Control> targets = new List<Control>();
+        UiCheck.CollectTargets(top, targets);
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            for (int j = i + 1; j < targets.Count; j = j + 1) {
+                Control a = targets[i];
+                Control b = targets[j];
+                if (UiCheck.IsAncestor(a, b) || UiCheck.IsAncestor(b, a)) { continue; }
+                int ix = UiCheck.Min(a.bx + a.bw, b.bx + b.bw) - UiCheck.Max(a.bx, b.bx);
+                int iy = UiCheck.Min(a.by + a.bh, b.by + b.bh) - UiCheck.Max(a.by, b.by);
+                if (ix > 1 && iy > 1) {
+                    UiCheck.Add(issues, "overlap", a, "overlaps '" + UiCheck.NameOf(b) + "' by "
+                        + Convert.ToString(ix) + "x" + Convert.ToString(iy) + "px", scale, pseudo);
+                }
+            }
+        }
+        return issues;
+    }
+
+    static int Min(int a, int b) { return a < b ? a : b; }
+    static int Max(int a, int b) { return a > b ? a : b; }
+
+    static string NameOf(Control c) {
+        return c.name != null && c.name != "" ? c.name : c.Kind();
+    }
+
+    static void Add(List<UiIssue> issues, string kind, Control c, string detail, int scale,
+                    bool pseudo) {
+        UiIssue i = new UiIssue();
+        i.kind = kind;
+        i.control = UiCheck.NameOf(c);
+        i.detail = detail;
+        i.scale = scale;
+        i.pseudo = pseudo;
+        issues.Add(i);
+    }
+
+    static bool IsAncestor(Control a, Control b) {
+        for (Control p = b.parent; p != null; p = p.parent) { if (p == a) { return true; } }
+        return false;
+    }
+
+    static bool Shown(Control c) {
+        string v = c.GetProp("visible");
+        return v != "0" && v != "false";
+    }
+
+    static bool Interactive(Control c) {
+        return c.HasInputClick() || (c.InputFocusCapabilities() & 1) != 0;
+    }
+
+    static void Walk(Control c, Control top, bool inScroll, int scale, bool pseudo,
+                     List<UiIssue> issues) {
+        if (!UiCheck.Shown(c)) { return; }
+        if (c != top && !inScroll) {
+            bool startOut = c.bx >= top.bx + top.bw || c.by >= top.by + top.bh
+                || c.bx < top.bx || c.by < top.by;
+            bool extentOut = c.bw > 0 && c.bh > 0
+                && (c.bx + c.bw > top.bx + top.bw + 1 || c.by + c.bh > top.by + top.bh + 1);
+            if (startOut || extentOut) {
+                UiCheck.Add(issues, "offscreen", c, "bounds (" + Convert.ToString(c.bx) + ","
+                    + Convert.ToString(c.by) + " " + Convert.ToString(c.bw) + "x"
+                    + Convert.ToString(c.bh) + ") exceed the window (" + Convert.ToString(top.bw)
+                    + "x" + Convert.ToString(top.bh) + ")", scale, pseudo);
+            }
+        }
+        if (c.ChildCount() == 0 && c.GetProp("text") != "" && c.bw > 0
+            && (c.prefW > c.bw + 1 || c.prefH > c.bh + 1)) {
+            UiCheck.Add(issues, "truncated", c, "needs " + Convert.ToString(c.prefW) + "x"
+                + Convert.ToString(c.prefH) + "px, has " + Convert.ToString(c.bw) + "x"
+                + Convert.ToString(c.bh), scale, pseudo);
+        }
+        if (UiCheck.Interactive(c) && (c.bw == 0 || c.bh == 0)) {
+            UiCheck.Add(issues, "collapsed", c, "laid out at " + Convert.ToString(c.bw) + "x"
+                + Convert.ToString(c.bh) + "px", scale, pseudo);
+        } else if (UiCheck.Interactive(c)) {
+            int min = MinTarget * scale / 100;
+            if (c.bw < min || c.bh < min) {
+                UiCheck.Add(issues, "small_target", c, Convert.ToString(c.bw) + "x"
+                    + Convert.ToString(c.bh) + "px is below " + Convert.ToString(min) + "px",
+                    scale, pseudo);
+            }
+        }
+        bool scroll = inScroll || c.IsScrollContainer();
+        for (int i = 0; i < c.ChildCount(); i = i + 1) {
+            UiCheck.Walk(c.ChildAt(i), top, scroll, scale, pseudo, issues);
+        }
+    }
+
+    // 可交互目标：命中点击或可获焦的最外层控件（按钮里的标签不另算）
+    static void CollectTargets(Control c, List<Control> found) {
+        if (!UiCheck.Shown(c)) { return; }
+        if (UiCheck.Interactive(c) && c.bw > 0 && c.bh > 0) {
+            found.Add(c);
+            return;
+        }
+        for (int i = 0; i < c.ChildCount(); i = i + 1) { UiCheck.CollectTargets(c.ChildAt(i), found); }
+    }
+
+    // 伪本地化：静态文本拉长 40%（不足 1 个字符补 1 个），首尾加括号便于肉眼识别
+    static void PseudoLocalize(Control c) {
+        string t = c.GetProp("text");
+        if (t != "" && c.ChildCount() == 0) {
+            int extra = t.Length * 2 / 5;
+            if (extra < 1) { extra = 1; }
+            string pad = "";
+            for (int i = 0; i < extra; i = i + 1) { pad = pad + "~"; }
+            c.SetProp("text", "[" + t + pad + "]");
+        }
+        for (int i = 0; i < c.ChildCount(); i = i + 1) { UiCheck.PseudoLocalize(c.ChildAt(i)); }
+    }
+
+    static string Esc(string s) {
+        return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n");
+    }
+
+    // {"form":…,"issues":[{kind,control,detail,scale,pseudo}]}
+    public static string Json(string formName, List<UiIssue> issues) {
+        string s = "{\"form\":\"" + UiCheck.Esc(formName) + "\",\"issues\":[";
+        for (int i = 0; i < issues.Count; i = i + 1) {
+            UiIssue x = issues[i];
+            if (i > 0) { s = s + ","; }
+            s = s + "{\"kind\":\"" + x.kind + "\",\"control\":\"" + UiCheck.Esc(x.control)
+                + "\",\"detail\":\"" + UiCheck.Esc(x.detail) + "\",\"scale\":"
+                + Convert.ToString(x.scale) + ",\"pseudo\":" + (x.pseudo ? "true" : "false") + "}";
+        }
+        return s + "]}";
+    }
+}

@@ -111,3 +111,23 @@ t.MatchSnapshot("tests/gui/snapshots/login_ok.json");   // 语义树快照，首
 - 依赖 App 的服务（`GetApp()` 返回 null）在脱窗时不可用：处理器里重绘用
   `RequestRedraw()`（无宿主时安全），不要直接 `GetApp().X`。
 
+## 布局不变量检查（`Gui.Testing.UiCheck`，ZAN_STANDARD S22）
+
+窗体离屏装配（不建系统窗口），按设计尺寸在给定 DPI 下排一帧后查：
+
+```csharp
+List<UiIssue> issues = UiCheck.Run(new LoginForm(), 150, true);   // 150% DPI + 伪本地化
+string json = UiCheck.Json("LoginForm", issues);
+```
+
+| 种类 | 含义 |
+|---|---|
+| `truncated` | 带文本的叶子控件比首选尺寸窄/矮——文字被截 |
+| `small_target` | 可交互控件小于 24 逻辑像素（按 DPI 折算） |
+| `overlap` | 两个可交互控件相交且互不包含——点击会落错 |
+| `offscreen` | 可见控件超出窗口（滚动容器内的内容不算） |
+| `collapsed` | 可交互控件被挤成 0 宽或 0 高 |
+
+伪本地化把静态文本拉长 40%，提前暴露译文变长后的截断（绑定文本同步时会被模型
+覆盖，不受影响）。`zan-check` 的 ui 步自动对输入里的全部窗体跑三档 DPI 与伪本地化。
+

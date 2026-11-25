@@ -8775,7 +8775,7 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME zan_check_report
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_zan_check.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
-      --exe ${CMAKE_BINARY_DIR}/zan-check${_exe_ext})
+      --exe ${CMAKE_BINARY_DIR}/zan-check${_exe_ext} --drivers ${CMAKE_BINARY_DIR})
   set_tests_properties(zan_check_report PROPERTIES TIMEOUT 600)
   # S2（docs/ZAN_STANDARD.md §1）：zanc --query——分配、捕获、可能抛出、能力、调用者。
   add_test(NAME query_symbol_facts

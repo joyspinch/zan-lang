@@ -15,7 +15,10 @@ using System.Collections.Generic;
 //   leaks    运行产物（带超时），解析退出时的泄漏报告（S10/S13）：残留数、按站点
 //            计数、孤儿环路径、判定口径 strict / early-exit；有泄漏、退出码非 0、
 //            超时即失败；
-//   ui       zan ui check（S22，P2）未实现，恒 skipped；
+//   ui       S22 布局不变量：在输入里找 `class X : Form` 且同目录有 X.html 的窗体，生成
+//            检查程序（Gui.Testing.UiCheck）离屏装配每个窗体，100%/150%/200% DPI 各排
+//            一帧，再各做一遍伪本地化（文本拉长 40%）；真实尺寸下的问题判失败，伪本地化
+//            的问题作为告警计数（预示译文变长后的截断）。没有窗体时 skipped；--no-ui 跳过；
 //   replay   回放比对与不变量（S26/S27，P3）未实现，恒 skipped。
 // 退出码：0 没有失败步骤（skipped 不算失败）；1 有失败；2 参数问题。
 public class ZanCheck {
@@ -171,9 +174,130 @@ public class ZanCheck {
         return s + ",\"status\":" + (ok ? "\"pass\"" : "\"fail\"") + "}";
     }
 
+    // ---- ui 步（S22）----
+
+    // 输入里的窗体：(类名, 命名空间, 标记路径)，类声明形如 `[partial] class X : Form`
+    static void FindForms(List<string> inputs, List<string> names, List<string> nss,
+                          List<string> htmls) {
+        List<string> files = new List<string>();
+        for (int i = 0; i < inputs.Count; i = i + 1) {
+            string p = inputs[i];
+            if (Directory.Exists(p)) {
+                List<string> fs = Directory.GetFiles(p, "*.zan", true);
+                for (int k = 0; k < fs.Count; k = k + 1) { files.Add(fs[k]); }
+            } else if (p.EndsWith(".zan")) {
+                files.Add(p);
+            }
+        }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string text = File.ReadAllText(files[i]);
+            List<string> lines = text.Replace("\r", "").Split("\n");
+            string ns = "";
+            for (int k = 0; k < lines.Count; k = k + 1) {
+                string l = lines[k].Trim();
+                if (l.StartsWith("namespace ")) {
+                    ns = l.Substring(10, l.Length - 10).Replace(";", "").Replace("{", "").Trim();
+                }
+                int at = l.IndexOf("class ");
+                int colon = l.IndexOf(":");
+                if (at < 0 || colon < at) { continue; }
+                string after = l.Substring(colon + 1, l.Length - colon - 1).Trim();
+                if (!(after == "Form" || after.StartsWith("Form ") || after.StartsWith("Form{")
+                      || after.StartsWith("Form,"))) {
+                    continue;
+                }
+                string name = l.Substring(at + 6, colon - at - 6).Trim();
+                if (name == "" || name.Contains(" ") || name.Contains("<")) { continue; }
+                string html = Path.Combine(Path.GetDirectoryName(files[i]), name + ".html");
+                if (File.Exists(html) && !names.Contains(name)) {
+                    names.Add(name);
+                    nss.Add(ns);
+                    htmls.Add(html);
+                }
+            }
+        }
+    }
+
+    static string Ui(string zanc, List<string> inputs, List<string> extra, string work,
+                     string exeSuffix, int timeoutMs, out bool ok) {
+        List<string> names = new List<string>();
+        List<string> nss = new List<string>();
+        List<string> htmls = new List<string>();
+        ZanCheck.FindForms(inputs, names, nss, htmls);
+        ok = true;
+        if (names.Count == 0) {
+            return ZanCheck.Skipped("ui", "no Form with a matching .html found in the inputs");
+        }
+        string src = "using System;\nusing Gui;\nusing Gui.Testing;\n";
+        for (int i = 0; i < nss.Count; i = i + 1) {
+            if (nss[i] != "") { src = src + "using " + nss[i] + ";\n"; }
+        }
+        src = src + "public class ZanCheckUiHarness {\n"
+            + "    static void One(string form, Form f, int scale, bool pseudo) {\n"
+            + "        string j = UiCheck.Json(form, UiCheck.Run(f, scale, pseudo));\n"
+            + "        Console.WriteLine(\"ZANUI {\\\"scale\\\":\" + Convert.ToString(scale)"
+            + " + \",\\\"pseudo\\\":\" + (pseudo ? \"true\" : \"false\") + \",\" + j.Substring(1, j.Length - 1));\n"
+            + "    }\n"
+            + "    public static void Main() {\n"
+            + "        int[] scales = new int[] { 100, 150, 200 };\n"
+            + "        for (int i = 0; i < scales.Length; i = i + 1) {\n";
+        for (int i = 0; i < names.Count; i = i + 1) {
+            src = src + "            One(\"" + names[i] + "\", new " + names[i] + "(), scales[i], false);\n"
+                + "            One(\"" + names[i] + "\", new " + names[i] + "(), scales[i], true);\n";
+        }
+        src = src + "        }\n    }\n}\n";
+        string harness = Path.Combine(work, "ZanCheckUiHarness.zan");
+        File.WriteAllText(harness, src);
+        string exe = Path.Combine(work, "ui" + exeSuffix);
+        List<string> args = new List<string>();
+        args.Add(harness);   // 第一个 Main 是入口：检查程序排在用户源文件之前
+        for (int i = 0; i < inputs.Count; i = i + 1) { args.Add(inputs[i]); }
+        for (int i = 0; i < htmls.Count; i = i + 1) { args.Add("--embed"); args.Add(htmls[i]); }
+        args.Add("--auto-stdlib");
+        args.Add("-o");
+        args.Add(exe);
+        for (int i = 0; i < extra.Count; i = i + 1) { args.Add(extra[i]); }
+        ProcessResult cr = Process.CaptureSafe(zanc, args, 600000);
+        if (cr.exitCode != 0 || !File.Exists(exe)) {
+            ok = false;
+            List<string> cl = cr.lines != null ? cr.lines : new List<string>();
+            return "{\"name\":\"ui\",\"status\":\"fail\",\"reason\":\"ui check program did not compile\","
+                + "\"forms\":" + ZanCheck.StrList(names, names.Count)
+                + ",\"output_tail\":" + ZanCheck.StrList(cl, 20) + "}";
+        }
+        ProcessResult r = Process.CaptureSafe(exe, new List<string>(), timeoutMs);
+        List<string> lines = r.lines != null ? r.lines : new List<string>();
+        string checks = "";
+        int nchecks = 0;
+        int issues = 0;
+        int pseudoIssues = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string l = lines[i].Trim();
+            if (!l.StartsWith("ZANUI ")) { continue; }
+            string obj = l.Substring(6, l.Length - 6);
+            if (nchecks > 0) { checks = checks + ","; }
+            checks = checks + obj;
+            nchecks = nchecks + 1;
+            int n = obj.Split("\"kind\":").Count - 1;
+            if (obj.Contains("\"pseudo\":true")) { pseudoIssues = pseudoIssues + n; }
+            else { issues = issues + n; }
+        }
+        ok = r.exitCode == 0 && issues == 0 && nchecks == names.Count * 6;
+        string st = "{\"name\":\"ui\",\"status\":" + (ok ? "\"pass\"" : "\"fail\"")
+            + ",\"forms\":" + ZanCheck.StrList(names, names.Count)
+            + ",\"issues\":" + Convert.ToString(issues)
+            + ",\"pseudo_issues\":" + Convert.ToString(pseudoIssues)
+            + ",\"checks\":[" + checks + "]";
+        if (r.exitCode != 0 || nchecks != names.Count * 6) {
+            st = st + ",\"exit_code\":" + Convert.ToString(r.exitCode)
+                + ",\"output_tail\":" + ZanCheck.StrList(lines, 20);
+        }
+        return st + "}";
+    }
+
     static void Usage() {
         Console.WriteLine("usage: zan-check <entry.zan|dir...> [--zanc <path>] [--timeout <seconds>]");
-        Console.WriteLine("                 [--no-run] [--zanc-arg <arg>]... [--out <report.json>]");
+        Console.WriteLine("                 [--no-run] [--no-ui] [--zanc-arg <arg>]... [--out <report.json>]");
         Console.WriteLine("                 [-- program args...]");
     }
 
@@ -185,6 +309,7 @@ public class ZanCheck {
         string outPath = "";
         int timeoutSec = 60;
         bool noRun = false;
+        bool noUi = false;
         int i = 0;
         bool rest = false;
         while (i < Environment.ArgCount()) {
@@ -193,6 +318,7 @@ public class ZanCheck {
             if (rest) { progArgs.Add(a); continue; }
             if (a == "--") { rest = true; }
             else if (a == "--no-run") { noRun = true; }
+            else if (a == "--no-ui") { noUi = true; }
             else if (a == "--help" || a == "-h") { ZanCheck.Usage(); return 0; }
             else if ((a == "--zanc" || a == "--timeout" || a == "--zanc-arg" || a == "--out")
                      && i >= Environment.ArgCount()) {
@@ -241,8 +367,16 @@ public class ZanCheck {
             steps = steps + "," + ZanCheck.Leaks(exe, progArgs, timeoutSec * 1000, out leaksOk);
             ok = ok && leaksOk;
         }
-        steps = steps + "," + ZanCheck.Skipped("ui",
-            "zan ui check (S22, ZAN_STANDARD P2) is not implemented yet");
+        if (!compiled) {
+            steps = steps + "," + ZanCheck.Skipped("ui", "compile failed");
+        } else if (noUi) {
+            steps = steps + "," + ZanCheck.Skipped("ui", "--no-ui");
+        } else {
+            bool uiOk = true;
+            steps = steps + "," + ZanCheck.Ui(zanc, inputs, extra, work, exeSuffix,
+                                              timeoutSec * 1000 * 4, out uiOk);
+            ok = ok && uiOk;
+        }
         steps = steps + "," + ZanCheck.Skipped("replay",
             "replay and invariants (S26/S27, ZAN_STANDARD P3) are not implemented yet");
 

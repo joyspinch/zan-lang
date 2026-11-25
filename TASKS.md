@@ -38,7 +38,7 @@
 
 ### 批次 3 · 有前置（前置闭了再领）
 
-- [~] B-ID223 ZAN_STANDARD P2 GUI 可验证（§5）〔软前置 B-ID222〕（进度：S21 已落地——启用 UiDriver 的程序 `ZAN_UI_DUMP` 一次性导出语义树，节点补 text/value/isChecked/enabled，钉 `gui_ui_dump_semantic_tree`；S23/S24 已落地——`Gui.Testing.UiTest` 脱窗建树绑定、按名操作与断言、语义树快照对账，钉 `conformance_gui_uitest_login`；S20 方向定为编译期检查标记、不生成代码）：S20 HTML 标记编译期生成强类型分部类、绑定编译期校验；S21 语义树 `--ui-dump json`；S22 `zan ui check` 布局不变量（多 DPI + 伪本地化）；S23 类型化 UI 测试 API；S24 ViewModel 脱窗可测。与 `docs/GUI_REFACTOR.md` 同向，串行接在其后。验收：绑定写错编译期报错；`templates/` 全部窗体过 ui check。
+- [~] B-ID223 ZAN_STANDARD P2 GUI 可验证（§5）〔软前置 B-ID222〕（进度：S21 已落地——启用 UiDriver 的程序 `ZAN_UI_DUMP` 一次性导出语义树，节点补 text/value/isChecked/enabled，钉 `gui_ui_dump_semantic_tree`；S22 已落地——`Gui.Testing.UiCheck` 离屏排版检查截断/过小/重叠/出界/塌缩，100/150/200% DPI + 伪本地化，`zan-check` ui 步自动找窗体生成检查程序，钉 `zan_check_report`（余：对比度、templates 全部过检）；S23/S24 已落地——`Gui.Testing.UiTest` 脱窗建树绑定、按名操作与断言、语义树快照对账，钉 `conformance_gui_uitest_login`；S20 方向定为编译期检查标记、不生成代码）：S20 HTML 标记编译期生成强类型分部类、绑定编译期校验；S21 语义树 `--ui-dump json`；S22 `zan ui check` 布局不变量（多 DPI + 伪本地化）；S23 类型化 UI 测试 API；S24 ViewModel 脱窗可测。与 `docs/GUI_REFACTOR.md` 同向，串行接在其后。验收：绑定写错编译期报错；`templates/` 全部窗体过 ui check。
 - [ ] B-ID224 ZAN_STANDARD P3 游戏可验证（§6）〔软前置 B-ID222〕：S25 `[Deterministic]` 命名空间模式；S26 回放即回归用例；S27 `[Invariant]` + 机器人模糊；S28 确定性模式下 switch 穷尽与配置表构建期校验；S29 帧路径分配告警。验收：`templates/game` 全部具备回放回归用例。
 - [ ] B-ID225 ZAN_STANDARD P4 安全与并发（§2/§4）〔软前置 B-ID222〕：S6 上下文感知插值；S7 包能力清单；S8 可空引用流分析；S9 无 UB；S14 结构化崩溃报告；S15 Disposable 告警；S16 跨线程共享推导 + 非原子 RC；S17 结构化并发；S18 确定性测试调度器；S19 UI 线程归属推导。验收：`--publish` 默认 Production 档；基准证明 RC 开销下降。
 - [ ] B-ID226 ZAN_STANDARD P5 规范互锚（§7）：S30 SPEC 补 ARC/async/泛型语义；S31 规则锚定 conformance 用例；S32 泛型双路径差分；S33 跨平台一致性矩阵（平台能力缺失链接期报错）。随 B-ID222～225 各阶段同步推进。

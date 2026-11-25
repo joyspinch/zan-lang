@@ -288,7 +288,7 @@ OnClick`、`Action a = Save;`）按当前类型及基类的同名方法连 defer
 ### 1.8 一条命令的检查报告（`zan-check`，S5）
 
 `zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run]
-[--zanc-arg <参数>]... [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
+[--no-ui] [--zanc-arg <参数>]... [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
 stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败步骤（skipped 不算
 失败），1 = 有失败，2 = 参数问题。`zan-check` 用 Zan 写（`src/check/ZanCheck.zan`），
 随工具链发布在 `toolchain/` 下，不依赖 Python；不给 `--zanc` 时用同目录的 `zanc`，
@@ -298,7 +298,7 @@ stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败
 |---|---|---|
 | `compile` | `zanc … --auto-stdlib --check-leaks --diag=json`：全部诊断原样收进 `diagnostics`（§1.6，含 fix-it 与 `end`），`errors`/`warnings` 计数；失败时附 `other_output`（非 JSON 输出的最后 20 行） | 编译失败 |
 | `leaks` | 运行产物（默认 60 秒超时）并解析退出报告：`leaked`、`sites[{count,site}]`、`cycles[]`（S13 路径）、`mode`（`strict` = Main 正常返回，`early-exit` = 提前退出只计不可达环）；退出码非 0 时附 `output_tail` | 有泄漏、退出码非 0 或超时 |
-| `ui` | `zan ui check`（S22，P2） | 未实现，恒 `skipped` |
+| `ui` | S22 布局不变量：在输入里找 `class X : Form` 且同目录有 `X.html` 的窗体，生成检查程序（排在用户源文件之前，它的 `Main` 是入口）离屏装配每个窗体（`Gui.Testing.UiCheck`），100%/150%/200% DPI 各排一帧、再各做一遍伪本地化（静态文本拉长 40%）。问题种类：`truncated`（文字比首选尺寸窄/矮）、`small_target`（可交互控件小于 24 逻辑像素）、`overlap`（两个可交互控件相交且互不包含）、`offscreen`（出窗口，滚动容器内不算）、`collapsed`（可交互控件被挤成 0 宽/高）。报告 `forms`、`issues`、`pseudo_issues` 与逐次 `checks[{form,scale,pseudo,issues}]`；没有窗体时 `skipped`，`--no-ui` 跳过。GUI 程序需要的 `--driver-dir` 等经 `--zanc-arg` 传 | 真实尺寸（非伪本地化）下有问题、检查程序编不过或没跑完；伪本地化的问题只计数（告警） |
 | `replay` | 回放比对与不变量（S26/S27，P3） | 未实现，恒 `skipped` |
 
 编译失败时后续步骤记 `skipped` 并写明原因，报告形状不变：
