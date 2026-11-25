@@ -151,13 +151,11 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             } else {
                 LLVMValueRef idx = emit_expr(g, operand->index.index, locals);
                 slot_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
-                emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
-                    operand->loc, "array");
                 idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
                     operand->loc, "array");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
-                slot_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                slot_ptr = emit_checked_elem_gep(g, elem_llvm, typed_arr, idx, "eidx");
             }
             slot_ty = elem_llvm;
         } else if (at && at->kind == TYPE_STRING) {
@@ -167,7 +165,6 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 arr_ptr = emit_string_base_guard(g, arr_ptr, operand->loc);
                 LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, operand->loc);
                 slot_oob = emit_index_oob_pred(g, idx, str_len);
-                emit_index_bounds_check(g, idx, str_len, operand->loc, "string");
                 idx = emit_index_safe_bounds(g, idx, str_len, operand->loc, "string");
             } else {
                 idx = emit_string_elem_guard(g, arr_ptr, idx, operand->loc, &arr_ptr);

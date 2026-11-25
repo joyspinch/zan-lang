@@ -2,6 +2,7 @@
 #include "optimizer.h"
 #include "build_cache.h"
 #include "list_width_hoist.h"
+#include "guard_version.h"
 #include "irgen.h"
 #include "binder.h"
 #include "zan_abi.h"
@@ -1913,6 +1914,10 @@ static bool list_hoist_wanted(zan_opt_level_t level) {
            !getenv("ZAN_OPT_PIPELINE");
 }
 
+static bool guard_version_wanted(zan_opt_level_t level) {
+    return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) && !getenv("ZAN_OPT_PIPELINE");
+}
+
 static bool late_arc_wanted(zan_opt_level_t level) {
     return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE || level == ZAN_OPT_SIZE ||
             level == ZAN_OPT_SIZE_MIN) &&
@@ -1938,6 +1943,12 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
         if (status == ZAN_OK) {
             zan_opt_simplify_module(g->mod, tm, ol, vec);
             status = zan_opt_verify_module(g->mod, "after simplification pipeline");
+        }
+        /* Soft-guard region versioning sits at default<ON>'s
+         * optimizer-early point, i.e. between the halves (guard_version.cpp). */
+        if (status == ZAN_OK && guard_version_wanted(level)) {
+            zan_guard_version_module(g->mod, tm);
+            status = zan_opt_verify_module(g->mod, "after guard versioning");
         }
         if (status == ZAN_OK && late_mask) status = late_arc_finish(g->mod, tm, late_mask);
         /* List 槽宽检查提出循环（见 zan_opt_run_passes_on_module 同名步骤）。
@@ -1991,7 +2002,15 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     bool late_arc = late_arc_wanted(level);
     unsigned late_mask = late_arc ? late_arc_outline(mod) : 0;
     late_arc = late_mask != 0;
-    LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
+    /* -O2/-O3 add soft-guard region versioning (guard_version.cpp)
+     * at the optimizer-early extension point; same pipeline otherwise. */
+    LLVMErrorRef err;
+    if (guard_version_wanted(level)) {
+        zan_pipeline_opts_t po = {vec, vec, vec, vec, vec, 1};
+        err = zan_run_passes_guarded(mod, passes, tm, &po);
+    } else {
+        err = LLVMRunPasses(mod, passes, tm, opts);
+    }
     LLVMDisposePassBuilderOptions(opts);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);

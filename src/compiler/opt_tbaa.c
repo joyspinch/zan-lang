@@ -52,6 +52,25 @@ void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st, int f
     LLVMSetMetadata(gep, kind, LLVMMetadataAsValue(g->ctx, md));
 }
 
+/* The array length word (base-16) gets its own tag. Only array
+ * headers live there -- objects and arrays never overlap and a field access
+ * never addresses an array header -- so field stores no longer force a
+ * reload of the length, and a bounds check's length load can leave the loop
+ * (a store to b.vx in nbody's inner loop used to re-read bs.Length). */
+void zan_tbaa_tag_array_len(zan_irgen_t *g, LLVMValueRef load) {
+    if (!load || !LLVMIsALoadInst(load) || getenv("ZAN_NO_TBAA")) return;
+    LLVMContextRef ctx = g->ctx;
+    LLVMMetadataRef root_name = LLVMMDStringInContext2(ctx, "Zan TBAA", 8);
+    LLVMMetadataRef root = LLVMMDNodeInContext2(ctx, &root_name, 1);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx);
+    LLVMMetadataRef zero = LLVMValueAsMetadata(LLVMConstInt(i64, 0, 0));
+    LLVMMetadataRef ty_ops[3] = {LLVMMDStringInContext2(ctx, "zan.arraylen", 12), root, zero};
+    LLVMMetadataRef ty = LLVMMDNodeInContext2(ctx, ty_ops, 3);
+    LLVMMetadataRef tag_ops[3] = {ty, ty, zero};
+    LLVMSetMetadata(load, LLVMGetMDKindIDInContext(ctx, "tbaa", 4),
+                    LLVMMetadataAsValue(ctx, LLVMMDNodeInContext2(ctx, tag_ops, 3)));
+}
+
 typedef struct {
     unsigned long long off;
     LLVMValueRef tag;

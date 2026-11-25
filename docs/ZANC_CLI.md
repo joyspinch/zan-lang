@@ -428,6 +428,8 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_NO_LATE_ARC` | `=1` 关闭内联后 ARC 收尾（默认 `-O2`/`-O3`/`-Os`/`-Oz` 开启：retain/release 与临时栈 push/pop 助手在 LLVM 主管线中保持外联，管线后消去同块或经软空守卫分叉的 retain/release 对、窗口内不会展开的 push/pop 对，再按原内联属性内联助手），仅供 A/B |
 | `ZAN_LATE_ARC_STATS` | 非空时在 stderr 打印内联后 ARC 收尾消去的 push/pop 对与 retain/release 对数 |
 | `ZAN_DUMP_LATE_ARC_IR` | `=<路径>` 落盘内联后 ARC 收尾之前的模块 IR（排查消对是否命中） |
+| `ZAN_NO_GUARD_VERSION` | `=1` 关闭软守卫版本化（默认 `-O2`/`-O3` 开启：含软运行时检查的循环克隆出无检查快环，第一个失败的检查从同一站点交给原循环全检查地跑完；循环不变守卫外提到预头部；报告次序与语义不变），仅供 A/B |
+| `ZAN_GUARD_VERSION_STATS` | `=1` 打印版本化了多少区域/整环；`=2` 逐个列出函数、种类与指令数 |
 | `ZAN_NO_TBAA` | `=1` 关闭字段别名元数据（默认优化构建给经 `emit_field_ptr` 的标量字段读写打按字段字节偏移的 TBAA 标签，告诉 LLVM 同一对象不同偏移的字段互不别名；显式布局结构不打），仅供 A/B 与排查疑似误编译 |
 | `ZAN_DLG_PIN_ALL` | `=1` 时每次委托调用都 retain 闭包并压临时栈（旧行为）。默认对函数内从不写、不按 ref 传、不被 lambda 捕获的局部/形参委托省掉这套簿记，仅供 A/B |
 | `ZAN_SOFT_SHARED_SCRATCH` | **运行时**环境变量：非空时软失败（try 外空引用继续执行）沿用旧的进程共享 4 KB 暂存区。默认每个出过软失败的线程惰性映射私有暂存（[保护页][头 + 1 MiB][保护页]，超出即触保护页而非写坏相邻内存），线程退出时清零后回池复用，仅供 A/B |

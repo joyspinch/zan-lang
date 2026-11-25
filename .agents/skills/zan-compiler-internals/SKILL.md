@@ -687,6 +687,33 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `emit_release_owned_call_temp` 内部识别并安全跳过）。
    - 判定器：`tests/conformance/arc_assign_call_temp_receiver.zan`。
 
+35. **软失败守卫的快路径要靠"版本化"而不是少查——合流点是性能杀手**：
+   - 动作：try 外的守卫失败侧报告后合流回快路径（`phi(x, scratch)`、`safeidx`），
+     合流之后 LLVM 不再知道 x 非空/下标在界，于是每次访问重查、经 phi 取址、
+     不能 CSE/外提，夹在 retain 与 release 之间的守卫 invoke 还让 ARC 对消不掉
+     （nbody 带检查 1.9s vs 去检查 0.9s）。别改语义去"只报第一个站点"，用
+     `guard_version.cpp`（optimizer-early 扩展点，拆分管线里在两半之间）：
+     ①整环版本化——循环克隆一份先跑，克隆里每个守卫的失败侧保留自己的报告块，
+     报告块的后继改接原循环（原循环从那一站接着全检查地跑完），快环无调用无合流；
+     ②循环不变守卫在预头部 unswitch；③大环退回"守卫支配区域"克隆。慢世界的分支
+     打 `zan.guard.done` 不再版本化（k 个变量 k+1 份，不是 2^k）。
+   - 配套前端卫生（都影响快路径）：分配失败用 `emit_runtime_check_noreturn`
+     （报告后 exit 70，旧做法续跑后往空头写而 SIGSEGV，且让"新数组非空"丢失）；
+     已钳位下标用 `emit_checked_elem_gep`（inbounds nuw，元素写不再别名长度头）；
+     数组长度读打 `zan.arraylen` TBAA + `!range [0,2^63)`（软失败暂存读作 2^62，
+     仍在范围内）；`emit_index_safe_bounds` 自己就报告，前面别再叠
+     `emit_index_bounds_check`（同站点双报、双分支）。
+   - 坑：交叉边若直接接到原报告块，它有多个前驱，late ARC 2b（把 retain 挪到
+     冷边）找不到单前驱的落脚块，b 的 retain/release 照留——所以交叉点放在
+     **报告块之后**。区域上限 400 条指令：1500 时 zandoc text +14%。
+   - 实测（user 秒，带检查 / --no-runtime-checks）：nbody 1.9→~0.5 / 0.4，
+     fannkuch 2.3→1.75 / 1.75，sort 0.36→0.30 / 0.28。剩余 nbody 差距是外层
+     `Body a` 的 retain/release：内层快环有出口到慢环，late ARC 跨循环对消
+     要求"全路径到 release"，需要它学会在侧出口补 retain。
+   - 判定器：`tests/conformance/guard_version_loops.zan`（-O0 与 -O2 stdout/
+     stderr 逐字节相同）；`ZAN_NO_GUARD_VERSION=1` A/B，
+     `ZAN_GUARD_VERSION_STATS=1/2` 看版本化了哪些环。
+
 ---
 
 ## 三、运行时数据布局与内存所有权（Runtime / ARC）

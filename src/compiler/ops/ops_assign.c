@@ -399,17 +399,19 @@ binding_lowered:
                                 expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
                             LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                            if (local->type && local->type->kind == TYPE_ARRAY) {
+                            bool clamped = local->type && local->type->kind == TYPE_ARRAY;
+                            if (clamped) {
                                 ar_oob = emit_index_oob_pred(g, idx,
                                     zan_array_len(g, arr_ptr));
-                                emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
-                                    expr->loc, "array");
-                                idx = emit_index_safe_bounds(g, idx,
-                                    zan_array_len(g, arr_ptr), expr->loc, "array");
+                                idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
+                                                             expr->loc, "array");
                             }
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
-                            elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                            elem_ptr = clamped ? emit_checked_elem_gep(g, elem_llvm, typed_arr, idx,
+                                                                       "eidx")
+                                               : LLVMBuildGEP2(g->builder, elem_llvm, typed_arr,
+                                                               &idx, 1, "eidx");
                         }
                         LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
                         emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
@@ -469,17 +471,14 @@ binding_lowered:
                             expr_has_reliable_string_bounds(arr_expr, locals)) {
                             arr_ptr = emit_string_base_guard(g, arr_ptr, expr->loc);
                             LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
-                            emit_index_bounds_check(g, idx, len, expr->loc, "string");
                             idx = emit_index_safe_bounds(g, idx, len, expr->loc, "string");
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
                             ar_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
-                            emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
-                                expr->loc, "array");
-                            idx = emit_index_safe_bounds(g, idx,
-                                zan_array_len(g, arr_ptr), expr->loc, "array");
+                            idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
+                                                         expr->loc, "array");
                         }
                         if (fsym->type && type_named(fsym->type, "List", 4)) {
                             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -666,17 +665,19 @@ binding_lowered:
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                                 expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
-                            if (at->kind == TYPE_ARRAY && at->array_rank == 1) {
+                            bool clamped = at->kind == TYPE_ARRAY && at->array_rank == 1;
+                            if (clamped) {
                                 ar_oob = emit_index_oob_pred(g, idx,
                                     zan_array_len(g, arr_ptr));
-                                emit_index_bounds_check(g, idx,
-                                    zan_array_len(g, arr_ptr), expr->loc, "array");
-                                idx = emit_index_safe_bounds(g, idx,
-                                    zan_array_len(g, arr_ptr), expr->loc, "array");
+                                idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
+                                                             expr->loc, "array");
                             }
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
-                            elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                            elem_ptr = clamped ? emit_checked_elem_gep(g, elem_llvm, typed_arr, idx,
+                                                                       "eidx")
+                                               : LLVMBuildGEP2(g->builder, elem_llvm, typed_arr,
+                                                               &idx, 1, "eidx");
                         }
                         LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
                         emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
@@ -772,14 +773,11 @@ binding_lowered:
                     } else {
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                         ar_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
-                        emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
-                            expr->loc, "array");
-                        idx = emit_index_safe_bounds(g, idx,
-                            zan_array_len(g, arr_ptr), expr->loc, "array");
+                        idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr), expr->loc,
+                                                     "array");
                         LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                             LLVMPointerType(elem_llvm, 0), "arrp");
-                        elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm,
-                            typed_arr, &idx, 1, "eidx");
+                        elem_ptr = emit_checked_elem_gep(g, elem_llvm, typed_arr, idx, "eidx");
                     }
                     LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
                     emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);

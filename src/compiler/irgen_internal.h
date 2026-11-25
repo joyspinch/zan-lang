@@ -294,6 +294,7 @@ void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap, LLVMValueR
 LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name);
 LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym, LLVMTypeRef st, LLVMValueRef base, int fi, const char *name);
 void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st, int fi);
+void zan_tbaa_tag_array_len(zan_irgen_t *g, LLVMValueRef load);
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb);
 LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v, int is_unsigned);
 LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned);
@@ -841,6 +842,10 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg);
 LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val, LLVMTypeRef target, zan_loc_t loc, LLVMValueRef arm_mask);
 void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef s, LLVMValueRef slen);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull, zan_loc_t loc);
+void emit_runtime_check_noreturn(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
+                                 const char *msg);
+LLVMValueRef emit_checked_elem_gep(zan_irgen_t *g, LLVMTypeRef elem_ty, LLVMValueRef base,
+                                   LLVMValueRef idx, const char *name);
 void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out, LLVMValueRef *window_out, LLVMValueRef length, zan_loc_t loc, const char *kind);
 void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start, LLVMValueRef window, LLVMValueRef length, zan_loc_t loc, const char *kind);
 LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b);

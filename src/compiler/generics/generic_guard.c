@@ -342,6 +342,40 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
 
+/* 已经过 emit_index_safe_bounds 钳位的数组元素地址。下标此时
+ * 必在 [0, len)（越界侧钳为 0），GEP 可标 inbounds nuw：别名分析据此知道
+ * 元素写不会碰到 base-16 处的长度头，长度读可以外提/合并。 */
+LLVMValueRef emit_checked_elem_gep(zan_irgen_t *g, LLVMTypeRef elem_ty, LLVMValueRef base,
+                                   LLVMValueRef idx, const char *name) {
+    if (!g->runtime_checks) return LLVMBuildGEP2(g->builder, elem_ty, base, &idx, 1, name);
+#if ZAN_LLVM_MAJOR >= 19
+    return LLVMBuildGEPWithNoWrapFlags(g->builder, elem_ty, base, &idx, 1, name,
+                                       LLVMGEPFlagInBounds | LLVMGEPFlagNUW);
+#else
+    return LLVMBuildInBoundsGEP2(g->builder, elem_ty, base, &idx, 1, name);
+#endif
+}
+
+/* 不可续跑的检查（分配失败）。软失败模式下旧做法报告后照常
+ * 续跑，紧接着往空指针写头部而 SIGSEGV；而合流又让 LLVM 失去"分配结果
+ * 非空"，此后每次访问该数组都得重查空值、经 soft.base phi 取址。这里失败
+ * 侧照常报告（try 内照常抛出），报告返回后 exit(70) 硬失败，成功侧不再合流。 */
+void emit_runtime_check_noreturn(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
+                                 const char *msg) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.fatal");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.ok");
+    LLVMBuildCondBr(g->builder, emit_expect_false(g, is_error), bad_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+    emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0), loc, msg);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 70, 0);
+        zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+        LLVMBuildUnreachable(g->builder);
+    }
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+}
+
 /* B-ID163②：擦除体（泛型类/泛型方法的未特化变体，类型实参未定，
  * irgen_call_spec.c 同款场景）里的 new T() 落到 irgen 兜底——旧实现直接
  * 返回零值，调用方拿 null 继续跑（TASKS B-ID163② 静默失效实录）。擦除体

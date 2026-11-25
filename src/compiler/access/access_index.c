@@ -228,7 +228,6 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             if (expr_has_reliable_string_bounds(expr->index.object, locals)) {
                 arr_ptr = emit_string_base_guard(g, arr_ptr, expr->loc);
                 LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, expr->loc);
-                emit_index_bounds_check(g, idx, str_len, expr->loc, "string");
                 idx = emit_index_safe_bounds(g, idx, str_len, expr->loc, "string");
             } else {
                 idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
@@ -275,11 +274,10 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
                 LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
                 LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
-                emit_index_bounds_check(g, idx, arr_len, expr->loc, "array");
                 idx = emit_index_safe_bounds(g, idx, arr_len, expr->loc, "array");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
-                elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                elem_ptr = emit_checked_elem_gep(g, elem_llvm, typed_arr, idx, "eidx");
             }
             return promote_loaded(g,
                 LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
