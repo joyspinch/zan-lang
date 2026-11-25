@@ -4,6 +4,7 @@
 #include "reflect_api.h"
 #include "definite.h"
 #include "diag.h"
+#include "suggest.h"
 #include "arena.h"
 #include "builtin_api.h"
 #include <string.h>

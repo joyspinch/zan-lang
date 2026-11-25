@@ -59,7 +59,7 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 
 | 编号 | 能力 | 说明 |
 |---|---|---|
-| S1 | `zanc --diag=json` | **第一刀已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置、fix-it 框架，首个补丁 E0032 缺 `;`）。余：更多诊断接 fix-it（`zan_diag_emit_fix`）、结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
+| S1 | `zanc --diag=json` | **已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置；fix-it：E0032 缺 `;`、E2084/E2085/E1005 拼写建议、E2073 `=`→`==`、W2111 补 `weak`）。余：结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
 | S2 | `zanc query <符号>` | 第一刀已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a；余：虚调用/委托目标展开 |
 | S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
 | S4 | `zanc --summary <包>` | 已落地，见 docs/ZANC_CLI.md §1.7：公开签名 + 效果列（S2 的 throws/能力）+ 一行文档；余：契约列（P4） |

@@ -16,7 +16,14 @@ build/zanc.exe <entry.zan> --auto-stdlib -o build/app
 ```
 
 Fix the **first** diagnostic first — the rest are often its fallout. Each one
-carries file, line, column and message. When a diagnostic surprises you, cut the
+carries file, line, column and message.
+
+For a machine-readable loop, compile with `--diag=json`: one JSON object per
+diagnostic, and many carry `fixits[]` — byte-offset patches you can apply
+directly (apply from the highest `offset` down). Typos in member/method/type
+names come back as "did you mean 'X'?" with a replacement patch (only when one
+candidate is clearly closest), a missing `;` as an insertion, `=` in
+a condition as `==`, and a class-to-class reference cycle (W2111) as `weak `. When a diagnostic surprises you, cut the
 construct down to a few lines and `zan_compile` that: a minimal snippet tells you
 whether your assumption or the code is wrong.
 

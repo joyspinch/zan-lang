@@ -203,8 +203,21 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `fixits[]` | 机器可应用补丁：把 `[offset, offset+length)` 字节替换为 `text`，`length = 0` 即插入；可能为空数组 |
 | summary `errors` `warnings` `suppressed` | 计数；`suppressed` = 错误上限与单行级联帽丢弃的条数；进程退出前输出 |
 
-当前带 fix-it 的诊断：E0032 缺 `;`（插在上一个 token 末尾；上一个 token 是
-字符串或运算符等量不出长度时不给补丁）。退出码语义与文本格式相同。
+当前带 fix-it 的诊断（文本格式的消息里同样带 "did you mean"，补丁只在 JSON 里）：
+
+| 诊断 | 补丁 |
+|---|---|
+| E0032 缺 `;` | 插在上一个 token 末尾（上一个 token 是字符串或运算符等量不出长度时不给） |
+| E2085 / E2084 成员或方法名不存在 | 换成类型（含基类）里拼写最近的同类成员：调用位置只看方法，取值位置看字段/属性/方法 |
+| E1005 未定义的类型 | 换成作用域里拼写最近的类型名（类/结构/接口/枚举/委托） |
+| E2073 条件里写成赋值 | 普通 `=` 换成 `==`（复合赋值不给） |
+| W2111 类之间的强引用环（S11） | 在回指针字段的类型前插入 `weak ` |
+
+拼写建议取编辑距离最小的候选（相邻换位算一次；名字 ≤4 字符最多差 1 处，
+更长最多 2 处），**最近的候选有两个就不给补丁**——猜错的补丁比没有更糟；
+编译器合成的名字（`get_`/`set_`/`op_`/`__` 开头）不当建议。退出码语义与文本
+格式相同。钉：`diag_json_fixit`、`diag_json_class_cycle`、`diag_fixits_apply`
+（`tests/test_diag_fixits.py`：逐个夹具把补丁应用回源码再编译必须通过）。
 
 ### 1.7 接口摘要（`--summary`，S4）
 

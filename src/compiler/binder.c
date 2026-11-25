@@ -3,6 +3,7 @@
 #include "binder.h"
 #include "arena.h"
 #include "diag.h"
+#include "suggest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

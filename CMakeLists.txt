@@ -204,6 +204,7 @@ add_executable(zanc
     src/compiler/builtin_api.c
     src/compiler/symbols.c
     src/compiler/query.c
+    src/compiler/suggest.c
     src/runtime/rt_decimal.c
     # compressor side of embedded resources (embedres.c embed_maybe_compress)
     src/common/miniz.c
@@ -8758,6 +8759,13 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_build_cache.py
       --zanc $<TARGET_FILE:zanc> --work ${CMAKE_BINARY_DIR}/test-out/build-cache)
   set_tests_properties(build_cache_memo PROPERTIES TIMEOUT 300)
+  # S1（docs/ZAN_STANDARD.md §1）：拼写建议（E2085/E2084/E1005）与
+  # '=' → '=='（E2073）的 fix-it 应用回源码后必须能编译；同样近的两个候选不给补丁。
+  add_test(NAME diag_fixits_apply
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_diag_fixits.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out/diag-fixits)
+  set_tests_properties(diag_fixits_apply PROPERTIES TIMEOUT 600)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
