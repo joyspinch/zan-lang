@@ -5,6 +5,8 @@
 FileNotFoundException），lambda 捕获 this 与形参 path，Main 里两个调用点。
 夹具 tests/query/query_catch.zan：catch 扣除（具体/基类型/裸 catch 收住，rethrow 与
 catch 体里新抛的逃出，lambda 体不算外层方法会抛，互递归各算各的 catch）。
+夹具 tests/query/query_virtual.zan：接口调用连到实现、抽象调用连到 override、
+方法组当值用算能力不算抛出。
 另核对单名按类型名优先（Store 列出它的方法，而不是 Vector128.Store）、
 无匹配退出码 1。"""
 import argparse
@@ -78,6 +80,20 @@ def main():
     assert via == 'Svc.Rethrow(string p) -> File.ReadAllText(string path)', via
     rc, hits, _ = query(a.zanc, csrc, 'Svc.Specific')
     assert [c['capability'] for c in hits[0]['capabilities']] == ['File'], hits[0]['capabilities']
+
+    vsrc = os.path.join(os.path.dirname(src), 'query_virtual.zan')
+    rc, hits, _ = query(a.zanc, vsrc, 'Program.Use')
+    q = hits[0]
+    assert 'FileStore.Load(string p)' in q['calls'], q['calls']
+    assert [e['type'] for e in q['throws']['escapes']] == ['FileNotFoundException'], q['throws']
+    assert q['capabilities'][0]['via'] == ('Program.Use(IStore s) -> FileStore.Load(string p)'
+                                           ' -> File.ReadAllText(string path)'), q['capabilities']
+    rc, hits, _ = query(a.zanc, vsrc, 'Shape.Twice')
+    assert [e['type'] for e in hits[0]['throws']['escapes']] == ['InvalidOperationException'], hits
+    rc, hits, _ = query(a.zanc, vsrc, 'Ui.Wire')
+    q = hits[0]
+    assert q['throws']['escapes'] == [] and q['calls'] == ['Ui.OnClick()'], q
+    assert [c['capability'] for c in q['capabilities']] == ['File'], q['capabilities']
     print('query: JSON contracts passed')
 
 

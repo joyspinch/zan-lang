@@ -14,8 +14,9 @@
  *   calls         直接调用的方法；callers：全程序里解析到它的调用点
  * 调用图来自 checker 写在调用节点上的 call.resolved_sym；每个调用点与 throw 点记下
  * 所处的 catch 上下文（只有 try 体受保护；lambda 体不受外层 try 保护）。`new T(...)` 连到 T 的
- * 同元数构造器。虚调用按静态目标连边（不展开覆盖），委托调用不连边（目标在运行期
- * 才定），lambda 里的调用算宿主方法的。各列表最多 64 项，callers 截断时
+ * 同元数构造器。虚/抽象/接口方法的调用点同时连到全部 override 与接口实现，方法名
+ * 当值用（方法组）连 deferred 边（见 query/query_virtual.c）；经委托变量的调用仍不
+ * 连边（目标运行期才定），lambda 体里的调用算 deferred。各列表最多 64 项，callers 截断时
  * callers_truncated 为 true。
  *
  * 名字：`Type.Method`、`Type.Type` / `Type.ctor`（构造器）；单名先当类型名列出它的
@@ -60,6 +61,8 @@ typedef struct {
     int             site_count, site_cap;
     q_throw_t      *throws;
     int             throw_count, throw_cap;
+    int            *overriders;   /* 可能代替本方法运行的 override / 接口实现 */
+    int             ov_count, ov_cap;
 } q_method_t;
 
 typedef struct {
@@ -262,6 +265,8 @@ static void q_add_throw(q_method_t *m, zan_ast_node_t *node, int filt, bool defe
     m->throw_count++;
 }
 
+#include "query/query_virtual.c"
+
 /* 方法体扫描：调用点与 throw 点连同所处的 catch 上下文记下来。只有 try 体受
  * 本 try 的 catch 保护；catch 体与 finally 在外层上下文里；lambda 体是委托被调用
  * 时才执行的代码（deferred）：不算本方法会抛的异常，但算本方法代码用到的能力。 */
@@ -292,7 +297,28 @@ static void q_scan(q_prog_t *P, int mi, zan_ast_node_t *n, int filt, bool deferr
     case AST_CALL:
         if (n->call.resolved_sym && n->call.resolved_sym->decl) {
             int to = q_find(P, n->call.resolved_sym->decl);
-            if (to >= 0) q_add_site(&P->m[mi], to, filt, deferred);
+            if (to >= 0) {
+                q_add_site(&P->m[mi], to, filt, deferred);
+                /* 虚/抽象/接口方法：真正运行的可能是任何一个覆盖者 */
+                for (int k = 0; k < P->m[to].ov_count; k++)
+                    q_add_site(&P->m[mi], P->m[to].overriders[k], filt, deferred);
+            }
+        }
+        /* callee 本身不是方法组引用：只扫实参，避免把被调名字当方法组 */
+        for (int i = 0; i < n->call.args.count; i++)
+            q_scan(P, mi, n->call.args.items[i], filt, deferred);
+        if (n->call.callee && n->call.callee->kind == AST_MEMBER_ACCESS)
+            q_scan(P, mi, n->call.callee->member.object, filt, deferred);
+        else if (n->call.callee && n->call.callee->kind != AST_IDENTIFIER)
+            q_scan(P, mi, n->call.callee, filt, deferred);
+        return;
+    case AST_IDENTIFIER:
+        qv_method_group(P, mi, n->ident.name, filt);
+        return;
+    case AST_MEMBER_ACCESS:
+        if (n->member.object && n->member.object->kind == AST_THIS_EXPR) {
+            qv_method_group(P, mi, n->member.name, filt);
+            return;
         }
         break;
     case AST_NEW_EXPR:
@@ -942,6 +968,7 @@ static bool q_prog_build(q_prog_t *P, zan_ast_node_t *unit, zan_binder_t *binder
         q_collect_types(P, &unit->comp_unit.decls);
     }
     if (!q_build_map(P)) return false;
+    qv_build_overrides(P);
     for (int i = 0; i < P->count; i++)
         q_scan(P, i, P->m[i].decl->method_decl.body, -1, false);
     return true;
@@ -952,6 +979,7 @@ static void q_prog_free(q_prog_t *P) {
         free(P->m[i].callees);
         free(P->m[i].sites);
         free(P->m[i].throws);
+        free(P->m[i].overriders);
     }
     free(P->filters);
     free(P->m);
