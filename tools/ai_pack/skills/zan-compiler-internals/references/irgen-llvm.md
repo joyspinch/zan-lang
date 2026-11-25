@@ -933,3 +933,37 @@ ThinLTO（试过，没落地）：llvm-split → 各分区 `thinlto-pre-link<O2>
 instructions retired 就能差 10%（程序行为依赖地址）。单个二进制 A/B 无效：每种
 配置至少编 3–4 个不同切分份数的二进制、各跑多轮取均值；机器负载 >20 时 wall time
 没有意义，用 cycles。
+
+## 42. 排序与 List 循环：先看算法，再看检查（2026-11-24 Mac arm64 实证）
+
+- **先拿 C 移植版对照**：`Array.Sort(int[])` 慢 C++ 3×，看着像代码生成问题，其实
+  把 Zan 的内省排序逐行抄成 C 也是 0.29 s——关掉运行期检查的 Zan IR 已和 C 一样
+  干净。差距是算法：libc++ 对算术类型用位图分块划分（BlockQuickSort），比较
+  结果不再驱动分支；随机数据上 Hoare 划分每元素一次误预测。改成 64 元素一块、
+  位图记"放错边"、`TrailingZeroCount` 成对交换后关检查 0.09 s = C++。
+  等值元素要单独处理（左邻枢轴不小于本层枢轴 → "等于归左"划分并跳过整段），
+  否则全等/少值输入退化成 O(n²)→堆排序。
+- **`List<T>` 窄槽宽度标签检查是 List 循环的主要开销**：每次特化访问先读表头
+  esz、不等就调 `__zan_list_repack`。这条冷调用留在循环里，LLVM 只能每轮重读
+  标签/数据指针/Count，循环也无法向量化（关检查 0.11 s，去掉检查 0.02 s）。
+  `list_width_hoist.cpp`（主管线后）：循环里所有调用都不可能把表改成别的宽度
+  （只认识的运行时助手、只读调用、同宽 repack）且检查块支配全部回边/出口时，
+  前置头里查一次、循环内分支折成直通，再跑 licm/gvn 清理。切分管线下放在两半
+  之间（后半段只有 LICM 没有 GVN，不先清理收益归零：0.14 → 0.09 s）；整管线
+  路径放在管线后并补跑 loop-vectorize（关检查读循环 0.11 → 0.03 s）。
+  提前 repack 语义不可见（只改槽宽不改内容），所以只需保证 lp 在前置头有效。
+  出口到 `unreachable` 块（OOM puts+exit）不算活出口，否则 Add 循环永远不满足
+  支配条件。`ZAN_NO_LIST_HOIST=1` 关断；回归 `codegen_list_width_hoist`。
+- LLVM 23 删了 `Instruction::Br` 并废弃 `BranchInst` 访问器（拆成
+  `CondBrInst/UncondBrInst`）；C++ 遍历分支形态按 `LLVM_VERSION_MAJOR` 分两套写，
+  建无条件跳转用 `IRBuilder::CreateBr`（各版本通用）。
+- 数组长度 load 带 `!range [0, INT64_MAX)` 后，InstCombine 把 `idx<0 || idx>=len`
+  并成一次无符号比较。`!invariant.load` 实测几乎无收益，且数组释放后同址复用
+  会违反其语义，不加。
+- 剩余差距（开检查 1.5×）是每次数组访问的软检查：冷路径 `__zan_guard_raise`
+  会返回（try 外 soft 报告后继续），不是 noreturn，LICM 提不出长度、也做不了
+  区间检查消除。要再收需要编译器做循环级越界检查消除，不是改排序写法。
+- `List<string>` / `Comparison<T>` 排序慢 C++ 4×，改走数组测不出收益：交换路径
+  每次 retain/release（数组内交换本应 ARC 中性），比较是调用——是 ARC 层面的事。
+- 机器 load 20+ 时只看 user 时间、A/B 交替跑取最小值；`sample` 在本机取不到
+  调用图，用 `objdump -d` 看热循环指令数更可靠。

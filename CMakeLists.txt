@@ -190,6 +190,7 @@ add_executable(zanc
     src/compiler/irgen_compact.cpp
     src/compiler/codegen_split.cpp
     src/compiler/build_cache.cpp
+    src/compiler/list_width_hoist.cpp
     src/compiler/optimizer.c
     src/compiler/opt_tbaa.c
     src/compiler/incremental.c
@@ -7799,6 +7800,15 @@ add_test(NAME diag_no_runtime_arc COMMAND ${CMAKE_COMMAND}
   -DWORKDIR=${CMAKE_BINARY_DIR}
   -P ${CMAKE_SOURCE_DIR}/tests/run_no_runtime_ir.cmake)
 set_tests_properties(diag_no_runtime_arc PROPERTIES TIMEOUT 60)
+
+# List<T> 槽宽标签检查须被提出循环（src/compiler/list_width_hoist.cpp）。
+add_test(NAME codegen_list_width_hoist
+  COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/list_width_hoist.zan
+  -DWORKDIR=${CMAKE_BINARY_DIR}
+  -P ${CMAKE_SOURCE_DIR}/tests/run_list_width_hoist_ir.cmake)
+set_tests_properties(codegen_list_width_hoist PROPERTIES TIMEOUT 120)
 
 # A pointer-width native handle must never be implicitly truncated into a
 # fixed 32-bit int. Exercise every conversion boundary independently so a new

@@ -309,9 +309,21 @@ LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_ARR_COUNT_OFF, 1);
     LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
-    return LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
+    LLVMValueRef len = LLVMBuildLoad2(
+        g->builder, i64, LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
         "arr.len");
+    /* 长度恒非负（建数组时负长/溢出都已钳成 0；soft 空数组的 scratch 页该位是
+     * 1<<62，同样落在范围内）。
+     * !range [0, INT64_MAX) 让 InstCombine 把下标检查 `idx < 0 || idx >= len`
+     * 并成一次无符号比较 `(u64)sext(idx) >= len`：每次数组访问少一对比较+分支
+     * （分块划分排序 0.16 → 0.14 s）。 */
+    unsigned range_kind = LLVMGetMDKindIDInContext(g->ctx, "range", 5);
+    LLVMMetadataRef range_ops[2] = {
+        LLVMValueAsMetadata(LLVMConstInt(i64, 0, 0)),
+        LLVMValueAsMetadata(LLVMConstInt(i64, (unsigned long long)INT64_MAX, 0))};
+    LLVMSetMetadata(len, range_kind,
+                    LLVMMetadataAsValue(g->ctx, LLVMMDNodeInContext2(g->ctx, range_ops, 2)));
+    return len;
 }
 LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
                                       int rank, LLVMTypeRef elem_llvm) {

@@ -1,6 +1,7 @@
 
 #include "optimizer.h"
 #include "build_cache.h"
+#include "list_width_hoist.h"
 #include "irgen.h"
 #include "binder.h"
 #include "zan_abi.h"
@@ -1886,6 +1887,16 @@ bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level) {
     return true;
 }
 
+/* 外提后清掉死 repack 块、把循环里重读的 Count/数据指针提出去。 */
+#define LIST_HOIST_CLEANUP                                                                         \
+    "function(simplifycfg,instcombine<no-verify-fixpoint>,loop-mssa(licm),gvn,simplifycfg)"
+
+/* ZAN_NO_LIST_HOIST=1 关断 List 槽宽检查外提（红绿对照用）。 */
+static bool list_hoist_wanted(zan_opt_level_t level) {
+    return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) && !getenv("ZAN_NO_LIST_HOIST") &&
+           !getenv("ZAN_OPT_PIPELINE");
+}
+
 static bool late_arc_wanted(zan_opt_level_t level) {
     return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE || level == ZAN_OPT_SIZE ||
             level == ZAN_OPT_SIZE_MIN) &&
@@ -1913,6 +1924,12 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
             status = zan_opt_verify_module(g->mod, "after simplification pipeline");
         }
         if (status == ZAN_OK && late_mask) status = late_arc_finish(g->mod, tm, late_mask);
+        /* List 槽宽检查提出循环（见 zan_opt_run_passes_on_module 同名步骤）。
+         * 放在两半之间：后半段只有 LICM 没有 GVN，循环里重读的 Count/数据指针
+         * 要先在这里外提，后半段的向量化才看得到干净循环。 */
+        if (status == ZAN_OK && list_hoist_wanted(level) &&
+            zan_opt_hoist_list_width_checks(g->mod) > 0)
+            status = run_checked_passes(g->mod, tm, LIST_HOIST_CLEANUP);
         /* Drop bodies the inliner left dead now, so extern-library pruning
          * between here and object emission sees the final call graph. */
         if (status == ZAN_OK) status = run_checked_passes(g->mod, NULL, "globaldce");
@@ -1968,6 +1985,17 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     }
     if (zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
         return ZAN_ERROR;
+    /* List<T> 槽宽标签检查提出循环（list_width_hoist.cpp）：循环里那条冷的
+     * __zan_list_repack 调用让 LLVM 每轮重读标签/数据指针/Count；提到循环前
+     * 置头后折掉循环内分支，再用一小段管线清掉死块、外提不变量。
+     * ZAN_NO_LIST_HOIST=1 关断（红绿对照用）。 */
+    if (list_hoist_wanted(level) && zan_opt_hoist_list_width_checks(mod) > 0) {
+        if (run_checked_passes(mod, tm,
+                               LIST_HOIST_CLEANUP
+                               ",function(loop-vectorize,"
+                               "instcombine<no-verify-fixpoint>,simplifycfg)") != ZAN_OK)
+            return ZAN_ERROR;
+    }
     if (late_arc && late_arc_finish(mod, tm, late_mask) != ZAN_OK) return ZAN_ERROR;
     /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
     {
