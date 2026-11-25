@@ -893,6 +893,11 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      有没有对外服务的义务"，而不是"它原来有没有 public 关键字"。搬迁后的兼容面
      只转发**纯函数**（无表、无共享状态），规格表与算法留在新包、用**全限定名**
      可达——全限定名不撞名，同时导入两个命名空间时裸名才会歧义。
+     第二轮同类事故（cf7e2571e，Zan.Net 47 文件规范化）：`HttpClient.BuildRequestHead`/
+     `BuildDownloadRequest`/`HasHeaderName` 与 `TlsStream.engine` 被收窄，4 条以上
+     conformance 编译失败。自足的报文构建器恢复 public；**可变字段**不恢复成 public 字段，
+     改给只读属性（`TlsStream.Engine { get }`）、用例跟着改名——外部要的是"看握手结果"，
+     不是"换掉引擎"。
 
 49. **只查不声明 = 静默跳过**：
    - 动作：编译器要调用**外部符号**（libc / Win32 API）时，必须用

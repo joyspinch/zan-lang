@@ -67,7 +67,6 @@ public class Clipboard {
 
     [DllImport("shell32", EntryPoint = "DragFinish")]
     private static extern void WinDragFinish(nint hdrop);
-    #endif
 
     // ---- 争用重试（Windows 剪贴板是全局独占资源）--------------------
     //
@@ -100,6 +99,7 @@ public class Clipboard {
         }
         return 0;
     }
+    #endif
 
     // 当前会话是否有可用的剪贴板（能打开就说明有）。
     //
@@ -129,6 +129,13 @@ public class Clipboard {
     private static int ToolXsel() { return 3; }      // xsel（只有纯文本）
     // macOS：pbcopy / pbpaste。
     private static int ToolPasteboard() { return 4; }// pbcopy / pbpaste
+
+    // pbcopy/pbpaste 按 locale 环境变量决定文本编码；LANG 没设时（launchd
+    // 起的进程、ctest、IDE 子进程都常见）退回 __CF_USER_TEXT_ENCODING 的
+    // 系统旧编码（中文系统是 MacChineseSimp），UTF-8 正文在写-读往返里被
+    // 改写或丢光。我们读写临时文件和管道的都是 UTF-8，所以固定一个 UTF-8
+    // locale；LC_ALL 优先级最高，用户 LANG 是 GBK 之类时也一样稳。
+    private static string PasteboardLocale() { return "LC_ALL=en_US.UTF-8"; }
 
     // POSIX 侧文本 MIME 类型。
     private static string MimeText() { return "text/plain;charset=utf-8"; }
@@ -281,7 +288,10 @@ public class Clipboard {
             args.Add("-o");
         } else {
             if (mime != Clipboard.MimeText()) { return ""; }
-            exe = "pbpaste";
+            // pbpaste 按 locale 选文本编码（见 PasteboardLocale）。
+            exe = "/usr/bin/env";
+            args.Add(Clipboard.PasteboardLocale());
+            args.Add("pbpaste");
         }
         ProcessResult res = Process.CaptureSafe(exe, args);
         if (res.exitCode == 0) { return res.Text(); }
@@ -323,8 +333,9 @@ public class Clipboard {
                 shArgs.Add("sh");
                 shArgs.Add(tmp);
             } else {
-                shArgs.Add("pbcopy < \"$1\"");
+                shArgs.Add("env \"$1\" pbcopy < \"$2\"");
                 shArgs.Add("sh");
+                shArgs.Add(Clipboard.PasteboardLocale());
                 shArgs.Add(tmp);
             }
             rc = Process.RunSafe("/bin/sh", shArgs);
