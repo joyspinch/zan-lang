@@ -6,20 +6,11 @@ using Gui.Widget;
 
 namespace Gui.Component.DataTable;
 
-// 绑定到调用方自身实体列表的数据网格，形式与
+// 绑定到调用方自身实体列表的数据网格（继承 DataTableHostBase），形式与
 // `ListView<T>` / `Dropdown<T>` 一致——用访问器声明列，传入数据，
-// 布局、存储或单元格字符串等细节不会泄漏到
-// 调用处：
-// ```zan
-// grid.Bind(users);          // 调用方的 List<User>，每帧读取
-// side.Add(grid);
-// ```
-// 底层驱动完整的 DataTable 引擎（可排序 / 可筛选 /
-// 可分组 / 可编辑 / 虚拟化），泛型前端不损失任何
-// 能力——可通过 `DataGrid.State()` 访问原始
-// `DataTableState`。
+// 底层驱动完整的 DataTable 引擎（排序/筛选/分组/编辑/虚拟化）。
 [ControlKind(Of = "string")]  // 按名构造（HTML/设计文档）造 string 实例
-public class DataGrid<T> : Control {
+public class DataGrid<T> : DataTableHostBase {
     public override Control CreateCloneShell() { return new DataGrid<T>(); }
     public List<GridColumn<T>> gcols;
     public List<T> data;
@@ -29,7 +20,6 @@ public class DataGrid<T> : Control {
     public int boundN;
     public string of;
     public bool defaultFactory;
-    private DataTableVisualTree visualTree;
 
     public void InitGrid() {
         this.InitControl("datatable");
@@ -50,6 +40,11 @@ public class DataGrid<T> : Control {
     }
 
     public DataGrid() { this.InitGrid(); }
+
+    protected override List<DataColumn> HostColumns() { return this.descs; }
+    protected override DataSource HostSource() { return this.source; }
+    protected override DataTableState HostState() { return this.st; }
+    protected override void BeforePrepareVisualTree() { this.SyncDescs(); }
 
     public List<GridColumn<T>> Columns {
         get { return this.gcols; }
@@ -79,165 +74,32 @@ public class DataGrid<T> : Control {
         }
     }
 
-    public int RowHeightPx {
-        get { return this.st.rowH; }
-        set { this.st.rowH = value; }
+    private void InstallDefaultFactory() {
+        this.defaultFactory = true;
+        this.source.factory = () => {
+            TypeInfo ti = typeof(T);
+            if (ti.Name != "string" && ti.Name != "object") {
+                try {
+                    object inst = ti.CreateInstance();
+                    if (inst != null) { return (T)inst; }
+                } catch (Exception _ex) {
+                }
+            }
+            return null;
+        };
     }
 
-    public bool ShowRowNumbers {
-        get { return this.st.showRowNum; }
-        set { this.st.showRowNum = value; }
-    }
-
-    public bool IsSelectable {
-        get { return this.st.showSelect; }
-        set { this.st.showSelect = value; }
-    }
-
-    public bool IsStriped {
-        get { return this.st.striped; }
-        set { this.st.striped = value; }
-    }
-
-    public bool AllowRowReorder {
-        get { return this.st.rowReorder; }
-        set { this.st.rowReorder = value; }
-    }
-
-    public bool ShowSummary {
-        get { return this.st.showSummary; }
-        set { this.st.showSummary = value; }
-    }
-
-    public bool ShowSelectionSummary {
-        get { return DataTable.GetShowSelectionSummary(this.st); }
-        set { DataTable.SetShowSelectionSummary(this.st, value); }
-    }
-
-    public bool ShowFilterRow {
-        get { return this.st.showFilterRow; }
-        set { this.st.showFilterRow = value; }
-    }
-
-    public bool ShowStatusBar {
-        get { return this.st.showStatusBar; }
-        set { this.st.showStatusBar = value; }
-    }
-
-    public bool ShowGroupPanel {
-        get { return this.st.showGroupPanel; }
-        set { this.st.showGroupPanel = value; }
-    }
-
-    public bool UseExternalRowMenu {
-        get { return this.st.externalRowMenu; }
-        set { this.st.externalRowMenu = value; }
-    }
-
-    public bool AllowAddRow {
-        get { return this.st.allowAddRow; }
-        set { this.st.allowAddRow = value; }
-    }
-
-    public ContextMenuFunc ContextMenuProvider {
-        get { return DataTable.GetContextMenuFunc(this.st); }
-        set { DataTable.SetContextMenuFunc(this.st, value); }
-    }
-
-    public RowStyleFunc RowStyleProvider {
-        get { return DataTable.GetRowStyleFunc(this.st); }
-        set { DataTable.SetRowStyleFunc(this.st, value); }
-    }
-
-    public CellSpanProvider SpanProvider {
-        get { return this.st.spanProvider; }
-        set { this.st.spanProvider = value; }
-    }
-
-    public DetailProvider DetailViewProvider {
-        get { return this.st.detail; }
-        set { DataTable.SetDetail(this.st, value); }
-    }
-
-    public bool ShowSelection { get { return this.st.showSelect; } set { this.st.showSelect = value; } }
-    public bool ShowStripes { get { return this.st.striped; } set { this.st.striped = value; } }
-    public bool ShowAddRow { get { return this.st.allowAddRow; } set { this.st.allowAddRow = value; } }
     public bool UseRowFactory {
         get { return this.source != null && this.source.factory != null; }
         set {
             if (!value || this.source.factory != null) { return; }
-            this.defaultFactory = true;
-            this.source.factory = () => {
-                TypeInfo ti = typeof(T);
-                if (ti.Name != "string" && ti.Name != "object") {
-                    try {
-                        object inst = ti.CreateInstance();
-                        if (inst != null) { return (T)inst; }
-                    } catch (Exception _ex) {
-                    }
-                }
-                return null;
-            };
+            this.InstallDefaultFactory();
         }
     }
 
     public string ColumnsJsonText() { return ""; }
     public void SetColumnsJsonText(string val) {
         if (val.Length > 0 && val[0] == 91) { this.SetColumnsJson(val); }
-    }
-
-    public override string StyleType() { return "datatable"; }
-
-    public override bool ChildControlsRenderedByOwner() { return true; }
-
-    public override void Arrange(int x, int y, int w, int h) {
-        this.bx = x; this.by = y; this.bw = w > 0 ? w : 0; this.bh = h > 0 ? h : 0;
-        this.SyncDescs();
-        if (this.visualTree == null) { this.visualTree = new DataTableVisualTree(this); }
-        this.visualTree.Prepare(this.App, this.descs, this.source, this.st);
-    }
-
-    public override bool AcceptsRetainedLongPress() { return true; }
-    public override int InputFocusCapabilities() { return 3; }
-
-    public override void OnRoutedEvent(RoutedEventArgs e) {
-        if (e.eventName != "PointerCancel") { this.PrepareInputTree(); }
-        if (this.visualTree != null) { this.visualTree.RouteBody(e); }
-        if (!e.handled) { base.OnRoutedEvent(e); }
-    }
-
-    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
-        if (e.eventName == "PointerCancel") { base.OnPreviewRoutedEvent(e); return; }
-        this.PrepareInputTree();
-        if (this.visualTree != null && this.visualTree.RouteMenuEvent(e)) { return; }
-        base.OnPreviewRoutedEvent(e);
-    }
-
-    public override bool ChildInViewport(Control child) {
-        return this.visualTree != null && this.visualTree.ContainsPrepared(this.st, child);
-    }
-
-    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
-        this.PrepareInputTree();
-        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
-        return this.visualTree != null ? this.visualTree.ClipHit(hit, x, y) : hit;
-    }
-
-    private void PrepareInputTree() {
-        this.SyncDescs();
-        if (this.visualTree == null || this.visualTree.NeedsPrepare(this.descs, this.source, this.st)) {
-            this.Arrange(this.bx, this.by, this.bw, this.bh);
-        }
-    }
-
-    public override void CollectInputFocus(App app, List<Control> controls) {
-        this.PrepareInputTree();
-        base.CollectInputFocus(app, controls);
-    }
-
-    public override Control FindInputFocus(App app) {
-        this.PrepareInputTree();
-        return base.FindInputFocus(app);
     }
 
     public void Bind(List<T> src) {
@@ -251,86 +113,14 @@ public class DataGrid<T> : Control {
         this.source.data = src;
         this.boundN = n;
         if (this.defaultFactory || (this.st.allowAddRow && this.source.factory == null)) {
-            this.defaultFactory = true;
-            this.source.factory = () => {
-                TypeInfo ti = typeof(T);
-                if (ti.Name != "string" && ti.Name != "object") {
-                    try {
-                        object inst = ti.CreateInstance();
-                        if (inst != null) { return (T)inst; }
-                    } catch (Exception _ex) {
-                    }
-                }
-                return null;
-            };
+            this.InstallDefaultFactory();
         }
-        if (changed && this.visualTree != null) { this.visualTree.Retire(this.st); }
-    }
-
-    public void Refresh() {
-        DataTable.Refresh(this.st, this.source);
+        if (changed) { this.RetireVisualTree(); }
     }
 
     public int Count() {
         if (this.data == null) { return 0; }
         return this.data.Count;
-    }
-
-    public DataTableState State() { return this.st; }
-
-    public void HideCol(string field, bool hidden) {
-        this.SyncDescs();
-        DataTable.EnsureInit(this.st, this.descs, this.source);
-        DataTable.HideField(this.st, this.descs, field, hidden);
-    }
-
-    public void ColumnChooser(bool open) {
-        DataTable.SetColumnChooser(this.st, open);
-    }
-
-    public bool IsColumnChooserOpen() {
-        return DataTable.IsColumnChooserOpen(this.st);
-    }
-
-    public void SizeColumnsToFit(int viewWidth) {
-        this.SyncDescs();
-        DataTable.SizeColumnsToFit(this.st, this.descs, viewWidth);
-    }
-
-    public void AutoMergeColumn(int colIndex) {
-        if (this.st.spanProvider == null || !(this.st.spanProvider is AutoCellSpanModel)) {
-            this.st.spanProvider = new AutoCellSpanModel();
-        }
-        AutoCellSpanModel autoModel = (AutoCellSpanModel)this.st.spanProvider;
-        autoModel.AddColumn(colIndex);
-    }
-
-    public void AutoMergeColumn(string field) {
-        this.SyncDescs();
-        int ci = DataTable.Col(this.descs, field);
-        if (ci >= 0) {
-            this.AutoMergeColumn(ci);
-        }
-    }
-
-    public byte[] SaveLayoutMsgPack() {
-        this.SyncDescs();
-        return DataTable.SaveLayoutMsgPack(this.st, this.descs);
-    }
-
-    public bool LoadLayoutMsgPack(byte[] bytes) {
-        this.SyncDescs();
-        return DataTable.LoadLayoutMsgPack(this.st, this.descs, bytes);
-    }
-
-    public string SaveLayoutToken() {
-        this.SyncDescs();
-        return DataTable.SaveLayoutToken(this.st, this.descs);
-    }
-
-    public bool LoadLayoutToken(string token) {
-        this.SyncDescs();
-        return DataTable.LoadLayoutToken(this.st, this.descs, token);
     }
 
     public void SyncDescs() {
@@ -369,11 +159,7 @@ public class DataGrid<T> : Control {
         }
     }
 
-    public override void OnPaint(App app) {
-        if (this.visualTree != null) { this.visualTree.Render(app, this.descs, this.source, this.st); }
-    }
-
-    // 声明式契约：外观开关落在引擎 state 上，经下面的转发属性绑定。
+    // 声明式契约：外观开关落在引擎 state 上，经基类转发属性绑定。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Bool("rowNumbers", "Row numbers").Field("ShowRowNumbers").WithTip("Show the row number gutter."));
@@ -488,54 +274,9 @@ public class DataGrid<T> : Control {
         return outp;
     }
 
-    // 最近一次命中的数据字段名（CellClick/ColumnResize 等事件
-    // 的 HitCol 翻译成稳定 field 名；越界/未命名列返回 ""）。
-    // 声明式列级事件（columns[i].click）按它分派，
-    // 列重排不影响路由。
     public string HitField() {
         int i = this.st.HitCol();
         if (i < 0 || i >= this.gcols.Count) { return ""; }
         return this.gcols[i].desc.FieldName();
     }
-
-    // 表格语义事件：引擎 state 持有事件对象（state.host = 本网格作为 sender），
-    // 这里以 [Event] 属性公开给按名接线（HTML/设计器）与设计器事件列表。
-    [Event]
-    public UiEvent RowClick { get { return this.st.RowClick; } }
-    [Event(Alias = "RowRightClick")]
-    public UiEvent RowContext { get { return this.st.RowContext; } }
-    [Event]
-    public UiEvent RowDoubleClick { get { return this.st.RowDoubleClick; } }
-    [Event]
-    public UiEvent CellClick { get { return this.st.CellClick; } }
-    [Event(Alias = "CellDblClick")]
-    public UiEvent CellDoubleClick { get { return this.st.CellDoubleClick; } }
-    [Event]
-    public UiEvent CellEdit { get { return this.st.CellEdit; } }
-    [Event]
-    public UiEvent CellValidating { get { return this.st.CellValidating; } }
-    [Event]
-    public UiEvent SelectionChanged { get { return this.st.SelectionChanged; } }
-    [Event]
-    public UiEvent Sort { get { return this.st.Sort; } }
-    [Event(Alias = "ColumnClick")]
-    public UiEvent HeaderClick { get { return this.st.HeaderClick; } }
-    [Event]
-    public UiEvent FilterChanged { get { return this.st.FilterChanged; } }
-    [Event]
-    public UiEvent ColumnResize { get { return this.st.ColumnResize; } }
-    [Event]
-    public UiEvent ColumnResizeEnd { get { return this.st.ColumnResizeEnd; } }
-    [Event]
-    public UiEvent ColumnReorder { get { return this.st.ColumnReorder; } }
-    [Event]
-    public UiEvent GroupChanged { get { return this.st.GroupChanged; } }
-    [Event]
-    public UiEvent BandToggled { get { return this.st.BandToggled; } }
-    [Event]
-    public UiEvent RowInserted { get { return this.st.RowInserted; } }
-    [Event]
-    public UiEvent RowDeleted { get { return this.st.RowDeleted; } }
-    [Event]
-    public UiEvent ScrollChanged { get { return this.st.ScrollChanged; } }
 }

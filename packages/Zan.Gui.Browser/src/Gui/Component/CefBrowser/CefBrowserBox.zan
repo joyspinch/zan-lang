@@ -4,137 +4,17 @@ using Gui.Component;
 
 namespace Gui.Component.CefBrowser;
 
-// 可摆放的 Chromium 浏览器控件：把原生 CefBrowser 包成一个普通的保留式
-// Control，因此设计器 / .html 设计稿里的 CEF 浏览器和别的控件一样，由布局给它
-// 一块矩形、由它自己负责绘制（与 WebViewBox 同构，只是引擎换成自带的
-// Chromium）。
-// tabs.Page(0).Add(box);              // 标签页里放一个浏览器
-// box.View().NavComplete += () => { ... };
-// 可见时按自己的已解析边界 Render，落在隐藏的标签页 / 折叠容器里时整棵
-// 子树不参与渲染，由 NativeLayer 兜底把没登记的原生层裁空（即隐藏）。
-public class CefBrowserBox : Control {
+// 可摆放的 Chromium (CEF) 浏览器控件（继承三引擎共享外壳 BrowserBoxBase）。
+public class CefBrowserBox : BrowserBoxBase {
     public override Control CreateCloneShell() { return new CefBrowserBox(); }
-    // 本控件拥有的原生浏览器（每个 CefBrowserBox 一个 Chromium 视图，
-    // 因此多标签浏览器就是多个 CefBrowserBox）。
     public CefBrowser view;
-    // 设计期填写的起始地址，首帧导航一次。
-    public string startUrl;
-    public bool navigated;
 
-    // 默认构造：无起始地址。
     public CefBrowserBox() {
-        this.InitControl("cefbrowser");
+        this.InitBrowserBox("cefbrowser");
         this.view = new CefBrowser();
-        this.startUrl = "";
-        this.navigated = false;
     }
 
-    // 底层原生浏览器：历史、JS、CDP、事件都在它上面。
-    // 返回: 本控件唯一拥有的 CefBrowser 实例。返回:
-    public CefBrowser View() { return view; }
-
-    // 起始地址（设计属性 `url`，设计文档里也可写成
-    // `placeholder`）。首帧之前设置只记录起始地址，待首次绘制时
-    // 导航一次；首帧之后设置立即等同于 Navigate。
-    public void SetStartUrl(string u) {
-        startUrl = u;
-        if (navigated && u != "") { view.Navigate(u); }
-    }
-
-    // 当前设置的起始地址。
-    public string StartUrl() { return startUrl; }
-
-    // 立即导航到 target（与 SetStartUrl 不同，不等首帧）。
-    public void Navigate(string target) {
-        navigated = true;
-        view.Navigate(target);
-    }
-
-    // 历史后退一页（转发到底层浏览器）。
-    public void Back() { view.Back(); }
-    // 历史前进一页。
-    public void Forward() { view.Forward(); }
-    // 重新加载当前页。
-    public void Reload() { view.Reload(); }
-    // 停止当前加载。
-    public void Stop() { view.Stop(); }
-    // 能否后退。
-    public bool CanGoBack() { return view.CanGoBack(); }
-    // 能否前进。
-    public bool CanGoForward() { return view.CanGoForward(); }
-    // 是否正在加载。
-    public bool IsLoading() { return view.IsLoading(); }
-    // 最近一次响应的 HTTP 状态码（无为 0）。
-    public int LastStatus() { return view.LastStatus(); }
-    // 当前 URL 快照。
-    public string CurrentUrl() { return view.CurrentUrl(); }
-    // 当前文档标题快照。
-    public string CurrentTitle() { return view.CurrentTitle(); }
-
-    // 隐藏原生浏览器（本控件不再上屏时调用；隐藏的标签页由 NativeLayer
-    // 自动兜底，这里供宿主显式收起）。
-    public void Hide() { view.Hide(); }
-
-    // 关闭原生浏览器（关闭标签页时调用），并把控件从树上
-    // 摘下。销毁后不要再 Render 本控件。
-    public void Destroy() {
-        view.Destroy();
-        if (parent != null) { parent.Remove(this); }
-    }
-
-    // ---- 设计器 / 序列化模型 --------------------------------------
-
-    // 控件类型标识（"CefBrowserBox"）。
+    public override IBrowserView BrowserView() { return this.view; }
+    public CefBrowser View() { return this.view; }
     public override string Kind() { return "CefBrowserBox"; }
-
-    // 设计器属性：起始地址（"url"）。
-    protected override List<PropSpec> DefineProps() {
-        List<PropSpec> ps = new List<PropSpec>();
-        // 设计器把每个字段的文本属性存成 `placeholder`，所以起始地址
-        // 同时应答这个键：在检查器里填的地址能原样往返。
-        ps.Add(PropSpec.Text("url", "Start URL").Also("placeholder").Field("startUrl"));
-        return ps;
-    }
-
-    // 导航语义事件挂在原生视图上，这里以 [Event] 属性公开：设计里的
-    // `onNavComplete` 之类直接落到视图的 UiEvent，宿主不必自己接线。
-    [Event]
-    public UiEvent NavStart { get { return view.NavStart; } }
-    [Event]
-    public UiEvent NavComplete { get { return view.NavComplete; } }
-    [Event]
-    public UiEvent TitleChanged { get { return view.TitleChanged; } }
-    [Event]
-    public UiEvent LoadingChanged { get { return view.LoadingChanged; } }
-
-    // ---- 保留式钩子（Control） ---------------------------------------
-
-    // 绘制：零尺寸时隐藏原生浏览器；首帧前先消费起始地址（原生
-    // 浏览器在 Render 里才创建，创建时会消费这次挂起的导航），然后
-    // 每帧驱动底层浏览器。
-    public void ConsumeStartUrl() {
-        if (!navigated && startUrl != "") {
-            navigated = true;
-            view.Navigate(startUrl);
-        }
-    }
-
-    public void UpdateBrowser(App app) {
-        app = this.ResolveApp(app);
-        BrowserNativeEntry entry = view.AttachNative(app, this);
-        if (entry != null) { entry.SetBounds(bx, by, bw, bh); }
-    }
-
-    public override void Arrange(int x, int y, int w, int h) {
-        base.Arrange(x, y, w, h);
-        App app = this.FindApp();
-        if (app != null) { this.UpdateBrowser(app); }
-    }
-    // Native creation, navigation and retirement belong to the host lifecycle.
-    // Paint only contributes this frame's native clip or fallback pixels.
-    public override void OnPaint(App app) {
-        app = this.ResolveApp(app);
-        if (bw > 0 && bh > 0) { view.Paint(app, bx, by, bw, bh); }
-    }
-
 }

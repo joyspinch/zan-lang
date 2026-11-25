@@ -5,20 +5,17 @@ using Gui.Widget;
 
 namespace Gui.Component.DataTable;
 
-// 非泛型 DataTable 的原生 Visual Tree 控件节点包装器（对标 DataGrid<T>）：
+// 非泛型 DataTable 的原生 Visual Tree 控件节点包装器（继承 DataTableHostBase）：
 // 允许调用方将任意动态列与通用数据源直接以标准 Control 节点形态挂入 Visual Tree：
 // ```zan
 // DataTableControl grid = new DataTableControl(cols, src, st);
 // layout.Add(grid);
 // ```
-// 内部自动维护主从明细（activeDetails）的 Visual Tree 子节点拓扑生命周期，
-// 并将指针与键盘事件路由至准备好的输入节点。
-public class DataTableControl : Control {
+public class DataTableControl : DataTableHostBase {
     public override Control CreateCloneShell() { return new DataTableControl(); }
     public List<DataColumn> columns;
     public DataSource source;
     public DataTableState state;
-    private DataTableVisualTree visualTree;
 
     public void InitGrid(List<DataColumn> cols, DataSource src, DataTableState st) {
         this.InitControl("datatable");
@@ -26,7 +23,6 @@ public class DataTableControl : Control {
         this.source = src;
         this.state = st != null ? st : new DataTableState();
         this.state.host = this;
-        // 引擎内部完成网格内部几何测算与多区域命中，基类控件不阻断子事件
         this.wiresOwnEvents = true;
     }
 
@@ -42,57 +38,9 @@ public class DataTableControl : Control {
         this.InitGrid(null, null, null);
     }
 
-    public override string StyleType() { return "datatable"; }
-
-    public override bool ChildControlsRenderedByOwner() { return true; }
-
-    public override void Arrange(int x, int y, int w, int h) {
-        this.bx = x; this.by = y; this.bw = w > 0 ? w : 0; this.bh = h > 0 ? h : 0;
-        if (this.visualTree == null) { this.visualTree = new DataTableVisualTree(this); }
-        this.visualTree.Prepare(this.App, this.columns, this.source, this.state);
-    }
-
-    public override bool AcceptsRetainedLongPress() { return true; }
-    public override int InputFocusCapabilities() { return 3; }
-
-    public override void OnRoutedEvent(RoutedEventArgs e) {
-        if (e.eventName != "PointerCancel") { this.PrepareInputTree(); }
-        if (this.visualTree != null) { this.visualTree.RouteBody(e); }
-        if (!e.handled) { base.OnRoutedEvent(e); }
-    }
-
-    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
-        if (e.eventName == "PointerCancel") { base.OnPreviewRoutedEvent(e); return; }
-        this.PrepareInputTree();
-        if (this.visualTree != null && this.visualTree.RouteMenuEvent(e)) { return; }
-        base.OnPreviewRoutedEvent(e);
-    }
-
-    public override bool ChildInViewport(Control child) {
-        return this.visualTree != null && this.visualTree.ContainsPrepared(this.state, child);
-    }
-
-    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
-        this.PrepareInputTree();
-        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
-        return this.visualTree != null ? this.visualTree.ClipHit(hit, x, y) : hit;
-    }
-
-    private void PrepareInputTree() {
-        if (this.visualTree == null || this.visualTree.NeedsPrepare(this.columns, this.source, this.state)) {
-            this.Arrange(this.bx, this.by, this.bw, this.bh);
-        }
-    }
-
-    public override void CollectInputFocus(App app, List<Control> controls) {
-        this.PrepareInputTree();
-        base.CollectInputFocus(app, controls);
-    }
-
-    public override Control FindInputFocus(App app) {
-        this.PrepareInputTree();
-        return base.FindInputFocus(app);
-    }
+    protected override List<DataColumn> HostColumns() { return this.columns; }
+    protected override DataSource HostSource() { return this.source; }
+    protected override DataTableState HostState() { return this.state; }
 
     public List<DataColumn> Columns {
         get { return this.columns; }
@@ -109,48 +57,6 @@ public class DataTableControl : Control {
         set { this.state = value != null ? value : new DataTableState(); }
     }
 
-    public int RowHeightPx {
-        get { return this.state.rowH; }
-        set { this.state.rowH = value; }
-    }
-
-    public bool ShowRowNumbers {
-        get { return this.state.showRowNum; }
-        set { this.state.showRowNum = value; }
-    }
-
-    public bool IsSelectable {
-        get { return this.state.showSelect; }
-        set { this.state.showSelect = value; }
-    }
-
-    public bool IsStriped {
-        get { return this.state.striped; }
-        set { this.state.striped = value; }
-    }
-
-    public bool ShowSummary {
-        get { return this.state.showSummary; }
-        set { this.state.showSummary = value; }
-    }
-
-    public bool ShowFilterRow {
-        get { return this.state.showFilterRow; }
-        set { this.state.showFilterRow = value; }
-    }
-
-    public bool ShowStatusBar {
-        get { return this.state.showStatusBar; }
-        set { this.state.showStatusBar = value; }
-    }
-
-    public bool ShowGroupPanel {
-        get { return this.state.showGroupPanel; }
-        set { this.state.showGroupPanel = value; }
-    }
-
-    public DataTableState State() { return this.state; }
-
     public void Bind(List<DataColumn> cols, DataSource src) {
         bool changed = this.source != src;
         bool schemaChanged = this.columns != cols;
@@ -162,119 +68,7 @@ public class DataTableControl : Control {
             DataTable.EnsureInit(this.state, this.columns, this.source);
         }
         // Commit the binding before Cancel can reenter Bind with a newer source.
-        if (changed && this.visualTree != null) { this.visualTree.Retire(this.state); }
-    }
-
-    // 采用通用 MessagePack 国际标准二进制保存表格布局（消灭 JSON 冗余与 GC）
-    public byte[] SaveLayoutMsgPack() {
-        return DataTable.SaveLayoutMsgPack(this.state, this.columns);
-    }
-
-    public bool LoadLayoutMsgPack(byte[] bytes) {
-        return DataTable.LoadLayoutMsgPack(this.state, this.columns, bytes);
-    }
-
-    // 保存为紧凑单行令牌（单行 Base64，适合存数据库字段或用户偏好配置文件）
-    public string SaveLayoutToken() {
-        return DataTable.SaveLayoutToken(this.state, this.columns);
-    }
-
-    public bool LoadLayoutToken(string token) {
-        return DataTable.LoadLayoutToken(this.state, this.columns, token);
-    }
-
-    // 自动适配全部可见列宽
-    public void AutoFitAll() {
-        this.AutoFitAll(this.App);
-    }
-    public void AutoFitAll(App app) {
-        if (this.columns == null || this.source == null || this.state == null) { return; }
-        app = this.ResolveApp(app);
-        DataTable.AutoFitAll(app, this.columns, this.source, this.state);
-    }
-
-    // 自动适配指定列宽
-    public void AutoFitColumn(int col) {
-        this.AutoFitColumn(this.App, col);
-    }
-    public void AutoFitColumn(App app, int col) {
-        if (this.columns == null || this.source == null || this.state == null) { return; }
-        app = this.ResolveApp(app);
-        DataTable.AutoFitColumn(app, this.columns, this.source, this.state, col);
-    }
-
-    // 按当前显示顺序全选/全不选
-    public void SelectAll(bool val) {
-        if (this.state != null && this.source != null) {
-            DataTable.SelectAllRows(this.state, this.source, val);
-        }
-    }
-
-    // 清空全部选择项
-    public void ClearSelection() {
-        this.SelectAll(false);
-    }
-
-    // 按指定字段排序（1 升序，2 降序）
-    public void SortBy(string field, int dir) {
-        if (this.state != null && this.columns != null) {
-            DataTable.SortByField(this.state, this.columns, field, dir);
-        }
-    }
-
-    // 按指定字段分组
-    public void GroupBy(string field) {
-        if (this.state != null && this.columns != null) {
-            DataTable.GroupByField(this.state, this.columns, field);
-        }
-    }
-
-    // 重置所有列（恢复默认宽度与排序）
-    public void ResetColumns() {
-        if (this.state != null && this.columns != null) {
-            DataTable.ResetColumns(this.state, this.columns);
-        }
-    }
-
-    // 打开行内快速搜索栏
-    public void OpenFind() {
-        if (this.state != null) {
-            DataTable.OpenFind(this.state);
-        }
-    }
-
-    // 关闭快速搜索栏
-    public void CloseFind() {
-        if (this.state != null) {
-            DataTable.CloseFind(this.state);
-        }
-    }
-
-    // 设置常驻视口全局子串高亮检索
-    public void SetHighlightQuery(string query) {
-        if (this.state != null) {
-            DataTable.SetHighlightQuery(this.state, query);
-        }
-    }
-
-    // 异步导出为 Excel XLSX 文件并弹出进度浮层
-    public bool ExportToXlsx(string path, bool selectionOnly) {
-        return this.ExportToXlsx(this.App, path, selectionOnly);
-    }
-    public bool ExportToXlsx(App app, string path, bool selectionOnly) {
-        if (this.columns == null || this.source == null || this.state == null) { return false; }
-        app = this.ResolveApp(app);
-        return DataTable.ExportToXlsxAsyncUi(app, this.state, this.columns, this.source, path, selectionOnly);
-    }
-
-    // 异步导出为 CSV 文件并弹出进度浮层
-    public bool ExportToCsv(string path, bool selectionOnly) {
-        return this.ExportToCsv(this.App, path, selectionOnly);
-    }
-    public bool ExportToCsv(App app, string path, bool selectionOnly) {
-        if (this.columns == null || this.source == null || this.state == null) { return false; }
-        app = this.ResolveApp(app);
-        return DataTable.ExportToCsvAsyncUi(app, this.state, this.columns, this.source, path, selectionOnly);
+        if (changed) { this.RetireVisualTree(); }
     }
 
     public override void OnMeasure(App app) {
@@ -291,9 +85,5 @@ public class DataTableControl : Control {
         }
         this.prefW = w;
         this.prefH = h;
-    }
-
-    public override void OnPaint(App app) {
-        if (this.visualTree != null) { this.visualTree.Render(app, this.columns, this.source, this.state); }
     }
 }

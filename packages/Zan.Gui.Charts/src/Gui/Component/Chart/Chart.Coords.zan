@@ -16,23 +16,22 @@ public partial class Chart {
         return (maxW * s + fh * co) / 1000 + 2;
     }
 
-    // 数值 → 水平像素：plotX 对应 lo，plotX+plotW 对应 hi。
-    // 大数值 × plotW 会超 int32（bar3 Population 到百万：
-    // 1000000×2601≈2.6e9），乘法走 long。
-    public static int ValueX(int plotX, int plotW, int lo, int hi, int v) {
-        long span = (long)hi - (long)lo;
+    // 线性标量偏移（定点倍率 g>=1，乘法走 long 防大数值 × plotSize 溢出）。
+    private static int LinearOffset(int plotLen, int lo, int hi, int v, int g) {
+        long mult = g > 1 ? (long)g : 1;
+        long span = ((long)hi - (long)lo) * mult;
         if (span < 1) { span = 1; }
-        return plotX + (int)(((long)v - (long)lo) * (long)plotW / span);
+        return (int)(((long)v - (long)lo * mult) * (long)plotLen / span);
     }
 
-    // 定点数值 → 水平像素：v 以 值×g 承载（PointV 约定），分母按
-    // span×g 缩放后再除——亚单位像素精度不丢（先 PointV 取整会把
-    // 小数坐标量化到整数值格点，scatter3 的 3 位小数云会塌成点阵）。
+    // 数值 → 水平像素：plotX 对应 lo，plotX+plotW 对应 hi。
+    public static int ValueX(int plotX, int plotW, int lo, int hi, int v) {
+        return plotX + Chart.LinearOffset(plotW, lo, hi, v, 1);
+    }
+
+    // 定点数值 → 水平像素：v 以 值×g 承载（PointV 约定），亚单位像素精度不丢。
     public static int ValueXF(int plotX, int plotW, int lo, int hi, int v, int g) {
-        if (g <= 1) { return Chart.ValueX(plotX, plotW, lo, hi, v); }
-        long span = ((long)hi - (long)lo) * (long)g;
-        if (span < 1) { span = 1; }
-        return plotX + (int)(((long)v - (long)lo * (long)g) * (long)plotW / span);
+        return plotX + Chart.LinearOffset(plotW, lo, hi, v, g);
     }
 
     // A15：axisLine.breakLine（缺省 true）——轴挂断带时轴线只画
@@ -178,28 +177,17 @@ public partial class Chart {
     }
 
     public static int ValueYF(int plotY, int plotH, int lo, int hi, int v, int g) {
-        if (g <= 1) { return Chart.ValueY(plotY, plotH, lo, hi, v); }
-        long span = ((long)hi - (long)lo) * (long)g;
-        if (span < 1) { span = 1; }
-        return plotY + plotH - (int)(((long)v - (long)lo * (long)g) * (long)plotH / span);
+        return plotY + plotH - Chart.LinearOffset(plotH, lo, hi, v, g);
     }
 
     // 数值 → 垂直像素：plotY+plotH 对应 lo，plotY 对应 hi（向上增大）。
-    // 同 ValueX：乘法走 long 防大数值 × plotH 溢出。
     public static int ValueY(int plotY, int plotH, int lo, int hi, int v) {
-        long span = (long)hi - (long)lo;
-        if (span < 1) { span = 1; }
-        return plotY + plotH - (int)(((long)v - (long)lo) * (long)plotH / span);
+        return plotY + plotH - Chart.LinearOffset(plotH, lo, hi, v, 1);
     }
 
-    // 1/1000 定点值 → 垂直像素：lo/hi（值×1000）之间的线性映射，
-    // 小数轴（leftMinF 定点域）的 YOfF 用——与 ValueY 同构，
-    // 分子分母同放大 1000 后 long 相除，亚单位值不再量化。
+    // 1/1000 定点值 → 垂直像素：loF/hiF（值×1000）之间的线性映射。
     public static int ValueYF1000(int plotY, int plotH, int loF, int hiF, int vF) {
-        long span = (long)hiF - (long)loF;
-        if (span < 1) { span = 1; }
-        return plotY + plotH
-            - (int)(((long)vF - (long)loF) * (long)plotH / span);
+        return plotY + plotH - Chart.LinearOffset(plotH, loF, hiF, vF, 1);
     }
 
     // ECharts axisLine.show 三态判定（cartesianAxisHelper.ts:169-181
@@ -306,42 +294,32 @@ public partial class Chart {
         return inside;
     }
 
-    // 将缩放窗口（千分值）解析为包含端点的分类索引范围 [i0,i1]。
-    // 首次调用时从 ChartOption.zoomStart/zoomEnd 初始化状态。
-    public static int ZoomI0(App app, ChartOption o, int wid, int n) {
-        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0 - 1);
-        if (lo < 0) {
-            lo = o.zoomStart * 10;
-            // startValue 按类目名定位窗口起点（line-aqi 的
-            // "2014-06-01"）；未声明或找不到类目回落百分比域。
-            if (o.zoomStartValue != null && o.zoomStartValue.Length > 0 && n > 1) {
-                int zi = Chart.CategoryIndexOf(o.XCategories(),
-                    o.zoomStartValue);
-                if (zi >= 0) { lo = zi * 1000 / (n - 1); }
+    // 解析缩放窗口边界索引（isEnd=false 起点 / isEnd=true 末端）。
+    private static int ZoomEdgeIndex(App app, ChartOption o, int wid, int n, bool isEnd) {
+        int key = isEnd ? Chart.ZoomHiKey(wid) : Chart.ZoomLoKey(wid);
+        int edge = app.StateGet(key, 0 - 1);
+        if (edge < 0) {
+            edge = (isEnd ? o.zoomEnd : o.zoomStart) * 10;
+            string edgeVal = isEnd ? o.zoomEndValue : o.zoomStartValue;
+            if (edgeVal != null && edgeVal.Length > 0 && n > 1) {
+                int zi = Chart.CategoryIndexOf(o.XCategories(), edgeVal);
+                if (zi >= 0) { edge = zi * 1000 / (n - 1); }
             }
-            app.StateSet(Chart.ZoomLoKey(wid), lo);
+            app.StateSet(key, edge);
         }
-        int i0 = lo * (n - 1) / 1000;
-        if (i0 < 0) { i0 = 0; }
-        if (i0 > n - 1) { i0 = n - 1; }
-        return i0;
+        int idx = edge * (n - 1) / 1000;
+        if (idx < 0) { idx = 0; }
+        if (idx > n - 1) { idx = n - 1; }
+        return idx;
+    }
+
+    // 将缩放窗口（千分值）解析为包含端点的分类索引范围 [i0,i1]。
+    public static int ZoomI0(App app, ChartOption o, int wid, int n) {
+        return Chart.ZoomEdgeIndex(app, o, wid, n, false);
     }
     // 窗口末端索引（与 ZoomI0 成对）。
     public static int ZoomI1(App app, ChartOption o, int wid, int n) {
-        int hi = app.StateGet(Chart.ZoomHiKey(wid), 0 - 1);
-        if (hi < 0) {
-            hi = o.zoomEnd * 10;
-            if (o.zoomEndValue != null && o.zoomEndValue.Length > 0 && n > 1) {
-                int zi = Chart.CategoryIndexOf(o.XCategories(),
-                    o.zoomEndValue);
-                if (zi >= 0) { hi = zi * 1000 / (n - 1); }
-            }
-            app.StateSet(Chart.ZoomHiKey(wid), hi);
-        }
-        int i1 = hi * (n - 1) / 1000;
-        if (i1 < 0) { i1 = 0; }
-        if (i1 > n - 1) { i1 = n - 1; }
-        return i1;
+        return Chart.ZoomEdgeIndex(app, o, wid, n, true);
     }
 
     // 将标签窗口化为包含端点的索引范围 [i0,i1]（全量范围时直接返回原列表，

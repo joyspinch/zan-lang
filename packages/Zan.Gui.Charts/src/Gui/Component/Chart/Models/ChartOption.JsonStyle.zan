@@ -168,22 +168,47 @@ public partial class ChartOption {
         ChartOption.ParsePaddingInto(v.Get("padding"), null, rs);
     }
 
+    // 通用颜色/渐变色解析辅助：渐变对象写入 stops 并取首停兜底色，普通色交 ParseColor。
+    public static int ParseColorOrGrad(JsonValue cv, int currentColor, ref List<int> stopsOut) {
+        if (cv == null) { return currentColor; }
+        if (cv.IsObject()) {
+            List<int> stops = ChartOption.ParseGradStops(cv);
+            if (stops != null && stops.Count > 0) {
+                stopsOut = stops;
+                return stops[0];
+            }
+            return currentColor;
+        }
+        return ChartOption.ParseColor(cv, currentColor);
+    }
+
+    // 通用 areaStyle 对象/字符串解析辅助。
+    public static void ParseAreaStyle(JsonValue area, ChartAreaStyle dst, bool parseOpacity) {
+        if (area == null || dst == null) { return; }
+        if (area.IsObject()) {
+            JsonValue acol = area.Has("color") ? area.Get("color") : null;
+            if (acol != null) {
+                dst.color = ChartOption.ParseColorOrGrad(acol, dst.color, ref dst.gradStops);
+            }
+            dst.type = area.Str("type", dst.type);
+            if (parseOpacity && area.Has("opacity")) {
+                double oa = area.Double("opacity", 1.0);
+                int ai = (int)(oa * 255.0 + 0.5);
+                if (ai < 0) { ai = 0; }
+                if (ai > 255) { ai = 255; }
+                dst.alpha = ai;
+            }
+        } else if (area.IsString()) {
+            dst.color = ChartOption.ParseColor(area, dst.color);
+        }
+    }
+
     // 把 JSON lineStyle 逐字段并入 line（color/color0 不接受数组形式）。
     public static void ParseLineStyle(JsonValue v, ChartLineStyle line) {
         if (v == null || !v.IsObject()) { return; }
         JsonValue lineColor = v.Get("color");
         if (lineColor != null && !lineColor.IsArray()) {
-            if (lineColor.IsObject()) {
-                // __grad 渐变线色：stops 存表（横向逐段取色），首停
-                // 当兜底纯色。
-                List<int> stops = ChartOption.ParseGradStops(lineColor);
-                if (stops != null) {
-                    line.gradStops = stops;
-                    line.color = stops[0];
-                }
-            } else {
-                line.color = ChartOption.ParseColor(lineColor, line.color);
-            }
+            line.color = ChartOption.ParseColorOrGrad(lineColor, line.color, ref line.gradStops);
         }
         JsonValue lineColor0 = v.Get("color0");
         if (lineColor0 != null && !lineColor0.IsArray()) {
@@ -344,16 +369,7 @@ public partial class ChartOption {
     public static void ParseItemStateStyle(JsonValue v, ChartItemStateStyle style) {
         if (v == null || !v.IsObject()) { return; }
         if (v.Has("color")) {
-            JsonValue cv = v.Get("color");
-            if (cv != null && cv.IsObject()) {
-                List<int> stops = ChartOption.ParseGradStops(cv);
-                if (stops != null && stops.Count > 0) {
-                    style.gradStops = stops;
-                    style.color = stops[0];
-                }
-            } else {
-                style.color = ChartOption.ParseColor(cv, style.color);
-            }
+            style.color = ChartOption.ParseColorOrGrad(v.Get("color"), style.color, ref style.gradStops);
         }
         if (v.Has("color0")) { style.color0 = ChartOption.ParseColor(v.Get("color0"), style.color0); }
         if (v.Has("borderColor")) { style.borderColor = ChartOption.ParseColor(v.Get("borderColor"), style.borderColor); }
@@ -375,31 +391,7 @@ public partial class ChartOption {
             }
         }
         ChartOption.ParseLineStyle(v.Get("lineStyle"), style.lineStyle);
-        JsonValue area = v.Get("areaStyle");
-        if (area != null && area.IsObject()) {
-            JsonValue acol2 = area.Has("color") ? area.Get("color") : null;
-            if (acol2 != null && acol2.IsObject()) {
-                List<int> stops2 = ChartOption.ParseGradStops(acol2);
-                if (stops2 != null) {
-                    style.areaStyle.gradStops = stops2;
-                    style.areaStyle.color = stops2[0];
-                }
-            } else if (acol2 != null) {
-                style.areaStyle.color = ChartOption.ParseColor(acol2, style.areaStyle.color);
-            }
-            style.areaStyle.type = area.Str("type", style.areaStyle.type);
-            // opacity 显式声明（0..1）按 0..255 记录；缺省 0 由渲染器
-            // 兜底 v6 多边形缺省 0.7。
-            if (area.Has("opacity")) {
-                double oa = area.Double("opacity", 1.0);
-                int ai = (int)(oa * 255.0 + 0.5);
-                if (ai < 0) { ai = 0; }
-                if (ai > 255) { ai = 255; }
-                style.areaStyle.alpha = ai;
-            }
-        } else if (area != null && area.IsString()) {
-            style.areaStyle.color = ChartOption.ParseColor(area, style.areaStyle.color);
-        }
+        ChartOption.ParseAreaStyle(v.Get("areaStyle"), style.areaStyle, true);
     }
 
     // 解析 itemStyle：顶层字段并入 normal，再叠加
@@ -426,20 +418,7 @@ public partial class ChartOption {
         JsonValue area = v.Get("areaStyle");
         if (area != null && area.IsObject()) {
             s.areaStyle = area.Bool("show", true);
-            JsonValue acol = area.Has("color") ? area.Get("color") : null;
-            if (acol != null && acol.IsObject()) {
-                // __grad 线性渐变面积（area-simple 橙→桃红）：stops
-                // 存表，首停当兜底纯色。
-                List<int> stops = ChartOption.ParseGradStops(acol);
-                if (stops != null) {
-                    s.itemStyle.normal.areaStyle.gradStops = stops;
-                    s.itemStyle.normal.areaStyle.color = stops[0];
-                }
-            } else if (acol != null) {
-                s.itemStyle.normal.areaStyle.color = ChartOption.ParseColor(
-                    acol, s.itemStyle.normal.areaStyle.color);
-            }
-            s.itemStyle.normal.areaStyle.type = area.Str("type", s.itemStyle.normal.areaStyle.type);
+            ChartOption.ParseAreaStyle(area, s.itemStyle.normal.areaStyle, false);
         } else if (area != null && area.IsBool()) {
             s.areaStyle = area.AsBool(false);
         }

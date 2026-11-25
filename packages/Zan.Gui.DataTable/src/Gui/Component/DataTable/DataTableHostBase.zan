@@ -1,0 +1,374 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// DataTableControl 与 DataGrid<T> 共享的控件宿主基类：
+// 统一 Visual Tree 生命周期、输入事件与焦点路由、外观与状态转发属性、
+// MessagePack / Token 布局持久化、常用表格命令以及 19 项语义 [Event]。
+public class DataTableHostBase : Control {
+    protected DataTableVisualTree visualTree;
+
+    protected virtual List<DataColumn> HostColumns() { return null; }
+    protected virtual DataSource HostSource() { return null; }
+    protected virtual DataTableState HostState() { return null; }
+    protected virtual void BeforePrepareVisualTree() { }
+
+    public override string StyleType() { return "datatable"; }
+    public override bool ChildControlsRenderedByOwner() { return true; }
+    public override bool AcceptsRetainedLongPress() { return true; }
+    public override int InputFocusCapabilities() { return 3; }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        this.bx = x;
+        this.by = y;
+        this.bw = w > 0 ? w : 0;
+        this.bh = h > 0 ? h : 0;
+        this.BeforePrepareVisualTree();
+        if (this.visualTree == null) { this.visualTree = new DataTableVisualTree(this); }
+        this.visualTree.Prepare(this.App, this.HostColumns(), this.HostSource(), this.HostState());
+    }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel") { this.PrepareInputTree(); }
+        if (this.visualTree != null) { this.visualTree.RouteBody(e); }
+        if (!e.handled) { base.OnRoutedEvent(e); }
+    }
+
+    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "PointerCancel") { base.OnPreviewRoutedEvent(e); return; }
+        this.PrepareInputTree();
+        if (this.visualTree != null && this.visualTree.RouteMenuEvent(e)) { return; }
+        base.OnPreviewRoutedEvent(e);
+    }
+
+    public override bool ChildInViewport(Control child) {
+        return this.visualTree != null && this.visualTree.ContainsPrepared(this.HostState(), child);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        this.PrepareInputTree();
+        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
+        return this.visualTree != null ? this.visualTree.ClipHit(hit, x, y) : hit;
+    }
+
+    protected void PrepareInputTree() {
+        this.BeforePrepareVisualTree();
+        if (this.visualTree == null || this.visualTree.NeedsPrepare(this.HostColumns(), this.HostSource(), this.HostState())) {
+            this.Arrange(this.bx, this.by, this.bw, this.bh);
+        }
+    }
+
+    protected void RetireVisualTree() {
+        if (this.visualTree != null) { this.visualTree.Retire(this.HostState()); }
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.PrepareInputTree();
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.PrepareInputTree();
+        return base.FindInputFocus(app);
+    }
+
+    public override void OnPaint(App app) {
+        if (this.visualTree != null) {
+            this.visualTree.Render(app, this.HostColumns(), this.HostSource(), this.HostState());
+        }
+    }
+
+    public DataTableState State() { return this.HostState(); }
+
+    // ---- 外观与状态转发属性 ----
+
+    public int RowHeightPx {
+        get { DataTableState s = this.HostState(); return s != null ? s.rowH : 0; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.rowH = value; } }
+    }
+
+    public bool ShowRowNumbers {
+        get { DataTableState s = this.HostState(); return s != null && s.showRowNum; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showRowNum = value; } }
+    }
+
+    public bool IsSelectable {
+        get { DataTableState s = this.HostState(); return s != null && s.showSelect; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showSelect = value; } }
+    }
+
+    public bool IsStriped {
+        get { DataTableState s = this.HostState(); return s != null && s.striped; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.striped = value; } }
+    }
+
+    public bool AllowRowReorder {
+        get { DataTableState s = this.HostState(); return s != null && s.rowReorder; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.rowReorder = value; } }
+    }
+
+    public bool ShowSummary {
+        get { DataTableState s = this.HostState(); return s != null && s.showSummary; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showSummary = value; } }
+    }
+
+    public bool ShowSelectionSummary {
+        get { DataTableState s = this.HostState(); return s != null && DataTable.GetShowSelectionSummary(s); }
+        set { DataTableState s = this.HostState(); if (s != null) { DataTable.SetShowSelectionSummary(s, value); } }
+    }
+
+    public bool ShowFilterRow {
+        get { DataTableState s = this.HostState(); return s != null && s.showFilterRow; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showFilterRow = value; } }
+    }
+
+    public bool ShowStatusBar {
+        get { DataTableState s = this.HostState(); return s != null && s.showStatusBar; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showStatusBar = value; } }
+    }
+
+    public bool ShowGroupPanel {
+        get { DataTableState s = this.HostState(); return s != null && s.showGroupPanel; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.showGroupPanel = value; } }
+    }
+
+    public bool UseExternalRowMenu {
+        get { DataTableState s = this.HostState(); return s != null && s.externalRowMenu; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.externalRowMenu = value; } }
+    }
+
+    public bool AllowAddRow {
+        get { DataTableState s = this.HostState(); return s != null && s.allowAddRow; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.allowAddRow = value; } }
+    }
+
+    public bool ShowSelection { get { return this.IsSelectable; } set { this.IsSelectable = value; } }
+    public bool ShowStripes { get { return this.IsStriped; } set { this.IsStriped = value; } }
+    public bool ShowAddRow { get { return this.AllowAddRow; } set { this.AllowAddRow = value; } }
+
+    public ContextMenuFunc ContextMenuProvider {
+        get { DataTableState s = this.HostState(); return s != null ? DataTable.GetContextMenuFunc(s) : null; }
+        set { DataTableState s = this.HostState(); if (s != null) { DataTable.SetContextMenuFunc(s, value); } }
+    }
+
+    public RowStyleFunc RowStyleProvider {
+        get { DataTableState s = this.HostState(); return s != null ? DataTable.GetRowStyleFunc(s) : null; }
+        set { DataTableState s = this.HostState(); if (s != null) { DataTable.SetRowStyleFunc(s, value); } }
+    }
+
+    public CellSpanProvider SpanProvider {
+        get { DataTableState s = this.HostState(); return s != null ? s.spanProvider : null; }
+        set { DataTableState s = this.HostState(); if (s != null) { s.spanProvider = value; } }
+    }
+
+    public DetailProvider DetailViewProvider {
+        get { DataTableState s = this.HostState(); return s != null ? s.detail : null; }
+        set { DataTableState s = this.HostState(); if (s != null) { DataTable.SetDetail(s, value); } }
+    }
+
+    // ---- 布局序列化与常用表格命令 ----
+
+    public void Refresh() {
+        DataTableState s = this.HostState();
+        DataSource src = this.HostSource();
+        if (s != null && src != null) { DataTable.Refresh(s, src); }
+    }
+
+    public void HideCol(string field, bool hidden) {
+        this.BeforePrepareVisualTree();
+        DataTableState s = this.HostState();
+        List<DataColumn> cols = this.HostColumns();
+        if (s == null || cols == null) { return; }
+        DataTable.EnsureInit(s, cols, this.HostSource());
+        DataTable.HideField(s, cols, field, hidden);
+    }
+
+    public void ColumnChooser(bool open) {
+        DataTableState s = this.HostState();
+        if (s != null) { DataTable.SetColumnChooser(s, open); }
+    }
+
+    public bool IsColumnChooserOpen() {
+        DataTableState s = this.HostState();
+        return s != null && DataTable.IsColumnChooserOpen(s);
+    }
+
+    public void SizeColumnsToFit(int viewWidth) {
+        this.BeforePrepareVisualTree();
+        DataTableState s = this.HostState();
+        List<DataColumn> cols = this.HostColumns();
+        if (s != null && cols != null) { DataTable.SizeColumnsToFit(s, cols, viewWidth); }
+    }
+
+    public void AutoMergeColumn(int colIndex) {
+        DataTableState s = this.HostState();
+        if (s == null) { return; }
+        if (s.spanProvider == null || !(s.spanProvider is AutoCellSpanModel)) {
+            s.spanProvider = new AutoCellSpanModel();
+        }
+        AutoCellSpanModel autoModel = (AutoCellSpanModel)s.spanProvider;
+        autoModel.AddColumn(colIndex);
+    }
+
+    public void AutoMergeColumn(string field) {
+        this.BeforePrepareVisualTree();
+        List<DataColumn> cols = this.HostColumns();
+        if (cols == null) { return; }
+        int ci = DataTable.Col(cols, field);
+        if (ci >= 0) { this.AutoMergeColumn(ci); }
+    }
+
+    public byte[] SaveLayoutMsgPack() {
+        this.BeforePrepareVisualTree();
+        return DataTable.SaveLayoutMsgPack(this.HostState(), this.HostColumns());
+    }
+
+    public bool LoadLayoutMsgPack(byte[] bytes) {
+        this.BeforePrepareVisualTree();
+        return DataTable.LoadLayoutMsgPack(this.HostState(), this.HostColumns(), bytes);
+    }
+
+    public string SaveLayoutToken() {
+        this.BeforePrepareVisualTree();
+        return DataTable.SaveLayoutToken(this.HostState(), this.HostColumns());
+    }
+
+    public bool LoadLayoutToken(string token) {
+        this.BeforePrepareVisualTree();
+        return DataTable.LoadLayoutToken(this.HostState(), this.HostColumns(), token);
+    }
+
+    public void AutoFitAll() { this.AutoFitAll(this.App); }
+    public void AutoFitAll(App app) {
+        this.BeforePrepareVisualTree();
+        List<DataColumn> cols = this.HostColumns();
+        DataSource src = this.HostSource();
+        DataTableState s = this.HostState();
+        if (cols == null || src == null || s == null) { return; }
+        DataTable.AutoFitAll(this.ResolveApp(app), cols, src, s);
+    }
+
+    public void AutoFitColumn(int col) { this.AutoFitColumn(this.App, col); }
+    public void AutoFitColumn(App app, int col) {
+        this.BeforePrepareVisualTree();
+        List<DataColumn> cols = this.HostColumns();
+        DataSource src = this.HostSource();
+        DataTableState s = this.HostState();
+        if (cols == null || src == null || s == null) { return; }
+        DataTable.AutoFitColumn(this.ResolveApp(app), cols, src, s, col);
+    }
+
+    public void SelectAll(bool val) {
+        DataTableState s = this.HostState();
+        DataSource src = this.HostSource();
+        if (s != null && src != null) { DataTable.SelectAllRows(s, src, val); }
+    }
+
+    public void ClearSelection() { this.SelectAll(false); }
+
+    public void SortBy(string field, int dir) {
+        this.BeforePrepareVisualTree();
+        DataTableState s = this.HostState();
+        List<DataColumn> cols = this.HostColumns();
+        if (s != null && cols != null) { DataTable.SortByField(s, cols, field, dir); }
+    }
+
+    public void GroupBy(string field) {
+        this.BeforePrepareVisualTree();
+        DataTableState s = this.HostState();
+        List<DataColumn> cols = this.HostColumns();
+        if (s != null && cols != null) { DataTable.GroupByField(s, cols, field); }
+    }
+
+    public void ResetColumns() {
+        this.BeforePrepareVisualTree();
+        DataTableState s = this.HostState();
+        List<DataColumn> cols = this.HostColumns();
+        if (s != null && cols != null) { DataTable.ResetColumns(s, cols); }
+    }
+
+    public void OpenFind() {
+        DataTableState s = this.HostState();
+        if (s != null) { DataTable.OpenFind(s); }
+    }
+
+    public void CloseFind() {
+        DataTableState s = this.HostState();
+        if (s != null) { DataTable.CloseFind(s); }
+    }
+
+    public void SetHighlightQuery(string query) {
+        DataTableState s = this.HostState();
+        if (s != null) { DataTable.SetHighlightQuery(s, query); }
+    }
+
+    public bool ExportToXlsx(string path, bool selectionOnly) {
+        return this.ExportToXlsx(this.App, path, selectionOnly);
+    }
+
+    public bool ExportToXlsx(App app, string path, bool selectionOnly) {
+        this.BeforePrepareVisualTree();
+        List<DataColumn> cols = this.HostColumns();
+        DataSource src = this.HostSource();
+        DataTableState s = this.HostState();
+        if (cols == null || src == null || s == null) { return false; }
+        return DataTable.ExportToXlsxAsyncUi(this.ResolveApp(app), s, cols, src, path, selectionOnly);
+    }
+
+    public bool ExportToCsv(string path, bool selectionOnly) {
+        return this.ExportToCsv(this.App, path, selectionOnly);
+    }
+
+    public bool ExportToCsv(App app, string path, bool selectionOnly) {
+        this.BeforePrepareVisualTree();
+        List<DataColumn> cols = this.HostColumns();
+        DataSource src = this.HostSource();
+        DataTableState s = this.HostState();
+        if (cols == null || src == null || s == null) { return false; }
+        return DataTable.ExportToCsvAsyncUi(this.ResolveApp(app), s, cols, src, path, selectionOnly);
+    }
+
+    // ---- 表格语义事件 ----
+
+    [Event]
+    public UiEvent RowClick { get { DataTableState s = this.HostState(); return s != null ? s.RowClick : null; } }
+    [Event(Alias = "RowRightClick")]
+    public UiEvent RowContext { get { DataTableState s = this.HostState(); return s != null ? s.RowContext : null; } }
+    [Event]
+    public UiEvent RowDoubleClick { get { DataTableState s = this.HostState(); return s != null ? s.RowDoubleClick : null; } }
+    [Event]
+    public UiEvent CellClick { get { DataTableState s = this.HostState(); return s != null ? s.CellClick : null; } }
+    [Event(Alias = "CellDblClick")]
+    public UiEvent CellDoubleClick { get { DataTableState s = this.HostState(); return s != null ? s.CellDoubleClick : null; } }
+    [Event]
+    public UiEvent CellEdit { get { DataTableState s = this.HostState(); return s != null ? s.CellEdit : null; } }
+    [Event]
+    public UiEvent CellValidating { get { DataTableState s = this.HostState(); return s != null ? s.CellValidating : null; } }
+    [Event]
+    public UiEvent SelectionChanged { get { DataTableState s = this.HostState(); return s != null ? s.SelectionChanged : null; } }
+    [Event]
+    public UiEvent Sort { get { DataTableState s = this.HostState(); return s != null ? s.Sort : null; } }
+    [Event(Alias = "ColumnClick")]
+    public UiEvent HeaderClick { get { DataTableState s = this.HostState(); return s != null ? s.HeaderClick : null; } }
+    [Event]
+    public UiEvent FilterChanged { get { DataTableState s = this.HostState(); return s != null ? s.FilterChanged : null; } }
+    [Event]
+    public UiEvent ColumnResize { get { DataTableState s = this.HostState(); return s != null ? s.ColumnResize : null; } }
+    [Event]
+    public UiEvent ColumnResizeEnd { get { DataTableState s = this.HostState(); return s != null ? s.ColumnResizeEnd : null; } }
+    [Event]
+    public UiEvent ColumnReorder { get { DataTableState s = this.HostState(); return s != null ? s.ColumnReorder : null; } }
+    [Event]
+    public UiEvent GroupChanged { get { DataTableState s = this.HostState(); return s != null ? s.GroupChanged : null; } }
+    [Event]
+    public UiEvent BandToggled { get { DataTableState s = this.HostState(); return s != null ? s.BandToggled : null; } }
+    [Event]
+    public UiEvent RowInserted { get { DataTableState s = this.HostState(); return s != null ? s.RowInserted : null; } }
+    [Event]
+    public UiEvent RowDeleted { get { DataTableState s = this.HostState(); return s != null ? s.RowDeleted : null; } }
+    [Event]
+    public UiEvent ScrollChanged { get { DataTableState s = this.HostState(); return s != null ? s.ScrollChanged : null; } }
+}

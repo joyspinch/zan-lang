@@ -1,0 +1,272 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// 统一图表比例尺契约（Scale）：负责域值 ↔ 归一化坐标 [0, 1] 与刻度生成。
+public interface IChartScale {
+    double Normalize(double value);
+    double Invert(double t);
+    double DomainMin();
+    double DomainMax();
+    List<double> Ticks(int splitNumber);
+}
+
+// 线性数值比例尺（对接 Chart.IntervalScaleNiceTicks，保持 ECharts 6.1 刻度口径）。
+public class LinearScale : IChartScale {
+    public double minVal;
+    public double maxVal;
+
+    public LinearScale(double lo, double hi) {
+        this.minVal = lo;
+        this.maxVal = hi > lo ? hi : (lo + 1.0);
+    }
+
+    public static LinearScale Nice(double dataLo, double dataHi, int splitNumber) {
+        if (dataHi < dataLo) { double t = dataLo; dataLo = dataHi; dataHi = t; }
+        if (dataHi == dataLo) { dataHi = dataLo + 1.0; }
+        double iv = 0.0;
+        int prec = 0;
+        double nt0 = 0.0;
+        double nt1 = 0.0;
+        Chart.IntervalScaleNiceTicks(dataLo, dataHi, splitNumber > 0 ? splitNumber : 5,
+            ChartOption.AutoD(), ChartOption.AutoD(), out iv, out prec, out nt0, out nt1);
+        if (iv > 0.0) {
+            if (nt0 > dataLo) { nt0 = Chart.RoundP(nt0 - iv, prec); }
+            if (nt1 < dataHi) { nt1 = Chart.RoundP(nt1 + iv, prec); }
+            if (nt1 > nt0) { return new LinearScale(nt0, nt1); }
+        }
+        return new LinearScale(dataLo, dataHi);
+    }
+
+    public double DomainMin() { return this.minVal; }
+    public double DomainMax() { return this.maxVal; }
+
+    public double Normalize(double value) {
+        double span = this.maxVal - this.minVal;
+        if (span == 0.0) { return 0.0; }
+        return (value - this.minVal) / span;
+    }
+
+    public double Invert(double t) {
+        return this.minVal + t * (this.maxVal - this.minVal);
+    }
+
+    public List<double> Ticks(int splitNumber) {
+        List<double> outp = new List<double>();
+        int n = splitNumber > 0 ? splitNumber : 5;
+        double iv = 0.0;
+        int prec = 0;
+        double nt0 = 0.0;
+        double nt1 = 0.0;
+        Chart.IntervalScaleNiceTicks(this.minVal, this.maxVal, n,
+            ChartOption.AutoD(), ChartOption.AutoD(), out iv, out prec, out nt0, out nt1);
+        if (iv <= 0.0) {
+            outp.Add(this.minVal);
+            outp.Add(this.maxVal);
+            return outp;
+        }
+        double cur = nt0;
+        int guard = 0;
+        while (cur <= nt1 + iv * 0.0001 && guard < 256) {
+            outp.Add(Chart.RoundP(cur, prec));
+            cur = cur + iv;
+            guard = guard + 1;
+        }
+        return outp;
+    }
+}
+
+// 对数数值比例尺（支持自定义底数，默认以 10 为底）。
+public class LogScale : IChartScale {
+    public double minVal;
+    public double maxVal;
+    public double logBase;
+
+    public LogScale(double lo, double hi, double baseVal) {
+        this.logBase = baseVal > 1.0 ? baseVal : 10.0;
+        this.minVal = lo > 0.0 ? lo : 1.0;
+        this.maxVal = hi > this.minVal ? hi : (this.minVal * this.logBase);
+    }
+
+    public LogScale(double lo, double hi) : this(lo, hi, 10.0) { }
+
+    private double LogB(double v) {
+        double safe = v > 1e-12 ? v : 1e-12;
+        return Math.Log(safe) / Math.Log(this.logBase);
+    }
+
+    public double DomainMin() { return this.minVal; }
+    public double DomainMax() { return this.maxVal; }
+
+    public double Normalize(double value) {
+        double l0 = this.LogB(this.minVal);
+        double l1 = this.LogB(this.maxVal);
+        double span = l1 - l0;
+        if (span == 0.0) { return 0.0; }
+        return (this.LogB(value) - l0) / span;
+    }
+
+    public double Invert(double t) {
+        double l0 = this.LogB(this.minVal);
+        double l1 = this.LogB(this.maxVal);
+        return Math.Pow(this.logBase, l0 + t * (l1 - l0));
+    }
+
+    public List<double> Ticks(int splitNumber) {
+        List<double> outp = new List<double>();
+        int e0 = (int)Math.Floor(this.LogB(this.minVal));
+        int e1 = (int)Math.Ceiling(this.LogB(this.maxVal));
+        int guard = 0;
+        for (int e = e0; e <= e1 && guard < 64; e = e + 1) {
+            outp.Add(Math.Pow(this.logBase, (double)e));
+            guard = guard + 1;
+        }
+        return outp;
+    }
+}
+
+// 类目带宽比例尺（支持边界留白 boundaryGap）。
+public class BandScale : IChartScale {
+    public int count;
+    public bool boundaryGap;
+
+    public BandScale(int itemCount, bool gap) {
+        this.count = itemCount > 0 ? itemCount : 1;
+        this.boundaryGap = gap;
+    }
+
+    public double DomainMin() { return 0.0; }
+    public double DomainMax() { return (double)(this.count > 1 ? this.count - 1 : 1); }
+
+    public double BandWidthRatio() {
+        return this.count > 0 ? (1.0 / (double)this.count) : 1.0;
+    }
+
+    public double Normalize(double value) {
+        if (this.boundaryGap) {
+            return (value + 0.5) / (double)this.count;
+        }
+        if (this.count <= 1) { return 0.5; }
+        return value / (double)(this.count - 1);
+    }
+
+    public double Invert(double t) {
+        if (this.boundaryGap) {
+            return t * (double)this.count - 0.5;
+        }
+        if (this.count <= 1) { return 0.0; }
+        return t * (double)(this.count - 1);
+    }
+
+    public int IndexAt(double t) {
+        double raw = this.Invert(t);
+        int idx = ChartOption.RoundOff(raw);
+        if (idx < 0) { idx = 0; }
+        if (idx >= this.count) { idx = this.count - 1; }
+        return idx;
+    }
+
+    public List<double> Ticks(int splitNumber) {
+        List<double> outp = new List<double>();
+        for (int i = 0; i < this.count; i = i + 1) {
+            outp.Add((double)i);
+        }
+        return outp;
+    }
+}
+
+// 统一二维坐标系投影契约（Coord）：域值 (u, v) ↔ 屏幕像素 (sx, sy)。
+public interface IChartCoord {
+    void Project(double u, double v, out int sx, out int sy);
+    void Unproject(int sx, int sy, out double u, out double v);
+}
+
+// 直角坐标系（组合 X / Y 任意 IChartScale）。
+public class CartesianCoord : IChartCoord {
+    public int plotX;
+    public int plotY;
+    public int plotW;
+    public int plotH;
+    public bool invertY;
+    public IChartScale xScale;
+    public IChartScale yScale;
+
+    public CartesianCoord(int x, int y, int w, int h, IChartScale xs, IChartScale ys) {
+        this.plotX = x;
+        this.plotY = y;
+        this.plotW = w > 0 ? w : 1;
+        this.plotH = h > 0 ? h : 1;
+        this.invertY = true;
+        this.xScale = xs;
+        this.yScale = ys;
+    }
+
+    public void Project(double u, double v, out int sx, out int sy) {
+        double tx = this.xScale != null ? this.xScale.Normalize(u) : u;
+        double ty = this.yScale != null ? this.yScale.Normalize(v) : v;
+        sx = this.plotX + ChartOption.RoundOff(tx * (double)this.plotW);
+        sy = this.invertY
+            ? (this.plotY + this.plotH - ChartOption.RoundOff(ty * (double)this.plotH))
+            : (this.plotY + ChartOption.RoundOff(ty * (double)this.plotH));
+    }
+
+    public void Unproject(int sx, int sy, out double u, out double v) {
+        double tx = (double)(sx - this.plotX) / (double)this.plotW;
+        double ty = this.invertY
+            ? ((double)(this.plotY + this.plotH - sy) / (double)this.plotH)
+            : ((double)(sy - this.plotY) / (double)this.plotH);
+        u = this.xScale != null ? this.xScale.Invert(tx) : tx;
+        v = this.yScale != null ? this.yScale.Invert(ty) : ty;
+    }
+}
+
+// 极坐标系（组合角度 / 半径任意 IChartScale；默认顺时针、90° 起步，对齐 ECharts polar）。
+public class PolarCoordSystem : IChartCoord {
+    public int cx;
+    public int cy;
+    public int innerR;
+    public int outerR;
+    public double startAngleDeg;
+    public double sweepDeg;
+    public IChartScale angleScale;
+    public IChartScale radiusScale;
+
+    public PolarCoordSystem(int centerX, int centerY, int rInner, int rOuter,
+                            double startDeg, bool clockwise,
+                            IChartScale aScale, IChartScale rScale) {
+        this.cx = centerX;
+        this.cy = centerY;
+        this.innerR = rInner;
+        this.outerR = rOuter > rInner ? rOuter : (rInner + 1);
+        this.startAngleDeg = startDeg;
+        this.sweepDeg = clockwise ? (0.0 - 360.0) : 360.0;
+        this.angleScale = aScale;
+        this.radiusScale = rScale;
+    }
+
+    public void Project(double angleVal, double radiusVal, out int sx, out int sy) {
+        double ta = this.angleScale != null ? this.angleScale.Normalize(angleVal) : angleVal;
+        double tr = this.radiusScale != null ? this.radiusScale.Normalize(radiusVal) : radiusVal;
+        double deg = this.startAngleDeg + ta * this.sweepDeg;
+        double r = (double)this.innerR + tr * (double)(this.outerR - this.innerR);
+        int degX10 = ChartOption.RoundOff(deg * 10.0);
+        int ri = ChartOption.RoundOff(r);
+        sx = this.cx + ChartView.CosDegX10(degX10) * ri / 1000;
+        sy = this.cy - ChartView.SinDegX10(degX10) * ri / 1000;
+    }
+
+    public void Unproject(int sx, int sy, out double angleVal, out double radiusVal) {
+        double dx = (double)(sx - this.cx);
+        double dy = (double)(this.cy - sy);
+        double r = Math.Sqrt(dx * dx + dy * dy);
+        double tr = (r - (double)this.innerR) / (double)(this.outerR - this.innerR);
+        double deg = Math.Atan2(dy, dx) * 180.0 / 3.141592653589793;
+        double ta = (deg - this.startAngleDeg) / this.sweepDeg;
+        while (ta < 0.0) { ta = ta + 1.0; }
+        while (ta >= 1.0) { ta = ta - 1.0; }
+        angleVal = this.angleScale != null ? this.angleScale.Invert(ta) : ta;
+        radiusVal = this.radiusScale != null ? this.radiusScale.Invert(tr) : tr;
+    }
+}

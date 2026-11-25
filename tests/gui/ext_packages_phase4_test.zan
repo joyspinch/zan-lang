@@ -1,0 +1,191 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component;
+using Gui.Component.WebView;
+using Gui.Component.CefBrowser;
+using Gui.Component.FirefoxBrowser;
+using Gui.Component.DataTable;
+using Gui.Component.Chart;
+
+// Phase 4 扩展包架构治理回归测试：
+// 1. Zan.Gui.Browser: IBrowserView + BrowserBoxBase 三引擎统一契约
+// 2. Zan.Gui.DataTable: DataTableHostBase 统一 DataTableControl / DataGrid<T> 及与 Gui.IndexSelection 无命名冲突
+// 3. Zan.Gui.Charts: IChartScale(Linear/Log/Band) + IChartCoord(Cartesian/Polar) + JSON 样式解析去重
+class ExtPackagesPhase4Test {
+    static int failures = 0;
+
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + msg);
+            failures = failures + 1;
+        }
+    }
+
+    static bool Near(double a, double b, double eps) {
+        double d = a - b;
+        if (d < 0.0) { d = 0.0 - d; }
+        return d <= eps;
+    }
+
+    static void TestBrowserUnification() {
+        WebViewBox wv = new WebViewBox();
+        CefBrowserBox cef = new CefBrowserBox();
+        FirefoxBrowserBox ff = new FirefoxBrowserBox("https://example.test/start");
+
+        List<BrowserBoxBase> boxes = new List<BrowserBoxBase>();
+        boxes.Add(wv);
+        boxes.Add(cef);
+        boxes.Add(ff);
+        Check(boxes.Count == 3, "all three browser boxes inherit BrowserBoxBase");
+
+        for (int i = 0; i < boxes.Count; i = i + 1) {
+            BrowserBoxBase b = boxes[i];
+            IBrowserView v = b.BrowserView();
+            Check(v != null, "BrowserBoxBase exposes non-null IBrowserView #" + Convert.ToString(i));
+            Check(b.NavStart != null && b.NavComplete != null
+                && b.TitleChanged != null && b.LoadingChanged != null,
+                "BrowserBoxBase exposes all 4 semantic events #" + Convert.ToString(i));
+            Check(!b.CanGoBack() && !b.CanGoForward(),
+                "fresh browser cannot go back/forward #" + Convert.ToString(i));
+        }
+
+        ff.ConsumeStartUrl();
+        Check(ff.navigated && ff.CurrentUrl() == "https://example.test/start",
+            "BrowserBoxBase.ConsumeStartUrl forwards startUrl to IBrowserView");
+
+        wv.startUrl = "https://zan.dev";
+        wv.ConsumeStartUrl();
+        Check(wv.navigated, "WebViewBox ConsumeStartUrl marks navigated");
+
+        cef.startUrl = "https://cef.dev";
+        cef.ConsumeStartUrl();
+        Check(cef.navigated, "CefBrowserBox ConsumeStartUrl marks navigated");
+
+        // IDisposable contract on IBrowserView
+        for (int i = 0; i < boxes.Count; i = i + 1) {
+            IBrowserView v = boxes[i].BrowserView();
+            v.Dispose();
+        }
+    }
+
+    static void TestDataTableHostBase() {
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(DataColumn.Text("Name", 120), "name"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Score", 80), "score"));
+
+        DataTableControl dt = new DataTableControl(cols, null);
+        DataGrid<string> dg = new DataGrid<string>();
+        dg.SetPreviewColumns("100,Name|80,Score");
+
+        List<DataTableHostBase> hosts = new List<DataTableHostBase>();
+        hosts.Add(dt);
+        hosts.Add(dg);
+
+        for (int i = 0; i < hosts.Count; i = i + 1) {
+            DataTableHostBase h = hosts[i];
+            h.ShowRowNumbers = true;
+            h.IsSelectable = true;
+            h.IsStriped = true;
+            h.ShowSummary = true;
+            h.ShowFilterRow = true;
+            h.ShowStatusBar = true;
+            h.ShowGroupPanel = true;
+            h.RowHeightPx = 32;
+
+            Check(h.ShowRowNumbers && h.IsSelectable && h.IsStriped
+                && h.ShowSummary && h.ShowFilterRow && h.ShowStatusBar
+                && h.ShowGroupPanel && h.RowHeightPx == 32,
+                "DataTableHostBase forwards all state flags #" + Convert.ToString(i));
+
+            Check(h.RowClick != null && h.SelectionChanged != null
+                && h.Sort != null && h.ScrollChanged != null,
+                "DataTableHostBase exposes semantic table events #" + Convert.ToString(i));
+
+            h.OpenFind();
+            Check(h.State() != null && h.State().findOpen,
+                "DataTableHostBase.OpenFind sets findOpen #" + Convert.ToString(i));
+            h.CloseFind();
+            Check(!h.State().findOpen,
+                "DataTableHostBase.CloseFind clears findOpen #" + Convert.ToString(i));
+
+            string tok = h.SaveLayoutToken();
+            Check(tok != null && tok.Length > 0,
+                "DataTableHostBase.SaveLayoutToken produces non-empty token #" + Convert.ToString(i));
+            Check(h.LoadLayoutToken(tok),
+                "DataTableHostBase.LoadLayoutToken round-trips #" + Convert.ToString(i));
+        }
+
+        // Verify zero namespace collision between Gui.IndexSelection and DataTable.SelectionModel
+        IndexSelection idxSel = new IndexSelection();
+        Check(idxSel.ToggleCtrl(2, 0 - 1) == 2, "Gui.IndexSelection works alongside DataTable");
+        SelectionModel dtSel = SelectionModel.Row();
+        Check(dtSel.SelectKey("row:1") && dtSel.ContainsKey("row:1"),
+            "DataTable.SelectionModel resolves cleanly alongside using Gui");
+    }
+
+    static void TestChartsScaleCoordAndStyle() {
+        LinearScale ls = LinearScale.Nice(12.0, 87.0, 5);
+        Check(ls.DomainMin() <= 12.0 && ls.DomainMax() >= 87.0, "LinearScale.Nice covers data domain");
+        double t = ls.Normalize(50.0);
+        Check(Near(ls.Invert(t), 50.0, 1e-6), "LinearScale Normalize/Invert round-trip");
+        List<double> lticks = ls.Ticks(5);
+        Check(lticks.Count >= 2, "LinearScale.Ticks returns tick list");
+
+        LogScale logS = new LogScale(1.0, 1000.0, 10.0);
+        Check(Near(logS.Normalize(10.0), 1.0 / 3.0, 1e-6), "LogScale Normalize(10) == 1/3");
+        Check(Near(logS.Invert(2.0 / 3.0), 100.0, 1e-5), "LogScale Invert(2/3) == 100");
+        List<double> logTicks = logS.Ticks(4);
+        Check(logTicks.Count == 4, "LogScale.Ticks returns 1,10,100,1000");
+
+        BandScale bs = new BandScale(4, true);
+        Check(Near(bs.Normalize(0.0), 0.125, 1e-6), "BandScale(4, gap=true) center 0 == 0.125");
+        Check(bs.IndexAt(0.6) == 2, "BandScale.IndexAt(0.6) == 2");
+
+        CartesianCoord cart = new CartesianCoord(100, 50, 400, 200,
+            new LinearScale(0.0, 100.0), new LinearScale(0.0, 200.0));
+        int sx = 0; int sy = 0;
+        cart.Project(25.0, 150.0, out sx, out sy);
+        Check(sx == 200 && sy == 100, "CartesianCoord.Project(25,150) == (200,100)");
+        double u = 0.0; double v = 0.0;
+        cart.Unproject(sx, sy, out u, out v);
+        Check(Near(u, 25.0, 1e-6) && Near(v, 150.0, 1e-6), "CartesianCoord.Unproject round-trip");
+
+        PolarCoordSystem polar = new PolarCoordSystem(200, 200, 0, 100, 90.0, true,
+            new LinearScale(0.0, 360.0), new LinearScale(0.0, 100.0));
+        int px = 0; int py = 0;
+        polar.Project(90.0, 100.0, out px, out py);
+        // 90° clockwise from top (90° math) = 0° math (3 o'clock) => (300, 200)
+        Check(px == 300 && py == 200, "PolarCoordSystem.Project(90,100) == (300,200)");
+        double pa = 0.0; double pr = 0.0;
+        polar.Unproject(px, py, out pa, out pr);
+        Check(Near(pa, 90.0, 1.0) && Near(pr, 100.0, 1.0), "PolarCoordSystem.Unproject round-trip");
+
+        // ChartOption JSON style unification (gradient + areaStyle)
+        string json = "{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\"]},"
+            + "\"yAxis\":{\"type\":\"value\"},"
+            + "\"series\":[{\"type\":\"line\",\"data\":[10,20],"
+            + "\"lineStyle\":{\"width\":2,\"color\":{\"type\":\"linear\",\"colorStops\":[{\"offset\":0,\"color\":\"#ff0000\"},{\"offset\":1,\"color\":\"#0000ff\"}]}},"
+            + "\"areaStyle\":{\"color\":{\"type\":\"linear\",\"colorStops\":[{\"offset\":0,\"color\":\"#00ff00\"},{\"offset\":1,\"color\":\"#0000ff\"}]}}}]}";
+        ChartOption opt = ChartOption.FromJson(json);
+        Check(opt.series.Count == 1, "ChartOption parsed 1 series");
+        ChartSeries s = opt.series[0];
+        Check(s.itemStyle.normal.lineStyle.gradStops != null
+            && s.itemStyle.normal.lineStyle.gradStops.Count == 2,
+            "ParseColorOrGrad populates lineStyle gradStops");
+        Check(s.areaStyle && s.itemStyle.normal.areaStyle.gradStops != null
+            && s.itemStyle.normal.areaStyle.gradStops.Count == 2,
+            "ParseAreaStyle populates areaStyle gradStops");
+    }
+
+    static void Main() {
+        TestBrowserUnification();
+        TestDataTableHostBase();
+        TestChartsScaleCoordAndStyle();
+        if (failures == 0) {
+            Console.WriteLine("EXT_PACKAGES_PHASE4_OK");
+        } else {
+            Console.WriteLine("FAILURES=" + Convert.ToString(failures));
+        }
+    }
+}
