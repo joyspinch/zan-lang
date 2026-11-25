@@ -1,13 +1,273 @@
 using System;
+using System.Collections.Generic;
 namespace Gui;
+
+// 响应式观察者接口（无全局静态可变状态，多窗口安全）。
+public interface ISignalObserver {
+    void OnSignalChanged();
+}
+
+// 响应式信号源契约：供 Computed / Effect / Binding 订阅。
+public interface ISignalSource {
+    int Version();
+    void AddObserver(ISignalObserver obs);
+    void RemoveObserver(ISignalObserver obs);
+}
+
+// 可释放的订阅句柄（幂等 Dispose，零捕获 this 闭包）。
+public class SignalSub {
+    private ISignalSource singleSource;
+    private List<ISignalSource> multiSources;
+    private ISignalObserver observer;
+    private Action disposeAction;
+    private bool disposed;
+
+    public SignalSub(Action disposeAction) {
+        this.disposeAction = disposeAction;
+        this.disposed = false;
+    }
+
+    public SignalSub(ISignalSource source, ISignalObserver observer) {
+        this.singleSource = source;
+        this.observer = observer;
+        this.disposed = false;
+    }
+
+    public SignalSub(List<ISignalSource> sources, ISignalObserver observer) {
+        this.multiSources = sources;
+        this.observer = observer;
+        this.disposed = false;
+    }
+
+    public bool IsDisposed() { return this.disposed; }
+
+    public void Dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        if (this.singleSource != null && this.observer != null) {
+            this.singleSource.RemoveObserver(this.observer);
+        }
+        if (this.multiSources != null && this.observer != null) {
+            for (int i = 0; i < this.multiSources.Count; i = i + 1) {
+                if (this.multiSources[i] != null) {
+                    this.multiSources[i].RemoveObserver(this.observer);
+                }
+            }
+            this.multiSources.Clear();
+        }
+        this.singleSource = null;
+        this.multiSources = null;
+        this.observer = null;
+        Action act = this.disposeAction;
+        this.disposeAction = null;
+        if (act != null) { act(); }
+    }
+}
+
+internal class SignalActionObserver : ISignalObserver {
+    private Action callback;
+    public SignalActionObserver(Action callback) { this.callback = callback; }
+    public void OnSignalChanged() {
+        if (this.callback != null) { this.callback(); }
+    }
+}
+
+internal class TypedSignalObserver<T> : ISignalObserver {
+    private weak State<T> source;
+    private Action<T> callback;
+    public TypedSignalObserver(State<T> source, Action<T> callback) {
+        this.source = source;
+        this.callback = callback;
+    }
+    public void OnSignalChanged() {
+        State<T> src = this.source;
+        if (src != null && this.callback != null) {
+            this.callback(src.Peek());
+        }
+    }
+}
+
+// 事务批处理器：在 Run() 期间合并重复通知，退出时每个观察者仅触发一次。
+public class SignalBatch {
+    private int depth;
+    private List<ISignalObserver> pending;
+
+    public SignalBatch() {
+        this.depth = 0;
+        this.pending = new List<ISignalObserver>();
+    }
+
+    public bool Active() { return this.depth > 0; }
+
+    public void Enqueue(ISignalObserver obs) {
+        if (obs == null) { return; }
+        for (int i = 0; i < this.pending.Count; i = i + 1) {
+            if (this.pending[i] == obs) { return; }
+        }
+        this.pending.Add(obs);
+    }
+
+    public void Run(Action work) {
+        if (work == null) { return; }
+        this.depth = this.depth + 1;
+        try {
+            work();
+        } finally {
+            this.depth = this.depth - 1;
+            if (this.depth == 0 && this.pending.Count > 0) {
+                List<ISignalObserver> snapshot = this.pending;
+                this.pending = new List<ISignalObserver>();
+                for (int i = 0; i < snapshot.Count; i = i + 1) {
+                    snapshot[i].OnSignalChanged();
+                }
+            }
+        }
+    }
+}
+
+// 信号公共基类：统一版本计数、观察者列表、批处理派发与零闭包订阅释放。
+public class SignalBase : ISignalSource {
+    protected int version;
+    protected List<ISignalObserver> observers;
+    protected SignalBatch batch;
+
+    public int Version() { return this.version; }
+    public void AttachBatch(SignalBatch batch) { this.batch = batch; }
+
+    public void AddObserver(ISignalObserver obs) {
+        if (obs == null) { return; }
+        if (this.observers == null) { this.observers = new List<ISignalObserver>(); }
+        for (int i = 0; i < this.observers.Count; i = i + 1) {
+            if (this.observers[i] == obs) { return; }
+        }
+        this.observers.Add(obs);
+    }
+
+    public void RemoveObserver(ISignalObserver obs) {
+        if (this.observers == null || obs == null) { return; }
+        for (int i = this.observers.Count - 1; i >= 0; i = i - 1) {
+            if (this.observers[i] == obs) { this.observers.RemoveAt(i); }
+        }
+    }
+
+    public SignalSub Subscribe(Action listener) {
+        if (listener == null) { return new SignalSub(null); }
+        SignalActionObserver obs = new SignalActionObserver(listener);
+        this.AddObserver(obs);
+        return new SignalSub(this, obs);
+    }
+
+    protected void NotifyObservers() {
+        if (this.observers == null || this.observers.Count == 0) { return; }
+        if (this.batch != null && this.batch.Active()) {
+            for (int i = 0; i < this.observers.Count; i = i + 1) {
+                this.batch.Enqueue(this.observers[i]);
+            }
+            return;
+        }
+        List<ISignalObserver> snap = new List<ISignalObserver>();
+        for (int i = 0; i < this.observers.Count; i = i + 1) {
+            snap.Add(this.observers[i]);
+        }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            snap[i].OnSignalChanged();
+        }
+    }
+}
+
+// 真响应式泛型推送状态 State<T>：支持推送订阅、批处理合并与派生 Computed<T>。
+public class State<T> : SignalBase {
+    private T val;
+
+    public State(T initial) {
+        this.val = initial;
+        this.version = 0;
+    }
+
+    public State(T initial, SignalBatch batch) {
+        this.val = initial;
+        this.version = 0;
+        this.batch = batch;
+    }
+
+    public T Get() { return this.val; }
+    public T Peek() { return this.val; }
+
+    public void SetSilent(T v) {
+        this.val = v;
+        this.version = this.version + 1;
+    }
+
+    public void Set(T v) {
+        this.val = v;
+        this.version = this.version + 1;
+        this.NotifyObservers();
+    }
+
+    public SignalSub Subscribe(Action<T> listener) {
+        if (listener == null) { return new SignalSub(null); }
+        TypedSignalObserver<T> obs = new TypedSignalObserver<T>(this, listener);
+        this.AddObserver(obs);
+        return new SignalSub(this, obs);
+    }
+}
+
+// 懒求值 + 推送失效的派生信号 Computed<T>。
+public class Computed<T> : SignalBase, ISignalObserver {
+    private Func<T> compute;
+    private List<ISignalSource> deps;
+    private T cached;
+    private bool dirty;
+    private bool disposed;
+
+    public Computed(List<ISignalSource> deps, Func<T> compute) {
+        this.compute = compute;
+        this.deps = deps != null ? deps : new List<ISignalSource>();
+        this.dirty = true;
+        this.version = 0;
+        this.disposed = false;
+        for (int i = 0; i < this.deps.Count; i = i + 1) {
+            if (this.deps[i] != null) { this.deps[i].AddObserver(this); }
+        }
+    }
+
+    public T Get() {
+        if (this.dirty && this.compute != null) {
+            this.cached = this.compute();
+            this.dirty = false;
+        }
+        return this.cached;
+    }
+
+    public void OnSignalChanged() {
+        if (this.disposed) { return; }
+        this.dirty = true;
+        this.version = this.version + 1;
+        this.NotifyObservers();
+    }
+
+    public void Dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        if (this.deps != null) {
+            for (int i = 0; i < this.deps.Count; i = i + 1) {
+                if (this.deps[i] != null) { this.deps[i].RemoveObserver(this); }
+            }
+            this.deps.Clear();
+        }
+        if (this.observers != null) { this.observers.Clear(); }
+    }
+}
+
 public class Signal {
+    public static State<T> Of<T>(T initial) { return new State<T>(initial); }
     public static SignalInt Int(int initial) { return new SignalInt(initial); }
     public static SignalBool Bool(bool initial) { return new SignalBool(initial); }
     public static SignalString String(string initial) { return new SignalString(initial); }
 }
-public class SignalInt {
+
+public class SignalInt : SignalBase {
     int val;
-    int version;
     public SignalInt(int initial) {
         this.val = initial;
         this.version = 0;
@@ -15,13 +275,13 @@ public class SignalInt {
     public int Get() { return val; }
     public void Set(int v) {
         val = v;
-        version = version + 1;
+        this.version = this.version + 1;
+        this.NotifyObservers();
     }
-    public int Version() { return version; }
 }
-public class SignalBool {
+
+public class SignalBool : SignalBase {
     bool val;
-    int version;
     public SignalBool(bool initial) {
         this.val = initial;
         this.version = 0;
@@ -29,17 +289,18 @@ public class SignalBool {
     public bool Get() { return val; }
     public void Set(bool v) {
         val = v;
-        version = version + 1;
+        this.version = this.version + 1;
+        this.NotifyObservers();
     }
     public void Toggle() {
         val = !val;
-        version = version + 1;
+        this.version = this.version + 1;
+        this.NotifyObservers();
     }
-    public int Version() { return version; }
 }
-public class SignalString {
+
+public class SignalString : SignalBase {
     string val;
-    int version;
     public SignalString(string initial) {
         this.val = initial;
         this.version = 0;
@@ -47,7 +308,7 @@ public class SignalString {
     public string Get() { return val; }
     public void Set(string v) {
         val = v;
-        version = version + 1;
+        this.version = this.version + 1;
+        this.NotifyObservers();
     }
-    public int Version() { return version; }
 }

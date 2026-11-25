@@ -1,0 +1,85 @@
+#if WINDOWS
+using System;
+using Gui;
+namespace Gui.Backend;
+public partial class Win32Shell {
+    static bool darkCacheReady;
+    static bool darkCacheValue;
+    static int darkCacheTickMs;
+
+    // 查询 Windows 10/11 系统主题偏好（HKCU\...\Personalize\AppsUseLightTheme），
+    // 带 2 秒节流缓存以避免每帧访问注册表。
+    static bool QuerySystemDarkMode() {
+        int now = Win32Shell.GetTickCount();
+        if (Win32Shell.darkCacheReady && (now - Win32Shell.darkCacheTickMs) < 2000
+            && (now - Win32Shell.darkCacheTickMs) >= 0) {
+            return Win32Shell.darkCacheValue;
+        }
+        bool isDark = false;
+        nint hkeyCurrentUser = (nint)(0 - 2147483647); // HKEY_CURRENT_USER (0xFFFFFFFF80000001)
+        nint subKey = Wide.Of("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        nint valName = Wide.Of("AppsUseLightTheme");
+        nint dataBuf = NativeMemory.Alloc(8);
+        nint sizeBuf = NativeMemory.Alloc(8);
+        if (dataBuf != 0 && sizeBuf != 0) {
+            new Span<int>(dataBuf, 1)[0] = 1;
+            new Span<int>(sizeBuf, 1)[0] = 4;
+            int status = Win32Shell.RegGetValueW(
+                hkeyCurrentUser, subKey, valName,
+                16 /* RRF_RT_REG_DWORD */, 0, dataBuf, sizeBuf);
+            if (status == 0) {
+                isDark = new Span<int>(dataBuf, 1)[0] == 0;
+            }
+        }
+        if (dataBuf != 0) { NativeMemory.Free(dataBuf); }
+        if (sizeBuf != 0) { NativeMemory.Free(sizeBuf); }
+        Wide.Free(subKey);
+        Wide.Free(valName);
+        Win32Shell.darkCacheReady = true;
+        Win32Shell.darkCacheValue = isDark;
+        Win32Shell.darkCacheTickMs = now;
+        return isDark;
+    }
+
+    static nint ActiveImeHwnd() {
+        nint hwnd = Win32Shell.GetFocus();
+        if (hwnd != 0) { return hwnd; }
+        if (Win32Shell.eventHwnd != 0) { return Win32Shell.eventHwnd; }
+        return Win32Shell.mainHwnd;
+    }
+
+    static void ImeSetOpen(bool on) {
+        nint hwnd = Win32Shell.ActiveImeHwnd();
+        if (hwnd == 0) { return; }
+        nint imc = Win32Shell.ImmGetContext(hwnd);
+        if (imc == 0) { return; }
+        Win32Shell.ImmSetOpenStatus(imc, on ? 1 : 0);
+        Win32Shell.ImmReleaseContext(hwnd, imc);
+    }
+
+    // 读取当前 IME 组合串（GCS_COMPSTR = 8），返回实时的 UTF-8 预编辑文本。
+    static string ImeComposing() {
+        nint hwnd = Win32Shell.ActiveImeHwnd();
+        if (hwnd == 0) { return ""; }
+        nint imc = Win32Shell.ImmGetContext(hwnd);
+        if (imc == 0) { return ""; }
+        int bytes = Win32Shell.ImmGetCompositionStringW(imc, 8 /* GCS_COMPSTR */, 0, 0);
+        if (bytes <= 0) {
+            Win32Shell.ImmReleaseContext(hwnd, imc);
+            return "";
+        }
+        int allocBytes = bytes + 2;
+        nint buf = NativeMemory.Alloc(allocBytes);
+        if (buf == 0) {
+            Win32Shell.ImmReleaseContext(hwnd, imc);
+            return "";
+        }
+        NativeMemory.Fill(buf, 0, allocBytes);
+        int copied = Win32Shell.ImmGetCompositionStringW(imc, 8 /* GCS_COMPSTR */, buf, bytes);
+        string text = copied > 0 ? Wide.Read(buf) : "";
+        NativeMemory.Free(buf);
+        Win32Shell.ImmReleaseContext(hwnd, imc);
+        return text;
+    }
+}
+#endif

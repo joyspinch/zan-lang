@@ -1,0 +1,160 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace GuiPhase2BTest;
+
+class BoxCtrl : Control {
+    public BoxCtrl(string id, int w, int h) {
+        this.name = id;
+        this.prefW = w;
+        this.prefH = h;
+        this.prefSet = true;
+    }
+    public override string Kind() { return "Box"; }
+    public override void OnPaint(App app) { }
+}
+
+class Program {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + msg);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestReactiveSignals() {
+        SignalBatch batch = new SignalBatch();
+        State<int> a = new State<int>(2, batch);
+        State<int> b = new State<int>(3, batch);
+        List<ISignalSource> deps = new List<ISignalSource>{ a, b };
+        Computed<int> sum = Reactive.Derive<int>(deps, () => a.Get() + b.Get());
+        Check(sum.Get() == 5, "computed initial 2+3=5");
+
+        int effectHits = 0;
+        int lastSum = 0;
+        SignalSub eff = Reactive.Effect(new List<ISignalSource>{ sum }, () => {
+            effectHits = effectHits + 1;
+            lastSum = sum.Get();
+        });
+        Check(effectHits == 1 && lastSum == 5, "effect ran immediately once");
+
+        // 批处理内两次 Set，下游仅触发一次通知
+        batch.Run(() => {
+            a.Set(10);
+            b.Set(20);
+        });
+        Check(effectHits == 2 && lastSum == 30, "batch coalesced 2 sets into 1 effect hit = 30");
+
+        int watchVal = 0;
+        SignalSub w = Reactive.Watch<int>(a, (int v) => { watchVal = v; }, true);
+        Check(watchVal == 10, "watch immediate captured 10");
+        a.Set(15);
+        Check(watchVal == 15 && lastSum == 35 && effectHits == 3, "watch & computed updated on Set(15)");
+
+        w.Dispose();
+        eff.Dispose();
+        a.Set(100);
+        Check(watchVal == 15 && effectHits == 3, "disposed subscriptions no longer fire");
+        Check(sum.Get() == 120, "computed still evaluates fresh value 120");
+        sum.Dispose();
+
+        State<string> label = Signal.Of<string>("init");
+        int labelHits = 0;
+        SignalSub lsub = label.Subscribe(() => { labelHits = labelHits + 1; });
+        label.Set("updated");
+        Check(label.Get() == "updated" && labelHits == 1, "Signal.Of<string> supports push Subscribe");
+        lsub.Dispose();
+    }
+
+    static void TestGridFrAndAutoRepeat() {
+        List<GridTrack> fr = CssGrid.ParseTracks("0.5fr 1.5fr 2fr");
+        Check(fr.Count == 3, "3 fr tracks");
+        Check(fr[0].val == 500 && fr[1].val == 1500 && fr[2].val == 2000,
+            "fractional fr weights 500/1500/2000");
+        List<int> widths = CssGrid.SizeTracks(fr, null, 3, new List<int>(), new List<int>(), 400, 0);
+        Check(widths[0] == 50 && widths[1] == 150 && widths[2] == 200,
+            "fractional fr track allocation 50/150/200");
+
+        List<GridTrack> autoFill = CssGrid.ParseTracksForWidth(
+            "repeat(auto-fill, minmax(100px, 1fr))", 430, 10);
+        Check(autoFill.Count == 4, "auto-fill fits 4 tracks in 430px with 10px gap");
+
+        // auto-fit 2 个子项在 430px 中折叠到 2 列
+        StyleBox sb = new StyleBox();
+        sb.gridCols = "repeat(auto-fit, minmax(100px, 1fr))";
+        List<Control> items = new List<Control>{ new BoxCtrl("g1", 50, 20), new BoxCtrl("g2", 50, 20) };
+        GridLayoutPlan plan = new GridLayoutPlan();
+        plan.Prepare(sb, items, 430, 10);
+        Check(plan.colDefs.Count == 2 && plan.placement.nCols == 2,
+            "auto-fit collapses empty trailing tracks to 2");
+    }
+
+    static void TestPositionFixed() {
+        StyleSheet sheet = StyleSheet.FromCss(
+            ".fixed-badge { position: fixed; left: 10px; top: 20px; width: 80px; height: 30px; }");
+        StyleBox sb = new StyleBox();
+        sheet.ApplyMatch(sb, "", "fixed-badge", "", "", 0);
+        Check(sb.position == 3, "position: fixed parsed as code 3");
+
+        BoxCtrl root = new BoxCtrl("root", 400, 300);
+        BoxCtrl container = new BoxCtrl("container", 200, 150);
+        BoxCtrl badge = new BoxCtrl("badge", 80, 30);
+        badge.computedStyle = sb;
+        container.Add(badge);
+        root.Add(container);
+
+        root.Arrange(0, 0, 400, 300);
+        container.Arrange(100, 80, 200, 150);
+        Check(badge.bx == 10 && badge.by == 20 && badge.bw == 80 && badge.bh == 30,
+            "position: fixed lays out against root viewport (10,20,80,30)");
+
+        container.ShiftTree(0, -40);
+        Check(badge.bx == 10 && badge.by == 20,
+            "position: fixed ignores parent scroll ShiftTree");
+    }
+
+    static void TestOverlayStackAndPlatform() {
+        App app = new App("phase2b", 640, 480, false, true);
+        BoxCtrl root = new BoxCtrl("root", 640, 480);
+        app.rootControl = root;
+
+        BoxCtrl p1 = new BoxCtrl("popup1", 200, 160);
+        BoxCtrl innerAnchor = new BoxCtrl("inner-btn", 60, 24);
+        p1.Add(innerAnchor);
+        BoxCtrl p2 = new BoxCtrl("popup2", 140, 100);
+
+        OverlayHost host = app.overlayHost;
+        host.ShowAt(app, p1, 40, 40);
+        Check(host.Depth() == 1 && host.ActiveRoot() == p1, "overlay depth 1 active p1");
+
+        // 锚点位于 p1 内部时 Show 自动嵌套压栈，不销毁 p1
+        innerAnchor.Arrange(50, 60, 60, 24);
+        host.ShowAtAnchor(app, innerAnchor, p2, 120, 60);
+        Check(host.Depth() == 2 && host.ActiveRoot() == p2, "auto-nested overlay depth 2 active p2");
+
+        host.Pop();
+        Check(host.Depth() == 1 && host.ActiveRoot() == p1, "Pop restores p1");
+
+        host.DismissAll();
+        Check(host.Depth() == 0 && host.ActiveRoot() == null, "DismissAll clears stack");
+
+        // Platform dark mode & IME smoke
+        bool sysDark = Platform.Shell().IsDarkMode();
+        Platform.Shell().SetDarkMode(!sysDark);
+        Check(Platform.Shell().IsDarkMode() == !sysDark, "SetDarkMode overrides dark mode");
+        Platform.Shell().SetDarkMode(sysDark);
+        string comp = Ime.Composing();
+        Check(comp != null, "Ime.Composing returns non-null string");
+    }
+
+    static int Main() {
+        TestReactiveSignals();
+        TestGridFrAndAutoRepeat();
+        TestPositionFixed();
+        TestOverlayStackAndPlatform();
+        Console.WriteLine("CORE_INFRA_PHASE2B_OK");
+        return 0;
+    }
+}
