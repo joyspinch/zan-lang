@@ -98,7 +98,16 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
  * 只需首次初始化。曾每次都拿全局 timer_lock——Web 压测下多 worker 在这把锁
  * 上排队，锁等待占 CPU 采样的四成以上（psynch_mutexwait 归因 ~6000/19000）。
  * 改为 acquire 读快路径；未发布时进锁双检、初始化后 release 发布。 */
-unsigned char *zan_rt_soft_scratch(void) {
+/* Prefix the generated code reads in front of a soft scratch base: array
+ * rc/magic at P-32/P-24, object rc at P-16, discriminator at P-8. */
+static void soft_scratch_init_header(unsigned char *hdr) {
+    store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
+    store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
+    store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
+    store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC); /* P-8:  discriminator */
+}
+
+static unsigned char *soft_scratch_shared(void) {
     unsigned char *scratch = __atomic_load_n(&g_soft_scratch, __ATOMIC_ACQUIRE);
     if (scratch) return scratch;
     timer_lock();
@@ -106,15 +115,166 @@ unsigned char *zan_rt_soft_scratch(void) {
     if (!scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
-        store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc */
-        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);
-        store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc */
-        store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
+        soft_scratch_init_header(hdr);
         scratch = hdr + 32;
         __atomic_store_n(&g_soft_scratch, scratch, __ATOMIC_RELEASE);
     }
     timer_unlock();
     return scratch;
+}
+
+/* Per-thread soft-failure scratch. A null receiver outside a try continues
+ * on this memory, so it must not be shared: one process-wide buffer let a
+ * thread (one request) read what another wrote through its own null object,
+ * and racing writes to it are data races. It must also be bounded: the
+ * caller adds the field offset of whatever class it accessed, which can
+ * exceed any fixed payload. So each thread that ever fails maps
+ * [guard][header + 1 MiB payload][guard] lazily: untouched pages cost no
+ * physical memory, and an offset past the payload faults on a guard page
+ * instead of corrupting adjacent memory. Freed at thread exit. Targets
+ * without threads or mmap (wasm, bare metal) and any mapping failure keep
+ * the shared static buffer. */
+#define ZAN_SOFT_TLS_PAYLOAD ((size_t)1 << 20)
+#if (defined(_WIN32) || defined(__unix__) || defined(__APPLE__)) && !defined(__wasm__) &&          \
+    !defined(ZAN_BARE_METAL)
+#define ZAN_SOFT_PER_THREAD 1
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+static size_t soft_page(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? si.dwPageSize : 4096;
+#else
+    long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? (size_t)ps : 4096;
+#endif
+}
+
+static size_t soft_map_len(size_t page) {
+    size_t body = (32 + ZAN_SOFT_TLS_PAYLOAD + page - 1) / page * page;
+    return page + body + page;
+}
+
+/* A finished thread's region is wiped and pooled, never unmapped: a pointer
+ * that escaped into it (a `ref` to a field of a null object) must keep
+ * landing in valid, harmless scratch rather than in whatever mapping reuses
+ * the address. Wiping replaces the payload with fresh zero pages, so nothing
+ * one thread wrote is visible to the next. */
+#define ZAN_SOFT_POOL_MAX 256
+static unsigned char *g_soft_pool[ZAN_SOFT_POOL_MAX];
+static int g_soft_pool_n;
+
+static void soft_scratch_init_header(unsigned char *hdr);
+
+static int soft_wipe(unsigned char *scratch) {
+    size_t page = soft_page();
+    unsigned char *map = scratch - 32 - page;
+    size_t body = soft_map_len(page) - 2 * page;
+#if defined(_WIN32)
+    if (!VirtualFree(map + page, body, MEM_DECOMMIT)) return 0;
+    if (!VirtualAlloc(map + page, body, MEM_COMMIT, PAGE_READWRITE)) return 0;
+#else
+    if (mmap(map + page, body, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) ==
+        MAP_FAILED)
+        return 0;
+#endif
+    soft_scratch_init_header(map + page);
+    return 1;
+}
+
+static void soft_release(unsigned char *scratch) {
+    if (!scratch) return;
+    if (!soft_wipe(scratch)) return; /* keep it mapped; never hand it out again */
+    timer_lock();
+    if (g_soft_pool_n < ZAN_SOFT_POOL_MAX) g_soft_pool[g_soft_pool_n++] = scratch;
+    timer_unlock();
+}
+
+static unsigned char *soft_pool_take(void) {
+    unsigned char *s = NULL;
+    timer_lock();
+    if (g_soft_pool_n > 0) s = g_soft_pool[--g_soft_pool_n];
+    timer_unlock();
+    return s;
+}
+
+static unsigned char *soft_map(void) {
+    size_t page = soft_page(), len = soft_map_len(page);
+#if defined(_WIN32)
+    unsigned char *map = (unsigned char *)VirtualAlloc(NULL, len, MEM_RESERVE, PAGE_NOACCESS);
+    if (!map) return NULL;
+    if (!VirtualAlloc(map + page, len - 2 * page, MEM_COMMIT, PAGE_READWRITE)) {
+        VirtualFree(map, 0, MEM_RELEASE);
+        return NULL;
+    }
+#else
+    unsigned char *map = (unsigned char *)mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED) return NULL;
+    if (mprotect(map + page, len - 2 * page, PROT_READ | PROT_WRITE) != 0) {
+        munmap(map, len);
+        return NULL;
+    }
+#endif
+    soft_scratch_init_header(map + page);
+    return map + page + 32;
+}
+
+static _Thread_local unsigned char *t_soft_scratch;
+static int g_soft_key_state; /* 0 none, 1 creating, 2 ready, 3 failed */
+#if defined(_WIN32)
+static DWORD g_soft_fls = FLS_OUT_OF_INDEXES;
+static void WINAPI soft_thread_exit(void *p) { soft_release((unsigned char *)p); }
+#else
+static pthread_key_t g_soft_key;
+static void soft_thread_exit(void *p) { soft_release((unsigned char *)p); }
+#endif
+
+static int soft_key_ready(void) {
+    int st = __atomic_load_n(&g_soft_key_state, __ATOMIC_ACQUIRE);
+    if (st == 2) return 1;
+    if (st == 3) return 0;
+    timer_lock();
+    if (g_soft_key_state == 0) {
+#if defined(_WIN32)
+        g_soft_fls = FlsAlloc(soft_thread_exit);
+        int ok = g_soft_fls != FLS_OUT_OF_INDEXES;
+#else
+        int ok = pthread_key_create(&g_soft_key, soft_thread_exit) == 0;
+#endif
+        __atomic_store_n(&g_soft_key_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+    }
+    st = g_soft_key_state;
+    timer_unlock();
+    return st == 2;
+}
+#endif
+
+unsigned char *zan_rt_soft_scratch(void) {
+#if defined(ZAN_SOFT_PER_THREAD)
+    unsigned char *mine = t_soft_scratch;
+    if (__builtin_expect(mine != NULL, 1)) return mine;
+    static int shared_only = -1;
+    if (shared_only < 0) shared_only = getenv("ZAN_SOFT_SHARED_SCRATCH") != NULL;
+    if (!shared_only && soft_key_ready()) {
+        mine = soft_pool_take();
+        if (!mine) mine = soft_map();
+        if (mine) {
+#if defined(_WIN32)
+            FlsSetValue(g_soft_fls, mine);
+#else
+            pthread_setspecific(g_soft_key, mine);
+#endif
+            t_soft_scratch = mine;
+            return mine;
+        }
+    }
+#endif
+    return soft_scratch_shared();
 }
 
 static int zan_soft_seen(const char *text) {

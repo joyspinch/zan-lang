@@ -417,10 +417,11 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_DUMP_LATE_ARC_IR` | `=<路径>` 落盘内联后 ARC 收尾之前的模块 IR（排查消对是否命中） |
 | `ZAN_NO_TBAA` | `=1` 关闭字段别名元数据（默认优化构建给经 `emit_field_ptr` 的标量字段读写打按字段字节偏移的 TBAA 标签，告诉 LLVM 同一对象不同偏移的字段互不别名；显式布局结构不打），仅供 A/B 与排查疑似误编译 |
 | `ZAN_DLG_PIN_ALL` | `=1` 时每次委托调用都 retain 闭包并压临时栈（旧行为）。默认对函数内从不写、不按 ref 传、不被 lambda 捕获的局部/形参委托省掉这套簿记，仅供 A/B |
+| `ZAN_SOFT_SHARED_SCRATCH` | **运行时**环境变量：非空时软失败（try 外空引用继续执行）沿用旧的进程共享 4 KB 暂存区。默认每个出过软失败的线程惰性映射私有暂存（[保护页][头 + 1 MiB][保护页]，超出即触保护页而非写坏相邻内存），线程退出时清零后回池复用，仅供 A/B |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断；设置时自动关闭构建缓存（命中会吞掉旁路输出，`ZAN_DUMP_OPT_IR` 同理） |
 | `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |
-| `ZAN_CACHE_DIR` | 构建缓存根目录（条目在其下 `backend/`）；缺省为平台用户缓存目录下 `zan/backend`（macOS `~/Library/Caches`、Linux `$XDG_CACHE_HOME` 或 `~/.cache`、Windows `%LOCALAPPDATA%`） |
+| `ZAN_CACHE_DIR` | 构建缓存根目录（条目在其下 `backend/`；`backend/` 建为 0700，条目 0600；POSIX 上 `backend/` 必须归当前用户且不可被组/他人写（自己的会被收紧），其父目录须归当前用户或 root 且不可被他人写（带粘滞位的如 `/tmp` 除外），否则告警并关缓存；读取时条目不是当前用户所有的普通文件或可被他人写即视为未命中重建）；缺省为平台用户缓存目录下 `zan/backend`（macOS `~/Library/Caches`、Linux `$XDG_CACHE_HOME` 或 `~/.cache`、Windows `%LOCALAPPDATA%`） |
 | `ZAN_CACHE_PRUNE` | 构建缓存清理策略（LLVM `pruneCache` 语法），缺省 `prune_interval=20m:prune_after=168h:cache_size_bytes=4g` |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |

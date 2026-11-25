@@ -1243,6 +1243,16 @@ static bool late_call_nounwind(LLVMValueRef call) {
 /* A window instruction keeps x alive and its count unchanged. Releases of any
  * other value close the window too (B-ID96: alias analysis here is SSA/slot
  * identity only, so another value may be the same object at run time). */
+/* x read from shared memory with a volatile or atomic load is lock-free
+ * publication: another thread may swap the slot and drop the old object at
+ * any moment, so the retain is the only thing keeping x alive. Never cancel
+ * its pair. */
+static bool late_obj_from_sync_load(LLVMValueRef obj) {
+    LLVMValueRef v = strip_pointer_casts(obj);
+    if (!v || !LLVMIsALoadInst(v)) return false;
+    return LLVMGetVolatile(v) || LLVMGetOrdering(v) != LLVMAtomicOrderingNotAtomic;
+}
+
 #define LATE_ARC_WINDOW 64
 static bool late_window_ok(LLVMValueRef c, LLVMValueRef obj) {
     zan_arc_call_kind_t k = get_arc_call_kind(c);
@@ -1489,6 +1499,10 @@ static int late_drop_arc_pairs(LLVMValueRef fn) {
             if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) {
                 zan_arc_call_kind_t want = k == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
                 LLVMValueRef obj = get_arc_operand(inst);
+                if (late_obj_from_sync_load(obj)) {
+                    inst = next;
+                    continue;
+                }
                 LLVMValueRef rel = NULL;
                 int steps = 0;
                 for (LLVMValueRef c = next; c && steps < LATE_ARC_WINDOW;
@@ -1536,6 +1550,7 @@ static LLVMValueRef late_phi_in(LLVMValueRef phi, LLVMBasicBlockRef from) {
 static bool late_try_cross(LLVMBuilderRef b, LLVMValueRef retain, shrink_map_t *preds) {
     LLVMBasicBlockRef bb = LLVMGetInstructionParent(retain);
     LLVMValueRef obj = get_arc_operand(retain);
+    if (late_obj_from_sync_load(obj)) return false;
     zan_arc_call_kind_t want =
         get_arc_call_kind(retain) == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
     LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
@@ -1727,6 +1742,7 @@ static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRe
 
 static bool late_try_region(LLVMValueRef retain, shrink_map_t *preds) {
     LLVMValueRef obj = get_arc_operand(retain);
+    if (late_obj_from_sync_load(obj)) return false;
     zan_arc_call_kind_t want =
         get_arc_call_kind(retain) == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
     late_region_t r;

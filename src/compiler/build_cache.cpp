@@ -32,7 +32,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <system_error>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #include <stdlib.h>
@@ -54,6 +58,7 @@ struct state_t {
     Digest context{};
     llvm::SmallString<256> dir;
     bool dir_ready = false;
+    bool warned_untrusted = false;
     bool capturing = false;
     std::string capture;
     int opt_hit = 0, opt_miss = 0, obj_hit = 0, obj_miss = 0;
@@ -103,6 +108,64 @@ bool env_set(const char *name) {
     return v && v[0];
 }
 
+/* Cache entries are linked into the program unverified (they are keyed by
+ * the input, so a digest beside them proves nothing to someone who can write
+ * both). What makes them trustworthy is that only this user can write them:
+ * the directory is created owner-only, an existing one must be owned by us
+ * and not group/other-writable (we tighten our own), and every entry read
+ * must be a regular file with the same property. Windows: the default
+ * location is per-user under %LOCALAPPDATA% and ACL-protected; checks below
+ * are POSIX-only. */
+#if !defined(_WIN32)
+bool owned_private(const llvm::Twine &path, bool want_dir, bool fix) {
+    llvm::sys::fs::file_status st;
+    if (llvm::sys::fs::status(path, st, /*follow=*/false)) return false;
+    if (want_dir ? st.type() != llvm::sys::fs::file_type::directory_file
+                 : st.type() != llvm::sys::fs::file_type::regular_file)
+        return false;
+    if (st.getUser() != (uint32_t)geteuid()) return false;
+    unsigned shared = llvm::sys::fs::group_write | llvm::sys::fs::others_write;
+    if (st.permissions() & shared) {
+        if (!fix) return false;
+        if (llvm::sys::fs::setPermissions(path, llvm::sys::fs::owner_all)) return false;
+    }
+    return true;
+}
+#endif
+
+/* The parent must not let others rename or replace `backend`: owned by us
+ * or root, and not group/other-writable unless sticky (like /tmp). */
+#if !defined(_WIN32)
+bool parent_safe(const llvm::SmallString<256> &dir) {
+    llvm::StringRef parent = llvm::sys::path::parent_path(dir);
+    if (parent.empty()) return true;
+    llvm::sys::fs::file_status st;
+    if (llvm::sys::fs::status(parent, st)) return false;
+    uint32_t uid = st.getUser();
+    if (uid != (uint32_t)geteuid() && uid != 0) return false;
+    unsigned shared = llvm::sys::fs::group_write | llvm::sys::fs::others_write;
+    return !(st.permissions() & shared) || (st.permissions() & llvm::sys::fs::sticky_bit);
+}
+#endif
+
+bool dir_trusted(const llvm::SmallString<256> &dir) {
+#if defined(_WIN32)
+    (void)dir;
+    return true;
+#else
+    return parent_safe(dir) && owned_private(dir, /*want_dir=*/true, /*fix=*/true);
+#endif
+}
+
+bool entry_trusted(const std::string &path) {
+#if defined(_WIN32)
+    (void)path;
+    return true;
+#else
+    return owned_private(path, /*want_dir=*/false, /*fix=*/false);
+#endif
+}
+
 bool ensure_dir() {
     if (g_bc.dir_ready) return true;
     llvm::SmallString<256> dir;
@@ -114,7 +177,19 @@ bool ensure_dir() {
         llvm::sys::path::append(dir, "zan");
     }
     llvm::sys::path::append(dir, "backend");
-    if (llvm::sys::fs::create_directories(dir)) return false;
+    if (llvm::sys::fs::create_directories(dir, /*IgnoreExisting=*/true, llvm::sys::fs::owner_all))
+        return false;
+    if (!dir_trusted(dir)) {
+        if (!g_bc.warned_untrusted) {
+            fprintf(stderr,
+                    "warning: build cache '%s' is not owned by you or is writable by others; "
+                    "not using it (set ZAN_CACHE_DIR to a private directory)\n",
+                    dir.c_str());
+            g_bc.warned_untrusted = true;
+        }
+        g_bc.enabled = false;
+        return false;
+    }
     g_bc.dir = dir;
     g_bc.dir_ready = true;
     return true;
@@ -138,7 +213,9 @@ template <typename Fill> bool write_atomic(const std::string &dst, Fill fill) {
     llvm::sys::path::append(model, "llvmcache-tmp-%%%%%%%%%%%%%%%%");
     int fd = -1;
     llvm::SmallString<256> tmp;
-    if (llvm::sys::fs::createUniqueFile(model, fd, tmp)) return false;
+    if (llvm::sys::fs::createUniqueFile(model, fd, tmp, llvm::sys::fs::OF_None,
+                                        llvm::sys::fs::owner_read | llvm::sys::fs::owner_write))
+        return false;
     bool ok;
     {
         llvm::raw_fd_ostream os(fd, /*shouldClose=*/true);
@@ -170,7 +247,8 @@ void prune() {
         llvm::consumeError(policy.takeError());
         return;
     }
-    llvm::pruneCache(g_bc.dir, *policy);
+    auto pruned = llvm::pruneCache(g_bc.dir, *policy);
+    if (!pruned) llvm::consumeError(pruned.takeError());
 }
 
 void finish_key(llvm::BLAKE3 &h, zan_bcache_key_t *key) {
@@ -266,8 +344,11 @@ extern "C" LLVMModuleRef zan_bcache_opt_load(const zan_bcache_key_t *key, LLVMMo
     if (!g_bc.enabled || !key->valid || !ensure_dir()) return nullptr;
     double t0 = now_ms();
     std::string bc_path = entry_path(key, ".opt.bc");
-    auto buf = llvm::MemoryBuffer::getFile(bc_path, /*IsText=*/false,
-                                           /*RequiresNullTerminator=*/false);
+    auto buf = entry_trusted(bc_path)
+                   ? llvm::MemoryBuffer::getFile(bc_path, /*IsText=*/false,
+                                                 /*RequiresNullTerminator=*/false)
+                   : llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>(
+                         std::make_error_code(std::errc::permission_denied));
     if (!buf) {
         g_bc.opt_miss++;
         g_bc.ms_load += now_ms() - t0;
@@ -283,7 +364,9 @@ extern "C" LLVMModuleRef zan_bcache_opt_load(const zan_bcache_key_t *key, LLVMMo
         return nullptr;
     }
     std::string log_path = entry_path(key, ".opt.log");
-    if (auto lb = llvm::MemoryBuffer::getFile(log_path, /*IsText=*/true)) {
+    if (!entry_trusted(log_path)) {
+        /* fall through without the replayed log */
+    } else if (auto lb = llvm::MemoryBuffer::getFile(log_path, /*IsText=*/true)) {
         llvm::StringRef text = (*lb)->getBuffer();
         char *copy = static_cast<char *>(malloc(text.size() + 1));
         if (copy) {
@@ -377,7 +460,7 @@ extern "C" bool zan_bcache_obj_load(const zan_bcache_key_t *key, int parts,
     if (!g_bc.enabled || !key->valid || parts < 1 || !ensure_dir()) return false;
     double t0 = now_ms();
     bool ok = true;
-    for (int i = 0; i < parts && ok; i++) ok = llvm::sys::fs::exists(obj_entry(key, i));
+    for (int i = 0; i < parts && ok; i++) ok = entry_trusted(obj_entry(key, i));
     for (int i = 0; i < parts && ok; i++)
         ok = !llvm::sys::fs::copy_file(obj_entry(key, i), paths[i]);
     if (ok) {
