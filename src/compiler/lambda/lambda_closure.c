@@ -491,6 +491,42 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                                   LLVMValueRef init);
 LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload);
+static const char *clo_slot_name(zan_irgen_t *g, zan_istr_t name) {
+    if (!name.str || !name.len) return "?";
+    char *s = zan_arena_alloc(g->arena, (size_t)name.len + 1);
+    if (!s) return "?";
+    memcpy(s, name.str, name.len);
+    s[name.len] = '\0';
+    return s;
+}
+
+/* 闭包记录的强引用槽登记进站点字段走图：target（方法组接收者）、拥有引用的
+ * 捕获槽（捕获盒、引用计数对象/字符串/委托）、强捕获的 this。弱捕获的 this
+ * （S12）不是强边，不登记。 */
+static void record_closure_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                  bool has_target, lambda_capture_t *caps, int capc,
+                                  int has_this) {
+    unsigned fields[ZAN_CLO_LAYOUT_MAX];
+    const char *names[ZAN_CLO_LAYOUT_MAX];
+    int n = 0;
+    if (has_target) { fields[n] = 2; names[n] = "target"; n++; }
+    for (int i = 0; i < capc && n < ZAN_CLO_LAYOUT_MAX; i++) {
+        if (!caps[i].boxed) {
+            if (!is_rc_managed_type(caps[i].type) ||
+                LLVMGetTypeKind(caps[i].llvm) != LLVMPointerTypeKind) continue;
+        }
+        fields[n] = (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i);
+        names[n] = clo_slot_name(g, caps[i].name);
+        n++;
+    }
+    if (has_this == 1 && n < ZAN_CLO_LAYOUT_MAX) {
+        fields[n] = (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc);
+        names[n] = "this";
+        n++;
+    }
+    zan_set_closure_site_layout(g, site_idx, rec_ty, fields, names, n);
+}
+
 static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
                                         const char *lname, LLVMTypeRef rec_ty,
                                         LLVMValueRef fn_ptr, LLVMValueRef target,
@@ -502,6 +538,8 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     LLVMValueRef dtor = build_closure_dtor(g, lname, rec_ty, caps, capc,
                                            has_this, true);
     int site_idx = reserve_closure_site(g);
+    record_closure_layout(g, site_idx, rec_ty, target != NULL && retain_target,
+                          caps, capc, has_this);
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];
@@ -971,6 +1009,11 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                              .type = vtype, .llvm = payload, .boxed = 0 };
     LLVMValueRef dtor = build_closure_dtor(g, bname, rec_ty, &val, 1, 0, true);
     int site_idx = reserve_closure_site(g);
+    if (is_rc_managed_type(vtype) && LLVMGetTypeKind(payload) == LLVMPointerTypeKind) {
+        unsigned vf = ZAN_BOX_VALUE_FIELD;
+        const char *vn = "value";
+        zan_set_closure_site_layout(g, site_idx, rec_ty, &vf, &vn, 1);
+    }
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];

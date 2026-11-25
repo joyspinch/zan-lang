@@ -50,14 +50,14 @@ static void zan_leak_walk_edges(void *obj, zan_leak_edge_cb_t cb, void *ctx) {
     if (!fg) return;
     if (fg->kind == 0) {
         for (uint32_t k = 0; k < fg->ref_count; k++) {
-            void *child = *(void **)((char *)obj + fg->refs[k].offset);
+            void *child = zan_edge_untag(*(void **)((char *)obj + fg->refs[k].offset));
             if (child) cb(obj, child, 0, k, ctx);
         }
     } else if (fg->kind == 1) {
         int64_t count = *(int64_t *)obj;
         void **data = *(void ***)((char *)obj + 16);
         for (int64_t j = 0; data && j < count; j++)
-            if (data[j]) cb(obj, data[j], 1, (uint32_t)j, ctx);
+            if (data[j]) cb(obj, zan_edge_untag(data[j]), 1, (uint32_t)j, ctx);
     } else if (fg->kind == 2) {
         int64_t count = *(int64_t *)obj;
         void **ks = *(void ***)((char *)obj + 16);
@@ -65,8 +65,8 @@ static void zan_leak_walk_edges(void *obj, zan_leak_edge_cb_t cb, void *ctx) {
         int key_is_rc = fg->ref_count & 1;
         int val_is_rc = (fg->ref_count >> 1) & 1;
         for (int64_t j = 0; j < count; j++) {
-            if (key_is_rc && ks && ks[j]) cb(obj, ks[j], 2, (uint32_t)j, ctx);
-            if (val_is_rc && vs && vs[j]) cb(obj, vs[j], 3, (uint32_t)j, ctx);
+            if (key_is_rc && ks && ks[j]) cb(obj, zan_edge_untag(ks[j]), 2, (uint32_t)j, ctx);
+            if (val_is_rc && vs && vs[j]) cb(obj, zan_edge_untag(vs[j]), 3, (uint32_t)j, ctx);
         }
     }
 }
@@ -132,6 +132,11 @@ static void zan_leak_emit_node(zan_leak_out_t *o, void *obj) {
     const char *where = NULL;
     if (o->site_names && site > 0 && site < (uint64_t)o->site_count)
         where = (const char *)o->site_names[site];
+    /* 闭包记录与捕获盒没有类型名，按站点名的方括号标注显示 */
+    if (where && strcmp(ty, "object") == 0) {
+        if (strstr(where, "[closure]")) ty = "closure";
+        else if (strstr(where, "[captured local]")) ty = "box";
+    }
     char buf[512];
     if (where) {
         /* 站点名形如 "file:line:col [List<T>]"：类型已由 ty 给出，去掉方括号尾巴 */

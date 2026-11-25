@@ -429,6 +429,13 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
             instance_size = (uint32_t)cursor;
             kind = (ref_count > 0) ? 0 : 3;
         }
+    } else if (g->site_clo && site_idx < g->site_clo_cap && g->site_clo[site_idx]) {
+        /* 闭包记录 / 捕获盒：登记过的强引用槽（target、捕获变量、强捕获 this） */
+        zan_clo_layout_t *cl = g->site_clo[site_idx];
+        kind = cl->n > 0 ? 0 : 3;
+        ref_count = (uint32_t)cl->n;
+        for (int k = 0; k < cl->n; k++) offsets[k] = cl->offsets[k];
+        instance_size = 24;
     } else {
         /* Closure or unknown site */
         kind = 0;
@@ -476,6 +483,21 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
  * 边的 refs 下标取名，打印 "Node.Next -> ..."。非类站点为空指针。 */
 static LLVMValueRef build_site_field_names(zan_irgen_t *g, int site_idx) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (g->site_clo && site_idx < g->site_clo_cap && g->site_clo[site_idx] &&
+        g->site_clo[site_idx]->n > 0) {
+        zan_clo_layout_t *cl = g->site_clo[site_idx];
+        LLVMValueRef cnames[ZAN_CLO_LAYOUT_MAX];
+        for (int k = 0; k < cl->n; k++)
+            cnames[k] = zan_irgen_intern_string(g, cl->names[k] ? cl->names[k] : "?");
+        char cgname[64];
+        snprintf(cgname, sizeof(cgname), "__zan_fnames_%d", site_idx);
+        LLVMTypeRef cat = LLVMArrayType(i8p, (unsigned)cl->n);
+        LLVMValueRef cgv = LLVMAddGlobal(g->mod, cat, cgname);
+        LLVMSetLinkage(cgv, LLVMInternalLinkage);
+        LLVMSetGlobalConstant(cgv, 1);
+        LLVMSetInitializer(cgv, LLVMConstArray(i8p, cnames, (unsigned)cl->n));
+        return LLVMConstBitCast(cgv, i8p);
+    }
     if ((g->site_coll && g->site_coll[site_idx]) || !g->site_syms ||
         !g->site_syms[site_idx])
         return LLVMConstNull(i8p);
@@ -511,6 +533,31 @@ static LLVMValueRef build_site_field_names(zan_irgen_t *g, int site_idx) {
     LLVMSetGlobalConstant(gv, 1);
     LLVMSetInitializer(gv, LLVMConstArray(i8p, names, n));
     return LLVMConstBitCast(gv, i8p);
+}
+
+void zan_set_closure_site_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                 const unsigned *fields, const char *const *names, int n) {
+    if (site_idx < 0 || n <= 0) return;
+    if (site_idx >= g->site_clo_cap) {
+        int ncap = g->site_clo_cap ? g->site_clo_cap : 256;
+        while (ncap <= site_idx) ncap *= 2;
+        zan_clo_layout_t **na = (zan_clo_layout_t **)realloc(g->site_clo,
+            (size_t)ncap * sizeof(*na));
+        if (!na) return;
+        memset(na + g->site_clo_cap, 0, (size_t)(ncap - g->site_clo_cap) * sizeof(*na));
+        g->site_clo = na;
+        g->site_clo_cap = ncap;
+    }
+    zan_clo_layout_t *cl = zan_arena_alloc(g->arena, sizeof(*cl));
+    if (!cl) return;
+    LLVMTargetDataRef layout = LLVMGetModuleDataLayout(g->mod);
+    cl->n = 0;
+    for (int k = 0; k < n && cl->n < ZAN_CLO_LAYOUT_MAX; k++) {
+        cl->offsets[cl->n] = (uint32_t)LLVMOffsetOfElement(layout, rec_ty, fields[k]);
+        cl->names[cl->n] = names[k];
+        cl->n++;
+    }
+    g->site_clo[site_idx] = cl;
 }
 
 /* 退出报告引用的字段名表全局（i8**）。报告函数在 main 发射时就要引用它，

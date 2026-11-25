@@ -340,6 +340,16 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym);
 void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals);
 int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst, int coll_kind, zan_type_t *coll_elem);
 int reserve_closure_site(zan_irgen_t *g);
+/* 闭包记录 / 捕获盒的强引用槽：字节偏移 + 显示名（捕获变量名、this、target）。
+ * 进入站点字段走图后，S13 环诊断与 GC.DetectCycles 能沿闭包走边。 */
+#define ZAN_CLO_LAYOUT_MAX 64
+typedef struct zan_clo_layout {
+    int         n;
+    uint32_t    offsets[ZAN_CLO_LAYOUT_MAX];
+    const char *names[ZAN_CLO_LAYOUT_MAX];
+} zan_clo_layout_t;
+void zan_set_closure_site_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                 const unsigned *fields, const char *const *names, int n);
 const char *arc_runtime_type_name(zan_irgen_t *g, zan_type_t *type);
 const char *arc_collection_type_name(zan_irgen_t *g, int kind, zan_type_t *element);
 zan_symbol_t * resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name, int argc, int type_arg_count);

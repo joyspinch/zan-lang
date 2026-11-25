@@ -459,6 +459,10 @@ struct zan_irgen {
     zan_type_t   **site_inst;    /* 分配点特化类类型：确保泛型析构释放对应字段 */
     int          *site_coll;
     zan_type_t   **site_coll_elem;
+    /* 闭包/捕获盒站点的强引用槽布局（字段走图用，见 zan_set_closure_site_layout）；
+     * 下标同 site_syms，按需增长到 site_clo_cap，未登记的站点为 NULL。 */
+    struct zan_clo_layout **site_clo;
+    int            site_clo_cap;
     uint32_t     *site_loc_file;
     uint32_t     *site_loc_line;
     int          leak_site_count;

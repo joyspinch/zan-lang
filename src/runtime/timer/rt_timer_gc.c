@@ -248,6 +248,12 @@ static const char *zan_get_object_tyname(void *obj) {
 
 typedef void (*zan_edge_cb_t)(void *from, void *to, void *ctx);
 
+/* 委托值是带 ZAN_CLOSURE_TAG 低位标记的闭包记录指针（对象至少 8 字节对齐，
+ * 低位恒 0）：走边时去掉标记才能在注册表里对上闭包记录本身。 */
+static inline void *zan_edge_untag(void *p) {
+    return (void *)((uintptr_t)p & ~(uintptr_t)ZAN_CLOSURE_TAG);
+}
+
 static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
     if (!obj) return;
     uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
@@ -277,7 +283,7 @@ static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
     if (fg->kind == 0) {
         for (uint32_t k = 0; k < fg->ref_count; k++) {
             uint32_t off = fg->refs[k].offset;
-            void *child = *(void **)((char *)obj + off);
+            void *child = zan_edge_untag(*(void **)((char *)obj + off));
             if (child) cb(obj, child, ctx);
         }
     } else if (fg->kind == 1) { /* List<T> */
@@ -285,7 +291,7 @@ static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
             void **data = *(void ***)((char *)obj + 16);
             if (data && count > 0) {
                 for (int64_t j = 0; j < count; j++) {
-                    void *child = data[j];
+                    void *child = zan_edge_untag(data[j]);
                     if (child) cb(obj, child, ctx);
                 }
             }
@@ -296,8 +302,8 @@ static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
             int key_is_rc = fg->ref_count & 1;
             int val_is_rc = (fg->ref_count >> 1) & 1;
             for (int64_t j = 0; j < count; j++) {
-                if (key_is_rc && ks && ks[j]) cb(obj, ks[j], ctx);
-                if (val_is_rc && vs && vs[j]) cb(obj, vs[j], ctx);
+                if (key_is_rc && ks && ks[j]) cb(obj, zan_edge_untag(ks[j]), ctx);
+                if (val_is_rc && vs && vs[j]) cb(obj, zan_edge_untag(vs[j]), ctx);
             }
         }
     }

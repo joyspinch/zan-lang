@@ -944,6 +944,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->site_coll = NULL;
     free(g->site_coll_elem);
     g->site_coll_elem = NULL;
+    free(g->site_clo);
+    g->site_clo = NULL;
+    g->site_clo_cap = 0;
     free(g->site_inst);
     g->site_inst = NULL;
     free(g->site_loc_file);
