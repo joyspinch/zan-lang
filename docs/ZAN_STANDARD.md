@@ -62,7 +62,7 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 | S1 | `zanc --diag=json` | **第一刀已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置、fix-it 框架，首个补丁 E0032 缺 `;`）。余：更多诊断接 fix-it（`zan_diag_emit_fix`）、结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
 | S2 | `zanc query <符号>` | 回答：分配了什么、捕获了什么、可能抛什么、用到哪些能力（§2.2）、被谁调用 |
 | S3 | `zanc --affected <diff>` | 输出受影响的 ctest 用例名单，替代人工挑选（对应 WC §8 的定向命中面） |
-| S4 | `zanc --summary <包>` | 生成紧凑接口摘要（公开签名 + 效果 + 契约 + 一行文档），供 AI 一次装入上下文；逐步替代手工维护的 `language-facts.md` |
+| S4 | `zanc --summary <包>` | 第一刀已落地，见 docs/ZANC_CLI.md §1.7（公开签名 + 一行文档）；余：效果与契约列（依赖 S2） |
 | S5 | `zan check` | 一条命令跑完：编译诊断 → 泄漏门禁（§3）→ `zan ui check`（§5）→ 回放比对与不变量（§6），输出单份 JSON 报告 |
 
 AI 工作循环收敛为：**改代码 → `zan check` → 应用 fix-it**。

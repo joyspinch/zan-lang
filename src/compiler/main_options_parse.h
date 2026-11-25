@@ -30,6 +30,7 @@ typedef struct zan_options {
     bool do_dump_tokens;
     bool do_dump_ast;
     const char *emit_symbols_path;
+    bool do_summary;               /* S4 --summary */
     const char *gen_meta_path;
     bool do_emit_ir;
     int check_leaks_opt;

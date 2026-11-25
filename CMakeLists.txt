@@ -1866,6 +1866,16 @@ add_test(NAME diag_json_class_cycle
     -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
 set_tests_properties(diag_json_class_cycle PROPERTIES TIMEOUT 180)
 
+# S4（docs/ZAN_STANDARD.md §1）：zanc --summary 公开接口摘要金样——只列公开面、
+# 文档取注释块第一句、属性访问器不重复、方法类型参数与基类型保留。
+add_test(NAME summary_surface
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/summary/summary_surface.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/summary/summary_surface.out
+    -P ${CMAKE_SOURCE_DIR}/tests/run_summary.cmake)
+set_tests_properties(summary_surface PROPERTIES TIMEOUT 120)
+
 # S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出报告——孤儿环逐条打印路径；
 # Environment.Exit 时栈帧/静态字段持有的对象是根，不误报。
 foreach(_leak_case leak_cycle_report leak_exit_roots)

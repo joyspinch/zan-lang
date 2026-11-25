@@ -52,6 +52,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
+    bool do_summary = false;              /* S4 --summary */
     const char *gen_meta_path = NULL;
     bool do_emit_ir = false;
     int check_leaks_opt = -1;
@@ -119,6 +120,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             do_dump_ast = true;
         } else if (strcmp(argv[i], "--emit-symbols") == 0 && i + 1 < argc) {
             emit_symbols_path = argv[++i];
+        } else if (strcmp(argv[i], "--summary") == 0) {
+            do_summary = true;
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
@@ -403,6 +406,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->do_dump_tokens = do_dump_tokens;
     opts->do_dump_ast = do_dump_ast;
     opts->emit_symbols_path = emit_symbols_path;
+    opts->do_summary = do_summary;
     opts->gen_meta_path = gen_meta_path;
     opts->do_emit_ir = do_emit_ir;
     opts->check_leaks_opt = check_leaks_opt;

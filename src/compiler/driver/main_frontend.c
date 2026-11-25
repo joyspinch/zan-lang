@@ -309,6 +309,18 @@
         return 3;
     }
 
+    /* S4：只摘显式输入文件的公开接口，不做类型检查与代码生成 */
+    if (do_summary) {
+        if (zan_diag_has_errors(diag)) {   /* 半截 AST 的摘要会误导，宁可不出 */
+            zan_arena_free(arena);
+            return 1;
+        }
+        zan_summary_emit(ast, diag, explicit_input_count, stdout);
+        fflush(stdout);
+        zan_arena_free(arena);
+        return 0;
+    }
+
     if (emit_symbols_path) {
         int srv = zan_symbols_emit(ast, emit_symbols_path);
         if (srv != 0)

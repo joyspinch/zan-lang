@@ -206,6 +206,32 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 当前带 fix-it 的诊断：E0032 缺 `;`（插在上一个 token 末尾；上一个 token 是
 字符串或运算符等量不出长度时不给补丁）。退出码语义与文本格式相同。
 
+### 1.7 接口摘要（`--summary`，S4）
+
+`zanc <文件|目录...> --summary [--auto-stdlib]` 打印**命令行显式给出的源文件**的
+公开面后退出（不做类型检查、不生成代码；有语法错误时不出摘要、退出码 1）。
+`--auto-stdlib`/包发现拉进来的库只用于解析，不进摘要。供 AI 一次装入一个包的
+接口，替代逐文件翻源码：
+
+```
+public class UiEvent  // 控件事件：单一订阅通道。
+  // namespace Gui
+  public static UiEvent op_add(UiEvent self, Action handler)  // 支持 event += handler（追加，多播）。
+  public int Count()  // 全部订阅数（两种处理器形状合计）。
+```
+
+- 每个类型一行头（修饰、种类、名字与类型参数、基类型）+ 一行 `// namespace`；
+  每个公开成员一行 C# 形态签名（方法类型参数、`static`/`virtual`/`override`/
+  `async`/`event` 修饰、属性的 `{ get; set; }`）。
+- 列出：类型除显式 `private`/`internal` 外都列；成员只列 `public`/`protected`，
+  接口与枚举成员全列。属性降解出的 `get_X`/`set_X` 不重复列。
+- 文档：声明上方紧邻注释块（`//`、`///`，跳过 `[特性]` 行）的第一句，剥 XML
+  标签，截到第一个 `。` 或 `. `。
+- 首行 `// zan-summary 1: …` 是格式版本；末行给类型/成员计数。效果（分配、
+  抛出、能力）与契约列待 S2 `zanc query` 提供后补进来。
+- 实测：`packages/Zan.Gui/src` 460 个类型、6349 个成员，约 1.5 秒。
+- 钉：`summary_surface`（`tests/summary/`）。
+
 ## 2. 全参数表（与 `zanc --help` 同源）
 
 > 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。
@@ -275,6 +301,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `--dump-ast` | — | 打印语法树后继续编译 |
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
+| `--summary` | — | 打印显式输入源文件的公开接口摘要后退出（S4，见 §1.7） |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 
 ### 2.4 打包（Packaging）

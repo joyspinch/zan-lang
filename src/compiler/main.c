@@ -567,6 +567,7 @@ int main(int argc, char **argv) {
     bool do_dump_tokens = opts.do_dump_tokens;
     bool do_dump_ast = opts.do_dump_ast;
     const char *emit_symbols_path = opts.emit_symbols_path;
+    bool do_summary = opts.do_summary;
     const char *gen_meta_path = opts.gen_meta_path;
     bool do_emit_ir = opts.do_emit_ir;
     int check_leaks_opt = opts.check_leaks_opt;
