@@ -1760,9 +1760,9 @@ static void cpu_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
   zan_polyline_core(s, pts, (i32)n, c, t, shift);
 }
 
-EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
-                                   const i32 *counts, i32 n_paths, i32 color,
-                                   i32 thickness) {
+static void draw_polybatch_impl(i32 surface_id, const i32 *pts,
+                                const i32 *counts, i32 n_paths, i32 color,
+                                i32 thickness, int shift) {
   if (surface_id < 0 || surface_id >= g_surface_count)
     return;
   zan_surface_t *s = g_surfaces[surface_id];
@@ -1773,7 +1773,7 @@ EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
     t = 1;
   region_write_clip(s);
   if (s->be && s->be->polybatch) {
-    s->be->polybatch(s, pts, counts, (int)n_paths, (u32)color, t, 0);
+    s->be->polybatch(s, pts, counts, (int)n_paths, (u32)color, t, shift);
     return;
   }
   i32 off = 0;
@@ -1781,7 +1781,7 @@ EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
     for (i32 p = 0; p < n_paths; p++) {
       i32 n = counts[p];
       if (n >= 2)
-        s->be->polyline(s, pts + off, (int)n, (u32)color, t, 0);
+        s->be->polyline(s, pts + off, (int)n, (u32)color, t, shift);
       off += n * 2;
     }
     return;
@@ -1789,9 +1789,21 @@ EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
   for (i32 p = 0; p < n_paths; p++) {
     i32 n = counts[p];
     if (n >= 2)
-      cpu_polyline(s, pts + off, (int)n, (u32)color, t, 0);
+      cpu_polyline(s, pts + off, (int)n, (u32)color, t, shift);
     off += n * 2;
   }
+}
+
+EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
+                                   const i32 *counts, i32 n_paths, i32 color,
+                                   i32 thickness) {
+  draw_polybatch_impl(surface_id, pts, counts, n_paths, color, thickness, 0);
+}
+
+EXPORT void zan_gui_draw_polybatch_fx(i32 surface_id, const i32 *pts,
+                                      const i32 *counts, i32 n_paths, i32 color,
+                                      i32 thickness) {
+  draw_polybatch_impl(surface_id, pts, counts, n_paths, color, thickness, 8);
 }
 
 static void cpu_composite_surface(zan_surface_t *d, zan_surface_t *s,

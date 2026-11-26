@@ -4,14 +4,27 @@ using Gui;
 namespace Gui;
 public class NativeLayer {
     static int MaxRects() { return 24; }
+    public static void PushClip(App app, int x, int y, int w, int h) {
+        if (app != null) { app.PushNativeClip(x, y, w, h); }
+    }
+    public static void PopClip(App app) {
+        if (app != null) { app.PopNativeClip(); }
+    }
     static void Register(App app, int handle, int x, int y, int w, int h,
     NativeClipFn apply) {
         if (app == null || handle == 0 || apply == null) { return; }
-        if (w <= 0 || h <= 0) { return; }
+        app.ClipNativeRect(ref x, ref y, ref w, ref h);
+        if (w <= 0 || h <= 0) {
+            NativeLayer.Track(new NativeLayerReq(app, handle, 0, 0, 0, 0, apply));
+            return;
+        }
         NativeLayerReq req = new NativeLayerReq(app, handle, x, y, w, h, apply);
+        req.occluderStart = app.nativeOccluders.Count;
         app.nativeLayers.Add(req);
         NativeLayer.Track(req);
-        Gui.Backend.Platform.Window().ForbidLayered(app.window.GetHandle());
+        if (app.window != null && app.window.GetHandle() != 0) {
+            Gui.Backend.Platform.Window().ForbidLayered(app.window.GetHandle());
+        }
     }
     static void Track(NativeLayerReq req) {
         GuiCoreState state = GuiCoreState.Current();
@@ -41,8 +54,19 @@ public class NativeLayer {
         }
         return false;
     }
+    internal static bool HasTrackedFor(App app) {
+        if (app == null) { return false; }
+        GuiCoreState state = GuiCoreState.Current();
+        List<NativeLayerReq> tracked = state.nativeLayerTracked;
+        if (tracked == null || tracked.Count == 0) { return false; }
+        for (int i = 0; i < tracked.Count; i = i + 1) {
+            if (tracked[i].owner == app) { return true; }
+        }
+        return false;
+    }
     static void Occlude(App app, int x, int y, int w, int h) {
         if (app == null) { return; }
+        app.ClipNativeRect(ref x, ref y, ref w, ref h);
         if (w <= 0 || h <= 0) { return; }
         app.nativeOccluders.Add(x);
         app.nativeOccluders.Add(y);
@@ -51,13 +75,17 @@ public class NativeLayer {
     }
     static void Flush(App app) {
         if (app == null) { return; }
-        if (Gui.Backend.Platform.Shell().SweepLayered()) {
+        if (app.window != null && app.window.GetHandle() != 0
+                && Gui.Backend.Platform.Shell().SweepLayered()) {
             app.needsRedraw = true;
             app.Stats.NoteRedrawWhy("native-host-unlayered");
         }
         NativeLayer.HideUnregistered(app);
         if (app.nativeLayers.Count == 0) { return; }
-        List<int> occ = NativeLayer.Occluders(app);
+        List<int> hitBlk = NativeLayer.HitBlockers(app);
+        List<int> occ = app.nativeOccluders;
+        List<int> marks = app.nativeOccluderMarks;
+        int cap = NativeLayer.MaxRects() * 4;
         for (int i = 0; i < app.nativeLayers.Count; i = i + 1) {
             NativeLayerReq req = app.nativeLayers[i];
             List<int> vis = new List<int>();
@@ -65,13 +93,34 @@ public class NativeLayer {
             vis.Add(req.y);
             vis.Add(req.w);
             vis.Add(req.h);
-            int k = 0;
-            while (k + 3 < occ.Count) {
-                if (vis.Count == 0) { break; }
-                if (vis.Count > NativeLayer.MaxRects() * 4) { break; }
-                vis = NativeLayer.Subtract(vis, occ[k], occ[k + 1],
-                occ[k + 2], occ[k + 3]);
-                k = k + 4;
+            int minStart = req.occluderStart;
+            if (minStart < 0) { minStart = 0; }
+            int mainEnd = occ.Count;
+            if (marks != null && marks.Count > 0) {
+                mainEnd = marks[0];
+                // Highest-z overlay passes first, forward within each pass so parent
+                // masks/surfaces subtract before their interior child controls.
+                for (int p = marks.Count - 1; p >= 0 && vis.Count > 0; p = p - 1) {
+                    int passStart = marks[p];
+                    int passEnd = p + 1 < marks.Count ? marks[p + 1] : occ.Count;
+                    if (passStart < minStart) { passStart = minStart; }
+                    if (passStart < passEnd) {
+                        vis = NativeLayer.SubtractRange(vis, occ, passStart, passEnd, cap);
+                    }
+                }
+            }
+            if (vis.Count > 0 && minStart < mainEnd) {
+                vis = NativeLayer.SubtractRange(vis, occ, minStart, mainEnd, cap);
+            }
+            for (int j = app.nativeLayers.Count - 1; j > i && vis.Count > 0; j = j - 1) {
+                NativeLayerReq topReq = app.nativeLayers[j];
+                vis = NativeLayer.SubtractBounded(vis, topReq.x, topReq.y, topReq.w, topReq.h, cap);
+            }
+            int b = 0;
+            while (b + 3 < hitBlk.Count && vis.Count > 0) {
+                vis = NativeLayer.SubtractBounded(vis, hitBlk[b], hitBlk[b + 1],
+                    hitBlk[b + 2], hitBlk[b + 3], cap);
+                b = b + 4;
             }
             req.apply(req.handle, NativeLayer.Spec(vis));
         }
@@ -86,7 +135,7 @@ public class NativeLayer {
             k.apply(k.handle, "");
         }
     }
-    static List<int> Occluders(App app) {
+    static List<int> HitBlockers(App app) {
         List<int> outp = new List<int>();
         List<HitRegion> blk = app.hitTester.blockers;
         for (int i = 0; i < blk.Count; i = i + 1) {
@@ -98,6 +147,10 @@ public class NativeLayer {
             outp.Add(r.width);
             outp.Add(r.height);
         }
+        return outp;
+    }
+    static List<int> Occluders(App app) {
+        List<int> outp = NativeLayer.HitBlockers(app);
         for (int i = 0; i < app.nativeOccluders.Count; i = i + 1) {
             outp.Add(app.nativeOccluders[i]);
         }
@@ -108,6 +161,87 @@ public class NativeLayer {
             if (app.hitOnlyBlockers[i] == id) { return true; }
         }
         return false;
+    }
+    static List<int> SubtractRange(List<int> rects, List<int> occ, int start, int end, int cap) {
+        int k = start;
+        while (k + 3 < end && rects.Count > 0) {
+            rects = NativeLayer.SubtractBounded(rects, occ[k], occ[k + 1],
+                occ[k + 2], occ[k + 3], cap);
+            k = k + 4;
+        }
+        return rects;
+    }
+    static List<int> SubtractBounded(List<int> rects, int ox, int oy, int ow, int oh, int cap) {
+        if (rects.Count == 0 || ow <= 0 || oh <= 0) { return rects; }
+        int ox2 = ox + ow;
+        int oy2 = oy + oh;
+        List<int> outp = new List<int>();
+        int i = 0;
+        while (i + 3 < rects.Count) {
+            int x = rects[i];
+            int y = rects[i + 1];
+            int w = rects[i + 2];
+            int h = rects[i + 3];
+            i = i + 4;
+            int x2 = x + w;
+            int y2 = y + h;
+            if (ox2 <= x || ox >= x2 || oy2 <= y || oy >= y2) {
+                outp.Add(x);
+                outp.Add(y);
+                outp.Add(w);
+                outp.Add(h);
+                continue;
+            }
+            int pieces = 0;
+            int p0x = 0; int p0y = 0; int p0w = 0; int p0h = 0;
+            int p1x = 0; int p1y = 0; int p1w = 0; int p1h = 0;
+            int p2x = 0; int p2y = 0; int p2w = 0; int p2h = 0;
+            int p3x = 0; int p3y = 0; int p3w = 0; int p3h = 0;
+            if (oy > y) {
+                p0x = x; p0y = y; p0w = w; p0h = oy - y;
+                pieces = 1;
+            }
+            if (oy2 < y2) {
+                int rx = x; int ry = oy2; int rw = w; int rh = y2 - oy2;
+                if (pieces == 0) { p0x = rx; p0y = ry; p0w = rw; p0h = rh; }
+                else { p1x = rx; p1y = ry; p1w = rw; p1h = rh; }
+                pieces = pieces + 1;
+            }
+            int midY = y;
+            if (oy > midY) { midY = oy; }
+            int midY2 = y2;
+            if (oy2 < midY2) { midY2 = oy2; }
+            if (midY2 > midY) {
+                if (ox > x) {
+                    int rx = x; int ry = midY; int rw = ox - x; int rh = midY2 - midY;
+                    if (pieces == 0) { p0x = rx; p0y = ry; p0w = rw; p0h = rh; }
+                    else if (pieces == 1) { p1x = rx; p1y = ry; p1w = rw; p1h = rh; }
+                    else { p2x = rx; p2y = ry; p2w = rw; p2h = rh; }
+                    pieces = pieces + 1;
+                }
+                if (ox2 < x2) {
+                    int rx = ox2; int ry = midY; int rw = x2 - ox2; int rh = midY2 - midY;
+                    if (pieces == 0) { p0x = rx; p0y = ry; p0w = rw; p0h = rh; }
+                    else if (pieces == 1) { p1x = rx; p1y = ry; p1w = rw; p1h = rh; }
+                    else if (pieces == 2) { p2x = rx; p2y = ry; p2w = rw; p2h = rh; }
+                    else { p3x = rx; p3y = ry; p3w = rw; p3h = rh; }
+                    pieces = pieces + 1;
+                }
+            }
+            int remaining = rects.Count - i;
+            if (pieces > 1 && outp.Count + pieces * 4 + remaining > cap) {
+                outp.Add(x);
+                outp.Add(y);
+                outp.Add(w);
+                outp.Add(h);
+                continue;
+            }
+            if (pieces >= 1) { outp.Add(p0x); outp.Add(p0y); outp.Add(p0w); outp.Add(p0h); }
+            if (pieces >= 2) { outp.Add(p1x); outp.Add(p1y); outp.Add(p1w); outp.Add(p1h); }
+            if (pieces >= 3) { outp.Add(p2x); outp.Add(p2y); outp.Add(p2w); outp.Add(p2h); }
+            if (pieces >= 4) { outp.Add(p3x); outp.Add(p3y); outp.Add(p3w); outp.Add(p3h); }
+        }
+        return outp;
     }
     static List<int> Subtract(List<int> rects, int ox, int oy, int ow, int oh) {
         List<int> outp = new List<int>();

@@ -343,7 +343,13 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     }
     float scale = fx == 0 ? 1.0f : 1.0f / 256.0f;
     float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
-    float lo_x = (float)s->width, lo_y = (float)s->height, hi_x = 0, hi_y = 0;
+    float pad = half + 1.0f;
+    float cx0 = fmaxf(0.0f, (float)s->clip_x0);
+    float cy0 = fmaxf(0.0f, (float)s->clip_y0);
+    float cx1 = fminf((float)s->width, (float)s->clip_x1);
+    float cy1 = fminf((float)s->height, (float)s->clip_y1);
+    if (cx0 >= cx1 || cy0 >= cy1) return;
+    float lo_x = cx1, lo_y = cy1, hi_x = cx0, hi_y = cy0;
     int segments = 0;
     int off = 0;
     for (int p = 0; p < n_paths; p++) {
@@ -355,19 +361,21 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
             float by = (float)pts[off + i * 2 + 3] * scale;
             float dx = bx - ax, dy = by - ay;
             if (dx * dx + dy * dy < 0.0001f) continue;
+            float s_min_x = fminf(ax, bx) - pad, s_max_x = fmaxf(ax, bx) + pad;
+            float s_min_y = fminf(ay, by) - pad, s_max_y = fmaxf(ay, by) + pad;
+            if (s_max_x <= cx0 || s_min_x >= cx1 || s_max_y <= cy0 || s_min_y >= cy1) continue;
             segments++;
-            float pad = half + 1.0f;
-            lo_x = fminf(lo_x, fminf(ax, bx) - pad);
-            lo_y = fminf(lo_y, fminf(ay, by) - pad);
-            hi_x = fmaxf(hi_x, fmaxf(ax, bx) + pad);
-            hi_y = fmaxf(hi_y, fmaxf(ay, by) + pad);
+            lo_x = fminf(lo_x, s_min_x);
+            lo_y = fminf(lo_y, s_min_y);
+            hi_x = fmaxf(hi_x, s_max_x);
+            hi_y = fmaxf(hi_y, s_max_y);
         }
         off += n * 2;
     }
-    lo_x = fmaxf(lo_x, fmaxf(0.0f, (float)s->clip_x0));
-    lo_y = fmaxf(lo_y, fmaxf(0.0f, (float)s->clip_y0));
-    hi_x = fminf(hi_x, fminf((float)s->width, (float)s->clip_x1));
-    hi_y = fminf(hi_y, fminf((float)s->height, (float)s->clip_y1));
+    lo_x = fmaxf(lo_x, cx0);
+    lo_y = fmaxf(lo_y, cy0);
+    hi_x = fminf(hi_x, cx1);
+    hi_y = fminf(hi_y, cy1);
     if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
     int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
     int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
@@ -387,6 +395,7 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     gl.Disable(ZGL_SCISSOR_TEST);
     g_zgl.mode = ZGL_MODE_UNION;
     off = 0;
+    const size_t chunk_floats = (size_t)16384 * (size_t)ZGL_VF * 6;
     for (int p = 0; p < n_paths; p++) {
         int n = counts[p];
         for (int i = 0; n >= 2 && i + 1 < n; i++) {
@@ -396,7 +405,10 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
             float by = (float)pts[off + i * 2 + 3] * scale;
             float dx = bx - ax, dy = by - ay;
             if (dx * dx + dy * dy < 0.0001f) continue;
+            if (fmaxf(ax, bx) + pad <= cx0 || fminf(ax, bx) - pad >= cx1 ||
+                fmaxf(ay, by) + pad <= cy0 || fminf(ay, by) - pad >= cy1) continue;
             gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
+            if (g_zgl.count >= chunk_floats) zgl_flush();
         }
         off += n * 2;
     }

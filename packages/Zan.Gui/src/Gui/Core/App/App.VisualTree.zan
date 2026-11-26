@@ -9,7 +9,12 @@ public partial class App {
     Control capturedPointerControl;
     bool capturedDragGesture;
     Control lastHoveredControl;
+    weak Control lastDrawerHoverVisual;
+    bool lastDrawerHoverValid;
     Control pointerDownTarget;
+    Control gestureOriginControl;
+    Control routedDragSource;
+    bool routedDragStarted;
     long pressSnapshotSequence;
     bool pressSnapshotSequenceValid;
     int pointerGestureTicket;
@@ -109,7 +114,12 @@ public partial class App {
         capturedPointerControl = null;
         capturedDragGesture = false;
         pointerDownTarget = null;
+        gestureOriginControl = null;
+        routedDragSource = null;
+        routedDragStarted = false;
         lastHoveredControl = null;
+        lastDrawerHoverVisual = null;
+        lastDrawerHoverValid = false;
         clickHistorySuppressed = true;
         pointerDown = false;
         this.RetireRetainedLongPress();
@@ -145,17 +155,51 @@ public partial class App {
         }
         return hovered;
     }
+    Control DrawerHoverVisualTarget(Control hovered, int x, int y) {
+        if (hovered == null) { return null; }
+        Control target = this.HoverFocusTarget(hovered);
+        if (target == null) { return null; }
+        if (target.IsHoverVisualAt(x, y)) { return target; }
+        return null;
+    }
+    static Control CommonHoverAncestor(Control a, Control b) {
+        if (a == null || b == null) { return null; }
+        Control curr = a;
+        while (curr != null) {
+            if (curr == b || curr.ContainsInputControl(b)) { return curr; }
+            curr = curr.parent;
+        }
+        return null;
+    }
+    Control ResolvePointerClickTarget(Control target, Control captureOwner, Control inputRoot,
+                                      int x, int y, int pointerType) {
+        if (captureOwner != null) {
+            Control down = this.pointerDownTarget;
+            while (down != null && down != captureOwner) { down = down.parent; }
+            Control up = inputRoot != null ? inputRoot.HitTest(x, y, pointerType) : null;
+            while (up != null && up != captureOwner) { up = up.parent; }
+            if (down == captureOwner && up == captureOwner) { return captureOwner; }
+            return null;
+        }
+        return this.pointerDownTarget == target ? target : null;
+    }
     void SyncRoutedPointerState(int kind) {
         if (focus == null) { return; }
-        Control hovered = lastHoveredControl;
+        Control hovered = this.HoverFocusTarget(lastHoveredControl);
         Control pressed = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
         int oldHover = focus.hoveredId;
         focus.SetHovered(hovered != null ? hovered.WidgetId() : -1);
         focus.SetPressed(pressed != null ? pressed.WidgetId() : -1);
-        Control cursorControl = pressed != null ? pressed : hovered;
-        int cursor = cursorControl != null ? cursorControl.PointerCursor() : -1;
+        Control cursorNode = pressed != null ? pressed : lastHoveredControl;
+        int cursor = -1;
+        while (cursorNode != null) {
+            cursor = cursorNode.PointerCursor();
+            if (cursor >= 0) { break; }
+            cursorNode = cursorNode.parent;
+        }
         if (cursor == 0) { Window.SetCursor(1); }
         else if (cursor == 1) { Window.SetCursor(2); }
+        else if (cursor == 2) { Window.SetCursor(5); }
         else if (cursor == 4) { Window.SetCursor(3); }
         else if (cursor == 5) { Window.SetCursor(4); }
         else if (cursor == 6) { Window.SetCursor(6); }
@@ -223,7 +267,24 @@ public partial class App {
         routedWindowHandled = handled;
         routedWindowGestureTicket = dispatchTicket;
         if (dispatchTicket != pointerGestureTicket) { routedWindowHandled = true; }
-        if (routedWindowHandled && (!drawerHover || previousHover != lastHoveredControl
+        bool drawerHoverChanged = previousHover != lastHoveredControl;
+        if (drawerHover) {
+            int evX = window.EventX();
+            int evY = window.EventY();
+            Control nextVisual = this.DrawerHoverVisualTarget(lastHoveredControl, evX, evY);
+            Control prevVisual = lastDrawerHoverValid
+                ? lastDrawerHoverVisual
+                : this.DrawerHoverVisualTarget(previousHover, evX, evY);
+            drawerHoverChanged = prevVisual != nextVisual
+                || (previousHover != null && previousHover.Tip != "")
+                || (lastHoveredControl != null && lastHoveredControl.Tip != "");
+            lastDrawerHoverVisual = nextVisual;
+            lastDrawerHoverValid = true;
+        } else {
+            lastDrawerHoverVisual = null;
+            lastDrawerHoverValid = false;
+        }
+        if (routedWindowHandled && (!drawerHover || drawerHoverChanged
                 || dispatchTicket != pointerGestureTicket || !this.ThemeDrawerHover(pointerType))) {
             needsRedraw = true;
         }
@@ -273,6 +334,8 @@ public partial class App {
         } else if (root.ContainsInputControl(lastHoveredControl)) {
             Control hovered = lastHoveredControl;
             lastHoveredControl = null;
+        lastDrawerHoverVisual = null;
+        lastDrawerHoverValid = false;
             if (focus != null) { focus.ClearHover(); }
             RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, mouseX, mouseY, currentPointerType);
             Control.RouteEvent(hovered, leave);
@@ -310,6 +373,8 @@ public partial class App {
             else if (hoverLost) {
                 Control hovered = lastHoveredControl;
                 lastHoveredControl = null;
+        lastDrawerHoverVisual = null;
+        lastDrawerHoverValid = false;
                 if (focus != null) { focus.ClearHover(); }
                 RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, mouseX, mouseY, currentPointerType);
                 Control.RouteEvent(hovered, leave);
@@ -342,6 +407,17 @@ public partial class App {
             this.CancelRoutedPointer();
             if (focus != null) { focus.ClearFocus(); }
             overlayPressBlocked = false;
+            if (window.DropPending()) {
+                Control dropPopup = overlayHost != null ? overlayHost.ActiveRoot() : null;
+                Control dropRoot = dropPopup != null ? dropPopup : rootControl;
+                Control dropTarget = dropRoot != null ? dropRoot.HitTest(x, y, pointerType) : null;
+                if (dropTarget != null) {
+                    RoutedEventArgs dropEvt = new RoutedEventArgs("Drop", dropTarget, x, y, pointerType);
+                    dropEvt.modifiers = window.EventMods();
+                    Control.RouteEvent(dropTarget, dropEvt);
+                    return true;
+                }
+            }
         }
         if (overlayHost != null && overlayHost.HandleInput(this, eventKind, x, y, keyCode)) {
             this.CancelRoutedPointer();
@@ -382,6 +458,8 @@ public partial class App {
                             Control pressed = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
                             this.ReleasePointerCapture();
                             pointerDownTarget = null;
+                            routedDragSource = null;
+                            routedDragStarted = false;
                             if (focus != null) { focus.ClearPress(); }
                             RoutedEventArgs cancelEvt = new RoutedEventArgs("PointerCancel", pressed, x, y, pointerType);
                             Control.RouteEvent(pressed, cancelEvt);
@@ -394,13 +472,28 @@ public partial class App {
                 int hoverRootGeneration = inputRootGeneration;
                 if (this.lastHoveredControl != target) {
                     Control previousHover = this.lastHoveredControl;
+                    Control hoverLca = App.CommonHoverAncestor(previousHover, target);
                     if (focus != null) {
-                        this.Damage.NoteHoverDamage(previousHover, target);
+                        if (this.ThemeDrawerHover(pointerType)) {
+                            Control prevVisual = lastDrawerHoverValid
+                                ? lastDrawerHoverVisual
+                                : this.DrawerHoverVisualTarget(previousHover, x, y);
+                            Control nextVisual = this.DrawerHoverVisualTarget(target, x, y);
+                            bool tipEdge = (previousHover != null && previousHover.Tip != "")
+                                || (target != null && target.Tip != "");
+                            if (prevVisual != nextVisual || tipEdge) {
+                                this.Damage.NoteHoverDamage(
+                                    prevVisual != null ? prevVisual : previousHover,
+                                    nextVisual != null ? nextVisual : target);
+                            }
+                        } else {
+                            this.Damage.NoteHoverDamage(previousHover, target);
+                        }
                     }
                     this.lastHoveredControl = null;
-                    if (previousHover != null) {
+                    if (previousHover != null && previousHover != hoverLca) {
                         RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", previousHover, x, y, pointerType);
-                        Control.RouteEvent(previousHover, leave);
+                        Control.RouteEventTo(previousHover, leave, hoverLca);
                     }
                     if (!isRunning || window.EventSeq() != hoverSequence
                     || inputRootGeneration != hoverRootGeneration
@@ -417,8 +510,10 @@ public partial class App {
                             hoverNode = hoverNode.parent;
                         }
                         this.lastHoveredControl = target;
-                        RoutedEventArgs enter = new RoutedEventArgs("PointerEnter", target, x, y, pointerType);
-                        Control.RouteEvent(target, enter);
+                        if (target != hoverLca) {
+                            RoutedEventArgs enter = new RoutedEventArgs("PointerEnter", target, x, y, pointerType);
+                            Control.RouteEventTo(target, enter, hoverLca);
+                        }
                     }
                 }
                 if (!isRunning || window.EventSeq() != hoverSequence
@@ -451,6 +546,9 @@ public partial class App {
             }
             if (eventKind == 3) {
                 this.pointerDownTarget = null;
+                this.gestureOriginControl = null;
+                this.routedDragSource = null;
+                this.routedDragStarted = false;
                 pointerDown = false;
             }
             return popup != null;
@@ -468,6 +566,7 @@ public partial class App {
         e.keyCode = keyCode;
         e.modifiers = window.EventMods();
         e.delta = delta;
+        if (eventKind == 2 || eventKind == 3) { e.button = window.EventButton(); }
         if (eventKind == 3) {
             e.gestureApp = this;
             e.gestureTicket = dispatchTicket;
@@ -478,6 +577,11 @@ public partial class App {
         }
         if (eventKind == 2) { // PointerDown
             this.pointerDownTarget = target;
+            if (window.EventButton() != 1) {
+                this.gestureOriginControl = target;
+                this.routedDragSource = target;
+                this.routedDragStarted = false;
+            }
             if (pointerType == 1) { // 触控记录初次落点以计算防抖死区
                 this.touchDownX = x;
                 this.touchDownY = y;
@@ -505,38 +609,127 @@ public partial class App {
         if (dispatchTicket != pointerGestureTicket) { return true; }
         Control.RouteEvent(target, e);
         if (dispatchTicket != pointerGestureTicket) { return true; }
-        if (eventKind == 3 && target != null && !e.handled && window.EventButton() != 1) {
-            bool allowClick = !this.HasLongPressFired();
-            if (pointerType == 1 && this.touchSlopExceeded) { allowClick = false; }
-            Control clickTarget = null;
-            if (captureOwner != null) {
-                Control down = this.pointerDownTarget;
-                while (down != null && down != captureOwner) { down = down.parent; }
-                Control up = inputRoot != null ? inputRoot.HitTest(x, y, pointerType) : null;
-                while (up != null && up != captureOwner) { up = up.parent; }
-                if (down == captureOwner && up == captureOwner) { clickTarget = captureOwner; }
-            } else if (this.pointerDownTarget == target) {
-                clickTarget = target;
-            }
-            if (!allowClick || clickTarget == null) { clickHistorySuppressed = true; }
-            if (allowClick && clickTarget != null) {
-                bool primaryDoubleClick = false;
-                if (window.EventButton() == 0) {
-                    this.NoteClickAt(clickTarget.WidgetId(), x, y);
-                    primaryDoubleClick = this.IsDoubleClickNow();
+        if (eventKind == 1 && !e.handled && pointerDown && routedDragSource != null
+                && dispatchTicket == pointerGestureTicket) {
+            int dragDx = x - pressStartX;
+            int dragDy = y - pressStartY;
+            if (dragDx * dragDx + dragDy * dragDy >= TOUCH_SLOP_PX * TOUCH_SLOP_PX
+                    && this.PointerEndpointCurrent(routedDragSource, inputRoot)) {
+                if (!routedDragStarted) {
+                    routedDragStarted = true;
+                    RoutedEventArgs dragStartEvt = new RoutedEventArgs("DragStart", routedDragSource, x, y, pointerType);
+                    dragStartEvt.modifiers = e.modifiers;
+                    dragStartEvt.gestureApp = this;
+                    dragStartEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(routedDragSource, dragStartEvt);
+                    if (dispatchTicket != pointerGestureTicket) { return true; }
                 }
-                RoutedEventArgs clickEvt = new RoutedEventArgs("Click", clickTarget, x, y, pointerType);
-                clickEvt.modifiers = e.modifiers;
-                clickEvt.isDoubleClick = primaryDoubleClick;
-                clickEvt.gestureApp = this;
-                clickEvt.gestureTicket = dispatchTicket;
-                Control.RouteEvent(clickTarget, clickEvt);
-                if (clickEvt.handled) { e.Handle(); }
+                if (routedDragStarted && this.PointerEndpointCurrent(routedDragSource, inputRoot)) {
+                    RoutedEventArgs dragEvt = new RoutedEventArgs("Drag", routedDragSource, x, y, pointerType);
+                    dragEvt.modifiers = e.modifiers;
+                    dragEvt.gestureApp = this;
+                    dragEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(routedDragSource, dragEvt);
+                    if (dispatchTicket != pointerGestureTicket) { return true; }
+                }
+            }
+        }
+        if (eventKind == 3 && target != null && !e.handled) {
+            Control clickTarget = this.ResolvePointerClickTarget(target, captureOwner, inputRoot, x, y, pointerType);
+            if (window.EventButton() == 0) {
+                bool allowClick = !this.HasLongPressFired();
+                if (pointerType == 1 && this.touchSlopExceeded) { allowClick = false; }
+                if (!allowClick || clickTarget == null) { clickHistorySuppressed = true; }
+                if (allowClick && clickTarget != null) {
+                    this.NoteClickAt(clickTarget.WidgetId(), x, y);
+                    bool primaryDoubleClick = this.IsDoubleClickNow();
+                    RoutedEventArgs clickEvt = new RoutedEventArgs("Click", clickTarget, x, y, pointerType);
+                    clickEvt.button = 0;
+                    clickEvt.modifiers = e.modifiers;
+                    clickEvt.isDoubleClick = primaryDoubleClick;
+                    clickEvt.gestureApp = this;
+                    clickEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(clickTarget, clickEvt);
+                    if (clickEvt.handled) { e.Handle(); }
+                    if (pointerType == 1 && dispatchTicket == pointerGestureTicket
+                            && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
+                        RoutedEventArgs tapEvt = new RoutedEventArgs("Tap", clickTarget, x, y, pointerType);
+                        tapEvt.button = 0;
+                        tapEvt.modifiers = e.modifiers;
+                        tapEvt.gestureApp = this;
+                        tapEvt.gestureTicket = dispatchTicket;
+                        Control.RouteEvent(clickTarget, tapEvt);
+                    }
+                    if (primaryDoubleClick && dispatchTicket == pointerGestureTicket
+                            && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
+                        RoutedEventArgs dblEvt = new RoutedEventArgs("DoubleClick", clickTarget, x, y, pointerType);
+                        dblEvt.button = 0;
+                        dblEvt.modifiers = e.modifiers;
+                        dblEvt.isDoubleClick = true;
+                        dblEvt.gestureApp = this;
+                        dblEvt.gestureTicket = dispatchTicket;
+                        Control.RouteEvent(clickTarget, dblEvt);
+                    }
+                }
+            } else if (window.EventButton() == 1 && clickTarget != null) {
+                this.NoteRightClickAt(clickTarget.WidgetId(), x, y);
+                bool rightDoubleClick = this.IsRightDoubleClickNow();
+                RoutedEventArgs rightEvt = new RoutedEventArgs("RightClick", clickTarget, x, y, pointerType);
+                rightEvt.button = 1;
+                rightEvt.modifiers = e.modifiers;
+                rightEvt.isDoubleClick = rightDoubleClick;
+                rightEvt.gestureApp = this;
+                rightEvt.gestureTicket = dispatchTicket;
+                Control.RouteEvent(clickTarget, rightEvt);
+                if (rightEvt.handled) { e.Handle(); }
+                if (rightDoubleClick && dispatchTicket == pointerGestureTicket
+                        && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
+                    RoutedEventArgs rightDblEvt = new RoutedEventArgs("RightDoubleClick", clickTarget, x, y, pointerType);
+                    rightDblEvt.button = 1;
+                    rightDblEvt.modifiers = e.modifiers;
+                    rightDblEvt.isDoubleClick = true;
+                    rightDblEvt.gestureApp = this;
+                    rightDblEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(clickTarget, rightDblEvt);
+                    if (rightDblEvt.handled) { e.Handle(); }
+                }
+            }
+            if (routedDragStarted && window.EventButton() != 1
+                    && dispatchTicket == pointerGestureTicket) {
+                Control dropTarget = inputRoot != null ? inputRoot.HitTest(x, y, pointerType) : null;
+                if (dropTarget == null) { dropTarget = routedDragSource; }
+                if (dropTarget != null && this.PointerEndpointCurrent(dropTarget, inputRoot)) {
+                    RoutedEventArgs dropEvt = new RoutedEventArgs("Drop", dropTarget, x, y, pointerType);
+                    dropEvt.modifiers = e.modifiers;
+                    dropEvt.gestureApp = this;
+                    dropEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(dropTarget, dropEvt);
+                }
+            }
+            if (pointerType == 1 && touchSlopExceeded && gestureOriginControl != null
+                    && dispatchTicket == pointerGestureTicket) {
+                int sdx = x - touchDownX;
+                int sdy = y - touchDownY;
+                if (sdx * sdx + sdy * sdy >= 30 * 30
+                        && this.PointerEndpointCurrent(gestureOriginControl, inputRoot)) {
+                    int absDx = sdx < 0 ? 0 - sdx : sdx;
+                    int absDy = sdy < 0 ? 0 - sdy : sdy;
+                    int dir = absDx >= absDy ? (sdx > 0 ? 1 : 0 - 1) : (sdy > 0 ? 2 : 0 - 2);
+                    RoutedEventArgs swipeEvt = new RoutedEventArgs("Swipe", gestureOriginControl, x, y, pointerType);
+                    swipeEvt.modifiers = e.modifiers;
+                    swipeEvt.delta = dir;
+                    swipeEvt.gestureApp = this;
+                    swipeEvt.gestureTicket = dispatchTicket;
+                    Control.RouteEvent(gestureOriginControl, swipeEvt);
+                }
             }
         }
         if (dispatchTicket != pointerGestureTicket) { return true; }
         if (eventKind == 3) {
             this.pointerDownTarget = null;
+            this.gestureOriginControl = null;
+            this.routedDragSource = null;
+            this.routedDragStarted = false;
             if (pointerType == 1 && this.lastHoveredControl != null) {
                 Control hovered = this.lastHoveredControl;
                 this.lastHoveredControl = null;

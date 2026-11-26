@@ -236,6 +236,35 @@ static void zc_ns_set_id(void *obj, const char *name, void *value) {
     send(obj, zc_ns.sel(name), value);
 }
 
+static unsigned long zc_ns_ulong(void *obj, const char *name) {
+    if (!obj || !zc_ns_init()) return 0;
+    unsigned long (*send)(void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    return send(obj, zc_ns.sel(name));
+}
+
+static void *zc_ns_object_at(void *obj, unsigned long idx) {
+    if (!obj || !zc_ns_init()) return NULL;
+    void *(*send)(void *, void *, unsigned long) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    return send(obj, zc_ns.sel("objectAtIndex:"), idx);
+}
+
+/* 原生玻璃模式会把 window.contentView 换成未翻转的 NSVisualEffectView，
+ * 此时真正的顶层绘制/翻转宿主视图 ZanView 位于其 subviews 中。 */
+static void *zc_mac_host_view(void *window) {
+    void *pview = zc_ns_id(window, "contentView");
+    if (!pview || zc_ns_bool(pview, "isFlipped")) return pview;
+    void *subs = zc_ns_id(pview, "subviews");
+    if (!subs) return pview;
+    unsigned long n = zc_ns_ulong(subs, "count");
+    for (unsigned long i = 0; i < n; i++) {
+        void *sub = zc_ns_object_at(subs, i);
+        if (sub && zc_ns_bool(sub, "isFlipped")) return sub;
+    }
+    return pview;
+}
+
 /* macOS 下 Chromium 消息泵与 NSApp 事件循环的协议适配 */
 static int zc_app_sending_event;
 
@@ -1200,23 +1229,33 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
         wi.style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
     }
 #elif defined(__APPLE__)
-    /* macOS 平台下绑定父 NSView 容器视图 */
+    /* macOS 平台下绑定父 NSView 容器视图（原生玻璃激活时避开背景 NSVisualEffectView） */
     {
-        void *pview = zc_ns_id((void *)parent, "contentView");
+        void *pview = zc_mac_host_view((void *)parent);
         wi.parent_view = (cef_window_handle_t)pview;
         if (zc_log_on()) {
             zc_rect_t pb = zc_ns_rect(pview, "bounds");
-            fprintf(stderr, "[zan_cef] embed parent=%p contentView=%p "
+            fprintf(stderr, "[zan_cef] embed parent=%p hostView=%p "
                             "bounds=%.0fx%.0f flipped=%d req=%d,%d %dx%d\n",
                     parent, pview, pb.w, pb.h, zc_ns_bool(pview, "isFlipped"),
                     x, y, w, h);
         }
         if (pview) {
             double sc = zc_view_scale(pview);
-            wi.bounds.x = (int)((double)wi.bounds.x / sc);
-            wi.bounds.y = (int)((double)wi.bounds.y / sc);
-            wi.bounds.width = (int)((double)wi.bounds.width / sc);
-            wi.bounds.height = (int)((double)wi.bounds.height / sc);
+            double px = (double)wi.bounds.x / sc;
+            double py = (double)wi.bounds.y / sc;
+            double pw = (double)wi.bounds.width / sc;
+            double ph = (double)wi.bounds.height / sc;
+            if (pw < 1.0) pw = 1.0;
+            if (ph < 1.0) ph = 1.0;
+            if (!zc_ns_bool(pview, "isFlipped")) {
+                zc_rect_t pb = zc_ns_rect(pview, "bounds");
+                py = pb.h - (py + ph);
+            }
+            wi.bounds.x = (int)px;
+            wi.bounds.y = (int)py;
+            wi.bounds.width = (int)pw;
+            wi.bounds.height = (int)ph;
             if (wi.bounds.width < 1) wi.bounds.width = 1;
             if (wi.bounds.height < 1) wi.bounds.height = 1;
         }
@@ -1410,16 +1449,15 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
 
 #ifdef __APPLE__
 /* 通过窗口遮罩区域剔除宿主控件覆盖部分的浏览器视图 */
-static void zc_mac_clip(zc_browser_t *b, const char *spec) {
+static int zc_mac_clip(zc_browser_t *b, const char *spec) {
     void *wnd = zan_cef_window(b->id);
-    if (!wnd || !zc_cg_init()) return;
-    if (b->clip_spec && strcmp(b->clip_spec, spec) == 0) return;
+    if (!wnd || !zc_cg_init()) return 1;
+    if (b->clip_spec && strcmp(b->clip_spec, spec) == 0) return 1;
     zc_rect_t fr = zc_ns_rect(wnd, "frame");
-    if (fr.w <= 0.0 || fr.h <= 0.0) return;
+    if (fr.w <= 0.0 || fr.h <= 0.0) return 1;
     double sc = zc_view_scale(wnd);
-    int flipped = zc_ns_bool(wnd, "isFlipped");
     void *path = zc_cg.path_create();
-    if (!path) return;
+    if (!path) return 1;
     int rects = 0, whole = 0;
     const char *p = spec;
     while (*p) {
@@ -1442,17 +1480,20 @@ static void zc_mac_clip(zc_browser_t *b, const char *spec) {
         r.w = (double)v[2] / sc;
         r.h = (double)v[3] / sc;
         double top = ((double)v[1] - (double)b->by) / sc;
-        r.y = flipped ? top : fr.h - top - r.h;
+        /* CAShapeLayer 显式保持未翻转（底左原点）坐标系 */
+        r.y = fr.h - top - r.h;
         zc_cg.path_add_rect(path, NULL, r);
         rects++;
-        if (r.x <= 0.0 && r.y <= 0.0 && r.x + r.w >= fr.w
-            && r.y + r.h >= fr.h) {
+        if (r.x <= 0.0 && top <= 0.0 && r.x + r.w >= fr.w
+            && top + r.h >= fr.h) {
             whole = 1;
         }
     }
     if (rects == 0) {
         zc_cg.path_release(path);
-        return;
+        free(b->clip_spec);
+        b->clip_spec = NULL;
+        return 0;
     }
     zc_ns_set_bool(wnd, "setWantsLayer:", 1);
     void *layer = zc_ns_id(wnd, "layer");
@@ -1462,6 +1503,7 @@ static void zc_mac_clip(zc_browser_t *b, const char *spec) {
         } else {
             void *shape = zc_ns_id(zc_ns_class("CAShapeLayer"), "layer");
             if (shape) {
+                zc_ns_set_bool(shape, "setGeometryFlipped:", 0);
                 zc_ns_set_frame(shape, zc_ns_rect(layer, "bounds"));
                 zc_ns_set_id(shape, "setPath:", path);
                 zc_ns_set_id(layer, "setMask:", shape);
@@ -1471,6 +1513,7 @@ static void zc_mac_clip(zc_browser_t *b, const char *spec) {
     zc_cg.path_release(path);
     free(b->clip_spec);
     b->clip_spec = zc_dup(spec, strlen(spec));
+    return 1;
 }
 #endif
 
@@ -1526,7 +1569,7 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
     }
 #elif defined(__APPLE__)
     /* macOS 下保持浏览器视图与宿主软件画布的层级同步 */
-    if (visible) zc_mac_clip(b, spec);
+    if (visible && !zc_mac_clip(b, spec)) visible = 0;
 #endif
     zan_cef_set_visible(h, visible);
 }

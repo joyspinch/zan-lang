@@ -7007,7 +7007,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       designer_typed_props_adapter scrollcolumn_cull_measure
       control_input_host_reentry dockhost_preparation_geometry browser_hosted_lifecycle
       app_loop_participant browser_native_lifecycle overlay_escape_input
-      routed_click_doubleclick scroll_geometry_input)
+      routed_click_doubleclick scroll_geometry_input caption_feedback_and_events)
     add_test(NAME conformance_gui_${_routing_case}
       COMMAND ${CMAKE_COMMAND}
         -DZANC=$<TARGET_FILE:zanc>
@@ -7455,6 +7455,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_theme_drawer_retained_input PROPERTIES
+    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+
+  add_test(NAME conformance_gui_native_layer_occlusion
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/native_layer_occlusion_test.zan
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/native_layer_occlusion_test.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_native_layer_occlusion${_exe_ext}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_native_layer_occlusion PROPERTIES
     TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
   add_test(NAME conformance_guihost_loop

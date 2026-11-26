@@ -1,6 +1,7 @@
 #if !WINDOWS
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Gui;
 namespace Gui.Backend;
 public class CapiPlatform : IPlatformWindow, IPlatformShell {
@@ -197,24 +198,55 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     [DllImport("zan_gui")]
     static extern string zan_gui_ime_composing();
     #endif
-    #if ANDROID
+    #if MACOS || ANDROID
     static bool refreshQueryResolved;
     static nint refreshQuery;
     static bool optionalGuiDriverResolved;
     static nint optionalGuiDriver;
+    #endif
+    #if ANDROID
     static bool displayFrameResolved;
     static nint displayFrameRequest;
     static nint displayFrameTake;
     #endif
+    #if MACOS
+    static bool macOptionalResolved;
+    static nint fnDpiScaleWin;
+    static nint fnDpiRevision;
+    static nint fnSetRoundCorners;
+    static nint fnSetMinSize;
+    static nint fnSetResizable;
+    static nint fnSetMaximizable;
+    static nint fnSetTitlebarHeight;
+    static nint fnSetCaptionZone;
+    static nint fnGetTickUs;
+    static Dict<nint, int> macTitlebarLogical;
+    #endif
     static SizePaintBody sizePaintUnused;
-    #if ANDROID
+    #if MACOS || ANDROID
     static nint OptionalGuiEntry(string symbol) {
         if (!CapiPlatform.optionalGuiDriverResolved) {
             CapiPlatform.optionalGuiDriverResolved = true;
+            #if ANDROID
             CapiPlatform.optionalGuiDriver = Interop.Load("libzan_gui.so");
+            #else
+            string dir = ProcessHost.AppDir();
+            if (dir != "") {
+                CapiPlatform.optionalGuiDriver = Interop.Load(dir + "/libzan_gui.dylib");
+            }
+            if (CapiPlatform.optionalGuiDriver == 0) {
+                CapiPlatform.optionalGuiDriver = Interop.Load("libzan_gui.dylib");
+            }
+            if (CapiPlatform.optionalGuiDriver == 0) {
+                CapiPlatform.optionalGuiDriver = Interop.PosixLoad(null, Interop.RtldNowLocal());
+            }
+            #endif
         }
+        if (CapiPlatform.optionalGuiDriver == 0) { return 0; }
         return Interop.Symbol(CapiPlatform.optionalGuiDriver, symbol);
     }
+    #endif
+    #if ANDROID
     static void ResolveDisplayFrame() {
         if (CapiPlatform.displayFrameResolved) { return; }
         CapiPlatform.displayFrameResolved = true;
@@ -222,8 +254,29 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
         CapiPlatform.displayFrameTake = CapiPlatform.OptionalGuiEntry("zan_gui_take_display_frame");
     }
     #endif
+    #if MACOS
+    static void ResolveMacOptional() {
+        if (CapiPlatform.macOptionalResolved) { return; }
+        CapiPlatform.macOptionalResolved = true;
+        CapiPlatform.fnDpiScaleWin = CapiPlatform.OptionalGuiEntry("zan_gui_get_dpi_scale_win");
+        CapiPlatform.fnDpiRevision = CapiPlatform.OptionalGuiEntry("zan_gui_dpi_revision");
+        CapiPlatform.fnSetRoundCorners = CapiPlatform.OptionalGuiEntry("zan_gui_set_round_corners");
+        CapiPlatform.fnSetMinSize = CapiPlatform.OptionalGuiEntry("zan_gui_set_min_size");
+        CapiPlatform.fnSetResizable = CapiPlatform.OptionalGuiEntry("zan_gui_set_resizable");
+        CapiPlatform.fnSetMaximizable = CapiPlatform.OptionalGuiEntry("zan_gui_set_maximizable");
+        CapiPlatform.fnSetTitlebarHeight = CapiPlatform.OptionalGuiEntry("zan_gui_set_titlebar_height");
+        CapiPlatform.fnSetCaptionZone = CapiPlatform.OptionalGuiEntry("zan_gui_set_caption_zone");
+        CapiPlatform.fnGetTickUs = CapiPlatform.OptionalGuiEntry("zan_gui_get_tick_us");
+    }
+    #endif
     public nint CreateWindow(string title, int width, int height) {
+        #if MACOS
+        int scale = zan_gui_get_dpi_scale();
+        if (scale < 100) { scale = 100; }
+        return zan_gui_create_window(title, width * scale / 100, height * scale / 100);
+        #else
         return zan_gui_create_window(title, width, height);
+        #endif
     }
     public nint CreateWindowPhysical(string title, int width, int height) {
         return zan_gui_create_window(title, width, height);
@@ -232,9 +285,53 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     public void SetCloseIntercept(nint hwnd, bool on) {
     }
     public void SetPosition(nint hwnd, int x, int y) { zan_gui_set_window_pos(hwnd, x, y); }
-    public int DpiScale(nint hwnd) { return zan_gui_get_dpi_scale(); }
-    public int TitlebarHeight(nint hwnd) { return zan_gui_titlebar_height(); }
-    public int CaptionButtonWidth(nint hwnd) { return zan_gui_caption_button_width(); }
+    public int DpiScale(nint hwnd) {
+        #if MACOS
+        if (hwnd != 0) {
+            CapiPlatform.ResolveMacOptional();
+            if (CapiPlatform.fnDpiScaleWin != 0) {
+                WindowIntFn fn = (WindowIntFn)CapiPlatform.fnDpiScaleWin;
+                int s = fn(hwnd);
+                if (s >= 100) { return s; }
+            }
+        }
+        #endif
+        return zan_gui_get_dpi_scale();
+    }
+    public int DpiRevision(nint hwnd) {
+        #if MACOS
+        if (hwnd != 0) {
+            CapiPlatform.ResolveMacOptional();
+            if (CapiPlatform.fnDpiRevision != 0) {
+                WindowIntFn fn = (WindowIntFn)CapiPlatform.fnDpiRevision;
+                return fn(hwnd);
+            }
+        }
+        #endif
+        return 0;
+    }
+    public int TitlebarHeight(nint hwnd) {
+        #if MACOS
+        int scale = this.DpiScale(hwnd);
+        if (scale < 100) { scale = 100; }
+        int logical = 32;
+        if (hwnd != 0 && CapiPlatform.macTitlebarLogical != null && CapiPlatform.macTitlebarLogical.ContainsKey(hwnd)) {
+            logical = CapiPlatform.macTitlebarLogical[hwnd];
+        }
+        return logical * scale / 100;
+        #else
+        return zan_gui_titlebar_height();
+        #endif
+    }
+    public int CaptionButtonWidth(nint hwnd) {
+        #if MACOS
+        int scale = this.DpiScale(hwnd);
+        if (scale < 100) { scale = 100; }
+        return 46 * scale / 100;
+        #else
+        return zan_gui_caption_button_width();
+        #endif
+    }
     public void ResizeClient(nint hwnd, int w, int h) {
         #if (LINUX && !ANDROID && !OHOS) || MACOS
         zan_gui_resize_client(hwnd, w, h);
@@ -243,7 +340,7 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     public void ResizeClientExact(nint hwnd, int wDev, int hDev) { this.ResizeClient(hwnd, wDev, hDev); }
     public void Center(nint hwnd) { zan_gui_center_window(hwnd); }
     public double RefreshRate(nint hwnd) {
-        #if ANDROID
+        #if ANDROID || MACOS
         if (!CapiPlatform.refreshQueryResolved) {
             CapiPlatform.refreshQueryResolved = true;
             CapiPlatform.refreshQuery = CapiPlatform.OptionalGuiEntry("zan_gui_refresh_rate");
@@ -285,7 +382,12 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     public void Minimize(nint hwnd) { zan_gui_minimize(hwnd); }
     public void ToggleMaximize(nint hwnd) { zan_gui_toggle_maximize(hwnd); }
     public void Close(nint hwnd) { zan_gui_close_window(hwnd); }
-    public void Destroy(nint hwnd) { zan_gui_destroy_window(hwnd); }
+    public void Destroy(nint hwnd) {
+        #if MACOS
+        if (CapiPlatform.macTitlebarLogical != null) { CapiPlatform.macTitlebarLogical.Remove(hwnd); }
+        #endif
+        zan_gui_destroy_window(hwnd);
+    }
     public bool IsMaximized(nint hwnd) { return zan_gui_is_maximized(hwnd) != 0; }
     public bool IsVisible(nint hwnd) { return zan_gui_window_visible(hwnd) != 0; }
     public bool IsFocused(nint hwnd) { return zan_gui_window_focused(hwnd) != 0; }
@@ -302,6 +404,13 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
         }
     }
     public void SetRoundCorners(nint hwnd, bool on) {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetRoundCorners != 0) {
+            WindowSetIntFn fn = (WindowSetIntFn)CapiPlatform.fnSetRoundCorners;
+            fn(hwnd, on ? 1 : 0);
+        }
+        #endif
     }
     public void SetTopmost(nint hwnd, bool on) {
         int v = 0;
@@ -309,10 +418,35 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
         zan_gui_set_topmost(hwnd, v);
     }
     public void SetMinSize(nint hwnd, int minW, int minH) {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetMinSize != 0) {
+            int scale = this.DpiScale(hwnd);
+            if (scale < 100) { scale = 100; }
+            int pw = minW > 0 ? minW * scale / 100 : 0;
+            int ph = minH > 0 ? minH * scale / 100 : 0;
+            WindowSetTwoIntFn fn = (WindowSetTwoIntFn)CapiPlatform.fnSetMinSize;
+            fn(hwnd, pw, ph);
+        }
+        #endif
     }
     public void SetResizable(nint hwnd, bool on) {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetResizable != 0) {
+            WindowSetIntFn fn = (WindowSetIntFn)CapiPlatform.fnSetResizable;
+            fn(hwnd, on ? 1 : 0);
+        }
+        #endif
     }
     public void SetMaximizable(nint hwnd, bool on) {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetMaximizable != 0) {
+            WindowSetIntFn fn = (WindowSetIntFn)CapiPlatform.fnSetMaximizable;
+            fn(hwnd, on ? 1 : 0);
+        }
+        #endif
     }
     public void SetToolWindow(nint hwnd, bool on) {
     }
@@ -323,8 +457,33 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
         zan_gui_add_hit_guard(hwnd, x, y, w, h);
     }
     public void SetTitlebarHeight(nint hwnd, int devicePx) {
+        #if MACOS
+        if (hwnd != 0 && devicePx > 0) {
+            int scale = this.DpiScale(hwnd);
+            if (scale < 100) { scale = 100; }
+            int logical = (devicePx * 100 + scale - 1) / scale;
+            if (logical > 32) {
+                if (CapiPlatform.macTitlebarLogical == null) {
+                    CapiPlatform.macTitlebarLogical = new Dict<nint, int>();
+                }
+                CapiPlatform.macTitlebarLogical[hwnd] = logical;
+            }
+        }
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetTitlebarHeight != 0) {
+            WindowSetIntFn fn = (WindowSetIntFn)CapiPlatform.fnSetTitlebarHeight;
+            fn(hwnd, devicePx);
+        }
+        #endif
     }
     public void SetCaptionZone(nint hwnd, int width) {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnSetCaptionZone != 0) {
+            WindowSetIntFn fn = (WindowSetIntFn)CapiPlatform.fnSetCaptionZone;
+            fn(hwnd, width);
+        }
+        #endif
     }
     public void ForbidLayered(nint hwnd) {
     }
@@ -362,7 +521,16 @@ public class CapiPlatform : IPlatformWindow, IPlatformShell {
     }
     public bool DropPending() { return zan_gui_drop_pending() != 0; }
     public int RawTickMs() { return (int)zan_gui_get_tick_ms(); }
-    public int GetTickUs() { return (int)zan_gui_get_tick_ms() * 1000; }
+    public int GetTickUs() {
+        #if MACOS
+        CapiPlatform.ResolveMacOptional();
+        if (CapiPlatform.fnGetTickUs != 0) {
+            GuiGetTickUsFn fn = (GuiGetTickUsFn)CapiPlatform.fnGetTickUs;
+            return (int)fn();
+        }
+        #endif
+        return (int)zan_gui_get_tick_ms() * 1000;
+    }
     public void SleepMs(int ms) { zan_gui_sleep_ms(ms); }
     public void SetCursor(int cursorType) { zan_gui_set_cursor(cursorType); }
     public void SetSizePaint(SizePaintBody body) { CapiPlatform.sizePaintUnused = body; }

@@ -1,0 +1,248 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class EventSinkPanel : Panel {
+    public int clicks;
+    public int doubleClicks;
+    public int rightClicks;
+    public int rightDoubleClicks;
+    public int keyPresses;
+    public int taps;
+    public int swipes;
+    public int lastSwipeDelta;
+    public int dragStarts;
+    public int drags;
+    public int drops;
+    public int lastButton;
+    public int lastModifiers;
+    public bool allowSwipe;
+
+    public EventSinkPanel() {
+        this.InitControl("eventSink");
+        this.lastButton = -1;
+    }
+
+    public override int InputFocusCapabilities() { return 1; }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "Click") { clicks = clicks + 1; lastButton = e.button; lastModifiers = e.modifiers; }
+        else if (e.eventName == "DoubleClick") { doubleClicks = doubleClicks + 1; lastButton = e.button; lastModifiers = e.modifiers; }
+        else if (e.eventName == "RightClick") { rightClicks = rightClicks + 1; lastButton = e.button; lastModifiers = e.modifiers; }
+        else if (e.eventName == "RightDoubleClick") { rightDoubleClicks = rightDoubleClicks + 1; lastButton = e.button; lastModifiers = e.modifiers; }
+        else if (e.eventName == "KeyPress") { keyPresses = keyPresses + 1; }
+        else if (e.eventName == "Tap") { taps = taps + 1; }
+        else if (e.eventName == "Swipe") { swipes = swipes + 1; lastSwipeDelta = e.delta; }
+        else if (e.eventName == "DragStart") { dragStarts = dragStarts + 1; }
+        else if (e.eventName == "Drag") { drags = drags + 1; }
+        else if (e.eventName == "Drop") { drops = drops + 1; }
+        base.OnRoutedEvent(e);
+    }
+}
+
+class CaptionFeedbackAndEventsTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("caption_feedback_and_events: " + label); }
+    }
+
+    static void Pump(App app) {
+        while (true) {
+            Action a = Dispatcher.Take();
+            if (a == null) { break; }
+            a();
+        }
+    }
+
+    static void MoveForm(Form form, App app, int x, int y) {
+        form.ProcessOffscreenInput(1, x, y, 0, 0, 0, 0);
+        Pump(app);
+    }
+
+    static void ClickPair(App app, int x, int y, int button, int mods, int flag) {
+        app.ProcessOffscreenInput(2, x, y, button, 0, mods, flag);
+        app.ProcessOffscreenInput(3, x, y, button, 0, mods, flag);
+        Pump(app);
+    }
+
+    static void TestCaptionFeedback() {
+        Form form = Form.CreateOffscreen("Caption feedback", 640, 240);
+        App app = form.GetApp();
+        app.showChrome = true;
+        app.SetThemeSettingsAction((App a) => { });
+        app.SetChromeButtons(true, true, true, true);
+        app.showCloseButton = true;
+        app.dpiScale = 100;
+        app.titlebarH = 32;
+        app.captionBtnW = 46;
+        form.CaptureSnapshot();
+
+        Button closeBtn = app.chromeClose;
+        Button minBtn = app.chromeMinimize;
+        Button pinBtn = app.chromePin;
+        Check(closeBtn != null && minBtn != null && pinBtn != null, "chrome buttons created");
+
+        StyleBox normalMin = minBtn.BoxState(app, Style.SNormal());
+        StyleBox hoverMin = minBtn.BoxState(app, Style.SHover());
+        StyleBox activeMin = minBtn.BoxState(app, Style.SHover() | Style.SActive());
+        Check(normalMin.bg == 0 && normalMin.borderW == 0 && normalMin.shadow == 0,
+            "normal caption button is flat transparent");
+        Check(hoverMin.bg != 0 && hoverMin.bg == app.theme.bgHover && hoverMin.borderW == 0,
+            "hover caption button gets bg-hover without border");
+        Check(activeMin.bg != 0 && activeMin.bg == app.theme.bgActive && activeMin.borderW == 0,
+            "active caption button gets bg-active without border");
+
+        StyleBox normalClose = closeBtn.BoxState(app, Style.SNormal());
+        StyleBox hoverClose = closeBtn.BoxState(app, Style.SHover());
+        StyleBox activeClose = closeBtn.BoxState(app, Style.SHover() | Style.SActive());
+        Check(normalClose.bg == 0 && normalClose.borderW == 0,
+            "normal close caption button is transparent");
+        Check(hoverClose.bg == ColorMath.WithAlpha(Theme.Rgb(232, 17, 35), 255)
+            && hoverClose.fg == app.theme.onScrim && hoverClose.borderW == 0,
+            "hover close caption button uses Windows red fill and on-scrim fg");
+        Check(activeClose.bg != 0 && activeClose.bg != hoverClose.bg && activeClose.fg == app.theme.onScrim,
+            "active close caption button uses pressed red fill");
+
+        app.isTopmost = true;
+        form.CaptureSnapshot();
+        StyleBox selectedPin = pinBtn.BoxState(app, Style.SNormal());
+        Check(selectedPin.fg == app.theme.primary, "selected pin caption uses primary fg");
+
+        // Brutal skin must not put thick borders, hard shadows, or press jumps on caption buttons.
+        app.ApplySkinName("brutal");
+        form.CaptureSnapshot();
+        StyleBox brutalHoverClose = closeBtn.BoxState(app, Style.SHover());
+        StyleBox brutalActiveClose = closeBtn.BoxState(app, Style.SHover() | Style.SActive());
+        Check(brutalHoverClose.shadow == 0 && brutalHoverClose.borderW == 0,
+            "brutal skin skips hard shadow and border on caption hover");
+        Check(brutalActiveClose.tx == 0 && brutalActiveClose.ty == 0 && brutalActiveClose.borderW == 0,
+            "brutal skin skips press translation on caption active");
+
+        // Composite IconView inside chromeClose must resolve hover/cursor/Enter/Leave cleanly.
+        int closeEnters = 0;
+        int closeLeaves = 0;
+        closeBtn.OnEnter(() => { closeEnters = closeEnters + 1; });
+        closeBtn.OnLeave(() => { closeLeaves = closeLeaves + 1; });
+
+        int cx = closeBtn.bx + closeBtn.bw / 2;
+        int cy = closeBtn.by + closeBtn.bh / 2;
+        MoveForm(form, app, cx, cy);
+        Check(app.focus.IsHovered(closeBtn.WidgetId()) && closeBtn.IsHovered(app),
+            "hovering child IconView sets hover on parent chromeClose");
+        Check(closeEnters == 1 && closeLeaves == 0, "entering IconView enters chromeClose once");
+
+        // Move to padding edge of chromeClose (leaving IconView, staying in chromeClose).
+        MoveForm(form, app, closeBtn.bx + 2, closeBtn.by + 2);
+        Check(app.focus.IsHovered(closeBtn.WidgetId()) && closeBtn.IsHovered(app),
+            "moving from IconView to Button padding keeps chromeClose hovered");
+        Check(closeEnters == 1 && closeLeaves == 0,
+            "moving between IconView and Button does not fire spurious Leave/Enter");
+
+        // Move off window (simulating WM_MOUSELEAVE / WM_NCMOUSEMOVE).
+        MoveForm(form, app, -10000, -10000);
+        Check(!app.focus.IsHovered(closeBtn.WidgetId()) && !closeBtn.IsHovered(app),
+            "leaving window clears chromeClose hover");
+        Check(closeLeaves == 1, "leaving window fires Leave once");
+
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
+    static void TestRoutedEvents() {
+        App app = App.CreateOffscreen("Routed events", 400, 300);
+        Control root = new Control();
+        EventSinkPanel box = new EventSinkPanel();
+        Button btn = new Button("Go");
+        EventSinkPanel dropZone = new EventSinkPanel();
+        Input input = new Input();
+        int inputKeyPresses = 0;
+        int boxKeyPresses = 0;
+        input.BindEvent("KeyPress", () => { inputKeyPresses = inputKeyPresses + 1; });
+        box.BindEvent("KeyPress", () => { boxKeyPresses = boxKeyPresses + 1; });
+
+        int btnDoubleClicks = 0;
+        btn.OnDoubleClick(() => { btnDoubleClicks = btnDoubleClicks + 1; });
+
+        root.Add(box);
+        root.Add(btn);
+        root.Add(dropZone);
+        root.Add(input);
+        root.UseApp(app);
+        root.Arrange(0, 0, 400, 300);
+        box.Arrange(10, 10, 140, 100);
+        btn.Arrange(170, 10, 100, 40);
+        dropZone.Arrange(170, 70, 120, 80);
+        input.Arrange(10, 130, 140, 36);
+        app.SetRootControl(root);
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+
+        // 1. DoubleClick on Button (even though Button.OnClick calls e.Handle())
+        ClickPair(app, 200, 30, 0, 0, 0);
+        ClickPair(app, 200, 30, 0, 0, 0);
+        Check(btnDoubleClicks == 1, "Button receives DoubleClick after two primary clicks");
+
+        // 2. RightClick + RightDoubleClick on EventSinkPanel without polluting primary history
+        int savedPrimaryId = app.lastClickId;
+        int savedPrimaryMs = app.lastClickMs;
+        ClickPair(app, 50, 50, 1, Modifiers.Ctrl(), 0);
+        Check(box.rightClicks == 1 && box.rightDoubleClicks == 0
+            && box.lastButton == 1 && box.lastModifiers == Modifiers.Ctrl(),
+            "first right click fires RightClick with button=1 and modifiers");
+        Check(app.lastClickId == savedPrimaryId && app.lastClickMs == savedPrimaryMs,
+            "RightClick does not overwrite primary click history");
+        ClickPair(app, 50, 50, 1, Modifiers.Shift(), 0);
+        Check(box.rightClicks == 2 && box.rightDoubleClicks == 1
+            && box.lastButton == 1 && box.lastModifiers == Modifiers.Shift(),
+            "second right click fires RightDoubleClick");
+        Check(app.lastClickId == savedPrimaryId && app.lastClickMs == savedPrimaryMs,
+            "RightDoubleClick does not overwrite primary click history");
+
+        // 3. KeyPress on generic focused Control vs Input (no double fire on Input)
+        app.focus.SetFocused(box.WidgetId(), box);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 97, 0, 0);
+        Pump(app);
+        Check(boxKeyPresses == 1,
+            "generic focused Control receives KeyPress on printable TextInput");
+
+        app.focus.SetFocused(input.WidgetId(), input);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 98, 0, 0);
+        Pump(app);
+        Check(inputKeyPresses == 1, "Input fires KeyPress exactly once without double-firing");
+
+        // 4. Touch Tap + Touch Swipe
+        ClickPair(app, 50, 50, 0, 0, 1);
+        Check(box.taps == 1 && box.swipes == 0, "touch click fires Tap");
+
+        int clicksBeforeSwipe = box.clicks;
+        int tapsBeforeSwipe = box.taps;
+        app.ProcessOffscreenInput(2, 30, 50, 0, 0, 0, 1);
+        app.ProcessOffscreenInput(1, 90, 50, 0, 0, 0, 1);
+        app.ProcessOffscreenInput(3, 90, 50, 0, 0, 0, 1);
+        Pump(app);
+        Check(box.swipes == 1 && box.lastSwipeDelta == 1
+            && box.clicks == clicksBeforeSwipe && box.taps == tapsBeforeSwipe,
+            "touch drag >= 30px fires Swipe and cancels Click/Tap");
+
+        // 5. Mouse DragStart -> Drag -> Drop onto dropZone
+        app.currentPointerType = 0;
+        app.ProcessOffscreenInput(2, 50, 50, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, 70, 50, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, 200, 100, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 200, 100, 0, 0, 0, 0);
+        Pump(app);
+        Check(box.dragStarts == 1 && box.drags >= 2 && dropZone.drops == 1,
+            "mouse drag emits DragStart, Drag, and Drop on target");
+
+        app.SetRootControl(null);
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        TestCaptionFeedback();
+        TestRoutedEvents();
+        Console.WriteLine("caption_feedback_and_events:ok");
+    }
+}

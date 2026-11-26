@@ -6,16 +6,35 @@ namespace Gui;
 public partial class Control {
     public virtual bool ChildControlsRenderedByOwner() { return false; }
     protected virtual bool PaintWithinBounds() { return false; }
-    private bool SkipBoundedPaint(App host) {
-        if (!host.SkipFormPaintBounds(bx, by, bw, bh) || childNodes.Count != 0
-            || Tip != "" || this.StyleOverflowX() > 1 || this.StyleOverflowY() > 1 || surfaceFrom != null
+    private bool CanBoundsCull(App host, bool needClippedChildren) {
+        if (this.app != host || Tip != "" || surfaceFrom != null
             || host.paintOffsetX != 0 || host.paintOffsetY != 0 || host.canvas.opacityPm != 1000
+            || this.ChildControlsRenderedByOwner()
             || (extra != null && ((extra.Paint != null && extra.Paint.Count() > 0)
-                || extra.surfaceTransitionKey != 0)) || !this.PaintWithinBounds()) { return false; }
+                || extra.surfaceTransitionKey != 0))
+            || !this.PaintWithinBounds()) { return false; }
         StyleBox style = computedStyle;
-        return style != null && this.SurfaceState(host) == computedStyleState
-            && style.shadow == 0 && style.blur == 0 && style.tx == 0 && style.ty == 0
-            && style.scale <= 1000 && style.anim == 0;
+        if (style == null || !this.ComputedStyleCurrent(host)
+            || this.SurfaceState(host) != computedStyleState
+            || style.shadow != 0 || style.blur != 0 || style.tx != 0 || style.ty != 0
+            || style.scale > 1000 || (style.rotate % 360) != 0 || style.opacity < 1000
+            || style.emboss != 0 || style.anim != 0) { return false; }
+        bool formCulled = host.SkipFormPaintBounds(bx, by, bw, bh);
+        bool generalPartial = !formCulled && host.Damage != null && host.Damage.partialFrame
+            && !host.Damage.forceFullNext
+            && (!PaintHash.On || host.paintingSteadyDrawer)
+            && !NativeLayer.HasTrackedFor(host)
+            && !host.Damage.FrameDamageIntersects(bx, by, bw, bh);
+        if (!formCulled && !generalPartial) { return false; }
+        if (formCulled && (this.StyleOverflowX() > 1 || this.StyleOverflowY() > 1)) { return false; }
+        if (!needClippedChildren) { return true; }
+        return childNodes.Count == 0
+            || (!formCulled && (this.IsScrollContainer() || style.overflow != 0));
+    }
+    private bool SkipBoundedPaint(App host) {
+        if (!this.CanBoundsCull(host, true)) { return false; }
+        host.culledControlPaints = host.culledControlPaints + 1;
+        return true;
     }
     protected void PaintContentMask(App host, int color) { host.Backdrop.PaintContentMask(bx, by, bw, bh, color); }
     void RenderInside(App app, Rect area) {
@@ -111,29 +130,34 @@ public partial class Control {
             // 自段哈希：置换累加器、计本节点自己的命令流，
             // OnPaint 出口比对——与上面卡顿归因同一段（不含子树，
             // 子树在下方递归里自成一段自算自比）。
-            PaintHashToken hashSeg = PaintHash.BeginScope();
-            try {
-                PaintStyleBox(app);
-                OnPaint(app);
-                if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
-                app.CommitPaintHash(hashSeg, this.CommonId(), bx, by, bw, bh);
-            } finally {
-                PaintHash.Restore(hashSeg);
-            }
-            if (selfProf) {
-                app.Stats.Node(this.Kind(), name, Window.GetTickUs() - selfT0);
-            }
-            if (Tip != "" && (app.ShouldShowTip(this, bx, by, bw, bh)
-            || app.HoldTip(this))) {
-                int place = Widget.Tooltip.Bottom();
-                if (TipSide == "top") { place = Widget.Tooltip.Top(); }
-                else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
-                else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
-                Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
-            }
-            if (this.extra != null && this.extra.Paint != null && this.extra.Paint.Count() > 0) {
-                this.extra.Paint.Raise(this);
-                if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+            bool skipSelf = !pushedLayer && this.CanBoundsCull(app, false);
+            if (skipSelf) {
+                app.culledControlPaints = app.culledControlPaints + 1;
+            } else {
+                PaintHashToken hashSeg = PaintHash.BeginScope();
+                try {
+                    PaintStyleBox(app);
+                    OnPaint(app);
+                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                    app.CommitPaintHash(hashSeg, this.CommonId(), bx, by, bw, bh);
+                } finally {
+                    PaintHash.Restore(hashSeg);
+                }
+                if (selfProf) {
+                    app.Stats.Node(this.Kind(), name, Window.GetTickUs() - selfT0);
+                }
+                if (Tip != "" && (app.ShouldShowTip(this, bx, by, bw, bh)
+                || app.HoldTip(this))) {
+                    int place = Widget.Tooltip.Bottom();
+                    if (TipSide == "top") { place = Widget.Tooltip.Top(); }
+                    else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
+                    else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
+                    Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
+                }
+                if (this.extra != null && this.extra.Paint != null && this.extra.Paint.Count() > 0) {
+                    this.extra.Paint.Raise(this);
+                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                }
             }
             bool scrollC = this.IsScrollContainer();
             if (childNodes.Count > 0 && !this.ChildControlsRenderedByOwner()) {

@@ -77,10 +77,24 @@ typedef struct {
     NSView   *view;   /* owns alloc/init in addition to the view hierarchy */
     int w, h;
     int caption_btns; /* per-window caption-button count for the drag hit-test */
+    int titlebar_h;   /* custom titlebar height override in px (0 = default) */
+    int caption_zone_w; /* extra right-side non-drag zone width in px */
+    int maximizable;  /* 1 by default; 0 disables zoom */
+    int round_corners;/* 1 when SetRoundCorners(true) is active */
+    int dpi_rev;      /* incremented on backing scale changes */
     NSView   *glassFx; /* owns alloc/init while native glass is on, else nil */
 } zan_mwin_t;
 static zan_mwin_t g_mwins[ZAN_MAX_WINDOWS];
 static int g_mwin_count = 0;
+
+static int zan_log_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("ZAN_GUI_LOG");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
 
 /* Pending-event slots: [kind, x, y, button, keycode, mods, hwnd]. */
 static long g_evt[7];
@@ -437,8 +451,7 @@ static int g_ime_composing = 0;
     if (actual) *actual = NSMakeRange(0, 0);
     CGFloat scale = [[self window] backingScaleFactor];
     if (scale <= 0) scale = 1.0;
-    NSRect r = NSMakeRect(g_ime_x / scale, g_ime_y / scale, 1,
-                          20.0 * zan_gui_get_dpi_scale() / 100.0 / scale);
+    NSRect r = NSMakeRect(g_ime_x / scale, g_ime_y / scale, 1, 20.0);
     r = [self convertRect:r toView:nil];
     return [[self window] convertRectToScreen:r];
 }
@@ -499,8 +512,23 @@ static int g_ime_composing = 0;
  * caption; these mirror the X11 backend so the draggable caption region and
  * the (non-draggable) caption-button cluster line up with what Zan paints. */
 static int g_caption_btn_count = 5;
-static int zan_titlebar_h(void) { return (int)(32 * zan_gui_get_dpi_scale() / 100); }
-static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() / 100); }
+static CGFloat zan_window_scale(NSWindow *window);
+static int zan_dpi_scale_for_win(NSWindow *window) {
+    CGFloat scale = zan_window_scale(window);
+    return (int)(scale * 100.0 + 0.5);
+}
+static int zan_titlebar_h_win(NSWindow *window) {
+    zan_mwin_t *mw = window ? mwin_find_win(window) : NULL;
+    if (mw && mw->titlebar_h > 0) return mw->titlebar_h;
+    int ds = window ? zan_dpi_scale_for_win(window) : (int)zan_gui_get_dpi_scale();
+    return (int)(32 * ds / 100);
+}
+static int zan_caption_btn_w_win(NSWindow *window) {
+    int ds = window ? zan_dpi_scale_for_win(window) : (int)zan_gui_get_dpi_scale();
+    return (int)(46 * ds / 100);
+}
+static int zan_titlebar_h(void) { return zan_titlebar_h_win(nil); }
+static int zan_caption_btn_w(void) { return zan_caption_btn_w_win(nil); }
 
 /* AppKit geometry is in points; Zan geometry is in physical pixels. */
 static CGFloat zan_window_scale(NSWindow *window) {
@@ -534,6 +562,9 @@ static int zan_points_to_pixels(CGFloat points, CGFloat scale) {
     }
 }
 - (void)windowDidChangeBackingProperties:(NSNotification *)note {
+    NSWindow *win = [note object];
+    zan_mwin_t *mw = mwin_find_win(win);
+    if (mw) mw->dpi_rev++;
     [self windowDidResize:note];
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -615,8 +646,16 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
             if (!screen) screen = [NSScreen mainScreen];
             CGFloat scale = screen ? [screen backingScaleFactor] : 1.0;
             if (scale <= 0) scale = 1.0;
-            NSRect rect = NSMakeRect(0, 0, (CGFloat)width / scale,
-                                      (CGFloat)height / scale);
+            CGFloat ptW = (CGFloat)width / scale;
+            CGFloat ptH = (CGFloat)height / scale;
+            if (screen) {
+                NSRect work = [screen visibleFrame];
+                if (work.size.width > 0 && ptW > work.size.width) ptW = work.size.width;
+                if (work.size.height > 0 && ptH > work.size.height) ptH = work.size.height;
+            }
+            if (ptW < 120.0) ptW = 120.0;
+            if (ptH < 72.0) ptH = 72.0;
+            NSRect rect = NSMakeRect(0, 0, ptW, ptH);
             /* Borderless: the app paints its own title bar/caption buttons, matching
              * the Win32 (WS_POPUP) and X11 (override caption) backends. Keep the
              * resizable/miniaturizable capabilities so edge-resize still works. */
@@ -658,19 +697,31 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
             /* Placement determines the actual backing scale. Correct dimensions
              * before publishing the window, then center using the corrected size. */
             scale = zan_window_scale(window);
-            [window setContentSize:NSMakeSize((CGFloat)width / scale,
-                                              (CGFloat)height / scale)];
-            if (parent) zan_center_child_window(window, parent, screen);
+            ptW = (CGFloat)width / scale;
+            ptH = (CGFloat)height / scale;
+            NSScreen *actualScreen = [window screen] ? [window screen] : screen;
+            if (actualScreen) {
+                NSRect work = [actualScreen visibleFrame];
+                if (work.size.width > 0 && ptW > work.size.width) ptW = work.size.width;
+                if (work.size.height > 0 && ptH > work.size.height) ptH = work.size.height;
+            }
+            if (ptW < 120.0) ptW = 120.0;
+            if (ptH < 72.0) ptH = 72.0;
+            [window setContentSize:NSMakeSize(ptW, ptH)];
+            if (parent) zan_center_child_window(window, parent, actualScreen);
             else [window center];
             NSSize actual = [view bounds].size;
             scale = zan_window_scale(window);
 
             zan_mwin_t *mw = &g_mwins[g_mwin_count++];
+            memset(mw, 0, sizeof(*mw));
             mw->window = window;
             mw->view = view;
             mw->w = zan_points_to_pixels(actual.width, scale);
             mw->h = zan_points_to_pixels(actual.height, scale);
             mw->caption_btns = 5;
+            mw->maximizable = 1;
+            mw->dpi_rev = 1;
             mw->glassFx = nil;
             window = nil; /* Transfer both alloc/init references to the registry. */
             view = nil;
@@ -775,8 +826,9 @@ EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) {
                 [mw->glassFx release];     /* Drops its separate alloc/init retain. */
                 mw->glassFx = nil;
             }
-            [win setOpaque:YES];
-            [win setBackgroundColor:[NSColor windowBackgroundColor]];
+            BOOL needAlpha = (mw->round_corners != 0 || [win alphaValue] < 0.999);
+            [win setOpaque:(needAlpha ? NO : YES)];
+            [win setBackgroundColor:(needAlpha ? [NSColor clearColor] : [NSColor windowBackgroundColor])];
             [view setNeedsDisplay:YES];
         } @catch (NSException *ex) {
             fprintf(stderr, "[Zan GUI Error] disable_glass failed: %s: %s\n",
@@ -851,6 +903,8 @@ static long zan_vk_from_keycode(unsigned short kc) {
     case 48:  return 9;   /* Tab */
     case 51:  return 8;   /* Backspace (Delete key) */
     case 117: return 46;  /* Forward Delete */
+    case 114: return 45;  /* Help / Insert */
+    case 57:  return 20;  /* Caps Lock */
     case 123: return 37;  /* Left */
     case 126: return 38;  /* Up */
     case 124: return 39;  /* Right */
@@ -862,8 +916,44 @@ static long zan_vk_from_keycode(unsigned short kc) {
     case 49:  return 32;  /* Space */
     case 122: return 112; /* F1 */
     case 120: return 113; /* F2 */
+    case 99:  return 114; /* F3 */
+    case 118: return 115; /* F4 */
     case 96:  return 116; /* F5 */
+    case 97:  return 117; /* F6 */
+    case 98:  return 118; /* F7 */
+    case 100: return 119; /* F8 */
+    case 101: return 120; /* F9 */
+    case 109: return 121; /* F10 */
     case 103: return 122; /* F11 */
+    case 111: return 123; /* F12 */
+    /* Numpad */
+    case 82:  return 96;  /* Numpad 0 */
+    case 83:  return 97;  /* Numpad 1 */
+    case 84:  return 98;  /* Numpad 2 */
+    case 85:  return 99;  /* Numpad 3 */
+    case 86:  return 100; /* Numpad 4 */
+    case 87:  return 101; /* Numpad 5 */
+    case 88:  return 102; /* Numpad 6 */
+    case 89:  return 103; /* Numpad 7 */
+    case 91:  return 104; /* Numpad 8 */
+    case 92:  return 105; /* Numpad 9 */
+    case 67:  return 106; /* Numpad * */
+    case 69:  return 107; /* Numpad + */
+    case 78:  return 109; /* Numpad - */
+    case 65:  return 110; /* Numpad . */
+    case 75:  return 111; /* Numpad / */
+    /* ANSI punctuation matching Win32 VK_OEM_* */
+    case 41:  return 186; /* ;: */
+    case 24:  return 187; /* =+ */
+    case 43:  return 188; /* ,< */
+    case 27:  return 189; /* -_ */
+    case 47:  return 190; /* .> */
+    case 44:  return 191; /* /? */
+    case 50:  return 192; /* `~ */
+    case 33:  return 219; /* [{ */
+    case 42:  return 220; /* \| */
+    case 30:  return 221; /* ]} */
+    case 39:  return 222; /* '" */
     default:  return 0;
     }
 }
@@ -876,6 +966,16 @@ static long zan_vk_from_chars(NSString *bare) {
     if (u >= 'a' && u <= 'z') return (long)(u - 'a' + 'A');
     if ((u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')) return (long)u;
     return 0;
+}
+
+static long zan_scroll_delta(double d, BOOL precise) {
+    if (d == 0.0) return 0;
+    double scaled = precise ? (d * 12.0) : (d * 120.0);
+    long delta = (long)(scaled >= 0.0 ? (scaled + 0.5) : (scaled - 0.5));
+    /* ScrollState divides delta * scrollSpeed / 120; keep >= 3 so slow
+     * trackpad gestures still scroll smoothly instead of rounding to 0. */
+    if (delta == 0) delta = d > 0.0 ? 3 : -3;
+    return delta;
 }
 
 static void decode_event(NSEvent *ev) {
@@ -909,8 +1009,10 @@ static void decode_event(NSEvent *ev) {
          * title-bar strip that is left of the caption-button cluster drags the
          * window natively and is not delivered as a client click; presses over
          * the buttons or below the caption fall through as ordinary clicks. */
-        int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w();
-        if (mw && ly >= 0 && ly < zan_titlebar_h() && lx < mw->w - capW) {
+        int tbH = zan_titlebar_h_win(win);
+        int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w_win(win);
+        if (mw && mw->caption_zone_w > capW) capW = mw->caption_zone_w;
+        if (mw && ly >= 0 && ly < tbH && lx < mw->w - capW) {
             [win performWindowDragWithEvent:ev];
             break;
         }
@@ -923,11 +1025,11 @@ static void decode_event(NSEvent *ev) {
     case NSEventTypeRightMouseUp:   evq_push(3, lx, ly, 1, 0, mods); break;
     case NSEventTypeOtherMouseUp:   evq_push(3, lx, ly, 2, 0, mods); break;
     case NSEventTypeScrollWheel: {
-        double dy = [ev scrollingDeltaY];
-        if ([ev hasPreciseScrollingDeltas]) dy /= 10.0;
-        long delta = (long)(dy * 120.0); /* one wheel notch == 120, like Win32 */
-        if (delta == 0 && dy != 0.0) delta = dy > 0 ? 120 : -120;
-        if (delta != 0) evq_push(13, lx, ly, 0, delta, mods);
+        BOOL precise = [ev hasPreciseScrollingDeltas];
+        long dy = zan_scroll_delta([ev scrollingDeltaY], precise);
+        long dx = zan_scroll_delta([ev scrollingDeltaX], precise);
+        if (dy != 0) evq_push(13, lx, ly, 0, dy, mods);
+        if (dx != 0) evq_push(13, lx, ly, 0, dx, mods | 2);
         break;
     }
     case NSEventTypeKeyDown: {
@@ -1159,22 +1261,37 @@ EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)g_evt[6]; }
 
 /* ---- native text rendering ---- */
 
-static CTFontRef zan_font(i64 font_size) {
+static CTFontRef zan_font_styled(i64 font_size, int bold) {
     CGFloat size = (CGFloat)font_size;
     if (size < 8.0) size = 8.0;
-    return CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+    CTFontRef base = CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+    if (!bold || !base) return base;
+    CTFontRef boldFont = CTFontCreateCopyWithSymbolicTraits(
+        base, 0.0, NULL, kCTFontBoldTrait, kCTFontBoldTrait);
+    if (boldFont) {
+        CFRelease(base);
+        return boldFont;
+    }
+    return base;
+}
+
+static CTFontRef zan_font(i64 font_size) {
+    return zan_font_styled(font_size, 0);
 }
 
 static CTLineRef zan_text_line(const char *utf8, CTFontRef font);
 
 /* Rendered text-run cache. CoreText layout + rasterization (font parsing,
  * glyph lookup, mask fill) dominates a full-page redraw, and UI strings repeat
- * across frames, so cache the finished coverage mask per (string, font size).
- * Direct-mapped by FNV hash; a collision simply re-renders and replaces. */
+ * across frames, so cache the finished coverage mask per (string, size, bold,
+ * angle). Direct-mapped by FNV hash; a collision simply re-renders. */
 typedef struct {
     char *key;              /* strdup'ed string, NULL = empty slot */
     i64 font_size;
+    int bold;
+    int angle_deg;
     int tw, th;             /* mask dimensions */
+    int left, top;          /* blit offset relative to (x, y) */
     double width;           /* typographic width (for measure) */
     unsigned char *mask;    /* tw*th coverage bytes (may be NULL: measure-only) */
 } zan_text_entry_t;
@@ -1182,25 +1299,31 @@ typedef struct {
 #define ZAN_TEXT_CACHE_SLOTS 1024
 static zan_text_entry_t g_text_cache[ZAN_TEXT_CACHE_SLOTS];
 
-static unsigned int zan_text_hash(const char *s, i64 font_size) {
+static unsigned int zan_text_hash(const char *s, i64 font_size, int bold,
+                                  int angle_deg) {
     unsigned int h = 2166136261u;
     while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
     h ^= (unsigned int)font_size * 2654435761u;
+    h ^= (unsigned int)(bold ? 0x9E3779B9u : 0u);
+    h ^= (unsigned int)angle_deg * 2246822519u;
     return h % ZAN_TEXT_CACHE_SLOTS;
 }
 
-/* Returns the cache slot for (utf8, font_size), rendering the coverage mask on
- * a miss (or when a measure-only entry needs pixels and need_mask is set).
- * Returns NULL when the string renders to an empty box. */
+/* Returns the cache slot for (utf8, font_size, bold, angle_deg), rendering the
+ * coverage mask on a miss. Returns NULL when the string renders empty. */
 static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
+                                         int bold, int angle_deg,
                                          bool need_mask) {
-    unsigned int slot = zan_text_hash(utf8, font_size);
+    int norm_angle = angle_deg % 360;
+    if (norm_angle < 0) norm_angle += 360;
+    unsigned int slot = zan_text_hash(utf8, font_size, bold, norm_angle);
     zan_text_entry_t *e = &g_text_cache[slot];
-    if (e->key && e->font_size == font_size && strcmp(e->key, utf8) == 0 &&
+    if (e->key && e->font_size == font_size && e->bold == bold &&
+        e->angle_deg == norm_angle && strcmp(e->key, utf8) == 0 &&
         (!need_mask || e->mask))
         return e;
 
-    CTFontRef font = zan_font(font_size);
+    CTFontRef font = zan_font_styled(font_size, bold);
     CTLineRef line = zan_text_line(utf8, font);
     if (!line) {
         if (font) CFRelease(font);
@@ -1210,8 +1333,38 @@ static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
     double measured = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
     int tw = (int)ceil(measured) + 2;
     int th = (int)ceil(ascent + descent + leading) + 2;
+    int left = -1, top = -1;
+    double rad = 0.0, mnx = 0.0, mny = 0.0;
+    if (norm_angle != 0) {
+        double w = measured + 2.0;
+        double h = (double)ascent + (double)descent + (double)leading + 2.0;
+        rad = (double)norm_angle * 3.14159265358979323846 / 180.0;
+        double cs = cos(rad), sn = sin(rad);
+        double cx0 = 0.0, cx1 = cs * w, cx2 = -sn * h, cx3 = cs * w - sn * h;
+        double cy0 = 0.0, cy1 = sn * w, cy2 = cs * h, cy3 = sn * w + cs * h;
+        mnx = cx0;
+        if (cx1 < mnx) mnx = cx1;
+        if (cx2 < mnx) mnx = cx2;
+        if (cx3 < mnx) mnx = cx3;
+        double mxx = cx0;
+        if (cx1 > mxx) mxx = cx1;
+        if (cx2 > mxx) mxx = cx2;
+        if (cx3 > mxx) mxx = cx3;
+        mny = cy0;
+        if (cy1 < mny) mny = cy1;
+        if (cy2 < mny) mny = cy2;
+        if (cy3 < mny) mny = cy3;
+        double mxy = cy0;
+        if (cy1 > mxy) mxy = cy1;
+        if (cy2 > mxy) mxy = cy2;
+        if (cy3 > mxy) mxy = cy3;
+        left = (int)floor(mnx) - 1;
+        top = (int)floor(mny) - 1;
+        tw = (int)ceil(mxx) - (int)floor(mnx) + 2;
+        th = (int)ceil(mxy) - (int)floor(mny) + 2;
+    }
     unsigned char *mask = NULL;
-    if (need_mask && tw > 0 && th > 0) {
+    if (need_mask && tw > 0 && th > 0 && tw <= 16384 && th <= 16384) {
         mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
         CGContextRef ctx = CGBitmapContextCreate(
@@ -1219,7 +1372,16 @@ static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
             cs, (CGBitmapInfo)kCGImageAlphaNone);
         if (ctx) {
             CGContextSetGrayFillColor(ctx, 1.0, 1.0);
-            CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+            if (norm_angle == 0) {
+                CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+            } else {
+                CGContextTranslateCTM(ctx, 0.0, (CGFloat)th);
+                CGContextScaleCTM(ctx, 1.0, -1.0);
+                CGContextTranslateCTM(ctx, -mnx + 1.0, -mny + 1.0);
+                CGContextRotateCTM(ctx, (CGFloat)rad);
+                CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1.0, -1.0));
+                CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+            }
             CTLineDraw(line, ctx);
             CGContextFlush(ctx);
             CGContextRelease(ctx);
@@ -1236,8 +1398,12 @@ static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
     free(e->mask);
     e->key = strdup(utf8);
     e->font_size = font_size;
+    e->bold = bold;
+    e->angle_deg = norm_angle;
     e->tw = tw;
     e->th = th;
+    e->left = left;
+    e->top = top;
     e->width = measured;
     e->mask = mask;
     return e;
@@ -1270,22 +1436,34 @@ static CTLineRef zan_text_line(const char *utf8, CTFontRef font) {
 static u32 zan_blend(u32 dst, u32 color, unsigned int coverage) {
     u32 ca = (color >> 24) & 0xFF;
     if (ca == 0) ca = 255;
-    u32 alpha = ca * coverage / 255;
-    u32 inv = 255 - alpha;
+    u32 sa = ca * coverage / 255;
+    if (sa == 0) return dst;
     u32 sr = (color >> 16) & 0xFF;
     u32 sg = (color >> 8) & 0xFF;
     u32 sb = color & 0xFF;
+    u32 da = (dst >> 24) & 0xFF;
     u32 dr = (dst >> 16) & 0xFF;
     u32 dg = (dst >> 8) & 0xFF;
     u32 db = dst & 0xFF;
-    u32 r = (sr * alpha + dr * inv) / 255;
-    u32 g = (sg * alpha + dg * inv) / 255;
-    u32 b = (sb * alpha + db * inv) / 255;
-    return 0xFF000000u | (r << 16) | (g << 8) | b;
+    u32 inv = 255 - sa;
+    if (da == 255) {
+        u32 r = (sr * sa + dr * inv) / 255;
+        u32 g = (sg * sa + dg * inv) / 255;
+        u32 b = (sb * sa + db * inv) / 255;
+        return 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
+    u32 da2 = da * inv / 255;
+    u32 oa = sa + da2;
+    if (oa == 0) return 0;
+    u32 r = (sr * sa + dr * da2) / oa;
+    u32 g = (sg * sa + dg * da2) / oa;
+    u32 b = (sb * sa + db * da2) / oa;
+    return (oa << 24) | (r << 16) | (g << 8) | b;
 }
 
-EXPORT void zan_gui_draw_text(
-    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
+static void zan_draw_text_impl(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size,
+    int bold, int angle_deg) {
     int sw = 0, sh = 0, stride = 0;
     u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
     if (!pixels || !utf8 || !*utf8) return;
@@ -1296,19 +1474,15 @@ EXPORT void zan_gui_draw_text(
     zan_gui_internal_surface_clip(surface_id, &cx0, &cy0, &cx1, &cy1);
 
     @autoreleasepool {
-        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, true);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, bold, angle_deg, true);
         if (!e || !e->mask) return;
         int tw = e->tw, th = e->th;
         const unsigned char *mask = e->mask;
-        /* The mask carries 1px of padding on every side (the line is drawn at
-         * (1, descent+1)); blit at (x-1, y-1) so the typographic box lands
-         * exactly at (x, y) like the GDI path, keeping icon/text rows that
-         * centre on font_height visually centred. */
         for (int py = 0; py < th; py++) {
-            int dy = (int)y + py - 1;
+            int dy = (int)y + e->top + py;
             if (dy < cy0 || dy >= cy1 || dy < 0 || dy >= sh) continue;
             for (int px = 0; px < tw; px++) {
-                int dx = (int)x + px - 1;
+                int dx = (int)x + e->left + px;
                 if (dx < cx0 || dx >= cx1 || dx < 0 || dx >= sw) continue;
                 unsigned int coverage = mask[py * tw + px];
                 if (!coverage) continue;
@@ -1319,28 +1493,26 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
-/* Canvas.DrawTextBold ABI: same regular-weight fallback as the shared
- * renderer (gui_runtime_font.c), which the Cocoa build does not compile. */
+EXPORT void zan_gui_draw_text(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
+    zan_draw_text_impl(surface_id, x, y, utf8, color, font_size, 0, 0);
+}
+
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
-    zan_gui_draw_text(surface_id, x, y, utf8, color, font_size);
+    zan_draw_text_impl(surface_id, x, y, utf8, color, font_size, 1, 0);
 }
 
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size,
     i32 angle_deg) {
-    /* The cached CoreText mask is an axis-aligned raster; rotating it is a
-     * per-pixel inverse-mapped blit this driver has not learned yet, so a
-     * rotated run draws unrotated rather than not at all (the Win32 and
-     * FreeType drivers bake the rotation into the cached tiles). */
-    (void)angle_deg;
-    zan_gui_draw_text(surface_id, x, y, utf8, color, font_size);
+    zan_draw_text_impl(surface_id, x, y, utf8, color, font_size, 0, (int)angle_deg);
 }
 
 EXPORT i32 zan_gui_measure_text(const char *utf8, i32 font_size) {
     if (!utf8 || !*utf8) return 0;
     @autoreleasepool {
-        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, false);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, 0, 0, false);
         if (!e) return 0;
         return (i64)ceil(e->width);
     }
@@ -1547,6 +1719,26 @@ EXPORT i32 zan_gui_set_cursor(i32 cursor) {
             case 2:  [[NSCursor IBeamCursor] set]; break;
             case 3:  [[NSCursor resizeLeftRightCursor] set]; break;
             case 4:  [[NSCursor resizeUpDownCursor] set]; break;
+            case 5:  [[NSCursor crosshairCursor] set]; break;
+            case 6:  [[NSCursor openHandCursor] set]; break;
+            case 7: {
+                SEL sel = NSSelectorFromString(@"_windowResizeNorthWestSouthEastCursor");
+                if ([NSCursor respondsToSelector:sel]) {
+                    NSCursor *c = ((NSCursor *(*)(id, SEL))objc_msgSend)([NSCursor class], sel);
+                    if (c) { [c set]; break; }
+                }
+                [[NSCursor arrowCursor] set];
+                break;
+            }
+            case 8: {
+                SEL sel = NSSelectorFromString(@"_windowResizeNorthEastSouthWestCursor");
+                if ([NSCursor respondsToSelector:sel]) {
+                    NSCursor *c = ((NSCursor *(*)(id, SEL))objc_msgSend)([NSCursor class], sel);
+                    if (c) { [c set]; break; }
+                }
+                [[NSCursor arrowCursor] set];
+                break;
+            }
             default: [[NSCursor arrowCursor] set]; break;
             }
         } @catch (NSException *ex) {
@@ -1560,6 +1752,12 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (i64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+EXPORT i64 zan_gui_get_tick_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (i64)ts.tv_sec * 1000000 + (i64)(ts.tv_nsec / 1000);
 }
 
 EXPORT void zan_gui_sleep_ms(i32 ms) {
@@ -1589,6 +1787,7 @@ EXPORT i32 zan_gui_toggle_maximize(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) {
+        if (!mw->maximizable) return 0;
         @autoreleasepool {
             @try {
                 [mw->window zoom:nil];
@@ -1674,7 +1873,8 @@ EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
     @autoreleasepool {
         @try {
             [mw->window setAlphaValue:((CGFloat)percent / 100.0)];
-            [mw->window setOpaque:(percent >= 100 ? YES : NO)];
+            BOOL opaque = (percent >= 100 && !mw->glassFx && !mw->round_corners);
+            [mw->window setOpaque:opaque];
         } @catch (NSException *ex) {
             return 1;
         }
@@ -1695,6 +1895,151 @@ EXPORT i32 zan_gui_get_dpi_scale(void) {
             return 100;
         }
     }
+}
+
+EXPORT i32 zan_gui_get_dpi_scale_win(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_get_dpi_scale_win(hwnd_val));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return zan_gui_get_dpi_scale();
+    @autoreleasepool {
+        return (i32)zan_dpi_scale_for_win(mw->window);
+    }
+}
+
+EXPORT i32 zan_gui_dpi_revision(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_dpi_revision(hwnd_val));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    return mw ? (i32)mw->dpi_rev : 0;
+}
+
+EXPORT i32 zan_gui_set_titlebar_height(iptr hwnd_val, i32 device_px) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_titlebar_height(hwnd_val, device_px));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    mw->titlebar_h = device_px > 0 ? (int)device_px : 0;
+    return 0;
+}
+
+EXPORT i32 zan_gui_set_caption_zone(iptr hwnd_val, i32 width) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_caption_zone(hwnd_val, width));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    mw->caption_zone_w = width > 0 ? (int)width : 0;
+    return 0;
+}
+
+EXPORT i32 zan_gui_set_min_size(iptr hwnd_val, i32 w, i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_min_size(hwnd_val, w, h));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    @autoreleasepool {
+        @try {
+            CGFloat scale = zan_window_scale(mw->window);
+            CGFloat pw = w > 0 ? (CGFloat)w / scale : 0.0;
+            CGFloat ph = h > 0 ? (CGFloat)h / scale : 0.0;
+            [mw->window setContentMinSize:NSMakeSize(pw, ph)];
+            return 0;
+        } @catch (NSException *ex) {
+            return 1;
+        }
+    }
+}
+
+EXPORT i32 zan_gui_set_resizable(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_resizable(hwnd_val, on));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    @autoreleasepool {
+        @try {
+            NSUInteger mask = [mw->window styleMask];
+            if (on) mask |= NSWindowStyleMaskResizable;
+            else mask &= ~NSWindowStyleMaskResizable;
+            [mw->window setStyleMask:mask];
+            return 0;
+        } @catch (NSException *ex) {
+            return 1;
+        }
+    }
+}
+
+EXPORT i32 zan_gui_set_maximizable(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_maximizable(hwnd_val, on));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    mw->maximizable = on ? 1 : 0;
+    return 0;
+}
+
+EXPORT i32 zan_gui_set_round_corners(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_round_corners(hwnd_val, on));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw || !mw->view) return 1;
+    mw->round_corners = on ? 1 : 0;
+    @autoreleasepool {
+        @try {
+            NSWindow *win = mw->window;
+            CALayer *layer = [mw->view layer];
+            if (on) {
+                [win setOpaque:NO];
+                [win setBackgroundColor:[NSColor clearColor]];
+                [win setHasShadow:YES];
+                if (layer) {
+                    layer.cornerRadius = 6.0;
+                    layer.masksToBounds = YES;
+                }
+            } else {
+                if (layer) {
+                    layer.cornerRadius = 0.0;
+                    layer.masksToBounds = NO;
+                }
+                BOOL opaque = (!mw->glassFx && [win alphaValue] >= 0.999);
+                [win setOpaque:opaque];
+                [win setBackgroundColor:(opaque ? [NSColor windowBackgroundColor] : [NSColor clearColor])];
+            }
+            return 0;
+        } @catch (NSException *ex) {
+            return 1;
+        }
+    }
+}
+
+EXPORT double zan_gui_refresh_rate(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_refresh_rate(hwnd_val));
+    @autoreleasepool {
+        @try {
+            zan_mwin_t *mw = mwin_find(hwnd_val);
+            if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+            NSScreen *screen = mw && mw->window ? [mw->window screen] : nil;
+            if (!screen) screen = [NSScreen mainScreen];
+            if (screen) {
+                if ([screen respondsToSelector:@selector(maximumFramesPerSecond)]) {
+                    NSInteger fps = ((NSInteger (*)(id, SEL))objc_msgSend)(
+                        screen, @selector(maximumFramesPerSecond));
+                    if (fps > 1 && fps <= 1000) return (double)fps;
+                }
+                NSNumber *num = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+                if (num) {
+                    CGDisplayModeRef mode = CGDisplayCopyDisplayMode((CGDirectDisplayID)[num unsignedIntValue]);
+                    if (mode) {
+                        double hz = CGDisplayModeGetRefreshRate(mode);
+                        CGDisplayModeRelease(mode);
+                        if (hz > 1.0 && hz <= 1000.0) return hz;
+                    }
+                }
+            }
+        } @catch (NSException *ex) {
+            (void)ex;
+        }
+    }
+    return 60.0;
 }
 
 /* Report the caret position (client-area px) so an IME's composition/candidate
@@ -2040,12 +2385,12 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
     if (self.layer.mask) {
         CAShapeLayer *mask = (CAShapeLayer *)self.layer.mask;
         if ([mask isKindOfClass:[CAShapeLayer class]] && mask.path) {
-            /* point passed into hitTest: is in self.superview coordinates.
-             * First convert to local view coordinates: */
+            /* point passed into hitTest: is in self.superview coordinates. */
             NSPoint local = [self convertPoint:point fromView:self.superview];
-            /* Since the view is flipped (top-left origin), and mask.path is defined
-             * in bottom-left origin CoreGraphics space, convert local.y to CG Y: */
-            CGPoint p = CGPointMake(local.x, self.bounds.size.height - local.y);
+            CGFloat h = self.bounds.size.height;
+            CGFloat topY = [self isFlipped] ? local.y : (h - local.y);
+            CGFloat maskY = mask.isGeometryFlipped ? topY : (h - topY);
+            CGPoint p = CGPointMake(local.x, maskY);
             if (!CGPathContainsPoint(mask.path, NULL, p, false)) {
                 /* Point falls into the occluded/cutout region (e.g. dropdown menu).
                  * Return nil to let click pass through to the host ZanView. */
@@ -2157,26 +2502,30 @@ EXPORT void zan_gui_window_snapshot(iptr hwnd_val, const char *out_png_path) {
     @autoreleasepool {
         ZanView *zv = (ZanView *)mw->view;
         NSRect r = [zv bounds];
-        int w = (int)r.size.width;
-        int h = (int)r.size.height;
+        CGFloat scale = zan_window_scale(mw->window);
+        int pw = zan_points_to_pixels(r.size.width, scale);
+        int ph = zan_points_to_pixels(r.size.height, scale);
+        if (pw <= 0 || ph <= 0) return;
         NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
             initWithBitmapDataPlanes:NULL
-                          pixelsWide:w
-                          pixelsHigh:h
+                          pixelsWide:pw
+                          pixelsHigh:ph
                        bitsPerSample:8
                      samplesPerPixel:4
                             hasAlpha:YES
                             isPlanar:NO
                       colorSpaceName:NSDeviceRGBColorSpace
-                         bytesPerRow:w * 4
+                         bytesPerRow:pw * 4
                         bitsPerPixel:32];
         if (rep) {
+            [rep setSize:r.size];
             NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
             [NSGraphicsContext saveGraphicsState];
             [NSGraphicsContext setCurrentContext:gc];
             CGContextRef ctx = (CGContextRef)[gc CGContext];
 
-            /* 1. Base layer: Zan software GUI canvas (titlebar, tabs, menus) */
+            /* 1. Base layer: Zan software GUI canvas (rep/gc is bottom-left unflipped;
+             * CGContextDrawImage draws top-down CGImage upright without flipping CTM). */
             IOSurfaceRef surf = zv->iosurf[zv->backingIdx];
             if (surf) {
                 IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
@@ -2187,11 +2536,7 @@ EXPORT void zan_gui_window_snapshot(iptr hwnd_val, const char *out_png_path) {
                     kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
                 CGImageRef img = sctx ? CGBitmapContextCreateImage(sctx) : NULL;
                 if (img) {
-                    CGContextSaveGState(ctx);
-                    CGContextTranslateCTM(ctx, 0, h);
-                    CGContextScaleCTM(ctx, 1.0, -1.0);
-                    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
-                    CGContextRestoreGState(ctx);
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, r.size.width, r.size.height), img);
                     CGImageRelease(img);
                 }
                 if (sctx) CGContextRelease(sctx);
@@ -2199,14 +2544,40 @@ EXPORT void zan_gui_window_snapshot(iptr hwnd_val, const char *out_png_path) {
                 IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
             }
 
-            /* 2. Subviews: WKWebView instances with their layer mask */
+            /* 2. Subviews: WKWebView instances converted from ZanView flipped
+             * coordinates to rep's bottom-left coordinates and clipped by mask. */
             for (NSView *sub in zv.subviews) {
                 if ([sub isHidden]) continue;
                 NSRect subFrame = sub.frame;
+                if (subFrame.size.width <= 0 || subFrame.size.height <= 0) continue;
+                NSRect destRect = NSMakeRect(
+                    subFrame.origin.x,
+                    r.size.height - NSMaxY(subFrame),
+                    subFrame.size.width,
+                    subFrame.size.height);
                 NSBitmapImageRep *subRep = [sub bitmapImageRepForCachingDisplayInRect:sub.bounds];
                 if (subRep) {
                     [sub cacheDisplayInRect:sub.bounds toBitmapImageRep:subRep];
-                    [subRep drawInRect:subFrame];
+                    CGContextSaveGState(ctx);
+                    if (sub.layer && [sub.layer.mask isKindOfClass:[CAShapeLayer class]]) {
+                        CAShapeLayer *mask = (CAShapeLayer *)sub.layer.mask;
+                        if (mask.path) {
+                            CGContextTranslateCTM(ctx, destRect.origin.x, destRect.origin.y);
+                            if (mask.isGeometryFlipped) {
+                                CGContextTranslateCTM(ctx, 0, destRect.size.height);
+                                CGContextScaleCTM(ctx, 1.0, -1.0);
+                            }
+                            CGContextAddPath(ctx, mask.path);
+                            CGContextClip(ctx);
+                            if (mask.isGeometryFlipped) {
+                                CGContextScaleCTM(ctx, 1.0, -1.0);
+                                CGContextTranslateCTM(ctx, 0, -destRect.size.height);
+                            }
+                            CGContextTranslateCTM(ctx, -destRect.origin.x, -destRect.origin.y);
+                        }
+                    }
+                    [subRep drawInRect:destRect];
+                    CGContextRestoreGState(ctx);
                 }
             }
 
@@ -2315,18 +2686,25 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
         if (rects == 0) {
             CGPathRelease(path);
             [wv setHidden:YES];
+            free(slot->clipSpec);
+            slot->clipSpec = NULL;
             return;
         }
         wv.wantsLayer = YES;
         if (rects == 1 && whole) {
             wv.layer.mask = nil;
-            fprintf(stderr, "[ZAN_CLIP] h=%d rects=1 whole=1 (no mask) spec=%s\n", (int)h, spec);
+            if (zan_log_on()) {
+                fprintf(stderr, "[ZAN_CLIP] h=%d rects=1 whole=1 (no mask) spec=%s\n", (int)h, spec);
+            }
         } else {
             CAShapeLayer *mask = [CAShapeLayer layer];
+            mask.geometryFlipped = NO;
             mask.frame = wv.layer.bounds;
             mask.path = path;
             wv.layer.mask = mask;
-            fprintf(stderr, "[ZAN_CLIP] h=%d rects=%d whole=%d (mask applied) spec=%s\n", (int)h, rects, whole, spec);
+            if (zan_log_on()) {
+                fprintf(stderr, "[ZAN_CLIP] h=%d rects=%d whole=%d (mask applied) spec=%s\n", (int)h, rects, whole, spec);
+            }
         }
         CGPathRelease(path);
         [wv setHidden:NO];

@@ -6,12 +6,14 @@ public partial class App {
         if (!this.ContinuePreparedFrame()) { return; }
         RunOverlays();
         if (!this.ContinuePreparedFrame()) { return; }
+        this.MarkNativeOccluderPass();
         Widget.Tooltip.Flush(this);
         if (!this.ContinuePreparedFrame()) { return; }
         List<AppHookFn> presentTails = App.PresentTails();
         if (presentTails != null) {
             for (int i = 0; i < presentTails.Count; i = i + 1) {
                 if (!this.ContinuePreparedFrame()) { return; }
+                this.MarkNativeOccluderPass();
                 presentTails[i](this);
                 if (!this.ContinuePreparedFrame()) { return; }
             }
@@ -183,10 +185,45 @@ public partial class App {
     Widget.TooltipRequest offscreenTooltip;
     App offscreenFrameParent;
     bool offscreenFrameActive;
+    internal bool CanUseOpaqueDrawerPartial() {
+        if (!Damage.partialFrame || !this.AllowsSteadyDrawerPartial()) { return false; }
+        if (shapeMode != 0 || glassNative || retainedLayerWindows != null || retainedLayerQueue != null) { return false; }
+        List<AppHookFn> presentTails = App.PresentTails();
+        if (presentTails != null && presentTails.Count != 0) { return false; }
+        if (NativeLayer.HasTrackedFor(this)) { return false; }
+        Control surface = themeDrawerSurface;
+        if (surface == null || surface.bw <= 0 || surface.bh <= 0 || !surface.StyleVisible()) { return false; }
+        if (!surface.ComputedStyleCurrent(this)) { return false; }
+        StyleBox ds = surface.computedStyle;
+        if (ds == null || ds.display == 2 || ds.visible == 0 || ds.blur != 0 || ds.opacity < 1000
+            || ds.emboss != 0 || ds.sheen != 0 || ds.specular != 0 || ds.anim != 0
+            || ds.tx != 0 || ds.ty != 0 || ds.scale != 1000 || ds.rotate != 0
+            || ds.bgTo != 0 || ds.shadowInset != 0 || StyleBox.AlphaOf(ds.Fade(ds.bg)) != 255) { return false; }
+        int borderMax = ds.BorderWOr(0);
+        if (ds.BorderLeftPx() > borderMax) { borderMax = ds.BorderLeftPx(); }
+        if (ds.BorderTopPx() > borderMax) { borderMax = ds.BorderTopPx(); }
+        if (ds.BorderRightPx() > borderMax) { borderMax = ds.BorderRightPx(); }
+        if (ds.BorderBottomPx() > borderMax) { borderMax = ds.BorderBottomPx(); }
+        int r = ds.RadiusOr(0);
+        int rmax = surface.bh / 2;
+        if (surface.bw < surface.bh) { rmax = surface.bw / 2; }
+        if (r > rmax) { r = rmax; }
+        int inset = (r > borderMax ? r : borderMax) + 1;
+        int ix = surface.bx + inset;
+        int iy = surface.by + inset;
+        int iw = surface.bw - inset * 2;
+        int ih = surface.bh - inset * 2;
+        if (iw <= 0 || ih <= 0) { return false; }
+        return Damage.presentX >= ix && Damage.presentY >= iy
+            && (long)Damage.presentX + Damage.presentW <= (long)ix + iw
+            && (long)Damage.presentY + Damage.presentH <= (long)iy + ih;
+    }
     void BeginFrame() {
         this.CheckPreparationFrameEntry();
         this.ResetFormRegion();
         displayAnimationPending = false;
+        drawerOpaquePartial = false;
+        paintingSteadyDrawer = false;
         if (window.GetHandle() == 0) { this.BeginOffscreenFrame(); return; }
         frameCadence.SetRate(window.RefreshRate());
         frameCadence.Begin(Stopwatch.GetMicroseconds());
@@ -288,7 +325,12 @@ public partial class App {
             Damage.presentY = Damage.dmgY;
             Damage.presentW = Damage.dmgW;
             Damage.presentH = Damage.dmgH;
+            drawerOpaquePartial = this.CanUseOpaqueDrawerPartial();
+            if (drawerOpaquePartial) {
+                drawerOpaquePartialFrames = drawerOpaquePartialFrames + 1;
+            }
         }
+        if (drawerOpaquePartial) { return; }
         if (shapeMode != 0) {
             int resizeBg = 0;
             if (resizeBg != lastResizeBg) {
@@ -365,6 +407,23 @@ public partial class App {
         nativeClipStack.RemoveAt(nativeClipStack.Count - 1);
         nativeClipStack.RemoveAt(nativeClipStack.Count - 1);
     }
+    internal void ClipNativeRect(ref int x, ref int y, ref int w, ref int h) {
+        if (w <= 0 || h <= 0) { w = 0; h = 0; return; }
+        if (nativeClipStack == null || nativeClipStack.Count < 4) { return; }
+        int n = nativeClipStack.Count;
+        int cx0 = nativeClipStack[n - 4];
+        int cy0 = nativeClipStack[n - 3];
+        int cx1 = nativeClipStack[n - 2];
+        int cy1 = nativeClipStack[n - 1];
+        int x0 = x > cx0 ? x : cx0;
+        int y0 = y > cy0 ? y : cy0;
+        int x1 = (x + w) < cx1 ? (x + w) : cx1;
+        int y1 = (y + h) < cy1 ? (y + h) : cy1;
+        x = x0;
+        y = y0;
+        w = x1 > x0 ? x1 - x0 : 0;
+        h = y1 > y0 ? y1 - y0 : 0;
+    }
     void AddOverlay(OverlayPopup p) {
         overlays.Add(p);
         // 在损坏裁剪帧期间出现的弹层/工具提示会被
@@ -390,13 +449,18 @@ public partial class App {
     void RunOverlays() {
         if (!this.ContinuePreparedFrame()) { return; }
         if (retainedLayerWindows != null) {
+            this.MarkNativeOccluderPass();
             retainedLayerWindows.RenderTree(this);
             if (!this.ContinuePreparedFrame()) { return; }
         }
-        if (retainedLayerQueue != null) { retainedLayerQueue.RenderTree(this); }
+        if (retainedLayerQueue != null) {
+            this.MarkNativeOccluderPass();
+            retainedLayerQueue.RenderTree(this);
+        }
         if (!this.ContinuePreparedFrame()) { return; }
         for (int i = 0; i < overlays.Count; i = i + 1) {
             if (!this.ContinuePreparedFrame()) { return; }
+            this.MarkNativeOccluderPass();
             OverlayPopup p = overlays[i];
             focus.PushId("App.Overlay");
             focus.PushId(i);
@@ -409,6 +473,7 @@ public partial class App {
         }
         if (!this.ContinuePreparedFrame()) { return; }
         if (this.overlayHost != null) {
+            this.MarkNativeOccluderPass();
             this.overlayHost.RenderAll(this);
             if (!this.ContinuePreparedFrame()) { return; }
         }
@@ -506,6 +571,33 @@ public partial class App {
         lastClickMs = t;
         lastClickX = x;
         lastClickY = y;
+    }
+    int lastRightClickId = -1;
+    int lastRightClickMs = 0;
+    int lastRightClickX = 0;
+    int lastRightClickY = 0;
+    bool rightDoubleClickNow = false;
+    long rightClickSnapshotSequence;
+    bool rightClickSnapshotSequenceValid;
+    public bool IsRightDoubleClickNow() { return rightDoubleClickNow; }
+    void NoteRightClickAt(int id, int x, int y) {
+        if (id < 0 || window.EventButton() != 1 || clickHistorySuppressed) { return; }
+        long sequence = window.EventSeq();
+        if (rightClickSnapshotSequenceValid && rightClickSnapshotSequence == sequence) { return; }
+        rightClickSnapshotSequence = sequence;
+        rightClickSnapshotSequenceValid = true;
+        int t = Window.GetTickMs();
+        int dx = x - lastRightClickX; if (dx < 0) { dx = 0 - dx; }
+        int dy = y - lastRightClickY; if (dy < 0) { dy = 0 - dy; }
+        if (id >= 0 && id == lastRightClickId && (t - lastRightClickMs) <= 400 && dx <= 6 && dy <= 6) {
+            rightDoubleClickNow = true;
+        } else {
+            rightDoubleClickNow = false;
+        }
+        lastRightClickId = id;
+        lastRightClickMs = t;
+        lastRightClickX = x;
+        lastRightClickY = y;
     }
     void NotePressStart(int id, int x, int y) {
         long sequence = window.EventSeq();

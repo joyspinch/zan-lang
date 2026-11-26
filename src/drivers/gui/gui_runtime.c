@@ -1176,13 +1176,23 @@ static void cpu_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
           u32 sr = (sp >> 16) & 0xFF;
           int idx = dst_row + px;
           u32 dp = s->pixels[idx];
+          u32 da = (dp >> 24) & 0xFF;
           u32 dr = (dp >> 16) & 0xFF;
           u32 dg = (dp >> 8) & 0xFF;
           u32 db = dp & 0xFF;
-          u32 or_ = (sr * a + dr * (255 - a)) / 255;
-          u32 og = (sg * a + dg * (255 - a)) / 255;
-          u32 ob = (sb * a + db * (255 - a)) / 255;
-          s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
+          if (da == 255) {
+            u32 or_ = (sr * a + dr * (255 - a)) / 255;
+            u32 og = (sg * a + dg * (255 - a)) / 255;
+            u32 ob = (sb * a + db * (255 - a)) / 255;
+            s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
+          } else {
+            u32 da2 = da * (255 - a) / 255;
+            u32 oa = a + da2;
+            u32 or_ = oa ? (sr * a + dr * da2) / oa : 0;
+            u32 og = oa ? (sg * a + dg * da2) / oa : 0;
+            u32 ob = oa ? (sb * a + db * da2) / oa : 0;
+            s->pixels[idx] = (oa << 24) | (or_ << 16) | (og << 8) | ob;
+          }
         }
       }
       continue;
@@ -1211,13 +1221,24 @@ static void cpu_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
         u32 ab = (sp & 0xFF) * ca / 255;
         int idx = dst_row + px;
         u32 dp = s->pixels[idx];
+        u32 da = (dp >> 24) & 0xFF;
         u32 dr = (dp >> 16) & 0xFF;
         u32 dg = (dp >> 8) & 0xFF;
         u32 db = dp & 0xFF;
-        u32 or_ = (cr * ar + dr * (255 - ar)) / 255;
-        u32 og = (cg * ag + dg * (255 - ag)) / 255;
-        u32 ob = (cb * ab + db * (255 - ab)) / 255;
-        s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
+        if (da == 255) {
+          u32 or_ = (cr * ar + dr * (255 - ar)) / 255;
+          u32 og = (cg * ag + dg * (255 - ag)) / 255;
+          u32 ob = (cb * ab + db * (255 - ab)) / 255;
+          s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
+        } else {
+          u32 aa = ar > ag ? (ar > ab ? ar : ab) : (ag > ab ? ag : ab);
+          u32 da2 = da * (255 - aa) / 255;
+          u32 oa = aa + da2;
+          u32 or_ = oa ? (cr * ar + dr * da2) / oa : 0;
+          u32 og = oa ? (cg * ag + dg * da2) / oa : 0;
+          u32 ob = oa ? (cb * ab + db * da2) / oa : 0;
+          s->pixels[idx] = (oa << 24) | (or_ << 16) | (og << 8) | ob;
+        }
       }
     }
   }

@@ -23,6 +23,58 @@ public partial class App {
     private long preparedEventSequence;
     private int preparedRootGeneration;
     private weak Control preparedRoot;
+    internal bool cleanHostLayoutValid;
+    private weak AppLoopRegistration cleanHostTicket;
+    private int cleanHostGeneration;
+    private int cleanHostRevision;
+    private Canvas cleanHostCanvas;
+    private int cleanHostW;
+    private int cleanHostH;
+    private weak Control cleanHostRoot;
+    private int cleanHostRootGen;
+    private int cleanHostStructure;
+    private int cleanHostTheme;
+    private int cleanHostScale;
+    private int cleanHostDpi;
+    private int cleanHostTop;
+    private int cleanHostShapeX;
+    private int cleanHostShapeY;
+    private int cleanHostClientW;
+    private int cleanHostClientH;
+    private void RecordCleanHostLayout(AppLoopRegistration ticket) {
+        if (ticket == null || canvas == null) { cleanHostLayoutValid = false; return; }
+        cleanHostLayoutValid = true;
+        cleanHostTicket = ticket;
+        cleanHostGeneration = ticket.generation;
+        cleanHostRevision = hostLayoutRevision;
+        cleanHostCanvas = canvas;
+        cleanHostW = canvas.Width();
+        cleanHostH = canvas.Height();
+        cleanHostRoot = rootControl;
+        cleanHostRootGen = inputRootGeneration;
+        cleanHostStructure = Control.BindingStructureRevision();
+        cleanHostTheme = bgThemeGen;
+        cleanHostScale = metricsScale;
+        cleanHostDpi = dpiScale;
+        cleanHostTop = this.ContentTop();
+        cleanHostShapeX = this.ShapeOffX();
+        cleanHostShapeY = this.ShapeOffY();
+        cleanHostClientW = this.ClientWidth();
+        cleanHostClientH = this.ClientHeight();
+    }
+    private bool CleanHostLayoutCurrent(AppLoopRegistration ticket) {
+        return cleanHostLayoutValid && ticket != null && cleanHostTicket == ticket
+            && ticket.generation == cleanHostGeneration
+            && hostLayoutRevision == cleanHostRevision
+            && canvas != null && canvas == cleanHostCanvas
+            && canvas.Width() == cleanHostW && canvas.Height() == cleanHostH
+            && rootControl == cleanHostRoot && inputRootGeneration == cleanHostRootGen
+            && Control.BindingStructureRevision() == cleanHostStructure
+            && bgThemeGen == cleanHostTheme && metricsScale == cleanHostScale
+            && dpiScale == cleanHostDpi && this.ContentTop() == cleanHostTop
+            && this.ShapeOffX() == cleanHostShapeX && this.ShapeOffY() == cleanHostShapeY
+            && this.ClientWidth() == cleanHostClientW && this.ClientHeight() == cleanHostClientH;
+    }
     internal bool HostPhaseCurrent(AppLoopRegistration ticket, AppPreparationProof proof, int revision) {
         return hostLayoutRevision == revision && this.CurrentHostLayout() == ticket
             && (ticket == null || (proof != null && proof.Current(this)));
@@ -95,8 +147,16 @@ public partial class App {
             if (!this.PrepareChromeTree() || !this.PreparationInputCurrent(phase, sequence)
                 || generation != loopGeneration
                 || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
-            if (!this.SyncPreparationHostLayout(true) || !this.PreparationInputCurrent(phase, sequence)
-                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
+            int pointerType = window.EventFlag() == 1 ? 1 : this.currentPointerType;
+            bool modalDrawerActive = overlayHost != null && themeDrawer != null
+                && overlayHost.ActiveRoot() == themeDrawer;
+            bool skipModalDrawerHostSync = (kind == 1 && !needsRedraw && this.ThemeDrawerHover(pointerType))
+                || (modalDrawerActive && (kind == 1 || kind == 13)
+                    && hostTicket != null && this.CleanHostLayoutCurrent(hostTicket)
+                    && !this.ModelHostsNeedFrameSync());
+            if (!skipModalDrawerHostSync && (!this.SyncPreparationHostLayout(true)
+                || !this.PreparationInputCurrent(phase, sequence)
+                || !this.HostPhaseCurrent(hostTicket, hostProof, revision))) { return false; }
             for (int i = 0; i < tickets.Count; i = i + 1) {
                 if (!this.PreparationInputCurrent(phase, sequence) || generation != loopGeneration
                     || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
@@ -156,9 +216,21 @@ public partial class App {
                 || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
             rootGeneration = inputRootGeneration;
             root = rootControl;
-            if (!this.SyncPreparationHostLayout(false)
-                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
-                || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)) { return false; }
+            int evKind = this.EventKind();
+            bool skipPaintHostSync = overlayHost != null && themeDrawer != null
+                && overlayHost.ActiveRoot() == themeDrawer
+                && hostTicket != null && this.CleanHostLayoutCurrent(hostTicket)
+                && !this.ModelHostsNeedFrameSync()
+                && !Damage.forceFullNext
+                && evKind != 4 && evKind != 5 && evKind != 6 && evKind != 9 && evKind != 14;
+            if (skipPaintHostSync) {
+                hostLayoutSkipCount = hostLayoutSkipCount + 1;
+            } else {
+                if (!this.SyncPreparationHostLayout(false)
+                    || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                    || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)) { return false; }
+                if (hostTicket != null) { this.RecordCleanHostLayout(hostTicket); }
+            }
             for (int i = 0; i < tickets.Count; i = i + 1) {
                 if (!this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)
                     || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
@@ -250,6 +322,9 @@ public partial class App {
         this.ResetFormRegion();
         this.TracePreparationFailure("abort");
         preparationFrameAborted = true;
+        cleanHostLayoutValid = false;
+        drawerOpaquePartial = false;
+        paintingSteadyDrawer = false;
         preparedHostFrameValid = false;
         preparedHostTicket = null;
         preparedHostProof = null;
