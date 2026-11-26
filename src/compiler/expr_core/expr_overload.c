@@ -502,7 +502,19 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
         int pf = type_family(pt), af = type_family(at);
         if (pt->kind == TYPE_OBJECT && (af == FAM_REF || af == FAM_STRING)) return 1;
         if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) return 0;
-        if (pf == af) return 2;
+        if (pf == af) {
+            if (pf == FAM_REF) {
+                if (pt->kind == TYPE_CLASS && at->kind == TYPE_CLASS && pt->sym && at->sym &&
+                    pt->sym != at->sym && !class_derives_from(at->sym, pt->sym)) {
+                    return -1;
+                }
+                if ((pt->kind == TYPE_ARRAY && at->kind == TYPE_CLASS) ||
+                    (pt->kind == TYPE_CLASS && at->kind == TYPE_ARRAY)) {
+                    return -1;
+                }
+            }
+            return 2;
+        }
         if (implicit_ctor_for_arg(g, pt, at, a, locals)) return 1;
         if (pf == FAM_FLOAT && af == FAM_INT) return 0;
         if (pf == FAM_DECIMAL && af == FAM_INT) return 1;
