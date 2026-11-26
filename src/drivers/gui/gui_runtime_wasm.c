@@ -301,7 +301,7 @@ static void *wdisp_record(void *d) {
 static void wdisp_retain(void *d) {
     void *rec = wdisp_record(d);
     if (!rec) return;
-    *(int64_t *)((char *)rec + ZAN_OBJ_RC_OFF) += 1;
+    *ZAN_RC_PTR(rec) += 1;
 }
 
 static void wdisp_release(void *d) {

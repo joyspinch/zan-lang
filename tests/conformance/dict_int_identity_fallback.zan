@@ -1,0 +1,84 @@
+// 整数键字典的自适应哈希对拍：索引先按恒等定位（顺序/稠密键访问连续），
+// 任一插入探测过长即整表退回种子哈希（见 builtin_dict.c ZAN_DICT_KEY_INT）。
+// 覆盖：稠密/步长/2 的高次幂步长（必触发回退）/打包键/高位键/负键；
+// 先稠密后成簇（增量追加路径中途回退）；稠密段内外的缺失查找（plim 截断）；
+// 删除后查找与再插入；TryGetValue 未命中把 out 置 default。
+using System;
+using System.Collections.Generic;
+namespace Conf;
+class Program {
+    static bool Check(string name, long[] keys, int n) {
+        Dict<long, long> d = new Dict<long, long>();
+        for (int i = 0; i < n; i = i + 1) { d[keys[i]] = i * 3 + 1; }
+        bool ok = d.Count == n;
+        for (int i = 0; i < n; i = i + 1) {
+            long v;
+            if (!d.TryGetValue(keys[i], out v) || v != i * 3 + 1) { ok = false; }
+        }
+        // 缺失查找：-k-1 与超出范围的远键都不该命中（键集里没有负的偶数镜像）
+        int miss = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (!d.ContainsKey(-keys[i] - 1)) { miss = miss + 1; }
+            if (!d.ContainsKey(keys[i] + 4611686018427387904L)) { miss = miss + 1; }
+        }
+        if (miss != 2 * n) { ok = false; }
+        // 删除偶数位，再查全部，再把每四个一个写回
+        for (int i = 0; i < n; i = i + 2) { d.Remove(keys[i]); }
+        for (int i = 0; i < n; i = i + 1) {
+            if (d.ContainsKey(keys[i]) != (i % 2 == 1)) { ok = false; }
+        }
+        for (int i = 0; i < n; i = i + 4) { d[keys[i]] = -i; }
+        long s = 0;
+        foreach (long k in d.Keys) { s = s + d[k]; }
+        long want = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (i % 2 == 1) { want = want + i * 3 + 1; }
+            if (i % 4 == 0) { want = want - i; }
+        }
+        if (s != want || d.Count != n / 2 + n / 4) { ok = false; }
+        Console.WriteLine(name + " " + (ok ? "ok" : "FAIL"));
+        return ok;
+    }
+    static void Main() {
+        int n = 3000;
+        long[] a = new long[n];
+        for (int i = 0; i < n; i = i + 1) { a[i] = i; }
+        Check("dense", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = (long)i * 7; }
+        Check("stride7", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = (long)i << 20; }
+        Check("pow2stride", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = ((long)(i / 50) << 16) | (long)(i % 50); }
+        Check("packed", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = (long)i << 40; }
+        Check("high40", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = -(long)i * 5 - 2; }
+        Check("negative", a, n);
+        for (int i = 0; i < n; i = i + 1) { a[i] = i < n / 2 ? (long)i : (long)(i - n / 2 + 1) << 32; }
+        Check("dense_then_clustered", a, n);
+
+        // 稠密段内找不到的键：恒等模式下由 plim 截断探测，不扫整段
+        Dict<int, int> di = new Dict<int, int>();
+        for (int i = 0; i < 100000; i = i + 1) { di[i] = i; }
+        int found = 0;
+        for (int i = 0; i < 100000; i = i + 1) {
+            if (di.ContainsKey(i + 131072)) { found = found + 1; }
+            if (di.ContainsKey(i - 262144)) { found = found + 1; }
+        }
+        Console.WriteLine("dense misses " + found);
+
+        // TryGetValue 未命中：out 为 default(TValue)
+        Dict<char, int> dc = new Dict<char, int>();
+        foreach (char ch in "mississippi") {
+            int c = 99;
+            dc.TryGetValue(ch, out c);
+            dc[ch] = c + 1;
+        }
+        Console.WriteLine("m=" + dc['m'] + " i=" + dc['i'] + " s=" + dc['s'] + " p=" + dc['p']);
+        Dict<int, string> ds = new Dict<int, string>();
+        ds[1] = "one";
+        string sv = "keep";
+        bool hit = ds.TryGetValue(2, out sv);
+        Console.WriteLine(hit + " " + (sv == null));
+    }
+}

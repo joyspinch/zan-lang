@@ -366,7 +366,6 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
 static void emit_weak_destroy_begin_body(zan_irgen_t *g,
                                          LLVMValueRef weak_calloc) {
   LLVMBuilderRef b = g->builder;
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
   LLVMValueRef obj = LLVMGetParam(g->rt_weak_destroy_begin, 0);
 
@@ -386,16 +385,13 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
 
   LLVMPositionBuilderAtEnd(b, lock_bb);
   emit_weak_lock(g, g->rt_weak_destroy_begin);
-  LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-  LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj,
-                                   &neg16, 1, "weak.begin.rcp");
-  LLVMValueRef rcip =
-      LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "weak.begin.rcip");
-  LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "weak.begin.rc");
-  LLVMSetAlignment(rc, 8);
+  LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
+  LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "weak.begin.rcp");
+  LLVMValueRef rc = LLVMBuildLoad2(b, rc_ty, rcip, "weak.begin.rc");
+  LLVMSetAlignment(rc, 4);
   LLVMSetOrdering(rc, LLVMAtomicOrderingAcquire);
   LLVMValueRef is_dead =
-      LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 0, 0), "weak.begin.ok");
+      LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(rc_ty, 0, 0), "weak.begin.ok");
   LLVMBuildCondBr(b, is_dead, scan_bb, abort_bb);
 
   LLVMPositionBuilderAtEnd(b, scan_bb);
@@ -413,7 +409,7 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
 static void emit_weak_load_retain_body(zan_irgen_t *g) {
   LLVMBuilderRef b = g->builder;
   LLVMTypeRef i8ptr = weak_i8ptr(g);
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
   LLVMValueRef slot = LLVMGetParam(g->rt_weak_load_retain, 0);
   LLVMValueRef null = LLVMConstPointerNull(i8ptr);
 
@@ -433,31 +429,27 @@ static void emit_weak_load_retain_body(zan_irgen_t *g) {
                   unlock_bb, check_bb);
 
   LLVMPositionBuilderAtEnd(b, check_bb);
-  LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-  LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), v, &neg16,
-                                   1, "weak.ld.rcp");
-  LLVMValueRef rcip =
-      LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "weak.ld.rcip");
-  LLVMValueRef rc0 = LLVMBuildLoad2(b, i64, rcip, "weak.ld.rc0");
-  LLVMSetAlignment(rc0, 8);
+  LLVMValueRef rcip = zan_rc_ptr(g, b, v, "weak.ld.rcp");
+  LLVMValueRef rc0 = LLVMBuildLoad2(b, rc_ty, rcip, "weak.ld.rc0");
+  LLVMSetAlignment(rc0, 4);
   LLVMSetOrdering(rc0, LLVMAtomicOrderingMonotonic);
   LLVMBuildBr(b, cas_bb);
 
   LLVMPositionBuilderAtEnd(b, cas_bb);
-  LLVMValueRef rc_phi = LLVMBuildPhi(b, i64, "weak.ld.rc");
+  LLVMValueRef rc_phi = LLVMBuildPhi(b, rc_ty, "weak.ld.rc");
   LLVMValueRef is_immortal = LLVMBuildICmp(
-      b, LLVMIntEQ, rc_phi, LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+      b, LLVMIntEQ, rc_phi, LLVMConstInt(rc_ty, ZAN_RC_IMMORTAL, 0),
       "weak.ld.immortal");
   LLVMBuildCondBr(b, is_immortal, unlock_bb, alive_bb);
 
   LLVMPositionBuilderAtEnd(b, alive_bb);
   LLVMValueRef is_alive = LLVMBuildICmp(
-      b, LLVMIntSGT, rc_phi, LLVMConstInt(i64, 0, 0), "weak.ld.isalive");
+      b, LLVMIntSGT, rc_phi, LLVMConstInt(rc_ty, 0, 0), "weak.ld.isalive");
   LLVMBuildCondBr(b, is_alive, try_cas_bb, unlock_bb);
 
   LLVMPositionBuilderAtEnd(b, try_cas_bb);
   LLVMValueRef rc_next =
-      LLVMBuildAdd(b, rc_phi, LLVMConstInt(i64, 1, 0), "weak.ld.rcnext");
+      LLVMBuildAdd(b, rc_phi, LLVMConstInt(rc_ty, 1, 0), "weak.ld.rcnext");
   LLVMValueRef cas = LLVMBuildAtomicCmpXchg(
       b, rcip, rc_phi, rc_next, LLVMAtomicOrderingMonotonic,
       LLVMAtomicOrderingMonotonic, 0);
@@ -559,6 +551,8 @@ void emit_weak_runtime(zan_irgen_t *g) {
  * 必须在 defer 声明建成之后调用：LLVMAddFunction 不查重名，先建会让
  * release_dyn 的同名声明被 mangler 改名（zan_rt_defer_push.5）而指空。 */
 void emit_defer_fallback(zan_irgen_t *g) {
+  if (!g->rt_defer_push || !g->rt_defer_pending || !g->rt_defer_drain)
+    return;
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMBuilderRef b = g->builder;
   LLVMTypeRef ptr = weak_i8ptr(g);
@@ -575,6 +569,9 @@ void emit_defer_fallback(zan_irgen_t *g) {
   LLVMSetLinkage(g->rt_defer_push, LLVMInternalLinkage);
   LLVMSetLinkage(g->rt_defer_pending, LLVMInternalLinkage);
   LLVMSetLinkage(g->rt_defer_drain, LLVMInternalLinkage);
+  zan_mark_nounwind(g, g->rt_defer_push);
+  zan_mark_nounwind(g, g->rt_defer_pending);
+  zan_mark_nounwind(g, g->rt_defer_drain);
 
   LLVMPositionBuilderAtEnd(
       b, LLVMAppendBasicBlockInContext(g->ctx, g->rt_defer_push, "entry"));
@@ -627,13 +624,14 @@ void emit_defer_fallback(zan_irgen_t *g) {
       b, ptr, LLVMBuildStructGEP2(b, node_type, node, 2, "obj.slot"), "obj");
   LLVMBuildStore(b, next, head);
   zan_call2(b, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &node, 1, "");
-  zan_call2(b, dtor_type, dtor, &obj, 1, "");
+  zan_mark_nounwind(g, zan_call2(b, dtor_type, dtor, &obj, 1, ""));
   LLVMBuildBr(b, loop);
 
   LLVMPositionBuilderAtEnd(b, done);
   LLVMBuildStore(b, LLVMConstNull(i32), g->arc_defer_depth);
   LLVMBuildRetVoid(b);
-  LLVMPositionBuilderAtEnd(b, saved);
+  if (saved)
+    LLVMPositionBuilderAtEnd(b, saved);
 }
 
 /* Without rt_mem, heap registration is inert and scans report unavailable. */
@@ -704,6 +702,21 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
   LLVMBasicBlockRef rfg_entry =
       LLVMAppendBasicBlockInContext(g->ctx, reg_fg_fn, "entry");
   LLVMPositionBuilderAtEnd(g->builder, rfg_entry);
+  LLVMBuildRetVoid(g->builder);
+
+  /* 默认模式的站点号 → 描述符表登记（docs/OBJECT_LAYOUT.md）；无运行时
+   * GC 走图的目标（wasm/bare）由这个弱空实现兜底 */
+  LLVMValueRef reg_dt_fn =
+      LLVMGetNamedFunction(g->mod, "zan_rt_register_desc_table");
+  if (!reg_dt_fn) {
+    LLVMTypeRef rdt_args[] = {LLVMPointerType(i8p, 0), i64t};
+    reg_dt_fn = LLVMAddFunction(
+        g->mod, "zan_rt_register_desc_table",
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rdt_args, 2, 0));
+  }
+  LLVMSetLinkage(reg_dt_fn, LLVMWeakAnyLinkage);
+  LLVMPositionBuilderAtEnd(
+      g->builder, LLVMAppendBasicBlockInContext(g->ctx, reg_dt_fn, "entry"));
   LLVMBuildRetVoid(g->builder);
 
   LLVMValueRef col_fn = LLVMGetNamedFunction(g->mod, "zan_gc_collect_cycles");

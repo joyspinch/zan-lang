@@ -15,12 +15,12 @@ extern const unsigned char *zan_embed_bytes(const char *, int *);
 extern int64_t zan_embed_list_alloc(const char *);
 
 static int valid(const char *text, uint32_t len) {
-  uint64_t rc, word;
+  uint64_t rc, word; /* 两个前缀字：len<<32|填充、ZANS|immortal rc */
   if (!text || ((uintptr_t)text & 7))
     return 0;
   memcpy(&rc, text - 16, 8);
   memcpy(&word, text - 8, 8);
-  return rc == ZAN_STRING_SENTINEL_RC && word == ZAN_STR_HDR_WORD(len);
+  return rc == ZAN_STR_LIT_W0(len) && word == ZAN_STR_LIT_W1;
 }
 
 int main(void) {

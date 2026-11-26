@@ -218,6 +218,84 @@ bool decl_is_explicit_layout(zan_symbol_t *sym);
  * 也对得上。结构体是值类型，没有 vptr 槽；显式布局类型自己给偏移，
  * 同样不留。
  */
+/* 2026-11-24 起改为"按继承树"：树根（最上层的非 object 祖先）的所有后代里
+ * 只要有一个类有虚/抽象/覆写方法或实现了接口，整棵树都留槽；整棵树都没有
+ * 多态（binary-trees 的 Node 这类）就不留——槽里永远是 null，白占 8 字节。
+ * 同一棵树里所有类的答案相同，所以基类与派生类对同一字段的下标仍一致。
+ * zanc 是整程序编译器：zan_irgen_emit 在注册任何类布局之前调
+ * class_vptr_plan_compute 扫一遍全部类型声明；计划算出来之前（或计划外的
+ * 类）一律按旧口径留槽。按首字比对身份的分派（接口分派、object.ToString
+ * 候选链）只在有 vptr 的对象上命中：无 vptr 对象的首字是字段值，不会等于
+ * 任何 vtable 的地址。设计见 docs/OBJECT_LAYOUT.md。 */
+static zan_symbol_t **g_vptr_poly_roots; /* 有多态的树根 */
+static int g_vptr_poly_count, g_vptr_poly_cap;
+static zan_symbol_t **g_vptr_known; /* 计划覆盖到的全部类 */
+static int g_vptr_known_count, g_vptr_known_cap;
+static bool g_vptr_plan_ready;
+
+static zan_symbol_t *class_layout_root(zan_symbol_t *sym) {
+    for (int guard = 0; sym && guard < 256; guard++) {
+        zan_symbol_t *base = sym->type && sym->type->base_type ? sym->type->base_type->sym : NULL;
+        if (!base || base == sym || base->kind != SYM_CLASS) break;
+        sym = base;
+    }
+    return sym;
+}
+static bool vptr_set_has(zan_symbol_t **set, int n, zan_symbol_t *sym) {
+    for (int i = 0; i < n; i++)
+        if (set[i] == sym) return true;
+    return false;
+}
+static void vptr_set_add(zan_symbol_t ***set, int *n, int *cap, zan_symbol_t *sym) {
+    if (vptr_set_has(*set, *n, sym)) return;
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        zan_symbol_t **ns = (zan_symbol_t **)realloc(*set, (size_t)nc * sizeof(*ns));
+        if (!ns) {
+            fprintf(stderr, "zanc: out of memory planning class layouts\n");
+            exit(1);
+        }
+        *set = ns;
+        *cap = nc;
+    }
+    (*set)[(*n)++] = sym;
+}
+static void vptr_plan_visit(zan_symbol_t *sym, int depth) {
+    if (!sym || depth > 32) return;
+    if (sym->kind == SYM_CLASS) {
+        vptr_set_add(&g_vptr_known, &g_vptr_known_count, &g_vptr_known_cap, sym);
+        if (class_has_virtual_methods(sym))
+            vptr_set_add(&g_vptr_poly_roots, &g_vptr_poly_count, &g_vptr_poly_cap,
+                         class_layout_root(sym));
+    }
+    if (sym->kind != SYM_CLASS && sym->kind != SYM_STRUCT && sym->kind != SYM_NAMESPACE) return;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m && (m->kind == SYM_CLASS || m->kind == SYM_STRUCT || m->kind == SYM_NAMESPACE))
+            vptr_plan_visit(m, depth + 1);
+    }
+}
+void class_vptr_plan_compute(zan_irgen_t *g, zan_ast_node_t *unit) {
+    g_vptr_poly_count = 0;
+    g_vptr_known_count = 0;
+    g_vptr_plan_ready = false;
+    const char *off = getenv("ZAN_VPTR_ALWAYS");
+    if (off && strcmp(off, "1") == 0) return;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
+        vptr_plan_visit(zan_binder_lookup(g->binder, decl->type_decl.name), 0);
+    }
+    /* 计划之前就注册过布局的类（初始化期的运行时类型）已经按留槽排好了：
+     * 把它们的树根记成"留槽"，整棵树跟着它们走。 */
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *sym = g->struct_types[i].sym;
+        if (sym && sym->kind == SYM_CLASS)
+            vptr_set_add(&g_vptr_poly_roots, &g_vptr_poly_count, &g_vptr_poly_cap,
+                         class_layout_root(sym));
+    }
+    g_vptr_plan_ready = true;
+}
 int class_vptr_offset(zan_symbol_t *sym) {
   if (!sym)
     return 0;
@@ -225,7 +303,15 @@ int class_vptr_offset(zan_symbol_t *sym) {
     return 0;
   if (decl_is_explicit_layout(sym))
     return 0;
-  return 1;
+  if (!g_vptr_plan_ready || sym->kind != SYM_CLASS)
+    return 1;
+  if (class_has_virtual_methods(sym))
+    return 1;
+  zan_symbol_t *root = class_layout_root(sym);
+  if (!vptr_set_has(g_vptr_known, g_vptr_known_count, sym) ||
+      !vptr_set_has(g_vptr_known, g_vptr_known_count, root))
+    return 1;
+  return vptr_set_has(g_vptr_poly_roots, g_vptr_poly_count, root) ? 1 : 0;
 }
 static inline size_t struct_sym_hash(const zan_symbol_t *sym) {
   uintptr_t x = (uintptr_t)sym;
@@ -309,7 +395,10 @@ LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
         LLVMStructTypeInContext(g->ctx, &e->field_llvm[fi], 1, 0);
     return LLVMBuildStructGEP2(g->builder, wrap, raw, 0, name);
   }
-  return LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
+  LLVMValueRef p =
+      LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
+  zan_tbaa_mark_field(g, p, st, fi);
+  return p;
 }
 bool field_member_is_static(zan_symbol_t *m) {
   if (m->modifiers & MOD_STATIC)

@@ -42,7 +42,7 @@ build/zanc src -o _scratch/app.exe
 # 多文件项目：显式列出全部源（Git Bash）
 build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
 
-# Release 发布档（strip + 优化，默认 -Os）
+# Release 发布档（strip + 优化，默认 -O2；要体积给 -Os）
 build/zanc src/main.zan --publish -o app.exe
 ```
 
@@ -170,7 +170,10 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 强引用数"者是根（栈帧、静态字段、未登记对象持有），根可达的都不算；其余
 孤儿只被孤儿引用——ARC 回收不了的环，逐条打印路径，例如
 `cycle: Node@a.zan:5:35 .Next -> List<Node>@a.zan:3:57 [0] -> Node@a.zan:5:35`
-（`.字段`、`[下标]`、Dict 的 `(key)`/`(value)`）。判定口径按退出方式分：
+（`.字段`、`[下标]`、Dict 的 `(key)`/`(value)`）。闭包也在图里：`closure@…`
+经 `.this`、`.target`（方法组接收者）或 `.捕获变量名` 走到被捕获对象，捕获盒
+显示为 `box@… .value`——"处理器列表 → 闭包 → this → 宿主"这类最常见的环能直接
+看到路径。判定口径按退出方式分：
 Main 正常返回（静态字段已释放）时残留对象一律算泄漏；`Environment.Exit` 等
 在 Main 返回前退出时栈帧与静态字段仍活着，只有孤儿环才算泄漏，报表首行写明
 `in unreachable cycles at exit`。
@@ -296,11 +299,113 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `code` | 诊断编号如 `E0032` / `W2072`，字母按**发射时**级别；未编号为 `null` |
 | `message` | 不含 `[E####]` 前缀的消息正文 |
 | `file` `line` `col` `offset` | 位置：`line`/`col` 1 起，**`col` 按字节计**；`offset` 0 起字节偏移 |
+| `end` | 诊断所在 token 的结束位置（不含）`{line, col, offset}`：按源码就地量出的标识符/数字/字面量/运算符长度；成员诊断落在 `.` 上时延到后面的成员名（区间覆盖 `.名字`）；量不出（跨行）时省略 |
 | `fixits[]` | 机器可应用补丁：把 `[offset, offset+length)` 字节替换为 `text`，`length = 0` 即插入；可能为空数组 |
 | summary `errors` `warnings` `suppressed` | 计数；`suppressed` = 错误上限与单行级联帽丢弃的条数；进程退出前输出 |
 
-当前带 fix-it 的诊断：E0032 缺 `;`（插在上一个 token 末尾；上一个 token 是
-字符串或运算符等量不出长度时不给补丁）。退出码语义与文本格式相同。
+当前带 fix-it 的诊断（文本格式的消息里同样带 "did you mean"，补丁只在 JSON 里）：
+
+| 诊断 | 补丁 |
+|---|---|
+| E0032 缺 `;` | 插在上一个 token 末尾（上一个 token 是字符串或运算符等量不出长度时不给） |
+| E2085 / E2084 成员或方法名不存在 | 换成类型（含基类）里拼写最近的同类成员：调用位置只看方法，取值位置看字段/属性/方法 |
+| E1005 未定义的类型 | 换成作用域里拼写最近的类型名（类/结构/接口/枚举/委托） |
+| E2073 条件里写成赋值 | 普通 `=` 换成 `==`（复合赋值不给） |
+| W2111 类之间的强引用环（S11） | 在回指针字段的类型前插入 `weak ` |
+| E2112 / E2113 / E2114 窗体标记里的处理器名 / 绑定路径 / 挂载字段不存在（S20） | 换成窗体类（含基类）里拼写最近的方法 / 字段或属性；补丁的 `file` 是那个 `.html`。同族的 E2115（`bind`/`:属性` 的值不是点分路径或属性名不是标识符）不给补丁 |
+
+zan-lsp 同口径：诊断的 range 用同一个结束位置，带 `code`（如 `E2085`）；有补丁的
+诊断在 `data.fix` 里带上补丁的 LSP range 与 `newText`，`textDocument/codeAction`
+据客户端带回的诊断给出首选 quickfix（标题 "Change to 'X'" / "Insert …" /
+"Replace with …"）。钉：`lsp_diag_fixit_quickfix`。
+
+拼写建议取编辑距离最小的候选（相邻换位算一次；名字 ≤4 字符最多差 1 处，
+更长最多 2 处），**最近的候选有两个就不给补丁**——猜错的补丁比没有更糟；
+编译器合成的名字（`get_`/`set_`/`op_`/`__` 开头）不当建议。退出码语义与文本
+格式相同。钉：`diag_json_fixit`、`diag_json_class_cycle`、`diag_fixits_apply`
+（`tests/test_diag_fixits.py`：逐个夹具把补丁应用回源码再编译必须通过）。
+
+### 1.7 接口摘要（`--summary`，S4）
+
+`zanc <文件|目录...> --summary [--auto-stdlib]` 打印**命令行显式给出的源文件**的
+公开面后退出（类型检查之后、不生成代码；有编译错误时不出摘要、退出码 1）。
+`--auto-stdlib`/包发现拉进来的库只用于解析，不进摘要。供 AI 一次装入一个包的
+接口，替代逐文件翻源码：
+
+```
+public class UiEvent  // 控件事件：单一订阅通道。
+  // namespace Gui
+  public static UiEvent op_add(UiEvent self, Action handler)  // 支持 event += handler（追加，多播）。
+  public int Count()  // 全部订阅数（两种处理器形状合计）。
+public class OrderLine  // A priced line in an order.
+  public static string LoadPrices(string path)  [throws FileNotFoundException; uses File]  // Reads a price list.
+```
+
+- 每个类型一行头（修饰、种类、名字与类型参数、基类型）+ 一行 `// namespace`；
+  每个公开成员一行 C# 形态签名（方法类型参数、`static`/`virtual`/`override`/
+  `async`/`event` 修饰、属性的 `{ get; set; }`）。
+- 列出：类型除显式 `private`/`internal` 外都列；成员只列 `public`/`protected`，
+  接口与枚举成员全列。属性降解出的 `get_X`/`set_X` 不重复列。
+- 文档：声明上方紧邻注释块（`//`、`///`，跳过 `[特性]` 行）的第一句，剥 XML
+  标签，截到第一个 `。` 或 `. `。
+- 效果列 `[throws …; uses …]`（方法与构造器，有才出）：与 §1.7a `--query` 同一
+  口径——可能逃出该成员的异常类型（扣除沿途 catch，rethrow 不计，每个成员最多
+  列 6 个、超出记 `...`）与用到的能力（Net/File/Process/Registry/Clipboard/
+  Native）。全程序一遍：调用图强连通分量定顺序，集合按方法记、分量内迭代到不动点。
+  分配不进摘要（几乎每个方法都分配，只是噪音）；契约列待 P4。
+- 首行 `// zan-summary 1: …` 是格式版本；末行给类型/成员计数。
+- 实测：`packages/Zan.Gui/src` 460 个类型、6350 个成员（1421 行带效果列），约 1.4 秒。
+- 钉：`summary_surface`（`tests/summary/`）。
+
+### 1.7a 符号查询（`--query`，S2）
+
+`zanc <入口...> --auto-stdlib --query <Type.Method | Type.Type | Type | Method>`
+在类型检查通过后回答"这个方法会干什么"，不生成代码；每个匹配一行 JSON，末行
+`{"kind":"summary","matches":N}`（无匹配退出码 1）：
+
+| 字段 | 内容 |
+|---|---|
+| `symbol` / `file` / `line` | `Type.Name(参数)` 与声明位置 |
+| `allocates` | 方法体里直接的分配：`new` 对象/数组、集合初始化、lambda 闭包 |
+| `captures` | 每个 lambda 是否用到 `this`、捕获了哪些外层局部量/形参 |
+| `throws` | `direct`：方法体里**没被本方法 catch 住**的 `throw`；`escapes`：可能逃出本方法的异常类型，每种一条真能逃出来的示例链（只走不收住它的调用点）；`escapes_truncated`：超过 32 种时为 true |
+| `capabilities` | 可达调用里用到的能力（S7 口径）：`Net`、`File`、`Process`、`Registry`、`Clipboard`、`Native`（标准库之外的 extern/DllImport），每项一条证据链 |
+| `calls` / `callers` | 直接调用的方法；全程序里解析到它的调用点（各最多 64 条，`callers_truncated` 标出截断） |
+| `reachable_methods` | 经调用图可达的方法数 |
+
+catch 扣除：只有 `try` 体受本 try 的 catch 保护（catch 体与 finally 不受）；catch
+基类型也收（`catch (IOException)` 收 `FileNotFoundException`），裸 `catch` 与
+`catch (Exception)` 全收；catch 体里 `throw;` 或把捕获变量原样抛出的不算收住。
+lambda 体是委托被调用时才执行的代码：里面的调用与 throw 不算外层方法会抛，但
+算它用到的能力。调用图来自类型检查写在调用节点上的解析结果；`new T(...)` 连到
+T 的同元数构造器；调用解析到虚/抽象/接口方法时同时连到全部 `override` 与接口
+实现（按名字 + 形参个数，沿基类与接口继承逐层找）；方法名当值用（`b.Click +=
+OnClick`、`Action a = Save;`）按当前类型及基类的同名方法连 deferred 边，与 lambda
+同口径。只有经委托变量的调用不连边（目标运行期才定）——所以 `escapes` 仍是上界。单名先当类型名
+列出它的全部方法，没有该类型再按方法名找。实测 702 文件的 GUI 程序查询 < 1 秒。
+钉：`query_symbol_facts`（`tests/test_query.py`）。
+
+### 1.8 一条命令的检查报告（`zan-check`，S5）
+
+`zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run]
+[--no-ui] [--no-replay] [--zanc-arg <参数>]... [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
+stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败步骤（skipped 不算
+失败），1 = 有失败，2 = 参数问题。`zan-check` 用 Zan 写（`src/check/ZanCheck.zan`），
+随工具链发布在 `toolchain/` 下，不依赖 Python；不给 `--zanc` 时用同目录的 `zanc`，
+其次 PATH 上的 `zanc`。程序在当前目录运行。
+
+| 步骤 | 内容 | 失败条件 |
+|---|---|---|
+| `compile` | `zanc … --auto-stdlib --check-leaks --diag=json`：全部诊断原样收进 `diagnostics`（§1.6，含 fix-it 与 `end`），`errors`/`warnings` 计数；失败时附 `other_output`（非 JSON 输出的最后 20 行） | 编译失败 |
+| `leaks` | 运行产物（默认 60 秒超时）并解析退出报告：`leaked`、`sites[{count,site}]`、`cycles[]`（S13 路径）、`mode`（`strict` = Main 正常返回，`early-exit` = 提前退出只计不可达环）；退出码非 0 时附 `output_tail` | 有泄漏、退出码非 0 或超时 |
+| `ui` | S22 布局不变量：在输入里找 `class X : Form` 且同目录有 `X.html` 的窗体，生成检查程序（排在用户源文件之前，它的 `Main` 是入口）离屏装配每个窗体（`Gui.Testing.UiCheck`），100%/150%/200% DPI 各排一帧、再各做一遍伪本地化（静态文本拉长 40%）。问题种类：`truncated`（文字比首选尺寸窄/矮超过 2 逻辑像素，同 `Control.LayoutLint` 的裁剪容差）、`small_target`（可交互控件小于 24 逻辑像素且不满足 WCAG 2.5.8 间距豁免——以它为中心的 24px 圆碰到别的目标）、`overlap`（两个可交互控件相交且互不包含）、`offscreen`（出窗口，滚动容器内不算）、`collapsed`（可交互控件被挤成 0 宽/高）。禁用控件不算交互目标；挂了 `FreeLayout()`（标记 `free-layout` 属性）的子树不查重叠/尺寸——刻意叠放要明说；`<template>` 行模板不查；自己装载标记（`Html.Load`/`HtmlDocs.Read`）的窗体不走声明式装配，跳过。报告 `forms`、`issues`、`pseudo_issues` 与逐次 `checks[{form,scale,pseudo,issues}]`；没有窗体时 `skipped`，`--no-ui` 跳过。GUI 程序需要的 `--driver-dir` 等经 `--zanc-arg` 传 | 真实尺寸（非伪本地化）下有问题、检查程序编不过或没跑完；伪本地化的问题只计数（告警） |
+| `replay` | S26/S27 回放即回归：在输入目录与其上一级找 `replays/*.replay`，按文件里的 `sim <类型名>` 生成检查程序，`Game.Foundation.Replay.Verify` 逐校验点重放、每帧查 `[Invariant]` 规则；仿真类有 `public static int Bot(DeterministicRandom, int)` 时再做机器人模糊（3 个种子 × 2000 帧）。报告 `replays`、`fuzz`、`failed` 与逐次 `runs[{kind,sim,file,seed,ok,frame,result}]`；没有回放时 `skipped`，`--no-replay` 跳过 | 分叉（`diverged at frame N`）、规则违反、崩溃，回放点名了输入里没有的仿真类，或检查程序编不过 |
+
+编译失败时后续步骤记 `skipped` 并写明原因，报告形状不变：
+`{"version":1, "ok":…, "inputs":[…], "steps":[{"name":…, "status":"pass|fail|skipped", …}]}`。
+GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出运行上限（到点杀掉
+直接子进程，leaks 步判失败并写明原因）。钉：`zan_check_report`
+（`tests/test_zan_check.py`）。
 
 ## 2. 全参数表（与 `zanc --help` 同源）
 
@@ -313,7 +418,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 |---|---|---|
 | `-o <file>` | — | 输出文件。**后缀决定产物类型**：`.dll/.so/.dylib`=共享库，`.a/.lib`=静态库，其余=可执行 |
 | `--emit-lib` | 关 | 强制库输出（无 CRT/入口点）；与 `-o` 后缀推断并存时后缀仍决定 shared/static |
-| `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 同样默认 `-O2`（保障发布程序运行时吞吐），需极限体积时显式传 `-Os`/`-Oz`。显式 `-O` 覆盖默认，但 `-g` 总是强制 `-O0` |
+| `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 同样默认 `-O2`（保障发布程序运行时吞吐；要体积显式给 `-Os`，`-Oz` 极限体积用于边缘/嵌入式）。显式 `-O` 覆盖默认，但 `-g` 总是强制 `-O0` |
 | `-fno-opt-<pass>` | 关 | 跳过单个自定义优化 pass（二分定位用）：`early/escape/arc/devirt/constfold/dce/inline/shrink`；未知 pass 名报用法错误 |
 | `--early-passes=<list>` | — | 覆盖早期 LLVM pass 管线（如 `sroa,early-cse`），`none` 跳过整个早期阶段 |
 | `--opt-pipeline=<text>` | — | 覆盖主 LLVM pass 管线文本，`none` 跳过 LLVM 管线 |
@@ -328,7 +433,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `--no-stdlib` | — | 关自动 stdlib **和**包发现；`--no-packages` 只关包 |
 | `--no-packages` | — | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
 | `--no-pullin-filter` | 关 | 关闭拉入过滤（调试用；未给时回退读 `ZAN_NO_PULLIN_FILTER`，显式 CLI 优先） |
-| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）。ELF/PE 以 `--wrap=malloc/free/calloc/realloc` 接管全镜像；Apple（ld64 无 `--wrap`）改为把 Zan 生成代码的分配调用改名指向 `zan_mem_*`，C 运行时/驱动仍用 libc，跨界的 `free`/`realloc` 由注册的 `zan_mem` malloc zone 回送。交叉目标不链；目标无分配器对象时告警并回退 CRT |
+| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）。ELF/PE 以 `--wrap=malloc/free/calloc/realloc` 接管全镜像；Apple（ld64 无 `--wrap`）改为把 Zan 生成代码的分配调用改名指向 `zan_mem_*`，C 运行时/驱动仍用 libc，跨界的 `free`/`realloc` 由注册的 `zan_mem` malloc zone 回送（交叉 macOS/iOS 在 `<zanc>/macos/<arch>/`、`ios/arm64/` 有 `zanrt_mem.o` 时同样改名链入）。其余交叉目标不链；目标无分配器对象时告警并回退 CRT |
 | `--no-fast-alloc` | — | 原生回退 CRT malloc——排查堆问题、或块需交还外部 CRT/驱动边界时用；与 `--fast-alloc` 同现时后写的生效 |
 | `-L<dir>` / `--libpath <dir>` | — | 追加原生库搜索目录（可重复） |
 | `--driver-dir <d>` | 内建目录 | 覆盖内建原生驱动目录（测试门指向新编的 zan_gui） |
@@ -339,18 +444,19 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `--no-icon` | — | 不嵌入任何图标（跳过 `--icon` 与内建默认）；仅 Windows PE |
 | `--default-icon` | — | 显式嵌入内建图标；只有 `--publish` 需要它（非发布档本来就嵌内建图标） |
 | `--quiet, -q` | — | 静默 stdout 进度行（驱动装运、APK 打包、`Compiled N files` 汇总） |
-| `--time` | — | 打印各阶段耗时与规模统计 |
+| `--time` | — | 打印各阶段耗时与规模统计（含一行 `build cache:` 命中/未命中与耗时；分区后端另有一行 `partition:`：单元数、命中/编译数、搬出与留在剩余模块的指令数） |
+| `--no-build-cache` | 缓存**开** | 关闭 LLVM 后端构建缓存（[`BUILD_CACHE.md`](BUILD_CACHE.md)）：优化前模块与最终模块按内容哈希记忆化优化结果和目标文件，重复构建跳过优化与后端，产物与关缓存逐字节相同。键含 zanc 二进制（路径/大小/mtime）、除 `-o`/`--emit-deps`/`--time` 外的全部参数与全部 `ZAN_*` 环境变量；`ZAN_BUILD_CACHE=0` 等效；`--emit-ir` 不走优化表 |
 | `-D<name>[=v]` | — | 预处理符号 |
 | `@<file>` | — | 响应文件（一行一个或空白分隔，带空格路径用引号，`#` 起注释，最多嵌套 8 层）——**超长命令行/含空格路径用它** |
 | （位置参数，文件/目录） | — | `.zan` 文件，或**目录**（递归展开 `*.zan`，按路径排序）。目录输入跳过 `.` 前缀与 `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` 等目录；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 会被 "the compile-time HTML channel has been removed" 拒绝——界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
 | （无旗标，按目标自动） | — | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
-| （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生不链（ld64 无 `--wrap`）；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
+| （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生与交叉（bundle 有对象时）经发射期改名 `zan_mem_*` 链入（ld64 无 `--wrap`）；Apple 链接一律 `-dead_strip`，未用到异步的程序不再调 `zan_co_sched_init`、不带 M:N 调度器；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
 | `--version, -v` / `--help, -h` | — | 版本 / 帮助；`--version` 输出 `zanc X.Y.Z (gen0)`——代次标记（B-ID189）由自举差分门盖进报告指纹；自举驱动（gen1）同旗标输出 `(gen1)`，字面量由 `bump_version.ps1` 与 VERSION 同步，漂移即门失败 |
 
 ### 2.2 发布（Publish）
 | 参数 | 取值 / 默认 | 说明 |
 |---|---|---|
-| `--publish` | 关 | 发布档：默认 `-O2` + 后端 codegen `-O3`、分片前执行闭世界去虚化/nothrow 折叠、链接期 strip（同 `--strip-symbols`）、启用 shard 模块优化（需控极限体积可配 `-Os`/`-Oz`）；`--check-leaks`/`--arc-guard` 默认关（显式传入仍生效）；**over-release 网默认开**（未显式给 `--arc-guard`/`--no-arc-guard` 时）；内建图标默认不嵌（`--default-icon` 可显式开启） |
+| `--publish` | 关 | 发布档：默认 `-O2` + 后端 codegen `-O3`、整模块优化（跨文件内联与普通构建相同；优化前分片默认关闭，`ZAN_SHARD=1` 显式开启并启用 shard 模块优化）、闭世界去虚化/nothrow 折叠、链接期 strip（同 `--strip-symbols`）（需控极限体积可配 `-Os`/`-Oz`）；`--check-leaks`/`--arc-guard` 默认关（显式传入仍生效）；**over-release 网默认开**（未显式给 `--arc-guard`/`--no-arc-guard` 时）；内建图标默认不嵌（`--default-icon` 可显式开启） |
 | `--strip-symbols` | 关 | 链接期 `-s` + ICF + 链接优化；`--publish` 已隐含；单独使用时只加 strip、不改优化档 |
 | `--link-mode <shared\|static>` | shared | 发布时原生驱动链接方式：shared 拷驱动到 exe 旁，static 链进 exe |
 | `--obfuscate-strings` | 关 | XOR 混淆用户字符串字面量（非 `-g` 时顺带裁剪 stdlib 函数体）；CLI 优先于环境变量 `ZAN_OBF=1`（内部/未稳定） |
@@ -368,6 +474,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `--no-arc-guard` | — | 关检疫，同时关掉 `--publish` 默认的 over-release 网 |
 | `--runtime-checks` | **开** | 启用运行时守卫（如数组/切片越界、除零）；发布档也默认开 |
 | `--no-runtime-checks` | — | 关运行时守卫；与 `--runtime-checks` 同现时后写的生效 |
+| `--fp-contract` | 关 | 允许把同一表达式里的 `a*b+c` / `a*b-c` / `c-a*b` 融合为一条 FMA（`llvm.fmuladd`，同 clang 默认的 `-ffp-contract=on`：不跨语句）。浮点密集循环可快 20–30%（mandel 0.52 → 0.40s，与 C 持平）；代价是结果末位可能因 CPU 而异，故默认关（默认与 C# 一样跨平台逐位一致）。钉：`case_fp_contract` / `case_fp_contract_flag` |
 | `--checked` | 关 | 全局 checked 算术（C# `/checked+` 等价）：全部整型算术溢出抛 `OverflowException`（含 `-` 取负、`++`/`--`、窄化强转）；`unchecked(){ }` 块局部豁免。默认（关）为 C# 默认的 unchecked 环绕语义。钉：`case_checked_arith_default`/`case_checked_arith_flag` |
 | `--strict-runtime` | 关 | 守卫失败直接 `exit(70)`；`ZAN_RT_HARD` 非空且非 `0` 等效；`ZAN_RT_HARD=0` 显式压回软模式 |
 | `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
@@ -380,6 +487,9 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `zanc --compile-ir <input.ll> -o <object>` | `-O2` | 将 LLVM IR 优化并编译为对象文件。可用 `--target <LLVM triple>` 指定目标，以及 `-O0` 至 `-O3`、`-Os`、`-Oz` 选择优化等级 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
+| `--summary` | — | 打印显式输入源文件的公开接口摘要后退出（S4，见 §1.7） |
+| `--query <sym>` | — | 类型检查后输出方法的分配/捕获/抛出/能力/调用者（JSON Lines）并退出（S2，见 §1.7a） |
+| `--emit-deps <f>` | — | 类型检查通过后把实际编进程序的源文件（拉入过滤之后，绝对路径一行一个）写到 `<f>`，照常继续编译（S3，见 §5） |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 | `--diagnostics-format=jsonl` / `--diagnostics-format=text` | `text` | C 宿主和自举编译器均支持。`jsonl` 按行向 stderr 写入 UTF-8 JSON。同一命令中后写的格式生效。 |
 | `--semantic-refs <file> <line> <col>` | — | C 编译器完成类型检查后查询指定位置的语义绑定，向 stdout 写一行 JSON。 |
@@ -458,11 +568,30 @@ GUI 窗口 HTML 与片段在发布时逐项声明。直接调用 zanc 时传入
 | `ZAN_VERBOSE_LINK` | 回显原生链接命令行（查 -L/-l 从哪来） |
 | `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策（`incl <文件> because <名字>`：`controller` 表示按 MVC 控制器常驻拉入） |
 | `ZAN_LINK_ECHO` | 回显链接命令（含 Unix 宿主 `cc` 链接，可看分片对象是否在链接行上） |
-| `ZAN_CODEGEN_SPLIT` | 优化后的模块 ≥20 万条指令时，目标文件代码生成按 `llvm::SplitModule` 切成多份、多线程并行发射（各线程独立 LLVMContext/TargetMachine，额外分区 `<out>.o.p<N>.o` 一并链接）；只影响本机、非交叉、非 `-g`、非库构建，不影响内联与运行速度。`=0` 关闭，`=N` 强制 N 份（上限 16，保持链接命令行短于 cmd.exe 的 8191 字符） |
+| `ZAN_CODEGEN_SPLIT` | 内联完成后的模块 ≥20 万条指令时，按 `llvm::SplitModule` 切成多份、多线程并行跑 LLVM 管线的后半段（向量化/展开/收尾清理）与目标文件代码生成（各线程独立 LLVMContext/TargetMachine，额外分区 `<out>.o.p<N>.o` 一并链接）；只影响本机、非交叉、非 `-g`、非库构建，不影响内联与运行速度。`=0` 关闭，`=N` 强制 N 份（上限 16，保持链接命令行短于 cmd.exe 的 8191 字符） |
+| `ZAN_OPT_SPLIT` | `=0` 时 LLVM 管线整段在优化阶段对整模块跑完（旧行为，仅供 A/B）。默认直接产出目标文件的构建只在优化阶段跑 `default<ON>` 的前半段（内联 + 函数化简，需整模块），后半段留到目标文件发射：切分时逐分区并行跑，不切分时整模块跑，结果与一段跑相同（`--emit-ir`、`ZAN_OPT_PIPELINE`、`ZAN_DUMP_OPT_IR` 自动走一段） |
+| `ZAN_SHARD` / `ZAN_NO_SHARD` | `ZAN_SHARD=1` 打开优化**前**分片（本机非交叉）：峰值内存与编译时间更低（自举编译器约 400MB/22s 对整模块 1.3GB/35s），但跨分片不内联，产物慢 10–20%；`ZAN_SHARD=0` 或 `ZAN_NO_SHARD=1` 关闭。`ZAN_SHARD_MAX_FN` / `ZAN_SHARD_MAX_INSN` 调单片上限 |
+| `ZAN_SPLIT_TRACE` | 非空时打印切分阶段各步的进程内存（切分前 / 分区序列化后 / 释放原模块后 / 并行发射后） |
 | `ZAN_HUGE_FN` | `-O2`/`-O3` 时，优化前指令数超过此值（默认 4000，`0` 关闭）的函数加 `optsize`，降低往超大分派函数里内联的阈值 |
 | `ZAN_DIAG_LIB_BODIES` | `=1` 时普通（封闭世界）构建也为未达到的标准库/`packages/` 方法生成一遍代码以报代码生成诊断（默认只诊断用户源码里未达到的方法；库由自身构建与测试覆盖） |
+| `ZAN_EH_FN_MARK` | `=1` 时每个方法/lambda 入口都记临时栈标记、落地垫都回卷到它（旧行为）。默认只有函数体压过临时（`__zan_eh_tmp_push`）的函数才记，其余函数省掉入口线程 EH 状态读取与回卷调用，仅供 A/B |
+| `ZAN_NO_LATE_ARC` | `=1` 关闭内联后 ARC 收尾（默认 `-O2`/`-O3`/`-Os`/`-Oz` 开启：retain/release 与临时栈 push/pop 助手在 LLVM 主管线中保持外联，管线后消去同块或经软空守卫分叉的 retain/release 对、窗口内不会展开的 push/pop 对，再按原内联属性内联助手），仅供 A/B |
+| `ZAN_LATE_ARC_STATS` | 非空时在 stderr 打印内联后 ARC 收尾消去的 push/pop 对与 retain/release 对数 |
+| `ZAN_DUMP_LATE_ARC_IR` | `=<路径>` 落盘内联后 ARC 收尾之前的模块 IR（排查消对是否命中） |
+| `ZAN_NO_GUARD_VERSION` | `=1` 关闭软守卫版本化（默认 `-O2`/`-O3` 开启：含软运行时检查的循环克隆出无检查快环，第一个失败的检查从同一站点交给原循环全检查地跑完；循环不变守卫外提到预头部；报告次序与语义不变），仅供 A/B |
+| `ZAN_GUARD_VERSION_STATS` | `=1` 打印版本化了多少区域/整环；`=2` 逐个列出函数、种类与指令数 |
+| `ZAN_NO_TBAA` | `=1` 关闭字段别名元数据（默认优化构建给经 `emit_field_ptr` 的标量字段读写打按字段字节偏移的 TBAA 标签，告诉 LLVM 同一对象不同偏移的字段互不别名；显式布局结构不打），仅供 A/B 与排查疑似误编译 |
+| `ZAN_DLG_PIN_ALL` | `=1` 时每次委托调用都 retain 闭包并压临时栈（旧行为）。默认对函数内从不写、不按 ref 传、不被 lambda 捕获的局部/形参委托省掉这套簿记，仅供 A/B |
+| `ZAN_SOFT_SHARED_SCRATCH` | **运行时**环境变量：非空时软失败（try 外空引用继续执行）沿用旧的进程共享 4 KB 暂存区。默认每个出过软失败的线程惰性映射私有暂存（[保护页][头 + 1 MiB][保护页]，超出即触保护页而非写坏相邻内存），线程退出时清零后回池复用，仅供 A/B |
+| `ZAN_KEEP_DEAD_EH_STATE` | `=1` 时优化前不删除无人使用的线程 EH 状态查找（`__zan_eh_state_fast`）。默认删除——原子 TSD 键读与惰性初始化调用不会被 LLVM 消掉，函数内联进循环后每轮都付一次，仅供 A/B |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
-| `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
+| `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断；设置时自动关闭构建缓存（命中会吞掉旁路输出，`ZAN_DUMP_OPT_IR` 同理） |
+| `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |
+| `ZAN_CACHE_DIR` | 构建缓存根目录（条目在其下 `backend/`；`backend/` 建为 0700，条目 0600；POSIX 上 `backend/` 必须归当前用户且不可被组/他人写（自己的会被收紧），其父目录须归当前用户或 root 且不可被他人写（带粘滞位的如 `/tmp` 除外），否则告警并关缓存；读取时条目不是当前用户所有的普通文件或可被他人写即视为未命中重建）；缺省为平台用户缓存目录下 `zan/backend`（macOS `~/Library/Caches`、Linux `$XDG_CACHE_HOME` 或 `~/.cache`、Windows `%LOCALAPPDATA%`） |
+| `ZAN_CACHE_PRUNE` | 构建缓存清理策略（LLVM `pruneCache` 语法），缺省 `prune_interval=20m:prune_after=168h:cache_size_bytes=4g` |
+| `ZAN_PARTITION` | `=0` 关闭分区后端（[`BUILD_CACHE.md`](BUILD_CACHE.md) 阶段 2）。缺省开：本机原生、非 `--publish`、`-O1` 及以上的可执行构建，单元函数体合计不少于 `ZAN_PART_MIN_INSNS` 条指令时，按来源单元（stdlib/包目录、每个用户源文件）切成独立模块并行优化、出码，按单元内容缓存；改用户代码只重编该文件的单元与剩余模块。`ZAN_OPT_PIPELINE`、`ZAN_DUMP_OPT_IR`、`ZAN_SHARD=1`、`-g`、库输出自动走整模块 |
+| `ZAN_PART_MIN_INSNS` | 分区门槛（单元函数体合计指令数），缺省 20000；`=0` 小程序也分区（测试用） |
+| `ZAN_PART_DUMP` | 调试：把每个单元的规范模块以 `<序号>-<单元>.ll` 写进该目录，对比两次构建哪个单元变了（不进缓存键） |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |
 | `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |
@@ -479,6 +608,8 @@ GUI 窗口 HTML 与片段在发布时逐项声明。直接调用 zanc 时传入
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
+| `ZAN_UI_DUMP` | GUI 程序**运行期**（仅启用了 UiDriver 自动化的程序认——模板生成的应用在 `OnLoad` 里调用 `Gui.Backend.UiDriver.Enable(app)`，默认已启用；Testing 是旁路层，核心层不依赖它，未启用的程序与发布构建不带 UiDriver）：设为文件路径时，首帧完整呈现后把当前窗口的语义树写成 JSON 并退出（S21）。每个节点：`kind`（角色）、`name`、`text`、`value`、`isChecked`、`enabled`（按祖先链折算）、`visible`、`focused`、`x/y/w/h` 与首选尺寸、`kids`。`ZAN_UI_SCRIPT`（UiDriver 脚本）同样只在启用的程序里生效 |
+| `ZAN_CYCLE_AUDIT` | **编译期**：设为非 `0` 时 S11 类型图强环检查（W2111）连标准库与 packages 里的类一起报，用于库审计；默认只报用户代码 |
 | `ZAN_LEAK_LOG` | `--check-leaks` 产物退出时把泄漏报表副本追加到此路径（默认工作目录下 `zan_leaks.log`；设为空串只打印不落盘）。测试驱动指向 `build/test-out/leaks/<用例>.log`，不再污染仓库根 |
 | `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |
 | `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |
@@ -516,6 +647,16 @@ stamp，并发构建会让无关用例成批假红）。
 2. **重新 configure**（`cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`）
    ——GLOB 在 configure 期展开，不重跑 ctest 看不到新用例。
 3. `ctest -R conformance_<name>` 验证。
+
+**受影响用例（S3）**：`python3 scripts/affected.py <改动文件...>`（或 `--git` 取
+工作区改动、`--diff x.patch`）列出受影响的 ctest 用例并给出锚定的 `ctest -R`
+命令。用例引用的文件 = 注册参数里的源文件/夹具/金样/驱动脚本 + 编译器记下的真实
+依赖——`tests/run_case.cmake` 与 `run_case_modes.cmake` 以
+`zanc --emit-deps <产物>.deps` 编译，拉入过滤后实际编进程序的每个标准库/包文件都在
+里面。默认避开 det 孪生（`--with-det` 包含），超过预算（`--budget`，默认 80）只报
+数量；编译器/运行时原生源码、`CMakeLists.txt`、文档不猜名单，在 notes 里说明
+怎么办。从未带依赖记录编过的用例只按注册参数匹配（notes 报数量），跑过一次即补齐。
+`--json` 输出 `{tests, count, over_budget, det_skipped, ctest_regex, notes}`。
 
 **泄漏门禁（S10）**：经 `tests/run_case.cmake` 的用例默认追加 `--check-leaks` 编译，
 退出时仍可达对象数必须为 0——泄漏报表从 stdout 尾部切下单独判定，不进金样对账。

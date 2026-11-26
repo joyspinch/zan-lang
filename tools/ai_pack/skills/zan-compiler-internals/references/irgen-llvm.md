@@ -815,3 +815,304 @@ gui_tabs 全程 21.6s/1.34GB → 11.9s/760MB。谓词从"只在发布跑"变成"
 诊断补发现仅限用户源码：封闭世界下未达的 stdlib/`packages/` 方法不再生成
 （`from_stdlib`/`from_package` 看 `type_sym->decl`）；`-g` 等全量构建不能跳过——
 那里补发的方法体会以 live=3 保留给反射。`ZAN_DIAG_LIB_BODIES=1` 恢复库覆盖。
+
+## 37. 每次调用都付的税：入口 EH 簿记要按"本函数是否压过临时"省掉（2026-11-24 Mac arm64 实证）
+
+跨语言基准 fib(40)：Zan 0.24s，C/Rust 0.18s。-O2 IR 里每个方法入口都取一次线程
+EH 状态（TSD `mrs TPIDRRO_EL0` + 判空 + 慢路径）、读 `tmps.top` 存入 `fn.tmp.mark`，
+递归调用全是 invoke + 落地垫调 `__zan_eh_tmp_unwind`——哪怕函数一个临时都不压。
+`__zan_eh_tmp_unwind` 恒 MAYTHROW，LLVM 删不掉这套东西，连尾递归消除都做不成。
+
+修法：`g->eh_tmp_push_seq` 在 `emit_eh_tmp_push[_slot]` 处自增；`init_fn_lpad` 记起点，
+`finish_fn_lpad` 时没变就不发 unwind，并用 `eh_drop_tmp_mark` 删掉入口 alloca/store/
+load 及无人用的字段 GEP 与状态取址（同步清 `eh_state_cached`/`eh_state_fields`）。
+无需释放局部的落地垫只剩 cleanup+resume，LLVM 折成普通 call。依据：本帧 mark 之上的
+临时只能来自本帧——压过临时的被调帧各自回卷，没有函数级落地垫的帧（async 体）由
+awaiter 或最近的 catch 回卷到更低的 mark。fib 0.24s → 0.18s（与 C 持平），字符串
+构建 0.32 → 0.30s。`ZAN_EH_FN_MARK=1` 恢复旧行为做 A/B。
+
+连带暴露：macOS `CLOCK_MONOTONIC` 只按整微秒走，而 `Stopwatch.Frequency()` 报
+1GHz——调用变快后 `case_bench_suite` 的"measured time is positive"大概率读到 0。
+Apple 上改用 `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)`（41.7ns 分辨率，含睡眠）。
+测试"变快后才失败"先怀疑测量工具的分辨率，别回退优化。
+
+## 38. 构建缓存：计时先关缓存；按模块字节做键要先读回（2026-11-24 Mac arm64 实证）
+
+zanc 默认开 LLVM 后端缓存（`docs/BUILD_CACHE.md`）：优化前模块与最终模块的 bitcode
+哈希命中时直接取优化结果与目标文件，`--time` 里 optimize/write obj 几乎归零。
+**给优化器或后端做 A/B 计时，一律加 `--no-build-cache`**（或重建/`touch` zanc——
+二进制 mtime 在键里）；`--time` 末尾的 `build cache:` 行能看出这次是否命中。
+
+键只认"闭世界、泛型、反射决定完之后的模块字节"，不重做任何决策，所以正确性不靠缓存
+理解这些规则。踩过的两个坑：
+- **bitcode writer 不是模块语义的函数**：同一个模块，优化后在内存里直接写，与读回后
+  再写，字节不同——函数内符号表按 StringMap 的插入历史排序，`mustprogress` 读回时被丢。
+  未命中路径存档后必须**改用读回的模块**继续，下一次构建的对象键才对得上。
+- **结构体类型名在 LLVMContext 里**：读进 irgen 同一个上下文，同名类型会变成
+  `String.1`，字节又不同。存档前把结构体类型去名（优化后没有按名找类型的代码）。
+- **优化之后 `irgen.mod` 是另一个模块**（命中换入缓存模块，未命中换入读回模块）。
+  优化后跑的代码只能按名字找函数/全局（`LLVMGetNamedFunction`），不能用 irgen 缓存的
+  `g->rt_*`、`g->functions` 等 LLVMValueRef——那是悬垂指针，不崩但判断静默出错
+  （实例：`zan_strip_unused_co_sched_init` 用 `g->rt_co_sched_init`，缓存构建不删调用，
+  exe 比关缓存大 38 KB，`build_cache_memo` 的"关缓存产物相同"抓到）。
+验证三件套：冷/热/`--no-build-cache` 三次产物 `cmp` 逐字节相同；用例 `build_cache_memo`。
+
+## 39. 内联后才相遇的 retain/release 要在内联后消（2026-11-24 Mac arm64 实证）
+
+`Make(i).Get()`（Make 返回静态字段，+1）100M 次循环 1.0s，换成局部变量也一样——
+不是临时栈的锅：每轮两次原子 retain/release。早期 `zan_opt_arc` 在内联前跑，
+retain 在 Make 里、release 在调用方；内联后 retain/release 自己也被内联成原子
+指令，没人能配对。做法：主管线期间 `zan_rt_retain/release[_dyn]`、`zan_rt_str_*`、
+`__zan_eh_tmp_push/pop` 加 noinline（记下原 alwaysinline），管线后：
+1. push(v)…pop 同块且窗口无可展开调用 → 删（临时栈条目只在展开时读）；
+2. 同块 retain(x)…release(x)，窗口满足 `is_safe_arc_intermediate` 且**不含任何
+   异对象 release**（B-ID96 别名规则，同早期 pass）→ 删；
+3. 软空守卫形态：retain(x) 在 B 末尾，B 分叉到冷报告块 T 与合流块 S，S 里
+   release(phi[x,B][scratch,T]) 或 release(x)：删 retain，T 顶部补回 retain，S 改
+   release 一个 B 边为 null 的新 phi；
+4. 恢复原内联属性，跑 `cgscc(inline)` + 轻量清理。
+结果 1.0s → 0.03–0.11s，`--publish`（-Os）同样受益。
+
+踩坑：第 4 步一开始给所有助手加 alwaysinline，把原本冷路径上外联的大 release
+全内联了，自举编译器 54s/1.6GB/8.3MB → 160s/4.2GB/23MB。必须恢复**原**属性交给
+代价模型。真实程序命中少（自举 17 对、gui_tabs 29 对），收益集中在 getter/属性
+链热循环；编译时间与产物大小不变。
+
+另：`selfhost_diff` 的 firebird_wire 5s 超时在机器 load 25+ 时必然抖（3s user
+→ 5–6s wall，无界空闲链版本同样超时）；先看 user 时间再下结论。owner 节点
+缓存深度改存在空闲链头节点里，少一个 thread_local（Mach-O 每次访问都是
+`_tlv_get_addr`）。
+
+## 40. 对齐 C 先建对照基准，再逐项拆因（2026-11-24 Mac arm64 实证）
+
+`_scratch/bench_suite/`（Zan 与 C/C++ 成对、`run.py` 比 user+sys）一次找出 7 个
+差距。先用 `--no-runtime-checks` 把"守卫"与"其余"分开，再对 C 侧做反向实验
+（`-ffp-contract=off`、`-fno-strict-aliasing`、把常量 n 改 volatile、结构数组改
+指针数组）定位到底是哪一个语言/编译器差异——比读汇编猜快得多。
+
+- **委托调用 10×**：每次经 Func 形参调用都 retain 闭包 + 临时栈 push/pop
+  （两次原子 + 两次 TSD 查找）。形参/局部若函数内从不写、不按 ref 传、不被
+  lambda 捕获（`body_writes_ident` + 按名 `local_is_lambda_captured`；形参没有
+  binding_decl，按名构造 AST_PARAM 查即可），槽位自身的引用保证闭包存活，
+  省掉整套簿记：1.48s → 0.15s（= C 函数指针）。
+- **nbody 去守卫后仍 2.2×**：C 加 `-fno-strict-aliasing` 正好慢到 Zan 的水平——
+  缺 TBAA。`emit_field_ptr` 给字段地址打 `!zan.fo`（字段字节偏移），`opt_tbaa.c`
+  在优化前把它转成 load/store 的 `!tbaa`。按**偏移**而非类做键：不同对象不重叠，
+  派生类前缀布局相同，同对象不同偏移的标量字段不重叠——这三条成立就安全；
+  显式布局（可重叠）、聚合类型字段、访问类型≠字段类型一律不打（不打=与谁都
+  可能别名）。0.79s → 0.41s（= C 指针版）。`ZAN_NO_TBAA=1` 做 A/B。
+- 内联后 ARC 收尾扩到跨循环区域：`Body a = bs[i]` 的 retain 在外层、release 在
+  内层循环之后；区域内无调用/指针存储/异对象 release、所有路径都到 release、
+  区域块只从区域内进入，才可消。
+- 守卫（软失败 phi(x, scratch) 让 LLVM 无法证明非空）、Dictionary、Array.Sort、
+  分配器是独立根因，各自另开任务。
+
+## 41. 发布档提速与优化并行：切在内联之后，别切在内联之前（2026-11-24 Mac arm64 实证）
+
+`--publish` 比 `-O2` 慢有两个独立原因，要分开量：默认 `-Os`（全函数 optsize）和
+优化**前**分片（shard，跨分片不内联）。自举编译器编自身（CPU 秒，同一时段）：`-O2`
+3.54；旧 publish 4.28；publish 不分片仍 `-Os` 4.37；publish `-O2` 仍分片 4.49。
+修法：publish 默认 `-O2`、不再默认分片（`ZAN_SHARD=1` 仍可显式开，换内存/编译时间），
+产物与 `-O2` 同速（12.8–13.2G），代价是体积 4.6MB → 8.1MB、编译 22s → ~34s、峰值
+~1.4GB（整模块内联本身就要 ~600MB，分片的 ~400MB 做不到）。
+
+优化并行（`codegen_split.cpp`）：`buildPerModuleDefaultPipeline` = 模块化简半段
+（CGSCC 内联 + 函数化简，需整模块）+ 模块优化半段（向量化/展开/收尾，函数局部）。
+优化阶段只跑前半段，后半段随 SplitModule 分区在各线程里跑完再发射。两段拼起来与
+`default<O2>` 逐函数相同（`ZAN_CODEGEN_SPLIT=0` 下对比 `otool -tv`）。优化阶段
+22.4s → 18.5s，总 30.5s → 27.6s（交替 5 轮取最小）。坑：
+- 分区后半段末尾的 GlobalDCE 会删掉本分区不再引用、但别的分区还在引用的
+  `linkonce[_odr]` 定义（虚表）→ 链接缺符号。切分前把它们改成 `weak[_odr]`。
+- 节准备（Apple fast-alloc 改名 malloc→zan_mem_*、COFF 函数节）必须在后半段之后，
+  改为每分区优化完回调 `zan_irgen_prepare_object_sections`。
+- 需要整模块的 pass 只能放在两半之间：§39 的内联后 ARC 收尾要把 ARC 辅助函数再内联
+  回去，分区里它们只是声明，所以它跑在前半段之后、切分之前。
+- 构建缓存（§38）缓存的是前半段后的模块：键里区分"后半段待跑"，命中时用
+  `zan_opt_plan_finish` 恢复同样的待跑状态，否则命中会静默跳过后半段。
+
+ThinLTO（试过，没落地）：llvm-split → 各分区 `thinlto-pre-link<O2>` → `llvm-lto2`
+进程内后端，编译 ~16s，但产物指令数 +17–22%、cycles +6%；调大
+`-import-instr-limit` 更差。整模块化简贵（单独 opt 24s，而 12 个分区各自化简合计
+<10s）恰恰因为跨分区内联多——这正是运行速度的来源，ThinLTO 补不回来。
+
+度量坑：同一份 IR 只换代码布局（不同切分份数）的自举编译器，`time -l` 的
+instructions retired 就能差 10%（程序行为依赖地址）。单个二进制 A/B 无效：每种
+配置至少编 3–4 个不同切分份数的二进制、各跑多轮取均值；机器负载 >20 时 wall time
+没有意义，用 cycles。
+
+## 42. 排序与 List 循环：先看算法，再看检查（2026-11-24 Mac arm64 实证）
+
+- **先拿 C 移植版对照**：`Array.Sort(int[])` 慢 C++ 3×，看着像代码生成问题，其实
+  把 Zan 的内省排序逐行抄成 C 也是 0.29 s——关掉运行期检查的 Zan IR 已和 C 一样
+  干净。差距是算法：libc++ 对算术类型用位图分块划分（BlockQuickSort），比较
+  结果不再驱动分支；随机数据上 Hoare 划分每元素一次误预测。改成 64 元素一块、
+  位图记"放错边"、`TrailingZeroCount` 成对交换后关检查 0.09 s = C++。
+  等值元素要单独处理（左邻枢轴不小于本层枢轴 → "等于归左"划分并跳过整段），
+  否则全等/少值输入退化成 O(n²)→堆排序。
+- **`List<T>` 窄槽宽度标签检查是 List 循环的主要开销**：每次特化访问先读表头
+  esz、不等就调 `__zan_list_repack`。这条冷调用留在循环里，LLVM 只能每轮重读
+  标签/数据指针/Count，循环也无法向量化（关检查 0.11 s，去掉检查 0.02 s）。
+  `list_width_hoist.cpp`（主管线后）：循环里所有调用都不可能把表改成别的宽度
+  （只认识的运行时助手、只读调用、同宽 repack）且检查块支配全部回边/出口时，
+  前置头里查一次、循环内分支折成直通，再跑 licm/gvn 清理。切分管线下放在两半
+  之间（后半段只有 LICM 没有 GVN，不先清理收益归零：0.14 → 0.09 s）；整管线
+  路径放在管线后并补跑 loop-vectorize（关检查读循环 0.11 → 0.03 s）。
+  提前 repack 语义不可见（只改槽宽不改内容），所以只需保证 lp 在前置头有效。
+  出口到 `unreachable` 块（OOM puts+exit）不算活出口，否则 Add 循环永远不满足
+  支配条件。`ZAN_NO_LIST_HOIST=1` 关断；回归 `codegen_list_width_hoist`。
+- LLVM 23 删了 `Instruction::Br` 并废弃 `BranchInst` 访问器（拆成
+  `CondBrInst/UncondBrInst`）；C++ 遍历分支形态按 `LLVM_VERSION_MAJOR` 分两套写，
+  建无条件跳转用 `IRBuilder::CreateBr`（各版本通用）。
+- 数组长度 load 带 `!range [0, INT64_MAX)` 后，InstCombine 把 `idx<0 || idx>=len`
+  并成一次无符号比较。`!invariant.load` 实测几乎无收益，且数组释放后同址复用
+  会违反其语义，不加。
+- 剩余差距（开检查 1.5×）是每次数组访问的软检查：冷路径 `__zan_guard_raise`
+  会返回（try 外 soft 报告后继续），不是 noreturn，LICM 提不出长度、也做不了
+  区间检查消除。要再收需要编译器做循环级越界检查消除，不是改排序写法。
+- `List<string>` / `Comparison<T>` 排序慢 C++ 4×，改走数组测不出收益：交换路径
+  每次 retain/release（数组内交换本应 ARC 中性），比较是调用——是 ARC 层面的事。
+- 机器 load 20+ 时只看 user 时间、A/B 交替跑取最小值；`sample` 在本机取不到
+  调用图，用 `objdump -d` 看热循环指令数更可靠。
+
+## 43. 软失败暂存、构建缓存与 ARC 消对的安全边界（2026-11-24）
+
+- **软失败暂存**原是进程共享的 4 KB 静态区：线程 A 经空对象写入的值线程 B 能读到
+  （新用例 `soft_scratch_isolation`，旧运行时打印 111），字段偏移超过 4 KB 直接写坏
+  相邻静态内存。改为每线程惰性映射 [保护页][头+1 MiB][保护页]；线程退出时**清零回池**
+  而不是 unmap——逃逸进暂存的指针（如空对象字段的 ref）仍落在合法且已清空的内存，
+  不会指向被复用的映射。`ZAN_SOFT_SHARED_SCRATCH=1` 回旧行为。
+- **构建缓存**条目按输入做键、读回直接链接——旁置摘要防不住能写目录的人。安全前提
+  是"只有本用户能写"：`backend/` 0700、条目 0600、父目录须本人/root 所有且他人不可写
+  （粘滞位除外），读前逐条确认属主与权限，不满足即未命中重建。
+- **内联后 ARC 消对**只在同线程推理；源自 volatile/atomic load 的对象（无锁发布）一律
+  不消。Zan 没有 Volatile/Interlocked，同步靠锁（调用）——调用本就截断窗口。
+
+## 44. 内联后 ARC 区域：遇到不安全点就地补回 retain，别整片放弃（2026-11-24）
+
+guard 版本化后 nbody 的快循环有若干出口进带检查的原循环（含 guard_raise 调用），
+区域消对原先"任一路径遇不安全指令就放弃"，外层 `Body a` 的 retain/release 留着。
+改为：路径遇到调用/invoke/返回/指针存储等非 ARC 中性点时，在该指令前**克隆一条
+retain** 结束此路径——此后与原程序完全一致；到达 release 的路径消掉这对。区域块
+仍须只从区域内进入、不得回到 retain 所在块，补回点上限 8。nbody 带检查 0.55 →
+0.44s（C 0.37）。
+
+mandel 的 1.28× 全是 FMA：C 去掉 `-ffp-contract` 正好与 Zan 同速。只给浮点指令加
+`contract` 标志不够——LLVM 先把 `zr*zr` CSE 成多用途，后端就不融合了。clang 的做法
+是前端在同一表达式内直接出 `llvm.fmuladd`；Zan 在优化前（局部仍在 alloca、尚未 CSE）
+把"单用途 fmul 喂 fadd/fsub"改写为 fmuladd，等价于不跨语句。`--fp-contract` 开启，
+默认关（末位结果随 CPU 变，默认保持 C# 式逐位一致）。
+
+## 45. 泛型容器的字段数组接收者别钉住：`items[i].M()` 34× → ~1×（2026-11-25）
+
+`Box<T>.Total()` 里 `items[i].Score()`（items 是 this 的字段）每次调用都钉住接收者：
+带闭包标签判定的 retain、临时栈 push/pop（两次 TSD）、"是串还是对象"的动态探测
+再外联 `zan_rt_release_dyn`——late ARC 认不出这种形态，内联后也消不掉。已有
+`zan_elem_receiver_needs_no_pin`（简单下标/实参 + leaf 被调者 = 窗口内无任何释放）
+只认**局部**数组基址；字段读同样无副作用，`this` 由调用者保活，leaf 规则也保证
+字段不会在窗口里被换掉，于是放宽到 this 的实例字段（裸 `items` 或 `this.items`）。
+generic 基准 1.01 → 0.04s。非 leaf 被调者（会改写字段数组）照旧钉住——新用例
+`elem_receiver_field_array` 两种都覆盖并开泄漏检查。
+
+另记（已修，2026-11-25）：异常基准内存随抛出次数线性增长（1.5M 迭代峰值
+83MB，C++ 2MB）而泄漏检查无报告——Zan 异常本体在 EH 状态里，`__cxa_throw` 的原生
+对象只驱动展开，却从没人释放。所有权规则：**落地后不会再被原样重抛的原生对象，
+在 landing pad 块里当场 `__cxa_begin_catch` + `__cxa_end_catch`**（`emit_eh_native_delete`，
+即 C++ `catch (...) {}` 的做法）。
+只有 `emit_eh_propagate_tail_lpad` 的"同步、无 catch、函数内无外层 lpad"分支
+原样重抛（`_Unwind_RaiseException`/`resume`），由 `eh_lpad_reraises_native` 判定、
+与尾部同一规则；其余（有 catch 的 try.lpad、catch.cleanup.lpad、async 协程根
+co.lpad）要么被 Zan catch 收下、要么尾部抛新对象，一律当场删。放在 lpad 块里
+天然只作用于"真有原生对象"的入口，同函数直接跳 catch（async rearm）不经过它。
+不用 `_Unwind_DeleteException`：它也能释放，但 `std::uncaught_exceptions()` 只在
+begin_catch 时 −1，会随抛出次数永久增长，进程里依赖它的 C++ 析构逻辑会误判。
+同步 finally 用 return 吞掉异常的那一条（外层无 lpad）仍不释放，罕见未处理。
+回归：`eh_native_exception_reclaim`（10 种抛出形状 ×6.2 万轮，RSS 增长 <8MB 且
+uncaught_exceptions()==0；未修时 +151MB）。坑：用例模式带 `--arc-guard`，释放的 Zan
+对象进检疫区永不回收，每次 `new Exception` 本身就涨 RSS——用例改抛共享对象。
+
+## 46. foreach 不被向量化：两条管线的 List 槽宽外提差异（2026-11-25）
+
+foreach 遍历 List<int> 比 C++ 慢 4–5×，可 `--emit-ir` 看到的循环已经向量化——
+`--emit-ir` 走整条管线，正常构建走"前半段 / 分区并行后半段"，list 槽宽外提在两半
+之间跑，看到的 IR 不同：
+1. 修复块被跳转线程化合并了 foreach 的"集合被改"检查与元素读取，`match_check`
+   要求修复块只有 `repack; br ok`——放宽为"repack 是修复块第一条"：外提后修复块
+   不可达，只要入口条件是 `esz == C`，走 ok 边本来就是原程序的行为。
+2. 前半段循环未旋转（头块先判"还有没有"再进体），检查不支配出口，`hoist_one`
+   拒绝——零次迭代时 lp 可能无效。foreach 的预头已经读过 lp 的 Count，lp 在那里
+   必然有效，提前 repack 只改槽宽，所以"预头（或其单前驱链）读过 lp"也放行。
+3. 外提清理管线补 `loop(loop-rotate)`：未旋转的循环后半段向量化器不接。
+foreach 0.34 → 0.05s（C++ 0.07）。教训：性能问题先确认看的是真实构建的产物
+（`otool -tv` 看二进制），`--emit-ir` 与正常构建的管线不同。
+
+## 47. 冷路径要的东西别在热路径算：guard 的 EH 状态与结构体构造标记（2026-11-25）
+
+structs 基准（值类型 Vec 的 Add/Scale/Dot 内联进循环）2.1× C：热循环每轮两次线程
+EH 状态查找（原子读 TSD 键 + mrs + 判空 + 慢路径调用，前后还有寄存器溢出）。
+三处来源：
+1. 每个运行时检查把 EH 状态作为 `__zan_guard_raise` 的首参传入——状态在热路径
+   算好只为冷路径用，LLVM 不会把原子读沉到冷分支。改为助手内部自取，站点传 null。
+2. 函数入口缓存的状态在用户都消失后仍留着：原子读与惰性初始化调用算副作用，没有
+   pass 会删。`zan_opt_drop_dead_eh_state` 在优化前删掉无人使用的查找（及挂在其上
+   的无用 GEP）。`ZAN_KEEP_DEAD_EH_STATE=1` 关。
+3. 结构体构造器（A528）入口存临时栈顶、每个出口写回；构造体内一次 push 都没有时
+   写回的就是原值。`drop_unused_ctor_mark`：槽位的读者只用来写回栈顶时，删掉入口
+   读、槽位与全部写回（有 unwind 调用读它就保留）。
+structs 0.34 → 0.17s（C 0.15）。
+
+## 48. 启动开销看运行时构造函数：时区库与 /dev/urandom（2026-11-25）
+
+hello 启动 5.9ms vs C 4.6ms。C 版只链 Zan 运行时目标文件就同样慢——差额全在运行时
+构造函数。逐项计时：崩溃处理器为了信号安全在启动时就 `localtime_r` 算时区偏移，
+首次调用加载 tz 数据库 0.5–5ms；哈希盐 `fopen("/dev/urandom")` 155µs（getentropy 1µs）。
+改为：崩溃时间戳用 UTC（带 " UTC"），启动不再碰时区；哈希盐 Apple 用
+`arc4random_buf`、Linux 用 `syscall(SYS_getrandom)`，失败回退 urandom。启动 5.9 → 5.2ms。
+顺修：`zan__crash_civil` 算出的日 `dd` 从未写回 `*d`，崩溃日期恒为 01 号（编译器
+"unused variable 'dd'" 警告早就指着它）。教训：给每个进程都跑的构造函数计时，
+别假设 libc 调用便宜；未用变量警告要看。
+
+## 49. 生产型负载基准：栈溢出、共享计数器钉住、await 走调度器（2026-11-25）
+
+JSON / 文件 / 线程 / async 四项对 Go 跑出三个问题：
+1. **fileio 段错误**：`StringBuilder.Append(char)` 的 i64 临时 `ch.tmp` 在使用点
+   `LLVMBuildAlloca`——非入口块的定长 alloca 对 LLVM 是动态分配，嵌套循环里每次
+   append 栈涨 16 字节，5×20 万次撑爆 8MB 主栈。扫语料还有约 20 处同类（反射实参槽、
+   弱引用链表游标、GC 遍历、原生委托缓冲……）。`zan_hoist_static_allocas`：优化前
+   （含 -O0）把所有常量大小 alloca 挪进入口块（Zan 无用户 stackalloc，全是编译器
+   临时）。踩坑：`LLVMGetEntryBasicBlock` 对声明返回垃圾指针而非 NULL，先判
+   `LLVMIsDeclaration`/块数。
+2. **共享 `static AtomicInt` 的 `.Add(1)`** 每次两次竞争 RC 原子 + 临时栈 push：静态
+   字段接收者被钉住，而 `AtomicInt.Add` 只调 `[DllImport("crt")] NativeAdd`、本不算
+   leaf。leaf 扫描接受本类 crt 外部方法（入口 `zan_atomic_*`/`zan_stopwatch_*`/
+   `zan_monotonic_*`、实参与返回皆原始类型）；新增 `zan_field_receiver_needs_no_pin`
+   （静态字段或 this 字段 + 简单实参 + leaf 被调者）。threads 2.08× → 0.70× Go。
+3. **await 一个立即完成的 async 方法** 2M 次 3.5s、内核态 4.8s：每次都经协程调度器
+   派给工作线程（互斥量/条件变量/kevent/管道）。应像 C# 那样同步跑到第一个真正
+   挂起的 await——另案。
+
+## 50. 分区后端：按来源单元切模块，缓存才能跨用户编辑命中（2026-11-25 Mac arm64 实证）
+
+构建缓存阶段 2（docs/BUILD_CACHE.md，`build_partition.cpp`）：开发构建把方法体按来源单元
+（stdlib/包目录、每个用户文件）切成独立模块，各自优化、出码、按内容缓存。踩过的坑：
+1. **共享助手不能带首个调用点的位置**：`__zan_str_ocmp` 惰性生成时把第一个请求站点的
+   loc 写进函数体，改用户文件一行注释就让 10 个库单元（它被复制进去）全部失效。查法：
+   `ZAN_PART_DUMP=<目录>` 两次构建逐单元 diff。共享助手的诊断位置要么由调用方传参
+   （`__zan_str_len_arr` 的写法），要么用零位置。
+2. **计数器命名**（`__zan_desc_N`、`lambda_N`、`Foo_ctor.N`、`__zan.refl.type.N`）随用户
+   代码重新编号；分区器按"前缀 + 结构内容哈希"改名（三轮细化）。新增 irgen 符号若按创建
+   顺序编号，单元命中率会掉——能按语义命名就按语义命名。
+3. **整模块才能做的事在切分前做**：nothrow 塌缩（`zan_shrink_collapse_invokes`）把
+   `__zan_`/`zan_` 前缀的**声明**当成不抛；单元里 `__zan_guard_raise` 只剩声明，在单元上
+   跑会错误塌缩 invoke。单元管线用 `zan_opt_run_passes_on_unit`（不跑塌缩）。
+4. **优化后检查要看到全程序引用**：外部库裁剪按"模块里还有没有这个声明"、调度器剥离按
+   "zan_co_* 有没有使用者"判；剩余模块把各单元优化后仍引用的符号挂进 `llvm.compiler.used`
+   （对目标文件无影响），否则会剥掉单元要用的 `linkonce` 虚表、`zan_embed_*` 定义而链接失败。
+5. **一个大单元会把并行吃掉**：自举编译器全部用户代码曾是一个单元，-O2 冷构建 58 s →
+   93 s；用户代码改为每文件一个单元后 70 s → 22 s，大单元先发。
+6. 剩余模块里只被单元用过的局部常量/函数要在切分后立即删掉，否则剩余模块的键随单元内容变。
+7. **分区暴露了 late ARC 区域消对的漏洞**（`late_try_region`）：某条路径在补偿点（如未内联
+   调用的 `invoke`）结束、已补回 retain，可它的后继仍流进区域里另一条路径的 release 块，那个
+   release 被删 → 每次泄漏一个引用（`case_orm_zansql` 分区后 `Mutex_Lock` 不再内联时复现）。
+   规则：区域内非入口块只能由"扫描继续到分支"的区域块进入（`late_region_t.cont`）；在 release
+   或补偿点结束的块不算区域内前驱。排查法：`ZAN_NO_LATE_ARC=1` 消失即锁定 late ARC，再按函数
+   二分哪个调用不内联时出现。

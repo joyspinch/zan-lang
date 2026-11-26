@@ -3,6 +3,7 @@
 #include "reflect_api.h"
 #include "definite.h"
 #include "diag.h"
+#include "suggest.h"
 #include "arena.h"
 #include "builtin_api.h"
 #include <string.h>
@@ -41,4 +42,5 @@ static ZAN_TLS int g_type_name_slot;
 #include "checker/checker_expr_adv.c"
 #include "checker/checker_stmt.c"
 #include "checker/checker_decl.c"
+#include "checker/checker_cycles.c"
 #include "checker/checker_unit.c"

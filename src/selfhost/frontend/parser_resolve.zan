@@ -293,6 +293,19 @@ public partial class Parser {
         if (workspaceNames) { return ResolveWorkspaceType(r, tr, ns, us); }
         int hit = FindNestedType(r, tr);
         if (hit >= 0) { return qFinals[hit]; }
+        // the enclosing classes first, innermost outward: a type nested in
+        // the current class (`Jobs.Handler`) wins over a same-named import
+        // (C# member lookup; the host resolves nested names in class scope)
+        if (curEncl != null && curEncl != "" && (ns == "" || curEncl.StartsWith(ns + "."))) {
+            string enc = curEncl;
+            while (enc.Length > ns.Length) {
+                int eh = FindFullExact(enc + "." + r);
+                if (eh >= 0 && ArityMatches(tr, qDcls[eh])) { return qFinals[eh]; }
+                int edot = enc.LastIndexOf(".");
+                if (edot <= 0) { break; }
+                enc = enc.Substring(0, edot);
+            }
+        }
         // same-namespace first (the global namespace is a namespace too: a
         // declaration at global scope must win over an import)
         string local = ns == "" ? r : ns + "." + r;
@@ -412,7 +425,14 @@ public partial class Parser {
                 i = i + 1;
             }
         }
+        curEncl = "";
+        int qi = 0;
+        while (qi < qDcls.Count) {
+            if (qDcls[qi] == d) { curEncl = qFulls[qi]; }
+            qi = qi + 1;
+        }
         NsWalk(d, d.nsName != null ? d.nsName : "", d.nsUsings, flds);
+        curEncl = "";
     }
 
     void NsWalk(Node n, string ns, List<string> us, List<string> sh) {
@@ -443,6 +463,14 @@ public partial class Parser {
             NsWalk(n.type, ns, us, sh2);
             pi = 0;
             while (pi < n.kids.Count) { NsWalk(n.kids[pi], ns, us, sh2); pi = pi + 1; }
+            // a constructor's `: base(args)` / `: this(args)` initializer
+            // (ctor.b / ctor.c): its arguments name types too --
+            // `: this(GeckoViewConfig.CreateDefault())` stayed unqualified
+            // and missed the collision rename (firefox_browser_model)
+            if (n.kind == AK.CtorDecl()) {
+                NsWalk(n.b, ns, us, sh2);
+                NsWalk(n.c, ns, us, sh2);
+            }
             NsWalk(n.d, ns, us, sh2);
             return;
         } else if (n.kind == AK.Lambda()) {
@@ -602,15 +630,73 @@ public partial class Parser {
         Node head = HeadIdentOf(recv);
         if (head != null && sh != null && ShadowHas(sh, head.sval)) { return; }
         string fin = ResolveStaticReceiver(full, ns, us, "");
+        if (fin == null && head != null) { fin = ResolveByQualifiedTail(full, head.sval); }
         if (fin == null) { return; }
         recv.kind = AK.Ident();
         recv.sval = fin;
         recv.qualifiedTypeReceiver = true;
+        recv.typeName = true;
         recv.a = null;
         recv.b = null;
         recv.c = null;
         recv.d = null;
         recv.kids = new List<Node>();
+    }
+
+    // The C host's qpath_ns_ok fallback (expr_core/expr_type_check.c): a
+    // namespace-headed path that names no declaration exactly still binds by
+    // its last segment when the written prefix and the type's namespace are
+    // related -- equal, either an ancestor of the other, or the prefix the
+    // tail of the namespace (`System.Security.Cryptography.RandomNumberGenerator`
+    // names `System.RandomNumberGenerator`; `System.Text.Csv` does NOT name
+    // `System.Csv.Csv`). A class-headed path is a nested member and stays with
+    // the exact lookup; a global-namespace type never takes a prefix. Only a
+    // single related candidate binds -- never guess between two.
+    string ResolveByQualifiedTail(string full, string headName) {
+        int dot = full.LastIndexOf(".");
+        if (dot <= 0) { return null; }
+        if (headName == null || CountSimple(headName) > 0) { return null; }
+        string pre = full.Substring(0, dot);
+        string tail = full.Substring(dot + 1);
+        List<int> group = qSimpleIx.Get(tail);
+        // a host builtin class has no declaration, and the host's check lets
+        // a declaration-less symbol through under any prefix (`System.Math`)
+        if (group == null) { return IsDeclLessBuiltinClass(tail) ? tail : null; }
+        int hit = -1;
+        int i = 0;
+        while (i < group.Count) {
+            Node d = qDcls[group[i]];
+            string dns = d.nsName != null ? d.nsName : "";
+            if (d.a == null && dns != "" && QualifiedNsRelated(pre, dns)) {
+                if (hit >= 0) { return null; }
+                hit = group[i];
+            }
+            i = i + 1;
+        }
+        return hit >= 0 ? qFinals[hit] : null;
+    }
+
+    // The C host's declaration-less builtin classes (the checker's and the
+    // backend's IsBuiltinClassName, minus the keyword aliases).
+    bool IsDeclLessBuiltinClass(string n) {
+        return n == "Console" || n == "Convert" || n == "Math" || n == "Task"
+            || n == "Gate" || n == "Socket" || n == "Environment" || n == "File"
+            || n == "Directory" || n == "Path" || n == "NativeMemory"
+            || n == "BitOperations" || n == "Vector128" || n == "Vector256"
+            || n == "Sse2" || n == "Aes" || n == "Sse42" || n == "String"
+            || n == "Int32" || n == "Int64" || n == "Double" || n == "Single";
+    }
+
+    bool QualifiedNsRelated(string pre, string ns) {
+        if (pre == ns) { return true; }
+        if (NsIsAncestor(pre, ns) || NsIsAncestor(ns, pre)) { return true; }
+        return ns.Length > pre.Length && ns.EndsWith("." + pre);
+    }
+
+    // a is b's ancestor on a segment boundary ("Sys" is not "System"'s)
+    bool NsIsAncestor(string a, string b) {
+        if (a.Length == 0 || a.Length >= b.Length) { return false; }
+        return b.StartsWith(a + ".");
     }
 
     // the head identifier of a dotted chain (null when there is none)

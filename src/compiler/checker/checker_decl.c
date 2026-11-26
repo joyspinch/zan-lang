@@ -355,15 +355,49 @@ static void checker_report_no_member(zan_checker_t *c, zan_ast_node_t *expr,
   zan_istr_t simple = checker_type_simple_name(recv);
   if (recv && recv->sym)
     ns = access_symbol_ns(recv->sym);
+  /* S1 fix-it：类型（含基类）里拼写最近的同类成员——调用位置只看方法，
+   * 取值位置看字段/属性/方法；唯一最近才给，补丁精确替换成员名 */
+  char hint[160] = "";
+  char repl[128];
+  zan_diag_fixit_t fix = {0}, *fixp = NULL;
+  zan_suggest_t sg;
+  zan_suggest_init(&sg, name.str, name.len);
+  for (zan_symbol_t *s = recv ? recv->sym : NULL; s;
+       s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+    for (int i = 0; i < s->member_count; i++) {
+      zan_symbol_t *m = s->members[i];
+      if (!m)
+        continue;
+      bool method = m->kind == SYM_METHOD;
+      if (is_method
+              ? !method
+              : !(method || m->kind == SYM_FIELD || m->kind == SYM_PROPERTY))
+        continue;
+      zan_suggest_offer(&sg, m->name.str, m->name.len);
+    }
+  }
+  const char *best;
+  size_t best_len;
+  zan_loc_t at;
+  if (zan_suggest_result(&sg, &best, &best_len) && best_len < sizeof(repl) &&
+      zan_diag_locate_word(c->diag, expr->loc, name.str, name.len, &at)) {
+    memcpy(repl, best, best_len);
+    repl[best_len] = '\0';
+    snprintf(hint, sizeof(hint), " -- did you mean '%s'?", repl);
+    fix.loc = at;
+    fix.len = name.len;
+    fix.text = repl;
+    fixp = &fix;
+  }
   if (ns.len) {
-    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2084,
-                       "type '%.*s.%.*s' %s '%.*s'", (int)ns.len, ns.str,
-                       (int)simple.len, simple.str, what, (int)name.len,
-                       name.str);
+    zan_diag_emit_fix(c->diag, DIAG_ERROR, expr->loc, 2084, fixp,
+                      "type '%.*s.%.*s' %s '%.*s'%s", (int)ns.len, ns.str,
+                      (int)simple.len, simple.str, what, (int)name.len,
+                      name.str, hint);
   } else {
-    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2085, "'%.*s' %s '%.*s'",
-                       (int)simple.len, simple.str, what, (int)name.len,
-                       name.str);
+    zan_diag_emit_fix(c->diag, DIAG_ERROR, expr->loc, 2085, fixp,
+                      "'%.*s' %s '%.*s'%s", (int)simple.len, simple.str, what,
+                      (int)name.len, name.str, hint);
   }
 }
 

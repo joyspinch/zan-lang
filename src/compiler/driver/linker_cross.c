@@ -540,6 +540,20 @@ else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
                 have_gcc ? " -lgcc -lgcc_eh -lsupc++"
                          : " -lclang_rt.builtins-aarch64 -lunwind -lucrt");
   }
+  /* GCC's libsupc++ (posix thread model, as built by MSYS2 and the
+   * Windows-host bundle) keeps per-thread exception globals behind
+   * pthread keys, so it needs winpthreads -- the native Windows link
+   * (linker_cross_apple.c) already passes it. Without this every
+   * non-Windows-host cross link of a program that can throw failed
+   * on pthread_key_create & co. Old bundles without the archive
+   * keep their previous link line. */
+  if (have_gcc) {
+    char wpthread[1300];
+    snprintf(wpthread, sizeof(wpthread), "%s/libwinpthread.a", syslib);
+    if (zan_file_exists(wpthread)) {
+      cmd_appendf(cmd, sizeof(cmd), " -l:libwinpthread.a");
+    }
+  }
   for (int ei = 0; ei < extra_link_lib_count; ei++) {
     cmd_appendf(cmd, sizeof(cmd), " -l%s", extra_link_libs[ei]);
   }

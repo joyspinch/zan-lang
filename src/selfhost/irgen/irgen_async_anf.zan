@@ -564,6 +564,33 @@ partial class Irgen {
         return blk;
     }
 
+    // Evaluate an operand into a fresh temp now (appended to `pre` ahead of a
+    // later operand's hoisted await). Constants, locals and parameters are
+    // left in place -- the awaited call cannot change them -- and so is an
+    // operand whose type is not knowable yet (no temp beats a wrong one).
+    Node SnapshotOperand(Node m, Node e, List<Node> pre) {
+        if (e == null) { return e; }
+        int k = e.kind;
+        if (k == AK.IntLit() || k == AK.FloatLit() || k == AK.StringLit() || k == AK.CharLit()
+                || k == AK.BoolLit() || k == AK.NullLit() || k == AK.Lambda()) { return e; }
+        if (k == AK.Ident() && (e.sval == null || e.sval.StartsWith("__aw$") || DeclTypeOf(m, e.sval) != null)) {
+            return e;
+        }
+        Node t = ArgTypeNode(e);
+        if (t == null || t.sval == null || t.sval == "" || t.sval == "var" || t.sval == "void") { return e; }
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = CopyType(t);
+        d.b = e;
+        d.line = e.line; d.col = e.col;
+        pre.Add(d);
+        Node id = new Node(AK.Ident());
+        id.sval = d.sval;
+        id.line = e.line; id.col = e.col;
+        return id;
+    }
+
     // Rewrite an expression tree: hoist every embedded await into `pre` and
     // replace it with a reference to the hoisted temp. Short-circuiting and
     // conditional arms with await stay guarded under IfStmt so dead arms
@@ -686,6 +713,14 @@ partial class Irgen {
             id.sval = resName;
             id.line = e.line; id.col = e.col;
             return id;
+        }
+        // `x OP await f()`: the left operand is evaluated BEFORE the await
+        // (the C host's order). Hoisting only the await would read `x` after
+        // the suspension and see whatever f() wrote to it
+        // (async_await_string_operator: `current == await Mutate(..)`).
+        if (e.kind == AK.Binary() && e.op != TK.AmpAmp() && e.op != TK.PipePipe() && e.op != TK.QQ()
+                && !ExprHasAwait(e.a) && ExprHasAwait(e.b)) {
+            e.a = SnapshotOperand(m, HoistExpr(cls, m, e.a, pre), pre);
         }
         e.a = HoistExpr(cls, m, e.a, pre);
         e.b = HoistExpr(cls, m, e.b, pre);

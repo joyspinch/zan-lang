@@ -73,6 +73,27 @@ GNU libc 的异常库。目标链接必须带 `--eh-frame-hdr`，以供静态异
 编译器旁边；首次加入产物必须重新 configure。交叉编译成功只证明链接，目标程序仍须
 在 Linux 上运行验证。
 
+## win-x64 / linux-x64 交叉链接包
+
+`toolchain/win-x64/mingw/lib` 必须是**同一快照**的 GCC 运行时 + winpthreads +
+mingw-w64 CRT/导入库（当前为 MSYS2 MINGW64：GCC 16.2.0、crt-git 13.0.0.r380）。
+曾经把 TDM-GCC 的 `libsupc++.a` 混进旧 CRT（B-ID71），它依赖 TDM 的
+`__eh_shmem3_gcc_tdm_*` 与 winpthreads，导致非 Windows 宿主的 win-x64 交叉链接
+连 hello 都失败。posix 线程模型的 libsupc++ 需要 `libwinpthread.a`：
+`linker_cross.c` 在包里有该归档时追加 `-l:libwinpthread.a`。MSYS2 winpthreads 以
+dllimport 调 `_set_errno`，而 msvcrt 版 CRT 只静态实现它，所以 `libwinpthread.a`
+额外带一个 `__imp__set_errno` 成员（源码 `toolchain/win-x64/mingw/zan_set_errno_imp.c`）。
+`zanrt_io*.o` 引用崩溃报告器，`toolchain/win-x64/zanrt_crash.o` 必须随包提交
+（drivers.yml 的提交清单已包含它）。
+
+`packages/Zan.Gui/src/Gui/drivers/linux-x64/static/libzan_gui.a` 的 GUI ABI 须与
+当前 `gui_runtime.c` 一致；CI 的 Linux 任务目前只上传产物、不回写提交。刷新时
+**原地替换** `zan_gui_x64.o`/`zan_crash_x64.o`/`zan_fortify_compat.o` 成员——
+libX11 与 libXdmcp 各有一个 `Flush.o`，解包再重打会丢 `XFlush`。
+
+在 macOS 上用 `scripts/refresh_cross_bundles.sh`（需要 Zig 0.17+ 与 llvm-ar；
+下载按 sha256 校验）同时刷新两者，然后重建 zanc 重新暂存 `toolchain/`。
+
 ## 外部工具链怎么被找到
 
 CMake 侧统一走 [`cmake/ZanToolchain.cmake`](../cmake/ZanToolchain.cmake)，

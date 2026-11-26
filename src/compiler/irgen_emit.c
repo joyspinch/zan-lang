@@ -2,6 +2,8 @@
 #include "optimizer.h"
 #include "irgen_compact.h"
 #include "codegen_split.h"
+#include "build_cache.h"
+#include "build_partition.h"
 #ifdef _WIN32
 #include <windows.h>
 #else

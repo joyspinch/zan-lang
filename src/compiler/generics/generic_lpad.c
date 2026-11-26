@@ -493,6 +493,39 @@ int call_consumes_free_arg(LLVMValueRef callee) {
 }
 void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
                                   local_scope_t *locals);
+/* A delegate held in a local or parameter that the function never writes,
+ * never passes by ref and no lambda captures cannot lose its owner during
+ * the call: neither argument evaluation nor the callback can reach that
+ * slot. The slot's own reference keeps the closure alive, so the call needs
+ * no retain/temp-push/pop/release around it (an indirect call through a
+ * Func parameter used to pay two atomics and two EH-state lookups). */
+static bool delegate_callee_is_stable_local(zan_irgen_t *g,
+                                            zan_ast_node_t *callee,
+                                            local_scope_t *locals) {
+  static int pin_all = -1;
+  if (pin_all < 0)
+    pin_all = getenv("ZAN_DLG_PIN_ALL") != NULL;
+  if (pin_all)
+    return false;
+  if (!callee || callee->kind != AST_IDENTIFIER || !locals ||
+      !g->current_fn_body)
+    return false;
+  if (g->current_async_frame)
+    return false;
+  local_var_t *v = local_find(locals, callee->ident.name);
+  if (!v || v->byref_slot || v->box_cell)
+    return false;
+  if (body_writes_ident(g, g->current_fn_body, callee->ident.name))
+    return false;
+  /* Parameters carry no binding_decl; the capture scan only needs the
+   * name (and matching by name is conservative). */
+  zan_ast_node_t by_name;
+  memset(&by_name, 0, sizeof(by_name));
+  by_name.kind = AST_PARAM;
+  by_name.param.name = callee->ident.name;
+  return !local_is_lambda_captured(g, locals, g->current_fn_body, &by_name);
+}
+
 LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
                                 LLVMValueRef fn_ptr, zan_ast_node_t *call,
                                 local_scope_t *locals) {
@@ -520,13 +553,12 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
   int argc = call->call.args.count;
   LLVMValueRef *call_args = (LLVMValueRef *)calloc(
       (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
-  /* 接收者为自身持有且永不重赋值的局部委托时免钉住：实参求值与回调本身
-   * 均不可能覆盖该局部槽，省去每次调用的 closure_retain/release 与 EH 栈压弹。 */
-  bool zan_receiver_needs_no_pin(zan_irgen_t *, zan_ast_node_t *,
-                                 local_scope_t *);
-  bool no_pin_dlg = zan_receiver_needs_no_pin(g, call->call.callee, locals);
+  /* The callee is borrowed from its local/field slot. Argument evaluation
+   * or the callback may overwrite that last owner, so keep the selected
+   * delegate alive until the invocation and argument cleanup finish. */
+  bool stable = delegate_callee_is_stable_local(g, call->call.callee, locals);
   int eh_pushed = 0;
-  if (!no_pin_dlg) {
+  if (!stable) {
     emit_closure_retain(g, fn_ptr);
     if (!g->current_fn_no_runtime) {
       emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
@@ -559,7 +591,7 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
   }
   if (eh_pushed)
     emit_eh_tmp_pop(g);
-  if (!no_pin_dlg)
+  if (!stable)
     emit_closure_release(g, fn_ptr);
   free(call_args);
   free(param_types);
@@ -912,6 +944,7 @@ typedef struct fn_cleanup_variant {
 struct zan_fn_cleanup_state {
   local_scope_t *locals;
   LLVMValueRef tmp_mark;
+  unsigned push_seq0;
   fn_cleanup_variant_t *variants;
   local_var_t *active;
   int active_cap;
@@ -924,6 +957,7 @@ void init_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry,
   memset(state, 0, sizeof(*state));
   state->locals = locals;
   state->tmp_mark = tmp_mark;
+  state->push_seq0 = g->eh_tmp_push_seq;
   entry->fn_cleanup = state;
 }
 
@@ -996,7 +1030,25 @@ void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef lp_type =
       LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i8ptr, i32t}, 2, 0);
-  if (state->variants && !state->tmp_mark) {
+  /* Temps above the entry mark can only come from pushes this body emitted:
+   * every callee that pushes unwinds its own on the way out, and frames
+   * without a function landing pad (async bodies) are drained by their
+   * awaiter or the nearest catch, which unwind to a lower mark anyway. A
+   * body with no pushes therefore skips the per-call state lookup on entry
+   * and leaves a bare cleanup pad that LLVM folds away when no locals need
+   * releasing -- recursive and leaf calls become plain calls. */
+  static int force_mark = -1;
+  if (force_mark < 0) {
+    const char *e = getenv("ZAN_EH_FN_MARK");
+    force_mark = e && *e == '1';
+  }
+  bool keep_mark = force_mark || g->eh_tmp_push_seq != state->push_seq0;
+  if (!keep_mark) {
+    if (state->tmp_mark) {
+      eh_drop_tmp_mark(g, state->tmp_mark);
+      state->tmp_mark = NULL;
+    }
+  } else if (state->variants && !state->tmp_mark) {
     /* 惰性生成函数入口 fn.tmp.mark：在 entry 首条指令前插 alloca，再借首个
      * variant 块调 get_eh_tmp_top_global 把 eh.st + eh.tmptopp 置入 entry 首部
      * 紧随 alloca 之后、任何 push 之前，最后紧跟 eh.tmptopp 插 load+store。 */
@@ -1033,9 +1085,11 @@ void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
                                "fn.lp");
       LLVMSetCleanup(lp, 1);
     }
-    LLVMValueRef mark =
-        LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
-    emit_eh_tmp_unwind_to(g, mark);
+    if (keep_mark && state->tmp_mark) {
+      LLVMValueRef mark =
+          LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
+      emit_eh_tmp_unwind_to(g, mark);
+    }
     emit_lpad_cleanups(g, &v->landing);
     if (g->target_is_wasm)
       emit_raise_exception(g);
@@ -1297,7 +1351,7 @@ void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur) {
   emit_closure_release(g, cur);
   LLVMBuildBr(g->builder, cbb);
   LLVMPositionBuilderAtEnd(g->builder, probe);
-  LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+  LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1);
   LLVMValueRef hp = LLVMBuildGEP2(g->builder, i8t, cur, &neg8, 1, "obj.hp");
   LLVMValueRef w = LLVMBuildLoad2(
       g->builder, i64,

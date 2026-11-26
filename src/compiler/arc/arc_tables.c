@@ -5,7 +5,7 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMContextRef c = g->ctx;
   LLVMBuilderRef b = g->builder;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+  LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
   LLVMTypeRef structT = get_struct_llvm_type(g, sym);
   LLVMValueRef obj = LLVMGetParam(fn, 0);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
@@ -18,42 +18,39 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
       zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
   zan_set_branch_weights(g, LLVMBuildCondBr(b, isnull, ret, cont), 1, 2000);
   LLVMPositionBuilderAtEnd(b, cont);
-  LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-  LLVMValueRef rcp =
-      LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
-  LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+  LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "rcp");
   LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
   if (!g->arc_guard) {
     /* 独占快路径：读到 rc == 1 且全局无活跃弱引用时，本线程是唯一持有者，
      * 直接写 0 + acquire fence 进 relf，免一次硬件 LOCK XADD 与二次 weak 判空。 */
-    LLVMValueRef rc_now = LLVMBuildLoad2(b, i64, rcip, "rcnow");
+    LLVMValueRef rc_now = LLVMBuildLoad2(b, rc_ty, rcip, "rcnow");
     LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
-    LLVMSetAlignment(rc_now, 8);
+    LLVMSetAlignment(rc_now, 4);
     LLVMBasicBlockRef uniq_chk = LLVMAppendBasicBlockInContext(c, fn, "uniq.chk");
     LLVMBasicBlockRef uniq_go = LLVMAppendBasicBlockInContext(c, fn, "uniq.go");
     LLVMBasicBlockRef atomic_bb = LLVMAppendBasicBlockInContext(c, fn, "sub.atomic");
     LLVMValueRef is_uniq =
-        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(i64, 1, 0), "isuniq");
+        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(rc_ty, 1, 0), "isuniq");
     zan_set_branch_weights(g, LLVMBuildCondBr(b, is_uniq, uniq_chk, atomic_bb),
                            2000, 1);
     LLVMPositionBuilderAtEnd(b, uniq_chk);
     zan_set_branch_weights(
         g, LLVMBuildCondBr(b, zan_emit_weak_any(g), atomic_bb, uniq_go), 1, 2000);
     LLVMPositionBuilderAtEnd(b, uniq_go);
-    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), rcip);
+    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(rc_ty, 0, 0), rcip);
     LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
-    LLVMSetAlignment(st0, 8);
+    LLVMSetAlignment(st0, 4);
     LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
     LLVMBuildBr(b, relf);
     LLVMPositionBuilderAtEnd(b, atomic_bb);
   }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-                                           LLVMConstInt(i64, 1, 0),
+                                           LLVMConstInt(rc_ty, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
   LLVMValueRef is1 =
-      zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
+      zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1");
   LLVMValueRef over =
-      zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+      zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over");
   LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
   zan_set_branch_weights(g, LLVMBuildCondBr(b, over, dorel, last_bb), 1, 2000);
   LLVMPositionBuilderAtEnd(b, last_bb);
@@ -153,7 +150,10 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
   LLVMBuildBr(b, freebb);
   LLVMPositionBuilderAtEnd(b, freebb);
-  LLVMValueRef freefn = get_arc_free_decl(g);
+  LLVMValueRef freefn =
+      ((sym->kind == SYM_CLASS && zan_class_needs_pad16(structT))
+           ? get_arc_free_obj16_decl(g)
+           : get_arc_free_obj_decl(g));
   zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
   LLVMBuildBr(b, ret);
   LLVMPositionBuilderAtEnd(b, dorel);
@@ -172,6 +172,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMBuilderRef b = g->builder;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+  LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
   LLVMValueRef obj = LLVMGetParam(fn, 0);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
   LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(c, fn, "cont");
@@ -183,35 +184,33 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
       zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
   zan_set_branch_weights(g, LLVMBuildCondBr(b, isnull, ret, cont), 1, 2000);
   LLVMPositionBuilderAtEnd(b, cont);
-  LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-  LLVMValueRef rcp =
-      LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
-  LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+  LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "rcp");
   if (!g->arc_guard) {
     /* 集合对象不进弱引用表：rc == 1 时本线程独占，写 0 直接进 relf（acquire fence）。 */
-    LLVMValueRef rc_now = LLVMBuildLoad2(b, i64, rcip, "rcnow");
+    LLVMValueRef rc_now = LLVMBuildLoad2(b, rc_ty, rcip, "rcnow");
     LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
-    LLVMSetAlignment(rc_now, 8);
+    LLVMSetAlignment(rc_now, 4);
     LLVMBasicBlockRef uniq_go = LLVMAppendBasicBlockInContext(c, fn, "uniq.go");
-    LLVMBasicBlockRef atomic_bb = LLVMAppendBasicBlockInContext(c, fn, "sub.atomic");
+    LLVMBasicBlockRef atomic_bb =
+        LLVMAppendBasicBlockInContext(c, fn, "sub.atomic");
     LLVMValueRef is_uniq =
-        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(i64, 1, 0), "isuniq");
+        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(rc_ty, 1, 0), "isuniq");
     zan_set_branch_weights(g, LLVMBuildCondBr(b, is_uniq, uniq_go, atomic_bb),
                            2000, 1);
     LLVMPositionBuilderAtEnd(b, uniq_go);
-    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), rcip);
+    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(rc_ty, 0, 0), rcip);
     LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
-    LLVMSetAlignment(st0, 8);
+    LLVMSetAlignment(st0, 4);
     LLVMBuildBr(b, relf);
     LLVMPositionBuilderAtEnd(b, atomic_bb);
   }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-                                           LLVMConstInt(i64, 1, 0),
+                                           LLVMConstInt(rc_ty, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
   LLVMValueRef is1 =
-      zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
+      zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1");
   LLVMValueRef over =
-      zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+      zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over");
   LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
   zan_set_branch_weights(g, LLVMBuildCondBr(b, over, dorel, last_bb), 1, 2000);
   LLVMPositionBuilderAtEnd(b, last_bb);
@@ -258,7 +257,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
   LLVMBuildBr(b, freebb);
   LLVMPositionBuilderAtEnd(b, freebb);
-  LLVMValueRef freefn = get_arc_free_decl(g);
+  LLVMValueRef freefn = get_arc_free_obj_decl(g);
   zan_call2(b, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
   LLVMBuildBr(b, ret);
   LLVMPositionBuilderAtEnd(b, dorel);
@@ -295,6 +294,7 @@ LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
   LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
+  zan_mark_nounwind(g, fn);
   build_collection_release_body(g, ck, ce, fn);
   return fn;
 }
@@ -321,6 +321,79 @@ void emit_all_class_releases(zan_irgen_t *g) {
     build_class_release_body(g, sym, inst, fn);
   }
 }
+/* ---- 站点号 → 描述符表（默认模式）-------------------------------------
+ * 对象头字的高 32 位是 tw = 对象标记 | 站点号（docs/OBJECT_LAYOUT.md）。
+ * 默认模式下按站点号查 __zan_desc_tbl 得描述符；表在 irgen 期间是占位，
+ * 收尾时 emit_desc_table 按 desc_gv 定型。没有对象标记（字符串、数组描述符
+ * 指针、soft scratch 前缀）或站点号越界的头字一律查出 null。 */
+static void desc_tbl_ensure(zan_irgen_t *g) {
+    if (g->g_desc_tbl) return;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    /* 占位是外部声明（无初值）：发布模式的逐函数压缩器会提前优化已完成的
+     * 函数，占位若是带初值的常量，表长/表项会被折成占位值（表长 1 → 全部
+     * 越界）。定型时换成内部常量并 RAUW。 */
+    g->g_desc_tbl = LLVMAddGlobal(g->mod, LLVMArrayType(i8p, 1), "__zan_desc_tbl.ph");
+    g->g_desc_n = LLVMAddGlobal(g->mod, i64t, "__zan_desc_n.ph");
+}
+LLVMValueRef zan_desc_tbl_global(zan_irgen_t *g, LLVMValueRef *count_out) {
+    desc_tbl_ensure(g);
+    if (count_out) *count_out = g->g_desc_n;
+    return g->g_desc_tbl;
+}
+LLVMValueRef zan_hdr_desc(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word, const char *name) {
+    desc_tbl_ensure(g);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef tw = LLVMBuildLShr(b, word, LLVMConstInt(i64t, 32, 0), "desc.tw");
+    LLVMValueRef site =
+        LLVMBuildAnd(b, tw, LLVMConstInt(i64t, ZAN_OBJ_TW_SITE_MASK, 0), "desc.site");
+    LLVMValueRef is_obj = LLVMBuildICmp(
+        b, LLVMIntNE, LLVMBuildAnd(b, tw, LLVMConstInt(i64t, ZAN_OBJ_TW_MARK, 0), "desc.mark"),
+        LLVMConstInt(i64t, 0, 0), "desc.isobj");
+    LLVMValueRef n = LLVMBuildLoad2(b, i64t, g->g_desc_n, "desc.n");
+    LLVMValueRef ok =
+        LLVMBuildAnd(b, is_obj, LLVMBuildICmp(b, LLVMIntULT, site, n, "desc.inrange"), "desc.ok");
+    LLVMValueRef idx = LLVMBuildSelect(b, ok, site, LLVMConstInt(i64t, 0, 0), "desc.idx");
+    LLVMValueRef slot = LLVMBuildGEP2(b, i8p, g->g_desc_tbl, &idx, 1, "desc.slot");
+    return LLVMBuildLoad2(b, i8p, slot, name);
+}
+void emit_desc_table(zan_irgen_t *g) {
+    if (!g->desc_hdr) return;
+    desc_tbl_ensure(g);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    unsigned n = g->leak_site_count > 0 ? (unsigned)g->leak_site_count : 1u;
+    LLVMValueRef *elems = (LLVMValueRef *)calloc(n, sizeof(LLVMValueRef));
+    if (!elems) {
+        fprintf(stderr, "zanc: out of memory building the ARC descriptor table\n");
+        exit(1);
+    }
+    for (unsigned i = 0; i < n; i++) {
+        LLVMValueRef dg = (g->desc_gv && (int)i < g->leak_site_count) ? g->desc_gv[i] : NULL;
+        elems[i] = dg ? (LLVMTypeOf(dg) == i8p ? dg : LLVMConstBitCast(dg, i8p)) : LLVMConstNull(i8p);
+    }
+    elems[0] = LLVMConstNull(i8p); /* 0 号站点是哨兵：未跟踪对象 */
+    LLVMTypeRef at = LLVMArrayType(i8p, n);
+    LLVMValueRef newg = LLVMAddGlobal(g->mod, at, "__zan_desc_tbl.final");
+    LLVMSetLinkage(newg, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(newg, 1);
+    LLVMSetInitializer(newg, LLVMConstArray(i8p, elems, n));
+    free(elems);
+    LLVMReplaceAllUsesWith(g->g_desc_tbl, newg);
+    LLVMDeleteGlobal(g->g_desc_tbl);
+    LLVMSetValueName2(newg, "__zan_desc_tbl", strlen("__zan_desc_tbl"));
+    g->g_desc_tbl = newg;
+    LLVMValueRef newn = LLVMAddGlobal(g->mod, i64t, "__zan_desc_n");
+    LLVMSetLinkage(newn, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(newn, 1);
+    LLVMSetInitializer(newn, LLVMConstInt(i64t, n, 0));
+    LLVMReplaceAllUsesWith(g->g_desc_n, newn);
+    LLVMDeleteGlobal(g->g_desc_n);
+    g->g_desc_n = newn;
+    g->desc_tbl_frozen = true;
+}
+
 void emit_site_live_tables(zan_irgen_t *g) {
   if (g->desc_hdr || !g->g_site_live || !g->g_site_count)
     return;
@@ -568,6 +641,15 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
       instance_size = (uint32_t)cursor;
       kind = (ref_count > 0) ? 0 : 3;
     }
+  } else if (g->site_clo && site_idx < g->site_clo_cap &&
+             g->site_clo[site_idx]) {
+    /* 闭包记录 / 捕获盒：登记过的强引用槽（target、捕获变量、强捕获 this） */
+    zan_clo_layout_t *cl = g->site_clo[site_idx];
+    kind = cl->n > 0 ? 0 : 3;
+    ref_count = (uint32_t)cl->n;
+    for (int k = 0; k < cl->n; k++)
+      offsets[k] = cl->offsets[k];
+    instance_size = 24;
   } else {
     /* Closure or unknown site */
     kind = 0;
@@ -576,10 +658,11 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
     instance_size = 24;
   }
 
-  LLVMTypeRef ref_ty = LLVMStructType((LLVMTypeRef[]){i32t, i32t}, 2, 0);
+  LLVMTypeRef ref_ty =
+      LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i32t, i32t}, 2, 0);
   LLVMTypeRef refs_arr_ty = LLVMArrayType(ref_ty, (unsigned)ref_count);
   LLVMTypeRef fg_fields_ty[5] = {i32t, i32t, i32t, i32t, refs_arr_ty};
-  LLVMTypeRef fg_ty = LLVMStructType(fg_fields_ty, 5, 0);
+  LLVMTypeRef fg_ty = LLVMStructTypeInContext(g->ctx, fg_fields_ty, 5, 0);
 
   LLVMValueRef fg_gv = LLVMAddGlobal(g->mod, fg_ty, fg_name);
   LLVMSetLinkage(fg_gv, LLVMInternalLinkage);
@@ -591,7 +674,7 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
     for (uint32_t k = 0; k < ref_count; k++) {
       LLVMValueRef rvals[2] = {LLVMConstInt(i32t, offsets[k], 0),
                                LLVMConstInt(i32t, 1, 0)};
-      ref_elems[k] = LLVMConstStruct(rvals, 2, 0);
+      ref_elems[k] = LLVMConstStructInContext(g->ctx, rvals, 2, 0);
     }
   }
   LLVMValueRef refs_val =
@@ -602,8 +685,8 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
   LLVMValueRef fg_init[5] = {
       LLVMConstInt(i32t, kind, 0), LLVMConstInt(i32t, ref_count, 0),
       LLVMConstInt(i32t, instance_size, 0), LLVMConstInt(i32t, 0, 0), refs_val};
-  LLVMSetInitializer(fg_gv, LLVMConstStruct(fg_init, 5, 0));
-  return LLVMConstBitCast(fg_gv, i8p);
+  LLVMSetInitializer(fg_gv, LLVMConstStructInContext(g->ctx, fg_init, 5, 0));
+  return LLVMTypeOf(fg_gv) == i8p ? fg_gv : LLVMConstBitCast(fg_gv, i8p);
 }
 /* S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出环路诊断的字段名表。
  * 每个类站点一个以 NUL 结尾的 C 串数组，与 build_site_field_graph 的 refs[]
@@ -611,6 +694,21 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
  * 边的 refs 下标取名，打印 "Node.Next -> ..."。非类站点为空指针。 */
 static LLVMValueRef build_site_field_names(zan_irgen_t *g, int site_idx) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (g->site_clo && site_idx < g->site_clo_cap && g->site_clo[site_idx] &&
+        g->site_clo[site_idx]->n > 0) {
+        zan_clo_layout_t *cl = g->site_clo[site_idx];
+        LLVMValueRef cnames[ZAN_CLO_LAYOUT_MAX];
+        for (int k = 0; k < cl->n; k++)
+            cnames[k] = zan_irgen_intern_string(g, cl->names[k] ? cl->names[k] : "?");
+        char cgname[64];
+        snprintf(cgname, sizeof(cgname), "__zan_fnames_%d", site_idx);
+        LLVMTypeRef cat = LLVMArrayType(i8p, (unsigned)cl->n);
+        LLVMValueRef cgv = LLVMAddGlobal(g->mod, cat, cgname);
+        LLVMSetLinkage(cgv, LLVMInternalLinkage);
+        LLVMSetGlobalConstant(cgv, 1);
+        LLVMSetInitializer(cgv, LLVMConstArray(i8p, cnames, (unsigned)cl->n));
+        return LLVMConstBitCast(cgv, i8p);
+    }
     if ((g->site_coll && g->site_coll[site_idx]) || !g->site_syms ||
         !g->site_syms[site_idx])
         return LLVMConstNull(i8p);
@@ -646,6 +744,31 @@ static LLVMValueRef build_site_field_names(zan_irgen_t *g, int site_idx) {
     LLVMSetGlobalConstant(gv, 1);
     LLVMSetInitializer(gv, LLVMConstArray(i8p, names, n));
     return LLVMConstBitCast(gv, i8p);
+}
+
+void zan_set_closure_site_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                 const unsigned *fields, const char *const *names, int n) {
+    if (site_idx < 0 || n <= 0) return;
+    if (site_idx >= g->site_clo_cap) {
+        int ncap = g->site_clo_cap ? g->site_clo_cap : 256;
+        while (ncap <= site_idx) ncap *= 2;
+        zan_clo_layout_t **na = (zan_clo_layout_t **)realloc(g->site_clo,
+            (size_t)ncap * sizeof(*na));
+        if (!na) return;
+        memset(na + g->site_clo_cap, 0, (size_t)(ncap - g->site_clo_cap) * sizeof(*na));
+        g->site_clo = na;
+        g->site_clo_cap = ncap;
+    }
+    zan_clo_layout_t *cl = zan_arena_alloc(g->arena, sizeof(*cl));
+    if (!cl) return;
+    LLVMTargetDataRef layout = LLVMGetModuleDataLayout(g->mod);
+    cl->n = 0;
+    for (int k = 0; k < n && cl->n < ZAN_CLO_LAYOUT_MAX; k++) {
+        cl->offsets[cl->n] = (uint32_t)LLVMOffsetOfElement(layout, rec_ty, fields[k]);
+        cl->names[cl->n] = names[k];
+        cl->n++;
+    }
+    g->site_clo[site_idx] = cl;
 }
 
 /* 退出报告引用的字段名表全局（i8**）。报告函数在 main 发射时就要引用它，

@@ -424,13 +424,14 @@ __attribute__((weak)) size_t zan_mem_trim(void) { return 0; }
 
 /* O(1) 读取 Zan 字符串头部缓存长度，失败时回退扫描/strlen。
  * 与 IR 侧 zan_hdr_page_ok 对齐：仅当地址距离 4 KiB 页首 >= 16 字节时
- * 才安全读取 [-8] 头部字，防止外来 C 串贴页首时跨页读缺页。 */
+ * 才安全读取 [-12] 长度与 [-8] 头部字，防止外来 C 串贴页首时跨页读缺页。 */
 static inline size_t zan_dict_str_len_fast(const char *s, int use_strlen) {
   if ((((uintptr_t)s) & 4080u) != 0) {
     uint64_t hdr;
-    memcpy(&hdr, s - 8, sizeof(hdr));
+    memcpy(&hdr, s + ZAN_HDR_WORD_OFF, sizeof(hdr));
     if ((hdr >> 32) == (uint64_t)ZAN_STRING_TAG) {
-      uint32_t cached = (uint32_t)(hdr & (uint64_t)ZAN_STR_LEN_MASK);
+      uint32_t cached;
+      memcpy(&cached, s + ZAN_STR_LEN_OFF, sizeof(cached));
       if (cached != (uint32_t)ZAN_STR_LEN_UNKNOWN)
         return (size_t)cached;
     }
@@ -463,6 +464,8 @@ int64_t __zan_dict_hash(const void *key, int64_t is_str) {
 #include "../rt_siphash.h"
 #if defined(_WIN32)
 #include <time.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
 #endif
 
 static uint64_t zan_hash_salt_k0 = 0, zan_hash_salt_k1 = 0;
@@ -486,6 +489,25 @@ static void zan_hash_salt_fill(uint64_t *k0, uint64_t *k1) {
   *k1 = (uint64_t)(uintptr_t)zan_hash_salt_fill ^
         ((uint64_t)GetCurrentProcessId() << 32);
 #else
+  /* One syscall, no FILE: fopen/fread/fclose of /dev/urandom cost ~155 us. */
+#if defined(__APPLE__)
+  {
+    uint64_t keys[2];
+    arc4random_buf(keys, sizeof(keys));
+    *k0 = keys[0];
+    *k1 = keys[1];
+    return;
+  }
+#elif defined(__linux__) && defined(SYS_getrandom)
+  {
+    uint64_t keys[2];
+    if (syscall(SYS_getrandom, keys, sizeof(keys), 0) == (long)sizeof(keys)) {
+      *k0 = keys[0];
+      *k1 = keys[1];
+      return;
+    }
+  }
+#endif
   FILE *f = fopen("/dev/urandom", "rb");
   if (f) {
     uint64_t keys[2];

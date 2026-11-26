@@ -4,6 +4,7 @@
 #include "arena.h"
 #include "diag.h"
 #include "../common/host_oom.h"
+#include "suggest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

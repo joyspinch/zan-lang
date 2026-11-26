@@ -17,6 +17,13 @@ if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
   message(FATAL_ERROR "run_arcnet.cmake: ZANC, SRC, EXPECTED and OUT_EXE are required")
 endif()
 
+# SHARD=1 forces the opt-in pre-optimization shard path (ZAN_SHARD=1), which
+# --publish no longer takes by default.
+if(SHARD)
+  set(ENV{ZAN_SHARD} 1)
+  set(ENV{ZAN_NO_SHARD} 0)
+endif()
+
 if(NOT WORKDIR AND CMAKE_SCRIPT_MODE_FILE)
   get_filename_component(_script_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
   get_filename_component(WORKDIR "${_script_dir}/.." ABSOLUTE)

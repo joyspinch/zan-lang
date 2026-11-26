@@ -435,7 +435,7 @@ partial class Irgen {
         return true;
     }
     bool IsTypeReceiver(Node receiver, string member) {
-        return receiver.kind == AK.Ident() && (receiver.qualifiedTypeReceiver
+        return receiver.kind == AK.Ident() && (receiver.qualifiedTypeReceiver || receiver.typeName
             || (LocalIdx(receiver.sval) < 0 && !ShadowsTypeName(receiver.sval, member)));
     }
 
@@ -708,6 +708,17 @@ partial class Irgen {
     }
 
     ExprVal GenMember(Node e) {
+        // `base.P`: the BASE class' own getter, bypassing an override (the
+        // host's base_recv -> direct dispatch, like `base.M()`)
+        if (e.a != null && e.a.kind == AK.BaseExpr() && curHasThis) {
+            Node bc = BaseClassOf(binder.FindType(curClass));
+            if (bc != null && FieldIndex(bc, e.sval) < 0 && FindMethodUp(bc, "get_" + e.sval) != null) {
+                Node gc = new Node(AK.Call());
+                gc.line = e.line; gc.col = e.col;
+                ExprVal bv = EmitBaseCall("get_" + e.sval, gc);
+                if (bv != null) { return bv; }
+            }
+        }
         if (IsTypeReceiver(e.a, e.sval)) {
             // Console.ForegroundColor / Console.BackgroundColor: the current
             // color, kept in a module-level slot by the C host.
@@ -868,9 +879,8 @@ partial class Irgen {
             return FromSlot(raw, ety);
         }
         if ((e.sval == "Length" || e.sval == "Count") && obj.ty != null && obj.ty.ival >= 1) {
-            // B-ID183：null 数组走 zarr_len（null→宿主 scratch 哨兵 1<<62，
-            // 与 C 宿主 .Length 软失败口径逐字对齐），裸 load 在 null 上是
-            // 段错误。
+            // B-ID183：null 数组走 zarr_len（null→0，与 C 宿主 .Length 软失败
+            // 落空数组 scratch 的口径逐字对齐），裸 load 在 null 上是段错误。
             string t = NT();
             L("  " + t + " = call i64 @zarr_len(i64* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));

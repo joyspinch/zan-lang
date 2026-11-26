@@ -934,6 +934,9 @@ partial class Irgen {
     ExprVal EmitDelegateCallVal(ExprVal clo, Node dty, Node e) {
         dty = InstDelegateType(dty);
         // Arguments or the callback may replace the last local/field owner.
+        // The retained closure is a temporary of the call expression: it is
+        // armed with the arguments (see ArmTempNow), so a throw from an
+        // argument or the callee releases it too (delegate_callee_exception_owner).
         EmitArcRetain(clo.op, dty);
         AddTemp(clo.op, dty);
         List<Node> pt = DelegParams(dty);
@@ -953,7 +956,12 @@ partial class Irgen {
         while (i < e.kids.Count) {
             Node pty = MkType("int"); if (i < pt.Count) { pty = pt[i]; }
             ExprVal av = GenArgExpr(e.kids[i], pty);
-            if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
+            // a struct argument is a VALUE: the delegate body gets its own
+            // copy, exactly like a direct call (CallArg's NeedsStructCopy)
+            // (never a `ref`/`out` argument: the callee writes through it)
+            Node ak = e.kids[i];
+            bool byRef = ak != null && ak.kind == AK.OutArg();   // `ref`/`out` both parse as OutArg
+            if (!byRef && NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
             string lt = MapType(pty);
             argTypes.Add(lt);
             argVals.Add(Coerce(av, lt));
@@ -1169,6 +1177,9 @@ partial class Irgen {
             Node scls = binder.FindType(curClass);
             if (scls != null) {
                 if (FindStaticField(scls, name) != null) { return true; }
+                // a static property (GenIdent reads it through its getter)
+                Node sg = FindMethodUp(scls, "get_" + name);
+                if (sg != null && HasMod(sg, MOD.Static())) { return true; }
                 Node mg = FindMethodUp(scls, name);
                 if (mg != null && HasMod(mg, MOD.Static())) { return true; }
             }

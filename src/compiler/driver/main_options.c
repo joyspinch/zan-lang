@@ -89,6 +89,8 @@ void print_usage(void) {
                   "files\" summary)\n");
   fprintf(stderr,
           "    --time           Report how long each compiler phase took\n");
+  fprintf(stderr, "    --no-build-cache Recompute optimization and object code "
+                  "(docs/BUILD_CACHE.md)\n");
   fprintf(stderr, "    -D<name>[=value] Define preprocessor symbol\n");
   fprintf(stderr, "    @<file>          Read further arguments from <file> "
                   "(one per line or\n");
@@ -154,6 +156,8 @@ void print_usage(void) {
   fprintf(stderr, "                     OverflowException (C# /checked+); "
                   "unchecked(){ }\n");
   fprintf(stderr, "                     blocks opt out locally\n");
+  fprintf(stderr, "    --fp-contract    Allow fused multiply-add (faster float "
+                  "math; last-bit results may differ by CPU)\n");
   fprintf(stderr, "    --strict-runtime  Guard failures exit(70); "
                   "ZAN_RT_HARD=0 forces soft mode\n");
   fprintf(stderr, "    --diagnostics-format=jsonl  Emit tagged compiler "
@@ -181,6 +185,19 @@ void print_usage(void) {
                   "<LLVM triple>] [-O0..-O3/-Os/-Oz]\n");
   fprintf(stderr, "    --emit-symbols <f> Write the type/member index (IDE "
                   "completion) and exit\n");
+  fprintf(stderr, "    --summary        Print the public surface of the given "
+                  "sources (one line\n"
+                  "                     per member, signature + first doc "
+                  "sentence) and exit\n");
+  fprintf(stderr, "    --emit-deps <f>  Write the source files this program "
+                  "compiled from\n"
+                  "                     (after stdlib pull-in), one absolute "
+                  "path per line\n");
+  fprintf(stderr, "    --query <sym>    After type checking, report what "
+                  "Type.Method allocates,\n"
+                  "                     captures, may throw, which capabilities "
+                  "it reaches and\n"
+                  "                     who calls it (JSON Lines) and exit\n");
   fprintf(stderr, "    --semantic-refs <file> <line> <col>  Check and print "
                   "bound symbol references as JSON\n");
   fprintf(stderr, "                       Positions use 1-based lines and "

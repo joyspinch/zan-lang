@@ -1,0 +1,64 @@
+using System;
+using Game.Foundation;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：SnGame 无头对局（不挂宿主、不写存档），
+// 固定 16ms 一帧推进。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是
+// 模糊测试用的机器人。改了手感或 AI 后回放分叉，就重新录制（见 README）。
+//
+// 输入编码：0 保持上一帧的方向；1..16 转向第 (输入-1) 个方向（16 等分圆周，0 = 向右，
+// 顺时针）；17..32 同上并按住冲刺；99 阵亡后重开一局。
+public class SnakeSim : IReplaySim {
+    const int FrameMs = 16;
+    static int[] DirX = new int[] { 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115, 0, 115, 212, 277 };
+    static int[] DirY = new int[] { 0, 115, 212, 277, 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115 };
+    SnGame g;
+    int now;
+
+    public void Reset(long seed) {
+        g = SnGame.CreateHeadless(seed);
+        now = 0;
+        g.StartGame(now);
+    }
+
+    public void Step(int frame, int input) {
+        if (input >= 1 && input <= 32) {
+            int d = (input - 1) % 16;
+            g.mouseX = SnGame.VW() / 2 + SnakeSim.DirX[d];
+            g.mouseY = SnGame.VH() / 2 + SnakeSim.DirY[d];
+            g.boostKey = input > 16;
+        } else if (input == 99 && g.over) {
+            g.StartGame(now);
+        }
+        now = now + SnakeSim.FrameMs;
+        g.Tick(now);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Bool(g.over).Int(g.score.Get()).Int(g.kills).Int(g.fever)
+         .Int(g.me.headX).Int(g.me.headY).Int(g.me.length).Int(g.orbs.Count);
+        for (int i = 0; i < g.foes.Count; i = i + 1) {
+            Worm w = g.foes[i];
+            h.Bool(w.alive).Int(w.headX).Int(w.headY).Int(w.length);
+        }
+        return h.Value();
+    }
+
+    [Invariant]
+    public bool FeverInRange() { return g.fever >= 0 && g.fever <= 100; }
+
+    [Invariant]
+    public bool ScoreNotNegative() { return g.score.Get() >= 0; }
+
+    // 长度只增不减（冲刺不扣长度），开局 14 节
+    [Invariant]
+    public bool LengthSane() { return g.me.length >= 14; }
+
+    // 机器人：每隔一阵换个方向，偶尔冲刺；阵亡后过一会儿重开
+    public static int Bot(DeterministicRandom rng, int frame) {
+        int roll = rng.NextBelow(100);
+        if (roll < 8) { return 1 + rng.NextBelow(32); }
+        if (roll < 10) { return 99; }
+        return 0;
+    }
+}

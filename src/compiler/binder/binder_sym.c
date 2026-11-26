@@ -1022,8 +1022,35 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
   }
 
   if (!base) {
-    zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1005,
-                       "undefined type '%.*s'", name.len, name.str);
+    /* S1 fix-it：作用域链里拼写最近的类型名（类/结构/接口/枚举/委托） */
+    char hint[160] = "", repl[128];
+    zan_diag_fixit_t fix = {0}, *fixp = NULL;
+    zan_suggest_t sg;
+    zan_suggest_init(&sg, name.str, name.len);
+    for (zan_scope_t *sc = b->current_scope; sc; sc = sc->parent) {
+      for (int i = 0; i < sc->sym_count; i++) {
+        zan_symbol_t *s = sc->symbols[i];
+        if (s && (s->kind == SYM_CLASS || s->kind == SYM_STRUCT ||
+                  s->kind == SYM_INTERFACE || s->kind == SYM_ENUM ||
+                  s->kind == SYM_DELEGATE))
+          zan_suggest_offer(&sg, s->name.str, s->name.len);
+      }
+    }
+    const char *best;
+    size_t best_len;
+    zan_loc_t at;
+    if (zan_suggest_result(&sg, &best, &best_len) && best_len < sizeof(repl) &&
+        zan_diag_locate_word(b->diag, type_ref->loc, name.str, name.len, &at)) {
+      memcpy(repl, best, best_len);
+      repl[best_len] = '\0';
+      snprintf(hint, sizeof(hint), " -- did you mean '%s'?", repl);
+      fix.loc = at;
+      fix.len = name.len;
+      fix.text = repl;
+      fixp = &fix;
+    }
+    zan_diag_emit_fix(b->diag, DIAG_ERROR, type_ref->loc, 1005, fixp,
+                      "undefined type '%.*s'%s", name.len, name.str, hint);
     return b->type_error;
   }
 

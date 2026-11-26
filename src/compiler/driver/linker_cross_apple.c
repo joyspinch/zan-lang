@@ -84,16 +84,20 @@ else if (cross_compiling &&
     snprintf(
         cmd, sizeof(cmd),
         "ld64.lld -arch arm64 -platform_version ios 14.0 14.0 -adhoc_codesign"
-        "%s -o \"%s\" \"%s\"",
-        (publish_mode || strip_symbols) ? " -dead_strip -S" : "", obj_path,
-        obj_tmp);
+        " -dead_strip%s -o \"%s\" \"%s\"",
+        (publish_mode || strip_symbols) ? " -S" : "", obj_path, obj_tmp);
   } else {
     snprintf(
         cmd, sizeof(cmd),
         "ld64.lld -arch %s -platform_version macos 11.0 11.0 -adhoc_codesign"
-        "%s -o \"%s\" \"%s\"",
-        march, (publish_mode || strip_symbols) ? " -dead_strip -S" : "",
-        obj_path, obj_tmp);
+        " -dead_strip%s -o \"%s\" \"%s\"",
+        march, (publish_mode || strip_symbols) ? " -S" : "", obj_path, obj_tmp);
+  }
+  /* -dead_strip 不再只限 --publish：运行时对象整份链入，不剥则
+   * 每个 exe 带全套 timer/io/crash 代码（见本机分支同注）。 */
+  if (rt_mem_obj) {
+    /* 发射期已把分配调用改名为 zan_mem_*（route_fast_alloc） */
+    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_mem_obj);
   }
   if (rt_timer_obj) {
     cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
@@ -331,6 +335,7 @@ else {
     argv[a++] = "--dynamicbase";
     argv[a++] = "--nxcompat";
     argv[a++] = "--high-entropy-va";
+    argv[a++] = "--no-insert-timestamp";
     if (publish_mode || strip_symbols) {
       argv[a++] = "-s";
     }
@@ -453,7 +458,8 @@ else {
     snprintf(link_cmd, sizeof(link_cmd),
              "clang --target=x86_64-w64-windows-gnu --ld-path=\"%s\" "
              "\"%s\" -o \"%s\" -Wl,--stack,268435456 -Wl,--gc-sections"
-             " -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va%s",
+             " -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va"
+             " -Wl,--no-insert-timestamp%s",
              lld_path, generated_objects.paths[0], obj_path,
              publish_mode ? " -O2 -s -Wl,--icf=safe -Wl,-O2" : "");
     for (int oi = 1; oi < generated_objects.count; oi++) {
@@ -525,13 +531,17 @@ else {
 #else
   char link_cmd[32768];
 #ifdef __APPLE__
+  /* ld64 只链整对象：不加 -dead_strip，zanrt_timer/io/crash/mem 的每个
+   * 函数都进 exe（hello 曾 176 KB）。Mach-O 对象自带
+   * SUBSECTIONS_VIA_SYMBOLS，按符号剥即可；驱动 dylib 不回调 exe 符号
+   * （nm -u 已核），注册表/构造器经 __mod_init_func 根保留。 */
   if (publish_mode || strip_symbols) {
     snprintf(link_cmd, sizeof(link_cmd),
              "cc \"%s\" -o \"%s\" -lm -O2 -Wl,-dead_strip -Wl,-S", obj_tmp,
              obj_path);
   } else {
-    snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm", obj_tmp,
-             obj_path);
+    snprintf(link_cmd, sizeof(link_cmd),
+             "cc \"%s\" -o \"%s\" -lm -Wl,-dead_strip", obj_tmp, obj_path);
   }
 #else
   if (publish_mode || strip_symbols) {

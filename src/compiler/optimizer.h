@@ -95,6 +95,11 @@ bool zan_opt_knob_off(signed char knob, const char *env);
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
                               zan_opt_level_t level,
                               const zan_opt_knobs_t *knobs);
+/* Decides whether this build leaves the finish half of the LLVM pipeline to
+ * object emission (codegen_split.h) and records it in g->opt_finish_level /
+ * opt_finish_vectorize. zan_optimize calls it; a build-cache hit on the
+ * optimized module calls it to restore the same pending state. */
+bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level);
 void zan_opt_report_print(const zan_opt_report_t *report);
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g,
                                            zan_opt_level_t level,
@@ -103,6 +108,11 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
                                           LLVMTargetMachineRef tm,
                                           zan_opt_level_t level,
                                           const zan_opt_knobs_t *knobs);
+/* The same pipeline for one partitioned unit module (build_partition.h):
+ * no whole-module-only steps. Thread-safe per module; returns 0 on success. */
+int zan_opt_run_passes_on_unit(LLVMModuleRef mod, LLVMTargetMachineRef tm, int level);
+/* Whole-module steps the unit pipeline leaves out; run once before splitting. */
+void zan_opt_unit_prelude(LLVMModuleRef mod);
 
 /* 收缩 pass（S-UNWIND）：nothrow 闭包后将可证
  * 不抛的 invoke 塌缩为 call（personality/语义不变）。返回塌缩数。 */
@@ -120,5 +130,9 @@ zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod);
 
 /* Shared gate for optimizer stages and artifact writers. */
 zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage);
+
+/* opt_tbaa.c: field-offset TBAA (see file comment). */
+void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st, int fi);
+int zan_opt_tbaa(LLVMModuleRef mod);
 
 #endif /* ZAN_OPTIMIZER_H */

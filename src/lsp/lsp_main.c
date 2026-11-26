@@ -987,6 +987,13 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri,
         tlen = (int)(le - tok);
       if (tlen > 0)
         end_char = utf16_units_range(ls, tok + tlen);
+      /* S1：编译器量出的 token 区间（成员诊断覆盖 ".名字"）更长时用它 */
+      zan_loc_t tend;
+      if (zan_diag_token_end(diag, e->loc, &tend) && tend.line == e->loc.line) {
+        int tc = byte_col_to_utf16_char(text, line, (int)tend.col);
+        if (tc > end_char)
+          end_char = tc;
+      }
     }
 
     json_value *d = json_new_obj();
@@ -1004,6 +1011,36 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri,
     json_obj_set(d, "severity", json_new_num(sev));
     json_obj_set(d, "source", json_new_str("zanc"));
     json_obj_set(d, "message", json_new_str(e->message));
+    if (e->code > 0) {
+      char codebuf[16];
+      snprintf(codebuf, sizeof(codebuf), "%c%04d",
+               e->level == DIAG_ERROR ? 'E' : 'W', e->code);
+      json_obj_set(d, "code", json_new_str(codebuf));
+    }
+    /* S1：fix-it 随诊断的 data 下发（LSP 3.16 起客户端在 codeAction 请求里原样
+     * 带回），handle_code_action 据此给出 quickfix；只收本文档内、单行的补丁 */
+    if (e->has_fix && e->fix_loc.file_id == e->loc.file_id &&
+        e->fix_loc.line > 0) {
+      int fl = (int)e->fix_loc.line - 1;
+      int fs = byte_col_to_utf16_char(text, fl, (int)e->fix_loc.col);
+      int fe =
+          byte_col_to_utf16_char(text, fl, (int)(e->fix_loc.col + e->fix_len));
+      json_value *data = json_new_obj();
+      json_value *fix = json_new_obj();
+      json_value *frange = json_new_obj();
+      json_value *fstart = json_new_obj();
+      json_value *fend = json_new_obj();
+      json_obj_set(fstart, "line", json_new_num(fl));
+      json_obj_set(fstart, "character", json_new_num(fs));
+      json_obj_set(fend, "line", json_new_num(fl));
+      json_obj_set(fend, "character", json_new_num(fe));
+      json_obj_set(frange, "start", fstart);
+      json_obj_set(frange, "end", fend);
+      json_obj_set(fix, "range", frange);
+      json_obj_set(fix, "newText", json_new_str(e->fix_text));
+      json_obj_set(data, "fix", fix);
+      json_obj_set(d, "data", data);
+    }
     json_arr_add(arr, d);
   }
 
@@ -4863,6 +4900,65 @@ static void handle_code_action(lsp_server_t *s, json_value *id,
   using_analysis_t analysis = intel_analyze_usings(is, doc->text, doc_len);
 
   json_value *actions = json_new_arr();
+
+  /* S1：编译器 fix-it → quickfix。诊断的 data.fix 是发布时附上的补丁，客户端在
+   * context.diagnostics 里原样带回；标题取 "did you mean 'X'" 里的建议名。 */
+  json_value *ctx = json_obj_get(params, "context");
+  json_value *cdiags = ctx ? json_obj_get(ctx, "diagnostics") : NULL;
+  for (int i = 0; cdiags && cdiags->type == JSON_ARR && i < cdiags->as.arr.count;
+       i++) {
+    json_value *cd = cdiags->as.arr.items[i];
+    json_value *data = cd ? json_obj_get(cd, "data") : NULL;
+    json_value *fix = data ? json_obj_get(data, "fix") : NULL;
+    json_value *frange = fix ? json_obj_get(fix, "range") : NULL;
+    const char *new_text =
+        fix ? json_get_str(json_obj_get(fix, "newText")) : NULL;
+    json_value *fs = frange ? json_obj_get(frange, "start") : NULL;
+    json_value *fe = frange ? json_obj_get(frange, "end") : NULL;
+    if (!new_text || !fs || !fe)
+      continue;
+    json_value *fsl = json_obj_get(fs, "line"),
+               *fsc = json_obj_get(fs, "character");
+    json_value *fel = json_obj_get(fe, "line"),
+               *fec = json_obj_get(fe, "character");
+    if (!fsl || !fsc || !fel || !fec)
+      continue;
+    char title[256];
+    const char *msg = json_get_str(json_obj_get(cd, "message"));
+    const char *dym = msg ? strstr(msg, "did you mean '") : NULL;
+    const char *q2 = dym ? strchr(dym + 14, '\'') : NULL;
+    if (dym && q2)
+      snprintf(title, sizeof(title), "Change to '%.*s'",
+               (int)(q2 - (dym + 14)), dym + 14);
+    else if (fsl->as.num == fel->as.num && fsc->as.num == fec->as.num)
+      snprintf(title, sizeof(title), "Insert '%s'", new_text);
+    else
+      snprintf(title, sizeof(title), "Replace with '%s'", new_text);
+    json_value *action = json_new_obj();
+    json_obj_set(action, "title", json_new_str(title));
+    json_obj_set(action, "kind", json_new_str("quickfix"));
+    json_obj_set(action, "isPreferred", json_new_bool(true));
+    json_value *range = json_new_obj();
+    json_value *start_pos = json_new_obj();
+    json_value *end_pos = json_new_obj();
+    json_obj_set(start_pos, "line", json_new_num(fsl->as.num));
+    json_obj_set(start_pos, "character", json_new_num(fsc->as.num));
+    json_obj_set(end_pos, "line", json_new_num(fel->as.num));
+    json_obj_set(end_pos, "character", json_new_num(fec->as.num));
+    json_obj_set(range, "start", start_pos);
+    json_obj_set(range, "end", end_pos);
+    json_value *text_edit = json_new_obj();
+    json_obj_set(text_edit, "range", range);
+    json_obj_set(text_edit, "newText", json_new_str(new_text));
+    json_value *edits = json_new_arr();
+    json_arr_add(edits, text_edit);
+    json_value *changes = json_new_obj();
+    json_obj_set(changes, uri, edits);
+    json_value *edit_obj = json_new_obj();
+    json_obj_set(edit_obj, "changes", changes);
+    json_obj_set(action, "edit", edit_obj);
+    json_arr_add(actions, action);
+  }
 
   if (analysis.missing_count > 0 || analysis.unused_count > 0) {
     json_value *action = json_new_obj();

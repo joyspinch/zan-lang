@@ -335,6 +335,18 @@ partial class Irgen {
         return ne;
     }
 
+    void TargetDelegateArms(Node c, Node dty) {
+        int i = 0;
+        while (i < 2) {
+            Node arm = i == 0 ? c.b : c.c;
+            i = i + 1;
+            if (arm == null) { continue; }
+            if (arm.kind == AK.Lambda()) { AnnotateLambda(arm, dty); }
+            else if (IsMethodGroup(arm)) { arm.methodGroupTarget = CopyType(dty); }
+            else if (arm.kind == AK.Conditional()) { TargetDelegateArms(arm, dty); }
+        }
+    }
+
     // evaluate a call argument, first pushing a delegate parameter's
     // signature onto a bare lambda argument
     ExprVal GenArgExpr(Node a, Node pty) {
@@ -351,6 +363,20 @@ partial class Irgen {
         }
         if (a != null && a.kind == AK.Lambda() && pty != null && IsDelegate(pty)) {
             AnnotateLambda(a, pty);
+        }
+        // `c ? lambda : other`: the delegate parameter types both arms (the
+        // host target-types the conditional) -- an untyped block lambda in an
+        // arm otherwise returns through an erased i8* slot
+        if (a != null && a.kind == AK.Conditional() && pty != null && IsDelegate(pty)) {
+            TargetDelegateArms(a, pty);
+        }
+        // a plain value for a Binding<T> parameter becomes a fresh Binding
+        // (live over a field lvalue, a constant otherwise) -- the C host's
+        // emit_arg_typed -> emit_binding_value; the object is a statement
+        // temp, released after the call (the callee borrows it)
+        if (a != null && pty != null && IsBindingTy(pty)) {
+            ExprVal bv = GenBindingValue(a, pty);
+            if (bv != null) { return bv; }
         }
         // a scalar argument for a class parameter becomes `new Target(arg)`
         Node w = WrapImplicitCtorArg(pty, a);
@@ -772,7 +798,14 @@ partial class Irgen {
             while (k < m.kids.Count) { if (m.kids[k].kind == AK.Param()) { np = np + 1; } k = k + 1; }
             int score = 0;
             if (np - 1 == e.kids.Count) { score = 100; }
-            score = score + MatchTypeScore(ParamTypeNode(m, 0), recvTy, TParams(m));
+            // the receiver ranks exact (4) > base class / interface (3) >
+            // open type parameter (2): `Describe(this Labelled)` beats
+            // `Describe<T>(this T)` for a LabelledItem receiver
+            Node p0 = ParamTypeNode(m, 0);
+            int rs = MatchTypeScore(p0, recvTy, TParams(m)) * 2;
+            if (rs == 0 && p0 != null && recvTy != null && p0.kids.Count == 0
+                && TypeImplementsOrDerives(recvTy, p0)) { rs = 3; }
+            score = score + rs;
             score = score + LambdaArgScore(m, recvTy, e);
             int a = 0;
             while (a < e.kids.Count) {

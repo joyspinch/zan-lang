@@ -31,6 +31,9 @@ typedef struct zan_options {
   bool do_dump_tokens;
   bool do_dump_ast;
   const char *emit_symbols_path;
+  bool do_summary;            /* S4 --summary */
+  const char *emit_deps_path; /* S3 --emit-deps <file> */
+  const char *query_name;     /* S2 --query <symbol> */
   const char *semantic_refs_file;
   uint32_t semantic_refs_line;
   uint32_t semantic_refs_col;
@@ -39,6 +42,7 @@ typedef struct zan_options {
   bool do_emit_ir;
   int check_leaks_opt;
   bool checked_arith;
+  bool fp_contract; /* --fp-contract: allow fused multiply-add */
   int arc_guard_opt;
   int runtime_checks_opt;
   bool runtime_checks;

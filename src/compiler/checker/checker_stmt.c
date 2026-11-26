@@ -222,10 +222,19 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     /* A522-③：`if (x = 1)` 曾仅警告、按 C 风格真假运行（C# CS0029 硬错）。
      * 仓库 .zan 全量 4283 处裸标识符条件全是合法 bool——赋值入条件没有
      * 任何合法用例，升级为编译错误。 */
-    if (stmt->if_stmt.cond && stmt->if_stmt.cond->kind == AST_ASSIGNMENT)
-      zan_diag_emit_code(c->diag, DIAG_ERROR, stmt->if_stmt.cond->loc, 2073,
-                         "assignment used as a condition (did you mean '=='? "
-                         "assignment (=) has no boolean value");
+    if (stmt->if_stmt.cond && stmt->if_stmt.cond->kind == AST_ASSIGNMENT) {
+      /* S1 fix-it：普通 `=`（非复合赋值）且源码该处确是 '='，改成 '==' */
+      zan_ast_node_t *cnd = stmt->if_stmt.cond;
+      zan_diag_fixit_t fix = {cnd->loc, 1, "=="};
+      zan_loc_t at;
+      bool plain = cnd->binary.compound_base == TK_EOF &&
+                   zan_diag_locate_word(c->diag, cnd->loc, "=", 1, &at) &&
+                   at.offset == cnd->loc.offset;
+      zan_diag_emit_fix(c->diag, DIAG_ERROR, cnd->loc, 2073,
+                        plain ? &fix : NULL,
+                        "assignment used as a condition (did you mean '=='? "
+                        "assignment (=) has no boolean value");
+    }
     zan_type_t *cond_type = zan_checker_check_expr(c, stmt->if_stmt.cond);
     if (cond_type->kind != TYPE_BOOL && cond_type->kind != TYPE_ERROR) {
       zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->if_stmt.cond->loc, 2074,

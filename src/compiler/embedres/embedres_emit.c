@@ -424,123 +424,113 @@ static LLVMValueRef embed_emit_passthrough(zan_irgen_t *g,
 
 /* Stable borrowed text views. Keep raw byte storage/length untouched and use
  * only libc so existing cross-target inflate objects remain compatible. */
-static LLVMValueRef embed_emit_text_view(zan_irgen_t *g,
-                                         struct embed_api_ctx *c) {
-  LLVMTypeRef args[] = {c->i8p, c->i64};
-  LLVMTypeRef ty = LLVMFunctionType(c->i8p, args, 2, 0);
-  LLVMValueRef fn = LLVMAddFunction(g->mod, "zan.embed.text", ty);
-  LLVMSetLinkage(fn, LLVMInternalLinkage);
-  LLVMValueRef cache = LLVMAddGlobal(g->mod, c->i8p, "zan.embed.texts");
-  LLVMSetInitializer(cache, LLVMConstNull(c->i8p));
-  LLVMSetLinkage(cache, LLVMInternalLinkage);
-  LLVMValueRef gate = LLVMAddGlobal(g->mod, c->i32, "zan.embed.text.gate");
-  LLVMSetInitializer(gate, LLVMConstInt(c->i32, 0, 0));
-  LLVMSetLinkage(gate, LLVMInternalLinkage);
-  LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
-  LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-  LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
-  LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
-  LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
-  LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
-  LLVMBasicBlockRef alloc = LLVMAppendBasicBlockInContext(g->ctx, fn, "alloc");
-  LLVMBasicBlockRef init = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
-  LLVMBasicBlockRef empty = LLVMAppendBasicBlockInContext(g->ctx, fn, "empty");
-  LLVMPositionBuilderAtEnd(b, entry);
-  LLVMValueRef source = LLVMGetParam(fn, 0), len = LLVMGetParam(fn, 1);
-  LLVMValueRef invalid =
-      LLVMBuildOr(b, LLVMBuildIsNull(b, source, "null"),
-                  LLVMBuildICmp(b, LLVMIntUGT, len,
-                                LLVMConstInt(c->i64, UINT32_MAX, 0), "huge"),
-                  "invalid");
-  LLVMValueRef cursor = LLVMBuildAlloca(b, c->i8p, "cursor");
-  LLVMBasicBlockRef lock = LLVMAppendBasicBlockInContext(g->ctx, fn, "lock");
-  LLVMBasicBlockRef locked =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "locked");
-  LLVMBuildBr(b, lock);
-  LLVMPositionBuilderAtEnd(b, lock);
-  LLVMValueRef prior = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpXchg, gate,
-                                          LLVMConstInt(c->i32, 1, 0),
-                                          LLVMAtomicOrderingAcquire, 0);
-  LLVMBuildCondBr(b,
-                  LLVMBuildICmp(b, LLVMIntEQ, prior, LLVMConstInt(c->i32, 0, 0),
-                                "acquired"),
-                  locked, lock);
-  LLVMPositionBuilderAtEnd(b, locked);
-  LLVMValueRef first = LLVMBuildLoad2(b, c->i8p, cache, "first");
-  LLVMBuildStore(b, first, cursor);
-  LLVMBuildCondBr(b, invalid, empty, head);
-  /* Node: source, byte length, next, sentinel RC, string header, text. */
-  LLVMTypeRef nf[] = {c->i8p, c->i64, c->i8p, c->i64, c->i64};
-  LLVMTypeRef node = LLVMStructTypeInContext(g->ctx, nf, 5, 0);
-  LLVMPositionBuilderAtEnd(b, head);
-  LLVMValueRef p = LLVMBuildLoad2(b, c->i8p, cursor, "p");
-  LLVMBuildCondBr(b, LLVMBuildIsNull(b, p, "end"), alloc, body);
-  LLVMPositionBuilderAtEnd(b, body);
-  LLVMValueRef sp = LLVMBuildStructGEP2(b, node, p, 0, "source.p");
-  LLVMValueRef lp = LLVMBuildStructGEP2(b, node, p, 1, "len.p");
-  LLVMValueRef same = LLVMBuildAnd(
-      b,
-      LLVMBuildICmp(b, LLVMIntEQ, LLVMBuildLoad2(b, c->i8p, sp, "source"),
-                    source, "same.source"),
-      LLVMBuildICmp(b, LLVMIntEQ, LLVMBuildLoad2(b, c->i64, lp, "len"), len,
-                    "same.len"),
-      "same");
-  LLVMBuildCondBr(b, same, hit, next);
-  LLVMValueRef skip = LLVMSizeOf(node);
-  LLVMPositionBuilderAtEnd(b, hit);
-  LLVMValueRef unlock_hit = LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
-  LLVMSetOrdering(unlock_hit, LLVMAtomicOrderingRelease);
-  LLVMBuildRet(b, LLVMBuildGEP2(b, c->i8, p, &skip, 1, "text"));
-  LLVMPositionBuilderAtEnd(b, next);
-  LLVMValueRef np = LLVMBuildStructGEP2(b, node, p, 2, "next.p");
-  LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, np, "next"), cursor);
-  LLVMBuildBr(b, head);
-  LLVMPositionBuilderAtEnd(b, alloc);
-  LLVMTypeRef ma[] = {c->i64}, mty;
-  LLVMValueRef malloc_fn = embed_libc(g, "malloc", c->i8p, ma, 1, &mty);
-  LLVMValueRef size = LLVMBuildAdd(
-      b, len, LLVMBuildAdd(b, skip, LLVMConstInt(c->i64, 1, 0), "overhead"),
-      "size");
-  LLVMValueRef raw = LLVMBuildCall2(b, mty, malloc_fn, &size, 1, "raw");
-  LLVMBuildCondBr(b, LLVMBuildIsNull(b, raw, "oom"), empty, init);
-  LLVMPositionBuilderAtEnd(b, init);
-  LLVMBuildStore(b, source, LLVMBuildStructGEP2(b, node, raw, 0, "source.p"));
-  LLVMBuildStore(b, len, LLVMBuildStructGEP2(b, node, raw, 1, "len.p"));
-  LLVMBuildStore(b, first, LLVMBuildStructGEP2(b, node, raw, 2, "next.p"));
-  LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_SENTINEL_RC, 0),
-                 LLVMBuildStructGEP2(b, node, raw, 3, "rc.p"));
-  /* Text preserves the C-string NUL contract; bytes retain full length. */
-  LLVMTypeRef ca[] = {c->i8p, c->i32, c->i64}, cty;
-  LLVMValueRef memchr_fn = embed_libc(g, "memchr", c->i8p, ca, 3, &cty);
-  LLVMValueRef cv[] = {source, LLVMConstInt(c->i32, 0, 0), len};
-  LLVMValueRef nul = LLVMBuildCall2(b, cty, memchr_fn, cv, 3, "nul");
-  LLVMValueRef textlen = LLVMBuildSelect(
-      b, LLVMBuildIsNull(b, nul, "no.nul"), len,
-      LLVMBuildSub(b, LLVMBuildPtrToInt(b, nul, c->i64, "nul.i"),
-                   LLVMBuildPtrToInt(b, source, c->i64, "source.i"), "prefix"),
-      "textlen");
-  LLVMBuildStore(b,
-                 LLVMBuildOr(b, LLVMConstInt(c->i64, ZAN_STRING_TAG << 32, 0),
-                             textlen, "word"),
-                 LLVMBuildStructGEP2(b, node, raw, 4, "word.p"));
-  LLVMValueRef text = LLVMBuildGEP2(b, c->i8, raw, &skip, 1, "text");
-  LLVMTypeRef cp[] = {c->i8p, c->i8p, c->i64}, cpty;
-  LLVMValueRef memcpy_fn = embed_libc(g, "memcpy", c->i8p, cp, 3, &cpty);
-  LLVMValueRef cpv[] = {text, source, len};
-  LLVMBuildCall2(b, cpty, memcpy_fn, cpv, 3, "");
-  LLVMBuildStore(b, LLVMConstInt(c->i8, 0, 0),
-                 LLVMBuildGEP2(b, c->i8, text, &len, 1, "end"));
-  LLVMBuildStore(b, raw, cache);
-  LLVMValueRef unlock_new = LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
-  LLVMSetOrdering(unlock_new, LLVMAtomicOrderingRelease);
-  LLVMBuildRet(b, text);
-  LLVMPositionBuilderAtEnd(b, empty);
-  LLVMValueRef unlock_empty =
-      LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
-  LLVMSetOrdering(unlock_empty, LLVMAtomicOrderingRelease);
-  LLVMBuildRet(b, c->empty);
-  LLVMDisposeBuilder(b);
-  return fn;
+static LLVMValueRef embed_emit_text_view(zan_irgen_t *g, struct embed_api_ctx *c) {
+    LLVMTypeRef args[] = { c->i8p, c->i64 };
+    LLVMTypeRef ty = LLVMFunctionType(c->i8p, args, 2, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "zan.embed.text", ty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMValueRef cache = LLVMAddGlobal(g->mod, c->i8p, "zan.embed.texts");
+    LLVMSetInitializer(cache, LLVMConstNull(c->i8p));
+    LLVMSetLinkage(cache, LLVMInternalLinkage);
+    LLVMValueRef gate = LLVMAddGlobal(g->mod, c->i32, "zan.embed.text.gate");
+    LLVMSetInitializer(gate, LLVMConstInt(c->i32, 0, 0));
+    LLVMSetLinkage(gate, LLVMInternalLinkage);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
+    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
+    LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef alloc = LLVMAppendBasicBlockInContext(g->ctx, fn, "alloc");
+    LLVMBasicBlockRef init = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
+    LLVMBasicBlockRef empty = LLVMAppendBasicBlockInContext(g->ctx, fn, "empty");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef source = LLVMGetParam(fn, 0), len = LLVMGetParam(fn, 1);
+    LLVMValueRef invalid = LLVMBuildOr(b, LLVMBuildIsNull(b, source, "null"),
+        LLVMBuildICmp(b, LLVMIntUGT, len, LLVMConstInt(c->i64, UINT32_MAX, 0), "huge"), "invalid");
+    LLVMValueRef cursor = LLVMBuildAlloca(b, c->i8p, "cursor");
+    LLVMBasicBlockRef lock = LLVMAppendBasicBlockInContext(g->ctx, fn, "lock");
+    LLVMBasicBlockRef locked = LLVMAppendBasicBlockInContext(g->ctx, fn, "locked");
+    LLVMBuildBr(b, lock);
+    LLVMPositionBuilderAtEnd(b, lock);
+    LLVMValueRef prior = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpXchg, gate,
+        LLVMConstInt(c->i32, 1, 0), LLVMAtomicOrderingAcquire, 0);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, prior,
+        LLVMConstInt(c->i32, 0, 0), "acquired"), locked, lock);
+    LLVMPositionBuilderAtEnd(b, locked);
+    LLVMValueRef first = LLVMBuildLoad2(b, c->i8p, cache, "first");
+    LLVMBuildStore(b, first, cursor);
+    LLVMBuildCondBr(b, invalid, empty, head);
+    /* Node: source, byte length, next, sentinel RC, string header, text. */
+    LLVMTypeRef nf[] = { c->i8p, c->i64, c->i8p, c->i64, c->i64 };
+    LLVMTypeRef node = LLVMStructTypeInContext(g->ctx, nf, 5, 0);
+    LLVMPositionBuilderAtEnd(b, head);
+    LLVMValueRef p = LLVMBuildLoad2(b, c->i8p, cursor, "p");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, p, "end"), alloc, body);
+    LLVMPositionBuilderAtEnd(b, body);
+    LLVMValueRef sp = LLVMBuildStructGEP2(b, node, p, 0, "source.p");
+    LLVMValueRef lp = LLVMBuildStructGEP2(b, node, p, 1, "len.p");
+    LLVMValueRef same = LLVMBuildAnd(b,
+        LLVMBuildICmp(b, LLVMIntEQ, LLVMBuildLoad2(b, c->i8p, sp, "source"), source, "same.source"),
+        LLVMBuildICmp(b, LLVMIntEQ, LLVMBuildLoad2(b, c->i64, lp, "len"), len, "same.len"), "same");
+    LLVMBuildCondBr(b, same, hit, next);
+    LLVMValueRef skip = LLVMSizeOf(node);
+    LLVMPositionBuilderAtEnd(b, hit);
+    LLVMValueRef unlock_hit = LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
+    LLVMSetOrdering(unlock_hit, LLVMAtomicOrderingRelease);
+    LLVMBuildRet(b, LLVMBuildGEP2(b, c->i8, p, &skip, 1, "text"));
+    LLVMPositionBuilderAtEnd(b, next);
+    LLVMValueRef np = LLVMBuildStructGEP2(b, node, p, 2, "next.p");
+    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, np, "next"), cursor);
+    LLVMBuildBr(b, head);
+    LLVMPositionBuilderAtEnd(b, alloc);
+    LLVMTypeRef ma[] = { c->i64 }, mty;
+    LLVMValueRef malloc_fn = embed_libc(g, "malloc", c->i8p, ma, 1, &mty);
+    LLVMValueRef size = LLVMBuildAdd(b, len,
+        LLVMBuildAdd(b, skip, LLVMConstInt(c->i64, 1, 0), "overhead"), "size");
+    LLVMValueRef raw = LLVMBuildCall2(b, mty, malloc_fn, &size, 1, "raw");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, raw, "oom"), empty, init);
+    LLVMPositionBuilderAtEnd(b, init);
+    LLVMBuildStore(b, source, LLVMBuildStructGEP2(b, node, raw, 0, "source.p"));
+    LLVMBuildStore(b, len, LLVMBuildStructGEP2(b, node, raw, 1, "len.p"));
+    LLVMBuildStore(b, first, LLVMBuildStructGEP2(b, node, raw, 2, "next.p"));
+    /* 串前缀两字（docs/OBJECT_LAYOUT.md）：W0 = len<<32 | 填充，W1 = ZANS|immortal rc；
+     * 长度在下面算出 textlen 后回填 */
+    /* Text preserves the C-string NUL contract; bytes retain full length. */
+    LLVMTypeRef ca[] = { c->i8p, c->i32, c->i64 }, cty;
+    LLVMValueRef memchr_fn = embed_libc(g, "memchr", c->i8p, ca, 3, &cty);
+    LLVMValueRef cv[] = { source, LLVMConstInt(c->i32, 0, 0), len };
+    LLVMValueRef nul = LLVMBuildCall2(b, cty, memchr_fn, cv, 3, "nul");
+    LLVMValueRef textlen = LLVMBuildSelect(b, LLVMBuildIsNull(b, nul, "no.nul"), len,
+        LLVMBuildSub(b, LLVMBuildPtrToInt(b, nul, c->i64, "nul.i"),
+            LLVMBuildPtrToInt(b, source, c->i64, "source.i"), "prefix"), "textlen");
+    LLVMBuildStore(
+        b,
+        LLVMBuildOr(b,
+                    LLVMBuildShl(b,
+                                 LLVMBuildAnd(b, textlen, LLVMConstInt(c->i64, ZAN_STR_LEN_MASK, 0),
+                                              "len32"),
+                                 LLVMConstInt(c->i64, 32, 0), "len.hi"),
+                    LLVMConstInt(c->i64, 0xffffffffu, 0), "w0"),
+        LLVMBuildStructGEP2(b, node, raw, 3, "rc.p"));
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STR_LIT_W1, 0),
+                   LLVMBuildStructGEP2(b, node, raw, 4, "word.p"));
+    LLVMValueRef text = LLVMBuildGEP2(b, c->i8, raw, &skip, 1, "text");
+    LLVMTypeRef cp[] = { c->i8p, c->i8p, c->i64 }, cpty;
+    LLVMValueRef memcpy_fn = embed_libc(g, "memcpy", c->i8p, cp, 3, &cpty);
+    LLVMValueRef cpv[] = { text, source, len };
+    LLVMBuildCall2(b, cpty, memcpy_fn, cpv, 3, "");
+    LLVMBuildStore(b, LLVMConstInt(c->i8, 0, 0), LLVMBuildGEP2(b, c->i8, text, &len, 1, "end"));
+    LLVMBuildStore(b, raw, cache);
+    LLVMValueRef unlock_new = LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
+    LLVMSetOrdering(unlock_new, LLVMAtomicOrderingRelease);
+    LLVMBuildRet(b, text);
+    LLVMPositionBuilderAtEnd(b, empty);
+    LLVMValueRef unlock_empty = LLVMBuildStore(b, LLVMConstInt(c->i32, 0, 0), gate);
+    LLVMSetOrdering(unlock_empty, LLVMAtomicOrderingRelease);
+    LLVMBuildRet(b, c->empty);
+    LLVMDisposeBuilder(b);
+    return fn;
 }
 
 static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
@@ -1153,8 +1143,8 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs,
   c.seed = seed;
   LLVMTypeRef empty_fields[] = {i64, i64, LLVMArrayType(c.i8, 1)};
   LLVMTypeRef empty_ty = LLVMStructTypeInContext(g->ctx, empty_fields, 3, 0);
-  LLVMValueRef empty_vals[] = {LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-                               LLVMConstInt(i64, ZAN_STR_HDR_WORD(0), 0),
+  LLVMValueRef empty_vals[] = {LLVMConstInt(i64, ZAN_STR_LIT_W0(0), 0),
+                               LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
                                LLVMConstStringInContext(g->ctx, "", 0, 0)};
   LLVMValueRef empty_gv = LLVMAddGlobal(g->mod, empty_ty, "zan.embed.empty");
   LLVMSetInitializer(empty_gv, LLVMConstNamedStruct(empty_ty, empty_vals, 3));

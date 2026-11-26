@@ -3,7 +3,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *module_name, const char *target_triple,
                             bool target_is_windows,
                             bool external_async_executor, bool check_leaks,
-                            bool runtime_checks, bool arc_guard, bool arc_net) {
+                            bool runtime_checks, bool arc_guard, bool arc_net,
+                            bool str_pages) {
   memset(g, 0, sizeof(*g));
   class_index_reset();
   s_current_irgen = g;
@@ -14,6 +15,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
   g->arc_guard = arc_guard;
   g->arc_net = arc_net;
   g->check_leaks = check_leaks;
+  g->str_pages = str_pages;
   if (target_triple && target_triple[0])
     snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
   g->target_is_windows = target_is_windows;
@@ -1001,6 +1003,26 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 }
 
 void zan_irgen_release_llvm(zan_irgen_t *g) {
+  if (!g)
+    return;
+  if (s_current_irgen == g)
+    s_current_irgen = NULL;
+  if (g_di_emit_ctx == g)
+    g_di_emit_ctx = NULL;
+  zan_irgen_origin_free(g);
+  zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
+  g->function_compactor = NULL;
+  if (g->builder) {
+    LLVMDisposeBuilder(g->builder);
+    g->builder = NULL;
+  }
+  if (g->mod) {
+    LLVMDisposeModule(g->mod);
+    g->mod = NULL;
+  }
+  free(g->functions);
+  g->functions = NULL;
+  g->function_count = g->function_cap = 0;
   free(g->fn_index);
   g->fn_index = NULL;
   g->fn_index_cap = 0;
@@ -1049,6 +1071,18 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
   g->class_release = NULL;
   g->class_release_count = g->class_release_cap = 0;
   class_index_reset();
+  /* The context owns every type, constant and metadata node (~36 MB for
+   * the self-hosted compiler); it outlived the module until process exit. */
+  if (g->tbaa_td) {
+    LLVMDisposeTargetData(g->tbaa_td);
+    g->tbaa_td = NULL;
+  }
+  if (g->ctx) {
+    LLVMContextDispose(g->ctx);
+    g->ctx = NULL;
+  }
+  g->eh_state_owner = g->eh_state_cached = NULL;
+  memset(g->eh_state_fields, 0, sizeof(g->eh_state_fields));
 }
 
 void zan_irgen_destroy(zan_irgen_t *g) {
@@ -1056,6 +1090,7 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     s_current_irgen = NULL;
   if (g_di_emit_ctx == g)
     g_di_emit_ctx = NULL;
+  zan_irgen_origin_free(g);
   free(g->catch_cleanups);
   g->catch_cleanups = NULL;
   g->catch_cleanup_count = g->catch_cleanup_cap = 0;
@@ -1099,10 +1134,18 @@ void zan_irgen_destroy(zan_irgen_t *g) {
   g->string_literal_index_cap = 0;
   zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
   g->function_compactor = NULL;
-  if (g->builder)
+  if (g->builder) {
     LLVMDisposeBuilder(g->builder);
-  if (g->mod)
+    g->builder = NULL;
+  }
+  if (g->mod) {
     LLVMDisposeModule(g->mod);
+    g->mod = NULL;
+  }
+  if (g->tbaa_td) {
+    LLVMDisposeTargetData(g->tbaa_td);
+    g->tbaa_td = NULL;
+  }
   if (g->ctx)
     g->ctx = NULL;
   free(g->functions);
@@ -1129,6 +1172,9 @@ void zan_irgen_destroy(zan_irgen_t *g) {
   g->site_coll = NULL;
   free(g->site_coll_elem);
   g->site_coll_elem = NULL;
+  free(g->site_clo);
+  g->site_clo = NULL;
+  g->site_clo_cap = 0;
   free(g->site_inst);
   g->site_inst = NULL;
   free(g->site_loc_file);

@@ -4,9 +4,14 @@ LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload,
                                        zan_loc_t loc) {
     return emit_string_len_ex(g, payload, 1, loc);
 }
-LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc) {
+LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t caller_loc) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_str_ocmp");
     if (fn) return fn;
+    /* One helper serves every comparison: it must not carry the location of
+     * whichever site happened to create it (that made its body, and every
+     * partitioned unit it is copied into, change with an unrelated edit). */
+    (void)caller_loc;
+    zan_loc_t loc = zan_loc(0, 0, 0, 0);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -163,7 +168,6 @@ LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
     LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
     LLVMTypeRef fnty = LLVMFunctionType(i1t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
     fn = LLVMAddFunction(g->mod, "__zan_str_eq", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -237,49 +241,48 @@ LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc) {
     LLVMPositionBuilderAtEnd(g->builder, ret0);
     LLVMBuildRet(g->builder, LLVMConstInt(i1t, 0, 0));
 
-    /* 热路径：双 ZANS 缓存头（先判 ha == hb，相等时只需单侧校验 + 空串免 memcmp） */
+    /* 热路径：双 ZANS 缓存头（[-4] 为 ZANS 标签，[-12] 为 u32 长度，不碰 [-8] 可变 rc） */
     LLVMPositionBuilderAtEnd(g->builder, fastbb);
-    LLVMValueRef off8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
-    LLVMValueRef ha = LLVMBuildLoad2(g->builder, i64,
+    LLVMTypeRef i32p = LLVMPointerType(i32t, 0);
+    LLVMValueRef off4 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_OFF, 1);
+    LLVMValueRef ta = LLVMBuildLoad2(g->builder, i32t,
         LLVMBuildBitCast(g->builder,
-            LLVMBuildGEP2(g->builder, i8, a, &off8, 1, "ha.p"), i64p, "ha.ip"),
-        "ha");
-    LLVMValueRef hb = LLVMBuildLoad2(g->builder, i64,
+            LLVMBuildGEP2(g->builder, i8, a, &off4, 1, "ta.p"), i32p, "ta.ip"),
+        "ta");
+    LLVMValueRef tb = LLVMBuildLoad2(g->builder, i32t,
         LLVMBuildBitCast(g->builder,
-            LLVMBuildGEP2(g->builder, i8, b2, &off8, 1, "hb.p"), i64p, "hb.ip"),
-        "hb");
-    LLVMValueRef unk = LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0);
-    LLVMValueRef la = LLVMBuildAnd(g->builder, ha,
-        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "la");
-    LLVMValueRef va = zan_and(g->builder, zan_hdr_is_string(g, ha, "sa"),
-        zan_icmp(g->builder, LLVMIntNE, la, unk, "ma"), "va");
-    LLVMBasicBlockRef neqhdrbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "neqhdr");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, ha, hb, "heq"),
-        eqlenbb, neqhdrbb);
+            LLVMBuildGEP2(g->builder, i8, b2, &off4, 1, "tb.p"), i32p, "tb.ip"),
+        "tb");
+    LLVMValueRef la32 = LLVMBuildLoad2(g->builder, i32t,
+        zan_str_len_ptr(g, g->builder, a, "la.p"), "la32");
+    LLVMValueRef lb32 = LLVMBuildLoad2(g->builder, i32t,
+        zan_str_len_ptr(g, g->builder, b2, "lb.p"), "lb32");
+    LLVMValueRef zans = LLVMConstInt(i32t, ZAN_STRING_TAG, 0);
+    LLVMValueRef unk32 = LLVMConstInt(i32t, ZAN_STR_LEN_UNKNOWN, 0);
+    LLVMValueRef va = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, ta, zans, "sa"),
+        zan_icmp(g->builder, LLVMIntNE, la32, unk32, "ma"), "va");
+    LLVMValueRef vb = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, tb, zans, "sb"),
+        zan_icmp(g->builder, LLVMIntNE, lb32, unk32, "mb"), "vb");
+    zan_set_branch_weights(g,
+        LLVMBuildCondBr(g->builder, zan_and(g->builder, va, vb, "vab"),
+            eqlenbb, slowbb), 2000, 1);
 
-    /* ha == hb：只需确认 ha 为合法已知长度 ZANS；len == 0 直接返回 true */
+    /* 两侧均为合法已知长度 ZANS：先比长度，长度相等且非空再 memcmp */
     LLVMPositionBuilderAtEnd(g->builder, eqlenbb);
     LLVMBasicBlockRef lenchkbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "lenchk");
-    zan_set_branch_weights(g,
-        LLVMBuildCondBr(g->builder, va, lenchkbb, slowbb), 2000, 1);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, la32, lb32, "leq"),
+        lenchkbb, ret0);
 
     LLVMPositionBuilderAtEnd(g->builder, lenchkbb);
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, la, LLVMConstInt(i64, 0, 0), "isz"),
+        zan_icmp(g->builder, LLVMIntEQ, la32, LLVMConstInt(i32t, 0, 0), "isz"),
         ret1, cmpbb);
 
-    /* ha != hb：若两侧均为合法已知长度 ZANS，则长度必不等，直接返回 false */
-    LLVMPositionBuilderAtEnd(g->builder, neqhdrbb);
-    LLVMValueRef lb = LLVMBuildAnd(g->builder, hb,
-        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "lb");
-    LLVMValueRef vb = zan_and(g->builder, zan_hdr_is_string(g, hb, "sb"),
-        zan_icmp(g->builder, LLVMIntNE, lb, unk, "mb"), "vb");
-    zan_set_branch_weights(g,
-        LLVMBuildCondBr(g->builder, zan_and(g->builder, va, vb, "vab"),
-            ret0, slowbb), 2000, 1);
-
     LLVMPositionBuilderAtEnd(g->builder, cmpbb);
+    LLVMValueRef la = LLVMBuildZExt(g->builder, la32, i64, "la");
     LLVMValueRef mr = zan_call2(g->builder, memcmp_ty, memcmp_fn,
         (LLVMValueRef[]){ a, b2, la }, 3, "eq.memcmp");
     LLVMBuildRet(g->builder,
@@ -361,6 +364,25 @@ LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st)
         base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");
     }
     return base;
+}
+/* A class-typed local used as a field receiver (read, store, compound store,
+ * ++/--): null check plus the soft-failure scratch, so a store through a null
+ * local fails softly like a read instead of writing near address 0. */
+LLVMValueRef struct_recv_ptr_guarded(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st,
+                                     zan_ast_node_t *obj_expr) {
+    LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+    if (!local->type || local->type->kind != TYPE_CLASS ||
+        LLVMGetTypeKind(LLVMTypeOf(struct_ptr)) != LLVMPointerTypeKind)
+        return struct_ptr;
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, struct_ptr,
+                                   LLVMConstNull(LLVMTypeOf(struct_ptr)), "recv.null");
+    char recv_msg[256];
+    if (obj_expr->kind == AST_IDENTIFIER)
+        snprintf(recv_msg, sizeof(recv_msg), "null reference: receiver '%.*s' is null",
+                 (int)obj_expr->ident.name.len, obj_expr->ident.name.str);
+    else snprintf(recv_msg, sizeof(recv_msg), "null reference: receiver is null");
+    emit_runtime_check(g, isnull, obj_expr->loc, recv_msg);
+    return emit_soft_base_select(g, struct_ptr, isnull, obj_expr->loc);
 }
 void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
     LLVMTypeRef ta = LLVMTypeOf(*a), tb = LLVMTypeOf(*b);
@@ -509,18 +531,12 @@ LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v) {
 }
 LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_size) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    /* 负载按 16 取整、下限 16：头 16 + 负载恰是 malloc 的 16 字节档，不留
-     * 尾巴。原先按 32 取整且下限 32——"k1" 这样的短串也占 48 字节，
-     * 40 字节的请求被抬到 64。没有任何路径依赖这段富余（无原地增长、无
-     * 按块越读），写入一律以请求尺寸为界。 */
-    LLVMValueRef fifteen = LLVMConstInt(i64, 15, 0);
-    LLVMValueRef padded = zan_add(g->builder, payload_size, fifteen, "str.pad");
-    LLVMValueRef aligned = zan_and(g->builder, padded,
-        LLVMConstInt(i64, ~UINT64_C(15), 0), "str.align");
-    LLVMValueRef min_payload = LLVMConstInt(i64, 16, 0);
-    LLVMValueRef payload = LLVMBuildSelect(g->builder,
-        zan_icmp(g->builder, LLVMIntULT, aligned, min_payload, "str.small"),
-        min_payload, aligned, "str.payload");
+    /* 负载按请求原样交给 zan_rt_str_alloc：串头 12 字节 + 负载由分配器按
+     * 8 字节粒度取整（--fast-alloc 串页）或交 malloc 取整。曾在这里先按
+     * 16 取整、下限 16——"item1234567" 头 16 + 负载 16 = 32 字节；现 24。
+     * 没有任何路径依赖这段富余（无原地增长、无按块越写），写入一律以
+     * 请求尺寸为界。 */
+    LLVMValueRef payload = payload_size;
     LLVMValueRef user_ptr = zan_call2(g->builder,
         LLVMFunctionType(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
                          (LLVMTypeRef[]){ i64 }, 1, 0),
@@ -805,10 +821,10 @@ LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
         ? stack_blob
         : (unsigned char *)malloc(total);
     if (!blob) return LLVMConstNull(LLVMPointerType(i8, 0));
-    uint64_t rc_word = ZAN_STRING_SENTINEL_RC;
-    uint64_t hdr_word = ZAN_STR_HDR_WORD(text.len);
-    memcpy(blob + 0, &rc_word, 8);
-    memcpy(blob + 8, &hdr_word, 8);
+    uint64_t w0 = ZAN_STR_LIT_W0(text.len);
+    uint64_t w1 = ZAN_STR_LIT_W1;
+    memcpy(blob + 0, &w0, 8);
+    memcpy(blob + 8, &w1, 8);
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
     bool obf = g->obfuscate_strings && text.len > 0;
@@ -1088,7 +1104,7 @@ LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     return emit_to_cstr_u(g, val, false);
 }
 /* 128 槽不朽单字符 ASCII 表（32B 步长、16B 对齐，总计 4 KB 只读常量）：
- * 每槽布局 [0..7]=ZAN_STRING_SENTINEL_RC, [8..15]=ZAN_STR_HDR_WORD(c?1:0),
+ * 每槽布局 [0..7]=ZAN_STR_LIT_W0(c?1:0), [8..15]=ZAN_STR_LIT_W1,
  * [16]=c, [17]=0。用于 char.ToString()、单 ASCII Substring 与 0..9 itoa 零堆分配。 */
 static LLVMValueRef get_ascii128_table(zan_irgen_t *g) {
     LLVMValueRef tbl = LLVMGetNamedGlobal(g->mod, "__zan.ascii128");
@@ -1102,13 +1118,13 @@ static LLVMValueRef get_ascii128_table(zan_irgen_t *g) {
     LLVMSetGlobalConstant(tbl, 1);
     LLVMSetAlignment(tbl, 16);
     LLVMValueRef slots[128];
-    uint64_t rc_word = ZAN_STRING_SENTINEL_RC;
+    uint64_t w1 = ZAN_STR_LIT_W1;
     for (unsigned c = 0; c < 128; c++) {
         unsigned char raw[32];
         memset(raw, 0, sizeof(raw));
-        uint64_t hdr_word = ZAN_STR_HDR_WORD(c == 0 ? 0 : 1);
-        memcpy(raw + 0, &rc_word, 8);
-        memcpy(raw + 8, &hdr_word, 8);
+        uint64_t w0 = ZAN_STR_LIT_W0(c == 0 ? 0 : 1);
+        memcpy(raw + 0, &w0, 8);
+        memcpy(raw + 8, &w1, 8);
         raw[16] = (unsigned char)c;
         slots[c] = LLVMConstStringInContext(g->ctx, (const char *)raw, 32, 1);
     }

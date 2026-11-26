@@ -3,6 +3,55 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
+    // checked context (B-ID76): + - * whose result leaves the operation
+    // width throw OverflowException (the host's emit_runtime_check with
+    // "integer overflow in checked operation"). `t` is the raw i64 result.
+    // Narrow widths compute exactly in i64, so overflow is "the wrap to the
+    // width changes the value"; 64-bit uses the with.overflow intrinsics.
+    // Null when the node is not a checked + - *.
+    ExprVal CheckedArith(Node e, int op, string av, string bv, string t, int aw, bool awu, bool uns) {
+        if (e.ival != 1 || !(op == TK.Plus() || op == TK.Minus() || op == TK.Star())) { return null; }
+        if (aw < 64) {
+            string w = WrapArith(t, aw, awu);
+            string ov = NT();
+            L("  " + ov + " = icmp ne i64 " + w + ", " + t);
+            EmitRuntimeCheckIf(e, ov, "integer overflow in checked operation");
+            return ArithResult(w, aw, uns);
+        }
+        string kind = (awu ? "u" : "s") + (op == TK.Plus() ? "add" : op == TK.Minus() ? "sub" : "mul");
+        string fn = "llvm." + kind + ".with.overflow.i64";
+        if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare {i64, i1} @" + fn + "(i64, i64)"); }
+        string pr = NT();
+        L("  " + pr + " = call {i64, i1} @" + fn + "(i64 " + av + ", i64 " + bv + ")");
+        string ov2 = NT();
+        L("  " + ov2 + " = extractvalue {i64, i1} " + pr + ", 1");
+        EmitRuntimeCheckIf(e, ov2, "integer overflow in checked operation");
+        return ArithResult(t, aw, uns);
+    }
+
+    // `a <kind> b` (add/sub) in a checked context: the i64 result, wrapped
+    // to width `w` (0 or 64 = the full slot), with the overflow check
+    // emitted (narrow: the wrap changed the value; 64: with.overflow).
+    string CheckedIntOp(Node e, string kind, string a, string b, int w) {
+        string t = NT();
+        L("  " + t + " = " + kind + " i64 " + a + ", " + b);
+        if (w > 0 && w < 64) {
+            string wr = WrapArith(t, w, false);
+            string ov = NT();
+            L("  " + ov + " = icmp ne i64 " + wr + ", " + t);
+            EmitRuntimeCheckIf(e, ov, "integer overflow in checked operation");
+            return wr;
+        }
+        string fn = "llvm.s" + kind + ".with.overflow.i64";
+        if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare {i64, i1} @" + fn + "(i64, i64)"); }
+        string pr = NT();
+        L("  " + pr + " = call {i64, i1} @" + fn + "(i64 " + a + ", i64 " + b + ")");
+        string ov2 = NT();
+        L("  " + ov2 + " = extractvalue {i64, i1} " + pr + ", 1");
+        EmitRuntimeCheckIf(e, ov2, "integer overflow in checked operation");
+        return t;
+    }
+
     ExprVal GenBinary(Node e) {
         int op = e.op;
         // constant folding: collapse pure integer-constant subtrees to a literal
@@ -528,6 +577,8 @@ partial class Irgen {
                 L("  " + z64 + " = zext i32 " + s32 + " to i64");
                 return ArithResult(z64, aw, uns);
             }
+            ExprVal ck = CheckedArith(e, op, a.op, bs, t, aw, awu, uns);
+            if (ck != null) { return ck; }
             if (aw < 64) { t = WrapArith(t, aw, awu); }
             return ArithResult(t, aw, uns);
         }

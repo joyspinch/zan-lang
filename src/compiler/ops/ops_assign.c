@@ -9,6 +9,15 @@ LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
                 return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
             }
             check_readonly_store(g, expr->binary.left, locals);
+            /* S12：`发布者.事件 += lambda` 且发布者以 this 为根——lambda 弱捕获
+             * this，订阅随订阅者释放自动失效。须在左值提升（ca_hoist_spine 把
+             * 左值换成临时量）之前判定。 */
+            if (expr->binary.compound_base == TK_PLUS && g->current_this &&
+                expr->binary.right && expr->binary.right->kind == AST_BINARY &&
+                expr->binary.right->binary.right &&
+                expr->binary.right->binary.right->kind == AST_LAMBDA &&
+                zan_subscription_rooted_at_this(g, expr->binary.left, locals))
+                g->weak_this_lambda = expr->binary.right->binary.right;
             /* 复合赋值左值子树单次求值防护 */
             if (expr->binary.compound_base != TK_EOF)
                 ca_hoist_spine(g, &expr->binary.left, locals, 1);
@@ -394,6 +403,10 @@ binding_lowered:
                         LLVMValueRef idx_1d = NULL;
                         LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                         int is_arr_1d = 0;
+                        if (local->type && local->type->kind == TYPE_ARRAY)
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                         if (local->type && local->type->kind == TYPE_ARRAY &&
                             local->type->array_rank > 1) {
                             /* 多维矩形数组槽位：多维越界检查与行优先平铺寻址 */
@@ -414,7 +427,7 @@ binding_lowered:
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
                             elem_ptr = is_arr_1d
-                                ? LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr, &idx_1d, 1, "eidx")
+                                ? emit_checked_elem_gep(g, elem_llvm, typed_arr, idx_1d, "eidx")
                                 : LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx_1d, 1, "eidx");
                         }
                         zan_type_t *et = local->type ? local->type->element_type : NULL;
@@ -478,6 +491,9 @@ binding_lowered:
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                             LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
                             ar_oob = emit_index_bounds_check(g, idx, arr_len,
                                 expr->loc, "array");
@@ -664,6 +680,10 @@ binding_lowered:
                             elem_llvm = map_type(g, at->element_type);
                         }
                         LLVMValueRef elem_ptr = NULL;
+                        if (at->kind == TYPE_ARRAY)
+                            arr_ptr = emit_array_null_guard(
+                                g, arr_ptr, expr->loc,
+                                "null reference where an array is required (element store)");
                         if (at->kind == TYPE_ARRAY && at->array_rank > 1) {
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                                 expr->binary.left, elem_llvm, locals, &ar_oob);
@@ -678,7 +698,7 @@ binding_lowered:
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
                             elem_ptr = (at->kind == TYPE_ARRAY && at->array_rank == 1)
-                                ? LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx")
+                                ? emit_checked_elem_gep(g, elem_llvm, typed_arr, idx, "eidx")
                                 : LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
                         }
                         zan_type_t *et = at->element_type;
@@ -771,6 +791,9 @@ binding_lowered:
                     LLVMValueRef elem_ptr = NULL;
                     LLVMValueRef idx_1d = NULL;
                     LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                    arr_ptr = emit_array_null_guard(
+                        g, arr_ptr, expr->loc,
+                        "null reference where an array is required (element store)");
                     if (at->array_rank > 1) {
                         elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
                             expr->binary.left, elem_llvm, locals, &ar_oob);
@@ -785,8 +808,8 @@ binding_lowered:
                     if (!elem_ptr) {
                         LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                             LLVMPointerType(elem_llvm, 0), "arrp");
-                        elem_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm,
-                            typed_arr, &idx_1d, 1, "eidx");
+                        elem_ptr = emit_checked_elem_gep(g, elem_llvm,
+                            typed_arr, idx_1d, "eidx");
                     }
                     LLVMValueRef stored = right;
                     LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
@@ -892,7 +915,8 @@ binding_lowered:
                                 expr->binary.right, locals);
                             stored = true;
                         } else if (st) {
-                            LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+                            LLVMValueRef struct_ptr =
+                                struct_recv_ptr_guarded(g, local, st, obj_expr);
                             LLVMValueRef fptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             zan_type_t *aft = afsym ? field_store_type(g, afsym, local->type) : NULL;
@@ -1012,6 +1036,16 @@ binding_lowered:
                             "'%.*s' has no member '%.*s'",
                             (int)acls->name.len, acls->name.str,
                             (int)an.len, an.str);
+                    } else if (!stored && obj_expr->kind == AST_THIS_EXPR) {
+                        /* `this.S = v` 而 S 是静态字段：读路径同口径报 E3009
+                         * （实例引用不能访问静态成员）。以前这里什么都不存，
+                         * 赋值静默丢失。 */
+                        zan_symbol_t *sf = get_field_sym(acls, an);
+                        if (sf && field_member_is_static(sf))
+                            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
+                                "'%.*s' has no member '%.*s'",
+                                (int)acls->name.len, acls->name.str,
+                                (int)an.len, an.str);
                     }
                 }
                 /* 命名空间/静态类型字段赋值错误防护 */

@@ -540,6 +540,11 @@ if (binder.symbol_reference) {
 }
 zan_compile_trace("check");
 zan_checker_check(&checker, ast);
+/* S20：窗体标记（同名 .html）的处理器名与绑定路径对照类型检查——只在类型
+ * 检查通过时跑（符号表完整才不误报）。 */
+if (!zan_diag_has_errors(diag))
+  zan_markup_check(ast, &binder, diag, explicit_input_count,
+                   (const char *const *)embed_specs, embed_spec_count);
 
 if (do_dump_ast) {
 }
@@ -557,6 +562,52 @@ if (zan_diag_has_errors(diag)) {
 
 phase("check");
 probe_phase_mem("check");
+
+/* S3：本程序实际编进来的源文件清单（拉入过滤之后），每行一个绝对路径。
+ * 测试驱动写到 <用例产物>.deps，scripts/affected.py 据此把改动文件映射到
+ * 受影响用例。<...> 形式的合成源不是文件，跳过。 */
+if (emit_deps_path) {
+  FILE *df = fopen(emit_deps_path, "wb");
+  if (!df) {
+    fprintf(stderr, "error: cannot write dependency list '%s'\n",
+            emit_deps_path);
+  } else {
+    for (int i = 0; i < diag->file_count; i++) {
+      const char *fn = diag->file_names ? diag->file_names[i] : NULL;
+      if (!fn || !fn[0] || fn[0] == '<')
+        continue;
+      char real[4096];
+      fprintf(df, "%s\n", pi_realpath(fn, real, sizeof(real)) ? real : fn);
+    }
+    fclose(df);
+  }
+}
+
+/* S4：显式输入文件的公开接口摘要。放在类型检查之后：效果列（S2 的
+ * throws/能力）要用 checker 解析好的调用目标。有错误时上面已返回 1——
+ * 半截程序的摘要会误导，宁可不出。不生成代码。 */
+if (do_summary) {
+  zan_effects_t *fx = zan_effects_build(ast, &binder);
+  zan_summary_emit(ast, diag, explicit_input_count, fx, stdout);
+  zan_effects_free(fx);
+  fflush(stdout);
+  free(semantic_refs.refs.items);
+  zan_diag_free_buffers(diag);
+  zan_arena_free(arena);
+  free(source);
+  return 0;
+}
+
+/* S2：符号查询——类型检查通过、调用已解析之后输出并退出，不生成代码 */
+if (query_name) {
+  int qrc = zan_query_emit(ast, &binder, diag, query_name, stdout);
+  fflush(stdout);
+  free(semantic_refs.refs.items);
+  zan_diag_free_buffers(diag);
+  zan_arena_free(arena);
+  free(source);
+  return qrc;
+}
 
 if (opts.semantic_refs_file) {
   int rc = 1;
@@ -656,9 +707,31 @@ if (!ir_arena) {
   free(source);
   return 1;
 }
+/* rt_mem.o 是否会链入（linker_setup.c 同判据）：决定串分配走不走它的
+ * 12 字节头串页（zan_mem_str_malloc），也决定 Apple 的分配调用改指 */
+bool have_rt_mem = false, apple_route_fast_alloc = false;
+#ifdef ZAN_RT_MEM_OBJ
+if (fast_alloc_opt >= 0 && !emit_lib) {
+  char fa_obj[1200];
+  if (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS) {
+    apple_route_fast_alloc =
+        zan_apple_rt_mem_path(&target, cross_compiling, fa_obj, sizeof(fa_obj));
+    /* 交叉 Apple 链的是 toolchain/ 里预编的 rt_mem.o，可能还没有
+     * zan_mem_str_malloc：串页只给本机构建 */
+    have_rt_mem = apple_route_fast_alloc && !cross_compiling;
+  } else if (!cross_compiling) {
+    char fa_dir[1024];
+    zan_exe_dir(fa_dir, sizeof(fa_dir));
+    snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
+             zan_path_basename(ZAN_RT_MEM_OBJ));
+    have_rt_mem = zan_file_exists(fa_obj);
+  }
+}
+#endif
 if (zan_irgen_init(&irgen, ir_arena, diag, &binder, input_file, irgen_triple,
                    target.os == ZAN_OS_WINDOWS, external_async_executor,
-                   check_leaks, runtime_checks, arc_guard, arc_net) != ZAN_OK) {
+                   check_leaks, runtime_checks, arc_guard, arc_net,
+                   have_rt_mem) != ZAN_OK) {
   fprintf(stderr, "error: failed to initialize code generator\n");
   zan_diag_free_buffers(diag);
   zan_arena_free(ir_arena);
@@ -674,18 +747,50 @@ irgen.publish_mode = publish_mode;
  * zan_mem_*；只有分配器对象确实在场才改，链接段（linker_setup.c）同判。
  * --emit-lib 不改：静态库只装用户对象、由外部宿主链接，拿不到 rt_mem.o。 */
 #ifdef ZAN_RT_MEM_OBJ
-if (fast_alloc_opt >= 0 && !cross_compiling && !emit_lib &&
-    (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-  char fa_dir[1024], fa_obj[1200];
-  zan_exe_dir(fa_dir, sizeof(fa_dir));
-  snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
-           zan_path_basename(ZAN_RT_MEM_OBJ));
-    irgen.route_fast_alloc = zan_file_exists(fa_obj);
-  }
+irgen.route_fast_alloc = apple_route_fast_alloc;
 #endif
+/* 设计稿处理器只经 Invoke 按名调用、静态上不可见：closed-world 发射（publish
+ * 与普通构建同口径，见 emit_target.c）须按名保留反射桩，否则 HasMethod 对账
+ * 通过、点击却静默不执行。普通构建另扫显式输入所在目录本层——运行期
+ * HtmlDocs.Find 也认工作目录/源文件旁的裸名标记。 */
+if (zan_inputs_use_design_doc(input_files, input_count)) {
+  char handler_root[1024];
+  zan_design_root_for(input_files[0], handler_root, sizeof(handler_root));
+  char input_dirs[8][1024];
+  const char *dir_list[8];
+  int dir_count = 0;
+  for (int fi = 0; !publish_mode && fi < explicit_input_count && dir_count < 8;
+       fi++) {
+    if (zan_is_zcomp_path(input_files[fi]))
+      continue;
+    const char *base = zan_path_basename(input_files[fi]);
+    size_t dl = (size_t)(base - input_files[fi]);
+    if (dl >= sizeof(input_dirs[0]))
+      continue;
+    if (dl == 0)
+      snprintf(input_dirs[dir_count], sizeof(input_dirs[0]), ".");
+    else
+      snprintf(input_dirs[dir_count], sizeof(input_dirs[0]), "%.*s",
+               (int)(dl - 1), input_files[fi]);
+    bool dup = false;
+    for (int k = 0; k < dir_count; k++)
+      if (strcmp(input_dirs[k], input_dirs[dir_count]) == 0)
+        dup = true;
+    if (!dup) {
+      dir_list[dir_count] = input_dirs[dir_count];
+      dir_count++;
+    }
+  }
+  irgen.html_handler_count = zan_embed_collect_html_handlers_ex(
+      handler_root, dir_list, dir_count, &irgen.html_handlers);
+  if (publish_mode)
+    fprintf(stderr, "note: retained %d html event handler name(s) from %s/src\n",
+            irgen.html_handler_count, handler_root);
+}
 irgen.codegen_level = opts.codegen_level;
 irgen.shard_opt = opts.shard_opt;
 irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
+irgen.fp_contract = fp_contract;
 irgen.rt_guard_split = !cross_compiling;
 const char *obf_env = getenv("ZAN_OBF");
 const char *no_obf_env = getenv("ZAN_NO_OBF");
@@ -720,8 +825,12 @@ bool native_arch =
     (target.arch == ZAN_ARCH_X86_64 || target.arch == ZAN_ARCH_AARCH64);
 bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                      (no_shard_env && no_shard_env[0] == '1');
+/* Pre-optimization sharding is opt-in (ZAN_SHARD=1): it bounds memory
+ * but loses cross-shard inlining (the self-hosted compiler ran 20-45%
+ * slower). --publish optimizes the whole module like any build; object
+ * emission splits and parallelizes after inlining (codegen_split.h). */
 bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
-                  ((shard_env && shard_env[0] == '1') || publish_mode);
+                  shard_env && shard_env[0] == '1';
 
 irgen.split_codegen_ok = native_arch && !cross_compiling;
 zan_irgen_bind_target(&irgen);

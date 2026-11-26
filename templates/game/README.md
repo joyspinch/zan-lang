@@ -24,6 +24,18 @@ IDE 的"新建项目"按这个标签分组。
 | 3D 漫游交互 Action3D | [fps-3d](fps-3d/) | `Game.Render3D` | 3D 第一人称漫游：GPU 网格批次渲染、视锥裁剪、平滑漫游与 3D 射线拾取 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
 
+## 回放即回归（每个模板都有）
+
+每个游戏模板都带 `src/<名字>Sim.zan`（把游戏逻辑包成只认种子与逐帧输入的无头仿真，
+`[Invariant]` 标出游戏规则，`Bot` 是模糊测试的机器人）和 `replays/bot.replay`（机器人
+录下的一局）。`zan-check` 的 replay 步重放每个回放、逐校验点比对，再让机器人按 3 个
+种子各跑 2000 帧查规则；full 档 `template_game_replay` 钉住全部模板。
+
+改规则（数值、AI、刷怪）是有意的，回放就会分叉——按 `Game.Foundation` README
+「Replays are regression tests」重录 `replays/bot.replay` 并一起提交。逻辑与表现分离
+是前提：仿真里不碰窗口、时钟和存档文件（roguelike 的 `RunFlow`、rts 的 `RtsBattle`、
+snake 的 `SnGame.CreateHeadless` 就是为此从界面里拆出来的）。
+
 ## 仓库外的大型游戏项目
 
 产品级的游戏（几十 MB 素材、上千文件、自带工具链与服务端）**不进模板位**——

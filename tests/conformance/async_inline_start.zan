@@ -1,0 +1,82 @@
+using System;
+using System.Threading;
+
+// await of an async call starts the callee inline on the awaiting thread
+// (C# semantics): a callee that never suspends completes without a scheduler
+// hop or thread switch; one that suspends parks the caller as before. Covers
+// inline nesting past the per-thread depth cap, exceptions and finally through
+// inline frames, real suspension (Delay/Yield) under inline frames, and
+// spawned tasks that mix inline and suspending awaits concurrently.
+class Program {
+    static int fin = 0;
+    static long wsum = 0;
+    static object lk = new object();
+
+    static async int Step(int x) { return x + 1; }
+    static async long Tid() { return Thread.CurrentId(); }
+    static async int Deep(int n) {
+        if (n == 0) return 0;
+        int r = await Deep(n - 1);
+        return r + 1;
+    }
+    static async int DeepDelay(int n) {
+        if (n == 0) { await Task.Delay(1); return 0; }
+        int r = await DeepDelay(n - 1);
+        return r + 1;
+    }
+    static async int Thrower(int x) {
+        if (x > 2) throw new Exception("boom" + x);
+        return x;
+    }
+    static async int Mid(int x) {
+        try { return await Thrower(x) * 10; } finally { fin++; }
+    }
+    static async int Delayed(int x) { await Task.Delay(5); return x * 2; }
+    static async int YieldChild(int x) { await Task.Yield(); return x + 100; }
+    static async string Str(int x) { return "s" + x; }
+    static async int SyncThenDelay(int x) {
+        int a = await Thrower(1);
+        await Task.Delay(2);
+        int b = await Thrower(2);
+        return a + b + x;
+    }
+    static async int Worker(int i) {
+        int acc = 0;
+        for (int j = 0; j < 2000; j++) {
+            acc += await Thrower(j % 3);
+            if (j % 500 == 0) await Task.Delay(1);
+        }
+        lock (lk) { wsum += acc; }
+        return 1;
+    }
+
+    static async long Run() {
+        long s = 0;
+        for (int i = 0; i < 100000; i++) s += await Step(i);
+        Console.WriteLine("chain " + s);
+        long before = Thread.CurrentId();
+        long inner = await Tid();
+        Console.WriteLine("same thread " + (before == inner));
+        Console.WriteLine("deep " + (await Deep(10000)));
+        Console.WriteLine("deep delay " + (await DeepDelay(300)));
+        for (int i = 0; i < 5; i++) {
+            try { Console.WriteLine("mid " + (await Mid(i))); }
+            catch (Exception e) { Console.WriteLine("caught " + e.Message); }
+        }
+        Console.WriteLine("fin " + fin);
+        Console.WriteLine("delayed " + (await Delayed(21)));
+        Console.WriteLine("yield " + (await YieldChild(1)));
+        Console.WriteLine(await Str(7));
+        Console.WriteLine("mixed " + (await SyncThenDelay(1000)));
+        List<long> hs = new List<long>();
+        for (int i = 0; i < 50; i++) hs.Add(Task.Spawn(Program.Worker(i)));
+        int joined = await Task.WhenAll(hs);
+        Console.WriteLine("joined " + joined + " wsum " + wsum);
+        return s;
+    }
+
+    static void Main() {
+        long r = await Run();
+        Console.WriteLine("result " + r);
+    }
+}

@@ -213,10 +213,10 @@ static void zan_live_register(void *obj, size_t size, zan_live_kind_t kind,
                               size_t data_offset, const char *source) {
     if (!obj || !zan_live_wanted() || size < ZAN_OBJ_HDR_SIZE) return;
     /* The compiler initializes the header before publishing the allocation.
-     * Store its type discriminator so snapshots need not read live object data. */
-    uint64_t site = *(const uint64_t *)((const char *)obj + ZAN_OBJ_SITE_OFF);
+     * Store its header word so snapshots need not read live object data. */
+    uint64_t site = *(const uint64_t *)((const char *)obj + ZAN_HDR_WORD_OFF);
     /* Older callers use the object hook for rank-one primitive arrays. The
-     * reserved site value identifies that layout without probing before -16. */
+     * reserved site value identifies that layout without probing before -8. */
     if (kind == ZAN_LIVE_OBJECT && site == ZAN_ARRAY_MAGIC)
         kind = ZAN_LIVE_ARRAY;
     size_t header_size = kind == ZAN_LIVE_OBJECT ? ZAN_OBJ_HDR_SIZE : ZAN_ARR_HDR_SIZE;
@@ -347,24 +347,78 @@ void zan_rt_register_site_dtors(void **dtors, int64_t count) {
     g_site_dtors_count = count;
 }
 
+/* 默认（描述符）模式：站点号 → 描述符表（编译器在 main 入口登记）。
+ * 对象头字 = (tw<<32)|rc，tw = 栈标记 | 对象标记 | 站点号（docs/OBJECT_LAYOUT.md）。 */
+static void **g_desc_tbl_reg = NULL;
+static int64_t g_desc_tbl_count = 0;
+
+void zan_rt_register_desc_table(void **tbl, int64_t count) {
+    g_desc_tbl_reg = tbl;
+    g_desc_tbl_count = count;
+}
+
+static inline int zan_word_is_string(uint64_t word) { return (word >> 32) == ZAN_STRING_TAG; }
+
+/* 对象头字的站点号；不是对象头（串、数组、外来指针）给 0（哨兵站点） */
+static inline uint64_t zan_word_site(uint64_t word) {
+    if (zan_word_is_string(word) || !ZAN_HDR_IS_OBJ(word)) return 0;
+    return ZAN_HDR_SITE(word);
+}
+
+/* 对象头实际占用的前缀字节数：普通 8 字节，PAD16 类 16 字节 */
+static inline size_t zan_obj_hdr_bytes(uint64_t word) {
+    return (ZAN_HDR_IS_OBJ(word) && (((word >> 32) & ZAN_OBJ_TW_PAD16) != 0))
+               ? (ZAN_OBJ_HDR_SIZE + 8)
+               : ZAN_OBJ_HDR_SIZE;
+}
+
+/* 头字 → 描述符：对象按站点号查登记的描述符表；数组头字里的大值是数组
+ * 描述符指针（没有对象标记）；其余（串、魔数、秩、越界站点）为 NULL */
+static const zan_arc_desc_t *zan_word_desc(uint64_t word) {
+    if (zan_word_is_string(word)) return NULL;
+    if (ZAN_HDR_IS_OBJ(word)) {
+        uint64_t site = ZAN_HDR_SITE(word);
+        if (g_desc_tbl_reg && site > 0 && (int64_t)site < g_desc_tbl_count)
+            return (const zan_arc_desc_t *)g_desc_tbl_reg[site];
+        return NULL;
+    }
+    if (word >= 4096 && word != ZAN_ARRAY_MAGIC) return (const zan_arc_desc_t *)(uintptr_t)word;
+    return NULL;
+}
+
+/* 委托值是带 ZAN_CLOSURE_TAG 低位标记的闭包记录指针（对象至少 8 字节对齐，
+ * 低位恒 0）：走边时去掉标记才能在注册表里对上闭包记录本身。 */
+static inline void *zan_edge_untag(void *p) {
+    return (void *)((uintptr_t)p & ~(uintptr_t)ZAN_CLOSURE_TAG);
+}
+
+/* 数组的引用计数在 -32（i64；-16 是长度）；其余对象与字符串在 -8（u32） */
+static inline int64_t zan_live_read_rc(const zan_live_entry_t *e) {
+    if (e->kind == ZAN_LIVE_OBJECT)
+        return (int64_t)(int32_t)__atomic_load_n(ZAN_RC_PTR(e->obj), __ATOMIC_RELAXED);
+    return __atomic_load_n((const int64_t *)((const char *)e->obj + ZAN_ARR_RC_OFF), __ATOMIC_RELAXED);
+}
+
 static const char *zan_get_object_tyname(const zan_live_entry_t *entry) {
-    uint64_t site = entry->site & ~ZAN_OBJ_STACK_FLAG;
+    uint64_t word = entry->site & ~ZAN_OBJ_STACK_FLAG;
     const char *const *names = NULL;
     if (entry->kind != ZAN_LIVE_OBJECT) {
         /* The rectangular layout uses its site word for the rank. */
         if (entry->kind == ZAN_LIVE_REF_ARRAY && entry->data_offset == 0 &&
-            site != ZAN_ARRAY_MAGIC && site >= 4096) {
-            const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)site;
+            word != ZAN_ARRAY_MAGIC && word >= 4096 && !ZAN_HDR_IS_OBJ(word)) {
+            const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)word;
             names = desc->tynames_arr;
         }
         return names && names[0] ? names[0] : "Array";
     }
-    if ((site >> 32) == ZAN_STRING_TAG) return "string";
-    if (g_site_tynames_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
-        names = g_site_tynames_reg[site];
-    } else if (site >= 4096) {
-        const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)site;
+    if (zan_word_is_string(word)) return "string";
+    const zan_arc_desc_t *desc = zan_word_desc(word);
+    if (desc && desc->tynames_arr) {
         names = desc->tynames_arr;
+    } else {
+        uint64_t site = zan_word_site(word);
+        if (g_site_tynames_reg && site > 0 && site < (uint64_t)g_site_reg_count)
+            names = g_site_tynames_reg[site];
     }
     return names && names[0] ? names[0] : "object";
 }
@@ -375,7 +429,7 @@ static void zan_walk_pointer_edges(void *const *data, size_t count,
                                    zan_edge_cb_t cb, void *ctx) {
     if (!data) return;
     for (size_t i = 0; i < count; i++) {
-        if (data[i]) cb(data[i], ctx);
+        if (data[i]) cb(zan_edge_untag(data[i]), ctx);
     }
 }
 
@@ -384,7 +438,7 @@ static void zan_walk_object_edges(const zan_live_entry_t *entry,
     const char *obj = entry->obj;
     if (entry->kind != ZAN_LIVE_OBJECT) {
         if (entry->kind == ZAN_LIVE_REF_ARRAY) {
-            int64_t count = *(const int64_t *)(obj + ZAN_OBJ_RC_OFF);
+            int64_t count = *(const int64_t *)(obj + ZAN_ARR_COUNT_OFF);
             size_t bytes = entry->size - ZAN_ARR_HDR_SIZE - entry->data_offset;
             if (count > 0 && (uint64_t)count <= bytes / sizeof(void *)) {
                 zan_walk_pointer_edges((void *const *)(obj + entry->data_offset),
@@ -394,18 +448,22 @@ static void zan_walk_object_edges(const zan_live_entry_t *entry,
         return;
     }
 
-    uint64_t site = entry->site & ~ZAN_OBJ_STACK_FLAG;
-    if ((site >> 32) == ZAN_STRING_TAG) return;
+    uint64_t word = entry->site & ~ZAN_OBJ_STACK_FLAG;
+    if (zan_word_is_string(word)) return;
     const zan_field_graph_t *fg = NULL;
-    if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
-        fg = g_site_field_graphs_reg[site];
-    } else if (site >= 4096) {
-        const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)site;
+    const zan_arc_desc_t *desc = zan_word_desc(word);
+    if (desc) {
         fg = desc->field_graph;
+    } else {
+        uint64_t site = zan_word_site(word);
+        if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count)
+            fg = (const zan_field_graph_t *)g_site_field_graphs_reg[site];
     }
     if (!fg) return;
 
-    size_t bytes = entry->size - ZAN_OBJ_HDR_SIZE;
+    size_t hdr_bytes = zan_obj_hdr_bytes(word);
+    if (entry->size < hdr_bytes) return;
+    size_t bytes = entry->size - hdr_bytes;
     if (fg->kind == 0) {
         for (uint32_t k = 0; k < fg->ref_count; k++) {
             uint32_t off = fg->refs[k].offset;
@@ -413,7 +471,7 @@ static void zan_walk_object_edges(const zan_live_entry_t *entry,
                 continue;
             void *child;
             memcpy(&child, obj + off, sizeof(child));
-            if (child) cb(child, ctx);
+            if (child) cb(zan_edge_untag(child), ctx);
         }
     } else if (fg->kind == 1 || fg->kind == 2) { /* List<T> or Dict<K,V> */
         size_t required = 16 + sizeof(void *) * fg->kind;
@@ -562,9 +620,7 @@ int64_t zan_gc_detect_cycles(void) {
         for (size_t b = 0; b < g_live_stripes[s].bucket_count; b++) {
             zan_live_entry_t *entry = g_live_stripes[s].buckets[b];
             while (entry && idx < total_count) {
-                int rc_offset = entry->kind == ZAN_LIVE_OBJECT ? ZAN_OBJ_RC_OFF : ZAN_ARR_RC_OFF;
-                const int64_t *rc_ptr = (const int64_t *)((const char *)entry->obj + rc_offset);
-                int64_t rc = __atomic_load_n(rc_ptr, __ATOMIC_RELAXED);
+                int64_t rc = zan_live_read_rc(entry);
                 /* A destructor can call the diagnostic while its own object
                  * is still registered. The outgoing edges are no longer live. */
                 if (rc != 0) {
@@ -584,7 +640,7 @@ int64_t zan_gc_detect_cycles(void) {
 
     size_t qhead = 0, qtail = 0;
     for (size_t i = 0; i < actual_count; i++) {
-        if (nodes[i].rc > nodes[i].internal_rc) {
+        if (nodes[i].rc < 0 || nodes[i].rc > nodes[i].internal_rc) {
             nodes[i].marked = 1;
             queue[qtail++] = (int)i;
         }
@@ -612,11 +668,12 @@ int64_t zan_gc_detect_cycles(void) {
         for (size_t i = 0; i < actual_count && printed < 20; i++) {
             if (!nodes[i].marked) {
                 const zan_live_entry_t *entry = nodes[i].entry;
+                uint64_t site = zan_word_site(entry->site & ~ZAN_OBJ_STACK_FLAG);
                 fprintf(stderr,
                     "  - [%s] at %p (rc=%lld, internal_rc=%lld, size=%zu, site=%llu)\n",
                     zan_get_object_tyname(entry), entry->obj, (long long)nodes[i].rc,
                     (long long)nodes[i].internal_rc, entry->size,
-                    (unsigned long long)entry->site);
+                    (unsigned long long)site);
                 printed++;
             }
         }
@@ -669,36 +726,35 @@ static const zan_field_graph_t *zan_gc_collectable_graph(const zan_live_entry_t 
     if (entry->kind != ZAN_LIVE_OBJECT) return NULL;
     uint64_t raw = entry->site;
     if (raw & ZAN_OBJ_STACK_FLAG) return NULL;
-    if ((raw >> 32) == ZAN_STRING_TAG) return NULL;
-    if (raw < 4096) {
+    if (zan_word_is_string(raw) || !ZAN_HDR_IS_OBJ(raw)) return NULL; /* 串、数组 */
+    uint64_t site = ZAN_HDR_SITE(raw);
+    if (!g_desc_tbl_reg) {
         /* 站点表模式；0 号是未知站点。闭包记录等非类站点在析构表里为空，自然排除 */
-        if (raw == 0 || !g_site_dtors_reg || !g_site_field_graphs_reg ||
-            (int64_t)raw >= g_site_dtors_count || (int64_t)raw >= g_site_reg_count)
+        if (site == 0 || !g_site_dtors_reg || !g_site_field_graphs_reg ||
+            (int64_t)site >= g_site_dtors_count || (int64_t)site >= g_site_reg_count)
             return NULL;
-        *dtor = g_site_dtors_reg[raw];
-        const zan_field_graph_t *fg = (const zan_field_graph_t *)g_site_field_graphs_reg[raw];
+        *dtor = g_site_dtors_reg[site];
+        const zan_field_graph_t *fg = (const zan_field_graph_t *)g_site_field_graphs_reg[site];
         return (*dtor && fg) ? fg : NULL;
     }
-    const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)raw;
-    if (!desc->dtor_fn || !desc->field_graph) return NULL;
+    const zan_arc_desc_t *desc = zan_word_desc(raw);
+    if (!desc || !desc->dtor_fn || !desc->field_graph) return NULL;
     *dtor = desc->dtor_fn;
     return desc->field_graph;
 }
 
-static void zan_gc_walk_slots(void *obj, size_t obj_size, const zan_field_graph_t *fg,
+static void zan_gc_walk_slots(void *obj, size_t body_bytes, const zan_field_graph_t *fg,
                               zan_slot_cb_t cb, void *ctx) {
-    if (obj_size < ZAN_OBJ_HDR_SIZE) return;
-    size_t bytes = obj_size - ZAN_OBJ_HDR_SIZE;
     if (fg->kind == 0) {
         for (uint32_t k = 0; k < fg->ref_count; k++) {
             uint32_t off = fg->refs[k].offset;
-            if (!fg->refs[k].is_rc || off > bytes || bytes - off < sizeof(void *))
+            if (!fg->refs[k].is_rc || off > body_bytes || body_bytes - off < sizeof(void *))
                 continue;
             void **slot = (void **)((char *)obj + off);
             if (*slot) cb(obj, slot, ctx);
         }
     } else if (fg->kind == 1) {
-        if (bytes < 16 + sizeof(void *)) return;
+        if (body_bytes < 16 + sizeof(void *)) return;
         int64_t count = *(const int64_t *)obj;
         int64_t capacity = *(const int64_t *)((const char *)obj + 8);
         void **data = *(void ***)((char *)obj + 16);
@@ -711,7 +767,7 @@ static void zan_gc_walk_slots(void *obj, size_t obj_size, const zan_field_graph_
 
 typedef struct {
     void                    *obj;
-    size_t                   size;
+    size_t                   body_bytes;
     const zan_field_graph_t *fg;
     void                    *dtor;
     int64_t                  rc;
@@ -781,11 +837,12 @@ int64_t zan_gc_collect_cycles(void) {
             for (size_t b = 0; b < g_live_stripes[s].bucket_count; b++) {
                 for (zan_live_entry_t *e = g_live_stripes[s].buckets[b]; e && n < total; e = e->next) {
                     zan_gc_node_t *nd = &nodes[n];
+                    size_t hdr_bytes = zan_obj_hdr_bytes(e->site & ~ZAN_OBJ_STACK_FLAG);
                     nd->obj = e->obj;
-                    nd->size = e->size;
+                    nd->body_bytes = e->size > hdr_bytes ? e->size - hdr_bytes : 0;
                     nd->dtor = NULL;
                     nd->fg = zan_gc_collectable_graph(e, &nd->dtor);
-                    nd->rc = nd->fg ? __atomic_load_n((const int64_t *)((const char *)e->obj + ZAN_OBJ_RC_OFF), __ATOMIC_RELAXED) : 0;
+                    nd->rc = nd->fg ? zan_live_read_rc(e) : 0;
                     nd->internal = 0;
                     nd->marked = 0;
                     zan_obj_map_put(&map, e->obj, (int)n);
@@ -806,7 +863,7 @@ int64_t zan_gc_collect_cycles(void) {
 
     zan_gc_ctx_t ctx = { nodes, &map, queue, 0 };
     for (size_t i = 0; i < n; i++)
-        if (nodes[i].fg) zan_gc_walk_slots(nodes[i].obj, nodes[i].size, nodes[i].fg, zan_gc_count_cb, &ctx);
+        if (nodes[i].fg) zan_gc_walk_slots(nodes[i].obj, nodes[i].body_bytes, nodes[i].fg, zan_gc_count_cb, &ctx);
     for (size_t i = 0; i < n; i++) {
         /* 不可回收的对象（字符串/数组/闭包/栈对象）与有外部持有者的对象都是根；
          * rc <= 0 或 immortal 的异常计数也按根处理，不碰 */
@@ -817,13 +874,13 @@ int64_t zan_gc_collect_cycles(void) {
     }
     for (size_t qh = 0; qh < ctx.qtail; qh++) {
         zan_gc_node_t *u = &nodes[queue[qh]];
-        if (u->fg) zan_gc_walk_slots(u->obj, u->size, u->fg, zan_gc_mark_cb, &ctx);
+        if (u->fg) zan_gc_walk_slots(u->obj, u->body_bytes, u->fg, zan_gc_mark_cb, &ctx);
     }
 
     for (size_t i = 0; i < n; i++) {
         if (!nodes[i].marked) {
-            zan_gc_walk_slots(nodes[i].obj, nodes[i].size, nodes[i].fg, zan_gc_clear_cb, &ctx);
-            __atomic_store_n((int64_t *)((char *)nodes[i].obj + ZAN_OBJ_RC_OFF), 1, __ATOMIC_RELEASE);
+            zan_gc_walk_slots(nodes[i].obj, nodes[i].body_bytes, nodes[i].fg, zan_gc_clear_cb, &ctx);
+            __atomic_store_n(ZAN_RC_PTR(nodes[i].obj), 1u, __ATOMIC_RELEASE);
         }
     }
     /* 孤儿环之间已断链且 rc 归 1；析构体可能回调诊断/mutator，锁外执行 */

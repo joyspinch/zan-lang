@@ -46,8 +46,11 @@ public partial class UiDriver {
     internal static void StartSession(UiDriverSession s, App a) {
         if (s == null || s.active) { return; }
         string path = UiDriver.Env("ZAN_UI_SCRIPT");
-        if (path == "") { return; }
-        if (!File.Exists(path)) { return; }
+        // S21：ZAN_UI_DUMP=<文件> 且没有脚本时，合成"首帧完整呈现 → 导出语义树 → 退出"
+        // 的一次性会话——AI 读文本即可理解界面，不必写脚本或截图。
+        string dumpPath = UiDriver.Env("ZAN_UI_DUMP");
+        if (path == "" && dumpPath == "") { return; }
+        if (path != "" && !File.Exists(path)) { return; }
         GuiHostState.SetAutomationSession(s);
         s.app = a;
         s.outDir = UiDriver.Env("ZAN_UI_OUT");
@@ -55,7 +58,9 @@ public partial class UiDriver {
         Directory.CreateDirectoryRecursive(s.outDir);
         s.resultsPath = s.outDir + "/results.log";
         s.cmds = new List<string>();
-        string body = File.ReadAllText(path);
+        string body = path != "" ? File.ReadAllText(path)
+            : "redraw full\ndump tree " + dumpPath + "\nquit\n";
+        if (path == "") { path = "ZAN_UI_DUMP"; }
         List<string> raw = body.Replace("\r", "").Split("\n");
         for (int i = 0; i < raw.Count; i = i + 1) { s.cmds.Add(raw[i]); }
         s.pc = 0;
@@ -616,6 +621,9 @@ public partial class UiDriver {
         }
         return o;
     }
+    // 任意控件子树的语义树节点（S21 的 ZAN_UI_DUMP 与 S23 Gui.Testing.UiTest 的
+    // 快照同一格式）。
+    public static ControlNode SemanticNode(Control c) { return UiDriver.NodeOf(c); }
     static ControlNode NodeOf(Control c) {
         ControlNode n = new ControlNode();
         n.kind = c.Kind();
@@ -628,6 +636,16 @@ public partial class UiDriver {
         n.h = c.bh;
         n.prefW = c.prefW;
         n.prefH = c.prefH;
+        n.text = c.GetProp("text");
+        n.value = c.GetProp("value");
+        n.isChecked = c.GetProp("checked");
+        n.enabled = 1;
+        for (Control a = c; a != null; a = a.parent) {
+            if (a.GetProp("disabled") == "1" || a.GetProp("disabled") == "true") {
+                n.enabled = 0;
+                break;
+            }
+        }
         n.kids = new List<ControlNode>();
         for (int i = 0; i < c.ChildCount(); i = i + 1) {
             n.kids.Add(UiDriver.NodeOf(c.ChildAt(i)));

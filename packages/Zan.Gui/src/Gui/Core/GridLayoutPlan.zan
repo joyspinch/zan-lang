@@ -19,6 +19,9 @@ internal class GridLayoutPlan {
     private bool colsAutoRepeat = false;
     private bool colsAutoFit = false;
     private List<int> placementKeys = new List<int>();
+    // 轨道里的 px 是逻辑像素，与其它长度（StyleBox.ResolveLength）一样按 DPI 换成设备
+    // 像素；换算比例是缓存键的一部分——运行期换 DPI（拖到别的显示器）要重新解析。
+    private int trackDpi = 0;
     private static int PlacementKey(StyleBox sb, int field) {
         if (sb == null) { return 0; }
         if (field == 0) { return sb.gColStart; }
@@ -41,6 +44,26 @@ internal class GridLayoutPlan {
         }
         return true;
     }
+    private static List<GridTrack> ScaleTracks(List<GridTrack> tracks, int dpi) {
+        if (dpi == 100 || tracks == null) { return tracks; }
+        List<GridTrack> scaled = new List<GridTrack>();
+        for (int i = 0; i < tracks.Count; i = i + 1) {
+            GridTrack src = tracks[i];
+            GridTrack t = new GridTrack();
+            t.kind = src.kind;
+            t.val = src.kind == 0 ? src.val * dpi / 100 : src.val;
+            t.minKind = src.minKind;
+            t.minVal = (src.kind == 4 && src.minKind == 0) ? src.minVal * dpi / 100 : src.minVal;
+            t.maxKind = src.maxKind;
+            t.maxVal = (src.kind == 4 && src.maxKind == 0) ? src.maxVal * dpi / 100 : src.maxVal;
+            scaled.Add(t);
+        }
+        return scaled;
+    }
+
+    private static List<GridTrack> Parse(string v, int dpi) {
+        return GridLayoutPlan.ScaleTracks(CssGrid.ParseTracks(v), dpi);
+    }
     public void Prepare(StyleBox style, List<Control> items) {
         this.Prepare(style, items, 0 - 1, 0);
     }
@@ -49,6 +72,9 @@ internal class GridLayoutPlan {
         string r = style != null ? style.gridRows : "";
         string ac = style != null ? style.gridAutoCols : "";
         string ar = style != null ? style.gridAutoRows : "";
+        int dpi = style != null && style.envDpiScale > 0 ? style.envDpiScale : 100;
+        bool rescale = dpi != trackDpi;
+        trackDpi = dpi;
         bool colsTextChanged = colDefs == null || cols != c;
         if (colsTextChanged) {
             colsAutoRepeat = CssGrid.HasAutoRepeat(c);
@@ -56,12 +82,17 @@ internal class GridLayoutPlan {
         }
         int itemCount = items != null ? items.Count : 0;
         bool tracksChanged = false;
-        if (colsTextChanged
+        if (colsTextChanged || rescale
             || (colsAutoRepeat && (lastColAvail != colAvail || lastColGap != colGap))
             || (colsAutoFit && lastAutoFitItems != itemCount)) {
-            colDefs = colsAutoRepeat
-                ? CssGrid.ParseTracksForWidth(c, colAvail, colGap)
-                : CssGrid.ParseTracks(c);
+            if (colsAutoRepeat) {
+                int logicalAvail = (dpi != 100 && colAvail > 0) ? colAvail * 100 / dpi : colAvail;
+                int logicalGap = (dpi != 100 && colGap > 0) ? colGap * 100 / dpi : colGap;
+                colDefs = GridLayoutPlan.ScaleTracks(
+                    CssGrid.ParseTracksForWidth(c, logicalAvail, logicalGap), dpi);
+            } else {
+                colDefs = GridLayoutPlan.Parse(c, dpi);
+            }
             if (colsAutoFit && itemCount > 0 && colDefs.Count > itemCount) {
                 while (colDefs.Count > itemCount) { colDefs.RemoveAt(colDefs.Count - 1); }
             }
@@ -72,14 +103,14 @@ internal class GridLayoutPlan {
             tracksChanged = true;
             parses = parses + 1;
         }
-        if (rowDefs == null || rows != r) {
-            rowDefs = CssGrid.ParseTracks(r); rows = r; tracksChanged = true; parses = parses + 1;
+        if (rowDefs == null || rows != r || rescale) {
+            rowDefs = GridLayoutPlan.Parse(r, dpi); rows = r; tracksChanged = true; parses = parses + 1;
         }
-        if (autoCols == null || implicitCols != ac) {
-            autoCols = CssGrid.ParseTracks(ac); implicitCols = ac; parses = parses + 1;
+        if (autoCols == null || implicitCols != ac || rescale) {
+            autoCols = GridLayoutPlan.Parse(ac, dpi); implicitCols = ac; parses = parses + 1;
         }
-        if (autoRows == null || implicitRows != ar) {
-            autoRows = CssGrid.ParseTracks(ar); implicitRows = ar; parses = parses + 1;
+        if (autoRows == null || implicitRows != ar || rescale) {
+            autoRows = GridLayoutPlan.Parse(ar, dpi); implicitRows = ar; parses = parses + 1;
         }
         if (placement == null || tracksChanged || !this.SameKeys(items)) {
             List<int> current = new List<int>();

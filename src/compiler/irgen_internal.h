@@ -211,6 +211,13 @@ typedef struct {
   zan_ast_node_t *body;
 } async_scan_t;
 
+/* Frame-header SCHED word bits shared with the M:N runtime
+ * (rt_io_co_pool.c CO_RUNNING); the in-module driver keeps SCHED at 0. */
+#define ZAN_CO_RUNNING_BIT 2LL
+/* Max coroutines started inline (await site, construct_await.c) nested on
+ * one thread before the await falls back to the scheduler. */
+#define ZAN_CO_INLINE_DEPTH_MAX 64
+
 enum {
   ASYNC_FRAME_SCHED = 0,
   ASYNC_FRAME_SCHED_STEP = 1,
@@ -285,6 +292,7 @@ void emit_raise_exception(zan_irgen_t *g);
 void emit_raise_exception_through_cleanups(zan_irgen_t *g);
 LLVMBasicBlockRef zan_raise_unwind_dest(zan_irgen_t *g, bool include_cleanups);
 LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g);
+LLVMValueRef zan_eh_co_depth_ptr(zan_irgen_t *g);
 LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g);
 void zan_emit_raise_call(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef *args, unsigned n,
                          LLVMBasicBlockRef cont_bb, bool include_cleanups);
@@ -300,6 +308,7 @@ LLVMTypeRef arc_desc_type(zan_irgen_t *g);
 LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx);
 bool class_has_virtual_methods(zan_symbol_t *sym);
 int class_vptr_offset(zan_symbol_t *sym);
+void class_vptr_plan_compute(zan_irgen_t *g, zan_ast_node_t *unit);
 int count_virtual_methods(zan_symbol_t *sym);
 bool decl_is_explicit_layout(zan_symbol_t *sym);
 unsigned long di_align_up(unsigned long v, unsigned long a);
@@ -311,8 +320,29 @@ unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem);
 LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                       long size, int coll_kind,
                                       zan_type_t *elem_type);
-void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
-                         LLVMValueRef rc_iptr);
+void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj, LLVMValueRef rc_iptr,
+                         LLVMTypeRef rc_ty);
+/* 释放链不跑用户代码（析构器被 E1016 拒收）：类/集合/数组释放函数、
+ * zan_rt_release(_dyn) 与经描述符的析构间接调用都不会展开。v 是函数则挂
+ * 函数属性，是调用指令则挂调用点属性。 */
+void zan_mark_nounwind(zan_irgen_t *g, LLVMValueRef v);
+/* 对象/字符串的 32 位 RC 槽地址：obj + ZAN_RC_OFF（见 zan_abi.h） */
+LLVMValueRef zan_rc_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
+                        const char *name);
+/* 字符串长度槽（u32）地址：str + ZAN_STR_LEN_OFF */
+LLVMValueRef zan_str_len_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef str,
+                             const char *name);
+LLVMValueRef zan_hdr_word_ptr(zan_irgen_t *g, LLVMBuilderRef b,
+                              LLVMValueRef obj, const char *name);
+LLVMValueRef zan_hdr_site(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word,
+                          const char *name);
+/* 默认（描述符）模式：头字 → 描述符指针（站点号越界 → null）；见 arc_tables.c */
+LLVMValueRef zan_hdr_desc(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word,
+                          const char *name);
+LLVMValueRef zan_desc_tbl_global(zan_irgen_t *g, LLVMValueRef *count_out);
+LLVMValueRef arc_class_site_val(zan_irgen_t *g, LLVMValueRef site_val,
+                                LLVMTypeRef st);
+void emit_desc_table(zan_irgen_t *g);
 LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty);
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
                   LLVMValueRef v);
@@ -321,6 +351,9 @@ LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty,
 LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
                             LLVMTypeRef st, LLVMValueRef base, int fi,
                             const char *name);
+void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st,
+                         int fi);
+void zan_tbaa_tag_array_len(zan_irgen_t *g, LLVMValueRef load);
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8,
                             LLVMBasicBlockRef ret_bb);
 LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v,
@@ -390,6 +423,16 @@ void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals);
 int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst,
                      int coll_kind, zan_type_t *coll_elem);
 int reserve_closure_site(zan_irgen_t *g);
+/* 闭包记录 / 捕获盒的强引用槽：字节偏移 + 显示名（捕获变量名、this、target）。
+ * 进入站点字段走图后，S13 环诊断与 GC.DetectCycles 能沿闭包走边。 */
+#define ZAN_CLO_LAYOUT_MAX 64
+typedef struct zan_clo_layout {
+    int         n;
+    uint32_t    offsets[ZAN_CLO_LAYOUT_MAX];
+    const char *names[ZAN_CLO_LAYOUT_MAX];
+} zan_clo_layout_t;
+void zan_set_closure_site_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                 const unsigned *fields, const char *const *names, int n);
 const char *arc_runtime_type_name(zan_irgen_t *g, zan_type_t *type);
 const char *arc_collection_type_name(zan_irgen_t *g, int kind,
                                      zan_type_t *element);
@@ -498,6 +541,8 @@ void emit_site_dtor_table(zan_irgen_t *g);
 void emit_site_field_graph_table(zan_irgen_t *g);
 LLVMValueRef zan_site_field_names_global(zan_irgen_t *g);
 LLVMValueRef zan_leak_main_done_global(zan_irgen_t *g);
+int zan_subscription_rooted_at_this(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals);
 void emit_site_live_tables(zan_irgen_t *g);
 void emit_site_tyname_table(zan_irgen_t *g);
 void emit_string_release(zan_irgen_t *g, LLVMValueRef v);
@@ -527,6 +572,9 @@ LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
 zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
                                zan_ast_node_t *call, local_scope_t *locals);
 LLVMValueRef get_arc_free_decl(zan_irgen_t *g);
+LLVMValueRef get_arc_free_obj_decl(zan_irgen_t *g);
+LLVMValueRef get_arc_free_obj16_decl(zan_irgen_t *g);
+bool zan_class_needs_pad16(LLVMTypeRef st);
 LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type);
 LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type,
                                     int rect);
@@ -670,19 +718,28 @@ LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key, zan_type_t *kt);
 LLVMValueRef get_dict_compact_fn(zan_irgen_t *g);
 void emit_dict_compact_if_holes(zan_irgen_t *g, LLVMValueRef draw);
 typedef enum {
-    ZAN_SORT_I32 = 0,
-    ZAN_SORT_I64,
-    ZAN_SORT_F64,
-    ZAN_SORT_STR,
-    ZAN_SORT_CMP_I32,
-    ZAN_SORT_CMP_I64,
-    ZAN_SORT_CMP_F64,
-    ZAN_SORT_CMP_PTR,
+  ZAN_SORT_I32 = 0,
+  ZAN_SORT_I64,
+  ZAN_SORT_F64,
+  ZAN_SORT_STR,
+  ZAN_SORT_CMP_I32,
+  ZAN_SORT_CMP_I64,
+  ZAN_SORT_CMP_F64,
+  ZAN_SORT_CMP_PTR,
 } zan_sort_kind_t;
 void emit_raw_buffer_sort(zan_irgen_t *g, int kind, LLVMValueRef data_raw,
                           LLVMValueRef count, LLVMValueRef cmp_or_null);
 LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                             LLVMValueRef draw, LLVMValueRef key);
+/* 字典键种类（__zan_dict_find/set/remove 的第三参）：0 = 其余原始键（引用
+ * 同一性、浮点位型等，种子哈希）；1 = 字符串（运行时 SipHash）；
+ * ZAN_DICT_KEY_INT = 整数类键——索引先用恒等定位（顺序/稠密键访问连续），
+ * 任一插入探测超过 ZAN_DICT_IDENT_MAX_PROBE 组即整表退回种子哈希。
+ * 种类只决定新索引的起始模式，此后哈希一律以索引里的 plim 为准。 */
+#define ZAN_DICT_KEY_INT 2
+#define ZAN_DICT_PLIM_SEEDED 0x7FFFFFFFFFFFFFFFull
+#define ZAN_DICT_IDENT_MAX_PROBE 4
+long long dict_key_hash_kind(zan_type_t *kt, int unknown_is_str);
 LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx);
 void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp);
 LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx);
@@ -718,6 +775,7 @@ void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top, LLVMValueRef *bufs,
 LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g);
 LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g);
 LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g);
+void eh_drop_tmp_mark(zan_irgen_t *g, LLVMValueRef mark);
 LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g);
 LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
@@ -746,6 +804,8 @@ LLVMValueRef get_str_join_fn(zan_irgen_t *g);
 LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g);
 LLVMValueRef get_str_replace_fn(zan_irgen_t *g);
 LLVMValueRef get_str_split_fn(zan_irgen_t *g);
+LLVMValueRef get_strtoll10_fn(zan_irgen_t *g);
+LLVMValueRef get_memchr_fn(zan_irgen_t *g);
 LLVMValueRef get_str_trim_fn(zan_irgen_t *g);
 void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
                       zan_symbol_t *method_sym, local_scope_t *locals);
@@ -1258,6 +1318,15 @@ void emit_sb_append_int(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef val64,
                         int is_ulong, int append_nl);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                    LLVMValueRef isnull, zan_loc_t loc);
+LLVMValueRef emit_soft_array_base_select(zan_irgen_t *g, LLVMValueRef base,
+                                         LLVMValueRef isnull);
+LLVMValueRef emit_array_null_guard(zan_irgen_t *g, LLVMValueRef arr,
+                                   zan_loc_t loc, const char *msg);
+void emit_runtime_check_noreturn(zan_irgen_t *g, LLVMValueRef is_error,
+                                 zan_loc_t loc, const char *msg);
+LLVMValueRef emit_checked_elem_gep(zan_irgen_t *g, LLVMTypeRef elem_ty,
+                                   LLVMValueRef base, LLVMValueRef idx,
+                                   const char *name);
 void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out,
                            LLVMValueRef *window_out, LLVMValueRef length,
                            zan_loc_t loc, const char *kind);
@@ -1325,6 +1394,8 @@ LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                   LLVMTypeRef *out_ty);
 LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local,
                              LLVMTypeRef st);
+LLVMValueRef struct_recv_ptr_guarded(zan_irgen_t *g, local_var_t *local,
+                                     LLVMTypeRef st, zan_ast_node_t *obj_expr);
 bool sym_declares_extern(zan_symbol_t *sym);
 void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
@@ -1364,7 +1435,10 @@ void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals,
                        const zan_irgen_finally_entry_t *entry);
 void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals);
+bool eh_lpad_reraises_native(zan_irgen_t *g, LLVMValueRef fn, bool has_catch);
+void emit_eh_native_delete(zan_irgen_t *g, LLVMValueRef lp_val);
 void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
+void emit_static_cleanup_call(zan_irgen_t *g);
 void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 /* --- From irgen_weak.c (4 functions) --- */

@@ -379,8 +379,31 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
       return zan_iwiden(g->builder, val, target);
     return val;
   }
-  if (src_fp && tk == LLVMIntegerTypeKind)
+  if (src_fp && tk == LLVMIntegerTypeKind) {
+    /* 无符号窄目标（byte/ushort/uint）按 [0, 2^w-1] 饱和：
+     * emit_fptosi_guarded 的窄化饱和只认 LLVM 位宽、按有符号域钳，
+     * (byte)200.9 会被钳成 127。这里先在 i64 上守卫转换，再按
+     * 无符号域钳位截断（checked 上下文越界抛溢出，同口径）。 */
+    unsigned uw = LLVMGetIntTypeWidth(target);
+    if (tt && uw < 64 &&
+        (tt->kind == TYPE_BYTE || tt->kind == TYPE_USHORT ||
+         tt->kind == TYPE_UINT)) {
+      LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+      LLVMValueRef w = emit_fptosi_guarded(g, val, i64t, expr->loc, NULL);
+      LLVMValueRef zero = LLVMConstInt(i64t, 0, 0);
+      LLVMValueRef umax = LLVMConstInt(i64t, (1ULL << uw) - 1, 0);
+      LLVMValueRef below = zan_icmp(g->builder, LLVMIntSLT, w, zero, "f2u.lo");
+      LLVMValueRef above = zan_icmp(g->builder, LLVMIntSGT, w, umax, "f2u.hi");
+      if (g->irgen_checked_depth > 0)
+        emit_runtime_check(
+            g, LLVMBuildOr(g->builder, below, above, "f2u.ovf"), expr->loc,
+            "integer overflow in checked operation");
+      LLVMValueRef hs = LLVMBuildSelect(g->builder, above, umax, w, "f2u.hs");
+      LLVMValueRef cl = LLVMBuildSelect(g->builder, below, zero, hs, "f2u.cl");
+      return LLVMBuildTrunc(g->builder, cl, target, "f2u.trunc");
+    }
     return emit_fptosi_guarded(g, val, target, expr->loc, NULL);
+  }
   if (sk == LLVMIntegerTypeKind && tgt_fp)
     return LLVMBuildSIToFP(g->builder, val, target, "cast");
   if (src_fp && tgt_fp) {
@@ -476,18 +499,13 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
   if (known_tname && strcmp(known_tname, "string") == 0) {
     LLVMBuildCondBr(g->builder, isnull, false_bb, hdr_bb);
     LLVMPositionBuilderAtEnd(g->builder, hdr_bb);
-    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
-    LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
-                                      x, &neg8, 1, "is.sptr");
     LLVMValueRef raw_site = LLVMBuildLoad2(
-        g->builder, i64,
-        LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
+        g->builder, i64, zan_hdr_word_ptr(g, g->builder, x, "is.sptr"),
         "is.site.raw");
-    LLVMSetMetadata(raw_site, inv_kind, inv_md);
-    LLVMValueRef site =
+    LLVMValueRef word =
         zan_and(g->builder, raw_site, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0),
-                "is.site");
-    LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
+                "is.word");
+    LLVMValueRef isstr = zan_hdr_is_string(g, word, "is.str");
     LLVMBuildCondBr(g->builder, isstr, true_bb, false_bb);
     LLVMPositionBuilderAtEnd(g->builder, true_bb);
     LLVMBuildBr(g->builder, merge);
@@ -519,20 +537,21 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
     LLVMBuildCondBr(g->builder, isnull, false_bb, hdr_bb);
   }
 
-  /* 对象头部 -8 处分配点标识字（分配后终生不变，标 invariant.load 供外提） */
+  /* 对象头部 -8 处双 32 位字（[-8] rc | [-4] tw，不可标 invariant.load） */
   LLVMPositionBuilderAtEnd(g->builder, hdr_bb);
-  LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
-  LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
-                                    x, &neg8, 1, "is.sptr");
   LLVMValueRef raw_site = LLVMBuildLoad2(
-      g->builder, i64,
-      LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
+      g->builder, i64, zan_hdr_word_ptr(g, g->builder, x, "is.sptr"),
       "is.site.raw");
-  LLVMSetMetadata(raw_site, inv_kind, inv_md);
-  LLVMValueRef site =
+  LLVMValueRef word =
       zan_and(g->builder, raw_site, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0),
-              "is.site");
-  LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
+              "is.word");
+  LLVMValueRef isstr = zan_hdr_is_string(g, word, "is.str");
+  LLVMValueRef is_obj = zan_icmp(
+      g->builder, LLVMIntNE,
+      zan_and(g->builder, word,
+              LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_MARK << 32, 0), "is.mark"),
+      LLVMConstInt(i64, 0, 0), "is.isobj");
+  LLVMValueRef site = zan_hdr_site(g, g->builder, word, "is.site");
   if (!known_tname) {
     LLVMBasicBlockRef str_bb =
         LLVMAppendBasicBlockInContext(g->ctx, fn, "is.s");
@@ -548,19 +567,30 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
   /* 越界分配点索引判定为非目标类型 */
   LLVMPositionBuilderAtEnd(g->builder, oob_bb);
   LLVMValueRef oob;
+  LLVMValueRef dsc = NULL;
   if (!g->desc_hdr) {
     LLVMValueRef bound =
         LLVMBuildLoad2(g->builder, i64, g->g_site_count, "is.bound");
-    oob = zan_icmp(g->builder, LLVMIntUGE, site, bound, "is.oob2");
+    oob = zan_or(g->builder, LLVMBuildNot(g->builder, is_obj, "is.notobj"),
+                 zan_icmp(g->builder, LLVMIntUGE, site, bound, "is.oob"),
+                 "is.oob2");
   } else {
-    /* 描述符模式：头部字作为元数据记录指针（site==0 已被 site < 4096 覆盖） */
-    oob = zan_or(
+    /* 描述符模式：对象头按站点号查描述符表；无对象标记的大值是数组
+     * 描述符指针，ZAN_ARRAY_MAGIC / 秩 / 0 没有描述符 */
+    LLVMValueRef arr_dsc = LLVMBuildSelect(
         g->builder,
-        zan_icmp(g->builder, LLVMIntULT, site, LLVMConstInt(i64, 4096, 0),
-                 "is.tinydsc"),
-        zan_icmp(g->builder, LLVMIntEQ, site,
-                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrdsc"),
-        "is.oob2");
+        zan_or(g->builder,
+               zan_icmp(g->builder, LLVMIntEQ, word,
+                        LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrdsc"),
+               zan_icmp(g->builder, LLVMIntULT, word, LLVMConstInt(i64, 4096, 0),
+                        "is.tinydsc"),
+               "is.notdsc"),
+        LLVMConstNull(i8ptr),
+        LLVMBuildIntToPtr(g->builder, word, i8ptr, "is.arrp"), "is.arrd");
+    dsc = LLVMBuildSelect(g->builder, is_obj,
+                          zan_hdr_desc(g, g->builder, word, "is.tbld"), arr_dsc,
+                          "is.dsc");
+    oob = zan_icmp(g->builder, LLVMIntEQ, dsc, LLVMConstNull(i8ptr), "is.oob2");
   }
   LLVMBuildCondBr(g->builder, oob, false_bb, list_bb);
 
@@ -575,9 +605,7 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
         LLVMBuildInBoundsGEP2(g->builder, i8ptr, tbl, &site, 1, "is.lp"),
         "is.list");
   } else {
-    LLVMValueRef dp = LLVMBuildIntToPtr(
-        g->builder, site, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
-        "is.dsc");
+    LLVMValueRef dp = dsc;
     LLVMValueRef tn_off = LLVMConstInt(i64, 8, 0);
     LLVMValueRef tn_p = LLVMBuildInBoundsGEP2(
         g->builder, LLVMInt8TypeInContext(g->ctx), dp, &tn_off, 1, "is.tnp");
@@ -658,8 +686,8 @@ bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
  * （emit_unbox_struct / build_class_release_body 的 SYM_STRUCT 分支）。
  * `is`/拆箱的 tag 走描述符名表（装箱 site 的 tynames 首项就是结构体名，
  * 见 zan_irgen_emit_arc_desc_init 的继承链遍历），基于头部不受载荷
- * 位移影响。头部由 zan_rt_alloc 统一布置：raw[0..7]=引用计数、
- * raw[8..15]=site 字。托管字段结构体（A556-3）同一协议：来源非 owned
+ * 位移影响。头部由 zan_rt_alloc 统一布置：[-8] u32 引用计数、
+ * [-4] u32 tw（对象标记 | 站点号）。托管字段结构体（A556-3）同一协议：来源非 owned
  * 时对托管字段 retain，箱的释放函数按字段 walk 释放（含嵌套结构体
  * 下钻）。 */
 LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,

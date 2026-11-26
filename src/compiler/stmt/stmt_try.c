@@ -174,7 +174,16 @@ case AST_TRY_STMT: {
   bool catches_native =
       ncatch > 0 || has_enclosing_catch ||
       (!g->current_async_frame && stmt->try_stmt.finally_body);
-  emit_eh_landing_to(g, catch_bb, lp_ret_ty, lp_slot, catches_native);
+  /* Unless the tail re-raises this same object, nothing reads it again. */
+  bool reraises_native = eh_lpad_reraises_native(g, fn, ncatch > 0);
+  emit_eh_landing_to(g, catch_bb, lp_ret_ty,
+                     (reraises_native || !catches_native) ? lp_slot : NULL,
+                     catches_native);
+  if (!reraises_native && !catches_native && !g->target_is_wasm) {
+    LLVMPositionBuilderBefore(g->builder, LLVMGetBasicBlockTerminator(lpad_bb));
+    emit_eh_native_delete(
+        g, LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "lp.del"));
+  }
   zan_builder_restore(g, lpad_pt);
 
   LLVMPositionBuilderAtEnd(g->builder, try_bb);
@@ -456,7 +465,15 @@ case AST_TRY_STMT: {
         zan_builder_point_t pt = zan_builder_save(g);
         LLVMPositionBuilderAtEnd(g->builder, cleanup_lpad);
         bool catches_cleanup = has_enclosing_catch || fin_idx >= 0;
-        emit_eh_landing_to(g, cleanup_bb, lp_ret_ty, lp_slot, catches_cleanup);
+        /* Leaving a catch always raises a fresh native object. */
+        emit_eh_landing_to(g, cleanup_bb, lp_ret_ty,
+                           catches_cleanup ? NULL : lp_slot, catches_cleanup);
+        if (!catches_cleanup && !g->target_is_wasm) {
+          LLVMPositionBuilderBefore(g->builder,
+                                    LLVMGetBasicBlockTerminator(cleanup_lpad));
+          emit_eh_native_delete(
+              g, LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "catch.lp.del"));
+        }
         zan_builder_restore(g, pt);
         zan_lpad_entry_t *entry = &g->lpad_stack[g->lpad_depth++];
         memset(entry, 0, sizeof(*entry));

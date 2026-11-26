@@ -89,3 +89,64 @@ GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按
      引用对应的 `Zan.Game.<类目>` 独立包（Arpg/Idle/Board/Match3 等）。
 2. **纯算法与专用工具就近放置**：
    - 二维码矩阵编码等仅为特定控件服务的算法，统一收敛在 `Gui.Widget`（如 `QrEncoder.zan`），避免在根目录平铺杂质。
+
+## 脱窗 UI 测试（`Gui.Testing.UiTest`，ZAN_STANDARD S23/S24）
+
+窗体（ViewModel）不起窗口、不建 App 就能测：`UiTest.Open(vm)` 按类型名取 `--embed`
+进来的同名标记（与 `Form.Show` 同一查找）建树、绑定到这个实例、按名接上处理器。
+
+```csharp
+LoginForm vm = new LoginForm();          // 声明式窗体 new 出来不建 App
+UiTest t = UiTest.Open(vm);              // 或 UiTest.OpenMarkup(vm, html)
+t.Type("UserName", "admin");             // 写入视图 → 回写模型
+t.Click("Login");                        // 触发 @click 处理器，再刷回视图
+t.Expect("Error").Hidden();              // Text/Value/Visible/Hidden/Enabled/Disabled/Checked
+t.MatchSnapshot("tests/gui/snapshots/login_ok.json");   // 语义树快照，首次录制
+```
+
+- 名字在用到时对照真实控件树校验：写错立刻抛 `UiTestException`，并给出最接近的名字
+  （"did you mean 'Login'?"）；禁用控件拒绝输入与点击。
+- 每次操作后做一次完整双向同步（一帧绑定泵做的事），断言看到的就是用户会看到的。
+- 快照与 `ZAN_UI_DUMP`（S21）同一格式；脱窗时没有布局，区间为 0，快照因此稳定。
+- 依赖 App 的服务（`GetApp()` 返回 null）在脱窗时不可用：处理器里重绘用
+  `RequestRedraw()`（无宿主时安全），不要直接 `GetApp().X`。
+
+## 布局不变量检查（`Gui.Testing.UiCheck`，ZAN_STANDARD S22）
+
+窗体离屏装配（不建系统窗口），按设计尺寸在给定 DPI 下排一帧后查：
+
+```csharp
+List<UiIssue> issues = UiCheck.Run(new LoginForm(), 150, true);   // 150% DPI + 伪本地化
+string json = UiCheck.Json("LoginForm", issues);
+```
+
+| 种类 | 含义 |
+|---|---|
+| `truncated` | 带文本的叶子控件比首选尺寸窄/矮超过 2 逻辑像素——文字被截 |
+| `small_target` | 可交互控件小于 24 逻辑像素（按 DPI 折算），且离别的目标太近（WCAG 2.5.8 间距豁免不成立） |
+| `overlap` | 两个可交互控件相交且互不包含——点击会落错 |
+| `offscreen` | 可见控件超出窗口（滚动容器内的内容不算） |
+| `collapsed` | 可交互控件被挤成 0 宽或 0 高 |
+
+禁用控件不算交互目标；刻意叠放（牌堆、角标）给容器挂 `free-layout` 属性（即
+`FreeLayout()`，与 LayoutLint 同一张免检牌），子树不查重叠与尺寸。
+
+伪本地化把静态文本拉长 40%，提前暴露译文变长后的截断（绑定文本同步时会被模型
+覆盖，不受影响）。`zan-check` 的 ui 步自动对输入里的全部窗体跑三档 DPI 与伪本地化。
+
+## 标记的编译期检查（ZAN_STANDARD S20）
+
+派生自 `Form` / `ChildWindow` 的类 `X` 与同目录（或 `--embed` 进来的）`X.html` 配对，
+zanc 在类型检查后对照 `X` 的成员查标记——与运行期开窗前的 DocWire 对账同一口径，
+只是提前到编译期、报在 `.html` 的属性值上并给拼写补丁：
+
+| 诊断 | 标记写法 | 要求 |
+|---|---|---|
+| E2112 | `@click` / `v-on:` / `z-on:` / `data-on-` / `on*` 的处理器名 | `X`（含基类）的方法，或在 `X` 的源码里以字符串登记过（`binder.Handle("名字", …)`） |
+| E2113 | `bind` / `bind:属性` / `:属性` 的纯路径 | 逐段是字段或属性；只下钻用户代码里声明的类（集合、字典、`JsonValue` 按运行期协议取值，不查） |
+| E2114 | `z-mount` / `data-mount` | `X` 的字段 |
+| E2115 | `bind` / `bind:属性` / `:属性`（含模板行） | 值是点分模型路径、属性名是标识符；表达式和字面量不收（运行期建树会抛异常），静态值写普通属性 |
+
+不查：`<template>` 子树里绑定路径是否存在（以行项为作用域）、非标识符的处理器值（路由
+动作）、`X` 在用户代码里重写了 `ViewModel()` 时的绑定路径。
+

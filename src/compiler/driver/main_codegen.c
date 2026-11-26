@@ -306,12 +306,128 @@ if (mf_built) {
   mf_built = false;
 }
 
-if (effective_opt > ZAN_OPT_NONE) {
-  zan_opt_report_t opt_report =
-      zan_optimize(&irgen, NULL, effective_opt, &opt_knobs);
-  if (!opt_report.success)
+/* Native object output: the optimizer may leave the finish half of the
+ * LLVM pipeline to zan_irgen_write_obj (parallel per partition). Cross
+ * targets keep the one-piece pipeline: their write_obj rewrites libc
+ * names (wasm/riscv32 adapters, iOS main) that the pipeline must see. */
+irgen.defer_opt_finish_ok = !do_emit_ir && irgen.split_codegen_ok;
+/* Partitioned backend (build_partition.h, docs/BUILD_CACHE.md stage 2):
+ * development builds of native executables compile each source unit's
+ * bodies as a module of its own, cached per unit, so a user edit
+ * recompiles only what changed. Release builds (--publish) keep the
+ * whole-module pipeline; ZAN_PARTITION=0 turns it off. */
+bool part_ok = false;
+if (effective_opt > ZAN_OPT_NONE && !do_emit_ir && shard_n == 0 &&
+    irgen.split_codegen_ok && !publish_mode && !irgen.emit_lib &&
+    !irgen.emit_debug) {
+  const char *pe = getenv("ZAN_PARTITION");
+  const char *pipe = getenv("ZAN_OPT_PIPELINE");
+  const char *dump = getenv("ZAN_DUMP_OPT_IR");
+  part_ok = !(pe && pe[0] == '0') && !(pipe && pipe[0]) &&
+            !(opt_knobs.pipeline && opt_knobs.pipeline[0]) &&
+            !(dump && dump[0]);
+}
+if (part_ok) {
+  irgen.opt_zan_passes_only = true;
+  zan_opt_report_t zrep = zan_optimize(&irgen, NULL, effective_opt, &opt_knobs);
+  irgen.opt_zan_passes_only = false;
+  if (!zrep.success)
     goto codegen_failed;
-  zan_opt_report_print(&opt_report);
+  zan_opt_report_print(&zrep);
+  phase("zan passes");
+  if (irgen.builder)
+    LLVMClearInsertionPosition(irgen.builder);
+  int prc = zan_irgen_partition(&irgen, (int)effective_opt, obj_path);
+  if (prc < 0)
+    goto codegen_failed;
+  if (g_time_phases)
+    fprintf(stderr,
+            "partition: %s; %d units (%d cached, %d compiled), %ld insns "
+            "moved, %ld left; split %.1f ms, units %.1f ms\n",
+            prc > 0 ? "on" : "off (too small)", irgen.part_stats.units,
+            irgen.part_stats.hit, irgen.part_stats.miss,
+            irgen.part_stats.moved_insns, irgen.part_stats.residual_insns,
+            irgen.part_stats.ms_split, irgen.part_stats.ms_compile);
+  phase("partition");
+  probe_phase_mem("partition");
+}
+if (part_ok) {
+  /* The residual (helpers, tables, main) -- or the whole module when it
+   * was too small to split: the LLVM pipeline only, the Zan passes
+   * already ran. Same pass order as the one-piece path below. */
+  zan_bcache_key_t opt_key = {{0}, false};
+  char *opt_log = NULL;
+  LLVMModuleRef cached_mod = NULL;
+  bool split_opt = zan_opt_plan_finish(&irgen, effective_opt);
+  if (zan_bcache_opt_key(irgen.mod,
+                         (int)effective_opt + (split_opt ? 64 : 0) + 128,
+                         &opt_key))
+    cached_mod = zan_bcache_opt_load(&opt_key, irgen.mod, &opt_log);
+  if (cached_mod) {
+    irgen.mod = cached_mod;
+    if (opt_log)
+      fputs(opt_log, stderr);
+  } else {
+    if (opt_key.valid)
+      zan_bcache_capture_begin();
+    zan_status_t ost =
+        zan_opt_configure_llvm_passes(&irgen, effective_opt, &opt_knobs);
+    if (opt_key.valid)
+      opt_log = zan_bcache_capture_end();
+    if (ost != ZAN_OK) {
+      free(opt_log);
+      goto codegen_failed;
+    }
+    if (opt_key.valid)
+      irgen.mod =
+          zan_bcache_opt_store(&opt_key, irgen.mod, opt_log ? opt_log : "");
+  }
+  free(opt_log);
+  phase("optimize");
+  probe_phase_mem("optimize");
+  zan_irgen_prune_extern_libs(&irgen);
+} else if (effective_opt > ZAN_OPT_NONE) {
+  /* Build cache (docs/BUILD_CACHE.md): the optimizer is a pure function
+   * of this module and the options, so a hit swaps in the optimized
+   * module the same input produced before and replays its report. A
+   * miss also continues with the stored module read back. Either way
+   * irgen.mod is a new module from here on: code after this point must
+   * find functions/globals by name, never through LLVMValueRefs that
+   * irgen cached (g->rt_*, g->functions, ...). */
+  zan_bcache_key_t opt_key = {{0}, false};
+  char *opt_log = NULL;
+  LLVMModuleRef cached_mod = NULL;
+  /* A split build caches the module between the pipeline halves (the
+   * finish half runs at object emission): key it apart, and a hit
+   * restores the same pending finish state. */
+  bool split_opt = zan_opt_plan_finish(&irgen, effective_opt);
+  if (!do_emit_ir &&
+      zan_bcache_opt_key(irgen.mod, (int)effective_opt + (split_opt ? 64 : 0),
+                         &opt_key)) {
+    if (irgen.builder)
+      LLVMClearInsertionPosition(irgen.builder);
+    cached_mod = zan_bcache_opt_load(&opt_key, irgen.mod, &opt_log);
+  }
+  if (cached_mod) {
+    irgen.mod = cached_mod;
+    if (opt_log)
+      fputs(opt_log, stderr);
+  } else {
+    if (opt_key.valid)
+      zan_bcache_capture_begin();
+    zan_opt_report_t opt_report =
+        zan_optimize(&irgen, NULL, effective_opt, &opt_knobs);
+    if (!opt_report.success) {
+      free(opt_key.valid ? zan_bcache_capture_end() : NULL);
+      goto codegen_failed;
+    }
+    zan_opt_report_print(&opt_report);
+    if (opt_key.valid) {
+      opt_log = zan_bcache_capture_end();
+      irgen.mod = zan_bcache_opt_store(&opt_key, irgen.mod, opt_log);
+    }
+  }
+  free(opt_log);
   phase("optimize");
   probe_phase_mem("optimize");
   if (shard_n == 0)
@@ -326,6 +442,11 @@ if (effective_opt > ZAN_OPT_NONE) {
       zan_irgen_prune_extern_libs(&irgen);
   }
 }
+
+/* 优化后再判：未优化模块里还挂着死掉的 stdlib 异步函数的引用。分片发射
+ * 时函数已搬进别的对象，主模块看不全引用面，保守不删。 */
+if (shard_n == 0)
+  zan_strip_unused_co_sched_init(&irgen);
 
 if (!do_emit_ir && target.os == ZAN_OS_WASI &&
     !zan_wasi_capabilities_supported(&irgen))
@@ -742,6 +863,35 @@ else {
     free(mdirs);
   }
 
+  if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
+    char design_root[1024];
+    zan_design_root_for(input_files[0], design_root, sizeof(design_root));
+    static char design_specs[256][1300];
+    int nd = zan_embed_collect_design_html(design_root, design_specs, 256);
+    if (nd < 0) {
+      fprintf(stderr,
+              "warning: more than 256 design html files under '%s/src'; "
+              "some were not auto-embedded\n",
+              design_root);
+      nd = 256;
+    }
+    for (int di = 0; di < nd; di++) {
+      if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
+        embed_specs[embed_spec_count++] = design_specs[di];
+      } else {
+        fprintf(stderr,
+                "warning: cannot auto-embed design html from '%s/src'; "
+                "--embed resources limit reached\n",
+                design_root);
+        break;
+      }
+    }
+    if (nd > 0) {
+      fprintf(stderr, "note: auto-embedded %d design html file(s) from %s/src\n",
+              nd, design_root);
+    }
+  }
+
   if (irgen.uses_embed_api && resolved_stdlib_root[0]) {
     char assets_dir[4200];
     snprintf(assets_dir, sizeof(assets_dir), "%s/assets", user_resource_root);
@@ -839,12 +989,21 @@ else {
   generated_object_vec_add(&generated_objects, obj_tmp);
   for (int si = 1; si < irgen.split_obj_count; si++)
     generated_object_vec_add(&generated_objects, irgen.split_objs[si]);
+  for (int pi = 0; pi < irgen.part_obj_count; pi++) {
+    generated_object_vec_add(&generated_objects, irgen.part_objs[pi]);
+    free(irgen.part_objs[pi]);
+  }
+  free(irgen.part_objs);
+  irgen.part_objs = NULL;
+  irgen.part_obj_count = 0;
   for (int si = 0; si < irgen.split_obj_count; si++)
     free(irgen.split_objs[si]);
   free(irgen.split_objs);
   irgen.split_objs = NULL;
   irgen.split_obj_count = 0;
   phase("write obj");
+  if (g_time_phases)
+    zan_bcache_print_stats();
   probe_phase_mem("write obj");
 
   zan_irgen_release_llvm(&irgen);

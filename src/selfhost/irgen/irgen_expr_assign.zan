@@ -269,6 +269,15 @@ partial class Irgen {
             }
         }
         L("  " + t + " = " + opn + " i64 " + cur.op + ", " + rs);
+        // checked `x op= y` (+ - *): overflow at the place's width throws
+        if (e.chk && (e.op == TK.PlusEq() || e.op == TK.MinusEq() || e.op == TK.StarEq())) {
+            int cw = cur.wbits > 0 ? cur.wbits : IntBits(cur.ty);
+            Node cb = new Node(AK.Binary());
+            cb.op = e.op == TK.PlusEq() ? TK.Plus() : e.op == TK.MinusEq() ? TK.Minus() : TK.Star();
+            cb.ival = 1; cb.line = e.line; cb.col = e.col;
+            ExprVal cr = CheckedArith(cb, cb.op, cur.op, rs, t, cw > 0 ? cw : 64, false, false);
+            if (cr != null) { t = cr.op; }
+        }
         if (e.op == TK.SlashEq() || e.op == TK.PercentEq()) {
             // B-ID181：unsafe（零除/MIN-1）时商归一化为 0——镜像 C 宿主
             // irgen_expr_ops.c 的 divz.res/remz.res select（同 GenBinary）。
@@ -387,12 +396,35 @@ partial class Irgen {
                     }
                 }
             }
+            // `base.P = v`: the base class' own setter (direct dispatch)
+            if (lhs.a.kind == AK.BaseExpr() && curHasThis) {
+                Node bc = BaseClassOf(binder.FindType(curClass));
+                if (bc != null && FieldIndex(bc, lhs.sval) < 0 && FindMethodUp(bc, "set_" + lhs.sval) != null) {
+                    Node bget = FindMethodUp(bc, "get_" + lhs.sval);
+                    Node sty = bget != null && bget.type != null ? bget.type : v.ty;
+                    string breg = AddLocal("__qdotbase" + lhs.line + "_" + lhs.col, sty);
+                    EA(breg, MapType(sty));
+                    L("  store " + MapType(sty) + " " + Coerce(v, MapType(sty)) + ", " + MapType(sty) + "* " + breg);
+                    Node sc = new Node(AK.Call());
+                    sc.line = lhs.line; sc.col = lhs.col;
+                    Node arg = new Node(AK.Ident());
+                    arg.sval = "__qdotbase" + lhs.line + "_" + lhs.col;
+                    sc.Add(arg);
+                    if (EmitBaseCall("set_" + lhs.sval, sc) != null) { return; }
+                }
+            }
             ExprVal obj = GenPlaceReceiver(lhs.a, true);
             string cn = obj.ty.sval;
             Node ocls = binder.FindType(cn);
             if (ocls != null && FieldIndex(ocls, lhs.sval) < 0) {
                 if (EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
                 if (FindStaticField(ocls, lhs.sval) != null) {
+                    // `this.S = v` with S static: the instance reference cannot reach
+                    // a static member (the host's E3009, same as the read path)
+                    if (lhs.a.kind == AK.ThisExpr()) {
+                        diags.Error("[E3009] '" + cn + "' has no member '" + lhs.sval + "'", lhs.line, lhs.col);
+                        return;
+                    }
                     string sown = StaticFieldOwner(ocls, lhs.sval);
                     StoreStaticField(ocls, lhs.sval, v, CurInstFor(sown));
                     return;
@@ -663,6 +695,10 @@ partial class Irgen {
         string t = NT();
         L("  " + t + " = call " + rtm + " @" + sym + "(%" + owner + "* " + thisOp
             + ", " + p0m + " " + CallArg(idx, p0, false) + ")");
+        // the getter hands back an owned (+1) value like any method call: it
+        // is a statement temporary (`source[0] is Node` leaked it --
+        // arc_is_owned_operand)
+        if (rtm == MapType(rty)) { AddTemp(t, rty); }
         return new ExprVal(t, rty);
     }
 
@@ -916,6 +952,7 @@ partial class Irgen {
         Node scls = binder.FindType(sty);
         string reg = "";
         string plt = "";
+        bool ownBind = false;
         if (e.sval != null && e.sval.Length > 0) {
             // the bound variable has the pattern's type: a class pointer, or
             // i8* for `string` (strings are not an LLVM struct type).
@@ -941,7 +978,12 @@ partial class Irgen {
                     locRef[li] = true;
                 } else {
                     reg = AddLocal(e.sval, e.type);
-                    locRef[locName.Count - 1] = true;
+                    // in an if condition the binding OWNS its value (the C
+                    // host's rule; GenIf releases it when the if ends): an
+                    // ordinary armed local, retained below on a match
+                    ownBind = ifCondOwnsPattern && !ShouldBox(e.sval)
+                        && (ArcManaged(e.type) || IsStr(e.type));
+                    locRef[locName.Count - 1] = !ownBind;
                     if (ShouldBox(e.sval)) {
                         reg = BoxLocal(locName.Count - 1);
                     } else {
@@ -1027,6 +1069,7 @@ partial class Irgen {
             string safe = NT();
             L("  " + safe + " = select i1 " + isOk + ", " + plt + " " + bc + ", " + plt + " " + nullLit);
             L("  store " + plt + " " + safe + ", " + plt + "* " + reg);
+            if (ownBind) { EmitArcRetain(safe, e.type); }
         }
         if (e.op == 1) {
             // `x is not T`: negate the test

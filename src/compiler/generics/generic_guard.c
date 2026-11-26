@@ -446,9 +446,8 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
     LLVMValueRef tid = LLVMConstBitCast(get_class_tid_global(g, sym), i8ptr);
     char mbuf[320];
     snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
-    LLVMValueRef st = LLVMBuildBitCast(g->builder, zan_eh_state_ptr(g), i8ptr, "");
     LLVMValueRef args[] = {
-        st,
+        LLVMConstNull(i8ptr), /* helper looks up the EH state */
         vt,
         ex_msg,
         tid,
@@ -505,6 +504,40 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
   }
 
   LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
+/* 已经过 emit_index_safe_bounds 钳位的数组元素地址。下标此时
+ * 必在 [0, len)（越界侧钳为 0），GEP 可标 inbounds nuw：别名分析据此知道
+ * 元素写不会碰到 base-16 处的长度头，长度读可以外提/合并。 */
+LLVMValueRef emit_checked_elem_gep(zan_irgen_t *g, LLVMTypeRef elem_ty, LLVMValueRef base,
+                                   LLVMValueRef idx, const char *name) {
+    if (!g->runtime_checks) return LLVMBuildGEP2(g->builder, elem_ty, base, &idx, 1, name);
+#if ZAN_LLVM_MAJOR >= 19
+    return LLVMBuildGEPWithNoWrapFlags(g->builder, elem_ty, base, &idx, 1, name,
+                                       LLVMGEPFlagInBounds | LLVMGEPFlagNUW);
+#else
+    return LLVMBuildInBoundsGEP2(g->builder, elem_ty, base, &idx, 1, name);
+#endif
+}
+
+/* 不可续跑的检查（分配失败）。软失败模式下旧做法报告后照常
+ * 续跑，紧接着往空指针写头部而 SIGSEGV；而合流又让 LLVM 失去"分配结果
+ * 非空"，此后每次访问该数组都得重查空值、经 soft.base phi 取址。这里失败
+ * 侧照常报告（try 内照常抛出），报告返回后 exit(70) 硬失败，成功侧不再合流。 */
+void emit_runtime_check_noreturn(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc,
+                                 const char *msg) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.fatal");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.ok");
+    LLVMBuildCondBr(g->builder, emit_expect_false(g, is_error), bad_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+    emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0), loc, msg);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 70, 0);
+        zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+        LLVMBuildUnreachable(g->builder);
+    }
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
 /* B-ID163②：擦除体（泛型类/泛型方法的未特化变体，类型实参未定，
@@ -852,6 +885,48 @@ LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
   return phi;
 }
 
+/* Array flavour of emit_soft_base_select: a null array continues on the
+ * scratch's empty array (count 0, zero element bytes; ZAN_SOFT_ARR_BASE_OFF in
+ * zan_abi.h), so its Length is 0 and every index is out of range. The object
+ * scratch cannot serve: its [-16] word carries the object rc, which reads as a
+ * 2^62 array count. */
+LLVMValueRef emit_soft_array_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull) {
+    if (!g->runtime_checks || !g->current_fn) return base;
+    if (LLVMGetTypeKind(LLVMTypeOf(base)) != LLVMPointerTypeKind) return base;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    if (!fn) return base;
+    LLVMBasicBlockRef fast_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.nullarr");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.arrdone");
+    LLVMBuildCondBr(g->builder, isnull, slow_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+    LLVMValueRef off = LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                    (unsigned long long)(long long)ZAN_SOFT_ARR_BASE_OFF, 1);
+    LLVMValueRef arr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                                     emit_soft_scratch_cached(g), &off, 1, "soft.arr");
+    arr = LLVMBuildBitCast(g->builder, arr, LLVMTypeOf(base), "soft.arr.bc");
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, LLVMTypeOf(base), "soft.arrbase");
+    LLVMValueRef vals[2] = {base, arr};
+    LLVMBasicBlockRef bbs[2] = {fast_bb, slow_end};
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
+}
+
+/* Null guard for an array about to be indexed, read or written: try ->
+ * NullReferenceException; outside a try report once and continue on the
+ * empty scratch array (stores then fall out of range and are skipped). */
+LLVMValueRef emit_array_null_guard(zan_irgen_t *g, LLVMValueRef arr, zan_loc_t loc,
+                                   const char *msg) {
+    if (!g->runtime_checks || !g->current_fn || !arr) return arr;
+    if (LLVMGetTypeKind(LLVMTypeOf(arr)) != LLVMPointerTypeKind) return arr;
+    LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr, "arr.null");
+    emit_runtime_check(g, isnull, loc, msg);
+    return emit_soft_array_base_select(g, arr, isnull);
+}
+
 /* Outlined-helper context: the null report reads file/line/col from the
  * helper's parameters instead of baking the call site's constants. */
 typedef struct {
@@ -918,6 +993,10 @@ static LLVMValueRef get_string_len_slow_helper(zan_irgen_t *g, int array_count) 
   return fn;
 }
 
+/* The helper is split in two: a tiny entry (null / header-readable / cached
+ * length probe, ~8 instructions) that LLVM inlines at hot sites, and the
+ * full body (array count, strlen, foreign pointer, null report) kept out of
+ * line. */
 static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     const char *name = array_count ? "__zan_str_len_arr" : "__zan_str_len";
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
@@ -926,7 +1005,6 @@ static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
     LLVMTypeRef fty = LLVMFunctionType(i64, (LLVMTypeRef[]){i8p, i8p, i32t, i32t}, 4, 0);
     fn = LLVMAddFunction(g->mod, name, fty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
@@ -955,16 +1033,16 @@ static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     zan_set_branch_weights(g, br0, 2000, 1);
 
     LLVMPositionBuilderAtEnd(g->builder, probe);
-    LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-        g->builder, i8, payload,
-        &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
-        "hdrp");
     LLVMValueRef word = LLVMBuildLoad2(
-        g->builder, i64, LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "hdrip"),
+        g->builder, i64, zan_hdr_word_ptr(g, g->builder, payload, "hdrp"),
         "hdr");
+    /* 长度在 [-12]（docs/OBJECT_LAYOUT.md），标签在头字高 32 位 */
+    LLVMValueRef cached = LLVMBuildZExt(
+        g->builder,
+        LLVMBuildLoad2(g->builder, i32t,
+                       zan_str_len_ptr(g, g->builder, payload, "lenp"), "len32"),
+        i64, "cached");
     LLVMValueRef is_str = zan_hdr_is_string(g, word, "isstr");
-    LLVMValueRef cached = LLVMBuildAnd(
-        g->builder, word, LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "cached");
     LLVMValueRef measured = zan_icmp(
         g->builder, LLVMIntNE, cached,
         LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "measured");
@@ -1039,7 +1117,7 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
 
   LLVMValueRef hdr_ptr = LLVMBuildGEP2(
       g->builder, i8, payload,
-      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
+      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1)}, 1,
       "strbuf.hdrp");
   LLVMValueRef probe_ok =
       zan_icmp(g->builder, LLVMIntNE, payload,
@@ -1070,9 +1148,11 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
       LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "strbuf.hdrip");
   LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strbuf.hdr");
   LLVMValueRef is_str = zan_hdr_is_string(g, word, "strbuf.isstr");
-  LLVMValueRef cached =
-      LLVMBuildAnd(g->builder, word, LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0),
-                   "strbuf.cached");
+  LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+  LLVMValueRef len_ptr = zan_str_len_ptr(g, g->builder, payload, "strbuf.lenp");
+  LLVMValueRef cached = LLVMBuildZExt(
+      g->builder, LLVMBuildLoad2(g->builder, i32, len_ptr, "strbuf.len32"), i64,
+      "strbuf.cached");
   LLVMValueRef measured =
       zan_icmp(g->builder, LLVMIntNE, cached,
                LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.measured");
@@ -1094,7 +1174,7 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
     LLVMPositionBuilderAtEnd(g->builder, arr_bb);
     LLVMValueRef cnt_ptr = LLVMBuildGEP2(
         g->builder, i8, payload,
-        &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1)}, 1,
+        &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_ARR_COUNT_OFF, 1)}, 1,
         "strbuf.countp");
     count = LLVMBuildLoad2(
         g->builder, i64,
@@ -1159,97 +1239,78 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
   return phi;
 }
 void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
-  if (LLVMGetTypeKind(LLVMTypeOf(payload)) != LLVMPointerTypeKind)
-    return;
-  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-  LLVMTypeRef i64p = LLVMPointerType(i64, 0);
-  LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
-  LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
-  LLVMBasicBlockRef probe_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.probe");
-  LLVMBasicBlockRef clear_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.clear");
-  LLVMBasicBlockRef done_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.done");
-  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-      g->builder, i8, payload,
-      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
-      "strinv.hdrp");
-  LLVMValueRef nonnull =
-      zan_icmp(g->builder, LLVMIntNE, payload,
-               LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
-  LLVMBasicBlockRef chk_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.hdrchk");
-  LLVMBuildCondBr(g->builder, nonnull, chk_bb, done_bb);
-  LLVMPositionBuilderAtEnd(g->builder, chk_bb);
-  LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
-  if (read_ok)
-    LLVMBuildCondBr(g->builder, read_ok, probe_bb, done_bb);
-  else
-    LLVMBuildBr(g->builder, probe_bb);
+    if (LLVMGetTypeKind(LLVMTypeOf(payload)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
+    LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.probe");
+    LLVMBasicBlockRef clear_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.clear");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.done");
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload, &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_HDR_WORD_OFF, 1)},
+        1, "strinv.hdrp");
+    LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
+        LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
+    LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.hdrchk");
+    LLVMBuildCondBr(g->builder, nonnull, chk_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, chk_bb);
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
+    if (read_ok) LLVMBuildCondBr(g->builder, read_ok, probe_bb, done_bb);
+    else LLVMBuildBr(g->builder, probe_bb);
 
-  LLVMPositionBuilderAtEnd(g->builder, probe_bb);
-  LLVMValueRef hdr_iptr =
-      LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "strinv.hdrip");
-  LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strinv.hdr");
-  LLVMValueRef stale = zan_and(
-      g->builder, zan_hdr_is_string(g, word, "strinv.isstr"),
-      zan_icmp(g->builder, LLVMIntNE,
-               LLVMBuildAnd(g->builder, word,
-                            LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0),
-                            "strinv.cached"),
-               LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strinv.measured"),
-      "strinv.stale");
-  LLVMBuildCondBr(g->builder, stale, clear_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, probe_bb);
+    LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
+                                             "strinv.hdrip");
+    LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strinv.hdr");
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef len_ptr = zan_str_len_ptr(g, g->builder, payload, "strinv.lenp");
+    LLVMValueRef stale = zan_and(
+        g->builder, zan_hdr_is_string(g, word, "strinv.isstr"),
+        zan_icmp(g->builder, LLVMIntNE, LLVMBuildLoad2(g->builder, i32, len_ptr, "strinv.cached"),
+                 LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0), "strinv.measured"),
+        "strinv.stale");
+    LLVMBuildCondBr(g->builder, stale, clear_bb, done_bb);
 
-  LLVMPositionBuilderAtEnd(g->builder, clear_bb);
-  LLVMValueRef rc_ptr = LLVMBuildGEP2(
-      g->builder, i8, payload,
-      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1)}, 1,
-      "strinv.rcp");
-  LLVMValueRef rc = LLVMBuildLoad2(
-      g->builder, i64,
-      LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strinv.rcip"), "strinv.rc");
-  LLVMBasicBlockRef store_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.store");
-  LLVMBuildCondBr(g->builder,
-                  zan_icmp(g->builder, LLVMIntNE, rc,
-                           LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-                           "strinv.writable"),
-                  store_bb, done_bb);
-  LLVMPositionBuilderAtEnd(g->builder, store_bb);
-  LLVMBuildStore(g->builder,
-                 LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
-                 hdr_iptr);
-  LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, clear_bb);
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, rc_ty,
+        zan_rc_ptr(g, g->builder, payload, "strinv.rcp"), "strinv.rc");
+    LLVMBasicBlockRef store_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.store");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, rc,
+                 LLVMConstInt(rc_ty, ZAN_RC_IMMORTAL, 0),
+                 "strinv.writable"),
+        store_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, store_bb);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0), len_ptr);
+    LLVMBuildBr(g->builder, done_bb);
 
   LLVMPositionBuilderAtEnd(g->builder, done_bb);
 }
 void emit_string_len_set(zan_irgen_t *g, LLVMValueRef payload,
-                         LLVMValueRef len) {
-  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-  LLVMTypeRef i64p = LLVMPointerType(i64, 0);
-  LLVMValueRef fits = zan_and(
-      g->builder,
-      zan_icmp(g->builder, LLVMIntULE, len,
-               LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strset.fits32"),
-      zan_icmp(g->builder, LLVMIntNE, len,
-               LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.notunk"),
-      "strset.ok");
-  LLVMValueRef half =
-      LLVMBuildSelect(g->builder, fits, len,
-                      LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.half");
-  LLVMValueRef word =
-      LLVMBuildOr(g->builder, LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0), half,
-                  "strset.hdr");
-  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-      g->builder, i8, payload,
-      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
-      "strset.hdrp");
-  LLVMBuildStore(g->builder, word,
-                 LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "strset.hdrip"));
+                                LLVMValueRef len) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
+    LLVMValueRef fits = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntULE, len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strset.fits32"),
+        zan_icmp(g->builder, LLVMIntNE, len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.notunk"),
+        "strset.ok");
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef half = LLVMBuildSelect(g->builder, fits, len,
+        LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.half");
+    /* 长度在 [-12]；同时补写 [-4] 的 ZANS 标签（不碰 [-8] 的 rc） */
+    LLVMBuildStore(g->builder, LLVMBuildTrunc(g->builder, half, i32, "strset.len32"),
+                   zan_str_len_ptr(g, g->builder, payload, "strset.lenp"));
+    LLVMValueRef tag_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload, &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_TW_OFF, 1)}, 1,
+        "strset.tagp");
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, ZAN_STRING_TAG, 0), tag_ptr);
+    (void)i64p;
 }
 bool sym_declares_extern(zan_symbol_t *sym) {
   if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL)

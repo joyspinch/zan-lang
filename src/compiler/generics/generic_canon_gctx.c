@@ -780,9 +780,9 @@ static LLVMValueRef materialize_gctx_slot_val(zan_irgen_t *g,
     } else if (s->sym) {
       site = reserve_arc_site(g, s->sym, cty, 0, NULL);
     }
-    if (site < 0 || !g->desc_hdr || !g->desc_gv || !g->desc_gv[site])
+    if (site < 0)
       return LLVMConstNull(i8ptr);
-    return LLVMConstBitCast(g->desc_gv[site], i8ptr);
+    return LLVMConstIntToPtr(arc_site_arg(g, site), i8ptr);
   }
   case GCTX_SLOT_CHILD_GCTX: {
     zan_type_t **c_bind = NULL;

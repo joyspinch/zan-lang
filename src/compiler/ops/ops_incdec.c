@@ -116,9 +116,9 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         prop_recv_type = local->type;
                         prop_recv = struct_base_ptr(g, local, st);
                     } else {
-                    LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
-                    slot_ptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
-                    slot_ty = fsym && fsym->type ? map_type(g, fsym->type) : i64;
+                        LLVMValueRef struct_ptr = struct_recv_ptr_guarded(g, local, st, obj_expr);
+                        slot_ptr = emit_field_ptr(g, local->type->sym, st, struct_ptr, fi, "fld");
+                        slot_ty = fsym && fsym->type ? map_type(g, fsym->type) : i64;
                     }
                 }
             }
@@ -153,6 +153,9 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef elem_llvm = at->element_type
                 ? map_type(g, at->element_type) : i64;
             LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
+            arr_ptr =
+                emit_array_null_guard(g, arr_ptr, operand->loc,
+                                      "null reference where an array is required (element store)");
             if (at->array_rank > 1) {
                 slot_ptr = emit_mdarray_elem_ptr(g, arr_ptr, operand,
                                                   elem_llvm, locals, &slot_oob);
@@ -166,7 +169,7 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstInt(LLVMTypeOf(idx), 0, 0), idx, "safeidx.ok");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
-                slot_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                slot_ptr = emit_checked_elem_gep(g, elem_llvm, typed_arr, idx, "eidx");
             }
             slot_ty = elem_llvm;
         } else if (at && at->kind == TYPE_STRING) {

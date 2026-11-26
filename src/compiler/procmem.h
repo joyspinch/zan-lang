@@ -11,6 +11,9 @@
 #include <string.h>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <psapi.h>
 #elif defined(__APPLE__)

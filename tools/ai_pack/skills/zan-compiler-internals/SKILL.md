@@ -499,23 +499,21 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      份代码 10 次编译崩 1 次）。
    - 边界：任何"先记下元素指针、递归之后再解引用"的写法都要复查；**间歇性**
      崩溃（同样输入时好时坏）优先怀疑缓存/表条目的生命周期，而不是随机性。
-23. **类布局的 vptr 槽必须整条继承链统一**：
-   - 动作：`class_vptr_offset`（`src/compiler/irgen.c`）对**所有类**一律返回
-     1（0 号槽留指针位），结构体返回 0，显式布局类型自己给偏移也不留；
-     虚表仍然只在"本类或祖先多态"时才发（`class_has_virtual_methods`），
-     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen/irgen.zan` 的
-     `FieldBase` 与 `EmitStruct` 同样按"类一律留槽"改。
-   - 理由：vptr 槽以前只在多态类里留，于是 `Base`（无接口无虚方法）与
-     `Derived : Base, IFace`（实现了接口）给**同一个字段**两套下标
-     （0 vs 1）：基类构造器把字段写进了派生对象的 vptr 槽，派生类读到的
-     却是垃圾（实测 `d.count=-724564432`），ARC 释放也漏掉基类那份字段
-     （泄漏报告指向基类的 `new`）。派生类一继承基类就坏。
-   - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），
-     结构体类型注册（`register_struct_type`）、调试信息、ARC 释放函数
-     （`irgen_arc.c`）、反射（`irgen_reflect.c`）都必须跟着它走；漏一处
-     就又是一处错位。判定器：`tests/conformance/inherit_interface_layout.zan`
-     （基类字段在派生实例上的读写 + 基类方法 + 接口分派），泄漏档与
-     arcguard 档同源覆盖。
+23. **类布局的 vptr 槽必须整条继承**树**统一**（2026-11-25 起按树条件化）：
+   - 动作：`class_vptr_offset`（`src/compiler/irgen/irgen_type_map.c`）对"树根（最上层
+     非 object 祖先）的所有后代里有任一多态类（虚/抽象/覆写方法或接口）"的类返回 1，
+     否则 0；结构体与显式布局类型返回 0。计划由 `class_vptr_plan_compute` 在
+     `zan_irgen_emit` 注册任何类布局之前扫全部类型声明算出，计划外的类按旧口径留槽；
+     `ZAN_VPTR_ALWAYS=1` 退回一律留槽（二分用）。自举后端有自己的布局（`FieldBase`
+     一律留槽），与 C 宿主无须一致。
+   - 理由：曾按"本类或祖先多态"逐类决定，`Base`（无多态）与 `Derived : Base, IFace`
+     给同一字段两套下标（0 vs 1），派生类一继承就坏；后来一律留槽，又让 binary-trees
+     这类无多态节点白占 8 字节（槽恒 null）。按整棵树决定两头都对：同树同答案。
+   - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），类型注册、
+     调试信息、ARC 释放、反射、字段走图都跟着它走。按首字比对身份的分派（接口分派、
+     object.ToString 候选链）只在有 vptr 的对象上命中，无 vptr 对象首字是字段值，
+     走兜底。判定器：`tests/conformance/inherit_interface_layout.zan`、
+     `tests/conformance/object_header_compact.zan`。
 24. **泛型类的每个实例化必须有自己的 vtable**：
    - 动作：泛型类不能只发一张共享 vtable。`get_vtable_global_inst`
      （`src/compiler/irgen_arc.c`）按实例实参生成 `__zan_vtable_<Class>$<token>`，
@@ -687,13 +685,41 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `emit_release_owned_call_temp` 内部识别并安全跳过）。
    - 判定器：`tests/conformance/arc_assign_call_temp_receiver.zan`。
 
+35. **软失败守卫的快路径要靠"版本化"而不是少查——合流点是性能杀手**：
+   - 动作：try 外的守卫失败侧报告后合流回快路径（`phi(x, scratch)`、`safeidx`），
+     合流之后 LLVM 不再知道 x 非空/下标在界，于是每次访问重查、经 phi 取址、
+     不能 CSE/外提，夹在 retain 与 release 之间的守卫 invoke 还让 ARC 对消不掉
+     （nbody 带检查 1.9s vs 去检查 0.9s）。别改语义去"只报第一个站点"，用
+     `guard_version.cpp`（optimizer-early 扩展点，拆分管线里在两半之间）：
+     ①整环版本化——循环克隆一份先跑，克隆里每个守卫的失败侧保留自己的报告块，
+     报告块的后继改接原循环（原循环从那一站接着全检查地跑完），快环无调用无合流；
+     ②循环不变守卫在预头部 unswitch；③大环退回"守卫支配区域"克隆。慢世界的分支
+     打 `zan.guard.done` 不再版本化（k 个变量 k+1 份，不是 2^k）。
+   - 配套前端卫生（都影响快路径）：分配失败用 `emit_runtime_check_noreturn`
+     （报告后 exit 70，旧做法续跑后往空头写而 SIGSEGV，且让"新数组非空"丢失）；
+     已钳位下标用 `emit_checked_elem_gep`（inbounds nuw，元素写不再别名长度头）；
+     数组长度读打 `zan.arraylen` TBAA + `!range [0,2^63)`（软失败暂存读作 2^62，
+     仍在范围内）；`emit_index_safe_bounds` 自己就报告，前面别再叠
+     `emit_index_bounds_check`（同站点双报、双分支）。
+   - 坑：交叉边若直接接到原报告块，它有多个前驱，late ARC 2b（把 retain 挪到
+     冷边）找不到单前驱的落脚块，b 的 retain/release 照留——所以交叉点放在
+     **报告块之后**。区域上限 400 条指令：1500 时 zandoc text +14%。
+   - 实测（user 秒，带检查 / --no-runtime-checks）：nbody 1.9→~0.5 / 0.4，
+     fannkuch 2.3→1.75 / 1.75，sort 0.36→0.30 / 0.28。剩余 nbody 差距是外层
+     `Body a` 的 retain/release：内层快环有出口到慢环，late ARC 跨循环对消
+     要求"全路径到 release"，需要它学会在侧出口补 retain。
+   - 判定器：`tests/conformance/guard_version_loops.zan`（-O0 与 -O2 stdout/
+     stderr 逐字节相同）；`ZAN_NO_GUARD_VERSION=1` A/B，
+     `ZAN_GUARD_VERSION_STATS=1/2` 看版本化了哪些环。
+
 ---
 
 ## 三、运行时数据布局与内存所有权（Runtime / ARC）
 
-27. **Dict 内建内存布局与保序约束**：
-   - 动作：Dict 的 keys/values 并行缓冲区必须严格保持插入顺序；元素删除（Remove）使用 memmove 整体向前搬移并置 `indexed_count = 0` 使索引表整体失效。
-   - 理由：枚举顺序与析构顺序依赖插入序；防止增量哈希索引修复引发探测链死循环。
+27. **Dict 内建内存布局、保序约束与整数键自适应哈希**：
+   - 动作：Dict 的 keys/values 并行缓冲区必须严格保持插入顺序；Remove 整体前移条目并就地修索引（墓碑 + 下标减一），墓碑到负载上限才整表重建。索引 = `ctrl[cap+16] | slots[cap] | tomb | plim`（`builtin_dict.c`）。整数类键（`ZAN_DICT_KEY_INT`）的索引先用**恒等定位**（h1 = 键），`plim` 记任一插入的最大探测组序号，查找探过 `plim` 组即判缺失；某次插入超过 `ZAN_DICT_IDENT_MAX_PROBE` 组就整表改用种子哈希重建（`plim = ZAN_DICT_PLIM_SEEDED`，扩容继承）。哈希种类永远以索引的 `plim` 为准，调用点传的种类只定新索引起始模式；`__zan_dict_key_eq` 只认种类 1 为字符串。
+   - 理由：枚举顺序与析构顺序依赖插入序。种子哈希把顺序整数键打散成随机访存，`Dict<int,int>` 200 万键 + 1000 万查找比 `std::unordered_map`（恒等哈希、顺序流式访存）慢 4–6×——恒等实验证明表结构本身只差 1.3×，差距全在定位策略。纯恒等在 2 的幂表上会被步长 2^k / 打包键打成长链、缺失查找扫整段稠密跑道，所以必须带 plim 截断 + 探测超限回退，HashDoS 下每次操作代价仍有常数上界（`case_dict_int_identity_fallback`）。
+   - 边界：`d[k] = v` 只调一次 `__zan_dict_set`（命中返回下标、追加返回 ~下标），不要在外面再 find 判命中；显式 `out` 的 TryGetValue 未命中写 default，裸标识符旧写法未命中保留原值（`case_tryget_pinyin`）。
 28. **FFI 外部指针借用与内建所有权白名单**：
    - 动作：从 `DllImport` 外部返回的字符串是借用指针，运行时不释放、不下标；内建 API 若返回借用或托管字符串必须显式在借用白名单中登记。
    - 理由：防止跨 FFI 边界的野指针析构或托管堆内存泄漏。
@@ -728,10 +754,11 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      （`llvm_scalar_size` 为 0）必须报错拒绝，而不是悄悄退化成 1 字。
 36. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
    - 动作：字符串字面量等编译期常量不是堆对象，它们的引用计数用哨兵值
-     `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写"对象前 16 字节计数头"
-     （`ZAN_OBJ_RC_OFF = -16`）的 ARC 路径——通用 retain / 通用 release、字符串
-     retain、动态释放——都必须**先判哨兵再动计数**。静态对象在只读段，对它做
-     原子加一/减一就是访问冲突。
+     `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写计数头
+     （2026-11-25 起：`ZAN_RC_OFF = -8` 的 **u32**，immortal = `ZAN_RC_IMMORTAL`
+     0xffffffff；静态串前缀是 `ZAN_STR_LIT_W0/W1`）的 ARC
+     路径——通用 retain / 通用 release、字符串 retain、动态释放——都必须
+     **先判哨兵再动计数**。静态对象在只读段，对它做原子加一/减一就是访问冲突。
    - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
      retain/release 漏了；而"字面量存进 `object` 槽"走的正是通用 retain
      （槽的静态类型是 object 不是 string），于是对只读段做原子加一 → 0xC0000005。
@@ -742,6 +769,87 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      计数头）。崩溃现场在 `<exe_dir>/zan_crash.log`（含 fault/rip/rax/raw stack），
      先读它再决定要不要上调试器；最小探针二分（`object o = "字面量"` vs
      `string s = "字面量"`）通常一步就切到根因。
+
+**ARC 头：对象头 8 字节、RC 是 [p-8] 的 u32，字符串头 12 字节——绝不碰串的 [p-16]**（实证，2026-11-25，设计 `docs/OBJECT_LAYOUT.md`）：
+- 布局（`src/common/zan_abi.h`）：对象 `[-8]` u32 rc | `[-4]` u32 tw（bit31 栈提升、
+  bit30 对象标记、bit29 前垫 8 字节、低 29 位站点号）；字符串 `[-12]` u32 len |
+  `[-8]` u32 rc | `[-4]` "ZANS"。[-8] 的 u64 头字：对象 `(tw<<32)|rc`、串
+  `(ZANS<<32)|rc`，"高 32 位 == ZANS 即串""头字 < 0 即栈对象"照旧。数组不变。
+- 描述符不再在头里：默认模式 `zan_hdr_desc` 按站点号查 `__zan_desc_tbl`（收尾定型，
+  须早于 `refl_compact_member_tables`，否则只经表引用的反射记录被当死记录清零——
+  GetType().Name 变空）；C 运行时经 `zan_rt_register_desc_table` 查。读头字取站点号
+  一律用 `zan_hdr_site` / `ZAN_HDR_SITE` 且先看对象标记（数组头字里可能是描述符指针）。
+- 对齐 16 的类（decimal/i128/SIMD 字段）：站点实参带 `ZAN_OBJ_TW_PAD16`，块前垫 8 字节
+  让 p 16 对齐，`__zan_arc_free` 按这一位传 p-16；漏了它 decimal 字段落在 8 mod 16 上。
+- 串长度读写走 `zan_str_len_ptr`（[-12] 的 u32），`emit_string_len_set` 只写 [-12] 与
+  [-4] 标签、不碰 rc；旧式整写 `[-8] = ZANS<<32|len` 会把 rc 改成长度。
+- 收益：两指针节点 40 → 24 字节，binary-trees 43 → 28 MB（C 18 MB）。
+- 链了 rt_mem（`g->str_pages`，Apple/ELF/Windows 原生且非 `--emit-lib`）时串经
+  `zan_mem_str_malloc` 进 8 字节粒度"串页"：块真起点在 4 mod 8，交出的是虚基址
+  V = 用户指针 - 16（释放照旧传 p-16）。**V[0..3] 是相邻串的尾巴**：任何对串写
+  `[-16]`（旧式 `store i64 1` 初始化 rc、i64 原子加减）都会悄悄改坏邻居的最后
+  4 字节——表现为别的串尾字符变了，不崩。新增串分配/RC 路径一律用 `zan_rc_ptr`
+  （i32），C 侧用 `ZAN_RC_PTR`/`ZAN_RC_LOAD`。
+- 收益：`"item"+i` 一千万个串 392 MiB → 315 MiB（每串 32 → 24 字节）。钉子用例
+  `tests/conformance/string_header_pages.zan`。
+- 自举后端自有串/对象 ABI（串头 32 字节、对象 rc i64 在 -16、delegate 钩子强覆盖），
+  不受影响；改 C 运行时读写 RC 的代码时别把它当成同一 ABI。
+- rt_mem 分配器性能坑：空闲链空时曾每次都进慢路径做 8 次远端条带原子交换
+  （全新分配为主的程序每次分配白付）；现快路径先切当前页、慢路径先读后换。
+  `zan_mem_cache_get` 拆成内联 TLS 快路径 + noinline 慢路径——它被多处内联
+  后编译器会把整函数外提，分配热路径多一次调用。
+
+**串助手一律以串头长度为界，新串必须记长度**（实证，2026-11-25）：
+strops（Split/IndexOf/Replace）0.13 → 0.07 s（C++ 0.07），numfmt 0.08 → 0.05 s。病根：
+- 产串助手（`__zan_list_push_strn` 即 Split 的每段、Replace、Trim、ToUpper/ToLower）
+  只补 `\0` 不调 `emit_string_len_set`：头里是"未测量"，此后每个 `.Length` /
+  `IndexOf` 都 strlen 一遍再盖戳。新增任何产串路径：分配 → 拷贝 → `\0` →
+  **`emit_string_len_set`**，缺一步就是隐性 O(n)。
+- Split/Replace 曾走 strlen + strstr，单字符实参（`Split(',')`）先物化成堆上 1 字节串。
+  现在 `builtin_str_scan.c`：调用点用 `emit_string_length` 取长度传进助手，查找走
+  `__zan_mem_find`（`__zan_memchr` 首字节 + memcmp 余下，支持串内 `\0`、无需 memmem），
+  `__zan_memchr` 跨度 < 32 字节逐字节扫（libc memchr 调用 + SIMD 起步在短字段上更贵）。
+  字符**字面量**实参在 `emit_string_like_arg` 直接取不朽串字面量（owned=2，不释放）。
+- `.Length` 的 `__zan_str_len_arr` 拆成小入口（空/页首/缓存命中）+ noinline `.slow`，
+  LLVM 才会把命中路径内联——整块助手太大，热循环里每次 `.Length` 一次调用。
+- `int.Parse`/`Convert.ToInt*` 的 strtoll 走 locale（numfmt 45% 采样）：`__zan_strtoll10`
+  吃掉"可选 '-' + ≤18 位"，其余（空白、'+'、≥19 位、非数字）原样交 strtoll，endp/errno 契约不变。
+- `zan_rt_str_release` 曾无条件对 `__zan_live` 原子减（加一只在 `--check-leaks`）；
+  rt_mem `free` 的块边界校验 `off % sz` 是一条 udiv（改 Lemire 整除判定表
+  `k_class_divm`），`zan_mem_fatal_block` 内联进 free 带来栈保护帧（改 noinline cold）。
+- 钉子用例 `tests/conformance/string_scan_fastpaths.zan`（多字节/重叠分隔符、UTF-8 字符
+  分隔符、短/长区间两条扫描路、等长/变长替换、解析快慢路径边界）。
+
+**分配密集代码的四道税：S-UNWIND 最小不动点、实参后于分配、构造体旧值读、48 字节类**（实证，2026-11-24）：
+binary-trees（`new Node(Make(d-1), Make(d-1))`）1.86 s → 0.9 s（C malloc/free 1.1 s），
+53 → 45 MiB。逐层病根：
+- **收缩 pass 取了最小不动点**：被调者全部已证 nothrow 才记 nothrow，递归函数
+  （Make 调 Make）永远停在 UNKNOWN，invoke、landing pad 与 EH 临时栈簿记全保留。
+  改为最大不动点（先记 nothrow，只沿调用边传播"可抛"）。同时三处假"可抛"源：
+  `mrs` 内联汇编（读 TSD）被当成未知间接调用；`pthread_*`/`getenv` 不在 native 名表；
+  释放链（`zan_rt_release(_dyn)`、类/集合/数组释放、`__zan_arc_free`、经描述符/闭包
+  头的析构间接调用）没标 nounwind——析构器被 E1016 拒收，释放链不跑用户代码，
+  现由 `zan_mark_nounwind` 统一挂属性，证得 nothrow 的函数也挂 nounwind。
+- **`new T(args)` 曾先分配再求实参**：新对象要进 EH 临时栈，实参调用又"看得见"它，
+  内联构造体 `this.l = a` 的 `old = load` 折不成 null，`release_dyn(old)` 卡住
+  retain(a)/release(临时量) 配对。现实参先求值（C# 同序；`emit_new_storage`），
+  分配点索引仍在原位置预留（`emit_new_site`，站点编号不漂）。
+- **GVN 折不掉新对象字段旧值**：活对象注册表调用与返回值捕获了指针，AA 认为任何
+  调用都可能写它。晚期 ARC 收尾补了块内精确折叠 `late_fold_fresh_loads`（只跨
+  不重叠的同对象 store、对分配前已存在值的 retain、不写内存的指令）。同处：
+  `late_drop_tmp_pairs` 迭代到不动点（嵌套临时量一趟只配最内层）；nounwind 且无
+  invoke/landingpad/tmp_unwind 的函数整体删 push/pop（`late_drop_dead_tmp`，跨块）；
+  窗口允许"存 x 本身"（所有权转移）；`retain/release(null)` 直接删。
+- **对象 40 字节进 48 字节类**：rt_mem 加 8 字节粒度"对象页"类（24..120 的奇数倍 8），
+  只经 `zan_mem_obj_malloc`（`g->str_pages` 时 zan_rt_alloc 调它）。判据靠 LLVM 不变式：
+  对齐 16 的类型尺寸必是 16 的倍数，`n % 16 == 8` 的对象天然只要 8 对齐。
+- 内存地板（2026-11-25 已降）：8 字节头（u32 rc + u32 站点号）+ 仅多态树才有的 vptr 槽
+  + 载荷，两指针节点 24 字节 vs C 16 字节（见上文"ARC 头"条）。
+- 顺带修了 `zan_rt_defer_push` IR 弱回退把 (fn, obj) 调反成 obj(fn) 的潜伏崩溃。
+- 钉子用例 `tests/conformance/arc_new_args_first.zan`（实参/构造体抛异常的释放）、
+  `tests/runtime/rt_mem_apple_zone_test.c`（对象页）。排查手法：`ZAN_DUMP_LATE_ARC_IR`
+  看晚期收尾前的 IR，`ZAN_LATE_ARC_STATS=1` 看配对数；分配器本身的份额用
+  "C 版基准改链 zanrt_mem.o"单独量（0.68 s，比 libc 快一倍——瓶颈不在分配器）。
 
 **弱字段存储不接管所有权——右值是 +1 临时时存储后必须释放**（实证，2026-11-02）：
 `emit_rc_store_field` 的 weak 路径经 `emit_weak_store` 落槽后，若右值属于 owned
@@ -825,14 +933,26 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      真实返回类型（`List<AiMessage>`），不是 `Task`——类型上看不出来，只能
      看方法原型上的 `MOD_ASYNC`。同理接口方法、类名静态接收者也都推不出来，
      必须各自走一条路。
-   - **运行时新增全局符号，必须过全部链接形态门**：rt_mem.o 只在原生 exe
-     与跨端 linux exe 链入——Windows DLL（ld.exe -shared）、macOS dylib
+   - **运行时新增全局符号，必须过全部链接形态门**：rt_mem.o 只在原生 exe、
+     跨端 linux exe 与 Apple（本机/交叉 bundle 有 zanrt_mem.o 时，发射期
+     改名 zan_mem_*）链入——Windows DLL（ld.exe -shared）、macOS dylib
      （ld64.lld）、Android 静态链（bionic 上 --wrap=malloc 崩，刻意不链
      mem）、selfhost zanrt_sh 束都拿不到它。B-ID78 把 defer 队列落进
      rt_mem.c 后这些形态全部断链（ELF .so 靠默认容忍未定义符号**静音带
      病**，dlopen 才炸——比响的更危险）。修法沿 zan_io_pump 先例：
      irgen 对已建声明补 WeakAnyLinkage + 函数体（emit_defer_fallback），
      链入强定义覆盖、未链入退化 fail-open。
+   - **Apple 体积与"静默弱桩"**：ld64 按整对象链入，Mach-O 只有
+     `-dead_strip` 才按符号剥（本机/交叉 Apple 现一律带；hello 176→58 KB）。
+     但 main 无条件调用的运行时入口会把整个子系统钉住、dead-strip 救不了
+     ——`zan_co_sched_init` 曾让每个 exe 带全套 M:N 调度器（~20 KB 代码）。
+     这类"启动即调"的入口要在**优化后**按模块引用面裁掉
+     （`zan_strip_unused_co_sched_init`；优化前死 stdlib 函数还挂着引用，
+     判不准），回归由 `size_budget_dev_macos` 的 FORBID_SYMBOLS 守。
+     反面：rt_timer.o 的 `zan_mem_slabs/trim` 是恒 0 弱桩，分配器对象没链上
+     时程序照跑、只是 GC 统计悄悄失真——只查"不崩、非负"的用例
+     （gc_trim_memory）看不出，必须断言强实现的可观察效果
+     （`case_gc_fast_alloc_linked`）。验证落点用 `nm`/`ld -why_live`。
    - **LLVMAddFunction 不查重名**：先建同名函数，后建者不会返回已有的，
      而是并存，发射时被 mangler 加 `.N` 后缀（如 `zan_rt_defer_push.5`）
      ——调用指空、链接 undefined reference。要给"延迟建的声明"补体/改
@@ -841,6 +961,23 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      保存恢复 builder 位置，否则后续 Br 插进别的函数。
 
 ---
+
+**新增编译器 .c 文件要同时进 zan-lsp 的源文件表**（实证，2026-11-24）：
+`zan-lsp` 内嵌同一套前端（lexer/parser/binder/checker/diag），但在 CMakeLists 里
+是**另一份**源文件表。前端新调用了新文件里的函数，只加进 `zanc` 的表，`zanc` 照常
+通过而 `zan-lsp` 链接失败（Undefined symbols），失败的链接还会删掉旧的
+`build/zan-lsp`。改前端后验证要 `cmake --build build --target zanc zan-lsp`，
+LSP 用例必须用**新编**的 zan-lsp 跑——旧产物照样"通过"，什么也证明不了。
+
+**普通构建也是 closed-world 反射：只经 Invoke 按名调用的方法须显式保留**（实证，2026-11-25）：
+非 `-g` 的普通构建与 `--publish` 同口径裁剪反射桩（`emit_target.c` 的 `closed_world`），
+静态上没人调用、只在标记里 `@click="HitMe"` 按名出现的方法，桩被裁掉后 `HasMethod`
+仍为真（对账通过），`Invoke` 却静默什么也不做——症状是"点了没反应"、不报错。
+`On<大写>` 名字被 `refl_is_framework_hook_name` 兜住，所以多数窗体看不出来。
+设计稿处理器名由 `zan_embed_collect_html_handlers_ex` 收集（工程 `src/` 递归 + 普通构建
+另扫显式输入所在目录本层，对齐运行期 `HtmlDocs.Find` 的查找面）；新增"只按名调用"的
+入口时同样要进这张保留表。探针写法注意：探针里顺手写一句 `obj.Invoke("名字")` 会
+让该名字静态可见、问题消失——复现要去掉一切同名字面量。
 
 ## 五、内建类型成员表与代码生成的一致性契约
 
@@ -893,6 +1030,11 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      有没有对外服务的义务"，而不是"它原来有没有 public 关键字"。搬迁后的兼容面
      只转发**纯函数**（无表、无共享状态），规格表与算法留在新包、用**全限定名**
      可达——全限定名不撞名，同时导入两个命名空间时裸名才会歧义。
+     第二轮同类事故（cf7e2571e，Zan.Net 47 文件规范化）：`HttpClient.BuildRequestHead`/
+     `BuildDownloadRequest`/`HasHeaderName` 与 `TlsStream.engine` 被收窄，4 条以上
+     conformance 编译失败。自足的报文构建器恢复 public；**可变字段**不恢复成 public 字段，
+     改给只读属性（`TlsStream.Engine { get }`）、用例跟着改名——外部要的是"看握手结果"，
+     不是"换掉引擎"。
 
 49. **只查不声明 = 静默跳过**：
    - 动作：编译器要调用**外部符号**（libc / Win32 API）时，必须用

@@ -160,27 +160,62 @@ _Static_assert(sizeof(zan_mem_slab_meta) <= ZAN_MEM_PAGE,
 
 static uintptr_t g_mem_secret;
 
-static const uint16_t k_class_size[] = {
-    16,  32,  48,  64,  80,  96,  112, 128,  160,  192,  224,  256,
-    320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048};
+/* 前 24 类是通用类（16 对齐）；其后是字符串专用的"串页"类（2026-11-24）：
+ * 8 字节粒度 24..128。Zan 串头 12 字节（[-12] u32 len、[-8] 头字），为让
+ * [-8] 头字 8 字节对齐，串块排在页内 4 mod 8 处：第 i 块真起点
+ * page + 4 + S*i，对外交出（也收回）的是"虚基址" V = page + S*i = 真起点 - 4
+ * （= 用户指针 - 16，编译器的 free 一向传它）。V 处 4 字节属于前一块的
+ * 尾巴，分配器自己的空闲链/ cookie 字放在 V+8 / V+16（都在本块内、8 对齐）。
+ * "item1234567"：12 + 12 = 24 字节一块（通用类得 32）。 */
+/* 通用类之后、串页类之前是"对象页"类（2026-11-24）：16 字节粒度之间的
+ * 奇数倍 8（24..120），只经 zan_mem_obj_malloc 取用——编译器的 zan_rt_alloc
+ * 给 Zan 对象/闭包/装箱分配时调它。块 8 字节对齐（页首 + 40*i），比 malloc
+ * 契约的 16 弱，所以绝不进 g_size_class（通用 malloc 永远拿不到）。两指针
+ * 字段的无多态类：8 字节头 + 2 字段 = 24 字节一块（docs/OBJECT_LAYOUT.md）。 */
+#define ZAN_MEM_CLASS_SIZES(X)                                                 \
+  X(16)                                                                        \
+  X(32) X(48) X(64) X(80) X(96) X(112) X(128) X(160) X(192) X(224) X(256)     \
+      X(320) X(384) X(448) X(512) X(640) X(768) X(896) X(1024) X(1280)        \
+          X(1536) X(1792) X(2048) X(24) X(40) X(56) X(72) X(88) X(104) X(120) \
+              X(24) X(32) X(40) X(48) X(56) X(64) X(72) X(80) X(88) X(96)     \
+                  X(104) X(112) X(120) X(128)
+#define ZAN_MEM_SZ_ELEM(n) n,
+#define ZAN_MEM_DIVM_ELEM(n) (UINT64_MAX / (uint64_t)(n) + 1u),
+static const uint16_t k_class_size[] = {ZAN_MEM_CLASS_SIZES(ZAN_MEM_SZ_ELEM)};
+/* free 校验"页内偏移是块尺寸整数倍"用 Lemire 整除判定（off * M <= M - 1，
+ * M = ceil(2^64 / sz)，对任意 32 位 off 精确）：曾是一条 udiv，每次释放
+ * 都付 ~10 周期的除法延迟。 */
+static const uint64_t k_class_divm[] = {ZAN_MEM_CLASS_SIZES(ZAN_MEM_DIVM_ELEM)};
 #define ZAN_MEM_NCLASS ((int)(sizeof(k_class_size) / sizeof(k_class_size[0])))
+#define ZAN_MEM_OBJ_CLS0 24 /* 第一个对象页类（24 字节）的下标 */
+#define ZAN_MEM_OBJ_MAX 120u
+#define ZAN_MEM_STR_CLS0 31 /* 第一个串页类（24 字节）的下标 */
+#define ZAN_MEM_STR_MIN 24u
+#define ZAN_MEM_STR_MAX 128u
+#define ZAN_MEM_STR_SKEW 4u /* 串块真起点 = V + 4 */
 
-/* 定点数倒数表：d = k_class_size[cls] >> 4 (1..128)，q = off >> 4 (0..1023)，
- * m = ceil(65536 / d)。由于 q / 65536 < 1/64 且 m*d < 65536 + d，
- * ((q * m) >> 16) * d == q 对 [0, 16384) 内所有页偏移精确等价于 off % sz == 0，
- * 用单次乘法+移位替代 64 位整数除法 DIV。 */
-#define ZAN_CLASS_INV(sz) (((1u << 16) + ((sz) >> 4) - 1u) / ((sz) >> 4))
-static const uint32_t k_class_inv[] = {
-    ZAN_CLASS_INV(16),   ZAN_CLASS_INV(32),   ZAN_CLASS_INV(48),
-    ZAN_CLASS_INV(64),   ZAN_CLASS_INV(80),   ZAN_CLASS_INV(96),
-    ZAN_CLASS_INV(112),  ZAN_CLASS_INV(128),  ZAN_CLASS_INV(160),
-    ZAN_CLASS_INV(192),  ZAN_CLASS_INV(224),  ZAN_CLASS_INV(256),
-    ZAN_CLASS_INV(320),  ZAN_CLASS_INV(384),  ZAN_CLASS_INV(448),
-    ZAN_CLASS_INV(512),  ZAN_CLASS_INV(640),  ZAN_CLASS_INV(768),
-    ZAN_CLASS_INV(896),  ZAN_CLASS_INV(1024), ZAN_CLASS_INV(1280),
-    ZAN_CLASS_INV(1536), ZAN_CLASS_INV(1792), ZAN_CLASS_INV(2048)};
-_Static_assert(sizeof(k_class_inv) / sizeof(k_class_inv[0]) == ZAN_MEM_NCLASS,
-               "k_class_inv length must match k_class_size");
+_Static_assert(ZAN_MEM_STR_CLS0 + (ZAN_MEM_STR_MAX - ZAN_MEM_STR_MIN) / 8 + 1 ==
+                   ZAN_MEM_NCLASS,
+               "string page classes must end the class table");
+_Static_assert(ZAN_MEM_OBJ_CLS0 + (ZAN_MEM_OBJ_MAX - 24u) / 16 + 1 ==
+                   ZAN_MEM_STR_CLS0,
+               "object page classes sit between the general and string classes");
+
+static inline int zan_mem_is_str_cls(int cls) { return cls >= ZAN_MEM_STR_CLS0; }
+/* 空闲块的链字与 cookie 字相对块地址 p（串页类为 V）的偏移 */
+static inline size_t zan_mem_link_off(int cls) {
+  return (size_t)zan_mem_is_str_cls(cls) << 3; /* 8 或 0，无分支 */
+}
+static inline void **zan_mem_link(void *p, int cls) {
+  return (void **)((char *)p + zan_mem_link_off(cls));
+}
+static inline uintptr_t *zan_mem_cookie_word(void *p, int cls) {
+  return (uintptr_t *)((char *)p + zan_mem_link_off(cls) + 8u);
+}
+/* 页内最后一个可切位置之后：串页类末尾要给真起点的 +4 让出空间 */
+static inline size_t zan_mem_page_span(int cls) {
+  return ZAN_MEM_PAGE - ((size_t)zan_mem_is_str_cls(cls) << 2); /* -4 或 -0 */
+}
 
 static unsigned char g_size_class[ZAN_MEM_MAX_SMALL + 1];
 static int g_class_ready;
@@ -210,19 +245,18 @@ size_t zan_mem_slabs(void) {
 }
 
 #define ZAN_MEM_REMOTE_STRIPES 8
-#define ZAN_MEM_ALLOC_BATCH 64u
 
 typedef struct zan_mem_cache {
   void *free_list[ZAN_MEM_NCLASS]; /* owner-only */
   char *page_bump[ZAN_MEM_NCLASS]; /* owner-only: 当前类页内未切部分 */
   char *page_end[ZAN_MEM_NCLASS];
-  char *bump;             /* owner-only: 当前 slab 未分出的页区间 */
-  char *bump_end;         /* owner-only */
-  char *bump_committed;   /* owner-only: Windows 已提交上界（按 64 KiB 块按需提交） */
-  uintptr_t last_slab;    /* owner-only: 最近命中的 slab 基址（免去高频释放的全局哈希探查） */
-  int bump_decommitted;   /* unallocated bump pages decommitted to OS */
-  uint32_t alloc_batch;   /* owner-only: 批次累计后刷入 g_small_alloc_count */
-  uint32_t remote_mask;   /* 非空远端释放条带位图，免去空条带 8 次 XCHG */
+  char *bump;           /* owner-only: 当前 slab 未分出的页区间 */
+  char *bump_end;       /* owner-only */
+  char *bump_committed; /* owner-only: Windows 已提交上界（按 64 KiB 块按需提交） */
+  uintptr_t last_slab;  /* owner-only: 最近命中的 slab 基址（免去高频释放的全局哈希探查） */
+  int bump_decommitted; /* unallocated bump pages decommitted to OS */
+  uint32_t alloc_batch; /* owner-only: 批次累计后刷入 g_small_alloc_count */
+  uint32_t remote_mask; /* 非空远端释放条带位图，免去空条带 8 次 XCHG */
   struct {
     void *head;
     char pad[64 - sizeof(void *)];
@@ -235,6 +269,20 @@ static zan_mem_slab_meta *g_reclaimed_head;
 static volatile int g_trim_lock;
 static int g_cache_init_count;
 static int g_multi_thread;
+
+/* g_small_alloc_count 按线程攒批并入（每 64 次一次原子加）：曾每次分配都对
+ * 这个全局计数做一次原子加，多线程分配时它是所有核争抢的同一缓存行。
+ * 统计因此最多滞后"活线程数 × 63"次，线程退役时补齐。 */
+#define ZAN_MEM_COUNT_BATCH 64u
+static inline void zan_mem_count_alloc(zan_mem_cache *c) {
+  uint32_t b = c->alloc_batch + 1u;
+  if (__builtin_expect(b >= ZAN_MEM_COUNT_BATCH, 0)) {
+    __atomic_fetch_add(&g_small_alloc_count, (size_t)b, __ATOMIC_RELAXED);
+    c->alloc_batch = 0;
+  } else {
+    c->alloc_batch = b;
+  }
+}
 
 static unsigned g_remote_rr;
 
@@ -275,16 +323,6 @@ void zan_mem_get_stats(zan_mem_stats_t *out) {
     cnt += t_cache->alloc_batch;
   out->small_alloc_count = cnt;
   out->trimmed_bytes = __atomic_load_n(&g_trimmed_bytes, __ATOMIC_RELAXED);
-}
-
-static inline void zan_mem_note_small_alloc(zan_mem_cache *c) {
-  uint32_t b = c->alloc_batch + 1u;
-  if (__builtin_expect(b >= ZAN_MEM_ALLOC_BATCH, 0)) {
-    __atomic_fetch_add(&g_small_alloc_count, (size_t)b, __ATOMIC_RELAXED);
-    c->alloc_batch = 0;
-  } else {
-    c->alloc_batch = b;
-  }
 }
 
 static volatile int g_slab_lock;
@@ -334,10 +372,10 @@ static void zan_mem_trim_unlock(void) { __sync_lock_release(&g_trim_lock); }
 static void zan_mem_build_classes(void) {
   int c = 0;
   for (unsigned s = 0; s <= ZAN_MEM_MAX_SMALL; s++) {
-    while (c < ZAN_MEM_NCLASS && k_class_size[c] < s)
+    while (c < ZAN_MEM_OBJ_CLS0 && k_class_size[c] < s)
       c++;
     g_size_class[s] =
-        (unsigned char)(c < ZAN_MEM_NCLASS ? c : ZAN_MEM_NCLASS - 1);
+        (unsigned char)(c < ZAN_MEM_OBJ_CLS0 ? c : ZAN_MEM_OBJ_CLS0 - 1);
   }
   __atomic_store_n(&g_class_ready, 1, __ATOMIC_RELEASE);
 }
@@ -395,19 +433,22 @@ static inline zan_mem_slab_meta *zan_mem_meta_of(const void *p, unsigned *page) 
 /* 块 p（已知在本分配器的 slab 内）的尺寸类；不是块起点（页表页、未分配页、
  * 页内非块边界）返回 -1。 */
 static inline int zan_mem_block_class(const void *p) {
-    unsigned pi;
-    zan_mem_slab_meta *m = zan_mem_meta_of(p, &pi);
-    if (__builtin_expect(pi == 0, 0)) return -1;
-    unsigned c1 = __atomic_load_n(&m->cls1[pi], __ATOMIC_ACQUIRE);
-    if (__builtin_expect(c1 == 0 || c1 > (unsigned)ZAN_MEM_NCLASS, 0)) return -1;
-    unsigned off = (unsigned)((uintptr_t)p & (uintptr_t)(ZAN_MEM_PAGE - 1));
-    if (__builtin_expect((off & 15u) != 0, 0)) return -1;
-    unsigned cls = c1 - 1u;
-    unsigned q = off >> 4;
-    unsigned d = (unsigned)k_class_size[cls] >> 4;
-    unsigned quot = (q * k_class_inv[cls]) >> 16;
-    if (__builtin_expect(quot * d != q, 0)) return -1;
-    return (int)cls;
+  unsigned pi;
+  zan_mem_slab_meta *m = zan_mem_meta_of(p, &pi);
+  if (__builtin_expect(pi == 0, 0))
+    return -1;
+  unsigned c1 = __atomic_load_n(&m->cls1[pi], __ATOMIC_ACQUIRE);
+  if (__builtin_expect(c1 == 0 || c1 > (unsigned)ZAN_MEM_NCLASS, 0))
+    return -1;
+  int cls = (int)c1 - 1;
+  uintptr_t off = (uintptr_t)p & (uintptr_t)(ZAN_MEM_PAGE - 1);
+  size_t sz = k_class_size[cls];
+  uint64_t dm = k_class_divm[cls];
+  if (__builtin_expect((uint64_t)off * dm > dm - 1u ||
+                           off + sz > zan_mem_page_span(cls),
+                       0))
+    return -1;
+  return cls;
 }
 
 static inline uintptr_t zan_mem_cookie(const void *p) {
@@ -440,7 +481,7 @@ static inline DWORD zan_mem_fls_slot(void) {
 }
 #endif
 
-static zan_mem_cache *zan_mem_cache_get(void) {
+static __attribute__((noinline)) zan_mem_cache *zan_mem_cache_get_slow(void) {
 #if defined(_WIN32)
   zan_mem_cache *c = t_cache;
   if (c)
@@ -503,14 +544,25 @@ static zan_mem_cache *zan_mem_cache_get(void) {
 static void zan_mem_drain_stripe(zan_mem_cache *c, int s) {
   void *p = __atomic_exchange_n(&c->remote[s].head, NULL, __ATOMIC_ACQUIRE);
   while (p) {
-    void *next = *(void **)p;
     int cls = zan_mem_block_class(p);
-    if (cls >= 0) {
-      *(void **)p = c->free_list[cls];
-      c->free_list[cls] = p;
-    }
+    if (cls < 0)
+      break; /* 链已损坏：丢弃余下的块 */
+    void **link = zan_mem_link(p, cls);
+    void *next = *link;
+    *link = c->free_list[cls];
+    c->free_list[cls] = p;
     p = next;
   }
+}
+
+/* 快路径：线程已有缓存时只是一次 TLS 读（曾整个函数不内联，每次分配
+ * 多付一次调用） */
+static inline __attribute__((always_inline)) zan_mem_cache *
+zan_mem_cache_get(void) {
+  zan_mem_cache *c = t_cache;
+  if (__builtin_expect(c != NULL, 1))
+    return c;
+  return zan_mem_cache_get_slow();
 }
 
 static void zan_mem_drain_remote(zan_mem_cache *c) {
@@ -574,7 +626,7 @@ static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
     void *p = rc->free_list[cls];
     if (p) {
       rc->free_list[cls] = NULL;
-      c->free_list[cls] = *(void **)p;
+      c->free_list[cls] = *zan_mem_link(p, cls);
       zan_mem_unlock();
       return p;
     }
@@ -587,25 +639,27 @@ static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
  * 线程使用；并发远端释放读到旧属主只会推进它的远端队列，之后被收割）。
  * 否则线程池频繁起落时每个退役线程都留下若干半空页。 */
 static int zan_mem_adopt_retired_page(zan_mem_cache *c, int cls) {
-    if (!__atomic_load_n(&g_cache_pool, __ATOMIC_ACQUIRE)) return 0;
-    size_t sz = k_class_size[cls];
-    zan_mem_lock();
-    for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
-        char *pb = rc->page_bump[cls];
-        if (pb && (size_t)(rc->page_end[cls] - pb) >= sz) {
-            c->page_bump[cls] = pb;
-            c->page_end[cls] = rc->page_end[cls];
-            rc->page_bump[cls] = NULL;
-            rc->page_end[cls] = NULL;
-            unsigned pi;
-            zan_mem_slab_meta *m = zan_mem_meta_of(pb, &pi);
-            __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELEASE);
-            zan_mem_unlock();
-            return 1;
-        }
-    }
-    zan_mem_unlock();
+  if (!__atomic_load_n(&g_cache_pool, __ATOMIC_ACQUIRE))
     return 0;
+  size_t sz = k_class_size[cls];
+  zan_mem_lock();
+  for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
+    char *pb = rc->page_bump[cls];
+    if (pb && (size_t)(rc->page_end[cls] - pb) >= sz) {
+      c->page_bump[cls] = pb;
+      c->page_end[cls] = rc->page_end[cls];
+      rc->page_bump[cls] = NULL;
+      rc->page_end[cls] = NULL;
+      unsigned pi;
+      zan_mem_slab_meta *m = zan_mem_meta_of(pb, &pi);
+      c->last_slab = (uintptr_t)m;
+      __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELEASE);
+      zan_mem_unlock();
+      return 1;
+    }
+  }
+  zan_mem_unlock();
+  return 0;
 }
 
 static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
@@ -848,96 +902,69 @@ static char *zan_mem_pop_reclaimed_page(void) {
   return page;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((noinline))
-#endif
-static void *zan_mem_small_slow(zan_mem_cache *c, int cls, size_t sz) {
-  void *p = zan_mem_harvest_free_block(c, cls);
+/* 慢路径：本线程空闲链为空且当前页已切完——收远端释放、收割退役缓存、复用空页、切新页 */
+static __attribute__((noinline)) void *zan_mem_small_slow(zan_mem_cache *c,
+                                                          int cls) {
+  void *p = c->free_list[cls];
+  if (!p) {
+    zan_mem_drain_remote(c);
+    p = c->free_list[cls];
+  }
   if (p) {
-    ((uintptr_t *)p)[1] = 0;
-    zan_mem_note_small_alloc(c);
+    c->free_list[cls] = *zan_mem_link(p, cls);
+    *zan_mem_cookie_word(p, cls) = 0; /* 清掉空闲 cookie */
+    zan_mem_count_alloc(c);
     return p;
   }
-  if (!zan_mem_adopt_retired_page(c, cls)) {
-    char *page = zan_mem_pop_reclaimed_page();
-    if (!page) {
-      /* 从当前 slab 的未分出页区间切一整页给这个类 */
-      if ((size_t)(c->bump_end - c->bump) < ZAN_MEM_PAGE) {
-        if (!zan_mem_adopt_retired_bump(c, ZAN_MEM_PAGE)) {
-          if (!zan_mem_new_slab(c))
-            return NULL;
+  p = zan_mem_harvest_free_block(c, cls);
+  if (p) {
+    *zan_mem_cookie_word(p, cls) = 0;
+    zan_mem_count_alloc(c);
+    return p;
+  }
+  size_t sz = k_class_size[cls];
+  if (!c->page_bump[cls] || (size_t)(c->page_end[cls] - c->page_bump[cls]) < sz) {
+    if (!zan_mem_adopt_retired_page(c, cls)) {
+      char *page = zan_mem_pop_reclaimed_page();
+      if (!page) {
+        /* 从当前 slab 的未分出页区间切一整页给这个类 */
+        if ((size_t)(c->bump_end - c->bump) < ZAN_MEM_PAGE) {
+          if (!zan_mem_adopt_retired_bump(c, ZAN_MEM_PAGE)) {
+            if (!zan_mem_new_slab(c))
+              return NULL;
+          }
         }
-      }
 #if defined(_WIN32)
-      if (c->bump_decommitted ||
-          c->bump_committed <= c->bump ||
-          (size_t)(c->bump_committed - c->bump) < ZAN_MEM_PAGE) {
-        size_t avail = (size_t)(c->bump_end - c->bump);
-        size_t chunk = avail < ZAN_MEM_COMMIT_CHUNK ? avail : ZAN_MEM_COMMIT_CHUNK;
-        if (!VirtualAlloc((void *)c->bump, chunk, MEM_COMMIT, PAGE_READWRITE))
-          return NULL;
-        c->bump_committed = c->bump + chunk;
-        c->bump_decommitted = 0;
-      }
+        if (c->bump_decommitted || c->bump_committed <= c->bump ||
+            (size_t)(c->bump_committed - c->bump) < ZAN_MEM_PAGE) {
+          size_t avail = (size_t)(c->bump_end - c->bump);
+          size_t chunk =
+              avail < ZAN_MEM_COMMIT_CHUNK ? avail : ZAN_MEM_COMMIT_CHUNK;
+          if (!VirtualAlloc((void *)c->bump, chunk, MEM_COMMIT, PAGE_READWRITE))
+            return NULL;
+          c->bump_committed = c->bump + chunk;
+          c->bump_decommitted = 0;
+        }
 #else
-      c->bump_decommitted = 0;
+        c->bump_decommitted = 0;
 #endif
-      page = c->bump;
-      c->bump += ZAN_MEM_PAGE;
+        page = c->bump;
+        c->bump += ZAN_MEM_PAGE;
+      }
+      unsigned pi;
+      zan_mem_slab_meta *m = zan_mem_meta_of(page, &pi);
+      c->last_slab = (uintptr_t)m;
+      __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELAXED);
+      __atomic_store_n(&m->cls1[pi], (uint8_t)(cls + 1), __ATOMIC_RELEASE);
+      c->page_bump[cls] = page;
+      c->page_end[cls] = page + zan_mem_page_span(cls);
     }
-    unsigned pi;
-    zan_mem_slab_meta *m = zan_mem_meta_of(page, &pi);
-    c->last_slab = (uintptr_t)m;
-    __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELAXED);
-    __atomic_store_n(&m->cls1[pi], (uint8_t)(cls + 1), __ATOMIC_RELEASE);
-    c->page_bump[cls] = page;
-    c->page_end[cls] = page + ZAN_MEM_PAGE;
   }
   p = c->page_bump[cls];
   c->page_bump[cls] += sz;
-  ((uintptr_t *)p)[1] = 0;
-  zan_mem_note_small_alloc(c);
+  *zan_mem_cookie_word(p, cls) = 0;
+  zan_mem_count_alloc(c);
   return p;
-}
-
-static void *zan_mem_small(size_t n) {
-  if (__builtin_expect(!__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE), 0))
-    zan_mem_ensure_classes();
-  zan_mem_cache *c = t_cache;
-  if (__builtin_expect(!c, 0)) {
-    c = zan_mem_cache_get();
-    if (!c)
-      return NULL;
-  }
-  int cls = g_size_class[n];
-  void *p = c->free_list[cls];
-  if (__builtin_expect(p != NULL, 1)) {
-    c->free_list[cls] = *(void **)p;
-    ((uintptr_t *)p)[1] = 0; /* 清掉空闲 cookie */
-    zan_mem_note_small_alloc(c);
-    return p;
-  }
-  if (__builtin_expect(
-          __atomic_load_n(&c->remote_mask, __ATOMIC_RELAXED) != 0, 0)) {
-    zan_mem_drain_remote(c);
-    p = c->free_list[cls];
-    if (p) {
-      c->free_list[cls] = *(void **)p;
-      ((uintptr_t *)p)[1] = 0;
-      zan_mem_note_small_alloc(c);
-      return p;
-    }
-  }
-  size_t sz = k_class_size[cls];
-  char *pb = c->page_bump[cls];
-  if (__builtin_expect(pb != NULL && (size_t)(c->page_end[cls] - pb) >= sz,
-                       1)) {
-    c->page_bump[cls] = pb + sz;
-    ((uintptr_t *)pb)[1] = 0;
-    zan_mem_note_small_alloc(c);
-    return pb;
-  }
-  return zan_mem_small_slow(c, cls, sz);
 }
 
 /* 在 g_trim_lock 保护下扫描缓存的各尺寸类空闲链：若某个 16 KiB 页的全部
@@ -951,7 +978,7 @@ static size_t zan_mem_trim_cache_pages(zan_mem_cache *c, int lock_held) {
     if (!head)
       continue;
     size_t sz = k_class_size[cls];
-    uint16_t cap = (uint16_t)(ZAN_MEM_PAGE / sz);
+    uint16_t cap = (uint16_t)(zan_mem_page_span(cls) / sz);
     uintptr_t partial_page = 0;
     if (c->page_bump[cls] &&
         (size_t)(c->page_end[cls] - c->page_bump[cls]) >= sz) {
@@ -961,7 +988,7 @@ static size_t zan_mem_trim_cache_pages(zan_mem_cache *c, int lock_held) {
 
     zan_mem_slab_meta *touched = NULL;
     int found_empty = 0;
-    for (void *p = head; p; p = *(void **)p) {
+    for (void *p = head; p; p = *zan_mem_link(p, cls)) {
       unsigned pi;
       zan_mem_slab_meta *m = zan_mem_meta_of(p, &pi);
       if (m->trim_touched == 0) {
@@ -985,9 +1012,9 @@ static size_t zan_mem_trim_cache_pages(zan_mem_cache *c, int lock_held) {
         zan_mem_slab_meta *m = zan_mem_meta_of(cur, &pi);
         uintptr_t paddr = (uintptr_t)m + (size_t)pi * ZAN_MEM_PAGE;
         if (m->trim_cnt[pi] == cap && paddr != partial_page) {
-          *pp = *(void **)cur;
+          *pp = *zan_mem_link(cur, cls);
         } else {
-          pp = (void **)cur;
+          pp = zan_mem_link(cur, cls);
         }
       }
       if (c->page_bump[cls] && !partial_page) {
@@ -1051,6 +1078,47 @@ static size_t zan_mem_trim_cache_pages(zan_mem_cache *c, int lock_held) {
     }
   }
   return trimmed;
+}
+
+/* 快路径（内联进各分配入口）：弹本线程空闲链 */
+static inline __attribute__((always_inline)) void *zan_mem_small_cls(int cls) {
+  zan_mem_cache *c = zan_mem_cache_get();
+  if (__builtin_expect(!c, 0))
+    return NULL;
+  void *p = c->free_list[cls];
+  if (__builtin_expect(p != NULL, 1)) {
+    c->free_list[cls] = *zan_mem_link(p, cls);
+    *zan_mem_cookie_word(p, cls) = 0; /* 清掉空闲 cookie */
+    zan_mem_count_alloc(c);
+    return p;
+  }
+  if (__builtin_expect(
+          __atomic_load_n(&c->remote_mask, __ATOMIC_RELAXED) != 0, 0)) {
+    zan_mem_drain_remote(c);
+    p = c->free_list[cls];
+    if (p) {
+      c->free_list[cls] = *zan_mem_link(p, cls);
+      *zan_mem_cookie_word(p, cls) = 0;
+      zan_mem_count_alloc(c);
+      return p;
+    }
+  }
+  /* 空闲链空且无远端待收、本类当前页还能切：直接切。 */
+  char *pb = c->page_bump[cls];
+  size_t sz = k_class_size[cls];
+  if (__builtin_expect(pb != NULL && (size_t)(c->page_end[cls] - pb) >= sz, 1)) {
+    c->page_bump[cls] = pb + sz;
+    *zan_mem_cookie_word(pb, cls) = 0;
+    zan_mem_count_alloc(c);
+    return pb;
+  }
+  return zan_mem_small_slow(c, cls);
+}
+
+static void *zan_mem_small(size_t n) {
+  if (__builtin_expect(!__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE), 0))
+    zan_mem_ensure_classes();
+  return zan_mem_small_cls(g_size_class[n]);
 }
 
 size_t zan_mem_trim(void) {
@@ -1124,7 +1192,38 @@ void *__wrap_malloc(size_t n) {
   return __real_malloc(n);
 }
 
-static void zan_mem_fatal_block(const char *what, const void *p) {
+/* Zan 字符串分配（编译器的 zan_rt_str_alloc 在链了本对象时调它）：要 n 字节
+ * 真实存储（12 字节串头 + 负载），返回虚基址 V——串块从 V+4 起、用户指针
+ * 是 V+16，释放传 V（free/zan_mem_free/realloc/libc free 都认）。
+ * 超出串页类的大串退回 malloc(n + 4)：V 即块起点，V[0..3] 是串的空位。 */
+void *zan_mem_str_malloc(size_t n) {
+  if (n <= ZAN_MEM_STR_MAX) {
+    size_t k = n <= ZAN_MEM_STR_MIN ? ZAN_MEM_STR_MIN : (n + 7u) & ~(size_t)7u;
+    void *p =
+        zan_mem_small_cls(ZAN_MEM_STR_CLS0 + (int)((k - ZAN_MEM_STR_MIN) / 8u));
+    if (p)
+      return p;
+  }
+  return __wrap_malloc(n + ZAN_MEM_STR_SKEW);
+}
+
+/* Zan 对象分配（编译器的 zan_rt_alloc 在链了本对象时调它）：n = 8 字节对象
+ * 头 + 载荷（对齐 16 的类再前垫 8）。n 是 16 的奇数倍 8 时进 8 字节粒度的对象页类，否则同 malloc。
+ * 8 字节对齐只在 n % 16 == 8 时出现，而 LLVM 里对齐要求 16 的类型尺寸必是
+ * 16 的倍数——含这类字段的对象 n % 16 == 0，照旧拿 16 对齐的通用类块。 */
+void *zan_mem_obj_malloc(size_t n) {
+  if (n <= ZAN_MEM_OBJ_MAX && (n & 15u) == 8u) {
+    void *p = zan_mem_small_cls(ZAN_MEM_OBJ_CLS0 + (int)(n >> 4) - 1);
+    if (p)
+      return p;
+  }
+  return __wrap_malloc(n);
+}
+
+/* 冷路径单独成函数：内联进 free 会把 snprintf 缓冲带进热路径（栈保护 +
+ * 栈帧开销每次释放都付）。 */
+static __attribute__((noinline, cold)) void zan_mem_fatal_block(const char *what,
+                                                                const void *p) {
   char msg[80];
   snprintf(msg, sizeof msg, "%s of block %p", what, p);
   zan_rt_fatal("mem", msg);
@@ -1150,29 +1249,16 @@ void __wrap_free(void *p) {
       return;
     }
   }
-  unsigned pi = (unsigned)(((uintptr_t)p - base) >> ZAN_MEM_PAGE_SHIFT);
-  zan_mem_slab_meta *m = (zan_mem_slab_meta *)base;
-  int cls = -1;
-  if (__builtin_expect(pi != 0, 1)) {
-    unsigned c1 = __atomic_load_n(&m->cls1[pi], __ATOMIC_ACQUIRE);
-    if (__builtin_expect(c1 != 0 && c1 <= (unsigned)ZAN_MEM_NCLASS, 1)) {
-      unsigned off = (unsigned)((uintptr_t)p & (uintptr_t)(ZAN_MEM_PAGE - 1));
-      if (__builtin_expect((off & 15u) == 0, 1)) {
-        unsigned c = c1 - 1u;
-        unsigned q = off >> 4;
-        unsigned d = (unsigned)k_class_size[c] >> 4;
-        unsigned quot = (q * k_class_inv[c]) >> 16;
-        if (__builtin_expect(quot * d == q, 1))
-          cls = (int)c;
-      }
-    }
-  }
+  int cls = zan_mem_block_class(p);
   if (__builtin_expect(cls < 0, 0)) {
     zan_mem_fatal_block("invalid free (not a block start)", p);
     return; /* 致命处理器返回时 */
   }
+  unsigned pi = (unsigned)(((uintptr_t)p - base) >> ZAN_MEM_PAGE_SHIFT);
+  zan_mem_slab_meta *m = (zan_mem_slab_meta *)base;
   uintptr_t ck = zan_mem_cookie(p);
-  uintptr_t *w = (uintptr_t *)p + 1;
+  uintptr_t *w = zan_mem_cookie_word(p, cls);
+  void **link = zan_mem_link(p, cls);
   zan_mem_cache *owner = __atomic_load_n(&m->owner[pi], __ATOMIC_RELAXED);
   if (__builtin_expect(owner == self && self != NULL, 1)) {
     if (__builtin_expect(!__atomic_load_n(&g_multi_thread, __ATOMIC_RELAXED),
@@ -1188,7 +1274,7 @@ void __wrap_free(void *p) {
       return;
     }
     self->last_slab = base;
-    *(void **)p = self->free_list[cls];
+    *link = self->free_list[cls];
     self->free_list[cls] = p;
     return;
   }
@@ -1210,7 +1296,7 @@ void __wrap_free(void *p) {
   void **slot = &owner->remote[s].head;
   void *head = __atomic_load_n(slot, __ATOMIC_RELAXED);
   do {
-    *(void **)p = head;
+    *link = head;
   } while (!__atomic_compare_exchange_n(slot, &head, p, 1, __ATOMIC_RELEASE,
                                         __ATOMIC_RELAXED));
   if (!head) {
@@ -1263,12 +1349,24 @@ void *__wrap_realloc(void *p, size_t n) {
   int cls = zan_mem_class_or_die(p);
   if (cls < 0)
     return NULL;
-  if (__atomic_load_n((const uintptr_t *)p + 1, __ATOMIC_ACQUIRE) ==
+  if (__atomic_load_n(zan_mem_cookie_word(p, cls), __ATOMIC_ACQUIRE) ==
       zan_mem_cookie(p)) {
     zan_mem_fatal_block("realloc of freed block", p);
     return NULL;
   }
   size_t old = k_class_size[cls];
+  if (zan_mem_is_str_cls(cls)) {
+    /* 串页块从 V 看是 old + 4 字节，但 V[0..3] 是邻块的：绝不原地交回
+     * （调用方会写那 4 字节），一律搬到通用块，布局不变（新块 [0..3]
+     * 成了自己的空位）。 */
+    old += ZAN_MEM_STR_SKEW;
+    void *np = __wrap_malloc(n);
+    if (!np)
+      return NULL;
+    memcpy(np, p, n < old ? n : old);
+    __wrap_free(p);
+    return np;
+  }
   if (n <= old)
     return p;
   void *np = __wrap_malloc(n);
@@ -1290,10 +1388,10 @@ static size_t zan_mem_block_size(const void *p) {
   int cls = zan_mem_block_class(p);
   if (cls < 0)
     return 0;
-  if (__atomic_load_n((const uintptr_t *)p + 1, __ATOMIC_ACQUIRE) ==
+  if (__atomic_load_n(zan_mem_cookie_word((void *)p, cls), __ATOMIC_ACQUIRE) ==
       zan_mem_cookie(p))
     return 0; /* 已释放 */
-  return k_class_size[cls];
+  return k_class_size[cls] + (zan_mem_is_str_cls(cls) ? ZAN_MEM_STR_SKEW : 0u);
 }
 
 static size_t zz_size(malloc_zone_t *z, const void *p) {

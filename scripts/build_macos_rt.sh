@@ -71,6 +71,13 @@ for pair in $macos_targets; do
     # program never notices it is missing.
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
+    # Small-object allocator (--fast-alloc, default on): zanc renames the
+    # program's malloc/free/calloc/realloc to zan_mem_* at emission when this
+    # object sits next to the target's other runtime objects. Without it a
+    # cross build silently falls back to libc malloc and GC.GetTotalMemory /
+    # TrimMemory report the weak zero stubs from zanrt_timer.o.
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
+        -c "$RT/rt_mem.c" -o "$out/zanrt_mem.o"
     # Independent feature members keep JSON/CPU users from loading crypto.
     set --
     for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
@@ -97,7 +104,7 @@ for pair in $macos_targets; do
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
         -c "$EMBED/zan_inflate.c" -o "$out/zan_inflate.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_crash.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_crash.o zanrt_decimal.o zanrt_mem.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
 # iOS uses the complete UIKit runtime, not the macOS compatibility shim.
@@ -114,5 +121,8 @@ mkdir -p "$ios_out"
 "$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
     -DZAN_GUI_IOS -DZAN_GUI_STATIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
     -c "$DRV/gui/gui_runtime.c" -o "$ios_out/zanrt_gui.o"
-echo "built $ios_out: zanrt_gui.o zanrt_crash.o"
+"$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
+    -I "$RT" -O2 -ffunction-sections -fdata-sections \
+    -c "$RT/rt_mem.c" -o "$ios_out/zanrt_mem.o"
+echo "built $ios_out: zanrt_gui.o zanrt_crash.o zanrt_mem.o"
 

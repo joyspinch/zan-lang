@@ -16,7 +16,14 @@ zan_compile(content)       # MCP: same, for one snippet
 ```
 
 Fix the **first** diagnostic first — the rest are often its fallout. Each one
-carries file, line, column and message. When a diagnostic surprises you, cut the
+carries file, line, column and message.
+
+For a machine-readable loop, compile with `--diag=json`: one JSON object per
+diagnostic, and many carry `fixits[]` — byte-offset patches you can apply
+directly (apply from the highest `offset` down). Typos in member/method/type
+names come back as "did you mean 'X'?" with a replacement patch (only when one
+candidate is clearly closest), a missing `;` as an insertion, `=` in
+a condition as `==`, and a class-to-class reference cycle (W2111) as `weak `. When a diagnostic surprises you, cut the
 construct down to a few lines and `zan_compile` that: a minimal snippet tells you
 whether your assumption or the code is wrong.
 
@@ -150,6 +157,21 @@ x86-64/Linux 上同样写法恰好能跑，所以只在 macOS/iOS arm64 现形�
 阻塞 accept 卡死一个调度 worker → 它负责的 IO 分片事件无人收割 → keep-alive 连接 1/4 的后续
 请求永不应答。判据：调用后用无变参的 `F_GETFL` 读回校验。修法：变参函数只经运行时 C 包装
 调用（如 `zan_io_set_nonblocking`），Zan 侧绝不直接 DllImport 变参 libc 函数。
+
+### macOS 外部工具按 locale 选编码；用例写死平台命令（2026-11-24）
+
+- `pbcopy`/`pbpaste` 按 locale 环境变量决定文本编码。ctest、launchd 和 IDE 起的子进程常常
+  **没有 `LANG`**，于是工具退回 `__CF_USER_TEXT_ENCODING` 里的旧系统编码（中文系统是
+  MacChineseSimp），UTF-8 正文在写-读往返里被改写或读回空串：`clipboard_roundtrip` 只在
+  `SetText→GetText` 两步红。复现时**清掉 LANG** 再跑（`env -u LANG …`）；交互 shell 里设了
+  UTF-8 locale 就复现不了。修法：库里调这类工具时显式带 `LC_ALL=en_US.UTF-8`（见
+  `Clipboard.PasteboardLocale`），不要指望继承来的环境。
+- 跨平台用例里写死 `cmd.exe /c …` 在 POSIX 上必然失败，看起来像 Process API 坏了
+  （`res_ok=false`/`async_ok=false`）。先用 `/bin/sh -c` 写一个探针单跑同一 API：通了就是用例
+  不可移植，用 `#if WINDOWS` 选平台 shell（`process_lifecycle_api` 的 `Shell()/ShellArgs()`），
+  别改金样、也别在库里把 `cmd.exe` 翻译成 sh。
+- `#if WINDOWS` 守卫要包住**所有**引用 Win32 extern 的私有辅助函数：辅助函数漏在守卫外，
+  非 Windows 目标直接报 `E2084 has no method 'WinXxx'`，整个包在 macOS/Linux 编译不过。
 
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 

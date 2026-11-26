@@ -194,11 +194,23 @@ partial class Irgen {
             types.Add(ll);
             i = i + 1;
         }
-        List<Node> slots = new List<Node>();
-        CollectVSlotNodes(cls, slots);
         int match = NL(); int next = NL();
         string cmp = NT();
-        L("  " + cmp + " = icmp eq i8* %tag, bitcast ([" + slots.Count + " x i8*]* @" + table + " to i8*)");
+        if (cls.kind == AK.StructDecl()) {
+            // Boxed structs carry no vtable word (slot 0 is the first field):
+            // match on the allocation header's type id at [-24].
+            string hp = NT();
+            L("  " + hp + " = bitcast i8* %receiver to i64*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr i64, i64* " + hp + ", i64 -3");
+            string cv = NT();
+            L("  " + cv + " = load i64, i64* " + cp);
+            L("  " + cmp + " = icmp eq i64 " + cv + ", ptrtoint (i8** @__tid_" + cls.sval + " to i64)");
+        } else {
+            List<Node> slots = new List<Node>();
+            CollectVSlotNodes(cls, slots);
+            L("  " + cmp + " = icmp eq i8* %tag, bitcast ([" + slots.Count + " x i8*]* @" + table + " to i8*)");
+        }
         L("  br i1 " + cmp + ", label %L" + match + ", label %L" + next);
         Label(match);
         string self = NT();
@@ -237,6 +249,16 @@ partial class Irgen {
             }
             tmp = 0; lbl = 0;
             L(sig + ") {"); L("entry:");
+            // Check boxed struct implementors via allocation header [-24] first so
+            // small/empty structs never load a non-existent vtable word at offset 0.
+            j = 0;
+            while (j < binder.types.Count) {
+                Node cls = binder.types[j];
+                if (cls.kind == AK.StructDecl() && IndexOfStr(tidNames, cls.sval) >= 0) {
+                    EmitInterfaceTarget(dispatch, cls, null, "");
+                }
+                j = j + 1;
+            }
             L("  %tagp = bitcast i8* %receiver to i8**");
             L("  %tag = load i8*, i8** %tagp");
             j = 0;

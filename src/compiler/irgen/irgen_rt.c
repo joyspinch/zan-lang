@@ -110,20 +110,20 @@ static LLVMValueRef zan_hdr_page_ok(zan_irgen_t *g, LLVMValueRef obj,
     return phi;
 }
 LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
-  /* 串长缓存读/盖戳/失效只碰 [p-8]、[p-16]（数组计数也在 -16） */
-  return zan_hdr_page_ok(g, obj, -(int64_t)ZAN_OBJ_RC_OFF);
+  /* 串长缓存读/盖戳/失效只碰 [p-12]（长度）、[p-8]（头字）；数组计数在 [p-16] */
+  return zan_hdr_page_ok(g, obj, -(int64_t)ZAN_ARR_COUNT_OFF);
 }
 LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
   /* 4 字段：{dtor_fn, tynames_arr_ptr, meta_ptr, field_graph_ptr}，共 32 字节。
    * 前 3 字段偏移不变 (0, 8, 16)，不影响 runtime 硬编码 GEP(8)/GEP(16)。
    * 第 4 字段 (offset 24) 承载 B-ID89 字段走图元数据指针。 */
   LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  return LLVMStructType((LLVMTypeRef[]){i8p, i8p, i8p, i8p}, 4, 0);
+  return LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i8p, i8p, i8p, i8p}, 4,
+                                 0);
 }
 
 static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
   LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef dt = arc_desc_type(g);
   char dname[64];
   snprintf(dname, sizeof(dname), "__zan_desc_%d", site_idx);
@@ -267,6 +267,9 @@ int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst,
       (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
     zan_host_oom();
   }
+  if (g->desc_tbl_frozen)
+    fprintf(stderr, "zanc: internal: ARC site reserved after the descriptor "
+                    "table was frozen\n");
   int site_idx = g->leak_site_count++;
   if (g->site_syms)
     g->site_syms[site_idx] = sym;
@@ -297,6 +300,9 @@ int reserve_closure_site(zan_irgen_t *g) {
       (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
     zan_host_oom();
   }
+  if (g->desc_tbl_frozen)
+    fprintf(stderr, "zanc: internal: ARC site reserved after the descriptor "
+                    "table was frozen\n");
   int site_idx = g->leak_site_count++;
   if (g->site_syms)
     g->site_syms[site_idx] = NULL;
@@ -311,12 +317,45 @@ int reserve_closure_site(zan_irgen_t *g) {
   }
   return site_idx;
 }
+/* 类型（递归）里有没有要求 16 字节对齐的成员：i128（decimal 等）、
+ * fp128/x86_fp80、16 字节以上的向量。对象头 8 字节后 p 只保证 8 对齐，
+ * 这类类实例要前垫 8 字节（ZAN_OBJ_TW_PAD16）。 */
+static bool llvm_type_needs_align16(LLVMTypeRef t, int depth) {
+    if (!t || depth > 16) return false;
+    switch (LLVMGetTypeKind(t)) {
+        case LLVMIntegerTypeKind: return LLVMGetIntTypeWidth(t) > 64;
+        case LLVMFP128TypeKind:
+        case LLVMX86_FP80TypeKind:
+        case LLVMPPC_FP128TypeKind: return true;
+        case LLVMVectorTypeKind: return abi_size_of(t) >= 16;
+        case LLVMArrayTypeKind: return llvm_type_needs_align16(LLVMGetElementType(t), depth + 1);
+        case LLVMStructTypeKind: {
+            if (LLVMIsPackedStruct(t)) return false;
+            unsigned n = LLVMCountStructElementTypes(t);
+            for (unsigned i = 0; i < n; i++)
+                if (llvm_type_needs_align16(LLVMStructGetTypeAtIndex(t, i), depth + 1)) return true;
+            return false;
+        }
+        default: return false;
+    }
+}
+bool zan_class_needs_pad16(LLVMTypeRef st) { return llvm_type_needs_align16(st, 0); }
+/* 类实例的 zan_rt_alloc 站点实参：对齐 16 的布局带上前垫标记 */
+LLVMValueRef arc_class_site_val(zan_irgen_t *g, LLVMValueRef site_val, LLVMTypeRef st) {
+    if (!site_val || !llvm_type_needs_align16(st, 0)) return site_val;
+    return LLVMBuildOr(g->builder, site_val,
+                       LLVMConstInt(LLVMInt64TypeInContext(g->ctx), ZAN_OBJ_TW_PAD16, 0),
+                       "site.pad16");
+}
+/* zan_rt_alloc 的站点实参：两种模式都是站点号（对象头 tw 的低 29 位）。
+ * 默认模式的描述符经 __zan_desc_tbl[站点号] 查到（docs/OBJECT_LAYOUT.md）。 */
 LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
-  if (!g->desc_hdr)
-    return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
-                        (unsigned long long)site_idx, 0);
-  return LLVMBuildPtrToInt(g->builder, g->desc_gv[site_idx],
-                           LLVMInt64TypeInContext(g->ctx), "desc.arg");
+  if (site_idx > (int)ZAN_OBJ_TW_SITE_MASK) {
+    fprintf(stderr, "zanc: too many allocation sites (%d)\n", site_idx);
+    exit(1);
+  }
+  return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                      (unsigned long long)site_idx, 0);
 }
 
 /* ---- initialization ---- */
@@ -808,7 +847,40 @@ void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta) {
 #define ZAN_ARC_FAULT_ARR_RELEASE 0xE0A2C008u
 #define ZAN_ARC_FAULT_USE_ARR 0xE0A2C009u
 
-#define ZAN_ARC_FREED_MARK 0xDEAD0000DEAD0000ull
+/* 失效标记：数组 RC 仍是 64 位，对象/字符串 RC 是 32 位（ZAN_RC_OFF） */
+#define ZAN_ARC_FREED_MARK   0xDEAD0000DEAD0000ull
+#define ZAN_ARC_FREED_MARK32 0xDEADDEADu
+
+static LLVMValueRef arc_freed_mark(LLVMTypeRef rc_ty) {
+    return LLVMConstInt(rc_ty, LLVMGetIntTypeWidth(rc_ty) == 32
+        ? ZAN_ARC_FREED_MARK32 : ZAN_ARC_FREED_MARK, 0);
+}
+
+LLVMValueRef zan_rc_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
+                        const char *name) {
+    LLVMValueRef off = LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                    (uint64_t)(int64_t)ZAN_RC_OFF, 1);
+    return LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj, &off, 1, name);
+}
+
+LLVMValueRef zan_str_len_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef str, const char *name) {
+    LLVMValueRef off =
+        LLVMConstInt(LLVMInt64TypeInContext(g->ctx), (uint64_t)(int64_t)ZAN_STR_LEN_OFF, 1);
+    return LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), str, &off, 1, name);
+}
+/* 头字（[obj-8] 的 u64）地址 */
+LLVMValueRef zan_hdr_word_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
+                              const char *name) {
+    LLVMValueRef off =
+        LLVMConstInt(LLVMInt64TypeInContext(g->ctx), (uint64_t)(int64_t)ZAN_HDR_WORD_OFF, 1);
+    return LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj, &off, 1, name);
+}
+/* 头字 → 站点号（i64，去掉栈标记与对象标记） */
+LLVMValueRef zan_hdr_site(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef word, const char *name) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    return LLVMBuildAnd(b, LLVMBuildLShr(b, word, LLVMConstInt(i64, 32, 0), "hdr.tw"),
+                        LLVMConstInt(i64, ZAN_OBJ_TW_SITE_MASK, 0), name);
+}
 
 static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
                                   LLVMValueRef rc_old, LLVMValueRef site,
@@ -821,6 +893,8 @@ static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
            "object %%p, site/freed-by 0x%%llX)\n",
            what);
   LLVMValueRef fmt = zan_irgen_intern_string(g, msg);
+  if (LLVMTypeOf(rc_old) != i64t)
+    rc_old = LLVMBuildSExt(g->builder, rc_old, i64t, "rc.wide");
   LLVMValueRef pargs[] = {fmt, rc_old, obj,
                           site ? site : LLVMConstInt(i64t, -1, 1)};
   zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 4, "");
@@ -864,9 +938,9 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
   if (g->arc_guard) {
     if (!g->runtime_checks)
       return;
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
-                                 LLVMConstInt(i64t, 0, 0), "arcdead");
+                                 LLVMConstInt(LLVMTypeOf(rc_old), 0, 0),
+                                 "arcdead");
     LLVMBasicBlockRef bad_bb =
         LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.bad");
     LLVMBasicBlockRef ok_bb =
@@ -879,9 +953,9 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
   }
   if (!g->arc_net)
     return;
-  LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
-                               LLVMConstInt(i64t, 0, 0), "arcdead");
+                               LLVMConstInt(LLVMTypeOf(rc_old), 0, 0),
+                               "arcdead");
   LLVMBasicBlockRef bad_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "arcnet.bad");
   LLVMBasicBlockRef ok_bb =
@@ -926,21 +1000,28 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     return;
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
-  LLVMValueRef freed =
-      zan_icmp(g->builder, LLVMIntEQ, rc,
-               LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), "arcfreed");
+  LLVMValueRef freed = zan_icmp(g->builder, LLVMIntEQ, rc,
+                                arc_freed_mark(LLVMTypeOf(rc)), "arcfreed");
   LLVMBasicBlockRef bad_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.bad");
   LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.ok");
   LLVMBuildCondBr(g->builder, freed, bad_bb, ok_bb);
   LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+  /* 释放点：数组（64 位 RC）记在 [-8] 整字；对象/字符串只剩 [-4] 的 32 位
+   * （[-8] 是 RC 本身，见 emit_arc_quarantine） */
+  bool wide = LLVMGetIntTypeWidth(LLVMTypeOf(rc)) == 64;
   LLVMValueRef sp = LLVMBuildGEP2(
       g->builder, i8t, obj,
-      (LLVMValueRef[]){LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
-      "uafsp");
-  LLVMValueRef sip =
-      LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "uafsip");
-  LLVMValueRef freed_by = LLVMBuildLoad2(g->builder, i64t, sip, "freedby");
+      (LLVMValueRef[]){LLVMConstInt(
+          i64t, (uint64_t)(wide ? ZAN_HDR_WORD_OFF : ZAN_OBJ_TW_OFF), 1)},
+      1, "uafsp");
+  LLVMValueRef freed_by =
+      wide ? LLVMBuildLoad2(g->builder, i64t, sp, "freedby")
+           : LLVMBuildZExt(
+                 g->builder,
+                 LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx), sp,
+                                "freedby32"),
+                 i64t, "freedby");
   emit_arc_fault_report(g, obj, LLVMConstInt(i64t, 0, 0), freed_by, code, what);
   LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
@@ -957,13 +1038,12 @@ LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
     if (out_ty) *out_ty = LLVMGlobalGetValueType(fn);
     return fn;
 }
-void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
-                         LLVMValueRef rc_iptr) {
+void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj, LLVMValueRef rc_iptr,
+                         LLVMTypeRef rc_ty) {
   LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-  LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0),
-                 rc_iptr);
+  LLVMBuildStore(g->builder, arc_freed_mark(rc_ty), rc_iptr);
   /* 不再往 obj[0] 写 0xDD 毒字节：零负载对象（无字段实例、头即全部的块）
    * 的 obj[0] 已在分配之外，正好是相邻块的 RC 低字节——邻居 RC 被改成
    * 0xDD-1=220 永不归零，--arc-guard 下凭空"泄漏"。没有任何代码读这个
@@ -972,19 +1052,27 @@ void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
   LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
   LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
   LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &zero, 1, "retaddr");
-  LLVMValueRef sp = LLVMBuildGEP2(
-      g->builder, i8t, obj,
-      (LLVMValueRef[]){LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
-      "qsp");
-  LLVMValueRef sip =
-      LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "qsip");
-  LLVMBuildStore(g->builder, LLVMBuildPtrToInt(g->builder, ra, i64t, "ran"),
-                 sip);
+  LLVMValueRef ran = LLVMBuildPtrToInt(g->builder, ra, i64t, "ran");
+  if (LLVMGetIntTypeWidth(rc_ty) == 64) {
+    LLVMValueRef sp = LLVMBuildGEP2(
+        g->builder, i8t, obj,
+        (LLVMValueRef[]){LLVMConstInt(i64t, (uint64_t)ZAN_HDR_WORD_OFF, 1)}, 1,
+        "qsp");
+    LLVMBuildStore(g->builder, ran, sp);
+  } else {
+    /* 对象/字符串：[-8] 是刚写的失效标记，释放点低 32 位记在 [-4] */
+    LLVMValueRef sp = LLVMBuildGEP2(
+        g->builder, i8t, obj,
+        (LLVMValueRef[]){LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_TW_OFF, 1)}, 1,
+        "qsp");
+    LLVMBuildStore(g->builder, LLVMBuildTrunc(g->builder, ran, i32t, "ran32"),
+                   sp);
+  }
 }
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8,
                             LLVMBasicBlockRef ret_bb) {
   /* ptr8 = GEP(obj, off)：守卫随后读的 ptr8 与其下一个头字 ptr8-8
-   * （串：-8 魔数、-16 RC；数组：-24 魔数、-32 RC），need = 8 - off。
+   * （串：-8 头字、-12 长度；数组：-24 魔数、-32 RC），need = 8 - off。
    * 不可读则直接走 ret_bb（外来指针：不 retain/release）。 */
   if (!ptr8 || !LLVMIsAGetElementPtrInst(ptr8) ||
       LLVMGetNumOperands(ptr8) != 2)
@@ -1008,7 +1096,6 @@ static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 LLVMValueRef rc, LLVMValueRef site) {
   if (!ev_fn)
     return;
-  LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef ra_ty = NULL;
   /* 声明而不是只查：只查的话，查不到就整段 return——ARC trace 事件被

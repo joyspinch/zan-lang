@@ -127,6 +127,8 @@ if(NOT _current)
   execute_process(
     COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS} ${_default_opt_args}
             --package-project ${WORKDIR}
+            # S3：实际编进来的源文件清单，scripts/affected.py 据此选受影响用例
+            --emit-deps ${OUT_EXE}.deps
     RESULT_VARIABLE compile_rc
     OUTPUT_VARIABLE compile_out
     ERROR_VARIABLE  compile_err)

@@ -1,0 +1,59 @@
+using System;
+using Game.Foundation;
+using Game.Render3D;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：FpsGame 的漫游与准星拾取以固定 1/60 秒一帧
+// 无头推进（不上传网格、不画）。场景固定，种子不参与。replays/ 下的回放由 `zan-check`
+// 重放、逐校验点比对；Bot 是模糊测试用的机器人。改了移动或视角参数后回放分叉，就重新
+// 录制（见 README）。
+//
+// 输入编码：0 保持上一帧的按键；1 + 按键位（1 前、2 后、4 左、8 右、16 上升、32 下沉）
+// = 本帧按住的键；100 + 方向（0..7，45° 一档）= 鼠标朝该方向拖 20 像素转视角。
+public class FpsSim : IReplaySim {
+    FpsGame game;
+
+    public void Reset(long seed) { game = FpsGame.Create(); }
+
+    public void Step(int frame, int input) {
+        if (input >= 1 && input <= 64) {
+            int k = input - 1;
+            game.keyFwd = (k & 1) != 0;
+            game.keyBwd = (k & 2) != 0;
+            game.keyLeft = (k & 4) != 0;
+            game.keyRight = (k & 8) != 0;
+            game.keyUp = (k & 16) != 0;
+            game.keyDown = (k & 32) != 0;
+        } else if (input >= 100 && input < 108) {
+            int d = input - 100;
+            int dx = d == 0 || d == 1 || d == 7 ? 20 : (d == 3 || d == 4 || d == 5 ? -20 : 0);
+            int dy = d == 1 || d == 2 || d == 3 ? 20 : (d == 5 || d == 6 || d == 7 ? -20 : 0);
+            game.OnMouseMove((float)dx, (float)dy);
+        }
+        game.Tick(1.0 / 60.0);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        Vector3 p = game.controller.Position;
+        h.Real(p.X).Real(p.Y).Real(p.Z).Real(game.controller.Yaw).Real(game.controller.Pitch)
+         .Bool(game.targetHit);
+        if (game.targetHit) { h.Real(game.hitDistance); }
+        return h.Value();
+    }
+
+    // 俯仰角钳在 ±89°（防万向锁）
+    [Invariant]
+    public bool PitchClamped() { return game.controller.Pitch >= -1.5534f && game.controller.Pitch <= 1.5534f; }
+
+    // 准星命中时距离是正的有限值
+    [Invariant]
+    public bool HitDistanceValid() { return !game.targetHit || (game.hitDistance > 0 && game.hitDistance < 1000); }
+
+    // 机器人：时不时换一组按键，偶尔拖动鼠标转视角
+    public static int Bot(DeterministicRandom rng, int frame) {
+        int roll = rng.NextBelow(100);
+        if (roll < 4) { return 1 + rng.NextBelow(64); }
+        if (roll < 10) { return 100 + rng.NextBelow(8); }
+        return 0;
+    }
+}

@@ -182,6 +182,88 @@ static void emit_new_object_inits(zan_irgen_t *g, zan_ast_node_t *expr,
   }
 }
 
+/* `new T(...)` 的存储：类走 rt_alloc（零初始化 + 虚表指针），结构体走入口
+ * alloca。从 emit_expr_new_expr 拆出，好让类的构造调用先求值实参、后分配
+ * 对象（C# 语义同序）：实参求值期间新对象既不必进 EH 临时栈，也不会被
+ * 实参里的调用"看见"——内联构造体对刚清零字段的 `old = load` 才折得成
+ * null，ARC 收尾才配得上 retain(实参)/release(临时量)。 */
+typedef struct { LLVMValueRef val, name; } new_site_t;
+
+/* 分配点索引在原位置（实参求值之前）预留：嵌套 `new` 的站点编号顺序与
+ * 求值顺序调整前一致，泄漏报告/IR 金样不随之漂移。 */
+static new_site_t emit_new_site(zan_irgen_t *g, zan_ast_node_t *expr,
+                                zan_symbol_t *sym) {
+  new_site_t site;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  site.name = LLVMConstNull(i8ptr);
+  site.val = NULL;
+  /* 分配固定分配点索引用于内存剖析与诊断 */
+  zan_type_t *site_inst = resolve_type_ctx(g, expr->new_expr.type);
+  if (g->cur_canon_body && g->cur_gctx_val && site_inst &&
+      type_mentions_canon(site_inst) && g->desc_hdr) {
+    LLVMValueRef dptr = emit_gctx_load_slot(g, GCTX_SLOT_ARC_DESC, sym,
+                                            site_inst, NULL, 0, 0, 0);
+    if (dptr)
+      site.val = LLVMBuildPtrToInt(g->builder, dptr, i64, "arc.site.gctx");
+  }
+  if (!site.val) {
+    int site_idx = reserve_arc_site(g, sym, site_inst, 0, NULL);
+    site.val = arc_site_arg(g, site_idx);
+  }
+  if (g->check_leaks) {
+    char site_buf[600];
+    const char *sfile = loc_site_file(g, expr->loc);
+    snprintf(site_buf, sizeof(site_buf), "%s:%u:%u", sfile, expr->loc.line,
+             expr->loc.col);
+    site.name = zan_irgen_intern_string(g, site_buf);
+  }
+  return site;
+}
+
+static LLVMValueRef emit_new_storage(zan_irgen_t *g, zan_symbol_t *sym,
+                                     LLVMTypeRef st, zan_type_t *new_inst,
+                                     new_site_t site) {
+  LLVMValueRef alloca;
+  if (sym->type->kind == TYPE_CLASS) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef sz = LLVMSizeOf(st);
+    LLVMValueRef site_val = arc_class_site_val(g, site.val, st),
+                 site_name = site.name;
+    LLVMTypeRef alloc_fn_type =
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64, i8ptr}, 3, 0);
+    LLVMValueRef alloc_args3[] = {sz, site_val, site_name};
+    LLVMValueRef raw = zan_call2(g->builder, alloc_fn_type, g->rt_alloc,
+                                 alloc_args3, 3, "newobj");
+    alloca = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "objp");
+  } else {
+    alloca = emit_entry_alloca(g, st, "new");
+  }
+  zan_store_fit(g, LLVMConstNull(st), alloca);
+
+  if (sym->type->kind == TYPE_CLASS && class_has_virtual_methods(sym)) {
+    LLVMTypeRef i8ptr_vt = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    /* 泛型类**每个实例化一张自己的 vtable**：整类共用一张表时，
+     * 表里的槽位指向擦除版方法体，而擦除版拿不到类型实参，
+     * 方法体里的 `m is T` 恒为 false——经基类引用做虚调用时
+     * 判定恒错（静默）。实例化自己的表指向特化版方法体。 */
+    LLVMValueRef vt8;
+    if (g->cur_canon_body && g->cur_gctx_val && new_inst &&
+        type_mentions_canon(new_inst)) {
+      vt8 = emit_gctx_load_slot(g, GCTX_SLOT_VTABLE, sym, new_inst, NULL, 0, 0,
+                                0);
+    } else {
+      LLVMValueRef vtg = get_vtable_global_inst(g, sym, new_inst);
+      vt8 = LLVMBuildBitCast(g->builder, vtg, i8ptr_vt, "vt.i8");
+    }
+    LLVMValueRef vpf0 =
+        LLVMBuildStructGEP2(g->builder, st, alloca, 0, "vpf.init");
+    zan_store_fit(g, vt8, vpf0);
+  }
+  return alloca;
+}
+
 LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals) {
   /* 工厂调用接对象初始化式 */
@@ -276,9 +358,21 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         continue;
       }
-      /* 普通字段/属性写入：通过合成访问器 */
+      /* 普通字段/属性写入：作用在**已求值**的工厂返回对象上。
+       * 以前接收者写成 call_init 本身——每个成员写都把工厂调用
+       * 再求值一次，写进新造的对象后丢弃（标量成员全丢，工厂
+       * 副作用重复）。经隐藏局部引用 obj，与集合分支同法。 */
+      LLVMTypeRef obj_lt = LLVMTypeOf(obj);
+      LLVMValueRef oslot = emit_entry_alloca(g, obj_lt, "finit.obj");
+      zan_store_fit(g, obj, oslot);
+      static const char finit_name[] = "\x01finit.obj";
+      zan_istr_t oname = {(char *)finit_name,
+                          (uint32_t)(sizeof(finit_name) - 1)};
+      local_add(locals, oname, oslot, otype);
+      zan_ast_node_t *orecv = zan_ast_new(g->arena, AST_IDENTIFIER, arg->loc);
+      orecv->ident.name = oname;
       zan_ast_node_t *mref = zan_ast_new(g->arena, AST_MEMBER_ACCESS, arg->loc);
-      mref->member.object = expr->new_expr.call_init;
+      mref->member.object = orecv;
       mref->member.name = mname;
       mref->member.null_cond = 0;
       zan_ast_node_t *setn = zan_ast_new(g->arena, AST_ASSIGNMENT, arg->loc);
@@ -286,6 +380,14 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
       setn->binary.left = mref;
       setn->binary.right = arg->binary.right;
       emit_expr(g, setn, locals);
+      for (int lv = locals->count - 1; lv >= 0; lv--) {
+        if (locals->vars[lv].name.str == oname.str) {
+          for (int sh = lv; sh < locals->count - 1; sh++)
+            locals->vars[sh] = locals->vars[sh + 1];
+          locals->count--;
+          break;
+        }
+      }
     }
     return obj;
   }
@@ -881,71 +983,12 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
       LLVMTypeRef st = get_struct_llvm_type(g, sym);
       if (st) {
-        LLVMValueRef alloca;
-        if (sym->type->kind == TYPE_CLASS) {
-          LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-          LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-          LLVMValueRef sz = LLVMSizeOf(st);
-          LLVMValueRef site_name = LLVMConstNull(i8ptr);
-          LLVMValueRef site_val = NULL;
-          {
-            /* 分配固定分配点索引用于内存剖析与诊断 */
-            zan_type_t *site_inst = resolve_type_ctx(g, expr->new_expr.type);
-            if (g->cur_canon_body && g->cur_gctx_val && site_inst &&
-                type_mentions_canon(site_inst) && g->desc_hdr) {
-              LLVMValueRef dptr = emit_gctx_load_slot(
-                  g, GCTX_SLOT_ARC_DESC, sym, site_inst, NULL, 0, 0, 0);
-              if (dptr)
-                site_val =
-                    LLVMBuildPtrToInt(g->builder, dptr, i64, "arc.site.gctx");
-            }
-            if (!site_val) {
-              int site_idx = reserve_arc_site(g, sym, site_inst, 0, NULL);
-              site_val = arc_site_arg(g, site_idx);
-            }
-            if (g->check_leaks) {
-              char site_buf[600];
-              const char *sfile = loc_site_file(g, expr->loc);
-              snprintf(site_buf, sizeof(site_buf), "%s:%u:%u", sfile,
-                       expr->loc.line, expr->loc.col);
-              site_name = zan_irgen_intern_string(g, site_buf);
-            }
-          }
-          LLVMTypeRef alloc_fn_type =
-              LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64, i8ptr}, 3, 0);
-          LLVMValueRef alloc_args3[] = {sz, site_val, site_name};
-          LLVMValueRef raw = zan_call2(g->builder, alloc_fn_type, g->rt_alloc,
-                                       alloc_args3, 3, "newobj");
-          alloca =
-              LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "objp");
-        } else {
-          alloca = emit_entry_alloca(g, st, "new");
-        }
-        zan_store_fit(g, LLVMConstNull(st), alloca);
-
+        new_site_t site = {NULL, NULL};
+        if (sym->type->kind == TYPE_CLASS)
+          site = emit_new_site(g, expr, sym);
         /* 查找并解析类的实例构造函数 */
         zan_type_t *new_inst = resolve_type_ctx(g, expr->new_expr.type);
-
-        if (sym->type->kind == TYPE_CLASS && class_has_virtual_methods(sym)) {
-          LLVMTypeRef i8ptr_vt =
-              LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-          /* 泛型类**每个实例化一张自己的 vtable**：整类共用一张表时，
-           * 表里的槽位指向擦除版方法体，而擦除版拿不到类型实参，
-           * 方法体里的 `m is T` 恒为 false——经基类引用做虚调用时
-           * 判定恒错（静默）。实例化自己的表指向特化版方法体。 */
-          LLVMValueRef vt8;
-          if (g->cur_canon_body && g->cur_gctx_val && new_inst &&
-              type_mentions_canon(new_inst)) {
-            vt8 = emit_gctx_load_slot(g, GCTX_SLOT_VTABLE, sym, new_inst, NULL,
-                                      0, 0, 0);
-          } else {
-            LLVMValueRef vtg = get_vtable_global_inst(g, sym, new_inst);
-            vt8 = LLVMBuildBitCast(g->builder, vtg, i8ptr_vt, "vt.i8");
-          }
-          LLVMValueRef vpf0 =
-              LLVMBuildStructGEP2(g->builder, st, alloca, 0, "vpf.init");
-          zan_store_fit(g, vt8, vpf0);
-        }
+        LLVMValueRef alloca = NULL;
 
         /* 对象初始化式字段赋值发射 */
         int init_start = expr->new_expr.args.count;
@@ -999,12 +1042,11 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
           int argc = ctor_arg_list.count + 1;
           LLVMValueRef *call_args =
               (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-          call_args[0] = alloca;
           int obj_eh_pushed = 0;
-          if (sym->type->kind == TYPE_CLASS) {
-            emit_eh_tmp_push(g, alloca);
-            obj_eh_pushed = 1;
-          }
+          /* 结构体是入口 alloca，原位清零即可；类对象等实参求值完
+           * 再分配（见 emit_new_storage）。 */
+          if (sym->type->kind != TYPE_CLASS)
+            alloca = emit_new_storage(g, sym, st, new_inst, site);
           /* 实参槽：构造函数抛异常时由展开器释放实参里的拥有型
            * 临时量（与普通方法调用路径同源判定）。 */
           int *arg_eh_pushed = (int *)calloc((size_t)argc, sizeof(int));
@@ -1026,14 +1068,20 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             arg_eh_pushed[k + 1] = emit_call_arg_eh_push(
                 g, ctor_arg_list.items[k], call_args[k + 1], locals);
           }
+          if (sym->type->kind == TYPE_CLASS) {
+            alloca = emit_new_storage(g, sym, st, new_inst, site);
+            emit_eh_tmp_push(g, alloca);
+            obj_eh_pushed = 1;
+          }
+          call_args[0] = alloca;
           zan_call_with_gctx(g, ctor_ft, ctor_fn, call_args, argc, ctor_gctx,
                              "");
-          /* 逆序弹出：实参槽先进后进（后进先出），对象槽最后弹 */
+          /* 逆序弹出：对象槽最后进、最先弹，再弹实参槽 */
+          if (obj_eh_pushed)
+            emit_eh_tmp_pop(g);
           for (int k = argc - 1; k >= 0; k--)
             if (arg_eh_pushed[k])
               emit_eh_tmp_pop(g);
-          if (obj_eh_pushed)
-            emit_eh_tmp_pop(g);
           for (int k = 0; k < ctor_arg_list.count; k++) {
             emit_release_owned_call_temp(g, ctor_arg_list.items[k],
                                          call_args[k + 1], locals);
@@ -1041,6 +1089,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
           free(arg_eh_pushed);
           free(call_args);
         } else {
+          alloca = emit_new_storage(g, sym, st, new_inst, site);
           if (sym->type->kind == TYPE_CLASS && ctor_arg_list.count > 0)
             zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3024,
                                "no constructor of '%.*s' accepts %d argument%s",

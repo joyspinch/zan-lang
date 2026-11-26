@@ -1487,6 +1487,23 @@ static int wasm_obj_vec_refs_any(const generated_object_vec_t *objects,
   return 0;
 }
 
+/* Apple 小对象分配器对象位置：本机在 zanc 旁，交叉在 <exe>/macos/<arch>/
+ * 或 <exe>/ios/arm64/（与其它交叉运行时对象同目录，build_macos_rt.sh 产出）。
+ * 发射期改名（route_fast_alloc）与链接注入用同一判据，缺对象则两边都不动。 */
+static bool zan_apple_rt_mem_path(const zan_target_t *t, bool cross,
+                                  char *out, size_t cap) {
+    char dir[1024];
+    zan_exe_dir(dir, sizeof(dir));
+    if (!cross)
+        snprintf(out, cap, "%s/zanrt_mem.o", dir);
+    else if (t->os == ZAN_OS_IOS)
+        snprintf(out, cap, "%s/ios/arm64/zanrt_mem.o", dir);
+    else
+        snprintf(out, cap, "%s/macos/%s/zanrt_mem.o", dir,
+                 t->arch == ZAN_ARCH_AARCH64 ? "arm64" : "x64");
+    return zan_file_exists(out);
+}
+
 static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
                                  bool use_comdat) {
   if (!value || LLVMIsDeclaration(value))
@@ -1617,6 +1634,50 @@ static void zan_strip_alloc_counter(zan_irgen_t *g) {
         LLVMValueRef user = LLVMGetUser(u);
         u = LLVMGetNextUse(u);
         if (LLVMIsACallInst(user) && LLVMGetCalledValue(user) == f)
+            LLVMInstructionEraseFromParent(user);
+    }
+}
+
+/* main 无条件调 zan_co_sched_init（emit_main.c），这一个引用就把整个 M:N
+ * 调度器（zanrt_io_mt.o：worker/IO shard/DNS/统计，Mac 上 ~15 KB 代码）
+ * 钉进每个 exe，dead-strip 也剥不掉。它只做调度队列复位 + 给延时定时器装
+ * 就绪钩子；模块里没有任何协程/IO/定时器/任务入口被引用时，这些状态永远
+ * 不会被读，删掉调用即可（定时器状态静态零初始化与 reset 后等价，公共
+ * 定时器不走就绪钩子）。库保留：宿主可能跑异步。 */
+static void zan_strip_unused_co_sched_init(zan_irgen_t *g) {
+    if (g->emit_lib) return;
+    /* By name, not g->rt_co_sched_init: this runs after optimization, and the
+     * build cache (docs/BUILD_CACHE.md) replaces g->mod there, so values
+     * cached during irgen point into a module that no longer exists. */
+    LLVMValueRef init = LLVMGetNamedFunction(g->mod, "zan_co_sched_init");
+    if (!init) return;
+    static const char *const prefixes[] = {
+        "zan_co_", "zan_io_", "zan_timer_", "zan_task_", "zan_async_",
+        "__zan_co_"
+    };
+    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+         fn = LLVMGetNextFunction(fn)) {
+        if (fn == init || !LLVMGetFirstUse(fn)) continue;
+        size_t len = 0;
+        const char *name = LLVMGetValueName2(fn, &len);
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            size_t pl = strlen(prefixes[i]);
+            if (len >= pl && memcmp(name, prefixes[i], pl) == 0) return;
+        }
+    }
+    for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
+         gv = LLVMGetNextGlobal(gv)) {
+        size_t len = 0;
+        const char *name = LLVMGetValueName2(gv, &len);
+        if (len >= 9 && memcmp(name, "__zan_co_", 9) == 0 &&
+            LLVMGetFirstUse(gv))
+            return;
+    }
+    LLVMUseRef u = LLVMGetFirstUse(init);
+    while (u) {
+        LLVMValueRef user = LLVMGetUser(u);
+        u = LLVMGetNextUse(u);
+        if (LLVMIsACallInst(user) && LLVMGetCalledValue(user) == init)
             LLVMInstructionEraseFromParent(user);
     }
 }

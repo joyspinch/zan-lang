@@ -490,8 +490,8 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp,
               LLVMConstInt(i64, (unsigned long long)ctor_count, 0), elem, targs,
               fields, LLVMConstInt(i64, (unsigned long long)field_count, 0),
               LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
-              LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-              LLVMConstInt(i64, ZAN_STR_HDR_WORD(sn), 0),
+              LLVMConstInt(i64, ZAN_STR_LIT_W0(sn), 0),
+              LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
               LLVMConstArray(i8, chars, (unsigned)(sn + 1))},
           19));
   free(chars);

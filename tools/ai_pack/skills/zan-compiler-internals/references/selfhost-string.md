@@ -133,3 +133,14 @@ h.IndexOf("CD")=-1  h.LastIndexOf("C")=-1  h.EndsWith("CD")=0
 - 同类教训：数组引用凡是被**容器或闭包持有**都要显式 `zarr_retain`——
   `ArcManaged()` 对数组返回 false。已补：List/Dictionary 槽（所有权 kind 3）、
   struct 拷贝的数组字段、lambda env 捕获的数组。新增持有点时先查这一条。
+
+## 9. 运行时缓存必须有上限并在空闲时归还（2026-11-24，selfhost_exception_ownership 实测）
+
+owner 节点（`zlocal_arm`/`zexc_push` 每个 40B）改走线程本地空闲链后，
+`string_allocation_balance` 首例 `alloc=6 free=2`：4 个节点永远挂在空闲链上。
+不只是测试口径问题——空闲链无上限、线程退出不回收，异步交接时 A 线程 arm、
+B 线程 retire，B 的链无限增长。改为：上限 64 个（`@zexc_node_count`），且
+`@zexc_owners` 归空时（本线程无任何存活 owner）把整条空闲链 free 掉。热循环里
+外层还有存活 owner 时照旧复用；整个作用域/线程退净后不留缓存。
+加任何"省 malloc"的缓存先问三件事：有没有上限、跨线程归还会不会单边增长、
+线程/作用域结束时谁来还。

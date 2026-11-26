@@ -28,7 +28,7 @@ static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
   fields[EH_F_TOP] = i32t;
   fields[EH_F_TMPS_TOP] = i32t;
   fields[EH_F_EXC_OWNED] = i32t;
-  fields[EH_F_PAD] = i32t;
+  fields[EH_F_CO_DEPTH] = i32t;
   fields[EH_F_EXC] = i8ptr;
   fields[EH_F_EXC_TID] = i8ptr;
   fields[EH_F_BUFS] = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
@@ -603,6 +603,50 @@ static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
   g->eh_state_fields[field] = p;
   return p;
 }
+/* Remove a function's unused temp-stack entry mark (alloca + store of the
+ * loaded top) and, when nothing else in the function needs it, the field
+ * address and the EH state lookup feeding it. finish_fn_lpad calls this for
+ * bodies that pushed no temps. */
+static bool eh_erase_if_dead(LLVMValueRef v) {
+  if (!v || !LLVMIsAInstruction(v) || LLVMGetFirstUse(v))
+    return false;
+  LLVMInstructionEraseFromParent(v);
+  return true;
+}
+void eh_drop_tmp_mark(zan_irgen_t *g, LLVMValueRef mark) {
+  if (!mark || !LLVMIsAAllocaInst(mark))
+    return;
+  LLVMUseRef u = LLVMGetFirstUse(mark);
+  if (!u || LLVMGetNextUse(u))
+    return;
+  LLVMValueRef st = LLVMGetUser(u);
+  if (!LLVMIsAStoreInst(st) || LLVMGetOperand(st, 1) != mark)
+    return;
+  LLVMValueRef ld = LLVMGetOperand(st, 0);
+  LLVMInstructionEraseFromParent(st);
+  LLVMInstructionEraseFromParent(mark);
+  if (!LLVMIsALoadInst(ld))
+    return;
+  LLVMValueRef field = LLVMGetOperand(ld, 0);
+  if (!eh_erase_if_dead(ld) || !LLVMIsAGetElementPtrInst(field) ||
+      LLVMGetFirstUse(field))
+    return;
+  LLVMValueRef st_ptr = LLVMGetOperand(field, 0);
+  for (int i = 0; i < EH_F_COUNT; i++)
+    if (g->eh_state_fields[i] == field)
+      g->eh_state_fields[i] = NULL;
+  LLVMInstructionEraseFromParent(field);
+  if (!LLVMIsAInstruction(st_ptr) || LLVMGetFirstUse(st_ptr))
+    return;
+  if (st_ptr == g->eh_state_cached) {
+    g->eh_state_cached = NULL;
+    g->eh_state_owner = NULL;
+  }
+  LLVMValueRef inner =
+      LLVMIsABitCastInst(st_ptr) ? LLVMGetOperand(st_ptr, 0) : NULL;
+  LLVMInstructionEraseFromParent(st_ptr);
+  eh_erase_if_dead(inner);
+}
 void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top, LLVMValueRef *bufs,
                     LLVMValueRef *exc) {
   *top = emit_eh_field_ptr(g, EH_F_TOP, "eh.topp");
@@ -1079,6 +1123,12 @@ LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g) {
                           "eh.stp.cold");
 }
 
+/* Per-thread nesting depth of coroutines started inline at an await site
+ * (construct_await.c). Lives in the calloc'd per-thread EH state block. */
+LLVMValueRef zan_eh_co_depth_ptr(zan_irgen_t *g) {
+    return emit_eh_field_ptr(g, EH_F_CO_DEPTH, "eh.codepth");
+}
+
 LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_guard_raise");
     if (fn) return fn;
@@ -1102,8 +1152,14 @@ LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef soft = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMTypeRef st_ty = get_eh_state_ty(g);
-    LLVMValueRef st =
-        LLVMBuildBitCast(g->builder, LLVMGetParam(fn, 0), LLVMPointerType(st_ty, 0), "st");
+    /* The helper looks up the EH state itself (param 0 is ignored; sites pass
+     * null). Passing it from the site made every checked site compute it on
+     * the hot path: the lookup is an atomic TSD-key load LLVM will not sink
+     * into the cold branch, so inlined struct methods in a loop paid two
+     * thread-state lookups per iteration (structs bench 2.2x C). */
+    LLVMValueRef st_raw = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
+                                    get_eh_state_fast_fn(g), NULL, 0, "st.raw");
+    LLVMValueRef st = LLVMBuildBitCast(g->builder, st_raw, LLVMPointerType(st_ty, 0), "st");
     LLVMValueRef top = LLVMBuildLoad2(
         g->builder, i32t, LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_TOP, "topp"), "top");
     LLVMBuildCondBr(g->builder,

@@ -39,8 +39,8 @@ static LLVMValueRef refl_const_string(zan_irgen_t *g, const char *s, int len) {
   chars[len] = LLVMConstInt(i8, 0, 0);
   LLVMValueRef init = LLVMConstNamedStruct(
       rec_ty,
-      (LLVMValueRef[]){LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-                       LLVMConstInt(i64, ZAN_STR_HDR_WORD(len), 0),
+      (LLVMValueRef[]){LLVMConstInt(i64, ZAN_STR_LIT_W0(len), 0),
+                       LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
                        LLVMConstArray(i8, chars, (unsigned)(len + 1))},
       3);
   free(chars);

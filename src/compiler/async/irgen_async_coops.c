@@ -210,6 +210,9 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMTypeRef lp_ret_ty =
       LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i8ptr, i32}, 2, 0);
+  /* The coroutine root stores the Zan exception in its frame and never
+   * re-raises this native object; emit_eh_landing_to frees it when
+   * native_slot is NULL and catches_native is true. */
   emit_eh_landing_to(g, exc_bb, lp_ret_ty, NULL, true);
   zan_builder_restore(g, lpad_pt);
 

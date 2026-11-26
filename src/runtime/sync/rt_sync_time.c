@@ -22,6 +22,8 @@ int64_t zan_monotonic_us(void) {
     if (f == 10000000LL) return (int64_t)(now.QuadPart / 10LL);
     return (int64_t)((now.QuadPart / f) * 1000000
         + ((now.QuadPart % f) * 1000000) / f);
+#elif defined(__APPLE__)
+    return (int64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -37,6 +39,12 @@ int64_t zan_monotonic_ns(void) {
     if (f == 10000000LL) return (int64_t)(now.QuadPart * 100LL);
     return (int64_t)((now.QuadPart / f) * 1000000000
         + ((now.QuadPart % f) * 1000000000) / f);
+#elif defined(__APPLE__)
+    /* Darwin's CLOCK_MONOTONIC only advances in whole microseconds, while
+     * Stopwatch reports a 1 GHz frequency: short samples read as 0. The raw
+     * clock is mach_continuous_time (counts sleep, like MONOTONIC) at the
+     * timebase resolution (41.7 ns on Apple Silicon). */
+    return (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

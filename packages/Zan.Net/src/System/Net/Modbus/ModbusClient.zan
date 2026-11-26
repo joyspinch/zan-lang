@@ -43,12 +43,14 @@ public class ModbusClient : IDisposable {
 
     // 关闭连接并安全唤醒所有排队等待的协程（幂等）。
     public void Close() {
-        while (this.waiters != null && this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
-            g.Signal();
+        lock (this) {
+            while (this.waiters != null && this.waiters.Count > 0) {
+                AsyncGate g = this.waiters[0];
+                this.waiters.RemoveAt(0);
+                g.Signal();
+            }
+            this.busy = false;
         }
-        this.busy = false;
         if (this.conn != null) { this.conn.Close(); }
         this.connected = false;
     }
@@ -83,24 +85,30 @@ public class ModbusClient : IDisposable {
     }
 
     private async bool AcquireLock() {
-        if (!this.busy) {
-            this.busy = true;
-            return true;
+        AsyncGate g = null;
+        lock (this) {
+            if (!this.busy) {
+                this.busy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+            this.waiters.Add(g);
         }
-        AsyncGate g = new AsyncGate();
-        this.waiters.Add(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     private void ReleaseLock() {
-        if (this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
-            g.Signal();
-        } else {
-            this.busy = false;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count > 0) {
+                AsyncGate g = this.waiters[0];
+                this.waiters.RemoveAt(0);
+                g.Signal();
+            } else {
+                this.busy = false;
+            }
         }
     }
 

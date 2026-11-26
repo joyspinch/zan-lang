@@ -32,7 +32,7 @@ stage="$staging/$name"
 mkdir -p "$stage/toolchain"
 
 # compiler + companion CLIs
-for exe in zanc zan-mvc zan-lsp zan-dap zanfmt zandoc; do
+for exe in zanc zan-mvc zan-lsp zan-dap zanfmt zandoc zan-check; do
     cp "$build/$exe" "$stage/toolchain/"
 done
 
@@ -107,6 +107,7 @@ This bundle ships the Zan compiler and CLIs as an SDK:
   toolchain/zan-dap      debug adapter
   toolchain/zanfmt       formatter
   toolchain/zandoc       doc generator
+  toolchain/zan-check    one-command check report (compile + leak gate, JSON)
   stdlib/ templates/ examples/
 
 Build and run a program with the host C toolchain (cc on PATH):

@@ -65,11 +65,15 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   bool do_dump_tokens = false;
   bool do_dump_ast = false;
   const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
+  bool do_summary = false;              /* S4 --summary */
+  const char *emit_deps_path = NULL;    /* S3 --emit-deps <file> */
+  const char *query_name = NULL;        /* S2 --query <symbol> */
   const char *gen_meta_path = NULL;
   bool gen_meta_bodies = false;
   bool do_emit_ir = false;
   int check_leaks_opt = -1;
   bool checked_arith = false; /* B-ID76：--checked 全局算术溢出守卫 */
+  bool fp_contract = false;
   int arc_guard_opt = -1;
   int runtime_checks_opt = -1;
   bool runtime_checks = true;
@@ -141,6 +145,12 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
       do_dump_ast = true;
     } else if (strcmp(argv[i], "--emit-symbols") == 0 && i + 1 < argc) {
       emit_symbols_path = argv[++i];
+    } else if (strcmp(argv[i], "--summary") == 0) {
+      do_summary = true;
+    } else if (strcmp(argv[i], "--emit-deps") == 0 && i + 1 < argc) {
+      emit_deps_path = argv[++i];
+    } else if (strcmp(argv[i], "--query") == 0 && i + 1 < argc) {
+      query_name = argv[++i];
     } else if (strcmp(argv[i], "--semantic-refs") == 0) {
       if (opts->semantic_refs_file || argc - i < 4 || !argv[i + 1][0] ||
           !parse_source_coordinate(argv[i + 2], &opts->semantic_refs_line) ||
@@ -171,6 +181,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
     } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
       runtime_checks_opt = 0;
       runtime_checks = false;
+    } else if (strcmp(argv[i], "--fp-contract") == 0) {
+      fp_contract = true;
     } else if (strcmp(argv[i], "--checked") == 0) {
       checked_arith = true; /* B-ID76：全局算术 checked（C# /checked+） */
     } else if (strcmp(argv[i], "--runtime-checks") == 0) {
@@ -378,6 +390,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
       error_limit = (int)lv;
     } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
       link_subsystem = argv[++i];
+    } else if (strcmp(argv[i], "--no-build-cache") == 0) {
+      /* consumed by zan_bcache_init (build_cache.h) */
     } else if (strcmp(argv[i], "--time") == 0) {
       g_time_phases = true;
       g_phase_start = now_ms();
@@ -574,11 +588,15 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   opts->do_dump_tokens = do_dump_tokens;
   opts->do_dump_ast = do_dump_ast;
   opts->emit_symbols_path = emit_symbols_path;
+  opts->do_summary = do_summary;
+  opts->emit_deps_path = emit_deps_path;
+  opts->query_name = query_name;
   opts->gen_meta_path = gen_meta_path;
   opts->gen_meta_bodies = gen_meta_bodies;
   opts->do_emit_ir = do_emit_ir;
   opts->check_leaks_opt = check_leaks_opt;
   opts->checked_arith = checked_arith;
+  opts->fp_contract = fp_contract;
   opts->arc_guard_opt = arc_guard_opt;
   opts->runtime_checks_opt = runtime_checks_opt;
   opts->runtime_checks = runtime_checks;

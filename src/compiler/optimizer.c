@@ -1,9 +1,13 @@
 
 #include "optimizer.h"
+#include "build_cache.h"
+#include "list_width_hoist.h"
+#include "guard_version.h"
 #include "irgen.h"
 #include "irgen_compact.h"
 #include "binder.h"
 #include "zan_abi.h"
+#include "codegen_split.h"
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Transforms/PassBuilder.h>
@@ -2022,9 +2026,6 @@ static const char *const shrink_native_names[] = {
     "Sleep",
     "usleep",
     "nanosleep",
-    "pthread_mutex_lock",
-    "pthread_mutex_unlock",
-    "pthread_self",
     "CancelIoEx",
     "DestroyWindow",
     "GetWindowLongPtrW",
@@ -2032,6 +2033,23 @@ static const char *const shrink_native_names[] = {
     "SetForegroundWindow",
     "ShowWindow",
     "UpdateWindow",
+    /* POSIX/Win32：EH 线程状态（__zan_eh_state_tsd）与运行时锁用到的 libc/
+     * libpthread/TLS 函数，纯 C 不展开。曾缺席时每个读 EH 状态的 Zan 函数
+     * 都被判可抛——macOS/Linux 上几乎没有 invoke 能塌缩。 */
+    "pthread_getspecific",
+    "pthread_setspecific",
+    "pthread_key_create",
+    "pthread_key_delete",
+    "pthread_self",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "getenv",
+    "TlsGetValue",
+    "TlsSetValue",
+    "TlsAlloc",
+    "FlsGetValue",
+    "FlsSetValue",
+    "FlsAlloc",
 };
 
 static bool shrink_is_native_leaf(const char *n) {
@@ -2102,6 +2120,9 @@ static bool shrink_extern_nothrow(const char *n) {
   return shrink_is_native_leaf(n);
 }
 
+static unsigned shrink_nounwind_kind(void) {
+  return LLVMGetEnumAttributeKindForName("nounwind", 8);
+}
 /* 调用站点的直接被调者（穿透常量 bitcast 到 Function），无则 NULL */
 static LLVMValueRef shrink_callee_fn(LLVMValueRef inst) {
   LLVMValueRef callee = LLVMGetCalledValue(inst);
@@ -2316,8 +2337,15 @@ static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
           if (!c) {
             /* Unknown indirect targets may unwind. Skipping the
              * edge without this mark incorrectly proves wrappers
-             * (reflection/delegates/vtables) nothrow. */
-            may_throw[i] = true;
+             * (reflection/delegates/vtables) nothrow. The one
+             * exception is inline asm (mrs/TLS read) or a site the
+             * emitter itself stamped nounwind (ARC descriptor dtor). */
+            LLVMValueRef cv = LLVMGetCalledValue(inst);
+            bool asm_site = cv && LLVMIsAInlineAsm(cv);
+            if (!asm_site &&
+                !LLVMGetCallSiteEnumAttribute(inst, LLVMAttributeFunctionIndex,
+                                              shrink_nounwind_kind()))
+              may_throw[i] = true;
             continue;
           }
           const char *callee_name = LLVMGetValueName(c);
@@ -2425,9 +2453,9 @@ static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
     if (zan_verify_ir_strict())
       zan_opt_verify_module(mod, "after shrink collapse");
     if (verbose) {
-      fprintf(stderr,
-              "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
-              collapsed, total_inv, nthr, nfn);
+      zan_bcache_logf(
+          "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
+          collapsed, total_inv, nthr, nfn);
     }
     for (unsigned i = 0; i < nfn; i++)
       free(callers[i].v);
@@ -2653,6 +2681,21 @@ static int zan_opt_eh_tmp_mod(LLVMModuleRef mod) {
   return removed;
 }
 
+static LLVMValueRef dtor_strip_ptr_base(LLVMValueRef ptr) {
+  for (int d = 0; ptr && d < 8; d++) {
+    if (LLVMIsAInstruction(ptr)) {
+      LLVMOpcode pop = LLVMGetInstructionOpcode(ptr);
+      if (pop == LLVMBitCast || pop == LLVMAddrSpaceCast ||
+          pop == LLVMGetElementPtr) {
+        ptr = LLVMGetOperand(ptr, 0);
+        continue;
+      }
+    }
+    break;
+  }
+  return ptr;
+}
+
 static bool dtor_fn_is_self_only_rec(LLVMValueRef fn, int depth) {
   if (!fn || !LLVMIsAFunction(fn) || LLVMIsDeclaration(fn) || depth > 4)
     return false;
@@ -2662,21 +2705,15 @@ static bool dtor_fn_is_self_only_rec(LLVMValueRef fn, int depth) {
     for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
          inst = LLVMGetNextInstruction(inst)) {
       LLVMOpcode op = LLVMGetInstructionOpcode(inst);
-      if (op == LLVMInvoke || op == LLVMStore)
+      if (op == LLVMInvoke)
         return false;
+      if (op == LLVMStore) {
+        LLVMValueRef dst = dtor_strip_ptr_base(LLVMGetOperand(inst, 1));
+        if (!self_param || dst != self_param)
+          return false;
+      }
       if (op == LLVMAtomicRMW || op == LLVMAtomicCmpXchg) {
-        LLVMValueRef ptr = LLVMGetOperand(inst, 0);
-        for (int d = 0; ptr && d < 8; d++) {
-          if (LLVMIsAInstruction(ptr)) {
-            LLVMOpcode pop = LLVMGetInstructionOpcode(ptr);
-            if (pop == LLVMBitCast || pop == LLVMAddrSpaceCast ||
-                pop == LLVMGetElementPtr) {
-              ptr = LLVMGetOperand(ptr, 0);
-              continue;
-            }
-          }
-          break;
-        }
+        LLVMValueRef ptr = dtor_strip_ptr_base(LLVMGetOperand(inst, 0));
         if (!self_param || ptr != self_param)
           return false;
       }
@@ -2688,6 +2725,9 @@ static bool dtor_fn_is_self_only_rec(LLVMValueRef fn, int depth) {
         if (!cn)
           return false;
         if (strcmp(cn, "free") == 0 ||
+            strcmp(cn, "__zan_arc_free") == 0 ||
+            strcmp(cn, "__zan_arc_free_obj") == 0 ||
+            strcmp(cn, "__zan_arc_free_obj16") == 0 ||
             strcmp(cn, "zan_rt_weak_nil_all") == 0 ||
             strcmp(cn, "zan_rt_weak_destroy_begin") == 0 ||
             strcmp(cn, "zan_rt_live_unregister") == 0 ||
@@ -2714,25 +2754,49 @@ static bool dtor_fn_is_self_only(LLVMValueRef fn) {
   return dtor_fn_is_self_only_rec(fn, 0);
 }
 
-static bool desc_dtor_is_self_only(LLVMValueRef site_val) {
+static bool desc_global_dtor_is_self_only(LLVMValueRef g) {
+  if (!g || LLVMIsNull(g))
+    return true;
+  if (LLVMIsAGlobalVariable(g) && LLVMIsGlobalConstant(g)) {
+    LLVMValueRef init = LLVMGetInitializer(g);
+    if (init && LLVMGetTypeKind(LLVMTypeOf(init)) == LLVMStructTypeKind &&
+        LLVMGetNumOperands(init) >= 1) {
+      LLVMValueRef dtor = strip_pointer_casts(LLVMGetOperand(init, 0));
+      if (!dtor || LLVMIsNull(dtor))
+        return true;
+      if (LLVMIsAFunction(dtor))
+        return dtor_fn_is_self_only(dtor);
+    }
+  }
+  return false;
+}
+
+static bool desc_dtor_is_self_only(LLVMModuleRef mod, LLVMValueRef site_val) {
   if (!site_val)
     return false;
-  if (LLVMIsAConstantInt(site_val))
-    return LLVMConstIntGetZExtValue(site_val) == 0;
+  if (LLVMIsAConstantInt(site_val)) {
+    uint64_t site_idx =
+        LLVMConstIntGetZExtValue(site_val) & (uint64_t)ZAN_OBJ_TW_SITE_MASK;
+    if (site_idx == 0)
+      return true;
+    LLVMValueRef tbl = mod ? LLVMGetNamedGlobal(mod, "__zan_desc_tbl") : NULL;
+    if (tbl && LLVMIsGlobalConstant(tbl)) {
+      LLVMValueRef tinit = LLVMGetInitializer(tbl);
+      if (!tinit || LLVMIsNull(tinit))
+        return true;
+      if (LLVMGetTypeKind(LLVMTypeOf(tinit)) == LLVMArrayTypeKind &&
+          site_idx < (uint64_t)LLVMGetNumOperands(tinit)) {
+        LLVMValueRef elem =
+            strip_pointer_casts(LLVMGetOperand(tinit, (unsigned)site_idx));
+        return desc_global_dtor_is_self_only(elem);
+      }
+    }
+    return false;
+  }
   if (LLVMIsAConstantExpr(site_val) &&
       LLVMGetConstOpcode(site_val) == LLVMPtrToInt) {
     LLVMValueRef g = strip_pointer_casts(LLVMGetOperand(site_val, 0));
-    if (g && LLVMIsAGlobalVariable(g) && LLVMIsGlobalConstant(g)) {
-      LLVMValueRef init = LLVMGetInitializer(g);
-      if (init && LLVMGetTypeKind(LLVMTypeOf(init)) == LLVMStructTypeKind &&
-          LLVMGetNumOperands(init) >= 1) {
-        LLVMValueRef dtor = strip_pointer_casts(LLVMGetOperand(init, 0));
-        if (!dtor || LLVMIsNull(dtor))
-          return true;
-        if (LLVMIsAFunction(dtor))
-          return dtor_fn_is_self_only(dtor);
-      }
-    }
+    return desc_global_dtor_is_self_only(g);
   }
   return false;
 }
@@ -3092,6 +3156,7 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
 
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx);
+  LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx);
   LLVMTypeRef i8 = LLVMInt8TypeInContext(ctx);
 
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
@@ -3121,8 +3186,9 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
                   insert_entry_alloca(b_entry, fn);
 
-                  LLVMValueRef total_val =
-                      LLVMConstInt(i64, obj_sz + ZAN_OBJ_HDR_SIZE, 0);
+                  /* 栈对象一律按 16 对齐放：块 16 对齐、头字在 +8、p = 块 + 16
+                   * （对齐 16 的类也满足；栈对象从不 free，前垫不用记） */
+                  LLVMValueRef total_val = LLVMConstInt(i64, obj_sz + 16, 0);
                   LLVMValueRef alloca_buf =
                       LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.raw");
                   LLVMSetAlignment(alloca_buf, 16);
@@ -3131,32 +3197,34 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
                   LLVMPositionBuilderBefore(b_inst, inst);
 
-                  /* rc = 1 at raw[0..7] */
-                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
-                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.rcp");
-                  LLVMBuildStore(b_inst, LLVMConstInt(i64, 1, 0), rc_ptr);
-
-                  /* site = site | ZAN_OBJ_STACK_FLAG at raw[8..15] */
-                  LLVMValueRef site_marked = LLVMBuildOr(
-                      b_inst, site_val,
-                      LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stk.site");
-                  LLVMValueRef eight =
-                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-                  LLVMValueRef site_ptr = LLVMBuildGEP2(
-                      b_inst, i8, alloca_buf, &eight, 1, "stk.sptr");
-                  LLVMValueRef site_iptr = LLVMBuildBitCast(
-                      b_inst, site_ptr, LLVMPointerType(i64, 0), "stk.siptr");
-                  LLVMBuildStore(b_inst, site_marked, site_iptr);
+                  /* 头字一次写：raw[8..11]（obj-8）rc = 1，raw[12..15] tw =
+                   * 栈标记 | 对象标记 | 站点号（docs/OBJECT_LAYOUT.md） */
+                  LLVMValueRef hdr_word = LLVMBuildOr(
+                      b_inst,
+                      LLVMBuildShl(
+                          b_inst,
+                          LLVMBuildOr(b_inst, site_val,
+                                      LLVMConstInt(i64, ZAN_OBJ_TW_MARK, 0),
+                                      "stk.tw"),
+                          LLVMConstInt(i64, 32, 0), "stk.tw.hi"),
+                      LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG | 1u, 0), "stk.hdr");
+                  LLVMValueRef hdr8 =
+                      LLVMConstInt(i64, 16 - ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &hdr8, 1, "stk.hdrp");
+                  LLVMValueRef hdr_iptr = LLVMBuildBitCast(
+                      b_inst, hdr_ptr, LLVMPointerType(i64, 0), "stk.hdrip");
+                  LLVMSetAlignment(LLVMBuildStore(b_inst, hdr_word, hdr_iptr),
+                                   8);
 
                   /* user_ptr = raw + 16 */
-                  LLVMValueRef hdr_off =
-                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef hdr_off = LLVMConstInt(i64, 16, 0);
                   LLVMValueRef stk_user_ptr = LLVMBuildGEP2(
                       b_inst, i8, alloca_buf, &hdr_off, 1, "stk.usr");
                   LLVMDisposeBuilder(b_inst);
 
                   clear_escape_user_tail_calls(inst, 0);
-                  if (desc_dtor_is_self_only(site_val))
+                  if (desc_dtor_is_self_only(mod, site_val))
                     erase_stack_obj_arc_calls(inst, false, 0);
                   LLVMReplaceAllUsesWith(inst, stk_user_ptr);
                   LLVMInstructionEraseFromParent(inst);
@@ -3185,15 +3253,9 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
 
                   LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
                   LLVMPositionBuilderBefore(b_inst, inst);
-                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
-                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.s.rcp");
-                  LLVMSetAlignment(
-                      LLVMBuildStore(b_inst,
-                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
-                                     rc_ptr),
-                      8);
-                  LLVMValueRef hdr_off =
-                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  /* 12B 字符串头在 [4..15]：len(i32) 在 +4，hdr_word(i64: rc=-1|"ZANS") 在 +8，
+                   * 字符数据在 +ZAN_STR_VBASE(+16)。 */
+                  LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_STR_VBASE, 0);
                   LLVMValueRef stk_str = LLVMBuildGEP2(
                       b_inst, i8, alloca_buf, &hdr_off, 1, "stk.s.usr");
                   LLVMValueRef val_arg = LLVMGetOperand(inst, 0);
@@ -3205,18 +3267,26 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                       itoa_n, "stk.s.len");
                   LLVMSetInstructionCallConv(
                       slen, LLVMGetFunctionCallConv(itoa64));
-                  LLVMValueRef eight =
-                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                  LLVMValueRef len_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_STR_LEN_OFF), 0);
+                  LLVMValueRef len_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &len_off, 1, "stk.s.lenp");
+                  LLVMValueRef len_iptr = LLVMBuildBitCast(
+                      b_inst, len_ptr, LLVMPointerType(i32, 0), "stk.s.lenip");
+                  LLVMValueRef slen32 =
+                      LLVMBuildTrunc(b_inst, slen, i32, "stk.s.len32");
+                  LLVMSetAlignment(LLVMBuildStore(b_inst, slen32, len_iptr), 4);
+                  LLVMValueRef w1_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_HDR_WORD_OFF), 0);
                   LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-                      b_inst, i8, alloca_buf, &eight, 1, "stk.s.hdrp");
+                      b_inst, i8, alloca_buf, &w1_off, 1, "stk.s.hdrp");
                   LLVMValueRef hdr_iptr = LLVMBuildBitCast(
                       b_inst, hdr_ptr, LLVMPointerType(i64, 0), "stk.s.hdrip");
-                  LLVMValueRef hdr_word = LLVMBuildOr(
-                      b_inst,
-                      LLVMConstInt(i64, (uint64_t)ZAN_STRING_TAG << 32, 0),
-                      slen, "stk.s.hdr");
                   LLVMSetAlignment(
-                      LLVMBuildStore(b_inst, hdr_word, hdr_iptr), 8);
+                      LLVMBuildStore(b_inst,
+                                     LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
+                                     hdr_iptr),
+                      8);
                   LLVMValueRef nul_p = LLVMBuildGEP2(
                       b_inst, i8, stk_str, &slen, 1, "stk.s.nulp");
                   LLVMBuildStore(b_inst, LLVMConstInt(i8, 0, 0), nul_p);
@@ -3243,7 +3313,7 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
                   insert_entry_alloca(b_entry, fn);
                   LLVMValueRef total_val =
-                      LLVMConstInt(i64, obj_sz + ZAN_OBJ_HDR_SIZE, 0);
+                      LLVMConstInt(i64, obj_sz + ZAN_STR_VBASE, 0);
                   LLVMValueRef alloca_buf =
                       LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.sraw");
                   LLVMSetAlignment(alloca_buf, 16);
@@ -3251,29 +3321,29 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
 
                   LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
                   LLVMPositionBuilderBefore(b_inst, inst);
-                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
-                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.s.rcp");
+                  LLVMValueRef len_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_STR_LEN_OFF), 0);
+                  LLVMValueRef len_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &len_off, 1, "stk.s.lenp");
+                  LLVMValueRef len_iptr = LLVMBuildBitCast(
+                      b_inst, len_ptr, LLVMPointerType(i32, 0), "stk.s.lenip");
                   LLVMSetAlignment(
                       LLVMBuildStore(b_inst,
-                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
-                                     rc_ptr),
-                      8);
-                  LLVMValueRef eight =
-                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                                     LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0),
+                                     len_iptr),
+                      4);
+                  LLVMValueRef w1_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_HDR_WORD_OFF), 0);
                   LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-                      b_inst, i8, alloca_buf, &eight, 1, "stk.s.hdrp");
+                      b_inst, i8, alloca_buf, &w1_off, 1, "stk.s.hdrp");
                   LLVMValueRef hdr_iptr = LLVMBuildBitCast(
                       b_inst, hdr_ptr, LLVMPointerType(i64, 0), "stk.s.hdrip");
                   LLVMSetAlignment(
-                      LLVMBuildStore(
-                          b_inst,
-                          LLVMConstInt(i64,
-                                       ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN),
-                                       0),
-                          hdr_iptr),
+                      LLVMBuildStore(b_inst,
+                                     LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
+                                     hdr_iptr),
                       8);
-                  LLVMValueRef hdr_off =
-                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_STR_VBASE, 0);
                   LLVMValueRef stk_str = LLVMBuildGEP2(
                       b_inst, i8, alloca_buf, &hdr_off, 1, "stk.s.usr");
                   LLVMDisposeBuilder(b_inst);
@@ -3287,7 +3357,7 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                 }
               } else if (dyn_sso_count < 8 &&
                          !check_val_escapes(inst, bb, entry_bb, 0)) {
-                /* 动态尺寸非逃逸短串 SSO 快路径：<=256B 走入口栈缓冲（rc=-1 免疫释放），
+                /* 动态尺寸非逃逸短串 SSO 快路径：<=256B 走入口栈缓冲（rc=0xffffffff 免疫释放），
                  * >256B 回退 zan_rt_str_alloc，并保留原 zan_rt_str_release 以正确释放堆回退。 */
                 LLVMBasicBlockRef join_bb =
                     zan_llvm_split_bb(bb, inst, "sso.join");
@@ -3296,7 +3366,7 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
                   insert_entry_alloca(b_entry, fn);
                   LLVMValueRef total_val =
-                      LLVMConstInt(i64, 256 + ZAN_OBJ_HDR_SIZE, 0);
+                      LLVMConstInt(i64, 256 + ZAN_STR_VBASE, 0);
                   LLVMValueRef alloca_buf =
                       LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.sso");
                   LLVMSetAlignment(alloca_buf, 16);
@@ -3319,29 +3389,29 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMBuildCondBr(b_br, is_small, fast_bb, heap_bb);
 
                   LLVMPositionBuilderAtEnd(b_br, fast_bb);
-                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
-                      b_br, alloca_buf, LLVMPointerType(i64, 0), "sso.rcp");
+                  LLVMValueRef len_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_STR_LEN_OFF), 0);
+                  LLVMValueRef len_ptr = LLVMBuildGEP2(
+                      b_br, i8, alloca_buf, &len_off, 1, "sso.lenp");
+                  LLVMValueRef len_iptr = LLVMBuildBitCast(
+                      b_br, len_ptr, LLVMPointerType(i32, 0), "sso.lenip");
                   LLVMSetAlignment(
                       LLVMBuildStore(b_br,
-                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
-                                     rc_ptr),
-                      8);
-                  LLVMValueRef eight =
-                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                                     LLVMConstInt(i32, ZAN_STR_LEN_UNKNOWN, 0),
+                                     len_iptr),
+                      4);
+                  LLVMValueRef w1_off = LLVMConstInt(
+                      i64, (uint64_t)(ZAN_STR_VBASE + ZAN_HDR_WORD_OFF), 0);
                   LLVMValueRef hdr_ptr = LLVMBuildGEP2(
-                      b_br, i8, alloca_buf, &eight, 1, "sso.hdrp");
+                      b_br, i8, alloca_buf, &w1_off, 1, "sso.hdrp");
                   LLVMValueRef hdr_iptr = LLVMBuildBitCast(
                       b_br, hdr_ptr, LLVMPointerType(i64, 0), "sso.hdrip");
                   LLVMSetAlignment(
-                      LLVMBuildStore(
-                          b_br,
-                          LLVMConstInt(i64,
-                                       ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN),
-                                       0),
-                          hdr_iptr),
+                      LLVMBuildStore(b_br,
+                                     LLVMConstInt(i64, ZAN_STR_LIT_W1, 0),
+                                     hdr_iptr),
                       8);
-                  LLVMValueRef hdr_off =
-                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_STR_VBASE, 0);
                   LLVMValueRef stk_str = LLVMBuildGEP2(
                       b_br, i8, alloca_buf, &hdr_off, 1, "sso.usr");
                   LLVMBuildBr(b_br, join_bb);
@@ -3382,12 +3452,1032 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
   return stats;
 }
 
+/* ===================== Late ARC pass: pairs exposed by inlining =====================
+ * The early zan_opt_arc only sees a retain and its release when both sit in
+ * one function before inlining. The common shape -- a callee returns +1
+ * (`Make()` retains a field), the caller uses it as a temporary and releases
+ * it -- only meets after LLVM inlines the callee, and by then retain/release
+ * are themselves inlined atomics nobody can match. Keeping the ARC, allocation,
+ * and temp-stack helpers out of line through the main pipeline lets both the
+ * post-inline Zan passes (escape/ARC/eh_tmp) and the late ARC passes cancel
+ * cross-block/region pairs before the helpers are inlined and cleaned up.
+ * ZAN_NO_LATE_ARC=1 disables the late ARC pair passes (A/B). */
+static unsigned late_attr_kind(const char *name) {
+  return LLVMGetEnumAttributeKindForName(name, strlen(name));
+}
+
+static const char *late_callee_name(LLVMValueRef call) {
+  LLVMValueRef callee = LLVMGetCalledValue(call);
+  if (!callee || !LLVMIsAFunction(callee))
+    return NULL;
+  return LLVMGetValueName(callee);
+}
+
+static bool late_call_nounwind(LLVMValueRef call) {
+  unsigned k = late_attr_kind("nounwind");
+  if (LLVMGetCallSiteEnumAttribute(call, LLVMAttributeFunctionIndex, k))
+    return true;
+  LLVMValueRef callee = LLVMGetCalledValue(call);
+  return callee && LLVMIsAFunction(callee) &&
+         LLVMGetEnumAttributeAtIndex(callee, LLVMAttributeFunctionIndex, k);
+}
+
+/* x read from shared memory with a volatile or atomic load is lock-free
+ * publication: another thread may swap the slot and drop the old object at
+ * any moment, so the retain is the only thing keeping x alive. Never cancel
+ * its pair. */
+static bool late_obj_from_sync_load(LLVMValueRef obj) {
+  LLVMValueRef v = strip_pointer_casts(obj);
+  if (!v || !LLVMIsALoadInst(v))
+    return false;
+  return LLVMGetVolatile(v) || LLVMGetOrdering(v) != LLVMAtomicOrderingNotAtomic;
+}
+
+#define LATE_ARC_WINDOW 64
+static bool late_window_ok(LLVMValueRef c, LLVMValueRef obj) {
+  zan_arc_call_kind_t k = get_arc_call_kind(c);
+  if (k == ARC_RELEASE_OBJ || k == ARC_RELEASE_STR)
+    return false;
+  /* Storing x itself is the ownership transfer the pair exists for
+   * (`this.l = a` inlined from a constructor: retain(a); store a; ...;
+   * the caller's release(a) of its temporary). The window already admits
+   * no release and no call that could run code, so nothing can drop the
+   * stored reference before the release; the store's slot simply inherits
+   * the temporary's +1. */
+  if (LLVMGetInstructionOpcode(c) == LLVMStore &&
+      strip_pointer_casts(LLVMGetOperand(c, 0)) == obj) {
+    LLVMValueRef dst = strip_pointer_casts(LLVMGetOperand(c, 1));
+    return dst != obj;
+  }
+  return is_safe_arc_intermediate(c, obj);
+}
+
+/* Pass 0: retain/release of a constant null is a no-op (inlining a
+ * constructor `this.l = null`, or `old` folded to null on a fresh object);
+ * left in place it closes every ARC window around it. */
+static int late_drop_null_arc(LLVMValueRef fn) {
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    while (inst) {
+      LLVMValueRef next = LLVMGetNextInstruction(inst);
+      if (get_arc_call_kind(inst) != ARC_NONE) {
+        LLVMValueRef v = get_arc_operand(inst);
+        if (v && LLVMIsAConstantPointerNull(v)) {
+          LLVMInstructionEraseFromParent(inst);
+          dropped++;
+        }
+      }
+      inst = next;
+    }
+  }
+  return dropped;
+}
+
+/* Pass 1: drop push(v)/pop pairs whose window cannot unwind. */
+static int late_drop_tmp_pairs(LLVMValueRef fn) {
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    while (inst) {
+      LLVMValueRef next = LLVMGetNextInstruction(inst);
+      const char *n = LLVMGetInstructionOpcode(inst) == LLVMCall
+                          ? late_callee_name(inst)
+                          : NULL;
+      if (n && strcmp(n, "__zan_eh_tmp_push") == 0) {
+        LLVMValueRef pop = NULL;
+        for (LLVMValueRef c = next; c && !LLVMIsATerminatorInst(c);
+             c = LLVMGetNextInstruction(c)) {
+          if (LLVMGetInstructionOpcode(c) != LLVMCall)
+            continue;
+          const char *cn = late_callee_name(c);
+          if (cn && strcmp(cn, "__zan_eh_tmp_pop") == 0) {
+            pop = c;
+            break;
+          }
+          if (cn && strncmp(cn, "__zan_eh_", 9) == 0)
+            break;
+          if (!late_call_nounwind(c))
+            break;
+        }
+        if (pop) {
+          if (next == pop)
+            next = LLVMGetNextInstruction(pop);
+          LLVMInstructionEraseFromParent(pop);
+          LLVMInstructionEraseFromParent(inst);
+          dropped++;
+        }
+      }
+      inst = next;
+    }
+  }
+  return dropped;
+}
+
+/* Pass 1b: a function that nothing can unwind into or out of never has its
+ * temp-stack entries read. */
+static int late_drop_dead_tmp(LLVMValueRef fn) {
+  if (!LLVMGetEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                   late_attr_kind("nounwind")))
+    return 0;
+  int n = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+         inst = LLVMGetNextInstruction(inst)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+      if (op == LLVMInvoke || op == LLVMLandingPad || op == LLVMResume)
+        return 0;
+      if (op != LLVMCall)
+        continue;
+      const char *cn = late_callee_name(inst);
+      if (!cn)
+        continue;
+      if (strcmp(cn, "__zan_eh_tmp_unwind") == 0)
+        return 0;
+      if (strcmp(cn, "__zan_eh_tmp_push") == 0 ||
+          strcmp(cn, "__zan_eh_tmp_pop") == 0)
+        n++;
+    }
+  }
+  if (n == 0)
+    return 0;
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    while (inst) {
+      LLVMValueRef next = LLVMGetNextInstruction(inst);
+      const char *cn = LLVMGetInstructionOpcode(inst) == LLVMCall
+                           ? late_callee_name(inst)
+                           : NULL;
+      if (cn && (strcmp(cn, "__zan_eh_tmp_push") == 0 ||
+                 strcmp(cn, "__zan_eh_tmp_pop") == 0)) {
+        LLVMInstructionEraseFromParent(inst);
+        dropped++;
+      }
+      inst = next;
+    }
+  }
+  return dropped / 2;
+}
+
+/* Pass 1c: fold loads from a freshly zeroed allocation. */
+static LLVMValueRef late_fresh_root(LLVMValueRef p, long long *off) {
+  long long o = 0;
+  for (int d = 0; d < 8 && p; d++) {
+    if (LLVMIsAGetElementPtrInst(p) && LLVMGetNumOperands(p) == 2 &&
+        LLVMGetGEPSourceElementType(p) ==
+            LLVMInt8TypeInContext(LLVMGetTypeContext(LLVMTypeOf(p)))) {
+      LLVMValueRef idx = LLVMGetOperand(p, 1);
+      if (!LLVMIsAConstantInt(idx))
+        return NULL;
+      o += LLVMConstIntGetSExtValue(idx);
+      p = LLVMGetOperand(p, 0);
+      continue;
+    }
+    if (LLVMIsACallInst(p)) {
+      const char *n = late_callee_name(p);
+      if (n && (strcmp(n, "malloc") == 0 || strcmp(n, "zan_mem_malloc") == 0 ||
+                strcmp(n, "zan_mem_obj_malloc") == 0)) {
+        *off = o;
+        return p;
+      }
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
+static bool late_value_predates(LLVMValueRef v, LLVMValueRef root) {
+  if (LLVMIsAArgument(v) || LLVMIsAConstant(v))
+    return true;
+  if (!LLVMIsAInstruction(v) ||
+      LLVMGetInstructionParent(v) != LLVMGetInstructionParent(root))
+    return false;
+  for (LLVMValueRef i = LLVMGetPreviousInstruction(root); i;
+       i = LLVMGetPreviousInstruction(i))
+    if (i == v)
+      return true;
+  return false;
+}
+
+static unsigned long long late_store_size(LLVMTypeRef t) {
+  switch (LLVMGetTypeKind(t)) {
+  case LLVMPointerTypeKind:
+  case LLVMDoubleTypeKind:
+    return 8;
+  case LLVMFloatTypeKind:
+    return 4;
+  case LLVMIntegerTypeKind:
+    return (LLVMGetIntTypeWidth(t) + 7) / 8;
+  default:
+    return 0;
+  }
+}
+
+static int late_fold_fresh_loads(LLVMValueRef fn) {
+  int folded = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    while (inst) {
+      LLVMValueRef next = LLVMGetNextInstruction(inst);
+      long long loff = 0;
+      unsigned long long lsz = 0;
+      LLVMValueRef root = NULL;
+      if (LLVMIsALoadInst(inst) && !LLVMGetVolatile(inst) &&
+          LLVMGetOrdering(inst) == LLVMAtomicOrderingNotAtomic &&
+          (lsz = late_store_size(LLVMTypeOf(inst))) != 0)
+        root = late_fresh_root(LLVMGetOperand(inst, 0), &loff);
+      for (LLVMValueRef c = root ? LLVMGetPreviousInstruction(inst) : NULL; c;
+           c = LLVMGetPreviousInstruction(c)) {
+        if (LLVMIsAStoreInst(c)) {
+          long long soff = 0;
+          LLVMValueRef sr = late_fresh_root(LLVMGetOperand(c, 1), &soff);
+          unsigned long long ssz =
+              late_store_size(LLVMTypeOf(LLVMGetOperand(c, 0)));
+          if (sr != root || !ssz || LLVMGetVolatile(c))
+            break;
+          if (soff < loff + (long long)lsz && loff < soff + (long long)ssz)
+            break;
+          continue;
+        }
+        if (LLVMIsACallInst(c)) {
+          const char *n = late_callee_name(c);
+          if (n && strncmp(n, "llvm.memset.", 12) == 0) {
+            long long moff = 0;
+            LLVMValueRef mr = late_fresh_root(LLVMGetOperand(c, 0), &moff);
+            LLVMValueRef val = LLVMGetOperand(c, 1), len = LLVMGetOperand(c, 2);
+            if (mr == root && LLVMIsAConstantInt(val) &&
+                LLVMConstIntGetZExtValue(val) == 0 && LLVMIsAConstantInt(len) &&
+                moff <= loff &&
+                loff + (long long)lsz <=
+                    moff + (long long)LLVMConstIntGetZExtValue(len)) {
+              LLVMReplaceAllUsesWith(inst, LLVMConstNull(LLVMTypeOf(inst)));
+              LLVMInstructionEraseFromParent(inst);
+              folded++;
+            }
+            break;
+          }
+          zan_arc_call_kind_t k = get_arc_call_kind(c);
+          if ((k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) &&
+              late_value_predates(get_arc_operand(c), root))
+            continue;
+          if (n && strncmp(n, "llvm.lifetime.", 14) == 0)
+            continue;
+          break;
+        }
+        if (c == root)
+          break;
+        LLVMOpcode op = LLVMGetInstructionOpcode(c);
+        if (op == LLVMAtomicRMW || op == LLVMAtomicCmpXchg || op == LLVMFence ||
+            op == LLVMInvoke || op == LLVMCallBr)
+          break;
+      }
+      inst = next;
+    }
+  }
+  return folded;
+}
+
+/* Pass 2: cancel retain(x) ... release(x) inside one block. */
+static int late_drop_arc_pairs(LLVMValueRef fn) {
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+    while (inst) {
+      LLVMValueRef next = LLVMGetNextInstruction(inst);
+      zan_arc_call_kind_t k = get_arc_call_kind(inst);
+      if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) {
+        zan_arc_call_kind_t want =
+            k == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
+        LLVMValueRef obj = get_arc_operand(inst);
+        if (late_obj_from_sync_load(obj)) {
+          inst = next;
+          continue;
+        }
+        LLVMValueRef rel = NULL;
+        int steps = 0;
+        for (LLVMValueRef c = next; c && steps < LATE_ARC_WINDOW;
+             c = LLVMGetNextInstruction(c), steps++) {
+          zan_arc_call_kind_t ck = get_arc_call_kind(c);
+          if (ck == want && are_same_arc_object(get_arc_operand(c), obj)) {
+            rel = c;
+            break;
+          }
+          if (!late_window_ok(c, obj))
+            break;
+        }
+        if (rel) {
+          if (next == rel)
+            next = LLVMGetNextInstruction(rel);
+          LLVMInstructionEraseFromParent(rel);
+          LLVMInstructionEraseFromParent(inst);
+          dropped++;
+        }
+      }
+      inst = next;
+    }
+  }
+  return dropped;
+}
+
+/* Pass 2b: retain(x) at the end of block B, release in a successor S. */
+static LLVMValueRef late_first_non_phi(LLVMBasicBlockRef bb) {
+  LLVMValueRef i = LLVMGetFirstInstruction(bb);
+  while (i && LLVMIsAPHINode(i))
+    i = LLVMGetNextInstruction(i);
+  return i;
+}
+
+static LLVMValueRef late_phi_in(LLVMValueRef phi, LLVMBasicBlockRef from) {
+  unsigned n = LLVMCountIncoming(phi);
+  for (unsigned i = 0; i < n; i++)
+    if (LLVMGetIncomingBlock(phi, i) == from)
+      return LLVMGetIncomingValue(phi, i);
+  return NULL;
+}
+
+static bool late_try_cross(LLVMBuilderRef b, LLVMValueRef retain,
+                           shrink_map_t *preds) {
+  LLVMBasicBlockRef bb = LLVMGetInstructionParent(retain);
+  LLVMValueRef obj = get_arc_operand(retain);
+  if (late_obj_from_sync_load(obj))
+    return false;
+  zan_arc_call_kind_t want = get_arc_call_kind(retain) == ARC_RETAIN_OBJ
+                                 ? ARC_RELEASE_OBJ
+                                 : ARC_RELEASE_STR;
+  LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+#if ZAN_LLVM_MAJOR >= 23
+  if (!term || (LLVMGetInstructionOpcode(term) != LLVMUncondBr &&
+                LLVMGetInstructionOpcode(term) != LLVMCondBr))
+    return false;
+#else
+  if (!term || LLVMGetInstructionOpcode(term) != LLVMBr)
+    return false;
+#endif
+  int steps = 0;
+  for (LLVMValueRef c = LLVMGetNextInstruction(retain); c && c != term;
+       c = LLVMGetNextInstruction(c))
+    if (++steps > LATE_ARC_WINDOW || !late_window_ok(c, obj))
+      return false;
+  unsigned ns = LLVMGetNumSuccessors(term);
+  if (ns < 1 || ns > 2)
+    return false;
+  if (ns == 2 && LLVMGetSuccessor(term, 0) == LLVMGetSuccessor(term, 1))
+    return false;
+  LLVMBasicBlockRef s_bb = NULL, other = NULL;
+  LLVMValueRef rel = NULL, rel_phi = NULL;
+  for (unsigned si = 0; si < ns; si++) {
+    LLVMBasicBlockRef sb = LLVMGetSuccessor(term, si);
+    if (s_bb) {
+      other = sb;
+      continue;
+    }
+    int sw = 0;
+    for (LLVMValueRef c = late_first_non_phi(sb); c && sw < LATE_ARC_WINDOW;
+         c = LLVMGetNextInstruction(c), sw++) {
+      if (get_arc_call_kind(c) == want) {
+        LLVMValueRef v = get_arc_operand(c);
+        LLVMValueRef in =
+            LLVMIsAPHINode(v) && LLVMGetInstructionParent(v) == sb
+                ? late_phi_in(v, bb)
+                : NULL;
+        int np = *shrink_map_slot(preds, LLVMBasicBlockAsValue(sb), NULL);
+        bool via_other = false;
+        if (np == 2 && ns == 2) {
+          LLVMBasicBlockRef t = LLVMGetSuccessor(term, si == 0 ? 1 : 0);
+          LLVMValueRef tt = LLVMGetBasicBlockTerminator(t);
+          via_other =
+              tt && LLVMGetNumSuccessors(tt) == 1 &&
+              LLVMGetSuccessor(tt, 0) == sb &&
+              *shrink_map_slot(preds, LLVMBasicBlockAsValue(t), NULL) == 1;
+        }
+        if (in && are_same_arc_object(in, obj)) {
+          rel = c;
+          rel_phi = v;
+          s_bb = sb;
+        } else if (are_same_arc_object(v, obj) && (np == 1 || via_other)) {
+          rel = c;
+          rel_phi = np == 1 ? NULL : v;
+          s_bb = sb;
+        }
+        break;
+      }
+      if (!is_safe_arc_intermediate(c, obj))
+        break;
+      if (get_arc_call_kind(c) != ARC_NONE)
+        break;
+    }
+    if (!s_bb)
+      other = sb;
+  }
+  if (!s_bb)
+    return false;
+  if (other) {
+    if (*shrink_map_slot(preds, LLVMBasicBlockAsValue(other), NULL) != 1)
+      return false;
+    if (LLVMIsAPHINode(LLVMGetFirstInstruction(other)))
+      return false;
+  }
+  if (rel_phi) {
+    LLVMPositionBuilderBefore(b, LLVMGetFirstInstruction(s_bb));
+    LLVMValueRef np = LLVMBuildPhi(b, LLVMTypeOf(rel_phi), "late.arc.rel");
+    if (LLVMIsAPHINode(rel_phi) && LLVMGetInstructionParent(rel_phi) == s_bb) {
+      unsigned n = LLVMCountIncoming(rel_phi);
+      for (unsigned i = 0; i < n; i++) {
+        LLVMBasicBlockRef ib = LLVMGetIncomingBlock(rel_phi, i);
+        LLVMValueRef iv = ib == bb ? LLVMConstNull(LLVMTypeOf(rel_phi))
+                                   : LLVMGetIncomingValue(rel_phi, i);
+        LLVMAddIncoming(np, &iv, &ib, 1);
+      }
+    } else {
+      LLVMValueRef iv[2] = {LLVMConstNull(LLVMTypeOf(rel_phi)), rel_phi};
+      LLVMBasicBlockRef ib[2] = {bb, other};
+      LLVMAddIncoming(np, iv, ib, 2);
+    }
+    LLVMSetOperand(rel, 0, np);
+  } else {
+    LLVMInstructionEraseFromParent(rel);
+  }
+  if (other) {
+    LLVMPositionBuilderBefore(b, LLVMGetFirstInstruction(other));
+    LLVMValueRef again = LLVMInstructionClone(retain);
+    LLVMInsertIntoBuilder(b, again);
+  }
+  LLVMInstructionEraseFromParent(retain);
+  return true;
+}
+
+static int late_drop_cross_pairs(LLVMValueRef fn) {
+  unsigned nblocks = LLVMCountBasicBlocks(fn);
+  if (nblocks < 2)
+    return 0;
+  shrink_map_t preds;
+  if (!shrink_map_init(&preds, nblocks))
+    return 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+    if (!term)
+      continue;
+    unsigned ns = LLVMGetNumSuccessors(term);
+    for (unsigned i = 0; i < ns; i++)
+      (*shrink_map_slot(&preds, LLVMBasicBlockAsValue(LLVMGetSuccessor(term, i)),
+                        NULL))++;
+  }
+  LLVMBuilderRef b =
+      LLVMCreateBuilderInContext(LLVMGetModuleContext(LLVMGetGlobalParent(fn)));
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef last = NULL;
+    for (LLVMValueRef c = LLVMGetFirstInstruction(bb); c;
+         c = LLVMGetNextInstruction(c)) {
+      zan_arc_call_kind_t k = get_arc_call_kind(c);
+      if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR)
+        last = c;
+    }
+    if (last && late_try_cross(b, last, &preds))
+      dropped++;
+  }
+  LLVMDisposeBuilder(b);
+  shrink_map_free(&preds);
+  return dropped;
+}
+
+/* Pass 2c: retain(x) whose releases lie further away, across a loop. */
+#define LATE_REGION_BLOCKS 64
+#define LATE_REGION_INSTS 4096
+#define LATE_REGION_COMPS 8
+
+typedef struct {
+  LLVMBasicBlockRef blocks[LATE_REGION_BLOCKS];
+  int nblocks;
+  LLVMValueRef rels[LATE_REGION_BLOCKS];
+  int nrels;
+  LLVMValueRef comps[LATE_REGION_COMPS];
+  int ncomps;
+  bool cont[LATE_REGION_BLOCKS];
+  int insts;
+} late_region_t;
+
+static int late_region_index(late_region_t *r, LLVMBasicBlockRef bb) {
+  for (int i = 0; i < r->nblocks; i++)
+    if (r->blocks[i] == bb)
+      return i;
+  return -1;
+}
+
+static bool late_region_comp(late_region_t *r, LLVMValueRef c) {
+  if (r->ncomps >= LATE_REGION_COMPS)
+    return false;
+  r->comps[r->ncomps++] = c;
+  return true;
+}
+
+static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb,
+                             LLVMValueRef start, LLVMValueRef obj,
+                             zan_arc_call_kind_t want) {
+  for (LLVMValueRef c = start; c; c = LLVMGetNextInstruction(c)) {
+    if (++r->insts > LATE_REGION_INSTS)
+      return false;
+    zan_arc_call_kind_t ck = get_arc_call_kind(c);
+    if (ck == want && are_same_arc_object(get_arc_operand(c), obj)) {
+      if (r->nrels >= LATE_REGION_BLOCKS)
+        return false;
+      r->rels[r->nrels++] = c;
+      return true;
+    }
+    if (LLVMIsATerminatorInst(c)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(c);
+#if ZAN_LLVM_MAJOR >= 23
+      bool branch = op == LLVMUncondBr || op == LLVMCondBr || op == LLVMSwitch;
+#else
+      bool branch = op == LLVMBr || op == LLVMSwitch;
+#endif
+      if (!branch)
+        return late_region_comp(r, c);
+      int self = late_region_index(r, bb);
+      if (self >= 0)
+        r->cont[self] = true;
+      unsigned ns = LLVMGetNumSuccessors(c);
+      for (unsigned i = 0; i < ns; i++) {
+        LLVMBasicBlockRef sb = LLVMGetSuccessor(c, i);
+        if (sb == r->blocks[0])
+          return false;
+        if (late_region_index(r, sb) >= 0)
+          continue;
+        if (r->nblocks >= LATE_REGION_BLOCKS)
+          return false;
+        r->blocks[r->nblocks++] = sb;
+      }
+      return true;
+    }
+    if (LLVMIsAPHINode(c))
+      continue;
+    if (!late_window_ok(c, obj))
+      return late_region_comp(r, c);
+    if (LLVMIsAStoreInst(c) &&
+        LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(c, 0))) ==
+            LLVMPointerTypeKind)
+      return late_region_comp(r, c);
+  }
+  return false;
+}
+
+static bool late_try_region(LLVMValueRef retain, shrink_map_t *preds) {
+  LLVMValueRef obj = get_arc_operand(retain);
+  if (late_obj_from_sync_load(obj))
+    return false;
+  zan_arc_call_kind_t want = get_arc_call_kind(retain) == ARC_RETAIN_OBJ
+                                 ? ARC_RELEASE_OBJ
+                                 : ARC_RELEASE_STR;
+  late_region_t r;
+  memset(&r, 0, sizeof(r));
+  r.blocks[r.nblocks++] = LLVMGetInstructionParent(retain);
+  if (!late_region_scan(&r, r.blocks[0], LLVMGetNextInstruction(retain), obj,
+                        want))
+    return false;
+  for (int bi = 1; bi < r.nblocks; bi++)
+    if (!late_region_scan(&r, r.blocks[bi],
+                          LLVMGetFirstInstruction(r.blocks[bi]), obj, want))
+      return false;
+  if (r.nrels == 0 || r.nblocks < 2)
+    return false;
+  for (int bi = 1; bi < r.nblocks; bi++) {
+    int inside = 0;
+    for (int pj = 0; pj < r.nblocks; pj++) {
+      if (!r.cont[pj])
+        continue;
+      LLVMValueRef t = LLVMGetBasicBlockTerminator(r.blocks[pj]);
+      unsigned ns = t ? LLVMGetNumSuccessors(t) : 0;
+      for (unsigned k = 0; k < ns; k++)
+        if (LLVMGetSuccessor(t, k) == r.blocks[bi])
+          inside++;
+    }
+    if (inside !=
+        *shrink_map_slot(preds, LLVMBasicBlockAsValue(r.blocks[bi]), NULL))
+      return false;
+  }
+  if (r.ncomps) {
+    LLVMBuilderRef b =
+        LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(retain)));
+    for (int i = 0; i < r.ncomps; i++) {
+      LLVMPositionBuilderBefore(b, r.comps[i]);
+      LLVMInsertIntoBuilder(b, LLVMInstructionClone(retain));
+    }
+    LLVMDisposeBuilder(b);
+  }
+  for (int i = 0; i < r.nrels; i++)
+    LLVMInstructionEraseFromParent(r.rels[i]);
+  LLVMInstructionEraseFromParent(retain);
+  return true;
+}
+
+static int late_drop_region_pairs(LLVMValueRef fn) {
+  unsigned nblocks = LLVMCountBasicBlocks(fn);
+  if (nblocks < 3)
+    return 0;
+  shrink_map_t preds;
+  if (!shrink_map_init(&preds, nblocks))
+    return 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+    if (!term)
+      continue;
+    unsigned ns = LLVMGetNumSuccessors(term);
+    for (unsigned i = 0; i < ns; i++)
+      (*shrink_map_slot(&preds, LLVMBasicBlockAsValue(LLVMGetSuccessor(term, i)),
+                        NULL))++;
+  }
+  int dropped = 0;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    LLVMValueRef c = LLVMGetFirstInstruction(bb);
+    while (c) {
+      LLVMValueRef next = LLVMGetNextInstruction(c);
+      zan_arc_call_kind_t k = get_arc_call_kind(c);
+      if ((k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) &&
+          late_try_region(c, &preds)) {
+        dropped++;
+        break;
+      }
+      c = next;
+    }
+  }
+  shrink_map_free(&preds);
+  return dropped;
+}
+
+static int late_arc_run_passes(LLVMModuleRef mod) {
+  int tmp = 0, arc = 0;
+  const char *dump = getenv("ZAN_DUMP_LATE_ARC_IR");
+  if (dump && dump[0])
+    LLVMPrintModuleToFile(mod, dump, NULL);
+  for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
+       fn = LLVMGetNextFunction(fn)) {
+    if (LLVMIsDeclaration(fn))
+      continue;
+    int ftmp = 0;
+    for (int d; (d = late_drop_tmp_pairs(fn)) > 0;)
+      ftmp += d;
+    ftmp += late_drop_dead_tmp(fn);
+    tmp += ftmp;
+    late_drop_null_arc(fn);
+    while (late_fold_fresh_loads(fn) > 0)
+      late_drop_null_arc(fn);
+    arc += late_drop_arc_pairs(fn);
+    arc += late_drop_cross_pairs(fn);
+    arc += late_drop_region_pairs(fn);
+  }
+  if (getenv("ZAN_LATE_ARC_STATS"))
+    fprintf(stderr,
+            "late-arc: %d temp push/pop pairs, %d retain/release pairs removed\n",
+            tmp, arc);
+  return tmp + arc;
+}
+
+/* 在主 LLVM O* 管线期间暂时给运行时 ARC/alloc/EH 辅助函数加上 noinline
+ * （并临时摘除其原有 alwaysinline，避免 noinline+alwaysinline 冲突），
+ * 让用户函数先行内联并暴露出完整逃逸/ARC 配对/常量特征，再在后续清理中放行内联。
+ * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
+ * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
+static const char *const k_rt_defer_inline[] = {
+    "zan_rt_alloc",      "zan_rt_str_alloc",   "__zan_itoa_str",
+    "zan_rt_retain",     "zan_rt_release",     "zan_rt_release_dyn",
+    "zan_rt_str_retain", "zan_rt_str_release", "__zan_str_len",
+    "__zan_str_len_arr", "__zan_eh_state_fast", "__zan_eh_tmp_push",
+    "__zan_eh_tmp_pop",
+};
+enum {
+  k_rt_defer_n = 13,
+  k_rt_eh_fast_idx = 10,
+  k_rt_restore_always_from = 10
+};
+
+typedef struct {
+  bool marked[k_rt_defer_n];
+  bool had_always[k_rt_defer_n];
+  bool eh_fast_mem_added;
+  bool guard_raise_ext;
+  unsigned noinline_kind;
+  unsigned alwaysinl_kind;
+  unsigned memory_kind;
+} rt_defer_state_t;
+
+static void rt_defer_outline(LLVMModuleRef mod, rt_defer_state_t *st) {
+  memset(st, 0, sizeof(*st));
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  st->noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+  st->alwaysinl_kind = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+  st->memory_kind = LLVMGetEnumAttributeKindForName("memory", 6);
+  if (st->noinline_kind == 0)
+    return;
+  LLVMAttributeRef noinl_attr =
+      LLVMCreateEnumAttribute(ctx, st->noinline_kind, 0);
+  for (int i = 0; i < k_rt_defer_n; i++) {
+    LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
+    if (fn && !LLVMIsDeclaration(fn) &&
+        !LLVMGetEnumAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+            st->noinline_kind)) {
+      if (st->alwaysinl_kind != 0 &&
+          LLVMGetEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+              st->alwaysinl_kind)) {
+        st->had_always[i] = true;
+        LLVMRemoveEnumAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+            st->alwaysinl_kind);
+      }
+      LLVMAddAttributeAtIndex(
+          fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinl_attr);
+      st->marked[i] = true;
+      if (i == k_rt_eh_fast_idx && st->memory_kind != 0 &&
+          !LLVMGetEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+              st->memory_kind)) {
+        /* 在 __zan_eh_state_fast 延后内联期间，@__zan_eh_self 仅对其自身可见；
+         * 临时标注 memory(inaccessiblemem: readwrite) 避免冷路径 rt.bad 里的
+         * EH 状态获取破坏热循环的别名分析与 LICM/向量化；放行内联前立即撤回。 */
+        LLVMAddAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(ctx, st->memory_kind, 0x0Cu));
+        st->eh_fast_mem_added = true;
+      }
+    }
+  }
+  /* 阻止 default<O2> 中的 DeadArgumentElimination 裁掉 __zan_guard_raise 的
+   * 常量文件名参数并把 memory(argmem: readwrite, inaccessiblemem: readwrite)
+   * 退化扩宽为全内存 memory(readwrite)；主管线结束后立即恢复 internal 链接。 */
+  LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
+  if (gr_fn && !LLVMIsDeclaration(gr_fn) &&
+      LLVMGetLinkage(gr_fn) == LLVMInternalLinkage) {
+    LLVMSetLinkage(gr_fn, LLVMExternalLinkage);
+    st->guard_raise_ext = true;
+  }
+}
+
+static void rt_defer_restore_guard(LLVMModuleRef mod, rt_defer_state_t *st) {
+  if (!st->guard_raise_ext)
+    return;
+  LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
+  if (gr_fn && !LLVMIsDeclaration(gr_fn))
+    LLVMSetLinkage(gr_fn, LLVMInternalLinkage);
+  st->guard_raise_ext = false;
+}
+
+static bool rt_defer_restore_attrs(LLVMModuleRef mod, rt_defer_state_t *st,
+                                   bool add_default_always) {
+  bool unmarked = false;
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  for (int i = 0; i < k_rt_defer_n; i++) {
+    if (!st->marked[i])
+      continue;
+    LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
+    if (fn && !LLVMIsDeclaration(fn)) {
+      LLVMRemoveEnumAttributeAtIndex(
+          fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+          st->noinline_kind);
+      if (i == k_rt_eh_fast_idx && st->eh_fast_mem_added &&
+          st->memory_kind != 0)
+        LLVMRemoveEnumAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+            st->memory_kind);
+      if (st->alwaysinl_kind != 0 &&
+          (st->had_always[i] ||
+           (add_default_always && i >= k_rt_restore_always_from))) {
+        LLVMAddAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(ctx, st->alwaysinl_kind, 0));
+      }
+      unmarked = true;
+    }
+    st->marked[i] = false;
+  }
+  st->eh_fast_mem_added = false;
+  return unmarked;
+}
+
+/* 外提后清掉死 repack 块、把循环里重读的 Count/数据指针提出去。 */
+/* loop-rotate: a foreach loop whose check was lifted from an unrotated
+ * header-exits-first shape must be rotated before the second pipeline half,
+ * or the vectorizer skips it (foreach over List<int> 0.17 s -> vectorised). */
+#define LIST_HOIST_CLEANUP                                                     \
+  "function(simplifycfg,instcombine<no-verify-fixpoint>,loop(loop-rotate),"    \
+  "loop-mssa(licm),gvn,simplifycfg)"
+
+/* ZAN_NO_LIST_HOIST=1 关断 List 槽宽检查外提（红绿对照用）。 */
+static bool list_hoist_wanted(zan_opt_level_t level, bool custom_pipe) {
+  return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) &&
+         !getenv("ZAN_NO_LIST_HOIST") && !custom_pipe;
+}
+
+static bool guard_version_wanted(zan_opt_level_t level, bool custom_pipe) {
+  return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) && !custom_pipe;
+}
+
+static bool late_arc_wanted(zan_opt_level_t level, bool custom_pipe) {
+  return (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE ||
+          level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) &&
+         !getenv("ZAN_NO_LATE_ARC") && !custom_pipe;
+}
+
+/* Level-dependent attribute marking shared by the one-piece and split
+ * pipelines. Returns the default<ON> text pipeline, or NULL for a bad level;
+ * *ol gets N and *vec whether the vectorizer tuning flags are on. */
+static const char *zan_opt_prepare_level(LLVMModuleRef mod,
+                                         zan_opt_level_t level,
+                                         const zan_opt_knobs_t *knobs, int *ol,
+                                         int *vec, bool shrink) {
+  /* S-UNWIND（全局 pass ②）：在 LLVM
+   * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
+   * -fno-opt-shrink（或回退 ZAN_NO_UNWIND_SHRINK=1）关断（红绿对照用）。
+   * 分区单元（build_partition.h）不跑：整模块在切分前已跑过一遍。 */
+  if (shrink &&
+      !zan_opt_knob_off(knobs ? knobs->no_shrink : 0, "ZAN_NO_UNWIND_SHRINK")) {
+    zan_shrink_collapse_invokes(mod);
+  }
+  *vec = level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE;
+  switch (level) {
+  case ZAN_OPT_BASIC:
+    *ol = 1;
+    return "default<O1>";
+  case ZAN_OPT_FULL:
+    zan_opt_mark_huge(mod);
+    *ol = 2;
+    return "default<O2>";
+#if ZAN_LLVM_MAJOR >= 23
+  case ZAN_OPT_SIZE:
+    zan_opt_mark_size(mod, false);
+    *ol = 2;
+    return "default<O2>,mergefunc,globaldce";
+  case ZAN_OPT_SIZE_MIN:
+    zan_opt_mark_size(mod, true);
+    *ol = 2;
+    return "default<O2>,mergefunc,globaldce";
+#else
+  case ZAN_OPT_SIZE:
+    *ol = 0;
+    return "default<Os>,mergefunc,globaldce";
+  case ZAN_OPT_SIZE_MIN:
+    *ol = 0;
+    return "default<Oz>,mergefunc,globaldce";
+#endif
+  case ZAN_OPT_AGGRESSIVE:
+    zan_opt_mark_huge(mod);
+    *ol = 3;
+    return "default<O3>";
+  default:
+    return NULL;
+  }
+}
+
+/* Split pipeline (codegen_split.h): run the simplification half -- every
+ * inlining decision -- on the whole module now, and leave the finish half to
+ * object emission, which runs it per partition in parallel with codegen
+ * (or on the whole module when it does not split). */
+static bool zan_opt_can_defer_finish(zan_irgen_t *g, zan_opt_level_t level) {
+#if ZAN_LLVM_MAJOR < 23
+  /* default<Os>/<Oz> have no split form here. */
+  if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN)
+    return false;
+#else
+  (void)level;
+#endif
+  const char *e = getenv("ZAN_OPT_SPLIT");
+  if (e && e[0] == '0')
+    return false;
+  if (!g->defer_opt_finish_ok)
+    return false;
+  if ((e = getenv("ZAN_OPT_PIPELINE")) && e[0])
+    return false;
+  if ((e = getenv("ZAN_DUMP_OPT_IR")) && e[0])
+    return false;
+  return true;
+}
+
+bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level) {
+  g->opt_finish_level = 0;
+  g->opt_finish_vectorize = false;
+  if (level == ZAN_OPT_NONE || !zan_opt_can_defer_finish(g, level))
+    return false;
+  switch (level) {
+  case ZAN_OPT_BASIC:
+    g->opt_finish_level = 1;
+    break;
+  case ZAN_OPT_FULL:
+  case ZAN_OPT_SIZE:
+  case ZAN_OPT_SIZE_MIN:
+    g->opt_finish_level = 2;
+    break;
+  case ZAN_OPT_AGGRESSIVE:
+    g->opt_finish_level = 3;
+    break;
+  default:
+    return false;
+  }
+  g->opt_finish_vectorize = level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE;
+  return true;
+}
+
+/* Post-inline Zan + Late ARC 优化 pass：先塌缩新暴露的 nothrow invoke、消除无抛出间隔的
+ * EH 临时栈 push/pop 与死 unwind，再消除栈逃逸、ARC/跨块/跨循环冗余、虚调用、常量与死代码。 */
+static bool zan_opt_run_post_inline_passes(LLVMModuleRef mod,
+                                           zan_opt_level_t level,
+                                           const zan_opt_knobs_t *knobs,
+                                           zan_irgen_t *g_opt,
+                                           zan_opt_report_t *report_out,
+                                           bool shrink, bool run_late_arc) {
+  bool post_changed = false;
+  if (shrink && !zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
+    if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
+      post_changed = true;
+  }
+  if (zan_opt_eh_tmp_mod(mod) > 0)
+    post_changed = true;
+  if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE")) {
+    zan_escape_stats_t es = zan_opt_escape_mod(mod);
+    if (es.stack_promoted > 0)
+      post_changed = true;
+    if (report_out) {
+      report_out->escape.objects_analyzed += es.objects_analyzed;
+      report_out->escape.stack_promoted += es.stack_promoted;
+    }
+  }
+  if (!zan_opt_knob_off(knobs->no_arc, "ZAN_NO_OPT_ARC")) {
+    zan_arc_opt_stats_t as = zan_opt_arc_mod(mod, level);
+    if (as.pairs_elided > 0)
+      post_changed = true;
+    if (report_out)
+      report_out->arc.pairs_elided += as.pairs_elided;
+    if (run_late_arc && late_arc_run_passes(mod) > 0)
+      post_changed = true;
+  }
+  if (!zan_opt_knob_off(knobs->no_devirt, "ZAN_NO_OPT_DEVIRT")) {
+    zan_devirt_stats_t ds = zan_opt_devirt_mod(mod, g_opt);
+    if (ds.calls_devirtualized > 0)
+      post_changed = true;
+    if (report_out)
+      report_out->devirt.calls_devirtualized += ds.calls_devirtualized;
+  }
+  if (!zan_opt_knob_off(knobs->no_constfold, "ZAN_NO_OPT_CONSTFOLD")) {
+    zan_constfold_stats_t cs = zan_opt_const_fold_mod(mod);
+    if (cs.constants_folded > 0)
+      post_changed = true;
+    if (report_out)
+      report_out->constfold.constants_folded += cs.constants_folded;
+  }
+  if (!zan_opt_knob_off(knobs->no_dce, "ZAN_NO_OPT_DCE")) {
+    zan_dce_stats_t ds2 = zan_opt_dce_mod(mod);
+    if (ds2.dead_stores > 0)
+      post_changed = true;
+    if (report_out)
+      report_out->dce.dead_stores += ds2.dead_stores;
+  }
+  return post_changed;
+}
+
+static const char *zan_opt_post_cleanup_pipeline(zan_opt_level_t level,
+                                                 bool rt_unmarked,
+                                                 bool post_changed) {
+  if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
+    if (rt_unmarked || post_changed)
+      return "cgscc(inline),"
+             "function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+             "simplifycfg,dse),globaldce";
+  } else if (level == ZAN_OPT_SIZE) {
+    /* -Os 下放行已摘除临时 noinline 的核心运行库按成本模型内联（不再永远禁止），
+     * 同时保留 mergefunc/globaldce 控体积。 */
+    if (rt_unmarked || post_changed)
+      return "cgscc(inline),"
+             "function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+             "simplifycfg,dse),mergefunc,globaldce";
+  } else if (level == ZAN_OPT_SIZE_MIN) {
+    if (rt_unmarked || post_changed)
+      return "always-inline,"
+             "function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+             "simplifycfg,dse),mergefunc,globaldce";
+  } else if (post_changed) {
+    return "function(sroa,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+           "simplifycfg,dse)";
+  }
+  return NULL;
+}
+
 static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
                                           LLVMTargetMachineRef tm,
                                           zan_opt_level_t level,
                                           const zan_opt_knobs_t *knobs,
                                           zan_irgen_t *g_opt,
-                                          zan_opt_report_t *report_out) {
+                                          zan_opt_report_t *report_out,
+                                          bool shrink) {
   static const zan_opt_knobs_t default_knobs;
   if (!knobs)
     knobs = &default_knobs;
@@ -3396,45 +4486,12 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     return ZAN_ERROR;
   if (level == ZAN_OPT_NONE)
     return ZAN_OK;
-  /* S-UNWIND（全局 pass ②）：在 LLVM
-   * 管线前塌缩可证不抛的 invoke，死 lpad 块交给后续管线清理。
-   * -fno-opt-shrink（或回退 ZAN_NO_UNWIND_SHRINK=1）关断（红绿对照用）。 */
-  if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
-    zan_shrink_collapse_invokes(mod);
-  }
-  const char *passes = NULL;
-  switch (level) {
-  case ZAN_OPT_BASIC:
-    passes = "default<O1>";
-    break;
-  case ZAN_OPT_FULL:
-    zan_opt_mark_huge(mod);
-    passes = "default<O2>";
-    break;
-#if ZAN_LLVM_MAJOR >= 23
-  case ZAN_OPT_SIZE:
-    zan_opt_mark_size(mod, false);
-    passes = "default<O2>,mergefunc,globaldce";
-    break;
-  case ZAN_OPT_SIZE_MIN:
-    zan_opt_mark_size(mod, true);
-    passes = "default<O2>,mergefunc,globaldce";
-    break;
-#else
-  case ZAN_OPT_SIZE:
-    passes = "default<Os>,mergefunc,globaldce";
-    break;
-  case ZAN_OPT_SIZE_MIN:
-    passes = "default<Oz>,mergefunc,globaldce";
-    break;
-#endif
-  case ZAN_OPT_AGGRESSIVE:
-    zan_opt_mark_huge(mod);
-    passes = "default<O3>";
-    break;
-  default:
+
+  int ol = 0, vec = 0;
+  const char *passes =
+      zan_opt_prepare_level(mod, level, knobs, &ol, &vec, shrink);
+  if (!passes)
     return ZAN_ERROR;
-  }
 
   /* 调试旋钮：--opt-pipeline（或回退 ZAN_OPT_PIPELINE）覆盖默认管线
    * 文本（如 "sroa" 逐 pass 二分），"none" 完全跳过 LLVM 管线——定位
@@ -3452,195 +4509,64 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     }
   }
 
-  /* 在主 LLVM O* 管线期间暂时给运行时 ARC/alloc 辅助函数加上 noinline，
-   * 让用户函数先行内联并暴露出完整逃逸/ARC 配对/常量特征，再在后续清理中按需放行内联。
-   * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
-   * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
-  static const char *const k_rt_defer_inline[] = {
-      "zan_rt_alloc",       "zan_rt_str_alloc",   "__zan_itoa_str",
-      "zan_rt_retain",      "zan_rt_release",     "zan_rt_release_dyn",
-      "zan_rt_str_retain",  "zan_rt_str_release", "__zan_str_len",
-      "__zan_str_len_arr",  "__zan_eh_state_fast", "__zan_eh_tmp_push",
-      "__zan_eh_tmp_pop",
-  };
-  enum { k_rt_defer_n = 13, k_rt_eh_fast_idx = 10, k_rt_restore_always_from = 10 };
-  bool marked_rt[k_rt_defer_n] = {false};
-  int marked_count = 0;
-  bool eh_fast_mem_added = false;
-  bool guard_raise_ext = false;
-  LLVMContextRef ctx = LLVMGetModuleContext(mod);
-  unsigned noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
-  unsigned memory_kind = LLVMGetEnumAttributeKindForName("memory", 6);
-  if (!custom_pipe && noinline_kind != 0 && level != ZAN_OPT_BASIC) {
-    LLVMAttributeRef noinl_attr = LLVMCreateEnumAttribute(ctx, noinline_kind, 0);
-    for (int i = 0; i < k_rt_defer_n; i++) {
-      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
-      if (fn && !LLVMIsDeclaration(fn) &&
-          !LLVMGetEnumAttributeAtIndex(
-              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-              noinline_kind)) {
-        LLVMAddAttributeAtIndex(
-            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinl_attr);
-        marked_rt[i] = true;
-        marked_count++;
-        if (i == k_rt_eh_fast_idx && memory_kind != 0 &&
-            !LLVMGetEnumAttributeAtIndex(
-                fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-                memory_kind)) {
-          /* 在 __zan_eh_state_fast 延后内联期间，@__zan_eh_self 仅对其自身可见；
-           * 临时标注 memory(inaccessiblemem: readwrite) 避免冷路径 rt.bad 里的
-           * EH 状态获取破坏热循环的别名分析与 LICM/向量化；放行内联前立即撤回。 */
-          LLVMAddAttributeAtIndex(
-              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-              LLVMCreateEnumAttribute(ctx, memory_kind, 0x0Cu));
-          eh_fast_mem_added = true;
-        }
-      }
-    }
-    /* 阻止 default<O2> 中的 DeadArgumentElimination 裁掉 __zan_guard_raise 的
-     * 常量文件名参数并把 memory(argmem: readwrite, inaccessiblemem: readwrite)
-     * 退化扩宽为全内存 memory(readwrite)；主管线结束后立即恢复 internal 链接。 */
-    LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
-    if (gr_fn && !LLVMIsDeclaration(gr_fn) &&
-        LLVMGetLinkage(gr_fn) == LLVMInternalLinkage) {
-      LLVMSetLinkage(gr_fn, LLVMExternalLinkage);
-      guard_raise_ext = true;
-    }
-  }
+  rt_defer_state_t defer;
+  memset(&defer, 0, sizeof(defer));
+  if (!custom_pipe && level != ZAN_OPT_BASIC)
+    rt_defer_outline(mod, &defer);
 
   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
   LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
   LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
 
-  if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
+  if (vec) {
     LLVMPassBuilderOptionsSetLoopInterleaving(opts, 1);
     LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
     LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
     LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
   }
 
-  LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
-  LLVMDisposePassBuilderOptions(opts);
-  if (guard_raise_ext) {
-    LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
-    if (gr_fn && !LLVMIsDeclaration(gr_fn))
-      LLVMSetLinkage(gr_fn, LLVMInternalLinkage);
+  /* -O2/-O3 add soft-guard region versioning (guard_version.cpp)
+   * at the optimizer-early extension point; same pipeline otherwise. */
+  LLVMErrorRef err;
+  if (guard_version_wanted(level, custom_pipe)) {
+    zan_pipeline_opts_t po = {vec, vec, vec, vec, vec, 1};
+    err = zan_run_passes_guarded(mod, passes, tm, &po);
+  } else {
+    err = LLVMRunPasses(mod, passes, tm, opts);
   }
+  LLVMDisposePassBuilderOptions(opts);
+  rt_defer_restore_guard(mod, &defer);
   if (err) {
-    for (int i = 0; i < k_rt_defer_n; i++) {
-      if (!marked_rt[i])
-        continue;
-      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
-      if (fn && !LLVMIsDeclaration(fn)) {
-        LLVMRemoveEnumAttributeAtIndex(
-            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
-        if (i == k_rt_eh_fast_idx && eh_fast_mem_added && memory_kind != 0)
-          LLVMRemoveEnumAttributeAtIndex(
-              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, memory_kind);
-      }
-    }
+    rt_defer_restore_attrs(mod, &defer, false);
     char *msg = LLVMGetErrorMessage(err);
     fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
     LLVMDisposeErrorMessage(msg);
     return ZAN_ERROR;
   }
 
-  /* Post-inline Zan 优化 pass：先塌缩新暴露的 nothrow invoke、消除无抛出间隔的
-   * EH 临时栈 push/pop 与死 unwind，再消除栈逃逸、ARC 冗余、虚调用、常量与死代码。 */
-  bool post_changed = false;
   if (!custom_pipe) {
-    if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
-      if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
-        post_changed = true;
-    }
-    if (zan_opt_eh_tmp_mod(mod) > 0)
-      post_changed = true;
-    if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE")) {
-      zan_escape_stats_t es = zan_opt_escape_mod(mod);
-      if (es.stack_promoted > 0)
-        post_changed = true;
-      if (report_out) {
-        report_out->escape.objects_analyzed += es.objects_analyzed;
-        report_out->escape.stack_promoted += es.stack_promoted;
+    /* List<T> 槽宽标签检查提出循环（list_width_hoist.cpp）：循环里那条冷的
+     * __zan_list_repack 调用让 LLVM 每轮重读标签/数据指针/Count；提到循环前
+     * 置头后折掉循环内分支，再用一小段管线清掉死块、外提不变量并向量化。 */
+    if (list_hoist_wanted(level, custom_pipe) &&
+        zan_opt_hoist_list_width_checks(mod) > 0) {
+      if (run_checked_passes(mod, tm,
+                             LIST_HOIST_CLEANUP
+                             ",function(loop-vectorize,"
+                             "instcombine<no-verify-fixpoint>,simplifycfg)") !=
+          ZAN_OK) {
+        rt_defer_restore_attrs(mod, &defer, false);
+        return ZAN_ERROR;
       }
     }
-    if (!zan_opt_knob_off(knobs->no_arc, "ZAN_NO_OPT_ARC")) {
-      zan_arc_opt_stats_t as = zan_opt_arc_mod(mod, level);
-      if (as.pairs_elided > 0)
-        post_changed = true;
-      if (report_out)
-        report_out->arc.pairs_elided += as.pairs_elided;
-    }
-    if (!zan_opt_knob_off(knobs->no_devirt, "ZAN_NO_OPT_DEVIRT")) {
-      zan_devirt_stats_t ds = zan_opt_devirt_mod(mod, g_opt);
-      if (ds.calls_devirtualized > 0)
-        post_changed = true;
-      if (report_out)
-        report_out->devirt.calls_devirtualized += ds.calls_devirtualized;
-    }
-    if (!zan_opt_knob_off(knobs->no_constfold, "ZAN_NO_OPT_CONSTFOLD")) {
-      zan_constfold_stats_t cs = zan_opt_const_fold_mod(mod);
-      if (cs.constants_folded > 0)
-        post_changed = true;
-      if (report_out)
-        report_out->constfold.constants_folded += cs.constants_folded;
-    }
-    if (!zan_opt_knob_off(knobs->no_dce, "ZAN_NO_OPT_DCE")) {
-      zan_dce_stats_t ds2 = zan_opt_dce_mod(mod);
-      if (ds2.dead_stores > 0)
-        post_changed = true;
-      if (report_out)
-        report_out->dce.dead_stores += ds2.dead_stores;
-    }
 
-    bool rt_unmarked = false;
-    unsigned alwaysinl_kind =
-        LLVMGetEnumAttributeKindForName("alwaysinline", 12);
-    for (int i = 0; i < k_rt_defer_n; i++) {
-      if (!marked_rt[i])
-        continue;
-      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
-      if (fn && !LLVMIsDeclaration(fn)) {
-        LLVMRemoveEnumAttributeAtIndex(
-            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
-        if (i == k_rt_eh_fast_idx && eh_fast_mem_added && memory_kind != 0)
-          LLVMRemoveEnumAttributeAtIndex(
-              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, memory_kind);
-        if (i >= k_rt_restore_always_from && alwaysinl_kind != 0) {
-          LLVMAddAttributeAtIndex(
-              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-              LLVMCreateEnumAttribute(ctx, alwaysinl_kind, 0));
-        }
-        rt_unmarked = true;
-      }
-    }
-    (void)marked_count;
+    bool post_changed = zan_opt_run_post_inline_passes(
+        mod, level, knobs, g_opt, report_out, shrink,
+        late_arc_wanted(level, custom_pipe));
+    bool rt_unmarked = rt_defer_restore_attrs(mod, &defer, true);
 
-    const char *cleanup = NULL;
-    if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
-      if (rt_unmarked || post_changed)
-        cleanup =
-            "cgscc(inline),"
-            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
-            "globaldce";
-    } else if (level == ZAN_OPT_SIZE) {
-      /* -Os 下放行已摘除临时 noinline 的核心运行库按成本模型内联（不再永远禁止），
-       * 同时保留 mergefunc/globaldce 控体积。 */
-      if (rt_unmarked || post_changed)
-        cleanup =
-            "cgscc(inline),"
-            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),mergefunc,"
-            "globaldce";
-    } else if (level == ZAN_OPT_SIZE_MIN) {
-      if (rt_unmarked || post_changed)
-        cleanup =
-            "always-inline,"
-            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),mergefunc,"
-            "globaldce";
-    } else if (post_changed) {
-      cleanup =
-          "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse)";
-    }
+    const char *cleanup =
+        zan_opt_post_cleanup_pipeline(level, rt_unmarked, post_changed);
     if (cleanup && run_checked_passes(mod, tm, cleanup) != ZAN_OK)
       return ZAN_ERROR;
   }
@@ -3668,14 +4594,74 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
 static zan_status_t zan_opt_configure_llvm_passes_ex(
     zan_irgen_t *g, zan_opt_level_t level, const zan_opt_knobs_t *knobs,
     zan_opt_report_t *report_out) {
+  static const zan_opt_knobs_t default_knobs;
+  if (!knobs)
+    knobs = &default_knobs;
   if (level == ZAN_OPT_NONE)
     return ZAN_OK;
 
   LLVMTargetMachineRef tm = NULL;
   if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
     return ZAN_ERROR;
-  zan_status_t status =
-      zan_opt_run_passes_ex(g->mod, tm, level, knobs, g, report_out);
+
+  zan_status_t status;
+  bool has_custom_pipe =
+      (knobs->pipeline && knobs->pipeline[0]) ||
+      (getenv("ZAN_OPT_PIPELINE") && getenv("ZAN_OPT_PIPELINE")[0]);
+  if (!has_custom_pipe && zan_opt_plan_finish(g, level)) {
+    status = zan_verify_ir_strict()
+                 ? zan_opt_verify_module(g->mod, "before optimization")
+                 : ZAN_OK;
+    int ol = 0, vec = 0;
+    if (status == ZAN_OK &&
+        !zan_opt_prepare_level(g->mod, level, knobs, &ol, &vec, true))
+      status = ZAN_ERROR;
+    rt_defer_state_t defer;
+    memset(&defer, 0, sizeof(defer));
+    if (status == ZAN_OK && level != ZAN_OPT_BASIC)
+      rt_defer_outline(g->mod, &defer);
+    if (status == ZAN_OK) {
+      zan_opt_simplify_module(g->mod, tm, ol, vec);
+      rt_defer_restore_guard(g->mod, &defer);
+      if (zan_verify_ir_strict())
+        status = zan_opt_verify_module(g->mod, "after simplification pipeline");
+    }
+    /* Soft-guard region versioning sits at default<ON>'s
+     * optimizer-early point, i.e. between the halves (guard_version.cpp). */
+    if (status == ZAN_OK && guard_version_wanted(level, false)) {
+      zan_guard_version_module(g->mod, tm);
+      if (zan_verify_ir_strict())
+        status = zan_opt_verify_module(g->mod, "after guard versioning");
+    }
+    if (status == ZAN_OK) {
+      bool post_changed = zan_opt_run_post_inline_passes(
+          g->mod, level, knobs, g, report_out, true,
+          late_arc_wanted(level, false));
+      bool rt_unmarked = rt_defer_restore_attrs(g->mod, &defer, true);
+      const char *cleanup =
+          zan_opt_post_cleanup_pipeline(level, rt_unmarked, post_changed);
+      if (cleanup)
+        status = run_checked_passes(g->mod, tm, cleanup);
+    } else {
+      rt_defer_restore_attrs(g->mod, &defer, false);
+    }
+    /* List 槽宽检查提出循环（见 zan_opt_run_passes_on_module 同名步骤）。
+     * 放在两半之间：后半段只有 LICM 没有 GVN，循环里重读的 Count/数据指针
+     * 要先在这里外提，后半段的向量化才看得到干净循环。 */
+    if (status == ZAN_OK && list_hoist_wanted(level, false)) {
+      if (zan_opt_hoist_list_width_checks(g->mod) > 0)
+        status = run_checked_passes(g->mod, tm, LIST_HOIST_CLEANUP);
+    }
+    /* Drop bodies the inliner left dead now, so extern-library pruning
+     * between here and object emission sees the final call graph. */
+    if (status == ZAN_OK)
+      status = run_checked_passes(g->mod, NULL, "globaldce");
+    if (status != ZAN_OK)
+      g->opt_finish_level = 0;
+  } else {
+    status = zan_opt_run_passes_ex(g->mod, tm, level, knobs, g, report_out,
+                                   true);
+  }
   if (tm)
     LLVMDisposeTargetMachine(tm);
   return status;
@@ -3691,7 +4677,22 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
                                           LLVMTargetMachineRef tm,
                                           zan_opt_level_t level,
                                           const zan_opt_knobs_t *knobs) {
-  return zan_opt_run_passes_ex(mod, tm, level, knobs, NULL, NULL);
+  return zan_opt_run_passes_ex(mod, tm, level, knobs, NULL, NULL, true);
+}
+
+void zan_opt_unit_prelude(LLVMModuleRef mod) {
+  /* The nothrow collapse needs every callee body: run it on the whole
+   * module before it is split, never on a unit. */
+  if (!getenv("ZAN_NO_UNWIND_SHRINK"))
+    zan_shrink_collapse_invokes(mod);
+}
+
+int zan_opt_run_passes_on_unit(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+                               int level) {
+  return zan_opt_run_passes_ex(mod, tm, (zan_opt_level_t)level, NULL, NULL,
+                               NULL, false) == ZAN_OK
+             ? 0
+             : -1;
 }
 
 /* 全局死代码消除 (GlobalDCE)：纯可达性扫描剔除未引用的内部符号 */
@@ -3725,6 +4726,143 @@ static zan_status_t zan_opt_early_mem2reg(zan_irgen_t *g,
                             (early && early[0]) ? early : "sroa,early-cse");
 }
 
+/* --fp-contract: fuse `a*b + c` written in one expression into
+ * llvm.fmuladd, as clang does for -ffp-contract=on (mandel 0.60 s -> C's
+ * 0.45 s). Run right after irgen, before any CSE: a single-use fmul feeding
+ * an fadd/fsub is then exactly a product inside the same source expression
+ * (locals still live in allocas, so nothing is fused across statements).
+ * Off by default: a fused result can differ in the last bit from the
+ * separately rounded one, and Zan, like C#, otherwise gives the same float
+ * results on every CPU. */
+static LLVMValueRef fpc_single_mul(LLVMValueRef v) {
+  if (!LLVMIsAInstruction(v) || LLVMGetInstructionOpcode(v) != LLVMFMul)
+    return NULL;
+  LLVMUseRef u = LLVMGetFirstUse(v);
+  return u && !LLVMGetNextUse(u) ? v : NULL;
+}
+
+static int zan_opt_fp_contract(LLVMModuleRef mod) {
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+  unsigned id = LLVMLookupIntrinsicID("llvm.fmuladd", 12);
+  int n = 0;
+  for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
+       fn = LLVMGetNextFunction(fn))
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      LLVMValueRef i = LLVMGetFirstInstruction(bb);
+      while (i) {
+        LLVMValueRef next = LLVMGetNextInstruction(i);
+        LLVMOpcode op = LLVMGetInstructionOpcode(i);
+        LLVMTypeRef ty = LLVMTypeOf(i);
+        LLVMTypeKind tk = LLVMGetTypeKind(ty);
+        if ((op == LLVMFAdd || op == LLVMFSub) &&
+            (tk == LLVMDoubleTypeKind || tk == LLVMFloatTypeKind)) {
+          LLVMValueRef l = LLVMGetOperand(i, 0), r = LLVMGetOperand(i, 1);
+          LLVMValueRef mul = fpc_single_mul(l);
+          bool mul_left = mul != NULL;
+          if (!mul)
+            mul = fpc_single_mul(r);
+          if (mul) {
+            LLVMPositionBuilderBefore(b, i);
+            LLVMValueRef x = LLVMGetOperand(mul, 0), y = LLVMGetOperand(mul, 1);
+            LLVMValueRef addend = mul_left ? r : l;
+            if (op == LLVMFSub) {
+              if (mul_left)
+                addend = LLVMBuildFNeg(b, addend, "fpc.neg"); /* a*b - c */
+              else
+                x = LLVMBuildFNeg(b, x, "fpc.neg"); /* c - a*b */
+            }
+            LLVMValueRef fma = LLVMGetIntrinsicDeclaration(mod, id, &ty, 1);
+            LLVMValueRef args[3] = {x, y, addend};
+            LLVMValueRef call = LLVMBuildCall2(b, LLVMGlobalGetValueType(fma),
+                                               fma, args, 3, "fpc.fma");
+            LLVMReplaceAllUsesWith(i, call);
+            LLVMInstructionEraseFromParent(i);
+            LLVMInstructionEraseFromParent(mul);
+            n++;
+          }
+        }
+        i = next;
+      }
+    }
+  LLVMDisposeBuilder(b);
+  return n;
+}
+
+/* Remove unused __zan_eh_state_fast lookups (and unused GEPs/bitcasts hanging
+ * off them) before optimizing so inlining into loops does not carry dead TSD
+ * lookups. */
+static int zan_opt_drop_dead_eh_state(LLVMModuleRef mod) {
+  LLVMValueRef sf = LLVMGetNamedFunction(mod, "__zan_eh_state_fast");
+  if (!sf)
+    return 0;
+  int n = 0;
+  LLVMUseRef u = LLVMGetFirstUse(sf);
+  while (u) {
+    LLVMValueRef call = LLVMGetUser(u);
+    u = LLVMGetNextUse(u);
+    if (!LLVMIsACallInst(call) || LLVMGetCalledValue(call) != sf)
+      continue;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (LLVMUseRef cu = LLVMGetFirstUse(call); cu; cu = LLVMGetNextUse(cu)) {
+        LLVMValueRef user = LLVMGetUser(cu);
+        if ((LLVMIsAGetElementPtrInst(user) || LLVMIsABitCastInst(user)) &&
+            !LLVMGetFirstUse(user)) {
+          LLVMInstructionEraseFromParent(user);
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!LLVMGetFirstUse(call)) {
+      if (u && LLVMGetUser(u) == call)
+        u = LLVMGetNextUse(u);
+      LLVMInstructionEraseFromParent(call);
+      n++;
+    }
+  }
+  return n;
+}
+
+/* Fixed-size allocas emitted mid-function are dynamic allocations to LLVM:
+ * hoist them to the entry block so loops do not grow the stack. Runs at every
+ * optimization level, -O0 included. */
+static int zan_hoist_static_allocas(LLVMModuleRef mod) {
+  LLVMBuilderRef b = LLVMCreateBuilderInContext(LLVMGetModuleContext(mod));
+  int moved = 0;
+  for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
+       fn = LLVMGetNextFunction(fn)) {
+    if (LLVMIsDeclaration(fn) || LLVMCountBasicBlocks(fn) < 2)
+      continue;
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+    LLVMValueRef at = LLVMGetFirstInstruction(entry);
+    while (at && LLVMIsAAllocaInst(at))
+      at = LLVMGetNextInstruction(at);
+    if (!at)
+      continue;
+    for (LLVMBasicBlockRef bb = LLVMGetNextBasicBlock(entry); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      LLVMValueRef i = LLVMGetFirstInstruction(bb);
+      while (i) {
+        LLVMValueRef next = LLVMGetNextInstruction(i);
+        if (LLVMIsAAllocaInst(i) &&
+            LLVMIsAConstantInt(LLVMGetOperand(i, 0))) {
+          LLVMInstructionRemoveFromParent(i);
+          LLVMPositionBuilderBefore(b, at);
+          LLVMInsertIntoBuilder(b, i);
+          moved++;
+        }
+        i = next;
+      }
+    }
+  }
+  LLVMDisposeBuilder(b);
+  return moved;
+}
+
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
                               zan_opt_level_t level,
                               const zan_opt_knobs_t *knobs) {
@@ -3736,6 +4874,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
   if (zan_opt_verify_module(g->mod, "before optimizer") != ZAN_OK)
     return report;
   report.success = true;
+  zan_hoist_static_allocas(g->mod);
   if (level == ZAN_OPT_NONE)
     return report;
 
@@ -3743,6 +4882,11 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
 
   /* 调试旋钮：-fno-opt-<name>（或回退 ZAN_NO_OPT_<NAME>=1）跳过对应
    * 自定义 pass（A595 二分） */
+  zan_opt_tbaa(g->mod);
+  if (!getenv("ZAN_KEEP_DEAD_EH_STATE"))
+    zan_opt_drop_dead_eh_state(g->mod);
+  if (g->fp_contract)
+    zan_opt_fp_contract(g->mod);
   if (!zan_opt_knob_off(knobs->no_early, "ZAN_NO_OPT_EARLY") &&
       zan_opt_early_mem2reg(g, knobs) != ZAN_OK) {
     report.success = false;
@@ -3761,8 +4905,15 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
     report.dce = zan_opt_dce(g);
   if (!zan_opt_knob_off(knobs->no_inline, "ZAN_NO_OPT_INLINE"))
     report.inlining = zan_opt_inline(g, level);
-  report.success =
-      zan_opt_configure_llvm_passes_ex(g, level, knobs, &report) == ZAN_OK;
+  if (g->opt_zan_passes_only) {
+    /* Partitioned backend: the LLVM pipeline runs per unit (or, when the
+     * module is not split, through zan_opt_configure_llvm_passes). */
+    report.success =
+        zan_opt_verify_module(g->mod, "after Zan passes") == ZAN_OK;
+  } else {
+    report.success =
+        zan_opt_configure_llvm_passes_ex(g, level, knobs, &report) == ZAN_OK;
+  }
 
   double t1 = get_time_ms();
   report.time_ms = t1 - t0;
@@ -3771,22 +4922,24 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
 }
 
 void zan_opt_report_print(const zan_opt_report_t *report) {
-  fprintf(stderr, "Optimization report (%.1f ms):\n", report->time_ms);
+  zan_bcache_logf("Optimization report (%.1f ms):\n", report->time_ms);
   if (report->escape.stack_promoted > 0)
-    fprintf(stderr, "  Escape: %d objects promoted to stack (of %d analyzed)\n",
-            report->escape.stack_promoted, report->escape.objects_analyzed);
+    zan_bcache_logf("  Escape: %d objects promoted to stack (of %d analyzed)\n",
+                    report->escape.stack_promoted,
+                    report->escape.objects_analyzed);
   if (report->arc.pairs_elided > 0)
-    fprintf(stderr, "  ARC: %d retain/release pairs elided\n",
-            report->arc.pairs_elided);
+    zan_bcache_logf("  ARC: %d retain/release pairs elided\n",
+                    report->arc.pairs_elided);
   if (report->devirt.calls_devirtualized > 0)
-    fprintf(stderr, "  Devirt: %d virtual calls resolved\n",
-            report->devirt.calls_devirtualized);
+    zan_bcache_logf("  Devirt: %d virtual calls resolved\n",
+                    report->devirt.calls_devirtualized);
   if (report->constfold.constants_folded > 0)
-    fprintf(stderr, "  Const: %d expressions folded\n",
-            report->constfold.constants_folded);
+    zan_bcache_logf("  Const: %d expressions folded\n",
+                    report->constfold.constants_folded);
   if (report->dce.dead_stores > 0)
-    fprintf(stderr, "  DCE: %d dead stores removed\n", report->dce.dead_stores);
+    zan_bcache_logf("  DCE: %d dead stores removed\n",
+                    report->dce.dead_stores);
   if (report->inlining.functions_inlined > 0)
-    fprintf(stderr, "  Inline: %d functions inlined\n",
-            report->inlining.functions_inlined);
+    zan_bcache_logf("  Inline: %d functions inlined\n",
+                    report->inlining.functions_inlined);
 }

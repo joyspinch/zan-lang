@@ -82,6 +82,33 @@ static int name_is_instance_member(zan_irgen_t *g, zan_istr_t name) {
     return 0;
 }
 
+/* S12（docs/ZAN_STANDARD.md §3）：事件订阅目标是否以 this 为根——
+ * `Click`、`this.Click`、`btn.Click`（btn 为实例字段）、`items[i].Changed`。
+ * 这正是会成环的形状：this 持有发布者，发布者的处理器列表持有闭包，闭包
+ * 再强捕获 this。局部变量、形参、静态成员为根的订阅保持强捕获（C# 语义：
+ * 只靠事件存活的订阅者仍然有效）。 */
+int zan_subscription_rooted_at_this(zan_irgen_t *g, zan_ast_node_t *e,
+                                    local_scope_t *locals) {
+    while (e) {
+        switch (e->kind) {
+        case AST_THIS_EXPR:
+            return 1;
+        case AST_IDENTIFIER:
+            if (locals && local_find(locals, e->ident.name)) return 0;
+            return name_is_instance_member(g, e->ident.name);
+        case AST_MEMBER_ACCESS:
+            e = e->member.object;
+            break;
+        case AST_INDEX:
+            e = e->index.object;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static void cap_use(capture_scan_t *cs, zan_istr_t name) {
     if (!name.len || cap_is_shadowed(cs, name)) return;
     for (int i = 0; i < cs->count; i++)
@@ -397,19 +424,18 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     LLVMBasicBlockRef dec   = LLVMAppendBasicBlockInContext(c, fn, "dec");
     LLVMValueRef rec = LLVMGetParam(fn, 0);
     LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), rec, &neg16, 1, "rcp");
-    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
+    LLVMValueRef rcip = zan_rc_ptr(g, b, rec, "rcp");
     /* 析构防重入：release 原子减 + 末次释放路径 acquire 栅栏 */
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingRelease, 0);
+        LLVMConstInt(rc_ty, 1, 0), LLVMAtomicOrderingRelease, 0);
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(c, fn, "done");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over"),
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over"),
                     dec, last_bb);
     LLVMPositionBuilderAtEnd(b, last_bb);
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1"),
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1"),
                     drop, done_bb);
     LLVMPositionBuilderAtEnd(b, drop);
     LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
@@ -432,7 +458,12 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
             emit_collection_value_release(g, caps[i].type, v, 0);
         else emit_rc_release_for_type(g, caps[i].type, v);
     }
-    if (has_this) {
+    if (has_this == 2) {
+        /* S12 弱捕获：没有引用可放，注销弱槽（订阅者先死时槽已被置空） */
+        LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "tp");
+        emit_weak_store(g, p, LLVMConstPointerNull(i8ptr));
+    } else if (has_this) {
         LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
             (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "tp");
         LLVMValueRef v = LLVMBuildLoad2(g->builder, i8ptr, p, "tv");
@@ -440,7 +471,7 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     }
     LLVMBuildBr(g->builder, freebb);
     LLVMPositionBuilderAtEnd(g->builder, freebb);
-    LLVMValueRef freefn = get_arc_free_decl(g);
+    LLVMValueRef freefn = get_arc_free_obj_decl(g);
     zan_call2(g->builder, LLVMGlobalGetValueType(freefn), freefn, &rec, 1, "");
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, dec);
@@ -460,6 +491,42 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                                   LLVMValueRef init);
 LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload);
+static const char *clo_slot_name(zan_irgen_t *g, zan_istr_t name) {
+    if (!name.str || !name.len) return "?";
+    char *s = zan_arena_alloc(g->arena, (size_t)name.len + 1);
+    if (!s) return "?";
+    memcpy(s, name.str, name.len);
+    s[name.len] = '\0';
+    return s;
+}
+
+/* 闭包记录的强引用槽登记进站点字段走图：target（方法组接收者）、拥有引用的
+ * 捕获槽（捕获盒、引用计数对象/字符串/委托）、强捕获的 this。弱捕获的 this
+ * （S12）不是强边，不登记。 */
+static void record_closure_layout(zan_irgen_t *g, int site_idx, LLVMTypeRef rec_ty,
+                                  bool has_target, lambda_capture_t *caps, int capc,
+                                  int has_this) {
+    unsigned fields[ZAN_CLO_LAYOUT_MAX];
+    const char *names[ZAN_CLO_LAYOUT_MAX];
+    int n = 0;
+    if (has_target) { fields[n] = 2; names[n] = "target"; n++; }
+    for (int i = 0; i < capc && n < ZAN_CLO_LAYOUT_MAX; i++) {
+        if (!caps[i].boxed) {
+            if (!is_rc_managed_type(caps[i].type) ||
+                LLVMGetTypeKind(caps[i].llvm) != LLVMPointerTypeKind) continue;
+        }
+        fields[n] = (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i);
+        names[n] = clo_slot_name(g, caps[i].name);
+        n++;
+    }
+    if (has_this == 1 && n < ZAN_CLO_LAYOUT_MAX) {
+        fields[n] = (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc);
+        names[n] = "this";
+        n++;
+    }
+    zan_set_closure_site_layout(g, site_idx, rec_ty, fields, names, n);
+}
+
 static LLVMValueRef emit_closure_record_gctx(
     zan_irgen_t *g, zan_loc_t loc, const char *lname, LLVMTypeRef rec_ty,
     LLVMValueRef fn_ptr, LLVMValueRef target, lambda_capture_t *caps,
@@ -470,6 +537,8 @@ static LLVMValueRef emit_closure_record_gctx(
     LLVMValueRef dtor = build_closure_dtor(g, lname, rec_ty, caps, capc,
                                            has_this, true);
     int site_idx = reserve_closure_site(g);
+    record_closure_layout(g, site_idx, rec_ty, target != NULL && retain_target,
+                          caps, capc, has_this);
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];
@@ -532,17 +601,24 @@ static LLVMValueRef emit_closure_record_gctx(
     if (has_this && self) {
         if (LLVMTypeOf(self) != i8ptr)
             self = LLVMBuildBitCast(g->builder, self, i8ptr, "cap.self8");
-        emit_arc_retain(g, self);
-        LLVMBuildStore(g->builder, self,
-            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
-                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp"));
+        LLVMValueRef selfp = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp");
+        if (has_this == 2) {
+            /* S12：事件订阅闭包弱捕获订阅者——槽先清零（弱存储会先摘旧值），
+             * 再登记进弱引用表，订阅者释放时自动置空。 */
+            LLVMBuildStore(g->builder, LLVMConstPointerNull(i8ptr), selfp);
+            emit_weak_store(g, selfp, self);
+        } else {
+            emit_arc_retain(g, self);
+            LLVMBuildStore(g->builder, self, selfp);
+        }
     }
     if (gctx_val) {
         if (LLVMTypeOf(gctx_val) != i8ptr)
             gctx_val = LLVMBuildBitCast(g->builder, gctx_val, i8ptr, "cap.gctx8");
         LLVMBuildStore(g->builder, gctx_val,
             LLVMBuildStructGEP2(g->builder, rec_ty, rec,
-                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this),
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + (has_this ? 1 : 0)),
                                 "cap.gctxp"));
     }
     LLVMValueRef tagged = LLVMBuildOr(g->builder,
@@ -950,6 +1026,11 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                              .type = vtype, .llvm = payload, .boxed = 0 };
     LLVMValueRef dtor = build_closure_dtor(g, bname, rec_ty, &val, 1, 0, true);
     int site_idx = reserve_closure_site(g);
+    if (is_rc_managed_type(vtype) && LLVMGetTypeKind(payload) == LLVMPointerTypeKind) {
+        unsigned vf = ZAN_BOX_VALUE_FIELD;
+        const char *vn = "value";
+        zan_set_closure_site_layout(g, site_idx, rec_ty, &vf, &vn, 1);
+    }
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];

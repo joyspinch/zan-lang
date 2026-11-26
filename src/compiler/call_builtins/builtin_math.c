@@ -105,7 +105,13 @@ if ((is_call_to(expr, "String", "CompareOrdinal") ||
       (LLVMBasicBlockRef[]){entry_bb, null_bb, bnull_bb, b0_bb, slow_bb}, 5);
   emit_release_owned_call_temp(g, a_ast, a, locals);
   emit_release_owned_call_temp(g, b_ast, b, locals);
-  return LLVMBuildSExt(g->builder, res32, i64t, "ordcmp64");
+  /* strcmp 的幅值随平台（Apple libc 返回字节差，MSVCRT 返回 ±1）；
+   * 序号比较的结果取其符号，跨平台一致（自举孪生同口径）。 */
+  LLVMValueRef gt = zan_icmp(g->builder, LLVMIntSGT, res32, zero32, "ordcmp.gt");
+  LLVMValueRef lt = zan_icmp(g->builder, LLVMIntSLT, res32, zero32, "ordcmp.lt");
+  return LLVMBuildSub(g->builder,
+      LLVMBuildZExt(g->builder, gt, i64t, "ordcmp.g"),
+      LLVMBuildZExt(g->builder, lt, i64t, "ordcmp.l"), "ordcmp64");
 }
 
 /* Array.Sort(T[])：原生零越界/零 ARC 原始缓冲内省排序（int/long/double/string 数组） */

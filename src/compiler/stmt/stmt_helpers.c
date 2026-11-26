@@ -1099,6 +1099,45 @@ static void emit_finallys_below_for_propagate(zan_irgen_t *g,
   }
 }
 
+/* Native exception object ownership. A Zan throw raises a fresh native
+ * object (__cxa_allocate_exception + __cxa_throw); the Zan exception itself
+ * lives in the EH state, the native object only drives the unwinder. A
+ * landing pad whose native object will never be re-raised must delete it,
+ * or every caught exception leaks it (exc bench: 83 MB vs 2 MB C++).
+ * Only emit_eh_propagate_tail_lpad's sync finally-only path with no
+ * enclosing landing re-raises the same object (_Unwind_RaiseException /
+ * resume); every other path ends in a Zan catch or raises a new object.
+ * Deletion is an immediate __cxa_begin_catch/__cxa_end_catch pair, i.e. what
+ * C++ `catch (...) {}` does: it frees native and foreign objects alike and
+ * keeps std::uncaught_exceptions() balanced for C++ code in the process
+ * (_Unwind_DeleteException would leave that count growing per throw). */
+bool eh_lpad_reraises_native(zan_irgen_t *g, LLVMValueRef fn, bool has_catch) {
+  if (g->current_async_frame || has_catch)
+    return false;
+  for (int i = g->lpad_depth - 1; i >= 0; i--) {
+    if (g->lpad_stack[i].fn != fn)
+      break;
+    if (g->lpad_stack[i].lpad_bb)
+      return false;
+  }
+  return true;
+}
+
+void emit_eh_native_delete(zan_irgen_t *g, LLVMValueRef lp_val) {
+  if (g->target_is_wasm)
+    return;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMValueRef native_exc =
+      LLVMBuildExtractValue(g->builder, lp_val, 0, "lp.native");
+  LLVMTypeRef begin_ty = LLVMFunctionType(i8ptr, &i8ptr, 1, 0);
+  zan_call2(g->builder, begin_ty, get_libc_fn(g, "__cxa_begin_catch", begin_ty),
+            &native_exc, 1, "");
+  LLVMTypeRef end_ty =
+      LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+  zan_call2(g->builder, end_ty, get_libc_fn(g, "__cxa_end_catch", end_ty), NULL,
+            0, "");
+}
+
 static void emit_eh_propagate_tail_lpad(zan_irgen_t *g, local_scope_t *locals,
                                         LLVMValueRef lp_slot,
                                         LLVMTypeRef lp_ret_ty,

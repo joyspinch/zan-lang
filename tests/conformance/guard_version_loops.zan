@@ -1,0 +1,100 @@
+// Soft runtime checks inside loops are versioned at -O2 (a check-free
+// fast copy of the loop; the first failing check hands over to the original,
+// fully checked loop at the same site). Output must match -O0 exactly: the
+// failing site's report, the scratch value it reads, every later iteration.
+// (Only reads go through possibly-null receivers: a field store through a
+// null receiver faults even at -O0, a separate bug.)
+using System;
+
+class Node {
+    public int v;
+    public int w;
+    public double x;
+    public Node(int a) { v = a; w = 0; x = a * 0.5; }
+}
+
+class P {
+    static Node[] Make(int n, int hole) {
+        Node[] a = new Node[n];
+        for (int i = 0; i < n; i++) if (i != hole) a[i] = new Node(i + 1);
+        return a;
+    }
+
+    // One null element in the middle: the fast loop leaves at i == hole.
+    static int SumFields(Node[] a) {
+        int s = 0;
+        for (int i = 0; i < a.Length; i++) {
+            Node n = a[i];
+            s += n.v * 10;
+            s += n.w + (int)n.x;
+            if (a[i] != null) a[i].w = i;
+        }
+        return s;
+    }
+
+    // nbody-shaped: invariant outer local, per-iteration inner local.
+    static double Pairs(Node[] a) {
+        double e = 0;
+        for (int i = 0; i < a.Length; i++) {
+            Node p = a[i];
+            for (int j = i + 1; j < a.Length; j++) {
+                Node q = a[j];
+                double d = p.x - q.x;
+                e += d * d + p.v * q.v + q.w;
+            }
+        }
+        return e;
+    }
+
+    // Index past the end mid-loop; the loop keeps going with clamped reads.
+    static int Overrun(int[] a, int extra) {
+        int s = 0;
+        for (int i = 0; i < a.Length + extra; i++) {
+            s += a[i] * (i + 1);
+            if (i < a.Length) a[i] = a[i] + 1;
+        }
+        return s;
+    }
+
+    // Inside try the same checks throw; the loop resumes after the catch.
+    static int Caught(Node[] a) {
+        int hits = 0, caught = 0;
+        for (int i = 0; i < a.Length; i++) {
+            try {
+                Node n = a[i];
+                hits += n.v;
+            } catch (NullReferenceException) {
+                caught++;
+            }
+        }
+        return hits * 100 + caught;
+    }
+
+    // Two nulls: the second failure happens while already in the checked loop.
+    static int TwoHoles(Node[] a) {
+        int s = 0;
+        for (int i = 0; i < a.Length; i++) {
+            Node n = a[i];
+            if (i == 2 || i == 5) n = null;
+            s += n.v + n.w;
+        }
+        return s;
+    }
+
+    static void Main() {
+        Node[] full = Make(6, -1);
+        Node[] holed = Make(6, 3);
+        Console.WriteLine("sum full " + SumFields(full));
+        Console.WriteLine("sum holed " + SumFields(holed));
+        Console.WriteLine("pairs full " + Pairs(Make(5, -1)));
+        Console.WriteLine("pairs holed " + Pairs(Make(5, 2)));
+        int[] arr = new int[] { 3, 1, 4, 1, 5 };
+        Console.WriteLine("overrun " + Overrun(arr, 0) + " " + Overrun(arr, 3));
+        Console.WriteLine("after " + arr[0] + " " + arr[4]);
+        Console.WriteLine("caught " + Caught(full) + " " + Caught(holed));
+        Console.WriteLine("two " + TwoHoles(Make(8, -1)));
+        int total = 0;
+        for (int r = 0; r < 3; r++) total += SumFields(r == 1 ? holed : full);
+        Console.WriteLine("repeat " + total);
+    }
+}

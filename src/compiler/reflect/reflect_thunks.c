@@ -704,7 +704,8 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
         g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64, i8ptr}, 3, 0),
         g->rt_alloc,
-        (LLVMValueRef[]){LLVMSizeOf(st), arc_site_arg(g, site),
+        (LLVMValueRef[]){LLVMSizeOf(st),
+                         arc_class_site_val(g, arc_site_arg(g, site), st),
                          LLVMConstNull(i8ptr)},
         3, "refl.newobj");
     LLVMValueRef obj =

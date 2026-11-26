@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 namespace Zan;
 
 partial class Irgen {
@@ -409,11 +410,118 @@ partial class Irgen {
             stmtTemps.Add(reg);
             stmtTempValues.Add(op); stmtTempOwners.Add(reg);
             stmtTempTypes.Add(ty);
+            ArmTempNow();
             return;
         }
         stmtTemps.Add(op);
         stmtTempValues.Add(op); stmtTempOwners.Add(op);
         stmtTempTypes.Add(ty);
+        ArmTempNow();
+    }
+
+    // Inside a call expression (callArmStack non-empty) the temporary just
+    // added is armed on the owner chain at once: a throw from a later
+    // argument, the callee or a built-in operation releases it. See
+    // EnterCallArm / LeaveCallArm.
+    void ArmTempNow() {
+        if (callArmStack == null || callArmStack.Count == 0) { return; }
+        if (curAsync || !eaActive) { return; }
+        // only into a call of THIS function: an inline-generated nested
+        // function (lambda, binding accessor) must never arm into its
+        // enclosing function's call
+        if (callArmFn[callArmFn.Count - 1] != entryAllocas) { return; }
+        List<string> top = callArmStack[callArmStack.Count - 1];
+        ArmArgTemps(stmtTemps.Count - 1, top);
+    }
+
+    // Every call expression brackets its receiver, arguments and the call
+    // itself. The temporaries armed meanwhile pass to the enclosing call of
+    // the same function when there is one -- an inner call's argument may
+    // still need releasing when the outer callee throws -- and the outermost
+    // call retires them once it has returned. A call expression holds no
+    // function exit, so no armed slot outlives its frame.
+    public List<List<string>> callArmStack;
+    public List<StringBuilder> callArmFn;
+    void EnterCallArm() {
+        if (callArmStack == null) { callArmStack = new List<List<string>>(); }
+        if (callArmFn == null) { callArmFn = new List<StringBuilder>(); }
+        callArmStack.Add(new List<string>());
+        callArmFn.Add(entryAllocas);
+    }
+    void LeaveCallArm() {
+        List<string> top = callArmStack[callArmStack.Count - 1];
+        StringBuilder fn = callArmFn[callArmFn.Count - 1];
+        callArmStack.RemoveAt(callArmStack.Count - 1);
+        callArmFn.RemoveAt(callArmFn.Count - 1);
+        if (callArmStack.Count > 0 && callArmFn[callArmFn.Count - 1] == fn) {
+            List<string> parent = callArmStack[callArmStack.Count - 1];
+            int i = 0;
+            while (i < top.Count) { parent.Add(top[i]); i = i + 1; }
+            return;
+        }
+        if (!term) { RetireArgTemps(top); }
+    }
+
+    // Is this slot already armed by a pending call of the current function?
+    bool SlotArmedHere(string slot) {
+        if (callArmStack == null) { return false; }
+        string key = "\t" + slot;
+        int d = 0;
+        while (d < callArmStack.Count) {
+            if (callArmFn[d] == entryAllocas) {
+                List<string> l = callArmStack[d];
+                int i = 0;
+                while (i < l.Count) {
+                    if (l[i].EndsWith(key)) { return true; }
+                    i = i + 1;
+                }
+            }
+            d = d + 1;
+        }
+        return false;
+    }
+
+    // Arm every temporary in [mark, end) that is not armed yet: a register
+    // temporary moves into an entry slot first. The armed entries
+    // ("<llvm type>\t<slot>") are appended to `armed`.
+    void ArmArgTemps(int mark, List<string> armed) {
+        if (curAsync || !eaActive) { return; }
+        int i = mark;
+        while (i < stmtTemps.Count) {
+            string op = stmtTemps[i];
+            Node ty = stmtTempTypes[i];
+            string lt = MapType(ty);
+            string slot = op;
+            bool isSlot = op.Length > 1 && op[1] == 122;
+            if (!isSlot) {
+                if (op == "null" || op.Length == 0 || op[0] != 37) { i = i + 1; continue; }
+                slot = NTS();
+                entryAllocas.Append("  " + slot + " = alloca " + lt + "\n");
+                entryAllocas.Append("  store " + lt + " null, " + lt + "* " + slot + "\n");
+                L("  store " + lt + " " + op + ", " + lt + "* " + slot);
+                stmtTemps[i] = slot;
+                int k = 0;
+                while (k < stmtTempOwners.Count) {
+                    if (stmtTempOwners[k] == op) { stmtTempOwners[k] = slot; }
+                    k = k + 1;
+                }
+            }
+            if (!SlotArmedHere(slot)) {
+                ArmLocalSlot(slot, ty, false);
+                armed.Add(lt + "\t" + slot);
+            }
+            i = i + 1;
+        }
+    }
+
+    void RetireArgTemps(List<string> armed) {
+        int i = 0;
+        while (i < armed.Count) {
+            string e = armed[i];
+            int tab = e.IndexOf("\t");
+            RetireLocalSlot(e.Substring(tab + 1), e.Substring(0, tab));
+            i = i + 1;
+        }
     }
 
     void EmitTempReleases() {
@@ -641,7 +749,15 @@ partial class Irgen {
         // Owner nodes (40 bytes: prev + exception record) are recycled
         // through a per-thread free list: every armed local takes one and a
         // hot loop over object locals otherwise pays a malloc/free pair per
-        // iteration. A node freed on another thread just joins that list.
+        // iteration. The cache is bounded (64 nodes) and handed back to the
+        // allocator as soon as the thread's owner list becomes empty, so an
+        // unwound thread or scope holds nothing: a node released on another
+        // thread (async hand-off) can no longer grow that thread's list
+        // without limit, and thread exit leaks no cached nodes.
+        // The cache depth lives in the free head node itself (word 1 of a
+        // free node), not in another thread_local: on Mach-O every
+        // thread_local access is a _tlv_get_addr call, and arm/retire sit on
+        // hot paths (firebird_wire).
         H("@zexc_node_free = internal thread_local global i8* null");
         H("define internal i8* @zexc_node_alloc() {");
         H("entry:");
@@ -657,12 +773,49 @@ partial class Irgen {
         H("  %raw = call i8* @malloc(i64 40)");
         H("  ret i8* %raw");
         H("}");
+        // Callers unlink the node from @zexc_owners before releasing it.
         H("define internal void @zexc_node_release(i8* %n) {");
         H("entry:");
+        H("  %owners = load i8*, i8** @zexc_owners");
+        H("  %idle = icmp eq i8* %owners, null");
         H("  %head = load i8*, i8** @zexc_node_free");
+        H("  br i1 %idle, label %drain, label %check");
+        H("check:");
+        H("  %hnil = icmp eq i8* %head, null");
+        H("  br i1 %hnil, label %keep, label %depth");
+        H("depth:");
+        H("  %hcp = getelementptr i8, i8* %head, i64 8");
+        H("  %hc = bitcast i8* %hcp to i64*");
+        H("  %c = load i64, i64* %hc");
+        H("  %full = icmp uge i64 %c, 64");
+        H("  br i1 %full, label %drop, label %keep");
+        H("keep:");
+        H("  %c0 = phi i64 [ 0, %check ], [ %c, %depth ]");
         H("  %np = bitcast i8* %n to i8**");
         H("  store i8* %head, i8** %np");
+        H("  %ncp = getelementptr i8, i8* %n, i64 8");
+        H("  %nc = bitcast i8* %ncp to i64*");
+        H("  %c1 = add i64 %c0, 1");
+        H("  store i64 %c1, i64* %nc");
         H("  store i8* %n, i8** @zexc_node_free");
+        H("  ret void");
+        H("drop:");
+        H("  call void @free(i8* %n)");
+        H("  ret void");
+        H("drain:");
+        H("  call void @free(i8* %n)");
+        H("  store i8* null, i8** @zexc_node_free");
+        H("  br label %loop");
+        H("loop:");
+        H("  %cur = phi i8* [ %head, %drain ], [ %nx, %body ]");
+        H("  %end = icmp eq i8* %cur, null");
+        H("  br i1 %end, label %done, label %body");
+        H("body:");
+        H("  %cp = bitcast i8* %cur to i8**");
+        H("  %nx = load i8*, i8** %cp");
+        H("  call void @free(i8* %cur)");
+        H("  br label %loop");
+        H("done:");
         H("  ret void");
         H("}");
         // B-ID199 round4: heap-backed, grown by @__exc_grow (was fixed [64]).
@@ -1041,15 +1194,13 @@ partial class Irgen {
     }
 
     // ---- array length probe ----
-    // The C host reads an array length from the header slot at -8; a null
-    // base is switched to the soft scratch page first (rt_timer_diag.c
-    // zan_rt_soft_scratch), whose length field carries the
-    // ZAN_SOFT_SCRATCH_RC sentinel (1<<62). A null array therefore reports
-    // a huge in-range length and element 0 reads as the zero value. The
-    // self-host has no scratch page: zarr_len mirrors the contract exactly
-    // (null answers the sentinel, a real array reads its header), so a
-    // null-array index passes the bounds check and lands on the zero page
-    // with element 0 -- and the header of the zero page is never read (it
+    // The C host switches a null array to the soft scratch's empty array
+    // (rt_timer_diag.c zan_rt_soft_scratch + ZAN_SOFT_ARR_BASE_OFF): count 0,
+    // so a null array has Length 0 and every index is out of range (clamped
+    // to element 0, which reads as the zero value). The self-host has no
+    // scratch page: zarr_len mirrors the contract exactly (null answers 0, a
+    // real array reads its header), and a null-array index lands on the zero
+    // page with element 0 -- the header of the zero page is never read (it
     // has none; reading past the global would be a real OOB read).
     void EmitArrLenRuntime() {
         H("define i64 @zarr_len(i64* %p) {");
@@ -1057,7 +1208,7 @@ partial class Irgen {
         H("  %isnull = icmp eq i64* %p, null");
         H("  br i1 %isnull, label %nullarr, label %probe");
         H("nullarr:");
-        H("  ret i64 4611686018427387904");
+        H("  ret i64 0");
         H("probe:");
         H("  %lp = getelementptr i64, i64* %p, i64 -1");
         H("  %len = load i64, i64* %lp");

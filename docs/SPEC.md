@@ -640,6 +640,46 @@ class Child {
 }
 ```
 
+**The compiler finds the cycles you declare (W2111).** When one class holds
+another through a non-`weak` field — directly (`Tree Owner`) or through a
+collection or array (`List<TreeNode> Nodes`) — and the chain leads back to the
+first class, the compiler warns with the cycle and a fix-it that inserts `weak`
+before the back reference (owner-like names such as `Parent`/`Owner` are
+preferred). A cycle made only of collections gets the warning without a fix-it.
+Self-references (`Node Next`, `List<Node> Children`) are not reported: linked
+lists and trees are fine until they actually close a loop, which the
+`--check-leaks` exit report catches. Interfaces, type parameters and delegates
+are not followed. Only your own code is checked.
+
+```
+warning: [W2111] strong reference cycle between classes:
+  Tree.Nodes[] -> TreeNode.Owner -> Tree; ... mark 'TreeNode.Owner' 'weak'
+```
+
+**Event subscriptions are bound to the subscriber's lifetime.** When the target
+of `+=` is rooted at `this` — `Click`, `this.saveBtn.Click`, `saveBtn.Click`
+with `saveBtn` an instance field, `items[i].Changed` — and the right-hand side
+is a lambda that uses `this`, the lambda captures `this` **weakly**. The usual
+owner → publisher → handler → owner cycle never forms; once the subscriber is
+released the handler does nothing (a non-void untyped handler returns zero).
+Nothing changes in how you write it:
+
+```csharp
+class EditorForm : Form {
+    Button saveBtn = new Button();
+    public EditorForm() {
+        saveBtn.Click += () => Save();   // no cycle, no unsubscribe needed
+    }
+    void Save() { ... }
+}
+```
+
+Subscriptions on anything else — a parameter, a local, a static member — keep
+the C# strong capture, so an object kept alive only by the event it subscribed
+to still receives it (`public Logger(Button b) { b.Click += () => Log(); }`).
+Handlers with a typed non-void return and lambdas in struct methods are also
+captured strongly. Method groups (`b.Click += OnClick;`) are unchanged.
+
 ### 6.5 Native Memory (no raw pointers)
 
 Zan 没有 `T*` 指针类型。低层内存操作经 `nint` 与 `NativeMemory` 完成：

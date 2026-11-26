@@ -309,9 +309,9 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     emit_runtime_check(g, isnull, expr->loc,
                        "null reference where a string/byte buffer is required "
                        "(element access)");
-    /* The scratch base keeps length and dimension probes safe after a soft null
-     * error. */
-    arr_ptr = emit_soft_base_select(g, arr_ptr, isnull, expr->loc);
+    /* The empty-array scratch base keeps length and dimension probes safe
+     * (length 0) after a soft null error. */
+    arr_ptr = emit_soft_array_base_select(g, arr_ptr, isnull);
 
     LLVMValueRef elem_ptr = NULL, oob;
     LLVMValueRef idx_1d = NULL;
@@ -350,8 +350,7 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!elem_ptr) {
       LLVMValueRef typed_arr = LLVMBuildBitCast(
           g->builder, arr_ptr, LLVMPointerType(elem_llvm, 0), "arrp");
-      elem_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr,
-                                       &idx_1d, 1, "eidx");
+      elem_ptr = emit_checked_elem_gep(g, elem_llvm, typed_arr, idx_1d, "eidx");
     }
     LLVMValueRef elem = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
     LLVMBuildBr(g->builder, done_bb);

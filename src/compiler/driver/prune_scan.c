@@ -100,6 +100,8 @@ static int pi_reserve(void *arr_p, int count, int *cap, size_t elem_sz) {
 }
 
 static void pi_reach(const char *subdir) {
+  if (!pi_arena)
+    return;
   for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
     if (strcmp(d->subdir, subdir) == 0)
       return;
@@ -148,6 +150,8 @@ static int pi_reach_package_input(const char *file) {
 }
 
 static int pi_reach_input_dir(const char *file) {
+  if (!pi_arena)
+    return 0;
   char comps[64][256];
   int n = 0;
   size_t len = strlen(file);

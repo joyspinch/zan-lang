@@ -59,11 +59,11 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 
 | 编号 | 能力 | 说明 |
 |---|---|---|
-| S1 | `zanc --diag=json` | **第一刀已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置、fix-it 框架，首个补丁 E0032 缺 `;`）。余：更多诊断接 fix-it（`zan_diag_emit_fix`）、结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
-| S2 | `zanc query <符号>` | 回答：分配了什么、捕获了什么、可能抛什么、用到哪些能力（§2.2）、被谁调用 |
-| S3 | `zanc --affected <diff>` | 输出受影响的 ctest 用例名单，替代人工挑选（对应 WC §8 的定向命中面） |
-| S4 | `zanc --summary <包>` | 生成紧凑接口摘要（公开签名 + 效果 + 契约 + 一行文档），供 AI 一次装入上下文；逐步替代手工维护的 `language-facts.md` |
-| S5 | `zan check` | 一条命令跑完：编译诊断 → 泄漏门禁（§3）→ `zan ui check`（§5）→ 回放比对与不变量（§6），输出单份 JSON 报告 |
+| S1 | `zanc --diag=json` | **已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置；fix-it：E0032 缺 `;`、E2084/E2085/E1005 拼写建议、E2073 `=`→`==`、W2111 补 `weak`；结束位置 `end`；zan-lsp 经 `data.fix` 下发补丁、codeAction 给 quickfix）。余：指向 SPEC 小节与 conformance 用例的链接；E2110 入库后补 `await` 补丁 |
+| S2 | `zanc query <符号>` | 已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a（catch 扣除、override/接口实现展开、方法组）；经委托变量的调用目标运行期才定，不展开 |
+| S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
+| S4 | `zanc --summary <包>` | 已落地，见 docs/ZANC_CLI.md §1.7：公开签名 + 效果列（S2 的 throws/能力）+ 一行文档；余：契约列（P4） |
+| S5 | `zan check` | 已落地为随工具链发布的原生 `zan-check`（Zan 写成），见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；ui/replay 步骤随 P2/P3 接入 |
 
 AI 工作循环收敛为：**改代码 → `zan check` → 应用 fix-it**。
 
@@ -123,9 +123,9 @@ AI 生成代码中最常见的注入类漏洞在语言层消失。
 
 | 编号 | 能力 | 说明 |
 |---|---|---|
-| S10 | 泄漏门禁 | 已落地，见 docs/ZANC_CLI.md「泄漏门禁（S10）」：run_case 默认 `--check-leaks`，基线 `tests/leak_baseline.txt` 只减不增（上线 12 例） |
-| S11 | 类型图强环检查 | 声明期零标注静态分析：A 强持 B、B 强持 A（含经集合/委托的间接路径）→ 告警并建议哪一侧改 `weak`（fix-it） |
-| S12 | 事件订阅绑定订阅者生命周期 | `btn.Click += () => Save()` 捕获 `this` 时，订阅随订阅者释放自动解除。写法不变 |
+| S10 | 泄漏门禁 | 已落地，见 docs/ZANC_CLI.md「泄漏门禁（S10）」：run_case 默认 `--check-leaks`，基线 `tests/leak_baseline.txt` 已清零（上线 12 例：7 例 Exit 误报由 S13 剔除、5 例修掉），此后泄漏一律要修 |
+| S11 | 类型图强环检查 | 已落地，见 docs/SPEC.md §6.4：W2111 报用户类之间的强引用环（含经集合/数组），fix-it 给回指针加 `weak`；委托边留给 S12/S13 |
+| S12 | 事件订阅绑定订阅者生命周期 | 已落地，见 docs/SPEC.md §6.4：`+=` 目标以 this 为根时 lambda 弱捕获 this，订阅者释放即失效；其余目标保持强捕获 |
 | S13 | debug 环诊断 | 已落地，见 docs/ZANC_CLI.md §1.5：`--check-leaks` 退出报告试探删除残留对象，逐条打印孤儿环路径；`Environment.Exit` 只计孤儿环 |
 | S14 | 结构化崩溃报告 | 崩溃输出 JSON：调用栈、调度种子（§4.3）、最近输入帧（§6.2），可直接交给 AI |
 | S15 | 资源未释放告警 | `IDisposable` 未进 `using` 且未转移所有权 → 告警 |
@@ -183,7 +183,11 @@ S11 + S12 预计覆盖 GUI 场景绝大部分泄漏来源（父子节点、事�
 
 ### 5.2 目标设计
 
-**S20 标记参与编译。** HTML 窗体在编译期生成强类型分部类：
+**S20 标记参与编译。**（已落地为编译期检查、不生成代码：派生自 `Gui.Form` /
+`Gui.ChildWindow` 的用户类配对同目录或 `--embed` 的同名 `.html`，处理器名 E2112、
+`bind`/`:属性` 路径 E2113（逐段下钻用户类）、`z-mount` 字段 E2114、绑定值不是点分路径（表达式/字面量）E2115 报在 `.html` 的属性值上并
+给补丁，口径与运行期 DocWire 对账相同；钉 `markup_check_compile`。元素 id → 类型化字段与
+未知标签/属性检查未做——后者需要编译期可见的组件注册表。）原设计：HTML 窗体在编译期生成强类型分部类：
 
 - 元素 id → 类型化字段；未知控件名/属性名 → 编译错误。
 - `{Binding Name}` 在编译期对照模型类型检查。
@@ -191,7 +195,9 @@ S11 + S12 预计覆盖 GUI 场景绝大部分泄漏来源（父子节点、事�
 - 与 GUI_REFACTOR 保留的「元数据驱动按名路径」兼容：设计器仍可按名操作，但编译期
   已验证名字存在。
 
-**S21 语义树为唯一事实来源。** 每个控件暴露 role / name / state / bounds / enabled：
+**S21 语义树为唯一事实来源。**（已落地：启用了 UiDriver 的程序——模板默认启用——在
+`ZAN_UI_DUMP=<文件>` 下首帧后导出，字段见 docs/ZANC_CLI.md 环境变量表；`zan run` 子命令
+尚不存在，以环境变量代替。）每个控件暴露 role / name / state / bounds / enabled：
 
 ```bash
 zan run app.zan --ui-dump json   # 输出当前窗口语义树快照
@@ -199,7 +205,8 @@ zan run app.zan --ui-dump json   # 输出当前窗口语义树快照
 
 无障碍、UI 测试、AI agent 共用同一棵树。**AI 读文本即可理解界面，无需截图。**
 
-**S22 `zan ui check` 布局不变量。** 无头运行，自动遍历项目所有窗体：
+**S22 `zan ui check` 布局不变量。**（已落地：`Gui.Testing.UiCheck` + `zan-check` 的 ui 步，
+见 docs/ZANC_CLI.md §1.8；对比度暂未检查；`templates/gui` 按 IDE 方式脚手架后全部过检，钉 full 档 `template_ui_check`） 无头运行，自动遍历项目所有窗体：
 
 - 文字截断、可交互控件重叠、超出窗口、点击区域过小、对比度不足；
 - 100% / 150% / 200% DPI 各跑一遍；
@@ -207,7 +214,9 @@ zan run app.zan --ui-dump json   # 输出当前窗口语义树快照
 
 复用现有预算类测试的基础设施。
 
-**S23 强类型 UI 测试 API**（由 S20 生成的类型驱动，替代字符串脚本）：
+**S23 强类型 UI 测试 API**（已落地为 `Gui.Testing.UiTest`，与 S24 同一套：S20 定为只做
+编译期检查、不生成类型化字段，所以按名操作、在用到时对照真实控件树校验，写错给
+"did you mean"；用法见 `packages/Zan.Gui/src/Gui/README.md`「脱窗 UI 测试」）（由 S20 生成的类型驱动，替代字符串脚本）：
 
 ```csharp
 var f = ui.Open<LoginForm>();
@@ -217,7 +226,8 @@ ui.Expect(f.Error).Hidden();
 ui.Snapshot("login_ok");   // 语义树快照为主（文本、可 diff），像素比对为辅
 ```
 
-**S24 模型可脱窗测试。** 绑定的 ViewModel 不依赖 `App` 即可实例化与断言，
+**S24 模型可脱窗测试。**（已落地：声明式窗体 `new X()` 不建 App；`UiTest.Open(vm)`
+脱窗建树绑定，处理器、双向绑定、可见性与启用态都能断言，钉 `conformance_gui_uitest_login`） 绑定的 ViewModel 不依赖 `App` 即可实例化与断言，
 窗体逻辑的大部分测试不需要起窗口。
 
 ---
@@ -249,10 +259,10 @@ ui.Snapshot("login_ok");   // 语义树快照为主（文本、可 diff），像
 引用 `Gui`/渲染模块。浮点切换到严格模式（禁止 FMA 收缩等）。
 **逻辑/表现分离从约定变成编译保证。**
 
-**S26 回放即测试。** 每次试玩记录种子 + 输入流；bug 报告即回放文件；CI 重放并逐帧
+**S26 回放即测试。**（已落地：`Game.Foundation` 的 `IReplaySim` / `ReplayLog` / `Replay.Record·Verify·Fuzz`，`zan-check` replay 步按 `replays/*.replay` 重放；全部 `templates/game` 带 `<名字>Sim` 与 `replays/bot.replay`，钉 `case_game_replay`、`zan_check_report` 与 full 档 `template_game_replay`；跨平台逐字节一致归 S33） 每次试玩记录种子 + 输入流；bug 报告即回放文件；CI 重放并逐帧
 比对 `Checksum`；回放文件自动成为回归用例。复用 `RollbackSession` / `Snapshot`。
 
-**S27 规则即不变量：**
+**S27 规则即不变量：**（已落地为运行期反射：`[Invariant]` 的 public 无参 bool 方法由 `Invariants.Check` 每帧调用——回放校验与机器人模糊都查；机器人是仿真类的 `static int Bot(DeterministicRandom, int)`，`Replay.Fuzz` 报规则违反/崩溃/卡死并产出可提交的回放。普通 debug 运行里的每帧检查未接入游戏循环）
 
 ```csharp
 [Invariant] bool GoldConserved() => TotalGold() == initialGold + minted - spent;

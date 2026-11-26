@@ -1,0 +1,83 @@
+using System;
+using Game.Foundation;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：用界面走的同一份 RunFlow 无头推进一局。
+// replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
+// 改了规则后回放分叉，就重新录制（见 README）。
+//
+// 输入编码（与当前阶段不符的输入忽略，和点不到的按钮一样）：
+//   1 开局（用回放种子）    10+i 进入第 i 个路线节点    20+i 打出第 i 张手牌
+//   30 结束回合              40+i 收下第 i 张奖励卡      50 回主菜单
+public class RoguelikeSim : IReplaySim {
+    RunFlow flow;
+    int seed;
+
+    public void Reset(long seed) {
+        this.seed = (int)(seed % 999999999);
+        flow = new RunFlow();
+    }
+
+    public void Step(int frame, int input) {
+        int p = flow.phase;
+        if (input == 1 && (p == 0 || p == 4)) {
+            flow.StartRun(seed);
+        } else if (input >= 10 && input < 20 && p == 1) {
+            int i = input - 10;
+            if (i < flow.run.Nodes().Count) { flow.EnterNode(flow.run.Nodes()[i]); }
+        } else if (input >= 20 && input < 30 && p == 2) {
+            flow.PlayCard(input - 20);
+        } else if (input == 30 && p == 2) {
+            flow.EndTurn();
+        } else if (input >= 40 && input < 50 && p == 3) {
+            int i = input - 40;
+            if (i < flow.rewardChoices.Count) { flow.TakeReward(flow.rewardChoices[i]); }
+        } else if (input == 50 && p == 4) {
+            flow.phase = 0;
+        }
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Int(flow.phase).Bool(flow.runWon);
+        if (flow.run != null) {
+            h.Int(flow.run.Floor()).Int(flow.run.Hp()).Int(flow.run.Gold()).Int(flow.run.Kills());
+            for (int i = 0; i < flow.run.Deck().Count; i = i + 1) { h.Text(flow.run.Deck()[i]); }
+        }
+        if (flow.phase == 2 && flow.battle != null) {
+            h.Int(flow.battle.Player().Hp()).Int(flow.battle.Enemy().Hp())
+             .Int(flow.battle.Energy()).Int(flow.battle.Turn()).Int(flow.battle.Deck().Hand().Count());
+        }
+        for (int i = 0; i < flow.rewardChoices.Count; i = i + 1) { h.Text(flow.rewardChoices[i]); }
+        return h.Value();
+    }
+
+    [Invariant]
+    public bool HpInRange() {
+        return flow.run == null || (flow.run.Hp() >= 0 && flow.run.Hp() <= flow.run.MaxHp());
+    }
+
+    [Invariant]
+    public bool FloorInRange() {
+        return flow.run == null || (flow.run.Floor() >= 0 && flow.run.Floor() <= 3);
+    }
+
+    // 战斗阶段一定有一场战斗；奖励阶段一定有三选一
+    [Invariant]
+    public bool PhaseConsistent() {
+        if (flow.phase < 0 || flow.phase > 4) { return false; }
+        if (flow.phase == 2 && flow.battle == null) { return false; }
+        if (flow.phase == 3 && flow.rewardChoices.Count == 0) { return false; }
+        return true;
+    }
+
+    // 机器人：按比例乱按——出牌最多，其次结束回合、选路线、拿奖励、开局
+    public static int Bot(DeterministicRandom rng, int frame) {
+        int roll = rng.NextBelow(100);
+        if (roll < 40) { return 20 + rng.NextBelow(5); }
+        if (roll < 60) { return 30; }
+        if (roll < 75) { return 10 + rng.NextBelow(2); }
+        if (roll < 90) { return 40 + rng.NextBelow(3); }
+        if (roll < 97) { return 1; }
+        return 50;
+    }
+}

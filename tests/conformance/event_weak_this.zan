@@ -1,0 +1,76 @@
+// S12（docs/ZAN_STANDARD.md §3）：事件订阅绑定订阅者生命周期。
+// 订阅目标以 this 为根（`Click`、`this.x.Click`、`x.Click` 中 x 为实例字段）时，
+// `+=` 右侧 lambda 弱捕获 this：宿主持有发布者、发布者持有闭包不再成环，
+// 宿主释放后订阅自动失效；订阅目标是形参/局部量时保持强捕获（C# 语义）。
+// 泄漏门禁（tests/run_case.cmake 默认 --check-leaks）兜底：成环即变红。
+using System;
+using System.Collections.Generic;
+
+delegate void Tick();
+
+public class WtEvent {
+    List<Action> hs;
+    public static WtEvent op_add(WtEvent self, Action h) { self.Add(h); return self; }
+    public void Add(Action h) {
+        if (hs == null) { hs = new List<Action>(); }
+        hs.Add(h);
+    }
+    public void Fire() {
+        if (hs == null) { return; }
+        for (int i = 0; i < hs.Count; i++) { hs[i](); }
+    }
+}
+
+public class WtChild {
+    public WtEvent Changed = new WtEvent();
+    public event Tick Ticked;
+    public void Tick() { if (Ticked != null) { Ticked.Invoke(); } }
+}
+
+public class WtOwner {
+    public WtChild child = new WtChild();
+    public WtEvent Own = new WtEvent();
+    public int hits = 0;
+    public WtOwner() {
+        child.Changed += () => Hit("child");
+        Own += () => Hit("own");
+        this.child.Changed += () => { hits = hits + 100; };
+        child.Ticked += () => {
+            hits = hits + 1000;
+            Action inner = () => { hits = hits + 10000; };
+            inner();
+            if (hits > 100000) { throw new Exception("boom"); }
+        };
+    }
+    void Hit(string what) {
+        hits = hits + 1;
+        Console.WriteLine("hit " + what);
+    }
+}
+
+public class WtLogger {
+    public WtLogger(WtEvent e) { e += () => Log(); }
+    void Log() { Console.WriteLine("logger alive through the event"); }
+}
+
+public class Program {
+    public static void Main() {
+        WtOwner o = new WtOwner();
+        o.child.Changed.Fire();
+        o.Own.Fire();
+        o.child.Tick();
+        Console.WriteLine("hits " + o.hits);
+        o.hits = 200000;
+        try { o.child.Tick(); } catch (Exception e) { Console.WriteLine("caught " + e.Message); }
+
+        WtChild keep = o.child;
+        o = null;
+        keep.Changed.Fire();
+        keep.Tick();
+        Console.WriteLine("owner released: no hits above");
+
+        WtEvent pub = new WtEvent();
+        new WtLogger(pub);
+        pub.Fire();
+    }
+}

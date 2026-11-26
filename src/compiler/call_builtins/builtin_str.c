@@ -767,7 +767,7 @@
                         LLVMConstInt(i64, 0, 0), "mc.n");
                     LLVMTypeRef memchr_ty = LLVMFunctionType(i8ptr,
                         (LLVMTypeRef[]){ i8ptr, LLVMInt32TypeInContext(g->ctx), i64 }, 3, 0);
-                    LLVMValueRef mc_fn = get_libc_fn(g, "memchr", memchr_ty);
+                    LLVMValueRef mc_fn = get_memchr_fn(g);
                     LLVMValueRef mc_args[] = {
                         search,
                         LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
@@ -991,10 +991,15 @@
                                                          locals, &from_owned);
                 LLVMValueRef to = emit_string_like_arg(g, expr->call.args.items[1],
                                                        locals, &to_owned);
+                /* 长度取自串头（null 走软诊断、按 0 长处理），指针按空串替身传入。 */
+                LLVMValueRef ls = emit_string_length(g, s, expr->loc);
+                LLVMValueRef lf = emit_string_length(g, from, expr->loc);
+                LLVMValueRef lt = emit_string_length(g, to, expr->loc);
                 LLVMValueRef rf = get_str_replace_fn(g);
-                LLVMValueRef rargs[] = { s, from, to };
-                LLVMValueRef res = zan_call2(g->builder,
-                    LLVMGlobalGetValueType(rf), rf, rargs, 3, "repl");
+                LLVMValueRef rargs[] = {emit_str_nonnull(g, s),  ls, emit_str_nonnull(g, from), lf,
+                                        emit_str_nonnull(g, to), lt};
+                LLVMValueRef res =
+                    zan_call2(g->builder, LLVMGlobalGetValueType(rf), rf, rargs, 6, "repl");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 release_string_like_arg(g, expr->call.args.items[0], from,
                                         from_owned, locals);
@@ -1053,9 +1058,13 @@
                     LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 1, "cap"));
                 LLVMBuildStore(g->builder, LLVMConstNull(LLVMPointerType(i64, 0)),
                     LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "df"));
+                LLVMValueRef ls = emit_string_length(g, s, expr->loc);
+                LLVMValueRef lsep = emit_string_length(g, sep, expr->loc);
                 LLVMValueRef hf = get_str_split_fn(g);
                 zan_call2(g->builder, LLVMGlobalGetValueType(hf), hf,
-                    (LLVMValueRef[]){ s, sep, lst, opt }, 4, "");
+                          (LLVMValueRef[]){emit_str_nonnull(g, s), ls, emit_str_nonnull(g, sep),
+                                           lsep, lst, opt},
+                          6, "");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 release_string_like_arg(g, expr->call.args.items[0], sep,
                                         sep_owned, locals);

@@ -753,8 +753,14 @@ static void co_stats_dump(void) {
   fflush(stderr);
 }
 
-/* Same optional compiler-provided EH teardown as rt_sync_thread.c. */
-#if defined(__GNUC__) || defined(__clang__)
+/* Same optional compiler-provided EH teardown as rt_sync_thread.c.
+ * MSVC COFF rejects two __attribute__((weak)) definitions in separate .obj
+ * files (LNK1227: conflicting .weak.__zan_eh_release.default.* names);
+ * targets that link both rt_io and rt_sync under MSVC pass
+ * -DZAN_IO_NO_WEAK_EH_RELEASE so rt_sync_thread.c owns the weak fallback. */
+#if defined(ZAN_IO_NO_WEAK_EH_RELEASE)
+extern void __zan_eh_release(void);
+#elif defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void __zan_eh_release(void) {}
 #else
 void __zan_eh_release(void) {}

@@ -101,8 +101,8 @@ class MemberTypos {
         return a + b;
     }
 }
-""", {"[E2084] type 'App.Services.Service' has no method 'Reed'",
-      "[E2084] type 'App.Services.Service' has no member 'Cuont'"}),
+""", {"[E2084] type 'App.Services.Service' has no method 'Reed' -- did you mean 'Read'?",
+      "[E2084] type 'App.Services.Service' has no member 'Cuont' -- did you mean 'Count'?"}),
     ("generic_shadow.zan", """namespace App.Services;
 class GenericShadow<Service> {
     Service Echo(Service value) { return value; }

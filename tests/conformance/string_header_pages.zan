@@ -1,0 +1,96 @@
+// 12 字节串头（[-12] u32 rc、[-8] 头字）+ --fast-alloc 串页（块在 4 mod 8
+// 处、邻块共享虚基址前 4 字节）的钉子用例：各长度档的串紧挨着分配、交错
+// 释放再复用，经 string 槽 / object 槽 / 集合 / 字典进出，任何越界写到
+// 串的 [-16..-12) 都会改坏相邻串的尾字节，最后逐个核对内容就能看出来。
+using System;
+using System.Collections.Generic;
+
+class Holder {
+    public object Slot;
+    public string Text;
+}
+
+class P {
+    static List<string> bases = new List<string>();
+
+    static string Make(int i) {
+        // 长度 0..299 循环，覆盖 24..128 每个 8 字节串页档和其后的通用类
+        if (bases.Count == 0) {
+            string letters = "abcdefghijklmnopqrstuvwxyz";
+            for (int k = 0; k < 26; k++) {
+                string one = letters.Substring(k, 1);
+                string b = "";
+                for (int r = 0; r < 300; r++) { b = b + one; }
+                bases.Add(b);
+            }
+        }
+        return bases[i % 26].Substring(0, i % 300);
+    }
+
+    static bool Check(string s, int i) {
+        int len = i % 300;
+        if (s.Length != len) { return false; }
+        char c = (char)('a' + (i % 26));
+        for (int k = 0; k < len; k++) {
+            if (s[k] != c) { return false; }
+        }
+        return true;
+    }
+
+    static void Main() {
+        int n = 6000;
+        List<string> items = new List<string>();
+        for (int i = 0; i < n; i++) { items.Add(Make(i)); }
+
+        // 释放偶数位、用新串填回：空闲块复用 + 相邻活串
+        for (int i = 0; i < n; i += 2) { items[i] = Make(i + 300); }
+        int bad = 0;
+        for (int i = 0; i < n; i++) {
+            int want = (i % 2 == 0) ? i + 300 : i;
+            if (!Check(items[i], want)) { bad++; }
+        }
+        Console.WriteLine("reuse bad=" + bad);
+
+        // object 槽走通用 retain/release（与对象同一 RC 槽）
+        List<Holder> hs = new List<Holder>();
+        for (int i = 0; i < 2000; i++) {
+            Holder h = new Holder();
+            h.Slot = items[i];
+            h.Text = items[i] + "#";
+            hs.Add(h);
+        }
+        items.Clear();
+        bad = 0;
+        for (int i = 0; i < hs.Count; i++) {
+            int want = (i % 2 == 0) ? i + 300 : i;
+            string s = (string)hs[i].Slot;
+            if (!Check(s, want)) { bad++; }
+            if (hs[i].Text.Length != s.Length + 1) { bad++; }
+            object o = s;
+            object o2 = o;
+            string back = (string)o2;
+            if (back.Length != s.Length) { bad++; }
+        }
+        Console.WriteLine("slots bad=" + bad);
+
+        // 字典键值、拼接、子串、短串
+        Dictionary<string, string> d = new Dictionary<string, string>();
+        for (int i = 0; i < 3000; i++) { d["k" + i] = "v" + (i * 7); }
+        bad = 0;
+        for (int i = 0; i < 3000; i++) {
+            if (d["k" + i] != "v" + (i * 7)) { bad++; }
+        }
+        string big = "";
+        for (int i = 0; i < 200; i++) { big = big + Convert.ToString(i % 10); }
+        for (int i = 0; i < 200; i++) {
+            string sub = big.Substring(i, 200 - i);
+            if (sub.Length != 200 - i || sub[0] != (char)('0' + (i % 10))) { bad++; }
+        }
+        Console.WriteLine("dict bad=" + bad + " count=" + d.Count);
+
+        long total = 0;
+        hs.Clear();
+        for (int i = 0; i < 100000; i++) { total = total + ("item" + Convert.ToString(i)).Length; }
+        Console.WriteLine(total);
+    }
+}

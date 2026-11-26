@@ -110,6 +110,8 @@ void emit_eh_landing_to(zan_irgen_t *g, LLVMBasicBlockRef body,
   LLVMSetCleanup(lp, 1);
   if (native_slot)
     LLVMBuildStore(g->builder, lp, native_slot);
+  else if (catches_native)
+    emit_eh_native_delete(g, lp);
   LLVMBuildBr(g->builder, body);
 }
 LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
@@ -522,7 +524,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
       rel_arr_null, rel_arr_work);
 
   LLVMPositionBuilderAtEnd(g->builder, rel_arr_work);
-  LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+  LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_HDR_WORD_OFF, 1);
   LLVMValueRef site_p = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                                       vobj, &neg8, 1, "arr.sitep");
   LLVMValueRef raw_site =
@@ -565,7 +567,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
   LLVMValueRef adfn =
       LLVMBuildBitCast(g->builder, adtor, LLVMPointerType(adfnty, 0), "adfn");
-  zan_call2(g->builder, adfnty, adfn, &vobj, 1, "");
+  zan_mark_nounwind(g, zan_call2(g->builder, adfnty, adfn, &vobj, 1, ""));
   LLVMBuildBr(g->builder, head);
 
   LLVMPositionBuilderAtEnd(g->builder, rel_arr_plain);
@@ -620,6 +622,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
 void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
   if (!obj || LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind)
     return;
+  g->eh_tmp_push_seq++;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (LLVMTypeOf(obj) != i8ptr)
     obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "eh.tmp");
@@ -630,6 +633,7 @@ void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj) {
 void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
   if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind)
     return;
+  g->eh_tmp_push_seq++;
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (LLVMTypeOf(slot) != i8ptr)
@@ -659,6 +663,7 @@ void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
 void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value) {
   if (!value || LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind)
     return;
+  g->eh_tmp_push_seq++;
   /* Erased delegates carry a closure tag, not EH kind bits. Encode closure
    * tags branchlessly via select so each call site adds 0 basic blocks. */
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);

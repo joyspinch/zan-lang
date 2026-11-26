@@ -28,29 +28,34 @@ static void zan_leak_walk_edges(const zan_live_entry_t *entry,
     const char *obj = (const char *)entry->obj;
     if (entry->kind != ZAN_LIVE_OBJECT) {
         if (entry->kind == ZAN_LIVE_REF_ARRAY) {
-            int64_t count = *(const int64_t *)(obj + ZAN_OBJ_RC_OFF);
+            int64_t count = *(const int64_t *)(obj + ZAN_ARR_COUNT_OFF);
             size_t bytes = entry->size - ZAN_ARR_HDR_SIZE - entry->data_offset;
             if (count > 0 && (uint64_t)count <= bytes / sizeof(void *)) {
                 void *const *elems = (void *const *)(obj + entry->data_offset);
-                for (int64_t i = 0; elems && i < count; i++)
-                    if (elems[i]) cb(entry, elems[i], 1, (uint32_t)i, ctx);
+                for (int64_t i = 0; elems && i < count; i++) {
+                    if (elems[i]) cb(entry, zan_edge_untag(elems[i]), 1, (uint32_t)i, ctx);
+                }
             }
         }
         return;
     }
 
-    uint64_t site = entry->site & ~ZAN_OBJ_STACK_FLAG;
-    if ((site >> 32) == ZAN_STRING_TAG) return;
+    uint64_t word = entry->site & ~ZAN_OBJ_STACK_FLAG;
+    if (zan_word_is_string(word)) return;
     const zan_field_graph_t *fg = NULL;
-    if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
-        fg = g_site_field_graphs_reg[site];
-    } else if (site >= 4096) {
-        const zan_arc_desc_t *desc = (const zan_arc_desc_t *)(uintptr_t)site;
-        fg = desc ? desc->field_graph : NULL;
+    const zan_arc_desc_t *desc = zan_word_desc(word);
+    if (desc) {
+        fg = desc->field_graph;
+    } else {
+        uint64_t site = zan_word_site(word);
+        if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count)
+            fg = (const zan_field_graph_t *)g_site_field_graphs_reg[site];
     }
     if (!fg) return;
 
-    size_t bytes = entry->size - ZAN_OBJ_HDR_SIZE;
+    size_t hdr_bytes = zan_obj_hdr_bytes(word);
+    if (entry->size < hdr_bytes) return;
+    size_t bytes = entry->size - hdr_bytes;
     if (fg->kind == 0) {
         for (uint32_t k = 0; k < fg->ref_count; k++) {
             uint32_t off = fg->refs[k].offset;
@@ -58,7 +63,7 @@ static void zan_leak_walk_edges(const zan_live_entry_t *entry,
                 continue;
             void *child;
             memcpy(&child, obj + off, sizeof(child));
-            if (child) cb(entry, child, 0, k, ctx);
+            if (child) cb(entry, zan_edge_untag(child), 0, k, ctx);
         }
     } else if (fg->kind == 1 || fg->kind == 2) {
         size_t required = 16 + sizeof(void *) * fg->kind;
@@ -69,15 +74,15 @@ static void zan_leak_walk_edges(const zan_live_entry_t *entry,
         if (fg->kind == 1) {
             void *const *data = *(void *const *const *)(obj + 16);
             for (int64_t j = 0; data && j < count; j++)
-                if (data[j]) cb(entry, data[j], 1, (uint32_t)j, ctx);
+                if (data[j]) cb(entry, zan_edge_untag(data[j]), 1, (uint32_t)j, ctx);
         } else {
             void *const *ks = *(void *const *const *)(obj + 16);
             void *const *vs = *(void *const *const *)(obj + 24);
             int key_is_rc = fg->ref_count & 1;
             int val_is_rc = (fg->ref_count >> 1) & 1;
             for (int64_t j = 0; j < count; j++) {
-                if (key_is_rc && ks && ks[j]) cb(entry, ks[j], 2, (uint32_t)j, ctx);
-                if (val_is_rc && vs && vs[j]) cb(entry, vs[j], 3, (uint32_t)j, ctx);
+                if (key_is_rc && ks && ks[j]) cb(entry, zan_edge_untag(ks[j]), 2, (uint32_t)j, ctx);
+                if (val_is_rc && vs && vs[j]) cb(entry, zan_edge_untag(vs[j]), 3, (uint32_t)j, ctx);
             }
         }
     }
@@ -143,13 +148,18 @@ static void zan_leak_emit(zan_leak_out_t *o, const char *fmt, const char *a, con
 }
 
 static void zan_leak_emit_node(zan_leak_out_t *o, const zan_live_entry_t *entry) {
-    uint64_t site = entry->site & ~ZAN_OBJ_STACK_FLAG;
+    uint64_t site = zan_word_site(entry->site & ~ZAN_OBJ_STACK_FLAG);
     const char *ty = zan_get_object_tyname(entry);
     const char *where = NULL;
     if (o->site_names && site > 0 && site < (uint64_t)o->site_count)
         where = (const char *)o->site_names[site];
     else if (entry->source)
         where = entry->source;
+    /* 闭包记录与捕获盒没有类型名，按站点名的方括号标注显示 */
+    if (where && strcmp(ty, "object") == 0) {
+        if (strstr(where, "[closure]")) ty = "closure";
+        else if (strstr(where, "[captured local]")) ty = "box";
+    }
     char buf[512];
     if (where) {
         /* 站点名形如 "file:line:col [List<T>]"：类型已由 ty 给出，去掉方括号尾巴 */
@@ -167,7 +177,7 @@ static void zan_leak_emit_edge(zan_leak_out_t *o, const zan_live_entry_t *entry,
                                const zan_leak_edge_t *e) {
     char buf[32];
     if (e->kind == 0) {
-        uint64_t site = entry->site & ~ZAN_OBJ_STACK_FLAG;
+        uint64_t site = zan_word_site(entry->site & ~ZAN_OBJ_STACK_FLAG);
         const char *name = NULL;
         if (o->field_names && site > 0 && site < (uint64_t)o->site_count) {
             const char **names = (const char **)o->field_names[site];
@@ -269,9 +279,7 @@ int64_t zan_rt_leak_cycles(void **site_names, void **field_names, int64_t site_c
     for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
         for (size_t b = 0; b < g_live_stripes[s].bucket_count; b++) {
             for (zan_live_entry_t *e = g_live_stripes[s].buckets[b]; e && n < total; e = e->next) {
-                int rc_offset = e->kind == ZAN_LIVE_OBJECT ? ZAN_OBJ_RC_OFF : ZAN_ARR_RC_OFF;
-                const int64_t *rc_ptr = (const int64_t *)((const char *)e->obj + rc_offset);
-                int64_t rc = __atomic_load_n(rc_ptr, __ATOMIC_RELAXED);
+                int64_t rc = zan_live_read_rc(e);
                 if (rc != 0) {
                     nodes[n] = (zan_cycle_node_t){.entry = e, .rc = rc};
                     zan_obj_map_put(&map, e->obj, (int)n);
@@ -286,7 +294,7 @@ int64_t zan_rt_leak_cycles(void **site_names, void **field_names, int64_t site_c
 
     size_t qhead = 0, qtail = 0;
     for (size_t i = 0; i < n; i++) {
-        if (nodes[i].rc > nodes[i].internal_rc) {
+        if (nodes[i].rc < 0 || nodes[i].rc > nodes[i].internal_rc) {
             nodes[i].marked = 1;
             queue[qtail++] = (int)i;
         }

@@ -42,6 +42,13 @@ typedef struct {
 } zan_lpad_entry_t;
 
 /* 编译器生成的保护文本驻留表项 */
+/* Partitioned backend counters (build_partition.h), printed by --time. */
+typedef struct {
+    int units, hit, miss;
+    long moved_insns, residual_insns;
+    double ms_split, ms_compile;
+} zan_part_stats_t;
+
 typedef struct zan_str_intern {
   char *text;
   LLVMValueRef gv;
@@ -457,22 +464,60 @@ struct zan_irgen {
   LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
   LLVMValueRef rt_weak_load_retain;
   LLVMValueRef rt_weak_destroy_begin;
+  /* 闭包/捕获盒站点的强引用槽布局（字段走图用，见 zan_set_closure_site_layout）；
+   * 下标同 site_syms，按需增长到 site_clo_cap，未登记的站点为 NULL。 */
+  struct zan_clo_layout **site_clo;
+  int site_clo_cap;
+  /* 默认模式的站点号 → 描述符表（docs/OBJECT_LAYOUT.md）：irgen 期间是
+   * 占位全局，zan_irgen_emit 收尾时按 desc_gv 定型（RAUW）。 */
+  LLVMValueRef g_desc_tbl;
+  LLVMValueRef g_desc_n;
+  bool desc_tbl_frozen;
   /* Apple --fast-alloc: ld64 has no --wrap, so object emission renames the
    * module's malloc/free/calloc/realloc declarations to rt_mem.c's
    * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
   bool route_fast_alloc;
+  bool str_pages; /* rt_mem 在场：串走 zan_mem_str_malloc 的 12 字节头串页 */
   /* Executable builds without -g (publish or not) use closed-world rules:
    * demand-driven method bodies and reflection thunks only for what the
    * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
    * every body and a thunk for every method. Set by zan_irgen_emit. */
   bool closed_world;
+  /* S12：`x.Event += lambda` 且订阅目标以 this 为根时，赋值发射把右侧
+   * lambda 节点记在这里；lambda 发射按节点身份取走，改为弱捕获 this。 */
+  struct zan_ast_node *weak_this_lambda;
   /* Set by the driver for native, non-cross executable builds: object
    * emission may split a large module across threads (codegen_split.h).
    * The extra partition objects are listed here for the linker. */
   bool split_codegen_ok;
+  /* Set by the driver when this module goes straight to object emission:
+   * the optimizer may then run only the simplification half of default<ON>
+   * and leave the finish half (opt_finish_level = N, 0 = nothing pending)
+   * to zan_irgen_write_obj, which runs it per partition in parallel. */
+  bool defer_opt_finish_ok;
+  bool opt_finish_vectorize;
+  int opt_finish_level;
   struct refl_inst_index *refl_inst_index; /* reflect_fields.c, lazily built */
   char **split_objs;
   int split_obj_count;
+  /* Partitioned backend (build_partition.h): zan_optimize runs only the
+   * Zan passes; zan_irgen_partition moves the unit bodies out and lists
+   * their objects here for the linker. */
+  bool opt_zan_passes_only;
+  char **part_objs;
+  int part_obj_count;
+  zan_part_stats_t part_stats; /* for --time */
+  /* Source unit of each emitted method body, by function name
+   * (irgen_origin.c; consumed by the partitioned backend). */
+  char **origin_fn_names;
+  int *origin_fn_unit;
+  int origin_count, origin_cap;
+  char **origin_units;
+  int origin_unit_count;
+  int *origin_file_unit;
+  int origin_file_cap;
+  char **html_handlers; /* publish：设计稿事件处理器名，按名保留反射 */
+  int html_handler_count;
 
   LLVMValueRef fn_printf;
   LLVMTypeRef printf_type;
@@ -848,6 +893,13 @@ struct zan_irgen {
   LLVMValueRef eh_state_owner;
   LLVMValueRef eh_state_cached;
   LLVMValueRef eh_state_fields[8];
+  /* Bumped by every emitted temp-stack push. A function whose body emitted
+   * none needs no entry mark and no landing-pad unwind (finish_fn_lpad). */
+  unsigned eh_tmp_push_seq;
+  /* Data layout for field-offset TBAA tags (opt_tbaa.c); lazily created. */
+  LLVMTargetDataRef tbaa_td;
+  /* --fp-contract: mark float add/sub/mul contractible (FMA) before optimizing. */
+  bool fp_contract;
 
   char target_triple[128];
   /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
@@ -1016,7 +1068,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *module_name, const char *target_triple,
                             bool target_is_windows,
                             bool external_async_executor, bool check_leaks,
-                            bool runtime_checks, bool arc_guard, bool arc_net);
+                            bool runtime_checks, bool arc_guard, bool arc_net,
+                            bool str_pages);
 void zan_irgen_destroy(zan_irgen_t *g);
 void zan_irgen_release_llvm(zan_irgen_t *g);
 
@@ -1086,6 +1139,14 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
 int zan_irgen_prune_extern_libs(zan_irgen_t *g);
+/* irgen_origin.c: record which source unit `fn`'s body comes from (decl's
+ * file; "user" for a generic instance over a user-declared type). */
+void zan_irgen_note_origin(zan_irgen_t *g, LLVMValueRef fn, struct zan_ast_node *decl,
+                           zan_type_t *inst, zan_type_t **bind, int nbind);
+void zan_irgen_origin_free(zan_irgen_t *g);
+/* emit_target.c: split the module into per-unit objects (build_partition.h).
+ * Returns 1 when split, 0 when not worth it, -1 on error. */
+int zan_irgen_partition(zan_irgen_t *g, int opt_level, const char *obj_base);
 
 /* Match a bundled iOS driver's logical DllImport name. */
 bool zan_irgen_imports_ios_driver(const zan_irgen_t *g, const char *driver);

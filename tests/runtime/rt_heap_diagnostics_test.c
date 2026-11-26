@@ -43,13 +43,28 @@ void zan_rt_fatal(const char *category, const char *message) {
   abort();
 }
 
+static void *g_test_descs[512];
+static int64_t g_test_desc_count = 1;
+
+static uint64_t register_test_desc(const zan_arc_desc_t *desc) {
+  for (int64_t i = 1; i < g_test_desc_count; i++) {
+    if (g_test_descs[i] == (void *)desc)
+      return (uint64_t)i;
+  }
+  if (g_test_desc_count >= (int64_t)(sizeof(g_test_descs) / sizeof(g_test_descs[0])))
+    abort();
+  uint64_t site = (uint64_t)g_test_desc_count++;
+  g_test_descs[site] = (void *)desc;
+  zan_rt_register_desc_table(g_test_descs, g_test_desc_count);
+  return site;
+}
+
 static void *new_object_with_source(uint64_t site, size_t bytes,
                                     const char *source) {
   uint64_t *raw = calloc(1, ZAN_OBJ_HDR_SIZE + bytes);
   if (!raw)
     abort();
-  raw[0] = 1;
-  raw[1] = site;
+  raw[0] = ZAN_OBJ_HDR_INIT(site);
   void *obj = (char *)raw + ZAN_OBJ_HDR_SIZE;
   if (source) {
     zan_rt_live_register_named(obj, ZAN_OBJ_HDR_SIZE + bytes, source);
@@ -64,7 +79,7 @@ static void *new_object_at_site(uint64_t site, size_t bytes) {
 }
 
 static void *new_object(const zan_arc_desc_t *desc, size_t bytes) {
-  return new_object_at_site((uintptr_t)desc, bytes);
+  return new_object_at_site(register_test_desc(desc), bytes);
 }
 
 static void **new_array(size_t count, size_t rank, int elements_are_refs) {
@@ -226,7 +241,7 @@ static int test_list_mutation(void) {
   CHECK(pthread_join(thread, NULL) == 0);
 #endif
   CHECK(zan_gc_detect_cycles() == 1);
-  *(int64_t *)((char *)list + ZAN_OBJ_RC_OFF) = 0;
+  *ZAN_RC_PTR(list) = 0;
   free(list->data);
   /* Final-release cleanup may still have the object in the registry. */
   CHECK(zan_gc_detect_cycles() == 0);
@@ -292,7 +307,7 @@ static int test_snapshot_sources(const char *path) {
   static const char first_repeat[] = "fixture path/main.zan:12:4";
   static const char second[] = "fixture path/main.zan:26:8";
   const size_t header = ZAN_OBJ_HDR_SIZE;
-  const uint64_t site = (uintptr_t)&desc;
+  const uint64_t site = register_test_desc(&desc);
   void *a = new_object_with_source(site, 8, first);
   void *a_repeat = new_object_with_source(site, 16, first_repeat);
   void *b = new_object_with_source(site, 32, second);

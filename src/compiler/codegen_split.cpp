@@ -1,7 +1,8 @@
-/* codegen_split.cpp -- split an optimized module and emit the parts in
- * parallel. See codegen_split.h. */
+/* codegen_split.cpp -- the default<ON> pipeline in two halves, and parallel
+ * optimization + emission of module partitions. See codegen_split.h. */
 
 #include "codegen_split.h"
+#include "procmem.h"
 
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -10,11 +11,16 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/IPO/Annotation2Metadata.h>
+#include <llvm/Transforms/IPO/ForceFunctionAttrs.h>
 #include <llvm/Transforms/Utils/SplitModule.h>
 
 #include <atomic>
@@ -28,6 +34,53 @@
 
 namespace {
 
+void trace_mem(const char *what) {
+    static const bool on = getenv("ZAN_SPLIT_TRACE") != nullptr;
+    if (!on) return;
+    zan_procmem_t m = zan_procmem_read();
+    fprintf(stderr, "split: %-28s commit %5zu MB  peak %5zu MB\n", what, m.commit >> 20,
+            m.peak >> 20);
+}
+
+/* One half of buildPerModuleDefaultPipeline, run the way LLVMRunPasses runs
+ * a text pipeline (same tuning options, analyses and instrumentation, so
+ * optnone and opt-bisect behave the same). */
+void run_half(llvm::Module &m, llvm::TargetMachine *tm, int level, int vectorize, bool simplify) {
+    llvm::OptimizationLevel ol = level <= 1   ? llvm::OptimizationLevel::O1
+                                 : level == 2 ? llvm::OptimizationLevel::O2
+                                              : llvm::OptimizationLevel::O3;
+    llvm::PipelineTuningOptions pto;
+    if (vectorize) {
+        pto.LoopInterleaving = true;
+        pto.LoopVectorization = true;
+        pto.SLPVectorization = true;
+        pto.LoopUnrolling = true;
+    }
+    llvm::PassInstrumentationCallbacks pic;
+    llvm::PassBuilder pb(tm, pto, std::nullopt, &pic);
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+    llvm::StandardInstrumentations si(m.getContext(), false, false);
+    si.registerCallbacks(pic, &mam);
+    llvm::ModulePassManager mpm;
+    if (simplify) {
+        mpm.addPass(llvm::Annotation2MetadataPass());
+        mpm.addPass(llvm::ForceFunctionAttrsPass());
+        pb.invokePipelineStartEPCallbacks(mpm, ol);
+        mpm.addPass(pb.buildModuleSimplificationPipeline(ol, llvm::ThinOrFullLTOPhase::None));
+    } else {
+        mpm.addPass(pb.buildModuleOptimizationPipeline(ol, llvm::ThinOrFullLTOPhase::None));
+    }
+    mpm.run(m, mam);
+}
+
 struct split_job_t {
     const llvm::Target *target;
     llvm::Triple triple;
@@ -38,6 +91,7 @@ struct split_job_t {
     llvm::CodeGenOptLevel opt_level;
     std::vector<llvm::SmallVector<char, 0>> bitcode;
     const char *const *paths;
+    zan_split_opts_t opts;
     std::atomic<int> next{0};
     std::mutex err_mu;
     std::string error;
@@ -69,6 +123,16 @@ struct split_job_t {
             fail("cannot create target machine for codegen partition");
             return;
         }
+        if (opts.finish_level > 0) {
+            run_half(**mod, tm.get(), opts.finish_level, opts.vectorize, false);
+            std::string msg;
+            llvm::raw_string_ostream os(msg);
+            if (llvm::verifyModule(**mod, &os)) {
+                fail("module verification failed after optimizing a partition: " + msg);
+                return;
+            }
+        }
+        if (opts.prepare) opts.prepare(opts.prepare_ctx, llvm::wrap(mod->get()));
         std::error_code ec;
         llvm::raw_fd_ostream out(paths[i], ec, llvm::sys::fs::OF_None);
         if (ec) {
@@ -96,8 +160,21 @@ struct split_job_t {
 
 } // namespace
 
+extern "C" void zan_opt_simplify_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, int level,
+                                        int vectorize) {
+    run_half(*llvm::unwrap(mod), reinterpret_cast<llvm::TargetMachine *>(tm), level, vectorize,
+             true);
+}
+
+extern "C" void zan_opt_finish_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, int level,
+                                      int vectorize) {
+    run_half(*llvm::unwrap(mod), reinterpret_cast<llvm::TargetMachine *>(tm), level, vectorize,
+             false);
+}
+
 extern "C" int zan_codegen_split_emit(LLVMModuleRef mod_ref, LLVMTargetMachineRef tm_ref, int parts,
-                                      int threads, const char *const *paths, char **error) {
+                                      int threads, const zan_split_opts_t *opts,
+                                      const char *const *paths, char **error) {
     *error = nullptr;
     std::unique_ptr<llvm::Module> mod(llvm::unwrap(mod_ref));
     auto *tm = reinterpret_cast<llvm::TargetMachine *>(tm_ref);
@@ -111,7 +188,21 @@ extern "C" int zan_codegen_split_emit(LLVMModuleRef mod_ref, LLVMTargetMachineRe
     job.code_model = tm->getCodeModel();
     job.opt_level = tm->getOptLevel();
     job.paths = paths;
+    if (opts) job.opts = *opts;
+    else memset(&job.opts, 0, sizeof(job.opts));
 
+    if (job.opts.finish_level > 0) {
+        /* The finish pipeline ends in GlobalDCE, which would delete a
+         * linkonce definition its own partition no longer uses while other
+         * partitions still reference it (they only see a declaration).
+         * weak keeps the same merge semantics without being discardable. */
+        for (llvm::GlobalValue &gv : mod->global_values()) {
+            if (gv.isDeclaration()) continue;
+            if (gv.hasLinkOnceODRLinkage()) gv.setLinkage(llvm::GlobalValue::WeakODRLinkage);
+            else if (gv.hasLinkOnceAnyLinkage()) gv.setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+        }
+    }
+    trace_mem("before split");
     int produced = 0;
     llvm::SplitModule(
         *mod, (unsigned)parts,
@@ -123,7 +214,9 @@ extern "C" int zan_codegen_split_emit(LLVMModuleRef mod_ref, LLVMTargetMachineRe
             produced++;
         },
         /*PreserveLocals=*/false);
+    trace_mem("partitions serialized");
     mod.reset();
+    trace_mem("input module freed");
 
     /* SplitModule may produce fewer non-empty partitions than requested; it
      * still calls back once per partition, so the counts agree. */
@@ -137,6 +230,7 @@ extern "C" int zan_codegen_split_emit(LLVMModuleRef mod_ref, LLVMTargetMachineRe
     for (int t = 1; t < threads; t++) pool.emplace_back([&job] { job.worker(); });
     job.worker();
     for (auto &th : pool) th.join();
+    trace_mem("partitions emitted");
     if (!job.error.empty()) {
         *error = strdup(job.error.c_str());
         return -1;

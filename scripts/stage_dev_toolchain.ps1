@@ -45,7 +45,7 @@ if ($SelfhostDefault) {
     Add-StageInput (Join-Path $Build 'zanc.exe') 'zanc.exe' -Required
     if ($IncludeSelfhost) { Add-StageInput (Join-Path $Build 'zanc-selfhost.exe') 'zanc-selfhost.exe' -Required }
 }
-foreach ($exe in @('zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
+foreach ($exe in @('zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'zan-check.exe', 'ld.exe', 'ld.lld.exe')) {
     Add-StageInput (Join-Path $Build $exe) $exe -Required
 }
 if ($IncludeSelfhost) {

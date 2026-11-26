@@ -107,6 +107,10 @@ static const zan_builtin_member_t members_convert[] = {
     {"ToDouble", 'M', "double ToDouble(string text)"},
     {"ToInt32", 'M', "int ToInt32(string text)"},
     {"ToInt64", 'M', "long ToInt64(string text)"},
+    /* Without this entry a built-in Convert.ToString call (no `using System`)
+     * inferred no type, so callers never released the fresh string it
+     * returns (Console.WriteLine(Convert.ToString(n)) leaked one per call). */
+    {"ToString", 'M', "string ToString(object value)"},
 };
 
 static const zan_builtin_member_t members_stringcls[] = {

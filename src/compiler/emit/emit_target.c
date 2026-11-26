@@ -392,6 +392,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
   }
 
+  class_vptr_plan_compute(g, unit);
   discover_generic_insts(g, unit);
 
   for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -836,6 +837,9 @@ done:;
       return ZAN_ERROR;
   }
   sinit_register_library_startup(g, get_static_init_coordinator(g));
+  /* 站点号 → 描述符表定型：此后不再登记分配点。须在反射成员表压缩之前——
+   * 描述符（及其反射记录）只经这张表被引用，占位表看不到它们会被当成死记录 */
+  emit_desc_table(g);
   refl_compact_member_tables(g);
   char *error = NULL;
   if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {
@@ -1778,6 +1782,66 @@ static bool zan_codegen_split_plan(zan_irgen_t *g, int *parts, int *threads) {
     return true;
 }
 
+static void prepare_sections_cb(void *ctx, LLVMModuleRef part) {
+    zan_irgen_prepare_object_sections((zan_irgen_t *)ctx, part);
+}
+
+static int zan_online_cpus(void) {
+    long cpus = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cpus = (long)si.dwNumberOfProcessors;
+#else
+    cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (cpus < 1) cpus = 1;
+    if (cpus > 16) cpus = 16;
+    return (int)cpus;
+}
+
+int zan_irgen_partition(zan_irgen_t *g, int opt_level, const char *obj_base) {
+    if (zan_diag_has_errors(g->diag)) return -1;
+    LLVMTargetMachineRef tm;
+    if (zan_bind_target_layout(g, &tm) != ZAN_OK) return -1;
+    zan_part_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.fn_names = (const char *const *)g->origin_fn_names;
+    o.fn_units = g->origin_fn_unit;
+    o.fn_count = g->origin_count;
+    o.units = (const char *const *)g->origin_units;
+    o.unit_count = g->origin_unit_count;
+    o.optimize = zan_opt_run_passes_on_unit;
+    o.prelude = zan_opt_unit_prelude;
+    o.level = opt_level;
+    o.prepare = prepare_sections_cb;
+    o.prepare_ctx = g;
+    o.threads = zan_online_cpus();
+    o.obj_base = obj_base;
+    zan_part_result_t r;
+    char *error = NULL;
+    int rc = zan_part_run(g->mod, tm, &o, &r, &error);
+    LLVMDisposeTargetMachine(tm);
+    g->part_stats.units = r.count;
+    g->part_stats.hit = r.units_hit;
+    g->part_stats.miss = r.units_miss;
+    g->part_stats.moved_insns = r.moved_insns;
+    g->part_stats.residual_insns = r.residual_insns;
+    g->part_stats.ms_split = r.ms_split;
+    g->part_stats.ms_compile = r.ms_compile;
+    if (rc < 0) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
+                           "partitioned backend failed: %s", error ? error : "?");
+        free(error);
+        return -1;
+    }
+    if (rc > 0) {
+        g->part_objs = r.objs;
+        g->part_obj_count = r.count;
+    }
+    return rc;
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
   LLVMTargetMachineRef tm;
   if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
@@ -1787,14 +1851,23 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMDisposeTargetMachine(tm);
     return ZAN_ERROR;
   }
-  zan_irgen_prepare_object_sections(g, g->mod);
-  if (zan_opt_verify_module(g->mod, "after object section preparation") !=
-      ZAN_OK) {
-    LLVMDisposeTargetMachine(tm);
-    return ZAN_ERROR;
-  }
+  /* The finish half of the optimizer, if zan_optimize left it pending, and
+   * section preparation (which must see the final IR: fast-alloc routing
+   * renames libc allocators the pipeline reasons about) run per partition
+   * when the module splits, else here on the whole module. */
+  zan_split_opts_t sopts;
+  memset(&sopts, 0, sizeof(sopts));
+  sopts.finish_level = g->opt_finish_level;
+  sopts.vectorize = g->opt_finish_vectorize;
+  sopts.prepare = prepare_sections_cb;
+  sopts.prepare_ctx = g;
+  g->opt_finish_level = 0;
   char *error = NULL;
   int parts = 0, threads = 1;
+  /* Build cache (docs/BUILD_CACHE.md): the key is this exact module plus
+   * the target machine and partition count, so a hit is the object(s) the
+   * same module produced before. */
+  zan_bcache_key_t obj_key = {{0}, false};
   if (zan_codegen_split_plan(g, &parts, &threads)) {
     size_t plen = strlen(path);
     char **paths = (char **)calloc((size_t)parts, sizeof(char *));
@@ -1810,10 +1883,17 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
       else
         snprintf(paths[i], plen + 24, "%s.p%d.o", path, i);
     }
+    if (ok && zan_bcache_obj_key(g->mod, tm, parts, &obj_key) &&
+        zan_bcache_obj_load(&obj_key, parts, (const char *const *)paths)) {
+      LLVMDisposeTargetMachine(tm);
+      g->split_objs = paths;
+      g->split_obj_count = parts;
+      return ZAN_OK;
+    }
     if (ok) {
       LLVMModuleRef mod = g->mod;
       g->mod = NULL; /* owned and disposed by the splitter */
-      int rc = zan_codegen_split_emit(mod, tm, parts, threads,
+      int rc = zan_codegen_split_emit(mod, tm, parts, threads, &sopts,
                                       (const char *const *)paths, &error);
       LLVMDisposeTargetMachine(tm);
       if (rc != 0) {
@@ -1828,6 +1908,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         free(paths);
         return ZAN_ERROR;
       }
+      zan_bcache_obj_store(&obj_key, parts, (const char *const *)paths);
       g->split_objs = paths;
       g->split_obj_count = parts;
       return ZAN_OK;
@@ -1837,6 +1918,25 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         free(paths[i]);
       free(paths);
     }
+  }
+  const char *one_path[1] = {path};
+  if (zan_bcache_obj_key(g->mod, tm, 1, &obj_key) &&
+      zan_bcache_obj_load(&obj_key, 1, one_path)) {
+    LLVMDisposeTargetMachine(tm);
+    return ZAN_OK;
+  }
+  if (sopts.finish_level > 0) {
+    zan_opt_finish_module(g->mod, tm, sopts.finish_level, sopts.vectorize);
+    if (zan_opt_verify_module(g->mod, "after optimization pipeline") != ZAN_OK) {
+      LLVMDisposeTargetMachine(tm);
+      return ZAN_ERROR;
+    }
+  }
+  zan_irgen_prepare_object_sections(g, g->mod);
+  if (zan_opt_verify_module(g->mod, "after object section preparation") !=
+      ZAN_OK) {
+    LLVMDisposeTargetMachine(tm);
+    return ZAN_ERROR;
   }
   if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path, LLVMObjectFile,
                                   &error)) {
@@ -1849,5 +1949,6 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
   }
 
   LLVMDisposeTargetMachine(tm);
+  zan_bcache_obj_store(&obj_key, 1, one_path);
   return ZAN_OK;
 }

@@ -175,6 +175,10 @@ LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
                                       zan_ast_node_t *, local_scope_t *);
   if (zan_elem_receiver_needs_no_pin(g, object, g->hold_call_expr, locals))
     return NULL;
+  bool zan_field_receiver_needs_no_pin(zan_irgen_t *, zan_ast_node_t *,
+                                       zan_ast_node_t *, local_scope_t *);
+  if (zan_field_receiver_needs_no_pin(g, object, g->hold_call_expr, locals))
+    return NULL;
   /* Protect the loaded value before null guards substitute scratch. Even an
    * owned local's slot can be cleared by a ref argument before dispatch. */
   emit_retain_obj_value(g, value);
@@ -321,23 +325,24 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
   } else {
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
-    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    emit_runtime_check_noreturn(g, null_raw, (zan_loc_t){0},
+                                "array allocation failed");
   }
   emit_rt_alloc_add(g, bytes);
   zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
                     LLVMConstInt(i64, 1, 0), "arr.rc");
   zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                     LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "arr.rcmagic");
-  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, count,
+  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_COUNT_OFF, count,
                     "arr.count");
   if (elem_type && is_rc_managed_type(elem_type)) {
     LLVMValueRef desc = get_array_desc(g, elem_type);
     LLVMValueRef desc_i64 =
         LLVMBuildPtrToInt(g->builder, desc, i64, "arr.desci");
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF, desc_i64,
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF, desc_i64,
                       "arr.desc");
   } else {
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF,
                       LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
   }
   LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
@@ -362,17 +367,31 @@ LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
 LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-  LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+  LLVMValueRef off =
+      LLVMConstInt(i64, (unsigned long long)ZAN_ARR_COUNT_OFF, 1);
   LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
-  LLVMValueRef ld = LLVMBuildLoad2(
+  LLVMValueRef len = LLVMBuildLoad2(
       g->builder, i64,
       LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
       "arr.len");
-  LLVMSetAlignment(ld, 8);
+  LLVMSetAlignment(len, 8);
   /* 数组长度在分配后终生不可变，标 invariant.load 供 GVN/LICM/BCE 折叠与外提 */
   unsigned inv_kind = LLVMGetMDKindIDInContext(g->ctx, "invariant.load", 14);
-  LLVMSetMetadata(ld, inv_kind, LLVMMDNodeInContext(g->ctx, NULL, 0));
-  return ld;
+  LLVMSetMetadata(len, inv_kind, LLVMMDNodeInContext(g->ctx, NULL, 0));
+  zan_tbaa_tag_array_len(g, len);
+  /* 长度恒非负（建数组时负长/溢出都已钳成 0；soft 空数组的 scratch 页该位是
+   * 1<<62，同样落在范围内）。
+   * !range [0, INT64_MAX) 让 InstCombine 把下标检查 `idx < 0 || idx >= len`
+   * 并成一次无符号比较 `(u64)sext(idx) >= len`：每次数组访问少一对比较+分支
+   * （分块划分排序 0.16 → 0.14 s）。 */
+  unsigned range_kind = LLVMGetMDKindIDInContext(g->ctx, "range", 5);
+  LLVMMetadataRef range_ops[2] = {
+      LLVMValueAsMetadata(LLVMConstInt(i64, 0, 0)),
+      LLVMValueAsMetadata(LLVMConstInt(i64, (unsigned long long)INT64_MAX, 0))};
+  LLVMSetMetadata(
+      len, range_kind,
+      LLVMMetadataAsValue(g->ctx, LLVMMDNodeInContext2(g->ctx, range_ops, 2)));
+  return len;
 }
 LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
                                LLVMTypeRef elem_llvm, zan_type_t *elem_type) {
@@ -407,7 +426,8 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
   } else {
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "md.null");
-    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    emit_runtime_check_noreturn(g, null_raw, (zan_loc_t){0},
+                                "array allocation failed");
   }
   emit_rt_alloc_add(g, bytes);
   LLVMValueRef hdri64 =
@@ -416,9 +436,9 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims, int rank,
                     LLVMConstInt(i64, 1, 0), "md.rc");
   zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                     LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "md.rcmagic");
-  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, total,
+  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_COUNT_OFF, total,
                     "md.count");
-  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+  zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_HDR_WORD_OFF,
                     LLVMConstInt(i64, rank, 0), "md.rank");
   for (int d = 0; d < rank; d++) {
     LLVMValueRef off =

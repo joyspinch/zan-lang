@@ -13,11 +13,15 @@
 #include "checker.h"
 #include "irgen.h"
 #include "optimizer.h"
+#include "build_cache.h"
+#include "build_partition.h"
 #include "procmem.h"
 #include "crosscomp.h"
 #include "winres.h"
 #include "embedres.h"
 #include "symbols.h"
+#include "query.h"
+#include "markup_check.h"
 #include "package.h"
 #include "win_utf8.h"
 #include "../packaging/mobile_postlink.h"
@@ -521,6 +525,70 @@ parse_secondary_unit(const char *path, zan_target_t target,
 #include "driver/main_dump.c"
 #include "driver/main_driver.c"
 
+/* 输入源里出现 Gui 窗口类记号（" : Form"，B-ID149 窗口即对象形态）
+ * 才启用自动内嵌：服务端/web 程序的 html 是运行期盘上资产，绝不能
+ * 烘死进 exe。 */
+static bool zan_inputs_use_design_doc(const char *const *input_files,
+                                      int input_count) {
+  for (int fi = 0; fi < input_count; fi++) {
+    if (zan_is_zcomp_path(input_files[fi]))
+      continue;
+    size_t len = 0;
+    char *src = read_file(input_files[fi], &len);
+    if (!src)
+      continue;
+    bool hit = strstr(src, " : Form") != NULL ||
+               strstr(src, " : ChildWindow") != NULL;
+    free(src);
+    if (hit)
+      return true;
+  }
+  return false;
+}
+
+/* 输入文件所属工程根：向上找最近的 zan.proj 祖先目录；散文件编译
+ * 退回输入所在目录。不向上吞 packages/ 祖先（package_project_root
+ * 的规则会把仓库内构建的整个仓库指成设计根）。 */
+static void zan_design_root_for(const char *input, char *out, size_t sz) {
+  char abs[1024];
+#ifdef _WIN32
+  if (!zan_utf8_full_path(input, abs, sizeof(abs)))
+    snprintf(abs, sizeof(abs), "%s", input);
+#else
+  char *rp = realpath(input, NULL);
+  snprintf(abs, sizeof(abs), "%s", rp ? rp : input);
+  free(rp);
+#endif
+  char dir[1024];
+  snprintf(dir, sizeof(dir), "%s", abs);
+  char *fwd = strrchr(dir, '/');
+  char *back = strrchr(dir, '\\');
+  char *sep = (fwd && fwd > back) ? fwd : back;
+  if (sep)
+    *sep = '\0';
+  else
+    snprintf(dir, sizeof(dir), ".");
+  for (;;) {
+    char probe[1200];
+    snprintf(probe, sizeof(probe), "%s/zan.proj", dir);
+    if (zan_file_exists(probe))
+      break;
+    fwd = strrchr(dir, '/');
+    back = strrchr(dir, '\\');
+    char *last = (fwd && fwd > back) ? fwd : back;
+    if (!last)
+      break;
+    if (last == dir) {
+      if (dir[1] == '\0')
+        break;
+      dir[1] = '\0';
+      continue;
+    }
+    *last = '\0';
+  }
+  snprintf(out, sz, "%s", dir);
+}
+
 static int zan_run_archiver(const char *tool, const char *format,
                             const char *arc, const char *obj) {
   const char *argv[] = {tool, format, "rcsD", arc, obj, NULL};
@@ -865,6 +933,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--compile-ir") == 0)
     return compile_ir_object(argc, argv);
 
+  zan_bcache_init(argc, argv);
   zan_options_t opts;
   zan_options_status_t opt_st = zan_options_parse(argc, argv, &opts);
   if (opt_st != ZAN_OPTIONS_OK) {
@@ -880,11 +949,15 @@ int main(int argc, char **argv) {
   bool do_dump_tokens = opts.do_dump_tokens;
   bool do_dump_ast = opts.do_dump_ast;
   const char *emit_symbols_path = opts.emit_symbols_path;
+  bool do_summary = opts.do_summary;
+  const char *emit_deps_path = opts.emit_deps_path;
+  const char *query_name = opts.query_name;
   const char *gen_meta_path = opts.gen_meta_path;
   bool gen_meta_bodies = opts.gen_meta_bodies;
   bool do_emit_ir = opts.do_emit_ir;
   int check_leaks_opt = opts.check_leaks_opt;
   bool checked_arith = opts.checked_arith;
+  bool fp_contract = opts.fp_contract;
   int arc_guard_opt = opts.arc_guard_opt;
   int runtime_checks_opt = opts.runtime_checks_opt;
   bool runtime_checks = opts.runtime_checks;
