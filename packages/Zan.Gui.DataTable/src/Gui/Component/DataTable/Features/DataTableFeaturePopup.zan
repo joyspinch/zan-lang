@@ -315,7 +315,7 @@ internal class DataTableFeaturePopup : Control {
             }
             int day = DataTable.ParseDate(state.editBuf, col.dateOrder);
             if (day == DataTable.NoDate()) { day = DataTable.Today(); }
-            calendar.SetDate(DateTime.FromUnixSeconds(day * 86400));
+            calendar.SetDate(DateTime.FromUnixSeconds((long)day * 86400L));
             prefW = app.Scale(300); prefH = app.Scale(290);
             Place("calendar", calendar, 0, 0, prefW, prefH);
         } else {
@@ -361,11 +361,15 @@ internal class DataTableFeaturePopup : Control {
         }
     }
 
+    public override bool NativePopupSelfOccludes() { return true; }
+
     public override void OnPaint(App app) {
         if (kind >= 5) { return; }
         StyleBox surface = Style.Part(app, "datatable", "menu", "", "", "", Style.SNormal());
-        app.canvas.FillRoundRect(bx, by, bw, bh, app.theme.borderRadiusMedium, surface.BgOr(0));
+        int bg = surface.BgOr(0);
+        app.canvas.FillRoundRect(bx, by, bw, bh, app.theme.borderRadiusMedium, bg);
         app.canvas.DrawRoundRect(bx, by, bw, bh, app.theme.borderRadiusMedium, surface.BorderOr(0), 1);
+        if (bw > 0 && bh > 0 && ((bg >> 24) & 255) > 0) { NativeLayer.Occlude(app, bx, by, bw, bh); }
     }
 
     internal void Execute(int action, int argument, bool value) {
@@ -374,8 +378,8 @@ internal class DataTableFeaturePopup : Control {
         if (action == 1) { Close(); return; }
         if (action == 50) { CancelExport(); return; }
         ColFilter filter = kind == 1 ? st.filters[column] : null;
-        bool query = false; bool columnsChanged = false;
-        if (action == 2) { DataTable.SortBy(st, column, argument); }
+        bool query = false; bool columnsChanged = false; bool sortChanged = false; bool closeAfter = false;
+        if (action == 2) { DataTable.SortBy(st, column, argument); sortChanged = true; }
         else if (action == 3) { st.filterTab = argument; st.editFocus = 0; }
         else if (action == 4) { filter.textMode = argument; query = true; }
         else if (action == 5) { filter.cmpMode = filter.cmpMode == argument ? 0 : argument; query = true; }
@@ -383,7 +387,15 @@ internal class DataTableFeaturePopup : Control {
         else if (action == 7) { filter.topMode = filter.topMode == argument ? 0 : argument; query = true; }
         else if (action == 8) { filter.topN = DataTable.MaxI(1, filter.topN + argument); query = true; }
         else if (action == 10) { filter.Toggle(rowValues[argument]); query = true; }
-        else if (action == 11) { filter.hidden.Clear(); query = true; }
+        else if (action == 11) {
+            filter.hidden.Clear();
+            if (!value && rowValues != null) {
+                for (int ri = 0; ri < rowValues.Count; ri = ri + 1) {
+                    filter.hidden.Add(rowValues[ri]);
+                }
+            }
+            query = true;
+        }
         else if (action == 12) { st.batchExactFlag = value ? 1 : 0; }
         else if (action == 13) {
             filter.batchTerms.Clear();
@@ -403,8 +415,12 @@ internal class DataTableFeaturePopup : Control {
         else if (action == 40) {
             st.editBuf = rowValues[argument]; st.editCur = st.editBuf.Length;
             st.edPopSel = st.edPopItems[argument]; st.edPopOpen = false;
+            closeAfter = true;
         }
+        if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
+        if (closeAfter) { Close(); }
         if (app != null) { app.RequestRedraw(); }
+        if (sortChanged) { st.Sort.Raise(st.host); return; }
         if (query) { DataTable.InvalidateQuery(st); st.FilterChanged.Raise(st.host); return; }
         if (columnsChanged) { st.ColumnResize.Raise(st.host); return; }
     }
@@ -430,7 +446,11 @@ internal class DataTableFeaturePopup : Control {
             filter.topN = number; query = true;
         } else if (field == 20) {
             st.editBuf = text; st.editCur = text.Length; st.edPopOpen = false;
+            if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
+            Close();
+            return;
         }
+        if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
         if (this.App != null) { this.App.RequestRedraw(); }
         if (query) { DataTable.InvalidateQuery(st); st.FilterChanged.Raise(st.host); }
     }
@@ -451,8 +471,10 @@ internal class DataTableFeaturePopup : Control {
         else if (kind == 5) { state.chartOpen = false; }
         else if (kind == 6 && state.exportUi != null) { state.exportUi.visible = false; }
         App app = this.App;
-        app.overlayHost.Hide(this);
-        if (app != null) { app.RequestRedraw(); }
+        if (app != null) {
+            app.overlayHost.Hide(this);
+            app.RequestRedraw();
+        }
     }
 
     public override bool DismissOnOutsideClick() { return kind != 6; }
