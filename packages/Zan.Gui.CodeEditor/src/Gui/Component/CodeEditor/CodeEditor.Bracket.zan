@@ -14,6 +14,7 @@ public partial class CodeEditor {
     public void CheckErrors() {
         if (analysisApp != null) { RequestAnalysis(); return; }
         errors = new List<Diagnostic>();
+        if (lines == null || lines.Count == 0) { return; }
         EnsureLineScan();
         int braceDepth = 0;
         int parenDepth = 0;
@@ -47,6 +48,7 @@ public partial class CodeEditor {
     // 逐字符扫描在 30 万行上是百毫秒级；改成只重扫文本真的变了的行
     // 后，一次击键只重扫一行。
     public void EnsureLineScan() {
+        if (lines == null) { return; }
         if (ceLineCaches == null) {
             ceLineCaches = new List<CeLineBracketCache>();
         }
@@ -63,7 +65,8 @@ public partial class CodeEditor {
 
     // 重算一行的括号增量和 using 启发式，写回按行缓存。
     public void ScanLineBrackets(int li) {
-        string ln = lines[li];
+        if (lines == null || ceLineCaches == null || li < 0 || li >= lines.Count || li >= ceLineCaches.Count) { return; }
+        string ln = lines[li] != null ? lines[li] : "";
         ceLineCaches[li].src = ln;
         ceLineCaches[li].brace = 0;
         ceLineCaches[li].paren = 0;
@@ -118,7 +121,9 @@ public partial class CodeEditor {
     // 误判代价只是少/多画一枚高亮框）。Lua/Python 的行注释
     // 引导符与单引号字符串随 syntaxLang 切换，同高亮分词器。
     public bool BracketInsideLexeme(int line, int col) {
+        if (lines == null || line < 0 || line >= lines.Count) { return false; }
         string s = lines[line];
+        if (s == null) { return false; }
         bool inStr = false;
         int strQuote = 0;
         bool inBlock = false;
@@ -162,12 +167,16 @@ public partial class CodeEditor {
     // 行字符串（含转义）、行注释、Zan 的 /*…*/（跨行状态从
     // 锚点起算）。命中写入 bpMLine/bpMCol。
     public bool ScanPairForward(int line, int col, int open, int close) {
+        if (lines == null || line < 0 || line >= lines.Count) { return false; }
         int depth = 0;
         bool inBlock = false;
         for (int li = line; li < lines.Count; li = li + 1) {
             string s = lines[li];
+            if (s == null) { continue; }
             int ci = li == line ? col : 0;
+            if (ci < 0) { ci = 0; }
             bool inStr = false;
+            int strQuote = 0;
             while (ci < s.Length) {
                 int ch = s[ci];
                 if (inBlock) {
@@ -181,7 +190,7 @@ public partial class CodeEditor {
                 }
                 if (inStr) {
                     if (ch == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
-                    if (ch == 34) { inStr = false; }
+                    if (ch == strQuote) { inStr = false; }
                     ci = ci + 1;
                     continue;
                 }
@@ -194,6 +203,7 @@ public partial class CodeEditor {
                     && s[ci + 1] == 42) { inBlock = true; ci = ci + 2; continue; }
                 if (ch == 34 || (ch == 39 && syntaxLang > 0)) {
                     inStr = true;
+                    strQuote = ch;
                     ci = ci + 1;
                     continue;
                 }
@@ -213,19 +223,22 @@ public partial class CodeEditor {
     // 括号列，再按列倒序找配对；块注释状态跨行无法恢复，向上
     // 走按普通代码处理（罕见误配的代价只是少画高亮框）。
     public bool ScanPairBackward(int line, int col, int open, int close) {
+        if (lines == null || line < 0 || line >= lines.Count) { return false; }
         int depth = 0;
         for (int li = line; li >= 0; li = li - 1) {
             string s = lines[li];
+            if (s == null) { continue; }
             int maxCi = li == line ? col : s.Length - 1;
             List<int> markCols = new List<int>();
             List<int> markChs = new List<int>();
             bool inStr = false;
+            int strQuote = 0;
             int ci = 0;
             while (ci <= maxCi && ci < s.Length) {
                 int ch = s[ci];
                 if (inStr) {
                     if (ch == 92 && ci + 1 < s.Length) { ci = ci + 2; continue; }
-                    if (ch == 34) { inStr = false; }
+                    if (ch == strQuote) { inStr = false; }
                     ci = ci + 1;
                     continue;
                 }
@@ -236,6 +249,7 @@ public partial class CodeEditor {
                 if (syntaxLang == 2 && ch == 35) { break; }
                 if (ch == 34 || (ch == 39 && syntaxLang > 0)) {
                     inStr = true;
+                    strQuote = ch;
                     ci = ci + 1;
                     continue;
                 }
@@ -269,7 +283,10 @@ public partial class CodeEditor {
             bpMCol = 0 - 1;
             return;
         }
-        string key = Convert.ToString(curLine) + "," + Convert.ToString(curCol)
+        string cur = lines[curLine];
+        if (cur == null) { return; }
+        int safeCol = Text.ClampCharStart(cur, curCol);
+        string key = Convert.ToString(curLine) + "," + Convert.ToString(safeCol)
             + "," + Convert.ToString(textVersion);
         if (key == bpMemoKey) { return; }
         bpMemoKey = key;
@@ -277,9 +294,18 @@ public partial class CodeEditor {
         bpACol = 0 - 1;
         bpMLine = 0 - 1;
         bpMCol = 0 - 1;
-        string cur = lines[curLine];
         for (int cand = 0; cand < 2; cand = cand + 1) {
-            int cc = cand == 0 ? curCol - 1 : curCol;
+            int cc = -1;
+            if (cand == 0) {
+                if (safeCol > 0) {
+                    int prev = Text.PrevCharStart(cur, safeCol);
+                    if (safeCol - prev == 1) { cc = prev; }
+                }
+            } else {
+                if (safeCol < cur.Length && Text.NextCharEnd(cur, safeCol) - safeCol == 1) {
+                    cc = safeCol;
+                }
+            }
             if (cc < 0 || cc >= cur.Length) { continue; }
             int ch = cur[cc];
             int open = 0;

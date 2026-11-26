@@ -17,7 +17,7 @@ public partial class CodeEditor {
     // 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
     // 并强制下一帧重新计算诊断。
     public void SetLines(List<string> ls) {
-        lines = ls;
+        lines = ls != null ? ls : new List<string>();
         if (lines.Count == 0) { lines.Add(""); }
         curLine = 0;
         curCol = 0;
@@ -52,7 +52,7 @@ public partial class CodeEditor {
     // 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
     // 签名备忘等派生自旧内容的缓存。
     public void LoadText(string s) {
-        SetLines(CodeEditor.SplitLines(s));
+        SetLines(CodeEditor.SplitLines(s != null ? s : ""));
         extRefDirty = true;
         // 其他文件的成员不属于本文件。
         sigMemoName = "";
@@ -62,6 +62,7 @@ public partial class CodeEditor {
 
     // 全部文本（行以 '\n' 连接）。
     public string GetText() {
+        if (lines == null) { return ""; }
         textMemo = string.Join("\n", lines);
         textMemoStamp = TextStamp();
         return textMemo;
@@ -75,11 +76,12 @@ public partial class CodeEditor {
 
     // 编辑器列是 UTF-8 字节偏移，LSP 列是 UTF-16 码元数。
     public static int ByteColumnToUtf16(string text, int byteCol) {
+        if (text == null || byteCol <= 0) { return 0; }
         int pos = 0;
         int units = 0;
         while (pos < text.Length && pos < byteCol) {
             int next = Text.NextCharEnd(text, pos);
-            if (next > byteCol) { break; }
+            if (next <= pos || next > byteCol) { break; }
             units = units + (next - pos == 4 ? 2 : 1);
             pos = next;
         }
@@ -87,10 +89,12 @@ public partial class CodeEditor {
     }
 
     public static int Utf16ColumnToByte(string text, int column) {
+        if (text == null || column <= 0) { return 0; }
         int pos = 0;
         int units = 0;
         while (pos < text.Length && units < column) {
             int next = Text.NextCharEnd(text, pos);
+            if (next <= pos) { break; }
             int width = next - pos == 4 ? 2 : 1;
             if (units + width > column) { break; }
             units = units + width;
@@ -162,10 +166,11 @@ public partial class CodeEditor {
 
     // 返回光标下的标识符（无则为空字符串）。
     public string WordAtCaret() {
-        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        if (lines == null || curLine < 0 || curLine >= lines.Count) { return ""; }
         string s = lines[curLine];
-        int col = curCol;
-        if (col >= s.Length) { col = s.Length - 1; }
+        if (s == null || s.Length == 0) { return ""; }
+        int col = Text.ClampCharStart(s, curCol);
+        if (col >= s.Length) { col = Text.PrevCharStart(s, s.Length); }
         if (col < 0) { return ""; }
         return CodeEditor.WordAt(s, col);
     }
@@ -178,13 +183,19 @@ public partial class CodeEditor {
     }
 
     // 替换调试变量面板的内容（宿主自己的数据，编辑器只负责显示）。
-    public void SetDebugVars(List<DbgVar> vars) { dbgVars = vars; }
+    public void SetDebugVars(List<DbgVar> vars) { dbgVars = vars != null ? vars : new List<DbgVar>(); }
 
     // 跳到某行行首（钳制行号、清除选区）。
     public void GoToLine(int line) {
         CancelSemanticCompletion();
-        if (line < 0) { line = 0; }
+        if (lines == null || lines.Count == 0) {
+            curLine = 0;
+            curCol = 0;
+            selActive = false;
+            return;
+        }
         if (line >= lines.Count) { line = lines.Count - 1; }
+        if (line < 0) { line = 0; }
         curLine = line;
         curCol = 0;
         selActive = false;
@@ -192,6 +203,7 @@ public partial class CodeEditor {
 
     // 同步查询缓冲区总大小；诊断失效使用 O(1) 的 TextStamp。
     public int BufLen() {
+        if (lines == null) { return 0; }
         int n = 0;
         for (int i = 0; i < lines.Count; i = i + 1) { n = n + lines[i].Length + 1; }
         return n;
@@ -202,7 +214,7 @@ public partial class CodeEditor {
     // 把光标跳到第一个错误，使其原因立即可见。
     // 当编译成功（diagnostics 为空）时，清空快速修复建议，并与编译器结果同步。
     public void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
-        compErrors = diagnostics;
+        compErrors = diagnostics != null ? diagnostics : new List<Diagnostic>();
         cErrStamp = TextStamp();
         diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
@@ -216,7 +228,7 @@ public partial class CodeEditor {
     // 渲染时在出错的那几个字符下面画波浪线（VS 的做法）。
     // 空诊断表示"这份文档现在没有错误"，直接清掉该路径的记录。
     public void SetSemanticDiagnostics(string path, List<Diagnostic> diagnostics) {
-        if (path.Length == 0) { return; }
+        if (path == null || path.Length == 0) { return; }
         if (semDiags == null) { semDiags = new Dict<string, List<Diagnostic>>(); }
         if (diagnostics == null || diagnostics.Count == 0) {
             if (semDiags.ContainsKey(path)) { semDiags.Remove(path); }
@@ -228,9 +240,10 @@ public partial class CodeEditor {
     // 当前文档在指定行上的语义诊断条数（不做逐帧分配：渲染每个
     // 可见行都要问一次，分配列表会拖慢每帧）。
     public int SemanticDiagCount(int line) {
-        if (semDiags == null || documentPath.Length == 0) { return 0; }
+        if (semDiags == null || documentPath == null || documentPath.Length == 0) { return 0; }
         if (!semDiags.ContainsKey(documentPath)) { return 0; }
         List<Diagnostic> all = semDiags[documentPath];
+        if (all == null) { return 0; }
         int n = 0;
         for (int i = 0; i < all.Count; i = i + 1) {
             if (all[i].line == line) { n = n + 1; }
@@ -240,9 +253,10 @@ public partial class CodeEditor {
 
     // 该行第 `idx` 条语义诊断（越界返回 null）。
     public Diagnostic SemanticDiagAt(int line, int idx) {
-        if (semDiags == null || documentPath.Length == 0) { return null; }
+        if (semDiags == null || documentPath == null || documentPath.Length == 0) { return null; }
         if (!semDiags.ContainsKey(documentPath)) { return null; }
         List<Diagnostic> all = semDiags[documentPath];
+        if (all == null) { return null; }
         int n = 0;
         for (int i = 0; i < all.Count; i = i + 1) {
             if (all[i].line != line) { continue; }

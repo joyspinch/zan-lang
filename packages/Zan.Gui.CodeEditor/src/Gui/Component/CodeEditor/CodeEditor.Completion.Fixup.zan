@@ -5,14 +5,15 @@ namespace Gui.Component.CodeEditor;
 
 partial class CodeEditor {
     bool InAttributeContext() {
-        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        if (lines == null || curLine < 0 || curLine >= lines.Count) { return false; }
         string s = lines[curLine];
-        int i = curCol - 1;
+        if (s == null || s.Length == 0) { return false; }
+        int i = Text.ClampCharStart(s, curCol) - 1;
         if (i >= s.Length) { i = s.Length - 1; }
         while (i >= 0) {
-            string ch = s.Substring(i, 1);
-            if (ch == "[") { return true; }
-            if (ch == "]") { return false; }
+            int ch = s[i] & 255;
+            if (ch == 91) { return true; }
+            if (ch == 93) { return false; }
             i = i - 1;
         }
         return false;
@@ -20,11 +21,11 @@ partial class CodeEditor {
 
     // 检查光标是否处于字符串字面量或单行/块注释内部，避免在引号或注释中弹出无意义的代码补全
     bool InStringOrCommentContext() {
-        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        if (lines == null || curLine < 0 || curLine >= lines.Count) { return false; }
         string ln = lines[curLine];
+        if (ln == null) { return false; }
         int n = ln.Length;
-        int limit = curCol;
-        if (limit > n) { limit = n; }
+        int limit = Text.ClampCharStart(ln, curCol);
 
         // 检查前序多行块注释（未闭合的 /*）
         int pLine = curLine - 1;
@@ -33,6 +34,7 @@ partial class CodeEditor {
         bool priorBlockComment = false;
         for (int pl = checkStart; pl <= pLine; pl = pl + 1) {
             string pln = lines[pl];
+            if (pln == null) { continue; }
             int pn = pln.Length;
             int pi = 0;
             while (pi < pn) {
@@ -167,6 +169,10 @@ partial class CodeEditor {
             if (muTypes == null) { muTypes = new List<CeBufType>(); }
             return;
         }
+        if (lines == null) {
+            if (muTypes == null) { muTypes = new List<CeBufType>(); }
+            return;
+        }
         if (workerSnapshot != null && workerBufferTypesReady) { return; }
         if (muTypes != null && !BufTypesStructuralChange()) { return; }
         List<string> names = new List<string>();
@@ -186,7 +192,7 @@ partial class CodeEditor {
     // 类型表只取决于声明行和花括号层次，所以在方法体里敲一个字
     // （最常见的编辑）不必重扫：只有声明形状或花括号变了才算数。
     bool BufTypesStructuralChange() {
-        if (btLineSrc == null || btLineSrc.Count != lines.Count) { return true; }
+        if (lines == null || btLineSrc == null || btLineSrc.Count != lines.Count) { return true; }
         for (int i = 0; i < lines.Count; i = i + 1) {
             string now = lines[i];
             string was = btLineSrc[i];
@@ -203,6 +209,7 @@ partial class CodeEditor {
 
     // 一行里 '{' 与 '}' 的个数，合成一个可比较的键。
     public static int BraceKey(string s) {
+        if (s == null) { return 0; }
         int open = 0;
         int close = 0;
         int n = s.Length;
@@ -227,15 +234,18 @@ partial class CodeEditor {
 
     void AnalyzeMissingUsings() {
         if (analysisApp != null) { RequestAnalysis(); return; }
+        if (lines == null) { return; }
         if (ReplayMissingUsings()) { return; }
         EnsureProjectScan();
         List<string> usings = new List<string>();
         ParseUsingsInto(usings);
         string fileNs = FileNamespace();
         EnsureBufTypes();
+        int muCount = muTypes != null ? muTypes.Count : 0;
+        int projCount = projTypes != null ? projTypes.Count : 0;
         string ctx = fileNs + "|" + string.Join(",", usings) + "|"
-            + Convert.ToString(muTypes.Count) + ":"
-            + Convert.ToString(projTypes.Count);
+            + Convert.ToString(muCount) + ":"
+            + Convert.ToString(projCount);
         if (muCtx != ctx || muLineCaches == null) {
             muCtx = ctx;
             muLineCaches = new List<CeMissingUsingLine>();
@@ -251,8 +261,10 @@ partial class CodeEditor {
                 ScanLineMissingUsing(li, usings, fileNs);
             }
             if (muLineCaches[li].ns.Length > 0) {
-                errors.Add(new Diagnostic(li, "'" + muLineCaches[li].word
-                    + "' needs 'using " + muLineCaches[li].ns + ";'"));
+                if (errors != null) {
+                    errors.Add(new Diagnostic(li, "'" + muLineCaches[li].word
+                        + "' needs 'using " + muLineCaches[li].ns + ";'"));
+                }
                 fixes.Add(new QuickFix(li, muLineCaches[li].ns));
             }
             li = li + 1;
@@ -264,15 +276,17 @@ partial class CodeEditor {
     }
 
     bool ReplayMissingUsings() {
-        if (muLineCaches == null || muLineCaches.Count != lines.Count) { return false; }
+        if (lines == null || muLineCaches == null || muLineCaches.Count != lines.Count) { return false; }
         for (int i = 0; i < lines.Count; i = i + 1) {
             if (muLineCaches[i].src != lines[i]) { return false; }
         }
         fixes = new List<QuickFix>();
         for (int j = 0; j < lines.Count; j = j + 1) {
             if (muLineCaches[j].ns.Length > 0) {
-                errors.Add(new Diagnostic(j, "'" + muLineCaches[j].word
-                    + "' needs 'using " + muLineCaches[j].ns + ";'"));
+                if (errors != null) {
+                    errors.Add(new Diagnostic(j, "'" + muLineCaches[j].word
+                        + "' needs 'using " + muLineCaches[j].ns + ";'"));
+                }
                 fixes.Add(new QuickFix(j, muLineCaches[j].ns));
             }
         }
@@ -280,15 +294,19 @@ partial class CodeEditor {
     }
 
     void ScanLineMissingUsing(int li, List<string> usings, string fileNs) {
+        if (lines == null || li < 0 || li >= lines.Count || muLineCaches == null || li >= muLineCaches.Count) { return; }
         muLineCaches[li].src = lines[li];
         muLineCaches[li].ns = "";
         muLineCaches[li].word = "";
         string tr = CodeEditor.TrimStr(lines[li]);
-        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+        if (tr.Length == 0) { return; }
+        int f0 = tr[0] & 255;
+        if (f0 == 47 || f0 == 42
             || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
             return;
         }
         string ln = lines[li];
+        if (ln == null) { return; }
         int p = 0;
         int n = ln.Length;
         while (p < n) {
@@ -324,6 +342,7 @@ partial class CodeEditor {
 
     // 缺失 using 的快速修复会为光标行添加的命名空间，无则 ""。
     string QuickFixNs() {
+        if (fixes == null) { return ""; }
         for (int i = 0; i < fixes.Count; i = i + 1) {
             if (fixes[i].line == curLine) { return fixes[i].ns; }
         }
@@ -336,7 +355,7 @@ partial class CodeEditor {
     // 在最后一个现有 using 之后（或顶部）插入 `using ns;`，
     // 除非已存在。
     void AddUsing(string ns) {
-        if (ns.Length == 0) { return; }
+        if (!CanMutate() || ns == null || ns.Length == 0 || lines == null) { return; }
         List<string> cur = new List<string>();
         ParseUsingsInto(cur);
         if (CodeEditor.Has(cur, ns)) { return; }
@@ -349,12 +368,14 @@ partial class CodeEditor {
         if (lastUsing >= 0) { at = lastUsing + 1; }
         lines.Insert(at, "using " + ns + ";");
         if (at <= curLine) { curLine = curLine + 1; }
+        BumpTextVersion();
         lastDiagLine = -1;
         CheckErrors();
     }
 
     // 若有则对光标行应用缺失 using 的快速修复。
     void ApplyQuickFix() {
+        if (!CanMutate()) { return; }
         AddUsing(QuickFixNs());
     }
 }

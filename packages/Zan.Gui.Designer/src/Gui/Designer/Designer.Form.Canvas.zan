@@ -13,6 +13,7 @@ partial class Designer {
     // 模型（选择 / 拖拽 / 框选 / 抓手平移 / 缩放 / 面板放置）。
     // 表单（自动吸附）和自由窗口共用这一份实现。
     void RenderDesignCanvas(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
+        if (app == null || c == null || cw <= 0 || ch <= 0) { return; }
         int fs = Style.FontFallback(app, "small");
         bool free = layoutMode == 1;
         // 浮层窗口（大编辑器、右键菜单、快速插入或帮助）开着时画布的裸指针路径整体让位：
@@ -35,7 +36,6 @@ partial class Designer {
         }
         int dw = winW < 40 ? 40 : winW;
         int dh = winH < 40 ? 40 : winH;
-        Canvas source = pvDocForm.GetApp().canvas;
         DesignerCanvasInput geometry = canvasInput != null ? canvasInput : new DesignerCanvasInput();
         this.UpdateCanvasGeometry(app, cx, cy, cw, ch, geometry);
         int inX = geometry.inX; int inY = geometry.inY; int inW = geometry.inW; int inH = geometry.inH;
@@ -51,7 +51,7 @@ partial class Designer {
         this.RegisterDesignTabs(ox, oy, psMilli);
         this.UpdateCanvasHover(app, locked, ox, oy, cw2, ch2, inX, inY, inW, inH, psMilli);
         this.RenderCanvasGrid(app, c, free, ox, oy, psMilli, dw, dh);
-        if (!preview) {
+        if (!preview && fields != null) {
             for (int i = 0; i < fields.Count; i = i + 1) {
                 this.RenderDesignOverlay(app, c, fields[i], ox, oy, psMilli);
             }
@@ -76,6 +76,7 @@ partial class Designer {
     }
 
     void HandleCanvasZoom(App app, bool locked, int inX, int inY, int inW, int inH, int ox, int oy, Canvas source) {
+        if (app == null || app.window == null) { return; }
         // Ctrl+滚轮以光标所在的设计物理位置为锚点平滑缩放画布（Fit 从
         // 实际适配比例起步，因此从 Fit 缩出时平滑且无漂移）。
         // 编辑器窗口开着时让位（locked），滚轮别穿透到画布。
@@ -93,7 +94,7 @@ partial class Designer {
                 if (z != oldZ) {
                     int oldPs = oldZ * this.DesignDpi() / 100;
                     int newPs = z * this.DesignDpi() / 100;
-                    if (oldPs > 0 && newPs > 0) {
+                    if (source != null && oldPs > 0 && newPs > 0) {
                         int cw2New = this.DesignViewPx(source.Width(), newPs);
                         int ch2New = this.DesignViewPx(source.Height(), newPs);
                         int relXOld = app.mouseX - ox;
@@ -126,6 +127,7 @@ partial class Designer {
     }
 
     void HandleCanvasMiddlePan(App app, bool locked, int ek, int inX, int inY, int inW, int inH) {
+        if (app == null || app.window == null) { return; }
         // 抓手：中键在视口任意处按下即抓住画布拖动，
         // 和场景设计器一致（左键留给选择和框选）。
         if (!locked && ek == 2 && app.window.EventButton() == 2
@@ -140,6 +142,7 @@ partial class Designer {
     }
 
     void UpdateCanvasHover(App app, bool locked, int ox, int oy, int cw2, int ch2, int inX, int inY, int inW, int inH, int psMilli) {
+        if (app == null) { return; }
         if (!locked && !preview && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
                 && !dragging && !freeDragging && !freePanning) {
@@ -155,9 +158,12 @@ partial class Designer {
     }
 
     void RenderCanvasGrid(App app, Canvas c, bool free, int ox, int oy, int psMilli, int dw, int dh) {
+        if (app == null || c == null || psMilli <= 0) { return; }
         if (!preview && showGrid && gridSize > 0 && free) {
             int step = gridSize;
-            while (step * psMilli / 1000 < app.Scale(6)) { step = step * 2; }
+            int minStep = app.Scale(6);
+            if (minStep < 1) { minStep = 1; }
+            while (step < 100000 && step * psMilli / 1000 < minStep) { step = step * 2; }
             int gridCol = Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0);
             if (gridCol == 0) {
                 gridCol = Style.Fade(Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), 85);
@@ -170,11 +176,13 @@ partial class Designer {
                 int py = oy + gy * psMilli / 1000;
                 for (int gx = 0; gx <= dw; gx = gx + step) {
                     bool hitLeaf = false;
-                    for (int fi = 0; fi < fields.Count; fi = fi + 1) {
-                        FormField f = fields[fi];
-                        if (!f.IsContainer() && gx >= f.fx && gx < f.fx + f.fw && gy >= f.fy && gy < f.fy + f.fh) {
-                            hitLeaf = true;
-                            break;
+                    if (fields != null) {
+                        for (int fi = 0; fi < fields.Count; fi = fi + 1) {
+                            FormField f = fields[fi];
+                            if (f != null && !f.IsContainer() && gx >= f.fx && gx < f.fx + f.fw && gy >= f.fy && gy < f.fy + f.fh) {
+                                hitLeaf = true;
+                                break;
+                            }
                         }
                     }
                     if (!hitLeaf) {
@@ -186,6 +194,7 @@ partial class Designer {
     }
 
     void HandleCanvasDropTarget(App app, Canvas c, Theme t, bool locked, bool free, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int dw, int cw2, int ch2) {
+        if (app == null || psMilli <= 0) { return; }
         // 放置目标：自由布局落在光标处；流式布局解析插入位置
         // 或指针下的容器，并画出插入线。自由画布拖拽（面板拖入或
         // 画布内拖动）给光标下的容器描边预告落点；画布内拖动松手
@@ -199,27 +208,25 @@ partial class Designer {
                 DropFreePalette(mDesX, mDesY, this.DesignPointerPx(app.mouseX, ox, psMilli),
                     this.DesignPointerPx(app.mouseY, oy, psMilli));
             } else if (dragging && dragFromPalette) {
-                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
                 if (c != null) {
                     this.DrawFreeDropHi(app, c, ox, oy, psMilli,
                         this.FreeDropContainerDevice(this.DesignPointerPx(app.mouseX, ox, psMilli),
                             this.DesignPointerPx(app.mouseY, oy, psMilli)));
                 }
             } else if (freeDragging && freeDragHasMoved && sel != null) {
-                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
                 FormField cont = this.FreeDropContainerDevice(this.DesignPointerPx(app.mouseX, ox, psMilli),
                         this.DesignPointerPx(app.mouseY, oy, psMilli));
                 FormField currentParent = this.DesignOwnerOf(sel);
                 bool invalidDrop = false;
                 if (cont != null) {
                     if (cont == sel || this.DesignInSubtree(sel, cont)) { invalidDrop = true; }
-                    for (int ei = 0; ei < freeExtra.Count; ei = ei + 1) {
-                        FormField ef = freeExtra[ei];
-                        if (ef != null && (cont == ef || this.DesignInSubtree(ef, cont))) {
-                            invalidDrop = true;
-                            break;
+                    if (freeExtra != null) {
+                        for (int ei = 0; ei < freeExtra.Count; ei = ei + 1) {
+                            FormField ef = freeExtra[ei];
+                            if (ef != null && (cont == ef || this.DesignInSubtree(ef, cont))) {
+                                invalidDrop = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -253,10 +260,11 @@ partial class Designer {
     bool HandleCanvasHandMode(App app, bool locked, int ek, int inX, int inY, int inW, int inH) {
         bool activeHand = freeHand || spacePressed;
         if (activeHand) { freeDragging = false; freeResizing = false; freeMarquee = false; }
+        if (app == null || app.window == null) { return activeHand; }
         if (!locked && activeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             Window.SetCursor(1);
             if (ek == 2 && app.window.EventButton() == 0) {
-                app.focus.ClearFocus();
+                if (app.focus != null) { app.focus.ClearFocus(); }
                 freePanning = true;
                 freePanSX = app.mouseX;
                 freePanSY = app.mouseY;
@@ -268,12 +276,11 @@ partial class Designer {
     }
 
     void HandleCanvasContextMenu(App app, bool locked, bool activeHand, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int cw2, int ch2) {
+        if (app == null || app.window == null || psMilli <= 0) { return; }
         // 画板右键菜单触发：在画板内右键点击，命中控件则选中该控件并弹出上下文菜单，点在空白处则弹出全局画布菜单
         if (!locked && !preview && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 1
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
-            app.focus.ClearFocus();
-            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            if (app.focus != null) { app.focus.ClearFocus(); }
             FormField hit = InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
                 ? this.DesignPickView(app.mouseX, app.mouseY, ox, oy, psMilli) : null;
             if (hit != null) {
@@ -298,20 +305,23 @@ partial class Designer {
     }
 
     void HandleCanvasPointerDown(App app, bool locked, bool activeHand, bool free, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int cw2, int ch2) {
+        if (app == null || app.window == null || psMilli <= 0) { return; }
         // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
         if (!locked && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 0
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
-            app.focus.SetFocused(canvasInput.WidgetId(), canvasInput);
+            if (app.focus != null && canvasInput != null) {
+                app.focus.SetFocused(canvasInput.WidgetId(), canvasInput);
+            }
             bool started = false;
             // 拖拽基先对齐当前选中项：框选/撤销/换父之后存的旧基
             // 会让手柄命中测试与随后的拖拽全部错位。
             if (free) { this.SyncFreeSelBase(); }
             TabHeaderHit th = preview || !InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2) ? null
                 : this.PickTabHeader(app.mouseX, app.mouseY, ox, oy, psMilli);
-            if (th != null) {
+            if (th != null && th.tabs != null) {
                 // 点页签就是翻页：顺带把这个 Tabs 设为活动容器，
                 // 接着添加/放下的组件落在正看着的这一页上。
-                th.tabs.uiState.Set(th.page);
+                if (th.tabs.uiState != null) { th.tabs.uiState.Set(th.page); }
                 sel = th.tabs;
                 inspTab = 0;
                 activeContainer = th.tabs;
@@ -322,66 +332,71 @@ partial class Designer {
             }
             if (!started && !preview && free && sel != null && !sel.locked && this.DesignVisible(sel)) {
                 List<FormField> mItems = this.GetMultiSelItems();
-                if (mItems.Count > 1) {
+                if (mItems != null && mItems.Count > 1) {
                     Rect mw = this.GetMultiSelWorldRect(mItems);
-                    int sx = ox + mw.x * psMilli / 1000;
-                    int sy = oy + mw.y * psMilli / 1000;
-                    int sw2 = mw.width * psMilli / 1000;
-                    int sh2 = mw.height * psMilli / 1000;
-                    int hs = app.Scale(10);
-                    for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
-                        int hx = FreeHandleX(hn, sx, sw2);
-                        int hy = FreeHandleY(hn, sy, sh2);
-                        if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)) {
-                            freeResizing = true;
-                            freeResizeH = hn;
-                            designResizeMoved = false;
-                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
-                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
-                            designResizeLeft = mw.x;
-                            designResizeTop = mw.y;
-                            designResizeRight = mw.x + mw.width;
-                            designResizeBottom = mw.y + mw.height;
-                            multiResizeStarts = new List<MultiResizeItem>();
-                            for (int mi = 0; mi < mItems.Count; mi = mi + 1) {
-                                FormField mf = mItems[mi];
-                                multiResizeStarts.Add(new MultiResizeItem(mf,
-                                    this.DesignWorldX(mf), this.DesignWorldY(mf),
-                                    mf.LayoutW(), mf.LayoutH()));
+                    if (mw != null) {
+                        int sx = ox + mw.x * psMilli / 1000;
+                        int sy = oy + mw.y * psMilli / 1000;
+                        int sw2 = mw.width * psMilli / 1000;
+                        int sh2 = mw.height * psMilli / 1000;
+                        int hs = app.Scale(10);
+                        for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                            int hx = FreeHandleX(hn, sx, sw2);
+                            int hy = FreeHandleY(hn, sy, sh2);
+                            if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)) {
+                                freeResizing = true;
+                                freeResizeH = hn;
+                                designResizeMoved = false;
+                                designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                                designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                                designResizeLeft = mw.x;
+                                designResizeTop = mw.y;
+                                designResizeRight = mw.x + mw.width;
+                                designResizeBottom = mw.y + mw.height;
+                                multiResizeStarts = new List<MultiResizeItem>();
+                                for (int mi = 0; mi < mItems.Count; mi = mi + 1) {
+                                    FormField mf = mItems[mi];
+                                    if (mf == null) { continue; }
+                                    multiResizeStarts.Add(new MultiResizeItem(mf,
+                                        this.DesignWorldX(mf), this.DesignWorldY(mf),
+                                        mf.LayoutW(), mf.LayoutH()));
+                                }
+                                started = true;
                             }
-                            started = true;
                         }
                     }
                 } else {
                     Rect selected = this.DesignViewRect(sel, ox, oy, psMilli);
-                    int sx = selected.x;
-                    int sy = selected.y;
-                    int sw2 = selected.width;
-                    int sh2 = selected.height;
-                    int hs = app.Scale(10);
-                    int nearest = -1;
-                    int distance = hs * hs * 2 + 1;
-                    for (int hn = 0; hn < 8; hn = hn + 1) {
-                        if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
-                        int hx = FreeHandleX(hn, sx, sw2);
-                        int hy = FreeHandleY(hn, sy, sh2);
-                        int dx = app.mouseX - hx; int dy = app.mouseY - hy;
-                        int squared = dx * dx + dy * dy;
-                        if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)
-                                && squared < distance) { nearest = hn; distance = squared; }
-                    }
-                    if (nearest >= 0) {
-                            freeResizing = true;
-                            freeResizeH = nearest;
-                            designResizeMoved = false;
-                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
-                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
-                            designResizeLeft = this.DesignWorldX(sel);
-                            designResizeTop = this.DesignWorldY(sel);
-                            designResizeRight = designResizeLeft + sel.LayoutW();
-                            designResizeBottom = designResizeTop + sel.LayoutH();
-                            multiResizeStarts = null;
-                            started = true;
+                    if (selected != null) {
+                        int sx = selected.x;
+                        int sy = selected.y;
+                        int sw2 = selected.width;
+                        int sh2 = selected.height;
+                        int hs = app.Scale(10);
+                        int nearest = -1;
+                        int distance = hs * hs * 2 + 1;
+                        for (int hn = 0; hn < 8; hn = hn + 1) {
+                            if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
+                            int hx = FreeHandleX(hn, sx, sw2);
+                            int hy = FreeHandleY(hn, sy, sh2);
+                            int dx = app.mouseX - hx; int dy = app.mouseY - hy;
+                            int squared = dx * dx + dy * dy;
+                            if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)
+                                    && squared < distance) { nearest = hn; distance = squared; }
+                        }
+                        if (nearest >= 0) {
+                                freeResizing = true;
+                                freeResizeH = nearest;
+                                designResizeMoved = false;
+                                designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                                designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                                designResizeLeft = this.DesignWorldX(sel);
+                                designResizeTop = this.DesignWorldY(sel);
+                                designResizeRight = designResizeLeft + sel.LayoutW();
+                                designResizeBottom = designResizeTop + sel.LayoutH();
+                                multiResizeStarts = null;
+                                started = true;
+                        }
                     }
                 }
             }
@@ -402,7 +417,7 @@ partial class Designer {
                         this.ClearExtraSel();
                     } else if (hit != sel && this.IsExtraSel(hit)) {
                         this.ToggleExtraSel(hit);
-                        if (sel != null) { freeExtra.Add(sel); }
+                        if (sel != null && freeExtra != null) { freeExtra.Add(sel); }
                     }
                     sel = hit;
                     inspTab = 0;

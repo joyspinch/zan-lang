@@ -14,8 +14,29 @@ partial class Designer {
     WindowShapeMask pvShapeMask;
     string pvShapeImage;
     bool pvShapeReady;
+    weak AppLoopRegistration pvLoopRegistration;
+
+    void EnsurePreviewLifecycleHook(App host) {
+        if (host == null || !host.isRunning) { return; }
+        AppLoopRegistration reg = pvLoopRegistration;
+        if (reg != null && reg.active && reg.host == host) { return; }
+        if (reg != null) { reg.Invalidate(); }
+        pvLoopRegistration = host.RegisterLoopParticipant(this, new DesignerPreviewLifecycle(this));
+    }
+
+    internal void OnPreviewHostStopped(App host) {
+        AppLoopRegistration reg = pvLoopRegistration;
+        if (reg != null && reg.host != null && reg.host != host) { return; }
+        pvLoopRegistration = null;
+        this.DisposeDesignPreview();
+    }
+
+    public void Dispose() {
+        this.DisposeDesignPreview();
+    }
 
     void BindDesignPreviewEvents(Control root, DesignPreviewEvents events) {
+        if (root == null || events == null) { return; }
         for (int i = 0; i < root.events.Count; i = i + 1) {
             string evt = root.events[i].key;
             string handler = root.events[i].val;
@@ -30,15 +51,16 @@ partial class Designer {
     void RenderDesignPreview() {
         if (pvDocForm == null) { return; }
         App target = pvDocForm.GetApp();
-        if (target.canvas == null) { return; }
+        if (target == null || target.canvas == null) { return; }
         pvDocForm.CaptureSnapshot();
         pvShapeReady = false;
         this.UpdateDesignPreviewLayout();
     }
 
     void ProcessDesignPreviewInput(App host, int x, int y, bool inside) {
-        if (pvDocForm == null) { return; }
+        if (host == null || host.window == null || pvDocForm == null) { return; }
         App target = pvDocForm.GetApp();
+        if (target == null) { return; }
         long seq = host.window.EventSeq();
         int kind = host.window.EventKind();
         bool fresh = !pvInputSeen || seq != pvInputSeq;
@@ -109,7 +131,7 @@ partial class Designer {
     }
 
     int DesignTargetDpi(App host) {
-        int dpi = targetDpi > 0 ? targetDpi : host.dpiScale;
+        int dpi = targetDpi > 0 ? targetDpi : (host != null ? host.dpiScale : 100);
         return dpi > 0 ? dpi : 100;
     }
 
@@ -141,22 +163,33 @@ partial class Designer {
         designResizeMoved = false;
         designMoves = null;
         this.MarkDocDirty();
-        this.PrepareDesignPreview(host);
-        host.RequestRedraw();
+        if (host != null) {
+            this.PrepareDesignPreview(host);
+            host.RequestRedraw();
+        }
     }
 
     bool PrepareDesignPreview(App host) {
+        if (host == null) { return false; }
+        this.EnsurePreviewLifecycleHook(host);
         if (winW != designAppliedW || winH != designAppliedH) {
             this.ApplyDesignSize(winW, winH);
         }
         int dpi = this.DesignTargetDpi(host);
         int width = winW < 40 ? 40 : winW;
         int height = winH < 40 ? 40 : winH;
+        if (pvDocForm != null) {
+            App existing = pvDocForm.GetApp();
+            if (existing == null || existing.canvas == null) {
+                this.DisposeDesignPreview();
+            }
+        }
         if (pvDocForm == null) {
             pvDocForm = Form.CreateOffscreen(winTitle, width, height);
             pvDocDirty = true;
         }
         App target = pvDocForm.GetApp();
+        if (target == null) { return false; }
         bool viewportChanged = target.canvas == null || target.canvas.Width() != width
             || target.canvas.Height() != height || pvDocDpi != dpi;
         if (viewportChanged) {
@@ -302,11 +335,12 @@ partial class Designer {
     }
 
     void PaintDesignPreview(Canvas canvas, int x, int y, int width, int height) {
-        if (pvDocForm == null) { return; }
+        if (canvas == null || pvDocForm == null || width <= 0 || height <= 0) { return; }
         // viewport 变化会替换并销毁旧表面，每次绘制取离屏 App 当前持有的画布。
         App target = pvDocForm.GetApp();
+        if (target == null) { return; }
         Canvas source = target.canvas;
-        if (source == null) { return; }
+        if (source == null || source.Width() <= 0 || source.Height() <= 0) { return; }
         bool moving = freeResizing || freeDragging || dragging || freePanning;
         if (!moving && (target.shapeMode != 0 || target.WindowOpacity() < 100)) {
             if (!pvShapeReady) {
@@ -328,6 +362,9 @@ partial class Designer {
     }
 
     void DisposeDesignPreview() {
+        AppLoopRegistration reg = pvLoopRegistration;
+        pvLoopRegistration = null;
+        if (reg != null) { reg.Invalidate(); }
         this.RetireInspectorInput();
         this.RetireCanvasInput();
         this.CloseDesignerMenus();
@@ -336,10 +373,14 @@ partial class Designer {
         pvShapeMask = null;
         pvShapeReady = false;
         if (pvDocForm != null) {
+            pvDocForm.Children.Clear();
             App target = pvDocForm.GetApp();
-            if (target.canvas != null) {
-                target.canvas.Destroy();
-                target.canvas = null;
+            if (target != null) {
+                if (target.overlayHost != null) { target.overlayHost.DismissAll(); }
+                if (target.canvas != null) {
+                    target.canvas.Destroy();
+                    target.canvas = null;
+                }
             }
         }
         pvDocForm = null;
@@ -349,5 +390,22 @@ partial class Designer {
         pvEvents = null;
         pvInputSeen = false;
         pvInputFocused = false;
+        pvDocDirty = true;
+    }
+}
+
+internal class DesignerPreviewLifecycle : AppLoopParticipant, AppLoopStopped {
+    weak Designer owner;
+
+    internal DesignerPreviewLifecycle(Designer owner) {
+        this.owner = owner;
+    }
+
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+
+    public void Stopped(App app) {
+        Designer current = owner;
+        if (current != null) { current.OnPreviewHostStopped(app); }
     }
 }

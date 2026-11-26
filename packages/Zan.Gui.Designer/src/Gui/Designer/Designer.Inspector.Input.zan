@@ -34,8 +34,9 @@ partial class Designer {
 
     // Callback-bearing tree/input operations may synchronously prepare a new scope or target.
     bool InspectorInputCurrent(int generation, UiViewScope view, Control root, App app, FormField target) {
+        App curApp = inspectorApp;
         return inspectorInputGeneration == generation && inspectorView == view && inspectorRoot == root
-            && inspectorApp == app && sel == target
+            && curApp == app && sel == target
             && (view == null || root == null || !root.visible || view.IsActive());
     }
     UiViewActions inspectorEventTextAction;
@@ -48,7 +49,8 @@ partial class Designer {
 
     public void InitializeInspectorInput(App app) {
         if (app == null) { return; }
-        if (inspectorView != null && (inspectorApp != app || !inspectorView.IsActive())) {
+        App curApp = inspectorApp;
+        if (inspectorView != null && (curApp != app || !inspectorView.IsActive())) {
             int retiring = inspectorInputGeneration + 1;
             this.RetireInspectorInput();
             if (inspectorInputGeneration != retiring || inspectorRoot != null) { return; }
@@ -91,13 +93,15 @@ partial class Designer {
         inspectorTitle.SetProp("style", "flex-shrink:0;");
         inspectorTabs.SetProp("style", "flex-shrink:0;");
         inspectorCategories.SetProp("style", "flex-shrink:0;");
-        inspFilterInput.SetProp("style", "flex-shrink:0;");
+        if (inspFilterInput != null) { inspFilterInput.SetProp("style", "flex-shrink:0;"); }
         inspectorBody.SetProp("style", "flex:1;min-height:0;");
         inspectorRoot.Add(inspectorTitle); inspectorRoot.Add(inspectorTabs);
         inspectorRoot.Add(inspectorCategories);
         int initializing = inspectorInputGeneration; Panel initializingRoot = inspectorRoot;
-        initializingRoot.Add(inspFilterInput);
-        if (inspectorInputGeneration != initializing || inspectorRoot != initializingRoot) { return; }
+        if (inspFilterInput != null) {
+            initializingRoot.Add(inspFilterInput);
+            if (inspectorInputGeneration != initializing || inspectorRoot != initializingRoot) { return; }
+        }
         initializingRoot.Add(inspectorBody);
         if (inspectorInputGeneration != initializing || inspectorRoot != initializingRoot) { return; }
         inspectorEventViews = new List<DesignerInspectorEventRow>();
@@ -114,7 +118,7 @@ partial class Designer {
             Button button = inspectorCategoryButtons[i];
             button.OnClick(inspectorView.Action("inspector-category", button).Run);
         }
-        inspFilterInput.OnChange(inspectorView.Action("inspector-filter", inspFilterInput).Run);
+        if (inspFilterInput != null) { inspFilterInput.OnChange(inspectorView.Action("inspector-filter", inspFilterInput).Run); }
         inspectorSaveComponent.OnClick(inspectorView.Action("inspector-save", inspectorSaveComponent).Run);
         inspectorBodyKey = ""; inspectorEventSignature = "";
         inspectorRoot.visible = false;
@@ -124,6 +128,7 @@ partial class Designer {
     public Rect InspectorRegion(App app, Rect host) {
         if (app == null || host == null || hostPanels || host.width <= 0 || host.height <= 0) { return null; }
         Rect canvas = this.CanvasRegion(app, host);
+        if (canvas == null) { return null; }
         int left = canvas.x + canvas.width + app.Scale(12);
         int width = host.x + host.width - app.Scale(24) - left;
         int height = host.y + host.height - app.Scale(32) - app.Scale(4) - canvas.y;
@@ -135,14 +140,16 @@ partial class Designer {
         if (app == null || region == null || region.width < 20 || region.height < 20) {
             this.SuspendInspectorInput(); return;
         }
-        if (inspectorView != null && (inspectorApp != app || !inspectorView.IsActive())) {
+        App curApp = inspectorApp;
+        if (inspectorView != null && (curApp != app || !inspectorView.IsActive())) {
             int retiring = inspectorInputGeneration + 1;
             this.RetireInspectorInput();
             if (inspectorInputGeneration != retiring || inspectorRoot != null) { return; }
         }
         this.InitializeInspectorInput(app);
         UiViewScope view = inspectorView; Panel root = inspectorRoot; FormField target = sel;
-        if (view == null || !view.IsActive() || root == null || inspectorApp != app) { return; }
+        App boundApp = inspectorApp;
+        if (view == null || !view.IsActive() || root == null || boundApp != app || inspectorInputHost == null) { return; }
         int generation = inspectorInputGeneration + 1; inspectorInputGeneration = generation;
         inspectorRegion = region; root.visible = true;
         inspectorInputHost.Bind(app);
@@ -219,17 +226,19 @@ partial class Designer {
 
     // Reconcile only structural changes. Kept children retain focus, capture and editor identity.
     bool SetInspectorChildren(Control parent, List<Control> children) {
+        if (parent == null || children == null) { return false; }
         int generation = inspectorInputGeneration;
         UiViewScope view = inspectorView; Control root = inspectorRoot; App app = inspectorApp; FormField target = sel;
         List<Control> previous = new List<Control>();
         for (int i = 0; i < parent.ChildCount(); i = i + 1) { previous.Add(parent.ChildAt(i)); }
         for (int i = previous.Count - 1; i >= 0; i = i - 1) {
             Control child = previous[i];
-            if (!children.Contains(child) && child.parent == parent) { parent.Remove(child); }
+            if (child != null && !children.Contains(child) && child.parent == parent) { parent.Remove(child); }
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
         }
         for (int i = 0; i < children.Count; i = i + 1) {
             Control child = children[i];
+            if (child == null) { continue; }
             if (child.parent != parent) { parent.Add(child); }
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return false; }
             parent.MoveChild(child, i);
@@ -241,15 +250,17 @@ partial class Designer {
     public bool PrepareInspectorView(UiViewScope view, App app) {
         if (view != inspectorView) { return false; }
         inspectorReady = false;
-        if (view == null || !view.IsActive() || inspectorApp != app || inspectorRegion == null
-                || inspectorRoot == null || !inspectorRoot.visible) { return true; }
+        App curApp = inspectorApp;
+        if (view == null || !view.IsActive() || curApp != app || inspectorRegion == null
+                || inspectorRoot == null || !inspectorRoot.visible || inspectorBody == null) { return true; }
         int generation = inspectorInputGeneration + 1; inspectorInputGeneration = generation;
         Control root = inspectorRoot; FormField target = sel; Rect region = inspectorRegion;
-        bool targetChanged = inspectorTarget != target;
+        FormField prevTarget = inspectorTarget;
+        bool targetChanged = prevTarget != target;
         if (targetChanged) {
             this.RetireInspectorFieldExtras();
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
-            propGrid.Bind("retired", new List<PropSpec>());
+            if (propGrid != null) { propGrid.Bind("retired", new List<PropSpec>()); }
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
             inspectorTarget = target; inspectorEventSignature = ""; this.ResetInspectorScroll();
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
@@ -263,14 +274,18 @@ partial class Designer {
                     + Designer.T(" selected)", " 个已选)");
             }
         }
-        inspectorTitle.SetProp("text", title);
-        inspectorPropertiesTab.Class = inspTab == 0 ? "primary small" : "secondary small";
-        inspectorEventsTab.Class = inspTab == 1 ? "primary small" : "secondary small";
-        inspectorCategories.visible = inspTab == 0 && sel != null;
-        for (int i = 0; i < inspectorCategoryButtons.Count; i = i + 1) {
-            inspectorCategoryButtons[i].Class = inspCategory == i ? "primary small" : "secondary small";
+        if (inspectorTitle != null) { inspectorTitle.SetProp("text", title); }
+        if (inspectorPropertiesTab != null) { inspectorPropertiesTab.Class = inspTab == 0 ? "primary small" : "secondary small"; }
+        if (inspectorEventsTab != null) { inspectorEventsTab.Class = inspTab == 1 ? "primary small" : "secondary small"; }
+        if (inspectorCategories != null) { inspectorCategories.visible = inspTab == 0 && sel != null; }
+        if (inspectorCategoryButtons != null) {
+            for (int i = 0; i < inspectorCategoryButtons.Count; i = i + 1) {
+                if (inspectorCategoryButtons[i] != null) {
+                    inspectorCategoryButtons[i].Class = inspCategory == i ? "primary small" : "secondary small";
+                }
+            }
         }
-        string filter = inspFilterInput.GetText().Trim().ToLower();
+        string filter = inspFilterInput != null ? inspFilterInput.GetText().Trim().ToLower() : "";
         string bodyKey = Convert.ToString(inspTab) + "|" + Convert.ToString(inspCategory) + "|" + filter;
         if (inspectorBodyKey != bodyKey) {
             inspectorBody.SetScrollTop(0);
@@ -282,23 +297,24 @@ partial class Designer {
             if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
             if (!this.PrepareInspectorEvents(app, filter)) { return true; }
         } else {
-            List<Control> children = new List<Control>(); children.Add(propGrid);
+            List<Control> children = new List<Control>();
+            if (propGrid != null) { children.Add(propGrid); }
             if (sel == null) {
                 if (selPrev != null || targetChanged) { selPrev = null; inspKeySeq = inspKeySeq + 1; }
                 string key = "win" + Convert.ToString(inspKeySeq);
                 DeviceProfile profile = DeviceProfile.ById(device);
                 if (profile != null && profile.Locked()) { key = key + "l"; }
-                propGrid.Bind(key, this.FilterWindowInspectorSpecs(filter));
+                if (propGrid != null) { propGrid.Bind(key, this.FilterWindowInspectorSpecs(filter)); }
                 if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
                 if (!this.PrepareWindowInspectorExtras()) { return true; }
-                children.Add(inspectorWindowExtras);
+                if (inspectorWindowExtras != null) { children.Add(inspectorWindowExtras); }
             } else {
                 this.SyncEditors(target);
-                propGrid.Bind("fld" + Convert.ToString(inspKeySeq), this.FieldSpecs(target));
+                if (propGrid != null) { propGrid.Bind("fld" + Convert.ToString(inspKeySeq), this.FieldSpecs(target)); }
                 if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
                 this.PrepareInspectorFieldExtras(app, target, inspectorFieldExtras);
                 if (!this.InspectorInputCurrent(generation, view, root, app, target)) { return true; }
-                children.Add(inspectorFieldExtras);
+                if (inspectorFieldExtras != null) { children.Add(inspectorFieldExtras); }
             }
             if (!this.SetInspectorChildren(inspectorBody, children)) { return true; }
         }
@@ -313,11 +329,11 @@ partial class Designer {
 
     List<PropSpec> FilterWindowInspectorSpecs(string filter) {
         List<PropSpec> specs = this.WindowSpecs();
-        if (filter == "") { return specs; }
+        if (filter == null || filter == "") { return specs; }
         List<PropSpec> selected = new List<PropSpec>();
         for (int i = 0; i < specs.Count; i = i + 1) {
             PropSpec spec = specs[i];
-            if (spec.key.ToLower().Contains(filter) || spec.label.ToLower().Contains(filter)) { selected.Add(spec); }
+            if (spec != null && (spec.key.ToLower().Contains(filter) || spec.label.ToLower().Contains(filter))) { selected.Add(spec); }
         }
         return selected;
     }
@@ -325,31 +341,34 @@ partial class Designer {
     bool PrepareWindowInspectorExtras() {
         List<Control> children = new List<Control>();
         DeviceProfile profile = DeviceProfile.ById(device);
-        if (profile != null && profile.Locked()) {
+        if (profile != null && profile.Locked() && inspectorDeviceHint != null) {
             inspectorDeviceHint.SetProp("text", Designer.T("Canvas ", "画布 ") + Convert.ToString(winW) + " × "
                 + Convert.ToString(winH) + Designer.T(" (locked by device)", "（由设备锁定）"));
             children.Add(inspectorDeviceHint);
         }
-        if ((device == "phone" || device == "tablet") && layoutMode == 1) { children.Add(inspectorLayoutHint); }
-        if (winShape == 3) {
+        if ((device == "phone" || device == "tablet") && layoutMode == 1 && inspectorLayoutHint != null) { children.Add(inspectorLayoutHint); }
+        if (winShape == 3 && inspectorShapeHint != null && inspectorShapeValue != null) {
             inspectorShapeValue.SetProp("text", winShapeSpec); children.Add(inspectorShapeHint); children.Add(inspectorShapeValue);
         }
-        children.Add(inspectorSaveComponent);
+        if (inspectorSaveComponent != null) { children.Add(inspectorSaveComponent); }
         return this.SetInspectorChildren(inspectorWindowExtras, children);
     }
 
     public bool InspectorAction(string name, Control sender) {
-        if (!name.StartsWith("inspector-")) { return false; }
+        if (name == null || !name.StartsWith("inspector-")) { return false; }
         if (inspectorView == null || !inspectorView.IsActive() || inspectorRegion == null || inspectorRoot == null
                 || !inspectorRoot.visible) { return true; }
+        if (sender != null && sender.IsDisabled()) { return true; }
         inspectorInputGeneration = inspectorInputGeneration + 1;
         if (name == "inspector-properties" || name == "inspector-events") {
             int tab = name == "inspector-events" ? 1 : 0;
             if (inspTab != tab) { inspTab = tab; activeEventDropdown = ""; this.ResetInspectorScroll(); }
         } else if (name == "inspector-category") {
-            for (int i = 0; i < inspectorCategoryButtons.Count; i = i + 1) {
-                if (sender == inspectorCategoryButtons[i] && inspCategory != i) {
-                    inspCategory = i; this.ResetInspectorScroll(); break;
+            if (inspectorCategoryButtons != null) {
+                for (int i = 0; i < inspectorCategoryButtons.Count; i = i + 1) {
+                    if (sender == inspectorCategoryButtons[i] && inspCategory != i) {
+                        inspCategory = i; this.ResetInspectorScroll(); break;
+                    }
                 }
             }
         } else if (name == "inspector-filter") { this.ResetInspectorScroll(); }

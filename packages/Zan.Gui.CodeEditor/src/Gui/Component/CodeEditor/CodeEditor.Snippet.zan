@@ -40,6 +40,7 @@ partial class CodeEditor {
     // 两处各写一份必然走散——列得出却展不开。
     // 模板必须写成 Zan 语法：插进去的代码要能直接编译。
     public static void SnippetTable(List<string> outNames, List<string> outTpls) {
+        if (outNames == null || outTpls == null) { return; }
         outNames.Add("if");         outTpls.Add("if ($1) {\n    $2\n}");
         outNames.Add("ifelse");     outTpls.Add("if ($1) {\n    $2\n} else {\n    $3\n}");
         outNames.Add("for");        outTpls.Add("for (int i = 0; i < $1; i = i + 1) {\n    $2\n}");
@@ -62,6 +63,7 @@ partial class CodeEditor {
 
     // 片段模板：名字 `name` 的模板；没有这个名字返回 ""。
     public static string SnippetTemplateOf(string name) {
+        if (name == null || name.Length == 0) { return ""; }
         List<string> names = new List<string>();
         List<string> tpls = new List<string>();
         CodeEditor.SnippetTable(names, tpls);
@@ -74,6 +76,7 @@ partial class CodeEditor {
     // 打开片段选择器（VS 的「插入代码片段...」）：弹窗里只有片段，
     // 上下键选、Enter 或 Tab 插入，插入后直接进洞位模式。
     void ShowSnippetPicker() {
+        if (!CanMutate()) { return; }
         acSnippetOnly = true;
         acFilter = "S";
         acDot = false;
@@ -92,19 +95,21 @@ partial class CodeEditor {
     }
 
     // 从 (line,col) 出发越过固定文本 seg 之后的落点。
-    // seg 里带换行时落点是新行上的列，否则是同一行的列偏移。
+    // seg 里带换行时落点是新行上的列，否则是同一行的列偏移（跳过 '\r' 以对齐 SplitLines）。
     public static void SnipAdvance(int line, int col, string seg,
                                    out int oline, out int ocol) {
         int nl = 0;
         int lastLen = 0;
         int n = seg == null ? 0 : seg.Length;
         for (int i = 0; i < n; i = i + 1) {
-            if ((seg[i] & 255) == 10) { nl = nl + 1; lastLen = 0; }
+            int ch = seg[i] & 255;
+            if (ch == 13) { continue; }
+            if (ch == 10) { nl = nl + 1; lastLen = 0; }
             else { lastLen = lastLen + 1; }
         }
         if (nl == 0) {
             oline = line;
-            ocol = col + n;
+            ocol = col + lastLen;
         } else {
             oline = line + nl;
             ocol = lastLen;
@@ -115,16 +120,20 @@ partial class CodeEditor {
     // 插入后进入片段模式（光标落在第一个洞）。
     void InsertSnippet(string body, int startLine, int startCol,
                        int endLine, int endCol) {
+        if (!CanMutate()) { return; }
         SnipEnd();
-        if (body == null || body.Length == 0) { return; }
+        if (body == null || body.Length == 0 || lines == null || lines.Count == 0) { return; }
         if (startLine < 0 || endLine < startLine || endLine >= lines.Count) { return; }
         if (startCol < 0 || startCol > lines[startLine].Length) { return; }
         if (endCol < 0 || endCol > lines[endLine].Length) { return; }
+        startCol = Text.ClampCharStart(lines[startLine], startCol);
+        endCol = Text.ClampCharStart(lines[endLine], endCol);
         SnippetTemplate tpl = SnippetParser.Parse(body);
         string text = tpl.text;
-        if (text.Length == 0) { return; }
+        if (text == null || text.Length == 0) { return; }
 
         List<string> ins = CodeEditor.SplitLines(text);
+        if (ins.Count == 0) { return; }
         string left = Text.Left(lines[startLine], startCol);
         string right = Text.Right(lines[endLine], endCol);
         for (int line = endLine; line > startLine; line = line - 1) { lines.RemoveAt(line); }
@@ -143,34 +152,41 @@ partial class CodeEditor {
         snipHoleCount = holeCount;
         snipHoleIdx = -1;
 
-        // 把模板里的字节偏移换算成文档里的绝对位置。
+        // 把模板里的字节偏移换算成文档里的绝对位置（跳过 '\r' 以对齐 SplitLines）。
         int line = startLine;
         int col = startCol;
         int o = 0;
         for (int h = 0; h < holeCount; h = h + 1) {
-            while (o < tpl.holeStart[h]) {
-                if ((text[o] & 255) == 10) { line = line + 1; col = 0; }
-                else { col = col + 1; }
+            while (o < tpl.holeStart[h] && o < text.Length) {
+                int b = text[o] & 255;
+                if (b == 10) { line = line + 1; col = 0; }
+                else if (b != 13) { col = col + 1; }
                 o = o + 1;
             }
             snipStartLine.Add(line);
             snipStartCol.Add(col);
-            while (o < tpl.holeStart[h] + tpl.holeLen[h]) {
-                if ((text[o] & 255) == 10) { line = line + 1; col = 0; }
-                else { col = col + 1; }
+            int hEnd = tpl.holeStart[h] + tpl.holeLen[h];
+            while (o < hEnd && o < text.Length) {
+                int b = text[o] & 255;
+                if (b == 10) { line = line + 1; col = 0; }
+                else if (b != 13) { col = col + 1; }
                 o = o + 1;
             }
             snipEndLine.Add(line);
             snipEndCol.Add(col);
-            int segStart = tpl.holeStart[h] + tpl.holeLen[h];
+            int segStart = hEnd <= text.Length ? hEnd : text.Length;
             int segEnd = holeCount > h + 1 ? tpl.holeStart[h + 1] : text.Length;
+            if (segEnd < segStart) { segEnd = segStart; }
+            if (segEnd > text.Length) { segEnd = text.Length; }
             snipSeg.Add(text.Substring(segStart, segEnd - segStart));
-            snipDef.Add(text.Substring(tpl.holeStart[h], tpl.holeLen[h]));
+            int defLen = segStart - tpl.holeStart[h];
+            snipDef.Add(defLen > 0 ? text.Substring(tpl.holeStart[h], defLen) : "");
         }
 
         // 光标先落在插入内容的末尾，再由第一个洞接管。
         curLine = lastLine;
         curCol = lines[lastLine].Length - right.Length;
+        ClampCol();
         selActive = false;
         if (holeCount > 0) {
             snipHoleIdx = 0;
@@ -178,7 +194,11 @@ partial class CodeEditor {
             selAnchorCol = snipStartCol[0];
             curLine = snipEndLine[0];
             curCol = snipEndCol[0];
-            selActive = snipEndLine[0] != snipStartLine[0] || snipEndCol[0] != snipStartCol[0];
+            ClampCol();
+            if (selAnchorLine >= 0 && selAnchorLine < lines.Count) {
+                selAnchorCol = Text.ClampCharStart(lines[selAnchorLine], selAnchorCol);
+            }
+            selActive = curLine != selAnchorLine || curCol != selAnchorCol;
             snipActive = true;
         }
     }
@@ -227,8 +247,9 @@ partial class CodeEditor {
         int ecol = col;
         string def = snipDef[next];
         for (int i = 0; i < def.Length; i = i + 1) {
-            if ((def[i] & 255) == 10) { eline = eline + 1; ecol = 0; }
-            else { ecol = ecol + 1; }
+            int b = def[i] & 255;
+            if (b == 10) { eline = eline + 1; ecol = 0; }
+            else if (b != 13) { ecol = ecol + 1; }
         }
         snipEndLine[next] = eline;
         snipEndCol[next] = ecol;
@@ -236,7 +257,13 @@ partial class CodeEditor {
         selAnchorCol = col;
         curLine = eline;
         curCol = ecol;
-        selActive = eline != line || ecol != col;
+        ClampCol();
+        if (lines != null && lines.Count > 0) {
+            if (selAnchorLine < 0) { selAnchorLine = 0; }
+            if (selAnchorLine >= lines.Count) { selAnchorLine = lines.Count - 1; }
+            selAnchorCol = Text.ClampCharStart(lines[selAnchorLine], selAnchorCol);
+        }
+        selActive = curLine != selAnchorLine || curCol != selAnchorCol;
         acActive = false;
         acDot = false;
         acFilter = "";
@@ -253,6 +280,7 @@ partial class CodeEditor {
             CodeEditor.SnipAdvance(snipEndLine[h], snipEndCol[h], snipSeg[h], out line, out col);
             curLine = line;
             curCol = col;
+            ClampCol();
         }
         SnipEnd();
         selActive = false;
@@ -275,10 +303,19 @@ partial class CodeEditor {
             snipEndCol[h] = qC;
             return;
         }
-        // 编辑落在洞外：退格删掉了洞前的字符 → 洞整体左移一列。
-        if (!grew && pL == sL && pC == sC && sC > 0) {
-            snipStartCol[h] = sC - 1;
-            if (eL == sL) { snipEndCol[h] = eC - 1; }
+        // 编辑落在洞外：退格删掉了洞前的字符 → 按实际删除字节数左移（UTF-8 安全）。
+        if (!grew && pL == sL && qL == sL && pC == sC && sC > 0) {
+            int delta = pC - qC;
+            if (delta > 0) {
+                int ns = sC - delta;
+                if (ns < 0) { ns = 0; }
+                snipStartCol[h] = ns;
+                if (eL == sL) {
+                    int ne = eC - delta;
+                    if (ne < ns) { ne = ns; }
+                    snipEndCol[h] = ne;
+                }
+            }
         }
     }
 

@@ -17,6 +17,7 @@ public partial class CodeEditor {
     }
 
     private void HandleBackspace(App app) {
+        if (!CanMutate()) { return; }
         if (selActive || HasSelection()) {
             ClearExtraCarets();
             DeleteSelection();
@@ -29,19 +30,24 @@ public partial class CodeEditor {
             app.RequestRedraw();
             return;
         }
-        // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧
+        // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧（按 UTF-8 码点校验）
+        ClampCol();
         string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
         if (curCol > 0 && curCol < ln.Length) {
-            string lCh = ln.Substring(curCol - 1, 1);
-            string rCh = ln.Substring(curCol, 1);
-            string expectedClose = CodeEditor.ClosingPairFor(lCh);
-            if (expectedClose != null && rCh == expectedClose) {
-                SaveUndo();
-                lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
-                curCol = curCol - 1;
-                UpdateCompletion();
-                app.RequestRedraw();
-                return;
+            int prevCol = Text.PrevCharStart(ln, curCol);
+            int nextCol = Text.NextCharEnd(ln, curCol);
+            if (curCol - prevCol == 1 && nextCol - curCol == 1) {
+                string lCh = ln.Substring(prevCol, 1);
+                string rCh = ln.Substring(curCol, 1);
+                string expectedClose = CodeEditor.ClosingPairFor(lCh);
+                if (expectedClose != null && rCh == expectedClose) {
+                    SaveUndo();
+                    lines[curLine] = ln.Substring(0, prevCol) + ln.Substring(nextCol, ln.Length - nextCol);
+                    curCol = prevCol;
+                    UpdateCompletion();
+                    app.RequestRedraw();
+                    return;
+                }
             }
         }
         SaveUndoBackspace();
@@ -51,6 +57,7 @@ public partial class CodeEditor {
     }
 
     private bool TryAutoClosePair(App app, string ch) {
+        if (!CanMutate()) { return false; }
         string close = CodeEditor.ClosingPairFor(ch);
         if (close == null) { return false; }
         SaveUndoTyping();
@@ -70,6 +77,7 @@ public partial class CodeEditor {
 
     // kind==6：键入字符、Ctrl 快捷键和编辑键。
     private void HandleCharKey(App app, int code, int modifiers) {
+        if (app == null || this.IsDisabled()) { return; }
         bool ate = ateCtrlKey;
         ateCtrlKey = false;
         // Ctrl 组合已经在 kind==4 里处理过：Windows 之后还会送一个
@@ -95,7 +103,7 @@ public partial class CodeEditor {
         // 作用域内所有内容，即使未输入前缀（部分平台 code 为 0 且带 Ctrl，
         // 其他平台为按住 Ctrl 的空格；严格防止 Windows IME 的裸 0 码误触发）。
         if (((code == 0 && Modifiers.HasCtrl(modifiers)) || (code == 32 && Modifiers.HasCtrl(modifiers)))) {
-            if (!InStringOrCommentContext()) {
+            if (CanMutate() && !InStringOrCommentContext()) {
                 ForceCompletion();
                 app.RequestRedraw();
             }
@@ -109,6 +117,7 @@ public partial class CodeEditor {
         }
         // Ctrl+X = 剪切（code 24）
         if (code == 24) {
+            if (!CanMutate()) { return; }
             CutSelection();
             CheckErrors();
             app.RequestRedraw();
@@ -116,6 +125,7 @@ public partial class CodeEditor {
         }
         // Ctrl+V = 粘贴（code 22）
         if (code == 22) {
+            if (!CanMutate()) { return; }
             PasteClipboard();
             CheckErrors();
             UpdateCompletion();
@@ -124,6 +134,7 @@ public partial class CodeEditor {
         }
         // Ctrl+Z = 撤销（code 26）
         if (code == 26) {
+            if (!CanMutate()) { return; }
             Undo();
             CheckErrors();
             app.RequestRedraw();
@@ -131,6 +142,7 @@ public partial class CodeEditor {
         }
         // Ctrl+Y = 重做（code 25）
         if (code == 25) {
+            if (!CanMutate()) { return; }
             Redo();
             CheckErrors();
             app.RequestRedraw();
@@ -138,6 +150,7 @@ public partial class CodeEditor {
         }
         // Ctrl+D = 复制行（code 4）
         if (code == 4) {
+            if (!CanMutate()) { return; }
             DuplicateLine();
             CheckErrors();
             app.RequestRedraw();
@@ -145,6 +158,7 @@ public partial class CodeEditor {
         }
         // Ctrl+L = 删除行（code 12）
         if (code == 12) {
+            if (!CanMutate()) { return; }
             DeleteLine();
             CheckErrors();
             app.RequestRedraw();
@@ -152,6 +166,7 @@ public partial class CodeEditor {
         }
         // Ctrl+/ = 切换行注释（code 31）
         if (code == 31) {
+            if (!CanMutate()) { return; }
             ToggleComment();
             CheckErrors();
             app.RequestRedraw();
@@ -172,6 +187,8 @@ public partial class CodeEditor {
                 acActive = false;
                 acSnippetOnly = false;
                 app.RequestRedraw();
+            } else if (!CanMutate()) {
+                return;
             } else if (acActive) { AcceptCompletion(false); }
             else {
                 ClearExtraCarets();
@@ -182,6 +199,7 @@ public partial class CodeEditor {
             }
             app.RequestRedraw();
         } else if (code == 9) {
+            if (!CanMutate()) { return; }
             EndUndoGroup();
             bool tabShift = Modifiers.HasShift(modifiers);
             if (snipActive) {
@@ -220,6 +238,7 @@ public partial class CodeEditor {
             SnipEnd();
             app.RequestRedraw();
         } else if (code > 31) {
+            if (!CanMutate()) { return; }
             string ch = Text.CharStr(code);
             if (ch.Length > 0) {
                 if (selActive) {
@@ -234,16 +253,20 @@ public partial class CodeEditor {
                     ClearExtraCarets();
                     DeleteSelection();
                 } else {
+                    ClampCol();
                     string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
                     // 1. 跳过已有闭合符号 (Type-over Closing Character)：输入右括号/引号且光标处正好相同时跳过该字符
-                    if (curCol < ln.Length && ln.Substring(curCol, 1) == ch) {
-                        if (ch == ")" || ch == "]" || ch == "}" || ch == "\"" || ch == "'") {
-                            if (ch == "\"" || ch == "'") {
-                                acActive = false; acDot = false; CancelSemanticCompletion();
+                    if (curCol < ln.Length) {
+                        int nextCol = Text.NextCharEnd(ln, curCol);
+                        if (nextCol - curCol == 1 && ln.Substring(curCol, 1) == ch) {
+                            if (ch == ")" || ch == "]" || ch == "}" || ch == "\"" || ch == "'") {
+                                if (ch == "\"" || ch == "'") {
+                                    acActive = false; acDot = false; CancelSemanticCompletion();
+                                }
+                                curCol = nextCol;
+                                app.RequestRedraw();
+                                return;
                             }
-                            curCol = curCol + 1;
-                            app.RequestRedraw();
-                            return;
                         }
                     }
                     // 2. 自动配对闭合 (Auto-closing Pairs)：输入左括号/引号自动闭合且光标居中
@@ -277,6 +300,7 @@ public partial class CodeEditor {
 
     // kind==4：导航 / 选择 / 多光标移动键。
     private void HandleNavKey(App app, int kc, int modifiers) {
+        if (app == null || this.IsDisabled()) { return; }
         // 片段模式里移动光标 = 离开片段（VS：光标一动，片段即结束）。
         if (snipActive && (kc == 37 || kc == 38 || kc == 39 || kc == 40
         || kc == 33 || kc == 34 || kc == 35 || kc == 36)) {
@@ -291,22 +315,28 @@ public partial class CodeEditor {
         && (kc == 67 || kc == 86 || kc == 88 || kc == 65)) {
             ateCtrlKey = true;
             if (kc == 67) { CopySelection(); }
-            else if (kc == 88) { CutSelection(); CheckErrors(); }
+            else if (kc == 88) { if (CanMutate()) { CutSelection(); CheckErrors(); } }
             else if (kc == 86) {
-                PasteClipboard();
-                CheckErrors();
-                UpdateCompletion();
+                if (CanMutate()) {
+                    PasteClipboard();
+                    CheckErrors();
+                    UpdateCompletion();
+                }
             } else { SelectAll(); }
             app.RequestRedraw();
             return;
         }
         if (acActive && kc == 38) {
-            acSel = acSel - 1;
-            if (acSel < 0) { acSel = acItems.Count - 1; }
+            if (acItems.Count > 0) {
+                acSel = acSel - 1;
+                if (acSel < 0) { acSel = acItems.Count - 1; }
+            }
             app.RequestRedraw();
         } else if (acActive && kc == 40) {
-            acSel = acSel + 1;
-            if (acSel >= acItems.Count) { acSel = 0; }
+            if (acItems.Count > 0) {
+                acSel = acSel + 1;
+                if (acSel >= acItems.Count) { acSel = 0; }
+            }
             app.RequestRedraw();
         } else if (kc == 27) { EndUndoGroup(); acActive = false; acFilter = ""; acSnippetOnly = false; selActive = false; refPopOpen = false; app.RequestRedraw(); }
         else if (kc == 37) {
@@ -327,7 +357,7 @@ public partial class CodeEditor {
             EndUndoGroup();
             int mods38 = modifiers;
             if (Modifiers.HasCtrl(mods38) && Modifiers.HasAlt(mods38)) { AddCaretAbove(); }
-            else if (Modifiers.HasAlt(mods38)) { ClearExtraCarets(); MoveLineUp(); CheckErrors(); }
+            else if (Modifiers.HasAlt(mods38)) { if (CanMutate()) { ClearExtraCarets(); MoveLineUp(); CheckErrors(); } }
             else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods38)); MoveUp(); }
             app.RequestRedraw();
         }
@@ -335,7 +365,7 @@ public partial class CodeEditor {
             EndUndoGroup();
             int mods40 = modifiers;
             if (Modifiers.HasCtrl(mods40) && Modifiers.HasAlt(mods40)) { AddCaretBelow(); }
-            else if (Modifiers.HasAlt(mods40)) { ClearExtraCarets(); MoveLineDown(); CheckErrors(); }
+            else if (Modifiers.HasAlt(mods40)) { if (CanMutate()) { ClearExtraCarets(); MoveLineDown(); CheckErrors(); } }
             else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods40)); MoveDown(); }
             app.RequestRedraw();
         }
@@ -352,7 +382,9 @@ public partial class CodeEditor {
             int vis = pageRows;
             bool sh = Modifiers.HasShift(modifiers);
             acActive = false; ClearExtraCarets(); SelPrepare(sh);
-            int np = curLine + vis; if (np > lines.Count - 1) { np = lines.Count - 1; }
+            int np = curLine + vis;
+            if (lines != null && np > lines.Count - 1) { np = lines.Count - 1; }
+            if (np < 0) { np = 0; }
             curLine = np; ClampCol(); app.RequestRedraw();
         }
         else if (kc == 36) {
@@ -367,19 +399,23 @@ public partial class CodeEditor {
             EndUndoGroup();
             int m35 = modifiers;
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m35));
-            if (Modifiers.HasCtrl(m35)) { curLine = lines.Count - 1; }
-            curCol = lines[curLine].Length;
+            if (lines != null && lines.Count > 0) {
+                if (Modifiers.HasCtrl(m35)) { curLine = lines.Count - 1; }
+                if (curLine >= 0 && curLine < lines.Count) { curCol = lines[curLine].Length; }
+            }
             app.RequestRedraw();
         }
         else if (kc == 8) {
             // 退格键 (VK_BACK = 8)：消费后续 kind==6 的 WM_CHAR 字符事件（code==8），防双重删除
             ateCtrlKey = true;
+            if (!CanMutate()) { return; }
             EndUndoGroup();
             HandleBackspace(app);
             return;
         }
         else if (kc == 46) {
             ateCtrlKey = true;
+            if (!CanMutate()) { return; }
             EndUndoGroup();
             if (selActive || HasSelection()) {
                 ClearExtraCarets();

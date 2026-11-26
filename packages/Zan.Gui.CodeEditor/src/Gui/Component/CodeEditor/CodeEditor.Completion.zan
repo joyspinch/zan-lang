@@ -10,6 +10,7 @@ partial class CodeEditor {
 
     // 列表 `xs` 已包含 `v` 时返回 true。
     public static bool Has(List<string> xs, string v) {
+        if (xs == null) { return false; }
         for (int i = 0; i < xs.Count; i = i + 1) {
             if (xs[i] == v) { return true; }
         }
@@ -19,6 +20,7 @@ partial class CodeEditor {
     // `s` 以 `pre` 开头时返回 true。按字节比：扫描路径会对每行
     // 调用它，而 Substring 要为每次测试分配一个字符串。
     public static bool StartsWithP(string s, string pre) {
+        if (s == null || pre == null) { return false; }
         int n = pre.Length;
         if (n > s.Length) { return false; }
         for (int i = 0; i < n; i = i + 1) {
@@ -29,6 +31,7 @@ partial class CodeEditor {
 
     // 把语言关键字追加到 `outk`。
     public static void KeywordList(List<string> outk) {
+        if (outk == null) { return; }
         string kws = "using namespace class struct enum interface static extern void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
         int n = kws.Length;
         int i = 0;
@@ -47,6 +50,7 @@ partial class CodeEditor {
     // 线性查找，于是一次收集是 词数×字符数 的平方级）。
     public static void CollectWordsRange(List<string> ls, int from, int to,
                                   List<string> outw) {
+        if (ls == null || outw == null) { return; }
         Dict<string, bool> seen = new Dict<string, bool>();
         for (int i = 0; i < outw.Count; i = i + 1) {
             if (!seen.ContainsKey(outw[i])) { seen.Add(outw[i], true); }
@@ -55,6 +59,7 @@ partial class CodeEditor {
         if (to > ls.Count) { to = ls.Count; }
         for (int li = from; li < to; li = li + 1) {
             string line = ls[li];
+            if (line == null) { continue; }
             int n = line.Length;
             int i = 0;
             while (i < n) {
@@ -146,6 +151,7 @@ partial class CodeEditor {
     // 未过滤的候选列表至少包含一个
     // 指定种类条目时返回 true（用于灰显不可用的过滤按钮）。
     bool HasKind(string kind) {
+        if (acAllCandidates == null) { return false; }
         for (int i = 0; i < acAllCandidates.Count; i = i + 1) {
             if (acAllCandidates[i].kind == kind) { return true; }
         }
@@ -157,7 +163,12 @@ partial class CodeEditor {
 
     // 即使尚未输入前缀。若处于字符串或注释内则绝对不打开。
     void ForceCompletion() {
+        if (!CanMutate() || lines == null || curLine < 0 || curLine >= lines.Count) {
+            DismissCompletion();
+            return;
+        }
         if (InStringOrCommentContext()) { return; }
+        ClampCol();
         acDot = false;
         acActive = true;
         acForced = true;
@@ -275,10 +286,11 @@ partial class CodeEditor {
         if (items == null) { return true; }
         for (int i = 0; i < items.Count; i = i + 1) {
             CodeCompletionItem item = items[i];
+            if (item == null || item.label == null) { continue; }
             int score = CodeEditor.MatchScore(item.label, prefix);
             if (score < 0 || taken.ContainsKey(item.label)) { continue; }
             taken[item.label] = true;
-            string kind = item.kind.Length > 0 ? item.kind : "M";
+            string kind = (item.kind != null && item.kind.Length > 0) ? item.kind : "M";
             CeCandidateItem candidate = new CeCandidateItem(item.label, kind);
             candidate.semantic = item;
             acAllCandidates.Add(candidate);
@@ -294,6 +306,11 @@ partial class CodeEditor {
     // DllImport/StructLayout）与周边词按匹配度打分合并，排序后截断
     // 再套种类过滤。无候选时收起弹窗。
     void UpdateCompletion() {
+        if (!CanMutate() || lines == null || curLine < 0 || curLine >= lines.Count) {
+            DismissCompletion();
+            return;
+        }
+        ClampCol();
         CancelSemanticCompletion();
         CaptureCompletionSource();
         // 弹窗已经关掉了：片段选择器模式随之结束（否则之后的打字
@@ -304,10 +321,13 @@ partial class CodeEditor {
         if (!acForced && InStringOrCommentContext()) { DismissCompletion(); return; }
 
         string ln = lines[curLine];
+        if (ln == null) { DismissCompletion(); return; }
 
         // 若处于点号模式，按输入的前缀过滤完整成员列表
         if (acDot) {
-            if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
+            if (acStart > curCol || acStart < 0 || acStart > ln.Length) { acActive = false; acDot = false; return; }
+            acStart = Text.ClampCharStart(ln, acStart);
+            if (acStart > curCol) { acActive = false; acDot = false; return; }
             string prefix = ln.Substring(acStart, curCol - acStart);
             acAllCandidates = new List<CeCandidateItem>();
             List<int> dscores = new List<int>();
@@ -317,14 +337,16 @@ partial class CodeEditor {
             if (!ScoreExternalCompletion(prefix, taken, dscores)) { acActive = false; return; }
 
             // 2. 用本地已知的原生成员作为补充与兜底，去重合并
-            for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
-                string mName = acFull[fi];
-                if (taken.ContainsKey(mName)) { continue; }
-                int sc = CodeEditor.MatchScore(mName, prefix);
-                if (sc >= 0) {
-                    taken[mName] = true;
-                    acAllCandidates.Add(new CeCandidateItem(mName, CodeEditor.MemberKind(mName)));
-                    dscores.Add(sc + CodeEditor.KindWeight(CodeEditor.MemberKind(mName)) + 500); // 兜底候选项
+            if (acFull != null) {
+                for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
+                    string mName = acFull[fi];
+                    if (mName == null || taken.ContainsKey(mName)) { continue; }
+                    int sc = CodeEditor.MatchScore(mName, prefix);
+                    if (sc >= 0) {
+                        taken[mName] = true;
+                        acAllCandidates.Add(new CeCandidateItem(mName, CodeEditor.MemberKind(mName)));
+                        dscores.Add(sc + CodeEditor.KindWeight(CodeEditor.MemberKind(mName)) + 500); // 兜底候选项
+                    }
                 }
             }
 
@@ -476,9 +498,14 @@ partial class CodeEditor {
     // 属性，*Changed/*Click → 事件，否则为方法。
 
     void AcceptCompletion(bool viaTab) {
+        if (!CanMutate()) { DismissCompletion(); return; }
         CancelSemanticCompletion();
         if (!acActive) { return; }
-        if (acSel < 0 || acSel >= acItems.Count) { acActive = false; return; }
+        if (lines == null || acItems == null || acVisibleCandidates == null
+            || acSel < 0 || acSel >= acItems.Count || acSel >= acVisibleCandidates.Count) {
+            acActive = false;
+            return;
+        }
         if (!CompletionSourceCurrent()) { acActive = false; acDot = false; return; }
         CeCandidateItem candidate = acVisibleCandidates[acSel];
         string chosen = candidate.item;
@@ -507,10 +534,13 @@ partial class CodeEditor {
             }
             if (sL < 0 || eL < sL || eL >= lines.Count
                 || sC < 0 || sC > lines[sL].Length
-                || eC < 0 || eC > lines[eL].Length) { acActive = false; return; }
+                || eC < 0 || eC > lines[eL].Length
+                || (sL == eL && eC < sC)
+                || Text.ClampCharStart(lines[sL], sC) != sC
+                || Text.ClampCharStart(lines[eL], eC) != eC) { acActive = false; return; }
             SaveUndo();
             ClearExtraCarets();
-            InsertSnippet(semantic.insertText, sL, sC, eL, eC);
+            InsertSnippet(semantic.insertText != null ? semantic.insertText : "", sL, sC, eL, eC);
             BumpTextVersion();
             acActive = false;
             acDot = false;
@@ -524,7 +554,9 @@ partial class CodeEditor {
         int endLine = curLine;
         int endCol = curCol;
         if (semantic != null) {
-            if (semantic.hasTextEdit || semantic.insertText.Length > 0) { chosen = semantic.insertText; }
+            if (semantic.hasTextEdit || (semantic.insertText != null && semantic.insertText.Length > 0)) {
+                chosen = semantic.insertText != null ? semantic.insertText : "";
+            }
             if (semantic.hasTextEdit) {
                 startLine = semantic.startLine; startCol = semantic.startCol;
                 endLine = semantic.endLine; endCol = semantic.endCol;
@@ -542,18 +574,24 @@ partial class CodeEditor {
                 || Text.ClampCharStart(lines[endLine], endCol) != endCol) {
                 acActive = false; acDot = false; return;
             }
+        } else {
+            startCol = Text.ClampCharStart(lines[startLine], startCol);
+            endCol = Text.ClampCharStart(lines[endLine], endCol);
+            if (startLine == endLine && endCol < startCol) { acActive = false; return; }
         }
         SaveUndo();
         ClearExtraCarets();
         string left = Text.Left(lines[startLine], startCol);
         string right = Text.Right(lines[endLine], endCol);
-        List<string> inserted = CodeEditor.SplitLines(chosen);
+        List<string> inserted = CodeEditor.SplitLines(chosen != null ? chosen : "");
+        if (inserted.Count == 0) { inserted.Add(""); }
         for (int line = endLine; line > startLine; line = line - 1) { lines.RemoveAt(line); }
         lines[startLine] = left + inserted[0];
         for (int i = 1; i < inserted.Count; i = i + 1) { lines.Insert(startLine + i, inserted[i]); }
         curLine = startLine + inserted.Count - 1;
         curCol = inserted.Count == 1 ? left.Length + inserted[0].Length : inserted[inserted.Count - 1].Length;
         lines[curLine] = lines[curLine] + right;
+        ClampCol();
         selActive = false;
         BumpTextVersion();
         acActive = false;
@@ -567,11 +605,13 @@ partial class CodeEditor {
     // 有扩展时插入并返回 true；否则返回 false（调用方回退为缩进空格）。
     // 只用同步来源，不发起语义（LSP）补全请求。
     bool TryCompleteWord() {
-        if (carets.Count > 0) { return false; }
-        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        if (!CanMutate()) { return false; }
+        if (carets != null && carets.Count > 0) { return false; }
+        if (lines == null || curLine < 0 || curLine >= lines.Count) { return false; }
         if (InStringOrCommentContext()) { return false; }
+        ClampCol();
         string ln = lines[curLine];
-        if (curCol > ln.Length) { return false; }
+        if (ln == null || curCol > ln.Length) { return false; }
         if (curCol < ln.Length && CodeEditor.IsIdentByte(ln[curCol] & 255)) { return false; }
         int st = curCol;
         while (st > 0 && CodeEditor.IsIdentByte(ln[st - 1] & 255)) { st = st - 1; }
@@ -582,7 +622,7 @@ partial class CodeEditor {
         if (cbCandidates != null) {
             for (int i = 0; i < cbCandidates.Count; i = i + 1) {
                 string lab = cbCandidates[i].item;
-                if (lab.StartsWith(pfx) && lab.Length > pfx.Length) { labels.Add(lab); }
+                if (lab != null && lab.StartsWith(pfx) && lab.Length > pfx.Length) { labels.Add(lab); }
             }
         }
         List<string> words = new List<string>();
@@ -598,6 +638,7 @@ partial class CodeEditor {
             int keep = 0;
             int max = lcp.Length < other.Length ? lcp.Length : other.Length;
             while (keep < max && lcp[keep] == other[keep]) { keep = keep + 1; }
+            keep = Text.ClampCharStart(lcp, keep);
             lcp = lcp.Substring(0, keep);
         }
         if (lcp.Length <= pfx.Length) { return false; }
@@ -609,24 +650,27 @@ partial class CodeEditor {
     // 不适用（无候选、语义 insertText/textEdit、片段、来源过期
     // 或标签不以已输入前缀开头）时返回空。
     string GhostExtension() {
-        if (!acActive || acVisibleCandidates == null || acItems == null) { return ""; }
-        if (acSel < 0 || acSel >= acItems.Count) { return ""; }
+        if (!CanMutate() || !acActive || acVisibleCandidates == null || acItems == null || lines == null) { return ""; }
+        if (acSel < 0 || acSel >= acItems.Count || acSel >= acVisibleCandidates.Count) { return ""; }
         if (!CompletionSourceCurrent()) { return ""; }
         CeCandidateItem candidate = acVisibleCandidates[acSel];
         if (candidate.semantic != null &&
-            (candidate.semantic.hasTextEdit || candidate.semantic.insertText.Length > 0)) {
+            (candidate.semantic.hasTextEdit || (candidate.semantic.insertText != null && candidate.semantic.insertText.Length > 0))) {
             return "";
         }
         if (candidate.kind == "S") { return ""; }
         if (acStart < 0 || acStart > curCol || curLine < 0 || curLine >= lines.Count) { return ""; }
         string ln = lines[curLine];
-        if (curCol > ln.Length) { return ""; }
-        string typed = ln.Substring(acStart, curCol - acStart);
+        if (ln == null || curCol > ln.Length) { return ""; }
+        int safeStart = Text.ClampCharStart(ln, acStart);
+        int safeCol = Text.ClampCharStart(ln, curCol);
+        if (safeStart > safeCol) { return ""; }
+        string typed = ln.Substring(safeStart, safeCol - safeStart);
         string label = candidate.item;
-        if (label.Length <= typed.Length) { return ""; }
+        if (label == null || label.Length <= typed.Length) { return ""; }
         if (!label.StartsWith(typed)) { return ""; }
         string ext = label.Substring(typed.Length);
-        if (ext.Length > 64) { ext = ext.Substring(0, 64); }
+        if (ext.Length > 64) { ext = ext.Substring(0, Text.ClampCharStart(ext, 64)); }
         return ext;
     }
 

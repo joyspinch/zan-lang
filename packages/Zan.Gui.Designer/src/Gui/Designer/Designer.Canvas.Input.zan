@@ -12,7 +12,7 @@ partial class Designer {
     bool canvasSameClickField;
 
     bool HandleCanvasKey(App app, RoutedEventArgs e) {
-        if (preview || this.BigEditorOpen() || this.CanvasInputLocked()
+        if (app == null || e == null || preview || this.BigEditorOpen() || this.CanvasInputLocked()
         || (e.eventName != "KeyDown" && e.eventName != "KeyUp" && e.eventName != "TextInput")) { return false; }
         if (e.eventName == "TextInput") {
             int cc = e.keyCode;
@@ -218,9 +218,10 @@ partial class Designer {
     }
 
     bool CanvasInputLocked() {
+        App app = this.hostApp;
         return this.BigEditorOpen() || inlineRenaming || canvasMenuOpen || quickInsertOpen || keymapHelpOpen
         || zoomMenuOpen || dpiMenuOpen || ribbonMenuOpen || activeEventDropdown != ""
-        || (hostApp != null && hostApp.HasOverlays());
+        || (app != null && app.HasOverlays());
     }
 
     public void InitializeCanvasInput(App app) {
@@ -246,13 +247,14 @@ partial class Designer {
         if (app == null || region == null || region.width <= 0 || region.height <= 0) {
             this.RetireCanvasInput(); return;
         }
-        if (canvasView != null && (hostApp != app || !canvasView.IsActive())) { this.RetireCanvasInput(); }
+        App prevApp = this.hostApp;
+        if (canvasView != null && (prevApp != app || !canvasView.IsActive())) { this.RetireCanvasInput(); }
         hostApp = app;
         canvasHostRect = region;
         this.InitializeCanvasInput(app);
-        canvasInputHost.Bind(app);
-        designerSurfaceHost.Bind(app);
-        designerSurface.Arrange(region.x, region.y, region.width, region.height);
+        if (canvasInputHost != null) { canvasInputHost.Bind(app); }
+        if (designerSurfaceHost != null) { designerSurfaceHost.Bind(app); }
+        if (designerSurface != null) { designerSurface.Arrange(region.x, region.y, region.width, region.height); }
         this.PrepareView(canvasView, app);
     }
 
@@ -270,15 +272,15 @@ partial class Designer {
 
     public void PrepareView(UiViewScope view, App app) {
         if (this.PrepareInspectorView(view, app)) { return; }
-        if (view != canvasView || canvasInput == null || canvasHostRect == null) { return; }
+        if (app == null || view != canvasView || canvasInput == null || canvasHostRect == null) { return; }
         DesignerCanvasInput preparing = canvasInput;
         this.SyncEditorWindowState();
         // 模态弹层每帧绘制遮罩时会把焦点重写到遮罩 id 上
         //（App.BlockHitsBelow），快捷插入输入框的键盘焦点帧尾即被夺走。
         // prepare 相每帧重申，输入相的按键（方向键/回车/文本）才能路由回
         // 输入框；与画布指针按下路径对 canvasInput 的 SetFocused 同一先例。
-        if (app != null && app.focus != null && quickInsertOpen
-        && quickInsertWin != null && quickInsertWin.open) {
+        if (app.focus != null && quickInsertOpen
+        && quickInsertWin != null && quickInsertWin.open && quickInsertInput != null) {
             app.focus.SetFocused(quickInsertInput.WidgetId(), quickInsertInput);
         }
         canvasInput.ready = false;
@@ -304,7 +306,7 @@ partial class Designer {
         if (this.InspectorPointer(sender, e)) { return; }
         DesignerCanvasInput input = canvasInput;
         App app = hostApp;
-        if (input == null || app == null || sender != input) { return; }
+        if (input == null || app == null || e == null || sender != input) { return; }
         if (e.eventName == "PointerCancel") { this.CancelCanvasGesture(); return; }
         if (!input.ready || this.CanvasInputLocked()) { return; }
         if (this.HandleCanvasKey(app, e)) { return; }
@@ -340,7 +342,7 @@ partial class Designer {
         bool keyEvent = e.eventName == "KeyDown" || e.eventName == "KeyUp" || e.eventName == "TextInput";
         if (preview && (pointerEvent || keyEvent) && !freeHand && !spacePressed && !freePanning
         && !(e.eventName == "Wheel" && Modifiers.HasCtrl(e.modifiers))
-        && app.window.EventButton() != 2) {
+        && (app.window == null || app.window.EventButton() != 2)) {
             bool inside = this.InRect(e.x, e.y, input.ox, input.oy, input.viewW, input.viewH);
             this.ProcessDesignPreviewInput(app, this.DesignPointerPx(e.x, input.ox, input.ps),
             this.DesignPointerPx(e.y, input.oy, input.ps), inside);
@@ -350,11 +352,14 @@ partial class Designer {
             e.Handle(); return;
         }
         if (e.eventName == "Wheel") {
-            canvasInputDispatch = true;
-            try {
-                this.HandleCanvasZoom(app, false, input.inX, input.inY, input.inW, input.inH,
-                input.ox, input.oy, pvDocForm.GetApp().canvas);
-            } finally { canvasInputDispatch = false; }
+            Canvas pvCanvas = (pvDocForm != null && pvDocForm.GetApp() != null) ? pvDocForm.GetApp().canvas : null;
+            if (pvCanvas != null) {
+                canvasInputDispatch = true;
+                try {
+                    this.HandleCanvasZoom(app, false, input.inX, input.inY, input.inW, input.inH,
+                    input.ox, input.oy, pvCanvas);
+                } finally { canvasInputDispatch = false; }
+            }
             e.Handle(); return;
         }
         int kind = 0;
@@ -397,8 +402,8 @@ partial class Designer {
                 canvasSameClickField = canvasClickField == released;
                 canvasClickField = canvasClickBlocked ? null : released;
                 canvasPressField = null;
-                Rect region = this.CanvasRegion(app, canvasHostRect);
-                if (dragging && dragFromPalette && FormField.IsNonVisualOf(dragKind)
+                Rect region = canvasHostRect != null ? this.CanvasRegion(app, canvasHostRect) : null;
+                if (region != null && dragging && dragFromPalette && FormField.IsNonVisualOf(dragKind)
                 && this.InRect(e.x, e.y, region.x, region.y + region.height + app.Scale(8), region.width, app.Scale(46))) {
                     activeContainer = null; this.AddField(dragKind); palClickPending = false;
                     dragging = false; dragFromPalette = false; dragMoved = false; dropContainer = null;
@@ -420,6 +425,7 @@ partial class Designer {
     }
 
     Rect CanvasRegion(App app, Rect host) {
+        if (app == null || host == null) { return new Rect(0, 0, 0, 0); }
         int pad = app.Scale(12);
         int avail = host.width - pad * 5;
         if (avail < app.Scale(80)) { avail = app.Scale(80); }
@@ -430,7 +436,8 @@ partial class Designer {
             int side = avail - minCan;
             if (side < 0) { side = 0; }
             int sum = palW + inspW;
-            palW = side * palW / sum; inspW = side - palW;
+            if (sum > 0) { palW = side * palW / sum; }
+            inspW = side - palW;
             if (palW < app.Scale(130)) { inspW = inspW + palW; palW = 0; }
             if (inspW < app.Scale(190)) { palW = palW + inspW; inspW = 0; }
             if (palW > 0 && palW < app.Scale(130)) { palW = 0; }
@@ -442,7 +449,9 @@ partial class Designer {
         if (hostPanels) { left = host.x + pad; }
         int top = host.y + app.Scale(6) + this.RibbonH(app) + app.Scale(6);
         int bottom = host.y + host.height - app.Scale(32) - app.Scale(4);
-        return new Rect(left, top, width, bottom - top - app.Scale(46) - app.Scale(8));
+        int regH = bottom - top - app.Scale(46) - app.Scale(8);
+        if (regH < 0) { regH = 0; }
+        return new Rect(left, top, width, regH);
     }
 
     void CancelCanvasGesture() {
@@ -458,10 +467,17 @@ partial class Designer {
         if (!dragging) { return; }
         if (dragFromPalette && !dragMoved) { this.PalClickRelease(); }
         palClickPending = false; dragging = false; dragFromPalette = false; dragMoved = false;
-        dragIndex = -1; dragUserComp = -1; dropContainer = null; app.RequestRedraw();
+        dragIndex = -1; dragUserComp = -1; dropContainer = null;
+        if (app != null) { app.RequestRedraw(); }
     }
     void UpdateCanvasGeometry(App app, int cx, int cy, int cw, int ch, DesignerCanvasInput input) {
+        if (app == null || input == null || pvDocForm == null || pvDocForm.GetApp() == null) { return; }
         Canvas source = pvDocForm.GetApp().canvas;
+        if (source == null) { return; }
+        int srcW = source.Width();
+        int srcH = source.Height();
+        if (srcW < 1) { srcW = 1; }
+        if (srcH < 1) { srcH = 1; }
 
         int inX = cx + app.Scale(12);
         int inY = cy + app.Scale(10);
@@ -473,8 +489,8 @@ partial class Designer {
         int psMilli;
         int effZoom = winZoom;
         if (effZoom <= 0) {
-            int fitX = inW * 1000 / source.Width();
-            int fitY = inH * 1000 / source.Height();
+            int fitX = inW * 1000 / srcW;
+            int fitY = inH * 1000 / srcH;
             effZoom = fitX;
             if (fitY < effZoom) { effZoom = fitY; }
             if (effZoom > 1000) { effZoom = 1000; }
@@ -484,8 +500,8 @@ partial class Designer {
         lastFitPct = effZoom;
         psMilli = effZoom * this.DesignDpi() / 100;
         if (psMilli < 1) { psMilli = 1; }
-        int cw2 = this.DesignViewPx(source.Width(), psMilli);
-        int ch2 = this.DesignViewPx(source.Height(), psMilli);
+        int cw2 = this.DesignViewPx(srcW, psMilli);
+        int ch2 = this.DesignViewPx(srcH, psMilli);
 
         int panMaxX = (cw2 - inW) / 2 + inW / 2;
         int panMaxY = (ch2 - inH) / 2 + inH / 2;

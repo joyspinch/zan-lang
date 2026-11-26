@@ -5,7 +5,8 @@ using Gui;
 namespace Gui.Component.CodeEditor;
 
 partial class CodeEditor {
-    App analysisApp;
+    weak App analysisApp;
+    weak AppLoopRegistration analysisLoopRegistration;
     CeAnalysisLease analysisLease;
     CeAnalysisSnapshot analysisRunning;
     CeAnalysisSnapshot analysisApplied;
@@ -32,14 +33,34 @@ partial class CodeEditor {
     CeAnalysisSnapshot workerSnapshot;
     bool workerBufferTypesReady;
 
+    void EnsureAnalysisLifecycle(App app) {
+        if (analysisDetached || app == null || !app.isRunning) { return; }
+        AppLoopRegistration reg = analysisLoopRegistration;
+        if (reg != null && reg.active && reg.host == app) { return; }
+        if (reg != null) { reg.Invalidate(); }
+        analysisLoopRegistration = app.RegisterLoopParticipant(this, new CodeEditorAnalysisLifecycle(this));
+    }
+
+    internal void OnAnalysisAppStopped(App app) {
+        App current = analysisApp;
+        if (current == null || current == app) {
+            DetachAnalysis();
+        }
+    }
+
     // UI 接线时调用。即时模式编辑器没有 Control 的隐式卸载钩子。
     void AttachAnalysis(App app) {
-        if (analysisApp == app && analysisLease != null) { return; }
+        App current = analysisApp;
+        if (current == app && analysisLease != null) {
+            EnsureAnalysisLifecycle(app);
+            return;
+        }
         DetachAnalysis();
         analysisApp = app;
         if (app == null) { return; }
         analysisDetached = false;
-        analysisLease = new CeAnalysisLease();
+        analysisLease = new CeAnalysisLease(this);
+        EnsureAnalysisLifecycle(app);
         // 共享只读表在 UI 上发布，避免多个分析线程同时初始化静态槽。
         CodeEditor.EnsureNsTable();
         RequestAnalysis();
@@ -48,9 +69,13 @@ partial class CodeEditor {
     // UI 关闭/解绑时调用；迟到 Post 的 lease 校验必然失败。
     void DetachAnalysis() {
         analysisDetached = true;
+        AppLoopRegistration reg = analysisLoopRegistration;
+        analysisLoopRegistration = null;
+        if (reg != null) { reg.Invalidate(); }
         if (analysisRunning != null) { analysisRunning.cancelled.Store(1); }
         analysisRunning = null;
         analysisApplied = null;
+        if (analysisLease != null) { analysisLease.owner = null; }
         analysisLease = null;
         analysisApp = null;
         analysisQueued = false;
@@ -77,7 +102,7 @@ partial class CodeEditor {
     // worker 调用：拆全文在这里完成，不访问 App/编辑器。
     public static CodeEditorPreparedText PrepareText(string text) {
         CodeEditorPreparedText prepared = new CodeEditorPreparedText();
-        prepared.lines = CodeEditor.SplitLines(text);
+        prepared.lines = CodeEditor.SplitLines(text != null ? text : "");
         if (prepared.lines.Count == 0) { prepared.lines.Add(""); }
         prepared.text = string.Join("\n", prepared.lines);
         return prepared;
@@ -136,29 +161,31 @@ partial class CodeEditor {
 
     // O(1) 请求合并；不存在按绘制帧推进的扫描预算。
     void RequestAnalysis() {
-        if (analysisApp == null || analysisLease == null) { return; }
+        App app = analysisApp;
+        CeAnalysisLease lease = analysisLease;
+        if (app == null || lease == null) { return; }
         if (AnalysisSnapshotCurrent(analysisRunning) && analysisRunning.cancelled.Load() == 0) { return; }
         if (AnalysisSnapshotCurrent(analysisApplied)) { analysisWanted = false; return; }
         analysisWanted = true;
         if (analysisRunning != null) { analysisRunning.cancelled.Store(1); }
         if (analysisRunning != null || analysisQueued) { return; }
         analysisQueued = true;
-        App app = analysisApp;
-        CeAnalysisLease lease = analysisLease;
         app.Post(() => {
-            if (analysisApp != app || analysisLease != lease) { return; }
-            analysisQueued = false;
-            StartAnalysis();
+            CodeEditor ed = lease.owner;
+            if (ed == null || ed.analysisLease != lease) { return; }
+            ed.analysisQueued = false;
+            ed.StartAnalysis();
         }, "CodeEditor.StartAnalysis");
     }
 
     void StartAnalysis() {
-        if (analysisApp == null || analysisRunning != null || !analysisWanted) { return; }
+        App app = analysisApp;
+        if (app == null || analysisRunning != null || !analysisWanted) { return; }
         analysisWanted = false;
         CeAnalysisSnapshot snapshot = CaptureAnalysisSnapshot();
         snapshot.cancelled = new AtomicInt(0);
         analysisRunning = snapshot;
-        App app = analysisApp;
+        CeAnalysisLease lease = snapshot.lease;
         // Worker 只访问 snapshot/独立分析器。owner 方法仅在 Post 内运行。
         AtomicInt workers = analysisWorkers;
         workers.Increment();
@@ -166,18 +193,27 @@ partial class CodeEditor {
             try {
                 CeAnalysisResult result = CodeEditor.ComputeAnalysis(snapshot);
                 if (result != null && !CodeEditor.SnapshotCancelled(snapshot)) {
-                    app.Post(() => { ApplyAnalysis(snapshot, result); }, "CodeEditor.ApplyAnalysis");
+                    app.Post(() => {
+                        CodeEditor ed = lease != null ? lease.owner : null;
+                        if (ed != null) { ed.ApplyAnalysis(snapshot, result); }
+                    }, "CodeEditor.ApplyAnalysis");
                 }
                 CeAnalysisLensResult counts = null;
                 if (result != null && !CodeEditor.SnapshotCancelled(snapshot)) {
                     counts = CodeEditor.ComputeAnalysisLenses(snapshot, result.references);
                 }
                 CeAnalysisLensResult completed = counts;
-                app.Post(() => { CompleteAnalysis(snapshot, completed, ""); }, "CodeEditor.CompleteAnalysis");
+                app.Post(() => {
+                    CodeEditor ed = lease != null ? lease.owner : null;
+                    if (ed != null) { ed.CompleteAnalysis(snapshot, completed, ""); }
+                }, "CodeEditor.CompleteAnalysis");
             } catch (Exception ex) {
                 // 后台边界：报告失败并释放单任务槽，不把异常伪装为有效空结果。
                 string failure = ex.Message;
-                app.Post(() => { CompleteAnalysis(snapshot, null, failure); }, "CodeEditor.FailAnalysis");
+                app.Post(() => {
+                    CodeEditor ed = lease != null ? lease.owner : null;
+                    if (ed != null) { ed.CompleteAnalysis(snapshot, null, failure); }
+                }, "CodeEditor.FailAnalysis");
             } finally {
                 // UI 校验只读标量；任务的全文/项目输入在屏障归零前释放。
                 snapshot.lines = null;
@@ -195,8 +231,9 @@ partial class CodeEditor {
 
     public static CodeEditor AnalysisWorker(CeAnalysisSnapshot snapshot) {
         CodeEditor worker = new CodeEditor();
-        worker.lines = snapshot.lines;
-        worker.projFileSrc = snapshot.projectSources;
+        if (snapshot == null) { return worker; }
+        worker.lines = snapshot.lines != null ? snapshot.lines : new List<string>();
+        worker.projFileSrc = snapshot.projectSources != null ? snapshot.projectSources : new List<string>();
         worker.projScanDirty = snapshot.projectTypes == null;
         if (snapshot.projectTypes != null) { worker.projTypes = snapshot.projectTypes; }
         worker.extRefDirty = true;
@@ -227,6 +264,7 @@ partial class CodeEditor {
 
     // 可独立无头测试的纯计算入口；不读 UI、provider 或渲染时钟。
     public static CeAnalysisResult ComputeAnalysis(CeAnalysisSnapshot snapshot) {
+        if (snapshot == null) { return null; }
         CodeEditor worker = CodeEditor.AnalysisWorker(snapshot);
         List<string> imports = new List<string>();
         worker.ParseUsingsInto(imports);
@@ -248,10 +286,11 @@ partial class CodeEditor {
         result.fileNamespace = worker.analysisNamespace;
         result.highlights = new List<CeHlLine>();
         bool inBlock = false;
-        for (int i = 0; i < snapshot.lines.Count; i = i + 1) {
+        int lineCount = worker.lines.Count;
+        for (int i = 0; i < lineCount; i = i + 1) {
             if (worker.AnalysisCancelled()) { return null; }
             CeHlLine hl = new CeHlLine();
-            hl.src = snapshot.lines[i];
+            hl.src = worker.lines[i] != null ? worker.lines[i] : "";
             hl.blockIn = inBlock;
             hl.spans = new List<CodeSpan>();
             hl.blockOpen = CodeEditor.HighlightSpansLang(hl.src,
@@ -262,16 +301,18 @@ partial class CodeEditor {
             result.highlights.Add(hl);
         }
         result.signatures = new Dict<string, string>();
-        CodeEditor.CollectAnalysisSignatures(snapshot.lines, result.signatures);
-        for (int i = 0; i < snapshot.projectSources.Count; i = i + 1) {
+        CodeEditor.CollectAnalysisSignatures(worker.lines, result.signatures);
+        for (int i = 0; i < worker.projFileSrc.Count; i = i + 1) {
             if (worker.AnalysisCancelled()) { return null; }
             CodeEditor.CollectAnalysisSignatures(
-                CodeEditor.SplitLines(snapshot.projectSources[i]), result.signatures);
+                CodeEditor.SplitLines(worker.projFileSrc[i] != null ? worker.projFileSrc[i] : ""),
+                result.signatures);
         }
         return result;
     }
 
     public static void CollectAnalysisSignatures(List<string> source, Dict<string, string> signatures) {
+        if (source == null || signatures == null) { return; }
         for (int i = 0; i < source.Count; i = i + 1) {
             string line = CodeEditor.TrimStr(source[i]);
             string name = CodeEditor.MemberDeclName(line);
@@ -283,6 +324,7 @@ partial class CodeEditor {
 
     // 较慢的项目引用统计单独发布，不能扣住已完成的高亮/诊断。
     public static CeAnalysisLensResult ComputeAnalysisLenses(CeAnalysisSnapshot snapshot, CeFileIndex index) {
+        if (snapshot == null || index == null || index.decls == null) { return null; }
         CodeEditor worker = CodeEditor.AnalysisWorker(snapshot);
         worker.refIdx = index;
         worker.refStamp = snapshot.version;
@@ -294,11 +336,11 @@ partial class CodeEditor {
         for (int i = 0; i < index.decls.Count; i = i + 1) {
             if (worker.AnalysisCancelled()) { return null; }
             string name = index.decls[i];
-            if (name.Length == 0) { continue; }
+            if (name == null || name.Length == 0) { continue; }
             List<int> hits = new List<int>();
             int count = worker.ScanRefs(name, i, hits);
-            string owner = i < index.owners.Count ? index.owners[i] : "";
-            if (owner.Length > 0) { count = count + worker.ExternRefCount(owner, name); }
+            string owner = index.owners != null && i < index.owners.Count ? index.owners[i] : "";
+            if (owner != null && owner.Length > 0) { count = count + worker.ExternRefCount(owner, name); }
             result.counts.Add(i, count);
             result.references.Add(i, hits);
         }
@@ -373,6 +415,7 @@ partial class CodeEditor {
             || refIdx.decls[declaration] != name
             || !analysisReferenceLines.ContainsKey(declaration)) { return 0; }
         List<int> hits = analysisReferenceLines[declaration];
+        if (hits == null) { return 0; }
         if (output != null) {
             for (int i = 0; i < hits.Count; i = i + 1) { output.Add(hits[i]); }
         }
