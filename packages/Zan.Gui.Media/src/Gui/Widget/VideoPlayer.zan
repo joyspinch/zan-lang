@@ -25,6 +25,8 @@ public class VideoPlayer : Control, IDisposable {
     private string currentKey = "";
     private string keyPrefix = "";
     private bool scrubbing = false;
+    private bool disposed = false;
+    private weak AppLoopRegistration loopRegistration = null;
 
     private static int nextPlayerId = 1;
 
@@ -58,25 +60,37 @@ public class VideoPlayer : Control, IDisposable {
     }
 
     public void Play() {
+        if (this.disposed) return;
         this.ResolveSource();
         if (this.session != null) { this.session.Play(); }
+        this.RequestRedraw();
     }
 
     public void Pause() {
         if (this.session != null) { this.session.Pause(); }
+        this.RequestRedraw();
     }
 
     public void TogglePause() {
+        if (this.disposed) return;
         this.ResolveSource();
         if (this.session != null) { this.session.TogglePause(); }
+        this.RequestRedraw();
     }
 
     public void Stop() {
         if (this.session != null) { this.session.Stop(); }
+        this.RequestRedraw();
     }
 
     public void SeekMs(long targetMs) {
-        if (this.session != null) { this.session.SeekMs(targetMs); }
+        if (this.disposed) return;
+        this.ResolveSource();
+        if (this.session != null) {
+            this.session.SeekMs(targetMs);
+            this.SyncFrameToKey();
+        }
+        this.RequestRedraw();
     }
 
     public void SetVolume(double vol) {
@@ -87,31 +101,49 @@ public class VideoPlayer : Control, IDisposable {
         if (this.session != null) { this.session.SetSpeed(speed); }
     }
 
-    private void ResolveSource() {
-        string src = this.Src != null ? this.Src.Get() : "";
-        if (src == null) src = "";
-        if (this.resolvedSrc != null && src == this.resolvedSrc) return;
-        this.resolvedSrc = src;
+    private void EnsureLifecycleHook(App app) {
+        if (this.disposed || app == null || !app.isRunning) return;
+        AppLoopRegistration reg = this.loopRegistration;
+        if (reg != null && reg.active && reg.host == app) return;
+        if (reg != null) { reg.Invalidate(); }
+        this.loopRegistration = app.RegisterLoopParticipant(this, new VideoPlayerLifecycle(this));
+    }
+
+    private void ReleaseTextures() {
         this.publishedVersion = -1;
+        this.keySlot = 0;
         if (this.currentKey != "") {
             Canvas.EvictImage(this.keyPrefix + "0");
             Canvas.EvictImage(this.keyPrefix + "1");
             this.currentKey = "";
         }
+    }
+
+    private void ResolveSource() {
+        if (this.disposed) return;
+        string src = this.Src != null ? this.Src.Get() : "";
+        if (src == null) src = "";
+        if (this.resolvedSrc != null && src == this.resolvedSrc) return;
+        this.resolvedSrc = src;
+        this.ReleaseTextures();
+        if (this.session != null) {
+            this.session.Close();
+        }
+        if (src == "") {
+            this.RequestRedraw();
+            return;
+        }
         if (this.session == null) {
             this.session = new MediaPlaybackSession();
         }
         this.session.Loop = this.Loop;
-        if (src == "") {
-            this.session.Close();
-            return;
-        }
         if (this.session.Open(src)) {
             this.SyncFrameToKey();
             if (this.AutoPlay) {
                 this.session.Play();
             }
         }
+        this.RequestRedraw();
     }
 
     private void SyncFrameToKey() {
@@ -130,6 +162,20 @@ public class VideoPlayer : Control, IDisposable {
         return app.Scale(36);
     }
 
+    private bool IsControlBarVisible(App app) {
+        return this.ShowControls && this.bh >= app.Scale(64);
+    }
+
+    private void ComputeTrackBounds(App app, string timeText, out int trackX, out int trackW, out int timeX) {
+        int pad = app.Scale(10);
+        int fs = Style.FontFallback(app, "small");
+        int btnW = app.Scale(28);
+        int timeW = Canvas.MeasureText(timeText, fs);
+        timeX = this.bx + this.bw - pad - timeW;
+        trackX = this.bx + pad + btnW + pad;
+        trackW = timeX - pad - trackX;
+    }
+
     private static string FormatTimeMs(long ms) {
         if (ms < 0) ms = 0;
         long totalSec = ms / 1000;
@@ -143,7 +189,10 @@ public class VideoPlayer : Control, IDisposable {
     }
 
     public override void OnMeasure(App app) {
-        this.ResolveSource();
+        if (!this.disposed) {
+            this.EnsureLifecycleHook(app);
+            this.ResolveSource();
+        }
         StyleBox s = this.ResolveStyleAs(app, "video-player", Class, Style.SNormal());
         int cssW = s.WidthOr(-1);
         int cssH = s.HeightOr(-1);
@@ -159,6 +208,8 @@ public class VideoPlayer : Control, IDisposable {
     }
 
     public override void OnPaint(App app) {
+        if (this.disposed) return;
+        this.EnsureLifecycleHook(app);
         this.ResolveSource();
         if (this.bw <= 0 || this.bh <= 0) return;
 
@@ -168,19 +219,22 @@ public class VideoPlayer : Control, IDisposable {
         }
 
         Canvas c = app.canvas;
-        // 黑色影院底
-        c.FillRect(this.bx, this.by, this.bw, this.bh, (int)0xFF101216);
+        // 黑色影院底（派生自主题 scrim，保证明暗皮肤下视频对比度一致）
+        c.FillRect(this.bx, this.by, this.bw, this.bh, ColorMath.WithAlpha(app.theme.scrim, 255));
 
         if (this.currentKey != "" && this.session != null
             && this.session.VideoWidth > 0 && this.session.VideoHeight > 0) {
             this.BlitVideo(c, this.session.VideoWidth, this.session.VideoHeight);
         }
 
-        if (this.ShowControls && this.bh >= app.Scale(64)) {
+        if (this.IsControlBarVisible(app)) {
             this.PaintControlBar(app, c);
         }
 
-        if (this.session != null && this.session.State == PlaybackState.Playing) {
+        if (this.session != null
+            && (this.session.State == PlaybackState.Playing
+                || this.session.HasPendingSeek
+                || (this.session.FrameVersion > 0 && this.session.FrameVersion != this.publishedVersion))) {
             app.RequestRedraw();
         }
     }
@@ -210,7 +264,7 @@ public class VideoPlayer : Control, IDisposable {
     private void PaintControlBar(App app, Canvas c) {
         int barH = this.ControlBarHeight(app);
         int barY = this.by + this.bh - barH;
-        c.FillRect(this.bx, barY, this.bw, barH, (int)0xB80E1014);
+        c.FillRect(this.bx, barY, this.bw, barH, ColorMath.WithAlpha(app.theme.scrim, 184));
 
         int pad = app.Scale(10);
         int fs = Style.FontFallback(app, "small");
@@ -218,60 +272,63 @@ public class VideoPlayer : Control, IDisposable {
 
         bool playing = this.session != null && this.session.State == PlaybackState.Playing;
         string btnText = playing ? "II" : ">";
-        int btnW = app.Scale(28);
-        c.DrawText(this.bx + pad + app.Scale(6), ty, btnText, (int)0xFFFFFFFF, fs);
+        c.DrawText(this.bx + pad + app.Scale(6), ty, btnText, app.theme.onScrim, fs);
 
         long pos = this.PositionMs;
         long dur = this.DurationMs;
         string timeText = VideoPlayer.FormatTimeMs(pos) + " / " + VideoPlayer.FormatTimeMs(dur);
-        int timeW = Canvas.MeasureText(timeText, fs);
-        int timeX = this.bx + this.bw - pad - timeW;
-        c.DrawText(timeX, ty, timeText, (int)0xFFDCE3EC, fs);
+        int trackX;
+        int trackW;
+        int timeX;
+        this.ComputeTrackBounds(app, timeText, out trackX, out trackW, out timeX);
+        c.DrawText(timeX, ty, timeText, ColorMath.ScaleAlpha(app.theme.onScrim, 850), fs);
 
-        int trackX = this.bx + pad + btnW + pad;
-        int trackW = timeX - pad - trackX;
         if (trackW > app.Scale(24)) {
             int trackH = app.Scale(6);
             int trackY = barY + (barH - trackH) / 2;
-            c.FillRect(trackX, trackY, trackW, trackH, (int)0x66FFFFFF);
+            c.FillRect(trackX, trackY, trackW, trackH, app.theme.scrimChipHover);
             if (dur > 0) {
                 int fillW = (int)((long)trackW * pos / dur);
                 if (fillW < 0) fillW = 0;
                 if (fillW > trackW) fillW = trackW;
-                c.FillRect(trackX, trackY, fillW, trackH, (int)0xFF3B82F6);
+                c.FillRect(trackX, trackY, fillW, trackH, app.theme.primary);
             }
         }
     }
 
     private void SeekByPointerX(App app, int px) {
         if (this.session == null || this.session.DurationMs <= 0) return;
-        int pad = app.Scale(10);
-        int fs = Style.FontFallback(app, "small");
-        int btnW = app.Scale(28);
         string timeText = VideoPlayer.FormatTimeMs(this.PositionMs) + " / " + VideoPlayer.FormatTimeMs(this.DurationMs);
-        int timeW = Canvas.MeasureText(timeText, fs);
-        int trackX = this.bx + pad + btnW + pad;
-        int trackW = (this.bx + this.bw - pad - timeW) - pad - trackX;
-        if (trackW <= 0) return;
+        int trackX;
+        int trackW;
+        int timeX;
+        this.ComputeTrackBounds(app, timeText, out trackX, out trackW, out timeX);
+        if (trackW <= app.Scale(24)) return;
         int rel = px - trackX;
         if (rel < 0) rel = 0;
         if (rel > trackW) rel = trackW;
         long target = (this.session.DurationMs * (long)rel) / (long)trackW;
         this.session.SeekMs(target);
+        this.SyncFrameToKey();
     }
 
     public override void OnPointerDown(RoutedEventArgs e) {
         App app = this.FindApp();
-        if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) return;
+        if (e.handled || this.disposed || this.IsDisabled() || app == null || app.window.EventButton() != 0) return;
         this.ResolveSource();
         int barH = this.ControlBarHeight(app);
         int barY = this.by + this.bh - barH;
-        if (this.ShowControls && e.y >= barY) {
+        if (this.IsControlBarVisible(app) && e.y >= barY) {
             int pad = app.Scale(10);
             int btnEnd = this.bx + pad + app.Scale(28) + pad;
+            string timeText = VideoPlayer.FormatTimeMs(this.PositionMs) + " / " + VideoPlayer.FormatTimeMs(this.DurationMs);
+            int trackX;
+            int trackW;
+            int timeX;
+            this.ComputeTrackBounds(app, timeText, out trackX, out trackW, out timeX);
             if (e.x <= btnEnd) {
                 this.TogglePause();
-            } else {
+            } else if (trackW > app.Scale(24) && e.x >= trackX && e.x <= trackX + trackW) {
                 this.scrubbing = true;
                 app.CapturePointer(this, true);
                 this.SeekByPointerX(app, e.x);
@@ -285,7 +342,15 @@ public class VideoPlayer : Control, IDisposable {
 
     public override void OnPointerMove(RoutedEventArgs e) {
         App app = this.FindApp();
-        if (e.handled || !this.scrubbing || app == null || app.GetCapturedPointer() != this) return;
+        if (e.handled || !this.scrubbing) return;
+        if (this.disposed || this.IsDisabled()) {
+            this.scrubbing = false;
+            if (app != null && app.GetCapturedPointer() == this) {
+                app.ReleasePointerCapture();
+            }
+            return;
+        }
+        if (app == null || app.GetCapturedPointer() != this) return;
         this.SeekByPointerX(app, e.x);
         app.RequestRedraw();
         e.Handle();
@@ -298,6 +363,7 @@ public class VideoPlayer : Control, IDisposable {
         if (app != null && app.GetCapturedPointer() == this) {
             app.ReleasePointerCapture();
         }
+        if (this.disposed || this.IsDisabled()) return;
         e.Handle();
     }
 
@@ -310,15 +376,39 @@ public class VideoPlayer : Control, IDisposable {
         }
     }
 
+    internal void OnAppStopped() {
+        this.loopRegistration = null;
+        this.Dispose();
+    }
+
     public void Dispose() {
-        if (this.currentKey != "") {
-            Canvas.EvictImage(this.keyPrefix + "0");
-            Canvas.EvictImage(this.keyPrefix + "1");
-            this.currentKey = "";
-        }
+        if (this.disposed) return;
+        this.disposed = true;
+        this.scrubbing = false;
+        AppLoopRegistration reg = this.loopRegistration;
+        this.loopRegistration = null;
+        if (reg != null) { reg.Invalidate(); }
+        this.resolvedSrc = null;
+        this.ReleaseTextures();
         if (this.session != null) {
             this.session.Dispose();
             this.session = null;
         }
+    }
+}
+
+internal class VideoPlayerLifecycle : AppLoopParticipant, AppLoopStopped {
+    weak VideoPlayer owner;
+
+    internal VideoPlayerLifecycle(VideoPlayer player) {
+        this.owner = player;
+    }
+
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+
+    public void Stopped(App app) {
+        VideoPlayer player = this.owner;
+        if (player != null) { player.OnAppStopped(); }
     }
 }

@@ -94,9 +94,13 @@ public partial class DockHost {
             inputParts[i].used = false;
         }
         this.PrepareDockLayout(app, new Rect(bx, by, bw, bh));
-        for (int i = 0; i < inputParts.Count; i = i + 1) {
-            if (!inputParts[i].used && inputParts[i].StyleVisible()) {
-                inputParts[i].SetShown(false); app.CancelInputSubtree(inputParts[i]);
+        for (int i = inputParts.Count - 1; i >= 0; i = i - 1) {
+            DockInputPart part = inputParts[i];
+            if (!part.used) {
+                part.SetShown(false);
+                app.CancelInputSubtree(part);
+                if (i < inputParts.Count && inputParts[i] == part) { inputParts.RemoveAt(i); }
+                if (part.parent == this) { this.Remove(part); }
             }
         }
         for (int i = 0; i < panels.Count; i = i + 1) {
@@ -144,11 +148,14 @@ public partial class DockHost {
         if ((name == "PointerMove" || (name == "PointerUp" && primary))
         && app.GetCapturedPointer() == part) {
             if (part.action == 2) {
-                int distance = (int)Math.Abs(e.x - app.pressStartX) + (int)Math.Abs(e.y - app.pressStartY);
-                if (!dragging && distance > app.Scale(6)) {
-                    dragging = true; dragArmed = true; dragId = part.panelId;
+                DockPanel panel = this.Find(part.panelId);
+                if (panel != null && !panel.headerless) {
+                    int distance = (int)Math.Abs(e.x - app.pressStartX) + (int)Math.Abs(e.y - app.pressStartY);
+                    if (!dragging && distance > app.Scale(6)) {
+                        dragging = true; dragArmed = true; dragId = part.panelId;
+                    }
+                    if (dragging) { this.ResolveDrop(app); }
                 }
-                if (dragging) { this.ResolveDrop(app); }
             } else if (part.action >= 4) {
                 int delta = (part.vertical ? e.x : e.y) - part.start;
                 if (delta != part.delta) {
@@ -168,30 +175,43 @@ public partial class DockHost {
                     }
                     if (part.action == 7) {
                         int index = this.IndexOfKey(part.groupKey); int next = this.IndexOfKey(part.nextKey);
-                        int min = app.Scale(56);
-                        if (index >= 0 && next >= 0 && part.first + delta >= min && part.second - delta >= min) {
-                            groups[index].extent = part.first + delta; groups[next].extent = part.second - delta;
+                        if (index >= 0 && next >= 0) {
+                            int total = part.first + part.second;
+                            int min = app.Scale(56);
+                            if (min * 2 > total) { min = total / 2; }
+                            if (min < 0) { min = 0; }
+                            int minDelta = min - part.first;
+                            int maxDelta = part.second - min;
+                            if (minDelta <= maxDelta) {
+                                int clamped = delta;
+                                if (clamped < minDelta) { clamped = minDelta; }
+                                if (clamped > maxDelta) { clamped = maxDelta; }
+                                groups[index].extent = part.first + clamped;
+                                groups[next].extent = part.second - clamped;
+                            }
                         }
                     }
                     pendingResize = true;
                 }
             }
             if (name == "PointerUp") {
+                bool wasDragArmed = dragArmed;
                 if (dragging) { this.ApplyDrop(); }
-                dragging = false; dragId = ""; dropKind = 0;
+                dragging = false; dragArmed = false; dragId = ""; dropKind = 0;
                 if (pendingResize) { changed = true; pendingResize = false; }
                 app.ReleasePointerCapture();
+                if (part.action != 2 || wasDragArmed) { e.Handle(); }
+            } else {
+                e.Handle();
             }
-            if (name != "PointerUp" || part.action != 2 || dragArmed) { e.Handle(); }
             app.RequestRedraw();
         }
         if (name == "Click" && primary && part.action >= 2 && part.action <= 3) {
-            if (!dragArmed) {
-                if (part.action == 3) { this.Close(part.panelId); }
-                else {
-                    int index = this.GroupOf(part.panelId);
-                    if (index >= 0) { groups[index].active = this.IndexIn(groups[index], part.panelId); }
-                }
+            if (part.action == 3) {
+                this.Close(part.panelId);
+            } else if (!dragArmed) {
+                int index = this.GroupOf(part.panelId);
+                if (index >= 0) { groups[index].active = this.IndexIn(groups[index], part.panelId); }
             }
             dragArmed = false; e.Handle(); app.RequestRedraw();
         }

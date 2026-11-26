@@ -25,6 +25,8 @@ public class AnimatedImageBox : Control, IDisposable {
     private int keySlot = 0;
     private string currentKey = "";
     private string keyPrefix = "";
+    private bool disposed = false;
+    private weak AppLoopRegistration loopRegistration = null;
 
     private static int nextInstanceId = 1;
 
@@ -52,15 +54,33 @@ public class AnimatedImageBox : Control, IDisposable {
     }
 
     public void Play() {
+        if (this.disposed) return;
+        this.ResolveSource();
+        if (!this.Loop && this.anim != null && this.anim.FrameCount > 1
+            && this.frameIndex >= this.anim.FrameCount - 1) {
+            this.frameIndex = 0;
+            this.UploadFrame(0);
+        }
         this.playing = true;
         this.lastTickMs = Environment.TickCount64;
+        this.RequestRedraw();
     }
 
     public void Pause() {
         this.playing = false;
+        this.RequestRedraw();
+    }
+
+    private void EnsureLifecycleHook(App app) {
+        if (this.disposed || app == null || !app.isRunning) return;
+        AppLoopRegistration reg = this.loopRegistration;
+        if (reg != null && reg.active && reg.host == app) return;
+        if (reg != null) { reg.Invalidate(); }
+        this.loopRegistration = app.RegisterLoopParticipant(this, new AnimatedImageBoxLifecycle(this));
     }
 
     private void ResolveSource() {
+        if (this.disposed) return;
         string src = this.Src != null ? this.Src.Get() : "";
         if (src == null) src = "";
         if (this.resolvedSrc != null && src == this.resolvedSrc) return;
@@ -69,9 +89,19 @@ public class AnimatedImageBox : Control, IDisposable {
         if (src == "") return;
 
         AnimatedImage loaded = AnimatedImage.FromFile(src);
-        if (loaded == null || !loaded.IsValid) return;
+        if (loaded == null) return;
+        if (!loaded.IsValid) {
+            loaded.Dispose();
+            return;
+        }
+        ImageBuffer buf = new ImageBuffer(loaded.Width, loaded.Height);
+        if (buf.IsEmpty) {
+            buf.Dispose();
+            loaded.Dispose();
+            return;
+        }
         this.anim = loaded;
-        this.frameBuf = new ImageBuffer(loaded.Width, loaded.Height);
+        this.frameBuf = buf;
         this.frameIndex = 0;
         this.lastTickMs = Environment.TickCount64;
         this.playing = this.AutoPlay;
@@ -89,7 +119,10 @@ public class AnimatedImageBox : Control, IDisposable {
     }
 
     public override void OnMeasure(App app) {
-        this.ResolveSource();
+        if (!this.disposed) {
+            this.EnsureLifecycleHook(app);
+            this.ResolveSource();
+        }
         StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
         int cssW = s.WidthOr(-1);
         int cssH = s.HeightOr(-1);
@@ -117,6 +150,8 @@ public class AnimatedImageBox : Control, IDisposable {
     }
 
     public override void OnPaint(App app) {
+        if (this.disposed) return;
+        this.EnsureLifecycleHook(app);
         this.ResolveSource();
         if (this.bw <= 0 || this.bh <= 0) return;
 
@@ -173,6 +208,10 @@ public class AnimatedImageBox : Control, IDisposable {
     }
 
     private void ReleaseMedia() {
+        this.frameIndex = 0;
+        this.lastTickMs = 0;
+        this.playing = false;
+        this.keySlot = 0;
         if (this.currentKey != "") {
             Canvas.EvictImage(this.keyPrefix + "0");
             Canvas.EvictImage(this.keyPrefix + "1");
@@ -182,7 +221,34 @@ public class AnimatedImageBox : Control, IDisposable {
         if (this.anim != null) { this.anim.Dispose(); this.anim = null; }
     }
 
+    internal void OnAppStopped() {
+        this.loopRegistration = null;
+        this.Dispose();
+    }
+
     public void Dispose() {
+        if (this.disposed) return;
+        this.disposed = true;
+        AppLoopRegistration reg = this.loopRegistration;
+        this.loopRegistration = null;
+        if (reg != null) { reg.Invalidate(); }
+        this.resolvedSrc = null;
         this.ReleaseMedia();
+    }
+}
+
+internal class AnimatedImageBoxLifecycle : AppLoopParticipant, AppLoopStopped {
+    weak AnimatedImageBox owner;
+
+    internal AnimatedImageBoxLifecycle(AnimatedImageBox box) {
+        this.owner = box;
+    }
+
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+
+    public void Stopped(App app) {
+        AnimatedImageBox box = this.owner;
+        if (box != null) { box.OnAppStopped(); }
     }
 }

@@ -269,32 +269,38 @@ public partial class DockHost {
             int extent = gs[i].extent;
             if (logicalLayoutPending) { extent = extent * scale / 100; }
             extents.Add(extent);
-            if (extent <= 0) { unset = unset + 1; wsum = wsum + gs[i].weight; }
-            else { sum = sum + extent; }
+            if (extent <= 0) {
+                unset = unset + 1;
+                wsum = wsum + (gs[i].weight > 0 ? gs[i].weight : 1);
+            } else { sum = sum + extent; }
         }
-        if (unset > 0 && !tiny) {
+        int floor = tiny ? 1 : minG;
+        if (unset > 0) {
             int rest = total - sum;
-            if (rest < unset * minG) { rest = unset * minG; }
+            if (rest < unset * floor) { rest = unset * floor; }
             if (wsum <= 0) { wsum = unset; }
             for (int i = 0; i < n; i = i + 1) {
                 if (extents[i] <= 0) {
-                    int extent = rest * gs[i].weight / wsum;
-                    if (extent < minG) { extent = minG; }
+                    int w = gs[i].weight > 0 ? gs[i].weight : 1;
+                    int extent = (int)((long)rest * w / wsum);
+                    if (extent < floor) { extent = floor; }
                     extents[i] = extent;
                     sum = sum + extent;
                 }
             }
         }
-        if (sum != total && sum > 0 && !tiny) {
+        if (sum != total && sum > 0) {
             int acc = 0;
             for (int i = 0; i < n - 1; i = i + 1) {
-                int extent = extents[i] * total / sum;
-                if (extent < minG) { extent = minG; }
+                int extent = (int)((long)extents[i] * total / sum);
+                if (extent < floor) { extent = floor; }
+                int maxForThis = total - acc - floor * (n - 1 - i);
+                if (extent > maxForThis) { extent = maxForThis; }
                 extents[i] = extent;
                 acc = acc + extent;
             }
             int last = total - acc;
-            if (last < minG) { last = minG; }
+            if (last < floor) { last = floor; }
             extents[n - 1] = last;
         }
         return extents;
@@ -464,6 +470,15 @@ public partial class DockHost {
         }
     }
 
+    private bool IsHeaderlessCenterGroup(DockGroup g) {
+        if (g == null || g.side != DockSide.Center()) { return false; }
+        for (int i = 0; i < g.ids.Count; i = i + 1) {
+            DockPanel p = this.Find(g.ids[i]);
+            if (p != null && p.headerless) { return true; }
+        }
+        return false;
+    }
+
     // 选取指针下方的放置目标：组的标签条或其中部并入该组，
     // 组的边缘带在旁侧新建组，
     // 整个停靠区的外侧带停靠到相应侧边。
@@ -479,7 +494,8 @@ public partial class DockHost {
         for (int gi = 0; gi < groups.Count; gi = gi + 1) {
             DockGroup g = groups[gi];
             if (this.GroupHasVisible(g) && g.bounds.Contains(mx, my)) {
-                if (g.header.height > 0 && g.header.Contains(mx, my)) {
+                bool fixedCenter = this.IsHeaderlessCenterGroup(g);
+                if (!fixedCenter && g.header.height > 0 && g.header.Contains(mx, my)) {
                     dropKind = 1;
                     dropGroup = gi;
                     dropRect = g.bounds;
@@ -487,6 +503,7 @@ public partial class DockHost {
                 }
                 int zone = DockHost.EdgeZone(g.bounds, mx, my);
                 if (zone == 0) {
+                    if (fixedCenter) { return; }
                     dropKind = 1;
                     dropGroup = gi;
                     dropRect = g.bounds;
@@ -563,11 +580,15 @@ public partial class DockHost {
         int w = leftW;
         if (side == DockSide.Right()) { w = rightW; }
         if (w <= 0) { w = app.Scale(240); }
+        if (w > area.width) { w = area.width; }
+        if (w < 0) { w = 0; }
         if (side == DockSide.Center()) { return area; }
         if (side == DockSide.Left()) { return new Rect(area.x, area.y, w, area.height); }
         if (side == DockSide.Right()) { return new Rect(area.Right() - w, area.y, w, area.height); }
         int h = bottomH;
         if (h <= 0) { h = app.Scale(170); }
+        if (h > area.height) { h = area.height; }
+        if (h < 0) { h = 0; }
         return new Rect(area.x, area.Bottom() - h, area.width, h);
     }
 
@@ -609,10 +630,11 @@ public partial class DockHost {
     public void ApplyDrop() {
         if (dropKind == 0) { return; }
         DockPanel p = this.Find(dragId);
-        if (p == null) { return; }
+        if (p == null || p.headerless) { return; }
         if (dropKind == 1) {
             if (dropGroup < 0 || dropGroup >= groups.Count) { return; }
             DockGroup target = groups[dropGroup];
+            if (this.IsHeaderlessCenterGroup(target)) { return; }
             if (DockHost.ListHas(target.ids, dragId)) {
                 target.active = this.IndexIn(target, dragId);
                 return;
@@ -636,8 +658,10 @@ public partial class DockHost {
         if (fromGroup >= 0 && groups[fromGroup].side == side
         && groups[fromGroup].ids.Count == 1) {
             // 该侧已是唯一组：只需重新排序。
+            int fromSideIdx = this.SideIndexOf(fromGroup);
             DockGroup solo = groups[fromGroup];
             groups.RemoveAt(fromGroup);
+            if (fromSideIdx < k) { k = k - 1; }
             int pos = this.InsertPos(side, k);
             if (pos > groups.Count) { pos = groups.Count; }
             groups.Insert(pos, solo);

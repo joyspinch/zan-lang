@@ -478,6 +478,7 @@ public partial class DockHost : Control {
         int gi = this.GroupWithKey(p.homeKey);
         if (gi < 0) {
             DockGroup ng = new DockGroup(p.home, 100);
+            if (p.homeKey > 0) { ng.key = p.homeKey; }
             int at = this.InsertPosFor(p.home, p.homeSideIdx);
             groups.Insert(at, ng);
             gi = this.GroupWithKey(ng.key);
@@ -561,13 +562,17 @@ public partial class DockHost : Control {
     // 加载时跳过未知 id，因此该格式能容忍不同版本间
     // 出现和消失的面板。
     public string SaveLayout() {
-        string s = "v2;S=" + Convert.ToString(PersistLogical(leftW)) + ","
-        + Convert.ToString(PersistLogical(rightW)) + ","
-        + Convert.ToString(PersistLogical(bottomH));
+        int lw = logicalLayoutPending ? leftW : this.PersistLogical(leftW);
+        int rw = logicalLayoutPending ? rightW : this.PersistLogical(rightW);
+        int bh = logicalLayoutPending ? bottomH : this.PersistLogical(bottomH);
+        string s = "v2;S=" + Convert.ToString(lw) + ","
+        + Convert.ToString(rw) + ","
+        + Convert.ToString(bh);
         for (int i = 0; i < groups.Count; i = i + 1) {
             DockGroup g = groups[i];
+            int ext = logicalLayoutPending ? g.extent : this.PersistLogical(g.extent);
             s = s + ";G=" + Convert.ToString(g.side) + ","
-            + Convert.ToString(PersistLogical(g.extent)) + ","
+            + Convert.ToString(ext) + ","
             + Convert.ToString(g.active);
             for (int j = 0; j < g.ids.Count; j = j + 1) {
                 if (j == 0) { s = s + ","; } else { s = s + "|"; }
@@ -591,73 +596,117 @@ public partial class DockHost : Control {
     // （调用方此时保留默认设置）。
     public bool LoadLayout(string text) {
         if (text == null) { return false; }
-        this.CloseMenu();
         List<string> parts = DockHost.SplitOn(text, ";");
         if (parts.Count == 0) { return false; }
         bool logical = parts[0] == "v2";
         if (!logical && parts[0] != "v1") { return false; }
-        logicalLayoutPending = logical;
 
+        bool hasSizes = false;
+        int parsedLeftW = leftW;
+        int parsedRightW = rightW;
+        int parsedBottomH = bottomH;
         List<DockGroup> loaded = new List<DockGroup>();
+        List<string> placed = new List<string>();
         List<string> hidden = new List<string>();
+        List<int> hiddenHome = new List<int>();
         int i = 1;
         while (i < parts.Count) {
             string seg = parts[i];
             if (DockHost.HasPrefix(seg, "S=")) {
                 List<string> nums = DockHost.SplitOn(DockHost.After(seg, 2), ",");
-                if (nums.Count >= 3) {
-                    leftW = Convert.ToInt32(nums[0]);
-                    rightW = Convert.ToInt32(nums[1]);
-                    bottomH = Convert.ToInt32(nums[2]);
-                    sized = true;
-                }
+                if (nums.Count < 3) { return false; }
+                int lw = 0;
+                int rw = 0;
+                int bh = 0;
+                if (!FormRule.TryParseInt(nums[0], out lw)
+                || !FormRule.TryParseInt(nums[1], out rw)
+                || !FormRule.TryParseInt(nums[2], out bh)) { return false; }
+                if (lw < 0 || rw < 0 || bh < 0) { return false; }
+                parsedLeftW = lw;
+                parsedRightW = rw;
+                parsedBottomH = bh;
+                hasSizes = true;
             } else if (DockHost.HasPrefix(seg, "G=")) {
                 List<string> f = DockHost.SplitOn(DockHost.After(seg, 2), ",");
-                if (f.Count >= 4) {
-                    DockGroup g = new DockGroup(Convert.ToInt32(f[0]), 100);
-                    g.extent = Convert.ToInt32(f[1]);
-                    g.active = Convert.ToInt32(f[2]);
-                    List<string> ids = DockHost.SplitOn(f[3], "|");
-                    for (int j = 0; j < ids.Count; j = j + 1) {
-                        if (this.Find(ids[j]) != null) { g.ids.Add(ids[j]); }
+                if (f.Count < 4) { return false; }
+                int side = 0;
+                int extent = 0;
+                int active = 0;
+                if (!FormRule.TryParseInt(f[0], out side)
+                || !FormRule.TryParseInt(f[1], out extent)
+                || !FormRule.TryParseInt(f[2], out active)) { return false; }
+                if (side < 0 || side > 3 || extent < 0) { return false; }
+                DockGroup g = new DockGroup(side, 100);
+                g.extent = extent;
+                g.active = active;
+                List<string> ids = DockHost.SplitOn(f[3], "|");
+                for (int j = 0; j < ids.Count; j = j + 1) {
+                    string pid = ids[j];
+                    if (this.Find(pid) != null && !DockHost.ListHas(placed, pid)) {
+                        g.ids.Add(pid);
+                        placed.Add(pid);
                     }
-                    if (g.ids.Count > 0) {
-                        if (g.active >= g.ids.Count) { g.active = g.ids.Count - 1; }
-                        if (g.active < 0) { g.active = 0; }
-                        loaded.Add(g);
-                    }
+                }
+                if (g.ids.Count > 0) {
+                    if (g.active >= g.ids.Count) { g.active = g.ids.Count - 1; }
+                    if (g.active < 0) { g.active = 0; }
+                    loaded.Add(g);
                 }
             } else if (DockHost.HasPrefix(seg, "H=")) {
                 List<string> hs = DockHost.SplitOn(DockHost.After(seg, 2), "|");
                 for (int hi = 0; hi < hs.Count; hi = hi + 1) {
                     List<string> hf = DockHost.SplitOn(hs[hi], ":");
                     if (hf.Count >= 1) {
-                        hidden.Add(hf[0]);
-                        DockPanel hp = this.Find(hf[0]);
-                        if (hp != null && hf.Count >= 2) {
-                            hp.home = Convert.ToInt32(hf[1]);
+                        int hhome = -1;
+                        if (hf.Count >= 2) {
+                            if (!FormRule.TryParseInt(hf[1], out hhome)
+                            || hhome < 0 || hhome > 3) { return false; }
+                        }
+                        string hid = hf[0];
+                        if (this.Find(hid) != null && !DockHost.ListHas(hidden, hid)) {
+                            hidden.Add(hid);
+                            hiddenHome.Add(hhome);
                         }
                     }
                 }
             }
             i = i + 1;
         }
-        if (loaded.Count == 0) { return false; }
+        List<string> finalHidden = new List<string>();
+        List<int> finalHiddenHome = new List<int>();
+        for (int hi = 0; hi < hidden.Count; hi = hi + 1) {
+            if (!DockHost.ListHas(placed, hidden[hi])) {
+                finalHidden.Add(hidden[hi]);
+                finalHiddenHome.Add(hiddenHome[hi]);
+            }
+        }
+        if (loaded.Count == 0 && finalHidden.Count == 0) { return false; }
+
+        this.CloseMenu();
+        logicalLayoutPending = logical;
+        if (hasSizes) {
+            leftW = parsedLeftW;
+            rightW = parsedRightW;
+            bottomH = parsedBottomH;
+            sized = true;
+        }
+        for (int hi = 0; hi < finalHidden.Count; hi = hi + 1) {
+            if (finalHiddenHome[hi] >= 0) {
+                DockPanel hp = this.Find(finalHidden[hi]);
+                if (hp != null) { hp.home = finalHiddenHome[hi]; }
+            }
+        }
 
         // 保留保存的布局从未提及的面板：将它们重新停靠到
         // 其注册所在侧的最后一个组（或新建组）。
-        List<string> placed = new List<string>();
-        for (int gi = 0; gi < loaded.Count; gi = gi + 1) {
-            for (int j = 0; j < loaded[gi].ids.Count; j = j + 1) {
-                placed.Add(loaded[gi].ids[j]);
-            }
-        }
         List<DockGroup> old = groups;
         groups = loaded;
         for (int p = 0; p < panels.Count; p = p + 1) {
             DockPanel pan = panels[p];
-            pan.hidden = DockHost.ListHas(hidden, pan.id);
-            if (!DockHost.ListHas(placed, pan.id) && !pan.hidden) {
+            pan.hidden = DockHost.ListHas(finalHidden, pan.id);
+            if (pan.hidden) {
+                pan.body = new Rect(0, 0, 0, 0);
+            } else if (!DockHost.ListHas(placed, pan.id)) {
                 int side = DockHost.SideOfIn(old, pan.id);
                 DockGroup g = this.LastGroupOf(side);
                 if (g == null) {
