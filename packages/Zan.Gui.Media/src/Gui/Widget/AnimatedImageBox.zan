@@ -1,0 +1,188 @@
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// 多帧动图播放控件（原生支持多帧 GIF，同时兼容 PNG/JPEG/BMP 静态图）。
+// 零热路径分配：复用单个 ImageBuffer 承接当前帧，按帧延迟自动推进并重绘。
+public class AnimatedImageBox : Control, IDisposable {
+    public override Control CreateCloneShell() { return new AnimatedImageBox(); }
+
+    public Binding<string> Src;
+    public string Fit = "contain";
+    public bool AutoPlay = true;
+    public bool Loop = true;
+
+    private string resolvedSrc = null;
+    private AnimatedImage anim = null;
+    private ImageBuffer frameBuf = null;
+    private int frameIndex = 0;
+    private long lastTickMs = 0;
+    private bool playing = true;
+    private int keySlot = 0;
+    private string currentKey = "";
+    private string keyPrefix = "";
+
+    private static int nextInstanceId = 1;
+
+    private void InitAnimBox(string src, string fit) {
+        this.InitControl("animated-image");
+        this.styleSurfaceOwned = true;
+        this.Src = src;
+        this.Fit = (fit == null || fit == "") ? "contain" : fit;
+        int id = AnimatedImageBox.nextInstanceId;
+        AnimatedImageBox.nextInstanceId = id + 1;
+        this.keyPrefix = "mem:anim_" + Convert.ToString(id) + "_";
+        this.playing = this.AutoPlay;
+    }
+
+    public AnimatedImageBox() { this.InitAnimBox("", "contain"); }
+    public AnimatedImageBox(string src) { this.InitAnimBox(src, "contain"); }
+    public AnimatedImageBox(string src, string fit) { this.InitAnimBox(src, fit); }
+
+    public int FrameCount {
+        get { return this.anim != null ? this.anim.FrameCount : 0; }
+    }
+
+    public int CurrentFrame {
+        get { return this.frameIndex; }
+    }
+
+    public void Play() {
+        this.playing = true;
+        this.lastTickMs = Environment.TickCount64;
+    }
+
+    public void Pause() {
+        this.playing = false;
+    }
+
+    private void ResolveSource() {
+        string src = this.Src != null ? this.Src.Get() : "";
+        if (src == null) src = "";
+        if (this.resolvedSrc != null && src == this.resolvedSrc) return;
+        this.resolvedSrc = src;
+        this.ReleaseMedia();
+        if (src == "") return;
+
+        AnimatedImage loaded = AnimatedImage.FromFile(src);
+        if (loaded == null || !loaded.IsValid) return;
+        this.anim = loaded;
+        this.frameBuf = new ImageBuffer(loaded.Width, loaded.Height);
+        this.frameIndex = 0;
+        this.lastTickMs = Environment.TickCount64;
+        this.playing = this.AutoPlay;
+        this.UploadFrame(0);
+    }
+
+    private void UploadFrame(int index) {
+        if (this.anim == null || this.frameBuf == null || this.frameBuf.IsEmpty) return;
+        if (!this.anim.CopyFrameTo(index, this.frameBuf)) return;
+        this.keySlot = 1 - this.keySlot;
+        string key = this.keyPrefix + Convert.ToString(this.keySlot);
+        if (this.frameBuf.RegisterAsImageKey(key)) {
+            this.currentKey = key;
+        }
+    }
+
+    public override void OnMeasure(App app) {
+        this.ResolveSource();
+        StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
+        int cssW = s.WidthOr(-1);
+        int cssH = s.HeightOr(-1);
+        int dw = 128;
+        int dh = 128;
+        if (cssW > 0 && cssH > 0) {
+            dw = cssW; dh = cssH;
+        } else if (this.anim != null && this.anim.IsValid) {
+            if (cssW > 0) {
+                dw = cssW;
+                dh = (int)((long)cssW * (long)this.anim.Height / (long)this.anim.Width);
+            } else if (cssH > 0) {
+                dh = cssH;
+                dw = (int)((long)cssH * (long)this.anim.Width / (long)this.anim.Height);
+            } else {
+                dw = app.Scale(this.anim.Width);
+                dh = app.Scale(this.anim.Height);
+            }
+        } else {
+            if (cssW > 0) dw = cssW;
+            if (cssH > 0) dh = cssH;
+        }
+        this.prefW = dw;
+        this.prefH = dh;
+    }
+
+    public override void OnPaint(App app) {
+        this.ResolveSource();
+        if (this.bw <= 0 || this.bh <= 0) return;
+
+        if (this.anim != null && this.anim.FrameCount > 1 && this.playing) {
+            long now = Environment.TickCount64;
+            int delay = this.anim.GetFrameDelayMs(this.frameIndex);
+            if (delay < 16) delay = 16;
+            if (now - this.lastTickMs >= (long)delay) {
+                this.lastTickMs = now;
+                int next = this.frameIndex + 1;
+                if (next >= this.anim.FrameCount) {
+                    if (this.Loop) { next = 0; }
+                    else { next = this.anim.FrameCount - 1; this.playing = false; }
+                }
+                if (next != this.frameIndex) {
+                    this.frameIndex = next;
+                    this.UploadFrame(this.frameIndex);
+                }
+            }
+            if (this.playing) {
+                app.RequestRedraw();
+            }
+        }
+
+        Canvas c = app.canvas;
+        StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
+        s.Paint(app, this.bx, this.by, this.bw, this.bh);
+
+        if (this.currentKey != "" && this.anim != null && this.anim.Width > 0 && this.anim.Height > 0) {
+            this.BlitFitted(c, this.anim.Width, this.anim.Height);
+        }
+    }
+
+    private void BlitFitted(Canvas c, int iw, int ih) {
+        c.PushClip(this.bx, this.by, this.bw, this.bh);
+        if (this.Fit == "fill") {
+            c.BlitImage(this.currentKey, this.bx, this.by, this.bw, this.bh, 0, 0, 0, 0);
+        } else {
+            long lhs = (long)this.bw * (long)ih;
+            long rhs = (long)this.bh * (long)iw;
+            int dw = this.bw;
+            int dh = this.bh;
+            bool cover = this.Fit == "cover";
+            if ((cover && lhs < rhs) || (!cover && lhs > rhs)) {
+                dw = (int)((long)this.bh * (long)iw / (long)ih);
+            } else {
+                dh = (int)((long)this.bw * (long)ih / (long)iw);
+            }
+            int dx = this.bx + (this.bw - dw) / 2;
+            int dy = this.by + (this.bh - dh) / 2;
+            c.BlitImage(this.currentKey, dx, dy, dw, dh, 0, 0, 0, 0);
+        }
+        c.PopClip();
+    }
+
+    private void ReleaseMedia() {
+        if (this.currentKey != "") {
+            Canvas.EvictImage(this.keyPrefix + "0");
+            Canvas.EvictImage(this.keyPrefix + "1");
+            this.currentKey = "";
+        }
+        if (this.frameBuf != null) { this.frameBuf.Dispose(); this.frameBuf = null; }
+        if (this.anim != null) { this.anim.Dispose(); this.anim = null; }
+    }
+
+    public void Dispose() {
+        this.ReleaseMedia();
+    }
+}

@@ -1,0 +1,219 @@
+using System;
+using System.IO;
+using System.Threading;
+using System.Drawing;
+using System.Drawing.Imaging;
+
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static int AbsDiff(int a, int b) {
+        return a > b ? (a - b) : (b - a);
+    }
+
+    static bool PixelNear(int p, int er, int eg, int eb, int tol) {
+        int r = (p >> 16) & 255;
+        int g = (p >> 8) & 255;
+        int b = p & 255;
+        return AbsDiff(r, er) <= tol && AbsDiff(g, eg) <= tol && AbsDiff(b, eb) <= tol;
+    }
+
+    static void Main() {
+        string workDir = Path.Combine(Directory.GetCurrentDirectory(), "_zan_image_pipeline_tmp");
+        if (Directory.Exists(workDir)) {
+            Directory.DeleteRecursive(workDir);
+        }
+        Directory.CreateDirectoryRecursive(workDir);
+
+        try {
+            // 1. 构造 24x16 测试图（四象限不同颜色，全不透明 Alpha=255）
+            ImageBuffer src = new ImageBuffer(24, 16);
+            src.FillRect(0, 0, 12, 8, (int)0xFFE03020);   // 左上红
+            src.FillRect(12, 0, 12, 8, (int)0xFF20D040);  // 右上绿
+            src.FillRect(0, 8, 12, 8, (int)0xFF3050E0);   // 左下蓝
+            src.FillRect(12, 8, 12, 8, (int)0xFFF0E020);  // 右下黄
+
+            Check("get-pixel-tl", src.GetPixel(2, 2) == (int)0xFFE03020);
+            src.SetPixel(2, 2, (int)0xFFE03021);
+            Check("set-pixel-tl", src.GetPixel(2, 2) == (int)0xFFE03021);
+            src.SetPixel(2, 2, (int)0xFFE03020);
+
+            // 2. PNG / JPEG / BMP / TGA 全格式编码 + 回读验证
+            string pngPath = Path.Combine(workDir, "out.png");
+            string jpgPath = Path.Combine(workDir, "out.jpg");
+            string bmpPath = Path.Combine(workDir, "out.bmp");
+            string tgaPath = Path.Combine(workDir, "out.tga");
+
+            Check("save-png", src.Save(pngPath));
+            Check("save-jpg", src.Save(jpgPath, 92));
+            Check("save-bmp", src.Save(bmpPath));
+            Check("save-tga", src.Save(tgaPath));
+
+            byte[] jpgBytes = File.ReadAllBytes(jpgPath);
+            Check("jpg-soi", jpgBytes.Length > 100 && jpgBytes[0] == 255 && jpgBytes[1] == 216);
+            Check("jpg-eoi", jpgBytes[jpgBytes.Length - 2] == 255 && jpgBytes[jpgBytes.Length - 1] == 217);
+
+            ImageBuffer decPng = ImageBuffer.FromFile(pngPath);
+            Check("dec-png-dim", decPng.Width == 24 && decPng.Height == 16);
+            Check("dec-png-exact", decPng.GetPixel(2, 2) == (int)0xFFE03020 && decPng.GetPixel(20, 12) == (int)0xFFF0E020);
+            decPng.Dispose();
+
+            ImageBuffer decJpg = ImageBuffer.FromFile(jpgPath);
+            Check("dec-jpg-dim", decJpg.Width == 24 && decJpg.Height == 16);
+            Check("dec-jpg-tl", PixelNear(decJpg.GetPixel(3, 3), 0xE0, 0x30, 0x20, 12));
+            Check("dec-jpg-tr", PixelNear(decJpg.GetPixel(20, 3), 0x20, 0xD0, 0x40, 12));
+            Check("dec-jpg-bl", PixelNear(decJpg.GetPixel(3, 12), 0x30, 0x50, 0xE0, 12));
+            Check("dec-jpg-br", PixelNear(decJpg.GetPixel(20, 12), 0xF0, 0xE0, 0x20, 12));
+            decJpg.Dispose();
+
+            ImageBuffer decBmp = ImageBuffer.FromFile(bmpPath);
+            Check("dec-bmp-exact", decBmp.Width == 24 && decBmp.GetPixel(20, 2) == (int)0xFF20D040);
+            decBmp.Dispose();
+
+            ImageBuffer decTga = ImageBuffer.FromFile(tgaPath);
+            Check("dec-tga-exact", decTga.Width == 24 && decTga.GetPixel(2, 12) == (int)0xFF3050E0);
+            decTga.Dispose();
+
+            // 3. 几何变换：旋转 90/180/270、水平/垂直翻转、Fit/Cover/Lanczos
+            ImageBuffer r90 = src.Rotate90();
+            Check("rot90-dim", r90.Width == 16 && r90.Height == 24);
+            // 原左上(0,0)红 顺时针90度后落在右上(15,0)
+            Check("rot90-px", r90.GetPixel(15, 0) == (int)0xFFE03020);
+            r90.Dispose();
+
+            ImageBuffer r180 = src.Rotate180();
+            Check("rot180-px", r180.GetPixel(23, 15) == (int)0xFFE03020);
+            r180.Dispose();
+
+            ImageBuffer r270 = src.Rotate270();
+            Check("rot270-dim", r270.Width == 16 && r270.Height == 24);
+            Check("rot270-px", r270.GetPixel(0, 23) == (int)0xFFE03020);
+            r270.Dispose();
+
+            ImageBuffer fl = src.Clone();
+            fl.FlipHorizontal();
+            Check("fliph-px", fl.GetPixel(22, 2) == (int)0xFFE03020);
+            fl.FlipVertical();
+            Check("flipv-px", fl.GetPixel(22, 14) == (int)0xFFE03020);
+            fl.Dispose();
+
+            ImageBuffer fit = src.ResizeFit(12, 12);
+            Check("fit-dim", fit.Width == 12 && fit.Height == 8);
+            fit.Dispose();
+
+            ImageBuffer cov = src.ResizeCover(10, 10);
+            Check("cover-dim", cov.Width == 10 && cov.Height == 10);
+            cov.Dispose();
+
+            // 4. Alpha 通道完整性：Invert & AdjustBrightness 不得破坏 Alpha=255
+            ImageBuffer fx = src.Clone();
+            fx.Invert();
+            int invTl = fx.GetPixel(2, 2);
+            Check("invert-alpha-preserved", ((invTl >> 24) & 255) == 255);
+            Check("invert-rgb", ((invTl >> 16) & 255) == (255 - 0xE0)
+                             && ((invTl >> 8) & 255) == (255 - 0x30)
+                             && (invTl & 255) == (255 - 0x20));
+            fx.AdjustBrightness(20);
+            int brTl = fx.GetPixel(2, 2);
+            Check("bright-alpha-preserved", ((brTl >> 24) & 255) == 255);
+            Check("bright-rgb", ((brTl >> 16) & 255) == (255 - 0xE0 + 20));
+            fx.AdjustContrast(20);
+            fx.AdjustSaturation(-50);
+            fx.Sharpen(30);
+            Check("filters-alpha-preserved", ((fx.GetPixel(2, 2) >> 24) & 255) == 255);
+            fx.Dispose();
+
+            // 5. ImageKey 双向注册与回读
+            Check("reg-key", src.RegisterAsImageKey("mem:pipe_test"));
+            ImageBuffer fromKey = ImageBuffer.FromImageKey("mem:pipe_test");
+            Check("from-key", fromKey.Width == 24 && fromKey.GetPixel(2, 2) == (int)0xFFE03020);
+            fromKey.Dispose();
+            ImageCodec.Evict("mem:pipe_test");
+
+            // 6. 多线程批处理管线（目录输入 + 缩放 + 水印 + 转 JPEG + 进度回调）
+            string inDir = Path.Combine(workDir, "batch_in");
+            string outDir = Path.Combine(workDir, "batch_out");
+            Directory.CreateDirectoryRecursive(inDir);
+            src.Save(Path.Combine(inDir, "a.png"));
+            src.Save(Path.Combine(inDir, "b.bmp"));
+            src.Save(Path.Combine(inDir, "c.tga"));
+            src.Save(Path.Combine(inDir, "d.jpg"), 90);
+
+            ImageBuffer wm = new ImageBuffer(4, 4);
+            wm.Clear((int)0xFF00FFFF);
+
+            ImageBatchOptions opt = new ImageBatchOptions();
+            opt.InputDirectory = inDir;
+            opt.OutputDirectory = outDir;
+            opt.OutputFormat = ImageFormat.Png;
+            opt.ResizeMode = ImageResizeMode.Cover;
+            opt.TargetWidth = 12;
+            opt.TargetHeight = 12;
+            opt.Watermark = wm;
+            opt.WatermarkAnchor = WatermarkAnchor.BottomRight;
+            opt.WatermarkMargin = 1;
+            opt.Concurrency = 2;
+            nint progressCalls = AtomicInt.NativeCreate(0);
+            opt.OnProgress = (int done, int total, string p, bool ok) => {
+                AtomicInt.NativeAdd(progressCalls, 1);
+            };
+
+            ImageBatchResult bres = ImageBatch.Run(opt);
+            int pCount = (int)AtomicInt.NativeLoad(progressCalls);
+            AtomicInt.NativeDestroy(progressCalls);
+            Check("batch-total", bres.Total == 4);
+            Check("batch-ok", bres.Succeeded == 4 && bres.Failed == 0);
+            Check("batch-progress", pCount == 4);
+            ImageBuffer bOut = ImageBuffer.FromFile(Path.Combine(outDir, "a.png"));
+            Check("batch-out-dim", bOut.Width == 12 && bOut.Height == 12);
+            // 水印贴在右下角 (12-4-1=7..10, 7..10)，验证青色水印生效
+            Check("batch-watermark", bOut.GetPixel(9, 9) == (int)0xFF00FFFF);
+            bOut.Dispose();
+            wm.Dispose();
+
+            // 7. 多帧动图 GIF 最小内嵌字节解码（2x2 2帧 GIF89a，帧0红延迟120ms，帧1蓝延迟250ms）
+            byte[] gif2 = new byte[] {
+                0x47,0x49,0x46,0x38,0x39,0x61, // GIF89a
+                0x02,0x00,0x02,0x00,0x80,0x00,0x00, // 2x2, GCT 2 colors
+                0xFF,0x00,0x00, 0x00,0x00,0xFF, // color 0: red, color 1: blue
+                // Frame 0: GCE delay=12 (120ms)
+                0x21,0xF9,0x04,0x00,0x0C,0x00,0x00,0x00,
+                0x2C,0x00,0x00,0x00,0x00,0x02,0x00,0x02,0x00,0x00,
+                0x02,0x02,0x44,0x01,0x00,
+                // Frame 1: GCE delay=25 (250ms)
+                0x21,0xF9,0x04,0x00,0x19,0x00,0x00,0x00,
+                0x2C,0x00,0x00,0x00,0x00,0x02,0x00,0x02,0x00,0x00,
+                0x02,0x02,0x4C,0x01,0x00,
+                0x3B // Trailer
+            };
+            AnimatedImage anim = AnimatedImage.FromBytes(gif2);
+            Check("anim-valid", anim != null && anim.IsValid);
+            if (anim != null && anim.IsValid) {
+                Check("anim-dim", anim.Width == 2 && anim.Height == 2 && anim.FrameCount == 2);
+                Check("anim-delay", anim.GetFrameDelayMs(0) == 120 && anim.GetFrameDelayMs(1) == 250);
+                ImageBuffer fbuf = new ImageBuffer(2, 2);
+                Check("anim-f0-copy", anim.CopyFrameTo(0, fbuf));
+                Check("anim-f0-red", fbuf.GetPixel(0, 0) == (int)0xFFFF0000);
+                Check("anim-f1-copy", anim.CopyFrameTo(1, fbuf));
+                Check("anim-f1-blue", fbuf.GetPixel(0, 0) == (int)0xFF0000FF);
+                fbuf.Dispose();
+                anim.Dispose();
+            }
+
+            src.Dispose();
+        } finally {
+            if (Directory.Exists(workDir)) {
+                Directory.DeleteRecursive(workDir);
+            }
+        }
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

@@ -1,0 +1,156 @@
+using System;
+using System.IO;
+using System.Drawing.Imaging;
+
+namespace System.Drawing;
+
+public partial class ImageBuffer {
+    // 从文件解码任意受支持静态图（PNG/JPEG/BMP/WebP/GIF首帧/TGA/PSD/PNM/ICO），
+    // 不占用 GUI 全局图像缓存，天然支持多线程批处理。失败返回空缓冲（Width == 0）。
+    public static ImageBuffer FromFile(string path) {
+        if (path == null || path == "") return new ImageBuffer(0, 0);
+        nint handle = ImageCodec.AnimOpenFile(path);
+        if (handle == 0) return new ImageBuffer(0, 0);
+        try {
+            return ImageBuffer.FromAnimHandle(handle, 0);
+        } finally {
+            ImageCodec.AnimClose(handle);
+        }
+    }
+
+    // 从内存字节解码受支持静态图。失败返回空缓冲（Width == 0）。
+    public static ImageBuffer FromBytes(byte[] data) {
+        if (data == null || data.Length <= 0) return new ImageBuffer(0, 0);
+        nint handle = ImageCodec.AnimOpenMem(data, data.Length);
+        if (handle == 0) return new ImageBuffer(0, 0);
+        try {
+            return ImageBuffer.FromAnimHandle(handle, 0);
+        } finally {
+            ImageCodec.AnimClose(handle);
+        }
+    }
+
+    // 从已加载到 ImageCodec 缓存的图像 key（含 "mem:" 与 SVG）拷贝像素。
+    public static ImageBuffer FromImageKey(string key) {
+        if (key == null || key == "") return new ImageBuffer(0, 0);
+        int w = ImageCodec.Width(key);
+        int h = ImageCodec.Height(key);
+        if (w <= 0 || h <= 0) return new ImageBuffer(0, 0);
+        ImageBuffer buf = new ImageBuffer(w, h);
+        if (buf.Pixels == 0) return buf;
+        int copied = ImageCodec.CopyArgb(key, buf.Pixels, w * h);
+        if (copied != w * h) {
+            buf.Dispose();
+            return new ImageBuffer(0, 0);
+        }
+        return buf;
+    }
+
+    internal static ImageBuffer FromAnimHandle(nint handle, int frameIndex) {
+        int w = ImageCodec.AnimWidth(handle);
+        int h = ImageCodec.AnimHeight(handle);
+        if (w <= 0 || h <= 0) return new ImageBuffer(0, 0);
+        ImageBuffer buf = new ImageBuffer(w, h);
+        if (buf.Pixels == 0) return buf;
+        int copied = ImageCodec.AnimCopyFrame(handle, frameIndex, buf.Pixels, w * h);
+        if (copied != w * h) {
+            buf.Dispose();
+            return new ImageBuffer(0, 0);
+        }
+        return buf;
+    }
+
+    public bool IsEmpty {
+        get { return this.Pixels == 0 || this.Width <= 0 || this.Height <= 0; }
+    }
+
+    // 读取单个像素（0xAARRGGBB），越界返回 0。
+    public int GetPixel(int x, int y) {
+        if (this.Pixels == 0 || x < 0 || y < 0 || x >= this.Width || y >= this.Height) return 0;
+        Span<int> row = new Span<int>(this.Pixels + (nint)(y * this.Stride), this.Width);
+        return row[x];
+    }
+
+    // 写入单个像素（0xAARRGGBB），越界忽略。
+    public void SetPixel(int x, int y, int argb) {
+        if (this.Pixels == 0 || x < 0 || y < 0 || x >= this.Width || y >= this.Height) return;
+        Span<int> row = new Span<int>(this.Pixels + (nint)(y * this.Stride), this.Width);
+        row[x] = argb;
+    }
+
+    // 深拷贝当前像素缓冲。
+    public ImageBuffer Clone() {
+        if (this.IsEmpty) return new ImageBuffer(0, 0);
+        ImageBuffer copy = new ImageBuffer(this.Width, this.Height);
+        if (copy.Pixels == 0) return copy;
+        NativeMemory.Copy2D(copy.Pixels, copy.Stride, this.Pixels, this.Stride, this.Width * 4, this.Height);
+        return copy;
+    }
+
+    // 注册/替换到 ImageCodec 内存键（必须以 "mem:" 开头），供 GUI Canvas 直接渲染。
+    public bool RegisterAsImageKey(string memKey) {
+        if (this.IsEmpty || memKey == null || !memKey.StartsWith("mem:")) return false;
+        return ImageCodec.RegisterArgb(memKey, this.Pixels, this.Width, this.Height, this.Width) == this.Width;
+    }
+
+    // 编码为 PNG 字节数组（8-bit RGBA）。
+    public byte[] ToPngBytes() {
+        if (this.IsEmpty) return null;
+        int count = this.Width * this.Height;
+        int totalBytes = count * 4;
+        nint tmp = NativeMemory.Alloc(totalBytes);
+        if (tmp == 0) return null;
+        try {
+            // ARGB32 (内存序 B,G,R,A) -> RGBA 字节序供 Png.Encode 使用
+            PixelOps.SwapRB(tmp, this.Pixels, count);
+            byte[] rgba = new byte[totalBytes];
+            NativeMemory.Copy((nint)rgba, tmp, totalBytes);
+            return Png.Encode(this.Width, this.Height, rgba);
+        } finally {
+            NativeMemory.Free(tmp);
+        }
+    }
+
+    // 编码为 JPEG 字节数组（quality: 1..100，推荐 85）。
+    public byte[] ToJpegBytes(int quality) {
+        return this.ToBytes(ImageFormat.Jpeg, quality);
+    }
+
+    // 按指定格式编码为字节数组。
+    public byte[] ToBytes(ImageFormat format, int quality) {
+        if (this.IsEmpty) return null;
+        if (format == ImageFormat.Png) {
+            return this.ToPngBytes();
+        }
+        return ImageCodec.EncodeArgb(this.Pixels, this.Width, this.Height, this.Width, (int)format, quality);
+    }
+
+    // 根据扩展名自动推导编码格式保存文件（默认 JPEG 质量 90）。
+    public bool Save(string path) {
+        return this.Save(path, 90);
+    }
+
+    public bool Save(string path, int quality) {
+        if (this.IsEmpty || path == null || path == "") return false;
+        ImageFormat fmt = ImageBuffer.InferFormatFromPath(path);
+        return this.Save(path, fmt, quality);
+    }
+
+    public bool Save(string path, ImageFormat format, int quality) {
+        if (this.IsEmpty || path == null || path == "") return false;
+        byte[] encoded = this.ToBytes(format, quality);
+        if (encoded == null || encoded.Length <= 0) return false;
+        File.WriteAllBytes(path, encoded);
+        return true;
+    }
+
+    public static ImageFormat InferFormatFromPath(string path) {
+        string ext = Path.GetExtension(path);
+        if (ext == null) return ImageFormat.Png;
+        string lower = ext.ToLower();
+        if (lower == ".jpg" || lower == ".jpeg") return ImageFormat.Jpeg;
+        if (lower == ".bmp") return ImageFormat.Bmp;
+        if (lower == ".tga") return ImageFormat.Tga;
+        return ImageFormat.Png;
+    }
+}

@@ -1,0 +1,267 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Media.Video;
+
+public class Program {
+    static int passCount = 0;
+    static int failCount = 0;
+
+    static void Check(string name, bool cond) {
+        if (cond) {
+            Program.passCount = Program.passCount + 1;
+        } else {
+            Program.failCount = Program.failCount + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static bool EnsureFfmpegLibs() {
+        if (VideoNative.IsAvailable()) return true;
+        string envDir = Environment.GetEnvironmentVariable("ZAN_FFMPEG_DIR");
+        if (envDir != null && envDir != "" && VideoNative.SetFfmpegDirectory(envDir)) {
+            if (VideoNative.IsAvailable()) return true;
+        }
+        if (Directory.Exists("C:\\Program Files\\ReArk")) {
+            VideoNative.SetFfmpegDirectory("C:\\Program Files\\ReArk");
+            if (VideoNative.IsAvailable()) return true;
+        }
+        return false;
+    }
+
+    static bool GenerateSampleMp4(string outPath) {
+        List<string> args = new List<string>();
+        args.Add("-hide_banner"); args.Add("-loglevel"); args.Add("error"); args.Add("-y");
+        args.Add("-f"); args.Add("lavfi"); args.Add("-i"); args.Add("testsrc2=size=320x180:rate=25:duration=2");
+        args.Add("-f"); args.Add("lavfi"); args.Add("-i"); args.Add("sine=frequency=440:sample_rate=44100:duration=2");
+        args.Add("-c:v"); args.Add("libx264"); args.Add("-preset"); args.Add("ultrafast");
+        args.Add("-pix_fmt"); args.Add("yuv420p");
+        args.Add("-c:a"); args.Add("aac"); args.Add("-b:a"); args.Add("96k");
+        args.Add("-shortest");
+        args.Add(outPath);
+        ProcessResult pr = Process.CaptureSafe("ffmpeg", args, 30000);
+        return pr.Ok() && File.Exists(outPath);
+    }
+
+    public static void Main() {
+        // 1. 基础无外部依赖校验
+        Program.Check("ext-mp4", VideoBatch.IsSupportedVideoExtension("clip.MP4"));
+        Program.Check("ext-mkv", VideoBatch.IsSupportedVideoExtension("movie.mkv"));
+        Program.Check("ext-txt", !VideoBatch.IsSupportedVideoExtension("notes.txt"));
+        MediaInfo badProbe = MediaProbe.Probe("");
+        Program.Check("bad-probe", !badProbe.IsValid);
+        VideoDecoder badDec = VideoDecoder.Open("");
+        Program.Check("bad-open", badDec == null);
+
+        if (!Program.EnsureFfmpegLibs()) {
+            if (Program.failCount == 0) {
+                Console.WriteLine("video_pipeline: ok");
+            } else {
+                Console.WriteLine("video_pipeline: fail=" + Convert.ToString(Program.failCount));
+            }
+            return;
+        }
+
+        string ver = VideoNative.Version();
+        Program.Check("ffmpeg-loaded", VideoNative.IsAvailable() && ver != null && ver.Length > 0);
+
+        string workDir = Path.Combine(Directory.GetCurrentDirectory(), "_zan_video_pipeline_tmp");
+        if (Directory.Exists(workDir)) { Directory.DeleteRecursive(workDir); }
+        Directory.CreateDirectoryRecursive(workDir);
+
+        try {
+            string sampleA = Path.Combine(workDir, "sample_a.mp4");
+            string sampleB = Path.Combine(workDir, "sample_b.mp4");
+            bool genOk = Program.GenerateSampleMp4(sampleA);
+            Program.Check("gen-sample-mp4", genOk);
+            if (!genOk) {
+                Console.WriteLine("video_pipeline: fail=" + Convert.ToString(Program.failCount));
+                return;
+            }
+            File.Copy(sampleA, sampleB);
+
+            // 2. 进程内元数据探测（MediaProbe）
+            MediaInfo info = MediaProbe.Probe(sampleA);
+            Program.Check("probe-valid", info.IsValid);
+            Program.Check("probe-has-av", info.HasVideo && info.HasAudio);
+            Program.Check("probe-dim", info.Width == 320 && info.Height == 180);
+            Program.Check("probe-dur", info.DurationMs >= 1800 && info.DurationMs <= 2500);
+            Program.Check("probe-fps", info.Fps > 24.0 && info.Fps < 26.0);
+            Program.Check("probe-audio-rate", info.AudioSampleRate == 44100 && info.AudioChannels >= 1);
+            Program.Check("probe-codecs", info.VideoCodec == "h264" && info.AudioCodec == "aac");
+
+            // 3. 进程内流式音视频解码与 Seek
+            VideoDecoder dec = VideoDecoder.Open(sampleA);
+            Program.Check("dec-open", dec != null && dec.IsValid);
+            if (dec != null) {
+                ImageBuffer frame = new ImageBuffer(160, 90);
+                int vFrames = 0;
+                int aFrames = 0;
+                int totalAudioSamples = 0;
+                bool alphaOpaque = false;
+                try {
+                    for (int i = 0; i < 300; i = i + 1) {
+                        VideoStepKind k = dec.Step();
+                        if (k == VideoStepKind.VideoFrame) {
+                            vFrames = vFrames + 1;
+                            if (vFrames == 1) {
+                                bool copied = dec.ReadVideoFrame(frame);
+                                Program.Check("dec-copy-frame", copied);
+                                int p0 = frame.GetPixel(80, 45);
+                                alphaOpaque = ((p0 >> 24) & 255) == 255;
+                            }
+                        } else if (k == VideoStepKind.AudioFrame) {
+                            aFrames = aFrames + 1;
+                            totalAudioSamples = totalAudioSamples + dec.AudioSamples;
+                        } else {
+                            break;
+                        }
+                        if (vFrames >= 10 && aFrames >= 10) break;
+                    }
+                    Program.Check("dec-got-video", vFrames >= 10);
+                    Program.Check("dec-got-audio", aFrames >= 10 && totalAudioSamples > 4000);
+                    Program.Check("dec-alpha-opaque", alphaOpaque);
+
+                    // Seek 到 1000ms 并读出一帧
+                    bool seekOk = dec.SeekMs(1000);
+                    Program.Check("dec-seek", seekOk);
+                    long afterPts = -1;
+                    for (int i = 0; i < 120; i = i + 1) {
+                        VideoStepKind k = dec.Step();
+                        if (k == VideoStepKind.VideoFrame) {
+                            afterPts = dec.VideoPtsMs;
+                            if (afterPts >= 800) break;
+                        } else if (k != VideoStepKind.AudioFrame) {
+                            break;
+                        }
+                    }
+                    Program.Check("dec-seek-pts", afterPts >= 800);
+                } finally {
+                    frame.Dispose();
+                    dec.Dispose();
+                }
+            }
+
+            // 4. 一键抽帧 + 保存 PNG/JPEG
+            ImageBuffer thumb = VideoDecoder.ExtractFrame(sampleA, 500, 160, 90);
+            Program.Check("extract-frame-dim", !thumb.IsEmpty && thumb.Width == 160 && thumb.Height == 90);
+            string thumbPng = Path.Combine(workDir, "thumb.png");
+            Program.Check("extract-frame-save", thumb.Save(thumbPng, ImageFormat.Png, 90));
+            thumb.Dispose();
+            ImageBuffer thumbReload = ImageBuffer.FromFile(thumbPng);
+            Program.Check("extract-frame-reload", thumbReload.Width == 160 && thumbReload.Height == 90);
+            thumbReload.Dispose();
+
+            // 5. 时间轴预览拼图（Contact Sheet）
+            ImageBuffer sheet = VideoProcessor.BuildContactSheet(sampleA, 2, 2, 80, 45, 4, (int)0xFF101014);
+            Program.Check("sheet-dim", sheet.Width == 172 && sheet.Height == 102);
+            Program.Check("sheet-bg", sheet.GetPixel(0, 0) == (int)0xFF101014);
+            Program.Check("sheet-tile-alpha", ((sheet.GetPixel(40, 24) >> 24) & 255) == 255);
+            sheet.Dispose();
+
+            // 6. 转码 / 裁切 / 抽音轨 / 转多帧 GIF（并由阶段 1 的 AnimatedImage 校验多帧）
+            string transcodedPath = Path.Combine(workDir, "out_160x90.mp4");
+            TranscodeOptions topt = new TranscodeOptions();
+            topt.Width = 160;
+            topt.Height = 90;
+            topt.Preset = "ultrafast";
+            topt.DurationMs = 1000;
+            MediaProcessResult tr = VideoProcessor.Transcode(sampleA, transcodedPath, topt);
+            Program.Check("transcode-ok", tr.Succeeded && File.Exists(transcodedPath));
+            MediaInfo trInfo = MediaProbe.Probe(transcodedPath);
+            Program.Check("transcode-dim", trInfo.IsValid && trInfo.Width == 160 && trInfo.Height == 90);
+            Program.Check("transcode-dur", trInfo.DurationMs >= 800 && trInfo.DurationMs <= 1400);
+
+            string audioOut = Path.Combine(workDir, "audio_only.m4a");
+            MediaProcessResult ar = VideoProcessor.ExtractAudio(sampleA, audioOut, "aac", "96k", "ffmpeg");
+            Program.Check("extract-audio-ok", ar.Succeeded && File.Exists(audioOut));
+            MediaInfo arInfo = MediaProbe.Probe(audioOut);
+            Program.Check("extract-audio-probe", arInfo.IsValid && arInfo.HasAudio && !arInfo.HasVideo);
+
+            string gifOut = Path.Combine(workDir, "clip.gif");
+            MediaProcessResult gr = VideoProcessor.ToGif(sampleA, gifOut, 0, 1000, 120, 8, "ffmpeg");
+            Program.Check("to-gif-ok", gr.Succeeded && File.Exists(gifOut));
+            AnimatedImage animGif = AnimatedImage.FromFile(gifOut);
+            Program.Check("to-gif-frames", animGif != null && animGif.IsValid && animGif.FrameCount >= 5 && animGif.Width == 120);
+            if (animGif != null) { animGif.Dispose(); }
+
+            // 7. 多线程批处理（VideoBatch：并发抽封面 + 生成雪碧图）
+            string batchThumbDir = Path.Combine(workDir, "batch_thumbs");
+            VideoBatchOptions bopt = new VideoBatchOptions();
+            bopt.InputFiles = new List<string>();
+            bopt.InputFiles.Add(sampleA);
+            bopt.InputFiles.Add(sampleB);
+            bopt.OutputDirectory = batchThumbDir;
+            bopt.TaskKind = VideoBatchTaskKind.ExtractThumbnail;
+            bopt.ThumbnailTimestampMs = 400;
+            bopt.ThumbnailWidth = 128;
+            bopt.ThumbnailHeight = 72;
+            bopt.ThumbnailFormat = ImageFormat.Jpeg;
+            bopt.Concurrency = 2;
+            nint cbCount = AtomicInt.NativeCreate(0);
+            bopt.OnProgress = (int done, int total, string path, bool ok) => {
+                if (ok) { AtomicInt.NativeAdd(cbCount, 1); }
+            };
+            VideoBatchResult bres = VideoBatch.Run(bopt);
+            long cbTotal = AtomicInt.NativeLoad(cbCount);
+            AtomicInt.NativeDestroy(cbCount);
+            Program.Check("batch-thumb-ok", bres.Total == 2 && bres.Succeeded == 2 && bres.Failed == 0 && cbTotal == 2);
+            Program.Check("batch-thumb-files",
+                File.Exists(Path.Combine(batchThumbDir, "sample_a.jpg"))
+                && File.Exists(Path.Combine(batchThumbDir, "sample_b.jpg")));
+
+            // 8. 后台线程音画播放引擎（MediaPlaybackSession）生命周期与双缓冲帧发布
+            MediaPlaybackSession session = new MediaPlaybackSession();
+            session.EnableAudioOutput = false; // 无头模式用单调时钟验证帧推进与 Seek
+            try {
+                bool opened = session.Open(sampleA);
+                Program.Check("session-open", opened && session.VideoWidth == 320 && session.VideoHeight == 180);
+                Program.Check("session-first-frame", session.FrameVersion >= 1 && session.State == PlaybackState.Paused);
+
+                long v0 = session.FrameVersion;
+                session.Play();
+                Program.Check("session-playing", session.State == PlaybackState.Playing);
+                Thread.Sleep(320);
+                long v1 = session.FrameVersion;
+                long pos1 = session.PositionMs;
+                Program.Check("session-frames-advance", v1 > v0 && pos1 > 0);
+
+                // 发布到 mem: 图像键并验证宽高
+                bool pubOk = session.PublishFrameToImageKey("mem:video_test_frame");
+                Program.Check("session-publish-key", pubOk);
+
+                // CopyCurrentFrameTo 截帧验证
+                ImageBuffer snap = new ImageBuffer(320, 180);
+                bool snapOk = session.CopyCurrentFrameTo(snap);
+                Program.Check("session-copy-frame", snapOk && ((snap.GetPixel(160, 90) >> 24) & 255) == 255);
+                snap.Dispose();
+
+                session.Pause();
+                Program.Check("session-paused", session.State == PlaybackState.Paused);
+
+                session.SeekMs(1200);
+                session.Play();
+                Thread.Sleep(220);
+                Program.Check("session-seek-ok", session.PositionMs >= 900);
+
+                session.Stop();
+                Program.Check("session-stopped", session.State == PlaybackState.Stopped);
+            } finally {
+                session.Dispose();
+            }
+        } finally {
+            if (Directory.Exists(workDir)) { Directory.DeleteRecursive(workDir); }
+        }
+
+        if (Program.failCount == 0 && Program.passCount == 45) {
+            Console.WriteLine("video_pipeline: ok");
+        } else {
+            Console.WriteLine("video_pipeline: pass=" + Convert.ToString(Program.passCount)
+                + ", fail=" + Convert.ToString(Program.failCount));
+        }
+    }
+}

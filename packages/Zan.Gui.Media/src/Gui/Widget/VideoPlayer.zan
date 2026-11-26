@@ -1,0 +1,324 @@
+using System;
+using System.Media.Video;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// 高性能视频播放控件：
+// - 后台线程运行 MediaPlaybackSession（音频硬件主时钟 A/V 同步，UI 线程零阻塞）；
+// - 仅在 FrameVersion 递增时将双缓冲最新帧发布到交替 mem: 纹理键并 Blit；
+// - 内置底部播放/暂停按钮、可拖拽进度条与时间码显示（可通过 ShowControls 关闭）。
+public class VideoPlayer : Control, IDisposable {
+    public override Control CreateCloneShell() { return new VideoPlayer(); }
+
+    public Binding<string> Src;
+    public string Fit = "contain";
+    public bool AutoPlay = false;
+    public bool Loop = false;
+    public bool ShowControls = true;
+
+    private string resolvedSrc = null;
+    private MediaPlaybackSession session = null;
+    private long publishedVersion = -1;
+    private int keySlot = 0;
+    private string currentKey = "";
+    private string keyPrefix = "";
+    private bool scrubbing = false;
+
+    private static int nextPlayerId = 1;
+
+    private void InitPlayer(string src) {
+        this.InitControl("video-player");
+        this.styleSurfaceOwned = true;
+        this.Src = src;
+        int id = VideoPlayer.nextPlayerId;
+        VideoPlayer.nextPlayerId = id + 1;
+        this.keyPrefix = "mem:vp_" + Convert.ToString(id) + "_";
+        this.session = new MediaPlaybackSession();
+    }
+
+    public VideoPlayer() { this.InitPlayer(""); }
+    public VideoPlayer(string src) { this.InitPlayer(src); }
+
+    public MediaPlaybackSession Session {
+        get { return this.session; }
+    }
+
+    public PlaybackState State {
+        get { return this.session != null ? this.session.State : PlaybackState.Stopped; }
+    }
+
+    public long PositionMs {
+        get { return this.session != null ? this.session.PositionMs : 0; }
+    }
+
+    public long DurationMs {
+        get { return this.session != null ? this.session.DurationMs : 0; }
+    }
+
+    public void Play() {
+        this.ResolveSource();
+        if (this.session != null) { this.session.Play(); }
+    }
+
+    public void Pause() {
+        if (this.session != null) { this.session.Pause(); }
+    }
+
+    public void TogglePause() {
+        this.ResolveSource();
+        if (this.session != null) { this.session.TogglePause(); }
+    }
+
+    public void Stop() {
+        if (this.session != null) { this.session.Stop(); }
+    }
+
+    public void SeekMs(long targetMs) {
+        if (this.session != null) { this.session.SeekMs(targetMs); }
+    }
+
+    public void SetVolume(double vol) {
+        if (this.session != null) { this.session.SetVolume(vol); }
+    }
+
+    public void SetSpeed(double speed) {
+        if (this.session != null) { this.session.SetSpeed(speed); }
+    }
+
+    private void ResolveSource() {
+        string src = this.Src != null ? this.Src.Get() : "";
+        if (src == null) src = "";
+        if (this.resolvedSrc != null && src == this.resolvedSrc) return;
+        this.resolvedSrc = src;
+        this.publishedVersion = -1;
+        if (this.currentKey != "") {
+            Canvas.EvictImage(this.keyPrefix + "0");
+            Canvas.EvictImage(this.keyPrefix + "1");
+            this.currentKey = "";
+        }
+        if (this.session == null) {
+            this.session = new MediaPlaybackSession();
+        }
+        this.session.Loop = this.Loop;
+        if (src == "") {
+            this.session.Close();
+            return;
+        }
+        if (this.session.Open(src)) {
+            this.SyncFrameToKey();
+            if (this.AutoPlay) {
+                this.session.Play();
+            }
+        }
+    }
+
+    private void SyncFrameToKey() {
+        if (this.session == null) return;
+        long ver = this.session.FrameVersion;
+        if (ver <= 0 || ver == this.publishedVersion) return;
+        this.keySlot = 1 - this.keySlot;
+        string key = this.keyPrefix + Convert.ToString(this.keySlot);
+        if (this.session.PublishFrameToImageKey(key)) {
+            this.currentKey = key;
+            this.publishedVersion = ver;
+        }
+    }
+
+    private int ControlBarHeight(App app) {
+        return app.Scale(36);
+    }
+
+    private static string FormatTimeMs(long ms) {
+        if (ms < 0) ms = 0;
+        long totalSec = ms / 1000;
+        long min = totalSec / 60;
+        long sec = totalSec % 60;
+        string mStr = Convert.ToString(min);
+        string sStr = Convert.ToString(sec);
+        if (mStr.Length < 2) mStr = "0" + mStr;
+        if (sStr.Length < 2) sStr = "0" + sStr;
+        return mStr + ":" + sStr;
+    }
+
+    public override void OnMeasure(App app) {
+        this.ResolveSource();
+        StyleBox s = this.ResolveStyleAs(app, "video-player", Class, Style.SNormal());
+        int cssW = s.WidthOr(-1);
+        int cssH = s.HeightOr(-1);
+        int dw = cssW > 0 ? cssW : app.Scale(640);
+        int dh = cssH > 0 ? cssH : app.Scale(360);
+        if (cssW > 0 && cssH <= 0 && this.session != null && this.session.VideoWidth > 0 && this.session.VideoHeight > 0) {
+            dh = (int)((long)cssW * (long)this.session.VideoHeight / (long)this.session.VideoWidth);
+        } else if (cssH > 0 && cssW <= 0 && this.session != null && this.session.VideoWidth > 0 && this.session.VideoHeight > 0) {
+            dw = (int)((long)cssH * (long)this.session.VideoWidth / (long)this.session.VideoHeight);
+        }
+        this.prefW = dw;
+        this.prefH = dh;
+    }
+
+    public override void OnPaint(App app) {
+        this.ResolveSource();
+        if (this.bw <= 0 || this.bh <= 0) return;
+
+        if (this.session != null) {
+            this.session.Loop = this.Loop;
+            this.SyncFrameToKey();
+        }
+
+        Canvas c = app.canvas;
+        // 黑色影院底
+        c.FillRect(this.bx, this.by, this.bw, this.bh, (int)0xFF101216);
+
+        if (this.currentKey != "" && this.session != null
+            && this.session.VideoWidth > 0 && this.session.VideoHeight > 0) {
+            this.BlitVideo(c, this.session.VideoWidth, this.session.VideoHeight);
+        }
+
+        if (this.ShowControls && this.bh >= app.Scale(64)) {
+            this.PaintControlBar(app, c);
+        }
+
+        if (this.session != null && this.session.State == PlaybackState.Playing) {
+            app.RequestRedraw();
+        }
+    }
+
+    private void BlitVideo(Canvas c, int vw, int vh) {
+        c.PushClip(this.bx, this.by, this.bw, this.bh);
+        if (this.Fit == "fill") {
+            c.BlitImage(this.currentKey, this.bx, this.by, this.bw, this.bh, 0, 0, 0, 0);
+        } else {
+            long lhs = (long)this.bw * (long)vh;
+            long rhs = (long)this.bh * (long)vw;
+            int dw = this.bw;
+            int dh = this.bh;
+            bool cover = this.Fit == "cover";
+            if ((cover && lhs < rhs) || (!cover && lhs > rhs)) {
+                dw = (int)((long)this.bh * (long)vw / (long)vh);
+            } else {
+                dh = (int)((long)this.bw * (long)vh / (long)vw);
+            }
+            int dx = this.bx + (this.bw - dw) / 2;
+            int dy = this.by + (this.bh - dh) / 2;
+            c.BlitImage(this.currentKey, dx, dy, dw, dh, 0, 0, 0, 0);
+        }
+        c.PopClip();
+    }
+
+    private void PaintControlBar(App app, Canvas c) {
+        int barH = this.ControlBarHeight(app);
+        int barY = this.by + this.bh - barH;
+        c.FillRect(this.bx, barY, this.bw, barH, (int)0xB80E1014);
+
+        int pad = app.Scale(10);
+        int fs = Style.FontFallback(app, "small");
+        int ty = Canvas.CenterTextY(barY, barH, fs);
+
+        bool playing = this.session != null && this.session.State == PlaybackState.Playing;
+        string btnText = playing ? "II" : ">";
+        int btnW = app.Scale(28);
+        c.DrawText(this.bx + pad + app.Scale(6), ty, btnText, (int)0xFFFFFFFF, fs);
+
+        long pos = this.PositionMs;
+        long dur = this.DurationMs;
+        string timeText = VideoPlayer.FormatTimeMs(pos) + " / " + VideoPlayer.FormatTimeMs(dur);
+        int timeW = Canvas.MeasureText(timeText, fs);
+        int timeX = this.bx + this.bw - pad - timeW;
+        c.DrawText(timeX, ty, timeText, (int)0xFFDCE3EC, fs);
+
+        int trackX = this.bx + pad + btnW + pad;
+        int trackW = timeX - pad - trackX;
+        if (trackW > app.Scale(24)) {
+            int trackH = app.Scale(6);
+            int trackY = barY + (barH - trackH) / 2;
+            c.FillRect(trackX, trackY, trackW, trackH, (int)0x66FFFFFF);
+            if (dur > 0) {
+                int fillW = (int)((long)trackW * pos / dur);
+                if (fillW < 0) fillW = 0;
+                if (fillW > trackW) fillW = trackW;
+                c.FillRect(trackX, trackY, fillW, trackH, (int)0xFF3B82F6);
+            }
+        }
+    }
+
+    private void SeekByPointerX(App app, int px) {
+        if (this.session == null || this.session.DurationMs <= 0) return;
+        int pad = app.Scale(10);
+        int fs = Style.FontFallback(app, "small");
+        int btnW = app.Scale(28);
+        string timeText = VideoPlayer.FormatTimeMs(this.PositionMs) + " / " + VideoPlayer.FormatTimeMs(this.DurationMs);
+        int timeW = Canvas.MeasureText(timeText, fs);
+        int trackX = this.bx + pad + btnW + pad;
+        int trackW = (this.bx + this.bw - pad - timeW) - pad - trackX;
+        if (trackW <= 0) return;
+        int rel = px - trackX;
+        if (rel < 0) rel = 0;
+        if (rel > trackW) rel = trackW;
+        long target = (this.session.DurationMs * (long)rel) / (long)trackW;
+        this.session.SeekMs(target);
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) return;
+        this.ResolveSource();
+        int barH = this.ControlBarHeight(app);
+        int barY = this.by + this.bh - barH;
+        if (this.ShowControls && e.y >= barY) {
+            int pad = app.Scale(10);
+            int btnEnd = this.bx + pad + app.Scale(28) + pad;
+            if (e.x <= btnEnd) {
+                this.TogglePause();
+            } else {
+                this.scrubbing = true;
+                app.CapturePointer(this, true);
+                this.SeekByPointerX(app, e.x);
+            }
+        } else {
+            this.TogglePause();
+        }
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || !this.scrubbing || app == null || app.GetCapturedPointer() != this) return;
+        this.SeekByPointerX(app, e.x);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (!this.scrubbing) return;
+        this.scrubbing = false;
+        if (app != null && app.GetCapturedPointer() == this) {
+            app.ReleasePointerCapture();
+        }
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.scrubbing = false;
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) {
+            app.ReleasePointerCapture();
+        }
+    }
+
+    public void Dispose() {
+        if (this.currentKey != "") {
+            Canvas.EvictImage(this.keyPrefix + "0");
+            Canvas.EvictImage(this.keyPrefix + "1");
+            this.currentKey = "";
+        }
+        if (this.session != null) {
+            this.session.Dispose();
+            this.session = null;
+        }
+    }
+}

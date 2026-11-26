@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Drawing;
+
+namespace System.Drawing.Imaging;
+
+public enum ImageResizeMode {
+    None = 0,
+    Fit = 1,
+    Cover = 2,
+    Exact = 3
+}
+
+public enum WatermarkAnchor {
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3,
+    Center = 4
+}
+
+public delegate void ImageBatchProgressCallback(int completed, int total, string inputPath, bool succeeded);
+
+// 批量图像处理任务配置（强类型配置实体，支持目录扫描或显式文件列表）。
+public class ImageBatchOptions {
+    public string InputDirectory = "";
+    public bool Recursive = false;
+    public List<string> InputFiles = null;
+    public string OutputDirectory = "";
+    public ImageFormat OutputFormat = ImageFormat.Jpeg;
+    public int Quality = 88;
+    public ImageResizeMode ResizeMode = ImageResizeMode.None;
+    public int TargetWidth = 0;
+    public int TargetHeight = 0;
+    public int RotateDegrees = 0; // 0 / 90 / 180 / 270
+    public bool FlipHorizontal = false;
+    public bool FlipVertical = false;
+    public bool Grayscale = false;
+    public int BrightnessDelta = 0;
+    public int ContrastPercent = 0;
+    public int SaturationPercent = 0;
+    public ImageBuffer Watermark = null;
+    public WatermarkAnchor WatermarkAnchor = WatermarkAnchor.BottomRight;
+    public int WatermarkMargin = 16;
+    public int Concurrency = 1;
+    public ImageBatchProgressCallback OnProgress = null;
+}
+
+public class ImageBatchItemResult {
+    public string InputPath = "";
+    public string OutputPath = "";
+    public bool Succeeded = false;
+    public string Error = "";
+    public int Width = 0;
+    public int Height = 0;
+}
+
+public class ImageBatchResult {
+    public int Total = 0;
+    public int Succeeded = 0;
+    public int Failed = 0;
+    public List<ImageBatchItemResult> Items = new List<ImageBatchItemResult>();
+}
+
+// 多线程/单线程图片批处理流水线（无 GUI 依赖，适用于服务端与 CLI 工具）。
+public class ImageBatch {
+    public static bool IsSupportedInputExtension(string path) {
+        string ext = Path.GetExtension(path);
+        if (ext == null || ext == "") return false;
+        string lower = ext.ToLower();
+        return lower == ".png" || lower == ".jpg" || lower == ".jpeg"
+            || lower == ".bmp" || lower == ".webp" || lower == ".gif"
+            || lower == ".tga" || lower == ".psd" || lower == ".ppm"
+            || lower == ".pgm" || lower == ".ico";
+    }
+
+    public static string ExtensionForFormat(ImageFormat fmt) {
+        if (fmt == ImageFormat.Jpeg) return ".jpg";
+        if (fmt == ImageFormat.Bmp || fmt == ImageFormat.Bmp24) return ".bmp";
+        if (fmt == ImageFormat.Tga) return ".tga";
+        return ".png";
+    }
+
+    public static ImageBatchResult Run(ImageBatchOptions options) {
+        ImageBatchResult result = new ImageBatchResult();
+        if (options == null || options.OutputDirectory == null || options.OutputDirectory == "") {
+            return result;
+        }
+        Directory.CreateDirectoryRecursive(options.OutputDirectory);
+
+        List<string> files = new List<string>();
+        if (options.InputFiles != null && options.InputFiles.Count > 0) {
+            for (int i = 0; i < options.InputFiles.Count; i = i + 1) {
+                files.Add(options.InputFiles[i]);
+            }
+        } else if (options.InputDirectory != null && options.InputDirectory != ""
+                   && Directory.Exists(options.InputDirectory)) {
+            List<string> found = Directory.GetFiles(options.InputDirectory, "*", options.Recursive);
+            for (int i = 0; i < found.Count; i = i + 1) {
+                if (ImageBatch.IsSupportedInputExtension(found[i])) {
+                    files.Add(found[i]);
+                }
+            }
+        }
+
+        int total = files.Count;
+        result.Total = total;
+        if (total == 0) return result;
+
+        ImageBatchItemResult[] slots = new ImageBatchItemResult[total];
+        int workers = options.Concurrency;
+        if (workers < 1) workers = 1;
+        if (workers > total) workers = total;
+        if (workers > 16) workers = 16;
+
+        if (workers == 1) {
+            for (int i = 0; i < total; i = i + 1) {
+                ImageBatchItemResult item = ImageBatch.ProcessOne(files[i], options);
+                slots[i] = item;
+                if (options.OnProgress != null) {
+                    options.OnProgress(i + 1, total, item.InputPath, item.Succeeded);
+                }
+            }
+        } else {
+            nint nextIdx = AtomicInt.NativeCreate(0);
+            nint doneCount = AtomicInt.NativeCreate(0);
+            nint activeWorkers = AtomicInt.NativeCreate(workers);
+            try {
+                for (int w = 0; w < workers; w = w + 1) {
+                    bool started = Thread.Start(() => {
+                        try {
+                            while (true) {
+                                int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
+                                if (idx >= total) break;
+                                ImageBatchItemResult item = ImageBatch.ProcessOne(files[idx], options);
+                                slots[idx] = item;
+                                int done = (int)AtomicInt.NativeAdd(doneCount, 1);
+                                if (options.OnProgress != null) {
+                                    options.OnProgress(done, total, item.InputPath, item.Succeeded);
+                                }
+                            }
+                        } finally {
+                            AtomicInt.NativeAdd(activeWorkers, -1);
+                        }
+                    });
+                    if (!started) {
+                        AtomicInt.NativeAdd(activeWorkers, -1);
+                    }
+                }
+                while (AtomicInt.NativeLoad(activeWorkers) > 0) {
+                    Thread.Sleep(2);
+                }
+            } finally {
+                AtomicInt.NativeDestroy(nextIdx);
+                AtomicInt.NativeDestroy(doneCount);
+                AtomicInt.NativeDestroy(activeWorkers);
+            }
+        }
+
+        for (int i = 0; i < total; i = i + 1) {
+            ImageBatchItemResult item = slots[i];
+            if (item == null) {
+                item = new ImageBatchItemResult();
+                item.InputPath = files[i];
+                item.Error = "worker aborted";
+            }
+            result.Items.Add(item);
+            if (item.Succeeded) { result.Succeeded = result.Succeeded + 1; }
+            else { result.Failed = result.Failed + 1; }
+        }
+        return result;
+    }
+
+    private static ImageBatchItemResult ProcessOne(string inputPath, ImageBatchOptions opt) {
+        ImageBatchItemResult res = new ImageBatchItemResult();
+        res.InputPath = inputPath;
+        string stem = Path.GetFileNameWithoutExtension(inputPath);
+        string ext = ImageBatch.ExtensionForFormat(opt.OutputFormat);
+        res.OutputPath = Path.Combine(opt.OutputDirectory, stem + ext);
+
+        ImageBuffer cur = ImageBuffer.FromFile(inputPath);
+        if (cur.IsEmpty) {
+            cur.Dispose();
+            res.Error = "decode failed";
+            return res;
+        }
+        try {
+            if (opt.RotateDegrees == 90 || opt.RotateDegrees == 180 || opt.RotateDegrees == 270) {
+                ImageBuffer rot = opt.RotateDegrees == 90 ? cur.Rotate90()
+                    : (opt.RotateDegrees == 180 ? cur.Rotate180() : cur.Rotate270());
+                cur.Dispose();
+                cur = rot;
+            }
+            if (opt.FlipHorizontal) { cur.FlipHorizontal(); }
+            if (opt.FlipVertical) { cur.FlipVertical(); }
+
+            if (opt.ResizeMode != ImageResizeMode.None && opt.TargetWidth > 0 && opt.TargetHeight > 0) {
+                ImageBuffer resized = null;
+                if (opt.ResizeMode == ImageResizeMode.Fit) {
+                    resized = cur.ResizeFit(opt.TargetWidth, opt.TargetHeight);
+                } else if (opt.ResizeMode == ImageResizeMode.Cover) {
+                    resized = cur.ResizeCover(opt.TargetWidth, opt.TargetHeight);
+                } else if (opt.ResizeMode == ImageResizeMode.Exact) {
+                    resized = cur.ResizeLanczos(opt.TargetWidth, opt.TargetHeight);
+                }
+                if (resized != null && !resized.IsEmpty) {
+                    cur.Dispose();
+                    cur = resized;
+                } else if (resized != null) {
+                    resized.Dispose();
+                }
+            }
+
+            if (opt.BrightnessDelta != 0) { cur.AdjustBrightness(opt.BrightnessDelta); }
+            if (opt.ContrastPercent != 0) { cur.AdjustContrast(opt.ContrastPercent); }
+            if (opt.SaturationPercent != 0) { cur.AdjustSaturation(opt.SaturationPercent); }
+            if (opt.Grayscale) { cur.Grayscale(); }
+
+            if (opt.Watermark != null && !opt.Watermark.IsEmpty) {
+                int wx = opt.WatermarkMargin;
+                int wy = opt.WatermarkMargin;
+                if (opt.WatermarkAnchor == WatermarkAnchor.TopRight) {
+                    wx = cur.Width - opt.Watermark.Width - opt.WatermarkMargin;
+                } else if (opt.WatermarkAnchor == WatermarkAnchor.BottomLeft) {
+                    wy = cur.Height - opt.Watermark.Height - opt.WatermarkMargin;
+                } else if (opt.WatermarkAnchor == WatermarkAnchor.BottomRight) {
+                    wx = cur.Width - opt.Watermark.Width - opt.WatermarkMargin;
+                    wy = cur.Height - opt.Watermark.Height - opt.WatermarkMargin;
+                } else if (opt.WatermarkAnchor == WatermarkAnchor.Center) {
+                    wx = (cur.Width - opt.Watermark.Width) / 2;
+                    wy = (cur.Height - opt.Watermark.Height) / 2;
+                }
+                cur.Blit(opt.Watermark, wx, wy, true);
+            }
+
+            res.Width = cur.Width;
+            res.Height = cur.Height;
+            bool saved = cur.Save(res.OutputPath, opt.OutputFormat, opt.Quality);
+            if (!saved) {
+                res.Error = "encode/save failed";
+                return res;
+            }
+            res.Succeeded = true;
+            return res;
+        } finally {
+            cur.Dispose();
+        }
+    }
+}

@@ -22,12 +22,14 @@ $owners = @{
     zan_gui = "packages\Zan.Gui\src\Gui\drivers"
     zan_image = "packages\Zan.Drawing\src\System\Drawing\Imaging\drivers"
     zan_audio = "packages\Zan.Desktop\src\System\Media\drivers"
+    zan_video = "packages\Zan.Media\src\System\Media\Video\drivers"
     zan_game = "packages\Zan.Game\src\Game\Graphics\drivers"
 }
 $syslibs = @{
     zan_gui = @("dwmapi", "gdi32", "imm32", "user32", "shcore", "ole32", "rpcrt4")
     zan_image = @()
     zan_audio = @("ole32")
+    zan_video = @()
     # .libs dependencies are flat: include the GUI system closure explicitly.
     zan_game = @("zan_gui", "zan_image", "dwmapi", "gdi32", "imm32", "user32", "shcore", "ole32", "rpcrt4")
 }
@@ -69,6 +71,7 @@ if ($Static) {
             "zan_gui" { "gui" }
             "zan_image" { "image" }
             "zan_audio" { "audio" }
+            "zan_video" { "video" }
             "zan_game" { "game" }
         }
         $sourceName = if ($driver -eq "zan_gui") { "gui_runtime.c" } else { "$driver.c" }

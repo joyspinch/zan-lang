@@ -1,0 +1,62 @@
+using System;
+
+namespace System.Drawing.Imaging;
+
+// 多帧动图容器（支持 GIF 全帧解码；静态图统一表现为 1 帧）。
+// 配合 CopyFrameTo 可在动画播放循环中实现零分配帧复用。
+public class AnimatedImage : IDisposable {
+    private nint handle;
+    public int Width;
+    public int Height;
+    public int FrameCount;
+
+    private AnimatedImage(nint handle) {
+        this.handle = handle;
+        this.Width = ImageCodec.AnimWidth(handle);
+        this.Height = ImageCodec.AnimHeight(handle);
+        this.FrameCount = ImageCodec.AnimFrameCount(handle);
+    }
+
+    public bool IsValid {
+        get { return this.handle != 0 && this.Width > 0 && this.Height > 0 && this.FrameCount > 0; }
+    }
+
+    public static AnimatedImage FromFile(string path) {
+        nint h = ImageCodec.AnimOpenFile(path);
+        return h == 0 ? null : new AnimatedImage(h);
+    }
+
+    public static AnimatedImage FromBytes(byte[] data) {
+        if (data == null || data.Length <= 0) return null;
+        nint h = ImageCodec.AnimOpenMem(data, data.Length);
+        return h == 0 ? null : new AnimatedImage(h);
+    }
+
+    // 返回第 index 帧的展示时长（毫秒）。
+    public int GetFrameDelayMs(int index) {
+        if (this.handle == 0 || index < 0 || index >= this.FrameCount) return 0;
+        return ImageCodec.AnimFrameDelayMs(this.handle, index);
+    }
+
+    // 分配新 ImageBuffer 并拷出第 index 帧（ARGB32）。
+    public ImageBuffer GetFrame(int index) {
+        if (!this.IsValid || index < 0 || index >= this.FrameCount) return new ImageBuffer(0, 0);
+        return ImageBuffer.FromAnimHandle(this.handle, index);
+    }
+
+    // 将第 index 帧直接拷贝到已有同尺寸 ImageBuffer（零分配热路径）。
+    public bool CopyFrameTo(int index, ImageBuffer dst) {
+        if (!this.IsValid || dst == null || dst.IsEmpty) return false;
+        if (index < 0 || index >= this.FrameCount) return false;
+        if (dst.Width != this.Width || dst.Height != this.Height) return false;
+        int expected = this.Width * this.Height;
+        return ImageCodec.AnimCopyFrame(this.handle, index, dst.Pixels, expected) == expected;
+    }
+
+    public void Dispose() {
+        if (this.handle != 0) {
+            ImageCodec.AnimClose(this.handle);
+            this.handle = 0;
+        }
+    }
+}

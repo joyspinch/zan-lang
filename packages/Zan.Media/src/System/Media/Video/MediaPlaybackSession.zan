@@ -1,0 +1,385 @@
+using System;
+using System.Threading;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Media;
+
+namespace System.Media.Video;
+
+public enum PlaybackState {
+    Stopped = 0,
+    Playing = 1,
+    Paused = 2,
+    Ended = 3
+}
+
+// 音画同步后台播放引擎：
+// - 独立解码线程运行 VideoDecoder，严守 UI 线程零阻塞铁律；
+// - 有音轨时以 zan_audio 流式音频硬件时钟为主时钟（Audio Master Clock），
+//   无音轨或无音频设备时自动切换单调系统时钟（Environment.TickCount64）；
+// - 双缓冲帧交换 + 递增 FrameVersion，UI 线程仅在有新帧时拷贝到纹理键。
+public class MediaPlaybackSession : IDisposable {
+    private string sourceUrl = "";
+    private VideoDecoder decoder = null;
+    private AudioStream audioStream = null;
+    private bool useAudioClock = false;
+
+    private ImageBuffer frontFrame = null;
+    private ImageBuffer backFrame = null;
+    private Mutex frameLock = new Mutex();
+
+    private nint stateAtomic = 0;        // 0=Stopped, 1=Playing, 2=Paused, 3=Ended
+    private nint stopFlag = 0;           // 1 = 请求后台线程退出
+    private nint workerRunning = 0;      // 1 = 后台线程运行中
+    private nint seekPending = 0;        // >= 0 表示待处理的 Seek 目标毫秒，-1 表示无
+    private nint positionMs = 0;
+    private nint frameVersion = 0;
+
+    private double volume = 1.0;
+    private double speed = 1.0;
+    private bool loop = false;
+    private bool enableAudioOutput = true;
+
+    public MediaInfo Info = new MediaInfo();
+
+    public MediaPlaybackSession() {
+        this.stateAtomic = AtomicInt.NativeCreate(0);
+        this.stopFlag = AtomicInt.NativeCreate(0);
+        this.workerRunning = AtomicInt.NativeCreate(0);
+        this.seekPending = AtomicInt.NativeCreate(-1);
+        this.positionMs = AtomicInt.NativeCreate(0);
+        this.frameVersion = AtomicInt.NativeCreate(0);
+    }
+
+    public PlaybackState State {
+        get {
+            int s = (int)AtomicInt.NativeLoad(this.stateAtomic);
+            if (s == 1) return PlaybackState.Playing;
+            if (s == 2) return PlaybackState.Paused;
+            if (s == 3) return PlaybackState.Ended;
+            return PlaybackState.Stopped;
+        }
+    }
+
+    public long PositionMs {
+        get { return AtomicInt.NativeLoad(this.positionMs); }
+    }
+
+    public long DurationMs {
+        get { return this.Info != null ? this.Info.DurationMs : 0; }
+    }
+
+    public long FrameVersion {
+        get { return AtomicInt.NativeLoad(this.frameVersion); }
+    }
+
+    public int VideoWidth {
+        get { return this.Info != null ? this.Info.Width : 0; }
+    }
+
+    public int VideoHeight {
+        get { return this.Info != null ? this.Info.Height : 0; }
+    }
+
+    public bool EnableAudioOutput {
+        get { return this.enableAudioOutput; }
+        set { this.enableAudioOutput = value; }
+    }
+
+    public bool Loop {
+        get { return this.loop; }
+        set { this.loop = value; }
+    }
+
+    public void SetVolume(double vol) {
+        if (vol < 0.0) vol = 0.0;
+        if (vol > 2.0) vol = 2.0;
+        this.volume = vol;
+        if (this.audioStream != null) {
+            this.audioStream.SetGain(vol);
+        }
+    }
+
+    public void SetSpeed(double spd) {
+        if (spd < 0.25) spd = 0.25;
+        if (spd > 4.0) spd = 4.0;
+        this.speed = spd;
+        if (this.audioStream != null) {
+            this.audioStream.SetSpeed(spd);
+        }
+    }
+
+    public bool Open(string url) {
+        this.Close();
+        if (url == null || url == "") return false;
+        VideoDecoder dec = VideoDecoder.Open(url);
+        if (dec == null) return false;
+
+        this.sourceUrl = url;
+        this.decoder = dec;
+        this.Info = dec.Info;
+        AtomicInt.NativeStore(this.positionMs, 0);
+        AtomicInt.NativeStore(this.frameVersion, 0);
+        AtomicInt.NativeStore(this.seekPending, -1);
+
+        if (dec.Info.HasVideo && dec.Info.Width > 0 && dec.Info.Height > 0) {
+            this.frameLock.WaitOne();
+            this.frontFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
+            this.backFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
+            this.frameLock.ReleaseMutex();
+        }
+
+        this.useAudioClock = false;
+        if (this.enableAudioOutput && dec.Info.HasAudio && dec.Info.AudioSampleRate > 0) {
+            if (Audio.IsOpen() || Audio.Open()) {
+                AudioStream stream = AudioStream.Create(dec.Info.AudioSampleRate, 2, 1000);
+                if (stream != null && stream.IsValid) {
+                    stream.SetGain(this.volume);
+                    stream.SetSpeed(this.speed);
+                    stream.Pause();
+                    this.audioStream = stream;
+                    this.useAudioClock = true;
+                }
+            }
+        }
+
+        // 预解码首帧，打开后即可显示封面画面
+        if (dec.Info.HasVideo && this.frontFrame != null) {
+            for (int i = 0; i < 64; i = i + 1) {
+                VideoStepKind k = dec.Step();
+                if (k == VideoStepKind.VideoFrame) {
+                    this.frameLock.WaitOne();
+                    if (dec.ReadVideoFrame(this.frontFrame)) {
+                        AtomicInt.NativeStore(this.positionMs, dec.VideoPtsMs);
+                        AtomicInt.NativeAdd(this.frameVersion, 1);
+                    }
+                    this.frameLock.ReleaseMutex();
+                    break;
+                } else if (k == VideoStepKind.EndOfStream || k == VideoStepKind.Error) {
+                    break;
+                }
+            }
+            dec.SeekMs(0);
+        }
+
+        AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Paused);
+        return true;
+    }
+
+    public void Play() {
+        if (this.decoder == null) return;
+        PlaybackState st = this.State;
+        if (st == PlaybackState.Ended) {
+            AtomicInt.NativeStore(this.seekPending, 0);
+        }
+        AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Playing);
+        if (this.audioStream != null) {
+            this.audioStream.Resume();
+        }
+        if (AtomicInt.NativeLoad(this.workerRunning) == 0) {
+            AtomicInt.NativeStore(this.stopFlag, 0);
+            AtomicInt.NativeStore(this.workerRunning, 1);
+            bool started = Thread.Start(() => { this.DecodeLoop(); });
+            if (!started) {
+                AtomicInt.NativeStore(this.workerRunning, 0);
+            }
+        }
+    }
+
+    public void Pause() {
+        if (this.decoder == null) return;
+        if (this.State == PlaybackState.Playing) {
+            AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Paused);
+            if (this.audioStream != null) {
+                this.audioStream.Pause();
+            }
+        }
+    }
+
+    public void TogglePause() {
+        if (this.State == PlaybackState.Playing) { this.Pause(); }
+        else { this.Play(); }
+    }
+
+    public void SeekMs(long targetMs) {
+        if (this.decoder == null) return;
+        if (targetMs < 0) targetMs = 0;
+        if (this.Info.DurationMs > 0 && targetMs > this.Info.DurationMs) {
+            targetMs = this.Info.DurationMs;
+        }
+        AtomicInt.NativeStore(this.seekPending, targetMs);
+        AtomicInt.NativeStore(this.positionMs, targetMs);
+        if (this.State == PlaybackState.Ended) {
+            AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Playing);
+        }
+    }
+
+    // 将最新解码画面注册到 "mem:" 图像键（供 UI 线程 Canvas.BlitImage 渲染，耗时 < 1ms）。
+    public bool PublishFrameToImageKey(string memKey) {
+        if (memKey == null || !memKey.StartsWith("mem:")) return false;
+        this.frameLock.WaitOne();
+        try {
+            if (this.frontFrame == null || this.frontFrame.IsEmpty) return false;
+            return this.frontFrame.RegisterAsImageKey(memKey);
+        } finally {
+            this.frameLock.ReleaseMutex();
+        }
+    }
+
+    // 将当前画面拷入调用方 ImageBuffer（无头模式或截帧用）。
+    public bool CopyCurrentFrameTo(ImageBuffer dst) {
+        if (dst == null || dst.IsEmpty) return false;
+        this.frameLock.WaitOne();
+        try {
+            if (this.frontFrame == null || this.frontFrame.IsEmpty) return false;
+            if (dst.Width != this.frontFrame.Width || dst.Height != this.frontFrame.Height) return false;
+            NativeMemory.Copy2D(dst.Pixels, dst.Stride, this.frontFrame.Pixels,
+                                this.frontFrame.Stride, this.frontFrame.Width * 4, this.frontFrame.Height);
+            return true;
+        } finally {
+            this.frameLock.ReleaseMutex();
+        }
+    }
+
+    private void DecodeLoop() {
+        long clockBasePtsMs = 0;
+        long clockBaseWallMs = Environment.TickCount64;
+        bool clockInitialized = false;
+
+        try {
+            while (AtomicInt.NativeLoad(this.stopFlag) == 0) {
+                // 1. 响应 Seek 请求
+                long reqSeek = AtomicInt.NativeExchange(this.seekPending, -1);
+                if (reqSeek >= 0) {
+                    this.decoder.SeekMs(reqSeek);
+                    if (this.audioStream != null) {
+                        this.audioStream.Flush();
+                    }
+                    clockBasePtsMs = reqSeek;
+                    clockBaseWallMs = Environment.TickCount64;
+                    clockInitialized = true;
+                }
+
+                int st = (int)AtomicInt.NativeLoad(this.stateAtomic);
+                if (st != (int)PlaybackState.Playing) {
+                    clockInitialized = false;
+                    Thread.Sleep(8);
+                    continue;
+                }
+
+                // 若音频缓冲充足，稍微让出 CPU 等待消费
+                if (this.useAudioClock && this.audioStream != null && this.audioStream.BufferedMs > 450) {
+                    Thread.Sleep(5);
+                    continue;
+                }
+
+                VideoStepKind kind = this.decoder.Step();
+                if (kind == VideoStepKind.AudioFrame) {
+                    if (this.audioStream != null && this.decoder.AudioSamples > 0) {
+                        if (!clockInitialized) {
+                            clockBasePtsMs = this.decoder.AudioPtsMs;
+                            clockBaseWallMs = Environment.TickCount64;
+                            clockInitialized = true;
+                        }
+                        nint ptr = this.decoder.AudioPcmPtr;
+                        int remain = this.decoder.AudioSamples;
+                        int offsetBytes = 0;
+                        while (remain > 0 && AtomicInt.NativeLoad(this.stopFlag) == 0) {
+                            int w = this.audioStream.Write(ptr + (nint)offsetBytes, remain);
+                            if (w > 0) {
+                                remain = remain - w;
+                                offsetBytes = offsetBytes + w * 4; // 2ch * s16
+                            } else {
+                                if (AtomicInt.NativeLoad(this.seekPending) >= 0) break;
+                                Thread.Sleep(4);
+                            }
+                        }
+                    }
+                } else if (kind == VideoStepKind.VideoFrame) {
+                    long pts = this.decoder.VideoPtsMs;
+                    if (!clockInitialized) {
+                        clockBasePtsMs = pts;
+                        clockBaseWallMs = Environment.TickCount64;
+                        clockInitialized = true;
+                    }
+
+                    // 音画同步等待：以音频硬件时钟优先，否则用单调系统时钟
+                    while (AtomicInt.NativeLoad(this.stopFlag) == 0) {
+                        if (AtomicInt.NativeLoad(this.seekPending) >= 0) break;
+                        if (AtomicInt.NativeLoad(this.stateAtomic) != (long)PlaybackState.Playing) break;
+                        long curClockMs = this.useAudioClock && this.audioStream != null
+                            ? (clockBasePtsMs + this.audioStream.PlayedMs)
+                            : (clockBasePtsMs + (long)((double)(Environment.TickCount64 - clockBaseWallMs) * this.speed));
+                        long delay = pts - curClockMs;
+                        if (delay <= 3) break;
+                        int sleepMs = delay > 20 ? 10 : (int)delay;
+                        Thread.Sleep(sleepMs);
+                    }
+
+                    if (this.backFrame != null && this.decoder.ReadVideoFrame(this.backFrame)) {
+                        this.frameLock.WaitOne();
+                        ImageBuffer tmp = this.frontFrame;
+                        this.frontFrame = this.backFrame;
+                        this.backFrame = tmp;
+                        this.frameLock.ReleaseMutex();
+                        AtomicInt.NativeStore(this.positionMs, pts);
+                        AtomicInt.NativeAdd(this.frameVersion, 1);
+                    }
+                } else if (kind == VideoStepKind.EndOfStream) {
+                    if (this.loop) {
+                        AtomicInt.NativeStore(this.seekPending, 0);
+                    } else {
+                        AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Ended);
+                    }
+                } else {
+                    AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Ended);
+                }
+            }
+        } finally {
+            AtomicInt.NativeStore(this.workerRunning, 0);
+        }
+    }
+
+    public void Stop() {
+        AtomicInt.NativeStore(this.stopFlag, 1);
+        AtomicInt.NativeStore(this.stateAtomic, (long)PlaybackState.Stopped);
+        if (this.audioStream != null) {
+            this.audioStream.Pause();
+            this.audioStream.Flush();
+        }
+        int wait = 0;
+        while (AtomicInt.NativeLoad(this.workerRunning) != 0 && wait < 500) {
+            Thread.Sleep(4);
+            wait = wait + 1;
+        }
+    }
+
+    public void Close() {
+        this.Stop();
+        if (this.audioStream != null) {
+            this.audioStream.Dispose();
+            this.audioStream = null;
+        }
+        if (this.decoder != null) {
+            this.decoder.Dispose();
+            this.decoder = null;
+        }
+        this.frameLock.WaitOne();
+        if (this.frontFrame != null) { this.frontFrame.Dispose(); this.frontFrame = null; }
+        if (this.backFrame != null) { this.backFrame.Dispose(); this.backFrame = null; }
+        this.frameLock.ReleaseMutex();
+        this.Info = new MediaInfo();
+        this.sourceUrl = "";
+    }
+
+    public void Dispose() {
+        this.Close();
+        if (this.stateAtomic != 0) { AtomicInt.NativeDestroy(this.stateAtomic); this.stateAtomic = 0; }
+        if (this.stopFlag != 0) { AtomicInt.NativeDestroy(this.stopFlag); this.stopFlag = 0; }
+        if (this.workerRunning != 0) { AtomicInt.NativeDestroy(this.workerRunning); this.workerRunning = 0; }
+        if (this.seekPending != 0) { AtomicInt.NativeDestroy(this.seekPending); this.seekPending = 0; }
+        if (this.positionMs != 0) { AtomicInt.NativeDestroy(this.positionMs); this.positionMs = 0; }
+        if (this.frameVersion != 0) { AtomicInt.NativeDestroy(this.frameVersion); this.frameVersion = 0; }
+        if (this.frameLock != null) { this.frameLock.Dispose(); this.frameLock = null; }
+    }
+}

@@ -1,0 +1,124 @@
+using System;
+using System.Drawing;
+
+namespace System.Media.Video;
+
+public enum VideoStepKind {
+    Error = -1,
+    EndOfStream = 0,
+    VideoFrame = 1,
+    AudioFrame = 2
+}
+
+// 进程内音视频流式解码器（基于动态加载 FFmpeg libavformat/libavcodec/libswscale/libswresample）。
+public class VideoDecoder : IDisposable {
+    private nint handle;
+    public MediaInfo Info;
+
+    private VideoDecoder(nint handle, string url) {
+        this.handle = handle;
+        this.Info = new MediaInfo();
+        this.Info.Source = url;
+        this.Info.IsValid = true;
+        this.Info.HasVideo = VideoNative.zan_video_has_video(handle) != 0;
+        this.Info.HasAudio = VideoNative.zan_video_has_audio(handle) != 0;
+        this.Info.Width = VideoNative.zan_video_width(handle);
+        this.Info.Height = VideoNative.zan_video_height(handle);
+        this.Info.DurationMs = VideoNative.zan_video_duration_ms(handle);
+        this.Info.FpsNum = VideoNative.zan_video_fps_num(handle);
+        this.Info.FpsDen = VideoNative.zan_video_fps_den(handle);
+        this.Info.Bitrate = VideoNative.zan_video_bitrate(handle);
+        this.Info.FrameCount = VideoNative.zan_video_frame_count(handle);
+        this.Info.VideoCodec = VideoNative.zan_video_video_codec(handle);
+        this.Info.AudioCodec = VideoNative.zan_video_audio_codec(handle);
+        this.Info.AudioSampleRate = VideoNative.zan_video_audio_sample_rate(handle);
+        this.Info.AudioChannels = VideoNative.zan_video_audio_channels(handle);
+    }
+
+    public bool IsValid {
+        get { return this.handle != 0; }
+    }
+
+    public static VideoDecoder Open(string url) {
+        if (url == null || url == "") return null;
+        nint h = VideoNative.zan_video_open(url);
+        return h == 0 ? null : new VideoDecoder(h, url);
+    }
+
+    // 推进一步解码，返回本步产出的帧类型（视频帧 / 音频帧 / 结束 / 错误）。
+    public VideoStepKind Step() {
+        if (this.handle == 0) return VideoStepKind.Error;
+        int r = VideoNative.zan_video_step(this.handle);
+        if (r == 1) return VideoStepKind.VideoFrame;
+        if (r == 2) return VideoStepKind.AudioFrame;
+        if (r == 0) return VideoStepKind.EndOfStream;
+        return VideoStepKind.Error;
+    }
+
+    // 将当前视频帧直接缩放/转色为 ARGB32 写入调用方的 ImageBuffer（零分配热路径）。
+    public bool ReadVideoFrame(ImageBuffer dst) {
+        if (this.handle == 0 || dst == null || dst.IsEmpty) return false;
+        return VideoNative.zan_video_copy_video_argb(
+            this.handle, dst.Pixels, dst.Width, dst.Height, dst.Width) != 0;
+    }
+
+    public long VideoPtsMs {
+        get { return this.handle == 0 ? 0 : VideoNative.zan_video_video_pts_ms(this.handle); }
+    }
+
+    // 当前音频帧原生 s16 立体声 PCM 指针（仅在下一次 Step/Seek/Dispose 前有效）。
+    public nint AudioPcmPtr {
+        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_pcm_ptr(this.handle); }
+    }
+
+    public int AudioSamples {
+        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_samples(this.handle); }
+    }
+
+    public long AudioPtsMs {
+        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_pts_ms(this.handle); }
+    }
+
+    public bool SeekMs(long targetMs) {
+        if (this.handle == 0) return false;
+        return VideoNative.zan_video_seek_ms(this.handle, targetMs) != 0;
+    }
+
+    // 一键抽取指定时间点的单帧图像（若 outWidth/outHeight <= 0 则使用原始视频分辨率）。
+    public static ImageBuffer ExtractFrame(string url, long timestampMs, int outWidth, int outHeight) {
+        if (url == null || url == "") return new ImageBuffer(0, 0);
+        int tw = outWidth;
+        int th = outHeight;
+        if (tw <= 0 || th <= 0) {
+            MediaInfo mi = MediaProbe.Probe(url);
+            if (!mi.IsValid || !mi.HasVideo || mi.Width <= 0 || mi.Height <= 0) {
+                return new ImageBuffer(0, 0);
+            }
+            if (tw <= 0 && th <= 0) {
+                tw = mi.Width;
+                th = mi.Height;
+            } else if (tw <= 0) {
+                tw = (int)((long)mi.Width * (long)th / (long)mi.Height);
+                if (tw < 1) tw = 1;
+            } else {
+                th = (int)((long)mi.Height * (long)tw / (long)mi.Width);
+                if (th < 1) th = 1;
+            }
+        }
+        ImageBuffer buf = new ImageBuffer(tw, th);
+        if (buf.IsEmpty) return buf;
+        int ok = VideoNative.zan_video_extract_frame_argb(url, timestampMs, buf.Pixels, tw, th);
+        if (ok == 0) {
+            buf.Dispose();
+            return new ImageBuffer(0, 0);
+        }
+        return buf;
+    }
+
+    public void Dispose() {
+        if (this.handle != 0) {
+            VideoNative.zan_video_close(this.handle);
+            this.handle = 0;
+        }
+    }
+}

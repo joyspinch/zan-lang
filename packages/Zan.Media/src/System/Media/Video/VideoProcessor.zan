@@ -1,0 +1,222 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Drawing;
+using System.Drawing.Imaging;
+
+namespace System.Media.Video;
+
+// 视频转码/裁切/压制配置（强类型，不拼接 shell 命令，杜绝命令注入）。
+public class TranscodeOptions {
+    public string VideoCodec = "libx264";
+    public string AudioCodec = "aac";
+    public int Crf = 23;               // <= 0 表示忽略 CRF
+    public string Preset = "medium";
+    public int Width = 0;              // <= 0 保持原宽；仅设其一时另一边按比例偶数对齐
+    public int Height = 0;
+    public int Fps = 0;                // <= 0 保持原帧率
+    public long StartMs = 0;           // > 0 时按起点裁切
+    public long DurationMs = 0;        // > 0 时限定输出时长
+    public string VideoBitrate = "";   // 如 "2M"
+    public string AudioBitrate = "128k";
+    public bool StripAudio = false;
+    public bool StreamCopy = false;    // 无损快速封装/裁切 (-c copy)
+    public string FfmpegExecutable = "ffmpeg";
+    public int TimeoutMs = 0;          // <= 0 表示使用默认无额外短超时
+}
+
+public class MediaProcessResult {
+    public bool Succeeded = false;
+    public int ExitCode = -1;
+    public string Error = "";
+}
+
+// 视频处理工具集：
+// - 进程内帧级处理（抽封面、等距抽帧、时间轴预览雪碧图 Contact Sheet）直通 zan_video；
+// - 转码/压缩/剪辑/提取音轨/高质量 GIF/无损拼接通过安全 argv 驱动 ffmpeg。
+public class VideoProcessor {
+    // 生成 N 列 x M 行视频时间轴预览拼图（Contact Sheet），全程进程内零 CLI 依赖。
+    public static ImageBuffer BuildContactSheet(string videoPath, int cols, int rows,
+                                                int tileWidth, int tileHeight, int gap, int bgColor) {
+        if (videoPath == null || cols <= 0 || rows <= 0 || tileWidth <= 0 || tileHeight <= 0) {
+            return new ImageBuffer(0, 0);
+        }
+        if (gap < 0) gap = 0;
+        MediaInfo info = MediaProbe.Probe(videoPath);
+        if (!info.IsValid || !info.HasVideo) return new ImageBuffer(0, 0);
+
+        int sheetW = cols * tileWidth + (cols + 1) * gap;
+        int sheetH = rows * tileHeight + (rows + 1) * gap;
+        ImageBuffer sheet = new ImageBuffer(sheetW, sheetH);
+        if (sheet.IsEmpty) return sheet;
+        sheet.Clear(bgColor);
+
+        int totalTiles = cols * rows;
+        long dur = info.DurationMs > 0 ? info.DurationMs : 0;
+        VideoDecoder dec = VideoDecoder.Open(videoPath);
+        if (dec == null) {
+            sheet.Dispose();
+            return new ImageBuffer(0, 0);
+        }
+        ImageBuffer tile = new ImageBuffer(tileWidth, tileHeight);
+        try {
+            for (int idx = 0; idx < totalTiles; idx = idx + 1) {
+                long ts = 0;
+                if (dur > 0) {
+                    ts = (dur * (long)(idx * 2 + 1)) / (long)(totalTiles * 2);
+                }
+                if (ts > 0) { dec.SeekMs(ts); }
+                bool got = false;
+                for (int tries = 0; tries < 400; tries = tries + 1) {
+                    VideoStepKind k = dec.Step();
+                    if (k == VideoStepKind.VideoFrame) {
+                        got = dec.ReadVideoFrame(tile);
+                        if (ts <= 0 || dec.VideoPtsMs >= ts) break;
+                    } else if (k != VideoStepKind.AudioFrame) {
+                        break;
+                    }
+                }
+                if (got) {
+                    int col = idx % cols;
+                    int row = idx / cols;
+                    int dx = gap + col * (tileWidth + gap);
+                    int dy = gap + row * (tileHeight + gap);
+                    sheet.Blit(tile, dx, dy, false);
+                }
+            }
+            return sheet;
+        } finally {
+            tile.Dispose();
+            dec.Dispose();
+        }
+    }
+
+    // 格式化毫秒为 FFmpeg 时间串 "seconds.mmm"。
+    private static string FormatSecondsMs(long ms) {
+        if (ms <= 0) return "0";
+        long sec = ms / 1000;
+        long rem = ms % 1000;
+        string rStr = Convert.ToString(rem);
+        while (rStr.Length < 3) { rStr = "0" + rStr; }
+        return Convert.ToString(sec) + "." + rStr;
+    }
+
+    private static MediaProcessResult RunFfmpeg(string exe, List<string> args, int timeoutMs) {
+        MediaProcessResult res = new MediaProcessResult();
+        string bin = (exe == null || exe == "") ? "ffmpeg" : exe;
+        ProcessResult pr = timeoutMs > 0
+            ? Process.CaptureSafe(bin, args, timeoutMs)
+            : Process.CaptureSafe(bin, args);
+        res.ExitCode = pr.ExitCode();
+        res.Succeeded = pr.Ok();
+        if (!res.Succeeded) {
+            res.Error = pr.Text();
+            if (res.Error == null || res.Error == "") {
+                res.Error = "ffmpeg exited with code " + Convert.ToString(res.ExitCode);
+            }
+        }
+        return res;
+    }
+
+    // 视频转码 / 压制 / 裁切 / 缩放。
+    public static MediaProcessResult Transcode(string inputPath, string outputPath, TranscodeOptions opt) {
+        MediaProcessResult res = new MediaProcessResult();
+        if (inputPath == null || inputPath == "" || outputPath == null || outputPath == "") {
+            res.Error = "inputPath and outputPath are required";
+            return res;
+        }
+        TranscodeOptions o = opt == null ? new TranscodeOptions() : opt;
+        List<string> args = new List<string>();
+        args.Add("-hide_banner");
+        args.Add("-loglevel"); args.Add("error");
+        args.Add("-y");
+
+        if (o.StartMs > 0) {
+            args.Add("-ss"); args.Add(VideoProcessor.FormatSecondsMs(o.StartMs));
+        }
+        args.Add("-i"); args.Add(inputPath);
+        if (o.DurationMs > 0) {
+            args.Add("-t"); args.Add(VideoProcessor.FormatSecondsMs(o.DurationMs));
+        }
+
+        if (o.StreamCopy) {
+            args.Add("-c"); args.Add("copy");
+        } else {
+            if (o.Width > 0 || o.Height > 0) {
+                int w = o.Width > 0 ? o.Width : -2;
+                int h = o.Height > 0 ? o.Height : -2;
+                args.Add("-vf");
+                args.Add("scale=" + Convert.ToString(w) + ":" + Convert.ToString(h));
+            }
+            if (o.Fps > 0) {
+                args.Add("-r"); args.Add(Convert.ToString(o.Fps));
+            }
+            if (o.VideoCodec != null && o.VideoCodec != "") {
+                args.Add("-c:v"); args.Add(o.VideoCodec);
+            }
+            if (o.Preset != null && o.Preset != "") {
+                args.Add("-preset"); args.Add(o.Preset);
+            }
+            if (o.Crf > 0) {
+                args.Add("-crf"); args.Add(Convert.ToString(o.Crf));
+            }
+            if (o.VideoBitrate != null && o.VideoBitrate != "") {
+                args.Add("-b:v"); args.Add(o.VideoBitrate);
+            }
+            args.Add("-pix_fmt"); args.Add("yuv420p");
+
+            if (o.StripAudio) {
+                args.Add("-an");
+            } else {
+                if (o.AudioCodec != null && o.AudioCodec != "") {
+                    args.Add("-c:a"); args.Add(o.AudioCodec);
+                }
+                if (o.AudioBitrate != null && o.AudioBitrate != "") {
+                    args.Add("-b:a"); args.Add(o.AudioBitrate);
+                }
+            }
+        }
+        args.Add("-movflags"); args.Add("+faststart");
+        args.Add(outputPath);
+        return VideoProcessor.RunFfmpeg(o.FfmpegExecutable, args, o.TimeoutMs);
+    }
+
+    // 提取音轨（如输出 .mp3 / .aac / .wav / .m4a）。
+    public static MediaProcessResult ExtractAudio(string inputPath, string outputAudioPath,
+                                                  string audioCodec, string bitrate, string ffmpegExe) {
+        List<string> args = new List<string>();
+        args.Add("-hide_banner"); args.Add("-loglevel"); args.Add("error"); args.Add("-y");
+        args.Add("-i"); args.Add(inputPath);
+        args.Add("-vn");
+        if (audioCodec != null && audioCodec != "") {
+            args.Add("-c:a"); args.Add(audioCodec);
+        }
+        if (bitrate != null && bitrate != "") {
+            args.Add("-b:a"); args.Add(bitrate);
+        }
+        args.Add(outputAudioPath);
+        return VideoProcessor.RunFfmpeg(ffmpegExe, args, 0);
+    }
+
+    // 视频片段转高质量调色板 GIF。
+    public static MediaProcessResult ToGif(string inputPath, string outputGifPath,
+                                           long startMs, long durationMs, int width, int fps,
+                                           string ffmpegExe) {
+        if (fps <= 0) fps = 10;
+        string scaleExpr = width > 0
+            ? ("scale=" + Convert.ToString(width) + ":-1:flags=lanczos")
+            : "scale=iw:ih";
+        string vf = "fps=" + Convert.ToString(fps) + "," + scaleExpr
+            + ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse";
+
+        List<string> args = new List<string>();
+        args.Add("-hide_banner"); args.Add("-loglevel"); args.Add("error"); args.Add("-y");
+        if (startMs > 0) { args.Add("-ss"); args.Add(VideoProcessor.FormatSecondsMs(startMs)); }
+        args.Add("-i"); args.Add(inputPath);
+        if (durationMs > 0) { args.Add("-t"); args.Add(VideoProcessor.FormatSecondsMs(durationMs)); }
+        args.Add("-vf"); args.Add(vf);
+        args.Add(outputGifPath);
+        return VideoProcessor.RunFfmpeg(ffmpegExe, args, 0);
+    }
+}

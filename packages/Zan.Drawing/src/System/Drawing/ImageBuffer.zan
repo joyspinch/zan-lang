@@ -7,7 +7,7 @@ namespace System.Drawing;
 // 封装内存管理、边界安全与高性能图像处理流水线（Crop、Resize、Blit、Fill）。
 // 所有热路径计算全部下沉至底层物理原语（NativeMemory.Copy2D 与 PixelOps），
 // 杜绝 C 业务胶水依赖，具备工业级运行效率。
-public class ImageBuffer : IDisposable {
+public partial class ImageBuffer : IDisposable {
     public int Width;
     public int Height;
     public int Stride;
@@ -177,15 +177,16 @@ public class ImageBuffer : IDisposable {
         PixelOps.SwapRB(this.Pixels, this.Pixels, this.Width * this.Height);
     }
 
-    // 调整整幅图像的明暗度（delta 为 -255..255）。基于 AVX2 饱和加减硬件指令，杜绝溢出反转。
+    // 调整整幅图像的明暗度（delta 为 -255..255）。基于 AVX2 饱和加减硬件指令，保留 Alpha 通道不变。
     public void AdjustBrightness(int delta) {
         if (this.Pixels == 0 || delta == 0) return;
         int totalBytes = this.Width * this.Height * 4;
         int i = 0;
         if (delta > 0) {
-            byte d = (byte)(delta > 255 ? 255 : delta);
-            Vector256 d256 = Vector256.Create(d);
-            Vector128 d128 = Vector128.Create(d);
+            int dv = delta > 255 ? 255 : delta;
+            int maskInt = (dv << 16) | (dv << 8) | dv;
+            Vector256 d256 = Vector256.Create(maskInt);
+            Vector128 d128 = Vector128.Create(maskInt);
             while (i + 32 <= totalBytes) {
                 Vector256 v = Vector256.Load(this.Pixels + (nint)i);
                 Vector256 sat = Vector256.AddSaturate(v, d256);
@@ -199,16 +200,21 @@ public class ImageBuffer : IDisposable {
                 i = i + 16;
             }
             Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
-            while (i < totalBytes) {
-                int val = (int)sp[i] + (int)d;
-                sp[i] = (byte)(val > 255 ? 255 : val);
-                i = i + 1;
+            while (i + 3 < totalBytes) {
+                int b = (int)sp[i] + dv;
+                int g = (int)sp[i + 1] + dv;
+                int r = (int)sp[i + 2] + dv;
+                sp[i] = (byte)(b > 255 ? 255 : b);
+                sp[i + 1] = (byte)(g > 255 ? 255 : g);
+                sp[i + 2] = (byte)(r > 255 ? 255 : r);
+                i = i + 4;
             }
         } else {
             int pos = -delta;
-            byte d = (byte)(pos > 255 ? 255 : pos);
-            Vector256 d256 = Vector256.Create(d);
-            Vector128 d128 = Vector128.Create(d);
+            int dv = pos > 255 ? 255 : pos;
+            int maskInt = (dv << 16) | (dv << 8) | dv;
+            Vector256 d256 = Vector256.Create(maskInt);
+            Vector128 d128 = Vector128.Create(maskInt);
             while (i + 32 <= totalBytes) {
                 Vector256 v = Vector256.Load(this.Pixels + (nint)i);
                 Vector256 sat = Vector256.SubtractSaturate(v, d256);
@@ -222,10 +228,14 @@ public class ImageBuffer : IDisposable {
                 i = i + 16;
             }
             Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
-            while (i < totalBytes) {
-                int val = (int)sp[i] - (int)d;
-                sp[i] = (byte)(val < 0 ? 0 : val);
-                i = i + 1;
+            while (i + 3 < totalBytes) {
+                int b = (int)sp[i] - dv;
+                int g = (int)sp[i + 1] - dv;
+                int r = (int)sp[i + 2] - dv;
+                sp[i] = (byte)(b < 0 ? 0 : b);
+                sp[i + 1] = (byte)(g < 0 ? 0 : g);
+                sp[i + 2] = (byte)(r < 0 ? 0 : r);
+                i = i + 4;
             }
         }
     }
@@ -317,29 +327,31 @@ public class ImageBuffer : IDisposable {
         }
     }
 
-    // 颜色反相（基于 AVX2 32 字节并行 XOR 硬件流水线）。
+    // 颜色反相（基于 AVX2 32 字节并行 XOR 硬件流水线，保留 Alpha 通道不变）。
     public void Invert() {
         if (this.Pixels == 0) return;
         int totalBytes = this.Width * this.Height * 4;
         int i = 0;
-        Vector256 all256 = Vector256.AllBitsSet;
-        Vector128 all128 = Vector128.AllBitsSet;
+        Vector256 rgb256 = Vector256.Create(0x00FFFFFF);
+        Vector128 rgb128 = Vector128.Create(0x00FFFFFF);
         while (i + 32 <= totalBytes) {
             Vector256 v = Vector256.Load(this.Pixels + (nint)i);
-            Vector256 inv = Vector256.Xor(v, all256);
+            Vector256 inv = Vector256.Xor(v, rgb256);
             Vector256.Store(this.Pixels + (nint)i, inv);
             i = i + 32;
         }
         while (i + 16 <= totalBytes) {
             Vector128 v = Vector128.Load(this.Pixels + (nint)i);
-            Vector128 inv = Vector128.Xor(v, all128);
+            Vector128 inv = Vector128.Xor(v, rgb128);
             Vector128.Store(this.Pixels + (nint)i, inv);
             i = i + 16;
         }
         Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
-        while (i < totalBytes) {
+        while (i + 3 < totalBytes) {
             sp[i] = (byte)(sp[i] ^ 255);
-            i = i + 1;
+            sp[i + 1] = (byte)(sp[i + 1] ^ 255);
+            sp[i + 2] = (byte)(sp[i + 2] ^ 255);
+            i = i + 4;
         }
     }
 

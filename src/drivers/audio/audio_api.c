@@ -125,6 +125,7 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     if (zan_audio_cs_ok) {
         EnterCriticalSection(&zan_audio_cs);
         for (i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+        zan_audio_streams_close_all_locked();
         LeaveCriticalSection(&zan_audio_cs);
     }
     if (zan_audio_stop_evt) { CloseHandle(zan_audio_stop_evt); zan_audio_stop_evt = NULL; }
@@ -141,6 +142,7 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     }
     zan_audio_lock();
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_streams_close_all_locked();
     zan_audio_unlock();
 #elif defined(__linux__)
     zan_audio_lock();
@@ -149,6 +151,7 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     zan_alsa_stop();
     zan_audio_lock();
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_streams_close_all_locked();
     zan_audio_unlock();
 #elif defined(__APPLE__)
     zan_audio_lock();
@@ -157,6 +160,7 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     zan_coreaudio_stop();
     zan_audio_lock();
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_streams_close_all_locked();
     zan_audio_unlock();
 #elif defined(__OHOS__)
     zan_audio_lock();
@@ -165,6 +169,7 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     zan_ohaudio_stop();
     zan_audio_lock();
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_streams_close_all_locked();
     zan_audio_unlock();
 #else
     zan_audio_ready = 0;

@@ -54,6 +54,7 @@
  * 5. audio/audio_api.c:    跨平台公开导出 zan_audio_* API
  */
 #include "audio_mixer.c"
+#include "audio_stream.c"
 #include "audio_clip.c"
 #include "audio_wasapi.c"
 #include "audio_posix.c"

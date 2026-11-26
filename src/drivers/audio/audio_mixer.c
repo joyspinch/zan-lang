@@ -109,6 +109,9 @@ static void zan_voice_reap_locked(void) {
     }
 }
 
+static void zan_audio_mix_streams_locked(float *acc, int frames, int devch);
+static void zan_audio_streams_close_all_locked(void);
+
 /* Mixer (Windows) */
 
 #ifdef _WIN32
@@ -167,6 +170,7 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
         v->cursor = cur;
         if (!v->loop && cur >= (double)nf) zan_voice_reset(v);
     }
+    zan_audio_mix_streams_locked(acc, (int)frames, devch);
     LeaveCriticalSection(&zan_audio_cs);
 
     switch (zan_audio_dev_fmt) {
@@ -277,6 +281,7 @@ static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
         v->cursor = cur;
         if (!v->loop && cur >= (double)nf) zan_voice_reset(v);
     }
+    zan_audio_mix_streams_locked(acc, frames, devch);
 
     /* Accumulator -> s16 with soft knee limiter */
     d = (short *)dst;
@@ -342,6 +347,7 @@ static void zan_audio_mix_f32(float *dst, int frames, int devch) {
         v->cursor = cur;
         if (!v->loop && cur >= (double)nf) zan_voice_reset(v);
     }
+    zan_audio_mix_streams_locked(acc, frames, devch);
 
     for (i = 0; i < total; i++) {
         float s = acc[i];
