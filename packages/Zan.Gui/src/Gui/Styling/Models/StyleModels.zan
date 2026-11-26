@@ -1,0 +1,374 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using System.Json;
+namespace Gui;
+
+public class AttrCond {
+    public string name;
+    public string op;
+    public string val;
+    public bool nocase;
+}
+
+public enum CompiledPropId {
+    Generic = 0,
+    Color = 1,
+    BgColor = 2,
+    AccentColor = 3,
+    BorderColor = 4,
+    BorderTopColor = 5,
+    BorderRightColor = 6,
+    BorderBottomColor = 7,
+    BorderLeftColor = 8,
+    Opacity = 9,
+    Display = 10,
+    FlexDir = 11,
+    Justify = 12,
+    AlignItems = 13,
+    FontWeight = 14,
+    TextAlign = 15,
+    Cursor = 16,
+    Visibility = 17,
+    Position = 18,
+    Overflow = 19,
+    OverflowX = 20,
+    OverflowY = 21,
+    ZIndex = 22,
+    BoxSizing = 23,
+    FlexWrap = 24,
+    FlexGrow = 25,
+    FlexShrink = 26
+}
+
+// 预编译单条 CSS 声明：在 StyleSheet 索引期完成 key 规范化、__zan_lengths 覆盖、
+// prescaled 标志、currentColor 检测及高频属性（纯色/枚举/opacity）的整型预求值。
+public struct CompiledDecl {
+    public string key;
+    public string val;
+    public CompiledPropId propId;
+    public int intVal;
+    public int auxVal;
+    public bool prescaled;
+    public int ccBits;
+    public bool isPureCurrentColor;
+}
+
+// CSS @keyframes 规则定义与任意进度插值求值器。
+public class CssKeyframeRule {
+    public string name;
+    public List<CssKeyframeStop> stops;
+
+    public CssKeyframeRule(string name) {
+        this.name = name;
+        this.stops = new List<CssKeyframeStop>();
+    }
+
+    public void AddStop(int offsetPm, JsonValue block) {
+        if (block == null || !block.IsObject()) { return; }
+        if (offsetPm < 0) { offsetPm = 0; }
+        if (offsetPm > 1000) { offsetPm = 1000; }
+        for (int i = 0; i < this.stops.Count; i = i + 1) {
+            if (this.stops[i].offsetPm == offsetPm) {
+                JsonValue dst = this.stops[i].block;
+                for (int k = 0; k < block.Count(); k = k + 1) {
+                    dst.Set(block.KeyAt(k), block.ValAt(k));
+                }
+                this.stops[i].Recompile();
+                return;
+            }
+            if (this.stops[i].offsetPm > offsetPm) {
+                this.stops.Insert(i, new CssKeyframeStop(offsetPm, block));
+                return;
+            }
+        }
+        this.stops.Add(new CssKeyframeStop(offsetPm, block));
+    }
+
+    static void ApplyStop(StyleBox b, CssKeyframeStop stop) {
+        if (stop == null || stop.compiled == null) { return; }
+        StyleSheet.ApplyCompiledList(b, stop.compiled);
+        StyleSheet.ResolveCurrentColor(b);
+    }
+
+    public StyleBox Evaluate(StyleBox baseBox, int progressPm) {
+        if (baseBox == null || this.stops == null || this.stops.Count == 0) { return baseBox; }
+        if (progressPm < 0) { progressPm = 0; }
+        if (progressPm > 1000) { progressPm = 1000; }
+
+        CssKeyframeStop prev = null;
+        CssKeyframeStop next = null;
+        for (int i = 0; i < this.stops.Count; i = i + 1) {
+            CssKeyframeStop st = this.stops[i];
+            if (st.offsetPm <= progressPm) {
+                prev = st;
+            }
+            if (st.offsetPm >= progressPm) {
+                next = st;
+                break;
+            }
+        }
+
+        int off0 = prev != null ? prev.offsetPm : 0;
+        int off1 = next != null ? next.offsetPm : 1000;
+
+        StyleBox b0 = baseBox.Clone();
+        if (prev != null) { CssKeyframeRule.ApplyStop(b0, prev); }
+
+        if (prev == next || off0 == off1) {
+            return b0;
+        }
+
+        StyleBox b1 = baseBox.Clone();
+        if (next != null) { CssKeyframeRule.ApplyStop(b1, next); }
+
+        int span = off1 - off0;
+        int localP = span > 0 ? (progressPm - off0) * 1000 / span : 1000;
+        StyleBox outBox = b1.Clone();
+        StyleBox.BlendSurfaceInto(outBox, b0, b1, localP);
+        return outBox;
+    }
+}
+
+// 单个 CSS @keyframes 关键帧停靠点（offsetPm 范围 0..1000）。
+public class CssKeyframeStop {
+    public int offsetPm;
+    public JsonValue block;
+    public List<CompiledDecl> compiled;
+
+    public CssKeyframeStop(int offsetPm, JsonValue block) {
+        this.offsetPm = offsetPm;
+        this.block = block;
+        this.compiled = StyleSheet.CompileBlock(block, false);
+    }
+
+    public void Recompile() {
+        this.compiled = StyleSheet.CompileBlock(this.block, false);
+    }
+}
+
+public class CssVarDecl {
+    public string name;
+    public string val;
+    public CssVarDecl(string name, string val) {
+        this.name = name != null ? name : "";
+        this.val = val != null ? val : "";
+    }
+    public static CssVarDecl Of(string name, string val) { return new CssVarDecl(name, val); }
+}
+
+public class HasCond {
+    public Selector inner;
+    public int lead;
+}
+
+public class MathCursor {
+    public List<string> toks;
+    public int pos;
+}
+
+public class MediaAlt {
+    public bool neg;
+    public List<MediaFeat> feats;
+    bool AltTrue(StyleBox b) {
+        if (feats == null || feats.Count == 0) { return false; }
+        bool ok = true;
+        for (int i = 0; i < feats.Count; i = i + 1) {
+            if (!feats[i].True(b)) { ok = false; break; }
+        }
+        return neg ? !ok : ok;
+    }
+    static MediaAlt And(MediaAlt x, MediaAlt y) {
+        MediaAlt outA = new MediaAlt();
+        outA.neg = x.neg || y.neg;
+        outA.feats = new List<MediaFeat>();
+        for (int i = 0; i < x.feats.Count; i = i + 1) { outA.feats.Add(x.feats[i]); }
+        for (int j = 0; j < y.feats.Count; j = j + 1) { outA.feats.Add(y.feats[j]); }
+        return outA;
+    }
+}
+
+public class MediaCond {
+    public List<MediaAlt> alts;
+    bool True(StyleBox b) {
+        if (alts == null || alts.Count == 0) { return false; }
+        for (int i = 0; i < alts.Count; i = i + 1) {
+            if (alts[i].AltTrue(b)) { return true; }
+        }
+        return false;
+    }
+    static MediaCond And(MediaCond x, MediaCond y) {
+        MediaCond outC = new MediaCond();
+        outC.alts = new List<MediaAlt>();
+        for (int i = 0; i < x.alts.Count; i = i + 1) {
+            for (int j = 0; j < y.alts.Count; j = j + 1) {
+                outC.alts.Add(MediaAlt.And(x.alts[i], y.alts[j]));
+            }
+        }
+        return outC;
+    }
+}
+
+public class MediaFeat {
+    public string name;
+    public string val;
+    bool True(StyleBox b) {
+        string n = Css.Lower(Css.Trim(name));
+        string v = Css.Lower(Css.Trim(val));
+        if (n == "screen" || n == "all") { return true; }
+        if (n == "print" || n == "speech" || n == "tv" || n == "tty"
+            || n == "projection" || n == "handheld") { return false; }
+        int w = b.envVw > 0 ? b.envVw : 1280;
+        int h = b.envVh > 0 ? b.envVh : 720;
+        if (n == "orientation") {
+            if (v == "landscape") { return w >= h; }
+            if (v == "portrait") { return h >= w; }
+            return false;
+        }
+        if (n == "prefers-color-scheme") {
+            if (v == "dark") { return b.mediaDark; }
+            if (v == "light") { return !b.mediaDark; }
+            return false;
+        }
+        if (n == "prefers-reduced-motion") {
+            if (v == "reduce") { return b.mediaReduced; }
+            if (v == "no-preference") { return !b.mediaReduced; }
+            return false;
+        }
+        if (n == "pointer" || n == "any-pointer") {
+            if (v == "fine") { return true; }
+            return false;
+        }
+        if (n == "hover" || n == "any-hover") {
+            if (v == "hover") { return true; }
+            return false;
+        }
+        if (n == "grid") { return v == "0"; }
+        if (n == "min-width") { return w >= StyleSheet.UnitPx(b, val); }
+        if (n == "max-width") { return w <= StyleSheet.UnitPx(b, val); }
+        if (n == "min-height") { return h >= StyleSheet.UnitPx(b, val); }
+        if (n == "max-height") { return h <= StyleSheet.UnitPx(b, val); }
+        if (n == "width") { return v == "" || w == StyleSheet.UnitPx(b, val); }
+        if (n == "height") { return v == "" || h == StyleSheet.UnitPx(b, val); }
+        if (n == "min-aspect-ratio" || n == "max-aspect-ratio"
+            || n == "aspect-ratio") {
+            int slash = Css.IndexFrom(val, "/", 0);
+            if (slash < 0) { return false; }
+            int dw = StyleSheet.Num(Css.Trim(val.Substring(0, slash)));
+            int dh = StyleSheet.Num(Css.Trim(val.Substring(
+                slash + 1, val.Length - slash - 1)));
+            if (dw <= 0 || dh <= 0) { return false; }
+            long lhs = (long)w * dh;
+            long rhs = (long)h * dw;
+            if (n == "min-aspect-ratio") { return lhs >= rhs; }
+            if (n == "max-aspect-ratio") { return lhs <= rhs; }
+            return lhs == rhs;
+        }
+        return false;
+    }
+}
+
+public class MediaOp {
+    public int at;
+    public string tx;
+    public MediaOp(int at, string tx) {
+        this.at = at;
+        this.tx = tx;
+    }
+}
+
+public class SelectorTokenChunk {
+    public string chunk;
+    public int combinator;
+    public SelectorTokenChunk(string chunk, int combinator) {
+        this.chunk = chunk;
+        this.combinator = combinator;
+    }
+}
+
+public class StyleMediaEntry {
+    public Selector selector;
+    public JsonValue block;
+    public JsonValue important;
+    public MediaCond condition;
+    public List<CompiledDecl> compiledNormal;
+    public List<CompiledDecl> compiledImportant;
+    public StyleMediaEntry(Selector selector, JsonValue block, JsonValue important, MediaCond condition) {
+        this.selector = selector;
+        this.block = block;
+        this.important = important;
+        this.condition = condition;
+        this.compiledNormal = StyleSheet.CompileBlock(block, false);
+        this.compiledImportant = StyleSheet.CompileBlock(block, true);
+    }
+}
+
+public class StyleRuleEntry {
+    public string text;
+    public Selector selector;
+    public JsonValue block;
+    public JsonValue important;
+    public List<CompiledDecl> compiledNormal;
+    public List<CompiledDecl> compiledImportant;
+    public StyleRuleEntry(string text, Selector selector, JsonValue block, JsonValue important) {
+        this.text = text;
+        this.selector = selector;
+        this.block = block;
+        this.important = important;
+        this.compiledNormal = StyleSheet.CompileBlock(block, false);
+        this.compiledImportant = StyleSheet.CompileBlock(block, true);
+    }
+}
+
+public class ThemeMetricsSnapshot {
+    public int fontSizeTiny;
+    public int fontSizeSmall;
+    public int fontSizeMedium;
+    public int fontSizeLarge;
+    public int fontSizeHuge;
+    public int heightTiny;
+    public int heightSmall;
+    public int heightMedium;
+    public int heightLarge;
+    public int paddingTiny;
+    public int paddingSmall;
+    public int paddingMedium;
+    public int paddingLarge;
+    public int gapSmall;
+    public int gapMedium;
+    public int gapLarge;
+    public int iconSizeSmall;
+    public int iconSizeMedium;
+    public int iconSizeLarge;
+    public int iconSizeCaption;
+    public int borderRadiusSmall;
+    public int borderRadiusMedium;
+    public int borderRadiusLarge;
+    public int borderWidth;
+    public ThemeMetricsSnapshot() {
+        this.fontSizeTiny = 12;
+        this.fontSizeSmall = 13;
+        this.fontSizeMedium = 14;
+        this.fontSizeLarge = 16;
+        this.fontSizeHuge = 20;
+        this.heightTiny = 20;
+        this.heightSmall = 24;
+        this.heightMedium = 28;
+        this.heightLarge = 32;
+        this.paddingTiny = 2;
+        this.paddingSmall = 4;
+        this.paddingMedium = 8;
+        this.paddingLarge = 12;
+        this.gapSmall = 2;
+        this.gapMedium = 4;
+        this.gapLarge = 6;
+        this.iconSizeSmall = 14;
+        this.iconSizeMedium = 18;
+        this.iconSizeLarge = 22;
+        this.iconSizeCaption = 16;
+        this.borderRadiusSmall = 2;
+        this.borderRadiusMedium = 4;
+        this.borderRadiusLarge = 6;
+        this.borderWidth = 1;
+    }
+}

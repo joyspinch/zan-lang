@@ -15,6 +15,52 @@ public partial class Chart {
         return s.axisIndex == axisIndex;
     }
 
+    private static void ClampWindow(int count, int i0, int i1, out int lo, out int hi) {
+        lo = 0;
+        hi = count - 1;
+        if (i0 >= 0 && i1 >= 0) {
+            lo = i0;
+            hi = i1;
+            if (lo > count - 1) { lo = count - 1; }
+            if (hi > count - 1) { hi = count - 1; }
+            if (hi < lo) { hi = lo; }
+        }
+    }
+
+    private static int AxisExtentCore(List<ChartSeries> series, int axisIndex, int i0, int i1,
+                                      bool scale, bool hasRight, bool wantMax, bool fixed1000) {
+        int acc = 0;
+        bool any = !scale;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            ChartSeries s = series[i];
+            if (!Chart.SeriesMatchesAxis(s, axisIndex, hasRight)) { continue; }
+            int cnt = s.Count();
+            if (cnt > 0 && (fixed1000 || s.data.Count > 0)) {
+                int j0 = 0; int j1 = 0;
+                Chart.ClampWindow(cnt, i0, i1, out j0, out j1);
+                for (int j = j0; j <= j1; j = j + 1) {
+                    int v;
+                    if (fixed1000) {
+                        double dv = s.Number(j);
+                        v = (int)(dv * 1000 + (dv >= 0 ? 0.5 : 0 - 0.5));
+                    } else {
+                        v = s.Value(j);
+                    }
+                    if (!any || (wantMax ? v > acc : v < acc)) { acc = v; any = true; }
+                }
+            }
+            if (s.points.Count < 1) { continue; }
+            int p0 = 0; int p1 = 0;
+            Chart.ClampWindow(s.points.Count, i0, i1, out p0, out p1);
+            for (int j2 = p0; j2 <= p1; j2 = j2 + 1) {
+                int py = Chart.PointV(s.points[j2].y, s.pointG);
+                if (fixed1000) { py = py * 1000; }
+                if (!any || (wantMax ? py > acc : py < acc)) { acc = py; any = true; }
+            }
+        }
+        return acc;
+    }
+
     // AxisMinFor 的 1/1000 定点对偶：与 AxisMaxForF 成对——原始
     // 数据下界直传（不许钳零），小数轴量程专用。i0/i1 窗口语义
     // 同 AxisMaxFor。
@@ -23,45 +69,7 @@ public partial class Chart {
     }
 
     public static int AxisMinForF(List<ChartSeries> series, int axisIndex, int i0, int i1, bool scale, bool hasRight) {
-        int mn = 0;
-        // !scale：0 本身算一个候选点（`_reformValue` 的同号归零前置条件）；
-        // scale：0 不参与，必须扫到真实数据才更新（否则正数据轴会被锚到 0）。
-        bool any = !scale;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            if (Chart.SeriesMatchesAxis(s, axisIndex, hasRight)) {
-                int j0 = 0; int j1 = s.Count() - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    j0 = i0; j1 = i1;
-                    if (j0 > s.Count() - 1) { j0 = s.Count() - 1; }
-                    if (j1 > s.Count() - 1) { j1 = s.Count() - 1; }
-                    if (j1 < j0) { j1 = j0; }
-                }
-                for (int j = j0; j <= j1; j = j + 1) {
-                    double v = s.Number(j);
-                    int vi = (int)(v * 1000 + (v >= 0 ? 0.5 : 0 - 0.5));
-                    if (!any || vi < mn) { mn = vi; any = true; }
-                }
-                // 类目 data 系列（`data:[2,7,...]`）没有点坐标。dataZoom
-                // 窗口下 i0/i1>=0，p0/p1 会被钳成 -1，而 `j2 <= p1` 在
-                // p0==p1==-1 时为真 → s.points[-1] 越界（bump-chart 的
-                // list index out of bounds）。空表跳过点坐标段（上面的
-                // data 段已计完）。
-                if (s.points.Count < 1) { continue; }
-                int p0 = 0; int p1 = s.points.Count - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    p0 = i0; p1 = i1;
-                    if (p0 > s.points.Count - 1) { p0 = s.points.Count - 1; }
-                    if (p1 > s.points.Count - 1) { p1 = s.points.Count - 1; }
-                    if (p1 < p0) { p1 = p0; }
-                }
-                for (int j2 = p0; j2 <= p1; j2 = j2 + 1) {
-                    int py = Chart.PointV(s.points[j2].y, s.pointG) * 1000;
-                    if (!any || py < mn) { mn = py; any = true; }
-                }
-            }
-        }
-        return mn;
+        return Chart.AxisExtentCore(series, axisIndex, i0, i1, scale, hasRight, false, true);
     }
 
     // 轴上是否存在共享 stackName 的柱族系列（堆叠柱）。小数堆叠柱
@@ -275,33 +283,8 @@ public partial class Chart {
     // 各分类中的最大堆叠总量（用于堆叠柱状图）。
     // 共享 stackName 的系列堆叠在一起；轴适配最高的组，
     // 使多组堆叠柱（ECharts `stack` 组）正确缩放。`n` 为分类数。
-    public static int MaxStack(List<ChartSeries> series, int n) {        List<string> grp = new List<string>();
-        for (int g = 0; g < series.Count; g = g + 1) {
-            ChartSeries cs = series[g];
-            if (!ChartView.IsLineFamily(cs.type)) {
-                bool found = false;
-                for (int gi = 0; gi < grp.Count; gi = gi + 1) {
-                    if (grp[gi] == cs.stackName) { found = true; }
-                }
-                if (!found) { grp.Add(cs.stackName); }
-            }
-        }
-        int ng = grp.Count;
-        if (ng < 1) { ng = 1; }
-        int mx = 0;
-        for (int i = 0; i < n; i = i + 1) {
-            for (int gi = 0; gi < ng; gi = gi + 1) {
-                int sum = 0;
-                for (int s = 0; s < series.Count; s = s + 1) {
-                    ChartSeries cs = series[s];
-                    if (!ChartView.IsLineFamily(cs.type) && cs.stackName == grp[gi]) {
-                        if (i < cs.Count()) { sum = sum + cs.Value(i); }
-                    }
-                }
-                if (sum > mx) { mx = sum; }
-            }
-        }
-        return mx;
+    public static int MaxStack(List<ChartSeries> series, int n) {
+        return Chart.MaxStackW(series, n, 0);
     }
 
     // MaxStack 的索引窗口版：仅累计分类 j + i0（j 在 [0,n)）。
@@ -309,12 +292,8 @@ public partial class Chart {
         List<string> grp = new List<string>();
         for (int g = 0; g < series.Count; g = g + 1) {
             ChartSeries cs = series[g];
-            if (!ChartView.IsLineFamily(cs.type)) {
-                bool found = false;
-                for (int gi = 0; gi < grp.Count; gi = gi + 1) {
-                    if (grp[gi] == cs.stackName) { found = true; }
-                }
-                if (!found) { grp.Add(cs.stackName); }
+            if (!ChartView.IsLineFamily(cs.type) && ChartView.GroupIndex(grp, cs.stackName) < 0) {
+                grp.Add(cs.stackName);
             }
         }
         int ng = grp.Count;
@@ -358,11 +337,8 @@ public partial class Chart {
         return Chart.MaxBarStackGroupsW(series, n, i0);
     }
 
-    // 堆叠柱（含逐系列 stackStrategy）在窗口内的**正侧组顶**最大值。
-    // 逐点用 ChartView.StackTopAll 取各系列堆叠结果，取正的最大值；
-    // 未堆叠系列按自身值参与（与旧 absMx 口径一致）。
-    public static int MaxBarStackGroupsW(List<ChartSeries> series, int n, int i0) {
-        int mx = 0;
+    private static int BarStackGroupsExtentW(List<ChartSeries> series, int n, int i0, bool wantMax) {
+        int acc = 0;
         List<double> tops = new List<double>();
         for (int i = 0; i < n; i = i + 1) {
             int oi = i0 + i;
@@ -375,32 +351,21 @@ public partial class Chart {
                 double top = s < tops.Count ? tops[s] : 0.0;
                 double cand = stackedOne ? top : cs.Number(oi);
                 int cF = (int)(cand >= 0.0 ? cand + 0.5 : cand - 0.5);
-                if (cF > mx) { mx = cF; }
+                if (wantMax ? cF > acc : cF < acc) { acc = cF; }
             }
         }
-        return mx;
+        return acc;
+    }
+
+    // 堆叠柱（含逐系列 stackStrategy）在窗口内的**正侧组顶**最大值。
+    public static int MaxBarStackGroupsW(List<ChartSeries> series, int n, int i0) {
+        return Chart.BarStackGroupsExtentW(series, n, i0, true);
     }
 
     // MaxBarStackGroupsW 的负侧对偶：各组堆叠结果的负侧最小值，
     // 返回值 ≤ 0（原始值单位，与调用方 NiceMin 一致）。
     public static int MinBarStackGroupsW(List<ChartSeries> series, int n, int i0) {
-        int mn = 0;
-        List<double> tops = new List<double>();
-        for (int i = 0; i < n; i = i + 1) {
-            int oi = i0 + i;
-            tops.Clear();
-            ChartView.StackTopAll(series, oi, tops);
-            for (int s = 0; s < series.Count; s = s + 1) {
-                ChartSeries cs = series[s];
-                if (cs.hidden || oi >= cs.Count()) { continue; }
-                bool stackedOne = cs.stackName.Length > 0 || cs.stack != 0;
-                double top = s < tops.Count ? tops[s] : 0.0;
-                double cand = stackedOne ? top : cs.Number(oi);
-                int cF = (int)(cand >= 0.0 ? cand + 0.5 : cand - 0.5);
-                if (cF < mn) { mn = cF; }
-            }
-        }
-        return mn;
+        return Chart.BarStackGroupsExtentW(series, n, i0, false);
     }
 
     // ---- 坐标系（双轴 + 友好刻度 + 标题）----
@@ -467,92 +432,17 @@ public partial class Chart {
     }
 
     public static int AxisMaxFor(List<ChartSeries> series, int axisIndex, int i0, int i1, bool scale, bool hasRight) {
-        int mx = 0;
-        // scale（axis.scale:true）：0 不并入量程——ECharts 的 incl0 由
-        // `needIncludeZero() = !option.scale` 决定（axisModelCommonMixin.ts:33）。
-        bool any = !scale;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            if (Chart.SeriesMatchesAxis(s, axisIndex, hasRight)) {
-                int j0 = 0; int j1 = s.Count() - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    j0 = i0; j1 = i1;
-                    if (j0 > s.Count() - 1) { j0 = s.Count() - 1; }
-                    if (j1 > s.Count() - 1) { j1 = s.Count() - 1; }
-                    if (j1 < j0) { j1 = j0; }
-                }
-                // points 系列（[[x,y],...] 数值对）的 y 由下方 points
-                // 环按 PointV 除回真值取极值——Value() 读到的是
-                // ×pointG 定点原值，混进来会把量程放大 1000 倍
-                // （line-in-cartesian 的 y 轴曾画成 0..100,000，
-                // 声明 min/max 与真值域错位）。
-                if (s.data.Count > 0) {
-                    for (int j = j0; j <= j1; j = j + 1) {
-                        int v = s.Value(j);
-                        if (!any || v > mx) { mx = v; any = true; }
-                    }
-                }
-                if (s.points.Count < 1) { continue; }
-                int p0 = 0; int p1 = s.points.Count - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    p0 = i0; p1 = i1;
-                    if (p0 > s.points.Count - 1) { p0 = s.points.Count - 1; }
-                    if (p1 > s.points.Count - 1) { p1 = s.points.Count - 1; }
-                    if (p1 < p0) { p1 = p0; }
-                }
-                for (int j2 = p0; j2 <= p1; j2 = j2 + 1) {
-                    int py = Chart.PointV(s.points[j2].y, s.pointG);
-                    if (!any || py > mx) { mx = py; any = true; }
-                }
-            }
-        }
-        return mx;
+        return Chart.AxisExtentCore(series, axisIndex, i0, i1, scale, hasRight, true, false);
     }
 
     // AxisMaxFor 的 1/1000 定点对偶：小数系列按 Number（未取整）
-    // 比较，整数按 Value×1000。ECharts extent 语义：原始数据上界
-    // 直传（不许钳零），锚定/取整全部由 NiceRange（smartSteps）
-    // 承担——见 valueAxis._calculateValue/_reformValue。
-    // i0/i1 窗口语义同 AxisMaxFor。
+    // 比较，整数按 Value×1000。i0/i1 窗口语义同 AxisMaxFor。
     public static int AxisMaxForF(List<ChartSeries> series, int axisIndex, int i0, int i1, bool scale) {
         return Chart.AxisMaxForF(series, axisIndex, i0, i1, scale, true);
     }
 
     public static int AxisMaxForF(List<ChartSeries> series, int axisIndex, int i0, int i1, bool scale, bool hasRight) {
-        int mx = 0;
-        // 与 AxisMinForF 成对：scale 时 0 不参与，取不到数据才回退 0
-        // （空轴仍要能渲染）。
-        bool any = !scale;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            if (Chart.SeriesMatchesAxis(s, axisIndex, hasRight)) {
-                int j0 = 0; int j1 = s.Count() - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    j0 = i0; j1 = i1;
-                    if (j0 > s.Count() - 1) { j0 = s.Count() - 1; }
-                    if (j1 > s.Count() - 1) { j1 = s.Count() - 1; }
-                    if (j1 < j0) { j1 = j0; }
-                }
-                for (int j = j0; j <= j1; j = j + 1) {
-                    double v = s.Number(j);
-                    int vi = (int)(v * 1000 + (v >= 0 ? 0.5 : 0 - 0.5));
-                    if (!any || vi > mx) { mx = vi; any = true; }
-                }
-                if (s.points.Count < 1) { continue; }
-                int p0 = 0; int p1 = s.points.Count - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    p0 = i0; p1 = i1;
-                    if (p0 > s.points.Count - 1) { p0 = s.points.Count - 1; }
-                    if (p1 > s.points.Count - 1) { p1 = s.points.Count - 1; }
-                    if (p1 < p0) { p1 = p0; }
-                }
-                for (int j2 = p0; j2 <= p1; j2 = j2 + 1) {
-                    int py = Chart.PointV(s.points[j2].y, s.pointG) * 1000;
-                    if (!any || py > mx) { mx = py; any = true; }
-                }
-            }
-        }
-        return mx;
+        return Chart.AxisExtentCore(series, axisIndex, i0, i1, scale, hasRight, true, true);
     }
 
     // 绑定到给定轴的可见系列是否存在小数数据（numberSet 且值
@@ -609,47 +499,11 @@ public partial class Chart {
     }
 
     public static int AxisMinFor(List<ChartSeries> series, int axisIndex, int i0, int i1, bool scale, bool hasRight) {
-        int mn = 0;
-        // 见 AxisMaxFor：scale 时 0 不参与（incl0 = !scale）。
-        bool any = !scale;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            if (Chart.SeriesMatchesAxis(s, axisIndex, hasRight)) {
-                int j0 = 0; int j1 = s.Count() - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    j0 = i0; j1 = i1;
-                    if (j0 > s.Count() - 1) { j0 = s.Count() - 1; }
-                    if (j1 > s.Count() - 1) { j1 = s.Count() - 1; }
-                    if (j1 < j0) { j1 = j0; }
-                }
-                if (s.data.Count > 0) {
-                    for (int j = j0; j <= j1; j = j + 1) {
-                        int v = s.Value(j);
-                        if (!any || v < mn) { mn = v; any = true; }
-                    }
-                }
-                if (s.points.Count < 1) { continue; }
-                int p0 = 0; int p1 = s.points.Count - 1;
-                if (i0 >= 0 && i1 >= 0) {
-                    p0 = i0; p1 = i1;
-                    if (p0 > s.points.Count - 1) { p0 = s.points.Count - 1; }
-                    if (p1 > s.points.Count - 1) { p1 = s.points.Count - 1; }
-                    if (p1 < p0) { p1 = p0; }
-                }
-                for (int j2 = p0; j2 <= p1; j2 = j2 + 1) {
-                    int py = Chart.PointV(s.points[j2].y, s.pointG);
-                    if (!any || py < mn) { mn = py; any = true; }
-                }
-            }
-        }
-        return mn;
+        return Chart.AxisExtentCore(series, axisIndex, i0, i1, scale, hasRight, false, false);
     }
 
-    // X 数值轴最小值：值对系列取 points.x，轴互换系列取 values
-    // （gap 项不计）；固定覆盖在调用方处理。
-    public static int XMinFor(List<ChartSeries> series, bool fromValues, bool scale) {
-        int mn = 0;
-        // scale（axis.scale:true）时不并入 0，同 AxisMinFor。
+    private static int XExtentFor(List<ChartSeries> series, bool fromValues, bool scale, bool wantMax) {
+        int acc = 0;
         bool any = !scale;
         for (int i = 0; i < series.Count; i = i + 1) {
             ChartSeries s = series[i];
@@ -658,40 +512,26 @@ public partial class Chart {
                 for (int j = 0; j < s.data.Count; j = j + 1) {
                     if (!s.data[j].gap) {
                         int v = s.data[j].val;
-                        if (!any || v < mn) { mn = v; any = true; }
+                        if (!any || (wantMax ? v > acc : v < acc)) { acc = v; any = true; }
                     }
                 }
             } else {
                 for (int j = 0; j < s.points.Count; j = j + 1) {
                     int px = Chart.PointV(s.points[j].x, s.pointG);
-                    if (!any || px < mn) { mn = px; any = true; }
+                    if (!any || (wantMax ? px > acc : px < acc)) { acc = px; any = true; }
                 }
             }
         }
-        return mn;
+        return acc;
+    }
+
+    // X 数值轴最小值：值对系列取 points.x，轴互换系列取 values（gap 项不计）。
+    public static int XMinFor(List<ChartSeries> series, bool fromValues, bool scale) {
+        return Chart.XExtentFor(series, fromValues, scale, false);
     }
     // X 数值轴最大值（XMinFor 的对偶）。
     public static int XMaxFor(List<ChartSeries> series, bool fromValues, bool scale) {
-        int mx = 0;
-        bool any = !scale;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            if (s.hidden) { continue; }
-            if (fromValues) {
-                for (int j = 0; j < s.data.Count; j = j + 1) {
-                    if (!s.data[j].gap) {
-                        int v = s.data[j].val;
-                        if (!any || v > mx) { mx = v; any = true; }
-                    }
-                }
-            } else {
-                for (int j = 0; j < s.points.Count; j = j + 1) {
-                    int px = Chart.PointV(s.points[j].x, s.pointG);
-                    if (!any || px > mx) { mx = px; any = true; }
-                }
-            }
-        }
-        return mx;
+        return Chart.XExtentFor(series, fromValues, scale, true);
     }
 
     // 是否存在绑定 axisIndex 轴的可见系列。
@@ -702,35 +542,26 @@ public partial class Chart {
         return false;
     }
 
-    // 从数据 + 固定覆盖解析数值轴的 [lo, hi] 范围（fixedLo/fixedHi
-    // 取 ChartOption.Auto() 时从数据推导）。有负值时下界自动扩展
-    // 到 0 以下。
-    // 横条值轴 'dataMin'/'dataMax' 的原始极值（不零锚、不 nice）：
-    // 可见系列的最小/最大值，官方 dataMM = 系列数据并集。
-    public static int BarDataMinRaw(List<ChartSeries> series) {
-        int mn = 0;
+    private static int BarDataRawExtent(List<ChartSeries> series, bool wantMax) {
+        int acc = 0;
         bool any = false;
         for (int i = 0; i < series.Count; i = i + 1) {
             if (series[i].hidden) { continue; }
             for (int j = 0; j < series[i].Count(); j = j + 1) {
                 int v = series[i].Value(j);
-                if (!any || v < mn) { mn = v; any = true; }
+                if (!any || (wantMax ? v > acc : v < acc)) { acc = v; any = true; }
             }
         }
-        return mn;
+        return acc;
+    }
+
+    // 横条值轴 'dataMin'/'dataMax' 的原始极值（不零锚、不 nice）。
+    public static int BarDataMinRaw(List<ChartSeries> series) {
+        return Chart.BarDataRawExtent(series, false);
     }
 
     public static int BarDataMaxRaw(List<ChartSeries> series) {
-        int mx = 0;
-        bool any = false;
-        for (int i = 0; i < series.Count; i = i + 1) {
-            if (series[i].hidden) { continue; }
-            for (int j = 0; j < series[i].Count(); j = j + 1) {
-                int v = series[i].Value(j);
-                if (!any || v > mx) { mx = v; any = true; }
-            }
-        }
-        return mx;
+        return Chart.BarDataRawExtent(series, true);
     }
 
     public static int AxisLo(int fixedLo, int dataMin) {

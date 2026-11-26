@@ -250,89 +250,85 @@ public partial class WebView2 {
         return 0;
     }
 
-    // GetCookies 完成回调（COM）：序列化 Cookie 列表到 cookieResult，
-    // 唤醒 gate。list 与完成回调的其他参数一样归引擎所有，不得
-    // Release（过释放会让后续 COM 调用在 STA 里挂死，实测）。
+    // GetCookies 完成回调（COM）：一次遍历 COM 列表提取强类型 Cookie，
+    // 再派生字符串视图，避免 3 次重复 COM 调用与 O(N²) 串拼接。
+    // list 归引擎所有，不得 Release（过释放会让后续 COM 调用在 STA 里挂死，实测）。
     public static int OnCookiesCompleted(nint self, int hr, nint list) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
         if (Com.Ok(hr) && list != 0) {
-            w.cookieResult = WebView2.Serialize(list);
-            w.cookieDetailsResult = WebView2.SerializeDetails(list);
-            w.cookieListResult = WebView2.ExtractCookies(list);
+            List<WebCookie> cookies = WebView2.ExtractCookies(list);
+            w.cookieListResult = cookies;
+            w.cookieResult = WebView2.FormatCookies(cookies);
+            w.cookieDetailsResult = WebView2.FormatCookieDetails(cookies);
         }
         w.cookieGate.Signal();
         return 0;
     }
 
+    private static string FormatCookies(List<WebCookie> cookies) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cookies.Count; i = i + 1) {
+            if (i > 0) { sb.Append("; "); }
+            sb.Append(cookies[i].name);
+            sb.Append("=");
+            sb.Append(cookies[i].value);
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatCookieDetails(List<WebCookie> cookies) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cookies.Count; i = i + 1) {
+            WebCookie c = cookies[i];
+            sb.Append(c.name);
+            sb.Append("\t");
+            sb.Append(c.value);
+            sb.Append("\t");
+            sb.Append(c.domain);
+            sb.Append("\t");
+            sb.Append(c.path);
+            sb.Append("\n");
+        }
+        return sb.ToString();
+    }
+
     // 将 Cookie 列表呈现为 "name=value; name2=value2"。
     public static string Serialize(nint list) {
-        int n = Com.GetInt(list, WebView2.SlotCookieCount());
-        string outp = "";
-        for (int i = 0; i < n; i = i + 1) {
-            nint cell = NativeMemory.Alloc(8);
-            new Span<long>(cell, 1)[0] = 0;
-            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
-            nint cookie = new Span<long>(cell, 1)[0];
-            NativeMemory.Free(cell);
-            if (Com.Ok(hr) && cookie != 0) {
-                string name = Com.GetString(cookie, WebView2.SlotCookieName());
-                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
-                if (name != "") {
-                    if (outp != "") { outp = outp + "; "; }
-                    outp = outp + name + "=" + val;
-                }
-                Com.Release(cookie);
-            }
-        }
-        return outp;
+        return WebView2.FormatCookies(WebView2.ExtractCookies(list));
     }
 
     // 将 Cookie 列表呈现为包含完整信息的制表符分隔行（每行一个：name\tvalue\tdomain\tpath\n）。
     public static string SerializeDetails(nint list) {
-        int n = Com.GetInt(list, WebView2.SlotCookieCount());
-        string outp = "";
-        for (int i = 0; i < n; i = i + 1) {
-            nint cell = NativeMemory.Alloc(8);
-            new Span<long>(cell, 1)[0] = 0;
-            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
-            nint cookie = new Span<long>(cell, 1)[0];
-            NativeMemory.Free(cell);
-            if (Com.Ok(hr) && cookie != 0) {
-                string name = Com.GetString(cookie, WebView2.SlotCookieName());
-                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
-                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
-                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
-                if (name != "") {
-                    outp = outp + name + "\t" + val + "\t" + dom + "\t" + path + "\n";
-                }
-                Com.Release(cookie);
-            }
-        }
-        return outp;
+        return WebView2.FormatCookieDetails(WebView2.ExtractCookies(list));
     }
 
-    // 直接从 COM 接口解构出强类型 List<WebCookie>，零中间字符串，完全保留所有原生字段。
+    // 直接从 COM 接口解构出强类型 List<WebCookie>，复用单个输出槽避免逐项原生分配。
     public static List<WebCookie> ExtractCookies(nint list) {
         List<WebCookie> result = new List<WebCookie>();
         if (list == 0) { return result; }
         int n = Com.GetInt(list, WebView2.SlotCookieCount());
-        for (int i = 0; i < n; i = i + 1) {
-            nint cell = NativeMemory.Alloc(8);
-            new Span<long>(cell, 1)[0] = 0;
-            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
-            nint cookie = new Span<long>(cell, 1)[0];
-            NativeMemory.Free(cell);
-            if (Com.Ok(hr) && cookie != 0) {
-                string name = Com.GetString(cookie, WebView2.SlotCookieName());
-                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
-                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
-                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
-                if (name != "") {
-                    result.Add(new WebCookie(name, val, dom, path));
+        if (n <= 0) { return result; }
+        nint cell = NativeMemory.Alloc(8);
+        try {
+            Span<long> cellSpan = new Span<long>(cell, 1);
+            for (int i = 0; i < n; i = i + 1) {
+                cellSpan[0] = 0;
+                int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+                nint cookie = cellSpan[0];
+                if (Com.Ok(hr) && cookie != 0) {
+                    string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                    string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                    string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
+                    string path = Com.GetString(cookie, WebView2.SlotCookiePath());
+                    if (name != "") {
+                        result.Add(new WebCookie(name, val, dom, path));
+                    }
+                    Com.Release(cookie);
                 }
-                Com.Release(cookie);
             }
+        } finally {
+            NativeMemory.Free(cell);
         }
         return result;
     }

@@ -4,18 +4,83 @@ using Gui;
 namespace Gui.Component.Chart;
 
 public partial class ChartView {
-    // markLine 末端箭头（ECharts markLine 默认
-    // symbol:['none','arrow']）：horizontal 时在 (ex,ey) 画右向
-    // 箭镞，否则画下向箭镞。箭头属线色，尺寸随刻度；终点在
-    // 绘图区边上，clip 放行 1px 防整箭头被裁。
-    public static void DrawMarkArrow(App app, Canvas c, int ex, int ey, int col,
-    bool horizontal) {
+    internal static ChartRenderContext EnsureRenderScratch() {
         ChartRenderContext ctx = Chart.renderContext;
         if (ctx == null) {
             Chart.renderContext = new ChartRenderContext();
             ctx = Chart.renderContext;
         }
         ctx.EnsureScratch();
+        return ctx;
+    }
+
+    private static void DrawAxisAlignedMarkStroke(App app, Canvas c, int x, int y, int len,
+                                                  bool horizontal, string lineType, int col) {
+        string lt = lineType.Length > 0 ? lineType : "dashed";
+        if (lt == "solid") {
+            if (horizontal) { c.FillRect(x, y, len, 1, col); }
+            else { c.FillRect(x, y, 1, len, col); }
+            return;
+        }
+        int dash = lt == "dotted" ? app.Scale(2) : app.Scale(6);
+        int gap = lt == "dotted" ? app.Scale(2) : app.Scale(6);
+        int cur = 0;
+        while (cur < len) {
+            int seg = dash;
+            if (cur + seg > len) { seg = len - cur; }
+            if (horizontal) { c.FillRect(x + cur, y, seg, 1, col); }
+            else { c.FillRect(x, y + cur, 1, seg, col); }
+            cur = cur + dash + gap;
+        }
+    }
+
+    private static void ResolveMarkOffset(App app, ChartSeries s, ChartMarkPoint m,
+                                          bool allowMarkSize, out int offX, out int offY) {
+        offX = 0;
+        offY = 0;
+        if (m.offSet) {
+            offX = app.Scale(m.offX);
+            offY = app.Scale(m.offY);
+        } else if (s.markOffSet) {
+            int mBase = allowMarkSize && m.sizeSet && m.size > 0
+                ? m.size
+                : (s.markSymbolSize >= 0 ? s.markSymbolSize : 20);
+            offX = s.markOffXPct != 0 ? mBase * s.markOffXPct / 100 : app.Scale(s.markOffX);
+            offY = s.markOffYPct != 0 ? mBase * s.markOffYPct / 100 : app.Scale(s.markOffY);
+        }
+    }
+
+    private static void DrawRichMarkCard(App app, Canvas c, ChartSeries s, ChartMarkPoint m,
+                                         int idx, int px, int py) {
+        string fmt2 = s.markLabelFmt.Length > 0 ? s.markLabelFmt : "{c}";
+        string raw2 = fmt2
+            .Replace("{a}", s.name)
+            .Replace("{b}", m.name)
+            .Replace("{c}", Chart.SeriesNumText(s, idx));
+        RichBlock blk = ChartView.RichLayout(app,
+            Chart.RichTokenize(raw2, s.markLabelSt), s.markLabelSt,
+            ChartFonts.SeriesLabel(app));
+        int dist2 = s.markLabelDist >= 0 ? app.Scale(s.markLabelDist) : app.Scale(5);
+        int inkC = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
+        if (s.markLabelPos == "right") {
+            ChartView.RichDraw(app, c, px + dist2, py - blk.h / 2, blk, inkC);
+        } else {
+            ChartView.RichDraw(app, c, px - blk.w / 2, py - dist2 - blk.h, blk, inkC);
+        }
+        if (s.markSymbolSize >= 0) {
+            int sr = app.Scale(s.markSymbolSize);
+            if (sr < 1) { sr = 1; }
+            c.FillCircle(px, py, sr, m.color != 0 ? m.color : s.color);
+        }
+    }
+
+    // markLine 末端箭头（ECharts markLine 默认
+    // symbol:['none','arrow']）：horizontal 时在 (ex,ey) 画右向
+    // 箭镞，否则画下向箭镞。箭头属线色，尺寸随刻度；终点在
+    // 绘图区边上，clip 放行 1px 防整箭头被裁。
+    public static void DrawMarkArrow(App app, Canvas c, int ex, int ey, int col,
+    bool horizontal) {
+        ChartRenderContext ctx = ChartView.EnsureRenderScratch();
         List<int> vx = ctx.pooledPx;
         List<int> vy = ctx.pooledPy;
         vx.Clear();
@@ -111,22 +176,7 @@ public partial class ChartView {
             int ly = isAvg ? ChartView.AverageY(f, s, i0, i1)
             : f.YOf(Chart.PointV(val, s.pointG), s.axisIndex);
             int col = m.color != 0 ? m.color : s.color;
-            string lt = m.lineType;
-            if (lt.Length == 0) { lt = "dashed"; }
-            if (lt == "solid") {
-                c.FillRect(f.plotX, ly, f.plotW, 1, col);
-            } else {
-                int dash = app.Scale(6);
-                int gap = lt == "dotted" ? app.Scale(2) : app.Scale(6);
-                if (lt == "dotted") { dash = app.Scale(2); }
-                int dx = f.plotX;
-                while (dx < f.plotX + f.plotW) {
-                    int seg = dash;
-                    if (dx + seg > f.plotX + f.plotW) { seg = f.plotX + f.plotW - dx; }
-                    c.FillRect(dx, ly, seg, 1, col);
-                    dx = dx + dash + gap;
-                }
-            }
+            ChartView.DrawAxisAlignedMarkStroke(app, c, f.plotX, ly, f.plotW, true, m.lineType, col);
             // 标签默认是具体数值（ECharts 默认 markLine.label 即
             // {c}），不是 "avg/min/max" 字样；显式 label 仍可带
             // {value} 占位。
@@ -171,22 +221,7 @@ public partial class ChartView {
             if (val == ChartOption.Auto()) { continue; }
             int lx = Chart.ValueX(plotX, plotW, lo, hi, val);
             int col = m.color != 0 ? m.color : s.color;
-            string lt = m.lineType;
-            if (lt.Length == 0) { lt = "dashed"; }
-            if (lt == "solid") {
-                c.FillRect(lx, plotY, 1, plotH, col);
-            } else {
-                int dash = app.Scale(6);
-                int gap = lt == "dotted" ? app.Scale(2) : app.Scale(6);
-                if (lt == "dotted") { dash = app.Scale(2); }
-                int dy = plotY;
-                while (dy < plotY + plotH) {
-                    int seg = dash;
-                    if (dy + seg > plotY + plotH) { seg = plotY + plotH - dy; }
-                    c.FillRect(lx, dy, 1, seg, col);
-                    dy = dy + dash + gap;
-                }
-            }
+            ChartView.DrawAxisAlignedMarkStroke(app, c, lx, plotY, plotH, false, m.lineType, col);
             if (m.labelShow) {
                 // 同 DrawSeriesMarkLines：默认具体数值，显式 label 支持
                 // {value} 占位，无占位则 "name: value"。
@@ -270,46 +305,12 @@ public partial class ChartView {
             // position right（缺省 top）+ distance 锚在 mark 点旁；
             // symbolSize 声明时 mark 点画小点、不再画 pin 气球。
             if (s.markLabelSt != null && s.markLabelSt.rich != null) {
-                Canvas c = app.canvas;
-                string fmt2 = s.markLabelFmt.Length > 0 ? s.markLabelFmt : "{c}";
-                string raw2 = fmt2
-                .Replace("{a}", s.name)
-                .Replace("{b}", m.name)
-                .Replace("{c}", Chart.SeriesNumText(s, idx));
-                RichBlock blk = ChartView.RichLayout(app,
-                Chart.RichTokenize(raw2, s.markLabelSt), s.markLabelSt,
-                ChartFonts.SeriesLabel(app));
-                int dist2 = s.markLabelDist >= 0
-                ? app.Scale(s.markLabelDist) : app.Scale(5);
                 int mxp = ChartView.BarMarkX(f, barX, idx - i0, band);
                 int myp = f.YOf(s.Value(idx), s.axisIndex);
-                // symbolOffset 偏移
                 int mOffX = 0;
                 int mOffY = 0;
-                if (m.offSet) {
-                    mOffX = app.Scale(m.offX);
-                    mOffY = app.Scale(m.offY);
-                } else if (s.markOffSet) {
-                    int mBase = s.markSymbolSize >= 0 ? s.markSymbolSize : 20;
-                    mOffX = s.markOffXPct != 0 ? mBase * s.markOffXPct / 100 : app.Scale(s.markOffX);
-                    mOffY = s.markOffYPct != 0 ? mBase * s.markOffYPct / 100 : app.Scale(s.markOffY);
-                }
-                mxp = mxp + mOffX;
-                myp = myp + mOffY;
-                int inkC = Style.Part(app, "chart", "label", "", "", "",
-                Style.SNormal()).FgOr(0);
-                if (s.markLabelPos == "right") {
-                    ChartView.RichDraw(app, c, mxp + dist2, myp - blk.h / 2,
-                    blk, inkC);
-                } else {
-                    ChartView.RichDraw(app, c, mxp - blk.w / 2,
-                    myp - dist2 - blk.h, blk, inkC);
-                }
-                if (s.markSymbolSize >= 0) {
-                    int sr = app.Scale(s.markSymbolSize);
-                    if (sr < 1) { sr = 1; }
-                    c.FillCircle(mxp, myp, sr, m.color != 0 ? m.color : s.color);
-                }
+                ChartView.ResolveMarkOffset(app, s, m, false, out mOffX, out mOffY);
+                ChartView.DrawRichMarkCard(app, app.canvas, s, m, idx, mxp + mOffX, myp + mOffY);
                 continue;
             }
             // ECharts markPoint.label 缺省 {c}：徽标里只写数值——
@@ -322,14 +323,7 @@ public partial class ChartView {
             }
             int mOffX = 0;
             int mOffY = 0;
-            if (m.offSet) {
-                mOffX = app.Scale(m.offX);
-                mOffY = app.Scale(m.offY);
-            } else if (s.markOffSet) {
-                int mBase = m.sizeSet && m.size > 0 ? m.size : (s.markSymbolSize >= 0 ? s.markSymbolSize : 20);
-                mOffX = s.markOffXPct != 0 ? mBase * s.markOffXPct / 100 : app.Scale(s.markOffX);
-                mOffY = s.markOffYPct != 0 ? mBase * s.markOffYPct / 100 : app.Scale(s.markOffY);
-            }
+            ChartView.ResolveMarkOffset(app, s, m, true, out mOffX, out mOffY);
             int markBx = ChartView.BarMarkX(f, barX, idx - i0, band) + mOffX;
             ChartView.MarkAt(app, f, s, idx, idx - i0, nWin, lbl,
             o.showValues || s.labelShow, m.color, m.symbol,
@@ -370,40 +364,11 @@ public partial class ChartView {
             int myp = by + barH / 2;
             int mOffX = 0;
             int mOffY = 0;
-            if (m.offSet) {
-                mOffX = app.Scale(m.offX);
-                mOffY = app.Scale(m.offY);
-            } else if (s.markOffSet) {
-                int mBase = s.markSymbolSize >= 0 ? s.markSymbolSize : 20;
-                mOffX = s.markOffXPct != 0 ? mBase * s.markOffXPct / 100 : app.Scale(s.markOffX);
-                mOffY = s.markOffYPct != 0 ? mBase * s.markOffYPct / 100 : app.Scale(s.markOffY);
-            }
+            ChartView.ResolveMarkOffset(app, s, m, false, out mOffX, out mOffY);
             vx = vx + mOffX;
             myp = myp + mOffY;
             if (s.markLabelSt != null && s.markLabelSt.rich != null) {
-                string fmt2 = s.markLabelFmt.Length > 0 ? s.markLabelFmt : "{c}";
-                string raw2 = fmt2.Replace("{a}", s.name)
-                .Replace("{b}", m.name)
-                .Replace("{c}", Chart.SeriesNumText(s, idx));
-                RichBlock blk = ChartView.RichLayout(app,
-                Chart.RichTokenize(raw2, s.markLabelSt), s.markLabelSt,
-                ChartFonts.SeriesLabel(app));
-                int dist2 = s.markLabelDist >= 0
-                ? app.Scale(s.markLabelDist) : app.Scale(5);
-                int inkC = Style.Part(app, "chart", "label", "", "", "",
-                Style.SNormal()).FgOr(0);
-                if (s.markLabelPos == "right") {
-                    ChartView.RichDraw(app, c, vx + dist2, myp - blk.h / 2,
-                    blk, inkC);
-                } else {
-                    ChartView.RichDraw(app, c, vx - blk.w / 2,
-                    myp - dist2 - blk.h, blk, inkC);
-                }
-                if (s.markSymbolSize >= 0) {
-                    int sr = app.Scale(s.markSymbolSize);
-                    if (sr < 1) { sr = 1; }
-                    c.FillCircle(vx, myp, sr, m.color != 0 ? m.color : s.color);
-                }
+                ChartView.DrawRichMarkCard(app, c, s, m, idx, vx, myp);
             } else {
                 // 端点圆徽标 + 数值（ECharts pin 徽标的横向近似）。
                 string lbl = Chart.SeriesNumText(s, idx);
@@ -462,12 +427,7 @@ public partial class ChartView {
         // 尾巴小三角：apex 在尾尖，底边藏进气球头（头后画、盖住
         // 底边接缝）。FillPoly1000 顶点千分比，r = hr，apex 落在
         // (0, ±1000)，中心取 cy ∓ hr/2。
-        ChartRenderContext ctx = Chart.renderContext;
-        if (ctx == null) {
-            Chart.renderContext = new ChartRenderContext();
-            ctx = Chart.renderContext;
-        }
-        ctx.EnsureScratch();
+        ChartRenderContext ctx = ChartView.EnsureRenderScratch();
         List<int> vx = ctx.pooledPx;
         List<int> vy = ctx.pooledPy;
         vx.Clear();

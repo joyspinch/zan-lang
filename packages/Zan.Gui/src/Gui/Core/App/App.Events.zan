@@ -20,6 +20,75 @@ public partial class App {
             finally { this.loopTurnRoot = previousLoopRoot; }
         }
     }
+    int NextWakeDeadline(int participantDeadline) {
+        int dl = animNextMs;
+        if (participantDeadline >= 0 && (dl < 0 || participantDeadline < dl)) { dl = participantDeadline; }
+        if (wakeNextMs >= 0 && (dl < 0 || wakeNextMs < dl)) { dl = wakeNextMs; }
+        if (wakeFrameNextMs >= 0 && (dl < 0 || wakeFrameNextMs < dl)) { dl = wakeFrameNextMs; }
+        if (fxNextMs >= 0 && (dl < 0 || fxNextMs < dl)) { dl = fxNextMs; }
+        return dl;
+    }
+    void RecordEventPrelude(int kind, bool mine) {
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) { inputNeedsFrame = true; }
+        if (kind == 13) { wheelScrollInput = true; }
+        if (kind == 3 && window.EventSeq() != clickEvSeq) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+        }
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
+        backdropDirty = mine && (kind != 0) && !hoverOnly && !typed;
+    }
+    void FinalizeUnhandledEvent(int kind, bool isMainLoop) {
+        if (kind == 9) {
+            if (isMainLoop) { pointerDown = false; }
+            this.Stats.NoteRedrawWhy("blur");
+            needsRedraw = true;
+        }
+        if (kind == 14) {
+            this.Stats.NoteRedrawWhy("exposed");
+            needsRedraw = true;
+            Damage.forceFullNext = true;
+        }
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow) {
+                int dir = Modifiers.HasShift(window.EventMods()) ? -1 : 1;
+                focus.FocusStep(dir);
+            }
+            this.Stats.NoteRedrawWhy("focus-tab");
+            needsRedraw = true;
+        }
+        if (kind == 13) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            if (isMainLoop) { this.scrollHoverDirty = true; }
+            bool wheelPressed = isMainLoop ? this.DoesPressOwnWheel() : (focus.pressedId >= 0);
+            if (wheelPressed) {
+                this.Stats.NoteRedrawWhy("wheel-pressed");
+                needsRedraw = true;
+            } else if (this.HasOverlays() || blocksInputBelow) {
+                this.Stats.NoteRedrawWhy("wheel-blocked");
+                needsRedraw = true;
+            } else if (!needsRedraw) {
+                this.Stats.NoteRedrawWhy("wheel-unclaimed");
+                needsRedraw = true;
+            }
+        }
+        if (kind == 6 || kind == 4 || kind == 5) {
+            this.Stats.NoteRedrawWhy("key");
+            needsRedraw = true;
+        }
+        if (kind >= 2 && kind <= 6) {
+            lastInputMs = Window.GetTickMs();
+        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
+            lastInputMs = Window.GetTickMs();
+            lastInX = mouseX;
+            lastInY = mouseY;
+        }
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+    }
     bool ProcessEventCore() {
         this.TraceFullPresent(2, true);
         this.TickAutomation();
@@ -49,11 +118,7 @@ public partial class App {
             } else if (result == 1 && !needsRedraw && !explicitPoll) {
                 int now = Window.GetTickMs();
                 int slice = 8;
-                int dl = animNextMs;
-                if (participantDeadline >= 0 && (dl < 0 || participantDeadline < dl)) { dl = participantDeadline; }
-                if (dl < 0 || (wakeNextMs >= 0 && wakeNextMs < dl)) { dl = wakeNextMs; }
-                if (dl < 0 || (wakeFrameNextMs >= 0 && wakeFrameNextMs < dl)) { dl = wakeFrameNextMs; }
-                if (dl < 0 || (fxNextMs >= 0 && fxNextMs < dl)) { dl = fxNextMs; }
+                int dl = this.NextWakeDeadline(participantDeadline);
                 if (dl >= 0) {
                     int d = dl - now;
                     if (d < 1) { d = 1; }
@@ -61,22 +126,16 @@ public partial class App {
                 }
                 result = window.WaitEventTimeout(slice);
             }
-        } else if (animNextMs >= 0 || wakeNextMs >= 0
-                   || wakeFrameNextMs >= 0 || fxNextMs >= 0 || participantDeadline >= 0) {
-            loopPath = 1;
-            int now = Window.GetTickMs();
-            int deadline = animNextMs;
-            if (participantDeadline >= 0 && (deadline < 0 || participantDeadline < deadline)) { deadline = participantDeadline; }
-            if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) { deadline = wakeNextMs; }
-            if (deadline < 0
-                || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
-                deadline = wakeFrameNextMs;
-            }
-            if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) { deadline = fxNextMs; }
-            if (deadline < 0 || now >= deadline) { result = window.PollEvent(); }
-            else { result = window.WaitEventTimeout(deadline - now); }
         } else {
-            result = window.WaitEvent();
+            int deadline = this.NextWakeDeadline(participantDeadline);
+            if (deadline >= 0) {
+                loopPath = 1;
+                int now = Window.GetTickMs();
+                if (now >= deadline) { result = window.PollEvent(); }
+                else { result = window.WaitEventTimeout(deadline - now); }
+            } else {
+                result = window.WaitEvent();
+            }
         }
         this.TraceFullPresent(3, false);
         bool displayReady = window.TakeDisplayFrame();
@@ -96,15 +155,7 @@ public partial class App {
         int kind = this.NormalizedKind();
         if (displayAnimationDue) { animNextMs = Window.GetTickMs(); }
         if (displayFxDue && fxNextMs >= 0 && this.FxActive()) { fxNextMs = Window.GetTickMs(); }
-        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) { inputNeedsFrame = true; }
-        if (kind == 13) { wheelScrollInput = true; }
-        if (kind == 3 && window.EventSeq() != clickEvSeq) {
-            clickSeenSeq = 0 - 1;
-            clickEvSeq = window.EventSeq();
-        }
-        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
-        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
-        backdropDirty = (kind != 0) && !hoverOnly && !typed;
+        this.RecordEventPrelude(kind, true);
         nint evh = Window.EventHwnd();
         if (evh != 0 && evh != window.GetHandle()) {
             ChildWindows.RouteEvent(evh);
@@ -119,55 +170,7 @@ public partial class App {
             if (!needsRedraw) { this.PumpDueFrame(); }
             return true;
         }
-        if (kind == 9) {
-            pointerDown = false;
-            this.Stats.NoteRedrawWhy("blur");
-            needsRedraw = true;
-        }
-        if (kind == 14) {
-            this.Stats.NoteRedrawWhy("exposed");
-            needsRedraw = true;
-            Damage.forceFullNext = true;
-        }
-        if (kind == 4 && window.EventKeyCode() == 9) {
-            if (!this.HasOverlays() && !blocksInputBelow) {
-                int dir = 1;
-                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
-                focus.FocusStep(dir);
-            }
-            this.Stats.NoteRedrawWhy("focus-tab");
-            needsRedraw = true;
-        }
-        if (kind == 13) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            this.scrollHoverDirty = true;
-            if (this.DoesPressOwnWheel()) {
-                this.Stats.NoteRedrawWhy("wheel-pressed");
-                needsRedraw = true;
-            } else if (this.HasOverlays() || blocksInputBelow) {
-                this.Stats.NoteRedrawWhy("wheel-blocked");
-                needsRedraw = true;
-            } else if (!needsRedraw) {
-                this.Stats.NoteRedrawWhy("wheel-unclaimed");
-                needsRedraw = true;
-            }
-        }
-        if (kind == 6 || kind == 4 || kind == 5) {
-            this.Stats.NoteRedrawWhy("key");
-            needsRedraw = true;
-        }
-        if (kind >= 2 && kind <= 6) {
-            lastInputMs = Window.GetTickMs();
-        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
-            lastInputMs = Window.GetTickMs();
-            lastInX = mouseX;
-            lastInY = mouseY;
-        }
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
-            && window.IsVisible()) {
-            fxNextMs = Window.GetTickMs();
-        }
+        this.FinalizeUnhandledEvent(kind, true);
         if (!needsRedraw) { this.PumpDueFrame(); }
         this.Stats.Mark("sh.eventend");
         return true;
@@ -188,15 +191,7 @@ public partial class App {
     bool ApplyEventCore(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
         int kind = this.NormalizedKind();
-        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) { inputNeedsFrame = true; }
-        if (kind == 13) { wheelScrollInput = true; }
-        if (kind == 3 && window.EventSeq() != clickEvSeq) {
-            clickSeenSeq = 0 - 1;
-            clickEvSeq = window.EventSeq();
-        }
-        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
-        bool typed = (kind == 4) || (kind == 5) || (kind == 6);
-        backdropDirty = mine && kind != 0 && !hoverOnly && !typed;
+        this.RecordEventPrelude(kind, mine);
         if (mine) { DrainPosts(); }
         if (mine && kind == 8) { return this.HandleCloseRequest(); }
         if (!mine) { return true; }
@@ -204,53 +199,7 @@ public partial class App {
         long dispatchSequence = window.EventSeq();
         if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return true; }
         if (this.ConsumeRoutedInput(kind)) { return true; }
-        if (kind == 9) {
-            this.Stats.NoteRedrawWhy("blur");
-            needsRedraw = true;
-        }
-        if (kind == 14) {
-            this.Stats.NoteRedrawWhy("exposed");
-            needsRedraw = true;
-            Damage.forceFullNext = true;
-        }
-        if (kind == 4 && window.EventKeyCode() == 9) {
-            if (!this.HasOverlays() && !blocksInputBelow) {
-                int dir = 1;
-                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
-                focus.FocusStep(dir);
-            }
-            this.Stats.NoteRedrawWhy("focus-tab");
-            needsRedraw = true;
-        }
-        if (kind == 13) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            if (focus.pressedId >= 0) {
-                this.Stats.NoteRedrawWhy("wheel-pressed");
-                needsRedraw = true;
-            } else if (this.HasOverlays() || blocksInputBelow) {
-                this.Stats.NoteRedrawWhy("wheel-blocked");
-                needsRedraw = true;
-            } else if (!needsRedraw) {
-                this.Stats.NoteRedrawWhy("wheel-unclaimed");
-                needsRedraw = true;
-            }
-        }
-        if (kind == 6 || kind == 4 || kind == 5) {
-            this.Stats.NoteRedrawWhy("key");
-            needsRedraw = true;
-        }
-        if (kind >= 2 && kind <= 6) {
-            lastInputMs = Window.GetTickMs();
-        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
-            lastInputMs = Window.GetTickMs();
-            lastInX = mouseX;
-            lastInY = mouseY;
-        }
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
-            && window.IsVisible()) {
-            fxNextMs = Window.GetTickMs();
-        }
+        this.FinalizeUnhandledEvent(kind, false);
         return true;
     }
 }
