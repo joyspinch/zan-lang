@@ -10,9 +10,19 @@ namespace System.Collections.Concurrent;
 public class ConcurrentDictionary<TKey, TValue> : IDisposable {
     public ConcurrentStripe<TKey, TValue>[] stripes;
     public int stripeCount;
+    private int stripeMask;
+
+    private static int NextPow2(int n) {
+        if (n <= 1) { return 1; }
+        if (n >= 256) { return 256; }
+        int p = 1;
+        while (p < n) { p = p << 1; }
+        return p;
+    }
 
     public ConcurrentDictionary() {
         this.stripeCount = 16;
+        this.stripeMask = 15;
         this.stripes = new ConcurrentStripe<TKey, TValue>[16];
         for (int i = 0; i < 16; i = i + 1) {
             this.stripes[i] = new ConcurrentStripe<TKey, TValue>();
@@ -20,10 +30,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
     }
 
     public ConcurrentDictionary(int concurrencyLevel) {
-        int n = concurrencyLevel;
-        if (n < 1) { n = 1; }
-        if (n > 256) { n = 256; }
+        int n = ConcurrentDictionary<TKey, TValue>.NextPow2(concurrencyLevel);
         this.stripeCount = n;
+        this.stripeMask = n - 1;
         this.stripes = new ConcurrentStripe<TKey, TValue>[n];
         for (int i = 0; i < n; i = i + 1) {
             this.stripes[i] = new ConcurrentStripe<TKey, TValue>();
@@ -43,15 +52,10 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         }
     }
 
-    // 根据键计算所属条带序号（基于稳定多项式哈希）
+    // 根据键计算所属条带序号（零分配 GetHashCode + 高低位混排 + 2 的幂位掩码）
     public int GetStripeIndex(TKey key) {
-        string s = key.ToString();
-        int h = 0;
-        int len = s.Length;
-        for (int i = 0; i < len; i = i + 1) {
-            h = (h * 31 + (int)s[i]) & 0x7fffffff;
-        }
-        return h % this.stripeCount;
+        int h = key.GetHashCode();
+        return (h ^ (h >> 16)) & this.stripeMask;
     }
 
     // 尝试添加键值对。若键已存在则返回 false，不覆盖旧值。
@@ -59,15 +63,13 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int idx = this.GetStripeIndex(key);
         ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
         stripe.Lock();
-        try {
-            if (stripe.map.ContainsKey(key)) {
-                return false;
-            }
-            stripe.map.Add(key, value);
-            return true;
-        } finally {
-            stripe.Unlock();
+        bool added = false;
+        if (!stripe.map.ContainsKey(key)) {
+            stripe.map[key] = value;
+            added = true;
         }
+        stripe.Unlock();
+        return added;
     }
 
     // 尝试获取指定键对应的值。
@@ -75,11 +77,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int idx = this.GetStripeIndex(key);
         ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
         stripe.Lock();
-        try {
-            return stripe.map.TryGetValue(key, out value);
-        } finally {
-            stripe.Unlock();
-        }
+        bool ok = stripe.map.TryGetValue(key, out value);
+        stripe.Unlock();
+        return ok;
     }
 
     // 尝试移除指定键并输出旧值。
@@ -87,15 +87,12 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int idx = this.GetStripeIndex(key);
         ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
         stripe.Lock();
-        try {
-            if (stripe.map.TryGetValue(key, out value)) {
-                stripe.map.Remove(key);
-                return true;
-            }
-            return false;
-        } finally {
-            stripe.Unlock();
+        bool ok = stripe.map.TryGetValue(key, out value);
+        if (ok) {
+            stripe.map.Remove(key);
         }
+        stripe.Unlock();
+        return ok;
     }
 
     // 判断是否包含指定键。
@@ -103,11 +100,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int idx = this.GetStripeIndex(key);
         ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
         stripe.Lock();
-        try {
-            return stripe.map.ContainsKey(key);
-        } finally {
-            stripe.Unlock();
-        }
+        bool ok = stripe.map.ContainsKey(key);
+        stripe.Unlock();
+        return ok;
     }
 
     // 若键不存在则插入，最终返回现有或新插入的值。
@@ -115,16 +110,14 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int idx = this.GetStripeIndex(key);
         ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
         stripe.Lock();
-        try {
-            TValue existing;
-            if (stripe.map.TryGetValue(key, out existing)) {
-                return existing;
-            }
-            stripe.map.Add(key, value);
-            return value;
-        } finally {
+        TValue existing;
+        if (stripe.map.TryGetValue(key, out existing)) {
             stripe.Unlock();
+            return existing;
         }
+        stripe.map[key] = value;
+        stripe.Unlock();
+        return value;
     }
 
     // 索引用法支持：读取或更新键值
@@ -140,15 +133,8 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
             int idx = this.GetStripeIndex(key);
             ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
             stripe.Lock();
-            try {
-                if (stripe.map.ContainsKey(key)) {
-                    stripe.map[key] = value;
-                } else {
-                    stripe.map.Add(key, value);
-                }
-            } finally {
-                stripe.Unlock();
-            }
+            stripe.map[key] = value;
+            stripe.Unlock();
         }
     }
 
@@ -169,27 +155,21 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
     // 清空字典中的所有项。
     public void Clear() {
         this.LockAll();
-        try {
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                this.stripes[i].map.Clear();
-            }
-        } finally {
-            this.UnlockAll();
+        for (int i = 0; i < this.stripeCount; i = i + 1) {
+            this.stripes[i].map.Clear();
         }
+        this.UnlockAll();
     }
 
     // 当前存储的总项数。
     public int Count() {
         this.LockAll();
-        try {
-            int total = 0;
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                total = total + this.stripes[i].map.Count;
-            }
-            return total;
-        } finally {
-            this.UnlockAll();
+        int total = 0;
+        for (int i = 0; i < this.stripeCount; i = i + 1) {
+            total = total + this.stripes[i].map.Count;
         }
+        this.UnlockAll();
+        return total;
     }
 
     // 字典是否为空。

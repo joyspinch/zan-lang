@@ -6,8 +6,9 @@ namespace System.Xml;
 // 递归下降 XML 解析器（XmlDocument.Parse 实现）：按字节游标逐字节判别（保留 UTF-8 多字节名），
 // 支持元素/属性、文本、5 种命名实体及 &#DDD;/&#xHH;、CDATA、注释、PI、XML 声明与 DOCTYPE（不解析命名空间）；非法格式抛带行列号的 XmlException。
 public class XmlParser {
-    // 输入文本与游标。
+    // 输入文本、原始字节指针与游标（s 持有所有权，basePtr 供零 ARC 热扫描）。
     public string s;
+    public nint basePtr;
     public int pos;
     public int len;
     // 读写对称的嵌套深度上限，防止无界递归耗尽调用栈。
@@ -21,6 +22,7 @@ public class XmlParser {
         }
         XmlParser p = new XmlParser();
         p.s = src;
+        p.basePtr = (nint)src;
         p.pos = 0;
         p.len = src.Length;
         return p.ReadDocument();
@@ -98,11 +100,15 @@ public class XmlParser {
             int q = CurB();
             if (q != 34 && q != 39) { Err("attribute value must be quoted"); }
             pos = pos + 1;  // 消费引号
-            int start = pos;
-            while (pos < len && (s[pos] & 255) != q) { pos = pos + 1; }
-            if (pos >= len) { Err("unterminated attribute value"); }
-            string raw = s.Substring(start, pos - start);
-            pos = pos + 1;  // 消费闭引号
+            int n = this.len;
+            int start = this.pos;
+            int hit = NativeMemory.Find(this.basePtr, start, q, n - start);
+            if (hit < 0) {
+                this.pos = n;
+                Err("unterminated attribute value");
+            }
+            this.pos = hit + 1;  // 消费闭引号
+            string raw = NativeMemory.GetString(this.basePtr, start, hit - start);
             // XML WFC: Unique Att Spec — 重复属性名立即报错。
             if (elem.attrs != null) {
                 for (int ai = 0; ai < elem.attrs.Count; ai = ai + 1) {
@@ -125,9 +131,12 @@ public class XmlParser {
         while (pos < len) {
             int c = CurB();
             if (c != 60) {  // '<'
-                int start = pos;
-                while (pos < len && (s[pos] & 255) != 60) { pos = pos + 1; }
-                elem.MergeText(DecodeText(s.Substring(start, pos - start)));
+                int n = this.len;
+                int start = this.pos;
+                int hit = NativeMemory.Find(this.basePtr, start, 60, n - start);
+                int end = hit < 0 ? n : hit;
+                this.pos = end;
+                elem.MergeText(DecodeText(NativeMemory.GetString(this.basePtr, start, end - start)));
                 continue;
             }
             if (Has("</")) {
@@ -227,50 +236,58 @@ public class XmlParser {
         return null;
     }
 
-    // 读取 XML 名字（ASCII 字母/数字/_ - . : 及 UTF-8 多字节）。
+    // 读取 XML 名字（ASCII 字母/数字/_ - . : 及 UTF-8 多字节；Span+128 位掩码零 ARC 判定）。
     string ReadName() {
-        int start = pos;
-        while (pos < len) {
-            int c = s[pos] & 255;
-            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
-                || (c >= 48 && c <= 57) || c == 95 || c == 45
-                || c == 46 || c == 58 || c >= 128;
-            if (!ok) { break; }
-            pos = pos + 1;
+        int n = this.len;
+        int p = this.pos;
+        int start = p;
+        Span<byte> buf = new Span<byte>(this.basePtr, n);
+        while (p < n) {
+            int c = buf[p] & 255;
+            if (c < 64) {
+                if ((0x07FF600000000000L & (1L << c)) == 0L) { break; }
+            } else if (c < 128) {
+                if ((0x07FFFFFE87FFFFFEL & (1L << (c - 64))) == 0L) { break; }
+            }
+            p = p + 1;
         }
-        if (pos == start) { Err("expected a name"); }
-        return s.Substring(start, pos - start);
+        this.pos = p;
+        if (p == start) { Err("expected a name"); }
+        return NativeMemory.GetString(this.basePtr, start, p - start);
     }
 
     // 实体解码与 CR 归一（\r\n / \r → \n）；无 '&' / '\r' 时零分配原串返回。
     string DecodeText(string raw) {
         int n = raw.Length;
+        if (n == 0) { return raw; }
+        nint rp = (nint)raw;
+        Span<byte> rbuf = new Span<byte>(rp, n);
         int scan = 0;
         while (scan < n) {
-            int c = raw[scan] & 255;
+            int c = rbuf[scan] & 255;
             if (c == 38 || c == 13) { break; }  // '&' '\r'
             scan = scan + 1;
         }
         if (scan >= n) { return raw; }
         StringBuilder sb = new StringBuilder();
-        if (scan > 0) { sb.Append(raw.Substring(0, scan)); }
+        if (scan > 0) { sb.Append(NativeMemory.GetString(rp, 0, scan)); }
         int i = scan;
         while (i < n) {
-            int c = raw[i] & 255;
+            int c = rbuf[i] & 255;
             if (c == 38) {  // '&'
                 i = ReadEntity(raw, i, sb);
             } else if (c == 13) {  // '\r'
-                if (i + 1 < n && (raw[i + 1] & 255) == 10) { i = i + 1; }
+                if (i + 1 < n && (rbuf[i + 1] & 255) == 10) { i = i + 1; }
                 sb.Append("\n");
                 i = i + 1;
             } else {
                 int j = i;
                 while (j < n) {
-                    int d = raw[j] & 255;
+                    int d = rbuf[j] & 255;
                     if (d == 38 || d == 13) { break; }
                     j = j + 1;
                 }
-                sb.Append(raw.Substring(i, j - i));
+                sb.Append(NativeMemory.GetString(rp, i, j - i));
                 i = j;
             }
         }
@@ -329,27 +346,34 @@ public class XmlParser {
     }
 
     void SkipWs() {
-        while (pos < len) {
-            int c = s[pos] & 255;
+        int n = this.len;
+        int p = this.pos;
+        Span<byte> buf = new Span<byte>(this.basePtr, n);
+        while (p < n) {
+            int c = buf[p] & 255;
             if (c == 32 || c == 9 || c == 10 || c == 13) {
-                pos = pos + 1;
+                p = p + 1;
             } else {
-                return;
+                break;
             }
         }
+        this.pos = p;
     }
 
     int CurB() {
         if (pos >= len) { return -1; }
-        return s[pos] & 255;
+        return new Span<byte>(this.basePtr, this.len)[pos] & 255;
     }
 
     // 游标处是否恰为 lit。
     bool Has(string lit) {
         int n = lit.Length;
         if (pos + n > len) { return false; }
+        Span<byte> buf = new Span<byte>(this.basePtr, this.len);
+        Span<byte> lbuf = new Span<byte>((nint)lit, n);
+        int p = pos;
         for (int i = 0; i < n; i = i + 1) {
-            if ((s[pos + i] & 255) != (lit[i] & 255)) { return false; }
+            if ((buf[p + i] & 255) != (lbuf[i] & 255)) { return false; }
         }
         return true;
     }

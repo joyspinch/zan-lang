@@ -452,6 +452,9 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if (mm.len == 11 && memcmp(mm.str, "GetHashCode", 11) == 0 &&
                 e->call.args.count == 0) {
                 zan_type_t *eot = infer_expr_type(g, callee->member.object, locals);
+                if (eot && irgen_type_is_hashable_prim(eot)) {
+                    return g->binder->type_int;
+                }
                 if (eot && (eot->kind == TYPE_OBJECT || eot->kind == TYPE_INTERFACE ||
                             eot->kind == TYPE_CLASS)) {
                     zan_symbol_t *osym = eot->sym;

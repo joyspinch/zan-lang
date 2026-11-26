@@ -173,6 +173,10 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c, zan_type_t *recv,
     if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0)
       return c->binder->type_int;
   }
+  if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0 &&
+      (bt != NULL || recv->kind == TYPE_STRING || recv->kind == TYPE_ENUM)) {
+    return c->binder->type_int;
+  }
   {
     zan_type_t *rt = zan_refl_member_type(c->binder, recv, name);
     if (rt)

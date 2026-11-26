@@ -727,6 +727,21 @@ void irgen_record_static_type_use(zan_irgen_t *g, zan_symbol_t *sym,
 LLVMValueRef get_static_init_coordinator(zan_irgen_t *g);
 void finalize_static_rc_cleanup(zan_irgen_t *g);
 LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper);
+LLVMValueRef get_str_find_ch_from_fn(zan_irgen_t *g);
+LLVMValueRef get_str_find_from_fn(zan_irgen_t *g);
+LLVMValueRef get_str_hashcode_fn(zan_irgen_t *g);
+static inline bool irgen_type_is_hashable_prim(const zan_type_t *t) {
+  if (!t) return false;
+  switch (t->kind) {
+  case TYPE_STRING: case TYPE_BOOL: case TYPE_BYTE: case TYPE_SBYTE:
+  case TYPE_SHORT: case TYPE_USHORT: case TYPE_INT: case TYPE_UINT:
+  case TYPE_LONG: case TYPE_ULONG: case TYPE_FLOAT: case TYPE_DOUBLE:
+  case TYPE_CHAR: case TYPE_NINT: case TYPE_ENUM:
+    return true;
+  default:
+    return false;
+  }
+}
 LLVMValueRef get_str_join_fn(zan_irgen_t *g);
 LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g);
 LLVMValueRef get_str_replace_fn(zan_irgen_t *g);

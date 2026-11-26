@@ -670,7 +670,6 @@
                 expr->call.args.count == 1 &&
                 is_string_expr(g, sc->member.object, locals) &&
                 is_string_like_expr(g, expr->call.args.items[0], locals)) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, sc->member.object, locals);
                 zan_ast_node_t *arg0 = expr->call.args.items[0];
@@ -684,29 +683,28 @@
                     single_ch = (unsigned char)arg0->str_val.str[0];
                 }
                 LLVMValueRef res;
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef slen = emit_string_length(g, s, expr->loc);
                 if (single_ch > 0) {
-                    /* 单字节非 NUL 常量针降级为 strchr（SIMD 单字节扫描且遇 NUL 截止） */
-                    LLVMTypeRef strchr_ty = LLVMFunctionType(i8ptr,
-                        (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
-                    LLVMValueRef strchr_fn = get_libc_fn(g, "strchr", strchr_ty);
-                    LLVMValueRef hit = zan_call2(g->builder, strchr_ty, strchr_fn,
-                        (LLVMValueRef[]){ s, LLVMConstInt(i32, (uint64_t)single_ch, 0) },
-                        2, "sc");
-                    res = zan_icmp(g->builder, LLVMIntNE, hit,
-                        LLVMConstPointerNull(i8ptr), "ctn");
+                    /* 单字节非 NUL 常量针走 SIMD memchr + NUL 拦截 */
+                    LLVMValueRef fch = get_str_find_ch_from_fn(g);
+                    LLVMValueRef pos = zan_call2(g->builder, LLVMGlobalGetValueType(fch), fch,
+                        (LLVMValueRef[]){ s, slen, LLVMConstInt(i64, 0, 0),
+                                          LLVMConstInt(i32, (uint64_t)single_ch, 0) },
+                        4, "cpos");
+                    res = zan_icmp(g->builder, LLVMIntSGE, pos,
+                        LLVMConstInt(i64, 0, 0), "ctn");
                     emit_release_owned_call_temp(g, sc->member.object, s, locals);
                     return res;
                 }
                 int sub_owned;
                 LLVMValueRef sub = emit_string_like_arg(g, arg0, locals, &sub_owned);
-                LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
-                    (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-                LLVMValueRef strstr_fn = get_libc_fn(g, "strstr", strstr_type);
-                LLVMValueRef ss_args[] = { s, sub };
-                LLVMValueRef hit = zan_call2(g->builder, strstr_type,
-                    strstr_fn, ss_args, 2, "ss");
-                res = zan_icmp(g->builder, LLVMIntNE, hit,
-                    LLVMConstPointerNull(i8ptr), "ctn");
+                LLVMValueRef ffn = get_str_find_from_fn(g);
+                LLVMValueRef pos = zan_call2(g->builder, LLVMGlobalGetValueType(ffn), ffn,
+                    (LLVMValueRef[]){ s, slen, LLVMConstInt(i64, 0, 0), sub },
+                    4, "cpos");
+                res = zan_icmp(g->builder, LLVMIntSGE, pos,
+                    LLVMConstInt(i64, 0, 0), "ctn");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 release_string_like_arg(g, arg0, sub, sub_owned, locals);
                 return res;
@@ -794,7 +792,6 @@
             if (is_idx && (expr->call.args.count == 1 || expr->call.args.count == 2) &&
                 is_string_expr(g, sc->member.object, locals) &&
                 is_string_like_expr(g, expr->call.args.items[0], locals)) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, sc->member.object, locals);
@@ -810,81 +807,27 @@
                 if (single_ch < 0) {
                     sub = emit_string_like_arg(g, arg0, locals, &sub_owned);
                 }
-                LLVMValueRef res;
+                LLVMValueRef slen = emit_string_length(g, s, expr->loc);
+                LLVMValueRef start;
                 if (expr->call.args.count == 2) {
-                    LLVMValueRef start = emit_expr(g, expr->call.args.items[1], locals);
+                    start = emit_expr(g, expr->call.args.items[1], locals);
                     if (LLVMGetTypeKind(LLVMTypeOf(start)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(start)) < 64)
                         start = LLVMBuildSExt(g->builder, start, i64, "idx.start");
-                    LLVMValueRef slen = emit_string_length(g, s, expr->loc);
-                    LLVMValueRef valid_start = zan_icmp(g->builder, LLVMIntULE,
-                        start, slen, "idx.valid");
-                    /* 仅在 valid_start 为真时解引用 s+start，杜绝 start 越界时的 strstr/strchr OOB UB */
-                    LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-                    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "idx.ok");
-                    LLVMBasicBlockRef inv_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "idx.inv");
-                    LLVMBasicBlockRef m_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "idx.m");
-                    zan_set_branch_weights(g, LLVMBuildCondBr(g->builder, valid_start, ok_bb, inv_bb), 2000, 1);
-
-                    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
-                    LLVMValueRef search = LLVMBuildInBoundsGEP2(g->builder,
-                        LLVMInt8TypeInContext(g->ctx), s, &start, 1, "idx.search");
-                    LLVMValueRef hit;
-                    if (single_ch > 0) {
-                        LLVMTypeRef strchr_ty = LLVMFunctionType(i8ptr,
-                            (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
-                        hit = zan_call2(g->builder, strchr_ty,
-                            get_libc_fn(g, "strchr", strchr_ty),
-                            (LLVMValueRef[]){ search, LLVMConstInt(i32, (uint64_t)single_ch, 0) },
-                            2, "sc");
-                    } else {
-                        LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
-                            (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-                        hit = zan_call2(g->builder, strstr_type,
-                            get_libc_fn(g, "strstr", strstr_type),
-                            (LLVMValueRef[]){ search, sub }, 2, "ss");
-                    }
-                    LLVMValueRef diff = zan_sub(g->builder,
-                        LLVMBuildPtrToInt(g->builder, hit, i64, "hi"),
-                        LLVMBuildPtrToInt(g->builder, s, i64, "si"), "diff");
-                    LLVMValueRef missed = zan_icmp(g->builder, LLVMIntEQ, hit,
-                        LLVMConstPointerNull(i8ptr), "missed");
-                    LLVMValueRef ok_res = LLVMBuildSelect(g->builder, missed,
-                        LLVMConstInt(i64, (uint64_t)-1, 1), diff, "idx.okv");
-                    LLVMBasicBlockRef ok_end = LLVMGetInsertBlock(g->builder);
-                    LLVMBuildBr(g->builder, m_bb);
-
-                    LLVMPositionBuilderAtEnd(g->builder, inv_bb);
-                    LLVMBuildBr(g->builder, m_bb);
-
-                    LLVMPositionBuilderAtEnd(g->builder, m_bb);
-                    res = LLVMBuildPhi(g->builder, i64, "idx");
-                    LLVMAddIncoming(res,
-                        (LLVMValueRef[]){ ok_res, LLVMConstInt(i64, (uint64_t)-1, 1) },
-                        (LLVMBasicBlockRef[]){ ok_end, inv_bb }, 2);
                 } else {
-                    LLVMValueRef hit;
-                    if (single_ch > 0) {
-                        LLVMTypeRef strchr_ty = LLVMFunctionType(i8ptr,
-                            (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
-                        hit = zan_call2(g->builder, strchr_ty,
-                            get_libc_fn(g, "strchr", strchr_ty),
-                            (LLVMValueRef[]){ s, LLVMConstInt(i32, (uint64_t)single_ch, 0) },
-                            2, "sc");
-                    } else {
-                        LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
-                            (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-                        hit = zan_call2(g->builder, strstr_type,
-                            get_libc_fn(g, "strstr", strstr_type),
-                            (LLVMValueRef[]){ s, sub }, 2, "ss");
-                    }
-                    LLVMValueRef diff = zan_sub(g->builder,
-                        LLVMBuildPtrToInt(g->builder, hit, i64, "hi"),
-                        LLVMBuildPtrToInt(g->builder, s, i64, "si"), "diff");
-                    LLVMValueRef missed = zan_icmp(g->builder, LLVMIntEQ, hit,
-                        LLVMConstPointerNull(i8ptr), "missed");
-                    res = LLVMBuildSelect(g->builder, missed,
-                        LLVMConstInt(i64, (uint64_t)-1, 1), diff, "idx");
+                    start = LLVMConstInt(i64, 0, 0);
+                }
+                LLVMValueRef res;
+                if (single_ch > 0) {
+                    LLVMValueRef fch = get_str_find_ch_from_fn(g);
+                    res = zan_call2(g->builder, LLVMGlobalGetValueType(fch), fch,
+                        (LLVMValueRef[]){ s, slen, start,
+                                          LLVMConstInt(i32, (uint64_t)single_ch, 0) },
+                        4, "idx");
+                } else {
+                    LLVMValueRef ffn = get_str_find_from_fn(g);
+                    res = zan_call2(g->builder, LLVMGlobalGetValueType(ffn), ffn,
+                        (LLVMValueRef[]){ s, slen, start, sub }, 4, "idx");
                 }
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 if (sub)

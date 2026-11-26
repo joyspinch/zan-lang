@@ -56,25 +56,28 @@ public class Csv {
             if (sep == 34 || sep == 13 || sep == 10) { sep = 44; }
         }
         int n = text.Length;
+        nint tPtr = (nint)text;
+        Span<byte> tbuf = new Span<byte>(tPtr, n);
         int i = 0;
-        if (n >= 3 && (text[0] & 255) == 239 && (text[1] & 255) == 187
-            && (text[2] & 255) == 191) {
+        if (n >= 3 && (tbuf[0] & 255) == 239 && (tbuf[1] & 255) == 187
+            && (tbuf[2] & 255) == 191) {
             i = 3;  // UTF-8 BOM
         }
         List<string> rec = new List<string>();
+        int colHint = 0;
         StringBuilder sb = null;
         int fieldStart = i;
         bool hasQuoted = false;
         bool dirty = false;
         while (i < n) {
-            int c = text[i] & 255;
+            int c = tbuf[i] & 255;
             if (c == 34) {  // '"'
                 if (!hasQuoted) {
                     hasQuoted = true;
                     if (sb == null) { sb = new StringBuilder(); }
                     else { sb.Clear(); }
                     if (i > fieldStart) {
-                        sb.Append(text.Substring(fieldStart, i - fieldStart));
+                        sb.Append(NativeMemory.GetString(tPtr, fieldStart, i - fieldStart));
                     }
                 }
                 if (sb.Length == 0) {
@@ -82,9 +85,9 @@ public class Csv {
                     dirty = true;
                     i = i + 1;
                     while (i < n) {
-                        int q = text[i] & 255;
+                        int q = tbuf[i] & 255;
                         if (q == 34) {
-                            if (i + 1 < n && (text[i + 1] & 255) == 34) {
+                            if (i + 1 < n && (tbuf[i + 1] & 255) == 34) {
                                 sb.Append("\"");
                                 i = i + 2;
                             } else {
@@ -93,10 +96,9 @@ public class Csv {
                             }
                         } else {
                             int start = i;
-                            while (i < n && (text[i] & 255) != 34) {
-                                i = i + 1;
-                            }
-                            sb.Append(text.Substring(start, i - start));
+                            int hit = NativeMemory.Find(tPtr, start, 34, n - start);
+                            i = hit < 0 ? n : hit;
+                            sb.Append(NativeMemory.GetString(tPtr, start, i - start));
                         }
                     }
                 } else {
@@ -117,25 +119,27 @@ public class Csv {
             if (c == 13 || c == 10) {
                 Csv.FlushField(rec, sb, hasQuoted, text, fieldStart, i);
                 hasQuoted = false;
-                if (c == 13 && i + 1 < n && (text[i + 1] & 255) == 10) {
+                if (c == 13 && i + 1 < n && (tbuf[i + 1] & 255) == 10) {
                     i = i + 2;
                 } else {
                     i = i + 1;
                 }
                 fieldStart = i;
+                if (rec.Count > colHint) { colHint = rec.Count; }
                 Csv.FinishRecord(t, rec);
                 rec = new List<string>();
+                if (colHint > 0) { rec.Reserve(colHint); }
                 dirty = false;
                 continue;
             }
             int begin = i;
             while (i < n) {
-                int d = text[i] & 255;
+                int d = tbuf[i] & 255;
                 if (d == sep || d == 13 || d == 10 || d == 34) { break; }
                 i = i + 1;
             }
             if (hasQuoted) {
-                sb.Append(text.Substring(begin, i - begin));
+                sb.Append(NativeMemory.GetString(tPtr, begin, i - begin));
             }
             dirty = true;
         }
@@ -199,12 +203,50 @@ public class Csv {
         return Csv.RowToTextSep(fields, ",");
     }
 
+    // 直接将转义后字段追加到目标 StringBuilder（无须引号时零临时分配）。
+    private static void AppendEscapedSep(StringBuilder sb, string field, string separator, int sepChar) {
+        if (field == null || field.Length == 0) { return; }
+        int flen = field.Length;
+        nint fPtr = (nint)field;
+        Span<byte> fbuf = new Span<byte>(fPtr, flen);
+        bool needQuote = false;
+        if (sepChar >= 0) {
+            for (int i = 0; i < flen; i = i + 1) {
+                int c = fbuf[i] & 255;
+                if (c == sepChar || c == 34 || c == 10 || c == 13) {
+                    needQuote = true;
+                    break;
+                }
+            }
+        } else {
+            if (separator != null && field.IndexOf(separator, 0) >= 0) { needQuote = true; }
+            else if (field.IndexOf("\"", 0) >= 0 || field.IndexOf("\n", 0) >= 0 || field.IndexOf("\r", 0) >= 0) { needQuote = true; }
+        }
+        if (!needQuote) {
+            sb.Append(field);
+            return;
+        }
+        sb.Append("\"");
+        int last = 0;
+        for (int i = 0; i < flen; i = i + 1) {
+            if ((fbuf[i] & 255) == 34) {
+                if (i > last) { sb.Append(NativeMemory.GetString(fPtr, last, i - last)); }
+                sb.Append("\"\"");
+                last = i + 1;
+            }
+        }
+        if (last < flen) { sb.Append(NativeMemory.GetString(fPtr, last, flen - last)); }
+        sb.Append("\"");
+    }
+
     // 把一条记录写为一行（自定义分隔符，不含行尾换行符）。
     public static string RowToTextSep(List<string> fields, string separator) {
+        int sepChar = (separator != null && separator.Length == 1) ? (separator[0] & 255) : -1;
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < fields.Count; i = i + 1) {
+        int n = fields.Count;
+        for (int i = 0; i < n; i = i + 1) {
             if (i > 0) { sb.Append(separator); }
-            sb.Append(Csv.EscapeSep(fields[i], separator));
+            Csv.AppendEscapedSep(sb, fields[i], separator, sepChar);
         }
         return sb.ToString();
     }
@@ -216,11 +258,18 @@ public class Csv {
     }
 
     // 把行列表序列化为 CSV 文本（自定义分隔符），每条
-    // 记录以 '\n' 结尾。
+    // 记录以 '\n' 结尾（共享单 StringBuilder 零逐行临时串）。
     public static string SerializeSep(List<List<string>> rows, string separator) {
-        StringBuilder sb = new StringBuilder();
-        for (int r = 0; r < rows.Count; r = r + 1) {
-            sb.Append(Csv.RowToTextSep(rows[r], separator));
+        int nr = rows.Count;
+        int sepChar = (separator != null && separator.Length == 1) ? (separator[0] & 255) : -1;
+        StringBuilder sb = new StringBuilder(nr * 48 + 32);
+        for (int r = 0; r < nr; r = r + 1) {
+            List<string> fields = rows[r];
+            int nf = fields.Count;
+            for (int i = 0; i < nf; i = i + 1) {
+                if (i > 0) { sb.Append(separator); }
+                Csv.AppendEscapedSep(sb, fields[i], separator, sepChar);
+            }
             sb.Append("\n");
         }
         return sb.ToString();

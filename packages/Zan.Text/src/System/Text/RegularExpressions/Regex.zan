@@ -92,9 +92,13 @@ public class Regex {
     // 所有命名组的名字。
     public List<string> GroupNames() { return this.prog.GroupNames(); }
 
-    // 模式在 `input` 任意位置匹配时返回 true。
+    // 模式在 `input` 任意位置匹配时返回 true（零 Match 分配快路径）。
     public bool IsMatch(string input) {
-        return this.FindFrom(input, 0).Success();
+        int len = input.Length;
+        RegexRun run = RegexRun.Create(input, len, this.prog.GroupCount() * 2, this.prog.MarkCount());
+        int rc = this.ScanFromStr(input, len, 0, run);
+        if (rc == -2) { this.Overflow(0); }
+        return rc >= 0;
     }
 
     // 最左侧的匹配；无匹配则返回失败的 Match。
@@ -102,40 +106,120 @@ public class Regex {
         return this.FindFrom(input, 0);
     }
 
-    // 从 `start` 处或之后开始的最左侧匹配。
+    // 从 `start` 处或之后开始的最左侧匹配（零拷贝直读 string）。
     public Match FindFrom(string input, int start) {
         int len = input.Length;
         if (start < 0) { start = 0; }
         if (start > len) { return Match.Failure(); }
-        nint buf = NativeMemory.Alloc(len + 1);
-        if (len > 0) {
-            NativeMemory.PutString(buf, 0, input, len);
-        }
-        List<int> caps = new List<int>();
-        int rc = this.ScanFrom(buf, len, start, caps);
-        NativeMemory.Free(buf);
-        buf = 0;
+        RegexRun run = RegexRun.Create(input, len, this.prog.GroupCount() * 2, this.prog.MarkCount());
+        int rc = this.ScanFromStr(input, len, start, run);
         if (rc == -2) { this.Overflow(start); }
         if (rc < 0) { return Match.Failure(); }
-        return Match.FromCaps(input, caps, this.prog.GroupCount());
+        return Match.FromCapsArr(input, run.caps, this.prog.GroupCount());
     }
 
-    // 在已经准备好的字节缓冲区上从 `start` 起找最左匹配。
-    // 返回 0 表示成功（`caps` 已填好），-1 无匹配，-2 预算耗尽。
-    // Matches/Replace 共用同一个缓冲区，避免每找到一个匹配就把整个
-    // 输入重新分配加拷贝一遍（原先是 O(n²)）。
-    public int ScanFrom(nint buf, int len, int start, List<int> caps) {
-        int at = start;
-        bool done = false;
-        while (!done) {
-            int end = this.prog.RunAt(buf, len, at, start, caps);
+    // 在 `input` 上从 `start` 起找最左匹配（复用 RegexRun，带起始/必现字节 SIMD 预过滤）。
+    // 返回 0 表示成功（`run.caps` 已填好），-1 无匹配，-2 预算耗尽。
+    public int ScanFromStr(string input, int len, int start, RegexRun run) {
+        RegexProgram p = this.prog;
+        nint ptr = run.inputPtr;
+        int sk = p.startKind;
+        int reqB = p.reqByte;
+        if (sk == 4) {
+            // C+ R 锚定反向预过滤：SIMD memchr 直跳 R，再反扫连续 C 起点（严格保最左匹配语义）
+            Span<byte> buf4 = new Span<byte>(ptr, len);
+            long mlo = p.startMaskLo;
+            long mhi = p.startMaskHi;
+            int search = start + 1;
+            while (search < len) {
+                int hit = NativeMemory.Find(ptr, search, reqB, len - search);
+                if (hit < 0) { return -1; }
+                int rStart = hit;
+                while (rStart > start) {
+                    int b = buf4[rStart - 1] & 255;
+                    if (b >= 128) { break; }
+                    long m = b < 64 ? mlo : mhi;
+                    if ((m & (1L << (b & 63))) == 0L) { break; }
+                    rStart = rStart - 1;
+                }
+                for (int at4 = rStart; at4 < hit; at4 = at4 + 1) {
+                    int end4 = p.RunAtStr(run, at4, start);
+                    if (end4 == -2) { return -2; }
+                    if (end4 >= 0) { return 0; }
+                }
+                search = hit + 1;
+            }
+            return -1;
+        }
+        // 必现字面量快拒：SIMD memchr 一步排除无命中输入
+        int nextReq = len;
+        if (reqB > 0) {
+            if (start >= len) { return -1; }
+            nextReq = NativeMemory.Find(ptr, start, reqB, len - start);
+            if (nextReq < 0) { return -1; }
+        }
+        if (sk == 1) {
+            // 仅在开头匹配 (^ / \A)
+            if (start != 0) { return -1; }
+            int end0 = p.RunAtStr(run, 0, start);
+            if (end0 == -2) { return -2; }
+            return end0 >= 0 ? 0 : -1;
+        }
+        if (sk == 2) {
+            // 精确 ASCII 首字节：用 SIMD NativeMemory.Find 直接跳至候选起点
+            int sb0 = p.startByte;
+            int at = start;
+            while (at < len) {
+                int hit = NativeMemory.Find(ptr, at, sb0, len - at);
+                if (hit < 0) { return -1; }
+                if (reqB > 0 && hit > nextReq) {
+                    nextReq = NativeMemory.Find(ptr, hit, reqB, len - hit);
+                    if (nextReq < 0) { return -1; }
+                }
+                int end = p.RunAtStr(run, hit, start);
+                if (end == -2) { return -2; }
+                if (end >= 0) { return 0; }
+                at = hit + 1;
+            }
+            return -1;
+        }
+        if (sk == 3) {
+            // 起始字符类 128 位 ASCII 位图快跳：Span 零 ARC 直读
+            Span<byte> buf3 = new Span<byte>(ptr, len);
+            long mlo = p.startMaskLo;
+            long mhi = p.startMaskHi;
+            bool allowNonAscii = p.startAllowsNonAscii;
+            int at = start;
+            while (at < len) {
+                int b = buf3[at] & 255;
+                if (b < 128) {
+                    long mask = b < 64 ? mlo : mhi;
+                    if ((mask & (1L << (b & 63))) == 0L) {
+                        at = at + 1;
+                        continue;
+                    }
+                } else if (!allowNonAscii) {
+                    at = at + RegexProgram.StepWidth(ptr, len, at);
+                    continue;
+                }
+                if (reqB > 0 && at > nextReq) {
+                    nextReq = NativeMemory.Find(ptr, at, reqB, len - at);
+                    if (nextReq < 0) { return -1; }
+                }
+                int end = p.RunAtStr(run, at, start);
+                if (end == -2) { return -2; }
+                if (end >= 0) { return 0; }
+                at = at + (b < 128 ? 1 : RegexProgram.StepWidth(ptr, len, at));
+            }
+            return -1;
+        }
+        int at0 = start;
+        while (true) {
+            int end = p.RunAtStr(run, at0, start);
             if (end == -2) { return -2; }
             if (end >= 0) { return 0; }
-            if (at >= len) {
-                done = true;
-            } else {
-                at = at + RegexProgram.StepWidth(buf, len, at);
-            }
+            if (at0 >= len) { return -1; }
+            at0 = at0 + RegexProgram.StepWidth(ptr, len, at0);
         }
         return -1;
     }
@@ -152,63 +236,170 @@ public class Regex {
     public List<Match> Matches(string input) {
         List<Match> all = new List<Match>();
         int len = input.Length;
-        nint buf = NativeMemory.Alloc(len + 1);
-        if (len > 0) {
-            NativeMemory.PutString(buf, 0, input, len);
-        }
-        List<int> caps = new List<int>();
+        int groups = this.prog.GroupCount();
+        RegexRun run = RegexRun.Create(input, len, groups * 2, this.prog.MarkCount());
         int at = 0;
-        bool done = false;
-        bool overflow = false;
-        int overflowAt = 0;
-        while (!done) {
-            int rc = this.ScanFrom(buf, len, at, caps);
-            if (rc == -2) {
-                overflow = true;
-                overflowAt = at;
-                done = true;
-            } else if (rc < 0) {
-                done = true;
-            } else {
-                Match m = Match.FromCaps(input, caps, this.prog.GroupCount());
-                all.Add(m);
-                int next = m.Index() + m.Length();
-                if (m.Length() == 0) {
-                    next = next + RegexProgram.StepWidth(buf, len, next);
-                }
-                at = next;
-                if (at > len) { done = true; }
+        while (at <= len) {
+            int rc = this.ScanFromStr(input, len, at, run);
+            if (rc == -2) { this.Overflow(at); }
+            if (rc < 0) { break; }
+            Match m = Match.FromCapsArr(input, run.caps, groups);
+            all.Add(m);
+            int mStart = run.caps[0];
+            int mEnd = run.caps[1];
+            int next = mEnd;
+            if (mEnd == mStart) {
+                next = next + RegexProgram.StepWidthStr(input, len, next);
             }
+            at = next;
         }
-        NativeMemory.Free(buf);
-        buf = 0;
-        if (overflow) { this.Overflow(overflowAt); }
         return all;
     }
 
-    // 不重叠匹配的数量。
+    // 不重叠匹配的数量（零 Match / 零 List 分配快路径）。
     public int Count(string input) {
-        return this.Matches(input).Count;
+        int len = input.Length;
+        int groups = this.prog.GroupCount();
+        RegexRun run = RegexRun.Create(input, len, groups * 2, this.prog.MarkCount());
+        int total = 0;
+        int at = 0;
+        while (at <= len) {
+            int rc = this.ScanFromStr(input, len, at, run);
+            if (rc == -2) { this.Overflow(at); }
+            if (rc < 0) { break; }
+            total = total + 1;
+            int mStart = run.caps[0];
+            int mEnd = run.caps[1];
+            int next = mEnd;
+            if (mEnd == mStart) {
+                next = next + RegexProgram.StepWidthStr(input, len, next);
+            }
+            at = next;
+        }
+        return total;
     }
 
     // 替换所有匹配。`replacement` 里 `$1` / `${1}` /
     // `${name}` 是捕获组，`$&amp;` 是整个匹配，`$$` 是字面量 '$'。
     public string Replace(string input, string replacement) {
-        List<Match> all = this.Matches(input);
-        StringBuilder sb = new StringBuilder();
+        int len = input.Length;
+        int groups = this.prog.GroupCount();
+        RegexRun run = RegexRun.Create(input, len, groups * 2, this.prog.MarkCount());
+        int rc = this.ScanFromStr(input, len, 0, run);
+        if (rc == -2) { this.Overflow(0); }
+        if (rc < 0) { return input; }
+
+        bool plain = replacement == null || replacement.Length == 0 || replacement.IndexOf("$") < 0;
+        string rep = replacement == null ? "" : replacement;
+        StringBuilder sb = new StringBuilder(len + 16);
+        int outPos = 0;
         int at = 0;
-        for (int i = 0; i < all.Count; i = i + 1) {
-            Match m = all[i];
-            if (m.Index() > at) {
-                sb.Append(input.Substring(at, m.Index() - at));
+        while (true) {
+            int mStart = run.caps[0];
+            int mEnd = run.caps[1];
+            if (mStart > outPos) {
+                sb.Append(input.Substring(outPos, mStart - outPos));
             }
-            sb.Append(this.ExpandFor(replacement, m));
-            at = m.Index() + m.Length();
+            if (plain) {
+                sb.Append(rep);
+            } else {
+                this.AppendExpanded(sb, run.inputPtr, run.caps, groups, rep);
+            }
+            outPos = mEnd;
+            int next = mEnd;
+            if (mEnd == mStart) {
+                next = next + RegexProgram.StepWidth(run.inputPtr, len, next);
+            }
+            at = next;
+            if (at > len) { break; }
+            rc = this.ScanFromStr(input, len, at, run);
+            if (rc == -2) { this.Overflow(at); }
+            if (rc < 0) { break; }
         }
-        if (at < input.Length) {
-            sb.Append(input.Substring(at, input.Length - at));
+        if (outPos < len) {
+            sb.Append(NativeMemory.GetString(run.inputPtr, outPos, len - outPos));
         }
         return sb.ToString();
+    }
+
+    // 零 Match / 零临时 StringBuilder 直接把替换串展开写入目标 sb。
+    private void AppendExpanded(StringBuilder sb, nint inPtr, int[] caps, int groups, string replacement) {
+        int n = replacement.Length;
+        nint rPtr = (nint)replacement;
+        Span<byte> rbuf = new Span<byte>(rPtr, n);
+        int i = 0;
+        int start = 0;
+        while (i < n) {
+            int c = rbuf[i] & 255;
+            if (c != 36 || i + 1 >= n) {
+                i = i + 1;
+                continue;
+            }
+            if (i > start) {
+                sb.Append(NativeMemory.GetString(rPtr, start, i - start));
+            }
+            int d = rbuf[i + 1] & 255;
+            if (d == 36) {
+                sb.Append("$");
+                i = i + 2;
+                start = i;
+            } else if (d == 38) {
+                int gs0 = caps[0];
+                int ge0 = caps[1];
+                if (gs0 >= 0 && ge0 > gs0) {
+                    sb.Append(NativeMemory.GetString(inPtr, gs0, ge0 - gs0));
+                }
+                i = i + 2;
+                start = i;
+            } else if (d == 123) {
+                int close = NativeMemory.Find(rPtr, i + 2, 125, n - (i + 2));
+                if (close < 0) {
+                    i = i + 1;
+                    start = i - 1;
+                } else {
+                    string body = NativeMemory.GetString(rPtr, i + 2, close - i - 2);
+                    int gi = this.RefNumber(body);
+                    if (gi < 0) {
+                        sb.Append(NativeMemory.GetString(rPtr, i, close - i + 1));
+                    } else if (gi < groups) {
+                        int gs = caps[gi * 2];
+                        int ge = caps[gi * 2 + 1];
+                        if (gs >= 0 && ge > gs) {
+                            sb.Append(NativeMemory.GetString(inPtr, gs, ge - gs));
+                        }
+                    }
+                    i = close + 1;
+                    start = i;
+                }
+            } else if (d >= 48 && d <= 57) {
+                int gi = d - 48;
+                int j = i + 2;
+                while (j < n) {
+                    int dj = rbuf[j] & 255;
+                    if (dj >= 48 && dj <= 57 && gi * 10 + (dj - 48) < groups) {
+                        gi = gi * 10 + (dj - 48);
+                        j = j + 1;
+                    } else {
+                        break;
+                    }
+                }
+                if (gi < groups) {
+                    int gs = caps[gi * 2];
+                    int ge = caps[gi * 2 + 1];
+                    if (gs >= 0 && ge > gs) {
+                        sb.Append(NativeMemory.GetString(inPtr, gs, ge - gs));
+                    }
+                }
+                i = j;
+                start = i;
+            } else {
+                i = i + 1;
+                start = i - 1;
+            }
+        }
+        if (start < n) {
+            sb.Append(NativeMemory.GetString(rPtr, start, n - start));
+        }
     }
 
     // 仅替换第一个匹配。

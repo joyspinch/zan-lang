@@ -474,6 +474,8 @@ static int checker_builtin_member_state(zan_type_t *t, zan_istr_t name) {
   default:
     return -1;
   }
+  if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0)
+    return 1;
   if (!zan_builtin_find(bt))
     return -1; /* decimal 没进表：判不了 */
   /* 编译器原生成员（int.Parse / string.AsSpan 这类）不在成员表里，

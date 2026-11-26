@@ -60,6 +60,24 @@ public partial class RegexProgram {
     int plen;
     int ppos;
 
+    // 编译期冻结的扁平字节码、128 位 ASCII 字符类位图与扫描预过滤元数据。
+    int[] opArr;
+    int[] axArr;
+    int[] ayArr;
+    int[] azArr;
+    long[] clsMaskLo;
+    long[] clsMaskHi;
+    // startKind: 0=无预过滤, 1=仅起点(^/\A), 2=精确 ASCII 首字节, 3=ASCII 首字符位图
+    public int startKind;
+    public int startByte;
+    public string startByteStr;
+    public long startMaskLo;
+    public long startMaskHi;
+    public bool startAllowsNonAscii;
+    // 必现 ASCII 字面量字节（>=1 时所有成功匹配均须经过该字节，供 memchr 快拒）
+    public int reqByte;
+    public string reqByteStr;
+
     public RegexProgram() {
         this.op = new List<int>();
         this.ax = new List<int>();
@@ -82,6 +100,20 @@ public partial class RegexProgram {
         this.pbuf = 0;
         this.plen = 0;
         this.ppos = 0;
+        this.opArr = null;
+        this.axArr = null;
+        this.ayArr = null;
+        this.azArr = null;
+        this.clsMaskLo = null;
+        this.clsMaskHi = null;
+        this.startKind = 0;
+        this.startByte = -1;
+        this.startByteStr = "";
+        this.startMaskLo = 0L;
+        this.startMaskHi = 0L;
+        this.startAllowsNonAscii = true;
+        this.reqByte = -1;
+        this.reqByteStr = "";
     }
 
     public static RegexProgram Compile(string pattern, bool ignoreCase) {
@@ -101,7 +133,199 @@ public partial class RegexProgram {
         p.Emit(RegexProgram.OpMatch(), 0, 0, 0);
         NativeMemory.Free(p.pbuf);
         p.pbuf = 0;
+        if (p.error.Length == 0) {
+            p.Freeze();
+        }
         return p;
+    }
+
+    public int MarkCount() { return this.marks; }
+
+    // 冻结扁平指令数组、预计算字符类 128 位 ASCII 位图，并推导起始与必现字面量预过滤器。
+    void Freeze() {
+        int n = this.op.Count;
+        int[] oa = new int[n];
+        int[] xa = new int[n];
+        int[] ya = new int[n];
+        int[] za = new int[n];
+        for (int i = 0; i < n; i = i + 1) {
+            oa[i] = this.op[i];
+            xa[i] = this.ax[i];
+            ya[i] = this.ay[i];
+            za[i] = this.az[i];
+        }
+        this.opArr = oa;
+        this.axArr = xa;
+        this.ayArr = ya;
+        this.azArr = za;
+
+        int ncls = this.clsStart.Count;
+        if (ncls > 0) {
+            long[] mlo = new long[ncls];
+            long[] mhi = new long[ncls];
+            for (int ci = 0; ci < ncls; ci = ci + 1) {
+                long lo = 0L;
+                long hi = 0L;
+                for (int c = 0; c < 64; c = c + 1) {
+                    if (this.ClassHasSlow(ci, c)) { lo = lo | (1L << c); }
+                }
+                for (int c = 64; c < 128; c = c + 1) {
+                    if (this.ClassHasSlow(ci, c)) { hi = hi | (1L << (c - 64)); }
+                }
+                mlo[ci] = lo;
+                mhi[ci] = hi;
+            }
+            this.clsMaskLo = mlo;
+            this.clsMaskHi = mhi;
+        }
+
+        // 1. 起始预过滤：跳过开头的 OpSave(7) 与 PlusAt 写入的 OpMark(15)
+        int pc = 0;
+        while (pc < n && (oa[pc] == 7 || oa[pc] == 15)) {
+            pc = pc + 1;
+        }
+        if (pc < n) {
+            int o0 = oa[pc];
+            if ((o0 == 8 && !this.multiline) || o0 == 12) {
+                this.startKind = 1;
+            } else if (o0 == 1) {
+                int ch = xa[pc];
+                if (ch > 0 && ch < 128) {
+                    if (!this.ignoreCase) {
+                        this.startKind = 2;
+                        this.startByte = ch;
+                        this.startByteStr = Encoding.Utf8FromCodePoint(ch);
+                        this.startAllowsNonAscii = false;
+                    } else {
+                        int f = RegexProgram.Fold(ch);
+                        long lo = 0L;
+                        long hi = 0L;
+                        if (f < 64) { lo = lo | (1L << f); } else { hi = hi | (1L << (f - 64)); }
+                        if (f >= 97 && f <= 122) {
+                            int u = f - 32;
+                            hi = hi | (1L << (u - 64));
+                        }
+                        this.startKind = 3;
+                        this.startMaskLo = lo;
+                        this.startMaskHi = hi;
+                        this.startAllowsNonAscii = false;
+                    }
+                }
+            } else if (o0 == 3) {
+                int ci = xa[pc];
+                this.startKind = 3;
+                this.startMaskLo = this.clsMaskLo[ci];
+                this.startMaskHi = this.clsMaskHi[ci];
+                bool nonAscii = this.clsNeg[ci] == 1;
+                if (!nonAscii) {
+                    int cFrom = this.clsStart[ci];
+                    int cTo = cFrom + this.clsCount[ci];
+                    for (int k = cFrom; k < cTo; k = k + 1) {
+                        if (this.clsKind[k] == 1 || this.clsHi[k] >= 128) {
+                            nonAscii = true;
+                            break;
+                        }
+                    }
+                }
+                this.startAllowsNonAscii = nonAscii;
+            }
+        }
+
+        // 2. 必现 ASCII 字面量字节（仅沿严格后支配前向边扫描，绝不跨交替/可选分支猜测）
+        int bestReq = -1;
+        int bestScore = 0;
+        int wpc = 0;
+        int guard = 0;
+        while (wpc >= 0 && wpc < n && guard < n) {
+            guard = guard + 1;
+            int wo = oa[wpc];
+            if (wo == 4) { break; }
+            if (wo == 1) {
+                int ch = xa[wpc];
+                if (ch > 0 && ch < 128 && !this.ignoreCase) {
+                    int score = ((ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57)) ? 1 : 2;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestReq = ch;
+                    }
+                }
+                wpc = wpc + 1;
+            } else if (wo == 2 || wo == 3 || wo == 7 || wo == 8 || wo == 9 || wo == 10
+                    || wo == 11 || wo == 12 || wo == 13 || wo == 14 || wo == 15) {
+                wpc = wpc + 1;
+            } else if (wo == 5) {
+                int tgt = xa[wpc];
+                if (tgt > wpc) { wpc = tgt; } else { break; }
+            } else if (wo == 16) {
+                // PlusAt 生成模式：[OpMark, body, OpEmptyChk(slot, end), OpSplit(loopBack, end), end...]
+                int endPc = ya[wpc];
+                if (endPc == wpc + 2 && wpc + 1 < n && oa[wpc + 1] == 6) {
+                    int sx = xa[wpc + 1];
+                    int sy = ya[wpc + 1];
+                    if ((sx < wpc && sy == endPc) || (sy < wpc && sx == endPc)) {
+                        wpc = endPc;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else if (wo == 17) {
+                int cont = ya[wpc];
+                if (cont > wpc) { wpc = cont; } else { break; }
+            } else {
+                break;
+            }
+        }
+        if (bestReq > 0 && !(this.startKind == 2 && this.startByte == bestReq)) {
+            this.reqByte = bestReq;
+            this.reqByteStr = Encoding.Utf8FromCodePoint(bestReq);
+        }
+
+        // 3. 检测前缀 `C+ R`（纯 ASCII 字符类正闭包紧跟不含于 C 的精确 ASCII 字面量 R）：
+        //    支持 ScanFromStr 用 SIMD memchr 直跳 R 再反向回扫 C 起点，避免无关前缀 O(L²) 回溯。
+        if (!this.ignoreCase) {
+            int p4 = 0;
+            while (p4 < n && oa[p4] == 7) { p4 = p4 + 1; }
+            if (p4 + 4 < n && oa[p4] == 15 && oa[p4 + 1] == 3
+                && oa[p4 + 2] == 16 && ya[p4 + 2] == p4 + 4
+                && oa[p4 + 3] == 6) {
+                int sx = xa[p4 + 3];
+                int sy = ya[p4 + 3];
+                if ((sx == p4 && sy == p4 + 4) || (sy == p4 && sx == p4 + 4)) {
+                    int ci = xa[p4 + 1];
+                    bool nonAscii = this.clsNeg[ci] == 1;
+                    if (!nonAscii) {
+                        int cFrom = this.clsStart[ci];
+                        int cTo = cFrom + this.clsCount[ci];
+                        for (int k = cFrom; k < cTo; k = k + 1) {
+                            if (this.clsKind[k] == 1 || this.clsHi[k] >= 128) {
+                                nonAscii = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!nonAscii) {
+                        int aPc = p4 + 4;
+                        while (aPc < n && oa[aPc] == 7) { aPc = aPc + 1; }
+                        if (aPc < n && oa[aPc] == 1) {
+                            int ch = xa[aPc];
+                            if (ch > 0 && ch < 128) {
+                                long m = ch < 64 ? this.clsMaskLo[ci] : this.clsMaskHi[ci];
+                                if ((m & (1L << (ch & 63))) == 0L) {
+                                    this.startKind = 4;
+                                    this.startMaskLo = this.clsMaskLo[ci];
+                                    this.startMaskHi = this.clsMaskHi[ci];
+                                    this.startAllowsNonAscii = false;
+                                    this.reqByte = ch;
+                                    this.reqByteStr = Encoding.Utf8FromCodePoint(ch);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     public string Error() { return this.error; }
@@ -157,6 +381,42 @@ public partial class RegexProgram {
 
     public static int StepWidth(nint buf, int len, int sp) {
         int packed = RegexProgram.DecodeAt(buf, len, sp);
+        return packed < 0 ? 1 : packed & 7;
+    }
+
+    // 直接从 string 解码 UTF-8 码点（零 NativeMemory 拷贝、零 Span 包装）。
+    public static int DecodeStrAt(string s, int len, int sp) {
+        if (sp < 0 || sp >= len) { return -1; }
+        int b0 = s[sp] & 255;
+        if (b0 < 128) { return (b0 << 3) | 1; }
+        int need = 0;
+        int cp = 0;
+        if (b0 >= 240) {
+            need = 3;
+            cp = b0 - 240;
+        } else if (b0 >= 224) {
+            need = 2;
+            cp = b0 - 224;
+        } else if (b0 >= 192) {
+            need = 1;
+            cp = b0 - 192;
+        } else {
+            return (65533 << 3) | 1;
+        }
+        for (int k = 1; k <= need; k = k + 1) {
+            if (sp + k >= len) { return (65533 << 3) | 1; }
+            int b = s[sp + k] & 255;
+            if (b < 128 || b >= 192) { return (65533 << 3) | 1; }
+            cp = (cp << 6) | (b - 128);
+        }
+        return (cp << 3) | (need + 1);
+    }
+
+    public static int StepWidthStr(string s, int len, int sp) {
+        if (sp < 0 || sp >= len) { return 1; }
+        int b0 = s[sp] & 255;
+        if (b0 < 128) { return 1; }
+        int packed = RegexProgram.DecodeStrAt(s, len, sp);
         return packed < 0 ? 1 : packed & 7;
     }
 
@@ -217,12 +477,12 @@ public partial class RegexProgram {
         return false;
     }
 
-    public bool ClassHas(int ci, int c) {
+    public bool ClassHasSlow(int ci, int c) {
         int from = this.clsStart[ci];
         int to = from + this.clsCount[ci];
         bool hit = false;
         for (int i = from; i < to && !hit; i = i + 1) {
-            if (this.clsKind[i] == RegexProgram.MemNotSet()) {
+            if (this.clsKind[i] == 1) {
                 if (!RegexProgram.InShorthand(this.clsLo[i], c)) { hit = true; }
             } else {
                 int lo = this.clsLo[i];
@@ -239,48 +499,63 @@ public partial class RegexProgram {
         return this.clsNeg[ci] == 1 ? !hit : hit;
     }
 
-    // 返回匹配终点，-1 表示无匹配，-2 表示回溯预算耗尽；每次按起点重置 2M 预算。
-    public int RunAt(nint input, int len, int start, int origin, List<int> caps) {
+    public bool ClassHas(int ci, int c) {
+        if (c >= 0 && c < 128 && this.clsMaskLo != null) {
+            return c < 64
+                ? ((this.clsMaskLo[ci] & (1L << c)) != 0L)
+                : ((this.clsMaskHi[ci] & (1L << (c - 64))) != 0L);
+        }
+        return this.ClassHasSlow(ci, c);
+    }
+
+    // 复用 RegexRun 在指定起点执行一次匹配（零堆分配），返回匹配终点、-1 无匹配、-2 预算耗尽。
+    public int RunAtStr(RegexRun run, int start, int origin) {
         int slots = this.groups * 2;
-        caps.Clear();
-        for (int i = 0; i < slots; i = i + 1) { caps.Add(-1); }
-        RegexRun run = new RegexRun();
-        run.input = input;
-        run.len = len;
-        run.caps = caps;
+        for (int i = 0; i < slots; i = i + 1) { run.caps[i] = -1; }
+        int mcnt = this.marks;
+        if (mcnt > 0) {
+            for (int i = 0; i < mcnt; i = i + 1) { run.marks[i] = -1; }
+        }
         run.budget = 2000000;
         run.origin = origin;
         run.overflow = false;
-        for (int i = 0; i < this.marks; i = i + 1) { run.marks.Add(-1); }
+        run.end = -1;
         if (this.Step(run, 0, start, 0)) { return run.end; }
         return run.overflow ? -2 : -1;
     }
 
     bool MatchAssertion(int o, int pc, RegexRun run, int sp) {
-        if (o == RegexProgram.OpBol()) {
+        int len = run.len;
+        Span<byte> buf = new Span<byte>(run.inputPtr, len);
+        if (o == 8) {
             if (sp == 0) { return true; }
-            return this.multiline && new Span<byte>(run.input + sp - 1, 1)[0] == 10;
+            return this.multiline && (buf[sp - 1] & 255) == 10;
         }
-        if (o == RegexProgram.OpEol()) {
-            if (sp == run.len) { return true; }
-            if (new Span<byte>(run.input + sp, 1)[0] != 10) { return false; }
-            return this.multiline || sp == run.len - 1;
+        if (o == 9) {
+            if (sp == len) { return true; }
+            if ((buf[sp] & 255) != 10) { return false; }
+            return this.multiline || sp == len - 1;
         }
-        if (o == RegexProgram.OpBos()) { return sp == 0; }
-        if (o == RegexProgram.OpEos()) {
-            if (sp == run.len) { return true; }
-            return this.ax[pc] == 1 && sp == run.len - 1
-                && new Span<byte>(run.input + sp, 1)[0] == 10;
+        if (o == 12) { return sp == 0; }
+        if (o == 13) {
+            if (sp == len) { return true; }
+            return this.axArr[pc] == 1 && sp == len - 1
+                && (buf[sp] & 255) == 10;
         }
-        if (o == RegexProgram.OpGpos()) { return sp == run.origin; }
-        bool before = sp > 0 && RegexProgram.IsWordCp(new Span<byte>(run.input + sp - 1, 1)[0]);
+        if (o == 14) { return sp == run.origin; }
+        bool before = sp > 0 && RegexProgram.IsWordCp(buf[sp - 1] & 255);
         bool after = false;
-        if (sp < run.len) {
-            int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-            after = RegexProgram.IsWordCp(packed / 8);
+        if (sp < len) {
+            int b = buf[sp] & 255;
+            if (b < 128) {
+                after = RegexProgram.IsWordCp(b);
+            } else {
+                int packed = RegexProgram.DecodeAt(run.inputPtr, len, sp);
+                after = RegexProgram.IsWordCp(packed >> 3);
+            }
         }
         bool boundary = before != after;
-        return this.ax[pc] == 1 ? boundary : !boundary;
+        return this.axArr[pc] == 1 ? boundary : !boundary;
     }
 
     int StepBackref(RegexRun run, int group, int sp) {
@@ -289,9 +564,10 @@ public partial class RegexProgram {
         if (gs < 0 || ge < gs) { return sp; }
         int n = ge - gs;
         if (sp + n > run.len) { return -1; }
+        Span<byte> buf = new Span<byte>(run.inputPtr, run.len);
         for (int k = 0; k < n; k = k + 1) {
-            int a = new Span<byte>(run.input + gs + k, 1)[0];
-            int b = new Span<byte>(run.input + sp + k, 1)[0];
+            int a = buf[gs + k] & 255;
+            int b = buf[sp + k] & 255;
             if (a != b) {
                 if (!this.ignoreCase || RegexProgram.Fold(a) != RegexProgram.Fold(b)) { return -1; }
             }
@@ -305,6 +581,9 @@ public partial class RegexProgram {
                 + Convert.ToString(RegexProgram.MaxRecursionDepth)
                 + " (pattern quantifier nesting on long input)");
         }
+        int len = run.len;
+        nint inpPtr = run.inputPtr;
+        Span<byte> buf = new Span<byte>(inpPtr, len);
         while (true) {
             if (run.overflow) { return false; }
             run.budget = run.budget - 1;
@@ -312,57 +591,98 @@ public partial class RegexProgram {
                 run.overflow = true;
                 return false;
             }
-            int o = this.op[pc];
-            if (o == RegexProgram.OpChar()) {
-                int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                if (packed < 0) { return false; }
-                int c = packed / 8;
-                int want = this.ax[pc];
-                if (c != want && (!this.ignoreCase || RegexProgram.Fold(c) != RegexProgram.Fold(want))) {
-                    return false;
+            int o = this.opArr[pc];
+            if (o == 3) {
+                // OpClass (最热指令)
+                if (sp >= len) { return false; }
+                int b0 = buf[sp] & 255;
+                int ci = this.axArr[pc];
+                if (b0 < 128) {
+                    long mask = b0 < 64 ? this.clsMaskLo[ci] : this.clsMaskHi[ci];
+                    if ((mask & (1L << (b0 & 63))) == 0L) { return false; }
+                    pc = pc + 1;
+                    sp = sp + 1;
+                } else {
+                    int packed = RegexProgram.DecodeAt(inpPtr, len, sp);
+                    if (packed < 0 || !this.ClassHasSlow(ci, packed >> 3)) { return false; }
+                    pc = pc + 1;
+                    sp = sp + (packed & 7);
                 }
-                pc = pc + 1;
-                sp = sp + (packed & 7);
-            } else if (o == RegexProgram.OpAny()) {
-                int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                if (packed < 0 || (!this.dotAll && packed / 8 == 10)) { return false; }
-                pc = pc + 1;
-                sp = sp + (packed & 7);
-            } else if (o == RegexProgram.OpClass()) {
-                int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                if (packed < 0 || !this.ClassHas(this.ax[pc], packed / 8)) { return false; }
-                pc = pc + 1;
-                sp = sp + (packed & 7);
-            } else if (o == RegexProgram.OpJmp()) {
-                pc = this.ax[pc];
-            } else if (o == RegexProgram.OpSplit()) {
-                if (this.Step(run, this.ax[pc], sp, depth + 1)) { return true; }
+            } else if (o == 1) {
+                // OpChar
+                if (sp >= len) { return false; }
+                int b0 = buf[sp] & 255;
+                int want = this.axArr[pc];
+                if (b0 < 128) {
+                    if (b0 != want && (!this.ignoreCase || RegexProgram.Fold(b0) != RegexProgram.Fold(want))) {
+                        return false;
+                    }
+                    pc = pc + 1;
+                    sp = sp + 1;
+                } else {
+                    int packed = RegexProgram.DecodeAt(inpPtr, len, sp);
+                    if (packed < 0) { return false; }
+                    int c = packed >> 3;
+                    if (c != want && (!this.ignoreCase || RegexProgram.Fold(c) != RegexProgram.Fold(want))) {
+                        return false;
+                    }
+                    pc = pc + 1;
+                    sp = sp + (packed & 7);
+                }
+            } else if (o == 6) {
+                // OpSplit
+                if (this.Step(run, this.axArr[pc], sp, depth + 1)) { return true; }
                 if (run.overflow) { return false; }
-                pc = this.ay[pc];
-            } else if (o == RegexProgram.OpSave()) {
-                int slot = this.ax[pc];
+                pc = this.ayArr[pc];
+            } else if (o == 5) {
+                // OpJmp
+                pc = this.axArr[pc];
+            } else if (o == 7) {
+                // OpSave
+                int slot = this.axArr[pc];
                 int old = run.caps[slot];
                 run.caps[slot] = sp;
                 if (this.Step(run, pc + 1, sp, depth + 1)) { return true; }
                 run.caps[slot] = old;
                 return false;
-            } else if (o == RegexProgram.OpMark()) {
-                int slot = this.ax[pc];
+            } else if (o == 15) {
+                // OpMark
+                int slot = this.axArr[pc];
                 int old = run.marks[slot];
                 run.marks[slot] = sp;
                 if (this.Step(run, pc + 1, sp, depth + 1)) { return true; }
                 run.marks[slot] = old;
                 return false;
-            } else if (o == RegexProgram.OpEmptyChk()) {
-                pc = run.marks[this.ax[pc]] == sp ? this.ay[pc] : pc + 1;
-            } else if (o == RegexProgram.OpLook()) {
-                int kind = this.ax[pc];
-                int cont = this.ay[pc];
+            } else if (o == 16) {
+                // OpEmptyChk
+                pc = run.marks[this.axArr[pc]] == sp ? this.ayArr[pc] : pc + 1;
+            } else if (o == 2) {
+                // OpAny
+                if (sp >= len) { return false; }
+                int b0 = buf[sp] & 255;
+                if (b0 < 128) {
+                    if (!this.dotAll && b0 == 10) { return false; }
+                    pc = pc + 1;
+                    sp = sp + 1;
+                } else {
+                    int packed = RegexProgram.DecodeAt(inpPtr, len, sp);
+                    if (packed < 0) { return false; }
+                    pc = pc + 1;
+                    sp = sp + (packed & 7);
+                }
+            } else if (o == 4) {
+                // OpMatch
+                run.end = sp;
+                return true;
+            } else if (o == 17) {
+                // OpLook
+                int kind = this.axArr[pc];
+                int cont = this.ayArr[pc];
                 int at = sp;
-                if (kind == RegexProgram.LookBehind() || kind == RegexProgram.LookBehindNeg()) {
-                    at = sp - this.az[pc];
+                if (kind == 2 || kind == 3) {
+                    at = sp - this.azArr[pc];
                     if (at < 0) {
-                        if (kind == RegexProgram.LookBehind()) { return false; }
+                        if (kind == 2) { return false; }
                         pc = cont;
                         continue;
                     }
@@ -373,21 +693,20 @@ public partial class RegexProgram {
                 if (run.overflow) { return false; }
                 int subEnd = run.subEnd;
                 run.subEnd = savedEnd;
-                bool neg = kind == RegexProgram.LookAheadNeg() || kind == RegexProgram.LookBehindNeg();
+                bool neg = kind == 1 || kind == 3;
                 if (neg ? ok : !ok) { return false; }
-                if (kind == RegexProgram.LookAtomic()) { sp = subEnd; }
+                if (kind == 4) { sp = subEnd; }
                 pc = cont;
-            } else if (o == RegexProgram.OpLookEnd()) {
+            } else if (o == 18) {
+                // OpLookEnd
                 run.subEnd = sp;
                 return true;
-            } else if (o == RegexProgram.OpBackref()) {
-                int nextSp = this.StepBackref(run, this.ax[pc], sp);
+            } else if (o == 11) {
+                // OpBackref
+                int nextSp = this.StepBackref(run, this.axArr[pc], sp);
                 if (nextSp < 0) { return false; }
                 pc = pc + 1;
                 sp = nextSp;
-            } else if (o == RegexProgram.OpMatch()) {
-                run.end = sp;
-                return true;
             } else {
                 if (!this.MatchAssertion(o, pc, run, sp)) { return false; }
                 pc = pc + 1;

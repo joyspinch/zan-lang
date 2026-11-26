@@ -434,6 +434,51 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
     fam = 2;
   if (fam >= 0) {
     zan_type_t *ot = infer_expr_type(g, ofc->member.object, locals);
+    if (fam == 2 && ot && irgen_type_is_hashable_prim(ot)) {
+      LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+      LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+      LLVMValueRef val = emit_expr(g, ofc->member.object, locals);
+      if (ot->kind == TYPE_STRING) {
+        LLVMValueRef hf = get_str_hashcode_fn(g);
+        LLVMValueRef res = zan_call2(g->builder, LLVMGlobalGetValueType(hf), hf,
+                                     &val, 1, "str.hc");
+        emit_release_owned_call_temp(g, ofc->member.object, val, locals);
+        return res;
+      }
+      LLVMTypeRef vt = LLVMTypeOf(val);
+      LLVMTypeKind vk = LLVMGetTypeKind(vt);
+      if (vk == LLVMFloatTypeKind) {
+        return LLVMBuildBitCast(g->builder, val, i32, "f32.hc");
+      }
+      if (vk == LLVMDoubleTypeKind) {
+        LLVMValueRef bits = LLVMBuildBitCast(g->builder, val, i64, "f64.bits");
+        LLVMValueRef hi = LLVMBuildLShr(g->builder, bits,
+                                        LLVMConstInt(i64, 32, 0), "f64.hi");
+        return LLVMBuildTrunc(g->builder,
+                              LLVMBuildXor(g->builder, bits, hi, "f64.x"), i32,
+                              "f64.hc");
+      }
+      if (vk == LLVMIntegerTypeKind) {
+        unsigned bw = LLVMGetIntTypeWidth(vt);
+        if (bw == 32)
+          return val;
+        if (bw < 32)
+          return LLVMBuildZExt(g->builder, val, i32, "i.hc");
+        LLVMValueRef hi = LLVMBuildLShr(g->builder, val,
+                                        LLVMConstInt(vt, 32, 0), "i64.hi");
+        return LLVMBuildTrunc(g->builder,
+                              LLVMBuildXor(g->builder, val, hi, "i64.x"), i32,
+                              "i64.hc");
+      }
+      if (vk == LLVMPointerTypeKind) {
+        LLVMValueRef pi = LLVMBuildPtrToInt(g->builder, val, i64, "p.i");
+        LLVMValueRef hi = LLVMBuildLShr(g->builder, pi,
+                                        LLVMConstInt(i64, 32, 0), "p.hi");
+        return LLVMBuildTrunc(g->builder,
+                              LLVMBuildXor(g->builder, pi, hi, "p.x"), i32,
+                              "p.hc");
+      }
+    }
     if (ot && (ot->kind == TYPE_OBJECT || ot->kind == TYPE_INTERFACE ||
                ot->kind == TYPE_CLASS)) {
       zan_symbol_t *osym = ot->sym;
