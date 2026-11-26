@@ -1,0 +1,185 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+class Counter {
+    public int Calls = 0;
+    public int Next(int v) {
+        this.Calls = this.Calls + 1;
+        return v + this.Calls;
+    }
+}
+
+class Program {
+    // 1. Escape analysis: returned string MUST stay on heap (must not stack-promote)
+    static string MakeReturned(int n) {
+        string s = $"ret-{n}-{n * 2}";
+        return s;
+    }
+
+    // 2. Escape analysis: loop-carried phi MUST stay on heap
+    static string LoopCarried(int n) {
+        string acc = "init";
+        for (int i = 0; i < n; i++) {
+            acc = $"{acc}:{i}";
+        }
+        return acc;
+    }
+
+    // 3. Escape analysis: constant-incoming PHI + static-bounded SSO (<= 256B)
+    static int TestPhiAndStaticSso() {
+        int total = 0;
+        for (int i = 0; i < 64; i++) {
+            string s = (i % 2 == 0) ? $"even-{i}-{i * 3}" : "odd-literal";
+            total += s.Length;
+        }
+        return total;
+    }
+
+    // 4. Dynamic-size Stack-SSO fast path (<= 256B) + heap fallback (> 256B)
+    static int TestDynamicSsoBothPaths(int count) {
+        var sb = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            sb.Append("ab");
+            sb.Append(i);
+        }
+        string s = sb.ToString();
+        return s.Length;
+    }
+
+    // 5. Single-pass string.Format: left-to-right single eval, repeated placeholders,
+    //    escaped braces, primitives, null, format specifiers
+    static void TestStringFormat() {
+        var c = new Counter();
+        string r1 = string.Format("{0}|{1}|{0}|{{ok}}|{2}", c.Next(10), c.Next(20), c.Next(30));
+        Console.WriteLine($"fmt1={r1} calls={c.Calls}");
+
+        string emptyOrNull = null;
+        string r2 = string.Format("i={0},l={1},b={2},c={3},s={4},n={5},d={6},raw={6:F2}",
+            -42, 9000000000L, true, 'Z', "hi", emptyOrNull, 3.5);
+        Console.WriteLine($"fmt2={r2}");
+
+        // Unused argument must still be evaluated once left-to-right
+        var c2 = new Counter();
+        string r3 = string.Format("{2}-{0}", c2.Next(1), c2.Next(2), c2.Next(3));
+        Console.WriteLine($"fmt3={r3} calls={c2.Calls}");
+    }
+
+    // 6. Fast Replace & Split
+    static void TestReplaceAndSplit() {
+        // 1->1 byte replace, identical 1->1, 1->N, 1->0, N->M, no-match, empty
+        Console.WriteLine("rep1=" + "a-b-c-d".Replace("-", "_"));
+        Console.WriteLine("rep2=" + "abc".Replace("a", "a"));
+        Console.WriteLine("rep3=" + "a,b,c".Replace(",", "::"));
+        Console.WriteLine("rep4=" + "a,b,c".Replace(",", ""));
+        Console.WriteLine("rep5=" + "foobarfoo".Replace("foo", "XYZ12"));
+        Console.WriteLine("rep6=" + "hello".Replace("z", "!"));
+        Console.WriteLine("rep7=" + "abc".Replace("", "x"));
+        Console.WriteLine("rep8=" + "".Replace("a", "b"));
+
+        // Split 1-byte sep (with empty parts & single-char ASCII parts & >8 parts)
+        var p1 = "a,b,,c,d,e,f,g,h,i,j".Split(",");
+        Console.WriteLine($"sp1={p1.Count}:{p1[0]}|{p1[2]}|{p1[10]}");
+
+        // Split multi-byte sep
+        var p2 = "x::y::::z::".Split("::");
+        Console.WriteLine($"sp2={p2.Count}:{p2[0]}|{p2[1]}|{p2[2]}|{p2[3]}|{p2[4]}");
+
+        // Split no-match & empty string
+        var p3 = "single".Split(",");
+        var p4 = "".Split(",");
+        Console.WriteLine($"sp3={p3.Count}:{p3[0]} sp4={p4.Count}:{p4[0].Length}");
+    }
+
+    // 7. Compact StringBuilder: grow, direct itoa, AppendLine(literal/char/int/var), Clear
+    static void TestStringBuilder() {
+        var sb = new StringBuilder();
+        Console.WriteLine($"sb0={sb.ToString().Length}");
+
+        sb.Append("row=");
+        sb.Append(0);
+        sb.Append(',');
+        sb.Append(-123456);
+        sb.AppendLine("!");
+        sb.AppendLine('X');
+        sb.AppendLine(42);
+        string dyn = $"d{7}";
+        sb.AppendLine(dyn);
+        string out1 = sb.ToString();
+        Console.WriteLine($"sb1={out1.Replace("\n", "\\n")}");
+
+        // Exercise multiple growths past initial capacity
+        sb.Clear();
+        for (int i = 0; i < 120; i++) {
+            sb.Append("k");
+            sb.Append(i);
+            sb.Append(';');
+        }
+        string out2 = sb.ToString();
+        Console.WriteLine($"sb2_len={out2.Length} head={out2.Substring(0, 12)}");
+    }
+
+    // 8. Compact SwissTable Dict<K,V>: i32 slots + 128-bit seeded hash
+    static void TestDict() {
+        var di = new Dictionary<int, int>();
+        // Insert 500 keys (multiple rebuilds), including 0 and negative keys
+        for (int i = -50; i < 450; i++) {
+            di[i] = i * 3 + 1;
+        }
+        // Overwrite subset
+        for (int i = 0; i < 100; i++) {
+            di[i] = i * 5;
+        }
+        // Remove 200 keys (tombstones)
+        int removed = 0;
+        for (int i = 100; i < 300; i++) {
+            if (di.Remove(i)) removed++;
+        }
+        // Re-insert 150 keys (tombstone reuse + rebuild)
+        for (int i = 200; i < 350; i++) {
+            di[i] = i * 7;
+        }
+        long sum = 0;
+        int hits = 0;
+        for (int i = -60; i < 460; i++) {
+            if (di.ContainsKey(i)) {
+                hits++;
+                sum += di[i];
+            }
+        }
+        Console.WriteLine($"di cnt={di.Count} rem={removed} hits={hits} sum={sum}");
+
+        var ds = new Dictionary<string, int>();
+        for (int i = 0; i < 300; i++) {
+            ds[$"key-{i}"] = i + 10;
+        }
+        ds[""] = 999;
+        ds["a"] = 888;
+        int srem = 0;
+        for (int i = 50; i < 200; i++) {
+            if (ds.Remove($"key-{i}")) srem++;
+        }
+        for (int i = 100; i < 250; i++) {
+            ds[$"key-{i}"] = i + 1000;
+        }
+        int ssum = 0;
+        if (ds.ContainsKey("")) ssum += ds[""];
+        if (ds.ContainsKey("a")) ssum += ds["a"];
+        for (int i = 0; i < 300; i++) {
+            string k = $"key-{i}";
+            if (ds.ContainsKey(k)) ssum += ds[k];
+        }
+        Console.WriteLine($"ds cnt={ds.Count} rem={srem} sum={ssum}");
+    }
+
+    static void Main() {
+        Console.WriteLine("ret=" + MakeReturned(21));
+        Console.WriteLine("loop=" + LoopCarried(4));
+        Console.WriteLine($"phi_sso={TestPhiAndStaticSso()}");
+        Console.WriteLine($"dyn_sso={TestDynamicSsoBothPaths(5)},{TestDynamicSsoBothPaths(120)}");
+        TestStringFormat();
+        TestReplaceAndSplit();
+        TestStringBuilder();
+        TestDict();
+    }
+}

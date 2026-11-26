@@ -1,6 +1,7 @@
 
 #include "optimizer.h"
 #include "irgen.h"
+#include "irgen_compact.h"
 #include "binder.h"
 #include "zan_abi.h"
 #include <llvm-c/Core.h>
@@ -2736,6 +2737,89 @@ static bool desc_dtor_is_self_only(LLVMValueRef site_val) {
   return false;
 }
 
+static bool phi_other_incomings_are_const(LLVMValueRef phi,
+                                          LLVMValueRef base_val) {
+  if (!phi || LLVMGetInstructionOpcode(phi) != LLVMPHI)
+    return false;
+  unsigned n = LLVMCountIncoming(phi);
+  if (n == 0)
+    return false;
+  for (unsigned i = 0; i < n; i++) {
+    LLVMValueRef inc = strip_pointer_casts(LLVMGetIncomingValue(phi, i));
+    if (inc != base_val && !LLVMIsConstant(inc))
+      return false;
+  }
+  return true;
+}
+
+/* 保守估计无符号 i64 表达式的静态上界（无法证明则返回 UINT64_MAX）。
+ * 用于将插值/拼接等“表达式动态但长度有界”的非逃逸字符串直接提升到栈上。 */
+static uint64_t val_max_u64(LLVMValueRef v, int depth) {
+  if (!v || depth > 10)
+    return UINT64_MAX;
+  if (LLVMIsAConstantInt(v))
+    return LLVMConstIntGetZExtValue(v);
+  if (!LLVMIsAInstruction(v))
+    return UINT64_MAX;
+  LLVMOpcode op = LLVMGetInstructionOpcode(v);
+  if (op == LLVMAdd) {
+    uint64_t a = val_max_u64(LLVMGetOperand(v, 0), depth + 1);
+    uint64_t b = val_max_u64(LLVMGetOperand(v, 1), depth + 1);
+    if (a == UINT64_MAX || b == UINT64_MAX || a > UINT64_MAX - b)
+      return UINT64_MAX;
+    return a + b;
+  }
+  if (op == LLVMAnd) {
+    LLVMValueRef rhs = LLVMGetOperand(v, 1);
+    if (LLVMIsAConstantInt(rhs)) {
+      uint64_t mask = LLVMConstIntGetZExtValue(rhs);
+      uint64_t a = val_max_u64(LLVMGetOperand(v, 0), depth + 1);
+      return a < mask ? a : mask;
+    }
+    return UINT64_MAX;
+  }
+  if (op == LLVMSelect) {
+    uint64_t a = val_max_u64(LLVMGetOperand(v, 1), depth + 1);
+    uint64_t b = val_max_u64(LLVMGetOperand(v, 2), depth + 1);
+    return a > b ? a : b;
+  }
+  if (op == LLVMZExt) {
+    LLVMValueRef src = LLVMGetOperand(v, 0);
+    uint64_t a = val_max_u64(src, depth + 1);
+    if (a != UINT64_MAX)
+      return a;
+    LLVMTypeRef st = LLVMTypeOf(src);
+    if (LLVMGetTypeKind(st) == LLVMIntegerTypeKind) {
+      unsigned w = LLVMGetIntTypeWidth(st);
+      if (w > 0 && w < 64)
+        return (UINT64_C(1) << w) - 1;
+    }
+    return UINT64_MAX;
+  }
+  if (op == LLVMCall) {
+    LLVMValueRef callee = LLVMGetCalledValue(v);
+    const char *cn =
+        (callee && LLVMIsAFunction(callee)) ? LLVMGetValueName(callee) : NULL;
+    if (!cn)
+      return UINT64_MAX;
+    if (strcmp(cn, "__zan_itoa64") == 0 || strcmp(cn, "__zan_u64toa") == 0)
+      return 21;
+    if (strcmp(cn, "__zan_char_to_stack") == 0)
+      return 4;
+    if (strcmp(cn, "llvm.umax.i64") == 0 && LLVMGetNumArgOperands(v) == 2) {
+      uint64_t a = val_max_u64(LLVMGetOperand(v, 0), depth + 1);
+      uint64_t b = val_max_u64(LLVMGetOperand(v, 1), depth + 1);
+      return a > b ? a : b;
+    }
+    if (strcmp(cn, "llvm.umin.i64") == 0 && LLVMGetNumArgOperands(v) == 2) {
+      uint64_t a = val_max_u64(LLVMGetOperand(v, 0), depth + 1);
+      uint64_t b = val_max_u64(LLVMGetOperand(v, 1), depth + 1);
+      return a < b ? a : b;
+    }
+  }
+  return UINT64_MAX;
+}
+
 static void erase_stack_obj_arc_calls(LLVMValueRef val, bool is_str,
                                       int depth) {
   if (!val || depth > 8)
@@ -2747,7 +2831,9 @@ static void erase_stack_obj_arc_calls(LLVMValueRef val, bool is_str,
     LLVMUseRef next_u = LLVMGetNextUse(u);
     if (user && LLVMIsAInstruction(user)) {
       LLVMOpcode op = LLVMGetInstructionOpcode(user);
-      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
+          (is_str && op == LLVMPHI &&
+           phi_other_incomings_are_const(user, base_val))) {
         erase_stack_obj_arc_calls(user, is_str, depth + 1);
         next_u = LLVMGetNextUse(u);
       } else if (op == LLVMStore) {
@@ -2845,7 +2931,8 @@ static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
     LLVMOpcode op = LLVMGetInstructionOpcode(user);
 
     if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
-        op == LLVMGetElementPtr || op == LLVMSelect) {
+        op == LLVMGetElementPtr || op == LLVMSelect ||
+        (op == LLVMPHI && phi_other_incomings_are_const(user, base_val))) {
       if (check_val_escapes(user, alloc_bb, entry_bb, depth + 1))
         return true;
     } else if (op == LLVMICmp || op == LLVMFCmp) {
@@ -2922,6 +3009,7 @@ static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
           strcmp(name, "__zan_str_eq") == 0 ||
           strcmp(name, "__zan_dict_hash") == 0 ||
           strcmp(name, "__zan_dict_find_str") == 0 ||
+          strcmp(name, "__zan_sb_grow") == 0 ||
           strcmp(name, "zan_rt_str_compare") == 0 ||
           strcmp(name, "zan_rt_str_equal") == 0 ||
           strcmp(name, "zan_rt_str_hash") == 0 ||
@@ -2970,7 +3058,8 @@ static void clear_escape_user_tail_calls(LLVMValueRef val, int depth) {
     if (user && LLVMIsAInstruction(user)) {
       LLVMOpcode op = LLVMGetInstructionOpcode(user);
       if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
-          op == LLVMGetElementPtr || op == LLVMSelect) {
+          op == LLVMGetElementPtr || op == LLVMSelect ||
+          (op == LLVMPHI && phi_other_incomings_are_const(user, base_val))) {
         clear_escape_user_tail_calls(user, depth + 1);
       } else if (op == LLVMStore) {
         LLVMValueRef store_val = strip_pointer_casts(LLVMGetOperand(user, 0));
@@ -3008,6 +3097,7 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
   while (fn) {
     if (!LLVMIsDeclaration(fn)) {
+      int dyn_sso_count = 0;
       LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
       LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
       while (bb) {
@@ -3146,10 +3236,10 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                        LLVMGetNumArgOperands(inst) >= 1) {
               stats.objects_analyzed++;
               LLVMValueRef size_val = LLVMGetOperand(inst, 0);
-              if (LLVMIsAConstantInt(size_val)) {
-                uint64_t obj_sz = LLVMConstIntGetZExtValue(size_val);
-                if (obj_sz <= 256 &&
-                    !check_val_escapes(inst, bb, entry_bb, 0)) {
+              uint64_t max_sz = val_max_u64(size_val, 0);
+              if (max_sz <= 256) {
+                uint64_t obj_sz = max_sz < 16 ? 16 : ((max_sz + 15) & ~UINT64_C(15));
+                if (!check_val_escapes(inst, bb, entry_bb, 0)) {
                   LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
                   insert_entry_alloca(b_entry, fn);
                   LLVMValueRef total_val =
@@ -3193,6 +3283,90 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMReplaceAllUsesWith(inst, stk_str);
                   LLVMInstructionEraseFromParent(inst);
 
+                  stats.stack_promoted++;
+                }
+              } else if (dyn_sso_count < 8 &&
+                         !check_val_escapes(inst, bb, entry_bb, 0)) {
+                /* 动态尺寸非逃逸短串 SSO 快路径：<=256B 走入口栈缓冲（rc=-1 免疫释放），
+                 * >256B 回退 zan_rt_str_alloc，并保留原 zan_rt_str_release 以正确释放堆回退。 */
+                LLVMBasicBlockRef join_bb =
+                    zan_llvm_split_bb(bb, inst, "sso.join");
+                if (join_bb) {
+                  dyn_sso_count++;
+                  LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
+                  insert_entry_alloca(b_entry, fn);
+                  LLVMValueRef total_val =
+                      LLVMConstInt(i64, 256 + ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef alloca_buf =
+                      LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.sso");
+                  LLVMSetAlignment(alloca_buf, 16);
+                  LLVMDisposeBuilder(b_entry);
+
+                  LLVMValueRef old_br = LLVMGetBasicBlockTerminator(bb);
+                  if (old_br)
+                    LLVMInstructionEraseFromParent(old_br);
+
+                  LLVMBasicBlockRef fast_bb =
+                      LLVMInsertBasicBlockInContext(ctx, join_bb, "sso.fast");
+                  LLVMBasicBlockRef heap_bb =
+                      LLVMInsertBasicBlockInContext(ctx, join_bb, "sso.heap");
+
+                  LLVMBuilderRef b_br = LLVMCreateBuilderInContext(ctx);
+                  LLVMPositionBuilderAtEnd(b_br, bb);
+                  LLVMValueRef is_small = LLVMBuildICmp(
+                      b_br, LLVMIntULE, size_val, LLVMConstInt(i64, 256, 0),
+                      "sso.small");
+                  LLVMBuildCondBr(b_br, is_small, fast_bb, heap_bb);
+
+                  LLVMPositionBuilderAtEnd(b_br, fast_bb);
+                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
+                      b_br, alloca_buf, LLVMPointerType(i64, 0), "sso.rcp");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(b_br,
+                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
+                                     rc_ptr),
+                      8);
+                  LLVMValueRef eight =
+                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+                      b_br, i8, alloca_buf, &eight, 1, "sso.hdrp");
+                  LLVMValueRef hdr_iptr = LLVMBuildBitCast(
+                      b_br, hdr_ptr, LLVMPointerType(i64, 0), "sso.hdrip");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(
+                          b_br,
+                          LLVMConstInt(i64,
+                                       ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN),
+                                       0),
+                          hdr_iptr),
+                      8);
+                  LLVMValueRef hdr_off =
+                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef stk_str = LLVMBuildGEP2(
+                      b_br, i8, alloca_buf, &hdr_off, 1, "sso.usr");
+                  LLVMBuildBr(b_br, join_bb);
+
+                  LLVMPositionBuilderAtEnd(b_br, heap_bb);
+                  LLVMValueRef heap_str = LLVMBuildCall2(
+                      b_br, LLVMGlobalGetValueType(callee), callee, &size_val,
+                      1, "sso.heap");
+                  LLVMSetInstructionCallConv(
+                      heap_str, LLVMGetInstructionCallConv(inst));
+                  LLVMBuildBr(b_br, join_bb);
+
+                  LLVMPositionBuilderBefore(b_br, inst);
+                  LLVMValueRef sso_phi = LLVMBuildPhi(
+                      b_br, LLVMPointerType(i8, 0), "sso.res");
+                  LLVMValueRef in_vals[2] = {stk_str, heap_str};
+                  LLVMBasicBlockRef in_bbs[2] = {fast_bb, heap_bb};
+                  LLVMAddIncoming(sso_phi, in_vals, in_bbs, 2);
+                  LLVMDisposeBuilder(b_br);
+
+                  clear_escape_user_tail_calls(inst, 0);
+                  LLVMReplaceAllUsesWith(inst, sso_phi);
+                  LLVMInstructionEraseFromParent(inst);
+
+                  bb = join_bb;
                   stats.stack_promoted++;
                 }
               }

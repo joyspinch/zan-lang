@@ -429,8 +429,28 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
       return raw;
     }
     if (sb_is_append || sb_is_appendline) {
+      int nl_done = 0;
       if (expr->call.args.count == 1) {
         zan_ast_node_t *arg0 = expr->call.args.items[0];
+        if (arg0->kind == AST_STRING_LITERAL) {
+          /* 字符串字面量直接用编译期常量长度；AppendLine 合并 "\n" 为单次追加 */
+          if (sb_is_appendline && arg0->str_val.len >= 0 &&
+              arg0->str_val.len < 4096) {
+            char tmp_nl[4097];
+            if (arg0->str_val.len > 0)
+              memcpy(tmp_nl, arg0->str_val.str, (size_t)arg0->str_val.len);
+            tmp_nl[arg0->str_val.len] = '\n';
+            zan_istr_t lit_nl = { tmp_nl, arg0->str_val.len + 1 };
+            LLVMValueRef s = emit_string_literal_rc(g, lit_nl);
+            emit_sb_append_bytes(g, sbp, s,
+                LLVMConstInt(i64, (uint64_t)lit_nl.len, 0));
+            nl_done = 1;
+          } else {
+            LLVMValueRef s = emit_string_literal_rc(g, arg0->str_val);
+            emit_sb_append_bytes(g, sbp, s,
+                LLVMConstInt(i64, (uint64_t)arg0->str_val.len, 0));
+          }
+        } else {
         LLVMValueRef v = emit_expr(g, arg0, locals);
         zan_type_t *at = infer_expr_type(g, arg0, locals);
         int sv_arg = at && at->kind == TYPE_STRUCT && at->name.len == 10 &&
@@ -462,38 +482,44 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
           int int_arg = !char_arg &&
                         LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1;
-          LLVMValueRef s, slen;
           if (int_arg) {
-            s = emit_entry_scratch(g, 40, "sb.i2s");
-            slen = emit_itoa_into(g, s, emit_widen_i64_for_print(g, v),
-                                  expr_is_ulong(g, arg0, locals) ? 1 : 0);
-          } else if (char_arg) {
-            /* char 直接在 8B 栈缓冲完成 UTF-8 编码，零堆分配/释放 */
-            s = emit_entry_scratch(g, 8, "sb.c2s");
-            slen = emit_char_to_stack(g, v, s);
-          } else if (arg0->kind == AST_STRING_LITERAL) {
-            /* 字符串字面量直接用编译期常量长度，免去运行期长度读取与空判 */
-            s = v;
-            slen = LLVMConstInt(i64, (uint64_t)arg0->str_val.len, 0);
+            emit_sb_append_int(g, sbp, emit_widen_i64_for_print(g, v),
+                               expr_is_ulong(g, arg0, locals) ? 1 : 0,
+                               sb_is_appendline);
+            nl_done = sb_is_appendline;
           } else {
-            s = emit_value_as_cstr(g, v);
-            int str_arg =
-                LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
-                is_string_expr(g, arg0, locals);
-            if (str_arg) {
-              s = emit_str_nonnull(g, s);
-              slen = emit_string_buffer_len(g, s, arg0->loc);
+            LLVMValueRef s, slen;
+            if (char_arg) {
+              /* char 直接在 8B 栈缓冲完成 UTF-8 编码，零堆分配/释放 */
+              s = emit_entry_scratch(g, 8, "sb.c2s");
+              slen = emit_char_to_stack(g, v, s);
+              if (sb_is_appendline) {
+                LLVMValueRef nlp = LLVMBuildGEP2(g->builder, i8, s, &slen, 1, "sb.cnlp");
+                LLVMBuildStore(g->builder, LLVMConstInt(i8, '\n', 0), nlp);
+                slen = zan_add(g->builder, slen, LLVMConstInt(i64, 1, 0), "sb.clen.nl");
+                nl_done = 1;
+              }
             } else {
-              slen = emit_cstr_len_of(g, s, arg0);
+              s = emit_value_as_cstr(g, v);
+              int str_arg =
+                  LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
+                  is_string_expr(g, arg0, locals);
+              if (str_arg) {
+                s = emit_str_nonnull(g, s);
+                slen = emit_string_buffer_len(g, s, arg0->loc);
+              } else {
+                slen = emit_cstr_len_of(g, s, arg0);
+              }
             }
+            emit_sb_append_bytes(g, sbp, s, slen);
+            if (!char_arg &&
+                LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+              emit_release_owned_call_temp(g, arg0, v, locals);
           }
-          emit_sb_append_bytes(g, sbp, s, slen);
-          if (!char_arg && arg0->kind != AST_STRING_LITERAL &&
-              LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
-            emit_release_owned_call_temp(g, arg0, v, locals);
+        }
         }
       }
-      if (sb_is_appendline) {
+      if (sb_is_appendline && !nl_done) {
         zan_istr_t nl = {"\n", 1};
         LLVMValueRef nls = emit_string_literal_rc(g, nl);
         emit_sb_append_bytes(g, sbp, nls, LLVMConstInt(i64, 1, 0));

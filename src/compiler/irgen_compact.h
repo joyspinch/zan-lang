@@ -32,6 +32,12 @@ LLVMTargetMachineRef zan_create_target_machine_with_options(
  * to external). The function becomes a declaration. */
 void zan_llvm_delete_body(LLVMValueRef function);
 
+/* Split basic block `bb` immediately before `before_inst`, updating all
+ * successor PHI incoming blocks automatically. Returns the new tail block. */
+LLVMBasicBlockRef zan_llvm_split_bb(LLVMBasicBlockRef bb,
+                                    LLVMValueRef before_inst,
+                                    const char *name);
+
 #ifdef __cplusplus
 }
 #endif

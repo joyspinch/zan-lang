@@ -30,12 +30,54 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
           return emit_bool_to_cstr(g, bc);
       }
       if (vk == LLVMPointerTypeKind) {
-        /* string 是不可变托管串，s.ToString() 零分配：
-         * 若接收者已是临时所有权则直接移交，否则仅 retain 后返回。 */
+        /* 常规无内嵌 NUL 字符串零分配（retain/移交）；
+         * 含内嵌 NUL 字符串按 C 可见长度截断复制（与自举/string_nul_search 对齐）。 */
         LLVMValueRef s = emit_str_nonnull(g, v);
-        if (!expr_yields_owned_rc_value(g, sc->member.object, locals))
+        bool recv_owned = expr_yields_owned_rc_value(g, sc->member.object, locals);
+        LLVMTypeRef strlen_ty =
+            LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr}, 1, 0);
+        LLVMValueRef clen =
+            zan_call2(g->builder, strlen_ty, g->fn_strlen, &s, 1, "tos.clen");
+        LLVMValueRef exact = emit_string_length(g, s, expr->loc);
+        LLVMBasicBlockRef bb_fast =
+            LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tos.fast");
+        LLVMBasicBlockRef bb_trunc =
+            LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tos.trunc");
+        LLVMBasicBlockRef bb_done =
+            LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "tos.done");
+        zan_set_branch_weights(
+            g,
+            LLVMBuildCondBr(
+                g->builder,
+                zan_icmp(g->builder, LLVMIntEQ, clen, exact, "tos.nonul"),
+                bb_fast, bb_trunc),
+            2000, 1);
+        LLVMPositionBuilderAtEnd(g->builder, bb_fast);
+        if (!recv_owned)
           emit_string_retain(g, s);
-        return s;
+        LLVMBasicBlockRef fast_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, bb_done);
+
+        LLVMPositionBuilderAtEnd(g->builder, bb_trunc);
+        LLVMTypeRef memcpy_ty =
+            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i8ptr, i8ptr, i64}, 3, 0);
+        LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
+        LLVMValueRef bufsz =
+            zan_add(g->builder, clen, LLVMConstInt(i64, 1, 0), "tos.bsz");
+        LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
+        zan_call2(g->builder, memcpy_ty, memcpy_fn,
+                  (LLVMValueRef[]){buf, s, bufsz}, 3, "");
+        emit_string_len_set(g, buf, clen);
+        if (recv_owned)
+          emit_string_release(g, s);
+        LLVMBasicBlockRef trunc_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, bb_done);
+
+        LLVMPositionBuilderAtEnd(g->builder, bb_done);
+        LLVMValueRef res = LLVMBuildPhi(g->builder, i8ptr, "tos.res");
+        LLVMAddIncoming(res, (LLVMValueRef[]){s, buf},
+                        (LLVMBasicBlockRef[]){fast_end, trunc_end}, 2);
+        return res;
       }
       if (rt_ty->kind == TYPE_ENUM && rt_ty->sym &&
           rt_ty->sym->member_count > 0) {

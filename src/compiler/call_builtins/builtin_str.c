@@ -48,8 +48,197 @@
                 expr->call.args.items[0]->kind == AST_STRING_LITERAL) {
                 zan_istr_t f = expr->call.args.items[0]->str_val;
                 zan_type_t *str_ty = g->binder->type_string;
-                LLVMValueRef res = NULL;
+                enum { FMT_MAX_PARTS = 64, FMT_MAX_ARGS = 32 };
+                struct { int is_arg; int arg_idx; zan_istr_t lit; } parts[FMT_MAX_PARTS];
+                int nparts = 0;
                 int seg_start = 0;
+                int too_big = (expr->call.args.count - 1 > FMT_MAX_ARGS);
+                if (!too_big) {
+                    for (int i = 0; i < f.len; i++) {
+                        if (f.str[i] == '{' && i + 2 < f.len + 1) {
+                            int j = i + 1, idx = 0, has = 0, oflow = 0;
+                            while (j < f.len && f.str[j] >= '0' && f.str[j] <= '9') {
+                                if (!oflow) {
+                                    if (idx > 214748363 ||
+                                        idx >= expr->call.args.count) oflow = 1;
+                                    else idx = idx * 10 + (f.str[j] - '0');
+                                }
+                                j++; has = 1;
+                            }
+                            if (has && !oflow && j < f.len && f.str[j] == '}' &&
+                                idx + 1 < expr->call.args.count) {
+                                if (i > seg_start) {
+                                    if (nparts >= FMT_MAX_PARTS) { too_big = 1; break; }
+                                    parts[nparts].is_arg = 0;
+                                    parts[nparts].arg_idx = 0;
+                                    parts[nparts].lit = (zan_istr_t){ f.str + seg_start, i - seg_start };
+                                    nparts++;
+                                }
+                                if (nparts >= FMT_MAX_PARTS) { too_big = 1; break; }
+                                parts[nparts].is_arg = 1;
+                                parts[nparts].arg_idx = idx;
+                                parts[nparts].lit = (zan_istr_t){ NULL, 0 };
+                                nparts++;
+                                i = j;
+                                seg_start = j + 1;
+                            }
+                        }
+                    }
+                    if (!too_big && (seg_start < f.len || nparts == 0)) {
+                        if (nparts >= FMT_MAX_PARTS) {
+                            too_big = 1;
+                        } else {
+                            parts[nparts].is_arg = 0;
+                            parts[nparts].arg_idx = 0;
+                            parts[nparts].lit = (zan_istr_t){ f.str + seg_start, f.len - seg_start };
+                            nparts++;
+                        }
+                    }
+                }
+
+                if (!too_big) {
+                    /* 单遍按栈缓冲格式化 + 一次分配拼接（与 emit_str_concat_n 同架构） */
+                    int nargs = expr->call.args.count - 1;
+                    bool arg_used[FMT_MAX_ARGS] = {0};
+                    for (int p = 0; p < nparts; p++) {
+                        if (parts[p].is_arg) arg_used[parts[p].arg_idx] = true;
+                    }
+                    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+                    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+                    LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+                    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+                    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
+
+                    LLVMValueRef arg_ptrs[FMT_MAX_ARGS] = {0};
+                    LLVMValueRef arg_lens[FMT_MAX_ARGS] = {0};
+                    bool arg_owned[FMT_MAX_ARGS] = {0};
+                    bool allow_stack = !g->current_async_frame;
+
+                    for (int k = 0; k < nargs; k++) {
+                        zan_ast_node_t *arg_ast = expr->call.args.items[k + 1];
+                        if (!arg_used[k]) {
+                            LLVMValueRef unused_v = emit_expr(g, arg_ast, locals);
+                            emit_release_owned_call_temp(g, arg_ast, unused_v, locals);
+                            continue;
+                        }
+                        if (arg_ast->kind == AST_STRING_LITERAL) {
+                            arg_ptrs[k] = emit_string_literal_rc(g, arg_ast->str_val);
+                            arg_lens[k] = LLVMConstInt(i64t, (uint64_t)arg_ast->str_val.len, 0);
+                            arg_owned[k] = false;
+                            continue;
+                        }
+                        LLVMValueRef av = emit_expr(g, arg_ast, locals);
+                        LLVMTypeRef vt = LLVMTypeOf(av);
+                        LLVMTypeKind vtk = LLVMGetTypeKind(vt);
+                        if (allow_stack && vtk != LLVMPointerTypeKind) {
+                            LLVMValueRef bc = (vtk == LLVMIntegerTypeKind)
+                                ? emit_bool_cond(g, av, arg_ast, locals) : NULL;
+                            if (bc) {
+                                arg_ptrs[k] = emit_bool_to_cstr(g, bc);
+                                arg_lens[k] = LLVMBuildSelect(g->builder, bc,
+                                    LLVMConstInt(i64t, 4, 0), LLVMConstInt(i64t, 5, 0), "fmt.blen");
+                                arg_owned[k] = false;
+                                continue;
+                            }
+                            if (vtk == LLVMIntegerTypeKind && expr_is_char(g, arg_ast, locals)) {
+                                LLVMValueRef sbuf = emit_entry_scratch(g, 8, "fmt.c2s");
+                                arg_ptrs[k] = sbuf;
+                                arg_lens[k] = emit_char_to_stack(g, av, sbuf);
+                                arg_owned[k] = false;
+                                continue;
+                            }
+                            if (vtk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vt) == 1) {
+                                arg_ptrs[k] = emit_bool_to_cstr(g, av);
+                                arg_lens[k] = LLVMBuildSelect(g->builder, av,
+                                    LLVMConstInt(i64t, 4, 0), LLVMConstInt(i64t, 5, 0), "fmt.blen");
+                                arg_owned[k] = false;
+                                continue;
+                            }
+                            if (vtk == LLVMIntegerTypeKind) {
+                                zan_type_t *st = infer_expr_type(g, arg_ast, locals);
+                                if (!st || st->kind != TYPE_ENUM) {
+                                    LLVMValueRef sbuf = emit_entry_scratch(g, 24, "fmt.i2s");
+                                    arg_ptrs[k] = sbuf;
+                                    arg_lens[k] = emit_itoa_into(g, sbuf,
+                                        emit_widen_i64_for_print(g, av),
+                                        (st && st->kind == TYPE_ULONG) ? 1 : 0);
+                                    arg_owned[k] = false;
+                                    continue;
+                                }
+                            }
+                            if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
+                                LLVMValueRef sbuf = emit_entry_scratch(g, 40, "fmt.d2s");
+                                emit_dbl_str(g, sbuf, LLVMConstInt(i64t, 40, 0), av);
+                                arg_ptrs[k] = sbuf;
+                                arg_lens[k] = zan_call2(g->builder, strlen_type, g->fn_strlen,
+                                                        &sbuf, 1, "fmt.dlen");
+                                arg_owned[k] = false;
+                                continue;
+                            }
+                        }
+                        LLVMValueRef as = emit_to_cstr_of(g, av, arg_ast, locals);
+                        as = emit_str_nonnull(g, as);
+                        arg_ptrs[k] = as;
+                        arg_owned[k] = !is_string_expr(g, arg_ast, locals) ||
+                                       expr_yields_owned_rc_value(g, arg_ast, locals);
+                        if (arg_owned[k]) {
+                            emit_eh_tmp_push_slot(g, as, ZAN_EH_SLOT_STR);
+                        }
+                        arg_lens[k] = emit_cstr_len_of(g, as, arg_ast);
+                    }
+
+                    if (nparts == 1 && !parts[0].is_arg) {
+                        for (int k = nargs - 1; k >= 0; k--) {
+                            if (arg_owned[k]) {
+                                emit_eh_tmp_pop(g);
+                                emit_string_release(g, arg_ptrs[k]);
+                            }
+                        }
+                        return emit_string_literal_rc(g, parts[0].lit);
+                    }
+
+                    LLVMValueRef total = LLVMConstInt(i64t, 1, 0);
+                    LLVMValueRef lit_ptrs[FMT_MAX_PARTS] = {0};
+                    for (int p = 0; p < nparts; p++) {
+                        if (!parts[p].is_arg) {
+                            lit_ptrs[p] = emit_string_literal_rc(g, parts[p].lit);
+                            total = zan_add(g->builder, total,
+                                LLVMConstInt(i64t, (uint64_t)parts[p].lit.len, 0), "fmt.t");
+                        } else {
+                            total = zan_add(g->builder, total,
+                                arg_lens[parts[p].arg_idx], "fmt.t");
+                        }
+                    }
+
+                    LLVMValueRef buf = emit_string_alloc_rc(g, total);
+                    LLVMValueRef off = LLVMConstInt(i64t, 0, 0);
+                    for (int p = 0; p < nparts; p++) {
+                        LLVMValueRef src = parts[p].is_arg ? arg_ptrs[parts[p].arg_idx] : lit_ptrs[p];
+                        LLVMValueRef slen = parts[p].is_arg
+                            ? arg_lens[parts[p].arg_idx]
+                            : LLVMConstInt(i64t, (uint64_t)parts[p].lit.len, 0);
+                        LLVMValueRef dst = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "fmt.dst");
+                        zan_call2(g->builder, memcpy_type, memcpy_fn,
+                            (LLVMValueRef[]){ dst, src, slen }, 3, "");
+                        off = zan_add(g->builder, off, slen, "fmt.off");
+                    }
+                    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "fmt.end");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
+                    emit_string_len_set(g, buf, off);
+                    for (int k = nargs - 1; k >= 0; k--) {
+                        if (arg_owned[k]) {
+                            emit_eh_tmp_pop(g);
+                            emit_string_release(g, arg_ptrs[k]);
+                        }
+                    }
+                    return buf;
+                }
+
+                /* 超长格式串回退路径 */
+                LLVMValueRef res = NULL;
+                seg_start = 0;
                 for (int i = 0; i < f.len; i++) {
                     if (f.str[i] == '{' && i + 2 < f.len + 1) {
                         int j = i + 1, idx = 0, has = 0, oflow = 0;

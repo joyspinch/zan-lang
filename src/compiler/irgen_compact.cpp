@@ -265,3 +265,12 @@ extern "C" void zan_llvm_delete_body(LLVMValueRef function) {
     fn->deleteBody();
     fn->setLinkage(linkage);
 }
+
+extern "C" LLVMBasicBlockRef zan_llvm_split_bb(LLVMBasicBlockRef bb,
+                                               LLVMValueRef before_inst,
+                                               const char *name) {
+    auto *b = llvm::unwrap(bb);
+    auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(llvm::unwrap(before_inst));
+    if (!b || !inst) return nullptr;
+    return llvm::wrap(b->splitBasicBlock(inst, name ? name : ""));
+}

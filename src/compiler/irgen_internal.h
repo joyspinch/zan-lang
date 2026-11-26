@@ -1218,6 +1218,8 @@ LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
                                  LLVMValueRef arm_mask);
 void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef s,
                           LLVMValueRef slen);
+void emit_sb_append_int(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef val64,
+                        int is_ulong, int append_nl);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                    LLVMValueRef isnull, zan_loc_t loc);
 void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out,
