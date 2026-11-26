@@ -3670,8 +3670,10 @@ set(_known_leaky
 # golden 必须取未插桩普通版的用例：泄漏报告打在 stdout 上，插桩版多一行报告
 # 就比不过 golden（已知会漏的那八条 + arc_leak_site_label），另有插桩自己会改
 # 输出的（它量的是进程内存，插桩的记账把它测的东西搅了——A495 的
-# array_local_free）。
-set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label)
+# array_local_free；atomicint_arc_cell / index_temp_container_release 数 fast-alloc
+# slab，--arc-guard 把释放块永久隔离，slab 必然增长——macOS 现在也链 rt_mem）。
+set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label
+  atomicint_arc_cell index_temp_container_release)
 
 # Native ABI fixture deliberately supplies its own descriptors/headers, outside
 # leak-site registration. Keep one uninstrumented binary and a precise verdict.
@@ -8234,7 +8236,8 @@ set(_new_diag_cases
   call_interface_arg_mismatch
   abstract_not_implemented
   abstract_instantiation
-  expr_tree_untranslatable)
+  expr_tree_untranslatable
+  async_call_without_await)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
@@ -8273,6 +8276,10 @@ foreach(_case ${_new_diag_cases})
     set(_diag_regex "does not implement abstract method")
   elseif(_case STREQUAL abstract_instantiation)
     set(_diag_regex "cannot instantiate abstract class")
+  elseif(_case STREQUAL async_call_without_await)
+    # An un-awaited async call yields its coroutine frame, not the result:
+    # used as a value it read a truncated frame pointer (E2116).
+    set(_diag_regex "async call 'Count' used as a value without 'await'")
   else()
     set(_diag_regex "narrowing conversion")
   endif()

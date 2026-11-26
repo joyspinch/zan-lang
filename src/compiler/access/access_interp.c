@@ -29,6 +29,18 @@ int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
     case 'F': case 'f':
         if (digits < 0) digits = 0;
         if (digits > 512) digits = 512;
+        /* An integer in fixed-point is exact in C# (ulong.MaxValue:F0 keeps
+         * every digit); print it as an integer plus literal zeros instead of
+         * rounding it through double. Long fractions fall back to double. */
+        if (!is_float && digits <= 20 && outcap > (size_t)digits + 8) {
+            int n = snprintf(out, outcap, is_ulong ? "%%llu" : "%%lld");
+            if (digits > 0) {
+                out[n++] = '.';
+                for (int z = 0; z < digits; z++) out[n++] = '0';
+                out[n] = '\0';
+            }
+            return n;
+        }
         if (want_float) *want_float = true;
         return snprintf(out, outcap, "%%.%dlf", digits);
     case 'E': case 'e': /* scientific */
@@ -281,9 +293,11 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                     int flen = interp_format_to_printf(&spec, false, iu,
                         &want_f, fbuf, sizeof(fbuf));
                     if (want_f) {
-                        LLVMValueRef as_d = (vt == LLVMFloatTypeKind)
-                            ? LLVMBuildFPExt(g->builder, val,
-                                LLVMDoubleTypeInContext(g->ctx), "f2d")
+                        /* Integer branch only (floats are formatted above): a
+                         * ulong above 2^63 must not go through a signed convert. */
+                        LLVMValueRef as_d = iu
+                            ? LLVMBuildUIToFP(g->builder, val64,
+                                LLVMDoubleTypeInContext(g->ctx), "u2d")
                             : LLVMBuildSIToFP(g->builder, val64,
                                 LLVMDoubleTypeInContext(g->ctx), "i2d");
                         emit_interp_snprintf_part(g, snprintf_type, fbuf, as_d,

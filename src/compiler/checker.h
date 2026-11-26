@@ -51,6 +51,10 @@ struct zan_checker {
    * （inR.Submit += ColorPicker.SubmitR），由 checker_check_assignable
    * 按目标裁决。check_member_access 的 saw_method 分支在此静默。 */
   int in_assignable_ctx;
+    /* 允许不经 await 直接出现的 async 调用节点（E2116）：await 的操作数、
+     * 语句级调用（脱钩执行）、Task.Spawn/Task.Run 的实参。其余位置的 async
+     * 调用产出的是协程帧而不是结果值，当值用会读到截断的帧指针。 */
+    zan_ast_node_t *async_call_ok;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

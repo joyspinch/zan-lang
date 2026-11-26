@@ -616,7 +616,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
       zan_ast_node_t *arg = expr->call.args.items[i];
       if (arg && arg->kind == AST_NAMED_ARG)
         arg = arg->named_arg.expr;
+      zan_ast_node_t *prev_ok = c->async_call_ok;
+      if (arg_is_spawn_callee(expr))
+        c->async_call_ok = arg;
       zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+      c->async_call_ok = prev_ok;
       if (observe && arg && arg == c->last_unproven_reference_expr)
         unproven_operand = true;
       arg_types[i] = arg_type;
@@ -679,6 +683,24 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     /* 泛型方法调用点的 where 约束（A518）：符号定了就查，别等运行期 */
     if (called_sym && called_sym->kind == SYM_METHOD)
       checker_check_method_call_constraints(c, called_sym, expr, arg_types);
+    /* E2116：async 调用的静态类型是结果类型，但未 await 时 irgen 产出的
+     * 是协程帧——当值用（赋值、运算、实参、return）读到的是截断的帧
+     * 指针，静默错值；与 + 等运算组合时还会让 LLVM 校验失败。 */
+    if (called_sym && called_sym->kind == SYM_METHOD && called_sym->decl &&
+        called_sym->decl->kind == AST_METHOD_DECL &&
+        (called_sym->decl->method_decl.modifiers & MOD_ASYNC) &&
+        c->async_call_ok != expr && called_sym->type &&
+        called_sym->type->kind != TYPE_VOID &&
+        called_sym->type->kind != TYPE_ERROR) {
+      zan_diag_emit_code(
+          c->diag, DIAG_ERROR, expr->loc, 2116,
+          "async call '%.*s' used as a value without 'await': write "
+          "'await %.*s(...)' (allowed in synchronous methods too), or "
+          "call it as a statement / pass it to Task.Spawn or Task.Run "
+          "to run it detached",
+          (int)called_sym->name.len, called_sym->name.str,
+          (int)called_sym->name.len, called_sym->name.str);
+    }
     if (!called_sym && expr->call.callee &&
         expr->call.callee->kind == AST_IDENTIFIER) {
       called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);

@@ -50,6 +50,27 @@
   `await`，编译器认为 `await` 的结果**还是那个 Task 本身**（类型对不上）。
   **直接 `await f()`**（`List<int> b = await MakeAsync();` 编译运行都对）。
   推论：Zan 里 `Task<T>` 变量几乎没有用武之地——async 调用与它的结果同型。
+* **未 await 的 async 调用当值用是编译错误 E2110**（实证，2026-11-22）：静态类型
+  虽是结果类型，不 await 时 irgen 产出的是**协程帧**——`int n = F();`、
+  `c += F();`、`return F();`、`if (!this.Can(bit))` 读到的是截断的帧指针（静默
+  错值；与 `+` 组合还让 LLVM 校验失败）。server-collab 模板的 `!this.Can(...)`
+  权限判断因此恒为假、拦截失效。合法形态只有三种：`await F()`（**同步方法里也
+  可以**，会把协程驱动到完成）、语句级 `F();`（脱钩执行）、`Task.Spawn/Task.Run`
+  实参。回归：`tests/diag/async_call_without_await.zan`。
+* **`using (var x = ...)` 可用**（2026-11-22 修复，此前把 `var` 当类型名报
+  undefined type）：与局部声明同口径推断，正常/异常路径都调 `Dispose`
+  （`using_var_inferred`）。
+* **`AtomicInt` 不需要 Dispose**（2026-11-22）：计数单元是 ARC 管理的 `long[1]`，
+  最后一个引用消失时随对象释放；曾每实例 malloc 一块原生单元从不释放。跨线程
+  共享时**不要**在别的线程可能还在用时自建原生句柄再手动释放——生命周期交给
+  ARC（`atomicint_arc_cell`）。
+* **对临时数组直接取下标会释放该临时**（2026-11-22 修复）：`new T[n][i]`、
+  `F()[i]`、`F()[i].x` 曾让临时数组永不释放（`Queue<T>` 构造里的 `new T[1][0]`
+  让每个 Queue 泄漏一块）。元素是**含受管字段的结构体**时数组仍按借用保留
+  （取出的字段借用数组），热路径上先存局部再取（`index_temp_container_release`）。
+* **每次捕获异常曾泄漏约 136 字节**（2026-11-22 修复）：catch/重抛/协程根从不
+  结束 native `__cxa` 展开令牌。修复后 `std::uncaught_exceptions()` 在每次 catch
+  后归零（`eh_native_token_release`）；长驻服务里用异常做控制流不再线性涨内存。
 * **字符串方法是编译器内建，不在 stdlib 里**：`Trim` / `ToLower` /
   `ToUpper` / `StartsWith` / `EndsWith` / `Substring` / `IndexOf` /
   `LastIndexOf` / `Split` / `Replace` / `Contains` / `Equals` 定义在

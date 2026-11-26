@@ -1,0 +1,65 @@
+using System;
+using System.Collections.Generic;
+
+// 对临时数组直接取下标（new T[n][i]、F()[i]）后必须释放该临时数组。
+// 此前数组分支漏调 finish_index_of_temp，临时数组永不释放；Queue<T> 构造里的
+// `new T[1][0]` 因此让每个 Queue 实例泄漏一个数组。引用类型元素在释放容器前
+// 先被 retain，取出的值在数组释放后仍须可用；不含受管字段的值结构体元素同样释放
+// （含受管字段的结构体元素仍按借用保留数组，见 access_index.c）。
+// 存活堆用 fast-alloc 的 slab 数观测（1 slab = 1 MiB）；没有 fast-alloc 的目标
+// （Apple）无法观测存活堆，只校验取值正确。
+class Node {
+    public string name;
+    public Node(string n) { name = n; }
+}
+
+struct Pt {
+    public int x;
+    public int y;
+}
+
+class Box<T> {
+    public T v;
+    public Box() { this.v = new T[1][0]; }
+}
+
+class Program {
+    [DllImport("crt", EntryPoint = "zan_mem_slabs")]
+    static extern long MemSlabs();
+
+    static string[] Names(int i) { return new string[] { "a" + i, "b" + i }; }
+    static Node[] Nodes(int i) { return new Node[] { new Node("n" + i), new Node("m" + i) }; }
+    static int[] Ints(int i) { return new int[] { i, i + 1, i + 2 }; }
+    static Pt[] Pts(int i) { Pt[] r = new Pt[2]; r[1].x = i; r[1].y = 2; return r; }
+
+    static long Churn(int n) {
+        long t = 0;
+        for (int i = 0; i < n; i++) {
+            t = t + new int[3][2];
+            t = t + Ints(i)[1];
+            t = t + Names(i)[1].Length;
+            t = t + Nodes(i)[0].name.Length;
+            t = t + Pts(i)[1].x + Pts(i)[1].y;
+            Box<int> b = new Box<int>();
+            t = t + b.v;
+            Queue<int> q = new Queue<int>();
+            q.Enqueue(i);
+            t = t + q.Dequeue();
+        }
+        return t;
+    }
+
+    static void Main() {
+        string keep = Names(41)[0];
+        Node keepNode = Nodes(41)[1];
+        Console.WriteLine("keep=" + keep + " node=" + keepNode.name);
+        Console.WriteLine("inline=" + Names(7)[1] + "/" + Nodes(7)[0].name + "/" + Ints(7)[2]);
+
+        Churn(2000);
+        long s0 = MemSlabs();
+        long t = Churn(200000);
+        long s1 = MemSlabs();
+        bool bounded = s0 == 0 || s1 - s0 <= 1;
+        Console.WriteLine("churn=" + t + " bounded=" + bounded);
+    }
+}
