@@ -421,6 +421,7 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
         zan_atlas_find(ZAN_TILE_RUN, ksize, text, key_len);
     if (cached) return cached;
 
+    ensure_text_dc();
     wchar_t stack_wtext[256];
     int text_len = 0;
     wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
@@ -480,7 +481,6 @@ EXPORT void zan_gui_draw_text(
     int size = (int)font_size;
     if (size < 8) size = 8;
 
-    ensure_text_dc();
     uint64_t t0 = 0;
     if (g_text_stats_enabled) {
         g_text_draw_calls++;
@@ -517,7 +517,6 @@ EXPORT void zan_gui_draw_text_bold(
     int size = (int)font_size;
     if (size < 8) size = 8;
 
-    ensure_text_dc();
     const zan_glyph_tile *tile = win_run_tile(text, size, 1);
     if (!tile) tile = win_dwrite_tile(text, size, 1);
     if (tile) {

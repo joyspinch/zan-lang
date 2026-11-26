@@ -143,9 +143,9 @@ static void zan_atlas_sweep(void) {
 
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
-    if (kind == g_atlas_last_kind && size == g_atlas_last_size &&
-        key_len == g_atlas_last_klen && key_len <= ZAN_ATLAS_INLINE_KEY &&
-        memcmp(key, g_atlas_last_key, (size_t)key_len) == 0 && g_atlas_last_tile != NULL) {
+    if (g_atlas_last_tile != NULL && kind == g_atlas_last_kind
+        && size == g_atlas_last_size && key_len == g_atlas_last_klen
+        && memcmp(key, g_atlas_last_key, (size_t)key_len) == 0) {
         g_atlas_hits++;
         return g_atlas_last_tile;
     }
@@ -154,10 +154,9 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
     int base = (int)(h & ZAN_ATLAS_MASK);
     for (int i = 0; i < ZAN_ATLAS_PROBE; i++) {
         zan_atlas_slot *e = &g_atlas[(base + i) & ZAN_ATLAS_MASK];
-        if (e->key_len <= 0) continue;
+        if (e->key_len != key_len || e->size != size || e->kind != kind) continue;
         const char *ekey = e->heap_key ? e->heap_key : e->inline_key;
-        if (e->kind == kind && e->size == size && e->key_len == key_len
-            && memcmp(ekey, key, (size_t)key_len) == 0) {
+        if (memcmp(ekey, key, (size_t)key_len) == 0) {
             e->used = ++g_atlas_clock;
             e->stamped = g_atlas_stores;
             g_atlas_hits++;

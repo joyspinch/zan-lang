@@ -600,31 +600,36 @@ typedef struct {
     float u0, v0, u1, v1;
 } zgl_quad;
 
-static void zgl_color(float *out, u32 c, int force_opaque) {
-    out[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    out[1] = (float)((c >> 8) & 0xFF) / 255.0f;
-    out[2] = (float)(c & 0xFF) / 255.0f;
+static inline void zgl_color(float *out, u32 c, int force_opaque) {
+    const float inv255 = 1.0f / 255.0f;
+    out[0] = (float)((c >> 16) & 0xFF) * inv255;
+    out[1] = (float)((c >> 8) & 0xFF) * inv255;
+    out[2] = (float)(c & 0xFF) * inv255;
     u32 a = (c >> 24) & 0xFF;
-    out[3] = force_opaque ? 1.0f : (float)a / 255.0f;
+    out[3] = force_opaque ? 1.0f : (float)a * inv255;
 }
 
-static void zgl_push(zan_surface_t *s, const zgl_quad *q,
-                     float x0, float y0, float x1, float y1) {
+static inline float *zgl_alloc_quad(zan_surface_t *s, int kind,
+                                    float *px0, float *py0, float *px1, float *py1,
+                                    float *ocx0, float *ocy0, float *ocx1, float *ocy1) {
     float cx0 = (float)s->clip_x0, cy0 = (float)s->clip_y0;
     float cx1 = (float)s->clip_x1, cy1 = (float)s->clip_y1;
+    float x0 = *px0, y0 = *py0, x1 = *px1, y1 = *py1;
     if (x0 < cx0) x0 = cx0;
     if (y0 < cy0) y0 = cy0;
     if (x1 > cx1) x1 = cx1;
     if (y1 > cy1) y1 = cy1;
-    if (x1 <= x0 || y1 <= y0) return;
+    if (x1 <= x0 || y1 <= y0) return NULL;
 
     if (g_zgl.mode != ZGL_MODE_UNION && s->id >= 0 && s->id < 64) {
-        zgl_target_mark_dirty(&g_zgl_targets[s->id],
-                              (int)floorf(x0), (int)floorf(y0),
-                              (int)ceilf(x1), (int)ceilf(y1));
+        int ix0 = (x0 >= 0.0f) ? (int)x0 : (int)floorf(x0);
+        int iy0 = (y0 >= 0.0f) ? (int)y0 : (int)floorf(y0);
+        int ix1 = (int)x1; if ((float)ix1 < x1) ix1++;
+        int iy1 = (int)y1; if ((float)iy1 < y1) iy1++;
+        zgl_target_mark_dirty(&g_zgl_targets[s->id], ix0, iy0, ix1, iy1);
     }
 
-    if (q->kind == ZGL_K_UNION || q->kind == ZGL_K_SURFACE) {
+    if (kind == ZGL_K_UNION || kind == ZGL_K_SURFACE) {
         if (!g_zgl.has_shader_over) {
             g_zgl.has_shader_over = 1;
             g_zgl.over_x0 = x0; g_zgl.over_y0 = y0;
@@ -641,11 +646,23 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         size_t cap = g_zgl.cap * 2;
         float *grown = (float *)realloc(g_zgl.verts, cap * sizeof(float));
         if (grown) { g_zgl.verts = grown; g_zgl.cap = cap; }
-        else { zgl_flush(); if (g_zgl.count + (size_t)ZGL_IF > g_zgl.cap) return; }
+        else { zgl_flush(); if (g_zgl.count + (size_t)ZGL_IF > g_zgl.cap) return NULL; }
     }
 
-    typedef struct { float d[4]; } zgl_v4;
+    *px0 = x0; *py0 = y0; *px1 = x1; *py1 = y1;
+    *ocx0 = cx0; *ocy0 = cy0; *ocx1 = cx1; *ocy1 = cy1;
     float *v = g_zgl.verts + g_zgl.count;
+    g_zgl.count += ZGL_IF;
+    return v;
+}
+
+static void zgl_push(zan_surface_t *s, const zgl_quad *q,
+                     float x0, float y0, float x1, float y1) {
+    float cx0, cy0, cx1, cy1;
+    float *v = zgl_alloc_quad(s, q->kind, &x0, &y0, &x1, &y1, &cx0, &cy0, &cx1, &cy1);
+    if (!v) return;
+
+    typedef struct { float d[4]; } zgl_v4;
     v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y1;
     float du = q->u1 - q->u0, dv = q->v1 - q->v0;
     if (du != 0.0f || dv != 0.0f) {
@@ -671,7 +688,6 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
     v[30] = cx0;            v[31] = cy0;
     v[32] = cx1;            v[33] = cy1;
     *(zgl_v4 *)(v + 34) = *(const zgl_v4 *)q->seg;
-    g_zgl.count += ZGL_IF;
 }
 
 /* primitives */
@@ -681,32 +697,27 @@ static void zgl_rect_quad(zan_surface_t *s, int x, int y, int w, int h,
                           u32 c0, u32 c1, u32 via, int opaque) {
     float x0 = (float)x, y0 = (float)y;
     float x1 = (float)(x + w), y1 = (float)(y + h);
-    if (x1 <= (float)s->clip_x0 || x0 >= (float)s->clip_x1 ||
-        y1 <= (float)s->clip_y0 || y0 >= (float)s->clip_y1) {
-        return;
-    }
-    zgl_quad q;
-    memset(&q, 0, sizeof(q));
-    q.kind = ZGL_K_RECT;
-    float fw = (float)w, fh = (float)h;
-    q.hw = fw * 0.5f;
-    q.hh = fh * 0.5f;
-    q.cx = x0 + q.hw;
-    q.cy = y0 + q.hh;
+    float cx0, cy0, cx1, cy1;
+    float *v = zgl_alloc_quad(s, ZGL_K_RECT, &x0, &y0, &x1, &y1, &cx0, &cy0, &cx1, &cy1);
+    if (!v) return;
+    float hw = (float)w * 0.5f, hh = (float)h * 0.5f;
     int r = radius;
     if (r < 0) r = 0;
     if (r > 0 && (corners & 15) == 0) r = 0;
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
-    q.radius = (float)r;
-    q.stroke = (float)stroke;
-    q.p0 = (float)(corners & 15);
-    q.p1 = (via != 0) ? 1.0f : 0.0f;
-    q.p2 = (float)gdir;
-    zgl_color(q.col0, c0, opaque);
-    zgl_color(q.col1, c1, opaque);
-    zgl_color(q.col2, via, opaque);
-    zgl_push(s, &q, x0, y0, x1, y1);
+    v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y1;
+    v[4] = 0.0f; v[5] = 0.0f; v[6] = 0.0f; v[7] = 0.0f;
+    v[8] = (float)x + hw; v[9] = (float)y + hh;
+    v[10] = hw; v[11] = hh;
+    v[12] = (float)r; v[13] = (float)stroke;
+    v[14] = (float)ZGL_K_RECT; v[15] = (float)(corners & 15);
+    v[16] = (via != 0) ? 1.0f : 0.0f; v[17] = (float)gdir;
+    zgl_color(v + 18, c0, opaque);
+    zgl_color(v + 22, c1, opaque);
+    zgl_color(v + 26, via, opaque);
+    v[30] = cx0; v[31] = cy0; v[32] = cx1; v[33] = cy1;
+    v[34] = 0.0f; v[35] = 0.0f; v[36] = 0.0f; v[37] = 0.0f;
 }
 
 #include "gui_gl_draw.c"
@@ -775,27 +786,47 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     if (!zgl_begin(s, ZGL_MODE_BLEND)) { cpu_glyph_run(s, run); return; }
     u32 color = run->color;
     if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;
+    float col0[4];
+    zgl_color(col0, color, 0);
     const float inv_dim = 1.0f / (float)ZGL_ATLAS_DIM;
     for (int i = 0; i < run->count; i++) {
         const zan_glyph_tile *tile = run->items[i].tile;
         zgl_tile_slot *slot = zgl_tile_upload(tile);
         if (!slot) continue;
-        zgl_quad q;
-        memset(&q, 0, sizeof(q));
-        q.kind = (tile->flags & ZAN_TILE_RGBA) ? ZGL_K_TEXTRGBA
-               : (tile->bpp == 4) ? ZGL_K_TEXT4 : ZGL_K_TEXT1;
-        float x0 = (float)run->items[i].x, y0 = (float)run->items[i].y;
-        float x1 = x0 + (float)tile->w, y1 = y0 + (float)tile->h;
-        q.cx = (x0 + x1) * 0.5f;
-        q.cy = (y0 + y1) * 0.5f;
-        q.hw = (x1 - x0) * 0.5f;
-        q.hh = (y1 - y0) * 0.5f;
-        q.u0 = (float)slot->x * inv_dim;
-        q.v0 = (float)slot->y * inv_dim;
-        q.u1 = (float)(slot->x + slot->w) * inv_dim;
-        q.v1 = (float)(slot->y + slot->h) * inv_dim;
-        zgl_color(q.col0, color, 0);
-        zgl_push(s, &q, x0, y0, x1, y1);
+        int kind = (tile->flags & ZAN_TILE_RGBA) ? ZGL_K_TEXTRGBA
+                 : (tile->bpp == 4) ? ZGL_K_TEXT4 : ZGL_K_TEXT1;
+        float bx0 = (float)run->items[i].x, by0 = (float)run->items[i].y;
+        float fw = (float)tile->w, fh = (float)tile->h;
+        float x0 = bx0, y0 = by0, x1 = bx0 + fw, y1 = by0 + fh;
+        float cx0, cy0, cx1, cy1;
+        float *v = zgl_alloc_quad(s, kind, &x0, &y0, &x1, &y1, &cx0, &cy0, &cx1, &cy1);
+        if (!v) continue;
+        float u0 = (float)slot->x * inv_dim;
+        float v0 = (float)slot->y * inv_dim;
+        float u1 = (float)(slot->x + slot->w) * inv_dim;
+        float v1 = (float)(slot->y + slot->h) * inv_dim;
+        v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y1;
+        if (x0 == bx0 && y0 == by0 && x1 == bx0 + fw && y1 == by0 + fh) {
+            v[4] = u0; v[5] = v0; v[6] = u1; v[7] = v1;
+        } else {
+            float inv_w = fw > 0.0f ? (1.0f / fw) : 0.0f;
+            float inv_h = fh > 0.0f ? (1.0f / fh) : 0.0f;
+            float du = u1 - u0, dv = v1 - v0;
+            v[4] = u0 + du * ((x0 - bx0) * inv_w);
+            v[5] = v0 + dv * ((y0 - by0) * inv_h);
+            v[6] = u0 + du * ((x1 - bx0) * inv_w);
+            v[7] = v0 + dv * ((y1 - by0) * inv_h);
+        }
+        v[8] = bx0 + fw * 0.5f; v[9] = by0 + fh * 0.5f;
+        v[10] = fw * 0.5f; v[11] = fh * 0.5f;
+        v[12] = 0.0f; v[13] = 0.0f;
+        v[14] = (float)kind; v[15] = 0.0f;
+        v[16] = 0.0f; v[17] = 0.0f;
+        v[18] = col0[0]; v[19] = col0[1]; v[20] = col0[2]; v[21] = col0[3];
+        v[22] = 0.0f; v[23] = 0.0f; v[24] = 0.0f; v[25] = 0.0f;
+        v[26] = 0.0f; v[27] = 0.0f; v[28] = 0.0f; v[29] = 0.0f;
+        v[30] = cx0; v[31] = cy0; v[32] = cx1; v[33] = cy1;
+        v[34] = 0.0f; v[35] = 0.0f; v[36] = 0.0f; v[37] = 0.0f;
     }
 }
 

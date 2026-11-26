@@ -89,20 +89,29 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
     zgl_target *t = zgl_target_of(s);
     int fast_blend = (t && t->opaque_dst);
     if (!fast_blend && g_zgl.count) zgl_flush();
-    zgl_quad q;
-    memset(&q, 0, sizeof(q));
-    q.kind = fast_blend ? ZGL_K_SURFACE_FAST : ZGL_K_SURFACE;
-    q.cx = (float)x + (float)w * 0.5f;
-    q.cy = (float)y + (float)h * 0.5f;
-    q.hw = (float)w * 0.5f; q.hh = (float)h * 0.5f;
-    int r = radius < 0 ? 0 : radius;
-    if (r > w / 2) r = w / 2;
-    if (r > h / 2) r = h / 2;
-    q.radius = (float)r;
-    q.stroke = thickness > 0 ? (float)thickness : 0.0f;
-    q.p0 = (float)(corners & 15);
-    zgl_color(q.col0, fill, 0); zgl_color(q.col1, border, 0);
-    zgl_push(s, &q, (float)x, (float)y, (float)x + (float)w, (float)y + (float)h);
+    int kind = fast_blend ? ZGL_K_SURFACE_FAST : ZGL_K_SURFACE;
+    float x0 = (float)x, y0 = (float)y;
+    float x1 = (float)(x + w), y1 = (float)(y + h);
+    float cx0, cy0, cx1, cy1;
+    float *v = zgl_alloc_quad(s, kind, &x0, &y0, &x1, &y1, &cx0, &cy0, &cx1, &cy1);
+    if (v) {
+        float hw = (float)w * 0.5f, hh = (float)h * 0.5f;
+        int r = radius < 0 ? 0 : radius;
+        if (r > w / 2) r = w / 2;
+        if (r > h / 2) r = h / 2;
+        v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y1;
+        v[4] = 0.0f; v[5] = 0.0f; v[6] = 0.0f; v[7] = 0.0f;
+        v[8] = (float)x + hw; v[9] = (float)y + hh;
+        v[10] = hw; v[11] = hh;
+        v[12] = (float)r; v[13] = thickness > 0 ? (float)thickness : 0.0f;
+        v[14] = (float)kind; v[15] = (float)(corners & 15);
+        v[16] = 0.0f; v[17] = 0.0f;
+        zgl_color(v + 18, fill, 0);
+        zgl_color(v + 22, border, 0);
+        v[26] = 0.0f; v[27] = 0.0f; v[28] = 0.0f; v[29] = 0.0f;
+        v[30] = cx0; v[31] = cy0; v[32] = cx1; v[33] = cy1;
+        v[34] = 0.0f; v[35] = 0.0f; v[36] = 0.0f; v[37] = 0.0f;
+    }
     if (!fast_blend) zgl_flush();
 }
 
