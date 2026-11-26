@@ -171,6 +171,18 @@ public partial class ImageBuffer : IDisposable {
         }
     }
 
+    // 带整图透明度缩放（opacity: 0..100）的 Porter-Duff Over 合成（供图片水印叠加使用）。
+    public void Blit(ImageBuffer src, int dx, int dy, int opacityPercent) {
+        if (src == null || src.Pixels == 0 || src.Width <= 0 || src.Height <= 0) return;
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0 || opacityPercent <= 0) return;
+        if (opacityPercent > 100) opacityPercent = 100;
+        int alphaScale = (opacityPercent * 255 + 50) / 100;
+        System.Drawing.Imaging.ImageCodec.BlitArgb(
+            this.Pixels, this.Width, this.Height,
+            src.Pixels, src.Width, src.Height,
+            dx, dy, alphaScale);
+    }
+
     // 将当前图像的通道在 RGBA 与 BGRA 之间翻转。
     public void SwapRB() {
         if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
@@ -355,125 +367,21 @@ public partial class ImageBuffer : IDisposable {
         }
     }
 
-    // 灰度化（基于定点数加权通道融合 Y = (B*29 + G*150 + R*77) >> 8）。保留 Alpha 通道不变。
+    // 灰度化（原生 C11 定点数单遍融合，保留 Alpha 通道不变）。
     public void Grayscale() {
-        if (this.Pixels == 0) return;
-        int count = this.Width * this.Height;
-        Span<byte> sp = new Span<byte>(this.Pixels, count * 4);
-        int i = 0;
-        int off = 0;
-        while (i < count) {
-            int b = (int)sp[off + 0];
-            int g = (int)sp[off + 1];
-            int r = (int)sp[off + 2];
-            byte gray = (byte)((b * 29 + g * 150 + r * 77) >> 8);
-            sp[off + 0] = gray;
-            sp[off + 1] = gray;
-            sp[off + 2] = gray;
-            off = off + 4;
-            i = i + 1;
-        }
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
+        System.Drawing.Imaging.ImageCodec.ColorAdjustArgb(this.Pixels, this.Width * this.Height, 0, 0, true);
     }
 
-    // 高性能双向可分离均值盒式模糊（Box Blur，可用于毛玻璃特效与平滑）。
-    // radius: 模糊半径（像素），必须 >= 1。
-    // 采用定点数倒数乘法加速，彻底消除每像素除法开销。
+    // 高性能双向可分离均值盒式模糊（原生 C11 行主序 O(1) 滑窗实现，消除列遍历 Cache 抖动）。
     public void BoxBlur(int radius) {
         if (this.Pixels == 0 || this.Width <= 1 || this.Height <= 1 || radius <= 0) return;
-        int w = this.Width;
-        int h = this.Height;
-        int r = radius;
-        if (r > w - 1) r = w - 1;
-        if (r > h - 1) r = h - 1;
+        System.Drawing.Imaging.ImageCodec.BoxBlurArgb(this.Pixels, this.Width, this.Height, radius, 1);
+    }
 
-        int totalBytes = w * h * 4;
-        nint temp = NativeMemory.Alloc(totalBytes);
-        if (temp == 0) return;
-
-        try {
-            Span<byte> srcSp = new Span<byte>(this.Pixels, totalBytes);
-            Span<byte> tmpSp = new Span<byte>(temp, totalBytes);
-
-            int winSize = 2 * r + 1;
-            // 定点数乘法比例因子 (1 << 16) / winSize
-            int invWin = (1 << 16) / winSize;
-
-            // 水平滤波通行：this.Pixels -> temp
-            for (int y = 0; y < h; y = y + 1) {
-                int rowOff = y * w * 4;
-                int sumA = 0; int sumR = 0; int sumG = 0; int sumB = 0;
-
-                for (int k = -r; k <= r; k = k + 1) {
-                    int px = k;
-                    if (px < 0) px = 0;
-                    else if (px >= w) px = w - 1;
-                    int pOff = rowOff + px * 4;
-                    sumB = sumB + (int)srcSp[pOff + 0];
-                    sumG = sumG + (int)srcSp[pOff + 1];
-                    sumR = sumR + (int)srcSp[pOff + 2];
-                    sumA = sumA + (int)srcSp[pOff + 3];
-                }
-
-                for (int x = 0; x < w; x = x + 1) {
-                    int dstOff = rowOff + x * 4;
-                    tmpSp[dstOff + 0] = (byte)((sumB * invWin) >> 16);
-                    tmpSp[dstOff + 1] = (byte)((sumG * invWin) >> 16);
-                    tmpSp[dstOff + 2] = (byte)((sumR * invWin) >> 16);
-                    tmpSp[dstOff + 3] = (byte)((sumA * invWin) >> 16);
-
-                    int enteringX = x + r + 1;
-                    if (enteringX >= w) enteringX = w - 1;
-                    int leavingX = x - r;
-                    if (leavingX < 0) leavingX = 0;
-
-                    int enterOff = rowOff + enteringX * 4;
-                    int leaveOff = rowOff + leavingX * 4;
-
-                    sumB = sumB + (int)srcSp[enterOff + 0] - (int)srcSp[leaveOff + 0];
-                    sumG = sumG + (int)srcSp[enterOff + 1] - (int)srcSp[leaveOff + 1];
-                    sumR = sumR + (int)srcSp[enterOff + 2] - (int)srcSp[leaveOff + 2];
-                    sumA = sumA + (int)srcSp[enterOff + 3] - (int)srcSp[leaveOff + 3];
-                }
-            }
-
-            // 垂直滤波通行：temp -> this.Pixels
-            for (int x = 0; x < w; x = x + 1) {
-                int sumA = 0; int sumR = 0; int sumG = 0; int sumB = 0;
-
-                for (int k = -r; k <= r; k = k + 1) {
-                    int py = k;
-                    if (py < 0) py = 0;
-                    else if (py >= h) py = h - 1;
-                    int pOff = py * w * 4 + x * 4;
-                    sumB = sumB + (int)tmpSp[pOff + 0];
-                    sumG = sumG + (int)tmpSp[pOff + 1];
-                    sumR = sumR + (int)tmpSp[pOff + 2];
-                    sumA = sumA + (int)tmpSp[pOff + 3];
-                }
-
-                for (int y = 0; y < h; y = y + 1) {
-                    int dstOff = y * w * 4 + x * 4;
-                    srcSp[dstOff + 0] = (byte)((sumB * invWin) >> 16);
-                    srcSp[dstOff + 1] = (byte)((sumG * invWin) >> 16);
-                    srcSp[dstOff + 2] = (byte)((sumR * invWin) >> 16);
-                    srcSp[dstOff + 3] = (byte)((sumA * invWin) >> 16);
-
-                    int enteringY = y + r + 1;
-                    if (enteringY >= h) enteringY = h - 1;
-                    int leavingY = y - r;
-                    if (leavingY < 0) leavingY = 0;
-
-                    int enterOff = enteringY * w * 4 + x * 4;
-                    int leaveOff = leavingY * w * 4 + x * 4;
-
-                    sumB = sumB + (int)tmpSp[enterOff + 0] - (int)tmpSp[leaveOff + 0];
-                    sumG = sumG + (int)tmpSp[enterOff + 1] - (int)tmpSp[leaveOff + 1];
-                    sumR = sumR + (int)tmpSp[enterOff + 2] - (int)tmpSp[leaveOff + 2];
-                    sumA = sumA + (int)tmpSp[enterOff + 3] - (int)tmpSp[leaveOff + 3];
-                }
-            }
-        } finally {
-            NativeMemory.Free(temp);
-        }
+    // 快速近似高斯模糊（原生 C11 三遍行主序可分离盒式滤波，商用毛玻璃与柔化首选）。
+    public void GaussianBlur(int radius) {
+        if (this.Pixels == 0 || this.Width <= 1 || this.Height <= 1 || radius <= 0) return;
+        System.Drawing.Imaging.ImageCodec.BoxBlurArgb(this.Pixels, this.Width, this.Height, radius, 3);
     }
 }

@@ -40,54 +40,30 @@ public partial class ImageBuffer {
         }
     }
 
-    // 顺时针旋转 90 度，返回新 ImageBuffer（宽高互换）。
+    // 顺时针旋转 90 度，返回新 ImageBuffer（原生 C 32x32 Cache-Tiled 分块转置）。
     public ImageBuffer Rotate90() {
         if (this.IsEmpty) return new ImageBuffer(0, 0);
-        int sw = this.Width;
-        int sh = this.Height;
-        ImageBuffer dst = new ImageBuffer(sh, sw);
+        ImageBuffer dst = new ImageBuffer(this.Height, this.Width);
         if (dst.Pixels == 0) return dst;
-        Span<int> srcSp = new Span<int>(this.Pixels, sw * sh);
-        Span<int> dstSp = new Span<int>(dst.Pixels, sw * sh);
-        for (int y = 0; y < sh; y = y + 1) {
-            int dstX = sh - 1 - y;
-            int srcRow = y * sw;
-            for (int x = 0; x < sw; x = x + 1) {
-                dstSp[x * sh + dstX] = srcSp[srcRow + x];
-            }
-        }
+        System.Drawing.Imaging.ImageCodec.RotateArgb(this.Pixels, this.Width, this.Height, dst.Pixels, 90);
         return dst;
     }
 
     // 旋转 180 度，返回新 ImageBuffer。
     public ImageBuffer Rotate180() {
         if (this.IsEmpty) return new ImageBuffer(0, 0);
-        int count = this.Width * this.Height;
         ImageBuffer dst = new ImageBuffer(this.Width, this.Height);
         if (dst.Pixels == 0) return dst;
-        Span<int> srcSp = new Span<int>(this.Pixels, count);
-        Span<int> dstSp = new Span<int>(dst.Pixels, count);
-        for (int i = 0; i < count; i = i + 1) {
-            dstSp[count - 1 - i] = srcSp[i];
-        }
+        System.Drawing.Imaging.ImageCodec.RotateArgb(this.Pixels, this.Width, this.Height, dst.Pixels, 180);
         return dst;
     }
 
-    // 顺时针旋转 270 度（逆时针 90 度），返回新 ImageBuffer。
+    // 顺时针旋转 270 度（逆时针 90 度），返回新 ImageBuffer（原生 C 32x32 Cache-Tiled 分块转置）。
     public ImageBuffer Rotate270() {
         if (this.IsEmpty) return new ImageBuffer(0, 0);
-        int sw = this.Width;
-        int sh = this.Height;
-        ImageBuffer dst = new ImageBuffer(sh, sw);
+        ImageBuffer dst = new ImageBuffer(this.Height, this.Width);
         if (dst.Pixels == 0) return dst;
-        Span<int> srcSp = new Span<int>(this.Pixels, sw * sh);
-        Span<int> dstSp = new Span<int>(dst.Pixels, sw * sh);
-        for (int y = 0; y < sh; y = y + 1) {
-            int srcRow = y * sw;
-            for (int x = 0; x < sw; x = x + 1) {
-                dstSp[(sw - 1 - x) * sh + y] = srcSp[srcRow + x];
-            }
-        }
+        System.Drawing.Imaging.ImageCodec.RotateArgb(this.Pixels, this.Width, this.Height, dst.Pixels, 270);
         return dst;
     }
 
@@ -96,21 +72,16 @@ public partial class ImageBuffer {
         if (this.IsEmpty || newWidth <= 0 || newHeight <= 0) return new ImageBuffer(0, 0);
         ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
         if (dst.Pixels == 0) return dst;
-        int sw = this.Width;
-        int sh = this.Height;
-        Span<int> srcSp = new Span<int>(this.Pixels, sw * sh);
-        Span<int> dstSp = new Span<int>(dst.Pixels, newWidth * newHeight);
-        for (int dy = 0; dy < newHeight; dy = dy + 1) {
-            int sy = (int)((long)dy * (long)sh / (long)newHeight);
-            if (sy >= sh) sy = sh - 1;
-            int srcRow = sy * sw;
-            int dstRow = dy * newWidth;
-            for (int dx = 0; dx < newWidth; dx = dx + 1) {
-                int sx = (int)((long)dx * (long)sw / (long)newWidth);
-                if (sx >= sw) sx = sw - 1;
-                dstSp[dstRow + dx] = srcSp[srcRow + sx];
-            }
-        }
+        System.Drawing.Imaging.ImageCodec.ResizeArgb(this.Pixels, this.Width, this.Height, dst.Pixels, newWidth, newHeight, 0);
+        return dst;
+    }
+
+    // 区域均值缩放（大幅缩图防摩尔纹且吞吐极高，适合电商缩略图批处理）。
+    public ImageBuffer ResizeArea(int newWidth, int newHeight) {
+        if (this.IsEmpty || newWidth <= 0 || newHeight <= 0) return new ImageBuffer(0, 0);
+        ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
+        if (dst.Pixels == 0) return dst;
+        System.Drawing.Imaging.ImageCodec.ResizeArgb(this.Pixels, this.Width, this.Height, dst.Pixels, newWidth, newHeight, 2);
         return dst;
     }
 
@@ -148,7 +119,7 @@ public partial class ImageBuffer {
         }
     }
 
-    // 高质量可分离 Lanczos-3 缩放（先水平后垂直，适合大幅缩图保留锐度）。
+    // 高质量可分离 14-bit 定点数 Lanczos-3 缩放（原生 C11 行主序连续访存加速）。
     public ImageBuffer ResizeLanczos(int newWidth, int newHeight) {
         if (this.IsEmpty || newWidth <= 0 || newHeight <= 0) return new ImageBuffer(0, 0);
         if (newWidth == this.Width && newHeight == this.Height) return this.Clone();
@@ -157,176 +128,22 @@ public partial class ImageBuffer {
             single.Clear(this.GetPixel(0, 0));
             return single;
         }
-
-        int sw = this.Width;
-        int sh = this.Height;
-        ImageBuffer mid = new ImageBuffer(newWidth, sh);
-        if (mid.Pixels == 0) return mid;
-        try {
-            ImageBuffer.LanczosPassH(this.Pixels, sw, sh, mid.Pixels, newWidth);
-            ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
-            if (dst.Pixels == 0) return dst;
-            ImageBuffer.LanczosPassV(mid.Pixels, newWidth, sh, dst.Pixels, newHeight);
-            return dst;
-        } finally {
-            mid.Dispose();
-        }
+        ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
+        if (dst.Pixels == 0) return dst;
+        System.Drawing.Imaging.ImageCodec.ResizeArgb(this.Pixels, this.Width, this.Height, dst.Pixels, newWidth, newHeight, 3);
+        return dst;
     }
 
-    private static double Lanczos3(double x) {
-        if (x < 0.0) x = -x;
-        if (x < 1e-9) return 1.0;
-        if (x >= 3.0) return 0.0;
-        double piX = 3.14159265358979323846 * x;
-        double piX3 = piX / 3.0;
-        return (Math.Sin(piX) / piX) * (Math.Sin(piX3) / piX3);
-    }
-
-    private static void LanczosPassH(nint src, int sw, int sh, nint dst, int dw) {
-        double ratio = (double)sw / (double)dw;
-        double filterScale = ratio > 1.0 ? ratio : 1.0;
-        double support = 3.0 * filterScale;
-        int maxTaps = (int)(support * 2.0) + 4;
-        int[] tapIdx = new int[maxTaps];
-        double[] tapW = new double[maxTaps];
-        Span<byte> srcB = new Span<byte>(src, sw * sh * 4);
-        Span<byte> dstB = new Span<byte>(dst, dw * sh * 4);
-
-        for (int dx = 0; dx < dw; dx = dx + 1) {
-            double center = ((double)dx + 0.5) * ratio - 0.5;
-            int left = (int)Math.Floor(center - support);
-            int right = (int)Math.Ceiling(center + support);
-            int taps = 0;
-            double wSum = 0.0;
-            for (int sx = left; sx <= right; sx = sx + 1) {
-                int cx = sx;
-                if (cx < 0) cx = 0;
-                else if (cx >= sw) cx = sw - 1;
-                double w = ImageBuffer.Lanczos3(((double)sx - center) / filterScale);
-                if (w != 0.0 && taps < maxTaps) {
-                    tapIdx[taps] = cx;
-                    tapW[taps] = w;
-                    wSum = wSum + w;
-                    taps = taps + 1;
-                }
-            }
-            if (wSum == 0.0) { wSum = 1.0; }
-            double invSum = 1.0 / wSum;
-            for (int t = 0; t < taps; t = t + 1) {
-                tapW[t] = tapW[t] * invSum;
-            }
-            for (int y = 0; y < sh; y = y + 1) {
-                int sRow = y * sw * 4;
-                double sb = 0.0; double sg = 0.0; double sr = 0.0; double sa = 0.0;
-                for (int t = 0; t < taps; t = t + 1) {
-                    int off = sRow + tapIdx[t] * 4;
-                    double w = tapW[t];
-                    sb = sb + (double)srcB[off] * w;
-                    sg = sg + (double)srcB[off + 1] * w;
-                    sr = sr + (double)srcB[off + 2] * w;
-                    sa = sa + (double)srcB[off + 3] * w;
-                }
-                int dOff = (y * dw + dx) * 4;
-                dstB[dOff] = ImageBuffer.ClampByte(sb);
-                dstB[dOff + 1] = ImageBuffer.ClampByte(sg);
-                dstB[dOff + 2] = ImageBuffer.ClampByte(sr);
-                dstB[dOff + 3] = ImageBuffer.ClampByte(sa);
-            }
-        }
-    }
-
-    private static void LanczosPassV(nint src, int w, int sh, nint dst, int dh) {
-        double ratio = (double)sh / (double)dh;
-        double filterScale = ratio > 1.0 ? ratio : 1.0;
-        double support = 3.0 * filterScale;
-        int maxTaps = (int)(support * 2.0) + 4;
-        int[] tapIdx = new int[maxTaps];
-        double[] tapW = new double[maxTaps];
-        Span<byte> srcB = new Span<byte>(src, w * sh * 4);
-        Span<byte> dstB = new Span<byte>(dst, w * dh * 4);
-
-        for (int dy = 0; dy < dh; dy = dy + 1) {
-            double center = ((double)dy + 0.5) * ratio - 0.5;
-            int top = (int)Math.Floor(center - support);
-            int bot = (int)Math.Ceiling(center + support);
-            int taps = 0;
-            double wSum = 0.0;
-            for (int sy = top; sy <= bot; sy = sy + 1) {
-                int cy = sy;
-                if (cy < 0) cy = 0;
-                else if (cy >= sh) cy = sh - 1;
-                double w = ImageBuffer.Lanczos3(((double)sy - center) / filterScale);
-                if (w != 0.0 && taps < maxTaps) {
-                    tapIdx[taps] = cy;
-                    tapW[taps] = w;
-                    wSum = wSum + w;
-                    taps = taps + 1;
-                }
-            }
-            if (wSum == 0.0) { wSum = 1.0; }
-            double invSum = 1.0 / wSum;
-            for (int t = 0; t < taps; t = t + 1) {
-                tapW[t] = tapW[t] * invSum;
-            }
-            int dRow = dy * w * 4;
-            for (int x = 0; x < w; x = x + 1) {
-                double sb = 0.0; double sg = 0.0; double sr = 0.0; double sa = 0.0;
-                int xOff = x * 4;
-                for (int t = 0; t < taps; t = t + 1) {
-                    int off = tapIdx[t] * w * 4 + xOff;
-                    double w = tapW[t];
-                    sb = sb + (double)srcB[off] * w;
-                    sg = sg + (double)srcB[off + 1] * w;
-                    sr = sr + (double)srcB[off + 2] * w;
-                    sa = sa + (double)srcB[off + 3] * w;
-                }
-                int dOff = dRow + xOff;
-                dstB[dOff] = ImageBuffer.ClampByte(sb);
-                dstB[dOff + 1] = ImageBuffer.ClampByte(sg);
-                dstB[dOff + 2] = ImageBuffer.ClampByte(sr);
-                dstB[dOff + 3] = ImageBuffer.ClampByte(sa);
-            }
-        }
-    }
-
-    // 调整对比度（contrastPercent: -100..100，0 不变）。保留 Alpha。
+    // 调整对比度（contrastPercent: -100..100，原生 C 256-entry 查表加速）。保留 Alpha。
     public void AdjustContrast(int contrastPercent) {
         if (this.IsEmpty || contrastPercent == 0) return;
-        if (contrastPercent < -100) contrastPercent = -100;
-        if (contrastPercent > 100) contrastPercent = 100;
-        double f = (100.0 + (double)contrastPercent) / 100.0;
-        f = f * f;
-        int factor256 = (int)(f * 256.0 + 0.5);
-        int count = this.Width * this.Height;
-        Span<byte> sp = new Span<byte>(this.Pixels, count * 4);
-        int off = 0;
-        for (int i = 0; i < count; i = i + 1) {
-            sp[off] = ImageBuffer.ClampInt((((int)sp[off] - 128) * factor256 >> 8) + 128);
-            sp[off + 1] = ImageBuffer.ClampInt((((int)sp[off + 1] - 128) * factor256 >> 8) + 128);
-            sp[off + 2] = ImageBuffer.ClampInt((((int)sp[off + 2] - 128) * factor256 >> 8) + 128);
-            off = off + 4;
-        }
+        System.Drawing.Imaging.ImageCodec.ColorAdjustArgb(this.Pixels, this.Width * this.Height, contrastPercent, 0, false);
     }
 
-    // 调整饱和度（saturationPercent: -100 为完全灰度，0 不变，100 为加倍饱和）。保留 Alpha。
+    // 调整饱和度（saturationPercent: -100..200，原生 C 定点数加速）。保留 Alpha。
     public void AdjustSaturation(int saturationPercent) {
         if (this.IsEmpty || saturationPercent == 0) return;
-        if (saturationPercent < -100) saturationPercent = -100;
-        if (saturationPercent > 200) saturationPercent = 200;
-        int s256 = (100 + saturationPercent) * 256 / 100;
-        int count = this.Width * this.Height;
-        Span<byte> sp = new Span<byte>(this.Pixels, count * 4);
-        int off = 0;
-        for (int i = 0; i < count; i = i + 1) {
-            int b = (int)sp[off];
-            int g = (int)sp[off + 1];
-            int r = (int)sp[off + 2];
-            int lum = (b * 29 + g * 150 + r * 77) >> 8;
-            sp[off] = ImageBuffer.ClampInt(lum + (((b - lum) * s256) >> 8));
-            sp[off + 1] = ImageBuffer.ClampInt(lum + (((g - lum) * s256) >> 8));
-            sp[off + 2] = ImageBuffer.ClampInt(lum + (((r - lum) * s256) >> 8));
-            off = off + 4;
-        }
+        System.Drawing.Imaging.ImageCodec.ColorAdjustArgb(this.Pixels, this.Width * this.Height, 0, saturationPercent, false);
     }
 
     // 复古棕褐色滤镜（Sepia），保留 Alpha。
@@ -349,45 +166,11 @@ public partial class ImageBuffer {
         }
     }
 
-    // 3x3 锐化滤镜（strength: 1..100），保留 Alpha。
+    // 3x3 锐化滤镜（strength: 1..100，原生 C11 卷积加速），保留 Alpha。
     public void Sharpen(int strength) {
         if (this.IsEmpty || this.Width < 3 || this.Height < 3 || strength <= 0) return;
         if (strength > 100) strength = 100;
-        int w = this.Width;
-        int h = this.Height;
-        int totalBytes = w * h * 4;
-        nint copy = NativeMemory.Alloc(totalBytes);
-        if (copy == 0) return;
-        try {
-            NativeMemory.Copy(copy, this.Pixels, totalBytes);
-            Span<byte> src = new Span<byte>(copy, totalBytes);
-            Span<byte> dst = new Span<byte>(this.Pixels, totalBytes);
-            int k256 = strength * 256 / 100;
-            for (int y = 1; y < h - 1; y = y + 1) {
-                for (int x = 1; x < w - 1; x = x + 1) {
-                    int c = (y * w + x) * 4;
-                    int l = c - 4;
-                    int r = c + 4;
-                    int u = c - w * 4;
-                    int d = c + w * 4;
-                    for (int ch = 0; ch < 3; ch = ch + 1) {
-                        int cv = (int)src[c + ch];
-                        int lap = cv * 4 - (int)src[l + ch] - (int)src[r + ch]
-                                - (int)src[u + ch] - (int)src[d + ch];
-                        dst[c + ch] = ImageBuffer.ClampInt(cv + ((lap * k256) >> 8));
-                    }
-                }
-            }
-        } finally {
-            NativeMemory.Free(copy);
-        }
-    }
-
-    private static byte ClampByte(double v) {
-        int iv = (int)(v + 0.5);
-        if (iv < 0) return 0;
-        if (iv > 255) return 255;
-        return (byte)iv;
+        System.Drawing.Imaging.ImageCodec.SharpenArgb(this.Pixels, this.Width, this.Height, strength);
     }
 
     private static byte ClampInt(int v) {

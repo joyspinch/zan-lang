@@ -7,6 +7,44 @@ using System.Drawing.Imaging;
 
 namespace System.Media.Video;
 
+// 硬件编码加速策略（Auto 在当前平台探测可用硬编，失败自动安全回退软编）。
+public enum VideoHardwareAccel {
+    None = 0,
+    Auto = 1,
+    Nvenc = 2,
+    Qsv = 3,
+    Amf = 4,
+    VideoToolbox = 5,
+    Vaapi = 6
+}
+
+// 视频硬烧录水印运动模式（导出/转码写入视频帧像素）。
+public enum VideoBurnWatermarkMode {
+    Static = 0,
+    Marquee = 1,
+    Bounce = 2,
+    RandomJump = 3
+}
+
+// 商用视频硬烧录水印配置（支持文字 drawtext 与透明图片 Logo overlay，安全转义零命令注入）。
+public class VideoBurnWatermark {
+    public string Text = "";                           // 非空时启用文字烧录水印
+    public string FontFile = "";                       // 可选 TTF/OTF 字体文件路径
+    public int FontSize = 24;
+    public string FontColor = "white";                 // FFmpeg 颜色名或 0xRRGGBB
+    public int OpacityPercent = 45;                    // 1..100
+    public bool EnableShadow = true;                   // 抗亮暗背景暗色投影
+    public string ImagePath = "";                      // 非空时启用图片 Logo 叠加
+    public int ImageWidth = 0;                         // <= 0 保持原尺寸
+    public int ImageHeight = 0;
+    public VideoBurnWatermarkMode Mode = VideoBurnWatermarkMode.Static;
+    public WatermarkAnchor Anchor = WatermarkAnchor.BottomRight;
+    public int MarginX = 20;
+    public int MarginY = 20;
+    public int SpeedPxPerSec = 90;                     // Marquee / Bounce 速度（像素/秒）
+    public int JumpIntervalSec = 5;                    // RandomJump 跳位周期（秒）
+}
+
 // 视频转码/裁切/压制配置（强类型，不拼接 shell 命令，杜绝命令注入）。
 public class TranscodeOptions {
     public string VideoCodec = "libx264";
@@ -22,6 +60,9 @@ public class TranscodeOptions {
     public string AudioBitrate = "128k";
     public bool StripAudio = false;
     public bool StreamCopy = false;    // 无损快速封装/裁切 (-c copy)
+    public VideoHardwareAccel HardwareAccel = VideoHardwareAccel.None;
+    public int Threads = 0;            // <= 0 使用 FFmpeg 自动多核线程数
+    public VideoBurnWatermark Watermark = null;
     public string FfmpegExecutable = "ffmpeg";
     public int TimeoutMs = 0;          // <= 0 表示使用默认无额外短超时
 }
@@ -119,23 +160,112 @@ public class VideoProcessor {
         return res;
     }
 
-    // 视频转码 / 压制 / 裁切 / 缩放。
-    public static MediaProcessResult Transcode(string inputPath, string outputPath, TranscodeOptions opt) {
-        MediaProcessResult res = new MediaProcessResult();
-        if (inputPath == null || inputPath == "" || outputPath == null || outputPath == "") {
-            res.Error = "inputPath and outputPath are required";
-            return res;
+    private static string EscapeDrawTextValue(string s) {
+        if (s == null) return "";
+        string res = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch == '\\') { res = res + "\\\\"; }
+            else if (ch == ':') { res = res + "\\:"; }
+            else if (ch == '\'') { res = res + "\\'"; }
+            else if (ch == '%') { res = res + "\\%"; }
+            else if (ch == ',') { res = res + "\\,"; }
+            else if (ch == ';') { res = res + "\\;"; }
+            else if (ch == '[') { res = res + "\\["; }
+            else if (ch == ']') { res = res + "\\]"; }
+            else { res = res + Convert.ToString(ch); }
         }
-        TranscodeOptions o = opt == null ? new TranscodeOptions() : opt;
+        return res;
+    }
+
+    private static string FormatAlpha01(int opacityPercent) {
+        int op = opacityPercent;
+        if (op < 1) op = 1;
+        if (op > 100) op = 100;
+        int whole = op / 100;
+        int frac = op % 100;
+        string fs = Convert.ToString(frac);
+        if (fs.Length < 2) fs = "0" + fs;
+        return Convert.ToString(whole) + "." + fs;
+    }
+
+    private static void BuildWatermarkPosExpr(VideoBurnWatermark wm, bool isOverlay,
+                                              out string xExpr, out string yExpr) {
+        string cw = isOverlay ? "W" : "w";
+        string ch = isOverlay ? "H" : "h";
+        string iw = isOverlay ? "w" : "text_w";
+        string ih = isOverlay ? "h" : "text_h";
+        string mx = Convert.ToString(wm.MarginX < 0 ? 0 : wm.MarginX);
+        string my = Convert.ToString(wm.MarginY < 0 ? 0 : wm.MarginY);
+        int spd = wm.SpeedPxPerSec > 0 ? wm.SpeedPxPerSec : 90;
+        string sp = Convert.ToString(spd);
+
+        if (wm.Mode == VideoBurnWatermarkMode.Marquee) {
+            xExpr = cw + "-mod(t*" + sp + "\\," + cw + "+" + iw + ")";
+            yExpr = wm.Anchor == WatermarkAnchor.TopLeft || wm.Anchor == WatermarkAnchor.TopRight
+                ? my
+                : (wm.Anchor == WatermarkAnchor.Center ? ("(" + ch + "-" + ih + ")/2") : (ch + "-" + ih + "-" + my));
+            return;
+        }
+        if (wm.Mode == VideoBurnWatermarkMode.Bounce) {
+            string spY = Convert.ToString(spd * 7 / 10 > 10 ? spd * 7 / 10 : 40);
+            xExpr = "abs(mod(t*" + sp + "\\,2*max(1\\," + cw + "-" + iw + "))-max(1\\," + cw + "-" + iw + "))";
+            yExpr = "abs(mod(t*" + spY + "\\,2*max(1\\," + ch + "-" + ih + "))-max(1\\," + ch + "-" + ih + "))";
+            return;
+        }
+        if (wm.Mode == VideoBurnWatermarkMode.RandomJump) {
+            int iv = wm.JumpIntervalSec > 0 ? wm.JumpIntervalSec : 5;
+            string ivs = Convert.ToString(iv);
+            xExpr = mx + "+mod(floor(t/" + ivs + ")*373\\,max(1\\," + cw + "-" + iw + "-2*" + mx + "))";
+            yExpr = my + "+mod(floor(t/" + ivs + ")*197\\,max(1\\," + ch + "-" + ih + "-2*" + my + "))";
+            return;
+        }
+
+        // Static 5-anchor
+        if (wm.Anchor == WatermarkAnchor.TopLeft) {
+            xExpr = mx; yExpr = my;
+        } else if (wm.Anchor == WatermarkAnchor.TopRight) {
+            xExpr = cw + "-" + iw + "-" + mx; yExpr = my;
+        } else if (wm.Anchor == WatermarkAnchor.BottomLeft) {
+            xExpr = mx; yExpr = ch + "-" + ih + "-" + my;
+        } else if (wm.Anchor == WatermarkAnchor.Center) {
+            xExpr = "(" + cw + "-" + iw + ")/2"; yExpr = "(" + ch + "-" + ih + ")/2";
+        } else {
+            xExpr = cw + "-" + iw + "-" + mx; yExpr = ch + "-" + ih + "-" + my;
+        }
+    }
+
+    private static string ResolveHardwareEncoder(VideoHardwareAccel accel, string baseCodec) {
+        bool isHevc = baseCodec != null && (baseCodec.Contains("265") || baseCodec.Contains("hevc"));
+        if (accel == VideoHardwareAccel.Nvenc) return isHevc ? "hevc_nvenc" : "h264_nvenc";
+        if (accel == VideoHardwareAccel.Qsv) return isHevc ? "hevc_qsv" : "h264_qsv";
+        if (accel == VideoHardwareAccel.Amf) return isHevc ? "hevc_amf" : "h264_amf";
+        if (accel == VideoHardwareAccel.VideoToolbox) return isHevc ? "hevc_videotoolbox" : "h264_videotoolbox";
+        if (accel == VideoHardwareAccel.Vaapi) return isHevc ? "hevc_vaapi" : "h264_vaapi";
+        return baseCodec;
+    }
+
+    private static MediaProcessResult TranscodeWithCodec(string inputPath, string outputPath,
+                                                         TranscodeOptions o, string videoCodec, bool isHw) {
         List<string> args = new List<string>();
         args.Add("-hide_banner");
         args.Add("-loglevel"); args.Add("error");
         args.Add("-y");
 
+        if (o.Threads > 0) {
+            args.Add("-threads"); args.Add(Convert.ToString(o.Threads));
+        }
         if (o.StartMs > 0) {
             args.Add("-ss"); args.Add(VideoProcessor.FormatSecondsMs(o.StartMs));
         }
         args.Add("-i"); args.Add(inputPath);
+
+        VideoBurnWatermark wm = o.Watermark;
+        bool hasImgWm = wm != null && wm.ImagePath != null && wm.ImagePath != "" && File.Exists(wm.ImagePath);
+        bool hasTextWm = wm != null && wm.Text != null && wm.Text != "";
+        if (!o.StreamCopy && hasImgWm) {
+            args.Add("-i"); args.Add(wm.ImagePath);
+        }
         if (o.DurationMs > 0) {
             args.Add("-t"); args.Add(VideoProcessor.FormatSecondsMs(o.DurationMs));
         }
@@ -143,23 +273,87 @@ public class VideoProcessor {
         if (o.StreamCopy) {
             args.Add("-c"); args.Add("copy");
         } else {
+            string scaleFilter = "";
             if (o.Width > 0 || o.Height > 0) {
                 int w = o.Width > 0 ? o.Width : -2;
                 int h = o.Height > 0 ? o.Height : -2;
-                args.Add("-vf");
-                args.Add("scale=" + Convert.ToString(w) + ":" + Convert.ToString(h));
+                scaleFilter = "scale=" + Convert.ToString(w) + ":" + Convert.ToString(h);
             }
+            string drawTextFilter = "";
+            if (hasTextWm) {
+                string tx; string ty;
+                VideoProcessor.BuildWatermarkPosExpr(wm, false, out tx, out ty);
+                string alpha = VideoProcessor.FormatAlpha01(wm.OpacityPercent);
+                string col = (wm.FontColor == null || wm.FontColor == "") ? "white" : wm.FontColor;
+                int fsize = wm.FontSize > 4 ? wm.FontSize : 24;
+                string dt = "drawtext=text='" + VideoProcessor.EscapeDrawTextValue(wm.Text) + "'"
+                    + ":fontsize=" + Convert.ToString(fsize)
+                    + ":fontcolor=" + col + "@" + alpha
+                    + ":x=" + tx + ":y=" + ty;
+                if (wm.FontFile != null && wm.FontFile != "") {
+                    dt = dt + ":fontfile='" + VideoProcessor.EscapeDrawTextValue(wm.FontFile) + "'";
+                }
+                if (wm.EnableShadow) {
+                    dt = dt + ":shadowcolor=black@" + alpha + ":shadowx=1:shadowy=1";
+                }
+                drawTextFilter = dt;
+            }
+
+            if (hasImgWm) {
+                string ox; string oy;
+                VideoProcessor.BuildWatermarkPosExpr(wm, true, out ox, out oy);
+                string alpha = VideoProcessor.FormatAlpha01(wm.OpacityPercent);
+                string baseChain = scaleFilter != "" ? ("[0:v]" + scaleFilter + "[vbase];") : "";
+                string baseLbl = scaleFilter != "" ? "[vbase]" : "[0:v]";
+                string wmPrep = "[1:v]format=rgba";
+                if (wm.ImageWidth > 0 || wm.ImageHeight > 0) {
+                    int iw = wm.ImageWidth > 0 ? wm.ImageWidth : -1;
+                    int ih = wm.ImageHeight > 0 ? wm.ImageHeight : -1;
+                    wmPrep = wmPrep + ",scale=" + Convert.ToString(iw) + ":" + Convert.ToString(ih);
+                }
+                if (wm.OpacityPercent > 0 && wm.OpacityPercent < 100) {
+                    wmPrep = wmPrep + ",colorchannelmixer=aa=" + alpha;
+                }
+                wmPrep = wmPrep + "[vwm];";
+                string fc = baseChain + wmPrep + baseLbl + "[vwm]overlay=x=" + ox + ":y=" + oy;
+                if (drawTextFilter != "") {
+                    fc = fc + "," + drawTextFilter;
+                }
+                fc = fc + "[vout]";
+                args.Add("-filter_complex"); args.Add(fc);
+                args.Add("-map"); args.Add("[vout]");
+                if (!o.StripAudio) {
+                    args.Add("-map"); args.Add("0:a?");
+                }
+            } else {
+                string vf = "";
+                if (scaleFilter != "" && drawTextFilter != "") { vf = scaleFilter + "," + drawTextFilter; }
+                else if (scaleFilter != "") { vf = scaleFilter; }
+                else if (drawTextFilter != "") { vf = drawTextFilter; }
+                if (vf != "") {
+                    args.Add("-vf"); args.Add(vf);
+                }
+            }
+
             if (o.Fps > 0) {
                 args.Add("-r"); args.Add(Convert.ToString(o.Fps));
             }
-            if (o.VideoCodec != null && o.VideoCodec != "") {
-                args.Add("-c:v"); args.Add(o.VideoCodec);
+            if (videoCodec != null && videoCodec != "") {
+                args.Add("-c:v"); args.Add(videoCodec);
             }
-            if (o.Preset != null && o.Preset != "") {
-                args.Add("-preset"); args.Add(o.Preset);
-            }
-            if (o.Crf > 0) {
-                args.Add("-crf"); args.Add(Convert.ToString(o.Crf));
+            if (!isHw) {
+                if (o.Preset != null && o.Preset != "") {
+                    args.Add("-preset"); args.Add(o.Preset);
+                }
+                if (o.Crf > 0) {
+                    args.Add("-crf"); args.Add(Convert.ToString(o.Crf));
+                }
+            } else if (o.Crf > 0) {
+                if (videoCodec.Contains("nvenc")) {
+                    args.Add("-cq"); args.Add(Convert.ToString(o.Crf));
+                } else if (videoCodec.Contains("qsv")) {
+                    args.Add("-global_quality"); args.Add(Convert.ToString(o.Crf));
+                }
             }
             if (o.VideoBitrate != null && o.VideoBitrate != "") {
                 args.Add("-b:v"); args.Add(o.VideoBitrate);
@@ -180,6 +374,57 @@ public class VideoProcessor {
         args.Add("-movflags"); args.Add("+faststart");
         args.Add(outputPath);
         return VideoProcessor.RunFfmpeg(o.FfmpegExecutable, args, o.TimeoutMs);
+    }
+
+    // 进程级硬件编码器自动探测缓存（-1=未探测，0=无可用硬编，>0=已命中的 VideoHardwareAccel 枚举值）
+    private static int cachedAutoHwAccel = -1;
+
+    // 视频转码 / 压制 / 裁切 / 缩放 / 硬件加速 / 商用烧录水印（Auto 硬编首次探测并缓存，失败自动无缝回退软编）。
+    public static MediaProcessResult Transcode(string inputPath, string outputPath, TranscodeOptions opt) {
+        MediaProcessResult res = new MediaProcessResult();
+        if (inputPath == null || inputPath == "" || outputPath == null || outputPath == "") {
+            res.Error = "inputPath and outputPath are required";
+            return res;
+        }
+        TranscodeOptions o = opt == null ? new TranscodeOptions() : opt;
+        string swCodec = (o.VideoCodec == null || o.VideoCodec == "") ? "libx264" : o.VideoCodec;
+
+        if (!o.StreamCopy && o.HardwareAccel != VideoHardwareAccel.None) {
+            if (o.HardwareAccel == VideoHardwareAccel.Auto) {
+                int cached = VideoProcessor.cachedAutoHwAccel;
+                if (cached == 0) {
+                    return VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, swCodec, false);
+                }
+                if (cached > 0) {
+                    string cachedCodec = VideoProcessor.ResolveHardwareEncoder((VideoHardwareAccel)cached, swCodec);
+                    MediaProcessResult cachedRes = VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, cachedCodec, true);
+                    if (cachedRes.Succeeded) return cachedRes;
+                    return VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, swCodec, false);
+                }
+                VideoHardwareAccel[] candidates = new VideoHardwareAccel[] {
+                    VideoHardwareAccel.Nvenc,
+                    VideoHardwareAccel.Qsv,
+                    VideoHardwareAccel.Amf,
+                    VideoHardwareAccel.VideoToolbox
+                };
+                for (int i = 0; i < candidates.Length; i = i + 1) {
+                    string hwCodec = VideoProcessor.ResolveHardwareEncoder(candidates[i], swCodec);
+                    MediaProcessResult hwRes = VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, hwCodec, true);
+                    if (hwRes.Succeeded) {
+                        VideoProcessor.cachedAutoHwAccel = (int)candidates[i];
+                        return hwRes;
+                    }
+                }
+                VideoProcessor.cachedAutoHwAccel = 0;
+                return VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, swCodec, false);
+            }
+            string explicitHw = VideoProcessor.ResolveHardwareEncoder(o.HardwareAccel, swCodec);
+            MediaProcessResult expRes = VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, explicitHw, true);
+            if (expRes.Succeeded) return expRes;
+            return VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, swCodec, false);
+        }
+
+        return VideoProcessor.TranscodeWithCodec(inputPath, outputPath, o, swCodec, false);
     }
 
     // 提取音轨（如输出 .mp3 / .aac / .wav / .m4a）。

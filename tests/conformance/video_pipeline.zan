@@ -57,6 +57,31 @@ public class Program {
         VideoDecoder badDec = VideoDecoder.Open("");
         Program.Check("bad-open", badDec == null);
 
+        // 1b. 播放器实时动态水印模型与 5 种运动模式确定性校验（无外部依赖）
+        VideoWatermark wmStatic = VideoWatermark.CreateStatic("UID-9527 {time}/{duration}", VideoWatermarkAnchor.BottomRight, 40);
+        Program.Check("wm-template", wmStatic.ResolveText(65000, 180000) == "UID-9527 01:05/03:00" && wmStatic.IsDynamic());
+        int wx1; int wy1; int wx2; int wy2;
+        wmStatic.ComputePosition(0, 0, 1280, 720, 200, 24, 0, 16, 16, 70, out wx1, out wy1);
+        Program.Check("wm-static-br", wx1 == 1064 && wy1 == 680);
+
+        VideoWatermark wmMarquee = VideoWatermark.CreateMarquee("CONFIDENTIAL", 35, 100);
+        wmMarquee.ComputePosition(0, 0, 1000, 500, 200, 20, 1000, 16, 16, 100, out wx1, out wy1);
+        wmMarquee.ComputePosition(0, 0, 1000, 500, 200, 20, 3000, 16, 16, 100, out wx2, out wy2);
+        Program.Check("wm-marquee-move", wx1 == 900 && wx2 == 700 && wy1 == wy2);
+
+        VideoWatermark wmBounce = VideoWatermark.CreateBounce("ANTI-PIRACY", 35, 100);
+        wmBounce.ComputePosition(10, 20, 640, 360, 100, 20, 4500, 10, 10, 100, out wx1, out wy1);
+        Program.Check("wm-bounce-bounds", wx1 >= 20 && wx1 + 100 <= 640 && wy1 >= 30 && wy1 + 20 <= 370);
+
+        VideoWatermark wmJump = VideoWatermark.CreateRandomJump("USER-42", 30, 3000);
+        wmJump.ComputePosition(0, 0, 1280, 720, 120, 24, 1000, 16, 16, 70, out wx1, out wy1);
+        wmJump.ComputePosition(0, 0, 1280, 720, 120, 24, 4000, 16, 16, 70, out wx2, out wy2);
+        Program.Check("wm-jump-change", (wx1 != wx2 || wy1 != wy2) && wx2 >= 16 && wx2 + 120 <= 1264);
+
+        VideoWatermark wmTiled = VideoWatermark.CreateTiled("INTERNAL", 25, -30);
+        wmTiled.TextProvider = (long p, long d) => { return "LIVE-" + Convert.ToString(p / 1000); };
+        Program.Check("wm-provider", wmTiled.ResolveText(5000, 60000) == "LIVE-5" && wmTiled.EffectiveAlpha255() == 64);
+
         if (!Program.EnsureFfmpegLibs()) {
             if (Program.failCount == 0) {
                 Console.WriteLine("video_pipeline: ok");
@@ -176,6 +201,29 @@ public class Program {
             Program.Check("transcode-dim", trInfo.IsValid && trInfo.Width == 160 && trInfo.Height == 90);
             Program.Check("transcode-dur", trInfo.DurationMs >= 800 && trInfo.DurationMs <= 1400);
 
+            // 6b. 商用视频硬烧录水印（Logo 透明叠加 + 跑马灯文字）与 Auto 硬件加速自动回退
+            string logoPath = Path.Combine(workDir, "wm_logo.png");
+            ImageBuffer wmLogoImg = new ImageBuffer(24, 24);
+            wmLogoImg.Clear((int)0xFFE03030);
+            Program.Check("wm-logo-save", wmLogoImg.Save(logoPath, ImageFormat.Png, 100));
+            wmLogoImg.Dispose();
+
+            string burnedPath = Path.Combine(workDir, "out_watermarked.mp4");
+            TranscodeOptions wopt = new TranscodeOptions();
+            wopt.Width = 160;
+            wopt.Height = 90;
+            wopt.Preset = "ultrafast";
+            wopt.DurationMs = 600;
+            wopt.HardwareAccel = VideoHardwareAccel.Auto;
+            wopt.Watermark = new VideoBurnWatermark();
+            wopt.Watermark.ImagePath = logoPath;
+            wopt.Watermark.OpacityPercent = 60;
+            wopt.Watermark.Mode = VideoBurnWatermarkMode.Marquee;
+            wopt.Watermark.SpeedPxPerSec = 80;
+            MediaProcessResult wr = VideoProcessor.Transcode(sampleA, burnedPath, wopt);
+            MediaInfo wrInfo = MediaProbe.Probe(burnedPath);
+            Program.Check("burn-watermark-ok", wr.Succeeded && wrInfo.IsValid && wrInfo.Width == 160 && wrInfo.Height == 90);
+
             string audioOut = Path.Combine(workDir, "audio_only.m4a");
             MediaProcessResult ar = VideoProcessor.ExtractAudio(sampleA, audioOut, "aac", "96k", "ffmpeg");
             Program.Check("extract-audio-ok", ar.Succeeded && File.Exists(audioOut));
@@ -257,7 +305,7 @@ public class Program {
             if (Directory.Exists(workDir)) { Directory.DeleteRecursive(workDir); }
         }
 
-        if (Program.failCount == 0 && Program.passCount == 45) {
+        if (Program.failCount == 0 && Program.passCount == 53) {
             Console.WriteLine("video_pipeline: ok");
         } else {
             Console.WriteLine("video_pipeline: pass=" + Convert.ToString(Program.passCount)

@@ -59,6 +59,7 @@ typedef struct zan_ff_api {
     int (*av_channel_layout_copy)(zan_ff_ch_layout_t *dst, const zan_ff_ch_layout_t *src);
     void (*av_channel_layout_uninit)(zan_ff_ch_layout_t *ch_layout);
     int64_t (*av_rescale_q)(int64_t a, zan_ff_rational_t bq, zan_ff_rational_t cq);
+    int (*av_opt_set)(void *obj, const char *name, const char *val, int search_flags);
 
     /* libavcodec */
     unsigned (*avcodec_version)(void);
@@ -261,6 +262,7 @@ static int zan_ff_try_load_set(const char *dir, const zan_ff_ver_tuple_t *t) {
     ZAN_LOAD_SYM(hu, av_channel_layout_copy);
     ZAN_LOAD_SYM(hu, av_channel_layout_uninit);
     ZAN_LOAD_SYM(hu, av_rescale_q);
+    *(void **)&g_ff.av_opt_set = zan_dl_sym(hu, "av_opt_set");
 
     ZAN_LOAD_SYM(hc, avcodec_version);
     ZAN_LOAD_SYM(hc, avcodec_alloc_context3);

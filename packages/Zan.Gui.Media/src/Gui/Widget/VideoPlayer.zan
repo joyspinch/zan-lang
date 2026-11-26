@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Drawing.Imaging;
 using System.Media.Video;
 using Gui;
 using Gui.Backend;
@@ -8,6 +10,7 @@ namespace Gui.Widget;
 // 高性能视频播放控件：
 // - 后台线程运行 MediaPlaybackSession（音频硬件主时钟 A/V 同步，UI 线程零阻塞）；
 // - 仅在 FrameVersion 递增时将双缓冲最新帧发布到交替 mem: 纹理键并 Blit；
+// - 原生支持多路商用实时动态水印（固定/跑马灯/碰壁漂移/定时随机跳位/全屏斜纹平铺/半透明台标 Logo）；
 // - 内置底部播放/暂停按钮、可拖拽进度条与时间码显示（可通过 ShowControls 关闭）。
 public class VideoPlayer : Control, IDisposable {
     public override Control CreateCloneShell() { return new VideoPlayer(); }
@@ -17,7 +20,10 @@ public class VideoPlayer : Control, IDisposable {
     public bool AutoPlay = false;
     public bool Loop = false;
     public bool ShowControls = true;
+    public VideoWatermark Watermark = null;
 
+    private List<VideoWatermark> extraWatermarks = null;
+    private long watermarkOriginMs = 0;
     private string resolvedSrc = null;
     private MediaPlaybackSession session = null;
     private long publishedVersion = -1;
@@ -99,6 +105,24 @@ public class VideoPlayer : Control, IDisposable {
 
     public void SetSpeed(double speed) {
         if (this.session != null) { this.session.SetSpeed(speed); }
+    }
+
+    // 追加一层实时动态水印（支持多路叠加，如全屏斜纹 + 随机跳位 ID + 台标 Logo）。
+    public void AddWatermark(VideoWatermark watermark) {
+        if (watermark == null) return;
+        if (this.extraWatermarks == null) {
+            this.extraWatermarks = new List<VideoWatermark>();
+        }
+        this.extraWatermarks.Add(watermark);
+        this.RequestRedraw();
+    }
+
+    public void ClearWatermarks() {
+        this.Watermark = null;
+        if (this.extraWatermarks != null) {
+            this.extraWatermarks.Clear();
+        }
+        this.RequestRedraw();
     }
 
     private void EnsureLifecycleHook(App app) {
@@ -222,26 +246,160 @@ public class VideoPlayer : Control, IDisposable {
         // 黑色影院底（派生自主题 scrim，保证明暗皮肤下视频对比度一致）
         c.FillRect(this.bx, this.by, this.bw, this.bh, ColorMath.WithAlpha(app.theme.scrim, 255));
 
+        int vx = this.bx;
+        int vy = this.by;
+        int vwOut = this.bw;
+        int vhOut = this.bh;
         if (this.currentKey != "" && this.session != null
             && this.session.VideoWidth > 0 && this.session.VideoHeight > 0) {
-            this.BlitVideo(c, this.session.VideoWidth, this.session.VideoHeight);
+            this.BlitVideo(c, this.session.VideoWidth, this.session.VideoHeight,
+                           out vx, out vy, out vwOut, out vhOut);
         }
 
-        if (this.IsControlBarVisible(app)) {
+        bool ctrlVisible = this.IsControlBarVisible(app);
+        int wmClipH = vhOut;
+        if (ctrlVisible) {
+            int barTop = this.by + this.bh - this.ControlBarHeight(app);
+            if (vy + wmClipH > barTop) {
+                wmClipH = barTop - vy;
+            }
+        }
+        if (vwOut > 0 && wmClipH > 0) {
+            this.PaintAllWatermarks(app, c, vx, vy, vwOut, wmClipH);
+        }
+
+        if (ctrlVisible) {
             this.PaintControlBar(app, c);
         }
 
-        if (this.session != null
-            && (this.session.State == PlaybackState.Playing
-                || this.session.HasPendingSeek
-                || (this.session.FrameVersion > 0 && this.session.FrameVersion != this.publishedVersion))) {
+        bool isPlaying = this.session != null && this.session.State == PlaybackState.Playing;
+        if (isPlaying
+            || (this.session != null
+                && (this.session.HasPendingSeek
+                    || (this.session.FrameVersion > 0 && this.session.FrameVersion != this.publishedVersion)))
+            || this.HasPausedDynamicWatermark()) {
             app.RequestRedraw();
         }
     }
 
-    private void BlitVideo(Canvas c, int vw, int vh) {
+    private bool HasPausedDynamicWatermark() {
+        if (this.Watermark != null && this.Watermark.Enabled
+            && this.Watermark.AnimateWhenPaused && this.Watermark.IsDynamic()) {
+            return true;
+        }
+        if (this.extraWatermarks != null) {
+            for (int i = 0; i < this.extraWatermarks.Count; i = i + 1) {
+                VideoWatermark wm = this.extraWatermarks[i];
+                if (wm != null && wm.Enabled && wm.AnimateWhenPaused && wm.IsDynamic()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void PaintAllWatermarks(App app, Canvas c, int vx, int vy, int vw, int vh) {
+        if (this.Watermark == null && (this.extraWatermarks == null || this.extraWatermarks.Count == 0)) {
+            return;
+        }
+        long nowTick = Environment.TickCount64;
+        if (this.watermarkOriginMs == 0) {
+            this.watermarkOriginMs = nowTick;
+        }
+        long wallElapsed = nowTick - this.watermarkOriginMs;
+        long posMs = this.PositionMs;
+        long durMs = this.DurationMs;
+
+        c.PushClip(vx, vy, vw, vh);
+        if (this.Watermark != null) {
+            this.PaintOneWatermark(app, c, this.Watermark, vx, vy, vw, vh, posMs, durMs, wallElapsed);
+        }
+        if (this.extraWatermarks != null) {
+            for (int i = 0; i < this.extraWatermarks.Count; i = i + 1) {
+                VideoWatermark wm = this.extraWatermarks[i];
+                if (wm != null) {
+                    this.PaintOneWatermark(app, c, wm, vx, vy, vw, vh, posMs, durMs, wallElapsed);
+                }
+            }
+        }
+        c.PopClip();
+    }
+
+    private void PaintOneWatermark(App app, Canvas c, VideoWatermark wm,
+                                   int vx, int vy, int vw, int vh,
+                                   long posMs, long durMs, long wallElapsed) {
+        if (!wm.Enabled) return;
+        int alpha = wm.EffectiveAlpha255();
+        if (alpha <= 0) return;
+
+        long elapsed = wm.AnimateWhenPaused ? wallElapsed : (posMs > 0 ? posMs : wallElapsed);
+        int mx = app.Scale(wm.MarginX);
+        int my = app.Scale(wm.MarginY);
+        int speed = app.Scale(wm.SpeedPxPerSec > 0 ? wm.SpeedPxPerSec : 70);
+
+        // 1. 半透明图片 Logo 水印
+        if (wm.ImagePath != null && wm.ImagePath != "") {
+            int iw = wm.ImageWidth > 0 ? app.Scale(wm.ImageWidth) : ImageCodec.Width(wm.ImagePath);
+            int ih = wm.ImageHeight > 0 ? app.Scale(wm.ImageHeight) : ImageCodec.Height(wm.ImagePath);
+            if (iw > 0 && ih > 0) {
+                int lx; int ly;
+                wm.ComputePosition(vx, vy, vw, vh, iw, ih, elapsed, mx, my, speed, out lx, out ly);
+                int opPm = wm.EffectiveOpacityPm();
+                if (opPm >= 1000) {
+                    c.BlitImage(wm.ImagePath, lx, ly, iw, ih, 0, 0, 0, 0);
+                } else if (c.PushLayerOpacity(lx, ly, iw, ih, opPm)) {
+                    c.BlitImage(wm.ImagePath, 0, 0, iw, ih, 0, 0, 0, 0);
+                    c.PopLayer();
+                }
+            }
+        }
+
+        // 2. 实时文字水印
+        string text = wm.ResolveText(posMs, durMs);
+        if (text == null || text == "") return;
+
+        int fs = app.Scale(wm.FontSize > 6 ? wm.FontSize : 16);
+        int fg = (wm.Color & 0x00FFFFFF) | (alpha << 24);
+        int shAlpha = (alpha * 7) / 10;
+        if (shAlpha < 1 && alpha > 0) shAlpha = 1;
+        int shadow = shAlpha << 24; // 黑色半透明投影
+
+        if (wm.Mode == VideoWatermarkMode.Tiled) {
+            int tw = Canvas.MeasureText(text, fs);
+            int gapX = app.Scale(wm.TileGapX > 40 ? wm.TileGapX : 180);
+            int gapY = app.Scale(wm.TileGapY > 40 ? wm.TileGapY : 120);
+            int stepX = tw + gapX;
+            if (stepX < app.Scale(80)) stepX = app.Scale(80);
+            int rowIdx = 0;
+            for (int py = vy - gapY; py < vy + vh + gapY; py = py + gapY) {
+                int xOff = ((rowIdx & 1) == 1) ? (stepX / 2) : 0;
+                for (int px = vx - stepX + xOff; px < vx + vw + stepX; px = px + stepX) {
+                    if (wm.EnableShadow) {
+                        c.DrawTextRot(px + 1, py + 1, text, shadow, fs, wm.AngleDegrees);
+                    }
+                    c.DrawTextRot(px, py, text, fg, fs, wm.AngleDegrees);
+                }
+                rowIdx = rowIdx + 1;
+            }
+            return;
+        }
+
+        int itemW = Canvas.MeasureText(text, fs);
+        int itemH = fs + app.Scale(4);
+        int tx; int ty;
+        wm.ComputePosition(vx, vy, vw, vh, itemW, itemH, elapsed, mx, my, speed, out tx, out ty);
+        if (wm.EnableShadow) {
+            if (wm.Bold) { c.DrawTextBold(tx + 1, ty + 1, text, shadow, fs); }
+            else { c.DrawText(tx + 1, ty + 1, text, shadow, fs); }
+        }
+        if (wm.Bold) { c.DrawTextBold(tx, ty, text, fg, fs); }
+        else { c.DrawText(tx, ty, text, fg, fs); }
+    }
+
+    private void BlitVideo(Canvas c, int vw, int vh, out int vx, out int vy, out int vwOut, out int vhOut) {
         c.PushClip(this.bx, this.by, this.bw, this.bh);
         if (this.Fit == "fill") {
+            vx = this.bx; vy = this.by; vwOut = this.bw; vhOut = this.bh;
             c.BlitImage(this.currentKey, this.bx, this.by, this.bw, this.bh, 0, 0, 0, 0);
         } else {
             long lhs = (long)this.bw * (long)vh;
@@ -257,6 +415,12 @@ public class VideoPlayer : Control, IDisposable {
             int dx = this.bx + (this.bw - dw) / 2;
             int dy = this.by + (this.bh - dh) / 2;
             c.BlitImage(this.currentKey, dx, dy, dw, dh, 0, 0, 0, 0);
+            vx = dx < this.bx ? this.bx : dx;
+            vy = dy < this.by ? this.by : dy;
+            int rx = (dx + dw) > (this.bx + this.bw) ? (this.bx + this.bw) : (dx + dw);
+            int ry = (dy + dh) > (this.by + this.bh) ? (this.by + this.bh) : (dy + dh);
+            vwOut = rx - vx;
+            vhOut = ry - vy;
         }
         c.PopClip();
     }
@@ -389,6 +553,11 @@ public class VideoPlayer : Control, IDisposable {
         this.loopRegistration = null;
         if (reg != null) { reg.Invalidate(); }
         this.resolvedSrc = null;
+        this.Watermark = null;
+        if (this.extraWatermarks != null) {
+            this.extraWatermarks.Clear();
+            this.extraWatermarks = null;
+        }
         this.ReleaseTextures();
         if (this.session != null) {
             this.session.Dispose();

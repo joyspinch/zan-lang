@@ -1,0 +1,263 @@
+using System;
+
+namespace System.Media.Video;
+
+// 播放器实时动态水印运动模式。
+public enum VideoWatermarkMode {
+    Static = 0,
+    Marquee = 1,
+    Bounce = 2,
+    RandomJump = 3,
+    Tiled = 4
+}
+
+// 静态/跑马灯垂直基准锚点。
+public enum VideoWatermarkAnchor {
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3,
+    Center = 4
+}
+
+// 动态水印实时文案回调（可用于按帧注入用户 ID、工号、IP、时间戳或会话指纹）。
+public delegate string VideoWatermarkTextProvider(long positionMs, long durationMs);
+
+// 商用播放器实时动态水印配置与确定性运动解算器（零 GUI 依赖，可独立单测）。
+// 支持 5 种防录屏与品牌模式：固定五方位、水平跑马灯、全画面碰壁漂移、定时随机跳位、全画面斜向平铺。
+public class VideoWatermark {
+    public bool Enabled = true;
+    public string Text = "";
+    public VideoWatermarkTextProvider TextProvider = null;
+
+    // 可选半透明图片 Logo（支持文件路径或 "mem:" 内存图像键）
+    public string ImagePath = "";
+    public int ImageWidth = 0;
+    public int ImageHeight = 0;
+
+    public VideoWatermarkMode Mode = VideoWatermarkMode.Static;
+    public VideoWatermarkAnchor Anchor = VideoWatermarkAnchor.BottomRight;
+
+    public int FontSize = 16;
+    public bool Bold = false;
+    public int Color = (int)0x00FFFFFF;   // RGB（不含 Alpha，透明度由 OpacityPercent 统一控制）
+    public int OpacityPercent = 35;       // 1..100
+    public bool EnableShadow = true;      // 1px 暗色投影，确保亮暗画面均清晰可读
+
+    public int MarginX = 16;
+    public int MarginY = 16;
+    public int SpeedPxPerSec = 70;        // Marquee / Bounce 速度（逻辑像素/秒）
+    public int JumpIntervalMs = 5000;     // RandomJump 跳位周期（毫秒）
+    public int AngleDegrees = -25;        // Tiled 斜纹倾角（度）
+    public int TileGapX = 180;            // Tiled 水平步距（逻辑像素）
+    public int TileGapY = 120;            // Tiled 垂直步距（逻辑像素）
+    public bool AnimateWhenPaused = false; // 暂停时是否继续按系统时钟漂移/跳位（防暂停截屏）
+    public int Seed = 1337;               // RandomJump 确定性随机种子（可按用户 ID 设定）
+
+    public static VideoWatermark CreateStatic(string text, VideoWatermarkAnchor anchor, int opacityPercent) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.Text = text == null ? "" : text;
+        wm.Mode = VideoWatermarkMode.Static;
+        wm.Anchor = anchor;
+        wm.OpacityPercent = opacityPercent;
+        return wm;
+    }
+
+    public static VideoWatermark CreateMarquee(string text, int opacityPercent, int speedPxPerSec) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.Text = text == null ? "" : text;
+        wm.Mode = VideoWatermarkMode.Marquee;
+        wm.Anchor = VideoWatermarkAnchor.TopRight;
+        wm.OpacityPercent = opacityPercent;
+        wm.SpeedPxPerSec = speedPxPerSec > 0 ? speedPxPerSec : 70;
+        return wm;
+    }
+
+    public static VideoWatermark CreateBounce(string text, int opacityPercent, int speedPxPerSec) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.Text = text == null ? "" : text;
+        wm.Mode = VideoWatermarkMode.Bounce;
+        wm.OpacityPercent = opacityPercent;
+        wm.SpeedPxPerSec = speedPxPerSec > 0 ? speedPxPerSec : 65;
+        return wm;
+    }
+
+    public static VideoWatermark CreateRandomJump(string text, int opacityPercent, int intervalMs) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.Text = text == null ? "" : text;
+        wm.Mode = VideoWatermarkMode.RandomJump;
+        wm.OpacityPercent = opacityPercent;
+        wm.JumpIntervalMs = intervalMs > 200 ? intervalMs : 5000;
+        wm.AnimateWhenPaused = true;
+        return wm;
+    }
+
+    public static VideoWatermark CreateTiled(string text, int opacityPercent, int angleDegrees) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.Text = text == null ? "" : text;
+        wm.Mode = VideoWatermarkMode.Tiled;
+        wm.OpacityPercent = opacityPercent;
+        wm.AngleDegrees = angleDegrees;
+        return wm;
+    }
+
+    public static VideoWatermark CreateLogo(string imagePath, int width, int height,
+                                            VideoWatermarkAnchor anchor, int opacityPercent) {
+        VideoWatermark wm = new VideoWatermark();
+        wm.ImagePath = imagePath == null ? "" : imagePath;
+        wm.ImageWidth = width;
+        wm.ImageHeight = height;
+        wm.Mode = VideoWatermarkMode.Static;
+        wm.Anchor = anchor;
+        wm.OpacityPercent = opacityPercent;
+        return wm;
+    }
+
+    public bool IsDynamic() {
+        if (!this.Enabled) return false;
+        if (this.Mode == VideoWatermarkMode.Marquee
+            || this.Mode == VideoWatermarkMode.Bounce
+            || this.Mode == VideoWatermarkMode.RandomJump) {
+            return true;
+        }
+        if (this.TextProvider != null) return true;
+        if (this.Text != null && (this.Text.Contains("{time}") || this.Text.Contains("{duration}"))) {
+            return true;
+        }
+        return false;
+    }
+
+    public int EffectiveAlpha255() {
+        int op = this.OpacityPercent;
+        if (op < 0) op = 0;
+        if (op > 100) op = 100;
+        return (op * 255 + 50) / 100;
+    }
+
+    public int EffectiveOpacityPm() {
+        int op = this.OpacityPercent;
+        if (op < 0) op = 0;
+        if (op > 100) op = 100;
+        return op * 10;
+    }
+
+    public static string FormatTimeCode(long ms) {
+        if (ms < 0) ms = 0;
+        long totalSec = ms / 1000;
+        long hrs = totalSec / 3600;
+        long min = (totalSec % 3600) / 60;
+        long sec = totalSec % 60;
+        string mStr = Convert.ToString(min);
+        string sStr = Convert.ToString(sec);
+        if (mStr.Length < 2) mStr = "0" + mStr;
+        if (sStr.Length < 2) sStr = "0" + sStr;
+        if (hrs > 0) {
+            string hStr = Convert.ToString(hrs);
+            if (hStr.Length < 2) hStr = "0" + hStr;
+            return hStr + ":" + mStr + ":" + sStr;
+        }
+        return mStr + ":" + sStr;
+    }
+
+    public string ResolveText(long positionMs, long durationMs) {
+        string raw = this.TextProvider != null ? this.TextProvider(positionMs, durationMs) : this.Text;
+        if (raw == null || raw == "") return "";
+        string res = raw;
+        if (res.Contains("{time}")) {
+            res = res.Replace("{time}", VideoWatermark.FormatTimeCode(positionMs));
+        }
+        if (res.Contains("{duration}")) {
+            res = res.Replace("{duration}", VideoWatermark.FormatTimeCode(durationMs));
+        }
+        return res;
+    }
+
+    // 根据运动模式与时间戳计算水印左上角坐标（像素单位）。
+    public void ComputePosition(int areaX, int areaY, int areaW, int areaH,
+                                int itemW, int itemH, long elapsedMs,
+                                int marginX, int marginY, int speedPxPerSec,
+                                out int outX, out int outY) {
+        if (elapsedMs < 0) elapsedMs = 0;
+        if (itemW < 1) itemW = 1;
+        if (itemH < 1) itemH = 1;
+        int mx = marginX < 0 ? 0 : marginX;
+        int my = marginY < 0 ? 0 : marginY;
+        int availW = areaW - itemW - mx * 2;
+        int availH = areaH - itemH - my * 2;
+        if (availW < 0) availW = 0;
+        if (availH < 0) availH = 0;
+
+        if (this.Mode == VideoWatermarkMode.Marquee) {
+            long spd = speedPxPerSec > 0 ? (long)speedPxPerSec : 70;
+            long span = (long)areaW + (long)itemW;
+            if (span < 1) span = 1;
+            long travel = (elapsedMs * spd / 1000) % span;
+            outX = areaX + areaW - (int)travel;
+            if (this.Anchor == VideoWatermarkAnchor.TopLeft || this.Anchor == VideoWatermarkAnchor.TopRight) {
+                outY = areaY + my;
+            } else if (this.Anchor == VideoWatermarkAnchor.Center) {
+                outY = areaY + (areaH - itemH) / 2;
+            } else {
+                outY = areaY + areaH - itemH - my;
+            }
+            return;
+        }
+
+        if (this.Mode == VideoWatermarkMode.Bounce) {
+            long spdX = speedPxPerSec > 0 ? (long)speedPxPerSec : 65;
+            long spdY = (spdX * 7) / 10;
+            if (spdY < 16) spdY = 16;
+
+            int ox = 0;
+            if (availW > 0) {
+                long periodX = (long)availW * 2;
+                long posX = (elapsedMs * spdX / 1000) % periodX;
+                ox = posX <= (long)availW ? (int)posX : (int)(periodX - posX);
+            }
+            int oy = 0;
+            if (availH > 0) {
+                long periodY = (long)availH * 2;
+                long posY = (elapsedMs * spdY / 1000) % periodY;
+                oy = posY <= (long)availH ? (int)posY : (int)(periodY - posY);
+            }
+            outX = areaX + mx + ox;
+            outY = areaY + my + oy;
+            return;
+        }
+
+        if (this.Mode == VideoWatermarkMode.RandomJump) {
+            long iv = this.JumpIntervalMs > 200 ? (long)this.JumpIntervalMs : 5000;
+            long bucket = elapsedMs / iv;
+            // 确定性混合哈希（SplitMix 风格），保证每次跳位均匀覆盖画面且可重现
+            long h1 = (bucket + (long)this.Seed) * 1103515245 + 12345;
+            h1 = h1 ^ (h1 >> 16);
+            long h2 = (bucket * 31 + (long)this.Seed * 17 + 7) * 214013 + 2531011;
+            h2 = h2 ^ (h2 >> 16);
+            if (h1 < 0) h1 = -h1;
+            if (h2 < 0) h2 = -h2;
+            int rx = availW > 0 ? (int)(h1 % (long)(availW + 1)) : 0;
+            int ry = availH > 0 ? (int)(h2 % (long)(availH + 1)) : 0;
+            outX = areaX + mx + rx;
+            outY = areaY + my + ry;
+            return;
+        }
+
+        // Static 五方位锚点
+        if (this.Anchor == VideoWatermarkAnchor.TopLeft) {
+            outX = areaX + mx;
+            outY = areaY + my;
+        } else if (this.Anchor == VideoWatermarkAnchor.TopRight) {
+            outX = areaX + areaW - itemW - mx;
+            outY = areaY + my;
+        } else if (this.Anchor == VideoWatermarkAnchor.BottomLeft) {
+            outX = areaX + mx;
+            outY = areaY + areaH - itemH - my;
+        } else if (this.Anchor == VideoWatermarkAnchor.Center) {
+            outX = areaX + (areaW - itemW) / 2;
+            outY = areaY + (areaH - itemH) / 2;
+        } else {
+            outX = areaX + areaW - itemW - mx;
+            outY = areaY + areaH - itemH - my;
+        }
+    }
+}

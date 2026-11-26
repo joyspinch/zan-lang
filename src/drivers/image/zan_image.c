@@ -544,3 +544,4 @@ ZAN_IMAGE_EXPORT int32_t zan_image_copy_argb(const char *key, uint32_t *dst,
 
 #include "zan_image_encode.c"
 #include "zan_image_anim.c"
+#include "zan_image_ops.c"
