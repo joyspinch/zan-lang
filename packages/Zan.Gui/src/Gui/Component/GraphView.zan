@@ -23,6 +23,7 @@ public class GraphView : Control {
     private int panStartX;
     private int panStartY;
     public string Empty;
+    public string Direction;
     private int ctxRow;
     private int ctxX;
     private int ctxY;
@@ -48,6 +49,7 @@ public class GraphView : Control {
         cardsStale = true;
         builtFor = 0 - 1;
         Empty = "";
+        Direction = "vertical";
         ctxRow = 0 - 1;
         ctxX = 0;
         ctxY = 0;
@@ -140,15 +142,20 @@ public class GraphView : Control {
         if (parsed > 0.05 && parsed <= 10.0) { zoom = parsed; }
     }
 
-    // 覆写：返回设计器属性清单（empty, panX, panY, zoom）。
+    // 覆写：返回设计器属性清单（empty, direction, panX, panY, zoom）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Text("empty", "Empty text").Field("Empty"));
+        ps.Add(PropSpec.Enum("direction", "Direction", new List<string>())
+            .Option("vertical").Option("horizontal").Field("Direction"));
         ps.Add(PropSpec.Int("panX", "Pan X").Field("panX"));
         ps.Add(PropSpec.Int("panY", "Pan Y").Field("panY"));
         ps.Add(PropSpec.Text("zoom", "Zoom").Accessor("ZoomText", "SetZoomText"));
         return ps;
     }
+    public bool IsHorizontal() { return Direction == "horizontal" || Direction == "lr" || Direction == "LR"; }
+    public GraphView Horizontal() { Direction = "horizontal"; return this; }
+    public GraphView Vertical() { Direction = "vertical"; return this; }
 
     // 绑定调用方的节点列表；不复制任何内容。
     public GraphView Bind(List<GraphNode> nodes) {
@@ -252,8 +259,16 @@ public class GraphView : Control {
         }
         cardsStale = false;
         builtFor = data.Count;
+        int selRow = sel.Get();
         for (int k = 0; k < slots.Count; k = k + 1) {
-            if (slots[k].card != null) { slots[k].card.MeasureTree(app); }
+            Control slotCard = slots[k].card;
+            if (slotCard == null) { continue; }
+            if (!this.Templated()) {
+                bool locked = this.LockedAt(k);
+                if (slots[k].lockMark != null) { slots[k].lockMark.visible = locked; }
+                slotCard.Class = GraphView.NodeClass(k == selRow, false, locked);
+            }
+            slotCard.MeasureTree(app);
         }
     }
     public void DispatchCardEvent(int row, string eventName) {
@@ -328,7 +343,7 @@ public class GraphView : Control {
         }
         if (n.progress >= 0) {
             Progress bar = new Progress(n.progress, 0);
-            bar.Class = "graphnodebar";
+            bar.SwitchClass("graphnodebar", true);
             box.Add(bar);
         }
         return box;
@@ -372,13 +387,23 @@ public class GraphView : Control {
         if (h < 1) { h = 1; }
         return h;
     }
+    private int SlotHeight(App app, int index, int minH, int fallbackH) {
+        int h = minH;
+        if (index >= 0 && index < slots.Count && slots[index].card != null && slots[index].card.prefH > h) {
+            h = slots[index].card.prefH;
+        } else if (index >= slots.Count || slots[index].card == null) {
+            h = fallbackH;
+        }
+        return h > 0 ? h : 1;
+    }
     public int Layout(int areaX, int areaY, int areaW) { return this.Layout(this.App, areaX, areaY, areaW); }
     private int Layout(App app, int areaX, int areaY, int areaW) {
         this.ComputeDepth();
         int gap = this.Gap(app);
         if (gap < 0) { gap = 0; }
         int cw = this.CardWidth(app, areaW);
-        int ch = this.CardHeight(app);
+        int minH = app != null ? app.Scale(48) : 48;
+        int fallbackCh = this.CardHeight(app);
         int stepW = cw + gap;
         if (stepW < 1) { stepW = 1; }
         int perRow = (areaW + gap) / stepW;
@@ -399,6 +424,11 @@ public class GraphView : Control {
             while (placed < layer.Count) {
                 int cnt = layer.Count - placed;
                 if (cnt > perRow) { cnt = perRow; }
+                int rowH = minH;
+                for (int k = 0; k < cnt; k = k + 1) {
+                    int nh = this.SlotHeight(app, layer[placed + k], minH, fallbackCh);
+                    if (nh > rowH) { rowH = nh; }
+                }
                 int rowW = cnt * cw + (cnt - 1) * gap;
                 int x = areaX + (areaW - rowW) / 2;
                 for (int k = 0; k < cnt; k = k + 1) {
@@ -406,19 +436,77 @@ public class GraphView : Control {
                     n.lx = x + k * (cw + gap);
                     n.ly = y;
                     n.lw = cw;
-                    n.lh = ch;
+                    n.lh = rowH;
                 }
                 placed = placed + cnt;
-                y = y + ch + gap;
+                y = y + rowH + gap;
             }
         }
         int total = y - areaY;
         if (total > 0) { total = total - gap; }
         return total;
     }
+    private void LayoutHorizontal(App app, int areaX, int areaY, out int totalW, out int totalH) {
+        this.ComputeDepth();
+        int gap = this.Gap(app);
+        if (gap < 0) { gap = 0; }
+        int cw = this.CardWidth(app, 0);
+        int minH = app != null ? app.Scale(48) : 48;
+        int fallbackCh = this.CardHeight(app);
+        int maxDepth = 0;
+        for (int i = 0; i < data.Count; i = i + 1) {
+            if (data[i].depth > maxDepth) { maxDepth = data[i].depth; }
+        }
+        List<int> colHeights = new List<int>();
+        int maxColH = 0;
+        int colCount = 0;
+        for (int d = 0; d <= maxDepth; d = d + 1) {
+            int chSum = 0;
+            int count = 0;
+            for (int i = 0; i < data.Count; i = i + 1) {
+                if (data[i].depth == d) {
+                    if (count > 0) { chSum = chSum + gap; }
+                    chSum = chSum + this.SlotHeight(app, i, minH, fallbackCh);
+                    count = count + 1;
+                }
+            }
+            colHeights.Add(chSum);
+            if (count > 0) {
+                colCount = colCount + 1;
+                if (chSum > maxColH) { maxColH = chSum; }
+            }
+        }
+        int x = areaX;
+        for (int d = 0; d <= maxDepth; d = d + 1) {
+            int colH = colHeights[d];
+            if (colH <= 0) { continue; }
+            int y = areaY + (maxColH - colH) / 2;
+            for (int i = 0; i < data.Count; i = i + 1) {
+                if (data[i].depth != d) { continue; }
+                int nh = this.SlotHeight(app, i, minH, fallbackCh);
+                GraphNode n = data[i];
+                n.lx = x;
+                n.ly = y;
+                n.lw = cw;
+                n.lh = nh;
+                y = y + nh + gap;
+            }
+            x = x + cw + gap;
+        }
+        totalW = colCount > 0 ? (colCount * cw + (colCount - 1) * gap) : 0;
+        totalH = maxColH;
+    }
     public override void OnMeasure(App app) {
         this.BuildCards(app);
         int gap = this.Gap(app);
+        if (this.IsHorizontal()) {
+            int tw = 0;
+            int th = 0;
+            this.LayoutHorizontal(app, 0, 0, out tw, out th);
+            prefW = tw + gap * 2;
+            prefH = th + gap * 2;
+            return;
+        }
         int areaW = bw - gap * 2;
         if (areaW <= 0) { areaW = app.Scale(320); }
         prefH = this.Layout(app, 0, 0, areaW) + gap * 2;
@@ -426,6 +514,9 @@ public class GraphView : Control {
     public override StyleBox ResolveStyle(App app, int state) {
         StyleBox box = base.ResolveStyle(app, state);
         if (box.overflowCss == 0 - 1) {
+            if (this.IsHorizontal()) {
+                box.overflowX = panX == 0 && panY == 0 ? 2 : 1;
+            }
             box.overflowY = panX == 0 && panY == 0 ? 2 : 1;
             box.overflow = 1;
         }
@@ -445,10 +536,41 @@ public class GraphView : Control {
         this.BuildCards(app);
         int gap = this.Gap(app);
         Rect view = this.ScrollViewport();
+        bool scrolling = panX == 0 && panY == 0;
+        if (this.IsHorizontal()) {
+            int contentW = 0;
+            int contentH = 0;
+            this.LayoutHorizontal(app, 0, 0, out contentW, out contentH);
+            scrollExtentX = scrolling && contentW + gap * 2 > view.width
+                ? contentW + gap * 2 : view.width;
+            scrollExtent = scrolling && contentH + gap * 2 > view.height
+                ? contentH + gap * 2 : view.height;
+            int maxX = scrollExtentX - view.width;
+            int maxY = scrollExtent - view.height;
+            int nextX = scrollX;
+            if (nextX < 0) { nextX = 0; }
+            if (nextX > maxX) { nextX = maxX; }
+            int nextY = scrollY;
+            if (nextY < 0) { nextY = 0; }
+            if (nextY > maxY) { nextY = maxY; }
+            this.CommitScrollOffset(nextX, nextY);
+            int originX = contentW + gap * 2 <= view.width
+                ? view.x + (view.width - contentW) / 2 : view.x + gap;
+            int originY = contentH + gap * 2 <= view.height
+                ? view.y + (view.height - contentH) / 2 : view.y + gap;
+            this.LayoutHorizontal(app, originX + panX - scrollX, originY + panY - scrollY,
+                out contentW, out contentH);
+            if (!this.ArrangeNodes(app)) { arrangingGraph = false; return; }
+            if (scroll != null && scroll.Active() && maxX <= 0 && maxY <= 0) {
+                RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", this, px, py);
+                this.ScrollPointerCancel(cancel);
+            }
+            arrangingGraph = false;
+            return;
+        }
         int areaW = view.width - gap * 2;
         if (areaW < app.Scale(40)) { areaW = app.Scale(40); }
         int contentH = this.Layout(app, view.x + gap, view.y + gap, areaW);
-        bool scrolling = panX == 0 && panY == 0;
         if (scrolling && contentH + gap * 2 > view.height) {
             areaW = areaW - app.Scale(8);
             if (areaW < 1) { areaW = 1; }
@@ -490,10 +612,30 @@ public class GraphView : Control {
         int edgeCol = edge.BgOr(0);
         int doneEdgeCol = doneEdge.BgOr(0);
         int arrowSz = app.Scale(4);
+        bool horiz = this.IsHorizontal();
         for (int i = 0; i < data.Count; i = i + 1) {
             GraphNode n = data[i];
             int nDeps = n.deps.Count;
             if (nDeps == 0) { continue; }
+            if (horiz) {
+                int x1 = n.lx;
+                int y1 = n.ly + (n.lh >> 1);
+                int x1_minus_a = x1 - arrowSz;
+                int y1_minus_a = y1 - arrowSz;
+                int y1_plus_a = y1 + arrowSz;
+                for (int k = 0; k < nDeps; k = k + 1) {
+                    int d = GraphView.IndexOf(data, n.deps[k]);
+                    if (d < 0) { continue; }
+                    GraphNode p = data[d];
+                    int col = p.done ? doneEdgeCol : edgeCol;
+                    int x0 = p.lx + p.lw;
+                    int y0 = p.ly + (p.lh >> 1);
+                    GraphView.DrawHorizontalBezier(c, x0, y0, x1, y1, col, th);
+                    c.DrawLine(x1_minus_a, y1_minus_a, x1, y1, col, th);
+                    c.DrawLine(x1_minus_a, y1_plus_a, x1, y1, col, th);
+                }
+                continue;
+            }
             int x1 = n.lx + (n.lw >> 1);
             int y1 = n.ly;
             int x1_minus_a = x1 - arrowSz;
@@ -510,6 +652,27 @@ public class GraphView : Control {
                 c.DrawLine(x1_minus_a, y1_minus_a, x1, y1, col, th);
                 c.DrawLine(x1_plus_a, y1_minus_a, x1, y1, col, th);
             }
+        }
+    }
+    private static void DrawHorizontalBezier(Canvas c, int x0, int y0, int x1, int y1, int col, int thickness) {
+        int dx = x1 - x0;
+        int ext = dx > 30 ? (dx / 2) : 25;
+        int cx0 = x0 + ext;
+        int cx1 = x1 - ext;
+        int prevX = x0;
+        int prevY = y0;
+        for (int step = 1; step <= 16; step = step + 1) {
+            double t = (double)step / 16.0;
+            double it = 1.0 - t;
+            double it2 = it * it;
+            double it3 = it2 * it;
+            double t2 = t * t;
+            double t3 = t2 * t;
+            int curX = (int)(it3 * (double)x0 + 3.0 * it2 * t * (double)cx0 + 3.0 * it * t2 * (double)cx1 + t3 * (double)x1);
+            int curY = (int)(it3 * (double)y0 + 3.0 * it2 * t * (double)y0 + 3.0 * it * t2 * (double)y1 + t3 * (double)y1);
+            c.DrawLine(prevX, prevY, curX, curY, col, thickness);
+            prevX = curX;
+            prevY = curY;
         }
     }
     private static void DrawCubicBezier(Canvas c, int x0, int y0, int x1, int y1, int col, int thickness) {
@@ -538,10 +701,12 @@ public class GraphView : Control {
         List<GraphNode> arrangedData = data;
         List<GraphCardSlot> arrangedSlots = slots;
         int selRow = sel.Get();
+        int viewportRight = bx + bw;
         int viewportBottom = by + bh;
         for (int i = 0; i < data.Count; i = i + 1) {
             GraphNode n = data[i];
-            bool onscreen = n.ly + n.lh > by && n.ly < viewportBottom;
+            bool onscreen = n.ly + n.lh > by && n.ly < viewportBottom
+                && n.lx + n.lw > bx && n.lx < viewportRight;
             Control card = null;
             Tag mark = null;
             if (i < slots.Count) {

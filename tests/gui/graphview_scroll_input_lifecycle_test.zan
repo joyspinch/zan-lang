@@ -150,6 +150,86 @@ class GraphScrollInputTest {
         Check(!graph.IsPressed() && !graph.IsPanning(), "non-pan Up always clears graph base press");
         app.SetRootControl(null);
     }
+    static void FindProgress(Control node, List<Progress> found) {
+        if (node == null) { return; }
+        if (node.Kind() == "Progress") { found.Add((Progress)node); return; }
+        for (int i = 0; i < node.ChildCount(); i = i + 1) {
+            FindProgress(node.ChildAt(i), found);
+        }
+    }
+    static void LayoutAndVisualEncapsulation() {
+        App app = App.CreateOffscreen("GraphView visual encapsulation", 960, 320);
+        app.EnableSkins();
+        int liquidIdx = app.SkinIndexOf("liquid");
+        Check(liquidIdx >= 0, "liquid skin exists");
+        app.ApplySkin(liquidIdx);
+        List<GraphNode> nodes = new List<GraphNode>();
+        GraphNode n0 = GraphNode.Of("a", "CSS Parse");
+        n0.WithTag("Core", "primary"); n0.WithState("Done", "success"); n0.Finished();
+        nodes.Add(n0);
+        GraphNode n1 = GraphNode.Of("b", "Flex Layout");
+        n1.After("a"); n1.WithTag("Layout", "info"); n1.WithState("Run", "primary"); n1.WithProgress(86);
+        nodes.Add(n1);
+        GraphNode n2 = GraphNode.Of("c", "Glass Paint");
+        n2.After("b"); n2.WithTag("Render", "warning"); n2.WithProgress(72);
+        nodes.Add(n2);
+
+        // 1. Vertical mode: per-row natural height + Progress retains .progress flex alignment
+        GraphView vg = new GraphView();
+        vg.Bind(nodes);
+        vg.UseApp(app);
+        app.SetRootControl(vg);
+        vg.MeasureTree(app);
+        vg.Arrange(0, 0, 960, 320);
+        Check(vg.NodeAt(0).lh < vg.NodeAt(1).lh,
+            "node without progress keeps snug height without dead whitespace");
+        List<Progress> bars = new List<Progress>();
+        FindProgress(vg.ChildAt(1), bars);
+        Check(bars.Count == 1, "progress node contains a Progress widget");
+        Progress bar = bars[0];
+        Check(bar.Class.Contains("progress") && bar.Class.Contains("graphnodebar"),
+            "GraphView preserves Progress base class alongside graphnodebar");
+        int trackMid = bar.trackNode.by + bar.trackNode.bh / 2;
+        int labelMid = bar.labelNode.by + bar.labelNode.bh / 2;
+        int diff = trackMid - labelMid;
+        if (diff < 0) { diff = 0 - diff; }
+        Check(diff <= 3 && bar.labelNode.bx > bar.trackNode.bx + bar.trackNode.bw,
+            "Progress label stays vertically centered to the right of track");
+
+        // 2. Horizontal mode: left-to-right columns + glass opacity/dashed rounded corner integrity
+        GraphView hg = new GraphView();
+        hg.Horizontal();
+        hg.Bind(nodes);
+        hg.UseApp(app);
+        app.SetRootControl(hg);
+        hg.MeasureTree(app);
+        hg.Arrange(0, 0, 960, 240);
+        Check(hg.NodeAt(0).lx + hg.NodeAt(0).lw < hg.NodeAt(1).lx
+            && hg.NodeAt(1).lx + hg.NodeAt(1).lw < hg.NodeAt(2).lx,
+            "horizontal GraphView lays out layers left-to-right");
+        int cy0 = hg.NodeAt(0).ly + hg.NodeAt(0).lh / 2;
+        int cy1 = hg.NodeAt(1).ly + hg.NodeAt(1).lh / 2;
+        int cyDiff = cy0 - cy1;
+        if (cyDiff < 0) { cyDiff = 0 - cyDiff; }
+        Check(cyDiff <= 2, "horizontal GraphView vertically centers nodes on centerline");
+
+        app.BeginOffscreenFrame();
+        app.canvas.FillRect(0, 0, 960, 240, (int)4294244863); // light pastel backdrop #FFF4F7FF
+        hg.RenderTree(app);
+        app.EndOffscreenFrame();
+        // Locked node (n2) uses backdrop-filter: blur + opacity < 100%; interior must stay bright, not muddy dark grey
+        Control lockedCard = hg.ChildAt(2);
+        int bgPx = app.canvas.GetPixel(lockedCard.bx + lockedCard.bw - 12, lockedCard.by + 12);
+        int lum = (((bgPx >> 16) & 255) + ((bgPx >> 8) & 255) + (bgPx & 255)) / 3;
+        Check(lum > 180, "locked glass node stays bright under backdrop-filter + opacity: lum=" + Convert.ToString(lum));
+        // Rounded dashed border must not protrude into the outer (bx, by) square corner pixel
+        int cornerPx = app.canvas.GetPixel(lockedCard.bx, lockedCard.by);
+        int cornerLum = (((cornerPx >> 16) & 255) + ((cornerPx >> 8) & 255) + (cornerPx & 255)) / 3;
+        Check(cornerLum > 220, "rounded dashed border does not paint square corner protrusion: lum=" + Convert.ToString(cornerLum));
+
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
     static void Main() {
         App frame = App.CreateOffscreen("independent Graph frame", 2, 2);
         App app = App.CreateOffscreen("Graph shared scroll", 640, 480);
@@ -160,6 +240,7 @@ class GraphScrollInputTest {
         RetirementCallback(app, true);
         RetirementCallback(app, false);
         app.canvas.Destroy(); frame.canvas.Destroy();
+        LayoutAndVisualEncapsulation();
         Console.WriteLine("graphview_scroll_input_lifecycle: ok");
     }
 }
