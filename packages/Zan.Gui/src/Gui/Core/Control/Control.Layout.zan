@@ -4,7 +4,10 @@ using Gui;
 namespace Gui;
 public partial class Control {
     protected int measureWidth = 0 - 1;
+    internal bool measureDependsOnWidth;
     private bool measureIntrinsic;
+    protected virtual bool UsesBaseFlowOnly() { return this.Kind() == "Control"; }
+    protected virtual bool IsWidthDependentMeasure() { return false; }
     private bool measuringTree;
     private weak App measuringApp;
     private List<App> measuringAncestors;
@@ -17,7 +20,7 @@ public partial class Control {
         long sequence = app != null && app.window != null ? app.window.EventSeq() : 0;
         syncingBinding = true;
         try {
-            this.SyncDeclarativeBindings();
+            if (this.extra != null) { this.SyncDeclarativeBindings(); }
             this.SyncBinding();
         }
         finally { syncingBinding = false; }
@@ -63,9 +66,11 @@ public partial class Control {
         app.styleCtx = this;
         measuringTree = true;
         measuringApp = app;
+        Style.BeginChainPass(app);
         try {
             this.MeasureTreeInner(app, available, clamp);
         } finally {
+            Style.EndChainPass();
             measureWidth = previousWidth;
             measuringTree = previous;
             measuringApp = previousApp;
@@ -105,8 +110,13 @@ public partial class Control {
             if (clamp && width > room) { width = room; }
             measureWidth = width > 0 ? width : 0;
         }
-        if (!this.StyleVisible()) { return; }
+        if (!this.StyleVisible()) { measureDependsOnWidth = false; return; }
         int display = this.StyleDisplay();
+        bool dep = this.IsWidthDependentMeasure() || display == 3 || display == 4
+            || (display == 1 && this.StyleWrap() != 0)
+            || (computedStyle != null && (computedStyle.widthPm >= 0
+                || computedStyle.minWPm >= 0 || computedStyle.maxWPm >= 0
+                || computedStyle.basisPm >= 0 || computedStyle.aspect != 0));
         bool row = display == 1 && this.StyleFlexDir() != 1;
         bool intrinsicKids = measureIntrinsic || display == 4 || (row && this.StyleWrap() == 0);
         bool deferGridKids = false;
@@ -140,10 +150,12 @@ public partial class Control {
             } else {
                 child.MeasureTree(app);
             }
+            if (child.measureDependsOnWidth) { dep = true; }
             if (parent != ownerParent || this.FindApp() != app || app.rootControl != root
             || app.inputRootGeneration != generation
             || (app.window != null && app.window.EventSeq() != sequence)) { return; }
         }
+        measureDependsOnWidth = dep;
         int keepW = prefW;
         int keepH = prefH;
         bool keepSet = prefSet;
@@ -373,6 +385,7 @@ public partial class Control {
     void MeasureContent(App app) {
         List<FlowEntry> entries = null;
         if (childNodes.Count == 0) {
+            if (this.UsesBaseFlowOnly()) { return; }
             entries = this.FlowEntries();
             if (entries.Count == 0) { return; }
         }
@@ -445,6 +458,14 @@ public partial class Control {
         by = py;
         bw = pw;
         bh = ph;
+        if (!everLaidOut || bw != lastBw || bh != lastBh) {
+            App host = this.app;
+            if (host != null) { host.layoutEventsDirty = true; }
+        }
+        if ((childNodes == null || childNodes.Count == 0) && this.UsesBaseFlowOnly()) {
+            if (this.IsScrollContainer()) { this.ArrangeScrollTail(); }
+            return;
+        }
         int innerPadL = this.StyleInsetL();
         int innerPadT = this.StyleInsetT();
         int innerPadR = this.StyleInsetR();

@@ -7,6 +7,13 @@ public partial class Control {
     public virtual bool ChildControlsRenderedByOwner() { return false; }
     protected virtual bool PaintWithinBounds() { return false; }
     private bool CanBoundsCull(App host, bool needClippedChildren) {
+        if (host.Damage == null || !host.Damage.partialFrame) { return false; }
+        bool formCulled = host.SkipFormPaintBounds(bx, by, bw, bh);
+        bool generalPartial = !formCulled && !host.Damage.forceFullNext
+            && (!PaintHash.On || host.paintingSteadyDrawer)
+            && !NativeLayer.HasTrackedFor(host)
+            && !host.Damage.FrameDamageIntersects(bx, by, bw, bh);
+        if (!formCulled && !generalPartial) { return false; }
         if (this.app != host || Tip != "" || surfaceFrom != null
             || host.paintOffsetX != 0 || host.paintOffsetY != 0 || host.canvas.opacityPm != 1000
             || this.ChildControlsRenderedByOwner()
@@ -19,13 +26,6 @@ public partial class Control {
             || style.shadow != 0 || style.blur != 0 || style.tx != 0 || style.ty != 0
             || style.scale > 1000 || (style.rotate % 360) != 0 || style.opacity < 1000
             || style.emboss != 0 || style.anim != 0) { return false; }
-        bool formCulled = host.SkipFormPaintBounds(bx, by, bw, bh);
-        bool generalPartial = !formCulled && host.Damage != null && host.Damage.partialFrame
-            && !host.Damage.forceFullNext
-            && (!PaintHash.On || host.paintingSteadyDrawer)
-            && !NativeLayer.HasTrackedFor(host)
-            && !host.Damage.FrameDamageIntersects(bx, by, bw, bh);
-        if (!formCulled && !generalPartial) { return false; }
         if (formCulled && (this.StyleOverflowX() > 1 || this.StyleOverflowY() > 1)) { return false; }
         if (!needClippedChildren) { return true; }
         return childNodes.Count == 0
@@ -54,18 +54,28 @@ public partial class Control {
         if (!app.ContinuePreparedFrame()) { return; }
         Control prevCtx = app.styleCtx;
         app.styleCtx = this;
+        Style.BeginChainPass(app);
         try {
             if (this.app == app && this.SkipBoundedPaint(app)) { return; }
             this.RenderTreeInner(app);
         } finally {
+            Style.EndChainPass();
             paintedStyle = null;
             app.styleCtx = prevCtx;
         }
     }
-    private bool PaintNodeCurrent(App host, Control ownerParent, int revision, Control root,
-    int generation, long sequence, int phase, int frame) {
-        return host.ContinuePreparedFrame() && host.isRunning
-        && this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)
+    private bool PaintNodeCurrent(App host, Control ownerParent, int revision, int structRev,
+    Control root, int generation, long sequence, int phase, int frame) {
+        if (!host.ContinuePreparedFrame() || !host.isRunning) { return false; }
+        if (host.rootControl != root || host.inputRootGeneration != generation
+            || host.inputPreparationTicket != phase || host.frameSeq != frame) { return false; }
+        if (parent == ownerParent && this.app == host && preparingLayoutOwner == null
+            && Control.BindingStructureRevision() == structRev
+            && this.LayoutRevision() == revision && this.StyleVisible()) {
+            if (host.window.EventSeq() == sequence) { return true; }
+            return false;
+        }
+        return this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)
         && this.LayoutNodeCurrent(host, ownerParent, revision) && this.StyleVisible()
         && (ownerParent == null || ownerParent.OwnsLayoutChild(this));
     }
@@ -116,6 +126,7 @@ public partial class Control {
             if (effOpacity <= 0) { return; }
             Control ownerParent = parent;
             int revision = this.LayoutRevision();
+            int structRev = Control.BindingStructureRevision();
             Control root = app.rootControl;
             int generation = app.inputRootGeneration;
             long sequence = app.window.EventSeq();
@@ -134,14 +145,20 @@ public partial class Control {
             if (skipSelf) {
                 app.culledControlPaints = app.culledControlPaints + 1;
             } else {
-                PaintHashToken hashSeg = PaintHash.BeginScope();
-                try {
+                if (PaintHash.On) {
+                    PaintHashToken hashSeg = PaintHash.BeginScope();
+                    try {
+                        PaintStyleBox(app);
+                        OnPaint(app);
+                        if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
+                        app.CommitPaintHash(hashSeg, this.CommonId(), bx, by, bw, bh);
+                    } finally {
+                        PaintHash.Restore(hashSeg);
+                    }
+                } else {
                     PaintStyleBox(app);
                     OnPaint(app);
-                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
-                    app.CommitPaintHash(hashSeg, this.CommonId(), bx, by, bw, bh);
-                } finally {
-                    PaintHash.Restore(hashSeg);
+                    if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
                 }
                 if (selfProf) {
                     app.Stats.Node(this.Kind(), name, Window.GetTickUs() - selfT0);
@@ -156,7 +173,7 @@ public partial class Control {
                 }
                 if (this.extra != null && this.extra.Paint != null && this.extra.Paint.Count() > 0) {
                     this.extra.Paint.Raise(this);
-                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                    if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
                 }
             }
             bool scrollC = this.IsScrollContainer();
@@ -186,7 +203,7 @@ public partial class Control {
                         by = pushedLayer ? 0 : origY + offY;
                         if (!inView) { continue; }
                         child.RenderTree(app);
-                        if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                        if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
                     }
                 } finally {
                     if (clipKids) {

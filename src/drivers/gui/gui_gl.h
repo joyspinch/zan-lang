@@ -19,6 +19,7 @@ typedef float         zgl_float;
 #define ZGL_TRUE                         1
 #define ZGL_NO_ERROR                     0
 #define ZGL_TRIANGLES                    0x0004
+#define ZGL_TRIANGLE_STRIP               0x0005
 #define ZGL_SRC_ALPHA                    0x0302
 #define ZGL_ONE_MINUS_SRC_ALPHA          0x0303
 #define ZGL_ONE                          1
@@ -65,6 +66,8 @@ typedef float         zgl_float;
 #define ZGL_TEXTURE0                     0x84C0
 #define ZGL_TEXTURE1                     0x84C1
 #define ZGL_TEXTURE2                     0x84C2
+#define ZGL_TEXTURE3                     0x84C3
+#define ZGL_TEXTURE4                     0x84C4
 #define ZGL_ARRAY_BUFFER                 0x8892
 #define ZGL_STREAM_DRAW                  0x88E0
 #define ZGL_STATIC_DRAW                  0x88E4

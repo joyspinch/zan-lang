@@ -11,13 +11,13 @@ static zan_gl_api gl;
 static void (*zgl_blend_equation)(zgl_enum);
 static int g_gl_state = 0;   /* 0 untried, 1 ready, -1 unusable */
 
-#define ZGL_VF 34
+#define ZGL_IF 38
+#define ZGL_RING_SLOTS 4
 
 typedef enum {
     ZGL_MODE_NONE = 0,
-    ZGL_MODE_BLEND,     /* shapes, source-over */
+    ZGL_MODE_BLEND,     /* unified shapes + text, source-over / dual-source LCD */
     ZGL_MODE_REPLACE,
-    ZGL_MODE_TEXT,
     ZGL_MODE_UNION
 } zgl_mode;
 
@@ -192,9 +192,9 @@ static void zgl_blurs_drop_all(void) {
 }
 
 static struct {
-    zgl_uint prog_shape, prog_text, vao, vao_text, vbo;
+    zgl_uint prog_shape, vao[ZGL_RING_SLOTS], vbo[ZGL_RING_SLOTS];
     zgl_uint prog_blur, prog_blur_comp, blur_vao;
-    zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
+    zgl_int  u_viewport_shape, u_atlas1, u_atlas4, u_coverage,
              u_destination;
     zgl_int  u_blur_tex, u_blur_uvrect, u_blur_step, u_blur_clamp, u_blur_mode;
     zgl_int  u_bcomp_tex, u_bcomp_vp, u_bcomp_rect, u_bcomp_uvrect, u_bcomp_shape, u_bcomp_clip;
@@ -205,8 +205,8 @@ static struct {
     zgl_uint bitmap_tex;
     float   *verts;
     size_t   count, cap;             /* in floats */
-    size_t   vbo_cap_verts;          /* streaming VBO ring capacity in vertices */
-    size_t   vbo_vert_off;           /* current write cursor in vertices */
+    size_t   vbo_cap_quads[ZGL_RING_SLOTS];
+    int      ring_idx;
     int      has_shader_over;
     float    over_x0, over_y0, over_x1, over_y1;
     zgl_mode mode;
@@ -218,8 +218,8 @@ static struct {
     zgl_uint st_vao;
     int      st_vp_w, st_vp_h;
     int      st_shape_vp_w, st_shape_vp_h;
-    int      st_text_vp_w, st_text_vp_h;
-    int      st_blend;     /* 0=unknown, 1=off, 2=alpha, 3=text, 4=union_max */
+    int      st_blend;     /* 0=unknown, 1=off, 2=unified_blend, 4=union_max */
+    int      st_atlases_bound;
 } g_zgl;
 
 static void zgl_invalidate_state(void) {
@@ -230,9 +230,8 @@ static void zgl_invalidate_state(void) {
     g_zgl.st_vp_h = 0;
     g_zgl.st_shape_vp_w = 0;
     g_zgl.st_shape_vp_h = 0;
-    g_zgl.st_text_vp_w = 0;
-    g_zgl.st_text_vp_h = 0;
     g_zgl.st_blend = 0;
+    g_zgl.st_atlases_bound = 0;
 }
 
 #include "gui_gl_shaders.c"
@@ -442,35 +441,27 @@ static void zgl_flush(void) {
         g_zgl.st_vp_w = t->w;
         g_zgl.st_vp_h = t->h;
     }
-    zgl_uint want_vao = (g_zgl.mode == ZGL_MODE_TEXT) ? g_zgl.vao_text : g_zgl.vao;
-    if (g_zgl.st_vao != want_vao) {
-        gl.BindVertexArray(want_vao);
-        g_zgl.st_vao = want_vao;
+    const size_t qstride = (size_t)ZGL_IF * sizeof(float);
+    size_t nquads = g_zgl.count / ZGL_IF;
+    size_t vbytes = nquads * qstride;
+    int slot = g_zgl.ring_idx;
+    g_zgl.ring_idx = (slot + 1) & (ZGL_RING_SLOTS - 1);
+    zgl_uint cur_vao = g_zgl.vao[slot];
+    zgl_uint cur_vbo = g_zgl.vbo[slot];
+    if (g_zgl.st_vao != cur_vao) {
+        gl.BindVertexArray(cur_vao);
+        g_zgl.st_vao = cur_vao;
     }
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    const size_t vstride = (size_t)ZGL_VF * sizeof(float);
-    size_t nverts = g_zgl.count / ZGL_VF;
-    size_t vbytes = nverts * vstride;
-    zgl_int first_vert = 0;
+    gl.BindBuffer(ZGL_ARRAY_BUFFER, cur_vbo);
     if (gl.BufferSubData) {
-        if (nverts > g_zgl.vbo_cap_verts) {
-            size_t new_cap = 16384; /* ~2.2 MiB streaming ring */
-            while (new_cap < nverts) new_cap *= 2;
-            gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)(new_cap * vstride),
+        if (nquads > g_zgl.vbo_cap_quads[slot]) {
+            size_t new_cap = g_zgl.vbo_cap_quads[slot] ? g_zgl.vbo_cap_quads[slot] : 2048;
+            while (new_cap < nquads) new_cap *= 2;
+            gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)(new_cap * qstride),
                           NULL, ZGL_STREAM_DRAW);
-            g_zgl.vbo_cap_verts = new_cap;
-            g_zgl.vbo_vert_off = 0;
-        } else if (g_zgl.vbo_vert_off + nverts > g_zgl.vbo_cap_verts) {
-            gl.BufferData(ZGL_ARRAY_BUFFER,
-                          (zgl_sizeiptr)(g_zgl.vbo_cap_verts * vstride),
-                          NULL, ZGL_STREAM_DRAW);
-            g_zgl.vbo_vert_off = 0;
+            g_zgl.vbo_cap_quads[slot] = new_cap;
         }
-        first_vert = (zgl_int)g_zgl.vbo_vert_off;
-        gl.BufferSubData(ZGL_ARRAY_BUFFER,
-                         (zgl_sizeiptr)(g_zgl.vbo_vert_off * vstride),
-                         (zgl_sizeiptr)vbytes, g_zgl.verts);
-        g_zgl.vbo_vert_off += nverts;
+        gl.BufferSubData(ZGL_ARRAY_BUFFER, 0, (zgl_sizeiptr)vbytes, g_zgl.verts);
     } else {
         gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)vbytes,
                       g_zgl.verts, ZGL_STREAM_DRAW);
@@ -478,21 +469,94 @@ static void zgl_flush(void) {
     int shader_over = g_zgl.has_shader_over;
     static zgl_uint snap_tex, snap_fbo; static int snap_w, snap_h;
 
-    if (g_zgl.mode == ZGL_MODE_TEXT) {
-        if (g_zgl.st_prog != g_zgl.prog_text) {
-            gl.UseProgram(g_zgl.prog_text);
-            g_zgl.st_prog = g_zgl.prog_text;
-        }
-        if (g_zgl.st_text_vp_w != t->w || g_zgl.st_text_vp_h != t->h) {
-            gl.Uniform2f(g_zgl.u_viewport_text, (float)t->w, (float)t->h);
-            g_zgl.st_text_vp_w = t->w;
-            g_zgl.st_text_vp_h = t->h;
-        }
-        gl.ActiveTexture(ZGL_TEXTURE0);
+    if (g_zgl.st_prog != g_zgl.prog_shape) {
+        gl.UseProgram(g_zgl.prog_shape);
+        g_zgl.st_prog = g_zgl.prog_shape;
+    }
+    if (g_zgl.st_shape_vp_w != t->w || g_zgl.st_shape_vp_h != t->h) {
+        gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
+        g_zgl.st_shape_vp_w = t->w;
+        g_zgl.st_shape_vp_h = t->h;
+    }
+    if (!g_zgl.st_atlases_bound) {
+        gl.ActiveTexture(ZGL_TEXTURE3);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas1);
-        gl.ActiveTexture(ZGL_TEXTURE1);
+        gl.ActiveTexture(ZGL_TEXTURE4);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
-        if (g_zgl.st_blend != 3) {
+        g_zgl.st_atlases_bound = 1;
+    }
+    gl.ActiveTexture(ZGL_TEXTURE0);
+    if (g_zgl.mode == ZGL_MODE_UNION) {
+        gl.BindTexture(ZGL_TEXTURE_2D, 0);
+    } else if (shader_over) {
+        if (snap_w != t->w || snap_h != t->h) {
+            if (snap_tex) { gl.DeleteTextures(1, &snap_tex); gl.DeleteFramebuffers(1, &snap_fbo); snap_tex = snap_fbo = 0; }
+            snap_w = snap_h = 0;
+            gl.GenTextures(1, &snap_tex);
+            gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+            zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
+            gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, t->w, t->h, 0,
+                          color_fmt, ZGL_UNSIGNED_BYTE, NULL);
+            gl.GenFramebuffers(1, &snap_fbo);
+            gl.BindFramebuffer(ZGL_FRAMEBUFFER, snap_fbo);
+            gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+                                    ZGL_TEXTURE_2D, snap_tex, 0);
+            if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
+                gl.DeleteFramebuffers(1, &snap_fbo); gl.DeleteTextures(1, &snap_tex);
+                snap_tex = snap_fbo = 0; snap_w = snap_h = 0;
+            } else snap_w = t->w, snap_h = t->h;
+        } else {
+            gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
+        }
+        if (snap_tex) {
+            int bx0 = clamp_i((int)floorf(g_zgl.over_x0) - 1, 0, t->w);
+            int by0 = clamp_i((int)floorf(g_zgl.over_y0) - 1, 0, t->h);
+            int bx1 = clamp_i((int)ceilf(g_zgl.over_x1) + 1, 0, t->w);
+            int by1 = clamp_i((int)ceilf(g_zgl.over_y1) + 1, 0, t->h);
+            if (bx1 > bx0 && by1 > by0) {
+                int gy0 = t->h - by1;
+                int gy1 = t->h - by0;
+                gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
+                gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, snap_fbo);
+                gl.BlitFramebuffer(bx0, gy0, bx1, gy1, bx0, gy0, bx1, gy1,
+                                   ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+                gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+            }
+            gl.ActiveTexture(ZGL_TEXTURE1);
+            gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
+            gl.ActiveTexture(ZGL_TEXTURE0);
+        } else {
+            shader_over = 0;
+        }
+    }
+    if (g_zgl.mode != ZGL_MODE_UNION) {
+        gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
+    }
+    if (g_zgl.bitmap_tex) {
+        gl.ActiveTexture(ZGL_TEXTURE2);
+        gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
+        gl.ActiveTexture(ZGL_TEXTURE0);
+    }
+    if (g_zgl.mode == ZGL_MODE_UNION) {
+        if (g_zgl.st_blend != 4) {
+            gl.Enable(ZGL_BLEND);
+            zgl_blend_equation(ZGL_MAX);
+            gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                 ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+            g_zgl.st_blend = 4;
+        }
+    } else if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
+        if (g_zgl.st_blend != 1) {
+            zgl_blend_equation(ZGL_FUNC_ADD);
+            gl.Disable(ZGL_BLEND);
+            g_zgl.st_blend = 1;
+        }
+    } else {
+        if (g_zgl.st_blend != 2) {
             zgl_blend_equation(ZGL_FUNC_ADD);
             gl.Enable(ZGL_BLEND);
             if (g_zgl.is_gles) {
@@ -500,102 +564,13 @@ static void zgl_flush(void) {
                                      ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
             } else {
                 gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
-                                     ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
+                                     ZGL_ONE, ZGL_ONE_MINUS_SRC1_ALPHA);
             }
-            g_zgl.st_blend = 3;
-        }
-    } else {
-        if (g_zgl.st_prog != g_zgl.prog_shape) {
-            gl.UseProgram(g_zgl.prog_shape);
-            g_zgl.st_prog = g_zgl.prog_shape;
-        }
-        if (g_zgl.st_shape_vp_w != t->w || g_zgl.st_shape_vp_h != t->h) {
-            gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
-            g_zgl.st_shape_vp_w = t->w;
-            g_zgl.st_shape_vp_h = t->h;
-        }
-        gl.ActiveTexture(ZGL_TEXTURE0);
-        if (g_zgl.mode == ZGL_MODE_UNION) {
-            gl.BindTexture(ZGL_TEXTURE_2D, 0);
-        } else if (shader_over) {
-            if (snap_w != t->w || snap_h != t->h) {
-                if (snap_tex) { gl.DeleteTextures(1, &snap_tex); gl.DeleteFramebuffers(1, &snap_fbo); snap_tex = snap_fbo = 0; }
-                snap_w = snap_h = 0;
-                gl.GenTextures(1, &snap_tex);
-                gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
-                gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
-                gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
-                gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
-                gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
-                zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
-                gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, t->w, t->h, 0,
-                              color_fmt, ZGL_UNSIGNED_BYTE, NULL);
-                gl.GenFramebuffers(1, &snap_fbo);
-                gl.BindFramebuffer(ZGL_FRAMEBUFFER, snap_fbo);
-                gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
-                                        ZGL_TEXTURE_2D, snap_tex, 0);
-                if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
-                    gl.DeleteFramebuffers(1, &snap_fbo); gl.DeleteTextures(1, &snap_tex);
-                    snap_tex = snap_fbo = 0; snap_w = snap_h = 0;
-                } else snap_w = t->w, snap_h = t->h;
-            } else {
-                gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
-            }
-            if (snap_tex) {
-                int bx0 = clamp_i((int)floorf(g_zgl.over_x0) - 1, 0, t->w);
-                int by0 = clamp_i((int)floorf(g_zgl.over_y0) - 1, 0, t->h);
-                int bx1 = clamp_i((int)ceilf(g_zgl.over_x1) + 1, 0, t->w);
-                int by1 = clamp_i((int)ceilf(g_zgl.over_y1) + 1, 0, t->h);
-                if (bx1 > bx0 && by1 > by0) {
-                    int gy0 = t->h - by1;
-                    int gy1 = t->h - by0;
-                    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
-                    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, snap_fbo);
-                    gl.BlitFramebuffer(bx0, gy0, bx1, gy1, bx0, gy0, bx1, gy1,
-                                       ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
-                    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-                }
-                gl.ActiveTexture(ZGL_TEXTURE1);
-                gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
-                gl.ActiveTexture(ZGL_TEXTURE0);
-            } else {
-                shader_over = 0;
-            }
-        }
-        if (g_zgl.mode != ZGL_MODE_UNION) {
-            gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
-        }
-        if (g_zgl.bitmap_tex) {
-            gl.ActiveTexture(ZGL_TEXTURE2);
-            gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
-            gl.ActiveTexture(ZGL_TEXTURE0);
-        }
-        if (g_zgl.mode == ZGL_MODE_UNION) {
-            if (g_zgl.st_blend != 4) {
-                gl.Enable(ZGL_BLEND);
-                zgl_blend_equation(ZGL_MAX);
-                gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
-                                     ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
-                g_zgl.st_blend = 4;
-            }
-        } else if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
-            if (g_zgl.st_blend != 1) {
-                zgl_blend_equation(ZGL_FUNC_ADD);
-                gl.Disable(ZGL_BLEND);
-                g_zgl.st_blend = 1;
-            }
-        } else {
-            if (g_zgl.st_blend != 2) {
-                zgl_blend_equation(ZGL_FUNC_ADD);
-                gl.Enable(ZGL_BLEND);
-                gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
-                                     ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
-                g_zgl.st_blend = 2;
-            }
+            g_zgl.st_blend = 2;
         }
     }
 
-    gl.DrawArrays(ZGL_TRIANGLES, first_vert, (zgl_sizei)nverts);
+    gl.DrawArraysInstanced(ZGL_TRIANGLE_STRIP, 0, 4, (zgl_sizei)nquads);
     g_zgl.count = 0;
     g_zgl.has_shader_over = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
@@ -662,58 +637,41 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         }
     }
 
-    if (g_zgl.count + (size_t)ZGL_VF * 6 > g_zgl.cap) {
+    if (g_zgl.count + (size_t)ZGL_IF > g_zgl.cap) {
         size_t cap = g_zgl.cap * 2;
         float *grown = (float *)realloc(g_zgl.verts, cap * sizeof(float));
         if (grown) { g_zgl.verts = grown; g_zgl.cap = cap; }
-        else { zgl_flush(); if (g_zgl.count + (size_t)ZGL_VF * 6 > g_zgl.cap) return; }
+        else { zgl_flush(); if (g_zgl.count + (size_t)ZGL_IF > g_zgl.cap) return; }
     }
-
-    const float corner[6][2] = {
-        { x0, y0 }, { x1, y0 }, { x1, y1 },
-        { x0, y0 }, { x1, y1 }, { x0, y1 },
-    };
-    float du = (q->u1 - q->u0), dv = (q->v1 - q->v0);
-    float qw = (x1 - x0), qh = (y1 - y0);
-    (void)qw; (void)qh;
-
-    float inv_2hw = (q->hw > 0.0f) ? (1.0f / (2.0f * q->hw)) : 0.0f;
-    float inv_2hh = (q->hh > 0.0f) ? (1.0f / (2.0f * q->hh)) : 0.0f;
-    float min_x = q->cx - q->hw;
-    float min_y = q->cy - q->hh;
 
     typedef struct { float d[4]; } zgl_v4;
-    zgl_v4 c0 = *(const zgl_v4 *)q->col0;
-    zgl_v4 c1 = *(const zgl_v4 *)q->col1;
-    zgl_v4 c2 = *(const zgl_v4 *)q->col2;
-    zgl_v4 sg = *(const zgl_v4 *)q->seg;
-    float clip_x0 = (float)s->clip_x0, clip_y0 = (float)s->clip_y0;
-    float clip_x1 = (float)s->clip_x1, clip_y1 = (float)s->clip_y1;
-    float q_cx = q->cx, q_cy = q->cy;
-    float q_hw = q->hw, q_hh = q->hh;
-    float q_radius = q->radius, q_stroke = q->stroke;
-    float q_kind = (float)q->kind, q_p0 = q->p0, q_p1 = q->p1, q_p2 = q->p2;
-
-    for (int i = 0; i < 6; i++) {
-        float *v = g_zgl.verts + g_zgl.count;
-        float px = corner[i][0], py = corner[i][1];
-        v[0] = px;            v[1] = py;
-        v[2] = q_cx;          v[3] = q_cy;
-        v[4] = q_hw;          v[5] = q_hh;
-        v[6] = q_radius;      v[7] = q_stroke;
-        v[8] = q_kind;        v[9] = q_p0; v[10] = q_p1; v[11] = q_p2;
-        *(zgl_v4 *)(v + 12) = c0;
-        *(zgl_v4 *)(v + 16) = c1;
-        *(zgl_v4 *)(v + 20) = c2;
-        v[24] = clip_x0;      v[25] = clip_y0;
-        v[26] = clip_x1;      v[27] = clip_y1;
-        *(zgl_v4 *)(v + 28) = sg;
-        float fu = (inv_2hw > 0.0f) ? (px - min_x) * inv_2hw : 0.0f;
-        float fv = (inv_2hh > 0.0f) ? (py - min_y) * inv_2hh : 0.0f;
-        v[32] = q->u0 + du * fu;
-        v[33] = q->v0 + dv * fv;
-        g_zgl.count += ZGL_VF;
+    float *v = g_zgl.verts + g_zgl.count;
+    v[0] = x0; v[1] = y0; v[2] = x1; v[3] = y1;
+    float du = q->u1 - q->u0, dv = q->v1 - q->v0;
+    if (du != 0.0f || dv != 0.0f) {
+        float inv_2hw = (q->hw > 0.0f) ? (1.0f / (2.0f * q->hw)) : 0.0f;
+        float inv_2hh = (q->hh > 0.0f) ? (1.0f / (2.0f * q->hh)) : 0.0f;
+        float min_x = q->cx - q->hw;
+        float min_y = q->cy - q->hh;
+        v[4] = q->u0 + du * ((x0 - min_x) * inv_2hw);
+        v[5] = q->v0 + dv * ((y0 - min_y) * inv_2hh);
+        v[6] = q->u0 + du * ((x1 - min_x) * inv_2hw);
+        v[7] = q->v0 + dv * ((y1 - min_y) * inv_2hh);
+    } else {
+        v[4] = q->u0; v[5] = q->v0; v[6] = q->u0; v[7] = q->v0;
     }
+    v[8]  = q->cx;          v[9]  = q->cy;
+    v[10] = q->hw;          v[11] = q->hh;
+    v[12] = q->radius;      v[13] = q->stroke;
+    v[14] = (float)q->kind; v[15] = q->p0;
+    v[16] = q->p1;          v[17] = q->p2;
+    *(zgl_v4 *)(v + 18) = *(const zgl_v4 *)q->col0;
+    *(zgl_v4 *)(v + 22) = *(const zgl_v4 *)q->col1;
+    *(zgl_v4 *)(v + 26) = *(const zgl_v4 *)q->col2;
+    v[30] = cx0;            v[31] = cy0;
+    v[32] = cx1;            v[33] = cy1;
+    *(zgl_v4 *)(v + 34) = *(const zgl_v4 *)q->seg;
+    g_zgl.count += ZGL_IF;
 }
 
 /* primitives */
@@ -802,17 +760,19 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
 
     /* Shelf allocation is strictly monotonic until zgl_atlas_reset() (which already
      * flushes), so this TexSubImage2D writes into disjoint unused texels and does not
-     * need to break the active text draw batch. */
-    gl.ActiveTexture(ZGL_TEXTURE0);
+     * need to break the active unified draw batch. */
+    gl.ActiveTexture(shelf ? ZGL_TEXTURE4 : ZGL_TEXTURE3);
     gl.BindTexture(ZGL_TEXTURE_2D, shelf ? g_zgl.atlas4 : g_zgl.atlas1);
     gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, slot->x, slot->y, slot->w, slot->h,
-                     shelf ? ZGL_BGRA : ZGL_RED, ZGL_UNSIGNED_BYTE, tile->cov);
+                     shelf ? (g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA) : ZGL_RED,
+                     ZGL_UNSIGNED_BYTE, tile->cov);
+    gl.ActiveTexture(ZGL_TEXTURE0);
     return slot;
 }
 
 static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     if (!run || run->count <= 0) return;
-    if (!zgl_begin(s, ZGL_MODE_TEXT)) { cpu_glyph_run(s, run); return; }
+    if (!zgl_begin(s, ZGL_MODE_BLEND)) { cpu_glyph_run(s, run); return; }
     u32 color = run->color;
     if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;
     const float inv_dim = 1.0f / (float)ZGL_ATLAS_DIM;
@@ -1440,9 +1400,7 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
         gl.Uniform4f(g_zgl.u_bcomp_clip, (float)s->clip_x0, (float)s->clip_y0,
                      (float)s->clip_x1, (float)s->clip_y1);
         gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
-        gl.BindVertexArray(g_zgl.vao);
-        gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-        g_zgl.st_vao = g_zgl.vao;
+        g_zgl.st_vao = 0;
         g_zgl.st_prog = 0;
         g_zgl.st_blend = 0;
         g_zgl.mode = ZGL_MODE_NONE;
@@ -1588,10 +1546,8 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
                  (float)s->clip_x1, (float)s->clip_y1);
     gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
 
-    gl.BindVertexArray(g_zgl.vao);
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
     g_zgl.st_fbo = t->fbo;
-    g_zgl.st_vao = g_zgl.vao;
+    g_zgl.st_vao = 0;
     g_zgl.st_prog = 0;
     g_zgl.st_vp_w = t->w;
     g_zgl.st_vp_h = t->h;

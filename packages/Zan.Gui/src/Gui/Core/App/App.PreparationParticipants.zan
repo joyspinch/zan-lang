@@ -7,6 +7,11 @@ public partial class App {
     internal int preparingInputDepth;
     internal int inputPreparationTicket;
     internal int layoutEventRaisedCount;
+    internal bool layoutEventsDirty = true;
+    private weak Control lastLayoutEvRoot;
+    private int lastLayoutEvRootGen;
+    private int lastLayoutEvRootRev;
+    private int lastLayoutEvStructRev;
     internal bool preparingPaintParticipants;
     private bool preparedPaintSequenceValid;
     private int preparedPaintSequence;
@@ -17,6 +22,7 @@ public partial class App {
     internal int hostLayoutRevision;
     private int preparedHostRevision;
     private int preparedHostGeneration;
+    private int preparedLoopMutRev;
     private AppPreparationProof preparedHostProof;
     private List<AppPreparationProof> preparedPaintProofs;
     private int preparedLoopGeneration;
@@ -126,7 +132,29 @@ public partial class App {
         long sequence = window.EventSeq();
         int phase = inputPreparationTicket;
         int frame = frameSeq;
-        if (root != null && !root.PrepareLayoutEvents(this, true)) { return false; }
+        if (root != null) {
+            int structRev = Control.BindingStructureRevision();
+            int rootRev = root.CurrentLayoutRevision();
+            bool skipEvents = !layoutEventsDirty && snapshotInputSilenceDepth == 0
+                && root == lastLayoutEvRoot && generation == lastLayoutEvRootGen
+                && rootRev == lastLayoutEvRootRev && structRev == lastLayoutEvStructRev
+                && !this.HasOverlays() && retainedLayerWindows == null && retainedLayerQueue == null;
+            if (!skipEvents) {
+                layoutEventsDirty = false;
+                if (!root.PrepareLayoutEvents(this, true)) {
+                    layoutEventsDirty = true;
+                    return false;
+                }
+                if (snapshotInputSilenceDepth == 0) {
+                    lastLayoutEvRoot = root;
+                    lastLayoutEvRootGen = generation;
+                    lastLayoutEvRootRev = root.CurrentLayoutRevision();
+                    lastLayoutEvStructRev = Control.BindingStructureRevision();
+                } else {
+                    layoutEventsDirty = true;
+                }
+            }
+        }
         if (rootControl != root || inputRootGeneration != generation || window.EventSeq() != sequence
             || inputPreparationTicket != phase || frameSeq != frame) { return false; }
         if (overlayHost != null && !overlayHost.PrepareLayout(this)) { return false; }
@@ -267,6 +295,7 @@ public partial class App {
         preparedHostTicket = ticket;
         preparedHostGeneration = ticket != null ? ticket.generation : 0;
         preparedHostRevision = revision;
+        preparedLoopMutRev = loopMutationRev;
         preparedHostProof = proof;
         preparedPaintProofs = visited;
         preparedLoopGeneration = generation;
@@ -276,13 +305,19 @@ public partial class App {
         preparedRoot = root;
     }
     internal bool HostLayoutPrepared(AppLoopRegistration ticket) {
-        return ticket != null && preparedHostFrameValid && !preparationFrameAborted
-            && preparedHostFrame == frameSeq && preparedHostTicket == ticket
-            && ticket.generation == preparedHostGeneration
-            && this.HostPhaseCurrent(ticket, preparedHostProof, preparedHostRevision)
-            && this.PreparationProofsCurrent(preparedPaintProofs)
-            && this.PaintPreparationCurrent(preparedLoopGeneration, preparedInputTicket,
-                preparedEventSequence, preparedHostFrame, preparedRootGeneration, preparedRoot);
+        if (ticket == null || !preparedHostFrameValid || preparationFrameAborted
+            || preparedHostFrame != frameSeq || preparedHostTicket != ticket
+            || ticket.generation != preparedHostGeneration
+            || hostLayoutRevision != preparedHostRevision
+            || !isRunning || preparedLoopGeneration != loopGeneration
+            || preparedInputTicket != inputPreparationTicket
+            || preparedRootGeneration != inputRootGeneration || preparedRoot != rootControl
+            || preparedEventSequence != window.EventSeq()) { return false; }
+        if (preparedHostProof == null || !preparedHostProof.Current(this)) { return false; }
+        if (preparedLoopMutRev != loopMutationRev && this.CurrentHostLayout() != ticket) { return false; }
+        if (preparedPaintProofs != null && preparedPaintProofs.Count > 0
+            && !this.PreparationProofsCurrent(preparedPaintProofs)) { return false; }
+        return true;
     }
     public bool ContinuePreparedFrame() {
         if (preparationFrameAborted) { return false; }

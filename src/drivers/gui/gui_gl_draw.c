@@ -452,7 +452,7 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     gl.Disable(ZGL_SCISSOR_TEST);
     g_zgl.mode = ZGL_MODE_UNION;
     off = 0;
-    const size_t chunk_floats = (size_t)16384 * (size_t)ZGL_VF * 6;
+    const size_t chunk_floats = (size_t)16384 * (size_t)ZGL_IF;
     for (int p = 0; p < n_paths; p++) {
         int n = counts[p];
         for (int i = 0; n >= 2 && i + 1 < n; i++) {

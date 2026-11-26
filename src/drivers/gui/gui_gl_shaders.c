@@ -4,7 +4,8 @@
 
 static const char *ZGL_VS_BODY =
 "uniform vec2 uViewport;\n"
-"in vec2 a_pos;\n"
+"in vec4 a_rect;\n"    /* x0, y0, x1, y1 (clipped quad bounds) */
+"in vec4 a_uvrect;\n"  /* u0, v0, u1, v1 */
 "in vec2 a_center;\n"
 "in vec4 a_shape;\n"   /* halfW, halfH, radius, stroke */
 "in vec4 a_kind;\n"    /* kind, p0, p1, p2 */
@@ -13,7 +14,6 @@ static const char *ZGL_VS_BODY =
 "in vec4 a_col2;\n"
 "in vec4 a_clip;\n"    /* x0, y0, x1, y1 (exclusive) */
 "in vec4 a_seg;\n"
-"in vec2 a_uv;\n"
 "flat out vec2 v_center;\n"
 "flat out vec4 v_shape;\n"
 "flat out vec4 v_kind;\n"
@@ -24,11 +24,14 @@ static const char *ZGL_VS_BODY =
 "flat out vec4 v_seg;\n"
 "out vec2 v_uv;\n"
 "void main() {\n"
+"    vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));\n"
+"    vec2 pos = mix(a_rect.xy, a_rect.zw, corner);\n"
+"    v_uv = mix(a_uvrect.xy, a_uvrect.zw, corner);\n"
 "    v_center = a_center; v_shape = a_shape; v_kind = a_kind;\n"
 "    v_col0 = a_col0; v_col1 = a_col1; v_col2 = a_col2;\n"
-"    v_clip = a_clip; v_seg = a_seg; v_uv = a_uv;\n"
-"    vec2 ndc = vec2(a_pos.x / uViewport.x * 2.0 - 1.0,\n"
-"                    1.0 - a_pos.y / uViewport.y * 2.0);\n"
+"    v_clip = a_clip; v_seg = a_seg;\n"
+"    vec2 ndc = vec2(pos.x / uViewport.x * 2.0 - 1.0,\n"
+"                    1.0 - pos.y / uViewport.y * 2.0);\n"
 "    gl_Position = vec4(ndc, 0.0, 1.0);\n"
 "}\n";
 
@@ -54,6 +57,8 @@ ZGL_FS_COMMON
 "uniform sampler2D uCoverage;\n"
 "uniform sampler2D uDestination;\n"
 "uniform sampler2D uAtlas2;\n"
+"uniform sampler2D uAtlas1;\n"
+"uniform sampler2D uAtlas4;\n"
 "vec4 over(vec4 src) {\n"
 "    vec4 dst = texelFetch(uDestination, ivec2(gl_FragCoord.xy), 0);\n"
 "    vec4 s = floor(clamp(src, 0.0, 1.0)*255.0 + 0.0001);\n"
@@ -64,7 +69,14 @@ ZGL_FS_COMMON
 "    \n"
 "    return vec4(floor((s.rgb*s.a+d.rgb*da)/a), a)/255.0;\n"
 "}\n"
+"#if ZGL_DUAL_SOURCE\n"
+"layout(location = 0, index = 0) out vec4 o_color;\n"
+"layout(location = 0, index = 1) out vec4 o_cov;\n"
+"void zemit(vec4 c) { o_color = c; o_cov = vec4(c.a); }\n"
+"#else\n"
 "out vec4 o_color;\n"
+"void zemit(vec4 c) { o_color = c; }\n"
+"#endif\n"
 "float sd_round(vec2 p, vec2 half_, float r, int mask) {\n"
 "    float rr = r;\n"
 "    int bit = (p.x < 0.0) ? ((p.y < 0.0) ? 1 : 8) : ((p.y < 0.0) ? 2 : 4);\n"
@@ -88,6 +100,26 @@ ZGL_FS_COMMON
 "    vec2 p = zpix();\n"
 "    zclip(p);\n"
 "    int kind = int(v_kind.x + 0.5);\n"
+"    if (kind == 5 || kind == 6) {\n"
+"        vec3 tcov = (kind == 5) ? vec3(texture(uAtlas1, v_uv).r)\n"
+"                                : texture(uAtlas4, v_uv).rgb;\n"
+"        if (tcov.r + tcov.g + tcov.b <= 0.0) discard;\n"
+"        vec3 c = tcov * v_col0.a;\n"
+"        float ca = max(max(c.r, c.g), c.b);\n"
+"#if ZGL_DUAL_SOURCE\n"
+"        o_color = vec4(v_col0.rgb, ca);\n"
+"        o_cov = vec4(c, ca);\n"
+"#else\n"
+"        o_color = vec4(v_col0.rgb, ca);\n"
+"#endif\n"
+"        return;\n"
+"    }\n"
+"    if (kind == 9) {\n"
+"        vec4 t = texture(uAtlas4, v_uv);\n"
+"        if (t.a <= 0.0) discard;\n"
+"        zemit(vec4(t.rgb, t.a * v_col0.a));\n"
+"        return;\n"
+"    }\n"
 "    vec2 lp = p - v_center;\n"
 "    if (kind == 2) lp -= vec2(0.5);\n"
 "    float cov = 0.0;\n"
@@ -95,7 +127,7 @@ ZGL_FS_COMMON
 "    if (kind == 0) {\n"
 "        int gdir = int(v_kind.w + 0.5);\n"
 "        if (v_shape.z <= 0.0 && v_shape.w <= 0.0) {\n"
-"            if (gdir < 0) { o_color = v_col0; return; }\n"
+"            if (gdir < 0) { zemit(v_col0); return; }\n"
 "            cov = 1.0;\n"
 "        } else {\n"
 "            float sd = sd_round(lp, v_shape.xy, v_shape.z, int(v_kind.y + 0.5));\n"
@@ -165,7 +197,7 @@ ZGL_FS_COMMON
 "        float alpha = fill + border;\n"
 "        if (alpha <= 0.0) discard;\n"
 "        vec4 src = vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha);\n"
-"        o_color = (kind == 8) ? over(src) : src;\n"
+"        zemit((kind == 8) ? over(src) : src);\n"
 "        return;\n"
 "    } else if (kind == 10) {\n"
 "        col = texture(uAtlas2, v_uv) * v_col0;\n"
@@ -181,7 +213,7 @@ ZGL_FS_COMMON
 "            vec4 c = texelFetch(uAtlas2, ivec2(ix, texH - 1 - iy), 0);\n"
 "            float oa = c.a * v_kind.z;\n"
 "            if (oa <= 0.001) discard;\n"
-"            o_color = vec4(c.rgb, oa);\n"
+"            zemit(vec4(c.rgb, oa));\n"
 "            return;\n"
 "        }\n"
 "        float sx = lp.x * v_seg.x + lp.y * v_seg.y + v_shape.x - 0.5;\n"
@@ -214,7 +246,7 @@ ZGL_FS_COMMON
 "            float wa = c.a * w11; aSum += wa; rgbSum += c.rgb * wa;\n"
 "        }\n"
 "        if (aSum <= 0.0019) discard;\n"
-"        o_color = vec4(rgbSum / aSum, clamp(aSum * v_kind.z, 0.0, 1.0));\n"
+"        zemit(vec4(rgbSum / aSum, clamp(aSum * v_kind.z, 0.0, 1.0)));\n"
 "        return;\n"
 "    } else if (kind == 11) {\n"
 "        float blur = v_shape.w;\n"
@@ -229,58 +261,10 @@ ZGL_FS_COMMON
 "        }\n"
 "    }\n"
 "    if (cov <= 0.0) discard;\n"
-"    o_color = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
-"                                          : vec4(col.rgb, col.a * cov);\n"
-"    if (kind == 7) o_color = over(o_color);\n"
-"}\n";
-
-/* Desktop Core 3.3 Text Fragment: 亚像素 Dual-Source LCD 混合 */
-static const char *ZGL_FS_TEXT_CORE_BODY =
-ZGL_FS_COMMON
-"uniform sampler2D uAtlas1;\n"
-"uniform sampler2D uAtlas4;\n"
-"layout(location = 0, index = 0) out vec4 o_color;\n"
-"layout(location = 0, index = 1) out vec4 o_cov;\n"
-"void main() {\n"
-"    vec2 p = zpix();\n"
-"    zclip(p);\n"
-"    int kind = int(v_kind.x + 0.5);\n"
-"    if (kind == 9) {\n"
-"        vec4 t = texture(uAtlas4, v_uv);\n"
-"        if (t.a <= 0.0) discard;\n"
-"        o_color = vec4(t.rgb, 1.0);\n"
-"        o_cov = vec4(t.a);\n"
-"        return;\n"
-"    }\n"
-"    vec3 cov = (kind == 5) ? vec3(texture(uAtlas1, v_uv).r)\n"
-"                           : texture(uAtlas4, v_uv).rgb;\n"
-"    if (cov.r + cov.g + cov.b <= 0.0) discard;\n"
-"    o_color = vec4(v_col0.rgb, 1.0);\n"
-"    vec3 c = cov * v_col0.a;\n"
-"    o_cov = vec4(c, max(max(c.r, c.g), c.b));\n"
-"}\n";
-
-/* GLES 3.0 Text Fragment: 标准高移植性 Alpha 混合输出 */
-static const char *ZGL_FS_TEXT_ES_BODY =
-ZGL_FS_COMMON
-"uniform sampler2D uAtlas1;\n"
-"uniform sampler2D uAtlas4;\n"
-"out vec4 o_color;\n"
-"void main() {\n"
-"    vec2 p = zpix();\n"
-"    zclip(p);\n"
-"    int kind = int(v_kind.x + 0.5);\n"
-"    if (kind == 9) {\n"
-"        vec4 t = texture(uAtlas4, v_uv);\n"
-"        if (t.a <= 0.0) discard;\n"
-"        o_color = vec4(t.rgb, t.a * v_col0.a);\n"
-"        return;\n"
-"    }\n"
-"    vec3 cov = (kind == 5) ? vec3(texture(uAtlas1, v_uv).r)\n"
-"                           : texture(uAtlas4, v_uv).rgb;\n"
-"    if (cov.r + cov.g + cov.b <= 0.0) discard;\n"
-"    float a = (kind == 5) ? cov.r : max(max(cov.r, cov.g), cov.b);\n"
-"    o_color = vec4(v_col0.rgb, v_col0.a * a);\n"
+"    vec4 res = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
+"                                             : vec4(col.rgb, col.a * cov);\n"
+"    if (kind == 7) res = over(res);\n"
+"    zemit(res);\n"
 "}\n";
 
 /* GPU Dual-Kawase Blur shaders (GL 3.3 Core & GLES 3.0 compatible) */
@@ -419,9 +403,9 @@ static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
 
 static void zgl_bind_attribs(zgl_uint prog) {
     struct { const char *name; int size; } a[] = {
-        { "a_pos", 2 }, { "a_center", 2 }, { "a_shape", 4 }, { "a_kind", 4 },
-        { "a_col0", 4 }, { "a_col1", 4 }, { "a_col2", 4 }, { "a_clip", 4 },
-        { "a_seg", 4 }, { "a_uv", 2 },
+        { "a_rect", 4 }, { "a_uvrect", 4 }, { "a_center", 2 }, { "a_shape", 4 },
+        { "a_kind", 4 }, { "a_col0", 4 }, { "a_col1", 4 }, { "a_col2", 4 },
+        { "a_clip", 4 }, { "a_seg", 4 },
     };
     size_t off = 0;
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); i++) {
@@ -429,8 +413,9 @@ static void zgl_bind_attribs(zgl_uint prog) {
         if (loc >= 0) {
             gl.EnableVertexAttribArray((zgl_uint)loc);
             gl.VertexAttribPointer((zgl_uint)loc, a[i].size, ZGL_FLOAT,
-                                   ZGL_FALSE, (zgl_sizei)(ZGL_VF * sizeof(float)),
+                                   ZGL_FALSE, (zgl_sizei)(ZGL_IF * sizeof(float)),
                                    (const void *)(off * sizeof(float)));
+            gl.VertexAttribDivisor((zgl_uint)loc, 1);
         }
         off += (size_t)a[i].size;
     }
@@ -457,6 +442,7 @@ static int zgl_init(void) {
     if (!zan_gl_ctx_create()) return 0;
     if (!zan_gl_ctx_make_current()) { zan_gl_ctx_destroy(); return 0; }
     if (!zan_gl_api_load(&gl, zan_gl_ctx_getproc)) { zan_gl_ctx_destroy(); return 0; }
+    if (!gl.DrawArraysInstanced || !gl.VertexAttribDivisor) { zan_gl_ctx_destroy(); return 0; }
     zgl_blend_equation = (void (*)(zgl_enum))zan_gl_ctx_getproc("glBlendEquation");
     if (!zgl_blend_equation) { zan_gl_ctx_destroy(); return 0; }
 
@@ -477,13 +463,12 @@ static int zgl_init(void) {
     const char *fs_head = g_zgl.is_gles
         ? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
         : "#version 330 core\n";
-    const char *fs_text_body = g_zgl.is_gles
-        ? ZGL_FS_TEXT_ES_BODY
-        : ZGL_FS_TEXT_CORE_BODY;
+    const char *fs_uber_head = g_zgl.is_gles
+        ? "#version 300 es\nprecision highp float;\nprecision highp int;\n#define ZGL_DUAL_SOURCE 0\n"
+        : "#version 330 core\n#define ZGL_DUAL_SOURCE 1\n";
 
-    g_zgl.prog_shape = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, ZGL_FS_SHAPE_BODY);
-    g_zgl.prog_text  = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, fs_text_body);
-    if (!g_zgl.prog_shape || !g_zgl.prog_text) { zan_gl_ctx_destroy(); return 0; }
+    g_zgl.prog_shape = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_uber_head, ZGL_FS_SHAPE_BODY);
+    if (!g_zgl.prog_shape) { zan_gl_ctx_destroy(); return 0; }
 
     g_zgl.prog_blur = zgl_link_parts(vs_head, ZGL_VS_BLUR_BODY, fs_head, ZGL_FS_KAWASE_BODY);
     g_zgl.prog_blur_comp = zgl_link_parts(vs_head, ZGL_VS_BLUR_COMP_BODY, fs_head, ZGL_FS_BLUR_COMP_BODY);
@@ -502,33 +487,34 @@ static int zgl_init(void) {
         g_zgl.u_bcomp_clip = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uClip");
     }
 
-    gl.GenVertexArrays(1, &g_zgl.vao);
-    gl.GenVertexArrays(1, &g_zgl.vao_text);
-    gl.GenBuffers(1, &g_zgl.vbo);
-    gl.BindVertexArray(g_zgl.vao);
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    zgl_bind_attribs(g_zgl.prog_shape);
-    gl.BindVertexArray(g_zgl.vao_text);
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    zgl_bind_attribs(g_zgl.prog_text);
-    gl.BindVertexArray(g_zgl.vao);
+    gl.GenVertexArrays(ZGL_RING_SLOTS, g_zgl.vao);
+    gl.GenBuffers(ZGL_RING_SLOTS, g_zgl.vbo);
+    for (int i = 0; i < ZGL_RING_SLOTS; i++) {
+        gl.BindVertexArray(g_zgl.vao[i]);
+        gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo[i]);
+        g_zgl.vbo_cap_quads[i] = 2048;
+        gl.BufferData(ZGL_ARRAY_BUFFER,
+                      (zgl_sizeiptr)(g_zgl.vbo_cap_quads[i] * (size_t)ZGL_IF * sizeof(float)),
+                      NULL, ZGL_STREAM_DRAW);
+        zgl_bind_attribs(g_zgl.prog_shape);
+    }
+    gl.BindVertexArray(g_zgl.vao[0]);
+    g_zgl.ring_idx = 0;
 
     g_zgl.u_viewport_shape = gl.GetUniformLocation(g_zgl.prog_shape, "uViewport");
-    g_zgl.u_viewport_text = gl.GetUniformLocation(g_zgl.prog_text, "uViewport");
     g_zgl.u_coverage = gl.GetUniformLocation(g_zgl.prog_shape, "uCoverage");
     g_zgl.u_destination = gl.GetUniformLocation(g_zgl.prog_shape, "uDestination");
     g_zgl.u_atlas2 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas2");
-    g_zgl.u_atlas1 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas1");
-    g_zgl.u_atlas4 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas4");
+    g_zgl.u_atlas1 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas1");
+    g_zgl.u_atlas4 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas4");
 
     /* Bind constant sampler texture units once for the lifetime of each program. */
     gl.UseProgram(g_zgl.prog_shape);
     if (g_zgl.u_coverage >= 0) gl.Uniform1i(g_zgl.u_coverage, 0);
     if (g_zgl.u_destination >= 0) gl.Uniform1i(g_zgl.u_destination, 1);
     if (g_zgl.u_atlas2 >= 0) gl.Uniform1i(g_zgl.u_atlas2, 2);
-    gl.UseProgram(g_zgl.prog_text);
-    if (g_zgl.u_atlas1 >= 0) gl.Uniform1i(g_zgl.u_atlas1, 0);
-    if (g_zgl.u_atlas4 >= 0) gl.Uniform1i(g_zgl.u_atlas4, 1);
+    if (g_zgl.u_atlas1 >= 0) gl.Uniform1i(g_zgl.u_atlas1, 3);
+    if (g_zgl.u_atlas4 >= 0) gl.Uniform1i(g_zgl.u_atlas4, 4);
     if (g_zgl.prog_blur && g_zgl.u_blur_tex >= 0) {
         gl.UseProgram(g_zgl.prog_blur);
         gl.Uniform1i(g_zgl.u_blur_tex, 0);
@@ -544,15 +530,9 @@ static int zgl_init(void) {
     g_zgl.atlas1 = zgl_new_atlas(ZGL_R8, ZGL_RED, ZGL_ATLAS_DIM);
     g_zgl.atlas4 = zgl_new_atlas(ZGL_RGBA8, color_fmt, ZGL_ATLAS_DIM);
 
-    g_zgl.cap = (size_t)ZGL_VF * 6 * 2048;
+    g_zgl.cap = (size_t)ZGL_IF * 2048;
     g_zgl.verts = (float *)malloc(g_zgl.cap * sizeof(float));
     if (!g_zgl.verts) { zan_gl_ctx_destroy(); return 0; }
-    g_zgl.vbo_cap_verts = 16384; /* ~2.2 MiB streaming ring */
-    g_zgl.vbo_vert_off = 0;
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    gl.BufferData(ZGL_ARRAY_BUFFER,
-                  (zgl_sizeiptr)(g_zgl.vbo_cap_verts * (size_t)ZGL_VF * sizeof(float)),
-                  NULL, ZGL_STREAM_DRAW);
 
     if (gl.GetError() != ZGL_NO_ERROR) { zan_gl_ctx_destroy(); return 0; }
     g_gl_state = 1;
