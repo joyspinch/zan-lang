@@ -219,6 +219,7 @@ typedef struct zan_mem_cache {
   char *bump;             /* owner-only: 当前 slab 未分出的页区间 */
   char *bump_end;         /* owner-only */
   char *bump_committed;   /* owner-only: Windows 已提交上界（按 64 KiB 块按需提交） */
+  uintptr_t last_slab;    /* owner-only: 最近命中的 slab 基址（免去高频释放的全局哈希探查） */
   int bump_decommitted;   /* unallocated bump pages decommitted to OS */
   uint32_t alloc_batch;   /* owner-only: 批次累计后刷入 g_small_alloc_count */
   uint32_t remote_mask;   /* 非空远端释放条带位图，免去空条带 8 次 XCHG */
@@ -232,6 +233,8 @@ typedef struct zan_mem_cache {
 static zan_mem_cache *g_cache_pool;
 static zan_mem_slab_meta *g_reclaimed_head;
 static volatile int g_trim_lock;
+static int g_cache_init_count;
+static int g_multi_thread;
 
 static unsigned g_remote_rr;
 
@@ -471,6 +474,8 @@ static zan_mem_cache *zan_mem_cache_get(void) {
     return NULL;
 #endif
   zan_mem_lock();
+  if (++g_cache_init_count > 1)
+    __atomic_store_n(&g_multi_thread, 1, __ATOMIC_RELEASE);
   c = __atomic_load_n(&g_cache_pool, __ATOMIC_RELAXED);
   if (c)
     __atomic_store_n(&g_cache_pool, c->next_free, __ATOMIC_RELEASE);
@@ -882,6 +887,7 @@ static void *zan_mem_small_slow(zan_mem_cache *c, int cls, size_t sz) {
     }
     unsigned pi;
     zan_mem_slab_meta *m = zan_mem_meta_of(page, &pi);
+    c->last_slab = (uintptr_t)m;
     __atomic_store_n(&m->owner[pi], c, __ATOMIC_RELAXED);
     __atomic_store_n(&m->cls1[pi], (uint8_t)(cls + 1), __ATOMIC_RELEASE);
     c->page_bump[cls] = page;
@@ -1136,29 +1142,63 @@ static int zan_mem_class_or_die(const void *p) {
 void __wrap_free(void *p) {
   if (!p)
     return;
-  if (!zan_mem_owns(p)) {
-    __real_free(p);
-    return;
+  zan_mem_cache *self = t_cache;
+  uintptr_t base = (uintptr_t)p & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
+  if (__builtin_expect(!(self != NULL && base == self->last_slab), 0)) {
+    if (!zan_mem_owns(p)) {
+      __real_free(p);
+      return;
+    }
   }
-  int cls = zan_mem_class_or_die(p);
-  if (cls < 0)
+  unsigned pi = (unsigned)(((uintptr_t)p - base) >> ZAN_MEM_PAGE_SHIFT);
+  zan_mem_slab_meta *m = (zan_mem_slab_meta *)base;
+  int cls = -1;
+  if (__builtin_expect(pi != 0, 1)) {
+    unsigned c1 = __atomic_load_n(&m->cls1[pi], __ATOMIC_ACQUIRE);
+    if (__builtin_expect(c1 != 0 && c1 <= (unsigned)ZAN_MEM_NCLASS, 1)) {
+      unsigned off = (unsigned)((uintptr_t)p & (uintptr_t)(ZAN_MEM_PAGE - 1));
+      if (__builtin_expect((off & 15u) == 0, 1)) {
+        unsigned c = c1 - 1u;
+        unsigned q = off >> 4;
+        unsigned d = (unsigned)k_class_size[c] >> 4;
+        unsigned quot = (q * k_class_inv[c]) >> 16;
+        if (__builtin_expect(quot * d == q, 1))
+          cls = (int)c;
+      }
+    }
+  }
+  if (__builtin_expect(cls < 0, 0)) {
+    zan_mem_fatal_block("invalid free (not a block start)", p);
     return; /* 致命处理器返回时 */
+  }
   uintptr_t ck = zan_mem_cookie(p);
   uintptr_t *w = (uintptr_t *)p + 1;
+  zan_mem_cache *owner = __atomic_load_n(&m->owner[pi], __ATOMIC_RELAXED);
+  if (__builtin_expect(owner == self && self != NULL, 1)) {
+    if (__builtin_expect(!__atomic_load_n(&g_multi_thread, __ATOMIC_RELAXED),
+                         1)) {
+      if (__builtin_expect(*w == ck, 0)) {
+        zan_mem_fatal_block("double free", p);
+        return;
+      }
+      *w = ck;
+    } else if (__builtin_expect(
+                   __atomic_exchange_n(w, ck, __ATOMIC_ACQ_REL) == ck, 0)) {
+      zan_mem_fatal_block("double free", p);
+      return;
+    }
+    self->last_slab = base;
+    *(void **)p = self->free_list[cls];
+    self->free_list[cls] = p;
+    return;
+  }
+  __atomic_store_n(&g_multi_thread, 1, __ATOMIC_RELEASE);
   if (__builtin_expect(
           __atomic_exchange_n(w, ck, __ATOMIC_ACQ_REL) == ck, 0)) {
     zan_mem_fatal_block("double free", p);
     return;
   }
-  unsigned pi;
-  zan_mem_slab_meta *m = zan_mem_meta_of(p, &pi);
-  zan_mem_cache *owner = __atomic_load_n(&m->owner[pi], __ATOMIC_ACQUIRE);
-  zan_mem_cache *self = t_cache;
-  if (__builtin_expect(owner == self && self != NULL, 1)) {
-    *(void **)p = self->free_list[cls];
-    self->free_list[cls] = p;
-    return;
-  }
+  owner = __atomic_load_n(&m->owner[pi], __ATOMIC_ACQUIRE);
   if (!owner)
     return;
   unsigned s;

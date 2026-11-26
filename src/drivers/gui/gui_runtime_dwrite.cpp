@@ -147,10 +147,13 @@ struct ZanDwFormat {
     wchar_t family[64];
     float size;
     int bold;
+    unsigned long long used;
     IDWriteTextFormat *fmt;
 };
-static ZanDwFormat g_formats[8];
+static const int ZAN_DW_FORMAT_CAP = 32;
+static ZanDwFormat g_formats[ZAN_DW_FORMAT_CAP];
 static int g_format_count = 0;
+static unsigned long long g_format_clock = 0;
 
 static IDWriteTextFormat *pick_format(const wchar_t *family, float size,
                                       int bold) {
@@ -159,6 +162,7 @@ static IDWriteTextFormat *pick_format(const wchar_t *family, float size,
         if (g_formats[i].size == size
             && g_formats[i].bold == bold
             && wcscmp(g_formats[i].family, family) == 0) {
+            g_formats[i].used = ++g_format_clock;
             return g_formats[i].fmt;
         }
     }
@@ -168,16 +172,113 @@ static IDWriteTextFormat *pick_format(const wchar_t *family, float size,
         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"",
         &fmt);
     if (FAILED(hr)) return nullptr;
-    ZanDwFormat *slot = (g_format_count < 8)
-        ? &g_formats[g_format_count++]
-        : &g_formats[0];
+    ZanDwFormat *slot = nullptr;
+    if (g_format_count < ZAN_DW_FORMAT_CAP) {
+        slot = &g_formats[g_format_count++];
+    } else {
+        slot = &g_formats[0];
+        for (int i = 1; i < ZAN_DW_FORMAT_CAP; i++) {
+            if (g_formats[i].used < slot->used) slot = &g_formats[i];
+        }
+    }
     if (slot->fmt) slot->fmt->Release();
     wcsncpy(slot->family, family, 63);
     slot->family[63] = L'\0';
     slot->size = size;
     slot->bold = bold;
+    slot->used = ++g_format_clock;
     slot->fmt = fmt;
     return fmt;
+}
+
+/* 复用持久化 DWrite BitmapRenderTarget（按 64px 阶梯增长，上限 4096x512），
+ * 避免每次文本光栅化都反复 GetDC + CreateBitmapRenderTarget + CreateDIBSection + Release。 */
+static IDWriteBitmapRenderTarget *g_dw_brt = nullptr;
+static int g_dw_brt_w = 0;
+static int g_dw_brt_h = 0;
+static unsigned char *g_dw_brt_bits = nullptr;
+static int g_dw_brt_stride = 0;
+static bool g_dw_brt_top_down = true;
+
+static unsigned int g_dw_inv_alpha[256];
+static bool g_dw_inv_ready = false;
+
+static void zan_dw_init_inv_alpha() {
+    if (g_dw_inv_ready) return;
+    g_dw_inv_alpha[0] = 0;
+    for (unsigned int a = 1; a < 256; a++) {
+        g_dw_inv_alpha[a] = (255u * 65536u + a / 2u) / a;
+    }
+    g_dw_inv_ready = true;
+}
+
+static bool zan_dw_acquire_brt(int tw, int th,
+                               IDWriteBitmapRenderTarget **out_brt,
+                               bool *out_owned,
+                               unsigned char **out_bits,
+                               int *out_stride,
+                               bool *out_top_down) {
+    bool cacheable = (tw <= 4096 && th <= 512);
+    if (cacheable) {
+        if (!g_dw_brt || g_dw_brt_w < tw || g_dw_brt_h < th) {
+            int cw = ((tw + 63) / 64) * 64;
+            int ch = ((th + 63) / 64) * 64;
+            if (cw < g_dw_brt_w) cw = g_dw_brt_w;
+            if (ch < g_dw_brt_h) ch = g_dw_brt_h;
+            if (cw > 4096) cw = 4096;
+            if (ch > 512) ch = 512;
+            HDC screen = GetDC(nullptr);
+            IDWriteBitmapRenderTarget *nb = nullptr;
+            HRESULT hr = g_gdi->CreateBitmapRenderTarget(screen, cw, ch, &nb);
+            ReleaseDC(nullptr, screen);
+            if (FAILED(hr) || !nb) return false;
+            HDC mem = nb->GetMemoryDC();
+            HBITMAP bmp = (HBITMAP)GetCurrentObject(mem, OBJ_BITMAP);
+            BITMAP bm;
+            if (!GetObjectW(bmp, sizeof(bm), &bm) || !bm.bmBits) {
+                nb->Release();
+                return false;
+            }
+            if (g_dw_brt) g_dw_brt->Release();
+            g_dw_brt = nb;
+            g_dw_brt_w = cw;
+            g_dw_brt_h = ch;
+            g_dw_brt_bits = (unsigned char *)bm.bmBits;
+            g_dw_brt_stride = bm.bmWidthBytes;
+            g_dw_brt_top_down = (bm.bmHeight > 0 || bm.bmWidthBytes >= 0);
+        }
+        size_t row_bytes = (size_t)tw * 4u;
+        for (int y = 0; y < th; y++) {
+            unsigned char *row = g_dw_brt_top_down
+                ? g_dw_brt_bits + (size_t)y * (size_t)g_dw_brt_stride
+                : g_dw_brt_bits + (size_t)(g_dw_brt_h - 1 - y) * (size_t)g_dw_brt_stride;
+            memset(row, 0, row_bytes);
+        }
+        *out_brt = g_dw_brt;
+        *out_owned = false;
+        *out_bits = g_dw_brt_bits;
+        *out_stride = g_dw_brt_stride;
+        *out_top_down = g_dw_brt_top_down;
+        return true;
+    }
+    HDC screen = GetDC(nullptr);
+    IDWriteBitmapRenderTarget *brt = nullptr;
+    HRESULT hr = g_gdi->CreateBitmapRenderTarget(screen, tw, th, &brt);
+    ReleaseDC(nullptr, screen);
+    if (FAILED(hr) || !brt) return false;
+    HDC mem = brt->GetMemoryDC();
+    HBITMAP bmp = (HBITMAP)GetCurrentObject(mem, OBJ_BITMAP);
+    BITMAP bm;
+    if (!GetObjectW(bmp, sizeof(bm), &bm) || !bm.bmBits) {
+        brt->Release();
+        return false;
+    }
+    *out_brt = brt;
+    *out_owned = true;
+    *out_bits = (unsigned char *)bm.bmBits;
+    *out_stride = bm.bmWidthBytes;
+    *out_top_down = (bm.bmHeight > 0 || bm.bmWidthBytes >= 0);
+    return true;
 }
 
 extern "C" int zan_dw_text_width(const wchar_t *w, int len,
@@ -230,55 +331,47 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
         lay->Release();
         return 0;
     }
-    HDC screen = GetDC(nullptr);
     IDWriteBitmapRenderTarget *brt = nullptr;
-    HRESULT hr2 = g_gdi->CreateBitmapRenderTarget(screen, tw, th, &brt);
-    HRESULT hr = hr2;
-    ReleaseDC(nullptr, screen);
-    if (FAILED(hr) || !brt) {
+    bool owned = false;
+    unsigned char *src_bits = nullptr;
+    int stride = 0;
+    bool top_down = true;
+    if (!zan_dw_acquire_brt(tw, th, &brt, &owned, &src_bits, &stride, &top_down)) {
         lay->Release();
         return 0;
     }
     ZanDwRenderer renderer(brt, g_params);
     lay->Draw(nullptr, &renderer, 0.0f, baseline + 1.0f);
 
-    /* Read the render target's 32bpp premultiplied BGRA DIB section: the
-     * alpha channel only survives a direct bits read -- GetDIBits with
-     * BI_RGB zeroes it. */
-    HDC mem = brt->GetMemoryDC();
-    HBITMAP bmp = (HBITMAP)GetCurrentObject(mem, OBJ_BITMAP);
-    BITMAP bm;
-    if (!GetObjectW(bmp, sizeof(bm), &bm) || !bm.bmBits) {
-        brt->Release();
-        lay->Release();
-        return 0;
-    }
-    int stride = bm.bmWidthBytes;
-    unsigned char *src_bits = (unsigned char *)bm.bmBits;
-    /* DWrite creates a top-down DIB; assert defensively via the sign bit. */
-    bool top_down = bm.bmHeight > 0 || stride >= 0;
-    unsigned char *buf = (unsigned char *)malloc((size_t)tw * th * 4);
+    unsigned char *buf = (unsigned char *)malloc((size_t)tw * (size_t)th * 4u);
     if (!buf) {
-        brt->Release();
+        if (owned) brt->Release();
         lay->Release();
         return 0;
     }
+    int total_h = owned ? th : g_dw_brt_h;
     for (int y = 0; y < th; y++) {
         const unsigned char *row = top_down
-            ? src_bits + (size_t)y * stride
-            : src_bits + (size_t)(th - 1 - y) * stride;
-        memcpy(buf + (size_t)y * tw * 4, row, (size_t)tw * 4);
+            ? src_bits + (size_t)y * (size_t)stride
+            : src_bits + (size_t)(total_h - 1 - y) * (size_t)stride;
+        memcpy(buf + (size_t)y * (size_t)tw * 4u, row, (size_t)tw * 4u);
     }
-    brt->Release();
+    if (owned) brt->Release();
     lay->Release();
-    /* Premultiplied BGRA -> straight BGRA. */
-    for (int i = 0; i < tw * th; i++) {
-        unsigned char a = buf[i * 4 + 3];
+    /* Premultiplied BGRA -> straight BGRA (查表定点数倒数，免逐通道整数除法). */
+    zan_dw_init_inv_alpha();
+    int total_px = tw * th;
+    for (int i = 0; i < total_px; i++) {
+        unsigned char *px = buf + (size_t)i * 4u;
+        unsigned char a = px[3];
         if (a > 0 && a < 255) {
-            for (int c = 0; c < 3; c++) {
-                unsigned v = (unsigned)buf[i * 4 + c] * 255u / a;
-                buf[i * 4 + c] = (unsigned char)(v > 255 ? 255 : v);
-            }
+            unsigned int inv = g_dw_inv_alpha[a];
+            unsigned int b = ((unsigned int)px[0] * inv + 32768u) >> 16;
+            unsigned int g = ((unsigned int)px[1] * inv + 32768u) >> 16;
+            unsigned int r = ((unsigned int)px[2] * inv + 32768u) >> 16;
+            px[0] = (unsigned char)(b > 255u ? 255u : b);
+            px[1] = (unsigned char)(g > 255u ? 255u : g);
+            px[2] = (unsigned char)(r > 255u ? 255u : r);
         }
     }
     *out_px = buf;

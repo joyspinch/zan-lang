@@ -16,12 +16,37 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMPositionBuilderAtEnd(b, entry);
   LLVMValueRef isnull =
       zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
-  LLVMBuildCondBr(b, isnull, ret, cont);
+  zan_set_branch_weights(g, LLVMBuildCondBr(b, isnull, ret, cont), 1, 2000);
   LLVMPositionBuilderAtEnd(b, cont);
   LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
   LLVMValueRef rcp =
       LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
   LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+  LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
+  if (!g->arc_guard) {
+    /* 独占快路径：读到 rc == 1 且全局无活跃弱引用时，本线程是唯一持有者，
+     * 直接写 0 + acquire fence 进 relf，免一次硬件 LOCK XADD 与二次 weak 判空。 */
+    LLVMValueRef rc_now = LLVMBuildLoad2(b, i64, rcip, "rcnow");
+    LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(rc_now, 8);
+    LLVMBasicBlockRef uniq_chk = LLVMAppendBasicBlockInContext(c, fn, "uniq.chk");
+    LLVMBasicBlockRef uniq_go = LLVMAppendBasicBlockInContext(c, fn, "uniq.go");
+    LLVMBasicBlockRef atomic_bb = LLVMAppendBasicBlockInContext(c, fn, "sub.atomic");
+    LLVMValueRef is_uniq =
+        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(i64, 1, 0), "isuniq");
+    zan_set_branch_weights(g, LLVMBuildCondBr(b, is_uniq, uniq_chk, atomic_bb),
+                           2000, 1);
+    LLVMPositionBuilderAtEnd(b, uniq_chk);
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(b, zan_emit_weak_any(g), atomic_bb, uniq_go), 1, 2000);
+    LLVMPositionBuilderAtEnd(b, uniq_go);
+    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), rcip);
+    LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(st0, 8);
+    LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
+    LLVMBuildBr(b, relf);
+    LLVMPositionBuilderAtEnd(b, atomic_bb);
+  }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
                                            LLVMConstInt(i64, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
@@ -30,17 +55,17 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMValueRef over =
       zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
   LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
-  LLVMBuildCondBr(b, over, dorel, last_bb);
+  zan_set_branch_weights(g, LLVMBuildCondBr(b, over, dorel, last_bb), 1, 2000);
   LLVMPositionBuilderAtEnd(b, last_bb);
   LLVMBasicBlockRef begin_bb = LLVMAppendBasicBlockInContext(c, fn, "begin");
   LLVMBuildCondBr(b, is1, begin_bb, ret);
   LLVMPositionBuilderAtEnd(b, begin_bb);
   LLVMBuildFence(b, LLVMAtomicOrderingAcquire, 0, "");
   /* 弱引用表为空时 destroy_begin 恒返回真：内联判空，不付调用 */
-  LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
   LLVMBasicBlockRef wcall_bb =
       LLVMAppendBasicBlockInContext(c, fn, "weak.begin.call");
-  LLVMBuildCondBr(b, zan_emit_weak_any(g), wcall_bb, relf);
+  zan_set_branch_weights(g, LLVMBuildCondBr(b, zan_emit_weak_any(g), wcall_bb, relf),
+                         1, 2000);
   LLVMPositionBuilderAtEnd(b, wcall_bb);
   LLVMValueRef weak_ok =
       zan_call2(b, LLVMGlobalGetValueType(g->rt_weak_destroy_begin),
@@ -156,12 +181,30 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMPositionBuilderAtEnd(b, entry);
   LLVMValueRef isnull =
       zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
-  LLVMBuildCondBr(b, isnull, ret, cont);
+  zan_set_branch_weights(g, LLVMBuildCondBr(b, isnull, ret, cont), 1, 2000);
   LLVMPositionBuilderAtEnd(b, cont);
   LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
   LLVMValueRef rcp =
       LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
   LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+  if (!g->arc_guard) {
+    /* 集合对象不进弱引用表：rc == 1 时本线程独占，写 0 直接进 relf（acquire fence）。 */
+    LLVMValueRef rc_now = LLVMBuildLoad2(b, i64, rcip, "rcnow");
+    LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(rc_now, 8);
+    LLVMBasicBlockRef uniq_go = LLVMAppendBasicBlockInContext(c, fn, "uniq.go");
+    LLVMBasicBlockRef atomic_bb = LLVMAppendBasicBlockInContext(c, fn, "sub.atomic");
+    LLVMValueRef is_uniq =
+        zan_icmp(b, LLVMIntEQ, rc_now, LLVMConstInt(i64, 1, 0), "isuniq");
+    zan_set_branch_weights(g, LLVMBuildCondBr(b, is_uniq, uniq_go, atomic_bb),
+                           2000, 1);
+    LLVMPositionBuilderAtEnd(b, uniq_go);
+    LLVMValueRef st0 = LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), rcip);
+    LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(st0, 8);
+    LLVMBuildBr(b, relf);
+    LLVMPositionBuilderAtEnd(b, atomic_bb);
+  }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
                                            LLVMConstInt(i64, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
@@ -170,7 +213,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
   LLVMValueRef over =
       zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
   LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
-  LLVMBuildCondBr(b, over, dorel, last_bb);
+  zan_set_branch_weights(g, LLVMBuildCondBr(b, over, dorel, last_bb), 1, 2000);
   LLVMPositionBuilderAtEnd(b, last_bb);
   LLVMBuildCondBr(b, is1, relf, ret);
   LLVMPositionBuilderAtEnd(b, relf);

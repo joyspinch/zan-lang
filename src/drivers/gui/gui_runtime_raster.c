@@ -536,6 +536,70 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
           dst[di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
                     ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
         }
+      } else if (full_y && ds == 4) {
+        const u32 *r0 = s->pixels + (y0 + sy0) * s->stride + x0;
+        const u32 *r1 = r0 + s->stride;
+        const u32 *r2 = r1 + s->stride;
+        const u32 *r3 = r2 + s->stride;
+        int full_dw = rw >> 2;
+        int di = 0;
+#if ZAN_HAS_SSE2
+        const __m128i vz = _mm_setzero_si128();
+        for (; di < full_dw; di++) {
+          int sx = di << 2;
+          __m128i v0 = _mm_loadu_si128((const __m128i *)(r0 + sx));
+          __m128i v1 = _mm_loadu_si128((const __m128i *)(r1 + sx));
+          __m128i v2 = _mm_loadu_si128((const __m128i *)(r2 + sx));
+          __m128i v3 = _mm_loadu_si128((const __m128i *)(r3 + sx));
+          __m128i sum = _mm_add_epi16(
+              _mm_add_epi16(_mm_unpacklo_epi8(v0, vz), _mm_unpackhi_epi8(v0, vz)),
+              _mm_add_epi16(_mm_unpacklo_epi8(v1, vz), _mm_unpackhi_epi8(v1, vz)));
+          sum = _mm_add_epi16(
+              sum,
+              _mm_add_epi16(
+                  _mm_add_epi16(_mm_unpacklo_epi8(v2, vz), _mm_unpackhi_epi8(v2, vz)),
+                  _mm_add_epi16(_mm_unpacklo_epi8(v3, vz), _mm_unpackhi_epi8(v3, vz))));
+          sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
+          sum = _mm_srli_epi16(sum, 4);
+          __m128i pk = _mm_packus_epi16(sum, vz);
+          dst[di] = (u32)_mm_cvtsi128_si32(pk) | 0xFF000000u;
+        }
+#else
+        for (; di < full_dw; di++) {
+          int sx = di << 2;
+          u32 sr = 0, sg = 0, sb = 0;
+          for (int k = 0; k < 4; k++) {
+            u32 p0 = r0[sx + k], p1 = r1[sx + k], p2 = r2[sx + k], p3 = r3[sx + k];
+            sr += ((p0 >> 16) & 0xFFu) + ((p1 >> 16) & 0xFFu) +
+                  ((p2 >> 16) & 0xFFu) + ((p3 >> 16) & 0xFFu);
+            sg += ((p0 >> 8) & 0xFFu) + ((p1 >> 8) & 0xFFu) +
+                  ((p2 >> 8) & 0xFFu) + ((p3 >> 8) & 0xFFu);
+            sb += (p0 & 0xFFu) + (p1 & 0xFFu) + (p2 & 0xFFu) + (p3 & 0xFFu);
+          }
+          dst[di] = 0xFF000000u | ((sr >> 4) << 16) | ((sg >> 4) << 8) | (sb >> 4);
+        }
+#endif
+        for (; di < dw; di++) {
+          int sx0 = di * ds;
+          int sx1 = sx0 + ds;
+          if (sx1 > rw)
+            sx1 = rw;
+          int sr = 0, sg = 0, sb = 0, cnt = 0;
+          for (int yy = sy0; yy < sy1; yy++) {
+            const u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+            for (int xx = sx0; xx < sx1; xx++) {
+              u32 px = row[xx];
+              sr += (px >> 16) & 0xFF;
+              sg += (px >> 8) & 0xFF;
+              sb += px & 0xFF;
+              cnt++;
+            }
+          }
+          if (cnt < 1)
+            cnt = 1;
+          dst[di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
+                    ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
+        }
       } else {
         int full_dw = full_y ? (rw / ds) : 0;
         for (int di = 0; di < full_dw; di++) {
@@ -783,6 +847,90 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
       int iwy = 256 - wy;
       int corner_row = (eff_cr > 0 && (j < eff_cr || j >= rh - eff_cr));
       int y_term = (y0 + j) * 173;
+      if (!corner_row) {
+#if ZAN_HAS_SSE2
+        const __m128i vz = _mm_setzero_si128();
+        const __m128i v_wy = _mm_set1_epi16((short)wy);
+        const __m128i v_iwy = _mm_set1_epi16((short)iwy);
+        const __m128i v_256 = _mm_set1_epi16(256);
+        int i = ci0;
+        for (; i + 1 < ci1; i += 2) {
+          int gx_a = xlut[i].gx, gx1_a = xlut[i].gx1, wx_a = xlut[i].wx;
+          int gx_b = xlut[i + 1].gx, gx1_b = xlut[i + 1].gx1, wx_b = xlut[i + 1].wx;
+          /* 垂直线性插值后右移 8 位，再做水平线性插值并右移 8 位（与原 >>16 精度对齐）。 */
+          __m128i r0_0 = _mm_unpacklo_epi8(
+              _mm_setr_epi32((int)row0[gx_a], (int)row0[gx_b], 0, 0), vz);
+          __m128i r1_0 = _mm_unpacklo_epi8(
+              _mm_setr_epi32((int)row1[gx_a], (int)row1[gx_b], 0, 0), vz);
+          __m128i r0_1 = _mm_unpacklo_epi8(
+              _mm_setr_epi32((int)row0[gx1_a], (int)row0[gx1_b], 0, 0), vz);
+          __m128i r1_1 = _mm_unpacklo_epi8(
+              _mm_setr_epi32((int)row1[gx1_a], (int)row1[gx1_b], 0, 0), vz);
+          __m128i col0 = _mm_srli_epi16(
+              _mm_add_epi16(_mm_mullo_epi16(r0_0, v_iwy), _mm_mullo_epi16(r1_0, v_wy)),
+              8);
+          __m128i col1 = _mm_srli_epi16(
+              _mm_add_epi16(_mm_mullo_epi16(r0_1, v_iwy), _mm_mullo_epi16(r1_1, v_wy)),
+              8);
+          __m128i v_wx = _mm_setr_epi16((short)wx_a, (short)wx_a, (short)wx_a, 0,
+                                        (short)wx_b, (short)wx_b, (short)wx_b, 0);
+          __m128i v_iwx = _mm_sub_epi16(v_256, v_wx);
+          __m128i pix = _mm_srli_epi16(
+              _mm_add_epi16(_mm_mullo_epi16(col0, v_iwx), _mm_mullo_epi16(col1, v_wx)),
+              8);
+          u32 u0 = (u32)(((x0 + i) * 197 + y_term) >> 3);
+          u32 u1 = (u32)(((x0 + i + 1) * 197 + y_term) >> 3);
+          int nz0 = (int)(u0 - (u32)(((uint64_t)u0 * 613566757ULL) >> 32) * 7u) - 3;
+          int nz1 = (int)(u1 - (u32)(((uint64_t)u1 * 613566757ULL) >> 32) * 7u) - 3;
+          __m128i v_nz = _mm_setr_epi16((short)nz0, (short)nz0, (short)nz0, 0,
+                                        (short)nz1, (short)nz1, (short)nz1, 0);
+          pix = _mm_add_epi16(pix, v_nz);
+          __m128i packed = _mm_packus_epi16(pix, vz);
+          u32 out0 = (u32)_mm_cvtsi128_si32(packed) | 0xFF000000u;
+          u32 out1 = (u32)_mm_cvtsi128_si32(_mm_srli_si128(packed, 4)) | 0xFF000000u;
+          dst_row[i] = out0;
+          dst_row[i + 1] = out1;
+        }
+        for (; i < ci1; i++) {
+          int gx = xlut[i].gx, gx1 = xlut[i].gx1, wx = xlut[i].wx;
+          u32 p00 = row0[gx], p01 = row0[gx1], p10 = row1[gx], p11 = row1[gx1];
+          int iwx = 256 - wx;
+          int w00 = iwx * iwy, w01 = wx * iwy, w10 = iwx * wy, w11 = wx * wy;
+          int rC = ((int)((p00 >> 16) & 0xFF) * w00 + (int)((p01 >> 16) & 0xFF) * w01 +
+                    (int)((p10 >> 16) & 0xFF) * w10 + (int)((p11 >> 16) & 0xFF) * w11) >> 16;
+          int gC = ((int)((p00 >> 8) & 0xFF) * w00 + (int)((p01 >> 8) & 0xFF) * w01 +
+                    (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
+          int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01 +
+                    (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+          u32 u = (u32)(((x0 + i) * 197 + y_term) >> 3);
+          int nz = (int)(u - (u32)(((uint64_t)u * 613566757ULL) >> 32) * 7u) - 3;
+          rC = clamp_i(rC + nz, 0, 255);
+          gC = clamp_i(gC + nz, 0, 255);
+          bC = clamp_i(bC + nz, 0, 255);
+          dst_row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+        }
+#else
+        for (int i = ci0; i < ci1; i++) {
+          int gx = xlut[i].gx, gx1 = xlut[i].gx1, wx = xlut[i].wx;
+          u32 p00 = row0[gx], p01 = row0[gx1], p10 = row1[gx], p11 = row1[gx1];
+          int iwx = 256 - wx;
+          int w00 = iwx * iwy, w01 = wx * iwy, w10 = iwx * wy, w11 = wx * wy;
+          int rC = ((int)((p00 >> 16) & 0xFF) * w00 + (int)((p01 >> 16) & 0xFF) * w01 +
+                    (int)((p10 >> 16) & 0xFF) * w10 + (int)((p11 >> 16) & 0xFF) * w11) >> 16;
+          int gC = ((int)((p00 >> 8) & 0xFF) * w00 + (int)((p01 >> 8) & 0xFF) * w01 +
+                    (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
+          int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01 +
+                    (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+          u32 u = (u32)(((x0 + i) * 197 + y_term) >> 3);
+          int nz = (int)(u - (u32)(((uint64_t)u * 613566757ULL) >> 32) * 7u) - 3;
+          rC = clamp_i(rC + nz, 0, 255);
+          gC = clamp_i(gC + nz, 0, 255);
+          bC = clamp_i(bC + nz, 0, 255);
+          dst_row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+        }
+#endif
+        continue;
+      }
       for (int i = ci0; i < ci1; i++) {
         int gx = xlut[i].gx;
         int gx1 = xlut[i].gx1;
@@ -808,12 +956,13 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
         int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01 +
                   (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >>
                  16;
-        int nz = ((((x0 + i) * 197 + y_term) >> 3) % 7) - 3;
+        u32 u = (u32)(((x0 + i) * 197 + y_term) >> 3);
+        int nz = (int)(u - (u32)(((uint64_t)u * 613566757ULL) >> 32) * 7u) - 3;
         rC = clamp_i(rC + nz, 0, 255);
         gC = clamp_i(gC + nz, 0, 255);
         bC = clamp_i(bC + nz, 0, 255);
         u32 out = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
-        if (corner_row && (i < eff_cr || i >= rw - eff_cr)) {
+        if (i < eff_cr || i >= rw - eff_cr) {
           int cov = zan_round_cov(i, j, rw, rh, eff_cr, cmask);
           if (cov >= 255)
             dst_row[i] = out;

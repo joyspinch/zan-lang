@@ -554,6 +554,7 @@ struct zan_irgen {
   bool fast_codegen;
   int codegen_level; /* --codegen-level；-1 未给（回退 ZAN_CODEGEN_LEVEL env）
                       */
+  int opt_level;    /* 实际生效的优化档（zan_opt_level_t），供分片与后端对齐 */
   bool shard_opt;   /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
   bool sharded_module; /* zan_irgen_shard_run 已拆出分片（非封闭整模块） */
   bool emit_lib;    /* 库构建模式：保持 public 成员导出链接 */

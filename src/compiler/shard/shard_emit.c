@@ -311,7 +311,23 @@ static void sh_emit_fn_decl(sh_sbuf_t *b, LLVMValueRef f) {
   free(pts);
   if (LLVMIsFunctionVarArg(ft))
     sh_sb_puts(b, "...");
-  sh_sb_puts(b, ")\n");
+  sh_sb_puts(b, ")");
+  /* 透传安全的无参函数属性，保证跨分片调用能折叠 invoke 与消除多余栈帧/异常边。 */
+  static const char *const k_safe_fn_attrs[] = {
+      "nounwind", "noreturn", "willreturn", "cold", "nosync", "nofree",
+  };
+  for (unsigned ai = 0;
+       ai < (unsigned)(sizeof(k_safe_fn_attrs) / sizeof(k_safe_fn_attrs[0]));
+       ai++) {
+    const char *an = k_safe_fn_attrs[ai];
+    unsigned ak = LLVMGetEnumAttributeKindForName(an, strlen(an));
+    if (ak && LLVMGetEnumAttributeAtIndex(
+                  f, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, ak)) {
+      sh_sb_puts(b, " ");
+      sh_sb_puts(b, an);
+    }
+  }
+  sh_sb_puts(b, "\n");
 }
 
 static void sh_emit_global_decl(sh_state_t *st, sh_sbuf_t *b, LLVMValueRef gv) {
@@ -443,11 +459,12 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx,
   /* --shard-opt 显式开启；未给时回退 ZAN_SHARD_OPT env（逃生口）。 */
   bool shard_opt = g->shard_opt || getenv("ZAN_SHARD_OPT") != NULL;
   if (g->publish_mode || g->obfuscate_strings || shard_opt) {
-    if (zan_opt_run_passes_on_module(mod, tm,
-                                     (g->publish_mode || g->obfuscate_strings)
-                                         ? ZAN_OPT_SIZE
-                                         : ZAN_OPT_FULL,
-                                     NULL) != ZAN_OK) {
+    zan_opt_level_t slvl =
+        (g->opt_level > ZAN_OPT_NONE)
+            ? (zan_opt_level_t)g->opt_level
+            : ((g->obfuscate_strings && !g->publish_mode) ? ZAN_OPT_SIZE
+                                                          : ZAN_OPT_FULL);
+    if (zan_opt_run_passes_on_module(mod, tm, slvl, NULL) != ZAN_OK) {
       st->optimizer_failed = true;
       snprintf(errbuf, errsz, "LLVM optimization failed");
       LLVMDisposeModule(mod);

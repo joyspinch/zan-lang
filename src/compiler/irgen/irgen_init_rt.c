@@ -222,10 +222,41 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "immortal");
   LLVMBasicBlockRef sub_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "sub");
-  LLVMBuildCondBr(g->builder, is_immortal, imm_bb, sub_bb);
+  LLVMBasicBlockRef free_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
+  zan_set_branch_weights(g,
+                         LLVMBuildCondBr(g->builder, is_immortal, imm_bb, sub_bb),
+                         1, 2000);
   LLVMPositionBuilderAtEnd(g->builder, imm_bb);
   LLVMBuildBr(g->builder, ret_bb);
   LLVMPositionBuilderAtEnd(g->builder, sub_bb);
+  if (!g->arc_guard && !arc_trace_ev) {
+    /* 独占快路径：读到 rc == 1 且全局无活跃弱引用时，本线程是唯一持有者，
+     * 直接写 0 后跳转 free_bb（acquire fence + free），免一次 LOCK XADD；
+     * 写 0 保证后续误二次释放仍触发 over-release 网（arc_net）。 */
+    LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
+    LLVMBasicBlockRef uniq_chk =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "uniq.chk");
+    LLVMBasicBlockRef uniq_free =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "uniq.free");
+    LLVMBasicBlockRef atomic_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "sub.atomic");
+    LLVMValueRef is_uniq =
+        zan_icmp(g->builder, LLVMIntEQ, rc_now, LLVMConstInt(i64, 1, 0), "isuniq");
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, is_uniq, uniq_chk, atomic_bb), 2000, 1);
+    LLVMPositionBuilderAtEnd(g->builder, uniq_chk);
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, zan_emit_weak_any(g), atomic_bb, uniq_free),
+        1, 2000);
+    LLVMPositionBuilderAtEnd(g->builder, uniq_free);
+    LLVMValueRef st0 =
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), rc_iptr);
+    LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(st0, 8);
+    LLVMBuildBr(g->builder, free_bb);
+    LLVMPositionBuilderAtEnd(g->builder, atomic_bb);
+  }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub,
                                            rc_iptr, LLVMConstInt(i64, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
@@ -256,8 +287,6 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
   }
   LLVMValueRef is_zero =
       zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64, 0, 0), "iszero");
-  LLVMBasicBlockRef free_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
   LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
   LLVMPositionBuilderAtEnd(g->builder, free_bb);
   LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
@@ -332,6 +361,12 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
         LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "chk");
     LLVMBasicBlockRef f_dec =
         LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fast.dec");
+    LLVMBasicBlockRef f_uchk =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fast.uchk");
+    LLVMBasicBlockRef f_uniq =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fast.uniq");
+    LLVMBasicBlockRef f_ucall =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fast.ucall");
     LLVMBasicBlockRef f_slw =
         LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "slow");
     LLVMBasicBlockRef f_ret =
@@ -339,10 +374,13 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
 
     LLVMPositionBuilderAtEnd(g->builder, f_ent);
     LLVMValueRef f_obj = LLVMGetParam(g->rt_release_dyn, 0);
-    LLVMBuildCondBr(
-        g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, f_obj, LLVMConstNull(i8ptr), "isnull"),
-        f_ret, f_cnt);
+    zan_set_branch_weights(
+        g,
+        LLVMBuildCondBr(
+            g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, f_obj, LLVMConstNull(i8ptr), "isnull"),
+            f_ret, f_cnt),
+        1, 2000);
 
     LLVMPositionBuilderAtEnd(g->builder, f_cnt);
     LLVMValueRef f_n16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
@@ -354,11 +392,14 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     LLVMValueRef f_rc = LLVMBuildLoad2(g->builder, i64, f_rcp, "rc");
     LLVMSetOrdering(f_rc, LLVMAtomicOrderingMonotonic);
     LLVMSetAlignment(f_rc, 8);
-    LLVMBuildCondBr(
-        g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, f_rc,
-                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "issent"),
-        f_ret, f_chk);
+    zan_set_branch_weights(
+        g,
+        LLVMBuildCondBr(
+            g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, f_rc,
+                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "issent"),
+            f_ret, f_chk),
+        1, 2000);
 
     LLVMPositionBuilderAtEnd(g->builder, f_chk);
     LLVMValueRef f_n8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
@@ -388,8 +429,8 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
                  "shared");
     LLVMValueRef br_fast = LLVMBuildCondBr(
         g->builder, zan_and(g->builder, f_not_arr, f_shared, "can.fast"), f_dec,
-        f_slw);
-    zan_set_branch_weights(g, br_fast, 2000, 1);
+        f_uchk);
+    zan_set_branch_weights(g, br_fast, 1000, 1000);
 
     LLVMPositionBuilderAtEnd(g->builder, f_dec);
     LLVMValueRef f_rc1 =
@@ -401,6 +442,39 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     LLVMValueRef f_ok = LLVMBuildExtractValue(g->builder, f_cx, 1, "cx.ok");
     LLVMValueRef br_ok = LLVMBuildCondBr(g->builder, f_ok, f_ret, f_slw);
     zan_set_branch_weights(g, br_ok, 2000, 1);
+
+    /* rc == 1 独占析构快路径：直接复用已加载的 f_desc 尾调 dtor，避免跳入冷慢路径
+     * 重复判空、重复读 rc/hdr/desc。字符串/数组/空 desc/over-release 仍回退 f_slw。 */
+    LLVMPositionBuilderAtEnd(g->builder, f_uchk);
+    LLVMValueRef f_is1 =
+        zan_icmp(g->builder, LLVMIntEQ, f_rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMValueRef f_not_str =
+        LLVMBuildNot(g->builder, zan_hdr_is_string(g, f_hdr, "is.str"), "not.str");
+    LLVMValueRef f_dnz =
+        zan_icmp(g->builder, LLVMIntNE, f_desc, LLVMConstInt(i64, 0, 0), "dnz");
+    LLVMValueRef f_uok = zan_and(
+        g->builder, zan_and(g->builder, f_is1, f_not_arr, "u1"),
+        zan_and(g->builder, f_not_str, f_dnz, "u2"), "can.uniq");
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, f_uok, f_uniq, f_slw), 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_uniq);
+    LLVMValueRef f_descp = LLVMBuildIntToPtr(
+        g->builder, f_desc, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+        "f.descp");
+    LLVMValueRef f_dtor = LLVMBuildLoad2(g->builder, i8ptr, f_descp, "f.dtor");
+    LLVMValueRef f_hasd =
+        zan_icmp(g->builder, LLVMIntNE, f_dtor, LLVMConstNull(i8ptr), "f.hasd");
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, f_hasd, f_ucall, f_slw), 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_ucall);
+    LLVMValueRef f_dfn =
+        LLVMBuildBitCast(g->builder, f_dtor, LLVMPointerType(reld_type, 0), "f.dfn");
+    LLVMValueRef uc =
+        zan_call2(g->builder, reld_type, f_dfn, &f_obj, 1, "");
+    LLVMSetTailCall(uc, 1);
+    LLVMBuildBr(g->builder, f_ret);
 
     LLVMPositionBuilderAtEnd(g->builder, f_slw);
     LLVMValueRef sc =
@@ -844,6 +918,30 @@ for (int rel = 0; rel < 2; rel++) {
                              "retain of an already-freed array");
     LLVMBuildBr(g->builder, ret_bb);
   } else {
+    LLVMBasicBlockRef free_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "dofree");
+    if (!g->arc_guard) {
+      /* 数组不进弱引用表：读到 rc == 1 说明本线程独占唯一引用，写 0 后直接进
+       * free_bb（acquire fence + free），免一次硬件 LOCK XADD。 */
+      LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rcnow");
+      LLVMSetOrdering(rc_now, LLVMAtomicOrderingMonotonic);
+      LLVMSetAlignment(rc_now, 8);
+      LLVMBasicBlockRef uniq_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, fn, "uniq.free");
+      LLVMBasicBlockRef atomic_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, fn, "dec.atomic");
+      LLVMValueRef is_uniq =
+          zan_icmp(g->builder, LLVMIntEQ, rc_now, LLVMConstInt(i64t, 1, 0), "isuniq");
+      zan_set_branch_weights(
+          g, LLVMBuildCondBr(g->builder, is_uniq, uniq_bb, atomic_bb), 2000, 1);
+      LLVMPositionBuilderAtEnd(g->builder, uniq_bb);
+      LLVMValueRef st0 =
+          LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), rc_iptr);
+      LLVMSetOrdering(st0, LLVMAtomicOrderingMonotonic);
+      LLVMSetAlignment(st0, 8);
+      LLVMBuildBr(g->builder, free_bb);
+      LLVMPositionBuilderAtEnd(g->builder, atomic_bb);
+    }
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(
         g->builder, LLVMAtomicRMWBinOpSub, rc_iptr, LLVMConstInt(i64t, 1, 0),
         LLVMAtomicOrderingRelease, 0);
@@ -852,8 +950,6 @@ for (int rel = 0; rel < 2; rel++) {
                              "release of an already-freed array");
     LLVMValueRef rc1 =
         zan_sub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
-    LLVMBasicBlockRef free_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, fn, "dofree");
     LLVMBuildCondBr(g->builder,
                     zan_icmp(g->builder, LLVMIntEQ, rc1,
                              LLVMConstInt(i64t, 0, 0), "iszero"),

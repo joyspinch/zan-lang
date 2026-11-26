@@ -179,15 +179,15 @@ if (irgen.cpu_profile && strcmp(irgen.cpu_profile, "baseline") == 0) {
 zan_opt_level_t effective_opt = ZAN_OPT_NONE;
 if (opt_level >= 0) {
   effective_opt = (zan_opt_level_t)opt_level;
-} else if (publish_mode) {
-  effective_opt = ZAN_OPT_SIZE;
 } else if (!debug_info) {
+  /* 发布模式与非调试默认均采用 -O2 以保障运行时吞吐；需极限体积时显式传 -Os/-Oz。 */
   effective_opt = ZAN_OPT_FULL;
 }
 if (debug_info && effective_opt > ZAN_OPT_NONE) {
   fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
   effective_opt = ZAN_OPT_NONE;
 }
+irgen.opt_level = (int)effective_opt;
 char final_link_path[1024];
 const char *obj_path = final_link_path;
 int path_len;
@@ -270,6 +270,14 @@ const bool check_elf_imports =
     lib_shared && (target.os == ZAN_OS_LINUX || target.os == ZAN_OS_OHOS);
 const bool *live_imports = NULL;
 if (!do_emit_ir && want_shard && mf_built) {
+  /* 分片拆出前整模块仍处于闭世界状态：先做一次 nothrow 标注与闭世界去虚化，
+   * 避免分片后失去全局实例化视图导致虚调用/invoke 无法折叠。 */
+  if (effective_opt > ZAN_OPT_NONE) {
+    if (!opt_knobs.no_shrink && !getenv("ZAN_NO_UNWIND_SHRINK"))
+      zan_shrink_collapse_invokes(irgen.mod);
+    if (!opt_knobs.no_devirt && !getenv("ZAN_NO_OPT_DEVIRT"))
+      (void)zan_opt_devirtualize(&irgen, NULL);
+  }
   /* A live import may disappear from the main module after sharding. */
   if (explicit_link_input_count || check_elf_imports)
     live_imports = zan_capture_live_imports(&irgen);

@@ -310,6 +310,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     tmp_ll[0] = '\0';
     FILE *body_file = NULL;
     sh_body_index_t body_idx = {0}, global_idx = {0};
+    sh_sbuf_t attr_groups = {0};
     if (!st.failed) {
         if (!obj_base || !*obj_base) {
             sh_fail(&st, "missing shard output path");
@@ -326,7 +327,8 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 body_file = fopen(tmp_ll, "rb");
                 if (!body_file) {
                     sh_fail(&st, "cannot open shard module text (errno=%d)", errno);
-                } else if (!sh_build_body_index(&body_idx, &global_idx, body_file)) {
+                } else if (!sh_build_body_index(&body_idx, &global_idx,
+                                                &attr_groups, body_file)) {
                     sh_fail(&st, "cannot build complete shard body/global index");
                 }
             }
@@ -512,7 +514,9 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             if (ff) {
                 bool wrote = (!types.n || fwrite(types.p, 1, types.n, ff) == types.n) &&
                              (!gdecls.n || fwrite(gdecls.p, 1, gdecls.n, ff) == gdecls.n) &&
-                             (!bodies.n || fwrite(bodies.p, 1, bodies.n, ff) == bodies.n);
+                             (!bodies.n || fwrite(bodies.p, 1, bodies.n, ff) == bodies.n) &&
+                             (!attr_groups.n ||
+                              fwrite(attr_groups.p, 1, attr_groups.n, ff) == attr_groups.n);
                 if (fclose(ff)) wrote = false;
                 if (!wrote) {
                     sh_fail(&st, "cannot write complete shard fragment '%s'", frag_path);
@@ -536,6 +540,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 
     sh_free_body_index(&body_idx);
     sh_free_body_index(&global_idx);
+    free(attr_groups.p);
     if (body_file) fclose(body_file);
     if (tmp_ll[0]) {
         remove(tmp_ll);

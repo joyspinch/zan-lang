@@ -3623,7 +3623,15 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
             "cgscc(inline),"
             "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
             "globaldce";
-    } else if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {
+    } else if (level == ZAN_OPT_SIZE) {
+      /* -Os 下放行已摘除临时 noinline 的核心运行库按成本模型内联（不再永远禁止），
+       * 同时保留 mergefunc/globaldce 控体积。 */
+      if (rt_unmarked || post_changed)
+        cleanup =
+            "cgscc(inline),"
+            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),mergefunc,"
+            "globaldce";
+    } else if (level == ZAN_OPT_SIZE_MIN) {
       if (rt_unmarked || post_changed)
         cleanup =
             "always-inline,"

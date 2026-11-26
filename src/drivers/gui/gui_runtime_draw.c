@@ -104,7 +104,8 @@ static void zan_shape_fill_round(zan_surface_t *s, int x, int y, int w, int h,
             if (initial) {
               zan_initial_fill_pixel(s, px, py, c, cov_i);
             } else {
-              u32 a = (sa * (u32)cov_i) / 255u;
+              u32 prod = sa * (u32)cov_i;
+              u32 a = (prod + 1u + (prod >> 8)) >> 8;
               if (a)
                 row[px] = blend_over(row[px], (a << 24) | rgb);
             }
@@ -704,7 +705,8 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
           if (cov > 0.0) {
             int cov_i = (int)(cov * 255.0);
             if (cov_i > 0) {
-              u32 a = (sa * (u32)cov_i) / 255u;
+              u32 prod = sa * (u32)cov_i;
+              u32 a = (prod + 1u + (prod >> 8)) >> 8;
               if (a)
                 row[px] = blend_over(row[px], (a << 24) | rgb);
             }
@@ -717,7 +719,8 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
           if (cov > 0.0) {
             int cov_i = (int)(cov * 255.0);
             if (cov_i > 0) {
-              u32 a = (sa * (u32)cov_i) / 255u;
+              u32 prod = sa * (u32)cov_i;
+              u32 a = (prod + 1u + (prod >> 8)) >> 8;
               if (a)
                 row[px] = blend_over(row[px], (a << 24) | rgb);
             }
@@ -869,6 +872,21 @@ EXPORT void zan_gui_draw_circle(i32 surface_id, i32 cx, i32 cy, i32 radius,
                     (int)thickness);
 }
 
+static inline u32 zan_blend_over_opaque_fast(u32 dst, u32 sr, u32 sg, u32 sb,
+                                             u32 a) {
+  u32 inv = 255u - a;
+  u32 dr = (dst >> 16) & 0xFFu;
+  u32 dg = (dst >> 8) & 0xFFu;
+  u32 db = dst & 0xFFu;
+  u32 xr = sr * a + dr * inv;
+  u32 xg = sg * a + dg * inv;
+  u32 xb = sb * a + db * inv;
+  u32 or_ = (xr + 1u + (xr >> 8)) >> 8;
+  u32 og = (xg + 1u + (xg >> 8)) >> 8;
+  u32 ob = (xb + 1u + (xb >> 8)) >> 8;
+  return 0xFF000000u | (or_ << 16) | (og << 8) | ob;
+}
+
 static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
                             u32 color, int inner_a) {
   region_write_clip(s);
@@ -877,6 +895,7 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
     return;
   int icx = cx, icy = cy;
   u32 rgb = color & 0x00FFFFFFu;
+  u32 sr = (rgb >> 16) & 0xFFu, sg = (rgb >> 8) & 0xFFu, sb = rgb & 0xFFu;
   int peak = inner_a;
   if (peak > 255)
     peak = 255;
@@ -894,6 +913,14 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
     y_lo = s->clip_y0;
   if (y_hi > s->clip_y1 - 1)
     y_hi = s->clip_y1 - 1;
+#if ZAN_HAS_SSE2
+  const __m128i v_zero = _mm_setzero_si128();
+  const __m128i v_255 = _mm_set1_epi16(255);
+  const __m128i v_one = _mm_set1_epi16(1);
+  const __m128i v_src16 = _mm_setr_epi16((short)sb, (short)sg, (short)sr, 255,
+                                         (short)sb, (short)sg, (short)sr, 255);
+  const __m128i v_amask = _mm_set1_epi32((int)0xFF000000u);
+#endif
   for (int py = y_lo; py <= y_hi; py++) {
     int dy = py - icy;
     int dy2 = dy * dy;
@@ -912,14 +939,69 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
       x_hi = s->clip_x1 - 1;
     u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
     if (use_recip) {
-      for (int px = x_lo; px <= x_hi; px++) {
+      int px = x_lo;
+#if ZAN_HAS_SSE2
+      /* SSE2 4 像素批处理：仅在 4 像素目标全不透明时走精确 0-LSB 向量混色 */
+      for (; px + 3 <= x_hi; px += 4) {
+        __m128i dst4 = _mm_loadu_si128((const __m128i *)(row + px));
+        __m128i a_eq = _mm_cmpeq_epi32(_mm_and_si128(dst4, v_amask), v_amask);
+        if (_mm_movemask_epi8(a_eq) != 0xFFFF) {
+          for (int k = 0; k < 4; k++) {
+            int dx = (px + k) - icx;
+            int rem = span - dx * dx;
+            int t = (int)(((uint64_t)rem * inv_r2) >> 40);
+            int a = (peak * t * t) >> 16;
+            if (a > 0)
+              row[px + k] = blend_over(row[px + k], ((u32)a << 24) | rgb);
+          }
+          continue;
+        }
+        int dx0 = px - icx;
+        int rem0 = span - dx0 * dx0;
+        int rem1 = span - (dx0 + 1) * (dx0 + 1);
+        int rem2 = span - (dx0 + 2) * (dx0 + 2);
+        int rem3 = span - (dx0 + 3) * (dx0 + 3);
+        int t0 = (int)(((uint64_t)rem0 * inv_r2) >> 40);
+        int t1 = (int)(((uint64_t)rem1 * inv_r2) >> 40);
+        int t2 = (int)(((uint64_t)rem2 * inv_r2) >> 40);
+        int t3 = (int)(((uint64_t)rem3 * inv_r2) >> 40);
+        int a0 = (peak * t0 * t0) >> 16;
+        int a1 = (peak * t1 * t1) >> 16;
+        int a2 = (peak * t2 * t2) >> 16;
+        int a3 = (peak * t3 * t3) >> 16;
+        if ((a0 | a1 | a2 | a3) == 0)
+          continue;
+        __m128i va_lo = _mm_setr_epi16((short)a0, (short)a0, (short)a0, 0,
+                                       (short)a1, (short)a1, (short)a1, 0);
+        __m128i va_hi = _mm_setr_epi16((short)a2, (short)a2, (short)a2, 0,
+                                       (short)a3, (short)a3, (short)a3, 0);
+        __m128i vi_lo = _mm_sub_epi16(v_255, va_lo);
+        __m128i vi_hi = _mm_sub_epi16(v_255, va_hi);
+        __m128i d_lo = _mm_unpacklo_epi8(dst4, v_zero);
+        __m128i d_hi = _mm_unpackhi_epi8(dst4, v_zero);
+        __m128i s_lo = _mm_add_epi16(_mm_mullo_epi16(v_src16, va_lo),
+                                     _mm_mullo_epi16(d_lo, vi_lo));
+        __m128i s_hi = _mm_add_epi16(_mm_mullo_epi16(v_src16, va_hi),
+                                     _mm_mullo_epi16(d_hi, vi_hi));
+        s_lo = _mm_srli_epi16(
+            _mm_add_epi16(_mm_add_epi16(s_lo, v_one), _mm_srli_epi16(s_lo, 8)), 8);
+        s_hi = _mm_srli_epi16(
+            _mm_add_epi16(_mm_add_epi16(s_hi, v_one), _mm_srli_epi16(s_hi, 8)), 8);
+        __m128i out = _mm_or_si128(_mm_packus_epi16(s_lo, s_hi), v_amask);
+        _mm_storeu_si128((__m128i *)(row + px), out);
+      }
+#endif
+      for (; px <= x_hi; px++) {
         int dx = px - icx;
         int rem = span - dx * dx;
         int t = (int)(((uint64_t)rem * inv_r2) >> 40);
         int a = (peak * t * t) >> 16;
         if (a <= 0)
           continue;
-        row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
+        u32 d = row[px];
+        row[px] = ((d >> 24) == 255u)
+                      ? zan_blend_over_opaque_fast(d, sr, sg, sb, (u32)a)
+                      : blend_over(d, ((u32)a << 24) | rgb);
       }
     } else {
       for (int px = x_lo; px <= x_hi; px++) {
@@ -929,7 +1011,10 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
         int a = (peak * t * t) >> 16;
         if (a <= 0)
           continue;
-        row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
+        u32 d = row[px];
+        row[px] = ((d >> 24) == 255u)
+                      ? zan_blend_over_opaque_fast(d, sr, sg, sb, (u32)a)
+                      : blend_over(d, ((u32)a << 24) | rgb);
       }
     }
   }

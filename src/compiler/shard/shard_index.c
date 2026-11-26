@@ -238,7 +238,7 @@ static bool sh_body_index_add(sh_body_index_t *idx, char *name,
 }
 
 static bool sh_build_body_index(sh_body_index_t *idx, sh_body_index_t *globals,
-                                 FILE *file) {
+                                sh_sbuf_t *attrs, FILE *file) {
     int cap = 1024;
     idx->mask = globals->mask = cap - 1;
     idx->keys = (char **)calloc((size_t)cap, sizeof(*idx->keys));
@@ -247,13 +247,14 @@ static bool sh_build_body_index(sh_body_index_t *idx, sh_body_index_t *globals,
     globals->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(*globals->vals));
     if (!idx->keys || !idx->vals || !globals->keys || !globals->vals) return false;
 
-    /* One module-text pass: index function bodies and complete global records.
-     * LLVM prints each global on one logical line, which may span many chunks. */
+    /* One module-text pass: index function bodies, complete global records,
+     * and top-level attribute group definitions (`attributes #N = { ... }`). */
     char chunk[16384];
     sh_sbuf_t header = {0};
     char *name = NULL;
     long long pos = 0, body_start = 0, global_start = 0;
-    bool line_start = true, in_body = false, in_header = false, in_global = false;
+    bool line_start = true, in_body = false, in_header = false, in_global = false,
+         in_attr = false;
     bool ok = true;
     while (fgets(chunk, sizeof(chunk), file)) {
         size_t n = strlen(chunk);
@@ -261,7 +262,7 @@ static bool sh_build_body_index(sh_body_index_t *idx, sh_body_index_t *globals,
             ok = false; break;
         }
         bool line_end = chunk[n - 1] == '\n';
-        if (line_start && !in_body && !in_global) {
+        if (line_start && !in_body && !in_global && !in_attr) {
             if (!strncmp(chunk, "define ", 7)) {
                 in_body = in_header = true;
                 body_start = pos;
@@ -270,9 +271,15 @@ static bool sh_build_body_index(sh_body_index_t *idx, sh_body_index_t *globals,
                 in_global = true;
                 global_start = pos;
                 header.n = 0;
+            } else if (attrs && !strncmp(chunk, "attributes #", 12)) {
+                in_attr = true;
             }
         }
-        if (in_global) {
+        if (in_attr) {
+            sh_sb_putn(attrs, chunk, n);
+            if (attrs->oom) { ok = false; break; }
+            if (line_end) in_attr = false;
+        } else if (in_global) {
             sh_sb_putn(&header, chunk, n);
             if (header.oom) { ok = false; break; }
             if (line_end) {

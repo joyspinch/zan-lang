@@ -1338,7 +1338,10 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     tm_features = "+aes";
   }
   LLVMCodeGenOptLevel cg =
-      g->fast_codegen ? LLVMCodeGenLevelNone : LLVMCodeGenLevelDefault;
+      g->fast_codegen
+          ? LLVMCodeGenLevelNone
+          : (g->publish_mode ? LLVMCodeGenLevelAggressive
+                             : LLVMCodeGenLevelDefault);
   /* 后端优化档：--codegen-level 显式优先，未给时回退 ZAN_CODEGEN_LEVEL env。 */
   int clvl = g->codegen_level;
   if (clvl < 0) {

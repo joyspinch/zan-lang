@@ -71,6 +71,37 @@ static void zgl_snapshots_drop_surface(int sid) {
     }
 }
 
+/* GPU 模糊缓存：按 slot 复用 Dual-Kawase 结果纹理，dirty == 0 时跳过降采样与多趟模糊直出合成。 */
+#define ZGL_BLUR_CACHE_SLOTS 32
+typedef struct {
+    zgl_uint tex, fbo;
+    int valid;
+    int sid, x, y, w, h, radius;
+    int bw, bh;
+    float cu0, cv0, cu1, cv1;
+} zgl_blur_cache_entry;
+static zgl_blur_cache_entry g_zgl_blurs[ZGL_BLUR_CACHE_SLOTS];
+
+static void zgl_blur_cache_drop(zgl_blur_cache_entry *c) {
+    if (c->fbo) gl.DeleteFramebuffers(1, &c->fbo);
+    if (c->tex) gl.DeleteTextures(1, &c->tex);
+    memset(c, 0, sizeof(*c));
+}
+
+static void zgl_blurs_drop_surface(int sid) {
+    for (int i = 0; i < ZGL_BLUR_CACHE_SLOTS; i++) {
+        if (g_zgl_blurs[i].fbo && g_zgl_blurs[i].sid == sid)
+            zgl_blur_cache_drop(&g_zgl_blurs[i]);
+    }
+}
+
+static void zgl_blurs_drop_all(void) {
+    for (int i = 0; i < ZGL_BLUR_CACHE_SLOTS; i++) {
+        if (g_zgl_blurs[i].fbo || g_zgl_blurs[i].tex)
+            zgl_blur_cache_drop(&g_zgl_blurs[i]);
+    }
+}
+
 static struct {
     zgl_uint prog_shape, prog_text, vao, vao_text, vbo;
     zgl_uint prog_blur, prog_blur_comp, blur_vao;
@@ -850,6 +881,7 @@ static void gl_drop_surface(zan_surface_t *s) {
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
         if (t->cov_tex) gl.DeleteTextures(1, &t->cov_tex);
         zgl_snapshots_drop_surface(s->id);
+        zgl_blurs_drop_surface(s->id);
     }
     if (g_zgl.target == s) g_zgl.target = NULL;
     free(t->shadow);
@@ -1164,11 +1196,34 @@ static int zgl_ensure_blur_targets(int need_w, int need_h) {
     return 1;
 }
 
+static int zgl_ensure_blur_cache_slot(zgl_blur_cache_entry *c, int bw, int bh) {
+    if (c->fbo && c->tex && c->bw == bw && c->bh == bh) return 1;
+    zgl_blur_cache_drop(c);
+    zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
+    gl.GenTextures(1, &c->tex);
+    gl.BindTexture(ZGL_TEXTURE_2D, c->tex);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, bw, bh, 0,
+                  color_fmt, ZGL_UNSIGNED_BYTE, NULL);
+    gl.GenFramebuffers(1, &c->fbo);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, c->fbo);
+    gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+                            ZGL_TEXTURE_2D, c->tex, 0);
+    if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
+        zgl_blur_cache_drop(c);
+        return 0;
+    }
+    c->bw = bw;
+    c->bh = bh;
+    return 1;
+}
+
 static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
                     int radius, int slot, int dirty,
                     int corner_radius, int corner_mask) {
-    (void)slot;
-    (void)dirty;
     if (!s || w <= 0 || h <= 0 || radius <= 0) return;
     if (g_gl_state <= 0 || !g_zgl.prog_blur || !g_zgl.prog_blur_comp
         || !zan_gl_ctx_make_current()) {
@@ -1186,6 +1241,38 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     zgl_target *t = zgl_target_of(s);
     if (!t) return;
     zgl_upload(s, t);
+
+    zgl_blur_cache_entry *ce =
+        (slot >= 0 && slot < ZGL_BLUR_CACHE_SLOTS) ? &g_zgl_blurs[slot] : NULL;
+    if (ce && !dirty && ce->valid && ce->tex
+        && ce->sid == s->id && ce->x == x && ce->y == y
+        && ce->w == w && ce->h == h && ce->radius == radius) {
+        /* 命中 GPU 模糊缓存：跳过降采样与 Dual-Kawase 多趟过滤，直接合成上屏。 */
+        gl.Disable(ZGL_SCISSOR_TEST);
+        gl.BindVertexArray(g_zgl.blur_vao);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+        gl.Viewport(0, 0, t->w, t->h);
+        gl.Enable(ZGL_BLEND);
+        gl.BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
+        gl.UseProgram(g_zgl.prog_blur_comp);
+        gl.ActiveTexture(ZGL_TEXTURE0);
+        gl.BindTexture(ZGL_TEXTURE_2D, ce->tex);
+        gl.Uniform1i(g_zgl.u_bcomp_tex, 0);
+        gl.Uniform2f(g_zgl.u_bcomp_vp, (float)t->w, (float)t->h);
+        gl.Uniform4f(g_zgl.u_bcomp_rect, (float)x, (float)y, (float)w, (float)h);
+        gl.Uniform4f(g_zgl.u_bcomp_uvrect, ce->cu0, ce->cv0, ce->cu1, ce->cv1);
+        gl.Uniform4f(g_zgl.u_bcomp_shape, (float)corner_radius, (float)corner_mask, 0.0f, 0.0f);
+        gl.Uniform4f(g_zgl.u_bcomp_clip, (float)s->clip_x0, (float)s->clip_y0,
+                     (float)s->clip_x1, (float)s->clip_y1);
+        gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
+        gl.BindVertexArray(g_zgl.vao);
+        gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
+        zgl_invalidate_state();
+        g_zgl.mode = ZGL_MODE_NONE;
+        t->gpu_ahead = 1;
+        s->painted = 1;
+        return;
+    }
 
     int pad = clamp_i(radius, 2, 32);
     int sx0 = clamp_i(x0 - pad, 0, s->width);
@@ -1242,10 +1329,13 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     float max_u = (float)bw * inv_cw;
     float max_v = (float)bh * inv_ch;
     float base_off = (float)radius * 0.16f + 0.5f;
+    int cached_out = (ce != NULL && zgl_ensure_blur_cache_slot(ce, bw, bh));
     for (int i = 0; i < passes; i++) {
         int nxt = 1 - cur;
         float off = base_off * (1.0f + (float)i * 0.6f);
-        gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[nxt]);
+        int is_last = (i == passes - 1);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER,
+                           (is_last && cached_out) ? ce->fbo : g_zgl.blur_fbo[nxt]);
         gl.Viewport(0, 0, bw, bh);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[cur]);
         gl.Uniform4f(g_zgl.u_blur_uvrect, 0.0f, 0.0f, max_u, max_v);
@@ -1257,20 +1347,36 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
         cur = nxt;
     }
 
+    zgl_uint comp_tex = g_zgl.blur_tex[cur];
+    float cu0, cu1, cv0, cv1;
+    if (cached_out) {
+        comp_tex = ce->tex;
+        cu0 = (float)(x - sx0) / (float)sw;
+        cu1 = (float)(x + w - sx0) / (float)sw;
+        cv0 = (float)(sy1 - (y + h)) / (float)sh;
+        cv1 = (float)(sy1 - y) / (float)sh;
+        ce->valid = 1;
+        ce->sid = s->id;
+        ce->x = x; ce->y = y; ce->w = w; ce->h = h;
+        ce->radius = radius;
+        ce->cu0 = cu0; ce->cv0 = cv0; ce->cu1 = cu1; ce->cv1 = cv1;
+    } else {
+        cu0 = ((float)(x - sx0) / (float)sw) * max_u;
+        cu1 = ((float)(x + w - sx0) / (float)sw) * max_u;
+        cv0 = ((float)(sy1 - (y + h)) / (float)sh) * max_v;
+        cv1 = ((float)(sy1 - y) / (float)sh) * max_v;
+    }
+
     /* Final composite back onto t->fbo with rounded-corner SDF mask & clip */
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
     gl.Viewport(0, 0, t->w, t->h);
     gl.Enable(ZGL_BLEND);
     gl.BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
     gl.UseProgram(g_zgl.prog_blur_comp);
-    gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[cur]);
+    gl.BindTexture(ZGL_TEXTURE_2D, comp_tex);
     gl.Uniform1i(g_zgl.u_bcomp_tex, 0);
     gl.Uniform2f(g_zgl.u_bcomp_vp, (float)t->w, (float)t->h);
     gl.Uniform4f(g_zgl.u_bcomp_rect, (float)x, (float)y, (float)w, (float)h);
-    float cu0 = ((float)(x - sx0) / (float)sw) * max_u;
-    float cu1 = ((float)(x + w - sx0) / (float)sw) * max_u;
-    float cv0 = ((float)(sy1 - (y + h)) / (float)sh) * max_v;
-    float cv1 = ((float)(sy1 - y) / (float)sh) * max_v;
     gl.Uniform4f(g_zgl.u_bcomp_uvrect, cu0, cv0, cu1, cv1);
     gl.Uniform4f(g_zgl.u_bcomp_shape, (float)corner_radius, (float)corner_mask, 0.0f, 0.0f);
     gl.Uniform4f(g_zgl.u_bcomp_clip, (float)s->clip_x0, (float)s->clip_y0,
@@ -1340,6 +1446,7 @@ void zan_gui_internal_gl_drop_present(void) {
         g_zgl.blur_fbo[i] = 0;
         g_zgl.blur_tex[i] = 0;
     }
+    zgl_blurs_drop_all();
     g_zgl.blur_cap_w = 0;
     g_zgl.blur_cap_h = 0;
     for (int i = 0; i < g_surface_count; i++)

@@ -125,10 +125,12 @@ static void zan_atlas_trim(void) {
     }
 }
 
-#define ZAN_ATLAS_COLD_STORES 64
-#define ZAN_ATLAS_SWEEP 64
+#define ZAN_ATLAS_COLD_STORES 2048
+#define ZAN_ATLAS_SWEEP 512
 
 static void zan_atlas_sweep(void) {
+    /* 内存远低于预算上限时不主动清扫，避免多文本界面（>64 条字符串）帧帧抖动重光栅化。 */
+    if (g_atlas_bytes <= (ZAN_ATLAS_BYTES / 2)) return;
     for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
         zan_atlas_slot *e = &g_atlas[i];
         if (e->key_len <= 0) continue;

@@ -135,8 +135,8 @@ static RECT present_clip_rect(const i32 *rect, int w, int h) {
                 right < w ? (LONG)right : w, bottom < h ? (LONG)bottom : h};
 }
 
-static int gdi_upload(HDC dc, zan_present_shadow_t *sh, const zan_surface_t *s,
-                      RECT r) {
+static int gdi_upload_ex(HDC dc, zan_present_shadow_t *sh,
+                         const zan_surface_t *s, RECT r, int do_flush) {
   int width = r.right - r.left;
   int height = r.bottom - r.top;
   if (sh) {
@@ -147,15 +147,23 @@ static int gdi_upload(HDC dc, zan_present_shadow_t *sh, const zan_surface_t *s,
     }
     BOOL copied = BitBlt(dc, r.left, r.top, width, height, sh->dc, r.left,
                          r.top, SRCCOPY);
-    /* DIB 像素由 CPU 和 GDI 共用。等待读取结束后才能再次写入。 */
-    BOOL flushed = GdiFlush();
-    return copied && flushed ? 1 : -1;
+    if (!copied)
+      return -1;
+    /* DIB 像素由 CPU 和 GDI 共用。仅在单矩形或批次末尾同步一次 GdiFlush。 */
+    if (do_flush && !GdiFlush())
+      return -1;
+    return 1;
   }
   BITMAPINFO info = present_bitmap_info(s->stride, s->height);
   int lines =
       StretchDIBits(dc, r.left, r.top, width, height, r.left, r.top, width,
                     height, s->pixels, &info, DIB_RGB_COLORS, SRCCOPY);
   return lines > 0 ? 1 : -1;
+}
+
+static int gdi_upload(HDC dc, zan_present_shadow_t *sh, const zan_surface_t *s,
+                      RECT r) {
+  return gdi_upload_ex(dc, sh, s, r, 1);
 }
 
 #endif /* _WIN32 */
@@ -227,6 +235,32 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     RECT r;
     if (present_bounds(s, sh->pixels, &r))
       calls = gdi_upload(dc, sh, s, r);
+  } else if (sh && rect_count > 1) {
+    /* 多脏矩形批次：先统一拷入 shadow DIB，再批量提交 BitBlt，末尾仅做一次 GdiFlush。 */
+    for (int i = 0; i < rect_count; i++) {
+      RECT r = present_clip_rect(rects + (size_t)i * 4, w, h);
+      if (r.left >= r.right || r.top >= r.bottom)
+        continue;
+      int width = r.right - r.left;
+      for (int y = r.top; y < r.bottom; y++) {
+        memcpy(sh->pixels + (size_t)y * sh->w + r.left,
+               s->pixels + (size_t)y * s->stride + r.left,
+               (size_t)width * sizeof(u32));
+      }
+    }
+    for (int i = 0; i < rect_count; i++) {
+      RECT r = present_clip_rect(rects + (size_t)i * 4, w, h);
+      if (r.left >= r.right || r.top >= r.bottom)
+        continue;
+      if (!BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                  sh->dc, r.left, r.top, SRCCOPY)) {
+        calls = -1;
+        break;
+      }
+      calls++;
+    }
+    if (calls > 0 && !GdiFlush())
+      calls = -1;
   } else {
     for (int i = 0; i < rect_count; i++) {
       RECT r = present_clip_rect(rects + (size_t)i * 4, w, h);

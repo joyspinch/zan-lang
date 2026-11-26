@@ -313,7 +313,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 |---|---|---|
 | `-o <file>` | — | 输出文件。**后缀决定产物类型**：`.dll/.so/.dylib`=共享库，`.a/.lib`=静态库，其余=可执行 |
 | `--emit-lib` | 关 | 强制库输出（无 CRT/入口点）；与 `-o` 后缀推断并存时后缀仍决定 shared/static |
-| `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 默认 `-Os`；`-Oz` 极限体积（边缘/嵌入式）。显式 `-O` 覆盖 `--publish` 默认，但 `-g` 总是强制 `-O0` |
+| `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 同样默认 `-O2`（保障发布程序运行时吞吐），需极限体积时显式传 `-Os`/`-Oz`。显式 `-O` 覆盖默认，但 `-g` 总是强制 `-O0` |
 | `-fno-opt-<pass>` | 关 | 跳过单个自定义优化 pass（二分定位用）：`early/escape/arc/devirt/constfold/dce/inline/shrink`；未知 pass 名报用法错误 |
 | `--early-passes=<list>` | — | 覆盖早期 LLVM pass 管线（如 `sroa,early-cse`），`none` 跳过整个早期阶段 |
 | `--opt-pipeline=<text>` | — | 覆盖主 LLVM pass 管线文本，`none` 跳过 LLVM 管线 |
@@ -350,7 +350,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 ### 2.2 发布（Publish）
 | 参数 | 取值 / 默认 | 说明 |
 |---|---|---|
-| `--publish` | 关 | 发布档：默认 `-Os`、链接期 strip（同 `--strip-symbols`）、启用 shard 模块优化；`--check-leaks`/`--arc-guard` 默认关（显式传入仍生效）；**over-release 网默认开**（未显式给 `--arc-guard`/`--no-arc-guard` 时）；内建图标默认不嵌（`--default-icon` 可显式开启） |
+| `--publish` | 关 | 发布档：默认 `-O2` + 后端 codegen `-O3`、分片前执行闭世界去虚化/nothrow 折叠、链接期 strip（同 `--strip-symbols`）、启用 shard 模块优化（需控极限体积可配 `-Os`/`-Oz`）；`--check-leaks`/`--arc-guard` 默认关（显式传入仍生效）；**over-release 网默认开**（未显式给 `--arc-guard`/`--no-arc-guard` 时）；内建图标默认不嵌（`--default-icon` 可显式开启） |
 | `--strip-symbols` | 关 | 链接期 `-s` + ICF + 链接优化；`--publish` 已隐含；单独使用时只加 strip、不改优化档 |
 | `--link-mode <shared\|static>` | shared | 发布时原生驱动链接方式：shared 拷驱动到 exe 旁，static 链进 exe |
 | `--obfuscate-strings` | 关 | XOR 混淆用户字符串字面量（非 `-g` 时顺带裁剪 stdlib 函数体）；CLI 优先于环境变量 `ZAN_OBF=1`（内部/未稳定） |
