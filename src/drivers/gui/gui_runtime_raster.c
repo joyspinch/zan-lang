@@ -1073,10 +1073,36 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     int cy0 = y0 > s->clip_y0 ? y0 : s->clip_y0;
     int cx1 = x1 < s->clip_x1 ? x1 : s->clip_x1;
     int cy1 = y1 < s->clip_y1 ? y1 : s->clip_y1;
+    int eff_cr = cr;
+    if (eff_cr > rw / 2) eff_cr = rw / 2;
+    if (eff_cr > rh / 2) eff_cr = rh / 2;
+    if (eff_cr <= 0 || (cmask & 15) == 0) {
+        for (int py = cy0; py < cy1; py++) {
+            memcpy(s->pixels + (size_t)py * s->stride + cx0,
+                   c->pixels + (size_t)(py - y0) * rw + (cx0 - x0),
+                   (size_t)(cx1 - cx0) * sizeof(u32));
+        }
+        return;
+    }
+    int mid_x0 = x0 + eff_cr > cx0 ? x0 + eff_cr : cx0;
+    int mid_x1 = x0 + rw - eff_cr < cx1 ? x0 + rw - eff_cr : cx1;
     for (int py = cy0; py < cy1; py++) {
-      memcpy(s->pixels + (size_t)py * s->stride + cx0,
-             c->pixels + (size_t)(py - y0) * rw + (cx0 - x0),
-             (size_t)(cx1 - cx0) * sizeof(u32));
+        int j = py - y0;
+        u32 *dst = s->pixels + (size_t)py * s->stride;
+        const u32 *src = c->pixels + (size_t)j * rw;
+        if (j >= eff_cr && j < rh - eff_cr) {
+            memcpy(dst + cx0, src + (cx0 - x0), (size_t)(cx1 - cx0) * sizeof(u32));
+            continue;
+        }
+        if (mid_x1 > mid_x0) {
+            memcpy(dst + mid_x0, src + (mid_x0 - x0), (size_t)(mid_x1 - mid_x0) * sizeof(u32));
+        }
+        for (int px = cx0; px < mid_x0; px++) {
+            if (zan_round_cov(px - x0, j, rw, rh, eff_cr, cmask) > 0) dst[px] = src[px - x0];
+        }
+        for (int px = mid_x1; px < cx1; px++) {
+            if (zan_round_cov(px - x0, j, rw, rh, eff_cr, cmask) > 0) dst[px] = src[px - x0];
+        }
     }
     return;
   }

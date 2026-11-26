@@ -28,29 +28,42 @@ public partial class StyleBox {
         int rmax = rh / 2;
         if (rw < rh) { rmax = rw / 2; }
         if (r > rmax) { r = rmax; }
+        bool hasOuterShadow = (shadow != 0 && shadowInset == 0) || shadow2 != 0;
+        int blurSlot = -1;
+        int blurPx = 0;
         if (blur > 0) {
             app.HostNoteGlassRect(rx, ry, rw, rh);
             int key = app.HostBlurKeyId(fxId);
             if (key == 0) { key = app.HostBlurKey(2, rx, ry, rw, rh); }
-            int slot = app.HostBlurSlotFor(key);
-            bool bd = app.HostBackdropDirtyIn(slot, rx, ry, rw, rh);
-            if (this.PaintStaticGlass(app, slot, bd, rx, ry, rw, rh, r)) { return; }
+            blurSlot = app.HostBlurSlotFor(key);
+            bool bd = app.HostBackdropDirtyIn(blurSlot, rx, ry, rw, rh);
+            if (this.PaintStaticGlass(app, blurSlot, bd, rx, ry, rw, rh, r)) { return; }
+            blurPx = this.PaintLength(app, blur, StyleBox.SourceBlur());
             if (r > 0) {
-                c.BlurRoundCached(rx, ry, rw, rh, this.PaintLength(app, blur, StyleBox.SourceBlur()),
-                                  slot, bd, r, this.Corners());
+                c.BlurRoundCached(rx, ry, rw, rh, blurPx, blurSlot, bd, r, this.Corners());
             } else {
-                c.BlurRectCached(rx, ry, rw, rh, this.PaintLength(app, blur, StyleBox.SourceBlur()),
-                                 slot, bd);
+                c.BlurRectCached(rx, ry, rw, rh, blurPx, blurSlot, bd);
             }
         }
-        if ((shadow != 0 && shadowInset == 0) || shadow2 != 0) { this.PaintShadow(app, rx, ry, rw, rh, r); }
+        if (hasOuterShadow) {
+            this.PaintShadow(app, rx, ry, rw, rh, r);
+            // 外阴影只在边框外侧生效（CSS Backgrounds §7.2）：磨砂玻璃表面复贴
+            // 刚缓存的纯净模糊底，避免外阴影透射进半透明玻璃内部发灰。
+            if (blur > 0 && blurPx > 0 && blurSlot >= 0) {
+                if (r > 0) {
+                    c.BlurRoundCached(rx, ry, rw, rh, blurPx, blurSlot, false, r, this.Corners());
+                } else {
+                    c.BlurRectCached(rx, ry, rw, rh, blurPx, blurSlot, false);
+                }
+            }
+        }
         if (emboss != 0) {
             Theme ht = app.HostTheme();
             Fx.Emboss(app, rx, ry, rw, rh, r, emboss == 2,
                       ht != null ? ht.bgPrimary : 0);
         }
         int corners = this.Corners();
-        bool combined = bgTo == 0 && borderStyle != 1 && sheen <= 0
+        bool combined = bgTo == 0 && borderStyle != 1
             && !(shadow != 0 && shadowInset == 1)
             && borderTopW <= 0 && borderRightW <= 0
             && borderBottomW <= 0 && borderLeftW <= 0;
@@ -135,45 +148,19 @@ public partial class StyleBox {
         if (borderTopW > inset) { inset = borderTopW; }
         if (inset < 0) { inset = 0; }
         if (inset > 0 && w > inset * 2 + 2 && h > inset * 2 + 2) {
+            // 已有外边框时仅叠加柔和顶部/底部弯月反光，避免再画一圈 1px 硬描边导致圆角双线重影。
             int ir = r - inset;
             if (ir < 0) { ir = 0; }
-            c.DrawRoundRectIn(x + inset, y + inset, w - inset * 2, h - inset * 2, ir, corners,
-                              ColorMath.ScaleAlpha(col, str * 48 / 100), 1);
-            int lipPad = r > inset ? r : inset;
-            int lipW = w - lipPad * 2;
-            if (lipW > 0) {
-                c.FillRect(x + lipPad, y + inset, lipW, 1, ColorMath.ScaleAlpha(col, str * 92 / 100));
-                if (str >= 300 && h >= 22) {
-                    c.FillRect(x + lipPad, y + inset + 1, lipW, 1, ColorMath.ScaleAlpha(col, str * 42 / 100));
-                }
-                // 液态玻璃 / 高光材质：底部内侧折光焦散棱（caustic bounce rim）
-                if (str >= 220 && h >= 18) {
-                    c.FillRect(x + lipPad, y + h - 1 - inset, lipW, 1,
-                               ColorMath.ScaleAlpha(col, str * 64 / 100));
-                    if (str >= 320 && h >= 28) {
-                        c.FillRect(x + lipPad, y + h - 2 - inset, lipW, 1,
-                                   ColorMath.ScaleAlpha(col, str * 30 / 100));
-                    }
-                }
+            int rimAlpha = str * 18 / 100;
+            if (rimAlpha > 0) {
+                c.DrawRoundRectIn(x + inset, y + inset, w - inset * 2, h - inset * 2, ir, corners,
+                                  ColorMath.ScaleAlpha(col, rimAlpha), 1);
             }
         } else {
-            c.DrawRoundRectIn(x, y, w, h, r, corners,
-                              ColorMath.ScaleAlpha(col, str * 48 / 100), 1);
-            int lipX = x + r;
-            int lipW = w - r * 2;
-            if (lipW > 0) {
-                c.FillRect(lipX, y, lipW, 1, ColorMath.ScaleAlpha(col, str * 92 / 100));
-                if (str >= 300 && h >= 22) {
-                    c.FillRect(lipX, y + 1, lipW, 1, ColorMath.ScaleAlpha(col, str * 42 / 100));
-                }
-                if (str >= 220 && h >= 18) {
-                    c.FillRect(lipX, y + h - 1, lipW, 1,
-                               ColorMath.ScaleAlpha(col, str * 60 / 100));
-                    if (str >= 320 && h >= 28) {
-                        c.FillRect(lipX, y + h - 2, lipW, 1,
-                                   ColorMath.ScaleAlpha(col, str * 28 / 100));
-                    }
-                }
+            int rimAlpha = str * 36 / 100;
+            if (rimAlpha > 0) {
+                c.DrawRoundRectIn(x, y, w, h, r, corners,
+                                  ColorMath.ScaleAlpha(col, rimAlpha), 1);
             }
         }
     }
@@ -269,18 +256,38 @@ public partial class StyleBox {
     void PaintSideArc(StyleHost app, int x, int y, int w, int h, int r, int on,
                       int cx, int cy, int hw, int vw, int hcol, int vcol) {
         if (app == null || on <= 0 || r <= 0) { return; }
-        int bw = hw;
-        if (vw > bw) { bw = vw; }
-        if (bw <= 0) { return; }
-        int col = hcol;
-        if (hw <= 0 || col == 0) { col = vcol; }
-        if (col == 0) { col = borderColor; }
-        col = this.Fade(col);
-        if (col == 0) { return; }
+        if (hw <= 0 && vw <= 0) { return; }
         Canvas c = app.HostCanvas();
         if (c == null) { return; }
+        int cn = this.Corners();
+        // 仅单边存在时（如 alertbox 的 border-left: 4 或 tab.line 的 border-bottom: 2），
+        // 按 CSS Borders Level 3 仅在该边厚度条带内沿外圆角轮廓裁切，避免绕 90° 圆弧拉出 C 形钩。
+        if (hw <= 0 && vw > 0) {
+            int col = this.SideColor(vcol);
+            if (col == 0) { return; }
+            int stripW = vw < r ? vw : r;
+            int stripX = cx == x ? x : (x + w - stripW);
+            c.PushClip(stripX, cy, stripW, r);
+            c.FillRoundRectIn(x, y, w, h, r, cn, col);
+            c.PopClip();
+            return;
+        }
+        if (vw <= 0 && hw > 0) {
+            int col = this.SideColor(hcol);
+            if (col == 0) { return; }
+            int stripH = hw < r ? hw : r;
+            int stripY = cy == y ? y : (y + h - stripH);
+            c.PushClip(cx, stripY, r, stripH);
+            c.FillRoundRectIn(x, y, w, h, r, cn, col);
+            c.PopClip();
+            return;
+        }
+        int bw = hw;
+        if (vw > bw) { bw = vw; }
+        int col = hcol != 0 ? this.Fade(hcol) : this.SideColor(vcol);
+        if (col == 0) { return; }
         c.PushClip(cx, cy, r, r);
-        c.DrawRoundRectIn(x, y, w, h, r, this.Corners(), col, bw);
+        c.DrawRoundRectIn(x, y, w, h, r, cn, col, bw);
         c.PopClip();
     }
     int SideColor(int col) {
