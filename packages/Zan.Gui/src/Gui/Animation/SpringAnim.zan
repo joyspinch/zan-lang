@@ -34,16 +34,19 @@ public class SpringAnim {
         this.paused = false;
         this.finished = false;
     }
+    static bool IsFinite(float v) { return v == v && (v - v) == 0.0f; }
     public static SpringAnim Create(float fromVal, float toVal, float stiffness,
                                     float damping, float mass, TweenUpdate onUpdate) {
         SpringAnim s = new SpringAnim();
-        s.value = fromVal;
-        s.target = toVal;
-        s.stiffness = stiffness > 1.0f ? stiffness : 1.0f;
-        s.damping = damping >= 0.0f ? damping : 0.0f;
-        s.mass = mass > 0.01f ? mass : 1.0f;
+        float f = SpringAnim.IsFinite(fromVal) ? fromVal : 0.0f;
+        float t = SpringAnim.IsFinite(toVal) ? toVal : f;
+        s.value = f;
+        s.target = t;
+        s.stiffness = (SpringAnim.IsFinite(stiffness) && stiffness > 1.0f) ? stiffness : 1.0f;
+        s.damping = (SpringAnim.IsFinite(damping) && damping >= 0.0f) ? damping : 0.0f;
+        s.mass = (SpringAnim.IsFinite(mass) && mass > 0.01f) ? mass : 1.0f;
         s.updateAction = onUpdate;
-        s.AutoRestThresholds(fromVal, toVal);
+        s.AutoRestThresholds(f, t);
         return s;
     }
     // SwiftUI 风格参数化：durationSec（感知时长）+ bounce（-1 过阻尼，0 临界阻尼，0..0.95 回弹）。
@@ -77,7 +80,7 @@ public class SpringAnim {
         }
     }
     public SpringAnim WithVelocity(float initialVelocity) {
-        this.velocity = initialVelocity;
+        this.velocity = SpringAnim.IsFinite(initialVelocity) ? initialVelocity : 0.0f;
         return this;
     }
     public SpringAnim WithDelay(int ms) {
@@ -85,8 +88,8 @@ public class SpringAnim {
         return this;
     }
     public SpringAnim WithPrecision(float displacementEps, float velocityEps) {
-        if (displacementEps > 0.0f) { this.restDisplacement = displacementEps; }
-        if (velocityEps > 0.0f) { this.restVelocity = velocityEps; }
+        if (SpringAnim.IsFinite(displacementEps) && displacementEps > 0.0f) { this.restDisplacement = displacementEps; }
+        if (SpringAnim.IsFinite(velocityEps) && velocityEps > 0.0f) { this.restVelocity = velocityEps; }
         return this;
     }
     public void OnComplete(TweenCallback onComplete) { this.completeAction = onComplete; }
@@ -96,12 +99,15 @@ public class SpringAnim {
         this.paused = false;
         this.finished = false;
         this.delayRemainingMs = this.delayMs;
-        if (this.delayRemainingMs == 0 && this.updateAction != null) {
-            this.updateAction(this.value);
+        TweenUpdate onUpd = this.updateAction;
+        if (this.delayRemainingMs == 0 && onUpd != null) {
+            onUpd(this.value);
         }
     }
     // 中途改目标：完整保留当前位置与速度，实现无跳变的可打断手势/状态衔接。
     public void Retarget(float newTarget) {
+        if (!SpringAnim.IsFinite(newTarget)) { return; }
+        this.playback = this.playback + 1;
         this.target = newTarget;
         this.finished = false;
         this.paused = false;
@@ -140,23 +146,38 @@ public class SpringAnim {
             this.delayRemainingMs = 0;
             if (rem == 0) { return true; }
         }
+        float m = (SpringAnim.IsFinite(this.mass) && this.mass > 0.01f) ? this.mass : 1.0f;
+        float k = (SpringAnim.IsFinite(this.stiffness) && this.stiffness > 1.0f) ? this.stiffness : 1.0f;
+        float c = (SpringAnim.IsFinite(this.damping) && this.damping >= 0.0f) ? this.damping : 0.0f;
+        if (!SpringAnim.IsFinite(this.target)) { this.target = 0.0f; }
+        if (!SpringAnim.IsFinite(this.value) || !SpringAnim.IsFinite(this.velocity)) {
+            this.value = this.target;
+            this.velocity = 0.0f;
+        }
         float totalDt = (float)rem / 1000.0f;
         if (totalDt > 0.1f) { totalDt = 0.1f; }
         // 按 4ms 固定子步做半隐式欧拉积分，避免高刚度弹簧在低帧率下能量爆炸。
         int subSteps = (int)(totalDt / 0.004f) + 1;
         if (subSteps > 32) { subSteps = 32; }
         float dt = totalDt / (float)subSteps;
-        float invMass = 1.0f / this.mass;
+        float invMass = 1.0f / m;
         for (int i = 0; i < subSteps; i = i + 1) {
             float disp = this.value - this.target;
-            float accel = (-this.stiffness * disp - this.damping * this.velocity) * invMass;
+            float accel = (-k * disp - c * this.velocity) * invMass;
             this.velocity = this.velocity + accel * dt;
             this.value = this.value + this.velocity * dt;
+            if (!SpringAnim.IsFinite(this.value) || !SpringAnim.IsFinite(this.velocity)) {
+                this.value = this.target;
+                this.velocity = 0.0f;
+                break;
+            }
         }
         float absDisp = this.value - this.target;
         if (absDisp < 0.0f) { absDisp = -absDisp; }
         float absVel = this.velocity < 0.0f ? -this.velocity : this.velocity;
-        if (absDisp <= this.restDisplacement && absVel <= this.restVelocity) {
+        float rDisp = (SpringAnim.IsFinite(this.restDisplacement) && this.restDisplacement > 0.0f) ? this.restDisplacement : 0.001f;
+        float rVel = (SpringAnim.IsFinite(this.restVelocity) && this.restVelocity > 0.0f) ? this.restVelocity : 0.001f;
+        if (absDisp <= rDisp && absVel <= rVel) {
             this.value = this.target;
             this.velocity = 0.0f;
             this.finished = true;
@@ -164,8 +185,10 @@ public class SpringAnim {
             this.paused = false;
         }
         int run = this.playback;
-        if (this.updateAction != null) { this.updateAction(this.value); }
-        if (this.playback == run && this.finished && this.completeAction != null) { this.completeAction(); }
+        TweenUpdate onUpd = this.updateAction;
+        if (onUpd != null) { onUpd(this.value); }
+        TweenCallback onDone = this.completeAction;
+        if (this.playback == run && this.finished && onDone != null) { onDone(); }
         return this.active && !this.finished;
     }
 }

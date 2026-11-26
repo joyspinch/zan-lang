@@ -43,7 +43,8 @@ public class RelativeBindingSource {
         int level = AncestorLevel > 1 ? AncestorLevel : 1;
         int matched = 0;
         Control cur = target.Parent();
-        while (cur != null) {
+        int depth = 0;
+        while (cur != null && depth < 256) {
             bool hit = false;
             if (Matcher != null && Matcher(cur)) { hit = true; }
             else if (AncestorTypeName != "" && cur.Kind() == AncestorTypeName) { hit = true; }
@@ -52,6 +53,7 @@ public class RelativeBindingSource {
                 if (matched >= level) { return cur; }
             }
             cur = cur.Parent();
+            depth = depth + 1;
         }
         return null;
     }
@@ -86,6 +88,7 @@ public class ControlBinding {
     protected bool hasSnapshot = false;
     protected bool syncing = false;
     protected object lastSource;
+    protected weak Control lastSourceControl;
     private weak Control wiredTarget;
     public bool IsSyncing() { return this.syncing; }
     public virtual bool IsTwoWay() {
@@ -128,6 +131,7 @@ public class ControlBinding {
     }
     protected void ApplyTargetValue(Control target, string val) {
         if (target == null || TargetProperty == "") { return; }
+        if (val == null) { val = ""; }
         bool prevSync = this.syncing;
         this.syncing = true;
         try {
@@ -243,9 +247,11 @@ public class TypedControlBinding<TSource> : ControlBinding {
             object ctx = target.ResolveDataContext();
             if (ctx != null && ctx is TSource) { return (TSource)ctx; }
             Control cur = target;
-            while (cur != null) {
+            int depth = 0;
+            while (cur != null && depth < 256) {
                 if (cur is TSource) { return (TSource)(object)cur; }
                 cur = cur.Parent();
+                depth = depth + 1;
             }
         }
         return null;
@@ -255,9 +261,20 @@ public class TypedControlBinding<TSource> : ControlBinding {
         if (target == null || this.syncing) { return false; }
         this.EnsureTargetWired(target);
         src = this.ResolveTypedSource(target);
-        if ((object)src != this.lastSource) {
-            this.lastSource = (object)src;
-            this.hasSnapshot = false;
+        if (src is Control) {
+            Control srcCtl = (Control)(object)src;
+            Control prevCtl = this.lastSourceControl;
+            if (srcCtl != prevCtl || this.lastSource != null) {
+                this.lastSourceControl = srcCtl;
+                this.lastSource = null;
+                this.hasSnapshot = false;
+            }
+        } else {
+            if ((object)src != this.lastSource || this.lastSourceControl != null) {
+                this.lastSource = (object)src;
+                this.lastSourceControl = null;
+                this.hasSnapshot = false;
+            }
         }
         return !this.TryPushDirtyTarget(target);
     }
@@ -340,7 +357,8 @@ public class PropertyBindingValue<TSource, TValue> : TypedControlBinding<TSource
         TSource src = null;
         if (!this.PrepareTypedApply(target, out src)) { return; }
         if (src != null && this.SourceProperty != null && this.Convert != null) {
-            this.ApplyAndSnapshot(target, this.Convert(this.SourceProperty(src)));
+            string converted = this.Convert(this.SourceProperty(src));
+            this.ApplyAndSnapshot(target, converted != null ? converted : "");
             return;
         }
         base.Apply(target);

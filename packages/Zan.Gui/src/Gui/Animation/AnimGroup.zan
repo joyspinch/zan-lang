@@ -52,8 +52,17 @@ public class AnimGroup {
         this.items.Add(item);
         return this;
     }
+    bool ContainsGroup(AnimGroup target, int depth) {
+        if (target == null || depth > 32) { return false; }
+        if (this == target) { return true; }
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            AnimGroup child = this.items[i].group;
+            if (child != null && child.ContainsGroup(target, depth + 1)) { return true; }
+        }
+        return false;
+    }
     public AnimGroup AddGroup(AnimGroup g) {
-        if (g == null || g == this) { return this; }
+        if (g == null || g == this || g.ContainsGroup(this, 0)) { return this; }
         AnimTrackItem item = new AnimTrackItem();
         item.group = g;
         item.offsetMs = this.mode == ModeStagger ? this.items.Count * this.staggerMs : 0;
@@ -120,6 +129,7 @@ public class AnimGroup {
     }
     public bool Step(int deltaMs) {
         if (!this.active || this.finished || deltaMs <= 0) { return false; }
+        int run = this.playback;
         int rem = deltaMs;
         if (this.delayRemainingMs > 0) {
             if (rem < this.delayRemainingMs) {
@@ -129,17 +139,22 @@ public class AnimGroup {
             rem = rem - this.delayRemainingMs;
             this.delayRemainingMs = 0;
             this.StartIteration();
-            if (this.finished || rem == 0) { return this.active && !this.finished; }
+            if (this.playback != run || this.finished || rem == 0) { return this.active && !this.finished; }
         }
         bool iterationDone = false;
         if (this.mode == ModeSequence) {
             if (this.cursor < this.items.Count) {
                 AnimTrackItem cur = this.items[this.cursor];
-                if (!cur.started) { cur.Start(); }
+                if (!cur.started) {
+                    cur.Start();
+                    if (this.playback != run) { return this.active && !this.finished; }
+                }
                 if (!cur.Step(rem)) {
+                    if (this.playback != run) { return this.active && !this.finished; }
                     this.cursor = this.cursor + 1;
                     if (this.cursor < this.items.Count) {
                         this.items[this.cursor].Start();
+                        if (this.playback != run) { return this.active && !this.finished; }
                     } else {
                         iterationDone = true;
                     }
@@ -148,18 +163,20 @@ public class AnimGroup {
                 iterationDone = true;
             }
         } else {
-            int prevElapsed = this.groupElapsedMs;
             this.groupElapsedMs = this.groupElapsedMs + rem;
             bool anyRunning = false;
             for (int i = 0; i < this.items.Count; i = i + 1) {
+                if (this.playback != run) { return this.active && !this.finished; }
                 AnimTrackItem it = this.items[i];
                 if (it.done) { continue; }
                 if (!it.started) {
                     if (this.groupElapsedMs >= it.offsetMs) {
                         it.Start();
+                        if (this.playback != run) { return this.active && !this.finished; }
                         int slice = this.groupElapsedMs - it.offsetMs;
                         if (slice > 0) {
                             if (it.Step(slice)) { anyRunning = true; }
+                            if (this.playback != run) { return this.active && !this.finished; }
                         } else {
                             anyRunning = true;
                         }
@@ -168,10 +185,12 @@ public class AnimGroup {
                     }
                 } else {
                     if (it.Step(rem)) { anyRunning = true; }
+                    if (this.playback != run) { return this.active && !this.finished; }
                 }
             }
             if (!anyRunning) { iterationDone = true; }
         }
+        if (this.playback != run) { return this.active && !this.finished; }
         if (iterationDone) {
             if (this.repeatCount < 0 || this.completedRepeats < this.repeatCount) {
                 this.completedRepeats = this.completedRepeats + 1;
@@ -180,8 +199,8 @@ public class AnimGroup {
                 this.finished = true;
                 this.active = false;
                 this.paused = false;
-                int run = this.playback;
-                if (this.playback == run && this.completeAction != null) { this.completeAction(); }
+                TweenCallback cb = this.completeAction;
+                if (this.playback == run && cb != null) { cb(); }
             }
         }
         return this.active && !this.finished;

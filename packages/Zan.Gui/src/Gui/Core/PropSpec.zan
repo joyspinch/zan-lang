@@ -123,7 +123,11 @@ public class PropSpec {
         throw new InvalidOperationException("Property field does not exist: " + member);
     }
     public string ReadFrom(Control owner) {
-        if (forwardProp != "") { return forwardTarget != null ? forwardTarget.GetProp(forwardProp) : ""; }
+        if (forwardProp != "") {
+            Control ft = forwardTarget;
+            return ft != null ? ft.GetProp(forwardProp) : "";
+        }
+        if (owner == null) { return member == "" && getter == "" ? this.Read() : ""; }
         if (getter != "") { return owner.InvokeString(getter); }
         if (member == "") { return this.Read(); }
         bool binding = this.Storage(owner) == 1;
@@ -143,7 +147,12 @@ public class PropSpec {
     }
     public void WriteTo(Control owner, string val) {
         if (forwardProp != "") {
-            if (forwardTarget != null) { forwardTarget.SetProp(forwardProp, val); }
+            Control ft = forwardTarget;
+            if (ft != null) { ft.SetProp(forwardProp, val); }
+            return;
+        }
+        if (owner == null) {
+            if (setter == "" && member == "") { this.Write(val); }
             return;
         }
         if (setter != "") {
@@ -186,7 +195,7 @@ public class PropSpec {
     }
     private bool AcceptNumber(string val) {
         if (kind == PropKind.Color || PropSpec.IsIntText(val)) { return true; }
-        if (kind == PropKind.Enum) {
+        if (kind == PropKind.Enum && options != null) {
             for (int i = 0; i < options.Count; i = i + 1) {
                 if (options[i] == val) { return true; }
             }
@@ -195,12 +204,13 @@ public class PropSpec {
     }
     private int NumberValue(string val) {
         if (kind == PropKind.Color) { return PropSpec.ColorInt(val); }
-        if (kind == PropKind.Enum) {
+        if (kind == PropKind.Enum && options != null) {
             for (int i = 0; i < options.Count; i = i + 1) {
                 if (options[i] == val) { return i; }
             }
         }
-        return Convert.ToInt32(val);
+        int parsed = 0;
+        return PropSpec.TryParseIntText(val, out parsed) ? parsed : 0;
     }
     string tip;
     // 整数属性（PropKind.Int）的步进配置：`step` 为 +/- 按钮每次增减量，
@@ -216,9 +226,10 @@ public class PropSpec {
     // Resolve aliases against one freshly obtained descriptor list. PropOf keeps
     // its historical bound-only contract; property dispatch also answers unbound specs.
     public static PropSpec Find(List<PropSpec> specs, string key, bool boundOnly) {
+        if (specs == null || key == null) { return null; }
         for (int i = 0; i < specs.Count; i = i + 1) {
             PropSpec p = specs[i];
-            if (p.Answers(key) && (p.IsBound() || !boundOnly)) { return p; }
+            if (p != null && p.Answers(key) && (p.IsBound() || !boundOnly)) { return p; }
         }
         return null;
     }
@@ -283,13 +294,14 @@ public class PropSpec {
 
     // 当 `key` 命名该属性（自身键或某个别名）时为 true。
     bool Answers(string k) {
+        if (k == null) { return false; }
         return key == k || Style.Has(alias, k);
     }
 
     // 给属性挂一段说明（返回 this，便于链式调用）。属性面板
     // 悬停该行时以气泡提示展示。
     PropSpec WithTip(string t) {
-        tip = t;
+        tip = t != null ? t : "";
         return this;
     }
 
@@ -310,6 +322,7 @@ public class PropSpec {
         return v;
     }
     PropSpec Also(string k) {
+        if (k == null || k == "") { return this; }
         if (alias == "") { alias = k; }
         else { alias = alias + " " + k; }
         return this;
@@ -320,7 +333,7 @@ public class PropSpec {
         if (flag != null) { return PropSpec.Flag(flag.Get()); }
         return "";
     }
-    // 按 `val` 字符串写回绑定：数字/布尔做解析（IsOn/ToInt32），
+    // 按 `val` 字符串写回绑定：数字/布尔做解析（IsOn/TryParse），
     // 文本原样写入；未绑定任何字段/signal 时为空操作。
     // 枚举属性（PropKind.Enum）还收选项文本：`SetProp("orient",
     // "vertical")` 写入的是该选项的下标。只认数字序号的话，
@@ -337,11 +350,13 @@ public class PropSpec {
         if (val == null) { return 0; }
         string t = val.Trim();
         if (t == "") { return 0; }
-        if (PropSpec.IsIntText(t)) { return Convert.ToInt32(t); }
+        int parsed = 0;
+        if (PropSpec.TryParseIntText(t, out parsed)) { return parsed; }
         Color c = Color.Parse(t);
         return c.ToARGB();
     }
-    static bool IsIntText(string s) {
+    static bool TryParseIntText(string s, out int value) {
+        value = 0;
         if (s == null || s.Length == 0) { return false; }
         int i = 0;
         if ((s[0] & 255) == 45) {
@@ -352,7 +367,11 @@ public class PropSpec {
             int c = s[i] & 255;
             if (c < 48 || c > 57) { return false; }
         }
-        return true;
+        return int.TryParse(s, out value);
+    }
+    static bool IsIntText(string s) {
+        int parsed = 0;
+        return PropSpec.TryParseIntText(s, out parsed);
     }
     static string Flag(bool on) {
         if (on) { return "true"; }
@@ -440,8 +459,12 @@ public class PropSpec {
     // 枚举属性工厂，值为 `opts` 之一（以其标签文本存储）。
     static PropSpec Enum(string k, string lbl, List<string> opts) {
         PropSpec p = new PropSpec(k, lbl, PropKind.Enum);
-        p.options = opts;
+        p.options = opts != null ? opts : new List<string>();
         return p;
     }
-    PropSpec Option(string o) { options.Add(o); return this; }
+    PropSpec Option(string o) {
+        if (options == null) { options = new List<string>(); }
+        if (o != null) { options.Add(o); }
+        return this;
+    }
 }

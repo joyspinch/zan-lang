@@ -170,7 +170,9 @@ public class SignalBase : ISignalSource {
             snap.Add(this.observers[i]);
         }
         for (int i = 0; i < snap.Count; i = i + 1) {
-            snap[i].OnSignalChanged();
+            ISignalObserver obs = snap[i];
+            if (obs == null || this.observers == null || !this.observers.Contains(obs)) { continue; }
+            obs.OnSignalChanged();
         }
     }
 }
@@ -219,6 +221,8 @@ public class Computed<T> : SignalBase, ISignalObserver {
     private T cached;
     private bool dirty;
     private bool disposed;
+    private bool computing;
+    private bool notifying;
 
     public Computed(List<ISignalSource> deps, Func<T> compute) {
         this.compute = compute;
@@ -226,29 +230,42 @@ public class Computed<T> : SignalBase, ISignalObserver {
         this.dirty = true;
         this.version = 0;
         this.disposed = false;
+        this.computing = false;
+        this.notifying = false;
         for (int i = 0; i < this.deps.Count; i = i + 1) {
             if (this.deps[i] != null) { this.deps[i].AddObserver(this); }
         }
     }
 
     public T Get() {
-        if (this.dirty && this.compute != null) {
-            this.cached = this.compute();
-            this.dirty = false;
+        if (this.dirty && !this.computing && this.compute != null) {
+            this.computing = true;
+            try {
+                this.cached = this.compute();
+                this.dirty = false;
+            } finally {
+                this.computing = false;
+            }
         }
         return this.cached;
     }
 
     public void OnSignalChanged() {
-        if (this.disposed) { return; }
-        this.dirty = true;
-        this.version = this.version + 1;
-        this.NotifyObservers();
+        if (this.disposed || this.notifying) { return; }
+        this.notifying = true;
+        try {
+            this.dirty = true;
+            this.version = this.version + 1;
+            this.NotifyObservers();
+        } finally {
+            this.notifying = false;
+        }
     }
 
     public void Dispose() {
         if (this.disposed) { return; }
         this.disposed = true;
+        this.compute = null;
         if (this.deps != null) {
             for (int i = 0; i < this.deps.Count; i = i + 1) {
                 if (this.deps[i] != null) { this.deps[i].RemoveObserver(this); }

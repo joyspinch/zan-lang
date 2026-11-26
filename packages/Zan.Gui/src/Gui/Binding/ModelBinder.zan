@@ -16,6 +16,7 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
     List<ChildExpandedRow> expandedRows;
     List<ChildExpandedRow> retiringRows;
     bool retiringRowsBusy;
+    bool syncingValues;
     List<ChildScopeBinding> scopeBindings;
     public ModelBinder() {
         this.root = null;
@@ -251,7 +252,9 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
     }
     private void ValidateValueBinding(ModelValueBinding binding) {
+        if (binding == null) { return; }
         Control c = binding.control;
+        if (c == null) { return; }
         object scope = this.ScopeItemOf(c);
         if (binding.twoWay && scope != null) {
             string actualPath = ModelBinder.StripAlias(binding.path, this.ScopeAliasOf(c));
@@ -365,53 +368,67 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
     }
     public void SyncChangedNode(Control c) { this.SyncChangedValues(); }
     public void SyncChangedValues() {
+        if (this.syncingValues) { return; }
         AppLoopRegistration ticket = this.hostRegistration;
         int generation = ticket != null ? ticket.generation : 0;
         Control tree = this.root;
         object state = this.model;
         if (!this.RefreshStructure(ticket, generation, tree, state)) { return; }
         if (this.valueBindings == null) { return; }
-        for (int i = 0; i < this.valueBindings.Count; i = i + 1) {
-            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-            ModelValueBinding binding = this.valueBindings[i];
-            Control c = binding.control;
-            if (c == null || !binding.twoWay) { continue; }
-            if (!binding.hasSnapshot) { continue; }
-            string value = this.BoundValue(binding);
-            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-            if (!binding.hasSnapshot || value != binding.snapshot) {
-                this.WriteBoundValue(binding, value);
+        this.syncingValues = true;
+        try {
+            for (int i = 0; this.valueBindings != null && i < this.valueBindings.Count; i = i + 1) {
                 if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-                    }
+                ModelValueBinding binding = this.valueBindings[i];
+                Control c = binding.control;
+                if (c == null || !binding.twoWay) { continue; }
+                if (!binding.hasSnapshot) { continue; }
+                string value = this.BoundValue(binding);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                if (!binding.hasSnapshot || value != binding.snapshot) {
+                    this.WriteBoundValue(binding, value);
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                }
+            }
+        } finally {
+            this.syncingValues = false;
         }
     }
     private void SyncValuesFromModel(AppLoopRegistration ticket, int generation, Control tree, object state) {
-        if (this.valueBindings == null) { return; }
-        for (int i = 0; i < this.valueBindings.Count; i = i + 1) {
-            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-            ModelValueBinding binding = this.valueBindings[i];
-            Control c = binding.control;
-            if (c == null) { continue; }
-            string value = "";
-            bool hasValue = this.TryResolveString(c, binding.path, out value);
-            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-            if (!hasValue) {
-                throw new InvalidOperationException("Cannot resolve binding path '" + binding.path + "' on " + c.Kind());
-            }
-            string current = this.BoundValue(binding);
-            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-            if (!binding.twoWay || !binding.hasSnapshot || current == binding.snapshot) {
-                string property = this.BoundProperty(binding);
-                if (current != value) { c.SetProp(property, value); }
+        if (this.syncingValues || this.valueBindings == null) { return; }
+        this.syncingValues = true;
+        try {
+            for (int i = 0; this.valueBindings != null && i < this.valueBindings.Count; i = i + 1) {
                 if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
-                binding.snapshot = this.BoundValue(binding);
-                binding.hasSnapshot = true;
+                ModelValueBinding binding = this.valueBindings[i];
+                Control c = binding.control;
+                if (c == null) { continue; }
+                string value = "";
+                bool hasValue = this.TryResolveString(c, binding.path, out value);
                 if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                if (!hasValue) {
+                    throw new InvalidOperationException("Cannot resolve binding path '" + binding.path + "' on " + c.Kind());
+                }
+                string current = this.BoundValue(binding);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                if (!binding.twoWay || !binding.hasSnapshot || current == binding.snapshot) {
+                    string property = this.BoundProperty(binding);
+                    binding.snapshot = value;
+                    binding.hasSnapshot = true;
+                    if (current != value) { c.SetProp(property, value); }
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                    binding.snapshot = this.BoundValue(binding);
+                    binding.hasSnapshot = true;
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                }
             }
+        } finally {
+            this.syncingValues = false;
         }
     }
     public static string StripAlias(string path, string alias) {
-        if (alias != "" && path.StartsWith(alias + ".")) { return path.Substring(alias.Length + 1); }
+        if (path == null) { return ""; }
+        if (alias != null && alias != "" && path.StartsWith(alias + ".")) { return path.Substring(alias.Length + 1); }
         return path;
     }
     static string StrListJson(List<string> items) {
@@ -525,9 +542,9 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         int modelKind = binding.modelKind;
         bool numericInput = valueKind == 1 || modelKind == 1;
         bool boolInput = valueKind == 2 || modelKind == 2;
-        if (numericInput && s.Trim() != "") {
+        if (numericInput && s != null && s.Trim() != "") {
             double parsed = 0.0;
-            if (!double.TryParse(s.Trim(), out parsed)) {
+            if (!double.TryParse(s.Trim(), out parsed) || parsed != parsed || (parsed - parsed) != 0.0) {
                 throw new ArgumentException("Invalid numeric value for binding '" + binding.path + "'");
             }
         }
