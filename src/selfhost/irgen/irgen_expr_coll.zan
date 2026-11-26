@@ -3,8 +3,16 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
-    // literal format string: expand {N} placeholders through a StringBuilder
+    // literal format string: evaluate arguments once left-to-right, then expand
+    // {N} placeholders through a StringBuilder (matches C host single-eval order)
     ExprVal EmitStrFormat(Node e) {
+        List<string> argStrs = new List<string>();
+        int ai = 1;
+        while (ai < e.kids.Count) {
+            ExprVal av = GenExpr(e.kids[ai]);
+            argStrs.Add(ToCStr(av));
+            ai = ai + 1;
+        }
         string sb = NT();
         L("  " + sb + " = call i8* @zsb_new()");
         string f = e.kids[0].sval;
@@ -19,21 +27,19 @@ partial class Irgen {
                 bool overflow = false;
                 while (j < f.Length && f[j] >= 48 && f[j] <= 57) {
                     if (!overflow) {
-                        if (idx > 214748363 || idx >= e.kids.Count) { overflow = true; }
+                        if (idx > 214748363 || idx >= argStrs.Count) { overflow = true; }
                         else { idx = idx * 10 + (f[j] - 48); }
                     }
                     j = j + 1;
                     has = true;
                 }
-                if (has && !overflow && j < f.Length && f[j] == 125 && idx + 1 < e.kids.Count) {
+                if (has && !overflow && j < f.Length && f[j] == 125 && idx < argStrs.Count) {
                     if (seg != "") {
                         ExprVal sl = GenStr(seg);
                         L("  call void @zsb_append(i8* " + sb + ", i8* " + sl.op + ")");
                         seg = "";
                     }
-                    ExprVal av = GenExpr(e.kids[idx + 1]);
-                    string s = ToCStr(av);
-                    L("  call void @zsb_append(i8* " + sb + ", i8* " + s + ")");
+                    L("  call void @zsb_append(i8* " + sb + ", i8* " + argStrs[idx] + ")");
                     i = j + 1;
                     subst = true;
                 }
@@ -75,7 +81,7 @@ partial class Irgen {
                 || name == "StartsWith" || name == "EndsWith") { return argc == 1; }
         if (name == "IndexOf" || name == "Split") { return argc == 1 || argc == 2; }
         if (name == "Replace") { return argc == 2; }
-        if (name == "Trim" || name == "ToUpper" || name == "ToLower" || name == "ToString") { return argc == 0; }
+        if (name == "Trim" || name == "ToUpper" || name == "ToLower" || name == "ToString" || name == "GetHashCode") { return argc == 0; }
         if (name == "AsSpan" || name == "AsReadOnlySpan" || name == "Slice") { return argc <= 2; }
         return false;
     }
@@ -240,6 +246,10 @@ partial class Irgen {
             AddTemp(r, lt);
             return new ExprVal(r, lt);
         }
+        if (name == "GetHashCode" && e.kids.Count == 0) {
+            string h = NT(); L("  " + h + " = call i64 @zstr_hashcode(i8* " + recv.op + ")");
+            return new ExprVal(h, MkType("int"));
+        }
         if (name == "ToString" && e.kids.Count == 0) {
             // owned copy of the receiver (C-visible bytes, like the C host)
             string n = StrCLen(recv.op);
@@ -350,6 +360,42 @@ partial class Irgen {
         }
         if (name == "AddRange" && e.kids.Count == 1) {
             ExprVal other = GenExpr(e.kids[0]);
+            if (other.ty != null && other.ty.ival >= 1) {
+                Node elemTy = MkType(other.ty.sval);
+                elemTy.ival = other.ty.ival - 1;
+                elemTy.op = other.ty.op;
+                elemTy.kids = other.ty.kids;
+                Node listElemTy = ListElem(recv.ty);
+                string storage = ArrayStorage(elemTy);
+                int lnonnull = NL(); int lc = NL(); int lb = NL(); int lend = NL();
+                string isNil = NT();
+                L("  " + isNil + " = icmp eq i64* " + other.op + ", null");
+                L("  br i1 " + isNil + ", label %L" + lend + ", label %L" + lnonnull);
+                Label(lnonnull);
+                string cnt = NT();
+                L("  " + cnt + " = call i64 @zarr_len(i64* " + other.op + ")");
+                string idx = NT();
+                EA(idx, "i64");
+                L("  store i64 0, i64* " + idx);
+                L("  br label %L" + lc);
+                Label(lc);
+                string ci = NT();
+                L("  " + ci + " = load i64, i64* " + idx);
+                string done = NT();
+                L("  " + done + " = icmp uge i64 " + ci + ", " + cnt);
+                L("  br i1 " + done + ", label %L" + lend + ", label %L" + lb);
+                Label(lb);
+                string place = ArrayPlace(other.op, ci, storage);
+                ExprVal elemVal = LoadArrayElement(place, elemTy, storage);
+                string sv = StructElemSlot(elemVal, listElemTy);
+                L("  call void @zlist_add(i8* " + recv.op + ", i64 " + sv + ")");
+                string ni = NT();
+                L("  " + ni + " = add i64 " + ci + ", 1");
+                L("  store i64 " + ni + ", i64* " + idx);
+                L("  br label %L" + lc);
+                Label(lend);
+                return new ExprVal("0", MkType("void"));
+            }
             L("  call void @zlist_addrange(i8* " + recv.op + ", i8* " + other.op + ")");
             return new ExprVal("0", MkType("void"));
         }

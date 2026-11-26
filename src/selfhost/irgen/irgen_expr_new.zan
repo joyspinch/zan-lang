@@ -95,33 +95,65 @@ partial class Irgen {
         if (IsSpanType(obj.ty)) {
             Node el = SpanElem(obj.ty);
             string ity = SpanIty(el);
+            string slen = NT();
+            L("  " + slen + " = extractvalue { i8*, i64 } " + obj.op + ", 1");
+            string soob = NT();
+            L("  " + soob + " = icmp uge i64 " + idx.op + ", " + slen);
+            EmitRuntimeCheckIf(e, soob, "span index out of bounds");
+            string rty = MapType(el);
+            int ldo = NL(); int lbad = NL(); int ldone = NL();
+            L("  br i1 " + soob + ", label %L" + lbad + ", label %L" + ldo);
+            Label(ldo);
             string ep = SpanElemPtr(obj.op, idx.op, ity);
+            string loaded = "";
             if (IsStructTy(el)) {
                 string dst = AllocStructObj(el.sval);
                 InitNestedFields(dst, binder.FindType(el.sval));
                 string dv = NT();
                 L("  " + dv + " = load " + ity + ", " + ity + "* " + ep + ", align 1");
                 L("  store " + ity + " " + dv + ", " + ity + "* " + dst);
-                return new ExprVal(dst, el);
-            }
-            string v0 = NT();
-            // align 1: a span may view a raw address (protocol framing, FFI
-            // structs) whose elements are not naturally aligned.
-            L("  " + v0 + " = load " + ity + ", " + ity + "* " + ep + ", align 1");
-            if (ity == "double" || ity == "float") {
-                if (ity == "float") {
+                loaded = dst;
+            } else {
+                string v0 = NT();
+                // align 1: a span may view a raw address (protocol framing, FFI
+                // structs) whose elements are not naturally aligned.
+                L("  " + v0 + " = load " + ity + ", " + ity + "* " + ep + ", align 1");
+                if (ity == "double" || ity == "float") {
+                    if (ity == "float") {
+                        string w = NT();
+                        L("  " + w + " = fpext float " + v0 + " to double");
+                        loaded = w;
+                    } else {
+                        loaded = v0;
+                    }
+                } else if (ity == "i64" || IsDecimal(el)) {
+                    loaded = v0;
+                } else {
                     string w = NT();
-                    L("  " + w + " = fpext float " + v0 + " to double");
-                    return new ExprVal(w, el);
+                    string ext = "sext";
+                    if (SpanZext(el)) { ext = "zext"; }
+                    L("  " + w + " = " + ext + " " + ity + " " + v0 + " to i64");
+                    loaded = w;
                 }
-                return new ExprVal(v0, el);
             }
-            if (ity == "i64" || IsDecimal(el)) { return new ExprVal(v0, el); }
-            string w = NT();
-            string ext = "sext";
-            if (SpanZext(el)) { ext = "zext"; }
-            L("  " + w + " = " + ext + " " + ity + " " + v0 + " to i64");
-            return new ExprVal(w, el);
+            string doLbl = curLbl;
+            L("  br label %L" + ldone);
+            Label(lbad);
+            string zval = "0";
+            if (rty == "double" || rty == "float") { zval = "0.0"; }
+            else if (IsPtrLL(rty)) { zval = "null"; }
+            else if (rty.StartsWith("{") || rty.StartsWith("%") || rty.StartsWith("<")) { zval = "zeroinitializer"; }
+            if (IsStructTy(el)) {
+                string zdst = AllocStructObj(el.sval);
+                InitNestedFields(zdst, binder.FindType(el.sval));
+                zval = zdst;
+            }
+            string badLbl = curLbl;
+            L("  br label %L" + ldone);
+            Label(ldone);
+            string res = NT();
+            L("  " + res + " = phi " + rty + " [ " + loaded + ", %" + doLbl + " ], [ " + zval + ", %" + badLbl + " ]");
+            return new ExprVal(res, el);
         }
         if (IsDictType(obj.ty)) {
             string slot = NT();

@@ -28,6 +28,57 @@ partial class Irgen {
     // A558: System.Object fallback family (ToString/Equals/GetHashCode)
     ExprVal EmitObjectFamilyCall(ExprVal recv, string name, Node e) {
         string rty = MapType(recv.ty);
+        if (name == "GetHashCode" && recv.ty != null && recv.ty.ival == 0) {
+            string tn = recv.ty.sval;
+            if (tn == "float") {
+                string f32 = NT();
+                if (rty == "double") {
+                    string ft = NT();
+                    L("  " + ft + " = fptrunc double " + recv.op + " to float");
+                    L("  " + f32 + " = bitcast float " + ft + " to i32");
+                } else {
+                    L("  " + f32 + " = bitcast float " + recv.op + " to i32");
+                }
+                string f64 = NT();
+                L("  " + f64 + " = sext i32 " + f32 + " to i64");
+                return new ExprVal(f64, MkType("int"));
+            }
+            if (tn == "double") {
+                string bits = NT();
+                L("  " + bits + " = bitcast double " + recv.op + " to i64");
+                string hi = NT();
+                L("  " + hi + " = lshr i64 " + bits + ", 32");
+                string xr = NT();
+                L("  " + xr + " = xor i64 " + bits + ", " + hi);
+                return new ExprVal(WrapArith(xr, 32, false), MkType("int"));
+            }
+            if (tn == "bool") {
+                string b1 = NT();
+                L("  " + b1 + " = and i64 " + recv.op + ", 1");
+                return new ExprVal(b1, MkType("int"));
+            }
+            if (tn == "byte" || tn == "sbyte") {
+                string b8 = NT();
+                L("  " + b8 + " = and i64 " + recv.op + ", 255");
+                return new ExprVal(b8, MkType("int"));
+            }
+            if (tn == "char" || tn == "short" || tn == "ushort") {
+                string b16 = NT();
+                L("  " + b16 + " = and i64 " + recv.op + ", 65535");
+                return new ExprVal(b16, MkType("int"));
+            }
+            Node et = binder.FindType(tn);
+            if (tn == "int" || tn == "uint" || (et != null && et.kind == AK.EnumDecl())) {
+                return new ExprVal(WrapArith(recv.op, 32, false), MkType("int"));
+            }
+            if (tn == "long" || tn == "ulong" || tn == "nint" || tn == "nuint") {
+                string hi = NT();
+                L("  " + hi + " = lshr i64 " + recv.op + ", 32");
+                string xr = NT();
+                L("  " + xr + " = xor i64 " + recv.op + ", " + hi);
+                return new ExprVal(WrapArith(xr, 32, false), MkType("int"));
+            }
+        }
         string recvRaw = NT();
         if (rty == "i8*") {
             recvRaw = recv.op;
@@ -130,9 +181,9 @@ partial class Irgen {
         int ldef = NL();
 
         // an object holding a STRING (header: no class id, string magic)
-        // answers with the string itself / compares contents (the host's
-        // object-family string path)
-        if (name == "ToString" || (name == "Equals" && argRaw != "")) {
+        // answers with the string itself / compares contents / hashes djb2
+        // (matching C host object-family string path)
+        if (name == "ToString" || name == "GetHashCode" || (name == "Equals" && argRaw != "")) {
             int lprobe = NL(); int lstr = NL(); int lnot = NL();
             string rn = NT();
             L("  " + rn + " = icmp eq i8* " + recvRaw + ", null");
@@ -144,6 +195,11 @@ partial class Irgen {
             if (name == "ToString") {
                 L("  call void @zstrv_retain(i8* " + recvRaw + ")");
                 L("  store i8* " + recvRaw + ", i8** " + resSlot);
+                L("  br label %L" + lend);
+            } else if (name == "GetHashCode") {
+                string sh = NT();
+                L("  " + sh + " = call i64 @zstr_hashcode(i8* " + recvRaw + ")");
+                L("  store i64 " + sh + ", i64* " + resSlot);
                 L("  br label %L" + lend);
             } else {
                 int laprobe = NL(); int lacmp = NL(); int lfalse = NL();

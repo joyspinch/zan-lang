@@ -403,7 +403,9 @@ partial class Irgen {
                     if (!ExternSeen(lf)) { externDecls.Add(lf); H("declare i32 @" + lf + "(i32)"); }
                     string mr = NT();
                     L("  " + mr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
-                    return new ExprVal(mr, MkType("int"));
+                    string mr64 = NT();
+                    L("  " + mr64 + " = sext i32 " + mr + " to i64");
+                    return new ExprVal(mr64, MkType("int"));
                 }
                 if (cm == "IsDigit" || cm == "IsLetter" || cm == "IsLetterOrDigit"
                         || cm == "IsUpper" || cm == "IsLower" || cm == "IsWhiteSpace") {
@@ -417,7 +419,9 @@ partial class Irgen {
                     L("  " + pr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
                     string nz = NT();
                     L("  " + nz + " = icmp ne i32 " + pr + ", 0");
-                    return new ExprVal(nz, MkType("bool"));
+                    string nz64 = NT();
+                    L("  " + nz64 + " = zext i1 " + nz + " to i64");
+                    return new ExprVal(nz64, MkType("bool"));
                 }
             }
             if (boolRecv && callee.sval == "Parse" && e.kids.Count == 1) {
@@ -715,26 +719,47 @@ partial class Irgen {
             ExprVal bv = GenBuiltinStatic(callee.a.sval, callee.sval, e);
             if (bv != null) { return bv; }
         }
-        // String.CompareOrdinal(a, b) -> strcmp: a compiler intrinsic in the
-        // C host (irgen_call.c), not a stdlib method. Byte-wise ordinal
-        // compare of two NUL-terminated strings.
+        // String.CompareOrdinal(a, b) -> null-safe ordinal compare of two
+        // strings (matching C host call_dispatch.c: null == null -> 0,
+        // null < non-null -> -1, non-null > null -> 1, else byte compare).
         if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && LocalIdx(callee.a.sval) < 0
             && (callee.a.sval == "String" || callee.a.sval == "string")
             && callee.sval == "CompareOrdinal" && e.kids.Count == 2) {
             ExprVal a = GenExpr(e.kids[0]);
             ExprVal b = GenExpr(e.kids[1]);
-            if (!ExternSeen("strcmp")) { externDecls.Add("strcmp"); H("declare i32 @strcmp(i8*, i8*)"); }
+            string slot = NT(); EA(slot, "i64");
+            int lsame = NL(); int lchkA = NL(); int lnullA = NL();
+            int lchkB = NL(); int lnullB = NL(); int lcmp = NL(); int ldone = NL();
+            string peq = NT(); L("  " + peq + " = icmp eq i8* " + a.op + ", " + b.op);
+            L("  br i1 " + peq + ", label %L" + lsame + ", label %L" + lchkA);
+            Label(lsame);
+            L("  store i64 0, i64* " + slot);
+            L("  br label %L" + ldone);
+            Label(lchkA);
+            string an = NT(); L("  " + an + " = icmp eq i8* " + a.op + ", null");
+            L("  br i1 " + an + ", label %L" + lnullA + ", label %L" + lchkB);
+            Label(lnullA);
+            L("  store i64 -1, i64* " + slot);
+            L("  br label %L" + ldone);
+            Label(lchkB);
+            string bn = NT(); L("  " + bn + " = icmp eq i8* " + b.op + ", null");
+            L("  br i1 " + bn + ", label %L" + lnullB + ", label %L" + lcmp);
+            Label(lnullB);
+            L("  store i64 1, i64* " + slot);
+            L("  br label %L" + ldone);
+            Label(lcmp);
             string r0 = NT();
-            L("  " + r0 + " = call i32 @strcmp(i8* " + a.op + ", i8* " + b.op + ")");
-            // strcmp's magnitude is the platform's (Apple libc returns the
-            // byte difference, MSVCRT +-1): the ordinal result is its SIGN
+            L("  " + r0 + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
             string gt = NT(); L("  " + gt + " = icmp sgt i32 " + r0 + ", 0");
             string lt = NT(); L("  " + lt + " = icmp slt i32 " + r0 + ", 0");
             string g64 = NT(); L("  " + g64 + " = zext i1 " + gt + " to i64");
             string l64 = NT(); L("  " + l64 + " = zext i1 " + lt + " to i64");
-            string r = NT();
-            L("  " + r + " = sub i64 " + g64 + ", " + l64);
+            string rc = NT(); L("  " + rc + " = sub i64 " + g64 + ", " + l64);
+            L("  store i64 " + rc + ", i64* " + slot);
+            L("  br label %L" + ldone);
+            Label(ldone);
+            string r = NT(); L("  " + r + " = load i64, i64* " + slot);
             return new ExprVal(r, MkType("int"));
         }
         // method access forms

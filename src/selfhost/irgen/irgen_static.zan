@@ -289,7 +289,44 @@ partial class Irgen {
         if (at >= 0) { L("  ; zan.sinit @" + sinitSyms[at]); }
     }
 
+    bool HasModuleInitializerAttr(Node m) {
+        if (m == null) { return false; }
+        if (m.attrBlob != null && m.attrBlob != "") {
+            if (m.attrBlob.IndexOf("ModuleInitializer=") == 0
+                || m.attrBlob.IndexOf(";ModuleInitializer=") >= 0) {
+                return true;
+            }
+        }
+        if (m.attributes == null) { return false; }
+        int i = 0;
+        while (i < m.attributes.Count) {
+            Node attr = m.attributes[i];
+            if (attr != null && attr.sval != null) {
+                int dot = attr.sval.LastIndexOf(".");
+                string tail = dot >= 0 ? attr.sval.Substring(dot + 1) : attr.sval;
+                if (tail == "ModuleInitializer" || tail == "ModuleInitializerAttribute") {
+                    return true;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
     void NoteStaticExport(Node cls, Node m, string sym) {
+        if (HasModuleInitializerAttr(m) && IsStatic(m) && TParams(cls).Count == 0
+            && TParams(m).Count == 0 && curInstArgs.Count == 0
+            && IndexOfStr(moduleInitSyms, sym) < 0) {
+            bool hasParams = false;
+            int pi = 0;
+            while (pi < m.kids.Count) {
+                if (m.kids[pi].kind == AK.Param()) { hasParams = true; break; }
+                pi = pi + 1;
+            }
+            if (!hasParams && (m.type == null || m.type.sval == "void")) {
+                moduleInitSyms.Add(sym);
+            }
+        }
         if (!libOut || HasMod(m, MOD.Private()) || TParams(cls).Count != 0
             || TParams(m).Count != 0 || IndexOfStr(sinitExportRoots, sym) >= 0) { return; }
         if (nativeLibraryDependencyLine > 0 && (m.line >= nativeLibraryDependencyLine
@@ -498,6 +535,12 @@ partial class Irgen {
             if (defs.ContainsKey(sym)) { StaticEnqueue(defs[sym], live, queue, 1); }
             i = i + 1;
         }
+        i = 0;
+        while (i < moduleInitSyms.Count) {
+            string sym = moduleInitSyms[i];
+            if (defs.ContainsKey(sym)) { StaticEnqueue(defs[sym], live, queue, 1); }
+            i = i + 1;
+        }
         StaticReach(functions, defs, live, queue);
 
         // The global fixed point has resolved every dispatch edge that any
@@ -551,6 +594,13 @@ partial class Irgen {
         i = 0;
         while (i < order.Count) {
             result.Append("  call void @" + sinitSyms[order[i]] + "()\n");
+            i = i + 1;
+        }
+        i = 0;
+        while (i < moduleInitSyms.Count) {
+            if (defs.ContainsKey(moduleInitSyms[i])) {
+                result.Append("  call void @" + moduleInitSyms[i] + "()\n");
+            }
             i = i + 1;
         }
         result.Append("  ret void\n}\n");
