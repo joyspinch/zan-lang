@@ -22,7 +22,7 @@ public class BsonWriter {
     public int len;
 
     public BsonWriter() {
-        buf = new byte[64];
+        buf = new byte[256];
         len = 0;
     }
 
@@ -62,13 +62,16 @@ public class BsonWriter {
 
     public void RawU64LE(long v) {
         EnsureRoom(8);
-        int i = 0;
-        while (i < 8) {
-            buf[len + i] = (byte)v;
-            v = v >> 8;
-            i = i + 1;
-        }
-        len = len + 8;
+        int p = len;
+        buf[p] = (byte)v;
+        buf[p + 1] = (byte)(v >> 8);
+        buf[p + 2] = (byte)(v >> 16);
+        buf[p + 3] = (byte)(v >> 24);
+        buf[p + 4] = (byte)(v >> 32);
+        buf[p + 5] = (byte)(v >> 40);
+        buf[p + 6] = (byte)(v >> 48);
+        buf[p + 7] = (byte)(v >> 56);
+        len = p + 8;
     }
 
     // 追加一段已编码字节（嵌套文档/数组整体拼接用）。
@@ -82,30 +85,68 @@ public class BsonWriter {
     // 供门面在拼接嵌套值前写类型用。
     public void RawType(int t) { RawU8(t); }
 
+    // 预留 4 字节文档长度头，返回文档起点偏移（配合 EndDocument 原地回填，消除嵌套子缓冲分配与拷贝）。
+    public int BeginDocument() {
+        int start = len;
+        EnsureRoom(4);
+        len = len + 4;
+        return start;
+    }
+
+    // 写入文档终止 NUL 并在 start 处原地回填 4 字节小端总长度。
+    public void EndDocument(int start) {
+        RawU8(0);
+        int total = len - start;
+        buf[start] = (byte)total;
+        buf[start + 1] = (byte)(total >> 8);
+        buf[start + 2] = (byte)(total >> 16);
+        buf[start + 3] = (byte)(total >> 24);
+    }
+
+    // 拷贝当前已写入字节 [0, len) 成精确长度数组。
+    public byte[] ToBytes() {
+        byte[] out2 = new byte[len];
+        if (len > 0) {
+            NativeMemory.Copy((nint)out2, (nint)buf, len);
+        }
+        return out2;
+    }
+
     // cstring（元素名）：字节后补一个 NUL。键含 NUL
-    // 无法在线上表示，抛 BsonException。
+    // 无法在线上表示，抛 BsonException。零中间 byte[] 分配直写。
     public void CStr(string s) {
-        byte[] b = Encoding.GetBytes(s);
-        int n = b.Length;
-        int i = 0;
-        while (i < n) {
-            if ((b[i] & 255) == 0) {
+        int n = s.Length;
+        if (n > 0) {
+            if (NativeMemory.Find((nint)s, 0, 0, n) >= 0) {
                 throw new BsonException("key contains NUL: " + s);
             }
-            i = i + 1;
+            EnsureRoom(n + 1);
+            NativeMemory.PutString((nint)buf, len, s, n);
+            len = len + n;
+            buf[len] = 0;
+            len = len + 1;
+        } else {
+            RawU8(0);
         }
-        RawBytes(b);
-        RawU8(0);
     }
 
     // string 值：int32 字节数（含终止 NUL）+ UTF-8 字节 +
     // NUL。长度前缀消歧，值内 NUL 合法（bson-corpus "Embedded
-    // nulls" 向量）；cstring 键才禁 NUL（见 CStr）。
+    // nulls" 向量）；cstring 键才禁 NUL（见 CStr）。零中间 byte[] 直写。
     public void WriteString(string s) {
-        byte[] b = Encoding.GetBytes(s);
-        RawU32LE(b.Length + 1);
-        RawBytes(b);
-        RawU8(0);
+        int n = s.Length;
+        int slen = n + 1;
+        EnsureRoom(n + 5);
+        int p = len;
+        buf[p] = (byte)slen;
+        buf[p + 1] = (byte)(slen >> 8);
+        buf[p + 2] = (byte)(slen >> 16);
+        buf[p + 3] = (byte)(slen >> 24);
+        if (n > 0) {
+            NativeMemory.PutString((nint)buf, p + 4, s, n);
+        }
+        buf[p + 4 + n] = 0;
+        len = p + 5 + n;
     }
 
     public void WriteDouble(double d) {

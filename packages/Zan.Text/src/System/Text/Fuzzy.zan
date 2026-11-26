@@ -32,40 +32,53 @@ public class Fuzzy {
     // [0,1] 的相似度：完全匹配（忽略大小写）为 1.0，
     // 有间隔则递减。连续片段、词首和驼峰边界有加分
     // （因此对 "FileList"，"flst" 优于 "flts"）。
-    // `query` 不是子序列时返回 0。
+    // `query` 不是子序列时返回 0。单遍融合扫描，消除三遍重复遍历。
     public static double Score(string query, string candidate) {
         if (query == null || query.Length == 0) { return 1.0; }
         if (candidate == null || candidate.Length == 0) { return 0.0; }
-        if (!Fuzzy.Matches(query, candidate)) { return 0.0; }
-        if (Fuzzy.SameStrIgnoreCase(query, candidate)) { return 1.0; }
+        int qlen = query.Length;
+        int clen = candidate.Length;
+        if (qlen > clen) { return 0.0; }
 
-        // 贪婪最左匹配，统计连续长度与边界命中。
         int score = 0;
         int qi = 0;
         int run = 0;
-        int qlen = query.Length;
-        int clen = candidate.Length;
-        for (int ci = 0; ci < clen && qi < qlen; ci = ci + 1) {
-            int qa = query[qi] & 255;
-            int ca = candidate[ci] & 255;
-            if (Fuzzy.SameByte(qa, ca)) {
+        int qa = query[0] & 255;
+        if (qa >= 65 && qa <= 90) { qa = qa + 32; }
+        int prevC = 0;
+        for (int ci = 0; ci < clen; ci = ci + 1) {
+            int rawC = candidate[ci] & 255;
+            int ca = (rawC >= 65 && rawC <= 90) ? (rawC + 32) : rawC;
+            if (qa == ca) {
                 run = run + 1;
-                // 连续匹配比孤立字符得分更高。
-                int gain = 1;
-                if (run >= 2) { gain = 2; }
-                // 边界加分：词首或驼峰边界。
+                int gain = run >= 2 ? 2 : 1;
                 if (run == 1) {
-                    if (ci == 0 || Fuzzy.IsBoundary(candidate, ci)) { gain = 3; }
+                    if (ci == 0) {
+                        gain = 3;
+                    } else {
+                        bool prevAlpha = (prevC >= 65 && prevC <= 90) || (prevC >= 97 && prevC <= 122);
+                        bool curAlpha = (rawC >= 65 && rawC <= 90) || (rawC >= 97 && rawC <= 122);
+                        if ((!prevAlpha && curAlpha) || ((prevC >= 97 && prevC <= 122) && (rawC >= 65 && rawC <= 90))) {
+                            gain = 3;
+                        }
+                    }
                 }
                 score = score + gain;
                 qi = qi + 1;
+                if (qi == qlen) {
+                    if (qlen == clen) { return 1.0; }
+                    return (double)score / (double)(qlen * 3);
+                }
+                qa = query[qi] & 255;
+                if (qa >= 65 && qa <= 90) { qa = qa + 32; }
             } else {
                 run = 0;
+                // 剩余字符数已不足匹配剩余 query，提前剪枝退出
+                if (clen - ci - 1 < qlen - qi) { return 0.0; }
             }
+            prevC = rawC;
         }
-        double maxScore = (double)(query.Length * 3);
-        double s = (double)score;
-        return s / maxScore;
+        return 0.0;
     }
 
     // 判断 s[i] 是否落在词边界上：边界指紧跟非字母的字母，

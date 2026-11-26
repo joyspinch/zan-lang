@@ -15,20 +15,41 @@ public class Bson {
     // 递归深度上限（编码/解码两侧一起限）。
     public static int MaxDepth = 512;
 
+    // 预生成常用数组下标键 "0".."63"，避免数组编码热点频繁 Convert.ToString 分配。
+    private static string[] s_idxKeys;
+
+    private static string ArrayIndexKey(int i) {
+        if (i >= 0 && i < 64) {
+            if (Bson.s_idxKeys == null) {
+                string[] tbl = new string[64];
+                for (int k = 0; k < 64; k = k + 1) {
+                    tbl[k] = Convert.ToString(k);
+                }
+                Bson.s_idxKeys = tbl;
+            }
+            return Bson.s_idxKeys[i];
+        }
+        return Convert.ToString(i);
+    }
+
     // 把文档编码成 BSON 字节。根必须是对象；键不得含
-    // NUL（cstring 语义）。
+    // NUL（cstring 语义）。单缓冲原地回填长度头，消除递归子缓冲与重复拷贝。
     public static byte[] Pack(JsonValue v) {
         if (v == null || !v.IsObject()) {
             throw new BsonException("root must be a document (object)");
         }
         BsonWriter w = new BsonWriter();
-        int n = v.Count();
+        int start = w.BeginDocument();
+        List<string> ks = v.keys;
+        List<JsonValue> vs = v.vals;
+        int n = ks != null ? ks.Count : 0;
         int i = 0;
         while (i < n) {
-            EncodeElement(w, v.KeyAt(i), v.ValAt(i), 0);
+            EncodeElement(w, ks[i], vs[i], 0);
             i = i + 1;
         }
-        return w.FinishDocument();
+        w.EndDocument(start);
+        return w.ToBytes();
     }
 
     // 解码整段 BSON 字节的首个文档（非法即抛 BsonException）。
@@ -77,25 +98,34 @@ public class Bson {
         }
         if (v.IsString()) { w.RawType(2); w.CStr(key); w.WriteString(v.AsString("")); return; }
         if (v.IsArray()) {
-            BsonWriter child = new BsonWriter();
-            int n = v.Count();
-            int i = 0;
-            while (i < n) {
-                EncodeElement(child, Convert.ToString(i), v.At(i), depth + 1);
-                i = i + 1;
+            w.RawType(4); w.CStr(key);
+            int start = w.BeginDocument();
+            if (v.numArr != null) {
+                double[] na = v.numArr;
+                int n = na.Length;
+                for (int i = 0; i < n; i = i + 1) {
+                    w.RawType(1); w.CStr(Bson.ArrayIndexKey(i)); w.WriteDouble(na[i]);
+                }
+            } else if (v.items != null) {
+                List<JsonValue> items = v.items;
+                int n = items.Count;
+                for (int i = 0; i < n; i = i + 1) {
+                    EncodeElement(w, Bson.ArrayIndexKey(i), items[i], depth + 1);
+                }
             }
-            w.RawType(4); w.CStr(key); w.RawBytes(child.FinishDocument());
+            w.EndDocument(start);
             return;
         }
         if (v.IsObject()) {
-            BsonWriter child = new BsonWriter();
-            int n = v.Count();
-            int i = 0;
-            while (i < n) {
-                EncodeElement(child, v.KeyAt(i), v.ValAt(i), depth + 1);
-                i = i + 1;
+            w.RawType(3); w.CStr(key);
+            int start = w.BeginDocument();
+            List<string> ks = v.keys;
+            List<JsonValue> vs = v.vals;
+            int n = ks != null ? ks.Count : 0;
+            for (int i = 0; i < n; i = i + 1) {
+                EncodeElement(w, ks[i], vs[i], depth + 1);
             }
-            w.RawType(3); w.CStr(key); w.RawBytes(child.FinishDocument());
+            w.EndDocument(start);
             return;
         }
         throw new BsonException("unsupported value kind while packing");

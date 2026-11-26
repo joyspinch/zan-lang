@@ -85,54 +85,81 @@ public class Encoding {
             return bytes.ToStr(offset, count);
         }
 
-        StringBuilder sb = new StringBuilder();
+        // 零分配 UTF-8 合法性验证 + 批量 span 冲刷：
+        // 100% 合法 UTF-8（绝大多数中文业务报文/JSON/HTML）走零堆分配验证循环后单次 ToStr 整体拷贝；
+        // 仅在真正出现非法字节时才惰性创建 StringBuilder，并按连续合法区间用 StringView 批量冲刷。
+        StringBuilder sb = null;
+        string repl = null;
+        nint bp = (nint)bytes;
+        int validStart = offset;
         int i = offset;
         int end = offset + count;
         while (i < end) {
             int b0 = bytes[i] & 255;
             if (b0 < 128) {
-                // 批量快进连续 ASCII 片段，避免对每一个单字节字符单独分配中间字符串
-                int asciiStart = i;
                 i = i + 1;
                 while (i < end && (bytes[i] & 255) < 128) {
                     i = i + 1;
                 }
-                sb.Append(bytes.ToStr(asciiStart, i - asciiStart));
                 continue;
             }
-            int need = 0;  // 首字节后还需要的续字节数
-            int cp = 0;
-            if (b0 >= 194 && b0 <= 223) { need = 1; cp = b0 & 31; }
-            else if (b0 >= 224 && b0 <= 239) { need = 2; cp = b0 & 15; }
-            else if (b0 >= 240 && b0 <= 244) { need = 3; cp = b0 & 7; }
-            if (need == 0 || i + need > end - 1) {
-                // 非法首字节，或序列尾部越出窗口（end 是开区间）：替换字符
-                sb.Append(Utf8FromCodePoint(65533));
-                i = i + 1;
+            bool ok = false;
+            int step = 1;
+            if (b0 >= 194 && b0 <= 223) {
+                if (i + 1 < end) {
+                    int b1 = bytes[i + 1] & 255;
+                    if ((b1 & 192) == 128) {
+                        ok = true;
+                        step = 2;
+                    }
+                }
+            } else if (b0 >= 224 && b0 <= 239) {
+                if (i + 2 < end) {
+                    int b1 = bytes[i + 1] & 255;
+                    int b2 = bytes[i + 2] & 255;
+                    if ((b1 & 192) == 128 && (b2 & 192) == 128) {
+                        // 排除过短编码 (< 0x800: b0==0xE0 && b1<0xA0) 与 UTF-16 代理区 (0xD800..0xDFFF: b0==0xED && b1>=0xA0)
+                        if (!((b0 == 224 && b1 < 160) || (b0 == 237 && b1 >= 160))) {
+                            ok = true;
+                            step = 3;
+                        }
+                    }
+                }
+            } else if (b0 >= 240 && b0 <= 244) {
+                if (i + 3 < end) {
+                    int b1 = bytes[i + 1] & 255;
+                    int b2 = bytes[i + 2] & 255;
+                    int b3 = bytes[i + 3] & 255;
+                    if ((b1 & 192) == 128 && (b2 & 192) == 128 && (b3 & 192) == 128) {
+                        // 排除过短编码 (< 0x10000: b0==0xF0 && b1<0x90) 与超上限 (> 0x10FFFF: b0==0xF4 && b1>=0x90)
+                        if (!((b0 == 240 && b1 < 144) || (b0 == 244 && b1 >= 144))) {
+                            ok = true;
+                            step = 4;
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                i = i + step;
                 continue;
             }
-            int k = 1;
-            bool bad = false;
-            while (k <= need) {
-                int bx = bytes[i + k] & 255;
-                if ((bx & 192) != 128) { bad = true; break; }
-                cp = (cp << 6) | (bx & 63);
-                k = k + 1;
+            // 非法字节：冲刷此前合法区间并写入 U+FFFD
+            if (sb == null) {
+                sb = new StringBuilder(count + 16);
+                repl = Utf8FromCodePoint(65533);
             }
-            if (bad) {
-                sb.Append(Utf8FromCodePoint(65533));
-                i = i + 1;
-                continue;
+            if (i > validStart) {
+                sb.Append(new StringView(bp + (nint)validStart, i - validStart));
             }
-            // 过短编码（如 2 字节编码 < 128）按 C# 语义仍替换
-            int min = need == 1 ? 128 : (need == 2 ? 2048 : 65536);
-            if (cp < min || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
-                sb.Append(Utf8FromCodePoint(65533));
-                i = i + 1;
-                continue;
-            }
-            sb.Append(bytes.ToStr(i, need + 1));
-            i = i + need + 1;
+            sb.Append(repl);
+            i = i + 1;
+            validStart = i;
+        }
+        if (sb == null) {
+            return bytes.ToStr(offset, count);
+        }
+        if (end > validStart) {
+            sb.Append(new StringView(bp + (nint)validStart, end - validStart));
         }
         return sb.ToString();
     }
@@ -305,7 +332,7 @@ public class Encoding {
         return "";
     }
 
-    // 对字符串进行 URL 编码。
+    // 对字符串进行 URL 编码。单次字节缓冲直写，零中间 string 分配。
     public static string UrlEncode(string text) {
         if (text == null) { return ""; }
         int len = text.Length;
@@ -317,38 +344,35 @@ public class Encoding {
                   c == 46 || c == 126)) { break; }
         }
         if (i == len) { return text; }
-        StringBuilder sb = new StringBuilder();
-        if (i > 0) { sb.Append(text.Substring(0, i)); }
+        byte[] outBuf = new byte[len * 3];
+        if (i > 0) { NativeMemory.PutString((nint)outBuf, 0, text, i); }
+        int di = i;
         while (i < len) {
             int c = text[i] & 255;
             if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
                 (c >= 48 && c <= 57) || c == 45 || c == 95 ||
                 c == 46 || c == 126) {
-                int run = i;
-                while (run < len) {
-                    int c2 = text[run] & 255;
-                    if (!((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122) ||
-                          (c2 >= 48 && c2 <= 57) || c2 == 45 || c2 == 95 ||
-                          c2 == 46 || c2 == 126)) { break; }
-                    run = run + 1;
-                }
-                sb.Append(text.Substring(i, run - i));
-                i = run;
-                continue;
+                outBuf[di] = (byte)c;
+                di = di + 1;
             } else if (c == 32) {
-                sb.Append("+");
+                outBuf[di] = 43;  // '+'
+                di = di + 1;
             } else {
-                sb.Append("%");
-                sb.Append(ByteToHex(c));
+                int hi = (c >> 4) & 15;
+                int lo = c & 15;
+                outBuf[di] = 37;  // '%'
+                outBuf[di + 1] = (byte)(hi < 10 ? hi + 48 : hi + 87);
+                outBuf[di + 2] = (byte)(lo < 10 ? lo + 48 : lo + 87);
+                di = di + 3;
             }
             i = i + 1;
         }
-        return sb.ToString();
+        return outBuf.ToStr(0, di);
     }
 
     // 对 application/x-www-form-urlencoded 字符串进行 URL 解码：
     // '+' 变为空格，每个 %XX 转义解码为其对应字节。
-    // 格式错误的转义原样保留。
+    // 格式错误的转义原样保留。单次字节缓冲直写，零中间 string 分配。
     public static string UrlDecode(string text) {
         if (text == null) { return ""; }
         int len = text.Length;
@@ -358,39 +382,38 @@ public class Encoding {
             if (c == 43 || c == 37) { break; }
         }
         if (i == len) { return text; }
-        StringBuilder sb = new StringBuilder();
-        if (i > 0) { sb.Append(text.Substring(0, i)); }
+        byte[] outBuf = new byte[len];
+        if (i > 0) { NativeMemory.PutString((nint)outBuf, 0, text, i); }
+        int di = i;
         while (i < len) {
             int c = text[i] & 255;
             if (c == 43) {
-                sb.Append(" ");
+                outBuf[di] = 32;  // ' '
+                di = di + 1;
                 i = i + 1;
             } else if (c == 37 && i + 2 < len) {
                 int h = Encoding.HexDigit(text[i + 1] & 255);
                 int l = Encoding.HexDigit(text[i + 2] & 255);
                 if (h >= 0 && l >= 0) {
-                    sb.Append(Encoding.CharFromCode(h * 16 + l));
+                    outBuf[di] = (byte)((h << 4) | l);
+                    di = di + 1;
                     i = i + 3;
                 } else {
-                    sb.Append("%");
+                    outBuf[di] = 37;
+                    di = di + 1;
                     i = i + 1;
                 }
             } else {
-                int run = i;
-                while (run < len) {
-                    int c2 = text[run] & 255;
-                    if (c2 == 43 || c2 == 37) { break; }
-                    run = run + 1;
-                }
-                sb.Append(text.Substring(i, run - i));
-                i = run;
+                outBuf[di] = (byte)c;
+                di = di + 1;
+                i = i + 1;
             }
         }
-        return sb.ToString();
+        return outBuf.ToStr(0, di);
     }
 
     // 对文本转义，以便安全嵌入 HTML 元素或属性
-    // 内容（&lt; &gt; &amp; &quot; &#39;）。
+    // 内容（&lt; &gt; &amp; &quot; &#39;）。使用 StringView 切片，零中间子串分配。
     public static string HtmlEncode(string text) {
         if (text == null) { return ""; }
         int len = text.Length;
@@ -400,8 +423,9 @@ public class Encoding {
             if (c == 60 || c == 62 || c == 38 || c == 34 || c == 39) { break; }
         }
         if (i == len) { return text; }
-        StringBuilder sb = new StringBuilder();
-        if (i > 0) { sb.Append(text.Substring(0, i)); }
+        StringBuilder sb = new StringBuilder(len + 32);
+        nint tp = (nint)text;
+        if (i > 0) { sb.Append(new StringView(tp, i)); }
         while (i < len) {
             int c = text[i] & 255;
             if (c == 60) { sb.Append("&lt;"); }
@@ -410,13 +434,13 @@ public class Encoding {
             else if (c == 34) { sb.Append("&quot;"); }
             else if (c == 39) { sb.Append("&#39;"); }
             else {
-                int run = i;
+                int run = i + 1;
                 while (run < len) {
                     int c2 = text[run] & 255;
                     if (c2 == 60 || c2 == 62 || c2 == 38 || c2 == 34 || c2 == 39) { break; }
                     run = run + 1;
                 }
-                sb.Append(text.Substring(i, run - i));
+                sb.Append(new StringView(tp + (nint)i, run - i));
                 i = run;
                 continue;
             }
@@ -637,6 +661,12 @@ public class Encoding {
     // 调用方持有的 20 字节缓冲区 <paramref name="digest"/>。消息长度
     // 字段按 64 位写出（高低 32 位分开搬，(long)len*8 不经 int，避免 i32 回绕）。
     public static void Sha1(string data, int len, byte[] digest) {
+        if (digest != null && digest.Length >= 20 && len >= 0) {
+            nint src = (len > 0 && data != null) ? (nint)data : (nint)"";
+            if (NativeMemory.Sha1Into(src, (long)len, (nint)digest) >= 0) {
+                return;
+            }
+        }
         long h0 = 1732584193;  // 0x67452301
         long h1 = 4023233417;  // 0xEFCDAB89
         long h2 = 2562383102;  // 0x98BADCFE

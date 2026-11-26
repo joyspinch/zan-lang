@@ -15,12 +15,13 @@ public class Template {
         return Template.Expand(text, vars, false);
     }
 
-    // 对字符串做 HTML 转义（& < > " '）。
+    // 对字符串做 HTML 转义（& < > " '），StringView 零中间子串分配。
     public static string EscapeHtml(string s) {
         if (s == null) { return ""; }
         int len = s.Length;
         int last = 0;
         StringBuilder sb = null;
+        nint sp = (nint)s;
         for (int i = 0; i < len; i = i + 1) {
             int c = s[i] & 255;
             string esc = null;
@@ -30,15 +31,53 @@ public class Template {
             else if (c == 34) { esc = "&quot;"; }
             else if (c == 39) { esc = "&#39;"; }
             if (esc != null) {
-                if (sb == null) { sb = new StringBuilder(); }
-                if (i > last) { sb.Append(s.Substring(last, i - last)); }
+                if (sb == null) { sb = new StringBuilder(len + 16); }
+                if (i > last) { sb.Append(new StringView(sp + (nint)last, i - last)); }
                 sb.Append(esc);
                 last = i + 1;
             }
         }
         if (sb == null) { return s; }
-        if (last < len) { sb.Append(s.Substring(last, len - last)); }
+        if (last < len) { sb.Append(new StringView(sp + (nint)last, len - last)); }
         return sb.ToString();
+    }
+
+    // 流式 HTML 转义写入目标 StringBuilder（无中间 StringBuilder/string 分配）。
+    private static void AppendEscapedHtml(StringBuilder sb, string s) {
+        if (s == null || s.Length == 0) { return; }
+        int len = s.Length;
+        int last = 0;
+        nint sp = (nint)s;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            string esc = null;
+            if (c == 38) { esc = "&amp;"; }
+            else if (c == 60) { esc = "&lt;"; }
+            else if (c == 62) { esc = "&gt;"; }
+            else if (c == 34) { esc = "&quot;"; }
+            else if (c == 39) { esc = "&#39;"; }
+            if (esc != null) {
+                if (i > last) { sb.Append(new StringView(sp + (nint)last, i - last)); }
+                sb.Append(esc);
+                last = i + 1;
+            }
+        }
+        if (last < len) { sb.Append(new StringView(sp + (nint)last, len - last)); }
+    }
+
+    // 裁剪切片 [ks, ke) 首尾空白后构造键字符串（避免 Substring + Trim 双次分配）。
+    private static string TrimmedSlice(string text, int ks, int ke) {
+        while (ks < ke) {
+            int c = text[ks] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            ks = ks + 1;
+        }
+        while (ke > ks) {
+            int c = text[ke - 1] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            ke = ke - 1;
+        }
+        return ks < ke ? text.Substring(ks, ke - ks) : "";
     }
 
     // 替换核心：扫描 {{key}} / {{{key}}} 占位符（键两侧空白会被裁剪）；
@@ -46,41 +85,48 @@ public class Template {
     public static string Expand(string text, Dictionary<string, string> vars, bool escape) {
         if (text == null) { return ""; }
         int n = text.Length;
-        if (n == 0 || text.IndexOf("{{") < 0) { return text; }
+        if (n == 0) { return ""; }
+        int open = text.IndexOf("{{");
+        if (open < 0) { return text; }
 
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(n + 32);
+        nint tp = (nint)text;
         int i = 0;
         while (i < n) {
-            int open = Template.Find(text, "{{", i);
+            if (i > 0) { open = text.IndexOf("{{", i); }
             if (open < 0) {
-                sb.Append(text.Substring(i, n - i));
+                sb.Append(new StringView(tp + (nint)i, n - i));
                 return sb.ToString();
             }
-            sb.Append(text.Substring(i, open - i));
+            if (open > i) { sb.Append(new StringView(tp + (nint)i, open - i)); }
             if (open + 2 < n && (text[open + 2] & 255) == 123) {
                 // {{{key}}} 原样形式
-                int close = Template.Find(text, "}}}", open + 3);
+                int close = text.IndexOf("}}}", open + 3);
                 if (close < 0) { return sb.ToString(); }
-                string key = Template.Trim(text.Substring(open + 3, close - open - 3));
-                sb.Append(Template.Lookup(key, vars));
+                string key = Template.TrimmedSlice(text, open + 3, close);
+                string val = Template.Lookup(key, vars);
+                if (val.Length > 0) { sb.Append(val); }
                 i = close + 3;
             } else {
-                int close = Template.Find(text, "}}", open + 2);
+                int close = text.IndexOf("}}", open + 2);
                 if (close < 0) { return sb.ToString(); }
-                string key = Template.Trim(text.Substring(open + 2, close - open - 2));
+                string key = Template.TrimmedSlice(text, open + 2, close);
                 string val = Template.Lookup(key, vars);
-                if (escape) { val = Template.EscapeHtml(val); }
-                sb.Append(val);
+                if (val.Length > 0) {
+                    if (escape) { Template.AppendEscapedHtml(sb, val); }
+                    else { sb.Append(val); }
+                }
                 i = close + 2;
             }
         }
         return sb.ToString();
     }
 
-    // 查占位符的值：vars 为 null 或键不存在时返回 ""（渲染不报错）。
+    // 查占位符的值：vars 为 null 或键不存在时返回 ""（渲染不报错，单次 TryGetValue）。
     public static string Lookup(string key, Dictionary<string, string> vars) {
         if (vars == null || key == null) { return ""; }
-        if (vars.ContainsKey(key)) { return vars[key]; }
+        string v;
+        if (vars.TryGetValue(key, out v)) { return v; }
         return "";
     }
 

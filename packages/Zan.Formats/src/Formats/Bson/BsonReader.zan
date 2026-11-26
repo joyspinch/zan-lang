@@ -40,19 +40,34 @@ public class BsonReader {
     }
 
     public long U32LE() {
-        long v = U8();
-        v = v | ((long)U8() << 8);
-        v = v | ((long)U8() << 16);
-        return v | ((long)U8() << 24);
+        if (len - pos < 4) {
+            pos = len;
+            throw new BsonException("truncated at byte " + Convert.ToString(pos));
+        }
+        int p = pos;
+        long v = (long)(buf[p] & 255)
+            | ((long)(buf[p + 1] & 255) << 8)
+            | ((long)(buf[p + 2] & 255) << 16)
+            | ((long)(buf[p + 3] & 255) << 24);
+        pos = p + 4;
+        return v;
     }
 
     public long U64LE() {
-        long v = 0;
-        int i = 0;
-        while (i < 8) {
-            v = v | ((long)U8() << (i * 8));
-            i = i + 1;
+        if (len - pos < 8) {
+            pos = len;
+            throw new BsonException("truncated at byte " + Convert.ToString(pos));
         }
+        int p = pos;
+        long v = (long)(buf[p] & 255)
+            | ((long)(buf[p + 1] & 255) << 8)
+            | ((long)(buf[p + 2] & 255) << 16)
+            | ((long)(buf[p + 3] & 255) << 24)
+            | ((long)(buf[p + 4] & 255) << 32)
+            | ((long)(buf[p + 5] & 255) << 40)
+            | ((long)(buf[p + 6] & 255) << 48)
+            | ((long)(buf[p + 7] & 255) << 56);
+        pos = p + 8;
         return v;
     }
 
@@ -120,23 +135,25 @@ public class BsonReader {
             }
             string name = CStr(bodyEnd);
             JsonValue item = ReadElement(t, depth);
-            if (asArray) { v.Append(item); } else { v.Put(name, item); }
+            if (asArray) { v.items.Add(item); } else { v.keys.Add(name); v.vals.Add(item); }
         }
     }
 
-    // cstring 元素名：扫描到第一个 NUL（cstring 定义上不含 NUL，
+    // cstring 元素名：SIMD 扫描到第一个 NUL（cstring 定义上不含 NUL，
     // 首个即终结）；扫到文档尾都没遇到即畸形。直接从 buf 切片解码，零中间数组分配。
     public string CStr(int bodyEnd) {
         int start = pos;
-        while (pos < bodyEnd && pos < len) {
-            if ((buf[pos] & 255) == 0) {
-                int n = pos - start;
-                string s = buf.ToStr(start, n);
-                pos = pos + 1;
+        int limit = bodyEnd < len ? bodyEnd : len;
+        int rem = limit - start;
+        if (rem > 0) {
+            int hit = NativeMemory.Find((nint)buf, start, 0, rem);
+            if (hit >= 0) {
+                string s = buf.ToStr(start, hit - start);
+                pos = hit + 1;
                 return s;
             }
-            pos = pos + 1;
         }
+        pos = limit;
         throw new BsonException("unterminated element name at byte "
             + Convert.ToString(start));
     }
@@ -245,18 +262,58 @@ public class BsonReader {
         long rem = ms % 1000;
         if (rem < 0) { rem = rem + 1000; sec = sec - 1; }
         DateTime t = DateTime.FromUnixSeconds(sec);
+        int year = t.Year();
+        int month = t.Month();
+        int day = t.Day();
+        int hour = t.Hour();
+        int minute = t.Minute();
+        int second = t.Second();
+        if (year >= 0 && year < 10000) {
+            int total = rem > 0 ? 24 : 20;
+            byte[] outb = new byte[total];
+            outb[0] = (byte)(48 + (year / 1000) % 10);
+            outb[1] = (byte)(48 + (year / 100) % 10);
+            outb[2] = (byte)(48 + (year / 10) % 10);
+            outb[3] = (byte)(48 + year % 10);
+            outb[4] = 45;
+            outb[5] = (byte)(48 + month / 10);
+            outb[6] = (byte)(48 + month % 10);
+            outb[7] = 45;
+            outb[8] = (byte)(48 + day / 10);
+            outb[9] = (byte)(48 + day % 10);
+            outb[10] = 84;
+            outb[11] = (byte)(48 + hour / 10);
+            outb[12] = (byte)(48 + hour % 10);
+            outb[13] = 58;
+            outb[14] = (byte)(48 + minute / 10);
+            outb[15] = (byte)(48 + minute % 10);
+            outb[16] = 58;
+            outb[17] = (byte)(48 + second / 10);
+            outb[18] = (byte)(48 + second % 10);
+            if (rem > 0) {
+                int r = (int)rem;
+                outb[19] = 46;
+                outb[20] = (byte)(48 + r / 100);
+                outb[21] = (byte)(48 + (r / 10) % 10);
+                outb[22] = (byte)(48 + r % 10);
+                outb[23] = 90;
+            } else {
+                outb[19] = 90;
+            }
+            return outb.ToStr(0, total);
+        }
         StringBuilder sb = new StringBuilder();
-        sb.Append(Pad4(t.Year()));
+        sb.Append(Pad4(year));
         sb.Append("-");
-        sb.Append(Pad2(t.Month()));
+        sb.Append(Pad2(month));
         sb.Append("-");
-        sb.Append(Pad2(t.Day()));
+        sb.Append(Pad2(day));
         sb.Append("T");
-        sb.Append(Pad2(t.Hour()));
+        sb.Append(Pad2(hour));
         sb.Append(":");
-        sb.Append(Pad2(t.Minute()));
+        sb.Append(Pad2(minute));
         sb.Append(":");
-        sb.Append(Pad2(t.Second()));
+        sb.Append(Pad2(second));
         if (rem > 0) {
             sb.Append(".");
             if (rem < 100) { sb.Append("0"); }

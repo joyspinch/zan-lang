@@ -24,10 +24,24 @@ public class HtmlNode {
     public string tag;
     // 文本/注释内容。
     public string text;
-    // 属性（名字小写 → 值）。同名属性取第一个（HTML 规则）。
-    public Dictionary<string, string> attrs;
-    // 子节点。
-    public List<HtmlNode> children;
+    // 属性（名字小写 → 值）。同名属性取第一个（HTML 规则）；按需懒建，消除文本/无属性节点字典分配。
+    internal Dictionary<string, string> attrsMap;
+    public Dictionary<string, string> attrs {
+        get {
+            if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
+            return this.attrsMap;
+        }
+        set { this.attrsMap = value; }
+    }
+    // 子节点；按需懒建，消除文本/注释/叶子节点列表分配。
+    internal List<HtmlNode> childList;
+    public List<HtmlNode> children {
+        get {
+            if (this.childList == null) { this.childList = new List<HtmlNode>(); }
+            return this.childList;
+        }
+        set { this.childList = value; }
+    }
     // 父节点（弱引用，见上面的说明）。
     private weak HtmlNode parentNode;
     // 在父节点的 children 里的下标。
@@ -37,8 +51,8 @@ public class HtmlNode {
         this.type = type;
         this.tag = "";
         this.text = "";
-        this.attrs = new Dictionary<string, string>();
-        this.children = new List<HtmlNode>();
+        this.attrsMap = null;
+        this.childList = null;
         this.parentNode = null;
         this.index = 0;
     }
@@ -97,42 +111,44 @@ public class HtmlNode {
     // 挂一个子节点（同时维护父指针与 index）。
     public void AppendChild(HtmlNode child) {
         if (child == null) { return; }
-        child.index = this.children.Count;
-        this.children.Add(child);
+        if (this.childList == null) { this.childList = new List<HtmlNode>(); }
+        child.index = this.childList.Count;
+        this.childList.Add(child);
         child.parentNode = this;
     }
 
     // 删掉第 i 个子节点（后面兄弟的 index 顺移）。
     public void RemoveChildAt(int i) {
-        if (i < 0 || i >= this.children.Count) { return; }
-        this.children.RemoveAt(i);
-        for (int k = i; k < this.children.Count; k = k + 1) {
-            this.children[k].index = k;
+        if (this.childList == null || i < 0 || i >= this.childList.Count) { return; }
+        this.childList.RemoveAt(i);
+        for (int k = i; k < this.childList.Count; k = k + 1) {
+            this.childList[k].index = k;
         }
     }
 
     // 取属性值（没有返回 fallback）。
     public string Get(string name, string fallback) {
-        if (name == null) { return fallback; }
+        if (name == null || this.attrsMap == null) { return fallback; }
         string v;
-        if (this.attrs.TryGetValue(name, out v)) { return v; }
+        if (this.attrsMap.TryGetValue(name, out v)) { return v; }
         return fallback;
     }
 
     // 是否带这个属性。
     public bool Has(string name) {
-        if (name == null) { return false; }
-        return this.attrs.ContainsKey(name);
+        if (name == null || this.attrsMap == null) { return false; }
+        return this.attrsMap.ContainsKey(name);
     }
 
     // 设置属性（值为 null 等于删除）。
     public void SetAttr(string name, string value) {
         if (name == null) { return; }
         if (value == null) {
-            this.attrs.Remove(name);
+            if (this.attrsMap != null) { this.attrsMap.Remove(name); }
             return;
         }
-        this.attrs[name] = value;
+        if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
+        this.attrsMap[name] = value;
     }
 
     // class 属性拆成的类名列表。
@@ -163,8 +179,9 @@ public class HtmlNode {
     // 子节点里的元素（不含文本/注释）。
     public List<HtmlNode> ElementChildren() {
         List<HtmlNode> out2 = new List<HtmlNode>();
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            if (this.children[i].IsElement()) { out2.Add(this.children[i]); }
+        if (this.childList == null) { return out2; }
+        for (int i = 0; i < this.childList.Count; i = i + 1) {
+            if (this.childList[i].IsElement()) { out2.Add(this.childList[i]); }
         }
         return out2;
     }
@@ -177,8 +194,9 @@ public class HtmlNode {
     }
 
     static void CollectText(HtmlNode node, StringBuilder sb) {
-        for (int i = 0; i < node.children.Count; i = i + 1) {
-            HtmlNode c = node.children[i];
+        if (node.childList == null) { return; }
+        for (int i = 0; i < node.childList.Count; i = i + 1) {
+            HtmlNode c = node.childList[i];
             if (c.type == HtmlNodeType.Text) { sb.Append(c.text); }
             else if (c.type == HtmlNodeType.Element) { HtmlNode.CollectText(c, sb); }
         }
@@ -187,8 +205,10 @@ public class HtmlNode {
     // 子节点序列化（HTML 源码形态）。
     public string InnerHtml() {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            HtmlNode.WriteOuter(this.children[i], sb);
+        if (this.childList != null) {
+            for (int i = 0; i < this.childList.Count; i = i + 1) {
+                HtmlNode.WriteOuter(this.childList[i], sb);
+            }
         }
         return sb.ToString();
     }
@@ -214,18 +234,22 @@ public class HtmlNode {
         }
         sb.Append("<");
         sb.Append(node.tag);
-        List<string> keys = node.attrs.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            sb.Append(" ");
-            sb.Append(keys[i]);
-            sb.Append("=\"");
-            sb.Append(HtmlUtil.EscapeAttr(node.attrs[keys[i]]));
-            sb.Append("\"");
+        if (node.attrsMap != null && node.attrsMap.Count > 0) {
+            List<string> keys = node.attrsMap.Keys;
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                sb.Append(" ");
+                sb.Append(keys[i]);
+                sb.Append("=\"");
+                sb.Append(HtmlUtil.EscapeAttr(node.attrsMap[keys[i]]));
+                sb.Append("\"");
+            }
         }
         sb.Append(">");
         if (HtmlUtil.IsVoidTag(node.tag)) { return; }
-        for (int i = 0; i < node.children.Count; i = i + 1) {
-            HtmlNode.WriteOuter(node.children[i], sb);
+        if (node.childList != null) {
+            for (int i = 0; i < node.childList.Count; i = i + 1) {
+                HtmlNode.WriteOuter(node.childList[i], sb);
+            }
         }
         sb.Append("</");
         sb.Append(node.tag);

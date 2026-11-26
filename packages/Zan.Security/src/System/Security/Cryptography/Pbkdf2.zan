@@ -4,12 +4,12 @@ namespace System.Security.Cryptography;
 
 // PBKDF2（RFC 2898 / RFC 8018）口令派生（基于 HMAC-SHA256，堆外缓冲零托管分配）。
 public class Pbkdf2 {
-    // NativeMemory.Sha256 的可空安全包装：无硬件路径时回退到纯 Zan SHA-256。
-    private static string Sha256Of(nint p, int len) {
+    // 零托管分配计算 SHA-256 并直接写入 dst（32 字节）；无硬件路径时回退纯 Zan SHA-256。
+    private static void Sha256ToPtr(nint src, int len, nint dst) {
         if (len < 0) { len = 0; }
-        string hw = NativeMemory.Sha256(p, len);
-        if (hw != null) { return hw; }
-        return Sha256.Hash(NativeMemory.GetString(p, 0, len), len);
+        if (NativeMemory.Sha256Into(src, (long)len, dst) >= 0) { return; }
+        byte[] h = Sha256.Hash(NativeMemory.GetString(src, 0, len), len);
+        NativeMemory.Copy(dst, (nint)h, 32);
     }
 
     // 派生 dkLen 字节（任意正值，按 32 字节块补齐截取），
@@ -21,62 +21,62 @@ public class Pbkdf2 {
         if (saltLen < 0) { saltLen = 0; }
 
         /* HMAC 键块：≤64 字节补零，更长先摘要。内层消息取
-           max(saltLen+4, 32)：首轮是盐||块序号，之后每轮是 32 字节 U。 */
+           max(saltLen+4, 32)：首轮是盐||块序号，之后每轮是 32 字节 U。
+           inner+64 与 outer+64 严格不相交，直接乒乓直写，迭代主循环零堆分配、零拷贝。 */
         int msgMax = saltLen + 4;
         if (msgMax < 32) { msgMax = 32; }
+        int dkAlloc = ((dkLen + 31) / 32) * 32;
         nint k0 = NativeMemory.Alloc(64);
         nint inner = NativeMemory.Alloc(64 + msgMax);
         nint outer = NativeMemory.Alloc(96);
-        nint dk = NativeMemory.Alloc(((dkLen + 31) / 32) * 32);
+        nint dk = NativeMemory.Alloc(dkAlloc);
         try {
             NativeMemory.Fill(k0, 0, 64);
             if (passLen > 64) {
-                string hk = Pbkdf2.Sha256Of(password, passLen);
-                Span<byte> kb = new Span<byte>(k0, 64);
-                for (int i = 0; i < 32; i = i + 1) {
-                    kb[i] = (byte)(hk[i] & 255);
-                }
-            } else {
+                Pbkdf2.Sha256ToPtr((nint)password, passLen, k0);
+            } else if (passLen > 0 && password != null) {
                 NativeMemory.PutString(k0, 0, password, passLen);
             }
             Span<byte> ks = new Span<byte>(k0, 64);
             Span<byte> ib = new Span<byte>(inner, 64 + msgMax);
             Span<byte> ob = new Span<byte>(outer, 96);
-            Span<byte> db = new Span<byte>(dk, ((dkLen + 31) / 32) * 32);
+            Span<byte> db = new Span<byte>(dk, dkAlloc);
             for (int i = 0; i < 64; i = i + 1) {
                 int v = ks[i] & 255;
                 ib[i] = (byte)(v ^ 0x36);
                 ob[i] = (byte)(v ^ 0x5c);
             }
 
+            nint innerMsg = inner + (nint)64;
+            nint outerMsg = outer + (nint)64;
             int blocks = (dkLen + 31) / 32;
             for (int blk = 1; blk <= blocks; blk = blk + 1) {
-                NativeMemory.PutString(inner, 64, salt, saltLen);
-                int be = blk;
-                ib[64 + saltLen] = (byte)((be >> 24) & 255);
-                ib[64 + saltLen + 1] = (byte)((be >> 16) & 255);
-                ib[64 + saltLen + 2] = (byte)((be >> 8) & 255);
-                ib[64 + saltLen + 3] = (byte)(be & 255);
-                int msgLen = saltLen + 4;
+                if (saltLen > 0 && salt != null) {
+                    NativeMemory.PutString(inner, 64, salt, saltLen);
+                }
+                ib[64 + saltLen] = (byte)((blk >> 24) & 255);
+                ib[64 + saltLen + 1] = (byte)((blk >> 16) & 255);
+                ib[64 + saltLen + 2] = (byte)((blk >> 8) & 255);
+                ib[64 + saltLen + 3] = (byte)(blk & 255);
                 int off = (blk - 1) * 32;
-                for (int it = 0; it < iterations; it = it + 1) {
-                    if (it > 0) {
-                        /* 消息换为上一轮 U（outer+64 处的 32 字节摘要）。*/
-                        for (int i = 0; i < 32; i = i + 1) {
-                            ib[64 + i] = ob[64 + i];
-                        }
-                        msgLen = 32;
+
+                // 第 0 轮：U1 = HMAC(P, S || INT(blk))，结果直落 inner+64，作为第 1 轮输入
+                Pbkdf2.Sha256ToPtr(inner, 64 + saltLen + 4, outerMsg);
+                Pbkdf2.Sha256ToPtr(outer, 96, innerMsg);
+                for (int i = 0; i < 32; i = i + 1) {
+                    db[off + i] = ib[64 + i];
+                }
+
+                // 后续轮次：inner+64 已持有上一轮 U，乒乓直写 outer+64 -> inner+64
+                for (int it = 1; it < iterations; it = it + 1) {
+                    if (NativeMemory.Sha256Into(inner, 96L, outerMsg) < 0) {
+                        Pbkdf2.Sha256ToPtr(inner, 96, outerMsg);
                     }
-                    string ih = Pbkdf2.Sha256Of(inner, 64 + msgLen);
-                    for (int i = 0; i < 32; i = i + 1) {
-                        ob[64 + i] = (byte)(ih[i] & 255);
+                    if (NativeMemory.Sha256Into(outer, 96L, innerMsg) < 0) {
+                        Pbkdf2.Sha256ToPtr(outer, 96, innerMsg);
                     }
-                    string u = Pbkdf2.Sha256Of(outer, 96);
                     for (int i = 0; i < 32; i = i + 1) {
-                        /* u 回写外层消息位：下一轮 HMAC 的消息就是它。*/
-                        ob[64 + i] = (byte)(u[i] & 255);
-                        int acc = db[off + i] & 255;
-                        db[off + i] = (byte)(acc ^ (u[i] & 255));
+                        db[off + i] = (byte)((db[off + i] & 255) ^ (ib[64 + i] & 255));
                     }
                 }
             }

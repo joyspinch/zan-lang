@@ -40,11 +40,14 @@ public class HtmlParser {
     }
 
     void Run() {
+        nint sp = (nint)this.src;
         while (this.pos < this.len) {
             int c = this.src[this.pos] & 255;
             if (c != 60) {
                 int start = this.pos;
-                while (this.pos < this.len && (this.src[this.pos] & 255) != 60) { this.pos = this.pos + 1; }
+                int rem = this.len - (start + 1);
+                int lt = rem > 0 ? NativeMemory.Find(sp, start + 1, 60, rem) : -1;
+                this.pos = lt < 0 ? this.len : lt;
                 this.AddText(HtmlUtil.DecodeEntities(this.src.Substring(start, this.pos - start)));
                 continue;
             }
@@ -90,12 +93,27 @@ public class HtmlParser {
         return true;
     }
 
-    // 从 from 起大小写不敏感地找 needle，找不到返回 -1。
+    // 从 from 起大小写不敏感地找 needle，找不到返回 -1（首字节 SIMD 跳跃扫描）。
     int FindIgnoreCase(string needle, int from) {
         int m = needle.Length;
         if (m == 0) { return -1; }
-        for (int i = from; i + m <= this.len; i = i + 1) {
-            if (this.MatchAt(needle, i)) { return i; }
+        int c0 = needle[0] & 255;
+        int lo = (c0 >= 65 && c0 <= 90) ? (c0 + 32) : c0;
+        int hi = (lo >= 97 && lo <= 122) ? (lo - 32) : lo;
+        nint sp = (nint)this.src;
+        int limit = this.len - m + 1;
+        int i = from;
+        while (i < limit) {
+            int hit;
+            if (lo == hi) {
+                hit = NativeMemory.Find(sp, i, lo, limit - i);
+            } else {
+                int rel = NativeMemory.IndexOfAny(sp + (nint)i, limit - i, (byte)lo, (byte)hi);
+                hit = rel < 0 ? -1 : (i + rel);
+            }
+            if (hit < 0) { return -1; }
+            if (this.MatchAt(needle, hit)) { return hit; }
+            i = hit + 1;
         }
         return -1;
     }
@@ -142,8 +160,9 @@ public class HtmlParser {
         int nameStart = j;
         while (j < this.len && HtmlUtil.IsNameChar(this.src[j] & 255)) { j = j + 1; }
         string name = HtmlParser.AsciiLowerSlice(this.src, nameStart, j);
-        while (j < this.len && (this.src[j] & 255) != 62) { j = j + 1; }
-        this.pos = j < this.len ? j + 1 : this.len;
+        int rem = this.len - j;
+        int gt = rem > 0 ? NativeMemory.Find((nint)this.src, j, 62, rem) : -1;
+        this.pos = gt < 0 ? this.len : gt + 1;
         if (name.Length > 0) { this.CloseTag(name); }
     }
 
@@ -179,7 +198,9 @@ public class HtmlParser {
                     if (q == 34 || q == 39) {
                         k = k + 1;
                         int vs = k;
-                        while (k < this.len && (this.src[k] & 255) != q) { k = k + 1; }
+                        int rem = this.len - k;
+                        int qe = rem > 0 ? NativeMemory.Find((nint)this.src, k, q, rem) : -1;
+                        k = qe < 0 ? this.len : qe;
                         value = this.src.Substring(vs, k - vs);
                         if (k < this.len) { k = k + 1; }
                     } else {
@@ -198,7 +219,8 @@ public class HtmlParser {
             // 属性值里的实体要解码——不解码的话 "javascript&colon;alert(1)"
             // 这种写法会被当成相对地址放过去，浏览器却是当成 javascript:
             // 执行的。
-            if (!node.attrs.ContainsKey(attrName)) { node.attrs.Add(attrName, HtmlUtil.DecodeEntities(value)); }
+            if (node.attrsMap == null) { node.attrsMap = new Dictionary<string, string>(); }
+            if (!node.attrsMap.ContainsKey(attrName)) { node.attrsMap.Add(attrName, HtmlUtil.DecodeEntities(value)); }
         }
         this.pos = j;
 

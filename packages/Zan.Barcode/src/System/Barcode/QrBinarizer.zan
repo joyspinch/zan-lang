@@ -84,8 +84,9 @@ public class QrBinarizer {
                 int min = 255;
                 int max = 0;
                 for (int y = y0; y < y1; y = y + 1) {
+                    int row = y * width;
                     for (int x = x0; x < x1; x = x + 1) {
-                        int v = lum[y * width + x] & 255;
+                        int v = lum[row + x] & 255;
                         if (v < min) { min = v; }
                         if (v > max) { max = v; }
                     }
@@ -95,8 +96,9 @@ public class QrBinarizer {
                     threshold = (min + max) / 2;
                 }
                 for (int y = y0; y < y1; y = y + 1) {
+                    int row = y * width;
                     for (int x = x0; x < x1; x = x + 1) {
-                        dark[y * width + x] = (lum[y * width + x] & 255) <= threshold;
+                        dark[row + x] = (lum[row + x] & 255) <= threshold;
                     }
                 }
             }
@@ -114,32 +116,61 @@ public class QrBinarizer {
     // 把整张图抹平，所以不能无条件用——解码流程把它当成一条策略来试。
     //
     // 平票时保留中心像素的取值（不做无依据的翻转）。
+    // 内部像素采用 3 列滑窗和（每像素仅 3 次读取、零边界分支）；四条边走通用边界判定。
     public static bool[] Denoise(bool[] dark, int width, int height) {
         bool[] outp = new bool[dark.Length];
-        for (int y = 0; y < height; y = y + 1) {
-            for (int x = 0; x < width; x = x + 1) {
-                int darkCount = 0;
-                int total = 0;
-                for (int dy = -1; dy <= 1; dy = dy + 1) {
-                    int yy = y + dy;
-                    if (yy < 0 || yy >= height) { continue; }
-                    for (int dx = -1; dx <= 1; dx = dx + 1) {
-                        int xx = x + dx;
-                        if (xx < 0 || xx >= width) { continue; }
-                        total = total + 1;
-                        if (dark[yy * width + xx]) { darkCount = darkCount + 1; }
-                    }
+        if (width < 3 || height < 3) {
+            for (int y = 0; y < height; y = y + 1) {
+                for (int x = 0; x < width; x = x + 1) {
+                    outp[y * width + x] = QrBinarizer.DenoiseBorderPixel(dark, width, height, x, y);
                 }
-                bool center = dark[y * width + x];
-                if (darkCount * 2 > total) {
-                    outp[y * width + x] = true;
-                } else if (darkCount * 2 < total) {
-                    outp[y * width + x] = false;
-                } else {
-                    outp[y * width + x] = center;
-                }
+            }
+            return outp;
+        }
+        // 顶行与底行
+        int lastRow = (height - 1) * width;
+        for (int x = 0; x < width; x = x + 1) {
+            outp[x] = QrBinarizer.DenoiseBorderPixel(dark, width, height, x, 0);
+            outp[lastRow + x] = QrBinarizer.DenoiseBorderPixel(dark, width, height, x, height - 1);
+        }
+        // 内部行：左右列边界 + 中间滑窗 3 列和（总邻域固定为 9，>= 5 即多数）
+        int w1 = width - 1;
+        for (int y = 1; y < height - 1; y = y + 1) {
+            int r0 = (y - 1) * width;
+            int r1 = y * width;
+            int r2 = (y + 1) * width;
+            outp[r1] = QrBinarizer.DenoiseBorderPixel(dark, width, height, 0, y);
+            outp[r1 + w1] = QrBinarizer.DenoiseBorderPixel(dark, width, height, w1, y);
+            int c0 = (dark[r0] ? 1 : 0) + (dark[r1] ? 1 : 0) + (dark[r2] ? 1 : 0);
+            int c1 = (dark[r0 + 1] ? 1 : 0) + (dark[r1 + 1] ? 1 : 0) + (dark[r2 + 1] ? 1 : 0);
+            for (int x = 1; x < w1; x = x + 1) {
+                int x2 = x + 1;
+                int c2 = (dark[r0 + x2] ? 1 : 0) + (dark[r1 + x2] ? 1 : 0) + (dark[r2 + x2] ? 1 : 0);
+                outp[r1 + x] = (c0 + c1 + c2) >= 5;
+                c0 = c1;
+                c1 = c2;
             }
         }
         return outp;
+    }
+
+    private static bool DenoiseBorderPixel(bool[] dark, int width, int height, int x, int y) {
+        int darkCount = 0;
+        int total = 0;
+        int y0 = y > 0 ? y - 1 : 0;
+        int y1 = y + 1 < height ? y + 1 : height - 1;
+        int x0 = x > 0 ? x - 1 : 0;
+        int x1 = x + 1 < width ? x + 1 : width - 1;
+        for (int yy = y0; yy <= y1; yy = yy + 1) {
+            int row = yy * width;
+            for (int xx = x0; xx <= x1; xx = xx + 1) {
+                total = total + 1;
+                if (dark[row + xx]) { darkCount = darkCount + 1; }
+            }
+        }
+        int doubled = darkCount * 2;
+        if (doubled > total) { return true; }
+        if (doubled < total) { return false; }
+        return dark[y * width + x];
     }
 }

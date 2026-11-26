@@ -26,7 +26,7 @@ public class CborWriter {
     public int len;
 
     public CborWriter() {
-        buf = new byte[64];
+        buf = new byte[256];
         len = 0;
     }
 
@@ -56,20 +56,34 @@ public class CborWriter {
 
     public void RawU16BE(int v) {
         EnsureRoom(2);
-        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(len, 2), (ushort)v);
-        len = len + 2;
+        int p = len;
+        buf[p] = (byte)(v >> 8);
+        buf[p + 1] = (byte)v;
+        len = p + 2;
     }
 
     public void RawU32BE(long v) {
         EnsureRoom(4);
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(len, 4), (uint)v);
-        len = len + 4;
+        int p = len;
+        buf[p] = (byte)(v >> 24);
+        buf[p + 1] = (byte)(v >> 16);
+        buf[p + 2] = (byte)(v >> 8);
+        buf[p + 3] = (byte)v;
+        len = p + 4;
     }
 
     public void RawU64BE(long v) {
         EnsureRoom(8);
-        BinaryPrimitives.WriteUInt64BigEndian(buf.AsSpan(len, 8), (ulong)v);
-        len = len + 8;
+        int p = len;
+        buf[p] = (byte)(v >> 56);
+        buf[p + 1] = (byte)(v >> 48);
+        buf[p + 2] = (byte)(v >> 40);
+        buf[p + 3] = (byte)(v >> 32);
+        buf[p + 4] = (byte)(v >> 24);
+        buf[p + 5] = (byte)(v >> 16);
+        buf[p + 6] = (byte)(v >> 8);
+        buf[p + 7] = (byte)v;
+        len = p + 8;
     }
 
     // 写 major type 头 + argument（规范最短：≤23 内联，24/25/26/27
@@ -77,11 +91,45 @@ public class CborWriter {
     public void Head(int major, long arg) {
         int m = major << 5;
         if (arg < 24) {
-            RawU8(m | (int)arg);
-        } else if (arg < 256) { RawU8(m | 24); RawU8((int)arg); }
-        else if (arg < 65536) { RawU8(m | 25); RawU16BE((int)arg); }
-        else if (arg < 4294967296) { RawU8(m | 26); RawU32BE(arg); }
-        else { RawU8(m | 27); RawU64BE(arg); }
+            EnsureRoom(1);
+            buf[len] = (byte)(m | (int)arg);
+            len = len + 1;
+        } else if (arg < 256) {
+            EnsureRoom(2);
+            int p = len;
+            buf[p] = (byte)(m | 24);
+            buf[p + 1] = (byte)arg;
+            len = p + 2;
+        } else if (arg < 65536) {
+            EnsureRoom(3);
+            int p = len;
+            buf[p] = (byte)(m | 25);
+            buf[p + 1] = (byte)(arg >> 8);
+            buf[p + 2] = (byte)arg;
+            len = p + 3;
+        } else if (arg < 4294967296) {
+            EnsureRoom(5);
+            int p = len;
+            buf[p] = (byte)(m | 26);
+            buf[p + 1] = (byte)(arg >> 24);
+            buf[p + 2] = (byte)(arg >> 16);
+            buf[p + 3] = (byte)(arg >> 8);
+            buf[p + 4] = (byte)arg;
+            len = p + 5;
+        } else {
+            EnsureRoom(9);
+            int p = len;
+            buf[p] = (byte)(m | 27);
+            buf[p + 1] = (byte)(arg >> 56);
+            buf[p + 2] = (byte)(arg >> 48);
+            buf[p + 3] = (byte)(arg >> 40);
+            buf[p + 4] = (byte)(arg >> 32);
+            buf[p + 5] = (byte)(arg >> 24);
+            buf[p + 6] = (byte)(arg >> 16);
+            buf[p + 7] = (byte)(arg >> 8);
+            buf[p + 8] = (byte)arg;
+            len = p + 9;
+        }
     }
 
     // 无符号整数（major 0）。
@@ -90,17 +138,36 @@ public class CborWriter {
     // 负整数（major 1，值 = -1 - n；n = ~v 对 long.MinValue 也不溢出）。
     public void WriteNeg(long v) { Head(1, ~v); }
 
-    // text string（major 3）；超过 ChunkBytes 写 indefinite 分片。
+    // text string（major 3）；超过 ChunkBytes 写 indefinite 分片。零中间 byte[] 直写。
     public void WriteString(string s) {
-        byte[] b = Encoding.GetBytes(s);
-        if (b.Length > CborWriter.ChunkBytes) {
-            Chunked(3, b);
+        int n = s.Length;
+        if (n > CborWriter.ChunkBytes) {
+            ChunkedStr(s);
             return;
         }
-        Head(3, b.Length);
-        EnsureRoom(b.Length);
-        NativeMemory.Copy((nint)buf + len, (nint)b, b.Length);
-        len = len + b.Length;
+        Head(3, n);
+        if (n > 0) {
+            EnsureRoom(n);
+            NativeMemory.PutString((nint)buf, len, s, n);
+            len = len + n;
+        }
+    }
+
+    private void ChunkedStr(string s) {
+        RawU8((3 << 5) | 31);
+        int slen = s.Length;
+        int off = 0;
+        nint sp = (nint)s;
+        while (off < slen) {
+            int n = slen - off;
+            if (n > (int)CborWriter.ChunkBytes) { n = (int)CborWriter.ChunkBytes; }
+            Head(3, n);
+            EnsureRoom(n);
+            NativeMemory.Copy((nint)buf + len, sp + off, n);
+            len = len + n;
+            off = off + n;
+        }
+        RawU8(255);
     }
 
     // byte string（major 2）；超过 ChunkBytes 写 indefinite 分片。
@@ -144,18 +211,32 @@ public class CborWriter {
 
     // float32（0xFA，固定 32 位）。
     public void WriteFloat(float f) {
-        RawU8(250);
-        EnsureRoom(4);
-        BinaryPrimitives.WriteSingleBigEndian(buf.AsSpan(len, 4), f);
-        len = len + 4;
+        EnsureRoom(5);
+        int bits = NativeMemory.AsI32(f);
+        int p = len;
+        buf[p] = 250;
+        buf[p + 1] = (byte)(bits >> 24);
+        buf[p + 2] = (byte)(bits >> 16);
+        buf[p + 3] = (byte)(bits >> 8);
+        buf[p + 4] = (byte)bits;
+        len = p + 5;
     }
 
     // float64（0xFB，固定 64 位——不做最短浮点规范化，文档化取舍）。
     public void WriteDouble(double d) {
-        RawU8(251);
-        EnsureRoom(8);
-        BinaryPrimitives.WriteDoubleBigEndian(buf.AsSpan(len, 8), d);
-        len = len + 8;
+        EnsureRoom(9);
+        long bits = NativeMemory.AsI64(d);
+        int p = len;
+        buf[p] = 251;
+        buf[p + 1] = (byte)(bits >> 56);
+        buf[p + 2] = (byte)(bits >> 48);
+        buf[p + 3] = (byte)(bits >> 40);
+        buf[p + 4] = (byte)(bits >> 32);
+        buf[p + 5] = (byte)(bits >> 24);
+        buf[p + 6] = (byte)(bits >> 16);
+        buf[p + 7] = (byte)(bits >> 8);
+        buf[p + 8] = (byte)bits;
+        len = p + 9;
     }
 
     // 任意 tag 头（major 6）。

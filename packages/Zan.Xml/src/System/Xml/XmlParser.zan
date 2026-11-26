@@ -120,7 +120,8 @@ public class XmlParser {
             XmlAttribute a = new XmlAttribute();
             a.name = aname;
             a.value = DecodeText(raw);
-            elem.AddAttr(a);
+            if (elem.attrs == null) { elem.attrs = new List<XmlAttribute>(); }
+            elem.attrs.Add(a);
         }
         Err("unterminated tag <" + (elem.name == null ? "" : elem.name) + ">");
         return false;
@@ -173,17 +174,14 @@ public class XmlParser {
     private string ReadUntil(int skipPrefix, string closeDelim, string unterminatedMsg) {
         pos = pos + skipPrefix;
         int start = pos;
-        int dlen = closeDelim.Length;
-        while (pos < len) {
-            if (Has(closeDelim)) {
-                string text = s.Substring(start, pos - start);
-                pos = pos + dlen;
-                return text;
-            }
-            pos = pos + 1;
+        int hit = s.IndexOf(closeDelim, start);
+        if (hit < 0) {
+            pos = len;
+            Err(unterminatedMsg);
+            return "";
         }
-        Err(unterminatedMsg);
-        return "";
+        pos = hit + closeDelim.Length;
+        return NativeMemory.GetString(this.basePtr, start, hit - start);
     }
 
     // 读取 '<!--...-->' 注释（正文原样保留）。
@@ -207,13 +205,13 @@ public class XmlParser {
         }
         SkipWs();
         int start = pos;
-        while (pos < len) {
-            if (Has("?>")) { break; }
-            pos = pos + 1;
+        int hit = s.IndexOf("?>", start);
+        if (hit < 0) {
+            pos = len;
+            Err("unterminated processing instruction");
         }
-        if (pos >= len) { Err("unterminated processing instruction"); }
-        XmlNode pi = XmlNode.NewPi(target, s.Substring(start, pos - start));
-        pos = pos + 2;  // 消费 '?>'
+        XmlNode pi = XmlNode.NewPi(target, NativeMemory.GetString(this.basePtr, start, hit - start));
+        pos = hit + 2;  // 消费 '?>'
         return pi;
     }
 
@@ -256,38 +254,29 @@ public class XmlParser {
         return NativeMemory.GetString(this.basePtr, start, p - start);
     }
 
-    // 实体解码与 CR 归一（\r\n / \r → \n）；无 '&' / '\r' 时零分配原串返回。
+    // 实体解码与 CR 归一（\r\n / \r → \n）；SIMD 双字节扫描 + StringView 零临时字符串冲刷。
     string DecodeText(string raw) {
         int n = raw.Length;
         if (n == 0) { return raw; }
         nint rp = (nint)raw;
+        int scan = NativeMemory.IndexOfAny(rp, n, (byte)38, (byte)13);
+        if (scan < 0) { return raw; }
         Span<byte> rbuf = new Span<byte>(rp, n);
-        int scan = 0;
-        while (scan < n) {
-            int c = rbuf[scan] & 255;
-            if (c == 38 || c == 13) { break; }  // '&' '\r'
-            scan = scan + 1;
-        }
-        if (scan >= n) { return raw; }
-        StringBuilder sb = new StringBuilder();
-        if (scan > 0) { sb.Append(NativeMemory.GetString(rp, 0, scan)); }
+        StringBuilder sb = new StringBuilder(n);
+        if (scan > 0) { sb.Append(new StringView(rp, scan)); }
         int i = scan;
         while (i < n) {
             int c = rbuf[i] & 255;
             if (c == 38) {  // '&'
-                i = ReadEntity(raw, i, sb);
+                i = ReadEntity(raw, rp, n, i, sb);
             } else if (c == 13) {  // '\r'
                 if (i + 1 < n && (rbuf[i + 1] & 255) == 10) { i = i + 1; }
                 sb.Append("\n");
                 i = i + 1;
             } else {
-                int j = i;
-                while (j < n) {
-                    int d = rbuf[j] & 255;
-                    if (d == 38 || d == 13) { break; }
-                    j = j + 1;
-                }
-                sb.Append(NativeMemory.GetString(rp, i, j - i));
+                int rel = NativeMemory.IndexOfAny(rp + (nint)i, n - i, (byte)38, (byte)13);
+                int j = rel < 0 ? n : (i + rel);
+                sb.Append(new StringView(rp + (nint)i, j - i));
                 i = j;
             }
         }
@@ -295,33 +284,49 @@ public class XmlParser {
     }
 
     // 解码 raw 中自 i 起（raw[i] == '&'）的一个实体，把结果追加进
-    // sb，返回 ';' 之后的新游标。未知实体与非法数字引用报错。
-    int ReadEntity(string raw, int i, StringBuilder sb) {
-        int semi = XmlNode.IndexOf(raw, ";", i + 1);
+    // sb，返回 ';' 之后的新游标。5 种命名实体与数字字符引用零 Substring 直判。
+    int ReadEntity(string raw, nint rp, int rlen, int i, StringBuilder sb) {
+        int rem = rlen - (i + 1);
+        if (rem > 12) { rem = 12; }
+        int semi = rem > 0 ? NativeMemory.Find(rp, i + 1, 59, rem) : -1;
         if (semi < 0 || semi - i > 12) {
             Err("malformed entity reference");
         }
-        string ent = raw.Substring(i + 1, semi - i - 1);
-        if (ent == "lt") { sb.Append("<"); }
-        else if (ent == "gt") { sb.Append(">"); }
-        else if (ent == "amp") { sb.Append("&"); }
-        else if (ent == "quot") { sb.Append("\""); }
-        else if (ent == "apos") { sb.Append("'"); }
-        else if (ent.Length > 0 && (ent[0] & 255) == 35) {  // '#'
+        int entStart = i + 1;
+        int entLen = semi - entStart;
+        if (entLen == 2) {
+            int c0 = raw[entStart] & 255;
+            int c1 = raw[entStart + 1] & 255;
+            if (c0 == 108 && c1 == 116) { sb.Append("<"); return semi + 1; }  // lt
+            if (c0 == 103 && c1 == 116) { sb.Append(">"); return semi + 1; }  // gt
+        } else if (entLen == 3) {
+            if ((raw[entStart] & 255) == 97 && (raw[entStart + 1] & 255) == 109
+                && (raw[entStart + 2] & 255) == 112) {
+                sb.Append("&"); return semi + 1;  // amp
+            }
+        } else if (entLen == 4) {
+            int c0 = raw[entStart] & 255;
+            int c1 = raw[entStart + 1] & 255;
+            int c2 = raw[entStart + 2] & 255;
+            int c3 = raw[entStart + 3] & 255;
+            if (c0 == 113 && c1 == 117 && c2 == 111 && c3 == 116) { sb.Append("\""); return semi + 1; }  // quot
+            if (c0 == 97 && c1 == 112 && c2 == 111 && c3 == 115) { sb.Append("'"); return semi + 1; }    // apos
+        }
+        if (entLen > 0 && (raw[entStart] & 255) == 35) {  // '#'
             int cp = 0;
             int k = 1;
             bool hex = false;
-            if (ent.Length > 1) {
-                int h = ent[1] & 255;
+            if (entLen > 1) {
+                int h = raw[entStart + 1] & 255;
                 if (h == 120 || h == 88) {  // 'x' 'X'
                     hex = true;
                     k = 2;
                 }
             }
-            if (k >= ent.Length) { Err("empty character reference"); }
-            while (k < ent.Length) {
-                int d = XmlParser.DigitVal(ent[k] & 255, hex);
-                if (d < 0) { Err("invalid character reference &" + ent + ";"); }
+            if (k >= entLen) { Err("empty character reference"); }
+            while (k < entLen) {
+                int d = XmlParser.DigitVal(raw[entStart + k] & 255, hex);
+                if (d < 0) { Err("invalid character reference &" + raw.Substring(entStart, entLen) + ";"); }
                 cp = cp * (hex ? 16 : 10) + d;
                 if (cp > 1114111) { Err("character reference out of range"); }
                 k = k + 1;
@@ -331,9 +336,9 @@ public class XmlParser {
                 Err("character reference cannot be represented");
             }
             sb.Append(Encoding.Utf8FromCodePoint(cp));
-        } else {
-            Err("unknown entity &" + ent + ";");
+            return semi + 1;
         }
+        Err("unknown entity &" + raw.Substring(entStart, entLen) + ";");
         return semi + 1;
     }
 

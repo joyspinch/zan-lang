@@ -17,86 +17,249 @@ namespace System.Text;
 // 协议；含 ASCII 控制字符的 URL 只渲染为标签文本，
 // 不生成锚点链接。
 public class Markdown {
-    // 将受支持的 Markdown 语法渲染为紧凑的转义 HTML。
+    // 零分配判定一行是否全空白（替代 Trim(line) == ""）。
+    private static bool IsBlankLine(string line) {
+        if (line == null) { return true; }
+        int n = line.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = line[i] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { return false; }
+        }
+        return true;
+    }
+
+    // 零分配判定是否以 "```" 开头。
+    private static bool IsFenceLine(string line) {
+        return line != null && line.Length >= 3 &&
+            (line[0] & 255) == 96 && (line[1] & 255) == 96 && (line[2] & 255) == 96;
+    }
+
+    // 流式 HTML 转义切片 [start, end) 直接写入目标 StringBuilder（StringView 零中间分配）。
+    private static void AppendEscapedSlice(StringBuilder sb, string text, int start, int end) {
+        if (text == null || start >= end) { return; }
+        nint tp = (nint)text;
+        int last = start;
+        for (int i = start; i < end; i = i + 1) {
+            int c = text[i] & 255;
+            string esc = null;
+            if (c == 38) { esc = "&amp;"; }
+            else if (c == 60) { esc = "&lt;"; }
+            else if (c == 62) { esc = "&gt;"; }
+            else if (c == 34) { esc = "&quot;"; }
+            else if (c == 39) { esc = "&#39;"; }
+            if (esc != null) {
+                if (i > last) { sb.Append(new StringView(tp + (nint)last, i - last)); }
+                sb.Append(esc);
+                last = i + 1;
+            }
+        }
+        if (last < end) { sb.Append(new StringView(tp + (nint)last, end - last)); }
+    }
+
+    // 在 [from, end) 内查找单字节 target，找不到返回 -1。
+    private static int FindByteInRange(nint tp, int from, int end, int target) {
+        int rem = end - from;
+        if (rem <= 0) { return -1; }
+        return NativeMemory.Find(tp, from, target, rem);
+    }
+
+    // 在 [from, end) 内查找双同字节 (ch, ch)，找不到返回 -1。
+    private static int FindDoubleByteInRange(string text, nint tp, int from, int end, int ch) {
+        int p = from;
+        while (p + 1 < end) {
+            int hit = NativeMemory.Find(tp, p, ch, end - 1 - p);
+            if (hit < 0) { return -1; }
+            if ((text[hit + 1] & 255) == ch) { return hit; }
+            p = hit + 1;
+        }
+        return -1;
+    }
+
+    // 流式行内渲染切片 [start, end) 直接写入目标 StringBuilder。
+    private static void AppendInlineSlice(StringBuilder html, string text, int start, int end, int depth) {
+        if (text == null || start >= end) { return; }
+        if (depth >= 32) {
+            Markdown.AppendEscapedSlice(html, text, start, end);
+            return;
+        }
+        nint tp = (nint)text;
+        int i = start;
+        while (i < end) {
+            int c = text[i] & 255;
+            if (c == 92 && i + 1 < end) {
+                int nc = text[i + 1] & 255;
+                if (nc == 38) { html.Append("&amp;"); }
+                else if (nc == 60) { html.Append("&lt;"); }
+                else if (nc == 62) { html.Append("&gt;"); }
+                else if (nc == 34) { html.Append("&quot;"); }
+                else if (nc == 39) { html.Append("&#39;"); }
+                else { html.Append(new StringView(tp + (nint)(i + 1), 1)); }
+                i = i + 2;
+            } else if (c == 96) {
+                int close = Markdown.FindByteInRange(tp, i + 1, end, 96);
+                if (close >= 0) {
+                    html.Append("<code>");
+                    Markdown.AppendEscapedSlice(html, text, i + 1, close);
+                    html.Append("</code>");
+                    i = close + 1;
+                } else {
+                    html.Append("`"); i = i + 1;
+                }
+            } else if ((c == 42 || c == 95) && i + 1 < end && (text[i + 1] & 255) == c) {
+                int close = Markdown.FindDoubleByteInRange(text, tp, i + 2, end, c);
+                if (close > i + 2) {
+                    html.Append("<strong>");
+                    Markdown.AppendInlineSlice(html, text, i + 2, close, depth + 1);
+                    html.Append("</strong>");
+                    i = close + 2;
+                } else {
+                    html.Append(c == 42 ? "**" : "__"); i = i + 2;
+                }
+            } else if (c == 42 || c == 95) {
+                int close = Markdown.FindByteInRange(tp, i + 1, end, c);
+                if (close > i + 1) {
+                    html.Append("<em>");
+                    Markdown.AppendInlineSlice(html, text, i + 1, close, depth + 1);
+                    html.Append("</em>");
+                    i = close + 1;
+                } else {
+                    html.Append(c == 42 ? "*" : "_"); i = i + 1;
+                }
+            } else if (c == 91) {
+                int labelEnd = Markdown.FindByteInRange(tp, i + 1, end, 93);
+                int urlEnd = -1;
+                if (labelEnd >= 0 && labelEnd + 1 < end && (text[labelEnd + 1] & 255) == 40) {
+                    urlEnd = Markdown.FindByteInRange(tp, labelEnd + 2, end, 41);
+                }
+                if (labelEnd >= 0 && urlEnd >= 0) {
+                    int us = labelEnd + 2;
+                    int ue = urlEnd;
+                    while (us < ue) {
+                        int uc = text[us] & 255;
+                        if (uc != 32 && uc != 9 && uc != 13 && uc != 10) { break; }
+                        us = us + 1;
+                    }
+                    while (ue > us) {
+                        int uc = text[ue - 1] & 255;
+                        if (uc != 32 && uc != 9 && uc != 13 && uc != 10) { break; }
+                        ue = ue - 1;
+                    }
+                    string url = text.Substring(us, ue - us);
+                    if (Markdown.SafeUrl(url)) {
+                        html.Append("<a href=\"");
+                        Markdown.AppendEscapedSlice(html, url, 0, url.Length);
+                        html.Append("\">");
+                        Markdown.AppendInlineSlice(html, text, i + 1, labelEnd, depth + 1);
+                        html.Append("</a>");
+                    } else {
+                        Markdown.AppendInlineSlice(html, text, i + 1, labelEnd, depth + 1);
+                    }
+                    i = urlEnd + 1;
+                } else {
+                    html.Append("["); i = i + 1;
+                }
+            } else {
+                int run = i + 1;
+                while (run < end) {
+                    int rc = text[run] & 255;
+                    if (rc == 92 || rc == 96 || rc == 42 || rc == 95 || rc == 91) { break; }
+                    run = run + 1;
+                }
+                Markdown.AppendEscapedSlice(html, text, i, run);
+                i = run;
+            }
+        }
+    }
+
+    // 将受支持的 Markdown 语法渲染为紧凑的转义 HTML（全程单 StringBuilder 流式写出）。
     public static string ToHtml(string text) {
+        if (text == null || text.Length == 0) { return ""; }
         List<string> lines = Markdown.Lines(text);
-        StringBuilder html = new StringBuilder();
+        int lineCount = lines.Count;
+        StringBuilder html = new StringBuilder(text.Length + 64);
         int i = 0;
         bool first = true;
-        while (i < lines.Count) {
+        while (i < lineCount) {
             string line = lines[i];
-            if (Markdown.Trim(line) == "") { i = i + 1; continue; }
+            if (Markdown.IsBlankLine(line)) { i = i + 1; continue; }
 
-            if (Markdown.StartsWith(line, "```")) {
-                StringBuilder code = new StringBuilder();
+            if (Markdown.IsFenceLine(line)) {
+                if (!first) { html.Append("\n"); }
+                first = false;
+                html.Append("<pre><code>");
                 i = i + 1;
                 bool codeFirst = true;
-                while (i < lines.Count && !Markdown.StartsWith(lines[i], "```")) {
-                    if (!codeFirst) { code.Append("\n"); }
-                    code.Append(lines[i]);
+                while (i < lineCount && !Markdown.IsFenceLine(lines[i])) {
+                    if (!codeFirst) { html.Append("\n"); }
+                    string cl = lines[i];
+                    Markdown.AppendEscapedSlice(html, cl, 0, cl.Length);
                     codeFirst = false;
                     i = i + 1;
                 }
-                if (i < lines.Count) { i = i + 1; }
-                first = Markdown.Block(html, first, "<pre><code>" + Markdown.EscapeHtml(code.ToString()) + "</code></pre>");
+                if (i < lineCount) { i = i + 1; }
+                html.Append("</code></pre>");
                 continue;
             }
 
             int heading = Markdown.HeadingLevel(line);
             if (heading > 0) {
-                string body = line.Substring(heading + 1, line.Length - heading - 1);
-                string tag = Convert.ToString(heading);
-                first = Markdown.Block(html, first, "<h" + tag + ">" + Markdown.Inline(body) + "</h" + tag + ">");
+                if (!first) { html.Append("\n"); }
+                first = false;
+                string openH = heading == 1 ? "<h1>" : (heading == 2 ? "<h2>" : (heading == 3 ? "<h3>" : (heading == 4 ? "<h4>" : (heading == 5 ? "<h5>" : "<h6>"))));
+                string closeH = heading == 1 ? "</h1>" : (heading == 2 ? "</h2>" : (heading == 3 ? "</h3>" : (heading == 4 ? "</h4>" : (heading == 5 ? "</h5>" : "</h6>"))));
+                html.Append(openH);
+                Markdown.AppendInlineSlice(html, line, heading + 1, line.Length, 0);
+                html.Append(closeH);
                 i = i + 1;
                 continue;
             }
 
             int listKind = Markdown.ListKind(line);
             if (listKind != 0) {
-                string tag = "ul";
-                if (listKind == 2) { tag = "ol"; }
-                StringBuilder list = new StringBuilder();
-                list.Append("<");
-                list.Append(tag);
-                list.Append(">");
-                while (i < lines.Count && Markdown.ListKind(lines[i]) == listKind) {
-                    int at = Markdown.ListBody(lines[i], listKind);
-                    list.Append("<li>");
-                    list.Append(Markdown.Inline(lines[i].Substring(at, lines[i].Length - at)));
-                    list.Append("</li>");
+                if (!first) { html.Append("\n"); }
+                first = false;
+                html.Append(listKind == 2 ? "<ol>" : "<ul>");
+                while (i < lineCount && Markdown.ListKind(lines[i]) == listKind) {
+                    string li = lines[i];
+                    int at = Markdown.ListBody(li, listKind);
+                    html.Append("<li>");
+                    Markdown.AppendInlineSlice(html, li, at, li.Length, 0);
+                    html.Append("</li>");
                     i = i + 1;
                 }
-                list.Append("</");
-                list.Append(tag);
-                list.Append(">");
-                first = Markdown.Block(html, first, list.ToString());
+                html.Append(listKind == 2 ? "</ol>" : "</ul>");
                 continue;
             }
 
             if (Markdown.IsQuote(line)) {
-                StringBuilder quote = new StringBuilder();
+                if (!first) { html.Append("\n"); }
+                first = false;
+                html.Append("<blockquote><p>");
                 bool quoteFirst = true;
-                while (i < lines.Count && Markdown.IsQuote(lines[i])) {
-                    if (!quoteFirst) { quote.Append(" "); }
-                    int at = 1;
-                    if (lines[i].Length > 1 && (lines[i][1] & 255) == 32) { at = 2; }
-                    quote.Append(Markdown.Inline(lines[i].Substring(at, lines[i].Length - at)));
+                while (i < lineCount && Markdown.IsQuote(lines[i])) {
+                    if (!quoteFirst) { html.Append(" "); }
+                    string ql = lines[i];
+                    int at = (ql.Length > 1 && (ql[1] & 255) == 32) ? 2 : 1;
+                    Markdown.AppendInlineSlice(html, ql, at, ql.Length, 0);
                     quoteFirst = false;
                     i = i + 1;
                 }
-                first = Markdown.Block(html, first, "<blockquote><p>" + quote.ToString() + "</p></blockquote>");
+                html.Append("</p></blockquote>");
                 continue;
             }
 
-            StringBuilder paragraph = new StringBuilder();
+            if (!first) { html.Append("\n"); }
+            first = false;
+            html.Append("<p>");
             bool paraFirst = true;
-            while (i < lines.Count && Markdown.Trim(lines[i]) != "" && !Markdown.IsBlockStart(lines[i])) {
-                if (!paraFirst) { paragraph.Append(" "); }
-                paragraph.Append(Markdown.Inline(lines[i]));
+            while (i < lineCount && !Markdown.IsBlankLine(lines[i]) && !Markdown.IsBlockStart(lines[i])) {
+                if (!paraFirst) { html.Append(" "); }
+                string pl = lines[i];
+                Markdown.AppendInlineSlice(html, pl, 0, pl.Length, 0);
                 paraFirst = false;
                 i = i + 1;
             }
-            first = Markdown.Block(html, first, "<p>" + paragraph.ToString() + "</p>");
+            html.Append("</p>");
         }
         return html.ToString();
     }
@@ -117,84 +280,10 @@ public class Markdown {
     // Inline 的递归实现：`depth` 限制嵌套层数，超限时整段只做
     // HTML 转义。未闭合的定界符按字面输出。
     public static string InlineAt(string text, int depth) {
+        if (text == null || text.Length == 0) { return ""; }
         if (depth >= 32) { return Markdown.EscapeHtml(text); }
-        StringBuilder html = new StringBuilder();
-        int i = 0;
-        int n = text.Length;
-        while (i < n) {
-            int c = text[i] & 255;
-            if (c == 92 && i + 1 < n) {
-                int nc = text[i + 1] & 255;
-                if (nc == 38) { html.Append("&amp;"); }
-                else if (nc == 60) { html.Append("&lt;"); }
-                else if (nc == 62) { html.Append("&gt;"); }
-                else if (nc == 34) { html.Append("&quot;"); }
-                else if (nc == 39) { html.Append("&#39;"); }
-                else { html.Append(text.Substring(i + 1, 1)); }
-                i = i + 2;
-            } else if (c == 96) {
-                int close = text.IndexOf("`", i + 1);
-                if (close >= 0) {
-                    html.Append("<code>");
-                    html.Append(Markdown.EscapeHtml(text.Substring(i + 1, close - i - 1)));
-                    html.Append("</code>");
-                    i = close + 1;
-                } else {
-                    html.Append("`"); i = i + 1;
-                }
-            } else if ((c == 42 || c == 95) && i + 1 < n && (text[i + 1] & 255) == c) {
-                string mark = c == 42 ? "**" : "__";
-                int close = text.IndexOf(mark, i + 2);
-                if (close > i + 2) {
-                    html.Append("<strong>");
-                    html.Append(Markdown.InlineAt(text.Substring(i + 2, close - i - 2), depth + 1));
-                    html.Append("</strong>");
-                    i = close + 2;
-                } else {
-                    html.Append(mark); i = i + 2;
-                }
-            } else if (c == 42 || c == 95) {
-                string mark = c == 42 ? "*" : "_";
-                int close = text.IndexOf(mark, i + 1);
-                if (close > i + 1) {
-                    html.Append("<em>");
-                    html.Append(Markdown.InlineAt(text.Substring(i + 1, close - i - 1), depth + 1));
-                    html.Append("</em>");
-                    i = close + 1;
-                } else {
-                    html.Append(mark); i = i + 1;
-                }
-            } else if (c == 91) {
-                int labelEnd = text.IndexOf("]", i + 1);
-                int urlEnd = -1;
-                if (labelEnd >= 0 && labelEnd + 1 < n && (text[labelEnd + 1] & 255) == 40) {
-                    urlEnd = text.IndexOf(")", labelEnd + 2);
-                }
-                if (labelEnd >= 0 && urlEnd >= 0) {
-                    string label = Markdown.InlineAt(text.Substring(i + 1, labelEnd - i - 1), depth + 1);
-                    string url = text.Substring(labelEnd + 2, urlEnd - labelEnd - 2).Trim();
-                    if (Markdown.SafeUrl(url)) {
-                        html.Append("<a href=\"");
-                        html.Append(Markdown.EscapeHtml(url));
-                        html.Append("\">");
-                        html.Append(label);
-                        html.Append("</a>");
-                    } else { html.Append(label); }
-                    i = urlEnd + 1;
-                } else {
-                    html.Append("["); i = i + 1;
-                }
-            } else {
-                int run = i;
-                while (run < n) {
-                    int rc = text[run] & 255;
-                    if (rc == 92 || rc == 96 || rc == 42 || rc == 95 || rc == 91) { break; }
-                    run = run + 1;
-                }
-                html.Append(Markdown.EscapeHtml(text.Substring(i, run - i)));
-                i = run;
-            }
-        }
+        StringBuilder html = new StringBuilder(text.Length + 16);
+        Markdown.AppendInlineSlice(html, text, 0, text.Length, depth);
         return html.ToString();
     }
 
@@ -216,12 +305,13 @@ public class Markdown {
         return scheme == "http" || scheme == "https" || scheme == "mailto";
     }
 
-    // HTML 转义：&lt; &gt; &amp; &quot; &#39;。
+    // HTML 转义：&lt; &gt; &amp; &quot; &#39;（StringView 零中间切片分配）。
     public static string EscapeHtml(string text) {
         if (text == null) { return ""; }
         int len = text.Length;
         int last = 0;
         StringBuilder html = null;
+        nint tp = (nint)text;
         for (int i = 0; i < len; i = i + 1) {
             int c = text[i] & 255;
             string esc = null;
@@ -231,14 +321,14 @@ public class Markdown {
             else if (c == 34) { esc = "&quot;"; }
             else if (c == 39) { esc = "&#39;"; }
             if (esc != null) {
-                if (html == null) { html = new StringBuilder(); }
-                if (i > last) { html.Append(text.Substring(last, i - last)); }
+                if (html == null) { html = new StringBuilder(len + 16); }
+                if (i > last) { html.Append(new StringView(tp + (nint)last, i - last)); }
                 html.Append(esc);
                 last = i + 1;
             }
         }
         if (html == null) { return text; }
-        if (last < len) { html.Append(text.Substring(last, len - last)); }
+        if (last < len) { html.Append(new StringView(tp + (nint)last, len - last)); }
         return html.ToString();
     }
 

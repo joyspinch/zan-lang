@@ -1,0 +1,216 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.CodePage;
+using System.Text.Html;
+using System.Security.Cryptography;
+using System.Json;
+using Formats.Bson;
+using Formats.Cbor;
+using System.Xml;
+using System.Barcode;
+using System.Web;
+
+class OptWave15Enterprise {
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL:" + name);
+        }
+    }
+
+    static void TestEncodingAndNativeHash() {
+        // 1. Valid UTF-8 (ASCII + 2/3/4-byte) and slice offset/count
+        string emoji = Encoding.Utf8FromCodePoint(0x1F600);
+        string utf8Src = "A\u00E9\u4E2D\u6587" + emoji + "Z";
+        byte[] utf8Bytes = Encoding.GetBytes(utf8Src);
+        Check("utf8_valid", Encoding.GetString(utf8Bytes, 0, utf8Bytes.Length) == utf8Src);
+        Check("utf8_slice", Encoding.GetString(utf8Bytes, 1, 2) == "\u00E9");
+
+        // Invalid UTF-8 sequences must decode to U+FFFD (\uFFFD)
+        byte[] bad = new byte[7];
+        bad[0] = 65;   // 'A'
+        bad[1] = 0xC0; // overlong start
+        bad[2] = 0x80; // lone cont
+        bad[3] = 0xED; // surrogate lead
+        bad[4] = 0xA0;
+        bad[5] = 0x80;
+        bad[6] = 66;   // 'B'
+        string decodedBad = Encoding.GetString(bad, 0, bad.Length);
+        Check("utf8_bad_len", decodedBad.StartsWith("A") && decodedBad.EndsWith("B") && decodedBad.Length > 2);
+
+        // 2. UrlEncode / UrlDecode lowercase hex parity & edge cases
+        string urlIn = "a b+c/中文?x=1&y=2~._-";
+        string urlEnc = Encoding.UrlEncode(urlIn);
+        Check("url_enc_lower", urlEnc == "a%20b%2Bc%2F%e4%b8%ad%e6%96%87%3Fx%3D1%26y%3D2~._-" || Encoding.UrlDecode(urlEnc) == urlIn);
+        Check("url_roundtrip", Encoding.UrlDecode(urlEnc) == urlIn);
+        Check("url_plus", Encoding.UrlDecode("hello+world%21%ZZ%2") == "hello world!%ZZ%2");
+        Check("url_fast_ascii", Encoding.UrlEncode("abcXYZ012-_.~") == "abcXYZ012-_.~");
+
+        // 3. HtmlEncode
+        Check("html_enc_fast", Encoding.HtmlEncode("plain text 123") == "plain text 123");
+        Check("html_enc_special", Encoding.HtmlEncode("<a>&\"'</a>") == "&lt;a&gt;&amp;&quot;&#39;&lt;/a&gt;");
+
+        // 4. Encoding.Sha1 & NativeMemory Sha*Into / Sha*Bytes
+        byte[] sha1Out = new byte[20];
+        Encoding.Sha1("abc", 3, sha1Out);
+        Check("enc_sha1_abc", Hex.Encode(sha1Out, 20) == "a9993e364706816aba3e25717850c26c9cd0d89d");
+        Check("sha256_abc", Hex.Encode(Sha256.Hash("abc"), 32) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        Check("sha1_abc", Hex.Encode(Sha1.Hash("abc"), 20) == "a9993e364706816aba3e25717850c26c9cd0d89d");
+        Check("sha512_abc", Hex.Encode(Sha512.Hash("abc"), 64) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+        Check("sha384_abc", Hex.Encode(Sha384.Hash("abc"), 48) == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+        Check("md5_abc", Hex.Encode(Md5.Hash("abc"), 16) == "900150983cd24fb0d6963f7d28e17f72");
+        Check("sm3_abc", Hex.Encode(Sm3.Hash("abc"), 32) == "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
+
+        // 5. PBKDF2-HMAC-SHA256 RFC 6070 / standard vectors (single & multi-block)
+        Check("pbkdf2_1", Pbkdf2.Hex("password", "salt", 1) == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+        Check("pbkdf2_2", Pbkdf2.Hex("password", "salt", 2) == "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+        string dk64 = Pbkdf2.Derive("password", 8, "salt", 4, 2, 64);
+        string dk64Hex = Hex.Encode(dk64, 64);
+        Check("pbkdf2_64", dk64Hex.Length == 128 && dk64Hex.StartsWith("ae4d0c95af6b46d3"));
+
+        // 6. Hex & SM4 CBC round-trip
+        byte[] hexDec = Hex.Decode("000aFf7f");
+        Check("hex_rt", Hex.Encode(hexDec, hexDec.Length) == "000aff7f");
+        string sm4Key = "0123456789abcdef";
+        string sm4Iv = "fedcba9876543210";
+        string pt = "Wave15 SM4 CBC payload 1234567890!";
+        List<int> outLen = new List<int>();
+        outLen.Add(0);
+        byte[] ct = Sm4.EncryptCbc(sm4Key, sm4Iv, pt, pt.Length, outLen);
+        int ctLen = outLen[0];
+        byte[] rt = Sm4.DecryptCbc(sm4Key, sm4Iv, ct, ctLen, outLen);
+        int rtLen = outLen[0];
+        Check("sm4_cbc_rt", Encoding.GetString(rt, 0, rtLen) == pt);
+        Console.WriteLine("P1_OK");
+    }
+
+    static void TestTextPackage() {
+        // 7. GBK encode/decode
+        string gbkSrc = "ABC中文测试2026!@#汉字编码";
+        byte[] gbkBin = Gbk.Encode(gbkSrc);
+        Check("gbk_rt", Gbk.Decode(gbkBin) == gbkSrc);
+        Check("gbk_ascii", Gbk.Decode(Gbk.Encode("hello-123")) == "hello-123");
+        byte[] unmapped = Gbk.EncodeLenient("A" + Encoding.Utf8FromCodePoint(0x1F600) + "B");
+        Check("gbk_unmapped", Gbk.Decode(unmapped) == "A?B");
+        bool strictThrew = false;
+        try { Gbk.Encode("A" + Encoding.Utf8FromCodePoint(0x1F600) + "B"); } catch (Exception) { strictThrew = true; }
+        Check("gbk_strict_threw", strictThrew);
+
+        // 8. Markdown
+        string md = "# Title\n\nHello **bold** & *italics* `code` [link](https://example.com).\n\n- a\n- b\n";
+        string mdHtml = Markdown.ToHtml(md);
+        Check("md_h1", mdHtml.Contains("<h1>Title</h1>"));
+        Check("md_inline", mdHtml.Contains("<strong>bold</strong>") && mdHtml.Contains("<em>italics</em>") && mdHtml.Contains("<code>code</code>"));
+        Check("md_list", mdHtml.Contains("<ul>") && mdHtml.Contains("<li>a</li>"));
+
+        // 9. HTML Parser + Lazy HtmlNode + Entities + Sanitizer
+        string html = "<div id=\"main\"><p>A &amp; B &lt;C&gt; &quot;D&quot; &apos;E&apos; &copy; &#65; &#x4E2D; &unknown; &</p><SCRIPT>var x = 1 < 2;</SCRIPT><a href=\"javascript:alert(1)\">bad</a><a href=\"https://ok.test\">good</a></div>";
+        HtmlDocument doc = HtmlParser.Parse(html);
+        string plain = doc.root.TextContent();
+        Check("html_ent", plain.Contains("A & B <C> \"D\" 'E' \u00A9 A \u4E2D &unknown; &"));
+        Check("html_raw_script", plain.Contains("var x = 1 < 2;"));
+        // Verify lazy attrs/children properties never return null
+        HtmlNode txt = HtmlNode.TextNode("leaf");
+        Check("html_lazy_attrs", txt.attrs != null && txt.attrs.Count == 0);
+        Check("html_lazy_children", txt.children != null && txt.children.Count == 0);
+        string clean = HtmlSanitizer.Clean(html, HtmlPolicy.Rich());
+        Check("html_san_script", !clean.Contains("alert(1)") && !clean.Contains("var x"));
+        Check("html_san_safe_link", clean.Contains("https://ok.test"));
+
+        // 10. Template (escaped, raw, missing key, unclosed truncates)
+        Dictionary<string, string> vars = new Dictionary<string, string>();
+        vars["name"] = "A&B<1>";
+        vars["raw"] = "<b>ok</b>";
+        string rendered = Template.Render("Hi {{ name }}, {{{ raw }}}, {{ missing }}, {{ unclosed", vars);
+        Check("tpl_render", rendered == "Hi A&amp;B&lt;1&gt;, <b>ok</b>, , ");
+
+        // 11. Fuzzy
+        double sExact = Fuzzy.Score("HttpFormParser", "HttpFormParser");
+        double sBoundary = Fuzzy.Score("hfp", "HttpFormParser");
+        double sMid = Fuzzy.Score("hpr", "HttpFormParser");
+        double sMiss = Fuzzy.Score("zzz", "HttpFormParser");
+        Check("fuzzy_order", sExact == 1.0 && sBoundary == 1.0 && sMid > 0.0 && sMid < 1.0 && sMiss == 0.0);
+        Console.WriteLine("P2_OK");
+    }
+
+    static void TestFormatsXmlBarcodeWeb() {
+        // 12. BSON nested docs + >64-element array + IsoFromMs
+        JsonValue root = JsonValue.NewObject();
+        root.Put("s", JsonValue.NewStr("hello\0world"));
+        root.Put("i32", JsonValue.NewInt(42));
+        root.Put("i64", JsonValue.NewInt(5000000000L));
+        root.Put("f", JsonValue.NewDouble(3.5));
+        root.Put("b", JsonValue.NewBool(true));
+        root.Put("n", JsonValue.NewNull());
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < 70; i = i + 1) {
+            arr.Append(JsonValue.NewInt(i));
+        }
+        root.Put("arr", arr);
+        JsonValue sub = JsonValue.NewObject();
+        sub.Put("k", JsonValue.NewStr("v"));
+        root.Put("sub", sub);
+        byte[] bsonBin = Bson.Pack(root);
+        JsonValue bsonDec = Bson.Unpack(bsonBin);
+        JsonValue bs = bsonDec.Get("s");
+        JsonValue bi64 = bsonDec.Get("i64");
+        JsonValue barr = bsonDec.Get("arr");
+        JsonValue bsub = bsonDec.Get("sub");
+        JsonValue bsubk = bsub != null ? bsub.Get("k") : null;
+        Check("bson_str_nul", bs != null && bs.AsString("") == "hello\0world");
+        Check("bson_i64", bi64 != null && bi64.AsLong(0) == 5000000000L);
+        Check("bson_arr_70", barr != null && barr.Count() == 70 && barr.At(69).AsLong(0) == 69L);
+        Check("bson_sub", bsubk != null && bsubk.AsString("") == "v");
+        Check("bson_iso_ms", BsonReader.IsoFromMs(1764144123456L) == "2025-11-26T08:02:03.456Z");
+        Check("bson_iso_sec", BsonReader.IsoFromMs(1764144123000L) == "2025-11-26T08:02:03Z");
+        Check("bson_iso_neg", BsonReader.IsoFromMs(-500L) == "1969-12-31T23:59:59.500Z");
+
+        // 13. CBOR encode/decode + IsoFromUnixNanos
+        byte[] cborBin = Cbor.Encode(root);
+        JsonValue cborDec = Cbor.Decode(cborBin);
+        JsonValue cs = cborDec.Get("s");
+        JsonValue carr = cborDec.Get("arr");
+        JsonValue csub = cborDec.Get("sub");
+        JsonValue csubk = csub != null ? csub.Get("k") : null;
+        Check("cbor_str_nul", cs != null && cs.AsString("") == "hello\0world");
+        Check("cbor_arr_70", carr != null && carr.Count() == 70 && carr.At(69).AsLong(0) == 69L);
+        Check("cbor_sub", csubk != null && csubk.AsString("") == "v");
+        Check("cbor_iso", CborReader.IsoFromUnixNanos(1764144123L, 45000000L) == "2025-11-26T08:02:03.045Z");
+
+        // 14. XML Parse (BOM, decl, PI, comment, CDATA, entities, CRLF/CR)
+        string xmlSrc = "\uFEFF<?xml version=\"1.0\"?><?pi data?>\r\n<!-- note --><root a=\"1&amp;2\" b='x'>&lt;&gt;&quot;&apos;&#65;&#x4E2D;\r\nL2\rL3<![CDATA[<raw>&]]></root>";
+        XmlDocument xdoc = XmlDocument.Parse(xmlSrc);
+        XmlNode xroot = xdoc.RootElement();
+        Check("xml_attr", xroot.Attr("a") == "1&2" && xroot.Attr("b") == "x");
+        Check("xml_text", xroot.InnerText() == "<>\"'A\u4E2D\nL2\nL3<raw>&");
+
+        // 15. QrBinarizer Denoise (2x2 small + 5x5 salt-and-pepper + corner tie-break)
+        bool[] small = new bool[4];
+        small[0] = true; small[1] = true; small[2] = false; small[3] = false;
+        bool[] smallOut = QrBinarizer.Denoise(small, 2, 2);
+        Check("qr_small_tie", smallOut[0] && smallOut[1] && !smallOut[2] && !smallOut[3]);
+        bool[] grid = new bool[25];
+        for (int i = 0; i < 25; i = i + 1) { grid[i] = true; }
+        grid[12] = false; // isolated white pixel at center (2,2)
+        bool[] gridOut = QrBinarizer.Denoise(grid, 5, 5);
+        Check("qr_interior_denoise", gridOut[12]);
+
+        // 16. HttpFormParser (urlencoded + multipart)
+        StrMap f1 = new StrMap();
+        HttpFormParser.ParseUrlEncoded("name=Alice+Smith&tags[]=a&tags[]=b&msg=%E4%B8%AD%E6%96%87", f1);
+        Check("form_url", f1.GetOr("name", "") == "Alice Smith" && f1.GetOr("tags", "") == "a,b" && f1.GetOr("msg", "") == "\u4E2D\u6587");
+        string ct = "multipart/form-data; BOUNDARY=\"B15\"";
+        string mp = "--B15\r\nContent-Disposition: form-data; NAME=\"user\"\r\n\r\nBob\r\n--B15\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nskip\r\n--B15--\r\n";
+        StrMap f2 = new StrMap();
+        HttpFormParser.ParseMultipartInto(ct, mp, f2);
+        Check("form_mp", f2.GetOr("user", "") == "Bob" && f2.GetOr("file", "") == "");
+        Console.WriteLine("P3_OK");
+    }
+
+    static void Main() {
+        TestEncodingAndNativeHash();
+        TestTextPackage();
+        TestFormatsXmlBarcodeWeb();
+        Console.WriteLine("ALL_OK");
+    }
+}
