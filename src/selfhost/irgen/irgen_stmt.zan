@@ -532,7 +532,24 @@ partial class Irgen {
     }
 
     void GenIf(Node s) {
+        // The C host's order: the condition's owned temporaries are released
+        // as soon as the condition is decided -- before either branch runs --
+        // and a pattern variable `x is T v` declared by the condition owns its
+        // own reference, released when the if statement ends
+        // (arc_is_owned_operand: "owned pattern scope released", "failed
+        // pattern before else released"). The temps used to be dropped
+        // unreleased and the binding only borrowed them.
+        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+        int condScope = locName.Count;
+        bool svOwn = ifCondOwnsPattern;
+        ifCondOwnsPattern = !curAsync;
         string c = GenCond(s.a);
+        ifCondOwnsPattern = svOwn;
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
         int lt = NL(); int le = NL(); int lend = NL();
         if (s.c != null) { L("  br i1 " + c + ", label %L" + lt + ", label %L" + le); }
         else { L("  br i1 " + c + ", label %L" + lt + ", label %L" + lend); }
@@ -545,6 +562,32 @@ partial class Irgen {
             if (!term) { L("  br label %L" + lend); }
         }
         Label(lend);
+        if (!curAsync && locName.Count > condScope) {
+            ReleaseLocalsFrom(condScope);
+            TrimLocals(condScope);
+        }
+    }
+
+    // A loop condition, the if's rule: its temporaries are released as soon
+    // as it is decided, and a pattern variable it declares owns its value --
+    // released at the back edge (ReleaseCondLocals) and when the loop exits
+    // (arc_is_owned_operand: "while backedge and false cleanup").
+    string GenLoopCond(Node cond) {
+        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+        bool svOwn = ifCondOwnsPattern;
+        ifCondOwnsPattern = !curAsync;
+        string c = GenCond(cond);
+        ifCondOwnsPattern = svOwn;
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
+        return c;
+    }
+    // Release (without forgetting) the locals a loop condition declared.
+    void ReleaseCondLocals(int from) {
+        if (!curAsync && locName.Count > from) { ReleaseLocalsFrom(from); }
     }
 
     void GenWhile(Node s) {
@@ -557,14 +600,17 @@ partial class Irgen {
         brkTarget = lend; contTarget = lc;
         brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
+        int condScope = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
-        string c = GenCond(s.a);
+        string c = GenLoopCond(s.a);
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         Label(lb);
         GenStmt(s.b);
-        if (!term) { L("  br label %L" + lc); }
+        if (!term) { ReleaseCondLocals(condScope); L("  br label %L" + lc); }
         Label(lend);
+        ReleaseCondLocals(condScope);
+        if (!curAsync && locName.Count > condScope) { TrimLocals(condScope); }
         syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
@@ -628,10 +674,11 @@ partial class Irgen {
         brkTarget = lend; contTarget = linc;
         brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
+        int condScope = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         if (s.b != null) {
-            string c = GenCond(s.b);
+            string c = GenLoopCond(s.b);
             L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         } else {
             L("  br label %L" + lb);
@@ -640,6 +687,7 @@ partial class Irgen {
         GenStmt(s.d);
         if (!term) { L("  br label %L" + linc); }
         Label(linc);
+        ReleaseCondLocals(condScope);
         if (s.c != null) {
             if (s.c.kind == AK.Block() || s.c.kind == AK.ExprStmt()) {
                 GenStmt(s.c);
