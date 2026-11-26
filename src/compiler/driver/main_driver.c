@@ -240,13 +240,86 @@ static zan_package_source_root_t *zan_collect_package_source_roots(int *count) {
   }
 }
 
+static void zan_canonicalize_path(const char *path, char *out, size_t cap) {
+  if (!path || !path[0] || !out || cap == 0) {
+    if (out && cap > 0)
+      out[0] = '\0';
+    return;
+  }
+#ifdef _WIN32
+  DWORD n = GetFullPathNameA(path, (DWORD)cap, out, NULL);
+  if (n == 0 || n >= (DWORD)cap)
+    snprintf(out, cap, "%s", path);
+#else
+  char raw[2048];
+  if (path[0] == '/') {
+    snprintf(raw, sizeof(raw), "%s", path);
+  } else {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)))
+      snprintf(raw, sizeof(raw), "%s/%s", cwd, path);
+    else
+      snprintf(raw, sizeof(raw), "%s", path);
+  }
+  const char *segs[128];
+  size_t lens[128];
+  int depth = 0;
+  const char *p = raw;
+  bool abs_path = (*p == '/');
+  while (*p) {
+    while (*p == '/' || *p == '\\')
+      p++;
+    if (!*p)
+      break;
+    const char *s = p;
+    while (*p && *p != '/' && *p != '\\')
+      p++;
+    size_t len = (size_t)(p - s);
+    if (len == 1 && s[0] == '.')
+      continue;
+    if (len == 2 && s[0] == '.' && s[1] == '.') {
+      if (depth > 0)
+        depth--;
+      continue;
+    }
+    if (depth < 128) {
+      segs[depth] = s;
+      lens[depth] = len;
+      depth++;
+    }
+  }
+  size_t pos = 0;
+  if (abs_path && pos + 1 < cap)
+    out[pos++] = '/';
+  for (int i = 0; i < depth; i++) {
+    if (i > 0 && pos + 1 < cap)
+      out[pos++] = '/';
+    size_t copy = lens[i];
+    if (pos + copy >= cap)
+      copy = cap - 1 - pos;
+    if (copy > 0) {
+      memcpy(out + pos, segs[i], copy);
+      pos += copy;
+    }
+  }
+  out[pos] = '\0';
+#endif
+}
+
 static bool zan_path_has_prefix(const char *path, const char *prefix) {
-  if (!path || !prefix || !prefix[0])
+  if (!path || !path[0] || path[0] == '<' || !prefix || !prefix[0])
     return false;
+  char norm_path[1200];
+  char norm_pref[1200];
+  zan_canonicalize_path(path, norm_path, sizeof(norm_path));
+  zan_canonicalize_path(prefix, norm_pref, sizeof(norm_pref));
+  size_t plen = strlen(norm_pref);
+  while (plen > 1 && (norm_pref[plen - 1] == '/' || norm_pref[plen - 1] == '\\'))
+    norm_pref[--plen] = '\0';
   size_t i = 0;
-  for (; prefix[i]; i++) {
-    char a = path[i];
-    char b = prefix[i];
+  for (; i < plen; i++) {
+    char a = norm_path[i];
+    char b = norm_pref[i];
     if (!a)
       return false;
     if (a == '\\')
@@ -262,7 +335,7 @@ static bool zan_path_has_prefix(const char *path, const char *prefix) {
     if (a != b)
       return false;
   }
-  return path[i] == '\0' || path[i] == '/' || path[i] == '\\';
+  return norm_path[i] == '\0' || norm_path[i] == '/' || norm_path[i] == '\\';
 }
 
 static bool zan_is_standard_os_lib(const char *name, int len) {
