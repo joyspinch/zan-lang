@@ -156,7 +156,7 @@ class GuiOverlayLayoutEncapsulationTest {
         Check(bgClicks.count == 0, "click inside popup never penetrates to background");
 
         // Wheel over popup must not scroll background ScrollColumn
-        app.ProcessOffscreenInput(13, ix, iy, 0, 0, -120, 0);
+        app.ProcessOffscreenInput(13, ix, iy, 0, -120, 0, 0);
         Drain(app);
         Check(bgScroll.ScrollTop() == 0, "wheel on popup never scrolls background ScrollColumn");
 
@@ -172,7 +172,7 @@ class GuiOverlayLayoutEncapsulationTest {
             "OverlayHost arranges unanchored Modal to full viewport");
         int mx = 8;
         int my = 8;
-        app.ProcessOffscreenInput(13, mx, my, 0, 0, -120, 0);
+        app.ProcessOffscreenInput(13, mx, my, 0, -120, 0, 0);
         Drain(app);
         Check(bgScroll.ScrollTop() == 0, "wheel on modal mask never scrolls background");
         app.ProcessOffscreenInput(2, mx, my, 0, 0, 0, 0);
@@ -256,6 +256,99 @@ class GuiOverlayLayoutEncapsulationTest {
         Check(lastStep.bx + lastStep.bw <= steps.bx + steps.bw + 1,
             "Steps last item stays within right bound lastRight="
             + Convert.ToString(lastStep.bx + lastStep.bw) + " stepsRight=" + Convert.ToString(steps.bx + steps.bw));
+
+        // 4. Result description wraps by default
+        Result res = Result.Create("success", "Ready");
+        res.Description("Long wrapped description for narrow card.");
+        bool foundWrappedDesc = false;
+        for (int ri = 0; ri < res.ChildCount(); ri = ri + 1) {
+            Control rc = res.ChildAt(ri);
+            if (rc is Label && Style.Has(rc.Class, "result-desc") && ((Label)rc).wrap) {
+                foundWrappedDesc = true;
+            }
+        }
+        Check(foundWrappedDesc, "Result description label enables wrap by default");
+
+        // 5. Ribbon command buttons are excluded from pill border-radius: 999 in liquid/starlight skins
+        app.EnableSkins();
+        app.UseSkin("liquid");
+        Button ribBtn = new Button("Paste");
+        ribBtn.ClassName = "ribbon-cmd";
+        StyleBox ribBoxLiquid = ribBtn.ResolveStyle(app, Style.SNormal());
+        Check(ribBoxLiquid.radius < 100, "liquid button.ribbon-cmd avoids 999 pill radius actual=" + Convert.ToString(ribBoxLiquid.radius));
+        app.UseSkin("starlight");
+        StyleBox ribBoxStar = ribBtn.ResolveStyle(app, Style.SNormal());
+        Check(ribBoxStar.radius < 100, "starlight button.ribbon-cmd avoids 999 pill radius actual=" + Convert.ToString(ribBoxStar.radius));
+    }
+
+    static void TestTabPaneScrollBarAndFlexWrapConvergence(App app) {
+        app.SetOffscreenViewport(800, 540, 100);
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("padding: 10; gap: 8;");
+
+        Tabs tabs = new Tabs(Tabs.Line());
+        tabs.Grow();
+
+        ScrollColumn sc = new ScrollColumn();
+        sc.Grow();
+        Panel tall = Panel.Column();
+        tall.SetInlineStyleCss("gap: 8;");
+        for (int i = 0; i < 30; i = i + 1) {
+            tall.Add(new Button("Overflow Item #" + Convert.ToString(i)));
+        }
+        sc.Add(tall);
+        tabs.Add(new TabPane("Overflow Tab", sc));
+
+        // Flex-wrap convergence next to a fixed-width sibling
+        Panel splitRow = Panel.Row();
+        splitRow.SetInlineStyleCss("gap: 12;");
+        Panel leftCol = Panel.Column();
+        leftCol.Grow();
+        Card wrapCard = new Card("Wrap Convergence");
+        Panel wrapRow = Panel.Row();
+        wrapRow.SetInlineStyleCss("gap: 8; flex-wrap: wrap;");
+        Button lastBtn = null;
+        for (int j = 0; j < 10; j = j + 1) {
+            lastBtn = new Button("Action Button #" + Convert.ToString(j));
+            wrapRow.Add(lastBtn);
+        }
+        wrapCard.Add(wrapRow);
+        leftCol.Add(wrapCard);
+        splitRow.Add(leftCol);
+        Card rightFixed = new Card("Side");
+        rightFixed.SetInlineStyleCss("width: 280;");
+        rightFixed.Add(new Label("Fixed sidebar"));
+        splitRow.Add(rightFixed);
+        tabs.Add(new TabPane("Wrap Tab", splitRow));
+
+        root.Add(tabs);
+        app.SetRootControl(root);
+
+        // Verify Tab 0: TabPane + ScrollColumn bounds to viewport, wants scrollbar, and scrolls on wheel
+        tabs.Select(0);
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 800, 540));
+        app.EndOffscreenFrame();
+        Drain(app);
+        Check(sc.bh > 100 && sc.bh < 520, "TabPane ScrollColumn bounds height to viewport bh=" + Convert.ToString(sc.bh));
+        Check(sc.ScrollExtent() > sc.bh + 200, "TabPane ScrollColumn reports overflow extent=" + Convert.ToString(sc.ScrollExtent()) + " bh=" + Convert.ToString(sc.bh));
+        int sx = sc.bx + sc.bw / 2;
+        int sy = sc.by + sc.bh / 2;
+        app.ProcessOffscreenInput(13, sx, sy, 0, -240, 0, 0);
+        Drain(app);
+        Check(sc.ScrollTop() > 0, "wheel inside TabPane ScrollColumn scrolls content top=" + Convert.ToString(sc.ScrollTop()));
+
+        // Verify Tab 1: flex-wrap card encloses its wrapped last button on Frame 1
+        tabs.Select(1);
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 800, 540));
+        app.EndOffscreenFrame();
+        Drain(app);
+        Check(lastBtn != null && lastBtn.by + lastBtn.bh <= wrapCard.by + wrapCard.bh,
+            "flex-wrap Card encloses wrapped last child bottom="
+            + Convert.ToString(lastBtn.by + lastBtn.bh) + " cardBottom=" + Convert.ToString(wrapCard.by + wrapCard.bh));
+
+        app.SetRootControl(null);
     }
 
     static void Main() {
@@ -267,6 +360,7 @@ class GuiOverlayLayoutEncapsulationTest {
         TestOverlayEventIsolation(app);
         TestTooltipCoordsInPushedLayerAndWrapGuard(app);
         TestStandardComponentEncapsulation(app);
+        TestTabPaneScrollBarAndFlexWrapConvergence(app);
         app.StopLoop();
         app.SetRootControl(null);
         Drain(app);
