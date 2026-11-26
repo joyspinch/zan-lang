@@ -25,6 +25,10 @@ public class Selector {
     public int anbB;
     public bool never;
     public string why;
+    static List<string> emptyClasses = new List<string>();
+    static List<AttrCond> emptyAttrs = new List<AttrCond>();
+    static List<Selector> emptySelectors = new List<Selector>();
+    static List<HasCond> emptyHasList = new List<HasCond>();
     static Selector Parse(string sel) {
         string s = Css.Trim(sel);
         if (s == "" || s == ":root") { return null; }
@@ -64,18 +68,18 @@ public class Selector {
         p.type = "";
         p.universal = false;
         p.classes = "";
-        p.classList = new List<string>();
+        p.classList = Selector.emptyClasses;
         p.id = "";
         p.part = "";
         p.state = "";
         p.clsContains = "";
-        p.attrs = new List<AttrCond>();
+        p.attrs = Selector.emptyAttrs;
         p.reqMask = 0;
         p.forbidMask = 0;
-        p.nots = new List<Selector>();
-        p.ises = new List<Selector>();
-        p.wheres = new List<Selector>();
-        p.hasList = new List<HasCond>();
+        p.nots = Selector.emptySelectors;
+        p.ises = Selector.emptySelectors;
+        p.wheres = Selector.emptySelectors;
+        p.hasList = Selector.emptyHasList;
         p.up = null;
         p.combo = 0;
         p.structCode = 0;
@@ -118,6 +122,7 @@ public class Selector {
                 if (ch == 46) {
                     if (p.classes == "") { p.classes = name; }
                     else { p.classes = p.classes + " " + name; }
+                    if (p.classList == Selector.emptyClasses) { p.classList = new List<string>(); }
                     p.classList.Add(name);
                 } else {
                     p.id = name;
@@ -167,7 +172,10 @@ public class Selector {
                     why = "':not()' argument cannot be evaluated";
                 }
                 for (int q = 0; q < sub.Count; q = q + 1) {
-                    if (sub[q] != null) { nots.Add(sub[q]); }
+                    if (sub[q] != null) {
+                        if (nots == Selector.emptySelectors) { nots = new List<Selector>(); }
+                        nots.Add(sub[q]);
+                    }
                 }
             } else if (lo == "is" || lo == "where") {
                 List<Selector> sub = Selector.ParseList(inner);
@@ -175,8 +183,13 @@ public class Selector {
                 for (int q = 0; q < sub.Count; q = q + 1) {
                     if (sub[q] != null && !sub[q].never) {
                         any = true;
-                        if (lo == "is") { ises.Add(sub[q]); }
-                        else { wheres.Add(sub[q]); }
+                        if (lo == "is") {
+                            if (ises == Selector.emptySelectors) { ises = new List<Selector>(); }
+                            ises.Add(sub[q]);
+                        } else {
+                            if (wheres == Selector.emptySelectors) { wheres = new List<Selector>(); }
+                            wheres.Add(sub[q]);
+                        }
                     }
                 }
                 if (!any) {
@@ -203,6 +216,7 @@ public class Selector {
                     HasCond hc = new HasCond();
                     hc.inner = isel;
                     hc.lead = lead;
+                    if (hasList == Selector.emptyHasList) { hasList = new List<HasCond>(); }
                     hasList.Add(hc);
                 }
                 if (!ok) {
@@ -275,10 +289,14 @@ public class Selector {
     }
     bool SetAnB(string arg) {
         string s = Css.Lower(Css.Trim(arg));
-        string t = "";
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch != " ") { t = t + ch; }
+        string t = s;
+        if (s.IndexOf(" ") >= 0) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.Length; i = i + 1) {
+                int b = s[i] & 255;
+                if (b != 32) { sb.Append((char)b); }
+            }
+            t = sb.ToString();
         }
         if (t == "odd") { anbA = 2; anbB = 1; return true; }
         if (t == "even") { anbA = 2; anbB = 0; return true; }
@@ -307,18 +325,19 @@ public class Selector {
     }
     static bool SignedInt(string s, out int v) {
         v = 0;
-        if (s.Length == 0) { return false; }
-        string t = s;
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int start = 0;
         int sign = 1;
-        if (t.Substring(0, 1) == "+") { t = t.Substring(1, t.Length - 1); }
-        else if (t.Substring(0, 1) == "-") {
-            sign = 0 - 1;
-            t = t.Substring(1, t.Length - 1);
+        int first = s[0] & 255;
+        if (first == 43) { start = 1; }
+        else if (first == 45) { sign = 0 - 1; start = 1; }
+        if (start >= n) { return false; }
+        for (int i = start; i < n; i = i + 1) {
+            int b = s[i] & 255;
+            if (b < 48 || b > 57) { return false; }
         }
-        if (t.Length == 0) { return false; }
-        for (int i = 0; i < t.Length; i = i + 1) {
-            if (!StyleSheet.Digit(t.Substring(i, 1))) { return false; }
-        }
+        string t = start == 0 ? s : s.Substring(start, n - start);
         v = sign * StyleSheet.Num(t);
         return true;
     }
@@ -391,24 +410,18 @@ public class Selector {
             }
             if (val == "") { return false; }
         }
-        if (name == "class") {
-            AttrCond a = new AttrCond();
-            a.name = name;
-            a.op = op;
-            a.val = val;
-            a.nocase = nocase;
-            attrs.Add(a);
-            if (op == "*=" && !nocase && clsContains == "") { clsContains = val; }
-            return true;
-        }
-        int bit = Selector.AttrState(name);
+        int bit = name == "class" ? 0 : Selector.AttrState(name);
         if (bit == 0) {
             AttrCond a = new AttrCond();
             a.name = name;
             a.op = op;
             a.val = val;
             a.nocase = nocase;
+            if (attrs == Selector.emptyAttrs) { attrs = new List<AttrCond>(); }
             attrs.Add(a);
+            if (name == "class" && op == "*=" && !nocase && clsContains == "") {
+                clsContains = val;
+            }
             return true;
         }
         bool truthy = true;
@@ -507,12 +520,16 @@ public class Selector {
                 if (ises[q].MatchNodeCtx(nodeType, classes, cls, nodeId,
                                          nodePart, stateBits, node)) {
                     any = true;
+                    break;
                 }
             }
-            for (int w = 0; w < wheres.Count; w = w + 1) {
-                if (wheres[w].MatchNodeCtx(nodeType, classes, cls, nodeId,
-                                           nodePart, stateBits, node)) {
-                    any = true;
+            if (!any) {
+                for (int w = 0; w < wheres.Count; w = w + 1) {
+                    if (wheres[w].MatchNodeCtx(nodeType, classes, cls, nodeId,
+                                               nodePart, stateBits, node)) {
+                        any = true;
+                        break;
+                    }
                 }
             }
             if (!any) { return false; }

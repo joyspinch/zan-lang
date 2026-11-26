@@ -3,11 +3,25 @@ using System.Collections.Generic;
 using Gui;
 namespace Gui;
 public partial class Css {
+    static Dict<string, int> BuildVarIndex(List<CssVarDecl> vars) {
+        if (vars == null || vars.Count == 0) { return null; }
+        Dict<string, int> idx = new Dict<string, int>();
+        for (int i = 0; i < vars.Count; i = i + 1) {
+            string nm = vars[i].name;
+            if (idx.ContainsKey(nm)) { idx[nm] = i; }
+            else { idx.Add(nm, i); }
+        }
+        return idx;
+    }
     static JsonValue ParseBlock(string body, List<CssVarDecl> vars) {
         return Css.ParseBlockWithSources(body, vars, 0);
     }
     static JsonValue ParseBlockWithSources(string body, List<CssVarDecl> vars,
                                            int externalCount) {
+        return Css.ParseBlockIndexed(body, vars, Css.BuildVarIndex(vars), externalCount);
+    }
+    static JsonValue ParseBlockIndexed(string body, List<CssVarDecl> vars,
+                                       Dict<string, int> varIdx, int externalCount) {
         JsonValue block = JsonValue.NewObject();
         JsonValue source = JsonValue.NewObject();
         JsonValue lengths = JsonValue.NewObject();
@@ -25,13 +39,24 @@ public partial class Css {
             string key = Css.Trim(d.Substring(0, colon));
             string val = Css.Trim(d.Substring(colon + 1, d.Length - colon - 1));
             if (key.Length == 0 || val.Length == 0) { continue; }
-            if (key.Length > 2 && key.Substring(0, 2) == "--") { continue; }
+            if (key.Length > 2 && (key[0] & 255) == 45 && (key[1] & 255) == 45) { continue; }
             string lowerKey = Css.Lower(key);
-            string plain = Css.StripImportant(Css.ExpandVars(val, vars));
             bool imp = Css.HasImportant(val);
-            string resolved = Css.StripImportant(
-                Css.ExpandVarsWithSources(val, vars, externalCount));
-            bool physical = Css.IsPrescaledValue(val, vars, externalCount);
+            string plain;
+            string resolved;
+            if (val.IndexOf("var(") < 0) {
+                plain = imp ? Css.StripImportant(val) : val;
+                resolved = plain;
+            } else {
+                plain = Css.StripImportant(Css.ExpandVarsIndexed(val, vars, varIdx));
+                if (externalCount <= 0 && plain.IndexOf("dpx") < 0) {
+                    resolved = plain;
+                } else {
+                    resolved = Css.StripImportant(
+                        Css.ExpandVarsWithSourcesIndexed(val, vars, varIdx, externalCount));
+                }
+            }
+            bool physical = Css.IsPrescaledResolved(resolved);
             if (imp) {
                 important.Set(lowerKey, JsonValue.NewStr(plain));
                 importantSource.Set(lowerKey, JsonValue.NewBool(physical));
@@ -71,8 +96,25 @@ public partial class Css {
         }
         return s + "dpx";
     }
+    static int LookupVarIndex(List<CssVarDecl> vars, Dict<string, int> varIdx, string name) {
+        if (vars == null || vars.Count == 0) { return 0 - 1; }
+        if (varIdx != null) {
+            int found = 0 - 1;
+            if (varIdx.TryGetValue(name, out found)) { return found; }
+            return 0 - 1;
+        }
+        int last = 0 - 1;
+        for (int i = 0; i < vars.Count; i = i + 1) {
+            if (vars[i].name == name) { last = i; }
+        }
+        return last;
+    }
     static string ExpandVarsWithSources(string val, List<CssVarDecl> vars,
                                          int externalCount) {
+        return Css.ExpandVarsWithSourcesIndexed(val, vars, null, externalCount);
+    }
+    static string ExpandVarsWithSourcesIndexed(string val, List<CssVarDecl> vars,
+                                                Dict<string, int> varIdx, int externalCount) {
         string s = val;
         for (int guard = 0; guard < 8; guard = guard + 1) {
             int at = Css.IndexFrom(s, "var(", 0);
@@ -84,12 +126,7 @@ public partial class Css {
             string name = comma < 0 ? inner : Css.Trim(inner.Substring(0, comma));
             string fallback = comma < 0 ? "" : Css.Trim(
                 inner.Substring(comma + 1, inner.Length - comma - 1));
-            int found = 0 - 1;
-            if (vars != null) {
-                for (int i = 0; i < vars.Count; i = i + 1) {
-                    if (vars[i].name == name) { found = i; }
-                }
-            }
+            int found = Css.LookupVarIndex(vars, varIdx, name);
             string rep = found < 0 ? "" : vars[found].val;
             if (rep == "") { rep = fallback; }
             else if (found < externalCount && Css.IsPhysicalThemeMetric(name)) {
@@ -102,17 +139,25 @@ public partial class Css {
         }
         return s;
     }
-    static bool IsPrescaledValue(string val, List<CssVarDecl> vars, int externalCount) {
-        string value = Css.StripImportant(Css.ExpandVarsWithSources(val, vars, externalCount));
+    static bool IsPrescaledResolved(string value) {
+        if (!value.EndsWith("dpx")) { return false; }
         List<string> parts = StyleSheet.Tokens(value);
-        return parts.Count == 1 && StyleSheet.IsNumeric(value) && value.EndsWith("dpx");
+        return parts.Count == 1 && StyleSheet.IsNumeric(value);
+    }
+    static bool IsPrescaledValue(string val, List<CssVarDecl> vars, int externalCount) {
+        return Css.IsPrescaledResolved(
+            Css.StripImportant(Css.ExpandVarsWithSources(val, vars, externalCount)));
+    }
+    static int IndexOfImportant(string val) {
+        if (val.IndexOf("!") < 0) { return 0 - 1; }
+        return Css.IndexFrom(Css.Lower(val), "!important", 0);
     }
     static string StripImportant(string val) {
-        int at = Css.IndexFrom(Css.Lower(val), "!important", 0);
+        int at = Css.IndexOfImportant(val);
         if (at < 0) { return val; }
         return Css.Trim(val.Substring(0, at));
     }
-    static bool HasImportant(string val) { return Css.IndexFrom(Css.Lower(val), "!important", 0) >= 0; }
+    static bool HasImportant(string val) { return Css.IndexOfImportant(val) >= 0; }
     static string Lower(string s) { return s.ToLower(); }
     static string ImportantOf(JsonValue block, string k) {
         if (block == null) { return ""; }
@@ -173,6 +218,9 @@ public partial class Css {
         return declsOut;
     }
     static string ExpandVars(string val, List<CssVarDecl> vars) {
+        return Css.ExpandVarsIndexed(val, vars, null);
+    }
+    static string ExpandVarsIndexed(string val, List<CssVarDecl> vars, Dict<string, int> varIdx) {
         string s = val;
         for (int guard = 0; guard < 8; guard = guard + 1) {
             int at = Css.IndexFrom(s, "var(", 0);
@@ -190,13 +238,9 @@ public partial class Css {
                     comma + 1, inner.Length - comma - 1));
                 hasFb = true;
             }
-            string rep = "";
-            bool found = false;
-            if (vars != null) {
-                for (int i = 0; i < vars.Count; i = i + 1) {
-                    if (vars[i].name == name) { rep = vars[i].val; found = true; }
-                }
-            }
+            int foundIdx = Css.LookupVarIndex(vars, varIdx, name);
+            bool found = foundIdx >= 0;
+            string rep = found ? vars[foundIdx].val : "";
             if (!found || rep == "") {
                 if (hasFb) { rep = fb; }
                 else if (!found) {
@@ -236,17 +280,20 @@ public partial class Css {
         return -1;
     }
     static string StripComments(string src) {
-        string outp = "";
+        int open = Css.IndexFrom(src, "/*", 0);
+        if (open < 0) { return src; }
+        StringBuilder sb = new StringBuilder();
         int i = 0;
-        while (i < src.Length) {
-            int open = Css.IndexFrom(src, "/*", i);
-            if (open < 0) { return outp + src.Substring(i, src.Length - i); }
-            outp = outp + src.Substring(i, open - i);
+        int n = src.Length;
+        while (open >= 0) {
+            if (open > i) { sb.Append(src.Substring(i, open - i)); }
             int end = Css.IndexFrom(src, "*/", open + 2);
-            if (end < 0) { return outp; }
+            if (end < 0) { return sb.ToString(); }
             i = end + 2;
+            open = Css.IndexFrom(src, "/*", i);
         }
-        return outp;
+        if (i < n) { sb.Append(src.Substring(i, n - i)); }
+        return sb.ToString();
     }
     static List<string> SplitTrim(string s, string sep) {
         List<string> outp = new List<string>();
@@ -284,53 +331,96 @@ public partial class Css {
     }
     static List<string> SelectorTokens(string s) {
         List<string> items = new List<string>();
-        string cur = "";
+        int tokStart = 0 - 1;
+        int tokEnd = 0;
+        StringBuilder curBuf = null;
         int depth = 0;
-        string quote = "";
+        int quote = 0;
         bool ws = false;
         int i = 0;
         int n = s.Length;
         while (i < n) {
-            string ch = s.Substring(i, 1);
+            int at = i;
+            int ch = s[i] & 255;
             i = i + 1;
-            if (quote != "") {
-                cur = cur + ch;
-                if (ch == "\\" && i < n) {
-                    cur = cur + s.Substring(i, 1);
-                    i = i + 1;
-                    continue;
+            if (quote != 0) {
+                int stepEnd = i;
+                if (ch == 92 && i < n) { i = i + 1; stepEnd = i; }
+                else if (ch == quote) { quote = 0; }
+                if (curBuf != null) { curBuf.Append(s.Substring(at, stepEnd - at)); }
+                else {
+                    if (tokStart < 0) { tokStart = at; }
+                    tokEnd = stepEnd;
                 }
-                if (ch == quote) { quote = ""; }
                 continue;
             }
-            if (ch == "\"" || ch == "'") {
-                quote = ch;
-                cur = cur + ch;
+            if (ch == 34 || ch == 39 || ch == 91 || ch == 40) {
+                if (ch == 34 || ch == 39) { quote = ch; }
+                else { depth = depth + 1; }
+                if (curBuf != null) { curBuf.Append(s.Substring(at, 1)); }
+                else if (tokStart < 0) { tokStart = at; tokEnd = i; }
+                else if (tokEnd == at) { tokEnd = i; }
+                else {
+                    curBuf = new StringBuilder();
+                    curBuf.Append(s.Substring(tokStart, tokEnd - tokStart));
+                    curBuf.Append(s.Substring(at, 1));
+                    tokStart = 0 - 1;
+                }
                 ws = false;
                 continue;
             }
-            if (ch == "[" || ch == "(") { depth = depth + 1; cur = cur + ch; ws = false; continue; }
-            if (ch == "]" || ch == ")") { depth = depth - 1; cur = cur + ch; continue; }
-            if (depth > 0) { cur = cur + ch; continue; }
-            if (Css.Space(ch)) {
-                if (cur != "") { ws = true; }
+            if (ch == 93 || ch == 41) {
+                depth = depth - 1;
+                if (curBuf != null) { curBuf.Append(s.Substring(at, 1)); }
+                else if (tokStart < 0) { tokStart = at; tokEnd = i; }
+                else if (tokEnd == at) { tokEnd = i; }
+                else {
+                    curBuf = new StringBuilder();
+                    curBuf.Append(s.Substring(tokStart, tokEnd - tokStart));
+                    curBuf.Append(s.Substring(at, 1));
+                    tokStart = 0 - 1;
+                }
                 continue;
             }
-            if (ch == ">" || ch == "+" || ch == "~") {
-                if (cur != "") { items.Add(cur); cur = ""; }
-                items.Add(ch);
+            if (depth > 0) {
+                if (curBuf != null) { curBuf.Append(s.Substring(at, 1)); }
+                else if (tokStart < 0) { tokStart = at; tokEnd = i; }
+                else { tokEnd = i; }
+                continue;
+            }
+            if (Css.IsSpaceByte(ch)) {
+                if (curBuf != null || tokStart >= 0) { ws = true; }
+                continue;
+            }
+            if (ch == 62 || ch == 43 || ch == 126) {
+                if (curBuf != null) {
+                    items.Add(curBuf.ToString());
+                    curBuf = null;
+                } else if (tokStart >= 0) {
+                    items.Add(s.Substring(tokStart, tokEnd - tokStart));
+                    tokStart = 0 - 1;
+                }
+                items.Add(ch == 62 ? ">" : (ch == 43 ? "+" : "~"));
                 ws = false;
                 continue;
             }
             if (ws) {
-                items.Add(cur);
-                cur = "";
+                if (curBuf != null) {
+                    items.Add(curBuf.ToString());
+                    curBuf = null;
+                } else if (tokStart >= 0) {
+                    items.Add(s.Substring(tokStart, tokEnd - tokStart));
+                    tokStart = 0 - 1;
+                }
                 items.Add(" ");
                 ws = false;
             }
-            cur = cur + ch;
+            if (curBuf != null) { curBuf.Append(s.Substring(at, 1)); }
+            else if (tokStart < 0) { tokStart = at; tokEnd = i; }
+            else { tokEnd = i; }
         }
-        if (cur != "") { items.Add(cur); }
+        if (curBuf != null) { items.Add(curBuf.ToString()); }
+        else if (tokStart >= 0) { items.Add(s.Substring(tokStart, tokEnd - tokStart)); }
         return items;
     }
     static int IndexFrom(string s, string needle, int start) {

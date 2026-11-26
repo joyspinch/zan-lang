@@ -173,6 +173,7 @@ public class PieLayout {
         // ECharts startAngle 是数学角（0=3 点钟，逆时针），默认 90
         // 视觉上=12 点钟；本库扇区角 0=12 点钟顺时针，换算 90-值。
         l.rot = ((90 - pies[0].startAngle) % 360 + 360) % 360;
+        Dict<string, int> colorMap = null;
 
         if (o.pieRings || ringGeo) {
             // 每条可见系列 = 一环，各自 total。ECharts 嵌套饼的系列
@@ -215,13 +216,15 @@ public class PieLayout {
                 // ECharts sort（玫瑰图系列）：'ascending' 按值升序铺
                 // 扇区（pie4 面积模式）。饼图默认保持 data 顺序——
                 // sort 字段默认值来自 funnel，不据此重排。
-                List<int> order = new List<int>();
-                for (int di4 = 0; di4 < s.Count(); di4 = di4 + 1) {
-                    order.Add(di4);
-                }
+                int sCount = s.Count();
+                List<int> order = null;
                 if (s.roseType.Length > 0 && s.sort == "ascending") {
-                    for (int oi = 0; oi < order.Count; oi = oi + 1) {
-                        for (int oj = oi + 1; oj < order.Count; oj = oj + 1) {
+                    order = new List<int>();
+                    for (int di4 = 0; di4 < sCount; di4 = di4 + 1) {
+                        order.Add(di4);
+                    }
+                    for (int oi = 0; oi < sCount; oi = oi + 1) {
+                        for (int oj = oi + 1; oj < sCount; oj = oj + 1) {
                             if (s.Value(order[oj]) < s.Value(order[oi])) {
                                 int tmpO = order[oi];
                                 order[oi] = order[oj];
@@ -237,7 +240,7 @@ public class PieLayout {
                 int roseMax = 0;
                 int roseVis = 0;
                 if (s.roseType.Length > 0) {
-                    for (int di5 = 0; di5 < s.Count(); di5 = di5 + 1) {
+                    for (int di5 = 0; di5 < sCount; di5 = di5 + 1) {
                         if (!s.data[di5].hidden && s.Value(di5) > 0) {
                             roseVis = roseVis + 1;
                             if (s.Value(di5) > roseMax) { roseMax = s.Value(di5); }
@@ -246,10 +249,11 @@ public class PieLayout {
                 }
                 long acc = 0;
                 int visIdx = 0;
-                for (int oi2 = 0; oi2 < order.Count; oi2 = oi2 + 1) {
-                    ChartData d = s.data[order[oi2]];
+                for (int oi2 = 0; oi2 < sCount; oi2 = oi2 + 1) {
+                    int diCur = order != null ? order[oi2] : oi2;
+                    ChartData d = s.data[diCur];
                     if (d.hidden) { continue; }
-                    int v = s.Value(order[oi2]);
+                    int v = s.Value(diCur);
                     if (v <= 0) { continue; }
                     int a0;
                     int a1;
@@ -272,8 +276,14 @@ public class PieLayout {
                         if (a0 < 0) { a0 = 0; }
                         if (a1 > 360) { a1 = 360; }
                     }
-                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, order[oi2], PieLayout.SlicePalIndex(o, s, order[oi2], origIdx[si] * 16 + order[oi2])),
-                        PieLayout.SliceName(s, order[oi2]), origIdx[si], order[oi2], a0, a1,
+                    int palIdx = origIdx[si] * 16 + diCur;
+                    if (d.name.Length > 0) {
+                        if (colorMap == null) { colorMap = PieLayout.BuildGlobalColorMap(o); }
+                        int mapped = 0;
+                        if (colorMap.TryGetValue(d.name, out mapped)) { palIdx = mapped; }
+                    }
+                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, diCur, palIdx),
+                        PieLayout.SliceName(s, diCur), origIdx[si], diCur, a0, a1,
                         pies.Count - 1 - si));
                     l.slices[l.slices.Count - 1].selected = d.selected;
                     l.slices[l.slices.Count - 1].padAngle = s.padAngle;
@@ -331,7 +341,13 @@ public class PieLayout {
                 if (v <= 0) { continue; }
                 int a0 = (int)(acc2 * 360 / total);
                 int a1 = (int)((acc2 + v) * 360 / total);
-                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, PieLayout.SlicePalIndex(o, s, di2, origIdx[p2] * 16 + di2)),
+                int palIdx2 = origIdx[p2] * 16 + di2;
+                if (d.name.Length > 0) {
+                    if (colorMap == null) { colorMap = PieLayout.BuildGlobalColorMap(o); }
+                    int mapped2 = 0;
+                    if (colorMap.TryGetValue(d.name, out mapped2)) { palIdx2 = mapped2; }
+                }
+                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, palIdx2),
                     PieLayout.SliceName(s, di2), origIdx[p2], di2, a0, a1, 0));
                 l.slices[l.slices.Count - 1].selected = d.selected;
                 l.slices[l.slices.Count - 1].padAngle = s.padAngle;
@@ -349,27 +365,38 @@ public class PieLayout {
         return (int)v;
     }
 
+    static Dict<string, int> BuildGlobalColorMap(ChartOption o) {
+        Dict<string, int> map = new Dict<string, int>();
+        int nextIdx = 0;
+        for (int a = 0; a < o.series.Count; a = a + 1) {
+            ChartSeries ps = o.series[a];
+            for (int b = 0; b < ps.data.Count; b = b + 1) {
+                string pn = PieLayout.SliceName(ps, b);
+                if (pn.Length == 0 || map.ContainsKey(pn)) { continue; }
+                map.Add(pn, nextIdx);
+                nextIdx = nextIdx + 1;
+            }
+        }
+        return map;
+    }
+
     // ECharts 同名同色：扇区调色板下标按名字在整个 option 中首次
     // 出现的顺序（去重）分配——多饼同板时同名项恒取同色（官方
     // pie.opt.js 三饼里 直达 恒为第 1 色、邮件营销 恒为第 4 色）。
     // 无名项回落 fallback（系列下标*16+项下标）。
     public static int GlobalColorIndex(ChartOption o, string nm, int fallback) {
         if (nm == null || nm.Length == 0) { return fallback; }
-        List<string> seen = new List<string>();
+        Dict<string, bool> seen = new Dict<string, bool>();
+        int idx = 0;
         for (int a = 0; a < o.series.Count; a = a + 1) {
             ChartSeries ps = o.series[a];
             for (int b = 0; b < ps.data.Count; b = b + 1) {
                 string pn = PieLayout.SliceName(ps, b);
-                if (pn.Length == 0) { continue; }
-                bool dup = false;
-                for (int c3 = 0; c3 < seen.Count; c3 = c3 + 1) {
-                    if (seen[c3] == pn) { dup = true; break; }
-                }
-                if (!dup) { seen.Add(pn); }
+                if (pn.Length == 0 || seen.ContainsKey(pn)) { continue; }
+                if (pn == nm) { return idx; }
+                seen.Add(pn, true);
+                idx = idx + 1;
             }
-        }
-        for (int c4 = 0; c4 < seen.Count; c4 = c4 + 1) {
-            if (seen[c4] == nm) { return c4; }
         }
         return fallback;
     }

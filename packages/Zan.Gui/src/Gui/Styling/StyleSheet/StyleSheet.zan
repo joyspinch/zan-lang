@@ -29,6 +29,8 @@ public partial class StyleSheet {
     List<StyleMediaEntry> mediaEntries;
     int mediaCount;
     Dict<string, CssKeyframeRule> keyframes;
+    List<List<int>> scratchBuckets;
+    List<int> scratchPos;
     StyleSheet() {
         this.rules = JsonValue.NewObject();
         this.vars = JsonValue.NewObject();
@@ -120,6 +122,18 @@ public partial class StyleSheet {
             }
         }
     }
+    static void MergeCountDict(Dict<string, int> dst, Dict<string, int> src) {
+        if (dst == null || src == null || src.Count == 0) { return; }
+        List<string> keys = src.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            int add = 0;
+            src.TryGetValue(k, out add);
+            int cur = 0;
+            if (dst.TryGetValue(k, out cur)) { dst[k] = cur + add; }
+            else { dst.Add(k, add); }
+        }
+    }
     void MergeSheet(StyleSheet other) {
         if (other == null) { return; }
         for (int i = 0; i < other.rules.Count(); i = i + 1) {
@@ -129,35 +143,9 @@ public partial class StyleSheet {
             vars.Set(other.vars.KeyAt(j), other.vars.ValAt(j));
         }
         this.atRulesDropped = this.atRulesDropped + other.atRulesDropped;
-        if (other.atRuleKinds != null && other.atRuleKinds.Count > 0) {
-            List<string> kinds = other.atRuleKinds.Keys;
-            for (int a = 0; a < kinds.Count; a = a + 1) {
-                string kind = kinds[a];
-                int add = 0;
-                other.atRuleKinds.TryGetValue(kind, out add);
-                int cur = 0;
-                if (this.atRuleKinds.TryGetValue(kind, out cur)) {
-                    this.atRuleKinds[kind] = cur + add;
-                } else {
-                    this.atRuleKinds.Add(kind, add);
-                }
-            }
-        }
+        StyleSheet.MergeCountDict(this.atRuleKinds, other.atRuleKinds);
         this.atGuardsSkipped = this.atGuardsSkipped + other.atGuardsSkipped;
-        if (other.atRuleGuards != null && other.atRuleGuards.Count > 0) {
-            List<string> conds = other.atRuleGuards.Keys;
-            for (int c = 0; c < conds.Count; c = c + 1) {
-                string cond = conds[c];
-                int add = 0;
-                other.atRuleGuards.TryGetValue(cond, out add);
-                int cur = 0;
-                if (this.atRuleGuards.TryGetValue(cond, out cur)) {
-                    this.atRuleGuards[cond] = cur + add;
-                } else {
-                    this.atRuleGuards.Add(cond, add);
-                }
-            }
-        }
+        StyleSheet.MergeCountDict(this.atRuleGuards, other.atRuleGuards);
         if (other.mediaEntries != null && other.mediaEntries.Count > 0) {
             if (this.mediaEntries == null) { this.mediaEntries = new List<StyleMediaEntry>(); }
             for (int m = 0; m < other.mediaEntries.Count; m = m + 1) {
@@ -204,7 +192,6 @@ public partial class StyleSheet {
         for (int i = 0; i < block.Count(); i = i + 1) {
             string k = block.KeyAt(i);
             if (StyleSheet.InternalKey(k)) { continue; }
-            JsonValue v = block.ValAt(i);
             StyleSheet.DeclBlock(b, block, k, false);
         }
         JsonValue imp = block.Get("__zan_important");
@@ -223,8 +210,9 @@ public partial class StyleSheet {
     void ApplyMatchCtx(StyleBox b, string type, string cls, string id,
                        string part, int stateBits, StyleNode node) {
         this.Index();
-        this.ApplyCascadeCtx(b, type, cls, id, part, stateBits, node);
-        this.ApplyImportantCtx(b, type, cls, id, part, stateBits, node);
+        List<string> want = Style.Classes(cls);
+        this.ApplyCascadeWithClasses(b, type, want, cls, id, part, stateBits, node);
+        this.ApplyImportantWithClasses(b, type, want, cls, id, part, stateBits, node);
         StyleSheet.ResolveCurrentColor(b);
     }
     void ApplyCascade(StyleBox b, string type, string cls, string id, string part,
@@ -272,8 +260,21 @@ public partial class StyleSheet {
             }
         }
     }
+    List<List<int>> BorrowBuckets(List<int> b0, List<int> b1) {
+        List<List<int>> extra = this.scratchBuckets;
+        if (extra != null) { this.scratchBuckets = null; extra.Clear(); }
+        else { extra = new List<List<int>>(); }
+        extra.Add(b0);
+        extra.Add(b1);
+        return extra;
+    }
     void ApplyCascadeCtx(StyleBox b, string type, string cls, string id,
                          string part, int stateBits, StyleNode node) {
+        this.ApplyCascadeWithClasses(b, type, Style.Classes(cls), cls, id, part, stateBits, node);
+    }
+    void ApplyCascadeWithClasses(StyleBox b, string type, List<string> want,
+                                 string cls, string id, string part,
+                                 int stateBits, StyleNode node) {
         List<int> b0 = null;
         List<int> b1 = null;
         List<List<int>> extra = null;
@@ -292,7 +293,7 @@ public partial class StyleSheet {
                 if (bCount == 0) { b0 = idBucket; bCount = 1; }
                 else if (bCount == 1) { b1 = idBucket; bCount = 2; }
                 else {
-                    if (extra == null) { extra = new List<List<int>>(); extra.Add(b0); extra.Add(b1); }
+                    if (extra == null) { extra = this.BorrowBuckets(b0, b1); }
                     extra.Add(idBucket);
                     bCount = bCount + 1;
                 }
@@ -302,56 +303,48 @@ public partial class StyleSheet {
             if (bCount == 0) { b0 = this.anyFallback; bCount = 1; }
             else if (bCount == 1) { b1 = this.anyFallback; bCount = 2; }
             else {
-                if (extra == null) { extra = new List<List<int>>(); extra.Add(b0); extra.Add(b1); }
+                if (extra == null) { extra = this.BorrowBuckets(b0, b1); }
                 extra.Add(this.anyFallback);
                 bCount = bCount + 1;
             }
         }
-        List<string> want = null;
-        if (cls != "") {
-            want = Style.Classes(cls);
-            if (this.byClass != null && want != null && want.Count > 0) {
-                int wc = want.Count;
-                for (int ci = 0; ci < wc; ci = ci + 1) {
-                    string cn = want[ci];
-                    bool dup = false;
-                    for (int pi = 0; pi < ci; pi = pi + 1) {
-                        if (want[pi] == cn) { dup = true; break; }
-                    }
-                    if (dup) { continue; }
-                    List<int> clsBucket;
-                    if (this.byClass.TryGetValue(cn, out clsBucket)
-                        && clsBucket != null && clsBucket.Count > 0) {
-                        if (bCount == 0) { b0 = clsBucket; bCount = 1; }
-                        else if (bCount == 1) { b1 = clsBucket; bCount = 2; }
-                        else {
-                            if (extra == null) {
-                                extra = new List<List<int>>();
-                                extra.Add(b0);
-                                extra.Add(b1);
-                            }
-                            extra.Add(clsBucket);
-                            bCount = bCount + 1;
-                        }
+        if (this.byClass != null && want != null && want.Count > 0) {
+            int wc = want.Count;
+            for (int ci = 0; ci < wc; ci = ci + 1) {
+                string cn = want[ci];
+                bool dup = false;
+                for (int pi = 0; pi < ci; pi = pi + 1) {
+                    if (want[pi] == cn) { dup = true; break; }
+                }
+                if (dup) { continue; }
+                List<int> clsBucket;
+                if (this.byClass.TryGetValue(cn, out clsBucket)
+                    && clsBucket != null && clsBucket.Count > 0) {
+                    if (bCount == 0) { b0 = clsBucket; bCount = 1; }
+                    else if (bCount == 1) { b1 = clsBucket; bCount = 2; }
+                    else {
+                        if (extra == null) { extra = this.BorrowBuckets(b0, b1); }
+                        extra.Add(clsBucket);
+                        bCount = bCount + 1;
                     }
                 }
             }
         }
         if (bCount == 0) {
             if (this.mediaEntries != null && this.mediaEntries.Count > 0) {
-                if (want == null) { want = Style.Classes(cls); }
                 this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, false);
             }
             return;
         }
-        if (want == null) { want = Style.Classes(cls); }
         if (bCount == 1) {
             this.ApplyCascadeBucket(b, b0, type, want, cls, id, part, stateBits, node);
         } else if (bCount == 2) {
             this.ApplyCascadePair(b, b0, b1, type, want, cls, id, part, stateBits, node);
         } else {
             int kCount = extra.Count;
-            List<int> pos = new List<int>();
+            List<int> pos = this.scratchPos;
+            if (pos != null) { this.scratchPos = null; pos.Clear(); }
+            else { pos = new List<int>(); }
             for (int k = 0; k < kCount; k = k + 1) { pos.Add(0); }
             while (true) {
                 int bestK = 0 - 1;
@@ -375,6 +368,10 @@ public partial class StyleSheet {
                     }
                 }
             }
+            pos.Clear();
+            this.scratchPos = pos;
+            extra.Clear();
+            this.scratchBuckets = extra;
         }
         if (this.mediaEntries != null && this.mediaEntries.Count > 0) {
             this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, false);
@@ -387,10 +384,15 @@ public partial class StyleSheet {
     void ApplyImportantCtx(StyleBox b, string type, string cls, string id,
                            string part, int stateBits, StyleNode node) {
         if (!this.hasImportant && !this.hasMediaImportant) { return; }
+        this.ApplyImportantWithClasses(b, type, Style.Classes(cls), cls, id, part, stateBits, node);
+    }
+    void ApplyImportantWithClasses(StyleBox b, string type, List<string> want,
+                                   string cls, string id, string part,
+                                   int stateBits, StyleNode node) {
+        if (!this.hasImportant && !this.hasMediaImportant) { return; }
         int impCount = (this.hasImportant && this.importantRules != null)
             ? this.importantRules.Count : 0;
         if (impCount == 0 && !this.hasMediaImportant) { return; }
-        List<string> want = Style.Classes(cls);
         if (impCount > 0) {
             for (int idx = 0; idx < impCount; idx = idx + 1) {
                 int i = this.importantRules[idx];

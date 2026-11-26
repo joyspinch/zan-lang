@@ -70,11 +70,56 @@ public partial class Style {
         return h;
     }
     static string[] s_stateStrs = new string[] {
-        "0", "1", "2", "3", "4", "5", "6", "7", "8"
+        "0", "1", "2", "3", "4", "5", "6", "7",
+        "8", "9", "10", "11", "12", "13", "14", "15",
+        "16", "17", "18", "19", "20", "21", "22", "23",
+        "24", "25", "26", "27", "28", "29", "30", "31",
+        "32", "33", "34", "35", "36", "37", "38", "39",
+        "40", "41", "42", "43", "44", "45", "46", "47",
+        "48", "49", "50", "51", "52", "53", "54", "55",
+        "56", "57", "58", "59", "60", "61", "62", "63"
     };
     public static string StateStr(int state) {
-        if (state >= 0 && state <= 8) { return s_stateStrs[state]; }
+        if (state >= 0 && state < 64) { return s_stateStrs[state]; }
         return Convert.ToString(state);
+    }
+    static StringBuilder s_keyBuf = new StringBuilder();
+    static string BuildFullKey(string type, string cls, string id, int state,
+                               string scaleTag, bool isolateApp, string sig) {
+        StringBuilder sb = Style.s_keyBuf;
+        sb.Clear();
+        sb.Append(type);
+        sb.Append("|");
+        sb.Append(cls);
+        sb.Append("|");
+        sb.Append(id);
+        sb.Append("|");
+        sb.Append(Style.StateStr(state));
+        sb.Append(scaleTag);
+        if (isolateApp) { sb.Append("|sys"); }
+        if (sig != "") { sb.Append("#"); sb.Append(sig); }
+        return sb.ToString();
+    }
+    static string BuildPartKey(string type, string part, string fallbackType,
+                               string cls, string id, int state,
+                               string scaleTag, bool isolateApp, string sig) {
+        StringBuilder sb = Style.s_keyBuf;
+        sb.Clear();
+        sb.Append(type);
+        sb.Append("::");
+        sb.Append(part);
+        sb.Append("|");
+        sb.Append(fallbackType);
+        sb.Append("|");
+        sb.Append(cls);
+        sb.Append("|");
+        sb.Append(id);
+        sb.Append("|");
+        sb.Append(Style.StateStr(state));
+        sb.Append(scaleTag);
+        if (isolateApp) { sb.Append("|sys"); }
+        if (sig != "") { sb.Append("#"); sb.Append(sig); }
+        return sb.ToString();
     }
     static int cachedDpiScale = -1;
     static int cachedMetricsScale = -1;
@@ -133,10 +178,9 @@ public partial class Style {
         int dependency = Style.ContextDependencyFor(basef, chartf, sheet, type, cls, id);
         StyleNode ctxNode = dependency == 0 ? null : app.HostStyleCtx();
         bool cacheable = dependency < 2 || ctxNode == null;
-        string sig = Style.ContextSig(app, dependency);
-        string key = type + "|" + cls + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
-        if (isolateApp) { key = key + "|sys"; }
-        if (sig != "") { key = key + "#" + sig; }
+        string sig = Style.ContextSigOf(app, basef, chartf, sheet, ctxNode, dependency);
+        string key = Style.BuildFullKey(type, cls, id, state, Style.ScaleTag(app),
+                                        isolateApp, sig);
         if (cacheable) {
             StyleBox hit = Style.CacheGet(app, key);
             if (hit != null) { return hit.Clone(); }
@@ -174,11 +218,9 @@ public partial class Style {
         }
         StyleNode ctxNode = dependency == 0 ? null : app.HostStyleCtx();
         bool cacheable = dependency < 2 || ctxNode == null;
-        string sig = Style.ContextSig(app, dependency);
-        string key = type + "::" + part + "|" + fallbackType + "|" + cls
-            + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
-        if (isolateApp) { key = key + "|sys"; }
-        if (sig != "") { key = key + "#" + sig; }
+        string sig = Style.ContextSigOf(app, basef, chartf, sheet, ctxNode, dependency);
+        string key = Style.BuildPartKey(type, part, fallbackType, cls, id, state,
+                                        Style.ScaleTag(app), isolateApp, sig);
         if (cacheable) {
             StyleBox hit = Style.CacheGet(app, key);
             if (hit != null) { return hit.Clone(); }
@@ -296,11 +338,28 @@ public partial class Style {
         sheet.ApplyMatchCtx(b, type, cls, id, part, state, node);
     }
     public static int NodeState(StyleNode c) { return c == null ? Style.SNormal() : c.StyleSurfaceState(); }
+    static int cachedMediaW = -1;
+    static int cachedMediaH = -1;
+    static bool cachedMediaDark = false;
+    static bool cachedMediaReduced = false;
+    static string cachedMediaSig = "";
     public static string MediaSig(StyleHost app) {
-        return "m" + Convert.ToString(app.CssViewportWidth()) + "x"
-            + Convert.ToString(app.CssViewportHeight())
-            + (app.HostIsDark() ? "d" : "l")
-            + (app.HostReducedMotion() ? "r" : "n");
+        int vw = app.CssViewportWidth();
+        int vh = app.CssViewportHeight();
+        bool dark = app.HostIsDark();
+        bool reduced = app.HostReducedMotion();
+        if (vw == Style.cachedMediaW && vh == Style.cachedMediaH
+            && dark == Style.cachedMediaDark && reduced == Style.cachedMediaReduced
+            && Style.cachedMediaSig != "") {
+            return Style.cachedMediaSig;
+        }
+        Style.cachedMediaW = vw;
+        Style.cachedMediaH = vh;
+        Style.cachedMediaDark = dark;
+        Style.cachedMediaReduced = reduced;
+        Style.cachedMediaSig = "m" + Convert.ToString(vw) + "x" + Convert.ToString(vh)
+            + (dark ? "d" : "l") + (reduced ? "r" : "n");
+        return Style.cachedMediaSig;
     }
     public static bool AnyMedia(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
         return (basef != null && basef.HasMedia())
@@ -345,33 +404,62 @@ public partial class Style {
     public static string ContextSig(StyleHost app) { return Style.ContextSig(app, Style.ContextDependency(app)); }
     public static string ContextSig(StyleHost app, int dependency) {
         if (app == null) { return ""; }
-        StyleNode ctxNode = app.HostStyleCtx();
-        string sig = dependency == 1 ? Style.CtxSig(ctxNode) : "";
-        if (dependency == 2 && ctxNode != null) { sig = "live"; }
         StyleSheet sheet = app.HostIsolateAppSheet() ? null : app.HostSheet();
-        if (Style.AnyMedia(Style.BaseSheet(app), app.HostChartSheet(), sheet)) {
+        StyleNode ctxNode = dependency == 0 ? null : app.HostStyleCtx();
+        return Style.ContextSigOf(app, Style.BaseSheet(app), app.HostChartSheet(),
+                                  sheet, ctxNode, dependency);
+    }
+    static string ContextSigOf(StyleHost app, StyleSheet basef, StyleSheet chartf,
+                               StyleSheet sheet, StyleNode ctxNode, int dependency) {
+        if (app == null) { return ""; }
+        string sig = "";
+        if (dependency == 1) { sig = Style.CtxSig(ctxNode); }
+        else if (dependency == 2 && ctxNode != null) { sig = "live"; }
+        if (Style.AnyMedia(basef, chartf, sheet)) {
             sig = sig + "#" + Style.MediaSig(app);
         }
         return sig;
     }
+    static List<StyleNode> s_ctxAnc = null;
+    static StringBuilder s_ctxBuf = new StringBuilder();
     public static string CtxSig(StyleNode node) {
-        string sig = "";
+        if (node == null) { return ""; }
+        List<StyleNode> chain = Style.s_ctxAnc;
+        if (chain != null) { Style.s_ctxAnc = null; chain.Clear(); }
+        else { chain = new List<StyleNode>(); }
         StyleNode anc = node;
         while (anc != null) {
-            string type = anc.StyleType();
-            string cls = anc.EffectiveClass();
-            string nm = anc.StyleNodeName();
-            string piece = Convert.ToString(type.Length) + ":" + type
-                + Convert.ToString(cls.Length) + ":" + cls
-                + Convert.ToString(nm.Length) + ":" + nm;
-            StyleNode par = anc.StyleParentNode();
-            int index = par == null ? 0 : par.StyleIndexOfNode(anc);
-            int state = anc == node ? 0 : Style.NodeState(anc);
-            piece = piece + "/" + Convert.ToString(index) + "/" + Style.StateStr(state);
-            sig = sig == "" ? piece : piece + ">" + sig;
-            anc = par;
+            chain.Add(anc);
+            anc = anc.StyleParentNode();
         }
-        return sig;
+        StringBuilder sb = Style.s_ctxBuf;
+        sb.Clear();
+        for (int i = chain.Count - 1; i >= 0; i = i - 1) {
+            if (i < chain.Count - 1) { sb.Append(">"); }
+            StyleNode cur = chain[i];
+            StyleNode par = i + 1 < chain.Count ? chain[i + 1] : null;
+            string type = cur.StyleType();
+            string cls = cur.EffectiveClass();
+            string nm = cur.StyleNodeName();
+            int index = par == null ? 0 : par.StyleIndexOfNode(cur);
+            int state = i == 0 ? 0 : Style.NodeState(cur);
+            sb.Append(type.Length);
+            sb.Append(":");
+            sb.Append(type);
+            sb.Append(cls.Length);
+            sb.Append(":");
+            sb.Append(cls);
+            sb.Append(nm.Length);
+            sb.Append(":");
+            sb.Append(nm);
+            sb.Append("/");
+            sb.Append(index);
+            sb.Append("/");
+            sb.Append(Style.StateStr(state));
+        }
+        chain.Clear();
+        Style.s_ctxAnc = chain;
+        return sb.ToString();
     }
     static List<string> emptyClasses = new List<string>();
     static Dict<string, List<string>> classesCache = new Dict<string, List<string>>();
