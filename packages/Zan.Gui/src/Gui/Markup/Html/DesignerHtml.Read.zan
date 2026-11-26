@@ -51,31 +51,16 @@ public partial class DesignerHtml {
                 if (v != "") { o.Put("zHide", JsonValue.NewStr(v)); }
                 continue;
             }
-            string eventVal = v;
-            int evParen = v.IndexOf("(");
-            if (evParen >= 0 && v.EndsWith(")")) {
-                eventVal = v.Substring(0, evParen).Trim();
-                string innerArg = v.Substring(evParen + 1, v.Length - evParen - 2).Trim();
-                if (!o.Has("arg") && innerArg != "") { o.Put("arg", JsonValue.NewStr(innerArg)); }
-            }
-            if (a.Length > 1 && a[0] == 64) { // '@'
-                string ev = NormalizeEventName(a.Substring(1));
-                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
-                continue;
-            }
-            if (a.Length > 5 && (HtmlText.StartsWith(a, "v-on:") || HtmlText.StartsWith(a, "z-on:"))) {
-                string ev = NormalizeEventName(a.Substring(5));
-                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
-                continue;
-            }
-            if (a.Length > 2 && HtmlText.StartsWith(a, "z-")) {
-                if (a == "z-show" || a == "z-hide") { continue; }
-                string ev = NormalizeEventName(a.Substring(2));
-                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
-                continue;
-            }
-            if (a.Length > 2 && a[0] == 111 && a[1] == 110) { // "on"
-                string ev = NormalizeEventName(a.Substring(2));
+            string evRaw = MatchEventAttrPrefix(a);
+            if (evRaw != null) {
+                string eventVal = v;
+                int evParen = v.IndexOf("(");
+                if (evParen >= 0 && v.EndsWith(")")) {
+                    eventVal = v.Substring(0, evParen).Trim();
+                    string innerArg = v.Substring(evParen + 1, v.Length - evParen - 2).Trim();
+                    if (!o.Has("arg") && innerArg != "") { o.Put("arg", JsonValue.NewStr(innerArg)); }
+                }
+                string ev = NormalizeEventName(evRaw);
                 if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
                 continue;
             }
@@ -120,7 +105,7 @@ public partial class DesignerHtml {
             o.Put("percent", JsonValue.NewNum(Convert.ToString(pct)));
         }
         if (kind == "SelectBox") {
-            string opts = "";
+            StringBuilder optsSb = new StringBuilder();
             int selIdx = 0 - 1;
             int oi = 0;
             for (int i = 0; i < n.items.Count; i = i + 1) {
@@ -130,22 +115,25 @@ public partial class DesignerHtml {
                 if (cn.tag != "option") { continue; }
                 string ot = cn.text;
                 if (ot == "") {
+                    StringBuilder otSb = new StringBuilder();
                     for (int k = 0; k < cn.items.Count; k = k + 1) {
                         WItem cit = cn.items[k];
                         if (cit.kid >= 0 || cit.text == "") { continue; }
-                        ot = ot + cit.text;
+                        otSb.Append(cit.text);
                     }
+                    ot = otSb.ToString();
                 }
                 ot = ot.Trim();
                 for (int q = 0; q < cn.attrs.Count; q = q + 1) {
                     if (cn.attrs[q].name == "selected") { selIdx = oi; }
                 }
                 if (ot != "") {
-                    if (oi > 0) { opts = opts + "|"; }
-                    opts = opts + ot;
+                    if (oi > 0) { optsSb.Append("|"); }
+                    optsSb.Append(ot);
                 }
                 oi = oi + 1;
             }
+            string opts = optsSb.ToString();
             if (opts != "") { o.Put("options", JsonValue.NewStr(opts)); }
             if (selIdx < 0 && opts != "") { selIdx = 0; }
             if (selIdx >= 0) { o.Put("value", JsonValue.NewNum(Convert.ToString(selIdx))); }
@@ -153,14 +141,15 @@ public partial class DesignerHtml {
         if (kind == "SelectBox") { return o; }
         JsonValue kids = JsonValue.NewArray();
         JsonValue content = JsonValue.NewArray();
-        string txt = n.text;
+        StringBuilder txtSb = new StringBuilder();
+        if (n.text != "") { txtSb.Append(n.text); }
         bool hasText = false;
         for (int i = 0; i < n.items.Count; i = i + 1) {
             WItem it = n.items[i];
             if (it.kid < 0) {
                 if (it.text != "") {
                     content.Append(JsonValue.NewStr(it.text));
-                    txt = txt + it.text;
+                    txtSb.Append(it.text);
                     hasText = true;
                 }
             } else {
@@ -171,11 +160,24 @@ public partial class DesignerHtml {
         if (hasText && kids.Count() > 0) {
             o.Set("htmlContent", content);
         } else {
+            string txt = txtSb.ToString();
             if (kind != "Element" && !o.Has("htmlTag")) { txt = txt.Trim(); }
             if (txt != "" && !o.Has("text")) { o.Put("text", JsonValue.NewStr(txt)); }
         }
         if (kids.Count() > 0) { o.Put("kids", kids); }
         return o;
+    }
+    static string MatchEventAttrPrefix(string a) {
+        if (a.Length > 1 && a[0] == 64) { return a.Substring(1); } // '@'
+        if (a.Length > 5 && (HtmlText.StartsWith(a, "v-on:") || HtmlText.StartsWith(a, "z-on:"))) {
+            return a.Substring(5);
+        }
+        if (a.Length > 2 && HtmlText.StartsWith(a, "z-")) {
+            if (a == "z-show" || a == "z-hide") { return null; }
+            return a.Substring(2);
+        }
+        if (a.Length > 2 && a[0] == 111 && a[1] == 110) { return a.Substring(2); } // "on"
+        return null;
     }
     public static string NormalizeEventName(string raw) { return HtmlText.EventName(raw); }
     public static void PutAttr(JsonValue o, string suffix, string v) {
@@ -264,18 +266,19 @@ public partial class DesignerHtml {
                  + EscapeAttr(v.ToJson()) + "\"");
     }
     public static string KebabKey(string s) {
-        string outp = "";
+        if (s == null || s.Length == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i];
             if (c >= 65 && c <= 90) {
-                if (i > 0) { outp = outp + "-"; }
-                outp = outp + (char)(c + 32);
+                if (i > 0) { sb.Append("-"); }
+                sb.Append((char)(c + 32));
             } else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)
                        || c == 45) {
-                outp = outp + s.Substring(i, 1);
+                sb.Append((char)c);
             }
         }
-        return outp;
+        return sb.ToString();
     }
     public static string Unkebab(string s) { return HtmlText.UnkebabKey(s); }
     public static bool IsNumeric(string s) {
@@ -293,20 +296,38 @@ public partial class DesignerHtml {
         return digits > 0 && dots <= 1;
     }
     public static string EscapeAttr(string s) {
-        string outp = "";
+        if (s == null || s.Length == 0) { return ""; }
+        int first = -1;
         for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "&") { outp = outp + "&amp;"; }
-            else if (ch == "<") { outp = outp + "&lt;"; }
-            else if (ch == ">") { outp = outp + "&gt;"; }
-            else if (ch == "\"") { outp = outp + "&quot;"; }
-            else if (ch == "'") { outp = outp + "&#39;"; }
-            else if (ch == "\n") { outp = outp + "&#10;"; }
-            else if (ch == "\r") { outp = outp + "&#13;"; }
-            else if (ch == "\t") { outp = outp + "&#9;"; }
-            else { outp = outp + ch; }
+            int c = s[i] & 255;
+            if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39
+                || c == 10 || c == 13 || c == 9) {
+                first = i;
+                break;
+            }
         }
-        return outp;
+        if (first < 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int runStart = 0;
+        for (int i = first; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            string esc = null;
+            if (c == 38) { esc = "&amp;"; }
+            else if (c == 60) { esc = "&lt;"; }
+            else if (c == 62) { esc = "&gt;"; }
+            else if (c == 34) { esc = "&quot;"; }
+            else if (c == 39) { esc = "&#39;"; }
+            else if (c == 10) { esc = "&#10;"; }
+            else if (c == 13) { esc = "&#13;"; }
+            else if (c == 9) { esc = "&#9;"; }
+            if (esc != null) {
+                if (i > runStart) { sb.Append(s.Substring(runStart, i - runStart)); }
+                sb.Append(esc);
+                runStart = i + 1;
+            }
+        }
+        if (runStart < s.Length) { sb.Append(s.Substring(runStart, s.Length - runStart)); }
+        return sb.ToString();
     }
     public static bool TextIsHtmlSafe(string s) {
         if (s.Length == 0) { return false; }

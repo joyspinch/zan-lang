@@ -101,66 +101,46 @@ public partial class ChartView {
     // O(高×边) 足够。
     public static void FillPolyAlpha(Canvas c, List<int> px, List<int> py,
     int color, int alpha) {
-        int n = px.Count;
-        if (n < 3 || py.Count < n) { return; }
-        int y0 = py[0];
-        int y1 = py[0];
-        for (int i = 1; i < n; i = i + 1) {
-            if (py[i] < y0) { y0 = py[i]; }
-            if (py[i] > y1) { y1 = py[i]; }
-        }
-        Chart.renderContext.EnsureScratch();
-        List<int> xs = Chart.renderContext.scratchI7;
-        for (int y = y0; y <= y1; y = y + 1) {
-            xs.Clear();
-            // 采样行中心 y+0.5（2 倍定点避免小数）：t =
-            // (y+0.5-ya)/(yb-ya)，交点 x*256。半开区间 [min,max)
-            // 防止顶点行重复计入。
-            int yc2 = y * 2 + 1;
-            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
-                int j = i2 + 1;
-                if (j == n) { j = 0; }
-                int ya = py[i2];
-                int yb = py[j];
-                if (ya == yb) { continue; }
-                bool inside = (yc2 >= ya * 2 && yc2 < yb * 2)
-                || (yc2 >= yb * 2 && yc2 < ya * 2);
-                if (!inside) { continue; }
-                xs.Add(px[i2] * 256
-                + (yc2 - ya * 2) * (px[j] - px[i2]) * 256 / (2 * (yb - ya)));
-            }
-            // 插入排序（xs 通常 2~4 个元素）。
-            for (int a = 1; a < xs.Count; a = a + 1) {
-                int v = xs[a];
-                int b = a - 1;
-                while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b = b - 1; }
-                xs[b + 1] = v;
-            }
-            for (int k = 0; k + 1 < xs.Count; k = k + 2) {
-                FillSpanAlpha(c, xs[k], xs[k + 1], y, color, alpha);
-            }
-        }
+        FillPolyScan(c, px, py, color, alpha, false);
     }
 
     // 一条水平段的亚像素填充：两端以 1/256 px 给定，首末列按
-    // 小数覆盖率混合，中间整列实铺。
+    // 小数覆盖率混合，中间整列一次 FillRect 实铺。
     public static void FillSpanAlpha(Canvas c, int xF0, int xF1, int y,
     int color, int alpha) {
         if (xF1 <= xF0) { return; }
         int x0 = xF0 / 256;
         int x1 = (xF1 - 1) / 256;
-        for (int x = x0; x <= x1; x = x + 1) {
-            int cov = 256;
-            if (x == x0) { cov = cov - (xF0 - x0 * 256); }
-            if (x == x1) { cov = cov - ((x1 + 1) * 256 - xF1); }
-            if (cov <= 0) { continue; }
-            c.FillRect(x, y, 1, 1, ChartColor.WithAlpha(color, alpha * cov / 256));
+        if (x0 > x1) { return; }
+        if (x0 == x1) {
+            int cov = xF1 - xF0;
+            if (cov > 0) {
+                c.FillRect(x0, y, 1, 1, ChartColor.WithAlpha(color, alpha * cov / 256));
+            }
+            return;
+        }
+        int cov0 = 256 - (xF0 - x0 * 256);
+        if (cov0 > 0) {
+            c.FillRect(x0, y, 1, 1, ChartColor.WithAlpha(color, alpha * cov0 / 256));
+        }
+        int midW = x1 - x0 - 1;
+        if (midW > 0) {
+            c.FillRect(x0 + 1, y, midW, 1, ChartColor.WithAlpha(color, alpha));
+        }
+        int cov1 = xF1 - x1 * 256;
+        if (cov1 > 0) {
+            c.FillRect(x1, y, 1, 1, ChartColor.WithAlpha(color, alpha * cov1 / 256));
         }
     }
 
     // 非零环绕填充：弦图缎带过圆心自交，偶奇规则会挖空。
     public static void FillPolyWinding(Canvas c, List<int> px, List<int> py,
     int color, int alpha) {
+        FillPolyScan(c, px, py, color, alpha, true);
+    }
+
+    private static void FillPolyScan(Canvas c, List<int> px, List<int> py,
+    int color, int alpha, bool winding) {
         int n = px.Count;
         if (n < 3 || py.Count < n) { return; }
         int y0 = py[0];
@@ -169,14 +149,14 @@ public partial class ChartView {
             if (py[i] < y0) { y0 = py[i]; }
             if (py[i] > y1) { y1 = py[i]; }
         }
-        Chart.renderContext.EnsureScratch();
-        List<int> xs = Chart.renderContext.scratchI7;
-        List<int> ds = Chart.renderContext.scratchI8;
+        ChartRenderContext rctx = ChartView.EnsureRenderScratch();
+        List<int> xs = rctx.scratchI7;
+        List<int> ds = rctx.scratchI8;
         for (int y = y0; y <= y1; y = y + 1) {
             xs.Clear();
-            ds.Clear();
-            // 与 FillPolyAlpha 同款：采样行中心 y+0.5，交点 1/256
-            // 定点，段首末列小数覆盖率混合（FillSpanAlpha）。
+            if (winding) { ds.Clear(); }
+            // 采样行中心 y+0.5（2 倍定点避免小数），交点 1/256 定点；
+            // 半开区间 [min,max) 防止顶点行重复计入。
             int yc2 = y * 2 + 1;
             for (int i2 = 0; i2 < n; i2 = i2 + 1) {
                 int j = i2 + 1;
@@ -189,26 +169,31 @@ public partial class ChartView {
                 if (!inside) { continue; }
                 xs.Add(px[i2] * 256
                 + (yc2 - ya * 2) * (px[j] - px[i2]) * 256 / (2 * (yb - ya)));
-                int dir = 1;
-                if (yb < ya) { dir = 0 - 1; }
-                ds.Add(dir);
+                if (winding) { ds.Add(yb < ya ? (0 - 1) : 1); }
             }
+            // 插入排序（xs 通常 2~4 个元素）。
             for (int a = 1; a < xs.Count; a = a + 1) {
                 int v = xs[a];
-                int d = ds[a];
+                int d = winding ? ds[a] : 0;
                 int b = a - 1;
                 while (b >= 0 && xs[b] > v) {
                     xs[b + 1] = xs[b];
-                    ds[b + 1] = ds[b];
+                    if (winding) { ds[b + 1] = ds[b]; }
                     b = b - 1;
                 }
                 xs[b + 1] = v;
-                ds[b + 1] = d;
+                if (winding) { ds[b + 1] = d; }
             }
-            int wind = 0;
-            for (int k = 0; k + 1 < xs.Count; k = k + 1) {
-                wind = wind + ds[k];
-                if (wind != 0) {
+            if (winding) {
+                int wind = 0;
+                for (int k = 0; k + 1 < xs.Count; k = k + 1) {
+                    wind = wind + ds[k];
+                    if (wind != 0) {
+                        FillSpanAlpha(c, xs[k], xs[k + 1], y, color, alpha);
+                    }
+                }
+            } else {
+                for (int k = 0; k + 1 < xs.Count; k = k + 2) {
                     FillSpanAlpha(c, xs[k], xs[k + 1], y, color, alpha);
                 }
             }

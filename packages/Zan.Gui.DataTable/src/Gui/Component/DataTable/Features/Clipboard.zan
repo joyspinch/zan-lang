@@ -31,26 +31,48 @@ public partial class DataTable {
     // 转义单个 CSV 字段（含逗号、引号或换行时加引号，内嵌引号翻倍）。
     public static string CsvField(string v) {
         bool needsQuote = false;
-        int i = 0;
-        while (i < v.Length) {
-            char ch = v[i];
-            int cc = (int)ch;
-            if (cc == 44 || cc == 34 || cc == 10 || cc == 13) { needsQuote = true; i = v.Length; }
-            else { i = i + 1; }
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int cc = (int)v[i];
+            if (cc == 44 || cc == 34 || cc == 10 || cc == 13) { needsQuote = true; break; }
         }
         if (!needsQuote) { return v; }
         // 将内嵌引号翻倍；用 Substring 复制片段，
         // 使非 ASCII 字符完整保留（不做逐字符重建）。
-        string body = "";
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
         int start = 0;
         for (int k = 0; k < v.Length; k = k + 1) {
             if ((int)v[k] == 34) {
-                body = body + v.Substring(start, k - start + 1) + "\"";
+                sb.Append(v.Substring(start, k - start + 1));
+                sb.Append("\"");
                 start = k + 1;
             }
         }
-        body = body + v.Substring(start, v.Length - start);
-        return "\"" + body + "\"";
+        if (start < v.Length) { sb.Append(v.Substring(start, v.Length - start)); }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+
+    private static void AppendHeaderRow(StringBuilder sb, List<DataColumn> cols,
+                                        int c0, int c1, string sep, bool csv, string nl) {
+        for (int cc = c0; cc <= c1; cc = cc + 1) {
+            string h = cols[cc].title;
+            if (csv) { h = DataTable.CsvField(h); }
+            if (cc > c0) { sb.Append(sep); }
+            sb.Append(h);
+        }
+        sb.Append(nl);
+    }
+
+    private static void AppendDataRow(StringBuilder sb, List<DataColumn> cols, DataSource src,
+                                      int srcRow, int c0, int c1, string sep, bool csv, string nl) {
+        for (int cc = c0; cc <= c1; cc = cc + 1) {
+            string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
+            if (csv) { v = DataTable.CsvField(v); }
+            if (cc > c0) { sb.Append(sep); }
+            sb.Append(v);
+        }
+        sb.Append(nl);
     }
 
     // 为当前单元格范围构建制表符分隔（剪贴板）或逗号分隔（CSV）文本块；
@@ -60,10 +82,9 @@ public partial class DataTable {
     // Ctrl 追加出的多区域选区按区域顺序逐块拼接（Excel 同款：
     // 每个区域独立成段，区域间不共享行）。
     public static string BuildText(DataTableState st, List<DataColumn> cols, DataSource src, bool csv, bool withHeader) {
-        string sep = "\t";
-        if (csv) { sep = ","; }
+        string sep = csv ? "," : "\t";
         string nl = "\r\n";
-        string outp = "";
+        StringBuilder sb = new StringBuilder();
 
         // 多区域：逐区域追加文本段。
         if (DataTable.RangeCount(st) > 1) {
@@ -71,37 +92,14 @@ public partial class DataTable {
             for (int mi = 0; mi < n; mi = mi + 1) {
                 int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
                 if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
-                if (withHeader) {
-                    string hline = "";
-                    int hc = mc0;
-                    while (hc <= mc1) {
-                        string h = cols[hc].title;
-                        if (csv) { h = DataTable.CsvField(h); }
-                        if (hc > mc0) { hline = hline + sep; }
-                        hline = hline + h;
-                        hc = hc + 1;
-                    }
-                    outp = outp + hline + nl;
-                }
-                int mrr = mr0;
-                while (mrr <= mr1) {
+                if (withHeader) { DataTable.AppendHeaderRow(sb, cols, mc0, mc1, sep, csv, nl); }
+                for (int mrr = mr0; mrr <= mr1; mrr = mrr + 1) {
                     if (mrr >= 0 && mrr < st.order.Count) {
-                        int srcRow = st.order[mrr];
-                        string line = "";
-                        int cc = mc0;
-                        while (cc <= mc1) {
-                            string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
-                            if (csv) { v = DataTable.CsvField(v); }
-                            if (cc > mc0) { line = line + sep; }
-                            line = line + v;
-                            cc = cc + 1;
-                        }
-                        outp = outp + line + nl;
+                        DataTable.AppendDataRow(sb, cols, src, st.order[mrr], mc0, mc1, sep, csv, nl);
                     }
-                    mrr = mrr + 1;
                 }
             }
-            return outp;
+            return sb.ToString();
         }
 
         int c0 = 0;
@@ -117,61 +115,30 @@ public partial class DataTable {
             if (c0 > c1) { return ""; }
         }
 
-        if (withHeader) {
-            string line = "";
-            int cc = c0;
-            while (cc <= c1) {
-                string h = cols[cc].title;
-                if (csv) { h = DataTable.CsvField(h); }
-                if (cc > c0) { line = line + sep; }
-                line = line + h;
-                cc = cc + 1;
-            }
-            outp = line + nl;
-        }
+        if (withHeader) { DataTable.AppendHeaderRow(sb, cols, c0, c1, sep, csv, nl); }
 
         if (rangeMode) {
             int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
             int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
-            int rr = r0;
-            while (rr <= r1) {
+            for (int rr = r0; rr <= r1; rr = rr + 1) {
                 if (rr >= 0 && rr < st.order.Count) {
-                    int srcRow = st.order[rr];
-                    string line = "";
-                    int cc = c0;
-                    while (cc <= c1) {
-                        string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
-                        if (csv) { v = DataTable.CsvField(v); }
-                        if (cc > c0) { line = line + sep; }
-                        line = line + v;
-                        cc = cc + 1;
-                    }
-                    outp = outp + line + nl;
+                    DataTable.AppendDataRow(sb, cols, src, st.order[rr], c0, c1, sep, csv, nl);
                 }
-                rr = rr + 1;
             }
-            return outp;
+            return sb.ToString();
         }
 
         // 否则：选中的行；未勾选任何行时用整个视图
         bool anySel = false;
-        int s = 0;
-        while (s < st.order.Count) { if (DataTable.IsSelected(st, src, st.order[s])) { anySel = true; s = st.order.Count; } else { s = s + 1; } }
+        for (int s = 0; s < st.order.Count; s = s + 1) {
+            if (DataTable.IsSelected(st, src, st.order[s])) { anySel = true; break; }
+        }
         for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
             int ri = st.order[oi];
             if (!anySel || DataTable.IsSelected(st, src, ri)) {
-                string line = "";
-                int cc = c0;
-                while (cc <= c1) {
-                    string v = DataTable.CellTextRouted(cols, src, ri, cc);
-                    if (csv) { v = DataTable.CsvField(v); }
-                    if (cc > c0) { line = line + sep; }
-                    line = line + v;
-                    cc = cc + 1;
-                }
-                outp = outp + line + nl;
+                DataTable.AppendDataRow(sb, cols, src, ri, c0, c1, sep, csv, nl);
             }
         }
-        return outp;
+        return sb.ToString();
     }
 }

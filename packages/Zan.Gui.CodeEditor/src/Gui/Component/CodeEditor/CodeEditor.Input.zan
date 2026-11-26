@@ -7,6 +7,67 @@ namespace Gui.Component.CodeEditor;
 
 // CodeEditor 分部：键盘输入分发、字符键与快捷键、光标导航与剪贴板按键
 public partial class CodeEditor {
+    private static string ClosingPairFor(string ch) {
+        if (ch == "(") { return ")"; }
+        if (ch == "[") { return "]"; }
+        if (ch == "{") { return "}"; }
+        if (ch == "\"") { return "\""; }
+        if (ch == "'") { return "'"; }
+        return null;
+    }
+
+    private void HandleBackspace(App app) {
+        if (selActive || HasSelection()) {
+            ClearExtraCarets();
+            DeleteSelection();
+            app.RequestRedraw();
+            return;
+        }
+        if (carets.Count > 0) {
+            McBackspace();
+            UpdateCompletion();
+            app.RequestRedraw();
+            return;
+        }
+        // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧
+        string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
+        if (curCol > 0 && curCol < ln.Length) {
+            string lCh = ln.Substring(curCol - 1, 1);
+            string rCh = ln.Substring(curCol, 1);
+            string expectedClose = CodeEditor.ClosingPairFor(lCh);
+            if (expectedClose != null && rCh == expectedClose) {
+                SaveUndo();
+                lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
+                curCol = curCol - 1;
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
+            }
+        }
+        SaveUndoBackspace();
+        BackspaceEdit();
+        UpdateCompletion();
+        app.RequestRedraw();
+    }
+
+    private bool TryAutoClosePair(App app, string ch) {
+        string close = CodeEditor.ClosingPairFor(ch);
+        if (close == null) { return false; }
+        SaveUndoTyping();
+        InsertStr(ch + close);
+        curCol = curCol - 1;
+        selActive = false;
+        if (ch == "\"" || ch == "'") {
+            acActive = false;
+            acDot = false;
+            CancelSemanticCompletion();
+        } else {
+            CheckErrors();
+        }
+        app.RequestRedraw();
+        return true;
+    }
+
     // kind==6：键入字符、Ctrl 快捷键和编辑键。
     private void HandleCharKey(App app, int code, int modifiers) {
         bool ate = ateCtrlKey;
@@ -97,37 +158,7 @@ public partial class CodeEditor {
             return;
         }
         if (code == 8) {
-            if (selActive || HasSelection()) {
-                ClearExtraCarets();
-                DeleteSelection();
-                app.RequestRedraw();
-                return;
-            }
-            if (carets.Count > 0) {
-                McBackspace();
-                UpdateCompletion();
-                app.RequestRedraw();
-                return;
-            }
-            // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧
-            string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
-            if (curCol > 0 && curCol < ln.Length) {
-                string lCh = ln.Substring(curCol - 1, 1);
-                string rCh = ln.Substring(curCol, 1);
-                if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                || (lCh == "'" && rCh == "'")) {
-                    SaveUndo();
-                    lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
-                    curCol = curCol - 1;
-                    UpdateCompletion();
-                    app.RequestRedraw();
-                    return;
-                }
-            }
-            SaveUndoBackspace(); BackspaceEdit();
-            UpdateCompletion();
-            app.RequestRedraw();
+            HandleBackspace(app);
             return;
         } else if (code == 13) {
             EndUndoGroup();
@@ -193,11 +224,13 @@ public partial class CodeEditor {
             if (ch.Length > 0) {
                 if (selActive) {
                     // 工业级选区包裹 (Surround With)：选中文本后输入括号/引号直接包裹选区
-                    if (ch == "(") { SurroundSelection("(", ")"); CheckErrors(); app.RequestRedraw(); return; }
-                    if (ch == "[") { SurroundSelection("[", "]"); CheckErrors(); app.RequestRedraw(); return; }
-                    if (ch == "{") { SurroundSelection("{", "}"); CheckErrors(); app.RequestRedraw(); return; }
-                    if (ch == "\"") { SurroundSelection("\"", "\""); CheckErrors(); app.RequestRedraw(); return; }
-                    if (ch == "'") { SurroundSelection("'", "'"); CheckErrors(); app.RequestRedraw(); return; }
+                    string pairClose = CodeEditor.ClosingPairFor(ch);
+                    if (pairClose != null) {
+                        SurroundSelection(ch, pairClose);
+                        CheckErrors();
+                        app.RequestRedraw();
+                        return;
+                    }
                     ClearExtraCarets();
                     DeleteSelection();
                 } else {
@@ -214,57 +247,7 @@ public partial class CodeEditor {
                         }
                     }
                     // 2. 自动配对闭合 (Auto-closing Pairs)：输入左括号/引号自动闭合且光标居中
-                    if (carets.Count == 0) {
-                        if (ch == "(") {
-                            SaveUndoTyping();
-                            InsertStr("()");
-                            curCol = curCol - 1;
-                            selActive = false;
-                            CheckErrors();
-                            app.RequestRedraw();
-                            return;
-                        }
-                        if (ch == "[") {
-                            SaveUndoTyping();
-                            InsertStr("[]");
-                            curCol = curCol - 1;
-                            selActive = false;
-                            CheckErrors();
-                            app.RequestRedraw();
-                            return;
-                        }
-                        if (ch == "{") {
-                            SaveUndoTyping();
-                            InsertStr("{}");
-                            curCol = curCol - 1;
-                            selActive = false;
-                            CheckErrors();
-                            app.RequestRedraw();
-                            return;
-                        }
-                        if (ch == "\"") {
-                            SaveUndoTyping();
-                            InsertStr("\"\"");
-                            curCol = curCol - 1;
-                            selActive = false;
-                            acActive = false;
-                            acDot = false;
-                            CancelSemanticCompletion();
-                            app.RequestRedraw();
-                            return;
-                        }
-                        if (ch == "'") {
-                            SaveUndoTyping();
-                            InsertStr("''");
-                            curCol = curCol - 1;
-                            selActive = false;
-                            acActive = false;
-                            acDot = false;
-                            CancelSemanticCompletion();
-                            app.RequestRedraw();
-                            return;
-                        }
-                    }
+                    if (carets.Count == 0 && TryAutoClosePair(app, ch)) { return; }
                     SaveUndoTyping();
                 }
                 if (carets.Count > 0) { McInsertStr(ch); }
@@ -392,37 +375,7 @@ public partial class CodeEditor {
             // 退格键 (VK_BACK = 8)：消费后续 kind==6 的 WM_CHAR 字符事件（code==8），防双重删除
             ateCtrlKey = true;
             EndUndoGroup();
-            if (selActive || HasSelection()) {
-                ClearExtraCarets();
-                DeleteSelection();
-                app.RequestRedraw();
-                return;
-            }
-            if (carets.Count > 0) {
-                McBackspace();
-                UpdateCompletion();
-                app.RequestRedraw();
-                return;
-            }
-            string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
-            if (curCol > 0 && curCol < ln.Length) {
-                string lCh = ln.Substring(curCol - 1, 1);
-                string rCh = ln.Substring(curCol, 1);
-                if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                || (lCh == "'" && rCh == "'")) {
-                    SaveUndo();
-                    lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
-                    curCol = curCol - 1;
-                    UpdateCompletion();
-                    app.RequestRedraw();
-                    return;
-                }
-            }
-            SaveUndoBackspace();
-            BackspaceEdit();
-            UpdateCompletion();
-            app.RequestRedraw();
+            HandleBackspace(app);
             return;
         }
         else if (kc == 46) {
