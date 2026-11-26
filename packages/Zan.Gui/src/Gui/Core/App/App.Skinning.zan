@@ -43,6 +43,9 @@ public partial class App {
     int userWallpaperOpacity;
     bool bgImagePickWanted;
     int bgThemeGen;
+    int cssDeferDepth;
+    bool cssPendingApply;
+    internal int cssApplyCount;
     void InitSkinning() {
         this.theme = Theme.Light();
         this.showThemeButton = false;
@@ -73,6 +76,9 @@ public partial class App {
         this.userWallpaperPath = "";
         this.userWallpaperOpacity = 100;
         this.bgImagePickWanted = false;
+        this.cssDeferDepth = 0;
+        this.cssPendingApply = false;
+        this.cssApplyCount = 0;
     }
     public void SetDark(bool dark) {
         isDark = dark;
@@ -84,7 +90,12 @@ public partial class App {
     public void ApplyTheme(Theme t, bool dark) {
         isDark = dark;
         theme = t;
-        if (densitySnapshot != null && t != null) { densitySnapshot.borderWidth = t.borderWidth; }
+        if (densitySnapshot != null && t != null) {
+            densitySnapshot.borderWidth = t.borderWidth;
+            densitySnapshot.borderRadiusSmall = t.borderRadiusSmall;
+            densitySnapshot.borderRadiusMedium = t.borderRadiusMedium;
+            densitySnapshot.borderRadiusLarge = t.borderRadiusLarge;
+        }
         this.ScaleThemeMetrics();
         if (glassNative) { window.DisableGlass(); }
         glassNative = false;
@@ -98,14 +109,23 @@ public partial class App {
         this.Stats.NoteRedrawWhy("ApplyTheme");
         needsRedraw = true;
     }
+    private void BeginCssBatch() { cssDeferDepth = cssDeferDepth + 1; }
+    private void EndCssBatch() {
+        if (cssDeferDepth <= 0) { return; }
+        cssDeferDepth = cssDeferDepth - 1;
+        if (cssDeferDepth == 0 && cssPendingApply) { this.ApplyAppCss(); }
+    }
     public void SetTheme(Theme t) {
-        theme = t;
-        this.ScaleThemeMetrics();
-        this.ApplySurfaceTranslucency();
-        bgThemeGen = bgThemeGen + 1;
-        this.ApplyAppCss();
-        this.Stats.NoteRedrawWhy("SetTheme");
-        needsRedraw = true;
+        this.BeginCssBatch();
+        try {
+            theme = t;
+            this.ScaleThemeMetrics();
+            this.ApplySurfaceTranslucency();
+            bgThemeGen = bgThemeGen + 1;
+            this.ApplyAppCss();
+            this.Stats.NoteRedrawWhy("SetTheme");
+            needsRedraw = true;
+        } finally { this.EndCssBatch(); }
     }
     void ScaleThemeMetrics() {
         if (density < 0) { density = 0; }
@@ -137,16 +157,22 @@ public partial class App {
     bool UseSkin(string name) {
         Skin s = Skin.Load(name);
         if (!s.IsLoaded()) { return false; }
-        s.Apply(this);
-        this.ApplyAppCss();
+        this.BeginCssBatch();
+        try {
+            s.Apply(this);
+            this.ApplyAppCss();
+        } finally { this.EndCssBatch(); }
         return true;
     }
     bool ReloadSkin() {
         if (skinName == "") { return false; }
         Skin s = Skin.Reload(skinName);
         if (!s.IsLoaded()) { return false; }
-        s.Apply(this);
-        this.ApplyAppCss();
+        this.BeginCssBatch();
+        try {
+            s.Apply(this);
+            this.ApplyAppCss();
+        } finally { this.EndCssBatch(); }
         return true;
     }
     public void UseAppCss(string css) {
@@ -172,6 +198,12 @@ public partial class App {
     public bool ChartThemeInited() { return this.chartThemeInited; }
     public void MarkChartThemeInited() { this.chartThemeInited = true; }
     public void ApplyAppCss() {
+        if (cssDeferDepth > 0) {
+            cssPendingApply = true;
+            return;
+        }
+        cssPendingApply = false;
+        cssApplyCount = cssApplyCount + 1;
         StyleSheet fresh = new StyleSheet();
         List<CssVarDecl> varList = Style.VarsFromTheme(theme);
         fresh.MergeSheet(Css.ParseWithSources(Style.UaCss(), varList, 0));
@@ -244,14 +276,17 @@ public partial class App {
         return Theme.Dark();
     }
     void ApplySkin(int i) {
-        if (!this.UseSkin(this.SkinNameAt(i))) { return; }
-        if (accentOverride != 0) {
-            theme.ApplyAccent(accentOverride);
-            this.ApplyAppCss();
-        }
-        themeMenuModel.Set(i);
-        appliedSkin = i;
-        this.SyncSkinDensity();
+        this.BeginCssBatch();
+        try {
+            if (!this.UseSkin(this.SkinNameAt(i))) { return; }
+            if (accentOverride != 0) {
+                theme.ApplyAccent(accentOverride);
+                this.ApplyAppCss();
+            }
+            themeMenuModel.Set(i);
+            appliedSkin = i;
+            this.SyncSkinDensity();
+        } finally { this.EndCssBatch(); }
     }
     int SkinDensity() {
         if (sheet == null) { return 0 - 1; }
