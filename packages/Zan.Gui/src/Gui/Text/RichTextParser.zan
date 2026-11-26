@@ -8,12 +8,14 @@ public class RichTextParser {
     RichTextDocument document;
     RichTextStyle style;
     RichTextLink link;
+    int depth;
     RichTextParser(string input, RichTextStyle style, RichTextLink link) {
-        this.input = input;
+        this.input = input != null ? input : "";
         this.position = 0;
-        this.document = new RichTextDocument(input);
-        this.style = style;
+        this.document = new RichTextDocument(this.input);
+        this.style = style != null ? style : RichTextStyle.Default();
         this.link = link;
+        this.depth = 0;
     }
     static RichTextDocument ParseText(string input) {
         RichTextParser parser = new RichTextParser(
@@ -27,6 +29,7 @@ public class RichTextParser {
     }
     static int FindIn(string text, string token, int start) {
         if (text == null || token == null) { return -1; }
+        if (start < 0) { start = 0; }
         int tlen = token.Length;
         int tMax = text.Length - tlen;
         if (tlen == 0) { return start <= text.Length ? start : -1; }
@@ -88,7 +91,7 @@ public class RichTextParser {
         return s.Substring(start, end - start);
     }
     static bool StartsAt(string text, int pos, string token) {
-        if (text == null || token == null) { return false; }
+        if (text == null || token == null || pos < 0) { return false; }
         int tlen = token.Length;
         if (pos + tlen > text.Length) { return false; }
         for (int i = 0; i < tlen; i = i + 1) {
@@ -97,14 +100,20 @@ public class RichTextParser {
         return true;
     }
     static int HexDigit(int b) {
-        if (b >= 48 && b <= 57) { return b - 48; } // '0'..'9'
-        if (b >= 97 && b <= 102) { return b - 87; } // 'a'..'f'
-        if (b >= 65 && b <= 70) { return b - 55; } // 'A'..'F'
+        int u = b & 255;
+        if (u >= 48 && u <= 57) { return u - 48; } // '0'..'9'
+        if (u >= 97 && u <= 102) { return u - 87; } // 'a'..'f'
+        if (u >= 65 && u <= 70) { return u - 55; } // 'A'..'F'
         return 0;
     }
     static int HexDigit(string digit) {
         if (digit == null || digit.Length == 0) { return 0; }
         return HexDigit(digit[0] & 255);
+    }
+    static int ClampByte(int v) {
+        if (v < 0) { return 0; }
+        if (v > 255) { return 255; }
+        return v;
     }
     static int ParseInt(string text) {
         string newValue = RichTextParser.TrimText(text);
@@ -116,14 +125,19 @@ public class RichTextParser {
             start = 1;
         }
         if (len >= start + 2 && newValue[start] == '0' && (newValue[start + 1] == 'x' || newValue[start + 1] == 'X')) {
-            int number = 0;
+            long number = 0;
             int i = start + 2;
-            while (i < len) {
-                number = (number << 4) | HexDigit(newValue[i]);
+            int digits = 0;
+            while (i < len && digits < 8) {
+                int b = newValue[i] & 255;
+                bool ok = (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70);
+                if (!ok) { break; }
+                number = (number << 4) | (long)HexDigit(b);
+                digits = digits + 1;
                 i = i + 1;
             }
-            if (negative) { return -number; }
-            return number;
+            if (negative) { return (int)(0 - number); }
+            return (int)number;
         }
         return newValue.ToInt32();
     }
@@ -143,10 +157,10 @@ public class RichTextParser {
         int count = ArgCount(args);
         if (count == 1) { return ParseColor(ArgAt(args, 0)); }
         if (count >= 4) {
-            int red = ParseInt(ArgAt(args, 0));
-            int green = ParseInt(ArgAt(args, 1));
-            int blue = ParseInt(ArgAt(args, 2));
-            int alpha = ParseInt(ArgAt(args, 3));
+            int red = RichTextParser.ClampByte(ParseInt(ArgAt(args, 0)));
+            int green = RichTextParser.ClampByte(ParseInt(ArgAt(args, 1)));
+            int blue = RichTextParser.ClampByte(ParseInt(ArgAt(args, 2)));
+            int alpha = RichTextParser.ClampByte(ParseInt(ArgAt(args, 3)));
             return (alpha << 24) | (red << 16) | (green << 8) | blue;
         }
         return 0;
@@ -173,8 +187,18 @@ public class RichTextParser {
     }
     void AddSimple(int kind) { this.document.Add(new RichTextRun(kind, this.style, this.link)); }
     void AddNested(string text, RichTextLink nestedLink) {
+        if (this.depth >= 32) {
+            if (text != null && text != "") {
+                RichTextRun run = new RichTextRun(
+                    RichTextRunKind.Text(), this.style, nestedLink);
+                run.SetText(text);
+                this.document.Add(run);
+            }
+            return;
+        }
         RichTextParser parser = new RichTextParser(
             text, this.style.Clone(), nestedLink);
+        parser.depth = this.depth + 1;
         RichTextDocument nested = parser.Parse();
         for (int i = 0; i < nested.RunCount(); i = i + 1) {
             this.document.Add(nested.RunAt(i));
@@ -346,14 +370,15 @@ public class RichTextParser {
     }
     RichTextDocument Parse() {
         StringBuilder text = new StringBuilder();
-        while (this.position < this.input.Length) {
-            string ch = this.input.Substring(this.position, 1);
-            if (ch == "\n") {
+        int len = this.input.Length;
+        while (this.position < len) {
+            int b = this.input[this.position] & 255;
+            if (b == 10) {
                 this.AddText(text.ToString());
                 text = new StringBuilder();
                 this.AddSimple(RichTextRunKind.LineBreak());
                 this.position = this.position + 1;
-            } else if (ch == "#") {
+            } else if (b == 35) {
                 if (this.Starts("##")) {
                     text.Append("#");
                     this.position = this.position + 2;
@@ -361,13 +386,19 @@ public class RichTextParser {
                 }
                 this.AddText(text.ToString());
                 text = new StringBuilder();
-                if (!this.ParseTag()) {
+                int before = this.position;
+                if (!this.ParseTag() || this.position <= before) {
                     text.Append("#");
-                    this.position = this.position + 1;
+                    this.position = before + 1;
                 }
             } else {
-                text.Append(ch);
-                this.position = this.position + 1;
+                int runStart = this.position;
+                while (this.position < len) {
+                    int cb = this.input[this.position] & 255;
+                    if (cb == 10 || cb == 35) { break; }
+                    this.position = this.position + 1;
+                }
+                text.Append(this.input.Substring(runStart, this.position - runStart));
             }
         }
         this.AddText(text.ToString());

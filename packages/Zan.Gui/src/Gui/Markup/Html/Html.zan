@@ -35,6 +35,8 @@ public partial class Html {
         return Html.ApplyDocument(app, Html.ParseWith(html, baseDir, handlers, factory));
     }
     private static Control ApplyDocument(App app, HtmlDoc doc) {
+        if (doc == null) { return new Panel(); }
+        if (app == null) { return doc.root; }
         string zs = app.NextLoadScope();
         string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
         app.ApplyScopedTree(doc.root, scoped, zs);
@@ -54,33 +56,53 @@ public partial class Html {
     public static string ExpandIncludes(string html, int depth) {
         return Html.ExpandIncludes(html, depth, HtmlDocs.Read);
     }
+    private static bool IsTagBoundaryByte(int b) {
+        return b == 32 || b == 9 || b == 10 || b == 13 || b == 47 || b == 62;
+    }
     private static string ExpandIncludes(string html, int depth, Func<string, string> readInclude) {
-        if (depth > 8) { return html; }
+        if (html == null) { return ""; }
+        if (depth > 8 || readInclude == null) { return html; }
         string outp = "";
         int i = 0;
-        while (i < html.Length) {
+        int len = html.Length;
+        while (i < len) {
             int nxt = i;
             int kind = 0;   // 0 文本尾, 1 include, 2 注释, 3 style/script
             int scan = i;
-            while (scan < html.Length) {
-                if (html[scan] != 60) { scan = scan + 1; continue; }   // '<'
+            while (scan < len) {
+                if ((html[scan] & 255) != 60) { scan = scan + 1; continue; }   // '<'
                 if (html.IndexOf("<!--", scan) == scan) {
-                    nxt = html.IndexOf("-->", scan + 4);
+                    int ce = html.IndexOf("-->", scan + 4);
+                    nxt = ce < 0 ? len : ce + 3;
                     kind = 2;
                     break;
                 }
-                if (html.IndexOf("<include", scan) == scan) {
+                if (html.IndexOf("<include", scan) == scan
+                    && (scan + 8 >= len || Html.IsTagBoundaryByte(html[scan + 8] & 255))) {
                     nxt = scan;
                     kind = 1;
                     break;
                 }
-                if (html.IndexOf("<style", scan) == scan || html.IndexOf("<script", scan) == scan) {
+                bool isStyle = html.IndexOf("<style", scan) == scan
+                    && (scan + 6 >= len || Html.IsTagBoundaryByte(html[scan + 6] & 255));
+                bool isScript = !isStyle && html.IndexOf("<script", scan) == scan
+                    && (scan + 7 >= len || Html.IsTagBoundaryByte(html[scan + 7] & 255));
+                if (isStyle || isScript) {
                     int nameEnd = html.IndexOf(">", scan);
-                    if (nameEnd < 0) { nxt = html.Length; kind = 3; break; }
-                    string tag = html.Substring(scan + 1, nameEnd - scan - 1).Trim();
-                    string close = "</" + tag.Split(" ")[0] + ">";
-                    int ce = html.IndexOf(close, nameEnd);
-                    nxt = ce < 0 ? html.Length : ce + close.Length;
+                    if (nameEnd < 0) { nxt = len; kind = 3; break; }
+                    if (nameEnd > scan + 1 && (html[nameEnd - 1] & 255) == 47) {
+                        nxt = nameEnd + 1;
+                        kind = 3;
+                        break;
+                    }
+                    string rawTag = isStyle ? "style" : "script";
+                    int ce = HtmlText.FindCloseTag(html, rawTag, nameEnd + 1);
+                    if (ce < 0) {
+                        nxt = len;
+                    } else {
+                        int cgt = html.IndexOf(">", ce);
+                        nxt = cgt < 0 ? len : cgt + 1;
+                    }
                     kind = 3;
                     break;
                 }
@@ -118,6 +140,7 @@ public partial class Html {
         return outp;
     }
     public static string IncludeSrc(string tag) {
+        if (tag == null) { return ""; }
         int a = tag.IndexOf("src=");
         if (a < 0) { return ""; }
         int vs = a + 4;
@@ -137,11 +160,13 @@ public partial class Html {
         return tag.Substring(vs, e - vs).Trim();
     }
     public static string BodyInner(string html) {
+        if (html == null) { return ""; }
         int bs = html.IndexOf("<body");
         if (bs < 0) { return html; }
         int contentStart = html.IndexOf(">", bs);
+        if (contentStart < 0) { return html; }
         int be = html.IndexOf("</body>", contentStart);
-        if (contentStart < 0 || be < 0) { return html; }
+        if (be < 0) { return html; }
         return html.Substring(contentStart + 1, be - contentStart - 1);
     }
     internal static HtmlDoc ParseComponent(string html) { return Html.Parse(html, "", null); }
@@ -320,6 +345,7 @@ public partial class Html {
         }
     }
     public static FbFlow AddFieldChild(Control parent, Control c, WNode node, FbFlow flow) {
+        if (parent == null || c == null || node == null) { return null; }
         string spanText = HtmlText.NodeAttr(node.attrs, "data-span");
         string caption = HtmlText.NodeAttr(node.attrs, "data-label");
         string position = HtmlText.NodeAttr(node.attrs, "data-position");
@@ -339,8 +365,9 @@ public partial class Html {
             Control slot = parent.NamedSlotHost("default");
             if (slot != null) { host = slot; }
         }
+        int span = 0;
         if (position == "1" || position == "Float" || c.StylePosition() >= 2
-            || !Html.IsIntText(spanText)) {
+            || !Html.IsIntText(spanText) || !int.TryParse(spanText, out span)) {
             Html.AddChild(host, c);
             return null;
         }
@@ -348,7 +375,6 @@ public partial class Html {
             flow = new FbFlow();
             host.Add(flow);
         }
-        int span = Convert.ToInt32(spanText);
         if (span < 1) { span = 1; }
         if (span > 24) { span = 24; }
         Control cell = c;
@@ -363,6 +389,7 @@ public partial class Html {
         return flow;
     }
     public static void AddChild(Control parent, Control c) {
+        if (parent == null || c == null) { return; }
         if (c.slotName != "" && parent.MountSlot(c.slotName, c)) { return; }
         if (parent is Element) {
             ((Element)parent).AddKid(c);
@@ -372,6 +399,7 @@ public partial class Html {
     }
     public static Control Clone(Control c) {
         Html.InstallDocument();
+        if (c == null) { return null; }
         if (c is Element) {
             Element src = (Element)c;
             Element el = new Element();
@@ -506,13 +534,16 @@ public partial class Html {
         }
     }
     public static void AutoLink(Control c, App app) {
-        if (app == null) { return; }
+        if (app == null || c == null) { return; }
         if (!(c is Element)) { return; }
         string href = c.CssAttr("href");
         if (!Html.Navigable(href)) { return; }
         if (c.Click.Count() > 0) { return; }
         bool blank = c.CssAttr("target") == "_blank";
-        c.BindEvent("Click", () => { Html.OpenLink(app, href, blank); });
+        c.BindEvent("Click", (Control sender) => {
+            App target = sender != null ? sender.FindApp() : App.FrameApp();
+            Html.OpenLink(target, href, blank);
+        });
     }
     public static void AutoLinkTree(Control root, App app) {
         Html.InstallDocument();
@@ -523,7 +554,7 @@ public partial class Html {
         }
     }
     public static bool Navigable(string href) {
-        if (href == "") { return false; }
+        if (href == null || href == "") { return false; }
         string low = href.ToLower();
         return HtmlText.StartsWith(low, "http://")
             || HtmlText.StartsWith(low, "https://");

@@ -30,6 +30,10 @@ public class Selector {
     static List<Selector> emptySelectors = new List<Selector>();
     static List<HasCond> emptyHasList = new List<HasCond>();
     static Selector Parse(string sel) {
+        return Selector.ParseDepth(sel, 0);
+    }
+    static Selector ParseDepth(string sel, int depth) {
+        if (sel == null || depth > 16) { return null; }
         string s = Css.Trim(sel);
         if (s == "" || s == ":root") { return null; }
         List<string> items = Css.SelectorTokens(s);
@@ -47,12 +51,12 @@ public class Selector {
             }
         }
         if (chunks.Count == 0) { return null; }
-        Selector subject = Selector.ParseCompound(chunks[chunks.Count - 1].chunk);
+        Selector subject = Selector.ParseCompoundDepth(chunks[chunks.Count - 1].chunk, depth);
         if (subject == null) { return null; }
         Selector cur = subject;
         int k = chunks.Count - 1;
         while (k >= 1) {
-            Selector link = Selector.ParseCompound(chunks[k - 1].chunk);
+            Selector link = Selector.ParseCompoundDepth(chunks[k - 1].chunk, depth);
             if (link == null) { return null; }
             cur.up = link;
             cur.combo = chunks[k].combinator;
@@ -62,6 +66,10 @@ public class Selector {
         return subject;
     }
     static Selector ParseCompound(string sel) {
+        return Selector.ParseCompoundDepth(sel, 0);
+    }
+    static Selector ParseCompoundDepth(string sel, int depth) {
+        if (sel == null || depth > 16) { return null; }
         string s = Css.Trim(sel);
         if (s == "" || s == ":root") { return null; }
         Selector p = new Selector();
@@ -106,7 +114,7 @@ public class Selector {
                 continue;
             }
             if (ch == 58) { // ':'
-                int ni = p.Pseudo(s, i);
+                int ni = p.PseudoDepth(s, i, depth);
                 if (ni < 0) { return null; }
                 i = ni;
                 continue;
@@ -135,6 +143,9 @@ public class Selector {
         return p;
     }
     int Pseudo(string s, int at) {
+        return this.PseudoDepth(s, at, 0);
+    }
+    int PseudoDepth(string s, int at, int depth) {
         int n = s.Length;
         int start = at + 1;
         bool isPart = false;
@@ -162,7 +173,12 @@ public class Selector {
             string inner = s.Substring(j + 1, close - j - 1);
             string lo = Css.Lower(name);
             if (lo == "not") {
-                List<Selector> sub = Selector.ParseList(inner);
+                if (depth >= 16) {
+                    never = true;
+                    why = "':not()' nesting too deep";
+                    return close + 1;
+                }
+                List<Selector> sub = Selector.ParseListDepth(inner, depth + 1);
                 bool determinate = sub.Count > 0;
                 for (int q = 0; q < sub.Count; q = q + 1) {
                     if (sub[q] == null || sub[q].never) { determinate = false; }
@@ -178,7 +194,12 @@ public class Selector {
                     }
                 }
             } else if (lo == "is" || lo == "where") {
-                List<Selector> sub = Selector.ParseList(inner);
+                if (depth >= 16) {
+                    never = true;
+                    why = "':" + lo + "()' nesting too deep";
+                    return close + 1;
+                }
+                List<Selector> sub = Selector.ParseListDepth(inner, depth + 1);
                 bool any = false;
                 for (int q = 0; q < sub.Count; q = q + 1) {
                     if (sub[q] != null && !sub[q].never) {
@@ -197,17 +218,24 @@ public class Selector {
                     why = "':" + lo + "()' has no matchable alternative";
                 }
             } else if (lo == "has") {
+                if (depth >= 16) {
+                    never = true;
+                    why = "':has()' nesting too deep";
+                    return close + 1;
+                }
                 List<string> alts = Css.SplitTopTrim(inner, ",");
                 bool ok = alts.Count > 0;
                 for (int h = 0; h < alts.Count && ok; h = h + 1) {
                     string alt = Css.Trim(alts[h]);
                     int lead = 0;
-                    if (alt != "" && (alt[0] == 62 || alt[0] == 43
-                                      || alt[0] == 126)) {
-                        lead = alt[0] == 62 ? 1 : (alt[0] == 43 ? 2 : 3);
-                        alt = Css.Trim(alt.Substring(1));
+                    if (alt != "") {
+                        int fb = alt[0] & 255;
+                        if (fb == 62 || fb == 43 || fb == 126) {
+                            lead = fb == 62 ? 1 : (fb == 43 ? 2 : 3);
+                            alt = Css.Trim(alt.Substring(1));
+                        }
                     }
-                    Selector isel = alt == "" ? null : Selector.Parse(alt);
+                    Selector isel = alt == "" ? null : Selector.ParseDepth(alt, depth + 1);
                     if (isel == null || isel.never || isel.part != ""
                         || isel.hasList.Count > 0) {
                         ok = false;
@@ -325,6 +353,7 @@ public class Selector {
     }
     static bool SignedInt(string s, out int v) {
         v = 0;
+        if (s == null) { return false; }
         int n = s.Length;
         if (n == 0) { return false; }
         int start = 0;
@@ -333,25 +362,32 @@ public class Selector {
         if (first == 43) { start = 1; }
         else if (first == 45) { sign = 0 - 1; start = 1; }
         if (start >= n) { return false; }
+        long acc = 0;
         for (int i = start; i < n; i = i + 1) {
             int b = s[i] & 255;
             if (b < 48 || b > 57) { return false; }
+            acc = acc * 10L + (long)(b - 48);
+            if (acc > 2147483647L) { return false; }
         }
-        string t = start == 0 ? s : s.Substring(start, n - start);
-        v = sign * StyleSheet.Num(t);
+        v = sign < 0 ? (0 - (int)acc) : (int)acc;
         return true;
     }
     bool MatchAnB(int idx) {
         if (anbA == 0) { return idx == anbB; }
-        int d = idx - anbB;
-        if (anbA > 0) { return d >= 0 && d % anbA == 0; }
-        return d <= 0 && d % anbA == 0;
+        long d = (long)idx - (long)anbB;
+        long a = (long)anbA;
+        if (a > 0) { return d >= 0 && d % a == 0; }
+        return d <= 0 && d % a == 0;
     }
     static List<Selector> ParseList(string text) {
+        return Selector.ParseListDepth(text, 0);
+    }
+    static List<Selector> ParseListDepth(string text, int depth) {
         List<Selector> outR = new List<Selector>();
+        if (text == null || depth > 16) { return outR; }
         List<string> parts = Css.SplitTopTrim(text, ",");
         for (int i = 0; i < parts.Count; i = i + 1) {
-            outR.Add(Selector.Parse(parts[i]));
+            outR.Add(Selector.ParseDepth(parts[i], depth));
         }
         return outR;
     }
@@ -463,6 +499,10 @@ public class Selector {
                       string nodeId, string nodePart, int stateBits,
                       StyleNode node) {
         if (never) { return false; }
+        if (nodeType == null) { nodeType = ""; }
+        if (cls == null) { cls = ""; }
+        if (nodeId == null) { nodeId = ""; }
+        if (nodePart == null) { nodePart = ""; }
         if (part != nodePart) { return false; }
         if (type != "" && type != nodeType) { return false; }
         if (id != "" && (nodeId == "" || id != nodeId)) { return false; }
@@ -509,7 +549,7 @@ public class Selector {
             if (!Selector.MatchAttr(attrs[a], classes, cls, node)) { return false; }
         }
         for (int t = 0; t < nots.Count; t = t + 1) {
-            if (nots[t].MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
+            if (nots[t] != null && nots[t].MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
                                      stateBits, node)) {
                 return false;
             }
@@ -517,7 +557,7 @@ public class Selector {
         if (ises.Count + wheres.Count > 0) {
             bool any = false;
             for (int q = 0; q < ises.Count; q = q + 1) {
-                if (ises[q].MatchNodeCtx(nodeType, classes, cls, nodeId,
+                if (ises[q] != null && ises[q].MatchNodeCtx(nodeType, classes, cls, nodeId,
                                          nodePart, stateBits, node)) {
                     any = true;
                     break;
@@ -525,7 +565,7 @@ public class Selector {
             }
             if (!any) {
                 for (int w = 0; w < wheres.Count; w = w + 1) {
-                    if (wheres[w].MatchNodeCtx(nodeType, classes, cls, nodeId,
+                    if (wheres[w] != null && wheres[w].MatchNodeCtx(nodeType, classes, cls, nodeId,
                                                nodePart, stateBits, node)) {
                         any = true;
                         break;
@@ -546,6 +586,7 @@ public class Selector {
         return true;
     }
     bool MatchChain(Selector up, StyleNode node) {
+        if (up == null || node == null) { return false; }
         StyleNode par = node.StyleParentNode();
         if (combo == 1) {
             if (par == null) { return false; }
@@ -558,17 +599,20 @@ public class Selector {
         }
         if (combo == 3) {
             int back = 1;
-            while (true) {
+            while (back <= 4096) {
                 StyleNode sib = Selector.SiblingAt(par, node, back);
                 if (sib == null) { return false; }
                 if (Selector.SelHit(up, sib)) { return true; }
                 back = back + 1;
             }
+            return false;
         }
         StyleNode anc = par;
-        while (anc != null) {
+        int steps = 0;
+        while (anc != null && steps < 256) {
             if (Selector.SelHit(up, anc)) { return true; }
             anc = anc.StyleParentNode();
+            steps = steps + 1;
         }
         return false;
     }
@@ -588,29 +632,39 @@ public class Selector {
         }
         if (hc.lead == 3) {
             int fwd = 1;
-            while (true) {
+            while (fwd <= 4096) {
                 StyleNode sib = Selector.SiblingAt(host.StyleParentNode(), host, 0 - fwd);
                 if (sib == null) { return false; }
                 if (Selector.SelHit(hc.inner, sib)) { return true; }
                 fwd = fwd + 1;
             }
+            return false;
         }
         return Selector.ScanSubtree(hc.inner, host, hc.lead == 1 ? 1 : 0);
     }
     static bool ScanSubtree(Selector inner, StyleNode host, int depth) {
-        for (int i = 0; i < host.StyleChildCount(); i = i + 1) {
+        return Selector.ScanSubtreeDepth(inner, host, depth != 0, 0);
+    }
+    static bool ScanSubtreeDepth(Selector inner, StyleNode host, bool directOnly, int depth) {
+        if (inner == null || host == null || depth >= 64) { return false; }
+        int cnt = host.StyleChildCount();
+        for (int i = 0; i < cnt; i = i + 1) {
             StyleNode k = host.StyleChildNodeAt(i);
+            if (k == null) { continue; }
             if (Selector.SelHit(inner, k)) { return true; }
-            if (depth == 0 && Selector.ScanSubtree(inner, k, 0)) { return true; }
+            if (!directOnly && Selector.ScanSubtreeDepth(inner, k, false, depth + 1)) { return true; }
         }
         return false;
     }
     static bool SelHit(Selector s, StyleNode c) {
+        if (s == null || c == null) { return false; }
         string cls = c.EffectiveClass();
+        if (cls == null) { cls = ""; }
         return s.MatchNodeCtx(c.StyleType(), Style.Classes(cls),
                               cls, c.StyleNodeName(), "", Style.NodeState(c), c);
     }
     bool MatchStruct(StyleNode node) {
+        if (node == null) { return false; }
         StyleNode par = node.StyleParentNode();
         int idx = par == null ? 0 : par.StyleIndexOfNode(node);
         int count = par == null ? 1 : par.StyleChildCount();
@@ -625,11 +679,13 @@ public class Selector {
             string ty = node.StyleType();
             int before = 0;
             int after = 0;
-            for (int i = 0; i < count; i = i + 1) {
-                StyleNode sib = par.StyleChildNodeAt(i);
-                if (sib == null || sib == node || sib.StyleType() != ty) { continue; }
-                if (i < idx) { before = before + 1; }
-                else { after = after + 1; }
+            if (par != null) {
+                for (int i = 0; i < count; i = i + 1) {
+                    StyleNode sib = par.StyleChildNodeAt(i);
+                    if (sib == null || sib == node || sib.StyleType() != ty) { continue; }
+                    if (i < idx) { before = before + 1; }
+                    else { after = after + 1; }
+                }
             }
             if (structCode == 6) { return before == 0; }
             if (structCode == 7) { return after == 0; }
@@ -676,11 +732,14 @@ public class Selector {
     }
     static bool MatchAttr(AttrCond a, List<string> classes, string cls,
                           StyleNode node) {
+        if (a == null) { return false; }
+        if (cls == null) { cls = ""; }
         if (a.name != "class") {
             if (a.op == "") { return node != null && node.CssHasAttr(a.name); }
             string v = node == null ? "" : node.CssAttr(a.name);
+            if (v == null) { v = ""; }
             string hay = v;
-            string val = a.val;
+            string val = a.val == null ? "" : a.val;
             if (a.nocase) { hay = Css.Lower(hay); val = Css.Lower(val); }
             if (val == "") { return false; }
             if (a.op == "~=") { return Style.Has(hay, val); }
@@ -688,7 +747,7 @@ public class Selector {
         }
         if (a.op == "") { return cls != ""; }
         string chay = cls;
-        string cval = a.val;
+        string cval = a.val == null ? "" : a.val;
         if (a.nocase) { chay = Css.Lower(chay); cval = Css.Lower(cval); }
         if (cval == "") { return false; }
         if (a.op == "~=") {
@@ -698,6 +757,7 @@ public class Selector {
         return Selector.HayOp(a.op, chay, cval);
     }
     static bool HayOp(string op, string hay, string val) {
+        if (op == null || hay == null || val == null) { return false; }
         if (op == "=") { return hay == val; }
         int hl = hay.Length;
         int vl = val.Length;
@@ -711,6 +771,7 @@ public class Selector {
         return Css.IndexFrom(hay, val, 0) >= 0;
     }
     static bool HoldsCI(List<string> classes, string name) {
+        if (classes == null || name == null) { return false; }
         for (int i = 0; i < classes.Count; i = i + 1) {
             if (Css.Lower(classes[i]) == name) { return true; }
         }
@@ -726,14 +787,17 @@ public class Selector {
         if (reqMask != 0 || forbidMask != 0) { spec = spec + 1000000; }
         int inner = 0;
         for (int t = 0; t < nots.Count; t = t + 1) {
+            if (nots[t] == null) { continue; }
             int s = nots[t].Specificity();
             if (s > inner) { inner = s; }
         }
         for (int q = 0; q < ises.Count; q = q + 1) {
+            if (ises[q] == null) { continue; }
             int s = ises[q].Specificity();
             if (s > inner) { inner = s; }
         }
         for (int h = 0; h < hasList.Count; h = h + 1) {
+            if (hasList[h] == null || hasList[h].inner == null) { continue; }
             int s = hasList[h].inner.Specificity();
             if (s > inner) { inner = s; }
         }

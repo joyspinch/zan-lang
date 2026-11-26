@@ -34,8 +34,12 @@ public class HtmlParser {
         if (rel == "stylesheet" && href != "" && baseDir != "") {
             string path = baseDir + "/" + href;
             if (File.Exists(path)) {
-                string css = File.ReadAllText(path);
-                doc.css = doc.css + css + "\n";
+                try {
+                    string css = File.ReadAllText(path);
+                    if (css != null) { doc.css = doc.css + css + "\n"; }
+                } catch (Exception ex) {
+                    // ignore unreadable external stylesheet
+                }
             }
         }
     }
@@ -50,6 +54,8 @@ public class HtmlParser {
         return parser.ParseDoc(html, baseDir);
     }
     public WDoc ParseDoc(string html, string baseDir) {
+        if (html == null) { html = ""; }
+        if (baseDir == null) { baseDir = ""; }
         WDoc doc = new WDoc();
         doc.css = "";
         doc.nodes = new List<WNode>();
@@ -62,52 +68,60 @@ public class HtmlParser {
         int n = html.Length;
         int i = 0;
         while (i < n) {
-            if (html[i] == 60) {  // '<'
-                if (i + 3 < n && html[i + 1] == 33 && html[i + 2] == 45
-                    && html[i + 3] == 45) {
+            if (st.Count > 0) {
+                WFrame top = st[st.Count - 1];
+                if (top.mode == 2 || top.mode == 3) {
+                    int close = HtmlText.FindCloseTag(html, top.tag, i);
+                    if (close < 0) {
+                        if (top.mode == 2 && i < n) {
+                            top.label = top.label + html.Substring(i, n - i);
+                        }
+                        i = n;
+                        break;
+                    }
+                    if (close > i) {
+                        if (top.mode == 2) {
+                            top.label = top.label + html.Substring(i, close - i);
+                        }
+                        i = close;
+                        continue;
+                    }
+                }
+            }
+            if ((html[i] & 255) == 60) {  // '<'
+                if (i + 3 < n && (html[i + 1] & 255) == 33 && (html[i + 2] & 255) == 45
+                    && (html[i + 3] & 255) == 45) {
                     int end = HtmlText.FindFrom(html, "-->", i + 4);
                     i = end < 0 ? n : end + 3;
                     continue;
                 }
-                if (i + 1 < n && html[i + 1] == 33) {
+                if (i + 1 < n && (html[i + 1] & 255) == 33) {
                     int gt = HtmlText.FindFrom(html, ">", i);
                     i = gt < 0 ? n : gt + 1;
                     continue;
                 }
-                if (i + 1 < n && html[i + 1] == 47) {
+                if (i + 1 < n && (html[i + 1] & 255) == 47) {
                     int j = i + 2;
                     int ns = j;
-                    while (j < n && HtmlText.IsNameChar(html[j])) { j = j + 1; }
+                    while (j < n && HtmlText.IsNameChar(html[j] & 255)) { j = j + 1; }
                     string name = html.Substring(ns, j - ns).ToLower();
-                    while (j < n && html[j] != 62) { j = j + 1; }
+                    while (j < n && (html[j] & 255) != 62) { j = j + 1; }
                     i = j < n ? j + 1 : n;
                     HtmlParser.CloseTag(st, doc, name);
                     continue;
                 }
-                if (i + 1 < n && HtmlText.IsAlpha(html[i + 1])) {
+                if (i + 1 < n && HtmlText.IsAlpha(html[i + 1] & 255)) {
                     tagAn.Clear();
                     tagAv.Clear();
                     WOpenResult r = HtmlParser.OpenTag(html, i, tagAn, tagAv);
-                    i = r.next;
+                    i = r.next > i ? r.next : i + 1;
                     this.HandleOpen(st, doc, r.name, tagAn, tagAv, r.selfClose,
                                     baseDir);
                     continue;
                 }
             }
-            if (st.Count > 0) {
-                WFrame top = st[st.Count - 1];
-                if (top.mode == 2 || top.mode == 3) {
-                    int close = HtmlText.FindCloseTag(html, top.tag, i);
-                    int bodyEnd = close < 0 ? n : close;
-                    if (bodyEnd > i && top.mode == 2) {
-                        top.label = top.label + html.Substring(i, bodyEnd - i);
-                    }
-                    i = close < 0 ? n : close;
-                    if (i < n) { continue; }
-                }
-            }
             int lt = i;
-            while (lt < n && html[lt] != 60) { lt = lt + 1; }
+            while (lt < n && (html[lt] & 255) != 60) { lt = lt + 1; }
             if (lt > i) {
                 HtmlParser.FeedText(st, html.Substring(i, lt - i));
                 i = lt;
@@ -125,17 +139,19 @@ public class HtmlParser {
     public static WOpenResult OpenTag(string html, int i,
                                       List<string> an, List<string> av) {
         WOpenResult r = new WOpenResult();
+        if (html == null) { r.name = ""; r.next = i; return r; }
         int n = html.Length;
         int j = i + 1;
         int ns = j;
-        while (j < n && HtmlText.IsNameChar(html[j])) { j = j + 1; }
-        r.name = html.Substring(ns, j - ns).ToLower();
+        while (j < n && HtmlText.IsNameChar(html[j] & 255)) { j = j + 1; }
+        r.name = j > ns ? html.Substring(ns, j - ns).ToLower() : "";
         r.selfClose = false;
         while (j < n) {
-            int ch = html[j];
+            int prevJ = j;
+            int ch = html[j] & 255;
             if (ch == 62) { j = j + 1; break; }
             if (ch == 47) {
-                if (j + 1 < n && html[j + 1] == 62) {
+                if (j + 1 < n && (html[j + 1] & 255) == 62) {
                     r.selfClose = true;
                     j = j + 2;
                     break;
@@ -145,27 +161,27 @@ public class HtmlParser {
             }
             if (HtmlText.IsSpaceChar(ch)) { j = j + 1; continue; }
             int asn = j;
-            while (j < n && !HtmlText.IsSpaceChar(html[j]) && html[j] != 61
-                   && html[j] != 62 && html[j] != 47) {
+            while (j < n && !HtmlText.IsSpaceChar(html[j] & 255) && (html[j] & 255) != 61
+                   && (html[j] & 255) != 62 && (html[j] & 255) != 47) {
                 j = j + 1;
             }
             string aname = html.Substring(asn, j - asn).ToLower();
-            while (j < n && HtmlText.IsSpaceChar(html[j])) { j = j + 1; }
+            while (j < n && HtmlText.IsSpaceChar(html[j] & 255)) { j = j + 1; }
             string aval = "";
-            if (j < n && html[j] == 61) {
+            if (j < n && (html[j] & 255) == 61) {
                 j = j + 1;
-                while (j < n && HtmlText.IsSpaceChar(html[j])) { j = j + 1; }
-                if (j < n && (html[j] == 34 || html[j] == 39)) {
-                    int q = html[j];
+                while (j < n && HtmlText.IsSpaceChar(html[j] & 255)) { j = j + 1; }
+                if (j < n && ((html[j] & 255) == 34 || (html[j] & 255) == 39)) {
+                    int q = html[j] & 255;
                     j = j + 1;
                     int vs = j;
-                    while (j < n && html[j] != q) { j = j + 1; }
+                    while (j < n && (html[j] & 255) != q) { j = j + 1; }
                     aval = html.Substring(vs, j - vs);
                     if (j < n) { j = j + 1; }
                 } else {
                     int vs = j;
-                    while (j < n && !HtmlText.IsSpaceChar(html[j])
-                           && html[j] != 62) {
+                    while (j < n && !HtmlText.IsSpaceChar(html[j] & 255)
+                           && (html[j] & 255) != 62) {
                         j = j + 1;
                     }
                     aval = html.Substring(vs, j - vs);
@@ -175,6 +191,7 @@ public class HtmlParser {
                 an.Add(aname);
                 av.Add(HtmlText.DecodeEntities(aval));
             }
+            if (j == prevJ) { j = j + 1; }
         }
         r.next = j;
         return r;
@@ -209,15 +226,15 @@ public class HtmlParser {
                 return;
             }
             if (name == "style") {
-                st.Add(HtmlParser.Frame(doc, 0 - 1, "style", 2));
+                if (!selfClose && st.Count < 512) { st.Add(HtmlParser.Frame(doc, 0 - 1, "style", 2)); }
                 return;
             }
             if (name == "title") {
-                st.Add(HtmlParser.Frame(doc, 0 - 1, "title", 1));
+                if (!selfClose && st.Count < 512) { st.Add(HtmlParser.Frame(doc, 0 - 1, "title", 1)); }
                 return;
             }
             if (name == "script") {
-                st.Add(HtmlParser.Frame(doc, 0 - 1, name, 3));
+                if (!selfClose && st.Count < 512) { st.Add(HtmlParser.Frame(doc, 0 - 1, name, 3)); }
                 return;
             }
             this.inHead = false;  // head 之外的其他标签：当正文
@@ -244,19 +261,24 @@ public class HtmlParser {
             HtmlParser.PushNode(doc, "body", 0 - 1, empty, empty);
             st.Add(HtmlParser.Frame(doc, doc.nodes.Count - 1, "body", 0));
         }
+        if (st.Count == 0) { return; }
         WFrame parent = st[st.Count - 1];
         bool isInl = HtmlText.IsInlineTag(name);
         if (name == "style") {
             HtmlParser.Flush(doc, parent, false);
             parent.prevInline = false;
-            WFrame f = HtmlParser.Frame(doc, 0 - 1, "style", 2);
-            st.Add(f);
+            if (!selfClose && st.Count < 512) {
+                WFrame f = HtmlParser.Frame(doc, 0 - 1, "style", 2);
+                st.Add(f);
+            }
             return;
         }
         if (name == "script" || name == "title") {
             HtmlParser.Flush(doc, parent, false);
             parent.prevInline = false;
-            st.Add(HtmlParser.Frame(doc, 0 - 1, name, 3));
+            if (!selfClose && st.Count < 512) {
+                st.Add(HtmlParser.Frame(doc, 0 - 1, name, 3));
+            }
             return;
         }
         if (name == "link") {
@@ -268,7 +290,9 @@ public class HtmlParser {
             HtmlParser.Flush(doc, parent, true);
             parent.prevInline = true;
             int rec = HtmlParser.PushNode(doc, name, parent.rec, an, av);
-            st.Add(HtmlParser.Frame(doc, rec, name, 1));
+            if (!selfClose && st.Count < 512) {
+                st.Add(HtmlParser.Frame(doc, rec, name, 1));
+            }
             return;
         }
         if (name == "input" || name == "img") {
@@ -285,7 +309,7 @@ public class HtmlParser {
         }
         HtmlParser.Flush(doc, parent, isInl);
         int crec = HtmlParser.PushNode(doc, name, parent.rec, an, av);
-        if (!selfClose && !HtmlText.IsVoidTag(name)) {
+        if (!selfClose && !HtmlText.IsVoidTag(name) && st.Count < 512) {
             st.Add(HtmlParser.Frame(doc, crec, name, 0));
         } else {
             parent.prevInline = isInl;
@@ -334,6 +358,7 @@ public class HtmlParser {
         if (st.Count > 0) { st[st.Count - 1].prevInline = HtmlText.IsInlineTag(name); }
     }
     public static void CloseTop(List<WFrame> st, WDoc doc) {
+        if (st == null || st.Count == 0) { return; }
         WFrame f = st[st.Count - 1];
         st.RemoveAt(st.Count - 1);
         if (f.mode == 2) {
