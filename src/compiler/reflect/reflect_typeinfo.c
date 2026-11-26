@@ -1217,7 +1217,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g, bool need_field_graph) {
         dtor = LLVMConstBitCast(fn, i8ptr);
       const char *cn = arc_collection_type_name(
           g, g->site_coll[i], g->site_coll_elem ? g->site_coll_elem[i] : NULL);
-      LLVMValueRef nptr[2] = {zan_irgen_intern_string(g, cn),
+      LLVMValueRef nptr[2] = {zan_irgen_intern_type_name(g, cn),
                               LLVMConstNull(i8ptr)};
       tynames = intern_desc_tynames_ptr(g, nptr, 1, i, i8ptr, i64, &tn_cache,
                                         &tn_cnt, &tn_cap);
@@ -1264,7 +1264,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g, bool need_field_graph) {
         LLVMValueRef *nptr =
             (LLVMValueRef *)calloc((size_t)k + 1, sizeof(LLVMValueRef));
         for (int j = 0; j < k; j++)
-          nptr[j] = zan_irgen_intern_string(g, names[j]);
+          nptr[j] = zan_irgen_intern_type_name(g, names[j]);
         nptr[k] = LLVMConstNull(i8ptr);
         tynames = intern_desc_tynames_ptr(g, nptr, k, i, i8ptr, i64, &tn_cache,
                                           &tn_cnt, &tn_cap);

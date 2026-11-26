@@ -77,10 +77,34 @@ int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name)) {
         E(BlitFramebuffer, "glBlitFramebuffer"),
 #undef E
     };
+    memset(api, 0, sizeof(*api));
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         void *fn = getproc(table[i].name);
         if (!fn) return 0;
         *(void **)((char *)api + table[i].off) = fn;
+    }
+    /* Optional / CAD-enhanced GL 3.3 + GLES 3.0 core symbols: graceful NULL on legacy drivers */
+    struct { const char *name; size_t off; } opt_table[] = {
+#define E(field, sym) { sym, offsetof(zan_gl_api, field) }
+        E(DrawArraysInstanced, "glDrawArraysInstanced"),
+        E(PolygonOffset, "glPolygonOffset"),
+        E(DepthMask, "glDepthMask"),
+        E(ColorMask, "glColorMask"),
+        E(CullFace, "glCullFace"),
+        E(FrontFace, "glFrontFace"),
+        E(StencilFunc, "glStencilFunc"),
+        E(StencilOp, "glStencilOp"),
+        E(StencilMask, "glStencilMask"),
+        E(ClearStencil, "glClearStencil"),
+        E(RenderbufferStorageMultisample, "glRenderbufferStorageMultisample"),
+        E(GetIntegerv, "glGetIntegerv"),
+        E(Uniform1f, "glUniform1f"),
+        E(Uniform4fv, "glUniform4fv"),
+#undef E
+    };
+    for (size_t i = 0; i < sizeof(opt_table) / sizeof(opt_table[0]); i++) {
+        void *fn = getproc(opt_table[i].name);
+        *(void **)((char *)api + opt_table[i].off) = fn;
     }
     return 1;
 }
@@ -98,6 +122,7 @@ typedef struct {
     HMODULE opengl32;
     HWND    wnd;
     HDC     dc;
+    HDC     cur_dc;
     HGLRC   rc;
     int     pf;
     HGLRC (WINAPI *CreateContext)(HDC);
@@ -105,6 +130,7 @@ typedef struct {
     BOOL  (WINAPI *MakeCurrent)(HDC, HGLRC);
     BOOL  (WINAPI *SwapBuffers_)(HDC);
     PROC  (WINAPI *GetProcAddress_)(LPCSTR);
+    BOOL  (WINAPI *SwapIntervalEXT)(int);
 } zan_gl_ctx;
 
 typedef struct {
@@ -209,12 +235,22 @@ static int zan_gl_ctx_create(void) {
         zan_gl_ctx_destroy();
         return 0;
     }
+    g_glctx.cur_dc = g_glctx.dc;
+    /* Frame pacing is owned by Win32Shell (DwmFlush / FrameCadence); disable
+     * WGL SwapBuffers VSync busy-spin so NVIDIA/AMD/Intel drivers don't burn
+     * 100% of a CPU core waiting for VBlank inside SwapBuffers. */
+    g_glctx.SwapIntervalEXT = (BOOL (WINAPI *)(int))
+        g_glctx.GetProcAddress_("wglSwapIntervalEXT");
+    if (g_glctx.SwapIntervalEXT) g_glctx.SwapIntervalEXT(0);
     return 1;
 }
 
 static int zan_gl_ctx_make_current(void) {
-    if (!g_glctx.MakeCurrent) return 0;
-    return g_glctx.MakeCurrent(g_glctx.dc, g_glctx.rc) ? 1 : 0;
+    if (!g_glctx.MakeCurrent || !g_glctx.rc) return 0;
+    if (g_glctx.cur_dc) return 1;
+    if (!g_glctx.MakeCurrent(g_glctx.dc, g_glctx.rc)) return 0;
+    g_glctx.cur_dc = g_glctx.dc;
+    return 1;
 }
 
 static LRESULT CALLBACK zan_gl_present_proc(HWND h, UINT msg, WPARAM wp,
@@ -237,11 +273,20 @@ static void zan_gl_ctx_present_drop(void *host) {
     for (int i = 0; i < n; i++)
         if (g_glpres[i].host == (HWND)host) p = &g_glpres[i];
     if (!p) return;
-    if (g_glctx.MakeCurrent) g_glctx.MakeCurrent(NULL, NULL);
+    if (g_glctx.cur_dc == p->dc) {
+        g_glctx.cur_dc = NULL;
+        if (g_glctx.MakeCurrent) {
+            if (g_glctx.dc && g_glctx.rc &&
+                g_glctx.MakeCurrent(g_glctx.dc, g_glctx.rc)) {
+                g_glctx.cur_dc = g_glctx.dc;
+            } else {
+                g_glctx.MakeCurrent(NULL, NULL);
+            }
+        }
+    }
     if (p->dc) ReleaseDC(p->child, p->dc);
     if (p->child) DestroyWindow(p->child);
     memset(p, 0, sizeof(*p));
-    zan_gl_ctx_make_current();
 }
 
 static void zan_gl_ctx_present_drop_all(void) {
@@ -257,6 +302,7 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     zan_gl_present_win *p = zan_gl_present_slot(hw);
     if (!p) return 0;
 
+    int created = 0;
     if (!p->child) {
         WNDCLASSA wc;
         memset(&wc, 0, sizeof(wc));
@@ -279,15 +325,21 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
             return 0;
         }
         p->host = hw; p->child = child; p->dc = dc; p->w = w; p->h = h;
+        created = 1;
     } else if (p->w != w || p->h != h) {
         MoveWindow(p->child, 0, 0, w, h, FALSE);
         p->w = w; p->h = h;
     }
 
-    if (!g_glctx.MakeCurrent(p->dc, g_glctx.rc)) {
-        zan_gl_ctx_present_drop(hw);
-        return 0;
+    if (g_glctx.cur_dc != p->dc) {
+        if (!g_glctx.MakeCurrent(p->dc, g_glctx.rc)) {
+            g_glctx.cur_dc = NULL;
+            zan_gl_ctx_present_drop(hw);
+            return 0;
+        }
+        g_glctx.cur_dc = p->dc;
     }
+    if (created && g_glctx.SwapIntervalEXT) g_glctx.SwapIntervalEXT(0);
     return 1;
 }
 
@@ -297,7 +349,6 @@ static void zan_gl_ctx_present_end(void *host) {
     for (int i = 0; i < n; i++)
         if (g_glpres[i].host == (HWND)host) p = &g_glpres[i];
     if (p && p->dc && g_glctx.SwapBuffers_) g_glctx.SwapBuffers_(p->dc);
-    zan_gl_ctx_make_current();
 }
 
 #elif defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
@@ -331,6 +382,7 @@ typedef struct {
     Display *dpy;
     int owns_dpy;
     GLXPbuffer_t pbuf;
+    GLXPbuffer_t cur_drawable;
     GLXContext_t rc;
     GLXFBConfig_t cfg;
     int can_present;
@@ -348,6 +400,8 @@ typedef struct {
                                      const int *);
     void (*destroy_glxwindow)(Display *, GLXPbuffer_t);
     void (*swap_buffers)(Display *, GLXPbuffer_t);
+    void (*swap_interval_ext)(Display *, GLXPbuffer_t, int);
+    int  (*swap_interval_mesa)(unsigned int);
 } zan_gl_ctx;
 
 static zan_gl_ctx g_glctx;
@@ -432,6 +486,10 @@ static int zan_gl_ctx_create(void) {
             "glXDestroyWindow");
     ZGL_GLX(swap_buffers, void (*)(Display *, GLXPbuffer_t),
             "glXSwapBuffers");
+    ZGL_GLX(swap_interval_ext, void (*)(Display *, GLXPbuffer_t, int),
+            "glXSwapIntervalEXT");
+    ZGL_GLX(swap_interval_mesa, int (*)(unsigned int),
+            "glXSwapIntervalMESA");
 #undef ZGL_GLX
     if (!g_glctx.choose_fbconfig || !g_glctx.create_pbuffer ||
         !g_glctx.create_context_attribs || !g_glctx.make_context_current) {
@@ -495,12 +553,17 @@ static int zan_gl_ctx_create(void) {
         zan_gl_ctx_destroy();
         return 0;
     }
+    g_glctx.cur_drawable = g_glctx.pbuf;
+    if (g_glctx.swap_interval_mesa) g_glctx.swap_interval_mesa(0);
     return 1;
 }
 
 static int zan_gl_ctx_make_current(void) {
-    return g_glctx.make_context_current(g_glctx.dpy, g_glctx.pbuf, g_glctx.pbuf,
-                                        g_glctx.rc);
+    if (g_glctx.cur_drawable) return 1;
+    if (!g_glctx.make_context_current(g_glctx.dpy, g_glctx.pbuf, g_glctx.pbuf,
+                                      g_glctx.rc)) return 0;
+    g_glctx.cur_drawable = g_glctx.pbuf;
+    return 1;
 }
 
 static zan_gl_present_win *zan_gl_present_find(Window host) {
@@ -512,13 +575,20 @@ static zan_gl_present_win *zan_gl_present_find(Window host) {
 static void zan_gl_ctx_present_drop(void *host) {
     zan_gl_present_win *p = zan_gl_present_find((Window)(size_t)host);
     if (!p) return;
-    g_glctx.make_context_current(g_glctx.dpy, 0, 0, NULL);
+    if (g_glctx.cur_drawable == p->glxwin) {
+        g_glctx.cur_drawable = 0;
+        if (g_glctx.make_context_current(g_glctx.dpy, g_glctx.pbuf, g_glctx.pbuf,
+                                         g_glctx.rc)) {
+            g_glctx.cur_drawable = g_glctx.pbuf;
+        } else {
+            g_glctx.make_context_current(g_glctx.dpy, 0, 0, NULL);
+        }
+    }
     if (p->glxwin && g_glctx.destroy_glxwindow)
         g_glctx.destroy_glxwindow(g_glctx.dpy, p->glxwin);
     if (p->child) XDestroyWindow(g_glctx.dpy, p->child);
     if (p->cmap) XFreeColormap(g_glctx.dpy, p->cmap);
     memset(p, 0, sizeof(*p));
-    zan_gl_ctx_make_current();
 }
 
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
@@ -555,6 +625,8 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
             return 0;
         }
         XMapWindow(g_glctx.dpy, child);
+        if (g_glctx.swap_interval_ext)
+            g_glctx.swap_interval_ext(g_glctx.dpy, glxwin, 0);
         p->host = hw; p->child = child; p->glxwin = glxwin; p->cmap = cmap;
         p->w = w; p->h = h;
     } else if (p->w != w || p->h != h) {
@@ -562,10 +634,14 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
         p->w = w; p->h = h;
     }
 
-    if (!g_glctx.make_context_current(g_glctx.dpy, p->glxwin, p->glxwin,
-                                     g_glctx.rc)) {
-        zan_gl_ctx_present_drop(host);
-        return 0;
+    if (g_glctx.cur_drawable != p->glxwin) {
+        if (!g_glctx.make_context_current(g_glctx.dpy, p->glxwin, p->glxwin,
+                                         g_glctx.rc)) {
+            g_glctx.cur_drawable = 0;
+            zan_gl_ctx_present_drop(host);
+            return 0;
+        }
+        g_glctx.cur_drawable = p->glxwin;
     }
     return 1;
 }
@@ -581,7 +657,6 @@ static void zan_gl_ctx_present_end(void *host) {
     zan_gl_present_win *p = zan_gl_present_find((Window)(size_t)host);
     if (p && p->glxwin && g_glctx.swap_buffers)
         g_glctx.swap_buffers(g_glctx.dpy, p->glxwin);
-    zan_gl_ctx_make_current();
 }
 
 #elif defined(__APPLE__)

@@ -472,6 +472,7 @@ void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn);
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn,
                               LLVMValueRef raw);
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
+LLVMValueRef zan_irgen_intern_type_name(zan_irgen_t *g, const char *text);
 
 /* --- From irgen_abi.c (5 functions) --- */
 void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn, zan_type_t *ret,

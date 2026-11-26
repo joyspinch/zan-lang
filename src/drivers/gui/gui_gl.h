@@ -80,6 +80,27 @@ typedef float         zgl_float;
 #define ZGL_DRAW_FRAMEBUFFER             0x8CA9
 #define ZGL_VERSION                      0x1F02
 #define ZGL_RENDERER                     0x1F01
+#define ZGL_LINES                        0x0001
+#define ZGL_LINE_STRIP                   0x0003
+#define ZGL_DYNAMIC_DRAW                 0x88E8
+#define ZGL_DEPTH24_STENCIL8             0x88F0
+#define ZGL_DEPTH_STENCIL_ATTACHMENT     0x821A
+#define ZGL_STENCIL_TEST                 0x0B90
+#define ZGL_STENCIL_BUFFER_BIT           0x00000400
+#define ZGL_POLYGON_OFFSET_FILL          0x8037
+#define ZGL_CULL_FACE                    0x0B44
+#define ZGL_BACK                         0x0405
+#define ZGL_CCW                          0x0901
+#define ZGL_MAX_SAMPLES                  0x8D57
+#define ZGL_LESS                         0x0201
+#define ZGL_ALWAYS                       0x0207
+#define ZGL_EQUAL                        0x0202
+#define ZGL_NOTEQUAL                     0x0205
+#define ZGL_KEEP                         0x1E00
+#define ZGL_REPLACE                      0x1E01
+#define ZGL_INVERT                       0x150A
+#define ZGL_INCR_WRAP                    0x8507
+#define ZGL_DECR_WRAP                    0x8508
 
 typedef struct zan_gl_api_s {
     /* --- state ---------------------------------------------------------- */
@@ -165,6 +186,22 @@ typedef struct zan_gl_api_s {
     void      (*BlitFramebuffer)(zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_bitfield, zgl_enum);
+    /* --- CAD / GL 3.3 & GLES 3.0 extensions (appended for ABI compat) --- */
+    void      (*DrawArraysInstanced)(zgl_enum, zgl_int, zgl_sizei, zgl_sizei);
+    void      (*PolygonOffset)(zgl_float, zgl_float);
+    void      (*DepthMask)(zgl_boolean);
+    void      (*ColorMask)(zgl_boolean, zgl_boolean, zgl_boolean, zgl_boolean);
+    void      (*CullFace)(zgl_enum);
+    void      (*FrontFace)(zgl_enum);
+    void      (*StencilFunc)(zgl_enum, zgl_int, zgl_uint);
+    void      (*StencilOp)(zgl_enum, zgl_enum, zgl_enum);
+    void      (*StencilMask)(zgl_uint);
+    void      (*ClearStencil)(zgl_int);
+    void      (*RenderbufferStorageMultisample)(zgl_enum, zgl_sizei, zgl_enum,
+                                                zgl_sizei, zgl_sizei);
+    void      (*GetIntegerv)(zgl_enum, zgl_int *);
+    void      (*Uniform1f)(zgl_int, zgl_float);
+    void      (*Uniform4fv)(zgl_int, zgl_sizei, const zgl_float *);
 } zan_gl_api;
 
 int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name));

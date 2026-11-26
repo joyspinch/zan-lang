@@ -1,0 +1,308 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Cad;
+
+public static class CadLineType {
+    public static int Solid() { return 0; }
+    public static int Dash() { return 1; }
+    public static int Dot() { return 2; }
+    public static int DashDot() { return 3; }
+    public static int Center() { return 4; }
+}
+
+public static class CadLineCap {
+    public static int Round() { return 0; }
+    public static int Butt() { return 1; }
+    public static int Square() { return 2; }
+}
+
+public static class CadHatchMode {
+    public static int Solid() { return 0; }
+    public static int Diag45() { return 1; }
+    public static int DiagNeg45() { return 2; }
+    public static int Cross() { return 3; }
+    public static int Horizontal() { return 4; }
+    public static int Vertical() { return 5; }
+}
+
+public class CadLayer2D {
+    private int handle;
+    private double originX;
+    private double originY;
+
+    private nint lineBuf;
+    private int lineCount;
+    private int lineCap;
+    private bool linesDirty;
+
+    private nint arcBuf;
+    private int arcCount;
+    private int arcCap;
+    private bool arcsDirty;
+
+    private nint fillVertBuf;
+    private int fillVertCount;
+    private int fillVertCap;
+    private nint fillIdxBuf;
+    private int fillIdxCount;
+    private int fillIdxCap;
+    private bool fillsDirty;
+
+    public CadLayer2D() {
+        this.handle = CadNative.zan_gui_cad_layer2d_create();
+        this.originX = 0.0;
+        this.originY = 0.0;
+        this.lineBuf = 0; this.lineCount = 0; this.lineCap = 0; this.linesDirty = false;
+        this.arcBuf = 0; this.arcCount = 0; this.arcCap = 0; this.arcsDirty = false;
+        this.fillVertBuf = 0; this.fillVertCount = 0; this.fillVertCap = 0;
+        this.fillIdxBuf = 0; this.fillIdxCount = 0; this.fillIdxCap = 0;
+        this.fillsDirty = false;
+    }
+
+    public int Handle() { return this.handle; }
+    public int LineCount() { return this.lineCount; }
+    public int ArcCount() { return this.arcCount; }
+    public int FillTriangleCount() { return this.fillIdxCount / 3; }
+
+    public void SetOrigin(double ox, double oy) {
+        this.originX = ox;
+        this.originY = oy;
+        if (this.handle > 0) {
+            CadNative.zan_gui_cad_layer2d_set_origin(this.handle, ox, oy);
+        }
+    }
+
+    public void Clear() {
+        this.lineCount = 0;
+        this.arcCount = 0;
+        this.fillVertCount = 0;
+        this.fillIdxCount = 0;
+        this.linesDirty = true;
+        this.arcsDirty = true;
+        this.fillsDirty = true;
+    }
+
+    private void EnsureLineCap(int need) {
+        if (this.lineCap >= need) { return; }
+        int nextCap = this.lineCap < 256 ? 256 : this.lineCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 12 * 4);
+        if (this.lineBuf != 0 && this.lineCount > 0) {
+            int nFloats = this.lineCount * 12;
+            Span<float> src = new Span<float>(this.lineBuf, nFloats);
+            Span<float> dst = new Span<float>(nb, nFloats);
+            for (int i = 0; i < nFloats; i++) { dst[i] = src[i]; }
+        }
+        if (this.lineBuf != 0) { NativeMemory.Free(this.lineBuf); }
+        this.lineBuf = nb;
+        this.lineCap = nextCap;
+    }
+
+    private void EnsureArcCap(int need) {
+        if (this.arcCap >= need) { return; }
+        int nextCap = this.arcCap < 128 ? 128 : this.arcCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 14 * 4);
+        if (this.arcBuf != 0 && this.arcCount > 0) {
+            int nFloats = this.arcCount * 14;
+            Span<float> src = new Span<float>(this.arcBuf, nFloats);
+            Span<float> dst = new Span<float>(nb, nFloats);
+            for (int i = 0; i < nFloats; i++) { dst[i] = src[i]; }
+        }
+        if (this.arcBuf != 0) { NativeMemory.Free(this.arcBuf); }
+        this.arcBuf = nb;
+        this.arcCap = nextCap;
+    }
+
+    private void EnsureFillVertCap(int need) {
+        if (this.fillVertCap >= need) { return; }
+        int nextCap = this.fillVertCap < 256 ? 256 : this.fillVertCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 8 * 4);
+        if (this.fillVertBuf != 0 && this.fillVertCount > 0) {
+            int nFloats = this.fillVertCount * 8;
+            Span<float> src = new Span<float>(this.fillVertBuf, nFloats);
+            Span<float> dst = new Span<float>(nb, nFloats);
+            for (int i = 0; i < nFloats; i++) { dst[i] = src[i]; }
+        }
+        if (this.fillVertBuf != 0) { NativeMemory.Free(this.fillVertBuf); }
+        this.fillVertBuf = nb;
+        this.fillVertCap = nextCap;
+    }
+
+    private void EnsureFillIdxCap(int need) {
+        if (this.fillIdxCap >= need) { return; }
+        int nextCap = this.fillIdxCap < 512 ? 512 : this.fillIdxCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 4);
+        if (this.fillIdxBuf != 0 && this.fillIdxCount > 0) {
+            Span<int> src = new Span<int>(this.fillIdxBuf, this.fillIdxCount);
+            Span<int> dst = new Span<int>(nb, this.fillIdxCount);
+            for (int i = 0; i < this.fillIdxCount; i++) { dst[i] = src[i]; }
+        }
+        if (this.fillIdxBuf != 0) { NativeMemory.Free(this.fillIdxBuf); }
+        this.fillIdxBuf = nb;
+        this.fillIdxCap = nextCap;
+    }
+
+    public void AddLine(
+        double x0, double y0, double x1, double y1,
+        int argb, float width, bool worldWidth, int lineType, int cap, float dashPeriod, int entityId) {
+        this.EnsureLineCap(this.lineCount + 1);
+        int baseIdx = this.lineCount * 12;
+        Span<float> dst = new Span<float>(this.lineBuf, (this.lineCount + 1) * 12);
+        int flags = (worldWidth ? 1 : 0) | ((lineType & 7) << 1) | ((cap & 3) << 4);
+        dst[baseIdx + 0] = (float)(x0 - this.originX);
+        dst[baseIdx + 1] = (float)(y0 - this.originY);
+        dst[baseIdx + 2] = (float)(x1 - this.originX);
+        dst[baseIdx + 3] = (float)(y1 - this.originY);
+        dst[baseIdx + 4] = width;
+        dst[baseIdx + 5] = (float)flags;
+        dst[baseIdx + 6] = (float)entityId;
+        dst[baseIdx + 7] = dashPeriod;
+        dst[baseIdx + 8] = (float)((argb >> 16) & 255) / 255.0f;
+        dst[baseIdx + 9] = (float)((argb >> 8) & 255) / 255.0f;
+        dst[baseIdx + 10] = (float)(argb & 255) / 255.0f;
+        dst[baseIdx + 11] = (float)((argb >> 24) & 255) / 255.0f;
+        this.lineCount += 1;
+        this.linesDirty = true;
+    }
+
+    public void AddPolyline(
+        List<double> xs, List<double> ys, bool closed,
+        int argb, float width, bool worldWidth, int lineType, int entityId) {
+        int n = xs.Count < ys.Count ? xs.Count : ys.Count;
+        if (n < 2) { return; }
+        for (int i = 0; i < n - 1; i++) {
+            this.AddLine(xs[i], ys[i], xs[i + 1], ys[i + 1], argb, width, worldWidth, lineType, 0, 14.0f, entityId);
+        }
+        if (closed && n >= 3) {
+            this.AddLine(xs[n - 1], ys[n - 1], xs[0], ys[0], argb, width, worldWidth, lineType, 0, 14.0f, entityId);
+        }
+    }
+
+    public void AddCubicBezier(
+        double x0, double y0, double cx0, double cy0, double cx1, double cy1, double x1, double y1,
+        int segments, int argb, float width, bool worldWidth, int lineType, int entityId) {
+        int segs = segments < 4 ? 4 : segments;
+        double px = x0;
+        double py = y0;
+        for (int i = 1; i <= segs; i++) {
+            double t = (double)i / (double)segs;
+            double u = 1.0 - t;
+            double nx = u * u * u * x0 + 3.0 * u * u * t * cx0 + 3.0 * u * t * t * cx1 + t * t * t * x1;
+            double ny = u * u * u * y0 + 3.0 * u * u * t * cy0 + 3.0 * u * t * t * cy1 + t * t * t * y1;
+            this.AddLine(px, py, nx, ny, argb, width, worldWidth, lineType, 0, 14.0f, entityId);
+            px = nx; py = ny;
+        }
+    }
+
+    public void AddCircle(double cx, double cy, double radius, int argb, float width, bool worldWidth, bool filled, int entityId) {
+        this.AddEllipseArc(cx, cy, radius, radius, 0.0, 0.0, 6.283185307179586, argb, width, worldWidth, filled, entityId);
+    }
+
+    public void AddArc(
+        double cx, double cy, double radius, double startRad, double sweepRad,
+        int argb, float width, bool worldWidth, bool filled, int entityId) {
+        this.AddEllipseArc(cx, cy, radius, radius, 0.0, startRad, sweepRad, argb, width, worldWidth, filled, entityId);
+    }
+
+    public void AddEllipseArc(
+        double cx, double cy, double rx, double ry, double rotRad, double startRad, double sweepRad,
+        int argb, float width, bool worldWidth, bool filled, int entityId) {
+        this.EnsureArcCap(this.arcCount + 1);
+        int baseIdx = this.arcCount * 14;
+        Span<float> dst = new Span<float>(this.arcBuf, (this.arcCount + 1) * 14);
+        int flags = (worldWidth ? 1 : 0) | (filled ? 8 : 0);
+        dst[baseIdx + 0] = (float)(cx - this.originX);
+        dst[baseIdx + 1] = (float)(cy - this.originY);
+        dst[baseIdx + 2] = (float)rx;
+        dst[baseIdx + 3] = (float)ry;
+        dst[baseIdx + 4] = (float)rotRad;
+        dst[baseIdx + 5] = (float)startRad;
+        dst[baseIdx + 6] = (float)sweepRad;
+        dst[baseIdx + 7] = width;
+        dst[baseIdx + 8] = (float)((argb >> 16) & 255) / 255.0f;
+        dst[baseIdx + 9] = (float)((argb >> 8) & 255) / 255.0f;
+        dst[baseIdx + 10] = (float)(argb & 255) / 255.0f;
+        dst[baseIdx + 11] = (float)((argb >> 24) & 255) / 255.0f;
+        dst[baseIdx + 12] = (float)flags;
+        dst[baseIdx + 13] = (float)entityId;
+        this.arcCount += 1;
+        this.arcsDirty = true;
+    }
+
+    public void AddConvexPolygonFill(List<double> xs, List<double> ys, int argb, int hatchMode, int entityId) {
+        int n = xs.Count < ys.Count ? xs.Count : ys.Count;
+        if (n < 3) { return; }
+        int baseVert = this.fillVertCount;
+        this.EnsureFillVertCap(baseVert + n);
+        this.EnsureFillIdxCap(this.fillIdxCount + (n - 2) * 3);
+
+        float cr = (float)((argb >> 16) & 255) / 255.0f;
+        float cg = (float)((argb >> 8) & 255) / 255.0f;
+        float cb = (float)(argb & 255) / 255.0f;
+        float ca = (float)((argb >> 24) & 255) / 255.0f;
+
+        Span<float> vdst = new Span<float>(this.fillVertBuf, (baseVert + n) * 8);
+        for (int i = 0; i < n; i++) {
+            int o = (baseVert + i) * 8;
+            vdst[o + 0] = (float)(xs[i] - this.originX);
+            vdst[o + 1] = (float)(ys[i] - this.originY);
+            vdst[o + 2] = cr; vdst[o + 3] = cg; vdst[o + 4] = cb; vdst[o + 5] = ca;
+            vdst[o + 6] = (float)entityId;
+            vdst[o + 7] = (float)hatchMode;
+        }
+        Span<int> idst = new Span<int>(this.fillIdxBuf, this.fillIdxCount + (n - 2) * 3);
+        int k = this.fillIdxCount;
+        for (int i = 1; i < n - 1; i++) {
+            idst[k + 0] = baseVert;
+            idst[k + 1] = baseVert + i;
+            idst[k + 2] = baseVert + i + 1;
+            k += 3;
+        }
+        this.fillVertCount = baseVert + n;
+        this.fillIdxCount = k;
+        this.fillsDirty = true;
+    }
+
+    public void Upload() {
+        if (this.handle <= 0) { return; }
+        if (this.linesDirty) {
+            CadNative.zan_gui_cad_layer2d_upload_lines(this.handle, this.lineBuf, this.lineCount);
+            this.linesDirty = false;
+        }
+        if (this.arcsDirty) {
+            CadNative.zan_gui_cad_layer2d_upload_arcs(this.handle, this.arcBuf, this.arcCount);
+            this.arcsDirty = false;
+        }
+        if (this.fillsDirty) {
+            CadNative.zan_gui_cad_layer2d_upload_fills(
+                this.handle, this.fillVertBuf, this.fillVertCount, this.fillIdxBuf, this.fillIdxCount);
+            this.fillsDirty = false;
+        }
+    }
+
+    public void Draw(int surfaceId, CadCamera2D cam) {
+        if (this.handle <= 0) { return; }
+        if (this.linesDirty || this.arcsDirty || this.fillsDirty) { this.Upload(); }
+        CadNative.zan_gui_cad_layer2d_draw(
+            surfaceId, this.handle, cam.CenterX, cam.CenterY, cam.Zoom, cam.RotationRad);
+    }
+
+    public void Dispose() {
+        if (this.handle > 0) {
+            CadNative.zan_gui_cad_layer2d_destroy(this.handle);
+            this.handle = 0;
+        }
+        if (this.lineBuf != 0) { NativeMemory.Free(this.lineBuf); this.lineBuf = 0; }
+        if (this.arcBuf != 0) { NativeMemory.Free(this.arcBuf); this.arcBuf = 0; }
+        if (this.fillVertBuf != 0) { NativeMemory.Free(this.fillVertBuf); this.fillVertBuf = 0; }
+        if (this.fillIdxBuf != 0) { NativeMemory.Free(this.fillIdxBuf); this.fillIdxBuf = 0; }
+        this.lineCap = 0; this.lineCount = 0;
+        this.arcCap = 0; this.arcCount = 0;
+        this.fillVertCap = 0; this.fillVertCount = 0;
+        this.fillIdxCap = 0; this.fillIdxCount = 0;
+    }
+}

@@ -1,0 +1,259 @@
+using System;
+
+namespace Gui.Cad;
+
+public class CadCamera2D {
+    public double CenterX;
+    public double CenterY;
+    public double Zoom;
+    public double RotationRad;
+
+    public CadCamera2D() {
+        this.CenterX = 0.0;
+        this.CenterY = 0.0;
+        this.Zoom = 1.0;
+        this.RotationRad = 0.0;
+    }
+
+    public CadCamera2D(double cx, double cy, double zoom) {
+        this.CenterX = cx;
+        this.CenterY = cy;
+        this.Zoom = zoom > 1e-9 ? zoom : 1.0;
+        this.RotationRad = 0.0;
+    }
+
+    public void PanByScreen(double dxPx, double dyPx) {
+        if (this.Zoom <= 1e-12) { return; }
+        double c = Math.Cos(this.RotationRad);
+        double s = Math.Sin(this.RotationRad);
+        double vx = -dxPx / this.Zoom;
+        double vy = dyPx / this.Zoom;
+        this.CenterX += vx * c + vy * s;
+        this.CenterY += -vx * s + vy * c;
+    }
+
+    public void ZoomAtScreen(double factor, double sx, double sy, double vpW, double vpH) {
+        if (factor <= 0.0) { return; }
+        double wx0 = this.ScreenToWorldX(sx, sy, vpW, vpH);
+        double wy0 = this.ScreenToWorldY(sx, sy, vpW, vpH);
+        double nextZoom = this.Zoom * factor;
+        if (nextZoom < 1e-6) { nextZoom = 1e-6; }
+        if (nextZoom > 1e6) { nextZoom = 1e6; }
+        this.Zoom = nextZoom;
+        double wx1 = this.ScreenToWorldX(sx, sy, vpW, vpH);
+        double wy1 = this.ScreenToWorldY(sx, sy, vpW, vpH);
+        this.CenterX += (wx0 - wx1);
+        this.CenterY += (wy0 - wy1);
+    }
+
+    public double WorldToScreenX(double wx, double wy, double vpW, double vpH) {
+        double dx = wx - this.CenterX;
+        double dy = wy - this.CenterY;
+        double c = Math.Cos(this.RotationRad);
+        double s = Math.Sin(this.RotationRad);
+        return vpW * 0.5 + (dx * c - dy * s) * this.Zoom;
+    }
+
+    public double WorldToScreenY(double wx, double wy, double vpW, double vpH) {
+        double dx = wx - this.CenterX;
+        double dy = wy - this.CenterY;
+        double c = Math.Cos(this.RotationRad);
+        double s = Math.Sin(this.RotationRad);
+        return vpH * 0.5 - (dx * s + dy * c) * this.Zoom;
+    }
+
+    public double ScreenToWorldX(double sx, double sy, double vpW, double vpH) {
+        if (this.Zoom <= 1e-12) { return this.CenterX; }
+        double rx = (sx - vpW * 0.5) / this.Zoom;
+        double ry = (vpH * 0.5 - sy) / this.Zoom;
+        double c = Math.Cos(this.RotationRad);
+        double s = Math.Sin(this.RotationRad);
+        return this.CenterX + rx * c + ry * s;
+    }
+
+    public double ScreenToWorldY(double sx, double sy, double vpW, double vpH) {
+        if (this.Zoom <= 1e-12) { return this.CenterY; }
+        double rx = (sx - vpW * 0.5) / this.Zoom;
+        double ry = (vpH * 0.5 - sy) / this.Zoom;
+        double c = Math.Cos(this.RotationRad);
+        double s = Math.Sin(this.RotationRad);
+        return this.CenterY - rx * s + ry * c;
+    }
+
+    public void FitBounds(double minX, double minY, double maxX, double maxY, double vpW, double vpH, double padding) {
+        double bw = maxX - minX;
+        double bh = maxY - minY;
+        this.CenterX = (minX + maxX) * 0.5;
+        this.CenterY = (minY + maxY) * 0.5;
+        double usableW = vpW - padding * 2.0;
+        double usableH = vpH - padding * 2.0;
+        if (usableW <= 1.0 || usableH <= 1.0 || bw <= 1e-9 || bh <= 1e-9) { return; }
+        double zx = usableW / bw;
+        double zy = usableH / bh;
+        this.Zoom = zx < zy ? zx : zy;
+    }
+}
+
+public static class CadMat4 {
+    public static void SetIdentity(nint dst16) {
+        Span<float> m = new Span<float>(dst16, 16);
+        for (int i = 0; i < 16; i++) { m[i] = 0.0f; }
+        m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
+    }
+
+    public static void SetTranslation(nint dst16, float tx, float ty, float tz) {
+        CadMat4.SetIdentity(dst16);
+        Span<float> m = new Span<float>(dst16, 16);
+        m[12] = tx; m[13] = ty; m[14] = tz;
+    }
+
+    public static void SetTrs(nint dst16, float tx, float ty, float tz, float rotYRad, float scale) {
+        float c = (float)Math.Cos((double)rotYRad) * scale;
+        float s = (float)Math.Sin((double)rotYRad) * scale;
+        Span<float> m = new Span<float>(dst16, 16);
+        for (int i = 0; i < 16; i++) { m[i] = 0.0f; }
+        m[0] = c;    m[2] = -s;
+        m[5] = scale;
+        m[8] = s;    m[10] = c;
+        m[12] = tx;  m[13] = ty;  m[14] = tz;  m[15] = 1.0f;
+    }
+
+    public static void Multiply(nint dst16, nint a16, nint b16) {
+        Span<float> a = new Span<float>(a16, 16);
+        Span<float> b = new Span<float>(b16, 16);
+        Span<float> o = new Span<float>(dst16, 16);
+        for (int col = 0; col < 4; col++) {
+            for (int row = 0; row < 4; row++) {
+                o[col * 4 + row] =
+                    a[0 * 4 + row] * b[col * 4 + 0] +
+                    a[1 * 4 + row] * b[col * 4 + 1] +
+                    a[2 * 4 + row] * b[col * 4 + 2] +
+                    a[3 * 4 + row] * b[col * 4 + 3];
+            }
+        }
+    }
+}
+
+public class CadCamera3D {
+    public double TargetX;
+    public double TargetY;
+    public double TargetZ;
+    public double YawRad;
+    public double PitchRad;
+    public double Distance;
+    public bool Orthographic;
+    public double FovYRad;
+    public double OrthoHeight;
+    public double NearPlane;
+    public double FarPlane;
+
+    public CadCamera3D() {
+        this.TargetX = 0.0;
+        this.TargetY = 0.0;
+        this.TargetZ = 0.0;
+        this.YawRad = 0.7853981633974483;
+        this.PitchRad = 0.6154797086703874;
+        this.Distance = 200.0;
+        this.Orthographic = true;
+        this.FovYRad = 0.7853981633974483;
+        this.OrthoHeight = 120.0;
+        this.NearPlane = 0.5;
+        this.FarPlane = 50000.0;
+    }
+
+    public void Orbit(double deltaYawRad, double deltaPitchRad) {
+        this.YawRad += deltaYawRad;
+        this.PitchRad += deltaPitchRad;
+        if (this.PitchRad > 1.54) { this.PitchRad = 1.54; }
+        if (this.PitchRad < -1.54) { this.PitchRad = -1.54; }
+    }
+
+    public void ZoomFactor(double factor) {
+        if (factor <= 0.0) { return; }
+        this.Distance *= factor;
+        this.OrthoHeight *= factor;
+        if (this.Distance < 1.0) { this.Distance = 1.0; }
+        if (this.OrthoHeight < 0.1) { this.OrthoHeight = 0.1; }
+    }
+
+    public void SetIsometric() {
+        this.YawRad = 0.7853981633974483;
+        this.PitchRad = 0.6154797086703874;
+    }
+
+    public void SetTopView() {
+        this.YawRad = 0.0;
+        this.PitchRad = 1.53;
+    }
+
+    public void SetFrontView() {
+        this.YawRad = 0.0;
+        this.PitchRad = 0.0;
+    }
+
+    public void BuildViewProj(int vpW, int vpH, nint outMat16) {
+        double aspect = vpH > 0 ? ((double)vpW / (double)vpH) : 1.0;
+        double cp = Math.Cos(this.PitchRad);
+        double sp = Math.Sin(this.PitchRad);
+        double cy = Math.Cos(this.YawRad);
+        double sy = Math.Sin(this.YawRad);
+
+        double ex = this.TargetX + this.Distance * cp * sy;
+        double ey = this.TargetY + this.Distance * sp;
+        double ez = this.TargetZ + this.Distance * cp * cy;
+
+        double fx = this.TargetX - ex;
+        double fy = this.TargetY - ey;
+        double fz = this.TargetZ - ez;
+        double fl = Math.Sqrt(fx * fx + fy * fy + fz * fz);
+        if (fl < 1e-9) { fl = 1.0; }
+        fx /= fl; fy /= fl; fz /= fl;
+
+        /* right = normalize(cross(f, up(0,1,0))) */
+        double rx = -fz;
+        double ry = 0.0;
+        double rz = fx;
+        double rl = Math.Sqrt(rx * rx + rz * rz);
+        if (rl < 1e-9) { rx = 1.0; ry = 0.0; rz = 0.0; rl = 1.0; }
+        rx /= rl; rz /= rl;
+
+        /* up = cross(right, f) */
+        double ux = ry * fz - rz * fy;
+        double uy = rz * fx - rx * fz;
+        double uz = rx * fy - ry * fx;
+
+        nint viewBuf = NativeMemory.Alloc(64);
+        nint projBuf = NativeMemory.Alloc(64);
+        Span<float> v = new Span<float>(viewBuf, 16);
+        Span<float> p = new Span<float>(projBuf, 16);
+
+        v[0] = (float)rx;  v[4] = (float)ry;  v[8] = (float)rz;   v[12] = (float)(-(rx * ex + ry * ey + rz * ez));
+        v[1] = (float)ux;  v[5] = (float)uy;  v[9] = (float)uz;   v[13] = (float)(-(ux * ex + uy * ey + uz * ez));
+        v[2] = (float)(-fx); v[6] = (float)(-fy); v[10] = (float)(-fz); v[14] = (float)(fx * ex + fy * ey + fz * ez);
+        v[3] = 0.0f;       v[7] = 0.0f;       v[11] = 0.0f;       v[15] = 1.0f;
+
+        for (int i = 0; i < 16; i++) { p[i] = 0.0f; }
+        double n = this.NearPlane;
+        double f = this.FarPlane;
+        if (this.Orthographic) {
+            double hh = this.OrthoHeight * 0.5;
+            double hw = hh * aspect;
+            p[0] = (float)(1.0 / hw);
+            p[5] = (float)(1.0 / hh);
+            p[10] = (float)(-2.0 / (f - n));
+            p[14] = (float)(-(f + n) / (f - n));
+            p[15] = 1.0f;
+        } else {
+            double t = 1.0 / Math.Tan(this.FovYRad * 0.5);
+            p[0] = (float)(t / aspect);
+            p[5] = (float)t;
+            p[10] = (float)(-(f + n) / (f - n));
+            p[11] = -1.0f;
+            p[14] = (float)(-2.0 * f * n / (f - n));
+        }
+
+        CadMat4.Multiply(outMat16, projBuf, viewBuf);
+        NativeMemory.Free(viewBuf);
+        NativeMemory.Free(projBuf);
+    }
+}

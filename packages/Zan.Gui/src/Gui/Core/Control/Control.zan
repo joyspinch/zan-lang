@@ -32,6 +32,7 @@ public partial class Control : StyleNode, AppLoopOwner {
     bool fillW;
     bool fillH;
     int gap;
+    List<Control> childSnapCache;
     ControlExtra extra;
     internal static int BindingStructureRevision() { return GuiHostState.BindingStructureRevision(); }
     static void NoteBindingStructureChanged() { GuiHostState.NextBindingStructureRevision(); }
@@ -287,7 +288,10 @@ public partial class Control : StyleNode, AppLoopOwner {
     string computedStyleCls;
     string computedStyleId;
     int computedStyleState;
-    string computedStyleCtx;
+    int computedStyleDep;
+    int computedStyleRuleSig;
+    long computedStyleCtxHash;
+    internal int childIndex;
     string styleTypeLower;
     bool styleSurfaceOwned;
     public int styleBg {
@@ -384,7 +388,10 @@ public partial class Control : StyleNode, AppLoopOwner {
         computedStyleCls = "";
         computedStyleId = "";
         computedStyleState = 0 - 1;
-        computedStyleCtx = "";
+        computedStyleDep = 0;
+        computedStyleRuleSig = 0 - 1;
+        computedStyleCtxHash = 0L;
+        childIndex = 0 - 1;
         styleTypeLower = "";
         styleSurfaceOwned = false;
     }
@@ -394,7 +401,9 @@ public partial class Control : StyleNode, AppLoopOwner {
         if (c != null && c.parent == this && this.IndexOf(c) >= 0) { return c; }
         if (!this.Adoptable(c)) { return c; }
         if (!this.Adopt(c)) { return c; }
+        c.childIndex = childNodes.Count;
         childNodes.Add(c);
+        childSnapCache = null;
         Control.NoteBindingStructureChanged();
         this.Invalidate();
         return c;
@@ -565,8 +574,16 @@ public partial class Control : StyleNode, AppLoopOwner {
         return this;
     }
     int IndexOf(Control c) {
+        if (c == null) { return -1; }
+        int hint = c.childIndex;
+        if (hint >= 0 && hint < childNodes.Count && childNodes[hint] == c) {
+            return hint;
+        }
         for (int i = 0; i < childNodes.Count; i = i + 1) {
-            if (childNodes[i] == c) { return i; }
+            if (childNodes[i] == c) {
+                c.childIndex = i;
+                return i;
+            }
         }
         return -1;
     }
@@ -574,6 +591,7 @@ public partial class Control : StyleNode, AppLoopOwner {
         int idx = IndexOf(c);
         if (idx < 0 || c.parent != this) { return false; }
         childNodes.RemoveAt(idx);
+        childSnapCache = null;
         c.parent = null;
         c.InheritApp(null);
         Control.NoteBindingStructureChanged();
@@ -629,6 +647,7 @@ public partial class Control : StyleNode, AppLoopOwner {
         if (at < 0) { at = 0; }
         if (at > childNodes.Count) { at = childNodes.Count; }
         childNodes.Insert(at, c);
+        childSnapCache = null;
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
@@ -640,6 +659,7 @@ public partial class Control : StyleNode, AppLoopOwner {
         if (at < 0) { at = 0; }
         if (at > childNodes.Count) { at = childNodes.Count; }
         childNodes.Insert(at, c);
+        childSnapCache = null;
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
@@ -661,7 +681,11 @@ public partial class Control : StyleNode, AppLoopOwner {
             }
             remaining.Remove(child);
         }
-        for (int i = 0; i < ordered.Count; i = i + 1) { childNodes[i] = ordered[i]; }
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            childNodes[i] = ordered[i];
+            ordered[i].childIndex = i;
+        }
+        childSnapCache = null;
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
@@ -691,7 +715,7 @@ public partial class Control : StyleNode, AppLoopOwner {
         if (this.ScrollBarHit(x, y) != 0) { return this; }
         int count = childNodes.Count;
         Control onlyChild = count == 1 ? childNodes[0] : null;
-        List<Control> ordered = count > 1 ? this.PaintChildren() : null;
+        List<Control> ordered = count > 1 ? this.PaintChildrenFast() : null;
         for (int i = count - 1; i >= 0; i = i - 1) {
             Control child = ordered != null ? ordered[i] : onlyChild;
             if (!this.ChildInViewport(child)) { continue; }
@@ -729,6 +753,14 @@ public partial class Control : StyleNode, AppLoopOwner {
         List<Control> snapshot = new List<Control>();
         snapshot.AddRange(childNodes);
         return snapshot;
+    }
+    internal List<Control> SnapshotChildrenCached() {
+        if (childSnapCache == null) {
+            List<Control> snapshot = new List<Control>();
+            snapshot.AddRange(childNodes);
+            childSnapCache = snapshot;
+        }
+        return childSnapCache;
     }
     public Control Parent() { return parent; }
     public virtual void OnPaint() { this.OnPaint(this.App); }

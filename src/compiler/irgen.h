@@ -1075,6 +1075,7 @@ void zan_irgen_release_llvm(zan_irgen_t *g);
 
 /* 编译器生成的保护文本驻留符号 */
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
+LLVMValueRef zan_irgen_intern_type_name(zan_irgen_t *g, const char *text);
 
 LLVMTypeRef get_decimal_type(zan_irgen_t *g);
 

@@ -489,7 +489,7 @@ static LLVMValueRef materialize_gctx_slot_val(zan_irgen_t *g,
     const char *nm = arc_runtime_type_name(g, cty);
     if (!nm || !nm[0])
       nm = "object";
-    return zan_irgen_intern_string(g, nm);
+    return zan_irgen_intern_type_name(g, nm);
   }
   case GCTX_SLOT_NEW_TP: {
     if (!cty)

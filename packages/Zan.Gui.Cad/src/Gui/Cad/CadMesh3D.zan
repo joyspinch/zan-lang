@@ -1,0 +1,271 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Cad;
+
+public static class CadMeshFlags {
+    public static int Faces() { return 1; }
+    public static int Edges() { return 2; }
+    public static int FacesAndEdges() { return 3; }
+    public static int Selected() { return 4; }
+    public static int XRay() { return 8; }
+    public static int BackFaceCull() { return 16; }
+}
+
+public class CadMesh3D {
+    private int handle;
+
+    private nint faceVertBuf;
+    private int faceVertCount;
+    private int faceVertCap;
+    private nint faceIdxBuf;
+    private int faceIdxCount;
+    private int faceIdxCap;
+    private bool facesDirty;
+
+    private nint edgeVertBuf;
+    private int edgeVertCount;
+    private int edgeVertCap;
+    private bool edgesDirty;
+
+    public CadMesh3D() {
+        this.handle = CadNative.zan_gui_cad_mesh3d_create();
+        this.faceVertBuf = 0; this.faceVertCount = 0; this.faceVertCap = 0;
+        this.faceIdxBuf = 0; this.faceIdxCount = 0; this.faceIdxCap = 0;
+        this.facesDirty = false;
+        this.edgeVertBuf = 0; this.edgeVertCount = 0; this.edgeVertCap = 0;
+        this.edgesDirty = false;
+    }
+
+    public int Handle() { return this.handle; }
+    public int TriangleCount() { return this.faceIdxCount / 3; }
+    public int EdgeCount() { return this.edgeVertCount / 2; }
+
+    public void Clear() {
+        this.faceVertCount = 0;
+        this.faceIdxCount = 0;
+        this.edgeVertCount = 0;
+        this.facesDirty = true;
+        this.edgesDirty = true;
+    }
+
+    private void EnsureFaceVertCap(int need) {
+        if (this.faceVertCap >= need) { return; }
+        int nextCap = this.faceVertCap < 256 ? 256 : this.faceVertCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 10 * 4);
+        if (this.faceVertBuf != 0 && this.faceVertCount > 0) {
+            int nFloats = this.faceVertCount * 10;
+            Span<float> src = new Span<float>(this.faceVertBuf, nFloats);
+            Span<float> dst = new Span<float>(nb, nFloats);
+            for (int i = 0; i < nFloats; i++) { dst[i] = src[i]; }
+        }
+        if (this.faceVertBuf != 0) { NativeMemory.Free(this.faceVertBuf); }
+        this.faceVertBuf = nb;
+        this.faceVertCap = nextCap;
+    }
+
+    private void EnsureFaceIdxCap(int need) {
+        if (this.faceIdxCap >= need) { return; }
+        int nextCap = this.faceIdxCap < 512 ? 512 : this.faceIdxCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 4);
+        if (this.faceIdxBuf != 0 && this.faceIdxCount > 0) {
+            Span<int> src = new Span<int>(this.faceIdxBuf, this.faceIdxCount);
+            Span<int> dst = new Span<int>(nb, this.faceIdxCount);
+            for (int i = 0; i < this.faceIdxCount; i++) { dst[i] = src[i]; }
+        }
+        if (this.faceIdxBuf != 0) { NativeMemory.Free(this.faceIdxBuf); }
+        this.faceIdxBuf = nb;
+        this.faceIdxCap = nextCap;
+    }
+
+    private void EnsureEdgeVertCap(int need) {
+        if (this.edgeVertCap >= need) { return; }
+        int nextCap = this.edgeVertCap < 256 ? 256 : this.edgeVertCap * 2;
+        while (nextCap < need) { nextCap *= 2; }
+        nint nb = NativeMemory.Alloc(nextCap * 7 * 4);
+        if (this.edgeVertBuf != 0 && this.edgeVertCount > 0) {
+            int nFloats = this.edgeVertCount * 7;
+            Span<float> src = new Span<float>(this.edgeVertBuf, nFloats);
+            Span<float> dst = new Span<float>(nb, nFloats);
+            for (int i = 0; i < nFloats; i++) { dst[i] = src[i]; }
+        }
+        if (this.edgeVertBuf != 0) { NativeMemory.Free(this.edgeVertBuf); }
+        this.edgeVertBuf = nb;
+        this.edgeVertCap = nextCap;
+    }
+
+    public int AddFaceVertex(float px, float py, float pz, float nx, float ny, float nz, int argb) {
+        int idx = this.faceVertCount;
+        this.EnsureFaceVertCap(idx + 1);
+        Span<float> dst = new Span<float>(this.faceVertBuf, (idx + 1) * 10);
+        int o = idx * 10;
+        dst[o + 0] = px; dst[o + 1] = py; dst[o + 2] = pz;
+        dst[o + 3] = nx; dst[o + 4] = ny; dst[o + 5] = nz;
+        dst[o + 6] = (float)((argb >> 16) & 255) / 255.0f;
+        dst[o + 7] = (float)((argb >> 8) & 255) / 255.0f;
+        dst[o + 8] = (float)(argb & 255) / 255.0f;
+        dst[o + 9] = (float)((argb >> 24) & 255) / 255.0f;
+        this.faceVertCount = idx + 1;
+        this.facesDirty = true;
+        return idx;
+    }
+
+    public void AddFaceTriangle(int i0, int i1, int i2) {
+        int k = this.faceIdxCount;
+        this.EnsureFaceIdxCap(k + 3);
+        Span<int> dst = new Span<int>(this.faceIdxBuf, k + 3);
+        dst[k + 0] = i0; dst[k + 1] = i1; dst[k + 2] = i2;
+        this.faceIdxCount = k + 3;
+        this.facesDirty = true;
+    }
+
+    public void AddEdgeSegment(float x0, float y0, float z0, float x1, float y1, float z1, int argb) {
+        int idx = this.edgeVertCount;
+        this.EnsureEdgeVertCap(idx + 2);
+        Span<float> dst = new Span<float>(this.edgeVertBuf, (idx + 2) * 7);
+        float cr = (float)((argb >> 16) & 255) / 255.0f;
+        float cg = (float)((argb >> 8) & 255) / 255.0f;
+        float cb = (float)(argb & 255) / 255.0f;
+        float ca = (float)((argb >> 24) & 255) / 255.0f;
+        int o0 = idx * 7;
+        dst[o0 + 0] = x0; dst[o0 + 1] = y0; dst[o0 + 2] = z0;
+        dst[o0 + 3] = cr; dst[o0 + 4] = cg; dst[o0 + 5] = cb; dst[o0 + 6] = ca;
+        int o1 = (idx + 1) * 7;
+        dst[o1 + 0] = x1; dst[o1 + 1] = y1; dst[o1 + 2] = z1;
+        dst[o1 + 3] = cr; dst[o1 + 4] = cg; dst[o1 + 5] = cb; dst[o1 + 6] = ca;
+        this.edgeVertCount = idx + 2;
+        this.edgesDirty = true;
+    }
+
+    private void AddQuadFace(
+        float x0, float y0, float z0, float x1, float y1, float z1,
+        float x2, float y2, float z2, float x3, float y3, float z3,
+        float nx, float ny, float nz, int argb) {
+        int v0 = this.AddFaceVertex(x0, y0, z0, nx, ny, nz, argb);
+        int v1 = this.AddFaceVertex(x1, y1, z1, nx, ny, nz, argb);
+        int v2 = this.AddFaceVertex(x2, y2, z2, nx, ny, nz, argb);
+        int v3 = this.AddFaceVertex(x3, y3, z3, nx, ny, nz, argb);
+        this.AddFaceTriangle(v0, v1, v2);
+        this.AddFaceTriangle(v0, v2, v3);
+    }
+
+    public void AddBox(float cx, float cy, float cz, float sx, float sy, float sz, int faceArgb, int edgeArgb) {
+        float x0 = cx - sx * 0.5f; float x1 = cx + sx * 0.5f;
+        float y0 = cy - sy * 0.5f; float y1 = cy + sy * 0.5f;
+        float z0 = cz - sz * 0.5f; float z1 = cz + sz * 0.5f;
+        this.AddQuadFace(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0.0f, 0.0f, 1.0f, faceArgb);
+        this.AddQuadFace(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0.0f, 0.0f, -1.0f, faceArgb);
+        this.AddQuadFace(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0.0f, 1.0f, 0.0f, faceArgb);
+        this.AddQuadFace(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0.0f, -1.0f, 0.0f, faceArgb);
+        this.AddQuadFace(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1.0f, 0.0f, 0.0f, faceArgb);
+        this.AddQuadFace(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1.0f, 0.0f, 0.0f, faceArgb);
+
+        this.AddEdgeSegment(x0, y0, z0, x1, y0, z0, edgeArgb);
+        this.AddEdgeSegment(x1, y0, z0, x1, y0, z1, edgeArgb);
+        this.AddEdgeSegment(x1, y0, z1, x0, y0, z1, edgeArgb);
+        this.AddEdgeSegment(x0, y0, z1, x0, y0, z0, edgeArgb);
+        this.AddEdgeSegment(x0, y1, z0, x1, y1, z0, edgeArgb);
+        this.AddEdgeSegment(x1, y1, z0, x1, y1, z1, edgeArgb);
+        this.AddEdgeSegment(x1, y1, z1, x0, y1, z1, edgeArgb);
+        this.AddEdgeSegment(x0, y1, z1, x0, y1, z0, edgeArgb);
+        this.AddEdgeSegment(x0, y0, z0, x0, y1, z0, edgeArgb);
+        this.AddEdgeSegment(x1, y0, z0, x1, y1, z0, edgeArgb);
+        this.AddEdgeSegment(x1, y0, z1, x1, y1, z1, edgeArgb);
+        this.AddEdgeSegment(x0, y0, z1, x0, y1, z1, edgeArgb);
+    }
+
+    public void AddCylinder(float cx, float cy, float cz, float radius, float height, int segments, int faceArgb, int edgeArgb) {
+        int segs = segments < 8 ? 8 : segments;
+        float y0 = cy - height * 0.5f;
+        float y1 = cy + height * 0.5f;
+        int topCenter = this.AddFaceVertex(cx, y1, cz, 0.0f, 1.0f, 0.0f, faceArgb);
+        int botCenter = this.AddFaceVertex(cx, y0, cz, 0.0f, -1.0f, 0.0f, faceArgb);
+        double step = 6.283185307179586 / (double)segs;
+
+        for (int i = 0; i < segs; i++) {
+            double a0 = step * (double)i;
+            double a1 = step * (double)(i + 1);
+            float c0 = (float)Math.Cos(a0); float s0 = (float)Math.Sin(a0);
+            float c1 = (float)Math.Cos(a1); float s1 = (float)Math.Sin(a1);
+            float x0 = cx + radius * c0; float z0 = cz + radius * s0;
+            float x1 = cx + radius * c1; float z1 = cz + radius * s1;
+
+            int sv0 = this.AddFaceVertex(x0, y0, z0, c0, 0.0f, s0, faceArgb);
+            int sv1 = this.AddFaceVertex(x1, y0, z1, c1, 0.0f, s1, faceArgb);
+            int sv2 = this.AddFaceVertex(x1, y1, z1, c1, 0.0f, s1, faceArgb);
+            int sv3 = this.AddFaceVertex(x0, y1, z0, c0, 0.0f, s0, faceArgb);
+            this.AddFaceTriangle(sv0, sv1, sv2);
+            this.AddFaceTriangle(sv0, sv2, sv3);
+
+            int tv0 = this.AddFaceVertex(x0, y1, z0, 0.0f, 1.0f, 0.0f, faceArgb);
+            int tv1 = this.AddFaceVertex(x1, y1, z1, 0.0f, 1.0f, 0.0f, faceArgb);
+            this.AddFaceTriangle(topCenter, tv1, tv0);
+
+            int bv0 = this.AddFaceVertex(x0, y0, z0, 0.0f, -1.0f, 0.0f, faceArgb);
+            int bv1 = this.AddFaceVertex(x1, y0, z1, 0.0f, -1.0f, 0.0f, faceArgb);
+            this.AddFaceTriangle(botCenter, bv0, bv1);
+
+            this.AddEdgeSegment(x0, y1, z0, x1, y1, z1, edgeArgb);
+            this.AddEdgeSegment(x0, y0, z0, x1, y0, z1, edgeArgb);
+        }
+    }
+
+    public void AddExtrudedPrism(List<double> xs, List<double> ys, float z0, float z1, int faceArgb, int edgeArgb) {
+        int n = xs.Count < ys.Count ? xs.Count : ys.Count;
+        if (n < 3) { return; }
+        int topBase = this.faceVertCount;
+        for (int i = 0; i < n; i++) {
+            this.AddFaceVertex((float)xs[i], (float)ys[i], z1, 0.0f, 0.0f, 1.0f, faceArgb);
+        }
+        int botBase = this.faceVertCount;
+        for (int i = 0; i < n; i++) {
+            this.AddFaceVertex((float)xs[i], (float)ys[i], z0, 0.0f, 0.0f, -1.0f, faceArgb);
+        }
+        for (int i = 1; i < n - 1; i++) {
+            this.AddFaceTriangle(topBase, topBase + i, topBase + i + 1);
+            this.AddFaceTriangle(botBase, botBase + i + 1, botBase + i);
+        }
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            float ax = (float)xs[i]; float ay = (float)ys[i];
+            float bx = (float)xs[j]; float by = (float)ys[j];
+            float dx = bx - ax; float dy = by - ay;
+            float len = (float)Math.Sqrt((double)(dx * dx + dy * dy));
+            float nx = len > 1e-6f ? (dy / len) : 0.0f;
+            float ny = len > 1e-6f ? (-dx / len) : 1.0f;
+            this.AddQuadFace(ax, ay, z0, bx, by, z0, bx, by, z1, ax, ay, z1, nx, ny, 0.0f, faceArgb);
+            this.AddEdgeSegment(ax, ay, z0, bx, by, z0, edgeArgb);
+            this.AddEdgeSegment(ax, ay, z1, bx, by, z1, edgeArgb);
+            this.AddEdgeSegment(ax, ay, z0, ax, ay, z1, edgeArgb);
+        }
+    }
+
+    public void Upload() {
+        if (this.handle <= 0) { return; }
+        if (this.facesDirty) {
+            CadNative.zan_gui_cad_mesh3d_upload_faces(
+                this.handle, this.faceVertBuf, this.faceVertCount, this.faceIdxBuf, this.faceIdxCount);
+            this.facesDirty = false;
+        }
+        if (this.edgesDirty) {
+            CadNative.zan_gui_cad_mesh3d_upload_edges(
+                this.handle, this.edgeVertBuf, this.edgeVertCount, 0, 0);
+            this.edgesDirty = false;
+        }
+    }
+
+    public void Dispose() {
+        if (this.handle > 0) {
+            CadNative.zan_gui_cad_mesh3d_destroy(this.handle);
+            this.handle = 0;
+        }
+        if (this.faceVertBuf != 0) { NativeMemory.Free(this.faceVertBuf); this.faceVertBuf = 0; }
+        if (this.faceIdxBuf != 0) { NativeMemory.Free(this.faceIdxBuf); this.faceIdxBuf = 0; }
+        if (this.edgeVertBuf != 0) { NativeMemory.Free(this.edgeVertBuf); this.edgeVertBuf = 0; }
+        this.faceVertCap = 0; this.faceVertCount = 0;
+        this.faceIdxCap = 0; this.faceIdxCount = 0;
+        this.edgeVertCap = 0; this.edgeVertCount = 0;
+    }
+}

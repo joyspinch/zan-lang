@@ -502,7 +502,7 @@ void emit_site_tyname_table(zan_irgen_t *g) {
     LLVMValueRef *nptr =
         (LLVMValueRef *)calloc((size_t)k + 1, sizeof(LLVMValueRef));
     for (int j = 0; j < k; j++)
-      nptr[j] = zan_irgen_intern_string(g, names[j]);
+      nptr[j] = zan_irgen_intern_type_name(g, names[j]);
     nptr[k] = LLVMConstNull(i8ptr);
     int hit = -1;
     for (int c = 0; c < tn_cnt; c++) {

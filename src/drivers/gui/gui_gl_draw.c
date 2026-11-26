@@ -1,8 +1,19 @@
 /* gui_gl_draw.c -- OpenGL 2D 几何与矢量图元栅格化（矩形、圆角、渐变、阴影、圆/弧、多段线） */
 
+static int zgl_covers_full_surface(const zan_surface_t *s, int x, int y, int w, int h) {
+    return x <= 0 && y <= 0 && x + w >= s->width && y + h >= s->height
+        && s->clip_x0 <= 0 && s->clip_y0 <= 0
+        && s->clip_x1 >= s->width && s->clip_y1 >= s->height;
+}
+
 static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     if (w <= 0 || h <= 0) return;
     int opaque = (((c >> 24) & 0xFF) == 255);
+    int full = zgl_covers_full_surface(s, x, y, w, h);
+    if (full && g_gl_state > 0) {
+        zgl_target *t0 = zgl_target_of(s);
+        if (t0) t0->cpu_ahead = 0;
+    }
     zgl_mode want = (opaque && g_zgl.count && g_zgl.target == s && g_zgl.mode == ZGL_MODE_BLEND)
                     ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE;
     if (!zgl_begin(s, want)) { cpu_clear_rect(s, x, y, w, h, c); return; }
@@ -10,20 +21,42 @@ static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     if (t) {
         if (!opaque) {
             t->opaque_dst = 0;
-        } else if (x <= 0 && y <= 0 && x + w >= s->width && y + h >= s->height
-                   && s->clip_x0 <= 0 && s->clip_y0 <= 0
-                   && s->clip_x1 >= s->width && s->clip_y1 >= s->height) {
+        } else if (full) {
             t->opaque_dst = 1;
         }
     }
     zgl_rect_quad(s, x, y, w, h, 0, ZAN_CORNERS_ALL, 0, -1, c, c, 0, 0);
+    if (t && full && (opaque || want == ZGL_MODE_REPLACE)) {
+        zgl_target_reset_base_clear(t, c);
+    }
 }
 
 static void gl_fill_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     if (w <= 0 || h <= 0) return;
-    if (((c >> 24) & 0xFF) == 0) return;
+    u32 a = (c >> 24) & 0xFF;
+    if (a == 0) return;
+    if (a == 255 && g_gl_state > 0) {
+        zgl_target *t0 = zgl_target_of(s);
+        if (t0 && !t0->cpu_ahead && t0->base_kind == 1 && t0->base_color == c) {
+            int cx0 = x > s->clip_x0 ? x : s->clip_x0;
+            int cy0 = y > s->clip_y0 ? y : s->clip_y0;
+            int cx1 = (x + w) < s->clip_x1 ? (x + w) : s->clip_x1;
+            int cy1 = (y + h) < s->clip_y1 ? (y + h) : s->clip_y1;
+            if (cx1 > cx0 && cy1 > cy0 && zgl_target_tiles_clean(t0, cx0, cy0, cx1, cy1)) {
+                return;
+            }
+        }
+    }
+    int full_opaque = (a == 255 && zgl_covers_full_surface(s, x, y, w, h));
+    if (full_opaque && g_gl_state > 0) {
+        zgl_target *t0 = zgl_target_of(s);
+        if (t0) t0->cpu_ahead = 0;
+    }
     if (!zgl_begin(s, ZGL_MODE_BLEND)) { cpu_fill_rect(s, x, y, w, h, c); return; }
+    zgl_target *t = full_opaque ? zgl_target_of(s) : NULL;
+    if (t) t->opaque_dst = 1;
     zgl_rect_quad(s, x, y, w, h, 0, ZAN_CORNERS_ALL, 0, -1, c, c, 0, 0);
+    if (t) zgl_target_reset_base_clear(t, c);
 }
 
 static void gl_fill_round(zan_surface_t *s, int x, int y, int w, int h,
@@ -77,8 +110,17 @@ static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 top, u32 bottom) {
     /* opaque=1 forces src.a=1.0, so ZGL_MODE_BLEND produces bit-identical output
      * to ZGL_MODE_REPLACE while preserving batching with neighboring primitives. */
+    int full_opaque = (radius <= 0 && zgl_covers_full_surface(s, x, y, w, h));
+    if (full_opaque && g_gl_state > 0) {
+        zgl_target *t0 = zgl_target_of(s);
+        if (t0) t0->cpu_ahead = 0;
+    }
     if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         cpu_fill_vgrad(s, x, y, w, h, radius, corners, top, bottom); return;
+    }
+    if (full_opaque) {
+        zgl_target *t = zgl_target_of(s);
+        if (t) t->opaque_dst = 1;
     }
     zgl_rect_quad(s, x, y, w, h, radius, corners, 0, ZAN_GRAD_VERTICAL,
                   top, bottom, 0, 1);
@@ -87,9 +129,22 @@ static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
 static void gl_fill_grad(zan_surface_t *s, int x, int y, int w, int h,
                          int radius, int corners, int dir,
                          u32 from, u32 via, u32 to) {
+    int full_opaque = (radius <= 0
+                       && ((from >> 24) & 0xFF) == 255
+                       && ((to >> 24) & 0xFF) == 255
+                       && (via == 0 || ((via >> 24) & 0xFF) == 255)
+                       && zgl_covers_full_surface(s, x, y, w, h));
+    if (full_opaque && g_gl_state > 0) {
+        zgl_target *t0 = zgl_target_of(s);
+        if (t0) t0->cpu_ahead = 0;
+    }
     if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         cpu_fill_grad(s, x, y, w, h, radius, corners, dir, from, via, to);
         return;
+    }
+    if (full_opaque) {
+        zgl_target *t = zgl_target_of(s);
+        if (t) t->opaque_dst = 1;
     }
     zgl_rect_quad(s, x, y, w, h, radius, corners, 0, dir, from, to, via, 0);
 }
@@ -296,6 +351,7 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
         return;
     }
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->cov_fbo);
+    g_zgl.st_fbo = t->cov_fbo;
     gl.Enable(ZGL_SCISSOR_TEST);
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -388,6 +444,7 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
         return;
     }
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->cov_fbo);
+    g_zgl.st_fbo = t->cov_fbo;
     gl.Enable(ZGL_SCISSOR_TEST);
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);

@@ -47,14 +47,99 @@ typedef struct {
     int opaque_dst;
     unsigned char *shadow;
     int shadow_valid;
+    int base_kind;         /* 0=unknown, 1=clear_color, 2=snapshot */
+    int base_slot;
+    uint64_t base_gen;
+    u32 base_color;
+    int base_x0, base_y0, base_x1, base_y1;
+    uint64_t mut_tiles[32]; /* 64x32 spatial tile dirty mask over [0..w, 0..h] */
 } zgl_target;
 
 static zgl_target g_zgl_targets[64];
+static uint64_t g_zgl_snap_gen = 1;
+
+static void zgl_target_invalidate_base(zgl_target *t) {
+    if (!t) return;
+    t->base_kind = 0;
+    memset(t->mut_tiles, 0xFF, sizeof(t->mut_tiles));
+}
+
+static void zgl_target_reset_base_clear(zgl_target *t, u32 color) {
+    if (!t) return;
+    t->base_kind = 1;
+    t->base_slot = -1;
+    t->base_gen = 0;
+    t->base_color = color;
+    t->base_x0 = 0;
+    t->base_y0 = 0;
+    t->base_x1 = t->w;
+    t->base_y1 = t->h;
+    memset(t->mut_tiles, 0, sizeof(t->mut_tiles));
+}
+
+static void zgl_target_reset_base_snap(zgl_target *t, int slot, uint64_t gen,
+                                       int x0, int y0, int x1, int y1) {
+    if (!t) return;
+    t->base_kind = 2;
+    t->base_slot = slot;
+    t->base_gen = gen;
+    t->base_color = 0;
+    t->base_x0 = x0;
+    t->base_y0 = y0;
+    t->base_x1 = x1;
+    t->base_y1 = y1;
+    memset(t->mut_tiles, 0, sizeof(t->mut_tiles));
+}
+
+static void zgl_target_mark_dirty(zgl_target *t, int x0, int y0, int x1, int y1) {
+    if (!t || t->base_kind == 0 || t->w <= 0 || t->h <= 0) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > t->w) x1 = t->w;
+    if (y1 > t->h) y1 = t->h;
+    if (x1 <= x0 || y1 <= y0) return;
+    int tx0 = (int)(((int64_t)x0 * 64) / t->w);
+    int tx1 = (int)(((int64_t)(x1 - 1) * 64) / t->w);
+    int ty0 = (int)(((int64_t)y0 * 32) / t->h);
+    int ty1 = (int)(((int64_t)(y1 - 1) * 32) / t->h);
+    if (tx0 < 0) tx0 = 0;
+    if (tx1 > 63) tx1 = 63;
+    if (ty0 < 0) ty0 = 0;
+    if (ty1 > 31) ty1 = 31;
+    uint64_t mask = (tx1 - tx0 >= 63)
+        ? ~((uint64_t)0)
+        : ((((uint64_t)1 << (tx1 - tx0 + 1)) - 1) << tx0);
+    for (int ty = ty0; ty <= ty1; ty++) {
+        t->mut_tiles[ty] |= mask;
+    }
+}
+
+static int zgl_target_tiles_clean(const zgl_target *t, int x0, int y0, int x1, int y1) {
+    if (!t || t->base_kind == 0 || t->w <= 0 || t->h <= 0) return 0;
+    if (x0 < t->base_x0 || y0 < t->base_y0 || x1 > t->base_x1 || y1 > t->base_y1) return 0;
+    if (x1 <= x0 || y1 <= y0) return 1;
+    int tx0 = (int)(((int64_t)x0 * 64) / t->w);
+    int tx1 = (int)(((int64_t)(x1 - 1) * 64) / t->w);
+    int ty0 = (int)(((int64_t)y0 * 32) / t->h);
+    int ty1 = (int)(((int64_t)(y1 - 1) * 32) / t->h);
+    if (tx0 < 0) tx0 = 0;
+    if (tx1 > 63) tx1 = 63;
+    if (ty0 < 0) ty0 = 0;
+    if (ty1 > 31) ty1 = 31;
+    uint64_t mask = (tx1 - tx0 >= 63)
+        ? ~((uint64_t)0)
+        : ((((uint64_t)1 << (tx1 - tx0 + 1)) - 1) << tx0);
+    for (int ty = ty0; ty <= ty1; ty++) {
+        if (t->mut_tiles[ty] & mask) return 0;
+    }
+    return 1;
+}
 
 /* Like the CPU cache, slots are global and the latest capture owns the slot. */
 typedef struct {
     zgl_uint tex, fbo;
     int sid, x, y, w, h, opaque;
+    uint64_t gen;
 } zgl_snapshot;
 static zgl_snapshot g_zgl_snapshots[ZAN_SNAP_CACHE_MAX_SLOTS];
 
@@ -71,14 +156,18 @@ static void zgl_snapshots_drop_surface(int sid) {
     }
 }
 
-/* GPU 模糊缓存：按 slot 复用 Dual-Kawase 结果纹理，dirty == 0 时跳过降采样与多趟模糊直出合成。 */
-#define ZGL_BLUR_CACHE_SLOTS 32
+/* GPU 模糊缓存：按 slot 复用 Dual-Kawase 结果纹理，背景瓦片未变更或 dirty == 0 时跳过降采样与多趟模糊直出合成。 */
+#define ZGL_BLUR_CACHE_SLOTS 64
 typedef struct {
     zgl_uint tex, fbo;
     int valid;
     int sid, x, y, w, h, radius;
     int bw, bh;
     float cu0, cv0, cu1, cv1;
+    int base_kind;
+    int base_slot;
+    uint64_t base_gen;
+    u32 base_color;
 } zgl_blur_cache_entry;
 static zgl_blur_cache_entry g_zgl_blurs[ZGL_BLUR_CACHE_SLOTS];
 
@@ -116,13 +205,15 @@ static struct {
     zgl_uint bitmap_tex;
     float   *verts;
     size_t   count, cap;             /* in floats */
-    size_t   vbo_bytes;
+    size_t   vbo_cap_verts;          /* streaming VBO ring capacity in vertices */
+    size_t   vbo_vert_off;           /* current write cursor in vertices */
     int      has_shader_over;
     float    over_x0, over_y0, over_x1, over_y1;
     zgl_mode mode;
     zan_surface_t *target;
     int      is_gles;
     /* Lightweight GL state cache to avoid redundant driver calls across flushes */
+    zgl_uint st_fbo;
     zgl_uint st_prog;
     zgl_uint st_vao;
     int      st_vp_w, st_vp_h;
@@ -132,6 +223,7 @@ static struct {
 } g_zgl;
 
 static void zgl_invalidate_state(void) {
+    g_zgl.st_fbo = 0;
     g_zgl.st_prog = 0;
     g_zgl.st_vao = 0;
     g_zgl.st_vp_w = 0;
@@ -150,6 +242,7 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
         return NULL;
     zgl_target *t = &g_zgl_targets[s->id];
     if (t->fbo && (t->w != s->width || t->h != s->height)) {
+        if (g_zgl.st_fbo == t->fbo || g_zgl.st_fbo == t->cov_fbo) g_zgl.st_fbo = 0;
         zgl_snapshots_drop_surface(s->id);
         gl.DeleteFramebuffers(1, &t->fbo);
         gl.DeleteTextures(1, &t->tex);
@@ -179,8 +272,19 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
         }
         t->w = s->width;
         t->h = s->height;
-        t->shadow = (unsigned char *)malloc((size_t)s->width * (size_t)s->height * 4);
-        t->cpu_ahead = 1;
+        /* Lazy shadow allocation: pure-GPU surfaces never allocate a CPU shadow
+         * copy or upload empty zeroed tiles on create/resize. */
+        t->shadow = NULL;
+        t->shadow_valid = 0;
+        if (s->painted) {
+            t->cpu_ahead = 1;
+        } else {
+            gl.Disable(ZGL_SCISSOR_TEST);
+            gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            gl.Clear(ZGL_COLOR_BUFFER_BIT);
+            t->cpu_ahead = 0;
+        }
+        g_zgl.st_fbo = t->fbo;
     }
     return t;
 }
@@ -210,6 +314,10 @@ static int zgl_tile_dirty(zan_surface_t *s, zgl_target *t,
 
 static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     if (!t->cpu_ahead) return;
+    if (!t->shadow && s->width > 0 && s->height > 0) {
+        t->shadow = (unsigned char *)malloc((size_t)s->width * (size_t)s->height * 4);
+        t->shadow_valid = 0;
+    }
     gl.BindTexture(ZGL_TEXTURE_2D, t->tex);
     gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
     if (!t->shadow) {
@@ -220,6 +328,7 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
         }
         t->cpu_ahead = 0;
         t->opaque_dst = 0;
+        zgl_target_invalidate_base(t);
         return;
     }
     u32 tile[ZGL_TILE * ZGL_TILE];
@@ -240,6 +349,7 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     t->shadow_valid = 1;
     t->cpu_ahead = 0;
     t->opaque_dst = 0;
+    zgl_target_invalidate_base(t);
 }
 
 static unsigned char *g_zgl_rb = NULL;
@@ -249,6 +359,7 @@ static void zgl_readback(zan_surface_t *s, zgl_target *t) {
     if (!t->gpu_ahead) return;
     if (s->width <= 0 || s->height <= 0) return;
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    g_zgl.st_fbo = t->fbo;
     size_t row = (size_t)s->width * 4;
     size_t need = row * (size_t)s->height;
     if (need > g_zgl_rb_cap) {
@@ -322,7 +433,10 @@ static void zgl_flush(void) {
     }
 
     zgl_uint want_fbo = (g_zgl.mode == ZGL_MODE_UNION) ? t->cov_fbo : t->fbo;
-    gl.BindFramebuffer(ZGL_FRAMEBUFFER, want_fbo);
+    if (g_zgl.st_fbo != want_fbo) {
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, want_fbo);
+        g_zgl.st_fbo = want_fbo;
+    }
     if (g_zgl.st_vp_w != t->w || g_zgl.st_vp_h != t->h) {
         gl.Viewport(0, 0, t->w, t->h);
         g_zgl.st_vp_w = t->w;
@@ -334,15 +448,32 @@ static void zgl_flush(void) {
         g_zgl.st_vao = want_vao;
     }
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    size_t vbytes = g_zgl.count * sizeof(float);
-    if (gl.BufferSubData && vbytes <= g_zgl.vbo_bytes) {
-        gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)g_zgl.vbo_bytes,
-                      NULL, ZGL_STREAM_DRAW);
-        gl.BufferSubData(ZGL_ARRAY_BUFFER, 0, (zgl_sizeiptr)vbytes, g_zgl.verts);
+    const size_t vstride = (size_t)ZGL_VF * sizeof(float);
+    size_t nverts = g_zgl.count / ZGL_VF;
+    size_t vbytes = nverts * vstride;
+    zgl_int first_vert = 0;
+    if (gl.BufferSubData) {
+        if (nverts > g_zgl.vbo_cap_verts) {
+            size_t new_cap = 16384; /* ~2.2 MiB streaming ring */
+            while (new_cap < nverts) new_cap *= 2;
+            gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)(new_cap * vstride),
+                          NULL, ZGL_STREAM_DRAW);
+            g_zgl.vbo_cap_verts = new_cap;
+            g_zgl.vbo_vert_off = 0;
+        } else if (g_zgl.vbo_vert_off + nverts > g_zgl.vbo_cap_verts) {
+            gl.BufferData(ZGL_ARRAY_BUFFER,
+                          (zgl_sizeiptr)(g_zgl.vbo_cap_verts * vstride),
+                          NULL, ZGL_STREAM_DRAW);
+            g_zgl.vbo_vert_off = 0;
+        }
+        first_vert = (zgl_int)g_zgl.vbo_vert_off;
+        gl.BufferSubData(ZGL_ARRAY_BUFFER,
+                         (zgl_sizeiptr)(g_zgl.vbo_vert_off * vstride),
+                         (zgl_sizeiptr)vbytes, g_zgl.verts);
+        g_zgl.vbo_vert_off += nverts;
     } else {
         gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)vbytes,
                       g_zgl.verts, ZGL_STREAM_DRAW);
-        g_zgl.vbo_bytes = vbytes;
     }
     int shader_over = g_zgl.has_shader_over;
     static zgl_uint snap_tex, snap_fbo; static int snap_w, snap_h;
@@ -464,7 +595,7 @@ static void zgl_flush(void) {
         }
     }
 
-    gl.DrawArrays(ZGL_TRIANGLES, 0, (zgl_sizei)(g_zgl.count / ZGL_VF));
+    gl.DrawArrays(ZGL_TRIANGLES, first_vert, (zgl_sizei)nverts);
     g_zgl.count = 0;
     g_zgl.has_shader_over = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
@@ -511,6 +642,12 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
     if (x1 > cx1) x1 = cx1;
     if (y1 > cy1) y1 = cy1;
     if (x1 <= x0 || y1 <= y0) return;
+
+    if (g_zgl.mode != ZGL_MODE_UNION && s->id >= 0 && s->id < 64) {
+        zgl_target_mark_dirty(&g_zgl_targets[s->id],
+                              (int)floorf(x0), (int)floorf(y0),
+                              (int)ceilf(x1), (int)ceilf(y1));
+    }
 
     if (q->kind == ZGL_K_UNION || q->kind == ZGL_K_SURFACE) {
         if (!g_zgl.has_shader_over) {
@@ -759,6 +896,7 @@ static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) 
         }
     }
     c->sid = s->id; c->x = x0; c->y = y0; c->w = rw; c->h = rh; c->opaque = t->opaque_dst;
+    c->gen = ++g_zgl_snap_gen;
     /* Snapshot and patch ignore the drawing clip; restore applies it below. */
     gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
@@ -766,6 +904,7 @@ static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) 
     gl.BlitFramebuffer(x0, t->h - y1, x1, t->h - y0, 0, 0, rw, rh,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    g_zgl.st_fbo = t->fbo;
 }
 
 static void gl_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h, int slot) {
@@ -779,6 +918,7 @@ static void gl_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h, int 
     if (x1 <= x0 || y1 <= y0 || x0 < c->x || y0 < c->y
         || x1 > c->x + c->w || y1 > c->y + c->h) return;
     if (!t->opaque_dst) c->opaque = 0;
+    c->gen = ++g_zgl_snap_gen;
     gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
     gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, c->fbo);
@@ -787,6 +927,7 @@ static void gl_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h, int 
                        x1 - c->x, c->y + c->h - y0,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    g_zgl.st_fbo = t->fbo;
 }
 
 static int gl_restore(zan_surface_t *s, int x, int y, int w, int h, int slot, int sub_rect) {
@@ -821,7 +962,10 @@ static int gl_restore(zan_surface_t *s, int x, int y, int w, int h, int slot, in
                        x0, t->h - y1, x1, t->h - y0,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    g_zgl.st_fbo = t->fbo;
     if (!c->opaque) t->opaque_dst = 0;
+    else if (x0 <= 0 && y0 <= 0 && x1 >= t->w && y1 >= t->h) t->opaque_dst = 1;
+    zgl_target_reset_base_snap(t, slot, c->gen, x0, y0, x1, y1);
     t->gpu_ahead = 1;
     t->cpu_ahead = 0;
     return 1;
@@ -860,6 +1004,7 @@ static int gl_present(zan_surface_t *s, void *native_window) {
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
     zan_gl_ctx_present_end(native_window);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    g_zgl.st_fbo = t->fbo;
     return 1;
 }
 
@@ -876,6 +1021,7 @@ static void gl_drop_surface(zan_surface_t *s) {
         if (g_zgl.target == s) zgl_flush();
         if (!zan_gl_ctx_make_current()) return;
         zgl_cleanup_extensions(s->id);
+        if (g_zgl.st_fbo == t->fbo || g_zgl.st_fbo == t->cov_fbo) g_zgl.st_fbo = 0;
         gl.DeleteFramebuffers(1, &t->fbo);
         gl.DeleteTextures(1, &t->tex);
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
@@ -1193,6 +1339,7 @@ static int zgl_ensure_blur_targets(int need_w, int need_h) {
     }
     g_zgl.blur_cap_w = cw;
     g_zgl.blur_cap_h = ch;
+    g_zgl.st_fbo = 0;
     return 1;
 }
 
@@ -1218,6 +1365,7 @@ static int zgl_ensure_blur_cache_slot(zgl_blur_cache_entry *c, int bw, int bh) {
     }
     c->bw = bw;
     c->bh = bh;
+    g_zgl.st_fbo = 0;
     return 1;
 }
 
@@ -1242,16 +1390,43 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     if (!t) return;
     zgl_upload(s, t);
 
+    int pad = clamp_i(radius, 2, 32);
+    int sx0 = clamp_i(x0 - pad, 0, s->width);
+    int sy0 = clamp_i(y0 - pad, 0, s->height);
+    int sx1 = clamp_i(x1 + pad, 0, s->width);
+    int sy1 = clamp_i(y1 + pad, 0, s->height);
+    int sw = sx1 - sx0;
+    int sh = sy1 - sy0;
+
+    int tiles_clean = (t->base_kind != 0 && zgl_target_tiles_clean(t, sx0, sy0, sx1, sy1));
     zgl_blur_cache_entry *ce =
         (slot >= 0 && slot < ZGL_BLUR_CACHE_SLOTS) ? &g_zgl_blurs[slot] : NULL;
-    if (ce && !dirty && ce->valid && ce->tex
+    int cache_hit = 0;
+    if (ce && ce->valid && ce->tex
         && ce->sid == s->id && ce->x == x && ce->y == y
         && ce->w == w && ce->h == h && ce->radius == radius) {
+        if (!dirty) {
+            cache_hit = 1;
+        } else if (tiles_clean && ce->base_kind == t->base_kind
+                   && ce->base_slot == t->base_slot
+                   && ce->base_gen == t->base_gen
+                   && ce->base_color == t->base_color) {
+            cache_hit = 1;
+        }
+    }
+    if (cache_hit) {
         /* 命中 GPU 模糊缓存：跳过降采样与 Dual-Kawase 多趟过滤，直接合成上屏。 */
         gl.Disable(ZGL_SCISSOR_TEST);
         gl.BindVertexArray(g_zgl.blur_vao);
-        gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-        gl.Viewport(0, 0, t->w, t->h);
+        if (g_zgl.st_fbo != t->fbo) {
+            gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+            g_zgl.st_fbo = t->fbo;
+        }
+        if (g_zgl.st_vp_w != t->w || g_zgl.st_vp_h != t->h) {
+            gl.Viewport(0, 0, t->w, t->h);
+            g_zgl.st_vp_w = t->w;
+            g_zgl.st_vp_h = t->h;
+        }
         gl.Enable(ZGL_BLEND);
         gl.BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
         gl.UseProgram(g_zgl.prog_blur_comp);
@@ -1267,25 +1442,26 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
         gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
         gl.BindVertexArray(g_zgl.vao);
         gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-        zgl_invalidate_state();
+        g_zgl.st_vao = g_zgl.vao;
+        g_zgl.st_prog = 0;
+        g_zgl.st_blend = 0;
         g_zgl.mode = ZGL_MODE_NONE;
+        zgl_target_mark_dirty(t, x0, y0, x1, y1);
         t->gpu_ahead = 1;
         s->painted = 1;
         return;
     }
 
-    int pad = clamp_i(radius, 2, 32);
-    int sx0 = clamp_i(x0 - pad, 0, s->width);
-    int sy0 = clamp_i(y0 - pad, 0, s->height);
-    int sx1 = clamp_i(x1 + pad, 0, s->width);
-    int sy1 = clamp_i(y1 + pad, 0, s->height);
-    int sw = sx1 - sx0;
-    int sh = sy1 - sy0;
-    int bw = (sw + 1) / 2;
-    int bh = (sh + 1) / 2;
+    int hw = (sw + 1) / 2;
+    int hh = (sh + 1) / 2;
+    if (hw < 1) hw = 1;
+    if (hh < 1) hh = 1;
+    int use_quarter = (radius >= 16 && sw >= 32 && sh >= 32);
+    int bw = use_quarter ? (hw + 1) / 2 : hw;
+    int bh = use_quarter ? (hh + 1) / 2 : hh;
     if (bw < 1) bw = 1;
     if (bh < 1) bh = 1;
-    if (!zgl_ensure_blur_targets(bw, bh)) {
+    if (!zgl_ensure_blur_targets(hw, hh)) {
         gl_sync_to_cpu(s);
         cpu_blur(s, x, y, w, h, radius, slot, dirty, corner_radius, corner_mask);
         return;
@@ -1296,7 +1472,7 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     float inv_cw = 1.0f / (float)g_zgl.blur_cap_w;
     float inv_ch = 1.0f / (float)g_zgl.blur_cap_h;
 
-    /* Pass 0: Downsample t->tex sub-rect into blur_fbo[0] */
+    /* Pass 0: Downsample t->tex sub-rect into blur_fbo[0] at half-res (hw x hh) */
     gl.Disable(ZGL_BLEND);
     gl.Disable(ZGL_SCISSOR_TEST);
     gl.BindVertexArray(g_zgl.blur_vao);
@@ -1311,7 +1487,7 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     float src_v0 = (float)(s->height - sy1) * inv_th;
     float src_v1 = (float)(s->height - sy0) * inv_th;
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[0]);
-    gl.Viewport(0, 0, bw, bh);
+    gl.Viewport(0, 0, hw, hh);
     gl.Uniform1i(g_zgl.u_blur_tex, 0);
     gl.Uniform4f(g_zgl.u_blur_uvrect, src_u0, src_v0, src_u1, src_v1);
     gl.Uniform2f(g_zgl.u_blur_step, inv_tw, inv_th);
@@ -1323,12 +1499,30 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
 
-    /* Passes 1..K: Dual-Kawase ping-pong tent filter */
-    int passes = (radius <= 5) ? 1 : (radius <= 14) ? 2 : 3;
     int cur = 0;
+    if (use_quarter) {
+        /* Pass 0b: Downsample 1/2-res -> 1/4-res into blur_fbo[1] for heavy glass blurs */
+        float h_max_u = (float)hw * inv_cw;
+        float h_max_v = (float)hh * inv_ch;
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[1]);
+        gl.Viewport(0, 0, bw, bh);
+        gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[0]);
+        gl.Uniform4f(g_zgl.u_blur_uvrect, 0.0f, 0.0f, h_max_u, h_max_v);
+        gl.Uniform2f(g_zgl.u_blur_step, inv_cw, inv_ch);
+        gl.Uniform4f(g_zgl.u_blur_clamp, 0.5f * inv_cw, 0.5f * inv_ch,
+                     h_max_u - 0.5f * inv_cw, h_max_v - 0.5f * inv_ch);
+        gl.Uniform1i(g_zgl.u_blur_mode, 0);
+        gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
+        cur = 1;
+    }
+
+    /* Passes 1..K: Dual-Kawase ping-pong tent filter */
+    int passes = use_quarter ? 2 : ((radius <= 5) ? 1 : (radius <= 14) ? 2 : 3);
     float max_u = (float)bw * inv_cw;
     float max_v = (float)bh * inv_ch;
-    float base_off = (float)radius * 0.16f + 0.5f;
+    float base_off = use_quarter
+        ? ((float)radius * 0.08f + 0.5f)
+        : ((float)radius * 0.16f + 0.5f);
     int cached_out = (ce != NULL && zgl_ensure_blur_cache_slot(ce, bw, bh));
     for (int i = 0; i < passes; i++) {
         int nxt = 1 - cur;
@@ -1360,6 +1554,17 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
         ce->x = x; ce->y = y; ce->w = w; ce->h = h;
         ce->radius = radius;
         ce->cu0 = cu0; ce->cv0 = cv0; ce->cu1 = cu1; ce->cv1 = cv1;
+        if (tiles_clean) {
+            ce->base_kind = t->base_kind;
+            ce->base_slot = t->base_slot;
+            ce->base_gen = t->base_gen;
+            ce->base_color = t->base_color;
+        } else {
+            ce->base_kind = 0;
+            ce->base_slot = -1;
+            ce->base_gen = 0;
+            ce->base_color = 0;
+        }
     } else {
         cu0 = ((float)(x - sx0) / (float)sw) * max_u;
         cu1 = ((float)(x + w - sx0) / (float)sw) * max_u;
@@ -1385,8 +1590,14 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
 
     gl.BindVertexArray(g_zgl.vao);
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    zgl_invalidate_state();
+    g_zgl.st_fbo = t->fbo;
+    g_zgl.st_vao = g_zgl.vao;
+    g_zgl.st_prog = 0;
+    g_zgl.st_vp_w = t->w;
+    g_zgl.st_vp_h = t->h;
+    g_zgl.st_blend = 0;
     g_zgl.mode = ZGL_MODE_NONE;
+    zgl_target_mark_dirty(t, x0, y0, x1, y1);
     t->gpu_ahead = 1;
     s->painted = 1;
 }
@@ -1433,10 +1644,13 @@ int zan_gui_internal_gl_install(void) {
     return 1;
 }
 
+static void zcad_drop_all(void);
+
 void zan_gui_internal_gl_drop_present(void) {
     if (g_gl_state <= 0) return;
     if (!zan_gl_ctx_make_current()) return;
     zgl_flush();
+    zcad_drop_all();
     zgl_cleanup_extensions(-1);
     ++g_gpu_epoch;
     for (int i = 0; i < ZGL_BITMAP_CAP; i++) zgl_bitmap_drop(i);
@@ -1506,3 +1720,6 @@ EXPORT u32 zan_gui_gpu_program(const char *vertex, const char *fragment) {
 EXPORT u32 zan_gui_gpu_texture(const zan_bitmap *bitmap) {
     return zgl_bitmap_tex(bitmap);
 }
+
+#include "gui_gl_cad_shaders.c"
+#include "gui_gl_cad.c"

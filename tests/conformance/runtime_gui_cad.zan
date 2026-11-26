@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+using Gui.Cad;
+
+class Program {
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_render_backend(int mode);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_create_surface(int width, int height);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_destroy_surface(int id);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_read_pixel(int id, int x, int y);
+
+    static int RunCase(int wantGpu) {
+        zan_gui_set_render_backend(wantGpu);
+        int w = 640;
+        int h = 480;
+        int sid = zan_gui_create_surface(w, h);
+        bool isGpu = CadViewport.IsGpuAccelerated(sid);
+
+        /* 1. 2D RTE 大坐标 + 解析线/圆/椭圆弧/填充 + 拾取 */
+        double rteX = 500000.125;
+        double rteY = 250000.375;
+        CadLayer2D layer = new CadLayer2D();
+        layer.SetOrigin(rteX, rteY);
+        layer.AddLine(rteX - 80.0, rteY, rteX + 80.0, rteY,
+            unchecked((int)0xFF38BDF8), 3.0f, false, CadLineType.Solid(), CadLineCap.Round(), 12.0f, 1001);
+        layer.AddCircle(rteX + 120.0, rteY, 24.0,
+            unchecked((int)0xFF22C55E), 2.0f, false, true, 2002);
+        List<double> px = new List<double>();
+        List<double> py = new List<double>();
+        px.Add(rteX - 180.0); py.Add(rteY - 40.0);
+        px.Add(rteX - 100.0); py.Add(rteY - 40.0);
+        px.Add(rteX - 100.0); py.Add(rteY + 40.0);
+        px.Add(rteX - 180.0); py.Add(rteY + 40.0);
+        layer.AddConvexPolygonFill(px, py, unchecked((int)0xCC60A5FA), CadHatchMode.Diag45(), 3003);
+        layer.Upload();
+
+        CadCamera2D cam2d = new CadCamera2D(rteX, rteY, 1.0);
+        CadViewport.DrawGrid2D(sid, cam2d, 20.0, 5,
+            unchecked((int)0xFF0F172A), unchecked((int)0xFF1E293B),
+            unchecked((int)0xFF334155), unchecked((int)0xFFEF4444), unchecked((int)0xFF22C55E));
+        layer.Draw(sid, cam2d);
+
+        int cLine = zan_gui_read_pixel(sid, w / 2, h / 2);
+        int cCircle = zan_gui_read_pixel(sid, w / 2 + 120, h / 2);
+        int cBg = zan_gui_read_pixel(sid, 12, 12);
+        if (cLine == cBg || cCircle == cBg) {
+            Console.WriteLine($"FAIL 2D raster wantGpu={wantGpu}");
+            layer.Dispose();
+            zan_gui_destroy_surface(sid);
+            return 1;
+        }
+
+        if (isGpu) {
+            int hitLine = 0;
+            if (CadViewport.PickBegin(sid, w / 2, h / 2, 4)) {
+                CadViewport.PickLayer2D(layer, cam2d);
+                hitLine = CadViewport.PickEnd();
+            }
+            int hitCircle = 0;
+            if (CadViewport.PickBegin(sid, w / 2 + 120, h / 2, 4)) {
+                CadViewport.PickLayer2D(layer, cam2d);
+                hitCircle = CadViewport.PickEnd();
+            }
+            int hitFill = 0;
+            if (CadViewport.PickBegin(sid, w / 2 - 140, h / 2, 4)) {
+                CadViewport.PickLayer2D(layer, cam2d);
+                hitFill = CadViewport.PickEnd();
+            }
+            int hitMiss = -1;
+            if (CadViewport.PickBegin(sid, 12, 12, 4)) {
+                CadViewport.PickLayer2D(layer, cam2d);
+                hitMiss = CadViewport.PickEnd();
+            }
+            if (hitLine != 1001 || hitCircle != 2002 || hitFill != 3003 || hitMiss != 0) {
+                Console.WriteLine($"FAIL 2D pick: {hitLine},{hitCircle},{hitFill},{hitMiss}");
+                layer.Dispose();
+                zan_gui_destroy_surface(sid);
+                return 2;
+            }
+        }
+        layer.Dispose();
+
+        /* 2. 3D B-Rep 实体/锐边 + 4x MSAA + 实时剖切面 + 32 位索引（>65535 顶点） */
+        if (isGpu) {
+            CadMesh3D boxA = new CadMesh3D();
+            boxA.AddBox(0.0f, 0.0f, 0.0f, 36.0f, 36.0f, 36.0f, unchecked((int)0xFF94A3B8), unchecked((int)0xFF0F172A));
+            boxA.Upload();
+
+            CadMesh3D bigMesh = new CadMesh3D();
+            /* 3000 个 Box = 72,000 顶点 (>65535，验证 32 位索引)，最后一个 Box 放在 (32, 0, 0) */
+            for (int i = 0; i < 2999; i++) {
+                bigMesh.AddBox(-300.0f, -300.0f, -300.0f, 1.0f, 1.0f, 1.0f, unchecked((int)0xFF475569), unchecked((int)0xFF0F172A));
+            }
+            bigMesh.AddBox(32.0f, 0.0f, 0.0f, 32.0f, 32.0f, 32.0f, unchecked((int)0xFF38BDF8), unchecked((int)0xFF020617));
+            bigMesh.Upload();
+
+            CadCamera3D cam3d = new CadCamera3D();
+            cam3d.Orthographic = true;
+            cam3d.OrthoHeight = 120.0;
+            cam3d.SetFrontView();
+
+            nint matA = NativeMemory.Alloc(64);
+            nint matId = NativeMemory.Alloc(64);
+            CadMat4.SetTranslation(matA, -32.0f, 0.0f, 0.0f);
+            CadMat4.SetIdentity(matId);
+
+            double pxPerUnit = (double)h / cam3d.OrthoHeight;
+            int sxA = w / 2 - (int)(32.0 * pxPerUnit);
+            int sxB = w / 2 + (int)(32.0 * pxPerUnit);
+
+            if (CadViewport.Begin3D(sid, 0, 0, w, h, unchecked((int)0xFF111827), 4, cam3d)) {
+                CadViewport.DrawMesh3D(boxA, matA, unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), CadMeshFlags.FacesAndEdges(), 5001);
+                CadViewport.DrawMesh3D(bigMesh, matId, unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), CadMeshFlags.FacesAndEdges(), 5002);
+                CadViewport.End3D(sid);
+            }
+            int pA = zan_gui_read_pixel(sid, sxA, h / 2);
+            int pB = zan_gui_read_pixel(sid, sxB, h / 2);
+            int pBg = zan_gui_read_pixel(sid, 8, 8);
+            if (pA == pBg || pB == pBg) {
+                Console.WriteLine("FAIL 3D render or 32-bit index high vertex missing");
+                boxA.Dispose(); bigMesh.Dispose();
+                NativeMemory.Free(matA); NativeMemory.Free(matId);
+                zan_gui_destroy_surface(sid);
+                return 3;
+            }
+
+            /* 启用实时剖切面 x >= 0，确认 boxA 渲染像素与拾取结果双双被剖切掉 */
+            if (CadViewport.Begin3D(sid, 0, 0, w, h, unchecked((int)0xFF111827), 4, cam3d)) {
+                CadViewport.SetClipPlane(1.0f, 0.0f, 0.0f, 0.0f);
+                CadViewport.DrawMesh3D(boxA, matA, unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), CadMeshFlags.FacesAndEdges(), 5001);
+                CadViewport.DrawMesh3D(bigMesh, matId, unchecked((int)0xFFFFFFFF), unchecked((int)0xFFFFFFFF), CadMeshFlags.FacesAndEdges(), 5002);
+                CadViewport.End3D(sid);
+            }
+            int pAClipped = zan_gui_read_pixel(sid, sxA, h / 2);
+            int pBKept = zan_gui_read_pixel(sid, sxB, h / 2);
+
+            int pickA = -1;
+            int pickB = 0;
+            if (CadViewport.PickBegin(sid, sxA, h / 2, 4)) {
+                CadViewport.PickBegin3D(0, 0, w, h, cam3d);
+                CadViewport.PickMesh3D(boxA, matA, 5001);
+                CadViewport.PickMesh3D(bigMesh, matId, 5002);
+                pickA = CadViewport.PickEnd();
+            }
+            if (CadViewport.PickBegin(sid, sxB, h / 2, 4)) {
+                CadViewport.PickBegin3D(0, 0, w, h, cam3d);
+                CadViewport.PickMesh3D(boxA, matA, 5001);
+                CadViewport.PickMesh3D(bigMesh, matId, 5002);
+                pickB = CadViewport.PickEnd();
+            }
+            CadViewport.ClearClipPlanes();
+
+            boxA.Dispose();
+            bigMesh.Dispose();
+            NativeMemory.Free(matA);
+            NativeMemory.Free(matId);
+
+            if (pAClipped != pBg || pBKept == pBg || pickA != 0 || pickB != 5002) {
+                Console.WriteLine($"FAIL 3D clip/pick: pAClipped=0x{pAClipped:X8} pBg=0x{pBg:X8} pickA={pickA} pickB={pickB}");
+                zan_gui_destroy_surface(sid);
+                return 4;
+            }
+        }
+
+        zan_gui_destroy_surface(sid);
+        return 0;
+    }
+
+    static int Main() {
+        int rGpu = RunCase(1);
+        if (rGpu != 0) { return rGpu; }
+        int rCpu = RunCase(0);
+        if (rCpu != 0) { return 10 + rCpu; }
+        Console.WriteLine("PASS runtime_gui_cad");
+        return 0;
+    }
+}

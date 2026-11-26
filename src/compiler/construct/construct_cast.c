@@ -453,12 +453,12 @@ LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
   }
   const char *tn = arc_runtime_type_name(g, tt);
   bool exact_only = (tt && tt->kind == TYPE_STRUCT);
-  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_string(g, tn), tn,
+  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_type_name(g, tn), tn,
                                     exact_only);
 }
 LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
                                    const char *tname) {
-  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_string(g, tname),
+  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_type_name(g, tname),
                                     tname, false);
 }
 LLVMValueRef emit_runtime_is_check_val(zan_irgen_t *g, LLVMValueRef x,
@@ -529,7 +529,7 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.h");
     LLVMBuildCondBr(g->builder, isnull, false_bb, head);
     LLVMPositionBuilderAtEnd(g->builder, head);
-    LLVMValueRef objstr = zan_irgen_intern_string(g, "object");
+    LLVMValueRef objstr = zan_irgen_intern_type_name(g, "object");
     LLVMValueRef oeq = zan_icmp(g->builder, LLVMIntEQ, tstr, objstr, "is.oeq");
     LLVMBuildCondBr(g->builder, oeq, true_bb, hdr_bb);
   } else {
@@ -557,7 +557,7 @@ static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
         LLVMAppendBasicBlockInContext(g->ctx, fn, "is.s");
     LLVMBuildCondBr(g->builder, isstr, str_bb, oob_bb);
     LLVMPositionBuilderAtEnd(g->builder, str_bb);
-    LLVMValueRef ststr = zan_irgen_intern_string(g, "string");
+    LLVMValueRef ststr = zan_irgen_intern_type_name(g, "string");
     LLVMValueRef seq = zan_icmp(g->builder, LLVMIntEQ, ststr, tstr, "is.seq");
     LLVMBuildCondBr(g->builder, seq, true_bb, false_bb);
   } else {

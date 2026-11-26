@@ -547,9 +547,12 @@ static int zgl_init(void) {
     g_zgl.cap = (size_t)ZGL_VF * 6 * 2048;
     g_zgl.verts = (float *)malloc(g_zgl.cap * sizeof(float));
     if (!g_zgl.verts) { zan_gl_ctx_destroy(); return 0; }
-    g_zgl.vbo_bytes = g_zgl.cap * sizeof(float);
+    g_zgl.vbo_cap_verts = 16384; /* ~2.2 MiB streaming ring */
+    g_zgl.vbo_vert_off = 0;
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)g_zgl.vbo_bytes, NULL, ZGL_STREAM_DRAW);
+    gl.BufferData(ZGL_ARRAY_BUFFER,
+                  (zgl_sizeiptr)(g_zgl.vbo_cap_verts * (size_t)ZGL_VF * sizeof(float)),
+                  NULL, ZGL_STREAM_DRAW);
 
     if (gl.GetError() != ZGL_NO_ERROR) { zan_gl_ctx_destroy(); return 0; }
     g_gl_state = 1;

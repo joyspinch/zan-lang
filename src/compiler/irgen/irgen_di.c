@@ -158,6 +158,18 @@ LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     return e->gv;
 }
 
+LLVMValueRef zan_irgen_intern_type_name(zan_irgen_t *g, const char *text) {
+    LLVMValueRef v = zan_irgen_intern_string(g, text);
+    if (!v) return v;
+    /* Runtime is/as/cast compares type-name pointers directly by address; clear
+     * unnamed_addr so per-unit partitioning shares one canonical symbol rather
+     * than duplicating private copies with distinct addresses across .obj files. */
+    LLVMValueRef gv = LLVMIsAGlobalVariable(v) ? v
+        : (LLVMGetNumOperands(v) > 0 ? LLVMIsAGlobalVariable(LLVMGetOperand(v, 0)) : NULL);
+    if (gv) LLVMSetUnnamedAddress(gv, LLVMNoUnnamedAddr);
+    return v;
+}
+
 static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned line) {
     if (!g->emit_debug || !g->builder) return NULL;
     LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
