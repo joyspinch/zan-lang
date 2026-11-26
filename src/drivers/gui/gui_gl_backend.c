@@ -576,7 +576,7 @@ static void zgl_flush(void) {
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
 }
 
-static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
+static int zgl_begin_slow(zan_surface_t *s, zgl_mode mode) {
     if (g_gl_state <= 0) return 0;
     zgl_target *t = zgl_target_of(s);
     if (!t) return 0;
@@ -587,6 +587,17 @@ static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
     }
     zgl_upload(s, t);
     return 1;
+}
+
+static inline int zgl_begin(zan_surface_t *s, zgl_mode mode) {
+    if (g_gl_state <= 0) return 0;
+    if (g_zgl.target == s && g_zgl.mode == mode && s->id >= 0 && s->id < 64) {
+        zgl_target *t = &g_zgl_targets[s->id];
+        if (t->fbo && t->w == s->width && t->h == s->height && !t->cpu_ahead) {
+            return 1;
+        }
+    }
+    return zgl_begin_slow(s, mode);
 }
 
 typedef struct {

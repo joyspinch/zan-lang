@@ -86,7 +86,7 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         cpu_surface_round(s, x, y, w, h, radius, corners, fill, border, thickness);
         return;
     }
-    zgl_target *t = zgl_target_of(s);
+    zgl_target *t = (s->id >= 0 && s->id < 64) ? &g_zgl_targets[s->id] : zgl_target_of(s);
     int fast_blend = (t && t->opaque_dst);
     if (!fast_blend && g_zgl.count) zgl_flush();
     int kind = fast_blend ? ZGL_K_SURFACE_FAST : ZGL_K_SURFACE;
