@@ -25,9 +25,11 @@ public partial class ChartView {
     // 列值由数据源以定点编码（字符串 AsInt 恒 0 无意义），所以
     // 类目查表挂在渲染层，直接查 option 的原始 dataset；没有
     // dataset 的形态（值列就是下标）按数值查 cats。
-    static List<ParCategoryLookupItem> parCatCache;
+    static List<int> parCatRowIdx;
     static List<string> parCatSrcCats;
     static string parCatSrcId;
+    static int parCatSrcDim = -1;
+    static int parCatSrcRows = -1;
     public static List<int> ParCatLookup(ChartOption o) {
         ChartVisualMap vm = null;
         for (int vi = 0; vi < o.visualMaps.Count; vi = vi + 1) {
@@ -35,37 +37,36 @@ public partial class ChartView {
         }
         if (vm == null) { return null; }
         string srcId = o.datasets.Count > 0 ? o.datasets[0].id : "";
-        if (parCatCache != null && parCatSrcCats == vm.vmCats && parCatSrcId == srcId) {
-            List<int> cachedCols = new List<int>();
-            for (int k = 0; k < parCatCache.Count; k = k + 1) {
-                cachedCols.Add(parCatCache[k].col);
-            }
-            return cachedCols;
+        int col = vm.dimension >= 0 ? vm.dimension : 1;
+        int nRows = o.datasets.Count > 0 ? o.datasets[0].rows.Count : 0;
+        if (parCatRowIdx != null && parCatSrcCats == vm.vmCats
+        && parCatSrcId == srcId && parCatSrcDim == col && parCatSrcRows == nRows) {
+            return parCatRowIdx;
         }
-        List<int> cols = new List<int>();
-        for (int ci = 0; ci < vm.vmCats.Count; ci = ci + 1) { cols.Add(0 - 1); }
+        List<int> rowCats = new List<int>();
         if (o.datasets.Count > 0) {
             ChartJsonDataset ds = o.datasets[0];
-            int col = vm.dimension >= 0 ? vm.dimension : 1;
             for (int ri = 0; ri < ds.rows.Count; ri = ri + 1) {
-                JsonValue row = ds.source.At(ds.rows[ri]);
-                if (row == null || !row.IsArray() || col >= row.Count()) { continue; }
-                string gv = row.At(col).AsString("");
-                for (int ci = 0; ci < vm.vmCats.Count; ci = ci + 1) {
-                    if (cols[ci] == 0 - 1 && vm.vmCats[ci] == gv) {
-                        cols[ci] = ds.rows[ri];
-                        break;
+                int matched = 0 - 1;
+                JsonValue row = ds.source != null ? ds.source.At(ds.rows[ri]) : null;
+                if (row != null && row.IsArray() && col >= 0 && col < row.Count()) {
+                    string gv = row.At(col).AsString("");
+                    for (int ci = 0; ci < vm.vmCats.Count; ci = ci + 1) {
+                        if (vm.vmCats[ci] == gv) {
+                            matched = ci;
+                            break;
+                        }
                     }
                 }
+                rowCats.Add(matched);
             }
         }
-        parCatCache = new List<ParCategoryLookupItem>();
-        for (int i = 0; i < vm.vmCats.Count; i = i + 1) {
-            parCatCache.Add(new ParCategoryLookupItem(vm.vmCats[i], cols[i]));
-        }
+        parCatRowIdx = rowCats;
         parCatSrcCats = vm.vmCats;
         parCatSrcId = srcId;
-        return cols;
+        parCatSrcDim = col;
+        parCatSrcRows = nRows;
+        return rowCats;
     }
 
     // 行色判定：类目模式优先（行号查表，查不到走 outOfRange），
@@ -78,15 +79,14 @@ public partial class ChartView {
             if (v.vmCats.Count > 0) { vm = v; break; }
         }
         if (vm != null && catCols != null) {
-            // 类目维的行值就是"行号"编码（渲染层把字符串 AsInt 恒
-            // 得 0）：先用行号查表，命中即取该类目色。
-            int hitR = rowIdx < catCols.Count ? catCols[rowIdx] : 0 - 1;
-            if (hitR >= 0 && hitR < vm.rangeColors.Count) {
-                return vm.rangeColors[hitR];
+            // 类目维：catCols[rowIdx] 存该行匹配到的 vmCats 下标。
+            int hitCi = rowIdx >= 0 && rowIdx < catCols.Count ? catCols[rowIdx] : 0 - 1;
+            if (hitCi >= 0 && hitCi < vm.rangeColors.Count) {
+                return vm.rangeColors[hitCi];
             }
             // 无 dataset 的形态：值列直接是类目下标。
             int vd = vm.dimension >= 0 ? vm.dimension : 0;
-            if (vd < row.Count && row[vd] >= 0 && row[vd] < vm.rangeColors.Count) {
+            if (vd >= 0 && vd < row.Count && row[vd] >= 0 && row[vd] < vm.rangeColors.Count) {
                 return vm.rangeColors[row[vd]];
             }
             return StyleSheet.ParseColor("#ccc");
