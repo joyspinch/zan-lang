@@ -736,9 +736,13 @@ static void ca_hoist_spine(zan_irgen_t *g, zan_ast_node_t **slot,
   }
 }
 
-/* 计算索引表达式 (AST_INDEX) 选中的目标元素内存地址 */
-LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
-                                  local_scope_t *locals) {
+/* 计算索引表达式 (AST_INDEX) 选中的目标元素内存地址。
+ * out_container 非空时回传一维数组分支求值出的容器（供读完字段后释放临时数组）。 */
+LLVMValueRef emit_struct_elem_ptr_ex(zan_irgen_t *g, zan_ast_node_t *expr,
+                                     local_scope_t *locals,
+                                     LLVMValueRef *out_container) {
+  if (out_container)
+    *out_container = NULL;
   zan_ast_node_t *base = expr->index.object;
   zan_type_t *bt = infer_expr_type(g, base, locals);
   if (!bt)
@@ -747,6 +751,8 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
   LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (bt->kind == TYPE_ARRAY) {
     LLVMValueRef arr = emit_expr(g, base, locals);
+    if (out_container && bt->array_rank <= 1)
+      *out_container = arr;
     LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr, "ref.array.null");
     emit_runtime_check(
         g, isnull, expr->loc,
@@ -807,6 +813,10 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
     return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
   }
   return NULL;
+}
+LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
+                                  local_scope_t *locals) {
+  return emit_struct_elem_ptr_ex(g, expr, locals, NULL);
 }
 LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                  local_scope_t *locals);

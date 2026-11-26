@@ -1,0 +1,92 @@
+using System;
+
+// 捕获异常后必须结束 native 展开令牌（__cxa_begin_catch/__cxa_end_catch）。
+// Zan 的 throw 为每次抛出分配一个 8 字节 __cxa 异常作为展开令牌（Zan 异常本体
+// 走 EH 全局）；此前 catch/重抛/协程根都不结束旧令牌，每次被捕获的异常泄漏
+// 约 136 字节，长驻服务内存线性增长。std::uncaught_exceptions() 在 __cxa_throw
+// 时 +1、仅在 __cxa_begin_catch 时 -1，所以每个场景跑完后计数必须回到 0
+// （修复前每个被捕获的异常都让它永久 +1）。Itanium 符号在 Linux/macOS/MinGW 同名。
+class Boom : Exception {
+    Boom(string m) { Message = m; }
+}
+
+class Program {
+    [DllImport("crt", EntryPoint = "_ZSt19uncaught_exceptionsv")]
+    static extern int UncaughtExceptions();
+
+    static int fin = 0;
+
+    static void Thrower(int i) { throw new InvalidOperationException("e" + i); }
+
+    static void Rethrower(int i) {
+        try { Thrower(i); } catch (InvalidOperationException e) { throw; }
+    }
+
+    static void Wrapper(int i) {
+        try { Thrower(i); } catch (Exception e) { throw new Boom("wrapped " + e.Message); }
+    }
+
+    static void FinallyOnly(int i) {
+        try { Thrower(i); } finally { fin = fin + 1; }
+    }
+
+    static void NoMatch(int i) {
+        try { Thrower(i); } catch (FormatException e) { }
+    }
+
+    static void Nested(int i) {
+        try {
+            try { Thrower(i); } finally { fin = fin + 1; }
+        } catch (FormatException f) { }
+    }
+
+    static string Run(string mode) {
+        string last = "";
+        for (int i = 0; i < 50; i++) {
+            try {
+                if (mode == "sync") Thrower(i);
+                else if (mode == "rethrow") Rethrower(i);
+                else if (mode == "wrap") Wrapper(i);
+                else if (mode == "finally") FinallyOnly(i);
+                else if (mode == "nomatch") NoMatch(i);
+                else if (mode == "nested") Nested(i);
+            } catch (Exception e) {
+                last = e.Message;
+            }
+        }
+        return mode + " last=" + last + " uncaught=" + UncaughtExceptions();
+    }
+
+    static async int AsyncThrow(int i) {
+        await Task.Delay(0);
+        throw new Boom("a" + i);
+    }
+
+    static async int AsyncCatch(int i) {
+        try { return await AsyncThrow(i); } catch (Boom e) { return 1; }
+    }
+
+    static async int AsyncInner(int i) {
+        await Task.Delay(0);
+        try { Thrower(i); } catch (Exception e) { return 1; }
+        return 0;
+    }
+
+    static async void Main() {
+        Console.WriteLine(Run("sync"));
+        Console.WriteLine(Run("rethrow"));
+        Console.WriteLine(Run("wrap"));
+        Console.WriteLine(Run("finally"));
+        Console.WriteLine(Run("nomatch"));
+        Console.WriteLine(Run("nested"));
+        Console.WriteLine("finally runs=" + fin);
+        int c = 0;
+        for (int i = 0; i < 50; i++) {
+            int r = await AsyncCatch(i);
+            c = c + r;
+            int r2 = await AsyncInner(i);
+            c = c + r2;
+        }
+        Console.WriteLine("async caught=" + c + " uncaught=" + UncaughtExceptions());
+    }
+}

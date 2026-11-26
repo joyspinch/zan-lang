@@ -1188,6 +1188,10 @@ LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
                                    LLVMValueRef *out_oob);
 LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
                                   local_scope_t *locals);
+/* out_container 非空时回传一维数组分支求值出的容器（供读完字段后释放临时数组）。 */
+LLVMValueRef emit_struct_elem_ptr_ex(zan_irgen_t *g, zan_ast_node_t *expr,
+                                     local_scope_t *locals,
+                                     LLVMValueRef *out_container);
 LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
                                  LLVMValueRef left, LLVMValueRef right);
 zan_type_t *field_store_type(zan_irgen_t *g, zan_symbol_t *fsym,

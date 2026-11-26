@@ -30,6 +30,14 @@ static double get_time_ms(void) {
 }
 #else
 #include <time.h>
+
+/* LLVM 23 splits the br opcode into LLVMUncondBr / LLVMCondBr; older
+ * releases have one LLVMBr for both. ZAN_OP_IS_BR matches either form. */
+#if ZAN_LLVM_MAJOR >= 23
+#define ZAN_OP_IS_BR(op) ((op) == LLVMUncondBr || (op) == LLVMCondBr)
+#else
+#define ZAN_OP_IS_BR(op) ((op) == LLVMBr)
+#endif
 static double get_time_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -419,11 +427,7 @@ static bool is_branch_terminator(LLVMValueRef term) {
   if (!term)
     return false;
   LLVMOpcode op = LLVMGetInstructionOpcode(term);
-#if ZAN_LLVM_MAJOR >= 23
-  return op == LLVMBr || op == LLVMCondBr;
-#else
-  return op == LLVMBr;
-#endif
+  return ZAN_OP_IS_BR(op);
 }
 
 static int find_bb_in_list(LLVMBasicBlockRef *bbs, int count,
@@ -642,7 +646,7 @@ static bool arc_val_derived_from_load_of(LLVMValueRef v, LLVMValueRef root,
 
 static bool arc_edge_proves_null(LLVMValueRef br, LLVMBasicBlockRef target_bb,
                                  LLVMValueRef ptr_val) {
-  if (!br || LLVMGetInstructionOpcode(br) != LLVMBr || !LLVMIsConditional(br))
+  if (!br || !ZAN_OP_IS_BR(LLVMGetInstructionOpcode(br)) || !LLVMIsConditional(br))
     return false;
   LLVMValueRef cond = LLVMGetCondition(br);
   if (!cond || !LLVMIsAICmpInst(cond))
@@ -667,7 +671,7 @@ static bool arc_loop_inst_is_pure_read(LLVMValueRef inst, LLVMValueRef phi_val,
                                        LLVMValueRef next_val) {
   LLVMOpcode op = LLVMGetInstructionOpcode(inst);
   if (LLVMIsATerminatorInst(inst))
-    return op == LLVMBr;
+    return ZAN_OP_IS_BR(op);
   if (op == LLVMPHI || op == LLVMGetElementPtr || op == LLVMBitCast ||
       op == LLVMICmp || op == LLVMFCmp || op == LLVMSelect || op == LLVMZExt ||
       op == LLVMSExt || op == LLVMTrunc || op == LLVMFPTrunc ||
@@ -835,7 +839,7 @@ static bool try_elide_loop_borrow_cursor(LLVMValueRef fn, LLVMBasicBlockRef H,
 
     /* 在 pre_bb 中反向寻找匹配的 retain(seed) */
     LLVMValueRef pre_term = LLVMGetBasicBlockTerminator(pre_bb);
-    if (!pre_term || LLVMGetInstructionOpcode(pre_term) != LLVMBr)
+    if (!pre_term || !ZAN_OP_IS_BR(LLVMGetInstructionOpcode(pre_term)))
       continue;
     if (LLVMIsConditional(pre_term)) {
       LLVMBasicBlockRef other =
@@ -915,7 +919,7 @@ static bool try_elide_loop_borrow_cursor(LLVMValueRef fn, LLVMBasicBlockRef H,
     for (int bi = 0; bi < loop_cnt && exits_ok; bi++) {
       LLVMBasicBlockRef b = loop_bbs[bi];
       LLVMValueRef term = LLVMGetBasicBlockTerminator(b);
-      if (!term || LLVMGetInstructionOpcode(term) != LLVMBr) {
+      if (!term || !ZAN_OP_IS_BR(LLVMGetInstructionOpcode(term))) {
         exits_ok = false;
         break;
       }

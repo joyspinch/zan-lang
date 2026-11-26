@@ -653,7 +653,10 @@ case AST_AWAIT_EXPR: {
    * 在降级处逐个报更具体的诊断（"await Gate.Park is only supported
    * inside an async method"），判据在那边，名单也只有一份。
    */
+            zan_ast_node_t *prev_ok = c->async_call_ok;
+            c->async_call_ok = expr->await_expr.expr;
   zan_type_t *inner = zan_checker_check_expr(c, expr->await_expr.expr);
+            c->async_call_ok = prev_ok;
   if (inner && inner->kind == TYPE_TASK) {
     return inner->type_arg_count == 1 ? inner->type_args[0]
                                       : c->binder->type_void;

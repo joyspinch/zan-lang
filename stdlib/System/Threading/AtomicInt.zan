@@ -3,73 +3,93 @@ using System;
 namespace System.Threading;
 
 // 用于 worker 线程间共享的顺序一致 64 位整数。
-public class AtomicInt {
+// 计数单元是 ARC 管理的 long[1]，原生原子操作直接作用在它的数据区上：
+// 任何线程持有 AtomicInt 期间单元都活着，最后一个引用消失时随对象释放——
+// 无需手动释放，也不存在“一个线程 Dispose、另一个线程还在读”的释放后使用。
+// （曾经每个实例 malloc 一块原生单元且从不释放，每个实例泄漏一块。）
+public class AtomicInt : IDisposable {
+    // 兼容字段：创建成功后非 0。计数不再依赖原生句柄。
     public nint handle;
+    long[] cell;
 
+    // 兼容入口：旧的原生句柄 API，AtomicInt 自身不再使用。
     [DllImport("crt", EntryPoint = "zan_atomic_int_create")]
     public static extern nint NativeCreate(long initialValue);
 
     [DllImport("crt", EntryPoint = "zan_atomic_int_destroy")]
     public static extern void NativeDestroy(nint handle);
 
+    // 原生入口的第一个参数是指向 int64 的指针；long[] 实参传的正是数据区地址
+    // （数组数据区 16 字节对齐，满足 64 位原子操作的对齐要求）。
     [DllImport("crt", EntryPoint = "zan_atomic_int_load")]
-    public static extern long NativeLoad(nint handle);
+    static extern long CellLoad(long[] cell);
 
     [DllImport("crt", EntryPoint = "zan_atomic_int_store")]
-    public static extern void NativeStore(nint handle, long newValue);
+    static extern void CellStore(long[] cell, long newValue);
 
     [DllImport("crt", EntryPoint = "zan_atomic_int_exchange")]
-    public static extern long NativeExchange(nint handle, long newValue);
+    static extern long CellExchange(long[] cell, long newValue);
 
     [DllImport("crt", EntryPoint = "zan_atomic_int_compare_exchange")]
-    public static extern long NativeCompareExchange(nint handle, long expected, long desired);
+    static extern long CellCompareExchange(long[] cell, long expected, long desired);
 
     [DllImport("crt", EntryPoint = "zan_atomic_int_add")]
-    public static extern long NativeAdd(nint handle, long delta);
+    static extern long CellAdd(long[] cell, long delta);
 
     // 创建初始值为 initialValue 的原子整数。
     public AtomicInt(long initialValue) {
-        this.handle = NativeCreate(initialValue);
+        this.cell = new long[1];
+        AtomicInt.CellStore(this.cell, initialValue);
+        this.handle = 1;
     }
 
-    // 底层句柄是否创建成功（0 = 无效）。
+    // 是否创建成功（兼容旧 API）。
     public bool IsValid() {
         return this.handle != 0;
     }
 
     // 顺序一致读取当前值。
     public long Load() {
-        return AtomicInt.NativeLoad(this.handle);
+        return AtomicInt.CellLoad(this.cell);
     }
 
     // 顺序一致写入新值。
     public void Store(long newValue) {
-        AtomicInt.NativeStore(this.handle, newValue);
+        AtomicInt.CellStore(this.cell, newValue);
     }
 
     // 原子换入新值，返回旧值。
     public long Exchange(long newValue) {
-        return AtomicInt.NativeExchange(this.handle, newValue);
+        return AtomicInt.CellExchange(this.cell, newValue);
     }
 
     // 当前值 == expected 时换入 desired；返回旧值（== expected
     // 表示成功）。
     public long CompareExchange(long expected, long desired) {
-        return AtomicInt.NativeCompareExchange(this.handle, expected, desired);
+        return AtomicInt.CellCompareExchange(this.cell, expected, desired);
     }
 
     // 原子加 delta，返回加后的新值。
     public long Add(long delta) {
-        return AtomicInt.NativeAdd(this.handle, delta);
+        return AtomicInt.CellAdd(this.cell, delta);
     }
 
     // 原子 +1，返回新值。
     public long Increment() {
-        return AtomicInt.NativeAdd(this.handle, 1);
+        return AtomicInt.CellAdd(this.cell, 1);
     }
 
     // 原子 -1，返回新值。
     public long Decrement() {
-        return AtomicInt.NativeAdd(this.handle, -1);
+        return AtomicInt.CellAdd(this.cell, -1);
+    }
+
+    // 兼容 IDisposable / using：单元由 ARC 管理，这里无需释放任何东西；
+    // 调用后对象照常可用（其他线程可能仍在读写）。
+    public void Close() {
+    }
+
+    public void Dispose() {
+        this.Close();
     }
 }

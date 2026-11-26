@@ -423,7 +423,10 @@ static void zan_soft_log_path(char *path, size_t cap) {
   }
   mkdir(g_soft_logdir, 0755);
   mkdir(dir, 0755);
-  snprintf(path, cap, "%s/%s.log", dir, day);
+    /* A directory that fits but leaves no room for "/DD.log" would be cut
+     * mid-name and log to a stray path; fall back like the overflow above. */
+    if ((size_t)snprintf(path, cap, "%s/%s.log", dir, day) >= cap)
+        snprintf(path, cap, "zan_soft.log");
 }
 #endif
 
@@ -638,13 +641,76 @@ void zan_rt_fatal(const char *category, const char *message) {
  * 判不了（系统调用被沙箱拒绝等）返回 1，即回到旧行为。 */
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <dlfcn.h>
+#include <mach-o/loader.h>
 #elif defined(__linux__) && !defined(ZAN_BARE_METAL)
 #include <sys/uio.h>
 #endif
+
+#if defined(__APPLE__)
+/* String literals live in this image (const blob, __cstring), and which of
+ * them start a page depends on layout: a hot literal there paid a
+ * vm_read_overwrite on every length query (a published self-hosted compiler
+ * spent 1 s of 4.8 s in the kernel). The image's readable segments stay
+ * mapped for the process lifetime, so answer for them without a syscall. */
+#define ZAN_IMG_MAX_SEGS 8
+static uintptr_t g_img_seg_lo[ZAN_IMG_MAX_SEGS], g_img_seg_hi[ZAN_IMG_MAX_SEGS];
+static int g_img_seg_n;
+static int g_img_state; /* 0 = not scanned, 1 = scanned (atomic) */
+
+static void zan_img_segments_init(void) {
+    Dl_info di;
+    int n = 0;
+    if (dladdr((const void *)&zan_rt_hdr_readable, &di) && di.dli_fbase) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)di.dli_fbase;
+        if (mh->magic == MH_MAGIC_64) {
+            const struct load_command *lc = (const struct load_command *)(mh + 1);
+            intptr_t slide = 0;
+            int have_slide = 0;
+            for (uint32_t i = 0; i < mh->ncmds; i++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+                    if (!have_slide && sc->fileoff == 0 && sc->filesize != 0) {
+                        slide = (intptr_t)((uintptr_t)mh - (uintptr_t)sc->vmaddr);
+                        have_slide = 1;
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+            lc = (const struct load_command *)(mh + 1);
+            for (uint32_t i = 0; have_slide && i < mh->ncmds && n < ZAN_IMG_MAX_SEGS; i++) {
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+                    if ((sc->initprot & VM_PROT_READ) && sc->vmsize &&
+                        strcmp(sc->segname, "__LINKEDIT") != 0) {
+                        g_img_seg_lo[n] = (uintptr_t)sc->vmaddr + (uintptr_t)slide;
+                        g_img_seg_hi[n] = g_img_seg_lo[n] + (uintptr_t)sc->vmsize;
+                        n++;
+                    }
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+        }
+    }
+    g_img_seg_n = n;
+    __atomic_store_n(&g_img_state, 1, __ATOMIC_RELEASE);
+}
+
+static int zan_in_image(uintptr_t lo, uintptr_t hi) {
+    if (!__atomic_load_n(&g_img_state, __ATOMIC_ACQUIRE)) zan_img_segments_init();
+    for (int i = 0; i < g_img_seg_n; i++)
+        if (lo >= g_img_seg_lo[i] && hi <= g_img_seg_hi[i]) return 1;
+    return 0;
+}
+#endif
+
 int zan_rt_hdr_readable(const void *p, int64_t need) {
     if (!p || need <= 0) return 1;
     uintptr_t lo = (uintptr_t)p - (uintptr_t)need;
     if (lo > (uintptr_t)p) return 0;
+#if defined(__APPLE__)
+    if (zan_in_image(lo, (uintptr_t)p)) return 1;
+#endif
 #if defined(_WIN32)
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery((LPCVOID)lo, &mbi, sizeof mbi)) return 0;

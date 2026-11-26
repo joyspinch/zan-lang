@@ -643,7 +643,11 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
              * in the WindowServer instead of a CPU drawRect blit. */
             [view setWantsLayer:YES];
             view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
-            view.layer.contentsGravity = kCAGravityResize;
+            /* 不缩放旧帧：程序改窗口尺寸（setContentSize）后、新帧到来前，
+             * kCAGravityResize 会把上一帧拉伸铺满新尺寸，窗口空闲时这张
+             * 拉伸图一直挂着 → 用户看到「窗口被拉伸变糊」。左上对齐只会短暂
+             * 露出未画区域，新帧到来即覆盖。 */
+            view.layer.contentsGravity = kCAGravityTopLeft;
             view.layer.opaque = NO;
             [window setContentView:view];
             [window makeFirstResponder:view];        /* key/IME input lands on the view */
@@ -706,6 +710,14 @@ EXPORT i32 zan_gui_show_window(iptr hwnd_val) {
         @try {
             [NSApp activateIgnoringOtherApps:YES];
             [mw->window makeKeyAndOrderFront:nil];
+            /* Secondary windows are owned by the first (main) window, like
+             * Win32 owned windows: they stay above it. Without this the main
+             * window -- and the native WKWebView sibling it hosts -- comes back
+             * on top of dialogs as soon as it is activated again. */
+            if (mw != &g_mwins[0] && g_mwin_count > 1 && g_mwins[0].window
+                && [mw->window parentWindow] == nil) {
+                [g_mwins[0].window addChildWindow:mw->window ordered:NSWindowAbove];
+            }
         } @catch (NSException *ex) {
             fprintf(stderr, "[Zan GUI Error] show_window failed: %s: %s\n",
                     [[ex name] UTF8String], [[ex reason] UTF8String]);
@@ -800,6 +812,8 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     memset(&g_mwins[g_mwin_count], 0, sizeof(g_mwins[0]));
     @autoreleasepool {
         @try {
+            NSWindow *ownerWin = [closing.window parentWindow];
+            if (ownerWin) { [ownerWin removeChildWindow:closing.window]; }
             [closing.window setDelegate:nil]; /* Shared delegate outlives every window. */
             [closing.window makeFirstResponder:nil];
             [closing.window setContentView:nil]; /* Releases only hierarchy ownership. */
@@ -1159,10 +1173,22 @@ EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)g_evt[6]; }
 
 /* ---- native text rendering ---- */
 
-static CTFontRef zan_font(i64 font_size) {
-    CGFloat size = (CGFloat)font_size;
+/* Cache/font key: low 20 bits = pixel size, ZAN_TEXT_BOLD_BIT = bold weight.
+ * Bold used to fall back to regular on Cocoa (titles/section headers lost their
+ * weight on macOS while the Win32 driver used FW_BOLD). */
+#define ZAN_TEXT_BOLD_BIT ((i64)1 << 20)
+
+static CTFontRef zan_font(i64 font_key) {
+    bool bold = (font_key & ZAN_TEXT_BOLD_BIT) != 0;
+    CGFloat size = (CGFloat)(font_key & (ZAN_TEXT_BOLD_BIT - 1));
     if (size < 8.0) size = 8.0;
-    return CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+    CTFontRef base = CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+    if (!bold || !base) return base;
+    CTFontRef b = CTFontCreateCopyWithSymbolicTraits(base, size, NULL,
+                                                     kCTFontBoldTrait, kCTFontBoldTrait);
+    if (!b) return base;
+    CFRelease(base);
+    return b;
 }
 
 static CTLineRef zan_text_line(const char *utf8, CTFontRef font);
@@ -1219,6 +1245,11 @@ static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
             cs, (CGBitmapInfo)kCGImageAlphaNone);
         if (ctx) {
             CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+            /* 与系统一致：macOS 11+ 默认关闭字体平滑（stem darkening）。
+             * 位图上下文默认开着，字形被加粗一圈，整屏文字发重发糊。 */
+            CGContextSetAllowsFontSmoothing(ctx, false);
+            CGContextSetShouldSmoothFonts(ctx, false);
+            CGContextSetShouldAntialias(ctx, true);
             CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
             CTLineDraw(line, ctx);
             CGContextFlush(ctx);
@@ -1284,8 +1315,16 @@ static u32 zan_blend(u32 dst, u32 color, unsigned int coverage) {
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+static void zan_draw_text_key(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i64 font_size);
+
 EXPORT void zan_gui_draw_text(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
+    zan_draw_text_key(surface_id, x, y, utf8, color, (i64)font_size);
+}
+
+static void zan_draw_text_key(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i64 font_size) {
     int sw = 0, sh = 0, stride = 0;
     u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
     if (!pixels || !utf8 || !*utf8) return;
@@ -1319,11 +1358,10 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
-/* Canvas.DrawTextBold ABI: same regular-weight fallback as the shared
- * renderer (gui_runtime_font.c), which the Cocoa build does not compile. */
+/* Canvas.DrawTextBold ABI: real bold weight (CoreText bold trait). */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
-    zan_gui_draw_text(surface_id, x, y, utf8, color, font_size);
+    zan_draw_text_key(surface_id, x, y, utf8, color, (i64)font_size | ZAN_TEXT_BOLD_BIT);
 }
 
 EXPORT void zan_gui_draw_text_rot(
@@ -2472,6 +2510,7 @@ EXPORT const char *zan_gui_webview_last_request(i32 h) {
 }
 
 EXPORT const char *zan_gui_webview_eval(i32 h, const char *js) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_webview_eval(h, js));
     if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
     zan_webview_t *w = &g_webviews[(int)h - 1];
     if (!w->used || !w->wv || !js) return "";
@@ -2520,6 +2559,10 @@ EXPORT void zan_gui_webview_snapshot(i32 h, const char *out_png_path) {
 }
 
 EXPORT const char *zan_gui_webview_get_cookies(i32 h, const char *url) {
+    /* WKHTTPCookieStore 只能在主线程用、回调也投到主线程：在工作线程上调用时
+     * 下面的 wv_spin 转的是工作线程的 runloop，回调永远等不到，3 秒超时返回
+     * 空串（调用方误判「已登出」）。转到主线程执行。 */
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_webview_get_cookies(h, url));
     if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
     zan_webview_t *w = &g_webviews[(int)h - 1];
     if (!w->used || !w->wv) return "";
@@ -2558,6 +2601,7 @@ EXPORT const char *zan_gui_webview_get_cookies(i32 h, const char *url) {
 }
 
 EXPORT void zan_gui_webview_set_cookie(i32 h, const char *url, const char *name, const char *value) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_set_cookie(h, url, name, value));
     WKWebView *wv = wv_get(h);
     if (!wv || !url || !name) return;
     @autoreleasepool {
@@ -2582,6 +2626,7 @@ EXPORT void zan_gui_webview_set_cookie(i32 h, const char *url, const char *name,
 }
 
 EXPORT void zan_gui_webview_clear_cookies(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_clear_cookies(h));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     @autoreleasepool {
@@ -2726,6 +2771,7 @@ EXPORT void zan_gui_webview_eval_async(i32 h, const char *js) {
 /* Every kind of website data (cookies, caches, localStorage, IndexedDB, ...)
  * for this view's data store -- the "log out and forget me" button. */
 EXPORT void zan_gui_webview_clear_data(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_clear_data(h));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     @autoreleasepool {

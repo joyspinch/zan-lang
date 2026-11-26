@@ -679,6 +679,11 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
 
     if (looks_like_var_decl(p)) {
       zan_ast_node_t *tref = parse_type_ref(p);
+            /* using (var x = ...)：与局部声明同口径，var 即推断类型。 */
+            if (tref && tref->kind == AST_TYPE_REF &&
+                tref->type_ref.name.len == 3 &&
+                memcmp(tref->type_ref.name.str, "var", 3) == 0)
+                tref = NULL;
       type = tref;
       name_loc = p->current.loc;
       if (parser_check(p, TK_IDENT)) {

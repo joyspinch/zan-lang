@@ -603,8 +603,10 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                         zan_type_t *et = infer_expr_type(g,
                             expr->member.object, locals);
                         LLVMTypeRef st = get_struct_llvm_type(g, cls);
+                        LLVMValueRef elem_container = NULL;
                         LLVMValueRef ep = (st && !type_is_binding(et))
-                            ? emit_struct_elem_ptr(g, expr->member.object, locals)
+                            ? emit_struct_elem_ptr_ex(g, expr->member.object,
+                                                      locals, &elem_container)
                             : NULL;
                         if (ep) {
                             LLVMValueRef sptr = LLVMBuildBitCast(g->builder, ep,
@@ -626,6 +628,16 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                                 (gpsym && (gpsym->modifiers & MOD_WEAK))
                                 ? emit_weak_field_load(g, field_ptr, ft)
                                 : LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                            /* F()[i].x：读完字段再释放临时数组。只对不含受管字段
+                             * 的值结构体放开——含受管字段时取出的字段仍借用数组。 */
+                            zan_ast_node_t *ix_obj = expr->member.object->index.object;
+                            zan_type_t *ct = infer_expr_type(g, ix_obj, locals);
+                            if (elem_container && ct && ct->kind == TYPE_ARRAY &&
+                                et && et->kind == TYPE_STRUCT &&
+                                !type_contains_collection_rc(g, et, 0) &&
+                                !expr_is_local_ident(ix_obj, locals) &&
+                                expr_yields_owned_rc_value(g, ix_obj, locals))
+                                emit_rc_release_for_type(g, ct, elem_container);
                             return promote_loaded(g, gfv0, fty);
                         }
                     }

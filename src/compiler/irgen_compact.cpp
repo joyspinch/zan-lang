@@ -13,6 +13,9 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Target/TargetMachine.h>
+#if LLVM_VERSION_MAJOR >= 21
+#include <llvm/TargetParser/Triple.h>
+#endif
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -253,8 +256,16 @@ extern "C" LLVMTargetMachineRef zan_create_target_machine_with_options(
 #else
     auto opt_level = static_cast<llvm::CodeGenOpt::Level>(level);
 #endif
+#if LLVM_VERSION_MAJOR >= 21
+    /* LLVM 21 takes the triple as llvm::Triple; the string overload is gone
+     * in later releases. */
+    auto *machine = reinterpret_cast<llvm::Target *>(target)->createTargetMachine(
+        llvm::Triple(triple), cpu, features, options, llvm::Reloc::PIC_, {},
+        opt_level);
+#else
     auto *machine = reinterpret_cast<llvm::Target *>(target)->createTargetMachine(
         triple, cpu, features, options, llvm::Reloc::PIC_, {}, opt_level);
+#endif
     return reinterpret_cast<LLVMTargetMachineRef>(machine);
 }
 

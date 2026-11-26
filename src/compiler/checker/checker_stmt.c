@@ -189,7 +189,10 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     if (mg) {
       reject_method_group(c, stmt->expr_stmt.expr);
     } else {
+      zan_ast_node_t *prev_ok = c->async_call_ok;
+      c->async_call_ok = stmt->expr_stmt.expr;
       zan_checker_check_expr(c, stmt->expr_stmt.expr);
+      c->async_call_ok = prev_ok;
     }
     break;
   }

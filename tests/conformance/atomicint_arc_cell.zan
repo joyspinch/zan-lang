@@ -1,0 +1,44 @@
+using System;
+using System.Threading;
+
+// AtomicInt 的计数单元是 ARC 管理的 long[1]：不调用 Dispose 也不泄漏（曾每实例 malloc
+// 一块原生单元且从不释放），跨线程计数精确，Dispose 之后对象仍可用（兼容 using）。
+class Program {
+    static AtomicInt shared = new AtomicInt(0);
+
+    [DllImport("crt", EntryPoint = "zan_mem_slabs")]
+    static extern long MemSlabs();
+
+    static long Churn(int n) {
+        long t = 0;
+        for (int i = 0; i < n; i++) {
+            AtomicInt a = new AtomicInt(i);
+            t = t + a.Increment();
+        }
+        return t;
+    }
+
+    static void Main() {
+        AtomicInt c = new AtomicInt(10);
+        long ex = c.Exchange(20);
+        long ce1 = c.CompareExchange(20, 30);
+        long ce2 = c.CompareExchange(5, 99);
+        Console.WriteLine("ex=" + ex + " ce1=" + ce1 + " ce2=" + ce2 + " now=" + c.Load() + " dec=" + c.Decrement());
+        c.Dispose();
+        Console.WriteLine("after dispose add=" + c.Add(5) + " valid=" + c.IsValid());
+
+        bool started = Thread.Start(() => {
+            for (int k = 0; k < 100000; k++) { Program.shared.Increment(); }
+        });
+        for (int k = 0; k < 100000; k++) { Program.shared.Increment(); }
+        int spins = 0;
+        while (Program.shared.Load() < 200000 && spins < 3000) { Thread.Sleep(5); spins = spins + 1; }
+        Console.WriteLine("started=" + started + " shared=" + Program.shared.Load());
+
+        Churn(2000);
+        long s0 = MemSlabs();
+        long t = Churn(300000);
+        long s1 = MemSlabs();
+        Console.WriteLine("churn=" + t + " bounded=" + (s0 == 0 || s1 - s0 <= 1));
+    }
+}

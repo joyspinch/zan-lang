@@ -305,6 +305,16 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     if (arr_type->element_type) {
       elem_llvm = map_type(g, arr_type->element_type);
     }
+    /* The null guards below may swap arr_ptr for a scratch page; a
+     * temporary container is released through the original value. */
+    LLVMValueRef arr_orig = arr_ptr;
+    /* new T[n][i] / F()[i]: the array temporary is released once the element
+     * is read. A struct element is a by-value copy whose reference fields stay
+     * borrowed from the array (F()[i].s.Length reads them after this point),
+     * so a struct with managed fields keeps the array alive. */
+    bool release_temp = !(arr_type->element_type &&
+                          arr_type->element_type->kind == TYPE_STRUCT &&
+                          type_contains_collection_rc(g, arr_type->element_type, 0));
     LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr_ptr, "arridx.null");
     emit_runtime_check(g, isnull, expr->loc,
                        "null reference where a string/byte buffer is required "
@@ -330,9 +340,13 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         elem_ptr = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed_arr,
                                          &idx_1d, 1, "eidx");
       }
-      return promote_loaded(
+      LLVMValueRef fast = promote_loaded(
           g, LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem"),
           arr_type->element_type);
+      if (!release_temp)
+        return fast;
+      return finish_index_of_temp(g, expr, locals, arr_type,
+                                  arr_type->element_type, arr_orig, fast);
     }
 
     /* Only the valid edge may load an element, even on an empty array. */
@@ -359,7 +373,11 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef values[] = {LLVMConstNull(elem_llvm), elem};
     LLVMBasicBlockRef blocks[] = {fail_bb, load_bb};
     LLVMAddIncoming(result, values, blocks, 2);
-    return promote_loaded(g, result, arr_type->element_type);
+    LLVMValueRef loaded = promote_loaded(g, result, arr_type->element_type);
+    if (!release_temp)
+      return loaded;
+    return finish_index_of_temp(g, expr, locals, arr_type,
+                                arr_type->element_type, arr_orig, loaded);
   }
   return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
 }
