@@ -370,9 +370,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                                LLVMPointerType(i64, 0),
                                i64,
                                i64,
-                               i64};
+                               i64,
+                               i64,
+                               i8ptr};
   g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
-  LLVMStructSetBody(g->dict_struct_type, dict_fields, 8, 0);
+  LLVMStructSetBody(g->dict_struct_type, dict_fields, 10, 0);
 
   g->task_struct_type = LLVMStructCreateNamed(g->ctx, "Task");
   LLVMTypeRef task_fields[] = {i64, i64, i64};

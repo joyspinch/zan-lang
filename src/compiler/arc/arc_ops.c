@@ -803,12 +803,31 @@ void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type,
       LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 3, "vp"), "vs");
   LLVMValueRef value_words = LLVMBuildLoad2(
       b, i64, LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 7, "vwp"), "vw");
+  LLVMValueRef holes = LLVMBuildLoad2(
+      b, i64, LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 8, "hp"), "holes");
+  LLVMValueRef dead = LLVMBuildLoad2(
+      b, i8ptr, LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 9, "deadp"), "dead");
+  LLVMValueRef has_holes = zan_and(
+      b, zan_icmp(b, LLVMIntNE, holes, LLVMConstInt(i64, 0, 0), "hh1"),
+      zan_icmp(b, LLVMIntNE, dead, LLVMConstNull(i8ptr), "hh2"), "hh");
+  LLVMBasicBlockRef chk_dead = LLVMAppendBasicBlockInContext(c, fn, "dc.chkd");
+  LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(c, fn, "dc.rel");
+  LLVMBasicBlockRef step_bb = LLVMAppendBasicBlockInContext(c, fn, "dc.step");
   LLVMBuildBr(b, head);
   LLVMPositionBuilderAtEnd(b, head);
   LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
   LLVMValueRef lt = zan_icmp(b, LLVMIntSLT, iphi, cnt, "lt");
   LLVMBuildCondBr(b, lt, body, done);
   LLVMPositionBuilderAtEnd(b, body);
+  LLVMBuildCondBr(b, has_holes, chk_dead, rel_bb);
+  LLVMPositionBuilderAtEnd(b, chk_dead);
+  LLVMValueRef dbyte = LLVMBuildLoad2(
+      b, LLVMInt8TypeInContext(c),
+      LLVMBuildInBoundsGEP2(b, LLVMInt8TypeInContext(c), dead, &iphi, 1, "dp8"), "db");
+  LLVMBuildCondBr(b,
+      LLVMBuildICmp(b, LLVMIntNE, dbyte, LLVMConstInt(LLVMInt8TypeInContext(c), 0, 0), "isd"),
+      step_bb, rel_bb);
+  LLVMPositionBuilderAtEnd(b, rel_bb);
   if (krc) {
     LLVMValueRef kslot = LLVMBuildGEP2(b, i8ptr, ks, &iphi, 1, "kslot");
     LLVMValueRef kv = LLVMBuildLoad2(b, i8ptr, kslot, "kv");
@@ -823,6 +842,8 @@ void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type,
                           : LLVMBuildLoad2(b, i64, vslot, "vv");
     emit_collection_release_raw_slot(g, vt, vv, i64);
   }
+  LLVMBuildBr(b, step_bb);
+  LLVMPositionBuilderAtEnd(b, step_bb);
   LLVMValueRef inext = zan_add(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
   LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
   LLVMBuildBr(b, head);

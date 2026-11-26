@@ -520,14 +520,18 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
   int argc = call->call.args.count;
   LLVMValueRef *call_args = (LLVMValueRef *)calloc(
       (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
-  /* The callee is borrowed from its local/field slot. Argument evaluation
-   * or the callback may overwrite that last owner, so keep the selected
-   * delegate alive until the invocation and argument cleanup finish. */
-  emit_closure_retain(g, fn_ptr);
+  /* 接收者为自身持有且永不重赋值的局部委托时免钉住：实参求值与回调本身
+   * 均不可能覆盖该局部槽，省去每次调用的 closure_retain/release 与 EH 栈压弹。 */
+  bool zan_receiver_needs_no_pin(zan_irgen_t *, zan_ast_node_t *,
+                                 local_scope_t *);
+  bool no_pin_dlg = zan_receiver_needs_no_pin(g, call->call.callee, locals);
   int eh_pushed = 0;
-  if (!g->current_fn_no_runtime) {
-    emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
-    eh_pushed = 1;
+  if (!no_pin_dlg) {
+    emit_closure_retain(g, fn_ptr);
+    if (!g->current_fn_no_runtime) {
+      emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
+      eh_pushed = 1;
+    }
   }
   int n_eh_args = 0;
   for (int k = 0; k < argc; k++) {
@@ -555,7 +559,8 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
   }
   if (eh_pushed)
     emit_eh_tmp_pop(g);
-  emit_closure_release(g, fn_ptr);
+  if (!no_pin_dlg)
+    emit_closure_release(g, fn_ptr);
   free(call_args);
   free(param_types);
   return result;

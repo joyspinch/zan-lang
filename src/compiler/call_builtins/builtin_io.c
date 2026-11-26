@@ -204,6 +204,13 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
       LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
       LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
       LLVMValueRef pfmt_lit = zan_irgen_intern_string(g, pfmt);
+      /* 浮点定点格式 "%.0f".."%.6f" 与 "%.0lf".."%.6lf" 走无 snprintf 的纯 IR 整数快路径 */
+      if (want_float && pfmt[0] == '%' && pfmt[1] == '.' &&
+          pfmt[2] >= '0' && pfmt[2] <= '6' &&
+          ((pfmt[3] == 'f' && pfmt[4] == '\0') ||
+           (pfmt[3] == 'l' && pfmt[4] == 'f' && pfmt[5] == '\0'))) {
+        return emit_dbl_fixed_string(g, arg, pfmt[2] - '0', pfmt_lit);
+      }
       /* 先在栈上格式化再按实际长度精确分配托管串 + 记 ZANS 长度，
        * 将 ToString("F2") 单串堆占用从 768B slab 压至 32B slab（24× 降幅）。 */
       LLVMValueRef tmp = emit_entry_scratch(g, 640, "tos.fmt.tmp");

@@ -1462,6 +1462,211 @@ LLVMValueRef emit_dbl_string(zan_irgen_t *g, LLVMValueRef v) {
     }
     return zan_call2(g->builder, fn_ty, fn, &v, 1, "dtoa.str");
 }
+
+/* 浮点定点格式快路径（"F0".."F6" / "%.0f".."%.6f" / "%.0lf".."%.6lf"）：
+ * 拆分出只写缓冲区的 __zan_ftoa_fixed(dst, v, prec, pfmt) -> len，托管串分配留在调用方，
+ * 以便 escape/SSO 优化对不逃逸的 dv.ToString("F2") 自动栈上零堆分配；
+ * 当 |v|*10^prec < 1e12 且距半整数边界 > 0.001（数学保证单次乘法的 <=0.5 ULP 误差不可能
+ * 跨越 0.5 舍入界，与 snprintf 逐字符比特等价）时，用纯 SSE2 整数转换 + digits200 写表，
+ * 零 snprintf、零 libm 调用；边界/NaN/Inf/极大值无缝回退 snprintf。 */
+LLVMValueRef emit_dbl_fixed_string(zan_irgen_t *g, LLVMValueRef v, int prec,
+                                   LLVMValueRef pfmt_lit) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+    LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_ty);
+
+    LLVMTypeRef fn_ty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, dbl, i32, i8ptr }, 4, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_ftoa_fixed");
+    if (!fn) {
+        fn = LLVMAddFunction(g->mod, "__zan_ftoa_fixed", fn_ty);
+        LLVMSetLinkage(fn, LLVMInternalLinkage);
+        {
+            unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+            if (nw)
+                LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                        LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        }
+        LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+        LLVMValueRef saved_fn = g->current_fn;
+        g->current_fn = fn;
+
+        /* 常量表：10^0..10^6（double 与 i64 各一份） */
+        LLVMValueRef fpow_vals[7];
+        LLVMValueRef ipow_vals[7];
+        double fp = 1.0;
+        unsigned long long ip = 1;
+        for (int k = 0; k < 7; k++) {
+            fpow_vals[k] = LLVMConstReal(dbl, fp);
+            ipow_vals[k] = LLVMConstInt(i64, ip, 0);
+            fp *= 10.0;
+            ip *= 10ULL;
+        }
+        LLVMTypeRef fpow_arr_ty = LLVMArrayType(dbl, 7);
+        LLVMValueRef fpow_gv = LLVMAddGlobal(g->mod, fpow_arr_ty, "__zan_ftos_fpow10");
+        LLVMSetLinkage(fpow_gv, LLVMInternalLinkage);
+        LLVMSetGlobalConstant(fpow_gv, 1);
+        LLVMSetInitializer(fpow_gv, LLVMConstArray(dbl, fpow_vals, 7));
+
+        LLVMTypeRef ipow_arr_ty = LLVMArrayType(i64, 7);
+        LLVMValueRef ipow_gv = LLVMAddGlobal(g->mod, ipow_arr_ty, "__zan_ftos_ipow10");
+        LLVMSetLinkage(ipow_gv, LLVMInternalLinkage);
+        LLVMSetGlobalConstant(ipow_gv, 1);
+        LLVMSetInitializer(ipow_gv, LLVMConstArray(i64, ipow_vals, 7));
+
+        LLVMTypeRef d1_ty = LLVMFunctionType(dbl, &dbl, 1, 0);
+        LLVMValueRef fabs_fn = LLVMGetNamedFunction(g->mod, "llvm.fabs.f64");
+        if (!fabs_fn) fabs_fn = LLVMAddFunction(g->mod, "llvm.fabs.f64", d1_ty);
+
+        LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+        LLVMBasicBlockRef chk_rnd = LLVMAppendBasicBlockInContext(g->ctx, fn, "chkr");
+        LLVMBasicBlockRef fast_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fast");
+        LLVMBasicBlockRef neg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "neg");
+        LLVMBasicBlockRef frac_chk = LLVMAppendBasicBlockInContext(g->ctx, fn, "fchk");
+        LLVMBasicBlockRef frac_prep = LLVMAppendBasicBlockInContext(g->ctx, fn, "fprep");
+        LLVMBasicBlockRef frac_loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "floop");
+        LLVMBasicBlockRef emit_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "femit");
+        LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
+
+        LLVMValueRef pdst = LLVMGetParam(fn, 0);
+        LLVMValueRef pv = LLVMGetParam(fn, 1);
+        LLVMValueRef pprec = LLVMGetParam(fn, 2);
+        LLVMValueRef pfmt = LLVMGetParam(fn, 3);
+
+        LLVMPositionBuilderAtEnd(g->builder, entry);
+        LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8,
+            LLVMConstInt(i64, 40, 0), "f.tmp");
+        LLVMValueRef prec64 = LLVMBuildZExt(g->builder, pprec, i64, "f.p64");
+        LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+        LLVMValueRef scale = LLVMBuildLoad2(g->builder, dbl,
+            LLVMBuildInBoundsGEP2(g->builder, fpow_arr_ty, fpow_gv,
+                (LLVMValueRef[]){ zero64, prec64 }, 2, "f.scp"), "f.sc");
+        LLVMValueRef av = zan_call2(g->builder, d1_ty, fabs_fn, &pv, 1, "f.av");
+        LLVMValueRef scaled = LLVMBuildFMul(g->builder, av, scale, "f.scaled");
+        /* 先判范围（ordered OLT 自动排除 NaN/Inf/极大值），确保后续 fptoui 绝不 UB */
+        LLVMValueRef in_range = LLVMBuildFCmp(g->builder, LLVMRealOLT, scaled,
+            LLVMConstReal(dbl, 1e12), "f.inrng");
+        LLVMBuildCondBr(g->builder, in_range, chk_rnd, slow_bb);
+
+        /* 纯 SSE2 半整数边界检验（零 floor/rint libm 调用）：
+         * scaled >= 0 且 < 1e12 时 fptoui 就是精确 floor，距 0.5 超过 0.001 时
+         * (uint64_t)(scaled + 0.5) 与无穷精度十进制舍入数学等价。 */
+        LLVMPositionBuilderAtEnd(g->builder, chk_rnd);
+        LLVMValueRef fl_i = LLVMBuildFPToUI(g->builder, scaled, i64, "f.fli");
+        LLVMValueRef fl = LLVMBuildUIToFP(g->builder, fl_i, dbl, "f.fl");
+        LLVMValueRef frac_d = LLVMBuildFSub(g->builder, scaled, fl, "f.fd");
+        LLVMValueRef half_d = LLVMBuildFSub(g->builder, frac_d,
+            LLVMConstReal(dbl, 0.5), "f.hd");
+        LLVMValueRef half_err = zan_call2(g->builder, d1_ty, fabs_fn, &half_d, 1, "f.herr");
+        LLVMValueRef safe_rnd = LLVMBuildFCmp(g->builder, LLVMRealOGT, half_err,
+            LLVMConstReal(dbl, 0.001), "f.srnd");
+        LLVMBuildCondBr(g->builder, safe_rnd, fast_bb, slow_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, fast_bb);
+        LLVMValueRef sp_half = LLVMBuildFAdd(g->builder, scaled,
+            LLVMConstReal(dbl, 0.5), "f.sph");
+        LLVMValueRef total = LLVMBuildFPToUI(g->builder, sp_half, i64, "f.tot");
+        LLVMValueRef iscale = LLVMBuildLoad2(g->builder, i64,
+            LLVMBuildInBoundsGEP2(g->builder, ipow_arr_ty, ipow_gv,
+                (LLVMValueRef[]){ zero64, prec64 }, 2, "f.iscp"), "f.isc");
+        LLVMValueRef int_part = LLVMBuildUDiv(g->builder, total, iscale, "f.int");
+        LLVMValueRef frac_part = LLVMBuildURem(g->builder, total, iscale, "f.frac");
+        LLVMValueRef istart = NULL, ilen = NULL;
+        emit_itoa64_digits_into_tmp(g, fn, tmp, int_part,
+            LLVMConstInt(i32, 1, 0), &istart, &ilen);
+        LLVMBasicBlockRef itoa_end_bb = LLVMGetInsertBlock(g->builder);
+        LLVMValueRef vbits = LLVMBuildBitCast(g->builder, pv, i64, "f.bits");
+        LLVMValueRef is_neg = LLVMBuildICmp(g->builder, LLVMIntSLT, vbits, zero64, "f.neg");
+        LLVMBuildCondBr(g->builder, is_neg, neg_bb, frac_chk);
+
+        LLVMPositionBuilderAtEnd(g->builder, neg_bb);
+        LLVMValueRef nstart = LLVMBuildSub(g->builder, istart,
+            LLVMConstInt(i64, 1, 0), "f.nstart");
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, '-', 0),
+            LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &nstart, 1, "f.negp"));
+        LLVMBuildBr(g->builder, frac_chk);
+
+        LLVMPositionBuilderAtEnd(g->builder, frac_chk);
+        LLVMValueRef start_phi = LLVMBuildPhi(g->builder, i64, "f.start");
+        LLVMAddIncoming(start_phi, (LLVMValueRef[]){ istart, nstart },
+            (LLVMBasicBlockRef[]){ itoa_end_bb, neg_bb }, 2);
+        LLVMValueRef has_frac = LLVMBuildICmp(g->builder, LLVMIntSGT, prec64, zero64, "f.hf");
+        LLVMBuildCondBr(g->builder, has_frac, frac_prep, emit_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, frac_prep);
+        LLVMValueRef dot_idx = LLVMConstInt(i64, 24, 0);
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, '.', 0),
+            LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &dot_idx, 1, "f.dotp"));
+        LLVMValueRef fend = LLVMBuildAdd(g->builder, dot_idx, prec64, "f.fend");
+        LLVMValueRef fend_p1 = LLVMBuildAdd(g->builder,
+            LLVMConstInt(i64, 25, 0), prec64, "f.ep1");
+        LLVMBuildBr(g->builder, frac_loop);
+
+        LLVMPositionBuilderAtEnd(g->builder, frac_loop);
+        LLVMValueRef fpos = LLVMBuildPhi(g->builder, i64, "f.fpos");
+        LLVMValueRef fval = LLVMBuildPhi(g->builder, i64, "f.fval");
+        LLVMValueRef fdig = LLVMBuildURem(g->builder, fval, LLVMConstInt(i64, 10, 0), "f.dig");
+        LLVMValueRef fnxt = LLVMBuildUDiv(g->builder, fval, LLVMConstInt(i64, 10, 0), "f.nxt");
+        LLVMValueRef fch = LLVMBuildTrunc(g->builder,
+            LLVMBuildAdd(g->builder, fdig, LLVMConstInt(i64, '0', 0), "f.d0"), i8, "f.ch");
+        LLVMBuildStore(g->builder, fch,
+            LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &fpos, 1, "f.fp"));
+        LLVMValueRef fpos_prev = LLVMBuildSub(g->builder, fpos,
+            LLVMConstInt(i64, 1, 0), "f.fprev");
+        LLVMAddIncoming(fpos, (LLVMValueRef[]){ fend, fpos_prev },
+            (LLVMBasicBlockRef[]){ frac_prep, frac_loop }, 2);
+        LLVMAddIncoming(fval, (LLVMValueRef[]){ frac_part, fnxt },
+            (LLVMBasicBlockRef[]){ frac_prep, frac_loop }, 2);
+        LLVMBuildCondBr(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGT, fpos_prev, dot_idx, "f.fmore"),
+            frac_loop, emit_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, emit_bb);
+        LLVMValueRef end_phi = LLVMBuildPhi(g->builder, i64, "f.end");
+        LLVMAddIncoming(end_phi,
+            (LLVMValueRef[]){ LLVMConstInt(i64, 24, 0), fend_p1 },
+            (LLVMBasicBlockRef[]){ frac_chk, frac_loop }, 2);
+        LLVMValueRef len = LLVMBuildSub(g->builder, end_phi, start_phi, "f.len");
+        LLVMValueRef src = LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &start_phi, 1, "f.src");
+        zan_call2(g->builder, memcpy_ty, memcpy_fn, (LLVMValueRef[]){ pdst, src, len }, 3, "");
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+            LLVMBuildInBoundsGEP2(g->builder, i8, pdst, &len, 1, "f.nul"));
+        LLVMBuildRet(g->builder, len);
+
+        /* 慢路径：边界/NaN/Inf/极大值回退 snprintf */
+        LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+        LLVMTypeRef snp_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i8ptr }, 3, 1);
+        LLVMValueRef wn = zan_call2(g->builder, snp_ty, g->fn_snprintf,
+            (LLVMValueRef[]){ pdst, LLVMConstInt(i64, 640, 0), pfmt, pv }, 4, "f.wn");
+        LLVMValueRef wn64 = LLVMBuildSExt(g->builder, wn, i64, "f.wn64");
+        LLVMValueRef max639 = LLVMConstInt(i64, 639, 0);
+        LLVMValueRef sl0 = LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSLT, wn64, zero64, "f.lt0"),
+            zero64, wn64, "f.l0");
+        LLVMValueRef slen = LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGT, sl0, max639, "f.gt"),
+            max639, sl0, "f.slen");
+        LLVMBuildRet(g->builder, slen);
+
+        g->current_fn = saved_fn;
+        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    }
+    /* 在调用方栈上格式化再分配托管串，自动触发 escape/SSO 零堆分配 */
+    LLVMValueRef scratch = emit_entry_scratch(g, 640, "ftos.tmp");
+    LLVMValueRef flen = zan_call2(g->builder, fn_ty, fn,
+        (LLVMValueRef[]){ scratch, v, LLVMConstInt(i32, prec, 0), pfmt_lit }, 4, "ftos.len");
+    LLVMValueRef bufsz = LLVMBuildAdd(g->builder, flen, LLVMConstInt(i64, 1, 0), "ftos.bsz");
+    LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
+    zan_call2(g->builder, memcpy_ty, memcpy_fn, (LLVMValueRef[]){ buf, scratch, flen }, 3, "");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+        LLVMBuildInBoundsGEP2(g->builder, i8, buf, &flen, 1, "ftos.nul"));
+    emit_string_len_set(g, buf, flen);
+    return buf;
+}
 void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
   if (!g->function_compactor || zan_diag_has_errors(g->diag))
     return;

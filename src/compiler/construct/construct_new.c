@@ -601,7 +601,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
       LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
       LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
       LLVMValueRef dict_raw = emit_alloc_rc_collection(
-          g, expr, 64, 3, resolve_type_ctx(g, expr->new_expr.type));
+          g, expr, 80, 3, resolve_type_ctx(g, expr->new_expr.type));
       LLVMValueRef typed_ptr =
           LLVMBuildBitCast(g->builder, dict_raw,
                            LLVMPointerType(g->dict_struct_type, 0), "dptr");
@@ -614,6 +614,12 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                           : (LLVMValueRef)LLVMConstInt(i64, 0, 0),
                       zp);
       }
+      zan_store_fit(g, LLVMConstInt(i64, 0, 0),
+                    LLVMBuildStructGEP2(g->builder, g->dict_struct_type,
+                                        typed_ptr, 8, "holes0"));
+      zan_store_fit(g, LLVMConstNull(i8ptr),
+                    LLVMBuildStructGEP2(g->builder, g->dict_struct_type,
+                                        typed_ptr, 9, "dead0"));
       zan_type_t *dict_type = resolve_type_ctx(g, expr->new_expr.type);
       zan_type_t *value_type = dict_value_type(dict_type);
       unsigned value_words = elem_slot_words(g, value_type);

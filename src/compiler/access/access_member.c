@@ -283,8 +283,12 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
                 LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "dcnt");
                 zan_tbaa_tag_cnt(g, cnt);
+                LLVMValueRef hp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 8, "dhp");
+                LLVMValueRef holes = LLVMBuildLoad2(g->builder, i64, hp, "dholes");
+                zan_tbaa_tag_cnt(g, holes);
+                LLVMValueRef live = zan_sub(g->builder, cnt, holes, "dlive");
                 emit_release_owned_call_temp(g, expr->member.object, raw, locals);
-                return cnt;
+                return live;
             }
         }
 
@@ -298,6 +302,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMValueRef raw = emit_guarded_member_object(g, expr, locals);
+                emit_dict_compact_if_holes(g, raw);
                 LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 bool dk_vw1 = want_keys || (elem && !type_mentions_canon(elem) &&

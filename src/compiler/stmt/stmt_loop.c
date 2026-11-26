@@ -208,6 +208,11 @@
             if (fe_array || fe_string) {
                 c0 = fe_len;
             } else {
+                if (col_type && type_named(col_type, "Dict", 4)) {
+                    emit_dict_compact_if_holes(g,
+                        LLVMBuildBitCast(g->builder, col0,
+                            LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "fe.d8"));
+                }
                 LLVMValueRef cnt_ptr0 = LLVMBuildStructGEP2(g->builder,
                     g->list_struct_type, col0, 0, "cnt_ptr");
                 c0 = LLVMBuildLoad2(g->builder, i64, cnt_ptr0, "cnt0");
@@ -324,6 +329,15 @@
                 col_cond, 0, "cnt_ptr");
             LLVMValueRef live = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
             zan_tbaa_tag_cnt(g, live);
+            if (col_type && type_named(col_type, "Dict", 4)) {
+                LLVMValueRef dp_c = LLVMBuildBitCast(g->builder, col_cond,
+                    LLVMPointerType(g->dict_struct_type, 0), "fe.dpc");
+                LLVMValueRef hp_c = LLVMBuildStructGEP2(g->builder,
+                    g->dict_struct_type, dp_c, 8, "fe.dhp");
+                LLVMValueRef dh_c = LLVMBuildLoad2(g->builder, i64, hp_c, "fe.dh");
+                zan_tbaa_tag_cnt(g, dh_c);
+                live = zan_sub(g->builder, live, dh_c, "fe.dlive");
+            }
             LLVMValueRef snap = LLVMBuildLoad2(g->builder, i64, fe_snap_alloc,
                                                "fe.snap");
             LLVMValueRef mutated = zan_icmp(g->builder, LLVMIntNE, live, snap,

@@ -35,10 +35,24 @@ static void borrow_note_decl(borrow_scan_t *s, zan_istr_t name) {
     if (borrow_name_eq(name, s->p)) s->p_decls++;
 }
 
+static zan_walk_action_t borrow_lambda_refs_visit(zan_ast_node_t *n, void *u) {
+    borrow_scan_t *s = (borrow_scan_t *)u;
+    if (borrow_names(n, s)) {
+        s->bad = true;
+        return ZAN_WALK_ABORT;
+    }
+    return ZAN_WALK_CONTINUE;
+}
+
 static zan_walk_action_t borrow_scan_visit(zan_ast_node_t *n, void *u) {
     borrow_scan_t *s = (borrow_scan_t *)u;
     switch (n->kind) {
-    case AST_LAMBDA: case AST_YIELD_STMT: case AST_AWAIT_EXPR:
+    case AST_LAMBDA:
+        /* 仅当该 lambda 体内实际提及 q 或 p（可能捕获/改写）时才保守放弃，
+         * 避免函数内存在无关 lambda 时毒化整函数全部局部借用与接收者免钉住。 */
+        zan_ast_walk(n->lambda.body, borrow_lambda_refs_visit, NULL, s);
+        return s->bad ? ZAN_WALK_ABORT : ZAN_WALK_SKIP_CHILDREN;
+    case AST_YIELD_STMT: case AST_AWAIT_EXPR:
     case AST_QUERY_EXPR: case AST_GOTO_STMT: case AST_METHOD_DECL:
         s->bad = true;
         break;
@@ -78,22 +92,42 @@ static zan_walk_action_t borrow_scan_visit(zan_ast_node_t *n, void *u) {
 static bool local_init_can_borrow(zan_irgen_t *g, zan_ast_node_t *stmt,
                                   zan_type_t *type, local_scope_t *locals) {
     zan_ast_node_t *init = stmt->var_decl.initializer;
-    if (!init || init->kind != AST_IDENTIFIER || !type) return false;
+    if (!init || !type) return false;
     if (!(is_arc_managed_type(type) || type->kind == TYPE_STRING)) return false;
     if (g->current_async_frame || !g->current_fn_body) return false;
-    local_var_t *src = local_find(locals, init->ident.name);
+    /* 支持引用向下/向上转型 `T q = (T)p;`：纯引用强转不分配新对象，与原指针同址 */
+    zan_ast_node_t *src_ident = init;
+    bool via_cast = false;
+    if (init->kind == AST_CAST_EXPR) {
+        if (!(type->kind == TYPE_CLASS || type->kind == TYPE_INTERFACE))
+            return false;
+        if (expr_yields_owned_rc_value(g, init, locals))
+            return false;
+        src_ident = init->cast.expr;
+        via_cast = true;
+    }
+    if (!src_ident || src_ident->kind != AST_IDENTIFIER) return false;
+    local_var_t *src = local_find(locals, src_ident->ident.name);
     if (!src || !src->type || src->box_cell || src->byref_slot ||
         src->async_decl || src->frame_owner >= 0 || src->struct_rc ||
         src->obj_rc_flag || src->opaque_string)
         return false;
     zan_type_t *st = src->type;
-    if (st->kind != type->kind ||
-        !(is_arc_managed_type(st) || st->kind == TYPE_STRING))
-        return false;
+    if (via_cast) {
+        if (!(st->kind == TYPE_CLASS || st->kind == TYPE_INTERFACE ||
+              st->kind == TYPE_OBJECT))
+            return false;
+        if (find_user_conversion(g, st, type, "op_explicit") != NULL)
+            return false;
+    } else {
+        if (!((is_arc_managed_type(st) && is_arc_managed_type(type)) ||
+              (st->kind == TYPE_STRING && type->kind == TYPE_STRING)))
+            return false;
+    }
     borrow_scan_t scan;
     memset(&scan, 0, sizeof scan);
     scan.q = stmt->var_decl.name;
-    scan.p = init->ident.name;
+    scan.p = src_ident->ident.name;
     zan_ast_walk(g->current_fn_body, borrow_scan_visit, NULL, &scan);
     return !scan.bad && scan.q_decls == 1 && scan.p_decls <= 1;
 }

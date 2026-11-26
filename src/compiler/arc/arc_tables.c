@@ -197,10 +197,14 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMValueRef ix = LLVMBuildLoad2(
         b, i8ptr, LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 4, "ip"),
         "ix8");
+    LLVMValueRef dead = LLVMBuildLoad2(
+        b, i8ptr, LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 9, "deadp"),
+        "dead8");
     emit_dict_release_elems(g, elem_type, obj);
     zan_call2(b, free_ty, g->fn_free, &ks, 1, "");
     zan_call2(b, free_ty, g->fn_free, &vs, 1, "");
     zan_call2(b, free_ty, g->fn_free, &ix, 1, "");
+    zan_call2(b, free_ty, g->fn_free, &dead, 1, "");
   } else if (coll_kind == 2) {
     LLVMValueRef sp =
         LLVMBuildBitCast(b, obj, LLVMPointerType(g->sb_struct_type, 0), "sp");

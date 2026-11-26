@@ -43,24 +43,98 @@
     return by_out;
 }
 
-/* String */
-if (is_call_to(expr, "String", "CompareOrdinal") &&
+/* String.CompareOrdinal / string.CompareOrdinal：
+ * 指针相等 → null 守卫 → 首字节无符号差值快路径 → strcmp(a+1, b+1)。 */
+if ((is_call_to(expr, "String", "CompareOrdinal") ||
+     is_call_to(expr, "string", "CompareOrdinal")) &&
     expr->call.args.count == 2) {
-  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   zan_ast_node_t *a_ast = expr->call.args.items[0];
   zan_ast_node_t *b_ast = expr->call.args.items[1];
   LLVMValueRef a = emit_expr(g, a_ast, locals);
   LLVMValueRef b = emit_expr(g, b_ast, locals);
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+  LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+  LLVMBasicBlockRef null_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oc.null");
+  LLVMBasicBlockRef bnull_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oc.bnull");
+  LLVMBasicBlockRef b0_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oc.b0");
+  LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oc.slow");
+  LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oc.done");
+  LLVMValueRef zero32 = LLVMConstInt(i32t, 0, 0);
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntEQ, a, b, "oc.peq"),
+                  done_bb, null_bb);
+  LLVMPositionBuilderAtEnd(g->builder, null_bb);
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntEQ, a, LLVMConstNull(i8ptr), "oc.an"),
+                  done_bb, bnull_bb);
+  LLVMPositionBuilderAtEnd(g->builder, bnull_bb);
+  LLVMBuildCondBr(g->builder,
+                  LLVMBuildICmp(g->builder, LLVMIntEQ, b, LLVMConstNull(i8ptr), "oc.bn"),
+                  done_bb, b0_bb);
+  LLVMPositionBuilderAtEnd(g->builder, b0_bb);
+  LLVMValueRef c0 = LLVMBuildZExt(g->builder, LLVMBuildLoad2(g->builder, i8t, a, "oc.a0"),
+                                  i32t, "oc.c0");
+  LLVMValueRef c1 = LLVMBuildZExt(g->builder, LLVMBuildLoad2(g->builder, i8t, b, "oc.b0"),
+                                  i32t, "oc.c1");
+  LLVMValueRef diff = LLVMBuildSub(g->builder, c0, c1, "oc.diff");
+  LLVMValueRef quick = LLVMBuildOr(
+      g->builder,
+      LLVMBuildICmp(g->builder, LLVMIntNE, diff, zero32, "oc.dne"),
+      LLVMBuildICmp(g->builder, LLVMIntEQ, c0, zero32, "oc.z0"), "oc.q");
+  LLVMBuildCondBr(g->builder, quick, done_bb, slow_bb);
+  LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+  LLVMValueRef one64 = LLVMConstInt(i64t, 1, 0);
+  LLVMValueRef a1 = LLVMBuildInBoundsGEP2(g->builder, i8t, a, &one64, 1, "oc.a1");
+  LLVMValueRef b1 = LLVMBuildInBoundsGEP2(g->builder, i8t, b, &one64, 1, "oc.b1");
   LLVMTypeRef strcmp_ty =
       LLVMFunctionType(i32t, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0);
   LLVMValueRef strcmp_fn = get_libc_fn(g, "strcmp", strcmp_ty);
-  LLVMValueRef r = zan_call2(g->builder, strcmp_ty, strcmp_fn,
-                             (LLVMValueRef[]){a, b}, 2, "ordcmp");
+  LLVMValueRef r_slow = zan_call2(g->builder, strcmp_ty, strcmp_fn,
+                                  (LLVMValueRef[]){a1, b1}, 2, "ordcmp");
+  LLVMBuildBr(g->builder, done_bb);
+  LLVMPositionBuilderAtEnd(g->builder, done_bb);
+  LLVMValueRef res32 = LLVMBuildPhi(g->builder, i32t, "oc.res");
+  LLVMAddIncoming(
+      res32,
+      (LLVMValueRef[]){zero32, LLVMConstInt(i32t, (unsigned long long)-1, 1),
+                       LLVMConstInt(i32t, 1, 0), diff, r_slow},
+      (LLVMBasicBlockRef[]){entry_bb, null_bb, bnull_bb, b0_bb, slow_bb}, 5);
   emit_release_owned_call_temp(g, a_ast, a, locals);
   emit_release_owned_call_temp(g, b_ast, b, locals);
-  return LLVMBuildSExt(g->builder, r, i64t, "ordcmp64");
+  return LLVMBuildSExt(g->builder, res32, i64t, "ordcmp64");
+}
+
+/* Array.Sort(T[])：原生零越界/零 ARC 原始缓冲内省排序（int/long/double/string 数组） */
+if (is_call_to(expr, "Array", "Sort") && expr->call.args.count == 1) {
+  zan_ast_node_t *a_ast = expr->call.args.items[0];
+  zan_type_t *at = infer_expr_type(g, a_ast, locals);
+  if (at && at->kind == TYPE_ARRAY && at->array_rank <= 1 && at->element_type) {
+    int sort_kind = -1;
+    if (at->element_type->kind == TYPE_INT) sort_kind = ZAN_SORT_I32;
+    else if (at->element_type->kind == TYPE_LONG) sort_kind = ZAN_SORT_I64;
+    else if (at->element_type->kind == TYPE_DOUBLE) sort_kind = ZAN_SORT_F64;
+    else if (at->element_type->kind == TYPE_STRING) sort_kind = ZAN_SORT_STR;
+    if (sort_kind >= 0) {
+      LLVMValueRef arr = emit_expr(g, a_ast, locals);
+      LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+      LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "asort.go");
+      LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "asort.end");
+      LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ,
+          arr, LLVMConstNull(LLVMTypeOf(arr)), "asort.null");
+      LLVMBuildCondBr(g->builder, is_null, end_bb, go_bb);
+      LLVMPositionBuilderAtEnd(g->builder, go_bb);
+      LLVMValueRef len = zan_array_len(g, arr);
+      emit_raw_buffer_sort(g, sort_kind, arr, len, NULL);
+      LLVMBuildBr(g->builder, end_bb);
+      LLVMPositionBuilderAtEnd(g->builder, end_bb);
+      emit_release_owned_call_temp(g, a_ast, arr, locals);
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+  }
 }
 
 /* Math.Sqrt(expr) → llvm.sqrt */

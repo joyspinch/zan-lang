@@ -327,6 +327,8 @@ LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v,
                             int is_unsigned);
 LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned);
 LLVMValueRef emit_dbl_string(zan_irgen_t *g, LLVMValueRef v);
+LLVMValueRef emit_dbl_fixed_string(zan_irgen_t *g, LLVMValueRef v, int prec,
+                                   LLVMValueRef pfmt_lit);
 void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta);
 void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes);
 LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
@@ -665,6 +667,20 @@ LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
 
 /* --- From irgen_builtins.c (36 functions) --- */
 LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key, zan_type_t *kt);
+LLVMValueRef get_dict_compact_fn(zan_irgen_t *g);
+void emit_dict_compact_if_holes(zan_irgen_t *g, LLVMValueRef draw);
+typedef enum {
+    ZAN_SORT_I32 = 0,
+    ZAN_SORT_I64,
+    ZAN_SORT_F64,
+    ZAN_SORT_STR,
+    ZAN_SORT_CMP_I32,
+    ZAN_SORT_CMP_I64,
+    ZAN_SORT_CMP_F64,
+    ZAN_SORT_CMP_PTR,
+} zan_sort_kind_t;
+void emit_raw_buffer_sort(zan_irgen_t *g, int kind, LLVMValueRef data_raw,
+                          LLVMValueRef count, LLVMValueRef cmp_or_null);
 LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                             LLVMValueRef draw, LLVMValueRef key);
 LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx);

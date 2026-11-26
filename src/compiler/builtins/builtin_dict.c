@@ -285,6 +285,165 @@ static LLVMValueRef emit_cttz32(zan_irgen_t *g, LLVMValueRef val32) {
     return zan_call2(g->builder, fty, fn, args, 2, "cttz");
 }
 
+/* 冷路径：原地紧缩存在删除空洞的 Dict（保持插入序，消除非尾删的 O(N) 搬移）。 */
+LLVMValueRef get_dict_compact_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_compact");
+    if (fn) return fn;
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(c);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef dty = g->dict_struct_type;
+    LLVMTypeRef fnty = LLVMFunctionType(voidt, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_dict_compact", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    dict_add_fn_attr(g, fn, "noinline");
+    dict_add_fn_attr(g, fn, "cold");
+    dict_add_fn_attr(g, fn, "nounwind");
+    LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32, i64 }, 3, 0);
+    LLVMValueRef memset_fn = get_libc_fn(g, "memset", memset_ty);
+    LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+    LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(b);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMBasicBlockRef prep = LLVMAppendBasicBlockInContext(c, fn, "prep");
+    LLVMBasicBlockRef cond = LLVMAppendBasicBlockInContext(c, fn, "cond");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(c, fn, "body");
+    LLVMBasicBlockRef live = LLVMAppendBasicBlockInContext(c, fn, "live");
+    LLVMBasicBlockRef mv = LLVMAppendBasicBlockInContext(c, fn, "mv");
+    LLVMBasicBlockRef mv1 = LLVMAppendBasicBlockInContext(c, fn, "mv1");
+    LLVMBasicBlockRef mvn = LLVMAppendBasicBlockInContext(c, fn, "mvn");
+    LLVMBasicBlockRef mvd = LLVMAppendBasicBlockInContext(c, fn, "mvd");
+    LLVMBasicBlockRef step = LLVMAppendBasicBlockInContext(c, fn, "step");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "done");
+
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef draw = LLVMGetParam(fn, 0);
+    LLVMValueRef dnull = zan_icmp(b, LLVMIntEQ, draw, LLVMConstNull(i8ptr), "dnull");
+    LLVMBuildCondBr(b, dnull, ret_bb, prep);
+
+    LLVMPositionBuilderAtEnd(b, ret_bb);
+    LLVMBuildRetVoid(b);
+
+    LLVMPositionBuilderAtEnd(b, prep);
+    LLVMValueRef dp = LLVMBuildBitCast(b, draw, LLVMPointerType(dty, 0), "dp");
+    LLVMValueRef cntp = LLVMBuildStructGEP2(b, dty, dp, 0, "cntp");
+    LLVMValueRef kp = LLVMBuildStructGEP2(b, dty, dp, 2, "kp");
+    LLVMValueRef vp = LLVMBuildStructGEP2(b, dty, dp, 3, "vp");
+    LLVMValueRef icntp = LLVMBuildStructGEP2(b, dty, dp, 6, "icntp");
+    LLVMValueRef vwp = LLVMBuildStructGEP2(b, dty, dp, 7, "vwp");
+    LLVMValueRef hp = LLVMBuildStructGEP2(b, dty, dp, 8, "hp");
+    LLVMValueRef deadp = LLVMBuildStructGEP2(b, dty, dp, 9, "deadp");
+    LLVMValueRef holes = LLVMBuildLoad2(b, i64, hp, "holes");
+    LLVMValueRef dead = LLVMBuildLoad2(b, i8ptr, deadp, "dead");
+    LLVMValueRef skip = zan_or(b,
+        zan_icmp(b, LLVMIntEQ, holes, LLVMConstInt(i64, 0, 0), "noholes"),
+        zan_icmp(b, LLVMIntEQ, dead, LLVMConstNull(i8ptr), "nodead"), "skip");
+    LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
+    LLVMValueRef ks = LLVMBuildLoad2(b, i8pp, kp, "ks");
+    LLVMValueRef vs = LLVMBuildLoad2(b, i64ptr, vp, "vs");
+    LLVMValueRef vw = LLVMBuildLoad2(b, i64, vwp, "vw");
+    LLVMValueRef vw_is1 = zan_icmp(b, LLVMIntEQ, vw, LLVMConstInt(i64, 1, 0), "vw1");
+    LLVMValueRef vw_bytes = zan_mul(b, vw, LLVMConstInt(i64, 8, 0), "vwb");
+    LLVMBuildCondBr(b, skip, ret_bb, cond);
+
+    LLVMPositionBuilderAtEnd(b, cond);
+    LLVMValueRef ri = LLVMBuildPhi(b, i64, "r");
+    LLVMValueRef wi = LLVMBuildPhi(b, i64, "w");
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, ri, cnt, "more"), body, done);
+
+    LLVMPositionBuilderAtEnd(b, body);
+    LLVMValueRef db = LLVMBuildLoad2(b, i8,
+        LLVMBuildInBoundsGEP2(b, i8, dead, &ri, 1, "dbp"), "db");
+    LLVMBuildCondBr(b,
+        LLVMBuildICmp(b, LLVMIntNE, db, LLVMConstInt(i8, 0, 0), "isd"),
+        step, live);
+
+    LLVMPositionBuilderAtEnd(b, live);
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntNE, wi, ri, "diff"), mv, mvd);
+
+    LLVMPositionBuilderAtEnd(b, mv);
+    LLVMValueRef kv = LLVMBuildLoad2(b, i8ptr,
+        LLVMBuildInBoundsGEP2(b, i8ptr, ks, &ri, 1, "kr"), "kv");
+    LLVMBuildStore(b, kv, LLVMBuildInBoundsGEP2(b, i8ptr, ks, &wi, 1, "kw"));
+    LLVMBuildCondBr(b, vw_is1, mv1, mvn);
+
+    LLVMPositionBuilderAtEnd(b, mv1);
+    LLVMValueRef vv = LLVMBuildLoad2(b, i64,
+        LLVMBuildInBoundsGEP2(b, i64, vs, &ri, 1, "vr"), "vv");
+    LLVMBuildStore(b, vv, LLVMBuildInBoundsGEP2(b, i64, vs, &wi, 1, "vw1s"));
+    LLVMBuildBr(b, mvd);
+
+    LLVMPositionBuilderAtEnd(b, mvn);
+    LLVMValueRef rw = zan_mul(b, ri, vw, "rw");
+    LLVMValueRef ww = zan_mul(b, wi, vw, "ww");
+    LLVMValueRef vsrc = LLVMBuildBitCast(b,
+        LLVMBuildInBoundsGEP2(b, i64, vs, &rw, 1, "vsp"), i8ptr, "vs8");
+    LLVMValueRef vdst = LLVMBuildBitCast(b,
+        LLVMBuildInBoundsGEP2(b, i64, vs, &ww, 1, "vdp"), i8ptr, "vd8");
+    zan_call2(b, memcpy_ty, memcpy_fn, (LLVMValueRef[]){ vdst, vsrc, vw_bytes }, 3, "");
+    LLVMBuildBr(b, mvd);
+
+    LLVMPositionBuilderAtEnd(b, mvd);
+    LLVMValueRef wi_inc = zan_add(b, wi, LLVMConstInt(i64, 1, 0), "wn");
+    LLVMBuildBr(b, step);
+
+    LLVMPositionBuilderAtEnd(b, step);
+    LLVMValueRef wi_next = LLVMBuildPhi(b, i64, "wn.phi");
+    LLVMAddIncoming(wi_next, (LLVMValueRef[]){ wi, wi_inc },
+        (LLVMBasicBlockRef[]){ body, mvd }, 2);
+    LLVMValueRef ri_next = zan_add(b, ri, LLVMConstInt(i64, 1, 0), "rn");
+    LLVMBuildBr(b, cond);
+    LLVMAddIncoming(ri, (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), ri_next },
+        (LLVMBasicBlockRef[]){ prep, step }, 2);
+    LLVMAddIncoming(wi, (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), wi_next },
+        (LLVMBasicBlockRef[]){ prep, step }, 2);
+
+    LLVMPositionBuilderAtEnd(b, done);
+    zan_call2(b, memset_ty, memset_fn,
+        (LLVMValueRef[]){ dead, LLVMConstInt(i32, 0, 0), cnt }, 3, "");
+    LLVMBuildStore(b, wi, cntp);
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), hp);
+    LLVMBuildStore(b, LLVMConstInt(i64, (unsigned long long)-1, 1), icntp);
+    LLVMBuildRetVoid(b);
+
+    g->current_fn = saved_fn;
+    if (saved) LLVMPositionBuilderAtEnd(b, saved);
+    return fn;
+}
+
+void emit_dict_compact_if_holes(zan_irgen_t *g, LLVMValueRef draw) {
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef dty = g->dict_struct_type;
+    LLVMValueRef dp = LLVMBuildBitCast(b, draw, LLVMPointerType(dty, 0), "dcmp.dp");
+    LLVMValueRef hp = LLVMBuildStructGEP2(b, dty, dp, 8, "dcmp.hp");
+    LLVMValueRef holes = LLVMBuildLoad2(b, i64, hp, "dcmp.h");
+    zan_tbaa_tag_cnt(g, holes);
+    LLVMValueRef has = zan_icmp(b, LLVMIntNE, holes, LLVMConstInt(i64, 0, 0), "dcmp.has");
+    LLVMValueRef cur_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef do_bb = LLVMAppendBasicBlockInContext(c, cur_fn, "dcmp.do");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(c, cur_fn, "dcmp.done");
+    LLVMValueRef br = LLVMBuildCondBr(b, has, do_bb, done_bb);
+    dict_set_branch_weights(g, br, 1, 2000);
+    LLVMPositionBuilderAtEnd(b, do_bb);
+    LLVMValueRef cfn = get_dict_compact_fn(g);
+    zan_call2(b, LLVMGlobalGetValueType(cfn), cfn, &draw, 1, "");
+    LLVMBuildBr(b, done_bb);
+    LLVMPositionBuilderAtEnd(b, done_bb);
+}
+
 /* 冷路径：SwissTable 增量追加或扩容重建（从 __zan_dict_find 拆出，避免阻塞热查找内联） */
 static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_rebuild");
@@ -329,6 +488,8 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef caploop  = LLVMAppendBasicBlockInContext(c, fn, "rb.caploop");
     LLVMBasicBlockRef capb     = LLVMAppendBasicBlockInContext(c, fn, "rb.capb");
     LLVMBasicBlockRef alloc    = LLVMAppendBasicBlockInContext(c, fn, "rb.alloc");
+    LLVMBasicBlockRef reuse_bb = LLVMAppendBasicBlockInContext(c, fn, "rb.reuse");
+    LLVMBasicBlockRef do_alloc = LLVMAppendBasicBlockInContext(c, fn, "rb.doalloc");
     LLVMBasicBlockRef alloc_ok = LLVMAppendBasicBlockInContext(c, fn, "rb.allocok");
     LLVMBasicBlockRef append_bb = LLVMAppendBasicBlockInContext(c, fn, "rb.append");
     LLVMBasicBlockRef fcond    = LLVMAppendBasicBlockInContext(c, fn, "rb.cond");
@@ -350,6 +511,7 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMValueRef is_str = LLVMGetParam(fn, 1);
 
     LLVMValueRef i_a = LLVMBuildAlloca(b, i64, "i");
+    LLVMValueRef cnt_a = LLVMBuildAlloca(b, i64, "cnt.cur");
     LLVMValueRef cap_a = LLVMBuildAlloca(b, i64, "ncap");
     LLVMValueRef gidx_a = LLVMBuildAlloca(b, i64, "gidx");
     LLVMValueRef step_a = LLVMBuildAlloca(b, i64, "step");
@@ -359,16 +521,17 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMValueRef dp = LLVMBuildBitCast(b, draw, LLVMPointerType(dty, 0), "dp");
     LLVMValueRef cntp = LLVMBuildStructGEP2(b, dty, dp, 0, "cntp");
     LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
+    LLVMBuildStore(b, cnt, cnt_a);
     LLVMValueRef kp = LLVMBuildStructGEP2(b, dty, dp, 2, "kp");
     LLVMValueRef ixp = LLVMBuildStructGEP2(b, dty, dp, 4, "ixp");
     LLVMValueRef icapp = LLVMBuildStructGEP2(b, dty, dp, 5, "icapp");
     LLVMValueRef icntp = LLVMBuildStructGEP2(b, dty, dp, 6, "icntp");
+    LLVMValueRef hp = LLVMBuildStructGEP2(b, dty, dp, 8, "hp");
     LLVMValueRef ix = LLVMBuildLoad2(b, i8ptr, ixp, "ix");
     LLVMValueRef icap = LLVMBuildLoad2(b, i64, icapp, "icap");
     LLVMValueRef icnt = LLVMBuildLoad2(b, i64, icntp, "icnt");
     LLVMValueRef noidx = zan_icmp(b, LLVMIntEQ, ix, LLVMConstNull(i8ptr), "noidx");
     LLVMValueRef nocap = zan_icmp(b, LLVMIntSLE, icap, LLVMConstInt(i64, 0, 0), "nocap");
-    LLVMValueRef cnt8 = zan_mul(b, cnt, LLVMConstInt(i64, 8, 0), "cnt8");
 
     /* 增量追加：已有索引、只多出尾部新条目、且（存活 + 墓碑）仍在 87.5% 负载内 */
     LLVMBuildCondBr(b, zan_or(b, noidx, nocap, "noix"), capc, needc2);
@@ -380,8 +543,10 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMBuildRet(b, LLVMConstInt(i1, 1, 0));
 
     LLVMPositionBuilderAtEnd(b, needc2);
+    LLVMValueRef holes = LLVMBuildLoad2(b, i64, hp, "holes");
+    LLVMValueRef live_cnt = zan_sub(b, cnt, holes, "live");
     LLVMValueRef tomb = LLVMBuildLoad2(b, i64, emit_dict_tomb_ptr(g, ix, icap), "tomb");
-    LLVMValueRef used8 = zan_mul(b, zan_add(b, cnt, tomb, "used"),
+    LLVMValueRef used8 = zan_mul(b, zan_add(b, live_cnt, tomb, "used"),
         LLVMConstInt(i64, 8, 0), "used8");
     LLVMValueRef cap7 = zan_mul(b, icap, LLVMConstInt(i64, 7, 0), "cap7");
     LLVMValueRef fits = zan_icmp(b, LLVMIntSLE, used8, cap7, "fits");
@@ -398,6 +563,11 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, fcond);
 
     LLVMPositionBuilderAtEnd(b, capc);
+    /* 整表重建前若有删除空洞，先原地紧缩，保证键数组致密且不带无效槽。 */
+    emit_dict_compact_if_holes(g, draw);
+    LLVMValueRef cnt_rb = LLVMBuildLoad2(b, i64, cntp, "cnt.rb");
+    LLVMBuildStore(b, cnt_rb, cnt_a);
+    LLVMValueRef cnt8 = zan_mul(b, cnt_rb, LLVMConstInt(i64, 8, 0), "cnt8");
     LLVMBuildStore(b, LLVMConstInt(i64, 16, 0), cap_a);
     /* want = (cnt * 8 + 6) / 7 */
     LLVMValueRef want = zan_sdiv(b,
@@ -413,8 +583,23 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, caploop);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    zan_call2(b, ixfree_ty, ixfree_fn, &ix, 1, "");
     LLVMValueRef ncap = LLVMBuildLoad2(b, i64, cap_a, "ncap.v");
+    LLVMValueRef can_reuse = zan_and(b,
+        zan_icmp(b, LLVMIntNE, ix, LLVMConstNull(i8ptr), "has_oldix"),
+        zan_icmp(b, LLVMIntEQ, ncap, icap, "same_cap"), "can_reuse");
+    LLVMBuildCondBr(b, can_reuse, reuse_bb, do_alloc);
+
+    LLVMPositionBuilderAtEnd(b, reuse_bb);
+    LLVMValueRef r_ctrl_sz = zan_add(b, icap, LLVMConstInt(i64, 16, 0), "r_ctrl_sz");
+    zan_call2(b, memset_ty, memset_fn,
+        (LLVMValueRef[]){ ix, LLVMConstInt(i32, ZAN_DICT_CTRL_EMPTY, 0), r_ctrl_sz }, 3, "");
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), emit_dict_tomb_ptr(g, ix, icap));
+    LLVMBuildStore(b, LLVMBuildLoad2(b, i64, cnt_a, "cnt.ru"), icntp);
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), i_a);
+    LLVMBuildBr(b, fcond);
+
+    LLVMPositionBuilderAtEnd(b, do_alloc);
+    zan_call2(b, ixfree_ty, ixfree_fn, &ix, 1, "");
     /* total_bytes = (ncap + 16) + (ncap * 4) + 8（墓碑计数）= ncap * 5 + 24 */
     LLVMValueRef total_bytes = zan_add(b,
         zan_mul(b, ncap, LLVMConstInt(i64, 5, 0), "ncap5"),
@@ -432,14 +617,15 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), emit_dict_tomb_ptr(g, nix, ncap));
     LLVMBuildStore(b, nix, ixp);
     LLVMBuildStore(b, ncap, icapp);
-    LLVMBuildStore(b, cnt, icntp);
+    LLVMBuildStore(b, LLVMBuildLoad2(b, i64, cnt_a, "cnt.al"), icntp);
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), i_a);
     LLVMBuildBr(b, fcond);
 
     /* ---- Rebuild / Populate Table Loop ---- */
     LLVMPositionBuilderAtEnd(b, fcond);
     LLVMValueRef fi = LLVMBuildLoad2(b, i64, i_a, "fi");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, fi, cnt, "fmore"), fbody, ok_bb);
+    LLVMValueRef cnt_lim = LLVMBuildLoad2(b, i64, cnt_a, "cnt.lim");
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, fi, cnt_lim, "fmore"), fbody, ok_bb);
 
     LLVMPositionBuilderAtEnd(b, fbody);
     LLVMValueRef cur_cap = LLVMBuildLoad2(b, i64, icapp, "cur_cap");
@@ -476,7 +662,8 @@ static LLVMValueRef get_dict_rebuild_fn(zan_irgen_t *g) {
     LLVMValueRef dslot = zan_and(b, zan_add(b, cur_gidx, bit64, "dslot0"), fmask, "dslot");
     LLVMValueRef dentry32 = LLVMBuildLoad2(b, i32, LLVMBuildInBoundsGEP2(b, i32, slots_base, &dslot, 1, "dentryp"), "dentry32");
     LLVMValueRef dentry = LLVMBuildZExt(b, dentry32, i64, "dentry");
-    LLVMValueRef valid_idx = zan_icmp(b, LLVMIntSLT, dentry, cnt, "valid_idx");
+    LLVMValueRef valid_idx = zan_icmp(b, LLVMIntSLT, dentry,
+        LLVMBuildLoad2(b, i64, cnt_a, "cnt.dup"), "valid_idx");
     LLVMBuildCondBr(b, valid_idx, fp_keq, fp_dnext);
 
     LLVMPositionBuilderAtEnd(b, fp_keq);
@@ -624,6 +811,7 @@ static LLVMValueRef get_dict_find_spec_fn(zan_irgen_t *g, int is_str_val) {
 
     /* ---- Hot Path Lookup Probe ---- */
     LLVMPositionBuilderAtEnd(b, probe);
+    LLVMValueRef pcnt = LLVMBuildLoad2(b, i64, cntp, "pcnt");
     LLVMValueRef pix = LLVMBuildLoad2(b, i8ptr, ixp, "pix");
     LLVMValueRef pcap = LLVMBuildLoad2(b, i64, icapp, "pcap");
     LLVMValueRef pks = LLVMBuildLoad2(b, i8pp, kp, "pks");
@@ -661,7 +849,7 @@ static LLVMValueRef get_dict_find_spec_fn(zan_irgen_t *g, int is_str_val) {
     LLVMValueRef p_entry32 = LLVMBuildLoad2(b, i32,
         LLVMBuildInBoundsGEP2(b, i32, p_slots_base, &p_slot, 1, "p_entryp"), "p_entry32");
     LLVMValueRef p_entry = LLVMBuildZExt(b, p_entry32, i64, "p_entry");
-    LLVMValueRef p_valid = zan_icmp(b, LLVMIntSLT, p_entry, cnt, "p_valid");
+    LLVMValueRef p_valid = zan_icmp(b, LLVMIntSLT, p_entry, pcnt, "p_valid");
     LLVMBasicBlockRef p_keq_bb = LLVMAppendBasicBlockInContext(c, fn, "p.keq");
     LLVMBasicBlockRef p_mnext_bb = LLVMAppendBasicBlockInContext(c, fn, "p.mnext");
     LLVMBuildCondBr(b, p_valid, p_keq_bb, p_mnext_bb);
@@ -780,21 +968,22 @@ LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef nokey = zan_icmp(b, LLVMIntSLT, fi, LLVMConstInt(i64, 0, 0), "nokey");
     LLVMBuildCondBr(b, nokey, miss, hit);
 
-    /* 命中后调用方会把条目 fi 之后的键值整体前移一格（保持插入序）。
-     * 曾在这里把 icnt 清零，逼下一次查找对全部 n 个键重新哈希建索引——
-     * 删除密集负载退化为 O(n²)（2 万次删插查 4.5s）。现就地修正索引：
-     * 被删条目的槽打墓碑，下标 > fi 的槽减一；只扫控制字节与槽、不哈希。
-     * 墓碑累积到负载上限时才回退到整表重建。 */
+    /* 命中后统一走 O(1) SIMD 探测把 SwissTable 对应槽打墓碑（尾删与非尾删均 O(1)！）：
+     * 尾元素删除直接递减 cnt 并顺手回收紧邻尾部空洞；非尾元素删除惰性分配 dead 标记数组，
+     * 置 dead[fi]=1、holes++，零 memmove、零全表扫描；仅在扩容/重建/Keys/Values/foreach
+     * 时原地紧缩，保持插入序且均摊严格 O(1)。 */
     LLVMPositionBuilderAtEnd(b, hit);
     LLVMContextRef cx = c;
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(cx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(cx);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(cx);
     LLVMTypeRef i32ptr = LLVMPointerType(i32, 0);
     LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
-    LLVMValueRef ncnt = zan_sub(b, cnt, LLVMConstInt(i64, 1, 0), "cnt.d");
-    LLVMBuildStore(b, ncnt, cntp);
+    LLVMValueRef capp = LLVMBuildStructGEP2(b, dty, dp, 1, "capp");
     LLVMValueRef ixp = LLVMBuildStructGEP2(b, dty, dp, 4, "ixp");
     LLVMValueRef icapp = LLVMBuildStructGEP2(b, dty, dp, 5, "icapp");
+    LLVMValueRef hp = LLVMBuildStructGEP2(b, dty, dp, 8, "hp");
+    LLVMValueRef deadp = LLVMBuildStructGEP2(b, dty, dp, 9, "deadp");
     LLVMValueRef ix = LLVMBuildLoad2(b, i8ptr, ixp, "ix");
     LLVMValueRef icap = LLVMBuildLoad2(b, i64, icapp, "icap");
     LLVMValueRef icnt = LLVMBuildLoad2(b, i64, icntp, "icnt");
@@ -803,32 +992,6 @@ LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
         zan_icmp(b, LLVMIntSGT, icap, LLVMConstInt(i64, 0, 0), "hascap"), "c1"),
         zan_icmp(b, LLVMIntEQ, icnt, cnt, "fresh"), "cur");
     LLVMBasicBlockRef stale_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.stale");
-    LLVMBasicBlockRef fix_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.fix");
-    LLVMBasicBlockRef lcond = LLVMAppendBasicBlockInContext(cx, fn, "rm.lcond");
-    LLVMBasicBlockRef lbody = LLVMAppendBasicBlockInContext(cx, fn, "rm.lbody");
-    LLVMBasicBlockRef locc = LLVMAppendBasicBlockInContext(cx, fn, "rm.occ");
-    LLVMBasicBlockRef lkill = LLVMAppendBasicBlockInContext(cx, fn, "rm.kill");
-    LLVMBasicBlockRef lmirror = LLVMAppendBasicBlockInContext(cx, fn, "rm.mirror");
-    LLVMBasicBlockRef lgt = LLVMAppendBasicBlockInContext(cx, fn, "rm.gtchk");
-    LLVMBasicBlockRef ldec = LLVMAppendBasicBlockInContext(cx, fn, "rm.dec");
-    LLVMBasicBlockRef lnext = LLVMAppendBasicBlockInContext(cx, fn, "rm.next");
-    LLVMBasicBlockRef ldone = LLVMAppendBasicBlockInContext(cx, fn, "rm.ldone");
-    LLVMBasicBlockRef lfull = LLVMAppendBasicBlockInContext(cx, fn, "rm.full");
-    LLVMBasicBlockRef lret = LLVMAppendBasicBlockInContext(cx, fn, "rm.ret");
-    LLVMBuildCondBr(b, cur, fix_bb, stale_bb);
-
-    LLVMPositionBuilderAtEnd(b, stale_bb);
-    LLVMBuildStore(b, LLVMConstInt(i64, (unsigned long long)-1, 1), icntp);
-    LLVMBuildRet(b, fi);
-
-    LLVMPositionBuilderAtEnd(b, fix_bb);
-    LLVMValueRef soff = zan_add(b, icap, LLVMConstInt(i64, 16, 0), "rm.soff");
-    LLVMValueRef slots = LLVMBuildBitCast(b,
-        LLVMBuildInBoundsGEP2(b, i8, ix, &soff, 1, "rm.s8"), i32ptr, "rm.slots");
-    LLVMValueRef is_tail_rm = zan_icmp(b, LLVMIntEQ, fi, ncnt, "rm.istail");
-    LLVMValueRef i64ptr_ix = LLVMPointerType(i64, 0);
-    LLVMValueRef mask8 = LLVMConstInt(i64, 0x8080808080808080ULL, 0);
-    LLVMValueRef del = LLVMConstInt(i8, ZAN_DICT_CTRL_DELETED, 0);
     LLVMBasicBlockRef tprobe = LLVMAppendBasicBlockInContext(cx, fn, "rm.tprobe");
     LLVMBasicBlockRef tloop  = LLVMAppendBasicBlockInContext(cx, fn, "rm.tloop");
     LLVMBasicBlockRef tmchk  = LLVMAppendBasicBlockInContext(cx, fn, "rm.tmchk");
@@ -836,14 +999,31 @@ LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef tkill  = LLVMAppendBasicBlockInContext(cx, fn, "rm.tkill");
     LLVMBasicBlockRef tmirr  = LLVMAppendBasicBlockInContext(cx, fn, "rm.tmirr");
     LLVMBasicBlockRef techk  = LLVMAppendBasicBlockInContext(cx, fn, "rm.techk");
-    LLVMBasicBlockRef lchunk = LLVMAppendBasicBlockInContext(cx, fn, "rm.chunk");
-    LLVMBasicBlockRef lchunk_skip = LLVMAppendBasicBlockInContext(cx, fn, "rm.cskip");
-    LLVMBasicBlockRef lkill_done = LLVMAppendBasicBlockInContext(cx, fn, "rm.kdone");
-    LLVMBuildCondBr(b, is_tail_rm, tprobe, lcond);
+    LLVMBasicBlockRef killed_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.killed");
+    LLVMBasicBlockRef mark_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.mark");
+    LLVMBasicBlockRef tail_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.tail");
+    LLVMBasicBlockRef trim_cond = LLVMAppendBasicBlockInContext(cx, fn, "rm.trcond");
+    LLVMBasicBlockRef trim_chk = LLVMAppendBasicBlockInContext(cx, fn, "rm.trchk");
+    LLVMBasicBlockRef trim_step = LLVMAppendBasicBlockInContext(cx, fn, "rm.trstep");
+    LLVMBasicBlockRef trim_done = LLVMAppendBasicBlockInContext(cx, fn, "rm.trdone");
+    LLVMBasicBlockRef tail_icnt = LLVMAppendBasicBlockInContext(cx, fn, "rm.ticnt");
+    LLVMBasicBlockRef nt_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.nontail");
+    LLVMBasicBlockRef nt_alloc = LLVMAppendBasicBlockInContext(cx, fn, "rm.dalloc");
+    LLVMBasicBlockRef nt_set = LLVMAppendBasicBlockInContext(cx, fn, "rm.dset");
+    LLVMBasicBlockRef ovf_bb = LLVMAppendBasicBlockInContext(cx, fn, "rm.ovf");
+    LLVMBasicBlockRef lfull = LLVMAppendBasicBlockInContext(cx, fn, "rm.full");
+    LLVMBasicBlockRef lret = LLVMAppendBasicBlockInContext(cx, fn, "rm.ret");
+    LLVMBuildCondBr(b, cur, tprobe, stale_bb);
 
-    /* O(1) 尾元素删除快路径：无需把后续条目的槽下标减一，直接用 SIMD 探测定位
-     * key 所在槽并打墓碑，把 O(capacity) 线性扫描降为一次 16 字节组探测。 */
+    LLVMPositionBuilderAtEnd(b, stale_bb);
+    LLVMBuildStore(b, LLVMConstInt(i64, (unsigned long long)-1, 1), icntp);
+    LLVMBuildBr(b, mark_bb);
+
     LLVMPositionBuilderAtEnd(b, tprobe);
+    LLVMValueRef soff = zan_add(b, icap, LLVMConstInt(i64, 16, 0), "rm.soff");
+    LLVMValueRef slots = LLVMBuildBitCast(b,
+        LLVMBuildInBoundsGEP2(b, i8, ix, &soff, 1, "rm.s8"), i32ptr, "rm.slots");
+    LLVMValueRef del = LLVMConstInt(i8, ZAN_DICT_CTRL_DELETED, 0);
     LLVMTypeRef v16i8 = LLVMVectorType(i8, 16);
     LLVMValueRef hashf = get_dict_hash_fn(g);
     LLVMValueRef th = zan_call2(b, LLVMGlobalGetValueType(hashf), hashf,
@@ -892,11 +1072,11 @@ LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, tkill);
     LLVMBuildStore(b, del, LLVMBuildInBoundsGEP2(b, i8, ix, &tslot, 1, "rm.tkp"));
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, tslot, LLVMConstInt(i64, 16, 0), "rm.tlt16"),
-        tmirr, ldone);
+        tmirr, killed_bb);
     LLVMPositionBuilderAtEnd(b, tmirr);
     LLVMValueRef tmi = zan_add(b, icap, tslot, "rm.tmi");
     LLVMBuildStore(b, del, LLVMBuildInBoundsGEP2(b, i8, ix, &tmi, 1, "rm.tmp"));
-    LLVMBuildBr(b, ldone);
+    LLVMBuildBr(b, killed_bb);
 
     LLVMPositionBuilderAtEnd(b, techk);
     LLVMValueRef tem = emit_swisstable_empty_mask(g, tcvec);
@@ -909,78 +1089,107 @@ LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef tstop = zan_or(b,
         LLVMBuildICmp(b, LLVMIntNE, tem, LLVMConstInt(i32, 0, 0), "rm.hasemp"),
         zan_icmp(b, LLVMIntSGE, tstep_n, icap, "rm.tlim"), "rm.tstop");
-    LLVMBuildCondBr(b, tstop, lcond, tloop);
+    LLVMBuildCondBr(b, tstop, stale_bb, tloop);
 
-    /* 非尾元素删除：按 8 字节块跳过全空/墓碑控制字节，只修已占槽 */
-    LLVMPositionBuilderAtEnd(b, lcond);
-    LLVMValueRef iv = LLVMBuildPhi(b, i64, "rm.i");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, iv, icap, "rm.more"), lchunk, ldone);
-
-    LLVMPositionBuilderAtEnd(b, lchunk);
-    LLVMValueRef is_aligned8 = zan_icmp(b, LLVMIntEQ,
-        zan_and(b, iv, LLVMConstInt(i64, 7, 0), "rm.a7"),
-        LLVMConstInt(i64, 0, 0), "rm.al8");
-    LLVMBuildCondBr(b, is_aligned8, lchunk_skip, lbody);
-
-    LLVMPositionBuilderAtEnd(b, lchunk_skip);
-    LLVMValueRef cp8 = LLVMBuildBitCast(b,
-        LLVMBuildInBoundsGEP2(b, i8, ix, &iv, 1, "rm.cp8"), i64ptr_ix, "rm.cp64");
-    LLVMValueRef ctrl8 = LLVMBuildLoad2(b, i64, cp8, "rm.ctrl8");
-    LLVMValueRef all_empty8 = zan_icmp(b, LLVMIntEQ,
-        zan_and(b, ctrl8, mask8, "rm.hb8"), mask8, "rm.allemp8");
-    LLVMBasicBlockRef lskip8 = LLVMAppendBasicBlockInContext(cx, fn, "rm.skip8");
-    LLVMBuildCondBr(b, all_empty8, lskip8, lbody);
-
-    LLVMPositionBuilderAtEnd(b, lskip8);
-    LLVMValueRef iv_p8 = zan_add(b, iv, LLVMConstInt(i64, 8, 0), "rm.ip8");
-    LLVMBuildBr(b, lcond);
-
-    LLVMPositionBuilderAtEnd(b, lbody);
-    LLVMValueRef ctrl = LLVMBuildLoad2(b, i8,
-        LLVMBuildInBoundsGEP2(b, i8, ix, &iv, 1, "rm.cp"), "rm.ctrl");
-    /* 必须用原生 i8 比较：zan_icmp 会把 i8 zext 成 i64 导致 SGE 0 恒真！ */
-    LLVMValueRef occ = LLVMBuildICmp(b, LLVMIntULT, ctrl, LLVMConstInt(i8, 128, 0), "rm.isocc");
-    LLVMBuildCondBr(b, occ, locc, lnext);
-
-    LLVMPositionBuilderAtEnd(b, locc);
-    LLVMValueRef sp = LLVMBuildInBoundsGEP2(b, i32, slots, &iv, 1, "rm.sp");
-    LLVMValueRef sv32 = LLVMBuildLoad2(b, i32, sp, "rm.sv32");
-    LLVMValueRef sv = LLVMBuildZExt(b, sv32, i64, "rm.sv");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, sv, fi, "rm.self"), lkill, lgt);
-
-    LLVMPositionBuilderAtEnd(b, lkill);
-    LLVMBuildStore(b, del, LLVMBuildInBoundsGEP2(b, i8, ix, &iv, 1, "rm.kp"));
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, iv, LLVMConstInt(i64, 16, 0), "rm.lt16"),
-        lmirror, lkill_done);
-    LLVMPositionBuilderAtEnd(b, lmirror);
-    LLVMValueRef mi = zan_add(b, icap, iv, "rm.mi");
-    LLVMBuildStore(b, del, LLVMBuildInBoundsGEP2(b, i8, ix, &mi, 1, "rm.mp"));
-    LLVMBuildBr(b, lkill_done);
-
-    LLVMPositionBuilderAtEnd(b, lkill_done);
-    LLVMBuildCondBr(b, is_tail_rm, ldone, lnext);
-
-    LLVMPositionBuilderAtEnd(b, lgt);
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSGT, sv, fi, "rm.after"), ldec, lnext);
-    LLVMPositionBuilderAtEnd(b, ldec);
-    LLVMBuildStore(b, zan_sub(b, sv32, LLVMConstInt(i32, 1, 0), "rm.svd"), sp);
-    LLVMBuildBr(b, lnext);
-
-    LLVMPositionBuilderAtEnd(b, lnext);
-    LLVMValueRef inext = zan_add(b, iv, LLVMConstInt(i64, 1, 0), "rm.inext");
-    LLVMBuildBr(b, lcond);
-    LLVMAddIncoming(iv,
-        (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0), inext, iv_p8 },
-        (LLVMBasicBlockRef[]){ fix_bb, techk, lnext, lskip8 }, 4);
-
-    LLVMPositionBuilderAtEnd(b, ldone);
+    LLVMPositionBuilderAtEnd(b, killed_bb);
     LLVMValueRef tp = emit_dict_tomb_ptr(g, ix, icap);
     LLVMValueRef nt = zan_add(b, LLVMBuildLoad2(b, i64, tp, "rm.t"),
         LLVMConstInt(i64, 1, 0), "rm.nt");
     LLVMBuildStore(b, nt, tp);
-    LLVMBuildStore(b, ncnt, icntp);
+    LLVMBuildBr(b, mark_bb);
+
+    LLVMPositionBuilderAtEnd(b, mark_bb);
+    LLVMValueRef ix_fresh = LLVMBuildPhi(b, i1, "rm.ixok");
+    LLVMValueRef nt_val = LLVMBuildPhi(b, i64, "rm.ntv");
+    LLVMAddIncoming(ix_fresh,
+        (LLVMValueRef[]){ LLVMConstInt(i1, 1, 0), LLVMConstInt(i1, 0, 0) },
+        (LLVMBasicBlockRef[]){ killed_bb, stale_bb }, 2);
+    LLVMAddIncoming(nt_val,
+        (LLVMValueRef[]){ nt, LLVMConstInt(i64, 0, 0) },
+        (LLVMBasicBlockRef[]){ killed_bb, stale_bb }, 2);
+    LLVMValueRef ncnt0 = zan_sub(b, cnt, LLVMConstInt(i64, 1, 0), "rm.cntd");
+    LLVMValueRef is_tail = zan_icmp(b, LLVMIntEQ, fi, ncnt0, "rm.istail");
+    LLVMValueRef holes0 = LLVMBuildLoad2(b, i64, hp, "rm.h0");
+    LLVMValueRef dead0 = LLVMBuildLoad2(b, i8ptr, deadp, "rm.d0");
+    LLVMBuildCondBr(b, is_tail, tail_bb, nt_bb);
+
+    /* 尾元素删除：递减 cnt，若前方紧邻旧空洞一并顺手收缩 */
+    LLVMPositionBuilderAtEnd(b, tail_bb);
+    LLVMValueRef has_d = zan_and(b,
+        zan_icmp(b, LLVMIntSGT, holes0, LLVMConstInt(i64, 0, 0), "rm.trh"),
+        zan_icmp(b, LLVMIntNE, dead0, LLVMConstNull(i8ptr), "rm.trd"), "rm.can_tr");
+    LLVMBuildCondBr(b, has_d, trim_cond, trim_done);
+
+    LLVMPositionBuilderAtEnd(b, trim_cond);
+    LLVMValueRef tc = LLVMBuildPhi(b, i64, "rm.tc");
+    LLVMValueRef tholes = LLVMBuildPhi(b, i64, "rm.th");
+    LLVMValueRef tr_more = zan_and(b,
+        zan_icmp(b, LLVMIntSGT, tc, LLVMConstInt(i64, 0, 0), "rm.tcpos"),
+        zan_icmp(b, LLVMIntSGT, tholes, LLVMConstInt(i64, 0, 0), "rm.thpos"), "rm.trm");
+    LLVMBuildCondBr(b, tr_more, trim_chk, trim_done);
+
+    LLVMPositionBuilderAtEnd(b, trim_chk);
+    LLVMValueRef prev_i = zan_sub(b, tc, LLVMConstInt(i64, 1, 0), "rm.tpi");
+    LLVMValueRef prev_dp = LLVMBuildInBoundsGEP2(b, i8, dead0, &prev_i, 1, "rm.tdp");
+    LLVMValueRef prev_d = LLVMBuildLoad2(b, i8, prev_dp, "rm.tdv");
+    LLVMBuildCondBr(b,
+        LLVMBuildICmp(b, LLVMIntNE, prev_d, LLVMConstInt(i8, 0, 0), "rm.tisd"),
+        trim_step, trim_done);
+
+    LLVMPositionBuilderAtEnd(b, trim_step);
+    LLVMBuildStore(b, LLVMConstInt(i8, 0, 0), prev_dp);
+    LLVMValueRef th_dec = zan_sub(b, tholes, LLVMConstInt(i64, 1, 0), "rm.thd");
+    LLVMBuildBr(b, trim_cond);
+    LLVMAddIncoming(tc, (LLVMValueRef[]){ ncnt0, prev_i },
+        (LLVMBasicBlockRef[]){ tail_bb, trim_step }, 2);
+    LLVMAddIncoming(tholes, (LLVMValueRef[]){ holes0, th_dec },
+        (LLVMBasicBlockRef[]){ tail_bb, trim_step }, 2);
+
+    LLVMPositionBuilderAtEnd(b, trim_done);
+    LLVMValueRef fin_cnt = LLVMBuildPhi(b, i64, "rm.fcnt");
+    LLVMValueRef fin_holes = LLVMBuildPhi(b, i64, "rm.fh");
+    LLVMAddIncoming(fin_cnt, (LLVMValueRef[]){ ncnt0, tc, tc },
+        (LLVMBasicBlockRef[]){ tail_bb, trim_cond, trim_chk }, 3);
+    LLVMAddIncoming(fin_holes, (LLVMValueRef[]){ holes0, tholes, tholes },
+        (LLVMBasicBlockRef[]){ tail_bb, trim_cond, trim_chk }, 3);
+    LLVMBuildStore(b, fin_cnt, cntp);
+    LLVMBuildStore(b, fin_holes, hp);
+    LLVMBuildCondBr(b, ix_fresh, tail_icnt, lret);
+
+    LLVMPositionBuilderAtEnd(b, tail_icnt);
+    LLVMBuildStore(b, fin_cnt, icntp);
+    LLVMBuildBr(b, ovf_bb);
+
+    /* 非尾元素删除：惰性分配 dead 标记数组，O(1) 标记 dead[fi]=1, holes++ */
+    LLVMPositionBuilderAtEnd(b, nt_bb);
+    LLVMValueRef no_dead = zan_icmp(b, LLVMIntEQ, dead0, LLVMConstNull(i8ptr), "rm.nod");
+    LLVMBuildCondBr(b, no_dead, nt_alloc, nt_set);
+
+    LLVMPositionBuilderAtEnd(b, nt_alloc);
+    LLVMValueRef cap_cur = LLVMBuildLoad2(b, i64, capp, "rm.cap");
+    LLVMTypeRef calloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0);
+    LLVMValueRef ndead = zan_call2(b, calloc_ty, get_calloc_fn(g),
+        (LLVMValueRef[]){ cap_cur, LLVMConstInt(i64, 1, 0) }, 2, "rm.ndead");
+    zan_irgen_emit_oom_check(g, fn, ndead);
+    LLVMBuildStore(b, ndead, deadp);
+    LLVMBasicBlockRef nt_alloc_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, nt_set);
+
+    LLVMPositionBuilderAtEnd(b, nt_set);
+    LLVMValueRef dead_use = LLVMBuildPhi(b, i8ptr, "rm.duse");
+    LLVMAddIncoming(dead_use, (LLVMValueRef[]){ dead0, ndead },
+        (LLVMBasicBlockRef[]){ nt_bb, nt_alloc_end }, 2);
+    LLVMBuildStore(b, LLVMConstInt(i8, 1, 0),
+        LLVMBuildInBoundsGEP2(b, i8, dead_use, &fi, 1, "rm.setp"));
+    LLVMBuildStore(b, zan_add(b, holes0, LLVMConstInt(i64, 1, 0), "rm.hp1"), hp);
+    LLVMBuildCondBr(b, ix_fresh, ovf_bb, lret);
+
+    LLVMPositionBuilderAtEnd(b, ovf_bb);
+    LLVMValueRef c_now = LLVMBuildLoad2(b, i64, cntp, "rm.cnow");
+    LLVMValueRef h_now = LLVMBuildLoad2(b, i64, hp, "rm.hnow");
+    LLVMValueRef live_now = zan_sub(b, c_now, h_now, "rm.lnow");
     LLVMValueRef over = zan_icmp(b, LLVMIntSGT,
-        zan_mul(b, zan_add(b, ncnt, nt, "rm.used"), LLVMConstInt(i64, 8, 0), "rm.u8"),
+        zan_mul(b, zan_add(b, live_now, nt_val, "rm.used"), LLVMConstInt(i64, 8, 0), "rm.u8"),
         zan_mul(b, icap, LLVMConstInt(i64, 7, 0), "rm.c7"), "rm.over");
     LLVMBuildCondBr(b, over, lfull, lret);
     LLVMPositionBuilderAtEnd(b, lfull);
@@ -1004,11 +1213,14 @@ LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     dict_add_fn_attr(g, fn, "nounwind");
     LLVMTypeRef realloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
+    LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef free_fn = get_libc_fn(g, "free", free_ty);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
     LLVMBasicBlockRef app_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "app");
     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "grow");
+    LLVMBasicBlockRef realloc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "realloc");
     LLVMBasicBlockRef put_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "put");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef draw = LLVMGetParam(fn, 0);
@@ -1017,14 +1229,11 @@ LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMValueRef dp = LLVMBuildBitCast(g->builder, draw,
         LLVMPointerType(g->dict_struct_type, 0), "dp");
     LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
-    LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
     LLVMValueRef capp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 1, "capp");
     LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
     LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
     LLVMValueRef vwp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 7, "vwp");
-    LLVMValueRef ks = LLVMBuildLoad2(g->builder, i8pp, kp, "ks");
-    LLVMValueRef vs = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs");
-    LLVMValueRef value_words = LLVMBuildLoad2(g->builder, i64, vwp, "vw");
+    LLVMValueRef deadp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 9, "deadp");
     LLVMValueRef findf = get_dict_find_fn(g);
     LLVMValueRef ci = zan_call2(g->builder, LLVMGlobalGetValueType(findf), findf,
         (LLVMValueRef[]){ draw, key, is_str }, 3, "dset.find");
@@ -1034,10 +1243,21 @@ LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, hit_bb);
     LLVMBuildRet(g->builder, ci);
     LLVMPositionBuilderAtEnd(g->builder, app_bb);
+    LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capp, "cap");
     LLVMValueRef full = zan_icmp(g->builder, LLVMIntSGE, cnt, cap, "full");
     LLVMBuildCondBr(g->builder, full, grow_bb, put_bb);
     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
+    /* 扩容前先回收删除空洞：若存在空洞则原地紧缩，无需 realloc 即可腾出空间 */
+    emit_dict_compact_if_holes(g, draw);
+    LLVMBasicBlockRef grow_chk_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cnt_after = LLVMBuildLoad2(g->builder, i64, cntp, "cnt.af");
+    LLVMValueRef still_full = zan_icmp(g->builder, LLVMIntSGE, cnt_after, cap, "sfull");
+    LLVMBuildCondBr(g->builder, still_full, realloc_bb, put_bb);
+    LLVMPositionBuilderAtEnd(g->builder, realloc_bb);
+    LLVMValueRef ks = LLVMBuildLoad2(g->builder, i8pp, kp, "ks");
+    LLVMValueRef vs = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs");
+    LLVMValueRef value_words = LLVMBuildLoad2(g->builder, i64, vwp, "vw");
     LLVMValueRef cap0 = zan_icmp(g->builder, LLVMIntEQ, cap,
         LLVMConstInt(i64, 0, 0), "cap0");
     LLVMValueRef ncap = LLVMBuildSelect(g->builder, cap0,
@@ -1055,15 +1275,23 @@ LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
         (LLVMValueRef[]){ vs8, value_bytes }, 2, "nvs8");
     zan_irgen_emit_oom_check(g, fn, nvs8);
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nvs8, i64ptr, "nvs"), vp);
+    /* holes 已为 0：释放旧尺寸 dead 数组，下次非尾删时按新 cap 惰性分配 */
+    LLVMValueRef old_dead = LLVMBuildLoad2(g->builder, i8ptr, deadp, "odead");
+    zan_call2(g->builder, free_ty, free_fn, &old_dead, 1, "");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), deadp);
     LLVMBuildStore(g->builder, ncap, capp);
+    LLVMBasicBlockRef realloc_end_bb = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, put_bb);
     LLVMPositionBuilderAtEnd(g->builder, put_bb);
+    LLVMValueRef put_cnt = LLVMBuildPhi(g->builder, i64, "put.cnt");
+    LLVMAddIncoming(put_cnt, (LLVMValueRef[]){ cnt, cnt_after, cnt_after },
+        (LLVMBasicBlockRef[]){ app_bb, grow_chk_bb, realloc_end_bb }, 3);
     LLVMValueRef ks2 = LLVMBuildLoad2(g->builder, i8pp, kp, "ks2");
-    LLVMValueRef kslot2 = LLVMBuildGEP2(g->builder, i8ptr, ks2, &cnt, 1, "ksl2");
+    LLVMValueRef kslot2 = LLVMBuildGEP2(g->builder, i8ptr, ks2, &put_cnt, 1, "ksl2");
     LLVMBuildStore(g->builder, key, kslot2);
     LLVMBuildStore(g->builder,
-        zan_add(g->builder, cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp);
-    LLVMBuildRet(g->builder, cnt);
+        zan_add(g->builder, put_cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp);
+    LLVMBuildRet(g->builder, put_cnt);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }
@@ -1080,9 +1308,12 @@ LLVMValueRef get_dict_append_fn(zan_irgen_t *g) {
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     dict_add_fn_attr(g, fn, "nounwind");
     LLVMTypeRef realloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
+    LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef free_fn = get_libc_fn(g, "free", free_ty);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "grow");
+    LLVMBasicBlockRef realloc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "realloc");
     LLVMBasicBlockRef put_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "put");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef draw = LLVMGetParam(fn, 0);
@@ -1100,8 +1331,16 @@ LLVMValueRef get_dict_append_fn(zan_irgen_t *g) {
     LLVMValueRef full_br = LLVMBuildCondBr(g->builder, full, grow_bb, put_bb);
     dict_set_branch_weights(g, full_br, 1, 2000);
     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
+    /* 扩容前先回收删除空洞：高频率删插交替时原地紧缩复用容量，防止内存膨胀 */
+    emit_dict_compact_if_holes(g, draw);
+    LLVMBasicBlockRef grow_chk_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cnt_after = LLVMBuildLoad2(g->builder, i64, cntp, "cnt.af");
+    LLVMValueRef still_full = zan_icmp(g->builder, LLVMIntSGE, cnt_after, cap, "sfull");
+    LLVMBuildCondBr(g->builder, still_full, realloc_bb, put_bb);
+    LLVMPositionBuilderAtEnd(g->builder, realloc_bb);
     LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
     LLVMValueRef vwp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 7, "vwp");
+    LLVMValueRef deadp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 9, "deadp");
     LLVMValueRef ks = LLVMBuildLoad2(g->builder, i8pp, kp, "ks");
     LLVMValueRef vs = LLVMBuildLoad2(g->builder, i64ptr, vp, "vs");
     LLVMValueRef value_words = LLVMBuildLoad2(g->builder, i64, vwp, "vw");
@@ -1122,16 +1361,23 @@ LLVMValueRef get_dict_append_fn(zan_irgen_t *g) {
         (LLVMValueRef[]){ vs8, value_bytes }, 2, "nvs8");
     zan_irgen_emit_oom_check(g, fn, nvs8);
     zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nvs8, i64ptr, "nvs"), vp));
+    LLVMValueRef old_dead = LLVMBuildLoad2(g->builder, i8ptr, deadp, "odead");
+    zan_call2(g->builder, free_ty, free_fn, &old_dead, 1, "");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), deadp);
     zan_tbaa_tag_meta(g, LLVMBuildStore(g->builder, ncap, capp));
+    LLVMBasicBlockRef realloc_end_bb = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, put_bb);
     LLVMPositionBuilderAtEnd(g->builder, put_bb);
+    LLVMValueRef put_cnt = LLVMBuildPhi(g->builder, i64, "put.cnt");
+    LLVMAddIncoming(put_cnt, (LLVMValueRef[]){ cnt, cnt_after, cnt_after },
+        (LLVMBasicBlockRef[]){ entry, grow_chk_bb, realloc_end_bb }, 3);
     LLVMValueRef ks2 = LLVMBuildLoad2(g->builder, i8pp, kp, "ks2");
     zan_tbaa_tag_meta(g, ks2);
-    LLVMValueRef kslot2 = LLVMBuildInBoundsGEP2(g->builder, i8ptr, ks2, &cnt, 1, "ksl2");
+    LLVMValueRef kslot2 = LLVMBuildInBoundsGEP2(g->builder, i8ptr, ks2, &put_cnt, 1, "ksl2");
     LLVMBuildStore(g->builder, key, kslot2);
     zan_tbaa_tag_cnt(g, LLVMBuildStore(g->builder,
-        zan_add(g->builder, cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp));
-    LLVMBuildRet(g->builder, cnt);
+        zan_add(g->builder, put_cnt, LLVMConstInt(i64, 1, 0), "ncnt"), cntp));
+    LLVMBuildRet(g->builder, put_cnt);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }

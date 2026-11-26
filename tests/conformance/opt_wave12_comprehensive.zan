@@ -1,0 +1,280 @@
+using System;
+using System.Collections.Generic;
+
+interface IOp {
+    int Apply(int x);
+}
+
+class AddOp : IOp {
+    public int Bias;
+    public AddOp(int b) { this.Bias = b; }
+    public int Apply(int x) { return x + this.Bias; }
+}
+
+class BoxVal {
+    public int Id;
+    public string Tag;
+    public BoxVal(int id, string tag) { this.Id = id; this.Tag = tag; }
+}
+
+class Program {
+    static void TestDictLazyHoles() {
+        // 1. Non-tail remove, tail remove, cascading tail trim, remove-until-empty, reinsert
+        var d = new Dictionary<int, int>();
+        for (int i = 0; i < 64; i++) d[i] = i * 10;
+        // Non-tail removes create holes
+        bool r1 = d.Remove(0);
+        bool r2 = d.Remove(10);
+        bool r3 = d.Remove(62);
+        bool r4 = d.Remove(999);
+        // Tail remove (63) should cascade-trim dead slot 62 as well
+        bool r5 = d.Remove(63);
+        Console.WriteLine($"dict_rm:{r1},{r2},{r3},{r4},{r5},cnt={d.Count}");
+
+        // Reinsert previously removed key & update existing key
+        d[10] = 777;
+        d[63] = 6300;
+        int outv = 0;
+        bool has0 = d.TryGetValue(0, out outv);
+        bool has10 = d.TryGetValue(10, out outv);
+        Console.WriteLine($"dict_reins:{has0},{has10},{outv},cnt={d.Count}");
+
+        // Remove all remaining keys in reverse/interleaved order -> count reaches 0
+        for (int i = 0; i < 64; i += 2) d.Remove(i);
+        for (int i = 63; i >= 0; i -= 2) d.Remove(i);
+        Console.WriteLine($"dict_empty:{d.Count},{d.ContainsKey(10)}");
+
+        // Heavy remove+insert churn triggering compaction on grow & SwissTable rebuild
+        for (int i = 0; i < 200; i++) d[i] = i * 3;
+        for (int step = 0; step < 500; step++) {
+            d.Remove(step);
+            d[step + 200] = (step + 200) * 3;
+        }
+        long fsum = 0;
+        int fcnt = 0;
+        foreach (int k in d) {
+            fsum += k + d[k];
+            fcnt++;
+        }
+        var keys = d.Keys;
+        var vals = d.Values;
+        Console.WriteLine($"dict_churn:cnt={d.Count},fcnt={fcnt},k={keys.Count},v={vals.Count},sum={fsum}");
+
+        // foreach mutation guard must still throw when mutating during iteration
+        bool threw = false;
+        try {
+            foreach (int k in d) {
+                d.Remove(k);
+            }
+        } catch (Exception ex) {
+            threw = true;
+        }
+        Console.WriteLine($"dict_guard:{threw}");
+
+        // Clear with holes + reuse
+        d.Clear();
+        d[42] = 420;
+        Console.WriteLine($"dict_clear:cnt={d.Count},v={d[42]}");
+
+        // ARC string keys & object values under non-tail remove churn (leak check!)
+        var sd = new Dictionary<string, BoxVal>();
+        for (int i = 0; i < 120; i++) {
+            string k = $"key_{i}";
+            sd[k] = new BoxVal(i, $"val_{i}");
+        }
+        for (int i = 0; i < 100; i++) {
+            sd.Remove($"key_{i}");
+            sd[$"key_{i + 120}"] = new BoxVal(i + 120, $"val_{i + 120}");
+        }
+        int ssum = 0;
+        foreach (string k in sd) {
+            BoxVal bv = sd[k];
+            ssum += bv.Id + k.Length + bv.Tag.Length;
+        }
+        sd.Clear();
+        Console.WriteLine($"dict_arc:ssum={ssum},after={sd.Count}");
+    }
+
+    static void TestDoubleParseAndFormat() {
+        // Leading fractional zeros, negative, integer, scientific, exact boundaries
+        double p1 = double.Parse("0.001");
+        double p2 = double.Parse("-0.0025");
+        double p3 = double.Parse("0.000001");
+        double p4 = double.Parse("123456.789");
+        double p5 = double.Parse("-3.5e-2");
+        double p6 = double.Parse("42");
+        Console.WriteLine($"dparse:{p1.ToString("F3")},{p2.ToString("F4")},{p3.ToString("F6")},{p4.ToString("F3")},{p5.ToString("F3")},{p6.ToString("F0")}");
+
+        double tv = 0.0;
+        bool ok1 = double.TryParse("98765.5", out tv);
+        bool ok2 = double.TryParse("not_a_num", out tv);
+        bool fmtThrew = false;
+        try {
+            double bad = double.Parse("abc123");
+            Console.WriteLine(bad);
+        } catch (FormatException ex) {
+            fmtThrew = true;
+        }
+        Console.WriteLine($"dtry:{ok1},{ok2},{fmtThrew}");
+
+        // F0..F6 fast path + halfway/boundary/large/NaN/Inf/float fallback
+        double vPos = 123.456789;
+        double vNeg = -7.891234;
+        double vHalf = 2.5;
+        double vHalf2 = 3.5;
+        double vBig = 1.5e13;
+        double vZero = 0.0;
+        float fv = 12.34f;
+        Console.WriteLine($"ffmt:{vPos.ToString("F0")},{vPos.ToString("F2")},{vPos.ToString("F6")},{vNeg.ToString("F2")},{vHalf.ToString("F0")},{vHalf2.ToString("F0")},{vZero.ToString("F2")},{fv.ToString("F2")}");
+        Console.WriteLine($"fbig:{vBig.ToString("F0")}");
+
+        // double.ToString() default roundtrip fast path
+        double d1 = 3.14;
+        double d2 = -0.0025;
+        double d3 = 123456.5;
+        double d4 = 0.0;
+        Console.WriteLine($"dtostr:{d1.ToString()},{d2.ToString()},{d3.ToString()},{d4.ToString()}");
+    }
+
+    static void TestCompareAndSort() {
+        // String/string.CompareOrdinal fast paths
+        string a = "alpha";
+        string b = "alpha";
+        string c = "alphanumeric";
+        string d = "beta";
+        int c1 = String.CompareOrdinal(a, a);
+        int c2 = string.CompareOrdinal(a, b);
+        int c3 = string.CompareOrdinal(a, c) < 0 ? -1 : 1;
+        int c4 = String.CompareOrdinal(d, a) > 0 ? 1 : -1;
+        int c5 = string.CompareOrdinal(null, a) < 0 ? -1 : 1;
+        int c6 = string.CompareOrdinal(a, null) > 0 ? 1 : -1;
+        int c7 = string.CompareOrdinal(null, null);
+        Console.WriteLine($"cmp:{c1},{c2},{c3},{c4},{c5},{c6},{c7}");
+
+        // List<int>, List<long>, List<double>, List<string> Introsort (size > 32 to hit quicksort + insertion)
+        var li = new List<int>();
+        var ll = new List<long>();
+        var ld = new List<double>();
+        var ls = new List<string>();
+        int seed = 1337;
+        for (int i = 0; i < 80; i++) {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+            int v = (seed % 1000) - 500;
+            li.Add(v);
+            ll.Add((long)v * 1000000L);
+            ld.Add((double)v * 0.25);
+            ls.Add($"item_{(v + 500):D4}");
+        }
+        li.Sort();
+        ll.Sort();
+        ld.Sort();
+        ls.Sort();
+        bool okI = true, okL = true, okD = true, okS = true;
+        for (int i = 1; i < 80; i++) {
+            if (li[i - 1] > li[i]) okI = false;
+            if (ll[i - 1] > ll[i]) okL = false;
+            if (ld[i - 1] > ld[i]) okD = false;
+            if (string.CompareOrdinal(ls[i - 1], ls[i]) > 0) okS = false;
+        }
+        Console.WriteLine($"lsort:{okI},{okL},{okD},{okS},min={li[0]},max={li[79]},s0={ls[0]},s79={ls[79]}");
+
+        // Custom comparator descending on int & string
+        li.Sort((x, y) => y - x);
+        ls.Sort((x, y) => string.CompareOrdinal(y, x));
+        bool descI = li[0] >= li[79] && li[0] >= li[1];
+        bool descS = string.CompareOrdinal(ls[0], ls[79]) >= 0;
+        Console.WriteLine($"csort:{descI},{descS},top={li[0]},stop={ls[0]}");
+
+        // Exception inside custom comparator on List<string> must remain valid (0 double-free / 0 leak)
+        var es = new List<string>();
+        for (int i = 0; i < 20; i++) es.Add($"exc_str_{20 - i}");
+        int cmpCalls = 0;
+        bool cmpThrew = false;
+        try {
+            es.Sort((x, y) => {
+                cmpCalls++;
+                if (cmpCalls == 5) throw new InvalidOperationException("abort sort");
+                return string.CompareOrdinal(x, y);
+            });
+        } catch (InvalidOperationException ex) {
+            cmpThrew = true;
+        }
+        int esLenSum = 0;
+        for (int i = 0; i < es.Count; i++) esLenSum += es[i].Length;
+        Console.WriteLine($"csort_exc:{cmpThrew},cnt={es.Count},lens={esLenSum}");
+
+        // Array.Sort on int[] (size 64 -> quicksort + insertion sort)
+        var ai = new int[64];
+        for (int i = 0; i < 64; i++) {
+            int v = ((i * 37) % 64) - 32;
+            ai[i] = v;
+        }
+        Array.Sort(ai);
+        bool aok = true;
+        for (int i = 1; i < 64; i++) {
+            if (ai[i - 1] > ai[i]) aok = false;
+        }
+        Console.WriteLine($"asort:{aok},i0={ai[0]},i63={ai[63]}");
+    }
+
+    static void TestBorrowAndDelegates() {
+        // Unrelated lambda in same function must NOT break borrow/cast/no-pin
+        Func<int, int> unrelated = x => x * 2;
+        IOp op = new AddOp(7);
+        int sum = 0;
+        Func<int, int> fn = x => x + 3;
+        for (int i = 0; i < 100; i++) {
+            if (op is AddOp) {
+                AddOp a = (AddOp)op;
+                sum += a.Apply(i);
+            }
+            sum += fn(i);
+        }
+        sum += unrelated(5);
+
+        // Mutable delegate reassigned inside itself must remain safely retained (no UAF)
+        int cap = 10;
+        Func<int, int> mut = null;
+        mut = x => {
+            mut = y => y + 100;
+            return x + cap;
+        };
+        int m1 = mut(5);
+        int m2 = mut(5);
+        Console.WriteLine($"borrow_del:{sum},{m1},{m2}");
+    }
+
+    static void TestPriorityQueue() {
+        var pq = new PriorityQueue<string, int>(16);
+        int seed = 42;
+        for (int i = 0; i < 64; i++) {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+            int pr = seed % 50;
+            pq.Enqueue($"p_{pr:D2}", pr);
+        }
+        int prev = -1;
+        bool mono = true;
+        int popped = 0;
+        while (!pq.IsEmpty()) {
+            string el = null;
+            int pr = 0;
+            if (pq.TryDequeue(out el, out pr)) {
+                if (pr < prev) mono = false;
+                prev = pr;
+                popped++;
+            }
+        }
+        // Single-element enqueue & dequeue
+        pq.Enqueue("solo", 9);
+        string solo = pq.Dequeue();
+        Console.WriteLine($"pq:{mono},popped={popped},empty={pq.IsEmpty()},solo={solo}");
+    }
+
+    static void Main() {
+        TestDictLazyHoles();
+        TestDoubleParseAndFormat();
+        TestCompareAndSort();
+        TestBorrowAndDelegates();
+        TestPriorityQueue();
+    }
+}
