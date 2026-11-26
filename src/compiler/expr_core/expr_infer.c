@@ -487,6 +487,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (sr && ((mm.len == 4 && memcmp(mm.str, "Join", 4) == 0) ||
                            (mm.len == 6 && memcmp(mm.str, "Format", 6) == 0)))
                     return g->binder->type_string;
+                int cr = on.len == 4 && (memcmp(on.str, "char", 4) == 0 ||
+                                         memcmp(on.str, "Char", 4) == 0);
+                if (cr) {
+                    if ((mm.len == 7 && memcmp(mm.str, "ToUpper", 7) == 0) ||
+                        (mm.len == 7 && memcmp(mm.str, "ToLower", 7) == 0))
+                        return g->binder->type_char;
+                    if ((mm.len == 7 && memcmp(mm.str, "IsDigit", 7) == 0) ||
+                        (mm.len == 8 && memcmp(mm.str, "IsLetter", 8) == 0) ||
+                        (mm.len == 15 && memcmp(mm.str, "IsLetterOrDigit", 15) == 0) ||
+                        (mm.len == 12 && memcmp(mm.str, "IsWhiteSpace", 12) == 0) ||
+                        (mm.len == 7 && memcmp(mm.str, "IsUpper", 7) == 0) ||
+                        (mm.len == 7 && memcmp(mm.str, "IsLower", 7) == 0))
+                        return g->binder->type_bool;
+                }
             }
         }
         if (callee->kind == AST_IDENTIFIER) {

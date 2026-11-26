@@ -260,6 +260,139 @@ static LLVMValueRef list_repack_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* 冷路径外提：List 扩容（2 倍增长，初值 8），保持热循环 Add 体积极小以便寄存器化 */
+LLVMValueRef get_list_grow_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_list_grow");
+    if (fn) return fn;
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef list_pt = LLVMPointerType(g->list_struct_type, 0);
+    LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(c),
+        (LLVMTypeRef[]){ list_pt, i64 }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_list_grow", fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    {
+        static const char *const attrs[] = { "noinline", "cold", "nounwind" };
+        for (size_t i = 0; i < 3; i++) {
+            unsigned k = LLVMGetEnumAttributeKindForName(attrs[i], strlen(attrs[i]));
+            if (k) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                           LLVMCreateEnumAttribute(c, k, 0));
+        }
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(c, nc, 0));
+    }
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(c);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef oom_bb = LLVMAppendBasicBlockInContext(c, fn, "oom");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(c, fn, "ok");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef lp = LLVMGetParam(fn, 0);
+    LLVMValueRef esz = LLVMGetParam(fn, 1);
+    LLVMValueRef cap_ptr = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 1, "capp");
+    LLVMValueRef cap = LLVMBuildLoad2(b, i64, cap_ptr, "cap");
+    zan_tbaa_tag_meta(g, cap);
+    LLVMValueRef cap_zero = LLVMBuildICmp(b, LLVMIntEQ, cap, LLVMConstInt(i64, 0, 0), "cz");
+    LLVMValueRef dbl = LLVMBuildMul(b, cap, LLVMConstInt(i64, 2, 0), "dbl");
+    LLVMValueRef ncap = LLVMBuildSelect(b, cap_zero, LLVMConstInt(i64, 8, 0), dbl, "ncap");
+    LLVMValueRef df = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "df");
+    LLVMValueRef old_data = LLVMBuildLoad2(b, i64ptr, df, "od");
+    zan_tbaa_tag_meta(g, old_data);
+    LLVMValueRef old_raw = LLVMBuildBitCast(b, old_data, i8ptr, "odr");
+    LLVMValueRef nsz = LLVMBuildMul(b, ncap, esz, "nsz");
+    LLVMValueRef nd_raw = LLVMBuildCall2(b,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
+        g->fn_realloc, (LLVMValueRef[]){ old_raw, nsz }, 2, "nd");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nd_raw, "oom"), oom_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(b, oom_bb);
+    {
+        LLVMTypeRef abty = LLVMFunctionType(LLVMVoidTypeInContext(c), NULL, 0, 0);
+        LLVMValueRef ab = LLVMGetNamedFunction(g->mod, "abort");
+        if (!ab) ab = LLVMAddFunction(g->mod, "abort", abty);
+        LLVMBuildCall2(b, abty, ab, NULL, 0, "");
+        LLVMBuildUnreachable(b);
+    }
+    LLVMPositionBuilderAtEnd(b, ok_bb);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, ncap, cap_ptr));
+    LLVMValueRef nd = LLVMBuildBitCast(b, nd_raw, i64ptr, "ndt");
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, nd, df));
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+
+/* 冷路径外提：List 批量预留至至少 need_cap（按 max(need_cap, cap*2) 几何扩容） */
+LLVMValueRef get_list_reserve_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_list_reserve");
+    if (fn) return fn;
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef list_pt = LLVMPointerType(g->list_struct_type, 0);
+    LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(c),
+        (LLVMTypeRef[]){ list_pt, i64, i64 }, 3, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_list_reserve", fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    {
+        static const char *const attrs[] = { "noinline", "cold", "nounwind" };
+        for (size_t i = 0; i < 3; i++) {
+            unsigned k = LLVMGetEnumAttributeKindForName(attrs[i], strlen(attrs[i]));
+            if (k) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                                           LLVMCreateEnumAttribute(c, k, 0));
+        }
+        unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+        if (nc) LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(c, nc, 0));
+    }
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(c);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(c, fn, "grow");
+    LLVMBasicBlockRef oom_bb = LLVMAppendBasicBlockInContext(c, fn, "oom");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(c, fn, "ok");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef lp = LLVMGetParam(fn, 0);
+    LLVMValueRef need = LLVMGetParam(fn, 1);
+    LLVMValueRef esz = LLVMGetParam(fn, 2);
+    LLVMValueRef cap_ptr = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 1, "capp");
+    LLVMValueRef cap = LLVMBuildLoad2(b, i64, cap_ptr, "cap");
+    zan_tbaa_tag_meta(g, cap);
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSGT, need, cap, "needg"), grow_bb, ret_bb);
+    LLVMPositionBuilderAtEnd(b, grow_bb);
+    LLVMValueRef dbl = LLVMBuildMul(b, cap, LLVMConstInt(i64, 2, 0), "dbl");
+    LLVMValueRef ncap = LLVMBuildSelect(b, LLVMBuildICmp(b, LLVMIntSGT, dbl, need, "dblgt"),
+        dbl, need, "ncap");
+    LLVMValueRef df = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "df");
+    LLVMValueRef old_data = LLVMBuildLoad2(b, i64ptr, df, "od");
+    zan_tbaa_tag_meta(g, old_data);
+    LLVMValueRef old_raw = LLVMBuildBitCast(b, old_data, i8ptr, "odr");
+    LLVMValueRef nsz = LLVMBuildMul(b, ncap, esz, "nsz");
+    LLVMValueRef nd_raw = LLVMBuildCall2(b,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
+        g->fn_realloc, (LLVMValueRef[]){ old_raw, nsz }, 2, "nd");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nd_raw, "oom"), oom_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(b, oom_bb);
+    {
+        LLVMTypeRef abty = LLVMFunctionType(LLVMVoidTypeInContext(c), NULL, 0, 0);
+        LLVMValueRef ab = LLVMGetNamedFunction(g->mod, "abort");
+        if (!ab) ab = LLVMAddFunction(g->mod, "abort", abty);
+        LLVMBuildCall2(b, abty, ab, NULL, 0, "");
+        LLVMBuildUnreachable(b);
+    }
+    LLVMPositionBuilderAtEnd(b, ok_bb);
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, ncap, cap_ptr));
+    LLVMValueRef nd = LLVMBuildBitCast(b, nd_raw, i64ptr, "ndt");
+    zan_tbaa_tag_meta(g, LLVMBuildStore(b, nd, df));
+    LLVMBuildBr(b, ret_bb);
+    LLVMPositionBuilderAtEnd(b, ret_bb);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+
 /* 取 List 的数据指针，先保证槽宽是本访问点要的宽度。 */
 LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr,
                            zan_type_t *et, const char *nm) {

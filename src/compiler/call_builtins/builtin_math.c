@@ -338,54 +338,94 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
                                   memcmp(cn.str, "Char", 4) == 0));
   if (char_cls) {
     zan_istr_t cm = expr->call.callee->member.name;
-    static const struct {
-      const char *name;
-      const char *libc;
-    } preds[] = {
-        {"IsDigit", "isdigit"},         {"IsLetter", "isalpha"},
-        {"IsLetterOrDigit", "isalnum"}, {"IsUpper", "isupper"},
-        {"IsLower", "islower"},         {"IsWhiteSpace", "isspace"},
-    };
-    static const struct {
-      const char *name;
-      const char *libc;
-    } mappers[] = {
-        {"ToUpper", "toupper"},
-        {"ToLower", "tolower"},
-    };
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-    LLVMTypeRef aty = LLVMFunctionType(i32t, (LLVMTypeRef[]){i32t}, 1, 0);
     LLVMValueRef cp = arg;
     if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(arg)) > 32)
       cp = LLVMBuildTrunc(g->builder, arg, i32t, "ch.cp32");
-    for (size_t pi = 0; pi < sizeof(preds) / sizeof(preds[0]); pi++) {
-      size_t nl = strlen(preds[pi].name);
-      if (cm.len != (int)nl || memcmp(cm.str, preds[pi].name, nl) != 0)
-        continue;
-      LLVMValueRef r =
-          zan_call2(g->builder, aty, get_libc_fn(g, preds[pi].libc, aty), &cp,
-                    1, "ch.pred");
-      LLVMValueRef nz =
-          zan_icmp(g->builder, LLVMIntNE, r, LLVMConstInt(i32t, 0, 0), "ch.nz");
-      emit_release_owned_call_temp(g, expr->call.args.items[0], arg, locals);
-      return nz;
+    else if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
+             LLVMGetIntTypeWidth(LLVMTypeOf(arg)) < 32)
+      cp = LLVMBuildZExt(g->builder, arg, i32t, "ch.cp32");
+
+    /* 无分支内联 ASCII 判定（等价于 C locale libc isdigit/isalpha/...，
+     * 消除每次外部 CRT 调用与 locale 检查，可供 LLVM 自动向量化） */
+    LLVMValueRef pred_res = NULL;
+    if (cm.len == 7 && memcmp(cm.str, "IsDigit", 7) == 0) {
+      pred_res = zan_icmp(g->builder, LLVMIntULE,
+                          zan_sub(g->builder, cp, LLVMConstInt(i32t, '0', 0), "ch.d"),
+                          LLVMConstInt(i32t, 9, 0), "ch.isdig");
+    } else if (cm.len == 7 && memcmp(cm.str, "IsUpper", 7) == 0) {
+      pred_res = zan_icmp(g->builder, LLVMIntULE,
+                          zan_sub(g->builder, cp, LLVMConstInt(i32t, 'A', 0), "ch.u"),
+                          LLVMConstInt(i32t, 25, 0), "ch.isup");
+    } else if (cm.len == 7 && memcmp(cm.str, "IsLower", 7) == 0) {
+      pred_res = zan_icmp(g->builder, LLVMIntULE,
+                          zan_sub(g->builder, cp, LLVMConstInt(i32t, 'a', 0), "ch.l"),
+                          LLVMConstInt(i32t, 25, 0), "ch.islo");
+    } else if (cm.len == 8 && memcmp(cm.str, "IsLetter", 8) == 0) {
+      LLVMValueRef low = zan_or(g->builder, cp, LLVMConstInt(i32t, 32, 0), "ch.fold");
+      pred_res = zan_icmp(g->builder, LLVMIntULE,
+                          zan_sub(g->builder, low, LLVMConstInt(i32t, 'a', 0), "ch.a"),
+                          LLVMConstInt(i32t, 25, 0), "ch.islet");
+    } else if (cm.len == 15 && memcmp(cm.str, "IsLetterOrDigit", 15) == 0) {
+      LLVMValueRef low = zan_or(g->builder, cp, LLVMConstInt(i32t, 32, 0), "ch.fold");
+      LLVMValueRef is_let = zan_icmp(g->builder, LLVMIntULE,
+                                     zan_sub(g->builder, low, LLVMConstInt(i32t, 'a', 0), "ch.a"),
+                                     LLVMConstInt(i32t, 25, 0), "ch.islet");
+      LLVMValueRef is_dig = zan_icmp(g->builder, LLVMIntULE,
+                                     zan_sub(g->builder, cp, LLVMConstInt(i32t, '0', 0), "ch.d"),
+                                     LLVMConstInt(i32t, 9, 0), "ch.isdig");
+      pred_res = zan_or(g->builder, is_let, is_dig, "ch.isalnum");
+    } else if (cm.len == 12 && memcmp(cm.str, "IsWhiteSpace", 12) == 0) {
+      LLVMValueRef is_sp = zan_icmp(g->builder, LLVMIntEQ, cp,
+                                    LLVMConstInt(i32t, 32, 0), "ch.sp");
+      LLVMValueRef is_ctl = zan_icmp(g->builder, LLVMIntULE,
+                                     zan_sub(g->builder, cp, LLVMConstInt(i32t, 9, 0), "ch.ws"),
+                                     LLVMConstInt(i32t, 4, 0), "ch.ctl");
+      pred_res = zan_or(g->builder, is_sp, is_ctl, "ch.isws");
     }
-    for (size_t mi = 0; mi < sizeof(mappers) / sizeof(mappers[0]); mi++) {
-      size_t nl = strlen(mappers[mi].name);
-      if (cm.len != (int)nl || memcmp(cm.str, mappers[mi].name, nl) != 0)
-        continue;
-      /* Unicode 简单大小写映射（审计 P1-12 / A525 后续）：
-       * libc toupper/tolower 是 C locale ASCII 口径，非 ASCII
-       * 原样返回；表助手覆盖全 Unicode 1:1 简单映射。 */
+    if (pred_res) {
+      emit_release_owned_call_temp(g, expr->call.args.items[0], arg, locals);
+      return pred_res;
+    }
+
+    int is_to_up = (cm.len == 7 && memcmp(cm.str, "ToUpper", 7) == 0);
+    int is_to_lo = (cm.len == 7 && memcmp(cm.str, "ToLower", 7) == 0);
+    if (is_to_up || is_to_lo) {
+      /* ASCII (<128) 3 指令内联快路径；非 ASCII 回落全 Unicode 二分表 */
+      LLVMValueRef fn_cur = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+      LLVMBasicBlockRef bb_asc = LLVMAppendBasicBlockInContext(g->ctx, fn_cur, "ch.asc");
+      LLVMBasicBlockRef bb_uni = LLVMAppendBasicBlockInContext(g->ctx, fn_cur, "ch.uni");
+      LLVMBasicBlockRef bb_m = LLVMAppendBasicBlockInContext(g->ctx, fn_cur, "ch.m");
+      LLVMValueRef is_asc = zan_icmp(g->builder, LLVMIntULT, cp,
+                                     LLVMConstInt(i32t, 128, 0), "ch.isasc");
+      zan_set_branch_weights(g, LLVMBuildCondBr(g->builder, is_asc, bb_asc, bb_uni), 2000, 1);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_asc);
+      LLVMValueRef base_c = LLVMConstInt(i32t, is_to_up ? 'a' : 'A', 0);
+      LLVMValueRef in_rng = zan_icmp(g->builder, LLVMIntULE,
+                                     zan_sub(g->builder, cp, base_c, "ch.sub"),
+                                     LLVMConstInt(i32t, 25, 0), "ch.inrng");
+      LLVMValueRef flipped = LLVMBuildXor(g->builder, cp,
+                                          LLVMConstInt(i32t, 32, 0), "ch.flip");
+      LLVMValueRef r_asc = LLVMBuildSelect(g->builder, in_rng, flipped, cp, "ch.rasc");
+      LLVMBuildBr(g->builder, bb_m);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_uni);
       LLVMTypeRef case_ty =
           LLVMFunctionType(i32t, (LLVMTypeRef[]){i32t, i32t}, 2, 0);
-      LLVMValueRef upc = LLVMConstInt(
-          i32t, strcmp(mappers[mi].name, "ToUpper") == 0 ? 1 : 0, 0);
+      LLVMValueRef upc = LLVMConstInt(i32t, is_to_up ? 1 : 0, 0);
       LLVMValueRef args2[2] = {cp, upc};
-      LLVMValueRef r = zan_call2(g->builder, case_ty, get_char_case_fn(g),
-                                 args2, 2, "ch.map");
+      LLVMValueRef r_uni = zan_call2(g->builder, case_ty, get_char_case_fn(g),
+                                     args2, 2, "ch.map");
+      LLVMBasicBlockRef uni_end = LLVMGetInsertBlock(g->builder);
+      LLVMBuildBr(g->builder, bb_m);
+
+      LLVMPositionBuilderAtEnd(g->builder, bb_m);
+      LLVMValueRef r = LLVMBuildPhi(g->builder, i32t, "ch.res");
+      LLVMAddIncoming(r, (LLVMValueRef[]){r_asc, r_uni},
+                      (LLVMBasicBlockRef[]){bb_asc, uni_end}, 2);
       if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
           LLVMGetIntTypeWidth(LLVMTypeOf(arg)) > 32)
         r = LLVMBuildSExt(g->builder, r, LLVMTypeOf(arg), "ch.map.w");
@@ -511,45 +551,34 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
     if (int_recv) {
       int is64 = (rn.len == 4 && memcmp(rn.str, "long", 4) == 0) ||
                  (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
-      LLVMTypeRef strtoll_ty =
-          LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i8pp, i32t}, 3, 0);
-      LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
-      LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "parse.endp");
-      LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
       LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
-      LLVMValueRef errnop = emit_errno_preset(g, i32t);
-      r = zan_call2(g->builder, strtoll_ty, f,
-                    (LLVMValueRef[]){s_safe, endp, LLVMConstInt(i32t, 10, 0)},
-                    3, "parse");
-      LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "parse.ep");
-      /* C# 语义两路分流：格式错 → FormatException，数值越界 →
-       * OverflowException。曾共用一条带 "(or out of range)" 的
-       * 消息，被关键词匹配整体误判成 IndexOutOfRange。两条检查
-       * 顺序发射：try 内第一条命中即抛不走第二条；try 外软诊断
-       * 各报各的，最后统一 select 归零。 */
-      LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+      LLVMValueRef out_slot = emit_entry_alloca(g, i64, "parse.val");
+      LLVMValueRef pfn = get_try_parse_i64_fn(g);
+      LLVMValueRef st = zan_call2(g->builder, LLVMGlobalGetValueType(pfn), pfn,
+                                  (LLVMValueRef[]){s_safe, out_slot}, 2,
+                                  "parse.st");
+      r = LLVMBuildLoad2(g->builder, i64, out_slot, "parse");
+      /* C# 语义两路分流：status==1 格式错 → FormatException，
+       * status==2 或 i32 中段越界 → OverflowException。 */
+      LLVMValueRef bad = zan_icmp(g->builder, LLVMIntEQ, st,
+                                  LLVMConstInt(i32t, 1, 0), "parse.bad");
       emit_runtime_check(g, bad, expr->loc,
                          "int.Parse: input is not a valid integer");
-      /* strtoll 饱和返回 LLONG_MIN/MAX 并置 errno=ERANGE——返回
-       * 值分不清「恰好极值」与「饱和」，long.Parse 的全宽范围
-       * 只有 ERANGE 抓得住（曾按 INT32 边界判，把合法的
-       * long.Parse("9223372036854775807") 误杀）。i32 档再补中段
-       * 越界：3000000000 吃进 64 位不置 ERANGE，但超出 int 范围
-       * 要按 C# 抛 Overflow。 */
-      LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t, errnop, "parse.errno");
-      LLVMValueRef over = zan_icmp(g->builder, LLVMIntEQ, er,
-                                   LLVMConstInt(i32t, 34, 0), "parse.erange");
+      LLVMValueRef over = zan_icmp(g->builder, LLVMIntEQ, st,
+                                   LLVMConstInt(i32t, 2, 0), "parse.erange");
       if (!is64) {
-        over = LLVMBuildOr(
-            g->builder, over,
-            LLVMBuildOr(g->builder,
-                        zan_icmp(g->builder, LLVMIntSLT, r,
-                                 LLVMConstInt(i64, (int64_t)INT32_MIN, 0),
-                                 "parse.lo"),
-                        zan_icmp(g->builder, LLVMIntSGT, r,
-                                 LLVMConstInt(i64, INT32_MAX, 0), "parse.hi"),
-                        "parse.over32"),
-            "parse.over");
+        LLVMValueRef ok0 = zan_icmp(g->builder, LLVMIntEQ, st,
+                                    LLVMConstInt(i32t, 0, 0), "parse.ok0");
+        LLVMValueRef out32 = LLVMBuildOr(
+            g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, r,
+                     LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "parse.lo"),
+            zan_icmp(g->builder, LLVMIntSGT, r,
+                     LLVMConstInt(i64, INT32_MAX, 0), "parse.hi"),
+            "parse.over32");
+        over = LLVMBuildOr(g->builder, over,
+                           zan_and(g->builder, ok0, out32, "parse.o32"),
+                           "parse.over");
       }
       emit_runtime_check(
           g, over, expr->loc,
@@ -655,36 +684,35 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
       return ok;
     }
 
-    LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
-    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
     LLVMValueRef v;
-    LLVMValueRef over = NULL;
+    LLVMValueRef ok;
+    LLVMValueRef not_null = LLVMBuildNot(g->builder, isnull, "tp.notnull");
     if (int_recv) {
       int is64 = (rn.len == 4 && memcmp(rn.str, "long", 4) == 0) ||
                  (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
-      LLVMValueRef errnop = emit_errno_preset(g, i32t);
-      LLVMTypeRef strtoll_ty =
-          LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i8pp, i32t}, 3, 0);
-      LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
-      v = zan_call2(g->builder, strtoll_ty, f,
-                    (LLVMValueRef[]){s_safe, endp, LLVMConstInt(i32t, 10, 0)},
-                    3, "tp");
-      LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t, errnop, "tp.errno");
-      over = zan_icmp(g->builder, LLVMIntEQ, er, LLVMConstInt(i32t, 34, 0),
-                      "tp.erange");
+      LLVMValueRef out_slot = emit_entry_alloca(g, i64, "tp.val");
+      LLVMValueRef pfn = get_try_parse_i64_fn(g);
+      LLVMValueRef st = zan_call2(g->builder, LLVMGlobalGetValueType(pfn), pfn,
+                                  (LLVMValueRef[]){s_safe, out_slot}, 2,
+                                  "tp.st");
+      v = LLVMBuildLoad2(g->builder, i64, out_slot, "tp");
+      ok = zan_and(g->builder, not_null,
+                   zan_icmp(g->builder, LLVMIntEQ, st,
+                            LLVMConstInt(i32t, 0, 0), "tp.st0"),
+                   "ok");
       if (!is64) {
-        over = LLVMBuildOr(
-            g->builder, over,
-            LLVMBuildOr(g->builder,
-                        zan_icmp(g->builder, LLVMIntSLT, v,
-                                 LLVMConstInt(i64, (int64_t)INT32_MIN, 0),
-                                 "tp.lo"),
-                        zan_icmp(g->builder, LLVMIntSGT, v,
-                                 LLVMConstInt(i64, INT32_MAX, 0), "tp.hi"),
-                        "tp.over32"),
-            "tp.over");
+        LLVMValueRef in32 = zan_and(
+            g->builder,
+            zan_icmp(g->builder, LLVMIntSGE, v,
+                     LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "tp.ge32"),
+            zan_icmp(g->builder, LLVMIntSLE, v,
+                     LLVMConstInt(i64, INT32_MAX, 0), "tp.le32"),
+            "tp.in32");
+        ok = zan_and(g->builder, ok, in32, "ok2");
       }
     } else {
+      LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
+      LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
       LLVMTypeRef strtod_ty =
           LLVMFunctionType(dbl, (LLVMTypeRef[]){i8ptr, i8pp}, 2, 0);
       LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
@@ -692,19 +720,13 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
         f = LLVMAddFunction(g->mod, "zan_rt_dbl_parse", strtod_ty);
       v = zan_call2(g->builder, strtod_ty, f, (LLVMValueRef[]){s_safe, endp}, 2,
                     "tp");
-    }
-    LLVMValueRef e = LLVMBuildLoad2(g->builder, i8ptr, endp, "e");
-    LLVMValueRef moved = zan_icmp(g->builder, LLVMIntNE, e, s_safe, "moved");
-    LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8, e, "ch");
-    LLVMValueRef at_end =
-        zan_icmp(g->builder, LLVMIntEQ, ch, LLVMConstInt(i8, 0, 0), "atend");
-    LLVMValueRef not_null = LLVMBuildNot(g->builder, isnull, "tp.notnull");
-    LLVMValueRef ok =
-        zan_and(g->builder, not_null,
-                zan_and(g->builder, moved, at_end, "moved_end"), "ok");
-    if (over) {
-      LLVMValueRef not_over = LLVMBuildNot(g->builder, over, "tp.notover");
-      ok = zan_and(g->builder, ok, not_over, "ok2");
+      LLVMValueRef e = LLVMBuildLoad2(g->builder, i8ptr, endp, "e");
+      LLVMValueRef moved = zan_icmp(g->builder, LLVMIntNE, e, s_safe, "moved");
+      LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8, e, "ch");
+      LLVMValueRef at_end =
+          zan_icmp(g->builder, LLVMIntEQ, ch, LLVMConstInt(i8, 0, 0), "atend");
+      ok = zan_and(g->builder, not_null,
+                   zan_and(g->builder, moved, at_end, "moved_end"), "ok");
     }
     LLVMValueRef stored =
         LLVMBuildSelect(g->builder, ok, v,

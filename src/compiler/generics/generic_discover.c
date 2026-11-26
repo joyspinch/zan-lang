@@ -687,12 +687,17 @@ LLVMValueRef emit_dispatch_call_gctx(zan_irgen_t *g, zan_symbol_t *static_sym,
         LLVMValueRef thisp =
             LLVMBuildBitCast(b, call_args[0], LLVMPointerType(st, 0), "vthis");
         LLVMValueRef vpf = LLVMBuildStructGEP2(b, st, thisp, 0, "vpf");
+        unsigned inv_kind =
+            LLVMGetMDKindIDInContext(g->ctx, "invariant.load", 14);
+        LLVMValueRef inv_md = LLVMMDNodeInContext(g->ctx, NULL, 0);
         LLVMValueRef vt8 = LLVMBuildLoad2(b, i8ptr, vpf, "vt8");
+        LLVMSetMetadata(vt8, inv_kind, inv_md);
         LLVMValueRef vt =
             LLVMBuildBitCast(b, vt8, LLVMPointerType(i8ptr, 0), "vt");
         LLVMValueRef sidx = LLVMConstInt(i64, (unsigned long long)slot, 0);
-        LLVMValueRef sp = LLVMBuildGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
+        LLVMValueRef sp = LLVMBuildInBoundsGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
         LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
+        LLVMSetMetadata(fn8, inv_kind, inv_md);
         LLVMValueRef fnp =
             LLVMBuildBitCast(b, fn8, LLVMPointerType(vtable_fnty, 0), "vfnp");
         LLVMValueRef call_res = zan_call_or_invoke(

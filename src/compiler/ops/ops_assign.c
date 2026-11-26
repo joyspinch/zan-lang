@@ -287,16 +287,15 @@ binding_lowered:
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                     LLVMValueRef span_len = LLVMBuildExtractValue(g->builder, span_val,
                         1, "sps.len");
-                    LLVMValueRef sp_oob = emit_index_oob_pred(g, idx, span_len);
-                    emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
+                    LLVMValueRef sp_oob =
+                        emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
                     LLVMBasicBlockRef sp_do = NULL, sp_end = NULL;
                     emit_oob_store_split(g, sp_oob, &sp_do, &sp_end);
                     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
                         idx = LLVMBuildSExt(g->builder, idx,
                             LLVMInt64TypeInContext(g->ctx), "sps.ix");
-                    idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
-                    LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
+                    LLVMValueRef ep = LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
                     LLVMValueRef sv = right;
                     if (LLVMTypeOf(sv) != elem_llvm) {
                         if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind &&

@@ -626,9 +626,13 @@ LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
   LLVMValueRef dim0 = LLVMBuildLoad2(
       g->builder, i64,
       LLVMBuildGEP2(g->builder, i64, dim_ptr, &zero, 1, "md.d0"), "md.dim0");
-  LLVMValueRef total_oob = emit_index_oob_pred(g, idx, dim0);
-  emit_index_bounds_check(g, idx, dim0, expr->loc, "array");
-  idx = emit_index_safe_bounds(g, idx, dim0, expr->loc, "array");
+  LLVMValueRef total_oob =
+      emit_index_bounds_check(g, idx, dim0, expr->loc, "array");
+  if (total_oob)
+    idx = LLVMBuildSelect(g->builder, total_oob, LLVMConstInt(i64, 0, 0), idx,
+                          "md.i0.ok");
+  else
+    total_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
   LLVMValueRef flat = idx;
   for (int d = 1; d < rank; d++) {
     LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)d, 0);
@@ -641,10 +645,13 @@ LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
     LLVMValueRef ix =
         extra_node ? emit_expr(g, extra_node, locals) : LLVMConstInt(i64, 0, 0);
     ix = emit_index_i64(g, ix, "md.ix");
-    LLVMValueRef cur_oob = emit_index_oob_pred(g, ix, dimv);
-    total_oob = LLVMBuildOr(g->builder, total_oob, cur_oob, "md.oob");
-    emit_index_bounds_check(g, ix, dimv, expr->loc, "array");
-    ix = emit_index_safe_bounds(g, ix, dimv, expr->loc, "array");
+    LLVMValueRef cur_oob =
+        emit_index_bounds_check(g, ix, dimv, expr->loc, "array");
+    if (cur_oob) {
+      total_oob = LLVMBuildOr(g->builder, total_oob, cur_oob, "md.oob");
+      ix = LLVMBuildSelect(g->builder, cur_oob, LLVMConstInt(i64, 0, 0), ix,
+                           "md.ix.ok");
+    }
     flat = zan_mul(g->builder, flat, dimv, "md.fm");
     flat = zan_add(g->builder, flat, ix, "md.fa");
   }

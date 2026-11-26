@@ -1044,6 +1044,8 @@ LLVMValueRef emit_object_family_call(zan_irgen_t *g, zan_ast_node_t *expr,
                        LLVMBuildBitCast(g->builder, recv,
                                         LLVMPointerType(i8ptr, 0), "objf.vpp"),
                        "objf.tag");
+    unsigned inv_kind = LLVMGetMDKindIDInContext(c, "invariant.load", 14);
+    LLVMSetMetadata(tag, inv_kind, LLVMMDNodeInContext(c, NULL, 0));
     for (int ci = 0; ci < cand_count; ci++) {
       LLVMBasicBlockRef callbb =
           LLVMAppendBasicBlockInContext(c, g->current_fn, "objf.call");

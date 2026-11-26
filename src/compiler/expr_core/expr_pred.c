@@ -290,7 +290,7 @@ static void zan_register_array(zan_irgen_t *g, LLVMValueRef array,
 
 static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
                                          LLVMValueRef count,
-                                         zan_type_t *elem_type) {
+                                         zan_type_t *elem_type, int zero_init) {
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -305,10 +305,18 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
   count = LLVMBuildSelect(g->builder, overflow, LLVMConstInt(i64, 0, 0), count,
                           "arr.count.safe");
   LLVMValueRef bytes = LLVMBuildAdd(g->builder, total, header, "arr.bytes");
-  LLVMValueRef raw = zan_call2(
-      g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
-      get_calloc_fn(g), (LLVMValueRef[]){bytes, LLVMConstInt(i64, 1, 0)}, 2,
-      "arr.raw");
+  LLVMValueRef raw;
+  if (zero_init) {
+    raw = zan_call2(
+        g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
+        get_calloc_fn(g), (LLVMValueRef[]){bytes, LLVMConstInt(i64, 1, 0)}, 2,
+        "arr.raw");
+  } else {
+    /* 仅用于调用方随即全量 memcpy 覆盖载荷的纯标量数组，省去无效 calloc 清零 */
+    raw = zan_call2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64}, 1, 0),
+                    g->fn_malloc, &bytes, 1, "arr.raw");
+  }
   if (g->current_fn) {
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
   } else {
@@ -340,11 +348,16 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
 }
 LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total,
                                    LLVMValueRef count, zan_type_t *elem_type) {
-  return zan_array_alloc_impl(g, total, count, elem_type);
+  return zan_array_alloc_impl(g, total, count, elem_type, 1);
+}
+LLVMValueRef zan_array_alloc_uninit_typed(zan_irgen_t *g, LLVMValueRef total,
+                                          LLVMValueRef count,
+                                          zan_type_t *elem_type) {
+  return zan_array_alloc_impl(g, total, count, elem_type, 0);
 }
 LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
                              LLVMValueRef count) {
-  return zan_array_alloc_impl(g, total, count, NULL);
+  return zan_array_alloc_impl(g, total, count, NULL, 1);
 }
 LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

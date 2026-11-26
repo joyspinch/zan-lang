@@ -367,8 +367,13 @@ void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes) {
   LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                        (LLVMTypeRef[]){i64}, 1, 0);
   LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_alloc_add");
-  if (!fn)
+  if (!fn) {
     fn = LLVMAddFunction(g->mod, "zan_rt_alloc_add", fn_ty);
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    if (nw)
+      LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nw, 0));
+  }
   LLVMValueRef b_val = bytes;
   if (LLVMTypeOf(b_val) != i64) {
     if (LLVMGetTypeKind(LLVMTypeOf(b_val)) == LLVMPointerTypeKind) {

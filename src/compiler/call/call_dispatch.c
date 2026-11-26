@@ -670,6 +670,8 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
       LLVMValueRef recv_pp = LLVMBuildBitCast(
           g->builder, recv, LLVMPointerType(i8ptr, 0), "ifc.recvpp");
       LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");
+      unsigned inv_kind = LLVMGetMDKindIDInContext(c, "invariant.load", 14);
+      LLVMSetMetadata(tag, inv_kind, LLVMMDNodeInContext(c, NULL, 0));
 
       LLVMBasicBlockRef merge =
           LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.merge");

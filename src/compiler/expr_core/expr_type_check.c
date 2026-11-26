@@ -681,12 +681,23 @@ bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
         zan_ast_node_t *callee = e->call.callee;
         if (callee && callee->kind == AST_MEMBER_ACCESS) {
             zan_istr_t m = callee->member.name;
+            if ((m.len == 7 && memcmp(m.str, "ToUpper", 7) == 0) ||
+                (m.len == 7 && memcmp(m.str, "ToLower", 7) == 0)) {
+                /* char.ToUpper/ToLower 返回 char 而非 string，不可按方法名误判为 string */
+                if (callee->member.object &&
+                    callee->member.object->kind == AST_IDENTIFIER &&
+                    !local_find(locals, callee->member.object->ident.name)) {
+                    zan_istr_t on = callee->member.object->ident.name;
+                    if (on.len == 4 && (memcmp(on.str, "char", 4) == 0 ||
+                                        memcmp(on.str, "Char", 4) == 0))
+                        return false;
+                }
+                return true;
+            }
             if ((m.len == 9 && memcmp(m.str, "Substring", 9) == 0) ||
                 (m.len == 8 && memcmp(m.str, "ToString", 8) == 0) ||
                 (m.len == 4 && memcmp(m.str, "Trim", 4) == 0) ||
-                (m.len == 7 && memcmp(m.str, "Replace", 7) == 0) ||
-                (m.len == 7 && memcmp(m.str, "ToUpper", 7) == 0) ||
-                (m.len == 7 && memcmp(m.str, "ToLower", 7) == 0))
+                (m.len == 7 && memcmp(m.str, "Replace", 7) == 0))
                 return true;
         }
         {

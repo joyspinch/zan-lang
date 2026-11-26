@@ -413,6 +413,11 @@ int type_is_or_derives(zan_type_t *s, zan_type_t *t) {
 LLVMValueRef emit_runtime_is_check_val(zan_irgen_t *g, LLVMValueRef x,
                                        LLVMValueRef tstr);
 
+static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
+                                               LLVMValueRef tstr,
+                                               const char *known_tname,
+                                               bool exact_only);
+
 /* 运行时 x is T 类型检查辅助封装 */
 LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                         zan_type_t *tt) {
@@ -421,54 +426,100 @@ LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
     LLVMValueRef tstr = emit_gctx_load_slot(g, GCTX_SLOT_TYPENAME, tt->sym, tt,
                                             NULL, 0, 0, 0);
     if (tstr)
-      return emit_runtime_is_check_val(g, x, tstr);
+      return emit_runtime_is_check_impl(g, x, tstr, NULL, false);
   }
-  return emit_runtime_is_check(g, x, arc_runtime_type_name(g, tt));
+  const char *tn = arc_runtime_type_name(g, tt);
+  bool exact_only = (tt && tt->kind == TYPE_STRUCT);
+  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_string(g, tn), tn,
+                                    exact_only);
 }
 LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
                                    const char *tname) {
-  return emit_runtime_is_check_val(g, x, zan_irgen_intern_string(g, tname));
+  return emit_runtime_is_check_impl(g, x, zan_irgen_intern_string(g, tname),
+                                    tname, false);
 }
 LLVMValueRef emit_runtime_is_check_val(zan_irgen_t *g, LLVMValueRef x,
                                        LLVMValueRef tstr) {
+  return emit_runtime_is_check_impl(g, x, tstr, NULL, false);
+}
+
+static LLVMValueRef emit_runtime_is_check_impl(zan_irgen_t *g, LLVMValueRef x,
+                                               LLVMValueRef tstr,
+                                               const char *known_tname,
+                                               bool exact_only) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-  LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
   if (!g->desc_hdr && !g->g_site_tynames)
     return LLVMConstInt(i1, 0, 0);
+
+  /* 编译期已知目标为 "object"：非空即真（1 条指令，零头部访存/零 strcmp） */
+  if (known_tname && strcmp(known_tname, "object") == 0) {
+    return zan_icmp(g->builder, LLVMIntNE, x, LLVMConstNull(LLVMTypeOf(x)),
+                    "is.obj");
+  }
+
+  unsigned inv_kind = LLVMGetMDKindIDInContext(g->ctx, "invariant.load", 14);
+  LLVMValueRef inv_md = LLVMMDNodeInContext(g->ctx, NULL, 0);
+
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-  LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef false_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "is.f");
   LLVMBasicBlockRef true_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.t");
   LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.m");
-  LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.h");
   LLVMBasicBlockRef hdr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.hdr");
-  LLVMBasicBlockRef str_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.s");
-  LLVMBasicBlockRef oob_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.o");
-  LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.l");
-  LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.b");
-  LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.n");
-  (void)cur;
 
   LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, x,
                                  LLVMConstNull(LLVMTypeOf(x)), "is.nul");
-  LLVMBuildCondBr(g->builder, isnull, false_bb, head);
 
-  /* 非空对象对 "object" 目标恒真（涵盖 string / 集合 / 类实例 / new object()） */
-  LLVMPositionBuilderAtEnd(g->builder, head);
-  LLVMValueRef objstr = zan_irgen_intern_string(g, "object");
-  LLVMTypeRef ostrcmp_ty =
-      LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0);
-  LLVMValueRef ostrcmp_fn = get_libc_fn(g, "strcmp", ostrcmp_ty);
-  LLVMValueRef ocmp = zan_call2(g->builder, ostrcmp_ty, ostrcmp_fn,
-                                (LLVMValueRef[]){tstr, objstr}, 2, "is.ocmp");
-  LLVMValueRef oeq =
-      zan_icmp(g->builder, LLVMIntEQ, ocmp, LLVMConstInt(i32, 0, 0), "is.oeq");
-  LLVMBuildCondBr(g->builder, oeq, true_bb, hdr_bb);
+  /* 编译期已知目标为 "string"：非空 + 头部魔数即判定，无需进入 tynames 链 */
+  if (known_tname && strcmp(known_tname, "string") == 0) {
+    LLVMBuildCondBr(g->builder, isnull, false_bb, hdr_bb);
+    LLVMPositionBuilderAtEnd(g->builder, hdr_bb);
+    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                                      x, &neg8, 1, "is.sptr");
+    LLVMValueRef raw_site = LLVMBuildLoad2(
+        g->builder, i64,
+        LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
+        "is.site.raw");
+    LLVMSetMetadata(raw_site, inv_kind, inv_md);
+    LLVMValueRef site =
+        zan_and(g->builder, raw_site, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0),
+                "is.site");
+    LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
+    LLVMBuildCondBr(g->builder, isstr, true_bb, false_bb);
+    LLVMPositionBuilderAtEnd(g->builder, true_bb);
+    LLVMBuildBr(g->builder, merge);
+    LLVMPositionBuilderAtEnd(g->builder, false_bb);
+    LLVMBuildBr(g->builder, merge);
+    LLVMPositionBuilderAtEnd(g->builder, merge);
+    LLVMValueRef res = LLVMBuildPhi(g->builder, i1, "is.res");
+    LLVMAddIncoming(
+        res, (LLVMValueRef[]){LLVMConstInt(i1, 1, 0), LLVMConstInt(i1, 0, 0)},
+        (LLVMBasicBlockRef[]){true_bb, false_bb}, 2);
+    return res;
+  }
 
-  /* 对象头部 -8 处分配点标识字（支持字符串/对象运行时类型识别） */
+  LLVMBasicBlockRef oob_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.o");
+  LLVMBasicBlockRef list_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "is.lst");
+
+  if (!known_tname) {
+    /* 泛型擦除/canon 体动态目标名：全部 tynames 与 tstr 均由
+     * zan_irgen_intern_string 在单模块内唯一驻留，指针相等即等价于 strcmp==0。 */
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.h");
+    LLVMBuildCondBr(g->builder, isnull, false_bb, head);
+    LLVMPositionBuilderAtEnd(g->builder, head);
+    LLVMValueRef objstr = zan_irgen_intern_string(g, "object");
+    LLVMValueRef oeq = zan_icmp(g->builder, LLVMIntEQ, tstr, objstr, "is.oeq");
+    LLVMBuildCondBr(g->builder, oeq, true_bb, hdr_bb);
+  } else {
+    /* 编译期已排除 "object" 与 "string"，跳过全部 const strcmp */
+    LLVMBuildCondBr(g->builder, isnull, false_bb, hdr_bb);
+  }
+
+  /* 对象头部 -8 处分配点标识字（分配后终生不变，标 invariant.load 供外提） */
   LLVMPositionBuilderAtEnd(g->builder, hdr_bb);
   LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
   LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
@@ -477,22 +528,22 @@ LLVMValueRef emit_runtime_is_check_val(zan_irgen_t *g, LLVMValueRef x,
       g->builder, i64,
       LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
       "is.site.raw");
+  LLVMSetMetadata(raw_site, inv_kind, inv_md);
   LLVMValueRef site =
       zan_and(g->builder, raw_site, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0),
               "is.site");
   LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
-  LLVMBuildCondBr(g->builder, isstr, str_bb, oob_bb);
-
-  LLVMPositionBuilderAtEnd(g->builder, str_bb);
-  LLVMValueRef ststr = zan_irgen_intern_string(g, "string");
-  LLVMTypeRef sstrcmp_ty =
-      LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0);
-  LLVMValueRef sstrcmp_fn = get_libc_fn(g, "strcmp", sstrcmp_ty);
-  LLVMValueRef scmp = zan_call2(g->builder, sstrcmp_ty, sstrcmp_fn,
-                                (LLVMValueRef[]){ststr, tstr}, 2, "is.scmp");
-  LLVMValueRef seq =
-      zan_icmp(g->builder, LLVMIntEQ, scmp, LLVMConstInt(i32, 0, 0), "is.seq");
-  LLVMBuildCondBr(g->builder, seq, true_bb, false_bb);
+  if (!known_tname) {
+    LLVMBasicBlockRef str_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "is.s");
+    LLVMBuildCondBr(g->builder, isstr, str_bb, oob_bb);
+    LLVMPositionBuilderAtEnd(g->builder, str_bb);
+    LLVMValueRef ststr = zan_irgen_intern_string(g, "string");
+    LLVMValueRef seq = zan_icmp(g->builder, LLVMIntEQ, ststr, tstr, "is.seq");
+    LLVMBuildCondBr(g->builder, seq, true_bb, false_bb);
+  } else {
+    LLVMBuildCondBr(g->builder, isstr, false_bb, oob_bb);
+  }
 
   /* 越界分配点索引判定为非目标类型 */
   LLVMPositionBuilderAtEnd(g->builder, oob_bb);
@@ -500,70 +551,79 @@ LLVMValueRef emit_runtime_is_check_val(zan_irgen_t *g, LLVMValueRef x,
   if (!g->desc_hdr) {
     LLVMValueRef bound =
         LLVMBuildLoad2(g->builder, i64, g->g_site_count, "is.bound");
-    oob = zan_or(g->builder,
-                 zan_icmp(g->builder, LLVMIntSLT, site, LLVMConstInt(i64, 0, 0),
-                          "is.neg"),
-                 zan_icmp(g->builder, LLVMIntSGE, site, bound, "is.oob"),
-                 "is.oob2");
+    oob = zan_icmp(g->builder, LLVMIntUGE, site, bound, "is.oob2");
   } else {
-    /* 描述符模式：头部字作为元数据记录指针 */
+    /* 描述符模式：头部字作为元数据记录指针（site==0 已被 site < 4096 覆盖） */
     oob = zan_or(
         g->builder,
-        zan_or(g->builder,
-               zan_icmp(g->builder, LLVMIntEQ, site, LLVMConstInt(i64, 0, 0),
-                        "is.nodsc"),
-               zan_icmp(g->builder, LLVMIntEQ, site,
-                        LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrdsc"),
-               "is.notdsc"),
         zan_icmp(g->builder, LLVMIntULT, site, LLVMConstInt(i64, 4096, 0),
                  "is.tinydsc"),
+        zan_icmp(g->builder, LLVMIntEQ, site,
+                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrdsc"),
         "is.oob2");
   }
-  LLVMBuildCondBr(g->builder, oob, false_bb, loop);
+  LLVMBuildCondBr(g->builder, oob, false_bb, list_bb);
 
-  LLVMPositionBuilderAtEnd(g->builder, loop);
-  LLVMValueRef idx = LLVMBuildPhi(g->builder, i64, "is.i");
+  /* 将描述符 tynames 指针加载提到循环外，且标 invariant.load */
+  LLVMPositionBuilderAtEnd(g->builder, list_bb);
   LLVMValueRef list;
   if (!g->desc_hdr) {
     LLVMValueRef tbl = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0),
                                       g->g_site_tynames, "is.tbl");
     list = LLVMBuildLoad2(
         g->builder, i8ptr,
-        LLVMBuildGEP2(g->builder, i8ptr, tbl, &site, 1, "is.lp"), "is.list");
+        LLVMBuildInBoundsGEP2(g->builder, i8ptr, tbl, &site, 1, "is.lp"),
+        "is.list");
   } else {
     LLVMValueRef dp = LLVMBuildIntToPtr(
         g->builder, site, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
         "is.dsc");
     LLVMValueRef tn_off = LLVMConstInt(i64, 8, 0);
-    LLVMValueRef tn_p = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
-                                      dp, &tn_off, 1, "is.tnp");
+    LLVMValueRef tn_p = LLVMBuildInBoundsGEP2(
+        g->builder, LLVMInt8TypeInContext(g->ctx), dp, &tn_off, 1, "is.tnp");
     list = LLVMBuildLoad2(g->builder, i8ptr, tn_p, "is.list");
+    LLVMSetMetadata(list, inv_kind, inv_md);
   }
   LLVMValueRef lnull =
       zan_icmp(g->builder, LLVMIntEQ, list, LLVMConstNull(i8ptr), "is.ln");
-  LLVMBuildCondBr(g->builder, lnull, false_bb, body);
 
-  LLVMPositionBuilderAtEnd(g->builder, body);
-  LLVMValueRef name_p =
-      LLVMBuildGEP2(g->builder, i8ptr, list, &idx, 1, "is.np");
-  LLVMValueRef name = LLVMBuildLoad2(g->builder, i8ptr, name_p, "is.name");
-  LLVMValueRef nnull =
-      zan_icmp(g->builder, LLVMIntEQ, name, LLVMConstNull(i8ptr), "is.nn");
-  LLVMBuildCondBr(g->builder, nnull, false_bb, next);
+  if (exact_only) {
+    /* 结构体无继承体系：仅首项 tynames[0] 可能匹配，O(1) 单次指针比对，零循环 */
+    LLVMBasicBlockRef exact_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "is.exact");
+    LLVMBuildCondBr(g->builder, lnull, false_bb, exact_bb);
+    LLVMPositionBuilderAtEnd(g->builder, exact_bb);
+    LLVMValueRef name0 = LLVMBuildLoad2(
+        g->builder, i8ptr,
+        LLVMBuildBitCast(g->builder, list, LLVMPointerType(i8ptr, 0), "is.n0p"),
+        "is.name0");
+    LLVMSetMetadata(name0, inv_kind, inv_md);
+    LLVMValueRef eq0 = zan_icmp(g->builder, LLVMIntEQ, name0, tstr, "is.eq0");
+    LLVMBuildCondBr(g->builder, eq0, true_bb, false_bb);
+  } else {
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.l");
+    LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.n");
+    LLVMBuildCondBr(g->builder, lnull, false_bb, loop);
 
-  LLVMPositionBuilderAtEnd(g->builder, next);
-  LLVMTypeRef strcmp_ty =
-      LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0);
-  LLVMValueRef strcmp_fn = get_libc_fn(g, "strcmp", strcmp_ty);
-  LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
-                               (LLVMValueRef[]){name, tstr}, 2, "is.cmp");
-  LLVMValueRef eq =
-      zan_icmp(g->builder, LLVMIntEQ, cmp, LLVMConstInt(i32, 0, 0), "is.eq");
-  LLVMValueRef idx2 =
-      zan_add(g->builder, idx, LLVMConstInt(i64, 1, 0), "is.i2");
-  LLVMBuildCondBr(g->builder, eq, true_bb, loop);
-  LLVMAddIncoming(idx, (LLVMValueRef[]){LLVMConstInt(i64, 0, 0), idx2},
-                  (LLVMBasicBlockRef[]){oob_bb, next}, 2);
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef idx = LLVMBuildPhi(g->builder, i64, "is.i");
+    LLVMValueRef name_p =
+        LLVMBuildInBoundsGEP2(g->builder, i8ptr, list, &idx, 1, "is.np");
+    LLVMValueRef name = LLVMBuildLoad2(g->builder, i8ptr, name_p, "is.name");
+    LLVMSetMetadata(name, inv_kind, inv_md);
+    LLVMValueRef nnull =
+        zan_icmp(g->builder, LLVMIntEQ, name, LLVMConstNull(i8ptr), "is.nn");
+    LLVMBuildCondBr(g->builder, nnull, false_bb, next);
+
+    LLVMPositionBuilderAtEnd(g->builder, next);
+    /* tynames[] 与 tstr 均经 zan_irgen_intern_string 唯一驻留：单条指针比较 */
+    LLVMValueRef eq = zan_icmp(g->builder, LLVMIntEQ, name, tstr, "is.eq");
+    LLVMValueRef idx2 =
+        zan_add(g->builder, idx, LLVMConstInt(i64, 1, 0), "is.i2");
+    LLVMBuildCondBr(g->builder, eq, true_bb, loop);
+    LLVMAddIncoming(idx, (LLVMValueRef[]){LLVMConstInt(i64, 0, 0), idx2},
+                    (LLVMBasicBlockRef[]){list_bb, next}, 2);
+  }
 
   LLVMPositionBuilderAtEnd(g->builder, true_bb);
   LLVMBuildBr(g->builder, merge);

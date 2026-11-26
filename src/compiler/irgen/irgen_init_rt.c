@@ -104,6 +104,12 @@ LLVMTypeRef retain_args[] = {i8ptr};
 LLVMTypeRef retain_type =
     LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
 g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
+{
+  unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+  if (nw)
+    LLVMAddAttributeAtIndex(g->rt_retain, LLVMAttributeFunctionIndex,
+                            LLVMCreateEnumAttribute(g->ctx, nw, 0));
+}
 
 {
   LLVMBasicBlockRef bb =
@@ -947,6 +953,12 @@ for (int rel = 0; rel < 2; rel++) {
     g->rt_str_release =
         LLVMAddFunction(g->mod, "zan_rt_str_release", release_type);
   }
+  {
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    if (nw)
+      LLVMAddAttributeAtIndex(g->rt_str_release, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nw, 0));
+  }
   LLVMBasicBlockRef bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "entry");
   LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -957,7 +969,8 @@ for (int rel = 0; rel < 2; rel++) {
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "ret");
   LLVMBasicBlockRef cont_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "cont");
-  LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
+  zan_set_branch_weights(g, LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb),
+                         1, 2000);
   LLVMPositionBuilderAtEnd(g->builder, cont_bb);
   LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
   LLVMValueRef magic_ptr = LLVMBuildGEP2(
@@ -971,7 +984,8 @@ for (int rel = 0; rel < 2; rel++) {
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "release");
   LLVMBasicBlockRef arr_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "arrfwd");
-  LLVMBuildCondBr(g->builder, has_magic, rel_bb, arr_bb);
+  zan_set_branch_weights(g, LLVMBuildCondBr(g->builder, has_magic, rel_bb, arr_bb),
+                         2000, 1);
   LLVMPositionBuilderAtEnd(g->builder, arr_bb);
   zan_call2(g->builder, release_type, g->rt_arr_release, &obj, 1, "");
   LLVMBuildBr(g->builder, ret_bb);
@@ -989,11 +1003,25 @@ for (int rel = 0; rel < 2; rel++) {
                LLVMConstInt(i64t, ZAN_STRING_SENTINEL_RC, 0), "issent");
   LLVMBasicBlockRef dec_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dec");
+  LLVMBasicBlockRef free_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
   LLVMBuildCondBr(g->builder, is_sent, ret_bb, dec_bb);
   LLVMPositionBuilderAtEnd(g->builder, dec_bb);
   emit_arc_freed_use_check(g, g->rt_str_release, rc, obj, ZAN_ARC_FAULT_USE_STR,
                            "release through a stale reference "
                            "(string was already freed)");
+  if (!g->arc_guard) {
+    /* 字符串不进弱引用表：读到 rc == 1 说明本线程独占唯一引用，
+     * 跳至 free_bb 走 acquire fence 直接释放，免一次硬件 LOCK XADD。 */
+    LLVMBasicBlockRef atomic_dec_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dec.atomic");
+    LLVMValueRef is_uniq =
+        zan_icmp(g->builder, LLVMIntEQ, rc, LLVMConstInt(i64t, 1, 0), "isuniq");
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, is_uniq, free_bb, atomic_dec_bb),
+        2000, 1);
+    LLVMPositionBuilderAtEnd(g->builder, atomic_dec_bb);
+  }
   LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub,
                                            rc_iptr, LLVMConstInt(i64t, 1, 0),
                                            LLVMAtomicOrderingRelease, 0);
@@ -1004,8 +1032,6 @@ for (int rel = 0; rel < 2; rel++) {
       zan_sub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
   LLVMValueRef is_zero =
       zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero");
-  LLVMBasicBlockRef free_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
   LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
   LLVMPositionBuilderAtEnd(g->builder, free_bb);
   LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquire, 0, "");
@@ -1023,7 +1049,7 @@ for (int rel = 0; rel < 2; rel++) {
     emit_arc_quarantine(g, obj, rc_iptr);
   else
     zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
-  {
+  if (g->check_leaks) {
     emit_leak_counter_add(g, g->g_live, -1);
   }
   LLVMBuildBr(g->builder, ret_bb);

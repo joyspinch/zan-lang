@@ -94,14 +94,13 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
       LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
       LLVMValueRef span_len =
           LLVMBuildExtractValue(g->builder, span_val, 1, "spx.len");
-      emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
       if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
           LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx),
                             "spx.ix");
       idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
       LLVMValueRef ep =
-          LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
+          LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
       LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
       LLVMSetAlignment(ld, 1);
       return promote_loaded(g, ld, et);
@@ -345,7 +344,8 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMAppendBasicBlockInContext(g->ctx, fn, "arridx.load");
     LLVMBasicBlockRef done_bb =
         LLVMAppendBasicBlockInContext(g->ctx, fn, "arridx.done");
-    LLVMBuildCondBr(g->builder, invalid, done_bb, load_bb);
+    zan_set_branch_weights(
+        g, LLVMBuildCondBr(g->builder, invalid, done_bb, load_bb), 1, 2000);
     LLVMPositionBuilderAtEnd(g->builder, load_bb);
     if (!elem_ptr) {
       LLVMValueRef typed_arr = LLVMBuildBitCast(

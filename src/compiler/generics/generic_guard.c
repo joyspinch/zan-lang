@@ -661,15 +661,13 @@ LLVMValueRef emit_index_range_check(zan_irgen_t *g, LLVMValueRef index,
                                     zan_loc_t loc, const char *kind) {
   if (!g->runtime_checks || !g->current_fn)
     return NULL;
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   index = emit_index_i64(g, index, "idx.i64");
   length = emit_index_i64(g, length, "len.i64");
-  LLVMValueRef negative = zan_icmp(g->builder, LLVMIntSLT, index,
-                                   LLVMConstInt(i64, 0, 0), "idx.neg");
-  LLVMIntPredicate upper_pred = allow_end ? LLVMIntSGT : LLVMIntSGE;
-  LLVMValueRef outside =
-      zan_icmp(g->builder, upper_pred, index, length, "idx.high");
-  LLVMValueRef bad = LLVMBuildOr(g->builder, negative, outside, "idx.bad");
+  /* 容器长度恒满足 0 <= length <= INT64_MAX：
+   * (uint64_t)index >= (uint64_t)length 等价于 index < 0 || index >= length，
+   * 单条无符号比较匹配 LLVM SCEV/IndVarSimplify 边界检查外提模式。 */
+  LLVMIntPredicate pred = allow_end ? LLVMIntUGT : LLVMIntUGE;
+  LLVMValueRef bad = zan_icmp(g->builder, pred, index, length, "idx.bad");
   char msg[96];
   snprintf(msg, sizeof(msg), "%s index out of bounds", kind ? kind : "array");
   emit_runtime_check(g, bad, loc, msg);
@@ -692,14 +690,9 @@ LLVMValueRef emit_index_oob_pred(zan_irgen_t *g, LLVMValueRef index,
   if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind ||
       LLVMGetTypeKind(LLVMTypeOf(length)) != LLVMIntegerTypeKind)
     return LLVMConstInt(i1, 0, 0);
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   index = emit_index_i64(g, index, "oob.idx");
   length = emit_index_i64(g, length, "oob.len");
-  LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, index,
-                              LLVMConstInt(i64, 0, 0), "oob.neg");
-  LLVMValueRef high =
-      zan_icmp(g->builder, LLVMIntSGE, index, length, "oob.high");
-  return LLVMBuildOr(g->builder, neg, high, "oob.bad");
+  return zan_icmp(g->builder, LLVMIntUGE, index, length, "oob.bad");
 }
 
 /* 越界写位点协议：split 在诊断之后切控制流（oob → end，否则 → do 块），
@@ -716,7 +709,8 @@ void emit_oob_store_split(zan_irgen_t *g, LLVMValueRef oob,
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
   *do_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sto.do");
   *end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sto.end");
-  LLVMBuildCondBr(g->builder, oob, *end_bb, *do_bb);
+  zan_set_branch_weights(g, LLVMBuildCondBr(g->builder, oob, *end_bb, *do_bb),
+                         1, 2000);
   LLVMPositionBuilderAtEnd(g->builder, *do_bb);
 }
 void emit_oob_store_finish(zan_irgen_t *g, LLVMBasicBlockRef do_bb,
@@ -732,20 +726,11 @@ LLVMValueRef emit_index_safe_check(zan_irgen_t *g, LLVMValueRef index,
                                    zan_loc_t loc, const char *kind) {
   if (!g->runtime_checks || !g->current_fn)
     return index;
-  emit_index_range_check(g, index, length, allow_end, loc, kind);
-  if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind)
+  LLVMValueRef bad =
+      emit_index_range_check(g, index, length, allow_end, loc, kind);
+  if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind || !bad)
     return index;
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-  LLVMValueRef idx = emit_index_i64(g, index, "safeidx.i64");
-  LLVMValueRef len = emit_index_i64(g, length, "safeidx.len");
-  LLVMValueRef negative = zan_icmp(g->builder, LLVMIntSLT, idx,
-                                   LLVMConstInt(i64, 0, 0), "safeidx.neg");
-  LLVMIntPredicate upper_pred = allow_end ? LLVMIntSGT : LLVMIntSGE;
-  LLVMValueRef outside =
-      zan_icmp(g->builder, upper_pred, idx, len, "safeidx.high");
-  LLVMValueRef unsafe =
-      LLVMBuildOr(g->builder, negative, outside, "safeidx.bad");
-  return LLVMBuildSelect(g->builder, unsafe,
+  return LLVMBuildSelect(g->builder, bad,
                          LLVMConstInt(LLVMTypeOf(index), 0, 0), index,
                          "safeidx.ok");
 }

@@ -980,6 +980,9 @@ LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
                              LLVMValueRef count);
 LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total,
                                    LLVMValueRef count, zan_type_t *elem_type);
+LLVMValueRef zan_array_alloc_uninit_typed(zan_irgen_t *g, LLVMValueRef total,
+                                          LLVMValueRef count,
+                                          zan_type_t *elem_type);
 LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr);
 bool zan_convert_tostring_exact_decl(zan_irgen_t *g, zan_ast_node_t *arg,
                                      local_scope_t *locals);
@@ -1267,6 +1270,9 @@ void emit_task_discard_config(zan_irgen_t *g, LLVMValueRef frame,
                               zan_type_t *rt);
 LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc);
 LLVMValueRef get_str_eq_fn(zan_irgen_t *g, zan_loc_t loc);
+LLVMValueRef get_try_parse_i64_fn(zan_irgen_t *g);
+LLVMValueRef get_list_grow_fn(zan_irgen_t *g);
+LLVMValueRef get_list_reserve_fn(zan_irgen_t *g);
 zan_type_t *ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e);
 int irgen_expr_was_boxed(zan_irgen_t *g, zan_ast_node_t *e);
 void irgen_note_boxed_expr(zan_irgen_t *g, zan_ast_node_t *e);
