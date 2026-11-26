@@ -40,7 +40,7 @@ class LayerWindowControl : Control {
         this.Add(maximize);
         this.Add(close);
         footerRoot = model.windowFooter;
-        this.Add(footerRoot);
+        if (footerRoot != null) { this.Add(footerRoot); }
         wiresOwnEvents = true;
     }
     static Button WindowButton(string glyph, int command, LayerWindowAction owner) {
@@ -49,6 +49,7 @@ class LayerWindowControl : Control {
         return button;
     }
     bool SyncFooter(App app, LayerState model) {
+        if (app == null || app.window == null) { return false; }
         Control next = model.windowFooter;
         if (footerRoot == next && (next == null || next.parent == this)) { return true; }
         Control root = app.rootControl; int generation = app.inputRootGeneration;
@@ -69,8 +70,8 @@ class LayerWindowControl : Control {
         if (app != null && model.open && !this.SyncFooter(app, model)) { return; }
         string title = model.title;
         if (titleLabel.GetText() != title) { titleLabel.Text = title; }
-        if (model.okBtn.Label() != model.okText) { model.okBtn.SetText(model.okText); }
-        if (model.cancelBtn.Label() != model.cancelText) { model.cancelBtn.SetText(model.cancelText); }
+        if (model.okBtn != null && model.okBtn.Label() != model.okText) { model.okBtn.SetText(model.okText); }
+        if (model.cancelBtn != null && model.cancelBtn.Label() != model.cancelText) { model.cancelBtn.SetText(model.cancelText); }
         minimize.Icon = model.state == 2 ? "restore" : "minimize";
         maximize.Icon = model.state == 1 ? "restore" : "maximize";
         minimize.Tip = model.state == 2 ? "Restore" : "Minimize";
@@ -79,7 +80,7 @@ class LayerWindowControl : Control {
     }
     public override void OnMeasure(App app) {
         LayerState model = state;
-        if (model == null) { return; }
+        if (model == null || app == null || app.canvas == null) { return; }
         if (!model.open) { return; }
         if (model.sizeMinW > 0 && model.state == 0 && !model.dragging && !model.sizing) {
             model.ApplySizeToContent(app);
@@ -97,7 +98,7 @@ class LayerWindowControl : Control {
     public override void Arrange(int px, int py, int pw, int ph) {
         LayerState model = state;
         App app = this.FindApp();
-        if (model == null || app == null || !model.open || model.modal) { return; }
+        if (model == null || app == null || app.window == null || !model.open || model.modal) { return; }
         preparation = preparation + 1; int ticket = preparation;
         Control root = app.rootControl; int generation = app.inputRootGeneration;
         long sequence = app.window.EventSeq(); int session = model.inputGeneration;
@@ -118,14 +119,16 @@ class LayerWindowControl : Control {
         maximize.SetShown(model.open && model.state != 2);
         minimize.SetShown(model.open);
         if (model.state == 2) { minimize.Arrange(x - buttonWidth, by, buttonWidth, bar); }
-        model.windowFooter.SetShown(model.open && model.footer && model.state != 2);
-        if (model.state != 2) {
-            int footerHeight = model.footer ? Layer.FooterH(app) : 0;
-            model.windowFooter.MeasureTree(app, bw - app.Scale(32));
-            if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
-            model.windowFooter.Arrange(bx + app.Scale(16), by + bh - footerHeight,
-            bw - app.Scale(32), app.theme.heightMedium);
-            if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+        if (model.windowFooter != null) {
+            model.windowFooter.SetShown(model.open && model.footer && model.state != 2);
+            if (model.state != 2) {
+                int footerHeight = model.footer ? Layer.FooterH(app) : 0;
+                model.windowFooter.MeasureTree(app, bw - app.Scale(32));
+                if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+                model.windowFooter.Arrange(bx + app.Scale(16), by + bh - footerHeight,
+                bw - app.Scale(32), app.theme.heightMedium);
+                if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+            }
         }
         if (model.state != 2) {
             int bodyY = by + bar + app.Scale(16);
@@ -185,7 +188,7 @@ class LayerWindowControl : Control {
         base.OnPointerDown(e);
         LayerState model = state;
         App app = this.FindApp();
-        if (e.handled || model == null || app == null || !model.open
+        if (e.handled || model == null || app == null || app.window == null || !model.open
         || app.GetCapturedPointer() != null || e.originalSource != this
         || app.window.EventButton() != 0) { return; }
         direction = this.ResizeAt(e.x, e.y);
@@ -215,10 +218,12 @@ class LayerWindowControl : Control {
             model.x = e.x - model.grabDx; model.y = e.y - model.grabDy;
             if (model.x < 0) { model.x = 0; }
             if (model.y < app.titlebarH) { model.y = app.titlebarH; }
-            int maxX = app.canvas.Width() - bw; if (maxX < 0) { maxX = 0; }
-            if (model.x > maxX) { model.x = maxX; }
-            int maxY = app.canvas.Height() - bh; if (maxY < app.titlebarH) { maxY = app.titlebarH; }
-            if (model.y > maxY) { model.y = maxY; }
+            if (app.canvas != null) {
+                int maxX = app.canvas.Width() - bw; if (maxX < 0) { maxX = 0; }
+                if (model.x > maxX) { model.x = maxX; }
+                int maxY = app.canvas.Height() - bh; if (maxY < app.titlebarH) { maxY = app.titlebarH; }
+                if (model.y > maxY) { model.y = maxY; }
+            }
         } else { Layer.ApplyResize(app, model, e.x, e.y); }
         this.MeasureTree(app); this.Arrange(0, 0, 0, 0);
         app.RequestRedraw(); e.Handle();
@@ -234,7 +239,7 @@ class LayerWindowControl : Control {
     public override void OnPointerUp(RoutedEventArgs e) {
         base.OnPointerUp(e);
         App app = this.FindApp();
-        if ((moving || sizing) && app != null && app.window.EventButton() == 0) {
+        if ((moving || sizing) && app != null && app.window != null && app.window.EventButton() == 0) {
             this.OnPointerMove(e);
             this.EndGesture(e);
         }
@@ -343,15 +348,16 @@ class LayerWindowHost : Control, AppLoopParticipant, AppPreparationParticipant {
     int deadline = -1;
     public LayerWindowHost(App app) : base("layer-windows") {
         hostApp = app; this.UseApp(app); wiresOwnEvents = true;
-        registration = app.RegisterLoopParticipant(app, this);
+        if (app != null) { registration = app.RegisterLoopParticipant(app, this); }
     }
     public override void OnMeasure(App app) {
+        if (app == null || app.canvas == null) { return; }
         prefW = app.canvas.Width(); prefH = app.canvas.Height();
         for (int i = 0; i < windows.Count; i = i + 1) { windows[i].MeasureTree(app); }
     }
     public override void Arrange(int px, int py, int pw, int ph) {
         App app = hostApp;
-        if (app != null) { pw = app.canvas.Width(); ph = app.canvas.Height(); }
+        if (app != null && app.canvas != null) { pw = app.canvas.Width(); ph = app.canvas.Height(); }
         bx = 0; by = 0; bw = pw; bh = ph;
         int minimized = 0;
         for (int i = 0; i < models.Count; i = i + 1) {
@@ -381,7 +387,14 @@ class LayerWindowHost : Control, AppLoopParticipant, AppPreparationParticipant {
     }
     protected override int LayoutRevision() { return preparation; }
     public void Sync(App app, List<LayerState> list) {
-        models.Clear(); models.AddRange(list);
+        models.Clear();
+        if (list != null) { models.AddRange(list); }
+        for (int j = windows.Count - 1; j >= 0; j = j - 1) {
+            LayerState st = windows[j].state;
+            if (st == null || st.modal || (!st.open && !st.closing) || !models.Contains(st)) {
+                windows.RemoveAt(j);
+            }
+        }
         for (int i = 0; i < models.Count; i = i + 1) {
             LayerState model = models[i];
             if (model.modal || (!model.open && !model.closing)) { continue; }
@@ -398,6 +411,7 @@ class LayerWindowHost : Control, AppLoopParticipant, AppPreparationParticipant {
         this.Prepare(app);
     }
     bool Prepare(App app) {
+        if (app == null || app.window == null || app.canvas == null) { return false; }
         preparation = preparation + 1; int ticket = preparation;
         Control root = app.rootControl; int generation = app.inputRootGeneration;
         long sequence = app.window.EventSeq();

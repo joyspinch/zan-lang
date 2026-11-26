@@ -119,7 +119,7 @@ public partial class FilePicker : IModalWindow {
         this.FilterChanged = new UiEvent();
     }
     public void SetFilters(List<FileFilter> items) {
-        filters = items;
+        filters = items != null ? items : new List<FileFilter>();
         filtersCustom = true;
         filterSel.Set(0);
     }
@@ -135,7 +135,8 @@ public partial class FilePicker : IModalWindow {
     public static string Normalize(string path) {
         if (path == null) { return ""; }
         string resultText = path.Replace("\\", "/");
-        while (resultText.Length > 3
+        while (resultText.Length > 1
+               && !(resultText.Length == 3 && (resultText[1] & 255) == 58)
                && (resultText[resultText.Length - 1] & 255) == 47) {
             resultText = resultText.Substring(0, resultText.Length - 1);
         }
@@ -157,6 +158,7 @@ public partial class FilePicker : IModalWindow {
         return dir + "/" + name;
     }
     public static string ParentDirectory(string dir) {
+        if (dir == null || dir == "") { return ""; }
         string parent = FilePicker.Normalize(Path.GetDirectoryName(dir));
         if (parent.Length == 2
             && (parent[1] & 255) == 58) {
@@ -181,10 +183,13 @@ public partial class FilePicker : IModalWindow {
         return dir;
     }
     public static bool ValidFolderName(string name) {
-        if (name == null || name == "" || name == "." || name == "..") { return false; }
+        if (name == null) { return false; }
+        string trimmed = name.Trim();
+        if (trimmed == "" || trimmed == "." || trimmed == "..") { return false; }
         for (int i = 0; i < name.Length; i = i + 1) {
             int c = name[i] & 255;
-            if (c == 47 || c == 92) { return false; }
+            if (c < 32 || c == 47 || c == 92 || c == 58 || c == 42
+                || c == 63 || c == 34 || c == 60 || c == 62 || c == 124) { return false; }
         }
         return true;
     }
@@ -283,10 +288,16 @@ public partial class FilePicker : IModalWindow {
         bool current = this.RetireInputHost(session);
         if (previous != null) {
             previous.StopLoop();
-            previous.window.Close();
-            previous.window.Destroy();
+            if (previous.window != null) {
+                previous.window.Close();
+                previous.window.Destroy();
+            }
         }
         if (!current || inputSession != session) { return; }
+        if (initial == null) { initial = ""; }
+        if (extension == null) { extension = ""; }
+        if (defaultName == null) { defaultName = ""; }
+        if (dialogTitle == null) { dialogTitle = ""; }
         mode = pickerMode;
         title = dialogTitle;
         suffix = extension;
@@ -370,8 +381,12 @@ public partial class FilePicker : IModalWindow {
         this.InstallInputHost(popup != null ? popup : host);
         this.MarkDirty();
     }
-    public void BeginFolder(string initial, string dialogTitle) { Begin(0, initial, "", "", dialogTitle); }
+    public void BeginFolder(string initial, string dialogTitle) {
+        allowMulti = false;
+        Begin(0, initial, "", "", dialogTitle);
+    }
     public void BeginOpenFile(string initial, string extension, string dialogTitle) {
+        allowMulti = false;
         Begin(1, initial, extension, "", dialogTitle);
     }
     public void BeginOpenFileFilters(
@@ -379,9 +394,17 @@ public partial class FilePicker : IModalWindow {
         List<FileFilter> items,
         string dialogTitle
     ) {
+        allowMulti = false;
+        this.BeginOpenFileFiltersCore(initial, items, dialogTitle);
+    }
+    private void BeginOpenFileFiltersCore(
+        string initial,
+        List<FileFilter> items,
+        string dialogTitle
+    ) {
         SetFilters(items);
         string first = "";
-        if (items.Count > 0) {
+        if (items != null && items.Count > 0) {
             first = FilePicker.FilterTokenToSuffix(
                 FilePicker.FirstExt(items[0].pattern));
         }
@@ -402,7 +425,7 @@ public partial class FilePicker : IModalWindow {
         string dialogTitle
     ) {
         allowMulti = true;
-        BeginOpenFileFilters(initial, items, dialogTitle);
+        this.BeginOpenFileFiltersCore(initial, items, dialogTitle);
     }
     public static string FirstExt(string pattern) {
         if (pattern == null || pattern == "") { return ""; }
@@ -416,6 +439,7 @@ public partial class FilePicker : IModalWindow {
         return text.ToLower().IndexOf(needle.ToLower()) >= 0;
     }
     public static string FilterTokenToSuffix(string ext) {
+        if (ext == null) { return ""; }
         string t = ext.Trim();
         while (t.StartsWith("*")) { t = t.Substring(1, t.Length - 1); }
         if (t == "" || t == ".") { return ""; }
@@ -449,6 +473,7 @@ public partial class FilePicker : IModalWindow {
         string defaultName,
         string dialogTitle
     ) {
+        allowMulti = false;
         Begin(2, initial, extension, defaultName, dialogTitle);
     }
     public void ApplySkin(int index) {
@@ -483,13 +508,13 @@ public partial class FilePicker : IModalWindow {
         int session = inputSession + 1; inputSession = session;
         App previous = popup;
         if (!this.RetireInputHost(session)) { return; }
-        if (previous != null && popup == previous) { previous.window.Close(); }
+        if (previous != null && popup == previous && previous.window != null) { previous.window.Close(); }
         if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
         if (inputSession != session) { return; }
         Closed.Raise();
     }
     public bool InMultiSelection(int idx, List<FilePickerItem> items) {
-        if (idx < 0 || idx >= items.Count) { return false; }
+        if (items == null || idx < 0 || idx >= items.Count) { return false; }
         return selectedPaths.Contains(items[idx].path);
     }
     public void RemoveSelectedPath(string path) {
@@ -506,13 +531,14 @@ public partial class FilePicker : IModalWindow {
     public bool ApplyEvent(nint evHwnd) {
         if (!OwnsWindow(evHwnd)) { return true; }
         App app = popup;
+        if (app == null) { return true; }
         int kind = app.EventKind();
         if (kind == 8) {
             if (open && !closing) { this.Close(); }
             if (popup != app) { return false; }
             popup = null;
             app.StopLoop();
-            app.window.Destroy();
+            if (app.window != null) { app.window.Destroy(); }
             closing = false;
             return false;
         }
@@ -524,7 +550,7 @@ public partial class FilePicker : IModalWindow {
         if (popup != null && !open) {
             App previous = popup; popup = null;
             previous.StopLoop();
-            previous.window.Destroy();
+            if (previous.window != null) { previous.window.Destroy(); }
         }
     }
     public int TakeResult() {
@@ -599,15 +625,21 @@ public partial class FilePicker : IModalWindow {
                 } else {
                     statusText = FilePicker.T(
                         "No such file or folder.", "没有此文件或文件夹。");
-                    if (popup != null) { popup.RequestRedraw(); }
+                    this.MarkDirty();
                 }
             } else {
                 statusText = FilePicker.T(
                     "Select a file first.", "请先选择文件。");
-                if (popup != null) { popup.RequestRedraw(); }
+                this.MarkDirty();
             }
-        } else if (mode == 2 && valid && nameInput.GetText() != "") {
-            string name = nameInput.GetText();
+        } else if (mode == 2 && valid) {
+            string name = nameInput.GetText().Trim();
+            if (!FilePicker.ValidFolderName(name)) {
+                statusText = FilePicker.T(
+                    "Enter a valid file name.", "请输入有效的文件名。");
+                this.MarkDirty();
+                return;
+            }
             string wantSuffix = "";
             if (filters.Count > 0 && filterSel.Get() >= 0 && filterSel.Get() < filters.Count) {
                 wantSuffix = FilePicker.FilterTokenToSuffix(FilePicker.FirstExt(filters[filterSel.Get()].pattern));

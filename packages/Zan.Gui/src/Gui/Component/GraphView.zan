@@ -83,7 +83,7 @@ public class GraphView : Control {
     public override void OnPointerDown(RoutedEventArgs e) {
         base.OnPointerDown(e);
         App app = this.App;
-        if (e.handled || e.originalSource != this || app == null
+        if (e.handled || e.originalSource != this || app == null || app.window == null
             || app.window.EventButton() != 0) { return; }
         this.BeginPan();
         if (dragging) { e.Handle(); }
@@ -102,7 +102,7 @@ public class GraphView : Control {
     public override void OnPointerUp(RoutedEventArgs e) {
         base.OnPointerUp(e);
         App app = this.App;
-        if (app == null || app.window.EventButton() != 0 || !dragging) { return; }
+        if (app == null || app.window == null || app.window.EventButton() != 0 || !dragging) { return; }
         this.MovePan(e); // The final Up coordinate is authoritative.
         this.EndPan();
     }
@@ -120,7 +120,25 @@ public class GraphView : Control {
 
     // 缩放倍率的文本形式（属性协议只承载 string/int/bool）。
     public string ZoomText() { return Convert.ToString(zoom); }
-    public void SetZoomText(string v) { zoom = Convert.ToDouble(v); }
+    public void SetZoomText(string v) {
+        if (v == null) { return; }
+        string s = v.Trim();
+        if (s == "") { return; }
+        bool hasDigit = false;
+        bool hasDot = false;
+        int i = 0;
+        if ((s[0] & 255) == 43 || (s[0] & 255) == 45) { i = 1; }
+        while (i < s.Length) {
+            int b = s[i] & 255;
+            if (b >= 48 && b <= 57) { hasDigit = true; }
+            else if (b == 46 && !hasDot) { hasDot = true; }
+            else { return; }
+            i = i + 1;
+        }
+        if (!hasDigit) { return; }
+        double parsed = Convert.ToDouble(s);
+        if (parsed > 0.05 && parsed <= 10.0) { zoom = parsed; }
+    }
 
     // 覆写：返回设计器属性清单（empty, panX, panY, zoom）。
     protected override List<PropSpec> DefineProps() {
@@ -141,7 +159,7 @@ public class GraphView : Control {
         if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
     }
     public void Refresh() { graphVersion = graphVersion + 1; cardsStale = true; }
-    public void EmptyText(string text) { Empty = text; }
+    public void EmptyText(string text) { Empty = text != null ? text : ""; }
     public void OnSelect(Action a) { Select.Add(a); }
     public void OnActivate(Action a) { Activate.Add(a); }
     public void OnBlocked(Action a) { Blocked.Add(a); }
@@ -158,7 +176,7 @@ public class GraphView : Control {
     public int ContextY() { return ctxY; }
     public int IndexOfId(string id) { return GraphView.IndexOf(data, id); }
     public void SelectId(string id) {
-        if (id == "") { this.Deselect(); return; }
+        if (id == null || id == "") { this.Deselect(); return; }
         int i = this.IndexOfId(id);
         if (i < 0 || sel.Get() == i) { return; }
         sel.Set(i);
@@ -166,7 +184,7 @@ public class GraphView : Control {
     }
     public void Deselect() { sel.Set(0 - 1); }
     public static int IndexOf(List<GraphNode> ns, string id) {
-        if (id == "") { return 0 - 1; }
+        if (ns == null || id == null || id == "") { return 0 - 1; }
         for (int i = 0; i < ns.Count; i = i + 1) {
             if (ns[i].id == id) { return i; }
         }
@@ -221,7 +239,10 @@ public class GraphView : Control {
                 mark = GraphView.LockMark();
                 card = GraphView.DefaultCard(data[i], mark);
             }
-            if (card == null) { continue; }
+            if (card == null) {
+                slots.Add(new GraphCardSlot(null, null));
+                continue;
+            }
             GraphCardAction action = new GraphCardAction(this, nodeIndex);
             card.Click.Add(action.Click);
             card.BindEvent("DoubleClick", action.DoubleClick);
@@ -232,11 +253,11 @@ public class GraphView : Control {
         cardsStale = false;
         builtFor = data.Count;
         for (int k = 0; k < slots.Count; k = k + 1) {
-            slots[k].card.MeasureTree(app);
+            if (slots[k].card != null) { slots[k].card.MeasureTree(app); }
         }
     }
     public void DispatchCardEvent(int row, string eventName) {
-        if (!this.Has(row)) { return; }
+        if (this.IsDisabled() || !this.Has(row)) { return; }
         App app = this.App;
         if (eventName == "Click") { this.OnNodeClick(row, app); }
         else if (eventName == "DoubleClick") { this.OnNodeDoubleClick(row, app); }
@@ -335,9 +356,10 @@ public class GraphView : Control {
         app = this.ResolveApp(app);
         int w = app != null ? app.Scale(140) : 140;
         for (int i = 0; i < slots.Count; i = i + 1) {
-            if (slots[i].card.prefW > w) { w = slots[i].card.prefW; }
+            if (slots[i].card != null && slots[i].card.prefW > w) { w = slots[i].card.prefW; }
         }
         if (w > areaW && areaW > 0) { w = areaW; }
+        if (w < 1) { w = 1; }
         return w;
     }
     public int CardHeight() { return this.CardHeight(this.App); }
@@ -345,17 +367,21 @@ public class GraphView : Control {
         app = this.ResolveApp(app);
         int h = app != null ? app.Scale(48) : 48;
         for (int i = 0; i < slots.Count; i = i + 1) {
-            if (slots[i].card.prefH > h) { h = slots[i].card.prefH; }
+            if (slots[i].card != null && slots[i].card.prefH > h) { h = slots[i].card.prefH; }
         }
+        if (h < 1) { h = 1; }
         return h;
     }
     public int Layout(int areaX, int areaY, int areaW) { return this.Layout(this.App, areaX, areaY, areaW); }
     private int Layout(App app, int areaX, int areaY, int areaW) {
         this.ComputeDepth();
         int gap = this.Gap(app);
+        if (gap < 0) { gap = 0; }
         int cw = this.CardWidth(app, areaW);
         int ch = this.CardHeight(app);
-        int perRow = (areaW + gap) / (cw + gap);
+        int stepW = cw + gap;
+        if (stepW < 1) { stepW = 1; }
+        int perRow = (areaW + gap) / stepW;
         if (perRow < 1) { perRow = 1; }
         int maxDepth = 0;
         for (int i = 0; i < data.Count; i = i + 1) {
@@ -552,9 +578,10 @@ public class GraphView : Control {
         return locked ? "graphnode graphnodelocked" : "graphnode";
     }
     private void NoteSelfDamage(App app) {
+        if (app == null) { return; }
         if (!arrangingGraph) { this.Arrange(bx, by, bw, bh); }
         app.Damage.NoteDamage(bx, by, bw, bh);
-        app.window.Wake();
+        if (app.window != null) { app.window.Wake(); }
     }
     private void PaintEmpty(App app) {
         if (Empty == "") { return; }

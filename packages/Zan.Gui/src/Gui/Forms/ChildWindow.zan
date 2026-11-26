@@ -71,10 +71,17 @@ public partial class ChildWindow : ChildWindowBase {
     // 标题由基类重取 Title() 处理，子类无需关心。
     override void OnLanguageChanged(string lang) { }
     private void OpenHostView(App parent, bool explicitHandlers) {
+        if (open) { this.Close(); }
+        else if (host != null) { this.Teardown(); }
+        destroyed = false;
         this.parentApp = parent;
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        if (host == null) {
+            open = false;
+            return;
+        }
         host.SetRootControl(root);
         host.SetChildMode(true);
         if (parent != null) {
@@ -108,9 +115,16 @@ public partial class ChildWindow : ChildWindowBase {
         if (root != null) { this.Render(); }
     }
     private void OpenStandaloneView(bool explicitHandlers) {
+        if (open) { this.Close(); }
+        else if (host != null) { this.Teardown(); }
+        destroyed = false;
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        if (host == null) {
+            open = false;
+            return;
+        }
         host.SetRootControl(root);
         host.SetChildMode(true);
         host.ApplySkinName(this.StandaloneSkin());
@@ -126,7 +140,7 @@ public partial class ChildWindow : ChildWindowBase {
     void PumpStandaloneUntilKeepOpen(ChildWindowStop stop) { this.PumpStandaloneUntilMode(stop, false); }
     void PumpStandaloneUntilMode(ChildWindowStop stop, bool closeWhenDone) {
         while (this.IsOpen() && (stop == null || !stop())) {
-            if (!host.PumpSafe()) {
+            if (host == null || !host.PumpSafe()) {
                 this.Close();
                 break;
             }
@@ -166,7 +180,7 @@ public partial class ChildWindow : ChildWindowBase {
         if (renderCb != null) { return true; }
         AppLoopRegistration ticket = hostLayoutRegistration;
         Control tree = root;
-        if (app != host || !open || destroyed || ticket == null || !app.LiveLoopRegistration(ticket)) { return false; }
+        if (app == null || app != host || app.window == null || !open || destroyed || ticket == null || !app.LiveLoopRegistration(ticket)) { return false; }
         AppPreparationProof proof = new AppPreparationProof(ticket);
         int revision = app.hostLayoutRevision;
         int phase = app.inputPreparationTicket;
@@ -196,12 +210,13 @@ public partial class ChildWindow : ChildWindowBase {
             if (renderCb != null) {
                 renderCb();
             } else {
+                if (frameHost == null) { return; }
                 frameHost.BeginFrame();
                 if (!frameHost.PrepareStandardHostFrame()) { return; }
                 AppLoopRegistration ticket = hostLayoutRegistration;
                 Control tree = root;
                 if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
-                if (frameHost.shapeMode != 0) {
+                if (frameHost.shapeMode != 0 && frameHost.canvas != null) {
                     frameHost.RenderBackground(0, 0, frameHost.canvas.Width(),
                     frameHost.canvas.Height(), 0);
                     if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
@@ -228,7 +243,7 @@ public partial class ChildWindow : ChildWindowBase {
     }
     // 窗口开着且有帧要出（宿主标脏、Pending() 或动画时钟到期）时为 true。
     override bool NeedsRedraw() {
-        if (!open) { return false; }
+        if (!open || host == null) { return false; }
         if (host.needsRedraw || this.Pending()) { return true; }
         int now = Window.GetTickMs();
         if (host.animNextMs >= 0 && now >= host.animNextMs) { return true; }
@@ -242,11 +257,11 @@ public partial class ChildWindow : ChildWindowBase {
 
     // 该 OS 窗口句柄是否归本窗口所有。
     override bool OwnsWindow(nint hwnd) {
-        return open && hwnd == host.WindowHandle();
+        return open && host != null && hwnd == host.WindowHandle();
     }
 
     override void ApplyEvent(nint hwnd) {
-        if (!this.OwnsWindow(hwnd)) { return; }
+        if (!this.OwnsWindow(hwnd) || host == null) { return; }
         if (host.EventKind() == 8) {
             this.Close();
             return;
@@ -257,80 +272,88 @@ public partial class ChildWindow : ChildWindowBase {
     void Close() {
         if (!open) { return; }
         open = false;
+        App parent = this.parentApp;
         this.OnCloseRequested();
-        host.window.Close();
+        if (host != null && host.window != null) { host.window.Close(); }
         this.Teardown();
-        if (this.parentApp != null) { this.parentApp.RequestRedraw(); }
+        if (parent != null) { parent.RequestRedraw(); }
     }
     override void Teardown() {
         if (destroyed) { return; }
         destroyed = true;
+        open = false;
         AppLoopRegistration oldLayout = hostLayoutRegistration;
         hostLayoutRegistration = null;
         if (oldLayout != null) { oldLayout.Invalidate(); }
         renderCb = null;
-        if (binder != null) { binder.Detach(); }
-        if (host != null) {
-            host.StopLoop();
-            host.SetRootControl(null);
+        AppModelHost oldBinder = binder;
+        binder = null;
+        if (oldBinder != null) { oldBinder.Detach(); }
+        App oldHost = host;
+        host = null;
+        this.parentApp = null;
+        if (oldHost != null) {
+            oldHost.StopLoop();
+            oldHost.SetRootControl(null);
         }
         root = null;
-        if (host != null) {
-            if (host.window != null) { host.window.Destroy(); }
-            if (host.canvas != null) { host.canvas.Destroy(); }
+        if (oldHost != null) {
+            if (oldHost.window != null) { oldHost.window.Destroy(); }
+            if (oldHost.canvas != null) { oldHost.canvas.Destroy(); }
         }
     }
     // 请求宿主重绘（窗口开着时）。
     override void RequestRedraw() {
-        if (open) {
+        if (open && host != null) {
             host.RequestRedraw();
-            if (this.parentApp != null) {
-                this.parentApp.RequestRedraw();
-                this.parentApp.Wake();
+            App parent = this.parentApp;
+            if (parent != null) {
+                parent.RequestRedraw();
+                parent.Wake();
             }
         }
     }
 
     // 转发给宿主换肤（窗口开着时）。
     void ApplySkin(int i) {
-        if (open) { host.ApplySkin(i); }
+        if (open && host != null) { host.ApplySkin(i); }
     }
     void SetWindowOpacity(int percent) {
-        if (open) { host.SetWindowOpacity(percent); }
+        if (open && host != null) { host.SetWindowOpacity(percent); }
     }
     void SetUserWallpaper(string path, int opacity) {
-        if (open) { host.SetUserWallpaper(path, opacity); }
+        if (open && host != null) { host.SetUserWallpaper(path, opacity); }
     }
-    nint WindowHandle() { return host.WindowHandle(); }
+    nint WindowHandle() { return host != null ? host.WindowHandle() : 0; }
     // 主窗口换肤后同步本副窗口并重绘。
     override void FollowSkin(int i) {
-        if (!open) { return; }
+        if (!open || host == null) { return; }
         host.ApplySkin(i);
         host.RequestRedraw();
     }
 
     // 主窗口换了界面语言：已经开着的副窗口的标题提示也得跟上。
     override void FollowCaptionTips(App src) {
-        if (!open) { return; }
+        if (!open || host == null) { return; }
         host.FollowCaptionTips(src);
         host.RequestRedraw();
     }
 
     // 主窗口调不透明度后同步本副窗口。
     override void FollowOpacity(int percent) {
-        if (!open) { return; }
+        if (!open || host == null) { return; }
         host.SetWindowOpacity(percent);
     }
 
     // 主窗口换壁纸后同步本副窗口。
     override void FollowWallpaper(string path, int opacity) {
-        if (!open) { return; }
+        if (!open || host == null) { return; }
         host.SetUserWallpaper(path, opacity);
     }
 
     // 宿主的下一次动画截止时刻（毫秒时钟；窗口关闭返回 -1）。
     override int AnimNextMs() {
-        if (!open) { return 0 - 1; }
+        if (!open || host == null) { return 0 - 1; }
         int due = host.animNextMs;
         int participantDue = host.MinLoopDeadline();
         if (participantDue >= 0 && (due < 0 || participantDue < due)) { due = participantDue; }
@@ -341,12 +364,12 @@ public partial class ChildWindow : ChildWindowBase {
     }
 
     override void TickInputGestures() {
-        if (open) { host.TickRoutedLongPress(); }
+        if (open && host != null) { host.TickRoutedLongPress(); }
     }
 
     // 宿主的下一次特效截止时刻（毫秒时钟；窗口关闭返回 -1）。
     override int FxNextMs() {
-        if (!open) { return 0 - 1; }
+        if (!open || host == null) { return 0 - 1; }
         return host.fxNextMs;
     }
 }

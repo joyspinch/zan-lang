@@ -29,9 +29,9 @@ public class Image : Control {
     public void InitImage(string src, string alt, string fit) {
         this.InitControl("image");
         styleSurfaceOwned = true;
-        Src = src;
-        Alt = alt;
-        Fit = fit;
+        Src = src != null ? src : "";
+        Alt = alt != null ? alt : "";
+        Fit = fit != null ? fit : "";
         Loaded = new UiEvent();
         Error = new UiEvent();
         resolvedSrc = null;
@@ -92,7 +92,7 @@ public class Image : Control {
         imgW = w;
         imgH = h;
         loadState = 1;
-        Loaded.Post(this);
+        if (Loaded != null) { Loaded.Post(this); }
     }
     private void ResolveFile(string src) {
         imgKey = src;
@@ -177,7 +177,7 @@ public class Image : Control {
         int w = 0;
         if (svgBytes != null) {
             w = Canvas.ImageLoadSvg(key, svgBytes, svgBytesLen, boxW, boxH);
-        } else {
+        } else if (svgText != null && svgText != "") {
             w = Canvas.ImageLoadSvg(key, svgText, boxW, boxH);
         }
         if (w <= 0) { loadState = 2; return; }
@@ -196,16 +196,21 @@ public class Image : Control {
     }
     public void OnSvgFetched(string text) {
         if (loadState == 1) { return; }
+        if (text == null || text == "") {
+            loadState = 2;
+            if (Error != null) { Error.Post(this); }
+            return;
+        }
         isSvg = true;
         svgText = text;
         svgBaseKey = imgKey;
         this.RasterSvg(0, 0);
-        if (loadState == 1) { Loaded.Post(this); }
+        if (loadState == 1 && Loaded != null) { Loaded.Post(this); }
     }
     public void OnFetchFailed() {
         if (loadState == 1) { return; }
         loadState = 2;
-        Error.Post(this);
+        if (Error != null) { Error.Post(this); }
     }
     public void Reload() {
         if (imgKey != "" && (imgKey.StartsWith("mem:u") || svgRasterKey != "")) { Canvas.EvictImage(imgKey); }
@@ -213,6 +218,7 @@ public class Image : Control {
     }
     public static long StrHash(string s) {
         long h = 5381;
+        if (s == null) { return h; }
         for (int i = 0; i < s.Length; i = i + 1) {
             h = (h * 33 + (s[i] & 255)) % 2147483647;
         }
@@ -220,13 +226,14 @@ public class Image : Control {
     }
     public static int ScaleTo(int v, int num, int den) {
         if (den <= 0) { return v; }
-        return (v * num * 2 + den) / (den * 2);
+        return (int)(((long)v * (long)num * 2 + (long)den) / ((long)den * 2));
     }
     // ---- 保留模式钩子（Control）-------------------------------------
 
     // 测量：CSS 尺寸优先，缺一边时按已加载图片的纵横比补齐，
     // 未加载时兜底 96x96。
     public override void OnMeasure(App app) {
+        if (app == null) { return; }
         this.Resolve(app);
         StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
         int cssW = s.WidthOr(-1);
@@ -255,6 +262,7 @@ public class Image : Control {
         prefH = dh;
     }
     public override void OnPaint(App app) {
+        if (app == null || app.canvas == null) { return; }
         this.Resolve(app);
         if (bw <= 0 || bh <= 0) { return; }
         Canvas c = app.canvas;
@@ -271,39 +279,42 @@ public class Image : Control {
     }
     private void BlitFitted(App app, Canvas c) {
         c.PushClip(bx, by, bw, bh);
-        string fit = this.FitMode();
-        if (fit == "fill") {
-            c.BlitImage(imgKey, bx, by, bw, bh, 0, 0, 0, 0);
-        } else if (fit == "none") {
-            int dw = app.Scale(imgW);
-            int dh = app.Scale(imgH);
-            c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
-                        dw, dh, 0, 0, 0, 0);
-        } else if (fit == "cover") {
-            int sw = imgW;
-            int sh = imgH;
-            int sx = 0;
-            int sy = 0;
-            if (bw * imgH >= bh * imgW) {
-                sh = this.ScaleTo(imgW, bh, bw);
-                sy = (imgH - sh) / 2;
+        try {
+            string fit = this.FitMode();
+            if (fit == "fill") {
+                c.BlitImage(imgKey, bx, by, bw, bh, 0, 0, 0, 0);
+            } else if (fit == "none") {
+                int dw = app.Scale(imgW);
+                int dh = app.Scale(imgH);
+                c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
+                            dw, dh, 0, 0, 0, 0);
+            } else if (fit == "cover") {
+                int sw = imgW;
+                int sh = imgH;
+                int sx = 0;
+                int sy = 0;
+                if ((long)bw * (long)imgH >= (long)bh * (long)imgW) {
+                    sh = this.ScaleTo(imgW, bh, bw);
+                    sy = (imgH - sh) / 2;
+                } else {
+                    sw = this.ScaleTo(imgH, bw, bh);
+                    sx = (imgW - sw) / 2;
+                }
+                c.BlitImage(imgKey, bx, by, bw, bh, sx, sy, sw, sh);
             } else {
-                sw = this.ScaleTo(imgH, bw, bh);
-                sx = (imgW - sw) / 2;
+                int dw = bw;
+                int dh = bh;
+                if ((long)bw * (long)imgH <= (long)bh * (long)imgW) {
+                    dh = this.ScaleTo(bw, imgH, imgW);
+                } else {
+                    dw = this.ScaleTo(bh, imgW, imgH);
+                }
+                c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
+                            dw, dh, 0, 0, 0, 0);
             }
-            c.BlitImage(imgKey, bx, by, bw, bh, sx, sy, sw, sh);
-        } else {
-            int dw = bw;
-            int dh = bh;
-            if (bw * imgH <= bh * imgW) {
-                dh = this.ScaleTo(bw, imgH, imgW);
-            } else {
-                dw = this.ScaleTo(bh, imgW, imgH);
-            }
-            c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
-                        dw, dh, 0, 0, 0, 0);
+        } finally {
+            c.PopClip();
         }
-        c.PopClip();
     }
     private void DrawPlaceholder(App app, Canvas c, StyleBox s) {
         string label = Alt;
@@ -317,7 +328,8 @@ public class Image : Control {
 
     // 换图源：写绑定并作废已解析的路径缓存。
     public void SetSrc(string v) {
-        if (Src != null) { Src.Set(v); } else { Src = v; }
+        string safe = v != null ? v : "";
+        if (Src != null) { Src.Set(safe); } else { Src = safe; }
         resolvedSrc = null;
     }
 
