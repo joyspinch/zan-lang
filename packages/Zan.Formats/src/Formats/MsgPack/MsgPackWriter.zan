@@ -20,7 +20,7 @@ public class MsgPackWriter {
     int len;
 
     public MsgPackWriter() {
-        buf = new byte[64];
+        buf = new byte[256];
         len = 0;
     }
 
@@ -86,27 +86,110 @@ public class MsgPackWriter {
 
     // 整数的规范最短形态：0..127 正 fixint、-32..-1 负
     // fixint（都单字节），向上依次 uint8/16/32/64（正）与
-    // int8/16/32/64（负）。
+    // int8/16/32/64（负）。合并单次 EnsureRoom 直写。
     public void WriteInt(long v) {
         if (v >= 0) {
-            if (v < 128) { RawU8((int)v); }
-            else if (v < 256) { RawU8(204); RawU8((int)v); }
-            else if (v < 65536) { RawU8(205); RawU16BE((int)v); }
-            else if (v < 4294967296) { RawU8(206); RawU32BE(v); }
-            else { RawU8(207); RawU64BE(v); }
+            if (v < 128) {
+                EnsureRoom(1);
+                buf[len] = (byte)v;
+                len = len + 1;
+            } else if (v < 256) {
+                EnsureRoom(2);
+                int p = len;
+                buf[p] = 204;
+                buf[p + 1] = (byte)v;
+                len = p + 2;
+            } else if (v < 65536) {
+                EnsureRoom(3);
+                int p = len;
+                buf[p] = 205;
+                buf[p + 1] = (byte)(v >> 8);
+                buf[p + 2] = (byte)v;
+                len = p + 3;
+            } else if (v < 4294967296) {
+                EnsureRoom(5);
+                int p = len;
+                buf[p] = 206;
+                buf[p + 1] = (byte)(v >> 24);
+                buf[p + 2] = (byte)(v >> 16);
+                buf[p + 3] = (byte)(v >> 8);
+                buf[p + 4] = (byte)v;
+                len = p + 5;
+            } else {
+                EnsureRoom(9);
+                int p = len;
+                buf[p] = 207;
+                buf[p + 1] = (byte)(v >> 56);
+                buf[p + 2] = (byte)(v >> 48);
+                buf[p + 3] = (byte)(v >> 40);
+                buf[p + 4] = (byte)(v >> 32);
+                buf[p + 5] = (byte)(v >> 24);
+                buf[p + 6] = (byte)(v >> 16);
+                buf[p + 7] = (byte)(v >> 8);
+                buf[p + 8] = (byte)v;
+                len = p + 9;
+            }
         } else {
-            if (v >= -32) { RawU8((int)(v + 256)); }
-            else if (v >= -128) { RawU8(208); RawU8((int)(v + 256)); }
-            else if (v >= -32768) { RawU8(209); RawU16BE((int)(v + 65536)); }
-            else if (v >= -2147483648) { RawU8(210); RawU32BE(v + 4294967296); }
-            else { RawU8(211); RawU64BE(v); }
+            if (v >= -32) {
+                EnsureRoom(1);
+                buf[len] = (byte)(v + 256);
+                len = len + 1;
+            } else if (v >= -128) {
+                EnsureRoom(2);
+                int p = len;
+                buf[p] = 208;
+                buf[p + 1] = (byte)(v + 256);
+                len = p + 2;
+            } else if (v >= -32768) {
+                EnsureRoom(3);
+                int p = len;
+                long u = v + 65536;
+                buf[p] = 209;
+                buf[p + 1] = (byte)(u >> 8);
+                buf[p + 2] = (byte)u;
+                len = p + 3;
+            } else if (v >= -2147483648) {
+                EnsureRoom(5);
+                int p = len;
+                long u = v + 4294967296;
+                buf[p] = 210;
+                buf[p + 1] = (byte)(u >> 24);
+                buf[p + 2] = (byte)(u >> 16);
+                buf[p + 3] = (byte)(u >> 8);
+                buf[p + 4] = (byte)u;
+                len = p + 5;
+            } else {
+                EnsureRoom(9);
+                int p = len;
+                buf[p] = 211;
+                buf[p + 1] = (byte)(v >> 56);
+                buf[p + 2] = (byte)(v >> 48);
+                buf[p + 3] = (byte)(v >> 40);
+                buf[p + 4] = (byte)(v >> 32);
+                buf[p + 5] = (byte)(v >> 24);
+                buf[p + 6] = (byte)(v >> 16);
+                buf[p + 7] = (byte)(v >> 8);
+                buf[p + 8] = (byte)v;
+                len = p + 9;
+            }
         }
     }
 
     // float64（0xCB + 8 字节大端 IEEE-754）。
     public void WriteDouble(double d) {
-        RawU8(203);
-        RawU64BE(DoubleBits(d));
+        EnsureRoom(9);
+        long bits = NativeMemory.AsI64(d);
+        int p = len;
+        buf[p] = 203;
+        buf[p + 1] = (byte)(bits >> 56);
+        buf[p + 2] = (byte)(bits >> 48);
+        buf[p + 3] = (byte)(bits >> 40);
+        buf[p + 4] = (byte)(bits >> 32);
+        buf[p + 5] = (byte)(bits >> 24);
+        buf[p + 6] = (byte)(bits >> 16);
+        buf[p + 7] = (byte)(bits >> 8);
+        buf[p + 8] = (byte)bits;
+        len = p + 9;
     }
 
     // string：零临时 byte[]，直接按 str 家族（fixstr/str8/16/32）写 UTF-8 字节。
@@ -167,16 +250,52 @@ public class MsgPackWriter {
 
     // 数组头：n ≤ 15 用 fixarray，否则 array16/32。
     public void WriteArrayHeader(int n) {
-        if (n <= 15) { RawU8(144 | n); }
-        else if (n <= 65535) { RawU8(220); RawU16BE(n); }
-        else { RawU8(221); RawU32BE(n); }
+        if (n <= 15) {
+            EnsureRoom(1);
+            buf[len] = (byte)(144 | n);
+            len = len + 1;
+        } else if (n <= 65535) {
+            EnsureRoom(3);
+            int p = len;
+            buf[p] = 220;
+            buf[p + 1] = (byte)(n >> 8);
+            buf[p + 2] = (byte)n;
+            len = p + 3;
+        } else {
+            EnsureRoom(5);
+            int p = len;
+            buf[p] = 221;
+            buf[p + 1] = (byte)(n >> 24);
+            buf[p + 2] = (byte)(n >> 16);
+            buf[p + 3] = (byte)(n >> 8);
+            buf[p + 4] = (byte)n;
+            len = p + 5;
+        }
     }
 
     // 映射头：n ≤ 15 用 fixmap，否则 map16/32。
     public void WriteMapHeader(int n) {
-        if (n <= 15) { RawU8(128 | n); }
-        else if (n <= 65535) { RawU8(222); RawU16BE(n); }
-        else { RawU8(223); RawU32BE(n); }
+        if (n <= 15) {
+            EnsureRoom(1);
+            buf[len] = (byte)(128 | n);
+            len = len + 1;
+        } else if (n <= 65535) {
+            EnsureRoom(3);
+            int p = len;
+            buf[p] = 222;
+            buf[p + 1] = (byte)(n >> 8);
+            buf[p + 2] = (byte)n;
+            len = p + 3;
+        } else {
+            EnsureRoom(5);
+            int p = len;
+            buf[p] = 223;
+            buf[p + 1] = (byte)(n >> 24);
+            buf[p + 2] = (byte)(n >> 16);
+            buf[p + 3] = (byte)(n >> 8);
+            buf[p + 4] = (byte)n;
+            len = p + 5;
+        }
     }
 
     // 取出已编码字节（复制一份）。

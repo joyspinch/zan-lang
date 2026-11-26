@@ -150,10 +150,14 @@ public class MsgPackReader {
         if (b >= 128 && b <= 143) {  // fixmap
             int n = b & 15;
             JsonValue obj = JsonValue.NewObject();
+            List<string> ks = obj.keys;
+            List<JsonValue> vs = obj.vals;
+            if (n > 0) { ks.Reserve(n); vs.Reserve(n); }
             int i = 0;
             while (i < n) {
                 string key = ReadMapKey(depth + 1);
-                obj.Put(key, ReadValue(depth + 1));
+                ks.Add(key);
+                vs.Add(ReadValue(depth + 1));
                 i = i + 1;
             }
             return obj;
@@ -161,9 +165,11 @@ public class MsgPackReader {
         if (b >= 144 && b <= 159) {  // fixarray
             int n = b & 15;
             JsonValue arr = JsonValue.NewArray();
+            List<JsonValue> items = arr.items;
+            if (n > 0) { items.Reserve(n); }
             int i = 0;
             while (i < n) {
-                arr.Append(ReadValue(depth + 1));
+                items.Add(ReadValue(depth + 1));
                 i = i + 1;
             }
             return arr;
@@ -251,9 +257,11 @@ public class MsgPackReader {
             throw new MsgPackException("array length out of bounds: " + Convert.ToString(n));
         }
         JsonValue arr = JsonValue.NewArray();
+        List<JsonValue> items = arr.items;
+        if (n > 0 && n <= 4096) { items.Reserve(n); }
         int i = 0;
         while (i < n) {
-            arr.Append(ReadValue(depth + 1));
+            items.Add(ReadValue(depth + 1));
             i = i + 1;
         }
         return arr;
@@ -264,10 +272,14 @@ public class MsgPackReader {
             throw new MsgPackException("map size out of bounds: " + Convert.ToString(n));
         }
         JsonValue obj = JsonValue.NewObject();
+        List<string> ks = obj.keys;
+        List<JsonValue> vs = obj.vals;
+        if (n > 0 && n <= 4096) { ks.Reserve(n); vs.Reserve(n); }
         int i = 0;
         while (i < n) {
             string key = ReadMapKey(depth + 1);
-            obj.Put(key, ReadValue(depth + 1));
+            ks.Add(key);
+            vs.Add(ReadValue(depth + 1));
             i = i + 1;
         }
         return obj;
@@ -305,13 +317,14 @@ public class MsgPackReader {
     }
 
     long U64Of(byte[] b, int at) {
-        long v = 0;
-        int i = 0;
-        while (i < 8) {
-            v = (v << 8) | (long)(b[at + i] & 255);
-            i = i + 1;
-        }
-        return v;
+        return ((long)(b[at] & 255) << 56)
+            | ((long)(b[at + 1] & 255) << 48)
+            | ((long)(b[at + 2] & 255) << 40)
+            | ((long)(b[at + 3] & 255) << 32)
+            | ((long)(b[at + 4] & 255) << 24)
+            | ((long)(b[at + 5] & 255) << 16)
+            | ((long)(b[at + 6] & 255) << 8)
+            | (long)(b[at + 7] & 255);
     }
 
     // Unix 秒 → ISO 8601 UTC（"YYYY-MM-DDTHH:MM:SSZ"）。
@@ -319,22 +332,62 @@ public class MsgPackReader {
         return IsoFromUnixNanos(sec, 0);
     }
 
-    // 带纳秒：非整毫秒截断到毫秒三位（ISO 字符串到毫秒为止）。
-    private static string IsoFromUnixNanos(long sec, long nanos) {
+    // 带纳秒：非整毫秒截断到毫秒三位（定长缓冲零中间串直写）。
+    public static string IsoFromUnixNanos(long sec, long nanos) {
         DateTime t = DateTime.FromUnixSeconds(sec);
-        StringBuilder sb = new StringBuilder();
-        sb.Append(Pad4(t.Year()));
-        sb.Append("-");
-        sb.Append(Pad2(t.Month()));
-        sb.Append("-");
-        sb.Append(Pad2(t.Day()));
-        sb.Append("T");
-        sb.Append(Pad2(t.Hour()));
-        sb.Append(":");
-        sb.Append(Pad2(t.Minute()));
-        sb.Append(":");
-        sb.Append(Pad2(t.Second()));
+        int year = t.Year();
+        int month = t.Month();
+        int day = t.Day();
+        int hour = t.Hour();
+        int minute = t.Minute();
+        int second = t.Second();
         long ms = nanos / 1000000;
+        if (year >= 0 && year < 10000 && ms >= 0 && ms < 1000) {
+            int total = ms > 0 ? 24 : 20;
+            byte[] outb = new byte[total];
+            outb[0] = (byte)(48 + (year / 1000) % 10);
+            outb[1] = (byte)(48 + (year / 100) % 10);
+            outb[2] = (byte)(48 + (year / 10) % 10);
+            outb[3] = (byte)(48 + year % 10);
+            outb[4] = 45;
+            outb[5] = (byte)(48 + month / 10);
+            outb[6] = (byte)(48 + month % 10);
+            outb[7] = 45;
+            outb[8] = (byte)(48 + day / 10);
+            outb[9] = (byte)(48 + day % 10);
+            outb[10] = 84;
+            outb[11] = (byte)(48 + hour / 10);
+            outb[12] = (byte)(48 + hour % 10);
+            outb[13] = 58;
+            outb[14] = (byte)(48 + minute / 10);
+            outb[15] = (byte)(48 + minute % 10);
+            outb[16] = 58;
+            outb[17] = (byte)(48 + second / 10);
+            outb[18] = (byte)(48 + second % 10);
+            if (ms > 0) {
+                int r = (int)ms;
+                outb[19] = 46;
+                outb[20] = (byte)(48 + r / 100);
+                outb[21] = (byte)(48 + (r / 10) % 10);
+                outb[22] = (byte)(48 + r % 10);
+                outb[23] = 90;
+            } else {
+                outb[19] = 90;
+            }
+            return outb.ToStr(0, total);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Pad4(year));
+        sb.Append("-");
+        sb.Append(Pad2(month));
+        sb.Append("-");
+        sb.Append(Pad2(day));
+        sb.Append("T");
+        sb.Append(Pad2(hour));
+        sb.Append(":");
+        sb.Append(Pad2(minute));
+        sb.Append(":");
+        sb.Append(Pad2(second));
         if (ms > 0) {
             sb.Append(".");
             if (ms < 100) { sb.Append("0"); }

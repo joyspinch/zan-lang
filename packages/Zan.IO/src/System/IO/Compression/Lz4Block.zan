@@ -30,7 +30,9 @@ public class Lz4Block {
         if (len == 0) {
             return new byte[0];
         }
-        byte[] out2 = new byte[maxOut + 8];
+        byte[] out2 = new byte[maxOut];
+        nint outPtr = (nint)out2;
+        nint srcPtr = (nint)src;
         int ip = offset;
         int end = offset + len;
         int op = 0;
@@ -50,7 +52,7 @@ public class Lz4Block {
             }
             if (litLen > 0) {
                 if (ip + litLen > end || op + litLen > maxOut) { return null; }
-                NativeMemory.Copy((nint)out2 + op, (nint)src + ip, litLen);
+                NativeMemory.Copy(outPtr + op, srcPtr + ip, litLen);
                 op = op + litLen;
                 ip = ip + litLen;
             }
@@ -77,7 +79,10 @@ public class Lz4Block {
             // 周期段，可作为源继续整块搬移（memmove，无重叠）。
             int mp = op - matchOff;
             if (matchOff >= matchLen) {
-                NativeMemory.Copy((nint)out2 + op, (nint)out2 + mp, matchLen);
+                NativeMemory.Copy(outPtr + op, outPtr + mp, matchLen);
+                op = op + matchLen;
+            } else if (matchOff == 1) {
+                NativeMemory.Fill(outPtr + op, out2[mp] & 255, matchLen);
                 op = op + matchLen;
             } else {
                 int done = 0;
@@ -89,7 +94,7 @@ public class Lz4Block {
                 }
                 while (done < matchLen) {
                     int step = matchLen - done > done ? done : matchLen - done;
-                    NativeMemory.Copy((nint)out2 + op, (nint)out2 + op - done, step);
+                    NativeMemory.Copy(outPtr + op, outPtr + op - done, step);
                     op = op + step;
                     done = done + step;
                 }
@@ -134,22 +139,30 @@ public class Lz4Block {
         int maxOut = Lz4Block.UpperBound(n);
         byte[] out2 = new byte[maxOut + 8];
         int[] table = new int[Lz4Block.HASH_SIZE];
-        // 表初始化为 -1（0 是合法位置）。
-        for (int i = 0; i < Lz4Block.HASH_SIZE; i = i + 1) {
-            table[i] = -1;
-        }
+        // 表初始化为 -1（0xFF × 4 = -1，单次 memset 取代 65536 次标量写）。
+        NativeMemory.Fill((nint)table, 255, Lz4Block.HASH_SIZE * 4);
         int op = 0;
         int anchor = 0;
         int ip = 0;
         int baseOff = offset;
         int mflimit = n - MIN_MATCH;
         int maxChain = Lz4Block.ChainLength(level);
+        int hashMask = Lz4Block.HASH_SIZE - 1;
         while (ip <= mflimit) {
-            int h = Lz4Block.Hash4(src, baseOff + ip);
+            int p0 = baseOff + ip;
+            int cur4 = (src[p0] & 255) | ((src[p0 + 1] & 255) << 8)
+                | ((src[p0 + 2] & 255) << 16) | ((src[p0 + 3] & 255) << 24);
+            int h = (int)(((uint)(cur4 * 265443576)) >> 16) & hashMask;
             int cand = table[h];
             table[h] = ip;
-            if (cand < 0 || ip - cand > 65535
-                || Lz4Block.Read4(src, baseOff + cand) != Lz4Block.Read4(src, baseOff + ip)) {
+            if (cand < 0 || ip - cand > 65535) {
+                ip = ip + 1;
+                continue;
+            }
+            int q0 = baseOff + cand;
+            int cand4 = (src[q0] & 255) | ((src[q0 + 1] & 255) << 8)
+                | ((src[q0 + 2] & 255) << 16) | ((src[q0 + 3] & 255) << 24);
+            if (cand4 != cur4) {
                 ip = ip + 1;
                 continue;
             }
@@ -160,9 +173,20 @@ public class Lz4Block {
             // 逐字节展开，可越过 match 起点）；maxChain 限步数。
             int matchLen = MIN_MATCH;
             int limit = ip + maxChain < n ? ip + maxChain : n;
-            int p = baseOff + ip + MIN_MATCH;
-            int q = baseOff + cand + MIN_MATCH;
-            while (p < baseOff + limit && src[p] == src[q]) {
+            int p = p0 + MIN_MATCH;
+            int q = q0 + MIN_MATCH;
+            int pEnd = baseOff + limit;
+            while (p + 4 <= pEnd) {
+                int w1 = (src[p] & 255) | ((src[p + 1] & 255) << 8)
+                    | ((src[p + 2] & 255) << 16) | ((src[p + 3] & 255) << 24);
+                int w2 = (src[q] & 255) | ((src[q + 1] & 255) << 8)
+                    | ((src[q + 2] & 255) << 16) | ((src[q + 3] & 255) << 24);
+                if (w1 != w2) { break; }
+                p = p + 4;
+                q = q + 4;
+                matchLen = matchLen + 4;
+            }
+            while (p < pEnd && src[p] == src[q]) {
                 p = p + 1;
                 q = q + 1;
                 matchLen = matchLen + 1;

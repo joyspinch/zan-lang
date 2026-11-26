@@ -75,19 +75,20 @@ public class HpackContext {
         return null;
     }
 
-    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIndex 记录首个匹配）。
-    public int Find(string name, string value, List<int> outNameIndex) {
-        List<int> staticName = new List<int>();
-        int exactStatic = HpackStaticTable.Find(name, value, staticName);
+    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIdx 输出首个匹配，零堆分配）。
+    private int FindFast(string name, string value, out int outNameIdx) {
+        int firstNameIdx = 0;
+        int exactStatic = HpackStaticTable.FindFast(name, value, out firstNameIdx);
         if (exactStatic > 0) {
+            outNameIdx = firstNameIdx;
             return exactStatic;
         }
-        int firstNameIdx = staticName.Count > 0 ? staticName[0] : 0;
-
-        for (int i = 0; i < this.dynamicTable.Count; i = i + 1) {
+        int dynCount = this.dynamicTable.Count;
+        for (int i = 0; i < dynCount; i = i + 1) {
             HpackHeader e = this.dynamicTable[i];
             if (e.name == name) {
                 if (e.value == value) {
+                    outNameIdx = 62 + i;
                     return 62 + i;
                 }
                 if (firstNameIdx == 0) {
@@ -95,8 +96,17 @@ public class HpackContext {
                 }
             }
         }
-        if (outNameIndex != null && firstNameIdx > 0) {
-            outNameIndex.Add(firstNameIdx);
+        outNameIdx = firstNameIdx;
+        return 0;
+    }
+
+    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIndex 记录首个匹配）。
+    public int Find(string name, string value, List<int> outNameIndex) {
+        int nameIdx = 0;
+        int exact = this.FindFast(name, value, out nameIdx);
+        if (exact > 0) { return exact; }
+        if (outNameIndex != null && nameIdx > 0) {
+            outNameIndex.Add(nameIdx);
         }
         return 0;
     }
@@ -121,9 +131,8 @@ public class HpackContext {
     public static int DecodeInt(byte[] buf, List<int> pos, int prefixBits) {
         return HpackContext.ReadInt(buf, pos, prefixBits, buf == null ? 0 : buf.Length);
     }
-    private static int ReadInt(byte[] buf, List<int> pos, int bits, int end) {
-        if (buf == null || pos == null || pos.Count == 0 || bits < 1 || bits > 8) { throw new IOException("Invalid HPACK integer"); }
-        int p = pos[0];
+    private static int ReadIntRef(byte[] buf, ref int p, int bits, int end) {
+        if (buf == null || bits < 1 || bits > 8) { throw new IOException("Invalid HPACK integer"); }
         if (p < 0 || end > buf.Length || p >= end) { throw new IOException("Truncated HPACK integer"); }
         int mask = (1 << bits) - 1;
         long value = buf[p] & mask;
@@ -140,19 +149,28 @@ public class HpackContext {
                 shift = shift + 7;
             }
         }
-        pos[0] = p;
         return (int)value;
+    }
+
+    private static int ReadInt(byte[] buf, List<int> pos, int bits, int end) {
+        if (pos == null || pos.Count == 0) { throw new IOException("Invalid HPACK integer"); }
+        int p = pos[0];
+        int res = HpackContext.ReadIntRef(buf, ref p, bits, end);
+        pos[0] = p;
+        return res;
     }
 
     // RFC 7541 §5.2: 字符串字面量编码
     public static void EncodeString(List<int> outBytes, string s, bool useHuffman) {
         if (s == null) { s = ""; }
         if (useHuffman) {
-            byte[] huff = HpackHuffman.Encode(s);
-            if (huff.Length < s.Length) {
+            int hlen = HpackHuffman.EncodedLength(s);
+            if (hlen < s.Length) {
+                byte[] huff = new byte[hlen];
+                HpackHuffman.EncodeInto(s, huff, 0);
                 // H = 1 (bit 7 为 1)
-                HpackContext.EncodeInt(outBytes, 128, 7, huff.Length);
-                for (int i = 0; i < huff.Length; i = i + 1) {
+                HpackContext.EncodeInt(outBytes, 128, 7, hlen);
+                for (int i = 0; i < hlen; i = i + 1) {
                     outBytes.Add(huff[i] & 255);
                 }
                 return;
@@ -165,19 +183,80 @@ public class HpackContext {
         }
     }
 
+    private static byte[] EnsureBufRoom(byte[] buf, int pos, int extra) {
+        int need = pos + extra;
+        if (need <= buf.Length) { return buf; }
+        int c = buf.Length * 2;
+        while (c < need) { c = c * 2; }
+        byte[] grown = new byte[c];
+        NativeMemory.Copy((nint)grown, (nint)buf, pos);
+        return grown;
+    }
+
+    private static byte[] WriteIntBuf(byte[] buf, ref int pos, int initialByte, int prefixBits, int val) {
+        buf = HpackContext.EnsureBufRoom(buf, pos, 8);
+        int maxPrefix = (1 << prefixBits) - 1;
+        if (val < maxPrefix) {
+            buf[pos] = (byte)(initialByte | val);
+            pos = pos + 1;
+            return buf;
+        }
+        buf[pos] = (byte)(initialByte | maxPrefix);
+        pos = pos + 1;
+        val = val - maxPrefix;
+        while (val >= 128) {
+            buf[pos] = (byte)((val & 127) | 128);
+            pos = pos + 1;
+            val = val >> 7;
+        }
+        buf[pos] = (byte)val;
+        pos = pos + 1;
+        return buf;
+    }
+
+    private static byte[] WriteStringBuf(byte[] buf, ref int pos, string s, bool useHuffman) {
+        if (s == null) { s = ""; }
+        int slen = s.Length;
+        if (useHuffman && slen > 0) {
+            int hlen = HpackHuffman.EncodedLength(s);
+            if (hlen < slen) {
+                buf = HpackContext.WriteIntBuf(buf, ref pos, 128, 7, hlen);
+                buf = HpackContext.EnsureBufRoom(buf, pos, hlen);
+                HpackHuffman.EncodeInto(s, buf, pos);
+                pos = pos + hlen;
+                return buf;
+            }
+        }
+        buf = HpackContext.WriteIntBuf(buf, ref pos, 0, 7, slen);
+        if (slen > 0) {
+            buf = HpackContext.EnsureBufRoom(buf, pos, slen);
+            NativeMemory.PutString((nint)buf, pos, s, slen);
+            pos = pos + slen;
+        }
+        return buf;
+    }
+
     // RFC 7541 §5.2: 字符串字面量解码
     public static string DecodeString(byte[] buf, List<int> pos) {
         return HpackContext.ReadString(buf, pos, buf == null ? 0 : buf.Length, 65536);
     }
-    private static string ReadString(byte[] buf, List<int> pos, int end, int budget) {
-        if (buf == null || pos == null || pos.Count == 0 || pos[0] < 0 || pos[0] >= end) { throw new IOException("Truncated HPACK string"); }
-        bool huffman = (buf[pos[0]] & 128) != 0;
-        int count = HpackContext.ReadInt(buf, pos, 7, end);
-        int p = pos[0];
+
+    private static string ReadStringRef(byte[] buf, ref int p, int end, int budget) {
+        if (buf == null || p < 0 || p >= end) { throw new IOException("Truncated HPACK string"); }
+        bool huffman = (buf[p] & 128) != 0;
+        int count = HpackContext.ReadIntRef(buf, ref p, 7, end);
         if (count > end - p || count > budget || budget < 0) { throw new IOException("HPACK string limit"); }
         string value = huffman ? HpackHuffman.Decode(buf, p, count) : buf.ToStr(p, count);
         if (value == null || value.Length > budget) { throw new IOException("Invalid HPACK string"); }
-        pos[0] = p + count;
+        p = p + count;
+        return value;
+    }
+
+    private static string ReadString(byte[] buf, List<int> pos, int end, int budget) {
+        if (pos == null || pos.Count == 0) { throw new IOException("Truncated HPACK string"); }
+        int p = pos[0];
+        string value = HpackContext.ReadStringRef(buf, ref p, end, budget);
+        pos[0] = p;
         return value;
     }
     // A failed block poisons the context; partially updated compression state cannot be reused.
@@ -192,15 +271,14 @@ public class HpackContext {
     private List<HpackHeader> DecodeBlock(byte[] buf, int offset, int length) {
         if (buf == null || offset < 0 || length < 0 || offset > buf.Length || length > buf.Length - offset || length > this.maxHeaderBytes) { throw new IOException("HPACK block limit"); }
         List<HpackHeader> headers = new List<HpackHeader>();
-        List<int> pos = new List<int>();
-        pos.Add(offset);
+        int pos = offset;
         int end = offset + length;
         int bytes = 0;
         bool fields = false;
-        while (pos[0] < end) {
-            int first = buf[pos[0]] & 255;
+        while (pos < end) {
+            int first = buf[pos] & 255;
             if ((first & 224) == 32) {
-                int size = HpackContext.ReadInt(buf, pos, 5, end);
+                int size = HpackContext.ReadIntRef(buf, ref pos, 5, end);
                 if (fields || size > this.allowedTableSize) { throw new IOException("Invalid HPACK table update"); }
                 this.maxTableSize = size;
                 this.EvictToMax(size);
@@ -212,7 +290,7 @@ public class HpackContext {
             string value = "";
             bool indexed = (first & 128) != 0;
             bool insert = (first & 192) == 64;
-            int index = HpackContext.ReadInt(buf, pos, indexed ? 7 : (insert ? 6 : 4), end);
+            int index = HpackContext.ReadIntRef(buf, ref pos, indexed ? 7 : (insert ? 6 : 4), end);
             if (index > 0) {
                 HpackHeader entry = this.GetHeader(index);
                 if (entry == null) { throw new IOException("Invalid HPACK index"); }
@@ -220,9 +298,9 @@ public class HpackContext {
                 if (indexed) { value = entry.value; }
             } else {
                 if (indexed) { throw new IOException("Zero HPACK index"); }
-                name = HpackContext.ReadString(buf, pos, end, this.maxHeaderBytes - bytes);
+                name = HpackContext.ReadStringRef(buf, ref pos, end, this.maxHeaderBytes - bytes);
             }
-            if (!indexed) { value = HpackContext.ReadString(buf, pos, end, this.maxHeaderBytes - bytes - name.Length); }
+            if (!indexed) { value = HpackContext.ReadStringRef(buf, ref pos, end, this.maxHeaderBytes - bytes - name.Length); }
             if (name.Length == 0 || name.Length + value.Length + 32 > this.maxHeaderBytes - bytes) { throw new IOException("HPACK header list limit"); }
             bytes = bytes + name.Length + value.Length + 32;
             if (insert) { this.AddHeader(name, value); }
@@ -231,38 +309,37 @@ public class HpackContext {
         return headers;
     }
 
-    // 编码一组头部字段为 HPACK 字节流（采用紧凑且标准的增量索引策略）。
+    // 编码一组头部字段为 HPACK 字节流（零 List<int> 装箱，直接写入连续 byte[]）。
     public byte[] EncodeHeaders(List<HpackHeader> headers, bool useHuffman) {
         if (headers == null || headers.Count == 0) { return new byte[0]; }
-        List<int> bytesList = new List<int>();
-        List<int> nameBox = new List<int>();
+        int hCount = headers.Count;
+        byte[] outBuf = new byte[hCount * 32 + 64];
+        int pos = 0;
 
-        for (int i = 0; i < headers.Count; i = i + 1) {
+        for (int i = 0; i < hCount; i = i + 1) {
             HpackHeader h = headers[i];
-            nameBox.Clear();
-            int exactIdx = this.Find(h.name, h.value, nameBox);
+            int nameIdx = 0;
+            int exactIdx = this.FindFast(h.name, h.value, out nameIdx);
             if (exactIdx > 0) {
                 // 完全命中：以 Indexed Header Field (1xxxxxxx, prefix 7) 编码
-                HpackContext.EncodeInt(bytesList, 128, 7, exactIdx);
-            } else if (nameBox.Count > 0 && nameBox[0] > 0) {
+                outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 128, 7, exactIdx);
+            } else if (nameIdx > 0) {
                 // 名称命中：以 Literal Header Field with Incremental Indexing (01xxxxxx, prefix 6) 编码
-                int nameIdx = nameBox[0];
-                HpackContext.EncodeInt(bytesList, 64, 6, nameIdx);
-                HpackContext.EncodeString(bytesList, h.value, useHuffman);
+                outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 64, 6, nameIdx);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.value, useHuffman);
                 this.AddHeader(h.name, h.value);
             } else {
                 // 全新头部：Literal with Incremental Indexing (01000000, index 0)
-                HpackContext.EncodeInt(bytesList, 64, 6, 0);
-                HpackContext.EncodeString(bytesList, h.name, useHuffman);
-                HpackContext.EncodeString(bytesList, h.value, useHuffman);
+                outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 64, 6, 0);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.name, useHuffman);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.value, useHuffman);
                 this.AddHeader(h.name, h.value);
             }
         }
 
-        byte[] res = new byte[bytesList.Count];
-        for (int k = 0; k < bytesList.Count; k = k + 1) {
-            res[k] = (byte)bytesList[k];
-        }
+        if (pos == outBuf.Length) { return outBuf; }
+        byte[] res = new byte[pos];
+        if (pos > 0) { NativeMemory.Copy((nint)res, (nint)outBuf, pos); }
         return res;
     }
 }

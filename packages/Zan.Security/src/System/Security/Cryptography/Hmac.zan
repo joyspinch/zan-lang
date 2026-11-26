@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.Intrinsics;
 
 namespace System.Security.Cryptography;
 
@@ -25,32 +26,78 @@ public class Hmac {
         return Sha256.Hash(buf, len);
     }
 
+    // 硬件原地摘要快路径（免中间 byte[] 分配；不支持或回退时返回 false）。
+    private static bool hashInto(int algo, nint src, int len, nint dst) {
+        nint p = (len > 0 && src != 0) ? src : (nint)"";
+        if (algo == 1) { return NativeMemory.Sha1Into(p, (long)len, dst) >= 0; }
+        if (algo == 2) { return NativeMemory.Sm3Into(p, (long)len, dst) >= 0; }
+        if (algo == 3) { return false; }
+        return NativeMemory.Sha256Into(p, (long)len, dst) >= 0;
+    }
+
+    // 统一原始指针核心实现（单块合并工作缓冲 + Vector256 双向量 ipad/opad + 硬件原地摘要，仅 2 次堆分配）。
+    private static byte[] ComputeCore(int algo, nint keyPtr, int keyLen, nint msgPtr, int msgLen) {
+        if (keyLen < 0) { keyLen = 0; }
+        if (msgLen < 0) { msgLen = 0; }
+        int dlen = digestLen(algo);
+        int outerLen = 64 + dlen;
+        int innerLen = 64 + msgLen;
+        // work 布局：[0..63] = opad(先暂存 k0)，[64..64+dlen-1] = innerHash，[outerLen..outerLen+63] = ipad，[outerLen+64..] = msg
+        byte[] work = new byte[outerLen + innerLen];
+        nint workPtr = (nint)work;
+        if (keyLen > 64) {
+            if (!hashInto(algo, keyPtr, keyLen, workPtr)) {
+                byte[] kTmp = new byte[keyLen];
+                NativeMemory.Copy((nint)kTmp, keyPtr, keyLen);
+                byte[] hk = hashOf(algo, kTmp, keyLen);
+                NativeMemory.Copy(workPtr, (nint)hk, dlen);
+            }
+        } else if (keyLen > 0 && keyPtr != 0) {
+            NativeMemory.Copy(workPtr, keyPtr, keyLen);
+        }
+
+        Vector256 kLo = Vector256.Load(work, 0);
+        Vector256 kHi = Vector256.Load(work, 32);
+        Vector256 vIpad = Vector256.Create((byte)54);  // ipad 0x36
+        Vector256 vOpad = Vector256.Create((byte)92);  // opad 0x5c
+
+        Vector256.Store(work, 0, Vector256.Xor(kLo, vOpad));
+        Vector256.Store(work, 32, Vector256.Xor(kHi, vOpad));
+        Vector256.Store(work, outerLen, Vector256.Xor(kLo, vIpad));
+        Vector256.Store(work, outerLen + 32, Vector256.Xor(kHi, vIpad));
+        if (msgLen > 0 && msgPtr != 0) {
+            NativeMemory.Copy(workPtr + (nint)(outerLen + 64), msgPtr, msgLen);
+        }
+
+        if (!hashInto(algo, workPtr + (nint)outerLen, innerLen, workPtr + 64)) {
+            byte[] inner = new byte[innerLen];
+            NativeMemory.Copy((nint)inner, workPtr + (nint)outerLen, innerLen);
+            byte[] ih = hashOf(algo, inner, innerLen);
+            NativeMemory.Copy(workPtr + 64, (nint)ih, dlen);
+        }
+
+        byte[] result = new byte[dlen];
+        if (hashInto(algo, workPtr, outerLen, (nint)result)) {
+            return result;
+        }
+        byte[] outer = new byte[outerLen];
+        NativeMemory.Copy((nint)outer, workPtr, outerLen);
+        return hashOf(algo, outer, outerLen);
+    }
+
     // 按所选算法计算 HMAC（0=SHA256、1=SHA1、2=SM3、3=MD5）。
     public static byte[] Compute(int algo, string key, int keyLen, string msg, int msgLen) {
-        int dlen = digestLen(algo);
-        byte[] k0 = new byte[64];
-        if (keyLen > 64) {
-            byte[] hk = hashOf(algo, key, keyLen);
-            NativeMemory.Copy((nint)k0, (nint)hk, dlen);
-        } else if (keyLen > 0) {
-            NativeMemory.PutString((nint)k0, 0, key, keyLen);
-        }
-        byte[] inner = new byte[64 + msgLen];
-        for (int i = 0; i < 64; i = i + 1) { inner[i] = (byte)((k0[i] ^ 54) & 255); }  // ipad 0x36
-        if (msgLen > 0) {
-            NativeMemory.PutString((nint)inner, 64, msg, msgLen);
-        }
-        byte[] ih = hashOf(algo, inner, 64 + msgLen);
-        byte[] outer = new byte[64 + dlen];
-        for (int i = 0; i < 64; i = i + 1) { outer[i] = (byte)((k0[i] ^ 92) & 255); }  // opad 0x5c
-        NativeMemory.Copy((nint)outer + 64, (nint)ih, dlen);
-        return hashOf(algo, outer, 64 + dlen);
+        nint kPtr = (key != null && keyLen > 0) ? (nint)key : 0;
+        nint mPtr = (msg != null && msgLen > 0) ? (nint)msg : 0;
+        return ComputeCore(algo, kPtr, keyLen, mPtr, msgLen);
     }
 
     private static byte[] ComputeBytes(int algo, byte[] key, byte[] msg) {
         int kLen = (key == null) ? 0 : key.Length;
         int mLen = (msg == null) ? 0 : msg.Length;
-        return Compute(algo, key, kLen, msg, mLen);
+        nint kPtr = kLen > 0 ? (nint)key : 0;
+        nint mPtr = mLen > 0 ? (nint)msg : 0;
+        return ComputeCore(algo, kPtr, kLen, mPtr, mLen);
     }
 
     // 以 SHA-256 计算 HMAC 的便捷封装。
@@ -65,7 +112,9 @@ public class Hmac {
 
     // 以 SHA-256 计算 HMAC（带显式长度）。
     public static byte[] Sha256(byte[] key, int keyLen, byte[] msg, int msgLen) {
-        return Compute(0, key, keyLen, msg, msgLen);
+        nint kPtr = (key != null && keyLen > 0) ? (nint)key : 0;
+        nint mPtr = (msg != null && msgLen > 0) ? (nint)msg : 0;
+        return ComputeCore(0, kPtr, keyLen, mPtr, msgLen);
     }
 
     public static byte[] Sha1(byte[] key, byte[] msg) {

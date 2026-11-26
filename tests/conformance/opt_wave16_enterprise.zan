@@ -1,0 +1,284 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Json;
+using System.Net.Http;
+using System.Net.Http.Hpack;
+using System.Security.Cryptography;
+using System.Text;
+using Formats.Csv;
+using Formats.MsgPack;
+using Formats.Protobuf;
+using Formats.Toml;
+using Formats.Yaml;
+
+class OptWave16Enterprise {
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL:" + name);
+        }
+    }
+
+    static bool BytesEqual(byte[] a, byte[] b) {
+        if (a == null || b == null) { return a == b; }
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    static void TestPillar1IO() {
+        // 1. Lz4Block: RLE (matchOff == 1), matchOff == 2, non-overlapping, tiny, levels 1/5/9
+        byte[] rle = new byte[256];
+        for (int i = 0; i < 256; i = i + 1) { rle[i] = 65; }
+        byte[] rleEnc1 = Lz4Block.Encode(rle, 1);
+        byte[] rleDec1 = Lz4Block.Decode(rleEnc1, 0, rleEnc1.Length, rle.Length);
+        Check("lz4_rle_rt1", BytesEqual(rle, rleDec1));
+        byte[] rleEnc9 = Lz4Block.Encode(rle, 9);
+        byte[] rleDec9 = Lz4Block.Decode(rleEnc9, 0, rleEnc9.Length, rle.Length);
+        Check("lz4_rle_rt9", BytesEqual(rle, rleDec9));
+        Check("lz4_rle_small", rleEnc9.Length < 40);
+
+        byte[] pat2 = new byte[300];
+        for (int i = 0; i < 300; i = i + 1) { pat2[i] = (byte)(i % 2 == 0 ? 88 : 89); }
+        byte[] pat2Enc = Lz4Block.Encode(pat2, 5);
+        byte[] pat2Dec = Lz4Block.Decode(pat2Enc, 0, pat2Enc.Length, pat2.Length);
+        Check("lz4_pat2_rt", BytesEqual(pat2, pat2Dec));
+
+        byte[] tiny = Encoding.GetBytes("abc");
+        byte[] tinyEnc = Lz4Block.Encode(tiny, 1);
+        Check("lz4_tiny_rt", BytesEqual(tiny, Lz4Block.Decode(tinyEnc, 0, tinyEnc.Length, tiny.Length)));
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 64; i = i + 1) {
+            sb.Append("{\"id\":" + Convert.ToString(i) + ",\"svc\":\"orders-api\",\"region\":\"cn-shanghai\"}\n");
+        }
+        byte[] jsonBytes = Encoding.GetBytes(sb.ToString());
+        byte[] jEnc9 = Lz4Block.Encode(jsonBytes, 9);
+        byte[] jDec9 = Lz4Block.Decode(jEnc9, 0, jEnc9.Length, jsonBytes.Length);
+        Check("lz4_lvl9_rt", BytesEqual(jsonBytes, jDec9));
+
+        // 2. ZstdXxH64: empty, short (<32), multi-stripe (>32), slice consistency
+        byte[] empty = new byte[0];
+        Check("xxh64_empty", ZstdXxH64.Compute(empty, 0, 0) == -1205034819632174695L);
+        byte[] b100 = new byte[100];
+        for (int i = 0; i < 100; i = i + 1) { b100[i] = (byte)((i * 31 + 7) & 255); }
+        long h100 = ZstdXxH64.Compute(b100, 0, 100);
+        long h100Slice = ZstdXxH64.Compute(b100, 10, 80);
+        byte[] b80 = new byte[80];
+        NativeMemory.Copy((nint)b80, (nint)b100 + 10, 80);
+        Check("xxh64_slice", h100Slice == ZstdXxH64.Compute(b80, 0, 80));
+        Check("xxh64_nonzero", h100 != 0 && ZstdXxH64.Compute(b100, 0, 32) != h100);
+
+        // 3. IniFile: CRLF/LF, comments, trimmed sections & keys, embedded '='
+        string iniText = "# top comment\r\n; semi comment\r\nglobal_k = global_v\r\n\r\n  [server]  \n  host = 127.0.0.1  \r\n  url = http://a/b?k=1&m=2 \n[db]\nport=5432\n";
+        IniFile ini = IniFile.Parse(iniText);
+        Check("ini_global", ini.GetString("", "global_k", "") == "global_v");
+        Check("ini_host", ini.GetString("server", "host", "") == "127.0.0.1");
+        Check("ini_eq_val", ini.GetString("server", "url", "") == "http://a/b?k=1&m=2");
+        Check("ini_port", ini.GetString("db", "port", "") == "5432");
+    }
+
+    static void TestPillar2Formats() {
+        // 1. MsgPack roundtrip + IsoFromUnixNanos
+        JsonValue root = JsonValue.NewObject();
+        root.Put("name", JsonValue.NewStr("zan-wave16"));
+        root.Put("neg", JsonValue.NewInt(-123456));
+        root.Put("big", JsonValue.NewInt(900000000000L));
+        root.Put("pi", JsonValue.NewDouble(3.14159));
+        root.Put("ok", JsonValue.NewBool(true));
+        root.Put("nil", JsonValue.NewNull());
+        JsonValue arr = JsonValue.NewArray();
+        arr.Append(JsonValue.NewInt(1));
+        arr.Append(JsonValue.NewStr("two"));
+        root.Put("arr", arr);
+        byte[] mp = MsgPack.Pack(root);
+        JsonValue dec = MsgPack.Unpack(mp);
+        JsonValue nVal = dec.Get("name");
+        JsonValue negVal = dec.Get("neg");
+        JsonValue bigVal = dec.Get("big");
+        JsonValue arrVal = dec.Get("arr");
+        Check("mp_name", nVal != null && nVal.AsString("") == "zan-wave16");
+        Check("mp_neg", negVal != null && negVal.AsLong(0) == -123456);
+        Check("mp_big", bigVal != null && bigVal.AsLong(0) == 900000000000L);
+        Check("mp_arr", arrVal != null && arrVal.Count() == 2 && arrVal.At(1).AsString("") == "two");
+        Check("mp_iso_epoch", MsgPackReader.IsoFromUnixNanos(0L, 0) == "1970-01-01T00:00:00Z");
+        Check("mp_iso_ms", MsgPackReader.IsoFromUnixNanos(1709251199L, 45000000) == "2024-02-29T23:59:59.045Z");
+        Check("mp_iso_pre1970", MsgPackReader.IsoFromUnixNanos(-86400L, 0) == "1969-12-31T00:00:00Z");
+
+        // 2. ProtoWriter flat + nested BeginMessage/EndMessage
+        ProtoWriter pw = new ProtoWriter();
+        pw.WriteInt32(1, 42);
+        pw.WriteString(2, "hello");
+        pw.BeginMessage(3);
+        pw.WriteInt64(1, 9876543210L);
+        pw.WriteBool(2, true);
+        pw.EndMessage();
+        byte[] pb = pw.ToBytes();
+        ProtoReader pr = new ProtoReader(pb);
+        Check("pb_f1", pr.Next() && pr.FieldNumber() == 1 && pr.ReadInt32() == 42);
+        Check("pb_f2", pr.Next() && pr.FieldNumber() == 2 && pr.ReadString() == "hello");
+        Check("pb_f3", pr.Next() && pr.FieldNumber() == 3);
+        ProtoReader sub = new ProtoReader(pr.ReadMessage());
+        Check("pb_sub1", sub.Next() && sub.FieldNumber() == 1 && sub.ReadInt64() == 9876543210L);
+        Check("pb_sub2", sub.Next() && sub.FieldNumber() == 2 && sub.ReadBool() == true);
+
+        // 3. Csv quoted, escaped quotes, embedded comma/newline
+        List<List<string>> rows = new List<List<string>>();
+        List<string> r1 = new List<string>();
+        r1.Add("id"); r1.Add("note"); r1.Add("tag");
+        rows.Add(r1);
+        List<string> r2 = new List<string>();
+        r2.Add("1"); r2.Add("say \"hi\", ok\nline2"); r2.Add("plain");
+        rows.Add(r2);
+        string csvText = Csv.Serialize(rows);
+        CsvTable parsed = Csv.Parse(csvText);
+        Check("csv_rows", parsed.header.Count == 3 && parsed.rows.Count == 1 && parsed.rows[0].Count == 3);
+        Check("csv_quote_nl", parsed.rows[0][1] == "say \"hi\", ok\nline2");
+
+        // 4. TomlParser: sections, array-of-tables, inline table, numeric underscores, escapes
+        string toml = "# comment\ntitle = \"wave\\t16\"\ncount = 1_000_000\ninline = { a = 1, b = \"two\" }\n[[items]]\nname = \"alpha\"\n[[items]]\nname = \"beta\"\n";
+        JsonValue tj = Toml.Parse(toml);
+        JsonValue tTitle = tj.Get("title");
+        JsonValue tCount = tj.Get("count");
+        JsonValue tInline = tj.Get("inline");
+        JsonValue tInlineB = tInline != null ? tInline.Get("b") : null;
+        JsonValue tItems = tj.Get("items");
+        JsonValue tItem1Name = (tItems != null && tItems.Count() == 2) ? tItems.At(1).Get("name") : null;
+        Check("toml_title", tTitle != null && tTitle.AsString("") == "wave\t16");
+        Check("toml_count", tCount != null && tCount.AsLong(0) == 1000000);
+        Check("toml_inline", tInline != null && tInline.Has("b") && tInlineB != null && tInlineB.AsString("") == "two");
+        Check("toml_items", tItem1Name != null && tItem1Name.AsString("") == "beta");
+
+        // 5. YamlParser: nested map, sequence, flow map/list, comments, CRLF
+        string yaml = "service:\r\n  name: gateway # inline comment\r\n  ports: [80, 443]\r\n  meta: {env: prod, tls: true}\r\n  nodes:\r\n    - n1\r\n    - n2\r\n";
+        JsonValue yj = Yaml.Parse(yaml);
+        JsonValue ySvc = yj.Get("service");
+        JsonValue yName = ySvc != null ? ySvc.Get("name") : null;
+        JsonValue yPorts = ySvc != null ? ySvc.Get("ports") : null;
+        JsonValue yMeta = ySvc != null ? ySvc.Get("meta") : null;
+        JsonValue yEnv = yMeta != null ? yMeta.Get("env") : null;
+        JsonValue yNodes = ySvc != null ? ySvc.Get("nodes") : null;
+        Check("yaml_name", yName != null && yName.AsString("") == "gateway");
+        Check("yaml_ports", yPorts != null && yPorts.Count() == 2 && yPorts.At(1).AsLong(0) == 443);
+        Check("yaml_meta", yEnv != null && yEnv.AsString("") == "prod");
+        Check("yaml_nodes", yNodes != null && yNodes.Count() == 2 && yNodes.At(0).AsString("") == "n1");
+    }
+
+    static void TestPillar3Net() {
+        // 1. HPACK Huffman RFC 7541 Appendix C vectors
+        byte[] h1 = HpackHuffman.Encode("www.example.com");
+        Check("huff_rfc_c41", Hex.Encode(h1, h1.Length) == "f1e3c2e5f23a6ba0ab90f4ff");
+        Check("huff_dec_c41", HpackHuffman.Decode(h1, 0, h1.Length) == "www.example.com");
+        byte[] h2 = HpackHuffman.Encode("no-cache");
+        Check("huff_rfc_c42", Hex.Encode(h2, h2.Length) == "a8eb10649cbf");
+        Check("huff_dec_c42", HpackHuffman.Decode(h2, 0, h2.Length) == "no-cache");
+        byte[] h3 = HpackHuffman.Encode("custom-key");
+        Check("huff_rfc_c43", Hex.Encode(h3, h3.Length) == "25a849e95ba97d7f");
+        Check("huff_dec_c43", HpackHuffman.Decode(h3, 0, h3.Length) == "custom-key");
+
+        // All 255 non-NUL byte values roundtrip
+        byte[] hiBytes = new byte[255];
+        for (int i = 0; i < 255; i = i + 1) { hiBytes[i] = (byte)(i + 1); }
+        string hiStr = hiBytes.ToStr(0, 255);
+        byte[] hiEnc = HpackHuffman.Encode(hiStr);
+        Check("huff_len_match", hiEnc.Length == HpackHuffman.EncodedLength(hiStr));
+        Check("huff_255_rt", HpackHuffman.Decode(hiEnc, 0, hiEnc.Length) == hiStr);
+
+        // Invalid padding (>7 bits 0xFF, non-1 trailing padding) must return null
+        byte[] badPad1 = new byte[] { 255 };
+        Check("huff_bad_pad8", HpackHuffman.Decode(badPad1, 0, 1) == null);
+        byte[] badPad2 = new byte[] { 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 254 };
+        Check("huff_bad_pad0", HpackHuffman.Decode(badPad2, 0, badPad2.Length) == null);
+
+        // 2. HpackStaticTable O(1) lookup
+        int nameIdx = 0;
+        Check("st_exact_post", HpackStaticTable.FindFast(":method", "POST", out nameIdx) == 3 && nameIdx == 2);
+        Check("st_exact_404", HpackStaticTable.FindFast(":status", "404", out nameIdx) == 13 && nameIdx == 8);
+        Check("st_name_only", HpackStaticTable.FindFast(":method", "DELETE", out nameIdx) == 0 && nameIdx == 2);
+        Check("st_miss", HpackStaticTable.FindFast("x-none", "1", out nameIdx) == 0 && nameIdx == 0);
+
+        // 3. HpackContext encode/decode roundtrip (Huffman on, dynamic table reuse)
+        HpackContext encCtx = new HpackContext(4096);
+        HpackContext decCtx = new HpackContext(4096);
+        List<HpackHeader> hdrs = new List<HpackHeader>();
+        hdrs.Add(new HpackHeader(":method", "GET"));
+        hdrs.Add(new HpackHeader(":path", "/api/v2/orders?limit=50"));
+        hdrs.Add(new HpackHeader("x-trace-id", "tr-9876543210-abcdef"));
+        byte[] blk1 = encCtx.EncodeHeaders(hdrs, true);
+        List<HpackHeader> out1 = decCtx.DecodeHeaderBlock(blk1, 0, blk1.Length);
+        Check("hpack_rt1", out1.Count == 3 && out1[1].value == "/api/v2/orders?limit=50" && out1[2].name == "x-trace-id" && out1[2].value == "tr-9876543210-abcdef");
+        byte[] blk2 = encCtx.EncodeHeaders(hdrs, true);
+        List<HpackHeader> out2 = decCtx.DecodeHeaderBlock(blk2, 0, blk2.Length);
+        Check("hpack_rt2_dyn", blk2.Length < blk1.Length && out2.Count == 3 && out2[2].value == "tr-9876543210-abcdef");
+
+        // 4. HttpFramer.IndexOfLf memchr fast path
+        HttpFramer fr = HttpFramer.Create(-1);
+        fr.Prime("GET / HTTP/1.1\r\nHost: x\r\n\r\n", 27);
+        Check("framer_lf1", fr.IndexOfLf(0) == 15);
+        Check("framer_lf2", fr.IndexOfLf(16) == 24);
+        Check("framer_lf3", fr.IndexOfLf(25) == 26);
+        Check("framer_lf_miss", fr.IndexOfLf(27) == -1);
+        fr.Dispose();
+    }
+
+    static void TestPillar4CryptoAndText() {
+        // 1. Keccak256 standard vectors + rate boundaries (135, 136, 137 bytes)
+        Check("keccak_empty", Keccak256.HashHex("") == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+        Check("keccak_abc", Keccak256.HashHex("abc") == "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45");
+        byte[] k135 = new byte[135];
+        byte[] k136 = new byte[136];
+        byte[] k137 = new byte[137];
+        for (int i = 0; i < 137; i = i + 1) {
+            byte v = (byte)(i & 255);
+            if (i < 135) { k135[i] = v; }
+            if (i < 136) { k136[i] = v; }
+            k137[i] = v;
+        }
+        Check("keccak_boundaries", Keccak256.HashHex(k135).Length == 64 && Keccak256.HashHex(k136) != Keccak256.HashHex(k135) && Keccak256.HashHex(k137) != Keccak256.HashHex(k136));
+
+        // 2. Hmac RFC 4231 / RFC 2202 (short key, >64B long key, SHA-256 / SHA-1 / MD5 / SM3)
+        byte[] k1 = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) { k1[i] = 11; } // 0x0b * 20
+        byte[] m1 = Encoding.GetBytes("Hi There");
+        byte[] mac256 = Hmac.Sha256(k1, m1);
+        Check("hmac_sha256_tc1", Hex.Encode(mac256, 32) == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        byte[] macSha1 = Hmac.Sha1(k1, m1);
+        Check("hmac_sha1_tc1", Hex.Encode(macSha1, 20) == "b617318655057264e28bc0b6fb378c8ef146be00");
+        byte[] kMd5 = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { kMd5[i] = 11; } // RFC 2202 TC1: 0x0b * 16
+        byte[] macMd5 = Hmac.Md5(kMd5, m1);
+        Check("hmac_md5_tc1", Hex.Encode(macMd5, 16) == "9294727a3638bb1c13f48ef8158bfc9d");
+        byte[] kLong = new byte[131];
+        for (int i = 0; i < 131; i = i + 1) { kLong[i] = 170; }
+        byte[] mLong = Encoding.GetBytes("Test Using Larger Than Block-Size Key - Hash Key First");
+        byte[] macLong = Hmac.Sha256(kLong, mLong);
+        Check("hmac_sha256_tc6", Hex.Encode(macLong, 32) == "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        byte[] macSm3 = Hmac.Sm3(k1, m1);
+        Check("hmac_sm3_len", macSm3 != null && macSm3.Length == 32);
+
+        // 3. Pinyin BMP LUT + pure ASCII fast path + mixed + Teardown/re-init
+        Check("py_basic", Pinyin.ToPinyin("中文") == "zhongwen");
+        Check("py_init", Pinyin.Initials("中华人民共和国") == "ZHRMGHG");
+        Check("py_mixed", Pinyin.ToPinyin("Zan 语言 v2.0") == "Zan yuyan v2.0");
+        Check("py_ascii_fast", Pinyin.ToPinyin("pure-ascii-123") == "pure-ascii-123");
+        Check("py_ascii_init", Pinyin.Initials("hello world") == "hello world");
+        Check("py_char", Pinyin.ToPinyinChar("编") == "bian" && Pinyin.ToPinyinChar("a") == "");
+        Check("py_lookup", Pinyin.Lookup("程") == "cheng" && Pinyin.Lookup("X") == "");
+        Pinyin.Teardown();
+        Check("py_reinit", Pinyin.ToPinyin("测试") == "ceshi" && Pinyin.Initials("测试") == "CS");
+    }
+
+    static void Main() {
+        TestPillar1IO();
+        TestPillar2Formats();
+        TestPillar3Net();
+        TestPillar4CryptoAndText();
+        HpackHuffman.Teardown();
+        HpackStaticTable.Teardown();
+        Pinyin.Teardown();
+        Console.WriteLine("ALL_OK");
+    }
+}

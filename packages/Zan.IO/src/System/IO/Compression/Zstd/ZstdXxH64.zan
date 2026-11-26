@@ -1,3 +1,6 @@
+using System;
+using System.Numerics;
+
 namespace System.IO.Compression;
 
 // XXH64 —— zstd 帧尾内容校验和用的哈希（XXH64，种子 0，取低 32 位）。
@@ -11,40 +14,42 @@ public class ZstdXxH64 {
     static long P4 = -8796714831421723037;   // 0x85EBCA77C2B2AE63
     static long P5 = 2870177450012600261;    // 0x27D4EB2F165667C5
 
-    // 64 位循环左移。
+    // 64 位循环左移（映射硬件 ROL 指令）。
     static long Rotl(long x, int r) {
-        return (x << r) | (x >>> (64 - r));
+        return BitOperations.RotateLeft(x, r);
     }
 
-    // 读 8 字节（小端）成一个 64 位整数。
+    // 读 8 字节（小端）成一个 64 位整数（完全展开，供 LLVM 合并为单条 64 位 load）。
     static long ReadLE64(byte[] d, int p) {
-        long v = 0;
-        for (int i = 7; i >= 0; i = i - 1) {
-            v = (v << 8) | (d[p + i] & 255);
-        }
-        return v;
+        return ((long)(d[p] & 255))
+            | ((long)(d[p + 1] & 255) << 8)
+            | ((long)(d[p + 2] & 255) << 16)
+            | ((long)(d[p + 3] & 255) << 24)
+            | ((long)(d[p + 4] & 255) << 32)
+            | ((long)(d[p + 5] & 255) << 40)
+            | ((long)(d[p + 6] & 255) << 48)
+            | ((long)(d[p + 7] & 255) << 56);
     }
 
-    // 读 4 字节（小端）成一个 32 位整数。
+    // 读 4 字节（小端）成一个 32 位整数（完全展开）。
     static long ReadLE32(byte[] d, int p) {
-        long v = 0;
-        for (int i = 3; i >= 0; i = i - 1) {
-            v = (v << 8) | (d[p + i] & 255);
-        }
-        return v;
+        return ((long)(d[p] & 255))
+            | ((long)(d[p + 1] & 255) << 8)
+            | ((long)(d[p + 2] & 255) << 16)
+            | ((long)(d[p + 3] & 255) << 24);
     }
 
     // 一步混合（XXH64 的 round）。
     static long Round(long acc, long input) {
         acc = acc + input * ZstdXxH64.P2;
-        acc = ZstdXxH64.Rotl(acc, 31);
+        acc = BitOperations.RotateLeft(acc, 31);
         acc = acc * ZstdXxH64.P1;
         return acc;
     }
 
     // 合并一个累加器（XXH64 的 mergeRound）。
     static long MergeRound(long acc, long val) {
-        val = ZstdXxH64.Round(0, val);
+        val = BitOperations.RotateLeft(val * ZstdXxH64.P2, 31) * ZstdXxH64.P1;
         acc = acc ^ val;
         acc = acc * ZstdXxH64.P1 + ZstdXxH64.P4;
         return acc;
@@ -52,51 +57,90 @@ public class ZstdXxH64 {
 
     // 计算 d[pos, pos+len) 的 XXH64（种子 0）。
     public static long Compute(byte[] d, int pos, int len) {
+        long p1 = ZstdXxH64.P1;
+        long p2 = ZstdXxH64.P2;
+        long p3 = ZstdXxH64.P3;
+        long p4 = ZstdXxH64.P4;
+        long p5 = ZstdXxH64.P5;
         long h;
         int p = pos;
         int end = pos + len;
         if (len >= 32) {
-            long v1 = ZstdXxH64.P1 + ZstdXxH64.P2;
-            long v2 = ZstdXxH64.P2;
+            long v1 = p1 + p2;
+            long v2 = p2;
             long v3 = 0;
-            long v4 = 0 - ZstdXxH64.P1;
+            long v4 = 0 - p1;
             int limit = end - 32;
+            Span<byte> sp = new Span<byte>((nint)d, d.Length);
             while (p <= limit) {
-                v1 = ZstdXxH64.Round(v1, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
-                v2 = ZstdXxH64.Round(v2, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
-                v3 = ZstdXxH64.Round(v3, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
-                v4 = ZstdXxH64.Round(v4, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
+                long k1 = ((long)(sp[p] & 255))
+                    | ((long)(sp[p + 1] & 255) << 8)
+                    | ((long)(sp[p + 2] & 255) << 16)
+                    | ((long)(sp[p + 3] & 255) << 24)
+                    | ((long)(sp[p + 4] & 255) << 32)
+                    | ((long)(sp[p + 5] & 255) << 40)
+                    | ((long)(sp[p + 6] & 255) << 48)
+                    | ((long)(sp[p + 7] & 255) << 56);
+                long k2 = ((long)(sp[p + 8] & 255))
+                    | ((long)(sp[p + 9] & 255) << 8)
+                    | ((long)(sp[p + 10] & 255) << 16)
+                    | ((long)(sp[p + 11] & 255) << 24)
+                    | ((long)(sp[p + 12] & 255) << 32)
+                    | ((long)(sp[p + 13] & 255) << 40)
+                    | ((long)(sp[p + 14] & 255) << 48)
+                    | ((long)(sp[p + 15] & 255) << 56);
+                long k3 = ((long)(sp[p + 16] & 255))
+                    | ((long)(sp[p + 17] & 255) << 8)
+                    | ((long)(sp[p + 18] & 255) << 16)
+                    | ((long)(sp[p + 19] & 255) << 24)
+                    | ((long)(sp[p + 20] & 255) << 32)
+                    | ((long)(sp[p + 21] & 255) << 40)
+                    | ((long)(sp[p + 22] & 255) << 48)
+                    | ((long)(sp[p + 23] & 255) << 56);
+                long k4 = ((long)(sp[p + 24] & 255))
+                    | ((long)(sp[p + 25] & 255) << 8)
+                    | ((long)(sp[p + 26] & 255) << 16)
+                    | ((long)(sp[p + 27] & 255) << 24)
+                    | ((long)(sp[p + 28] & 255) << 32)
+                    | ((long)(sp[p + 29] & 255) << 40)
+                    | ((long)(sp[p + 30] & 255) << 48)
+                    | ((long)(sp[p + 31] & 255) << 56);
+                v1 = BitOperations.RotateLeft(v1 + k1 * p2, 31) * p1;
+                v2 = BitOperations.RotateLeft(v2 + k2 * p2, 31) * p1;
+                v3 = BitOperations.RotateLeft(v3 + k3 * p2, 31) * p1;
+                v4 = BitOperations.RotateLeft(v4 + k4 * p2, 31) * p1;
+                p = p + 32;
             }
-            h = ZstdXxH64.Rotl(v1, 1) + ZstdXxH64.Rotl(v2, 7)
-                + ZstdXxH64.Rotl(v3, 12) + ZstdXxH64.Rotl(v4, 18);
+            h = BitOperations.RotateLeft(v1, 1) + BitOperations.RotateLeft(v2, 7)
+                + BitOperations.RotateLeft(v3, 12) + BitOperations.RotateLeft(v4, 18);
             h = ZstdXxH64.MergeRound(h, v1);
             h = ZstdXxH64.MergeRound(h, v2);
             h = ZstdXxH64.MergeRound(h, v3);
             h = ZstdXxH64.MergeRound(h, v4);
         } else {
-            h = ZstdXxH64.P5;
+            h = p5;
         }
         h = h + len;
         while (end - p >= 8) {
-            long k1 = ZstdXxH64.Round(0, ZstdXxH64.ReadLE64(d, p));
+            long k1 = BitOperations.RotateLeft(ZstdXxH64.ReadLE64(d, p) * p2, 31) * p1;
             h = h ^ k1;
-            h = ZstdXxH64.Rotl(h, 27) * ZstdXxH64.P1 + ZstdXxH64.P4;
+            h = BitOperations.RotateLeft(h, 27) * p1 + p4;
             p = p + 8;
         }
         if (end - p >= 4) {
-            h = h ^ (ZstdXxH64.ReadLE32(d, p) * ZstdXxH64.P1);
-            h = ZstdXxH64.Rotl(h, 23) * ZstdXxH64.P2 + ZstdXxH64.P3;
+            h = h ^ (ZstdXxH64.ReadLE32(d, p) * p1);
+            h = BitOperations.RotateLeft(h, 23) * p2 + p3;
             p = p + 4;
         }
         while (p < end) {
-            h = h ^ ((d[p] & 255) * ZstdXxH64.P5);
-            h = ZstdXxH64.Rotl(h, 11) * ZstdXxH64.P1;
+            h = h ^ ((d[p] & 255) * p5);
+            h = BitOperations.RotateLeft(h, 11) * p1;
             p = p + 1;
         }
         h = h ^ (h >>> 33);
-        h = h * ZstdXxH64.P2;
+        h = h * p2;
         h = h ^ (h >>> 29);
-        h = h * ZstdXxH64.P3;
+        h = h * p3;
         h = h ^ (h >>> 32);
         return h;
     }

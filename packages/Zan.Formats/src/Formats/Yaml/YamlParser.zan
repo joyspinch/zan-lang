@@ -40,17 +40,32 @@ public class YamlParser {
 
     void SplitLines(string src) {
         int lineNo = 1;
-        int lineStart = 0;
-        int i = 0;
         int n = src.Length;
+        nint sp = (nint)src;
+        bool hasCr = n > 0 && NativeMemory.Find(sp, 0, 13, n) >= 0;
+        if (!hasCr) {
+            int lineStart = 0;
+            while (lineStart <= n) {
+                int nl = lineStart < n ? NativeMemory.Find(sp, lineStart, 10, n - lineStart) : -1;
+                int lineEnd = nl < 0 ? n : nl;
+                PushLineSlice(src, lineStart, lineEnd, lineNo);
+                lineNo = lineNo + 1;
+                if (nl < 0) { break; }
+                lineStart = nl + 1;
+            }
+            lineCount = lines.Count;
+            return;
+        }
+        int lineStart2 = 0;
+        int i = 0;
         while (i <= n) {
             int c = i < n ? (src[i] & 255) : 10;
             if (c == 13 || c == 10) {
-                PushLineSlice(src, lineStart, i, lineNo);
+                PushLineSlice(src, lineStart2, i, lineNo);
                 lineNo = lineNo + 1;
                 i = i + 1;
                 if (c == 13 && i < n && (src[i] & 255) == 10) { i = i + 1; }
-                lineStart = i;
+                lineStart2 = i;
             } else {
                 i = i + 1;
             }
@@ -61,16 +76,20 @@ public class YamlParser {
     void PushLineSlice(string src, int lineStart, int lineEnd, int lineNo) {
         int ind = lineStart;
         while (ind < lineEnd && (src[ind] & 255) == 32) { ind = ind + 1; }
-        bool blank = true;
-        int k = ind;
-        while (k < lineEnd) {
-            int c = src[k] & 255;
-            if (c != 32 && c != 9) { blank = false; break; }
-            k = k + 1;
+        if (ind == lineEnd) {
+            lines.Add(new YamlLine(ind - lineStart, "", lineNo));
+            return;
         }
-        if (ind < lineEnd && (src[ind] & 255) == 9 && !blank) {
-            throw new YamlException("tab indentation is not allowed (line "
-                + Convert.ToString(lineNo) + ")");
+        if ((src[ind] & 255) == 9) {
+            int k = ind + 1;
+            while (k < lineEnd) {
+                int c = src[k] & 255;
+                if (c != 32 && c != 9) {
+                    throw new YamlException("tab indentation is not allowed (line "
+                        + Convert.ToString(lineNo) + ")");
+                }
+                k = k + 1;
+            }
         }
         lines.Add(new YamlLine(ind - lineStart, src.Substring(ind, lineEnd - ind), lineNo));
     }
@@ -212,7 +231,10 @@ public class YamlParser {
                 throw new YamlException("duplicate key '" + key + "' (line "
                     + Convert.ToString(lastLineNo) + ")");
             }
-            obj.Put(key, val);
+            int kidx = obj.keys.Count;
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            if (obj.keyIndex != null) { obj.keyIndex[key] = kidx; }
         }
         return obj;
     }
@@ -221,6 +243,7 @@ public class YamlParser {
 
     JsonValue ParseSeq(int indent, int depth) {
         JsonValue arr = JsonValue.NewArray();
+        List<JsonValue> items = arr.items;
         while (true) {
             SkipIgnorable();
             if (AtDocMarker()) { break; }
@@ -236,7 +259,7 @@ public class YamlParser {
                 Advance();
                 JsonValue child = ParseBlock(indent + 1, depth + 1);
                 if (child == null) { child = JsonValue.NewNull(); }
-                arr.Append(child);
+                items.Add(child);
                 continue;
             }
             int sp = 1;
@@ -248,12 +271,12 @@ public class YamlParser {
                 // "- "（短横后仅空格）等价 "-" 单独成行：null 项。
                 // rest 为空串时取 rest[0] 会越界（运行时致命报告）。
                 Advance();
-                arr.Append(JsonValue.NewNull());
+                items.Add(JsonValue.NewNull());
                 continue;
             }
             if (rest[0] == 124 || rest[0] == 62) {  // "- |" 块标量
                 Advance();
-                arr.Append(ReadBlockScalar(rest, indent));
+                items.Add(ReadBlockScalar(rest, indent));
                 continue;
             }
             // 压缩形式：把剩余内容回灌为 contentCol 列的虚拟行。
@@ -261,7 +284,7 @@ public class YamlParser {
             lines[cur].text = rest;
             JsonValue item = ParseBlock(contentCol, depth + 1);
             if (item == null) { item = JsonValue.NewNull(); }
-            arr.Append(item);
+            items.Add(item);
         }
         return arr;
     }
@@ -306,10 +329,11 @@ public class YamlParser {
         int n = rest.Length;
         while (b < n && (rest[b] & 255) == 32) { b = b + 1; }
         if (b >= n) { return JsonValue.NewNull(); }
-        int c = rest[b] & 255;
-        if (c == 34) { return JsonValue.NewStr(DecodeDoubleQuoted(rest.Substring(b))); }
-        if (c == 39) { return JsonValue.NewStr(DecodeSingleQuoted(rest.Substring(b))); }
-        return TypeScalar(StripComment(rest.Substring(b)));
+        string sub = b == 0 ? rest : rest.Substring(b);
+        int c = sub[0] & 255;
+        if (c == 34) { return JsonValue.NewStr(DecodeDoubleQuoted(sub)); }
+        if (c == 39) { return JsonValue.NewStr(DecodeSingleQuoted(sub)); }
+        return TypeScalar(StripComment(sub));
     }
 
     // ===== 锚点/别名 =====
@@ -472,13 +496,14 @@ public class YamlParser {
         if (c == 91) {  // [ 数组
             at = at + 1;
             JsonValue arr = JsonValue.NewArray();
+            List<JsonValue> items = arr.items;
             while (true) {
                 SkipFlowSpace(s, ref at);
                 if (at >= s.Length) {
                     throw new YamlException("unterminated flow sequence");
                 }
                 if ((s[at] & 255) == 93) { at = at + 1; break; }
-                arr.Append(FlowValue(s, ref at, depth + 1));
+                items.Add(FlowValue(s, ref at, depth + 1));
                 SkipFlowSpace(s, ref at);
                 if (at < s.Length && (s[at] & 255) == 44) { at = at + 1; continue; }
                 if (at < s.Length && (s[at] & 255) == 93) { at = at + 1; break; }
@@ -510,7 +535,10 @@ public class YamlParser {
                     throw new YamlException("duplicate key '" + key
                         + "' in flow mapping");
                 }
-                obj.Put(key, vv);
+                int kidx = obj.keys.Count;
+                obj.keys.Add(key);
+                obj.vals.Add(vv);
+                if (obj.keyIndex != null) { obj.keyIndex[key] = kidx; }
                 SkipFlowSpace(s, ref at);
                 if (at < s.Length && (s[at] & 255) == 44) { at = at + 1; continue; }
                 if (at < s.Length && (s[at] & 255) == 125) { at = at + 1; break; }
@@ -538,56 +566,71 @@ public class YamlParser {
         return anchors[name];
     }
 
-    // 流式标量：引号串完整解码；plain 到 , ] } 或 ': ' 止。
+    // 流式标量：引号串完整解码（无转义快路径零 StringBuilder）；plain 到 , ] } 或 ': ' 止。
     JsonValue FlowScalar(string s, ref int at) {
         int c = s[at] & 255;
         if (c == 34) {  // 双引
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = null;
             at = at + 1;
             int chunkStart = at;
             int n = s.Length;
+            nint sp = (nint)s;
             while (at < n) {
                 int ch = s[at] & 255;
                 if (ch == 92) {
-                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
+                    if (sb == null) { sb = new StringBuilder(); }
+                    if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
                     at = at + 1;
                     ReadEscape(s, ref at, sb);
                     chunkStart = at;
                     continue;
                 }
                 if (ch == 34) {
-                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
+                    if (sb == null) {
+                        string direct = s.Substring(chunkStart, at - chunkStart);
+                        at = at + 1;
+                        return JsonValue.NewStr(direct);
+                    }
+                    if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
                     at = at + 1;
-                    chunkStart = at;
-                    break;
+                    return JsonValue.NewStr(sb.ToString());
                 }
                 at = at + 1;
             }
-            if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
+            if (sb == null) { return JsonValue.NewStr(s.Substring(chunkStart, at - chunkStart)); }
+            if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
             return JsonValue.NewStr(sb.ToString());
         }
         if (c == 39) {  // 单引
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = null;
             at = at + 1;
             int chunkStart = at;
             int n = s.Length;
+            nint sp = (nint)s;
             while (at < n) {
                 int ch = s[at] & 255;
                 if (ch == 39) {
-                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
                     if (at + 1 < n && (s[at + 1] & 255) == 39) {
+                        if (sb == null) { sb = new StringBuilder(); }
+                        if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
                         sb.Append("'");
                         at = at + 2;
                         chunkStart = at;
                         continue;
                     }
+                    if (sb == null) {
+                        string direct = s.Substring(chunkStart, at - chunkStart);
+                        at = at + 1;
+                        return JsonValue.NewStr(direct);
+                    }
+                    if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
                     at = at + 1;
-                    chunkStart = at;
-                    break;
+                    return JsonValue.NewStr(sb.ToString());
                 }
                 at = at + 1;
             }
-            if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
+            if (sb == null) { return JsonValue.NewStr(s.Substring(chunkStart, at - chunkStart)); }
+            if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
             return JsonValue.NewStr(sb.ToString());
         }
         int start = at;
@@ -600,10 +643,9 @@ public class YamlParser {
             }
             at = at + 1;
         }
-        string text = s.Substring(start, at - start);
-        int e = text.Length;
-        while (e > 0 && (text[e - 1] & 255) == 32) { e = e - 1; }
-        return TypeScalar(text.Substring(0, e));
+        int e = at;
+        while (e > start && (s[e - 1] & 255) == 32) { e = e - 1; }
+        return TypeScalar(s.Substring(start, e - start));
     }
 
     void SkipFlowSpace(string s, ref int at) {
@@ -658,18 +700,21 @@ public class YamlParser {
         return t.Length >= 2 && t[0] == 45 && t[1] == 32;
     }
 
-    // plain 标量去 ` #` 注释（引号内的 # 不算——plain 无引号，
-    // 只需找"空格+#"）。
+    // plain 标量去 ` #` 注释（memchr 直跳 `#`，无 `#` 零扫描开销）。
     string StripComment(string s) {
-        int i = 0;
         int n = s.Length;
-        while (i < n) {
-            if ((s[i] & 255) == 35 && i > 0 && (s[i - 1] & 255) == 32) {
-                int e = i;
+        if (n < 2) { return s; }
+        nint sp = (nint)s;
+        int pos = 1;
+        while (pos < n) {
+            int hit = NativeMemory.Find(sp, pos, 35, n - pos);
+            if (hit < 0) { return s; }
+            if ((s[hit - 1] & 255) == 32) {
+                int e = hit;
                 while (e > 0 && (s[e - 1] & 255) == 32) { e = e - 1; }
                 return s.Substring(0, e);
             }
-            i = i + 1;
+            pos = hit + 1;
         }
         return s;
     }

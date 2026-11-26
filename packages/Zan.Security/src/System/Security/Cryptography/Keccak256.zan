@@ -45,55 +45,124 @@ public class Keccak256 {
         18,  2, 61, 56, 14
     };
 
-    // 64 位循环左移（直接映射至硬件 ROL 机器指令）
-    private static long rotl(long x, int n) {
-        if (n == 0) { return x; }
-        return BitOperations.RotateLeft(x, n);
+    // 64 位小端读取（8 字节展开，LLVM 后端自动合并为单条 64 位非对齐加载指令）
+    private static long ReadLE64(byte[] data, int off) {
+        return ((long)(data[off] & 255))
+            | (((long)(data[off + 1] & 255)) << 8)
+            | (((long)(data[off + 2] & 255)) << 16)
+            | (((long)(data[off + 3] & 255)) << 24)
+            | (((long)(data[off + 4] & 255)) << 32)
+            | (((long)(data[off + 5] & 255)) << 40)
+            | (((long)(data[off + 6] & 255)) << 48)
+            | (((long)(data[off + 7] & 255)) << 56);
     }
 
-    // Keccak-f[1600] 置换核心函数（24 轮）
+    // 64 位小端写出（8 字节展开）
+    private static void WriteLE64(byte[] dst, int off, long w) {
+        dst[off]     = (byte)(w & 255);
+        dst[off + 1] = (byte)((w >> 8) & 255);
+        dst[off + 2] = (byte)((w >> 16) & 255);
+        dst[off + 3] = (byte)((w >> 24) & 255);
+        dst[off + 4] = (byte)((w >> 32) & 255);
+        dst[off + 5] = (byte)((w >> 40) & 255);
+        dst[off + 6] = (byte)((w >> 48) & 255);
+        dst[off + 7] = (byte)((w >> 56) & 255);
+    }
+
+    // Keccak-f[1600] 置换核心函数（24 轮，25 个 64 位状态全部寄存器常驻，零堆分配、零取模）
     private static void permute(long[] st) {
-        long[] c = new long[5];
-        long[] d = new long[5];
-        long[] b = new long[25];
+        long[] rc = RC;
+        long a0  = st[0];  long a1  = st[1];  long a2  = st[2];  long a3  = st[3];  long a4  = st[4];
+        long a5  = st[5];  long a6  = st[6];  long a7  = st[7];  long a8  = st[8];  long a9  = st[9];
+        long a10 = st[10]; long a11 = st[11]; long a12 = st[12]; long a13 = st[13]; long a14 = st[14];
+        long a15 = st[15]; long a16 = st[16]; long a17 = st[17]; long a18 = st[18]; long a19 = st[19];
+        long a20 = st[20]; long a21 = st[21]; long a22 = st[22]; long a23 = st[23]; long a24 = st[24];
 
         for (int round = 0; round < 24; round = round + 1) {
             // 1. Theta 步骤
-            for (int x = 0; x < 5; x = x + 1) {
-                c[x] = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
-            }
-            for (int x = 0; x < 5; x = x + 1) {
-                long cPrev = c[(x + 4) % 5];
-                long cNext = c[(x + 1) % 5];
-                d[x] = cPrev ^ rotl(cNext, 1);
-            }
-            for (int i = 0; i < 25; i = i + 1) {
-                st[i] = st[i] ^ d[i % 5];
-            }
+            long c0 = a0 ^ a5 ^ a10 ^ a15 ^ a20;
+            long c1 = a1 ^ a6 ^ a11 ^ a16 ^ a21;
+            long c2 = a2 ^ a7 ^ a12 ^ a17 ^ a22;
+            long c3 = a3 ^ a8 ^ a13 ^ a18 ^ a23;
+            long c4 = a4 ^ a9 ^ a14 ^ a19 ^ a24;
 
-            // 2 & 3. Rho & Pi 步骤
-            for (int x = 0; x < 5; x = x + 1) {
-                for (int y = 0; y < 5; y = y + 1) {
-                    int src = x + 5 * y;
-                    int dst = y + 5 * ((2 * x + 3 * y) % 5);
-                    b[dst] = rotl(st[src], RHO[src]);
-                }
-            }
+            long d0 = c4 ^ BitOperations.RotateLeft(c1, 1);
+            long d1 = c0 ^ BitOperations.RotateLeft(c2, 1);
+            long d2 = c1 ^ BitOperations.RotateLeft(c3, 1);
+            long d3 = c2 ^ BitOperations.RotateLeft(c4, 1);
+            long d4 = c3 ^ BitOperations.RotateLeft(c0, 1);
 
-            // 4. Chi 步骤
-            for (int y = 0; y < 5; y = y + 1) {
-                int row = 5 * y;
-                for (int x = 0; x < 5; x = x + 1) {
-                    st[row + x] = b[row + x] ^ ((~b[row + ((x + 1) % 5)]) & b[row + ((x + 2) % 5)]);
-                }
-            }
+            // 2 & 3. Theta-XOR + Rho + Pi 融合步骤（常量旋转位数直出硬件 ROL）
+            long b0  = a0 ^ d0;
+            long b10 = BitOperations.RotateLeft(a1 ^ d1, 1);
+            long b20 = BitOperations.RotateLeft(a2 ^ d2, 62);
+            long b5  = BitOperations.RotateLeft(a3 ^ d3, 28);
+            long b15 = BitOperations.RotateLeft(a4 ^ d4, 27);
 
-            // 5. Iota 步骤
-            st[0] = st[0] ^ RC[round];
+            long b16 = BitOperations.RotateLeft(a5 ^ d0, 36);
+            long b1  = BitOperations.RotateLeft(a6 ^ d1, 44);
+            long b11 = BitOperations.RotateLeft(a7 ^ d2, 6);
+            long b21 = BitOperations.RotateLeft(a8 ^ d3, 55);
+            long b6  = BitOperations.RotateLeft(a9 ^ d4, 20);
+
+            long b7  = BitOperations.RotateLeft(a10 ^ d0, 3);
+            long b17 = BitOperations.RotateLeft(a11 ^ d1, 10);
+            long b2  = BitOperations.RotateLeft(a12 ^ d2, 43);
+            long b12 = BitOperations.RotateLeft(a13 ^ d3, 25);
+            long b22 = BitOperations.RotateLeft(a14 ^ d4, 39);
+
+            long b23 = BitOperations.RotateLeft(a15 ^ d0, 41);
+            long b8  = BitOperations.RotateLeft(a16 ^ d1, 45);
+            long b18 = BitOperations.RotateLeft(a17 ^ d2, 15);
+            long b3  = BitOperations.RotateLeft(a18 ^ d3, 21);
+            long b13 = BitOperations.RotateLeft(a19 ^ d4, 8);
+
+            long b14 = BitOperations.RotateLeft(a20 ^ d0, 18);
+            long b24 = BitOperations.RotateLeft(a21 ^ d1, 2);
+            long b9  = BitOperations.RotateLeft(a22 ^ d2, 61);
+            long b19 = BitOperations.RotateLeft(a23 ^ d3, 56);
+            long b4  = BitOperations.RotateLeft(a24 ^ d4, 14);
+
+            // 4 & 5. Chi + Iota 融合步骤
+            a0  = b0  ^ ((~b1)  & b2)  ^ rc[round];
+            a1  = b1  ^ ((~b2)  & b3);
+            a2  = b2  ^ ((~b3)  & b4);
+            a3  = b3  ^ ((~b4)  & b0);
+            a4  = b4  ^ ((~b0)  & b1);
+
+            a5  = b5  ^ ((~b6)  & b7);
+            a6  = b6  ^ ((~b7)  & b8);
+            a7  = b7  ^ ((~b8)  & b9);
+            a8  = b8  ^ ((~b9)  & b5);
+            a9  = b9  ^ ((~b5)  & b6);
+
+            a10 = b10 ^ ((~b11) & b12);
+            a11 = b11 ^ ((~b12) & b13);
+            a12 = b12 ^ ((~b13) & b14);
+            a13 = b13 ^ ((~b14) & b10);
+            a14 = b14 ^ ((~b10) & b11);
+
+            a15 = b15 ^ ((~b16) & b17);
+            a16 = b16 ^ ((~b17) & b18);
+            a17 = b17 ^ ((~b18) & b19);
+            a18 = b18 ^ ((~b19) & b15);
+            a19 = b19 ^ ((~b15) & b16);
+
+            a20 = b20 ^ ((~b21) & b22);
+            a21 = b21 ^ ((~b22) & b23);
+            a22 = b22 ^ ((~b23) & b24);
+            a23 = b23 ^ ((~b24) & b20);
+            a24 = b24 ^ ((~b20) & b21);
         }
+
+        st[0]  = a0;  st[1]  = a1;  st[2]  = a2;  st[3]  = a3;  st[4]  = a4;
+        st[5]  = a5;  st[6]  = a6;  st[7]  = a7;  st[8]  = a8;  st[9]  = a9;
+        st[10] = a10; st[11] = a11; st[12] = a12; st[13] = a13; st[14] = a14;
+        st[15] = a15; st[16] = a16; st[17] = a17; st[18] = a18; st[19] = a19;
+        st[20] = a20; st[21] = a21; st[22] = a22; st[23] = a23; st[24] = a24;
     }
 
-    // 计算字节数组的前 len 字节的 Keccak-256 散列，输出 32 字节摘要
+    // 计算字节数组的前 len 字节的 Keccak-256 散列，输出 32 字节摘要（流式零整块拷贝吸收）
     public static byte[] Hash(byte[] data, int len) {
         if (data == null || len < 0) { return new byte[32]; }
         if (len > data.Length) { len = data.Length; }
@@ -101,43 +170,63 @@ public class Keccak256 {
         int rate = 136; // 1088 位 = 136 字节
         long[] st = new long[25];
 
-        int blockCount = (len / rate) + 1;
-        int totalPadded = blockCount * rate;
-        byte[] padded = new byte[totalPadded];
-
-        // 复制原始数据
-        for (int i = 0; i < len; i = i + 1) {
-            padded[i] = data[i];
-        }
-
-        // Keccak 填充：0x01 ... 0x80
-        padded[len] = (byte)(padded[len] ^ 1);
-        padded[totalPadded - 1] = (byte)(padded[totalPadded - 1] ^ 128);
-
-        // 按 136 字节块逐块吸收 (Absorb)
-        for (int blk = 0; blk < blockCount; blk = blk + 1) {
-            int offset = blk * rate;
-            for (int i = 0; i < 17; i = i + 1) {
-                int pos = offset + i * 8;
-                long w = 0;
-                for (int j = 0; j < 8; j = j + 1) {
-                    long byteVal = (long)(padded[pos + j] & 255);
-                    w = w | (byteVal << (j * 8));
-                }
-                st[i] = st[i] ^ w;
-            }
+        // 1. 直接流式吸收完整 136 字节块（免除整块输入拷贝）
+        int offset = 0;
+        while (offset + rate <= len) {
+            st[0]  = st[0]  ^ ReadLE64(data, offset);
+            st[1]  = st[1]  ^ ReadLE64(data, offset + 8);
+            st[2]  = st[2]  ^ ReadLE64(data, offset + 16);
+            st[3]  = st[3]  ^ ReadLE64(data, offset + 24);
+            st[4]  = st[4]  ^ ReadLE64(data, offset + 32);
+            st[5]  = st[5]  ^ ReadLE64(data, offset + 40);
+            st[6]  = st[6]  ^ ReadLE64(data, offset + 48);
+            st[7]  = st[7]  ^ ReadLE64(data, offset + 56);
+            st[8]  = st[8]  ^ ReadLE64(data, offset + 64);
+            st[9]  = st[9]  ^ ReadLE64(data, offset + 72);
+            st[10] = st[10] ^ ReadLE64(data, offset + 80);
+            st[11] = st[11] ^ ReadLE64(data, offset + 88);
+            st[12] = st[12] ^ ReadLE64(data, offset + 96);
+            st[13] = st[13] ^ ReadLE64(data, offset + 104);
+            st[14] = st[14] ^ ReadLE64(data, offset + 112);
+            st[15] = st[15] ^ ReadLE64(data, offset + 120);
+            st[16] = st[16] ^ ReadLE64(data, offset + 128);
             permute(st);
+            offset = offset + rate;
         }
 
-        // 挤压输出前 32 字节 (Squeeze)
-        byte[] output = new byte[32];
-        for (int i = 0; i < 4; i = i + 1) {
-            long w = st[i];
-            int pos = i * 8;
-            for (int j = 0; j < 8; j = j + 1) {
-                output[pos + j] = (byte)((w >> (j * 8)) & 255);
-            }
+        // 2. 仅对尾块构造 136 字节 Keccak pad10*1 填充：0x01 ... 0x80
+        byte[] tail = new byte[136];
+        int rem = len - offset;
+        if (rem > 0) {
+            NativeMemory.Copy((nint)tail, (nint)data + (nint)offset, rem);
         }
+        tail[rem] = (byte)(tail[rem] ^ 1);
+        tail[135] = (byte)(tail[135] ^ 128);
+        st[0]  = st[0]  ^ ReadLE64(tail, 0);
+        st[1]  = st[1]  ^ ReadLE64(tail, 8);
+        st[2]  = st[2]  ^ ReadLE64(tail, 16);
+        st[3]  = st[3]  ^ ReadLE64(tail, 24);
+        st[4]  = st[4]  ^ ReadLE64(tail, 32);
+        st[5]  = st[5]  ^ ReadLE64(tail, 40);
+        st[6]  = st[6]  ^ ReadLE64(tail, 48);
+        st[7]  = st[7]  ^ ReadLE64(tail, 56);
+        st[8]  = st[8]  ^ ReadLE64(tail, 64);
+        st[9]  = st[9]  ^ ReadLE64(tail, 72);
+        st[10] = st[10] ^ ReadLE64(tail, 80);
+        st[11] = st[11] ^ ReadLE64(tail, 88);
+        st[12] = st[12] ^ ReadLE64(tail, 96);
+        st[13] = st[13] ^ ReadLE64(tail, 104);
+        st[14] = st[14] ^ ReadLE64(tail, 112);
+        st[15] = st[15] ^ ReadLE64(tail, 120);
+        st[16] = st[16] ^ ReadLE64(tail, 128);
+        permute(st);
+
+        // 3. 挤压输出前 32 字节 (Squeeze)
+        byte[] output = new byte[32];
+        WriteLE64(output, 0, st[0]);
+        WriteLE64(output, 8, st[1]);
+        WriteLE64(output, 16, st[2]);
+        WriteLE64(output, 24, st[3]);
 
         return output;
     }

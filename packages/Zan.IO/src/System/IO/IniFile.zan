@@ -12,37 +12,60 @@ public class IniFile {
 
     public IniFile() {}
 
-    // 将给定文本解析为内存中的 INI。
+    private static bool IsTrimWs(int c) {
+        return c == 32 || (c >= 9 && c <= 13);
+    }
+
+    // 将给定文本解析为内存中的 INI（零 SplitLines / 零逐行临时串，memchr 按行直扫）。
     public static IniFile Parse(string text) {
         IniFile ini = new IniFile();
+        if (text == null || text.Length == 0) { return ini; }
         IniSection cur = null;
-        List<string> lines = IniFile.SplitLines(text);
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i].Trim();
-            if (line.Length > 0) {
-                int head = line[0] & 255;
-                if (head == 59 || head == 35) {
-                    // 注释 (';' or '#')
-                } else if (head == 91) {  // '['
-                    int close = line.IndexOf("]", 1);
-                    if (close > 1) {
+        int len = text.Length;
+        nint tPtr = (nint)text;
+        Span<byte> tbuf = new Span<byte>(tPtr, len);
+        int pos = 0;
+        while (pos < len) {
+            int nl = NativeMemory.Find(tPtr, pos, 10, len - pos);
+            int lineEnd = nl < 0 ? len : nl;
+            int s = pos;
+            int e = lineEnd;
+            pos = nl < 0 ? len : nl + 1;
+            while (s < e && IniFile.IsTrimWs(tbuf[s] & 255)) { s = s + 1; }
+            while (e > s && IniFile.IsTrimWs(tbuf[e - 1] & 255)) { e = e - 1; }
+            if (s >= e) { continue; }
+            int head = tbuf[s] & 255;
+            if (head == 59 || head == 35) {
+                // 注释 (';' or '#')
+            } else if (head == 91) {  // '['
+                int close = NativeMemory.Find(tPtr, s + 1, 93, e - (s + 1));
+                if (close > s + 1) {
+                    int ns = s + 1;
+                    int ne = close;
+                    while (ns < ne && IniFile.IsTrimWs(tbuf[ns] & 255)) { ns = ns + 1; }
+                    while (ne > ns && IniFile.IsTrimWs(tbuf[ne - 1] & 255)) { ne = ne - 1; }
+                    cur = new IniSection();
+                    cur.name = ns < ne ? NativeMemory.GetString(tPtr, ns, ne - ns) : "";
+                    ini.sections.Add(cur);
+                }
+            } else {
+                int eq = NativeMemory.Find(tPtr, s, 61, e - s);
+                if (eq > s) {
+                    int ks = s;
+                    int ke = eq;
+                    while (ke > ks && IniFile.IsTrimWs(tbuf[ke - 1] & 255)) { ke = ke - 1; }
+                    int vs = eq + 1;
+                    int ve = e;
+                    while (vs < ve && IniFile.IsTrimWs(tbuf[vs] & 255)) { vs = vs + 1; }
+                    IniEntry entry = new IniEntry();
+                    entry.key = ks < ke ? NativeMemory.GetString(tPtr, ks, ke - ks) : "";
+                    entry.text = vs < ve ? NativeMemory.GetString(tPtr, vs, ve - vs) : "";
+                    if (cur == null) {
                         cur = new IniSection();
-                        cur.name = line.Substring(1, close - 1).Trim();
+                        cur.name = "";
                         ini.sections.Add(cur);
                     }
-                } else {
-                    int eq = line.IndexOf("=", 0);
-                    if (eq > 0) {
-                        IniEntry e = new IniEntry();
-                        e.key = line.Substring(0, eq).Trim();
-                        e.text = line.Substring(eq + 1, line.Length - eq - 1).Trim();
-                        if (cur == null) {
-                            cur = new IniSection();
-                            cur.name = "";
-                            ini.sections.Add(cur);
-                        }
-                        cur.entries.Add(e);
-                    }
+                    cur.entries.Add(entry);
                 }
             }
         }

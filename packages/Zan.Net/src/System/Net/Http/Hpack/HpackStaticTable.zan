@@ -6,6 +6,7 @@ namespace System.Net.Http.Hpack;
 // RFC 7541 附录 A: HPACK 静态表（61 个预定义头部字段，索引 1..61）。
 public class HpackStaticTable {
     private static List<HpackHeader> entries;
+    private static Dictionary<string, int> firstByName;
 
     private static void EnsureInit() {
         if (entries != null) { return; }
@@ -73,6 +74,12 @@ public class HpackStaticTable {
         list.Add(new HpackHeader("vary", ""));
         list.Add(new HpackHeader("via", ""));
         list.Add(new HpackHeader("www-authenticate", ""));
+        Dictionary<string, int> idxMap = new Dictionary<string, int>();
+        for (int i = 1; i <= 61; i = i + 1) {
+            string n = list[i].name;
+            if (!idxMap.ContainsKey(n)) { idxMap[n] = i; }
+        }
+        firstByName = idxMap;
         entries = list;
     }
 
@@ -88,24 +95,35 @@ public class HpackStaticTable {
         return entries[index];
     }
 
+    // O(1) 名称定位的零分配静态表查询（outNameIdx 输出首个名称匹配索引，0 表示未命中）。
+    public static int FindFast(string name, string value, out int outNameIdx) {
+        EnsureInit();
+        int first = 0;
+        if (!firstByName.TryGetValue(name, first)) {
+            outNameIdx = 0;
+            return 0;
+        }
+        // RFC 7541 静态表中同名条目（:method/:path/:scheme/:status）均为连续区间
+        for (int i = first; i <= 61; i = i + 1) {
+            HpackHeader e = entries[i];
+            if (e.name != name) { break; }
+            if (e.value == value) {
+                outNameIdx = first;
+                return i;
+            }
+        }
+        outNameIdx = first;
+        return 0;
+    }
+
     // 在静态表中查找匹配条目：
     // 若完全匹配（name 与 value 均相同），返回该索引（1..61）；
     // 若仅 name 匹配，outNameIndex[0] 记录该索引并继续查找是否有完全匹配；
     // 最终无完全匹配时返回 0。
     public static int Find(string name, string value, List<int> outNameIndex) {
-        EnsureInit();
         int nameMatch = 0;
-        for (int i = 1; i <= 61; i = i + 1) {
-            HpackHeader e = entries[i];
-            if (e.name == name) {
-                if (e.value == value) {
-                    return i; // 找到完全匹配
-                }
-                if (nameMatch == 0) {
-                    nameMatch = i; // 记录第一个 name 匹配
-                }
-            }
-        }
+        int exact = FindFast(name, value, out nameMatch);
+        if (exact > 0) { return exact; }
         if (outNameIndex != null && nameMatch > 0) {
             outNameIndex.Add(nameMatch);
         }
@@ -114,6 +132,10 @@ public class HpackStaticTable {
 
     // 拆卸静态表缓存，防止常驻静态根阻断进程退出泄漏探测。
     public static void Teardown() {
+        if (firstByName != null) {
+            firstByName.Clear();
+            firstByName = null;
+        }
         if (entries != null) {
             entries.Clear();
             entries = null;
