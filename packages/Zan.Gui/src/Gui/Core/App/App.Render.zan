@@ -23,6 +23,32 @@ public partial class App {
             if (!this.ContinuePreparedFrame()) { return; }
         }
     }
+    bool HasActiveFxOverlays() {
+        if (this.HasOverlays() || retainedLayerWindows != null || retainedLayerQueue != null
+            || tooltipActiveLastFrame) { return true; }
+        List<AppHookFn> presentTails = App.PresentTails();
+        return presentTails != null && presentTails.Count > 0;
+    }
+    void RenderFxOverlays() {
+        if (!this.ContinuePreparedFrame()) { return; }
+        RunOverlays();
+        if (!this.ContinuePreparedFrame()) { return; }
+        if (tooltipActiveLastFrame && fxTooltipText != null && fxTooltipText != "") {
+            this.MarkNativeOccluderPass();
+            Widget.Tooltip.RenderAt(this, fxTooltipX, fxTooltipY, fxTooltipText, fxTooltipPlace, fxTooltipMaxW);
+        }
+        if (!this.ContinuePreparedFrame()) { return; }
+        List<AppHookFn> presentTails = App.PresentTails();
+        if (presentTails != null) {
+            for (int i = 0; i < presentTails.Count; i = i + 1) {
+                if (!this.ContinuePreparedFrame()) { return; }
+                this.MarkNativeOccluderPass();
+                presentTails[i](this);
+                if (!this.ContinuePreparedFrame()) { return; }
+            }
+        }
+        NativeLayer.Flush(this);
+    }
     void PresentFrame() {
         this.TraceFullPresent(21, true);
         if (!this.ContinuePreparedFrame()) {
@@ -32,6 +58,63 @@ public partial class App {
         if (window.GetHandle() == 0) { this.EndOffscreenFrame(); return; }
         int perfT0 = 0;
         if (App.PerfOn()) { perfT0 = Window.RawTickMs(); }
+        this.TraceFullPresent(25, true);
+        if (this.FxActive()) {
+            if (!drawerOpaquePartial) {
+                Canvas fc = canvas;
+                int fxNow = Window.GetTickMs();
+                if (Damage.partialFrame) {
+                    // 只有损伤条带被重绘（因此那里是合成前的根表面像素），
+                    // 裁剪仍然生效：以上一整帧的相位重新合成背景特效，
+                    // 只覆盖该条带，其余像素保持已合成的状态。
+                    if (fxSnapValid) {
+                        // 只把页面条带的干净像素补进整窗快照。条带即使超过
+                        // 半窗也必须补齐，否则下一拍恢复会抹掉新页面内容。
+                        fc.SnapshotPatchRect(Damage.presentX, Damage.presentY, Damage.presentW,
+                                             Damage.presentH, App.FxSnapSlot());
+                    }
+                    this.PaintBackdropFx(fxFrameMs);
+                    BackdropFx.TakeDamage();
+                    if (!fxPagePending) {
+                        fxDamage = null;
+                        fxTouched = null;
+                        fxTouchedFull = false;
+                        if (fxNextMs < 0 || fxNow >= fxNextMs) { fxNextMs = fxNow; }
+                    }
+                } else {
+                    bool burst = lastFullFrameMs > 0
+                        && fxNow - lastFullFrameMs < 120;
+                    if (burst) {
+                        fxSnapValid = false;
+                        fxDamage = null;
+                        fxTouched = null;
+                        fxTouchedFull = false;
+                        this.ScheduleFxFrame();
+                    } else {
+                        fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
+                                        App.FxSnapSlot());
+                        fxSnapValid = true;
+                        if (frameDiagnostics != null) { frameDiagnostics.Snapshot(); }
+                    }
+                    this.PaintBackdropFx(fxNow);
+                    if (!burst) {
+                        fxDamage = BackdropFx.TakeDamage();
+                        fxTouched = fxDamage;
+                        fxTouchedFull = fxDamage.Count / 4 > 1024;
+                        this.ScheduleFxFrame();
+                    } else {
+                        BackdropFx.TakeDamage();
+                    }
+                    fxFrameMs = fxNow;
+                    if (!window.IsVisible()) { fxNextMs = -1; }
+                }
+            }
+        } else {
+            fxNextMs = -1;
+        }
+        int perfT1 = 0;
+        if (App.PerfOn()) { perfT1 = Window.RawTickMs(); }
+        this.TraceFullPresent(25, false);
         this.TraceFullPresent(23, true);
         this.RenderFrameOverlays();
         this.TraceFullPresent(23, false);
@@ -54,67 +137,12 @@ public partial class App {
             this.TraceFullPresent(22, true);
             return;
         }
-        this.TraceFullPresent(25, true);
-        int perfT1 = 0;
-        if (App.PerfOn()) { perfT1 = Window.RawTickMs(); }
-        if (this.FxActive()) {
-            Canvas fc = canvas;
-            int fxNow = Window.GetTickMs();
-            if (Damage.partialFrame) {
-                // 只有损伤条带被重绘（因此那里是合成前的像素），
-                // 裁剪仍然生效：以上一整帧的相位重新合成
-                // 特效，只覆盖该条带，其余像素保持已合成的状态。
-                if (fxSnapValid) {
-                    // 只把页面条带的干净像素补进整窗快照。条带即使超过
-                    // 半窗也必须补齐，否则下一拍恢复会抹掉新页面内容。
-                    fc.SnapshotPatchRect(Damage.presentX, Damage.presentY, Damage.presentW,
-                                         Damage.presentH, App.FxSnapSlot());
-                }
-                this.PaintBackdropFx(fxFrameMs);
-                BackdropFx.TakeDamage();
-                if (!fxPagePending) {
-                    fxDamage = null;
-                    fxTouched = null;
-                    fxTouchedFull = false;
-                    if (fxNextMs < 0 || fxNow >= fxNextMs) { fxNextMs = fxNow; }
-                }
-            } else {
-            bool burst = lastFullFrameMs > 0
-                && fxNow - lastFullFrameMs < 120;
-            if (burst) {
-                fxSnapValid = false;
-                fxDamage = null;
-                fxTouched = null;
-                fxTouchedFull = false;
-                this.ScheduleFxFrame();
-            } else {
-                fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
-                                App.FxSnapSlot());
-                fxSnapValid = true;
-                if (frameDiagnostics != null) { frameDiagnostics.Snapshot(); }
-            }
-            this.PaintBackdropFx(fxNow);
-            if (!burst) {
-                fxDamage = BackdropFx.TakeDamage();
-                fxTouched = fxDamage;
-                fxTouchedFull = fxDamage.Count / 4 > 1024;
-                this.ScheduleFxFrame();
-            } else {
-                BackdropFx.TakeDamage();
-            }
-            fxFrameMs = fxNow;
-            if (!window.IsVisible()) { fxNextMs = -1; }
-            }
-        } else {
-            fxNextMs = -1;
-        }
         int perfPreMs = 0;
         if (App.PerfOn()) {
             perfPreMs = Window.RawTickMs();
-            Stats.OverlayMs = Stats.OverlayMs + (perfT1 - perfT0);
-            Stats.FxMs = Stats.FxMs + (perfPreMs - perfT1);
+            Stats.FxMs = Stats.FxMs + (perfT1 - perfT0);
+            Stats.OverlayMs = Stats.OverlayMs + (perfPreMs - perfT1);
         }
-        this.TraceFullPresent(25, false);
         this.TraceFullPresent(26, true);
         int blurMiss = Canvas.TakeBlurPartialMiss();
         if (Damage.partialFrame) {
