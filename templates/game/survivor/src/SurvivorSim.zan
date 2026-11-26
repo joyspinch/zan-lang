@@ -1,0 +1,56 @@
+using System;
+using Game.Foundation;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：SurvivorGame 以固定 1/60 秒一帧无头推进。
+// 刷怪方位由游戏时间公式决定，种子不参与。replays/ 下的回放由 `zan-check` 重放、逐校验点
+// 比对；Bot 是模糊测试用的机器人。改了数值或刷怪后回放分叉，就重新录制（见 README）。
+//
+// 输入编码：0 保持上一帧的按键；1 + 按键位（1 上、2 下、4 左、8 右）= 本帧按住的方向键。
+public class SurvivorSim : IReplaySim {
+    SurvivorGame game;
+
+    public void Reset(long seed) { game = SurvivorGame.Create(); }
+
+    public void Step(int frame, int input) {
+        if (input >= 1 && input <= 16) {
+            int keys = input - 1;
+            game.moveX = (keys & 4) != 0 ? -1.0 : ((keys & 8) != 0 ? 1.0 : 0.0);
+            game.moveY = (keys & 1) != 0 ? -1.0 : ((keys & 2) != 0 ? 1.0 : 0.0);
+        }
+        game.Tick(1.0 / 60.0);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Real(game.playerX).Real(game.playerY).Int(game.playerHp).Int(game.level).Int(game.exp)
+         .Int(game.killCount).Real(game.gameTime);
+        int alive = 0;
+        for (int i = 0; i < game.enemies.Count; i = i + 1) {
+            Enemy e = game.enemies[i];
+            if (e.active) { alive = alive + 1; h.Real(e.x).Real(e.y).Int(e.hp); }
+        }
+        return h.Int(alive).Value();
+    }
+
+    [Invariant]
+    public bool PlayerInArena() {
+        return game.playerX >= 30 && game.playerX <= 1250 && game.playerY >= 80 && game.playerY <= 690;
+    }
+
+    [Invariant]
+    public bool HpWithinMax() { return game.playerHp > 0 && game.playerHp <= game.playerMaxHp; }
+
+    // 升级后经验余数小于下一级门槛
+    [Invariant]
+    public bool ExpBelowNextLevel() { return game.exp >= 0 && game.exp < game.expToNext; }
+
+    // 阵亡的怪物槽位被复用：列表大小有上界（同屏存活数 + 少量余量）
+    [Invariant]
+    public bool EnemyPoolBounded() { return game.enemies.Count <= 400; }
+
+    // 机器人：随机按方向键走位，隔一阵换一次
+    public static int Bot(DeterministicRandom rng, int frame) {
+        if (rng.NextBelow(30) != 0) { return 0; }
+        return 1 + rng.NextBelow(16);
+    }
+}

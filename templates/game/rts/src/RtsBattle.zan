@@ -1,0 +1,152 @@
+using System;
+using System.Collections.Generic;
+using Game.Tactics;
+using Game.Core;
+
+// 战场仿真：流场寻路 + RVO 群体避障 + 单位与资源，不碰界面。Program 每 50ms 调
+// TickSimulation 并读它画图；RtsSim 用同一份逻辑做无头回放与机器人模糊
+// （docs/ZAN_STANDARD.md S26/S27）。
+public class RtsBattle {
+    // 引擎系统
+    public FlowField flowField;
+    public RvoSimulator rvoSim;
+    public List<RtsUnit> units;
+
+    // 战场参数
+    public int worldWidth = 1024;
+    public int worldHeight = 600;
+    public int cellSize = 32;
+
+    // 目标集结点
+    public double targetX = 512.0;
+    public double targetY = 300.0;
+    public bool hasTarget = false;
+
+    // 资源统计
+    public int minerals = 1500;
+    public int power = 100;
+    public int supplyUsed = 24;
+    public int supplyMax = 100;
+
+    public RtsBattle() {
+        int cols = worldWidth / cellSize;
+        int rows = worldHeight / cellSize;
+        flowField = FlowField.Create(cols, rows, cellSize);
+        rvoSim = RvoSimulator.Create(256, 48);
+        units = new List<RtsUnit>();
+        // 构造中央关隘峡谷障碍，孵化初始军团
+        SetupTerrain();
+        SpawnInitialArmies();
+    }
+
+    public void SetupTerrain() {
+        int cols = worldWidth / cellSize;
+        int rows = worldHeight / cellSize;
+
+        // 设置峡谷山体障碍物（在中间留有通道峡口）
+        int midCol = cols / 2;
+        for (int r = 0; r < rows; r = r + 1) {
+            // 在中间第 8~12 行留出通路峡口，其余设为不可通行悬崖 (代价 255)
+            if (r < 7 || r > 12) {
+                flowField.SetCost(midCol, r, (byte)255);
+                flowField.SetCost(midCol + 1, r, (byte)255);
+            }
+        }
+    }
+
+    public void SpawnInitialArmies() {
+        // 在左侧基地生成蓝方兵团。
+        // 间距要大于单位直径（步兵 18、坦克 32），否则编队糊成一块——
+        // 这是贴图版和矢量版的共同要求：矢量圆小，贴图大，占位一样。
+        for (int i = 0; i < 40; i = i + 1) {
+            int uType = (i % 6 == 0) ? 1 : 0;  // 少量坦克，大量步兵
+            double sx = 60.0 + (double)((i % 8) * 40);
+            double sy = 120.0 + (double)((i / 8) * 44);
+            RtsUnit u = RtsUnit.Create(i + 1, uType, 0, sx, sy);
+            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
+            u.RvoSlot = slot;
+            units.Add(u);
+        }
+    }
+
+    // 征召一个装甲营（10 辆）。人口上限之内才征召——不设上限的话连点按钮会让单位数
+    // 冲破 RVO 避障器的 256 个槽位，新单位拿不到槽位、原地不动。
+    public void SpawnReinforcements() {
+        if (supplyUsed + 10 > supplyMax) { return; }
+        int baseId = units.Count + 1;
+        for (int i = 0; i < 10; i = i + 1) {
+            double sx = 40.0 + (double)(i * 24);
+            double sy = 80.0;
+            RtsUnit u = RtsUnit.Create(baseId + i, 1, 0, sx, sy);
+            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
+            u.RvoSlot = slot;
+            units.Add(u);
+        }
+        supplyUsed = supplyUsed + 10;
+    }
+
+    public void CommandMove(int mouseX, int mouseY) {
+        targetX = (double)mouseX;
+        targetY = (double)mouseY;
+        hasTarget = true;
+
+        // 1. 刷新宏观流场寻路目标
+        int targetCol = (int)targetX / cellSize;
+        int targetRow = (int)targetY / cellSize;
+        flowField.SetTarget(targetCol, targetRow);
+        flowField.Rebuild();
+
+        // 2. 选中的所有单位（默认全部蓝方单位）设置朝向目标的期望速度
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            u.Selected = true;
+        }
+    }
+
+    public void TickSimulation(double dt) {
+        if (!hasTarget) { return; }
+
+        // 1. 根据 FlowField 向量场为每个 Agent 注入宏观期望速度
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.RvoSlot < 0) { continue; }
+
+            double dx = targetX - u.X;
+            double dy = targetY - u.Y;
+            double distToTarget = Math.Sqrt(dx * dx + dy * dy);
+
+            if (distToTarget < 25.0) {
+                // 已到达集结点，期望速度归零
+                rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+            } else {
+                float fx;
+                float fy;
+                flowField.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
+
+                // 若流场有效，按流场方向全速前进；否则直指目标
+                double vx;
+                double vy;
+                if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
+                    vx = (double)fx * u.Speed;
+                    vy = (double)fy * u.Speed;
+                } else {
+                    vx = (dx / distToTarget) * u.Speed;
+                    vy = (dy / distToTarget) * u.Speed;
+                }
+                rvoSim.SetPrefVelocity(u.RvoSlot, vx, vy);
+            }
+        }
+
+        // 2. 微观 RVO2 互斥推挤物理步进计算
+        rvoSim.Step(dt);
+
+        // 3. 将 RVO 物理位置同步回逻辑单位
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.RvoSlot >= 0) {
+                u.X = rvoSim.GetX(u.RvoSlot);
+                u.Y = rvoSim.GetY(u.RvoSlot);
+            }
+        }
+    }
+}

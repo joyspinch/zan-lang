@@ -1,0 +1,59 @@
+using System;
+using Game.Foundation;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：PinWorld 以固定 16ms 一帧无头推进。
+// replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
+// 改了手感参数（转速、飞针速度、碰撞）后回放分叉，就重新录制（见 README）。
+//
+// 输入编码：0 无操作；1 发射；2 暂停/继续；3 下一回合（过关进下一关、失败重开本关）。
+public class PinSim : IReplaySim {
+    const int FrameMs = 16;
+    PinWorld world;
+    int seed;
+
+    public void Reset(long seed) {
+        this.seed = (int)(seed % 360);
+        world = new PinWorld();
+        world.StartRound(1, this.seed);
+    }
+
+    public void Step(int frame, int input) {
+        if (input == 1) {
+            world.Shoot();
+        } else if (input == 2) {
+            world.TogglePause();
+        } else if (input == 3 && world.state != RoundState.Playing) {
+            int next = world.state == RoundState.Cleared ? world.level + 1 : world.level;
+            world.StartRound(next, seed + frame);
+        }
+        world.Step(PinSim.FrameMs);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Int(world.level).Int(world.inserted).Int((int)world.state).Int(world.elapsedMs)
+         .Bool(world.flying).Bool(world.paused).Real(world.rotation).Real(world.shotRadius);
+        h.Int(world.pins.Count);
+        for (int i = 0; i < world.pins.Count; i = i + 1) { h.Real(world.pins[i].angle); }
+        return h.Value();
+    }
+
+    [Invariant]
+    public bool InsertedWithinTarget() { return world.inserted >= 0 && world.inserted <= world.target; }
+
+    [Invariant]
+    public bool RotationWrapped() { return world.rotation >= 0 && world.rotation < 6.2832; }
+
+    // 飞针只在发射半径与针座半径之间
+    [Invariant]
+    public bool ShotInFlightRange() { return world.shotRadius >= 144 && world.shotRadius <= 312; }
+
+    // 机器人：时不时发射，回合结束后过一会儿点下一回合，极少暂停
+    public static int Bot(DeterministicRandom rng, int frame) {
+        int roll = rng.NextBelow(1000);
+        if (roll < 50) { return 1; }
+        if (roll < 80) { return 3; }
+        if (roll < 84) { return 2; }
+        return 0;
+    }
+}

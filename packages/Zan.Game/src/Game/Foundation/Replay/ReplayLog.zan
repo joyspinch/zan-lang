@@ -1,0 +1,100 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+namespace Game.Foundation;
+
+// 回放文件（S26）：种子 + 逐帧输入 + 校验点。一次试玩、一份 bug 报告、一条回归
+// 用例都是它。纯文本、按行，便于 diff 与提交：
+//
+//   zan-replay 1
+//   sim TrapCatSim          ← 仿真类型名（zan-check 的 replay 步按名 new 出来）
+//   seed 20261125
+//   frames 240
+//   i 12 37                 ← 第 12 帧输入 37（未列出的帧输入为 0）
+//   c 30 1288177462         ← 第 30 帧执行后的状态校验和
+//   end 905542310           ← 最后一帧执行后的校验和
+//
+// 未知行忽略（向前兼容）；"#" 开头为注释。
+public class ReplayLog {
+    public string sim = "";
+    public long seed;
+    public int frames;
+    // 逐帧输入（下标 = 帧号）
+    public List<int> inputs = new List<int>();
+    public List<int> checkFrames = new List<int>();
+    public List<int> checkValues = new List<int>();
+    public int endChecksum;
+    // 解析失败的原因（空 = 成功）
+    public string error = "";
+
+    public int InputAt(int frame) {
+        return frame >= 0 && frame < this.inputs.Count ? this.inputs[frame] : 0;
+    }
+
+    // 第 frame 帧的校验点（没有时返回 false）
+    public bool CheckAt(int frame, out int value) {
+        value = 0;
+        for (int i = 0; i < this.checkFrames.Count; i = i + 1) {
+            if (this.checkFrames[i] == frame) { value = this.checkValues[i]; return true; }
+        }
+        return false;
+    }
+
+    public string ToText() {
+        string s = "zan-replay 1\nsim " + this.sim + "\nseed " + Convert.ToString(this.seed)
+            + "\nframes " + Convert.ToString(this.frames) + "\n";
+        int next = 0;
+        for (int f = 0; f < this.frames; f = f + 1) {
+            int v = this.InputAt(f);
+            if (v != 0) { s = s + "i " + Convert.ToString(f) + " " + Convert.ToString(v) + "\n"; }
+            while (next < this.checkFrames.Count && this.checkFrames[next] == f) {
+                s = s + "c " + Convert.ToString(f) + " " + Convert.ToString(this.checkValues[next]) + "\n";
+                next = next + 1;
+            }
+        }
+        return s + "end " + Convert.ToString(this.endChecksum) + "\n";
+    }
+
+    public static ReplayLog Parse(string text) {
+        ReplayLog log = new ReplayLog();
+        List<string> lines = text.Replace("\r", "").Split("\n");
+        bool header = false;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string l = lines[i].Trim();
+            if (l == "" || l.StartsWith("#")) { continue; }
+            List<string> p = l.Split(" ");
+            if (p[0] == "zan-replay") { header = true; continue; }
+            if (p.Count < 2) { continue; }
+            if (p[0] == "sim") { log.sim = p[1]; }
+            else if (p[0] == "seed") { log.seed = Convert.ToInt64(p[1]); }
+            else if (p[0] == "frames") {
+                log.frames = Convert.ToInt32(p[1]);
+                while (log.inputs.Count < log.frames) { log.inputs.Add(0); }
+            } else if (p[0] == "i" && p.Count >= 3) {
+                int f = Convert.ToInt32(p[1]);
+                while (log.inputs.Count <= f) { log.inputs.Add(0); }
+                log.inputs[f] = Convert.ToInt32(p[2]);
+            } else if (p[0] == "c" && p.Count >= 3) {
+                log.checkFrames.Add(Convert.ToInt32(p[1]));
+                log.checkValues.Add(Convert.ToInt32(p[2]));
+            } else if (p[0] == "end") {
+                log.endChecksum = Convert.ToInt32(p[1]);
+            }
+        }
+        if (!header) { log.error = "not a zan-replay file (missing 'zan-replay 1' header)"; }
+        else if (log.frames <= 0) { log.error = "replay has no frames"; }
+        return log;
+    }
+
+    public static ReplayLog Load(string path) {
+        if (!File.Exists(path)) {
+            ReplayLog missing = new ReplayLog();
+            missing.error = "replay file not found: " + path;
+            return missing;
+        }
+        return ReplayLog.Parse(File.ReadAllText(path));
+    }
+
+    public void Save(string path) { File.WriteAllText(path, this.ToText()); }
+}

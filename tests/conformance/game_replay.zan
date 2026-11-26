@@ -1,0 +1,95 @@
+// S26 / S27（docs/ZAN_STANDARD.md §6）：回放即回归、规则即不变量。
+// 一个小金库仿真：输入 1 挖矿（随机产出，种子决定）、2 花钱、3 故意违规（花成负数）。
+// 录制 → 文本往返 → 重放逐校验点一致；改一帧输入即报 diverged 并指出帧号；
+// 机器人模糊按种子复现、找到违规的 [Invariant] 规则并产出可提交的回放；
+// 异常被捕获成 crashed，状态不动的卡死被判 stalled。
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+
+public class VaultSim : IReplaySim {
+    public int gold;
+    public int minted;
+    public int spent;
+    public int frame;
+    DeterministicRandom rng;
+
+    public void Reset(long seed) {
+        gold = 10;
+        minted = 0;
+        spent = 0;
+        frame = 0;
+        rng = new DeterministicRandom(seed);
+    }
+
+    public void Step(int f, int input) {
+        frame = f;
+        if (input == 1) {
+            int found = 1 + rng.NextBelow(5);
+            gold = gold + found;
+            minted = minted + found;
+        } else if (input == 2 && gold >= 3) {
+            gold = gold - 3;
+            spent = spent + 3;
+        } else if (input == 3) {
+            gold = gold - 100;   // 违规：不记 spent，金币也会变负
+        } else if (input == 4) {
+            throw new Exception("vault door jammed");
+        }
+    }
+
+    public int StateChecksum() {
+        return new StateHasher().Int(gold).Int(minted).Int(spent).Long(rng.State()).Value();
+    }
+
+    [Invariant]
+    public bool GoldConserved() { return gold == 10 + minted - spent; }
+
+    [Invariant]
+    public bool NeverNegative() { return gold >= 0; }
+
+    // 普通方法不算规则
+    public bool Rich() { return gold > 100; }
+}
+
+public class Program {
+    static int Honest(DeterministicRandom rng, int frame) { return 1 + rng.NextBelow(2); }
+    static int Reckless(DeterministicRandom rng, int frame) { return frame == 57 ? 3 : 1; }
+    static int Jammer(DeterministicRandom rng, int frame) { return frame == 9 ? 4 : 1; }
+    static int Idle(DeterministicRandom rng, int frame) { return 0; }
+
+    public static void Main() {
+        Console.WriteLine("rules: " + String.Join(",", Invariants.Of(new VaultSim())));
+
+        List<int> inputs = new List<int>();
+        for (int i = 0; i < 120; i = i + 1) { inputs.Add(i % 7 == 0 ? 2 : (i % 3 == 0 ? 1 : 0)); }
+        ReplayLog log = Replay.Record(new VaultSim(), "VaultSim", 20261125, inputs, 30);
+        Console.WriteLine("recorded: frames=" + log.frames + " checkpoints=" + log.checkFrames.Count);
+
+        ReplayLog back = ReplayLog.Parse(log.ToText());
+        Console.WriteLine("roundtrip same text: " + (back.ToText() == log.ToText()));
+        Console.WriteLine("verify: " + Replay.Verify(new VaultSim(), back).Describe());
+
+        // 两次录制同一种子同一输入：逐字节相同（确定性）
+        ReplayLog again = Replay.Record(new VaultSim(), "VaultSim", 20261125, inputs, 30);
+        Console.WriteLine("deterministic: " + (again.ToText() == log.ToText()));
+
+        // 改第 40 帧的输入：在下一个校验点（第 59 帧）报分叉
+        back.inputs[40] = 1;
+        Console.WriteLine("tampered: " + Replay.Verify(new VaultSim(), back).Describe());
+
+        ReplayResult honest = Replay.Fuzz(new VaultSim(), "VaultSim", 7, 500, Honest, 0);
+        Console.WriteLine("fuzz honest: " + honest.Describe());
+        Console.WriteLine("fuzz replay verifies: " + Replay.Verify(new VaultSim(), honest.log).ok);
+
+        ReplayResult bad = Replay.Fuzz(new VaultSim(), "VaultSim", 7, 500, Reckless, 0);
+        Console.WriteLine("fuzz reckless: " + bad.Describe());
+        Console.WriteLine("failure replay frames: " + bad.log.frames);
+        Console.WriteLine("failure replay reproduces: "
+            + Replay.Verify(new VaultSim(), ReplayLog.Parse(bad.log.ToText())).Describe());
+
+        Console.WriteLine("fuzz jammer: " + Replay.Fuzz(new VaultSim(), "VaultSim", 7, 500, Jammer, 0).Describe());
+        Console.WriteLine("fuzz idle: " + Replay.Fuzz(new VaultSim(), "VaultSim", 7, 500, Idle, 60).Describe());
+        Console.WriteLine("bad file: " + Replay.Verify(new VaultSim(), ReplayLog.Parse("hello")).Describe());
+    }
+}

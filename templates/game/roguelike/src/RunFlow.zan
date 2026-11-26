@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using Game.Cards;
+using Game.Foundation;
+
+// 一局的流程状态机（阶段 0 主菜单 · 1 路线选择 · 2 战斗 · 3 战后奖励 · 4 结算），
+// 不碰界面：Program 调它推进流程、再按 phase 重建控件树；RoguelikeSim 用同一份
+// 流程做无头回放与机器人模糊（docs/ZAN_STANDARD.md S26/S27）。逻辑与表现分离后，
+// 回放验证的就是玩家实际走的那套规则。
+public class RunFlow {
+    public CardLibrary library;
+    public RunState run;
+    public int phase;
+    public CardBattle battle;
+    public List<string> rewardChoices;
+    public bool runWon;
+    public bool bossFight;
+    public string lastNote;
+
+    public RunFlow() {
+        this.library = new CardLibrary();
+        this.rewardChoices = new List<string>();
+        this.phase = 0;
+        this.lastNote = "";
+    }
+
+    // 开一局：种子决定后面的一切。
+    public void StartRun(int seed) {
+        if (seed <= 0) { seed = 1; }
+        this.run = new RunState(seed, this.library);
+        this.run.BuildFloor();
+        this.rewardChoices.Clear();
+        this.lastNote = "";
+        this.runWon = false;
+        this.phase = 1;
+    }
+
+    // 进入一个路线节点：宝箱直接开，其余是战斗。
+    public void EnterNode(MapNode node) {
+        if (node.Kind() == 2) {
+            this.OpenChest();
+            return;
+        }
+        this.StartBattle(node);
+    }
+
+    // 开一场战斗：按当前牌组建牌堆，交给引擎的 CardBattle 结算。
+    public void StartBattle(MapNode node) {
+        CardDeck deck = new CardDeck(this.BattleSeed(node));
+        for (int i = 0; i < this.run.Deck().Count; i = i + 1) {
+            CardDefinition def = this.library.Find(this.run.Deck()[i]);
+            if (def != null) { deck.Add(def); }
+        }
+        this.bossFight = node.Kind() == 3;
+        this.battle = new CardBattle(
+            new CardActor("hero", this.run.Hp()),
+            new CardActor(node.EnemyName(), node.Hp()),
+            deck);
+        this.battle.SetEnemyDamage(node.Damage());
+        this.battle.Start();
+        this.lastNote = "";
+        this.phase = 2;
+    }
+
+    // 出一张牌。
+    public void PlayCard(int index) {
+        if (this.battle == null) { return; }
+        CardPlayResult result = this.battle.Play(index);
+        if (!result.Success()) { return; }
+        this.lastNote = "伤害 " + Convert.ToString(result.Damage())
+            + " · 格挡 " + Convert.ToString(result.Blocked())
+            + " · 治疗 " + Convert.ToString(result.Healed())
+            + " · 抽牌 " + Convert.ToString(result.Drawn());
+        this.CheckBattleEnd();
+    }
+
+    // 结束回合：弃牌、挨打、抽新牌。
+    public void EndTurn() {
+        if (this.battle == null || this.battle.Winner() >= 0) { return; }
+        int hurt = this.battle.EndPlayerTurn();
+        this.lastNote = "敌人反击，你受到 " + Convert.ToString(hurt) + " 点伤害";
+        this.CheckBattleEnd();
+    }
+
+    // 战斗结束判定：胜则进奖励，败则进结算。
+    public void CheckBattleEnd() {
+        if (this.battle.Winner() < 0) { return; }
+        if (this.battle.Winner() == 0) {
+            // 残留格挡不跨战斗，折进生命。
+            this.run.SetHp(this.battle.Player().Hp() + this.battle.Player().Block());
+            this.run.AddKill(12);
+            if (this.bossFight) {
+                this.runWon = true;
+                this.phase = 4;
+                return;
+            }
+            this.DrawRewards();
+            this.phase = 3;
+            return;
+        }
+        this.run.SetHp(0);
+        this.runWon = false;
+        this.phase = 4;
+    }
+
+    // 抽三张互不相同的奖励卡（走本局随机源，同种子同结果）。
+    public void DrawRewards() {
+        this.run.DrawRewards(this.library, this.rewardChoices);
+    }
+
+    // 收下奖励，进入下一层。
+    public void TakeReward(string cardId) {
+        this.run.AddCard(cardId);
+        this.AdvanceFloor();
+    }
+
+    // 宝箱：白拿一张牌，回一点血。
+    public void OpenChest() {
+        string id = this.library.RewardAt(this.run.Roll(this.library.RewardCount()));
+        this.run.AddCard(id);
+        this.run.Heal(8);
+        this.lastNote = "宝箱：获得「" + this.library.Find(id).Name() + "」，回复 8 点生命";
+        this.AdvanceFloor();
+    }
+
+    // 层数推进：三层打完即登顶。
+    public void AdvanceFloor() {
+        if (this.run.Floor() >= 3) {
+            this.runWon = true;
+            this.phase = 4;
+            return;
+        }
+        this.run.BuildFloor();
+        this.phase = 1;
+    }
+
+    // 每场战斗的牌堆种子：由本局种子与节点派生，同种子必然同洗牌。
+    public int BattleSeed(MapNode node) {
+        return this.run.Seed() + this.run.Floor() * 97 + node.Kind();
+    }
+}

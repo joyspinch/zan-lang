@@ -1,0 +1,70 @@
+using System;
+using Game.Foundation;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：RtsBattle 以界面同样的 50ms 一帧无头推进。
+// 地形与初始军团固定，种子不参与。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；
+// Bot 是模糊测试用的机器人。改了寻路或避障参数后回放分叉，就重新录制（见 README）。
+//
+// 输入编码：0 无操作；1 + 格子下标（32 列 × 18 行，按行）= 点击该格中心下达行军令；
+// 1000 = 征召装甲营。
+public class RtsSim : IReplaySim {
+    RtsBattle battle;
+
+    public void Reset(long seed) { battle = new RtsBattle(); }
+
+    public void Step(int frame, int input) {
+        int cols = battle.worldWidth / battle.cellSize;
+        int rows = battle.worldHeight / battle.cellSize;
+        if (input >= 1 && input <= cols * rows) {
+            int cell = input - 1;
+            battle.CommandMove((cell % cols) * battle.cellSize + battle.cellSize / 2,
+                               (cell / cols) * battle.cellSize + battle.cellSize / 2);
+        } else if (input == 1000) {
+            battle.SpawnReinforcements();
+        }
+        battle.TickSimulation(0.05);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Int(battle.units.Count).Int(battle.supplyUsed).Bool(battle.hasTarget)
+         .Real(battle.targetX).Real(battle.targetY);
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            RtsUnit u = battle.units[i];
+            h.Real(u.X).Real(u.Y);
+        }
+        return h.Value();
+    }
+
+    [Invariant]
+    public bool SupplyWithinCap() { return battle.supplyUsed <= battle.supplyMax; }
+
+    // 每个单位都在避障器里有槽位（拿不到槽位的单位原地不动）
+    [Invariant]
+    public bool UnitsHaveRvoSlots() {
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            if (battle.units[i].RvoSlot < 0) { return false; }
+        }
+        return true;
+    }
+
+    // 单位不会被推出战场（留 64px 余量给避障推挤）
+    [Invariant]
+    public bool UnitsOnField() {
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            RtsUnit u = battle.units[i];
+            if (u.X < -64 || u.Y < -64 || u.X > battle.worldWidth + 64 || u.Y > battle.worldHeight + 64) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 机器人：隔一阵在随机格子下达行军令，偶尔征召
+    public static int Bot(DeterministicRandom rng, int frame) {
+        int roll = rng.NextBelow(100);
+        if (roll < 4) { return 1 + rng.NextBelow(32 * 18); }
+        if (roll < 6) { return 1000; }
+        return 0;
+    }
+}

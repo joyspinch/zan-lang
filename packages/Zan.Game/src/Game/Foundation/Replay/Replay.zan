@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Foundation;
+
+// 回放校验 / 机器人模糊测试的结果。ok=false 时 frame 是出事的帧，kind 说明是哪类：
+//   diverged   校验和与回放文件不一致（逻辑改了、或引入了不确定性）
+//   invariant  [Invariant] 规则不成立（rule 为规则名）
+//   crashed    Step 抛了异常（message 为异常消息）
+//   stalled    机器人模糊：连续 stallFrames 帧状态不变（卡死 / softlock）
+//   invalid    回放文件本身有问题（message）
+public class ReplayResult {
+    public bool ok = true;
+    public string kind = "";
+    public int frame = -1;
+    public int expected;
+    public int actual;
+    public string rule = "";
+    public string message = "";
+    // 实际跑出来的回放（录制 / 模糊测试的产物；失败时即可提交为回归用例）
+    public ReplayLog log;
+
+    public string Describe() {
+        if (this.ok) { return "ok"; }
+        string at = " at frame " + Convert.ToString(this.frame);
+        if (this.kind == "diverged") {
+            return "diverged" + at + ": checksum " + Convert.ToString(this.actual)
+                + ", replay recorded " + Convert.ToString(this.expected);
+        }
+        if (this.kind == "invariant") { return "invariant '" + this.rule + "' broken" + at; }
+        if (this.kind == "crashed") { return "crashed" + at + ": " + this.message; }
+        if (this.kind == "stalled") { return "stalled" + at + ": " + this.message; }
+        return this.kind + ": " + this.message;
+    }
+}
+
+// 机器人的输入策略：按帧号与确定性随机源给出本帧输入（同一种子同一输入流）。
+public delegate int ReplayInputPolicy(DeterministicRandom rng, int frame);
+
+// S26 / S27：录制、校验与模糊测试。
+//
+//   ReplayLog log = Replay.Record(new TrapCatSim(), "TrapCatSim", 42, inputs, 30);
+//   ReplayResult r = Replay.Verify(new TrapCatSim(), ReplayLog.Load("replays/basic.replay"));
+//   ReplayResult f = Replay.Fuzz(new TrapCatSim(), "TrapCatSim", 7, 2000, Bot, 0);
+//
+// 每帧 Step 之后都查一遍 [Invariant] 规则；异常被捕获成 crashed 结果而不是终止进程。
+public class Replay {
+    // 按给定输入流跑一遍并记录校验点（每 every 帧一个，外加最后一帧）
+    public static ReplayLog Record(IReplaySim sim, string simName, long seed, List<int> inputs,
+                                   int every) {
+        ReplayLog log = new ReplayLog();
+        log.sim = simName;
+        log.seed = seed;
+        log.frames = inputs.Count;
+        sim.Reset(seed);
+        for (int f = 0; f < inputs.Count; f = f + 1) {
+            log.inputs.Add(inputs[f]);
+            sim.Step(f, inputs[f]);
+            if (every > 0 && (f + 1) % every == 0) {
+                log.checkFrames.Add(f);
+                log.checkValues.Add(sim.StateChecksum());
+            }
+        }
+        log.endChecksum = sim.StateChecksum();
+        return log;
+    }
+
+    // 重放并逐个校验点比对；第一处分叉、规则违反或异常即停
+    public static ReplayResult Verify(IReplaySim sim, ReplayLog log) {
+        ReplayResult r = new ReplayResult();
+        r.log = log;
+        if (log.error != "") { return Replay.Fail(r, "invalid", -1, log.error); }
+        try {
+            sim.Reset(log.seed);
+            string broken = Invariants.Check(sim);
+            if (broken != "") { r.rule = broken; return Replay.Fail(r, "invariant", -1, ""); }
+            for (int f = 0; f < log.frames; f = f + 1) {
+                r.frame = f;
+                sim.Step(f, log.InputAt(f));
+                broken = Invariants.Check(sim);
+                if (broken != "") { r.rule = broken; return Replay.Fail(r, "invariant", f, ""); }
+                int want = 0;
+                if (log.CheckAt(f, out want)) {
+                    int got = sim.StateChecksum();
+                    if (got != want) {
+                        r.expected = want;
+                        r.actual = got;
+                        return Replay.Fail(r, "diverged", f, "");
+                    }
+                }
+            }
+            int end = sim.StateChecksum();
+            if (end != log.endChecksum) {
+                r.expected = log.endChecksum;
+                r.actual = end;
+                return Replay.Fail(r, "diverged", log.frames - 1, "");
+            }
+        } catch (Exception e) {
+            return Replay.Fail(r, "crashed", r.frame, e.Message);
+        }
+        r.frame = log.frames - 1;
+        return r;
+    }
+
+    // 机器人模糊：按策略生成 frames 帧输入，每帧查规则；stallFrames > 0 时状态连续
+    // 这么多帧不变判为卡死。结果的 log 是实际跑过的回放（含到出事为止的输入），
+    // 失败时 Save 下来即成为回归用例。
+    public static ReplayResult Fuzz(IReplaySim sim, string simName, long seed, int frames,
+                                    ReplayInputPolicy policy, int stallFrames) {
+        ReplayResult r = new ReplayResult();
+        DeterministicRandom rng = new DeterministicRandom(seed);
+        List<int> inputs = new List<int>();
+        int last = 0;
+        int same = 0;
+        try {
+            sim.Reset(seed);
+            last = sim.StateChecksum();
+            for (int f = 0; f < frames; f = f + 1) {
+                r.frame = f;
+                int input = policy(rng, f);
+                inputs.Add(input);
+                sim.Step(f, input);
+                string broken = Invariants.Check(sim);
+                if (broken != "") {
+                    r.rule = broken;
+                    r.log = Replay.Record(sim, simName, seed, inputs, 0);
+                    return Replay.Fail(r, "invariant", f, "");
+                }
+                int now = sim.StateChecksum();
+                same = now == last ? same + 1 : 0;
+                last = now;
+                if (stallFrames > 0 && same >= stallFrames) {
+                    r.log = Replay.Record(sim, simName, seed, inputs, 0);
+                    return Replay.Fail(r, "stalled", f, "state unchanged for "
+                        + Convert.ToString(same) + " frames");
+                }
+            }
+        } catch (Exception e) {
+            string msg = e.Message;
+            r.log = Replay.Partial(simName, seed, inputs);
+            return Replay.Fail(r, "crashed", r.frame, msg);
+        }
+        r.log = Replay.Record(sim, simName, seed, inputs, 30);
+        r.frame = frames - 1;
+        return r;
+    }
+
+    // 崩溃时不能再跑一遍记录校验和：只保存输入，回放到同一帧会再现同一异常
+    static ReplayLog Partial(string simName, long seed, List<int> inputs) {
+        ReplayLog log = new ReplayLog();
+        log.sim = simName;
+        log.seed = seed;
+        log.frames = inputs.Count;
+        for (int i = 0; i < inputs.Count; i = i + 1) { log.inputs.Add(inputs[i]); }
+        return log;
+    }
+
+    static ReplayResult Fail(ReplayResult r, string kind, int frame, string message) {
+        r.ok = false;
+        r.kind = kind;
+        r.frame = frame;
+        r.message = message;
+        return r;
+    }
+}

@@ -1,0 +1,78 @@
+using System;
+using Game.Foundation;
+
+namespace Match3;
+
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：三消逻辑包成只认逐帧输入的仿真，
+// 不开窗口。replays/ 下的回放由 `zan-check` 无头重放、逐校验点比对；Bot 是模糊
+// 测试用的机器人。改了规则后回放分叉，就重新录制（见 README）。
+//
+// 输入编码：0 无操作；1 + 格子 * 4 + 方向（0 右、1 下、2 左、3 上）= 先点这一格、再点
+// 相邻那一格（一次交换尝试）；300 = 点一下棋盘外（取消选中 / 结束后重开）。
+// 开盘与补子都出自 Match3Game.rng，由回放种子决定。
+public class Match3Sim : IReplaySim {
+    Match3Game game;
+
+    public void Reset(long seed) { game = new Match3Game(seed); }
+
+    static void Click(Match3Game g, int col, int row) {
+        g.OnClick(Match3Game.BoardStartX + col * Match3Game.TileSize + Match3Game.TileSize / 2,
+                  Match3Game.BoardStartY + row * Match3Game.TileSize + Match3Game.TileSize / 2);
+    }
+
+    public void Step(int frame, int input) {
+        if (input >= 1 && input <= Match3Game.Cols * Match3Game.Rows * 4) {
+            int cell = (input - 1) / 4;
+            int dir = (input - 1) % 4;
+            int col = cell % Match3Game.Cols;
+            int row = cell / Match3Game.Cols;
+            int col2 = col + (dir == 0 ? 1 : (dir == 2 ? -1 : 0));
+            int row2 = row + (dir == 1 ? 1 : (dir == 3 ? -1 : 0));
+            if (col2 >= 0 && col2 < Match3Game.Cols && row2 >= 0 && row2 < Match3Game.Rows) {
+                Match3Sim.Click(game, col, row);
+                Match3Sim.Click(game, col2, row2);
+            }
+        } else if (input == 300) {
+            game.OnClick(0, 0);
+        }
+        game.Update(1.0 / 60.0);
+    }
+
+    public int StateChecksum() {
+        StateHasher h = new StateHasher();
+        h.Int(game.score).Int(game.movesLeft).Bool(game.gameOver).Bool(game.hasSelection)
+         .Long(game.rng.State());
+        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
+            for (int c = 0; c < Match3Game.Cols; c = c + 1) { h.Int(game.board.Get(c, r)); }
+        }
+        return h.Value();
+    }
+
+    [Invariant]
+    public bool MovesInRange() { return game.movesLeft >= 0 && game.movesLeft <= 25; }
+
+    [Invariant]
+    public bool ScoreNotNegative() { return game.score >= 0; }
+
+    // 没结束的局面上一定有棋可走（不会卡死）
+    [Invariant]
+    public bool HasMoveWhilePlaying() { return game.gameOver || game.HasAnyMove(); }
+
+    // 棋盘上只有空位（0）和六种宝石
+    [Invariant]
+    public bool GemsValid() {
+        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
+            for (int c = 0; c < Match3Game.Cols; c = c + 1) {
+                int v = game.board.Get(c, r);
+                if (v < 0 || v > 6) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // 机器人：随机挑一格往随机方向换；偶尔点棋盘外
+    public static int Bot(DeterministicRandom rng, int frame) {
+        if (rng.NextBelow(40) == 0) { return 300; }
+        return 1 + rng.NextBelow(Match3Game.Cols * Match3Game.Rows * 4);
+    }
+}
