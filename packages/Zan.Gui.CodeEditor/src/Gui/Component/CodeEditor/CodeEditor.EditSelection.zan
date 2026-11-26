@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using Gui;
 using Gui.Backend;
 
@@ -9,7 +10,9 @@ namespace Gui.Component.CodeEditor;
 public partial class CodeEditor {
     // ---- 多光标 ----
     // 清掉全部辅助光标（只留主光标）。
-    public void ClearExtraCarets() { carets = new List<Caret>(); }
+    public void ClearExtraCarets() {
+        if (carets.Count > 0) { carets.Clear(); }
+    }
 
     // 在最下方活动光标的下一行添加辅助光标。
     public void AddCaretBelow() {
@@ -69,50 +72,53 @@ public partial class CodeEditor {
         }
     }
 
-    // 选区文本（行间以 '\n' 连接；方向自动归一，无选区为 ""）。
-    public string GetSelectedText() {
-        if (!selActive) { return ""; }
-        int sL = selAnchorLine;
-        int sC = selAnchorCol;
-        int eL = curLine;
-        int eC = curCol;
+    // 归一选区起止位置；无选区返回 false。
+    private bool TryGetSelectionRange(out int sL, out int sC, out int eL, out int eC) {
+        if (!selActive) {
+            sL = 0; sC = 0; eL = 0; eC = 0;
+            return false;
+        }
+        sL = selAnchorLine;
+        sC = selAnchorCol;
+        eL = curLine;
+        eC = curCol;
         if (sL > eL || (sL == eL && sC > eC)) {
             int tmpL = sL; sL = eL; eL = tmpL;
             int tmpC = sC; sC = eC; eC = tmpC;
         }
+        return true;
+    }
+
+    // 选区文本（行间以 '\n' 连接；方向自动归一，无选区为 ""）。
+    public string GetSelectedText() {
+        int sL; int sC; int eL; int eC;
+        if (!TryGetSelectionRange(out sL, out sC, out eL, out eC)) { return ""; }
         if (sL == eL) {
             string ln = lines[sL];
             if (sC > ln.Length) { sC = ln.Length; }
             if (eC > ln.Length) { eC = ln.Length; }
             return ln.Substring(sC, eC - sC);
         }
-        string result = "";
+        StringBuilder sb = new StringBuilder();
         string firstLn = lines[sL];
         if (sC <= firstLn.Length) {
-            result = firstLn.Substring(sC, firstLn.Length - sC);
+            sb.Append(firstLn.Substring(sC, firstLn.Length - sC));
         }
-        int mi = sL + 1;
-        while (mi < eL) {
-            result = result + "\n" + lines[mi];
-            mi = mi + 1;
+        for (int mi = sL + 1; mi < eL; mi = mi + 1) {
+            sb.Append("\n");
+            sb.Append(lines[mi]);
         }
         string lastLn = lines[eL];
         if (eC > lastLn.Length) { eC = lastLn.Length; }
-        result = result + "\n" + lastLn.Substring(0, eC);
-        return result;
+        sb.Append("\n");
+        sb.Append(lastLn.Substring(0, eC));
+        return sb.ToString();
     }
 
     // 删除整个选区：光标落在选区起点，选区取消（无选区或空选区返回 false，成功删除返回 true）。
     public bool DeleteSelection() {
-        if (!selActive) { return false; }
-        int sL = selAnchorLine;
-        int sC = selAnchorCol;
-        int eL = curLine;
-        int eC = curCol;
-        if (sL > eL || (sL == eL && sC > eC)) {
-            int tmpL = sL; sL = eL; eL = tmpL;
-            int tmpC = sC; sC = eC; eC = tmpC;
-        }
+        int sL; int sC; int eL; int eC;
+        if (!TryGetSelectionRange(out sL, out sC, out eL, out eC)) { return false; }
         if (sL == eL && sC == eC) {
             selActive = false;
             return false;
@@ -129,11 +135,18 @@ public partial class CodeEditor {
             if (sC > firstLn.Length) { sC = firstLn.Length; }
             if (eC > lastLn.Length) { eC = lastLn.Length; }
             string keep = firstLn.Substring(0, sC) + lastLn.Substring(eC, lastLn.Length - eC);
-            lines[sL] = keep;
-            int ri = eL;
-            while (ri > sL) {
-                lines.RemoveAt(ri);
-                ri = ri - 1;
+            int dropCount = eL - sL;
+            if (dropCount >= 4) {
+                List<string> nextLines = new List<string>();
+                for (int i = 0; i < sL; i = i + 1) { nextLines.Add(lines[i]); }
+                nextLines.Add(keep);
+                for (int i = eL + 1; i < lines.Count; i = i + 1) { nextLines.Add(lines[i]); }
+                lines = nextLines;
+            } else {
+                lines[sL] = keep;
+                for (int ri = eL; ri > sL; ri = ri - 1) {
+                    lines.RemoveAt(ri);
+                }
             }
         }
         curLine = sL;
@@ -148,16 +161,9 @@ public partial class CodeEditor {
 
     // 工业级选区包裹（Surround With）：输入括号/引号时用成对字符包裹当前选区文本
     public void SurroundSelection(string openCh, string closeCh) {
-        if (!selActive) { return; }
+        int sL; int sC; int eL; int eC;
+        if (!TryGetSelectionRange(out sL, out sC, out eL, out eC)) { return; }
         string selText = GetSelectedText();
-        int sL = selAnchorLine;
-        int sC = selAnchorCol;
-        int eL = curLine;
-        int eC = curCol;
-        if (sL > eL || (sL == eL && sC > eC)) {
-            int tmpL = sL; sL = eL; eL = tmpL;
-            int tmpC = sC; sC = eC; eC = tmpC;
-        }
         DeleteSelection();
         InsertStr(openCh + selText + closeCh);
         selAnchorLine = sL;
@@ -183,12 +189,10 @@ public partial class CodeEditor {
     // 当无选区时，按 Visual Studio 规范剪切当前整行并删除该行。
     public void CutSelection() {
         if (selActive) {
-            clipboard = GetSelectedText();
-            Clipboard.SetText(clipboard);
+            CopySelection();
             DeleteSelection();
         } else if (lines != null && curLine >= 0 && curLine < lines.Count) {
-            clipboard = lines[curLine] + "\n";
-            Clipboard.SetText(clipboard);
+            CopySelection();
             DeleteLine();
         }
     }
@@ -215,19 +219,24 @@ public partial class CodeEditor {
         } else {
             string ln = lines[curLine];
             string left = ln.Substring(0, curCol);
-            string right = "";
-            if (curCol < ln.Length) {
-                right = ln.Substring(curCol, ln.Length - curCol);
-            }
-            lines[curLine] = left + pLines[0];
-            int pi = 1;
-            while (pi < pLines.Count - 1) {
-                lines.Insert(curLine + pi, pLines[pi]);
-                pi = pi + 1;
-            }
+            string right = curCol < ln.Length ? ln.Substring(curCol, ln.Length - curCol) : "";
             int lastIdx = pLines.Count - 1;
             string lastP = pLines[lastIdx];
-            lines.Insert(curLine + lastIdx, lastP + right);
+            if (pLines.Count > 4) {
+                List<string> nextLines = new List<string>();
+                for (int i = 0; i < curLine; i = i + 1) { nextLines.Add(lines[i]); }
+                nextLines.Add(left + pLines[0]);
+                for (int pi = 1; pi < lastIdx; pi = pi + 1) { nextLines.Add(pLines[pi]); }
+                nextLines.Add(lastP + right);
+                for (int i = curLine + 1; i < lines.Count; i = i + 1) { nextLines.Add(lines[i]); }
+                lines = nextLines;
+            } else {
+                lines[curLine] = left + pLines[0];
+                for (int pi = 1; pi < lastIdx; pi = pi + 1) {
+                    lines.Insert(curLine + pi, pLines[pi]);
+                }
+                lines.Insert(curLine + lastIdx, lastP + right);
+            }
             curLine = curLine + lastIdx;
             curCol = lastP.Length;
         }
@@ -275,8 +284,8 @@ public partial class CodeEditor {
                     // 保留前导缩进，在缩进后添加注释符
                     int ws = 0;
                     while (ws < s.Length) {
-                        string ch = s.Substring(ws, 1);
-                        if (ch == " " || ch == "\t") { ws = ws + 1; } else { break; }
+                        int ch = s[ws] & 255;
+                        if (ch == 32 || ch == 9) { ws = ws + 1; } else { break; }
                     }
                     string indent = s.Substring(0, ws);
                     string codePart = s.Substring(ws, s.Length - ws);
@@ -349,8 +358,8 @@ public partial class CodeEditor {
     public static string UncommentTok(string s, string tok) {
         int i = 0;
         while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == " " || ch == "\t") { i = i + 1; }
+            int ch = s[i] & 255;
+            if (ch == 32 || ch == 9) { i = i + 1; }
             else { break; }
         }
         string lead = s.Substring(0, i);
@@ -358,7 +367,7 @@ public partial class CodeEditor {
         int tl = tok.Length;
         if (rest.Length >= tl && rest.Substring(0, tl) == tok) {
             rest = rest.Substring(tl, rest.Length - tl);
-            if (rest.Length >= 1 && rest.Substring(0, 1) == " ") {
+            if (rest.Length >= 1 && (rest[0] & 255) == 32) {
                 rest = rest.Substring(1, rest.Length - 1);
             }
         }

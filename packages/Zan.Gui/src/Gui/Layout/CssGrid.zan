@@ -3,6 +3,16 @@ using System.Collections.Generic;
 using Gui;
 namespace Gui;
 public class CssGrid {
+    static Dict<string, List<GridTrack>> s_trackCache;
+    static GridTrack s_autoTrack;
+    static GridTrack AutoTrack() {
+        if (CssGrid.s_autoTrack == null) {
+            GridTrack tr = new GridTrack();
+            tr.kind = 2;
+            CssGrid.s_autoTrack = tr;
+        }
+        return CssGrid.s_autoTrack;
+    }
     static GridLine ParseLine(string v) {
         GridLine gl = new GridLine();
         List<string> t = StyleSheet.Tokens(v);
@@ -30,12 +40,12 @@ public class CssGrid {
         return gl;
     }
     static bool HasAutoRepeat(string v) {
-        if (v == null || v == "") { return false; }
+        if (v == null || v.IndexOf("(") < 0) { return false; }
         string lo = StyleSheet.Lower(v);
         return lo.IndexOf("auto-fill") >= 0 || lo.IndexOf("auto-fit") >= 0;
     }
     static bool HasAutoFit(string v) {
-        if (v == null || v == "") { return false; }
+        if (v == null || v.IndexOf("(") < 0) { return false; }
         return StyleSheet.Lower(v).IndexOf("auto-fit") >= 0;
     }
     static int TrackMinPx(GridTrack tr) {
@@ -45,7 +55,19 @@ public class CssGrid {
         return 0;
     }
     static List<GridTrack> ParseTracks(string v) {
-        return CssGrid.ParseTracksForWidth(v, 0 - 1, 0);
+        if (v == null || v == "") { return new List<GridTrack>(); }
+        if (CssGrid.HasAutoRepeat(v)) {
+            return CssGrid.ParseTracksForWidth(v, 0 - 1, 0);
+        }
+        if (CssGrid.s_trackCache == null) {
+            CssGrid.s_trackCache = new Dict<string, List<GridTrack>>();
+        }
+        List<GridTrack> hit = null;
+        if (CssGrid.s_trackCache.TryGetValue(v, out hit)) { return hit; }
+        List<GridTrack> parsed = CssGrid.ParseTracksForWidth(v, 0 - 1, 0);
+        if (CssGrid.s_trackCache.Count >= 256) { CssGrid.s_trackCache.Clear(); }
+        CssGrid.s_trackCache[v] = parsed;
+        return parsed;
     }
     static List<GridTrack> ParseTracksForWidth(string v, int avail, int gap) {
         List<GridTrack> out2 = new List<GridTrack>();
@@ -55,13 +77,7 @@ public class CssGrid {
             string w = t[i];
             if (CssGrid.StartsWith(w, "repeat(") && CssGrid.EndsWith(w, ")")) {
                 string inner = w.Substring(7, w.Length - 8);
-                int depth = 0;
-                int comma = 0 - 1;
-                for (int k = 0; k < inner.Length; k = k + 1) {
-                    if (inner[k] == 40) { depth = depth + 1; }
-                    else if (inner[k] == 41) { depth = depth - 1; }
-                    else if (inner[k] == 44 && depth == 0) { comma = k; break; }
-                }
+                int comma = Css.TopComma(inner);
                 if (comma < 0) { continue; }
                 string countTok = StyleSheet.Lower(StyleSheet.Trim(
                     inner.Substring(0, comma)));
@@ -122,20 +138,14 @@ public class CssGrid {
         }
         if (CssGrid.StartsWith(w, "minmax(") && CssGrid.EndsWith(w, ")")) {
             string inner = w.Substring(7, w.Length - 8);
-            int depth = 0;
-            int comma = 0 - 1;
-            for (int k = 0; k < inner.Length; k = k + 1) {
-                if (inner[k] == 40) { depth = depth + 1; }
-                else if (inner[k] == 41) { depth = depth - 1; }
-                else if (inner[k] == 44 && depth == 0) { comma = k; break; }
-            }
+            int comma = Css.TopComma(inner);
             tr.kind = 4;
             GridTrack lo = comma > 0
                 ? CssGrid.ParseOne(StyleSheet.Trim(inner.Substring(0, comma)))
-                : CssGrid.ParseOne("auto");
+                : CssGrid.AutoTrack();
             GridTrack hi = comma > 0
                 ? CssGrid.ParseOne(StyleSheet.Trim(inner.Substring(comma + 1)))
-                : CssGrid.ParseOne("auto");
+                : CssGrid.AutoTrack();
             tr.minKind = lo.kind; tr.minVal = lo.val;
             tr.maxKind = hi.kind; tr.maxVal = hi.val;
             return tr;
@@ -171,6 +181,21 @@ public class CssGrid {
         if (s == null || suf == null || s.Length < suf.Length) { return false; }
         return s.EndsWith(suf);
     }
+    static int EnsureRows(List<bool> occ, int nCols, int capRows, int needRows) {
+        while (capRows < needRows) {
+            for (int k = 0; k < nCols; k = k + 1) { occ.Add(false); }
+            capRows = capRows + 1;
+        }
+        return capRows;
+    }
+    static void CommitSlot(GridItemSlot slot, List<bool> occ, int nCols,
+                           int colStart, int rowStart, int colSpan, int rowSpan) {
+        slot.colStart = colStart;
+        slot.colSpan = colSpan;
+        slot.rowStart = rowStart;
+        slot.rowSpan = rowSpan;
+        CssGrid.Mark(occ, nCols, colStart, rowStart, colSpan, rowSpan);
+    }
     static GridPlace Place(List<StyleBox> itemStyles, int expCols, int expRows) {
         GridPlace pl = new GridPlace();
         int n = itemStyles.Count;
@@ -202,14 +227,10 @@ public class CssGrid {
             if (r0[i] >= 0 && r0[i] + rN[i] > nRows) { nRows = r0[i] + rN[i]; }
         }
         List<bool> occ = new List<bool>();
-        int capRows = nRows;
-        for (int k = 0; k < nCols * capRows; k = k + 1) { occ.Add(false); }
+        int capRows = CssGrid.EnsureRows(occ, nCols, 0, nRows);
         for (int i = 0; i < n; i = i + 1) {
             if (c0[i] < 0 || r0[i] < 0) { continue; }
-            GridItemSlot slot = pl.slots[i];
-            slot.colStart = c0[i]; slot.colSpan = cN[i];
-            slot.rowStart = r0[i]; slot.rowSpan = rN[i];
-            CssGrid.Mark(occ, nCols, c0[i], r0[i], cN[i], rN[i]);
+            CssGrid.CommitSlot(pl.slots[i], occ, nCols, c0[i], r0[i], cN[i], rN[i]);
         }
         for (int i = 0; i < n; i = i + 1) {
             if (r0[i] < 0 || c0[i] >= 0) { continue; }
@@ -219,36 +240,24 @@ public class CssGrid {
                 occ = CssGrid.Widen(occ, nCols, capRows, c + cN[i]);
                 nCols = c + cN[i];
             }
-            GridItemSlot slot = pl.slots[i];
-            slot.colStart = c; slot.colSpan = cN[i];
-            slot.rowStart = r0[i]; slot.rowSpan = rN[i];
-            CssGrid.Mark(occ, nCols, c, r0[i], cN[i], rN[i]);
+            CssGrid.CommitSlot(pl.slots[i], occ, nCols, c, r0[i], cN[i], rN[i]);
         }
         for (int i = 0; i < n; i = i + 1) {
             if (c0[i] < 0 || r0[i] >= 0) { continue; }
             int r = CssGrid.FindFreeInCol(occ, nCols, capRows, c0[i], rN[i]);
             if (r < 0) {
                 r = capRows;
-                while (capRows < r + rN[i]) {
-                    for (int k = 0; k < nCols; k = k + 1) { occ.Add(false); }
-                    capRows = capRows + 1;
-                }
+                capRows = CssGrid.EnsureRows(occ, nCols, capRows, r + rN[i]);
             }
             if (r + rN[i] > nRows) { nRows = r + rN[i]; }
-            GridItemSlot slot = pl.slots[i];
-            slot.colStart = c0[i]; slot.colSpan = cN[i];
-            slot.rowStart = r; slot.rowSpan = rN[i];
-            CssGrid.Mark(occ, nCols, c0[i], r, cN[i], rN[i]);
+            CssGrid.CommitSlot(pl.slots[i], occ, nCols, c0[i], r, cN[i], rN[i]);
         }
         int cr = 0;
         int cc = 0;
         for (int i = 0; i < n; i = i + 1) {
             if (c0[i] >= 0 || r0[i] >= 0) { continue; }
             while (true) {
-                while (cr + rN[i] > capRows) {
-                    for (int k = 0; k < nCols; k = k + 1) { occ.Add(false); }
-                    capRows = capRows + 1;
-                }
+                capRows = CssGrid.EnsureRows(occ, nCols, capRows, cr + rN[i]);
                 if (cc + cN[i] <= nCols
                     && CssGrid.Free(occ, nCols, cc, cr, cN[i], rN[i])) {
                     break;
@@ -257,10 +266,7 @@ public class CssGrid {
                 if (cc + cN[i] > nCols) { cr = cr + 1; cc = 0; }
             }
             if (cr + rN[i] > nRows) { nRows = cr + rN[i]; }
-            GridItemSlot slot = pl.slots[i];
-            slot.colStart = cc; slot.colSpan = cN[i];
-            slot.rowStart = cr; slot.rowSpan = rN[i];
-            CssGrid.Mark(occ, nCols, cc, cr, cN[i], rN[i]);
+            CssGrid.CommitSlot(pl.slots[i], occ, nCols, cc, cr, cN[i], rN[i]);
             cc = cc + cN[i];
         }
         pl.nCols = nCols;
@@ -315,21 +321,26 @@ public class CssGrid {
         List<int> limit = new List<int>();
         List<bool> flex = new List<bool>();
         List<int> frVal = new List<int>();
+        List<int> contentMax = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { contentMax.Add(0); }
+        for (int k = 0; k < span1At.Count; k = k + 1) {
+            int idx = span1At[k];
+            if (idx >= 0 && idx < n && span1Sz[k] > contentMax[idx]) {
+                contentMax[idx] = span1Sz[k];
+            }
+        }
         int frTotal = 0;
         int big = 1 << 28;
+        GridTrack autoDef = CssGrid.AutoTrack();
         for (int i = 0; i < n; i = i + 1) {
             GridTrack d = null;
             if (i < defs.Count) { d = defs[i]; }
             else if (auto != null && auto.Count > 0) { d = auto[(i - defs.Count) % auto.Count]; }
-            int content = 0;
-            for (int k = 0; k < span1At.Count; k = k + 1) {
-                if (span1At[k] == i && span1Sz[k] > content) { content = span1Sz[k]; }
-            }
-            int b = content;
+            int b = contentMax[i];
             int lim = big;
             bool fx = false;
             int fv = 0;
-            if (d == null) { d = CssGrid.ParseOne("auto"); }
+            if (d == null) { d = autoDef; }
             if (d.kind == 0) { b = d.val; lim = d.val; }
             else if (d.kind == 1) {
                 if (avail >= 0) { b = d.val * avail / 1000; lim = b; }
