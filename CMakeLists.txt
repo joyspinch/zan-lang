@@ -7009,7 +7009,8 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       designer_typed_props_adapter scrollcolumn_cull_measure
       control_input_host_reentry dockhost_preparation_geometry browser_hosted_lifecycle
       app_loop_participant browser_native_lifecycle overlay_escape_input
-      routed_click_doubleclick scroll_geometry_input caption_feedback_and_events)
+      routed_click_doubleclick scroll_geometry_input caption_feedback_and_events
+      gui_overlay_layout_encapsulation)
     add_test(NAME conformance_gui_${_routing_case}
       COMMAND ${CMAKE_COMMAND}
         -DZANC=$<TARGET_FILE:zanc>

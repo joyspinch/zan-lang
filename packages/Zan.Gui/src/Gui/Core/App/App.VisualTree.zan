@@ -316,6 +316,28 @@ public partial class App {
         this.capturedDragGesture = false;
     }
     public Control GetCapturedPointer() { return this.capturedPointerControl; }
+    public bool IsPointerEligible(Control c) {
+        if (c == null) { return false; }
+        if (overlayHost != null && overlayHost.HasActive()) {
+            Control top = overlayHost.ActiveRoot();
+            return top != null && top.ContainsInputControl(c);
+        }
+        return true;
+    }
+    public void RequestPaintRectAnim(int x, int y, int w, int h) {
+        this.RequestAnimationFrameIn(x - paintOffsetX, y - paintOffsetY, w, h);
+    }
+    internal void ClearHoverOutside(Control popup) {
+        if (lastHoveredControl == null) { return; }
+        if (popup != null && popup.ContainsInputControl(lastHoveredControl)) { return; }
+        Control hovered = lastHoveredControl;
+        lastHoveredControl = null;
+        lastDrawerHoverVisual = null;
+        lastDrawerHoverValid = false;
+        if (focus != null) { focus.ClearHover(); }
+        RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", hovered, mouseX, mouseY, currentPointerType);
+        Control.RouteEvent(hovered, leave);
+    }
     public void ReleaseInputSubtree(Control root) {
         if (root == null) { return; }
         List<InputRetirementToken> retiring = this.SnapshotInputRetirements(root, null, false);
@@ -590,10 +612,11 @@ public partial class App {
             }
             if (window.EventButton() != 1) { this.ArmRetainedLongPress(target, inputRoot, pointerType); }
         }
+        Control routeStop = popup != null ? popup.parent : null;
         if (eventKind == 2 && window.EventButton() != 1) {
             Control node = target;
             bool assigned = false;
-            while (node != null) {
+            while (node != null && node != routeStop) {
                 int id = node.WidgetId();
                 if (node.InputFocusEligible(this, inputRoot)
                     && (node.InputFocusCapabilities() & 1) != 0) {
@@ -602,12 +625,13 @@ public partial class App {
                     assigned = true;
                     break;
                 }
+                if (node == inputRoot) { break; }
                 node = node.parent;
             }
             if (!assigned && focus != null) { focus.ClearFocus(); }
         }
         if (dispatchTicket != pointerGestureTicket) { return true; }
-        Control.RouteEvent(target, e);
+        Control.RouteEventTo(target, e, routeStop);
         if (dispatchTicket != pointerGestureTicket) { return true; }
         if (eventKind == 1 && !e.handled && pointerDown && routedDragSource != null
                 && dispatchTicket == pointerGestureTicket) {
@@ -621,7 +645,7 @@ public partial class App {
                     dragStartEvt.modifiers = e.modifiers;
                     dragStartEvt.gestureApp = this;
                     dragStartEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(routedDragSource, dragStartEvt);
+                    Control.RouteEventTo(routedDragSource, dragStartEvt, routeStop);
                     if (dispatchTicket != pointerGestureTicket) { return true; }
                 }
                 if (routedDragStarted && this.PointerEndpointCurrent(routedDragSource, inputRoot)) {
@@ -629,7 +653,7 @@ public partial class App {
                     dragEvt.modifiers = e.modifiers;
                     dragEvt.gestureApp = this;
                     dragEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(routedDragSource, dragEvt);
+                    Control.RouteEventTo(routedDragSource, dragEvt, routeStop);
                     if (dispatchTicket != pointerGestureTicket) { return true; }
                 }
             }
@@ -649,7 +673,7 @@ public partial class App {
                     clickEvt.isDoubleClick = primaryDoubleClick;
                     clickEvt.gestureApp = this;
                     clickEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(clickTarget, clickEvt);
+                    Control.RouteEventTo(clickTarget, clickEvt, routeStop);
                     if (clickEvt.handled) { e.Handle(); }
                     if (pointerType == 1 && dispatchTicket == pointerGestureTicket
                             && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
@@ -658,7 +682,7 @@ public partial class App {
                         tapEvt.modifiers = e.modifiers;
                         tapEvt.gestureApp = this;
                         tapEvt.gestureTicket = dispatchTicket;
-                        Control.RouteEvent(clickTarget, tapEvt);
+                        Control.RouteEventTo(clickTarget, tapEvt, routeStop);
                     }
                     if (primaryDoubleClick && dispatchTicket == pointerGestureTicket
                             && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
@@ -668,7 +692,7 @@ public partial class App {
                         dblEvt.isDoubleClick = true;
                         dblEvt.gestureApp = this;
                         dblEvt.gestureTicket = dispatchTicket;
-                        Control.RouteEvent(clickTarget, dblEvt);
+                        Control.RouteEventTo(clickTarget, dblEvt, routeStop);
                     }
                 }
             } else if (window.EventButton() == 1 && clickTarget != null) {
@@ -680,7 +704,7 @@ public partial class App {
                 rightEvt.isDoubleClick = rightDoubleClick;
                 rightEvt.gestureApp = this;
                 rightEvt.gestureTicket = dispatchTicket;
-                Control.RouteEvent(clickTarget, rightEvt);
+                Control.RouteEventTo(clickTarget, rightEvt, routeStop);
                 if (rightEvt.handled) { e.Handle(); }
                 if (rightDoubleClick && dispatchTicket == pointerGestureTicket
                         && this.PointerEndpointCurrent(clickTarget, inputRoot)) {
@@ -690,7 +714,7 @@ public partial class App {
                     rightDblEvt.isDoubleClick = true;
                     rightDblEvt.gestureApp = this;
                     rightDblEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(clickTarget, rightDblEvt);
+                    Control.RouteEventTo(clickTarget, rightDblEvt, routeStop);
                     if (rightDblEvt.handled) { e.Handle(); }
                 }
             }
@@ -703,7 +727,7 @@ public partial class App {
                     dropEvt.modifiers = e.modifiers;
                     dropEvt.gestureApp = this;
                     dropEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(dropTarget, dropEvt);
+                    Control.RouteEventTo(dropTarget, dropEvt, routeStop);
                 }
             }
             if (pointerType == 1 && touchSlopExceeded && gestureOriginControl != null
@@ -720,7 +744,7 @@ public partial class App {
                     swipeEvt.delta = dir;
                     swipeEvt.gestureApp = this;
                     swipeEvt.gestureTicket = dispatchTicket;
-                    Control.RouteEvent(gestureOriginControl, swipeEvt);
+                    Control.RouteEventTo(gestureOriginControl, swipeEvt, routeStop);
                 }
             }
         }
@@ -737,6 +761,9 @@ public partial class App {
                 Control.RouteEvent(hovered, leave);
                 if (dispatchTicket != pointerGestureTicket) { return true; }
             }
+        }
+        if (popup != null && (eventKind == 1 || eventKind == 2 || eventKind == 3 || eventKind == 13)) {
+            return true;
         }
         return e.handled;
     }

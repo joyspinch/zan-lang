@@ -1,0 +1,276 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class ClickCounter {
+    public int count;
+    public void Bump() { count = count + 1; }
+}
+
+class GuiOverlayLayoutEncapsulationTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("EncapsulationTest FAIL: " + label); }
+    }
+
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action a = Dispatcher.Take();
+            if (a == null) { return; }
+            a();
+        }
+    }
+
+    static void TestTabSwitchGlobalLayoutStability(App app) {
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("padding: 12; gap: 10;");
+
+        Card topCard = new Card();
+        topCard.SetInlineStyleCss("padding: 8; gap: 6;");
+        Panel row1 = Panel.Row();
+        row1.Add(new Button("Skin A"));
+        row1.Add(new Button("Skin B"));
+        Panel row2 = Panel.Row();
+        row2.Add(new Button("Fx A"));
+        row2.Add(new Button("Fx B"));
+        topCard.Add(row1);
+        topCard.Add(row2);
+        root.Add(topCard);
+
+        Tabs tabs = new Tabs(Tabs.Line(), Tabs.Horizontal());
+        tabs.Grow();
+        tabs.Add("Short", false);
+        tabs.Add("Tall", false);
+
+        ScrollColumn sc0 = new ScrollColumn();
+        sc0.Grow();
+        for (int i = 0; i < 4; i = i + 1) { sc0.Add(new Button("S" + Convert.ToString(i))); }
+        tabs.Page(0).Add(sc0);
+
+        ScrollColumn sc1 = new ScrollColumn();
+        sc1.Grow();
+        for (int i = 0; i < 40; i = i + 1) { sc1.Add(new Button("T" + Convert.ToString(i))); }
+        tabs.Page(1).Add(sc1);
+
+        root.Add(tabs);
+        app.SetRootControl(root);
+
+        tabs.Select(0);
+        root.UseApp(app);
+        root.MeasureTree(app, 800);
+        root.Arrange(0, 0, 800, 540);
+        int h0 = topCard.bh;
+        int pref0 = topCard.prefH;
+        Check(h0 >= pref0 && h0 > 0, "topCard not crushed on short tab h0=" + Convert.ToString(h0) + " pref=" + Convert.ToString(pref0));
+
+        tabs.Select(1);
+        root.MeasureTree(app, 800);
+        root.Arrange(0, 0, 800, 540);
+        int h1 = topCard.bh;
+        Check(h1 == h0, "switching to tall tab keeps topCard height identical h0=" + Convert.ToString(h0) + " h1=" + Convert.ToString(h1));
+        Check(tabs.by + tabs.bh <= 540, "tabs stays bounded inside viewport");
+        app.SetRootControl(null);
+    }
+
+    static void TestGlassPopupOpacityAndTabStates(App app) {
+        app.EnableSkins();
+        app.UseSkin("liquid");
+
+        RichMenuPanel menu = new RichMenuPanel(null, 0);
+        Check(menu.StyleType() == "contextmenu", "RichMenuPanel uses contextmenu style type");
+        StyleBox menuBox = menu.ResolveStyle(app, Style.SNormal());
+        int menuA = StyleBox.AlphaOf(menuBox.bg);
+        Check(menuA >= 210, "liquid contextmenu bg alpha >= 210 actual=" + Convert.ToString(menuA));
+
+        Modal modal = new Modal("Dialog");
+        Check(Style.Has(modal.modalBox.Class, "modal-surface"), "Modal box carries modal-surface class");
+        StyleBox modalBox = modal.modalBox.ResolveStyle(app, Style.SNormal());
+        int modalA = StyleBox.AlphaOf(modalBox.bg);
+        Check(modalA >= 210, "liquid modal-surface bg alpha >= 210 actual=" + Convert.ToString(modalA));
+
+        Card popCard = new Card();
+        popCard.ClassName = "popover-card";
+        StyleBox popBox = popCard.ResolveStyle(app, Style.SNormal());
+        Check(StyleBox.AlphaOf(popBox.bg) >= 210, "liquid popover-card bg alpha >= 210");
+
+        StyleBox tabHover = Style.Of(app, "tab", "line", Style.SHover());
+        StyleBox tabSel = Style.Of(app, "tab", "line", Style.SSelected());
+        StyleBox tabSelHover = Style.Of(app, "tab", "line", Style.SSelected() | Style.SHover());
+        Check(tabSel.FgOr(0) == app.theme.primary, "liquid selected tab uses primary color");
+        Check(tabSelHover.FgOr(0) == app.theme.primary, "liquid selected:hover tab preserves primary color");
+        Check(StyleBox.AlphaOf(tabSel.bg) > StyleBox.AlphaOf(tabHover.bg),
+            "liquid selected tab pill is visually stronger than unselected hover");
+
+        app.UseSkin("frosted");
+        StyleBox frostedMenu = menu.ResolveStyle(app, Style.SNormal());
+        Check(StyleBox.AlphaOf(frostedMenu.bg) >= 210, "frosted contextmenu bg alpha >= 210");
+        StyleBox frostedModal = modal.modalBox.ResolveStyle(app, Style.SNormal());
+        Check(StyleBox.AlphaOf(frostedModal.bg) >= 210, "frosted modal-surface bg alpha >= 210");
+    }
+
+    static void TestOverlayEventIsolation(App app) {
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("padding: 10; gap: 8;");
+
+        ClickCounter bgClicks = new ClickCounter();
+        Button bgBtn = new Button("Background");
+        bgBtn.Click.Add(bgClicks.Bump);
+        root.Add(bgBtn);
+
+        ScrollColumn bgScroll = new ScrollColumn();
+        bgScroll.SetInlineStyleCss("height: 160;");
+        for (int i = 0; i < 20; i = i + 1) { bgScroll.Add(new Button("Row " + Convert.ToString(i))); }
+        root.Add(bgScroll);
+
+        PopupControl pop = new PopupControl("popup", 220, 120);
+        Button trig = new Button("Open Popup");
+        pop.TriggerContent = trig;
+        ClickCounter innerClicks = new ClickCounter();
+        Panel popPanel = Panel.Column();
+        popPanel.SetInlineStyleCss("padding: 8;");
+        Button innerBtn = new Button("Inside Popup");
+        innerBtn.Click.Add(innerClicks.Bump);
+        popPanel.Add(innerBtn);
+        pop.SetPopupContent(popPanel);
+        Check(!popPanel.StyleVisible(), "closed popup panel starts hidden");
+        root.Add(pop);
+
+        app.SetRootControl(root);
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 800, 600));
+        app.EndOffscreenFrame();
+        Drain(app);
+
+        pop.SetOpen(true);
+        Check(pop.IsOpen() && popPanel.StyleVisible(), "opening popup shows popupPanel");
+        Check(!app.IsPointerEligible(bgBtn), "background button ineligible while popup open");
+        Check(app.IsPointerEligible(innerBtn), "inner popup button eligible while popup open");
+
+        int ix = innerBtn.bx + innerBtn.bw / 2;
+        int iy = innerBtn.by + innerBtn.bh / 2;
+        app.ProcessOffscreenInput(2, ix, iy, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, ix, iy, 0, 0, 0, 0);
+        Drain(app);
+        Check(innerClicks.count == 1, "click inside popup fires inner button once");
+        Check(bgClicks.count == 0, "click inside popup never penetrates to background");
+
+        // Wheel over popup must not scroll background ScrollColumn
+        app.ProcessOffscreenInput(13, ix, iy, 0, 0, -120, 0);
+        Drain(app);
+        Check(bgScroll.ScrollTop() == 0, "wheel on popup never scrolls background ScrollColumn");
+
+        pop.SetOpen(false);
+        Check(!popPanel.StyleVisible(), "closing popup hides popupPanel");
+
+        // Modal mask blocks wheel & click penetration and closes cleanly on mask click
+        Modal modal = new Modal("Mask Test");
+        modal.Content(new Label("Modal body"));
+        modal.Show();
+        app.overlayHost.Push(app, null, modal, true);
+        Check(modal.bw == app.canvas.Width() && modal.bh == app.canvas.Height(),
+            "OverlayHost arranges unanchored Modal to full viewport");
+        int mx = 8;
+        int my = 8;
+        app.ProcessOffscreenInput(13, mx, my, 0, 0, -120, 0);
+        Drain(app);
+        Check(bgScroll.ScrollTop() == 0, "wheel on modal mask never scrolls background");
+        app.ProcessOffscreenInput(2, mx, my, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, mx, my, 0, 0, 0, 0);
+        Drain(app);
+        Check(!modal.IsOpen(), "clicking modal mask closes maskClosable modal");
+        Check(bgClicks.count == 0, "clicking modal mask never clicks background button");
+
+        app.SetRootControl(null);
+    }
+
+    static void TestTooltipCoordsInPushedLayerAndWrapGuard(App app) {
+        app.reducedMotion = true;
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("padding: 180 0 0 160;");
+        Card layerCard = new Card();
+        layerCard.SetInlineStyleCss("transform: scale(0.99); padding: 12;");
+        Button tipBtn = new Button("Hover Tip");
+        tipBtn.Tip = "Layer Tip";
+        tipBtn.TipSide = "top";
+        layerCard.Add(tipBtn);
+        root.Add(layerCard);
+
+        app.SetRootControl(root);
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 800, 600));
+        app.EndOffscreenFrame();
+        Drain(app);
+
+        int bx = tipBtn.bx + tipBtn.bw / 2;
+        int by = tipBtn.by + tipBtn.bh / 2;
+        Check(bx >= 160 && by >= 180, "button is positioned away from top-left origin");
+        app.ProcessOffscreenInput(1, bx, by, 0, 0, 0, 0);
+        Drain(app);
+
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(0, 0, 800, 600));
+        // Inspect requested tooltip anchor before Flush clears it
+        TooltipRequest tipReq = Tooltip.Suspend(app);
+        Check(tipReq.text.Contains("Layer Tip"), "tooltip requested for hovered button in transformed layer actual=" + tipReq.text);
+        Check(tipReq.x >= 160 && tipReq.y >= 180,
+            "tooltip anchor uses window-space coords instead of layer-local (0,0) actual="
+            + Convert.ToString(tipReq.x) + "," + Convert.ToString(tipReq.y));
+        Tooltip.Restore(app, tipReq);
+        app.EndOffscreenFrame();
+        Drain(app);
+
+        // WrapLines termination guard with narrow maxW on multibyte CJK text
+        List<string> wrapped = Tooltip.WrapLines("中文超长字符串不带空格测试换行边界守卫", 14, 10);
+        Check(wrapped.Count > 1, "Tooltip.WrapLines terminates cleanly on narrow multibyte text");
+
+        app.reducedMotion = false;
+        app.SetRootControl(null);
+    }
+
+    static void TestStandardComponentEncapsulation(App app) {
+        // 1. Timeline row height is not double-scaled at 150% DPI
+        app.SetOffscreenViewport(800, 600, 150);
+        int rh = Timeline.RowHeightFor(app, "");
+        Check(rh > 40 && rh < 165, "Timeline.RowHeightFor avoids double scaling at 150% DPI actual=" + Convert.ToString(rh));
+
+        // 2. Collapse.AddPanel wraps text by default
+        Collapse col = new Collapse();
+        CollapseItem item = col.AddPanel("Section", "Long wrapped description paragraph for collapse panel.");
+        Check(item.Content is Label && ((Label)item.Content).wrap, "Collapse.AddPanel creates wrapped Label");
+
+        // 3. Steps fits strictly inside container width with zero right overflow
+        Steps steps = new Steps();
+        steps.AddStepDesc("选择皮肤", "16 套内置预设");
+        steps.AddStepDesc("配置材质", "玻璃/柔陶/波普");
+        steps.AddStepDesc("叠加动效", "脏矩形合成");
+        steps.AddStepDesc("实时验收", "全 DPI 对齐");
+        steps.Current.Set(1);
+        steps.BuildSteps();
+        steps.UseApp(app);
+        steps.MeasureTree(app, 600);
+        steps.Arrange(0, 0, 600, 80);
+        Check(steps.ChildCount() == 4, "Steps has 4 step items");
+        Control lastStep = steps.ChildAt(3);
+        Check(Style.Has(lastStep.Class, "last"), "last horizontal step carries .last class");
+        Check(lastStep.bx + lastStep.bw <= steps.bx + steps.bw + 1,
+            "Steps last item stays within right bound lastRight="
+            + Convert.ToString(lastStep.bx + lastStep.bw) + " stepsRight=" + Convert.ToString(steps.bx + steps.bw));
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        App app = App.CreateOffscreen("encapsulation regression", 800, 600);
+        app.SetChromeVisible(false);
+        TestTabSwitchGlobalLayoutStability(app);
+        TestGlassPopupOpacityAndTabStates(app);
+        TestOverlayEventIsolation(app);
+        TestTooltipCoordsInPushedLayerAndWrapGuard(app);
+        TestStandardComponentEncapsulation(app);
+        app.StopLoop();
+        app.SetRootControl(null);
+        Drain(app);
+        app.canvas.Destroy();
+        Console.WriteLine("GUI_OVERLAY_LAYOUT_ENCAPSULATION_OK");
+    }
+}
