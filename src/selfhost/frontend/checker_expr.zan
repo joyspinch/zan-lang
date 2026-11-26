@@ -393,6 +393,13 @@ public partial class Checker {
             }
             return;
         }
+        if (k == AK.AwaitExpr()) {
+            Node prevAsyncOk = asyncCallOk;
+            asyncCallOk = n.a;
+            CheckExpr(n.a);
+            asyncCallOk = prevAsyncOk;
+            return;
+        }
         if (k == AK.TupleExpr()) {
             int i = 0;
             while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
@@ -627,6 +634,25 @@ public partial class Checker {
         return pick;
     }
 
+    bool ArgIsSpawnCallee(Node call) {
+        if (call == null || call.a == null || call.a.kind != AK.MemberAccess() || call.kids.Count != 1) {
+            return false;
+        }
+        return call.a.sval == "Spawn" || call.a.sval == "Run";
+    }
+
+    void CheckAsyncCallAsValue(Node m, Node call) {
+        if (m == null || m.kind != AK.MethodDecl()) { return; }
+        if (!HasMod(m, MOD.Async())) { return; }
+        if (asyncCallOk == call) { return; }
+        Node retTy = m.type;
+        if (IsTaskTy(retTy)) { retTy = TaskElemTy(retTy); }
+        if (retTy == null || retTy.sval == "void") { return; }
+        diags.Error("[E2116] async call '" + m.sval + "' used as a value without 'await': write 'await "
+            + m.sval + "(...)' (allowed in synchronous methods too), or call it as a statement / pass it to Task.Spawn or Task.Run to run it detached",
+            call.line, call.col);
+    }
+
     void CheckCall(Node n) {
         Node callee = n.a;
         // This callee marker is the builtin Task routing decision consumed by
@@ -675,7 +701,12 @@ public partial class Checker {
                 taskMethod = CheckTaskActionMethod(n.kids[i]);
                 if (taskMethod || n.kids[i].kind == AK.Lambda()) { curTargetType = MkType("Action"); }
             }
-            if (!taskMethod) { CheckExpr(n.kids[i]); }
+            if (!taskMethod) {
+                Node prevAsyncOk = asyncCallOk;
+                if (ArgIsSpawnCallee(n)) { asyncCallOk = n.kids[i]; }
+                CheckExpr(n.kids[i]);
+                asyncCallOk = prevAsyncOk;
+            }
             if (callTargetMethod != null) {
                 CheckErasedArrayConversion(curTargetType, InferType(n.kids[i]),
                     n.kids[i] != null && n.kids[i].kind == AK.NullLit(), n.kids[i].line, n.kids[i].col);
@@ -703,6 +734,7 @@ public partial class Checker {
             }
             if (!hasNamed) { CheckTaskArgs(cands, n); }
             CheckMethodConstraints(cands, n);
+            CheckAsyncCallAsValue(cands, n);
             return;
         }
         if (callee != null && callee.kind == AK.MemberAccess()) {
@@ -740,6 +772,7 @@ public partial class Checker {
                 n.resolvedSym = mm;
                 n.isIntrinsic = (mm.mods & MOD.Intrinsic()) != 0 ||
                                 (targetCls != null && (targetCls.mods & MOD.Intrinsic()) != 0);
+                CheckAsyncCallAsValue(mm, n);
             }
             return;
         }

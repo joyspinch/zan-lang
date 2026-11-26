@@ -409,7 +409,7 @@ partial class Irgen {
     // "no format": the value is rendered the default way. The rules are
     // the host's, not C#'s: D/X need a digit count (> 0), F/E clamp it,
     // G means "significant digits", and 0/# is the custom pattern.
-    string FormatSpecToPrintf(string spec, bool isUlong) {
+    string FormatSpecToPrintf(string spec, bool isDbl, bool isUlong) {
         if (spec == null || spec.Length == 0) { return ""; }
         string code = spec.Substring(0, 1);
         int digits = 0;
@@ -429,6 +429,17 @@ partial class Irgen {
         }
         if (code == "F" || code == "f") {
             if (digits > 512) { digits = 512; }
+            // Align with C host access_interp.c: integers in fixed-point format
+            // stay exact (ulong.MaxValue:F0 keeps every digit) when digits <= 20.
+            if (!isDbl && digits <= 20) {
+                string exact = isUlong ? "%llu" : "%lld";
+                if (digits > 0) {
+                    exact = exact + ".";
+                    int z = 0;
+                    while (z < digits) { exact = exact + "0"; z = z + 1; }
+                }
+                return exact;
+            }
             return "%." + Convert.ToString(digits) + "f";
         }
         if (code == "E" || code == "e") {
@@ -463,11 +474,22 @@ partial class Irgen {
     }
 
     // does the mapped printf pattern render as a double (a fixed/scientific
-    // spec on an integer widens it first)?
-    bool SpecWantsDouble(string spec) {
+    // spec on an integer widens it first unless exact integer :Fn was selected)?
+    bool SpecWantsDouble(string spec, bool isDbl) {
         if (spec == null || spec.Length == 0) { return false; }
         string code = spec.Substring(0, 1);
-        if (code == "F" || code == "f" || code == "E" || code == "e" || code == "G" || code == "g") { return true; }
+        if (code == "F" || code == "f") {
+            if (isDbl) { return true; }
+            int digits = 0;
+            int i = 1;
+            while (i < spec.Length) {
+                int d = spec[i] - 48;
+                if (d >= 0 && d <= 9) { if (digits <= 9999) { digits = digits * 10 + d; } }
+                i = i + 1;
+            }
+            return digits > 20;
+        }
+        if (code == "E" || code == "e" || code == "G" || code == "g") { return true; }
         if (code == "0" || code == "#") {
             int i = 0;
             while (i < spec.Length) {
@@ -514,13 +536,14 @@ partial class Irgen {
         if (isDbl && (code == "D" || code == "d" || code == "X" || code == "x")) {
             return new ExprVal(ToCStr(recv), MkType("string"));
         }
-        string pat = FormatSpecToPrintf(spec, isU);
+        string pat = FormatSpecToPrintf(spec, isDbl, isU);
         if (pat == "") { return new ExprVal(ToCStr(recv), MkType("string")); }
         string vop = recv.op;
         string vty = "i64";
         if (isDbl) { vty = "double"; }
-        else if (SpecWantsDouble(spec)) {
-            string d = NT(); L("  " + d + " = sitofp i64 " + recv.op + " to double");
+        else if (SpecWantsDouble(spec, isDbl)) {
+            string d = NT();
+            L("  " + d + " = " + (isU ? "uitofp" : "sitofp") + " i64 " + recv.op + " to double");
             vop = d; vty = "double";
         }
         string fp = FmtPatGlobal(pat);
