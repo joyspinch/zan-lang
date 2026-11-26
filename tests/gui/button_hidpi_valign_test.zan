@@ -1,0 +1,86 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Verify button label vertical centering stays balanced across 100%/125%/150%/200% DPI.
+// Regression guard for Win32 GDI tmAscent vs OS/2 font ascent baseline mismatch
+// in src/drivers/gui/gui_runtime_text.c (which previously pushed 125%-200% DPI
+// button text 4-5px below vertical center).
+class GuiButtonHidpiValignTest {
+    static int fails;
+
+    static void Check(bool ok, string msg) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + msg);
+    }
+
+    static void CheckLabel(App app, int dpi, string text, string tag) {
+        app.SetOffscreenViewport(320, 120, dpi);
+        app.canvas.Clear(0xFF000000);
+        Button btn = new Button(text);
+        btn.UseApp(app);
+        btn.MeasureTree(app);
+        int bw = btn.prefW > app.Scale(110) ? btn.prefW : app.Scale(110);
+        int bh = btn.prefH;
+        btn.Arrange(16, 16, bw, bh);
+        btn.RenderTree(app);
+
+        int minY = bh;
+        int maxY = -1;
+        for (int y = 1; y < bh - 1; y = y + 1) {
+            for (int x = 2; x < bw - 2; x = x + 1) {
+                int px = app.canvas.GetPixel(16 + x, 16 + y);
+                int r = (px >> 16) & 255;
+                int g = (px >> 8) & 255;
+                int b = px & 255;
+                if (r > 96 || g > 112 || b > 128) {
+                    if (y < minY) { minY = y; }
+                    if (y > maxY) { maxY = y; }
+                }
+            }
+        }
+        bool hasInk = maxY >= minY;
+        Check(hasInk, tag + " dpi=" + Convert.ToString(dpi) + " has ink");
+        if (!hasInk) { return; }
+        int topGap = minY;
+        int botGap = (bh - 1) - maxY;
+        int signedDiff = topGap - botGap;
+        int diff = signedDiff < 0 ? -signedDiff : signedDiff;
+        int maxAbs = dpi >= 200 ? 3 : 2;
+        Check(diff <= maxAbs && signedDiff <= 2,
+            tag + " dpi=" + Convert.ToString(dpi)
+            + " topGap=" + Convert.ToString(topGap)
+            + " botGap=" + Convert.ToString(botGap)
+            + " diff=" + Convert.ToString(signedDiff));
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("button-hidpi-valign", 320, 120);
+        app.SetChromeVisible(false);
+        app.SetBackdropFx(false);
+        app.UseAppCss("button { background: #102030; color: #ffffff; border: 0; border-radius: 0; }");
+        try {
+            int[] dpis = new int[4];
+            dpis[0] = 100;
+            dpis[1] = 125;
+            dpis[2] = 150;
+            dpis[3] = 200;
+            for (int i = 0; i < 4; i = i + 1) {
+                int dpi = dpis[i];
+                CheckLabel(app, dpi, "BUTTON", "en-caps");
+                #if WINDOWS
+                CheckLabel(app, dpi, "主要操作", "cn");
+                CheckLabel(app, dpi, "液态+流光", "cn-mix");
+                #endif
+            }
+        } finally {
+            app.canvas.Destroy();
+        }
+        if (fails == 0) {
+            Console.WriteLine("GUI_BUTTON_HIDPI_VALIGN_OK");
+        } else {
+            Environment.Exit(1);
+        }
+    }
+}

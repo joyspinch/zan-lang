@@ -7500,6 +7500,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
     set_tests_properties(conformance_gui_effects_coalesce PROPERTIES
       TIMEOUT 120 WORKING_DIRECTORY "${_gui_effects_coalesce_workdir}")
+    add_test(NAME conformance_gui_button_hidpi_valign
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/button_hidpi_valign_test.zan
+        "-DZANC_ARGS=--auto-stdlib;--subsystem;console${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_button_hidpi_valign.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_button_hidpi_valign${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_button_hidpi_valign PROPERTIES
+      TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
   endif()
 
   add_test(NAME conformance_trap_cat_sprite_cache

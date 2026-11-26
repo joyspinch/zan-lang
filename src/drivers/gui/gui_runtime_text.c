@@ -322,6 +322,7 @@ extern int zan_dw_text_width(const wchar_t *w, int len,
 extern int zan_dw_render(const wchar_t *w, int len,
     const wchar_t *family, float size, int bold,
     unsigned char **out_px, int *out_w, int *out_h, int *out_advance);
+EXPORT i32 zan_gui_font_ascent(i32 font_size);
 
 static int win_cp_is_emoji(unsigned int cp) {
     if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;
@@ -425,10 +426,20 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
     if (!wtext) return NULL;
 
+    int want_asc = (int)zan_gui_font_ascent(size);
     HFONT font = get_or_create_font(size, bold);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     SIZE ts;
     GetTextExtentPoint32W(g_text_dc, wtext, text_len, &ts);
+    TEXTMETRICW tm;
+    int top_off = 0;
+    if (GetTextMetricsW(g_text_dc, &tm) && tm.tmAscent > 0) {
+        /* GDI grid-fitting adds non-linear tmInternalLeading at HiDPI sizes
+         * (e.g. fs=21 -> tmAscent=24 vs OS/2 ascent=22). Align the rasterized
+         * baseline to y + zan_gui_font_ascent(size) so layout centering holds
+         * across all DPI scales. */
+        top_off = want_asc - (int)tm.tmAscent;
+    }
     int tw = ts.cx + 2;
     int th = ts.cy + 2;
     if (tw <= 0 || th <= 0) {
@@ -447,9 +458,8 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     TextOutW(g_text_dc, 0, 0, wtext, text_len);
     GdiFlush();
 
-    const zan_glyph_tile *tile =
-        zan_atlas_store_strided(ZAN_TILE_RUN, ksize, text, key_len,
-                                tw, th, 0, 0, (int)ts.cx, dbits, 4, dib_stride);
+    const zan_glyph_tile *tile = zan_atlas_store_strided(
+        ZAN_TILE_RUN, ksize, text, key_len, tw, th, 0, top_off, (int)ts.cx, dbits, 4, dib_stride);
 
     if (temp_bmp) {
         SelectObject(g_text_dc, old_bmp);
