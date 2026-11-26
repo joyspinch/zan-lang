@@ -32,6 +32,8 @@ public class DatePicker : Control {
     private string parsedText = "";
     private string parsedType = "";
     private int scaledBtnW = 34;
+    private weak App popupApp;
+    private Control activePopup;
     public DatePicker() {
         this.InitControl("datePicker");
         editor = new Input("YYYY-MM-DD");
@@ -425,12 +427,15 @@ public class DatePicker : Control {
             }
             if (h > 23) { h = 23; }
             if (mi > 59) { mi = 59; }
-            selected = dv;
-            hour = h;
-            minute = mi;
-            viewYear = dv.Year();
-            viewMonth = dv.Month();
-            if (notify) { Change.Raise(this); }
+            bool changed = selected == null || !dv.Equals(selected) || h != hour || mi != minute;
+            if (changed) {
+                selected = dv;
+                hour = h;
+                minute = mi;
+                viewYear = dv.Year();
+                viewMonth = dv.Month();
+                if (notify) { Change.Raise(this); }
+            }
             return;
         }
         DateTime value = this.ParseSingle(raw);
@@ -454,17 +459,23 @@ public class DatePicker : Control {
         while (cur != null) {
             if (cur is DatePicker) {
                 DatePicker dp = (DatePicker)cur;
+                if (dp.IsDisabled()) { return; }
                 DateTime d = cal.GetDate();
                 if (d != null) {
-                    dp.selected = d;
-                    dp.WriteText(dp.FormatText());
-                    dp.open = false;
-                    dp.Change.Raise(dp);
-                    OverlayHost.DismissPopup();
+                    dp.PickDate(d);
                 }
                 return;
             }
             cur = cur.Parent();
+        }
+    }
+    private void HideActivePopup() {
+        App previous = popupApp;
+        Control popup = activePopup;
+        popupApp = null;
+        activePopup = null;
+        if (previous != null && previous.overlayHost != null && popup != null) {
+            previous.overlayHost.Hide(popup);
         }
     }
     public Card EnsurePopupCard() { return this.EnsurePopupCard(this.App); }
@@ -485,13 +496,26 @@ public class DatePicker : Control {
         return defaultPopupCard;
     }
     public void ToggleOpen() {
-        open = !open;
-        if (!open) {
-            OverlayHost.DismissPopup();
+        if (this.IsDisabled()) {
+            if (open) {
+                open = false;
+                this.HideActivePopup();
+            }
             return;
         }
-        Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard();
-        OverlayHost.ShowPopup(this.ResolveApp(App.FrameApp()), this, pop);
+        open = !open;
+        if (!open) {
+            this.HideActivePopup();
+            return;
+        }
+        App host = this.ResolveApp(App.FrameApp());
+        Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard(host);
+        if (host != null && host.overlayHost != null && pop != null) {
+            if (pop == this.customPopup) { pop.UseApp(host); }
+            popupApp = host;
+            activePopup = pop;
+            host.overlayHost.Show(host, this, pop);
+        }
         pickingEnd = false;
         if (this.IsRange()) {
             if (hasPending) {
@@ -508,15 +532,20 @@ public class DatePicker : Control {
             viewMonth = value.Month();
         }
     }
-    public override void OnPopupDismissed() { open = false; }
+    public override void OnPopupDismissed() {
+        open = false;
+        popupApp = null;
+        activePopup = null;
+    }
     public bool IsOpen() { return open; }
     public void SetOpen(bool want) {
+        if (want && this.IsDisabled()) { return; }
         if (open == want) { return; }
         if (want) {
             this.ToggleOpen();
         } else {
             open = false;
-            OverlayHost.DismissPopup();
+            this.HideActivePopup();
         }
     }
     public override bool MountSlot(string slot, Control c) {
@@ -527,14 +556,16 @@ public class DatePicker : Control {
         return base.MountSlot(slot, c);
     }
     public void SetPopupContent(Control c) {
+        if (this.customPopup == c) { return; }
+        if (open) { this.SetOpen(false); }
         this.customPopup = c;
-        if (c != null && this.IndexOf(c) < 0) { this.Add(c); }
+        if (c != null && this.IndexOf(c) >= 0) { this.Remove(c); }
     }
     public Control GetPopupContent() { return this.customPopup; }
     public void MoveMonth(int delta) {
         viewMonth = viewMonth + delta;
-        if (viewMonth < 1) { viewMonth = 12; viewYear = viewYear - 1; }
-        if (viewMonth > 12) { viewMonth = 1; viewYear = viewYear + 1; }
+        while (viewMonth < 1) { viewMonth = viewMonth + 12; viewYear = viewYear - 1; }
+        while (viewMonth > 12) { viewMonth = viewMonth - 12; viewYear = viewYear + 1; }
     }
     public void MoveView(int delta) {
         string gran = this.Granularity();
@@ -571,6 +602,7 @@ public class DatePicker : Control {
             pickingEnd = false;
             this.WriteText(this.FormatText());
             open = false;
+            this.HideActivePopup();
             Change.Raise(this);
             return;
         }
@@ -595,12 +627,14 @@ public class DatePicker : Control {
             pickingEnd = false;
             this.WriteText(this.FormatText());
             open = false;
+            this.HideActivePopup();
             Change.Raise(this);
             return;
         }
         selected = picked;
         this.WriteText(this.FormatText());
         open = false;
+        this.HideActivePopup();
         Change.Raise(this);
     }
     public override void OnPaint(App app) { this.SyncBinding(); this.Edited(); }
@@ -641,6 +675,7 @@ public class DatePicker : Control {
         viewMonth = startV.Month();
         this.WriteText(this.FormatText());
         open = false;
+        this.HideActivePopup();
         Change.Raise(this);
     }
     public void ApplyShortcutIndex(int index) {

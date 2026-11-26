@@ -32,6 +32,7 @@ public class InputOtp : Control {
     private bool completeArmed;
     public static List<string> SplitCps(string s) {
         List<string> outList = new List<string>();
+        if (s == null) { return outList; }
         int i = 0;
         while (i < s.Length) {
             int e = Text.NextCharEnd(s, i);
@@ -138,14 +139,16 @@ public class InputOtp : Control {
     public int ActiveIndex() { return active; }
     public void SetCodeFromModel() { this.SyncBinding(); }
     public string GetCode() {
+        if (cells == null) { return ""; }
         string s = "";
-        int n = cells != null && cells.Count < length ? cells.Count : length;
+        int n = cells.Count < length ? cells.Count : length;
         for (int i = 0; i < n; i = i + 1) { s = s + cells[i]; }
         return s;
     }
     public int FilledCount() {
+        if (cells == null) { return 0; }
         int n = 0;
-        int limit = cells != null && cells.Count < length ? cells.Count : length;
+        int limit = cells.Count < length ? cells.Count : length;
         for (int i = 0; i < limit; i = i + 1) {
             if (cells[i] != "") { n = n + 1; }
         }
@@ -184,9 +187,12 @@ public class InputOtp : Control {
         if (liveApp != null) { liveApp.RequestRedraw(); }
     }
     public void Focus() {
-        if (liveApp == null || this.IsDisabled()) { return; }
-        liveApp.focus.SetFocused(this.WidgetId());
-        liveApp.RequestRedraw();
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || this.IsDisabled()) { return; }
+        liveApp = app;
+        app.focus.SetFocused(this.WidgetId(), this);
+        app.RequestRedraw();
     }
     public void Blur() {
         if (liveApp == null) { return; }
@@ -337,6 +343,38 @@ public class InputOtp : Control {
         this.SyncBinding();
         if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
     }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (e.handled || this.IsDisabled()) { return; }
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app != null && app.window != null && app.window.EventButton() != 0) { return; }
+        int hit = -1;
+        if (cellNodes != null) {
+            for (int i = 0; i < cellNodes.Count && i < length; i = i + 1) {
+                Control cell = cellNodes[i];
+                if (cell == null) { continue; }
+                if (e.originalSource != null && cell.ContainsInputControl(e.originalSource)) {
+                    hit = i;
+                    break;
+                }
+                if (cell.bw > 0 && cell.bh > 0
+                    && e.x >= cell.bx && e.x < cell.bx + cell.bw
+                    && e.y >= cell.by && e.y < cell.by + cell.bh) {
+                    hit = i;
+                    break;
+                }
+            }
+        }
+        if (hit >= 0) { active = hit; }
+        if (app != null) {
+            liveApp = app;
+            app.focus.SetFocused(this.WidgetId(), this);
+            this.SyncBinding();
+            app.RequestRedraw();
+        }
+        base.OnPointerDown(e);
+        e.Handle();
+    }
     public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
     public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
     public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
@@ -353,13 +391,19 @@ public class InputOtp : Control {
         base.SyncBinding();
         this.ApplySizeClass();
         liveApp = this.FindApp();
+        if (length > 0 && (cells == null || cells.Count != length)) {
+            int wantLen = length;
+            this.SetLength(wantLen);
+        }
         if (Value != null) {
             string cur = Value.Get();
             if (cur != this.GetCode()) {
                 int wantActive = active;
-                this.SetCode(cur);
-                active = wantActive;
-                if (active > length - 1) { active = length - 1; }
+                if (this.SetCode(cur)) {
+                    active = wantActive;
+                    if (active > length - 1) { active = length - 1; }
+                    wasFull = this.IsFull();
+                }
             }
         }
         if (cellNodes != null && cellLabels != null) {
@@ -418,7 +462,7 @@ public class InputOtp : Control {
         ps.Add(PropSpec.Text("value", "Value").DefaultBinding().Accessor("GetCode", "SetCodeText").Also("code"));
         ps.Add(PropSpec.TextField("MaskChar"));
         ps.Add(PropSpec.Text("groups", "Groups").Accessor("GroupsText", "SetGroupsText"));
-        ps.Add(PropSpec.Int("length", "Length").Accessor("GetLength", "SetLength").Step(1, 1, 32));
+        ps.Add(PropSpec.Int("length", "Length").Field("length").Step(1, 1, 32));
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
         sz.Field("Size");

@@ -7,9 +7,16 @@ using System.Threading;
 using Gui;
 using Gui.Widget;
 namespace Gui;
+internal class ImageHttpJob {
+    public string url;
+    public string key;
+    public weak App app;
+    public weak Image img;
+    public bool hasImg;
+}
 public class ImageHttp {
     nint lockHandle = Mutex.Create();
-    List<ImageHttpReq> pending = new List<ImageHttpReq>();
+    List<ImageHttpJob> pending = new List<ImageHttpJob>();
     bool workerStarted;
     Dict<string, ImageHttpSlot> urlSlots = new Dict<string, ImageHttpSlot>();
     int slotSeq;
@@ -40,11 +47,13 @@ public class ImageHttp {
         return null;
     }
     void Fetch(App app, Image img, string url, string key) {
-        ImageHttpReq r = new ImageHttpReq();
+        if (app == null) { return; }
+        ImageHttpJob r = new ImageHttpJob();
         r.url = url;
         r.key = key;
         r.app = app;
         r.img = img;
+        r.hasImg = img != null;
         Mutex.Lock(lockHandle);
         pending.Add(r);
         bool needWorker = !workerStarted;
@@ -55,7 +64,7 @@ public class ImageHttp {
     async void WorkerLoop() {
         Socket.Initialize();
         while (true) {
-            ImageHttpReq r = Take();
+            ImageHttpJob r = Take();
             if (r == null) {
                 Mutex.Lock(lockHandle);
                 if (pending.Count == 0) {
@@ -69,8 +78,8 @@ public class ImageHttp {
             await FetchOne(r);
         }
     }
-    ImageHttpReq Take() {
-        ImageHttpReq r = null;
+    ImageHttpJob Take() {
+        ImageHttpJob r = null;
         Mutex.Lock(lockHandle);
         if (pending.Count > 0) {
             r = pending[0];
@@ -79,7 +88,8 @@ public class ImageHttp {
         Mutex.Unlock(lockHandle);
         return r;
     }
-    async int FetchOne(ImageHttpReq r) {
+    async int FetchOne(ImageHttpJob r) {
+        if (r.app == null) { return 0; }
         string err = "";
         string body = null;
         byte[] bytes = null;
@@ -116,11 +126,15 @@ public class ImageHttp {
         string b = body;
         byte[] bb = bytes;
         int n = blen;
-        r.app.Post(() => { Apply(r, bb, b, n, e); }, "ImageHttp.Apply");
+        App host = r.app;
+        if (host == null) { return 0; }
+        host.Post(() => { Apply(r, bb, b, n, e); }, "ImageHttp.Apply");
         return 0;
     }
-    void Apply(ImageHttpReq r, byte[] bytes, string body, int len, string err) {
-        if (r.img == null) {
+    void Apply(ImageHttpJob r, byte[] bytes, string body, int len, string err) {
+        App host = r.app;
+        if (host == null) { return; }
+        if (!r.hasImg) {
             ImageHttpSlot s = null;
             if (urlSlots != null && urlSlots.ContainsKey(r.url)) { s = urlSlots[r.url]; }
             if (s != null) {
@@ -143,26 +157,28 @@ public class ImageHttp {
                 } else {
                     s.state = 2;
                 }
-                r.app.RequestRedraw();
+                host.RequestRedraw();
             }
             return;
         }
+        Image targetImg = r.img;
+        if (targetImg == null) { return; }
         if (err == "") {
             int w2 = 0;
             if (bytes != null) {
                 w2 = Canvas.ImageLoadMem(r.key, bytes, len);
             } else if (body != null) {
                 if (body.Contains("<svg")) {
-                    r.img.OnSvgFetched(body);
+                    targetImg.OnSvgFetched(body);
                     return;
                 }
                 w2 = Canvas.ImageLoadMem(r.key, body, len);
             }
             if (w2 > 0) {
-                r.img.OnFetched(r.key, w2, Canvas.ImageHeight(r.key));
+                targetImg.OnFetched(r.key, w2, Canvas.ImageHeight(r.key));
                 return;
             }
         }
-        r.img.OnFetchFailed();
+        targetImg.OnFetchFailed();
     }
 }

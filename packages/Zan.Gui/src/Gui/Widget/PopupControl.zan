@@ -5,6 +5,8 @@ namespace Gui.Widget;
 public class PopupControl : Control {
     public Binding<bool> Opened;
     private bool appliedOpen;
+    private weak App popupApp;
+    private Control activePopup;
     public int triggerId;
     public int placement; // 0 = Bottom (default), 1 = Top, 2 = Auto
     public int popupWidth;
@@ -17,6 +19,8 @@ public class PopupControl : Control {
         this.InitControl(kind != "" ? kind : "popup");
         this.Opened = false;
         this.appliedOpen = false;
+        this.popupApp = null;
+        this.activePopup = null;
         this.triggerId = this.WidgetId();
         this.placement = 2; // Auto 边缘自适应翻转
         this.popupWidth = w > 0 ? w : 260;
@@ -56,10 +60,28 @@ public class PopupControl : Control {
             if (value != null && !(this.IndexOf(value) >= 0)) { this.Add(value); }
         }
     }
+    public override bool ChildControlsRenderedByOwner() { return true; }
+    public override void OnPaint(App app) {
+        this.SyncBinding();
+        if (this.customTrigger != null) {
+            this.customTrigger.Arrange(bx, by, bw, bh);
+            this.customTrigger.RenderTree(app);
+            return;
+        }
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control child = this.ChildAt(i);
+            if (child == null || child == this.popupPanel) { continue; }
+            child.RenderTree(app);
+        }
+    }
     public virtual bool IsOpen() { return this.Opened != null ? this.Opened.Get() : false; }
     public virtual void ToggleOpen() { this.SetOpen(!this.IsOpen()); }
     public virtual void DismissPopup() { this.SetOpen(false); }
     public virtual void SetPopupContent(Control content) {
+        if (this.popupPanel == content) { return; }
+        if (this.popupPanel != null && this.popupPanel.parent == this) {
+            this.Remove(this.popupPanel);
+        }
         this.popupPanel = content;
         if (content != null && !(this.IndexOf(content) >= 0)) { this.Add(content); }
     }
@@ -74,12 +96,17 @@ public class PopupControl : Control {
             if (def != null) { this.SetPopupContent(def); }
         }
         if (this.popupPanel != null) {
-            if (this.popupWidth > 0) { this.popupPanel.prefW = this.popupWidth; }
-            if (this.popupHeight > 0) { this.popupPanel.prefH = this.popupHeight; }
+            if (this.popupWidth > 0) {
+                this.popupPanel.prefW = app != null ? app.Scale(this.popupWidth) : this.popupWidth;
+            }
+            if (this.popupHeight > 0) {
+                this.popupPanel.prefH = app != null ? app.Scale(this.popupHeight) : this.popupHeight;
+            }
             if (app != null) { this.popupPanel.OnMeasure(app); }
         }
     }
     public virtual void SetOpen(bool want) {
+        if (want && this.IsDisabled()) { return; }
         if (this.Opened.Get() != want) { this.Opened.Set(want); }
         this.ApplyOpen(want, true);
     }
@@ -88,24 +115,44 @@ public class PopupControl : Control {
         this.ApplyOpen(this.Opened.Get(), false);
     }
     private void ApplyOpen(bool want, bool notify) {
-        if (this.appliedOpen == want) { return; }
-        this.appliedOpen = want;
-        App a = this.FindApp();
-        if (a == null) { a = App.FrameApp(); }
         if (want) {
+            if (this.IsDisabled() || this.appliedOpen) { return; }
+            App a = this.FindApp();
+            if (a == null) { a = App.FrameApp(); }
+            if (a == null || a.overlayHost == null) { return; }
             this.EnsurePopup(a);
-            if (this.popupPanel != null) { OverlayHost.ShowPopup(a, this, this.popupPanel); }
-            if (notify && this.OpenEvent != null) { this.OpenEvent.Raise(this); }
+            if (this.popupPanel == null) { return; }
+            this.popupApp = a;
+            this.activePopup = this.popupPanel;
+            this.appliedOpen = true;
+            this.popupPanel.UseApp(a);
+            OverlayHost.ShowPopup(a, this, this.popupPanel);
+            if (this.appliedOpen && notify && this.OpenEvent != null) { this.OpenEvent.Raise(this); }
+            if (a.window != null) { a.window.Wake(); }
         } else {
-            OverlayHost.DismissPopup();
+            if (!this.appliedOpen) { return; }
+            App hostApp = this.popupApp;
+            Control shown = this.activePopup != null ? this.activePopup : this.popupPanel;
+            this.appliedOpen = false;
+            this.popupApp = null;
+            this.activePopup = null;
+            if (hostApp == null) {
+                hostApp = this.FindApp();
+                if (hostApp == null) { hostApp = App.FrameApp(); }
+            }
+            if (hostApp != null && hostApp.overlayHost != null && shown != null) {
+                hostApp.overlayHost.Hide(shown);
+            }
             if (notify && this.CloseEvent != null) { this.CloseEvent.Raise(this); }
+            if (hostApp != null && hostApp.window != null) { hostApp.window.Wake(); }
         }
-        if (a != null && a.window != null) { a.window.Wake(); }
     }
     public override void OnPopupDismissed() {
-        if (this.appliedOpen) {
+        if (this.appliedOpen || (this.Opened != null && this.Opened.Get())) {
             this.appliedOpen = false;
-            if (this.Opened.Get()) { this.Opened.Set(false); }
+            this.popupApp = null;
+            this.activePopup = null;
+            if (this.Opened != null && this.Opened.Get()) { this.Opened.Set(false); }
             if (this.CloseEvent != null) { this.CloseEvent.Raise(this); }
             App a = this.FindApp();
             if (a != null && a.window != null) { a.window.Wake(); }
