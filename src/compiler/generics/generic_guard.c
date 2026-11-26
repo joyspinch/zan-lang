@@ -801,6 +801,11 @@ static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
     sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
     guard_add_attr(g, sf, "cold");
     guard_add_attr(g, sf, "nounwind");
+    guard_add_attr(g, sf, "willreturn");
+    unsigned mk = LLVMGetEnumAttributeKindForName("memory", 6);
+    if (mk)
+      LLVMAddAttributeAtIndex(sf, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, mk, 0x0Cu));
   }
   return zan_call2(g->builder, fn_ty, sf, NULL, 0, "soft.scratch");
 }
@@ -878,25 +883,122 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
  * string building reached 85k IR instructions, and LLVM's time and memory
  * follow IR size. Emit one call to a shared internal helper per use instead;
  * the optimizer still inlines it where that pays off. */
+static void tag_strlen_fn_attrs(zan_irgen_t *g, LLVMValueRef fn, bool is_slow) {
+  guard_add_attr(g, fn, "nounwind");
+  guard_add_attr(g, fn, is_slow ? "noinline" : "inlinehint");
+  if (is_slow)
+    guard_add_attr(g, fn, "cold");
+  unsigned mk = LLVMGetEnumAttributeKindForName("memory", 6);
+  if (mk) {
+    /* argmem: read (0x01) + inaccessiblemem: readwrite (0x0C) = 0x0D when
+     * runtime_checks may call zan_rt_guard_fail3/zan_rt_hdr_readable;
+     * otherwise pure argmem: read (0x01). */
+    uint64_t mem_bits = g->runtime_checks ? 0x0Du : 0x01u;
+    LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                            LLVMCreateEnumAttribute(g->ctx, mk, mem_bits));
+  }
+  unsigned nc = LLVMGetEnumAttributeKindForName("nocapture", 9);
+  if (nc)
+    LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(g->ctx, nc, 0));
+}
+
+static LLVMValueRef get_string_len_slow_helper(zan_irgen_t *g, int array_count) {
+  const char *name =
+      array_count ? "__zan_str_len_arr_slow" : "__zan_str_len_slow";
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+  if (fn)
+    return fn;
+  LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef fty =
+      LLVMFunctionType(i64, (LLVMTypeRef[]){i8p, i8p, i32t, i32t}, 4, 0);
+  fn = LLVMAddFunction(g->mod, name, fty);
+  LLVMSetLinkage(fn, LLVMInternalLinkage);
+  LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+  tag_strlen_fn_attrs(g, fn, true);
+  LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+  LLVMValueRef saved_fn = g->current_fn;
+  g->current_fn = fn;
+  LLVMPositionBuilderAtEnd(g->builder,
+                           LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+  strlen_site_args_t site = {LLVMGetParam(fn, 1), LLVMGetParam(fn, 2),
+                             LLVMGetParam(fn, 3)};
+  LLVMValueRef len = emit_string_len_inline(g, LLVMGetParam(fn, 0), array_count,
+                                            zan_loc(0, 0, 0, 0), &site);
+  LLVMBuildRet(g->builder, len);
+  g->current_fn = saved_fn;
+  if (saved_bb)
+    LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+  return fn;
+}
+
 static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     const char *name = array_count ? "__zan_str_len_arr" : "__zan_str_len";
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
     if (fn) return fn;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
     LLVMTypeRef fty = LLVMFunctionType(i64, (LLVMTypeRef[]){i8p, i8p, i32t, i32t}, 4, 0);
     fn = LLVMAddFunction(g->mod, name, fty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+    tag_strlen_fn_attrs(g, fn, false);
+    LLVMValueRef slow_fn = get_string_len_slow_helper(g, array_count);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMValueRef saved_fn = g->current_fn;
     g->current_fn = fn;
-    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
-    strlen_site_args_t site = {LLVMGetParam(fn, 1), LLVMGetParam(fn, 2), LLVMGetParam(fn, 3)};
-    LLVMValueRef len =
-        emit_string_len_inline(g, LLVMGetParam(fn, 0), array_count, zan_loc(0, 0, 0, 0), &site);
-    LLVMBuildRet(g->builder, len);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
+    LLVMBasicBlockRef fast_ret = LLVMAppendBasicBlockInContext(g->ctx, fn, "fast.ret");
+    LLVMBasicBlockRef slow = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef payload = LLVMGetParam(fn, 0);
+    LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
+                                    LLVMConstNull(i8p), "nn");
+    LLVMValueRef addr = LLVMBuildPtrToInt(g->builder, payload, i64, "addr");
+    LLVMValueRef samepage = zan_icmp(
+        g->builder, LLVMIntNE,
+        zan_and(g->builder, addr, LLVMConstInt(i64, 4080, 0), "pgoff"),
+        LLVMConstInt(i64, 0, 0), "samepg");
+    LLVMValueRef br0 = LLVMBuildCondBr(
+        g->builder, zan_and(g->builder, nonnull, samepage, "canprobe"),
+        probe, slow);
+    zan_set_branch_weights(g, br0, 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+        g->builder, i8, payload,
+        &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1,
+        "hdrp");
+    LLVMValueRef word = LLVMBuildLoad2(
+        g->builder, i64, LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "hdrip"),
+        "hdr");
+    LLVMValueRef is_str = zan_hdr_is_string(g, word, "isstr");
+    LLVMValueRef cached = LLVMBuildAnd(
+        g->builder, word, LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "cached");
+    LLVMValueRef measured = zan_icmp(
+        g->builder, LLVMIntNE, cached,
+        LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "measured");
+    LLVMValueRef br1 = LLVMBuildCondBr(
+        g->builder, zan_and(g->builder, is_str, measured, "known"),
+        fast_ret, slow);
+    zan_set_branch_weights(g, br1, 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, fast_ret);
+    LLVMBuildRet(g->builder, cached);
+
+    LLVMPositionBuilderAtEnd(g->builder, slow);
+    LLVMValueRef sargs[4] = {payload, LLVMGetParam(fn, 1), LLVMGetParam(fn, 2),
+                             LLVMGetParam(fn, 3)};
+    LLVMValueRef slen = zan_call2(g->builder, fty, slow_fn, sargs, 4, "slen");
+    LLVMSetInstructionCallConv(slen, LLVMFastCallConv);
+    LLVMSetTailCall(slen, 1);
+    LLVMBuildRet(g->builder, slen);
+
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     return fn;
@@ -945,12 +1047,6 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
                   : NULL;
   LLVMBasicBlockRef slow_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.slow");
-  LLVMBasicBlockRef stamp_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.stamp");
-  LLVMBasicBlockRef stamp_do_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.stampdo");
-  LLVMBasicBlockRef slow_end_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.slowend");
   LLVMBasicBlockRef raw_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.raw");
   LLVMBasicBlockRef done_bb =
@@ -1025,40 +1121,6 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
   LLVMPositionBuilderAtEnd(g->builder, slow_bb);
   LLVMValueRef string_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
                                       &payload, 1, "strbuf.strlen");
-  LLVMValueRef fits = zan_and(
-      g->builder,
-      zan_icmp(g->builder, LLVMIntNE, string_len,
-               LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.notunk"),
-      zan_icmp(g->builder, LLVMIntULE, string_len,
-               LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strbuf.fits32"),
-      "strbuf.fits");
-  LLVMBuildCondBr(g->builder,
-                  zan_and(g->builder, is_str, fits, "strbuf.stampable"),
-                  stamp_bb, slow_end_bb);
-
-  LLVMPositionBuilderAtEnd(g->builder, stamp_bb);
-  LLVMValueRef rc_ptr = LLVMBuildGEP2(
-      g->builder, i8, payload,
-      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1)}, 1,
-      "strbuf.rcp");
-  LLVMValueRef rc = LLVMBuildLoad2(
-      g->builder, i64,
-      LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strbuf.rcip"), "strbuf.rc");
-  LLVMBuildCondBr(g->builder,
-                  zan_icmp(g->builder, LLVMIntNE, rc,
-                           LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-                           "strbuf.writable"),
-                  stamp_do_bb, slow_end_bb);
-
-  LLVMPositionBuilderAtEnd(g->builder, stamp_do_bb);
-  LLVMBuildStore(g->builder,
-                 LLVMBuildOr(g->builder,
-                             LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0),
-                             string_len, "strbuf.newhdr"),
-                 hdr_iptr);
-  LLVMBuildBr(g->builder, slow_end_bb);
-
-  LLVMPositionBuilderAtEnd(g->builder, slow_end_bb);
   LLVMBuildBr(g->builder, done_bb);
 
   LLVMPositionBuilderAtEnd(g->builder, raw_bb);
@@ -1068,7 +1130,16 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
       LLVMTypeRef fail_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                              (LLVMTypeRef[]){i8p, i32t, i32t, i8p}, 4, 0);
       LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail3");
-      if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+      if (!fail_fn) {
+        fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+        guard_add_attr(g, fail_fn, "noinline");
+        guard_add_attr(g, fail_fn, "cold");
+        guard_add_attr(g, fail_fn, "nounwind");
+        unsigned mk = LLVMGetEnumAttributeKindForName("memory", 6);
+        if (mk)
+          LLVMAddAttributeAtIndex(fail_fn, LLVMAttributeFunctionIndex,
+                                  LLVMCreateEnumAttribute(g->ctx, mk, 0x0Du));
+      }
       LLVMValueRef msg = zan_irgen_intern_string(
           g, "null reference where a string/byte buffer is required (length probe)\n");
       zan_call2(g->builder, fail_ty, fail_fn,
@@ -1093,7 +1164,7 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
     LLVMAddIncoming(phi, (LLVMValueRef[]){count}, (LLVMBasicBlockRef[]){arr_bb},
                     1);
   LLVMAddIncoming(phi, (LLVMValueRef[]){string_len},
-                  (LLVMBasicBlockRef[]){slow_end_bb}, 1);
+                  (LLVMBasicBlockRef[]){slow_bb}, 1);
   if (phi_raw)
     LLVMAddIncoming(phi, (LLVMValueRef[]){phi_raw},
                     (LLVMBasicBlockRef[]){phi_raw_pred}, 1);

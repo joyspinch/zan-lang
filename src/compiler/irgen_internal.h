@@ -402,6 +402,9 @@ unsigned list_elem_bytes(zan_irgen_t *g, zan_type_t *et);
 LLVMTypeRef list_slot_type(zan_irgen_t *g, zan_type_t *et);
 LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et,
                            const char *nm);
+LLVMValueRef list_data_direct(zan_irgen_t *g, LLVMValueRef list_ptr,
+                              const char *nm);
+bool irgen_is_loop_guarded_list(zan_irgen_t *g, const void *lv);
 void list_header_init_esz(zan_irgen_t *g, LLVMValueRef list_ptr,
                           zan_type_t *et);
 LLVMValueRef list_elem_ptr(zan_irgen_t *g, LLVMValueRef data, LLVMValueRef idx,

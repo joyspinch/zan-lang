@@ -1,0 +1,191 @@
+using System;
+using System.Collections.Generic;
+
+class TinyPair {
+    public int A;
+    public int B;
+    public TinyPair(int a, int b) {
+        this.A = a;
+        this.B = b;
+    }
+    public int Score() {
+        return this.A * 3 + this.B * 5;
+    }
+}
+
+class NestedOwnedBox {
+    public OwnedFieldBox Inner;
+    public int Extra;
+    public NestedOwnedBox(string tag, int num, int extra) {
+        this.Inner = new OwnedFieldBox(tag, num);
+        this.Extra = extra;
+    }
+}
+
+class OwnedFieldBox {
+    public string Tag;
+    public int Num;
+    public OwnedFieldBox(string tag, int num) {
+        this.Tag = tag;
+        this.Num = num;
+    }
+}
+
+class ThrowingBox {
+    public string Label;
+    public ThrowingBox(string label, bool fail) {
+        this.Label = label;
+        if (fail) {
+            throw new Exception("ctor-fail:" + label);
+        }
+    }
+}
+
+class WeakHolder {
+    public weak TinyPair Target;
+}
+
+class Program {
+    static long TestStackObjAndDtor() {
+        long sum = 0;
+        for (int i = 0; i < 2000; i++) {
+            TinyPair p = new TinyPair(i & 31, (i * 7) & 31);
+            sum += p.Score();
+        }
+        long dsum = 0;
+        for (int i = 0; i < 50; i++) {
+            NestedOwnedBox d = new NestedOwnedBox("nested_" + i.ToString(), i, i * 2);
+            dsum += d.Inner.Tag.Length + d.Extra;
+        }
+        long osum = 0;
+        for (int i = 0; i < 200; i++) {
+            OwnedFieldBox ob = new OwnedFieldBox("k_" + i.ToString(), i);
+            osum += ob.Tag.Length + ob.Num;
+        }
+        WeakHolder wh = new WeakHolder();
+        {
+            TinyPair live = new TinyPair(11, 22);
+            wh.Target = live;
+            if (wh.Target == null || wh.Target.Score() != 143) {
+                throw new Exception("weak target live mismatch");
+            }
+        }
+        if (wh.Target != null) {
+            throw new Exception("weak target not nilled");
+        }
+        return sum + dsum + osum;
+    }
+
+    static int TestThrowingCtor() {
+        int caught = 0;
+        for (int i = 0; i < 40; i++) {
+            string dyn = "item_" + i.ToString();
+            try {
+                ThrowingBox tb = new ThrowingBox(dyn, (i & 1) == 0);
+                if (tb.Label.Length == 0) {
+                    throw new Exception("unexpected empty");
+                }
+            } catch (Exception e) {
+                if (e.Message.Length > 0) {
+                    caught++;
+                }
+            }
+        }
+        return caught;
+    }
+
+    static long TestItoaAndStrLen() {
+        long total = 0;
+        for (int i = -100; i <= 100; i++) {
+            int v = i * 12345;
+            string s = v.ToString();
+            total += s.Length;
+        }
+        long mn = -9223372036854775807L - 1L;
+        if (mn.ToString() != "-9223372036854775808" || mn.ToString().Length != 20) {
+            throw new Exception("long.MinValue mismatch");
+        }
+        ulong umx = 18446744073709551615UL;
+        if (umx.ToString() != "18446744073709551615" || umx.ToString().Length != 20) {
+            throw new Exception("ulong.MaxValue mismatch: " + umx.ToString());
+        }
+        ulong uz = 0UL;
+        if (uz.ToString() != "0" || uz.ToString().Length != 1) {
+            throw new Exception("ulong 0 mismatch");
+        }
+        string empty = "";
+        string lit = "hello";
+        string single = "A";
+        string heap = "ab" + "cd" + (42).ToString();
+        long lenAcc = 0;
+        for (int i = 0; i < 100; i++) {
+            lenAcc += empty.Length + lit.Length + single.Length + heap.Length;
+        }
+        if (lenAcc != 1200) {
+            throw new Exception("lenAcc=" + lenAcc);
+        }
+        return total + lenAcc;
+    }
+
+    static List<int> SwapList(List<int> cur, List<int> alt) {
+        return alt;
+    }
+
+    static long TestListDirectAndGuard() {
+        List<int> xs = new List<int>();
+        List<int> ys = new List<int>();
+        for (int i = 0; i < 128; i++) {
+            xs.Add(i * 2 + 1);
+            ys.Add(i * 3 + 2);
+        }
+        // Pure nested read loop (eligible for list_data_direct)
+        long rsum = 0;
+        for (int r = 0; r < 10; r++) {
+            for (int i = 0; i < xs.Count; i++) {
+                rsum += xs[i];
+            }
+        }
+        // Pure write + read loop (eligible for list_data_direct)
+        for (int i = 0; i < xs.Count; i++) {
+            xs[i] = xs[i] + 1;
+        }
+        long wsum = 0;
+        for (int i = 0; i < xs.Count; i++) {
+            wsum += xs[i];
+        }
+        // Reassigned list in loop (must NOT assume stale pointer/width)
+        List<int> cur = xs;
+        long ssum = 0;
+        for (int i = 0; i < 4; i++) {
+            ssum += cur[i];
+            if (i == 1) {
+                cur = SwapList(cur, ys);
+            }
+        }
+        // Out-of-bounds in try/catch must still throw IndexOutOfRangeException
+        int oobCaught = 0;
+        for (int i = 0; i < 4; i++) {
+            try {
+                int bad = xs[128 + i];
+                ssum += bad;
+            } catch (IndexOutOfRangeException e) {
+                if (e.Message.Length > 0) {
+                    oobCaught++;
+                }
+            }
+        }
+        if (oobCaught != 4) {
+            throw new Exception("oobCaught=" + oobCaught);
+        }
+        return rsum + wsum + ssum;
+    }
+
+    static void Main() {
+        long a = TestStackObjAndDtor();
+        int b = TestThrowingCtor();
+        long c = TestItoaAndStrLen();
+        long d = TestListDirectAndGuard();
+        Console.WriteLine("a=" + a + " b=" + b + " c=" + c + " d=" + d);
+        Console.WriteLine("PASS: wave9 escape eh list strlen");
+    }
+}

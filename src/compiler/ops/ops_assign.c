@@ -353,7 +353,10 @@ binding_lowered:
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx), "idxext");
                     }
-                    LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(local->type), "data");
+                    LLVMValueRef data =
+                        irgen_is_loop_guarded_list(g, local)
+                            ? list_data_direct(g, list_ptr, "data")
+                            : list_data_for(g, list_ptr, container_elem_type(local->type), "data");
                     LLVMValueRef slot_ptr = list_elem_ptr(g, data, idx, container_elem_type(local->type), "ep");
                     emit_collection_slot_store(g, container_elem_type(local->type), list_slot_type(g, container_elem_type(local->type)), slot_ptr,
                         right, expr->binary.right, locals, 1);

@@ -132,8 +132,12 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
         return emit_expr_with_expr(g, expr, locals);
 
     case AST_POSTFIX_UNARY:
-        if (expr->unary.op == TK_BANG)
-            return emit_expr(g, expr->unary.operand, locals);
+        if (expr->unary.op == TK_BANG) {
+            LLVMValueRef v = emit_expr(g, expr->unary.operand, locals);
+            if (v && llvm_is_nullable(LLVMTypeOf(v)))
+                return nullable_get_payload(g, v);
+            return v;
+        }
         return emit_incdec_expr(g, expr, locals, 0);
 
     case AST_IS_EXPR: {

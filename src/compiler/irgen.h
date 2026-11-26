@@ -327,6 +327,8 @@ struct zan_irgen {
   /* 当前函数体拥有的作用域清理项 */
   int eh_armed_base;
   int eh_armed_loop_base;
+  void *loop_guarded_lists[16];
+  int loop_guarded_list_count;
 
   zan_lpad_entry_t lpad_stack[ZAN_MAX_ARMED_TRY];
   int lpad_depth;

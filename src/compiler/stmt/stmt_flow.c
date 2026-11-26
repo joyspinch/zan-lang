@@ -284,8 +284,10 @@ case AST_WHILE_STMT: {
   g->finally_loop_base = g->finally_count;
   int saved_loop_ehbase = g->eh_armed_loop_base;
   g->eh_armed_loop_base = g->eh_armed_count;
+  int saved_guarded_lists = g->loop_guarded_list_count;
 
-  emit_loop_preheader_list_guards(g, stmt->while_stmt.body, locals);
+  emit_loop_preheader_list_guards(g, stmt->while_stmt.cond, NULL,
+                                  stmt->while_stmt.body, locals);
   LLVMBuildBr(g->builder, cond_bb);
   LLVMPositionBuilderAtEnd(g->builder, cond_bb);
   LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
@@ -321,6 +323,7 @@ case AST_WHILE_STMT: {
   g->loop_catch_base = saved_loop_cbase;
   g->finally_loop_base = saved_loop_fbase;
   g->eh_armed_loop_base = saved_loop_ehbase;
+  g->loop_guarded_list_count = saved_guarded_lists;
 
   LLVMPositionBuilderAtEnd(g->builder, end_bb);
   break;
@@ -362,8 +365,10 @@ case AST_FOR_STMT: {
   g->finally_loop_base = g->finally_count;
   int saved_loop_ehbase = g->eh_armed_loop_base;
   g->eh_armed_loop_base = g->eh_armed_count;
+  int saved_guarded_lists = g->loop_guarded_list_count;
 
-  emit_loop_preheader_list_guards(g, stmt->for_stmt.body, locals);
+  emit_loop_preheader_list_guards(g, stmt->for_stmt.cond, stmt->for_stmt.step,
+                                  stmt->for_stmt.body, locals);
   LLVMBuildBr(g->builder, cond_bb);
   LLVMPositionBuilderAtEnd(g->builder, cond_bb);
   if (stmt->for_stmt.cond) {
@@ -413,6 +418,7 @@ case AST_FOR_STMT: {
   g->loop_catch_base = saved_loop_cbase;
   g->finally_loop_base = saved_loop_fbase;
   g->eh_armed_loop_base = saved_loop_ehbase;
+  g->loop_guarded_list_count = saved_guarded_lists;
 
   LLVMPositionBuilderAtEnd(g->builder, end_bb);
   emit_release_owned_locals_from(g, locals, for_start);

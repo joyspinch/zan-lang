@@ -162,7 +162,90 @@ static void collect_loop_indexed_lists(zan_ast_node_t *n, local_scope_t *locals,
   }
 }
 
-static void emit_loop_preheader_list_guards(zan_irgen_t *g, zan_ast_node_t *body,
+static bool ast_loop_preserves_list_width(zan_ast_node_t *n, local_var_t *lv,
+                                          int depth) {
+  if (!n)
+    return true;
+  if (depth > 24)
+    return false;
+  switch (n->kind) {
+  case AST_INT_LITERAL:
+  case AST_FLOAT_LITERAL:
+  case AST_DECIMAL_LITERAL:
+  case AST_STRING_LITERAL:
+  case AST_CHAR_LITERAL:
+  case AST_BOOL_LITERAL:
+  case AST_NULL_LITERAL:
+  case AST_IDENTIFIER:
+  case AST_BREAK_STMT:
+  case AST_CONTINUE_STMT:
+    return true;
+  case AST_BLOCK:
+    for (int i = 0; i < n->block.stmts.count; i++)
+      if (!ast_loop_preserves_list_width(n->block.stmts.items[i], lv, depth + 1))
+        return false;
+    return true;
+  case AST_EXPR_STMT:
+    return ast_loop_preserves_list_width(n->expr_stmt.expr, lv, depth + 1);
+  case AST_VAR_DECL:
+    return ast_loop_preserves_list_width(n->var_decl.initializer, lv, depth + 1);
+  case AST_IF_STMT:
+    return ast_loop_preserves_list_width(n->if_stmt.cond, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->if_stmt.then_body, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->if_stmt.else_body, lv, depth + 1);
+  case AST_WHILE_STMT:
+  case AST_DO_WHILE_STMT:
+    return ast_loop_preserves_list_width(n->while_stmt.cond, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->while_stmt.body, lv, depth + 1);
+  case AST_FOR_STMT:
+    return ast_loop_preserves_list_width(n->for_stmt.init, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->for_stmt.cond, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->for_stmt.step, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->for_stmt.body, lv, depth + 1);
+  case AST_BINARY:
+    return ast_loop_preserves_list_width(n->binary.left, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->binary.right, lv, depth + 1);
+  case AST_ASSIGNMENT:
+    if (n->binary.left && n->binary.left->kind == AST_IDENTIFIER &&
+        n->binary.left->ident.name.len == lv->name.len &&
+        memcmp(n->binary.left->ident.name.str, lv->name.str,
+               (size_t)lv->name.len) == 0)
+      return false;
+    return ast_loop_preserves_list_width(n->binary.left, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->binary.right, lv, depth + 1);
+  case AST_UNARY:
+  case AST_POSTFIX_UNARY:
+    if (n->unary.operand && n->unary.operand->kind == AST_IDENTIFIER &&
+        n->unary.operand->ident.name.len == lv->name.len &&
+        memcmp(n->unary.operand->ident.name.str, lv->name.str,
+               (size_t)lv->name.len) == 0)
+      return false;
+    return ast_loop_preserves_list_width(n->unary.operand, lv, depth + 1);
+  case AST_CONDITIONAL:
+    return ast_loop_preserves_list_width(n->conditional.cond, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->conditional.then_expr, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->conditional.else_expr, lv, depth + 1);
+  case AST_CAST_EXPR:
+    return ast_loop_preserves_list_width(n->cast.expr, lv, depth + 1);
+  case AST_INDEX:
+    return ast_loop_preserves_list_width(n->index.object, lv, depth + 1) &&
+           ast_loop_preserves_list_width(n->index.index, lv, depth + 1);
+  case AST_MEMBER_ACCESS:
+    if ((n->member.name.len == 5 &&
+         memcmp(n->member.name.str, "Count", 5) == 0) ||
+        (n->member.name.len == 6 &&
+         memcmp(n->member.name.str, "Length", 6) == 0))
+      return ast_loop_preserves_list_width(n->member.object, lv, depth + 1);
+    return false;
+  default:
+    return false;
+  }
+}
+
+static void emit_loop_preheader_list_guards(zan_irgen_t *g,
+                                            zan_ast_node_t *cond,
+                                            zan_ast_node_t *step,
+                                            zan_ast_node_t *body,
                                             local_scope_t *locals) {
   if (!body || !locals || !g->current_fn)
     return;
@@ -174,6 +257,8 @@ static void emit_loop_preheader_list_guards(zan_irgen_t *g, zan_ast_node_t *body
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   for (int i = 0; i < nlists; i++) {
     local_var_t *lv = lists[i];
+    if (irgen_is_loop_guarded_list(g, lv))
+      continue;
     LLVMTypeRef st = local_slot_type(g, lv);
     if (!st || LLVMGetTypeKind(st) != LLVMPointerTypeKind)
       continue;
@@ -187,6 +272,12 @@ static void emit_loop_preheader_list_guards(zan_irgen_t *g, zan_ast_node_t *body
     (void)list_data_for(g, raw, container_elem_type(lv->type), "lp.d0");
     LLVMBuildBr(g->builder, cont_bb);
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+    if (g->loop_guarded_list_count < 16 &&
+        ast_loop_preserves_list_width(cond, lv, 0) &&
+        ast_loop_preserves_list_width(step, lv, 0) &&
+        ast_loop_preserves_list_width(body, lv, 0)) {
+      g->loop_guarded_lists[g->loop_guarded_list_count++] = lv;
+    }
   }
 }
 

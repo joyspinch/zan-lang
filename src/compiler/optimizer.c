@@ -2469,6 +2469,369 @@ static void insert_entry_alloca(LLVMBuilderRef b, LLVMValueRef fn) {
   }
 }
 
+static void eh_tmp_erase_dead_chain(LLVMValueRef v, int depth) {
+  if (!v || depth > 8 || !LLVMIsAInstruction(v) || LLVMGetFirstUse(v) != NULL)
+    return;
+  LLVMOpcode op = LLVMGetInstructionOpcode(v);
+  if (op != LLVMBitCast && op != LLVMAddrSpaceCast && op != LLVMIntToPtr &&
+      op != LLVMPtrToInt && op != LLVMOr && op != LLVMAnd && op != LLVMICmp &&
+      op != LLVMSelect && op != LLVMTrunc && op != LLVMZExt &&
+      op != LLVMSExt && op != LLVMGetElementPtr)
+    return;
+  unsigned nops = (unsigned)LLVMGetNumOperands(v);
+  LLVMValueRef ops[4];
+  unsigned keep = nops < 4 ? nops : 4;
+  for (unsigned i = 0; i < keep; i++)
+    ops[i] = LLVMGetOperand(v, i);
+  LLVMInstructionEraseFromParent(v);
+  for (unsigned i = 0; i < keep; i++)
+    eh_tmp_erase_dead_chain(ops[i], depth + 1);
+}
+
+static bool eh_tmp_call_is_nothrow(LLVMValueRef call, unsigned nounwind_kind) {
+  if (!call || LLVMGetInstructionOpcode(call) != LLVMCall)
+    return false;
+  if (nounwind_kind &&
+      LLVMGetCallSiteEnumAttribute(
+          call, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, nounwind_kind))
+    return true;
+  LLVMValueRef callee = LLVMGetCalledValue(call);
+  if (!callee || !LLVMIsAFunction(callee))
+    return false;
+  const char *cn = LLVMGetValueName(callee);
+  if (!cn || !cn[0])
+    return false;
+  if (strncmp(cn, "llvm.", 5) == 0)
+    return true;
+  if (strcmp(cn, "__zan_eh_tmp_unwind") == 0 ||
+      strcmp(cn, "__zan_eh_tmp_drop") == 0 ||
+      strcmp(cn, "__zan_guard_raise") == 0 ||
+      strcmp(cn, "__zan_throw_guard") == 0 ||
+      strcmp(cn, "__cxa_throw") == 0 ||
+      strncmp(cn, "__zan_throw", 11) == 0)
+    return false;
+  if (nounwind_kind &&
+      LLVMGetEnumAttributeAtIndex(
+          callee, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+          nounwind_kind))
+    return true;
+  if (shrink_is_arc_release_fn(cn) || shrink_decl_safe_nounwind(cn))
+    return true;
+  return false;
+}
+
+static bool eh_tmp_callee_never_pushes(LLVMValueRef inst,
+                                       unsigned nounwind_kind) {
+  LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+  if (op == LLVMCall && eh_tmp_call_is_nothrow(inst, nounwind_kind))
+    return true;
+  LLVMValueRef callee = LLVMGetCalledValue(inst);
+  if (!callee || !LLVMIsAFunction(callee))
+    return false;
+  const char *cn = LLVMGetValueName(callee);
+  if (!cn)
+    return false;
+  return strcmp(cn, "__zan_guard_raise") == 0 ||
+         strcmp(cn, "__zan_throw_guard") == 0 ||
+         strcmp(cn, "__cxa_throw") == 0 ||
+         strcmp(cn, "__zan_eh_tmp_unwind") == 0;
+}
+
+/* 消除不可能抛异常区间内的成对 __zan_eh_tmp_push / __zan_eh_tmp_pop，以及
+ * 无临时栈活动且仅触发守卫异常的函数中冗余的 __zan_eh_tmp_unwind。
+ * 必须在 shrink（标注 nounwind）之后、escape 分析之前运行，释放 new T(...) 栈提升。 */
+static int zan_opt_eh_tmp_mod(LLVMModuleRef mod) {
+  if (!mod)
+    return 0;
+  unsigned nounwind_kind = LLVMGetEnumAttributeKindForName("nounwind", 8);
+  int removed = 0;
+  for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
+       fn = LLVMGetNextFunction(fn)) {
+    if (LLVMIsDeclaration(fn))
+      continue;
+    /* Pass A: 块内无抛出间隔的 push/pop 配对消除 */
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      LLVMValueRef stack[64];
+      int sp = 0;
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;) {
+        LLVMValueRef next = LLVMGetNextInstruction(inst);
+        LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+        if (op == LLVMCall) {
+          LLVMValueRef callee = LLVMGetCalledValue(inst);
+          const char *cn =
+              (callee && LLVMIsAFunction(callee)) ? LLVMGetValueName(callee) : NULL;
+          if (cn && strcmp(cn, "__zan_eh_tmp_push") == 0) {
+            if (sp < 64)
+              stack[sp++] = inst;
+            else
+              sp = 0;
+          } else if (cn && strcmp(cn, "__zan_eh_tmp_pop") == 0) {
+            if (sp > 0) {
+              LLVMValueRef push_i = stack[--sp];
+              LLVMValueRef arg0 = LLVMGetNumArgOperands(push_i) >= 1
+                                      ? LLVMGetOperand(push_i, 0)
+                                      : NULL;
+              LLVMInstructionEraseFromParent(inst);
+              LLVMInstructionEraseFromParent(push_i);
+              if (arg0)
+                eh_tmp_erase_dead_chain(arg0, 0);
+              removed++;
+            }
+          } else if (!eh_tmp_call_is_nothrow(inst, nounwind_kind)) {
+            sp = 0;
+          }
+        } else if (op == LLVMInvoke) {
+          sp = 0;
+        }
+        inst = next;
+      }
+    }
+
+    /* Pass B: 若函数体已无任何 push/pop/drop 且所有可能抛出的调用都绝不压栈
+     * （仅 __zan_guard_raise/__cxa_throw），则 landingpad 里的 __zan_eh_tmp_unwind
+     * 必为空操作，连带释放死 fn.tmp.top0 与 __zan_eh_state_fast。 */
+    bool has_tmp_activity = false;
+    bool has_other_throw = false;
+    int unwind_calls = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+         bb && !has_tmp_activity && !has_other_throw;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+           inst = LLVMGetNextInstruction(inst)) {
+        LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+        if (op != LLVMCall && op != LLVMInvoke)
+          continue;
+        LLVMValueRef callee = LLVMGetCalledValue(inst);
+        const char *cn =
+            (callee && LLVMIsAFunction(callee)) ? LLVMGetValueName(callee) : NULL;
+        if (cn && (strcmp(cn, "__zan_eh_tmp_push") == 0 ||
+                   strcmp(cn, "__zan_eh_tmp_pop") == 0 ||
+                   strcmp(cn, "__zan_eh_tmp_drop") == 0)) {
+          has_tmp_activity = true;
+          break;
+        }
+        if (cn && strcmp(cn, "__zan_eh_tmp_unwind") == 0) {
+          if (op == LLVMCall)
+            unwind_calls++;
+          else
+            has_other_throw = true;
+          continue;
+        }
+        if (!eh_tmp_callee_never_pushes(inst, nounwind_kind)) {
+          has_other_throw = true;
+          break;
+        }
+      }
+    }
+    if (!has_tmp_activity && !has_other_throw && unwind_calls > 0) {
+      for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+           bb = LLVMGetNextBasicBlock(bb)) {
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;) {
+          LLVMValueRef next = LLVMGetNextInstruction(inst);
+          if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+            LLVMValueRef callee = LLVMGetCalledValue(inst);
+            const char *cn = (callee && LLVMIsAFunction(callee))
+                                 ? LLVMGetValueName(callee)
+                                 : NULL;
+            if (cn && strcmp(cn, "__zan_eh_tmp_unwind") == 0) {
+              LLVMValueRef arg0 = LLVMGetNumArgOperands(inst) >= 1
+                                      ? LLVMGetOperand(inst, 0)
+                                      : NULL;
+              LLVMInstructionEraseFromParent(inst);
+              if (arg0)
+                eh_tmp_erase_dead_chain(arg0, 0);
+              removed++;
+            }
+          }
+          inst = next;
+        }
+      }
+    }
+  }
+  return removed;
+}
+
+static bool dtor_fn_is_self_only_rec(LLVMValueRef fn, int depth) {
+  if (!fn || !LLVMIsAFunction(fn) || LLVMIsDeclaration(fn) || depth > 4)
+    return false;
+  LLVMValueRef self_param = LLVMCountParams(fn) >= 1 ? LLVMGetParam(fn, 0) : NULL;
+  for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+       bb = LLVMGetNextBasicBlock(bb)) {
+    for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+         inst = LLVMGetNextInstruction(inst)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+      if (op == LLVMInvoke || op == LLVMStore)
+        return false;
+      if (op == LLVMAtomicRMW || op == LLVMAtomicCmpXchg) {
+        LLVMValueRef ptr = LLVMGetOperand(inst, 0);
+        for (int d = 0; ptr && d < 8; d++) {
+          if (LLVMIsAInstruction(ptr)) {
+            LLVMOpcode pop = LLVMGetInstructionOpcode(ptr);
+            if (pop == LLVMBitCast || pop == LLVMAddrSpaceCast ||
+                pop == LLVMGetElementPtr) {
+              ptr = LLVMGetOperand(ptr, 0);
+              continue;
+            }
+          }
+          break;
+        }
+        if (!self_param || ptr != self_param)
+          return false;
+      }
+      if (op == LLVMCall) {
+        LLVMValueRef callee = LLVMGetCalledValue(inst);
+        if (!callee || !LLVMIsAFunction(callee))
+          return false;
+        const char *cn = LLVMGetValueName(callee);
+        if (!cn)
+          return false;
+        if (strcmp(cn, "free") == 0 ||
+            strcmp(cn, "zan_rt_weak_nil_all") == 0 ||
+            strcmp(cn, "zan_rt_weak_destroy_begin") == 0 ||
+            strcmp(cn, "zan_rt_live_unregister") == 0 ||
+            strncmp(cn, "llvm.", 5) == 0 ||
+            (strcmp(cn, "zan_rt_release") == 0 &&
+             LLVMGetNumArgOperands(inst) >= 1 &&
+             self_param &&
+             strip_pointer_casts(LLVMGetOperand(inst, 0)) == self_param))
+          continue;
+        /* MergeFunctions (-Os / --publish) 可把等价析构函数折叠为尾调用跳板 */
+        if (strncmp(cn, "__zan_release_", 14) == 0 && callee != fn &&
+            LLVMGetNumArgOperands(inst) == 1 && self_param &&
+            strip_pointer_casts(LLVMGetOperand(inst, 0)) == self_param &&
+            dtor_fn_is_self_only_rec(callee, depth + 1))
+          continue;
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool dtor_fn_is_self_only(LLVMValueRef fn) {
+  return dtor_fn_is_self_only_rec(fn, 0);
+}
+
+static bool desc_dtor_is_self_only(LLVMValueRef site_val) {
+  if (!site_val)
+    return false;
+  if (LLVMIsAConstantInt(site_val))
+    return LLVMConstIntGetZExtValue(site_val) == 0;
+  if (LLVMIsAConstantExpr(site_val) &&
+      LLVMGetConstOpcode(site_val) == LLVMPtrToInt) {
+    LLVMValueRef g = strip_pointer_casts(LLVMGetOperand(site_val, 0));
+    if (g && LLVMIsAGlobalVariable(g) && LLVMIsGlobalConstant(g)) {
+      LLVMValueRef init = LLVMGetInitializer(g);
+      if (init && LLVMGetTypeKind(LLVMTypeOf(init)) == LLVMStructTypeKind &&
+          LLVMGetNumOperands(init) >= 1) {
+        LLVMValueRef dtor = strip_pointer_casts(LLVMGetOperand(init, 0));
+        if (!dtor || LLVMIsNull(dtor))
+          return true;
+        if (LLVMIsAFunction(dtor))
+          return dtor_fn_is_self_only(dtor);
+      }
+    }
+  }
+  return false;
+}
+
+static void erase_stack_obj_arc_calls(LLVMValueRef val, bool is_str,
+                                      int depth) {
+  if (!val || depth > 8)
+    return;
+  LLVMValueRef base_val = strip_pointer_casts(val);
+  LLVMUseRef u = LLVMGetFirstUse(val);
+  while (u) {
+    LLVMValueRef user = LLVMGetUser(u);
+    LLVMUseRef next_u = LLVMGetNextUse(u);
+    if (user && LLVMIsAInstruction(user)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(user);
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+        erase_stack_obj_arc_calls(user, is_str, depth + 1);
+        next_u = LLVMGetNextUse(u);
+      } else if (op == LLVMStore) {
+        LLVMValueRef store_val = strip_pointer_casts(LLVMGetOperand(user, 0));
+        LLVMValueRef store_dst = strip_pointer_casts(LLVMGetOperand(user, 1));
+        if (store_dst != base_val && store_val == base_val &&
+            LLVMIsAAllocaInst(store_dst)) {
+          LLVMUseRef au = LLVMGetFirstUse(store_dst);
+          while (au) {
+            LLVMValueRef auser = LLVMGetUser(au);
+            LLVMUseRef next_au = LLVMGetNextUse(au);
+            if (auser && auser != user && LLVMIsAInstruction(auser) &&
+                LLVMGetInstructionOpcode(auser) == LLVMLoad) {
+              erase_stack_obj_arc_calls(auser, is_str, depth + 1);
+            }
+            au = next_au;
+          }
+          next_u = LLVMGetNextUse(u);
+        }
+      } else if (op == LLVMCall) {
+        LLVMValueRef callee = LLVMGetCalledValue(user);
+        const char *cn =
+            (callee && LLVMIsAFunction(callee)) ? LLVMGetValueName(callee) : NULL;
+        bool match = false;
+        if (cn) {
+          if (strcmp(cn, "zan_rt_retain") == 0 ||
+              strcmp(cn, "zan_retain") == 0 ||
+              strcmp(cn, "zan_rt_release") == 0 ||
+              strcmp(cn, "zan_rt_release_dyn") == 0 ||
+              strcmp(cn, "zan_release") == 0) {
+            match = true;
+          } else if (is_str && (strcmp(cn, "zan_rt_str_retain") == 0 ||
+                                strcmp(cn, "zan_rt_str_release") == 0)) {
+            match = true;
+          } else if (!is_str && strncmp(cn, "__zan_release_", 14) == 0 &&
+                     dtor_fn_is_self_only(callee)) {
+            match = true;
+          }
+        }
+        if (match && LLVMGetFirstUse(user) == NULL) {
+          LLVMInstructionEraseFromParent(user);
+          u = LLVMGetFirstUse(val);
+          continue;
+        }
+      }
+    }
+    u = next_u;
+  }
+}
+
+static void replace_known_str_len_calls(LLVMValueRef val, LLVMValueRef known_len,
+                                        int depth) {
+  if (!val || !known_len || depth > 8)
+    return;
+  LLVMUseRef u = LLVMGetFirstUse(val);
+  while (u) {
+    LLVMValueRef user = LLVMGetUser(u);
+    LLVMUseRef next_u = LLVMGetNextUse(u);
+    if (user && LLVMIsAInstruction(user)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(user);
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+        replace_known_str_len_calls(user, known_len, depth + 1);
+        next_u = LLVMGetNextUse(u);
+      } else if (op == LLVMCall) {
+        LLVMValueRef callee = LLVMGetCalledValue(user);
+        const char *cn =
+            (callee && LLVMIsAFunction(callee)) ? LLVMGetValueName(callee) : NULL;
+        if (cn && (strcmp(cn, "__zan_str_len") == 0 ||
+                   strcmp(cn, "__zan_str_len_arr") == 0 ||
+                   strcmp(cn, "zan_rt_str_len") == 0) &&
+            LLVMGetNumArgOperands(user) >= 1 &&
+            LLVMGetOperand(user, 0) == val &&
+            LLVMTypeOf(user) == LLVMTypeOf(known_len)) {
+          LLVMReplaceAllUsesWith(user, known_len);
+          LLVMInstructionEraseFromParent(user);
+          u = LLVMGetFirstUse(val);
+          continue;
+        }
+      }
+    }
+    u = next_u;
+  }
+}
+
 static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
                               LLVMBasicBlockRef entry_bb, int depth) {
   if (depth > 12)
@@ -2552,6 +2915,13 @@ static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
           strcmp(name, "zan_rt_arr_retain") == 0 ||
           strcmp(name, "zan_rt_arr_release") == 0 ||
           strcmp(name, "zan_rt_str_len") == 0 ||
+          strcmp(name, "__zan_str_len") == 0 ||
+          strcmp(name, "__zan_str_len_arr") == 0 ||
+          strcmp(name, "__zan_str_len_slow") == 0 ||
+          strcmp(name, "__zan_str_len_arr_slow") == 0 ||
+          strcmp(name, "__zan_str_eq") == 0 ||
+          strcmp(name, "__zan_dict_hash") == 0 ||
+          strcmp(name, "__zan_dict_find_str") == 0 ||
           strcmp(name, "zan_rt_str_compare") == 0 ||
           strcmp(name, "zan_rt_str_equal") == 0 ||
           strcmp(name, "zan_rt_str_hash") == 0 ||
@@ -2562,10 +2932,16 @@ static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
           strcmp(name, "zan_rt_live_register") == 0 ||
           strcmp(name, "zan_rt_live_register_named") == 0 ||
           strcmp(name, "zan_rt_live_unregister") == 0 ||
+          strcmp(name, "strlen") == 0 ||
+          strcmp(name, "memcmp") == 0 ||
+          strcmp(name, "strcmp") == 0 ||
+          strcmp(name, "strncmp") == 0 ||
           strncmp(name, "llvm.memset", 11) == 0 ||
           strncmp(name, "llvm.memcpy", 11) == 0 ||
           strncmp(name, "llvm.memmove", 12) == 0 ||
-          strncmp(name, "llvm.lifetime", 13) == 0) {
+          strncmp(name, "llvm.lifetime", 13) == 0 ||
+          (strncmp(name, "__zan_release_", 14) == 0 &&
+           dtor_fn_is_self_only(callee))) {
         /* 安全内部调用 */
       } else {
         return true;
@@ -2690,7 +3066,131 @@ static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
                   LLVMDisposeBuilder(b_inst);
 
                   clear_escape_user_tail_calls(inst, 0);
+                  if (desc_dtor_is_self_only(site_val))
+                    erase_stack_obj_arc_calls(inst, false, 0);
                   LLVMReplaceAllUsesWith(inst, stk_user_ptr);
+                  LLVMInstructionEraseFromParent(inst);
+
+                  stats.stack_promoted++;
+                }
+              }
+            } else if (callee_name &&
+                       strcmp(callee_name, "__zan_itoa_str") == 0 &&
+                       LLVMGetNumArgOperands(inst) >= 1) {
+              LLVMValueRef itoa64 = LLVMGetNamedFunction(mod, "__zan_itoa64");
+              unsigned itoa_n = itoa64 ? LLVMCountParams(itoa64) : 0;
+              unsigned str_n = (unsigned)LLVMGetNumArgOperands(inst);
+              bool sig_ok = (itoa_n == 3 && str_n == 2) ||
+                            (itoa_n == 2 && str_n == 1);
+              if (itoa64 && sig_ok) {
+                stats.objects_analyzed++;
+                if (!check_val_escapes(inst, bb, entry_bb, 0)) {
+                  LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
+                  insert_entry_alloca(b_entry, fn);
+                  LLVMValueRef buf_len = LLVMConstInt(i64, 48, 0);
+                  LLVMValueRef alloca_buf =
+                      LLVMBuildArrayAlloca(b_entry, i8, buf_len, "stk.itoa");
+                  LLVMSetAlignment(alloca_buf, 16);
+                  LLVMDisposeBuilder(b_entry);
+
+                  LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
+                  LLVMPositionBuilderBefore(b_inst, inst);
+                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
+                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.s.rcp");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(b_inst,
+                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
+                                     rc_ptr),
+                      8);
+                  LLVMValueRef hdr_off =
+                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef stk_str = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &hdr_off, 1, "stk.s.usr");
+                  LLVMValueRef val_arg = LLVMGetOperand(inst, 0);
+                  LLVMValueRef call_args[3] = {
+                      stk_str, val_arg,
+                      itoa_n == 3 ? LLVMGetOperand(inst, 1) : NULL};
+                  LLVMValueRef slen = LLVMBuildCall2(
+                      b_inst, LLVMGlobalGetValueType(itoa64), itoa64, call_args,
+                      itoa_n, "stk.s.len");
+                  LLVMSetInstructionCallConv(
+                      slen, LLVMGetFunctionCallConv(itoa64));
+                  LLVMValueRef eight =
+                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &eight, 1, "stk.s.hdrp");
+                  LLVMValueRef hdr_iptr = LLVMBuildBitCast(
+                      b_inst, hdr_ptr, LLVMPointerType(i64, 0), "stk.s.hdrip");
+                  LLVMValueRef hdr_word = LLVMBuildOr(
+                      b_inst,
+                      LLVMConstInt(i64, (uint64_t)ZAN_STRING_TAG << 32, 0),
+                      slen, "stk.s.hdr");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(b_inst, hdr_word, hdr_iptr), 8);
+                  LLVMValueRef nul_p = LLVMBuildGEP2(
+                      b_inst, i8, stk_str, &slen, 1, "stk.s.nulp");
+                  LLVMBuildStore(b_inst, LLVMConstInt(i8, 0, 0), nul_p);
+                  LLVMDisposeBuilder(b_inst);
+
+                  clear_escape_user_tail_calls(inst, 0);
+                  replace_known_str_len_calls(inst, slen, 0);
+                  erase_stack_obj_arc_calls(inst, true, 0);
+                  LLVMReplaceAllUsesWith(inst, stk_str);
+                  LLVMInstructionEraseFromParent(inst);
+
+                  stats.stack_promoted++;
+                }
+              }
+            } else if (callee_name &&
+                       strcmp(callee_name, "zan_rt_str_alloc") == 0 &&
+                       LLVMGetNumArgOperands(inst) >= 1) {
+              stats.objects_analyzed++;
+              LLVMValueRef size_val = LLVMGetOperand(inst, 0);
+              if (LLVMIsAConstantInt(size_val)) {
+                uint64_t obj_sz = LLVMConstIntGetZExtValue(size_val);
+                if (obj_sz <= 256 &&
+                    !check_val_escapes(inst, bb, entry_bb, 0)) {
+                  LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
+                  insert_entry_alloca(b_entry, fn);
+                  LLVMValueRef total_val =
+                      LLVMConstInt(i64, obj_sz + ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef alloca_buf =
+                      LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.sraw");
+                  LLVMSetAlignment(alloca_buf, 16);
+                  LLVMDisposeBuilder(b_entry);
+
+                  LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
+                  LLVMPositionBuilderBefore(b_inst, inst);
+                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
+                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.s.rcp");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(b_inst,
+                                     LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 1),
+                                     rc_ptr),
+                      8);
+                  LLVMValueRef eight =
+                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                  LLVMValueRef hdr_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &eight, 1, "stk.s.hdrp");
+                  LLVMValueRef hdr_iptr = LLVMBuildBitCast(
+                      b_inst, hdr_ptr, LLVMPointerType(i64, 0), "stk.s.hdrip");
+                  LLVMSetAlignment(
+                      LLVMBuildStore(
+                          b_inst,
+                          LLVMConstInt(i64,
+                                       ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN),
+                                       0),
+                          hdr_iptr),
+                      8);
+                  LLVMValueRef hdr_off =
+                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef stk_str = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &hdr_off, 1, "stk.s.usr");
+                  LLVMDisposeBuilder(b_inst);
+
+                  clear_escape_user_tail_calls(inst, 0);
+                  erase_stack_obj_arc_calls(inst, true, 0);
+                  LLVMReplaceAllUsesWith(inst, stk_str);
                   LLVMInstructionEraseFromParent(inst);
 
                   stats.stack_promoted++;
@@ -2783,17 +3283,23 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
    * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
    * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
   static const char *const k_rt_defer_inline[] = {
-      "zan_rt_alloc",       "zan_rt_retain",      "zan_rt_release",
-      "zan_rt_release_dyn", "zan_rt_str_retain",  "zan_rt_str_release",
-      "__zan_eh_state_fast",
+      "zan_rt_alloc",       "zan_rt_str_alloc",   "__zan_itoa_str",
+      "zan_rt_retain",      "zan_rt_release",     "zan_rt_release_dyn",
+      "zan_rt_str_retain",  "zan_rt_str_release", "__zan_str_len",
+      "__zan_str_len_arr",  "__zan_eh_state_fast", "__zan_eh_tmp_push",
+      "__zan_eh_tmp_pop",
   };
-  bool marked_rt[7] = {false};
+  enum { k_rt_defer_n = 13, k_rt_eh_fast_idx = 10, k_rt_restore_always_from = 10 };
+  bool marked_rt[k_rt_defer_n] = {false};
   int marked_count = 0;
+  bool eh_fast_mem_added = false;
+  bool guard_raise_ext = false;
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   unsigned noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+  unsigned memory_kind = LLVMGetEnumAttributeKindForName("memory", 6);
   if (!custom_pipe && noinline_kind != 0 && level != ZAN_OPT_BASIC) {
     LLVMAttributeRef noinl_attr = LLVMCreateEnumAttribute(ctx, noinline_kind, 0);
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < k_rt_defer_n; i++) {
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
       if (fn && !LLVMIsDeclaration(fn) &&
           !LLVMGetEnumAttributeAtIndex(
@@ -2803,7 +3309,28 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinl_attr);
         marked_rt[i] = true;
         marked_count++;
+        if (i == k_rt_eh_fast_idx && memory_kind != 0 &&
+            !LLVMGetEnumAttributeAtIndex(
+                fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                memory_kind)) {
+          /* 在 __zan_eh_state_fast 延后内联期间，@__zan_eh_self 仅对其自身可见；
+           * 临时标注 memory(inaccessiblemem: readwrite) 避免冷路径 rt.bad 里的
+           * EH 状态获取破坏热循环的别名分析与 LICM/向量化；放行内联前立即撤回。 */
+          LLVMAddAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+              LLVMCreateEnumAttribute(ctx, memory_kind, 0x0Cu));
+          eh_fast_mem_added = true;
+        }
       }
+    }
+    /* 阻止 default<O2> 中的 DeadArgumentElimination 裁掉 __zan_guard_raise 的
+     * 常量文件名参数并把 memory(argmem: readwrite, inaccessiblemem: readwrite)
+     * 退化扩宽为全内存 memory(readwrite)；主管线结束后立即恢复 internal 链接。 */
+    LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
+    if (gr_fn && !LLVMIsDeclaration(gr_fn) &&
+        LLVMGetLinkage(gr_fn) == LLVMInternalLinkage) {
+      LLVMSetLinkage(gr_fn, LLVMExternalLinkage);
+      guard_raise_ext = true;
     }
   }
 
@@ -2820,14 +3347,22 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
 
   LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
   LLVMDisposePassBuilderOptions(opts);
+  if (guard_raise_ext) {
+    LLVMValueRef gr_fn = LLVMGetNamedFunction(mod, "__zan_guard_raise");
+    if (gr_fn && !LLVMIsDeclaration(gr_fn))
+      LLVMSetLinkage(gr_fn, LLVMInternalLinkage);
+  }
   if (err) {
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < k_rt_defer_n; i++) {
       if (!marked_rt[i])
         continue;
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
       if (fn && !LLVMIsDeclaration(fn)) {
         LLVMRemoveEnumAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
+        if (i == k_rt_eh_fast_idx && eh_fast_mem_added && memory_kind != 0)
+          LLVMRemoveEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, memory_kind);
       }
     }
     char *msg = LLVMGetErrorMessage(err);
@@ -2836,14 +3371,16 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     return ZAN_ERROR;
   }
 
-  /* Post-inline Zan 优化 pass：先塌缩新暴露的 nothrow invoke，再消除栈逃逸、ARC 冗余、
-   * 虚调用、常量与死代码（含已失活的 __zan_eh_state_fast TLS 调用）。 */
+  /* Post-inline Zan 优化 pass：先塌缩新暴露的 nothrow invoke、消除无抛出间隔的
+   * EH 临时栈 push/pop 与死 unwind，再消除栈逃逸、ARC 冗余、虚调用、常量与死代码。 */
   bool post_changed = false;
   if (!custom_pipe) {
     if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
       if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
         post_changed = true;
     }
+    if (zan_opt_eh_tmp_mod(mod) > 0)
+      post_changed = true;
     if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE")) {
       zan_escape_stats_t es = zan_opt_escape_mod(mod);
       if (es.stack_promoted > 0)
@@ -2885,14 +3422,17 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     bool rt_unmarked = false;
     unsigned alwaysinl_kind =
         LLVMGetEnumAttributeKindForName("alwaysinline", 12);
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < k_rt_defer_n; i++) {
       if (!marked_rt[i])
         continue;
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
       if (fn && !LLVMIsDeclaration(fn)) {
         LLVMRemoveEnumAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
-        if (i == 6 && alwaysinl_kind != 0) {
+        if (i == k_rt_eh_fast_idx && eh_fast_mem_added && memory_kind != 0)
+          LLVMRemoveEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, memory_kind);
+        if (i >= k_rt_restore_always_from && alwaysinl_kind != 0) {
           LLVMAddAttributeAtIndex(
               fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
               LLVMCreateEnumAttribute(ctx, alwaysinl_kind, 0));
@@ -3026,6 +3566,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
     report.success = false;
     return report;
   }
+  zan_opt_eh_tmp_mod(g->mod);
   if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE"))
     report.escape = zan_opt_escape(g);
   if (!zan_opt_knob_off(knobs->no_arc, "ZAN_NO_OPT_ARC"))

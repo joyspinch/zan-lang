@@ -172,6 +172,11 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef em = et ? map_type(g, et) : NULL;
     int is_struct_elem = (em && LLVMGetTypeKind(em) == LLVMStructTypeKind);
     LLVMTypeRef res_ty = is_struct_elem ? em : i64;
+    bool guarded_list = false;
+    if (expr->index.object && expr->index.object->kind == AST_IDENTIFIER) {
+      local_var_t *lv = local_find(locals, expr->index.object->ident.name);
+      guarded_list = lv && irgen_is_loop_guarded_list(g, lv);
+    }
     LLVMValueRef raw_or_struct = NULL;
     if (g->runtime_checks && g->current_fn && oob) {
       /* 单次越界检查 + 安全分支：避免重复 __zan_guard_raise，并在软检查模式下
@@ -186,7 +191,8 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
       zan_set_branch_weights(g, oob_br, 1, 2000);
       LLVMPositionBuilderAtEnd(g->builder, load_bb);
       /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
-      LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
+      LLVMValueRef data = guarded_list ? list_data_direct(g, list_ptr, "data")
+                                       : list_data_for(g, list_ptr, et, "data");
       LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
       LLVMValueRef loaded = is_struct_elem
                                 ? load_struct_from_slot(g, elem_ptr, em)
@@ -201,7 +207,8 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
       raw_or_struct = phi;
     } else {
       /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
-      LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
+      LLVMValueRef data = guarded_list ? list_data_direct(g, list_ptr, "data")
+                                       : list_data_for(g, list_ptr, et, "data");
       LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
       raw_or_struct = is_struct_elem
                           ? load_struct_from_slot(g, elem_ptr, em)

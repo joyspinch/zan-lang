@@ -657,6 +657,11 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
     LLVMAddAttributeAtIndex(g->rt_alloc, LLVMAttributeReturnIndex,
                             LLVMCreateEnumAttribute(g->ctx, nonnull_kind, 0));
   }
+  unsigned noalias_kind = LLVMGetEnumAttributeKindForName("noalias", 7);
+  if (noalias_kind) {
+    LLVMAddAttributeAtIndex(g->rt_alloc, LLVMAttributeReturnIndex,
+                            LLVMCreateEnumAttribute(g->ctx, noalias_kind, 0));
+  }
 }
 
 {
@@ -722,6 +727,11 @@ g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
     if (nonnull_kind) {
       LLVMAddAttributeAtIndex(g->rt_str_alloc, LLVMAttributeReturnIndex,
                               LLVMCreateEnumAttribute(g->ctx, nonnull_kind, 0));
+    }
+    unsigned noalias_kind = LLVMGetEnumAttributeKindForName("noalias", 7);
+    if (noalias_kind) {
+      LLVMAddAttributeAtIndex(g->rt_str_alloc, LLVMAttributeReturnIndex,
+                              LLVMCreateEnumAttribute(g->ctx, noalias_kind, 0));
     }
   }
   LLVMBasicBlockRef bb =

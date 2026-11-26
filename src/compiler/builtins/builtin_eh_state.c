@@ -1065,7 +1065,19 @@ static unsigned eh_tmp_shift(zan_irgen_t *g) {
  * per module does all of it; the site is a single call/invoke. Semantics
  * are unchanged: inside a try (eh.top >= 0) it throws through the caller's
  * landing pad (the site invokes it), otherwise it reports and returns. */
-LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g) { return emit_eh_state(g); }
+LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g) {
+  LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+  LLVMValueRef fn = cur ? LLVMGetBasicBlockParent(cur) : NULL;
+  if (fn && fn == g->eh_state_owner && g->eh_state_cached)
+    return g->eh_state_cached;
+  /* Cold guard sites fetch EH state locally so guard-only helpers do not hoist
+   * a TLS probe into entry_bb (or into loops that inline them). */
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
+                             get_eh_state_fast_fn(g), NULL, 0, "eh.st.cold");
+  return LLVMBuildBitCast(g->builder, p, LLVMPointerType(get_eh_state_ty(g), 0),
+                          "eh.stp.cold");
+}
 
 LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_guard_raise");

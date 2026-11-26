@@ -295,6 +295,27 @@ LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr,
     zan_tbaa_tag_meta(g, data);
     return data;
 }
+/* 循环 preheader 已确认槽宽且循环体内绝不重排该表时，直接取数据指针。 */
+LLVMValueRef list_data_direct(zan_irgen_t *g, LLVMValueRef list_ptr,
+                              const char *nm) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef lp = LLVMBuildBitCast(g->builder, list_ptr,
+        LLVMPointerType(g->list_struct_type, 0), "lw.lp");
+    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+        LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "lw.df"),
+        nm ? nm : "data");
+    zan_tbaa_tag_meta(g, data);
+    return data;
+}
+bool irgen_is_loop_guarded_list(zan_irgen_t *g, const void *lv) {
+    if (!g || !lv)
+        return false;
+    for (int i = 0; i < g->loop_guarded_list_count; i++) {
+        if (g->loop_guarded_lists[i] == lv)
+            return true;
+    }
+    return false;
+}
 /* 新建 List 的表头宽度标签（各建表点在写 count/cap/data 时一并调用）。 */
 void list_header_init_esz(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
