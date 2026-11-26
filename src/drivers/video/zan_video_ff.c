@@ -132,6 +132,11 @@ static void zan_ff_lock(void) {
 static void zan_ff_unlock(void) { LeaveCriticalSection(&g_ff_cs); }
 static void *zan_dl_sym(HMODULE m, const char *name) { return (void *)GetProcAddress(m, name); }
 static void zan_dl_close(HMODULE m) { if (m) FreeLibrary(m); }
+#elif defined(__wasi__) || defined(__wasm__)
+static void zan_ff_lock(void) { }
+static void zan_ff_unlock(void) { }
+static void *zan_dl_sym(void *m, const char *name) { (void)m; (void)name; return NULL; }
+static void zan_dl_close(void *m) { (void)m; }
 #else
 static pthread_mutex_t g_ff_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void zan_ff_lock(void) { pthread_mutex_lock(&g_ff_mutex); }
@@ -157,16 +162,22 @@ typedef struct zan_ff_ver_tuple {
     const char *swresample;
 } zan_ff_ver_tuple_t;
 
-/* FFmpeg 8 (62/62/60/9/6), FFmpeg 7 (61/61/59/8/5), FFmpeg 6 (60/60/58/7/4) */
+/* FFmpeg 8 (62/62/60/9/6), FFmpeg 7 (61/61/59/8/5), FFmpeg 6 (60/60/58/7/4), 以及无版本号通配（Android/OHOS/捆绑 dylib） */
 static const zan_ff_ver_tuple_t g_ff_tuples[] = {
     { "60", "62", "62", "9", "6" },
     { "59", "61", "61", "8", "5" },
     { "58", "60", "60", "7", "4" },
+    { "",   "",   "",   "",  ""  },
 };
 
 static int zan_ff_try_load_set(const char *dir, const zan_ff_ver_tuple_t *t) {
+#if defined(__wasi__) || defined(__wasm__)
+    (void)dir; (void)t;
+    return 0;
+#else
     char p_u[640], p_c[640], p_f[640], p_s[640], p_r[640];
 #ifdef _WIN32
+    if (!t->avutil[0]) return 0;
     if (dir && dir[0]) {
         SetDllDirectoryA(dir);
         snprintf(p_u, sizeof(p_u), "%s\\avutil-%s.dll", dir, t->avutil);
@@ -194,11 +205,12 @@ static int zan_ff_try_load_set(const char *dir, const zan_ff_ver_tuple_t *t) {
 #elif defined(__APPLE__)
     const char *pfx = (dir && dir[0]) ? dir : "";
     const char *sep = (dir && dir[0]) ? "/" : "";
-    snprintf(p_u, sizeof(p_u), "%s%slibavutil.%s.dylib", pfx, sep, t->avutil);
-    snprintf(p_c, sizeof(p_c), "%s%slibavcodec.%s.dylib", pfx, sep, t->avcodec);
-    snprintf(p_f, sizeof(p_f), "%s%slibavformat.%s.dylib", pfx, sep, t->avformat);
-    snprintf(p_s, sizeof(p_s), "%s%slibswscale.%s.dylib", pfx, sep, t->swscale);
-    snprintf(p_r, sizeof(p_r), "%s%slibswresample.%s.dylib", pfx, sep, t->swresample);
+    const char *dot = t->avutil[0] ? "." : "";
+    snprintf(p_u, sizeof(p_u), "%s%slibavutil%s%s.dylib", pfx, sep, dot, t->avutil);
+    snprintf(p_c, sizeof(p_c), "%s%slibavcodec%s%s.dylib", pfx, sep, dot, t->avcodec);
+    snprintf(p_f, sizeof(p_f), "%s%slibavformat%s%s.dylib", pfx, sep, dot, t->avformat);
+    snprintf(p_s, sizeof(p_s), "%s%slibswscale%s%s.dylib", pfx, sep, dot, t->swscale);
+    snprintf(p_r, sizeof(p_r), "%s%slibswresample%s%s.dylib", pfx, sep, dot, t->swresample);
     void *hu = dlopen(p_u, RTLD_LAZY | RTLD_LOCAL);
     void *hc = hu ? dlopen(p_c, RTLD_LAZY | RTLD_LOCAL) : NULL;
     void *hf = hc ? dlopen(p_f, RTLD_LAZY | RTLD_LOCAL) : NULL;
@@ -211,11 +223,12 @@ static int zan_ff_try_load_set(const char *dir, const zan_ff_ver_tuple_t *t) {
 #else
     const char *pfx = (dir && dir[0]) ? dir : "";
     const char *sep = (dir && dir[0]) ? "/" : "";
-    snprintf(p_u, sizeof(p_u), "%s%slibavutil.so.%s", pfx, sep, t->avutil);
-    snprintf(p_c, sizeof(p_c), "%s%slibavcodec.so.%s", pfx, sep, t->avcodec);
-    snprintf(p_f, sizeof(p_f), "%s%slibavformat.so.%s", pfx, sep, t->avformat);
-    snprintf(p_s, sizeof(p_s), "%s%slibswscale.so.%s", pfx, sep, t->swscale);
-    snprintf(p_r, sizeof(p_r), "%s%slibswresample.so.%s", pfx, sep, t->swresample);
+    const char *dot = t->avutil[0] ? "." : "";
+    snprintf(p_u, sizeof(p_u), "%s%slibavutil.so%s%s", pfx, sep, dot, t->avutil);
+    snprintf(p_c, sizeof(p_c), "%s%slibavcodec.so%s%s", pfx, sep, dot, t->avcodec);
+    snprintf(p_f, sizeof(p_f), "%s%slibavformat.so%s%s", pfx, sep, dot, t->avformat);
+    snprintf(p_s, sizeof(p_s), "%s%slibswscale.so%s%s", pfx, sep, dot, t->swscale);
+    snprintf(p_r, sizeof(p_r), "%s%slibswresample.so%s%s", pfx, sep, dot, t->swresample);
     void *hu = dlopen(p_u, RTLD_LAZY | RTLD_LOCAL);
     void *hc = hu ? dlopen(p_c, RTLD_LAZY | RTLD_LOCAL) : NULL;
     void *hf = hc ? dlopen(p_f, RTLD_LAZY | RTLD_LOCAL) : NULL;
@@ -296,6 +309,7 @@ static int zan_ff_try_load_set(const char *dir, const zan_ff_ver_tuple_t *t) {
     g_ff.av_log_set_level(16);
     g_ff.loaded = 1;
     return 1;
+#endif
 }
 
 static int zan_ff_try_dir(const char *dir) {

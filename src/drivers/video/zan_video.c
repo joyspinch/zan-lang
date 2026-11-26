@@ -11,7 +11,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#else
+#elif !defined(__wasi__) && !defined(__wasm__)
 #include <dlfcn.h>
 #include <pthread.h>
 #endif

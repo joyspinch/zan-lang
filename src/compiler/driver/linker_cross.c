@@ -673,16 +673,18 @@ else if (cross_compiling && target.os == ZAN_OS_WASI) {
     static const char *const gui_pre[] = {"zan_gui_", NULL};
     static const char *const image_pre[] = {"zan_image_", NULL};
     static const char *const audio_pre[] = {"zan_audio_", NULL};
+    static const char *const video_pre[] = {"zan_video_", NULL};
     static const char *const game_pre[] = {"zan_game_", NULL};
     int need_game = wasm_obj_vec_refs_any(&generated_objects, game_pre);
     int need_gui =
         need_game || wasm_obj_vec_refs_any(&generated_objects, gui_pre);
     const int need_module[] = {
         need_game || wasm_obj_vec_refs_any(&generated_objects, image_pre),
-        wasm_obj_vec_refs_any(&generated_objects, audio_pre), need_game};
+        wasm_obj_vec_refs_any(&generated_objects, audio_pre),
+        wasm_obj_vec_refs_any(&generated_objects, video_pre), need_game};
     static const char *const module_obj[] = {"zanrt_image.o", "zanrt_audio.o",
-                                             "zanrt_game.o"};
-    for (int mi = 0; mi < 3; mi++) {
+                                             "zanrt_video.o", "zanrt_game.o"};
+    for (int mi = 0; mi < 4; mi++) {
       if (!need_module[mi])
         continue;
       char nativeobj[1300];

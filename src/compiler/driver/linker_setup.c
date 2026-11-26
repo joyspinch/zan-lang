@@ -433,7 +433,8 @@ if (!emit_lib || lib_shared) {
     }
     if (cross_compiling && !emit_lib && target.os == ZAN_OS_IOS) {
       static const char *const ios_modules[] = {"zan_gui", "zan_image",
-                                                "zan_audio", "zan_game"};
+                                                "zan_audio", "zan_video",
+                                                "zan_game"};
       for (size_t i = 0; i < sizeof(ios_modules) / sizeof(ios_modules[0]); i++)
         if (strlen(ios_modules[i]) == (size_t)nlen &&
             memcmp(nm, ios_modules[i], (size_t)nlen) == 0)
@@ -441,7 +442,8 @@ if (!emit_lib || lib_shared) {
     }
     if (target.os == ZAN_OS_WASI) {
       static const char *const wasi_modules[] = {"zan_gui", "zan_image",
-                                                 "zan_audio", "zan_game"};
+                                                 "zan_audio", "zan_video",
+                                                 "zan_game"};
       for (size_t i = 0; i < sizeof(wasi_modules) / sizeof(wasi_modules[0]);
            i++)
         if (strlen(wasi_modules[i]) == (size_t)nlen &&

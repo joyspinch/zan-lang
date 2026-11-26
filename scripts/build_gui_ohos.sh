@@ -122,14 +122,15 @@ src/sfnt/sfnt.c src/truetype/truetype.c src/type1/type1.c src/type42/type42.c \
 src/winfonts/winfnt.c"
 
 build_arch() {  # build_arch <arch>   (x64 | arm64)
-  local a="$1" triple ftlib drv image audio game feature
+  local a="$1" triple ftlib drv image audio video game feature
   if [ "$a" = "x64" ]; then triple=x86_64-linux-ohos; else triple=aarch64-linux-ohos; fi
   ftlib="freetype_$a"
   drv="$REPO/packages/Zan.Gui/src/Gui/drivers/ohos-$a"
   image="$REPO/packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/ohos-$a"
   audio="$REPO/packages/Zan.Desktop/src/System/Media/drivers/ohos-$a"
+  video="$REPO/packages/Zan.Media/src/System/Media/Video/drivers/ohos-$a"
   game="$REPO/packages/Zan.Game/src/Game/Graphics/drivers/ohos-$a"
-  mkdir -p "$OUT/obj/$a" "$drv/static" "$image/static" "$audio/static" "$game/static"
+  mkdir -p "$OUT/obj/$a" "$drv/static" "$image/static" "$audio/static" "$video/static" "$game/static"
 
   if [ ! -f "$OUT/lib$ftlib.a" ]; then
     echo "== ohos-$a: freetype per-file (INSTALL.ANY) -> lib$ftlib.a"
@@ -155,7 +156,7 @@ build_arch() {  # build_arch <arch>   (x64 | arm64)
     --target=$triple --sysroot="$SYS" \
     -c "$REPO/src/drivers/gui/gui_runtime.c" -o "$OUT/gui_ohos_$a.o"
 
-  for feature in image audio game; do
+  for feature in image audio video game; do
     "$CLANG" -O2 -fPIC -g0 -DNDEBUG -std=c11 -D_GNU_SOURCE \
       -D"ZAN_$(printf '%s' "$feature" | tr '[:lower:]' '[:upper:]')_STATIC" \
       -I"$REPO/src/runtime" -I"$REPO/src/drivers" -I"$REPO/src/third_party" --target=$triple --sysroot="$SYS" \
@@ -169,20 +170,25 @@ build_arch() {  # build_arch <arch>   (x64 | arm64)
   "$CLANG" -fPIC -shared -g0 --target=$triple --sysroot="$SYS" \
     -Wl,-soname,libzan_audio.so -o "$audio/libzan_audio.so" "$OUT/zan_audio_$a.o" -ldl -pthread -lm
   "$CLANG" -fPIC -shared -g0 --target=$triple --sysroot="$SYS" \
+    -Wl,-soname,libzan_video.so -o "$video/libzan_video.so" "$OUT/zan_video_$a.o" -ldl -pthread
+  "$CLANG" -fPIC -shared -g0 --target=$triple --sysroot="$SYS" \
     -Wl,-soname,libzan_game.so -Wl,-rpath,'$ORIGIN' -o "$game/libzan_game.so" \
     "$OUT/zan_game_$a.o" -L"$drv" -L"$image" -lzan_gui -lzan_image -lm
-  rm -f "$drv/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$game/static/libzan_game.a"
+  rm -f "$drv/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$video/static/libzan_video.a" "$game/static/libzan_game.a"
   "$AR" rcs "$drv/static/libzan_gui.a" "$OUT/gui_ohos_$a.o" "$OUT"/obj/"$a"/src_*.o
   "$AR" rcs "$image/static/libzan_image.a" "$OUT/zan_image_$a.o"
   "$AR" rcs "$audio/static/libzan_audio.a" "$OUT/zan_audio_$a.o"
+  "$AR" rcs "$video/static/libzan_video.a" "$OUT/zan_video_$a.o"
   "$AR" rcs "$game/static/libzan_game.a" "$OUT/zan_game_$a.o"
   printf 'EGL\nGLESv3\ndl\nm\n' > "$drv/static/zan_gui.libs"
   printf 'm\n' > "$image/static/zan_image.libs"
   printf 'dl\npthread\nm\n' > "$audio/static/zan_audio.libs"
+  printf 'dl\npthread\n' > "$video/static/zan_video.libs"
   { printf 'zan_gui\nzan_image\n'; cat "$drv/static/zan_gui.libs"; } > "$game/static/zan_game.libs"
   printf 'libzan_gui.so\n' > "$drv/zan_gui.bundle"
   printf 'libzan_image.so\n' > "$image/zan_image.bundle"
   printf 'libzan_audio.so\n' > "$audio/zan_audio.bundle"
+  printf 'libzan_video.so\n' > "$video/zan_video.bundle"
   printf '@driver/zan_gui\n@driver/zan_image\nlibzan_game.so\n' > "$game/zan_game.bundle"
   echo "== ohos-$a: staged GUI/image/audio/game shared and static drivers"
 }

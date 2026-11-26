@@ -92,6 +92,9 @@ if not exist "%IOSHDR%\pthread.h" (
   exit /b 1
 )
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -DZAN_GUI_IOS -DZAN_GUI_STATIC -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_runtime.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=gnu11 -fPIC -DZAN_IMAGE_STATIC -I %RT% -I %DRV% -I %TP% -I %TP%\libwebp\src -O2 -ffunction-sections -fdata-sections -c %DRV%\image\zan_image.c -o toolchain\ios\arm64\zanrt_image.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=gnu11 -fPIC -DZAN_AUDIO_STATIC -I %RT% -I %DRV% -I %TP% -O2 -ffunction-sections -fdata-sections -c %DRV%\audio\zan_audio.c -o toolchain\ios\arm64\zanrt_audio.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=gnu11 -fPIC -DZAN_VIDEO_STATIC -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\video\zan_video.c -o toolchain\ios\arm64\zanrt_video.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
@@ -180,6 +183,7 @@ rem Game consumes the shared graphics context and image cache via their headers.
 rem WASI keeps offline WAV/Vorbis APIs and the existing no-device result;
 rem zan_audio.c's WASI path must not require desktop pthread/dlopen backends.
 "%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -ffunction-sections -fdata-sections -c %DRV%\audio\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\video\zan_video.c -DZAN_VIDEO_STATIC -o toolchain\wasm32\zanrt_video.o || exit /b 1
 rem Single-threaded sync equivalents for wasm32 GUI programs (rt_sync_wasm.c):
 rem threads run their body synchronously, atomics are plain cells, the shared
 rem table degrades to "unavailable", clocks are real. main.c links this next to

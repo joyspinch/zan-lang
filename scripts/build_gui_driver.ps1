@@ -9,7 +9,7 @@
 param(
     [switch]$Static,
     [ValidateSet("win-x64", "win-arm64")][string]$Target = "win-x64",
-    [string[]]$Drivers = @("zan_gui", "zan_image", "zan_audio", "zan_game"),
+    [string[]]$Drivers = @("zan_gui", "zan_image", "zan_audio", "zan_video", "zan_game"),
     [string]$BuildDir = "build",
     [string]$StageRoot = "",
     [string]$Clang = "clang",

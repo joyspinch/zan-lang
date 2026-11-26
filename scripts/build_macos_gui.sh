@@ -15,10 +15,11 @@ build() {
     local gui="packages/Zan.Gui/src/Gui/drivers/$target"
     local image="packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/$target"
     local audio="packages/Zan.Desktop/src/System/Media/drivers/$target"
+    local video="packages/Zan.Media/src/System/Media/Video/drivers/$target"
     local game="packages/Zan.Game/src/Game/Graphics/drivers/$target"
     local flags=(-O2 -g0 -DNDEBUG -fPIC -arch "$arch" -mmacosx-version-min=11.0 -I src/drivers -I src/third_party -I src/runtime)
     local frameworks=(-framework Cocoa -framework CoreText -framework QuartzCore -framework IOSurface -framework WebKit -framework Metal)
-    mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$game/static"
+    mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$video/static" "$game/static"
     xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -DZAN_GUI_STATIC -c src/drivers/gui/gui_runtime.c -o "$work/gui.o"
     xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -c src/drivers/gui/gui_runtime_mac.m -o "$work/cocoa.o"
     # Same TU set as the CMake zan_gui target: the Metal render backend is a
@@ -28,26 +29,30 @@ build() {
     xcrun clang "${flags[@]}" -c src/runtime/rt_crash.c -o "$work/crash.o"
     xcrun clang "${flags[@]}" -DZAN_IMAGE_STATIC -c src/drivers/image/zan_image.c -o "$work/image.o"
     xcrun clang "${flags[@]}" -DZAN_AUDIO_STATIC -c src/drivers/audio/zan_audio.c -o "$work/audio.o"
+    xcrun clang "${flags[@]}" -DZAN_VIDEO_STATIC -c src/drivers/video/zan_video.c -o "$work/video.o"
     xcrun clang "${flags[@]}" -DZAN_GAME_STATIC -DZAN_GUI_COCOA -c src/drivers/game/zan_game.c -o "$work/game.o"
 
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_gui.dylib -o "$gui/libzan_gui.dylib" "$work/gui.o" "$work/cocoa.o" "$work/metal.o" "$work/crash.o" -lm "${frameworks[@]}"
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_image.dylib -o "$image/libzan_image.dylib" "$work/image.o" -lm
     # CoreAudio is loaded by zan_audio; no GUI or Cocoa dependency is needed.
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_audio.dylib -o "$audio/libzan_audio.dylib" "$work/audio.o" -lpthread -ldl -lm
+    xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_video.dylib -o "$video/libzan_video.dylib" "$work/video.o" -lpthread -ldl
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_game.dylib -Wl,-rpath,@loader_path -o "$game/libzan_game.dylib" "$work/game.o" -L"$gui" -L"$image" -lzan_gui -lzan_image -lm
-    rm -f "$gui/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$game/static/libzan_game.a"
+    rm -f "$gui/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$video/static/libzan_video.a" "$game/static/libzan_game.a"
     xcrun ar rcs "$gui/static/libzan_gui.a" "$work/gui.o" "$work/cocoa.o" "$work/metal.o"
     xcrun ar rcs "$image/static/libzan_image.a" "$work/image.o"
     xcrun ar rcs "$audio/static/libzan_audio.a" "$work/audio.o"
+    xcrun ar rcs "$video/static/libzan_video.a" "$work/video.o"
     xcrun ar rcs "$game/static/libzan_game.a" "$work/game.o"
     printf 'm\nobjc\n@framework/Cocoa\n@framework/CoreText\n@framework/QuartzCore\n@framework/IOSurface\n@framework/WebKit\n@framework/Metal\n' > "$gui/static/zan_gui.libs"
     printf 'm\n' > "$image/static/zan_image.libs"
     printf 'pthread\ndl\nm\n' > "$audio/static/zan_audio.libs"
+    printf 'pthread\ndl\n' > "$video/static/zan_video.libs"
     { printf 'zan_gui\nzan_image\n'; cat "$gui/static/zan_gui.libs"; } > "$game/static/zan_game.libs"
-    for driver in zan_gui zan_image zan_audio zan_game; do
+    for driver in zan_gui zan_image zan_audio zan_video zan_game; do
         case "$driver" in
             zan_gui) dest="$gui" ;; zan_image) dest="$image" ;;
-            zan_audio) dest="$audio" ;; zan_game) dest="$game" ;;
+            zan_audio) dest="$audio" ;; zan_video) dest="$video" ;; zan_game) dest="$game" ;;
         esac
         codesign --force --sign - "$dest/lib$driver.dylib"
         if [ "$driver" = zan_game ]; then

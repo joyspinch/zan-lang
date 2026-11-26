@@ -61,10 +61,11 @@ build() { # triple driver-target
   local gui="$REPO/packages/Zan.Gui/src/Gui/drivers/$target"
   local image="$REPO/packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/$target"
   local audio="$REPO/packages/Zan.Desktop/src/System/Media/drivers/$target"
+  local video="$REPO/packages/Zan.Media/src/System/Media/Video/drivers/$target"
   local game="$REPO/packages/Zan.Game/src/Game/Graphics/drivers/$target"
   local target_flags=(--sysroot="$SYSROOT" -target "$triple")
   local ft_objects=()
-  mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$game/static"
+  mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$video/static" "$game/static"
   "$NDKBIN/clang" "${target_flags[@]}" "${COMMON[@]}" "${FT_FLAGS[@]}" \
     -DZAN_GUI_ANDROID_NATIVE -DZAN_GUI_FREETYPE -DZAN_GUI_STATIC -I"$REPO/toolchain/$target" \
     -c "$REPO/src/drivers/gui/gui_runtime.c" -o "$work/gui.o"
@@ -74,30 +75,34 @@ build() { # triple driver-target
       -c "$FT/src/$f" -o "$work/$m.o"
     ft_objects+=("$work/$m.o")
   done
-  for feature in image audio game; do
+  for feature in image audio video game; do
     "$NDKBIN/clang" "${target_flags[@]}" "${COMMON[@]}" \
       -D"ZAN_$(printf '%s' "$feature" | tr '[:lower:]' '[:upper:]')_STATIC" \
       -c "$REPO/src/drivers/$feature/zan_$feature.c" -o "$work/$feature.o"
   done
-  rm -f "$gui/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$game/static/libzan_game.a"
+  rm -f "$gui/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$video/static/libzan_video.a" "$game/static/libzan_game.a"
   "$NDKBIN/llvm-ar" rcs "$gui/static/libzan_gui.a" "$work/gui.o" "${ft_objects[@]}"
   "$NDKBIN/llvm-ar" rcs "$image/static/libzan_image.a" "$work/image.o"
   "$NDKBIN/llvm-ar" rcs "$audio/static/libzan_audio.a" "$work/audio.o"
+  "$NDKBIN/llvm-ar" rcs "$video/static/libzan_video.a" "$work/video.o"
   "$NDKBIN/llvm-ar" rcs "$game/static/libzan_game.a" "$work/game.o"
   "$NDKBIN/clang" "${target_flags[@]}" -shared -Wl,-soname,libzan_gui.so \
     -o "$gui/libzan_gui.so" "$work/gui.o" "${ft_objects[@]}" -landroid -llog -lEGL -lGLESv3 -ldl -lm
   "$NDKBIN/clang" "${target_flags[@]}" -shared -Wl,-soname,libzan_image.so -o "$image/libzan_image.so" "$work/image.o" -lm
   "$NDKBIN/clang" "${target_flags[@]}" -shared -Wl,-soname,libzan_audio.so -o "$audio/libzan_audio.so" "$work/audio.o" -laaudio -ldl -lm
+  "$NDKBIN/clang" "${target_flags[@]}" -shared -Wl,-soname,libzan_video.so -o "$video/libzan_video.so" "$work/video.o" -ldl
   "$NDKBIN/clang" "${target_flags[@]}" -shared -Wl,-soname,libzan_game.so -Wl,-rpath,'$ORIGIN' \
     -o "$game/libzan_game.so" "$work/game.o" -L"$gui" -L"$image" -lzan_gui -lzan_image -lm
   # pthread symbols are provided by Android libc; there is no libpthread.a.
   printf 'android\nlog\nEGL\nGLESv3\ndl\nm\n' > "$gui/static/zan_gui.libs"
   printf 'm\n' > "$image/static/zan_image.libs"
   printf 'aaudio\ndl\nm\n' > "$audio/static/zan_audio.libs"
+  printf 'dl\n' > "$video/static/zan_video.libs"
   { printf 'zan_gui\nzan_image\n'; cat "$gui/static/zan_gui.libs"; } > "$game/static/zan_game.libs"
   printf 'libzan_gui.so\n' > "$gui/zan_gui.bundle"
   printf 'libzan_image.so\n' > "$image/zan_image.bundle"
   printf 'libzan_audio.so\n' > "$audio/zan_audio.bundle"
+  printf 'libzan_video.so\n' > "$video/zan_video.bundle"
   printf '@driver/zan_gui\n@driver/zan_image\nlibzan_game.so\n' > "$game/zan_game.bundle"
   echo "staged GUI/image/audio/game shared and static drivers for $target"
 }

@@ -204,6 +204,22 @@ else if (cross_compiling &&
   if (has_audio_driver && zan_file_exists(macrt_audio)) {
     cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_audio);
   }
+  char macrt_video[1400] = {0};
+  snprintf(macrt_video, sizeof(macrt_video), "%s/zanrt_video.o", macrt);
+  if (!zan_file_exists(macrt_video)) {
+    if (target.os == ZAN_OS_IOS) {
+      snprintf(macrt_video, sizeof(macrt_video),
+               "%s/toolchain/ios/arm64/zanrt_video.o", exe_dir2);
+      if (!zan_file_exists(macrt_video)) {
+        snprintf(macrt_video, sizeof(macrt_video),
+                 "toolchain/ios/arm64/zanrt_video.o");
+      }
+    }
+  }
+  bool has_video_driver = zan_irgen_imports_ios_driver(&irgen, "zan_video");
+  if (has_video_driver && zan_file_exists(macrt_video)) {
+    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_video);
+  }
   for (int di = 0; di < zan_lib_ndirs; di++) {
     cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"", zan_lib_dirs[di]);
   }
