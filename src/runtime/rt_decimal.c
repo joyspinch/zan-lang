@@ -21,22 +21,75 @@
 #if defined(__SIZEOF_INT128__)
 typedef unsigned __int128 uint128_t;
 static const uint128_t MANTISSA_96_MAX = (((uint128_t)1) << 96) - 1;
+static const uint128_t MANTISSA_96_DIV10 = ((((uint128_t)1) << 96) - 1) / 10;
 
-static inline int nlz32(uint32_t x) {
-    int n = 0;
-    if (x == 0) return 32;
-    while (!(x & 0x80000000U)) { x <<= 1; n++; }
-    return n;
+static const uint64_t POW10_U64[20] = {
+    1ULL,
+    10ULL,
+    100ULL,
+    1000ULL,
+    10000ULL,
+    100000ULL,
+    1000000ULL,
+    10000000ULL,
+    100000000ULL,
+    1000000000ULL,
+    10000000000ULL,
+    100000000000ULL,
+    1000000000000ULL,
+    10000000000000ULL,
+    100000000000000ULL,
+    1000000000000000ULL,
+    10000000000000000ULL,
+    100000000000000000ULL,
+    1000000000000000000ULL,
+    10000000000000000000ULL
+};
+
+static const double POW10_DBL[29] = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+    1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+    1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28
+};
+
+static inline uint128_t pow10_128(int n) {
+    if (n <= 19) return (uint128_t)POW10_U64[n];
+    return (uint128_t)POW10_U64[19] * (uint128_t)POW10_U64[n - 19];
 }
 
-/* u128/u128 多精度除法：Knuth 算法 D（TAOCP 4.3.1），32 位 digits。
- * 曾是 128 次逐位移位环，单次除法数百至上千周期（B-ID84）；现按除数
- * 有效位数（1..4）做 1..5 轮"商估-乘减-加回"，96 位量级 ~3.4 倍提速。
- * 商估与乘减全程 64 位乘法承载（digit 32 位，乘积/中间差均不溢出）。
- * 乘减的借位链依赖算术移位语义（Hacker's Delight divmnu 同款）：
- * k = (p>>32) - (t>>32)，t 为 int64_t——无符号逻辑移位会算错借位。
- * 对拍证据：_scratch 探针 3.2M 对（边界值/随机/decimal 口径）与旧实现
- * 逐位一致且满足 q*den+r==num。 */
+static inline int nlz32(uint32_t x) {
+    if (x == 0) return 32;
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_clz(x);
+#else
+    int n = 0;
+    while (!(x & 0x80000000U)) { x <<= 1; n++; }
+    return n;
+#endif
+}
+
+/* 128 位除以 32 位快速路径（覆盖 /10、/10^9 与小除数），免去 Knuth 算法 D 归一化开销 */
+static inline uint128_t u128_divrem_u32(uint128_t num, uint32_t d, uint32_t *rem_out) {
+    if (num <= UINT64_MAX) {
+        uint64_t n = (uint64_t)num;
+        uint64_t q = n / d;
+        if (rem_out) *rem_out = (uint32_t)(n - q * d);
+        return (uint128_t)q;
+    }
+    uint64_t hi = (uint64_t)(num >> 64);
+    uint64_t lo = (uint64_t)num;
+    uint64_t q_hi = hi / d;
+    uint64_t r = hi - q_hi * d;
+    uint64_t mid = (r << 32) | (lo >> 32);
+    uint64_t q_mid = mid / d;
+    r = mid - q_mid * d;
+    uint64_t low = (r << 32) | (lo & 0xFFFFFFFFULL);
+    uint64_t q_lo = low / d;
+    if (rem_out) *rem_out = (uint32_t)(low - q_lo * d);
+    return ((uint128_t)q_hi << 64) | (q_mid << 32) | q_lo;
+}
+
+/* u128/u128 多精度除法：64 位硬件除法 + 32 位除数快路径 + Knuth 算法 D（TAOCP 4.3.1） */
 static uint128_t u128_divrem(uint128_t num, uint128_t den, uint128_t *rem_out) {
     if (den == 0) {
         if (rem_out) *rem_out = 0;
@@ -49,6 +102,19 @@ static uint128_t u128_divrem(uint128_t num, uint128_t den, uint128_t *rem_out) {
     if (num == den) {
         if (rem_out) *rem_out = 0;
         return 1;
+    }
+    if (num <= UINT64_MAX) {
+        uint64_t n = (uint64_t)num;
+        uint64_t d = (uint64_t)den;
+        uint64_t q = n / d;
+        if (rem_out) *rem_out = (uint128_t)(n - q * d);
+        return (uint128_t)q;
+    }
+    if (den <= 0xFFFFFFFFULL) {
+        uint32_t r32 = 0;
+        uint128_t q = u128_divrem_u32(num, (uint32_t)den, &r32);
+        if (rem_out) *rem_out = (uint128_t)r32;
+        return q;
     }
 
     const uint64_t B = 0x100000000ull; /* base 2^32 */
@@ -207,15 +273,12 @@ int64_t zan_decimal_to_int64(zan_decimal_t d) {
     if (scale > MAX_SCALE) scale = MAX_SCALE;
 #if defined(__SIZEOF_INT128__)
     uint128_t m = ((uint128_t)d.hi32 << 64) | (uint128_t)d.lo64;
-    /* C# 的 decimal→整数显式转换是舍入到最近、半数到偶（银行家）——
-     * 2.9m→3、2.5m→2。曾按逐位截断：ToInt64(2.9m)=2（TASKS.md A513）。
-     * 一次取商余再判定，不逐位舍入（逐位会把 2.49 滚成 3）。 */
     if (scale == 0)
         return dec_is_neg(d) ? -(int64_t)m : (int64_t)m;
-    uint128_t div = 1;
-    for (uint8_t i = 0; i < scale; i++) div *= 10;
-    uint128_t q = m / div, r = m % div;
-    if (r * 2 > div || (r * 2 == div && (q % 2 == 1))) q += 1;
+    uint128_t div = pow10_128(scale);
+    uint128_t r = 0;
+    uint128_t q = u128_divrem(m, div, &r);
+    if (r * 2 > div || (r * 2 == div && ((uint64_t)q & 1ULL))) q += 1;
     return dec_is_neg(d) ? -(int64_t)q : (int64_t)q;
 #else
     uint64_t res = d.lo64;
@@ -226,9 +289,12 @@ int64_t zan_decimal_to_int64(zan_decimal_t d) {
 double zan_decimal_to_double(zan_decimal_t d) {
     double res = (double)d.hi32 * 18446744073709551616.0 + (double)d.lo64;
     uint8_t scale = dec_scale(d);
-    while (scale > 0) {
-        res /= 10.0;
-        scale--;
+    if (scale > 0) {
+        if (scale <= MAX_SCALE) {
+            res /= POW10_DBL[scale];
+        } else {
+            while (scale > 0) { res /= 10.0; scale--; }
+        }
     }
     return dec_is_neg(d) ? -res : res;
 }
@@ -250,9 +316,17 @@ static inline uint128_t get_m128(zan_decimal_t d) {
 }
 
 static inline zan_decimal_t from_m128(uint128_t m, bool neg, uint8_t scale) {
-    while (m > MANTISSA_96_MAX && scale > 0) {
-        m /= 10;
-        scale--;
+    if (m > MANTISSA_96_MAX && scale > 0) {
+        while (m > MANTISSA_96_MAX && scale >= 9) {
+            uint128_t q = u128_divrem_u32(m, 1000000000U, NULL);
+            if (q <= MANTISSA_96_MAX) break;
+            m = q;
+            scale -= 9;
+        }
+        while (m > MANTISSA_96_MAX && scale > 0) {
+            m = u128_divrem_u32(m, 10U, NULL);
+            scale--;
+        }
     }
     uint32_t hi = (uint32_t)(m >> 64);
     uint64_t lo = (uint64_t)(m & 0xFFFFFFFFFFFFFFFFULL);
@@ -260,21 +334,59 @@ static inline zan_decimal_t from_m128(uint128_t m, bool neg, uint8_t scale) {
 }
 
 static void align_scale(uint128_t *ma, uint8_t *sa, uint128_t *mb, uint8_t *sb) {
-    while (*sa < *sb && *ma <= (MANTISSA_96_MAX / 10)) {
-        *ma *= 10;
-        (*sa)++;
-    }
-    while (*sb < *sa && *mb <= (MANTISSA_96_MAX / 10)) {
-        *mb *= 10;
-        (*sb)++;
-    }
-    while (*sa < *sb) {
-        *mb /= 10;
-        (*sb)--;
-    }
-    while (*sb < *sa) {
-        *ma /= 10;
-        (*sa)--;
+    if (*sa == *sb) return;
+    if (*sa < *sb) {
+        uint8_t diff = *sb - *sa;
+        if (diff <= MAX_SCALE) {
+            uint128_t p = pow10_128(diff);
+            if (*ma <= u128_divrem(MANTISSA_96_MAX, p, NULL)) {
+                *ma *= p;
+                *sa = *sb;
+                return;
+            }
+        }
+        while (*sa < *sb && *ma <= MANTISSA_96_DIV10) {
+            *ma *= 10;
+            (*sa)++;
+        }
+        if (*sa < *sb) {
+            uint8_t rem_d = *sb - *sa;
+            if (rem_d <= MAX_SCALE) {
+                *mb = u128_divrem(*mb, pow10_128(rem_d), NULL);
+                *sb = *sa;
+            } else {
+                while (*sa < *sb) {
+                    *mb = u128_divrem_u32(*mb, 10U, NULL);
+                    (*sb)--;
+                }
+            }
+        }
+    } else {
+        uint8_t diff = *sa - *sb;
+        if (diff <= MAX_SCALE) {
+            uint128_t p = pow10_128(diff);
+            if (*mb <= u128_divrem(MANTISSA_96_MAX, p, NULL)) {
+                *mb *= p;
+                *sb = *sa;
+                return;
+            }
+        }
+        while (*sb < *sa && *mb <= MANTISSA_96_DIV10) {
+            *mb *= 10;
+            (*sb)++;
+        }
+        if (*sb < *sa) {
+            uint8_t rem_d = *sa - *sb;
+            if (rem_d <= MAX_SCALE) {
+                *ma = u128_divrem(*ma, pow10_128(rem_d), NULL);
+                *sa = *sb;
+            } else {
+                while (*sb < *sa) {
+                    *ma = u128_divrem_u32(*ma, 10U, NULL);
+                    (*sa)--;
+                }
+            }
+        }
     }
 }
 
@@ -290,12 +402,9 @@ int32_t zan_decimal_cmp(zan_decimal_t a, zan_decimal_t b) {
 
     uint8_t sa = dec_scale(a);
     uint8_t sb = dec_scale(b);
-    align_scale(&ma, &sa, &mb, &sb);
+    if (sa != sb) align_scale(&ma, &sa, &mb, &sb);
 
-    int cmp = 0;
-    if (ma < mb) cmp = -1;
-    else if (ma > mb) cmp = 1;
-
+    int cmp = (ma > mb) - (ma < mb);
     return neg_a ? -cmp : cmp;
 }
 
@@ -307,7 +416,7 @@ zan_decimal_t zan_decimal_add(zan_decimal_t a, zan_decimal_t b) {
     uint8_t sa = dec_scale(a);
     uint8_t sb = dec_scale(b);
 
-    align_scale(&ma, &sa, &mb, &sb);
+    if (sa != sb) align_scale(&ma, &sa, &mb, &sb);
 
     if (neg_a == neg_b) {
         uint128_t sum = ma + mb;
@@ -333,11 +442,49 @@ zan_decimal_t zan_decimal_mul(zan_decimal_t a, zan_decimal_t b) {
 
     /* 简单的 128 位乘法 */
     uint128_t prod = ma * mb;
-    while (scale > MAX_SCALE && scale > 0) {
-        prod /= 10;
-        scale--;
+    if (scale > MAX_SCALE) {
+        int drop = (int)scale - MAX_SCALE;
+        if (drop <= MAX_SCALE) {
+            prod = u128_divrem(prod, pow10_128(drop), NULL);
+            scale = MAX_SCALE;
+        } else {
+            while (scale > MAX_SCALE) {
+                prod = u128_divrem_u32(prod, 10U, NULL);
+                scale--;
+            }
+        }
     }
     return from_m128(prod, neg, scale);
+}
+
+static inline void strip_trailing_zeros(uint128_t *quo, int *scale) {
+    uint128_t q = *quo;
+    int s = *scale;
+    if (q == 0) { *scale = 0; return; }
+    while (s >= 9 && q > UINT64_MAX) {
+        uint32_t rem = 0;
+        uint128_t next = u128_divrem_u32(q, 1000000000U, &rem);
+        if (rem != 0) break;
+        q = next;
+        s -= 9;
+    }
+    while (s > 0 && q > UINT64_MAX) {
+        uint32_t rem = 0;
+        uint128_t next = u128_divrem_u32(q, 10U, &rem);
+        if (rem != 0) break;
+        q = next;
+        s--;
+    }
+    if (q <= UINT64_MAX) {
+        uint64_t q64 = (uint64_t)q;
+        while (s > 0 && (q64 % 10ULL) == 0ULL) {
+            q64 /= 10ULL;
+            s--;
+        }
+        q = (uint128_t)q64;
+    }
+    *quo = q;
+    *scale = s;
 }
 
 zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
@@ -349,11 +496,38 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
 
     bool neg = dec_is_neg(a) ^ dec_is_neg(b);
     uint128_t ma = get_m128(a);
+    if (ma == 0) return make_dec(0, 0, neg, 0);
+
     int scale = (int)dec_scale(a) - (int)dec_scale(b);
 
-    /* 精度目标提到 28 位 scale（.NET 的目标精度）——曾停在 18，
-     * 1m/3m 只有 18 位（C# 28 位，TASKS.md A511①）。 */
-    while (scale < MAX_SCALE && ma <= (MANTISSA_96_MAX / 10)) {
+    /* 快路径：除数尾数为 1（如 / 1m、/ 100m）：免去先扩 28 位再退 28 位 */
+    if (mb == 1) {
+        if (scale < 0) {
+            int grow = -scale;
+            if (grow <= MAX_SCALE) {
+                ma *= pow10_128(grow);
+                scale = 0;
+            } else {
+                while (scale < 0) { ma *= 10; scale++; }
+            }
+        } else if (scale > 0) {
+            strip_trailing_zeros(&ma, &scale);
+        }
+        return from_m128(ma, neg, (uint8_t)scale);
+    }
+
+    /* 精度目标提到 28 位 scale（.NET 的目标精度）：分步快乘与原逐位循环停止点严格一致 */
+    static const uint128_t MANTISSA_96_DIV1E9 = ((((uint128_t)1) << 96) - 1) / 1000000000ULL;
+    static const uint128_t MANTISSA_96_DIV1E4 = ((((uint128_t)1) << 96) - 1) / 10000ULL;
+    while (scale + 9 <= MAX_SCALE && ma <= MANTISSA_96_DIV1E9) {
+        ma *= 1000000000ULL;
+        scale += 9;
+    }
+    while (scale + 4 <= MAX_SCALE && ma <= MANTISSA_96_DIV1E4) {
+        ma *= 10000ULL;
+        scale += 4;
+    }
+    while (scale < MAX_SCALE && ma <= MANTISSA_96_DIV10) {
         ma *= 10;
         scale++;
     }
@@ -362,8 +536,8 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
         scale++;
     }
 
-    uint128_t quo = ma / mb;
-    uint128_t rem = ma % mb;
+    uint128_t rem = 0;
+    uint128_t quo = u128_divrem(ma, mb, &rem);
     bool rounded = false;
     if (rem != 0 && rem * 2 >= mb && quo < MANTISSA_96_MAX) {
         /* 末位四舍五入（远离零）——精度已用尽，2m/3m 尾位 …6667 不是截断 …666 */
@@ -373,11 +547,8 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
 
     /* 精确商去尾零：10m/4m 应得 2.5（scale 1），不是 2.5000…。
      * 舍入出来的不精确商不去零——尾位是补出来的。 */
-    if (!rounded) {
-        while (scale > 0 && quo % 10 == 0) {
-            quo /= 10;
-            scale--;
-        }
+    if (!rounded && scale > 0) {
+        strip_trailing_zeros(&quo, &scale);
     }
     return from_m128(quo, neg, (uint8_t)scale);
 }
@@ -391,8 +562,10 @@ zan_decimal_t zan_decimal_rem(zan_decimal_t a, zan_decimal_t b) {
     uint128_t ma = get_m128(a);
     uint8_t sa = dec_scale(a);
     uint8_t sb = dec_scale(b);
-    align_scale(&ma, &sa, &mb, &sb);
-    return from_m128(ma % mb, dec_is_neg(a), sa);
+    if (sa != sb) align_scale(&ma, &sa, &mb, &sb);
+    uint128_t rem = 0;
+    u128_divrem(ma, mb, &rem);
+    return from_m128(rem, dec_is_neg(a), sa);
 }
 
 #else
@@ -457,7 +630,9 @@ bool zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out) {
     else if (str[i] == '+') { i++; }
 
 #if defined(__SIZEOF_INT128__)
+    uint64_t m64 = 0;
     uint128_t m = 0;
+    bool wide = false;
     uint8_t scale = 0;
     bool has_dot = false;
     bool has_digit = false;
@@ -469,12 +644,20 @@ bool zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out) {
             has_dot = true;
         } else if (c >= '0' && c <= '9') {
             has_digit = true;
-            if (m <= (MANTISSA_96_MAX / 10)) {
-                m = m * 10 + (uint32_t)(c - '0');
+            uint32_t d = (uint32_t)(c - '0');
+            if (!wide) {
+                if (m64 <= 1844674407370955160ULL) {
+                    m64 = m64 * 10ULL + d;
+                    if (has_dot) scale++;
+                } else {
+                    wide = true;
+                    m = (uint128_t)m64 * 10 + d;
+                    if (has_dot) scale++;
+                }
+            } else if (m <= MANTISSA_96_DIV10) {
+                m = m * 10 + d;
                 if (has_dot) scale++;
             }
-        } else if (c == 'm' || c == 'M') {
-            break;
         } else {
             break;
         }
@@ -482,7 +665,11 @@ bool zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out) {
 
     if (!has_digit) return false;
     if (scale > MAX_SCALE) scale = MAX_SCALE;
-    *out = from_m128(m, neg, scale);
+    if (!wide) {
+        *out = make_dec(0, m64, neg, scale);
+    } else {
+        *out = from_m128(m, neg, scale);
+    }
     return true;
 #else
     double d = strtod(str, NULL);
@@ -503,9 +690,20 @@ int zan_decimal_to_string(zan_decimal_t d, char *buf, size_t buf_size) {
     if (m == 0) {
         digits[dpos++] = '0';
     } else {
-        while (m > 0) {
-            digits[dpos++] = (char)('0' + (int)(m % 10));
-            m /= 10;
+        while (m > UINT64_MAX) {
+            uint32_t chunk = 0;
+            m = u128_divrem_u32(m, 1000000000U, &chunk);
+            for (int k = 0; k < 9; k++) {
+                uint32_t q = chunk / 10U;
+                digits[dpos++] = (char)('0' + (int)(chunk - q * 10U));
+                chunk = q;
+            }
+        }
+        uint64_t m64 = (uint64_t)m;
+        while (m64 > 0) {
+            uint64_t q = m64 / 10ULL;
+            digits[dpos++] = (char)('0' + (int)(m64 - q * 10ULL));
+            m64 = q;
         }
     }
 

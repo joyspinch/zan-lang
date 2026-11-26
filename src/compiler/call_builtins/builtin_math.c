@@ -137,7 +137,7 @@ if (is_call_to(expr, "Array", "Sort") && expr->call.args.count == 1) {
   }
 }
 
-/* Math.Sqrt(expr) → llvm.sqrt */
+/* Math.Sqrt(expr) → llvm.sqrt.f64（单条 sqrtsd / 自动向量化，不碰 errno） */
 if (!zan_type_defines(g, "Math", "Sqrt") && is_call_to(expr, "Math", "Sqrt") &&
     expr->call.args.count == 1) {
   LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -146,17 +146,15 @@ if (!zan_type_defines(g, "Math", "Sqrt") && is_call_to(expr, "Math", "Sqrt") &&
                             "Sqrt"))
     return LLVMConstReal(dbl, 0.0);
   arg = math_arg_to_double(g, arg);
-  LLVMValueRef sqrt_fn = LLVMGetNamedFunction(g->mod, "sqrt");
-  if (!sqrt_fn) {
-    LLVMTypeRef sqrt_args[] = {dbl};
-    LLVMTypeRef sqrt_type = LLVMFunctionType(dbl, sqrt_args, 1, 0);
-    sqrt_fn = LLVMAddFunction(g->mod, "sqrt", sqrt_type);
-  }
   LLVMTypeRef sqrt_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
+  LLVMValueRef sqrt_fn = LLVMGetNamedFunction(g->mod, "llvm.sqrt.f64");
+  if (!sqrt_fn) {
+    sqrt_fn = LLVMAddFunction(g->mod, "llvm.sqrt.f64", sqrt_type);
+  }
   return zan_call2(g->builder, sqrt_type, sqrt_fn, &arg, 1, "sqrt");
 }
 
-/* Math */
+/* Math 一元超越函数：补齐 nounwind + willreturn + memory(none)，解锁 LICM/GVN/向量化 */
 {
   static const char *math1[] = {"Sin",  "sin",  "Cos",  "cos",  "Tan",  "tan",
                                 "Log",  "log",  "Exp",  "exp",  "Atan", "atan",
@@ -172,8 +170,15 @@ if (!zan_type_defines(g, "Math", "Sqrt") && is_call_to(expr, "Math", "Sqrt") &&
       arg = math_arg_to_double(g, arg);
       LLVMTypeRef fty = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
       LLVMValueRef fn = LLVMGetNamedFunction(g->mod, math1[mi + 1]);
-      if (!fn)
+      if (!fn) {
         fn = LLVMAddFunction(g->mod, math1[mi + 1], fty);
+        unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+        unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+        unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+        if (nw) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        if (wr) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+        if (mm) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
+      }
       return zan_call2(g->builder, fty, fn, &arg, 1, math1[mi + 1]);
     }
   }
@@ -191,19 +196,22 @@ if (!zan_type_defines(g, "Math", "Atan2") &&
     return LLVMConstReal(dbl, 0.0);
   y_v = math_arg_to_double(g, y_v);
   x_v = math_arg_to_double(g, x_v);
+  LLVMTypeRef atan2_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0);
   LLVMValueRef atan2_fn = LLVMGetNamedFunction(g->mod, "atan2");
   if (!atan2_fn) {
-    LLVMTypeRef atan2_args[] = {dbl, dbl};
-    LLVMTypeRef atan2_type = LLVMFunctionType(dbl, atan2_args, 2, 0);
     atan2_fn = LLVMAddFunction(g->mod, "atan2", atan2_type);
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+    unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+    if (nw) LLVMAddAttributeAtIndex(atan2_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+    if (wr) LLVMAddAttributeAtIndex(atan2_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+    if (mm) LLVMAddAttributeAtIndex(atan2_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
   }
   LLVMValueRef args[] = {y_v, x_v};
-  return zan_call2(g->builder,
-                   LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0),
-                   atan2_fn, args, 2, "atan2");
+  return zan_call2(g->builder, atan2_type, atan2_fn, args, 2, "atan2");
 }
 
-/* Math.Abs(expr) */
+/* Math.Abs(expr) → 浮点直降 llvm.fabs.f64（单条 andpd） */
 if (!zan_type_defines(g, "Math", "Abs") && is_call_to(expr, "Math", "Abs") &&
     expr->call.args.count == 1) {
   LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -216,14 +224,12 @@ if (!zan_type_defines(g, "Math", "Abs") && is_call_to(expr, "Math", "Abs") &&
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
     if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind)
       arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
-    LLVMValueRef fabs_fn = LLVMGetNamedFunction(g->mod, "fabs");
+    LLVMTypeRef fabs_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
+    LLVMValueRef fabs_fn = LLVMGetNamedFunction(g->mod, "llvm.fabs.f64");
     if (!fabs_fn) {
-      LLVMTypeRef fabs_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
-      fabs_fn = LLVMAddFunction(g->mod, "fabs", fabs_type);
+      fabs_fn = LLVMAddFunction(g->mod, "llvm.fabs.f64", fabs_type);
     }
-    return zan_call2(g->builder,
-                     LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0), fabs_fn,
-                     &arg, 1, "fabs");
+    return zan_call2(g->builder, fabs_type, fabs_fn, &arg, 1, "fabs");
   } else {
     unsigned abs_bits = LLVMGetIntTypeWidth(arg_type);
     LLVMValueRef shift = zan_ashr(
@@ -319,16 +325,19 @@ if (!zan_type_defines(g, "Math", "Pow") && is_call_to(expr, "Math", "Pow") &&
     return LLVMConstReal(dbl, 0.0);
   base_v = math_arg_to_double(g, base_v);
   exp_v = math_arg_to_double(g, exp_v);
+  LLVMTypeRef pow_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0);
   LLVMValueRef pow_fn = LLVMGetNamedFunction(g->mod, "pow");
   if (!pow_fn) {
-    LLVMTypeRef pow_args[] = {dbl, dbl};
-    LLVMTypeRef pow_type = LLVMFunctionType(dbl, pow_args, 2, 0);
     pow_fn = LLVMAddFunction(g->mod, "pow", pow_type);
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+    unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+    if (nw) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+    if (wr) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+    if (mm) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
   }
   LLVMValueRef args[] = {base_v, exp_v};
-  return zan_call2(g->builder,
-                   LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0),
-                   pow_fn, args, 2, "pow");
+  return zan_call2(g->builder, pow_type, pow_fn, args, 2, "pow");
 }
 
 if (!zan_type_defines(g, "Math", "Floor") &&
@@ -339,14 +348,12 @@ if (!zan_type_defines(g, "Math", "Floor") &&
                             "Floor"))
     return LLVMConstReal(dbl, 0.0);
   arg = math_arg_to_double(g, arg);
-  LLVMValueRef floor_fn = LLVMGetNamedFunction(g->mod, "floor");
+  LLVMTypeRef floor_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
+  LLVMValueRef floor_fn = LLVMGetNamedFunction(g->mod, "llvm.floor.f64");
   if (!floor_fn) {
-    LLVMTypeRef floor_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
-    floor_fn = LLVMAddFunction(g->mod, "floor", floor_type);
+    floor_fn = LLVMAddFunction(g->mod, "llvm.floor.f64", floor_type);
   }
-  return zan_call2(g->builder,
-                   LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0), floor_fn,
-                   &arg, 1, "floor");
+  return zan_call2(g->builder, floor_type, floor_fn, &arg, 1, "floor");
 }
 
 if (!zan_type_defines(g, "Math", "Ceiling") &&
@@ -357,17 +364,15 @@ if (!zan_type_defines(g, "Math", "Ceiling") &&
                             "Ceiling"))
     return LLVMConstReal(dbl, 0.0);
   arg = math_arg_to_double(g, arg);
-  LLVMValueRef ceil_fn = LLVMGetNamedFunction(g->mod, "ceil");
+  LLVMTypeRef ceil_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
+  LLVMValueRef ceil_fn = LLVMGetNamedFunction(g->mod, "llvm.ceil.f64");
   if (!ceil_fn) {
-    LLVMTypeRef ceil_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
-    ceil_fn = LLVMAddFunction(g->mod, "ceil", ceil_type);
+    ceil_fn = LLVMAddFunction(g->mod, "llvm.ceil.f64", ceil_type);
   }
-  return zan_call2(g->builder,
-                   LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0), ceil_fn,
-                   &arg, 1, "ceil");
+  return zan_call2(g->builder, ceil_type, ceil_fn, &arg, 1, "ceil");
 }
 
-/* Math */
+/* Math.Round → llvm.rint.f64（单条 roundsd，保银行家舍入语义；常量 digits 编译期折叠 10^d） */
 if (!zan_type_defines(g, "Math", "Round") &&
     is_call_to(expr, "Math", "Round") &&
     (expr->call.args.count == 1 || expr->call.args.count == 2)) {
@@ -378,23 +383,39 @@ if (!zan_type_defines(g, "Math", "Round") &&
                             "Round"))
     return LLVMConstReal(dbl, 0.0);
   arg = math_arg_to_double(g, arg);
-  /* C# Math.Round 是银行家舍入（to-even）——libc rint 按默认 FP
-   * 舍入模式（最近偶数）实现；libc round 是远离零，曾与 C# 分叉
-   * （Round(2.5) 得 3，C# 是 2；TASKS.md A513）。 */
-  LLVMValueRef round_fn = get_libc_fn(g, "rint", d1_ty);
+  LLVMValueRef round_fn = LLVMGetNamedFunction(g->mod, "llvm.rint.f64");
+  if (!round_fn)
+    round_fn = LLVMAddFunction(g->mod, "llvm.rint.f64", d1_ty);
   if (expr->call.args.count == 1)
     return zan_call2(g->builder, d1_ty, round_fn, &arg, 1, "rint");
   /* digits: rint(x * 10^d) / 10^d（同样银行家） */
-  LLVMValueRef digits = emit_expr(g, expr->call.args.items[1], locals);
-  if (!math_require_numeric(g, expr, expr->call.args.items[1], digits, locals,
-                            "Round"))
-    return LLVMConstReal(dbl, 0.0);
-  digits = math_arg_to_double(g, digits);
-  LLVMTypeRef d2_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0);
-  LLVMValueRef pow_fn = get_libc_fn(g, "pow", d2_ty);
-  LLVMValueRef scale =
-      zan_call2(g->builder, d2_ty, pow_fn,
-                (LLVMValueRef[]){LLVMConstReal(dbl, 10.0), digits}, 2, "scale");
+  zan_ast_node_t *dig_node = expr->call.args.items[1];
+  LLVMValueRef scale = NULL;
+  if (dig_node && dig_node->kind == AST_INT_LITERAL &&
+      dig_node->int_val >= 0 && dig_node->int_val <= 15) {
+    static const double kPow10[16] = {
+        1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+        1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+    scale = LLVMConstReal(dbl, kPow10[dig_node->int_val]);
+  } else {
+    LLVMValueRef digits = emit_expr(g, dig_node, locals);
+    if (!math_require_numeric(g, expr, dig_node, digits, locals, "Round"))
+      return LLVMConstReal(dbl, 0.0);
+    digits = math_arg_to_double(g, digits);
+    LLVMTypeRef d2_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl, dbl}, 2, 0);
+    LLVMValueRef pow_fn = LLVMGetNamedFunction(g->mod, "pow");
+    if (!pow_fn) {
+      pow_fn = LLVMAddFunction(g->mod, "pow", d2_ty);
+      unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+      unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+      unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+      if (nw) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+      if (wr) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+      if (mm) LLVMAddAttributeAtIndex(pow_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
+    }
+    scale = zan_call2(g->builder, d2_ty, pow_fn,
+                      (LLVMValueRef[]){LLVMConstReal(dbl, 10.0), digits}, 2, "scale");
+  }
   LLVMValueRef scaled = LLVMBuildFMul(g->builder, arg, scale, "scaled");
   LLVMValueRef r = zan_call2(g->builder, d1_ty, round_fn, &scaled, 1, "rint");
   return LLVMBuildFDiv(g->builder, r, scale, "rdig");

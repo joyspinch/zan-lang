@@ -36,16 +36,21 @@ public class DataFrame {
         DataFrame df = new DataFrame();
         List<string> header = t.Header();
         if (t.RowCount() == 0 || header.Count == 0) { return df; }
+        int rc = t.RowCount();
         for (int c = 0; c < header.Count; c = c + 1) {
             int kind = DataFrame.InferKind(t, c);
-            df.cols.Add(DataCol.Create(header[c], kind));
+            DataCol col = DataCol.Create(header[c], kind);
+            col.Reserve(rc);
+            df.cols.Add(col);
         }
-        df.rowCount = t.RowCount();
+        df.rowCount = rc;
         List<List<string>> rows = t.Rows();
+        int colCount = df.cols.Count;
         for (int r = 0; r < rows.Count; r = r + 1) {
             List<string> row = rows[r];
-            for (int c = 0; c < df.cols.Count; c = c + 1) {
-                if (c < row.Count) { df.cols[c].Append(row[c]); }
+            int rowLen = row.Count;
+            for (int c = 0; c < colCount; c = c + 1) {
+                if (c < rowLen) { df.cols[c].Append(row[c]); }
                 else { df.cols[c].Append(""); }
             }
         }
@@ -128,10 +133,16 @@ public class DataFrame {
     // （不是 0）。"这列在这行没填"与"这行填了 0"是两回事。
     public DataFrame AddColumn(string name, int kind) {
         DataCol c = DataCol.Create(name, kind);
-        for (int r = 0; r < this.rowCount; r = r + 1) {
-            if (kind == ColKind.Str) { c.Append(""); }
-            else if (kind == ColKind.Int) { c.AppendLong(0); c.MarkMissing(r); }
-            else { c.AppendDouble(0.0); c.MarkMissing(r); }
+        int rc = this.rowCount;
+        c.Reserve(rc);
+        if (kind == ColKind.Str) {
+            for (int r = 0; r < rc; r = r + 1) { c.text.Add(""); }
+        } else if (kind == ColKind.Int) {
+            c.missing.Reserve(rc);
+            for (int r = 0; r < rc; r = r + 1) { c.ints.Add(0); c.missing.Add(true); }
+        } else {
+            c.missing.Reserve(rc);
+            for (int r = 0; r < rc; r = r + 1) { c.nums.Add(0.0); c.missing.Add(true); }
         }
         this.cols.Add(c);
         return this;
@@ -302,36 +313,35 @@ public class DataFrame {
         this.ColOrThrow(col).PutDouble(row, v);
     }
 
-    // 过滤：谓词为 true 的行组成新表（同一 schema）。
+    // 过滤：谓词为 true 的行组成新表（同一 schema），列式批量物化。
     // 谓词闭包可捕获本帧读取任意单元格。
     public DataFrame Filter(RowFn fn) {
-        DataFrame outDf = new DataFrame();
-        for (int c = 0; c < this.cols.Count; c = c + 1) {
-            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
+        List<int> matched = new List<int>();
+        int n = this.rowCount;
+        for (int r = 0; r < n; r = r + 1) {
+            if (fn(r)) { matched.Add(r); }
         }
-        for (int r = 0; r < this.rowCount; r = r + 1) {
-            if (fn(r)) {
-                for (int c = 0; c < this.cols.Count; c = c + 1) {
-                    outDf.cols[c].AppendFrom(this.cols[c], r);
-                }
-                outDf.rowCount = outDf.rowCount + 1;
-            }
+        DataFrame outDf = new DataFrame();
+        outDf.rowCount = matched.Count;
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            DataCol src = this.cols[c];
+            DataCol dst = DataCol.Create(src.Name(), src.Kind());
+            dst.GatherFromList(src, matched);
+            outDf.cols.Add(dst);
         }
         return outDf;
     }
 
-    // 深拷贝：同 schema 同值的新表（列与行都复制，列存不共享）。
+    // 深拷贝：同 schema 同值的新表（列式整列复制，列存不共享）。
     // 改新表不影响原表。
     public DataFrame Copy() {
         DataFrame outDf = new DataFrame();
+        outDf.rowCount = this.rowCount;
         for (int c = 0; c < this.cols.Count; c = c + 1) {
-            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
-        }
-        for (int r = 0; r < this.rowCount; r = r + 1) {
-            for (int c = 0; c < this.cols.Count; c = c + 1) {
-                outDf.cols[c].AppendFrom(this.cols[c], r);
-            }
-            outDf.rowCount = outDf.rowCount + 1;
+            DataCol src = this.cols[c];
+            DataCol dst = DataCol.Create(src.Name(), src.Kind());
+            dst.CopyFrom(src);
+            outDf.cols.Add(dst);
         }
         return outDf;
     }
@@ -339,6 +349,7 @@ public class DataFrame {
     // 全部行号（0..Rows()-1），供 Aggregate 系列整表聚合使用。
     public List<int> AllRows() {
         List<int> all = new List<int>();
+        all.Reserve(this.rowCount);
         for (int r = 0; r < this.rowCount; r = r + 1) { all.Add(r); }
         return all;
     }
@@ -347,38 +358,167 @@ public class DataFrame {
     // desc 为 true 时降序。列不存在抛异常。
     public DataFrame SortBy(string col, bool desc) {
         DataCol key = this.ColOrThrow(col);
-        List<int> idx = new List<int>();
-        for (int r = 0; r < this.rowCount; r = r + 1) { idx.Add(r); }
-        int kind = key.Kind();
-        // 闭包捕获键列与方向；相等时返回负数让归并取左，保持稳定。
-        RowCmpFn cmp = (int a, int b) => {
-            int r = 0;
+        int n = this.rowCount;
+        int[] idx = new int[n];
+        for (int r = 0; r < n; r = r + 1) { idx[r] = r; }
+        if (n >= 2) {
+            int[] tmp = new int[n];
+            int kind = key.Kind();
             if (kind == ColKind.Int) {
-                long x = key.ints[a];
-                long y = key.ints[b];
-                r = x < y ? 0 - 1 : (x > y ? 1 : 0);
+                DataFrame.MergeSortInt(idx, tmp, 0, n, key.ints, desc);
             } else if (kind == ColKind.Float) {
-                double x = key.nums[a];
-                double y = key.nums[b];
-                r = x < y ? 0 - 1 : (x > y ? 1 : 0);
+                DataFrame.MergeSortFloat(idx, tmp, 0, n, key.nums, desc);
             } else {
-                r = key.text[a].CompareTo(key.text[b]);
+                DataFrame.MergeSortStr(idx, tmp, 0, n, key.text, desc);
             }
-            return desc ? 0 - r : r;
-        };
-        List<int> tmp = new List<int>();
-        DataFrame.MergeSort(idx, tmp, 0, this.rowCount, cmp);
-        DataFrame outDf = new DataFrame();
-        for (int c = 0; c < this.cols.Count; c = c + 1) {
-            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
         }
-        for (int i = 0; i < idx.Count; i = i + 1) {
-            for (int c = 0; c < this.cols.Count; c = c + 1) {
-                outDf.cols[c].AppendFrom(this.cols[c], idx[i]);
-            }
-            outDf.rowCount = outDf.rowCount + 1;
+        DataFrame outDf = new DataFrame();
+        outDf.rowCount = n;
+        for (int c = 0; c < this.cols.Count; c = c + 1) {
+            DataCol src = this.cols[c];
+            DataCol dst = DataCol.Create(src.Name(), src.Kind());
+            dst.GatherFromArray(src, idx, n);
+            outDf.cols.Add(dst);
         }
         return outDf;
+    }
+
+    private static void MergeSortInt(int[] idx, int[] tmp, int lo, int hi, List<long> vals, bool desc) {
+        int len = hi - lo;
+        if (len <= 16) {
+            for (int i = lo + 1; i < hi; i = i + 1) {
+                int cur = idx[i];
+                long cv = vals[cur];
+                int j = i - 1;
+                if (desc) {
+                    while (j >= lo && cv > vals[idx[j]]) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                } else {
+                    while (j >= lo && cv < vals[idx[j]]) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                }
+                idx[j + 1] = cur;
+            }
+            return;
+        }
+        int mid = lo + (len >> 1);
+        DataFrame.MergeSortInt(idx, tmp, lo, mid, vals, desc);
+        DataFrame.MergeSortInt(idx, tmp, mid, hi, vals, desc);
+        int a = lo;
+        int b = mid;
+        int k = lo;
+        if (desc) {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]] > vals[idx[a]]) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        } else {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]] < vals[idx[a]]) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        }
+        while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
+        while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
+        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
+    }
+
+    private static void MergeSortFloat(int[] idx, int[] tmp, int lo, int hi, List<double> vals, bool desc) {
+        int len = hi - lo;
+        if (len <= 16) {
+            for (int i = lo + 1; i < hi; i = i + 1) {
+                int cur = idx[i];
+                double cv = vals[cur];
+                int j = i - 1;
+                if (desc) {
+                    while (j >= lo && cv > vals[idx[j]]) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                } else {
+                    while (j >= lo && cv < vals[idx[j]]) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                }
+                idx[j + 1] = cur;
+            }
+            return;
+        }
+        int mid = lo + (len >> 1);
+        DataFrame.MergeSortFloat(idx, tmp, lo, mid, vals, desc);
+        DataFrame.MergeSortFloat(idx, tmp, mid, hi, vals, desc);
+        int a = lo;
+        int b = mid;
+        int k = lo;
+        if (desc) {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]] > vals[idx[a]]) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        } else {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]] < vals[idx[a]]) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        }
+        while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
+        while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
+        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
+    }
+
+    private static void MergeSortStr(int[] idx, int[] tmp, int lo, int hi, List<string> vals, bool desc) {
+        int len = hi - lo;
+        if (len <= 16) {
+            for (int i = lo + 1; i < hi; i = i + 1) {
+                int cur = idx[i];
+                string cv = vals[cur];
+                int j = i - 1;
+                if (desc) {
+                    while (j >= lo && cv.CompareTo(vals[idx[j]]) > 0) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                } else {
+                    while (j >= lo && cv.CompareTo(vals[idx[j]]) < 0) {
+                        idx[j + 1] = idx[j];
+                        j = j - 1;
+                    }
+                }
+                idx[j + 1] = cur;
+            }
+            return;
+        }
+        int mid = lo + (len >> 1);
+        DataFrame.MergeSortStr(idx, tmp, lo, mid, vals, desc);
+        DataFrame.MergeSortStr(idx, tmp, mid, hi, vals, desc);
+        int a = lo;
+        int b = mid;
+        int k = lo;
+        if (desc) {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]].CompareTo(vals[idx[a]]) > 0) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        } else {
+            while (a < mid && b < hi) {
+                if (vals[idx[b]].CompareTo(vals[idx[a]]) < 0) { tmp[k] = idx[b]; b = b + 1; }
+                else { tmp[k] = idx[a]; a = a + 1; }
+                k = k + 1;
+            }
+        }
+        while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
+        while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
+        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
     }
 
     // 归并排序（稳定）：对 idx[lo, hi) 排序，tmp 为工作缓冲。
@@ -407,13 +547,46 @@ public class DataFrame {
     public List<RowGroup> GroupBy(string col) {
         DataCol key = this.ColOrThrow(col);
         List<RowGroup> groups = new List<RowGroup>();
-        Dictionary<string, RowGroup> map = new Dictionary<string, RowGroup>();
-        for (int r = 0; r < this.rowCount; r = r + 1) {
+        int kind = key.kind;
+        int n = this.rowCount;
+        if (kind == ColKind.Int) {
+            // 整数键快路径：直接以 long 哈希，仅在新建组时格式化一次字符串。
+            List<long> vals = key.ints;
+            Dictionary<long, RowGroup> map = new Dictionary<long, RowGroup>();
+            for (int r = 0; r < n; r = r + 1) {
+                long k = vals[r];
+                RowGroup g = null;
+                if (!map.TryGetValue(k, out g)) {
+                    g = RowGroup.Create(Convert.ToString(k));
+                    map[k] = g;
+                    groups.Add(g);
+                }
+                g.rows.Add(r);
+            }
+            return groups;
+        }
+        if (kind == ColKind.Str) {
+            List<string> vals = key.text;
+            Dictionary<string, RowGroup> map = new Dictionary<string, RowGroup>();
+            for (int r = 0; r < n; r = r + 1) {
+                string k = vals[r];
+                RowGroup g = null;
+                if (!map.TryGetValue(k, out g)) {
+                    g = RowGroup.Create(k);
+                    map[k] = g;
+                    groups.Add(g);
+                }
+                g.rows.Add(r);
+            }
+            return groups;
+        }
+        Dictionary<string, RowGroup> fmap = new Dictionary<string, RowGroup>();
+        for (int r = 0; r < n; r = r + 1) {
             string k = key.GetStr(r);
             RowGroup g = null;
-            if (!map.TryGetValue(k, out g)) {
+            if (!fmap.TryGetValue(k, out g)) {
                 g = RowGroup.Create(k);
-                map[k] = g;
+                fmap[k] = g;
                 groups.Add(g);
             }
             g.rows.Add(r);
@@ -435,13 +608,60 @@ public class DataFrame {
     public double Aggregate(List<int> rows, string col, int op) {
         if (op == Agg.Count) { return (double)rows.Count; }
         DataCol c = this.ColOrThrow(col);
-        if (rows.Count == 0) { return 0.0; }
+        int n = rows.Count;
+        if (n == 0) { return 0.0; }
+        if (c.missing.Count == 0) {
+            if (c.kind == ColKind.Float) {
+                List<double> nums = c.nums;
+                if (op == Agg.Sum || op == Agg.Avg) {
+                    double sum = 0.0;
+                    for (int i = 0; i < n; i = i + 1) { sum = sum + nums[rows[i]]; }
+                    return op == Agg.Sum ? sum : sum / (double)n;
+                }
+                if (op == Agg.Max) {
+                    double hi = nums[rows[0]];
+                    for (int i = 1; i < n; i = i + 1) {
+                        double v = nums[rows[i]];
+                        if (v > hi) { hi = v; }
+                    }
+                    return hi;
+                }
+                double lo = nums[rows[0]];
+                for (int i = 1; i < n; i = i + 1) {
+                    double v = nums[rows[i]];
+                    if (v < lo) { lo = v; }
+                }
+                return lo;
+            }
+            if (c.kind == ColKind.Int) {
+                List<long> ints = c.ints;
+                if (op == Agg.Sum || op == Agg.Avg) {
+                    double sum = 0.0;
+                    for (int i = 0; i < n; i = i + 1) { sum = sum + (double)ints[rows[i]]; }
+                    return op == Agg.Sum ? sum : sum / (double)n;
+                }
+                if (op == Agg.Max) {
+                    long hi = ints[rows[0]];
+                    for (int i = 1; i < n; i = i + 1) {
+                        long v = ints[rows[i]];
+                        if (v > hi) { hi = v; }
+                    }
+                    return (double)hi;
+                }
+                long lo = ints[rows[0]];
+                for (int i = 1; i < n; i = i + 1) {
+                    long v = ints[rows[i]];
+                    if (v < lo) { lo = v; }
+                }
+                return (double)lo;
+            }
+        }
         // 收集有效值（缺失的跳过）。
         int valid = 0;
-        double sum = 0.0;
+        double sum2 = 0.0;
         double low = 0.0;
         double high = 0.0;
-        for (int i = 0; i < rows.Count; i = i + 1) {
+        for (int i = 0; i < n; i = i + 1) {
             int r = rows[i];
             if (c.IsMissing(r)) { continue; }
             double v = c.GetDouble(r);
@@ -450,12 +670,12 @@ public class DataFrame {
                 if (v < low) { low = v; }
                 if (v > high) { high = v; }
             }
-            sum = sum + v;
+            sum2 = sum2 + v;
             valid = valid + 1;
         }
         if (valid == 0) { return 0.0; }
-        if (op == Agg.Sum) { return sum; }
-        if (op == Agg.Avg) { return sum / (double)valid; }
+        if (op == Agg.Sum) { return sum2; }
+        if (op == Agg.Avg) { return sum2 / (double)valid; }
         if (op == Agg.Max) { return high; }
         return low;
     }
@@ -492,42 +712,69 @@ public class DataFrame {
         if (ri < 0) {
             throw new InvalidOperationException("Join: 右表没有列: " + rightKeyCol);
         }
-        Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
-        for (int r = 0; r < right.rowCount; r = r + 1) {
-            string k = right.cols[ri].GetStr(r);
-            List<int> bucket = null;
-            if (!map.TryGetValue(k, out bucket)) {
-                bucket = new List<int>();
-                map[k] = bucket;
+        DataCol lKey = this.cols[li];
+        DataCol rKey = right.cols[ri];
+        List<int> matchedL = new List<int>();
+        List<int> matchedR = new List<int>();
+        if (lKey.kind == ColKind.Int && rKey.kind == ColKind.Int) {
+            // 双侧整数键：直接 long 哈希，零字符串分配。
+            List<long> rVals = rKey.ints;
+            Dictionary<long, List<int>> map = new Dictionary<long, List<int>>();
+            for (int r = 0; r < right.rowCount; r = r + 1) {
+                long k = rVals[r];
+                List<int> bucket = null;
+                if (!map.TryGetValue(k, out bucket)) {
+                    bucket = new List<int>();
+                    map[k] = bucket;
+                }
+                bucket.Add(r);
             }
-            bucket.Add(r);
+            List<long> lVals = lKey.ints;
+            for (int r = 0; r < this.rowCount; r = r + 1) {
+                List<int> matches = null;
+                if (!map.TryGetValue(lVals[r], out matches)) { continue; }
+                for (int m = 0; m < matches.Count; m = m + 1) {
+                    matchedL.Add(r);
+                    matchedR.Add(matches[m]);
+                }
+            }
+        } else {
+            Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+            for (int r = 0; r < right.rowCount; r = r + 1) {
+                string k = rKey.GetStr(r);
+                List<int> bucket = null;
+                if (!map.TryGetValue(k, out bucket)) {
+                    bucket = new List<int>();
+                    map[k] = bucket;
+                }
+                bucket.Add(r);
+            }
+            for (int r = 0; r < this.rowCount; r = r + 1) {
+                string k = lKey.GetStr(r);
+                List<int> matches = null;
+                if (!map.TryGetValue(k, out matches)) { continue; }
+                for (int m = 0; m < matches.Count; m = m + 1) {
+                    matchedL.Add(r);
+                    matchedR.Add(matches[m]);
+                }
+            }
         }
         DataFrame outDf = new DataFrame();
+        outDf.rowCount = matchedL.Count;
         for (int c = 0; c < this.cols.Count; c = c + 1) {
-            outDf.cols.Add(DataCol.Create(this.cols[c].Name(), this.cols[c].Kind()));
+            DataCol src = this.cols[c];
+            DataCol dst = DataCol.Create(src.Name(), src.Kind());
+            dst.GatherFromList(src, matchedL);
+            outDf.cols.Add(dst);
         }
         for (int c = 0; c < right.cols.Count; c = c + 1) {
             if (c == ri) { continue; }
-            string name = right.cols[c].Name();
+            DataCol src = right.cols[c];
+            string name = src.Name();
             if (this.ColIndex(name) >= 0) { name = name + "_1"; }
-            outDf.cols.Add(DataCol.Create(name, right.cols[c].Kind()));
-        }
-        for (int r = 0; r < this.rowCount; r = r + 1) {
-            string k = this.cols[li].GetStr(r);
-            List<int> matches = null;
-            if (!map.TryGetValue(k, out matches)) { continue; }
-            for (int m = 0; m < matches.Count; m = m + 1) {
-                for (int c = 0; c < this.cols.Count; c = c + 1) {
-                    outDf.cols[c].AppendFrom(this.cols[c], r);
-                }
-                int oc = this.cols.Count;
-                for (int c = 0; c < right.cols.Count; c = c + 1) {
-                    if (c == ri) { continue; }
-                    outDf.cols[oc].AppendFrom(right.cols[c], matches[m]);
-                    oc = oc + 1;
-                }
-                outDf.rowCount = outDf.rowCount + 1;
-            }
+            DataCol dst = DataCol.Create(name, src.Kind());
+            dst.GatherFromList(src, matchedR);
+            outDf.cols.Add(dst);
         }
         return outDf;
     }

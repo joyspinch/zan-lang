@@ -511,7 +511,9 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
                 slen = emit_cstr_len_of(g, s, arg0);
               }
             }
-            emit_sb_append_bytes(g, sbp, s, slen);
+            emit_sb_append_bytes_nl(g, sbp, s, slen,
+                                    sb_is_appendline && !nl_done ? 1 : 0);
+            if (sb_is_appendline) nl_done = 1;
             if (!char_arg &&
                 LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
               emit_release_owned_call_temp(g, arg0, v, locals);
@@ -520,9 +522,7 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
         }
       }
       if (sb_is_appendline && !nl_done) {
-        zan_istr_t nl = {"\n", 1};
-        LLVMValueRef nls = emit_string_literal_rc(g, nl);
-        emit_sb_append_bytes(g, sbp, nls, LLVMConstInt(i64, 1, 0));
+        emit_sb_append_bytes_nl(g, sbp, NULL, LLVMConstInt(i64, 0, 0), 1);
       }
       emit_intrinsic_drop_recv(g, sbcallee->member.object, raw, locals,
                                sb_recv_own);

@@ -72,10 +72,18 @@ public class Stats {
         return hi;
     }
 
-    // 极差（max - min）。空集返回 0.0。
+    // 极差（max - min）。单遍扫描；空集返回 0.0。
     public static double Range(List<double> xs) {
         if (xs == null || xs.Count == 0) { return 0.0; }
-        return Stats.Max(xs) - Stats.Min(xs);
+        double lo = xs[0];
+        double hi = lo;
+        int n = xs.Count;
+        for (int i = 1; i < n; i = i + 1) {
+            double v = xs[i];
+            if (v < lo) { lo = v; }
+            if (v > hi) { hi = v; }
+        }
+        return hi - lo;
     }
 
     // 总体方差（除以 n）。空集返回 0.0；单元素集为 0.0。
@@ -115,36 +123,41 @@ public class Stats {
         return Math.Sqrt(Stats.SampleVariance(xs));
     }
 
-    // 偏度（Fisher-Pearson 标准化三阶矩）。空集或样本方差为 0
-    // （所有值相同）时返回 0.0——分布退化，偏度无定义但返回 0
-    // 比返回 NaN 更安全（NaN 会污染下游图表）。
+    // 偏度（Fisher-Pearson 标准化三阶矩，两遍融合：均值 + 同步二/三阶中心矩）。
     public static double Skewness(List<double> xs) {
         if (xs == null || xs.Count < 3) { return 0.0; }
+        int n = xs.Count;
         double m = Stats.Mean(xs);
-        double v = Stats.Variance(xs);
-        if (v <= 0.0) { return 0.0; }
-        double acc = 0.0;
-        for (int i = 0; i < xs.Count; i = i + 1) {
+        double acc2 = 0.0;
+        double acc3 = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
             double d = xs[i] - m;
-            acc = acc + d * d * d;
+            double d2 = d * d;
+            acc2 = acc2 + d2;
+            acc3 = acc3 + d2 * d;
         }
-        double m3 = acc / (double)xs.Count;
+        double v = acc2 / (double)n;
+        if (v <= 0.0) { return 0.0; }
+        double m3 = acc3 / (double)n;
         return m3 / (v * Math.Sqrt(v));
     }
 
-    // 峰度（超额峰度：四阶矩 / 方差² 减 3，正态分布为 0）。
-    // 空集或方差为 0 时返回 0.0。
+    // 峰度（超额峰度：四阶矩 / 方差² 减 3，两遍融合：均值 + 同步二/四阶中心矩）。
     public static double Kurtosis(List<double> xs) {
         if (xs == null || xs.Count < 4) { return 0.0; }
+        int n = xs.Count;
         double m = Stats.Mean(xs);
-        double v = Stats.Variance(xs);
-        if (v <= 0.0) { return 0.0; }
-        double acc = 0.0;
-        for (int i = 0; i < xs.Count; i = i + 1) {
+        double acc2 = 0.0;
+        double acc4 = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
             double d = xs[i] - m;
-            acc = acc + d * d * d * d;
+            double d2 = d * d;
+            acc2 = acc2 + d2;
+            acc4 = acc4 + d2 * d2;
         }
-        double m4 = acc / (double)xs.Count;
+        double v = acc2 / (double)n;
+        if (v <= 0.0) { return 0.0; }
+        double m4 = acc4 / (double)n;
         return m4 / (v * v) - 3.0;
     }
 
@@ -179,17 +192,54 @@ public class Stats {
         return acc;
     }
 
-    // 排序后的副本（不改动入参）。升序。
+    // 排序后的副本（不改动入参）。升序（直接内联三数取中快排，零闭包比较开销）。
     public static List<double> SortedCopy(List<double> xs) {
         List<double> s = new List<double>();
         if (xs == null) { return s; }
-        for (int i = 0; i < xs.Count; i = i + 1) { s.Add(xs[i]); }
-        s.Sort((double a, double b) => {
-            if (a < b) { return 0 - 1; }
-            if (a > b) { return 1; }
-            return 0;
-        });
+        int n = xs.Count;
+        s.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { s.Add(xs[i]); }
+        if (n > 1) { Stats.QuickSortDoubles(s, 0, n - 1); }
         return s;
+    }
+
+    private static void QuickSortDoubles(List<double> a, int lo, int hi) {
+        while (hi - lo > 16) {
+            int mid = lo + ((hi - lo) >> 1);
+            double x = a[lo];
+            double y = a[mid];
+            double z = a[hi];
+            double pivot = x < y ? (y < z ? y : (x < z ? z : x)) : (x < z ? x : (y < z ? z : y));
+            int i = lo;
+            int j = hi;
+            while (i <= j) {
+                while (a[i] < pivot) { i = i + 1; }
+                while (a[j] > pivot) { j = j - 1; }
+                if (i <= j) {
+                    double t = a[i];
+                    a[i] = a[j];
+                    a[j] = t;
+                    i = i + 1;
+                    j = j - 1;
+                }
+            }
+            if (j - lo < hi - i) {
+                if (lo < j) { Stats.QuickSortDoubles(a, lo, j); }
+                lo = i;
+            } else {
+                if (i < hi) { Stats.QuickSortDoubles(a, i, hi); }
+                hi = j;
+            }
+        }
+        for (int i = lo + 1; i <= hi; i = i + 1) {
+            double v = a[i];
+            int j = i - 1;
+            while (j >= lo && a[j] > v) {
+                a[j + 1] = a[j];
+                j = j - 1;
+            }
+            a[j + 1] = v;
+        }
     }
 
     // 前 n 项均值（只看入参的前 n 个，不排序）。

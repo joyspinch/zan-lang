@@ -9,44 +9,70 @@ namespace Document.Pdf;
 // **自己拼字节而不是拼字符串**：PDF 里要写二进制标记（`%` + 4 个高位字节），
 // 字符串承载不了；而且拼字符串再转字节要多一次拷贝与一次编码。
 public class PdfBuffer {
-    private List<byte> bytes;
+    private byte[] data;
+    private int count;
+    private byte[] scratch;
 
     public PdfBuffer() {
-        this.bytes = new List<byte>();
+        this.data = new byte[1024];
+        this.count = 0;
+        this.scratch = new byte[24];
     }
 
     // 当前长度（字节）。
-    public int Length() { return this.bytes.Count; }
+    public int Length() { return this.count; }
 
     // 清空缓冲以便复用（保留底层容量）。
-    public void Clear() { this.bytes.Clear(); }
+    public void Clear() { this.count = 0; }
+
+    private void Ensure(int extra) {
+        int need = this.count + extra;
+        if (need <= this.data.Length) { return; }
+        int cap = this.data.Length * 2;
+        while (cap < need) { cap = cap * 2; }
+        byte[] bigger = new byte[cap];
+        if (this.count > 0) {
+            NativeMemory.Copy((nint)bigger, (nint)this.data, this.count);
+        }
+        this.data = bigger;
+    }
 
     // 追加 ASCII 文本（非 ASCII 字符按字节截断——调用方只应传 ASCII）。
     public void Ascii(string text) {
         if (text == null) { return; }
-        this.AsciiSlice(text, 0, text.Length);
+        int len = text.Length;
+        if (len <= 0) { return; }
+        this.Ensure(len);
+        NativeMemory.PutString((nint)this.data, this.count, text, len);
+        this.count = this.count + len;
     }
 
     // 追加字符串切片 [start, start + length) 的 ASCII/Latin-1 字节（零中间 Substring 分配）。
     public void AsciiSlice(string text, int start, int length) {
         if (text == null || length <= 0) { return; }
-        int end = start + length;
         if (start < 0) { start = 0; }
+        int end = start + length;
         if (end > text.Length) { end = text.Length; }
-        for (int i = start; i < end; i = i + 1) {
-            int c = text[i];
+        int n = end - start;
+        if (n <= 0) { return; }
+        this.Ensure(n);
+        byte[] dst = this.data;
+        int p = this.count;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = text[start + i];
             if (c > 255) { c = 63; }
-            this.bytes.Add((byte)c);
+            dst[p + i] = (byte)c;
         }
+        this.count = p + n;
     }
 
     // 直接合并另一份 PdfBuffer 的字节内容。
     public void Append(PdfBuffer other) {
-        if (other == null) { return; }
-        int n = other.bytes.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            this.bytes.Add(other.bytes[i]);
-        }
+        if (other == null || other.count <= 0) { return; }
+        int n = other.count;
+        this.Ensure(n);
+        NativeMemory.Copy((nint)this.data + this.count, (nint)other.data, n);
+        this.count = this.count + n;
     }
 
     // 追加十进制整数（零中间字符串分配）。
@@ -54,51 +80,64 @@ public class PdfBuffer {
         this.AppendLong((long)value);
     }
 
-    // 追加 64 位十进制整数（零中间字符串分配）。
+    // 追加 64 位十进制整数（零堆分配）。
     public void AppendLong(long value) {
+        this.Ensure(21);
+        byte[] dst = this.data;
+        int p = this.count;
         if (value == 0L) {
-            this.bytes.Add(48);
+            dst[p] = 48;
+            this.count = p + 1;
             return;
         }
         long v = value;
         if (v < 0L) {
-            this.bytes.Add(45);
+            dst[p] = 45;
+            p = p + 1;
             v = -v;
         }
-        byte[] digits = new byte[20];
-        int count = 0;
+        byte[] digits = this.scratch;
+        int n = 0;
         while (v > 0L) {
-            digits[count] = (byte)(48 + (int)(v % 10L));
-            v = v / 10L;
-            count = count + 1;
+            long q = v / 10L;
+            digits[n] = (byte)(48 + (int)(v - q * 10L));
+            v = q;
+            n = n + 1;
         }
-        for (int i = count - 1; i >= 0; i = i - 1) {
-            this.bytes.Add(digits[i]);
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            dst[p] = digits[i];
+            p = p + 1;
         }
+        this.count = p;
     }
 
-    // 追加定长 10 位十进制整数（左侧补 '0'，用于 xref 偏移表）。
+    // 追加定长 10 位十进制整数（左侧补 '0'，用于 xref 偏移表，零堆分配）。
     public void AppendPad10(int value) {
+        this.Ensure(10);
         int v = value < 0 ? 0 : value;
-        byte[] digits = new byte[10];
+        byte[] dst = this.data;
+        int p = this.count;
         for (int i = 9; i >= 0; i = i - 1) {
-            digits[i] = (byte)(48 + (v % 10));
-            v = v / 10;
+            int q = v / 10;
+            dst[p + i] = (byte)(48 + (v - q * 10));
+            v = q;
         }
-        for (int i = 0; i < 10; i = i + 1) {
-            this.bytes.Add(digits[i]);
-        }
+        this.count = p + 10;
     }
 
     // 追加一个字节。
     public void Raw(byte value) {
-        this.bytes.Add(value);
+        if (this.count >= this.data.Length) { this.Ensure(1); }
+        this.data[this.count] = value;
+        this.count = this.count + 1;
     }
 
-    // 追加一个数（PDF 数字格式，最多三位小数，零中间字符串分配）。
+    // 追加一个数（PDF 数字格式，最多三位小数，零堆分配）。
     public void Number(double value) {
+        this.Ensure(28);
         if (value < 0.0) {
-            this.bytes.Add(45);
+            this.data[this.count] = 45;
+            this.count = this.count + 1;
             value = -value;
         }
         double intPart = Math.Floor(value);
@@ -110,22 +149,35 @@ public class PdfBuffer {
         }
         this.AppendLong(whole);
         if (thousandths == 0L) { return; }
-        this.bytes.Add(46);
-        int d1 = (int)(thousandths / 100L);
-        int d2 = (int)((thousandths / 10L) % 10L);
-        int d3 = (int)(thousandths % 10L);
-        this.bytes.Add((byte)(48 + d1));
+        byte[] dst = this.data;
+        int p = this.count;
+        dst[p] = 46;
+        p = p + 1;
+        int t = (int)thousandths;
+        int d1 = t / 100;
+        int rem = t - d1 * 100;
+        int d2 = rem / 10;
+        int d3 = rem - d2 * 10;
+        dst[p] = (byte)(48 + d1);
+        p = p + 1;
         if (d2 != 0 || d3 != 0) {
-            this.bytes.Add((byte)(48 + d2));
+            dst[p] = (byte)(48 + d2);
+            p = p + 1;
             if (d3 != 0) {
-                this.bytes.Add((byte)(48 + d3));
+                dst[p] = (byte)(48 + d3);
+                p = p + 1;
             }
         }
+        this.count = p;
     }
 
     // 取出内容。
     public byte[] ToArray() {
-        return this.bytes.ToArray();
+        byte[] out2 = new byte[this.count];
+        if (this.count > 0) {
+            NativeMemory.Copy((nint)out2, (nint)this.data, this.count);
+        }
+        return out2;
     }
 
     // 数字转 PDF 字面量（不依赖 locale 的定点格式）。

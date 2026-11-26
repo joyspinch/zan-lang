@@ -29,6 +29,9 @@ static LLVMValueRef hdr_readable_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
     unsigned nk = LLVMGetEnumAttributeKindForName("nounwind", 8);
     if (nk) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateEnumAttribute(g->ctx, nk, 0));
+    unsigned wk = LLVMGetEnumAttributeKindForName("willreturn", 10);
+    if (wk) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, wk, 0));
     unsigned ck = LLVMGetEnumAttributeKindForName("cold", 4);
     if (ck) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateEnumAttribute(g->ctx, ck, 0));

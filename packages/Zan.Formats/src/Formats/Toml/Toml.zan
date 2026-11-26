@@ -42,37 +42,40 @@ public class Toml {
         if (depth > Toml.MaxDepth) {
             throw new TomlException("ToToml: nesting too deep (cycle?)");
         }
-        for (int i = 0; i < table.Count(); i = i + 1) {
-            string key = table.KeyAt(i);
-            JsonValue v = table.Get(key);
-            if (v == null) { continue; }  // Get 可空契约
+        int count = table.Count();
+        for (int i = 0; i < count; i = i + 1) {
+            JsonValue v = table.ValAt(i);
+            if (v == null) { continue; }
             if (v.IsObject() && v.Count() > 0) { continue; }
             if (v.IsArray() && Toml.AllObjects(v)) { continue; }  // 走表数组头
-            sb.Append(Toml.EncodeKey(key));
+            Toml.WriteKey(sb, table.KeyAt(i));
             sb.Append(" = ");
             Toml.WriteValue(sb, v, depth + 1);
             sb.Append("\n");
         }
-        for (int i = 0; i < table.Count(); i = i + 1) {
-            string key = table.KeyAt(i);
-            JsonValue v = table.Get(key);
+        for (int i = 0; i < count; i = i + 1) {
+            JsonValue v = table.ValAt(i);
             if (v == null) { continue; }
             if (v.IsObject() && v.Count() > 0) {
-                Toml.WriteSubTable(sb, Toml.ExtendPath(path, key), v, false, depth);
+                path.Add(table.KeyAt(i));
+                Toml.WriteSubTable(sb, path, v, false, depth);
+                path.RemoveAt(path.Count - 1);
                 continue;
             }
             if (v.IsArray() && Toml.AllObjects(v)) {
-                List<string> sub = Toml.ExtendPath(path, key);
-                for (int j = 0; j < v.Count(); j = j + 1) {
-                    Toml.WriteSubTable(sb, sub, v.At(j), true, depth);
+                path.Add(table.KeyAt(i));
+                int arrLen = v.Count();
+                for (int j = 0; j < arrLen; j = j + 1) {
+                    Toml.WriteSubTable(sb, path, v.At(j), true, depth);
                 }
+                path.RemoveAt(path.Count - 1);
             }
         }
     }
 
     private static void WriteSubTable(StringBuilder sb, List<string> sub, JsonValue child, bool arrayTable, int depth) {
         Toml.Separate(sb);
-        sb.Append(Toml.Header(sub, arrayTable));
+        Toml.WriteHeader(sb, sub, arrayTable);
         sb.Append("\n");
         Toml.WriteTable(sb, child, sub, depth + 1);
     }
@@ -100,7 +103,8 @@ public class Toml {
         }
         if (v.IsArray()) {
             sb.Append("[");
-            for (int i = 0; i < v.Count(); i = i + 1) {
+            int arrLen = v.Count();
+            for (int i = 0; i < arrLen; i = i + 1) {
                 if (i > 0) { sb.Append(", "); }
                 Toml.WriteValue(sb, v.At(i), depth + 1);
             }
@@ -108,43 +112,40 @@ public class Toml {
             return;
         }
         // 行内表；空表紧凑写成 {}，非空才加内侧空格。
-        if (v.Count() == 0) { sb.Append("{}"); return; }
+        int objLen = v.Count();
+        if (objLen == 0) { sb.Append("{}"); return; }
         sb.Append("{ ");
-        for (int i = 0; i < v.Count(); i = i + 1) {
+        for (int i = 0; i < objLen; i = i + 1) {
             if (i > 0) { sb.Append(", "); }
-            string k = v.KeyAt(i);
-            sb.Append(Toml.EncodeKey(k));
+            Toml.WriteKey(sb, v.KeyAt(i));
             sb.Append(" = ");
-            Toml.WriteValue(sb, v.Get(k), depth + 1);
+            Toml.WriteValue(sb, v.ValAt(i), depth + 1);
         }
         sb.Append(" }");
     }
 
-    // 表头文本：[a.b] 或 [[a.b]]。
-    private static string Header(List<string> path, bool arrayTable) {
-        StringBuilder sb = new StringBuilder();
+    // 表头文本直写：[a.b] 或 [[a.b]]。
+    private static void WriteHeader(StringBuilder sb, List<string> path, bool arrayTable) {
         sb.Append(arrayTable ? "[[" : "[");
         for (int i = 0; i < path.Count; i = i + 1) {
             if (i > 0) { sb.Append("."); }
-            sb.Append(Toml.EncodeKey(path[i]));
+            Toml.WriteKey(sb, path[i]);
         }
         sb.Append(arrayTable ? "]]" : "]");
-        return sb.ToString();
     }
 
-    // 键编码：裸键 [A-Za-z0-9_-]+ 直写，其余加引号。
-    private static string EncodeKey(string key) {
-        bool bare = key.Length > 0;
-        for (int i = 0; bare && i < key.Length; i = i + 1) {
+    // 键编码直写：裸键 [A-Za-z0-9_-]+ 直写，其余加引号。
+    private static void WriteKey(StringBuilder sb, string key) {
+        int n = key.Length;
+        bool bare = n > 0;
+        for (int i = 0; bare && i < n; i = i + 1) {
             int c = key[i] & 255;
             bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
                 || (c >= 48 && c <= 57) || c == 95 || c == 45;
             if (!ok) { bare = false; }
         }
-        if (bare) { return key; }
-        StringBuilder sb = new StringBuilder();
+        if (bare) { sb.Append(key); return; }
         Toml.EncodeString(sb, key);
-        return sb.ToString();
     }
 
     // 基本字符串编码：\ " 与控制字符转义，非 ASCII 原样（UTF-8）。
@@ -171,7 +172,11 @@ public class Toml {
                 from = i + 1;
             }
         }
-        if (from < n) { sb.Append(t.Substring(from, n - from)); }
+        if (from == 0) {
+            sb.Append(t);
+        } else if (from < n) {
+            sb.Append(t.Substring(from, n - from));
+        }
         sb.Append("\"");
     }
 

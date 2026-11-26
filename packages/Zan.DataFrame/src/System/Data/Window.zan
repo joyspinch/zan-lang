@@ -9,7 +9,8 @@ public class Window {
     public static DataFrame Rolling(DataFrame df, string valueCol, int window,
             int agg, int minPeriods, string outCol) {
         if (df == null) { throw new InvalidOperationException("Rolling: 表为 null"); }
-        if (df.ColIndex(valueCol) < 0) { throw new InvalidOperationException("Rolling 没有列: " + valueCol); }
+        int valAt = df.ColIndex(valueCol);
+        if (valAt < 0) { throw new InvalidOperationException("Rolling 没有列: " + valueCol); }
         if (window < 1) { window = 1; }
         int need = minPeriods < 1 ? 1 : minPeriods;
         if (need > window) { need = window; }
@@ -17,15 +18,119 @@ public class Window {
         DataFrame outp = df.Copy();
         int outAt = Window.EnsureFloatCol(outp, outCol, valueCol + "_rolling");
         int n = df.Rows();
-        List<int> windowRows = new List<int>();
+        if (n == 0) { return outp; }
+        DataCol src = df.cols[valAt];
+        DataCol dst = outp.cols[outAt];
+
+        if (agg == Agg.Count) {
+            for (int r = 0; r < n; r = r + 1) {
+                int lo = r - window + 1;
+                if (lo < 0) { lo = 0; }
+                int cnt = r - lo + 1;
+                if (cnt >= need) { dst.PutDouble(r, (double)cnt); }
+            }
+            return outp;
+        }
+
+        // 无缺失数值列 O(N) / 零分配滑动窗口快路径。
+        if (src.missing.Count == 0 && (src.kind == ColKind.Float || src.kind == ColKind.Int)) {
+            double[] vals = new double[n];
+            if (src.kind == ColKind.Float) {
+                List<double> sn = src.nums;
+                for (int r = 0; r < n; r = r + 1) { vals[r] = sn[r]; }
+            } else {
+                List<long> si = src.ints;
+                for (int r = 0; r < n; r = r + 1) { vals[r] = (double)si[r]; }
+            }
+            if (agg == Agg.Sum || agg == Agg.Avg) {
+                if (src.kind == ColKind.Int) {
+                    // 整数求和 O(N) 滑动窗口，无浮点误差。
+                    List<long> si = src.ints;
+                    long run = 0;
+                    for (int r = 0; r < n; r = r + 1) {
+                        run = run + si[r];
+                        if (r >= window) { run = run - si[r - window]; }
+                        int cnt = r + 1 < window ? r + 1 : window;
+                        if (cnt >= need) {
+                            dst.PutDouble(r, agg == Agg.Sum ? (double)run : (double)run / (double)cnt);
+                        }
+                    }
+                    return outp;
+                }
+                if (window <= 32) {
+                    for (int r = 0; r < n; r = r + 1) {
+                        int lo = r - window + 1;
+                        if (lo < 0) { lo = 0; }
+                        int cnt = r - lo + 1;
+                        if (cnt < need) { continue; }
+                        double s = 0.0;
+                        for (int i = lo; i <= r; i = i + 1) { s = s + vals[i]; }
+                        dst.PutDouble(r, agg == Agg.Sum ? s : s / (double)cnt);
+                    }
+                    return outp;
+                }
+                double runD = 0.0;
+                for (int r = 0; r < n; r = r + 1) {
+                    runD = runD + vals[r];
+                    if (r >= window) { runD = runD - vals[r - window]; }
+                    int cnt = r + 1 < window ? r + 1 : window;
+                    if (cnt >= need) {
+                        dst.PutDouble(r, agg == Agg.Sum ? runD : runD / (double)cnt);
+                    }
+                }
+                return outp;
+            }
+            // Agg.Min / Agg.Max：单调双端队列 O(N) 且逐位精确。
+            int[] dq = new int[n];
+            int head = 0;
+            int tail = 0;
+            bool isMax = agg == Agg.Max;
+            for (int r = 0; r < n; r = r + 1) {
+                int lo = r - window + 1;
+                if (lo < 0) { lo = 0; }
+                while (head < tail && dq[head] < lo) { head = head + 1; }
+                double vr = vals[r];
+                if (isMax) {
+                    while (head < tail && vals[dq[tail - 1]] <= vr) { tail = tail - 1; }
+                } else {
+                    while (head < tail && vals[dq[tail - 1]] >= vr) { tail = tail - 1; }
+                }
+                dq[tail] = r;
+                tail = tail + 1;
+                int cnt = r - lo + 1;
+                if (cnt >= need) { dst.PutDouble(r, vals[dq[head]]); }
+            }
+            return outp;
+        }
+
+        // 通用路径（含缺失值或 Str 列）：直接扫描窗口，零 windowRows 分配。
         for (int r = 0; r < n; r = r + 1) {
             int lo = r - window + 1;
             if (lo < 0) { lo = 0; }
-            windowRows.Clear();
-            for (int i = lo; i <= r; i = i + 1) { windowRows.Add(i); }
-            if (windowRows.Count < need) { continue; }
-            double v = df.Aggregate(windowRows, valueCol, agg);
-            outp.cols[outAt].PutDouble(r, v);
+            if (r - lo + 1 < need) { continue; }
+            int valid = 0;
+            double sum = 0.0;
+            double low = 0.0;
+            double high = 0.0;
+            for (int i = lo; i <= r; i = i + 1) {
+                if (src.IsMissing(i)) { continue; }
+                double v = src.GetDouble(i);
+                if (valid == 0) { low = v; high = v; }
+                else {
+                    if (v < low) { low = v; }
+                    if (v > high) { high = v; }
+                }
+                sum = sum + v;
+                valid = valid + 1;
+            }
+            double res = 0.0;
+            if (valid > 0) {
+                if (agg == Agg.Sum) { res = sum; }
+                else if (agg == Agg.Avg) { res = sum / (double)valid; }
+                else if (agg == Agg.Max) { res = high; }
+                else { res = low; }
+            }
+            dst.PutDouble(r, res);
         }
         return outp;
     }
@@ -70,24 +175,26 @@ public class Window {
         DataFrame outp = df.Copy();
         int outAt = Window.EnsureFloatCol(outp, outCol, valueCol + "_ewm");
         int n = df.Rows();
+        DataCol src = df.cols[at];
+        DataCol dst = outp.cols[outAt];
         double decay = 1.0 - alpha;
         if (adjust) {
             double num = 0.0;
             double w = 0.0;
             for (int r = 0; r < n; r = r + 1) {
-                double x = df.cols[at].GetDouble(r);
+                double x = src.GetDouble(r);
                 num = x + decay * num;
                 w = 1.0 + decay * w;
-                outp.cols[outAt].PutDouble(r, num / w);
+                dst.PutDouble(r, num / w);
             }
             return outp;
         }
         if (n > 0) {
-            double y = df.cols[at].GetDouble(0);
-            outp.cols[outAt].PutDouble(0, y);
+            double y = src.GetDouble(0);
+            dst.PutDouble(0, y);
             for (int r = 1; r < n; r = r + 1) {
-                y = alpha * df.cols[at].GetDouble(r) + decay * y;
-                outp.cols[outAt].PutDouble(r, y);
+                y = alpha * src.GetDouble(r) + decay * y;
+                dst.PutDouble(r, y);
             }
         }
         return outp;
@@ -109,10 +216,13 @@ public class Window {
         if (periods < 1) { periods = 1; }
         DataFrame outp = df.Copy();
         int outAt = Window.EnsureFloatCol(outp, outCol, valueCol + "_diff");
-        for (int r = periods; r < outp.Rows(); r = r + 1) {
-            double cur = df.cols[at].GetDouble(r);
-            double prev = df.cols[at].GetDouble(r - periods);
-            outp.cols[outAt].PutDouble(r, cur - prev);
+        DataCol src = df.cols[at];
+        DataCol dst = outp.cols[outAt];
+        int n = outp.Rows();
+        for (int r = periods; r < n; r = r + 1) {
+            double cur = src.GetDouble(r);
+            double prev = src.GetDouble(r - periods);
+            dst.PutDouble(r, cur - prev);
         }
         return outp;
     }
@@ -126,7 +236,7 @@ public class Window {
         int outAt = outp.ColIndex(name);
         if (outAt < 0) {
             outp.AddColumn(name, ColKind.Float);
-            outAt = outp.ColIndex(name);
+            outAt = outp.cols.Count - 1;
         }
         return outAt;
     }

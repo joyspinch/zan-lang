@@ -517,6 +517,9 @@
                                 expr->call.args.items[0], locals);
                             if (bc) return emit_bool_to_cstr(g, bc);
                         }
+                        if (LLVMTypeOf(arg) == get_decimal_type(g)) {
+                            return emit_to_cstr(g, arg);
+                        }
                         LLVMTypeKind atk = LLVMGetTypeKind(LLVMTypeOf(arg));
                         if (atk == LLVMDoubleTypeKind || atk == LLVMFloatTypeKind) {
                             return emit_dbl_string(g, arg);

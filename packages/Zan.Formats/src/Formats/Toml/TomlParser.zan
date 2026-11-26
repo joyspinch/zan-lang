@@ -86,13 +86,30 @@ public class TomlParser {
     // 键值对：path.to.key = value。文档层与表头的对收口到行尾；
     // 行内表里的对以 ',' / '}' 收口，不做行尾校验。
     void ReadKeyValue(JsonValue owner, bool needLineEnd) {
-        List<string> path = ReadKeyPath();
+        string firstKey = ReadKey();
         SkipH();
+        if (CurB() == 61) {  // 单段键快路径（无点号，零 List 分配）
+            pos = pos + 1;
+            SkipH();
+            JsonValue v = ReadValue(1);
+            if (owner.Has(firstKey)) { Err("key defined twice: " + firstKey); }
+            owner.Set(firstKey, v);
+            if (needLineEnd) { EndOfLine("key-value pair"); }
+            return;
+        }
+        List<string> path = new List<string>();
+        path.Add(firstKey);
+        while (pos < len && CurB() == 46) {
+            pos = pos + 1;
+            SkipH();
+            path.Add(ReadKey());
+            SkipH();
+        }
         if (CurB() != 61) { Err("expected '=' after key"); }  // '='
         pos = pos + 1;
         SkipH();
-        JsonValue v = ReadValue(1);
-        SetValue(owner, path, v);
+        JsonValue v2 = ReadValue(1);
+        SetValue(owner, path, v2);
         if (needLineEnd) { EndOfLine("key-value pair"); }
     }
 
@@ -246,17 +263,30 @@ public class TomlParser {
     // 基本字符串 "..."：转义 \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX。
     string ReadBasicString() {
         pos = pos + 1;  // 消费 '"'
-        StringBuilder sb = new StringBuilder();
+        int runStart = pos;
+        StringBuilder sb = null;
         while (pos < len) {
             int c = s[pos] & 255;
-            if (c == 34) { pos = pos + 1; return sb.ToString(); }
+            if (c == 34) {
+                if (sb == null) {
+                    string direct = s.Substring(runStart, pos - runStart);
+                    pos = pos + 1;
+                    return direct;
+                }
+                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
+                pos = pos + 1;
+                return sb.ToString();
+            }
             if (c == 10) { Err("newline in basic string"); }
             if (c == 92) {  // '\'
+                if (sb == null) { sb = new StringBuilder(); }
+                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
                 pos = pos + 1;
                 ReadEscape(sb);
+                runStart = pos;
                 continue;
             }
-            AppendRun(sb, c);
+            pos = pos + 1;
         }
         Err("unterminated basic string");
         return "";
@@ -270,38 +300,47 @@ public class TomlParser {
         else if (CurB() == 13 && pos + 1 < len && (s[pos + 1] & 255) == 10) {
             pos = pos + 2;
         }
-        StringBuilder sb = new StringBuilder();
+        int runStart = pos;
+        StringBuilder sb = null;
         while (pos < len) {
-            if (Has("\"\"\"")) {
+            int c = s[pos] & 255;
+            if (c == 34 && pos + 2 < len && (s[pos + 1] & 255) == 34 && (s[pos + 2] & 255) == 34) {
                 // 内容里的 " 允许出现在界定符前："""" = 引号 + 收口。
                 if (pos + 3 < len && (s[pos + 3] & 255) == 34) {
-                    sb.Append("\"");
                     pos = pos + 1;
                     continue;
                 }
+                if (sb == null) {
+                    string direct = s.Substring(runStart, pos - runStart);
+                    pos = pos + 3;
+                    return direct;
+                }
+                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
                 pos = pos + 3;
                 return sb.ToString();
             }
-            int c = s[pos] & 255;
-            if (c == 92 && TomlParser.LineBackslash(s, pos, len)) {
-                // 行尾反斜杠：吃掉反斜杠 + 空白 + 换行。
-                pos = pos + 1;
-                while (pos < len) {
-                    int w = s[pos] & 255;
-                    if (w == 32 || w == 9 || w == 10 || w == 13) {
-                        pos = pos + 1;
-                    } else {
-                        break;
+            if (c == 92) {
+                if (sb == null) { sb = new StringBuilder(); }
+                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
+                if (TomlParser.LineBackslash(s, pos, len)) {
+                    // 行尾反斜杠：吃掉反斜杠 + 空白 + 换行。
+                    pos = pos + 1;
+                    while (pos < len) {
+                        int w = s[pos] & 255;
+                        if (w == 32 || w == 9 || w == 10 || w == 13) {
+                            pos = pos + 1;
+                        } else {
+                            break;
+                        }
                     }
+                } else {
+                    pos = pos + 1;
+                    ReadEscape(sb);
                 }
+                runStart = pos;
                 continue;
             }
-            if (c == 92) {  // '\'
-                pos = pos + 1;
-                ReadEscape(sb);
-                continue;
-            }
-            AppendRun(sb, c);
+            pos = pos + 1;
         }
         Err("unterminated multi-line basic string");
         return "";

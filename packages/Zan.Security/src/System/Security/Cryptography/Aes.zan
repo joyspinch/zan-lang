@@ -225,7 +225,7 @@ public class Aes {
             return null;
         }
         byte[] outb = new byte[16];
-        long res = NativeMemory.AesEcbBlock(key, keyLen, in16, outb);
+        long res = NativeMemory.AesEcbBlock(key, keyLen * 8, in16, outb);
         if (res == 0) {
             return outb;
         }
@@ -260,7 +260,7 @@ public class Aes {
             int pad = 16 - (len % 16);
             int tot = len + pad;
             byte[] outb = new byte[tot];
-            long res = NativeMemory.AesCbcEncrypt(outb, data, (long)len, key, keyLen, iv);
+            long res = NativeMemory.AesCbcEncrypt(outb, data, (long)len, key, keyLen * 8, iv);
             if (res >= 0) {
                 outLen[0] = (int)res;
                 return outb;
@@ -314,12 +314,12 @@ public class Aes {
 
         {
             byte[] outb = new byte[len];
-            long res = NativeMemory.AesCbcDecrypt(outb, data, (long)len, key, keyLen, iv);
+            long res = NativeMemory.AesCbcDecrypt(outb, data, (long)len, key, keyLen * 8, iv);
             if (res >= 0) {
                 int plainLen = (int)res;
                 outLen[0] = plainLen;
                 byte[] resBytes = new byte[plainLen];
-                for (int i = 0; i < plainLen; i = i + 1) { resBytes[i] = outb[i]; }
+                if (plainLen > 0) { NativeMemory.Copy((nint)resBytes, (nint)outb, plainLen); }
                 return resBytes;
             }
             if (res == -2) {
@@ -373,31 +373,32 @@ public class Aes {
         int plainLen = len - padVal;
         outLen[0] = plainLen;
         byte[] res = new byte[plainLen];
-        for (int i = 0; i < plainLen; i = i + 1) { res[i] = outb[i]; }
+        if (plainLen > 0) { NativeMemory.Copy((nint)res, (nint)outb, plainLen); }
         return res;
     }
 
     // AES-CTR 流加密/解密（对称）。计数器按 128 位大端自增。
     public static byte[] CryptCtr(string key, int keyLen, string iv16, string data, int len) {
-        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || iv16 == null) { return null; }
+        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || iv16 == null || iv16.Length < 16) { return null; }
         if (len < 0) { return null; }
         if (len == 0) { return new byte[0]; }
         if (data == null) { return null; }
 
-        List<int> nr = new List<int>(); nr.Add(0);
-        int[] rk = ExpandKey(key, keyLen, nr);
-
         byte[] ctr = new byte[16];
-        for (int i = 0; i < 16; i = i + 1) { ctr[i] = (byte)(iv16[i] & 255); }
+        NativeMemory.PutString((nint)ctr, 0, iv16, 16);
 
+        // 优先走硬件 AES-NI / ARMv8 Crypto，免去软件 T-Table 初始化与密钥扩展开销。
         {
             byte[] hwout = new byte[len];
-            long res = NativeMemory.AesCtrCrypt(hwout, data, (long)len, key, keyLen, ctr);
+            long res = NativeMemory.AesCtrCrypt(hwout, data, (long)len, key, keyLen * 8, ctr);
             if (res >= 0) {
                 return hwout;
             }
             /* -1 = 本机无 AES 硬件路径：落到下方纯 Zan 实现 */
         }
+
+        List<int> nr = new List<int>(); nr.Add(0);
+        int[] rk = ExpandKey(key, keyLen, nr);
 
         byte[] outb = new byte[len];
         byte[] mask = new byte[16];

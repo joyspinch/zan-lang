@@ -30,35 +30,42 @@ public class Sha1 {
         int rem = total % 64; int pad = 0; if (rem != 0) { pad = 64 - rem; }
         int plen = total + pad;
         byte[] m = new byte[plen];
-        for (int i = 0; i < len; i = i + 1) { m[i] = msg[i] & 255; }
+        if (len > 0 && msg != null) { NativeMemory.PutString((nint)m, 0, msg, len); }
         m[len] = 128;
         long bits = (long)len * 8; int bi = plen - 8;
         m[bi+0]=(bits>>56)&255; m[bi+1]=(bits>>48)&255; m[bi+2]=(bits>>40)&255; m[bi+3]=(bits>>32)&255;
         m[bi+4]=(bits>>24)&255; m[bi+5]=(bits>>16)&255; m[bi+6]=(bits>>8)&255; m[bi+7]=bits&255;
         int blocks = plen / 64;
         int[] h = Sha1.NewState();
+        int[] w = new int[80];
         for (int b = 0; b < blocks; b = b + 1) {
-            Sha1.Block(h, m, b * 64);
+            Sha1.Block(h, m, b * 64, w);
         }
         byte[] o = new byte[20];
         wBE(o,0,h[0]); wBE(o,4,h[1]); wBE(o,8,h[2]); wBE(o,12,h[3]); wBE(o,16,h[4]);
         return o;
     }
 
-    // 对字节缓冲区的前 len 字节计算 SHA-1。
+    // 对字节缓冲区的前 len 字节计算 SHA-1（优先走硬件 SHA-NI/原生路径，回退复用消息扩展表）。
     public static byte[] HashBytes(byte[] data, int len) {
         if (data == null) { return null; }
+        if (len < 0) { len = 0; }
         if (len > data.Length) { len = data.Length; }
+        string hw = len > 0 ? NativeMemory.Sha1((nint)data, (long)len) : NativeMemory.Sha1((nint)"", 0L);
+        if (hw != null) {
+            return hw.ToBytes();
+        }
         int[] h = Sha1.NewState();
+        int[] w = new int[80];
         int off = 0;
         while (off + 64 <= len) {
-            Sha1.Block(h, data, off);
+            Sha1.Block(h, data, off, w);
             off = off + 64;
         }
         byte[] carry = new byte[64];
         int carryLen = len - off;
         if (carryLen > 0) { NativeMemory.Copy((nint)carry, (nint)data + off, carryLen); }
-        return Sha1.Finish(h, carry, carryLen, (long)len);
+        return Sha1.Finish(h, carry, carryLen, (long)len, w);
     }
 
     // 流式计算文件的 SHA-1（不把文件整体读入内存），返回
@@ -67,6 +74,7 @@ public class Sha1 {
         nint fp = PlatFopen(path, "rb");
         if (fp == 0) { return null; }
         int[] h = Sha1.NewState();
+        int[] w = new int[80];
         byte[] buf = new byte[65536];
         byte[] carry = new byte[64];
         int carryLen = 0;
@@ -87,12 +95,12 @@ public class Sha1 {
                     carryLen = carryLen + need;
                     pos = need;
                     if (carryLen == 64) {
-                        Sha1.Block(h, carry, 0);
+                        Sha1.Block(h, carry, 0, w);
                         carryLen = 0;
                     }
                 }
                 while (pos + 64 <= n) {
-                    Sha1.Block(h, buf, pos);
+                    Sha1.Block(h, buf, pos, w);
                     pos = pos + 64;
                 }
                 int tail = n - pos;
@@ -101,7 +109,7 @@ public class Sha1 {
             }
         }
         PlatFclose(fp);
-        return Sha1.Finish(h, carry, carryLen, total);
+        return Sha1.Finish(h, carry, carryLen, total, w);
     }
 
     // 流式计算文件的 SHA-1 并返回小写十六进制串；失败返回空串。
@@ -139,9 +147,9 @@ public class Sha1 {
 
     // 追加 FIPS 填充（0x80、零、64 位大端比特长度）并返回摘要；
     // tail 保存最后一个不完整块（tailLen < 64）。
-    private static byte[] Finish(int[] h, byte[] tail, int tailLen, long totalBytes) {
+    private static byte[] Finish(int[] h, byte[] tail, int tailLen, long totalBytes, int[] w) {
         byte[] last = new byte[128];
-        for (int i = 0; i < tailLen; i = i + 1) { last[i] = tail[i]; }
+        if (tailLen > 0) { NativeMemory.Copy((nint)last, (nint)tail, tailLen); }
         last[tailLen] = 128;
         int plen = 64;
         if (tailLen + 1 + 8 > 64) { plen = 128; }
@@ -151,16 +159,15 @@ public class Sha1 {
         last[bi+2]=(bits>>40)&255; last[bi+3]=(bits>>32)&255;
         last[bi+4]=(bits>>24)&255; last[bi+5]=(bits>>16)&255;
         last[bi+6]=(bits>>8)&255;  last[bi+7]=bits&255;
-        Sha1.Block(h, last, 0);
-        if (plen == 128) { Sha1.Block(h, last, 64); }
+        Sha1.Block(h, last, 0, w);
+        if (plen == 128) { Sha1.Block(h, last, 64, w); }
         byte[] o = new byte[20];
         wBE(o,0,h[0]); wBE(o,4,h[1]); wBE(o,8,h[2]); wBE(o,12,h[3]); wBE(o,16,h[4]);
         return o;
     }
 
-    // 单个 64 字节块的压缩函数，原地更新 h[0..4]。
-    private static void Block(int[] h, byte[] m, int off) {
-        int[] w = new int[80];
+    // 单个 64 字节块的压缩函数，原地更新 h[0..4]，复用外部传入的 w[80]。
+    private static void Block(int[] h, byte[] m, int off, int[] w) {
         for (int t = 0; t < 16; t = t + 1) {
             int j = off + t*4;
             w[t] = ((m[j]&255)<<24)|((m[j+1]&255)<<16)|((m[j+2]&255)<<8)|(m[j+3]&255);

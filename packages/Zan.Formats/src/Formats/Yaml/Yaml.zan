@@ -133,7 +133,7 @@ public class Yaml {
                     sb.Append("\n");
                     AppendIndent(indent);
                 }
-                sb.Append(EmitKey(k));
+                WriteKey(k);
                 sb.Append(":");
                 WriteValueAfter(val, indent);
                 i = i + 1;
@@ -177,7 +177,7 @@ public class Yaml {
                     }
                 } else {
                     sb.Append(" ");
-                    sb.Append(ScalarText(item));
+                    WriteScalar(item);
                 }
                 i = i + 1;
             }
@@ -197,27 +197,42 @@ public class Yaml {
                     else { WriteSeq(val, indent + 2, false); }
                 } else {
                     sb.Append(" ");
-                    sb.Append(ScalarText(val));
+                    WriteScalar(val);
                 }
                 return;
             }
             sb.Append(" ");
-            sb.Append(ScalarText(val));
+            WriteScalar(val);
         }
+
+        private static string Spaces32 = "                                ";
 
         public void AppendIndent(int indent) {
-            int i = 0;
-            while (i < indent) { sb.Append(" "); i = i + 1; }
+            int rem = indent;
+            while (rem >= 32) {
+                sb.Append(Spaces32);
+                rem = rem - 32;
+            }
+            if (rem > 0) {
+                sb.Append(Spaces32.Substring(0, rem));
+            }
         }
 
-        public string EmitKey(string k) {
-            if (NeedsQuote(k)) { return EncodeDoubleQuoted(k); }
-            return k;
+        public void WriteKey(string k) {
+            if (NeedsQuote(k)) { WriteDoubleQuoted(k); }
+            else { sb.Append(k); }
         }
 
-        // 标量 → core schema 文本：null/bool 原形；整数直接十进制；
-        // 浮点整值补 ".0" 保型（否则往返变 int）；特殊值 .inf/.nan；
-        // 字符串按需加引号。
+        public void WriteScalar(JsonValue v) {
+            if (v.IsNull()) { sb.Append("null"); return; }
+            if (v.IsBool()) { sb.Append(v.AsBool(false) ? "true" : "false"); return; }
+            if (v.IsInt()) { sb.Append(v.AsLong(0)); return; }
+            if (v.IsNumber()) { sb.Append(DoubleText(v.AsDouble(0))); return; }
+            string s = v.AsString("");
+            if (NeedsQuote(s)) { WriteDoubleQuoted(s); }
+            else { sb.Append(s); }
+        }
+
         public string ScalarText(JsonValue v) {
             if (v.IsNull()) { return "null"; }
             if (v.IsBool()) { return v.AsBool(false) ? "true" : "false"; }
@@ -237,7 +252,7 @@ public class Yaml {
             int i = 0;
             while (i < s.Length) {
                 int c = s[i] & 255;
-                if (c == 46 || c == 101 || c == 69) { hasMark = true; }
+                if (c == 46 || c == 101 || c == 69) { hasMark = true; break; }
                 i = i + 1;
             }
             if (!hasMark) { return s + ".0"; }
@@ -245,20 +260,22 @@ public class Yaml {
         }
 
         // 该字符串按 plain 写出会不会被重新解析成别的类型/结构——
-        // 会则必须加引号。判定复用读侧 TypeScalar：变型即加引号，
-        // 另加指示符/结构歧义等形态规则。
+        // 会则必须加引号。无堆分配判定替代 TypeScalar 临时对象构建。
         public bool NeedsQuote(string s) {
-            if (s.Length == 0) { return true; }
-            JsonValue re = YamlParser.TypeScalar(s);
-            if (!re.IsString()) { return true; }
+            int n = s.Length;
+            if (n == 0) { return true; }
+            if (YamlParser.IsNonStringScalar(s)) { return true; }
             int c0 = s[0] & 255;
-            if (s == "-" || (s.Length >= 2 && c0 == 45 && (s[1] & 255) == 32)) {
-                return true;  // 会被当成序列项
+            if (c0 == 32 || (s[n - 1] & 255) == 32) {
+                return true;  // 首尾空格
             }
-            if (s == "?" || (s.Length >= 2 && c0 == 63 && (s[1] & 255) == 32)) {
+            if (c0 == 45 && (n == 1 || (s[1] & 255) == 32)) {
+                return true;  // "-" 或 "- x" 会被当成序列项
+            }
+            if (c0 == 63 && (n == 1 || (s[1] & 255) == 32)) {
                 return true;
             }
-            if (s.Length >= 2 && c0 == 58 && (s[1] & 255) == 32) {
+            if (n >= 2 && c0 == 58 && (s[1] & 255) == 32) {
                 return true;  // ": x" 会当映射
             }
             if (c0 == 44 || c0 == 91 || c0 == 93 || c0 == 123 || c0 == 125
@@ -267,13 +284,10 @@ public class Yaml {
                 || c0 == 96) {
                 return true;  // , [ ] { } # & * ! | > ' " % @ `
             }
-            if ((s[0] & 255) == 32 || (s[s.Length - 1] & 255) == 32) {
-                return true;  // 首尾空格
-            }
             int i = 0;
-            while (i < s.Length) {
+            while (i < n) {
                 int c = s[i] & 255;
-                if (c == 58 && (i + 1 >= s.Length || (s[i + 1] & 255) == 32)) {
+                if (c == 58 && (i + 1 >= n || (s[i + 1] & 255) == 32)) {
                     return true;  // ": " 或结尾 ":"
                 }
                 if (c == 35 && i > 0 && (s[i - 1] & 255) == 32) {
@@ -285,6 +299,37 @@ public class Yaml {
                 i = i + 1;
             }
             return false;
+        }
+
+        // 直写双引号包裹 + 转义到主 StringBuilder，避免中间 StringBuilder 分配。
+        public void WriteDoubleQuoted(string s) {
+            sb.Append("\"");
+            int i = 0;
+            int start = 0;
+            int n = s.Length;
+            while (i < n) {
+                int c = s[i] & 255;
+                if (c == 34 || c == 92 || c == 10 || c == 9 || c == 13 || c < 32 || c == 127) {
+                    if (i > start) { sb.Append(s.Substring(start, i - start)); }
+                    if (c == 34) { sb.Append("\\\""); }
+                    else if (c == 92) { sb.Append("\\\\"); }
+                    else if (c == 10) { sb.Append("\\n"); }
+                    else if (c == 9) { sb.Append("\\t"); }
+                    else if (c == 13) { sb.Append("\\r"); }
+                    else {
+                        sb.Append("\\x");
+                        int hi = (c >> 4) & 15;
+                        int lo = c & 15;
+                        sb.Append(HexChar(hi));
+                        sb.Append(HexChar(lo));
+                    }
+                    start = i + 1;
+                }
+                i = i + 1;
+            }
+            if (start == 0) { sb.Append(s); }
+            else if (n > start) { sb.Append(s.Substring(start, n - start)); }
+            sb.Append("\"");
         }
 
         // 双引号包裹 + 转义：\\ \" \n \t \r，其余控制字符 \xXX。

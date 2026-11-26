@@ -37,25 +37,78 @@ public class MsgPackReader {
     }
 
     public int U16BE() {
-        int hi = U8();
-        return (hi << 8) | U8();
+        if (2 > len - pos) {
+            throw new MsgPackException("truncated at byte " + Convert.ToString(pos));
+        }
+        int v = ((buf[pos] & 255) << 8) | (buf[pos + 1] & 255);
+        pos = pos + 2;
+        return v;
     }
 
     public long U32BE() {
-        long v = U8();
-        v = (v << 8) | U8();
-        v = (v << 8) | U8();
-        return (v << 8) | U8();
+        if (4 > len - pos) {
+            throw new MsgPackException("truncated at byte " + Convert.ToString(pos));
+        }
+        long v = ((long)(buf[pos] & 255) << 24)
+            | ((long)(buf[pos + 1] & 255) << 16)
+            | ((long)(buf[pos + 2] & 255) << 8)
+            | (long)(buf[pos + 3] & 255);
+        pos = pos + 4;
+        return v;
     }
 
     public long U64BE() {
-        long v = U8();
-        int i = 0;
-        while (i < 7) {
-            v = (v << 8) | U8();
-            i = i + 1;
+        if (8 > len - pos) {
+            throw new MsgPackException("truncated at byte " + Convert.ToString(pos));
         }
+        long v = ((long)(buf[pos] & 255) << 56)
+            | ((long)(buf[pos + 1] & 255) << 48)
+            | ((long)(buf[pos + 2] & 255) << 40)
+            | ((long)(buf[pos + 3] & 255) << 32)
+            | ((long)(buf[pos + 4] & 255) << 24)
+            | ((long)(buf[pos + 5] & 255) << 16)
+            | ((long)(buf[pos + 6] & 255) << 8)
+            | (long)(buf[pos + 7] & 255);
+        pos = pos + 8;
         return v;
+    }
+
+    // 零临时 byte[]，直接从 buf 切片解码 UTF-8 字符串。
+    string TakeString(int n) {
+        if (n < 0 || n > len - pos) {
+            throw new MsgPackException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+        if (n == 0) { return ""; }
+        string s = Encoding.GetString(buf, pos, n);
+        pos = pos + n;
+        return s;
+    }
+
+    // 零 JsonValue 包装直读 map 键字符串。
+    string ReadMapKey(int depth) {
+        if (depth > 512) {
+            throw new MsgPackException("nesting too deep at byte " + Convert.ToString(pos));
+        }
+        int b = U8();
+        if (b >= 160 && b <= 191) { return TakeString(b & 31); }
+        if (b == 217) { return TakeString(U8()); }
+        if (b == 218) { return TakeString(U16BE()); }
+        if (b == 219) {
+            long nL = U32BE();
+            if (nL < 0 || nL > 536870912) {
+                throw new MsgPackException("str length out of bounds at byte " + Convert.ToString(pos));
+            }
+            return TakeString((int)nL);
+        }
+        if (b >= 196 && b <= 198) {
+            long nL = b == 196 ? (long)U8() : (b == 197 ? (long)U16BE() : U32BE());
+            if (nL < 0 || nL > 536870912) {
+                throw new MsgPackException("bin length out of bounds at byte " + Convert.ToString(pos));
+            }
+            return TakeString((int)nL);
+        }
+        throw new MsgPackException("map key is not a string at byte " + Convert.ToString(pos));
     }
 
     // 取 n 字节（越界抛）。n 用减法比较防 int 溢出绕过。
@@ -99,12 +152,8 @@ public class MsgPackReader {
             JsonValue obj = JsonValue.NewObject();
             int i = 0;
             while (i < n) {
-                JsonValue k = ReadValue(depth + 1);
-                if (!k.IsString()) {
-                    throw new MsgPackException("map key is not a string at byte "
-                        + Convert.ToString(pos));
-                }
-                obj.Put(k.AsString(""), ReadValue(depth + 1));
+                string key = ReadMapKey(depth + 1);
+                obj.Put(key, ReadValue(depth + 1));
                 i = i + 1;
             }
             return obj;
@@ -120,7 +169,7 @@ public class MsgPackReader {
             return arr;
         }
         if (b >= 160 && b <= 191) {  // fixstr
-            return JsonValue.NewStr(DecodedText(Take(b & 31)));
+            return JsonValue.NewStr(TakeString(b & 31));
         }
         if (b == 192) { return JsonValue.NewNull(); }  // nil
         if (b == 193) {
@@ -135,7 +184,7 @@ public class MsgPackReader {
                 throw new MsgPackException("bin length out of bounds at byte " + Convert.ToString(pos));
             }
             // bin 无文本语义：UTF-8 尽力解码（非法序列 U+FFFD）。
-            return JsonValue.NewStr(DecodedText(Take((int)nL)));
+            return JsonValue.NewStr(TakeString((int)nL));
         }
         if (b >= 199 && b <= 201) {  // ext8/16/32
             long nL = b == 199 ? (long)U8() : (b == 200 ? (long)U16BE() : U32BE());
@@ -166,14 +215,14 @@ public class MsgPackReader {
             int type = S8();
             return ExtValue(type, Take(n));
         }
-        if (b == 217) { return JsonValue.NewStr(DecodedText(Take(U8()))); }
-        if (b == 218) { return JsonValue.NewStr(DecodedText(Take(U16BE()))); }
+        if (b == 217) { return JsonValue.NewStr(TakeString(U8())); }
+        if (b == 218) { return JsonValue.NewStr(TakeString(U16BE())); }
         if (b == 219) {
             long nL = U32BE();
             if (nL < 0 || nL > 536870912) {
                 throw new MsgPackException("str length out of bounds at byte " + Convert.ToString(pos));
             }
-            return JsonValue.NewStr(DecodedText(Take((int)nL)));
+            return JsonValue.NewStr(TakeString((int)nL));
         }
         if (b == 220) { return ArrayOf(U16BE(), depth); }
         if (b == 221) {
@@ -217,12 +266,8 @@ public class MsgPackReader {
         JsonValue obj = JsonValue.NewObject();
         int i = 0;
         while (i < n) {
-            JsonValue k = ReadValue(depth + 1);
-            if (!k.IsString()) {
-                throw new MsgPackException("map key is not a string at byte "
-                    + Convert.ToString(pos));
-            }
-            obj.Put(k.AsString(""), ReadValue(depth + 1));
+            string key = ReadMapKey(depth + 1);
+            obj.Put(key, ReadValue(depth + 1));
             i = i + 1;
         }
         return obj;
@@ -329,47 +374,9 @@ public class MsgPackReader {
         return NativeMemory.AsF64(bits);
     }
 
-    // 由 32 位 IEEE-754 位型还原 double（float32 家族）。
+    // 由 32 位 IEEE-754 位型还原 double（编译器内建 bitcast，单指令精确还原）。
     private static double BitsSingle(int bits) {
-        int sign = (bits >> 31) & 1;
-        int exp = (bits >> 23) & 255;
-        int mant = bits & 8388607;  // 2^23-1
-        if (exp == 255) {
-            double inf = Pow2(128);
-            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
-            return inf - inf;
-        }
-        double m = 0.0;
-        if (exp == 0) {
-            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
-            int b = 22;
-            while (b >= 0) {
-                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 23); }
-                b = b - 1;
-            }
-            double v = m * Pow2(-126);
-            return sign == 1 ? 0.0 - v : v;
-        }
-        m = 1.0;
-        int b2 = 22;
-        while (b2 >= 0) {
-            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 23); }
-            b2 = b2 - 1;
-        }
-        double r = m * Pow2(exp - 127);
-        return sign == 1 ? 0.0 - r : r;
-    }
-
-    private static double Pow2(int e) {
-        double v = 1.0;
-        if (e >= 0) {
-            int i = 0;
-            while (i < e) { v = v * 2.0; i = i + 1; }
-        } else {
-            int i = 0;
-            while (i > e) { v = v / 2.0; i = i - 1; }
-        }
-        return v;
+        return (double)NativeMemory.AsF32(bits);
     }
 
     // 字节 → 字符串（UTF-8 尽力，非法序列 U+FFFD；长度显式，

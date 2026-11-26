@@ -12,53 +12,64 @@ public class TensorMath {
 
     public static Tensor Add(Tensor a, Tensor b) {
         int n = TensorMath.RequireSameCount(a, b);
+        float[] ad = a.data;
+        float[] bd = b.data;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = a.data[i] + b.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = ad[i] + bd[i]; }
         return new Tensor(a.Shape(), res);
     }
 
     public static Tensor Sub(Tensor a, Tensor b) {
         int n = TensorMath.RequireSameCount(a, b);
+        float[] ad = a.data;
+        float[] bd = b.data;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = a.data[i] - b.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = ad[i] - bd[i]; }
         return new Tensor(a.Shape(), res);
     }
 
     public static Tensor Mul(Tensor a, Tensor b) {
         int n = TensorMath.RequireSameCount(a, b);
+        float[] ad = a.data;
+        float[] bd = b.data;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = a.data[i] * b.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = ad[i] * bd[i]; }
         return new Tensor(a.Shape(), res);
     }
 
     public static Tensor Div(Tensor a, Tensor b) {
         int n = TensorMath.RequireSameCount(a, b);
+        float[] ad = a.data;
+        float[] bd = b.data;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = a.data[i] / b.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = ad[i] / bd[i]; }
         return new Tensor(a.Shape(), res);
     }
 
     // 逐元素乘标量。
     public static Tensor Scale(Tensor a, float factor) {
-        int n = a.data.Length;
+        float[] ad = a.data;
+        int n = ad.Length;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = a.data[i] * factor; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = ad[i] * factor; }
         return new Tensor(a.Shape(), res);
     }
 
     public static Tensor Neg(Tensor a) {
-        int n = a.data.Length;
+        float[] ad = a.data;
+        int n = ad.Length;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = -a.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { res[i] = -ad[i]; }
         return new Tensor(a.Shape(), res);
     }
 
     // 逐元素夹到 [lo, hi]。
     public static Tensor Clamp(Tensor a, float lo, float hi) {
-        int n = a.data.Length;
+        float[] ad = a.data;
+        int n = ad.Length;
         float[] res = new float[n];
         for (int i = 0; i < n; i = i + 1) {
-            float v = a.data[i];
+            float v = ad[i];
             if (v < lo) { v = lo; }
             if (v > hi) { v = hi; }
             res[i] = v;
@@ -69,7 +80,9 @@ public class TensorMath {
     // 原地累加：dst += src（Transformer 里累加残差用得多，省一次分配）。
     public static void AddInto(Tensor dst, Tensor src) {
         int n = TensorMath.RequireSameCount(dst, src);
-        for (int i = 0; i < n; i = i + 1) { dst.data[i] = dst.data[i] + src.data[i]; }
+        float[] dd = dst.data;
+        float[] sd = src.data;
+        for (int i = 0; i < n; i = i + 1) { dd[i] = dd[i] + sd[i]; }
     }
 
     // ---- 线性代数 ----
@@ -89,7 +102,7 @@ public class TensorMath {
         return TensorMath.MatMulCpu(a, b);
     }
 
-    // CPU 参考实现的矩阵乘（i-k-j 顺序，内层沿 b 的行连续）。
+    // CPU 参考实现的矩阵乘（4 行分块 i-k-j 复用 b 行加载，单元素累加顺序完全一致）。
     public static Tensor MatMulCpu(Tensor a, Tensor b) {
         int m = a.Dim(0);
         int k = a.Dim(1);
@@ -98,21 +111,48 @@ public class TensorMath {
         shape.Add(m);
         shape.Add(n);
         float[] res = new float[m * n];
-        for (int i = 0; i < m; i = i + 1) {
+        float[] ad = a.data;
+        float[] bd = b.data;
+        int i = 0;
+        for (; i + 3 < m; i = i + 4) {
+            int rowA0 = i * k;
+            int rowA1 = rowA0 + k;
+            int rowA2 = rowA1 + k;
+            int rowA3 = rowA2 + k;
+            int rowO0 = i * n;
+            int rowO1 = rowO0 + n;
+            int rowO2 = rowO1 + n;
+            int rowO3 = rowO2 + n;
+            for (int p = 0; p < k; p = p + 1) {
+                float a0 = ad[rowA0 + p];
+                float a1 = ad[rowA1 + p];
+                float a2 = ad[rowA2 + p];
+                float a3 = ad[rowA3 + p];
+                int rowB = p * n;
+                for (int j = 0; j < n; j = j + 1) {
+                    float bv = bd[rowB + j];
+                    res[rowO0 + j] = res[rowO0 + j] + a0 * bv;
+                    res[rowO1 + j] = res[rowO1 + j] + a1 * bv;
+                    res[rowO2 + j] = res[rowO2 + j] + a2 * bv;
+                    res[rowO3 + j] = res[rowO3 + j] + a3 * bv;
+                }
+            }
+        }
+        for (; i < m; i = i + 1) {
             int rowA = i * k;
             int rowO = i * n;
             for (int p = 0; p < k; p = p + 1) {
-                float av = a.data[rowA + p];
+                float av = ad[rowA + p];
                 int rowB = p * n;
                 for (int j = 0; j < n; j = j + 1) {
-                    res[rowO + j] = res[rowO + j] + av * b.data[rowB + j];
+                    res[rowO + j] = res[rowO + j] + av * bd[rowB + j];
                 }
             }
         }
         return new Tensor(shape, res);
     }
 
-    // 矩阵乘向量：结果[m] = a[m,k] · v[k]。
+    // 矩阵乘向量：结果[m] = a[m,k] · v[k]（4 行并发复用 v[p] 加载，累加顺序逐位一致）。
     public static Tensor MatVec(Tensor a, Tensor v) {
         if (a.Rank() != 2 || v.Rank() != 1) {
             throw new ArgumentException("TensorMath.MatVec: expects a 2D matrix and a 1D vector");
@@ -125,10 +165,34 @@ public class TensorMath {
         List<int> shape = new List<int>();
         shape.Add(m);
         float[] res = new float[m];
-        for (int i = 0; i < m; i = i + 1) {
+        float[] ad = a.data;
+        float[] vd = v.data;
+        int i = 0;
+        for (; i + 3 < m; i = i + 4) {
+            int rowA0 = i * k;
+            int rowA1 = rowA0 + k;
+            int rowA2 = rowA1 + k;
+            int rowA3 = rowA2 + k;
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+            for (int p = 0; p < k; p = p + 1) {
+                float vp = vd[p];
+                acc0 = acc0 + ad[rowA0 + p] * vp;
+                acc1 = acc1 + ad[rowA1 + p] * vp;
+                acc2 = acc2 + ad[rowA2 + p] * vp;
+                acc3 = acc3 + ad[rowA3 + p] * vp;
+            }
+            res[i] = acc0;
+            res[i + 1] = acc1;
+            res[i + 2] = acc2;
+            res[i + 3] = acc3;
+        }
+        for (; i < m; i = i + 1) {
             int rowA = i * k;
             float acc = 0.0f;
-            for (int p = 0; p < k; p = p + 1) { acc = acc + a.data[rowA + p] * v.data[p]; }
+            for (int p = 0; p < k; p = p + 1) { acc = acc + ad[rowA + p] * vd[p]; }
             res[i] = acc;
         }
         return new Tensor(shape, res);
@@ -137,12 +201,14 @@ public class TensorMath {
     // 一维点积。
     public static float Dot(Tensor a, Tensor b) {
         int n = TensorMath.RequireSameCount(a, b);
+        float[] ad = a.data;
+        float[] bd = b.data;
         float acc = 0.0f;
-        for (int i = 0; i < n; i = i + 1) { acc = acc + a.data[i] * b.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { acc = acc + ad[i] * bd[i]; }
         return acc;
     }
 
-    // 右操作数转置矩阵乘：left[m,k] · right[n,k]ᵀ -> [m,n]（(m,n,p) 循环保证双侧末维连续访问）。
+    // 右操作数转置矩阵乘：left[m,k] · right[n,k]ᵀ -> [m,n]（4 列复用 left 行，双侧末维连续）。
     public static Tensor MatMulRightTransposed(Tensor left, Tensor right) {
         if (left.Rank() != 2 || right.Rank() != 2) {
             throw new ArgumentException("TensorMath.MatMulRightTransposed: expects 2D tensors");
@@ -157,14 +223,38 @@ public class TensorMath {
         shape.Add(m);
         shape.Add(n);
         float[] res = new float[m * n];
+        float[] ld = left.data;
+        float[] rd = right.data;
         for (int i = 0; i < m; i = i + 1) {
             int rowL = i * k;
             int rowO = i * n;
-            for (int j = 0; j < n; j = j + 1) {
+            int j = 0;
+            for (; j + 3 < n; j = j + 4) {
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                int baseR0 = j * k;
+                int baseR1 = baseR0 + k;
+                int baseR2 = baseR1 + k;
+                int baseR3 = baseR2 + k;
+                for (int p = 0; p < k; p = p + 1) {
+                    float lv = ld[rowL + p];
+                    acc0 = acc0 + lv * rd[baseR0 + p];
+                    acc1 = acc1 + lv * rd[baseR1 + p];
+                    acc2 = acc2 + lv * rd[baseR2 + p];
+                    acc3 = acc3 + lv * rd[baseR3 + p];
+                }
+                res[rowO + j] = acc0;
+                res[rowO + j + 1] = acc1;
+                res[rowO + j + 2] = acc2;
+                res[rowO + j + 3] = acc3;
+            }
+            for (; j < n; j = j + 1) {
                 float acc = 0.0f;
                 int baseR = j * k;
                 for (int p = 0; p < k; p = p + 1) {
-                    acc = acc + left.data[rowL + p] * right.data[baseR + p];
+                    acc = acc + ld[rowL + p] * rd[baseR + p];
                 }
                 res[rowO + j] = acc;
             }
@@ -175,17 +265,23 @@ public class TensorMath {
     // ---- 归一化与激活 ----
 
     private static void SoftmaxSlice(Tensor src, float[] dst, int rowBase, int count) {
-        float max = TensorMath.MaxOf(src, rowBase, count);
+        float[] sd = src.data;
+        float max = sd[rowBase];
+        for (int i = 1; i < count; i = i + 1) {
+            float v = sd[rowBase + i];
+            if (v > max) { max = v; }
+        }
         float sum = 0.0f;
         for (int i = 0; i < count; i = i + 1) {
-            float e = (float)MathUtil.Exp((double)(src.data[rowBase + i] - max));
+            float e = (float)Math.Exp((double)(sd[rowBase + i] - max));
             dst[rowBase + i] = e;
             sum = sum + e;
         }
         if (sum == 0.0f) {
             for (int i = 0; i < count; i = i + 1) { dst[rowBase + i] = 0.0f; }
         } else {
-            for (int i = 0; i < count; i = i + 1) { dst[rowBase + i] = dst[rowBase + i] / sum; }
+            float invSum = 1.0f / sum;
+            for (int i = 0; i < count; i = i + 1) { dst[rowBase + i] = dst[rowBase + i] * invSum; }
         }
     }
 
@@ -230,16 +326,26 @@ public class TensorMath {
         int last = x.Dim(x.Rank() - 1);
         int rows = x.Count() / (last > 0 ? last : 1);
         TensorMath.RequireLastDimMatch("RMSNorm", "weight", weight, last);
-        float[] res = new float[x.Count()];
+        float[] xd = x.data;
+        float[] wd = weight != null ? weight.data : null;
+        float[] res = new float[xd.Length];
+        float invLast = 1.0f / (float)last;
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;
             float ss = 0.0f;
-            for (int i = 0; i < last; i = i + 1) { ss = ss + x.data[rowBase + i] * x.data[rowBase + i]; }
-            float inv = (float)(1.0 / Math.Sqrt((double)(ss / (float)last) + (double)eps));
             for (int i = 0; i < last; i = i + 1) {
-                float v = x.data[rowBase + i] * inv;
-                if (weight != null) { v = v * weight.data[i]; }
-                res[rowBase + i] = v;
+                float v = xd[rowBase + i];
+                ss = ss + v * v;
+            }
+            float inv = (float)(1.0 / Math.Sqrt((double)(ss * invLast) + (double)eps));
+            if (wd != null) {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = xd[rowBase + i] * inv * wd[i];
+                }
+            } else {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = xd[rowBase + i] * inv;
+                }
             }
         }
         return new Tensor(x.Shape(), res);
@@ -251,23 +357,38 @@ public class TensorMath {
         int rows = x.Count() / (last > 0 ? last : 1);
         TensorMath.RequireLastDimMatch("LayerNorm", "weight", weight, last);
         TensorMath.RequireLastDimMatch("LayerNorm", "bias", bias, last);
-        float[] res = new float[x.Count()];
+        float[] xd = x.data;
+        float[] wd = weight != null ? weight.data : null;
+        float[] bd = bias != null ? bias.data : null;
+        float[] res = new float[xd.Length];
+        float invLast = 1.0f / (float)last;
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;
             float sum = 0.0f;
-            for (int i = 0; i < last; i = i + 1) { sum = sum + x.data[rowBase + i]; }
-            float mean = sum / (float)last;
+            for (int i = 0; i < last; i = i + 1) { sum = sum + xd[rowBase + i]; }
+            float mean = sum * invLast;
             float variance = 0.0f;
             for (int i = 0; i < last; i = i + 1) {
-                float d = x.data[rowBase + i] - mean;
+                float d = xd[rowBase + i] - mean;
                 variance = variance + d * d;
             }
-            float inv = (float)(1.0 / Math.Sqrt((double)(variance / (float)last) + (double)eps));
-            for (int i = 0; i < last; i = i + 1) {
-                float v = (x.data[rowBase + i] - mean) * inv;
-                if (weight != null) { v = v * weight.data[i]; }
-                if (bias != null) { v = v + bias.data[i]; }
-                res[rowBase + i] = v;
+            float inv = (float)(1.0 / Math.Sqrt((double)(variance * invLast) + (double)eps));
+            if (wd != null && bd != null) {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = (xd[rowBase + i] - mean) * inv * wd[i] + bd[i];
+                }
+            } else if (wd != null) {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = (xd[rowBase + i] - mean) * inv * wd[i];
+                }
+            } else if (bd != null) {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = (xd[rowBase + i] - mean) * inv + bd[i];
+                }
+            } else {
+                for (int i = 0; i < last; i = i + 1) {
+                    res[rowBase + i] = (xd[rowBase + i] - mean) * inv;
+                }
             }
         }
         return new Tensor(x.Shape(), res);
@@ -275,40 +396,46 @@ public class TensorMath {
 
     // SiLU：x · sigmoid(x)。
     public static Tensor SiLU(Tensor x) {
-        int n = x.data.Length;
+        float[] xd = x.data;
+        int n = xd.Length;
         float[] res = new float[n];
         for (int i = 0; i < n; i = i + 1) {
-            float v = x.data[i];
-            res[i] = v / (1.0f + (float)MathUtil.Exp((double)(-v)));
+            float v = xd[i];
+            res[i] = v / (1.0f + (float)Math.Exp((double)(-v)));
         }
         return new Tensor(x.Shape(), res);
     }
 
     // GELU（tanh 近似）。
     public static Tensor GELU(Tensor x) {
-        int n = x.data.Length;
+        float[] xd = x.data;
+        int n = xd.Length;
         float[] res = new float[n];
         for (int i = 0; i < n; i = i + 1) {
-            float v = x.data[i];
-            double inner = 0.7978845608028654 * ((double)v + 0.044715 * (double)v * (double)v * (double)v);
+            double dv = (double)xd[i];
+            double inner = 0.7978845608028654 * (dv + 0.044715 * dv * dv * dv);
             double t = TensorMath.Tanh(inner);
-            res[i] = (float)(0.5 * (double)v * (1.0 + t));
+            res[i] = (float)(0.5 * dv * (1.0 + t));
         }
         return new Tensor(x.Shape(), res);
     }
 
-    // SwiGLU：silu(gate) * up（LLaMA 系 MLP 的门控）。
+    // SwiGLU：silu(gate) * up（单遍融合，省去中间 Tensor 分配与二次扫描）。
     public static Tensor SwiGLU(Tensor gate, Tensor up) {
         int n = TensorMath.RequireSameCount(gate, up);
-        Tensor g = TensorMath.SiLU(gate);
+        float[] gd = gate.data;
+        float[] ud = up.data;
         float[] res = new float[n];
-        for (int i = 0; i < n; i = i + 1) { res[i] = g.data[i] * up.data[i]; }
+        for (int i = 0; i < n; i = i + 1) {
+            float v = gd[i];
+            res[i] = (v / (1.0f + (float)Math.Exp((double)(-v)))) * ud[i];
+        }
         return new Tensor(gate.Shape(), res);
     }
 
     // ---- 结构操作 ----
 
-    // 按行取表：table 是 [vocab, dim]，indices 是行号 → [len(indices), dim]。
+    // 按行取表：table 是 [vocab, dim]，indices 是行号 → [len(indices), dim]（整行 memcpy）。
     public static Tensor GatherRows(Tensor table, List<int> indices) {
         if (table.Rank() != 2) {
             throw new ArgumentException("TensorMath.GatherRows: expects a 2D table");
@@ -320,19 +447,22 @@ public class TensorMath {
         shape.Add(n);
         shape.Add(dim);
         float[] res = new float[n * dim];
+        int rowBytes = dim * 4;
+        nint srcPtr = (nint)table.data;
+        nint dstPtr = (nint)res;
         for (int i = 0; i < n; i = i + 1) {
             int row = indices[i];
             if (row < 0 || row >= vocab) {
                 throw new ArgumentException("TensorMath.GatherRows: row index out of range");
             }
-            int src = row * dim;
-            int dst = i * dim;
-            for (int k = 0; k < dim; k = k + 1) { res[dst + k] = table.data[src + k]; }
+            if (rowBytes > 0) {
+                NativeMemory.Copy(dstPtr + (nint)(i * rowBytes), srcPtr + (nint)(row * rowBytes), rowBytes);
+            }
         }
         return new Tensor(shape, res);
     }
 
-    // 沿第 0 维拼接两个张量（形状其余维必须一致）。
+    // 沿第 0 维拼接两个张量（双段整块 memcpy）。
     public static Tensor ConcatRows(Tensor a, Tensor b) {
         if (a.Rank() != b.Rank()) { throw new ArgumentException("TensorMath.ConcatRows: rank mismatch"); }
         int inner = 1;
@@ -344,12 +474,14 @@ public class TensorMath {
         int rowsB = b.Dim(0);
         List<int> shape = a.Shape();
         shape[0] = rowsA + rowsB;
-        float[] res = new float[(rowsA + rowsB) * inner];
-        for (int r = 0; r < rowsA; r = r + 1) {
-            for (int k = 0; k < inner; k = k + 1) { res[r * inner + k] = a.data[r * inner + k]; }
+        int elemsA = rowsA * inner;
+        int elemsB = rowsB * inner;
+        float[] res = new float[elemsA + elemsB];
+        if (elemsA > 0) {
+            NativeMemory.Copy((nint)res, (nint)a.data, elemsA * 4);
         }
-        for (int r = 0; r < rowsB; r = r + 1) {
-            for (int k = 0; k < inner; k = k + 1) { res[(rowsA + r) * inner + k] = b.data[r * inner + k]; }
+        if (elemsB > 0) {
+            NativeMemory.Copy((nint)res + (nint)(elemsA * 4), (nint)b.data, elemsB * 4);
         }
         return new Tensor(shape, res);
     }
@@ -358,42 +490,56 @@ public class TensorMath {
 
     // 最大值所在下标（第一处最大值）。
     public static int ArgMax(Tensor x) {
-        int n = x.data.Length;
+        float[] xd = x.data;
+        int n = xd.Length;
         if (n == 0) { throw new ArgumentException("TensorMath.ArgMax: empty tensor"); }
         int best = 0;
+        float bestVal = xd[0];
         for (int i = 1; i < n; i = i + 1) {
-            if (x.data[i] > x.data[best]) { best = i; }
+            float v = xd[i];
+            if (v > bestVal) {
+                bestVal = v;
+                best = i;
+            }
         }
         return best;
     }
 
     // 前 k 大的下标（按值从大到小；同值按原下标升序）。
     public static List<int> TopK(Tensor x, int k) {
-        int n = x.data.Length;
+        float[] xd = x.data;
+        int n = xd.Length;
         if (k < 0) { k = 0; }
         if (k > n) { k = n; }
-        List<int> idx = new List<int>();
-        for (int i = 0; i < n; i = i + 1) { idx.Add(i); }
+        int[] idx = new int[n];
+        for (int i = 0; i < n; i = i + 1) { idx[i] = i; }
         // 选择排序：k 很小（采样用），代价可忽略。
         for (int i = 0; i < k; i = i + 1) {
             int best = i;
+            float bestVal = xd[idx[i]];
             for (int j = i + 1; j < n; j = j + 1) {
-                if (x.data[idx[j]] > x.data[idx[best]]) { best = j; }
+                float v = xd[idx[j]];
+                if (v > bestVal) {
+                    bestVal = v;
+                    best = j;
+                }
             }
             int tmp = idx[i];
             idx[i] = idx[best];
             idx[best] = tmp;
         }
         List<int> res = new List<int>();
+        res.Reserve(k);
         for (int i = 0; i < k; i = i + 1) { res.Add(idx[i]); }
         return res;
     }
 
     // 元素和。
     public static float Sum(Tensor x) {
-        int n = x.data.Length;
+        float[] xd = x.data;
+        int n = xd.Length;
         float acc = 0.0f;
-        for (int i = 0; i < n; i = i + 1) { acc = acc + x.data[i]; }
+        for (int i = 0; i < n; i = i + 1) { acc = acc + xd[i]; }
         return acc;
     }
 
@@ -412,20 +558,21 @@ public class TensorMath {
         if (len <= 0) {
             throw new ArgumentException("TensorMath.MaxOf: empty range");
         }
-        float max = x.data[start];
+        float[] xd = x.data;
+        float max = xd[start];
         for (int i = 1; i < len; i = i + 1) {
-            float v = x.data[start + i];
+            float v = xd[start + i];
             if (v > max) { max = v; }
         }
         return max;
     }
 
-    // tanh（stdlib 没有，用 exp 展开）。
+    // tanh（基于底层 Math.Exp，带饱和快速路防溢出）。
     public static double Tanh(double v) {
-        double e2 = MathUtil.Exp(2.0 * v);
-        if (e2 > 1e308) { return 1.0; }
-        double t = (e2 - 1.0) / (e2 + 1.0);
-        return t;
+        if (v > 20.0) { return 1.0; }
+        if (v < -20.0) { return -1.0; }
+        double e2 = Math.Exp(2.0 * v);
+        return (e2 - 1.0) / (e2 + 1.0);
     }
 
     // 两个张量元素数必须一致。

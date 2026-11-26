@@ -1,0 +1,471 @@
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Numerics;
+using System.IO.Compression;
+using System.Json;
+using System.Data;
+using System.Security.Cryptography;
+using Document.Pdf;
+using Formats.Toml;
+using Formats.Yaml;
+using Formats.Protobuf;
+using Formats.MsgPack;
+using Ai.Tensor;
+using Data.Caching;
+
+class W14Item {
+    public int Id;
+    public string Name;
+    public double Price;
+    public bool Active;
+
+    public W14Item() {
+        this.Id = 0;
+        this.Name = "";
+        this.Price = 0.0;
+        this.Active = false;
+    }
+
+    public W14Item(int id, string name, double price, bool active) {
+        this.Id = id;
+        this.Name = name;
+        this.Price = price;
+        this.Active = active;
+    }
+}
+
+class W14Batch {
+    public List<int> Ints;
+    public List<long> Longs;
+    public List<double> Scores;
+    public List<string> Tags;
+    public List<bool> Flags;
+    public List<W14Item> Items;
+
+    public W14Batch() {
+        this.Ints = new List<int>();
+        this.Longs = new List<long>();
+        this.Scores = new List<double>();
+        this.Tags = new List<string>();
+        this.Flags = new List<bool>();
+        this.Items = new List<W14Item>();
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static bool Near(double a, double b, double eps) {
+        return Math.Abs(a - b) <= eps;
+    }
+
+    static void TestPillar1CompilerAndDecimal() {
+        // Math LLVM intrinsics & banker's rounding
+        Check(Near(Math.Sqrt(9.0), 3.0, 1e-12), "math.sqrt");
+        Check(Near(Math.Abs(-42.5), 42.5, 1e-12), "math.abs");
+        Check(Math.Floor(2.9) == 2.0 && Math.Floor(-2.1) == -3.0, "math.floor");
+        Check(Math.Ceiling(2.1) == 3.0 && Math.Ceiling(-2.9) == -2.0, "math.ceil");
+        Check(Math.Round(2.5) == 2.0 && Math.Round(3.5) == 4.0, "math.round.banker.pos");
+        Check(Math.Round(-2.5) == -2.0 && Math.Round(-3.5) == -4.0, "math.round.banker.neg");
+        Check(Near(Math.Round(3.1415926, 2), 3.14, 1e-12), "math.round.digits2");
+        Check(Near(Math.Round(2.675, 2), 2.68, 1e-9), "math.round.digits2b");
+        Check(Near(Math.Sin(0.0), 0.0, 1e-12) && Near(Math.Cos(0.0), 1.0, 1e-12), "math.trig");
+        Check(Near(Math.Log(Math.Exp(1.5)), 1.5, 1e-12), "math.explog");
+
+        // LastIndexOf reverse scan
+        string text = "ab--cd--ef--ab--gh";
+        Check(text.LastIndexOf("ab") == 12, "str.lastidx.multi");
+        Check(text.LastIndexOf("--") == 14, "str.lastidx.sep");
+        Check(text.LastIndexOf("h") == 17, "str.lastidx.end");
+        Check(text.LastIndexOf("a") == 12, "str.lastidx.ch");
+        Check(text.LastIndexOf("zz") == -1, "str.lastidx.miss");
+        Check(text.LastIndexOf("") == text.Length, "str.lastidx.empty");
+        Check("xyz".LastIndexOf("xyz") == 0, "str.lastidx.exact");
+
+        // SIMD Split
+        List<string> p1 = "a,b,,c,".Split(",");
+        Check(p1.Count == 5 && p1[0] == "a" && p1[2] == "" && p1[4] == "", "str.split.single");
+        List<string> p2 = "alpha::beta::gamma::".Split("::");
+        Check(p2.Count == 4 && p2[0] == "alpha" && p2[1] == "beta" && p2[2] == "gamma" && p2[3] == "", "str.split.multi");
+        List<string> p3 = "no_match".Split("::");
+        Check(p3.Count == 1 && p3[0] == "no_match", "str.split.nomatch");
+
+        // StringBuilder.AppendLine single-check inline path
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("line1");
+        sb.AppendLine("");
+        sb.Append("line3");
+        sb.AppendLine("!");
+        Check(sb.ToString() == "line1\n\nline3!\n", "sb.appendline");
+
+        // Convert.ToString(decimal) + rt_decimal 128-bit paths
+        decimal d0 = Decimal.Parse("0.00");
+        decimal d1 = Decimal.Parse("123456789012345.6789");
+        decimal d2 = Decimal.Parse("-98765.4321");
+        Check(Convert.ToString(d0) == "0.00", "dec.convert.zero");
+        Check(Convert.ToString(d1) == "123456789012345.6789", "dec.convert.big");
+        Check(Convert.ToString(d2) == "-98765.4321", "dec.convert.neg");
+        decimal prod = Decimal.Parse("100.25") * Decimal.Parse("3.04");
+        Check(Convert.ToString(prod) == "304.7600", "dec.mul");
+        decimal q1 = Decimal.Parse("100") / Decimal.Parse("8");
+        Check(Convert.ToString(q1) == "12.5", "dec.div.small");
+        decimal q2 = Decimal.Parse("0") / Decimal.Parse("123.45");
+        Check(Convert.ToString(q2) == "0", "dec.div.zero");
+        decimal q3 = Decimal.Parse("999999999999999999.99") / Decimal.Parse("1");
+        Check(Convert.ToString(q3) == "999999999999999999.99", "dec.div.one");
+        decimal q4 = Decimal.Parse("1000000000000") / Decimal.Parse("3000000000");
+        Check(Convert.ToString(Decimal.Round(q4, 4)) == "333.3333", "dec.div.u64.round");
+        Check(Convert.ToString(Decimal.Round(Decimal.Parse("2.5"), 0)) == "2", "dec.round.even2");
+        Check(Convert.ToString(Decimal.Round(Decimal.Parse("3.5"), 0)) == "4", "dec.round.even4");
+    }
+
+    static void TestPillar2IoAndPdf() {
+        // Crc32 with offset == 0 and offset > 0 (hardware path)
+        byte[] raw = Encoding.GetBytes("XXXX123456789YYYY");
+        int crcFull = Crc32.Compute(Encoding.GetBytes("123456789"), 0, 9, 0);
+        int crcSlice = Crc32.Compute(raw, 4, 9, 0);
+        int crcStr = Crc32.Compute("XXXX123456789YYYY", 4, 9, 0);
+        Check(crcFull == -873187034, "crc32.ieee.check");
+        Check(crcSlice == crcFull && crcStr == crcFull, "crc32.offset.hw");
+
+        // Deflate + GZip + Zip roundtrip
+        StringBuilder payloadSb = new StringBuilder();
+        for (int i = 0; i < 80; i = i + 1) {
+            payloadSb.Append("Invoice#");
+            payloadSb.Append(i);
+            payloadSb.Append(" SKU-ABC-12345 qty=12 price=99.95\n");
+        }
+        byte[] payload = Encoding.GetBytes(payloadSb.ToString());
+        byte[] def = Deflate.Deflate(payload, 6);
+        byte[] inf = Deflate.Inflate(def, 0, def.Length, payload.Length + 64);
+        Check(inf.Length == payload.Length && Crc32.Compute(inf, 0, inf.Length, 0) == Crc32.Compute(payload, 0, payload.Length, 0), "deflate.rt");
+
+        byte[] gz = GZip.Compress(payload, 6);
+        byte[] ungz = GZip.Decompress(gz);
+        Check(ungz.Length == payload.Length && Crc32.Compute(ungz, 0, ungz.Length, 0) == Crc32.Compute(payload, 0, payload.Length, 0), "gzip.rt");
+
+        // Multi-member GZip
+        byte[] gz2 = new byte[gz.Length * 2];
+        NativeMemory.Copy((nint)gz2, (nint)gz, gz.Length);
+        NativeMemory.Copy((nint)gz2 + gz.Length, (nint)gz, gz.Length);
+        byte[] ungz2 = GZip.Decompress(gz2);
+        Check(ungz2.Length == payload.Length * 2, "gzip.multimember");
+
+        List<ZipEntry> entries = new List<ZipEntry>();
+        entries.Add(new ZipEntry("a.txt", payload));
+        entries.Add(new ZipEntry("b.txt", Encoding.GetBytes("hello zip world")));
+        byte[] zipBytes = Zip.Create(entries, 6);
+        List<ZipEntry> readList = Zip.Read(zipBytes);
+        byte[] exA = Zip.Extract(zipBytes, readList[0]);
+        byte[] exB = Zip.Extract(zipBytes, readList[1]);
+        Check(exA.Length == payload.Length && Crc32.Compute(exA, 0, exA.Length, 0) == Crc32.Compute(payload, 0, payload.Length, 0), "zip.extract.a");
+        Check(Encoding.GetString(exB) == "hello zip world", "zip.extract.b");
+
+        // PDF generation with cached fonts, escaped text, alignment, and table
+        PdfDocument doc = new PdfDocument();
+        PdfPage page = doc.AddPage();
+        page.DrawText(40.0, 760.0, "Invoice (2026) \\ Test", PdfFont.HelveticaBold(), 14.0, PdfColor.Black);
+        page.DrawText(40.0, 740.0, "Centered", PdfFont.Helvetica(), 12.0, PdfColor.Black);
+        page.DrawText(40.0, 720.0, "Right", PdfFont.Courier(), 12.0, PdfColor.Black);
+        PdfTable tbl = new PdfTable();
+        tbl.AddColumn("Item", 120.0);
+        tbl.AddColumn("Amount", 80.0);
+        tbl.AddRow(new string[] { "Widget (A)", "125.00" });
+        tbl.AddRow(new string[] { "Gadget \\ B", "250.50" });
+        tbl.Draw(page, 40.0, 680.0);
+        byte[] pdf = doc.Build();
+        string pdfHead = Encoding.GetString(pdf, 0, 5);
+        Check(pdf.Length > 500 && pdfHead == "%PDF-", "pdf.generate");
+    }
+
+    static void TestPillar3FormatsAndJson() {
+        // TOML
+        string tomlSrc = "title = \"Zan Config\"\nport = 8080\n[db.primary]\nhost = \"127.0.0.1\"\nnote = \"line1\\nline2\"\n";
+        JsonValue t = Toml.Parse(tomlSrc);
+        JsonValue tTitle = t.Get("title");
+        JsonValue tPort = t.Get("port");
+        Check(tTitle != null && tTitle.AsString("") == "Zan Config" && tPort != null && tPort.AsInt(0) == 8080, "toml.parse.top");
+        JsonValue db = t.Get("db");
+        JsonValue pri = db != null ? db.Get("primary") : null;
+        JsonValue pHost = pri != null ? pri.Get("host") : null;
+        JsonValue pNote = pri != null ? pri.Get("note") : null;
+        Check(pHost != null && pHost.AsString("") == "127.0.0.1" && pNote != null && pNote.AsString("") == "line1\nline2", "toml.parse.nested");
+        JsonValue tRt = Toml.Parse(Toml.ToToml(t));
+        JsonValue tRtTitle = tRt.Get("title");
+        Check(tRtTitle != null && tRtTitle.AsString("") == "Zan Config", "toml.roundtrip");
+
+        // YAML
+        string yamlSrc = "name: workflow\ncount: 42\nflag: true\nver: \"1.0\"\nsteps:\n  - build\n  - \"test:unit\"\n";
+        JsonValue yn = Yaml.Parse(yamlSrc);
+        JsonValue yName = yn.Get("name");
+        JsonValue yCnt = yn.Get("count");
+        JsonValue yVer = yn.Get("ver");
+        Check(yName != null && yName.AsString("") == "workflow" && yCnt != null && yCnt.AsInt(0) == 42 && yVer != null && yVer.AsString("") == "1.0", "yaml.parse");
+        string yamlOut = Yaml.ToYaml(yn);
+        JsonValue yn2 = Yaml.Parse(yamlOut);
+        JsonValue yName2 = yn2.Get("name");
+        JsonValue yVer2 = yn2.Get("ver");
+        Check(yName2 != null && yName2.AsString("") == "workflow" && yVer2 != null && yVer2.AsString("") == "1.0", "yaml.roundtrip");
+
+        // Protobuf
+        ProtoWriter pw = new ProtoWriter();
+        pw.WriteInt32(1, 7);
+        pw.WriteInt64(2, 123456789012L);
+        pw.WriteString(3, "proto-payload");
+        byte[] pb = pw.ToBytes();
+        ProtoReader pr = new ProtoReader(pb);
+        long pf1 = 0;
+        long pf2 = 0;
+        string pf3 = "";
+        while (pr.Next()) {
+            if (pr.FieldNumber() == 1) { pf1 = (long)pr.ReadInt32(); }
+            else if (pr.FieldNumber() == 2) { pf2 = pr.ReadInt64(); }
+            else if (pr.FieldNumber() == 3) { pf3 = pr.ReadString(); }
+            else { pr.Skip(); }
+        }
+        Check(pf1 == 7 && pf2 == 123456789012L && pf3 == "proto-payload", "proto.roundtrip");
+
+        // MsgPack
+        MsgPackWriter mw = new MsgPackWriter();
+        mw.WriteMapHeader(3);
+        mw.WriteString("id");
+        mw.WriteInt(999);
+        mw.WriteString("name");
+        mw.WriteString("alpha");
+        mw.WriteString("val");
+        mw.WriteDouble(3.25);
+        byte[] mp = mw.ToBytes();
+        MsgPackReader mr = new MsgPackReader(mp);
+        JsonValue mpVal = mr.ReadValue(0);
+        JsonValue mpId = mpVal.Get("id");
+        JsonValue mpName = mpVal.Get("name");
+        JsonValue mpV = mpVal.Get("val");
+        Check(mpId != null && mpId.AsInt(0) == 999 && mpName != null && mpName.AsString("") == "alpha" && mpV != null && Near(mpV.AsDouble(0.0), 3.25, 1e-12), "msgpack.roundtrip");
+
+        // JSON typed lists + POCO list + Pretty + JsonDoc
+        W14Batch batch = new W14Batch();
+        batch.Ints.Add(1); batch.Ints.Add(2); batch.Ints.Add(3);
+        batch.Longs.Add(10000000000L);
+        batch.Scores.Add(1.5); batch.Scores.Add(2.5);
+        batch.Tags.Add("erp"); batch.Tags.Add("oa");
+        batch.Flags.Add(true); batch.Flags.Add(false);
+        batch.Items.Add(new W14Item(1, "A", 10.5, true));
+        batch.Items.Add(new W14Item(2, "B", 20.25, false));
+        string js = Json.Serialize(batch);
+        W14Batch batch2 = Json.Deserialize<W14Batch>(js);
+        Check(batch2.Ints.Count == 3 && batch2.Ints[2] == 3, "json.list.int");
+        Check(batch2.Longs.Count == 1 && batch2.Longs[0] == 10000000000L, "json.list.long");
+        Check(batch2.Scores.Count == 2 && Near(batch2.Scores[1], 2.5, 1e-12), "json.list.double");
+        Check(batch2.Tags.Count == 2 && batch2.Tags[1] == "oa", "json.list.string");
+        Check(batch2.Flags.Count == 2 && batch2.Flags[0] && !batch2.Flags[1], "json.list.bool");
+        Check(batch2.Items.Count == 2 && batch2.Items[1].Name == "B", "json.list.poco");
+
+        JsonDoc jdoc = JsonDoc.Parse("{\"k\":\"plain\",\"e\":\"a\\nb\"}");
+        Check(jdoc.StrEquals(jdoc.FirstChild(0), "plain"), "jsondoc.streq");
+        Check(jdoc.ToJson() == "{\"k\":\"plain\",\"e\":\"a\\nb\"}", "jsondoc.tojson");
+        JsonValue jv = JsonValue.Parse("{\"a\":{\"b\":[1,2]}}");
+        Check(jv.PrettyToJson().Contains("    \"b\""), "jsonvalue.pretty");
+    }
+
+    static void TestPillar4NumericsAndTensor() {
+        // MathUtil
+        Check(MathUtil.Log(0.0) == double.NegativeInfinity && MathUtil.Log(-5.0) == double.NegativeInfinity, "mathutil.log.neg");
+        Check(Near(MathUtil.Log(MathUtil.E), 1.0, 1e-12) && Near(MathUtil.Exp(1.0), MathUtil.E, 1e-12), "mathutil.logexp");
+
+        // Vector & Quaternion
+        Vector3 v = Vector3.Normalize(new Vector3(3.0f, 4.0f, 0.0f));
+        Check(Near((double)v.X, 0.6, 1e-5) && Near((double)v.Y, 0.8, 1e-5), "vec3.norm");
+        Quaternion qEuler = Quaternion.FromEulerRadians(0.3f, 0.5f, 0.2f);
+        Quaternion qRef = Quaternion.Multiply(
+            Quaternion.FromAxisAngle(Vector3.UnitY, 0.5f),
+            Quaternion.Multiply(Quaternion.FromAxisAngle(Vector3.UnitX, 0.3f), Quaternion.FromAxisAngle(Vector3.UnitZ, 0.2f))
+        );
+        Check(Near((double)qEuler.X, (double)qRef.X, 1e-5) && Near((double)qEuler.W, (double)qRef.W, 1e-5), "quat.euler");
+        Vector3 p = new Vector3(1.0f, 2.0f, 3.0f);
+        Vector3 rp = Quaternion.Rotate(p, qEuler);
+        Vector3 mp = Matrix4x4.Transform(p, qEuler.ToMatrix());
+        Check(Near((double)rp.X, (double)mp.X, 1e-4) && Near((double)rp.Y, (double)mp.Y, 1e-4) && Near((double)rp.Z, (double)mp.Z, 1e-4), "quat.rotate.mat");
+        Quaternion qs = Quaternion.Slerp(Quaternion.Identity, qEuler, 0.5f);
+        Check(Near((double)Quaternion.Length(qs), 1.0, 1e-4), "quat.slerp");
+
+        // Tensor & TensorMath (non-multiple-of-4 & >16 dims to hit tiled & remainder loops)
+        List<int> sA = new List<int>(); sA.Add(5); sA.Add(7);
+        List<int> sB = new List<int>(); sB.Add(7); sB.Add(6);
+        float[] dA = new float[35];
+        for (int i = 0; i < 35; i = i + 1) { dA[i] = (float)(i + 1) * 0.1f; }
+        float[] dB = new float[42];
+        for (int i = 0; i < 42; i = i + 1) { dB[i] = (float)(i + 1) * 0.05f; }
+        Tensor tA = new Tensor(sA, dA);
+        Tensor tB = new Tensor(sB, dB);
+        Tensor tC = TensorMath.MatMulCpu(tA, tB);
+        Tensor tBt = tB.Transpose2D();
+        Tensor tC2 = TensorMath.MatMulRightTransposed(tA, tBt);
+        Check(tC.Count() == 30 && Near((double)tC.At(0), (double)tC2.At(0), 1e-4) && Near((double)tC.At(29), (double)tC2.At(29), 1e-4), "tensor.matmul.rt");
+
+        // 19x21 Transpose2D (tests 16x16 tiles + remainder)
+        List<int> sBig = new List<int>(); sBig.Add(19); sBig.Add(21);
+        float[] dBig = new float[399];
+        for (int i = 0; i < 399; i = i + 1) { dBig[i] = (float)i; }
+        Tensor tBig = new Tensor(sBig, dBig);
+        Tensor tBigT = tBig.Transpose2D();
+        Check(tBigT.At(20 * 19 + 18) == tBig.At(18 * 21 + 20), "tensor.transpose.tiled");
+
+        // SwiGLU fused vs SiLU * up
+        Tensor gate = tA.Clone();
+        Tensor up = TensorMath.Scale(tA, 2.0f);
+        Tensor sw1 = TensorMath.SwiGLU(gate, up);
+        Tensor sw2 = TensorMath.Mul(TensorMath.SiLU(gate), up);
+        Check(Near((double)sw1.At(17), (double)sw2.At(17), 1e-5), "tensor.swiglu.fused");
+
+        // GatherRows & ConcatRows
+        List<int> rows = new List<int>(); rows.Add(4); rows.Add(0);
+        Tensor g = TensorMath.GatherRows(tA, rows);
+        Check(g.At(0) == tA.At(28) && g.At(7) == tA.At(0), "tensor.gather");
+        Tensor cat = TensorMath.ConcatRows(g, g);
+        Check(cat.Dim(0) == 4 && cat.At(14) == tA.At(28), "tensor.concat");
+        Check(TensorMath.ArgMax(tA) == 34, "tensor.argmax");
+    }
+
+    static void TestPillar5DataFrame() {
+        StringBuilder csv = new StringBuilder();
+        csv.Append("id,dept,val\n");
+        for (int i = 0; i < 50; i = i + 1) {
+            csv.Append(i);
+            csv.Append(",");
+            csv.Append(i % 4);
+            csv.Append(",");
+            csv.Append((double)((50 - i) * 2));
+            csv.Append("\n");
+        }
+        DataFrame df = DataFrame.FromCsv(csv.ToString());
+        Check(df.Rows() == 50, "df.fromcsv");
+        DataFrame sorted = df.SortBy("val", false);
+        Check(Near(sorted.GetFloat(0, "val"), 2.0, 1e-9) && Near(sorted.GetFloat(49, "val"), 100.0, 1e-9), "df.sortby.float");
+        List<RowGroup> groups = df.GroupBy("dept");
+        Check(groups.Count == 4, "df.groupby.int");
+
+        DataFrame right = DataFrame.FromCsv("dept,label\n0,A\n1,B\n2,C\n3,D\n");
+        DataFrame joined = df.Join(right, "dept", "dept");
+        Check(joined.Rows() == 50 && joined.GetStr(0, "label") == "A", "df.join.int");
+
+        DataFrame rAvg = Window.Rolling(df, "val", 5, Agg.Avg);
+        Check(Near(rAvg.GetFloat(4, "val_rolling"), 96.0, 1e-9), "df.rolling.avg");
+        DataFrame rMin = Window.Rolling(df, "val", 5, Agg.Min);
+        Check(Near(rMin.GetFloat(4, "val_rolling"), 92.0, 1e-9), "df.rolling.min");
+        DataFrame rMax = Window.Rolling(df, "val", 5, Agg.Max);
+        Check(Near(rMax.GetFloat(4, "val_rolling"), 100.0, 1e-9), "df.rolling.max");
+        DataFrame rBig = Window.Rolling(df, "val", 40, Agg.Sum);
+        Check(Near(rBig.GetFloat(49, "val_rolling"), 1640.0, 1e-9), "df.rolling.w40");
+
+        List<double> xs = new List<double>();
+        for (int i = 1; i <= 40; i = i + 1) { xs.Add((double)i); }
+        Check(Near(Stats.Median(xs), 20.5, 1e-9), "stats.median");
+        Check(Near(Stats.Range(xs), 39.0, 1e-9), "stats.range");
+        Check(Near(Stats.Skewness(xs), 0.0, 1e-9), "stats.skew");
+        Check(Stats.Kurtosis(xs) < -1.0, "stats.kurt");
+    }
+
+    static void TestPillar6CollectionsCacheSecurity() {
+        // HashSet O(1) ElementAt + post-remove + Compact
+        var hs = new HashSet<int>();
+        for (int i = 0; i < 40; i = i + 1) { hs.Add(i * 3); }
+        Check(hs.ElementAt(10) == 30 && hs.ElementAt(39) == 117, "hs.elem.fast");
+        hs.Remove(0);
+        hs.Remove(3);
+        Check(hs.ElementAt(0) == 6 && hs.Count() == 38, "hs.elem.tombstone");
+        for (int i = 2; i < 30; i = i + 1) { hs.Remove(i * 3); }
+        Check(hs.Count() == 10 && hs.ElementAt(0) == 90, "hs.compact");
+
+        // PriorityQueue
+        var pq = new PriorityQueue<int, int>();
+        pq.Enqueue(10, 50); pq.Enqueue(20, 10); pq.Enqueue(30, 30); pq.Enqueue(40, 20);
+        Check(pq.Dequeue() == 20 && pq.Dequeue() == 40 && pq.Dequeue() == 30 && pq.Dequeue() == 10, "pq.order");
+
+        // Queue wrap-around + QueueEnumerator bitmask
+        var q = new Queue<int>();
+        for (int i = 0; i < 12; i = i + 1) { q.Enqueue(i); }
+        for (int i = 0; i < 6; i = i + 1) { q.Dequeue(); }
+        for (int i = 12; i < 20; i = i + 1) { q.Enqueue(i); }
+        int qSum = 0;
+        foreach (int x in q) { qSum = qSum + x; }
+        Check(qSum == 175, "queue.enum.wrap");
+
+        // Stack
+        var st = new Stack<int>();
+        st.Push(1); st.Push(2); st.Push(3);
+        int[] stArr = st.ToArray();
+        Check(stArr.Length == 3 && stArr[0] == 3 && stArr[2] == 1 && st.Pop() == 3, "stack.ops");
+
+        // MemoryCache (no-TTL + TTL + Sweep)
+        var cache = new MemoryCache<string>();
+        cache.SetCapacity(3);
+        cache.SetTtl(0L);
+        cache.Set("a", "1"); cache.Set("b", "2"); cache.Set("c", "3");
+        Check(cache.Get("a") == "1", "cache.get.hit");
+        cache.Set("d", "4"); // evicts "b"
+        Check(cache.Get("b") == null && cache.Get("a") == "1" && cache.Get("d") == "4", "cache.lru");
+        Check(cache.Sweep() == 0, "cache.sweep.zero");
+
+        // AES-128/192/256 ECB/CBC/CTR (hardware AES-NI keybits fix!)
+        string k16 = "0123456789ABCDEF";
+        string k24 = "0123456789ABCDEF01234567";
+        string k32 = "0123456789ABCDEF0123456789ABCDEF";
+        string iv16 = "FEDCBA9876543210";
+        string msg = "Wave14 hardware AES-NI verification payload 1234567890!";
+
+        byte[] ecb16 = Aes.EncryptBlockEcb(k16, 16, iv16);
+        byte[] ecbDec = Aes.DecryptBlockEcb(k16, 16, ecb16.ToStr(0, 16));
+        Check(Encoding.GetString(ecbDec) == iv16, "aes128.ecb.rt");
+
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        byte[] cbc128 = Aes.EncryptCbc(k16, 16, iv16, msg, msg.Length, outLen);
+        byte[] dec128 = Aes.DecryptCbc(k16, 16, iv16, cbc128.ToStr(0, outLen[0]), outLen[0], outLen);
+        Check(Encoding.GetString(dec128) == msg, "aes128.cbc.rt");
+
+        byte[] cbc256 = Aes.EncryptCbc(k32, 32, iv16, msg, msg.Length, outLen);
+        byte[] dec256 = Aes.DecryptCbc(k32, 32, iv16, cbc256.ToStr(0, outLen[0]), outLen[0], outLen);
+        Check(Encoding.GetString(dec256) == msg, "aes256.cbc.rt");
+
+        byte[] ctr192 = Aes.CryptCtr(k24, 24, iv16, msg, msg.Length);
+        byte[] ctrDec = Aes.CryptCtr(k24, 24, iv16, ctr192.ToStr(0, ctr192.Length), ctr192.Length);
+        Check(Encoding.GetString(ctrDec) == msg, "aes192.ctr.rt");
+
+        // SHA-1 NIST vector ("abc") via Hash & HashBytes
+        byte[] s1 = Sha1.Hash("abc", 3);
+        byte[] s2 = Sha1.HashBytes(Encoding.GetBytes("abc"), 3);
+        Check(Sha1.ToHex(s1) == "a9993e364706816aba3e25717850c26c9cd0d89d", "sha1.nist.str");
+        Check(Sha1.ToHex(s2) == "a9993e364706816aba3e25717850c26c9cd0d89d", "sha1.nist.bytes");
+
+        // HMAC-SHA256
+        byte[] mac = Hmac.Sha256(Encoding.GetBytes("key"), Encoding.GetBytes("The quick brown fox jumps over the lazy dog"));
+        Check(Hex.Encode(mac, mac.Length) == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", "hmac.sha256.rfc");
+
+        // Base64
+        string b64 = Base64.Encode(Encoding.GetBytes(msg));
+        byte[] b64Dec = Base64.Decode(b64);
+        Check(Encoding.GetString(b64Dec) == msg, "base64.rt");
+    }
+
+    static int Main() {
+        TestPillar1CompilerAndDecimal();
+        TestPillar2IoAndPdf();
+        TestPillar3FormatsAndJson();
+        TestPillar4NumericsAndTensor();
+        TestPillar5DataFrame();
+        TestPillar6CollectionsCacheSecurity();
+        if (failures == 0) {
+            Console.WriteLine("PASS opt_wave14_comprehensive");
+            return 0;
+        }
+        Console.WriteLine("FAIL count=" + Convert.ToString(failures));
+        return 1;
+    }
+}

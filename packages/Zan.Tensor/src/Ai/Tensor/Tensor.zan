@@ -121,11 +121,13 @@ public class Tensor {
         return offset;
     }
 
-    // 深拷贝。
+    // 深拷贝（整块 memcpy，零逐元素循环）。
     public Tensor Clone() {
         int n = this.data.Length;
         float[] buf = new float[n];
-        for (int i = 0; i < n; i = i + 1) { buf[i] = this.data[i]; }
+        if (n > 0) {
+            NativeMemory.Copy((nint)buf, (nint)this.data, n * 4);
+        }
         return new Tensor(this.Shape(), buf);
     }
 
@@ -135,7 +137,7 @@ public class Tensor {
         return new Tensor(newShape, this.data);
     }
 
-    // 二维转置：返回新张量（拷贝），形状 (m,n) → (n,m)。
+    // 二维转置：返回新张量（16x16 分块提升缓存局部性），形状 (m,n) → (n,m)。
     public Tensor Transpose2D() {
         if (this.shape.Count != 2) {
             throw new ArgumentException("Tensor.Transpose2D: rank " + Convert.ToString(this.shape.Count) + " != 2");
@@ -146,15 +148,25 @@ public class Tensor {
         outShape.Add(n);
         outShape.Add(m);
         float[] res = new float[m * n];
-        for (int i = 0; i < m; i = i + 1) {
-            for (int j = 0; j < n; j = j + 1) {
-                res[j * m + i] = this.data[i * n + j];
+        float[] src = this.data;
+        for (int ii = 0; ii < m; ii = ii + 16) {
+            int iEnd = ii + 16;
+            if (iEnd > m) { iEnd = m; }
+            for (int jj = 0; jj < n; jj = jj + 16) {
+                int jEnd = jj + 16;
+                if (jEnd > n) { jEnd = n; }
+                for (int i = ii; i < iEnd; i = i + 1) {
+                    int srcRow = i * n;
+                    for (int j = jj; j < jEnd; j = j + 1) {
+                        res[j * m + i] = src[srcRow + j];
+                    }
+                }
             }
         }
         return new Tensor(outShape, res);
     }
 
-    // 沿某一维切一段（拷贝）。start 允许为负（从末尾数）。
+    // 沿某一维切一段（按连续块 memcpy）。start 允许为负（从末尾数）。
     public Tensor Slice(int axis, int start, int len) {
         if (axis < 0 || axis >= this.shape.Count) {
             throw new ArgumentException("Tensor.Slice: axis out of range");
@@ -171,11 +183,17 @@ public class Tensor {
         List<int> outShape = this.Shape();
         outShape[axis] = len;
         float[] res = new float[outer * len * inner];
-        for (int o = 0; o < outer; o = o + 1) {
-            int srcBase = o * dim * inner + start * inner;
-            int dstBase = o * len * inner;
-            for (int k = 0; k < len * inner; k = k + 1) {
-                res[dstBase + k] = this.data[srcBase + k];
+        int chunkElems = len * inner;
+        if (chunkElems > 0) {
+            int chunkBytes = chunkElems * 4;
+            int srcStride = dim * inner;
+            int startOff = start * inner;
+            nint srcPtr = (nint)this.data;
+            nint dstPtr = (nint)res;
+            for (int o = 0; o < outer; o = o + 1) {
+                int srcBase = o * srcStride + startOff;
+                int dstBase = o * chunkElems;
+                NativeMemory.Copy(dstPtr + (nint)(dstBase * 4), srcPtr + (nint)(srcBase * 4), chunkBytes);
             }
         }
         return new Tensor(outShape, res);

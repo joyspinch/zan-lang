@@ -639,7 +639,7 @@ public class YamlParser {
         string t = part;
         int e = t.Length;
         while (e > 0 && (t[e - 1] & 255) == 32) { e = e - 1; }
-        t = t.Substring(0, e);
+        if (e < t.Length) { t = t.Substring(0, e); }
         if (t.Length >= 2 && t[0] == 34) {
             return DecodeDoubleQuoted(t);
         }
@@ -674,20 +674,21 @@ public class YamlParser {
         return s;
     }
 
-    // 双引标量（整段含首尾引号）解码。
+    // 双引标量（整段含首尾引号）解码（无转义快路径零 StringBuilder）。
     string DecodeDoubleQuoted(string t) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = null;
         int at = 1;
         int start = 1;
         int n = t.Length;
         while (at < n) {
             int ch = t[at] & 255;
             if (ch == 34) {
+                if (sb == null) { return t.Substring(start, at - start); }
                 if (at > start) { sb.Append(t.Substring(start, at - start)); }
-                start = at;
-                break;
+                return sb.ToString();
             }
             if (ch == 92) {
+                if (sb == null) { sb = new StringBuilder(); }
                 if (at > start) { sb.Append(t.Substring(start, at - start)); }
                 at = at + 1;
                 ReadEscape(t, ref at, sb);
@@ -696,31 +697,35 @@ public class YamlParser {
             }
             at = at + 1;
         }
+        if (sb == null) { return t.Substring(start, at - start); }
         if (at > start) { sb.Append(t.Substring(start, at - start)); }
         return sb.ToString();
     }
 
-    // 单引标量（整段含首尾引号）解码：'' → '。
+    // 单引标量（整段含首尾引号）解码：'' → '（无转义快路径零 StringBuilder）。
     string DecodeSingleQuoted(string t) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = null;
         int at = 1;
         int start = 1;
         int n = t.Length;
         while (at < n) {
             int ch = t[at] & 255;
             if (ch == 39) {
-                if (at > start) { sb.Append(t.Substring(start, at - start)); }
                 if (at + 1 < n && (t[at + 1] & 255) == 39) {
+                    if (sb == null) { sb = new StringBuilder(); }
+                    if (at > start) { sb.Append(t.Substring(start, at - start)); }
                     sb.Append("'");
                     at = at + 2;
                     start = at;
                     continue;
                 }
-                start = at;
-                break;
+                if (sb == null) { return t.Substring(start, at - start); }
+                if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                return sb.ToString();
             }
             at = at + 1;
         }
+        if (sb == null) { return t.Substring(start, at - start); }
         if (at > start) { sb.Append(t.Substring(start, at - start)); }
         return sb.ToString();
     }
@@ -777,6 +782,67 @@ public class YamlParser {
 
     // ===== core schema 类型推断 =====
 
+    // 零堆分配判定 plain 标量是否会被 TypeScalar 识别为非字符串（null/bool/int/float）。
+    public static bool IsNonStringScalar(string s) {
+        int n = s.Length;
+        if (n == 0) { return true; }
+        int c0 = s[0] & 255;
+        if (c0 == 126 && n == 1) { return true; }  // "~"
+        if (c0 == 110 || c0 == 78) {
+            if (s == "null" || s == "Null" || s == "NULL") { return true; }
+            return false;
+        }
+        if (c0 == 116 || c0 == 84) {
+            if (s == "true" || s == "True" || s == "TRUE") { return true; }
+            return false;
+        }
+        if (c0 == 102 || c0 == 70) {
+            if (s == "false" || s == "False" || s == "FALSE") { return true; }
+            return false;
+        }
+        if (c0 == 46 || c0 == 43 || c0 == 45 || (c0 >= 48 && c0 <= 57)) {
+            if (s == ".inf" || s == ".Inf" || s == ".INF"
+                || s == "+.inf" || s == "+.Inf" || s == "+.INF"
+                || s == "-.inf" || s == "-.Inf" || s == "-.INF"
+                || s == ".nan" || s == ".NaN" || s == ".NAN") {
+                return true;
+            }
+            if (IsIntShape(s)) {
+                long v = 0;
+                int i = (c0 == 45 || c0 == 43) ? 1 : 0;
+                if (n > i + 1 && s[i] == 48 && s[i + 1] == 120) {
+                    i = i + 2;
+                    while (i < n) {
+                        int d = HexDigit(s[i] & 255);
+                        if (d < 0 || v > 576460752303423487) { return false; }
+                        v = (v << 4) + d;
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                if (n > i + 1 && s[i] == 48 && s[i + 1] == 111) {
+                    i = i + 2;
+                    while (i < n) {
+                        int c = s[i] & 255;
+                        if (c < 48 || c > 55 || v > 1152921504606846975) { return false; }
+                        v = (v << 3) + (c - 48);
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                while (i < n) {
+                    int c = s[i] & 255;
+                    if (c < 48 || c > 57 || v > 922337203685477579) { return false; }
+                    v = v * 10 + (c - 48);
+                    i = i + 1;
+                }
+                return true;
+            }
+            if (IsFloatShape(s)) { return true; }
+        }
+        return false;
+    }
+
     // plain 标量 → null/bool/int/float/string（core schema，宽松接受
     // True/TRUE 等大小写变体）。公开给写侧复用：ToYaml 判断字符串
     // 是否需要加引号，就看它重新解析会不会变型。
@@ -791,13 +857,13 @@ public class YamlParser {
         }
         if (s == ".inf" || s == ".Inf" || s == ".INF"
             || s == "+.inf" || s == "+.Inf" || s == "+.INF") {
-            return JsonValue.NewDouble(Pow2(1024));
+            return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF0000000000000L));
         }
         if (s == "-.inf" || s == "-.Inf" || s == "-.INF") {
-            return JsonValue.NewDouble(0.0 - Pow2(1024));
+            return JsonValue.NewDouble(0.0 - NativeMemory.AsF64(0x7FF0000000000000L));
         }
         if (s == ".nan" || s == ".NaN" || s == ".NAN") {
-            return JsonValue.NewDouble(Pow2(1024) - Pow2(1024));
+            return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF8000000000000L));
         }
         if (IsIntShape(s)) {
             long v = 0;
@@ -812,8 +878,6 @@ public class YamlParser {
                 while (i < n) {
                     int d = HexDigit(s[i] & 255);
                     if (d < 0) { return JsonValue.NewStr(s); }
-                    // 每步 4 位须留 1 位余量：(2^63-1-15)/16。旧值 2^61-1
-                    // 差 4 倍，0x1FFFFFFFFFFFFFFF0 这类输入漏检、回绕成 -16。
                     if (v > 576460752303423487) { overflow = true; }
                     v = (v << 4) + d;
                     i = i + 1;
@@ -842,18 +906,6 @@ public class YamlParser {
         }
         if (IsFloatShape(s)) { return JsonValue.NewDouble(DoubleOf(s)); }
         return JsonValue.NewStr(s);
-    }
-
-    private static double Pow2(int e) {
-        double v = 1.0;
-        if (e >= 0) {
-            int i = 0;
-            while (i < e) { v = v * 2.0; i = i + 1; }
-        } else {
-            int i = 0;
-            while (i > e) { v = v / 2.0; i = i - 1; }
-        }
-        return v;
     }
 
     private static double DoubleOf(string s) {
@@ -889,17 +941,21 @@ public class YamlParser {
             while (i < n) {
                 int c = s[i] & 255;
                 if (c < 48 || c > 57) { break; }
-                if (ex <= 100000) { ex = ex * 10 + (c - 48); }  // 累加有界，后续数字只消耗
+                if (ex <= 100000) { ex = ex * 10 + (c - 48); }
                 i = i + 1;
             }
-            // 指数钳到 4096：double 范围 ~1e±308，|acc| 非零时 10^4096
-            // 已必然溢到 ±inf（负指数归 0），更大指数乘除结果无可观察
-            // 差异——钳制封死 1e99999999999 这类输入的 2^31 次循环。
-            if (ex > 4096) { ex = 4096; }
-            int k = 0;
-            while (k < ex) {
-                if (eneg) { acc = acc / 10.0; } else { acc = acc * 10.0; }
-                k = k + 1;
+            if (ex > 324) {
+                acc = eneg ? 0.0 : (acc == 0.0 ? 0.0 : NativeMemory.AsF64(0x7FF0000000000000L));
+            } else if (ex > 0) {
+                double p = 1.0;
+                double base10 = 10.0;
+                int e = ex;
+                while (e > 0) {
+                    if ((e & 1) != 0) { p = p * base10; }
+                    base10 = base10 * base10;
+                    e = e >> 1;
+                }
+                acc = eneg ? acc / p : acc * p;
             }
         }
         if (neg) { return 0.0 - acc; }

@@ -109,24 +109,28 @@ public class MemoryCache<TValue> {
             this.Leave();
             return null;
         }
-        long now = MemoryCache<TValue>.NowUs();
-        if (this.slots[i].expiresAtUs != 0 && now >= this.slots[i].expiresAtUs) {
-            this.DropSlot(i);
-            this.stats.expirations = this.stats.expirations + 1;
-            this.stats.misses = this.stats.misses + 1;
-            this.Leave();
-            return null;
+        CacheEntry<TValue> entry = this.slots[i];
+        long exp = entry.expiresAtUs;
+        if (exp != 0 || (this.sliding && this.ttlUs > 0)) {
+            long now = MemoryCache<TValue>.NowUs();
+            if (exp != 0 && now >= exp) {
+                this.DropSlot(i);
+                this.stats.expirations = this.stats.expirations + 1;
+                this.stats.misses = this.stats.misses + 1;
+                this.Leave();
+                return null;
+            }
+            entry.touchedUs = now;
+            if (this.sliding && this.ttlUs > 0) {
+                entry.expiresAtUs = now + this.ttlUs;
+            }
         }
         this.stats.hits = this.stats.hits + 1;
-        this.slots[i].touchedUs = now;
-        if (this.sliding && this.ttlUs > 0) {
-            this.slots[i].expiresAtUs = now + this.ttlUs;
-        }
         if (this.head != i) {
             this.Unlink(i);
             this.LinkHead(i);
         }
-        TValue v = this.slots[i].value;
+        TValue v = entry.value;
         this.Leave();
         return v;
     }
@@ -197,13 +201,18 @@ public class MemoryCache<TValue> {
     // ttlMs <= 0 表示该条不过期（覆盖默认 TTL）。
     public void Set(string key, TValue value, long ttlMs) {
         this.Enter();
-        long now = MemoryCache<TValue>.NowUs();
-        long expiresAt = ttlMs > 0 ? now + ttlMs * 1000 : 0;
+        long now = 0;
+        long expiresAt = 0;
+        if (ttlMs > 0) {
+            now = MemoryCache<TValue>.NowUs();
+            expiresAt = now + ttlMs * 1000;
+        }
         int i = -1;
         if (this.index.TryGetValue(key, out i)) {
-            this.slots[i].value = value;
-            this.slots[i].expiresAtUs = expiresAt;
-            this.slots[i].touchedUs = now;
+            CacheEntry<TValue> entry = this.slots[i];
+            entry.value = value;
+            entry.expiresAtUs = expiresAt;
+            entry.touchedUs = now;
             if (this.head != i) {
                 this.Unlink(i);
                 this.LinkHead(i);
@@ -216,10 +225,11 @@ public class MemoryCache<TValue> {
             this.EvictTail();
         }
         int s = this.AllocSlot();
-        this.slots[s].key = key;
-        this.slots[s].value = value;
-        this.slots[s].expiresAtUs = expiresAt;
-        this.slots[s].touchedUs = now;
+        CacheEntry<TValue> slot = this.slots[s];
+        slot.key = key;
+        slot.value = value;
+        slot.expiresAtUs = expiresAt;
+        slot.touchedUs = now;
         this.LinkHead(s);
         this.index.Add(key, s);
         this.used = this.used + 1;
@@ -268,29 +278,28 @@ public class MemoryCache<TValue> {
         this.Leave();
     }
 
-    // 回收所有已过期的槽位，返回回收个数。不访问的过期项靠它释放。
+    // 回收所有已过期的槽位，返回回收个数（原地释放，零临时 List 分配）。
     public int Sweep() {
         this.Enter();
-        long now = MemoryCache<TValue>.NowUs();
-        List<int> dead = new List<int>();
         int n = this.slots.Count;
-        int i = 0;
-        while (i < n) {
-            string k = this.slots[i].key;
-            if (k != "" && this.slots[i].expiresAtUs != 0 && now >= this.slots[i].expiresAtUs) {
-                dead.Add(i);
-            }
-            i = i + 1;
+        if (this.used == 0 || n == 0) {
+            this.Leave();
+            return 0;
         }
-        int m = dead.Count;
-        i = 0;
-        while (i < m) {
-            this.DropSlot(dead[i]);
-            this.stats.expirations = this.stats.expirations + 1;
-            i = i + 1;
+        long now = MemoryCache<TValue>.NowUs();
+        int swept = 0;
+        List<CacheEntry<TValue>> sl = this.slots;
+        for (int i = 0; i < n; i = i + 1) {
+            CacheEntry<TValue> e = sl[i];
+            long exp = e.expiresAtUs;
+            if (exp != 0 && now >= exp && e.key.Length > 0) {
+                this.DropSlot(i);
+                this.stats.expirations = this.stats.expirations + 1;
+                swept = swept + 1;
+            }
         }
         this.Leave();
-        return m;
+        return swept;
     }
 
     public CacheStats Stats() {
@@ -311,23 +320,25 @@ public class MemoryCache<TValue> {
     private int AllocSlot() {
         if (this.freeHead >= 0) {
             int s = this.freeHead;
-            this.freeHead = this.slots[s].next;
-            this.slots[s].prev = -1;
-            this.slots[s].next = -1;
+            CacheEntry<TValue> e = this.slots[s];
+            this.freeHead = e.next;
+            e.prev = -1;
+            e.next = -1;
             return s;
         }
-        CacheEntry<TValue> e = new CacheEntry<TValue>();
-        this.slots.Add(e);
+        CacheEntry<TValue> ne = new CacheEntry<TValue>();
+        this.slots.Add(ne);
         return this.slots.Count - 1;
     }
 
     private void FreeSlot(int i) {
-        this.slots[i].key = "";
-        this.slots[i].value = null;
-        this.slots[i].expiresAtUs = 0;
-        this.slots[i].touchedUs = 0;
-        this.slots[i].prev = -1;
-        this.slots[i].next = this.freeHead;
+        CacheEntry<TValue> e = this.slots[i];
+        e.key = "";
+        e.value = null;
+        e.expiresAtUs = 0;
+        e.touchedUs = 0;
+        e.prev = -1;
+        e.next = this.freeHead;
         this.freeHead = i;
         this.used = this.used - 1;
     }
@@ -346,19 +357,21 @@ public class MemoryCache<TValue> {
     }
 
     private void LinkHead(int i) {
-        this.slots[i].prev = -1;
-        this.slots[i].next = this.head;
+        CacheEntry<TValue> e = this.slots[i];
+        e.prev = -1;
+        e.next = this.head;
         if (this.head >= 0) { this.slots[this.head].prev = i; }
         this.head = i;
         if (this.tail < 0) { this.tail = i; }
     }
 
     private void Unlink(int i) {
-        int p = this.slots[i].prev;
-        int nx = this.slots[i].next;
+        CacheEntry<TValue> e = this.slots[i];
+        int p = e.prev;
+        int nx = e.next;
         if (p >= 0) { this.slots[p].next = nx; } else { this.head = nx; }
         if (nx >= 0) { this.slots[nx].prev = p; } else { this.tail = p; }
-        this.slots[i].prev = -1;
-        this.slots[i].next = -1;
+        e.prev = -1;
+        e.next = -1;
     }
 }
