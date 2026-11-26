@@ -36,12 +36,19 @@ public class FirefoxBrowser : IBrowserView {
 
     public void ReleaseNative() {
         nativeRevision = nativeRevision + 1;
+        if (this.agent != null) {
+            this.agent.Invalidate();
+            this.agent = null;
+        }
         if (handle != 0) {
             this.Hide();
             if (viewId > 0) { NativeLayer.Forget(viewId); }
             if (FirefoxCore.PfnDestroy != 0) { GeckoActionFn destroy = (GeckoActionFn)FirefoxCore.PfnDestroy; destroy(handle); }
         }
-        handle = 0; viewId = 0; created = false; agent = null;
+        handle = 0; viewId = 0; created = false;
+        this.lastX = -1; this.lastY = -1; this.lastW = -1; this.lastH = -1;
+        this.lastVisible = false; this.boundSyncFrames = 0;
+        if (nativeTarget != null && nativeTarget != "") { this.pendingUrl = nativeTarget; }
         if (nativeEntry != null) { nativeEntry.ForgetHandle(); }
     }
 
@@ -104,12 +111,15 @@ public class FirefoxBrowser : IBrowserView {
     }
 
     public void Navigate(string target) {
-        nativeTarget = target;
+        if (nativeDestroyed) { return; }
+        string url = BrowserUrl.Normalize(target);
+        if (url == "") { return; }
+        nativeTarget = url;
         nativeHtml = "";
-        this.pendingUrl = target;
+        this.pendingUrl = url;
         if (this.handle != 0 && FirefoxCore.PfnNavigate != 0) {
             GeckoNavigateFn fn = (GeckoNavigateFn)FirefoxCore.PfnNavigate;
-            fn(this.handle, target);
+            fn(this.handle, url);
         }
     }
 
@@ -159,15 +169,17 @@ public class FirefoxBrowser : IBrowserView {
     public string CurrentUrl() {
         if (this.handle != 0 && FirefoxCore.PfnGetUrl != 0) {
             GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetUrl;
-            return fn(this.handle);
+            string u = fn(this.handle);
+            return u != null ? u : "";
         }
-        return this.pendingUrl;
+        return this.pendingUrl != null ? this.pendingUrl : "";
     }
 
     public string CurrentTitle() {
         if (this.handle != 0 && FirefoxCore.PfnGetTitle != 0) {
             GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetTitle;
-            return fn(this.handle);
+            string t = fn(this.handle);
+            return t != null ? t : "";
         }
         return "";
     }
@@ -281,22 +293,31 @@ public class FirefoxBrowser : IBrowserView {
             initFn(parentHwnd);
         }
 
+        if (this.fingerprint == null) {
+            this.fingerprint = FingerprintProfile.CleanDefault();
+        }
+        string start = (this.pendingUrl != null && this.pendingUrl != "")
+            ? BrowserUrl.Normalize(this.pendingUrl) : "";
+
         if (this.viewConfig.structSize > 0 && FirefoxCore.PfnCreateViewEx != 0) {
             GeckoCreateViewExFn cfn = (GeckoCreateViewExFn)FirefoxCore.PfnCreateViewEx;
             string profileDir = "profiles/store_" + this.contextId.ToString();
             this.handle = cfn(
                 parentHwnd, x, y, w, h, profileDir, ref this.viewConfig
             );
-            if (this.handle != 0 && this.pendingUrl != "") {
-                this.Navigate(this.pendingUrl);
+            if (this.handle != 0 && start != "") {
+                this.Navigate(start);
             }
         } else if (FirefoxCore.PfnCreateWithContext != 0) {
             GeckoCreateWithContextFn cfn = (GeckoCreateWithContextFn)FirefoxCore.PfnCreateWithContext;
-            string start = (this.pendingUrl != "") ? this.pendingUrl : "about:blank";
+            if (start == "") { start = "about:blank"; }
+            string vendor = this.fingerprint.webglVendor != null ? this.fingerprint.webglVendor : "";
+            string renderer = this.fingerprint.webglRenderer != null ? this.fingerprint.webglRenderer : "";
+            string tz = this.fingerprint.timezone != null ? this.fingerprint.timezone : "";
+            string ua = this.fingerprint.userAgent != null ? this.fingerprint.userAgent : "";
             this.handle = cfn(
                 parentHwnd, x, y, w, h, start, this.contextId,
-                this.fingerprint.webglVendor, this.fingerprint.webglRenderer,
-                this.fingerprint.timezone, this.fingerprint.userAgent
+                vendor, renderer, tz, ua
             );
 
             if (this.handle != 0 && FirefoxCore.PfnSetFingerprint != 0) {

@@ -1,6 +1,9 @@
 using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Text;
+using System.Json;
+using Gui.Component;
 
 namespace Gui.Component.FirefoxBrowser;
 
@@ -59,64 +62,34 @@ public class PageSnapshot {
         PageSnapshot snap = new PageSnapshot();
         if (json == null || json == "") return snap;
 
-        snap.Title = ExtractJsonString(json, "\"title\":\"");
-        snap.Url = ExtractJsonString(json, "\"url\":\"");
-
-        int elemIdx = json.IndexOf("\"elements\":[");
-        if (elemIdx < 0) return snap;
-
-        int cur = elemIdx + 11;
-        while (cur < json.Length) {
-            int startObj = json.IndexOf("{", cur);
-            if (startObj < 0) break;
-            int endObj = json.IndexOf("}", startObj);
-            if (endObj < 0) break;
-
-            string objStr = json.Substring(startObj, endObj - startObj + 1);
-            PageElement el = new PageElement();
-            el.Ref = ExtractJsonString(objStr, "\"ref\":\"");
-            el.Tag = ExtractJsonString(objStr, "\"tag\":\"");
-            el.Type = ExtractJsonString(objStr, "\"type\":\"");
-            el.Text = ExtractJsonString(objStr, "\"text\":\"");
-            el.Selector = ExtractJsonString(objStr, "\"selector\":\"");
-            el.X = ExtractJsonInt(objStr, "\"x\":");
-            el.Y = ExtractJsonInt(objStr, "\"y\":");
-            el.W = ExtractJsonInt(objStr, "\"w\":");
-            el.H = ExtractJsonInt(objStr, "\"h\":");
-
-            snap.Elements.Add(el);
-            cur = endObj + 1;
-        }
-
-        return snap;
-    }
-
-    static string ExtractJsonString(string src, string key) {
-        int k = src.IndexOf(key);
-        if (k < 0) return "";
-        int s = k + key.Length;
-        int e = src.IndexOf("\"", s);
-        if (e < 0) return "";
-        return src.Substring(s, e - s);
-    }
-
-    static int ExtractJsonInt(string src, string key) {
-        int k = src.IndexOf(key);
-        if (k < 0) return 0;
-        int s = k + key.Length;
-        int e = s;
-        while (e < src.Length) {
-            char c = src[e];
-            if ((c >= '0' && c <= '9') || c == '-') {
-                e = e + 1;
-            } else {
-                break;
+        try {
+            JsonValue root = JsonValue.Parse(json);
+            if (root == null || !root.IsObject()) { return snap; }
+            snap.Title = root.Str("title", "");
+            snap.Url = root.Str("url", "");
+            JsonValue elems = root.Get("elements");
+            if (elems != null && elems.IsArray()) {
+                int count = elems.Count();
+                for (int i = 0; i < count; i = i + 1) {
+                    JsonValue item = elems.At(i);
+                    if (item == null || !item.IsObject()) { continue; }
+                    PageElement el = new PageElement();
+                    el.Ref = item.Str("ref", "");
+                    el.Tag = item.Str("tag", "");
+                    el.Type = item.Str("type", "");
+                    el.Text = item.Str("text", "");
+                    el.Selector = item.Str("selector", "");
+                    el.X = item.Int("x", 0);
+                    el.Y = item.Int("y", 0);
+                    el.W = item.Int("w", 0);
+                    el.H = item.Int("h", 0);
+                    snap.Elements.Add(el);
+                }
             }
+        } catch (Exception) {
+            return snap;
         }
-        if (e > s) {
-            return int.Parse(src.Substring(s, e - s));
-        }
-        return 0;
+        return snap;
     }
 }
 
@@ -134,23 +107,34 @@ public class FirefoxAgentTab {
 
     public nint GetHandle() { return this.viewHandle; }
     public int GetContextId() { return this.contextId; }
+    public bool IsValid() { return this.viewHandle != 0; }
+    public void Invalidate() { this.viewHandle = 0; }
+
+    static string JsStr(string s) {
+        if (s == null) { return "\"\""; }
+        return "\"" + Encoding.JsonEscape(s) + "\"";
+    }
 
     public void Navigate(string url) {
         if (this.viewHandle == 0 || FirefoxCore.PfnNavigate == 0) return;
+        string normalized = BrowserUrl.Normalize(url);
+        if (normalized == "") return;
         GeckoNavigateFn fn = (GeckoNavigateFn)FirefoxCore.PfnNavigate;
-        fn(this.viewHandle, url);
+        fn(this.viewHandle, normalized);
     }
 
     public string Title() {
         if (this.viewHandle == 0 || FirefoxCore.PfnGetTitle == 0) return "";
         GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetTitle;
-        return fn(this.viewHandle);
+        string t = fn(this.viewHandle);
+        return t != null ? t : "";
     }
 
     public string Url() {
         if (this.viewHandle == 0 || FirefoxCore.PfnGetUrl == 0) return "";
         GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetUrl;
-        return fn(this.viewHandle);
+        string u = fn(this.viewHandle);
+        return u != null ? u : "";
     }
 
     public int SendSnapshot() {
@@ -158,13 +142,13 @@ public class FirefoxAgentTab {
     }
 
     public int SendFill(string targetRefOrSel, string text) {
-        string clean = text.Replace("'", "\\'");
-        string js = "window.ZanAgent ? ZanAgent.fill('" + targetRefOrSel + "', '" + clean + "') : false";
+        string js = "window.ZanAgent ? ZanAgent.fill(" + JsStr(targetRefOrSel)
+            + ", " + JsStr(text) + ") : false";
         return this.ExecuteScriptAsync(js);
     }
 
     public int SendClick(string targetRefOrSel) {
-        string js = "window.ZanAgent ? ZanAgent.click('" + targetRefOrSel + "') : false";
+        string js = "window.ZanAgent ? ZanAgent.click(" + JsStr(targetRefOrSel) + ") : false";
         return this.ExecuteScriptAsync(js);
     }
 
@@ -174,6 +158,7 @@ public class FirefoxAgentTab {
 
     public int ExecuteScriptAsync(string script) {
         if (this.viewHandle == 0 || FirefoxCore.PfnExecuteScript == 0) return -1;
+        if (script == null || script == "") return -1;
         this.nextEvalId = this.nextEvalId + 1;
         int id = this.nextEvalId;
         GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)FirefoxCore.PfnExecuteScript;
@@ -182,19 +167,20 @@ public class FirefoxAgentTab {
     }
 
     public bool IsDone(int evalId) {
-        if (FirefoxCore.PfnGetLastEvalId == 0) return false;
+        if (this.viewHandle == 0 || FirefoxCore.PfnGetLastEvalId == 0) return false;
         GeckoGetIntFn fn = (GeckoGetIntFn)FirefoxCore.PfnGetLastEvalId;
         return fn(this.viewHandle) == evalId;
     }
 
     public string GetResult() {
-        if (FirefoxCore.PfnGetLastEvalResult == 0) return "";
+        if (this.viewHandle == 0 || FirefoxCore.PfnGetLastEvalResult == 0) return "";
         GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetLastEvalResult;
-        return fn(this.viewHandle);
+        string r = fn(this.viewHandle);
+        return r != null ? r : "";
     }
 
     public bool GetSuccess() {
-        if (FirefoxCore.PfnGetLastEvalSuccess == 0) return false;
+        if (this.viewHandle == 0 || FirefoxCore.PfnGetLastEvalSuccess == 0) return false;
         GeckoGetBoolFn fn = (GeckoGetBoolFn)FirefoxCore.PfnGetLastEvalSuccess;
         return fn(this.viewHandle);
     }
@@ -203,8 +189,10 @@ public class FirefoxAgentTab {
     public async Task<string> EvalAsync(string script, int timeoutMs = 8000) {
         int id = this.ExecuteScriptAsync(script);
         if (id < 0) return "";
+        if (timeoutMs <= 0) { timeoutMs = 1; }
         int elapsed = 0;
         while (elapsed < timeoutMs) {
+            if (this.viewHandle == 0) { return ""; }
             if (this.IsDone(id)) {
                 return this.GetResult();
             }
@@ -222,79 +210,76 @@ public class FirefoxAgentTab {
 
     // 异步智能拟人点击 (三次贝塞尔轨迹 + 菲茨定律加减速 + 悬停 + 物理按压时长 + 遮挡探测)
     public async Task<bool> ClickAsync(string refOrSel, int timeoutMs = 8000) {
-        string clean = refOrSel.Replace("'", "\\'");
-        string script = "ZanAgent.click('" + clean + "');";
+        string script = "ZanAgent.click(" + JsStr(refOrSel) + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }
 
     // 异步智能表单直填 (穿透 React/Vue 双向绑定 Setter 并派发完整 InputEvent)
     public async Task<bool> FillAsync(string refOrSel, string text, int timeoutMs = 8000) {
-        string cleanSel = refOrSel.Replace("'", "\\'");
-        string cleanText = text.Replace("'", "\\'");
-        string script = "ZanAgent.fill('" + cleanSel + "', '" + cleanText + "');";
+        string script = "ZanAgent.fill(" + JsStr(refOrSel) + ", " + JsStr(text) + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }
 
     // 异步拟人逐字敲击 (模拟人类击键时序与高斯分布节奏抖动，突破前端击键生物识别)
     public async Task<bool> TypeAsync(string refOrSel, string text, int timeoutMs = 12000) {
-        string cleanSel = refOrSel.Replace("'", "\\'");
-        string cleanText = text.Replace("'", "\\'");
-        string script = "ZanAgent.type('" + cleanSel + "', '" + cleanText + "');";
+        string script = "ZanAgent.type(" + JsStr(refOrSel) + ", " + JsStr(text) + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }
 
     // 异步平滑鼠标移动 (三次贝塞尔曲线 + 菲茨加减速 + 生理微震颤)
     public async Task<bool> MouseMoveAsync(string target, int timeoutMs = 8000) {
-        string clean = target.Replace("'", "\\'");
-        string script = "ZanAgent.mouseMove('" + clean + "');";
+        string script = "ZanAgent.mouseMove(" + JsStr(target) + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }
 
     // 异步滑块验证码拖拽 (非匀速物理加速+减速+微波浪 Y 轴微动)
     public async Task<bool> DragAsync(string target, int offsetX, int offsetY = 0, int timeoutMs = 8000) {
-        string clean = target.Replace("'", "\\'");
-        string script = "ZanAgent.drag('" + clean + "', " + offsetX.ToString() + ", " + offsetY.ToString() + ");";
+        string script = "ZanAgent.drag(" + JsStr(target) + ", "
+            + offsetX.ToString() + ", " + offsetY.ToString() + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }
 
     // 异步抗网页改版选项匹配 (Picker-Rank 7级平滑阶梯，支持原生与现代化框架自定义 Select)
     public async Task<string> SelectOptionAsync(string target, string wanted, int timeoutMs = 8000) {
-        string cleanTarget = target.Replace("'", "\\'");
-        string cleanWanted = wanted.Replace("'", "\\'");
-        string script = "ZanAgent.selectOption('" + cleanTarget + "', '" + cleanWanted + "');";
+        string script = "ZanAgent.selectOption(" + JsStr(target) + ", " + JsStr(wanted) + ");";
         return await this.EvalAsync(script, timeoutMs);
     }
 
     // 异步真实可见文本提取 (过滤 -9999px / clip 等防爬虫蜜罐文本陷阱)
     public async Task<string> VisibleTextAsync(string target, int timeoutMs = 8000) {
-        string clean = target.Replace("'", "\\'");
-        string script = "ZanAgent.visibleText('" + clean + "');";
+        string script = "ZanAgent.visibleText(" + JsStr(target) + ");";
         return await this.EvalAsync(script, timeoutMs);
     }
 
     // 异步多行结构化批量采集 (一次性抽取多行数据为 JSON，0 次多余 IPC 开销)
     public async Task<string> ReadRowsAsync(string rowSelector, string fieldMapJson, int limit = 100, int timeoutMs = 10000) {
-        string cleanRow = rowSelector.Replace("'", "\\'");
-        string script = "ZanAgent.readRows('" + cleanRow + "', " + fieldMapJson + ", { limit: " + limit.ToString() + " });";
+        string mapArg = (fieldMapJson != null && fieldMapJson != "") ? fieldMapJson : "{}";
+        int safeLimit = limit < 0 ? 0 : limit;
+        string script = "ZanAgent.readRows(" + JsStr(rowSelector) + ", " + mapArg
+            + ", { limit: " + safeLimit.ToString() + " });";
         return await this.EvalAsync(script, timeoutMs);
     }
 
     // 异步结果驱动全分支竞速等待状态机 (成功/报错/消失/跳转全分支竞速，抛弃低效 Sleep)
     public async Task<string> WaitForOutcomeAsync(string success = "", string error = "", string gone = "", string url = "", int timeoutMs = 10000) {
-        string script = "ZanAgent.waitForOutcome({";
+        int safeTimeout = timeoutMs < 0 ? 0 : timeoutMs;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("ZanAgent.waitForOutcome({");
         bool hasField = false;
-        if (success != "") { script = script + " success: '" + success.Replace("'", "\\'") + "'"; hasField = true; }
-        if (error != "") { if (hasField) script = script + ","; script = script + " error: '" + error.Replace("'", "\\'") + "'"; hasField = true; }
-        if (gone != "") { if (hasField) script = script + ","; script = script + " gone: '" + gone.Replace("'", "\\'") + "'"; hasField = true; }
-        if (url != "") { if (hasField) script = script + ","; script = script + " url: '" + url.Replace("'", "\\'") + "'"; hasField = true; }
-        if (hasField) script = script + ",";
-        script = script + " timeoutMs: " + timeoutMs.ToString() + " });";
-        return await this.EvalAsync(script, timeoutMs + 1000);
+        if (success != null && success != "") { sb.Append(" success: "); sb.Append(JsStr(success)); hasField = true; }
+        if (error != null && error != "") { if (hasField) { sb.Append(","); } sb.Append(" error: "); sb.Append(JsStr(error)); hasField = true; }
+        if (gone != null && gone != "") { if (hasField) { sb.Append(","); } sb.Append(" gone: "); sb.Append(JsStr(gone)); hasField = true; }
+        if (url != null && url != "") { if (hasField) { sb.Append(","); } sb.Append(" url: "); sb.Append(JsStr(url)); hasField = true; }
+        if (hasField) { sb.Append(","); }
+        sb.Append(" timeoutMs: ");
+        sb.Append(safeTimeout.ToString());
+        sb.Append(" });");
+        return await this.EvalAsync(sb.ToString(), safeTimeout + 1000);
     }
 
     // 异步平滑页面滚动
@@ -306,10 +291,9 @@ public class FirefoxAgentTab {
 
     // 异步注入内存级网络 Mock 响应 (离线注入响应、解密脱壳或替换验证码图片)
     public async Task<bool> MockResourceAsync(string urlPattern, string responseBody, string contentType = "application/json", int timeoutMs = 5000) {
-        string cleanPat = urlPattern.Replace("'", "\\'");
-        string cleanBody = responseBody.Replace("'", "\\'");
-        string cleanType = contentType.Replace("'", "\\'");
-        string script = "ZanAgent.mockResource('" + cleanPat + "', '" + cleanBody + "', '" + cleanType + "');";
+        string ct = (contentType != null && contentType != "") ? contentType : "application/json";
+        string script = "ZanAgent.mockResource(" + JsStr(urlPattern) + ", "
+            + JsStr(responseBody) + ", " + JsStr(ct) + ");";
         string res = await this.EvalAsync(script, timeoutMs);
         return res == "true" || res == "ok";
     }

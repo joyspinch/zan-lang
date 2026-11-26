@@ -32,6 +32,11 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
     public int EntryCount() { return entries.Count; }
 
     public static BrowserNativeLoop For(App app) {
+        if (app == null) {
+            BrowserNativeLoop detached = new BrowserNativeLoop();
+            detached.stopped = true;
+            return detached;
+        }
         AppLoopParticipant existing = app.FindLoopService("Gui.Component.BrowserNativeLoop");
         if (existing is BrowserNativeLoop) { return (BrowserNativeLoop)existing; }
         BrowserNativeLoop loop = new BrowserNativeLoop();
@@ -73,11 +78,11 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
     public int NextDeadline() { return deadline; }
 
     void WorkOnce(App app) {
-        int turn = app.LoopTurnIdentity();
+        int turn = app != null ? app.LoopTurnIdentity() : 0;
         if (turn != 0) {
             App root = ChildWindows.LoopRoot(app);
             if (workLoop == null || workLoop.Root != root) { workLoop = CefWorkLoop.For(root); }
-            if (!workLoop.TryEnter(turn)) { return; }
+            if (workLoop != null && !workLoop.TryEnter(turn)) { return; }
         }
         // Turn zero deliberately pumps on every call without changing the
         // shared nonzero claim, including reentrant shutdown of another App.
@@ -96,14 +101,15 @@ public class BrowserNativeLoop : AppLoopParticipant, AppLoopService, AppLoopStop
         int wake = wakeGeneration;
         try {
             // Create/bounds before Work; poll events only after the engine turn.
-            for (int i = 0; i < count && !stopped; i = i + 1) {
+            for (int i = 0; i < count && i < entries.Count && !stopped; i = i + 1) {
                 BrowserNativeEntry entry = entries[i];
                 if (!entry.Prepare(app)) { continue; }
                 if (entry.HasCef()) { cefActive = true; }
             }
             if ((cefActive || closing.Count > 0) && !stopped) { WorkOnce(app); }
-            for (int i = 0; i < count && !stopped; i = i + 1) {
+            for (int i = 0; i < count && i < entries.Count && !stopped; i = i + 1) {
                 BrowserNativeEntry entry = entries[i];
+                if (entry.retired) { continue; }
                 if (entry.Poll(app)) { busy = true; }
             }
             for (int i = closing.Count - 1; i >= 0; i = i - 1) {

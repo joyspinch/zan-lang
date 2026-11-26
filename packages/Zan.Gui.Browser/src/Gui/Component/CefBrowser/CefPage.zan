@@ -10,6 +10,22 @@ namespace Gui.Component.CefBrowser;
 // <code>
 // page.AutoDismissDialogs(true);   // alert/confirm 一律确定，避免页面卡住
 // </code>
+internal class CefPageDialogRelay {
+    private weak CefPage owner;
+
+    internal CefPageDialogRelay(CefPage owner) {
+        this.owner = owner;
+    }
+
+    internal void Handle(string json) {
+        CefPage page = this.owner;
+        if (page == null || page.cdp == null) { return; }
+        page.cdp.Send("Page.handleJavaScriptDialog",
+            page.dialogAccept ? "{\"accept\":true}" : "{\"accept\":false}",
+            null);
+    }
+}
+
 public class CefPage {
     public CefCdp cdp;
     public bool pageOn;
@@ -25,7 +41,7 @@ public class CefPage {
 
     // Page 域的事件要先 enable。
     public void EnsurePage() {
-        if (pageOn) { return; }
+        if (pageOn || cdp == null) { return; }
         cdp.Enable("Page");
         pageOn = true;
     }
@@ -38,19 +54,21 @@ public class CefPage {
     // guid/url/文件名/进度/状态）。默认 Chromium 在无 UI 的嵌入场景里是拒绝
     // 下载的，所以不调这个就不会有文件落盘。
     public void AllowDownloads(string dir, CdpEventFn onEvent) {
+        if (cdp == null) { return; }
         if (onEvent != null) {
             cdp.On("Browser.downloadWillBegin", onEvent);
             cdp.On("Browser.downloadProgress", onEvent);
         }
         JsonValue p = JsonValue.NewObject();
         p.PutStr("behavior", "allow");
-        p.PutStr("downloadPath", dir);
+        p.PutStr("downloadPath", dir != null ? dir : "");
         p.PutBool("eventsEnabled", true);
         cdp.Send("Browser.setDownloadBehavior", p.ToJson(), null);
     }
 
     // 拒绝一切下载。
     public void DenyDownloads() {
+        if (cdp == null) { return; }
         JsonValue p = JsonValue.NewObject();
         p.PutStr("behavior", "deny");
         cdp.Send("Browser.setDownloadBehavior", p.ToJson(), null);
@@ -58,6 +76,7 @@ public class CefPage {
 
     // 取消一个正在进行的下载（guid 来自下载事件）。
     public void CancelDownload(string guid) {
+        if (cdp == null || guid == null || guid == "") { return; }
         JsonValue p = JsonValue.NewObject();
         p.PutStr("guid", guid);
         cdp.Send("Browser.cancelDownload", p.ToJson(), null);
@@ -70,23 +89,21 @@ public class CefPage {
     // 嵌入式浏览器里这些对话框默认没人应答，页面会一直停在那儿。
     public void AutoDismissDialogs(bool accept) {
         dialogAccept = accept;
+        if (cdp == null) { return; }
         EnsurePage();
         if (dialogAuto) { return; }
         dialogAuto = true;
-        cdp.On("Page.javascriptDialogOpening", (json) => {
-            cdp.Send("Page.handleJavaScriptDialog",
-                     dialogAccept ? "{\"accept\":true}" : "{\"accept\":false}",
-                     null);
-        });
+        cdp.On("Page.javascriptDialogOpening", new CefPageDialogRelay(this).Handle);
     }
 
     // 自己应答一个打开着的对话框（配合
     // <see cref="CefCdp.On"/> 订阅 `Page.javascriptDialogOpening` 时用）；
     // <paramref name="promptText"/> 只对 prompt 有意义。
     public void AnswerDialog(bool accept, string promptText) {
+        if (cdp == null) { return; }
         JsonValue p = JsonValue.NewObject();
         p.PutBool("accept", accept);
-        if (promptText != "") { p.PutStr("promptText", promptText); }
+        if (promptText != null && promptText != "") { p.PutStr("promptText", promptText); }
         cdp.Send("Page.handleJavaScriptDialog", p.ToJson(), null);
     }
 
@@ -95,6 +112,7 @@ public class CefPage {
     // 订阅页面 console：`Runtime.consoleAPICalled`（console.log 一族）
     // 与 `Log.entryAdded`（浏览器自己的告警，如 CSP、404）。
     public void OnConsole(CdpEventFn onEvent) {
+        if (cdp == null) { return; }
         cdp.On("Runtime.consoleAPICalled", onEvent);
         cdp.On("Log.entryAdded", onEvent);
         cdp.Enable("Runtime");
@@ -103,6 +121,7 @@ public class CefPage {
 
     // 订阅未捕获异常（`Runtime.exceptionThrown`）。
     public void OnException(CdpEventFn onEvent) {
+        if (cdp == null) { return; }
         cdp.On("Runtime.exceptionThrown", onEvent);
         cdp.Enable("Runtime");
     }
@@ -113,6 +132,7 @@ public class CefPage {
     // `Network.responseReceived`、`Network.loadingFailed`）。要改写或拦截请求
     // 得用 Fetch 域，自己 <see cref="CefCdp.On"/> + `Fetch.continueRequest`。
     public void OnNetwork(CdpEventFn onEvent) {
+        if (cdp == null) { return; }
         cdp.On("Network.requestWillBeSent", onEvent);
         cdp.On("Network.responseReceived", onEvent);
         cdp.On("Network.loadingFailed", onEvent);
@@ -121,18 +141,20 @@ public class CefPage {
 
     // 覆盖 User-Agent（空串还原）。
     public void SetUserAgent(string ua) {
+        if (cdp == null) { return; }
         cdp.Enable("Network");
         JsonValue p = JsonValue.NewObject();
-        p.PutStr("userAgent", ua);
+        p.PutStr("userAgent", ua != null ? ua : "");
         cdp.Send("Network.setUserAgentOverride", p.ToJson(), null);
     }
 
     // 附加 HTTP 头（JSON 对象，如
     // `{"X-Token":"abc"}`）；`{}` 清空。
     public void SetExtraHeaders(string headersJson) {
+        if (cdp == null) { return; }
         cdp.Enable("Network");
         JsonValue p = JsonValue.NewObject();
-        p.PutJson("headers", headersJson);
+        p.PutJson("headers", (headersJson != null && headersJson != "") ? headersJson : "{}");
         cdp.Send("Network.setExtraHTTPHeaders", p.ToJson(), null);
     }
 }

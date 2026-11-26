@@ -160,7 +160,7 @@ public class CefBrowser : IBrowserView {
         try {
         if (created) { return; }
         if (app == null) { app = App.FrameApp(); }
-        if (app == null) { supported = false; return; }
+        if (app == null || app.window == null) { supported = false; return; }
         if (!CefHost.IsRunning()) {
             // CEF 还没起来（宿主没调 CefHost.StartAsync，或运行时下载失败）：
             // 不标记 created，下一帧再试，这样“下载完成后自动出现”成立。
@@ -184,9 +184,11 @@ public class CefBrowser : IBrowserView {
 
     // 导航到 URL。无协议的裸主机名视为 https://。
     public void Navigate(string target) {
-        nativeTarget = CefBrowser.Normalize(target);
-        nativeHtml = "";
+        if (nativeDestroyed) { return; }
         string u = CefBrowser.Normalize(target);
+        if (u == "") { return; }
+        nativeTarget = u;
+        nativeHtml = "";
         if (handle == 0) {
             pendingUrl = u;
             return;
@@ -243,7 +245,7 @@ public class CefBrowser : IBrowserView {
     // 在页面里执行 JavaScript（不取返回值）。要拿结果用
     // <see cref="Evaluate"/>（走 CDP）。
     public void ExecuteJs(string code) {
-        if (handle != 0) { CefBackend.ExecuteJs(handle, code, "", 0); }
+        if (handle != 0 && code != null && code != "") { CefBackend.ExecuteJs(handle, code, "", 0); }
     }
 
     // 键盘焦点交给/收回浏览器。
@@ -266,7 +268,7 @@ public class CefBrowser : IBrowserView {
 
     public void SyncFocus(App app) {
         if (app == null) { app = App.FrameApp(); }
-        if (app == null || handle == 0) { return; }
+        if (app == null || app.focus == null || handle == 0) { return; }
         bool gui = app.focus.focusedId >= 0;
         if (gui != guiHadFocus) {
             guiHadFocus = gui;
@@ -274,8 +276,9 @@ public class CefBrowser : IBrowserView {
         }
         if (!gui) { return; }
         #if WINDOWS
+        if (app.window == null) { return; }
         nint host = app.window.GetHandle();
-        if (CefBrowser.Win32GetFocus() != host) {
+        if (host != 0 && CefBrowser.Win32GetFocus() != host) {
             CefBrowser.Win32SetFocus(host);
         }
         #endif
@@ -285,13 +288,14 @@ public class CefBrowser : IBrowserView {
     // <see cref="TakeCdpMessage"/> 取，因此调用是异步的：
     // // 之后的帧里
     public int SendCdp(string method, string paramsJson) {
-        if (handle == 0) { return 0; }
-        return CefBackend.CdpSend(handle, method, paramsJson);
+        if (handle == 0 || method == null || method == "") { return 0; }
+        return CefBackend.CdpSend(handle, method, paramsJson != null ? paramsJson : "{}");
     }
 
     // 用 CDP 求值一个 JavaScript 表达式，返回其消息 id：结果会以
     // Runtime.evaluate 的回复出现在 <see cref="TakeCdpMessage"/> 里。
     public int Evaluate(string expression) {
+        if (expression == null || expression == "") { return 0; }
         JsonValue p = JsonValue.NewObject();
         p.PutStr("expression", expression);
         p.PutBool("returnByValue", true);
@@ -336,7 +340,7 @@ public class CefBrowser : IBrowserView {
     // 页内查找并高亮。第一次调用 findNext 传 false（开一次新搜索），之后
     // 传 true 在同一批命中之间前后跳；<see cref="StopFind"/> 收尾。
     public void Find(string text, bool forward, bool matchCase, bool findNext) {
-        if (handle != 0) {
+        if (handle != 0 && text != null) {
             CefBackend.Find(handle, text, forward, matchCase, findNext);
         }
     }
@@ -426,6 +430,8 @@ public class CefBrowser : IBrowserView {
     // App 停止后的最终排空由进程级 CefHost.Shutdown 负责。
     public void Destroy() {
         nativeDestroyed = true;
+        popupSink = null;
+        if (cdpRouter != null) { cdpRouter.Clear(); }
         BrowserNativeEntry previous = nativeEntry;
         if (previous != null && !previous.retired) { previous.Retire(null); }
         else { this.ReleaseNative(); }
@@ -507,7 +513,7 @@ public class CefBrowser : IBrowserView {
         }
         // 浏览器画面变化不会经过 Zan 的重绘逻辑，但原生窗口是自己刷新的，
         // 这里只在有语义变化时请求重绘（省电）。
-        if (dirty) { app.RequestRedraw(); }
+        if (dirty && app != null) { app.RequestRedraw(); }
 
         }
 

@@ -6,22 +6,106 @@ namespace Gui.Component;
 // 浏览器组件 URL 补全与数据转义公共工具类。
 // 收拢 CefBrowser / FfBrowser / WebView 三家重复实现的协议探测与 data: URL 转义。
 public class BrowserUrl {
-    // 导航目标补全：没有协议前缀的裸地址加 `https://`。
+    // 导航目标补全：去首尾空白与控制字符、拦截危险脚本协议、
+    // 规范协议前缀小写、处理 // 协议相对地址、裸地址补 `https://`。
     public static string Normalize(string target) {
-        if (target == "") { return ""; }
-        if (BrowserUrl.HasScheme(target)) { return target; }
-        return "https://" + target;
+        if (target == null) { return ""; }
+        string s = BrowserUrl.TrimAscii(target);
+        if (s == "") { return ""; }
+        string clean = BrowserUrl.StripControl(s);
+        if (clean == "") { return ""; }
+        string probeScheme = BrowserUrl.SchemePrefix(clean);
+        if (probeScheme == "javascript" || probeScheme == "vbscript") {
+            return "";
+        }
+        if (probeScheme == "data") {
+            // data: 载荷中允许保留原文（如内联 HTML 换行），仅归一协议小写。
+            string rawScheme = BrowserUrl.SchemePrefix(s);
+            if (rawScheme == "data") {
+                if (s.StartsWith("data:")) { return s; }
+                return "data" + s.Substring(4, s.Length - 4);
+            }
+            if (clean.StartsWith("data:")) { return clean; }
+            return "data" + clean.Substring(4, clean.Length - 4);
+        }
+        s = clean;
+        if (BrowserUrl.HasScheme(s)) {
+            if (s.StartsWith(probeScheme + ":")) { return s; }
+            return probeScheme + s.Substring(probeScheme.Length,
+                s.Length - probeScheme.Length);
+        }
+        if (s.StartsWith("//")) { return "https:" + s; }
+        return "https://" + s;
     }
 
-    // 是否带协议前缀（"://"，或 data:/about: 这类无 // 的 scheme）。
+    // 是否带合法协议前缀（RFC 3986 §3.1：首字符字母，后接字母/数字/+/-/.，
+    // 紧跟 "://"，或大小写无关的 data:/about:）。
     public static bool HasScheme(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        string scheme = BrowserUrl.SchemePrefix(s);
+        if (scheme == "") { return false; }
+        if (scheme == "data" || scheme == "about") { return true; }
+        int colon = scheme.Length;
+        return colon + 2 < s.Length
+            && s[colon + 1] == '/'
+            && s[colon + 2] == '/';
+    }
+
+    // 提取开头符合 RFC 3986 §3.1 的协议名（小写）；不符合返回 ""。
+    static string SchemePrefix(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        int c0 = s[0] & 255;
+        bool alpha0 = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
+        if (!alpha0) { return ""; }
         int n = s.Length;
-        for (int i = 0; i + 2 < n; i = i + 1) {
-            if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+        for (int i = 1; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 58) {
+                return s.Substring(0, i).ToLower();
+            }
+            bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46;
+            if (!ok) { return ""; }
         }
-        if (s.StartsWith("data:")) { return true; }
-        if (s.StartsWith("about:")) { return true; }
-        return false;
+        return "";
+    }
+
+    static string TrimAscii(string s) {
+        int start = 0;
+        int end = s.Length;
+        while (start < end) {
+            int c = s[start] & 255;
+            if (c <= 32 || c == 127) { start = start + 1; }
+            else { break; }
+        }
+        while (end > start) {
+            int c = s[end - 1] & 255;
+            if (c <= 32 || c == 127) { end = end - 1; }
+            else { break; }
+        }
+        if (start == 0 && end == s.Length) { return s; }
+        return s.Substring(start, end - start);
+    }
+
+    static string StripControl(string s) {
+        int len = s.Length;
+        bool hasCtrl = false;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 32 || c == 127) { hasCtrl = true; break; }
+        }
+        if (!hasCtrl) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int start = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 32 || c == 127) {
+                if (i > start) { sb.Append(s.Substring(start, i - start)); }
+                start = i + 1;
+            }
+        }
+        if (start < len) { sb.Append(s.Substring(start, len - start)); }
+        return sb.ToString();
     }
 
     // data: URL 里必须转义的字符（其余按 UTF-8 原样传，Chromium 与 Gecko 均接受）。
@@ -31,7 +115,8 @@ public class BrowserUrl {
         bool hasBad = false;
         for (int j = 0; j < len; j = j + 1) {
             int c = s[j] & 255;
-            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32) {
+            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32
+                || c == 10 || c == 13) {
                 hasBad = true;
                 break;
             }
@@ -41,7 +126,8 @@ public class BrowserUrl {
         int start = 0;
         for (int i = 0; i < len; i = i + 1) {
             int c = s[i] & 255;
-            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32) {
+            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32
+                || c == 10 || c == 13) {
                 if (i > start) {
                     sb.Append(s.Substring(start, i - start));
                 }
@@ -49,6 +135,8 @@ public class BrowserUrl {
                 else if (c == 37) { sb.Append("%25"); }
                 else if (c == 38) { sb.Append("%26"); }
                 else if (c == 63) { sb.Append("%3F"); }
+                else if (c == 10) { sb.Append("%0A"); }
+                else if (c == 13) { sb.Append("%0D"); }
                 else { sb.Append("%20"); }
                 start = i + 1;
             }

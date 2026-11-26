@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace Gui.Component.FirefoxBrowser;
 
@@ -70,23 +72,45 @@ public class FirefoxCore {
     public static nint PfnGetFingerprint = 0;
     public static nint PfnShrinkMemory = 0;
 
+    static void AddSearchPath(List<string> paths, string p) {
+        if (p == null || p == "") { return; }
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (paths[i] == p) { return; }
+        }
+        paths.Add(p);
+    }
+
+    static nint LoadFromDir(string dir, string fullPath) {
+        #if WINDOWS
+        SetDllDirectoryA(dir);
+        try {
+            return Interop.Load(fullPath);
+        } finally {
+            SetDllDirectoryA(null);
+        }
+        #else
+        return Interop.Load(fullPath);
+        #endif
+    }
+
     public static bool EnsureLoaded() {
         if (loaded) return (XulMod != 0 || EmbedMod != 0);
         loaded = true;
 
-        string[] searchPaths = new string[] {
-            "D:/project/firefox/sdk/bin/Release",
-            "D:/project/firefox/sdk/bin",
-            "D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin",
-            "D:/project/firefox/dist/bin",
-            "D:/project/firefox/dist/zan-browser-windows-x64",
-            "./",
-            "./bin",
-            "../dist/zan-browser-windows-x64",
-            "/Applications/Firefox.app/Contents/MacOS",
-            "/usr/lib/firefox",
-            "/usr/local/lib"
-        };
+        List<string> searchPaths = new List<string>();
+        AddSearchPath(searchPaths, Environment.GetEnvironmentVariable("ZAN_FIREFOX_DIR"));
+        AddSearchPath(searchPaths, Environment.GetEnvironmentVariable("GECKO_DIR"));
+        string appDir = ProcessHost.AppDir();
+        if (appDir != null && appDir != "") {
+            AddSearchPath(searchPaths, appDir);
+            AddSearchPath(searchPaths, Path.Combine(appDir, "bin"));
+        }
+        AddSearchPath(searchPaths, "./");
+        AddSearchPath(searchPaths, "./bin");
+        AddSearchPath(searchPaths, "../dist/zan-browser-windows-x64");
+        AddSearchPath(searchPaths, "/Applications/Firefox.app/Contents/MacOS");
+        AddSearchPath(searchPaths, "/usr/lib/firefox");
+        AddSearchPath(searchPaths, "/usr/local/lib");
 
         string[] embedNames = new string[] {
             "gecko_embed.dll",
@@ -104,15 +128,12 @@ public class FirefoxCore {
         };
 
         // 优先加载高可配置化控制器 gecko_embed (.dll / .dylib / .so)
-        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+        for (int i = 0; i < searchPaths.Count; i = i + 1) {
             string p = searchPaths[i];
             for (int j = 0; j < embedNames.Length; j = j + 1) {
                 string embedPath = Path.Combine(p, embedNames[j]);
                 if (File.Exists(embedPath)) {
-                    #if WINDOWS
-                    SetDllDirectoryA(p);
-                    #endif
-                    EmbedMod = Interop.Load(embedPath);
+                    EmbedMod = LoadFromDir(p, embedPath);
                     if (EmbedMod != 0) {
                         Console.WriteLine("[FirefoxCore] Loaded gecko_embed from: " + embedPath);
                         PfnCreateViewEx = Interop.Symbol(EmbedMod, "gecko_create_view_ex");
@@ -125,15 +146,12 @@ public class FirefoxCore {
         }
 
         // 加载核心 xul 动态库
-        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+        for (int i = 0; i < searchPaths.Count; i = i + 1) {
             string p = searchPaths[i];
             for (int j = 0; j < xulNames.Length; j = j + 1) {
                 string xulPath = Path.Combine(p, xulNames[j]);
                 if (File.Exists(xulPath)) {
-                    #if WINDOWS
-                    SetDllDirectoryA(p);
-                    #endif
-                    XulMod = Interop.Load(xulPath);
+                    XulMod = LoadFromDir(p, xulPath);
                     if (XulMod != 0) {
                         Console.WriteLine("[FirefoxCore] Loaded xul from: " + xulPath);
                         ResolveSymbols();
@@ -186,6 +204,6 @@ public class FirefoxCore {
     public static void ApplyClip(int viewId, string spec) {
         if (viewId <= 0 || PfnSetClipById == 0) return;
         GeckoClipByIdFn fn = (GeckoClipByIdFn)PfnSetClipById;
-        fn(viewId, spec);
+        fn(viewId, spec != null ? spec : "");
     }
 }

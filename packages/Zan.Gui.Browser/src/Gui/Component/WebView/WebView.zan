@@ -116,7 +116,7 @@ public class WebView : IBrowserView {
     // 该 id。
     public WebView(string profileId) {
         this.handle = 0;
-        this.profileId = profileId;
+        this.profileId = profileId != null ? profileId : "";
         this.created = false;
         this.supported = true;
         this.lastNavSeq = 0;
@@ -169,7 +169,7 @@ public class WebView : IBrowserView {
         try {
         if (created) { return; }
         if (app == null) { app = App.FrameApp(); }
-        if (app == null) { supported = false; return; }
+        if (app == null || app.window == null) { supported = false; return; }
         created = true;
         handle = WebViewBackend.Create(app.window.GetHandle(), profileId);
         if (handle == 0) {
@@ -247,9 +247,11 @@ public class WebView : IBrowserView {
     // 创建前调用会把地址挂起，创建时自动消费（后调的 LoadHtml 会
     // 覆盖挂起的 Navigate，反之亦然）。
     public void Navigate(string target) {
-        nativeTarget = WebView.Normalize(target);
-        nativeHtml = "";
+        if (nativeDestroyed) { return; }
         string u = WebView.Normalize(target);
+        if (u == "") { return; }
+        nativeTarget = u;
+        nativeHtml = "";
         if (!created || !supported) {
             pendingUrl = u;
             pendingHtml = "";
@@ -261,14 +263,17 @@ public class WebView : IBrowserView {
     // 加载内存中的 HTML 字符串（baseUrl 解析相对链接；可为
     // ""）。原生视图创建前调用同样挂起，创建时消费。
     public void LoadHtml(string html, string baseUrl) {
-        nativeHtml = html; nativeBase = baseUrl; nativeTarget = "";
+        if (nativeDestroyed) { return; }
+        string safeHtml = html != null ? html : "";
+        string safeBase = baseUrl != null ? baseUrl : "";
+        nativeHtml = safeHtml; nativeBase = safeBase; nativeTarget = "";
         if (!created || !supported) {
-            pendingHtml = html;
-            pendingBase = baseUrl;
+            pendingHtml = safeHtml;
+            pendingBase = safeBase;
             pendingUrl = "";
             return;
         }
-        WebViewBackend.LoadHtml(handle, html, baseUrl);
+        WebViewBackend.LoadHtml(handle, safeHtml, safeBase);
     }
 
     // 历史后退一页（未创建/不支持为空操作）。
@@ -341,7 +346,7 @@ public class WebView : IBrowserView {
     // 给宿主发消息；消息按 <see cref="TakeMessage"/> 逐条取（和 CEF 那边的
     // CDP 队列同一套用法）。可在原生视图创建前调用。
     public void AddMessageHandler(string handlerName) {
-        if (handlerName == "") { return; }
+        if (nativeDestroyed || handlerName == null || handlerName == "") { return; }
         if (!nativeHandlers.Contains(handlerName)) { nativeHandlers.Add(handlerName); }
         if (!created || !supported || handle == 0) {
             pendingHandlers.Add(handlerName);
@@ -352,6 +357,7 @@ public class WebView : IBrowserView {
 
     // 撤掉 AddMessageHandler 注册的消息通道（不支持的后端为空操作）。
     public void RemoveMessageHandler(string handlerName) {
+        if (handlerName == null || handlerName == "") { return; }
         for (int i = nativeHandlers.Count - 1; i >= 0; i = i - 1) {
             if (nativeHandlers[i] == handlerName) { nativeHandlers.RemoveAt(i); }
         }
@@ -386,7 +392,7 @@ public class WebView : IBrowserView {
     // 每次导航都注入的脚本：atDocumentEnd=true 在文档解析完后跑（能用
     // document/window），false 则在页面自己的脚本之前跑（适合装桥）。
     public void InjectScript(string js, bool atDocumentEnd) {
-        if (js == "") { return; }
+        if (nativeDestroyed || js == null || js == "") { return; }
         nativeScripts.Add(new PendingScriptItem(js, atDocumentEnd));
         if (!created || !supported || handle == 0) {
             pendingScripts.Add(new PendingScriptItem(js, atDocumentEnd));
@@ -397,7 +403,7 @@ public class WebView : IBrowserView {
 
     // 每次导航都注入的 CSS。
     public void InjectStyle(string css) {
-        if (css == "") { return; }
+        if (nativeDestroyed || css == null || css == "") { return; }
         nativeStyles.Add(css);
         if (!created || !supported || handle == 0) {
             pendingStyles.Add(css);
@@ -452,12 +458,16 @@ public class WebView : IBrowserView {
     // 之前补上——否则"先把登录态种进网页、再打开页面"这条用法直接失效
     // （后台网页看不到登录态，落到登录页）。
     public void SetCookie(string forUrl, string cookieName, string cookieValue) {
-        if (!supported) { return; }
+        if (nativeDestroyed || !supported) { return; }
+        string u = forUrl != null ? forUrl : "";
+        string n = cookieName != null ? cookieName : "";
+        string v = cookieValue != null ? cookieValue : "";
+        if (u == "" || n == "") { return; }
         if (handle == 0) {
-            pendingCookies.Add(new PendingCookieItem(forUrl, cookieName, cookieValue));
+            pendingCookies.Add(new PendingCookieItem(u, n, v));
             return;
         }
-        WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);
+        WebViewBackend.SetCookie(handle, u, n, v);
     }
     // 清除共享存储中的所有 Cookie。
     public void ClearCookies() {
@@ -528,6 +538,7 @@ public class WebView : IBrowserView {
     // 空操作；如需重用应新建实例。
     public void Destroy() {
         nativeDestroyed = true;
+        this.ResourceResponse = null;
         BrowserNativeEntry previous = nativeEntry;
         if (previous != null && !previous.retired) { previous.Retire(null); }
         else { this.ReleaseNative(); }
@@ -614,7 +625,7 @@ public class WebView : IBrowserView {
             TitleChanged.Raise(); if (nativeRevision != generation || handle != expected || nativeDestroyed || (nativeEntry != null && !nativeEntry.IsCurrent(app))) { return; }
             dirty = true;
         }
-        if (dirty) { app.RequestRedraw(); }
+        if (dirty && app != null) { app.RequestRedraw(); }
 
         }
 

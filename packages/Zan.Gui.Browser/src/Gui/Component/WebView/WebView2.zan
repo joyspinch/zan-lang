@@ -78,8 +78,12 @@ public partial class WebView2 {
     public static bool comReady;
     public static List<WvResponseContext> respContexts;
     public static int nextRespId = 1;
+    public static nint contentVtbl;
 
     public int handle;
+    public bool disposed;
+    public List<nint> sinkInvokes;
+    public List<nint> sinkObjs;
     // 本视图独占的宿主子窗口（WebView2 controller 的父窗口）。
     public nint host;
     public nint env;
@@ -318,11 +322,33 @@ public partial class WebView2 {
         return WebView2.views;
     }
 
-    // 句柄 1..n 寻址静态视图列表；0 或越界返回 null。
+    // 句柄 1..n 寻址静态视图列表；0、越界或已销毁返回 null。
     public static WebView2 Get(int h) {
         List<WebView2> all = WebView2.All();
         if (h <= 0 || h > all.Count) { return null; }
         return all[h - 1];
+    }
+
+    // 销毁后从静态表摘除视图并唤醒所有等待门，释放托管对象图与响应上下文；
+    // 槽位置 null 而非缩表，防止句柄号被立刻复用导致在途 COM 回调串台。
+    public static void Remove(int h) {
+        if (WebView2.views == null || h <= 0 || h > WebView2.views.Count) { return; }
+        WebView2 w = WebView2.views[h - 1];
+        WebView2.views[h - 1] = null;
+        if (w != null) {
+            w.disposed = true;
+            w.onResourceResponse = null;
+            if (w.readyGate != null) { w.readyGate.Signal(); }
+            if (w.evalGate != null) { w.evalGate.Signal(); }
+            if (w.cookieGate != null) { w.cookieGate.Signal(); }
+        }
+        if (WebView2.respContexts != null) {
+            for (int i = WebView2.respContexts.Count - 1; i >= 0; i = i - 1) {
+                if (WebView2.respContexts[i].handle == h) {
+                    WebView2.respContexts.RemoveAt(i);
+                }
+            }
+        }
     }
 
     // 存在 WebView2Loader.dll 和运行时环境时为 true。
@@ -369,6 +395,9 @@ public partial class WebView2 {
         }
 
         WebView2 w = new WebView2();
+        w.disposed = false;
+        w.sinkInvokes = new List<nint>();
+        w.sinkObjs = new List<nint>();
         w.host = 0;
         w.env = 0;
         w.ctrl = 0;
@@ -408,14 +437,23 @@ public partial class WebView2 {
 
         if (!w.Start(hwnd, profileId)) {
             w.Dispose();
+            WebView2.Remove(w.handle);
             return 0;
         }
         return w.handle;
     }
 
     // 构建这些 API 所需的四槽 IUnknown+Invoke 回调对象之一，
-    // 并打上本视图句柄的标签。
+    // 并打上本视图句柄的标签。同一视图的同一 invoke 函数复用单一 COM 对象，
+    // 消除 Eval/GetCookies/AddDocScript 每次调用泄漏原生 vtable/对象内存。
     public nint Sink(nint invoke) {
+        if (sinkInvokes == null) {
+            sinkInvokes = new List<nint>();
+            sinkObjs = new List<nint>();
+        }
+        for (int i = 0; i < sinkInvokes.Count; i = i + 1) {
+            if (sinkInvokes[i] == invoke) { return sinkObjs[i]; }
+        }
         ComVtbl v = ComVtbl.Create(4);
         v.Add((nint)WebView2.OnQueryInterface);
         v.Add((nint)WebView2.OnAddRef);
@@ -423,6 +461,8 @@ public partial class WebView2 {
         v.Add(invoke);
         nint obj = v.Build();
         v.SetState(handle);
+        sinkInvokes.Add(invoke);
+        sinkObjs.Add(obj);
         return obj;
     }
 
@@ -494,14 +534,18 @@ public partial class WebView2 {
 
         this.ApplySettings();
 
-        // 应用就绪前由控件排队的几何尺寸和可见性
+        // 应用就绪前由控件排队的几何尺寸和可见性（先复位脏标记，避免被
+        // SetFrame/SetVisible/SetClip 的幂等去重早退跳过首次下发）。
         if (frameSet) {
+            frameSet = false;
             this.SetFrame(fx, fy, fw, fh);
         }
         if (visibleSet) {
+            visibleSet = false;
             this.SetVisible(visible);
         }
         if (clipSet) {
+            clipSet = false;
             this.SetClip(clipSpec);
         }
 
@@ -550,6 +594,7 @@ public partial class WebView2 {
     // add_* 接受处理器和一个 EventRegistrationToken 输出参数；
     // 稍后 remove_* 需要的就是这个 token。
     public long Subscribe(int slot, nint sink) {
+        if (core == 0 || sink == 0) { return 0; }
         nint token = NativeMemory.Alloc(8);
         new Span<long>(token, 1)[0] = 0;
         Com.Call2(core, slot, sink, token);
@@ -558,17 +603,14 @@ public partial class WebView2 {
         return t;
     }
 
-    // remove_* 撤销订阅：token 装进 8 字节临时单元按地址传给 COM。
+    // remove_* 撤销订阅：token 为 8 字节结构体，x64 ABI 按值经寄存器传递。
     public void Unsubscribe(int slot, long token) {
-        nint cell = NativeMemory.Alloc(8);
-        new Span<long>(cell, 1)[0] = token;
-        // token 是按值传递的结构体；8 字节时它在寄存器中传递，
-        // 因此其值就是参数。
+        if (core == 0 || token == 0) { return; }
         Com.Call1(core, slot, (nint)token);
-        NativeMemory.Free(cell);
     }
 
     public long SubscribeCore2(nint iface, int slot, nint sink) {
+        if (iface == 0 || sink == 0) { return 0; }
         nint token = NativeMemory.Alloc(8);
         new Span<long>(token, 1)[0] = 0;
         Com.Call2(iface, slot, sink, token);
@@ -578,10 +620,8 @@ public partial class WebView2 {
     }
 
     public void UnsubscribeCore2(nint iface, int slot, long token) {
-        nint cell = NativeMemory.Alloc(8);
-        new Span<long>(cell, 1)[0] = token;
+        if (iface == 0 || token == 0) { return; }
         Com.Call1(iface, slot, (nint)token);
-        NativeMemory.Free(cell);
     }
 
     // %LOCALAPPDATA%\ZanGui\WebView2\<profile>；WebView2 按此文件夹
@@ -589,7 +629,7 @@ public partial class WebView2 {
     public static string ProfileDir(string profileId) {
         string userEnv = Interop.EnvVar("WEBVIEW2_USER_DATA_FOLDER");
         if (userEnv != "") { return userEnv; }
-        string id = profileId;
+        string id = profileId != null ? profileId : "";
         if (id == "") { id = "default"; }
         string safe = "";
         for (int i = 0; i < id.Length; i = i + 1) {
@@ -599,6 +639,7 @@ public partial class WebView2 {
         }
         string root = Interop.EnvVar("LOCALAPPDATA");
         if (root == "") { root = Interop.EnvVar("TEMP"); }
+        if (root == "") { root = "."; }
         return root + "\\ZanGui\\WebView2\\" + safe;
     }
 
