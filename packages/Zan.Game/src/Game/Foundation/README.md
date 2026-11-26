@@ -139,3 +139,53 @@ with its own off-by-one:
 Both are pinned by `tests/conformance/game_combo_qte.zan` in the language
 repository.
 
+## Replays are regression tests (S26 / S27)
+
+A game that wants headless replay wraps its *logic* (never its window) in an
+`IReplaySim`: `Reset(seed)` starts a run whose randomness comes only from the
+seed (`DeterministicRandom`), `Step(frame, input)` advances one fixed frame
+with the player's input encoded as an `int`, and `StateChecksum()` folds the
+state that matters into a `StateHasher`.
+
+```zan
+using Game.Foundation;
+
+public class VaultSim : IReplaySim {
+    public void Reset(long seed) { ... }
+    public void Step(int frame, int input) { ... }
+    public int StateChecksum() { return new StateHasher().Int(gold).Int(spent).Value(); }
+
+    // A game rule: checked after every frame by Verify and Fuzz.
+    [Invariant] public bool GoldConserved() { return gold == 10 + minted - spent; }
+
+    // Optional bot for fuzzing (zan-check runs 3 seeds x 2000 frames).
+    public static int Bot(DeterministicRandom rng, int frame) { return rng.NextBelow(3); }
+}
+```
+
+- `Replay.Record(sim, "VaultSim", seed, inputs, 30)` plays an input list and
+  stores a checksum every 30 frames; `ReplayLog.Save/Load` use a small text
+  format (`zan-replay 1`, `sim`, `seed`, `frames`, `i <frame> <input>`,
+  `c <frame> <checksum>`, `end <checksum>`) that diffs cleanly.
+- `Replay.Verify(sim, log)` replays and stops at the first divergence,
+  broken `[Invariant]` (public, parameterless, returns `bool`) or exception —
+  `ReplayResult.Describe()` names the frame.
+- `Replay.Fuzz(sim, name, seed, frames, bot, stallFrames)` drives the sim
+  with a bot, checking rules every frame; on failure `result.log` is the
+  replay of what happened — save it next to the others and it becomes a
+  regression test.
+
+Put replays under `<project>/replays/*.replay`; `zan-check` finds them, builds
+the named sim, replays every file and fuzzes every sim that has a `Bot`.
+Every game template ships `src/<Name>Sim.zan` and `replays/bot.replay`. When a
+rule change is intended, re-record:
+
+```zan
+ReplayResult r = Replay.Fuzz(new TrapCatSim(), "TrapCatSim", 20261125, 600, TrapCatSim.Bot, 0);
+if (r.ok) { r.log.Save("replays/bot.replay"); }
+```
+
+`DeterministicRandom` mixes its output (splitmix64 finalizer over the LCG
+state): raw LCG low bits have tiny periods (`NextBelow(2)` used to alternate
+0, 1, 0, 1), which bots and shuffles would lock onto.
+

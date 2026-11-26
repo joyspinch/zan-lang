@@ -4,9 +4,9 @@
 缺分号程序在 compile 步失败、带 E0032 与 fix-it，后续 leaks 记 skipped；
 Environment.Exit 时栈帧/静态持有不算泄漏；--no-run 跳过运行；永不退出的程序在
 --timeout 到点后判失败；ui 步（S22）对输入里带同名 .html 的窗体做布局检查——反例按
-种类报出截断/过小/重叠/出界/塌缩并判失败，正例三档 DPI 都通过，无窗体时 skipped。
-replay 恒为
-skipped（P2/P3 未实现），报告形状从第一天起稳定。"""
+种类报出截断/过小/重叠/出界/塌缩并判失败，正例三档 DPI 都通过，无窗体时 skipped；
+replay 步（S26/S27）按工程 replays/*.replay 重放、带机器人的仿真再做 3 个种子的模糊，
+正例全过，被改过校验点的回放在那一帧报 diverged，没有回放时 skipped。"""
 import argparse
 import json
 import os
@@ -22,7 +22,6 @@ def check(root, zanc, *args):
     report = json.loads(r.stdout)
     steps = {s['name']: s for s in report['steps']}
     assert [s['name'] for s in report['steps']] == ['compile', 'leaks', 'ui', 'replay'], report
-    assert steps['replay']['status'] == 'skipped'
     assert (r.returncode == 0) == report['ok'], (r.returncode, report['ok'])
     return report, steps
 
@@ -82,6 +81,19 @@ def main():
     rep, st = check(root, a.zanc, *gui, 'tests/check/ui_good/GoodForm.zan')
     ui = st['ui']
     assert ui['status'] == 'pass' and ui['issues'] == 0 and ui['forms'] == ['GoodForm'], ui
+    assert st['replay']['status'] == 'skipped', st['replay']
+
+    rep, st = check(root, a.zanc, '--no-run', '--no-ui', 'tests/check/replay_good/src')
+    rp = st['replay']
+    assert rep['ok'] and rp['status'] == 'pass' and rp['replays'] == 1 and rp['fuzz'] == 3, rp
+    assert [(x['kind'], x['ok']) for x in rp['runs']] == [('replay', True)] + [('fuzz', True)] * 3, rp
+    rep, st = check(root, a.zanc, '--no-run', '--no-ui', 'tests/check/replay_bad/src')
+    rp = st['replay']
+    assert not rep['ok'] and rp['status'] == 'fail' and rp['failed'] == 1, rp
+    bad = rp['runs'][0]
+    assert bad['frame'] == 119 and bad['result'].startswith('diverged at frame 119'), bad
+    rep, st = check(root, a.zanc, '--no-run', '--no-replay', 'tests/check/replay_good/src')
+    assert st['replay']['status'] == 'skipped' and st['replay']['reason'] == '--no-replay', st
     print('zan check: report contracts passed')
 
 

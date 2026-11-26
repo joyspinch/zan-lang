@@ -6,7 +6,7 @@ using System.Collections.Generic;
 // zan-check：S5（docs/ZAN_STANDARD.md §1）的原生命令——一条命令跑完，输出单份
 // JSON 报告。用 Zan 写、随工具链发布，不依赖 Python。
 //
-//   zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run]
+//   zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run] [--no-ui] [--no-replay]
 //             [--zanc-arg <参数>]... [--out <report.json>] [-- 程序参数...]
 //
 // 步骤（失败步骤之后依赖它的步骤记 skipped，报告照样完整）：
@@ -19,7 +19,11 @@ using System.Collections.Generic;
 //            检查程序（Gui.Testing.UiCheck）离屏装配每个窗体，100%/150%/200% DPI 各排
 //            一帧，再各做一遍伪本地化（文本拉长 40%）；真实尺寸下的问题判失败，伪本地化
 //            的问题作为告警计数（预示译文变长后的截断）。没有窗体时 skipped；--no-ui 跳过；
-//   replay   回放比对与不变量（S26/S27，P3）未实现，恒 skipped。
+//   replay   S26/S27 回放即回归：在输入目录与其上一级找 replays/*.replay，按文件里的
+//            `sim <类型名>` 生成检查程序，Game.Foundation.Replay.Verify 逐校验点重放并每帧查
+//            [Invariant] 规则；仿真类若有 `public static int Bot(DeterministicRandom, int)`，
+//            再用它做机器人模糊（3 个种子 × 2000 帧，查规则违反与崩溃）。分叉、规则违反、
+//            崩溃即失败。没有回放文件也没有机器人时 skipped；--no-replay 跳过。
 // 退出码：0 没有失败步骤（skipped 不算失败）；1 有失败；2 参数问题。
 public class ZanCheck {
     static string Esc(string s) {
@@ -298,9 +302,178 @@ public class ZanCheck {
         return st + "}";
     }
 
+    // 输入目录与其上一级的 replays/*.replay（工程布局：<工程>/src + <工程>/replays）
+    static List<string> FindReplays(List<string> inputs) {
+        List<string> dirs = new List<string>();
+        for (int i = 0; i < inputs.Count; i = i + 1) {
+            string p = Path.GetFullPath(inputs[i]);
+            string d = Directory.Exists(p) ? p : Path.GetDirectoryName(p);
+            string up = Path.GetDirectoryName(d);
+            string[] cands = new string[] { Path.Combine(d, "replays"), Path.Combine(up, "replays") };
+            for (int k = 0; k < cands.Length; k = k + 1) {
+                if (Directory.Exists(cands[k]) && !dirs.Contains(cands[k])) { dirs.Add(cands[k]); }
+            }
+        }
+        List<string> files = new List<string>();
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            List<string> fs = Directory.GetFiles(dirs[i], "*.replay", false);
+            fs.Sort();
+            for (int k = 0; k < fs.Count; k = k + 1) { files.Add(fs[k]); }
+        }
+        return files;
+    }
+
+    // 输入源里找类 name 的命名空间与它是否带机器人（static int Bot(DeterministicRandom, int)）；
+    // 找不到类返回 false
+    static bool FindSim(List<string> inputs, string name, out string ns, out bool bot) {
+        ns = "";
+        bot = false;
+        List<string> files = new List<string>();
+        for (int i = 0; i < inputs.Count; i = i + 1) {
+            if (Directory.Exists(inputs[i])) {
+                List<string> fs = Directory.GetFiles(inputs[i], "*.zan", true);
+                for (int k = 0; k < fs.Count; k = k + 1) { files.Add(fs[k]); }
+            } else if (inputs[i].EndsWith(".zan")) { files.Add(inputs[i]); }
+        }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string text = File.ReadAllText(files[i]);
+            List<string> lines = text.Replace("\r", "").Split("\n");
+            string cur = "";
+            bool found = false;
+            for (int k = 0; k < lines.Count; k = k + 1) {
+                string l = lines[k].Trim();
+                if (l.StartsWith("namespace ")) {
+                    cur = l.Substring(10, l.Length - 10).Replace(";", "").Replace("{", "").Trim();
+                }
+                if (!found && (l.Contains("class " + name + " ") || l.Contains("class " + name + ":")
+                               || l.EndsWith("class " + name))) {
+                    found = true;
+                    ns = cur;
+                }
+            }
+            if (found) {
+                bot = text.Contains("static int Bot(DeterministicRandom");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static string Replays(string zanc, List<string> inputs, List<string> extra, string work,
+                          string exeSuffix, int timeoutMs, out bool ok) {
+        ok = true;
+        List<string> files = ZanCheck.FindReplays(inputs);
+        List<string> sims = new List<string>();
+        List<string> nss = new List<string>();
+        List<bool> bots = new List<bool>();
+        string missing = "";
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string sim = "";
+            List<string> lines = File.ReadAllText(files[i]).Replace("\r", "").Split("\n");
+            for (int k = 0; k < lines.Count && k < 8; k = k + 1) {
+                if (lines[k].StartsWith("sim ")) { sim = lines[k].Substring(4, lines[k].Length - 4).Trim(); }
+            }
+            if (sims.Contains(sim)) { continue; }
+            string ns = "";
+            bool bot = false;
+            if (sim == "" || !ZanCheck.FindSim(inputs, sim, out ns, out bot)) {
+                missing = missing + (missing != "" ? ", " : "") + Path.GetFileName(files[i])
+                    + (sim == "" ? " (no 'sim' line)" : " (sim class '" + sim + "' not in the inputs)");
+                continue;
+            }
+            sims.Add(sim);
+            nss.Add(ns);
+            bots.Add(bot);
+        }
+        if (missing != "") {
+            ok = false;
+            return "{\"name\":\"replay\",\"status\":\"fail\",\"reason\":"
+                + ZanCheck.Str("replay files name unknown sims: " + missing) + "}";
+        }
+        if (files.Count == 0) {
+            return ZanCheck.Skipped("replay", "no replays/*.replay next to the inputs");
+        }
+        string src = "using System;\nusing Game.Foundation;\n";
+        for (int i = 0; i < nss.Count; i = i + 1) {
+            if (nss[i] != "") { src = src + "using " + nss[i] + ";\n"; }
+        }
+        src = src + "public class ZanCheckReplayHarness {\n"
+            + "    static string Esc(string s) { return s.Replace(\"\\\\\", \"\\\\\\\\\").Replace(\"\\\"\", \"\\\\\\\"\").Replace(\"\\n\", \" \"); }\n"
+            + "    static void Emit(string what, string sim, string file, long seed, ReplayResult r) {\n"
+            + "        Console.WriteLine(\"ZANREPLAY {\\\"kind\\\":\\\"\" + what + \"\\\",\\\"sim\\\":\\\"\" + sim"
+            + " + \"\\\",\\\"file\\\":\\\"\" + Esc(file) + \"\\\",\\\"seed\\\":\" + Convert.ToString(seed)"
+            + " + \",\\\"ok\\\":\" + (r.ok ? \"true\" : \"false\") + \",\\\"frame\\\":\" + Convert.ToString(r.frame)"
+            + " + \",\\\"result\\\":\\\"\" + Esc(r.Describe()) + \"\\\"}\");\n"
+            + "    }\n"
+            + "    public static void Main() {\n";
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string sim = "";
+            List<string> lines = File.ReadAllText(files[i]).Replace("\r", "").Split("\n");
+            for (int k = 0; k < lines.Count && k < 8; k = k + 1) {
+                if (lines[k].StartsWith("sim ")) { sim = lines[k].Substring(4, lines[k].Length - 4).Trim(); }
+            }
+            string path = files[i].Replace("\\", "/");
+            src = src + "        { ReplayLog log = ReplayLog.Load(\"" + ZanCheck.Esc(path) + "\");\n"
+                + "          Emit(\"replay\", \"" + sim + "\", \"" + ZanCheck.Esc(path) + "\", log.seed, Replay.Verify(new "
+                + sim + "(), log)); }\n";
+        }
+        int fuzzRuns = 0;
+        for (int i = 0; i < sims.Count; i = i + 1) {
+            if (!bots[i]) { continue; }
+            for (int seed = 1; seed <= 3; seed = seed + 1) {
+                src = src + "        Emit(\"fuzz\", \"" + sims[i] + "\", \"\", " + Convert.ToString(seed)
+                    + ", Replay.Fuzz(new " + sims[i] + "(), \"" + sims[i] + "\", " + Convert.ToString(seed)
+                    + ", 2000, " + sims[i] + ".Bot, 0));\n";
+                fuzzRuns = fuzzRuns + 1;
+            }
+        }
+        src = src + "    }\n}\n";
+        string harness = Path.Combine(work, "ZanCheckReplayHarness.zan");
+        File.WriteAllText(harness, src);
+        string exe = Path.Combine(work, "replay" + exeSuffix);
+        List<string> args = new List<string>();
+        args.Add(harness);   // 第一个 Main 是入口
+        for (int i = 0; i < inputs.Count; i = i + 1) { args.Add(inputs[i]); }
+        args.Add("--auto-stdlib");
+        args.Add("-o");
+        args.Add(exe);
+        for (int i = 0; i < extra.Count; i = i + 1) { args.Add(extra[i]); }
+        ProcessResult cr = Process.CaptureSafe(zanc, args, 600000);
+        if (cr.exitCode != 0 || !File.Exists(exe)) {
+            ok = false;
+            List<string> cl = cr.lines != null ? cr.lines : new List<string>();
+            return "{\"name\":\"replay\",\"status\":\"fail\",\"reason\":\"replay check program did not compile\","
+                + "\"output_tail\":" + ZanCheck.StrList(cl, 20) + "}";
+        }
+        ProcessResult r = Process.CaptureSafe(exe, new List<string>(), timeoutMs);
+        List<string> out2 = r.lines != null ? r.lines : new List<string>();
+        string runs = "";
+        int n = 0;
+        int failed = 0;
+        for (int i = 0; i < out2.Count; i = i + 1) {
+            string l = out2[i].Trim();
+            if (!l.StartsWith("ZANREPLAY ")) { continue; }
+            string obj = l.Substring(10, l.Length - 10);
+            runs = runs + (n > 0 ? "," : "") + obj;
+            n = n + 1;
+            if (!obj.Contains("\"ok\":true")) { failed = failed + 1; }
+        }
+        int want = files.Count + fuzzRuns;
+        ok = r.exitCode == 0 && failed == 0 && n == want;
+        string st = "{\"name\":\"replay\",\"status\":" + (ok ? "\"pass\"" : "\"fail\"")
+            + ",\"replays\":" + Convert.ToString(files.Count) + ",\"fuzz\":" + Convert.ToString(fuzzRuns)
+            + ",\"failed\":" + Convert.ToString(failed) + ",\"runs\":[" + runs + "]";
+        if (r.exitCode != 0 || n != want) {
+            st = st + ",\"exit_code\":" + Convert.ToString(r.exitCode)
+                + ",\"output_tail\":" + ZanCheck.StrList(out2, 20);
+        }
+        return st + "}";
+    }
+
     static void Usage() {
         Console.WriteLine("usage: zan-check <entry.zan|dir...> [--zanc <path>] [--timeout <seconds>]");
-        Console.WriteLine("                 [--no-run] [--no-ui] [--zanc-arg <arg>]... [--out <report.json>]");
+        Console.WriteLine("                 [--no-run] [--no-ui] [--no-replay] [--zanc-arg <arg>]...");
+        Console.WriteLine("                 [--out <report.json>]");
         Console.WriteLine("                 [-- program args...]");
     }
 
@@ -313,6 +486,7 @@ public class ZanCheck {
         int timeoutSec = 60;
         bool noRun = false;
         bool noUi = false;
+        bool noReplay = false;
         int i = 0;
         bool rest = false;
         while (i < Environment.ArgCount()) {
@@ -322,6 +496,7 @@ public class ZanCheck {
             if (a == "--") { rest = true; }
             else if (a == "--no-run") { noRun = true; }
             else if (a == "--no-ui") { noUi = true; }
+            else if (a == "--no-replay") { noReplay = true; }
             else if (a == "--help" || a == "-h") { ZanCheck.Usage(); return 0; }
             else if ((a == "--zanc" || a == "--timeout" || a == "--zanc-arg" || a == "--out")
                      && i >= Environment.ArgCount()) {
@@ -380,8 +555,16 @@ public class ZanCheck {
                                               timeoutSec * 1000 * 4, out uiOk);
             ok = ok && uiOk;
         }
-        steps = steps + "," + ZanCheck.Skipped("replay",
-            "replay and invariants (S26/S27, ZAN_STANDARD P3) are not implemented yet");
+        if (!compiled) {
+            steps = steps + "," + ZanCheck.Skipped("replay", "compile failed");
+        } else if (noReplay) {
+            steps = steps + "," + ZanCheck.Skipped("replay", "--no-replay");
+        } else {
+            bool replayOk = true;
+            steps = steps + "," + ZanCheck.Replays(zanc, inputs, extra, work, exeSuffix,
+                                                   timeoutSec * 1000 * 4, out replayOk);
+            ok = ok && replayOk;
+        }
 
         string report = "{\"version\":1,\"ok\":" + (ok ? "true" : "false")
             + ",\"inputs\":" + ZanCheck.StrList(inputs, inputs.Count)

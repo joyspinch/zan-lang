@@ -4,6 +4,7 @@ using Gui;
 using Game.Foundation.Gui;
 using Game.Match3;
 using Game.Kit;
+using Game.Foundation;
 
 namespace Match3;
 
@@ -30,7 +31,13 @@ public class Match3Game {
     // 宝石配色 (AARRGGBB)
     public int[] gemColors;
 
-    public Match3Game() {
+    // 开盘与补子的唯一随机源：同一种子同一局（回放 replays/ 依赖这一点）
+    public DeterministicRandom rng;
+
+    public Match3Game() : this(20260101) { }
+
+    public Match3Game(long seed) {
+        this.rng = new DeterministicRandom(seed);
         this.board = new Match3Board(Cols, Rows);
         this.floatingTexts = new FloatingTextPool(32);
         this.score = 0;
@@ -57,14 +64,44 @@ public class Match3Game {
         return new Match3Game();
     }
 
-    public void InitBoard() {
-        // 初始填充并保证没有预先匹配好的三连
+    // 界面开局用时钟当种子（每次一盘新局）；回放走 Match3Game(seed) 固定种子
+    public static Match3Game Create(long seed) {
+        return new Match3Game(seed);
+    }
+
+    // 随机发一盘：逐格取色，避开会和左边两格或上边两格连成三连的颜色（开局没有
+    // 现成的消除）；发出来的盘面一步可走都没有就重发——开局必须有棋可下。
+    public void Deal() {
+        for (int attempt = 0; attempt < 100; attempt = attempt + 1) {
+            for (int r = 0; r < Rows; r = r + 1) {
+                for (int c = 0; c < Cols; c = c + 1) {
+                    int val = 1 + rng.NextBelow(6);
+                    for (int guard = 0; guard < 6; guard = guard + 1) {
+                        bool row3 = c >= 2 && board.Get(c - 1, r) == val && board.Get(c - 2, r) == val;
+                        bool col3 = r >= 2 && board.Get(c, r - 1) == val && board.Get(c, r - 2) == val;
+                        if (!row3 && !col3) { break; }
+                        val = val % 6 + 1;
+                    }
+                    board.Set(c, r, val);
+                }
+            }
+            if (HasAnyMove()) { return; }
+        }
+    }
+
+    // 盘面上是否还有一步能消除的交换
+    public bool HasAnyMove() {
         for (int r = 0; r < Rows; r = r + 1) {
             for (int c = 0; c < Cols; c = c + 1) {
-                int val = 1 + (c * 3 + r * 5) % 6;
-                board.Set(c, r, val);
+                if (c + 1 < Cols && board.CanSwap(c, r, c + 1, r)) { return true; }
+                if (r + 1 < Rows && board.CanSwap(c, r, c, r + 1)) { return true; }
             }
         }
+        return false;
+    }
+
+    public void InitBoard() {
+        Deal();
         score = 0;
         movesLeft = 25;
         gameOver = false;
@@ -122,7 +159,7 @@ public class Match3Game {
             // 产生连续掉落结算
             int[] incoming = new int[Cols * Rows];
             for (int i = 0; i < incoming.Length; i = i + 1) {
-                incoming[i] = 1 + (i * 7 + movesLeft * 11) % 6;
+                incoming[i] = 1 + rng.NextBelow(6);
             }
             int inIdx = 0;
             int totalCleared = 0;
@@ -138,6 +175,9 @@ public class Match3Game {
 
             if (score >= targetScore || movesLeft <= 0) {
                 gameOver = true;
+            } else if (!HasAnyMove()) {
+                // 死局：洗牌重发，分数与剩余步数保留
+                Deal();
             }
         }
     }

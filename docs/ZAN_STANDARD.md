@@ -259,10 +259,10 @@ ui.Snapshot("login_ok");   // 语义树快照为主（文本、可 diff），像
 引用 `Gui`/渲染模块。浮点切换到严格模式（禁止 FMA 收缩等）。
 **逻辑/表现分离从约定变成编译保证。**
 
-**S26 回放即测试。** 每次试玩记录种子 + 输入流；bug 报告即回放文件；CI 重放并逐帧
+**S26 回放即测试。**（已落地：`Game.Foundation` 的 `IReplaySim` / `ReplayLog` / `Replay.Record·Verify·Fuzz`，`zan-check` replay 步按 `replays/*.replay` 重放；全部 `templates/game` 带 `<名字>Sim` 与 `replays/bot.replay`，钉 `case_game_replay`、`zan_check_report` 与 full 档 `template_game_replay`；跨平台逐字节一致归 S33） 每次试玩记录种子 + 输入流；bug 报告即回放文件；CI 重放并逐帧
 比对 `Checksum`；回放文件自动成为回归用例。复用 `RollbackSession` / `Snapshot`。
 
-**S27 规则即不变量：**
+**S27 规则即不变量：**（已落地为运行期反射：`[Invariant]` 的 public 无参 bool 方法由 `Invariants.Check` 每帧调用——回放校验与机器人模糊都查；机器人是仿真类的 `static int Bot(DeterministicRandom, int)`，`Replay.Fuzz` 报规则违反/崩溃/卡死并产出可提交的回放。普通 debug 运行里的每帧检查未接入游戏循环）
 
 ```csharp
 [Invariant] bool GoldConserved() => TotalGold() == initialGold + minted - spent;

@@ -289,7 +289,7 @@ OnClick`、`Action a = Save;`）按当前类型及基类的同名方法连 defer
 ### 1.8 一条命令的检查报告（`zan-check`，S5）
 
 `zan-check <入口.zan|目录...> [--zanc <路径>] [--timeout <秒>] [--no-run]
-[--no-ui] [--zanc-arg <参数>]... [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
+[--no-ui] [--no-replay] [--zanc-arg <参数>]... [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
 stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败步骤（skipped 不算
 失败），1 = 有失败，2 = 参数问题。`zan-check` 用 Zan 写（`src/check/ZanCheck.zan`），
 随工具链发布在 `toolchain/` 下，不依赖 Python；不给 `--zanc` 时用同目录的 `zanc`，
@@ -300,7 +300,7 @@ stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败
 | `compile` | `zanc … --auto-stdlib --check-leaks --diag=json`：全部诊断原样收进 `diagnostics`（§1.6，含 fix-it 与 `end`），`errors`/`warnings` 计数；失败时附 `other_output`（非 JSON 输出的最后 20 行） | 编译失败 |
 | `leaks` | 运行产物（默认 60 秒超时）并解析退出报告：`leaked`、`sites[{count,site}]`、`cycles[]`（S13 路径）、`mode`（`strict` = Main 正常返回，`early-exit` = 提前退出只计不可达环）；退出码非 0 时附 `output_tail` | 有泄漏、退出码非 0 或超时 |
 | `ui` | S22 布局不变量：在输入里找 `class X : Form` 且同目录有 `X.html` 的窗体，生成检查程序（排在用户源文件之前，它的 `Main` 是入口）离屏装配每个窗体（`Gui.Testing.UiCheck`），100%/150%/200% DPI 各排一帧、再各做一遍伪本地化（静态文本拉长 40%）。问题种类：`truncated`（文字比首选尺寸窄/矮超过 2 逻辑像素，同 `Control.LayoutLint` 的裁剪容差）、`small_target`（可交互控件小于 24 逻辑像素且不满足 WCAG 2.5.8 间距豁免——以它为中心的 24px 圆碰到别的目标）、`overlap`（两个可交互控件相交且互不包含）、`offscreen`（出窗口，滚动容器内不算）、`collapsed`（可交互控件被挤成 0 宽/高）。禁用控件不算交互目标；挂了 `FreeLayout()`（标记 `free-layout` 属性）的子树不查重叠/尺寸——刻意叠放要明说；`<template>` 行模板不查；自己装载标记（`Html.Load`/`HtmlDocs.Read`）的窗体不走声明式装配，跳过。报告 `forms`、`issues`、`pseudo_issues` 与逐次 `checks[{form,scale,pseudo,issues}]`；没有窗体时 `skipped`，`--no-ui` 跳过。GUI 程序需要的 `--driver-dir` 等经 `--zanc-arg` 传 | 真实尺寸（非伪本地化）下有问题、检查程序编不过或没跑完；伪本地化的问题只计数（告警） |
-| `replay` | 回放比对与不变量（S26/S27，P3） | 未实现，恒 `skipped` |
+| `replay` | S26/S27 回放即回归：在输入目录与其上一级找 `replays/*.replay`，按文件里的 `sim <类型名>` 生成检查程序，`Game.Foundation.Replay.Verify` 逐校验点重放、每帧查 `[Invariant]` 规则；仿真类有 `public static int Bot(DeterministicRandom, int)` 时再做机器人模糊（3 个种子 × 2000 帧）。报告 `replays`、`fuzz`、`failed` 与逐次 `runs[{kind,sim,file,seed,ok,frame,result}]`；没有回放时 `skipped`，`--no-replay` 跳过 | 分叉（`diverged at frame N`）、规则违反、崩溃，回放点名了输入里没有的仿真类，或检查程序编不过 |
 
 编译失败时后续步骤记 `skipped` 并写明原因，报告形状不变：
 `{"version":1, "ok":…, "inputs":[…], "steps":[{"name":…, "status":"pass|fail|skipped", …}]}`。
