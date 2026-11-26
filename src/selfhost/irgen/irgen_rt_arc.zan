@@ -545,51 +545,53 @@ partial class Irgen {
         stmtTempTypes = new List<Node>();
     }
 
+    void ReleaseLocalAt(int i) {
+        if (i < 0 || i >= locName.Count) { return; }
+        // __qdot temps hold a borrowed `?.` receiver: not owned, never released
+        if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { return; }
+        // a by-ref parameter's reference belongs to the CALLER's slot
+        if (i < locRef.Count && locRef[i]) { return; }
+        if (curAsync && ReleaseAsyncCatchLocal(locReg[i])) { return; }
+        if (locBox[i]) {
+            string cell = locCell[i];
+            if (curAsync) {
+                if (IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], "i8*"); }
+                cell = NT();
+                L("  " + cell + " = load i8*, i8** " + locReg[i]);
+                L("  store i8* null, i8** " + locReg[i]);
+            } else {
+                string ownerSlot = locReg[i] + ".local.owner";
+                RetireLocalSlot(ownerSlot, "i8*");
+                cell = NT();
+                L("  " + cell + " = load i8*, i8** " + ownerSlot);
+                L("  store i8* null, i8** " + ownerSlot);
+            }
+            EmitCellRelease(cell);
+            return;
+        }
+        if (ArcManaged(locType[i]) || (locType[i] != null && locType[i].ival >= 1)) {
+            string lt = MapType(locType[i]);
+            string t = NT();
+            if (curAsync && locBox[i]) {
+                string c = NT();
+                L("  " + c + " = load i8*, i8** " + locReg[i]);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                L("  " + t + " = load " + lt + ", " + lt + "* " + p);
+                EmitArcRelease(t, locType[i]);
+            } else {
+                if (!curAsync || IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], lt); }
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                L("  store " + lt + " null, " + lt + "* " + locReg[i]);
+                EmitArcRelease(t, locType[i]);
+            }
+        }
+    }
+
     void ReleaseLocalsFrom(int from) {
         int i = from;
         while (i < locName.Count) {
-            // __qdot temps hold a borrowed `?.` receiver: not owned, never released
-            if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
-            // a by-ref parameter's reference belongs to the CALLER's slot
-            if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
-            if (curAsync && ReleaseAsyncCatchLocal(locReg[i])) { i = i + 1; continue; }
-            if (locBox[i]) {
-                string cell = locCell[i];
-                if (curAsync) {
-                    if (IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], "i8*"); }
-                    cell = NT();
-                    L("  " + cell + " = load i8*, i8** " + locReg[i]);
-                    L("  store i8* null, i8** " + locReg[i]);
-                } else {
-                    string ownerSlot = locReg[i] + ".local.owner";
-                    RetireLocalSlot(ownerSlot, "i8*");
-                    cell = NT();
-                    L("  " + cell + " = load i8*, i8** " + ownerSlot);
-                    L("  store i8* null, i8** " + ownerSlot);
-                }
-                EmitCellRelease(cell);
-                i = i + 1; continue;
-            }
-            if (ArcManaged(locType[i]) || (locType[i] != null && locType[i].ival >= 1)) {
-                string lt = MapType(locType[i]);
-                string t = NT();
-                if (curAsync && locBox[i]) {
-                    // the local lives in a heap cell: the register holds the
-                    // CELL pointer, the cell holds the value -- release the
-                    // value, not the cell
-                    string c = NT();
-                    L("  " + c + " = load i8*, i8** " + locReg[i]);
-                    string p = NT();
-                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
-                    L("  " + t + " = load " + lt + ", " + lt + "* " + p);
-                    EmitArcRelease(t, locType[i]);
-                } else {
-                    if (!curAsync || IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], lt); }
-                    L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                    L("  store " + lt + " null, " + lt + "* " + locReg[i]);
-                    EmitArcRelease(t, locType[i]);
-                }
-            }
+            ReleaseLocalAt(i);
             i = i + 1;
         }
     }

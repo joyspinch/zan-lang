@@ -485,10 +485,20 @@ partial class Irgen {
             && ty.kids.Count == 1 && !MentionsTypeParam(ty.kids[0]);
     }
 
+    bool IsClosedDictType(Node ty) {
+        return IsDictType(ty) && IsContainerType("Dictionary")
+            && ty.kids.Count == 2 && !MentionsTypeParam(ty.kids[0]) && !MentionsTypeParam(ty.kids[1]);
+    }
+
     bool HasStaticReferenceConversion(Node src, Node tgt) {
         if (IsClosedListType(tgt)) {
             return IsListType(src) && src.kids.Count == 1
                 && ArrayTypeKey(src.kids[0]) == ArrayTypeKey(tgt.kids[0]);
+        }
+        if (IsClosedDictType(tgt)) {
+            return IsDictType(src) && src.kids.Count == 2
+                && ArrayTypeKey(src.kids[0]) == ArrayTypeKey(tgt.kids[0])
+                && ArrayTypeKey(src.kids[1]) == ArrayTypeKey(tgt.kids[1]);
         }
         return tgt.sval == "object" || IsSubclassName(src.sval, tgt.sval);
     }
@@ -506,8 +516,22 @@ partial class Irgen {
         return ok;
     }
 
+    string EmitClosedDictTypeTest(ExprVal obj, Node tgt) {
+        if (IsClosedDictType(obj.ty)) {
+            if (HasStaticReferenceConversion(obj.ty, tgt)) { return Bool1(EmitNonNullVal(obj)); }
+            return "false";
+        }
+        if (!IsPtrType(obj.ty) || (!IsDictType(obj.ty) && !DynamicReferenceType(obj.ty))) { return "false"; }
+        string meta = DictTypeMetadata(tgt);
+        string raw = Coerce(obj, "i8*");
+        string ok = NT();
+        L("  " + ok + " = call i1 @zdict_matches_type(i8* " + raw + ", i8* " + meta + ")");
+        return ok;
+    }
+
     string EmitReferenceTypeTest(ExprVal obj, Node tgt) {
         if (IsClosedListType(tgt)) { return EmitClosedListTypeTest(obj, tgt); }
+        if (IsClosedDictType(tgt)) { return EmitClosedDictTypeTest(obj, tgt); }
         if (tgt.sval == "string") { return EmitStringIdTest(obj); }
         return EmitClassIdTest(obj, tgt.sval);
     }
@@ -515,6 +539,7 @@ partial class Irgen {
     // The type test half of a switch pattern (`case T x:`): an i1 condition.
     string EmitTypeTestVal(ExprVal obj, Node pat, Node at) {
         if (IsClosedListType(pat)) { return EmitClosedListTypeTest(obj, pat); }
+        if (IsClosedDictType(pat)) { return EmitClosedDictTypeTest(obj, pat); }
         string tt = pat.sval;
         string st = obj.ty != null ? obj.ty.sval : "";
         if (tt == "object") {
@@ -571,8 +596,9 @@ partial class Irgen {
     // address of its class's tid global, so the test accepts every class that
     // derives from `tt` (closed world, the same rule the vtable test uses).
     string EmitClassIdTest(ExprVal obj, string tt) {
+        string raw = Coerce(obj, "i8*");
         string cid = NT();
-        L("  " + cid + " = call i8* @__zan_class_id(i8* " + obj.op + ")");
+        L("  " + cid + " = call i8* @__zan_class_id(i8* " + raw + ")");
         string acc = "";
         // A built-in container's class ID identifies its container kind.
         if (IsContainerType(tt)) {
@@ -603,8 +629,9 @@ partial class Irgen {
     // right before the payload; a class instance has a destructor pointer
     // there instead.
     string EmitStringIdTest(ExprVal obj) {
+        string raw = Coerce(obj, "i8*");
         string v = NT();
-        L("  " + v + " = call i64 @__zan_is_string(i8* " + obj.op + ")");
+        L("  " + v + " = call i64 @__zan_is_string(i8* " + raw + ")");
         return Bool1(v);
     }
 

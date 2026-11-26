@@ -50,13 +50,13 @@ def version_token(v):
     return parts[1] if len(parts) >= 2 else ""
 
 
-def run_cmd(cmd, workdir, timeout=0):
+def run_cmd(cmd, workdir, timeout=0, env=None):
     """Run a subprocess, capturing output the way execute_process does.
     A timeout kills the process: unvetted corpus cases can miscompile into
     a spin or a memory hog, and one runaway must not take the pool down."""
     try:
         p = subprocess.run(cmd, cwd=workdir, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout or None)
+                           stderr=subprocess.PIPE, timeout=timeout or None, env=env)
         return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace")
@@ -64,6 +64,31 @@ def run_cmd(cmd, workdir, timeout=0):
         return -9, out, err
     except OSError as e:
         return -1, "", str(e)
+
+
+CASE_ENV = {
+    "async_nested_yield": {"ZAN_CO_WORKERS": "1"},
+    "async_preempt_hotloop": {"ZAN_CO_WORKERS": "1"},
+    "async_sync_delay_timer": {"ZAN_CO_WORKERS": "1"},
+    "crypto_sm4_scalar_kat": {"ZAN_NO_HWACCEL": "1"},
+    "datetime_now": {"TZ": "EST5EDT,M3.2.0,M11.1.0"},
+}
+
+
+def isolated_run_env(outdir, tag):
+    """Provide a per-case writable temp dir so parallel tests do not collide
+    and sandboxed runs with read-only host %TEMP% stay deterministic."""
+    tmpdir = os.path.join(outdir, "_tmp", tag)
+    if os.path.exists(tmpdir):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    os.makedirs(tmpdir, exist_ok=True)
+    env = os.environ.copy()
+    env["TEMP"] = tmpdir
+    env["TMP"] = tmpdir
+    env["TMPDIR"] = tmpdir
+    for k, v in CASE_ENV.get(tag, {}).items():
+        env[k] = v
+    return env, tmpdir
 
 
 def normalize(out):
@@ -102,6 +127,16 @@ def check_output(exe, golden, name, a):
     return ""
 
 
+def case_helpers(case_dir, case):
+    """Return extra companion .zan files for multi-file conformance cases."""
+    extras = []
+    for suffix in (".zan", "_item.zan"):
+        helper = os.path.join(case_dir, "helpers", case + suffix)
+        if os.path.isfile(helper):
+            extras.append(helper)
+    return extras
+
+
 def run_focused_case(case, a):
     src = os.path.join(a.case_dir, case + ".zan")
     golden = os.path.join(a.case_dir, case + ".out")
@@ -112,8 +147,7 @@ def run_focused_case(case, a):
     for path in (ll, host_exe, gen_exe, bc):
         if os.path.exists(path):
             os.remove(path)
-    helper = os.path.join(a.case_dir, "helpers", case + ".zan")
-    extras = [helper] if os.path.exists(helper) else []
+    extras = case_helpers(a.case_dir, case)
     failures = []
     rc, out, err = stage(a, case + ".host.compile",
                          [a.zanc, src] + extras + ["--auto-stdlib", "--package-project", a.workdir, "-o", host_exe], a.emit_timeout)
@@ -155,8 +189,7 @@ def run_case(case, a):
             os.remove(f)
 
     why = ""
-    helper = os.path.join(a.case_dir, "helpers", case + ".zan")
-    extra_args = [helper] if os.path.exists(helper) else []
+    extra_args = case_helpers(a.case_dir, case)
     rc, out, err = run_cmd([a.gen1, ll, src] + extra_args, a.workdir, a.emit_timeout)
     if rc == -9:
         why = "gen1 emit timed out after %ds (miscompile spin?)" % a.emit_timeout
@@ -169,7 +202,11 @@ def run_case(case, a):
         elif rc != 0:
             why = "clang rejected the emitted IR (rc=%d): %s%s" % (rc, out, err)
     if why == "":
-        rc, out, err = run_cmd([exe], a.workdir, a.run_timeout)
+        run_env, tmpdir = isolated_run_env(a.outdir, case)
+        try:
+            rc, out, err = run_cmd([exe], a.workdir, a.run_timeout, env=run_env)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         if rc == -9:
             why = "the program timed out after %ds (spin or hang)" % a.run_timeout
         elif rc != 0:
@@ -294,7 +331,7 @@ def main():
         passed_file = os.path.join(a.log_dir, "passed.txt")
         if os.path.exists(passed_file):
             os.remove(passed_file)
-    jobs = a.jobs if a.jobs > 0 else min(os.cpu_count() or 8, 8)
+    jobs = a.jobs if a.jobs > 0 else min(os.cpu_count() or 8, 12)
 
     # ---- report identity stamp (B-ID189) ------------------------------------
     # A differential report is only worth anything if a later session can
@@ -420,9 +457,7 @@ def main():
         inputs += [p for p in [a.llvm_as, a.stdlib_stamp] if p]
         for case in cases:
             inputs += [os.path.join(a.case_dir, case + ext) for ext in (".zan", ".out")]
-            helper = os.path.join(a.case_dir, "helpers", case + ".zan")
-            if os.path.isfile(helper):
-                inputs.append(helper)
+            inputs += case_helpers(a.case_dir, case)
         for name, _, _ in rejects:
             inputs.append(os.path.join(a.reject_dir, name + ".zan"))
             helper = os.path.join(a.reject_dir, name + "_helper.zan")

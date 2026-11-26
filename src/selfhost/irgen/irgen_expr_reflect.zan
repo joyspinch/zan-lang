@@ -189,6 +189,36 @@ partial class Irgen {
         return ReflMetaConst(list, FormatTypeNode(list));
     }
 
+    string DictTypeMetadata(Node ty) {
+        if (!IsClosedDictType(ty)) { return "null"; }
+        Node canon = MkType("Dictionary");
+        canon.Add(ty.kids[0]);
+        canon.Add(ty.kids[1]);
+        return ReflMetaConst(canon, FormatTypeNode(canon));
+    }
+
+    void CollectClassMethods(Node cls, List<Node> outMethods, List<string> seenNames) {
+        if (cls == null) { return; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && !m.sval.StartsWith("op_") && m.sval != "_init_fields") {
+                if (IndexOfStr(seenNames, m.sval) < 0) {
+                    seenNames.Add(m.sval);
+                    outMethods.Add(m);
+                }
+            }
+            i = i + 1;
+        }
+        Node baseNode = BaseClassOf(cls);
+        if (baseNode != null && baseNode.sval != "" && baseNode.sval != "object") {
+            Node baseCls = binder.FindType(baseNode.sval);
+            if (baseCls != null) {
+                CollectClassMethods(baseCls, outMethods, seenNames);
+            }
+        }
+    }
+
     int ListSlotOwnership(Node elem) {
         if (elem != null && (elem.ival >= 1 || DynamicReferenceType(elem))) { return 3; }
         if (IsDelegate(elem)) { return 2; }
@@ -398,45 +428,52 @@ partial class Irgen {
         List<long> cFlags = new List<long>();
 
         if (targetCls != null) {
+            List<Node> allMethods = new List<Node>();
+            List<string> seenMethodNames = new List<string>();
+            CollectClassMethods(targetCls, allMethods, seenMethodNames);
             int mi = 0;
-            while (mi < targetCls.kids.Count) {
-                Node m = targetCls.kids[mi];
-                if (m.kind == AK.MethodDecl() && !m.sval.StartsWith("op_") && m.sval != "_init_fields") {
-                    mNames.Add(m.sval);
-                    string mret = m.type != null ? FormatTypeNode(m.type) : "void";
-                    mRetTys.Add(mret);
-                    mRetKinds.Add(mret == "void" ? 0 : (long)ReflFkOf(mret));
-                    List<string> pts = new List<string>();
-                    int pi = 0;
-                    while (pi < m.kids.Count) {
-                        if (m.kids[pi].kind == AK.Param()) {
-                            pts.Add(m.kids[pi].type != null ? FormatTypeNode(m.kids[pi].type) : "object");
-                        }
-                        pi = pi + 1;
+            while (mi < allMethods.Count) {
+                Node m = allMethods[mi];
+                mNames.Add(m.sval);
+                string mret = m.type != null ? FormatTypeNode(m.type) : "void";
+                mRetTys.Add(mret);
+                mRetKinds.Add(mret == "void" ? 0 : (long)ReflFkOf(mret));
+                List<string> pts = new List<string>();
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    if (m.kids[pi].kind == AK.Param()) {
+                        pts.Add(m.kids[pi].type != null ? FormatTypeNode(m.kids[pi].type) : "object");
                     }
-                    mPCnts.Add((long)pts.Count);
-                    long fl = HasMod(m, MOD.Static()) ? 1 : 0;
-                    if (HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()) || HasMod(m, MOD.Abstract())) { fl = fl | 2; }
-                    mFlags.Add(fl);
-                    mAttrs.Add(m.attrBlob != null ? m.attrBlob : "");
-                    mDeclared.Add(m.attrDeclaredData);
-                    if (pts.Count > 0) {
-                        string ptGv = "@__zan_refl_mpt_" + metaIdx + "_" + (mNames.Count - 1);
-                        StringBuilder ptb = new StringBuilder();
-                        ptb.Append(ptGv + " = private unnamed_addr constant [" + pts.Count + " x i8*] [\n");
-                        int pti = 0;
-                        while (pti < pts.Count) {
-                            ptb.Append("    i8* " + GenConstStr(pts[pti]));
-                            if (pti + 1 < pts.Count) { ptb.Append(",\n"); } else { ptb.Append("\n"); }
-                            pti = pti + 1;
-                        }
-                        ptb.Append("]");
-                        H(ptb.ToString());
-                        mPTypesGvs.Add("bitcast ([" + pts.Count + " x i8*]* " + ptGv + " to i8**)");
-                    } else {
-                        mPTypesGvs.Add("null");
+                    pi = pi + 1;
+                }
+                mPCnts.Add((long)pts.Count);
+                long fl = HasMod(m, MOD.Static()) ? 1 : 0;
+                if (HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()) || HasMod(m, MOD.Abstract())) { fl = fl | 2; }
+                mFlags.Add(fl);
+                mAttrs.Add(m.attrBlob != null ? m.attrBlob : "");
+                mDeclared.Add(m.attrDeclaredData);
+                if (pts.Count > 0) {
+                    string ptGv = "@__zan_refl_mpt_" + metaIdx + "_" + (mNames.Count - 1);
+                    StringBuilder ptb = new StringBuilder();
+                    ptb.Append(ptGv + " = private unnamed_addr constant [" + pts.Count + " x i8*] [\n");
+                    int pti = 0;
+                    while (pti < pts.Count) {
+                        ptb.Append("    i8* " + GenConstStr(pts[pti]));
+                        if (pti + 1 < pts.Count) { ptb.Append(",\n"); } else { ptb.Append("\n"); }
+                        pti = pti + 1;
                     }
-                } else if (m.kind == AK.CtorDecl() && !HasMod(m, MOD.Static())) {
+                    ptb.Append("]");
+                    H(ptb.ToString());
+                    mPTypesGvs.Add("bitcast ([" + pts.Count + " x i8*]* " + ptGv + " to i8**)");
+                } else {
+                    mPTypesGvs.Add("null");
+                }
+                mi = mi + 1;
+            }
+            int ci0 = 0;
+            while (ci0 < targetCls.kids.Count) {
+                Node m = targetCls.kids[ci0];
+                if (m.kind == AK.CtorDecl() && !HasMod(m, MOD.Static())) {
                     cNames.Add(".ctor");
                     cRetTys.Add(targetCls.sval);
                     cRetKinds.Add(15);
@@ -467,7 +504,7 @@ partial class Irgen {
                         cPTypesGvs.Add("null");
                     }
                 }
-                mi = mi + 1;
+                ci0 = ci0 + 1;
             }
             if (cNames.Count == 0 && (targetCls.kind == AK.ClassDecl() || targetCls.kind == AK.StructDecl())) {
                 cNames.Add(".ctor");

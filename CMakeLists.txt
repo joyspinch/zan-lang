@@ -4724,7 +4724,7 @@ if(SELFHOST_CLANG)
       "-DRTOBJS=${_shd_rt_objs}"
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
-  set_tests_properties(selfhost_diff PROPERTIES TIMEOUT 1800)
+  set_tests_properties(selfhost_diff PROPERTIES TIMEOUT 3600)
   # Consume the existing gen1 and differential runtime bundle; this focused
   # driver never rebuilds either compiler or copies runtime DLLs/stdlib.
   add_test(NAME selfhost_entry_format

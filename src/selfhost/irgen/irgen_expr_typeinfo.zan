@@ -537,6 +537,12 @@ partial class Irgen {
                 if (atn != null && atn.sval != null && atn.sval != "") {
                     // An open generic argument does not change the outer parameter type.
                     bool bareTypeParam = pt.ival == 0 && pt.kids.Count == 0 && MentionsTypeParam(pt);
+                    // `string` is a reference type even though binder.IsPrimitive("string") is true:
+                    // never match a numeric/bool argument against a string parameter or vice versa.
+                    if (atn.ival == 0 && pt.ival == 0 && pt.sval != "object" && atn.sval != "object" && !bareTypeParam
+                        && ((atn.sval == "string") != (pt.sval == "string"))) {
+                        return false;
+                    }
                     if (binder.IsPrimitive(atn.sval) && atn.ival == 0
                         && (pt.ival > 0 || (!binder.IsPrimitive(pt.sval)
                             && pt.sval != "object" && !bareTypeParam))) {
@@ -670,6 +676,18 @@ partial class Irgen {
         Label(done);
     }
 
+    string EmitReflectInvokeTaskResult(ExprVal cres) {
+        if (cres != null && cres.asyncCall) {
+            usesAsync = true;
+            string handle = TaskRegister(cres.op);
+            EmitTaskReadyFrame(cres, true);
+            string tok = NT();
+            L("  " + tok + " = ptrtoint i8* " + handle + " to i64");
+            return tok;
+        }
+        return "0";
+    }
+
     ExprVal EmitReflInstCall(ExprVal recv, string mname, Node e) {
         if (mname == "HasMethod") {
             string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
@@ -682,7 +700,7 @@ partial class Irgen {
         }
 
         if (mname == "Invoke" || mname == "InvokeInt" || mname == "InvokeLong"
-        || mname == "InvokeDouble" || mname == "InvokeString" || mname == "InvokeObject") {
+        || mname == "InvokeDouble" || mname == "InvokeString" || mname == "InvokeObject" || mname == "InvokeTask") {
             string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
             Node invCall = new Node(AK.Call());
             invCall.line = e.line;
@@ -696,15 +714,18 @@ partial class Irgen {
             Node cls0 = ClassOf(recv.ty);
             if (cls0 != null && cls0.sval != "object" && methName != "") {
                 Node meth = FindMethodUp(cls0, methName);
-                if (meth == null) {
+                if (meth == null || (mname == "InvokeTask" && !HasMod(meth, MOD.Async()))) {
                     if (mname == "Invoke") { return new ExprVal("0", MkType("bool")); }
                     if (mname == "InvokeInt") { return new ExprVal("0", MkType("int")); }
-                    if (mname == "InvokeLong") { return new ExprVal("0", MkType("long")); }
+                    if (mname == "InvokeLong" || mname == "InvokeTask") { return new ExprVal("0", MkType("long")); }
                     if (mname == "InvokeDouble") { return new ExprVal("0.0", MkType("double")); }
                     if (mname == "InvokeString") { return GenStr(""); }
                     if (mname == "InvokeObject") { return new ExprVal("null", MkType("object")); }
                 }
                 ExprVal cres = EmitInstanceCallAs(recv, cls0.sval, methName, invCall, false);
+                if (mname == "InvokeTask") {
+                    return new ExprVal(EmitReflectInvokeTaskResult(cres), MkType("long"));
+                }
                 if (mname == "Invoke") {
                     return new ExprVal("1", MkType("bool"));
                 }
@@ -722,6 +743,78 @@ partial class Irgen {
                 }
             }
 
+            // Computed method name on a statically typed class receiver: dispatch by strcmp over its method hierarchy.
+            if (cls0 != null && cls0.sval != "object" && methName == "" && e.kids.Count > 0) {
+                List<Node> allM = new List<Node>();
+                List<string> seenM = new List<string>();
+                CollectClassMethods(cls0, allM, seenM);
+                List<string> matchNames = new List<string>();
+                int ami = 0;
+                while (ami < allM.Count) {
+                    Node am = allM[ami];
+                    if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(am, invCall)
+                        && (mname != "InvokeTask" || HasMod(am, MOD.Async()))) {
+                        matchNames.Add(am.sval);
+                    }
+                    ami = ami + 1;
+                }
+                ExprVal nmVal = GenExpr(e.kids[0]);
+                string nmPtr = Coerce(nmVal, "i8*");
+                if (matchNames.Count > 0) {
+                    string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
+                    string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
+                    string resSlot = NT();
+                    L("  " + resSlot + " = alloca " + retTyLL);
+                    L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
+                    int lend = NL();
+                    int lchk = NL();
+                    string nonNullNm = NT();
+                    L("  " + nonNullNm + " = icmp ne i8* " + nmPtr + ", null");
+                    L("  br i1 " + nonNullNm + ", label %L" + lchk + ", label %L" + lend);
+                    Label(lchk);
+                    int mni = 0;
+                    while (mni < matchNames.Count) {
+                        string cnm = matchNames[mni];
+                        int lmatch = NL();
+                        int lnext = NL();
+                        string lit = RawCString(cnm);
+                        string eq = NT();
+                        L("  " + eq + " = call i32 @strcmp(i8* " + nmPtr + ", i8* " + lit + ")");
+                        string isEq = NT();
+                        L("  " + isEq + " = icmp eq i32 " + eq + ", 0");
+                        L("  br i1 " + isEq + ", label %L" + lmatch + ", label %L" + lnext);
+                        Label(lmatch);
+                        ExprVal cres = EmitInstanceCallAs(recv, cls0.sval, cnm, invCall, false);
+                        if (mname == "InvokeTask") {
+                            L("  store i64 " + EmitReflectInvokeTaskResult(cres) + ", i64* " + resSlot);
+                        } else if (mname == "Invoke") {
+                            L("  store i64 1, i64* " + resSlot);
+                        } else if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble") {
+                            string number = CoerceReflectInvokeNumber(cres, mname, e);
+                            L("  store " + retTyLL + " " + number + ", " + retTyLL + "* " + resSlot);
+                        } else if (mname == "InvokeString" || mname == "InvokeObject") {
+                            string sptr = Coerce(cres, "i8*");
+                            EmitArcRetainObject(sptr);
+                            L("  store i8* " + sptr + ", i8** " + resSlot);
+                        }
+                        L("  br label %L" + lend);
+                        Label(lnext);
+                        mni = mni + 1;
+                    }
+                    L("  br label %L" + lend);
+                    Label(lend);
+                    string retVal = NT();
+                    L("  " + retVal + " = load " + retTyLL + ", " + retTyLL + "* " + resSlot);
+                    if (mname == "Invoke") { return new ExprVal(retVal, MkType("bool")); }
+                    if (mname == "InvokeInt") { return new ExprVal(retVal, MkType("int")); }
+                    if (mname == "InvokeLong" || mname == "InvokeTask") { return new ExprVal(retVal, MkType("long")); }
+                    if (mname == "InvokeDouble") { return new ExprVal(retVal, MkType("double")); }
+                    Node resultType = MkType(mname == "InvokeString" ? "string" : "object");
+                    AddTemp(retVal, resultType);
+                    return new ExprVal(retVal, resultType);
+                }
+            }
+
             // Fallback for object / dynamic receiver: dispatch through candidate classes in tidNames
             if (methName != "") {
                 List<string> cands = new List<string>();
@@ -730,16 +823,18 @@ partial class Irgen {
                     string cn = tidNames[tii];
                     Node cdecl = binder.FindType(cn);
                     if (cdecl != null && ClassHasMethodWithCall(cdecl, methName, invCall)) {
-                        cands.Add(cn);
+                        if (mname != "InvokeTask" || (FindMethodUp(cdecl, methName) != null && HasMod(FindMethodUp(cdecl, methName), MOD.Async()))) {
+                            cands.Add(cn);
+                        }
                     }
                     tii = tii + 1;
                 }
-                bool isListMeth = IsContainerType("List") && (
+                bool isListMeth = mname != "InvokeTask" && IsContainerType("List") && (
                     (methName == "Count" && invCall.kids.Count == 0)
                     || ((methName == "Get" || methName == "At" || (methName == "Add" && mname == "Invoke"))
                         && invCall.kids.Count == 1));
                 if (cands.Count > 0 || isListMeth) {
-                    string retTyLL = mname == "Invoke" ? "i64" : (mname == "InvokeInt" ? "i64" : (mname == "InvokeLong" ? "i64" : (mname == "InvokeDouble" ? "double" : "i8*")));
+                    string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
                     string resSlot = NT();
                     L("  " + resSlot + " = alloca " + retTyLL);
@@ -777,7 +872,9 @@ partial class Irgen {
                         L("  " + castRecvOp + " = bitcast i8* " + rawRecv + " to %" + cand + "*");
                         ExprVal castRecv = new ExprVal(castRecvOp, MkType(cand));
                         ExprVal cres = EmitInstanceCallAs(castRecv, cand, methName, invCall, false);
-                        if (mname == "Invoke") {
+                        if (mname == "InvokeTask") {
+                            L("  store i64 " + EmitReflectInvokeTaskResult(cres) + ", i64* " + resSlot);
+                        } else if (mname == "Invoke") {
                             L("  store i64 1, i64* " + resSlot);
                         } else if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble") {
                             string number = CoerceReflectInvokeNumber(cres, mname, e);
@@ -797,7 +894,7 @@ partial class Irgen {
                     L("  " + retVal + " = load " + retTyLL + ", " + retTyLL + "* " + resSlot);
                     if (mname == "Invoke") { return new ExprVal(retVal, MkType("bool")); }
                     if (mname == "InvokeInt") { return new ExprVal(retVal, MkType("int")); }
-                    if (mname == "InvokeLong") { return new ExprVal(retVal, MkType("long")); }
+                    if (mname == "InvokeLong" || mname == "InvokeTask") { return new ExprVal(retVal, MkType("long")); }
                     if (mname == "InvokeDouble") { return new ExprVal(retVal, MkType("double")); }
                     if (mname == "InvokeString" || mname == "InvokeObject") {
                         Node resultType = MkType(mname == "InvokeString" ? "string" : "object");
@@ -808,7 +905,7 @@ partial class Irgen {
             }
             if (mname == "Invoke") { return new ExprVal("0", MkType("bool")); }
             if (mname == "InvokeInt") { return new ExprVal("0", MkType("int")); }
-            if (mname == "InvokeLong") { return new ExprVal("0", MkType("long")); }
+            if (mname == "InvokeLong" || mname == "InvokeTask") { return new ExprVal("0", MkType("long")); }
             if (mname == "InvokeDouble") { return new ExprVal("0.0", MkType("double")); }
             if (mname == "InvokeObject") { return new ExprVal("null", MkType("object")); }
             return GenStr("");

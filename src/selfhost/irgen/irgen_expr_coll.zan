@@ -662,6 +662,7 @@ partial class Irgen {
             // there. The C host's emit (irgen_call.c) leaves the out slot
             // UNTOUCHED on a miss -- so the store is behind the hit branch.
             Node oarg = e.kids[1];
+            bool explicitOut = oarg != null && oarg.kind == AK.OutArg();
             if (oarg != null && oarg.kind != AK.OutArg() && (oarg.kind == AK.Ident() || oarg.kind == AK.Index() || oarg.kind == AK.MemberAccess())) {
                 Node ow = new Node(AK.OutArg());
                 ow.a = oarg;
@@ -683,15 +684,18 @@ partial class Irgen {
             string slot = NT();
             L("  " + slot + " = call i64 @zdict_get(i8* " + recv.op + ", i8* " + kstr + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             ExprVal val = FromSlot(slot, vty);
+            string outAddr = "";
+            if (oarg.type != null) {
+                // `out T v`: a fresh local the caller sees afterwards
+                outAddr = NewOutLocal(oarg);
+            }
             int lhit = NL(); int lmiss = NL(); int ldone = NL();
             L("  br i1 " + hit + ", label %L" + lhit + ", label %L" + lmiss);
             Label(lhit);
             if (oarg.type != null) {
-                // `out T v`: a fresh local the caller sees afterwards
-                string addr = NewOutLocal(oarg);
                 string lt = MapType(oarg.type);
                 string sv = Coerce(val, lt);
-                L("  store " + lt + " " + sv + ", " + lt + "* " + addr);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + outAddr);
                 EmitArcRetain(sv, oarg.type);
             } else {
                 // `out place`: the value lands in the caller's own slot
@@ -699,6 +703,15 @@ partial class Irgen {
             }
             L("  br label %L" + ldone);
             Label(lmiss);
+            if (oarg.type != null) {
+                string lt = MapType(oarg.type);
+                L("  store " + lt + " " + ZeroConst(lt) + ", " + lt + "* " + outAddr);
+            } else if (explicitOut) {
+                // C host (call_collections.c): explicit `out` arg writes default(TValue)
+                // on miss; bare identifier without `out` keeps its prior value (tryget_pinyin).
+                ExprVal dflt = new ExprVal(ZeroConst(MapType(vty)), vty);
+                StoreTo(oarg.a, dflt);
+            }
             L("  br label %L" + ldone);
             Label(ldone);
             string z = NT();

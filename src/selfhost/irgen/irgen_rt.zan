@@ -479,8 +479,9 @@ partial class Irgen {
         // Non-string keys remain opaque tokens; existing field offsets are stable.
         // Fields 6-7 hold an optional open-addressed hash index (slot = key index + 1,
         // 0 = empty; power-of-two capacity, 0 = not built) built once count >= 8 so
-        // large dicts stay O(1). Offsets 0..5 are unchanged (foreach reads count/keys).
-        H("%zdict = type { i64, i64, i8**, i64*, i64, i64, i64*, i64 }");
+        // large dicts stay O(1). Field 8 holds the closed Dictionary<K,V> TypeInfo
+        // pointer for runtime `is`/`as` identity checks. Offsets 0..5 are unchanged.
+        H("%zdict = type { i64, i64, i8**, i64*, i64, i64, i64*, i64, i8* }");
         H("define void @zdict_dtor(i8* %p) {");
         H("entry:");
         H("  call void @zdict_clear(i8* %p)");
@@ -496,7 +497,11 @@ partial class Irgen {
         H("  ret void");
         H("}");
         H("define i8* @zdict_new(i64 %owns) {");
-        H("  %p = call i8* @zalloc(i64 64, i8* bitcast (void (i8*)* @zdict_dtor to i8*), " + ContainerCid("Dict") + ")");
+        H("  %p = call i8* @zdict_new_typed(i64 %owns, i8* null)");
+        H("  ret i8* %p");
+        H("}");
+        H("define i8* @zdict_new_typed(i64 %owns, i8* %meta) {");
+        H("  %p = call i8* @zalloc(i64 72, i8* bitcast (void (i8*)* @zdict_dtor to i8*), " + ContainerCid("Dict") + ")");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %c = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -514,7 +519,26 @@ partial class Irgen {
         H("  store i64* null, i64** %htp");
         H("  %hcp = getelementptr %zdict, %zdict* %d, i32 0, i32 7");
         H("  store i64 0, i64* %hcp");
+        H("  %mp = getelementptr %zdict, %zdict* %d, i32 0, i32 8");
+        H("  store i8* %meta, i8** %mp");
         H("  ret i8* %p");
+        H("}");
+        H("define internal i8* @zdict_typeinfo(i8* %p) {");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %slot = getelementptr %zdict, %zdict* %d, i32 0, i32 8");
+        H("  %meta = load i8*, i8** %slot");
+        H("  ret i8* %meta");
+        H("}");
+        H("define internal i1 @zdict_matches_type(i8* %p, i8* %meta) {");
+        H("  %cid = call i8* @__zan_class_id(i8* %p)");
+        H("  %isdict = icmp eq i8* %cid, bitcast (i8** @__tid_Dict to i8*)");
+        H("  br i1 %isdict, label %check, label %miss");
+        H("check:");
+        H("  %actual = call i8* @zdict_typeinfo(i8* %p)");
+        H("  %same = icmp eq i8* %actual, %meta");
+        H("  ret i1 %same");
+        H("miss:");
+        H("  ret i1 false");
         H("}");
         H("define i8* @zdict_keys(i8* %p, i64 %string_keys, i8* %meta) {");
         H("entry:");
@@ -726,6 +750,9 @@ partial class Irgen {
         H("}");
         H("define i64 @zdict_index(i8* %p, i8* %key, i64 %is_str) {");
         H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %notfound, label %nonnull");
+        H("nonnull:");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  %count = load i64, i64* %cptr");
@@ -784,6 +811,9 @@ partial class Irgen {
     void EmitDictRuntimeMutate() {
         H("define void @zdict_set(i8* %p, i8* %key, i64 %val, i64 %is_str) {");
         H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %doneu, label %nonnull");
+        H("nonnull:");
         H("  %idx = call i64 @zdict_index(i8* %p, i8* %key, i64 %is_str)");
         H("  %exists = icmp sge i64 %idx, 0");
         H("  br i1 %exists, label %update, label %insert");
@@ -971,6 +1001,12 @@ partial class Irgen {
         H("  ret i64 1");
         H("}");
         H("define i64 @zdict_count(i8* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %ret0, label %nonnull");
+        H("ret0:");
+        H("  ret i64 0");
+        H("nonnull:");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  %c = load i64, i64* %cptr");
@@ -978,6 +1014,11 @@ partial class Irgen {
         H("}");
         H("define void @zdict_clear(i8* %p) {");
         H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %ret, label %nonnull");
+        H("ret:");
+        H("  ret void");
+        H("nonnull:");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  %count = load i64, i64* %cptr");
