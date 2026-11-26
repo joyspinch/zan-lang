@@ -675,12 +675,13 @@ partial class Irgen {
             } else {
                 L("  call void @" + sym + "(" + args + ")");
             }
-            // C `free(s)` consumes the string: null out the freed lvalue so
-            // ARC never touches the dangling pointer again
+            // C `free(s)` consumes the string: null out the freed lvalue
+            // directly WITHOUT releasing the already-freed pointer (mirrors
+            // C host's emit_invalidate_freed_string).
             if (m != null && HasMod(m, MOD.Extern()) && ExternName(m) == "free"
             && aargs.Count == 1 && aargs[0] != null && freeArgIsStr
             && (aargs[0].kind == AK.Ident() || aargs[0].kind == AK.MemberAccess())) {
-                StoreTo(aargs[0], new ExprVal("null", MkType("string")));
+                InvalidateFreedString(aargs[0]);
             }
             return new ExprVal("0", MkType("void"));
         }
@@ -716,6 +717,12 @@ partial class Irgen {
             }
         }
         if (m != null && HasMod(m, MOD.Extern()) && IsStr(m.type)) {
+            if (sym == "calloc" || sym == "malloc" || sym == "realloc") {
+                // Raw C allocator returning a mutable buffer typed as `string`:
+                // keep the raw pointer (no zstr_of copy/header offset and no
+                // ARC temp release) so `free(buf)` receives the exact pointer.
+                return new ExprVal(t, m.type);
+            }
             // an extern hands back a plain C string: wrap it into the managed
             // layout so its length is exact
             t = WrapManaged(t);
@@ -916,13 +923,16 @@ partial class Irgen {
         return score;
     }
 
-    // deep receiver-shape match: concrete equality scores above a
-    // type-parameter wildcard; a mismatch scores zero
+    // deep receiver-shape match: concrete equality scores above interface/base
+    // compatibility, which scores above a type-parameter wildcard; mismatch = 0
     int MatchTypeScore(Node shape, Node conc, List<string> mtps) {
         if (shape == null || conc == null) { return 0; }
         if (IndexOfStr(mtps, shape.sval) >= 0 && shape.kids.Count == 0) { return 1; }
-        if (shape.sval != conc.sval) { return 0; }
-        int s = 2;
+        if (shape.sval != conc.sval) {
+            if (TypeImplementsOrDerives(conc, shape)) { return 2; }
+            return 0;
+        }
+        int s = 4;
         int i = 0;
         while (i < shape.kids.Count && i < conc.kids.Count) {
             s = s + MatchTypeScore(shape.kids[i], conc.kids[i], mtps);

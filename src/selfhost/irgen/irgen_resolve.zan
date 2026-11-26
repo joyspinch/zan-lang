@@ -944,9 +944,15 @@ Node ArgTypeNode(Node e) {
     if (k == AK.CharLit()) { return MkType("char"); }
     if (k == AK.BoolLit()) { return MkType("bool"); }
     if (k == AK.ThisExpr()) { return CurThisTy(); }
-    if (k == AK.CastExpr()) { return e.type; }
+    if (k == AK.CastExpr() || k == AK.AsExpr()) { return e.type; }
     if (k == AK.NewExpr()) { return e.type; }
     if (k == AK.IsExpr()) { return MkType("bool"); }
+    if (k == AK.Conditional()) {
+        Node tt = ArgTypeNode(e.b);
+        Node ft = ArgTypeNode(e.c);
+        if (tt != null && ft != null) { return MergeArmTypes(tt, ft); }
+        return tt != null ? tt : ft;
+    }
     if (k == AK.Ident()) {
         int li = LocalIdx(e.sval);
         if (li >= 0) { return locType[li]; }
@@ -1005,6 +1011,11 @@ Node ArgTypeNode(Node e) {
     if (k == AK.PostfixUnary()) { return ArgTypeNode(e.a); }
     if (k == AK.Binary()) {
         int op = e.op;
+        if (op == TK.QQ()) {
+            Node lt = ArgTypeNode(e.a);
+            Node rt = ArgTypeNode(e.b);
+            return lt != null ? lt : rt;
+        }
         if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
         || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
             return MkType("bool");
@@ -1018,7 +1029,13 @@ Node ArgTypeNode(Node e) {
     if (k == AK.Index()) {
         Node ot = ArgTypeNode(e.a);
         if (ot != null) {
+            if (ot.ival >= 1) {
+                Node et = MkType(ot.sval);
+                et.ival = ot.ival - 1;
+                return et;
+            }
             if (IsListType(ot)) { return ListElem(ot); }
+            if (IsDictType(ot)) { return DictVal(ot); }
             if (ot.sval == "string") { return MkType("char"); }
         }
         return null;
@@ -1258,6 +1275,25 @@ int ScoreCand(Node m, Node e, int argc, bool wantStatic, Node recvTy) {
                 score = score + 2;
             } else if (pt != null && (pt.sval == "string" || binder.IsPrimitive(pt.sval))) {
                 score = score - 10;
+            }
+            a = a + 1;
+            continue;
+        }
+        if (arg.kind == AK.NullLit()) {
+            if (pt != null) {
+                bool valOnly = false;
+                if (pt.op != 1 && pt.ival == 0) {
+                    if (binder.IsPrimitive(pt.sval) && pt.sval != "string" && pt.sval != "object") {
+                        valOnly = true;
+                    } else {
+                        Node td = binder.FindType(pt.sval);
+                        if (td != null && (td.kind == AK.StructDecl() || td.kind == AK.EnumDecl())) {
+                            valOnly = true;
+                        }
+                    }
+                }
+                if (valOnly) { score = score - 1000000; }
+                else { score = score + 4; }
             }
             a = a + 1;
             continue;

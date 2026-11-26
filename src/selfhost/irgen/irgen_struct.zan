@@ -50,11 +50,74 @@ partial class Irgen {
         return obj;
     }
 
+    int FieldStorageBytes(Node fty) {
+        string lt = MapFieldType(fty);
+        if (lt == "i8") { return 1; }
+        if (lt == "i16") { return 2; }
+        if (lt == "i32" || lt == "float") { return 4; }
+        if (lt == DecimalLL()) { return 16; }
+        return 8;
+    }
+
+    int FieldByteOffset(Node cls, string name) {
+        if (cls == null) { return 0; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node k = cls.kids[i];
+            if (k.kind == AK.FieldDecl() && k.sval == name) {
+                if (k.fieldOffset >= 0) { return k.fieldOffset; }
+                return 0;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    int ExplicitStructBytes(Node cls) {
+        int maxEnd = 1;
+        if (cls == null) { return maxEnd; }
+        string savedScope = typeScopeCls;
+        typeScopeCls = cls.sval;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node k = cls.kids[i];
+            if (k.kind == AK.FieldDecl() && !IsStatic(k)) {
+                int off = k.fieldOffset >= 0 ? k.fieldOffset : 0;
+                int end = off + FieldStorageBytes(k.type);
+                if (end > maxEnd) { maxEnd = end; }
+            }
+            i = i + 1;
+        }
+        typeScopeCls = savedScope;
+        return maxEnd;
+    }
+
+    string EmitFieldPtr(Node cls, string clsName, string objOp, string field, string ft) {
+        if (cls != null && cls.kind == AK.StructDecl() && cls.layoutExplicit) {
+            int off = FieldByteOffset(cls, field);
+            string raw = NT();
+            L("  " + raw + " = bitcast %" + clsName + "* " + objOp + " to i8*");
+            string bp = raw;
+            if (off > 0) {
+                bp = NT();
+                L("  " + bp + " = getelementptr i8, i8* " + raw + ", i64 " + off);
+            }
+            string fp = NT();
+            L("  " + fp + " = bitcast i8* " + bp + " to " + ft + "*");
+            return fp;
+        }
+        int idx = FieldIndex(cls, field);
+        string p = NT();
+        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        return p;
+    }
+
     // A struct-typed field holds a pointer to a nested instance. Every
     // instance therefore needs its nested instances allocated (zeroed) --
     // otherwise writing a nested field dereferences a null pointer.
     void InitNestedFields(string obj, Node decl) {
         if (decl == null) { return; }
+        if (decl.kind == AK.StructDecl() && decl.layoutExplicit) { return; }
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(decl, names, types);
@@ -85,6 +148,11 @@ partial class Irgen {
         H("  %szi = ptrtoint %" + cn + "* %szp to i64");
         H("  %raw = call i8* @zalloc(i64 %szi, i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
         H("  %obj = bitcast i8* %raw to %" + cn + "*");
+        if (decl.kind == AK.StructDecl() && decl.layoutExplicit) {
+            H("  ret i8* %raw");
+            H("}");
+            return;
+        }
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(decl, names, types);
@@ -138,6 +206,16 @@ partial class Irgen {
     // fields are copied recursively.
     void CopyStructInto(string dst, string src, Node decl) {
         if (decl == null) { return; }
+        if (decl.kind == AK.StructDecl() && decl.layoutExplicit) {
+            string cn0 = decl.sval;
+            int sz = ExplicitStructBytes(decl);
+            string d8 = NT();
+            L("  " + d8 + " = bitcast %" + cn0 + "* " + dst + " to i8*");
+            string s8 = NT();
+            L("  " + s8 + " = bitcast %" + cn0 + "* " + src + " to i8*");
+            L("  call i8* @memcpy(i8* " + d8 + ", i8* " + s8 + ", i64 " + sz + ")");
+            return;
+        }
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(decl, names, types);

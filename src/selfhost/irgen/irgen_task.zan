@@ -101,6 +101,8 @@ partial class Irgen {
         H("@co_head = global i8* null");
         H("@co_tail = global i8* null");
         H("@co_fallback_active = internal global i1 false");
+        H("@co_slice_start = internal global i64 0");
+        H("@co_poll_tick = internal global i64 0");
         // Coroutine re-entrancy depth: >0 while the scheduler is executing a
         // frame's step function. Task.IsDone consults it to decide whether it
         // may drive the scheduler (see EmitTaskIsDone): a query issued from
@@ -210,6 +212,38 @@ partial class Irgen {
         H("  store i8* %n, i8** @co_tail");
         H("  ret void");
         H("}");
+        // Symmetric transfer for awaited child coroutines: when the fallback
+        // FIFO scheduler is active, prepend the child at @co_head so it runs
+        // immediately next (matching the multi-worker runtime's LIFO fast-slot
+        // without growing the C stack). Task.Yield / Spawn / timers continue
+        // to use @zan_co_ready (FIFO tail) for fairness.
+        H("define internal void @co_ready_child(i8* %frame, void(i8*)* %step) {");
+        H("entry:");
+        H("  %fb = load i1, i1* @co_fallback_active");
+        H("  br i1 %fb, label %front, label %deleg");
+        H("deleg:");
+        H("  call void @zan_co_ready(i8* %frame, void(i8*)* %step)");
+        H("  ret void");
+        H("front:");
+        H("  %n = call i8* @malloc(i64 24)");
+        H("  %np = bitcast i8* %n to %co_node*");
+        H("  %oldh = load i8*, i8** @co_head");
+        H("  %nx = getelementptr %co_node, %co_node* %np, i32 0, i32 0");
+        H("  store i8* %oldh, i8** %nx");
+        H("  %frp = getelementptr %co_node, %co_node* %np, i32 0, i32 1");
+        H("  store i8* %frame, i8** %frp");
+        H("  %stp = getelementptr %co_node, %co_node* %np, i32 0, i32 2");
+        H("  %si = bitcast void(i8*)* %step to i8*");
+        H("  store i8* %si, i8** %stp");
+        H("  store i8* %n, i8** @co_head");
+        H("  %wasempty = icmp eq i8* %oldh, null");
+        H("  br i1 %wasempty, label %settail, label %done");
+        H("settail:");
+        H("  store i8* %n, i8** @co_tail");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
         H("define weak void @zan_co_ready_batch(i8* %tasks, i64 %count) {");
         H("entry:");
         H("  %cmp = icmp ule i64 %count, 0");
@@ -237,6 +271,30 @@ partial class Irgen {
         H("  call void @zan_timer_delay(i64 %ms, i8* %frame, void(i8*)* %step)");
         H("  ret void");
         H("}");
+        H("define weak i32 @zan_co_poll() {");
+        H("entry:");
+        H("  %tk = load i64, i64* @co_poll_tick");
+        H("  %ntk = add i64 %tk, 1");
+        H("  store i64 %ntk, i64* @co_poll_tick");
+        H("  %mask = and i64 %ntk, 1023");
+        H("  %chk = icmp eq i64 %mask, 0");
+        H("  br i1 %chk, label %check_time, label %no");
+        H("check_time:");
+        H("  %s0 = load i64, i64* @co_slice_start");
+        H("  %has = icmp ne i64 %s0, 0");
+        H("  br i1 %has, label %measure, label %no");
+        H("measure:");
+        H("  %now = call i64 @zan_co_precise_us()");
+        H("  %el = sub i64 %now, %s0");
+        H("  %qms = call i64 @zan_co_quantum_ms()");
+        H("  %qus = mul i64 %qms, 1000");
+        H("  %over = icmp sge i64 %el, %qus");
+        H("  br i1 %over, label %yes, label %no");
+        H("yes:");
+        H("  ret i32 1");
+        H("no:");
+        H("  ret i32 0");
+        H("}");
     }
 
     /// The fallback scheduler stops on task completion, a sync delay deadline,
@@ -245,8 +303,10 @@ partial class Irgen {
         H("declare i64 @zan_timer_dispatch_due_wait()");
         H("declare i64 @zan_timer_next_timeout()");
         H("declare i64 @zan_co_precise_us()");
+        H("declare i64 @zan_co_quantum_ms()");
         H("declare i64 @zan_timer_saturating_due_us(i64, i64)");
         H("declare void @zan_co_sync_sleep(i64)");
+        H("declare void @zan_task_run_profiled(i8*, void(i8*)*)");
         H("define internal void @co_sched_drive(i32* %done, i64 %deadline) {");
         H("entry:");
         H("  %timed = icmp ne i64 %deadline, 0");
@@ -292,7 +352,12 @@ partial class Irgen {
         H("  %dpold = load i32, i32* @__zan_co_depth");
         H("  %dpnew = add i32 %dpold, 1");
         H("  store i32 %dpnew, i32* @__zan_co_depth");
-        H("  call void %stfn(i8* %fr)");
+        H("  %s0old = load i64, i64* @co_slice_start");
+        H("  %s0now = call i64 @zan_co_precise_us()");
+        H("  store i64 %s0now, i64* @co_slice_start");
+        H("  store i64 0, i64* @co_poll_tick");
+        H("  call void @zan_task_run_profiled(i8* %fr, void(i8*)* %stfn)");
+        H("  store i64 %s0old, i64* @co_slice_start");
         H("  store i32 %dpold, i32* @__zan_co_depth");
         H("  br label %loop");
         H("idle:");

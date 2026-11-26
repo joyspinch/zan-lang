@@ -247,7 +247,6 @@ partial class Irgen {
     ExprVal LoadField(string objOp, Node recvTy, string field) {
         string clsName = recvTy.sval;
         Node cls = binder.FindType(clsName);
-        int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
         // the concrete type of the field, when the receiver's static type
         // carries the class's type arguments (`Box<double>.values` is a
@@ -255,8 +254,7 @@ partial class Irgen {
         // gets its real type back
         Node vty = SubstRecvTy(fty, recvTy);
         string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
-        string p = NT();
-        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        string p = EmitFieldPtr(cls, clsName, objOp, field, ft);
         string t = NT();
         L("  " + t + " = load " + ft + ", " + ft + "* " + p);
         if (cls != null && cls.kind == AK.StructDecl() && ft != "i64" && (ft == "i8" || ft == "i16" || ft == "i32")) {
@@ -705,26 +703,30 @@ partial class Irgen {
             string bad = ParseBadPred(s, ep);
             string erl = NT();
             L("  " + erl + " = load i32, i32* " + errp);
-            string erb = NT();
-            L("  " + erb + " = icmp eq i32 " + erl + ", 34");
-            string ber = NT();
-            L("  " + ber + " = or i1 " + bad + ", " + erb);
-            bad = ber;
+            string ov = NT();
+            L("  " + ov + " = icmp eq i32 " + erl + ", 34");
             if (!int64) {
                 string lo = NT();
                 L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
                 string hi = NT();
                 L("  " + hi + " = icmp sgt i64 " + r + ", 2147483647");
-                string ov = NT();
-                L("  " + ov + " = or i1 " + lo + ", " + hi);
-                string b2 = NT();
-                L("  " + b2 + " = or i1 " + bad + ", " + ov);
-                bad = b2;
+                string o32 = NT();
+                L("  " + o32 + " = or i1 " + lo + ", " + hi);
+                string ov2 = NT();
+                L("  " + ov2 + " = or i1 " + ov + ", " + o32);
+                ov = ov2;
             }
-            EmitRuntimeCheckIf(at, bad,
-                "Convert.ToInt*: input is not a valid integer (or out of range)");
+            string notBad = NT();
+            L("  " + notBad + " = xor i1 " + bad + ", true");
+            string ovOnly = NT();
+            L("  " + ovOnly + " = and i1 " + notBad + ", " + ov);
+            EmitRuntimeCheckIf(at, bad, "Convert.ToInt*: input is not a valid integer");
+            EmitRuntimeCheckIf(at, ovOnly,
+                "Convert.ToInt*: value is outside the range of " + (int64 ? "long" : "int"));
+            string anyBad = NT();
+            L("  " + anyBad + " = or i1 " + bad + ", " + ov);
             string safe = NT();
-            L("  " + safe + " = select i1 " + bad + ", i64 0, i64 " + r);
+            L("  " + safe + " = select i1 " + anyBad + ", i64 0, i64 " + r);
             return safe;
         }
         if (IsDbl(a.ty)) {

@@ -571,7 +571,7 @@ partial class Irgen {
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         Label(lb);
         GenStmt(s.b);
-        if (!term) { L("  br label %L" + lc); }
+        if (!term) { EmitAsyncPreemptSite(lc); }
         Label(lend);
         syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
@@ -610,7 +610,14 @@ partial class Irgen {
             } else {
                 c = GenCond(s.a);
             }
-            L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+            if (curAsync) {
+                int lback = NL();
+                L("  br i1 " + c + ", label %L" + lback + ", label %L" + lend);
+                Label(lback);
+                EmitAsyncPreemptSite(lb);
+            } else {
+                L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+            }
         }
         Label(lend);
         syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
@@ -655,7 +662,7 @@ partial class Irgen {
                 GenExpr(s.c);
             }
         }
-        L("  br label %L" + lc);
+        EmitAsyncPreemptSite(lc);
         Label(lend);
         ReleaseLocalsFrom(forScope);
         TrimLocals(forScope);
@@ -792,7 +799,9 @@ partial class Irgen {
         ExprVal coll = GenExpr(s.b);
         bool feDict = coll.ty != null && (coll.ty.sval == "Dictionary" || coll.ty.sval.IndexOf("Dictionary<") == 0
                                           || coll.ty.sval == "Dict" || coll.ty.sval.IndexOf("Dict<") == 0);
+        ExprVal dictOrig = null;
         if (feDict) {
+            dictOrig = coll;
             Node keysRef = new Node(AK.MemberAccess());
             keysRef.a = s.b;
             keysRef.sval = "Keys";
@@ -838,6 +847,11 @@ partial class Irgen {
             MaterializeAsyncLoopLocal(creg, cty, s.ival);
             L("  store " + cty + " " + coll.op + ", " + cty + "* " + creg);
             asyncSlotReg.Add(creg); asyncSlotTy.Add(coll.ty); asyncSlotIdx.Add(s.ival);
+            if (feDict && dictOrig != null) {
+                string dp0 = NT();
+                L("  " + dp0 + " = bitcast i64* " + FrameGep("%ff", s.ival + 5) + " to i8**");
+                L("  store i8* " + dictOrig.op + ", i8** " + dp0);
+            }
         }
         string idx = NT();
         if (!curAsync) {
@@ -874,7 +888,9 @@ partial class Irgen {
         // in the coroutine frame for async bodies (it must survive awaits).
         string feSnap = NT();
         string cnt0 = NT();
-        if (feList) {
+        if (feDict && dictOrig != null) {
+            L("  " + cnt0 + " = call i64 @zdict_count(i8* " + dictOrig.op + ")");
+        } else if (feList) {
             L("  " + cnt0 + " = call i64 @zlist_count(i8* " + coll.op + ")");
         } else if (feArr) {
             string lp0 = NT();
@@ -929,6 +945,18 @@ partial class Irgen {
         // label). For async bodies the snapshot pointer is re-derived: a
         // pointer computed before the loop does not dominate the header once
         // the body can be re-entered from a resume block.
+        string liveCnt = cnt;
+        if (feDict && dictOrig != null) {
+            string dv = dictOrig.op;
+            if (curAsync) {
+                string dp1 = NT();
+                L("  " + dp1 + " = bitcast i64* " + FrameGep("%ff", s.ival + 5) + " to i8**");
+                dv = NT();
+                L("  " + dv + " = load i8*, i8** " + dp1);
+            }
+            liveCnt = NT();
+            L("  " + liveCnt + " = call i64 @zdict_count(i8* " + dv + ")");
+        }
         string sn = NT();
         if (curAsync) {
             L("  " + sn + " = load i64, i64* " + FrameGep("%ff", s.ival + 4));
@@ -936,7 +964,7 @@ partial class Irgen {
             L("  " + sn + " = load i64, i64* " + feSnap);
         }
         string mut = NT();
-        L("  " + mut + " = icmp ne i64 " + cnt + ", " + sn);
+        L("  " + mut + " = icmp ne i64 " + liveCnt + ", " + sn);
         int lmut = NL(); int lgo = NL();
         L("  br i1 " + mut + ", label %L" + lmut + ", label %L" + lgo);
         Label(lmut);
@@ -998,7 +1026,7 @@ partial class Irgen {
             L("  " + inc + " = add i64 " + iv2 + ", 1");
             L("  store i64 " + inc + ", i64* " + idx);
         }
-        L("  br label %L" + lc);
+        EmitAsyncPreemptSite(lc);
         Label(lend);
         ReleaseLocalsFrom(feScope);
         TrimLocals(feScope);

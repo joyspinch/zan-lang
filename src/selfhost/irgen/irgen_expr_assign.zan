@@ -43,6 +43,71 @@ partial class Irgen {
         }
     }
 
+    // Null out a string lvalue after C `free(s)` without emitting ARC release
+    // on the already-freed pointer (mirrors C host emit_invalidate_freed_string).
+    void InvalidateFreedString(Node lhs) {
+        if (lhs == null) { return; }
+        if (lhs.kind == AK.Ident()) {
+            int li = LocalIdx(lhs.sval);
+            if (li >= 0) {
+                if (locBox[li]) {
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[li]);
+                    string p = NT();
+                    L("  " + p + " = getelementptr inbounds i8, i8* " + c + ", i64 8");
+                    string p2 = NT();
+                    L("  " + p2 + " = bitcast i8* " + p + " to i8**");
+                    L("  store i8* null, i8** " + p2);
+                } else {
+                    L("  store i8* null, i8** " + locReg[li]);
+                }
+                return;
+            }
+            if (curHasThis) {
+                Node cls = binder.FindType(curClass);
+                if (cls != null && FieldIndex(cls, lhs.sval) >= 0) {
+                    string fp = EmitFieldPtr(cls, curClass, "%this", lhs.sval, "i8*");
+                    L("  store i8* null, i8** " + fp);
+                    return;
+                }
+            }
+            if (curClass != "") {
+                Node scls = binder.FindType(curClass);
+                if (scls != null && FindStaticField(scls, lhs.sval) != null) {
+                    string sown = StaticFieldOwner(scls, lhs.sval);
+                    List<Node> sargs = CurInstFor(sown);
+                    DemandStaticType(sown, sargs);
+                    EnsureStaticGlobal(sown, lhs.sval, sargs, "i8*");
+                    string g = StaticGlobal(sown, lhs.sval, sargs);
+                    L("  store i8* null, i8** " + g);
+                    return;
+                }
+            }
+            return;
+        }
+        if (lhs.kind == AK.MemberAccess()) {
+            if (IsTypeReceiver(lhs.a, lhs.sval)) {
+                Node tc = binder.FindType(lhs.a.sval);
+                if (tc != null && FindStaticField(tc, lhs.sval) != null) {
+                    string sown = StaticFieldOwner(tc, lhs.sval);
+                    List<Node> sargs = ConcreteInstArgs(lhs, tc.sval);
+                    DemandStaticType(sown, sargs);
+                    EnsureStaticGlobal(sown, lhs.sval, sargs, "i8*");
+                    string g = StaticGlobal(sown, lhs.sval, sargs);
+                    L("  store i8* null, i8** " + g);
+                    return;
+                }
+            }
+            ExprVal obj = GenPlaceReceiver(lhs.a, true);
+            Node ocls = binder.FindType(obj.ty.sval);
+            if (ocls != null && FieldIndex(ocls, lhs.sval) >= 0) {
+                string fp = EmitFieldPtr(ocls, obj.ty.sval, obj.op, lhs.sval, "i8*");
+                L("  store i8* null, i8** " + fp);
+                return;
+            }
+        }
+    }
+
     // ---- assignment ----
     ExprVal GenAssign(Node e) {
         Node target = e.a;
@@ -325,8 +390,14 @@ partial class Irgen {
             ExprVal obj = GenPlaceReceiver(lhs.a, true);
             string cn = obj.ty.sval;
             Node ocls = binder.FindType(cn);
-            if (ocls != null && FieldIndex(ocls, lhs.sval) < 0
-                && EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
+            if (ocls != null && FieldIndex(ocls, lhs.sval) < 0) {
+                if (EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
+                if (FindStaticField(ocls, lhs.sval) != null) {
+                    string sown = StaticFieldOwner(ocls, lhs.sval);
+                    StoreStaticField(ocls, lhs.sval, v, CurInstFor(sown));
+                    return;
+                }
+            }
             if (ocls != null) {
                 // Convert to the field's type on this receiver. StoreField
                 // still uses the declared type for the physical slot layout.
@@ -670,10 +741,9 @@ partial class Irgen {
         // (zeroinitializer / all-ones) and must not touch memory
         if (clsName == "Vector128" || clsName == "Vector256") { return; }
         Node cls = binder.FindType(clsName);
-        int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
-        string p = NT();
-        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        string ft = IsErasedType(fty) ? "i64" : (cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty));
+        string p = EmitFieldPtr(cls, clsName, objOp, field, ft);
         // erased field: pack the value into an i64 slot
         if (IsErasedType(fty)) {
             // a struct value is copied: the field holds its own instance
@@ -702,7 +772,6 @@ partial class Irgen {
             StoreNullable(p, v, fty, true);
             return;
         }
-        string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
         ExprVal src = StrSlotConv(fty, v);
         src = NarrowToDeclared(src, fty);
         if (field == "target" && IsBorrowedBindingField(BindingFieldOwner(cls, field), field)) {

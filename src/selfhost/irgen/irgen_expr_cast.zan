@@ -144,26 +144,45 @@ partial class Irgen {
             if (refTarget && !HasStaticReferenceConversion(v.ty, tgt)) {
                 int lok = NL();
                 int lbad = NL();
+                string nullLbl = "";
                 if (!isStruct) {
                     // A null reference converts successfully. A struct unbox
                     // still requires a matching runtime object.
                     int lcheck = NL();
                     string nil = NT();
                     L("  " + nil + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
+                    nullLbl = curLbl;
                     L("  br i1 " + nil + ", label %L" + lok + ", label %L" + lcheck);
                     Label(lcheck);
                 }
                 string ok = EmitReferenceTypeTest(v, tgt);
-                L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
-                Label(lbad);
                 if (isStruct) {
+                    L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
+                    Label(lbad);
                     EmitCastThrow("InvalidCastException: object is not an instance of the target struct type");
-                } else {
-                    EmitCastThrow("InvalidCastException: object is not an instance of the target type");
+                    Label(lok);
+                    term = false;
+                    ExprVal converted = new ExprVal(Coerce(v, MapType(tgt)), tgt);
+                    converted.ownerTemp = v.ownerTemp;
+                    return converted;
                 }
+                // A509 dual-track reference downcast: throws InvalidCastException
+                // inside try, exits 70 under --strict-runtime, and reports a soft
+                // diagnostic + falls back to null outside try.
+                string bad = NT();
+                L("  " + bad + " = xor i1 " + ok + ", true");
+                EmitRuntimeCheckIf(e, bad, "InvalidCastException: object is not an instance of the target type");
+                string tll = MapType(tgt);
+                string cv = Coerce(v, tll);
+                string res = NT();
+                L("  " + res + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
+                string fromChk = curLbl;
+                L("  br label %L" + lok);
                 Label(lok);
                 term = false;
-                ExprVal converted = new ExprVal(Coerce(v, MapType(tgt)), tgt);
+                string fin = NT();
+                L("  " + fin + " = phi " + tll + " [ null, %" + nullLbl + " ], [ " + res + ", %" + fromChk + " ]");
+                ExprVal converted = new ExprVal(fin, tgt);
                 converted.ownerTemp = v.ownerTemp;
                 return converted;
             }

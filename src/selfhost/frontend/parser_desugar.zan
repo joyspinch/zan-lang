@@ -4,25 +4,388 @@ namespace Zan;
 
 public partial class Parser {
 
-    // Iterator methods are lowered eagerly: a method containing `yield` gets a
-    // hidden `List<T> __yield` accumulator, each `yield return e` appends to it,
-    // `yield break` returns it early, and the method returns the finished list
-    // (its IEnumerable<T> return type is rewritten to List<T>, which foreach
-    // already iterates). Mirrors the C host desugar_yield.
+    int iterSynthCounter;
+
+    // Lazy iterator state-machine desugaring (mirrors C host iter_desugar_method
+    // in src/compiler/parser/parser_type_decl.c): a static `IEnumerable<T>`
+    // method containing `yield` synthesizes a `__Iter_<name>_<id>` class
+    // implementing `IEnumerator<T>, IEnumerable<T>`, hoisting params and locals
+    // to fields and rewriting each `yield return v` to
+    // `{ __cur = v; __state = N; return true; RN: }`.
     void DesugarIterators(Node unit) {
+        int origCount = unit.kids.Count;
         int di = 0;
-        while (di < unit.kids.Count) {
+        while (di < origCount) {
             Node d = unit.kids[di];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
                 int mi = 0;
                 while (mi < d.kids.Count) {
                     Node m = d.kids[mi];
-                    if (m.kind == AK.MethodDecl() && m.d != null) { DesugarYieldMethod(m); }
+                    if (m.kind == AK.MethodDecl() && m.d != null && StmtHasYield(m.d)) {
+                        if (m.type != null && m.type.sval == "IEnumerable" && m.type.kids.Count == 1
+                                && HasModBit(m.mods, MOD.Static())) {
+                            DesugarLazyIterator(unit, d, m);
+                        } else {
+                            DesugarYieldMethod(m);
+                        }
+                    }
                     mi = mi + 1;
                 }
             }
             di = di + 1;
         }
+    }
+
+    Node IterTypeRef(string name, int line, int col) {
+        Node t = new Node(AK.TypeRef());
+        t.sval = name; t.line = line; t.col = col;
+        return t;
+    }
+
+    Node IterIdent(string name, int line, int col) {
+        Node n = new Node(AK.Ident());
+        n.sval = name; n.line = line; n.col = col;
+        return n;
+    }
+
+    Node IterBool(bool v, int line, int col) {
+        Node n = new Node(AK.BoolLit());
+        n.ival = v ? 1 : 0; n.line = line; n.col = col;
+        return n;
+    }
+
+    Node IterInt(long v, int line, int col) {
+        Node n = new Node(AK.IntLit());
+        n.ival = v; n.line = line; n.col = col;
+        return n;
+    }
+
+    Node IterAssign(Node lhs, Node rhs, int line, int col) {
+        Node n = new Node(AK.Assignment());
+        n.op = TK.Eq(); n.a = lhs; n.b = rhs; n.line = line; n.col = col;
+        return n;
+    }
+
+    Node IterMember(Node obj, string name, int line, int col) {
+        Node n = new Node(AK.MemberAccess());
+        n.a = obj; n.sval = name; n.line = line; n.col = col;
+        return n;
+    }
+
+    void IterAddField(Node cls, string name, Node ftype, int line, int col) {
+        Node f = new Node(AK.FieldDecl());
+        f.sval = name; f.type = ftype; f.mods = 0; f.line = line; f.col = col;
+        cls.Add(f);
+    }
+
+    bool IterEncHasMember(Node enc, string name) {
+        int i = 0;
+        while (i < enc.kids.Count) {
+            Node mm = enc.kids[i];
+            if ((mm.kind == AK.MethodDecl() || mm.kind == AK.FieldDecl() || mm.kind == AK.PropertyDecl())
+                    && mm.sval == name) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void IterFixExpr(Node e, Node enc, List<string> hoisted) {
+        if (e == null) { return; }
+        int k = e.kind;
+        if (k == AK.Ident()) {
+            if (e.sval != "" && !ContainsStr(hoisted, e.sval) && IterEncHasMember(enc, e.sval)) {
+                string nm = e.sval;
+                e.kind = AK.MemberAccess();
+                e.a = IterIdent(enc.sval, e.line, e.col);
+                e.sval = nm;
+            }
+            return;
+        }
+        if (k == AK.Binary() || k == AK.Assignment() || k == AK.Index()) {
+            IterFixExpr(e.a, enc, hoisted);
+            IterFixExpr(e.b, enc, hoisted);
+            return;
+        }
+        if (k == AK.Unary() || k == AK.PostfixUnary() || k == AK.MemberAccess()
+                || k == AK.CastExpr() || k == AK.IsExpr() || k == AK.AsExpr() || k == AK.AwaitExpr()) {
+            IterFixExpr(e.a, enc, hoisted);
+            return;
+        }
+        if (k == AK.Call()) {
+            IterFixExpr(e.a, enc, hoisted);
+            int i = 0;
+            while (i < e.kids.Count) { IterFixExpr(e.kids[i], enc, hoisted); i = i + 1; }
+            return;
+        }
+        if (k == AK.Conditional()) {
+            IterFixExpr(e.a, enc, hoisted);
+            IterFixExpr(e.b, enc, hoisted);
+            IterFixExpr(e.c, enc, hoisted);
+            return;
+        }
+        if (k == AK.NewExpr() || k == AK.TupleExpr()) {
+            int i = 0;
+            while (i < e.kids.Count) { IterFixExpr(e.kids[i], enc, hoisted); i = i + 1; }
+            return;
+        }
+        if (k == AK.CallInit()) {
+            IterFixExpr(e.a, enc, hoisted);
+            int i = 0;
+            while (i < e.kids.Count) { IterFixExpr(e.kids[i], enc, hoisted); i = i + 1; }
+            return;
+        }
+    }
+
+    void IterHoistVarDecl(Node s, Node cls, List<string> hoisted) {
+        string name = s.sval;
+        if (!ContainsStr(hoisted, name)) {
+            hoisted.Add(name);
+            Node ft = s.type != null ? s.type : IterTypeRef("int", s.line, s.col);
+            IterAddField(cls, name, ft, s.line, s.col);
+        }
+        if (s.b != null) {
+            Node asg = IterAssign(IterIdent(name, s.line, s.col), s.b, s.line, s.col);
+            s.kind = AK.ExprStmt();
+            s.a = asg;
+            s.b = null;
+            s.type = null;
+            s.sval = "";
+        } else {
+            s.kind = AK.Block();
+            s.a = null;
+            s.b = null;
+            s.type = null;
+            s.sval = "";
+            s.kids = new List<Node>();
+        }
+    }
+
+    int IterRewriteStmt(Node s, Node cls, Node enc, List<string> hoisted, int nextState) {
+        if (s == null) { return nextState; }
+        int k = s.kind;
+        if (k == AK.YieldStmt()) {
+            int ln = s.line; int cl = s.col;
+            if (s.a != null) {
+                IterFixExpr(s.a, enc, hoisted);
+                int st = nextState + 1;
+                Node e1 = new Node(AK.ExprStmt()); e1.line = ln; e1.col = cl;
+                e1.a = IterAssign(IterIdent("__cur", ln, cl), s.a, ln, cl);
+                Node e2 = new Node(AK.ExprStmt()); e2.line = ln; e2.col = cl;
+                e2.a = IterAssign(IterIdent("__state", ln, cl), IterInt(st, ln, cl), ln, cl);
+                Node rt = new Node(AK.ReturnStmt()); rt.line = ln; rt.col = cl;
+                rt.a = IterBool(true, ln, cl);
+                Node lb = new Node(AK.LabelStmt()); lb.line = ln; lb.col = cl;
+                lb.sval = "R" + st;
+                s.kind = AK.Block();
+                s.a = null;
+                s.kids = new List<Node>();
+                s.Add(e1);
+                s.Add(e2);
+                s.Add(rt);
+                s.Add(lb);
+                return st;
+            }
+            s.kind = AK.ReturnStmt();
+            s.a = IterBool(false, ln, cl);
+            return nextState;
+        }
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) {
+                nextState = IterRewriteStmt(s.kids[i], cls, enc, hoisted, nextState);
+                i = i + 1;
+            }
+            return nextState;
+        }
+        if (k == AK.ExprStmt() || k == AK.ReturnStmt() || k == AK.ThrowStmt()) {
+            IterFixExpr(s.a, enc, hoisted);
+            return nextState;
+        }
+        if (k == AK.IfStmt()) {
+            IterFixExpr(s.a, enc, hoisted);
+            nextState = IterRewriteStmt(s.b, cls, enc, hoisted, nextState);
+            nextState = IterRewriteStmt(s.c, cls, enc, hoisted, nextState);
+            return nextState;
+        }
+        if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.LockStmt()) {
+            IterFixExpr(s.a, enc, hoisted);
+            return IterRewriteStmt(s.b, cls, enc, hoisted, nextState);
+        }
+        if (k == AK.ForStmt()) {
+            if (s.a != null) {
+                if (s.a.kind == AK.VarDecl()) {
+                    IterFixExpr(s.a.b, enc, hoisted);
+                    IterHoistVarDecl(s.a, cls, hoisted);
+                } else if (s.a.kind == AK.ExprStmt()) {
+                    IterFixExpr(s.a.a, enc, hoisted);
+                } else {
+                    IterFixExpr(s.a, enc, hoisted);
+                }
+            }
+            IterFixExpr(s.b, enc, hoisted);
+            IterFixExpr(s.c, enc, hoisted);
+            return IterRewriteStmt(s.d, cls, enc, hoisted, nextState);
+        }
+        if (k == AK.ForeachStmt()) {
+            IterFixExpr(s.b, enc, hoisted);
+            return IterRewriteStmt(s.c, cls, enc, hoisted, nextState);
+        }
+        if (k == AK.SwitchStmt()) {
+            IterFixExpr(s.a, enc, hoisted);
+            int i = 0;
+            while (i < s.kids.Count) {
+                nextState = IterRewriteStmt(s.kids[i].b, cls, enc, hoisted, nextState);
+                i = i + 1;
+            }
+            return nextState;
+        }
+        if (k == AK.VarDecl()) {
+            IterFixExpr(s.b, enc, hoisted);
+            IterHoistVarDecl(s, cls, hoisted);
+            return nextState;
+        }
+        if (k == AK.TryStmt()) {
+            nextState = IterRewriteStmt(s.a, cls, enc, hoisted, nextState);
+            if (s.c != null) { nextState = IterRewriteStmt(s.c, cls, enc, hoisted, nextState); }
+            return nextState;
+        }
+        return nextState;
+    }
+
+    void DesugarLazyIterator(Node unit, Node enc, Node m) {
+        Node rt = m.type;
+        Node elemTy = rt.kids[0];
+        int ln = m.line; int cl = m.col;
+
+        string clsName = "__Iter_" + m.sval + "_" + iterSynthCounter;
+        iterSynthCounter = iterSynthCounter + 1;
+
+        Node cls = new Node(AK.ClassDecl());
+        cls.sval = clsName;
+        cls.mods = 0;
+        cls.line = ln; cls.col = cl;
+
+        Node ibase = IterTypeRef("IEnumerator", ln, cl);
+        ibase.Add(elemTy);
+        ibase.a = elemTy;
+        cls.sval2 = "IEnumerator";
+        cls.type = ibase;
+
+        Node ebase = IterTypeRef("IEnumerable", ln, cl);
+        ebase.Add(elemTy);
+        ebase.a = elemTy;
+        cls.interfaces.Add("IEnumerable");
+        cls.interfaceRefs = new List<Node>();
+        cls.interfaceRefs.Add(ebase);
+
+        IterAddField(cls, "__state", IterTypeRef("int", ln, cl), ln, cl);
+        IterAddField(cls, "__cur", elemTy, ln, cl);
+
+        List<string> hoisted = new List<string>();
+        Node ctor = new Node(AK.CtorDecl());
+        ctor.sval = clsName;
+        ctor.mods = MOD.Public();
+        ctor.line = ln; ctor.col = cl;
+        Node cbody = new Node(AK.Block());
+        cbody.line = ln; cbody.col = cl;
+        ctor.d = cbody;
+
+        Node nw = new Node(AK.NewExpr());
+        nw.type = IterTypeRef(clsName, ln, cl);
+        nw.line = ln; nw.col = cl;
+
+        int pi = 0;
+        while (pi < m.kids.Count) {
+            Node pm = m.kids[pi];
+            if (pm.kind == AK.Param()) {
+                IterAddField(cls, pm.sval, pm.type, ln, cl);
+                Node np = new Node(AK.Param());
+                np.sval = pm.sval; np.type = pm.type; np.line = ln; np.col = cl;
+                ctor.Add(np);
+                Node asStmt = new Node(AK.ExprStmt()); asStmt.line = ln; asStmt.col = cl;
+                Node th = new Node(AK.ThisExpr()); th.line = ln; th.col = cl;
+                asStmt.a = IterAssign(IterMember(th, pm.sval, ln, cl), IterIdent(pm.sval, ln, cl), ln, cl);
+                cbody.Add(asStmt);
+                hoisted.Add(pm.sval);
+                nw.Add(IterIdent(pm.sval, ln, cl));
+            }
+            pi = pi + 1;
+        }
+        cls.Add(ctor);
+
+        int maxState = IterRewriteStmt(m.d, cls, enc, hoisted, 0);
+
+        Node mb = new Node(AK.Block());
+        mb.line = ln; mb.col = cl;
+        int st = 1;
+        while (st <= maxState) {
+            Node eq = new Node(AK.Binary());
+            eq.op = TK.EqEq(); eq.line = ln; eq.col = cl;
+            eq.a = IterIdent("__state", ln, cl);
+            eq.b = IterInt(st, ln, cl);
+            Node gt = new Node(AK.GotoStmt());
+            gt.sval = "R" + st; gt.line = ln; gt.col = cl;
+            Node tb = new Node(AK.Block()); tb.line = ln; tb.col = cl;
+            tb.Add(gt);
+            Node ifs = new Node(AK.IfStmt()); ifs.line = ln; ifs.col = cl;
+            ifs.a = eq; ifs.b = tb; ifs.c = null;
+            mb.Add(ifs);
+            st = st + 1;
+        }
+        int bi = 0;
+        while (bi < m.d.kids.Count) {
+            mb.Add(m.d.kids[bi]);
+            bi = bi + 1;
+        }
+        Node rf = new Node(AK.ReturnStmt()); rf.line = ln; rf.col = cl;
+        rf.a = IterBool(false, ln, cl);
+        mb.Add(rf);
+
+        Node mn = new Node(AK.MethodDecl());
+        mn.sval = "MoveNext";
+        mn.type = IterTypeRef("bool", ln, cl);
+        mn.mods = MOD.Public();
+        mn.d = mb;
+        mn.line = ln; mn.col = cl;
+        cls.Add(mn);
+
+        Node cb = new Node(AK.Block()); cb.line = ln; cb.col = cl;
+        Node cr = new Node(AK.ReturnStmt()); cr.line = ln; cr.col = cl;
+        cr.a = IterIdent("__cur", ln, cl);
+        cb.Add(cr);
+        Node cu = new Node(AK.MethodDecl());
+        cu.sval = "Current";
+        cu.type = elemTy;
+        cu.mods = MOD.Public();
+        cu.d = cb;
+        cu.line = ln; cu.col = cl;
+        cls.Add(cu);
+
+        Node gret = IterTypeRef("IEnumerator", ln, cl);
+        gret.Add(elemTy);
+        gret.a = elemTy;
+        Node gb = new Node(AK.Block()); gb.line = ln; gb.col = cl;
+        Node gr = new Node(AK.ReturnStmt()); gr.line = ln; gr.col = cl;
+        Node th2 = new Node(AK.ThisExpr()); th2.line = ln; th2.col = cl;
+        gr.a = th2;
+        gb.Add(gr);
+        Node ge = new Node(AK.MethodDecl());
+        ge.sval = "GetEnumerator";
+        ge.type = gret;
+        ge.mods = MOD.Public();
+        ge.d = gb;
+        ge.line = ln; ge.col = cl;
+        cls.Add(ge);
+
+        Node nb = new Node(AK.Block()); nb.line = ln; nb.col = cl;
+        Node nret = new Node(AK.ReturnStmt()); nret.line = ln; nret.col = cl;
+        nret.a = nw;
+        nb.Add(nret);
+        m.d = nb;
+
+        unit.Add(cls);
     }
 
     bool StmtHasYield(Node s) {

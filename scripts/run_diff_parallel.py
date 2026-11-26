@@ -322,7 +322,8 @@ def main():
     # libraries are fixed per OS, so they are derived here rather than
     # threaded through the cmake->python argument boundary
     if sys.platform == "win32":
-        a.syslibs = ["-lkernel32", "-lshell32", "-luser32", "-lgdi32", "-ladvapi32",
+        a.syslibs = ["-Wl,/STACK:8388608",
+                     "-lkernel32", "-lshell32", "-luser32", "-lgdi32", "-ladvapi32",
                      "-lversion", "-lws2_32", "-lbcrypt", "-lpsapi", "-lsetupapi",
                      "-liphlpapi", "-lwinspool", "-lntdll", "-lole32"]
         sqlite_dir = os.path.join(a.workdir, "packages", "Zan.Data", "src", "System", "Data", "Sqlite", "drivers", "win-x64")

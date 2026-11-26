@@ -1149,6 +1149,36 @@ partial class Irgen {
             + "compiler yet", callExpr.line, callExpr.col);
         return new ExprVal("0", MkType("int"));
     }
+
+    // Cooperative preemption point on loop back-edges inside async methods
+    // (mirrors C host emit_async_preempt_site): polls @zan_co_poll() and
+    // suspends via @zan_co_ready when the scheduler requests a yield.
+    void EmitAsyncPreemptSite(int targetLbl) {
+        if (!curAsync) {
+            L("  br label %L" + targetLbl);
+            return;
+        }
+        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+        int st = seq + 1;
+        string poll = NT();
+        L("  " + poll + " = call i32 @zan_co_poll()");
+        string need = NT();
+        L("  " + need + " = icmp ne i32 " + poll + ", 0");
+        int ly = NL();
+        L("  br i1 " + need + ", label %L" + ly + ", label %L" + targetLbl);
+        Label(ly);
+        EmitAsyncSaveSlots();
+        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
+        EmitAsyncSuspend();
+        L("  ret void");
+        L("resume_" + st + ":");
+        term = false; curLbl = "resume_" + st;
+        EmitAsyncReloadSlots();
+        EmitAsyncRearm();
+        L("  br label %L" + targetLbl);
+        term = true;
+    }
     // The result type of an awaited call: `Task<T>` -> T, a bare `Task` ->
     // void (no result). A declared return type spelled `Task<T>` is the C#
     // spelling of an async method -- the awaited value is the element.

@@ -65,8 +65,31 @@ partial class Irgen {
             return new ExprVal(z, MkType("char"));
         }
         if (IsListType(obj.ty)) {
+            string lnull = NT();
+            L("  " + lnull + " = icmp eq i8* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, lnull, "null reference where a List is required");
+            int lchk = NL(); int ldo = NL(); int ldone = NL();
+            string curB0 = curLbl;
+            L("  br i1 " + lnull + ", label %L" + ldone + ", label %L" + lchk);
+            Label(lchk);
+            string lc = NT();
+            L("  " + lc + " = call i64 @zlist_count(i8* " + obj.op + ")");
+            string lneg = NT();
+            L("  " + lneg + " = icmp slt i64 " + idx.op + ", 0");
+            string lge = NT();
+            L("  " + lge + " = icmp sge i64 " + idx.op + ", " + lc);
+            string loob = NT();
+            L("  " + loob + " = or i1 " + lneg + ", " + lge);
+            EmitRuntimeCheckIf(e, loob, "list index out of bounds");
+            string curB1 = curLbl;
+            L("  br i1 " + loob + ", label %L" + ldone + ", label %L" + ldo);
+            Label(ldo);
+            string val = NT();
+            L("  " + val + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
+            L("  br label %L" + ldone);
+            Label(ldone);
             string slot = NT();
-            L("  " + slot + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
+            L("  " + slot + " = phi i64 [ 0, %" + curB0 + " ], [ 0, %" + curB1 + " ], [ " + val + ", %L" + ldo + " ]");
             return FromSlot(slot, ListElem(obj.ty));
         }
         if (IsSpanType(obj.ty)) {
@@ -274,16 +297,49 @@ partial class Irgen {
                 }
             }
             else if (e.kids.Count == 1) {
-                // `new List<T>(src)`: a list argument is the copy constructor
-                // (the C host's list_copy lowering) -- the source's elements
-                // are copied into the new list. Any other argument is a
-                // single-item collection initializer, exactly like the host.
+                // `new List<T>(src)`: a list argument is the copy constructor,
+                // a 1D array argument copies each element into the new list,
+                // and any other argument is a single-item collection initializer.
                 ExprVal sv = GenExpr(e.kids[0]);
+                Node le = ListElem(ty);
                 if (IsListType(sv.ty)) {
                     L("  call void @zlist_copy(i8* " + t + ", i8* " + sv.op + ")");
                 }
+                else if (sv.ty != null && sv.ty.ival >= 1 && ArrRankOf(sv.ty) == 1
+                         && (le == null || sv.ty.ival == le.ival + 1)) {
+                    Node arrElem = ArrElemOf(sv.ty);
+                    if (arrElem == null) { arrElem = le != null ? le : MkType("int"); }
+                    string astorage = ArrayStorage(arrElem);
+                    string isn = NT();
+                    L("  " + isn + " = icmp eq i64* " + sv.op + ", null");
+                    int lskip = NL(); int linit = NL(); int lcond = NL(); int lbody = NL();
+                    L("  br i1 " + isn + ", label %L" + lskip + ", label %L" + linit);
+                    Label(linit);
+                    string alen = NT();
+                    L("  " + alen + " = call i64 @zarr_len(i64* " + sv.op + ")");
+                    string aidx = NT();
+                    EA(aidx, "i64");
+                    L("  store i64 0, i64* " + aidx);
+                    L("  br label %L" + lcond);
+                    Label(lcond);
+                    string curi = NT();
+                    L("  " + curi + " = load i64, i64* " + aidx);
+                    string more = NT();
+                    L("  " + more + " = icmp slt i64 " + curi + ", " + alen);
+                    L("  br i1 " + more + ", label %L" + lbody + ", label %L" + lskip);
+                    Label(lbody);
+                    string aplace = ArrayPlace(sv.op, curi, astorage);
+                    ExprVal aval = LoadArrayElement(aplace, arrElem, astorage);
+                    string aslot = StructElemSlot(aval, le);
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + aslot + ")");
+                    string nexti = NT();
+                    L("  " + nexti + " = add i64 " + curi + ", 1");
+                    L("  store i64 " + nexti + ", i64* " + aidx);
+                    L("  br label %L" + lcond);
+                    Label(lskip);
+                }
                 else {
-                    string ss = StructElemSlot(sv, ListElem(ty));
+                    string ss = StructElemSlot(sv, le);
                     L("  call void @zlist_add(i8* " + t + ", i64 " + ss + ")");
                 }
             }
