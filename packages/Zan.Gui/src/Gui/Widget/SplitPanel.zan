@@ -11,6 +11,9 @@ public class SplitPanel : Control {
     private Panel firstPane;
     private Panel secondPane;
     private bool dragging;
+    public bool responsiveStack;
+    public int responsiveBreakpoint;
+    private bool autoStacked;
     public int handleX;
     public int handleY;
     public int handleW;
@@ -24,6 +27,9 @@ public class SplitPanel : Control {
         minFirst = 60;
         minSecond = 60;
         dragging = false;
+        responsiveStack = false;
+        responsiveBreakpoint = Responsive.CompactMax + 1;
+        autoStacked = false;
         handleX = 0;
         handleY = 0;
         handleW = 0;
@@ -33,6 +39,22 @@ public class SplitPanel : Control {
         this.Add(firstPane);
         this.Add(secondPane);
     }
+    public SplitPanel AutoStack(bool enabled, int breakpoint = 600) {
+        responsiveStack = enabled;
+        if (breakpoint > 0) { responsiveBreakpoint = breakpoint; }
+        this.Invalidate();
+        return this;
+    }
+    public bool ResponsiveStack {
+        get { return this.responsiveStack; }
+        set { this.responsiveStack = value; this.Invalidate(); }
+    }
+    public int ResponsiveBreakpoint {
+        get { return this.responsiveBreakpoint; }
+        set { this.responsiveBreakpoint = value > 0 ? value : (Responsive.CompactMax + 1); this.Invalidate(); }
+    }
+    public bool IsAutoStacked() { return this.autoStacked; }
+    private int EffectiveOrient() { return autoStacked ? 1 : orient; }
     public static Panel NewPane(string name) {
         Panel p = Panel.Column();
         p.name = name;
@@ -94,6 +116,8 @@ public class SplitPanel : Control {
         ps.Add(PropSpec.Int("size", "First pane").Field("FirstSize"));
         ps.Add(PropSpec.Int("minFirst", "Min first").Field("minFirst"));
         ps.Add(PropSpec.Int("minSecond", "Min second").Field("minSecond"));
+        ps.Add(PropSpec.Bool("responsiveStack", "Auto stack on narrow screens").Field("responsiveStack"));
+        ps.Add(PropSpec.Int("responsiveBreakpoint", "Stack breakpoint (logical px)").Field("responsiveBreakpoint"));
         ps.Add(PropSpec.Text("options", "Options").Accessor("OptionsText", "SetOptionsText"));
         return ps;
     }
@@ -124,9 +148,14 @@ public class SplitPanel : Control {
         by = py;
         bw = pw;
         bh = ph;
+        autoStacked = responsiveStack && orient == 0 && pw > 0
+            && Responsive.LogicalWidth(pw, this.FindApp()) < responsiveBreakpoint;
+        int effOrient = this.EffectiveOrient();
         int bar = SplitPanel.BarSize();
-        if (orient == 1) {
-            int fh = this.Clamp(FirstSize.Get(), ph, bar);
+        if (effOrient == 1) {
+            int wantFirst = FirstSize.Get();
+            if (autoStacked && ph > 0 && wantFirst > ph / 2) { wantFirst = ph / 2; }
+            int fh = this.Clamp(wantFirst, ph, bar);
             firstPane.Arrange(px, py, pw, fh);
             secondPane.Arrange(px, py + fh + bar, pw, ph - fh - bar);
             handleX = px;
@@ -156,7 +185,7 @@ public class SplitPanel : Control {
     private bool HitsHandle(int x, int y, int pointerType) {
         int margin = pointerType == 1 ? 20 : 4;
         if (handleW <= 0 || handleH <= 0) { return false; }
-        if (orient == 1) {
+        if (this.EffectiveOrient() == 1) {
             return x >= handleX && x < handleX + handleW && y >= handleY - margin && y < handleY + handleH + margin;
         }
         return x >= handleX - margin && x < handleX + handleW + margin && y >= handleY && y < handleY + handleH;
@@ -166,9 +195,18 @@ public class SplitPanel : Control {
         if (this.HitsHandle(x, y, pointerType)) { return this; }
         return base.HitTestCore(x, y, pointerType, excludedSubtrees);
     }
+    public override int PointerCursor() {
+        if (this.IsDisabled()) { return -1; }
+        App app = this.FindApp();
+        if (dragging || (app != null && this.HitsHandle(app.mouseX, app.mouseY, app.GetPointerDeviceType()))) {
+            return this.EffectiveOrient() == 1 ? 5 : 4;
+        }
+        return -1;
+    }
     private void DragTo(App app, RoutedEventArgs e) {
-        int value = orient == 1 ? e.y - by : e.x - bx;
-        int total = orient == 1 ? bh : bw;
+        int eff = this.EffectiveOrient();
+        int value = eff == 1 ? e.y - by : e.x - bx;
+        int total = eff == 1 ? bh : bw;
         value = this.Clamp(value, total, SplitPanel.BarSize());
         if (value == FirstSize.Get()) { return; }
         FirstSize.Set(value);

@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using Gui;
 namespace Gui.Widget;
 public partial class Ribbon {
@@ -8,7 +9,33 @@ public partial class Ribbon {
     public static int TabStripHeight(App app) { return app.Scale(30); }
     public static int HeightTabbed(App app) { return Ribbon.TabStripHeight(app) + app.Scale(96); }
     public static int HeightGroups(App app) { return app.Scale(76); }
-    private static int SmallColW(App app, RibbonGroup grp, bool compact, RibbonFit fit, int start) {
+    private static int VisibleUnpinnedLargeCount(RibbonGroup grp, int start, RibbonFit fit) {
+        int count = 0;
+        for (int m = 0; m < grp.items.Count; m = m + 1) {
+            int flat = start + m;
+            if (fit.dropped.Count > flat && fit.dropped[flat]) { continue; }
+            RibbonItem mi = grp.items[m];
+            if (!mi.small && !mi.tile && !mi.pinLarge) { count = count + 1; }
+        }
+        return count;
+    }
+    private static int EffectiveKind(RibbonItem it, bool compact, int level, int unpinnedLargeCount) {
+        if (it.tile) { return 2; }
+        if (it.small) { return (compact || level >= 2) ? 2 : 1; }
+        if (level <= 0) { return 0; }
+        if (level == 1) {
+            if (!it.pinLarge && unpinnedLargeCount >= 2) { return 1; }
+            return 0;
+        }
+        if (level == 2) {
+            if (!it.pinLarge && unpinnedLargeCount >= 2) { return 2; }
+            if (!it.pinLarge) { return 1; }
+            return 0;
+        }
+        return 2;
+    }
+    private static int SmallColW(App app, RibbonGroup grp, bool compact, int level, int unpinnedLargeCount,
+                                 RibbonFit fit, int start) {
         Theme t = app.theme;
         StyleBox textStyle = Style.Part(app, "ribbon", "item", "",
                                         "", "", Style.SNormal());
@@ -16,12 +43,12 @@ public partial class Ribbon {
         int smallW = app.Scale(72);
         for (int m = 0; m < grp.items.Count; m = m + 1) {
             RibbonItem mi = grp.items[m];
-            if (mi.tile || !mi.small) { continue; }
-            if (compact) { continue; }
             int flat = start + m;
             if (fit.dropped.Count > flat && fit.dropped[flat]) { continue; }
+            if (Ribbon.EffectiveKind(mi, compact, level, unpinnedLargeCount) != 1) { continue; }
             int mw;
-            if (fit.widths.Count > flat) { mw = fit.widths[flat]; }
+            if (fit.smallWidths.Count > flat && fit.smallWidths[flat] > 0) { mw = fit.smallWidths[flat]; }
+            else if (mi.small && fit.widths.Count > flat) { mw = fit.widths[flat]; }
             else {
                 mw = Canvas.MeasureText(mi.label, fontSize)
                     + t.iconSizeSmall + app.Scale(22);
@@ -45,13 +72,15 @@ public partial class Ribbon {
         for (int g = 0; g < groups.Count; g = g + 1) {
             RibbonGroup grp = groups[g];
             bool cp = fit.compact.Count > g ? fit.compact[g] : false;
-            int smallW = Ribbon.SmallColW(app, grp, cp, fit, flat);
+            int level = fit.groupLevel.Count > g ? fit.groupLevel[g] : 0;
+            int unpinnedLargeCount = Ribbon.VisibleUnpinnedLargeCount(grp, flat, fit);
+            int smallW = Ribbon.SmallColW(app, grp, cp, level, unpinnedLargeCount, fit, flat);
             int compactW = tileW;
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 int idx = flat + j;
                 RibbonItem item = grp.items[j];
-                if (!item.tile && !(cp && item.small)) { continue; }
                 if (fit.dropped.Count > idx && fit.dropped[idx]) { continue; }
+                if (Ribbon.EffectiveKind(item, cp, level, unpinnedLargeCount) != 2) { continue; }
                 if (fit.tileWidths.Count > idx && fit.tileWidths[idx] > compactW) { compactW = fit.tileWidths[idx]; }
             }
             int groupStartX = cx;
@@ -66,10 +95,7 @@ public partial class Ribbon {
                 flat = flat + 1;
                 if (gone) { continue; }
                 kept = kept + 1;
-                int kind = 0;
-                bool asTile = it.tile || (cp && it.small);
-                if (asTile) { kind = 2; }
-                else if (it.small) { kind = 1; }
+                int kind = Ribbon.EffectiveKind(it, cp, level, unpinnedLargeCount);
                 if (kind != curKind && sIdx % rows != 0) {
                     cx = cx + curW;
                     sIdx = 0;
@@ -166,6 +192,7 @@ public partial class Ribbon {
         int g = 0;
         while (g < groups.Count) {
             fit.compact.Add(false);
+            fit.groupLevel.Add(0);
             RibbonGroup grp = groups[g];
             int j = 0;
             while (j < grp.items.Count) { fit.dropped.Add(false); j = j + 1; }
@@ -173,13 +200,36 @@ public partial class Ribbon {
         }
         return fit;
     }
+    private static List<int> CollapseOrder(List<RibbonGroup> groups) {
+        List<int> order = new List<int>();
+        for (int g = groups.Count - 1; g >= 0; g = g - 1) { order.Add(g); }
+        // 按 collapsePriority 降序，同优先级保持由右向左（Excel 规则）。
+        for (int i = 1; i < order.Count; i = i + 1) {
+            int cur = order[i];
+            int curPri = groups[cur].collapsePriority;
+            int j = i - 1;
+            while (j >= 0 && groups[order[j]].collapsePriority < curPri) {
+                order[j + 1] = order[j];
+                j = j - 1;
+            }
+            order[j + 1] = cur;
+        }
+        return order;
+    }
     public static RibbonFit Fit(App app, List<RibbonGroup> groups, int bh,
                                 int rows, int w, RibbonFit measured = null) {
         RibbonFit fit = Ribbon.FitNone(groups);
-        if (measured != null) { fit.widths = measured.widths; fit.tileWidths = measured.tileWidths; }
+        if (measured != null) {
+            fit.widths = measured.widths;
+            fit.smallWidths = measured.smallWidths;
+            fit.tileWidths = measured.tileWidths;
+        }
         int need = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
-        int gi = groups.Count - 1;
-        while (gi >= 0 && need > w) {
+        if (need <= w) { return fit; }
+        List<int> order = Ribbon.CollapseOrder(groups);
+        // 阶段 1：先退场 optional 低价值命令（由右向左）。
+        for (int oi = 0; oi < order.Count && need > w; oi = oi + 1) {
+            int gi = order[oi];
             RibbonGroup grp = groups[gi];
             int start = Ribbon.GroupStart(groups, gi);
             int idx = start + grp.items.Count - 1;
@@ -191,11 +241,52 @@ public partial class Ribbon {
                 }
                 idx = idx - 1;
             }
-            if (need > w && Ribbon.HasLabeledSmall(grp)) {
-                fit.compact[gi] = true;
-                need = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+        }
+        // 阶段 2（Excel 紧凑堆叠态）：多 Large 组收缩为 3 行 Small；带文字小按钮组收为图标 Tile。
+        for (int oi = 0; oi < order.Count && need > w; oi = oi + 1) {
+            int gi = order[oi];
+            RibbonGroup grp = groups[gi];
+            int start = Ribbon.GroupStart(groups, gi);
+            int largeCnt = Ribbon.VisibleUnpinnedLargeCount(grp, start, fit);
+            if (largeCnt >= 2) {
+                fit.groupLevel[gi] = 1;
+                int cand = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+                if (cand < need) { need = cand; }
+                else { fit.groupLevel[gi] = 0; }
             }
-            gi = gi - 1;
+            if (need > w && Ribbon.HasLabeledSmall(grp) && !fit.compact[gi]) {
+                bool prevCompact = fit.compact[gi];
+                fit.compact[gi] = true;
+                int cand = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+                if (cand < need) { need = cand; }
+                else { fit.compact[gi] = prevCompact; }
+            }
+        }
+        // 阶段 3（Excel 纯图标态）：将已降级的 Large 组进一步收为图标 Tile，并允许非固定单 Large 缩为 Small。
+        for (int oi = 0; oi < order.Count && need > w; oi = oi + 1) {
+            int gi = order[oi];
+            int prevLevel = fit.groupLevel[gi];
+            bool prevCompact = fit.compact[gi];
+            if (prevLevel < 2) {
+                fit.groupLevel[gi] = 2;
+                if (Ribbon.HasLabeledSmall(groups[gi])) { fit.compact[gi] = true; }
+                int cand = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+                if (cand < need) { need = cand; }
+                else { fit.groupLevel[gi] = prevLevel; fit.compact[gi] = prevCompact; }
+            }
+        }
+        // 阶段 4（超窄 / 移动端极限态）：所有剩余 Large（含单主按钮与 pinLarge）收为图标 Tile，减少溢出。
+        for (int oi = 0; oi < order.Count && need > w; oi = oi + 1) {
+            int gi = order[oi];
+            int prevLevel = fit.groupLevel[gi];
+            bool prevCompact = fit.compact[gi];
+            if (prevLevel < 3) {
+                fit.groupLevel[gi] = 3;
+                fit.compact[gi] = true;
+                int cand = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+                if (cand < need) { need = cand; }
+                else { fit.groupLevel[gi] = prevLevel; fit.compact[gi] = prevCompact; }
+            }
         }
         return fit;
     }

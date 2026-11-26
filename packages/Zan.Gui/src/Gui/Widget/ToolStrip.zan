@@ -5,7 +5,13 @@ public delegate void ToolItemCallback(int index);
 public class ToolStrip : Control {
     public override Control CreateCloneShell() { return new ToolStrip(); }
     private List<Button> items;
+    private List<string> itemTexts;
+    private List<string> itemIcons;
+    private List<bool> itemSeps;
+    private List<int> overflowIndices;
     private Control spacer;
+    private Button overflowBtn;
+    private weak Control overflowPopup;
     private List<ToolItemCallback> itemCbs;
     // 不关心是哪一项的项点击处理（设计器 ItemClick 事件）。
     [Event]
@@ -13,10 +19,16 @@ public class ToolStrip : Control {
     private int lastIndex;
     private int tintBg;  // 0 = 主题表面，否则为纯色着色
     private bool iconOnly;
+    public bool responsive;
+    private bool autoIconOnly;
     private string itemsSpec;
     public ToolStrip() {
         this.InitControl("toolStrip");
         items = new List<Button>();
+        itemTexts = new List<string>();
+        itemIcons = new List<string>();
+        itemSeps = new List<bool>();
+        overflowIndices = new List<int>();
         spacer = new Control("toolSpacer");
         spacer.SetProp("style", "flex:1;min-width:0;order:1");
         this.Add(spacer);
@@ -25,7 +37,30 @@ public class ToolStrip : Control {
         lastIndex = -1;
         tintBg = 0;
         iconOnly = false;
+        responsive = true;
+        autoIconOnly = false;
         itemsSpec = "";
+    }
+    public bool Responsive {
+        get { return this.responsive; }
+        set { this.responsive = value; this.Invalidate(); }
+    }
+    public int OverflowCount() { return overflowIndices.Count; }
+    public bool IsCompactIcons() { return autoIconOnly; }
+    public Button OverflowButton() { return overflowBtn; }
+    private void EnsureOverflowButton() {
+        if (overflowBtn != null) { return; }
+        overflowBtn = new Button("");
+        overflowBtn.name = "toolstrip-overflow";
+        overflowBtn.Class = "text small ghost";
+        overflowBtn.SetProp("icon", "chevrons-right");
+        overflowBtn.SetProp("style", "order:2147483647;flex-shrink:0;");
+        overflowBtn.Tip = Lang.Tr("More actions", "更多操作");
+        overflowBtn.Visible = false;
+        ToolStripOverflowAction act = new ToolStripOverflowAction();
+        act.owner = this;
+        overflowBtn.Click.Add(act.Open);
+        base.Add(overflowBtn);
     }
     // 任何一项被点击时回调，参数为项的索引。
     public void OnItemClick(ToolItemCallback cb) { itemCbs.Add(cb); }
@@ -43,6 +78,7 @@ public class ToolStrip : Control {
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Bool("iconOnly", "Icons only").Field("iconOnly"));
+        ps.Add(PropSpec.Bool("responsive", "Responsive").Field("responsive"));
         ps.Add(PropSpec.Color("tint", "Tint").Field("tintBg"));
         PropSpec it = PropSpec.Text("options", "Items").Field("itemsSpec").Setter("SetItemsText");
         it.WithTip("Pipe-separated \"text:icon\" items; prefix > to "
@@ -58,12 +94,17 @@ public class ToolStrip : Control {
         return items[i];
     }
     public Button NewItem(string text, string icon) {
-        string caption = text;
-        if (iconOnly && icon != "") { caption = ""; }
+        string rawText = text != null ? text : "";
+        string rawIcon = icon != null ? icon : "";
+        string caption = rawText;
+        if (iconOnly && rawIcon != "") { caption = ""; }
         Button b = new Button(caption);
         b.Class = "text small";
-        b.SetProp("icon", icon);
+        b.SetProp("icon", rawIcon);
         items.Add(b);
+        itemTexts.Add(rawText);
+        itemIcons.Add(rawIcon);
+        itemSeps.Add(false);
         Add(b);
         ToolStripItemAction action = new ToolStripItemAction();
         action.owner = this;
@@ -75,6 +116,11 @@ public class ToolStrip : Control {
     public int Add(string text) { return this.Add(text, ""); }
     public void Clear() {
         items = new List<Button>();
+        itemTexts = new List<string>();
+        itemIcons = new List<string>();
+        itemSeps = new List<bool>();
+        overflowIndices = new List<int>();
+        overflowBtn = null;
         this.RemoveAll();
         this.Add(spacer);
     }
@@ -88,6 +134,9 @@ public class ToolStrip : Control {
         Button b = new Button { Text = "", Class = "text small toolstrip-separator", Disabled = true };
         b.FreeLayout();
         items.Add(b);
+        itemTexts.Add("");
+        itemIcons.Add("");
+        itemSeps.Add(true);
         Add(b);
         return items.Count - 1;
     }
@@ -145,10 +194,141 @@ public class ToolStrip : Control {
         }
         if (computedStyle != null) { Style.Inline(computedStyle, this); }
     }
+    private int ItemNaturalWidth(Button b) {
+        int w = b.prefW;
+        int sw = b.StyleWidthIn(0);
+        if (sw > w) { w = sw; }
+        return w + b.StyleMarL() + b.StyleMarR();
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        App app = this.FindApp();
+        if (responsive && app != null && w > 0 && items.Count > 0) {
+            overflowIndices.Clear();
+            autoIconOnly = false;
+            int gapPx = this.StyleGap();
+            if (gapPx <= 0) { gapPx = gap; }
+            int padW = padL + padR;
+            int sumW = padW;
+            int visCount = 0;
+            bool hasIconLabel = false;
+            for (int i = 0; i < items.Count; i = i + 1) {
+                Button b = items[i];
+                b.Visible = true;
+                if (!itemSeps[i]) {
+                    string wantText = (iconOnly && itemIcons[i] != "") ? "" : itemTexts[i];
+                    if (b.Label() != wantText) {
+                        b.SetText(wantText);
+                        b.MeasureTree(app);
+                    }
+                    if (itemIcons[i] != "" && itemTexts[i] != "") { hasIconLabel = true; }
+                }
+                int iw = this.ItemNaturalWidth(b);
+                if (visCount > 0) { sumW = sumW + gapPx; }
+                sumW = sumW + iw;
+                visCount = visCount + 1;
+            }
+            if (overflowBtn != null) { overflowBtn.Visible = false; }
+            // 阶段 1：带图标按钮先收缩为纯图标（保留 Tip 提示）。
+            if (sumW > w && !iconOnly && hasIconLabel) {
+                autoIconOnly = true;
+                sumW = padW;
+                visCount = 0;
+                for (int i = 0; i < items.Count; i = i + 1) {
+                    Button b = items[i];
+                    if (!itemSeps[i] && itemIcons[i] != "" && itemTexts[i] != "") {
+                        b.SetText("");
+                        if (b.Tip == "") { b.Tip = itemTexts[i]; }
+                        b.MeasureTree(app);
+                    }
+                    int iw = this.ItemNaturalWidth(b);
+                    if (visCount > 0) { sumW = sumW + gapPx; }
+                    sumW = sumW + iw;
+                    visCount = visCount + 1;
+                }
+            }
+            // 阶段 2：仍超宽时将尾部非分隔项收入溢出菜单。
+            if (sumW > w) {
+                this.EnsureOverflowButton();
+                overflowBtn.Visible = true;
+                overflowBtn.MeasureTree(app);
+                int moreW = this.ItemNaturalWidth(overflowBtn) + gapPx;
+                int avail = w - moreW;
+                if (avail < 0) { avail = 0; }
+                for (int i = items.Count - 1; i >= 0 && sumW > avail; i = i - 1) {
+                    Button b = items[i];
+                    if (!b.Visible) { continue; }
+                    int iw = this.ItemNaturalWidth(b);
+                    b.Visible = false;
+                    sumW = sumW - iw - (visCount > 1 ? gapPx : 0);
+                    visCount = visCount - 1;
+                    if (!itemSeps[i]) { overflowIndices.Insert(0, i); }
+                }
+                // 清理尾部悬空分隔条。
+                for (int i = items.Count - 1; i >= 0; i = i - 1) {
+                    if (!items[i].Visible) { continue; }
+                    if (itemSeps[i]) { items[i].Visible = false; }
+                    else { break; }
+                }
+                if (overflowIndices.Count == 0) { overflowBtn.Visible = false; }
+            }
+        } else if (overflowBtn != null) {
+            overflowBtn.Visible = false;
+            overflowIndices.Clear();
+        }
+        base.Arrange(x, y, w, h);
+    }
+    internal void ToggleOverflow() {
+        App app = this.FindApp();
+        if (app == null || app.overlayHost == null || overflowBtn == null || overflowIndices.Count == 0) { return; }
+        Control prev = overflowPopup;
+        if (prev != null && app.overlayHost.ActiveRoot() == prev) {
+            app.overlayHost.Hide(prev);
+            overflowPopup = null;
+            return;
+        }
+        Control popup = new Control("toolstrip-overflow-menu");
+        popup.ClassName = "contextmenu col";
+        popup.SetProp("style", "display:flex;flex-direction:column;overflow-y:auto;max-height:60vh;padding:var(--space-xs);gap:var(--padding-tiny)");
+        for (int k = 0; k < overflowIndices.Count; k = k + 1) {
+            int idx = overflowIndices[k];
+            if (idx < 0 || idx >= items.Count) { continue; }
+            string lbl = itemTexts[idx] != "" ? itemTexts[idx] : itemIcons[idx];
+            Button mi = new Button(lbl);
+            mi.ClassName = "contextmenu-item row align-center ghost small";
+            if (itemIcons[idx] != "") { mi.SetProp("icon", itemIcons[idx]); }
+            mi.Disabled = items[idx].IsDisabled();
+            ToolStripOverflowAction act = new ToolStripOverflowAction();
+            act.owner = this;
+            act.popup = popup;
+            act.index = idx;
+            mi.Click.Add(act.Pick);
+            popup.Add(mi);
+        }
+        popup.UseApp(app);
+        popup.MeasureTree(app);
+        int pw = popup.prefW > app.theme.ScaleMetric(140) ? popup.prefW : app.theme.ScaleMetric(140);
+        int ph = popup.prefH > 0 ? popup.prefH : app.theme.ScaleMetric(120);
+        int px = OverlayPopup.FitX(app, overflowBtn.bx + overflowBtn.bw - pw, pw);
+        int py = OverlayPopup.FitY(app, overflowBtn.by + overflowBtn.bh + app.theme.gapSmall, overflowBtn.bh, ph);
+        popup.Prefer(pw, ph);
+        popup.Arrange(px, py, pw, ph);
+        overflowPopup = popup;
+        app.overlayHost.ShowAtAnchor(app, overflowBtn, popup, px, py);
+    }
+    internal void PickOverflowItem(int index, Control menu) {
+        App app = this.FindApp();
+        if (app != null && app.overlayHost != null && menu != null) {
+            app.overlayHost.Hide(menu);
+        }
+        overflowPopup = null;
+        if (index >= 0 && index < items.Count && !items[index].IsDisabled()) {
+            this.FireItem(index);
+        }
+    }
     public override void OnPaint(App app) {
-        StyleBox divider = this.ResolveStyleAs(app, "divider", "", Style.SNormal());
+        StyleBox divider = Control.BareBox(app, "divider", Style.SNormal());
         int h = divider.HeightOr(1);
-        int col = divider.BgOr(0);
+        int col = divider.BgOr(app.theme.divider);
         app.canvas.FillRect(bx, by + bh - h, bw, h, col);
     }
 }

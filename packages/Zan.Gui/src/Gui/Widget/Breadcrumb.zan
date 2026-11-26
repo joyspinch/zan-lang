@@ -5,28 +5,155 @@ public class Breadcrumb : Control {
     public override Control CreateCloneShell() { return new Breadcrumb(); }
     public List<string> items;
     public string Separator;
+    public bool responsive;
+    private int collapsedCount;
+    private Label ellipsisNode;
+    private IconView ellipsisSep;
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
     private void InitBreadcrumb() {
         this.InitControl("breadcrumb");
         items = new List<string>();
         Separator = "chevron-right";
+        responsive = true;
+        collapsedCount = 0;
+        ellipsisNode = null;
+        ellipsisSep = null;
     }
+    public bool Responsive {
+        get { return this.responsive; }
+        set { this.responsive = value; this.Invalidate(); }
+    }
+    public int CollapsedCount() { return this.collapsedCount; }
     public Breadcrumb() { InitBreadcrumb(); }
     public override Control Add(Control c) {
-        if (this.ChildCount() > 0 && Separator != "") {
+        if (this.HasRealItem() && Separator != "") {
             IconView sep = new IconView(Separator, 14);
             sep.ClassName = "breadcrumb-separator";
             base.Add(sep);
         }
-        return base.Add(c);
+        Control added = base.Add(c);
+        this.SyncCurrentItem();
+        return added;
+    }
+    private bool HasRealItem() {
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control ch = this.ChildAt(i);
+            if (ch != ellipsisNode && ch != ellipsisSep) { return true; }
+        }
+        return false;
+    }
+    private void EnsureEllipsisNodes() {
+        if (ellipsisNode != null) { return; }
+        ellipsisNode = new Label("...");
+        ellipsisNode.ClassName = "breadcrumb-ellipsis text-muted";
+        ellipsisNode.Visible = false;
+        ellipsisSep = null;
+        if (Separator != "") {
+            ellipsisSep = new IconView(Separator, 14);
+            ellipsisSep.ClassName = "breadcrumb-separator";
+            ellipsisSep.Visible = false;
+        }
+        // 插在首项与首分隔符之后（若有）。
+        int insertPos = 0;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is BreadcrumbItem) {
+                insertPos = i + 1;
+                if (insertPos < this.ChildCount() && !(this.ChildAt(insertPos) is BreadcrumbItem)) {
+                    insertPos = insertPos + 1;
+                }
+                break;
+            }
+        }
+        this.InsertAt(insertPos, ellipsisNode);
+        if (ellipsisSep != null) { this.InsertAt(insertPos + 1, ellipsisSep); }
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        App app = this.FindApp();
+        collapsedCount = 0;
+        if (ellipsisNode != null) { ellipsisNode.Visible = false; }
+        if (ellipsisSep != null) { ellipsisSep.Visible = false; }
+        List<int> itemIdx = new List<int>();
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control ch = this.ChildAt(i);
+            if (ch == ellipsisNode || ch == ellipsisSep) { continue; }
+            ch.Visible = true;
+            if (ch is BreadcrumbItem) { itemIdx.Add(i); }
+        }
+        if (responsive && app != null && w > 0 && itemIdx.Count >= 3) {
+            int gapPx = this.StyleGap();
+            int sumW = this.StyleInsetL() + this.StyleInsetR();
+            int visCnt = 0;
+            for (int i = 0; i < this.ChildCount(); i = i + 1) {
+                Control ch = this.ChildAt(i);
+                if (!ch.Visible) { continue; }
+                int cw = ch.prefW > ch.StyleWidthIn(0) ? ch.prefW : ch.StyleWidthIn(0);
+                if (visCnt > 0) { sumW = sumW + gapPx; }
+                sumW = sumW + cw;
+                visCnt = visCnt + 1;
+            }
+            if (sumW > w) {
+                this.EnsureEllipsisNodes();
+                // 重新采集索引（InsertAt 可能偏移后续索引）。
+                itemIdx.Clear();
+                for (int i = 0; i < this.ChildCount(); i = i + 1) {
+                    Control ch = this.ChildAt(i);
+                    if (ch is BreadcrumbItem) { itemIdx.Add(i); }
+                }
+                ellipsisNode.Visible = true;
+                ellipsisNode.MeasureTree(app);
+                sumW = sumW + (ellipsisNode.prefW > ellipsisNode.StyleWidthIn(0) ? ellipsisNode.prefW : ellipsisNode.StyleWidthIn(0)) + gapPx;
+                if (ellipsisSep != null) {
+                    ellipsisSep.Visible = true;
+                    ellipsisSep.MeasureTree(app);
+                    sumW = sumW + (ellipsisSep.prefW > ellipsisSep.StyleWidthIn(0) ? ellipsisSep.prefW : ellipsisSep.StyleWidthIn(0)) + gapPx;
+                }
+                for (int k = 1; k < itemIdx.Count - 1 && sumW > w; k = k + 1) {
+                    int idx = itemIdx[k];
+                    Control item = this.ChildAt(idx);
+                    item.Visible = false;
+                    int iw = item.prefW > item.StyleWidthIn(0) ? item.prefW : item.StyleWidthIn(0);
+                    sumW = sumW - iw - gapPx;
+                    // 同时隐藏该项后的分隔符（若存在且非省略号分隔符）。
+                    if (idx + 1 < this.ChildCount()) {
+                        Control nextCh = this.ChildAt(idx + 1);
+                        if (!(nextCh is BreadcrumbItem) && nextCh != ellipsisNode && nextCh != ellipsisSep) {
+                            nextCh.Visible = false;
+                            int sw = nextCh.prefW > nextCh.StyleWidthIn(0) ? nextCh.prefW : nextCh.StyleWidthIn(0);
+                            sumW = sumW - sw - gapPx;
+                        }
+                    }
+                    collapsedCount = collapsedCount + 1;
+                }
+                if (collapsedCount == 0) {
+                    ellipsisNode.Visible = false;
+                    if (ellipsisSep != null) { ellipsisSep.Visible = false; }
+                }
+            }
+        }
+        base.Arrange(x, y, w, h);
     }
     public void AddItem(BreadcrumbItem it) { this.Add(it); }
     public void AddItem(string label) {
         items.Add(label);
         BreadcrumbItem it = new BreadcrumbItem(label);
-        if (items.Count > 1) { it.ClassName = "breadcrumb-item"; }
+        it.ClassName = "breadcrumb-item";
         this.Add(it);
+    }
+    private void SyncCurrentItem() {
+        int lastIdx = 0 - 1;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is BreadcrumbItem) { lastIdx = i; }
+        }
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is BreadcrumbItem) {
+                this.ChildAt(i).SwitchClass("current", i == lastIdx);
+            }
+        }
+    }
+    public override void SyncBinding() {
+        base.SyncBinding();
+        this.SyncCurrentItem();
     }
     public Breadcrumb(List<string> labels) : this() {
         if (labels != null) {
@@ -56,6 +183,9 @@ public class Breadcrumb : Control {
     public void SetItemsText(string val) {
         List<string> parts = val.Split(",");
         items = new List<string>();
+        ellipsisNode = null;
+        ellipsisSep = null;
+        collapsedCount = 0;
         this.RemoveAll();
         if (val == "") { return; }
         for (int i = 0; i < parts.Count; i = i + 1) {
@@ -67,6 +197,7 @@ public class Breadcrumb : Control {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Text("items", "Items (comma separated)").Accessor("ItemsText", "SetItemsText"));
         ps.Add(PropSpec.Text("separator", "Separator icon").Field("Separator"));
+        ps.Add(PropSpec.Bool("responsive", "Collapse middle items on narrow screens").Field("responsive"));
         return ps;
     }
 

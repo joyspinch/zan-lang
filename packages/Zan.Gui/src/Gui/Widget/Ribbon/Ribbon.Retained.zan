@@ -7,6 +7,7 @@ public partial class Ribbon {
     Button retainedMore;
     List<Button> retainedItems = new List<Button>();
     List<Label> retainedLabels = new List<Label>();
+    List<IconView> retainedIcons = new List<IconView>();
     List<Control> retainedGroups = new List<Control>();
     List<Control> retainedBoxes = new List<Control>();
     List<Label> retainedTitles = new List<Label>();
@@ -28,6 +29,80 @@ public partial class Ribbon {
     public RibbonLayout CurrentLayout() { return retainedLayout; }
     public List<RibbonSlot> OverflowSlots() { return retainedOverflow; }
     public Button OverflowButton() { return retainedMore; }
+    int RetainedKindForSlot(int flat, int fallbackKind) {
+        if (retainedLayout != null) {
+            for (int i = 0; i < retainedLayout.slots.Count; i = i + 1) {
+                RibbonSlot slot = retainedLayout.slots[i];
+                if (slot.flat == flat && !slot.overflow) { return slot.kind; }
+            }
+        }
+        return fallbackKind;
+    }
+    public void SyncItems() {
+        if (retainedBand == null) { return; }
+        App app = this.FindApp();
+        bool changed = false;
+        if (groups.Count > 0) {
+            int total = 0;
+            for (int gi = 0; gi < groups.Count; gi = gi + 1) { total = total + groups[gi].items.Count; }
+            if (total != retainedItems.Count) {
+                this.BuildTree();
+                this.RequestRedraw();
+                return;
+            }
+            int flat = 0;
+            for (int gi = 0; gi < groups.Count; gi = gi + 1) {
+                RibbonGroup grp = groups[gi];
+                for (int ii = 0; ii < grp.items.Count; ii = ii + 1) {
+                    RibbonItem item = grp.items[ii];
+                    Button button = retainedItems[flat];
+                    int kind = this.RetainedKindForSlot(flat, item.tile ? 2 : (item.small ? 1 : 0));
+                    string nextCls = Ribbon.RetainedItemClass(item, kind);
+                    if (button.ClassName != nextCls) { button.ClassName = nextCls; changed = true; }
+                    bool nextDisabled = !item.enabled;
+                    if (button.IsDisabled() != nextDisabled) {
+                        button.Disabled = nextDisabled;
+                        if (nextDisabled && app != null) { app.ReleaseInputSubtree(button); }
+                        changed = true;
+                    }
+                    string nextTip = item.tip != "" ? item.tip : item.label;
+                    if (button.Tip != nextTip) { button.Tip = nextTip; changed = true; }
+                    if (flat < retainedLabels.Count && retainedLabels[flat] != null
+                        && retainedLabels[flat].Str() != item.label) {
+                        retainedLabels[flat].Text.Set(item.label);
+                        changed = true;
+                    }
+                    flat = flat + 1;
+                }
+            }
+        } else {
+            if (cmds.Count != retainedItems.Count) {
+                this.BuildTree();
+                this.RequestRedraw();
+                return;
+            }
+            for (int ci = 0; ci < cmds.Count; ci = ci + 1) {
+                RibbonCmd cmd = cmds[ci];
+                Button button = retainedItems[ci];
+                int kind = this.RetainedKindForSlot(ci, cmd.compact ? 2 : 0);
+                string nextCls = "ribbon-cmd" + (kind == 0 ? " stacked" : (kind == 1 ? " small" : "")) + (cmd.on ? " on" : "");
+                if (button.ClassName != nextCls) { button.ClassName = nextCls; changed = true; }
+                bool nextDisabled = !cmd.enabled;
+                if (button.IsDisabled() != nextDisabled) {
+                    button.Disabled = nextDisabled;
+                    if (nextDisabled && app != null) { app.ReleaseInputSubtree(button); }
+                    changed = true;
+                }
+                if (button.Tip != cmd.tip) { button.Tip = cmd.tip; changed = true; }
+                if (ci < retainedLabels.Count && retainedLabels[ci] != null
+                    && retainedLabels[ci].Str() != cmd.label) {
+                    retainedLabels[ci].Text.Set(cmd.label);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) { this.RequestRedraw(); }
+    }
     public bool RetireInput() {
         layoutRevision = layoutRevision + 1;
         int session = layoutRevision;
@@ -41,6 +116,7 @@ public partial class Ribbon {
     void BeginRetainedTree() {
         retainedTabs = null; retainedBand = null; retainedMore = null;
         retainedItems = new List<Button>(); retainedLabels = new List<Label>();
+        retainedIcons = new List<IconView>();
         retainedGroups = new List<Control>(); retainedBoxes = new List<Control>();
         retainedTitles = new List<Label>(); retainedLayout = null; retainedMeasured = null;
         retainedOverflow = new List<RibbonSlot>();
@@ -88,19 +164,39 @@ public partial class Ribbon {
                 for (int j = 0; j < group.items.Count; j = j + 1) {
                     RibbonItem item = group.items[j];
                     Button button = retainedItems[flat]; Label caption = retainedLabels[flat];
+                    IconView iconView = flat < retainedIcons.Count ? retainedIcons[flat] : null;
                     bool shown = button.Visible;
                     bool captionShown = caption != null && caption.Visible;
                     string classes = button.ClassName;
+                    int prevIconBox = iconView != null ? iconView.Box : 0;
                     try {
                         button.Visible = true;
-                        if (caption != null) { caption.Visible = true; }
+                        if (caption != null) { caption.Visible = !item.tile; }
                         int kind = item.tile ? 2 : (item.small ? 1 : 0);
+                        if (iconView != null) { iconView.Box = kind == 0 ? 20 : 14; }
                         button.ClassName = Ribbon.RetainedItemClass(item, kind);
                         button.MeasureTree(app);
-                        measured.widths.Add((int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap);
+                        int natW = (int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap;
+                        measured.widths.Add(natW);
+                        int smallWidth = 0;
+                        if (!item.tile) {
+                            if (item.small) {
+                                smallWidth = natW;
+                            } else {
+                                if (caption != null) { caption.Visible = true; }
+                                if (iconView != null) { iconView.Box = 14; }
+                                button.ClassName = Ribbon.RetainedItemClass(item, 1);
+                                button.MeasureTree(app);
+                                smallWidth = (int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap;
+                            }
+                        }
+                        measured.smallWidths.Add(smallWidth);
                         int tileWidth = 0;
-                        if (item.tile || item.small) {
+                        if (item.tile) {
+                            tileWidth = natW;
+                        } else {
                             if (caption != null) { caption.Visible = false; }
+                            if (iconView != null) { iconView.Box = 14; }
                             button.ClassName = Ribbon.RetainedItemClass(item, 2);
                             button.MeasureTree(app);
                             tileWidth = (int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap;
@@ -109,6 +205,7 @@ public partial class Ribbon {
                     } finally {
                         button.Visible = shown; button.ClassName = classes;
                         if (caption != null) { caption.Visible = captionShown; }
+                        if (iconView != null) { iconView.Box = prevIconBox; }
                     }
                     flat = flat + 1;
                 }
@@ -161,7 +258,7 @@ public partial class Ribbon {
                 button.MeasureTree(app);
                 int tw = button.prefW;
                 button.Arrange(tx, y, (int)Math.Max(0, Math.Min(tw, x + this.bw - tx)), stripH);
-                tx = tx + tw;
+                tx = tx + tw + app.theme.gapSmall;
             }
         }
         if (retainedBand == null) { return; }
@@ -284,6 +381,7 @@ public partial class Ribbon {
                 if (treeGeneration != session || arrangeEpoch != revision) { return false; }
             }
             button.ClassName = Ribbon.RetainedItemClass(item, found.kind);
+            if (i < retainedIcons.Count && retainedIcons[i] != null) { retainedIcons[i].Box = found.kind == 0 ? 20 : 14; }
             if (i < retainedLabels.Count && retainedLabels[i] != null) { retainedLabels[i].Visible = found.kind != 2; }
             button.MeasureTree(app);
             int gap = app.Scale(Space.XS);
