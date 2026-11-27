@@ -72,11 +72,14 @@ public partial class RegexProgram {
             this.ppos = this.ppos + 1;
             int len = this.Here() - start;
             this.Shift(start, len, 1);
+            if (this.error.Length > 0) { return; }
             int jmpOut = this.Emit(RegexProgram.OpJmp(), 0, 0, 0);
+            if (this.error.Length > 0) { return; }
             this.op[start] = RegexProgram.OpSplit();
             this.ax[start] = start + 1;
             this.ay[start] = this.Here();
             this.ParseSeq();
+            if (this.error.Length > 0) { return; }
             this.ax[jmpOut] = this.Here();
         }
     }
@@ -310,8 +313,10 @@ public partial class RegexProgram {
         int slot = this.marks;
         this.marks = this.marks + 1;
         this.Shift(start, len, 2);
+        if (this.error.Length > 0) { return; }
         int chk = this.Emit(RegexProgram.OpEmptyChk(), slot, 0, 0);
         this.Emit(RegexProgram.OpJmp(), start, 0, 0);
+        if (this.error.Length > 0) { return; }
         int outPc = this.Here();
         this.ay[chk] = outPc;
         this.op[start + 1] = RegexProgram.OpMark();
@@ -326,11 +331,13 @@ public partial class RegexProgram {
         int slot = this.marks;
         this.marks = this.marks + 1;
         this.Shift(start, len, 1);
+        if (this.error.Length > 0) { return; }
         this.op[start] = RegexProgram.OpMark();
         this.ax[start] = slot;
         this.ay[start] = 0;
         int chk = this.Emit(RegexProgram.OpEmptyChk(), slot, 0, 0);
         int sp = this.Emit(RegexProgram.OpSplit(), 0, 0, 0);
+        if (this.error.Length > 0) { return; }
         this.ay[chk] = sp + 1;
         this.SetSplitTargets(sp, start, sp + 1, lazy);
     }
@@ -338,6 +345,7 @@ public partial class RegexProgram {
     // 将 [start, start+len) 处的主体转换为 body?。
     public void OptionalAt(int start, int len, bool lazy) {
         this.Shift(start, len, 1);
+        if (this.error.Length > 0) { return; }
         int outPc = this.Here();
         this.op[start] = RegexProgram.OpSplit();
         this.SetSplitTargets(start, start + 1, outPc, lazy);
@@ -346,9 +354,16 @@ public partial class RegexProgram {
     // 在 [start, start+len) 处的主体前为 `n` 条指令腾出空间，
     // 并重定位 start 处及之后的跳转目标。
     public void Shift(int start, int len, int n) {
+        if (this.error.Length > 0) { return; }
+        if (this.op.Count + n > RegexProgram.MaxInstructions()) {
+            this.error = "compiled regex exceeds maximum instruction limit ("
+                + Convert.ToString(RegexProgram.MaxInstructions()) + ")";
+            return;
+        }
         int i = 0;
         for (; i < n; i = i + 1) {
             this.Emit(RegexProgram.OpJmp(), 0, 0, 0);
+            if (this.error.Length > 0) { return; }
         }
         // 从末尾开始把主体上移 n 位，避免覆盖
         i = len - 1;
@@ -414,6 +429,19 @@ public partial class RegexProgram {
 
     // '(' 已消耗，处理捕获组、(?:、(?#、(?=/(?!/ (?<=/ (?<!/ (?> 与命名捕获组 (?<name> / (?'name' / (?P<name>。
     public void ParseGroup() {
+        if (this.parseDepth >= 256) {
+            this.error = "regex group nesting exceeds maximum depth (256) at " + this.ppos;
+            return;
+        }
+        this.parseDepth = this.parseDepth + 1;
+        try {
+            this.ParseGroupBody();
+        } finally {
+            this.parseDepth = this.parseDepth - 1;
+        }
+    }
+
+    private void ParseGroupBody() {
         if (this.Peek() != 63) {  // 普通捕获组
             this.ParseCaptureBody(this.NewGroup(""));
             return;

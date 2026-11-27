@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Input;
+using System.Management;
 
 namespace System.Windows;
 
@@ -41,11 +43,56 @@ public static class DockCorner {
     public const int Center = 4;
 }
 
+// 单台物理显示器的边界与扣除任务栏后的工作区（支持负坐标副屏与竖屏）。
+public class MonitorWorkArea {
+    public int Index;
+    public string Name;
+    public bool IsPrimary;
+    public WorkAreaRect Bounds;
+    public WorkAreaRect WorkArea;
+
+    public MonitorWorkArea(int index, string name, bool isPrimary,
+                           WorkAreaRect bounds, WorkAreaRect workArea) {
+        this.Index = index;
+        this.Name = name == null ? "" : name;
+        this.IsPrimary = isPrimary;
+        this.Bounds = bounds;
+        this.WorkArea = workArea;
+    }
+}
+
 // 桌面工作区探测与窗口安全停靠/拖拽钳位工具（零 Gui 依赖，可与任意窗口壳组合）。
 public static class DesktopDock {
     #if WINDOWS
     [DllImport("user32", EntryPoint = "SystemParametersInfoW")]
     private static extern int WinSystemParametersInfoW(int uiAction, int uiParam, nint pvParam, int fWinIni);
+
+    [DllImport("user32", EntryPoint = "MonitorFromRect")]
+    private static extern nint WinMonitorFromRect(nint lprc, int dwFlags);
+
+    [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
+    private static extern int WinGetMonitorInfoW(nint hMonitor, nint lpmi);
+
+    private static bool TryQueryMonitorRects(nint hmon, out WorkAreaRect bounds, out WorkAreaRect work) {
+        bounds = null;
+        work = null;
+        if (hmon == 0) { return false; }
+        // MONITORINFO: cbSize(4) + rcMonitor(16) + rcWork(16) + dwFlags(4) = 40 bytes
+        nint mi = NativeMemory.Alloc(40);
+        try {
+            Span<int> sp = new Span<int>(mi, 10);
+            for (int i = 0; i < 10; i = i + 1) { sp[i] = 0; }
+            sp[0] = 40;
+            if (DesktopDock.WinGetMonitorInfoW(hmon, mi) != 0) {
+                bounds = new WorkAreaRect(sp[1], sp[2], sp[3], sp[4]);
+                work = new WorkAreaRect(sp[5], sp[6], sp[7], sp[8]);
+                return work.Width > 0 && work.Height > 0;
+            }
+        } finally {
+            NativeMemory.Free(mi);
+        }
+        return false;
+    }
     #endif
 
     // 查询主显示器扣除任务栏后的可用工作区；不支持或失败时回退到 ScreenWidth x ScreenHeight。
@@ -73,6 +120,85 @@ public static class DesktopDock {
         if (w <= 0) { w = 1920; }
         if (h <= 0) { h = 1080; }
         return new WorkAreaRect(0, 0, w, h);
+    }
+
+    // 枚举所有物理显示器及其各自扣除任务栏后的工作区（复用 System.Management.Display 拓扑）。
+    public static List<MonitorWorkArea> GetMonitors() {
+        List<MonitorWorkArea> result = new List<MonitorWorkArea>();
+        List<DisplayInfo> displays = Display.Monitors();
+        for (int i = 0; i < displays.Count; i = i + 1) {
+            DisplayInfo d = displays[i];
+            if (d == null) { continue; }
+            WorkAreaRect bounds = new WorkAreaRect(d.x, d.y, d.x + d.width, d.y + d.height);
+            WorkAreaRect work = bounds;
+            #if WINDOWS
+            nint probe = NativeMemory.Alloc(16);
+            try {
+                Span<int> sp = new Span<int>(probe, 4);
+                int cx = d.x + d.width / 2;
+                int cy = d.y + d.height / 2;
+                sp[0] = cx;
+                sp[1] = cy;
+                sp[2] = cx + 1;
+                sp[3] = cy + 1;
+                nint hmon = DesktopDock.WinMonitorFromRect(probe, 2 /* MONITOR_DEFAULTTONEAREST */);
+                WorkAreaRect qBounds;
+                WorkAreaRect qWork;
+                if (DesktopDock.TryQueryMonitorRects(hmon, out qBounds, out qWork)) {
+                    bounds = qBounds;
+                    work = qWork;
+                }
+            } finally {
+                NativeMemory.Free(probe);
+            }
+            #endif
+            result.Add(new MonitorWorkArea(d.index, d.name, d.primary, bounds, work));
+        }
+        if (result.Count == 0) {
+            WorkAreaRect primary = DesktopDock.GetPrimaryWorkArea();
+            result.Add(new MonitorWorkArea(0, "PRIMARY", true, primary, primary));
+        }
+        return result;
+    }
+
+    // 查询包含（或最接近）虚拟桌面坐标 (x, y) 的显示器工作区（天然支持左副屏负坐标）。
+    public static WorkAreaRect GetWorkAreaAt(int x, int y) {
+        #if WINDOWS
+        nint probe = NativeMemory.Alloc(16);
+        try {
+            Span<int> sp = new Span<int>(probe, 4);
+            sp[0] = x;
+            sp[1] = y;
+            sp[2] = x + 1;
+            sp[3] = y + 1;
+            nint hmon = DesktopDock.WinMonitorFromRect(probe, 2 /* MONITOR_DEFAULTTONEAREST */);
+            WorkAreaRect qBounds;
+            WorkAreaRect qWork;
+            if (DesktopDock.TryQueryMonitorRects(hmon, out qBounds, out qWork)) {
+                return qWork;
+            }
+        } finally {
+            NativeMemory.Free(probe);
+        }
+        #endif
+        return DesktopDock.GetPrimaryWorkArea();
+    }
+
+    // 计算窗口停靠在指定显示器索引（0 = 主屏，1..N = 副屏）四角/居中时的安全坐标。
+    public static DockPosition ComputeMonitorCorner(int monitorIndex, int winW, int winH,
+                                                    int corner, int marginX, int marginY) {
+        List<MonitorWorkArea> mons = DesktopDock.GetMonitors();
+        WorkAreaRect area = DesktopDock.GetPrimaryWorkArea();
+        if (monitorIndex >= 0 && monitorIndex < mons.Count) {
+            area = mons[monitorIndex].WorkArea;
+        }
+        return DesktopDock.ComputeCorner(area, winW, winH, corner, marginX, marginY);
+    }
+
+    // 按窗口中心点自动定位所在显示器并钳位，适合多屏环境拖拽桌宠窗口。
+    public static DockPosition ClampToMonitorAt(int x, int y, int winW, int winH) {
+        WorkAreaRect area = DesktopDock.GetWorkAreaAt(x + winW / 2, y + winH / 2);
+        return DesktopDock.ClampToArea(area, x, y, winW, winH);
     }
 
     // 计算窗口停靠在指定工作区四角/居中时的安全坐标（自动钳位防止越界）。
@@ -210,5 +336,212 @@ public static class CompanionActivityTracker {
     private static bool OnMouse(int x, int y, int msg, int data, bool injected) {
         CompanionActivityTracker.RecordMouseEvent(x, y, msg, data);
         return false;
+    }
+}
+
+// 前台全屏游戏/视频自动躲避检测器（商业桌宠在全屏场景自动隐藏或降帧休眠的核心机制）。
+public static class ForegroundFullscreenDetector {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetForegroundWindow")]
+    private static extern nint WinGetForegroundWindow();
+
+    [DllImport("user32", EntryPoint = "GetDesktopWindow")]
+    private static extern nint WinGetDesktopWindow();
+
+    [DllImport("user32", EntryPoint = "GetShellWindow")]
+    private static extern nint WinGetShellWindow();
+
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    private static extern int WinGetWindowRect(nint hwnd, nint lpRect);
+
+    [DllImport("user32", EntryPoint = "MonitorFromWindow")]
+    private static extern nint WinMonitorFromWindow(nint hwnd, int dwFlags);
+
+    [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
+    private static extern int WinGetMonitorInfoW(nint hMonitor, nint lpmi);
+
+    [DllImport("user32", EntryPoint = "GetClassNameW")]
+    private static extern int WinGetClassNameW(nint hwnd, nint lpClassName, int nMaxCount);
+    #endif
+
+    // 纯几何覆盖判定：窗口矩形是否完全覆盖目标显示器物理边界。
+    public static bool IsRectCoveringMonitor(WorkAreaRect winRect, WorkAreaRect monBounds) {
+        if (winRect == null || monBounds == null) { return false; }
+        if (monBounds.Width <= 0 || monBounds.Height <= 0) { return false; }
+        return winRect.Left <= monBounds.Left
+            && winRect.Top <= monBounds.Top
+            && winRect.Right >= monBounds.Right
+            && winRect.Bottom >= monBounds.Bottom;
+    }
+
+    // 探测当前前台活动窗口是否处于独占/无边框全屏状态（自动排除桌面壳 Progman/WorkerW/任务栏）。
+    public static bool IsFullscreenActive() {
+        #if WINDOWS
+        nint fg = ForegroundFullscreenDetector.WinGetForegroundWindow();
+        if (fg == 0) { return false; }
+        if (fg == ForegroundFullscreenDetector.WinGetDesktopWindow()
+            || fg == ForegroundFullscreenDetector.WinGetShellWindow()) {
+            return false;
+        }
+        nint clsBuf = NativeMemory.Alloc(128 * 2);
+        string clsName = "";
+        try {
+            int n = ForegroundFullscreenDetector.WinGetClassNameW(fg, clsBuf, 128);
+            if (n > 0) { clsName = Wide.Read(clsBuf); }
+        } finally {
+            NativeMemory.Free(clsBuf);
+        }
+        if (clsName == "Progman" || clsName == "WorkerW"
+            || clsName == "Shell_TrayWnd" || clsName == "Shell_SecondaryTrayWnd") {
+            return false;
+        }
+        nint wr = NativeMemory.Alloc(16);
+        nint mi = NativeMemory.Alloc(40);
+        try {
+            if (ForegroundFullscreenDetector.WinGetWindowRect(fg, wr) == 0) { return false; }
+            nint mon = ForegroundFullscreenDetector.WinMonitorFromWindow(fg, 2 /* MONITOR_DEFAULTTONEAREST */);
+            if (mon == 0) { return false; }
+            Span<int> msp = new Span<int>(mi, 10);
+            for (int i = 0; i < 10; i = i + 1) { msp[i] = 0; }
+            msp[0] = 40;
+            if (ForegroundFullscreenDetector.WinGetMonitorInfoW(mon, mi) == 0) { return false; }
+            Span<int> wsp = new Span<int>(wr, 4);
+            WorkAreaRect winRect = new WorkAreaRect(wsp[0], wsp[1], wsp[2], wsp[3]);
+            WorkAreaRect monBounds = new WorkAreaRect(msp[1], msp[2], msp[3], msp[4]);
+            return ForegroundFullscreenDetector.IsRectCoveringMonitor(winRect, monBounds);
+        } finally {
+            NativeMemory.Free(wr);
+            NativeMemory.Free(mi);
+        }
+        #else
+        return false;
+        #endif
+    }
+}
+
+// 跨进程单实例防双开互斥锁（Win32 CreateMutexW + ERROR_ALREADY_EXISTS；非 Windows 进程内兜底）。
+public class SingleInstanceGuard : IDisposable {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateMutexW")]
+    private static extern nint WinCreateMutexW(nint attrs, int initialOwner, nint name);
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    private static extern int WinGetLastError();
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    private static extern int WinCloseHandle(nint handle);
+    #endif
+
+    private static List<string> localHeld = new List<string>();
+    private nint handle;
+    private string key;
+
+    private SingleInstanceGuard(nint handle, string key) {
+        this.handle = handle;
+        this.key = key;
+    }
+
+    // 尝试获取应用单实例锁；成功返回持锁对象（退出前 Dispose 释放），已被其他实例持有返回 null。
+    public static SingleInstanceGuard TryAcquire(string appId) {
+        if (appId == null || appId == "") { return null; }
+        string fullKey = "Local\\ZanSingleInstance_" + appId;
+        #if WINDOWS
+        nint wname = Wide.Of(fullKey);
+        nint h = 0;
+        int err = 0;
+        try {
+            h = SingleInstanceGuard.WinCreateMutexW(0, 1, wname);
+            err = SingleInstanceGuard.WinGetLastError();
+        } finally {
+            Wide.Free(wname);
+        }
+        if (h == 0) { return null; }
+        if (err == 183 /* ERROR_ALREADY_EXISTS */) {
+            SingleInstanceGuard.WinCloseHandle(h);
+            return null;
+        }
+        return new SingleInstanceGuard(h, fullKey);
+        #else
+        for (int i = 0; i < SingleInstanceGuard.localHeld.Count; i = i + 1) {
+            if (SingleInstanceGuard.localHeld[i] == fullKey) { return null; }
+        }
+        SingleInstanceGuard.localHeld.Add(fullKey);
+        return new SingleInstanceGuard(1, fullKey);
+        #endif
+    }
+
+    public bool IsHeld { get { return this.handle != 0; } }
+
+    public void Dispose() {
+        if (this.handle == 0) { return; }
+        #if WINDOWS
+        SingleInstanceGuard.WinCloseHandle(this.handle);
+        #else
+        for (int i = SingleInstanceGuard.localHeld.Count - 1; i >= 0; i = i - 1) {
+            if (SingleInstanceGuard.localHeld[i] == this.key) {
+                SingleInstanceGuard.localHeld.RemoveAt(i);
+                break;
+            }
+        }
+        #endif
+        this.handle = 0;
+    }
+}
+
+// 开机自启注册管理（Windows 读写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。
+public static class StartupRegistration {
+    private const string RUN_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    public static bool Enable(string appName, string commandLine) {
+        if (appName == null || appName == "" || commandLine == null || commandLine == "") {
+            return false;
+        }
+        #if WINDOWS
+        nint k = Registry.CreateKey(Registry.Hkcu(), RUN_KEY);
+        if (k == 0) { return false; }
+        try {
+            Registry.SetString(k, appName, commandLine);
+            return true;
+        } finally {
+            Registry.CloseKey(k);
+        }
+        #else
+        return false;
+        #endif
+    }
+
+    public static bool Disable(string appName) {
+        if (appName == null || appName == "") { return false; }
+        #if WINDOWS
+        nint k = Registry.OpenKey(Registry.Hkcu(), RUN_KEY, true);
+        if (k == 0) { return false; }
+        try {
+            Registry.DeleteValue(k, appName);
+            return true;
+        } finally {
+            Registry.CloseKey(k);
+        }
+        #else
+        return false;
+        #endif
+    }
+
+    public static string GetCommand(string appName) {
+        if (appName == null || appName == "") { return ""; }
+        #if WINDOWS
+        nint k = Registry.OpenKey(Registry.Hkcu(), RUN_KEY, false);
+        if (k == 0) { return ""; }
+        try {
+            return Registry.GetString(k, appName);
+        } finally {
+            Registry.CloseKey(k);
+        }
+        #else
+        return "";
+        #endif
+    }
+
+    public static bool IsEnabled(string appName) {
+        return StartupRegistration.GetCommand(appName) != "";
     }
 }

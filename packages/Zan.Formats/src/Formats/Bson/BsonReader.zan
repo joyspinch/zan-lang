@@ -208,10 +208,51 @@ public class BsonReader {
                         + Convert.ToString(typeAt));
                 }
                 string name = InternCStr(bp, bodyEnd);
-                ks.Add(name);
-                vs.Add(ReadElement(t, depth));
+                JsonValue elem = ReadElement(t, depth);
+                BsonReader.SetObjField(v, name, elem);
             }
         }
+    }
+
+    // 新建文档字段去重写入（小对象线性探测、大对象按需建 keyIndex，避免重复键）。
+    private static void SetObjField(JsonValue obj, string key, JsonValue val) {
+        if (obj.keyIndex != null) {
+            int existing = 0;
+            if (obj.keyIndex.TryGetValue(key, out existing)) {
+                obj.vals[existing] = val;
+                return;
+            }
+            int ni = obj.keys.Count;
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            obj.keyIndex[key] = ni;
+            return;
+        }
+        int cnt = obj.keys.Count;
+        if (cnt < 8) {
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (obj.keys[i] == key) {
+                    obj.vals[i] = val;
+                    return;
+                }
+            }
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            return;
+        }
+        Dict<string, int> idx = new Dict<string, int>();
+        for (int i = 0; i < cnt; i = i + 1) {
+            idx[obj.keys[i]] = i;
+        }
+        obj.keyIndex = idx;
+        int ex2 = 0;
+        if (idx.TryGetValue(key, out ex2)) {
+            obj.vals[ex2] = val;
+            return;
+        }
+        obj.keys.Add(key);
+        obj.vals.Add(val);
+        idx[key] = cnt;
     }
 
     // 数组元素键跳过：零字符串分配，SIMD memchr 直定位终止 NUL。

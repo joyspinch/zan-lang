@@ -87,6 +87,21 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id);
 ZAN_GAME_API int32_t zan_game_set_lights3d(int32_t count, const float *dirs,
     const float *colors, const float *ambient);
 
+/* 商业级 3D 相机、PBR 材质/自发光、动态点光源与线性距离雾状态（用于 draw3d_ex /
+ * draw3d_skinned；缺省值保证历史纯漫反射着色逐位兼容）：
+ * - set_camera3d: 传入世界空间相机位置（激活高光视角与距离雾计算）。
+ * - set_material3d: metallic [0..1], roughness [0..1], emissive RGB（自发光不受光照与阴影衰减）。
+ * - set_point_lights3d: 最多 4 盏动态点光源，pos_range4 为 count*4 float [x,y,z,radius]，
+ *   colors3 为 count*3 float [r,g,b]。
+ * - set_fog3d: 线性大气距离雾（start..end 区间平滑混入雾色）。 */
+ZAN_GAME_API void zan_game_set_camera3d(float x, float y, float z);
+ZAN_GAME_API void zan_game_set_material3d(float metallic, float roughness,
+    float em_r, float em_g, float em_b);
+ZAN_GAME_API int32_t zan_game_set_point_lights3d(int32_t count,
+    const float *pos_range4, const float *colors3);
+ZAN_GAME_API void zan_game_set_fog3d(int32_t enabled, float r, float g, float b,
+    float start_dist, float end_dist);
+
 #ifdef __cplusplus
 }
 #endif

@@ -514,7 +514,6 @@
 - host nullable sbyte 的本轮错误在输出扩宽而非数组 stride：`Nullable.Value` 推断保留 TYPE_SBYTE，payload extract 得到正确 i8，但 `emit_widen_i64_for_print -> zan_iwiden` 对 <=8 位整数做 ZExt，使 -113/-7 变成 143/249。Console.WriteLine/Write 的整数出口利用表达式语义类型，对 TYPE_SBYTE 显式 SExt 到 i64；byte 保持原零扩展。LLVM i8 本身不携带 signedness，不能为修 sbyte 全局把 i8 扩宽改为 SExt；本次也未证明所有转换/格式化出口的 signedness 已闭合。
 - 回归锚点：`selfhost_nullable_byte_array_stride` 覆盖 byte?/sbyte? 一维及矩形数组、null、替换、alias 与负值输出；nullable rank fixture 覆盖数组不能误进标量路径。主会话报告新增 3 组对拍 PASS、6 项 host CTest 全 PASS（7.27 秒）。nullable ARC 检查未开启：上述证据确认功能输出与本轮布局路径，不外推为 nullable box 引用计数/析构无泄漏或异常展开已验收。
 
-
 ## 16. 异步 GenVarDecl：捕获 cell 标准头与 lambda 目标签名（2026-11-11 实证）
 
 - async `GenVarDecl` 的提前返回分支必须遵循普通局部声明的闭包契约：被捕获局部的 cell 统一由 `OwnedCell(pty0)` 创建，不能用裸 `malloc(TypeSizeBytes(...))`。初始化、默认 struct 初始化和其他默认初始化的 captured cell 均须覆盖；cell 的零初始化 payload 由标准分配器提供。
@@ -527,6 +526,11 @@
 ## 17. Async pending return：撤销 owner 与最终结果缓存必须同源（2026-11-11 实证）
 
 - Selfhost 返回值先 retain 并写 frame slot6，再执行可挂起 finally；finally 逃逸异常、下一次 resume 取消或 frame cleanup 必须 load → clear → 按声明类型 release。helper 显式传 retTy，独立 cleanup 生成前保存类型；正常 completion 将 owner 转给 awaiter，不能在每次 throw 时撤销，finally 内部 catch 后仍可能继续返回。替换 return 先 retain 新值再释放旧值，允许两者别名。
+
+## 18. 异步 throw 清理 O(N²) 抑制与空 `__zan_sinit_` 裁剪（2026-11-23 实证）
+
+- **异步 `throw` 与 `emit_async_complete` 禁止重复清理预分配帧局部及其别名**：`emit_async.c` 在进入函数体前把全部帧局部预填在 `locals[0 .. current_async_frame_local_count - 1]`，并在 `irgen_async_coops.c` 将协程根 landing pad（`catch_bb = current_async_exc_bb`、`throw_locals_base = 0`）压入 `lpad_stack`。当异步 `throw` 无更内层用户 `catch_bb`（排除 `top->catch_bb == g->current_async_exc_bb`）或走 `emit_async_complete` 时，控制流必经 `co.exc` → `co.complete` (`emit_async_complete_epilogue`) 一次性释放并清零全部帧局部；此时 `stmt_jump.c` 与 `irgen_async_pending.c` 必须以 `current_async_frame_local_count` 为 `rel_base` 下界并跳过 `frame_owner >= 0` 的帧别名释放（保留非别名局部及局部 `try/catch` 内清理）。否则 N 局部 + N `throw` 退化为 O(N²) IR（`conformance_async_throw_ir_scaling` 32→64 从 325% 降至 196%）。
+- **无 `cctor` 与静态初始化器的类型省略 `__zan_sinit_` 函数但保留 `static_init_types` 登记**：`finalize_static_rc_cleanup`（`irgen_stmt.c`）依赖 `g->static_init_types` 判断哪些活跃类型/泛型实例需要在退出时释放未初始化静态 RC 字段（如 `static T Cached;`）。因此 `sinit_activate`（`emit_static_init.c`）仍登记活跃 `(sym, inst)`，仅当 `sinit_type_has_init_work` 为真时才创建/发射/调用 `__zan_sinit_*`（否则 `fn = NULL, emitted = true`），`GCTX_SLOT_SINIT_FN` 已兼容 `NULL`。定向回归 `case_generic_static_rc_cleanup` 与 33 项定向 suite（含 `publish_static_init_demand_ir` 等）全过，500 实体单函数异步+`throw` 探针 `-O0`/`-O2` 均 `--check-leaks` 零泄漏。
 - 宿主 typed RVAL 还兼作 pending return 缓存。pending discard 已释放 owner 后，RVAL 可能残留旧指针；orphan 清理必须以最终 RESULT 是否交付值为准，先清 RVAL，指针结果从 RESULT 解码，聚合只在实际交付时按类型释放。不得用旧 RVAL 再 release，也不得关 arcguard 掩盖错误。
 - 实证：selfhost_async_pending_result_owner 的旧 gen1 异常及取消两处 WeakReference 错误为 true；修后四路径（正常跨 Yield、finally 内部 catch、异常终结、取消）均匹配 golden。修后 gen1 c7614f9ab367a98983898b7b5e05ecd0a3d8ad07fbafec11145c49e9af7f0454，另 3 项 focused 通过。宿主普通 probe 虽绿，正式 CTest arcguard 首次报 stale release；修 RVAL/RESULT 后原 fixture 与 async_spawn_result_release 的 arcguard+check-leaks probe 和两条正式 CTest 均通过（4.79 秒）。
 - 边界：独立 cleanup callback 与 finally 第二次 return 只有生成/链接覆盖；最新改动未重跑 fixedpoint 或完整 production driver。前一 checkpoint 的 fixedpoint+24行为+10拒绝通过不可冒充本次新源码结果。证据 _scratch/async-pending-owner。
@@ -543,7 +547,6 @@
 
 - 原异常的对象和类型必须一起保存。同步 throw、裸重抛、catch 类型不匹配后的传播在运行内联 finally 后，只有控制流正常返回才发布原异常；finally 逃逸的新异常继续传播。不要把同步 SSA 保存方式用于可能挂起的 async 路径。
 - 实证：selfhost_sync_finally_payload 旧 gen1 三次进入错误的外层 handler，新 gen1 与两个 pending-return 回归均匹配预期。另有独立探针证明普通同步局部在同帧和跨帧异常时仍漏释放；异常派发修复不等于 ARC 保活或局部 owner 展开。证据见 _scratch/sync-owner-eh-review。
-
 
 ## 20. 失败的 await 必须沿最内层异常清理入口展开
 
@@ -562,18 +565,17 @@
 - 同名局部实例仍须按实例处理。回归同时覆盖 `Console.WriteLine(await Number())` 和局部 `Sink Console`：await 实参将该变量改为 replacement 时，本次调用仍写入 original，下一次调用才使用 replacement。
 - 2026-11-11：`case_async_builtin_static_receiver` 与未改写的 `case_async_generic_method` 定向通过（2/2，2.81 秒）；前者完整输出为 `42`、`original:7`、`replacement:9`。这证明本次静态接收者分类与实例求值顺序，不代表所有异步降级路径已验收。
 
-## 21. 泛型异步帧扫描与恢复体必须使用同一组类型绑定
-
-- `emit_async.c` 的 `async_scan_stmt` 之前，安装当前 work item 的方法类型形参、实参和接收者实例（`w->mtps`、`w->mbind`、`w->cur_inst`）；扫描结束恢复调用者环境。帧槽类型和 ARC owner 分类必须与写入该槽的 resume 体一致。
-- 扫描留在开放泛型环境时，恢复体仍可能正确写入具体引用值，却没有为该槽生成释放路径。典型形状是泛型转发器 `return await factory.Open()`，以及等价的命名局部与 `try/finally` 形状；返回值正确不代表 owner 已回收。
-- 用 `case_async_generic_frame_owner` 检查结果与泄漏。独立探针使用未优化构建配合 `--check-leaks --arc-guard --strict-runtime`，三种形状都应返回 42 且无运行时诊断。
-
 ## 22. 500+ 实体 EH `-O2` 扩展性与未限定泛型静态接收者推导（2026-11-23 实证）
 
 - **EH helper `noinline`、冷 `try.lpad` volatile release 与 guard outlining 消除 `-O2` 组合爆炸**：单函数 N 个顺序 `try` + 引用局部时，内联 `__zan_eh_tmp_push` / `__zan_eh_tmp_pop` / `__zan_eh_state_fast` 叠加 `try.lpad` 清理把 CFG 块与 TLS/SSA 数据流放大到 PassBuilder / InstCombine / CodeGen 超时（500 实体 `-O2` >120s、Peak RAM 2,246 MB）。`builtin_eh_state.c` / `builtin_eh_unwind.c` 对这 3 个 helper 标 `noinline`（Windows `tls_fallback` 也设 `noinline`）；`generic_lpad.c` 在 `cleanup_count > 8` 时保持 `try.lpad` release 为 `volatile` 防跨百块重排；`generic_guard.c` 将空指针/边界校验诊断外提为 `__zan_guard_report_merged`（`noinline` + `cold`）和 `__zan_throw_guard`；`arc_ops.c` 按 64-entry 步长做 `volatile` 屏障，并在 `optimizer.c` 给 `InstCombine` 传保守选项。实测 500 实体 EH+ARC 探针 `-O2 --check-leaks` 降至 ~39s（`optimize` 16.4s、`write obj` 20.4s、Peak RAM 501 MB），输出 `500` 且零泄漏。
 - **未限定泛型静态接收者（`Box.Create(8)`）必须同时覆盖 checker 与 irgen**：`nsresolve_stamp.c` 仅在非当前命名空间时设置 `ident.is_type_receiver = true`，同命名空间 `Box.Create(8)` 的 `is_type_receiver` 为 `false`。`checker_expr_core.c` 的 `uninstantiated_generic_type_recv` 须改用 `checker_method_group_type_receiver(c, obj) == recv->sym`（同时保留泛型类体内 `Box<T>` 开放性与 `diag_host_generic_invariant_return` 的 E2024 校验）。irgen 侧 `call_dispatch.c`、`expr_infer.c` 与 `generic_discover.c` 不能因 `ident_inst_type == NULL` 回退到擦除 `abort()` 桩 `@Box_Create`：需在发码实参前调用 `infer_generic_static_recv_inst`（`lambda_infer.c`）从实参类型推导闭合泛型实例（`locals == NULL` 时用空 `local_scope_t` 兜底避免 `local_find(NULL, ...)` 解引用空指针），并在 `generic_discover.c` 用带作用域 `collect_inst_expr_scoped` 追踪局部变量/`var`/循环变量类型以收集闭合泛型实例。
 - 实证：`case_generic_static_member_access`、`diag_host_generic_invariant_return`、`case_generic_open_call_template`、`case_selfhost_local_exception_owner` 及 76 项 generic/selfhost/EH/async 回归通过；未限定 `Box.Create(x)` / `var b = Box.Create("hello")` / `Pair.Of(42, "ok")` 边界探针 `--check-leaks` 零泄漏。
 
+## 21. 泛型异步帧扫描与恢复体必须使用同一组类型绑定
+
+- `emit_async.c` 的 `async_scan_stmt` 之前，安装当前 work item 的方法类型形参、实参和接收者实例（`w->mtps`、`w->mbind`、`w->cur_inst`）；扫描结束恢复调用者环境。帧槽类型和 ARC owner 分类必须与写入该槽的 resume 体一致。
+- 扫描留在开放泛型环境时，恢复体仍可能正确写入具体引用值，却没有为该槽生成释放路径。典型形状是泛型转发器 `return await factory.Open()`，以及等价的命名局部与 `try/finally` 形状；返回值正确不代表 owner 已回收。
+- 用 `case_async_generic_frame_owner` 检查结果与泄漏。独立探针使用未优化构建配合 `--check-leaks --arc-guard --strict-runtime`，三种形状都应返回 42 且无运行时诊断。
 
 ## 22. 异常态 finally 的原异常拥有者与离开入口（2026-11-11 实证）
 
@@ -586,7 +588,6 @@
 - `await_target_is_async` 在没有适用实例/接口方法后调用共享 `find_extension_method`，按选中声明的 `MOD_ASYNC` 决定取帧。泛型 async 扩展的静态返回类型仍是结果类型，不能依赖 Task 类型或假定 checker 已填 resolved_sym。
 - 缺扩展分类时，`await executor.ReadAsync<Entity>()` 曾落到同步 emit_expr，挂起后的返回值变成空白/垃圾整数；加分类后同步根驱动与 async 嵌套等待均返回42。判定器：`case_async_generic_extension` 和真实 SQLite `case_orm_executor_extensions`；保留同步扩展 await 的直返语义。
 - 自举后端单独依赖 `ExprVal.asyncCall`（EmitAwait）；`EmitExtensionCall` 对 async 方法必须发 `i8*` 帧返回签名，并用 `AsyncFrame` 携带替换后的结果类型，不能登记为普通 ARC 临时。`PickExtension` 同样先拒绝显式泛型元数不符候选。修前同一用例输出 -1/-1/垃圾整数；局部修复并按 canonical 清单重建 gen1 后，单案差分 PASS（1 passed, 0 gaps, 0 failures），已登记 diff_cases。
-
 
 ## 23. 自举同步异常清理入口与线程隔离（2026-11-11 实证）
 

@@ -190,10 +190,10 @@ public class CborReader {
             long hi = (v >> 1) & 9223372036854775807;
             return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
         }
-        if (major == 1) {  // 负整数
+        if (major == 1) {  // 负整数：RFC 8949 定义值为 -1 - n（n 为无符号 64 位参数）
             long n = Arg(ai);
             if (n >= 0) { return JsonValue.NewInt(-1 - n); }
-            return JsonValue.NewDouble(0.0 - U64ToDouble(~n) - 1.0);
+            return JsonValue.NewDouble(0.0 - (1.0 + U64ToDouble(n)));
         }
         if (major == 2) {  // byte string
             if (ai == 31) { return JsonValue.NewStr(TakeChunksStr(2)); }
@@ -255,8 +255,49 @@ public class CborReader {
         return SimpleValue(ai);  // major 7
     }
 
+    // 新建对象快速写入并去重（小对象线性扫描、大对象转 keyIndex，避开重复键且零 CheckCycle 开销）。
+    private static void SetObjField(JsonValue obj, string key, JsonValue val) {
+        if (obj.keyIndex != null) {
+            int existing = 0;
+            if (obj.keyIndex.TryGetValue(key, out existing)) {
+                obj.vals[existing] = val;
+                return;
+            }
+            int ni = obj.keys.Count;
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            obj.keyIndex[key] = ni;
+            return;
+        }
+        int cnt = obj.keys.Count;
+        if (cnt < 8) {
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (obj.keys[i] == key) {
+                    obj.vals[i] = val;
+                    return;
+                }
+            }
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            return;
+        }
+        Dict<string, int> idx = new Dict<string, int>();
+        for (int i = 0; i < cnt; i = i + 1) {
+            idx[obj.keys[i]] = i;
+        }
+        obj.keyIndex = idx;
+        int ex2 = 0;
+        if (idx.TryGetValue(key, out ex2)) {
+            obj.vals[ex2] = val;
+            return;
+        }
+        obj.keys.Add(key);
+        obj.vals.Add(val);
+        idx[key] = cnt;
+    }
+
     // map 条目：key 必须是文本字符串（JsonValue 对象键即字符串）。
-    // 定长文本键快路径走短键缓存直接解 string 并跳过新建树的 CheckCycle 遍历。
+    // 定长文本键快路径走短键缓存直接解 string 并去重写入。
     public void PutEntry(JsonValue obj, int depth) {
         if (depth + 1 <= 512 && pos < len) {
             int ib = buf[pos] & 255;
@@ -266,9 +307,8 @@ public class CborReader {
                     pos = pos + 1;
                     string key = TakeCachedKey(ArgLen(Arg(ai)));
                     JsonValue val = ReadValue(depth + 1);
-                    if (obj.keyIndex == null && !obj.isReadOnly) {
-                        obj.keys.Add(key);
-                        obj.vals.Add(val);
+                    if (!obj.isReadOnly) {
+                        CborReader.SetObjField(obj, key, val);
                     } else {
                         obj.Put(key, val);
                     }
@@ -282,9 +322,8 @@ public class CborReader {
                 + Convert.ToString(pos));
         }
         JsonValue val2 = ReadValue(depth + 1);
-        if (obj.keyIndex == null && !obj.isReadOnly) {
-            obj.keys.Add(k.AsString(""));
-            obj.vals.Add(val2);
+        if (!obj.isReadOnly) {
+            CborReader.SetObjField(obj, k.AsString(""), val2);
         } else {
             obj.Put(k.AsString(""), val2);
         }

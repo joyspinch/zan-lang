@@ -1,0 +1,103 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerDeltaLagCompTest {
+    static bool Near(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = 0.0f - d; }
+        return d <= eps;
+    }
+
+    static void Main() {
+        // 1. Delta 增量快照位图压缩：10 实体世界仅 1 动 1 删 1 增，验证 >65% 带宽节省 + 100% 精准还原
+        WorldSnapshot baseSnap = new WorldSnapshot(10, 1000, 5);
+        for (int i = 1; i <= 10; i = i + 1) {
+            baseSnap.AddEntity(new EntityNetState(i, (float)(i * 5), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.25f, 1));
+        }
+
+        WorldSnapshot nextSnap = new WorldSnapshot(11, 1050, 6);
+        for (int i = 1; i <= 10; i = i + 1) {
+            if (i == 9) { continue; } // 实体 9 离场删除
+            float x = (float)(i * 5);
+            if (i == 2) { x = x + 3.5f; } // 仅实体 2 移动
+            nextSnap.AddEntity(new EntityNetState(i, x, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.25f, 1));
+        }
+        nextSnap.AddEntity(new EntityNetState(11, 99.0f, 1.0f, -2.0f, 4.0f, 0.0f, 0.0f, 1.5f, 3)); // 实体 11 新增
+
+        byte[] fullBytes = nextSnap.Encode();
+        byte[] deltaBytes = DeltaSnapshotCodec.EncodeDelta(baseSnap, nextSnap, 0.001f, 0.001f);
+        WorldSnapshot restored = DeltaSnapshotCodec.ApplyDelta(baseSnap, deltaBytes);
+        WorldSnapshot wrongBase = DeltaSnapshotCodec.ApplyDelta(new WorldSnapshot(999, 0, 0), deltaBytes);
+
+        EntityNetState r2 = restored != null ? restored.FindEntity(2) : null;
+        EntityNetState r5 = restored != null ? restored.FindEntity(5) : null;
+        EntityNetState r9 = restored != null ? restored.FindEntity(9) : null;
+        EntityNetState r11 = restored != null ? restored.FindEntity(11) : null;
+
+        bool deltaOk = deltaBytes.Length * 3 < fullBytes.Length // 至少省 66% 带宽
+            && restored != null
+            && wrongBase == null
+            && restored.ServerTick == 11
+            && restored.LastAckInputSeq == 6
+            && restored.Entities.Count == 10
+            && r2 != null && Near(r2.X, 13.5f, 0.001f)
+            && r5 != null && Near(r5.X, 25.0f, 0.001f)
+            && r9 == null
+            && r11 != null && Near(r11.X, 99.0f, 0.001f) && r11.Flags == 3;
+        Console.WriteLine("delta-snapshot-compression: " + Convert.ToString(deltaOk ? 1 : 0));
+
+        // 2. 服务端延迟补偿倒带（LagCompensator）：
+        // 目标实体 2 从 t=1000ms X=0 以 10m/s 移动到 t=1200ms X=2.0，再到 t=1500ms X=5.0。
+        // 在当前服务器时刻 t=1200ms，100ms RTT 客户端在 t=1100ms 瞄准 X=1.0 开火：
+        // - 按 t=1200ms 当前位置判会 miss（目标已跑去 X=2.0，半径 0.5）；
+        // - 经 LagCompensator 倒带到 t=1100ms（X=1.0）精准命中！
+        // - 恶意声称在 t=500ms（超 maxRewind=200ms）开火会被钳位到 t=1000ms，防外挂生效！
+        LagCompensator lc = new LagCompensator(1000, 200);
+        WorldSnapshot h0 = new WorldSnapshot(1, 1000, 0);
+        h0.AddEntity(new EntityNetState(1, 1.0f, 0.0f, 10.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1));
+        h0.AddEntity(new EntityNetState(2, 0.0f, 0.0f, 0.0f, 10.0f, 0.0f, 0.0f, 0.0f, 1));
+        lc.RecordSnapshot(h0);
+
+        WorldSnapshot h1 = new WorldSnapshot(2, 1200, 0);
+        h1.AddEntity(new EntityNetState(1, 1.0f, 0.0f, 10.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1));
+        h1.AddEntity(new EntityNetState(2, 2.0f, 0.0f, 0.0f, 10.0f, 0.0f, 0.0f, 0.0f, 1));
+        lc.RecordSnapshot(h1);
+
+        // 射击者 1 从 (1, 0, 10) 沿 (0, 0, -1) 射向 X=1.0 线
+        LagCompHit noRewind = lc.RaycastHitTest(1.0f, 0.0f, 10.0f, 0.0f, 0.0f, -1.0f, 30.0f, 0.45f, 1200, 1200, 1);
+        LagCompHit withRewind = lc.RaycastHitTest(1.0f, 0.0f, 10.0f, 0.0f, 0.0f, -1.0f, 30.0f, 0.45f, 1100, 1200, 1);
+        int clampedMs = lc.ClampRewindTime(500, 1200);
+
+        bool lagCompOk = noRewind == null
+            && withRewind != null
+            && withRewind.EntityId == 2
+            && withRewind.RewoundTimeMs == 1100
+            && Near(withRewind.Distance, 9.55f, 0.05f)
+            && clampedMs == 1000;
+        Console.WriteLine("lag-compensation-rewind: " + Convert.ToString(lagCompOk ? 1 : 0));
+
+        // 3. 多房间隔离、满员拒绝、权限校验与房主掉线自动迁移
+        NetRoomManager mgr = new NetRoomManager();
+        NetRoom room = mgr.CreateRoom("Ranked-1", 2, 101);
+        bool join102 = mgr.JoinRoom(room.RoomId, 102);
+        bool join103Full = mgr.JoinRoom(room.RoomId, 103); // 满员必须拒绝
+        bool nonHostStart = mgr.StartMatch(room.RoomId, 102); // 非房主开局必须拒绝
+        bool hostLeave = mgr.LeaveRoom(room.RoomId, 101); // 房主退出 -> 自动迁移给 102！
+        bool newHostStart = mgr.StartMatch(room.RoomId, 102); // 新房主 102 成功开局
+        bool lastLeave = mgr.LeaveRoom(room.RoomId, 102); // 全员离房 -> 自动销毁房间
+
+        bool roomOk = room != null
+            && join102
+            && !join103Full
+            && !nonHostStart
+            && hostLeave
+            && room.HostPeerId == 102
+            && newHostStart
+            && room.State == NetRoomState.Playing
+            && lastLeave
+            && mgr.RoomCount == 0;
+        Console.WriteLine("room-lifecycle-host-migration: " + Convert.ToString(roomOk ? 1 : 0));
+    }
+}

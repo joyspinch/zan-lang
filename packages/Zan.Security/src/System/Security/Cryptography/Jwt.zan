@@ -87,26 +87,59 @@ public class Jwt {
         return outBuf.ToStr(0, outLen);
     }
 
-    // 严格解码无填充的 Base64Url。outLen[0] 为字节数，输入格式错误时为 -1。
+    // 严格解码无填充的 Base64Url（RFC 4648 §5，拒绝 + / = 及非规范尾位）。
+    // outLen[0] 为字节数，输入格式错误时为 -1。
     public static byte[] Base64UrlDecode(string text, List<int> outLen) {
         if (text == null) {
             if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
             return new byte[0];
         }
         int len = text.Length;
+        if (len == 0) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = 0; }
+            return new byte[0];
+        }
         if ((len & 3) == 1) {
             if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
-            return new byte[len];
+            return new byte[0];
         }
-        int maxDecoded = (len * 3) / 4 + 4;
-        byte[] result = new byte[maxDecoded];
+        for (int i = 0; i < len; i = i + 1) {
+            if (urlDigit(text[i] & 255) < 0) {
+                if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+                return new byte[0];
+            }
+        }
+        int rem = len & 3;
+        if (rem == 2 && (urlDigit(text[len - 1] & 255) & 15) != 0) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+            return new byte[0];
+        }
+        if (rem == 3 && (urlDigit(text[len - 1] & 255) & 3) != 0) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+            return new byte[0];
+        }
+        int maxDecoded = (len / 4) * 3 + (rem == 0 ? 0 : (rem == 2 ? 1 : 2));
+        byte[] result = new byte[maxDecoded > 0 ? maxDecoded : 1];
         long written = NativeMemory.Base64Decode(result, text, (long)len);
-        if (written >= 0) {
+        if (written >= 0 && written == (long)maxDecoded) {
             if (outLen != null && outLen.Count > 0) { outLen[0] = (int)written; }
             return result;
         }
-        if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
-        return new byte[len];
+        int o = 0;
+        int acc = 0;
+        int nbits = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int d = urlDigit(text[i] & 255);
+            acc = (acc << 6) | d;
+            nbits = nbits + 6;
+            if (nbits >= 8) {
+                nbits = nbits - 8;
+                result[o] = (byte)((acc >> nbits) & 255);
+                o = o + 1;
+            }
+        }
+        if (outLen != null && outLen.Count > 0) { outLen[0] = o; }
+        return result;
     }
 
     // 从 `from` 起第一个 '.' 的下标；没有则 -1。

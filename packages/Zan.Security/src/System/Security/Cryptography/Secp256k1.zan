@@ -15,6 +15,7 @@ public class Secp256k1 {
     static BigInt N;
     static BigInt HALF_N;
     static bool ready = false;
+    static object initLock = new object();
 
     private static BigInt hb(string h) {
         return BigInt.FromBytesBE(Hex.Decode(h), 32);
@@ -22,12 +23,15 @@ public class Secp256k1 {
 
     private static void init() {
         if (ready) { return; }
-        P = hb(PHEX);
-        N = hb(NHEX);
-        // HALF_N = N / 2 (用于 EIP-2 低 s 防延展性归约)
-        HALF_N = hb("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0");
-        EcField256.GetCurve(EcField256.CurveSecp256k1);
-        ready = true;
+        lock (Secp256k1.initLock) {
+            if (ready) { return; }
+            P = hb(PHEX);
+            N = hb(NHEX);
+            // HALF_N = N / 2 (用于 EIP-2 低 s 防延展性归约)
+            HALF_N = hb("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0");
+            EcField256.GetCurve(EcField256.CurveSecp256k1);
+            ready = true;
+        }
     }
 
     // 模 N 标量运算
@@ -139,13 +143,16 @@ public class Secp256k1 {
                         // s = k^-1 * (e + r * d) mod n
                         BigInt s = nmul(ninv(kb), nmod(BigInt.add(e, nmul(r, d))));
                         if (!s.isZero()) {
-                            // 基础恢复位 v: 取点 R 的 y 坐标奇偶性 (0 为偶, 1 为奇)
+                            // 基础恢复位 v: 低位取点 R 的 y 坐标奇偶性，bit1 表示 rx >= N
                             int recId = (int)(ry[0] & 1L);
+                            if (EcField256.Cmp(rx, cd.N) >= 0) {
+                                recId = recId | 2;
+                            }
 
                             // 低 s 防延展规范: 如果 s > n/2，则将 s 翻转为 n - s，并反转恢复奇偶性
                             if (BigInt.cmp(s, HALF_N) > 0) {
                                 s = BigInt.sub(N, s);
-                                recId = 1 - recId;
+                                recId = recId ^ 1;
                             }
 
                             return new Secp256k1Signature(r.ToBytesBE(32), s.ToBytesBE(32), recId);
@@ -173,6 +180,11 @@ public class Secp256k1 {
         EcField256.FromBytesBE(sig.S, 0, sl);
         if (EcField256.IsZero(xl) || EcField256.Cmp(xl, cd.N) >= 0) { return null; }
         if (EcField256.IsZero(sl) || EcField256.Cmp(sl, cd.N) >= 0) { return null; }
+        if ((sig.V & 2) != 0) {
+            BigInt xBig = BigInt.add(BigInt.FromBytesBE(sig.R, 32), N);
+            if (BigInt.cmp(xBig, P) >= 0) { return null; }
+            EcField256.FromBigInt(xBig, xl);
+        }
         if (EcField256.Cmp(xl, cd.P) >= 0) { return null; }
 
         // 2. 求解 y^2 = x^3 + 7 (mod p) 的平方根: y = (x^3 + 7)^((p+1)/4) mod p

@@ -94,14 +94,66 @@ public class Mnemonic {
         return sb.ToString();
     }
 
-    // 基于 PBKDF2 口令派生函数将助记词派生为 512 位 (64 字节) 确定性种子
+    // 基于 BIP-39 规范 PBKDF2-HMAC-SHA512 将助记词派生为 512 位 (64 字节) 确定性种子
     // 盐为 "mnemonic" + passphrase，迭代 2048 轮
     public static byte[] MnemonicToSeed(string mnemonic, string passphrase) {
         if (mnemonic == null) { mnemonic = ""; }
         string salt = "mnemonic" + (passphrase != null ? passphrase : "");
 
-        string derivedStr = Pbkdf2.Derive(mnemonic, mnemonic.Length, salt, salt.Length, 2048, 64);
-        return derivedStr.ToBytes();
+        byte[] pwdBytes = mnemonic.ToBytes();
+        byte[] saltBytes = salt.ToBytes();
+        int pwdLen = pwdBytes.Length;
+        int saltLen = saltBytes.Length;
+
+        // 预计算 HMAC-SHA512 的 ipad/opad 密钥块（128 字节），避免 2048 轮重复哈希密钥
+        byte[] k0 = new byte[128];
+        if (pwdLen > 128) {
+            string pStr = pwdBytes;
+            byte[] hk = Sha512.Hash(pStr, pwdLen);
+            for (int i = 0; i < 64; i = i + 1) { k0[i] = hk[i]; }
+        } else {
+            for (int i = 0; i < pwdLen; i = i + 1) { k0[i] = pwdBytes[i]; }
+        }
+
+        byte[] innerFirst = new byte[128 + saltLen + 4];
+        byte[] innerIter = new byte[128 + 64];
+        byte[] outerBuf = new byte[128 + 64];
+        for (int i = 0; i < 128; i = i + 1) {
+            byte ip = (byte)((k0[i] & 255) ^ 0x36);
+            byte op = (byte)((k0[i] & 255) ^ 0x5c);
+            innerFirst[i] = ip;
+            innerIter[i] = ip;
+            outerBuf[i] = op;
+        }
+        for (int i = 0; i < saltLen; i = i + 1) {
+            innerFirst[128 + i] = saltBytes[i];
+        }
+        innerFirst[128 + saltLen] = 0;
+        innerFirst[128 + saltLen + 1] = 0;
+        innerFirst[128 + saltLen + 2] = 0;
+        innerFirst[128 + saltLen + 3] = 1;
+
+        // U_1 = HMAC-SHA512(mnemonic, salt || INT_32_BE(1))
+        string firstInStr = innerFirst;
+        byte[] ih = Sha512.Hash(firstInStr, 128 + saltLen + 4);
+        NativeMemory.Copy((nint)outerBuf + 128, (nint)ih, 64);
+        string outStr = outerBuf;
+        byte[] u = Sha512.Hash(outStr, 192);
+
+        byte[] seed = new byte[64];
+        NativeMemory.Copy((nint)seed, (nint)u, 64);
+
+        string iterInStr = innerIter;
+        for (int iter = 1; iter < 2048; iter = iter + 1) {
+            NativeMemory.Copy((nint)innerIter + 128, (nint)u, 64);
+            ih = Sha512.Hash(iterInStr, 192);
+            NativeMemory.Copy((nint)outerBuf + 128, (nint)ih, 64);
+            u = Sha512.Hash(outStr, 192);
+            for (int j = 0; j < 64; j = j + 1) {
+                seed[j] = (byte)((seed[j] & 255) ^ (u[j] & 255));
+            }
+        }
+        return seed;
     }
 
     // 一步到位：从助记词与口令直接派生出可用的以太坊钱包账户
