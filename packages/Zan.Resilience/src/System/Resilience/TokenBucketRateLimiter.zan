@@ -10,19 +10,22 @@ public class TokenBucketRateLimiter : IDisposable {
     public double currentTokens;
     public long lastRefillTicks;
     public nint mtx;
+    private object gate;
+    private bool disposed;
 
     public TokenBucketRateLimiter(int capacity, int refillRatePerSec) {
         this.capacity = capacity > 0 ? capacity : 100;
         this.refillRatePerSec = refillRatePerSec > 0 ? refillRatePerSec : 50;
         this.currentTokens = (double)this.capacity;
         this.lastRefillTicks = Stopwatch.NowTicks();
-        this.mtx = Mutex.Create();
+        this.mtx = 0;
+        this.gate = new object();
+        this.disposed = false;
     }
 
     public void Dispose() {
-        if (this.mtx != 0) {
-            Mutex.Destroy(this.mtx);
-            this.mtx = 0;
+        lock (this.gate) {
+            this.disposed = true;
         }
     }
 
@@ -37,9 +40,8 @@ public class TokenBucketRateLimiter : IDisposable {
     // 尝试获取指定数量的令牌。
     public bool TryAcquire(int count) {
         if (count <= 0) { return true; }
-        if (this.mtx == 0) { return false; }
-        Mutex.Lock(this.mtx);
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return false; }
             long nowTicks = Stopwatch.NowTicks();
             long freq = Stopwatch.Frequency();
             if (freq > 0) {
@@ -57,20 +59,15 @@ public class TokenBucketRateLimiter : IDisposable {
                 return true;
             }
             return false;
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 
     // 重置限流器至满桶状态。
     public void Reset() {
-        if (this.mtx == 0) { return; }
-        Mutex.Lock(this.mtx);
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return; }
             this.currentTokens = (double)this.capacity;
             this.lastRefillTicks = Stopwatch.NowTicks();
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 }

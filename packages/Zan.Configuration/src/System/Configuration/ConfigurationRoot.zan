@@ -10,6 +10,8 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     public List<IConfigurationProvider> providers;
     public List<Action> reloadCallbacks;
     public nint syncLock;
+    private object gate;
+    private bool disposed;
 
     public ConfigurationRoot(List<IConfigurationProvider> providers) {
         this.providers = new List<IConfigurationProvider>();
@@ -19,7 +21,9 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
             }
         }
         this.reloadCallbacks = new List<Action>();
-        this.syncLock = Mutex.Create();
+        this.syncLock = 0;
+        this.gate = new object();
+        this.disposed = false;
     }
 
     // 占位符 ${VAR:-default} 解析（StringView 零中间切片分配）
@@ -66,9 +70,8 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
         if (key == null) { return null; }
         string found = null;
         bool hasFound = false;
-        nint lk = this.syncLock;
-        if (lk != 0) { Mutex.Lock(lk); }
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return null; }
             // 倒序遍历配置提供程序：后添加的源优先级更高
             for (int i = this.providers.Count - 1; i >= 0; i = i - 1) {
                 string v;
@@ -78,8 +81,6 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
                     break;
                 }
             }
-        } finally {
-            if (lk != 0) { Mutex.Unlock(lk); }
         }
         if (hasFound) {
             return ConfigurationRoot.ResolvePlaceholders(found);
@@ -125,14 +126,11 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     // 所以全部写入后，任何一个 provider 都能读到新值。
     public void Set(string key, string value) {
         if (key == null) { return; }
-        nint lk = this.syncLock;
-        if (lk != 0) { Mutex.Lock(lk); }
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
                 this.providers[i].Set(key, value);
             }
-        } finally {
-            if (lk != 0) { Mutex.Unlock(lk); }
         }
     }
 
@@ -143,9 +141,8 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     public List<string> GetKeys() {
         HashSet<string> seen = new HashSet<string>();
         List<string> result = new List<string>();
-        nint lk = this.syncLock;
-        if (lk != 0) { Mutex.Lock(lk); }
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return result; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
                 List<string> pKeys = this.providers[i].GetKeys();
                 for (int j = 0; j < pKeys.Count; j = j + 1) {
@@ -156,25 +153,20 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
                     }
                 }
             }
-        } finally {
-            if (lk != 0) { Mutex.Unlock(lk); }
         }
         return result;
     }
 
     public void Reload() {
         List<Action> snapshot = new List<Action>();
-        nint lk = this.syncLock;
-        if (lk != 0) { Mutex.Lock(lk); }
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
                 this.providers[i].Load();
             }
             for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
                 snapshot.Add(this.reloadCallbacks[i]);
             }
-        } finally {
-            if (lk != 0) { Mutex.Unlock(lk); }
         }
 
         for (int i = 0; i < snapshot.Count; i = i + 1) {
@@ -188,27 +180,22 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
 
     public void OnReload(Action callback) {
         if (callback == null) { return; }
-        nint lk = this.syncLock;
-        if (lk == 0) { return; }
-        Mutex.Lock(lk);
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return; }
             this.reloadCallbacks.Add(callback);
-        } finally {
-            Mutex.Unlock(lk);
         }
     }
 
     public void Dispose() {
-        nint lk = this.syncLock;
-        if (lk != 0) {
-            this.syncLock = 0;
-            Mutex.Destroy(lk);
-        }
-        if (this.providers != null) {
-            this.providers.Clear();
-        }
-        if (this.reloadCallbacks != null) {
-            this.reloadCallbacks.Clear();
+        lock (this.gate) {
+            if (this.disposed) { return; }
+            this.disposed = true;
+            if (this.providers != null) {
+                this.providers.Clear();
+            }
+            if (this.reloadCallbacks != null) {
+                this.reloadCallbacks.Clear();
+            }
         }
     }
 

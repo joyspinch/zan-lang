@@ -13,7 +13,10 @@ public class CircuitBreaker : IDisposable {
     public int consecutiveSuccesses;
     public long trippedAtMs;
     public nint mtx;
+    private object gate;
+    private bool disposed;
     private int halfOpenInFlight;
+    private int generation;
 
     public CircuitBreaker(int failureThreshold, long breakDurationMs, int successThreshold) {
         this.failureThreshold = failureThreshold > 0 ? failureThreshold : 5;
@@ -24,14 +27,15 @@ public class CircuitBreaker : IDisposable {
         this.consecutiveSuccesses = 0;
         this.trippedAtMs = 0;
         this.halfOpenInFlight = 0;
-        this.mtx = Mutex.Create();
+        this.generation = 1;
+        this.mtx = 0;
+        this.gate = new object();
+        this.disposed = false;
     }
 
     public void Dispose() {
-        nint m = this.mtx;
-        if (m != 0) {
-            this.mtx = 0;
-            Mutex.Destroy(m);
+        lock (this.gate) {
+            this.disposed = true;
         }
     }
 
@@ -41,44 +45,56 @@ public class CircuitBreaker : IDisposable {
 
     // 获取当前生效的熔断状态（如果处于 Open 且熔断时间已过，自动推进至 HalfOpen）。
     public CircuitState State() {
-        if (this.mtx == 0) { return this.state; }
-        Mutex.Lock(this.mtx);
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return this.state; }
             this.UpdateStateInternal();
             return this.state;
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 
     // 检查是否允许放行调用（Open 状态快速失败拦截，杜绝雪崩）。
     public bool CanExecute() {
-        if (this.mtx == 0) { return false; }
-        Mutex.Lock(this.mtx);
-        try {
+        int ignored = 0;
+        return this.CanExecute(out ignored);
+    }
+
+    // 带状态代数令牌的放行检查：配合 RecordSuccess(token)/RecordFailure(token) 屏蔽跨周期迟到回调。
+    public bool CanExecute(out int token) {
+        token = 0;
+        lock (this.gate) {
+            if (this.disposed) { return false; }
             this.UpdateStateInternal();
             if (this.state == CircuitState.Closed) {
+                token = this.generation;
                 return true;
             }
             if (this.state == CircuitState.HalfOpen) {
                 // 限制半开态并发探测数不超过剩余所需成功阈值，防止恢复瞬间惊群击穿。
                 if (this.halfOpenInFlight + this.consecutiveSuccesses < this.successThreshold) {
                     this.halfOpenInFlight = this.halfOpenInFlight + 1;
+                    token = this.generation;
                     return true;
                 }
                 return false;
             }
             return false; // Open 状态快速失败
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 
     // 记录一次成功调用。
     public void RecordSuccess() {
-        if (this.mtx == 0) { return; }
-        Mutex.Lock(this.mtx);
-        try {
+        this.RecordSuccessInternal(-1);
+    }
+
+    // 按代数令牌记录成功调用；过期周期的迟到回报将被忽略。
+    public void RecordSuccess(int token) {
+        this.RecordSuccessInternal(token);
+    }
+
+    private void RecordSuccessInternal(int token) {
+        lock (this.gate) {
+            if (this.disposed) { return; }
+            if (token >= 0 && token != this.generation) { return; }
             if (this.state == CircuitState.HalfOpen) {
                 if (this.halfOpenInFlight > 0) {
                     this.halfOpenInFlight = this.halfOpenInFlight - 1;
@@ -91,20 +107,28 @@ public class CircuitBreaker : IDisposable {
                     this.consecutiveSuccesses = 0;
                     this.trippedAtMs = 0;
                     this.halfOpenInFlight = 0;
+                    this.generation = this.generation + 1;
                 }
             } else if (this.state == CircuitState.Closed) {
                 this.consecutiveFailures = 0;
             }
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 
     // 记录一次失败调用。
     public void RecordFailure() {
-        if (this.mtx == 0) { return; }
-        Mutex.Lock(this.mtx);
-        try {
+        this.RecordFailureInternal(-1);
+    }
+
+    // 按代数令牌记录失败调用；过期周期的迟到失败不会误熔断新周期。
+    public void RecordFailure(int token) {
+        this.RecordFailureInternal(token);
+    }
+
+    private void RecordFailureInternal(int token) {
+        lock (this.gate) {
+            if (this.disposed) { return; }
+            if (token >= 0 && token != this.generation) { return; }
             long now = CircuitBreaker.NowMs();
             if (this.state == CircuitState.HalfOpen) {
                 // 半开探测失败，立即重新触发熔断
@@ -112,6 +136,7 @@ public class CircuitBreaker : IDisposable {
                 this.trippedAtMs = now;
                 this.consecutiveSuccesses = 0;
                 this.halfOpenInFlight = 0;
+                this.generation = this.generation + 1;
             } else if (this.state == CircuitState.Closed) {
                 this.consecutiveFailures = this.consecutiveFailures + 1;
                 if (this.consecutiveFailures >= this.failureThreshold) {
@@ -120,25 +145,22 @@ public class CircuitBreaker : IDisposable {
                     this.trippedAtMs = now;
                     this.consecutiveSuccesses = 0;
                     this.halfOpenInFlight = 0;
+                    this.generation = this.generation + 1;
                 }
             }
-        } finally {
-            Mutex.Unlock(this.mtx);
         }
     }
 
     // 手动重置熔断器至 Closed 初始正常状态。
     public void Reset() {
-        if (this.mtx == 0) { return; }
-        Mutex.Lock(this.mtx);
-        try {
+        lock (this.gate) {
+            if (this.disposed) { return; }
             this.state = CircuitState.Closed;
             this.consecutiveFailures = 0;
             this.consecutiveSuccesses = 0;
             this.trippedAtMs = 0;
             this.halfOpenInFlight = 0;
-        } finally {
-            Mutex.Unlock(this.mtx);
+            this.generation = this.generation + 1;
         }
     }
 
@@ -149,6 +171,7 @@ public class CircuitBreaker : IDisposable {
                 this.state = CircuitState.HalfOpen;
                 this.consecutiveSuccesses = 0;
                 this.halfOpenInFlight = 0;
+                this.generation = this.generation + 1;
             }
         }
     }

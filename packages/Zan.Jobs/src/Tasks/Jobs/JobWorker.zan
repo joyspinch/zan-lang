@@ -20,6 +20,7 @@ public class JobWorker {
     string workerId;
     int pollMs;
     bool running;
+    int loopGeneration;
 
     public JobWorker(JobStorage storage, JobRegistry registry, RetryPolicy policy) {
         this.storage = storage;
@@ -29,6 +30,7 @@ public class JobWorker {
         this.workerId = "w1";
         this.pollMs = 200;
         this.running = false;
+        this.loopGeneration = 0;
     }
 
     // 换掉用于生成周期任务下一次 id 的队列（让 worker 与调度器共用
@@ -48,7 +50,11 @@ public class JobWorker {
 
     // 轮询间隔（毫秒）。
     public void SetPollMs(int ms) {
-        if (ms > 0) { this.pollMs = ms; }
+        if (ms > 0) {
+            lock (this) {
+                this.pollMs = ms;
+            }
+        }
     }
 
     // 是否在跑。
@@ -60,33 +66,42 @@ public class JobWorker {
 
     // 起后台线程执行任务。已经在跑返回 false（`AlreadyRunning`）。
     public bool Start() {
+        int myGen = 0;
         lock (this) {
             if (this.running) { return false; }
             this.running = true;
+            this.loopGeneration = this.loopGeneration + 1;
+            myGen = this.loopGeneration;
         }
         System.Threading.Thread.Start(() => {
-            this.Loop();
+            this.Loop(myGen);
         });
         return true;
     }
 
-    // 请求停止（当前这一轮做完就退出）。
+    // 请求停止（当前这一轮做完就退出；推进代际避免 Stop+Start 双线程并发）。
     public void Stop() {
         lock (this) {
             this.running = false;
+            this.loopGeneration = this.loopGeneration + 1;
         }
     }
 
     // 后台循环。
-    void Loop() {
-        while (this.IsRunning()) {
+    void Loop(int myGen) {
+        while (true) {
+            int sleepMs = 200;
+            lock (this) {
+                if (!this.running || this.loopGeneration != myGen) { break; }
+                sleepMs = this.pollMs;
+            }
             try {
                 this.ProcessOnce();
             } catch (Exception e) {
                 // 单轮失败不能让 worker 死掉：记一笔，继续下一轮。
                 // 这里刻意不写存储（写存储也可能失败），只保证线程活着。
             }
-            System.Threading.Thread.Sleep(this.pollMs);
+            System.Threading.Thread.Sleep(sleepMs);
         }
     }
 
@@ -154,8 +169,8 @@ public class JobWorker {
             rec.state = JobState.Succeeded;
             rec.endAt = finishedAt;
             rec.error = "";
-            this.storage.Append(rec);
-            if (rec.interval > 0) {
+            bool committed = this.storage.CompleteUnlessDeleted(rec);
+            if (committed && rec.interval > 0) {
                 this.ScheduleNext(rec, finishedAt);
             }
             return rec;
@@ -167,12 +182,12 @@ public class JobWorker {
             rec.state = JobState.Failed;
             rec.retry = rec.attempts;
             rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
         rec.state = JobState.Dead;
         rec.retry = rec.attempts;
-        this.storage.Append(rec);
+        this.storage.CompleteUnlessDeleted(rec);
         return rec;
     }
 
@@ -254,8 +269,8 @@ public class JobWorker {
             rec.state = JobState.Succeeded;
             rec.endAt = finishedAt;
             rec.error = "";
-            this.storage.Append(rec);
-            if (rec.interval > 0) {
+            bool committed = this.storage.CompleteUnlessDeleted(rec);
+            if (committed && rec.interval > 0) {
                 this.ScheduleNext(rec, finishedAt);
             }
             return rec;
@@ -267,12 +282,12 @@ public class JobWorker {
             rec.state = JobState.Failed;
             rec.retry = rec.attempts;
             rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
         rec.state = JobState.Dead;
         rec.retry = rec.attempts;
-        this.storage.Append(rec);
+        this.storage.CompleteUnlessDeleted(rec);
         return rec;
     }
 

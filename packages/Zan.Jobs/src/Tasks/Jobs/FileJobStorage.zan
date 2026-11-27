@@ -43,17 +43,35 @@ public class FileJobStorage : JobStorage {
         return this.path;
     }
 
+    long AcquireFileLock(string contextId) {
+        long handle = File.TryLock(this.lockPath);
+        if (handle == 0) {
+            if (contextId != null && contextId.Length > 0) {
+                throw new JobException(JobError.StorageFailure, contextId,
+                    "storage is locked by another process: " + this.path);
+            }
+            throw new JobException(JobError.StorageFailure,
+                "storage is locked by another process: " + this.path);
+        }
+        return handle;
+    }
+
     // 重新读一遍存储文件（外部改了文件、或要丢弃内存状态时用）。
     public void Reload() {
         writeLock.WaitOne();
         try {
-            this.ReloadInternal();
+            long handle = this.AcquireFileLock("");
+            try {
+                this.ReloadInternal();
+            } finally {
+                File.Unlock(handle);
+            }
         } finally {
             writeLock.ReleaseMutex();
         }
     }
 
-    // 须持 writeLock 调用：从文件重建内存 index。
+    // 须同时持 writeLock 与跨进程文件锁调用：从文件重建内存 index。
     void ReloadInternal() {
         Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
         if (File.Exists(this.path)) {
@@ -68,55 +86,93 @@ public class FileJobStorage : JobStorage {
         this.index = fresh;
     }
 
+    // 须同时持 writeLock 与跨进程文件锁调用：追加一行并更新内存 index。
+    void AppendLocked(JobRecord record) {
+        File.AppendAllText(this.path, record.ToJson() + "\n");
+        this.index[record.id] = record;
+    }
+
     public override void Append(JobRecord record) {
         if (record == null) {
             throw new JobException(JobError.InvalidArgs, "record is null");
         }
         writeLock.WaitOne();
         try {
-            this.AppendInternal(record);
+            long handle = this.AcquireFileLock(record.id);
+            try {
+                this.AppendLocked(record);
+            } finally {
+                File.Unlock(handle);
+            }
         } finally {
             writeLock.ReleaseMutex();
         }
     }
 
-    // 须持 writeLock 调用：跨进程文件锁内追加一行并更新内存 index。
-    void AppendInternal(JobRecord record) {
-        long handle = File.TryLock(this.lockPath);
-        if (handle == 0) {
-            throw new JobException(JobError.StorageFailure, record.id,
-                "storage is locked by another process: " + this.path);
-        }
-        try {
-            File.AppendAllText(this.path, record.ToJson() + "\n");
-        } finally {
-            File.Unlock(handle);
-        }
-        this.index[record.id] = record;
-    }
-
-    // 原子领取：可执行校验与置 Processing 在同一把进程内写锁内一次完成，
-    // 多 worker（含同进程多存储实例）并发拉取不会重复执行同一任务。
-    // 领取前从文件重建 index——内存 index 可能落后（同进程其它实例或
-    // 另一进程已追加/领取），用陈旧状态校验会重复领取或盖掉别人的变更；
-    // 领取是低频操作（一条任务一次），重建的 O(行数) 读可接受。
-    // 锁内直调 AppendInternal——Append 会二次 WaitOne 进程锁，自死锁。
+    // 原子领取：在进程内写锁与跨进程文件锁内一次完成重放、校验与置 Processing。
     public override JobRecord Claim(string id, long now, string workerId) {
         if (id == null) { return null; }
         writeLock.WaitOne();
         try {
-            this.ReloadInternal();
-            JobRecord current = null;
-            if (!this.index.TryGetValue(id, out current)) { return null; }
-            if (!current.IsRunnableAt(now)) { return null; }
-            JobRecord rec = current.Copy();
-            rec.state = JobState.Processing;
-            rec.startAt = now;
-            rec.attempts = current.attempts + 1;
-            rec.worker = workerId;
-            rec.error = "";
-            this.AppendInternal(rec);
-            return rec;
+            long handle = this.AcquireFileLock(id);
+            try {
+                this.ReloadInternal();
+                JobRecord current = null;
+                if (!this.index.TryGetValue(id, out current)) { return null; }
+                if (!current.IsRunnableAt(now)) { return null; }
+                JobRecord rec = current.Copy();
+                rec.state = JobState.Processing;
+                rec.startAt = now;
+                rec.attempts = current.attempts + 1;
+                rec.worker = workerId;
+                rec.error = "";
+                this.AppendLocked(rec);
+                return rec;
+            } finally {
+                File.Unlock(handle);
+            }
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    public override bool Delete(string id) {
+        if (id == null) { return false; }
+        writeLock.WaitOne();
+        try {
+            long handle = this.AcquireFileLock(id);
+            try {
+                this.ReloadInternal();
+                JobRecord current = null;
+                if (!this.index.TryGetValue(id, out current) || current == null) { return false; }
+                JobRecord rec = current.Copy();
+                rec.state = JobState.Deleted;
+                this.AppendLocked(rec);
+                return true;
+            } finally {
+                File.Unlock(handle);
+            }
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    public override bool CompleteUnlessDeleted(JobRecord record) {
+        if (record == null || record.id == null) { return false; }
+        writeLock.WaitOne();
+        try {
+            long handle = this.AcquireFileLock(record.id);
+            try {
+                this.ReloadInternal();
+                JobRecord current = null;
+                if (this.index.TryGetValue(record.id, out current) && current != null && current.state == JobState.Deleted) {
+                    return false;
+                }
+                this.AppendLocked(record);
+                return true;
+            } finally {
+                File.Unlock(handle);
+            }
         } finally {
             writeLock.ReleaseMutex();
         }
@@ -125,7 +181,13 @@ public class FileJobStorage : JobStorage {
     public override List<JobRecord> Snapshot() {
         writeLock.WaitOne();
         try {
-            return this.SnapshotInternal();
+            long handle = this.AcquireFileLock("");
+            try {
+                this.ReloadInternal();
+                return this.SnapshotInternal();
+            } finally {
+                File.Unlock(handle);
+            }
         } finally {
             writeLock.ReleaseMutex();
         }
@@ -147,9 +209,15 @@ public class FileJobStorage : JobStorage {
         if (id == null) { return null; }
         writeLock.WaitOne();
         try {
-            JobRecord r = null;
-            if (this.index.TryGetValue(id, out r)) { return r; }
-            return null;
+            long handle = this.AcquireFileLock(id);
+            try {
+                this.ReloadInternal();
+                JobRecord r = null;
+                if (this.index.TryGetValue(id, out r)) { return r; }
+                return null;
+            } finally {
+                File.Unlock(handle);
+            }
         } finally {
             writeLock.ReleaseMutex();
         }
