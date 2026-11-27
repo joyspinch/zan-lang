@@ -54,18 +54,32 @@ public struct CompiledDecl {
     public bool isPureCurrentColor;
 }
 
+public class KeyframeEvalCache {
+    internal CssKeyframeRule rule;
+    internal int ruleVersion;
+    internal StyleBox baseBox;
+    internal CssKeyframeStop prevStop;
+    internal CssKeyframeStop nextStop;
+    internal StyleBox box0;
+    internal StyleBox box1;
+    internal StyleBox outBox;
+}
+
 // CSS @keyframes 规则定义与任意进度插值求值器。
 public class CssKeyframeRule {
     public string name;
     public List<CssKeyframeStop> stops;
+    internal int version;
 
     public CssKeyframeRule(string name) {
         this.name = name != null ? name : "";
         this.stops = new List<CssKeyframeStop>();
+        this.version = 1;
     }
 
     public void AddStop(int offsetPm, JsonValue block) {
         if (block == null || !block.IsObject()) { return; }
+        this.version = this.version + 1;
         if (offsetPm < 0) { offsetPm = 0; }
         if (offsetPm > 1000) { offsetPm = 1000; }
         for (int i = 0; i < this.stops.Count; i = i + 1) {
@@ -128,6 +142,57 @@ public class CssKeyframeRule {
         StyleBox outBox = b1.Clone();
         StyleBox.BlendSurfaceInto(outBox, b0, b1, localP);
         return outBox;
+    }
+
+    public StyleBox EvaluateCached(StyleBox baseBox, int progressPm, KeyframeEvalCache cache) {
+        if (cache == null) { return this.Evaluate(baseBox, progressPm); }
+        if (baseBox == null || this.stops == null || this.stops.Count == 0) { return baseBox; }
+        if (progressPm < 0) { progressPm = 0; }
+        if (progressPm > 1000) { progressPm = 1000; }
+
+        CssKeyframeStop prev = null;
+        CssKeyframeStop next = null;
+        int n = this.stops.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            CssKeyframeStop st = this.stops[i];
+            if (st == null) { continue; }
+            if (st.offsetPm <= progressPm) {
+                prev = st;
+            }
+            if (st.offsetPm >= progressPm) {
+                next = st;
+                break;
+            }
+        }
+
+        int off0 = prev != null ? prev.offsetPm : 0;
+        int off1 = next != null ? next.offsetPm : 1000;
+        bool single = prev == next || off0 == off1;
+        bool hit = cache.rule == this && cache.ruleVersion == this.version
+            && cache.baseBox == baseBox && cache.prevStop == prev && cache.nextStop == next
+            && cache.box0 != null && (single || (cache.box1 != null && cache.outBox != null));
+        if (!hit) {
+            if (cache.box0 == null) { cache.box0 = new StyleBox(); }
+            cache.box0.CopyFrom(baseBox, false);
+            if (prev != null) { CssKeyframeRule.ApplyStop(cache.box0, prev); }
+            if (!single) {
+                if (cache.box1 == null) { cache.box1 = new StyleBox(); }
+                cache.box1.CopyFrom(baseBox, false);
+                if (next != null) { CssKeyframeRule.ApplyStop(cache.box1, next); }
+                if (cache.outBox == null) { cache.outBox = new StyleBox(); }
+                cache.outBox.CopyFrom(cache.box1, false);
+            }
+            cache.rule = this;
+            cache.ruleVersion = this.version;
+            cache.baseBox = baseBox;
+            cache.prevStop = prev;
+            cache.nextStop = next;
+        }
+        if (single) { return cache.box0; }
+        int span = off1 - off0;
+        int localP = span > 0 ? (int)((long)(progressPm - off0) * 1000L / (long)span) : 1000;
+        StyleBox.BlendSurfaceInto(cache.outBox, cache.box0, cache.box1, localP);
+        return cache.outBox;
     }
 }
 

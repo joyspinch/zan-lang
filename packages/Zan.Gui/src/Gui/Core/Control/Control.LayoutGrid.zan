@@ -6,15 +6,21 @@ public partial class Control {
     List<Control> GridItems() { return this.PlannedChildren(false, true); }
     int GridOuterW(Control c) {
         if (c == null) { return 0; }
-        int w = c.StyleDeclaresWidthAbs() ? c.StyleWidthIn(0) : c.prefW;
+        StyleBox cs = c.computedStyle;
+        int w = (cs != null && cs.width >= 0) ? c.StyleWidthIn(0) : c.prefW;
         if (w < 0) { w = 0; }
-        return w + c.StyleMarL() + c.StyleMarR();
+        int ml = c.marSet ? c.marL : (cs != null && cs.marL > 0 ? cs.marL : 0);
+        int mr = c.marSet ? c.marR : (cs != null && cs.marR > 0 ? cs.marR : 0);
+        return w + ml + mr;
     }
     int GridOuterH(Control c) {
         if (c == null) { return 0; }
-        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+        StyleBox cs = c.computedStyle;
+        int h = (cs != null && cs.height >= 0) ? c.StyleHeightIn(0) : c.prefH;
         if (h < 0) { h = 0; }
-        return h + c.StyleMarT() + c.StyleMarB();
+        int mt = c.marSet ? c.marT : (cs != null && cs.marT > 0 ? cs.marT : 0);
+        int mb = c.marSet ? c.marB : (cs != null && cs.marB > 0 ? cs.marB : 0);
+        return h + mt + mb;
     }
     private int GridMeasureWidth() {
         if (measureWidth < 0 && hintWrapW <= 0 && !this.StyleDeclaresWidthAbs()) { return 0 - 1; }
@@ -22,27 +28,42 @@ public partial class Control {
         return width > 0 ? width : 0;
     }
     void MeasureGridContent(App app) {
+        this.MeasureGridContentPass(app, null, null, 0 - 2, 0, null, 0, 0L, 0, false, 0L, 0);
+    }
+    void MeasureGridContentPass(App app, List<Control> preItems, GridLayoutPlan prePlan, int preAvail,
+                                int passId, Control root, int generation, long sequence,
+                                int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
         if (prefW > 0 && prefH > 0 && (app == null || measureIntrinsic)) { return; }
         StyleBox sb = computedStyle;
-        if (sb == null) { sb = new StyleBox(); }
-        int colGap = this.StyleColGap(this.StyleGap());
-        int rowGap = this.StyleRowGap(this.StyleGap());
-        List<Control> items = this.GridItems();
-        int colAvail = this.GridMeasureWidth();
-        GridLayoutPlan plan = this.PlanGrid(items, colAvail, colGap);
+        int baseGap = sb != null && sb.gap >= 0 ? sb.gap : gap;
+        int colGap = sb != null && sb.colGap >= 0 ? sb.colGap : baseGap;
+        int rowGap = sb != null && sb.rowGap >= 0 ? sb.rowGap : baseGap;
+        List<Control> items = preItems != null ? preItems : this.GridItems();
+        int colAvail = preAvail != 0 - 2 ? preAvail : this.GridMeasureWidth();
+        GridLayoutPlan plan = prePlan != null ? prePlan : this.PlanGrid(items, colAvail, colGap);
         if (plan == null || plan.placement == null) { return; }
         GridPlace pl = plan.placement;
-        List<int> colW = this.GridColumns(plan, items, colAvail, colGap);
+        List<int> colW = gridColBuf;
+        List<int> rowH = gridRowBuf;
+        gridColBuf = null;
+        gridRowBuf = null;
+        if (colW == null) { colW = new List<int>(); }
+        if (rowH == null) { rowH = new List<int>(); }
+        this.GridColumnsInto(plan, items, colAvail, colGap, colW);
         int rowAvail = 0 - 1;
-        if (this.StyleDeclaresHeightAbs()) {
+        if (sb != null && sb.height >= 0) {
             rowAvail = this.StyleHeightIn(0)
                 - this.StyleInsetT() - this.StyleInsetB();
             if (rowAvail < 0) { rowAvail = 0; }
         }
         App activeHost = (measuringTree || (app != null && measuringPass != 0 && measuringPass == app.measurePassSeq)) ? app : null;
-        List<int> rowH = this.GridRows(activeHost, plan, items, colW, rowAvail, colGap, rowGap);
+        this.GridRowsIntoPass(activeHost, plan, items, colW, rowAvail, colGap, rowGap,
+                              passId, root, generation, sequence,
+                              passRuleSig, passAnyMedia, passMediaHash, passChainSeq, rowH);
         int sumW = CssGrid.SpanSum(colW, colGap, 0, pl.nCols);
         int sumH = CssGrid.SpanSum(rowH, rowGap, 0, pl.nRows);
+        if (gridColBuf == null) { colW.Clear(); gridColBuf = colW; }
+        if (gridRowBuf == null) { rowH.Clear(); gridRowBuf = rowH; }
         if (prefH <= 0 && sumH > 0) {
             prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
             this.fillH = true;
@@ -54,53 +75,64 @@ public partial class Control {
     }
     void ArrangeGrid(int cx, int cy, int cw, int ch) {
         StyleBox sb = computedStyle;
-        if (sb == null) { sb = new StyleBox(); }
-        int colGap = this.StyleColGap(this.StyleGap());
-        int rowGap = this.StyleRowGap(this.StyleGap());
+        int baseGap = sb != null && sb.gap >= 0 ? sb.gap : gap;
+        int colGap = sb != null && sb.colGap >= 0 ? sb.colGap : baseGap;
+        int rowGap = sb != null && sb.rowGap >= 0 ? sb.rowGap : baseGap;
+        int jc = sb != null ? sb.justifyItems : 0;
+        int ac = sb != null ? sb.alignItems : 0;
         List<Control> items = this.GridItems();
         if (cw < 0) { cw = 0; }
         if (ch < 0) { ch = 0; }
         GridLayoutPlan plan = this.PlanGrid(items, cw, colGap);
         if (plan == null || plan.placement == null || plan.placement.slots == null) { return; }
         GridPlace pl = plan.placement;
-        List<int> colW = this.GridColumns(plan, items, cw, colGap);
-        List<int> rowH = this.GridRows(null, plan, items, colW, ch, colGap, rowGap);
+        List<int> colW = gridColBuf;
+        List<int> rowH = gridRowBuf;
+        gridColBuf = null;
+        gridRowBuf = null;
+        if (colW == null) { colW = new List<int>(); }
+        if (rowH == null) { rowH = new List<int>(); }
+        this.GridColumnsInto(plan, items, cw, colGap, colW);
+        this.GridRowsInto(null, plan, items, colW, ch, colGap, rowGap, rowH);
         int limit = items.Count < pl.slots.Count ? items.Count : pl.slots.Count;
+        int colCount = colW.Count;
+        int rowCount = rowH.Count;
         for (int i = 0; i < limit; i = i + 1) {
             Control c = items[i];
             GridItemSlot slot = pl.slots[i];
             if (c == null || slot == null) { continue; }
             int cellX = cx + CssGrid.TrackOffset(colW, colGap, slot.colStart);
             int cellY = cy + CssGrid.TrackOffset(rowH, rowGap, slot.rowStart);
-            int cellW = CssGrid.SpanSum(colW, colGap, slot.colStart,
-                                     slot.colSpan);
-            int cellH = CssGrid.SpanSum(rowH, rowGap, slot.rowStart,
-                                     slot.rowSpan);
-            int ml = c.StyleMarL();
-            int mr = c.StyleMarR();
-            int mt = c.StyleMarT();
-            int mb = c.StyleMarB();
+            int cellW = (slot.colSpan == 1 && slot.colStart >= 0 && slot.colStart < colCount)
+                ? colW[slot.colStart]
+                : CssGrid.SpanSum(colW, colGap, slot.colStart, slot.colSpan);
+            int cellH = (slot.rowSpan == 1 && slot.rowStart >= 0 && slot.rowStart < rowCount)
+                ? rowH[slot.rowStart]
+                : CssGrid.SpanSum(rowH, rowGap, slot.rowStart, slot.rowSpan);
+            StyleBox ccs = c.computedStyle;
+            int ml = c.marSet ? c.marL : (ccs != null && ccs.marL > 0 ? ccs.marL : 0);
+            int mr = c.marSet ? c.marR : (ccs != null && ccs.marR > 0 ? ccs.marR : 0);
+            int mt = c.marSet ? c.marT : (ccs != null && ccs.marT > 0 ? ccs.marT : 0);
+            int mb = c.marSet ? c.marB : (ccs != null && ccs.marB > 0 ? ccs.marB : 0);
             int innerW = cellW - ml - mr;
             if (innerW < 0) { innerW = 0; }
             int innerH = cellH - mt - mb;
             if (innerH < 0) { innerH = 0; }
-            int jc = sb.justifyItems;
+            bool declW = ccs != null && (ccs.width >= 0 || ccs.widthPm >= 0);
             int px = cellX + ml;
             int w = innerW;
-            if (jc != 0 || c.StyleDeclaresWidth()) {
-                w = c.StyleDeclaresWidth()
-                    ? c.StyleWidthIn(cellW) : c.prefW;
+            if (jc != 0 || declW) {
+                w = declW ? c.StyleWidthIn(cellW) : c.prefW;
                 if (w < 0) { w = 0; }
                 int free = innerW - w;
                 if (jc == 2) { px = px + free / 2; }
                 else if (jc == 3) { px = px + free; }
             }
-            int ac = sb.alignItems;
+            bool declH = ccs != null && (ccs.height >= 0 || ccs.heightPm >= 0);
             int py = cellY + mt;
             int h = innerH;
-            if (ac != 0 || c.StyleDeclaresHeight()) {
-                h = c.StyleDeclaresHeight()
-                    ? c.StyleHeightIn(cellH) : c.prefH;
+            if (ac != 0 || declH) {
+                h = declH ? c.StyleHeightIn(cellH) : c.prefH;
                 if (h < 0) { h = 0; }
                 int free = innerH - h;
                 if (ac == 2) { py = py + free / 2; }
@@ -108,5 +140,7 @@ public partial class Control {
             }
             c.Arrange(px, py, w, h);
         }
+        if (gridColBuf == null) { colW.Clear(); gridColBuf = colW; }
+        if (gridRowBuf == null) { rowH.Clear(); gridRowBuf = rowH; }
     }
 }
