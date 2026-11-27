@@ -113,6 +113,11 @@ public class ZstdBuffer {
     public byte[] Raw() {
         return this.buf;
     }
+
+    // 直接设置已写长度（供块解码器批处理游标回写）。
+    public void SetLength(int n) {
+        this.len = n;
+    }
 }
 
 // zstd 帧内块解码上下文（跨块延续最近三偏移、Huffman 表与 FSE 序列表，新帧重置）。
@@ -430,12 +435,34 @@ public class ZstdBlockDecoder {
         return this.mlTab;
     }
 
-    // 解码并执行 nbSeq 条序列（本地缓存表引用减少字段间接寻址）。
+    // 解码并执行 nbSeq 条序列（内联 64 位反向位流寄存器并提升输出缓冲游标，消除每序列多次方法调用）。
     void RunSequences(byte[] data, int start, int end, int nbSeq) {
-        ZstdBackBits br = new ZstdBackBits(data, start, end);
-        if (br.Bad()) {
+        if (end <= start || end > data.Length || start < 0) {
             throw new ZstdException(ZstdError.BadSequences, "zstd: empty sequence bitstream");
         }
+        int lastByte = data[end - 1] & 255;
+        if (lastByte == 0) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: empty sequence bitstream");
+        }
+        int initP = ZstdBits.HighBit(lastByte);
+        ulong bitBuf = initP > 0 ? (((ulong)(lastByte & ((1 << initP) - 1))) << (64 - initP)) : 0UL;
+        int bitCount = initP;
+        int bp = end - 2;
+        while (bitCount <= 32 && bp - 3 >= start) {
+            ulong w = (((ulong)(data[bp] & 255)) << 24)
+                | (((ulong)(data[bp - 1] & 255)) << 16)
+                | (((ulong)(data[bp - 2] & 255)) << 8)
+                | ((ulong)(data[bp - 3] & 255));
+            bitBuf = bitBuf | (w << (32 - bitCount));
+            bitCount = bitCount + 32;
+            bp = bp - 4;
+        }
+        while (bitCount <= 56 && bp >= start) {
+            bitBuf = bitBuf | (((ulong)(data[bp] & 255)) << (56 - bitCount));
+            bitCount = bitCount + 8;
+            bp = bp - 1;
+        }
+
         ZstdFseTable llFse = this.llTab.fse;
         ZstdFseTable ofFse = this.ofTab.fse;
         ZstdFseTable mlFse = this.mlTab.fse;
@@ -457,10 +484,41 @@ public class ZstdBlockDecoder {
         int r0 = this.rep0;
         int r1 = this.rep1;
         int r2 = this.rep2;
-        int llState = br.Read(llFse.tableLog);
-        int ofState = br.Read(ofFse.tableLog);
-        int mlState = br.Read(mlFse.tableLog);
+
+        // 读初始三个 FSE 状态（总位宽 <= 26 <= 57）
+        int llState = 0;
+        int llLog = llFse.tableLog;
+        if (llLog > 0) {
+            llState = (int)(bitBuf >> (64 - llLog));
+            if (llLog < bitCount) { bitBuf = bitBuf << llLog; bitCount = bitCount - llLog; }
+            else { bitBuf = 0UL; bitCount = 0; }
+        }
+        int ofState = 0;
+        int ofLog = ofFse.tableLog;
+        if (ofLog > 0) {
+            ofState = (int)(bitBuf >> (64 - ofLog));
+            if (ofLog < bitCount) { bitBuf = bitBuf << ofLog; bitCount = bitCount - ofLog; }
+            else { bitBuf = 0UL; bitCount = 0; }
+        }
+        int mlState = 0;
+        int mlLog = mlFse.tableLog;
+        if (mlLog > 0) {
+            mlState = (int)(bitBuf >> (64 - mlLog));
+            if (mlLog < bitCount) { bitBuf = bitBuf << mlLog; bitCount = bitCount - mlLog; }
+            else { bitBuf = 0UL; bitCount = 0; }
+        }
+
+        // 提升 sink / literals 状态到局部变量
+        byte[] raw = this.sink.Raw();
+        int rawCap = raw.Length;
+        int dst = this.sink.Length();
+        byte[] lits = this.literals;
+        int lp = this.litPos;
+        int litTotal = this.litLen;
+        long winSize = this.windowSize;
+        int fStart = this.frameStart;
         int lastSeq = nbSeq - 1;
+
         for (int i = 0; i < nbSeq; i = i + 1) {
             int llCode = llSym[llState];
             int mlCode = mlSym[mlState];
@@ -470,9 +528,31 @@ public class ZstdBlockDecoder {
             int ofBits = ofAdd[ofCode];
             int llBaseV = llBase[llCode];
             int ll0 = llBaseV == 0 ? 1 : 0;
+
+            // 单次装填保障 >= 57 位，覆盖 ofBits(<=31) + mlBits(<=16) + llBits(<=16) 之一或全部
+            if (bitCount < 32 && bp >= start) {
+                while (bitCount <= 32 && bp - 3 >= start) {
+                    ulong w = (((ulong)(data[bp] & 255)) << 24)
+                        | (((ulong)(data[bp - 1] & 255)) << 16)
+                        | (((ulong)(data[bp - 2] & 255)) << 8)
+                        | ((ulong)(data[bp - 3] & 255));
+                    bitBuf = bitBuf | (w << (32 - bitCount));
+                    bitCount = bitCount + 32;
+                    bp = bp - 4;
+                }
+                while (bitCount <= 56 && bp >= start) {
+                    bitBuf = bitBuf | (((ulong)(data[bp] & 255)) << (56 - bitCount));
+                    bitCount = bitCount + 8;
+                    bp = bp - 1;
+                }
+            }
+
             int offset;
             if (ofBits > 1) {
-                offset = ofBase[ofCode] + br.Read(ofBits);
+                int ofExtra = (int)(bitBuf >> (64 - ofBits));
+                if (ofBits < bitCount) { bitBuf = bitBuf << ofBits; bitCount = bitCount - ofBits; }
+                else { bitBuf = 0UL; bitCount = 0; }
+                offset = ofBase[ofCode] + ofExtra;
                 r2 = r1;
                 r1 = r0;
                 r0 = offset;
@@ -481,7 +561,10 @@ public class ZstdBlockDecoder {
                 if (ll0 == 1) { r1 = r0; }
                 r0 = offset;
             } else {
-                int v = ofBase[ofCode] + ll0 + br.Read(1);
+                int b1 = (int)(bitBuf >> 63);
+                if (1 < bitCount) { bitBuf = bitBuf << 1; bitCount = bitCount - 1; }
+                else { bitBuf = 0UL; bitCount = 0; }
+                int v = ofBase[ofCode] + ll0 + b1;
                 int temp;
                 if (v == 3) {
                     temp = r0 - 1;
@@ -501,22 +584,129 @@ public class ZstdBlockDecoder {
             if (offset <= 0) {
                 throw new ZstdException(ZstdError.BadOffset, "zstd: invalid offset");
             }
+
+            if (bitCount < 32 && bp >= start) {
+                while (bitCount <= 32 && bp - 3 >= start) {
+                    ulong w = (((ulong)(data[bp] & 255)) << 24)
+                        | (((ulong)(data[bp - 1] & 255)) << 16)
+                        | (((ulong)(data[bp - 2] & 255)) << 8)
+                        | ((ulong)(data[bp - 3] & 255));
+                    bitBuf = bitBuf | (w << (32 - bitCount));
+                    bitCount = bitCount + 32;
+                    bp = bp - 4;
+                }
+                while (bitCount <= 56 && bp >= start) {
+                    bitBuf = bitBuf | (((ulong)(data[bp] & 255)) << (56 - bitCount));
+                    bitCount = bitCount + 8;
+                    bp = bp - 1;
+                }
+            }
+
             int matchLen = mlBase[mlCode];
             if (mlBits > 0) {
-                matchLen = matchLen + br.Read(mlBits);
+                matchLen = matchLen + (int)(bitBuf >> (64 - mlBits));
+                if (mlBits < bitCount) { bitBuf = bitBuf << mlBits; bitCount = bitCount - mlBits; }
+                else { bitBuf = 0UL; bitCount = 0; }
             }
             int litLen = llBaseV;
             if (llBits > 0) {
-                litLen = litLen + br.Read(llBits);
+                litLen = litLen + (int)(bitBuf >> (64 - llBits));
+                if (llBits < bitCount) { bitBuf = bitBuf << llBits; bitCount = bitCount - llBits; }
+                else { bitBuf = 0UL; bitCount = 0; }
             }
+
             if (i < lastSeq) {
-                llState = llNs[llState] + br.Read(llNb[llState]);
-                mlState = mlNs[mlState] + br.Read(mlNb[mlState]);
-                ofState = ofNs[ofState] + br.Read(ofNb[ofState]);
+                if (bitCount < 26 && bp >= start) {
+                    while (bitCount <= 32 && bp - 3 >= start) {
+                        ulong w = (((ulong)(data[bp] & 255)) << 24)
+                            | (((ulong)(data[bp - 1] & 255)) << 16)
+                            | (((ulong)(data[bp - 2] & 255)) << 8)
+                            | ((ulong)(data[bp - 3] & 255));
+                        bitBuf = bitBuf | (w << (32 - bitCount));
+                        bitCount = bitCount + 32;
+                        bp = bp - 4;
+                    }
+                    while (bitCount <= 56 && bp >= start) {
+                        bitBuf = bitBuf | (((ulong)(data[bp] & 255)) << (56 - bitCount));
+                        bitCount = bitCount + 8;
+                        bp = bp - 1;
+                    }
+                }
+                int nb1 = llNb[llState];
+                if (nb1 > 0) {
+                    llState = llNs[llState] + (int)(bitBuf >> (64 - nb1));
+                    if (nb1 < bitCount) { bitBuf = bitBuf << nb1; bitCount = bitCount - nb1; }
+                    else { bitBuf = 0UL; bitCount = 0; }
+                } else {
+                    llState = llNs[llState];
+                }
+                int nb2 = mlNb[mlState];
+                if (nb2 > 0) {
+                    mlState = mlNs[mlState] + (int)(bitBuf >> (64 - nb2));
+                    if (nb2 < bitCount) { bitBuf = bitBuf << nb2; bitCount = bitCount - nb2; }
+                    else { bitBuf = 0UL; bitCount = 0; }
+                } else {
+                    mlState = mlNs[mlState];
+                }
+                int nb3 = ofNb[ofState];
+                if (nb3 > 0) {
+                    ofState = ofNs[ofState] + (int)(bitBuf >> (64 - nb3));
+                    if (nb3 < bitCount) { bitBuf = bitBuf << nb3; bitCount = bitCount - nb3; }
+                    else { bitBuf = 0UL; bitCount = 0; }
+                } else {
+                    ofState = ofNs[ofState];
+                }
             }
-            this.CopyLiterals(litLen);
-            this.CopyMatch(offset, matchLen);
+
+            // 合并容量检查与内联字面量 + 匹配拷贝
+            if (litLen < 0 || lp + litLen > litTotal) {
+                throw new ZstdException(ZstdError.BadSequences, "zstd: literals exhausted");
+            }
+            int needOut = litLen + matchLen;
+            if (needOut > rawCap - dst) {
+                this.sink.SetLength(dst);
+                this.sink.Ensure(needOut);
+                raw = this.sink.Raw();
+                rawCap = raw.Length;
+            }
+            if (litLen > 0) {
+                if (litLen < 16) {
+                    for (int k = 0; k < litLen; k = k + 1) {
+                        raw[dst + k] = lits[lp + k];
+                    }
+                } else {
+                    NativeMemory.Copy((nint)raw + dst, (nint)lits + lp, litLen);
+                }
+                dst = dst + litLen;
+                lp = lp + litLen;
+            }
+            int srcPos = dst - offset;
+            if ((long)offset > winSize || srcPos < fStart) {
+                throw new ZstdException(ZstdError.BadOffset, "zstd: offset points outside the window");
+            }
+            if (matchLen < 16) {
+                for (int k = 0; k < matchLen; k = k + 1) {
+                    raw[dst + k] = raw[srcPos + k];
+                }
+            } else if (offset >= matchLen) {
+                NativeMemory.Copy((nint)raw + dst, (nint)raw + srcPos, matchLen);
+            } else if (offset == 1) {
+                NativeMemory.Fill((nint)raw + dst, raw[srcPos] & 255, matchLen);
+            } else {
+                nint p = (nint)raw;
+                NativeMemory.Copy(p + dst, p + srcPos, offset);
+                int done = offset;
+                while (done < matchLen) {
+                    int step = matchLen - done;
+                    if (step > done) { step = done; }
+                    NativeMemory.Copy(p + dst + done, p + dst, step);
+                    done = done + step;
+                }
+            }
+            dst = dst + matchLen;
         }
+        this.sink.SetLength(dst);
+        this.litPos = lp;
         this.rep0 = r0;
         this.rep1 = r1;
         this.rep2 = r2;

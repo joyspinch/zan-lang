@@ -106,9 +106,9 @@ public partial class ImageBuffer : IDisposable {
             // 单列源图：仅做垂直线性插值并整行填充，避免 ResampleBilinearRow 越界读取 sx+1。
             Span<int> col = new Span<int>(this.Pixels, this.Height);
             for (int dy = 0; dy < newHeight; dy++) {
-                int fpY = (int)(((long)dy * (long)(this.Height - 1) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1));
-                int sy = fpY >> 16;
-                int wy = (fpY & 0xFFFF) >> 8;
+                long fpY = (((long)dy * (long)(this.Height - 1)) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1);
+                int sy = (int)(fpY >> 16);
+                int wy = (int)((fpY & 0xFFFFL) >> 8);
                 if (sy >= this.Height - 1) { sy = this.Height - 2; wy = 256; }
                 if (sy < 0) { sy = 0; wy = 0; }
                 int c0 = col[sy];
@@ -124,17 +124,28 @@ public partial class ImageBuffer : IDisposable {
             return dst;
         }
 
+        if (newWidth > 536870911) {
+            dst.Dispose();
+            return new ImageBuffer(0, 0);
+        }
         nint xIdxBuf = NativeMemory.Alloc(newWidth * 4);
         nint xWeightBuf = NativeMemory.Alloc(newWidth * 4);
+        if (xIdxBuf == 0 || xWeightBuf == 0) {
+            if (xIdxBuf != 0) { NativeMemory.Free(xIdxBuf); }
+            if (xWeightBuf != 0) { NativeMemory.Free(xWeightBuf); }
+            dst.Dispose();
+            return new ImageBuffer(0, 0);
+        }
+        bool ok = false;
         try {
             Span<int> xIndices = new Span<int>(xIdxBuf, newWidth);
             Span<int> xWeights = new Span<int>(xWeightBuf, newWidth);
 
-            // 预计算 X 轴坐标与插值权重 (16.16 定点数)
+            // 预计算 X 轴坐标与插值权重 (16.16 定点数，64 位防 Width > 32768 溢出)
             for (int dx = 0; dx < newWidth; dx++) {
-                int fp = (int)(((long)dx * (long)(this.Width - 1) << 16) / (long)(newWidth > 1 ? newWidth - 1 : 1));
-                int sx = fp >> 16;
-                int wx = (fp & 0xFFFF) >> 8;  // 0..256
+                long fp = (((long)dx * (long)(this.Width - 1)) << 16) / (long)(newWidth > 1 ? newWidth - 1 : 1);
+                int sx = (int)(fp >> 16);
+                int wx = (int)((fp & 0xFFFFL) >> 8);  // 0..256
                 if (sx >= this.Width - 1) {
                     sx = this.Width - 2;
                     wx = 256;
@@ -149,9 +160,9 @@ public partial class ImageBuffer : IDisposable {
 
             // 逐行调度物理插值微内核（Height == 1 时 sy1 钳位为 sy，避免 src1 越界一行）。
             for (int dy = 0; dy < newHeight; dy++) {
-                int fpY = (int)(((long)dy * (long)(this.Height - 1) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1));
-                int sy = fpY >> 16;
-                int wy = (fpY & 0xFFFF) >> 8;  // 0..256
+                long fpY = (((long)dy * (long)(this.Height - 1)) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1);
+                int sy = (int)(fpY >> 16);
+                int wy = (int)((fpY & 0xFFFFL) >> 8);  // 0..256
                 if (sy >= this.Height - 1) {
                     sy = this.Height - 2;
                     wy = 256;
@@ -168,9 +179,11 @@ public partial class ImageBuffer : IDisposable {
 
                 PixelOps.ResampleBilinearRow(dstRow, src0, src1, xIdxBuf, xWeightBuf, wy, newWidth);
             }
+            ok = true;
         } finally {
             NativeMemory.Free(xIdxBuf);
             NativeMemory.Free(xWeightBuf);
+            if (!ok) { dst.Dispose(); }
         }
         return dst;
     }

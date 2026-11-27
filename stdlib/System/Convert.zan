@@ -65,8 +65,9 @@ public class Convert {
     public static int ToBase64Chars(byte[] inArray, int inOff, int inLen, byte[] outBuf, int outOff) {
         if (inArray == null || inLen <= 0) { return 0; }
         if (outBuf == null) { return -1; }
-        int req = ((inLen + 2) / 3) * 4;
-        if (outOff < 0 || outOff + req > outBuf.Length) { return -1; }
+        if (inOff < 0 || inOff > inArray.Length || inLen > inArray.Length - inOff) { return -1; }
+        long reqL = (((long)inLen + 2L) / 3L) * 4L;
+        if (reqL > 2147483647L || outOff < 0 || (long)outOff + reqL > (long)outBuf.Length) { return -1; }
 
         int di = outOff;
         int i = inOff;
@@ -74,7 +75,7 @@ public class Convert {
 
         // 硬件 AVX2/LUT 快路径：保留最后 1..3 字节在 Zan 侧写出，
         // 使 C 侧尾 NUL 写入安全落在 outBuf[outOff + prefixOut] 内并随即被尾块覆盖。
-        if (inLen >= 6 && inOff >= 0 && end <= inArray.Length) {
+        if (inLen >= 6) {
             int prefixIn = ((inLen - 1) / 3) * 3;
             int prefixOut = (prefixIn / 3) * 4;
             long written = NativeMemory.Base64EncodeTo(
@@ -173,64 +174,24 @@ public class Convert {
     public static int FromBase64Chars(byte[] inBuf, int inOff, int inLen, byte[] outBuf, int outOff) {
         if (inBuf == null || inLen <= 0) { return 0; }
         if (outBuf == null) { return -1; }
+        if (inOff < 0 || inOff > inBuf.Length || inLen > inBuf.Length - inOff) { return -1; }
+        if ((inLen & 3) != 0) { return -1; }
 
         int pad = 0;
         int end = inOff + inLen;
         if (inLen > 0 && inBuf[end - 1] == 61) { pad = pad + 1; }
         if (inLen > 1 && inBuf[end - 2] == 61) { pad = pad + 1; }
 
-        long outLenL = ((long)inLen * 3) / 4 - pad;
-        if (outLenL < 0) { outLenL = 0; }
+        long outLenL = ((long)inLen * 3L) / 4L - (long)pad;
+        if (outLenL < 0L) { outLenL = 0L; }
+        if (outLenL > 2147483647L || outOff < 0 || (long)outOff + outLenL > (long)outBuf.Length) { return -1; }
         int req = (int)outLenL;
-        if (outOff < 0 || outOff + req > outBuf.Length) { return -1; }
 
         // 硬件 AVX2/256-LUT 快路径（标准 4 字节对齐 Base64，含 0/1/2 位 '=' 填充）。
-        if ((inLen & 3) == 0 && inOff >= 0 && end <= inBuf.Length) {
-            long written = NativeMemory.Base64Decode(
-                (nint)outBuf + (nint)outOff, (nint)inBuf + (nint)inOff, (long)inLen);
-            if (written == (long)req) { return req; }
-            return -1;
-        }
-
-        int si = inOff;
-        int di = outOff;
-        int validEnd = end - pad;
-
-        while (si + 4 <= validEnd) {
-            int c0 = DecB64(inBuf[si] & 255);
-            int c1 = DecB64(inBuf[si + 1] & 255);
-            int c2 = DecB64(inBuf[si + 2] & 255);
-            int c3 = DecB64(inBuf[si + 3] & 255);
-            if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) { return -1; }
-
-            int n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
-            outBuf[di]     = (byte)((n >> 16) & 255);
-            outBuf[di + 1] = (byte)((n >> 8) & 255);
-            outBuf[di + 2] = (byte)(n & 255);
-            di = di + 3;
-            si = si + 4;
-        }
-
-        if (pad > 0 && si + 4 == end) {
-            int c0 = DecB64(inBuf[si] & 255);
-            int c1 = DecB64(inBuf[si + 1] & 255);
-            if (c0 < 0 || c1 < 0) { return -1; }
-
-            if (pad == 2) {
-                int n = (c0 << 18) | (c1 << 12);
-                outBuf[di] = (byte)((n >> 16) & 255);
-                di = di + 1;
-            } else if (pad == 1) {
-                int c2 = DecB64(inBuf[si + 2] & 255);
-                if (c2 < 0) { return -1; }
-                int n = (c0 << 18) | (c1 << 12) | (c2 << 6);
-                outBuf[di]     = (byte)((n >> 16) & 255);
-                outBuf[di + 1] = (byte)((n >> 8) & 255);
-                di = di + 2;
-            }
-        }
-
-        return di - outOff;
+        long written = NativeMemory.Base64Decode(
+            (nint)outBuf + (nint)outOff, (nint)inBuf + (nint)inOff, (long)inLen);
+        if (written == (long)req) { return req; }
+        return -1;
     }
 
     // 将字节数组编码为小写十六进制文本（零中间字符串分配）。
@@ -267,10 +228,12 @@ public class Convert {
     public static string ToHexString(byte[] inArray, int offset, int length) {
         if (inArray == null || length <= 0) { return ""; }
         if (offset < 0) { offset = 0; }
-        int end = offset + length;
-        if (end > inArray.Length) { end = inArray.Length; }
-        int realLen = end - offset;
+        if (offset >= inArray.Length) { return ""; }
+        long endL = (long)offset + (long)length;
+        if (endL > (long)inArray.Length) { endL = (long)inArray.Length; }
+        int realLen = (int)(endL - (long)offset);
         if (realLen <= 0) { return ""; }
+        if ((long)realLen * 2L > 2147483591L) { throw new ArgumentOutOfRangeException("length"); }
         byte[] buf = new byte[realLen * 2];
         ushort[] lut = Convert.GetHexEncLut();
         nint srcPtr = (nint)inArray + (nint)offset;

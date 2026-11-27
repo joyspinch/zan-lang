@@ -731,57 +731,64 @@ public class DataFrame {
         DataCol rKey = right.cols[ri];
         List<int> matchedL = new List<int>();
         List<int> matchedR = new List<int>();
+        matchedL.Reserve(this.rowCount);
+        matchedR.Reserve(this.rowCount);
+        int rCount = right.rowCount;
+        int[] nextRow = new int[rCount];
         if (lKey.kind == ColKind.Int && rKey.kind == ColKind.Int) {
-            // 双侧整数键：直接 long 哈希，零字符串分配；缺失值单独分桶，避免与 0 误匹配。
+            // 双侧整数键：逆序建单头表 + 扁平链式行号数组（零 List<int> 桶分配，遍历保持升序）；缺失值单独分链。
             List<long> rVals = rKey.ints;
-            Dictionary<long, List<int>> map = new Dictionary<long, List<int>>();
-            List<int> missingR = null;
-            for (int r = 0; r < right.rowCount; r = r + 1) {
-                if (rKey.IsMissing(r)) {
-                    if (missingR == null) { missingR = new List<int>(); }
-                    missingR.Add(r);
+            Dictionary<long, int> headMap = new Dictionary<long, int>();
+            int missingHead = -1;
+            bool rHasMiss = rKey.missing.Count > 0;
+            for (int r = rCount - 1; r >= 0; r = r - 1) {
+                if (rHasMiss && rKey.IsMissing(r)) {
+                    nextRow[r] = missingHead;
+                    missingHead = r;
                     continue;
                 }
                 long k = rVals[r];
-                List<int> bucket = null;
-                if (!map.TryGetValue(k, out bucket)) {
-                    bucket = new List<int>();
-                    map[k] = bucket;
-                }
-                bucket.Add(r);
+                int prev = -1;
+                if (headMap.TryGetValue(k, out prev)) { nextRow[r] = prev; }
+                else { nextRow[r] = -1; }
+                headMap[k] = r;
             }
             List<long> lVals = lKey.ints;
+            bool lHasMiss = lKey.missing.Count > 0;
             for (int r = 0; r < this.rowCount; r = r + 1) {
-                List<int> matches = null;
-                if (lKey.IsMissing(r)) {
-                    matches = missingR;
-                    if (matches == null) { continue; }
-                } else if (!map.TryGetValue(lVals[r], out matches)) {
+                int rr = -1;
+                if (lHasMiss && lKey.IsMissing(r)) {
+                    rr = missingHead;
+                } else if (!headMap.TryGetValue(lVals[r], out rr)) {
                     continue;
                 }
-                for (int m = 0; m < matches.Count; m = m + 1) {
+                while (rr >= 0) {
                     matchedL.Add(r);
-                    matchedR.Add(matches[m]);
+                    matchedR.Add(rr);
+                    rr = nextRow[rr];
                 }
             }
         } else {
-            Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
-            for (int r = 0; r < right.rowCount; r = r + 1) {
-                string k = rKey.IsMissing(r) ? "" : rKey.GetStr(r);
-                List<int> bucket = null;
-                if (!map.TryGetValue(k, out bucket)) {
-                    bucket = new List<int>();
-                    map[k] = bucket;
-                }
-                bucket.Add(r);
+            Dictionary<string, int> headMap = new Dictionary<string, int>();
+            bool rIsStr = rKey.kind == ColKind.Str;
+            bool rHasMiss = rKey.missing.Count > 0;
+            for (int r = rCount - 1; r >= 0; r = r - 1) {
+                string k = (rHasMiss && rKey.IsMissing(r)) ? "" : (rIsStr ? rKey.text[r] : rKey.GetStr(r));
+                int prev = -1;
+                if (headMap.TryGetValue(k, out prev)) { nextRow[r] = prev; }
+                else { nextRow[r] = -1; }
+                headMap[k] = r;
             }
+            bool lIsStr = lKey.kind == ColKind.Str;
+            bool lHasMiss = lKey.missing.Count > 0;
             for (int r = 0; r < this.rowCount; r = r + 1) {
-                string k = lKey.IsMissing(r) ? "" : lKey.GetStr(r);
-                List<int> matches = null;
-                if (!map.TryGetValue(k, out matches)) { continue; }
-                for (int m = 0; m < matches.Count; m = m + 1) {
+                string k = (lHasMiss && lKey.IsMissing(r)) ? "" : (lIsStr ? lKey.text[r] : lKey.GetStr(r));
+                int rr = -1;
+                if (!headMap.TryGetValue(k, out rr)) { continue; }
+                while (rr >= 0) {
                     matchedL.Add(r);
-                    matchedR.Add(matches[m]);
+                    matchedR.Add(rr);
+                    rr = nextRow[rr];
                 }
             }
         }

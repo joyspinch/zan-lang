@@ -34,25 +34,25 @@ public class Wav {
         int dataLength = 0;
 
         // 遍历 chunk
-        int pos = 12;
-        while (pos + 8 <= data.Length) {
-            string id = Str(data, pos, 4);
-            int size = ReadI32(data, pos + 4);
-            int body = pos + 8;
-            if (size < 0) { break; }
+        long pos = 12L;
+        long totalLen = (long)data.Length;
+        while (pos + 8L <= totalLen) {
+            int p = (int)pos;
+            string id = Str(data, p, 4);
+            long size = (long)ReadI32(data, p + 4) & 0xFFFFFFFFL;
+            long body = pos + 8L;
             if (id == "fmt ") {
-                if (body + 16 > data.Length) { break; }
-                format = ReadU16(data, body);
-                channels = ReadU16(data, body + 2);
-                sampleRate = ReadI32(data, body + 4);
-                bitsPerSample = ReadU16(data, body + 14);
-                // WAVE_FORMAT_EXTENSIBLE (0xFFFE)：有效位在 body+18，
-                // 子格式 GUID 的头两字节在 body+24。
-                if (format == 0xFFFE && body + 26 <= data.Length) {
-                    int validBits = ReadU16(data, body + 18);
-                    if (validBits > 0) { bitsPerSample = validBits; }
-                    int sub = ReadU16(data, body + 24);
+                if (body + 16L > totalLen) { break; }
+                int bp = (int)body;
+                format = ReadU16(data, bp);
+                channels = ReadU16(data, bp + 2);
+                sampleRate = ReadI32(data, bp + 4);
+                bitsPerSample = ReadU16(data, bp + 14);
+                // WAVE_FORMAT_EXTENSIBLE (0xFFFE)：保持容器位宽作为采样步长，仅用子格式判断 IEEE float。
+                if (format == 0xFFFE && body + 26L <= totalLen) {
+                    int sub = ReadU16(data, bp + 24);
                     if (sub == 3) { isFloat = true; }
+                    else if (sub != 1) { return null; }
                 } else if (format == 3) {
                     // 标准 IEEE float（wFormatTag == 3）：**不是** EXTENSIBLE。
                     // 漏掉这一支会把浮点采样当 int32 读——数值全错
@@ -63,17 +63,20 @@ public class Wav {
                     return null;
                 }
             } else if (id == "data") {
-                dataOffset = body;
-                dataLength = size;
-                // data chunk 后面还有 chunk 时，size 可能是 0xFFFFFFFF
-                // （流式写法），此时取剩余全部。
-                if (size == 0xFFFFFFFF || body + size > data.Length) {
-                    dataLength = data.Length - body;
+                dataOffset = (int)body;
+                long avail = totalLen - body;
+                if (size == 0xFFFFFFFFL || size > avail) {
+                    dataLength = (int)avail;
+                } else {
+                    dataLength = (int)size;
                 }
             }
-            pos = body + size;
+            if (size == 0xFFFFFFFFL) { break; }
+            long nextPos = body + size;
             // chunk 按偶数字节对齐
-            if ((size & 1) != 0) { pos = pos + 1; }
+            if ((size & 1L) != 0L) { nextPos = nextPos + 1L; }
+            if (nextPos <= pos || nextPos > totalLen) { break; }
+            pos = nextPos;
         }
 
         if (dataOffset < 0 || channels <= 0 || sampleRate <= 0) { return null; }
@@ -81,7 +84,9 @@ public class Wav {
 
         int bytesPerSample = bitsPerSample / 8;
         if (bytesPerSample <= 0) { return null; }
-        int frameBytes = bytesPerSample * channels;
+        long frameBytesL = (long)bytesPerSample * (long)channels;
+        if (frameBytesL <= 0L || frameBytesL > 2147483647L) { return null; }
+        int frameBytes = (int)frameBytesL;
         int frames = dataLength / frameBytes;
         if (frames <= 0) { return null; }
 

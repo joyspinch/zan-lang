@@ -11,6 +11,8 @@ public class XmlParser {
     public nint basePtr;
     public int pos;
     public int len;
+    StringBuilder scratch;
+    string[] nameCache;
     // 读写对称的嵌套深度上限，防止无界递归耗尽调用栈。
     public static int MaxDepth = 512;
 
@@ -108,7 +110,6 @@ public class XmlParser {
                 Err("unterminated attribute value");
             }
             this.pos = hit + 1;  // 消费闭引号
-            string raw = NativeMemory.GetString(this.basePtr, start, hit - start);
             // XML WFC: Unique Att Spec — 重复属性名立即报错。
             if (elem.attrs != null) {
                 for (int ai = 0; ai < elem.attrs.Count; ai = ai + 1) {
@@ -119,7 +120,7 @@ public class XmlParser {
             }
             XmlAttribute a = new XmlAttribute();
             a.name = aname;
-            a.value = DecodeText(raw);
+            a.value = DecodeSlice(start, hit - start);
             if (elem.attrs == null) { elem.attrs = new List<XmlAttribute>(); }
             elem.attrs.Add(a);
         }
@@ -129,19 +130,46 @@ public class XmlParser {
 
     // 读取元素子节点与文本直到匹配的结束标签。
     private void ReadChildren(XmlNode elem, int depth) {
-        while (pos < len) {
-            int c = CurB();
+        nint bp = this.basePtr;
+        int n = this.len;
+        Span<byte> buf = new Span<byte>(bp, n);
+        while (pos < n) {
+            int c = buf[pos] & 255;
             if (c != 60) {  // '<'
-                int n = this.len;
                 int start = this.pos;
-                int hit = NativeMemory.Find(this.basePtr, start, 60, n - start);
+                int hit = NativeMemory.Find(bp, start, 60, n - start);
                 int end = hit < 0 ? n : hit;
                 this.pos = end;
-                elem.MergeText(DecodeText(NativeMemory.GetString(this.basePtr, start, end - start)));
+                elem.MergeText(DecodeSlice(start, end - start));
                 continue;
             }
-            if (Has("</")) {
+            int next = (pos + 1 < n) ? (buf[pos + 1] & 255) : -1;
+            if (next == 47) {  // '</'
                 pos = pos + 2;
+                // 快路径：直接按字节匹配 elem.name，零结束标签名字符串分配。
+                string expect = elem.name;
+                int elen = expect.Length;
+                if (pos + elen < n) {
+                    Span<byte> eb = new Span<byte>((nint)expect, elen);
+                    bool ok = true;
+                    for (int k = 0; k < elen; k = k + 1) {
+                        if (buf[pos + k] != eb[k]) { ok = false; break; }
+                    }
+                    if (ok) {
+                        int after = buf[pos + elen] & 255;
+                        if (after == 62) {
+                            pos = pos + elen + 1;
+                            return;
+                        }
+                        if (after == 32 || after == 9 || after == 10 || after == 13) {
+                            pos = pos + elen;
+                            SkipWs();
+                            if (CurB() != 62) { Err("expected '>' after closing tag name"); }
+                            pos = pos + 1;
+                            return;
+                        }
+                    }
+                }
                 string closeName = ReadName();
                 SkipWs();
                 if (CurB() != 62) { Err("expected '>' after closing tag name"); }
@@ -152,19 +180,21 @@ public class XmlParser {
                 }
                 return;
             }
-            if (Has("<!--")) {
-                elem.AddChild(ReadComment());
-                continue;
+            if (next == 33) {  // '<!'
+                if (Has("<!--")) {
+                    elem.AddChild(ReadComment());
+                    continue;
+                }
+                if (Has("<![CDATA[")) {
+                    elem.AddChild(ReadCdata());
+                    continue;
+                }
+                Err("unexpected <! construct in element content");
             }
-            if (Has("<![CDATA[")) {
-                elem.AddChild(ReadCdata());
-                continue;
-            }
-            if (Has("<?")) {
+            if (next == 63) {  // '<?'
                 elem.AddChild(ReadPiOrDecl());
                 continue;
             }
-            if (Has("<!")) { Err("unexpected <! construct in element content"); }
             XmlNode child = ReadElement(depth + 1);
             elem.AddChild(child);
         }
@@ -257,8 +287,153 @@ public class XmlParser {
             p = p + 1;
         }
         this.pos = p;
-        if (p == start) { Err("expected a name"); }
-        return NativeMemory.GetString(this.basePtr, start, p - start);
+        int nlen = p - start;
+        if (nlen == 0) { Err("expected a name"); }
+        // 短标签/属性名直映缓存（64 槽，FNV-1a 32 + 逐字节验证），高频重复标签名零堆分配。
+        if (nlen <= 32) {
+            if (this.nameCache == null) { this.nameCache = new string[64]; }
+            uint h = 2166136261U;
+            for (int i = 0; i < nlen; i = i + 1) {
+                h = (h ^ (uint)(buf[start + i] & 255)) * 16777619U;
+            }
+            int slot = (int)(h & 63U);
+            string cached = this.nameCache[slot];
+            if (cached != null && cached.Length == nlen) {
+                Span<byte> cb = new Span<byte>((nint)cached, nlen);
+                bool eq = true;
+                for (int i = 0; i < nlen; i = i + 1) {
+                    if (buf[start + i] != cb[i]) { eq = false; break; }
+                }
+                if (eq) { return cached; }
+            }
+            string fresh = NativeMemory.GetString(this.basePtr, start, nlen);
+            this.nameCache[slot] = fresh;
+            return fresh;
+        }
+        return NativeMemory.GetString(this.basePtr, start, nlen);
+    }
+
+    // 预缓存常见纯空白缩进文本（"\n" + 0..16 空格），美化 XML 解析零堆分配。
+    private static string[] IndentTextCache = new string[] {
+        "\n",
+        "\n ",
+        "\n  ",
+        "\n   ",
+        "\n    ",
+        "\n     ",
+        "\n      ",
+        "\n       ",
+        "\n        ",
+        "\n         ",
+        "\n          ",
+        "\n           ",
+        "\n            ",
+        "\n             ",
+        "\n              ",
+        "\n               ",
+        "\n                "
+    };
+
+    // 直接对源切片 [start, start+slen) 做零中间串实体解码与 CR 归一，复用 scratch StringBuilder。
+    string DecodeSlice(int start, int slen) {
+        if (slen <= 0) { return ""; }
+        nint rp = this.basePtr + (nint)start;
+        // 快路径：常见标签间 "\n   " 缩进空白直接返回只读缓存串，零堆分配。
+        if (slen <= 17) {
+            Span<byte> wbuf = new Span<byte>(rp, slen);
+            if ((wbuf[0] & 255) == 10) {
+                bool allSp = true;
+                for (int k = 1; k < slen; k = k + 1) {
+                    if ((wbuf[k] & 255) != 32) { allSp = false; break; }
+                }
+                if (allSp) { return XmlParser.IndentTextCache[slen - 1]; }
+            }
+        }
+        int scan = NativeMemory.IndexOfAny(rp, slen, (byte)38, (byte)13);
+        if (scan < 0) { return NativeMemory.GetString(this.basePtr, start, slen); }
+        Span<byte> rbuf = new Span<byte>(rp, slen);
+        StringBuilder sb = this.scratch;
+        if (sb == null) {
+            sb = new StringBuilder(slen < 64 ? 64 : slen);
+            this.scratch = sb;
+        } else {
+            sb.Clear();
+        }
+        if (scan > 0) { sb.Append(new StringView(rp, scan)); }
+        int i = scan;
+        while (i < slen) {
+            int c = rbuf[i] & 255;
+            if (c == 38) {  // '&'
+                i = ReadEntityPtr(rp, rbuf, slen, i, sb);
+            } else if (c == 13) {  // '\r'
+                if (i + 1 < slen && (rbuf[i + 1] & 255) == 10) { i = i + 1; }
+                sb.Append("\n");
+                i = i + 1;
+            } else {
+                int rel = NativeMemory.IndexOfAny(rp + (nint)i, slen - i, (byte)38, (byte)13);
+                int j = rel < 0 ? slen : (i + rel);
+                sb.Append(new StringView(rp + (nint)i, j - i));
+                i = j;
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 指针版实体解码：零临时 raw 字符串构造。
+    int ReadEntityPtr(nint rp, Span<byte> rbuf, int rlen, int i, StringBuilder sb) {
+        int rem = rlen - (i + 1);
+        if (rem > 12) { rem = 12; }
+        int semi = rem > 0 ? NativeMemory.Find(rp, i + 1, 59, rem) : -1;
+        if (semi < 0 || semi - i > 12) {
+            Err("malformed entity reference");
+        }
+        int entStart = i + 1;
+        int entLen = semi - entStart;
+        if (entLen == 2) {
+            int c0 = rbuf[entStart] & 255;
+            int c1 = rbuf[entStart + 1] & 255;
+            if (c0 == 108 && c1 == 116) { sb.Append("<"); return semi + 1; }  // lt
+            if (c0 == 103 && c1 == 116) { sb.Append(">"); return semi + 1; }  // gt
+        } else if (entLen == 3) {
+            if ((rbuf[entStart] & 255) == 97 && (rbuf[entStart + 1] & 255) == 109
+                && (rbuf[entStart + 2] & 255) == 112) {
+                sb.Append("&"); return semi + 1;  // amp
+            }
+        } else if (entLen == 4) {
+            int c0 = rbuf[entStart] & 255;
+            int c1 = rbuf[entStart + 1] & 255;
+            int c2 = rbuf[entStart + 2] & 255;
+            int c3 = rbuf[entStart + 3] & 255;
+            if (c0 == 113 && c1 == 117 && c2 == 111 && c3 == 116) { sb.Append("\""); return semi + 1; }  // quot
+            if (c0 == 97 && c1 == 112 && c2 == 111 && c3 == 115) { sb.Append("'"); return semi + 1; }    // apos
+        }
+        if (entLen > 0 && (rbuf[entStart] & 255) == 35) {  // '#'
+            int cp = 0;
+            int k = 1;
+            bool hex = false;
+            if (entLen > 1) {
+                int h = rbuf[entStart + 1] & 255;
+                if (h == 120 || h == 88) {  // 'x' 'X'
+                    hex = true;
+                    k = 2;
+                }
+            }
+            if (k >= entLen) { Err("empty character reference"); }
+            while (k < entLen) {
+                int d = XmlParser.DigitVal(rbuf[entStart + k] & 255, hex);
+                if (d < 0) { Err("invalid character reference &" + NativeMemory.GetString(rp, entStart, entLen) + ";"); }
+                cp = cp * (hex ? 16 : 10) + d;
+                if (cp > 1114111) { Err("character reference out of range"); }
+                k = k + 1;
+            }
+            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
+                Err("character reference cannot be represented");
+            }
+            sb.Append(Encoding.Utf8FromCodePoint(cp));
+            return semi + 1;
+        }
+        Err("unknown entity &" + NativeMemory.GetString(rp, entStart, entLen) + ";");
+        return semi + 1;
     }
 
     // 实体解码与 CR 归一（\r\n / \r → \n）；SIMD 双字节扫描 + StringView 零临时字符串冲刷。

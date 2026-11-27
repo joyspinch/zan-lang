@@ -136,13 +136,13 @@ public class XmlNode {
         attrs.Add(a);
     }
 
-    // 取属性值；不存在返回 null。无前缀的名字回退本地名匹配。
+    // 取属性值；不存在返回 null。无前缀的名字回退零分配本地名后缀匹配。
     public string Attr(string attrName) {
         int idx = IndexOfAttr(attrName);
         if (idx >= 0) { return attrs[idx].value; }
-        if (attrs != null && XmlNode.IndexOf(attrName, ":", 0) < 0) {
+        if (attrs != null && NativeMemory.Find((nint)attrName, 0, 58, attrName.Length) < 0) {
             for (int i = 0; i < attrs.Count; i = i + 1) {
-                if (XmlNode.LocalNameOf(attrs[i].name) == attrName) {
+                if (XmlNode.MatchesLocal(attrs[i].name, attrName)) {
                     return attrs[i].value;
                 }
             }
@@ -176,20 +176,44 @@ public class XmlNode {
         return qname.Substring(colon + 1, qname.Length - colon - 1);
     }
 
+    // 零堆分配判定 qname 的本地名（最后一个 ':' 之后，或整体）是否等于 want。
+    public static bool MatchesLocal(string qname, string want) {
+        if (qname == null || want == null) { return false; }
+        int qlen = qname.Length;
+        int wlen = want.Length;
+        if (qlen == wlen) {
+            return qname == want;
+        }
+        if (qlen <= wlen) { return false; }
+        int start = qlen - wlen;
+        if ((qname[start - 1] & 255) != 58) { return false; }  // 必须是 ':' 后缀
+        Span<byte> qb = new Span<byte>((nint)qname + (nint)start, wlen);
+        Span<byte> wb = new Span<byte>((nint)want, wlen);
+        for (int i = 0; i < wlen; i = i + 1) {
+            if (qb[i] != wb[i]) { return false; }
+        }
+        return true;
+    }
+
     // 子节点按名匹配规则：先精确匹配原样名字；查询名不带 ':'
-    // 时再回退本地名匹配。带前缀的查询只做精确匹配。
+    // 时再回退零分配本地名匹配。带前缀的查询只做精确匹配。
     public bool MatchesName(string want) {
         if (name == want) { return true; }
-        if (XmlNode.IndexOf(want, ":", 0) >= 0) { return false; }
-        return XmlNode.LocalNameOf(name) == want;
+        if (want == null || NativeMemory.Find((nint)want, 0, 58, want.Length) >= 0) { return false; }
+        return XmlNode.MatchesLocal(name, want);
     }
 
     // 第一个按 MatchesName 命中的子元素；没有返回 null。
     public XmlNode Element(string name) {
-        if (children == null) { return null; }
-        for (int i = 0; i < children.Count; i = i + 1) {
+        if (children == null || name == null) { return null; }
+        bool hasColon = NativeMemory.Find((nint)name, 0, 58, name.Length) >= 0;
+        int n = children.Count;
+        for (int i = 0; i < n; i = i + 1) {
             XmlNode c = children[i];
-            if (c.kind == 0 && c.MatchesName(name)) { return c; }
+            if (c.kind == 0) {
+                if (c.name == name) { return c; }
+                if (!hasColon && XmlNode.MatchesLocal(c.name, name)) { return c; }
+            }
         }
         return null;
     }
@@ -197,10 +221,16 @@ public class XmlNode {
     // 全部按 MatchesName 命中的子元素（按文档顺序）。
     public List<XmlNode> Elements(string name) {
         List<XmlNode> outList = new List<XmlNode>();
-        if (children == null) { return outList; }
-        for (int i = 0; i < children.Count; i = i + 1) {
+        if (children == null || name == null) { return outList; }
+        bool hasColon = NativeMemory.Find((nint)name, 0, 58, name.Length) >= 0;
+        int n = children.Count;
+        for (int i = 0; i < n; i = i + 1) {
             XmlNode c = children[i];
-            if (c.kind == 0 && c.MatchesName(name)) { outList.Add(c); }
+            if (c.kind == 0) {
+                if (c.name == name || (!hasColon && XmlNode.MatchesLocal(c.name, name))) {
+                    outList.Add(c);
+                }
+            }
         }
         return outList;
     }

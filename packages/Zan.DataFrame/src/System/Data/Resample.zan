@@ -34,35 +34,109 @@ public class Resample {
         int vAt = df.ColIndex(valueCol);
         if (vAt < 0) { throw new InvalidOperationException("ResampleBy 没有列: " + valueCol); }
 
-        // 桶起始 → 该桶的行号。
-        Dictionary<long, List<int>> buckets = new Dictionary<long, List<int>>();
-        List<long> order = new List<long>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            long t = df.cols[tAt].GetLong(r);
-            long b = Resample.BucketStart(t, freq);
-            if (!buckets.ContainsKey(b)) {
-                buckets[b] = new List<int>();
-                order.Add(b);
-            }
-            buckets[b].Add(r);
-        }
-        // 桶按时间升序（输入未必有序）。
-        order.Sort((long a, long b) => {
-            if (a < b) { return 0 - 1; }
-            if (a > b) { return 1; }
-            return 0;
-        });
+        DataCol tCol = df.cols[tAt];
+        DataCol vCol = df.cols[vAt];
+        int nRows = df.Rows();
+        bool tIsInt = tCol.kind == ColKind.Int;
+        bool vIsFloat = vCol.kind == ColKind.Float;
+        bool vIsInt = vCol.kind == ColKind.Int;
+        bool vHasMiss = vCol.missing.Count > 0;
+        List<long> tInts = tIsInt ? tCol.ints : null;
+        List<double> vNums = vIsFloat ? vCol.nums : null;
+        List<long> vInts = vIsInt ? vCol.ints : null;
 
-        DataFrame outp = new DataFrame();
-        outp.cols.Add(DataCol.Create(timeCol, ColKind.Int));
-        outp.cols.Add(DataCol.Create(valueCol, ColKind.Float));
-        for (int i = 0; i < order.Count; i = i + 1) {
-            long b = order[i];
-            List<int> rows = buckets[b];
-            int row = outp.AddRow();
-            outp.cols[0].PutLong(row, b);
-            outp.cols[1].PutDouble(row, df.Aggregate(rows, valueCol, agg));
+        // 单遍流式聚合：消除每桶 List<int> 堆分配与二次遍历；缓存最近桶 [cacheStart, cacheEnd) 区间，
+        // 对有序/局部有序时序免去重复日期分解与字典查找。
+        Dictionary<long, int> bucketId = new Dictionary<long, int>();
+        List<long> bKeys = new List<long>();
+        List<double> bAcc = new List<double>();
+        List<int> bCnt = new List<int>();
+        long cacheStart = 0L;
+        long cacheEnd = 0L;
+        int cacheIdx = -1;
+        bool sorted = true;
+        long lastNewKey = 0L;
+
+        for (int r = 0; r < nRows; r = r + 1) {
+            long t = tIsInt ? tInts[r] : tCol.GetLong(r);
+            int bi = -1;
+            if (cacheIdx >= 0 && t >= cacheStart && t < cacheEnd) {
+                bi = cacheIdx;
+            } else {
+                long b = Resample.BucketStart(t, freq);
+                if (!bucketId.TryGetValue(b, out bi)) {
+                    bi = bKeys.Count;
+                    if (bi > 0 && b < lastNewKey) { sorted = false; }
+                    lastNewKey = b;
+                    bucketId[b] = bi;
+                    bKeys.Add(b);
+                    bAcc.Add(0.0);
+                    bCnt.Add(0);
+                }
+                cacheStart = b;
+                cacheEnd = Resample.BucketEnd(b, freq);
+                cacheIdx = bi;
+            }
+            if (agg == Agg.Count) {
+                bCnt[bi] = bCnt[bi] + 1;
+                continue;
+            }
+            if (vHasMiss && vCol.IsMissing(r)) { continue; }
+            double v = vIsFloat ? vNums[r] : (vIsInt ? (double)vInts[r] : vCol.GetDouble(r));
+            int c = bCnt[bi];
+            if (agg == Agg.Sum || agg == Agg.Avg) {
+                bAcc[bi] = bAcc[bi] + v;
+            } else if (c == 0) {
+                bAcc[bi] = v;
+            } else if (agg == Agg.Max) {
+                if (v > bAcc[bi]) { bAcc[bi] = v; }
+            } else {
+                if (v < bAcc[bi]) { bAcc[bi] = v; }
+            }
+            bCnt[bi] = c + 1;
         }
+
+        int nBuckets = bKeys.Count;
+        DataFrame outp = new DataFrame();
+        DataCol outT = DataCol.Create(timeCol, ColKind.Int);
+        DataCol outV = DataCol.Create(valueCol, ColKind.Float);
+        outT.Reserve(nBuckets);
+        outV.Reserve(nBuckets);
+        List<long> outTInts = outT.ints;
+        List<double> outVNums = outV.nums;
+        if (sorted) {
+            for (int i = 0; i < nBuckets; i = i + 1) {
+                outTInts.Add(bKeys[i]);
+                int c = bCnt[i];
+                if (agg == Agg.Count) { outVNums.Add((double)c); }
+                else if (c == 0) { outVNums.Add(0.0); }
+                else if (agg == Agg.Avg) { outVNums.Add(bAcc[i] / (double)c); }
+                else { outVNums.Add(bAcc[i]); }
+            }
+        } else {
+            List<int> order = new List<int>();
+            order.Reserve(nBuckets);
+            for (int i = 0; i < nBuckets; i = i + 1) { order.Add(i); }
+            order.Sort((int a, int b) => {
+                long ka = bKeys[a];
+                long kb = bKeys[b];
+                if (ka < kb) { return 0 - 1; }
+                if (ka > kb) { return 1; }
+                return 0;
+            });
+            for (int i = 0; i < nBuckets; i = i + 1) {
+                int idx = order[i];
+                outTInts.Add(bKeys[idx]);
+                int c = bCnt[idx];
+                if (agg == Agg.Count) { outVNums.Add((double)c); }
+                else if (c == 0) { outVNums.Add(0.0); }
+                else if (agg == Agg.Avg) { outVNums.Add(bAcc[idx] / (double)c); }
+                else { outVNums.Add(bAcc[idx]); }
+            }
+        }
+        outp.cols.Add(outT);
+        outp.cols.Add(outV);
+        outp.rowCount = nBuckets;
         return outp;
     }
 

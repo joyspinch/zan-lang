@@ -1,0 +1,419 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Data;
+using System.Xml;
+using System.Json;
+using System.Text;
+using Formats.Yaml;
+using Formats.Cbor;
+
+class OptWave26Core {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            throw new Exception("FAIL: " + msg);
+        }
+    }
+
+    static bool IsMissingAt(DataFrame df, int row, string col) {
+        int idx = df.ColIndex(col);
+        Check(idx >= 0, "missing col: " + col);
+        return df.cols[idx].IsMissing(row);
+    }
+
+    static int HexVal(int c) {
+        if (c >= 97) { return c - 87; }
+        if (c >= 65) { return c - 55; }
+        return c - 48;
+    }
+
+    static byte[] FromHex(string s) {
+        int n = s.Length / 2;
+        byte[] b = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            int hi = HexVal(s[i * 2] & 255);
+            int lo = HexVal(s[i * 2 + 1] & 255);
+            b[i] = (byte)((hi << 4) | lo);
+        }
+        return b;
+    }
+
+    static long FnvBytes(byte[] data) {
+        long h = -3750763034362895579L;
+        for (int i = 0; i < data.Length; i = i + 1) {
+            h = (h ^ (long)(data[i] & 255)) * 1099511628211L;
+        }
+        return h;
+    }
+
+    static void TestDataFrame() {
+        // 1. Unstack: sparse cells, duplicate overwrite, multi-id columns
+        string csv = "k1,k2,metric,val\n"
+            + "a,1,cpu,10.5\n"
+            + "a,1,mem,20.0\n"
+            + "a,1,cpu,15.5\n"
+            + "b,2,mem,40.0\n"
+            + "a,2,cpu,5.0\n";
+        DataFrame df = DataFrame.FromCsv(csv);
+        DataFrame wide = Reshape.Unstack(df, "metric", "val");
+        Check(wide.Rows() == 3, "unstack rows");
+        Check(wide.ColCount() == 4, "unstack cols");
+        Check(wide.GetFloat(0, "metric_cpu") == 15.5, "unstack dup overwrite");
+        Check(wide.GetFloat(0, "metric_mem") == 20.0, "unstack mem row0");
+        Check(IsMissingAt(wide, 1, "metric_cpu"), "unstack sparse null cpu");
+        Check(wide.GetFloat(1, "metric_mem") == 40.0, "unstack mem row1");
+        Check(wide.GetFloat(2, "metric_cpu") == 5.0, "unstack cpu row2");
+        Check(IsMissingAt(wide, 2, "metric_mem"), "unstack sparse null mem");
+
+        // 2. ResampleBy: unsorted timestamps & all Agg modes
+        long t0 = 1704067200L; // 2024-01-01 00:00:00 UTC
+        string tsCsv = "ts,v\n"
+            + Convert.ToString(t0 + 90000L) + ",30.0\n"
+            + Convert.ToString(t0 + 100L) + ",10.0\n"
+            + Convert.ToString(t0 + 86500L) + ",50.0\n"
+            + Convert.ToString(t0 + 200L) + ",20.0\n";
+        DataFrame tsDf = DataFrame.FromCsv(tsCsv);
+        DataFrame rSum = Resample.ResampleBy(tsDf, "ts", "v", Freq.Day, Agg.Sum);
+        Check(rSum.Rows() == 2, "resample day buckets");
+        Check(rSum.GetFloat(0, "v") == 30.0, "resample day0 sum");
+        Check(rSum.GetFloat(1, "v") == 80.0, "resample day1 sum");
+        DataFrame rAvg = Resample.ResampleBy(tsDf, "ts", "v", Freq.Day, Agg.Avg);
+        Check(rAvg.GetFloat(0, "v") == 15.0, "resample day0 avg");
+        Check(rAvg.GetFloat(1, "v") == 40.0, "resample day1 avg");
+        DataFrame rMin = Resample.ResampleBy(tsDf, "ts", "v", Freq.Day, Agg.Min);
+        Check(rMin.GetFloat(0, "v") == 10.0 && rMin.GetFloat(1, "v") == 30.0, "resample min");
+        DataFrame rMax = Resample.ResampleBy(tsDf, "ts", "v", Freq.Day, Agg.Max);
+        Check(rMax.GetFloat(0, "v") == 20.0 && rMax.GetFloat(1, "v") == 50.0, "resample max");
+        DataFrame rCnt = Resample.ResampleBy(tsDf, "ts", "v", Freq.Day, Agg.Count);
+        Check(rCnt.GetFloat(0, "v") == 2.0 && rCnt.GetFloat(1, "v") == 2.0, "resample count");
+
+        // 3. MergeTables (Inner/Left/Right/Outer) + DataFrame.Join with duplicate keys in ascending order
+        DataFrame left = DataFrame.FromCsv("id,lval\n1,L1\n2,L2\n3,L3\n");
+        DataFrame right = DataFrame.FromCsv("id,rval,rnum\n2,R2a,20\n2,R2b,21\n4,R4,40\n");
+        List<string> on = new List<string>();
+        on.Add("id");
+
+        DataFrame inner = Merge.MergeTables(left, right, on, on, MergeKind.Inner);
+        Check(inner.Rows() == 2, "merge inner rows");
+        Check(inner.GetStr(0, "rval") == "R2a" && inner.GetStr(1, "rval") == "R2b", "merge inner order");
+
+        DataFrame mLeft = Merge.MergeTables(left, right, on, on, MergeKind.Left);
+        Check(mLeft.Rows() == 4, "merge left rows");
+        Check(mLeft.GetStr(0, "rval") == "" && IsMissingAt(mLeft, 0, "rnum")
+            && mLeft.GetStr(1, "rval") == "R2a" && mLeft.GetInt(1, "rnum") == 20
+            && mLeft.GetStr(2, "rval") == "R2b" && mLeft.GetInt(2, "rnum") == 21
+            && mLeft.GetStr(3, "rval") == "" && IsMissingAt(mLeft, 3, "rnum"), "merge left vals");
+
+        DataFrame mRight = Merge.MergeTables(left, right, on, on, MergeKind.Right);
+        Check(mRight.Rows() == 3, "merge right rows");
+        Check(mRight.GetStr(0, "lval") == "L2" && mRight.GetStr(1, "lval") == "L2"
+            && mRight.GetStr(2, "lval") == "" && mRight.GetStr(2, "rval") == "R4", "merge right vals");
+
+        DataFrame mOuter = Merge.MergeTables(left, right, on, on, MergeKind.Outer);
+        Check(mOuter.Rows() == 5, "merge outer rows");
+        Check(mOuter.GetStr(4, "lval") == "" && mOuter.GetInt(4, "id") == 4
+            && mOuter.GetStr(4, "rval") == "R4" && mOuter.GetInt(4, "rnum") == 40, "merge outer fallback key");
+
+        DataFrame joined = left.Join(right, "id", "id");
+        Check(joined.Rows() == 2, "df join rows");
+        Check(joined.GetStr(0, "rval") == "R2a" && joined.GetStr(1, "rval") == "R2b", "df join order");
+        Console.WriteLine("dataframe=ok");
+    }
+
+    static void TestZstd() {
+        string h = "28b52ffda0401f0200044a00ca66a80f0f807b50fa43e90f7566e6c30ccc105cf500f500f500aeb1a5123aa690210278"
+            + "6f5e9d32c2e71a5b2aa1630a192280f7e6d529237caeb1a5123aa6902102786f5e9d32c2e71a5b2aa1630a192280f7e6"
+            + "d529237caeb1a5123aa6902102786f5e9d32c2e71a5b2aa1630a192280f7e6d529237caeb1a5123aa6902102786f5e9d"
+            + "32c2e71a5b2aa1630a192280f7e6d529237caeb1a5123aa6902102786f5e9d32c2e71a5b2aa1630a192280f7e6d52923"
+            + "7caeb1a5123aa6902102786f5e9d32c2e71a5b2aa1630a192280f7e6d529237caeb1a5123aa6902102786f5e9d32c2e7"
+            + "1a5b2aa1630a192280f7e6d529237caeb1a5123aa6902102786f5e9d32c2e71a5b2aa1630a192280f7e6d5091d53c810"
+            + "01bc37af4e19e1738d2d95d031850c11c07bf3ea94113ed7d852091d53c81001bc37af4e19e1738d2d95d031850c11c0"
+            + "7bf3ea94113ed7d852091d53c81001bc37af4e19e1738d2d95d031850c11c07bf3ea94113ed7d852091d53c81001bc37"
+            + "af4e19e1738d2d95d031850c11c07bf3ea94113ed7d852091d53c81001bc37af4e19e1738d2d95d031850c11c07bf3ea"
+            + "94113ed7d852091d53c81001bc37af4e19e1738d2d95d031850c11c07bf3ea94113ed7d852091d53c81001bc37af4e19"
+            + "e1738d2d95d031850c11c07bf3ea94113ed7d852091d53c81001bc37af4e19e1738d2d95d031850c11c07bf3ea9411be"
+            + "648800de9b57a78cf0b9c6964ae898428608e0bd7975ca089f6b6ca9848e29648800de9b57a78cf0b9c6964ae8984286"
+            + "08e0bd7975ca089f6b6ca9848e29648800de9b57a78cf0b9c6964ae898428608e0bd7975ca089f6b6ca9848e29648800"
+            + "de9b57a78cf0b9c6964ae898428608e0bd7975ca089f6b6ca9848e29648800de9b57a78cf0b9c6964ae898428608e0bd"
+            + "7975ca089f6b6ca9848e29648800de9b57a78cf0b9c6964ae898428608e0bd7975ca089f6b6ca9848e29648800de9b57"
+            + "a78cf0b9c6964ae898428608e0bd7975ca089f6b6ca9848e29648800de9b57a78cf0b9c6964ae898428608e0bd7975ca"
+            + "089f6b6ca9efcdab5346f85c634b25744c214304f0debc3a6584cf35b65442c714324400efcdab5346f85c634b25744c"
+            + "214304f0debc3a6584cf35b65442c714324400efcdab5346f85c634b25744c214304f0debc3a6584cf35b65442c71432"
+            + "4400efcdab5346f85c634b25744c214304f0debc3a6584cf35b65442c714324400efcdab5346f85c634b25744c214304"
+            + "f0debc3a6584cf35b65442c714324400efcdab5346f85c634b25744c214304f0debc3a6584cf35b65442c714324400ef"
+            + "cdab5346f85c634b25744c214304f0debc3a6584cf35b65442c714324400efcdab5346f85c634b25744c214304f0debc"
+            + "3a6584cf35b65442c794866c6801e33f0613f08f40c0ff7790c060703431da1f903482d600abd748dbb7ef2fde76dd70"
+            + "08e2742f8733b1f42f60f331f244443ab432c522764c23817c7b6b4da586853dd82b78f16d2e61699e19587eede2c2dd"
+            + "750cd7042d7f96d95d98ef8628b1ce62ae98c1cdc27403e0837690c9efc9e7f3acb12b83ff92ed0034e3212796eb4689"
+            + "d3b570e5f53d5c9ee01cded648528921ceddaebd9c7f3569948860a32eb9a61c50c79e4a8a14b669802b8ae9090bb458"
+            + "6b05c81c3c25c6b111a39a881466fb0b96477f749c0069c2d377612885994c742dfddc696699d2ced6e171c65a6fc688"
+            + "45328ce4cba7b3d19a05419a5ad35e452bbda63c193656a87865d5a0a259977906a52153f22f972893222cd298d18b69"
+            + "bbd4b413720b9af734de300f06783dd6bc00aedd4fae1b35868f3882adf9c39e7b571e3da86681413a586889f2fb1956"
+            + "7ddde839a84b48a8516edbfd12f031f10e4c853ed3fb94ca733d9f699ee2964a0d971c0a64906b0fdd9ef2df070a2e35"
+            + "a70b2ddb0789693517473605f9cd46968aec88e296c1273b2e308f8651fa1f3d384b162fb32015da3f49793f4208dba4"
+            + "f8e6560a665b61421abe393e441da93988c603bc347b05c38fe8963ab2e84ee05790a32d1e0f265b2bef365745ca710b"
+            + "a183dc00ac0bd2aee2b9c6d90fb1d6a54958e512c489512bf33331889c6f6a17ac807a55e9c9c48c2942a0bd2b901fc0"
+            + "225466c4b3d0050be3d021b8876e9cf1d9cae64ea2ff51dd3d1acf13d8fd102f7770c214835904a7e4d00d304fb428bf"
+            + "c4f7a996004c39a1ac1242ba982340fee633db07ba8c869d42183dc971c01f2f7210bbb81dd555ffa55752ae9764c852"
+            + "dfe15222d0240fc003b8c626b12486ec52e8d84af8998ae2ce282f20f871026836bcfb66cdb661c12ff832726cc9dfde"
+            + "5c112b2caf141aaa8fe631a463b1fbc1db2eac02a72ade43a0d90c7fcf90a886ea97584b0e81e9b1d158ef9e06086740"
+            + "eea98c92816a80d711f0553fbd58c8ca9b7f41d3ad3ae01c0232cda706d4a7d49767a414f116e4a10d604b802b95a2b0"
+            + "1c66ea5fd4117c5228f2e0121de0061058c6359e9dabfcedd3ee3489a53d6309209d98f98fa0f072fbe399e732053784"
+            + "23453ebd66644aa77949b2a2acf6a04906c8deefa7f3bd02064c64c6dfd9774178a5ef764eb4c71a3639ae31baf864a1"
+            + "f3143b1100996bcc90be65d3a8c1edfc2258b598c4fc2be4d219fb717439e9937e870bc73a537800685a0193f6d47775"
+            + "862260d6333a6b72036ca4a482a67558270819edd21d44f8e377132a73a4abf17b46414518d2197e5ef9a7cc58207b1e"
+            + "23ce3f0282a278a7295c73a2d6fa5308fc03dc6a8b5f83b9f5154ca15611216db06279268d2e88e06f8972bfe4438d01"
+            + "8b4a211d25208ba03e81e178e2c711520002cbfc5fb2cb64d822d3359948723c9fdb72153b4594e1b9e988f29f5f2e4a"
+            + "bab239029af90a1110a12e57202fb1ec1ada649fbe193aa44f385085a3d90beba98f824f4b9e171712c4c897d3264188"
+            + "cba8e5b2a9ca122e1cc686549c850e61cbd0f8e364a002cc39d131b872a46dd2671bd87fd6d4a06602b0b90e287c6449"
+            + "1ffc238a78db49d949210ada0d49297f992a311859ae93747d3bee9266eb3e147d733c46ce198366018a42a74400f12a"
+            + "e48a27b74211a6d3e82125df6c70824a03271e802990e42dab2a8d96ebbfd34bc286cb84f5b981cd83806f722b8c884a"
+            + "bba882375ed2e4107bfacef74b4518ef514a9b036b2b93d873a00452175071ccd0540c82e8695d0dfd004dbef65c2c8b"
+            + "f02bf296910d6b82d21a322582061076964ce8e34425d2e0121fc7df15ef85f0593aa71db328164a258dd2176f4824d7"
+            + "f3894a711e292b9a043635161a6be82ac4fd086911c97b679ab1eb0a05050043871131c618638c31c6186384cf35b654"
+            + "42c714324400efcdab5346f85c634b25744c214304f0debc3a6584cf35b65442c714324400efcdab5346f85c634b2574"
+            + "4c214304f0debc1a655c0100794eeb619a3058b772ae4e441fde3242c2ef99944f95bd5e6d1e949e6f8d8bb8bac15303"
+            + "dc39b8caaed8bdef5ecfa60687a54546cb4de6e72319891fb4302000a3328e2d523191c6812e64b802b12954c2594e";
+        byte[] o1 = Zstd.Decompress(FromHex(h));
+        Check(o1.Length == 139072 && FnvBytes(o1) == -145882950326387635L, "zstd 4-stream huff+seq length+fnv");
+        byte[] o2 = Zstd.Decompress(FromHex("28b52ffd609203850100740248656c6c6f2c207a73746421205a616e2e494f20636f6d7072657373696f6e206c617965722e2001004743fdea09"));
+        Check(o2.Length == 1170 && FnvBytes(o2) == -1010452698360265067L, "zstd text length+fnv");
+        bool badThrown = false;
+        try {
+            byte[] bad = FromHex("28b52ffd609203850100");
+            Zstd.Decompress(bad);
+        } catch (Exception ex) {
+            badThrown = true;
+        }
+        Check(badThrown, "zstd truncated throws");
+        Console.WriteLine("zstd=ok");
+    }
+
+    static void TestBZip2() {
+        int[] v = new int[]{
+            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 236, 48, 137, 148, 0, 0,
+            178, 127, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 192, 1, 188, 0, 9, 48, 0, 76, 0, 4, 192, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 152, 0, 38, 0, 2, 96,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 76, 0, 19, 0,
+            1, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 207, 253,
+            85, 80, 147, 196, 200, 101, 60, 166, 26, 0, 6, 154, 105, 48, 152, 3,
+            77, 1, 48, 201, 48, 38, 140, 76, 153, 49, 160, 152, 9, 154, 52, 4,
+            97, 48, 64, 50, 97, 48, 134, 76, 141, 24, 141, 49, 52, 49, 26, 122,
+            153, 48, 38, 76, 8, 196, 97, 49, 25, 49, 52, 48, 4, 201, 164, 82,
+            17, 10, 134, 78, 30, 2, 29, 16, 137, 78, 82, 72, 180, 194, 97, 223,
+            79, 17, 136, 215, 130, 142, 71, 188, 36, 245, 62, 79, 212, 4, 130, 130,
+            161, 40, 106, 34, 138, 163, 40, 234, 66, 146, 165, 48, 105, 4, 179, 10,
+            145, 83, 146, 74, 122, 77, 80, 120, 106, 138, 204, 169, 164, 85, 71, 136,
+            170, 171, 106, 186, 176, 172, 171, 72, 245, 109, 14, 174, 43, 169, 69, 121,
+            42, 175, 172, 9, 117, 137, 99, 89, 30, 42, 202, 179, 40, 40, 32, 238,
+            165, 16, 176, 45, 8, 72, 18, 169, 100, 138, 93, 110, 66, 60, 100, 108,
+            9, 53, 169, 107, 91, 22, 213, 197, 111, 69, 60, 117, 193, 228, 60, 148,
+            146, 226, 137, 92, 151, 55, 148, 186, 46, 175, 45, 118, 81, 23, 119, 152,
+            188, 47, 43, 210, 97, 123, 76, 162, 19, 43, 242, 148, 139, 121, 169, 101,
+            253, 231, 48, 203, 202, 158, 181, 48, 76, 27, 8, 196, 49, 172, 51, 14,
+            178, 166, 80, 201, 218, 62, 4, 90, 120, 154, 71, 35, 152, 148, 58, 37,
+            14, 134, 69, 39, 105, 164, 250, 4, 42, 126, 156, 164, 17, 8, 68, 50,
+            112, 157, 49, 76, 91, 24, 140, 99, 83, 214, 57, 143, 121, 239, 65, 144,
+            100, 89, 38, 77, 232, 178, 140, 171, 44, 203, 179, 15, 73, 233, 189, 71,
+            170, 245, 158, 187, 216, 102, 89, 167, 178, 205, 179, 140, 235, 60, 246, 153,
+            246, 129, 161, 104, 158, 219, 220, 123, 173, 27, 72, 247, 154, 86, 153, 239,
+            190, 6, 157, 240, 190, 38, 161, 169, 106, 159, 27, 228, 106, 223, 43, 88,
+            214, 181, 207, 153, 175, 124, 239, 161, 244, 182, 13, 139, 100, 250, 159, 91,
+            102, 251, 19, 111, 181, 180, 109, 95, 115, 108, 219, 183, 13, 203, 116, 221,
+            190, 246, 241, 189, 126, 13, 243, 126, 224, 56, 46, 19, 134, 252, 95, 147,
+            136, 226, 184, 207, 205, 250, 56, 238, 67, 146, 229, 63, 87, 45, 204, 115,
+            95, 179, 247, 115, 156, 247, 240, 232, 58, 46, 147, 249, 116, 223, 211, 251,
+            127, 142, 163, 170, 235, 58, 238, 195, 178, 237, 59, 110, 227, 253, 108, 157,
+            214, 205, 222, 127, 206, 250, 109, 4, 27, 135, 254, 46, 228, 138, 112, 161,
+            33, 216, 97, 19, 40
+        };
+        byte[] comp = new byte[v.Length];
+        for (int i = 0; i < v.Length; i = i + 1) { comp[i] = (byte)(v[i] & 255); }
+        byte[] plain = BZip2.Decompress(comp);
+        Check(plain != null && plain.Length == 2025, "bzip2 plain length");
+        comp[10] = (byte)((comp[10] ^ 1) & 255);
+        Check(BZip2.Decompress(comp) == null, "bzip2 bad crc returns null");
+        Console.WriteLine("bzip2=ok");
+    }
+
+    static void TestLz4() {
+        // Test empty, tiny (<16), medium compressible (hashLog 8/10/12/14/16), RLE overlap, and incompressible
+        int[] sizes = new int[]{ 0, 1, 7, 15, 16, 128, 1024, 8192, 65536 };
+        for (int s = 0; s < sizes.Length; s = s + 1) {
+            int n = sizes[s];
+            byte[] src = new byte[n];
+            for (int i = 0; i < n; i = i + 1) {
+                src[i] = (byte)(((i / 4) + (i % 7) * 13) & 255);
+            }
+            byte[] comp = Lz4Block.Encode(src, 3);
+            byte[] dec = Lz4Block.Decode(comp, 0, comp.Length, n);
+            Check(dec.Length == n && FnvBytes(dec) == FnvBytes(src), "lz4 compressible size=" + Convert.ToString(n));
+        }
+
+        // Overlapping short-offset RLE matches (offsets 1, 2, 3)
+        byte[] rle = new byte[4096];
+        for (int i = 0; i < 1024; i = i + 1) { rle[i] = 65; }
+        for (int i = 1024; i < 2048; i = i + 1) { rle[i] = (byte)(66 + (i & 1)); }
+        for (int i = 2048; i < 4096; i = i + 1) { rle[i] = (byte)(70 + (i % 3)); }
+        byte[] rleComp = Lz4Block.Encode(rle, 5);
+        byte[] rleDec = Lz4Block.Decode(rleComp, 0, rleComp.Length, rle.Length);
+        Check(FnvBytes(rleDec) == FnvBytes(rle), "lz4 overlapping rle");
+
+        // Incompressible pseudo-random payload (triggers miss acceleration)
+        byte[] rnd = new byte[32768];
+        uint seed = 2463534242U;
+        for (int i = 0; i < rnd.Length; i = i + 1) {
+            seed = seed ^ (seed << 13);
+            seed = seed ^ (seed >> 17);
+            seed = seed ^ (seed << 5);
+            rnd[i] = (byte)(seed & 255U);
+        }
+        byte[] rndComp = Lz4Block.Encode(rnd, 3);
+        byte[] rndDec = Lz4Block.Decode(rndComp, 0, rndComp.Length, rnd.Length);
+        Check(FnvBytes(rndDec) == FnvBytes(rnd), "lz4 incompressible");
+        Console.WriteLine("lz4=ok");
+    }
+
+    static void TestXml() {
+        string xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+            + "<!-- top comment -->\r\n"
+            + "<ns:root xmlns:ns=\"urn:test\" ns:ver=\"1.0\" attr=\"a&amp;b&lt;c&gt;&quot;d&#39;\">\r\n"
+            + "  <ns:item id=\"1\">\r\n"
+            + "    <ns:name>Alpha &amp; &#65;&#x42;</ns:name>\r\n"
+            + "    <ns:raw><![CDATA[plain text without bracket]]></ns:raw>\r\n"
+            + "    <ns:edge><![CDATA[has ]]]]><![CDATA[> split ]] end]]></ns:edge>\r\n"
+            + "  </ns:item>\r\n"
+            + "  <ns:item id=\"2\">\r\n"
+            + "    <ns:name>Beta</ns:name>\r\n"
+            + "  </ns:item>\r\n"
+            + "</ns:root>\r\n";
+        XmlDocument doc = XmlDocument.Parse(xml);
+        XmlNode root = doc.RootElement();
+        Check(root != null, "xml root non-null");
+        Check(root.LocalName() == "root", "xml root local");
+        Check(root.Attr("ver") == "1.0", "xml attr local fallback");
+        Check(root.Attr("ns:ver") == "1.0", "xml attr exact");
+        Check(root.Attr("attr") == "a&b<c>\"d'", "xml attr entities");
+        List<XmlNode> items = root.Elements("item");
+        Check(items.Count == 2, "xml local Elements count");
+        XmlNode nName = items[0].Element("name");
+        XmlNode nRaw = items[0].Element("raw");
+        XmlNode nEdge = items[0].Element("edge");
+        Check(nName != null && nName.InnerText() == "Alpha & AB", "xml entity decode");
+        Check(nRaw != null && nRaw.InnerText() == "plain text without bracket", "xml cdata fastpath");
+        Check(nEdge != null && nEdge.InnerText() == "has ]]> split ]] end", "xml cdata split");
+
+        string compact = doc.ToXml();
+        XmlDocument doc2 = XmlDocument.Parse(compact);
+        XmlNode r2 = doc2.RootElement();
+        Check(r2 != null, "xml roundtrip root");
+        XmlNode e2 = r2.Elements("item")[0].Element("edge");
+        Check(e2 != null && e2.InnerText() == "has ]]> split ]] end", "xml compact roundtrip");
+
+        // Deep nesting (> 16 levels -> > 32 spaces indent)
+        XmlDocument deep = new XmlDocument();
+        XmlNode cur = XmlNode.NewElement("d0");
+        deep.children.Add(cur);
+        for (int i = 1; i <= 20; i = i + 1) {
+            XmlNode nxt = XmlNode.NewElement("d" + Convert.ToString(i));
+            cur.AddChild(nxt);
+            cur = nxt;
+        }
+        cur.AddText("leaf");
+        string pretty = deep.ToPrettyXml();
+        XmlDocument deep2 = XmlDocument.Parse(pretty);
+        XmlNode dr2 = deep2.RootElement();
+        Check(dr2 != null && dr2.InnerText().IndexOf("leaf") >= 0, "xml deep pretty roundtrip");
+        Console.WriteLine("xml=ok");
+    }
+
+    static JsonValue MustGet(JsonValue obj, string key) {
+        JsonValue v = obj.Get(key);
+        Check(v != null, "missing key: " + key);
+        return v;
+    }
+
+    static void TestYamlAndCbor() {
+        string yml = "defaults: &def\n"
+            + "  enabled: true\n"
+            + "  disabled: false\n"
+            + "  empty: null\n"
+            + "  tilde: ~\n"
+            + "items:\n"
+            + "  - name: first # inline comment\n"
+            + "    dec: -42\n"
+            + "    hex: 0x2a\n"
+            + "    oct: 0o52\n"
+            + "    big: 99999999999999999999999\n"
+            + "    flt: 3.14\n"
+            + "    dq: \"line1\\nline2\"\n"
+            + "    sq: 'it''s ok'\n"
+            + "    lit: |-\n"
+            + "      a\n"
+            + "      b\n"
+            + "    fld: >\n"
+            + "      hello\n"
+            + "      world\n"
+            + "    flow: [1, 2, 3]\n"
+            + "    ref: *def\n"
+            + "  - name: second\n"
+            + "    dec: 100\n";
+        JsonValue doc = Yaml.Parse(yml);
+        JsonValue items = MustGet(doc, "items");
+        Check(items.Count() == 2, "yaml items count");
+        JsonValue i0 = items.At(0);
+        Check(i0 != null, "yaml i0");
+        Check(MustGet(i0, "name").AsString("") == "first", "yaml inline comment strip");
+        Check(MustGet(i0, "dec").AsInt(0) == -42, "yaml neg int");
+        Check(MustGet(i0, "hex").AsInt(0) == 42, "yaml hex int");
+        Check(MustGet(i0, "oct").AsInt(0) == 42, "yaml oct int");
+        Check(MustGet(i0, "big").AsString("") == "99999999999999999999999", "yaml overflow str");
+        Check(MustGet(i0, "dq").AsString("") == "line1\nline2", "yaml double quote");
+        Check(MustGet(i0, "sq").AsString("") == "it's ok", "yaml single quote");
+        Check(MustGet(i0, "lit").AsString("") == "a\nb", "yaml literal strip");
+        Check(MustGet(i0, "fld").AsString("") == "hello world\n", "yaml folded clip");
+        Check(MustGet(i0, "flow").Count() == 3, "yaml flow seq");
+        JsonValue rdef = MustGet(i0, "ref");
+        Check(MustGet(rdef, "enabled").AsBool(false) && !MustGet(rdef, "disabled").AsBool(true)
+            && MustGet(rdef, "empty").IsNull() && MustGet(rdef, "tilde").IsNull(), "yaml alias & types");
+        JsonValue i1 = items.At(1);
+        Check(i1 != null && MustGet(i1, "name").AsString("") == "second"
+            && MustGet(i1, "dec").AsInt(0) == 100, "yaml cached keys");
+
+        // CBOR roundtrip + indefinite-length text/byte strings
+        byte[] enc = Cbor.Encode(doc);
+        JsonValue dec = Cbor.Decode(enc);
+        JsonValue decItems = MustGet(dec, "items");
+        Check(decItems.Count() == 2, "cbor roundtrip count");
+        JsonValue d0 = decItems.At(0);
+        JsonValue d1 = decItems.At(1);
+        Check(d0 != null && d1 != null && MustGet(d0, "dec").AsInt(0) == -42
+            && MustGet(d1, "name").AsString("") == "second", "cbor roundtrip values");
+
+        // Indefinite-length text string (0x7f, "hi", "!", 0xff)
+        byte[] indefTxt = FromHex("7f6268696121ff");
+        JsonValue tVal = Cbor.Decode(indefTxt);
+        Check(tVal.AsString("") == "hi!", "cbor indef text chunks");
+
+        // Indefinite-length byte string (0x5f, "AB", "C", 0xff -> decoded as UTF-8 "ABC")
+        byte[] indefBytes = FromHex("5f4241424143ff");
+        JsonValue bVal = Cbor.Decode(indefBytes);
+        Check(bVal.AsString("") == "ABC", "cbor indef bytes chunks");
+        Console.WriteLine("yaml_cbor=ok");
+    }
+
+    public static void Main() {
+        TestDataFrame();
+        TestZstd();
+        TestBZip2();
+        TestLz4();
+        TestXml();
+        TestYamlAndCbor();
+        Console.WriteLine("ALL_WAVE26_OK");
+    }
+}

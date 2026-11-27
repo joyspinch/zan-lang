@@ -226,41 +226,118 @@ public class Reshape {
         for (int c = 0; c < df.ColCount(); c = c + 1) {
             if (c != keyAt && c != valAt) { idCols.Add(c); }
         }
-        // 键值 → 输出列下标。
+        int totalRows = df.Rows();
+        DataCol keyCol = df.cols[keyAt];
+        DataCol valCol = df.cols[valAt];
+
+        // 单遍键值编码：同时记录每行对应的输出列下标，消除二次 GetStr + Dictionary 查找。
         List<string> keyValues = new List<string>();
         Dictionary<string, int> keyColAt = new Dictionary<string, int>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            string k = df.cols[keyAt].GetStr(r);
-            if (!keyColAt.ContainsKey(k)) {
-                keyColAt[k] = keyValues.Count;
+        int[] rowKeyCol = new int[totalRows];
+        bool keyIsStr = keyCol.kind == ColKind.Str;
+        for (int r = 0; r < totalRows; r = r + 1) {
+            string k = keyIsStr ? keyCol.text[r] : keyCol.GetStr(r);
+            int kc = 0;
+            if (!keyColAt.TryGetValue(k, out kc)) {
+                kc = keyValues.Count;
+                keyColAt[k] = kc;
                 keyValues.Add(k);
             }
+            rowKeyCol[r] = kc;
         }
 
-        DataFrame outp = new DataFrame();
-        for (int i = 0; i < idCols.Count; i = i + 1) {
-            outp.cols.Add(DataCol.Create(df.cols[idCols[i]].Name(), df.cols[idCols[i]].Kind()));
-        }
-        for (int k = 0; k < keyValues.Count; k = k + 1) {
-            outp.cols.Add(DataCol.Create(keyVar + "_" + keyValues[k], ColKind.Float));
-        }
-
-        // id 组合 → 输出行号；同一 id 组合的多行按行序填进不同键列。
-        Dictionary<string, int> rowAt = new Dictionary<string, int>();
-        int totalRows = df.Rows();
-        for (int r = 0; r < totalRows; r = r + 1) {
-            string idKey = Reshape.RowKey(df, r, idCols);
-            int outRow = 0;
-            if (!rowAt.TryGetValue(idKey, out outRow)) {
-                outRow = outp.Rows();
-                outp.AddRow();
-                for (int i = 0; i < idCols.Count; i = i + 1) {
-                    outp.cols[i].PutStr(outRow, df.cols[idCols[i]].GetStr(r));
+        // 单遍行标识分组：单 Str/Int id 列直哈希零 RowKey 拼接；记录代表源行号以便列式 Gather。
+        List<int> firstSrcRow = new List<int>();
+        int[] rowOutIdx = new int[totalRows];
+        int idCount = idCols.Count;
+        if (idCount == 1 && df.cols[idCols[0]].kind == ColKind.Str) {
+            List<string> idText = df.cols[idCols[0]].text;
+            Dictionary<string, int> rowAtS = new Dictionary<string, int>();
+            for (int r = 0; r < totalRows; r = r + 1) {
+                string idKey = idText[r];
+                int outRow = 0;
+                if (!rowAtS.TryGetValue(idKey, out outRow)) {
+                    outRow = firstSrcRow.Count;
+                    rowAtS[idKey] = outRow;
+                    firstSrcRow.Add(r);
                 }
-                rowAt[idKey] = outRow;
+                rowOutIdx[r] = outRow;
             }
-            int kc = keyColAt[df.cols[keyAt].GetStr(r)];
-            outp.cols[idCols.Count + kc].PutDouble(outRow, df.cols[valAt].GetDouble(r));
+        } else if (idCount == 1 && df.cols[idCols[0]].kind == ColKind.Int
+                && df.cols[idCols[0]].missing.Count == 0) {
+            List<long> idInts = df.cols[idCols[0]].ints;
+            Dictionary<long, int> rowAtI = new Dictionary<long, int>();
+            for (int r = 0; r < totalRows; r = r + 1) {
+                long idKey = idInts[r];
+                int outRow = 0;
+                if (!rowAtI.TryGetValue(idKey, out outRow)) {
+                    outRow = firstSrcRow.Count;
+                    rowAtI[idKey] = outRow;
+                    firstSrcRow.Add(r);
+                }
+                rowOutIdx[r] = outRow;
+            }
+        } else {
+            Dictionary<string, int> rowAt = new Dictionary<string, int>();
+            for (int r = 0; r < totalRows; r = r + 1) {
+                string idKey = Reshape.RowKey(df, r, idCols);
+                int outRow = 0;
+                if (!rowAt.TryGetValue(idKey, out outRow)) {
+                    outRow = firstSrcRow.Count;
+                    rowAt[idKey] = outRow;
+                    firstSrcRow.Add(r);
+                }
+                rowOutIdx[r] = outRow;
+            }
+        }
+
+        int outRows = firstSrcRow.Count;
+        int nKeys = keyValues.Count;
+        DataFrame outp = new DataFrame();
+        outp.rowCount = outRows;
+        for (int i = 0; i < idCount; i = i + 1) {
+            DataCol srcId = df.cols[idCols[i]];
+            DataCol dstId = DataCol.Create(srcId.Name(), srcId.Kind());
+            dstId.GatherFromList(srcId, firstSrcRow);
+            outp.cols.Add(dstId);
+        }
+
+        // 扁平值矩阵一次性散射写入，再按列批量物化（消除逐格 AddRow/PutStr/MarkMissing）。
+        int cells = outRows * nKeys;
+        double[] grid = new double[cells];
+        bool[] present = new bool[cells];
+        if (valCol.kind == ColKind.Float) {
+            List<double> vNums = valCol.nums;
+            for (int r = 0; r < totalRows; r = r + 1) {
+                int idx = rowKeyCol[r] * outRows + rowOutIdx[r];
+                grid[idx] = vNums[r];
+                present[idx] = true;
+            }
+        } else if (valCol.kind == ColKind.Int) {
+            List<long> vInts = valCol.ints;
+            for (int r = 0; r < totalRows; r = r + 1) {
+                int idx = rowKeyCol[r] * outRows + rowOutIdx[r];
+                grid[idx] = (double)vInts[r];
+                present[idx] = true;
+            }
+        } else {
+            for (int r = 0; r < totalRows; r = r + 1) {
+                int idx = rowKeyCol[r] * outRows + rowOutIdx[r];
+                grid[idx] = valCol.GetDouble(r);
+                present[idx] = true;
+            }
+        }
+        for (int k = 0; k < nKeys; k = k + 1) {
+            DataCol vc = DataCol.Create(keyVar + "_" + keyValues[k], ColKind.Float);
+            vc.Reserve(outRows);
+            List<double> dn = vc.nums;
+            int colBase = k * outRows;
+            for (int r = 0; r < outRows; r = r + 1) {
+                int idx = colBase + r;
+                dn.Add(grid[idx]);
+                if (!present[idx]) { vc.MarkMissing(r); }
+            }
+            outp.cols.Add(vc);
         }
         return outp;
     }
