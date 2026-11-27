@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Game.Animation;
 using Game.Render3D;
 
 namespace Game.Graphics;
@@ -26,6 +27,34 @@ public static class CanvasGameExtensions {
     [DllImport("zan_game")]
     private static extern int zan_game_draw3d(int surfaceId, int mesh, nint mvp,
     int color, string texture);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_draw3d_ex(int surfaceId, int mesh, nint mvp,
+    nint model, int color, string texture);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_set_blend3d(int enabled, int depthWrite);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_shadow_begin(int surfaceId, int mapSize,
+    nint lightVp);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_shadow_draw(int surfaceId, int mesh,
+    nint model);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_shadow_end(int surfaceId);
+
+    [DllImport("zan_game")]
+    private static extern void zan_game_shadow_clear();
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_set_bones3d(int count, nint matrices16);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_draw3d_skinned(int surfaceId, int mesh, nint mvp,
+    nint model, int color, string texture);
 
     [DllImport("zan_game")]
     private static extern int zan_game_draw3d_batch_begin(int surfaceId);
@@ -195,5 +224,157 @@ public static class CanvasGameExtensions {
     public static int DrawMesh3DBatchEnd(this Canvas c) {
         if (c == null) { return 0; }
         return zan_game_draw3d_batch_end(c.SurfaceId());
+    }
+
+    private static nint cachedModelPtr;
+    private static nint cachedBonesPtr;
+    private static int cachedBonesCap;
+
+    private static void WriteMat4ColumnMajor(nint dst, Mat4 mat) {
+        Span<float> ms = new Span<float>(dst, 16);
+        float[] m = mat.m;
+        ms[0] = m[0];  ms[1] = m[4];  ms[2] = m[8];   ms[3] = m[12];
+        ms[4] = m[1];  ms[5] = m[5];  ms[6] = m[9];   ms[7] = m[13];
+        ms[8] = m[2];  ms[9] = m[6];  ms[10] = m[10]; ms[11] = m[14];
+        ms[12] = m[3]; ms[13] = m[7]; ms[14] = m[11]; ms[15] = m[15];
+    }
+
+    private static void EnsureMatBuffers() {
+        if (cachedMvpPtr == 0) { cachedMvpPtr = NativeMemory.Alloc(64); }
+        if (cachedModelPtr == 0) { cachedModelPtr = NativeMemory.Alloc(64); }
+    }
+
+    // 上传 GPU 蒙皮网格（flags bit1 = 2，16 float/顶点）。
+    public static int MeshUploadSkinned(this Canvas c, SkinnedMesh3D mesh) {
+        if (c == null || mesh == null) { return 0; }
+        int nv = mesh.VertexCount();
+        int ni = mesh.IndexCount();
+        if (nv <= 0 || ni <= 0) { return 0; }
+        int vertBytes = nv * mesh.StrideFloats() * 4;
+        if (vertBytes > meshUploadVertCap) {
+            if (meshUploadVertBuf != 0) { NativeMemory.Free(meshUploadVertBuf); }
+            int newCap = vertBytes < 65536 ? 65536 : vertBytes * 2;
+            meshUploadVertBuf = NativeMemory.Alloc(newCap);
+            meshUploadVertCap = newCap;
+        }
+        mesh.CopyVerticesTo(meshUploadVertBuf);
+
+        int idxBytes = ni * 2;
+        if (idxBytes > meshUploadIdxCap) {
+            if (meshUploadIdxBuf != 0) { NativeMemory.Free(meshUploadIdxBuf); }
+            int newCap = idxBytes < 32768 ? 32768 : idxBytes * 2;
+            meshUploadIdxBuf = NativeMemory.Alloc(newCap);
+            meshUploadIdxCap = newCap;
+        }
+        mesh.CopyIndicesTo(meshUploadIdxBuf);
+
+        return zan_game_mesh_create_ex(c.SurfaceId(), meshUploadVertBuf, nv,
+            meshUploadIdxBuf, ni, 2);
+    }
+
+    // 控制 3D Alpha 混合与深度写入（半透明物体设为 enabled=true, depthWrite=false，画完切回 false, true）。
+    public static int SetBlend3D(this Canvas c, bool enabled, bool depthWrite) {
+        if (c == null) { return 0; }
+        return zan_game_set_blend3d(enabled ? 1 : 0, depthWrite ? 1 : 0);
+    }
+
+    // 扩展 3D 绘制：显式传 model 矩阵以启用 ShadowMap 3x3 PCF 软阴影接收。
+    public static int DrawMesh3DEx(this Canvas c, int mesh, Mat4 mvp, Mat4 model,
+    int color, string texture) {
+        if (c == null || mvp == null || mvp.m == null || mvp.m.Length < 16) { return 0; }
+        EnsureMatBuffers();
+        WriteMat4ColumnMajor(cachedMvpPtr, mvp);
+        nint modelPtr = 0;
+        if (model != null && model.m != null && model.m.Length >= 16) {
+            WriteMat4ColumnMajor(cachedModelPtr, model);
+            modelPtr = cachedModelPtr;
+        }
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d_ex(c.SurfaceId(), mesh, cachedMvpPtr, modelPtr, color, texKey);
+    }
+
+    public static int DrawMesh3DEx(this Canvas c, int mesh, float[] mvpColumnMajor,
+    float[] modelColumnMajor, int color, string texture) {
+        if (c == null || mvpColumnMajor == null || mvpColumnMajor.Length < 16) { return 0; }
+        EnsureMatBuffers();
+        Span<float> ms = new Span<float>(cachedMvpPtr, 16);
+        for (int i = 0; i < 16; i = i + 1) { ms[i] = mvpColumnMajor[i]; }
+        nint modelPtr = 0;
+        if (modelColumnMajor != null && modelColumnMajor.Length >= 16) {
+            Span<float> md = new Span<float>(cachedModelPtr, 16);
+            for (int i = 0; i < 16; i = i + 1) { md[i] = modelColumnMajor[i]; }
+            modelPtr = cachedModelPtr;
+        }
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d_ex(c.SurfaceId(), mesh, cachedMvpPtr, modelPtr, color, texKey);
+    }
+
+    // 开启单方向光 ShadowMap 深度渲染 Pass（mapSize 256..4096）。
+    public static int ShadowBegin(this Canvas c, int mapSize, Mat4 lightVp) {
+        if (c == null || lightVp == null || lightVp.m == null || lightVp.m.Length < 16) { return 0; }
+        EnsureMatBuffers();
+        WriteMat4ColumnMajor(cachedMvpPtr, lightVp);
+        return zan_game_shadow_begin(c.SurfaceId(), mapSize, cachedMvpPtr);
+    }
+
+    public static int ShadowDraw(this Canvas c, int mesh, Mat4 model) {
+        if (c == null || model == null || model.m == null || model.m.Length < 16) { return 0; }
+        EnsureMatBuffers();
+        WriteMat4ColumnMajor(cachedModelPtr, model);
+        return zan_game_shadow_draw(c.SurfaceId(), mesh, cachedModelPtr);
+    }
+
+    public static int ShadowEnd(this Canvas c) {
+        if (c == null) { return 0; }
+        return zan_game_shadow_end(c.SurfaceId());
+    }
+
+    public static void ShadowClear(this Canvas c) {
+        if (c == null) { return; }
+        zan_game_shadow_clear();
+    }
+
+    // 上传当前帧 GPU 骨骼蒙皮矩阵（列主序 float[boneCount * 16]，最多 64 根骨骼）。
+    public static int SetBones3D(this Canvas c, float[] columnMajorMatrices16, int boneCount) {
+        if (c == null || boneCount < 0 || boneCount > 64) { return 0; }
+        if (boneCount == 0) { return zan_game_set_bones3d(0, 0); }
+        if (columnMajorMatrices16 == null || columnMajorMatrices16.Length < boneCount * 16) {
+            return 0;
+        }
+        int bytes = boneCount * 16 * 4;
+        if (bytes > cachedBonesCap) {
+            if (cachedBonesPtr != 0) { NativeMemory.Free(cachedBonesPtr); }
+            int newCap = bytes < 4096 ? 4096 : bytes;
+            cachedBonesPtr = NativeMemory.Alloc(newCap);
+            cachedBonesCap = newCap;
+        }
+        Span<float> dst = new Span<float>(cachedBonesPtr, boneCount * 16);
+        int n = boneCount * 16;
+        for (int i = 0; i < n; i = i + 1) { dst[i] = columnMajorMatrices16[i]; }
+        return zan_game_set_bones3d(boneCount, cachedBonesPtr);
+    }
+
+    // 直接从 Game.Animation.Skeleton 计算蒙皮矩阵并上传至 GPU。
+    public static int SetBones3D(this Canvas c, Skeleton skeleton) {
+        if (c == null || skeleton == null) { return 0; }
+        int count = skeleton.Count();
+        if (count > 64) { count = 64; }
+        float[] mats = SkinnedMesh3D.BuildBoneMatrices(skeleton);
+        return c.SetBones3D(mats, count);
+    }
+
+    // 绘制已上传的 GPU 蒙皮网格（MeshUploadSkinned 返回的句柄）。
+    public static int DrawMesh3DSkinned(this Canvas c, int mesh, Mat4 mvp, Mat4 model,
+    int color, string texture) {
+        if (c == null || mvp == null || mvp.m == null || mvp.m.Length < 16) { return 0; }
+        EnsureMatBuffers();
+        WriteMat4ColumnMajor(cachedMvpPtr, mvp);
+        nint modelPtr = 0;
+        if (model != null && model.m != null && model.m.Length >= 16) {
+            WriteMat4ColumnMajor(cachedModelPtr, model);
+            modelPtr = cachedModelPtr;
+        }
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d_skinned(c.SurfaceId(), mesh, cachedMvpPtr, modelPtr, color, texKey);
     }
 }

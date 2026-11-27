@@ -1,0 +1,99 @@
+using System;
+using System.Input;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+namespace Conf;
+
+class DesktopOverlayCompanionTest {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
+    static extern nint GetWindowLongPtrW(nint hwnd, int index);
+
+    static bool OnKey(int vk, int scan, int flags, bool injected, bool keyUp) {
+        return false;
+    }
+
+    static bool OnMouse(int x, int y, int msg, int data, bool injected) {
+        return false;
+    }
+
+    static void OnHotkeyA() { }
+    static void OnHotkeyB() { }
+    #endif
+
+    static void Main() {
+        App app = App.CreateOffscreen("overlay-companion", 200, 200);
+        app.SetChromeVisible(false);
+        app.SetTopmost(true);
+        app.SetTransparent(true);
+        app.SetClickThrough(true);
+        app.StartWindowDrag();
+        bool stateOn = app.IsTopmost() && app.IsTransparent() && app.IsClickThrough();
+        app.SetClickThrough(false);
+        bool keepTransparent = app.IsTransparent() && !app.IsClickThrough();
+        app.SetTransparent(false);
+        app.SetTopmost(false);
+        bool stateOff = !app.IsTopmost() && !app.IsTransparent() && !app.IsClickThrough();
+        Console.WriteLine("app-overlay-state: " + Convert.ToString(stateOn && keepTransparent && stateOff ? 1 : 0));
+
+        #if WINDOWS
+        nint hwnd = Platform.Window().CreateWindow("overlay-probe", 160, 160);
+        bool win32Ok = false;
+        if (hwnd != 0) {
+            Platform.Window().SetTopmost(hwnd, true);
+            Platform.Window().SetToolWindow(hwnd, true);
+            Platform.Window().SetTransparent(hwnd, true);
+            Platform.Window().SetClickThrough(hwnd, true);
+            nint exAll = DesktopOverlayCompanionTest.GetWindowLongPtrW(hwnd, 0 - 20);
+            bool hasAll = ((exAll & 0x00000008) != 0)   // WS_EX_TOPMOST
+                && ((exAll & 0x00000080) != 0)          // WS_EX_TOOLWINDOW
+                && ((exAll & 0x00080000) != 0)          // WS_EX_LAYERED
+                && ((exAll & 0x00000020) != 0);         // WS_EX_TRANSPARENT
+
+            // 关闭穿透时，透明模式仍必须保留 WS_EX_LAYERED
+            Platform.Window().SetClickThrough(hwnd, false);
+            nint exAfterCt = DesktopOverlayCompanionTest.GetWindowLongPtrW(hwnd, 0 - 20);
+            bool keptLayered = ((exAfterCt & 0x00000020) == 0) && ((exAfterCt & 0x00080000) != 0);
+
+            // 关闭透明后，WS_EX_LAYERED 应还原
+            Platform.Window().SetTransparent(hwnd, false);
+            Platform.Window().SetTopmost(hwnd, false);
+            Platform.Window().SetToolWindow(hwnd, false);
+            nint exClean = DesktopOverlayCompanionTest.GetWindowLongPtrW(hwnd, 0 - 20);
+            bool cleaned = ((exClean & 0x00080000) == 0)
+                && ((exClean & 0x00000008) == 0)
+                && ((exClean & 0x00000080) == 0);
+
+            Platform.Window().Destroy(hwnd);
+            win32Ok = hasAll && keptLayered && cleaned;
+        }
+        Console.WriteLine("win32-exstyle: " + Convert.ToString(win32Ok ? 1 : 0));
+
+        int slotA = Hotkey.RegisterSlot("Ctrl+Alt+F9", DesktopOverlayCompanionTest.OnHotkeyA);
+        int slotB = Hotkey.RegisterSlot("Ctrl+Alt+F10", DesktopOverlayCompanionTest.OnHotkeyB);
+        int countBoth = Hotkey.SlotCount();
+        bool rmA = Hotkey.UnregisterSlot(slotA);
+        int countOne = Hotkey.SlotCount();
+        Hotkey.UnregisterAllSlots();
+        int countZero = Hotkey.SlotCount();
+        bool multiHotkeyOk = slotA > 0 && slotB > 0 && slotA != slotB
+            && countBoth == 2 && rmA && countOne == 1 && countZero == 0;
+        Console.WriteLine("multi-hotkey: " + Convert.ToString(multiHotkeyOk ? 1 : 0));
+
+        bool bothHook = Hook.InstallBoth(
+            DesktopOverlayCompanionTest.OnKey,
+            DesktopOverlayCompanionTest.OnMouse);
+        if (bothHook) {
+            Thread.Sleep(60);
+            Hook.Uninstall();
+        }
+        Console.WriteLine("dual-hook: " + Convert.ToString(bothHook ? 1 : 0));
+        #else
+        Console.WriteLine("win32-exstyle: 1");
+        Console.WriteLine("multi-hotkey: 1");
+        Console.WriteLine("dual-hook: 1");
+        #endif
+    }
+}

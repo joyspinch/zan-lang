@@ -1,0 +1,677 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+namespace System.Net.Sockets;
+
+// KCP 底层发包回调：将编码后的 UDP 数据报写往网络或模拟链路。
+public delegate int KcpOutputFn(byte[] data, int len);
+
+internal class KcpSegment {
+    public int conv;
+    public int cmd;
+    public int frg;
+    public int wnd;
+    public int ts;
+    public int sn;
+    public int una;
+    public int resendTs;
+    public int rto;
+    public int fastAck;
+    public int xmit;
+    public byte[] data;
+    public int len;
+
+    public KcpSegment(int size) {
+        this.data = size > 0 ? new byte[size] : new byte[0];
+        this.len = size;
+    }
+}
+
+// 标准 KCP 可靠低延迟 ARQ 传输会话（兼容标准 24 字节头协议规范）。
+// 纯托管跨平台实现，支持 MTU 分片重组、滑动窗口、快速重传、无延迟模式与自适应 RTO。
+public class KcpSession {
+    public const int CMD_PUSH = 81;
+    public const int CMD_ACK = 82;
+    public const int CMD_WASK = 83;
+    public const int CMD_WINS = 84;
+    public const int OVERHEAD = 24;
+
+    private const int RTO_NDL = 30;
+    private const int RTO_MIN = 100;
+    private const int RTO_DEF = 200;
+    private const int RTO_MAX = 60000;
+    private const int WND_SND = 32;
+    private const int WND_RCV = 128;
+    private const int MTU_DEF = 1400;
+    private const int INTERVAL = 100;
+    private const int PROBE_INIT = 7000;
+    private const int PROBE_LIMIT = 120000;
+    private const int ASK_SEND = 1;
+    private const int ASK_TELL = 2;
+
+    private int conv;
+    private int mtu;
+    private int mss;
+    private int sndUna;
+    private int sndNxt;
+    private int rcvNxt;
+    private int ssthresh;
+    private int rxRttval;
+    private int rxSrtt;
+    private int rxRto;
+    private int rxMinRto;
+    private int sndWnd;
+    private int rcvWnd;
+    private int rmtWnd;
+    private int cwnd;
+    private int probe;
+    private int current;
+    private int interval;
+    private int tsFlush;
+    private int xmit;
+    private int nodelay;
+    private bool updated;
+    private int tsProbe;
+    private int probeWait;
+    private int incr;
+    private int fastResend;
+    private int fastLimit;
+    private bool nocwnd;
+
+    private List<KcpSegment> sndQueue;
+    private List<KcpSegment> rcvQueue;
+    private List<KcpSegment> sndBuf;
+    private List<KcpSegment> rcvBuf;
+    private List<int> ackSn;
+    private List<int> ackTs;
+    private byte[] outBuf;
+    private KcpOutputFn output;
+
+    public KcpSession(int conv, KcpOutputFn outputFn) {
+        this.conv = conv;
+        this.output = outputFn;
+        this.sndWnd = WND_SND;
+        this.rcvWnd = WND_RCV;
+        this.rmtWnd = WND_RCV;
+        this.mtu = MTU_DEF;
+        this.mss = this.mtu - OVERHEAD;
+        this.rxRto = RTO_DEF;
+        this.rxMinRto = RTO_MIN;
+        this.interval = INTERVAL;
+        this.tsFlush = INTERVAL;
+        this.ssthresh = 2;
+        this.fastLimit = 5;
+        this.sndQueue = new List<KcpSegment>();
+        this.rcvQueue = new List<KcpSegment>();
+        this.sndBuf = new List<KcpSegment>();
+        this.rcvBuf = new List<KcpSegment>();
+        this.ackSn = new List<int>();
+        this.ackTs = new List<int>();
+        this.outBuf = new byte[(this.mtu + OVERHEAD) * 3];
+    }
+
+    public int Conv { get { return this.conv; } }
+    public int TotalRetransmits { get { return this.xmit; } }
+    public int RttMs { get { return this.rxSrtt; } }
+
+    public void SetOutput(KcpOutputFn outputFn) { this.output = outputFn; }
+
+    // 快速模式推荐配置：SetNoDelay(1, 10, 2, 1)
+    public void SetNoDelay(int nodelayVal, int intervalMs, int resend, int nc) {
+        if (nodelayVal >= 0) {
+            this.nodelay = nodelayVal;
+            this.rxMinRto = nodelayVal != 0 ? RTO_NDL : RTO_MIN;
+        }
+        if (intervalMs >= 0) {
+            int iv = intervalMs;
+            if (iv > 5000) { iv = 5000; }
+            else if (iv < 10) { iv = 10; }
+            this.interval = iv;
+        }
+        if (resend >= 0) { this.fastResend = resend; }
+        if (nc >= 0) { this.nocwnd = nc != 0; }
+    }
+
+    public void SetWndSize(int snd, int rcv) {
+        if (snd > 0) { this.sndWnd = snd; }
+        if (rcv > 0) { this.rcvWnd = rcv > WND_RCV ? rcv : WND_RCV; }
+    }
+
+    public bool SetMtu(int newMtu) {
+        if (newMtu < 50 || newMtu < OVERHEAD + 16) { return false; }
+        this.mtu = newMtu;
+        this.mss = newMtu - OVERHEAD;
+        this.outBuf = new byte[(this.mtu + OVERHEAD) * 3];
+        return true;
+    }
+
+    public int WaitSnd() {
+        return this.sndBuf.Count + this.sndQueue.Count;
+    }
+
+    // 窥视下一条完整可读消息的字节长度；无完整消息返回 -1。
+    public int PeekSize() {
+        if (this.rcvQueue.Count == 0) { return -1; }
+        KcpSegment head = this.rcvQueue[0];
+        if (head.frg == 0) { return head.len; }
+        if (this.rcvQueue.Count < head.frg + 1) { return -1; }
+        int total = 0;
+        for (int i = 0; i < this.rcvQueue.Count; i = i + 1) {
+            KcpSegment seg = this.rcvQueue[i];
+            total = total + seg.len;
+            if (seg.frg == 0) { break; }
+        }
+        return total;
+    }
+
+    // 发送一条可靠消息（超过 MSS 自动分片，最多 255 片）。成功返回 0，失败返回负数。
+    public int Send(byte[] data, int offset, int len) {
+        if (data == null || len <= 0 || offset < 0 || offset + len > data.Length) {
+            return -1;
+        }
+        int count = len <= this.mss ? 1 : (len + this.mss - 1) / this.mss;
+        if (count >= 255) { return -2; }
+        int pos = offset;
+        int remain = len;
+        for (int i = 0; i < count; i = i + 1) {
+            int size = remain > this.mss ? this.mss : remain;
+            KcpSegment seg = new KcpSegment(size);
+            for (int j = 0; j < size; j = j + 1) {
+                seg.data[j] = data[pos + j];
+            }
+            seg.frg = count - i - 1;
+            this.sndQueue.Add(seg);
+            pos = pos + size;
+            remain = remain - size;
+        }
+        return 0;
+    }
+
+    public int Send(byte[] data) {
+        if (data == null) { return -1; }
+        return this.Send(data, 0, data.Length);
+    }
+
+    // 接收一条完整重组后的可靠消息；无完整消息返回 null。
+    public byte[] Recv() {
+        int peek = this.PeekSize();
+        if (peek < 0) { return null; }
+        bool recover = this.rcvQueue.Count >= this.rcvWnd;
+        byte[] result = new byte[peek];
+        int pos = 0;
+        while (this.rcvQueue.Count > 0) {
+            KcpSegment seg = this.rcvQueue[0];
+            this.rcvQueue.RemoveAt(0);
+            for (int i = 0; i < seg.len; i = i + 1) {
+                result[pos + i] = seg.data[i];
+            }
+            pos = pos + seg.len;
+            if (seg.frg == 0) { break; }
+        }
+        this.MoveRcvBufToQueue();
+        if (this.rcvQueue.Count < this.rcvWnd && recover) {
+            this.probe = this.probe | ASK_TELL;
+        }
+        return result;
+    }
+
+    // 喂入从底层 UDP 收到的原始数据报。成功返回 0，格式或 conv 不符返回负数。
+    public int Input(byte[] packet, int len) {
+        if (packet == null || len < OVERHEAD || len > packet.Length) { return -1; }
+        int prevUna = this.sndUna;
+        int maxAck = 0;
+        bool flag = false;
+        int pos = 0;
+
+        while (len - pos >= OVERHEAD) {
+            int pConv = ReadU32LE(packet, pos);
+            if (pConv != this.conv) { return -2; }
+            int cmd = packet[pos + 4] & 255;
+            int frg = packet[pos + 5] & 255;
+            int wnd = ReadU16LE(packet, pos + 6);
+            int ts = ReadU32LE(packet, pos + 8);
+            int sn = ReadU32LE(packet, pos + 12);
+            int una = ReadU32LE(packet, pos + 16);
+            int segLen = ReadU32LE(packet, pos + 20);
+            pos = pos + OVERHEAD;
+
+            if (segLen < 0 || len - pos < segLen) { return -3; }
+            if (cmd != CMD_PUSH && cmd != CMD_ACK && cmd != CMD_WASK && cmd != CMD_WINS) {
+                return -4;
+            }
+
+            this.rmtWnd = wnd;
+            this.ParseUna(una);
+            this.ShrinkBuf();
+
+            if (cmd == CMD_ACK) {
+                if (TimeDiff(this.current, ts) >= 0) {
+                    this.UpdateAck(TimeDiff(this.current, ts));
+                }
+                this.ParseAck(sn);
+                this.ShrinkBuf();
+                if (!flag) {
+                    flag = true;
+                    maxAck = sn;
+                } else if (TimeDiff(sn, maxAck) > 0) {
+                    maxAck = sn;
+                }
+            } else if (cmd == CMD_PUSH) {
+                if (TimeDiff(sn, this.rcvNxt + this.rcvWnd) < 0) {
+                    this.ackSn.Add(sn);
+                    this.ackTs.Add(ts);
+                    if (TimeDiff(sn, this.rcvNxt) >= 0) {
+                        KcpSegment seg = new KcpSegment(segLen);
+                        seg.conv = pConv;
+                        seg.cmd = cmd;
+                        seg.frg = frg;
+                        seg.wnd = wnd;
+                        seg.ts = ts;
+                        seg.sn = sn;
+                        seg.una = una;
+                        for (int i = 0; i < segLen; i = i + 1) {
+                            seg.data[i] = packet[pos + i];
+                        }
+                        this.ParseData(seg);
+                    }
+                }
+            } else if (cmd == CMD_WASK) {
+                this.probe = this.probe | ASK_TELL;
+            }
+            pos = pos + segLen;
+        }
+
+        if (flag) {
+            this.ParseFastAck(maxAck);
+        }
+
+        if (TimeDiff(this.sndUna, prevUna) > 0) {
+            if (this.cwnd < this.rmtWnd) {
+                int m = this.mss;
+                if (this.cwnd < this.ssthresh) {
+                    this.cwnd = this.cwnd + 1;
+                    this.incr = this.incr + m;
+                } else {
+                    if (this.incr < m) { this.incr = m; }
+                    this.incr = this.incr + (m * m) / this.incr + (m / 16);
+                    if ((this.cwnd + 1) * m <= this.incr) {
+                        this.cwnd = (this.incr + m - 1) / (m > 0 ? m : 1);
+                    }
+                }
+                if (this.cwnd > this.rmtWnd) {
+                    this.cwnd = this.rmtWnd;
+                    this.incr = this.rmtWnd * m;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // 按当前毫秒时钟推进 KCP 状态并在到点时刷出数据包与重传包。
+    public void Update(int nowMs) {
+        this.current = nowMs;
+        if (!this.updated) {
+            this.updated = true;
+            this.tsFlush = this.current;
+        }
+        int slap = TimeDiff(this.current, this.tsFlush);
+        if (slap >= 10000 || slap < -10000) {
+            this.tsFlush = this.current;
+            slap = 0;
+        }
+        if (slap >= 0) {
+            this.tsFlush = this.tsFlush + this.interval;
+            if (TimeDiff(this.current, this.tsFlush) >= 0) {
+                this.tsFlush = this.current + this.interval;
+            }
+            this.Flush();
+        }
+    }
+
+    // 立即刷出待发送的 ACK、窗口探测与数据包/重传包。
+    public void Flush() {
+        if (!this.updated) { return; }
+        int cur = this.current;
+        int wndUnused = this.WndUnused();
+        int bufPos = 0;
+        bool change = false;
+        bool lost = false;
+
+        // 1. 刷出所有 ACK
+        for (int i = 0; i < this.ackSn.Count; i = i + 1) {
+            if (bufPos + OVERHEAD > this.mtu) {
+                this.EmitOutput(bufPos);
+                bufPos = 0;
+            }
+            bufPos = this.EncodeHeader(bufPos, CMD_ACK, 0, wndUnused, this.ackTs[i], this.ackSn[i], this.rcvNxt, 0);
+        }
+        this.ackSn.Clear();
+        this.ackTs.Clear();
+
+        // 2. 远端窗口为 0 时触发窗口探测
+        if (this.rmtWnd == 0) {
+            if (this.probeWait == 0) {
+                this.probeWait = PROBE_INIT;
+                this.tsProbe = cur + this.probeWait;
+            } else if (TimeDiff(cur, this.tsProbe) >= 0) {
+                if (this.probeWait < PROBE_INIT) { this.probeWait = PROBE_INIT; }
+                this.probeWait = this.probeWait + this.probeWait / 2;
+                if (this.probeWait > PROBE_LIMIT) { this.probeWait = PROBE_LIMIT; }
+                this.tsProbe = cur + this.probeWait;
+                this.probe = this.probe | ASK_SEND;
+            }
+        } else {
+            this.tsProbe = 0;
+            this.probeWait = 0;
+        }
+
+        if ((this.probe & ASK_SEND) != 0) {
+            if (bufPos + OVERHEAD > this.mtu) { this.EmitOutput(bufPos); bufPos = 0; }
+            bufPos = this.EncodeHeader(bufPos, CMD_WASK, 0, wndUnused, 0, 0, this.rcvNxt, 0);
+        }
+        if ((this.probe & ASK_TELL) != 0) {
+            if (bufPos + OVERHEAD > this.mtu) { this.EmitOutput(bufPos); bufPos = 0; }
+            bufPos = this.EncodeHeader(bufPos, CMD_WINS, 0, wndUnused, 0, 0, this.rcvNxt, 0);
+        }
+        this.probe = 0;
+
+        // 3. 计算有效发送窗口并将 sndQueue 移入 sndBuf
+        int cwndEff = this.sndWnd < this.rmtWnd ? this.sndWnd : this.rmtWnd;
+        if (!this.nocwnd && this.cwnd < cwndEff) { cwndEff = this.cwnd; }
+        if (cwndEff < 1 && this.rmtWnd > 0) { cwndEff = 1; }
+
+        while (TimeDiff(this.sndNxt, this.sndUna + cwndEff) < 0 && this.sndQueue.Count > 0) {
+            KcpSegment seg = this.sndQueue[0];
+            this.sndQueue.RemoveAt(0);
+            seg.conv = this.conv;
+            seg.cmd = CMD_PUSH;
+            seg.wnd = wndUnused;
+            seg.ts = cur;
+            seg.sn = this.sndNxt;
+            this.sndNxt = this.sndNxt + 1;
+            seg.una = this.rcvNxt;
+            seg.resendTs = cur;
+            seg.rto = this.rxRto;
+            seg.fastAck = 0;
+            seg.xmit = 0;
+            this.sndBuf.Add(seg);
+        }
+
+        int resent = this.fastResend > 0 ? this.fastResend : 0x7FFFFFFF;
+        int rtomin = this.nodelay == 0 ? (this.rxRto >> 3) : 0;
+
+        // 4. 刷出首次发送、超时重传与快速重传的分片
+        for (int i = 0; i < this.sndBuf.Count; i = i + 1) {
+            KcpSegment seg = this.sndBuf[i];
+            bool needSend = false;
+            if (seg.xmit == 0) {
+                needSend = true;
+                seg.xmit = seg.xmit + 1;
+                seg.rto = this.rxRto;
+                seg.resendTs = cur + seg.rto + rtomin;
+            } else if (TimeDiff(cur, seg.resendTs) >= 0) {
+                needSend = true;
+                seg.xmit = seg.xmit + 1;
+                this.xmit = this.xmit + 1;
+                if (this.nodelay == 0) {
+                    seg.rto = seg.rto + (seg.rto > this.rxRto ? seg.rto : this.rxRto);
+                } else {
+                    int step = this.nodelay < 2 ? seg.rto : this.rxRto;
+                    seg.rto = seg.rto + step / 2;
+                }
+                if (seg.rto > RTO_MAX) { seg.rto = RTO_MAX; }
+                seg.resendTs = cur + seg.rto;
+                lost = true;
+            } else if (seg.fastAck >= resent && (seg.xmit <= this.fastLimit || this.fastLimit <= 0)) {
+                needSend = true;
+                seg.xmit = seg.xmit + 1;
+                seg.fastAck = 0;
+                seg.resendTs = cur + seg.rto;
+                change = true;
+            }
+
+            if (needSend) {
+                seg.ts = cur;
+                seg.wnd = wndUnused;
+                seg.una = this.rcvNxt;
+                int need = OVERHEAD + seg.len;
+                if (bufPos + need > this.mtu) {
+                    this.EmitOutput(bufPos);
+                    bufPos = 0;
+                }
+                bufPos = this.EncodeHeader(bufPos, seg.cmd, seg.frg, seg.wnd, seg.ts, seg.sn, seg.una, seg.len);
+                for (int j = 0; j < seg.len; j = j + 1) {
+                    this.outBuf[bufPos + j] = seg.data[j];
+                }
+                bufPos = bufPos + seg.len;
+            }
+        }
+
+        if (bufPos > 0) {
+            this.EmitOutput(bufPos);
+        }
+
+        if (change) {
+            int inflight = this.sndNxt - this.sndUna;
+            this.ssthresh = inflight / 2;
+            if (this.ssthresh < 2) { this.ssthresh = 2; }
+            this.cwnd = this.ssthresh + resent;
+            this.incr = this.cwnd * this.mss;
+        }
+        if (lost) {
+            this.ssthresh = cwndEff / 2;
+            if (this.ssthresh < 2) { this.ssthresh = 2; }
+            this.cwnd = 1;
+            this.incr = this.mss;
+        }
+        if (this.cwnd < 1) {
+            this.cwnd = 1;
+            this.incr = this.mss;
+        }
+    }
+
+    private void EmitOutput(int len) {
+        if (len <= 0 || this.output == null) { return; }
+        byte[] pkt = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { pkt[i] = this.outBuf[i]; }
+        this.output(pkt, len);
+    }
+
+    private int EncodeHeader(int pos, int cmd, int frg, int wnd, int ts, int sn, int una, int len) {
+        WriteU32LE(this.outBuf, pos, this.conv);
+        this.outBuf[pos + 4] = (byte)(cmd & 255);
+        this.outBuf[pos + 5] = (byte)(frg & 255);
+        WriteU16LE(this.outBuf, pos + 6, wnd);
+        WriteU32LE(this.outBuf, pos + 8, ts);
+        WriteU32LE(this.outBuf, pos + 12, sn);
+        WriteU32LE(this.outBuf, pos + 16, una);
+        WriteU32LE(this.outBuf, pos + 20, len);
+        return pos + OVERHEAD;
+    }
+
+    private int WndUnused() {
+        if (this.rcvQueue.Count < this.rcvWnd) {
+            return this.rcvWnd - this.rcvQueue.Count;
+        }
+        return 0;
+    }
+
+    private void UpdateAck(int rtt) {
+        if (this.rxSrtt == 0) {
+            this.rxSrtt = rtt;
+            this.rxRttval = rtt / 2;
+        } else {
+            int delta = rtt - this.rxSrtt;
+            if (delta < 0) { delta = 0 - delta; }
+            this.rxRttval = (3 * this.rxRttval + delta) / 4;
+            this.rxSrtt = (7 * this.rxSrtt + rtt) / 8;
+            if (this.rxSrtt < 1) { this.rxSrtt = 1; }
+        }
+        int rto = this.rxSrtt + (this.interval > 4 * this.rxRttval ? this.interval : 4 * this.rxRttval);
+        if (rto < this.rxMinRto) { rto = this.rxMinRto; }
+        if (rto > RTO_MAX) { rto = RTO_MAX; }
+        this.rxRto = rto;
+    }
+
+    private void ShrinkBuf() {
+        if (this.sndBuf.Count > 0) {
+            this.sndUna = this.sndBuf[0].sn;
+        } else {
+            this.sndUna = this.sndNxt;
+        }
+    }
+
+    private void ParseAck(int sn) {
+        if (TimeDiff(sn, this.sndUna) < 0 || TimeDiff(sn, this.sndNxt) >= 0) { return; }
+        for (int i = 0; i < this.sndBuf.Count; i = i + 1) {
+            KcpSegment seg = this.sndBuf[i];
+            if (sn == seg.sn) {
+                this.sndBuf.RemoveAt(i);
+                return;
+            }
+            if (TimeDiff(sn, seg.sn) < 0) { return; }
+        }
+    }
+
+    private void ParseUna(int una) {
+        while (this.sndBuf.Count > 0) {
+            if (TimeDiff(una, this.sndBuf[0].sn) > 0) {
+                this.sndBuf.RemoveAt(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    private void ParseFastAck(int sn) {
+        if (TimeDiff(sn, this.sndUna) < 0 || TimeDiff(sn, this.sndNxt) >= 0) { return; }
+        for (int i = 0; i < this.sndBuf.Count; i = i + 1) {
+            KcpSegment seg = this.sndBuf[i];
+            if (TimeDiff(sn, seg.sn) < 0) { break; }
+            if (sn != seg.sn) { seg.fastAck = seg.fastAck + 1; }
+        }
+    }
+
+    private void ParseData(KcpSegment newSeg) {
+        int sn = newSeg.sn;
+        if (TimeDiff(sn, this.rcvNxt + this.rcvWnd) >= 0 || TimeDiff(sn, this.rcvNxt) < 0) {
+            return;
+        }
+        int insertAt = this.rcvBuf.Count;
+        for (int i = this.rcvBuf.Count - 1; i >= 0; i = i - 1) {
+            KcpSegment seg = this.rcvBuf[i];
+            if (seg.sn == sn) { return; }
+            if (TimeDiff(sn, seg.sn) > 0) {
+                insertAt = i + 1;
+                break;
+            }
+            insertAt = i;
+        }
+        this.rcvBuf.Insert(insertAt, newSeg);
+        this.MoveRcvBufToQueue();
+    }
+
+    private void MoveRcvBufToQueue() {
+        while (this.rcvBuf.Count > 0) {
+            KcpSegment seg = this.rcvBuf[0];
+            if (seg.sn == this.rcvNxt && this.rcvQueue.Count < this.rcvWnd) {
+                this.rcvBuf.RemoveAt(0);
+                this.rcvQueue.Add(seg);
+                this.rcvNxt = this.rcvNxt + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    private static int TimeDiff(int later, int earlier) { return later - earlier; }
+
+    private static void WriteU16LE(byte[] buf, int pos, int val) {
+        buf[pos] = (byte)(val & 255);
+        buf[pos + 1] = (byte)((val >> 8) & 255);
+    }
+
+    private static int ReadU16LE(byte[] buf, int pos) {
+        return (buf[pos] & 255) | ((buf[pos + 1] & 255) << 8);
+    }
+
+    private static void WriteU32LE(byte[] buf, int pos, int val) {
+        buf[pos] = (byte)(val & 255);
+        buf[pos + 1] = (byte)((val >> 8) & 255);
+        buf[pos + 2] = (byte)((val >> 16) & 255);
+        buf[pos + 3] = (byte)((val >> 24) & 255);
+    }
+
+    private static int ReadU32LE(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+}
+
+// 直接绑定 UdpClient 的即用型 KCP 点对点可靠 UDP 通道。
+public class KcpUdpPeer : IDisposable {
+    private UdpClient udp;
+    private string remoteIp;
+    private int remotePort;
+    private KcpSession kcp;
+    private byte[] recvBuf;
+    private bool ownedUdp;
+
+    public KcpUdpPeer(UdpClient socket, int conv, string targetIp, int targetPort, bool ownSocket) {
+        this.udp = socket;
+        this.remoteIp = targetIp != null ? targetIp : "127.0.0.1";
+        this.remotePort = targetPort;
+        this.ownedUdp = ownSocket;
+        this.recvBuf = new byte[4096];
+        UdpClient sockRef = socket;
+        string dstIp = this.remoteIp;
+        int dstPort = this.remotePort;
+        this.kcp = new KcpSession(conv, (byte[] data, int len) => {
+            if (sockRef == null) { return -1; }
+            return sockRef.SendBytesTo(data, len, dstIp, dstPort);
+        });
+        // 游戏实时联机默认极速配置：nodelay=1, 10ms 轮询, fastresend=2, 关闭拥塞退让
+        this.kcp.SetNoDelay(1, 10, 2, 1);
+    }
+
+    public static KcpUdpPeer Bind(string localHost, int localPort, int conv, string remoteIp, int remotePort) {
+        UdpClient u = UdpClient.Bind(localHost, localPort);
+        if (u == null) { return null; }
+        return new KcpUdpPeer(u, conv, remoteIp, remotePort, true);
+    }
+
+    public KcpSession Session { get { return this.kcp; } }
+
+    public int Send(byte[] payload) {
+        return this.kcp.Send(payload);
+    }
+
+    // 非阻塞抽取所有到达的 UDP 报文喂给 KCP，并推进 KCP 定时重传状态机。
+    public void Poll(int nowMs) {
+        if (this.udp != null) {
+            for (int i = 0; i < 64; i = i + 1) {
+                int n = this.udp.RecvBytesFrom(this.recvBuf, this.recvBuf.Length);
+                if (n <= 0) { break; }
+                this.kcp.Input(this.recvBuf, n);
+            }
+        }
+        this.kcp.Update(nowMs);
+    }
+
+    public byte[] Recv() {
+        return this.kcp.Recv();
+    }
+
+    public void Dispose() {
+        if (this.kcp != null) {
+            this.kcp.SetOutput(null);
+        }
+        if (this.ownedUdp && this.udp != null) {
+            this.udp.Close();
+        }
+        this.udp = null;
+    }
+}

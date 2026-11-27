@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Runtime.Intrinsics;
+using Game.Animation;
+
+namespace Game.Render3D;
+
+// GPU 蒙皮网格构建器：交错顶点 16 float（px,py,pz, nx,ny,nz, u,v, j0,j1,j2,j3, w0,w1,w2,w3）+ ushort 索引。
+// 对应原生 zan_game_mesh_create_ex(..., flags = 2) 与 zan_game_draw3d_skinned，支持最多 64 根骨骼的 4 权重线性混合蒙皮。
+public class SkinnedMesh3D {
+    private List<float> v;
+    private List<ushort> idx;
+    private int vertexCount;
+
+    public SkinnedMesh3D() {
+        this.v = new List<float>();
+        this.idx = new List<ushort>();
+        this.vertexCount = 0;
+    }
+
+    public int StrideFloats() { return 16; }
+    public int VertexCount() { return this.vertexCount; }
+    public int IndexCount() { return this.idx.Count; }
+
+    public int Vertex(
+        float px, float py, float pz,
+        float nx, float ny, float nz,
+        float u, float vv,
+        int j0, int j1, int j2, int j3,
+        float w0, float w1, float w2, float w3) {
+        this.v.Add(px); this.v.Add(py); this.v.Add(pz);
+        this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
+        this.v.Add(u); this.v.Add(vv);
+        this.v.Add((float)j0); this.v.Add((float)j1); this.v.Add((float)j2); this.v.Add((float)j3);
+        this.v.Add(w0); this.v.Add(w1); this.v.Add(w2); this.v.Add(w3);
+        int id = this.vertexCount;
+        this.vertexCount = id + 1;
+        return id;
+    }
+
+    public void Triangle(int a, int b, int c) {
+        this.idx.Add((ushort)a);
+        this.idx.Add((ushort)b);
+        this.idx.Add((ushort)c);
+    }
+
+    public void Quad(int a, int b, int c, int d) {
+        this.Triangle(a, b, c);
+        this.Triangle(a, c, d);
+    }
+
+    public void CopyVerticesTo(nint dest) {
+        int n = this.v.Count;
+        int i = 0;
+        int simdEnd = n - 3;
+        while (i < simdEnd) {
+            Vector128.Store(dest + (nint)(i * 4),
+                Vector128.Create(this.v[i], this.v[i + 1], this.v[i + 2], this.v[i + 3]));
+            i = i + 4;
+        }
+        Span<float> s = new Span<float>(dest, n);
+        while (i < n) {
+            s[i] = this.v[i];
+            i = i + 1;
+        }
+    }
+
+    public void CopyIndicesTo(nint dest) {
+        int n = this.idx.Count;
+        Span<ushort> s = new Span<ushort>(dest, n);
+        for (int i = 0; i < n; i = i + 1) { s[i] = this.idx[i]; }
+    }
+
+    public float[] VertexArray() {
+        int n = this.v.Count;
+        float[] outv = new float[n];
+        for (int i = 0; i < n; i = i + 1) { outv[i] = this.v[i]; }
+        return outv;
+    }
+
+    public ushort[] IndexArray() {
+        int n = this.idx.Count;
+        ushort[] outi = new ushort[n];
+        for (int i = 0; i < n; i = i + 1) { outi[i] = this.idx[i]; }
+        return outi;
+    }
+
+    // 把 Transform3D（p' = R*(S*p) + T）写成 OpenGL 列主序 4x4 矩阵（写入 outMat16[offset..offset+15]）。
+    public static void WriteTransformColumnMajor(Transform3D t, float[] outMat16, int offset) {
+        if (outMat16 == null || offset < 0 || offset + 16 > outMat16.Length) { return; }
+        float x = t.Rotation.X;
+        float y = t.Rotation.Y;
+        float z = t.Rotation.Z;
+        float w = t.Rotation.W;
+        float xx = x * x; float yy = y * y; float zz = z * z;
+        float xy = x * y; float xz = x * z; float yz = y * z;
+        float xw = x * w; float yw = y * w; float zw = z * w;
+
+        float sx = t.Scale.X;
+        float sy = t.Scale.Y;
+        float sz = t.Scale.Z;
+
+        // Col 0
+        outMat16[offset + 0] = (1.0f - 2.0f * (yy + zz)) * sx;
+        outMat16[offset + 1] = (2.0f * (xy + zw)) * sx;
+        outMat16[offset + 2] = (2.0f * (xz - yw)) * sx;
+        outMat16[offset + 3] = 0.0f;
+        // Col 1
+        outMat16[offset + 4] = (2.0f * (xy - zw)) * sy;
+        outMat16[offset + 5] = (1.0f - 2.0f * (xx + zz)) * sy;
+        outMat16[offset + 6] = (2.0f * (yz + xw)) * sy;
+        outMat16[offset + 7] = 0.0f;
+        // Col 2
+        outMat16[offset + 8] = (2.0f * (xz + yw)) * sz;
+        outMat16[offset + 9] = (2.0f * (yz - xw)) * sz;
+        outMat16[offset + 10] = (1.0f - 2.0f * (xx + yy)) * sz;
+        outMat16[offset + 11] = 0.0f;
+        // Col 3
+        outMat16[offset + 12] = t.Position.X;
+        outMat16[offset + 13] = t.Position.Y;
+        outMat16[offset + 14] = t.Position.Z;
+        outMat16[offset + 15] = 1.0f;
+    }
+
+    // 便捷：把 Skeleton 的全部骨骼蒙皮矩阵打包为连续列主序 float[]（最多 64 根骨骼）。
+    public static float[] BuildBoneMatrices(Skeleton skeleton) {
+        if (skeleton == null) { return new float[0]; }
+        int count = skeleton.Count();
+        if (count > 64) { count = 64; }
+        float[] mats = new float[count * 16];
+        for (int i = 0; i < count; i = i + 1) {
+            Transform3D skin = skeleton.SkinMatrix(i);
+            SkinnedMesh3D.WriteTransformColumnMajor(skin, mats, i * 16);
+        }
+        return mats;
+    }
+}

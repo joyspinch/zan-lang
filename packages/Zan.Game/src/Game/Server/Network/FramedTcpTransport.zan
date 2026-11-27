@@ -1,0 +1,181 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace Game.Server.Network;
+
+// 将 PacketFramer 真正接上异步 TCP Socket 的长连接封装：
+// 1. 完整处理 TCP 半包/粘包拆包（内部持续喂入 PacketFramer）；
+// 2. 支持直接关联 Game.Server.Network.Session，在断线重连后自动从 Outbox 补发未确认报文。
+public class FramedTcpConnection : IDisposable {
+    private Socket socket;
+    private PacketFramer framer;
+    private byte[] recvScratch;
+    private Session boundSession;
+    private int nextSeq;
+    private bool closed;
+
+    public FramedTcpConnection(Socket sock, int maxPacketSize) {
+        this.socket = sock;
+        this.framer = new PacketFramer(4096, maxPacketSize > 1024 ? maxPacketSize : 1024 * 1024);
+        this.recvScratch = new byte[4096];
+        this.boundSession = null;
+        this.nextSeq = 1;
+        this.closed = sock == null;
+    }
+
+    public FramedTcpConnection(Socket sock) : this(sock, 1024 * 1024) {
+    }
+
+    public bool IsClosed { get { return this.closed; } }
+    public Session BoundSession { get { return this.boundSession; } }
+
+    public void AttachSession(Session session) {
+        this.boundSession = session;
+    }
+
+    // 异步连接远端游戏服。成功返回 FramedTcpConnection，失败返回 null。
+    public static async FramedTcpConnection ConnectAsync(string host, int port, int timeoutMs) {
+        Socket.Initialize();
+        Socket sock = Socket.Tcp();
+        if (sock == null || sock.Handle < 0) { return null; }
+        Socket.SetNonBlocking(sock.Handle);
+        int rc = await sock.ConnectAsync(host, port, timeoutMs > 0 ? timeoutMs : 5000);
+        if (rc != 0) {
+            sock.Close();
+            return null;
+        }
+        return new FramedTcpConnection(sock);
+    }
+
+    // 发送一条二进制封包；若已绑定 Session，同时写入 Outbox 以备断线重连补发。
+    public async bool SendPacketAsync(Packet packet) {
+        if (this.closed || this.socket == null || packet == null) { return false; }
+        if (packet.seq == 0) {
+            packet.seq = this.nextSeq;
+            this.nextSeq = this.nextSeq + 1;
+        }
+        if (this.boundSession != null) {
+            this.boundSession.EnqueueOutbox(packet);
+        }
+        byte[] wire = PacketFramer.Encode(packet);
+        int sent = await this.socket.SendBytesAsync(wire, 0, wire.Length);
+        if (sent != wire.Length) {
+            this.closed = true;
+            return false;
+        }
+        return true;
+    }
+
+    // 按指定 opCode/routeId 发送载荷的便捷方法。
+    public async bool SendAsync(int opCode, long routeId, byte[] payload) {
+        Packet pkt = Packet.Create(opCode, this.nextSeq, routeId, payload);
+        this.nextSeq = this.nextSeq + 1;
+        return await this.SendPacketAsync(pkt);
+    }
+
+    // 断线重连后，将 Session Outbox 中尚未 Ack 的所有下行包按顺序补发。
+    public async int ReplayOutboxAsync(Session session) {
+        if (this.closed || this.socket == null || session == null) { return 0; }
+        Packet[] pending = session.DrainOutbox();
+        int replayed = 0;
+        for (int i = 0; i < pending.Length; i = i + 1) {
+            Packet p = pending[i];
+            if (p == null) { continue; }
+            byte[] wire = PacketFramer.Encode(p);
+            int sent = await this.socket.SendBytesAsync(wire, 0, wire.Length);
+            if (sent != wire.Length) {
+                this.closed = true;
+                return replayed;
+            }
+            replayed = replayed + 1;
+        }
+        return replayed;
+    }
+
+    // 异步读取直到拼出一条完整 Packet（自动跨多次 Recv 拼接半包、保留后续粘包）。
+    // 对端关闭或超时返回 null。
+    public async Packet ReceivePacketAsync(int timeoutMs) {
+        if (this.closed || this.socket == null) { return null; }
+        Packet ready = this.framer.Poll();
+        if (ready != null) { return ready; }
+
+        while (!this.closed) {
+            int n = timeoutMs > 0
+                ? await this.socket.ReceiveAsync(this.recvScratch, this.recvScratch.Length, timeoutMs)
+                : await this.socket.ReceiveAsync(this.recvScratch, this.recvScratch.Length);
+            if (n <= 0) {
+                if (n == 0) { this.closed = true; }
+                return null;
+            }
+            this.framer.Feed(this.recvScratch, 0, n);
+            ready = this.framer.Poll();
+            if (ready != null) { return ready; }
+        }
+        return null;
+    }
+
+    public void Close() {
+        this.closed = true;
+        if (this.socket != null) {
+            this.socket.Close();
+            this.socket = null;
+        }
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+}
+
+// 基于异步非阻塞 TCP 监听与 PacketFramer 的轻量专用游戏服监听端。
+public class FramedTcpServer : IDisposable {
+    private nint listenFd;
+    private bool listening;
+
+    public FramedTcpServer() {
+        this.listenFd = (nint)(0 - 1);
+        this.listening = false;
+    }
+
+    public bool IsListening { get { return this.listening; } }
+
+    public bool Start(string host, int port, int backlog) {
+        Socket.Initialize();
+        nint fd = Socket.CreateTcp();
+        if (fd < 0) { return false; }
+        Socket.SetReuseAddr(fd);
+        Socket.SetNonBlocking(fd);
+        if (Socket.Bind(fd, host, port) != 0) {
+            Socket.Close(fd);
+            return false;
+        }
+        if (Socket.Listen(fd, backlog > 0 ? backlog : 64) != 0) {
+            Socket.Close(fd);
+            return false;
+        }
+        this.listenFd = fd;
+        this.listening = true;
+        return true;
+    }
+
+    public async FramedTcpConnection AcceptAsync() {
+        if (!this.listening || this.listenFd < 0) { return null; }
+        nint cfd = await AsyncSocket.Accept(this.listenFd);
+        if (cfd < 0) { return null; }
+        Socket.SetNonBlocking(cfd);
+        return new FramedTcpConnection(new Socket(cfd));
+    }
+
+    public void Stop() {
+        this.listening = false;
+        if (this.listenFd >= 0) {
+            Socket.Close(this.listenFd);
+            this.listenFd = (nint)(0 - 1);
+        }
+    }
+
+    public void Dispose() {
+        this.Stop();
+    }
+}

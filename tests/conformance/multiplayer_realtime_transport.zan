@@ -1,0 +1,267 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+using Game.Net;
+using Game.Netcode;
+using Game.Server.Network;
+using Sdk.Steam;
+
+namespace Conf;
+
+class MultiplayerRealtimeTransportTest {
+    static int simStateP0 = 0;
+    static int simStateP1 = 0;
+
+    static int CaptureSize() { return 8; }
+
+    static void CaptureState(byte[] buf) {
+        buf[0] = (byte)(simStateP0 & 255);
+        buf[1] = (byte)((simStateP0 >> 8) & 255);
+        buf[2] = (byte)((simStateP0 >> 16) & 255);
+        buf[3] = (byte)((simStateP0 >> 24) & 255);
+        buf[4] = (byte)(simStateP1 & 255);
+        buf[5] = (byte)((simStateP1 >> 8) & 255);
+        buf[6] = (byte)((simStateP1 >> 16) & 255);
+        buf[7] = (byte)((simStateP1 >> 24) & 255);
+    }
+
+    static void RestoreState(byte[] buf) {
+        simStateP0 = (buf[0] & 255) | ((buf[1] & 255) << 8)
+            | ((buf[2] & 255) << 16) | ((buf[3] & 255) << 24);
+        simStateP1 = (buf[4] & 255) | ((buf[5] & 255) << 8)
+            | ((buf[6] & 255) << 16) | ((buf[7] & 255) << 24);
+    }
+
+    static void StepState(int frame, int[] inputs) {
+        simStateP0 = simStateP0 + inputs[0] * 3 + 1;
+        simStateP1 = simStateP1 + inputs[1] * 5 + 2;
+    }
+
+    static bool TestKcpLossAndFragmentation() {
+        List<byte[]> wireAtoB = new List<byte[]>();
+        List<byte[]> wireBtoA = new List<byte[]>();
+        int dropSeq = 0;
+
+        KcpSession a = new KcpSession(0x1024, (byte[] data, int len) => {
+            dropSeq = dropSeq + 1;
+            // 每第 3 个数据报丢包，验证 ARQ 快速重传与超时重传
+            if (dropSeq % 3 == 0) { return len; }
+            wireAtoB.Add(data);
+            return len;
+        });
+        KcpSession b = new KcpSession(0x1024, (byte[] data, int len) => {
+            wireBtoA.Add(data);
+            return len;
+        });
+        a.SetNoDelay(1, 10, 2, 1);
+        b.SetNoDelay(1, 10, 2, 1);
+        a.SetMtu(512);
+        b.SetMtu(512);
+
+        // 发送一条 2200 字节超大消息（需拆 5 片）+ 5 条小消息
+        byte[] big = new byte[2200];
+        for (int i = 0; i < big.Length; i = i + 1) {
+            big[i] = (byte)((i * 37 + 11) & 255);
+        }
+        a.Send(big);
+        for (int m = 0; m < 5; m = m + 1) {
+            byte[] small = new byte[16];
+            small[0] = (byte)(m + 100);
+            small[15] = (byte)(m + 200);
+            a.Send(small);
+        }
+
+        List<byte[]> received = new List<byte[]>();
+        int now = 1000;
+        for (int step = 0; step < 80 && received.Count < 6; step = step + 1) {
+            a.Update(now);
+            b.Update(now);
+            while (wireAtoB.Count > 0) {
+                byte[] pkt = wireAtoB[0];
+                wireAtoB.RemoveAt(0);
+                b.Input(pkt, pkt.Length);
+            }
+            while (wireBtoA.Count > 0) {
+                byte[] pkt = wireBtoA[0];
+                wireBtoA.RemoveAt(0);
+                a.Input(pkt, pkt.Length);
+            }
+            byte[] msg = b.Recv();
+            while (msg != null) {
+                received.Add(msg);
+                msg = b.Recv();
+            }
+            now = now + 20;
+        }
+
+        if (received.Count != 6) { return false; }
+        byte[] gotBig = received[0];
+        if (gotBig.Length != big.Length) { return false; }
+        for (int i = 0; i < big.Length; i = i + 1) {
+            if (gotBig[i] != big[i]) { return false; }
+        }
+        for (int m = 0; m < 5; m = m + 1) {
+            byte[] sm = received[m + 1];
+            if (sm.Length != 16 || sm[0] != (byte)(m + 100) || sm[15] != (byte)(m + 200)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool TestRealUdpLockstepAndRollback() {
+        // 使用高位临时端口做真 localhost UDP 回环
+        int portA = 39411;
+        int portB = 39412;
+        KcpUdpPeer peerA = KcpUdpPeer.Bind("127.0.0.1", portA, 0x2001, "127.0.0.1", portB);
+        KcpUdpPeer peerB = KcpUdpPeer.Bind("127.0.0.1", portB, 0x2001, "127.0.0.1", portA);
+        if (peerA == null || peerB == null) {
+            if (peerA != null) { peerA.Dispose(); }
+            if (peerB != null) { peerB.Dispose(); }
+            return false;
+        }
+
+        // 1. Lockstep 权威帧经真 UDP 传输并推进对端逻辑帧
+        LockstepManager lsClient = LockstepManager.Create(20.0, 128);
+        LockstepUdpBridge lsSend = new LockstepUdpBridge(null, peerA.Session);
+        LockstepUdpBridge lsRecv = new LockstepUdpBridge(lsClient, peerB.Session);
+
+        PlayerCommand[] f1 = new PlayerCommand[1];
+        f1[0] = PlayerCommand.Create(1, 1, 12.5, 34.25, 9, 77);
+        PlayerCommand[] f2 = new PlayerCommand[1];
+        f2[0] = PlayerCommand.Create(2, 2, -5.0, 8.75, 11, 88);
+        lsSend.SendAuthorityFrame(1, f1, 1);
+        lsSend.SendAuthorityFrame(2, f2, 1);
+
+        int t = 100;
+        for (int i = 0; i < 40 && lsRecv.FramesReceived < 2; i = i + 1) {
+            peerA.Poll(t);
+            peerB.Poll(t);
+            lsRecv.PumpIncoming();
+            Thread.Sleep(5);
+            t = t + 20;
+        }
+
+        int executedCmdSum = 0;
+        lsClient.Update(0.2, (int frame, FrameBucket bucket) => {
+            if (bucket != null && bucket.CommandCount > 0) {
+                PlayerCommand c = bucket.GetCommand(0);
+                if (c != null) {
+                    executedCmdSum = executedCmdSum + c.ExtraParam;
+                }
+            }
+        });
+        bool lockstepOk = lsClient.CurrentLogicFrame == 2 && executedCmdSum == (77 + 88);
+
+        // 2. Rollback 远端输入经真 UDP 触发误预测回滚并校验一致性
+        simStateP0 = 0;
+        simStateP1 = 0;
+        RollbackSession rbB = new RollbackSession(2, 16,
+            MultiplayerRealtimeTransportTest.CaptureSize,
+            MultiplayerRealtimeTransportTest.CaptureState,
+            MultiplayerRealtimeTransportTest.RestoreState,
+            MultiplayerRealtimeTransportTest.StepState);
+        // 先推进本地 3 帧（此时尚无 P1 远端输入，预测 P1=0）
+        rbB.Advance(1);
+        rbB.Advance(2);
+        rbB.Advance(3);
+
+        // 对端 A 通过真 UDP 发送 P1 在帧 0/1/2 的权威输入 (10, 20, 30)
+        RollbackUdpBridge rbSend = new RollbackUdpBridge(null, peerA.Session, 1);
+        RollbackUdpBridge rbRecv = new RollbackUdpBridge(rbB, peerB.Session, 0);
+        rbSend.SendLocalInput(0, 10);
+        rbSend.SendLocalInput(1, 20);
+        rbSend.SendLocalInput(2, 30);
+
+        int gotInputs = 0;
+        for (int i = 0; i < 40 && gotInputs < 3; i = i + 1) {
+            peerA.Poll(t);
+            peerB.Poll(t);
+            gotInputs = gotInputs + rbRecv.PumpIncoming();
+            Thread.Sleep(5);
+            t = t + 20;
+        }
+
+        // 期望精确状态：
+        // P0: (1*3+1) + (2*3+1) + (3*3+1) = 4 + 7 + 10 = 21
+        // P1: (10*5+2) + (20*5+2) + (30*5+2) = 52 + 102 + 152 = 306
+        bool rollbackOk = gotInputs == 3 && rbB.MispredictionCount() > 0
+            && simStateP0 == 21 && simStateP1 == 306;
+
+        peerA.Dispose();
+        peerB.Dispose();
+        return lockstepOk && rollbackOk;
+    }
+
+    static async bool TestFramedTcpAndSessionReplayAsync() {
+        int port = 39419;
+        FramedTcpServer server = new FramedTcpServer();
+        if (!server.Start("127.0.0.1", port, 16)) { return false; }
+
+        FramedTcpConnection client = await FramedTcpConnection.ConnectAsync("127.0.0.1", port, 2000);
+        if (client == null) {
+            server.Stop();
+            return false;
+        }
+        FramedTcpConnection serverConn = await server.AcceptAsync();
+        if (serverConn == null) {
+            client.Close();
+            server.Stop();
+            return false;
+        }
+
+        // 关联 Session，发送 2 个包（同时进 Outbox）
+        Session sess = new Session(1001L, 16);
+        sess.BindPlayer(42L, "tok-xyz");
+        serverConn.AttachSession(sess);
+
+        byte[] p1 = new byte[4];
+        p1[0] = 11; p1[1] = 22; p1[2] = 33; p1[3] = 44;
+        byte[] p2 = new byte[3];
+        p2[0] = 55; p2[1] = 66; p2[2] = 77;
+        await serverConn.SendAsync(101, 42L, p1);
+        await serverConn.SendAsync(102, 42L, p2);
+
+        Packet r1 = await client.ReceivePacketAsync(2000);
+        Packet r2 = await client.ReceivePacketAsync(2000);
+        bool firstBatchOk = r1 != null && r2 != null
+            && r1.opCode == 101 && r1.payloadLength == 4 && r1.payload[3] == 44
+            && r2.opCode == 102 && r2.payloadLength == 3 && r2.payload[2] == 77;
+
+        // 模拟客户端仅 Ack 了第 1 条包后断线重连，通过 ReplayOutboxAsync 补发第 2 条包
+        sess.Ack(r1.seq);
+        sess.MarkDisconnected(1000L);
+        bool resumed = sess.TryResume(1002L, "tok-xyz", 1500L);
+        int replayed = await serverConn.ReplayOutboxAsync(sess);
+        Packet r2Again = await client.ReceivePacketAsync(2000);
+        bool replayOk = resumed && replayed == 1 && r2Again != null
+            && r2Again.opCode == 102 && r2Again.payload[0] == 55;
+
+        client.Close();
+        serverConn.Close();
+        server.Stop();
+        return firstBatchOk && replayOk;
+    }
+
+    static bool TestSteamNativeGracefulFallback() {
+        SteamNative steam = new SteamNative();
+        bool ok = steam.Initialize("missing_steam_api64_probe.dll");
+        bool fallback = !ok && !steam.IsInitialized && steam.LastError != ""
+            && steam.CreateLobby(SteamNative.LOBBY_FRIENDS_ONLY, 4) == 0UL
+            && steam.CreateListenSocketP2P(0) == 0;
+        steam.Dispose();
+        return fallback;
+    }
+
+    static async void Main() {
+        bool kcpOk = MultiplayerRealtimeTransportTest.TestKcpLossAndFragmentation();
+        bool udpOk = MultiplayerRealtimeTransportTest.TestRealUdpLockstepAndRollback();
+        bool tcpOk = await MultiplayerRealtimeTransportTest.TestFramedTcpAndSessionReplayAsync();
+        bool steamOk = MultiplayerRealtimeTransportTest.TestSteamNativeGracefulFallback();
+        Console.WriteLine("kcp-loss-frag: " + Convert.ToString(kcpOk ? 1 : 0));
+        Console.WriteLine("udp-lockstep-rollback: " + Convert.ToString(udpOk ? 1 : 0));
+        Console.WriteLine("tcp-framed-replay: " + Convert.ToString(tcpOk ? 1 : 0));
+        Console.WriteLine("steam-native-fallback: " + Convert.ToString(steamOk ? 1 : 0));
+    }
+}

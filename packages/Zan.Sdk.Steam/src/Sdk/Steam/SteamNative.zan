@@ -1,0 +1,275 @@
+using System;
+using System.Runtime.InteropServices;
+
+namespace Sdk.Steam;
+
+// Steamworks 原生 flat C API（steam_api64.dll / libsteam_api.so / libsteam_api.dylib）函数指针委托。
+public delegate bool SteamInitFn();
+public delegate void SteamVoidFn();
+public delegate nint SteamInterfaceFn();
+public delegate ulong SteamCreateLobbyFn(nint iface, int lobbyType, int maxMembers);
+public delegate ulong SteamJoinLobbyFn(nint iface, ulong steamIdLobby);
+public delegate void SteamLeaveLobbyFn(nint iface, ulong steamIdLobby);
+public delegate int SteamLobbyMemberCountFn(nint iface, ulong steamIdLobby);
+public delegate ulong SteamLobbyMemberAtFn(nint iface, ulong steamIdLobby, int index);
+public delegate ulong SteamLobbyOwnerFn(nint iface, ulong steamIdLobby);
+public delegate bool SteamSetLobbyDataFn(nint iface, ulong steamIdLobby, string key, string val);
+public delegate string SteamGetLobbyDataFn(nint iface, ulong steamIdLobby, string key);
+public delegate void SteamInitRelayFn(nint iface);
+public delegate int SteamListenP2PFn(nint iface, int virtualPort, int nOptions, nint pOptions);
+public delegate int SteamConnectP2PFn(nint iface, nint identityRemote, int virtualPort, int nOptions, nint pOptions);
+public delegate int SteamAcceptConnFn(nint iface, int hConn);
+public delegate bool SteamCloseConnFn(nint iface, int hConn, int reason, string debugMsg, bool linger);
+public delegate int SteamSendMsgFn(nint iface, int hConn, nint data, int cbData, int sendFlags, nint outMsgNum);
+public delegate int SteamRecvMsgsFn(nint iface, int hConn, nint outMsgs, int maxMsgs);
+
+// Steamworks 原生 SDK 动态加载封装：
+// - 通过 Interop.Load 动态加载平台对应库，未部署 steam_api64 时安全返回 false 而不影响编译/启动；
+// - 覆盖商业独立联机最核心的两大能力：ISteamMatchmaking（好友大厅）与 ISteamNetworkingSockets（SDR 全球中继 + 可靠/不可靠 UDP）。
+public class SteamNative : IDisposable {
+    public const int LOBBY_PRIVATE = 0;
+    public const int LOBBY_FRIENDS_ONLY = 1;
+    public const int LOBBY_PUBLIC = 2;
+    public const int LOBBY_INVISIBLE = 3;
+
+    public const int SEND_UNRELIABLE = 0;
+    public const int SEND_NO_NAGLE = 1;
+    public const int SEND_NO_DELAY = 4;
+    public const int SEND_RELIABLE = 8;
+
+    private nint libHandle;
+    private bool initialized;
+    private string lastError;
+
+    private nint fnInit;
+    private nint fnShutdown;
+    private nint fnRunCallbacks;
+    private nint fnMatchmaking;
+    private nint fnNetworkingSockets;
+
+    private nint fnCreateLobby;
+    private nint fnJoinLobby;
+    private nint fnLeaveLobby;
+    private nint fnGetNumLobbyMembers;
+    private nint fnGetLobbyMemberByIndex;
+    private nint fnGetLobbyOwner;
+    private nint fnSetLobbyData;
+    private nint fnGetLobbyData;
+
+    private nint fnInitRelay;
+    private nint fnListenP2P;
+    private nint fnConnectP2P;
+    private nint fnAcceptConn;
+    private nint fnCloseConn;
+    private nint fnSendMsg;
+    private nint fnRecvMsgs;
+
+    public SteamNative() {
+        this.libHandle = 0;
+        this.initialized = false;
+        this.lastError = "";
+    }
+
+    public bool IsLoaded { get { return this.libHandle != 0; } }
+    public bool IsInitialized { get { return this.initialized; } }
+    public string LastError { get { return this.lastError; } }
+
+    public static string DefaultLibraryName() {
+        #if WINDOWS
+        return "steam_api64.dll";
+        #elif MACOS
+        return "libsteam_api.dylib";
+        #else
+        return "libsteam_api.so";
+        #endif
+    }
+
+    // 加载 Steamworks 动态库并解析 flat C API 符号；未找到库时返回 false 并写入 LastError。
+    public bool Load(string libraryPath) {
+        if (this.libHandle != 0) { return true; }
+        string path = (libraryPath != null && libraryPath != "") ? libraryPath : SteamNative.DefaultLibraryName();
+        nint h = Interop.Load(path);
+        if (h == 0) {
+            this.lastError = "Steamworks native library not found: " + path;
+            return false;
+        }
+        this.libHandle = h;
+        this.fnInit = Interop.Symbol(h, "SteamAPI_Init");
+        this.fnShutdown = Interop.Symbol(h, "SteamAPI_Shutdown");
+        this.fnRunCallbacks = Interop.Symbol(h, "SteamAPI_RunCallbacks");
+        this.fnMatchmaking = Interop.Symbol(h, "SteamAPI_SteamMatchmaking_v009");
+        this.fnNetworkingSockets = Interop.Symbol(h, "SteamAPI_SteamNetworkingSockets_SteamAPI_v012");
+
+        this.fnCreateLobby = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_CreateLobby");
+        this.fnJoinLobby = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_JoinLobby");
+        this.fnLeaveLobby = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_LeaveLobby");
+        this.fnGetNumLobbyMembers = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers");
+        this.fnGetLobbyMemberByIndex = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex");
+        this.fnGetLobbyOwner = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_GetLobbyOwner");
+        this.fnSetLobbyData = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_SetLobbyData");
+        this.fnGetLobbyData = Interop.Symbol(h, "SteamAPI_ISteamMatchmaking_GetLobbyData");
+
+        this.fnInitRelay = Interop.Symbol(h, "SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess");
+        this.fnListenP2P = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P");
+        this.fnConnectP2P = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_ConnectP2P");
+        this.fnAcceptConn = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_AcceptConnection");
+        this.fnCloseConn = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_CloseConnection");
+        this.fnSendMsg = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_SendMessageToConnection");
+        this.fnRecvMsgs = Interop.Symbol(h, "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection");
+        this.lastError = "";
+        return true;
+    }
+
+    public bool Initialize(string libraryPath) {
+        if (this.initialized) { return true; }
+        if (!this.Load(libraryPath)) { return false; }
+        if (this.fnInit == 0) {
+            this.lastError = "SteamAPI_Init symbol missing";
+            return false;
+        }
+        SteamInitFn initFn = (SteamInitFn)this.fnInit;
+        if (!initFn()) {
+            this.lastError = "SteamAPI_Init returned false (is Steam client running and steam_appid.txt present?)";
+            return false;
+        }
+        this.initialized = true;
+        return true;
+    }
+
+    public bool Initialize() {
+        return this.Initialize("");
+    }
+
+    public void RunCallbacks() {
+        if (!this.initialized || this.fnRunCallbacks == 0) { return; }
+        SteamVoidFn run = (SteamVoidFn)this.fnRunCallbacks;
+        run();
+    }
+
+    public void Shutdown() {
+        if (this.initialized && this.fnShutdown != 0) {
+            SteamVoidFn stop = (SteamVoidFn)this.fnShutdown;
+            stop();
+        }
+        this.initialized = false;
+    }
+
+    public nint MatchmakingInterface() {
+        if (!this.initialized || this.fnMatchmaking == 0) { return 0; }
+        SteamInterfaceFn getIf = (SteamInterfaceFn)this.fnMatchmaking;
+        return getIf();
+    }
+
+    public nint NetworkingSocketsInterface() {
+        if (!this.initialized || this.fnNetworkingSockets == 0) { return 0; }
+        SteamInterfaceFn getIf = (SteamInterfaceFn)this.fnNetworkingSockets;
+        return getIf();
+    }
+
+    // --- ISteamMatchmaking (好友大厅) ---
+
+    public ulong CreateLobby(int lobbyType, int maxMembers) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnCreateLobby == 0) { return 0UL; }
+        SteamCreateLobbyFn call = (SteamCreateLobbyFn)this.fnCreateLobby;
+        return call(iface, lobbyType, maxMembers);
+    }
+
+    public ulong JoinLobby(ulong steamIdLobby) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnJoinLobby == 0) { return 0UL; }
+        SteamJoinLobbyFn call = (SteamJoinLobbyFn)this.fnJoinLobby;
+        return call(iface, steamIdLobby);
+    }
+
+    public void LeaveLobby(ulong steamIdLobby) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnLeaveLobby == 0) { return; }
+        SteamLeaveLobbyFn call = (SteamLeaveLobbyFn)this.fnLeaveLobby;
+        call(iface, steamIdLobby);
+    }
+
+    public int GetNumLobbyMembers(ulong steamIdLobby) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnGetNumLobbyMembers == 0) { return 0; }
+        SteamLobbyMemberCountFn call = (SteamLobbyMemberCountFn)this.fnGetNumLobbyMembers;
+        return call(iface, steamIdLobby);
+    }
+
+    public ulong GetLobbyMemberByIndex(ulong steamIdLobby, int index) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnGetLobbyMemberByIndex == 0) { return 0UL; }
+        SteamLobbyMemberAtFn call = (SteamLobbyMemberAtFn)this.fnGetLobbyMemberByIndex;
+        return call(iface, steamIdLobby, index);
+    }
+
+    public ulong GetLobbyOwner(ulong steamIdLobby) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnGetLobbyOwner == 0) { return 0UL; }
+        SteamLobbyOwnerFn call = (SteamLobbyOwnerFn)this.fnGetLobbyOwner;
+        return call(iface, steamIdLobby);
+    }
+
+    public bool SetLobbyData(ulong steamIdLobby, string key, string value) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnSetLobbyData == 0) { return false; }
+        SteamSetLobbyDataFn call = (SteamSetLobbyDataFn)this.fnSetLobbyData;
+        return call(iface, steamIdLobby, key, value);
+    }
+
+    public string GetLobbyData(ulong steamIdLobby, string key) {
+        nint iface = this.MatchmakingInterface();
+        if (iface == 0 || this.fnGetLobbyData == 0) { return ""; }
+        SteamGetLobbyDataFn call = (SteamGetLobbyDataFn)this.fnGetLobbyData;
+        string s = call(iface, steamIdLobby, key);
+        return s != null ? s : "";
+    }
+
+    // --- ISteamNetworkingSockets (SDR 全球中继与可靠/不可靠多通道 P2P) ---
+
+    public int CreateListenSocketP2P(int virtualPort) {
+        nint iface = this.NetworkingSocketsInterface();
+        if (iface == 0 || this.fnListenP2P == 0) { return 0; }
+        SteamListenP2PFn call = (SteamListenP2PFn)this.fnListenP2P;
+        return call(iface, virtualPort, 0, 0);
+    }
+
+    public int AcceptConnection(int hConn) {
+        nint iface = this.NetworkingSocketsInterface();
+        if (iface == 0 || this.fnAcceptConn == 0) { return -1; }
+        SteamAcceptConnFn call = (SteamAcceptConnFn)this.fnAcceptConn;
+        return call(iface, hConn);
+    }
+
+    public bool CloseConnection(int hConn, int reason, string debugMsg, bool enableLinger) {
+        nint iface = this.NetworkingSocketsInterface();
+        if (iface == 0 || this.fnCloseConn == 0) { return false; }
+        SteamCloseConnFn call = (SteamCloseConnFn)this.fnCloseConn;
+        return call(iface, hConn, reason, debugMsg != null ? debugMsg : "", enableLinger);
+    }
+
+    // 向指定 Steam P2P/SDR 连接发送二进制载荷（支持 SEND_RELIABLE / SEND_UNRELIABLE）。
+    public int SendMessageToConnection(int hConn, byte[] payload, int sendFlags) {
+        nint iface = this.NetworkingSocketsInterface();
+        if (iface == 0 || this.fnSendMsg == 0 || payload == null || payload.Length == 0) {
+            return -1;
+        }
+        nint raw = NativeMemory.Alloc(payload.Length);
+        if (raw == 0) { return -1; }
+        try {
+            Span<byte> dst = new Span<byte>(raw, payload.Length);
+            for (int i = 0; i < payload.Length; i = i + 1) {
+                dst[i] = payload[i];
+            }
+            SteamSendMsgFn call = (SteamSendMsgFn)this.fnSendMsg;
+            return call(iface, hConn, raw, payload.Length, sendFlags, 0);
+        } finally {
+            NativeMemory.Free(raw);
+        }
+    }
+
+    public void Dispose() {
+        this.Shutdown();
+        this.libHandle = 0;
+    }
+}

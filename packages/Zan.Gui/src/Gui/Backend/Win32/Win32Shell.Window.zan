@@ -212,9 +212,16 @@ public partial class Win32Shell {
         return Win32Shell.GetForegroundWindow() == hwnd;
     }
     static void SetTopmost(nint hwnd, bool on) {
+        if (hwnd == 0) { return; }
         nint after = 0 - 2;                        // HWND_NOTOPMOST
         if (on) { after = 0 - 1; }                 // HWND_TOPMOST
-        Win32Shell.SetWindowPos(hwnd, after, 0, 0, 0, 0, 2 | 1 | 16);
+        Win32Shell.SetWindowPos(hwnd, after, 0, 0, 0, 0, 0x0020 | 2 | 1 | 16);
+        if (on && (Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20) & 0x00000008) == 0) {
+            // Windows 10/11 后台进程中对新建未激活窗口首次直传 HWND_TOPMOST 会被 win32k 忽略；
+            // 先经 HWND_NOTOPMOST 落位 Z-order 再置顶，可不抢焦点地可靠提交 WS_EX_TOPMOST。
+            Win32Shell.SetWindowPos(hwnd, 0 - 2, 0, 0, 0, 0, 0x0020 | 2 | 1 | 16);
+            Win32Shell.SetWindowPos(hwnd, 0 - 1, 0, 0, 0, 0, 0x0020 | 2 | 1 | 16);
+        }
     }
     static void SetTitle(nint hwnd, string title) {
         nint wtitle = Wide.Of(title);
@@ -307,7 +314,7 @@ public partial class Win32Shell {
                 if (Win32Shell.toolHwnd[i] == hwnd) { Win32Shell.toolHwnd.RemoveAt(i); }
             }
         }
-        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 4 | 16);
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 1 | 2 | 4 | 16);
     }
     static bool IsToolWindow(nint hwnd) {
         if (Win32Shell.toolHwnd == null) { return false; }
@@ -514,13 +521,78 @@ public partial class Win32Shell {
         int own = Win32Shell.SurfaceOf(hwnd);
         if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
     }
+    static bool NeedsLayered() {
+        int op = Win32Shell.winOpacityPercent;
+        if (op <= 0) { op = 100; }
+        return Win32Shell.glassOn || Win32Shell.transparentOn || Win32Shell.shapeMode != 0
+            || Win32Shell.clickThroughOn || op < 100;
+    }
+    static void SetTransparent(nint hwnd, bool on) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        if (Win32Shell.IsLayerHost(hwnd)) {
+            Win32Shell.transparentOn = on;
+            return;
+        }
+        Win32Shell.transparentOn = on;
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (on) {
+            if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+            }
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
+        } else if (!Win32Shell.NeedsLayered() && (ex & 0x00080000) != 0) {
+            Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        }
+    }
+    static void SetClickThrough(nint hwnd, bool on) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        Win32Shell.clickThroughOn = on;
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (on) {
+            nint nextEx = ex | 0x00000020;             // WS_EX_TRANSPARENT
+            if (!Win32Shell.IsLayerHost(hwnd)) {
+                nextEx = nextEx | 0x00080000;          // WS_EX_LAYERED（跨进程穿透所需）
+            }
+            if (nextEx != ex) {
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, nextEx);
+            }
+            if (!Win32Shell.IsLayerHost(hwnd) && !Win32Shell.glassOn
+                && !Win32Shell.transparentOn && Win32Shell.shapeMode == 0) {
+                int op = Win32Shell.winOpacityPercent;
+                if (op <= 0 || op > 100) { op = 100; }
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0,
+                    (byte)(op * 255 / 100), 2);
+            }
+        } else {
+            nint nextEx = ex & ~0x00000020;
+            if (!Win32Shell.NeedsLayered() && (nextEx & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                nextEx = nextEx & ~0x00080000;
+            }
+            if (nextEx != ex) {
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, nextEx);
+            }
+        }
+    }
+    static void StartWindowDrag(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        Win32Shell.ReleaseCapture();
+        Win32Shell.SendMessageW(hwnd, 0x00A1, 2, 0);   // WM_NCLBUTTONDOWN + HTCAPTION
+    }
     static void DisableGlass(nint hwnd) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
         Win32Shell.AcrylicApply(hwnd, 0, 0);
-        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
-        Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
         Win32Shell.glassOn = false;
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (!Win32Shell.NeedsLayered() && (ex & 0x00080000) != 0) {
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        }
     }
     static void SetOpacity(nint hwnd, int percent) {
         Win32Shell.Init();
@@ -529,16 +601,18 @@ public partial class Win32Shell {
         if (percent < 10) { percent = 10; }
         if (percent > 100) { percent = 100; }
         Win32Shell.winOpacityPercent = percent;
-        if (Win32Shell.shapeMode != 0 || Win32Shell.glassOn) {
+        if (Win32Shell.shapeMode != 0 || Win32Shell.glassOn || Win32Shell.transparentOn) {
             int own = Win32Shell.SurfaceOf(hwnd);
             if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
             return;
         }
         nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
         if (percent >= 100) {
-            if (!Win32Shell.glassOn && (ex & 0x00080000) != 0) {
+            if (!Win32Shell.NeedsLayered() && (ex & 0x00080000) != 0) {
                 Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
                 Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            } else if ((ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
             }
             return;
         }
@@ -552,16 +626,16 @@ public partial class Win32Shell {
         if (desc == null || desc.IsEmpty()) {
             Win32Shell.hasShadowBand = false;
             Win32Shell.SetWindowRgn(hwnd, 0, true);
-            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
-            if ((ex & 0x00080000) != 0) {
-                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
-                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
-            }
             Win32Shell.shapeMode = 0;
             Win32Shell.shapeRegionList = new List<Win32ShapeRegion>();
             Win32Shell.shapeMaskRegions = new List<WindowShapeRegion>();
             Win32Shell.shapeMask = new WindowShapeMask();
             Win32Shell.glassOn = false;
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if (!Win32Shell.NeedsLayered() && (ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
             return;
         }
         List<Win32ShapeRegion> regs = new List<Win32ShapeRegion>();

@@ -1,0 +1,692 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Numerics;
+using Game.Animation;
+using Game.Render3D;
+
+namespace Game.Assets;
+
+// glTF 2.0 材质基础参数（PBR Metallic-Roughness 子集）。
+public class GltfMaterial {
+    public string Name;
+    public float BaseColorR;
+    public float BaseColorG;
+    public float BaseColorB;
+    public float BaseColorA;
+    public float MetallicFactor;
+    public float RoughnessFactor;
+    public string AlphaMode;
+
+    public GltfMaterial() {
+        this.Name = "";
+        this.BaseColorR = 1.0f;
+        this.BaseColorG = 1.0f;
+        this.BaseColorB = 1.0f;
+        this.BaseColorA = 1.0f;
+        this.MetallicFactor = 0.0f;
+        this.RoughnessFactor = 1.0f;
+        this.AlphaMode = "OPAQUE";
+    }
+}
+
+// 单个 glTF 图元（静态网格进 Mesh，带 JOINTS_0+WEIGHTS_0 的蒙皮网格进 SkinnedMesh）。
+public class GltfPrimitive {
+    public string MeshName;
+    public int MaterialIndex;
+    public bool IsSkinned;
+    public Mesh3D Mesh;
+    public SkinnedMesh3D SkinnedMesh;
+
+    public GltfPrimitive() {
+        this.MeshName = "";
+        this.MaterialIndex = -1;
+        this.IsSkinned = false;
+        this.Mesh = null;
+        this.SkinnedMesh = null;
+    }
+}
+
+// glTF 2.0 解析结果：包含网格图元、材质表、可选骨架（已按父在子前顺序构造成 Game.Animation.Skeleton）。
+public class GltfModel {
+    public List<GltfPrimitive> Primitives;
+    public List<GltfMaterial> Materials;
+    public Skeleton Skeleton;
+    public int[] JointNodeIndices;
+    public float[] InverseBindMatrices;
+
+    public GltfModel() {
+        this.Primitives = new List<GltfPrimitive>();
+        this.Materials = new List<GltfMaterial>();
+        this.Skeleton = null;
+        this.JointNodeIndices = new int[0];
+        this.InverseBindMatrices = new float[0];
+    }
+
+    public int PrimitiveCount { get { return this.Primitives.Count; } }
+    public int MaterialCount { get { return this.Materials.Count; } }
+}
+
+internal class GltfBufferView {
+    public int BufferIndex;
+    public int ByteOffset;
+    public int ByteLength;
+    public int ByteStride;
+}
+
+internal class GltfAccessor {
+    public int BufferView;
+    public int ByteOffset;
+    public int ComponentType;
+    public int Count;
+    public int ComponentCount;
+    public bool Normalized;
+}
+
+internal class GltfNodeInfo {
+    public string Name;
+    public int ParentIndex;
+    public Transform3D LocalTransform;
+    public List<int> Children;
+
+    public GltfNodeInfo() {
+        this.Name = "";
+        this.ParentIndex = -1;
+        this.LocalTransform = Transform3D.Identity;
+        this.Children = new List<int>();
+    }
+}
+
+// 纯 Zan glTF 2.0 / GLB 商业资产导入器：
+// 支持 GLB 二进制封装（JSON + BIN chunk）与 .gltf JSON（外联 .bin 或 data-URI base64），
+// 自动解包 POSITION/NORMAL/TEXCOORD_0/COLOR_0/JOINTS_0/WEIGHTS_0/indices、PBR 材质与 Skeleton 骨架。
+public static class GltfLoader {
+    private const uint GLB_MAGIC = 0x46546C67u;
+    private const uint CHUNK_JSON = 0x4E4F534Au;
+    private const uint CHUNK_BIN = 0x004E4942u;
+
+    private const int COMP_SBYTE = 5120;
+    private const int COMP_UBYTE = 5121;
+    private const int COMP_SHORT = 5122;
+    private const int COMP_USHORT = 5123;
+    private const int COMP_UINT = 5125;
+    private const int COMP_FLOAT = 5126;
+
+    // 从文件路径加载 .glb 或 .gltf。
+    public static GltfModel LoadFile(string path) {
+        if (path == null || path == "") { return null; }
+        byte[] data = File.ReadAllBytes(path);
+        if (data == null || data.Length < 12) { return null; }
+        uint magic = ReadU32(data, 0);
+        if (magic == GLB_MAGIC) {
+            return LoadGlb(data);
+        }
+        string baseDir = Path.GetDirectoryName(path);
+        return LoadGltfBytes(data, null, baseDir);
+    }
+
+    // 从内存 GLB 字节流加载。
+    public static GltfModel LoadGlb(byte[] glb) {
+        if (glb == null || glb.Length < 20) { return null; }
+        uint magic = ReadU32(glb, 0);
+        uint version = ReadU32(glb, 4);
+        uint totalLen = ReadU32(glb, 8);
+        if (magic != GLB_MAGIC || version != 2u || (long)totalLen > (long)glb.Length) {
+            return null;
+        }
+        byte[] jsonBytes = null;
+        byte[] binBytes = null;
+        int pos = 12;
+        int end = (int)totalLen;
+        while (pos + 8 <= end) {
+            int chunkLen = (int)ReadU32(glb, pos);
+            uint chunkType = ReadU32(glb, pos + 4);
+            pos = pos + 8;
+            if (chunkLen < 0 || pos + chunkLen > end) { break; }
+            if (chunkType == CHUNK_JSON && jsonBytes == null) {
+                jsonBytes = SliceBytes(glb, pos, chunkLen);
+            } else if (chunkType == CHUNK_BIN && binBytes == null) {
+                binBytes = SliceBytes(glb, pos, chunkLen);
+            }
+            pos = pos + chunkLen;
+        }
+        if (jsonBytes == null) { return null; }
+        return LoadGltfBytes(jsonBytes, binBytes, "");
+    }
+
+    // 从内存 glTF JSON + 可选内嵌 BIN 缓冲加载。
+    public static GltfModel LoadGltfBytes(byte[] jsonBytes, byte[] glbBin, string baseDir) {
+        if (jsonBytes == null || jsonBytes.Length == 0) { return null; }
+        JsonDoc doc = JsonDoc.ParseBytes(jsonBytes, 0, jsonBytes.Length);
+        if (doc == null) { return null; }
+
+        List<byte[]> buffers = ParseBuffers(doc, glbBin, baseDir);
+        List<GltfBufferView> views = ParseBufferViews(doc);
+        List<GltfAccessor> accessors = ParseAccessors(doc);
+
+        GltfModel model = new GltfModel();
+        ParseMaterials(doc, model);
+        ParseMeshes(doc, buffers, views, accessors, model);
+        ParseFirstSkin(doc, buffers, views, accessors, model);
+        return model;
+    }
+
+    private static List<byte[]> ParseBuffers(JsonDoc doc, byte[] glbBin, string baseDir) {
+        List<byte[]> result = new List<byte[]>();
+        int arr = doc.Get("buffers");
+        if (arr < 0) {
+            if (glbBin != null) { result.Add(glbBin); }
+            return result;
+        }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            int uriSlot = doc.Get(c, "uri");
+            byte[] buf = null;
+            if (uriSlot < 0) {
+                buf = (i == 0 && glbBin != null) ? glbBin : new byte[0];
+            } else {
+                string uri = doc.StrOfSlot(uriSlot);
+                buf = LoadBufferUri(uri, baseDir);
+            }
+            result.Add(buf == null ? new byte[0] : buf);
+            c = doc.NextSibling(c);
+        }
+        return result;
+    }
+
+    private static byte[] LoadBufferUri(string uri, string baseDir) {
+        if (uri == null || uri == "") { return new byte[0]; }
+        int comma = uri.IndexOf(",");
+        if (uri.StartsWith("data:") && comma > 0) {
+            string b64 = uri.Substring(comma + 1, uri.Length - comma - 1);
+            return Convert.FromBase64String(b64);
+        }
+        string fullPath = (baseDir != null && baseDir != "") ? Path.Combine(baseDir, uri) : uri;
+        if (File.Exists(fullPath)) {
+            return File.ReadAllBytes(fullPath);
+        }
+        return new byte[0];
+    }
+
+    private static List<GltfBufferView> ParseBufferViews(JsonDoc doc) {
+        List<GltfBufferView> list = new List<GltfBufferView>();
+        int arr = doc.Get("bufferViews");
+        if (arr < 0) { return list; }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            GltfBufferView bv = new GltfBufferView();
+            bv.BufferIndex = doc.IntAt(doc.Get(c, "buffer"), 0);
+            bv.ByteOffset = doc.IntAt(doc.Get(c, "byteOffset"), 0);
+            bv.ByteLength = doc.IntAt(doc.Get(c, "byteLength"), 0);
+            bv.ByteStride = doc.IntAt(doc.Get(c, "byteStride"), 0);
+            list.Add(bv);
+            c = doc.NextSibling(c);
+        }
+        return list;
+    }
+
+    private static List<GltfAccessor> ParseAccessors(JsonDoc doc) {
+        List<GltfAccessor> list = new List<GltfAccessor>();
+        int arr = doc.Get("accessors");
+        if (arr < 0) { return list; }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            GltfAccessor acc = new GltfAccessor();
+            acc.BufferView = doc.IntAt(doc.Get(c, "bufferView"), -1);
+            acc.ByteOffset = doc.IntAt(doc.Get(c, "byteOffset"), 0);
+            acc.ComponentType = doc.IntAt(doc.Get(c, "componentType"), COMP_FLOAT);
+            acc.Count = doc.IntAt(doc.Get(c, "count"), 0);
+            int typeSlot = doc.Get(c, "type");
+            string t = typeSlot >= 0 ? doc.StrOfSlot(typeSlot) : "SCALAR";
+            acc.ComponentCount = TypeToCompCount(t);
+            acc.Normalized = doc.IntAt(doc.Get(c, "normalized"), 0) != 0;
+            list.Add(acc);
+            c = doc.NextSibling(c);
+        }
+        return list;
+    }
+
+    private static void ParseMaterials(JsonDoc doc, GltfModel model) {
+        int arr = doc.Get("materials");
+        if (arr < 0) { return; }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            GltfMaterial mat = new GltfMaterial();
+            int nameSlot = doc.Get(c, "name");
+            if (nameSlot >= 0) { mat.Name = doc.StrOfSlot(nameSlot); }
+            int alphaSlot = doc.Get(c, "alphaMode");
+            if (alphaSlot >= 0) { mat.AlphaMode = doc.StrOfSlot(alphaSlot); }
+            int pbr = doc.Get(c, "pbrMetallicRoughness");
+            if (pbr >= 0) {
+                mat.MetallicFactor = (float)doc.DoubleAt(doc.Get(pbr, "metallicFactor"), 1.0);
+                mat.RoughnessFactor = (float)doc.DoubleAt(doc.Get(pbr, "roughnessFactor"), 1.0);
+                int bc = doc.Get(pbr, "baseColorFactor");
+                if (bc >= 0 && doc.Count(bc) >= 4) {
+                    int b0 = doc.FirstChild(bc);
+                    int b1 = doc.NextSibling(b0);
+                    int b2 = doc.NextSibling(b1);
+                    int b3 = doc.NextSibling(b2);
+                    mat.BaseColorR = (float)doc.DoubleAt(b0, 1.0);
+                    mat.BaseColorG = (float)doc.DoubleAt(b1, 1.0);
+                    mat.BaseColorB = (float)doc.DoubleAt(b2, 1.0);
+                    mat.BaseColorA = (float)doc.DoubleAt(b3, 1.0);
+                }
+            }
+            model.Materials.Add(mat);
+            c = doc.NextSibling(c);
+        }
+    }
+
+    private static void ParseMeshes(JsonDoc doc, List<byte[]> buffers,
+        List<GltfBufferView> views, List<GltfAccessor> accessors, GltfModel model) {
+        int arr = doc.Get("meshes");
+        if (arr < 0) { return; }
+        int mCount = doc.Count(arr);
+        int mc = doc.FirstChild(arr);
+        for (int mi = 0; mi < mCount && mc >= 0; mi = mi + 1) {
+            int nameSlot = doc.Get(mc, "name");
+            string meshName = nameSlot >= 0 ? doc.StrOfSlot(nameSlot) : ("mesh_" + mi.ToString());
+            int prims = doc.Get(mc, "primitives");
+            if (prims >= 0) {
+                int pCount = doc.Count(prims);
+                int pc = doc.FirstChild(prims);
+                for (int pi = 0; pi < pCount && pc >= 0; pi = pi + 1) {
+                    GltfPrimitive gp = ParsePrimitive(doc, pc, meshName, buffers, views, accessors);
+                    if (gp != null) { model.Primitives.Add(gp); }
+                    pc = doc.NextSibling(pc);
+                }
+            }
+            mc = doc.NextSibling(mc);
+        }
+    }
+
+    private static GltfPrimitive ParsePrimitive(JsonDoc doc, int primSlot, string meshName,
+        List<byte[]> buffers, List<GltfBufferView> views, List<GltfAccessor> accessors) {
+        int attrs = doc.Get(primSlot, "attributes");
+        if (attrs < 0) { return null; }
+        int posAcc = doc.IntAt(doc.Get(attrs, "POSITION"), -1);
+        if (posAcc < 0 || posAcc >= accessors.Count) { return null; }
+
+        float[] positions = ReadFloatAccessor(posAcc, buffers, views, accessors);
+        int vCount = positions.Length / 3;
+        if (vCount <= 0) { return null; }
+
+        int normAcc = doc.IntAt(doc.Get(attrs, "NORMAL"), -1);
+        float[] normals = normAcc >= 0 ? ReadFloatAccessor(normAcc, buffers, views, accessors) : null;
+
+        int uvAcc = doc.IntAt(doc.Get(attrs, "TEXCOORD_0"), -1);
+        float[] uvs = uvAcc >= 0 ? ReadFloatAccessor(uvAcc, buffers, views, accessors) : null;
+
+        int colorAcc = doc.IntAt(doc.Get(attrs, "COLOR_0"), -1);
+        float[] colors = colorAcc >= 0 ? ReadFloatAccessor(colorAcc, buffers, views, accessors) : null;
+        int colorStride = (colorAcc >= 0 && colorAcc < accessors.Count) ? accessors[colorAcc].ComponentCount : 0;
+
+        int jointsAcc = doc.IntAt(doc.Get(attrs, "JOINTS_0"), -1);
+        int weightsAcc = doc.IntAt(doc.Get(attrs, "WEIGHTS_0"), -1);
+        bool isSkinned = jointsAcc >= 0 && weightsAcc >= 0;
+
+        int idxAcc = doc.IntAt(doc.Get(primSlot, "indices"), -1);
+        int[] indices = idxAcc >= 0 ? ReadIntAccessor(idxAcc, buffers, views, accessors) : null;
+        if (indices == null) {
+            indices = new int[vCount];
+            for (int i = 0; i < vCount; i = i + 1) { indices[i] = i; }
+        }
+
+        // 无显式法线时按三角形面法线累加求平滑法线。
+        if (normals == null || normals.Length < vCount * 3) {
+            normals = ComputeVertexNormals(positions, vCount, indices);
+        }
+
+        GltfPrimitive gp = new GltfPrimitive();
+        gp.MeshName = meshName;
+        gp.MaterialIndex = doc.IntAt(doc.Get(primSlot, "material"), -1);
+        gp.IsSkinned = isSkinned;
+
+        if (isSkinned) {
+            int[] joints = ReadIntAccessor(jointsAcc, buffers, views, accessors);
+            float[] weights = ReadFloatAccessor(weightsAcc, buffers, views, accessors);
+            SkinnedMesh3D sm = new SkinnedMesh3D();
+            for (int i = 0; i < vCount; i = i + 1) {
+                float u = (uvs != null && i * 2 + 1 < uvs.Length) ? uvs[i * 2] : 0.0f;
+                float vv = (uvs != null && i * 2 + 1 < uvs.Length) ? uvs[i * 2 + 1] : 0.0f;
+                int j0 = (joints != null && i * 4 + 3 < joints.Length) ? joints[i * 4] : 0;
+                int j1 = (joints != null && i * 4 + 3 < joints.Length) ? joints[i * 4 + 1] : 0;
+                int j2 = (joints != null && i * 4 + 3 < joints.Length) ? joints[i * 4 + 2] : 0;
+                int j3 = (joints != null && i * 4 + 3 < joints.Length) ? joints[i * 4 + 3] : 0;
+                float w0 = (weights != null && i * 4 + 3 < weights.Length) ? weights[i * 4] : 1.0f;
+                float w1 = (weights != null && i * 4 + 3 < weights.Length) ? weights[i * 4 + 1] : 0.0f;
+                float w2 = (weights != null && i * 4 + 3 < weights.Length) ? weights[i * 4 + 2] : 0.0f;
+                float w3 = (weights != null && i * 4 + 3 < weights.Length) ? weights[i * 4 + 3] : 0.0f;
+                sm.Vertex(
+                    positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
+                    normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2],
+                    u, vv, j0, j1, j2, j3, w0, w1, w2, w3);
+            }
+            for (int t = 0; t + 2 < indices.Length; t = t + 3) {
+                sm.Triangle(indices[t], indices[t + 1], indices[t + 2]);
+            }
+            gp.SkinnedMesh = sm;
+        } else {
+            Mesh3D m = new Mesh3D();
+            bool hasColor = colors != null && (colorStride == 3 || colorStride == 4)
+                && colors.Length >= vCount * colorStride;
+            for (int i = 0; i < vCount; i = i + 1) {
+                float u = (uvs != null && i * 2 + 1 < uvs.Length) ? uvs[i * 2] : 0.0f;
+                float vv = (uvs != null && i * 2 + 1 < uvs.Length) ? uvs[i * 2 + 1] : 0.0f;
+                if (hasColor) {
+                    int ci = i * colorStride;
+                    float ca = colorStride == 4 ? colors[ci + 3] : 1.0f;
+                    m.VertexC(
+                        positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
+                        normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2],
+                        u, vv, colors[ci], colors[ci + 1], colors[ci + 2], ca);
+                } else {
+                    m.Vertex(
+                        positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
+                        normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2],
+                        u, vv);
+                }
+            }
+            for (int t = 0; t + 2 < indices.Length; t = t + 3) {
+                m.Triangle(indices[t], indices[t + 1], indices[t + 2]);
+            }
+            gp.Mesh = m;
+        }
+        return gp;
+    }
+
+    private static void ParseFirstSkin(JsonDoc doc, List<byte[]> buffers,
+        List<GltfBufferView> views, List<GltfAccessor> accessors, GltfModel model) {
+        int skinsSlot = doc.Get("skins");
+        int nodesSlot = doc.Get("nodes");
+        if (skinsSlot < 0 || doc.Count(skinsSlot) <= 0 || nodesSlot < 0) { return; }
+
+        // 解析全部节点层级
+        int nodeCount = doc.Count(nodesSlot);
+        List<GltfNodeInfo> nodes = new List<GltfNodeInfo>();
+        int nc = doc.FirstChild(nodesSlot);
+        for (int i = 0; i < nodeCount && nc >= 0; i = i + 1) {
+            GltfNodeInfo info = new GltfNodeInfo();
+            int ns = doc.Get(nc, "name");
+            info.Name = ns >= 0 ? doc.StrOfSlot(ns) : ("node_" + i.ToString());
+            Vector3 pos = Vector3.Zero;
+            Quaternion rot = Quaternion.Identity;
+            Vector3 scl = Vector3.One;
+            int tr = doc.Get(nc, "translation");
+            if (tr >= 0 && doc.Count(tr) >= 3) {
+                int c0 = doc.FirstChild(tr);
+                int c1 = doc.NextSibling(c0);
+                int c2 = doc.NextSibling(c1);
+                pos = new Vector3((float)doc.DoubleAt(c0, 0.0), (float)doc.DoubleAt(c1, 0.0), (float)doc.DoubleAt(c2, 0.0));
+            }
+            int rt = doc.Get(nc, "rotation");
+            if (rt >= 0 && doc.Count(rt) >= 4) {
+                int c0 = doc.FirstChild(rt);
+                int c1 = doc.NextSibling(c0);
+                int c2 = doc.NextSibling(c1);
+                int c3 = doc.NextSibling(c2);
+                rot = new Quaternion((float)doc.DoubleAt(c0, 0.0), (float)doc.DoubleAt(c1, 0.0),
+                    (float)doc.DoubleAt(c2, 0.0), (float)doc.DoubleAt(c3, 1.0));
+            }
+            int sc = doc.Get(nc, "scale");
+            if (sc >= 0 && doc.Count(sc) >= 3) {
+                int c0 = doc.FirstChild(sc);
+                int c1 = doc.NextSibling(c0);
+                int c2 = doc.NextSibling(c1);
+                scl = new Vector3((float)doc.DoubleAt(c0, 1.0), (float)doc.DoubleAt(c1, 1.0), (float)doc.DoubleAt(c2, 1.0));
+            }
+            info.LocalTransform = new Transform3D(pos, rot, scl);
+            int ch = doc.Get(nc, "children");
+            if (ch >= 0) {
+                int chCount = doc.Count(ch);
+                int cc = doc.FirstChild(ch);
+                for (int k = 0; k < chCount && cc >= 0; k = k + 1) {
+                    info.Children.Add(doc.IntAt(cc, -1));
+                    cc = doc.NextSibling(cc);
+                }
+            }
+            nodes.Add(info);
+            nc = doc.NextSibling(nc);
+        }
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            List<int> ch = nodes[i].Children;
+            for (int k = 0; k < ch.Count; k = k + 1) {
+                int childIdx = ch[k];
+                if (childIdx >= 0 && childIdx < nodes.Count) {
+                    nodes[childIdx].ParentIndex = i;
+                }
+            }
+        }
+
+        int skin0 = doc.FirstChild(skinsSlot);
+        int jointsArr = doc.Get(skin0, "joints");
+        if (jointsArr < 0 || doc.Count(jointsArr) <= 0) { return; }
+        int jCount = doc.Count(jointsArr);
+        int[] jointNodes = new int[jCount];
+        Dictionary<int, int> nodeToJoint = new Dictionary<int, int>();
+        int jc = doc.FirstChild(jointsArr);
+        for (int i = 0; i < jCount && jc >= 0; i = i + 1) {
+            int nIdx = doc.IntAt(jc, 0);
+            jointNodes[i] = nIdx;
+            if (!nodeToJoint.ContainsKey(nIdx)) {
+                nodeToJoint.Add(nIdx, i);
+            }
+            jc = doc.NextSibling(jc);
+        }
+        model.JointNodeIndices = jointNodes;
+
+        int ibmAcc = doc.IntAt(doc.Get(skin0, "inverseBindMatrices"), -1);
+        if (ibmAcc >= 0 && ibmAcc < accessors.Count) {
+            model.InverseBindMatrices = ReadFloatAccessor(ibmAcc, buffers, views, accessors);
+        }
+
+        // 按父在子前拓扑序构建 Game.Animation.Skeleton（若存在非拓扑排列则通过迭代就绪队列排序）。
+        Skeleton skel = new Skeleton();
+        int[] jointToSkel = new int[jCount];
+        bool[] added = new bool[jCount];
+        for (int i = 0; i < jCount; i = i + 1) { jointToSkel[i] = -1; }
+        int remaining = jCount;
+        for (int pass = 0; pass < jCount && remaining > 0; pass = pass + 1) {
+            bool progress = false;
+            for (int i = 0; i < jCount; i = i + 1) {
+                if (added[i]) { continue; }
+                int nIdx = jointNodes[i];
+                int parentNode = (nIdx >= 0 && nIdx < nodes.Count) ? nodes[nIdx].ParentIndex : -1;
+                int parentJoint = -1;
+                if (parentNode >= 0 && nodeToJoint.TryGetValue(parentNode, out parentJoint)) {
+                    if (!added[parentJoint]) { continue; }
+                } else {
+                    parentJoint = -1;
+                }
+                int skelParent = parentJoint >= 0 ? jointToSkel[parentJoint] : -1;
+                string bName = (nIdx >= 0 && nIdx < nodes.Count && nodes[nIdx].Name != "")
+                    ? nodes[nIdx].Name : ("joint_" + i.ToString());
+                if (skel.IndexOf(bName) >= 0) {
+                    bName = bName + "_" + i.ToString();
+                }
+                Transform3D bind = (nIdx >= 0 && nIdx < nodes.Count)
+                    ? nodes[nIdx].LocalTransform : Transform3D.Identity;
+                skel.AddBone(bName, skelParent, bind);
+                jointToSkel[i] = skel.Count() - 1;
+                added[i] = true;
+                remaining = remaining - 1;
+                progress = true;
+            }
+            if (!progress) { break; }
+        }
+        skel.RefreshBind();
+        model.Skeleton = skel;
+    }
+
+    private static float[] ComputeVertexNormals(float[] pos, int vCount, int[] indices) {
+        float[] nrm = new float[vCount * 3];
+        for (int t = 0; t + 2 < indices.Length; t = t + 3) {
+            int i0 = indices[t];
+            int i1 = indices[t + 1];
+            int i2 = indices[t + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vCount || i1 >= vCount || i2 >= vCount) {
+                continue;
+            }
+            float ax = pos[i1 * 3] - pos[i0 * 3];
+            float ay = pos[i1 * 3 + 1] - pos[i0 * 3 + 1];
+            float az = pos[i1 * 3 + 2] - pos[i0 * 3 + 2];
+            float bx = pos[i2 * 3] - pos[i0 * 3];
+            float by = pos[i2 * 3 + 1] - pos[i0 * 3 + 1];
+            float bz = pos[i2 * 3 + 2] - pos[i0 * 3 + 2];
+            float nx = ay * bz - az * by;
+            float ny = az * bx - ax * bz;
+            float nz = ax * by - ay * bx;
+            nrm[i0 * 3] = nrm[i0 * 3] + nx; nrm[i0 * 3 + 1] = nrm[i0 * 3 + 1] + ny; nrm[i0 * 3 + 2] = nrm[i0 * 3 + 2] + nz;
+            nrm[i1 * 3] = nrm[i1 * 3] + nx; nrm[i1 * 3 + 1] = nrm[i1 * 3 + 1] + ny; nrm[i1 * 3 + 2] = nrm[i1 * 3 + 2] + nz;
+            nrm[i2 * 3] = nrm[i2 * 3] + nx; nrm[i2 * 3 + 1] = nrm[i2 * 3 + 1] + ny; nrm[i2 * 3 + 2] = nrm[i2 * 3 + 2] + nz;
+        }
+        for (int i = 0; i < vCount; i = i + 1) {
+            float x = nrm[i * 3];
+            float y = nrm[i * 3 + 1];
+            float z = nrm[i * 3 + 2];
+            float len = (float)Math.Sqrt((double)(x * x + y * y + z * z));
+            if (len > 1e-6f) {
+                nrm[i * 3] = x / len;
+                nrm[i * 3 + 1] = y / len;
+                nrm[i * 3 + 2] = z / len;
+            } else {
+                nrm[i * 3] = 0.0f; nrm[i * 3 + 1] = 1.0f; nrm[i * 3 + 2] = 0.0f;
+            }
+        }
+        return nrm;
+    }
+
+    private static float[] ReadFloatAccessor(int accIndex, List<byte[]> buffers,
+        List<GltfBufferView> views, List<GltfAccessor> accessors) {
+        if (accIndex < 0 || accIndex >= accessors.Count) { return new float[0]; }
+        GltfAccessor acc = accessors[accIndex];
+        if (acc.BufferView < 0 || acc.BufferView >= views.Count || acc.Count <= 0) {
+            return new float[0];
+        }
+        GltfBufferView bv = views[acc.BufferView];
+        if (bv.BufferIndex < 0 || bv.BufferIndex >= buffers.Count) { return new float[0]; }
+        byte[] buf = buffers[bv.BufferIndex];
+        int compSize = ComponentByteSize(acc.ComponentType);
+        int elemSize = compSize * acc.ComponentCount;
+        int stride = bv.ByteStride > 0 ? bv.ByteStride : elemSize;
+        int baseOff = bv.ByteOffset + acc.ByteOffset;
+        float[] dst = new float[acc.Count * acc.ComponentCount];
+        for (int i = 0; i < acc.Count; i = i + 1) {
+            int rowOff = baseOff + i * stride;
+            for (int k = 0; k < acc.ComponentCount; k = k + 1) {
+                int off = rowOff + k * compSize;
+                if (off < 0 || off + compSize > buf.Length) { continue; }
+                dst[i * acc.ComponentCount + k] = ReadComponentFloat(buf, off, acc.ComponentType, acc.Normalized);
+            }
+        }
+        return dst;
+    }
+
+    private static int[] ReadIntAccessor(int accIndex, List<byte[]> buffers,
+        List<GltfBufferView> views, List<GltfAccessor> accessors) {
+        if (accIndex < 0 || accIndex >= accessors.Count) { return new int[0]; }
+        GltfAccessor acc = accessors[accIndex];
+        if (acc.BufferView < 0 || acc.BufferView >= views.Count || acc.Count <= 0) {
+            return new int[0];
+        }
+        GltfBufferView bv = views[acc.BufferView];
+        if (bv.BufferIndex < 0 || bv.BufferIndex >= buffers.Count) { return new int[0]; }
+        byte[] buf = buffers[bv.BufferIndex];
+        int compSize = ComponentByteSize(acc.ComponentType);
+        int elemSize = compSize * acc.ComponentCount;
+        int stride = bv.ByteStride > 0 ? bv.ByteStride : elemSize;
+        int baseOff = bv.ByteOffset + acc.ByteOffset;
+        int[] dst = new int[acc.Count * acc.ComponentCount];
+        for (int i = 0; i < acc.Count; i = i + 1) {
+            int rowOff = baseOff + i * stride;
+            for (int k = 0; k < acc.ComponentCount; k = k + 1) {
+                int off = rowOff + k * compSize;
+                if (off < 0 || off + compSize > buf.Length) { continue; }
+                dst[i * acc.ComponentCount + k] = ReadComponentInt(buf, off, acc.ComponentType);
+            }
+        }
+        return dst;
+    }
+
+    private static float ReadComponentFloat(byte[] buf, int off, int compType, bool normalized) {
+        if (compType == COMP_FLOAT) {
+            return BitConverter.ToSingle(buf, off);
+        }
+        if (compType == COMP_UBYTE) {
+            int v = buf[off] & 255;
+            return normalized ? (float)v / 255.0f : (float)v;
+        }
+        if (compType == COMP_USHORT) {
+            int v = (buf[off] & 255) | ((buf[off + 1] & 255) << 8);
+            return normalized ? (float)v / 65535.0f : (float)v;
+        }
+        if (compType == COMP_SBYTE) {
+            int v = buf[off] & 255;
+            if (v >= 128) { v = v - 256; }
+            if (!normalized) { return (float)v; }
+            float f = (float)v / 127.0f;
+            return f < -1.0f ? -1.0f : f;
+        }
+        if (compType == COMP_SHORT) {
+            int v = (buf[off] & 255) | ((buf[off + 1] & 255) << 8);
+            if (v >= 32768) { v = v - 65536; }
+            if (!normalized) { return (float)v; }
+            float f = (float)v / 32767.0f;
+            return f < -1.0f ? -1.0f : f;
+        }
+        if (compType == COMP_UINT) {
+            return (float)ReadU32(buf, off);
+        }
+        return 0.0f;
+    }
+
+    private static int ReadComponentInt(byte[] buf, int off, int compType) {
+        if (compType == COMP_UBYTE) { return buf[off] & 255; }
+        if (compType == COMP_USHORT) { return (buf[off] & 255) | ((buf[off + 1] & 255) << 8); }
+        if (compType == COMP_UINT) { return (int)ReadU32(buf, off); }
+        if (compType == COMP_SBYTE) {
+            int v = buf[off] & 255;
+            return v >= 128 ? v - 256 : v;
+        }
+        if (compType == COMP_SHORT) {
+            int v = (buf[off] & 255) | ((buf[off + 1] & 255) << 8);
+            return v >= 32768 ? v - 65536 : v;
+        }
+        if (compType == COMP_FLOAT) { return (int)BitConverter.ToSingle(buf, off); }
+        return 0;
+    }
+
+    private static int TypeToCompCount(string t) {
+        if (t == "VEC2") { return 2; }
+        if (t == "VEC3") { return 3; }
+        if (t == "VEC4") { return 4; }
+        if (t == "MAT2") { return 4; }
+        if (t == "MAT3") { return 9; }
+        if (t == "MAT4") { return 16; }
+        return 1;
+    }
+
+    private static int ComponentByteSize(int compType) {
+        if (compType == COMP_SBYTE || compType == COMP_UBYTE) { return 1; }
+        if (compType == COMP_SHORT || compType == COMP_USHORT) { return 2; }
+        return 4;
+    }
+
+    private static uint ReadU32(byte[] b, int off) {
+        return (uint)(b[off] & 255)
+            | ((uint)(b[off + 1] & 255) << 8)
+            | ((uint)(b[off + 2] & 255) << 16)
+            | ((uint)(b[off + 3] & 255) << 24);
+    }
+
+    private static byte[] SliceBytes(byte[] src, int off, int len) {
+        byte[] dst = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { dst[i] = src[off + i]; }
+        return dst;
+    }
+}

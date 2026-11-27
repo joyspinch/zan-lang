@@ -1,0 +1,299 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Animation;
+using Game.Assets;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DCommercialBaseTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static void WriteU32(List<byte> buf, uint v) {
+        buf.Add((byte)(v & 255u));
+        buf.Add((byte)((v >> 8) & 255u));
+        buf.Add((byte)((v >> 16) & 255u));
+        buf.Add((byte)((v >> 24) & 255u));
+    }
+
+    private static void WriteU16(List<byte> buf, int v) {
+        buf.Add((byte)(v & 255));
+        buf.Add((byte)((v >> 8) & 255));
+    }
+
+    private static void WriteF32(List<byte> buf, float f) {
+        int bits = BitConverter.SingleToInt32Bits(f);
+        WriteU32(buf, (uint)bits);
+    }
+
+    private static void Pad4(List<byte> buf, byte padByte) {
+        while ((buf.Count & 3) != 0) { buf.Add(padByte); }
+    }
+
+    // 在内存中构造一个完全符合 glTF 2.0 规范的 .glb 二进制资产：
+    // - BufferView 0: 3 个顶点 POSITION (36B)
+    // - BufferView 1: 3 个顶点 NORMAL (36B)
+    // - BufferView 2: 3 个顶点 TEXCOORD_0 (24B)
+    // - BufferView 3: 3 个顶点 JOINTS_0 UBYTE4 (12B)
+    // - BufferView 4: 3 个顶点 WEIGHTS_0 FLOAT4 (48B)
+    // - BufferView 5: 3 个索引 USHORT (6B + 2B pad)
+    // 包含 1 个静态网格（省略法线以验证自动法线）、1 个蒙皮网格、1 个 BLEND 材质、2 骨骼父子骨架。
+    private static byte[] BuildSampleGlb() {
+        List<byte> bin = new List<byte>();
+
+        // BV 0: POSITION (offset 0, len 36)
+        int offPos = bin.Count;
+        WriteF32(bin, -0.6f); WriteF32(bin, -0.5f); WriteF32(bin, 0.0f);
+        WriteF32(bin,  0.6f); WriteF32(bin, -0.5f); WriteF32(bin, 0.0f);
+        WriteF32(bin,  0.0f); WriteF32(bin,  0.7f); WriteF32(bin, 0.0f);
+        int lenPos = bin.Count - offPos;
+
+        // BV 1: NORMAL (offset 36, len 36)
+        int offNrm = bin.Count;
+        for (int i = 0; i < 3; i = i + 1) {
+            WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        }
+        int lenNrm = bin.Count - offNrm;
+
+        // BV 2: UV (offset 72, len 24)
+        int offUv = bin.Count;
+        WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        WriteF32(bin, 1.0f); WriteF32(bin, 1.0f);
+        WriteF32(bin, 0.5f); WriteF32(bin, 0.0f);
+        int lenUv = bin.Count - offUv;
+
+        // BV 3: JOINTS_0 UBYTE4 (offset 96, len 12)
+        int offJnt = bin.Count;
+        bin.Add(0); bin.Add(0); bin.Add(0); bin.Add(0);
+        bin.Add(0); bin.Add(1); bin.Add(0); bin.Add(0);
+        bin.Add(1); bin.Add(0); bin.Add(0); bin.Add(0);
+        int lenJnt = bin.Count - offJnt;
+
+        // BV 4: WEIGHTS_0 FLOAT4 (offset 108, len 48)
+        int offWgt = bin.Count;
+        WriteF32(bin, 1.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        WriteF32(bin, 0.5f); WriteF32(bin, 0.5f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        WriteF32(bin, 1.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        int lenWgt = bin.Count - offWgt;
+
+        // BV 5: INDICES USHORT (offset 156, len 6)
+        int offIdx = bin.Count;
+        WriteU16(bin, 0); WriteU16(bin, 1); WriteU16(bin, 2);
+        int lenIdx = bin.Count - offIdx;
+        Pad4(bin, 0);
+
+        string json = "{"
+            + "\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":" + bin.Count.ToString() + "}],"
+            + "\"bufferViews\":["
+            + "{\"buffer\":0,\"byteOffset\":" + offPos.ToString() + ",\"byteLength\":" + lenPos.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offNrm.ToString() + ",\"byteLength\":" + lenNrm.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offUv.ToString() + ",\"byteLength\":" + lenUv.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offJnt.ToString() + ",\"byteLength\":" + lenJnt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offWgt.ToString() + ",\"byteLength\":" + lenWgt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offIdx.ToString() + ",\"byteLength\":" + lenIdx.ToString() + "}"
+            + "],"
+            + "\"accessors\":["
+            + "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},"
+            + "{\"bufferView\":3,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":4,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":5,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}"
+            + "],"
+            + "\"materials\":[{\"name\":\"glass\",\"alphaMode\":\"BLEND\","
+            + "\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.25,0.5,0.75,0.5],\"metallicFactor\":0.2,\"roughnessFactor\":0.4}}],"
+            + "\"meshes\":["
+            + "{\"name\":\"static_tri\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"TEXCOORD_0\":2},\"indices\":5,\"material\":0}]},"
+            + "{\"name\":\"skinned_tri\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4},\"indices\":5,\"material\":0}]}"
+            + "],"
+            + "\"nodes\":["
+            + "{\"name\":\"root\",\"children\":[1],\"translation\":[0,0,0]},"
+            + "{\"name\":\"arm\",\"translation\":[0,1,0]}"
+            + "],"
+            + "\"skins\":[{\"joints\":[0,1]}]"
+            + "}";
+
+        byte[] jsonRaw = Encoding.UTF8.GetBytes(json);
+        List<byte> jsonChunk = new List<byte>();
+        for (int i = 0; i < jsonRaw.Length; i = i + 1) { jsonChunk.Add(jsonRaw[i]); }
+        Pad4(jsonChunk, 0x20); // JSON chunk 用空格 0x20 4 字节对齐
+
+        int totalLen = 12 + 8 + jsonChunk.Count + 8 + bin.Count;
+        List<byte> glb = new List<byte>();
+        WriteU32(glb, 0x46546C67u); // "glTF"
+        WriteU32(glb, 2u);
+        WriteU32(glb, (uint)totalLen);
+        // JSON chunk
+        WriteU32(glb, (uint)jsonChunk.Count);
+        WriteU32(glb, 0x4E4F534Au); // "JSON"
+        for (int i = 0; i < jsonChunk.Count; i = i + 1) { glb.Add(jsonChunk[i]); }
+        // BIN chunk
+        WriteU32(glb, (uint)bin.Count);
+        WriteU32(glb, 0x004E4942u); // "BIN\0"
+        for (int i = 0; i < bin.Count; i = i + 1) { glb.Add(bin[i]); }
+
+        byte[] outBytes = new byte[glb.Count];
+        for (int i = 0; i < glb.Count; i = i + 1) { outBytes[i] = glb[i]; }
+        return outBytes;
+    }
+
+    private static bool Near(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = -d; }
+        return d <= eps;
+    }
+
+    private static bool TestGltfAndSkeleton(out GltfModel outModel) {
+        byte[] glb = BuildSampleGlb();
+        GltfModel model = GltfLoader.LoadGlb(glb);
+        outModel = model;
+        if (model == null) { return false; }
+        if (model.PrimitiveCount != 2 || model.MaterialCount != 1) { return false; }
+
+        GltfMaterial mat = model.Materials[0];
+        if (mat.AlphaMode != "BLEND" || !Near(mat.BaseColorR, 0.25f, 0.001f)
+            || !Near(mat.BaseColorA, 0.5f, 0.001f)) { return false; }
+
+        GltfPrimitive p0 = model.Primitives[0];
+        GltfPrimitive p1 = model.Primitives[1];
+        if (p0.IsSkinned || p0.Mesh == null || p0.Mesh.VertexCount() != 3 || p0.Mesh.IndexCount() != 3) {
+            return false;
+        }
+        // 验证自动计算的法线朝 +Z
+        float[] v0 = p0.Mesh.VertexArray();
+        if (!Near(v0[3], 0.0f, 0.001f) || !Near(v0[4], 0.0f, 0.001f) || !Near(v0[5], 1.0f, 0.001f)) {
+            return false;
+        }
+
+        if (!p1.IsSkinned || p1.SkinnedMesh == null || p1.SkinnedMesh.VertexCount() != 3
+            || p1.SkinnedMesh.StrideFloats() != 16) {
+            return false;
+        }
+        float[] vs = p1.SkinnedMesh.VertexArray();
+        // 顶点 1 的权重应为 (0.5, 0.5, 0, 0)，关节为 (0, 1, 0, 0)
+        if (!Near(vs[16 + 8], 0.0f, 0.001f) || !Near(vs[16 + 9], 1.0f, 0.001f)
+            || !Near(vs[16 + 12], 0.5f, 0.001f) || !Near(vs[16 + 13], 0.5f, 0.001f)) {
+            return false;
+        }
+
+        if (model.Skeleton == null || model.Skeleton.Count() != 2) { return false; }
+        Bone b0 = model.Skeleton.At(0);
+        Bone b1 = model.Skeleton.At(1);
+        if (b0 == null || b1 == null || b0.Name != "root" || b1.Name != "arm"
+            || b1.ParentIndex != 0) {
+            return false;
+        }
+
+        // 平移 arm 骨骼 (+0.4, 0, 0)，验证蒙皮矩阵列 3 包含该位移
+        Transform3D armPose = new Transform3D(new Vector3(0.4f, 1.0f, 0.0f), Quaternion.Identity, Vector3.One);
+        model.Skeleton.SetLocalPose(1, armPose);
+        float[] boneMats = SkinnedMesh3D.BuildBoneMatrices(model.Skeleton);
+        if (boneMats.Length != 32) { return false; }
+        // Bone 0 保持单位矩阵；Bone 1 蒙皮位移应为 (+0.4, 0, 0)
+        if (!Near(boneMats[0], 1.0f, 0.001f) || !Near(boneMats[16 + 12], 0.4f, 0.001f)
+            || !Near(boneMats[16 + 13], 0.0f, 0.001f)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static int RenderedCentroidX(int surfaceId, int bg, out int pixelCount) {
+        int sumX = 0;
+        int cnt = 0;
+        for (int y = 0; y < 128; y = y + 2) {
+            for (int x = 0; x < 128; x = x + 2) {
+                int p = zan_gui_read_pixel(surfaceId, x, y);
+                if (p != bg) {
+                    sumX = sumX + x;
+                    cnt = cnt + 1;
+                }
+            }
+        }
+        pixelCount = cnt;
+        return cnt > 0 ? (sumX / cnt) : -1;
+    }
+
+    private static bool TestGpu3DPipeline(GltfModel model) {
+        // 显式启用 GPU 后端（OpenGL 3.3 Core），真正走通着色器/FBO/蒙皮管线
+        Canvas.SetBackend(1);
+        Canvas c = new Canvas(128, 128);
+        int bg = unchecked((int)0xFF102030);
+        c.Clear(bg);
+
+        int staticHandle = c.MeshUpload(model.Primitives[0].Mesh);
+        int skinnedHandle = c.MeshUploadSkinned(model.Primitives[1].SkinnedMesh);
+
+        // 若运行在无 OpenGL 上下文的纯无头环境，安全返回
+        if (staticHandle == 0 && skinnedHandle == 0) {
+            c.Destroy();
+            return true;
+        }
+        if (staticHandle <= 0 || skinnedHandle <= 0) {
+            c.Destroy();
+            return false;
+        }
+
+        Mat4 id = Mat4.Identity();
+        // 1. ShadowMap 渲染 Pass（投射体 + 3x3 PCF 软阴影采样）
+        int shBegin = c.ShadowBegin(512, id);
+        int shDraw = c.ShadowDraw(staticHandle, id);
+        int shEnd = c.ShadowEnd();
+        if (shBegin != 1 || shDraw != 1 || shEnd != 1) {
+            c.Destroy();
+            return false;
+        }
+
+        // 2. 带阴影接收的主 Pass 3D 绘制 + 24-bit 深度缓冲
+        int drawOpaque = c.DrawMesh3DEx(staticHandle, id, id, unchecked((int)0xFFCCCCCC), "");
+        int pxOpaque = zan_gui_read_pixel(c.SurfaceId(), 64, 64);
+
+        // 3. 半透明 Alpha Blend（深度写关闭，半透明纯红叠在灰白三角上，像素必变化且 R 通道抬升）
+        int blendOn = c.SetBlend3D(true, false);
+        int drawBlend = c.DrawMesh3DEx(staticHandle, id, id, unchecked((int)0x80FF2020), "");
+        int pxBlended = zan_gui_read_pixel(c.SurfaceId(), 64, 64);
+        int blendOff = c.SetBlend3D(false, true);
+        c.ShadowClear();
+
+        // 4. GPU 骨骼蒙皮绘制：对比绑定姿势（对称中心）与 arm 骨骼右移 +0.4 后的像素质心 X
+        model.Skeleton.ResetToBindPose();
+        c.Clear(bg);
+        int setBind = c.SetBones3D(model.Skeleton);
+        int drawBind = c.DrawMesh3DSkinned(skinnedHandle, id, id, unchecked((int)0xFF40FF40), "");
+        int bindCount = 0;
+        int bindCentroidX = RenderedCentroidX(c.SurfaceId(), bg, out bindCount);
+
+        Transform3D shiftedPose = new Transform3D(new Vector3(0.4f, 1.0f, 0.0f), Quaternion.Identity, Vector3.One);
+        model.Skeleton.SetLocalPose(1, shiftedPose);
+        c.Clear(bg);
+        int setShift = c.SetBones3D(model.Skeleton);
+        int drawShift = c.DrawMesh3DSkinned(skinnedHandle, id, id, unchecked((int)0xFF40FF40), "");
+        int shiftCount = 0;
+        int shiftCentroidX = RenderedCentroidX(c.SurfaceId(), bg, out shiftCount);
+
+        c.Destroy();
+
+        int rOpaque = (pxOpaque >> 16) & 255;
+        int rBlended = (pxBlended >> 16) & 255;
+        bool bgChangedOpaque = pxOpaque != bg;
+        bool blendChanged = pxBlended != pxOpaque && rBlended > rOpaque;
+        bool skinnedShifted = bindCount > 100 && shiftCount > 100
+            && shiftCentroidX > bindCentroidX + 5;
+        return drawOpaque == 1 && blendOn == 1 && drawBlend == 1 && blendOff == 1
+            && setBind == 1 && drawBind == 1 && setShift == 1 && drawShift == 1
+            && bgChangedOpaque && blendChanged && skinnedShifted;
+    }
+
+    static void Main() {
+        GltfModel model = null;
+        bool gltfOk = TestGltfAndSkeleton(out model);
+        bool gpuOk = gltfOk && TestGpu3DPipeline(model);
+        Console.WriteLine("gltf-glb-skeleton: " + Convert.ToString(gltfOk ? 1 : 0));
+        Console.WriteLine("gpu-3d-shadow-blend-skin: " + Convert.ToString(gpuOk ? 1 : 0));
+    }
+}

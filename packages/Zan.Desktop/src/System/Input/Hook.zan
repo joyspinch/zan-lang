@@ -57,9 +57,12 @@ public class Hook {
     // 原生 hook proc。存放在静态字段中，确保 ARC 在 user32 仍持有其地址期间不会释放该
     // delegate。
     static HookProc hookProc;
+    static HookProc kbHookProc;
+    static HookProc msHookProc;
 
     static nint hookHandle;
-    static int hookKind;  // 13 = 键盘，14 = 鼠标
+    static nint secondHookHandle;
+    static int hookKind;  // 13 = 键盘，14 = 鼠标，15 = 键盘+鼠标双钩子
     static int hookThreadId;
     static int wantUnhook;
     static int threadFailed;
@@ -146,6 +149,22 @@ public class Hook {
         return Hook.Install(14, null, cb);
         #elif LINUX || MACOS
         return Hook.PosixInstall(14, null, cb);
+        #else
+        throw new PlatformNotSupportedException(
+            "Global input hooks are only supported on Windows, Linux, and macOS.");
+        #endif
+    }
+
+    // 同时安装全局低级键盘钩子与鼠标钩子（适合桌宠/挂机计数等需要同时监听键鼠的场景）。
+    public static bool InstallBoth(KeyboardHookCallback kcb, MouseHookCallback mcb) {
+        if (kcb == null && mcb == null) { return false; }
+        #if WINDOWS
+        if (kcb != null && mcb == null) { return Hook.Install(13, kcb, null); }
+        if (kcb == null && mcb != null) { return Hook.Install(14, null, mcb); }
+        return Hook.Install(15, kcb, mcb);
+        #elif LINUX || MACOS
+        if (kcb != null) { return Hook.PosixInstall(13, kcb, null); }
+        return Hook.PosixInstall(14, null, mcb);
         #else
         throw new PlatformNotSupportedException(
             "Global input hooks are only supported on Windows, Linux, and macOS.");
@@ -256,27 +275,73 @@ public class Hook {
         int kind = Hook.hookKind;
         int tid = Hook.GetCurrentThreadId();
         Hook.hookThreadId = tid;
-        Hook.hookProc = Hook.HookProcImpl;
-        nint h = Hook.SetWindowsHookExW(kind, Hook.hookProc, 0, 0);
-        if (h == 0) {
-            Hook.threadFailed = 1;
-            return;
+        nint h1 = 0;
+        nint h2 = 0;
+        if (kind == 15) {
+            Hook.kbHookProc = Hook.KbHookProcImpl;
+            Hook.msHookProc = Hook.MsHookProcImpl;
+            h1 = Hook.SetWindowsHookExW(13, Hook.kbHookProc, 0, 0);
+            if (h1 == 0) {
+                Hook.threadFailed = 1;
+                return;
+            }
+            h2 = Hook.SetWindowsHookExW(14, Hook.msHookProc, 0, 0);
+            if (h2 == 0) {
+                Hook.UnhookWindowsHookEx(h1);
+                Hook.threadFailed = 1;
+                return;
+            }
+            Hook.secondHookHandle = h2;
+            Hook.hookHandle = h1;
+        } else {
+            Hook.hookProc = Hook.HookProcImpl;
+            h1 = Hook.SetWindowsHookExW(kind, Hook.hookProc, 0, 0);
+            if (h1 == 0) {
+                Hook.threadFailed = 1;
+                return;
+            }
+            Hook.secondHookHandle = 0;
+            Hook.hookHandle = h1;
         }
-        Hook.hookHandle = h;
         nint msg = NativeMemory.Alloc(64);
         try {
             while (Hook.wantUnhook == 0) {
                 int r = Hook.GetMessageW(msg, 0, 0, 0);
                 if (r <= 0) { break; }
-                // 低级钩子回调在 GetMessage 内部触发；无需再分发其他内容
-                // （低级钩子看到事件时，事件还没进入目标
-                // 窗口的消息队列）。
             }
         } finally {
             NativeMemory.Free(msg);
-            Hook.UnhookWindowsHookEx(h);
+            if (h2 != 0) { Hook.UnhookWindowsHookEx(h2); }
+            Hook.UnhookWindowsHookEx(h1);
+            Hook.secondHookHandle = 0;
             Hook.hookHandle = 0;
         }
+    }
+
+    private static nint KbHookProcImpl(int code, nint wp, nint lp) {
+        if (code >= 0 && Hook.keyboardCb != null) {
+            Span<int> k = new Span<int>(lp, 6);
+            int vk = k[0];
+            int scan = k[1];
+            int flags = k[2];
+            bool injected = (flags & 0x10) != 0;
+            bool up = (flags & 0x80) != 0;
+            if (Hook.keyboardCb(vk, scan, flags, injected, up)) { return (nint)1; }
+        }
+        return Hook.CallNextHookEx(0, code, wp, lp);
+    }
+
+    private static nint MsHookProcImpl(int code, nint wp, nint lp) {
+        if (code >= 0 && Hook.mouseCb != null) {
+            Span<int> m = new Span<int>(lp, 8);
+            int x = m[0];
+            int y = m[1];
+            int data = m[2];
+            int flags = m[3];
+            bool injected = (flags & 0x01) != 0;
+            if (Hook.mouseCb(x, y, (int)wp, data, injected)) { return (nint)1; }
+        }
+        return Hook.CallNextHookEx(0, code, wp, lp);
     }
 
     // 由操作系统调用的 hook proc（运行在钩子线程上）。

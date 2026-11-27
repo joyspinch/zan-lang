@@ -1884,6 +1884,52 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
     return 0;
 }
 
+EXPORT void zan_gui_set_transparent(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_transparent(hwnd_val, on));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return;
+    @autoreleasepool {
+        @try {
+            [mw->window setOpaque:(on ? NO : YES)];
+            [mw->window setBackgroundColor:(on ? [NSColor clearColor] : [NSColor windowBackgroundColor])];
+            [mw->window setHasShadow:(on ? NO : YES)];
+        } @catch (NSException *ex) {
+        }
+    }
+}
+
+EXPORT void zan_gui_set_click_through(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_click_through(hwnd_val, on));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return;
+    @autoreleasepool {
+        @try {
+            [mw->window setIgnoresMouseEvents:(on ? YES : NO)];
+        } @catch (NSException *ex) {
+        }
+    }
+}
+
+EXPORT i32 zan_gui_start_window_drag(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_start_window_drag(hwnd_val));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 0;
+    @autoreleasepool {
+        @try {
+            NSEvent *ev = [NSApp currentEvent];
+            if (ev) {
+                [mw->window performWindowDragWithEvent:ev];
+                return 1;
+            }
+        } @catch (NSException *ex) {
+        }
+    }
+    return 0;
+}
+
 /* Whole-window opacity, 10..100 percent. */
 EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
     ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_opacity(hwnd_val, percent));

@@ -976,6 +976,44 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
     return 0;
 }
 
+EXPORT void zan_gui_set_transparent(iptr hwnd_val, i32 on) {
+    (void)hwnd_val;
+    (void)on;
+}
+
+EXPORT void zan_gui_set_click_through(iptr hwnd_val, i32 on) {
+    (void)hwnd_val;
+    (void)on;
+}
+
+EXPORT i32 zan_gui_start_window_drag(iptr hwnd_val) {
+    if (!g_display) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!xid) return 0;
+    Window root = DefaultRootWindow(g_display);
+    Window child = 0;
+    int rx = 0, ry = 0, wx = 0, wy = 0;
+    unsigned int mask = 0;
+    if (!XQueryPointer(g_display, root, &root, &child, &rx, &ry, &wx, &wy, &mask)) {
+        return 0;
+    }
+    XUngrabPointer(g_display, CurrentTime);
+    XEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = xid;
+    ev.xclient.message_type = x11_atom("_NET_WM_MOVERESIZE");
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = rx;
+    ev.xclient.data.l[1] = ry;
+    ev.xclient.data.l[2] = 8; /* _NET_WM_MOVERESIZE_MOVE */
+    ev.xclient.data.l[3] = Button1;
+    ev.xclient.data.l[4] = 1;
+    XSendEvent(g_display, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(g_display);
+    return 1;
+}
+
 EXPORT i32 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i32 zan_gui_caption_button_width(void) { return g_btn_w_l; }
 EXPORT i32 zan_gui_safe_area_top(void) { return 0; }

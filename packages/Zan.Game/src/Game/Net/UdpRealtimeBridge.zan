@@ -1,0 +1,220 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using Game.Netcode;
+
+namespace Game.Net;
+
+// 帧同步权威帧的紧凑二进制编解码与 KCP 实时网络桥接。
+// 线协议（小端序）：
+// [0]      msgType = 1 (AuthorityFrame)
+// [1..4]   frameIdx (int32)
+// [5..6]   cmdCount (uint16)
+// [7..]    每条命令 24 字节：playerId(4) + cmdType(4) + targetX_milli(4) + targetY_milli(4) + targetId(4) + extraParam(4)
+public class LockstepUdpBridge {
+    private const int MSG_AUTH_FRAME = 1;
+    private const int CMD_BYTES = 24;
+
+    private LockstepManager lockstep;
+    private KcpSession kcp;
+    private int framesSent;
+    private int framesReceived;
+
+    public LockstepUdpBridge(LockstepManager manager, KcpSession session) {
+        this.lockstep = manager;
+        this.kcp = session;
+        this.framesSent = 0;
+        this.framesReceived = 0;
+    }
+
+    public int FramesSent { get { return this.framesSent; } }
+    public int FramesReceived { get { return this.framesReceived; } }
+
+    public static byte[] EncodeFrame(int frameIdx, PlayerCommand[] cmds, int count) {
+        int n = cmds != null ? count : 0;
+        if (n < 0) { n = 0; }
+        if (cmds != null && n > cmds.Length) { n = cmds.Length; }
+        if (n > 256) { n = 256; }
+        byte[] buf = new byte[7 + n * CMD_BYTES];
+        buf[0] = (byte)MSG_AUTH_FRAME;
+        WriteI32(buf, 1, frameIdx);
+        buf[5] = (byte)(n & 255);
+        buf[6] = (byte)((n >> 8) & 255);
+        int off = 7;
+        for (int i = 0; i < n; i = i + 1) {
+            PlayerCommand c = cmds[i];
+            int pid = c != null ? c.playerId : 0;
+            int typ = c != null ? c.cmdType : 0;
+            int tx = c != null ? (int)(c.targetX * 1000.0) : 0;
+            int ty = c != null ? (int)(c.targetY * 1000.0) : 0;
+            int tid = c != null ? c.targetId : 0;
+            int ext = c != null ? c.extraParam : 0;
+            WriteI32(buf, off, pid);
+            WriteI32(buf, off + 4, typ);
+            WriteI32(buf, off + 8, tx);
+            WriteI32(buf, off + 12, ty);
+            WriteI32(buf, off + 16, tid);
+            WriteI32(buf, off + 20, ext);
+            off = off + CMD_BYTES;
+        }
+        return buf;
+    }
+
+    public bool SendAuthorityFrame(int frameIdx, PlayerCommand[] cmds, int count) {
+        if (this.kcp == null) { return false; }
+        byte[] wire = LockstepUdpBridge.EncodeFrame(frameIdx, cmds, count);
+        if (this.kcp.Send(wire) == 0) {
+            this.framesSent = this.framesSent + 1;
+            return true;
+        }
+        return false;
+    }
+
+    // 抽取 KCP 中所有完整到达的权威帧并投喂给 LockstepManager。返回接收到的帧数。
+    public int PumpIncoming() {
+        if (this.kcp == null || this.lockstep == null) { return 0; }
+        int got = 0;
+        byte[] pkt = this.kcp.Recv();
+        while (pkt != null) {
+            if (pkt.Length >= 7 && (pkt[0] & 255) == MSG_AUTH_FRAME) {
+                int frameIdx = ReadI32(pkt, 1);
+                int count = (pkt[5] & 255) | ((pkt[6] & 255) << 8);
+                if (7 + count * CMD_BYTES <= pkt.Length) {
+                    PlayerCommand[] cmds = new PlayerCommand[count];
+                    int off = 7;
+                    for (int i = 0; i < count; i = i + 1) {
+                        int pid = ReadI32(pkt, off);
+                        int typ = ReadI32(pkt, off + 4);
+                        double tx = (double)ReadI32(pkt, off + 8) / 1000.0;
+                        double ty = (double)ReadI32(pkt, off + 12) / 1000.0;
+                        int tid = ReadI32(pkt, off + 16);
+                        int ext = ReadI32(pkt, off + 20);
+                        cmds[i] = new PlayerCommand(pid, typ, tx, ty, tid, ext);
+                        off = off + CMD_BYTES;
+                    }
+                    this.lockstep.ReceiveServerFrame(frameIdx, cmds, count);
+                    this.framesReceived = this.framesReceived + 1;
+                    got = got + 1;
+                }
+            }
+            pkt = this.kcp.Recv();
+        }
+        return got;
+    }
+
+    private static void WriteI32(byte[] b, int o, int v) {
+        b[o] = (byte)(v & 255);
+        b[o + 1] = (byte)((v >> 8) & 255);
+        b[o + 2] = (byte)((v >> 16) & 255);
+        b[o + 3] = (byte)((v >> 24) & 255);
+    }
+
+    private static int ReadI32(byte[] b, int o) {
+        return (b[o] & 255)
+            | ((b[o + 1] & 255) << 8)
+            | ((b[o + 2] & 255) << 16)
+            | ((b[o + 3] & 255) << 24);
+    }
+}
+
+// 预测回滚（RollbackSession）的 KCP 实时网络同步桥接：
+// 传输本地输入帧与可选状态校验和，收到远端输入后自动 SubmitRemoteInput 并触发 Resimulate。
+// 线协议（小端序，固定 17 字节）：
+// [0]      msgType = 2 (RollbackInput) | 3 (RollbackChecksum)
+// [1..4]   frameIndex (int32)
+// [5..8]   playerId (int32)
+// [9..12]  inputMask (int32)
+// [13..16] checksum (int32)
+public class RollbackUdpBridge {
+    private const int MSG_INPUT = 2;
+    private const int MSG_CHECKSUM = 3;
+    private const int PACKET_SIZE = 17;
+
+    private RollbackSession rollback;
+    private KcpSession kcp;
+    private int localPlayerId;
+    private int checksumMatches;
+    private int checksumMismatches;
+
+    public RollbackUdpBridge(RollbackSession session, KcpSession transport, int localPlayer) {
+        this.rollback = session;
+        this.kcp = transport;
+        this.localPlayerId = localPlayer;
+        this.checksumMatches = 0;
+        this.checksumMismatches = 0;
+    }
+
+    public int ChecksumMatches { get { return this.checksumMatches; } }
+    public int ChecksumMismatches { get { return this.checksumMismatches; } }
+
+    public bool SendLocalInput(int frameIndex, int inputMask) {
+        if (this.kcp == null) { return false; }
+        byte[] buf = new byte[PACKET_SIZE];
+        buf[0] = (byte)MSG_INPUT;
+        WriteI32(buf, 1, frameIndex);
+        WriteI32(buf, 5, this.localPlayerId);
+        WriteI32(buf, 9, inputMask);
+        WriteI32(buf, 13, 0);
+        return this.kcp.Send(buf) == 0;
+    }
+
+    public bool SendFrameChecksum(int frameIndex, int checksum) {
+        if (this.kcp == null) { return false; }
+        byte[] buf = new byte[PACKET_SIZE];
+        buf[0] = (byte)MSG_CHECKSUM;
+        WriteI32(buf, 1, frameIndex);
+        WriteI32(buf, 5, this.localPlayerId);
+        WriteI32(buf, 9, 0);
+        WriteI32(buf, 13, checksum);
+        return this.kcp.Send(buf) == 0;
+    }
+
+    // 抽取远端输入与校验和；若有误预测则立即回滚重放。返回本轮提交的远端输入数。
+    public int PumpIncoming() {
+        if (this.kcp == null || this.rollback == null) { return 0; }
+        int submitted = 0;
+        byte[] pkt = this.kcp.Recv();
+        while (pkt != null) {
+            if (pkt.Length >= PACKET_SIZE) {
+                int kind = pkt[0] & 255;
+                int frame = ReadI32(pkt, 1);
+                int pid = ReadI32(pkt, 5);
+                int input = ReadI32(pkt, 9);
+                int csum = ReadI32(pkt, 13);
+                if (kind == MSG_INPUT) {
+                    if (this.rollback.SubmitRemoteInput(frame, pid, input)) {
+                        submitted = submitted + 1;
+                    }
+                } else if (kind == MSG_CHECKSUM) {
+                    if (this.rollback.NeedsResimulation()) {
+                        this.rollback.Resimulate();
+                    }
+                    if (this.rollback.VerifyChecksum(frame, csum)) {
+                        this.checksumMatches = this.checksumMatches + 1;
+                    } else {
+                        this.checksumMismatches = this.checksumMismatches + 1;
+                    }
+                }
+            }
+            pkt = this.kcp.Recv();
+        }
+        if (this.rollback.NeedsResimulation()) {
+            this.rollback.Resimulate();
+        }
+        return submitted;
+    }
+
+    private static void WriteI32(byte[] b, int o, int v) {
+        b[o] = (byte)(v & 255);
+        b[o + 1] = (byte)((v >> 8) & 255);
+        b[o + 2] = (byte)((v >> 16) & 255);
+        b[o + 3] = (byte)((v >> 24) & 255);
+    }
+
+    private static int ReadI32(byte[] b, int o) {
+        return (b[o] & 255)
+            | ((b[o + 1] & 255) << 8)
+            | ((b[o + 2] & 255) << 16)
+            | ((b[o + 3] & 255) << 24);
+    }
+}
