@@ -36,31 +36,83 @@ public class DnsPacket {
         this.ednsPayloadSize = 512;
     }
 
-    private static void AppendHex16(StringBuilder sb, int val) {
-        string hex = "0123456789abcdef";
-        sb.Append(hex[(val >> 12) & 15]);
-        sb.Append(hex[(val >> 8) & 15]);
-        sb.Append(hex[(val >> 4) & 15]);
-        sb.Append(hex[val & 15]);
+    // 预计算 RFC 1035 域名编码后的字节数（与 EncodeDomainName 精确一致，零 Split 分配）。
+    private static int MeasureDomainName(string domain) {
+        if (domain == null || domain.Length == 0) { return 1; }
+        int dlen = domain.Length;
+        nint dp = (nint)domain;
+        int total = 1; // 末尾 0 字节
+        int i = 0;
+        while (i < dlen) {
+            int dot = NativeMemory.Find(dp, i, 46, dlen - i);
+            int end = dot < 0 ? dlen : dot;
+            int segLen = end - i;
+            if (segLen > 0) {
+                if (segLen > 63) { segLen = 63; }
+                total = total + 1 + segLen;
+            }
+            if (dot < 0) { break; }
+            i = dot + 1;
+        }
+        return total;
     }
 
-    // 编码域名为 RFC 1035 格式（以标签长度前缀，以 0 字节结尾）
+    // 将域名原地写入已精确分配的 byte[] 缓冲，返回写入后的新偏移。
+    private static int WriteDomainName(byte[] dst, int pos, string domain) {
+        if (domain == null || domain.Length == 0) {
+            dst[pos] = 0;
+            return pos + 1;
+        }
+        int dlen = domain.Length;
+        nint dp = (nint)domain;
+        nint dstPtr = (nint)dst;
+        int i = 0;
+        while (i < dlen) {
+            int dot = NativeMemory.Find(dp, i, 46, dlen - i);
+            int end = dot < 0 ? dlen : dot;
+            int segLen = end - i;
+            if (segLen > 0) {
+                if (segLen > 63) { segLen = 63; }
+                dst[pos] = (byte)segLen;
+                pos = pos + 1;
+                if (segLen >= 16) {
+                    NativeMemory.Copy(dstPtr + (nint)pos, dp + (nint)i, segLen);
+                } else {
+                    for (int k = 0; k < segLen; k = k + 1) {
+                        dst[pos + k] = (byte)(domain[i + k] & 255);
+                    }
+                }
+                pos = pos + segLen;
+            }
+            if (dot < 0) { break; }
+            i = dot + 1;
+        }
+        dst[pos] = 0;
+        return pos + 1;
+    }
+
+    // 编码域名为 RFC 1035 格式（以标签长度前缀，以 0 字节结尾，零 Split 分配）
     public static void EncodeDomainName(List<byte> buf, string domain) {
         if (domain == null || domain.Length == 0) {
             buf.Add(0);
             return;
         }
-        List<string> parts = domain.Split(".");
-        for (int p = 0; p < parts.Count; p = p + 1) {
-            string label = parts[p];
-            if (label.Length > 0) {
-                int len = label.Length;
-                if (len > 63) { len = 63; } // RFC 1035 规定单标签最长 63 字节
-                buf.Add((byte)len);
-                for (int i = 0; i < len; i = i + 1) {
-                    buf.Add((byte)(label[i] & 255));
+        int dlen = domain.Length;
+        nint dp = (nint)domain;
+        int i = 0;
+        while (i < dlen) {
+            int dot = NativeMemory.Find(dp, i, 46, dlen - i);
+            int end = dot < 0 ? dlen : dot;
+            int segLen = end - i;
+            if (segLen > 0) {
+                if (segLen > 63) { segLen = 63; } // RFC 1035 规定单标签最长 63 字节
+                buf.Add((byte)segLen);
+                for (int k = 0; k < segLen; k = k + 1) {
+                    buf.Add((byte)(domain[i + k] & 255));
                 }
             }
+            if (dot < 0) { break; }
+            i = dot + 1;
         }
         buf.Add(0); // 根标签结尾
     }
@@ -70,125 +122,193 @@ public class DnsPacket {
         return DnsPacket.BuildQuery(domain, queryType, txId, 4096);
     }
 
-    // 构建指定 EDNS0 UDP 接收缓冲区上限的 DNS 查询包（ednsPayloadSize <= 512 时退化为标准 RFC 1035 基础报文）
+    // 构建指定 EDNS0 UDP 接收缓冲区上限的 DNS 查询包（单次精确分配，零 List<byte>/Split）
     public static byte[] BuildQuery(string domain, int queryType, int txId, int ednsPayloadSize) {
-        List<byte> buf = new List<byte>();
+        bool hasEdns = ednsPayloadSize > 512;
+        int nameBytes = DnsPacket.MeasureDomainName(domain);
+        int total = 12 + nameBytes + 4 + (hasEdns ? 11 : 0);
+        byte[] res = new byte[total];
 
         // 1. Header (12 字节)
-        buf.Add((byte)((txId >> 8) & 255));
-        buf.Add((byte)(txId & 255));
-        // Flags: 0x0100 (RD = 1, 标准递归查询)
-        buf.Add(1);
-        buf.Add(0);
-        // QDCOUNT = 1 (1 个问题)
-        buf.Add(0);
-        buf.Add(1);
-        // ANCOUNT = 0
-        buf.Add(0);
-        buf.Add(0);
-        // NSCOUNT = 0
-        buf.Add(0);
-        buf.Add(0);
-        // ARCOUNT = (ednsPayloadSize > 512) ? 1 : 0
-        bool hasEdns = ednsPayloadSize > 512;
-        if (hasEdns) {
-            buf.Add(0);
-            buf.Add(1);
-        } else {
-            buf.Add(0);
-            buf.Add(0);
-        }
+        res[0] = (byte)((txId >> 8) & 255);
+        res[1] = (byte)(txId & 255);
+        res[2] = 1; // Flags: 0x0100 (RD = 1)
+        res[3] = 0;
+        res[4] = 0; res[5] = 1; // QDCOUNT = 1
+        // ANCOUNT = 0, NSCOUNT = 0 (zero-initialized)
+        res[11] = (byte)(hasEdns ? 1 : 0); // ARCOUNT
 
         // 2. Question Section
-        DnsPacket.EncodeDomainName(buf, domain);
-        // QTYPE
-        buf.Add((byte)((queryType >> 8) & 255));
-        buf.Add((byte)(queryType & 255));
-        // QCLASS = 1 (IN)
-        buf.Add(0);
-        buf.Add(1);
+        int pos = DnsPacket.WriteDomainName(res, 12, domain);
+        res[pos] = (byte)((queryType >> 8) & 255);
+        res[pos + 1] = (byte)(queryType & 255);
+        res[pos + 2] = 0;
+        res[pos + 3] = 1; // QCLASS = IN
+        pos = pos + 4;
 
-        // 3. RFC 6891 EDNS0 OPT 伪资源记录（附加在 Additional Section）
+        // 3. RFC 6891 EDNS0 OPT 伪资源记录
         if (hasEdns) {
-            buf.Add(0); // 根域名空标签 (Root)
-            buf.Add(0);
-            buf.Add(41); // TYPE = OPT (41)
-            buf.Add((byte)((ednsPayloadSize >> 8) & 255));
-            buf.Add((byte)(ednsPayloadSize & 255)); // CLASS = UDP Payload Size (4096)
-            buf.Add(0);
-            buf.Add(0);
-            buf.Add(0);
-            buf.Add(0); // EXT-RCODE / VERSION(0) / FLAGS
-            buf.Add(0);
-            buf.Add(0); // RDLENGTH = 0 (无额外 Option 键值对)
-        }
-
-        byte[] res = new byte[buf.Count];
-        for (int i = 0; i < buf.Count; i = i + 1) {
-            res[i] = buf[i];
+            // res[pos] = 0 (Root), res[pos + 1] = 0
+            res[pos + 2] = 41; // TYPE = OPT (41)
+            res[pos + 3] = (byte)((ednsPayloadSize >> 8) & 255);
+            res[pos + 4] = (byte)(ednsPayloadSize & 255);
+            // EXT-RCODE/VERSION/FLAGS/RDLENGTH 均为 0
         }
         return res;
     }
 
-    // 内部零装箱 ref int 域名解压器（支持 0xC0 压缩指针，限制最大 16 跳防止循环 DoS）
-    private static string ReadNameRef(byte[] data, int len, ref int outPos, int depth) {
-        if (depth > 16 || data == null || outPos < 0 || outPos >= len) {
+    // 迭代式零递归 RFC 1035 域名解压器（支持 0xC0 压缩指针，最大 16 跳防循环 DoS）
+    private static string ReadNameSpan(Span<byte> d, nint dPtr, int len, ref int outPos, int depth) {
+        if (depth > 16 || len <= 0 || outPos < 0 || outPos >= len) {
             return "";
         }
         int pos = outPos;
-        StringBuilder sb = new StringBuilder();
+        int jumps = depth;
         bool jumped = false;
+        byte[] tmp = new byte[256];
+        nint tmpPtr = (nint)tmp;
+        int oLen = 0;
 
         while (pos < len) {
-            int b = data[pos] & 255;
+            int b = d[pos] & 255;
             if (b == 0) {
                 if (!jumped) {
                     outPos = pos + 1;
                 }
                 break;
             }
-
-            // 0xC0: RFC 1035 §4.1.4 压缩指针标记
             if ((b & 0xC0) == 0xC0) {
                 if (pos + 1 >= len) { break; }
-                int ptr = ((b & 0x3F) << 8) | (data[pos + 1] & 255);
+                int ptr = ((b & 0x3F) << 8) | (d[pos + 1] & 255);
                 if (!jumped) {
                     outPos = pos + 2;
                     jumped = true;
                 }
-                if (ptr >= len) { break; }
-                int ptrPos = ptr;
-                string rest = DnsPacket.ReadNameRef(data, len, ref ptrPos, depth + 1);
-                if (sb.Length > 0 && rest.Length > 0) {
-                    sb.Append(".");
-                }
-                sb.Append(rest);
-                break;
-            } else if ((b & 0xC0) != 0) {
+                jumps = jumps + 1;
+                if (jumps > 16 || ptr >= len) { break; }
+                pos = ptr;
+                continue;
+            }
+            if ((b & 0xC0) != 0) {
                 // RFC 1035 保留标签类型（01/10），拒绝畸形标签
                 break;
+            }
+            pos = pos + 1;
+            if (pos + b > len) { break; }
+            int need = oLen + (oLen > 0 ? 1 : 0) + b;
+            if (need > tmp.Length) {
+                int nc = tmp.Length * 2;
+                while (nc < need) { nc = nc * 2; }
+                byte[] grown = new byte[nc];
+                if (oLen > 0) { NativeMemory.Copy((nint)grown, tmpPtr, oLen); }
+                tmp = grown;
+                tmpPtr = (nint)tmp;
+            }
+            if (oLen > 0) {
+                tmp[oLen] = 46; // '.'
+                oLen = oLen + 1;
+            }
+            if (b >= 16) {
+                NativeMemory.Copy(tmpPtr + (nint)oLen, dPtr + (nint)pos, b);
             } else {
-                pos = pos + 1;
-                if (pos + b > len) { break; }
-                if (sb.Length > 0) {
-                    sb.Append(".");
-                }
-                sb.Append(new StringView((nint)data + (nint)pos, b));
-                pos = pos + b;
-                if (!jumped) {
-                    outPos = pos;
+                for (int k = 0; k < b; k = k + 1) {
+                    tmp[oLen + k] = d[pos + k];
                 }
             }
+            oLen = oLen + b;
+            pos = pos + b;
+            if (!jumped) {
+                outPos = pos;
+            }
         }
+        return oLen == 0 ? "" : NativeMemory.GetString(tmpPtr, 0, oLen);
+    }
 
-        return sb.ToString();
+    // 零分配跳过线上的域名（用于 Authority 区段，不构造任何字符串）
+    private static void SkipNameSpan(Span<byte> d, int len, ref int outPos) {
+        int pos = outPos;
+        while (pos < len) {
+            int b = d[pos] & 255;
+            if (b == 0) {
+                outPos = pos + 1;
+                return;
+            }
+            if ((b & 0xC0) == 0xC0) {
+                if (pos + 1 < len) {
+                    outPos = pos + 2;
+                }
+                return;
+            }
+            if ((b & 0xC0) != 0) {
+                return;
+            }
+            pos = pos + 1;
+            if (pos + b > len) { return; }
+            pos = pos + b;
+            outPos = pos;
+        }
+    }
+
+    private static int WriteByteDec(byte[] buf, int pos, int v) {
+        if (v >= 100) {
+            int h = v / 100;
+            int r = v - h * 100;
+            int t = r / 10;
+            buf[pos] = (byte)(48 + h);
+            buf[pos + 1] = (byte)(48 + t);
+            buf[pos + 2] = (byte)(48 + (r - t * 10));
+            return pos + 3;
+        }
+        if (v >= 10) {
+            int t = v / 10;
+            buf[pos] = (byte)(48 + t);
+            buf[pos + 1] = (byte)(48 + (v - t * 10));
+            return pos + 2;
+        }
+        buf[pos] = (byte)(48 + v);
+        return pos + 1;
+    }
+
+    private static string FormatIPv4(Span<byte> d, int pos) {
+        byte[] buf = new byte[15];
+        int o = DnsPacket.WriteByteDec(buf, 0, d[pos] & 255);
+        buf[o] = 46; o = DnsPacket.WriteByteDec(buf, o + 1, d[pos + 1] & 255);
+        buf[o] = 46; o = DnsPacket.WriteByteDec(buf, o + 1, d[pos + 2] & 255);
+        buf[o] = 46; o = DnsPacket.WriteByteDec(buf, o + 1, d[pos + 3] & 255);
+        return NativeMemory.GetString((nint)buf, 0, o);
+    }
+
+    private static string FormatIPv6Full(Span<byte> d, int pos) {
+        byte[] buf = new byte[39];
+        int o = 0;
+        for (int i = 0; i < 16; i = i + 2) {
+            if (i > 0) {
+                buf[o] = 58; // ':'
+                o = o + 1;
+            }
+            int b0 = d[pos + i] & 255;
+            int b1 = d[pos + i + 1] & 255;
+            int n0 = (b0 >> 4) & 15;
+            int n1 = b0 & 15;
+            int n2 = (b1 >> 4) & 15;
+            int n3 = b1 & 15;
+            buf[o] = (byte)(n0 < 10 ? 48 + n0 : 87 + n0);
+            buf[o + 1] = (byte)(n1 < 10 ? 48 + n1 : 87 + n1);
+            buf[o + 2] = (byte)(n2 < 10 ? 48 + n2 : 87 + n2);
+            buf[o + 3] = (byte)(n3 < 10 ? 48 + n3 : 87 + n3);
+            o = o + 4;
+        }
+        return NativeMemory.GetString((nint)buf, 0, 39);
     }
 
     // 读取解压 RFC 1035 域名标签（含压缩指针 0xC0 处理与循环死锁防御）
     public static string ReadName(byte[] data, int len, List<int> offsetBox, int depth) {
-        if (offsetBox == null || offsetBox.Count == 0) { return ""; }
+        if (offsetBox == null || offsetBox.Count == 0 || data == null || len <= 0) { return ""; }
+        if (len > data.Length) { len = data.Length; }
         int pos = offsetBox[0];
-        string name = DnsPacket.ReadNameRef(data, len, ref pos, depth);
+        nint dPtr = (nint)data;
+        Span<byte> d = new Span<byte>(dPtr, len);
+        string name = DnsPacket.ReadNameSpan(d, dPtr, len, ref pos, depth);
         offsetBox[0] = pos;
         return name;
     }
@@ -199,30 +319,33 @@ public class DnsPacket {
             return null;
         }
         if (length > data.Length) { length = data.Length; }
+        nint dPtr = (nint)data;
+        Span<byte> d = new Span<byte>(dPtr, length);
 
         DnsPacket pkt = new DnsPacket();
-        pkt.transactionId = ((data[0] & 255) << 8) | (data[1] & 255);
-        pkt.flags = ((data[2] & 255) << 8) | (data[3] & 255);
-        int qdCount = ((data[4] & 255) << 8) | (data[5] & 255);
-        int anCount = ((data[6] & 255) << 8) | (data[7] & 255);
-        int nsCount = ((data[8] & 255) << 8) | (data[9] & 255);
-        int arCount = ((data[10] & 255) << 8) | (data[11] & 255);
+        pkt.transactionId = ((d[0] & 255) << 8) | (d[1] & 255);
+        int fl = ((d[2] & 255) << 8) | (d[3] & 255);
+        pkt.flags = fl;
+        int qdCount = ((d[4] & 255) << 8) | (d[5] & 255);
+        int anCount = ((d[6] & 255) << 8) | (d[7] & 255);
+        int nsCount = ((d[8] & 255) << 8) | (d[9] & 255);
+        int arCount = ((d[10] & 255) << 8) | (d[11] & 255);
 
-        pkt.isResponse = (pkt.flags & 32768) != 0;      // QR bit
-        pkt.isTruncated = (pkt.flags & 512) != 0;       // TC bit
-        pkt.recursionDesired = (pkt.flags & 256) != 0;  // RD bit
-        pkt.recursionAvailable = (pkt.flags & 128) != 0;// RA bit
-        pkt.responseCode = pkt.flags & 15;              // RCODE 4 bits
+        pkt.isResponse = (fl & 32768) != 0;      // QR bit
+        pkt.isTruncated = (fl & 512) != 0;       // TC bit
+        pkt.recursionDesired = (fl & 256) != 0;  // RD bit
+        pkt.recursionAvailable = (fl & 128) != 0;// RA bit
+        pkt.responseCode = fl & 15;              // RCODE 4 bits
 
         int cursor = 12;
 
         // 1. 解析 Question 区段
         for (int q = 0; q < qdCount; q = q + 1) {
-            string qname = DnsPacket.ReadNameRef(data, length, ref cursor, 0);
+            string qname = DnsPacket.ReadNameSpan(d, dPtr, length, ref cursor, 0);
             int pos = cursor;
             if (pos + 4 > length) { return null; }
-            int qtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
-            int qclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
+            int qtype = ((d[pos] & 255) << 8) | (d[pos + 1] & 255);
+            int qclass = ((d[pos + 2] & 255) << 8) | (d[pos + 3] & 255);
             cursor = pos + 4;
 
             DnsRecord qRec = new DnsRecord();
@@ -234,61 +357,60 @@ public class DnsPacket {
 
         // 2. 解析 Answer 区段
         for (int a = 0; a < anCount; a = a + 1) {
-            string name = DnsPacket.ReadNameRef(data, length, ref cursor, 0);
+            string name = DnsPacket.ReadNameSpan(d, dPtr, length, ref cursor, 0);
             int pos = cursor;
             if (pos + 10 > length) { break; }
-            int rtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
-            int rclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
-            int ttl = ((data[pos + 4] & 255) << 24) | ((data[pos + 5] & 255) << 16)
-                    | ((data[pos + 6] & 255) << 8) | (data[pos + 7] & 255);
-            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            int rtype = ((d[pos] & 255) << 8) | (d[pos + 1] & 255);
+            int rclass = ((d[pos + 2] & 255) << 8) | (d[pos + 3] & 255);
+            int ttl = ((d[pos + 4] & 255) << 24) | ((d[pos + 5] & 255) << 16)
+                    | ((d[pos + 6] & 255) << 8) | (d[pos + 7] & 255);
+            int rdlen = ((d[pos + 8] & 255) << 8) | (d[pos + 9] & 255);
             pos = pos + 10;
             if (pos + rdlen > length) { break; }
             cursor = pos + rdlen;
 
             string val = "";
             if (rtype == DnsRecordType.A && rdlen == 4) {
-                val = Convert.ToString(data[pos] & 255) + "."
-                    + Convert.ToString(data[pos + 1] & 255) + "."
-                    + Convert.ToString(data[pos + 2] & 255) + "."
-                    + Convert.ToString(data[pos + 3] & 255);
+                val = DnsPacket.FormatIPv4(d, pos);
             } else if (rtype == DnsRecordType.AAAA && rdlen == 16) {
-                StringBuilder sb = new StringBuilder(39);
-                for (int i = 0; i < 16; i = i + 2) {
-                    if (i > 0) { sb.Append(":"); }
-                    int piece = ((data[pos + i] & 255) << 8) | (data[pos + i + 1] & 255);
-                    DnsPacket.AppendHex16(sb, piece);
-                }
-                val = sb.ToString();
+                val = DnsPacket.FormatIPv6Full(d, pos);
             } else if (rtype == DnsRecordType.CNAME || rtype == DnsRecordType.NS || rtype == DnsRecordType.PTR) {
                 int np = pos;
-                val = DnsPacket.ReadNameRef(data, length, ref np, 0);
+                val = DnsPacket.ReadNameSpan(d, dPtr, length, ref np, 0);
             } else if (rtype == DnsRecordType.MX && rdlen >= 3) {
-                int pref = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
+                int pref = ((d[pos] & 255) << 8) | (d[pos + 1] & 255);
                 int mxPos = pos + 2;
-                string mxEx = DnsPacket.ReadNameRef(data, length, ref mxPos, 0);
+                string mxEx = DnsPacket.ReadNameSpan(d, dPtr, length, ref mxPos, 0);
                 val = Convert.ToString(pref) + " " + mxEx;
             } else if (rtype == DnsRecordType.SRV && rdlen >= 7) {
-                int priority = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
-                int weight = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
-                int port = ((data[pos + 4] & 255) << 8) | (data[pos + 5] & 255);
+                int priority = ((d[pos] & 255) << 8) | (d[pos + 1] & 255);
+                int weight = ((d[pos + 2] & 255) << 8) | (d[pos + 3] & 255);
+                int port = ((d[pos + 4] & 255) << 8) | (d[pos + 5] & 255);
                 int srvPos = pos + 6;
-                string target = DnsPacket.ReadNameRef(data, length, ref srvPos, 0);
+                string target = DnsPacket.ReadNameSpan(d, dPtr, length, ref srvPos, 0);
                 val = Convert.ToString(priority) + " " + Convert.ToString(weight) + " " + Convert.ToString(port) + " " + target;
             } else if (rtype == DnsRecordType.TXT && rdlen > 0) {
-                StringBuilder sb = new StringBuilder(rdlen);
-                int cur = pos;
-                int end = pos + rdlen;
-                while (cur < end) {
-                    int txtLen = data[cur] & 255;
-                    cur = cur + 1;
-                    if (cur + txtLen > end) { break; }
-                    if (txtLen > 0) {
-                        sb.Append(new StringView((nint)data + (nint)cur, txtLen));
+                int firstLen = d[pos] & 255;
+                if (1 + firstLen == rdlen) {
+                    val = firstLen > 0 ? NativeMemory.GetString(dPtr, pos + 1, firstLen) : "";
+                } else {
+                    byte[] tbuf = new byte[rdlen];
+                    nint tPtr = (nint)tbuf;
+                    int tOut = 0;
+                    int cur = pos;
+                    int end = pos + rdlen;
+                    while (cur < end) {
+                        int txtLen = d[cur] & 255;
+                        cur = cur + 1;
+                        if (cur + txtLen > end) { break; }
+                        if (txtLen > 0) {
+                            NativeMemory.Copy(tPtr + (nint)tOut, dPtr + (nint)cur, txtLen);
+                            tOut = tOut + txtLen;
+                        }
+                        cur = cur + txtLen;
                     }
-                    cur = cur + txtLen;
+                    val = tOut > 0 ? NativeMemory.GetString(tPtr, 0, tOut) : "";
                 }
-                val = sb.ToString();
             }
 
             DnsRecord rec = new DnsRecord(name, rtype, ttl, val);
@@ -296,26 +418,26 @@ public class DnsPacket {
             pkt.answers.Add(rec);
         }
 
-        // 3. 跳过 NS Authority 区段
+        // 3. 跳过 NS Authority 区段（零字符串分配）
         for (int s = 0; s < nsCount; s = s + 1) {
-            DnsPacket.ReadNameRef(data, length, ref cursor, 0);
+            DnsPacket.SkipNameSpan(d, length, ref cursor);
             int pos = cursor;
             if (pos + 10 > length) { break; }
-            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            int rdlen = ((d[pos + 8] & 255) << 8) | (d[pos + 9] & 255);
             if (pos + 10 + rdlen > length) { break; }
             cursor = pos + 10 + rdlen;
         }
 
         // 4. 解析 Additional 区段（提取 RFC 6891 EDNS0 OPT 伪记录）
         for (int r = 0; r < arCount; r = r + 1) {
-            string name = DnsPacket.ReadNameRef(data, length, ref cursor, 0);
+            string name = DnsPacket.ReadNameSpan(d, dPtr, length, ref cursor, 0);
             int pos = cursor;
             if (pos + 10 > length) { break; }
-            int rtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
-            int rclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
-            int ttl = ((data[pos + 4] & 255) << 24) | ((data[pos + 5] & 255) << 16)
-                    | ((data[pos + 6] & 255) << 8) | (data[pos + 7] & 255);
-            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            int rtype = ((d[pos] & 255) << 8) | (d[pos + 1] & 255);
+            int rclass = ((d[pos + 2] & 255) << 8) | (d[pos + 3] & 255);
+            int ttl = ((d[pos + 4] & 255) << 24) | ((d[pos + 5] & 255) << 16)
+                    | ((d[pos + 6] & 255) << 8) | (d[pos + 7] & 255);
+            int rdlen = ((d[pos + 8] & 255) << 8) | (d[pos + 9] & 255);
             pos = pos + 10;
             if (pos + rdlen > length) { break; }
             cursor = pos + rdlen;
@@ -325,7 +447,6 @@ public class DnsPacket {
             pkt.additionals.Add(arRec);
 
             if (rtype == DnsRecordType.OPT) {
-                // RFC 6891 §6.1.2: CLASS 字段在 OPT RR 中承载请求方通告的 UDP Payload Size
                 pkt.ednsPayloadSize = rclass;
             }
         }
@@ -333,89 +454,90 @@ public class DnsPacket {
         return pkt;
     }
 
-    // 构造 RFC 1035 截断报文 (TC=1)，用于测试客户端自动回退 TCP 53 端口查询逻辑
+    // 构造 RFC 1035 截断报文 (TC=1)，单次精确分配
     public static byte[] BuildMockTruncatedResponse(int txId, string domain, int qtype) {
-        List<byte> buf = new List<byte>();
-
-        // Header: QR=1, TC=1, RD=1, RA=1 -> 0x8380 (131, 128)
-        buf.Add((byte)((txId >> 8) & 255));
-        buf.Add((byte)(txId & 255));
-        buf.Add(131); // 0x83
-        buf.Add(128); // 0x80
-        // QDCOUNT = 1
-        buf.Add(0); buf.Add(1);
-        // ANCOUNT = 0 (数据被截断，无完整回答)
-        buf.Add(0); buf.Add(0);
-        buf.Add(0); buf.Add(0);
-        buf.Add(0); buf.Add(0);
-
-        DnsPacket.EncodeDomainName(buf, domain);
-        buf.Add((byte)((qtype >> 8) & 255));
-        buf.Add((byte)(qtype & 255));
-        buf.Add(0); buf.Add(1);
-
-        byte[] res = new byte[buf.Count];
-        for (int i = 0; i < buf.Count; i = i + 1) {
-            res[i] = buf[i];
-        }
+        int nameBytes = DnsPacket.MeasureDomainName(domain);
+        byte[] res = new byte[12 + nameBytes + 4];
+        res[0] = (byte)((txId >> 8) & 255);
+        res[1] = (byte)(txId & 255);
+        res[2] = 131; // 0x83
+        res[3] = 128; // 0x80
+        res[5] = 1;   // QDCOUNT = 1
+        int pos = DnsPacket.WriteDomainName(res, 12, domain);
+        res[pos] = (byte)((qtype >> 8) & 255);
+        res[pos + 1] = (byte)(qtype & 255);
+        res[pos + 3] = 1;
         return res;
     }
 
-    // 辅助构造用于自测或 Mock 的标准 DNS 应答报文
-    public static byte[] BuildMockResponse(int txId, string domain, int qtype, List<string> ipList, int ttl) {
-        List<byte> buf = new List<byte>();
-
-        // Header: QR=1, RD=1, RA=1, RCODE=0 -> 0x8180
-        buf.Add((byte)((txId >> 8) & 255));
-        buf.Add((byte)(txId & 255));
-        buf.Add(129); // 0x81
-        buf.Add(128); // 0x80
-        // QDCOUNT = 1
-        buf.Add(0);
-        buf.Add(1);
-        // ANCOUNT = ipList.Count
-        int anCount = ipList != null ? ipList.Count : 0;
-        buf.Add((byte)((anCount >> 8) & 255));
-        buf.Add((byte)(anCount & 255));
-        // NSCOUNT = 0, ARCOUNT = 0
-        buf.Add(0); buf.Add(0);
-        buf.Add(0); buf.Add(0);
-
-        // Question:
-        int nameStartOffset = buf.Count;
-        DnsPacket.EncodeDomainName(buf, domain);
-        buf.Add((byte)((qtype >> 8) & 255));
-        buf.Add((byte)(qtype & 255));
-        buf.Add(0); buf.Add(1); // CLASS IN
-
-        // Answers: 使用指针压缩指向前面的 Question 域名 (0xC0 | nameStartOffset)
-        for (int a = 0; a < anCount; a = a + 1) {
-            buf.Add((byte)(192 | ((nameStartOffset >> 8) & 63)));
-            buf.Add((byte)(nameStartOffset & 255));
-            // TYPE
-            buf.Add((byte)((qtype >> 8) & 255));
-            buf.Add((byte)(qtype & 255));
-            // CLASS IN
-            buf.Add(0); buf.Add(1);
-            // TTL
-            buf.Add((byte)((ttl >> 24) & 255));
-            buf.Add((byte)((ttl >> 16) & 255));
-            buf.Add((byte)((ttl >> 8) & 255));
-            buf.Add((byte)(ttl & 255));
-
-            string ip = ipList[a];
-            if (qtype == DnsRecordType.A) {
-                List<string> segs = ip.Split(".");
-                buf.Add(0); buf.Add(4); // RDLENGTH = 4
-                for (int s = 0; s < segs.Count; s = s + 1) {
-                    buf.Add((byte)Convert.ToInt32(segs[s]));
-                }
+    private static int WriteIpv4Bytes(byte[] dst, int pos, string ip) {
+        if (ip == null) { return pos; }
+        int ilen = ip.Length;
+        int cur = 0;
+        int seg = 0;
+        for (int i = 0; i <= ilen; i = i + 1) {
+            int c = i == ilen ? 46 : (ip[i] & 255);
+            if (c == 46) {
+                dst[pos + seg] = (byte)cur;
+                seg = seg + 1;
+                cur = 0;
+                if (seg == 4) { break; }
+            } else if (c >= 48 && c <= 57) {
+                cur = cur * 10 + (c - 48);
             }
         }
+        return pos + seg;
+    }
 
-        byte[] res = new byte[buf.Count];
-        for (int i = 0; i < buf.Count; i = i + 1) {
-            res[i] = buf[i];
+    // 辅助构造用于自测或 Mock 的标准 DNS 应答报文（单次精确分配，零 Split/List<byte>）
+    public static byte[] BuildMockResponse(int txId, string domain, int qtype, List<string> ipList, int ttl) {
+        int anCount = ipList != null ? ipList.Count : 0;
+        int nameBytes = DnsPacket.MeasureDomainName(domain);
+        int perAnswer = qtype == DnsRecordType.A ? 16 : 10;
+        int total = 12 + nameBytes + 4 + anCount * perAnswer;
+        byte[] res = new byte[total];
+
+        // Header: QR=1, RD=1, RA=1, RCODE=0 -> 0x8180
+        res[0] = (byte)((txId >> 8) & 255);
+        res[1] = (byte)(txId & 255);
+        res[2] = 129; // 0x81
+        res[3] = 128; // 0x80
+        res[5] = 1;   // QDCOUNT = 1
+        res[6] = (byte)((anCount >> 8) & 255);
+        res[7] = (byte)(anCount & 255);
+
+        // Question at offset 12
+        int pos = DnsPacket.WriteDomainName(res, 12, domain);
+        res[pos] = (byte)((qtype >> 8) & 255);
+        res[pos + 1] = (byte)(qtype & 255);
+        res[pos + 3] = 1; // CLASS IN
+        pos = pos + 4;
+
+        byte qtHi = (byte)((qtype >> 8) & 255);
+        byte qtLo = (byte)(qtype & 255);
+        byte ttl3 = (byte)((ttl >> 24) & 255);
+        byte ttl2 = (byte)((ttl >> 16) & 255);
+        byte ttl1 = (byte)((ttl >> 8) & 255);
+        byte ttl0 = (byte)(ttl & 255);
+
+        for (int a = 0; a < anCount; a = a + 1) {
+            res[pos] = 192; // 0xC0 | (12 >> 8)
+            res[pos + 1] = 12;
+            res[pos + 2] = qtHi;
+            res[pos + 3] = qtLo;
+            res[pos + 4] = 0;
+            res[pos + 5] = 1;
+            res[pos + 6] = ttl3;
+            res[pos + 7] = ttl2;
+            res[pos + 8] = ttl1;
+            res[pos + 9] = ttl0;
+            pos = pos + 10;
+            if (qtype == DnsRecordType.A) {
+                res[pos] = 0;
+                res[pos + 1] = 4;
+                pos = pos + 2;
+                pos = DnsPacket.WriteIpv4Bytes(res, pos, ipList[a]);
+            }
         }
         return res;
     }

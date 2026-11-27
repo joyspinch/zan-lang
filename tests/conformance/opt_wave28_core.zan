@@ -1,0 +1,246 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Json;
+using System.Net;
+using System.Net.Dns;
+using System.Net.Http.Client;
+using System.Net.Sip;
+
+public class Program {
+    static void Check(bool cond, string label) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + label);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestDateParser() {
+        // ISO-8601 fast path: UTC, positive/negative TZ offsets, sub-ms truncation, date-only
+        DateTime d1 = DateParser.TryParse("2024-03-15T14:25:36.789Z");
+        Check(d1 != null, "iso utc");
+        Check(DateParser.Format(d1, "yyyy-MM-dd'T'HH:mm:ss.fff'Z'") == "2024-03-15T14:25:36.789Z", "iso fmt");
+
+        DateTime d2 = DateParser.TryParse("2024-11-27 08:30:45+08:00");
+        Check(d2 != null && DateParser.Format(d2, "yyyy-MM-dd HH:mm:ss") == "2024-11-27 00:30:45", "iso +08:00");
+
+        DateTime d3 = DateParser.TryParse("2025-01-01T02:00:00-05:30");
+        Check(d3 != null && DateParser.Format(d3, "yyyy-MM-dd HH:mm:ss") == "2025-01-01 07:30:00", "iso -05:30");
+
+        // Compact 8-digit leap day & invalid leap day
+        DateTime leap = DateParser.TryParse("20240229");
+        Check(leap != null && leap.year == 2024 && leap.month == 2 && leap.day == 29, "compact leap");
+        Check(DateParser.TryParse("2023-02-29") == null, "invalid non-leap");
+        Check(DateParser.TryParse("2024-13-01") == null, "invalid month");
+        Check(DateParser.TryParse("2024-01-01T10:00:00+15:00") == null, "invalid tz > 14h");
+
+        // English month names + AM/PM + Chinese date
+        DateTime en = DateParser.TryParse("Jan 15, 2024 3:45:12 PM");
+        Check(en != null && DateParser.Format(en, "yyyy-MM-dd HH:mm:ss") == "2024-01-15 15:45:12", "en am/pm");
+        DateTime cn = DateParser.TryParse("2024年11月27日 09:15:30");
+        Check(cn != null && DateParser.Format(cn, "yyyy-MM-dd HH:mm:ss") == "2024-11-27 09:15:30", "chinese date");
+
+        // Relative keywords
+        Check(DateParser.TryParse("now") != null, "rel now");
+        Check(DateParser.TryParse("TODAY") != null, "rel today");
+        Check(DateParser.TryParse("tomorrow") != null, "rel tomorrow");
+        Check(DateParser.TryParse("yesterday") != null, "rel yesterday");
+
+        // TryParseExact + Format tokens (yy, M, d, h, tt, escaped quotes)
+        DateTime ex = DateParser.TryParseExact("2026-01-02 03:04:05.120", "yyyy-MM-dd HH:mm:ss.fff");
+        Check(ex != null && ex.millisecond == 120, "exact ms");
+        Check(DateParser.Format(ex, "yy/M/d h:m:s tt 'o''clock'") == "26/1/2 3:4:5 AM o'clock", "format tokens");
+        Check(DateParser.TryParseExact("2026-01-02 03:04:05", "yyyy-MM-dd HH:mm:ss.fff") == null, "exact short fail");
+
+        Console.WriteLine("date_ok");
+    }
+
+    static void TestDnsPacket() {
+        byte[] q = DnsPacket.BuildQuery("api.prod.example.com", DnsRecordType.A, 0xBEEF, 4096);
+        Check(q != null && q.Length > 12, "dns query len");
+        DnsPacket qp = DnsPacket.Parse(q, q.Length);
+        Check(qp != null && qp.transactionId == 0xBEEF && qp.ednsPayloadSize == 4096, "dns query parse");
+        Check(qp.questions.Count == 1 && qp.questions[0].name == "api.prod.example.com", "dns qname");
+
+        List<string> ips = new List<string>();
+        ips.Add("10.20.30.40");
+        ips.Add("192.168.1.254");
+        byte[] mr = DnsPacket.BuildMockResponse(0x1234, "www.zan-lang.org", DnsRecordType.A, ips, 600);
+        DnsPacket mp = DnsPacket.Parse(mr, mr.Length);
+        Check(mp != null && mp.isResponse && mp.answers.Count == 2, "dns mock resp");
+        Check(mp.answers[0].name == "www.zan-lang.org" && mp.answers[0].value == "10.20.30.40", "dns ans0");
+        Check(mp.answers[1].value == "192.168.1.254" && mp.answers[1].ttl == 600, "dns ans1");
+
+        byte[] trunc = DnsPacket.BuildMockTruncatedResponse(0x5678, "trunc.test", DnsRecordType.AAAA);
+        DnsPacket tp = DnsPacket.Parse(trunc, trunc.Length);
+        Check(tp != null && tp.isTruncated && tp.transactionId == 0x5678, "dns trunc");
+
+        // Compression pointer loop guard (pointer to self at offset 12)
+        byte[] loop = new byte[] {
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01
+        };
+        DnsPacket lp = DnsPacket.Parse(loop, loop.Length);
+        Check(lp != null && lp.questions.Count == 1, "dns loop safe");
+
+        Console.WriteLine("dns_ok");
+    }
+
+    static void TestSipMessage() {
+        string wire =
+            "INVITE sip:bob@biloxi.example.com SIP/2.0\r\n" +
+            "v: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bK776\r\n" +
+            "f: Alice <sip:alice@atlanta.example.com>;tag=19283\r\n" +
+            "t: Bob <sip:bob@biloxi.example.com>\r\n" +
+            "i: call-999@pc33\r\n" +
+            "l: 5\r\n\r\n" +
+            "helloEXTRA";
+        SipMessage m = SipMessage.Parse(wire);
+        Check(m != null && m.GetIsRequest() && m.GetMethod() == "INVITE", "sip req");
+        Check(m.Header("Via") == "SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bK776", "sip compact via");
+        Check(m.Header("Call-ID") == "call-999@pc33", "sip compact call-id");
+        Check(SipMessage.ExtractTag(m.Header("From")) == "19283", "sip tag");
+        Check(m.GetBody() == "hello", "sip content-length trunc");
+
+        // Sanitization: CRLF injection cut + illegal token rejected + clean fast path
+        m.Add("Bad:Header", "ignored");
+        m.Add("X-Clean", "ok-value");
+        m.Add("X-Inject", "first\r\nInjected: evil");
+        Check(m.Header("Bad:Header") == "", "sip bad token rejected");
+        Check(m.Header("X-Clean") == "ok-value", "sip clean val");
+        Check(m.Header("X-Inject") == "first", "sip crlf sanitized");
+
+        string serialized = m.Serialize();
+        SipMessage m2 = SipMessage.Parse(serialized);
+        Check(m2 != null && m2.GetUri() == "sip:bob@biloxi.example.com" && m2.GetBody() == "hello", "sip roundtrip");
+
+        SipMessage resp = SipMessage.Response(200, "OK");
+        resp.Add("Call-ID", "c1");
+        resp.SetBody("sdp");
+        SipMessage resp2 = SipMessage.Parse(resp.Serialize());
+        Check(resp2 != null && !resp2.GetIsRequest() && resp2.GetStatus() == 200 && resp2.GetReason() == "OK", "sip resp roundtrip");
+
+        Console.WriteLine("sip_ok");
+    }
+
+    static void TestCookieJar() {
+        CookieJar jar = new CookieJar();
+        string head =
+            "HTTP/1.1 200 OK\r\n" +
+            "Set-Cookie: sid=abc; Path=/; HttpOnly; Secure\r\n" +
+            "Set-Cookie: oct=ok; Path=/app; Expires=Wed, 21 Oct 2035 07:28:00 GMT\r\n" +
+            "Set-Cookie: deep=yes; Path=/app/v1; Domain=api.example.com\r\n" +
+            "Set-Cookie: expired=gone; Path=/; Expires=Sun, 06 Nov 1994 08:49:37 GMT\r\n" +
+            "Set-Cookie: badhost=no; Domain=evil.com\r\n" +
+            "\r\n";
+        jar.AbsorbHead("API.EXAMPLE.COM", "/app/v1/login", head);
+        Check(jar.Count() == 3, "cookie count after absorb");
+        Check(jar.Get("oct") == "ok", "cookie oct month parsed");
+        Check(jar.Get("expired") == "", "cookie past expires dropped");
+        Check(jar.Get("badhost") == "", "cookie domain mismatch rejected");
+
+        // Path-length descending order + Secure gating
+        string httpsHdr = jar.HeaderValue("api.example.com", "/app/v1/items?q=1", true);
+        Check(httpsHdr == "deep=yes; oct=ok; sid=abc", "cookie https order");
+        string httpHdr = jar.HeaderValue("api.example.com", "/app/v1/items#sec", false);
+        Check(httpHdr == "deep=yes; oct=ok", "cookie http hides secure");
+
+        // Max-Age=0 deletion & overwrite
+        jar.SetCookie("api.example.com", "/app/v1/items", "oct=gone; Path=/app; Max-Age=0");
+        Check(jar.Count() == 2 && jar.Get("oct") == "", "cookie max-age 0 delete");
+
+        Console.WriteLine("cookie_ok");
+    }
+
+    static void TestIPAddress() {
+        Check(IPAddress.IsIPv4("192.168.1.1"), "v4 valid");
+        Check(IPAddress.IsIPv4("0.0.0.0") && IPAddress.IsIPv4("255.255.255.255"), "v4 bounds");
+        Check(!IPAddress.IsIPv4("01.2.3.4"), "v4 leading zero rejected");
+        Check(!IPAddress.IsIPv4("256.0.0.1"), "v4 >255 rejected");
+        Check(!IPAddress.IsIPv4("1.2.3"), "v4 3 parts rejected");
+        Check(IPAddress.ParseIPv4("10.0.0.1") == 167772161L, "v4 parse");
+
+        Check(IPAddress.IsIPv6("::1") && IPAddress.IsIPv6("::") && IPAddress.IsIPv6("2001:db8::1"), "v6 valid");
+        Check(IPAddress.IsIPv6("::ffff:192.168.1.1") && IPAddress.IsIPv6("0:0:0:0:0:FFFF:10.0.0.1"), "v6 mapped");
+        Check(!IPAddress.IsIPv6("2001::db8::1") && !IPAddress.IsIPv6(":::1") && !IPAddress.IsIPv6("1:2:3:4:5:6:7:8:9"), "v6 invalid");
+
+        Check(IPAddress.IsInSubnet("10.20.30.40", "10.0.0.0/8"), "cidr /8");
+        Check(IPAddress.IsInSubnet("172.31.255.255", "172.16.0.0/12"), "cidr /12");
+        Check(!IPAddress.IsInSubnet("172.32.0.1", "172.16.0.0/12"), "cidr /12 out");
+        Check(IPAddress.IsInSubnet("1.2.3.4", "0.0.0.0/0"), "cidr /0");
+        Check(IPAddress.IsInSubnet("1.2.3.4", "1.2.3.4/32"), "cidr /32");
+
+        Check(IPAddress.IsLoopback("127.0.0.1") && IPAddress.IsLoopback("::1") && !IPAddress.IsLoopback("127.0.0.999"), "loopback");
+        Check(IPAddress.IsPrivate("10.1.2.3") && IPAddress.IsPrivate("172.16.0.1") && IPAddress.IsPrivate("192.168.0.1") && IPAddress.IsPrivate("169.254.1.1"), "private v4");
+        Check(!IPAddress.IsPrivate("8.8.8.8"), "public v4");
+        Check(IPAddress.IsPrivate("fc00::1") && IPAddress.IsPrivate("FD12::1") && IPAddress.IsPrivate("fe80::1") && !IPAddress.IsPrivate("2001:db8::1"), "private v6");
+
+        Console.WriteLine("ip_ok");
+    }
+
+    static void TestJsonPointerAndPatch() {
+        Check(JsonPointer.Escape("plain") == "plain", "jp escape clean");
+        Check(JsonPointer.Escape("a/b~c") == "a~1b~0c", "jp escape special");
+        Check(JsonPointer.Unescape("a~1b~0c") == "a/b~c", "jp unescape special");
+        Check(JsonPointer.Unescape("~01") == "~1", "jp unescape ~01 ordering");
+
+        List<string> segs = JsonPointer.Split("/users/0/a~1b/c~0d");
+        Check(segs.Count == 4 && segs[2] == "a/b" && segs[3] == "c~d", "jp split");
+        Check(JsonPointer.Join(segs) == "/users/0/a~1b/c~0d", "jp join escaped");
+        List<string> plainSegs = new List<string>();
+        plainSegs.Add("a"); plainSegs.Add("b"); plainSegs.Add("0");
+        Check(JsonPointer.Join(plainSegs) == "/a/b/0", "jp join plain");
+
+        JsonValue doc = JsonValue.Parse("{\"a\":{\"b\":[10,20,30]},\"k/1\":\"v\",\"rm\":true}");
+        string patch =
+            "[" +
+            "{\"op\":\"test\",\"path\":\"/a/b/1\",\"value\":20}," +
+            "{\"op\":\"replace\",\"path\":\"/a/b/1\",\"value\":25}," +
+            "{\"op\":\"add\",\"path\":\"/a/b/-\",\"value\":40}," +
+            "{\"op\":\"add\",\"path\":\"/a/b/0\",\"value\":5}," +
+            "{\"op\":\"move\",\"from\":\"/k~11\",\"path\":\"/moved\"}," +
+            "{\"op\":\"copy\",\"from\":\"/a/b/2\",\"path\":\"/copied\"}," +
+            "{\"op\":\"remove\",\"path\":\"/rm\"}" +
+            "]";
+        JsonValue res = JsonPatch.Apply(doc, patch);
+        JsonValue v0 = JsonPatch.Get(res, "/a/b/0");
+        JsonValue v2 = JsonPatch.Get(res, "/a/b/2");
+        JsonValue v4 = JsonPatch.Get(res, "/a/b/4");
+        JsonValue vMoved = JsonPatch.Get(res, "/moved");
+        JsonValue vCopied = JsonPatch.Get(res, "/copied");
+        Check(v0 != null && v0.AsInt(-1) == 5, "patch insert 0");
+        Check(v2 != null && v2.AsInt(-1) == 25, "patch replace");
+        Check(v4 != null && v4.AsInt(-1) == 40, "patch append -");
+        Check(vMoved != null && vMoved.AsString("") == "v" && JsonPatch.Get(res, "/k~11") == null, "patch move");
+        Check(vCopied != null && vCopied.AsInt(-1) == 25, "patch copy");
+        Check(JsonPatch.Get(res, "/rm") == null, "patch remove");
+        // Original doc untouched
+        JsonValue origRm = JsonPatch.Get(doc, "/rm");
+        JsonValue origB1 = JsonPatch.Get(doc, "/a/b/1");
+        Check(origRm != null && origRm.AsBool(false) == true && origB1 != null && origB1.AsInt(-1) == 20, "patch immutable doc");
+
+        // Error path: moving into own child must throw JsonPatchException
+        bool threw = false;
+        try {
+            JsonPatch.Apply(doc, "[{\"op\":\"move\",\"from\":\"/a\",\"path\":\"/a/child\"}]");
+        } catch (JsonPatchException e) {
+            threw = true;
+        }
+        Check(threw, "patch self-child move throws");
+
+        // Leading zero array index rejected
+        Check(JsonPatch.Get(doc, "/a/b/01") == null, "patch leading zero idx null");
+
+        Console.WriteLine("jpatch_ok");
+    }
+
+    public static void Main() {
+        TestDateParser();
+        TestDnsPacket();
+        TestSipMessage();
+        TestCookieJar();
+        TestIPAddress();
+        TestJsonPointerAndPatch();
+        Console.WriteLine("ALL_WAVE28_OK");
+    }
+}
