@@ -570,3 +570,10 @@
   写线程抢先跑完会导致读线程零轮退出、主线程永久死等。读线程循环须保证至少执行
   一轮（`bool first = true; while (first || writeDone.Load() == 0) { first = false; ... }`）。
 
+- **重度治理实证四则（Waves 14–16：内存重叠、资源生命周期、加密常量时间与 64 位防溢出）**：
+  ① **重叠内存搬移禁直调 `NativeMemory.Copy`**：`NativeMemory.Copy` 底层是 `memcpy` 语义，同缓冲向后重叠搬移（`dst > src && dst < src + count`，如 `RingBuffer` 头部右移）会导致数据损坏，须改用从尾部向前的倒序搬移或按 `memmove` 语义分支处理；
+  ② **资源块语法与一次性对象清理**：Zan 的 `using` 资源语句须带括号块 `using (Type x = ...) { ... }`（不支持 C# 8 无块 `using Type x = ...;`）；每次创建的 `HttpClient` / 临时连接与事务必须在 `try/finally` 内关闭或按 `committed` 标志自动 `Rollback()`，socket `Close()` 须按 `sock >= 0`（而非 `connected`）释放，避免建连失败或已断线路径泄漏句柄；
+  ③ **密码学与二进制协议边界**：JWT/MAC 比较（`fixedEquals`）须避免按长度提前返回或对短数组跳过访存，静态查表/曲线懒初始化（`Aes`/`Ecdsa`）须用双检锁先填充局部表再发布；64 位文件偏移、Tensor 维度乘积/行偏移、网络帧长 `PacketFramer`/`ArpgMessage` 扩容与校验须在 `long` 域算完并检查上界，严禁 `int` 相加或翻倍回绕；
+  ④ **ECS/容器 swap-remove 遍历与循环依赖**：在 `Dispatch`/`Tick` 中遍历允许 `KillSelf()` 触发 swap-remove 的数组时，命中当前槽被替换不得盲目递增下标（会跳过被换入的尾元素）；`AssetStore` 递归加载依赖须带 `visiting` 集合防循环依赖死循环，且依赖引用计数 `depCount + 1` 须在自身 `LoadBytes` 成功之后再提交。
+
+

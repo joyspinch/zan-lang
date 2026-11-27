@@ -1286,3 +1286,18 @@ LSP 用例必须用**新编**的 zan-lsp 跑——旧产物照样"通过"，什�
       静默 abort）、`case_task_run_async_bg`、`case_async_spawn_result_release`、
       `case_task_spawn_indirect`；运行时注册表单元
       `runtime_task_handle_registry`。
+
+65. **泛型实例发现与规范化必须按接口实现关系匹配接口扩展方法接收者**：
+    - 动作：`src/compiler/generics/generic_discover.c`（`disc_collect_call`）与
+      `src/compiler/generics/generic_canon.c`（`canon_chk`）查找扩展方法返回类型
+      以登记 `$__Canon` 泛型实例化时，不能只按 `p0->kind == rt->kind && p0->name == rt->name`
+      精确比对接收者——当扩展方法接收者是 `TYPE_INTERFACE`（如 `this IDbExecutor db`）
+      而调用点接收者是具体实现类 `TYPE_CLASS`（如 `SqliteConnection`）时，必须同步使用
+      `zan_binder_class_implements_iface(rt->sym, p0->sym)`（与 `expr_overload.c` 的
+      `ext_receiver_interface_match` 同口径）。
+    - 理由：若 `conn.Delete<Entity>().WhereEq(...).ExecuteAffrows()` 链路中没有显式声明
+      `DeleteQuery<Entity>` 局部类型，漏匹配会导致 `DeleteQuery<Entity>` 从未被登记到
+      `$__Canon` 单态化表，发码退化为未特化的 `call void @abort(); unreachable` 桩，
+      运行期静默 `RC=3` 崩溃。
+    - 判定器：`tests/conformance/generic_ext_iface_return.zan`（具体类调接口泛型扩展
+      链式返回且无显式局部声明）与 `case_arpg_save_repository`。
