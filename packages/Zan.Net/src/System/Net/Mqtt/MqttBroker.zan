@@ -374,14 +374,14 @@ public class MqttBroker : IDisposable {
                 }
                 if (match) {
                     // 非阻塞同步写入，不挂起当前广播协程：
-                    // 当客户端写缓冲区满时快速跳过/断开，彻底杜绝单慢客户端拖垮 Broker 扇出
+                    // 当客户端写缓冲区满时快速跳过，短写或 0 字节写入会破坏帧边界故立即断开。
                     int n = Socket.Send(sess.sock, packet, packetLen);
-                    if (n > 0) {
+                    if (n == packetLen) {
                         receivers = receivers + 1;
                         sess.msgsOut = sess.msgsOut + 1;
                         this.msgsOut = this.msgsOut + 1;
                         this.bytesOut = this.bytesOut + packetLen;
-                    } else if (n == 0) {
+                    } else if (n >= 0) {
                         sess.alive = false;
                         Socket.ShutdownBoth(sess.sock);
                     }
@@ -462,11 +462,14 @@ public class MqttBroker : IDisposable {
             if (!sess.alive) { continue; }
             if (!this.Matches(sess, topic)) { continue; }
             int n = Socket.Send(sess.sock, packet, packetLen);
-            if (n > 0) {
+            if (n == packetLen) {
                 sent = sent + 1;
                 sess.msgsOut = sess.msgsOut + 1;
                 this.msgsOut = this.msgsOut + 1;
                 this.bytesOut = this.bytesOut + packetLen;
+            } else if (n >= 0) {
+                sess.alive = false;
+                Socket.ShutdownBoth(sess.sock);
             }
         }
         return sent;
@@ -719,13 +722,12 @@ public class MqttBroker : IDisposable {
         sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
         int cur = 10;
         if (cur + 2 <= remainLen) {
-            int idLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+            int wireIdLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
             cur = cur + 2;
-            if (idLen > 128) { idLen = 128; }
-            if (cur + idLen <= remainLen) {
-                sess.clientId = body.ToStr(cur, idLen);
-                cur = cur + idLen;
-            }
+            if (cur + wireIdLen > remainLen) { return false; }
+            int keepIdLen = wireIdLen > 128 ? 128 : wireIdLen;
+            sess.clientId = body.ToStr(cur, keepIdLen);
+            cur = cur + wireIdLen;
         }
         if (sess.willFlag && cur + 2 <= remainLen) {
             int wtLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
@@ -860,10 +862,11 @@ public class MqttBroker : IDisposable {
         List<int> grantedQos = new List<int>();
         List<string> newlySubscribedFilters = new List<string>();
         bool malformed = false;
-        while (offset + 2 < remainLen) {
+        while (offset < remainLen) {
+            if (offset + 2 > remainLen) { malformed = true; break; }
             int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
             offset = offset + 2;
-            if (offset + fLen + 1 > remainLen) { malformed = true; break; }
+            if (fLen <= 0 || offset + fLen + 1 > remainLen) { malformed = true; break; }
             string filter = body.ToStr(offset, fLen);
             offset = offset + fLen;
             int reqQos = body[offset] & 255;
@@ -890,7 +893,7 @@ public class MqttBroker : IDisposable {
             }
             grantedQos.Add(reqQos);
         }
-        if (malformed) { return false; }
+        if (malformed || grantedQos.Count == 0) { return false; }
         int ackRemainLen = 2 + grantedQos.Count;
         int varintLen = MqttClient.RemainLenBytes(ackRemainLen);
         int ackLen = 1 + varintLen + ackRemainLen;
@@ -904,15 +907,22 @@ public class MqttBroker : IDisposable {
             suback[ackOffset + g] = (byte)grantedQos[g];
         }
         int _s = await Socket.SendAsync(sock, suback, ackLen);
-        for (int sf = 0; sf < newlySubscribedFilters.Count; sf = sf + 1) {
-            string nFilter = newlySubscribedFilters[sf];
-            for (int rm = 0; rm < this.retainedMessages.Count; rm = rm + 1) {
-                MqttRetainedMessage msg = this.retainedMessages[rm];
-                if (MqttBroker.TopicMatches(nFilter, msg.topic)) {
-                    byte[] rpkt = MqttBroker.BuildPublishRetain(msg.topic, msg.payload, msg.payloadLen);
-                    int rpktLen = this.PublishPacketLen(msg.topic, msg.payloadLen);
-                    int _sent = await Socket.SendAsync(sess.sock, rpkt, rpktLen);
+        if (newlySubscribedFilters.Count > 0 && this.retainedMessages.Count > 0) {
+            List<MqttRetainedMessage> toSend = new List<MqttRetainedMessage>();
+            for (int sf = 0; sf < newlySubscribedFilters.Count; sf = sf + 1) {
+                string nFilter = newlySubscribedFilters[sf];
+                for (int rm = 0; rm < this.retainedMessages.Count; rm = rm + 1) {
+                    MqttRetainedMessage msg = this.retainedMessages[rm];
+                    if (MqttBroker.TopicMatches(nFilter, msg.topic)) {
+                        toSend.Add(msg);
+                    }
                 }
+            }
+            for (int k = 0; k < toSend.Count; k = k + 1) {
+                MqttRetainedMessage msg = toSend[k];
+                byte[] rpkt = MqttBroker.BuildPublishRetain(msg.topic, msg.payload, msg.payloadLen);
+                int rpktLen = this.PublishPacketLen(msg.topic, msg.payloadLen);
+                int _sent = await Socket.SendAsync(sess.sock, rpkt, rpktLen);
             }
         }
         return true;

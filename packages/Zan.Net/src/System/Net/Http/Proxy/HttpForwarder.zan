@@ -272,10 +272,16 @@ public partial class HttpForwarder : IDisposable {
             nint client = await this.listener.AcceptAsync();
             if (client < 0) { break; }
             Socket.SetNoDelay(client);
-            if (this.active >= this.maxConnections) {
+            bool accepted = false;
+            lock (this) {
+                if (this.active < this.maxConnections) {
+                    this.active = this.active + 1;
+                    accepted = true;
+                }
+            }
+            if (!accepted) {
                 Task.Spawn(HttpForwarder.RejectBusy(client));
             } else {
-                this.active = this.active + 1;
                 Task.Spawn(this.Serve(client));
             }
         }
@@ -295,7 +301,9 @@ public partial class HttpForwarder : IDisposable {
         try {
             await this.ServeOnce(clientSock);
         } finally {
-            this.active = this.active - 1;
+            lock (this) {
+                if (this.active > 0) { this.active = this.active - 1; }
+            }
         }
     }
 
@@ -304,6 +312,8 @@ public partial class HttpForwarder : IDisposable {
     private async void ServeOnce(nint clientSock) {
         FwdChannel client = FwdChannel.OfSocket(clientSock, this.recvIdleMs);
         FwdReader creader = new FwdReader(client, this.chunkBytes);
+        FwdReader ureader = null;
+        try {
         string head = await creader.ReadHeadAsync(this.maxHeadBytes);
         if (head.Length == 0) {
             client.Close();
@@ -375,7 +385,7 @@ public partial class HttpForwarder : IDisposable {
             }
         }
 
-        FwdReader ureader = new FwdReader(up, this.chunkBytes);
+        ureader = new FwdReader(up, this.chunkBytes);
         string rhead = "";
         bool expectContinue = HttpForwarder.HasHeaderToken(head, "expect", "100-continue")
             && HttpForwarder.HasRequestBody(head);
@@ -424,6 +434,7 @@ public partial class HttpForwarder : IDisposable {
                     up.Close();
                     up = null;
                 } else {
+                    ureader.Dispose();
                     ureader = new FwdReader(up, this.chunkBytes);
                     rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
                 }
@@ -508,6 +519,10 @@ public partial class HttpForwarder : IDisposable {
             up.Close();
         }
         client.Close();
+        } finally {
+            if (ureader != null) { ureader.Dispose(); }
+            creader.Dispose();
+        }
     }
 
     // CONNECT：连上游后回 200，然后双向裸字节对拷
@@ -528,8 +543,12 @@ public partial class HttpForwarder : IDisposable {
         int _o = await client.SendAllAsync(
             "HTTP/1.1 200 Connection Established\r\n\r\n");
         FwdReader ureader = new FwdReader(up, this.chunkBytes);
-        await HttpForwarder.Tunnel(client, creader, up, ureader,
-                                   this.chunkBytes);
+        try {
+            await HttpForwarder.Tunnel(client, creader, up, ureader,
+                                       this.chunkBytes);
+        } finally {
+            ureader.Dispose();
+        }
     }
 
     // 建立上游连接（必要时完成 TLS 握手）。连接走

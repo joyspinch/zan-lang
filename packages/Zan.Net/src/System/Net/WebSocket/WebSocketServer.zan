@@ -76,7 +76,8 @@ public class WebSocketConnection : IDisposable {
         }
     }
 
-    // 发送正常关闭帧（RFC 6455 Opcode 8）并断开连接
+    // 发送正常关闭帧（RFC 6455 Opcode 8）并半关套接字唤醒读循环；
+    // 句柄关闭由 HandleConnection 的 finally → Dispose 独占完成（防双关）。
     public async void CloseAsync() {
         if (!this.connected) { return; }
         this.connected = false;
@@ -86,15 +87,23 @@ public class WebSocketConnection : IDisposable {
             int _r = await this.SendEncodedAsync(encoded, 2);
         } catch (Exception ex) {
         } finally {
-            if (this.client != null) { this.client.Close(); }
-            if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+            nint s = this.sock;
+            if (s >= 0) { Socket.ShutdownBoth(s); }
         }
     }
 
     public void Dispose() {
         this.connected = false;
-        if (this.client != null) { this.client.Close(); }
-        if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        TcpClient c = null;
+        nint s = -1;
+        lock (this) {
+            c = this.client;
+            this.client = null;
+            s = this.sock;
+            this.sock = -1;
+        }
+        if (c != null) { c.Close(); }
+        else if (s >= 0) { Socket.Close(s); }
         if (this.sendLock != null) {
             this.sendLock.Close();
             this.sendLock = null;
@@ -205,10 +214,11 @@ public class WebSocketServer : IDisposable {
     private async void HandleConnection(nint clientSock) {
         WebSocketConnection conn = null;
         HttpDeadlineToken watch = null;
+        TcpClient client = null;
         try {
             Socket.SetNonBlocking(clientSock);
             watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-            TcpClient client = TcpClient.FromSocket(clientSock);
+            client = TcpClient.FromSocket(clientSock);
             WsReader reader = new WsReader(clientSock);
             int headerEnd = -1;
             bool alive = true;
@@ -227,7 +237,6 @@ public class WebSocketServer : IDisposable {
             if (!alive || headerEnd < 0) {
                 HttpDeadline.Disarm(watch);
                 watch = null;
-                client.Close();
                 return;
             }
 
@@ -240,7 +249,6 @@ public class WebSocketServer : IDisposable {
                 watch = null;
                 string bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 await client.SendAsync(bad);
-                client.Close();
                 return;
             }
 
@@ -262,7 +270,6 @@ public class WebSocketServer : IDisposable {
             HttpDeadline.Disarm(watch);
             watch = null;
             if (sent < 0 || timedOut) {
-                client.Close();
                 return;
             }
 
@@ -289,16 +296,21 @@ public class WebSocketServer : IDisposable {
                     }
                 }
                 conn.Dispose();
+            } else if (client != null) {
+                client.Close();
             } else {
                 Socket.Close(clientSock);
             }
-            this.connLock.WaitOne();
-            try {
-                if (this.activeConnections > 0) {
-                    this.activeConnections = this.activeConnections - 1;
+            Mutex lk = this.connLock;
+            if (lk != null) {
+                lk.WaitOne();
+                try {
+                    if (this.activeConnections > 0) {
+                        this.activeConnections = this.activeConnections - 1;
+                    }
+                } finally {
+                    lk.ReleaseMutex();
                 }
-            } finally {
-                this.connLock.ReleaseMutex();
             }
         }
     }

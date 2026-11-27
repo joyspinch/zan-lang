@@ -230,6 +230,7 @@ public partial class HttpClient {
         next.totalDeadlineUs = current.totalDeadlineUs;
         next.jar = current.jar;
         next.uploadProbe = current.uploadProbe;
+        next.cancelProbe = current.cancelProbe;
         next.defaultHeaders = new List<string>();
         for (int hi = 0; hi < current.defaultHeaders.Count; hi = hi + 1) {
             string h = current.defaultHeaders[hi];
@@ -258,54 +259,59 @@ public partial class HttpClient {
         // 最近一次请求的实际路径（不含 origin），相对 Location 按它解析。
         string currentPath = path;
         int hops = 0;
-        while (current.RedirectWanted(resp, hops)) {
-            int code = resp.statusCode;
-            string location = resp.GetHeader("Location");
-            if (HttpResponse.HasCrlf(location)) {
-                current.ClosePoolConnections();
-                throw new HttpRequestException(
-                    "redirect Location header injection rejected");
+        try {
+            while (current.RedirectWanted(resp, hops)) {
+                int code = resp.statusCode;
+                string location = resp.GetHeader("Location");
+                if (HttpResponse.HasCrlf(location)) {
+                    current.ClosePoolConnections();
+                    throw new HttpRequestException(
+                        "redirect Location header injection rejected");
+                }
+                // 相对引用按当前请求 URL 解析（与文本通道同一套规则）。
+                string resolved = HttpClient.ResolveLocation(currentPath, location,
+                    current.useTls, current.host, current.port);
+                ExternalTarget target = ExternalTarget.Parse(resolved);
+                if (target == null || visited.Contains(target.Canonical())) {
+                    current.ClosePoolConnections();
+                    throw new HttpRequestException(
+                        "redirect target is invalid or repeated");
+                }
+                visited.Add(target.Canonical());
+                if (current.useTls && !target.IsTls()) {
+                    current.ClosePoolConnections();
+                    throw new HttpRequestException(
+                        "insecure redirect: HTTPS to HTTP downgrade forbidden");
+                }
+                bool sameOrigin = current.RedirectHost() == target.Host()
+                    && current.port == target.Port()
+                    && current.useTls == target.IsTls();
+                string nextMethod = "";
+                if (!current.RedirectReplay(currentMethod, code, sameOrigin,
+                        out nextMethod)) {
+                    current.ClosePoolConnections();
+                    throw new HttpRequestException("unsafe redirect replay");
+                }
+                bool dropEntityHeaders = nextMethod != currentMethod;
+                if (current == this) { current.ClosePoolConnections(); }
+                HttpClient next = current.RedirectNextClient(current, target,
+                    sameOrigin, dropEntityHeaders);
+                if (current != this) { current.Dispose(); }
+                current = next;
+                // 动作改写（301/302/303 → GET）后字节通道的请求正文一律
+                // 丢弃；下载通道的驱动端用同一 body 参数携带 Range 行为，
+                // 改写后的 GET 原样续传（Range 不匹配时服务器返回 200
+                // 全量，与"重定向后重新下载"一致）。
+                string nextReq = nextMethod == currentMethod ? body : "";
+                resp = await driver(next, nextMethod,
+                    target.Path() + target.Query(), nextReq);
+                currentMethod = nextMethod;
+                currentPath = target.Path() + target.Query();
+                hops = hops + 1;
             }
-            // 相对引用按当前请求 URL 解析（与文本通道同一套规则）。
-            string resolved = HttpClient.ResolveLocation(currentPath, location,
-                current.useTls, current.host, current.port);
-            ExternalTarget target = ExternalTarget.Parse(resolved);
-            if (target == null || visited.Contains(target.Canonical())) {
-                current.ClosePoolConnections();
-                throw new HttpRequestException(
-                    "redirect target is invalid or repeated");
-            }
-            visited.Add(target.Canonical());
-            if (current.useTls && !target.IsTls()) {
-                current.ClosePoolConnections();
-                throw new HttpRequestException(
-                    "insecure redirect: HTTPS to HTTP downgrade forbidden");
-            }
-            bool sameOrigin = current.RedirectHost() == target.Host()
-                && current.port == target.Port()
-                && current.useTls == target.IsTls();
-            string nextMethod = "";
-            if (!current.RedirectReplay(currentMethod, code, sameOrigin,
-                    out nextMethod)) {
-                current.ClosePoolConnections();
-                throw new HttpRequestException("unsafe redirect replay");
-            }
-            bool dropEntityHeaders = nextMethod != currentMethod;
-            if (current == this) { current.ClosePoolConnections(); }
-            HttpClient next = current.RedirectNextClient(current, target,
-                sameOrigin, dropEntityHeaders);
-            // 动作改写（301/302/303 → GET）后字节通道的请求正文一律
-            // 丢弃；下载通道的驱动端用同一 body 参数携带 Range 行为，
-            // 改写后的 GET 原样续传（Range 不匹配时服务器返回 200
-            // 全量，与"重定向后重新下载"一致）。
-            string nextReq = nextMethod == currentMethod ? body : "";
-            resp = await driver(next, nextMethod,
-                target.Path() + target.Query(), nextReq);
-            current = next;
-            currentMethod = nextMethod;
-            currentPath = target.Path() + target.Query();
-            hops = hops + 1;
+            return resp;
+        } finally {
+            if (current != this) { current.Dispose(); }
         }
-        return resp;
     }
 }

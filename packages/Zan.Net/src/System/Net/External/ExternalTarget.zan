@@ -319,19 +319,83 @@ public class ExternalTarget {
         return groups == 8;
     }
 
-    // 主机是否为回环地址：IPv4 第一段为 127，或精确 "::1"。
+    // 将严格纯十六进制 IPv6 字面量规范解析为 16 字节大端数组；非法返回 null。
+    private static byte[] ParseIPv6Bytes(string h) {
+        if (h == null || h.Length < 2 || h.Contains(".")) { return null; }
+        int first = h.IndexOf("::");
+        if (first >= 0 && h.IndexOf("::", first + 2) >= 0) { return null; }
+        if (h.IndexOf(":::") >= 0) { return null; }
+        int[] left = new int[8];
+        int leftCount = 0;
+        int[] right = new int[8];
+        int rightCount = 0;
+        bool inRight = false;
+        int start = 0;
+        int len = h.Length;
+        for (int i = 0; i <= len; i = i + 1) {
+            if (i == len || (h[i] & 255) == 58) { // ':'
+                if (i > start) {
+                    int val = ExternalTarget.ParseHexSlice(h, start, i - start);
+                    if (val < 0) { return null; }
+                    if (!inRight) {
+                        if (leftCount >= 8) { return null; }
+                        left[leftCount] = val;
+                        leftCount = leftCount + 1;
+                    } else {
+                        if (rightCount >= 8) { return null; }
+                        right[rightCount] = val;
+                        rightCount = rightCount + 1;
+                    }
+                } else if (i == 0) {
+                    if (first != 0) { return null; }
+                    inRight = true;
+                } else if (i == len) {
+                    if (first != len - 2) { return null; }
+                } else if ((h[i - 1] & 255) == 58) {
+                    inRight = true;
+                } else {
+                    return null;
+                }
+                start = i + 1;
+            }
+        }
+        int totalGroups = leftCount + rightCount;
+        if (first >= 0) {
+            if (totalGroups >= 8) { return null; }
+        } else {
+            if (totalGroups != 8) { return null; }
+        }
+        int[] groups = new int[8];
+        for (int i = 0; i < leftCount; i = i + 1) { groups[i] = left[i]; }
+        int zeroFill = 8 - totalGroups;
+        for (int i = 0; i < rightCount; i = i + 1) { groups[leftCount + zeroFill + i] = right[i]; }
+        byte[] bytes = new byte[16];
+        for (int i = 0; i < 8; i = i + 1) {
+            bytes[i * 2] = (byte)((groups[i] >> 8) & 255);
+            bytes[i * 2 + 1] = (byte)(groups[i] & 255);
+        }
+        return bytes;
+    }
+
+    // 主机是否为回环地址：IPv4 第一段为 127，或规范解析后等于 ::1（覆盖 0:0:0:0:0:0:0:1 / 0::1 等写法）。
     private static bool IsLoopbackHost(string h) {
         if (ValidIPv4(h)) {
             return h.StartsWith("127.");
         }
-        return h == "::1";
+        byte[] b = ExternalTarget.ParseIPv6Bytes(h);
+        if (b == null) { return false; }
+        for (int i = 0; i < 15; i = i + 1) {
+            if ((b[i] & 255) != 0) { return false; }
+        }
+        return (b[15] & 255) == 1;
     }
 
     // 判定字面量地址是否安全公网。IPv4 排除：0/8、10/8、127/8、
     // 224/4 及以上（组播+保留）、169.254/16、172.16/12、192.0.0/24、
     // 192.168/16、100.64/10、198.18/15、198.51.100/24、203.0.113/24、
-    // 255.255.255.255。IPv6 排除：::1、::、fe80::/10、fc00::/7、ff00::/8、
-    // 2001:db8::/32、::ffff: 映射段。
+    // 255.255.255.255。IPv6 规范化为 16 字节后排除：::/96（含 ::、::1、IPv4 兼容）、
+    // ::ffff:0:0/96（IPv4 映射）、64:ff9b::/96（NAT64）、100::/64、fe80::/10、fec0::/10、
+    // fc00::/7、ff00::/8、2001:db8::/32。
     private static bool SafeLiteral(string h) {
         if (ValidIPv4(h)) {
             int a = 0;
@@ -362,16 +426,40 @@ public class ExternalTarget {
             if (a == 255 && b == 255 && c == 255 && d == 255) { return false; }
             return true;
         }
-        if (!ValidIPv6(h)) { return false; }
-        string low = ExternalTarget.AsciiLowerSlice(h, 0, h.Length);
-        if (low == "::1" || low == "::") { return false; }
-        if (low.StartsWith("fe8") || low.StartsWith("fe9")
-            || low.StartsWith("fea") || low.StartsWith("feb")) { return false; }
-        if (low.StartsWith("fc") || low.StartsWith("fd") || low.StartsWith("ff")) {
-            return false;
+        byte[] ip = ExternalTarget.ParseIPv6Bytes(h);
+        if (ip == null) { return false; }
+        int b0 = ip[0] & 255;
+        int b1 = ip[1] & 255;
+        int b2 = ip[2] & 255;
+        int b3 = ip[3] & 255;
+        // 检查前 10 字节是否全 0（覆盖 ::、::1、::/96、::ffff:0:0/96）
+        bool zero10 = true;
+        for (int i = 0; i < 10; i = i + 1) {
+            if ((ip[i] & 255) != 0) { zero10 = false; break; }
         }
-        if (low.StartsWith("2001:db8:")) { return false; }
-        if (low.StartsWith("::ffff:")) { return false; }
+        if (zero10) {
+            int b10 = ip[10] & 255;
+            int b11 = ip[11] & 255;
+            if ((b10 == 0 && b11 == 0) || (b10 == 255 && b11 == 255)) { return false; }
+        }
+        // NAT64 well-known prefix 64:ff9b::/96
+        if (b0 == 0 && b1 == 100 && b2 == 255 && b3 == 155) {
+            bool natZero = true;
+            for (int i = 4; i < 12; i = i + 1) {
+                if ((ip[i] & 255) != 0) { natZero = false; break; }
+            }
+            if (natZero) { return false; }
+        }
+        // Discard-only 100::/64
+        if (b0 == 1 && b1 == 0 && b2 == 0 && b3 == 0
+            && (ip[4] & 255) == 0 && (ip[5] & 255) == 0
+            && (ip[6] & 255) == 0 && (ip[7] & 255) == 0) { return false; }
+        // Link-local fe80::/10 & deprecated site-local fec0::/10
+        if (b0 == 254 && ((b1 & 192) == 128 || (b1 & 192) == 192)) { return false; }
+        // Unique local fc00::/7 & multicast ff00::/8
+        if ((b0 & 254) == 252 || b0 == 255) { return false; }
+        // Documentation 2001:db8::/32
+        if (b0 == 32 && b1 == 1 && b2 == 13 && b3 == 184) { return false; }
         return true;
     }
 }

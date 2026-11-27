@@ -604,19 +604,36 @@ public class Deflate {
         return Deflate.FixedCompress(src, level);
     }
 
-    // 单个 stored 块（BFINAL=1）——最简单合法的流。
+    // stored 块（每块上限 65535 字节，仅最后一块置 BFINAL=1）—— RFC 1951 §3.2.4。
     private static byte[] Store(byte[] src, int offset, int len) {
-        int blockHeader = 1;  // BFINAL=1, BTYPE=00 -> 字节 0x01
-        byte[] out2 = new byte[len + 8];
-        out2[0] = 1;
-        out2[1] = (byte)(len & 255);
-        out2[2] = (byte)((len >> 8) & 255);
-        out2[3] = (byte)((~len) & 255);
-        out2[4] = (byte)((~len >> 8) & 255);
-        if (len > 0) {
-            NativeMemory.Copy((nint)out2 + 5, (nint)src + offset, len);
+        if (len <= 0) {
+            byte[] empty = new byte[5];
+            empty[0] = 1; // BFINAL=1, BTYPE=00
+            empty[1] = 0;
+            empty[2] = 0;
+            empty[3] = 255;
+            empty[4] = 255;
+            return empty;
         }
-        return Deflate.Trim(out2, len + 5);
+        int blocks = (len + 65534) / 65535;
+        byte[] out2 = new byte[len + blocks * 5];
+        int srcPos = offset;
+        int remain = len;
+        int outPos = 0;
+        while (remain > 0) {
+            int chunk = remain > 65535 ? 65535 : remain;
+            int bfinal = remain <= 65535 ? 1 : 0;
+            out2[outPos] = (byte)bfinal;
+            out2[outPos + 1] = (byte)(chunk & 255);
+            out2[outPos + 2] = (byte)((chunk >> 8) & 255);
+            out2[outPos + 3] = (byte)((~chunk) & 255);
+            out2[outPos + 4] = (byte)((~chunk >> 8) & 255);
+            NativeMemory.Copy((nint)out2 + outPos + 5, (nint)src + srcPos, chunk);
+            srcPos = srcPos + chunk;
+            outPos = outPos + 5 + chunk;
+            remain = remain - chunk;
+        }
+        return out2;
     }
 
     // LZ77 + 固定 Huffman。输出一个最终块；字面量和长度/

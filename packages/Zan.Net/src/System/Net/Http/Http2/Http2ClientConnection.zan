@@ -30,6 +30,9 @@ public class Http2ClientConnection : IDisposable {
     private int peerMaxStreams = 16;
     private int bufferedResponseBytes;
     private AsyncGate wireGate;
+    private int activeOps;
+    private bool transportReleased;
+    private bool transportClosed;
     public int maxHeaderBytes = 65536;
     public int maxResponseBytes = 8388608;
     public int maxConcurrentStreams = 16;
@@ -346,10 +349,12 @@ public class Http2ClientConnection : IDisposable {
             headerBytes = headerBytes + headers[i].name.Length + headers[i].value.Length + 32;
             if (headers.Count > 128 || headerBytes > this.maxHeaderBytes || headerBytes > 65536) { throw new IOException("HTTP2 request header limit"); }
         }
+        if (!this.BeginTransportOp()) { return null; }
+        try {
         await this.wireGate.Wait();
         Http2Stream stream = null;
         lock (this.activeStreams) {
-            if (this.activeStreams.Count >= this.maxConcurrentStreams || this.activeStreams.Count >= this.peerMaxStreams || this.activeStreams.Count >= 16 || this.nextStreamId > 2147483645) { this.wireGate.Signal(); return null; }
+            if (!this.connected || this.activeStreams.Count >= this.maxConcurrentStreams || this.activeStreams.Count >= this.peerMaxStreams || this.activeStreams.Count >= 16 || this.nextStreamId > 2147483645) { this.wireGate.Signal(); return null; }
             stream = new Http2Stream(this.nextStreamId);
             this.nextStreamId = this.nextStreamId + 2;
             stream.outboundWindow = this.initialStreamWindow;
@@ -419,12 +424,15 @@ public class Http2ClientConnection : IDisposable {
             return null;
         } finally {
             HttpDeadline.Disarm(watch);
-            stream.gate.Close();
             lock (this.activeStreams) {
                 for (int i = 0; i < this.activeStreams.Count; i = i + 1) {
                     if (this.activeStreams[i].streamId == sid) { this.bufferedResponseBytes = this.bufferedResponseBytes - stream.bodyLength; this.activeStreams.RemoveAt(i); break; }
                 }
             }
+            stream.gate.Close();
+        }
+        } finally {
+            this.EndTransportOp();
         }
     }
     private byte[] Packet(int type, int flags, int id, byte[] data, int offset, int count) {
@@ -450,9 +458,14 @@ public class Http2ClientConnection : IDisposable {
         return offset;
     }
     private async int SendRawAsync(byte[] buf, int len) {
-        await this.wireGate.Wait();
-        try { return await this.SendUnlockedAsync(buf, len); }
-        finally { this.wireGate.Signal(); }
+        if (!this.BeginTransportOp()) { throw new IOException("HTTP2 connection closed"); }
+        try {
+            await this.wireGate.Wait();
+            try { return await this.SendUnlockedAsync(buf, len); }
+            finally { this.wireGate.Signal(); }
+        } finally {
+            this.EndTransportOp();
+        }
     }
 
     // 精确读取指定字节数（TLS 与首次明文直读直接落入目标缓冲区，避免逐帧临时分配与逐字节拷贝）。
@@ -494,7 +507,39 @@ public class Http2ClientConnection : IDisposable {
         }
     }
 
+    private bool BeginTransportOp() {
+        lock (this.activeStreams) {
+            if (!this.connected || this.transportReleased) { return false; }
+            this.activeOps = this.activeOps + 1;
+            return true;
+        }
+    }
+
+    private void EndTransportOp() {
+        bool shouldRelease = false;
+        lock (this.activeStreams) {
+            if (this.activeOps > 0) { this.activeOps = this.activeOps - 1; }
+            if (this.transportReleased && this.activeOps == 0 && !this.transportClosed) {
+                this.transportClosed = true;
+                shouldRelease = true;
+            }
+        }
+        if (shouldRelease) { this.ReleaseTransportNow(); }
+    }
+
     private void ReleaseTransport() {
+        bool shouldRelease = false;
+        lock (this.activeStreams) {
+            this.transportReleased = true;
+            if (this.activeOps == 0 && !this.transportClosed) {
+                this.transportClosed = true;
+                shouldRelease = true;
+            }
+        }
+        if (shouldRelease) { this.ReleaseTransportNow(); }
+    }
+
+    private void ReleaseTransportNow() {
         if (this.tls != null) { this.tls.Close(); this.tls = null; }
         if (this.tlsCtx != null) { this.tlsCtx.Free(); this.tlsCtx = null; }
         if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }

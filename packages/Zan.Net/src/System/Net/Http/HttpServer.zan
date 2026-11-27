@@ -401,6 +401,7 @@ public class HttpServer : IDisposable {
             // The existing HTTP/2 entry accepts a byte writer and the same
             // framer, including bytes buffered after the preface's first line.
             if (request.method == "PRI" && request.path == "*" && request.version == "HTTP/2.0") {
+                HttpDeadline.Disarm(watch);
                 framer.Consume(headerEnd);
                 return await Http2ServerConnection.ServeTlsAsync(writer.SendFrameAsync, handler,
                     framer, maxHeaderBytes, maxRequestBytes, timeoutMs);
@@ -533,7 +534,8 @@ public class HttpServer : IDisposable {
         return true;
     }
 
-    // 停止服务器。
+    // 停止服务器：仅对活跃连接发 ShutdownBoth 唤醒在途读写，
+    // 由各连接协程的 finally 独占关闭句柄并归还 activeConnections 计数（防双关与负计数）。
     public void Stop() {
         this.running = false;
         if (this.listener != null) {
@@ -543,11 +545,9 @@ public class HttpServer : IDisposable {
             if (this.activeSockets != null) {
                 List<nint> socks = this.activeSockets.ToList();
                 for (int i = 0; i < socks.Count; i = i + 1) {
-                    Socket.Close(socks[i]);
+                    Socket.ShutdownBoth(socks[i]);
                 }
-                this.activeSockets.Clear();
             }
-            this.activeConnections = 0;
         }
     }
 

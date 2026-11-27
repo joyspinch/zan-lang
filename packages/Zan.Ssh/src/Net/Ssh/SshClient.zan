@@ -61,6 +61,7 @@ public class SshClient : IDisposable {
     public string negotiatedHostKey;
     public string negotiatedCipher;
     private long localChannel;
+    private long nextLocalChannel;
     private long remoteChannel;
     private long remoteWindow;
     private long remoteMaxPacket;
@@ -91,6 +92,7 @@ public class SshClient : IDisposable {
         this.negotiatedHostKey = "";
         this.negotiatedCipher = "";
         this.localChannel = 0;
+        this.nextLocalChannel = 0;
         this.remoteChannel = 0;
         this.remoteWindow = 0;
         this.remoteMaxPacket = 32768;
@@ -323,6 +325,10 @@ public class SshClient : IDisposable {
         SshReader pk = new SshReader(payload, 1, payload.Length - 1);
         string signedAlg = pk.ReadText();
         byte[] signedKeyBlob = pk.ReadString();
+        if (signedAlg != key.algorithm || !SshClient.BytesEqual(signedKeyBlob, key.blob)) {
+            throw new SshException(SshError.UnexpectedMessage,
+                "server PK_OK algorithm or key blob mismatch");
+        }
         // RFC 4252 §7: session_id || SSH_MSG_USERAUTH_REQUEST || user || "ssh-connection" || "publickey" || TRUE || alg || keyBlob
         SshWriter signed2 = new SshWriter(512);
         signed2.WriteString(this.sessionId);
@@ -331,8 +337,8 @@ public class SshClient : IDisposable {
         signed2.WriteText("ssh-connection");
         signed2.WriteText("publickey");
         signed2.WriteBool(true);
-        signed2.WriteText(signedAlg);
-        signed2.WriteString(signedKeyBlob);
+        signed2.WriteText(key.algorithm);
+        signed2.WriteString(key.blob);
         byte[] signature = key.Sign(signed2.ToArray());
 
         SshWriter real = new SshWriter(512);
@@ -412,8 +418,31 @@ public class SshClient : IDisposable {
         this.SendChannelIdMsg(SshMessage.ChannelClose);
     }
 
+    private static bool BytesEqual(byte[] a, byte[] b) {
+        if (a == null || b == null || a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if ((a[i] & 255) != (b[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    private static bool IsStaleChannelMessage(int message, byte[] payload, long expectedLocalChannel) {
+        if (message != SshMessage.ChannelEof && message != SshMessage.ChannelClose
+            && message != SshMessage.ChannelWindowAdjust && message != SshMessage.ChannelData
+            && message != SshMessage.ChannelExtendedData && message != SshMessage.ChannelRequest
+            && message != SshMessage.ChannelSuccess && message != SshMessage.ChannelFailure) {
+            return false;
+        }
+        if (payload.Length < 5) { return true; }
+        SshReader cr = new SshReader(payload, 1, payload.Length - 1);
+        long recipient = cr.ReadU32();
+        return recipient != expectedLocalChannel;
+    }
+
     public void OpenSessionChannel() {
-        this.localChannel = 0;
+        this.localChannel = this.nextLocalChannel;
+        this.nextLocalChannel = this.nextLocalChannel + 1;
+        this.windowConsumed = 0;
         SshWriter w = new SshWriter(64);
         w.WriteText("session");
         w.WriteU32(this.localChannel);
@@ -422,25 +451,33 @@ public class SshClient : IDisposable {
         this.SendMessage(SshMessage.ChannelOpen, w.ToArray());
         byte[] payload = null;
         int message = 0;
+        SshReader r = null;
         while (true) {
-            payload = this.packets.Recv();
+            payload = this.NextMessage();
             message = payload[0] & 255;
-            if (message == SshMessage.Ignore || message == SshMessage.Debug) { continue; }
+            if (message == SshMessage.Ignore || message == SshMessage.Debug
+                || message == SshMessage.GlobalRequest) { continue; }
             if (message == SshMessage.Disconnect) {
                 SshClient.ThrowDisconnect(payload, "peer disconnected");
             }
-            break;
-        }
-        SshReader r = new SshReader(payload, 1, payload.Length - 1);
-        if (message == SshMessage.ChannelOpenFailure) {
-            r.ReadU32();
-            throw new SshException(SshError.ChannelOpenFailed, "cannot open session channel", r.ReadText());
-        }
-        if (message != SshMessage.ChannelOpenConfirmation) {
+            if (SshClient.IsStaleChannelMessage(message, payload, this.localChannel)) {
+                continue;
+            }
+            r = new SshReader(payload, 1, payload.Length - 1);
+            if (message == SshMessage.ChannelOpenFailure) {
+                long recipFail = r.ReadU32();
+                if (recipFail != this.localChannel) { continue; }
+                r.ReadU32(); // reason code
+                throw new SshException(SshError.ChannelOpenFailed, "cannot open session channel", r.ReadText());
+            }
+            if (message == SshMessage.ChannelOpenConfirmation) {
+                long recipOk = r.ReadU32();
+                if (recipOk != this.localChannel) { continue; }
+                break;
+            }
             throw new SshException(SshError.UnexpectedMessage, "unexpected reply to channel open",
                 SshMessage.Name(message));
         }
-        r.ReadU32();
         this.remoteChannel = r.ReadU32();
         this.remoteWindow = r.ReadU32();
         this.remoteMaxPacket = r.ReadU32();
@@ -616,6 +653,10 @@ public class SshClient : IDisposable {
     }
 
     public void Close() {
+        this.localChannel = 0;
+        this.nextLocalChannel = 0;
+        this.remoteChannel = 0;
+        this.windowConsumed = 0;
         if (this.pipe != null) {
             this.pipe.Close();
             this.pipe = null;

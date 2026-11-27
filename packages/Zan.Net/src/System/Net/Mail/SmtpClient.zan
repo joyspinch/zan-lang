@@ -119,6 +119,8 @@ public class SmtpClient : IDisposable {
         this.recvTmp = null;
         this.inhead = 0;
         this.intail = 0;
+        this.lastCode = 0;
+        this.lastResponse = "";
         this.user = "";
         this.pass = "";
     }
@@ -199,6 +201,8 @@ public class SmtpClient : IDisposable {
     // 读取一条完整 SMTP 响应（可能多行 "250-..." / "250 ..."）。
     // 失败/关闭返回 null。行数上限 512，防止恶意服务器无限刷行。
     private async string readResponse() {
+        this.lastCode = 0;
+        this.lastResponse = "";
         StringBuilder sb = new StringBuilder();
         int code = 0;
         int lines = 0;
@@ -557,8 +561,10 @@ public class SmtpClient : IDisposable {
             }
             string resp = await this.readResponse();
             if (resp == null || this.lastCode != 220) {
+                int code = this.lastCode;
+                string text = this.lastResponse;
                 this.Close();
-                return SmtpResult.Fail("starttls", this.lastCode, this.lastResponse);
+                return SmtpResult.Fail("starttls", code, text);
             }
             TlsContext ctx = TlsContext.CreateClient();
             TlsStream ts = await TlsStream.ConnectAsync(ctx, this.conn.GetSocket(),
@@ -598,9 +604,12 @@ public class SmtpClient : IDisposable {
             this.Close();
             return SmtpResult.Fail("mail", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 250) {
-            return SmtpResult.Fail("mail", this.lastCode, this.lastResponse);
+        string mailResp = await this.readResponse();
+        if (mailResp == null || this.lastCode != 250) {
+            int code = this.lastCode;
+            string text = this.lastResponse;
+            if (mailResp == null) { this.Close(); }
+            return SmtpResult.Fail("mail", code, text);
         }
         // RCPT TO（to+cc+bcc）。
         for (int i = 0; i < toClean.Count; i = i + 1) {
@@ -620,9 +629,12 @@ public class SmtpClient : IDisposable {
             this.Close();
             return SmtpResult.Fail("data", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 354) {
-            return SmtpResult.Fail("data", this.lastCode, this.lastResponse);
+        string dataResp = await this.readResponse();
+        if (dataResp == null || this.lastCode != 354) {
+            int code = this.lastCode;
+            string text = this.lastResponse;
+            if (dataResp == null) { this.Close(); }
+            return SmtpResult.Fail("data", code, text);
         }
         string mime = this.MimeText(msg, this.MakeBoundary(), this.MakeDateLine(),
                                     this.MakeMessageId(msg));
@@ -634,9 +646,12 @@ public class SmtpClient : IDisposable {
             this.Close();
             return SmtpResult.Fail("data", 0, "正文写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 250) {
-            return SmtpResult.Fail("data", this.lastCode, this.lastResponse);
+        string endResp = await this.readResponse();
+        if (endResp == null || this.lastCode != 250) {
+            int code = this.lastCode;
+            string text = this.lastResponse;
+            if (endResp == null) { this.Close(); }
+            return SmtpResult.Fail("data", code, text);
         }
         // QUIT 留给连接复用：不主动发，Close 时由 TCP 收尾。
         SmtpResult ok = new SmtpResult();
@@ -648,11 +663,15 @@ public class SmtpClient : IDisposable {
 
     private async SmtpResult RcptAsync(string addr) {
         if (!await this.writeLine("RCPT TO:<" + addr + ">")) {
+            this.Close();
             return SmtpResult.Fail("rcpt", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 250 && this.lastCode != 251) {
-            return SmtpResult.Fail("rcpt", this.lastCode, this.lastResponse);
+        string resp = await this.readResponse();
+        if (resp == null || (this.lastCode != 250 && this.lastCode != 251)) {
+            int code = this.lastCode;
+            string text = this.lastResponse;
+            if (resp == null) { this.Close(); }
+            return SmtpResult.Fail("rcpt", code, text);
         }
         SmtpResult r = new SmtpResult();
         r.ok = true;
@@ -678,8 +697,8 @@ public class SmtpClient : IDisposable {
         }
         this.open = true;
         // 220 问候。
-        await this.readResponse();
-        if (this.lastCode != 220) {
+        string greetResp = await this.readResponse();
+        if (greetResp == null || this.lastCode != 220) {
             SmtpResult r = SmtpResult.Fail("greeting", this.lastCode, this.lastResponse);
             this.Close();
             return r;
@@ -750,35 +769,35 @@ public class SmtpClient : IDisposable {
         if (!await this.writeLine("AUTH PLAIN " + b64)) {
             return SmtpResult.Fail("auth", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode == 235) {
+        string r1 = await this.readResponse();
+        if (r1 != null && this.lastCode == 235) {
             SmtpResult ok = new SmtpResult();
             ok.ok = true;
             return ok;
         }
-        if (this.lastCode != 504 && this.lastCode != 535 && this.lastCode != 500 && this.lastCode != 502) {
+        if (r1 == null || (this.lastCode != 504 && this.lastCode != 535 && this.lastCode != 500 && this.lastCode != 502)) {
             return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
         }
         // 退 AUTH LOGIN。
         if (!await this.writeLine("AUTH LOGIN")) {
             return SmtpResult.Fail("auth", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 334) {
+        string r2 = await this.readResponse();
+        if (r2 == null || this.lastCode != 334) {
             return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
         }
         if (!await this.writeLine(Base64.Encode(Encoding.UTF8.GetBytes(this.user)))) {
             return SmtpResult.Fail("auth", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 334) {
+        string r3 = await this.readResponse();
+        if (r3 == null || this.lastCode != 334) {
             return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
         }
         if (!await this.writeLine(Base64.Encode(Encoding.UTF8.GetBytes(this.pass)))) {
             return SmtpResult.Fail("auth", 0, "写入失败");
         }
-        await this.readResponse();
-        if (this.lastCode != 235) {
+        string r4 = await this.readResponse();
+        if (r4 == null || this.lastCode != 235) {
             return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
         }
         SmtpResult ok2 = new SmtpResult();

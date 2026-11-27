@@ -1,13 +1,15 @@
 using System;
 using System.Net.Sockets;
+using System.Net.Tls;
 using System.Net.WebSocket;
 using System.Text;
 
 namespace System.Web;
 
-// WebSocket 服务端会话实例：封装底层连接、帧读写与生命周期管理。
+// WebSocket 服务端会话实例：封装底层连接（明文 TCP 或 TLS）、帧读写与生命周期管理。
 public class WsSession : IDisposable {
     private TcpClient client;
+    private TlsStream tls;
     private WsReader reader;
     private WsWriter writer;
     private WsAssembler asm;
@@ -20,6 +22,19 @@ public class WsSession : IDisposable {
     public WsSession(TcpClient client, WsReader reader, WsWriter writer,
                      WsAssembler asm, HttpContext ctx) {
         this.client = client;
+        this.tls = null;
+        this.reader = reader;
+        this.writer = writer;
+        this.asm = asm;
+        this.ctx = ctx;
+        this.open = true;
+        this.lastOpcode = WsOpcode.Text;
+    }
+
+    public WsSession(TlsStream tls, WsReader reader, WsWriter writer,
+                     WsAssembler asm, HttpContext ctx) {
+        this.client = null;
+        this.tls = tls;
         this.reader = reader;
         this.writer = writer;
         this.asm = asm;
@@ -33,6 +48,10 @@ public class WsSession : IDisposable {
     public void Dispose() {
         if (this.open) {
             this.open = false;
+        }
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
         }
         if (this.client != null) {
             this.client.Dispose();
@@ -154,12 +173,16 @@ public class WsSession : IDisposable {
         this.open = false;
         byte[] enc = WsFrame.CloseFrameWithCode(code).Encode();
         this.writer.Append(enc, 4);
-        int _f = await this.writer.Flush(this.client);
+        int _f = this.tls != null
+            ? await this.writer.FlushTls(this.tls)
+            : await this.writer.Flush(this.client);
     }
 
     // 把写缓冲里挂起的帧推到对端；失败即关闭会话并返回 false。
     public async bool FlushOut() {
-        int n = await this.writer.Flush(this.client);
+        int n = this.tls != null
+            ? await this.writer.FlushTls(this.tls)
+            : await this.writer.Flush(this.client);
         if (n < 0) {
             this.open = false;
             return false;
