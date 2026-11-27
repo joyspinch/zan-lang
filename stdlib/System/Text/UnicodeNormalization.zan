@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Interop;
 
 namespace System.Text;
 
@@ -32,6 +33,12 @@ public class UnicodeNormalization {
 
     // 递归规范分解一个码点到 target 列表中（NFD 阶段 1）。
     private static void DecomposeRecursive(int cp, List<int> target) {
+        // 0. ASCII 与 Latin-1 前段（< U+00C0）无规范分解，直接 O(1) 跳过二分查找
+        if (cp < 0xC0) {
+            target.Add(cp);
+            return;
+        }
+
         // 1. 韩文算法分解（零查表）
         if (cp >= 0xAC00 && cp <= 0xD7A3) {
             int sIndex = cp - 0xAC00;
@@ -136,20 +143,52 @@ public class UnicodeNormalization {
         return 0;
     }
 
+    // 将码点列表直接编码为单个 UTF-8 字符串，避免逐码点分配临时 string。
+    private static string EncodeCodePointsUtf8(List<int> cps) {
+        int count = cps.Count;
+        if (count == 0) { return ""; }
+        int totalBytes = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int cp = cps[i];
+            if (cp < 0x80) { totalBytes = totalBytes + 1; }
+            else if (cp < 0x800) { totalBytes = totalBytes + 2; }
+            else if (cp < 0x10000) { totalBytes = totalBytes + 3; }
+            else { totalBytes = totalBytes + 4; }
+        }
+        byte[] buf = new byte[totalBytes];
+        int pos = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int cp = cps[i];
+            if (cp < 0x80) {
+                buf[pos] = (byte)cp;
+                pos = pos + 1;
+            } else if (cp < 0x800) {
+                buf[pos] = (byte)(0xC0 | (cp >> 6));
+                buf[pos + 1] = (byte)(0x80 | (cp & 0x3F));
+                pos = pos + 2;
+            } else if (cp < 0x10000) {
+                buf[pos] = (byte)(0xE0 | (cp >> 12));
+                buf[pos + 1] = (byte)(0x80 | ((cp >> 6) & 0x3F));
+                buf[pos + 2] = (byte)(0x80 | (cp & 0x3F));
+                pos = pos + 3;
+            } else {
+                buf[pos] = (byte)(0xF0 | (cp >> 18));
+                buf[pos + 1] = (byte)(0x80 | ((cp >> 12) & 0x3F));
+                buf[pos + 2] = (byte)(0x80 | ((cp >> 6) & 0x3F));
+                buf[pos + 3] = (byte)(0x80 | (cp & 0x3F));
+                pos = pos + 4;
+            }
+        }
+        return buf.ToStr(0, pos);
+    }
+
     // 将字符串规范化为指定的 Unicode 规范化形式（UAX #15）。
     public static string Normalize(string s, NormalizationForm form) {
         if (s == null || s.Length == 0) { return s; }
 
         // 快速检测纯 ASCII：纯 ASCII 字符串在 NFC/NFD 下恒为自身
-        bool allAscii = true;
         int slen = s.Length;
-        for (int i = 0; i < slen; i = i + 1) {
-            if ((s[i] & 255) >= 128) {
-                allAscii = false;
-                break;
-            }
-        }
-        if (allAscii) { return s; }
+        if (NativeMemory.IsAscii((nint)s, slen)) { return s; }
 
         // 步骤 1：规范分解（NFD）
         List<int> decomposed = new List<int>();
@@ -166,12 +205,7 @@ public class UnicodeNormalization {
 
         // 若请求 NFD，直接编码返回
         if (form == NormalizationForm.FormD) {
-            StringBuilder sbD = new StringBuilder();
-            int cntD = decomposed.Count;
-            for (int k = 0; k < cntD; k = k + 1) {
-                sbD.Append(Encoding.Utf8FromCodePoint(decomposed[k]));
-            }
-            return sbD.ToString();
+            return EncodeCodePointsUtf8(decomposed);
         }
 
         // 步骤 3：规范合成（NFC）
@@ -212,12 +246,7 @@ public class UnicodeNormalization {
             }
         }
 
-        StringBuilder sbC = new StringBuilder();
-        int cntC = composed.Count;
-        for (int m = 0; m < cntC; m = m + 1) {
-            sbC.Append(Encoding.Utf8FromCodePoint(composed[m]));
-        }
-        return sbC.ToString();
+        return EncodeCodePointsUtf8(composed);
     }
 
     // 判断字符串是否已符合指定的 Unicode 规范化形式。

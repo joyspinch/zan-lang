@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Interop;
 using System.Json;
 using System.Text;
@@ -147,48 +148,44 @@ public class Jwt {
         return false;
     }
 
-    private static bool keysEqual(JsonDoc doc, JsonPair p1, JsonPair p2) {
-        if (p1.keyLen != p2.keyLen) { return false; }
-        int len = p1.keyLen;
-        if (len == 0) { return true; }
-        if (p1.keyStart >= 0 && p2.keyStart >= 0) {
-            byte[] buf = doc.buf;
-            int s1 = p1.keyStart;
-            int s2 = p2.keyStart;
-            if (buf[s1] != buf[s2] || buf[s1 + len - 1] != buf[s2 + len - 1]) {
-                return false;
-            }
-            for (int m = 1; m < len - 1; m = m + 1) {
-                if (buf[s1 + m] != buf[s2 + m]) { return false; }
-            }
-            return true;
+    // 还原 JsonPair 对应的键字符串（keyStart < 0 时 keyLen 为 escPool 索引，非字节长度）。
+    private static string decodePairKey(JsonDoc doc, JsonPair p) {
+        if (p.keyStart >= 0) {
+            return doc.src.Substring(p.keyStart, p.keyLen);
         }
-        string k1 = p1.keyStart >= 0 ? doc.src.Substring(p1.keyStart, len) : doc.escPool[p1.keyLen];
-        string k2 = p2.keyStart >= 0 ? doc.src.Substring(p2.keyStart, len) : doc.escPool[p2.keyLen];
-        return k1 == k2;
+        return doc.escPool[p.keyLen];
     }
 
-    // JsonDoc 中对象层是否存在重复键（单向链表遍历 + 首尾快筛 + 基元结构剪枝，零堆分配）。
-    public static bool hasDuplicateKeysDoc(JsonDoc doc, int node) {
+    // JsonDoc 中对象层是否存在重复键：O(K) 哈希去重，正确处理含转义的键名（keyStart < 0）。
+    private static bool hasDuplicateKeysDoc(JsonDoc doc, int node) {
         if (doc == null || node < 0 || node >= doc.slotCount) { return false; }
         int k = doc.KindAt(node);
         if (k == 5) {
-            int p1 = (int)(doc.slots[node].a >> 8);
-            while (p1 >= 0) {
-                JsonPair pair1 = doc.pairs[p1];
-                int p2 = pair1.nextPair;
-                while (p2 >= 0) {
-                    JsonPair pair2 = doc.pairs[p2];
-                    if (Jwt.keysEqual(doc, pair1, pair2)) { return true; }
-                    p2 = pair2.nextPair;
-                }
-                if (pair1.valueSlot >= 0) {
-                    int vk = doc.KindAt(pair1.valueSlot);
-                    if (vk >= 4 && Jwt.hasDuplicateKeysDoc(doc, pair1.valueSlot)) {
+            int p = (int)(doc.slots[node].a >> 8);
+            if (p < 0) { return false; }
+            JsonPair first = doc.pairs[p];
+            if (first.nextPair < 0) {
+                if (first.valueSlot >= 0) {
+                    int vk = doc.KindAt(first.valueSlot);
+                    if (vk >= 4 && Jwt.hasDuplicateKeysDoc(doc, first.valueSlot)) {
                         return true;
                     }
                 }
-                p1 = pair1.nextPair;
+                return false;
+            }
+            HashSet<string> seen = new HashSet<string>();
+            while (p >= 0) {
+                JsonPair pair = doc.pairs[p];
+                string key = Jwt.decodePairKey(doc, pair);
+                if (seen.Contains(key)) { return true; }
+                seen.Add(key);
+                if (pair.valueSlot >= 0) {
+                    int vk = doc.KindAt(pair.valueSlot);
+                    if (vk >= 4 && Jwt.hasDuplicateKeysDoc(doc, pair.valueSlot)) {
+                        return true;
+                    }
+                }
+                p = pair.nextPair;
             }
         } else if (k == 4) {
             int child = doc.FirstChild(node);
@@ -369,8 +366,9 @@ public class Jwt {
     // 仅解析并校验 HS256，然后对照显式输入验证 exp、nbf、iss 和 aud。
     public static JwtToken ParseHs256(string token, string secret, int secretLen,
         long now, string issuer, string audience) {
-        if (token == null || secret == null || secretLen < 0 || secretLen > secret.Length) {
-            return Jwt.fail("invalid parameters");
+        if (token == null) { return Jwt.fail("null token"); }
+        if (secret == null || secretLen < 0 || secretLen > secret.Length) {
+            return Jwt.fail("invalid secret length");
         }
         JwtToken result = Jwt.parseParts(token, "HS256");
         if (result.error.Length > 0) { return result; }
@@ -408,9 +406,10 @@ public class Jwt {
     // 仅解析并校验 RS256，然后对照显式输入验证 exp、nbf、iss 和 aud。
     public static JwtToken ParseRs256(string token, RsaKey publicKey,
         long now, string issuer, string audience) {
-        if (token == null || publicKey == null) { return Jwt.fail("invalid parameters"); }
+        if (token == null) { return Jwt.fail("null token"); }
         JwtToken result = Jwt.parseParts(token, "RS256");
         if (result.error.Length > 0) { return result; }
+        if (publicKey == null) { return Jwt.fail("signature mismatch"); }
         int second = Jwt.dotAt(token, Jwt.dotAt(token, 0) + 1);
         string signing = token.Substring(0, second);
         string sigText = token.Substring(second + 1, token.Length - second - 1);

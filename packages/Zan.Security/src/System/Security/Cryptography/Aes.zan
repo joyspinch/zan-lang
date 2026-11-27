@@ -177,8 +177,20 @@ public class Aes {
         outb[outOff + 12] = (byte)((r3 >> 24) & 255); outb[outOff + 13] = (byte)((r3 >> 16) & 255); outb[outOff + 14] = (byte)((r3 >> 8) & 255); outb[outOff + 15] = (byte)(r3 & 255);
     }
 
+    // 预计算逆列混淆轮密钥（EqInvCipher）：每次密钥扩展仅做一次，免除 DecryptCore 逐块逐轮重复查表。
+    private static void InvertRoundKeys(int[] rk, int nr) {
+        int end = nr * 4;
+        for (int i = 4; i < end; i = i + 1) {
+            int w = rk[i];
+            rk[i] = InvT0[Sbox[(w >> 24) & 255]]
+                  ^ InvT1[Sbox[(w >> 16) & 255]]
+                  ^ InvT2[Sbox[(w >> 8) & 255]]
+                  ^ InvT3[Sbox[w & 255]];
+        }
+    }
+
     // -------------------------------------------------------------------------
-    // 单分组解密（纯 Zan 逆 T-Table 原位计算，0 堆分配）
+    // 单分组解密（纯 Zan 逆 T-Table 原位计算，使用已预计算逆列混淆的轮密钥，0 堆分配）
     // -------------------------------------------------------------------------
     private static void DecryptCore(int[] rk, int nr, string inb, int inOff, byte[] outb, int outOff) {
         int kLast = nr * 4;
@@ -191,16 +203,10 @@ public class Aes {
 
         for (int r = nr - 1; r >= 1; r = r - 1) {
             int kOff = r * 4;
-            // 逆列混淆变换后的轮密钥
-            int rk0 = InvT0[Sbox[(rk[kOff + 0] >> 24) & 255]] ^ InvT1[Sbox[(rk[kOff + 0] >> 16) & 255]] ^ InvT2[Sbox[(rk[kOff + 0] >> 8) & 255]] ^ InvT3[Sbox[rk[kOff + 0] & 255]];
-            int rk1 = InvT0[Sbox[(rk[kOff + 1] >> 24) & 255]] ^ InvT1[Sbox[(rk[kOff + 1] >> 16) & 255]] ^ InvT2[Sbox[(rk[kOff + 1] >> 8) & 255]] ^ InvT3[Sbox[rk[kOff + 1] & 255]];
-            int rk2 = InvT0[Sbox[(rk[kOff + 2] >> 24) & 255]] ^ InvT1[Sbox[(rk[kOff + 2] >> 16) & 255]] ^ InvT2[Sbox[(rk[kOff + 2] >> 8) & 255]] ^ InvT3[Sbox[rk[kOff + 2] & 255]];
-            int rk3 = InvT0[Sbox[(rk[kOff + 3] >> 24) & 255]] ^ InvT1[Sbox[(rk[kOff + 3] >> 16) & 255]] ^ InvT2[Sbox[(rk[kOff + 3] >> 8) & 255]] ^ InvT3[Sbox[rk[kOff + 3] & 255]];
-
-            t0 = InvT0[(s0 >> 24) & 255] ^ InvT1[(s3 >> 16) & 255] ^ InvT2[(s2 >> 8) & 255] ^ InvT3[s1 & 255] ^ rk0;
-            t1 = InvT0[(s1 >> 24) & 255] ^ InvT1[(s0 >> 16) & 255] ^ InvT2[(s3 >> 8) & 255] ^ InvT3[s2 & 255] ^ rk1;
-            t2 = InvT0[(s2 >> 24) & 255] ^ InvT1[(s1 >> 16) & 255] ^ InvT2[(s0 >> 8) & 255] ^ InvT3[s3 & 255] ^ rk2;
-            t3 = InvT0[(s3 >> 24) & 255] ^ InvT1[(s2 >> 16) & 255] ^ InvT2[(s1 >> 8) & 255] ^ InvT3[s0 & 255] ^ rk3;
+            t0 = InvT0[(s0 >> 24) & 255] ^ InvT1[(s3 >> 16) & 255] ^ InvT2[(s2 >> 8) & 255] ^ InvT3[s1 & 255] ^ rk[kOff + 0];
+            t1 = InvT0[(s1 >> 24) & 255] ^ InvT1[(s0 >> 16) & 255] ^ InvT2[(s3 >> 8) & 255] ^ InvT3[s2 & 255] ^ rk[kOff + 1];
+            t2 = InvT0[(s2 >> 24) & 255] ^ InvT1[(s1 >> 16) & 255] ^ InvT2[(s0 >> 8) & 255] ^ InvT3[s3 & 255] ^ rk[kOff + 2];
+            t3 = InvT0[(s3 >> 24) & 255] ^ InvT1[(s2 >> 16) & 255] ^ InvT2[(s1 >> 8) & 255] ^ InvT3[s0 & 255] ^ rk[kOff + 3];
             s0 = t0; s1 = t1; s2 = t2; s3 = t3;
         }
 
@@ -221,7 +227,7 @@ public class Aes {
 
     // AES-ECB 单块加密（16 字节 → 16 字节）。
     public static byte[] EncryptBlockEcb(string key, int keyLen, string in16) {
-        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || in16 == null) {
+        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || key == null || key.Length < keyLen || in16 == null || in16.Length < 16) {
             return null;
         }
         byte[] outb = new byte[16];
@@ -237,11 +243,12 @@ public class Aes {
 
     // AES-ECB 单块解密（16 字节 → 16 字节）。
     public static byte[] DecryptBlockEcb(string key, int keyLen, string in16) {
-        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || in16 == null) {
+        if ((keyLen != 16 && keyLen != 24 && keyLen != 32) || key == null || key.Length < keyLen || in16 == null || in16.Length < 16) {
             return null;
         }
         List<int> nr = new List<int>(); nr.Add(0);
         int[] rk = ExpandKey(key, keyLen, nr);
+        InvertRoundKeys(rk, nr[0]);
         byte[] outb = new byte[16];
         DecryptCore(rk, nr[0], in16, 0, outb, 0);
         return outb;
@@ -336,6 +343,7 @@ public class Aes {
 
         List<int> nr = new List<int>(); nr.Add(0);
         int[] rk = ExpandKey(key, keyLen, nr);
+        InvertRoundKeys(rk, nr[0]);
 
         byte[] outb = new byte[len];
         byte[] prev = new byte[16];
@@ -352,17 +360,15 @@ public class Aes {
             off = off + 16;
         }
 
-        // 常数时间 PKCS#7 校验
+        // 无分支常数时间 PKCS#7 校验
         int padVal = outb[len - 1] & 255;
-        int bad = 0;
-        if (padVal < 1 || padVal > 16) { bad = 1; }
+        int bad = (((padVal - 1) >> 31) | ((16 - padVal) >> 31)) & 1;
 
         for (int i = 0; i < 16; i = i + 1) {
             int idx = len - 1 - i;
             int diff = (outb[idx] & 255) ^ padVal;
-            int inPad = 0;
-            if (i < padVal) { inPad = 1; }
-            if (inPad == 1 && diff != 0) { bad = bad | 1; }
+            int inPadMask = (i - padVal) >> 31;
+            bad = bad | (diff & inPadMask);
         }
 
         if (bad != 0) {

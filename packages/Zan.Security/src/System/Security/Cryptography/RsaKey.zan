@@ -97,34 +97,57 @@ public class RsaKey {
         return Base64.Decode(clean.ToString(), outLen);
     }
 
-    // 读 DER TLV 的长度字段（短/长形式），cursor 前移过它。
+    // 读 DER TLV 的长度字段（短/长形式），带完整边界与溢出校验，失败返回 -1。
     private static int ReadLength(string der, List<int> cursor) {
-        int b = der[cursor[0]] & 255;
-        cursor[0] = cursor[0] + 1;
-        if (b < 128) { return b; }
+        if (der == null || cursor == null || cursor.Count == 0) { return -1; }
+        int pos = cursor[0];
+        if (pos < 0 || pos >= der.Length) { return -1; }
+        int b = der[pos] & 255;
+        pos = pos + 1;
+        if (b < 128) {
+            cursor[0] = pos;
+            if (b > der.Length - pos) { return -1; }
+            return b;
+        }
         int bytes = b - 128;
+        if (bytes < 1 || bytes > 4 || pos + bytes > der.Length) { return -1; }
         int result = 0;
         for (int i = 0; i < bytes; i = i + 1) {
-            result = (result << 8) | (der[cursor[0]] & 255);
-            cursor[0] = cursor[0] + 1;
+            int nextByte = der[pos + i] & 255;
+            if (result > 8388607) { return -1; }
+            result = (result << 8) | nextByte;
         }
+        pos = pos + bytes;
+        cursor[0] = pos;
+        if (result < 0 || result > der.Length - pos) { return -1; }
         return result;
     }
 
-    // 期望 `tag` 并进入其内容，返回内容结束下标；tag 不符返回 -1。
+    // 期望 `tag` 并进入其内容，返回内容结束下标；越界或 tag 不符返回 -1。
     private static int Enter(string der, List<int> cursor, int tag) {
-        if ((der[cursor[0]] & 255) != tag) { return -1; }
-        cursor[0] = cursor[0] + 1;
+        if (der == null || cursor == null || cursor.Count == 0) { return -1; }
+        int pos = cursor[0];
+        if (pos < 0 || pos >= der.Length) { return -1; }
+        if ((der[pos] & 255) != tag) { return -1; }
+        cursor[0] = pos + 1;
         int len = RsaKey.ReadLength(der, cursor);
+        if (len < 0) { return -1; }
         return cursor[0] + len;
     }
 
-    // 读 DER INTEGER，去掉前导 0x00 符号字节；非 INTEGER 返回 null。
+    // 读 DER INTEGER，去掉前导 0x00 符号字节；非 INTEGER 或越界返回 null。
     internal static byte[] ReadIntegerSafe(string der, List<int> cursor, List<int> outLen) {
-        if ((der[cursor[0]] & 255) != 2) { outLen[0] = 0; return null; }
-        cursor[0] = cursor[0] + 1;
+        if (der == null || cursor == null || cursor.Count == 0 || outLen == null || outLen.Count == 0) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = 0; }
+            return null;
+        }
+        int pos = cursor[0];
+        if (pos < 0 || pos >= der.Length || (der[pos] & 255) != 2) { outLen[0] = 0; return null; }
+        cursor[0] = pos + 1;
         int rawLen = RsaKey.ReadLength(der, cursor);
+        if (rawLen <= 0) { outLen[0] = 0; return null; }
         int rawStart = cursor[0];
+        if (rawStart + rawLen > der.Length) { outLen[0] = 0; return null; }
         int start = rawStart;
         int len = rawLen;
         if (len > 1 && (der[start] & 255) == 0) {
@@ -174,44 +197,52 @@ public class RsaKey {
         return key;
     }
 
-    // 跳过一个 DER 元素（标签+长度+内容），cursor 停在其末尾。
+    // 跳过一个 DER 元素（标签+长度+内容），cursor 停在其末尾；越界或畸形返回 -1。
     private static int SkipElement(string der, List<int> cursor) {
-        cursor[0] = cursor[0] + 1;  // 标签
+        if (der == null || cursor == null || cursor.Count == 0) { return -1; }
+        int pos = cursor[0];
+        if (pos < 0 || pos >= der.Length) { return -1; }
+        cursor[0] = pos + 1;  // 标签
         int len = RsaKey.ReadLength(der, cursor);
+        if (len < 0) { return -1; }
         int end = cursor[0] + len;
+        if (end > der.Length) { return -1; }
         cursor[0] = end;
         return end;
     }
 
     // 解析 SubjectPublicKeyInfo：跳过 AlgorithmIdentifier，取 BIT STRING
-    // 内的 PKCS#1 公钥。结构不符返回 null。
+    // 内的 PKCS#1 公钥。结构不符或越界返回 null。
     private static RsaKey ParseSpkiPublic(string der, int offset) {
         List<int> c = new List<int>(); c.Add(offset);
         if (RsaKey.Enter(der, c, 48) < 0) { return null; }
-        if ((der[c[0]] & 255) != 48) { return null; }
+        if (c[0] >= der.Length || (der[c[0]] & 255) != 48) { return null; }
         int algorithmEnd = RsaKey.Enter(der, c, 48);
-        if (algorithmEnd < 0) { return null; }
+        if (algorithmEnd < 0 || algorithmEnd >= der.Length) { return null; }
         c[0] = algorithmEnd;
         if ((der[c[0]] & 255) != 3) { return null; }
         c[0] = c[0] + 1;
         int bitLen = RsaKey.ReadLength(der, c);
-        if (bitLen < 2) { return null; }
+        if (bitLen < 2 || c[0] + bitLen > der.Length) { return null; }
         c[0] = c[0] + 1;  // 未用位（unused-bits）字节
         return RsaKey.ParsePkcs1Public(der, c[0]);
     }
 
     // 解析 X.509 证书：定位 tbsCertificate 的 SubjectPublicKeyInfo 并取其
-    // RSA 公钥。结构不符返回 null。
+    // RSA 公钥。结构不符或越界返回 null。
     private static RsaKey ParseCertificatePublic(string der) {
         List<int> c = new List<int>(); c.Add(0);
         if (RsaKey.Enter(der, c, 48) < 0) { return null; }
         if (RsaKey.Enter(der, c, 48) < 0) { return null; }  // tbsCertificate
-        if ((der[c[0]] & 255) == 160) { RsaKey.SkipElement(der, c); }  // 版本号 [0]
-        RsaKey.SkipElement(der, c);  // 序列号
-        RsaKey.SkipElement(der, c);  // 签名
-        RsaKey.SkipElement(der, c);  // 颁发者
-        RsaKey.SkipElement(der, c);  // 有效期
-        RsaKey.SkipElement(der, c);  // 主体
+        if (c[0] >= der.Length) { return null; }
+        if ((der[c[0]] & 255) == 160) {
+            if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 版本号 [0]
+        }
+        if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 序列号
+        if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 签名
+        if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 颁发者
+        if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 有效期
+        if (RsaKey.SkipElement(der, c) < 0) { return null; }  // 主体
         return RsaKey.ParseSpkiPublic(der, c[0]);
     }
 
@@ -239,18 +270,18 @@ public class RsaKey {
         if (RsaKey.Enter(der, c, 48) < 0) { return null; }
         List<int> tmp = new List<int>(); tmp.Add(0);
         byte[] version = RsaKey.ReadIntegerSafe(der, c, tmp);
-        if (version == null) { return null; }
+        if (version == null || c[0] >= der.Length) { return null; }
         if ((der[c[0]] & 255) == 2) {
             return RsaKey.ParsePkcs1Private(der, 0);
         }
         if ((der[c[0]] & 255) != 48) { return null; }
         int algorithmEnd = RsaKey.Enter(der, c, 48);
-        if (algorithmEnd < 0) { return null; }
+        if (algorithmEnd < 0 || algorithmEnd >= der.Length) { return null; }
         c[0] = algorithmEnd;
         if ((der[c[0]] & 255) != 4) { return null; }
         c[0] = c[0] + 1;
         int innerLen = RsaKey.ReadLength(der, c);
-        if (innerLen < 8) { return null; }
+        if (innerLen < 8 || c[0] + innerLen > der.Length) { return null; }
         return RsaKey.ParsePkcs1Private(der, c[0]);
     }
 

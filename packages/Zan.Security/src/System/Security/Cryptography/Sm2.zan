@@ -1,4 +1,5 @@
 using System;
+using System.Interop;
 
 namespace System.Security.Cryptography;
 
@@ -25,16 +26,21 @@ public class Sm2 {
     static BigInt N;
     static BigInt GX;
     static BigInt GY;
+    static BigInt TWO;
+    static BigInt THREE;
+    static BigInt FOUR;
+    static BigInt EIGHT;
     static bool ready = false;
 
     // 十六进制串 -> 大端字节 -> BigInt。
     private static BigInt hb(string h) { return BigInt.FromBytesBE(Hex.Decode(h), h.Length / 2); }
 
-    // 惰性装载 SM2 推荐曲线参数（幂等）。
+    // 惰性装载 SM2 推荐曲线参数与固定小常数（幂等）。
     private static void init() {
         if (ready) { return; }
         P = hb(PHEX); A = hb(AHEX); B = hb(BHEX); N = hb(NHEX);
         GX = hb(GXHEX); GY = hb(GYHEX);
+        TWO = fromInt(2); THREE = fromInt(3); FOUR = fromInt(4); EIGHT = fromInt(8);
         ready = true;
     }
 
@@ -45,11 +51,18 @@ public class Sm2 {
         return BigInt.FromBytesBE(b, 4);
     }
 
-    // 域运算，模 P
+    // 域运算，模 P（输入输出均保持在 [0, P) 内，免除 Knuth 除法开销）
     // (x + y) mod P。
-    private static BigInt fadd(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, y), P); }
+    private static BigInt fadd(BigInt x, BigInt y) {
+        BigInt s = BigInt.add(x, y);
+        if (BigInt.cmp(s, P) >= 0) { return BigInt.sub(s, P); }
+        return s;
+    }
     // (x - y) mod P。
-    private static BigInt fsub(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, BigInt.sub(P, y)), P); }
+    private static BigInt fsub(BigInt x, BigInt y) {
+        if (BigInt.cmp(x, y) >= 0) { return BigInt.sub(x, y); }
+        return BigInt.sub(BigInt.add(x, P), y);
+    }
     // (x * y) mod P。
     private static BigInt fmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), P); }
     // x² mod P。
@@ -82,10 +95,10 @@ public class Sm2 {
         BigInt delta = fsqr(Z1);
         BigInt gamma = fsqr(Y1);
         BigInt beta = fmul(X1, gamma);
-        BigInt alpha = fmul(fromInt(3), fmul(fsub(X1, delta), fadd(X1, delta)));
-        BigInt X3 = fsub(fsqr(alpha), fmul(fromInt(8), beta));
+        BigInt alpha = fmul(THREE, fmul(fsub(X1, delta), fadd(X1, delta)));
+        BigInt X3 = fsub(fsqr(alpha), fmul(EIGHT, beta));
         BigInt Z3 = fsub(fsub(fsqr(fadd(Y1, Z1)), gamma), delta);
-        BigInt Y3 = fsub(fmul(alpha, fsub(fmul(fromInt(4), beta), X3)), fmul(fromInt(8), fsqr(gamma)));
+        BigInt Y3 = fsub(fmul(alpha, fsub(fmul(FOUR, beta), X3)), fmul(EIGHT, fsqr(gamma)));
         return pt(X3, Y3, Z3);
     }
 
@@ -104,7 +117,7 @@ public class Sm2 {
             return inf();
         }
         BigInt HH = fsqr(H); BigInt HHH = fmul(H, HH); BigInt V = fmul(U1, HH);
-        BigInt X3 = fsub(fsub(fsqr(r), HHH), fmul(fromInt(2), V));
+        BigInt X3 = fsub(fsub(fsqr(r), HHH), fmul(TWO, V));
         BigInt Y3 = fsub(fmul(r, fsub(V, X3)), fmul(S1, HHH));
         BigInt Z3 = fmul(fmul(Z1, Z2), H);
         return pt(X3, Y3, Z3);
@@ -205,17 +218,21 @@ public class Sm2 {
         return BigInt.cmp(R, r) == 0;
     }
 
-    // GB/T 32918.4 中的 KDF
+    // GB/T 32918.4 中的 KDF（复用单块输入缓冲，避免每 32 字节重复分配与拷贝 z）
     private static byte[] kdf(string z, int zLen, int klen) {
         byte[] outb = new byte[klen];
+        if (klen <= 0) { return outb; }
+        byte[] buf = new byte[zLen + 4];
+        if (zLen > 0) { NativeMemory.Copy((nint)buf, (nint)z, zLen); }
         int ct = 1; int pos = 0;
         while (pos < klen) {
-            byte[] buf = new byte[zLen + 4];
-             for (int i = 0; i < zLen; i = i + 1) { buf[i] = z[i] & 255; }
-            buf[zLen] = (ct >> 24) & 255; buf[zLen+1] = (ct >> 16) & 255;
-            buf[zLen+2] = (ct >> 8) & 255; buf[zLen+3] = ct & 255;
+            buf[zLen] = (byte)((ct >> 24) & 255); buf[zLen + 1] = (byte)((ct >> 16) & 255);
+            buf[zLen + 2] = (byte)((ct >> 8) & 255); buf[zLen + 3] = (byte)(ct & 255);
             byte[] h = Sm3.Hash(buf, zLen + 4);
-            for (int j = 0; j < 32 && pos < klen; j = j + 1) { outb[pos] = h[j] & 255; pos = pos + 1; }
+            int take = klen - pos;
+            if (take > 32) { take = 32; }
+            NativeMemory.Copy((nint)outb + (nint)pos, (nint)h, take);
+            pos = pos + take;
             ct = ct + 1;
         }
         return outb;
@@ -249,29 +266,65 @@ public class Sm2 {
         return outb;
     }
 
-    // 对 C1C3C2 密文（C1 带 0x04 前缀）进行 SM2 解密。返回
-    // 明文；outLen[0] 接收其长度（C3 校验失败时为 -1）。
+    // 对 C1C3C2 密文（C1 带 0x04 前缀）进行 SM2 解密。严格校验 C1 落在曲线上、
+    // KDF 输出非全零与 C3 摘要匹配；校验失败时清零明文缓冲、置 outLen[0] = -1 并返回 null。
     public static byte[] Decrypt(string cph, int cphLen, BigInt d, List<int> outLen) {
         init();
+        if (outLen == null || outLen.Count == 0) { return null; }
+        if (cph == null || cphLen <= 97 || cphLen > cph.Length || (cph[0] & 255) != 4) {
+            outLen[0] = -1;
+            return null;
+        }
         int msgLen = cphLen - 97;
         BigInt x1 = BigInt.FromBytesBE(sliceBE(cph, 1), 32);
         BigInt y1 = BigInt.FromBytesBE(sliceBE(cph, 33), 32);
+        // GB/T 32918.4 步骤 B1：验证 C1 ∈ E(Fp)（y1² ≡ x1³ + A*x1 + B (mod P)），防无效曲线攻击
+        if (BigInt.cmp(x1, P) >= 0 || BigInt.cmp(y1, P) >= 0) {
+            outLen[0] = -1;
+            return null;
+        }
+        BigInt lhs = fsqr(y1);
+        BigInt rhs = fadd(fadd(fmul(fsqr(x1), x1), fmul(A, x1)), B);
+        if (BigInt.cmp(lhs, rhs) != 0) {
+            outLen[0] = -1;
+            return null;
+        }
         List<BigInt> C1 = pt(x1, y1, BigInt.one());
         List<BigInt> kP = toAffine(scalarMul(d, C1));
+        if (isInf(kP)) {
+            outLen[0] = -1;
+            return null;
+        }
         byte[] z = new byte[64];
         writeBE32(z, 0, kP[0]); writeBE32(z, 32, kP[1]);
         byte[] t = kdf(z, 64, msgLen);
+        int tNonZero = 0;
         byte[] m = new byte[msgLen];
-        int i = 0; for (; i < msgLen; i = i + 1) { m[i] = (cph[97 + i] & 255) ^ (t[i] & 255); }
+        int i = 0;
+        for (; i < msgLen; i = i + 1) {
+            int tb = t[i] & 255;
+            tNonZero = tNonZero | tb;
+            m[i] = (byte)((cph[97 + i] & 255) ^ tb);
+        }
+        if (tNonZero == 0) {
+            NativeMemory.Fill((nint)m, 0, msgLen);
+            outLen[0] = -1;
+            return null;
+        }
         // 校验 C3
         byte[] c3in = new byte[64 + msgLen];
         writeBE32(c3in, 0, kP[0]);
-        i = 0; while (i < msgLen) { c3in[32 + i] = m[i] & 255; i = i + 1; }
+        NativeMemory.Copy((nint)c3in + (nint)32, (nint)m, msgLen);
         writeBE32(c3in, 32 + msgLen, kP[1]);
         byte[] c3 = Sm3.Hash(c3in, 64 + msgLen);
         int diff = 0;
         i = 0; while (i < 32) { diff = diff | ((c3[i] & 255) ^ (cph[65 + i] & 255)); i = i + 1; }
-        if (diff == 0) { outLen[0] = msgLen; } else { outLen[0] = -1; }
+        if (diff != 0) {
+            NativeMemory.Fill((nint)m, 0, msgLen);
+            outLen[0] = -1;
+            return null;
+        }
+        outLen[0] = msgLen;
         return m;
     }
 

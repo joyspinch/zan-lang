@@ -171,7 +171,7 @@ public class Sm4 {
 
     // 加密单个 16 字节分组。返回新的 16 字节缓冲区。
     public static byte[] EncryptBlock(string key, string in16) {
-        if (key == null || in16 == null) { return null; }
+        if (key == null || in16 == null || key.Length < 16 || in16.Length < 16) { return null; }
         int[] rk = KeySchedule(key, false);
         byte[] o = new byte[16];
         CryptBlock(in16, 0, o, 0, rk);
@@ -180,7 +180,7 @@ public class Sm4 {
 
     // 解密单个 16 字节分组。返回新的 16 字节缓冲区。
     public static byte[] DecryptBlock(string key, string in16) {
-        if (key == null || in16 == null) { return null; }
+        if (key == null || in16 == null || key.Length < 16 || in16.Length < 16) { return null; }
         int[] rk = KeySchedule(key, true);
         byte[] o = new byte[16];
         CryptBlock(in16, 0, o, 0, rk);
@@ -189,16 +189,17 @@ public class Sm4 {
 
     // 带 PKCS#7 填充的 SM4-CBC 加密。
     public static byte[] EncryptCbc(string key, string iv, string data, int len, List<int> outLen) {
-        if (key == null || iv == null || outLen == null) {
-            if (outLen != null) { outLen[0] = -1; }
+        if (outLen == null || outLen.Count == 0) { return null; }
+        if (key == null || iv == null || key.Length < 16 || iv.Length < 16) {
+            outLen[0] = -1;
             return null;
         }
-        if (len < 0 || (len > 0 && data == null)) {
+        if (len < 0 || len > 2147483600 || (len > 0 && (data == null || data.Length < len))) {
             outLen[0] = -1;
             return null;
         }
 
-        if (key.Length == 16 && iv.Length >= 16) {
+        if (key.Length >= 16 && iv.Length >= 16) {
             int pad = 16 - (len % 16);
             int tot = len + pad;
             byte[] outb = new byte[tot];
@@ -242,69 +243,28 @@ public class Sm4 {
 
     // SM4-CBC 解密，去除 PKCS#7 填充。常数时间校验填充。
     public static byte[] DecryptCbc(string key, string iv, string data, int len, List<int> outLen) {
-        if (key == null || iv == null || outLen == null) {
-            if (outLen != null) { outLen[0] = -1; }
+        if (outLen == null || outLen.Count == 0) { return null; }
+        if (key == null || iv == null || key.Length < 16 || iv.Length < 16) {
+            outLen[0] = -1;
             return null;
         }
-        if (len <= 0 || (len % 16) != 0 || data == null) {
+        if (len <= 0 || (len % 16) != 0 || data == null || data.Length < len) {
             outLen[0] = -1;
             return null;
         }
 
-        if (key.Length == 16 && iv.Length >= 16) {
-            byte[] outb = new byte[len];
-            long res = NativeMemory.Sm4CbcDecrypt(outb, data, (long)len, key, iv);
-            if (res >= 0) {
-                int plainLen = (int)res;
-                outLen[0] = plainLen;
-                if (plainLen == len) { return outb; }
-                byte[] resBytes = new byte[plainLen];
-                if (plainLen > 0) { NativeMemory.Copy((nint)resBytes, (nint)outb, plainLen); }
-                return resBytes;
-            }
-            outLen[0] = -1;
-            return null;
-        }
-
-        int[] rk = KeySchedule(key, true);
+        // C 运行时内建 HW+SW 完整路径，返回值 < 0 必为填充校验失败，立即常数时间熔断。
         byte[] outb = new byte[len];
-        byte[] prev = new byte[16];
-        for (int i = 0; i < 16; i = i + 1) { prev[i] = (byte)(iv[i] & 255); }
-
-        byte[] dec = new byte[16];
-        int off = 0;
-        while (off < len) {
-            string decStr = dec;
-            CryptBlock(data, off, dec, 0, rk);
-            for (int j = 0; j < 16; j = j + 1) {
-                outb[off + j] = (byte)((dec[j] & 255) ^ (prev[j] & 255));
-                prev[j] = (byte)(data[off + j] & 255);
-            }
-            off = off + 16;
+        long res = NativeMemory.Sm4CbcDecrypt(outb, data, (long)len, key, iv);
+        if (res >= 0) {
+            int plainLen = (int)res;
+            outLen[0] = plainLen;
+            if (plainLen == len) { return outb; }
+            byte[] resBytes = new byte[plainLen];
+            if (plainLen > 0) { NativeMemory.Copy((nint)resBytes, (nint)outb, plainLen); }
+            return resBytes;
         }
-
-        // 常数时间校验 PKCS#7 填充
-        int padVal = outb[len - 1] & 255;
-        int bad = 0;
-        if (padVal < 1 || padVal > 16) { bad = 1; }
-
-        for (int i = 0; i < 16; i = i + 1) {
-            int idx = len - 1 - i;
-            int diff = (outb[idx] & 255) ^ padVal;
-            int inPad = 0;
-            if (i < padVal) { inPad = 1; }
-            if (inPad == 1 && diff != 0) { bad = bad | 1; }
-        }
-
-        if (bad != 0) {
-            outLen[0] = -1;
-            return null;
-        }
-
-        int plainLen = len - padVal;
-        outLen[0] = plainLen;
-        byte[] res = new byte[plainLen];
-        if (plainLen > 0) { NativeMemory.Copy((nint)res, (nint)outb, plainLen); }
-        return res;
+        outLen[0] = -1;
+        return null;
     }
 }

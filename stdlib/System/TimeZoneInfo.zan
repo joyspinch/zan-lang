@@ -235,7 +235,10 @@ public class PosixRule {
         if (!this.hasDst || this.dstStart == null || this.dstEnd == null) {
             return false;
         }
-        int days = (int)(unixSeconds / 86400L);
+        long dayQ = unixSeconds / 86400L;
+        long dayR = unixSeconds % 86400L;
+        if (dayR < 0L) { dayQ = dayQ - 1L; }
+        int days = (int)dayQ;
         int year, m, d;
         DateTime.CivilFromDays(days, out year, out m, out d);
 
@@ -371,6 +374,24 @@ public class TimeZoneInfo {
             && data[off + 2] == (byte)105 && data[off + 3] == (byte)102;
     }
 
+    // 校验 TZif 头部计数合法性并返回主体字节长度（溢出或非法返回 -1）。
+    private static long TzifBodySize(int timecnt, int typecnt, int charcnt, int leapcnt, int ttisstdcnt, int ttisutccnt, bool use64) {
+        if (timecnt < 0 || timecnt > 65536) { return -1L; }
+        if (typecnt < 1 || typecnt > 256) { return -1L; }
+        if (charcnt < 0 || charcnt > 65536) { return -1L; }
+        if (leapcnt < 0 || leapcnt > 4096) { return -1L; }
+        if (ttisstdcnt < 0 || ttisstdcnt > 256) { return -1L; }
+        if (ttisutccnt < 0 || ttisutccnt > 256) { return -1L; }
+        long timeEntry = use64 ? 8L : 4L;
+        long leapEntry = use64 ? 12L : 8L;
+        return (long)timecnt * (timeEntry + 1L)
+            + (long)typecnt * 6L
+            + (long)charcnt
+            + (long)leapcnt * leapEntry
+            + (long)ttisstdcnt
+            + (long)ttisutccnt;
+    }
+
     // 从 RFC 8536 TZif 二进制字节流解析时区信息（支持 v1/v2/v3，优先提取 64 位时间戳与 POSIX 规则）。
     public static TimeZoneInfo FromTzData(string id, byte[] data) {
         if (data == null || data.Length < 44 || !HasTzifMagic(data, 0)) { return null; }
@@ -382,22 +403,32 @@ public class TimeZoneInfo {
         int typecnt    = ReadInt32BE(data, 36);
         int charcnt    = ReadInt32BE(data, 40);
 
-        int v1DataSize = timecnt * 4 + timecnt + typecnt * 6 + charcnt + leapcnt * 8 + ttisstdcnt + ttisutccnt;
-        bool hasV2 = (ver == (byte)50 || ver == (byte)51 || ver == (byte)52) && (data.Length >= 44 + v1DataSize + 44);
+        long v1DataSize = TzifBodySize(timecnt, typecnt, charcnt, leapcnt, ttisstdcnt, ttisutccnt, false);
+        if (v1DataSize < 0L || 44L + v1DataSize > (long)data.Length) { return null; }
+
+        bool hasV2 = (ver == (byte)50 || ver == (byte)51 || ver == (byte)52) && ((long)data.Length >= 44L + v1DataSize + 44L);
 
         int hdr = 0;
         int p = 44;
         bool use64 = false;
 
         if (hasV2) {
-            hdr = 44 + v1DataSize;
+            hdr = 44 + (int)v1DataSize;
             if (HasTzifMagic(data, hdr)) {
-                ttisutccnt = ReadInt32BE(data, hdr + 20);
-                ttisstdcnt = ReadInt32BE(data, hdr + 24);
-                leapcnt    = ReadInt32BE(data, hdr + 28);
-                timecnt    = ReadInt32BE(data, hdr + 32);
-                typecnt    = ReadInt32BE(data, hdr + 36);
-                charcnt    = ReadInt32BE(data, hdr + 40);
+                int v2Utc  = ReadInt32BE(data, hdr + 20);
+                int v2Std  = ReadInt32BE(data, hdr + 24);
+                int v2Leap = ReadInt32BE(data, hdr + 28);
+                int v2Time = ReadInt32BE(data, hdr + 32);
+                int v2Type = ReadInt32BE(data, hdr + 36);
+                int v2Char = ReadInt32BE(data, hdr + 40);
+                long v2DataSize = TzifBodySize(v2Time, v2Type, v2Char, v2Leap, v2Std, v2Utc, true);
+                if (v2DataSize < 0L || (long)hdr + 44L + v2DataSize > (long)data.Length) { return null; }
+                ttisutccnt = v2Utc;
+                ttisstdcnt = v2Std;
+                leapcnt    = v2Leap;
+                timecnt    = v2Time;
+                typecnt    = v2Type;
+                charcnt    = v2Char;
                 p = hdr + 44;
                 use64 = true;
             }
@@ -416,7 +447,9 @@ public class TimeZoneInfo {
 
         List<int> typeIndices = new List<int>();
         for (int i = 0; i < timecnt; i++) {
-            typeIndices.Add((int)data[p] & 0xFF);
+            int ti = (int)data[p] & 0xFF;
+            if (ti >= typecnt) { return null; }
+            typeIndices.Add(ti);
             p += 1;
         }
 
@@ -439,6 +472,10 @@ public class TimeZoneInfo {
         List<string> abbrevs = new List<string>();
         for (int i = 0; i < typecnt; i++) {
             int dIdx = desigidxs[i];
+            if (dIdx >= charcnt) {
+                abbrevs.Add("");
+                continue;
+            }
             int s = charStart + dIdx;
             int e = s;
             while (e < charStart + charcnt && data[e] != 0) {
@@ -694,6 +731,31 @@ public class TimeZoneInfo {
         return null;
     }
 
+    private static Dictionary<string, TimeZoneInfo> s_tzCache = new Dictionary<string, TimeZoneInfo>();
+
+    // 校验用于文件系统查找的 IANA 时区 ID，杜绝目录遍历（".."、绝对路径、"\\"、控制字符与非法字符）。
+    private static bool IsSafeTzFileId(string id) {
+        if (id == null || id.Length == 0 || id.Length > 128) { return false; }
+        int len = id.Length;
+        if ((id[0] & 255) == 47 || (id[len - 1] & 255) == 47) { return false; }
+        int segStart = 0;
+        for (int i = 0; i <= len; i = i + 1) {
+            int c = (i < len) ? (id[i] & 255) : 47;
+            if (c == 47) { // '/'
+                int segLen = i - segStart;
+                if (segLen == 0) { return false; }
+                if (segLen == 1 && (id[segStart] & 255) == 46) { return false; }
+                if (segLen == 2 && (id[segStart] & 255) == 46 && (id[segStart + 1] & 255) == 46) { return false; }
+                segStart = i + 1;
+            } else {
+                bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                    || (c >= 48 && c <= 57) || c == 95 || c == 45 || c == 43 || c == 46;
+                if (!ok) { return false; }
+            }
+        }
+        return true;
+    }
+
     public static bool TryFindSystemTimeZoneById(string id, out TimeZoneInfo result) {
         result = null;
         if (id == null || id.Length == 0) { return false; }
@@ -702,27 +764,42 @@ public class TimeZoneInfo {
             return true;
         }
 
-        List<string> zoneRoots = new List<string>();
-        string tzDir = Environment.GetEnvironmentVariable("TZDIR");
-        if (tzDir != null && tzDir.Length > 0) {
-            zoneRoots.Add(tzDir);
+        lock (TimeZoneInfo.s_tzCache) {
+            TimeZoneInfo cached = null;
+            if (TimeZoneInfo.s_tzCache.TryGetValue(id, out cached)) {
+                result = cached;
+                return true;
+            }
         }
-        zoneRoots.Add("/usr/share/zoneinfo");
-        zoneRoots.Add("/usr/lib/zoneinfo");
-        zoneRoots.Add("/etc/zoneinfo");
-        zoneRoots.Add("/var/db/timezone/zoneinfo");
-        zoneRoots.Add("C:/Program Files/Git/usr/share/zoneinfo");
 
-        for (int i = 0; i < zoneRoots.Count; i++) {
-            string root = zoneRoots[i];
-            string path = root + "/" + id;
-            if (File.Exists(path)) {
-                byte[] data = File.ReadAllBytes(path);
-                if (data != null && data.Length >= 44) {
-                    TimeZoneInfo tzi = FromTzData(id, data);
-                    if (tzi != null) {
-                        result = tzi;
-                        return true;
+        if (IsSafeTzFileId(id)) {
+            List<string> zoneRoots = new List<string>();
+            string tzDir = Environment.GetEnvironmentVariable("TZDIR");
+            if (tzDir != null && tzDir.Length > 0) {
+                zoneRoots.Add(tzDir);
+            }
+            zoneRoots.Add("/usr/share/zoneinfo");
+            zoneRoots.Add("/usr/lib/zoneinfo");
+            zoneRoots.Add("/etc/zoneinfo");
+            zoneRoots.Add("/var/db/timezone/zoneinfo");
+            zoneRoots.Add("C:/Program Files/Git/usr/share/zoneinfo");
+
+            for (int i = 0; i < zoneRoots.Count; i++) {
+                string root = zoneRoots[i];
+                string path = root + "/" + id;
+                if (File.Exists(path)) {
+                    byte[] data = File.ReadAllBytes(path);
+                    if (data != null && data.Length >= 44) {
+                        TimeZoneInfo tzi = FromTzData(id, data);
+                        if (tzi != null) {
+                            lock (TimeZoneInfo.s_tzCache) {
+                                if (TimeZoneInfo.s_tzCache.Count < 512) {
+                                    TimeZoneInfo.s_tzCache[id] = tzi;
+                                }
+                            }
+                            result = tzi;
+                            return true;
+                        }
                     }
                 }
             }
@@ -732,6 +809,11 @@ public class TimeZoneInfo {
         if (fallbackPosix != null) {
             TimeZoneInfo tzi = FromPosixString(id, fallbackPosix);
             if (tzi != null) {
+                lock (TimeZoneInfo.s_tzCache) {
+                    if (TimeZoneInfo.s_tzCache.Count < 512) {
+                        TimeZoneInfo.s_tzCache[id] = tzi;
+                    }
+                }
                 result = tzi;
                 return true;
             }
