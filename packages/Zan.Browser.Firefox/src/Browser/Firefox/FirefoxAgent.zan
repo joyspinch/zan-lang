@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Json;
 using System.Text;
 using System.Threading;
 
@@ -74,63 +75,41 @@ public class PageSnapshot {
 
     public static PageSnapshot FromJson(string json) {
         PageSnapshot snap = new PageSnapshot();
-        if (json == null || json == "") return snap;
+        if (json == null || json.Length == 0) return snap;
 
-        snap.Title = ExtractJsonString(json, "\"title\":\"");
-        snap.Url = ExtractJsonString(json, "\"url\":\"");
-
-        int cur = 0;
-        while (true) {
-            int startObj = json.IndexOf("{\"ref\":", cur);
-            if (startObj < 0) break;
-            int endObj = json.IndexOf("}", startObj);
-            if (endObj < 0) break;
-
-            string objStr = json.Substring(startObj, endObj - startObj + 1);
-            PageElement el = new PageElement();
-            el.Ref = ExtractJsonString(objStr, "\"ref\":\"");
-            el.Tag = ExtractJsonString(objStr, "\"tag\":\"");
-            el.Type = ExtractJsonString(objStr, "\"type\":\"");
-            el.Text = ExtractJsonString(objStr, "\"text\":\"");
-            el.Selector = ExtractJsonString(objStr, "\"selector\":\"");
-            el.X = ExtractJsonInt(objStr, "\"x\":");
-            el.Y = ExtractJsonInt(objStr, "\"y\":");
-            el.W = ExtractJsonInt(objStr, "\"w\":");
-            el.H = ExtractJsonInt(objStr, "\"h\":");
-
-            snap.Elements.Add(el);
-            cur = endObj + 1;
+        JsonDoc doc = null;
+        try {
+            doc = JsonDoc.Parse(json);
+        } catch (Exception _ex) {
+            return snap;
         }
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) { return snap; }
 
-        return snap;
-    }
+        snap.Title = doc.StrAt(doc.Get(doc.root, "title"), "");
+        snap.Url = doc.StrAt(doc.Get(doc.root, "url"), "");
 
-    static string ExtractJsonString(string src, string key) {
-        int k = src.IndexOf(key);
-        if (k < 0) return "";
-        int s = k + key.Length;
-        int e = src.IndexOf("\"", s);
-        if (e < 0) return "";
-        return src.Substring(s, e - s);
-    }
-
-    static int ExtractJsonInt(string src, string key) {
-        int k = src.IndexOf(key);
-        if (k < 0) return 0;
-        int s = k + key.Length;
-        int e = s;
-        while (e < src.Length) {
-            char c = src[e];
-            if ((c >= '0' && c <= '9') || c == '-') {
-                e = e + 1;
-            } else {
-                break;
+        int elems = doc.Get(doc.root, "elements");
+        if (elems >= 0 && doc.KindAt(elems) == 4) {
+            int count = doc.Count(elems);
+            int cur = doc.FirstChild(elems);
+            for (int i = 0; i < count && cur >= 0; i = i + 1) {
+                if (doc.KindAt(cur) == 5) {
+                    PageElement el = new PageElement();
+                    el.Ref = doc.StrAt(doc.Get(cur, "ref"), "");
+                    el.Tag = doc.StrAt(doc.Get(cur, "tag"), "");
+                    el.Type = doc.StrAt(doc.Get(cur, "type"), "");
+                    el.Text = doc.StrAt(doc.Get(cur, "text"), "");
+                    el.Selector = doc.StrAt(doc.Get(cur, "selector"), "");
+                    el.X = doc.IntAt(doc.Get(cur, "x"), 0);
+                    el.Y = doc.IntAt(doc.Get(cur, "y"), 0);
+                    el.W = doc.IntAt(doc.Get(cur, "w"), 0);
+                    el.H = doc.IntAt(doc.Get(cur, "h"), 0);
+                    snap.Elements.Add(el);
+                }
+                cur = doc.NextSibling(cur);
             }
         }
-        if (e > s) {
-            return int.Parse(src.Substring(s, e - s));
-        }
-        return 0;
+        return snap;
     }
 }
 
@@ -174,21 +153,23 @@ public class GeckoNative {
 
     public static bool EnsureLoaded() {
         if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
-        loaded = true;
 
-        string[] searchPaths = new string[] {
-            ".",
-            "bin",
-            "D:/project/firefox/sdk/bin/Release",
-            "D:/project/firefox/sdk/bin",
-            "D:/project/firefox/dist/bin",
-            "D:/project/firefox/dist/zan-browser-windows-x64",
-            "D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin",
-            "../dist/zan-browser-windows-x64",
-            "/Applications/Firefox.app/Contents/MacOS",
-            "/usr/lib/firefox",
-            "/usr/local/lib"
-        };
+        // 优先受控绝对安装路径与显式环境变量，相对路径兜底置后，降低 DLL 预加载劫持风险
+        List<string> searchPaths = new List<string>();
+        string envDir = Interop.EnvVar("ZAN_GECKO_DIR");
+        if (envDir != null && envDir.Length > 0) {
+            searchPaths.Add(envDir);
+        }
+        searchPaths.Add("D:/project/firefox/sdk/bin/Release");
+        searchPaths.Add("D:/project/firefox/sdk/bin");
+        searchPaths.Add("D:/project/firefox/dist/bin");
+        searchPaths.Add("D:/project/firefox/dist/zan-browser-windows-x64");
+        searchPaths.Add("D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin");
+        searchPaths.Add("/Applications/Firefox.app/Contents/MacOS");
+        searchPaths.Add("/usr/lib/firefox");
+        searchPaths.Add("/usr/local/lib");
+        searchPaths.Add("../dist/zan-browser-windows-x64");
+        searchPaths.Add("bin");
 
         string[] embedNames = new string[] {
             "gecko_embed.dll",
@@ -206,15 +187,21 @@ public class GeckoNative {
         };
 
         // 优先尝试装载高可配置化的跨平台 gecko_embed 动态库 (.dll / .dylib / .so)
-        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+        for (int i = 0; i < searchPaths.Count; i = i + 1) {
             string p = searchPaths[i];
             for (int j = 0; j < embedNames.Length; j = j + 1) {
                 string embedPath = Path.Combine(p, embedNames[j]);
                 if (File.Exists(embedPath)) {
                     #if WINDOWS
                     SetDllDirectoryA(p);
-                    #endif
+                    try {
+                        EmbedMod = Interop.Load(embedPath);
+                    } finally {
+                        SetDllDirectoryA(null);
+                    }
+                    #else
                     EmbedMod = Interop.Load(embedPath);
+                    #endif
                     if (EmbedMod != 0) {
                         PfnCreateViewEx = Interop.Symbol(EmbedMod, "gecko_create_view_ex");
                         PfnDefaultViewConfig = Interop.Symbol(EmbedMod, "gecko_default_view_config");
@@ -226,17 +213,24 @@ public class GeckoNative {
         }
 
         // 装载 C-ABI 核心 xul 动态库
-        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+        for (int i = 0; i < searchPaths.Count; i = i + 1) {
             string p = searchPaths[i];
             for (int j = 0; j < xulNames.Length; j = j + 1) {
                 string xulPath = Path.Combine(p, xulNames[j]);
                 if (File.Exists(xulPath)) {
                     #if WINDOWS
                     SetDllDirectoryA(p);
-                    #endif
+                    try {
+                        XulMod = Interop.Load(xulPath);
+                    } finally {
+                        SetDllDirectoryA(null);
+                    }
+                    #else
                     XulMod = Interop.Load(xulPath);
+                    #endif
                     if (XulMod != 0) {
                         ResolveSymbols();
+                        loaded = true;
                         return true;
                     }
                 }
@@ -247,11 +241,13 @@ public class GeckoNative {
             XulMod = Interop.Load(xulNames[j]);
             if (XulMod != 0) {
                 ResolveSymbols();
+                loaded = true;
                 return true;
             }
         }
 
-        return EmbedMod != 0;
+        loaded = (EmbedMod != 0);
+        return loaded;
     }
 
     static void ResolveSymbols() {
@@ -287,11 +283,40 @@ public class FirefoxAgentTab {
     nint viewHandle;
     int contextId;
     int nextEvalId;
+    bool evalBusy;
+    Queue<AsyncGate> evalWaiters;
 
     public FirefoxAgentTab(nint handle, int userContextId) {
         this.viewHandle = handle;
         this.contextId = userContextId;
         this.nextEvalId = 1000;
+        this.evalBusy = false;
+        this.evalWaiters = new Queue<AsyncGate>();
+    }
+
+    private async void AcquireEvalLock() {
+        AsyncGate gate = null;
+        lock (this) {
+            if (!this.evalBusy) {
+                this.evalBusy = true;
+                return;
+            }
+            gate = new AsyncGate();
+            this.evalWaiters.Enqueue(gate);
+        }
+        await gate.Wait();
+    }
+
+    private void ReleaseEvalLock() {
+        AsyncGate next = null;
+        lock (this) {
+            if (this.evalWaiters.Count() > 0) {
+                next = this.evalWaiters.Dequeue();
+            } else {
+                this.evalBusy = false;
+            }
+        }
+        if (next != null) { next.Signal(); }
     }
 
     public nint GetHandle() { return this.viewHandle; }
@@ -323,8 +348,11 @@ public class FirefoxAgentTab {
 
     public int ExecuteScriptAsync(string script) {
         if (this.viewHandle == 0 || GeckoNative.PfnExecuteScript == 0) return -1;
-        this.nextEvalId = this.nextEvalId + 1;
-        int id = this.nextEvalId;
+        int id = 0;
+        lock (this) {
+            this.nextEvalId = this.nextEvalId + 1;
+            id = this.nextEvalId;
+        }
         GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)GeckoNative.PfnExecuteScript;
         fn(this.viewHandle, script, id);
         return id;
@@ -353,20 +381,25 @@ public class FirefoxAgentTab {
     // =========================================================================
 
     /// <summary>
-    /// 核心异步非阻塞求值 (基于 await Task.Delay 协程挂起，零线程开销，让出事件循环)
+    /// 核心异步非阻塞求值 (基于 await Task.Delay 协程挂起，零线程开销，让出事件循环；按标签页串行化防止单槽 lastEvalId 竞态)
     /// </summary>
     public async string EvalAsync(string script, int timeoutMs = 8000) {
-        int id = this.ExecuteScriptAsync(script);
-        if (id < 0) return "";
-        int elapsed = 0;
-        while (elapsed < timeoutMs) {
-            if (this.IsDone(id)) {
-                return this.GetResult();
+        await this.AcquireEvalLock();
+        try {
+            int id = this.ExecuteScriptAsync(script);
+            if (id < 0) return "";
+            int elapsed = 0;
+            while (elapsed < timeoutMs) {
+                if (this.IsDone(id)) {
+                    return this.GetResult();
+                }
+                await Task.Delay(16);
+                elapsed = elapsed + 16;
             }
-            await Task.Delay(16);
-            elapsed = elapsed + 16;
+            return "";
+        } finally {
+            this.ReleaseEvalLock();
         }
-        return "";
     }
 
     /// <summary>
@@ -485,7 +518,8 @@ public class FirefoxAgentTab {
     /// 异步多行结构化批量采集 (一次性抽取多行数据为 JSON，0 次多余 IPC 开销)
     /// </summary>
     public async string ReadRowsAsync(string rowSelector, string fieldMapJson, int limit = 100, int timeoutMs = 10000) {
-        string script = "ZanAgent.readRows(" + JsQuote(rowSelector) + ", " + fieldMapJson + ", { limit: " + limit.ToString() + " });";
+        string safeMap = (fieldMapJson != null && fieldMapJson.Length > 0) ? fieldMapJson : "{}";
+        string script = "ZanAgent.readRows(" + JsQuote(rowSelector) + ", JSON.parse(" + JsQuote(safeMap) + "), { limit: " + limit.ToString() + " });";
         return await this.EvalAsync(script, timeoutMs);
     }
 
@@ -581,8 +615,8 @@ public class FirefoxAgentTab {
         string script = "(function() { " +
             "return ZanKernel.fetch(" + JsQuote(url) + ", { " +
             "method: " + JsQuote(safeMethod) + ", " +
-            "headers: " + safeHeaders + ", " +
-            "body: " + safeBody + " " +
+            "headers: JSON.parse(" + JsQuote(safeHeaders) + "), " +
+            "body: JSON.parse(" + JsQuote(safeBody) + ") " +
             "}); })()";
 
         return await this.EvalAsync(script, timeoutMs);

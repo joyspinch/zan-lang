@@ -21,10 +21,19 @@ public partial class ImageBuffer : IDisposable {
             this.Pixels = 0;
             return;
         }
+        long stride64 = (long)width * 4L;
+        long bytes64 = stride64 * (long)height;
+        if (stride64 > 2147483647L || bytes64 <= 0L || bytes64 > 2147483647L) {
+            this.Width = 0;
+            this.Height = 0;
+            this.Stride = 0;
+            this.Pixels = 0;
+            return;
+        }
         this.Width = width;
         this.Height = height;
-        this.Stride = width * 4;
-        this.Pixels = NativeMemory.Alloc(this.Stride * height);
+        this.Stride = (int)stride64;
+        this.Pixels = NativeMemory.Alloc((int)bytes64);
     }
 
     public void Dispose() {
@@ -62,7 +71,8 @@ public partial class ImageBuffer : IDisposable {
         if (w <= 0 || h <= 0) return new ImageBuffer(0, 0);
 
         ImageBuffer sub = new ImageBuffer(w, h);
-        nint srcOff = this.Pixels + (nint)(y * this.Stride + x * 4);
+        if (sub.Pixels == 0) { return sub; }
+        nint srcOff = this.Pixels + (nint)((long)y * (long)this.Stride + (long)x * 4L);
         NativeMemory.Copy2D(sub.Pixels, sub.Stride, srcOff, this.Stride, w * 4, h);
         return sub;
     }
@@ -74,9 +84,31 @@ public partial class ImageBuffer : IDisposable {
         }
 
         ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
+        if (dst.Pixels == 0) { return dst; }
         if (this.Width == 1 && this.Height == 1) {
             Span<int> sp = new Span<int>(this.Pixels, 1);
             dst.Clear(sp[0]);
+            return dst;
+        }
+        if (this.Width == 1) {
+            // 单列源图：仅做垂直线性插值并整行填充，避免 ResampleBilinearRow 越界读取 sx+1。
+            Span<int> col = new Span<int>(this.Pixels, this.Height);
+            for (int dy = 0; dy < newHeight; dy++) {
+                int fpY = (int)(((long)dy * (long)(this.Height - 1) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1));
+                int sy = fpY >> 16;
+                int wy = (fpY & 0xFFFF) >> 8;
+                if (sy >= this.Height - 1) { sy = this.Height - 2; wy = 256; }
+                if (sy < 0) { sy = 0; wy = 0; }
+                int c0 = col[sy];
+                int c1 = col[sy + 1];
+                int inv = 256 - wy;
+                int a = ((((c0 >> 24) & 255) * inv) + (((c1 >> 24) & 255) * wy)) >> 8;
+                int r = ((((c0 >> 16) & 255) * inv) + (((c1 >> 16) & 255) * wy)) >> 8;
+                int g = ((((c0 >> 8) & 255) * inv) + (((c1 >> 8) & 255) * wy)) >> 8;
+                int b = (((c0 & 255) * inv) + ((c1 & 255) * wy)) >> 8;
+                int color = (a << 24) | (r << 16) | (g << 8) | b;
+                PixelOps.FillRect(dst.Pixels, dst.Stride, 0, dy, newWidth, 1, color);
+            }
             return dst;
         }
 
@@ -103,7 +135,7 @@ public partial class ImageBuffer : IDisposable {
                 xWeights[dx] = wx;
             }
 
-            // 逐行调度物理插值微内核
+            // 逐行调度物理插值微内核（Height == 1 时 sy1 钳位为 sy，避免 src1 越界一行）。
             for (int dy = 0; dy < newHeight; dy++) {
                 int fpY = (int)(((long)dy * (long)(this.Height - 1) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1));
                 int sy = fpY >> 16;
@@ -116,10 +148,11 @@ public partial class ImageBuffer : IDisposable {
                     sy = 0;
                     wy = 0;
                 }
+                int sy1 = (sy + 1 < this.Height) ? (sy + 1) : sy;
 
-                nint src0 = this.Pixels + (nint)(sy * this.Stride);
-                nint src1 = this.Pixels + (nint)((sy + 1) * this.Stride);
-                nint dstRow = dst.Pixels + (nint)(dy * dst.Stride);
+                nint src0 = this.Pixels + (nint)((long)sy * (long)this.Stride);
+                nint src1 = this.Pixels + (nint)((long)sy1 * (long)this.Stride);
+                nint dstRow = dst.Pixels + (nint)((long)dy * (long)dst.Stride);
 
                 PixelOps.ResampleBilinearRow(dstRow, src0, src1, xIdxBuf, xWeightBuf, wy, newWidth);
             }

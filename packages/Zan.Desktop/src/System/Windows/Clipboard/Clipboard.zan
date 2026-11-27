@@ -355,16 +355,22 @@ public class Clipboard {
         #if WINDOWS
         if (Clipboard.WinIsClipboardFormatAvailable(13) == 0) { return ""; }
         if (Clipboard.WinOpenClipboardRetry() == 0) { return ""; }
-        nint handle = Clipboard.WinGetClipboardData(13);
         string s = "";
-        if (handle != 0) {
-            nint text = Clipboard.WinGlobalLock(handle);
-            if (text != 0) {
-                s = Wide.Read(text);
-                Clipboard.WinGlobalUnlock(handle);
+        try {
+            nint handle = Clipboard.WinGetClipboardData(13);
+            if (handle != 0) {
+                nint text = Clipboard.WinGlobalLock(handle);
+                if (text != 0) {
+                    try {
+                        s = Wide.Read(text);
+                    } finally {
+                        Clipboard.WinGlobalUnlock(handle);
+                    }
+                }
             }
+        } finally {
+            Clipboard.WinCloseClipboard();
         }
-        Clipboard.WinCloseClipboard();
         return s;
         #else
         return Clipboard.PosixRead(Clipboard.PosixTool(), Clipboard.MimeText());
@@ -375,23 +381,25 @@ public class Clipboard {
     public static bool SetText(string text) {
         #if WINDOWS
         nint wide = Wide.Of(text);
-        int units = 0;
         nint mem = (nint)0;
+        bool committed = false;
         try {
-            units = Wide.Length(wide);
+            int units = Wide.Length(wide);
             mem = Clipboard.WinGlobalAlloc(2 /*GMEM_MOVEABLE*/, (units + 1) * 2);
             if (mem == 0) { return false; }
             nint dst = Clipboard.WinGlobalLock(mem);
-            if (dst == 0) {
-                Clipboard.WinGlobalFree(mem);
-                return false;
+            if (dst == 0) { return false; }
+            try {
+                NativeMemory.Copy(dst, wide, (units + 1) * 2);
+            } finally {
+                Clipboard.WinGlobalUnlock(mem);
             }
-            NativeMemory.Copy(dst, wide, (units + 1) * 2);
-            Clipboard.WinGlobalUnlock(mem);
+            committed = true;
+            return Clipboard.WinCommitClipboardMem(13, mem);
         } finally {
             Wide.Free(wide);
+            if (!committed && mem != 0) { Clipboard.WinGlobalFree(mem); }
         }
-        return Clipboard.WinCommitClipboardMem(13, mem);
         #else
         return Clipboard.PosixWrite(Clipboard.PosixTool(),
                                     Clipboard.MimeText(), text);
@@ -436,26 +444,35 @@ public class Clipboard {
         total = total + 2;
         nint mem = Clipboard.WinGlobalAlloc(2, total);
         if (mem == 0) { return false; }
-        nint dst = Clipboard.WinGlobalLock(mem);
-        if (dst == 0) {
-            Clipboard.WinGlobalFree(mem);
-            return false;
+        bool committed = false;
+        try {
+            nint dst = Clipboard.WinGlobalLock(mem);
+            if (dst == 0) { return false; }
+            try {
+                new Span<int>(dst, 1)[0] = 20;
+                new Span<int>(dst + 16, 1)[0] = 1;
+                int offset = 20;
+                i = 0;
+                while (i < paths.Count) {
+                    nint w = Wide.Of(paths[i]);
+                    try {
+                        int units = Wide.Length(w);
+                        NativeMemory.Copy(dst + offset, w, (units + 1) * 2);
+                        offset = offset + (units + 1) * 2;
+                    } finally {
+                        Wide.Free(w);
+                    }
+                    i = i + 1;
+                }
+                new Span<ushort>(dst + offset, 1)[0] = 0;
+            } finally {
+                Clipboard.WinGlobalUnlock(mem);
+            }
+            committed = true;
+            return Clipboard.WinCommitClipboardMem(15, mem);
+        } finally {
+            if (!committed) { Clipboard.WinGlobalFree(mem); }
         }
-        new Span<int>(dst, 1)[0] = 20;
-        new Span<int>(dst + 16, 1)[0] = 1;
-        int offset = 20;
-        i = 0;
-        while (i < paths.Count) {
-            nint w = Wide.Of(paths[i]);
-            int units = Wide.Length(w);
-            NativeMemory.Copy(dst + offset, w, (units + 1) * 2);
-            Wide.Free(w);
-            offset = offset + (units + 1) * 2;
-            i = i + 1;
-        }
-        new Span<ushort>(dst + offset, 1)[0] = 0;
-        Clipboard.WinGlobalUnlock(mem);
-        return Clipboard.WinCommitClipboardMem(15, mem);
         #elif MACOS
         return Clipboard.MacSetFiles(paths);
         #else

@@ -340,7 +340,7 @@ public class AiClient : IDisposable, IChat {
         // 传输与消费分离：producer 把字节推进 sink（内存缓冲 + 事件门），
         // consumer 用 TakeCo 真挂起地等数据——有数据才醒，不靠轮询。
         SseSink sink = SseSink.ToMemory();
-        Task.Spawn(http.PostSseToSinkAsync(ep.Path() + "/chat/completions",
+        long producer = Task.Spawn(http.PostSseToSinkAsync(ep.Path() + "/chat/completions",
         payload, sink));
 
         StringBuilder sb = new StringBuilder();
@@ -350,70 +350,82 @@ public class AiClient : IDisposable, IChat {
         // 流内错误帧（provider 在 SSE 数据里报错）。它**不是**调用方
         // 叫停，所以不能被"主动停止不算失败"那条规则吞掉。
         bool failed = false;
-        while (true) {
-            SseDelivery d = await sink.TakeCo();
-            if (d.data.Length > 0) {
-                reader.Feed(d.data);
-                string line = reader.Next();
-                while (line.Length > 0) {
-                    int r = this.OnStreamLine(line, sb, onDelta);
-                    if (r == 0) {
-                        // 调用方要求停止。
-                        stopped = true;
-                        break;
+        string resultText = null;
+        Exception caught = null;
+        try {
+            while (true) {
+                SseDelivery d = await sink.TakeCo();
+                if (d.data.Length > 0) {
+                    reader.Feed(d.data);
+                    string line = reader.Next();
+                    while (line.Length > 0) {
+                        int r = this.OnStreamLine(line, sb, onDelta);
+                        if (r == 0) {
+                            // 调用方要求停止。
+                            stopped = true;
+                            break;
+                        }
+                        if (r < 0) {
+                            // 流内错误帧：不是调用方叫停（错误已记进 lastError，
+                            // 不能被"主动停止不算失败"那条规则吞掉）。
+                            failed = true;
+                            stopped = true;
+                            break;
+                        }
+                        line = reader.Next();
                     }
-                    if (r < 0) {
-                        // 流内错误帧：不是调用方叫停（错误已记进 lastError，
-                        // 不能被"主动停止不算失败"那条规则吞掉）。
-                        failed = true;
-                        stopped = true;
-                        break;
-                    }
-                    line = reader.Next();
+                }
+                if (stopped) {
+                    // 调用方主动停止：中止上游（别让对端接着算 token），
+                    // 返回已收到的全文。
+                    sink.Abort();
+                    break;
+                }
+                if (d.finished) { break; }
+            }
+
+            // 流结束时可能还剩半行：对端把最后一帧发了但**没以换行收尾**
+            // （SSE 允许这样收尾，最后一个事件不必有空行）。这半行要按
+            // 完整的一行处理，否则最后一个分片会被**静默丢掉**——收流
+            // 正常结束、内容却少一截，且没有任何错误提示。
+            if (!stopped) {
+                string rest = reader.Flush();
+                if (rest.Length > 0) {
+                    this.OnStreamLine(rest, sb, onDelta);
                 }
             }
-            if (stopped) {
-                // 调用方主动停止：中止上游（别让对端接着算 token），
-                // 返回已收到的全文。
-                sink.Abort();
-                break;
-            }
-            if (d.finished) { break; }
-        }
 
-        // 流结束时可能还剩半行：对端把最后一帧发了但**没以换行收尾**
-        // （SSE 允许这样收尾，最后一个事件不必有空行）。这半行要按
-        // 完整的一行处理，否则最后一个分片会被**静默丢掉**——收流
-        // 正常结束、内容却少一截，且没有任何错误提示。
-        if (!stopped) {
-            string rest = reader.Flush();
-            if (rest.Length > 0) {
-                this.OnStreamLine(rest, sb, onDelta);
+            // 传输结果：ok / err: ...
+            //
+            // **调用方主动停止不算失败**：中止上游必然让传输层报
+            // "err: cancelled"，那是我们自己叫停的，报成错误会让调用方
+            // 以为流挂了。
+            //
+            // 但**流内错误帧**要报：那不是我们叫停的，lastError 已经被
+            // OnStreamLine 填好了，这里不能覆盖也不能吞掉。
+            if (!stopped) {
+                string attempt = sink.Attempt();
+                if (attempt.Length > 0 && attempt.StartsWith("err:")) {
+                    string reason = attempt.Substring(4).Trim();
+                    // 已经收到过内容却中途失败：内容仍然有用，但原因要报出来。
+                    this.lastError = "流式请求失败：" + reason;
+                    if (sb.Length > 0) { resultText = sb.ToString(); }
+                } else {
+                    resultText = sb.ToString();
+                }
+            } else if (failed) {
+                // 流内错误：已收到过内容就把半截内容交回去（内容仍然有用），
+                // 一个字都没有就当失败返回 null。
+                if (sb.Length > 0) { resultText = sb.ToString(); }
+            } else {
+                resultText = sb.ToString();
             }
+        } catch (Exception ex) {
+            caught = ex;
         }
-
-        // 传输结果：ok / err: ...
-        //
-        // **调用方主动停止不算失败**：中止上游必然让传输层报
-        // "err: cancelled"，那是我们自己叫停的，报成错误会让调用方
-        // 以为流挂了。
-        //
-        // 但**流内错误帧**要报：那不是我们叫停的，lastError 已经被
-        // OnStreamLine 填好了，这里不能覆盖也不能吞掉。
-        if (!stopped) {
-            string attempt = sink.Attempt();
-            if (attempt.Length > 0 && attempt.StartsWith("err:")) {
-                string reason = attempt.Substring(4).Trim();
-                // 已经收到过内容却中途失败：内容仍然有用，但原因要报出来。
-                this.lastError = "流式请求失败：" + reason;
-                if (sb.Length == 0) { return null; }
-            }
-        } else if (failed) {
-            // 流内错误：已收到过内容就把半截内容交回去（内容仍然有用），
-            // 一个字都没有就当失败返回 null。
-            if (sb.Length == 0) { return null; }
-        }
-        return sb.ToString();
+        await AiStream.ReleaseSink(producer, sink);
+        if (caught != null) { throw caught; }
+        return resultText;
     }
 
     // 流式补全（带工具）。
