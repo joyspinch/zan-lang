@@ -10,6 +10,10 @@ class DesktopOverlayCompanionTest {
     #if WINDOWS
     [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
     static extern nint GetWindowLongPtrW(nint hwnd, int index);
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int GetWindowRect(nint hwnd, nint rect);
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
 
     static bool OnKey(int vk, int scan, int flags, bool injected, bool keyUp) {
         return false;
@@ -57,6 +61,33 @@ class DesktopOverlayCompanionTest {
             nint exAfterCt = DesktopOverlayCompanionTest.GetWindowLongPtrW(hwnd, 0 - 20);
             bool keptLayered = ((exAfterCt & 0x00000020) == 0) && ((exAfterCt & 0x00080000) != 0);
 
+            // 验证透明陪伴窗口逐像素 Alpha HitTest：
+            // 透明角 (alpha==0) 返回 HTTRANSPARENT (-1)，中心不透明矩形 (alpha==255) 返回 HTCLIENT (1)
+            Canvas hitSurf = new Canvas(160, 160);
+            hitSurf.Clear(0);
+            hitSurf.FillRect(40, 40, 80, 80, unchecked((int)0xFFFF3030));
+            Platform.Window().Present(hwnd, hitSurf.SurfaceId());
+            nint rc = NativeMemory.Alloc(16);
+            bool alphaHitOk = false;
+            if (DesktopOverlayCompanionTest.GetWindowRect(hwnd, rc) != 0) {
+                Span<int> r = new Span<int>(rc, 4);
+                int wLeft = r[0];
+                int wTop = r[1];
+                int wW = r[2] - wLeft;
+                int wH = r[3] - wTop;
+                int tx = wLeft + 4;
+                int ty = wTop + 4;
+                int ox = wLeft + wW / 2;
+                int oy = wTop + wH / 2;
+                nint lpTrans = (nint)((tx & 0xFFFF) | ((ty & 0xFFFF) << 16));
+                nint lpOpaque = (nint)((ox & 0xFFFF) | ((oy & 0xFFFF) << 16));
+                nint htTrans = DesktopOverlayCompanionTest.SendMessageW(hwnd, 0x0084, 0, lpTrans);
+                nint htOpaque = DesktopOverlayCompanionTest.SendMessageW(hwnd, 0x0084, 0, lpOpaque);
+                alphaHitOk = (htTrans == (nint)(0 - 1)) && (htOpaque == (nint)1);
+            }
+            NativeMemory.Free(rc);
+            hitSurf.Destroy();
+
             // 关闭透明后，WS_EX_LAYERED 应还原
             Platform.Window().SetTransparent(hwnd, false);
             Platform.Window().SetTopmost(hwnd, false);
@@ -67,7 +98,7 @@ class DesktopOverlayCompanionTest {
                 && ((exClean & 0x00000080) == 0);
 
             Platform.Window().Destroy(hwnd);
-            win32Ok = hasAll && keptLayered && cleaned;
+            win32Ok = hasAll && keptLayered && alphaHitOk && cleaned;
         }
         Console.WriteLine("win32-exstyle: " + Convert.ToString(win32Ok ? 1 : 0));
 

@@ -151,6 +151,7 @@ typedef struct {
     zgl_uint program;
     zgl_int u_light_vp;
     zgl_int u_model;
+    zgl_int u_bones;
 } zan_game_shadow_program;
 
 #define ZAN_GAME_LOC_POS 0
@@ -186,6 +187,7 @@ static uint64_t g_game_epoch;
 static zan_game_program g_game_progs[2][2];
 static zan_game_program g_game_skin_prog;
 static zan_game_shadow_program g_game_shadow_prog;
+static zan_game_shadow_program g_game_shadow_skin_prog;
 static zgl_uint g_game_instance_vbo;
 static int32_t g_game_batch_surface = -1;
 static zan_gpu_frame g_game_batch_frame;
@@ -314,6 +316,24 @@ static const char *const ZAN_GAME_3D_VS_SHADOW =
 "uniform mat4 uModel;\n"
 "void main() {\n"
 "    gl_Position = uLightVP * (uModel * vec4(a_pos, 1.0));\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_VS_SHADOW_SKINNED =
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 9) in vec4 a_joints;\n"
+"layout(location = 10) in vec4 a_weights;\n"
+"uniform mat4 uLightVP;\n"
+"uniform mat4 uModel;\n"
+"uniform mat4 uBones[64];\n"
+"void main() {\n"
+"    ivec4 ji = clamp(ivec4(a_joints + vec4(0.5)), ivec4(0), ivec4(63));\n"
+"    float wsum = a_weights.x + a_weights.y + a_weights.z + a_weights.w;\n"
+"    mat4 skin = (wsum > 0.0001)\n"
+"        ? (uBones[ji.x] * a_weights.x + uBones[ji.y] * a_weights.y +\n"
+"           uBones[ji.z] * a_weights.z + uBones[ji.w] * a_weights.w)\n"
+"        : mat4(1.0);\n"
+"    vec4 sp = skin * vec4(a_pos, 1.0);\n"
+"    gl_Position = uLightVP * (uModel * sp);\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_SHADOW =
@@ -505,6 +525,8 @@ static void zan_game_forget_gpu(void) {
             g_game_gl->DeleteProgram(g_game_skin_prog.program);
         if (g_game_shadow_prog.program)
             g_game_gl->DeleteProgram(g_game_shadow_prog.program);
+        if (g_game_shadow_skin_prog.program)
+            g_game_gl->DeleteProgram(g_game_shadow_skin_prog.program);
         if (g_game_instance_vbo)
             g_game_gl->DeleteBuffers(1, &g_game_instance_vbo);
         zan_game_drop_shadow();
@@ -516,6 +538,7 @@ static void zan_game_forget_gpu(void) {
     memset(g_game_progs, 0, sizeof(g_game_progs));
     memset(&g_game_skin_prog, 0, sizeof(g_game_skin_prog));
     memset(&g_game_shadow_prog, 0, sizeof(g_game_shadow_prog));
+    memset(&g_game_shadow_skin_prog, 0, sizeof(g_game_shadow_skin_prog));
     g_game_instance_vbo = 0;
     g_game_batch_surface = -1;
     g_game_shadow_surface = -1;
@@ -708,7 +731,36 @@ static zan_game_shadow_program *zan_game_shadow_program_get(void) {
     g_game_shadow_prog.program = program;
     g_game_shadow_prog.u_light_vp = light_vp;
     g_game_shadow_prog.u_model = model;
+    g_game_shadow_prog.u_bones = -1;
     return &g_game_shadow_prog;
+}
+
+static zan_game_shadow_program *zan_game_shadow_skin_program_get(void) {
+    if (g_game_shadow_skin_prog.program) return &g_game_shadow_skin_prog;
+    char vs_src[2048];
+    char fs_src[512];
+    const char *head = zan_game_glsl_head();
+    snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SHADOW_SKINNED);
+    snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_SHADOW);
+    zgl_uint program = zan_gui_gpu_program(vs_src, fs_src);
+    if (!program) return NULL;
+    zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
+    zgl_int joints = g_game_gl->GetAttribLocation(program, "a_joints");
+    zgl_int weights = g_game_gl->GetAttribLocation(program, "a_weights");
+    zgl_int light_vp = g_game_gl->GetUniformLocation(program, "uLightVP");
+    zgl_int model = g_game_gl->GetUniformLocation(program, "uModel");
+    zgl_int bones = g_game_gl->GetUniformLocation(program, "uBones");
+    if (pos != ZAN_GAME_LOC_POS || joints != ZAN_GAME_LOC_JOINTS ||
+        weights != ZAN_GAME_LOC_WEIGHTS || light_vp < 0 || model < 0 ||
+        bones < 0 || g_game_gl->GetError() != ZGL_NO_ERROR) {
+        g_game_gl->DeleteProgram(program);
+        return NULL;
+    }
+    g_game_shadow_skin_prog.program = program;
+    g_game_shadow_skin_prog.u_light_vp = light_vp;
+    g_game_shadow_skin_prog.u_model = model;
+    g_game_shadow_skin_prog.u_bones = bones;
+    return &g_game_shadow_skin_prog;
 }
 
 /* 光照 uniform 上传：程序间 uniform 状态互不共享，每个程序按全局版本
@@ -1261,6 +1313,32 @@ ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh_id,
     gl->UseProgram(prog->program);
     gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
     gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE, model);
+    gl->BindVertexArray(mesh->vao);
+    gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
+    gl->BindVertexArray(0);
+    return gl->GetError() == ZGL_NO_ERROR;
+}
+
+ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t mesh_id,
+    const float *model) {
+    if (surface_id < 0 || surface_id != g_game_shadow_surface ||
+        mesh_id <= 0 || !model) return 0;
+    zan_gpu_frame *frame = &g_game_shadow_frame;
+    if (!zan_game_gpu_prepare(frame)) return 0;
+    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
+    if (!mesh || !mesh->skinned) return 0;
+    zan_game_shadow_program *prog = zan_game_shadow_skin_program_get();
+    if (!prog) return 0;
+    const zan_gl_api *gl = frame->api;
+    if (g_game_bone_count == 0) {
+        for (int i = 0; i < ZAN_GAME_MAX_BONES; ++i) {
+            memcpy(&g_game_bones[i * 16], g_game_identity_mat4, 16 * sizeof(float));
+        }
+    }
+    gl->UseProgram(prog->program);
+    gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+    gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE, model);
+    gl->UniformMatrix4fv(prog->u_bones, ZAN_GAME_MAX_BONES, ZGL_FALSE, g_game_bones);
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);

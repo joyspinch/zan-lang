@@ -50,6 +50,9 @@ ZAN_GAME_API int32_t zan_game_shadow_begin(int32_t surface_id, int32_t map_size,
     const float *light_vp);
 ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh,
     const float *model);
+/* 蒙皮网格动态阴影投射（使用当前 zan_game_set_bones3d 上传的骨骼矩阵变形后写入 ShadowMap）。 */
+ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t mesh,
+    const float *model);
 ZAN_GAME_API int32_t zan_game_shadow_end(int32_t surface_id);
 ZAN_GAME_API void zan_game_shadow_clear(void);
 

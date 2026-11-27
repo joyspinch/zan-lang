@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Sockets;
+
+// 单端口多客户端 KCP 服务器中的对端连接状态。
+public class KcpClientConn {
+    public int PeerId;
+    public int Conv;
+    public string RemoteIp;
+    public int RemotePort;
+    public string EndpointKey;
+    public KcpSession Session;
+    public int LastActiveMs;
+    public bool Connected;
+
+    public KcpClientConn(int peerId, int conv, string ip, int port, KcpSession session, int nowMs) {
+        this.PeerId = peerId;
+        this.Conv = conv;
+        this.RemoteIp = ip != null ? ip : "";
+        this.RemotePort = port;
+        this.EndpointKey = this.RemoteIp + ":" + Convert.ToString(port);
+        this.Session = session;
+        this.LastActiveMs = nowMs;
+        this.Connected = true;
+    }
+
+    public void UpdateEndpoint(string ip, int port) {
+        this.RemoteIp = ip != null ? ip : "";
+        this.RemotePort = port;
+        this.EndpointKey = this.RemoteIp + ":" + Convert.ToString(port);
+    }
+}
+
+// KcpUdpServer 接收队列中的一条完整可靠消息。
+public class KcpPacket {
+    public int PeerId;
+    public int Conv;
+    public string RemoteIp;
+    public int RemotePort;
+    public byte[] Payload;
+
+    public KcpPacket(int peerId, int conv, string ip, int port, byte[] payload) {
+        this.PeerId = peerId;
+        this.Conv = conv;
+        this.RemoteIp = ip;
+        this.RemotePort = port;
+        this.Payload = payload;
+    }
+}
+
+// 连接生命周期事件回调。
+public delegate void KcpPeerEventFn(KcpClientConn conn);
+
+// 单 UDP 端口多客户端权威 KCP 服务器：
+// - 单 socket 复用所有客户端（按 conv + ip:port 路由，支持移动网络 NAT 地址漂移无缝重绑定）
+// - 内置心跳超时驱逐、单播 SendTo、广播 Broadcast 与断线清理
+public class KcpUdpServer : IDisposable {
+    private UdpClient udp;
+    private bool ownedUdp;
+    private byte[] recvBuf;
+    private List<KcpClientConn> clients;
+    private List<KcpPacket> incoming;
+    private int nextPeerId;
+    private int timeoutMs;
+    private int nodelay;
+    private int intervalMs;
+    private int fastResend;
+    private int nocwnd;
+    private KcpPeerEventFn onConnected;
+    private KcpPeerEventFn onDisconnected;
+
+    public KcpUdpServer(UdpClient socket, bool ownSocket) {
+        this.udp = socket;
+        this.ownedUdp = ownSocket;
+        this.recvBuf = new byte[4096];
+        this.clients = new List<KcpClientConn>();
+        this.incoming = new List<KcpPacket>();
+        this.nextPeerId = 1;
+        this.timeoutMs = 15000;
+        this.nodelay = 1;
+        this.intervalMs = 10;
+        this.fastResend = 2;
+        this.nocwnd = 1;
+    }
+
+    // 在指定地址和端口启动单端口多客户端 KCP 服务器。
+    public static KcpUdpServer Bind(string host, int port) {
+        UdpClient u = UdpClient.Bind(host, port);
+        if (u == null) { return null; }
+        return new KcpUdpServer(u, true);
+    }
+
+    public int ClientCount { get { return this.clients.Count; } }
+    public int PendingCount { get { return this.incoming.Count; } }
+
+    public void SetTimeoutMs(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+    }
+
+    public void SetNoDelay(int nd, int ivMs, int resend, int nc) {
+        this.nodelay = nd;
+        this.intervalMs = ivMs;
+        this.fastResend = resend;
+        this.nocwnd = nc;
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            this.clients[i].Session.SetNoDelay(nd, ivMs, resend, nc);
+        }
+    }
+
+    public void SetOnConnected(KcpPeerEventFn fn) { this.onConnected = fn; }
+    public void SetOnDisconnected(KcpPeerEventFn fn) { this.onDisconnected = fn; }
+
+    public KcpClientConn FindByPeerId(int peerId) {
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            if (this.clients[i].PeerId == peerId) { return this.clients[i]; }
+        }
+        return null;
+    }
+
+    public KcpClientConn FindByConv(int conv) {
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            if (this.clients[i].Conv == conv) { return this.clients[i]; }
+        }
+        return null;
+    }
+
+    public List<int> PeerIds() {
+        List<int> ids = new List<int>();
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            ids.Add(this.clients[i].PeerId);
+        }
+        return ids;
+    }
+
+    // 非阻塞驱动：接收到达的所有 UDP 报文 -> 路由/建连 -> 解包入队 -> 推进 KCP 定时重传 -> 超时清理。
+    public void Poll(int nowMs) {
+        if (this.udp != null) {
+            for (int iter = 0; iter < 256; iter = iter + 1) {
+                int n = this.udp.RecvBytesFrom(this.recvBuf, this.recvBuf.Length);
+                if (n <= 0) { break; }
+                if (n < KcpSession.OVERHEAD) { continue; }
+                string ip = Socket.PeerIp();
+                int port = Socket.PeerPort();
+                if (ip == null || ip.Length == 0 || port <= 0) { continue; }
+                int conv = ReadU32LE(this.recvBuf, 0);
+                KcpClientConn conn = this.FindOrAccept(conv, ip, port, nowMs);
+                if (conn == null) { continue; }
+                conn.LastActiveMs = nowMs;
+                conn.Session.Input(this.recvBuf, n);
+                for (int r = 0; r < 64; r = r + 1) {
+                    byte[] msg = conn.Session.Recv();
+                    if (msg == null) { break; }
+                    this.incoming.Add(new KcpPacket(conn.PeerId, conn.Conv, conn.RemoteIp, conn.RemotePort, msg));
+                }
+            }
+        }
+
+        // 推进所有会话并清理超时对端
+        for (int i = this.clients.Count - 1; i >= 0; i = i - 1) {
+            KcpClientConn c = this.clients[i];
+            if (this.timeoutMs > 0 && (nowMs - c.LastActiveMs) > this.timeoutMs) {
+                this.RemoveClientAt(i);
+            } else {
+                c.Session.Update(nowMs);
+            }
+        }
+    }
+
+    // 取出一条已解码的客户端消息；无消息返回 null。
+    public KcpPacket Recv() {
+        if (this.incoming.Count == 0) { return null; }
+        KcpPacket p = this.incoming[0];
+        this.incoming.RemoveAt(0);
+        return p;
+    }
+
+    // 向指定 peerId 可靠单播。成功返回 0，失败返回负数。
+    public int SendTo(int peerId, byte[] payload) {
+        KcpClientConn c = this.FindByPeerId(peerId);
+        if (c == null || !c.Connected) { return -1; }
+        return c.Session.Send(payload);
+    }
+
+    // 向所有已连接客户端可靠广播；excludePeerId > 0 时跳过该对端。返回成功投递的客户端数。
+    public int Broadcast(byte[] payload, int excludePeerId) {
+        int sent = 0;
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            KcpClientConn c = this.clients[i];
+            if (!c.Connected || c.PeerId == excludePeerId) { continue; }
+            if (c.Session.Send(payload) == 0) { sent = sent + 1; }
+        }
+        return sent;
+    }
+
+    // 主动断开指定客户端。
+    public bool Disconnect(int peerId) {
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            if (this.clients[i].PeerId == peerId) {
+                this.RemoveClientAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private KcpClientConn FindOrAccept(int conv, string ip, int port, int nowMs) {
+        KcpClientConn existing = this.FindByConv(conv);
+        if (existing != null) {
+            // NAT 漂移/重绑定：同一 conv 来自新端口时自动更新回包地址
+            if (existing.RemotePort != port || existing.RemoteIp != ip) {
+                existing.UpdateEndpoint(ip, port);
+            }
+            return existing;
+        }
+        int peerId = this.nextPeerId;
+        this.nextPeerId = this.nextPeerId + 1;
+
+        UdpClient sockRef = this.udp;
+        KcpClientConn conn = new KcpClientConn(peerId, conv, ip, port, null, nowMs);
+        KcpClientConn connRef = conn;
+        KcpSession session = new KcpSession(conv, (byte[] data, int len) => {
+            if (sockRef == null || connRef == null || !connRef.Connected) { return -1; }
+            return sockRef.SendBytesTo(data, len, connRef.RemoteIp, connRef.RemotePort);
+        });
+        session.SetNoDelay(this.nodelay, this.intervalMs, this.fastResend, this.nocwnd);
+        conn.Session = session;
+        this.clients.Add(conn);
+        if (this.onConnected != null) { this.onConnected(conn); }
+        return conn;
+    }
+
+    private void RemoveClientAt(int idx) {
+        KcpClientConn c = this.clients[idx];
+        c.Connected = false;
+        if (c.Session != null) { c.Session.SetOutput(null); }
+        this.clients.RemoveAt(idx);
+        if (this.onDisconnected != null) { this.onDisconnected(c); }
+    }
+
+    public void Dispose() {
+        for (int i = this.clients.Count - 1; i >= 0; i = i - 1) {
+            KcpClientConn c = this.clients[i];
+            c.Connected = false;
+            if (c.Session != null) { c.Session.SetOutput(null); }
+        }
+        this.clients.Clear();
+        this.incoming.Clear();
+        this.onConnected = null;
+        this.onDisconnected = null;
+        if (this.ownedUdp && this.udp != null) {
+            this.udp.Close();
+            this.udp = null;
+        }
+    }
+
+    private static int ReadU32LE(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+}

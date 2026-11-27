@@ -1,0 +1,291 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Animation;
+using Game.Assets;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DGltfAnimShadowTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    [DllImport("zan_image")]
+    private static extern nint zan_image_encode_argb(nint pixels, int w, int h, int stride,
+        int format, int quality, nint outLenPtr);
+
+    [DllImport("zan_image")]
+    private static extern void zan_image_free_bytes(nint ptr);
+
+    private static void WriteU32(List<byte> buf, uint v) {
+        buf.Add((byte)(v & 255u));
+        buf.Add((byte)((v >> 8) & 255u));
+        buf.Add((byte)((v >> 16) & 255u));
+        buf.Add((byte)((v >> 24) & 255u));
+    }
+
+    private static void WriteU16(List<byte> buf, int v) {
+        buf.Add((byte)(v & 255));
+        buf.Add((byte)((v >> 8) & 255));
+    }
+
+    private static void WriteF32(List<byte> buf, float f) {
+        WriteU32(buf, (uint)BitConverter.SingleToInt32Bits(f));
+    }
+
+    private static void Pad4(List<byte> buf, byte padByte) {
+        while ((buf.Count & 3) != 0) { buf.Add(padByte); }
+    }
+
+    // 用原生编码器在内存中生成合法 4x4 纯蓝 PNG（ARGB 0xFF1848F0）以嵌入 GLB。
+    private static byte[] MakeBluePng4x4() {
+        nint px = NativeMemory.Alloc(16 * 4);
+        nint lenPtr = NativeMemory.Alloc(4);
+        Span<int> ps = new Span<int>(px, 16);
+        int blue = unchecked((int)0xFF1848F0);
+        for (int i = 0; i < 16; i = i + 1) { ps[i] = blue; }
+        Span<int> ls = new Span<int>(lenPtr, 1);
+        ls[0] = 0;
+        nint pngPtr = zan_image_encode_argb(px, 4, 4, 4, 1, 90, lenPtr);
+        int pngLen = ls[0];
+        byte[] result = new byte[0];
+        if (pngPtr != 0 && pngLen > 0) {
+            result = new byte[pngLen];
+            Span<byte> src = new Span<byte>(pngPtr, pngLen);
+            for (int i = 0; i < pngLen; i = i + 1) { result[i] = src[i]; }
+            zan_image_free_bytes(pngPtr);
+        }
+        NativeMemory.Free(lenPtr);
+        NativeMemory.Free(px);
+        return result;
+    }
+
+    // 在内存中构造带蒙皮四边形、2 骨骼层级、关键帧平移/缩放动画、内嵌 4x4 PNG 纹理的完整 GLB 2.0。
+    private static byte[] BuildAnimatedTexturedGlb(byte[] pngBytes) {
+        List<byte> bin = new List<byte>();
+
+        // BV 0: POSITION (4 verts, quad X in [-0.3, 0.3], Y in [-0.35, 0.35], Z = -0.3)
+        int offPos = bin.Count;
+        WriteF32(bin, -0.3f); WriteF32(bin, -0.35f); WriteF32(bin, -0.3f);
+        WriteF32(bin,  0.3f); WriteF32(bin, -0.35f); WriteF32(bin, -0.3f);
+        WriteF32(bin,  0.3f); WriteF32(bin,  0.35f); WriteF32(bin, -0.3f);
+        WriteF32(bin, -0.3f); WriteF32(bin,  0.35f); WriteF32(bin, -0.3f);
+        int lenPos = bin.Count - offPos;
+
+        // BV 1: NORMAL (4 verts, +Z)
+        int offNrm = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        }
+        int lenNrm = bin.Count - offNrm;
+
+        // BV 2: TEXCOORD_0 (4 verts)
+        int offUv = bin.Count;
+        WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        WriteF32(bin, 1.0f); WriteF32(bin, 1.0f);
+        WriteF32(bin, 1.0f); WriteF32(bin, 0.0f);
+        WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        int lenUv = bin.Count - offUv;
+
+        // BV 3: JOINTS_0 UBYTE4 (all vertices bound 100% to bone 1 = "arm")
+        int offJnt = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            bin.Add(1); bin.Add(0); bin.Add(0); bin.Add(0);
+        }
+        int lenJnt = bin.Count - offJnt;
+
+        // BV 4: WEIGHTS_0 FLOAT4
+        int offWgt = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            WriteF32(bin, 1.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        }
+        int lenWgt = bin.Count - offWgt;
+
+        // BV 5: INDICES USHORT (2 triangles = 6 indices)
+        int offIdx = bin.Count;
+        WriteU16(bin, 0); WriteU16(bin, 1); WriteU16(bin, 2);
+        WriteU16(bin, 0); WriteU16(bin, 2); WriteU16(bin, 3);
+        int lenIdx = bin.Count - offIdx;
+        Pad4(bin, 0);
+
+        // BV 6: Animation keyframe times [0.0, 1.0] (2 floats)
+        int offTimes = bin.Count;
+        WriteF32(bin, 0.0f);
+        WriteF32(bin, 1.0f);
+        int lenTimes = bin.Count - offTimes;
+
+        // BV 7: Animation translation values [(0,0,0), (0.6,0,0)] (2 VEC3)
+        int offTrans = bin.Count;
+        WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        WriteF32(bin, 0.6f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        int lenTrans = bin.Count - offTrans;
+
+        // BV 8: Embedded PNG bytes
+        int offImg = bin.Count;
+        for (int i = 0; i < pngBytes.Length; i = i + 1) { bin.Add(pngBytes[i]); }
+        int lenImg = bin.Count - offImg;
+        Pad4(bin, 0);
+
+        string json = "{"
+            + "\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":" + bin.Count.ToString() + "}],"
+            + "\"bufferViews\":["
+            + "{\"buffer\":0,\"byteOffset\":" + offPos.ToString() + ",\"byteLength\":" + lenPos.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offNrm.ToString() + ",\"byteLength\":" + lenNrm.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offUv.ToString() + ",\"byteLength\":" + lenUv.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offJnt.ToString() + ",\"byteLength\":" + lenJnt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offWgt.ToString() + ",\"byteLength\":" + lenWgt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offIdx.ToString() + ",\"byteLength\":" + lenIdx.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offTimes.ToString() + ",\"byteLength\":" + lenTimes.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offTrans.ToString() + ",\"byteLength\":" + lenTrans.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offImg.ToString() + ",\"byteLength\":" + lenImg.ToString() + "}"
+            + "],"
+            + "\"accessors\":["
+            + "{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":2,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},"
+            + "{\"bufferView\":3,\"componentType\":5121,\"count\":4,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":4,\"componentType\":5126,\"count\":4,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":5,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},"
+            + "{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"
+            + "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}"
+            + "],"
+            + "\"images\":[{\"name\":\"albedo_blue\",\"mimeType\":\"image/png\",\"bufferView\":8}],"
+            + "\"textures\":[{\"name\":\"tex0\",\"source\":0}],"
+            + "\"materials\":[{\"name\":\"blue_mat\",\"pbrMetallicRoughness\":{"
+            + "\"baseColorFactor\":[1,1,1,1],\"baseColorTexture\":{\"index\":0}}}],"
+            + "\"meshes\":[{\"name\":\"caster_quad\",\"primitives\":[{"
+            + "\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4},"
+            + "\"indices\":5,\"material\":0}]}],"
+            + "\"nodes\":["
+            + "{\"name\":\"root\",\"children\":[1],\"translation\":[0,0,0]},"
+            + "{\"name\":\"arm\",\"translation\":[0,0,0]}"
+            + "],"
+            + "\"skins\":[{\"joints\":[0,1]}],"
+            + "\"animations\":[{\"name\":\"SlideRight\","
+            + "\"samplers\":[{\"input\":6,\"output\":7,\"interpolation\":\"LINEAR\"}],"
+            + "\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}}]}]"
+            + "}";
+
+        byte[] jsonRaw = Encoding.UTF8.GetBytes(json);
+        List<byte> jsonChunk = new List<byte>();
+        for (int i = 0; i < jsonRaw.Length; i = i + 1) { jsonChunk.Add(jsonRaw[i]); }
+        Pad4(jsonChunk, 32);
+
+        uint totalLen = (uint)(12 + 8 + jsonChunk.Count + 8 + bin.Count);
+        List<byte> glb = new List<byte>();
+        WriteU32(glb, 0x46546C67u);
+        WriteU32(glb, 2u);
+        WriteU32(glb, totalLen);
+        WriteU32(glb, (uint)jsonChunk.Count);
+        WriteU32(glb, 0x4E4F534Au);
+        for (int i = 0; i < jsonChunk.Count; i = i + 1) { glb.Add(jsonChunk[i]); }
+        WriteU32(glb, (uint)bin.Count);
+        WriteU32(glb, 0x004E4942u);
+        for (int i = 0; i < bin.Count; i = i + 1) { glb.Add(bin[i]); }
+        return glb.ToArray();
+    }
+
+    private static int PixelLum(int argb) {
+        int r = (argb >> 16) & 255;
+        int g = (argb >> 8) & 255;
+        int b = argb & 255;
+        return (r + g + b) / 3;
+    }
+
+    static void Main() {
+        // 1. 生成内嵌 PNG + GLB 并解析动画与纹理元数据
+        byte[] png = MakeBluePng4x4();
+        byte[] glb = BuildAnimatedTexturedGlb(png);
+        GltfModel model = GltfLoader.LoadGlb(glb);
+        AnimationClip clip = model != null ? model.FindAnimation("SlideRight") : null;
+        bool parseOk = model != null
+            && model.PrimitiveCount == 1 && model.Primitives[0].IsSkinned
+            && model.Skeleton != null && model.Skeleton.Count() == 2
+            && model.AnimationCount == 1 && clip != null
+            && clip.TrackCount() == 1 && clip.Duration >= 0.99f
+            && model.ImageCount == 1 && model.TextureCount == 1
+            && model.Materials.Count == 1 && model.Materials[0].BaseColorTextureIndex == 0;
+        Console.WriteLine("gltf-anim-tex-parse: " + Convert.ToString(parseOk ? 1 : 0));
+
+        // 2. 启用 OpenGL 3.3 Core，验证 GLB 内嵌 PNG 纹理一键注册与 GPU 采样
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        string texKey = model != null ? model.RegisterMaterialBaseColorTexture(0, "gltf_anim_shadow") : "";
+
+        // 背景接收阴影的白色平板（Z = +0.3）
+        Mesh3D receiver = new Mesh3D();
+        receiver.Vertex(-0.95f, -0.95f, 0.3f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        receiver.Vertex( 0.95f, -0.95f, 0.3f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        receiver.Vertex( 0.95f,  0.95f, 0.3f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        receiver.Vertex(-0.95f,  0.95f, 0.3f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        receiver.Triangle(0, 1, 2);
+        receiver.Triangle(0, 2, 3);
+
+        int recvHandle = cv.MeshUpload(receiver);
+        int skinHandle = (model != null && model.PrimitiveCount > 0)
+            ? cv.MeshUploadSkinned(model.Primitives[0].SkinnedMesh) : 0;
+
+        Mat4 ident = Mat4.Identity();
+        float[] lDirs = new float[3]; lDirs[0] = 0.0f; lDirs[1] = 0.0f; lDirs[2] = 1.0f;
+        float[] lCols = new float[3]; lCols[0] = 0.85f; lCols[1] = 0.85f; lCols[2] = 0.85f;
+        float[] lAmb = new float[3]; lAmb[0] = 0.15f; lAmb[1] = 0.15f; lAmb[2] = 0.15f;
+        cv.SetLights3D(lDirs, lCols, lAmb);
+
+        // 2a. 绘制绑定 GLB 内嵌蓝色 PNG 纹理的蒙皮网格（t=0，居中）
+        bool texSampleOk = false;
+        if (skinHandle > 0 && texKey != "") {
+            cv.ShadowClear();
+            cv.Clear(unchecked((int)0xFF000000));
+            cv.SetBones3D(model.Skeleton);
+            int dr = cv.DrawMesh3DSkinned(skinHandle, ident, ident, unchecked((int)0xFFFFFFFF), texKey);
+            int pxCenter = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+            int pr = (pxCenter >> 16) & 255;
+            int pb = pxCenter & 255;
+            texSampleOk = dr == 1 && pb > pr + 80;
+        }
+        Console.WriteLine("gltf-embedded-png-gpu: " + Convert.ToString(texSampleOk ? 1 : 0));
+
+        // 3. 端到端验证：GLB AnimationClip -> Skeleton -> SetBones3D -> ShadowDrawSkinned 动态阴影跟随骨骼移动
+        bool skinnedShadowOk = false;
+        if (recvHandle > 0 && skinHandle > 0 && clip != null) {
+            PoseBuffer poseBuf = new PoseBuffer(model.Skeleton.Count());
+
+            // Pose A (t = 0.0): 蒙皮网格居中 X in [-0.3, +0.3] -> 阴影落在中心 (64,64)，右侧 (102,64) 受光
+            clip.ApplyTo(model.Skeleton, 0.0f, poseBuf);
+            cv.SetBones3D(model.Skeleton);
+            int sb0 = cv.ShadowBegin(512, ident);
+            int sd0 = cv.ShadowDrawSkinned(skinHandle, ident);
+            int se0 = cv.ShadowEnd();
+            cv.Clear(unchecked((int)0xFF000000));
+            cv.DrawMesh3DEx(recvHandle, ident, ident, unchecked((int)0xFFFFFFFF), "");
+            int lumCenterT0 = PixelLum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+            int lumRightT0 = PixelLum(zan_gui_read_pixel(cv.SurfaceId(), 102, 64));
+
+            // Pose B (t = 1.0): 动画将 arm 骨骼平移 +0.6 -> 蒙皮阴影动态右移到 X in [+0.3, +0.9]
+            // 中心 (64,64) 退出阴影变亮，右侧 (102,64) 进入阴影变暗！
+            clip.ApplyTo(model.Skeleton, 1.0f, poseBuf);
+            cv.SetBones3D(model.Skeleton);
+            int sb1 = cv.ShadowBegin(512, ident);
+            int sd1 = cv.ShadowDrawSkinned(skinHandle, ident);
+            int se1 = cv.ShadowEnd();
+            cv.Clear(unchecked((int)0xFF000000));
+            cv.DrawMesh3DEx(recvHandle, ident, ident, unchecked((int)0xFFFFFFFF), "");
+            int lumCenterT1 = PixelLum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+            int lumRightT1 = PixelLum(zan_gui_read_pixel(cv.SurfaceId(), 102, 64));
+
+            cv.ShadowClear();
+            skinnedShadowOk = sb0 == 1 && sd0 == 1 && se0 == 1
+                && sb1 == 1 && sd1 == 1 && se1 == 1
+                && (lumRightT0 > lumCenterT0 + 40)
+                && (lumCenterT1 > lumCenterT0 + 40)
+                && (lumRightT0 > lumRightT1 + 40);
+        }
+        Console.WriteLine("gpu-skinned-shadow-anim: " + Convert.ToString(skinnedShadowOk ? 1 : 0));
+        cv.Destroy();
+    }
+}

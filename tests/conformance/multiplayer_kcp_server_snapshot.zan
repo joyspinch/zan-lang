@@ -1,0 +1,159 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerKcpServerSnapshotTest {
+    static int AbsFloatDiffLe(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = 0.0f - d; }
+        return d <= eps ? 1 : 0;
+    }
+
+    static void Main() {
+        // 1. 单端口多客户端 KcpUdpServer + 真 localhost UDP 广播 WorldSnapshot + 超时驱逐
+        int srvPort = 39411;
+        int c1Port = 39412;
+        int c2Port = 39413;
+        KcpUdpServer srv = KcpUdpServer.Bind("127.0.0.1", srvPort);
+        KcpUdpPeer cli1 = KcpUdpPeer.Bind("127.0.0.1", c1Port, 101, "127.0.0.1", srvPort);
+        KcpUdpPeer cli2 = KcpUdpPeer.Bind("127.0.0.1", c2Port, 202, "127.0.0.1", srvPort);
+
+        bool kcpSrvOk = false;
+        if (srv != null && cli1 != null && cli2 != null) {
+            srv.SetTimeoutMs(500);
+            byte[] hello1 = new byte[4];
+            hello1[0] = (byte)65; hello1[1] = (byte)49; hello1[2] = (byte)0; hello1[3] = (byte)1;
+            byte[] hello2 = new byte[4];
+            hello2[0] = (byte)66; hello2[1] = (byte)50; hello2[2] = (byte)0; hello2[3] = (byte)2;
+            cli1.Send(hello1);
+            cli2.Send(hello2);
+
+            int recvCount = 0;
+            int peer1Id = 0;
+            int peer2Id = 0;
+            int now = 100;
+            for (int step = 0; step < 30 && recvCount < 2; step = step + 1) {
+                now = now + 15;
+                cli1.Poll(now);
+                cli2.Poll(now);
+                srv.Poll(now);
+                for (int r = 0; r < 8; r = r + 1) {
+                    KcpPacket pkt = srv.Recv();
+                    if (pkt == null) { break; }
+                    recvCount = recvCount + 1;
+                    if (pkt.Conv == 101) { peer1Id = pkt.PeerId; }
+                    if (pkt.Conv == 202) { peer2Id = pkt.PeerId; }
+                }
+                Thread.Sleep(2);
+            }
+
+            // 服务器编码权威快照并单端口广播给全部客户端
+            WorldSnapshot snap = new WorldSnapshot(7, 200, 12);
+            snap.AddEntity(new EntityNetState(1, 12.5f, 1.0f, -3.5f, 1.25f, 4.0f, 0.0f, 0.0f, 3));
+            snap.AddEntity(new EntityNetState(2, -8.0f, 2.0f, 6.25f, -0.5f, 0.0f, 0.0f, 2.0f, 1));
+            byte[] wire = snap.Encode();
+            int bcastCount = srv.Broadcast(wire, 0);
+
+            WorldSnapshot got1 = null;
+            WorldSnapshot got2 = null;
+            for (int step = 0; step < 30 && (got1 == null || got2 == null); step = step + 1) {
+                now = now + 15;
+                srv.Poll(now);
+                cli1.Poll(now);
+                cli2.Poll(now);
+                if (got1 == null) {
+                    byte[] m1 = cli1.Recv();
+                    if (m1 != null) { got1 = WorldSnapshot.Decode(m1); }
+                }
+                if (got2 == null) {
+                    byte[] m2 = cli2.Recv();
+                    if (m2 != null) { got2 = WorldSnapshot.Decode(m2); }
+                }
+                Thread.Sleep(2);
+            }
+
+            bool decodedOk = got1 != null && got2 != null
+                && got1.ServerTick == 7 && got1.LastAckInputSeq == 12
+                && got1.Entities.Count == 2 && got2.Entities.Count == 2
+                && AbsFloatDiffLe(got1.Entities[0].X, 12.5f, 0.001f) == 1
+                && AbsFloatDiffLe(got2.Entities[1].Z, 6.25f, 0.001f) == 1;
+
+            // 先消费客户端回传的尾包 ACK，随后静默超过 500ms 触发超时驱逐
+            srv.Poll(now + 15);
+            srv.Poll(now + 1000);
+            bool evictedOk = srv.ClientCount == 0;
+
+            kcpSrvOk = recvCount == 2 && peer1Id > 0 && peer2Id > 0 && peer1Id != peer2Id
+                && bcastCount == 2 && decodedOk && evictedOk;
+        }
+        if (cli1 != null) { cli1.Dispose(); }
+        if (cli2 != null) { cli2.Dispose(); }
+        if (srv != null) { srv.Dispose(); }
+        Console.WriteLine("kcp-multi-server: " + Convert.ToString(kcpSrvOk ? 1 : 0));
+
+        // 2. 快照插值（位置 + 最短弧 Yaw 跨越 +-PI + 有界外推）+ 客户端预测回滚和解
+        SnapshotInterpolator interp = new SnapshotInterpolator(100, 150);
+        WorldSnapshot s0 = new WorldSnapshot(1, 100, 1);
+        s0.AddEntity(new EntityNetState(10, 0.0f, 0.0f, 0.0f, 3.0f, 100.0f, 0.0f, 0.0f, 1));
+        WorldSnapshot s1 = new WorldSnapshot(2, 200, 2);
+        s1.AddEntity(new EntityNetState(10, 10.0f, 0.0f, 0.0f, -3.0f, 100.0f, 0.0f, 0.0f, 1));
+        bool pushOk = interp.PushSnapshot(s0) && interp.PushSnapshot(s1) && !interp.PushSnapshot(s0);
+
+        // renderTime=250, delay=100 -> target=150 (中点 t=0.5): x=5.0, yaw 跨越 PI 而不是 0
+        List<EntityNetState> mid = interp.Sample(250);
+        bool midOk = mid.Count == 1
+            && AbsFloatDiffLe(mid[0].X, 5.0f, 0.01f) == 1
+            && (mid[0].Yaw > 3.0f || mid[0].Yaw < -3.0f);
+
+        // renderTime=500, delay=100 -> target=400 (超尾 200ms，被 maxExtrapolate=150ms 钳位): x = 10 + 100*0.15 = 25.0
+        List<EntityNetState> ext = interp.Sample(500);
+        bool extOk = ext.Count == 1 && AbsFloatDiffLe(ext[0].X, 25.0f, 0.01f) == 1;
+
+        ClientPredictionBuffer pred = new ClientPredictionBuffer();
+        pred.RecordInput(1.0f, 0.0f, 0.0f, 0.0f, 1, 0.016f);
+        pred.RecordInput(1.0f, 0.0f, 0.0f, 0.0f, 1, 0.016f);
+        pred.RecordInput(0.0f, 0.0f, 1.0f, 0.5f, 2, 0.016f);
+        pred.RecordInput(0.0f, 0.0f, 1.0f, 0.5f, 2, 0.016f);
+        List<ClientInputCmd> replay = pred.AcknowledgeAndPending(2);
+        bool predOk = replay.Count == 2 && replay[0].Seq == 3 && replay[1].Seq == 4;
+        Console.WriteLine("snapshot-interp: " + Convert.ToString(pushOk && midOk && extOk && predOk ? 1 : 0));
+
+        // 3. 轻量 UDP NAT 穿透信令交换（真 localhost UDP 交换双端公网地址）
+        int hubPort = 39414;
+        int natAPort = 39415;
+        int natBPort = 39416;
+        NatRendezvousHub hub = NatRendezvousHub.Bind("127.0.0.1", hubPort);
+        UdpClient peerA = UdpClient.Bind("127.0.0.1", natAPort);
+        UdpClient peerB = UdpClient.Bind("127.0.0.1", natBPort);
+        bool natOk = false;
+        if (hub != null && peerA != null && peerB != null) {
+            peerA.SendTo("REG|room42|alice", "127.0.0.1", hubPort);
+            peerB.SendTo("REG|room42|bob", "127.0.0.1", hubPort);
+            string gotA = "";
+            string gotB = "";
+            for (int i = 0; i < 20 && (gotA.Length == 0 || gotB.Length == 0); i = i + 1) {
+                hub.Poll();
+                if (gotA.Length == 0) {
+                    string r = peerA.RecvFrom(256);
+                    if (r != null && r.Length > 0) { gotA = r; }
+                }
+                if (gotB.Length == 0) {
+                    string r = peerB.RecvFrom(256);
+                    if (r != null && r.Length > 0) { gotB = r; }
+                }
+                Thread.Sleep(2);
+            }
+            string expA = "PEER|bob|127.0.0.1|" + Convert.ToString(natBPort);
+            string expB = "PEER|alice|127.0.0.1|" + Convert.ToString(natAPort);
+            natOk = hub.RegisteredCount == 2 && gotA == expA && gotB == expB;
+        }
+        if (peerA != null) { peerA.Dispose(); }
+        if (peerB != null) { peerB.Dispose(); }
+        if (hub != null) { hub.Dispose(); }
+        Console.WriteLine("nat-rendezvous: " + Convert.ToString(natOk ? 1 : 0));
+    }
+}

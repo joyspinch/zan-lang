@@ -1,0 +1,418 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace Game.Net;
+
+// 权威服务器同步的单个实体网络状态（位置、朝向、速度与状态标志）。
+public class EntityNetState {
+    public int EntityId;
+    public float X;
+    public float Y;
+    public float Z;
+    public float Yaw;
+    public float Vx;
+    public float Vy;
+    public float Vz;
+    public int Flags;
+
+    public EntityNetState(int entityId, float x, float y, float z, float yaw,
+                          float vx, float vy, float vz, int flags) {
+        this.EntityId = entityId;
+        this.X = x;
+        this.Y = y;
+        this.Z = z;
+        this.Yaw = yaw;
+        this.Vx = vx;
+        this.Vy = vy;
+        this.Vz = vz;
+        this.Flags = flags;
+    }
+
+    public EntityNetState Clone() {
+        return new EntityNetState(this.EntityId, this.X, this.Y, this.Z,
+            this.Yaw, this.Vx, this.Vy, this.Vz, this.Flags);
+    }
+}
+
+// 权威服务器下发的世界状态快照（定长二进制编解码：16 字节头 + 36 字节/实体）。
+public class WorldSnapshot {
+    public const int MAGIC = 0x5A534E50; // "ZSNP"
+    public const int HEADER_BYTES = 20;
+    public const int ENTITY_BYTES = 36;
+
+    public int ServerTick;
+    public int ServerTimeMs;
+    public int LastAckInputSeq;
+    public List<EntityNetState> Entities;
+
+    public WorldSnapshot(int serverTick, int serverTimeMs, int lastAckInputSeq) {
+        this.ServerTick = serverTick;
+        this.ServerTimeMs = serverTimeMs;
+        this.LastAckInputSeq = lastAckInputSeq;
+        this.Entities = new List<EntityNetState>();
+    }
+
+    public void AddEntity(EntityNetState state) {
+        if (state != null) { this.Entities.Add(state); }
+    }
+
+    public EntityNetState FindEntity(int entityId) {
+        for (int i = 0; i < this.Entities.Count; i = i + 1) {
+            if (this.Entities[i].EntityId == entityId) { return this.Entities[i]; }
+        }
+        return null;
+    }
+
+    // 编码为紧凑小端二进制帧，适合经 KcpUdpServer / UDP 直接发送。
+    public byte[] Encode() {
+        int count = this.Entities.Count;
+        byte[] buf = new byte[HEADER_BYTES + count * ENTITY_BYTES];
+        WriteI32(buf, 0, MAGIC);
+        WriteI32(buf, 4, this.ServerTick);
+        WriteI32(buf, 8, this.ServerTimeMs);
+        WriteI32(buf, 12, this.LastAckInputSeq);
+        WriteI32(buf, 16, count);
+        int off = HEADER_BYTES;
+        for (int i = 0; i < count; i = i + 1) {
+            EntityNetState e = this.Entities[i];
+            WriteI32(buf, off, e.EntityId);
+            WriteF32(buf, off + 4, e.X);
+            WriteF32(buf, off + 8, e.Y);
+            WriteF32(buf, off + 12, e.Z);
+            WriteF32(buf, off + 16, e.Yaw);
+            WriteF32(buf, off + 20, e.Vx);
+            WriteF32(buf, off + 24, e.Vy);
+            WriteF32(buf, off + 28, e.Vz);
+            WriteI32(buf, off + 32, e.Flags);
+            off = off + ENTITY_BYTES;
+        }
+        return buf;
+    }
+
+    public static WorldSnapshot Decode(byte[] data) {
+        if (data == null || data.Length < HEADER_BYTES) { return null; }
+        if (ReadI32(data, 0) != MAGIC) { return null; }
+        int tick = ReadI32(data, 4);
+        int timeMs = ReadI32(data, 8);
+        int ackSeq = ReadI32(data, 12);
+        int count = ReadI32(data, 16);
+        if (count < 0 || HEADER_BYTES + count * ENTITY_BYTES > data.Length) { return null; }
+        WorldSnapshot snap = new WorldSnapshot(tick, timeMs, ackSeq);
+        int off = HEADER_BYTES;
+        for (int i = 0; i < count; i = i + 1) {
+            EntityNetState e = new EntityNetState(
+                ReadI32(data, off),
+                ReadF32(data, off + 4),
+                ReadF32(data, off + 8),
+                ReadF32(data, off + 12),
+                ReadF32(data, off + 16),
+                ReadF32(data, off + 20),
+                ReadF32(data, off + 24),
+                ReadF32(data, off + 28),
+                ReadI32(data, off + 32)
+            );
+            snap.AddEntity(e);
+            off = off + ENTITY_BYTES;
+        }
+        return snap;
+    }
+
+    private static void WriteI32(byte[] buf, int pos, int val) {
+        buf[pos] = (byte)(val & 255);
+        buf[pos + 1] = (byte)((val >> 8) & 255);
+        buf[pos + 2] = (byte)((val >> 16) & 255);
+        buf[pos + 3] = (byte)((val >> 24) & 255);
+    }
+
+    private static int ReadI32(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+
+    private static void WriteF32(byte[] buf, int pos, float val) {
+        WriteI32(buf, pos, BitConverter.SingleToInt32Bits(val));
+    }
+
+    private static float ReadF32(byte[] buf, int pos) {
+        return BitConverter.ToSingle(buf, pos);
+    }
+}
+
+// 权威服务器快照插值器（Source/Overwatch 模式）：
+// - 按渲染延迟（默认 100ms）在相邻快照之间平滑插值位置/速度与最短弧 Yaw 朝向
+// - 网络抖动超尾时按速度有界外推（默认上限 150ms），避免实体瞬移或卡顿
+public class SnapshotInterpolator {
+    private List<WorldSnapshot> buffer;
+    private int interpDelayMs;
+    private int maxExtrapolateMs;
+    private int maxBuffered;
+    private int latestServerTick;
+    private int lastAckInputSeq;
+
+    public SnapshotInterpolator(int interpDelayMs, int maxExtrapolateMs) {
+        this.buffer = new List<WorldSnapshot>();
+        this.interpDelayMs = interpDelayMs >= 0 ? interpDelayMs : 100;
+        this.maxExtrapolateMs = maxExtrapolateMs >= 0 ? maxExtrapolateMs : 150;
+        this.maxBuffered = 32;
+        this.latestServerTick = -1;
+        this.lastAckInputSeq = 0;
+    }
+
+    public int InterpDelayMs { get { return this.interpDelayMs; } }
+    public int LatestServerTick { get { return this.latestServerTick; } }
+    public int LastAckInputSeq { get { return this.lastAckInputSeq; } }
+    public int BufferedCount { get { return this.buffer.Count; } }
+
+    // 推入权威快照（自动丢弃乱序旧 tick 并维持时间升序缓冲）。
+    public bool PushSnapshot(WorldSnapshot snap) {
+        if (snap == null) { return false; }
+        if (snap.ServerTick <= this.latestServerTick) { return false; }
+        this.latestServerTick = snap.ServerTick;
+        if (snap.LastAckInputSeq > this.lastAckInputSeq) {
+            this.lastAckInputSeq = snap.LastAckInputSeq;
+        }
+        this.buffer.Add(snap);
+        while (this.buffer.Count > this.maxBuffered) {
+            this.buffer.RemoveAt(0);
+        }
+        return true;
+    }
+
+    // 在客户端当前逻辑时钟 renderTimeMs 处采样插值后的实体集合。
+    public List<EntityNetState> Sample(int renderTimeMs) {
+        List<EntityNetState> result = new List<EntityNetState>();
+        int n = this.buffer.Count;
+        if (n == 0) { return result; }
+        int targetMs = renderTimeMs - this.interpDelayMs;
+
+        // 渲染时间早于最旧快照：直接返回最旧快照副本
+        WorldSnapshot first = this.buffer[0];
+        if (n == 1 || targetMs <= first.ServerTimeMs) {
+            if (n == 1 && targetMs > first.ServerTimeMs) {
+                return this.Extrapolate(first, targetMs - first.ServerTimeMs);
+            }
+            for (int i = 0; i < first.Entities.Count; i = i + 1) {
+                result.Add(first.Entities[i].Clone());
+            }
+            return result;
+        }
+
+        // 渲染时间晚于最新快照：速度有界外推（Dead Reckoning）
+        WorldSnapshot last = this.buffer[n - 1];
+        if (targetMs >= last.ServerTimeMs) {
+            return this.Extrapolate(last, targetMs - last.ServerTimeMs);
+        }
+
+        // 查找包含 targetMs 的相邻快照区间 [s0, s1]
+        WorldSnapshot s0 = first;
+        WorldSnapshot s1 = last;
+        for (int i = 0; i < n - 1; i = i + 1) {
+            WorldSnapshot a = this.buffer[i];
+            WorldSnapshot b = this.buffer[i + 1];
+            if (a.ServerTimeMs <= targetMs && targetMs <= b.ServerTimeMs) {
+                s0 = a;
+                s1 = b;
+                break;
+            }
+        }
+        int span = s1.ServerTimeMs - s0.ServerTimeMs;
+        float t = span > 0 ? (float)(targetMs - s0.ServerTimeMs) / (float)span : 1.0f;
+        if (t < 0.0f) { t = 0.0f; }
+        if (t > 1.0f) { t = 1.0f; }
+
+        for (int i = 0; i < s1.Entities.Count; i = i + 1) {
+            EntityNetState e1 = s1.Entities[i];
+            EntityNetState e0 = s0.FindEntity(e1.EntityId);
+            if (e0 == null) {
+                result.Add(e1.Clone());
+            } else {
+                float x = e0.X + (e1.X - e0.X) * t;
+                float y = e0.Y + (e1.Y - e0.Y) * t;
+                float z = e0.Z + (e1.Z - e0.Z) * t;
+                float yaw = LerpAngle(e0.Yaw, e1.Yaw, t);
+                float vx = e0.Vx + (e1.Vx - e0.Vx) * t;
+                float vy = e0.Vy + (e1.Vy - e0.Vy) * t;
+                float vz = e0.Vz + (e1.Vz - e0.Vz) * t;
+                result.Add(new EntityNetState(e1.EntityId, x, y, z, yaw, vx, vy, vz, e1.Flags));
+            }
+        }
+        return result;
+    }
+
+    private List<EntityNetState> Extrapolate(WorldSnapshot snap, int deltaMs) {
+        List<EntityNetState> result = new List<EntityNetState>();
+        int clamped = deltaMs;
+        if (clamped < 0) { clamped = 0; }
+        if (clamped > this.maxExtrapolateMs) { clamped = this.maxExtrapolateMs; }
+        float dt = (float)clamped * 0.001f;
+        for (int i = 0; i < snap.Entities.Count; i = i + 1) {
+            EntityNetState e = snap.Entities[i];
+            result.Add(new EntityNetState(
+                e.EntityId,
+                e.X + e.Vx * dt,
+                e.Y + e.Vy * dt,
+                e.Z + e.Vz * dt,
+                e.Yaw,
+                e.Vx, e.Vy, e.Vz,
+                e.Flags
+            ));
+        }
+        return result;
+    }
+
+    // 最短弧角度插值（弧度制，处理 -PI..+PI 跨越）
+    public static float LerpAngle(float a, float b, float t) {
+        float pi = 3.14159265f;
+        float twoPi = 6.28318530f;
+        float diff = b - a;
+        while (diff > pi) { diff = diff - twoPi; }
+        while (diff < 0.0f - pi) { diff = diff + twoPi; }
+        return a + diff * t;
+    }
+}
+
+// 客户端预测输入指令与回滚和解缓冲（Client-Side Prediction & Reconciliation）。
+public class ClientInputCmd {
+    public int Seq;
+    public float MoveX;
+    public float MoveY;
+    public float MoveZ;
+    public float Yaw;
+    public int Buttons;
+    public float DtSec;
+
+    public ClientInputCmd(int seq, float mx, float my, float mz, float yaw, int buttons, float dtSec) {
+        this.Seq = seq;
+        this.MoveX = mx;
+        this.MoveY = my;
+        this.MoveZ = mz;
+        this.Yaw = yaw;
+        this.Buttons = buttons;
+        this.DtSec = dtSec;
+    }
+}
+
+public class ClientPredictionBuffer {
+    private List<ClientInputCmd> pending;
+    private int nextSeq;
+
+    public ClientPredictionBuffer() {
+        this.pending = new List<ClientInputCmd>();
+        this.nextSeq = 1;
+    }
+
+    public int PendingCount { get { return this.pending.Count; } }
+
+    public ClientInputCmd RecordInput(float mx, float my, float mz, float yaw, int buttons, float dtSec) {
+        int seq = this.nextSeq;
+        this.nextSeq = this.nextSeq + 1;
+        ClientInputCmd cmd = new ClientInputCmd(seq, mx, my, mz, yaw, buttons, dtSec);
+        this.pending.Add(cmd);
+        return cmd;
+    }
+
+    // 服务器确认到 ackSeq 后丢弃已确认输入，返回仍需在客户端重演的未确认输入列表。
+    public List<ClientInputCmd> AcknowledgeAndPending(int ackSeq) {
+        while (this.pending.Count > 0 && this.pending[0].Seq <= ackSeq) {
+            this.pending.RemoveAt(0);
+        }
+        List<ClientInputCmd> replay = new List<ClientInputCmd>();
+        for (int i = 0; i < this.pending.Count; i = i + 1) {
+            replay.Add(this.pending[i]);
+        }
+        return replay;
+    }
+}
+
+// 轻量 UDP NAT 穿透信令中继（Rendezvous Hub）：
+// 双方客户端向公网信令端口发送 "REG|<room>|<peer>"，中继记录各自公网 (ip, port)，
+// 同房间双端到齐后互推 "PEER|<peer>|<ip>|<port>"，配合 UDP 打洞包实现 P2P 直连。
+public class NatPeerEndpoint {
+    public string Room;
+    public string PeerName;
+    public string PublicIp;
+    public int PublicPort;
+
+    public NatPeerEndpoint(string room, string peerName, string ip, int port) {
+        this.Room = room;
+        this.PeerName = peerName;
+        this.PublicIp = ip;
+        this.PublicPort = port;
+    }
+}
+
+public class NatRendezvousHub : IDisposable {
+    private UdpClient udp;
+    private List<NatPeerEndpoint> entries;
+
+    public NatRendezvousHub(UdpClient socket) {
+        this.udp = socket;
+        this.entries = new List<NatPeerEndpoint>();
+    }
+
+    public static NatRendezvousHub Bind(string host, int port) {
+        UdpClient u = UdpClient.Bind(host, port);
+        if (u == null) { return null; }
+        return new NatRendezvousHub(u);
+    }
+
+    public int RegisteredCount { get { return this.entries.Count; } }
+
+    // 非阻塞处理所有到达的 REG 信令并向同房间的对端广播公网端点。
+    public int Poll() {
+        if (this.udp == null) { return 0; }
+        int handled = 0;
+        for (int i = 0; i < 64; i = i + 1) {
+            string msg = Socket.RecvFromPeer(this.udp.GetSocket(), 512);
+            if (msg == null || msg.Length == 0) { break; }
+            string ip = Socket.PeerIp();
+            int port = Socket.PeerPort();
+            if (ip == null || ip.Length == 0 || port <= 0) { continue; }
+            List<string> parts = msg.Split("|");
+            if (parts.Count >= 3 && parts[0] == "REG") {
+                string room = parts[1];
+                string peer = parts[2];
+                this.RegisterAndNotify(room, peer, ip, port);
+                handled = handled + 1;
+            }
+        }
+        return handled;
+    }
+
+    private void RegisterAndNotify(string room, string peerName, string ip, int port) {
+        NatPeerEndpoint self = null;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            NatPeerEndpoint e = this.entries[i];
+            if (e.Room == room && e.PeerName == peerName) {
+                e.PublicIp = ip;
+                e.PublicPort = port;
+                self = e;
+                break;
+            }
+        }
+        if (self == null) {
+            self = new NatPeerEndpoint(room, peerName, ip, port);
+            this.entries.Add(self);
+        }
+        // 与同房间的其它对端双向交换公网地址
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            NatPeerEndpoint other = this.entries[i];
+            if (other.Room != room || other.PeerName == peerName) { continue; }
+            string toOther = "PEER|" + self.PeerName + "|" + self.PublicIp + "|" + Convert.ToString(self.PublicPort);
+            string toSelf = "PEER|" + other.PeerName + "|" + other.PublicIp + "|" + Convert.ToString(other.PublicPort);
+            this.udp.SendTo(toOther, other.PublicIp, other.PublicPort);
+            this.udp.SendTo(toSelf, self.PublicIp, self.PublicPort);
+        }
+    }
+
+    public void Dispose() {
+        this.entries.Clear();
+        if (this.udp != null) {
+            this.udp.Close();
+            this.udp = null;
+        }
+    }
+}

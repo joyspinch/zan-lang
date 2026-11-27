@@ -18,6 +18,7 @@ public class GltfMaterial {
     public float MetallicFactor;
     public float RoughnessFactor;
     public string AlphaMode;
+    public int BaseColorTextureIndex;
 
     public GltfMaterial() {
         this.Name = "";
@@ -28,6 +29,54 @@ public class GltfMaterial {
         this.MetallicFactor = 0.0f;
         this.RoughnessFactor = 1.0f;
         this.AlphaMode = "OPAQUE";
+        this.BaseColorTextureIndex = -1;
+    }
+}
+
+// glTF 2.0 内嵌或外联图像资源（原始 PNG/JPEG 字节流，支持一键注册到 zan_image 纹理缓存）。
+public class GltfImageData {
+    [DllImport("zan_image")]
+    private static extern int zan_image_load_mem_bytes(string key, nint data, int len);
+
+    public string Name;
+    public string MimeType;
+    public byte[] Bytes;
+    public string RegisteredKey;
+
+    public GltfImageData() {
+        this.Name = "";
+        this.MimeType = "";
+        this.Bytes = new byte[0];
+        this.RegisteredKey = "";
+    }
+
+    // 解码并注册到原生纹理缓存（自动补齐 "mem:" 前缀），返回注册后的纹理键；失败返回 ""。
+    // 返回的键可直接传入 Canvas.DrawMesh3DEx / Canvas.DrawMesh3DSkinned 的 texture 参数。
+    public string RegisterAsTexture(string key) {
+        if (this.Bytes == null || this.Bytes.Length == 0) { return ""; }
+        string finalKey = (key == null || key == "") ? "mem:gltf_img" : key;
+        if (!finalKey.StartsWith("mem:")) { finalKey = "mem:" + finalKey; }
+        nint ptr = NativeMemory.Alloc(this.Bytes.Length);
+        Span<byte> dst = new Span<byte>(ptr, this.Bytes.Length);
+        for (int i = 0; i < this.Bytes.Length; i = i + 1) { dst[i] = this.Bytes[i]; }
+        int w = zan_image_load_mem_bytes(finalKey, ptr, this.Bytes.Length);
+        NativeMemory.Free(ptr);
+        if (w <= 0) { return ""; }
+        this.RegisteredKey = finalKey;
+        return finalKey;
+    }
+}
+
+// glTF 2.0 纹理索引项（指向 Images 中的图像索引）。
+public class GltfTextureInfo {
+    public string Name;
+    public int ImageIndex;
+    public int SamplerIndex;
+
+    public GltfTextureInfo() {
+        this.Name = "";
+        this.ImageIndex = -1;
+        this.SamplerIndex = -1;
     }
 }
 
@@ -48,10 +97,13 @@ public class GltfPrimitive {
     }
 }
 
-// glTF 2.0 解析结果：包含网格图元、材质表、可选骨架（已按父在子前顺序构造成 Game.Animation.Skeleton）。
+// glTF 2.0 解析结果：网格图元、材质表、内嵌纹理、可选骨架与关键帧动画片段（Game.Animation.AnimationClip）。
 public class GltfModel {
     public List<GltfPrimitive> Primitives;
     public List<GltfMaterial> Materials;
+    public List<GltfImageData> Images;
+    public List<GltfTextureInfo> Textures;
+    public List<AnimationClip> Animations;
     public Skeleton Skeleton;
     public int[] JointNodeIndices;
     public float[] InverseBindMatrices;
@@ -59,6 +111,9 @@ public class GltfModel {
     public GltfModel() {
         this.Primitives = new List<GltfPrimitive>();
         this.Materials = new List<GltfMaterial>();
+        this.Images = new List<GltfImageData>();
+        this.Textures = new List<GltfTextureInfo>();
+        this.Animations = new List<AnimationClip>();
         this.Skeleton = null;
         this.JointNodeIndices = new int[0];
         this.InverseBindMatrices = new float[0];
@@ -66,6 +121,29 @@ public class GltfModel {
 
     public int PrimitiveCount { get { return this.Primitives.Count; } }
     public int MaterialCount { get { return this.Materials.Count; } }
+    public int ImageCount { get { return this.Images.Count; } }
+    public int TextureCount { get { return this.Textures.Count; } }
+    public int AnimationCount { get { return this.Animations.Count; } }
+
+    // 按名称查找动画片段；未找到返回 null。
+    public AnimationClip FindAnimation(string name) {
+        if (name == null) { return null; }
+        for (int i = 0; i < this.Animations.Count; i = i + 1) {
+            if (this.Animations[i].Name == name) { return this.Animations[i]; }
+        }
+        return null;
+    }
+
+    // 注册指定材质的 baseColorTexture 到 zan_image 纹理缓存，返回 "mem:..." 纹理键；无纹理或解码失败返回 ""。
+    public string RegisterMaterialBaseColorTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].BaseColorTextureIndex;
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
 }
 
 internal class GltfBufferView {
@@ -166,9 +244,13 @@ public static class GltfLoader {
         List<GltfAccessor> accessors = ParseAccessors(doc);
 
         GltfModel model = new GltfModel();
+        ParseImages(doc, buffers, views, baseDir, model);
+        ParseTextures(doc, model);
         ParseMaterials(doc, model);
         ParseMeshes(doc, buffers, views, accessors, model);
-        ParseFirstSkin(doc, buffers, views, accessors, model);
+        List<GltfNodeInfo> nodes = ParseNodes(doc);
+        Dictionary<int, string> nodeBoneNames = ParseFirstSkin(doc, nodes, buffers, views, accessors, model);
+        ParseAnimations(doc, nodes, nodeBoneNames, buffers, views, accessors, model);
         return model;
     }
 
@@ -276,8 +358,61 @@ public static class GltfLoader {
                     mat.BaseColorB = (float)doc.DoubleAt(b2, 1.0);
                     mat.BaseColorA = (float)doc.DoubleAt(b3, 1.0);
                 }
+                int bct = doc.Get(pbr, "baseColorTexture");
+                if (bct >= 0) {
+                    mat.BaseColorTextureIndex = doc.IntAt(doc.Get(bct, "index"), -1);
+                }
             }
             model.Materials.Add(mat);
+            c = doc.NextSibling(c);
+        }
+    }
+
+    private static void ParseImages(JsonDoc doc, List<byte[]> buffers,
+        List<GltfBufferView> views, string baseDir, GltfModel model) {
+        int arr = doc.Get("images");
+        if (arr < 0) { return; }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            GltfImageData img = new GltfImageData();
+            int nameSlot = doc.Get(c, "name");
+            img.Name = nameSlot >= 0 ? doc.StrOfSlot(nameSlot) : ("image_" + i.ToString());
+            int mimeSlot = doc.Get(c, "mimeType");
+            if (mimeSlot >= 0) { img.MimeType = doc.StrOfSlot(mimeSlot); }
+            int bvIdx = doc.IntAt(doc.Get(c, "bufferView"), -1);
+            if (bvIdx >= 0 && bvIdx < views.Count) {
+                GltfBufferView bv = views[bvIdx];
+                if (bv.BufferIndex >= 0 && bv.BufferIndex < buffers.Count) {
+                    byte[] buf = buffers[bv.BufferIndex];
+                    if (bv.ByteOffset >= 0 && bv.ByteLength > 0 && bv.ByteOffset + bv.ByteLength <= buf.Length) {
+                        img.Bytes = SliceBytes(buf, bv.ByteOffset, bv.ByteLength);
+                    }
+                }
+            } else {
+                int uriSlot = doc.Get(c, "uri");
+                if (uriSlot >= 0) {
+                    string uri = doc.StrOfSlot(uriSlot);
+                    img.Bytes = LoadBufferUri(uri, baseDir);
+                }
+            }
+            model.Images.Add(img);
+            c = doc.NextSibling(c);
+        }
+    }
+
+    private static void ParseTextures(JsonDoc doc, GltfModel model) {
+        int arr = doc.Get("textures");
+        if (arr < 0) { return; }
+        int count = doc.Count(arr);
+        int c = doc.FirstChild(arr);
+        for (int i = 0; i < count && c >= 0; i = i + 1) {
+            GltfTextureInfo tex = new GltfTextureInfo();
+            int nameSlot = doc.Get(c, "name");
+            tex.Name = nameSlot >= 0 ? doc.StrOfSlot(nameSlot) : ("texture_" + i.ToString());
+            tex.ImageIndex = doc.IntAt(doc.Get(c, "source"), -1);
+            tex.SamplerIndex = doc.IntAt(doc.Get(c, "sampler"), -1);
+            model.Textures.Add(tex);
             c = doc.NextSibling(c);
         }
     }
@@ -400,15 +535,11 @@ public static class GltfLoader {
         return gp;
     }
 
-    private static void ParseFirstSkin(JsonDoc doc, List<byte[]> buffers,
-        List<GltfBufferView> views, List<GltfAccessor> accessors, GltfModel model) {
-        int skinsSlot = doc.Get("skins");
-        int nodesSlot = doc.Get("nodes");
-        if (skinsSlot < 0 || doc.Count(skinsSlot) <= 0 || nodesSlot < 0) { return; }
-
-        // 解析全部节点层级
-        int nodeCount = doc.Count(nodesSlot);
+    private static List<GltfNodeInfo> ParseNodes(JsonDoc doc) {
         List<GltfNodeInfo> nodes = new List<GltfNodeInfo>();
+        int nodesSlot = doc.Get("nodes");
+        if (nodesSlot < 0) { return nodes; }
+        int nodeCount = doc.Count(nodesSlot);
         int nc = doc.FirstChild(nodesSlot);
         for (int i = 0; i < nodeCount && nc >= 0; i = i + 1) {
             GltfNodeInfo info = new GltfNodeInfo();
@@ -462,10 +593,18 @@ public static class GltfLoader {
                 }
             }
         }
+        return nodes;
+    }
+
+    private static Dictionary<int, string> ParseFirstSkin(JsonDoc doc, List<GltfNodeInfo> nodes,
+        List<byte[]> buffers, List<GltfBufferView> views, List<GltfAccessor> accessors, GltfModel model) {
+        Dictionary<int, string> nodeBoneNames = new Dictionary<int, string>();
+        int skinsSlot = doc.Get("skins");
+        if (skinsSlot < 0 || doc.Count(skinsSlot) <= 0 || nodes.Count == 0) { return nodeBoneNames; }
 
         int skin0 = doc.FirstChild(skinsSlot);
         int jointsArr = doc.Get(skin0, "joints");
-        if (jointsArr < 0 || doc.Count(jointsArr) <= 0) { return; }
+        if (jointsArr < 0 || doc.Count(jointsArr) <= 0) { return nodeBoneNames; }
         int jCount = doc.Count(jointsArr);
         int[] jointNodes = new int[jCount];
         Dictionary<int, int> nodeToJoint = new Dictionary<int, int>();
@@ -513,6 +652,9 @@ public static class GltfLoader {
                     ? nodes[nIdx].LocalTransform : Transform3D.Identity;
                 skel.AddBone(bName, skelParent, bind);
                 jointToSkel[i] = skel.Count() - 1;
+                if (!nodeBoneNames.ContainsKey(nIdx)) {
+                    nodeBoneNames.Add(nIdx, bName);
+                }
                 added[i] = true;
                 remaining = remaining - 1;
                 progress = true;
@@ -521,6 +663,86 @@ public static class GltfLoader {
         }
         skel.RefreshBind();
         model.Skeleton = skel;
+        return nodeBoneNames;
+    }
+
+    // 解析 glTF 2.0 animations（translation / rotation / scale 轨道），直接产出可被 AnimationPlayer 驱动的 AnimationClip。
+    private static void ParseAnimations(JsonDoc doc, List<GltfNodeInfo> nodes,
+        Dictionary<int, string> nodeBoneNames, List<byte[]> buffers,
+        List<GltfBufferView> views, List<GltfAccessor> accessors, GltfModel model) {
+        int animsSlot = doc.Get("animations");
+        if (animsSlot < 0) { return; }
+        int aCount = doc.Count(animsSlot);
+        int ac = doc.FirstChild(animsSlot);
+        for (int ai = 0; ai < aCount && ac >= 0; ai = ai + 1) {
+            int nameSlot = doc.Get(ac, "name");
+            string clipName = nameSlot >= 0 ? doc.StrOfSlot(nameSlot) : ("anim_" + ai.ToString());
+            AnimationClip clip = new AnimationClip(clipName, 0.0f);
+
+            // 解析 samplers
+            List<int> samplerIn = new List<int>();
+            List<int> samplerOut = new List<int>();
+            List<bool> samplerCubic = new List<bool>();
+            int samplersSlot = doc.Get(ac, "samplers");
+            if (samplersSlot >= 0) {
+                int sCount = doc.Count(samplersSlot);
+                int sc = doc.FirstChild(samplersSlot);
+                for (int si = 0; si < sCount && sc >= 0; si = si + 1) {
+                    samplerIn.Add(doc.IntAt(doc.Get(sc, "input"), -1));
+                    samplerOut.Add(doc.IntAt(doc.Get(sc, "output"), -1));
+                    int interpSlot = doc.Get(sc, "interpolation");
+                    string interp = interpSlot >= 0 ? doc.StrOfSlot(interpSlot) : "LINEAR";
+                    samplerCubic.Add(interp == "CUBICSPLINE");
+                    sc = doc.NextSibling(sc);
+                }
+            }
+
+            // 解析 channels 并写入 AnimationClip 轨道
+            int channelsSlot = doc.Get(ac, "channels");
+            if (channelsSlot >= 0) {
+                int chCount = doc.Count(channelsSlot);
+                int cc = doc.FirstChild(channelsSlot);
+                for (int ci = 0; ci < chCount && cc >= 0; ci = ci + 1) {
+                    int sIdx = doc.IntAt(doc.Get(cc, "sampler"), -1);
+                    int targetSlot = doc.Get(cc, "target");
+                    if (sIdx >= 0 && sIdx < samplerIn.Count && targetSlot >= 0) {
+                        int targetNode = doc.IntAt(doc.Get(targetSlot, "node"), -1);
+                        int pathSlot = doc.Get(targetSlot, "path");
+                        string path = pathSlot >= 0 ? doc.StrOfSlot(pathSlot) : "";
+                        string boneName = "";
+                        if (!nodeBoneNames.TryGetValue(targetNode, out boneName)) {
+                            if (targetNode >= 0 && targetNode < nodes.Count) {
+                                boneName = nodes[targetNode].Name;
+                            }
+                        }
+                        if (boneName != "" && (path == "translation" || path == "rotation" || path == "scale")) {
+                            float[] times = ReadFloatAccessor(samplerIn[sIdx], buffers, views, accessors);
+                            float[] vals = ReadFloatAccessor(samplerOut[sIdx], buffers, views, accessors);
+                            bool cubic = samplerCubic[sIdx];
+                            int comps = path == "rotation" ? 4 : 3;
+                            int rowStride = cubic ? comps * 3 : comps;
+                            int valBase = cubic ? comps : 0;
+                            for (int k = 0; k < times.Length; k = k + 1) {
+                                int off = k * rowStride + valBase;
+                                if (off + comps > vals.Length) { break; }
+                                float t = times[k];
+                                if (path == "translation") {
+                                    clip.AddPositionKey(boneName, t, new Vector3(vals[off], vals[off + 1], vals[off + 2]));
+                                } else if (path == "rotation") {
+                                    clip.AddRotationKey(boneName, t, new Quaternion(vals[off], vals[off + 1], vals[off + 2], vals[off + 3]));
+                                } else if (path == "scale") {
+                                    clip.AddScaleKey(boneName, t, new Vector3(vals[off], vals[off + 1], vals[off + 2]));
+                                }
+                            }
+                        }
+                    }
+                    cc = doc.NextSibling(cc);
+                }
+            }
+
+            model.Animations.Add(clip);
+            ac = doc.NextSibling(ac);
+        }
     }
 
     private static float[] ComputeVertexNormals(float[] pos, int vCount, int[] indices) {
