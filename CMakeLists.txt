@@ -3583,6 +3583,32 @@ if(_gui_driver_args)
   set(_gui_driver_tail ";--driver-dir;$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
+# GPU 后端文字回归：macOS CoreText 文字曾绕过后端直写 CPU 像素，Auto(GL)
+# 下整片空白。文字后再做一次 GPU 绘制并回读，CPU/GPU 两种后端都要见字。
+add_test(NAME conformance_gui_text_gpu_backend
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_gpu_backend_test.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text_gpu_backend.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_text_gpu_backend${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_text_gpu_backend PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+# 标记 p/h1–h6（Typography）正文在 items：须经 AddDocumentText 接上，
+# 否则标题/段落整段空白；label/button 正文不得重复。
+add_test(NAME conformance_gui_markup_typography_text
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/markup_typography_text_test.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_markup_typography_text.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_markup_typography_text${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_markup_typography_text PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 set(_cw_publish_doc "${CMAKE_SOURCE_DIR}/tests/gui/cwpublish")
 set(_cw_publish_cwd "${CMAKE_BINARY_DIR}/cases/cwpublish_cwd")
 file(MAKE_DIRECTORY "${_cw_publish_cwd}")

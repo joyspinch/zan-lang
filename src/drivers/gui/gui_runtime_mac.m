@@ -37,6 +37,10 @@ typedef uint32_t u32;
 extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
 extern void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0,
                                           int *x1, int *y1);
+extern void zan_gui_internal_draw_coverage(i64 id, const char *key, int key_len,
+                                           int key_size, int x, int y, int w,
+                                           int h, const unsigned char *cov,
+                                           u32 color);
 
 /* Defined below; used by the client-side title-bar metrics helpers. */
 i32 zan_gui_get_dpi_scale(void);
@@ -1454,63 +1458,25 @@ static CTLineRef zan_text_line(const char *utf8, CTFontRef font) {
     return line;
 }
 
-static u32 zan_blend(u32 dst, u32 color, unsigned int coverage) {
-    u32 ca = (color >> 24) & 0xFF;
-    if (ca == 0) ca = 255;
-    u32 sa = ca * coverage / 255;
-    if (sa == 0) return dst;
-    u32 sr = (color >> 16) & 0xFF;
-    u32 sg = (color >> 8) & 0xFF;
-    u32 sb = color & 0xFF;
-    u32 da = (dst >> 24) & 0xFF;
-    u32 dr = (dst >> 16) & 0xFF;
-    u32 dg = (dst >> 8) & 0xFF;
-    u32 db = dst & 0xFF;
-    u32 inv = 255 - sa;
-    if (da == 255) {
-        u32 r = (sr * sa + dr * inv) / 255;
-        u32 g = (sg * sa + dg * inv) / 255;
-        u32 b = (sb * sa + db * inv) / 255;
-        return 0xFF000000u | (r << 16) | (g << 8) | b;
-    }
-    u32 da2 = da * inv / 255;
-    u32 oa = sa + da2;
-    if (oa == 0) return 0;
-    u32 r = (sr * sa + dr * da2) / oa;
-    u32 g = (sg * sa + dg * da2) / oa;
-    u32 b = (sb * sa + db * da2) / oa;
-    return (oa << 24) | (r << 16) | (g << 8) | b;
-}
-
 static void zan_draw_text_impl(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size,
     int bold, int angle_deg) {
-    int sw = 0, sh = 0, stride = 0;
-    u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
-    if (!pixels || !utf8 || !*utf8) return;
-
-    /* Honour the surface's active clip window (PushClip) like the shared
-     * renderer does, so glyphs never spill outside a scrolled/nested parent. */
-    int cx0 = 0, cy0 = 0, cx1 = sw, cy1 = sh;
-    zan_gui_internal_surface_clip(surface_id, &cx0, &cy0, &cx1, &cy1);
-
+    if (!utf8 || !*utf8) return;
+    /* 覆盖度交给共享运行时走 surface 后端的 glyph_run（GPU 后端画进 FBO、
+     * CPU 后端照旧混合并遵守 PushClip 裁剪窗）。曾在这里直接写
+     * zan_gui_internal_surface_data() 的像素：GL 后端下那份 CPU 像素既不上传
+     * 又会被下次回读覆盖，macOS 默认 Auto(GL) 时所有文字整片消失。 */
     @autoreleasepool {
         zan_text_entry_t *e = zan_text_lookup(utf8, font_size, bold, angle_deg, true);
         if (!e || !e->mask) return;
-        int tw = e->tw, th = e->th;
-        const unsigned char *mask = e->mask;
-        for (int py = 0; py < th; py++) {
-            int dy = (int)y + e->top + py;
-            if (dy < cy0 || dy >= cy1 || dy < 0 || dy >= sh) continue;
-            for (int px = 0; px < tw; px++) {
-                int dx = (int)x + e->left + px;
-                if (dx < cx0 || dx >= cx1 || dx < 0 || dx >= sw) continue;
-                unsigned int coverage = mask[py * tw + px];
-                if (!coverage) continue;
-                int index = dy * stride + dx;
-                pixels[index] = zan_blend(pixels[index], (u32)color, coverage);
-            }
-        }
+        /* 与 GL glyph_run 一致：alpha 0 视为不透明（旧 CPU 混合即如此）。 */
+        u32 rgba = (u32)color;
+        if (((rgba >> 24) & 0xFF) == 0) rgba |= 0xFF000000u;
+        int key_size = ((int)font_size & 0xFFF) | ((bold ? 1 : 0) << 12) |
+                       (e->angle_deg << 13);
+        zan_gui_internal_draw_coverage(
+            surface_id, e->key, (int)strlen(e->key), key_size,
+            (int)x + e->left, (int)y + e->top, e->tw, e->th, e->mask, rgba);
     }
 }
 
@@ -1885,7 +1851,7 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
 }
 
 EXPORT void zan_gui_set_transparent(iptr hwnd_val, i32 on) {
-    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_transparent(hwnd_val, on));
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_set_transparent(hwnd_val, on));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return;
@@ -1900,7 +1866,7 @@ EXPORT void zan_gui_set_transparent(iptr hwnd_val, i32 on) {
 }
 
 EXPORT void zan_gui_set_click_through(iptr hwnd_val, i32 on) {
-    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_click_through(hwnd_val, on));
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_set_click_through(hwnd_val, on));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return;

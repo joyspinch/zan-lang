@@ -223,6 +223,24 @@ static lsp_sock_t lsp_listen_accept(int port) {
 #endif
     return LSP_INVALID_SOCK;
   }
+  struct sockaddr_in bound;
+  memset(&bound, 0, sizeof(bound));
+#ifdef _WIN32
+  int blen = (int)sizeof(bound);
+#else
+  socklen_t blen = (socklen_t)sizeof(bound);
+#endif
+  if (getsockname(ls, (struct sockaddr *)&bound, &blen) != 0) {
+#ifdef _WIN32
+    closesocket(ls);
+#else
+    close(ls);
+#endif
+    return LSP_INVALID_SOCK;
+  }
+  unsigned int actual_port = (unsigned int)ntohs(bound.sin_port);
+  fprintf(stdout, "zan-lsp: listening on 127.0.0.1:%u\n", actual_port);
+  fflush(stdout);
   lsp_sock_t cs = accept(ls, NULL, NULL);
 #ifdef _WIN32
   closesocket(ls);
@@ -5748,9 +5766,19 @@ static void lsp_worker_loop(lsp_server_t *s) {
 
 int main(int argc, char **argv) {
   int port = 0;
+  bool has_port = false;
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
-      port = atoi(argv[++i]);
+    if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      const char *arg = argv[++i];
+      char *end = NULL;
+      long parsed = strtol(arg, &end, 10);
+      if (!arg[0] || !end || *end != '\0' || parsed < 0 || parsed > 65535) {
+        fprintf(stderr, "zan-lsp: invalid port '%s'\n", arg);
+        return 1;
+      }
+      port = (int)parsed;
+      has_port = true;
+    }
   }
 
   lsp_server_t server;
@@ -5773,7 +5801,7 @@ int main(int argc, char **argv) {
                                               lsp_worker_main, &server) == 0;
 #endif
 
-  if (port > 0) {
+  if (has_port) {
     server.sock = lsp_listen_accept(port);
     if (server.sock == LSP_INVALID_SOCK) {
       fprintf(stderr, "zan-lsp: failed to listen on port %d\n", port);

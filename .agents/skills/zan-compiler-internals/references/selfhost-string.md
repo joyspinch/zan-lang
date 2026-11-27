@@ -116,7 +116,7 @@ h.IndexOf("CD")=-1  h.LastIndexOf("C")=-1  h.EndsWith("CD")=0
   见 `TASKS.md` A390。
 - string 现参与 ARC；fresh producer 通过 OwnedString/AddTemp 登记，赋值先 retain 新值再替换并释放旧值。AddTemp 只去重当前 live 的同 operand，不可把跨 statement 的历史登记当 live。
 - 循环条件分支的 temp 槽释放必须先清 null，避免下轮死臂再次消费旧指针。异步返回先独立 retain/store result，再消费 statement temps；只验证值正确不能证明临时量闭账。
-- 2026-11-11 durable string 11 组在 gen1 `ebe2ded3d5aa19596d3f47785bc030f3ef2a0fab8f6378a79ca2ad13ce333f4e` 实测 134 allocation/134 free，各组 live blocks/bytes 与 bad free 均 0；包含 alias、return、容器、转换/NUL、异常、object 动态所有权及跨 Yield。观测只覆盖生成模块分配，不含 runtime 内部，也不证明所有 API 或并发分配。nullable await 临时实参的独立修补需单独验收。
+- durable string 探针组在 gen1 实测 134 allocation/134 free，各组 live blocks/bytes 与 bad free 均 0；包含 alias、return、容器、转换/NUL、异常、object 动态所有权及跨 Yield。观测只覆盖生成模块分配，不含 runtime 内部，也不证明所有 API 或并发分配。nullable await 临时实参的独立修补需单独验收。
 
 ## 8. string 槽里不一定是托管串（2026-11-23，Mac selfhost_diff 实测）
 

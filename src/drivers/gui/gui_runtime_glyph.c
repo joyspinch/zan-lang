@@ -2,6 +2,8 @@
 
 #define ZAN_TILE_RUN   0
 #define ZAN_TILE_GLYPH 1
+/* 本 TU 之外的平台文字光栅器（Cocoa CoreText）交进来的整串覆盖度。 */
+#define ZAN_TILE_HOST_RUN 2
 
 #define ZAN_ATLAS_INLINE_KEY 32
 
