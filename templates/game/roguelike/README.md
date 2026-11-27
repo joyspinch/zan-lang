@@ -8,6 +8,34 @@ zan Roguelike Deckbuilder — 肉鸽爬塔（模板版）
 - 敌人每回合造成固定伤害，格挡在回合开始清零，易伤让受伤 +50%
 - 每场胜利三选一加牌，牌组一路滚大；死亡或登顶即结算
 
+操作
+----
+| 操作 | 说明 |
+|------|------|
+| 鼠标点「进入」 | 选路线节点（宝箱直接回血拿牌） |
+| 鼠标点手牌 | 出牌；变暗、费用宝石转灰并标「能量不足」的牌打不出 |
+| 「结束回合」 | 弃牌、敌人按意图反击、抽新牌 |
+| `Esc` | 局中弹出"放弃本局？"确认条（再按一次 Esc 收起）；结算页回主菜单；不会一键退出 |
+| `M` | 音效静音开关（顶栏/菜单也有按钮），偏好会记住 |
+
+回合制，不需要暂停：局中离开窗口不会发生任何事。第一次打开（档案里还没开过局）
+菜单会展开一块"新手指引"石板，之后换成"攀登要诀"。
+
+战绩与音效
+----------
+- **战绩**（`GameProfile.Open("roguelike")`）：开局次数、登顶次数、到过的最高层、
+  最快登顶（全局累计回合数，越少越好）。菜单页常驻显示；结算页显示本局回合数，
+  刷新纪录时出现 **NEW BEST**。
+- **存在哪**：用户应用数据目录下 `ZanGames/roguelike/`（macOS
+  `~/Library/Application Support`、Windows `%LOCALAPPDATA%`、Linux
+  `~/.local/share`）；设 `ZAN_GAME_DATA_DIR` 可改根目录。不写工作目录。
+  单局进度本身不存档（肉鸽：一局一命）。
+- **音效**（程序化合成，零音频文件）：出牌 select、造成伤害 hit、获得格挡
+  block（本作自配的下滑闷响）、击败敌人 explode、拿奖励/开宝箱 coin、
+  阵亡 fail、登顶 success、界面按钮 click、出牌失败 error。没有声卡时静默。
+- **确定性**：外壳（`RogueShell`）只在界面层调用，`RunFlow` / `RoguelikeSim`
+  不碰声音、档案和时钟，所以同种子同一局、`replays/bot.replay` 不受影响。
+
 种子
 ----
 - 顶栏和结算页都显示本局**种子**
@@ -19,16 +47,14 @@ zan Roguelike Deckbuilder — 肉鸽爬塔（模板版）
 
 编译
 ----
-`zanc` **不会自动带上同目录的其它 .zan**，多文件模板要把源文件一次列全：
+把入口和整个 `src/` 目录一起交给 zanc：
 
-    zanc src/main.zan src/Program.zan src/CardLibrary.zan src/MapNode.zan src/RunState.zan \
-        --auto-stdlib -o roguelike.exe
+    zanc src/main.zan src --auto-stdlib --embed assets=assets -o roguelike.exe
 
 在仓库里（带仓库内的包）：
 
-    zanc templates/game/roguelike/src/main.zan templates/game/roguelike/src/Program.zan \
-        templates/game/roguelike/src/CardLibrary.zan templates/game/roguelike/src/MapNode.zan \
-        templates/game/roguelike/src/RunState.zan --auto-stdlib --package-project . -o roguelike.exe
+    zanc templates/game/roguelike/src/main.zan templates/game/roguelike/src --auto-stdlib \
+        --package-project . --embed templates/game/roguelike/assets=assets -o roguelike.exe
 
 美术素材
 --------
@@ -56,7 +82,11 @@ zan Roguelike Deckbuilder — 肉鸽爬塔（模板版）
 | 文件 | 职责 |
 |------|------|
 | `src/main.zan` | 入口：起窗，把控制权交给 Program |
-| `src/Program.zan` | 阶段状态机 + 全部界面（菜单/路线/战斗/奖励/结算） |
+| `src/Program.zan` | 阶段状态机 + 全部界面（菜单/路线/战斗/奖励/结算）+ 快捷键与音效触发 |
+| `src/RunFlow.zan` | 一局的流程与规则（无界面，回放与界面共用） |
+| `src/RoguelikeSim.zan` | 无头回放/机器人模糊测试（`replays/bot.replay`） |
+| `src/RogueShell.zan` | 外壳：玩家档案（战绩、静音）+ 音效库，只给界面层用 |
+| `src/RogueSkin.zan` | 游戏皮肤：暗石 + 熔金 + 余烬 + 深红的 CSS 与语义类（`rg-*`），`app.UseCss` 内嵌进 exe |
 | `src/RunState.zan` | 一局的状态：种子、层数、生命、牌组、当前层候选节点 |
 | `src/CardLibrary.zan` | 全部牌面定义 + 起始牌组 + 奖励池 |
 | `src/MapNode.zan` | 一个路线节点（普通/精英/宝箱/Boss） |

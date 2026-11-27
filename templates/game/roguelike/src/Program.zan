@@ -10,15 +10,23 @@ using Game.Kit;
 
 // 肉鸽爬塔（卡牌构筑）——应用壳与阶段状态机。
 //
-// 界面全部由标准库控件（Panel / Label / Button / InputNumber）拼出，
-// 不自绘：任何状态变化都重建整棵控件树（RemoveAll + 重新 With）。
+// 界面全部由标准库控件（Panel / Label / Button / InputNumber / Progress / Image）
+// 拼出，不自绘：任何状态变化都重建整棵控件树（RemoveAll + 重新 With）。
 // 状态少的时候这样最省心，也让"界面 = 状态的函数"这件事一目了然。
+//
+// 外观只走语义类 + 游戏皮肤（RogueSkin.Css，app.UseCss 内嵌进 exe）：
+// 暗色石砌塔、熔金、余烬橙与深红，取自标题图。卡牌是"内容为一列牌面的
+// 标准 Button"，能量不足就是禁用态——悬停/按下/焦点/禁用都由皮肤给出。
 //
 // 战斗结算交给引擎的 Game.Cards：CardBattle 管能量/抽牌/弃牌/胜负，
 // CardDeck 管三区牌堆，CardDefinition 是共享牌面模板。本文件只负责
 // 流程编排与展示，不重复实现任何卡牌规则。
 //
 // 阶段：0 主菜单 · 1 路线选择 · 2 战斗 · 3 战后奖励 · 4 结算
+//
+// 外壳（RogueShell）：跨局统计与静音落盘、事件音效——只在本层调用，
+// RunFlow 与无头回放永远不碰，种子确定性不受影响。
+// 快捷键：M 静音；Esc 局中弹出"放弃本局？"确认条（不再一键退出），结算页回菜单。
 public class Program {
     Form form;
     App app;
@@ -26,20 +34,36 @@ public class Program {
 
     // 流程与规则（无界面），见 RunFlow
     RunFlow flow;
+    // 档案 + 音效
+    RogueShell shell;
+    // Esc 局中确认条是否展开
+    bool confirmQuit;
+    // 本局结算是否已记入档案（只记一次）
+    bool endRecorded;
 
     // 入口在 src/main.zan（RoguelikeApp.Main）——全工程只留一个入口，
     // 两个 Main 会让链接期挑错启动函数。
     void Run() {
         this.flow = new RunFlow();
+        this.shell = new RogueShell();
+        this.confirmQuit = false;
+        this.endRecorded = false;
 
         form = Form.CreateDark("肉鸽爬塔 · Roguelike Deckbuilder (Zan)", 1280, 820);
         app = form.GetApp();
-        app.UseSkin("graphite");
+        // 游戏自己的皮肤（不叠桌面皮肤）：未声明的部分落回 Gui 内嵌的 base.css。
+        app.UseCss(RogueSkin.Css());
+        UiDriver.Enable(app);
 
         root = Panel.Column();
-        root.Pad(16);
-        root.Gap(12);
+        root.Class = "rg-root";
+        // Esc / M：没被控件消费的按键都走应用级出口（焦点在哪都收得到，
+        // 种子输入框里打字不会触发）。
+        app.OnUnhandledKey((int key) => { this.OnKey(key); });
+        root.Pad(22);
+        root.Gap(14);
         form.Add(root);
+        form.FrameHook(() => { this.PublishProbes(); });
 
         this.BuildUi();
         form.Run();
@@ -54,6 +78,7 @@ public class Program {
     // 的新控件不会收到同一次点击的尾巴，实测无需额外认领点击。
     void BuildUi() {
         root.RemoveAll();
+        if (this.confirmQuit) { this.BuildConfirm(); }
         if (this.flow.phase == 0) { this.BuildMenu(); }
         else if (this.flow.phase == 1) { this.BuildMap(); }
         else if (this.flow.phase == 2) { this.BuildBattle(); }
@@ -62,313 +87,660 @@ public class Program {
         app.RequestRedraw();
     }
 
-    // 顶栏：阶段标题 + 本局关键数值。
-    void BuildTopBar(string title) {
-        Panel bar = Panel.Row();
-        bar.Class = "card";
-        bar.Pad(10);
-        bar.Gap(18);
-        Label head = new Label(title);
-        head.Class = "title medium strong";
-        bar.With(head);
-        Label seedLabel = new Label("种子 " + Convert.ToString(this.flow.run.Seed()));
-        seedLabel.Class = "small secondary";
-        bar.With(seedLabel);
-        Label hpLabel = new Label("生命 "
-            + Convert.ToString(this.flow.run.Hp()) + "/" + Convert.ToString(this.flow.run.MaxHp()));
-        hpLabel.Class = "medium green";
-        bar.With(hpLabel);
-        Label deckLabel = new Label("牌组 " + Convert.ToString(this.flow.run.Deck().Count) + " 张");
-        deckLabel.Class = "medium";
-        bar.With(deckLabel);
-        Label goldLabel = new Label("金币 " + Convert.ToString(this.flow.run.Gold()));
-        goldLabel.Class = "medium yellow";
-        bar.With(goldLabel);
+    // ---- 快捷键 ------------------------------------------------------------
+
+    // M 切静音；Esc：确认条开着就收起，局中展开确认条，结算页回菜单，菜单页不动作。
+    void OnKey(int key) {
+        if (key == 77) {
+            this.shell.ToggleMute();
+            this.BuildUi();
+            return;
+        }
+        if (key != 27) { return; }
+        if (this.confirmQuit) {
+            this.confirmQuit = false;
+            this.shell.Play("click");
+        } else if (this.flow.phase >= 1 && this.flow.phase <= 3) {
+            this.confirmQuit = true;
+            this.shell.Play("click");
+        } else if (this.flow.phase == 4) {
+            this.GoMenu();
+            return;
+        } else {
+            return;
+        }
+        this.BuildUi();
+    }
+
+    // 局中 Esc 的确认条：继续 / 放弃回菜单（深红警示石板）。
+    void BuildConfirm() {
+        Panel bar = this.Row("rg-panel rg-panel-danger");
+        bar.Pad(14);
+        bar.Gap(14);
+        this.Mid(bar);
+        Panel words = this.Col("rg-fill");
+        words.Gap(2);
+        words.With(this.Txt("放弃本局并回到主菜单？", "rg-h2 rg-red"));
+        words.With(this.Txt("本局进度不会保存；战绩里的开局次数照记。", "rg-dim"));
+        bar.With(words);
+        Button stay = new Button("继续爬塔（Esc）");
+        stay.Class = "rg-cta";
+        stay.OnClick(() => { this.confirmQuit = false; this.shell.Play("click"); this.BuildUi(); });
+        bar.With(stay);
+        Button leave = new Button("放弃本局");
+        leave.Class = "rg-danger";
+        leave.OnClick(() => { this.GoMenu(); });
+        bar.With(leave);
         root.With(bar);
     }
 
-    // 主菜单：选种子开局。
+    void GoMenu() {
+        this.confirmQuit = false;
+        this.flow.phase = 0;
+        this.shell.Play("click");
+        this.BuildUi();
+    }
+
+    // 静音开关按钮（顶栏与菜单共用）。
+    Button MuteButton() {
+        Button b = new Button(this.shell.Muted() ? "音效：关（M）" : "音效：开（M）");
+        b.Class = "rg-chip";
+        b.OnClick(() => { this.shell.ToggleMute(); this.BuildUi(); });
+        return b;
+    }
+
+    // 自动化探针（ZAN_UI_SCRIPT 驱动时才发布）。
+    void PublishProbes() {
+        if (!UiDriver.Active()) { return; }
+        UiDriver.SetProbe("rogue.phase", Convert.ToString(this.flow.phase));
+        UiDriver.SetProbe("rogue.confirm", this.confirmQuit ? "1" : "0");
+        UiDriver.SetProbe("rogue.muted", this.shell.Muted() ? "1" : "0");
+        UiDriver.SetProbe("rogue.runs", Convert.ToString(this.shell.Runs()));
+        UiDriver.SetProbe("rogue.bestFloor", Convert.ToString(this.shell.BestFloor()));
+        UiDriver.SetProbe("rogue.newBest", (this.shell.NewBestFloor() ? "floor " : "")
+            + (this.shell.NewFastest() ? "fastest" : ""));
+    }
+
+    // ---- 控件小工厂（只挂语义类，外观全在 RogueSkin） ------------------------
+
+    Panel Col(string cls) {
+        Panel p = Panel.Column();
+        if (cls != "") { p.Class = cls; }
+        return p;
+    }
+
+    Panel Row(string cls) {
+        Panel p = Panel.Row();
+        if (cls != "") { p.Class = cls; }
+        return p;
+    }
+
+    Label Txt(string text, string cls) {
+        Label l = new Label(text);
+        l.Class = cls;
+        return l;
+    }
+
+    // 交叉轴居中（行里竖直居中、列里水平居中）。
+    Panel Mid(Panel p) {
+        p.Class = (p.Class == null || p.Class == "") ? "rg-mid" : p.Class + " rg-mid";
+        return p;
+    }
+
+    // 横向占位：把后面的控件推到行尾。
+    Panel Spacer() { return this.Row("rg-spacer"); }
+
+    // 生命条：标准 Progress，皮肤给它石槽 + 绿/红填充。
+    Progress Bar(int value, int max, string cls) {
+        int pct = max > 0 ? value * 100 / max : 0;
+        if (pct < 0) { pct = 0; }
+        if (pct > 100) { pct = 100; }
+        Progress p = new Progress(pct, 1);
+        p.IsShowText = false;
+        p.SwitchClass("rg-bar", true);
+        p.SwitchClass(cls, true);
+        return p;
+    }
+
+    // 数值砖：大号数字 + 小字说明（菜单战绩、结算页共用）。
+    Panel Tile(string value, string caption, string valueCls) {
+        Panel t = this.Col("rg-tile");
+        t.Pad(10);
+        t.Gap(2);
+        t.With(this.Txt(value, "rg-big rg-center " + valueCls));
+        t.With(this.Txt(caption, "rg-cap rg-center"));
+        return t;
+    }
+
+    // 素材图；找不到素材返回 null，调用方不加（不崩、不留空框）。
+    Image Art(string rel, string alt, string cls) {
+        string path = this.ArtPath(rel);
+        if (path == "") { return null; }
+        Image img = new Image(path, alt, "cover");
+        img.Class = cls;
+        return img;
+    }
+
+    // 顶栏：阶段标题 + 本局关键数值（生命条、牌组、金币、种子）+ 静音。
+    void BuildTopBar(string title) {
+        Panel bar = this.Row("rg-topbar");
+        bar.Pad(12);
+        bar.Gap(18);
+        bar.With(this.Txt(title, "rg-h2"));
+        Panel hp = this.Row("");
+        hp.Gap(8);
+        this.Mid(hp);
+        hp.With(this.Txt("生命", "rg-dim"));
+        hp.With(this.Bar(this.flow.run.Hp(), this.flow.run.MaxHp(), "rg-hp rg-bar-small"));
+        hp.With(this.Txt(Convert.ToString(this.flow.run.Hp()) + "/"
+            + Convert.ToString(this.flow.run.MaxHp()), "rg-text rg-green"));
+        bar.With(hp);
+        bar.With(this.Txt("牌组 " + Convert.ToString(this.flow.run.Deck().Count) + " 张", "rg-text"));
+        bar.With(this.Txt("金币 " + Convert.ToString(this.flow.run.Gold()), "rg-text rg-gold"));
+        bar.With(this.Txt("种子 " + Convert.ToString(this.flow.run.Seed()), "rg-dim"));
+        bar.With(this.Spacer());
+        bar.With(this.Txt(this.flow.phase == 4 ? "Esc 回主菜单" : "Esc 放弃本局", "rg-dim"));
+        bar.With(this.MuteButton());
+        root.With(bar);
+    }
+
+    // ---- 主菜单 ------------------------------------------------------------
+
+    // 主菜单：左边标题图与题名，右边开局 / 战绩 / 指引三块石板，铺满整窗。
     void BuildMenu() {
-        Panel hero = new Panel("hero");
-        hero.Pad(20);
-        hero.Gap(10);
+        Panel page = this.Row("rg-fill");
+        page.Gap(28);
 
-        // 标题图：素材在 assets/ 下，找不到就只留文字标题（不崩、不留空框）。
-        string titleArt = this.ArtPath("assets/title.png");
-        if (titleArt != "") {
-            hero.With(this.SizedImage(titleArt, "肉鸽爬塔", 160));
-        }
+        Panel hero = this.Col("");
+        hero.Gap(6);
+        hero.Class = "rg-mid rg-vcenter";
+        Image art = this.Art("assets/title.png", "肉鸽爬塔", "rg-hero-art");
+        if (art != null) { hero.With(art); }
+        hero.With(this.Txt("肉鸽爬塔", "rg-h1 rg-center"));
+        hero.With(this.Txt("ROGUELIKE  ·  DECKBUILDER", "rg-sub rg-center"));
+        page.With(hero);
 
-        Label title = new Label("肉鸽爬塔");
-        title.Class = "title large strong";
-        hero.With(title);
+        Panel side = this.Col("rg-fill");
+        side.Gap(16);
+        side.With(this.MenuStartPanel());
+        side.With(this.MenuStatsPanel());
+        side.With(this.MenuGuidePanel());
+        page.With(side);
+        root.With(page);
+    }
 
-        Label desc = new Label(
-            "爬塔三层，每层二选一：战斗换牌，宝箱回血换牌。\n"
-            + "同一颗种子必然给出同一张地图、同一批敌人、同一组奖励三选一。");
-        desc.Class = "medium secondary";
-        hero.With(desc);
-
-        Panel row = Panel.Row();
+    // 开局石板：玩法一句话 + 种子 + 开局按钮。
+    Panel MenuStartPanel() {
+        Panel box = this.Col("rg-panel rg-panel-gold");
+        box.Pad(20);
+        box.Gap(10);
+        box.With(this.Txt("开始攀登", "rg-h2"));
+        box.With(this.Txt("爬塔三层，每层二选一：战斗换牌，宝箱回血换牌。", "rg-text"));
+        box.With(this.Txt("同一颗种子必然给出同一张地图、同一批敌人、同一组奖励三选一。", "rg-dim"));
+        Panel row = this.Row("");
         row.Gap(12);
+        this.Mid(row);
         InputNumber seedBox = new InputNumber(1, 999999999);
         seedBox.Hint("种子");
         seedBox.SetValue(this.DefaultSeed());
-        seedBox.Prefer(220, 40);
+        seedBox.SwitchClass("rg-seed", true);
+        seedBox.Prefer(230, 44);
         row.With(seedBox);
         Button start = new Button("用此种子开局");
-        start.Class = "primary";
+        start.Class = "rg-cta rg-big-btn";
         start.OnClick(() => { this.StartRun(seedBox.Value.Get()); });
         row.With(start);
         Button random = new Button("随机种子");
+        random.Class = "rg-btn";
         random.OnClick(() => { this.StartRun(this.RandomSeed()); });
         row.With(random);
-        hero.With(row);
-
+        box.With(row);
         if (this.flow.run != null) {
+            Panel againRow = this.Row("");
             Button again = new Button("重开上一局（种子 "
                 + Convert.ToString(this.flow.run.Seed()) + "）");
+            again.Class = "rg-btn";
             again.OnClick(() => { this.StartRun(this.flow.run.Seed()); });
-            hero.With(again);
+            againRow.With(again);
+            box.With(againRow);
         }
-        root.With(hero);
+        return box;
     }
 
-    // 路线选择：本层的候选节点。
+    // 战绩石板：跨局累计（档案落在用户数据目录，见 RogueShell）。
+    Panel MenuStatsPanel() {
+        Panel box = this.Col("rg-panel");
+        box.Pad(18);
+        box.Gap(12);
+        Panel head = this.Row("");
+        this.Mid(head);
+        head.With(this.Txt("战绩", "rg-h2"));
+        head.With(this.Spacer());
+        head.With(this.MuteButton());
+        box.With(head);
+        Panel tiles = this.Row("");
+        tiles.Gap(12);
+        tiles.With(this.Tile(Convert.ToString(this.shell.Runs()), "已开局", ""));
+        tiles.With(this.Tile(Convert.ToString(this.shell.Wins()), "登顶次数", "rg-green"));
+        tiles.With(this.Tile("第 " + Convert.ToString(this.shell.BestFloor()) + " 层", "最高到达", "rg-ember"));
+        string fastest = this.shell.HasFastest() ? Convert.ToString(this.shell.FastestTurns()) + " 回合" : "—";
+        tiles.With(this.Tile(fastest, "最快登顶", "rg-teal"));
+        box.With(tiles);
+        return box;
+    }
+
+    // 指引石板：第一次玩展开成新手指引，之后换成"攀登要诀"；底部是三类卡牌图例。
+    Panel MenuGuidePanel() {
+        Panel box = this.Col("rg-panel rg-fill");
+        box.Pad(18);
+        box.Gap(8);
+        if (this.shell.Runs() == 0) {
+            box.With(this.Txt("新手指引", "rg-h2 rg-ember"));
+            box.With(this.Txt("1. 路线页点「进入」选一条路；宝箱直接回血拿牌。", "rg-text"));
+            box.With(this.Txt("2. 战斗中点手牌出牌，每回合 3 点能量；变暗的牌表示能量不足。", "rg-text"));
+            box.With(this.Txt("3. 出完牌点「结束回合」，敌人按意图反击；格挡先吃伤害。", "rg-text"));
+            box.With(this.Txt("4. 每场胜利三选一加牌，打败第 3 层的 Boss 即登顶。", "rg-text"));
+        } else {
+            box.With(this.Txt("攀登要诀", "rg-h2 rg-ember"));
+            box.With(this.Txt("· 精英更难但奖励更好；血量吃紧时宝箱能救命。", "rg-text"));
+            box.With(this.Txt("· 先看敌人意图：伤害高的回合优先叠格挡。", "rg-text"));
+            box.With(this.Txt("· 能力牌越早打越值——力量对之后每一击都生效。", "rg-text"));
+        }
+        box.With(this.Spacer());
+        Panel legend = this.Row("");
+        legend.Gap(14);
+        this.Mid(legend);
+        legend.With(this.LegendItem("assets/cards/attack.png", "攻击", "造成伤害", "rg-type-attack"));
+        legend.With(this.LegendItem("assets/cards/skill.png", "技能", "格挡 · 治疗 · 抽牌", "rg-type-skill"));
+        legend.With(this.LegendItem("assets/cards/power.png", "能力", "力量 · 能量", "rg-type-power"));
+        box.With(legend);
+        box.With(this.Txt("快捷键：M 静音 · Esc 局中放弃本局（会先确认）", "rg-dim"));
+        return box;
+    }
+
+    Panel LegendItem(string art, string name, string desc, string typeCls) {
+        Panel item = this.Row("rg-fill");
+        item.Gap(10);
+        this.Mid(item);
+        Image img = this.Art(art, name, "rg-legend-art");
+        if (img != null) { item.With(img); }
+        Panel words = this.Col("");
+        words.Gap(2);
+        words.With(this.Txt(name, "rg-h2 " + typeCls));
+        words.With(this.Txt(desc, "rg-dim"));
+        item.With(words);
+        return item;
+    }
+
+    // ---- 路线 --------------------------------------------------------------
+
+    // 路线选择：楼层进度珠 + 本层的候选路线牌。
     void BuildMap() {
         this.BuildTopBar("第 " + Convert.ToString(this.flow.run.Floor()) + " 层 · 选一条路");
-        Panel row = Panel.Row();
-        row.Gap(16);
+        root.With(this.FloorTrack());
+        Panel row = this.Row("rg-fill rg-center");
+        row.Gap(48);
         for (int i = 0; i < this.flow.run.Nodes().Count; i = i + 1) {
             row.With(this.NodeCard(this.flow.run.Nodes()[i]));
         }
         root.With(row);
-        Label hint = new Label("提示：精英怪更难但奖励更好；宝箱保命但只给一张牌。");
-        hint.Class = "small secondary";
-        root.With(hint);
+        root.With(this.Txt("提示：精英怪更难但奖励更好；宝箱保命但只给一张牌。", "rg-dim rg-center"));
     }
 
-    // 单个路线节点卡片。节点作为参数传入，闭包捕获的是本次调用的参数，
+    // 三层进度：走过的层暗金，当前层熔金高亮，Boss 层标出来。
+    Panel FloorTrack() {
+        Panel track = this.Row("rg-center");
+        track.Gap(10);
+        for (int f = 1; f <= 3; f = f + 1) {
+            if (f > 1) { track.With(this.Txt("———", "rg-pip-link")); }
+            string text = "第 " + Convert.ToString(f) + " 层" + (f == 3 ? " · Boss" : "");
+            string cls = "rg-pip";
+            if (f < this.flow.run.Floor()) { cls = "rg-pip rg-pip-done"; }
+            else if (f == this.flow.run.Floor()) { cls = "rg-pip rg-pip-now"; }
+            track.With(this.Txt(text, cls));
+        }
+        return track;
+    }
+
+    // 单个路线牌。节点作为参数传入，闭包捕获的是本次调用的参数，
     // 不会串到别的节点上。
     Panel NodeCard(MapNode node) {
-        Panel box = new Panel("node");
-        box.Pad(14);
-        box.Gap(8);
-        box.Prefer(300, 170);
-        Label kind = new Label(node.KindName());
-        kind.Class = "title medium strong yellow";
-        box.With(kind);
-        Label desc = new Label(node.Desc());
-        desc.Class = "small secondary";
-        box.With(desc);
+        string kindCls = "";
+        string kindText = "rg-node-kind";
+        string art = "assets/cards/attack.png";
+        if (node.Kind() == 1) { kindCls = " rg-node-elite"; kindText = "rg-node-kind rg-node-elite-kind"; }
+        else if (node.Kind() == 2) { kindCls = " rg-node-chest"; art = "assets/cards/power.png"; }
+        else if (node.Kind() == 3) { kindCls = " rg-node-boss"; kindText = "rg-node-kind rg-node-boss-kind"; art = "assets/title.png"; }
+        Panel box = this.Col("rg-node" + kindCls);
+        box.Pad(18);
+        box.Gap(10);
+        box.With(this.Txt(node.KindName(), kindText));
+        Image img = this.Art(art, node.KindName(), "rg-node-art");
+        if (img != null) { box.With(img); }
+        if (node.Kind() == 2) {
+            box.With(this.Txt("宝箱", "rg-text rg-gold rg-center"));
+        } else {
+            box.With(this.Txt(node.EnemyName(), "rg-text rg-center"));
+        }
+        box.With(this.Txt(node.Kind() == 2 ? node.Desc()
+            : Convert.ToString(node.Hp()) + " 生命 · 每回合 " + Convert.ToString(node.Damage()) + " 伤害",
+            "rg-dim rg-center"));
         Button go = new Button("进入");
-        go.Class = "primary";
+        go.Class = "rg-cta";
         go.OnClick(() => { this.EnterNode(node); });
         box.With(go);
         return box;
     }
 
-    // 战斗界面：敌人条 / 玩家条 / 手牌 / 操作行。
+    // ---- 战斗 --------------------------------------------------------------
+
+    // 战斗界面：顶栏 / 我方石板 · 敌人意图 · 敌方石板 / 能量与结束回合 / 手牌。
     void BuildBattle() {
         this.BuildTopBar("第 " + Convert.ToString(this.flow.run.Floor()) + " 层 · 战斗");
+        CardBattle battle = this.flow.battle;
 
-        Panel enemyBar = Panel.Row();
-        enemyBar.Class = "card";
-        enemyBar.Pad(10);
-        enemyBar.Gap(16);
-        Label enemyName = new Label(this.flow.battle.Enemy().Id());
-        enemyName.Class = "title medium strong red";
-        enemyBar.With(enemyName);
-        Label enemyHp = new Label("生命 " + Convert.ToString(this.flow.battle.Enemy().Hp())
-            + "/" + Convert.ToString(this.flow.battle.Enemy().MaxHp()));
-        enemyHp.Class = "medium";
-        enemyBar.With(enemyHp);
-        Label intent = new Label("意图：每回合 "
-            + Convert.ToString(this.flow.battle.EnemyDamage()) + " 点伤害");
-        intent.Class = "small secondary";
-        enemyBar.With(intent);
-        root.With(enemyBar);
+        Panel arena = this.Row("");
+        arena.Gap(18);
+        arena.With(this.ActorPanel("攀登者", battle.Player(), false));
+        arena.With(this.IntentPanel());
+        arena.With(this.ActorPanel(battle.Enemy().Id(), battle.Enemy(), true));
+        root.With(arena);
 
-        Panel playerBar = Panel.Row();
-        playerBar.Class = "card";
-        playerBar.Pad(10);
-        playerBar.Gap(16);
-        Label hp = new Label("生命 " + Convert.ToString(this.flow.battle.Player().Hp())
-            + "/" + Convert.ToString(this.flow.battle.Player().MaxHp()));
-        hp.Class = "medium green";
-        playerBar.With(hp);
-        Label block = new Label("格挡 " + Convert.ToString(this.flow.battle.Player().Block()));
-        block.Class = "medium cyan";
-        playerBar.With(block);
-        Label strength = new Label("力量 " + Convert.ToString(this.flow.battle.Player().Strength()));
-        strength.Class = "medium yellow";
-        playerBar.With(strength);
-        Label energy = new Label("能量 " + Convert.ToString(this.flow.battle.Energy())
-            + "/" + Convert.ToString(this.flow.battle.MaxEnergy()));
-        energy.Class = "medium strong";
-        playerBar.With(energy);
-        Label turn = new Label("回合 " + Convert.ToString(this.flow.battle.Turn()));
-        turn.Class = "medium";
-        playerBar.With(turn);
-        root.With(playerBar);
+        Panel strip = this.Row("");
+        strip.Gap(16);
+        this.Mid(strip);
+        Panel orb = this.Col(battle.Energy() > 0 ? "rg-energy" : "rg-energy rg-energy-empty");
+        orb.With(this.Txt(Convert.ToString(battle.Energy()) + "/" + Convert.ToString(battle.MaxEnergy()), "rg-energy-num"));
+        orb.With(this.Txt("能量", "rg-energy-cap"));
+        strip.With(orb);
+        Panel piles = this.Col("");
+        piles.Gap(4);
+        piles.With(this.Txt("抽牌堆 " + Convert.ToString(battle.Deck().DrawPile().Count())
+            + " 张 · 弃牌堆 " + Convert.ToString(battle.Deck().DiscardPile().Count()) + " 张", "rg-text"));
+        piles.With(this.Txt(this.flow.lastNote != "" ? "上一张：" + this.flow.lastNote
+            : "点手牌出牌；变暗的牌能量不足。", "rg-dim"));
+        strip.With(piles);
+        strip.With(this.Spacer());
+        Button endTurn = new Button("结束回合");
+        endTurn.Class = "rg-cta rg-big-btn";
+        endTurn.OnClick(() => { this.EndTurn(); });
+        strip.With(endTurn);
+        root.With(strip);
 
-        Panel hand = Panel.Row();
-        hand.Gap(10);
-        CardZone zone = this.flow.battle.Deck().Hand();
+        Panel hand = this.Row("rg-hand");
+        hand.Gap(12);
+        CardZone zone = battle.Deck().Hand();
+        // 手牌超过 6 张（连抽）时换窄牌，整手仍排得下一行。
+        bool tight = zone.Count() > 6;
         for (int i = 0; i < zone.Count(); i = i + 1) {
-            CardDefinition def = zone.At(i).Definition();
-            if (this.flow.battle.CanPlay(i)) {
-                hand.With(this.CardTile(def, i, true));
-            } else {
-                // 能量不够的牌不给按钮，避免误点；灰字仍显示牌面信息。
-                hand.With(this.CardTile(def, i, false));
-            }
+            // 能量不够的牌是禁用态的卡：照样展示牌面，但点不动。
+            Button card = this.CardTile(zone.At(i).Definition(), i, battle.CanPlay(i));
+            if (tight) { card.Class = card.Class + " rg-card-tight"; }
+            hand.With(card);
         }
         root.With(hand);
-
-        Panel actions = Panel.Row();
-        actions.Gap(14);
-        Button endTurn = new Button("结束回合");
-        endTurn.Class = "primary";
-        endTurn.OnClick(() => { this.EndTurn(); });
-        actions.With(endTurn);
-        Label piles = new Label("抽牌堆 " + Convert.ToString(this.flow.battle.Deck().DrawPile().Count())
-            + " · 弃牌堆 " + Convert.ToString(this.flow.battle.Deck().DiscardPile().Count()));
-        piles.Class = "small secondary";
-        actions.With(piles);
-        root.With(actions);
-
-        if (this.flow.lastNote != "") {
-            Label note = new Label(this.flow.lastNote);
-            note.Class = "small";
-            root.With(note);
-        }
     }
 
-    // 手牌牌面：上图下按钮（像一张真卡）。索引作为参数传入，闭包不会串牌。
-    // 没有卡面素材时退化成纯文字牌，牌照样能打。
-    Panel CardTile(CardDefinition def, int index, bool playable) {
-        Panel tile = Panel.Column();
-        tile.Class = "card";
-        tile.Pad(8);
-        tile.Gap(4);
-        string art = this.ArtPath(def.Art());
-        if (art != "") {
-            tile.With(this.SizedImage(art, def.Name(), 88));
+    // 角色石板：名字、生命条、格挡/力量/易伤状态。
+    Panel ActorPanel(string name, CardActor actor, bool enemy) {
+        Panel box = this.Col(enemy ? "rg-panel rg-enemy" : "rg-panel rg-actor");
+        box.Pad(18);
+        box.Gap(10);
+        Panel head = this.Row("");
+        this.Mid(head);
+        head.With(this.Txt(name, enemy ? "rg-h2 rg-red" : "rg-h2"));
+        head.With(this.Spacer());
+        if (enemy && this.flow.bossFight) { head.With(this.Txt("BOSS", "rg-cap rg-ember")); }
+        box.With(head);
+        box.With(this.Bar(actor.Hp(), actor.MaxHp(), enemy ? "rg-ehp" : "rg-hp"));
+        box.With(this.Txt("生命 " + Convert.ToString(actor.Hp()) + " / " + Convert.ToString(actor.MaxHp()),
+            enemy ? "rg-text rg-red" : "rg-text rg-green"));
+        Panel chips = this.Row("");
+        chips.Gap(8);
+        if (!enemy || actor.Block() > 0) {
+            chips.With(this.Txt("格挡 " + Convert.ToString(actor.Block()), "rg-status rg-status-block"));
         }
+        if (!enemy || actor.Strength() > 0) {
+            chips.With(this.Txt("力量 " + Convert.ToString(actor.Strength()), "rg-status rg-status-str"));
+        }
+        if (actor.Vulnerable() > 0) {
+            chips.With(this.Txt("易伤 " + Convert.ToString(actor.Vulnerable()), "rg-status rg-status-vuln"));
+        }
+        box.With(chips);
+        return box;
+    }
+
+    // 敌人意图横幅（居中）：下回合伤害大字 + 回合数。
+    Panel IntentPanel() {
+        Panel col = this.Col("rg-fill rg-center");
+        col.Gap(10);
+        col.With(this.Txt("第 " + Convert.ToString(this.flow.battle.Turn()) + " 回合", "rg-cap rg-center"));
+        Panel banner = this.Col("rg-intent");
+        banner.Pad(16);
+        banner.Gap(2);
+        banner.With(this.Txt("敌人意图 · 下回合攻击", "rg-text rg-center"));
+        banner.With(this.Txt(Convert.ToString(this.flow.battle.EnemyDamage()), "rg-intent-num"));
+        int block = this.flow.battle.Player().Block();
+        banner.With(this.Txt(block > 0 ? "你的格挡 " + Convert.ToString(block) + " 会先吸收伤害"
+            : "你没有格挡——这一下全额吃满", "rg-dim rg-center"));
+        col.With(banner);
+        return col;
+    }
+
+    // 一张卡牌：标准 Button，内容是一列牌面（费用 + 类型 / 卡面 / 名称 / 效果）。
+    // 索引作为参数传入，闭包不会串牌。没有卡面素材时只少一张图，牌照样能打。
+    Button CardTile(CardDefinition def, int index, bool playable) {
+        Button card = new Button(this.CardFace(def, playable, false));
+        card.Class = "rg-card rg-card-" + def.Category();
+        card.name = "card" + Convert.ToString(index);
         if (playable) {
-            Button b = new Button(this.CardText(def));
-            b.OnClick(() => { this.PlayCard(index); });
-            tile.With(b);
+            card.OnClick(() => { this.PlayCard(index); });
         } else {
-            Label muted = new Label(this.CardText(def));
-            muted.Class = "small secondary";
-            tile.With(muted);
+            card.Disabled = true;
         }
-        return tile;
+        return card;
     }
 
-    // 素材定位：以 exe 目录为锚向上找 assets/（Game.Kit.Assets），
-    // 找不到就返回空串——调用方据此走"无素材"分支，绝不崩。
+    Panel CardFace(CardDefinition def, bool affordable, bool big) {
+        Panel face = this.Col("rg-card-body");
+        Panel head = this.Row("rg-card-head");
+        head.With(this.Txt(Convert.ToString(def.Cost()), affordable ? "rg-cost" : "rg-cost rg-cost-off"));
+        head.With(this.Txt(this.CategoryName(def.Category()), "rg-type rg-type-" + def.Category()));
+        face.With(head);
+        Image img = this.Art(def.Art(), def.Name(), "rg-card-art");
+        if (img != null) { face.With(img); }
+        face.With(this.Txt(def.Name(), "rg-card-name"));
+        for (int i = 0; i < def.EffectCount(); i = i + 1) {
+            face.With(this.Txt(this.EffectText(def.EffectAt(i)), "rg-card-fx"));
+        }
+        if (!affordable) { face.With(this.Txt("能量不足", "rg-card-warn")); }
+        return face;
+    }
+
+    string CategoryName(string category) {
+        if (category == "attack") { return "攻击"; }
+        if (category == "skill") { return "技能"; }
+        if (category == "power") { return "能力"; }
+        return category;
+    }
+
+    // 素材定位：以 exe 目录为锚向上找 assets/（Game.Kit.Assets）；磁盘上没有就用
+    // 编译期内嵌的同名资源（--embed / 模板 assets/，Image 会读内嵌字节）；
+    // 都没有返回空串——调用方据此走"无素材"分支，绝不崩。
     string ArtPath(string rel) {
         if (rel == null || rel == "") { return ""; }
         string p = Assets.Find(rel);
-        if (p == null || !File.Exists(p)) { return ""; }
-        return p;
+        if (p != null && File.Exists(p)) { return p; }
+        if (File.EmbedExists(rel)) { return rel; }
+        return "";
     }
 
-    // 定尺寸图片：行/列容器的默认 align-items 是 stretch，子项没声明
-    // 宽高就被拉满整行（标题图曾被拉成 1920 宽的一条）。
-    // 用内联 CSS 声明宽高，容器才按声明尺寸摆它。
-    Image SizedImage(string path, string alt, int size) {
-        Image img = new Image(path, alt, "cover");
-        string css = "width: " + Convert.ToString(size)
-            + "px; height: " + Convert.ToString(size) + "px;";
-        img.SetProp("style", css);
-        return img;
-    }
+    // ---- 奖励 --------------------------------------------------------------
 
-    // 战后奖励：三选一。
+    // 战后奖励：三张大卡三选一（点卡或点下面的按钮都算选它）。
     void BuildReward() {
         this.BuildTopBar("战利品 · 三选一");
-        Panel row = Panel.Row();
-        row.Gap(16);
+        Panel page = this.Col("rg-fill rg-center");
+        page.Gap(18);
+        page.With(this.Txt("胜利！选一张加入牌组", "rg-h3 rg-center"));
+        Panel row = this.Row("rg-center");
+        row.Gap(36);
         for (int i = 0; i < this.flow.rewardChoices.Count; i = i + 1) {
             row.With(this.RewardCard(this.flow.rewardChoices[i]));
         }
-        root.With(row);
-        Label hint = new Label("选一张加入牌组，本局永久生效。");
-        hint.Class = "small secondary";
-        root.With(hint);
+        page.With(row);
+        page.With(this.Txt("本局永久生效；牌组越精，抽到好牌越稳。", "rg-dim rg-center"));
+        root.With(page);
     }
 
     Panel RewardCard(string cardId) {
         CardDefinition def = this.flow.library.Find(cardId);
-        Panel box = new Panel("reward");
-        box.Pad(14);
-        box.Gap(8);
-        box.Prefer(300, 150);
-        string art = this.ArtPath(def.Art());
-        if (art != "") {
-            box.With(this.SizedImage(art, def.Name(), 120));
-        }
-        Label name = new Label(def.Name());
-        name.Class = "title medium strong cyan";
-        box.With(name);
-        Label desc = new Label(this.CardText(def));
-        desc.Class = "small";
-        box.With(desc);
+        Panel col = this.Col("");
+        col.Gap(12);
+        this.Mid(col);
+        Button card = new Button(this.CardFace(def, true, true));
+        card.Class = "rg-card rg-card-big rg-card-" + def.Category();
+        card.OnClick(() => { this.TakeReward(cardId); });
+        col.With(card);
         Button take = new Button("收入牌组");
-        take.Class = "primary";
+        take.Class = "rg-cta";
         take.OnClick(() => { this.TakeReward(cardId); });
-        box.With(take);
-        return box;
+        col.With(take);
+        return col;
     }
 
-    // 结算：胜利或阵亡。
+    // ---- 结算 --------------------------------------------------------------
+
+    // 结算：胜利熔金、阵亡深红；本局数据砖 + 纪录 + 再来一局。
     void BuildOver() {
-        string title = this.flow.runWon ? "登顶成功" : "倒在了第 "
+        bool won = this.flow.runWon;
+        string title = won ? "登顶成功" : "倒在了第 "
             + Convert.ToString(this.flow.run.Floor()) + " 层";
         this.BuildTopBar(title);
-        Panel card = new Panel("over");
-        card.Pad(20);
-        card.Gap(10);
-        Label seedLine = new Label("种子 " + Convert.ToString(this.flow.run.Seed()));
-        seedLine.Class = "medium";
-        card.With(seedLine);
-        Label statLine = new Label("击杀 " + Convert.ToString(this.flow.run.Kills())
-            + " · 金币 " + Convert.ToString(this.flow.run.Gold())
-            + " · 牌组 " + Convert.ToString(this.flow.run.Deck().Count) + " 张");
-        statLine.Class = "medium";
-        card.With(statLine);
+        Panel page = this.Col("rg-fill rg-center");
+        Panel card = this.Col(won ? "rg-panel rg-panel-gold" : "rg-panel rg-panel-danger");
+        card.Pad(26);
+        card.Gap(14);
+        card.Prefer(720, 0);
+        Panel head = this.Row("");
+        head.Gap(22);
+        this.Mid(head);
+        Image art = this.Art("assets/title.png", "肉鸽爬塔", "rg-over-art");
+        if (art != null) { head.With(art); }
+        Panel words = this.Col("rg-fill");
+        words.Gap(6);
+        words.With(this.Txt(won ? "登顶成功" : "攀登失败", won ? "rg-h1" : "rg-h1 rg-red"));
+        words.With(this.Txt(won ? "王冠归你了——深渊守卫倒在了塔顶。"
+            : "倒在了第 " + Convert.ToString(this.flow.run.Floor()) + " 层，换个思路再爬一次。", "rg-text"));
+        words.With(this.Txt("种子 " + Convert.ToString(this.flow.run.Seed()), "rg-dim"));
+        head.With(words);
+        card.With(head);
+
+        Panel tiles = this.Row("");
+        tiles.Gap(12);
+        tiles.With(this.Tile(Convert.ToString(this.flow.run.Kills()), "击杀", "rg-red"));
+        tiles.With(this.Tile(Convert.ToString(this.flow.run.Gold()), "金币", ""));
+        tiles.With(this.Tile(Convert.ToString(this.flow.run.Deck().Count) + " 张", "牌组", "rg-teal"));
+        tiles.With(this.Tile(Convert.ToString(this.flow.turnsTaken), "本局回合", "rg-ember"));
+        card.With(tiles);
+
+        if (this.shell.NewFastest()) {
+            card.With(this.Txt("NEW BEST · 最快登顶 " + Convert.ToString(this.flow.turnsTaken) + " 回合！", "rg-newbest"));
+        }
+        if (this.shell.NewBestFloor()) {
+            card.With(this.Txt("NEW BEST · 最高到达第 " + Convert.ToString(this.flow.run.Floor()) + " 层！", "rg-newbest"));
+        }
+        string fastest = this.shell.HasFastest()
+            ? Convert.ToString(this.shell.FastestTurns()) + " 回合" : "—";
+        card.With(this.Txt("纪录：最高第 " + Convert.ToString(this.shell.BestFloor())
+            + " 层 · 最快登顶 " + fastest + " · 登顶 " + Convert.ToString(this.shell.Wins())
+            + " / " + Convert.ToString(this.shell.Runs()) + " 局", "rg-dim"));
+        // 按钮放进横排，不被纵向容器拉成通栏。
+        Panel actions = this.Row("");
+        actions.Gap(12);
         Button again = new Button("同种子再来一局");
-        again.Class = "primary";
+        again.Class = "rg-cta rg-big-btn";
         again.OnClick(() => { this.StartRun(this.flow.run.Seed()); });
-        card.With(again);
-        Button back = new Button("回到主菜单");
-        back.OnClick(() => { this.flow.phase = 0; this.BuildUi(); });
-        card.With(back);
-        root.With(card);
+        actions.With(again);
+        Button back = new Button("回到主菜单（Esc）");
+        back.Class = "rg-btn rg-big-btn";
+        back.OnClick(() => { this.GoMenu(); });
+        actions.With(back);
+        card.With(actions);
+        page.With(card);
+        root.With(page);
     }
 
     // ---- 流程（规则在 RunFlow，这里推进后重建界面） --------------------------
 
-    void StartRun(int seed) { this.flow.StartRun(seed); this.BuildUi(); }
-    void EnterNode(MapNode node) { this.flow.EnterNode(node); this.BuildUi(); }
-    void PlayCard(int index) { this.flow.PlayCard(index); this.BuildUi(); }
-    void EndTurn() { this.flow.EndTurn(); this.BuildUi(); }
-    void TakeReward(string cardId) { this.flow.TakeReward(cardId); this.BuildUi(); }
+    // 每一步都先记下推进前的数值，推进后对比出"发生了什么"再配音效：
+    // 规则层不知道有声音，声音也不改变规则。
+    void StartRun(int seed) {
+        this.flow.StartRun(seed);
+        this.shell.BeginRun();
+        this.shell.Play("click");
+        this.confirmQuit = false;
+        this.endRecorded = false;
+        this.BuildUi();
+    }
+
+    void EnterNode(MapNode node) {
+        int prev = this.flow.phase;
+        this.flow.EnterNode(node);
+        this.shell.Play(node.Kind() == 2 ? "coin" : "click");
+        this.AfterStep(prev);
+    }
+
+    void PlayCard(int index) {
+        int prev = this.flow.phase;
+        int enemyHp = this.flow.battle.Enemy().Hp();
+        int block = this.flow.battle.Player().Block();
+        this.flow.PlayCard(index);
+        if (!this.flow.lastPlayOk) {
+            this.shell.Play("error");
+        } else {
+            this.shell.Play("select");
+            if (this.flow.battle.Enemy().Hp() < enemyHp) { this.shell.Play("hit"); }
+            if (this.flow.battle.Player().Block() > block) { this.shell.Play("block"); }
+        }
+        this.AfterStep(prev);
+    }
+
+    void EndTurn() {
+        int prev = this.flow.phase;
+        int hp = this.flow.battle.Player().Hp();
+        this.flow.EndTurn();
+        if (this.flow.battle.Player().Hp() < hp) { this.shell.Play("hit", 0.8); }
+        else { this.shell.Play("block", 0.7); }
+        this.AfterStep(prev);
+    }
+
+    void TakeReward(string cardId) {
+        int prev = this.flow.phase;
+        this.flow.TakeReward(cardId);
+        this.shell.Play("coin");
+        this.AfterStep(prev);
+    }
+
+    // 阶段切换的音效与结算记账，然后重建界面。
+    void AfterStep(int prev) {
+        int now = this.flow.phase;
+        if (prev == 2 && now == 3) { this.shell.Play("explode"); }
+        if (now == 4 && !this.endRecorded) {
+            this.endRecorded = true;
+            this.confirmQuit = false;
+            this.shell.EndRun(this.flow.runWon, this.flow.run.Floor(), this.flow.turnsTaken);
+            if (this.flow.runWon) {
+                if (prev == 2) { this.shell.Play("explode", 0.8); }
+                this.shell.Play("success");
+            } else {
+                this.shell.Play("fail");
+            }
+        }
+        this.BuildUi();
+    }
 
     // ---- 文案 ------------------------------------------------------------
-
-    // 卡面文案：费用 + 名称 + 效果串。
-    string CardText(CardDefinition def) {
-        string text = "[" + Convert.ToString(def.Cost()) + "] " + def.Name();
-        for (int i = 0; i < def.EffectCount(); i = i + 1) {
-            text = text + " · " + this.EffectText(def.EffectAt(i));
-        }
-        return text;
-    }
 
     // 单条效果的文案。
     string EffectText(CardEffect effect) {
