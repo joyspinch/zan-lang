@@ -6,6 +6,8 @@ namespace System.IO;
 // 子类覆写 ReadInto / WriteFrom / Seek / Close 及能力与长度查询即可复用全部辅助方法；
 // 字节数据以带显式长度的 string（保留 NUL）或裸地址 nint（零拷贝）传递。
 public class Stream : IDisposable {
+    private byte[] byteScratch;
+
     // 流可读时为真。
     public virtual bool CanRead() { return false; }
 
@@ -63,7 +65,7 @@ public class Stream : IDisposable {
     // 读取最多 `count` 字节到字节数组中（从 `offset` 起填充）。
     // 返回实际读取的字节数；0 表示流已结束。零托管堆分配。
     public int ReadBytes(byte[] buffer, int offset, int count) {
-        if (buffer == null || count <= 0 || offset < 0 || offset + count > buffer.Length) {
+        if (buffer == null || count <= 0 || offset < 0 || count > buffer.Length - offset) {
             return 0;
         }
         return this.ReadInto((nint)buffer + (nint)offset, count);
@@ -97,25 +99,18 @@ public class Stream : IDisposable {
         return this.Write(data, data.Length);
     }
 
-    // 写入 `data` 的前 `count` 个字节（二进制安全，可含 NUL）。
+    // 写入 `data` 的前 `count` 个字节（二进制安全，可含 NUL；零拷贝直传底层地址）。
     public int Write(string data, int count) {
         if (data == null || count <= 0) {
             return 0;
         }
-        nint buf = NativeMemory.Alloc(count + 1);
-        int w = 0;
-        try {
-            NativeMemory.PutString(buf, 0, data, count);
-            w = this.WriteFromAll(buf, count);
-        } finally {
-            NativeMemory.Free(buf);
-        }
-        return w;
+        if (count > data.Length) { count = data.Length; }
+        return this.WriteFromAll((nint)data, count);
     }
 
     // 写入字节数组的一部分（二进制安全）。
     public int WriteBytes(byte[] data, int offset, int count) {
-        if (data == null || count <= 0 || offset < 0 || offset + count > data.Length) {
+        if (data == null || count <= 0 || offset < 0 || count > data.Length - offset) {
             return 0;
         }
         return this.WriteFromAll((nint)data + (nint)offset, count);
@@ -127,30 +122,20 @@ public class Stream : IDisposable {
         return this.WriteBytes(data, 0, data.Length);
     }
 
-    // 读取一个字节，流结束时返回 -1。
-    public int ReadByte() {
-        nint buf = NativeMemory.Alloc(1);
-        int v = -1;
-        try {
-            int n = this.ReadInto(buf, 1);
-            if (n == 1) {
-                v = new Span<byte>(buf, 1)[0];
-            }
-        } finally {
-            NativeMemory.Free(buf);
+    // 读取一个字节，流结束时返回 -1（子类可覆写以避免额外间接调用）。
+    public virtual int ReadByte() {
+        if (this.byteScratch == null) { this.byteScratch = new byte[1]; }
+        if (this.ReadInto((nint)this.byteScratch, 1) == 1) {
+            return this.byteScratch[0] & 255;
         }
-        return v;
+        return -1;
     }
 
-    // 写入一个字节（`b` 的低 8 位）。
-    public void WriteByte(int b) {
-        nint buf = NativeMemory.Alloc(1);
-        try {
-            new Span<byte>(buf, 1)[0] = b & 255;
-            this.WriteFrom(buf, 1);
-        } finally {
-            NativeMemory.Free(buf);
-        }
+    // 写入一个字节（`b` 的低 8 位；子类可覆写以零分配直写）。
+    public virtual void WriteByte(int b) {
+        if (this.byteScratch == null) { this.byteScratch = new byte[1]; }
+        this.byteScratch[0] = (byte)(b & 255);
+        this.WriteFrom((nint)this.byteScratch, 1);
     }
 
     // 读取流中剩余的全部内容（二进制安全）。

@@ -17,15 +17,7 @@ public class Channel<T> : IDisposable {
     nint mtx;
 
     // 创建无界通道（capacity <= 0 表示无上限）
-    public Channel() {
-        this.buffer = new List<T>();
-        this.head = 0;
-        this.capacity = 0;
-        this.isClosed = false;
-        this.readGate = new AsyncGate();
-        this.writeGate = new AsyncGate();
-        this.mtx = Mutex.Create();
-    }
+    public Channel() : this(0) {}
 
     // 创建指定容量的有界通道（带生产者背压）
     public Channel(int capacity) {
@@ -135,6 +127,27 @@ public class Channel<T> : IDisposable {
         }
     }
 
+    // 须持锁且 head < buffer.Count 时调用：弹出队头并及时清空或紧凑，避免 ARC 滞留与无谓重建。
+    private T PopLocked() {
+        T item = this.buffer[this.head];
+        this.head = this.head + 1;
+        int n = this.buffer.Count;
+        if (this.head >= n) {
+            this.buffer.Clear();
+            this.head = 0;
+        } else if (this.head >= 64 && this.head * 2 >= n) {
+            int rem = n - this.head;
+            List<T> compacted = new List<T>();
+            compacted.Reserve(rem);
+            for (int i = this.head; i < n; i = i + 1) {
+                compacted.Add(this.buffer[i]);
+            }
+            this.buffer = compacted;
+            this.head = 0;
+        }
+        return item;
+    }
+
     // 尝试非阻塞读取一项。
     // 若缓冲区有数据则取出并返回 true；若通道为空则返回 false。
     public bool TryRead(out T item) {
@@ -144,17 +157,7 @@ public class Channel<T> : IDisposable {
         }
         Mutex.Lock(this.mtx);
         if (this.head < this.buffer.Count) {
-            item = this.buffer[this.head];
-            this.head = this.head + 1;
-            // 惰性紧凑压缩，防止长生命周期列表过度占用内存
-            if (this.head >= 64 && this.head * 2 >= this.buffer.Count) {
-                List<T> compacted = new List<T>();
-                for (int i = this.head; i < this.buffer.Count; i = i + 1) {
-                    compacted.Add(this.buffer[i]);
-                }
-                this.buffer = compacted;
-                this.head = 0;
-            }
+            item = this.PopLocked();
             bool hadBackpressure = this.capacity > 0;
             Mutex.Unlock(this.mtx);
             if (hadBackpressure) {
@@ -174,16 +177,7 @@ public class Channel<T> : IDisposable {
         while (true) {
             Mutex.Lock(this.mtx);
             if (this.head < this.buffer.Count) {
-                item = this.buffer[this.head];
-                this.head = this.head + 1;
-                if (this.head >= 64 && this.head * 2 >= this.buffer.Count) {
-                    List<T> compacted = new List<T>();
-                    for (int i = this.head; i < this.buffer.Count; i = i + 1) {
-                        compacted.Add(this.buffer[i]);
-                    }
-                    this.buffer = compacted;
-                    this.head = 0;
-                }
+                item = this.PopLocked();
                 bool hadBackpressure = this.capacity > 0;
                 Mutex.Unlock(this.mtx);
                 if (hadBackpressure) {

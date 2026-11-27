@@ -317,42 +317,29 @@ public class Process {
         plat_fseek(fp, 0, 2);
         int size = (int)plat_ftell(fp);
         plat_fseek(fp, 0, 0);
+        if (size <= 0) {
+            plat_fclose(fp);
+            return "";
+        }
         byte[] raw = new byte[size];
         int got = (int)plat_fread(raw, 1, size, fp);
         plat_fclose(fp);
-        if (got < 2) { return raw.ToStr(0, got); }
+        if (got < 2) { return got > 0 ? raw.ToStr(0, got) : ""; }
         bool utf16 = raw[0] == 255 && raw[1] == 254;   // BOM FF FE
-        int units = 0;
-        if (utf16) {
-            units = (got - 2) / 2;
-        } else {
-            // ANSI（CP_ACP，中文系统上通常是 GBK）：每个字节
-            // 最多对应一个 UTF-16 单元，因此 got*2+2 恒够用。
-            units = got * 2 + 2;
-        }
+        int units = utf16 ? (got - 2) / 2 : got * 2 + 2;
         nint wide = NativeMemory.Alloc(units * 2 + 2);
         string s = "";
         try {
             if (utf16) {
-                for (int k = 0; k < units; k = k + 1) {
-                    new Span<ushort>(wide + k * 2, 1)[0] = (ushort)(raw[2 + k * 2] |
-                        (raw[3 + k * 2] << 8));
+                if (units > 0) {
+                    NativeMemory.Copy(wide, (nint)raw + 2, units * 2);
                 }
-                new Span<ushort>(wide + units * 2, 1)[0] = 0;
+                new Span<ushort>(wide + (nint)units * 2, 1)[0] = 0;
             } else {
-                nint mb = NativeMemory.Alloc(got);
-                try {
-                    for (int k = 0; k < got; k = k + 1) {
-                        new Span<byte>(mb + k, 1)[0] = raw[k];
-                    }
-                    // 原地转换：wide 存放 UTF-16 结果（units 已按其预留），
-                    // 再为 UTF-8 转换推算真实长度。
-                    int n = Process.WinMultiToWide(0 /*CP_ACP*/, 0, mb, got, wide, units);
-                    if (n > 0) { units = n; }
-                    new Span<ushort>(wide + units * 2, 1)[0] = 0;
-                } finally {
-                    NativeMemory.Free(mb);
-                }
+                // 直接传托管 byte[] 指针，零拷贝零额外 NativeMemory.Alloc
+                int n = Process.WinMultiToWide(0 /*CP_ACP*/, 0, (nint)raw, got, wide, units);
+                if (n > 0) { units = n; }
+                new Span<ushort>(wide + (nint)units * 2, 1)[0] = 0;
             }
             int need = Process.WinWideToMulti(65001, 0, wide, units, 0, 0, 0, 0);
             if (need <= 0) { need = 1; }
@@ -407,14 +394,14 @@ public class Process {
             return r;
         }
         StringBuilder sb = new StringBuilder();
+        byte[] buf = new byte[4097];
         bool reading = true;
         while (reading) {
-            byte[] buf = new byte[4097];
             int n = (int)fread(buf, 1, 4096, fp);
             if (n <= 0) {
                 reading = false;
             } else {
-                sb.Append(buf.ToStr(0, n));
+                sb.Append(new StringView((nint)buf, n));
             }
         }
         int status = PipeClose(fp);

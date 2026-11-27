@@ -39,6 +39,9 @@ public class File {
     [DllImport("crt")]
     internal static extern long fread(string buf, long size, long count, nint fp);
 
+    [DllImport("crt", EntryPoint = "fread")]
+    internal static extern long fread_ptr(nint buf, long size, long count, nint fp);
+
     [DllImport("crt")]
     internal static extern long fwrite(string buf, long size, long count, nint fp);
 
@@ -152,10 +155,16 @@ public class File {
         if (fileLen > 0 && fileLen <= 2147483647) {
             int len = (int)fileLen;
             byte[] buf = new byte[len];
-            int readLen = (int)fread(buf, 1, len, fp);
+            int total = 0;
+            while (total < len) {
+                int got = (int)fread_ptr((nint)buf + (nint)total, 1, len - total, fp);
+                if (got <= 0) { break; }
+                total = total + got;
+            }
             fclose(fp);
-            if (readLen >= 0) {
-                return File.StripBom(buf.ToStr(0, readLen));
+            if (total > 0) {
+                int off = (total >= 3 && (buf[0] & 255) == 0xEF && (buf[1] & 255) == 0xBB && (buf[2] & 255) == 0xBF) ? 3 : 0;
+                return buf.ToStr(off, total - off);
             }
             return "";
         }
@@ -490,20 +499,17 @@ public class File {
             if (take > 0) { NativeMemory.Copy((nint)part, (nint)all + (nint)offset, take); }
             return part;
         }
+        if (count <= 0) { return new byte[0]; }
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
             throw new FileNotFoundException("Could not open file: " + path);
         }
-        fseek(fp, offset, 0);
+        if (offset > 0) { fseek(fp, offset, 0); }
         byte[] buf = new byte[count];
         int total = 0;
-        byte[] chunk = new byte[BINARY_CHUNK_SIZE];
         while (total < count) {
-            int want = count - total;
-            if (want > BINARY_CHUNK_SIZE) { want = BINARY_CHUNK_SIZE; }
-            int got = (int)fread(chunk, 1, want, fp);
+            int got = (int)fread_ptr((nint)buf + (nint)total, 1, count - total, fp);
             if (got <= 0) { break; }
-            NativeMemory.Copy((nint)buf + (nint)total, (nint)chunk, got);
             total = total + got;
         }
         fclose(fp);
@@ -542,16 +548,34 @@ public class File {
         if (fp == 0) {
             throw new FileNotFoundException("Could not open file: " + path);
         }
-        // 这里的 fp 只用来证明盘上文件可打开；真正的读取在下面
-        // GetSize/ReadBytes 各自开合。不关掉它，句柄就漏到进程退出——
-        // Windows 上被读过的文件会一直处于打开状态，锁死后续的改名/删除
-        // （WebApp 静态资产服务每个资产漏一个，问题在那里最先显形）。
-        fclose(fp);
-        int size = File.GetSize(path);
-        if (size < 0) {
+        fseek(fp, 0, 2);
+        long fileLen = ftell64(fp);
+        fseek(fp, 0, 0);
+        if (fileLen < 0) {
+            fclose(fp);
             throw new FileNotFoundException("Could not open file: " + path);
         }
-        return File.ReadBytes(path, 0, size);
+        if (fileLen == 0) {
+            fclose(fp);
+            return new byte[0];
+        }
+        int size = fileLen > 2147483647 ? 2147483647 : (int)fileLen;
+        byte[] buf = new byte[size];
+        int total = 0;
+        while (total < size) {
+            int got = (int)fread_ptr((nint)buf + (nint)total, 1, size - total, fp);
+            if (got <= 0) { break; }
+            total = total + got;
+        }
+        fclose(fp);
+        if (total < size) {
+            byte[] actual = new byte[total];
+            if (total > 0) {
+                NativeMemory.Copy((nint)actual, (nint)buf, total);
+            }
+            return actual;
+        }
+        return buf;
     }
 
     [DllImport("crt", EntryPoint = "memcpy")]

@@ -15,30 +15,6 @@ public class DateTime {
     [DllImport("crt")]
     private static extern long time(nint ptr);
 
-    #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "GetSystemTimeAsFileTime")]
-    private static extern void GetSystemTimeAsFileTime(nint lpFileTime);
-    #else
-    [DllImport("crt", EntryPoint = "clock_gettime")]
-    private static extern int clock_gettime(int clkId, nint tp);
-    #endif
-
-    // 本机时区换算：localtime_r（POSIX）/ _localtime64_s（Windows）
-    // 将纪元秒展开进线程局部 struct tm 缓冲，避免并发冲突。
-    // 再用 timegm / _mkgmtime 将其当作 UTC 折回纪元秒，两者的差值
-    // 即为该时刻的实际本地偏移（包含夏令时）。
-    #if WINDOWS
-    [DllImport("crt", EntryPoint = "_localtime64_s")]
-    private static extern int plat_localtime(nint tmOut, nint tptr);
-    [DllImport("crt", EntryPoint = "_mkgmtime")]
-    private static extern long plat_timegm(nint tm);
-    #else
-    [DllImport("crt", EntryPoint = "localtime_r")]
-    private static extern nint plat_localtime(nint tptr, nint tmOut);
-    [DllImport("crt", EntryPoint = "timegm")]
-    private static extern long plat_timegm(nint tm);
-    #endif
-
     [DllImport("crt", EntryPoint = "zan_time_epoch_ms")]
     private static extern long zan_time_epoch_ms();
 
@@ -142,24 +118,27 @@ public class DateTime {
         return LocalOffsetMinutesAt(time(0));
     }
 
-    // 同一时刻的本地墙钟表示：年月日时分秒都是本机时区读数。
+    // 同一时刻的本地墙钟表示：年月日时分秒都是本机时区读数（保留毫秒精度）。
     // 注意它的 <see cref="ToUnixSeconds"/> 已被偏移，不再是纪元秒；
     // 需要纪元秒请用原来的 UTC 时刻。
     public DateTime ToLocalTime() {
-        return new DateTime(epoch
-            + (long)DateTime.LocalOffsetMinutesAt(epoch) * 60);
+        return DateTime.FromUnixMilliseconds(epochMs
+            + (long)DateTime.LocalOffsetMinutesAt(epoch) * 60000);
     }
 
-    // 将本机墙钟时间（例如 <see cref="Now"/>）转回 UTC 时刻。
+    // 将本机墙钟时间（例如 <see cref="Now"/>）转回 UTC 时刻（保留毫秒精度）。
     public DateTime ToUniversalTime() {
-        return new DateTime(epoch
-            - (long)DateTime.LocalOffsetMinutesAt(epoch) * 60);
+        return DateTime.FromUnixMilliseconds(epochMs
+            - (long)DateTime.LocalOffsetMinutesAt(epoch) * 60000);
     }
 
     // 本机时区的当前墙钟时间（见 <see cref="ToLocalTime"/>）；
-    // 与 <see cref="Now"/> 等价，保留给按“本地”语义书写的调用方。
+    // 与 <see cref="Now"/> 等价，单次分配且保留毫秒精度。
     public static DateTime LocalNow() {
-        return DateTime.UtcNow().ToLocalTime();
+        long utcMs = GetCurrentUnixMilliseconds();
+        long utcSec = FloorDivL(utcMs, 1000);
+        return DateTime.FromUnixMilliseconds(utcMs
+            + (long)DateTime.LocalOffsetMinutesAt(utcSec) * 60000);
     }
 
     // 根据 Unix 时间戳（自纪元起的秒数）构造时刻。

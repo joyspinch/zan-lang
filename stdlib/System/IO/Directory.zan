@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Platform;
 using System.Text;
 
@@ -28,39 +29,51 @@ public class Directory {
         }
         string raw = File.zan_embed_list(pre);
         if (raw == null || raw.Length == 0) { return outp; }
+        HashSet<string> seen = new HashSet<string>();
         int start = 0;
         int rawLen = raw.Length;
         for (int i = 0; i <= rawLen; i = i + 1) {
             if (i != rawLen && (raw[i] & 255) != 10) { continue; }
-            string name = raw.Substring(start, i - start);
-            start = i + 1;
-            if (name.Length <= pre.Length) { continue; }
-            string rest = name.Substring(pre.Length, name.Length - pre.Length);
-            int slash = rest.IndexOf("/");
-            string item = slash >= 0 ? rest.Substring(0, slash) : rest;
-            if (dirs != (slash >= 0)) { continue; }
-            bool seen = false;
-            for (int k = 0; k < outp.Count; k = k + 1) {
-                if (outp[k] == item) { seen = true; break; }
+            int lineLen = i - start;
+            if (lineLen > pre.Length) {
+                string rest = raw.Substring(start + pre.Length, lineLen - pre.Length);
+                int slash = rest.IndexOf("/");
+                if (dirs == (slash >= 0)) {
+                    string item = slash >= 0 ? rest.Substring(0, slash) : rest;
+                    if (seen.Add(item)) { outp.Add(item); }
+                }
             }
-            if (!seen) { outp.Add(item); }
+            start = i + 1;
         }
         return outp;
     }
 
     public static bool EmbedExists(string path) {
-        if (Directory.EmbedChildren(path, false).Count > 0) { return true; }
-        return Directory.EmbedChildren(path, true).Count > 0;
+        string pre = File.EmbedName(path);
+        if (pre.Length > 0 && (pre[pre.Length - 1] & 255) != 47) {
+            pre = pre + "/";
+        }
+        string raw = File.zan_embed_list(pre);
+        if (raw == null || raw.Length == 0) { return false; }
+        int start = 0;
+        int rawLen = raw.Length;
+        for (int i = 0; i <= rawLen; i = i + 1) {
+            if (i != rawLen && (raw[i] & 255) != 10) { continue; }
+            if (i - start > pre.Length) { return true; }
+            start = i + 1;
+        }
+        return false;
     }
 
     public static List<string> MergeEmbed(List<string> disk, string path, bool dirs) {
         List<string> emb = Directory.EmbedChildren(path, dirs);
+        if (emb.Count == 0) { return disk; }
+        HashSet<string> existing = new HashSet<string>();
+        for (int k = 0; k < disk.Count; k = k + 1) {
+            existing.Add(disk[k]);
+        }
         for (int i = 0; i < emb.Count; i = i + 1) {
-            bool seen = false;
-            for (int k = 0; k < disk.Count; k = k + 1) {
-                if (disk[k] == emb[i]) { seen = true; break; }
-            }
-            if (!seen) { disk.Add(emb[i]); }
+            if (existing.Add(emb[i])) { disk.Add(emb[i]); }
         }
         return disk;
     }
@@ -194,25 +207,43 @@ public class Directory {
         return 0;
     }
 
+    // 线性回溯通配符匹配（最坏 O(N*M)，避免多 '*' 指数级递归回溯）。
     private static bool NameMatch(string pat, int pi, string name, int ni) {
-        if (pi >= pat.Length) { return ni >= name.Length; }
-        int pc = pat[pi] & 255;
-        if (pc == 42) {
-            while (pi < pat.Length && (pat[pi] & 255) == 42) { pi = pi + 1; }
-            for (int k = 0; ni + k <= name.Length; k = k + 1) {
-                if (Directory.NameMatch(pat, pi, name, ni + k)) { return true; }
+        int pLen = pat.Length;
+        int nLen = name.Length;
+        int starPi = -1;
+        int matchNi = 0;
+        bool caseSensitive = Pal.FileSystem.IsCaseSensitive();
+        while (ni < nLen) {
+            if (pi < pLen) {
+                int pc = pat[pi] & 255;
+                if (pc == 42) {
+                    while (pi < pLen && (pat[pi] & 255) == 42) { pi = pi + 1; }
+                    starPi = pi;
+                    matchNi = ni;
+                    continue;
+                }
+                if (pc == 63 || Directory.NameCharEq(pc, name[ni] & 255, caseSensitive)) {
+                    pi = pi + 1;
+                    ni = ni + 1;
+                    continue;
+                }
+            }
+            if (starPi >= 0) {
+                pi = starPi;
+                matchNi = matchNi + 1;
+                ni = matchNi;
+                continue;
             }
             return false;
         }
-        if (ni >= name.Length) { return false; }
-        if (pc == 63) { return Directory.NameMatch(pat, pi + 1, name, ni + 1); }
-        if (!Directory.NameCharEq(pc, name[ni] & 255)) { return false; }
-        return Directory.NameMatch(pat, pi + 1, name, ni + 1);
+        while (pi < pLen && (pat[pi] & 255) == 42) { pi = pi + 1; }
+        return pi == pLen;
     }
 
-    private static bool NameCharEq(int a, int b) {
+    private static bool NameCharEq(int a, int b, bool caseSensitive) {
         if (a == b) { return true; }
-        if (!Pal.FileSystem.IsCaseSensitive()) {
+        if (!caseSensitive) {
             if (a >= 65 && a <= 90) { a = a + 32; }
             if (b >= 65 && b <= 90) { b = b + 32; }
             return a == b;

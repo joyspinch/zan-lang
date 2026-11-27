@@ -97,51 +97,76 @@ public class StreamReader : IDisposable {
 
     // 读取最多 `count` 字节；输入结束时返回 ""。
     public string ReadBlock(int count) {
-        StringBuilder sb = new StringBuilder();
-        int need = count;
+        if (count <= 0) { return ""; }
+        this.Fill();
+        int firstAvail = this.buf.Length - this.pos;
+        if (firstAvail <= 0) { return ""; }
+        if (firstAvail >= count) {
+            string fast = this.buf.Substring(this.pos, count);
+            this.pos = this.pos + count;
+            return fast;
+        }
+        StringBuilder sb = new StringBuilder(count);
+        sb.Append(new StringView((nint)this.buf + (nint)this.pos, firstAvail));
+        this.pos = this.buf.Length;
+        int need = count - firstAvail;
         while (need > 0) {
             this.Fill();
             int avail = this.buf.Length - this.pos;
             if (avail <= 0) {
-                need = 0;
-            } else {
-                int take = need;
-                if (take > avail) { take = avail; }
-                sb.Append(this.buf.Substring(this.pos, take));
-                this.pos = this.pos + take;
-                need = need - take;
+                break;
             }
+            int take = need < avail ? need : avail;
+            sb.Append(new StringView((nint)this.buf + (nint)this.pos, take));
+            this.pos = this.pos + take;
+            need = need - take;
         }
         return sb.ToString();
     }
 
-    private static void AppendTrimmedSlice(StringBuilder sb, string slice) {
-        if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
-            slice = slice.Substring(0, slice.Length - 1);
+    private static void AppendTrimmedRange(StringBuilder sb, string s, int start, int end) {
+        if (end > start && (s[end - 1] & 255) == 13) {
+            end = end - 1;
         }
-        if (slice.IndexOf("\r") >= 0) {
-            slice = slice.Replace("\r", "");
+        if (end <= start) { return; }
+        int cr = s.IndexOf("\r", start);
+        if (cr < 0 || cr >= end) {
+            sb.Append(new StringView((nint)s + (nint)start, end - start));
+            return;
         }
-        if (slice.Length > 0) {
-            sb.Append(slice);
+        sb.Append(s.Substring(start, end - start).Replace("\r", ""));
+    }
+
+    // 尝试从当前缓冲直接切出完整一行（零 StringBuilder 分配）；未命中 '\n' 返回 null。
+    private string TryTakeBufferedLine() {
+        int nl = this.buf.IndexOf("\n", this.pos);
+        if (nl < 0) { return null; }
+        int start = this.pos;
+        int lineEnd = nl;
+        if (lineEnd > start && (this.buf[lineEnd - 1] & 255) == 13) {
+            lineEnd = lineEnd - 1;
         }
+        this.pos = nl + 1;
+        if (lineEnd <= start) { return ""; }
+        int cr = this.buf.IndexOf("\r", start);
+        if (cr < 0 || cr >= lineEnd) {
+            return this.buf.Substring(start, lineEnd - start);
+        }
+        return this.buf.Substring(start, lineEnd - start).Replace("\r", "");
     }
 
     // 从当前 buf 消费至 '\n'；命中返回 true（pos 跳过换行），未命中消费到 buf 尾返回 false。
     private bool ConsumeBufferedLine(StringBuilder sb) {
-        int bufLen = this.buf.Length;
         int start = this.pos;
-        int end = this.pos;
-        while (end < bufLen) {
-            if ((this.buf[end] & 255) == 10) {  // '\n'
-                StreamReader.AppendTrimmedSlice(sb, this.buf.Substring(start, end - start));
-                this.pos = end + 1;
-                return true;
-            }
-            end = end + 1;
+        int nl = this.buf.IndexOf("\n", start);
+        if (nl >= 0) {
+            StreamReader.AppendTrimmedRange(sb, this.buf, start, nl);
+            this.pos = nl + 1;
+            return true;
         }
-        StreamReader.AppendTrimmedSlice(sb, this.buf.Substring(start, end - start));
-        this.pos = end;
+        int bufLen = this.buf.Length;
+        StreamReader.AppendTrimmedRange(sb, this.buf, start, bufLen);
+        this.pos = bufLen;
         return false;
     }
 
@@ -151,6 +176,8 @@ public class StreamReader : IDisposable {
         if (this.pos >= this.buf.Length) {
             return null;
         }
+        string fast = this.TryTakeBufferedLine();
+        if (fast != null) { return fast; }
         StringBuilder sb = new StringBuilder();
         while (true) {
             this.Fill();
@@ -176,6 +203,8 @@ public class StreamReader : IDisposable {
         if (this.pos >= this.buf.Length) {
             return null;
         }
+        string fast = this.TryTakeBufferedLine();
+        if (fast != null) { return fast; }
         StringBuilder sb = new StringBuilder();
         while (true) {
             await this.FillAsync();

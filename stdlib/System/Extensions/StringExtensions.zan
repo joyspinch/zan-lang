@@ -49,12 +49,15 @@ public class StringExtensions {
         int len = s.Length;
         if (len == 0) { return true; }
         int i = 0;
-        nint p = (nint)s;
-        while (i + 16 <= len) {
-            Vector128 v = Vector128.Load(p + (nint)i);
-            Vector128 sp = Vector128.Equals(v, Vector128.Create((byte)32));
-            if (Vector128.ExtractMostSignificantBits(sp) != 65535) { break; }
-            i = i + 16;
+        if (len >= 16) {
+            nint p = (nint)s;
+            Vector128 spVal = Vector128.Create((byte)32);
+            while (i + 16 <= len) {
+                Vector128 v = Vector128.Load(p + (nint)i);
+                Vector128 sp = Vector128.Equals(v, spVal);
+                if (Vector128.ExtractMostSignificantBits(sp) != 65535) { break; }
+                i = i + 16;
+            }
         }
         while (i < len) {
             if (!StringExtensions.IsWhitespaceByte(s[i] & 255)) { return false; }
@@ -70,15 +73,15 @@ public class StringExtensions {
         string firstRune = pad.Length == 1 ? pad : pad.RuneAt(0);
         if (firstRune.Length == 0) { firstRune = " "; }
         if (firstRune.Length == 1 && runes == s.Length) {
-            byte p = (byte)(firstRune[0] & 255);
+            int p = firstRune[0] & 255;
             byte[] buf = new byte[width];
             int padStart = padLeft ? 0 : s.Length;
             int strStart = padLeft ? diff : 0;
-            for (int i = 0; i < diff; i = i + 1) { buf[padStart + i] = p; }
-            for (int j = 0; j < s.Length; j = j + 1) { buf[strStart + j] = (byte)(s[j] & 255); }
+            NativeMemory.Fill((nint)buf + (nint)padStart, p, diff);
+            if (s.Length > 0) { NativeMemory.PutString((nint)buf, strStart, s, s.Length); }
             return buf.ToStr(0, width);
         }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(s.Length + diff * firstRune.Length);
         if (!padLeft) { sb.Append(s); }
         for (int k = 0; k < diff; k = k + 1) { sb.Append(firstRune); }
         if (padLeft) { sb.Append(s); }
@@ -130,33 +133,46 @@ public class StringExtensions {
         if (s == null) { return null; }
         int len = s.Length;
         if (len == 0) { return ""; }
-        int i = 0;
-        int lastNonWs = 0;
-        while (i < len) {
-            int b = s[i] & 255;
+        int end = len;
+        while (end > 0) {
+            int b = s[end - 1] & 255;
             if (b < 128) {
-                if (!StringExtensions.IsWhitespaceByte(b)) { lastNonWs = i + 1; }
-                i = i + 1;
-                continue;
+                if (StringExtensions.IsWhitespaceByte(b)) {
+                    end = end - 1;
+                    continue;
+                }
+                break;
             }
-            long res = Encoding.DecodeCodePointFast(s, i);
+            // 从尾字节回退最多 3 字节定位 UTF-8 首字节，O(尾部空白长度)
+            int cpStart = end - 1;
+            int minStart = end > 4 ? end - 4 : 0;
+            while (cpStart > minStart && (s[cpStart] & 192) == 128) {
+                cpStart = cpStart - 1;
+            }
+            long res = Encoding.DecodeCodePointFast(s, cpStart);
             int used = (int)(res >> 32);
-            if (used <= 0) { used = 1; }
-            if (!StringExtensions.IsWhitespaceCodePoint((int)(res & 0xFFFFFFFFL))) {
-                lastNonWs = i + used;
-            }
-            i = i + used;
+            if (cpStart + used != end) { break; }
+            if (!StringExtensions.IsWhitespaceCodePoint((int)(res & 0xFFFFFFFFL))) { break; }
+            end = cpStart;
         }
-        if (lastNonWs == len) { return s; }
-        if (lastNonWs == 0) { return ""; }
-        return s.Substring(0, lastNonWs);
+        if (end == len) { return s; }
+        if (end == 0) { return ""; }
+        return s.Substring(0, end);
     }
 
     public static string Insert(this string s, int index, string text) {
+        if (text == null || text.Length == 0) { return s; }
+        int slen = s.Length;
+        int tlen = text.Length;
         int at = index;
         if (at < 0) { at = 0; }
-        if (at > s.Length) { at = s.Length; }
-        return s.Substring(0, at) + text + s.Substring(at, s.Length - at);
+        if (at > slen) { at = slen; }
+        int total = slen + tlen;
+        byte[] buf = new byte[total];
+        if (at > 0) { NativeMemory.PutString((nint)buf, 0, s, at); }
+        NativeMemory.PutString((nint)buf, at, text, tlen);
+        if (at < slen) { NativeMemory.Copy((nint)buf + (nint)(at + tlen), (nint)s + (nint)at, slen - at); }
+        return buf.ToStr(0, total);
     }
 
     public static string Remove(this string s, int start) {
@@ -166,12 +182,21 @@ public class StringExtensions {
     }
 
     public static string Remove(this string s, int start, int count) {
+        int slen = s.Length;
         int at = start;
         if (at < 0) { at = 0; }
-        if (at >= s.Length) { return s; }
+        if (at >= slen) { return s; }
         int n = count < 0 ? 0 : count;
-        if (at + n > s.Length) { n = s.Length - at; }
-        return s.Substring(0, at) + s.Substring(at + n, s.Length - at - n);
+        if (n == 0) { return s; }
+        if (n > slen - at) { n = slen - at; }
+        if (at == 0) { return s.Substring(n, slen - n); }
+        if (at + n == slen) { return s.Substring(0, at); }
+        int tail = slen - at - n;
+        int total = at + tail;
+        byte[] buf = new byte[total];
+        NativeMemory.PutString((nint)buf, 0, s, at);
+        NativeMemory.Copy((nint)buf + (nint)at, (nint)s + (nint)(at + n), tail);
+        return buf.ToStr(0, total);
     }
 
     public static int CompareTo(this string s, string other) { return String.CompareOrdinal(s, other); }
@@ -259,6 +284,12 @@ public class StringExtensions {
         if (s == null) { return null; }
         int len = s.Length;
         if (len == 0) { return ""; }
+        bool needChange = false;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 97 && c <= 122) { needChange = true; break; }
+        }
+        if (!needChange) { return s; }
         byte[] b = s.ToBytes();
         MemoryExtensions.ToUpperAscii(b, 0, len);
         return b.ToStr(0, len);
@@ -268,6 +299,12 @@ public class StringExtensions {
         if (s == null) { return null; }
         int len = s.Length;
         if (len == 0) { return ""; }
+        bool needChange = false;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 65 && c <= 90) { needChange = true; break; }
+        }
+        if (!needChange) { return s; }
         byte[] b = s.ToBytes();
         MemoryExtensions.ToLowerAscii(b, 0, len);
         return b.ToStr(0, len);

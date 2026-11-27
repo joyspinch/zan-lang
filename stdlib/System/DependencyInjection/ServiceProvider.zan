@@ -8,6 +8,7 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     public Dictionary<string, object> singletons;
     public Dictionary<string, object> scopedInstances;
     public Dictionary<string, bool> building;
+    private Dictionary<string, long> buildingThreads;
     public ServiceProvider rootProvider;
     public nint syncLock;
     public bool isDisposed;
@@ -16,13 +17,19 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
         this.syncLock = Mutex.Create();
         this.isDisposed = false;
         this.rootProvider = root;
-        this.descriptorMap = new Dictionary<string, ServiceDescriptor>();
-        this.building = new Dictionary<string, bool>();
+        this.building = null;
+        this.buildingThreads = null;
 
-        if (descriptors != null) {
-            for (int i = 0; i < descriptors.Count; i = i + 1) {
-                ServiceDescriptor d = descriptors[i];
-                this.descriptorMap[d.serviceType] = d;
+        if (descriptors == null && root != null) {
+            // 子 scope 共享根容器只读描述表，零分配且 GetService 仅查一次
+            this.descriptorMap = root.descriptorMap;
+        } else {
+            this.descriptorMap = new Dictionary<string, ServiceDescriptor>();
+            if (descriptors != null) {
+                for (int i = 0; i < descriptors.Count; i = i + 1) {
+                    ServiceDescriptor d = descriptors[i];
+                    this.descriptorMap[d.serviceType] = d;
+                }
             }
         }
 
@@ -47,7 +54,8 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
         }
 
         ServiceDescriptor d = null;
-        if (!this.descriptorMap.TryGetValue(serviceType, out d) && this.rootProvider != null) {
+        if (!this.descriptorMap.TryGetValue(serviceType, out d) &&
+            this.rootProvider != null && this.descriptorMap != this.rootProvider.descriptorMap) {
             this.rootProvider.descriptorMap.TryGetValue(serviceType, out d);
         }
 
@@ -79,19 +87,33 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
 
     private object ResolveCached(ServiceProvider owner, Dictionary<string, object> cache,
                                  string serviceType, ServiceDescriptor d) {
-        Mutex.Lock(owner.syncLock);
-        object existing = null;
-        if (cache.TryGetValue(serviceType, out existing)) {
+        long tid = Thread.CurrentId();
+        if (tid == 0) { tid = 1; }
+        while (true) {
+            Mutex.Lock(owner.syncLock);
+            object existing = null;
+            if (cache.TryGetValue(serviceType, out existing)) {
+                Mutex.Unlock(owner.syncLock);
+                return existing;
+            }
+            if (owner.buildingThreads != null) {
+                long ownerTid = 0;
+                if (owner.buildingThreads.TryGetValue(serviceType, out ownerTid)) {
+                    Mutex.Unlock(owner.syncLock);
+                    if (ownerTid == tid) {
+                        throw new InvalidOperationException(
+                            "A circular dependency was detected for the service of type '" + serviceType + "'.");
+                    }
+                    Thread.Sleep(1);
+                    continue;
+                }
+            } else {
+                owner.buildingThreads = new Dictionary<string, long>();
+            }
+            owner.buildingThreads[serviceType] = tid;
             Mutex.Unlock(owner.syncLock);
-            return existing;
+            break;
         }
-        if (owner.building.ContainsKey(serviceType)) {
-            Mutex.Unlock(owner.syncLock);
-            throw new InvalidOperationException(
-                "A circular dependency was detected for the service of type '" + serviceType + "'.");
-        }
-        owner.building[serviceType] = true;
-        Mutex.Unlock(owner.syncLock);
 
         object created = null;
         try {
@@ -100,7 +122,9 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             }
         } finally {
             Mutex.Lock(owner.syncLock);
-            owner.building.Remove(serviceType);
+            if (owner.buildingThreads != null) {
+                owner.buildingThreads.Remove(serviceType);
+            }
             if (created != null) {
                 cache[serviceType] = created;
             }
@@ -118,16 +142,19 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     private void DisposeInstanceMap(Dictionary<string, object> map) {
         if (map == null) { return; }
         Mutex.Lock(this.syncLock);
-        List<string> keys = map.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            object obj = map[keys[i]];
-            if (obj is IDisposable) {
-                IDisposable disp = (IDisposable)obj;
-                disp.Dispose();
+        try {
+            List<object> vals = map.Values;
+            for (int i = 0; i < vals.Count; i = i + 1) {
+                object obj = vals[i];
+                if (obj is IDisposable) {
+                    IDisposable disp = (IDisposable)obj;
+                    disp.Dispose();
+                }
             }
+            map.Clear();
+        } finally {
+            Mutex.Unlock(this.syncLock);
         }
-        map.Clear();
-        Mutex.Unlock(this.syncLock);
     }
 
     public void Dispose() {

@@ -38,10 +38,11 @@ public class BlockingQueue<T> : IDisposable {
         this.capacity = capacity > 0 ? capacity : 0;
         this.lockHandle = Mutex.Create();
         this.sem = Semaphore.Create(0, 1048576);
-        this.slots = Semaphore.Create(0, 1048576);
+        this.slots = this.capacity > 0 ? Semaphore.Create(0, 1048576) : 0;
     }
 
     private static void ReleaseWaiters(nint semHandle, int count) {
+        if (semHandle == 0) { return; }
         for (int i = 0; i < count; i = i + 1) {
             Semaphore.Release(semHandle);
         }
@@ -83,6 +84,7 @@ public class BlockingQueue<T> : IDisposable {
 
     // 超时或队列已结束返回 false；负超时无限等待。
     public bool EnqueueFor(T item, int timeoutMs) {
+        long deadline = timeoutMs >= 0 ? DateTime.GetCurrentUnixMilliseconds() + (long)timeoutMs : -1L;
         while (true) {
             Mutex.Lock(this.lockHandle);
             if (this.closed) {
@@ -96,9 +98,18 @@ public class BlockingQueue<T> : IDisposable {
                 if (wake) { Semaphore.Release(this.sem); }
                 return true;
             }
+            int waitMs = timeoutMs;
+            if (deadline >= 0L) {
+                long rem = deadline - DateTime.GetCurrentUnixMilliseconds();
+                if (rem <= 0L) {
+                    Mutex.Unlock(this.lockHandle);
+                    return false;
+                }
+                waitMs = rem > 2147483647L ? 2147483647 : (int)rem;
+            }
             this.posters = this.posters + 1;
             Mutex.Unlock(this.lockHandle);
-            if (Semaphore.WaitFor(this.slots, timeoutMs)) { continue; }
+            if (Semaphore.WaitFor(this.slots, waitMs)) { continue; }
             Mutex.Lock(this.lockHandle);
             bool parked = this.posters > 0;
             if (parked) { this.posters = this.posters - 1; }
@@ -119,6 +130,7 @@ public class BlockingQueue<T> : IDisposable {
     }
 
     public T DequeueFor(int timeoutMs) {
+        long deadline = timeoutMs >= 0 ? DateTime.GetCurrentUnixMilliseconds() + (long)timeoutMs : -1L;
         while (true) {
             Mutex.Lock(this.lockHandle);
             if (this.head < this.items.Count) {
@@ -132,9 +144,18 @@ public class BlockingQueue<T> : IDisposable {
                 Mutex.Unlock(this.lockHandle);
                 return this.empty;
             }
+            int waitMs = timeoutMs;
+            if (deadline >= 0L) {
+                long rem = deadline - DateTime.GetCurrentUnixMilliseconds();
+                if (rem <= 0L) {
+                    Mutex.Unlock(this.lockHandle);
+                    return this.empty;
+                }
+                waitMs = rem > 2147483647L ? 2147483647 : (int)rem;
+            }
             this.waiters = this.waiters + 1;
             Mutex.Unlock(this.lockHandle);
-            if (Semaphore.WaitFor(this.sem, timeoutMs)) { continue; }
+            if (Semaphore.WaitFor(this.sem, waitMs)) { continue; }
             Mutex.Lock(this.lockHandle);
             bool parked = this.waiters > 0;
             if (parked) { this.waiters = this.waiters - 1; }
@@ -241,13 +262,18 @@ public class BlockingQueue<T> : IDisposable {
     }
 
     public T TakeLocked() {
-        if (this.head >= this.items.Count) { return this.empty; }
+        int n = this.items.Count;
+        if (this.head >= n) { return this.empty; }
         T v = this.items[this.head];
         this.head = this.head + 1;
-        if (this.head > 64 && this.head * 2 >= this.items.Count) {
+        if (this.head >= n) {
+            this.items.Clear();
+            this.head = 0;
+        } else if (this.head >= 64 && this.head * 2 >= n) {
             List<T> rest = new List<T>();
+            rest.Reserve(n - this.head);
             int i = this.head;
-            while (i < this.items.Count) {
+            while (i < n) {
                 rest.Add(this.items[i]);
                 i = i + 1;
             }
