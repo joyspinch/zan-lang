@@ -523,3 +523,50 @@
   坑出处：xiangqi / gomoku / weiqi / breakout / ddz 五个项目接设置时，
   高亮不生效的根因是"行内 style 压过 class"（实为没写那条 class 规则），
   `SetClassIn` 的 group 不含状态类会留下脏 class。
+
+- **协程入口与 `Task.Run` 静态析构竞态**：`Task.Run(AsyncFn())` 是即发即忘
+  （fire-and-forget）；从同步 `static void Main()` 调出后，主函数立刻返回并执行
+  `__zan_static_cleanup()`，把所有 `static` 字段（常量查找表、单例、零值对象）
+  释放并置空，正在后台跑的协程随后访问静态字段即空指针崩溃。需要等待协程跑完的
+  入口与探针必须声明 `static async void Main()`。
+
+- **容器与指针原语契约三则**：① `List<T>` 没有 `int` 容量构造器（`new List<T>(n)`
+  运行期崩溃），预分配一律 `new List<T>()` + `.Reserve(n)`；② `Queue<T>.Count()`
+  是方法而非属性（与 `List<T>.Count` 属性相反）；③ `nint` 构造器与形参不隐式接受
+  整型字面量 `0`，须显式强转 `(nint)0`。
+
+- **无确定性 `Dispose()` 对象的异步串行化**：`AsyncRwLock` 内部创建 OS `Mutex`
+  且必须显式 `Dispose()` 回收；对于没有确定性关闭生命周期的代理/会话对象，需要串行
+  执行异步操作时应使用 `lock (this)` + `bool busy` + `Queue<AsyncGate>`（零 OS
+  互斥量，随对象 ARC 回收不泄漏）。锁内只做状态切换与出队，`AsyncGate.Set()` 唤醒
+  一律放在 `lock` 块外，避免重入回调引发死锁。
+
+- **数据库连接池、驱动锁与原生句柄生命周期**：
+  ① 跨线程共享的连接门锁（`AcquireLock`/`ReleaseLock`/`Close`）必须用 `lock (this)`
+  保护状态位与等待队列，`Close()` 将等待队列摘出并在锁外逐一唤醒；② 建连/握手/打开
+  文件在任何提前失败路径都必须调用 `Close()` 回收已分配的 TLS、socket、认证上下文、
+  `RwLock`/`Mutex`，对象销毁时逐级释放子组件持有的原生互斥量；③ 使用
+  `AsyncTlsStream` 的连接在连接池归还遇到残留事务时，严禁降级调同步 `Rollback()`
+  直接读写底层 fd（会绕过 TLS 帧层或破坏密文流），须异步派发 `RollbackAsync()`
+  完成后再归还或关闭剔除；④ POSIX 文件描述符有效性判据是 `fd < 0`（`0` 是合法 fd，
+  严禁 `fd <= 0`）；⑤ 跨进程/多工作进程并发写锁或租约文件（如分布式锁/会话表）
+  须带 `Environment.ProcessId` 前缀，避免不同进程内自增计数器撞号。
+
+- **不受信任输入、协议缓冲与系统互操作边界**：
+  ① 解压帧（LZ4）、磁盘快照（HNSW `batchLen`）、分块流与加密迭代次数（PBKDF2/SCRAM）
+  在分配或循环前必须校验剩余字节与安全上限（如 KDF 迭代上限 `10_000_000`），防止
+  恶意输入触发 OOM 或 CPU DoS；② 图像像素缓冲区宽高乘积与步长计算用 64 位整数防
+  溢出，缩放在 `w==1` 或 `h==1` 边界独立钳制插值索引；③ 只读 JSON 响应解析优先使用
+  零树分配的 `JsonDoc`（`FirstChild`/`NextSibling` $O(N)$ 遍历，严禁循环调用
+  `At(i)` 退化为 $O(N^2)$），RPC 请求统一走 `JsonRpcBuilder`，JS 参数注入统一走
+  `JSON.parse(JsQuote(...))`，URL 主机解析兼容 IPv6 `[host]:port`；④ 高频协议
+  编码缓冲与密钥流（TDS/Firebird/RESP）用紧凑 `byte[]` + `NativeMemory.Copy` 替代
+  `List<int>` 逐字节拼接，订阅表退订直接槽位置 `null` + `activeCount` 实现 $O(1)$
+  并即刻释放闭包引用；⑤ Windows GDI `SelectObject` 必在 `try/finally` 中恢复旧对象
+  再释放 DC，剪贴板/动态库搜索目录（`SetDllDirectoryA`）必在 `finally` 还原。
+
+- **多线程并发用例防启动竞态**：测试读线程与写线程并发时，若主线程在写线程结束后
+  等待 `while (readRounds == 0)`，而读线程写成 `while (writeDone == 0)`，高负载下
+  写线程抢先跑完会导致读线程零轮退出、主线程永久死等。读线程循环须保证至少执行
+  一轮（`bool first = true; while (first || writeDone.Load() == 0) { first = false; ... }`）。
+
