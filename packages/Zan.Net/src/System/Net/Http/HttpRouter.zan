@@ -6,71 +6,163 @@ namespace System.Net.Http;
 
 public class HttpRouter {
     private List<HttpRoute> routes;
+    private int[] bucketHead;
+    private int[] bucketTail;
+    private int[] nextRoute;
+    private int bucketMask;
 
     // 创建空路由表。
     public HttpRouter() {
         this.routes = new List<HttpRoute>();
+        this.bucketHead = null;
+        this.bucketTail = null;
+        this.nextRoute = null;
+        this.bucketMask = 0;
+    }
+
+    private static ulong HashString(string s) {
+        ulong h = 14695981039346656037UL;
+        if (s == null) { return h; }
+        int len = s.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            h = (h ^ (ulong)(s[i] & 255)) * 1099511628211UL;
+        }
+        return h;
+    }
+
+    private static ulong HashView(StringView pv) {
+        ulong h = 14695981039346656037UL;
+        int len = pv.length;
+        if (len <= 0 || pv.ptr == 0) { return h; }
+        Span<byte> sp = new Span<byte>(pv.ptr, len);
+        for (int i = 0; i < len; i = i + 1) {
+            h = (h ^ (ulong)(sp[i] & 255)) * 1099511628211UL;
+        }
+        return h;
+    }
+
+    private void RebuildIndex(int minBuckets) {
+        int cap = 16;
+        while (cap < minBuckets) { cap = cap << 1; }
+        int[] heads = new int[cap];
+        int[] tails = new int[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            heads[i] = -1;
+            tails[i] = -1;
+        }
+        int n = this.routes.Count;
+        int nextCap = n > cap ? n : cap;
+        int[] next = new int[nextCap];
+        int mask = cap - 1;
+        for (int i = 0; i < n; i = i + 1) {
+            next[i] = -1;
+            int b = (int)(HttpRouter.HashString(this.routes[i].path) & (ulong)mask);
+            if (heads[b] < 0) {
+                heads[b] = i;
+                tails[b] = i;
+            } else {
+                next[tails[b]] = i;
+                tails[b] = i;
+            }
+        }
+        this.bucketHead = heads;
+        this.bucketTail = tails;
+        this.nextRoute = next;
+        this.bucketMask = mask;
+    }
+
+    private void AddRoute(HttpRoute route) {
+        int idx = this.routes.Count;
+        this.routes.Add(route);
+        if (this.bucketHead == null || (idx + 1) * 2 > this.bucketHead.Length) {
+            this.RebuildIndex((idx + 1) * 2);
+            return;
+        }
+        if (idx >= this.nextRoute.Length) {
+            int[] grown = new int[this.nextRoute.Length * 2];
+            for (int i = 0; i < idx; i = i + 1) { grown[i] = this.nextRoute[i]; }
+            this.nextRoute = grown;
+        }
+        this.nextRoute[idx] = -1;
+        int b = (int)(HttpRouter.HashString(route.path) & (ulong)this.bucketMask);
+        if (this.bucketHead[b] < 0) {
+            this.bucketHead[b] = idx;
+            this.bucketTail[b] = idx;
+        } else {
+            this.nextRoute[this.bucketTail[b]] = idx;
+            this.bucketTail[b] = idx;
+        }
     }
 
     // 注册一条 GET 路由。
     public HttpRouter Get(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("GET", path, responseBody));
+        this.AddRoute(new HttpRoute("GET", path, responseBody));
         return this;
     }
 
     // 注册一条 POST 路由。
     public HttpRouter Post(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("POST", path, responseBody));
+        this.AddRoute(new HttpRoute("POST", path, responseBody));
         return this;
     }
 
     // 注册一条 PUT 路由。
     public HttpRouter Put(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("PUT", path, responseBody));
+        this.AddRoute(new HttpRoute("PUT", path, responseBody));
         return this;
     }
 
     // 注册一条 DELETE 路由。
     public HttpRouter Delete(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("DELETE", path, responseBody));
+        this.AddRoute(new HttpRoute("DELETE", path, responseBody));
         return this;
     }
 
     // 注册一条 PATCH 路由 (RFC 5789)。
     public HttpRouter Patch(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("PATCH", path, responseBody));
+        this.AddRoute(new HttpRoute("PATCH", path, responseBody));
         return this;
     }
 
     // 注册一条 HEAD 路由 (RFC 7231 §4.3.2)。
     public HttpRouter Head(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("HEAD", path, responseBody));
+        this.AddRoute(new HttpRoute("HEAD", path, responseBody));
         return this;
     }
 
     // 注册一条 OPTIONS 路由 (RFC 7231 §4.3.7)。
     public HttpRouter Options(string path, string responseBody) {
-        this.routes.Add(new HttpRoute("OPTIONS", path, responseBody));
+        this.AddRoute(new HttpRoute("OPTIONS", path, responseBody));
         return this;
     }
 
     // 注册适用于任意方法的路由。
     public HttpRouter Route(string method, string path, string responseBody) {
-        this.routes.Add(new HttpRoute(method, path, responseBody));
+        this.AddRoute(new HttpRoute(method, path, responseBody));
         return this;
     }
 
-    // 将请求匹配到已注册的路由。
+    // 将请求匹配到已注册的路由（O(1) 零分配 StringView 哈希桶查找，保持先注册先命中语义）。
     // 若路径完全匹配但请求方法不被允许，返回 405 Method Not Allowed 并携带 Allow 头部 (RFC 7231 §6.5.5)。
     // 若路径未匹配，返回 404 Not Found。
     public HttpResponse Match(HttpRequest request) {
+        if (this.bucketHead == null || this.routes.Count == 0) {
+            return HttpResponse.NotFound();
+        }
         StringView pv = request.PathView();
+        int b = (int)(HttpRouter.HashView(pv) & (ulong)this.bucketMask);
+        int cur = this.bucketHead[b];
+        if (cur < 0) {
+            return HttpResponse.NotFound();
+        }
         bool pathMatched = false;
         StringBuilder allowSb = null;
-        foreach (HttpRoute r in this.routes) {
+        string reqMethod = request.method;
+        while (cur >= 0) {
+            HttpRoute r = this.routes[cur];
             if (pv.Equals(r.path)) {
                 pathMatched = true;
-                if (r.method == request.method || r.method == "*") {
+                if (r.method == reqMethod || r.method == "*") {
                     return HttpResponse.Ok(r.response);
                 }
                 if (r.method != "*") {
@@ -84,6 +176,7 @@ public class HttpRouter {
                     }
                 }
             }
+            cur = this.nextRoute[cur];
         }
         if (pathMatched) {
             return HttpResponse.MethodNotAllowed(allowSb != null ? allowSb.ToString() : "");
@@ -99,5 +192,9 @@ public class HttpRouter {
     // 清空所有已注册路由规则。
     public void Clear() {
         this.routes.Clear();
+        this.bucketHead = null;
+        this.bucketTail = null;
+        this.nextRoute = null;
+        this.bucketMask = 0;
     }
 }

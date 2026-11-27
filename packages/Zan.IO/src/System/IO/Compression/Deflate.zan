@@ -659,8 +659,14 @@ public class Deflate {
         int[] distBase = Deflate.DistBase;
         int[] distExtra = Deflate.DistExtra;
 
-        // 哈希表：16 位哈希 -> 链头位置（从 1 开始，0 表示空）。
-        int[] head = new int[65536];
+        // 自适应哈希表尺寸：小块用 12/14 位免除每次 256 KiB 清零开销，乘法散列大幅降冲突。
+        int hashBits = 16;
+        if (n <= 4096) { hashBits = 12; }
+        else if (n <= 16384) { hashBits = 14; }
+        int hashSize = 1 << hashBits;
+        int hashMask = hashSize - 1;
+        int hashShift = 32 - hashBits;
+        int[] head = new int[hashSize];
         int[] prev = new int[n];
 
         int outPos = bitPos >> 3;
@@ -671,34 +677,43 @@ public class Deflate {
         while (pos < n) {
             int match = 0;
             int matchLen = 0;
-            // 在 pos 处查找最长匹配（对 3 字节取哈希），一次计算同时用于查找和插入。
+            // 在 pos 处查找最长匹配（3 字节 Knuth 乘法散列），一次计算同时用于查找和插入。
             if (pos + 2 < n) {
-                int h = ((((src[pos] & 255) << 8) | (src[pos + 1] & 255)) ^
-                        (src[pos + 2] & 255)) & 65535;
+                int b0 = src[pos] & 255;
+                int b1 = src[pos + 1] & 255;
+                int b2 = src[pos + 2] & 255;
+                uint key3 = (uint)((b0 << 16) | (b1 << 8) | b2);
+                int h = (int)((key3 * 506832829U) >> hashShift) & hashMask;
                 int cand = head[h];  // 从 1 开始的位置
                 prev[pos] = cand;
                 head[h] = pos + 1;
+                byte p0 = (byte)b0;
+                byte p1 = (byte)b1;
+                int maxLBase = n - pos;
+                if (maxLBase > 258) { maxLBase = 258; }
                 for (int chain = 0; cand > 0 && chain < maxChain; chain = chain + 1) {
                     int c0 = cand - 1;
                     int dist = pos - c0;
                     if (dist > 32768) { break; }
                     if (dist > 0) {
-                        // 首尾剪枝：若 matchLen 处字符不等，绝不可能更长
-                        if (matchLen > 0 && pos + matchLen < n && src[c0 + matchLen] != src[pos + matchLen]) {
+                        // 首尾双剪枝：先验 matchLen 处字符与首 2 字节，最快过滤伪命中
+                        if (matchLen > 0 && matchLen < maxLBase && src[c0 + matchLen] != src[pos + matchLen]) {
                             cand = prev[c0];
                             continue;
                         }
-                        int maxL = n - pos;
-                        if (maxL > 258) { maxL = 258; }
-                        int l = 0;
-                        while (l + 4 <= maxL) {
+                        if (src[c0] != p0 || src[c0 + 1] != p1) {
+                            cand = prev[c0];
+                            continue;
+                        }
+                        int l = 2;
+                        while (l + 4 <= maxLBase) {
                             if (src[c0 + l] != src[pos + l] || src[c0 + l + 1] != src[pos + l + 1] ||
                                 src[c0 + l + 2] != src[pos + l + 2] || src[c0 + l + 3] != src[pos + l + 3]) {
                                 break;
                             }
                             l = l + 4;
                         }
-                        while (l < maxL && src[c0 + l] == src[pos + l]) {
+                        while (l < maxLBase && src[c0 + l] == src[pos + l]) {
                             l = l + 1;
                         }
                         if (l > matchLen) {

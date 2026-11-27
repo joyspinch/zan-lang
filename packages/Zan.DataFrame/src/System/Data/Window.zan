@@ -103,7 +103,97 @@ public class Window {
             return outp;
         }
 
-        // 通用路径（含缺失值或 Str 列）：直接扫描窗口，零 windowRows 分配。
+        // 含缺失值数值列 O(N) 滑动窗口 / 单调双端队列快路径（消除 O(N×W) 嵌套扫描）。
+        if (src.kind == ColKind.Float || src.kind == ColKind.Int) {
+            byte[] miss = new byte[n];
+            int mc = src.missing.Count;
+            if (mc > n) { mc = n; }
+            List<bool> sm = src.missing;
+            for (int r = 0; r < mc; r = r + 1) {
+                if (sm[r]) { miss[r] = 1; }
+            }
+            double[] vals = new double[n];
+            if (src.kind == ColKind.Float) {
+                List<double> sn = src.nums;
+                for (int r = 0; r < n; r = r + 1) { vals[r] = sn[r]; }
+            } else {
+                List<long> si = src.ints;
+                for (int r = 0; r < n; r = r + 1) { vals[r] = (double)si[r]; }
+            }
+            if (agg == Agg.Sum || agg == Agg.Avg) {
+                if (window <= 32) {
+                    for (int r = 0; r < n; r = r + 1) {
+                        int lo = r - window + 1;
+                        if (lo < 0) { lo = 0; }
+                        if (r - lo + 1 < need) { continue; }
+                        int valid = 0;
+                        double s = 0.0;
+                        for (int i = lo; i <= r; i = i + 1) {
+                            if (miss[i] == 0) {
+                                s = s + vals[i];
+                                valid = valid + 1;
+                            }
+                        }
+                        if (valid > 0) {
+                            dst.PutDouble(r, agg == Agg.Sum ? s : s / (double)valid);
+                        } else {
+                            dst.PutDouble(r, 0.0);
+                        }
+                    }
+                    return outp;
+                }
+                int valid = 0;
+                double run = 0.0;
+                for (int r = 0; r < n; r = r + 1) {
+                    if (miss[r] == 0) {
+                        run = run + vals[r];
+                        valid = valid + 1;
+                    }
+                    if (r >= window) {
+                        int outIdx = r - window;
+                        if (miss[outIdx] == 0) {
+                            run = run - vals[outIdx];
+                            valid = valid - 1;
+                        }
+                    }
+                    int cnt = r + 1 < window ? r + 1 : window;
+                    if (cnt >= need) {
+                        if (valid > 0) {
+                            dst.PutDouble(r, agg == Agg.Sum ? run : run / (double)valid);
+                        } else {
+                            dst.PutDouble(r, 0.0);
+                        }
+                    }
+                }
+                return outp;
+            }
+            // Agg.Min / Agg.Max：跳过缺失项的单调双端队列 O(N) 精确求极值。
+            int[] dq = new int[n];
+            int head = 0;
+            int tail = 0;
+            bool isMax = agg == Agg.Max;
+            for (int r = 0; r < n; r = r + 1) {
+                int lo = r - window + 1;
+                if (lo < 0) { lo = 0; }
+                while (head < tail && dq[head] < lo) { head = head + 1; }
+                if (miss[r] == 0) {
+                    double vr = vals[r];
+                    if (isMax) {
+                        while (head < tail && vals[dq[tail - 1]] <= vr) { tail = tail - 1; }
+                    } else {
+                        while (head < tail && vals[dq[tail - 1]] >= vr) { tail = tail - 1; }
+                    }
+                    dq[tail] = r;
+                    tail = tail + 1;
+                }
+                if (r - lo + 1 >= need) {
+                    dst.PutDouble(r, head < tail ? vals[dq[head]] : 0.0);
+                }
+            }
+            return outp;
+        }
+
+        // 通用路径（Str 列）：直接扫描窗口，零 windowRows 分配。
         for (int r = 0; r < n; r = r + 1) {
             int lo = r - window + 1;
             if (lo < 0) { lo = 0; }

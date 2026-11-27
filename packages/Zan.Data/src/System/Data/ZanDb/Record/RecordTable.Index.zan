@@ -19,23 +19,26 @@ public partial class RecordTable {
             List<string> sortedKeys = new List<string>();
             this.indexKeysSorted[colName] = sortedKeys;
 
-            // 扫描当前所有活跃行填充索引
+            // 扫描当前所有活跃行填充索引（收集后一次性 O(K log K) 排序，消除 O(K^2) 插入搬移）
             for (int id = 1; id <= this.totalRows; id = id + 1) {
                 if (!this.tombstones.ContainsKey(id)) {
                     RecordRow r = this.GetLocked(id);
                     if (r != null) {
-                        string key = this.ExtractColKey(r, colName);
+                        string key = col != null ? RecordTable.ExtractColKeyFor(r, col) : this.ExtractColKey(r, colName);
                         if (key != null) {
                             List<int> bucket = null;
                             if (!idx.TryGetValue(key, out bucket)) {
                                 bucket = new List<int>();
                                 idx[key] = bucket;
-                                RecordTable.InsertSortedKey(sortedKeys, key);
+                                sortedKeys.Add(key);
                             }
                             bucket.Add(id);
                         }
                     }
                 }
+            }
+            if (sortedKeys.Count > 1) {
+                RecordTable.SortKeysOrdinal(sortedKeys, 0, sortedKeys.Count - 1);
             }
             this.SaveIndexesLocked();
         } finally {
@@ -45,11 +48,13 @@ public partial class RecordTable {
 
     public void IndexRowLocked(RecordRow r) {
         if (this.indexes.Count == 0 || r == null) { return; }
-        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
-            string colName = this.schema.columns[i].name;
+        int colCount = this.schema.columns.Count;
+        for (int i = 0; i < colCount; i = i + 1) {
+            RecordColumn col = this.schema.columns[i];
+            string colName = col.name;
             Dictionary<string, List<int>> idx = null;
             if (this.indexes.TryGetValue(colName, out idx)) {
-                string key = this.ExtractColKey(r, colName);
+                string key = RecordTable.ExtractColKeyFor(r, col);
                 if (key != null) {
                     List<int> bucket = null;
                     if (!idx.TryGetValue(key, out bucket)) {
@@ -59,17 +64,28 @@ public partial class RecordTable {
                         if (this.indexKeysSorted.TryGetValue(colName, out sk)) {
                             RecordTable.InsertSortedKey(sk, key);
                         }
-                    }
-                    bool exists = false;
-                    int bcnt = bucket.Count;
-                    for (int j = 0; j < bcnt; j = j + 1) {
-                        if (bucket[j] == r.id) {
-                            exists = true;
-                            break;
-                        }
-                    }
-                    if (!exists) {
                         bucket.Add(r.id);
+                    } else {
+                        int bcnt = bucket.Count;
+                        if (bcnt == 0 || bucket[bcnt - 1] < r.id) {
+                            bucket.Add(r.id);
+                        } else if (bucket[bcnt - 1] != r.id) {
+                            int lo = 0;
+                            int hi = bcnt - 1;
+                            int ins = bcnt;
+                            bool exists = false;
+                            while (lo <= hi) {
+                                int mid = lo + ((hi - lo) >> 1);
+                                int v = bucket[mid];
+                                if (v == r.id) { exists = true; break; }
+                                if (v < r.id) { lo = mid + 1; }
+                                else { ins = mid; hi = mid - 1; }
+                            }
+                            if (!exists) {
+                                if (ins >= bcnt) { bucket.Add(r.id); }
+                                else { bucket.Insert(ins, r.id); }
+                            }
+                        }
                     }
                 }
             }
@@ -78,17 +94,34 @@ public partial class RecordTable {
 
     public void UnindexRowLocked(RecordRow r) {
         if (this.indexes.Count == 0 || r == null) { return; }
-        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
-            string colName = this.schema.columns[i].name;
+        int colCount = this.schema.columns.Count;
+        for (int i = 0; i < colCount; i = i + 1) {
+            RecordColumn col = this.schema.columns[i];
+            string colName = col.name;
             Dictionary<string, List<int>> idx = null;
             if (this.indexes.TryGetValue(colName, out idx)) {
-                string key = this.ExtractColKey(r, colName);
+                string key = RecordTable.ExtractColKeyFor(r, col);
                 List<int> list = null;
                 if (key != null && idx.TryGetValue(key, out list)) {
-                    for (int j = 0; j < list.Count; j = j + 1) {
-                        if (list[j] == r.id) {
-                            list.RemoveAt(j);
-                            break;
+                    int lo = 0;
+                    int hi = list.Count - 1;
+                    int found = -1;
+                    while (lo <= hi) {
+                        int mid = lo + ((hi - lo) >> 1);
+                        int v = list[mid];
+                        if (v == r.id) { found = mid; break; }
+                        if (v < r.id) { lo = mid + 1; }
+                        else { hi = mid - 1; }
+                    }
+                    if (found >= 0) {
+                        list.RemoveAt(found);
+                    } else {
+                        // 兼容外部未排序桶的回退路径
+                        for (int j = 0; j < list.Count; j = j + 1) {
+                            if (list[j] == r.id) {
+                                list.RemoveAt(j);
+                                break;
+                            }
                         }
                     }
                     if (list.Count == 0) {
@@ -195,9 +228,50 @@ public partial class RecordTable {
         }
     }
 
-    public string ExtractColKey(RecordRow r, string colName) {
-        RecordColumn col = this.schema.FindColumn(colName);
+    private static void SortKeysOrdinal(List<string> a, int lo, int hi) {
+        while (hi - lo > 16) {
+            int mid = lo + ((hi - lo) >> 1);
+            string x = a[lo];
+            string y = a[mid];
+            string z = a[hi];
+            string pivot = String.CompareOrdinal(x, y) < 0
+                ? (String.CompareOrdinal(y, z) < 0 ? y : (String.CompareOrdinal(x, z) < 0 ? z : x))
+                : (String.CompareOrdinal(x, z) < 0 ? x : (String.CompareOrdinal(y, z) < 0 ? z : y));
+            int i = lo;
+            int j = hi;
+            while (i <= j) {
+                while (String.CompareOrdinal(a[i], pivot) < 0) { i = i + 1; }
+                while (String.CompareOrdinal(a[j], pivot) > 0) { j = j - 1; }
+                if (i <= j) {
+                    string t = a[i];
+                    a[i] = a[j];
+                    a[j] = t;
+                    i = i + 1;
+                    j = j - 1;
+                }
+            }
+            if (j - lo < hi - i) {
+                if (lo < j) { RecordTable.SortKeysOrdinal(a, lo, j); }
+                lo = i;
+            } else {
+                if (i < hi) { RecordTable.SortKeysOrdinal(a, i, hi); }
+                hi = j;
+            }
+        }
+        for (int i = lo + 1; i <= hi; i = i + 1) {
+            string v = a[i];
+            int j = i - 1;
+            while (j >= lo && String.CompareOrdinal(a[j], v) > 0) {
+                a[j + 1] = a[j];
+                j = j - 1;
+            }
+            a[j + 1] = v;
+        }
+    }
+
+    private static string ExtractColKeyFor(RecordRow r, RecordColumn col) {
         if (col == null) { return null; }
+        string colName = col.name;
         if (col.dataType == RecordDataType.Int32) {
             return RecordTable.FormatIntKey(r.GetInt32(colName));
         } else if (col.dataType == RecordDataType.FixedStr) {
@@ -212,6 +286,10 @@ public partial class RecordTable {
             return r.GetBool(colName) ? "1" : "0";
         }
         return null;
+    }
+
+    public string ExtractColKey(RecordRow r, string colName) {
+        return RecordTable.ExtractColKeyFor(r, this.schema.FindColumn(colName));
     }
 
     private static bool EqualsAsciiIgnoreCase(string a, string b) {
@@ -383,22 +461,26 @@ public partial class RecordTable {
 
         for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
             string colName = this.schema.columns[i].name;
-            if (this.indexes.ContainsKey(colName)) {
-                Dictionary<string, List<int>> map = this.indexes[colName];
-                byte[] nb = Encoding.GetBytes(colName);
-                int nlen = nb != null ? nb.Length : 0;
+            Dictionary<string, List<int>> map = null;
+            if (this.indexes.TryGetValue(colName, out map)) {
+                int nlen = colName != null ? colName.Length : 0;
                 b.WriteU8(nlen);
-                for (int j = 0; j < nlen; j = j + 1) { b.WriteU8((int)nb[j]); }
+                if (nlen > 0) { b.WriteRaw(colName, nlen); }
 
-                List<string> keys = map.Keys;
-                b.WriteU32((long)keys.Count);
-                for (int k = 0; k < keys.Count; k = k + 1) {
+                // 优先按已有序键表持久化，加载时即可保持有序
+                List<string> keys = null;
+                if (this.indexKeysSorted == null || !this.indexKeysSorted.TryGetValue(colName, out keys)) {
+                    keys = map.Keys;
+                }
+                int kCount = keys.Count;
+                b.WriteU32((long)kCount);
+                for (int k = 0; k < kCount; k = k + 1) {
                     string key = keys[k];
-                    byte[] kb = Encoding.GetBytes(key);
-                    int klen = kb != null ? kb.Length : 0;
+                    int klen = key != null ? key.Length : 0;
                     b.WriteU16(klen);
-                    for (int j = 0; j < klen; j = j + 1) { b.WriteU8((int)kb[j]); }
-                    List<int> idList = map[key];
+                    if (klen > 0) { b.WriteRaw(key, klen); }
+                    List<int> idList = null;
+                    map.TryGetValue(key, out idList);
                     int idCount = idList != null ? idList.Count : 0;
                     b.WriteU32((long)idCount);
                     for (int j = 0; j < idCount; j = j + 1) {
@@ -457,26 +539,35 @@ public partial class RecordTable {
         this.indexKeysSorted.Clear();
         for (int c = 0; c < idxColCount; c = c + 1) {
             int nlen = b.ReadU8();
-            byte[] nb = new byte[nlen];
-            for (int j = 0; j < nlen; j = j + 1) { nb[j] = (byte)b.ReadU8(); }
-            string colName = Encoding.GetString(nb, 0, nlen);
+            string colName = nlen > 0 ? NativeMemory.GetString(b.data, b.rpos, nlen) : "";
+            b.SeekRead(b.rpos + nlen);
 
             Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
             List<string> sortedKeys = new List<string>();
             int kCount = (int)b.ReadU32();
+            sortedKeys.Reserve(kCount);
+            bool alreadySorted = true;
+            string prevKey = null;
             for (int k = 0; k < kCount; k = k + 1) {
                 int klen = b.ReadU16();
-                byte[] kb = new byte[klen];
-                for (int j = 0; j < klen; j = j + 1) { kb[j] = (byte)b.ReadU8(); }
-                string key = Encoding.GetString(kb, 0, klen);
+                string key = klen > 0 ? NativeMemory.GetString(b.data, b.rpos, klen) : "";
+                b.SeekRead(b.rpos + klen);
 
                 int idCount = (int)b.ReadU32();
                 List<int> ids = new List<int>();
+                ids.Reserve(idCount);
                 for (int j = 0; j < idCount; j = j + 1) {
                     ids.Add((int)b.ReadU32());
                 }
                 map[key] = ids;
-                RecordTable.InsertSortedKey(sortedKeys, key);
+                if (prevKey != null && String.CompareOrdinal(prevKey, key) >= 0) {
+                    alreadySorted = false;
+                }
+                prevKey = key;
+                sortedKeys.Add(key);
+            }
+            if (!alreadySorted && sortedKeys.Count > 1) {
+                RecordTable.SortKeysOrdinal(sortedKeys, 0, sortedKeys.Count - 1);
             }
             this.indexes[colName] = map;
             this.indexKeysSorted[colName] = sortedKeys;

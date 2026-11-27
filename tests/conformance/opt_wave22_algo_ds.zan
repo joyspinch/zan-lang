@@ -1,0 +1,343 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Data;
+using System.Data.ZanDb;
+using System.Net.Http;
+using System.Net.Mqtt;
+using System.Numerics;
+using Formats.Protobuf;
+using Game.Animation;
+using Game.Audio;
+
+class OptWave22AlgoDsTest {
+    static bool Near(double a, double b, double eps) {
+        double d = a - b;
+        if (d < 0.0) { d = -d; }
+        return d <= eps;
+    }
+
+    // 1. RecordTable.Index: EnsureIndex O(K log K), sorted buckets, Unindex, Save/LoadIndexesLocked
+    static bool TestZanDbIndex() {
+        Directory.CreateDirectory("_scratch");
+        string basePath = "_scratch/test_w22_idx";
+        string[] exts = new string[] { ".t.ztab", ".t.zblob", ".t.zidx", ".t.zwal" };
+        for (int i = 0; i < exts.Length; i = i + 1) {
+            if (File.Exists(basePath + exts[i])) { File.Delete(basePath + exts[i]); }
+        }
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("k");
+        schema.AddFixedStr("tag", 16);
+        RecordTable tbl = RecordTable.Open(basePath, "t", schema);
+        for (int i = 0; i < 200; i = i + 1) {
+            RecordRow row = new RecordRow(schema);
+            row.SetInt32("k", ((i * 73 + 17) % 100) - 50); // negative + duplicate keys
+            row.SetStr("tag", "t_" + Convert.ToString((i * 31) % 80));
+            tbl.Add(row);
+        }
+        tbl.EnsureIndex("k");
+        tbl.EnsureIndex("tag");
+
+        List<int> eq = tbl.FindIdsByIndex("k", "0");
+        if (eq.Count != 2) { Console.WriteLine("zdb eq fail: " + Convert.ToString(eq.Count)); tbl.Close(); return false; }
+        List<int> rng = tbl.FindIdsByRange("k", "-10", "10");
+        if (rng.Count != 42) { Console.WriteLine("zdb rng fail: " + Convert.ToString(rng.Count)); tbl.Close(); return false; }
+
+        // Delete one row and add a new row to exercise UnindexRowLocked + IndexRowLocked
+        tbl.Delete(eq[0]);
+        List<int> eqAfterDel = tbl.FindIdsByIndex("k", "0");
+        if (eqAfterDel.Count != 1) { Console.WriteLine("zdb del fail"); tbl.Close(); return false; }
+
+        RecordRow extra = new RecordRow(schema);
+        extra.SetInt32("k", 0);
+        extra.SetStr("tag", "t_new");
+        tbl.Add(extra);
+        if (tbl.FindIdsByIndex("k", "0").Count != 2) { Console.WriteLine("zdb add fail"); tbl.Close(); return false; }
+        tbl.Close();
+
+        // Reload persisted .zidx
+        RecordTable tbl2 = RecordTable.Open(basePath, "t", schema);
+        List<int> rng2 = tbl2.FindIdsByRange("k", "-10", "10");
+        List<int> tagNew = tbl2.FindIdsByIndex("tag", "t_new");
+        tbl2.Close();
+
+        for (int i = 0; i < exts.Length; i = i + 1) {
+            if (File.Exists(basePath + exts[i])) { File.Delete(basePath + exts[i]); }
+        }
+        if (rng2.Count != 42 || tagNew.Count != 1) {
+            Console.WriteLine("zdb reload fail");
+            return false;
+        }
+        return true;
+    }
+
+    // 2. MqttBroker: zero-alloc TopicMatches edge cases + O(1) Touch + O(1) SaveRetained
+    static bool TestMqtt() {
+        if (!MqttBroker.TopicMatches("#", "a/b/c")) { return false; }
+        if (!MqttBroker.TopicMatches("a/b/#", "a/b")) { return false; }
+        if (!MqttBroker.TopicMatches("a/b/#", "a/b/c/d")) { return false; }
+        if (!MqttBroker.TopicMatches("a/+", "a/")) { return false; }
+        if (!MqttBroker.TopicMatches("a/+", "a/x")) { return false; }
+        if (MqttBroker.TopicMatches("a/+", "a")) { return false; }
+        if (MqttBroker.TopicMatches("a/+", "a/x/y")) { return false; }
+        if (!MqttBroker.TopicMatches("+/+", "/")) { return false; }
+        if (!MqttBroker.TopicMatches("/a/+", "/a/b")) { return false; }
+        if (MqttBroker.TopicMatches("a/b", "a/c")) { return false; }
+        if (!MqttBroker.TopicMatches("", "")) { return false; }
+        if (MqttBroker.TopicMatches("a", "")) { return false; }
+
+        MqttBroker b = new MqttBroker("127.0.0.1", 0);
+        for (int i = 0; i < 50; i = i + 1) {
+            string t = "dev/" + Convert.ToString(i);
+            b.Publish(t, "v1", 0, true);
+            b.Publish(t, "v2", 1, true);
+        }
+        if (b.topics.Count != 50 || b.retainedMessages.Count != 50) { b.Shutdown(); return false; }
+        if (b.topics[0].messages != 2 || b.retainedMessages[0].payload != "v2") { b.Shutdown(); return false; }
+        // Clear single retained via empty payload
+        b.Publish("dev/10", "", 0, true);
+        if (b.retainedMessages.Count != 49) { b.Shutdown(); return false; }
+        // Clear via ClearRetained
+        if (!b.ClearRetained("dev/20") || b.retainedMessages.Count != 48) { b.Shutdown(); return false; }
+        if (!b.ClearRetained("") || b.retainedMessages.Count != 0) { b.Shutdown(); return false; }
+        b.Shutdown();
+        return true;
+    }
+
+    // 3. ProtoWriter: nested <128B (0-move), >=128B (2-byte len), >=16384B (3-byte len)
+    static bool TestProto() {
+        byte[] big = new byte[17000];
+        for (int i = 0; i < big.Length; i = i + 1) { big[i] = (byte)((i * 29 + 3) & 255); }
+
+        ProtoWriter pw = new ProtoWriter();
+        pw.BeginMessage(1);
+        pw.BeginMessage(2); // < 128B fast path
+        pw.WriteInt32(1, 150);
+        pw.WriteString(2, "hello");
+        pw.EndMessage();
+        pw.BeginMessage(3); // >= 16384B 3-byte varint shift path
+        pw.WriteBytes(1, big);
+        pw.EndMessage();
+        pw.EndMessage();
+
+        byte[] raw = pw.ToBytes();
+        ProtoReader rOuter = new ProtoReader(raw);
+        if (!rOuter.Next() || rOuter.FieldNumber() != 1 || rOuter.WireType() != 2) { return false; }
+        ProtoReader r1 = new ProtoReader(rOuter.ReadBytes());
+
+        if (!r1.Next() || r1.FieldNumber() != 2) { return false; }
+        ProtoReader rSmall = new ProtoReader(r1.ReadBytes());
+        if (!rSmall.Next() || rSmall.ReadInt32() != 150) { return false; }
+        if (!rSmall.Next() || rSmall.ReadString() != "hello") { return false; }
+
+        if (!r1.Next() || r1.FieldNumber() != 3) { return false; }
+        ProtoReader rBig = new ProtoReader(r1.ReadBytes());
+        if (!rBig.Next() || rBig.FieldNumber() != 1) { return false; }
+        byte[] gotBig = rBig.ReadBytes();
+        if (gotBig.Length != big.Length || gotBig[0] != big[0] || gotBig[16999] != big[16999]) { return false; }
+        return true;
+    }
+
+    // 4. Stats: Quickselect Median & Percentile vs SortedCopy across odd/even/duplicate/edge inputs
+    static bool TestStats() {
+        List<double> dup = new List<double>();
+        for (int i = 0; i < 100; i = i + 1) { dup.Add(7.5); }
+        if (Stats.Median(dup) != 7.5 || Stats.Percentile(dup, 0.37) != 7.5) { return false; }
+
+        int[] sizes = new int[] { 1, 2, 3, 16, 17, 64, 129, 1000 };
+        double[] qs = new double[] { 0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0 };
+        ulong st = 1234567UL;
+        for (int si = 0; si < sizes.Length; si = si + 1) {
+            int n = sizes[si];
+            List<double> xs = new List<double>();
+            for (int i = 0; i < n; i = i + 1) {
+                st = st * 6364136223846793005UL + 1442695040888963407UL;
+                xs.Add((double)(long)((st >> 40) % 200UL) * 0.5);
+            }
+            List<double> sorted = Stats.SortedCopy(xs);
+            double refMed = (n % 2 == 1) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) * 0.5;
+            if (!Near(Stats.Median(xs), refMed, 1e-12)) { return false; }
+            for (int qi = 0; qi < qs.Length; qi = qi + 1) {
+                double q = qs[qi];
+                double pos = q * (double)(n - 1);
+                int lo = (int)pos;
+                int hi = lo + 1 < n ? lo + 1 : lo;
+                double refP = sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - (double)lo);
+                if (!Near(Stats.Percentile(xs, q), refP, 1e-12)) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // 5. Window.Rolling nullable O(N) vs naive O(N*W) reference (including all-missing window)
+    static bool TestWindowNullable() {
+        int n = 300;
+        DataFrame df = new DataFrame();
+        df.AddColumn("v", ColKind.Float);
+        DataCol col = df.cols[0];
+        for (int i = 0; i < n; i = i + 1) {
+            col.nums.Add((double)((i * 53 + 7) % 97) - 40.0);
+            // Make rows [120..190] completely missing to test valid == 0 case
+            bool isMiss = (i % 7 == 0) || (i >= 120 && i <= 190);
+            col.missing.Add(isMiss);
+        }
+        df.rowCount = n;
+
+        int[] wins = new int[] { 8, 50 };
+        int[] aggs = new int[] { Agg.Sum, Agg.Avg, Agg.Min, Agg.Max };
+        for (int wi = 0; wi < wins.Length; wi = wi + 1) {
+            int w = wins[wi];
+            for (int ai = 0; ai < aggs.Length; ai = ai + 1) {
+                int agg = aggs[ai];
+                DataFrame gotDf = Window.Rolling(df, "v", w, agg, 4, "out");
+                List<double> got = gotDf.cols[1].nums;
+                for (int r = 0; r < n; r = r + 1) {
+                    int lo = r - w + 1;
+                    if (lo < 0) { lo = 0; }
+                    double expected = 0.0;
+                    if (r - lo + 1 >= 4) {
+                        int valid = 0;
+                        double sum = 0.0;
+                        double mn = 0.0;
+                        double mx = 0.0;
+                        for (int i = lo; i <= r; i = i + 1) {
+                            if (col.missing[i]) { continue; }
+                            double v = col.nums[i];
+                            if (valid == 0) { mn = v; mx = v; }
+                            else {
+                                if (v < mn) { mn = v; }
+                                if (v > mx) { mx = v; }
+                            }
+                            sum = sum + v;
+                            valid = valid + 1;
+                        }
+                        if (valid > 0) {
+                            if (agg == Agg.Sum) { expected = sum; }
+                            else if (agg == Agg.Avg) { expected = sum / (double)valid; }
+                            else if (agg == Agg.Min) { expected = mn; }
+                            else { expected = mx; }
+                        }
+                    }
+                    if (!Near(got[r], expected, 1e-9)) {
+                        Console.WriteLine("win mismatch w=" + Convert.ToString(w) + " agg=" + Convert.ToString(agg) + " r=" + Convert.ToString(r));
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // 6. HttpRouter: hash bucket index, rehash, registration order, wildcard *, 405 Allow, 404, Clear
+    static bool TestHttpRouter() {
+        HttpRouter router = new HttpRouter();
+        for (int i = 0; i < 120; i = i + 1) {
+            router.Get("/r/" + Convert.ToString(i), "g" + Convert.ToString(i));
+        }
+        // Duplicate GET on /r/5: first registered must win
+        router.Get("/r/5", "second");
+        router.Post("/r/5", "p5");
+        router.Route("*", "/any", "star");
+
+        HttpRequest reqHit = HttpRequest.Parse("GET /r/5 HTTP/1.1\r\nHost: x\r\n\r\n");
+        HttpResponse rHit = router.Match(reqHit);
+        if (rHit.statusCode != 200 || rHit.body != "g5") { return false; }
+
+        HttpRequest req405 = HttpRequest.Parse("DELETE /r/5 HTTP/1.1\r\nHost: x\r\n\r\n");
+        HttpResponse r405 = router.Match(req405);
+        if (r405.statusCode != 405) { return false; }
+
+        HttpRequest reqStar = HttpRequest.Parse("PATCH /any HTTP/1.1\r\nHost: x\r\n\r\n");
+        HttpResponse rStar = router.Match(reqStar);
+        if (rStar.statusCode != 200 || rStar.body != "star") { return false; }
+
+        HttpRequest req404 = HttpRequest.Parse("GET /nope HTTP/1.1\r\nHost: x\r\n\r\n");
+        if (router.Match(req404).statusCode != 404) { return false; }
+
+        router.Clear();
+        if (router.Count() != 0 || router.Match(reqHit).statusCode != 404) { return false; }
+        return true;
+    }
+
+    // 7. SkinMesh: palette Skin() matches SkinVertex() for every vertex
+    static bool TestSkinMesh() {
+        Skeleton sk = new Skeleton();
+        for (int b = 0; b < 8; b = b + 1) {
+            sk.AddBone("b" + Convert.ToString(b), b == 0 ? -1 : b - 1,
+                new Transform3D(new Vector3((float)b, 0.0f, 0.0f), Quaternion.Identity, new Vector3(1.0f, 1.0f, 1.0f)));
+        }
+        sk.SetLocalPose(2, new Transform3D(new Vector3(0.5f, 1.0f, -0.5f), Quaternion.FromAxisAngle(new Vector3(0.0f, 0.0f, 1.0f), 0.7f), new Vector3(1.0f, 1.0f, 1.0f)));
+        sk.ComputeWorldPoses();
+
+        SkinMesh mesh = new SkinMesh();
+        for (int v = 0; v < 40; v = v + 1) {
+            mesh.AddVertexInfluenced(new Vector3((float)v * 0.2f, 1.0f, -0.3f), v % 8, 0.6f, (v + 3) % 8, 0.2f);
+            mesh.SetInfluence(v, 2, (v + 5) % 8, 0.4f); // intentionally unnormalized sum = 1.2
+        }
+        // Zero-weight vertex (must return bind pose unchanged)
+        mesh.AddVertex(new Vector3(3.0f, 4.0f, 5.0f), 0, 0.0f);
+
+        List<Vector3> batch = mesh.Skin(sk);
+        if (batch.Count != mesh.VertexCount()) { return false; }
+        for (int i = 0; i < batch.Count; i = i + 1) {
+            Vector3 refV = mesh.SkinVertex(sk, i);
+            if (!Near((double)batch[i].X, (double)refV.X, 1e-5) ||
+                !Near((double)batch[i].Y, (double)refV.Y, 1e-5) ||
+                !Near((double)batch[i].Z, (double)refV.Z, 1e-5)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 8. PitchShift: Shift + Resample + ConvertSampleRate
+    static bool TestPitchShift() {
+        AudioBuffer src = new AudioBuffer(44100, 2, 4096);
+        for (int i = 0; i < src.count; i = i + 1) {
+            src.samples[i] = Math.Sin((double)i * 0.05);
+        }
+        AudioBuffer shifted = PitchShift.Shift(src, 4.0);
+        if (shifted.frames != 4096 || shifted.channels != 2) { return false; }
+        double peak = shifted.Peak();
+        if (peak <= 0.1 || peak > 3.0) { return false; }
+
+        AudioBuffer resampled = PitchShift.Resample(src, 2.0);
+        if (resampled.frames != 2048 || resampled.channels != 2) { return false; }
+
+        AudioBuffer conv = PitchShift.ConvertSampleRate(src, 22050);
+        if (conv.sampleRate != 22050 || conv.frames != 2048) { return false; }
+        return true;
+    }
+
+    // 9. Deflate: adaptive hash table sizes across 4 KiB / 16 KiB / 32 KiB boundaries
+    static bool TestDeflate() {
+        int[] lens = new int[] { 0, 1, 17, 512, 4096, 4097, 16384, 16385, 36000 };
+        for (int li = 0; li < lens.Length; li = li + 1) {
+            int n = lens[li];
+            byte[] src = new byte[n];
+            for (int i = 0; i < n; i = i + 1) {
+                src[i] = (byte)(((i % 23) * 11 + (i / 100)) & 255);
+            }
+            byte[] comp = Deflate.Deflate(src, 6);
+            byte[] dec = Deflate.Inflate(comp, 0, comp.Length, n + 64);
+            if (dec.Length != n) { Console.WriteLine("deflate len fail " + Convert.ToString(n)); return false; }
+            for (int i = 0; i < n; i = i + 1) {
+                if (dec[i] != src[i]) { Console.WriteLine("deflate byte fail " + Convert.ToString(n)); return false; }
+            }
+        }
+        return true;
+    }
+
+    static void Main() {
+        Console.WriteLine(TestZanDbIndex() ? "zandb_index=ok" : "zandb_index=fail");
+        Console.WriteLine(TestMqtt() ? "mqtt=ok" : "mqtt=fail");
+        Console.WriteLine(TestProto() ? "proto=ok" : "proto=fail");
+        Console.WriteLine(TestStats() ? "stats=ok" : "stats=fail");
+        Console.WriteLine(TestWindowNullable() ? "window_null=ok" : "window_null=fail");
+        Console.WriteLine(TestHttpRouter() ? "http_router=ok" : "http_router=fail");
+        Console.WriteLine(TestSkinMesh() ? "skin_mesh=ok" : "skin_mesh=fail");
+        Console.WriteLine(TestPitchShift() ? "pitch_shift=ok" : "pitch_shift=fail");
+        Console.WriteLine(TestDeflate() ? "deflate=ok" : "deflate=fail");
+    }
+}

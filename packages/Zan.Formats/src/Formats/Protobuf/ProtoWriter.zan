@@ -162,14 +162,20 @@ public class ProtoWriter {
     public void WriteDouble(int field, double v) { WriteFixed64(field, DoubleBits(v)); }
 
     public int BeginMessage(int field) {
-        Tag(field, 2);
+        long tag = Tag(field, 2);
         if (openFields == null) {
             openFields = new List<int>();
             openMarks = new List<int>();
         }
+        int mark = len;
+        int reserved = ProtoWriter.VarintSize(tag) + 1;
+        EnsureRoom(reserved);
+        int at = WriteVarintAt(mark, tag);
+        buf[at] = 0;
+        len = mark + reserved;
         openFields.Add(field);
-        openMarks.Add(len);
-        return len;
+        openMarks.Add(mark);
+        return mark;
     }
 
     public void EndMessage() {
@@ -181,20 +187,22 @@ public class ProtoWriter {
         int mark = openMarks[n - 1];
         openFields.RemoveAt(n - 1);
         openMarks.RemoveAt(n - 1);
-        int payload = len - mark;
         long tag = Tag(field, 2);
-        int header = ProtoWriter.VarintSize(tag) + ProtoWriter.VarintSize(payload);
-        EnsureRoom(header);
-        // 目标区间 [mark+header, mark+header+payload) 与源区间 [mark, mark+payload) 重叠，
-        // 反向搬移避免 memcpy 重叠未定义行为。
-        if (payload > 0) {
-            for (int i = payload - 1; i >= 0; i = i - 1) {
-                buf[mark + header + i] = buf[mark + i];
-            }
+        int tagSize = ProtoWriter.VarintSize(tag);
+        int reserved = tagSize + 1;
+        int payload = len - (mark + reserved);
+        if (payload < 128) {
+            // 95%+ 子消息长度 < 128：直接原地写回 1 字节长度，零字节搬移。
+            buf[mark + tagSize] = (byte)payload;
+            return;
         }
-        int at = WriteVarintAt(mark, tag);
-        WriteVarintAt(at, payload);
-        len = len + header;
+        int lenSize = ProtoWriter.VarintSize(payload);
+        int extra = lenSize - 1;
+        EnsureRoom(extra);
+        // NativeMemory.Copy 具备 memmove 语义（重叠安全，SIMD 向量化搬移）。
+        NativeMemory.Copy((nint)buf + (mark + reserved + extra), (nint)buf + (mark + reserved), payload);
+        WriteVarintAt(mark + tagSize, payload);
+        len = len + extra;
     }
 
     public byte[] ToBytes() {
@@ -203,6 +211,12 @@ public class ProtoWriter {
         return out2;
     }
 
-    public void Reset() { len = 0; }
+    public void Reset() {
+        len = 0;
+        if (openFields != null) {
+            openFields.Clear();
+            openMarks.Clear();
+        }
+    }
     public static long DoubleBits(double v) { return NativeMemory.AsI64(v); }
 }

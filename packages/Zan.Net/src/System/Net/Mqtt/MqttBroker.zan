@@ -24,6 +24,8 @@ public class MqttBroker : IDisposable {
     public MqttMessageHook messageHook;
     private bool keepAliveRunning;
     private MqttSharedBus sharedBus;
+    private Dictionary<string, MqttTopicStat> topicMap;
+    private Dictionary<string, MqttRetainedMessage> retainedMap;
 
     private int nextId;
     private int startedAt;
@@ -39,6 +41,8 @@ public class MqttBroker : IDisposable {
         this.topics = new List<MqttTopicStat>();
         this.retainedMessages = new List<MqttRetainedMessage>();
         this.inflightMessages = new List<MqttInflightMessage>();
+        this.topicMap = new Dictionary<string, MqttTopicStat>();
+        this.retainedMap = new Dictionary<string, MqttRetainedMessage>();
         this.wal = null;
         this.authHandler = null;
         this.messageHook = null;
@@ -50,6 +54,25 @@ public class MqttBroker : IDisposable {
         this.msgsOut = 0;
         this.bytesIn = 0;
         this.bytesOut = 0;
+    }
+
+    // 同步 retainedMap 以兼容外部直接修改或 WAL 恢复 retainedMessages 列表。
+    private void EnsureRetainedMapSynced() {
+        if (this.retainedMap.Count == this.retainedMessages.Count) { return; }
+        this.retainedMap.Clear();
+        for (int i = 0; i < this.retainedMessages.Count; i = i + 1) {
+            MqttRetainedMessage r = this.retainedMessages[i];
+            this.retainedMap[r.topic] = r;
+        }
+    }
+
+    private void EnsureTopicMapSynced() {
+        if (this.topicMap.Count == this.topics.Count) { return; }
+        this.topicMap.Clear();
+        for (int i = 0; i < this.topics.Count; i = i + 1) {
+            MqttTopicStat t = this.topics[i];
+            this.topicMap[t.name] = t;
+        }
     }
 
     // 设置客户端连接鉴权委托
@@ -67,7 +90,13 @@ public class MqttBroker : IDisposable {
     // 后续保留消息变更与飞行中消息状态将追加到磁盘。
     public bool EnableWal(string walFilePath) {
         this.wal = new MqttWal(walFilePath);
-        return this.wal.Recover(this.retainedMessages, this.inflightMessages);
+        bool ok = this.wal.Recover(this.retainedMessages, this.inflightMessages);
+        this.retainedMap.Clear();
+        for (int i = 0; i < this.retainedMessages.Count; i = i + 1) {
+            MqttRetainedMessage r = this.retainedMessages[i];
+            this.retainedMap[r.topic] = r;
+        }
+        return ok;
     }
 
     // 执行快照压缩收缩 WAL 文件尺寸。
@@ -150,7 +179,9 @@ public class MqttBroker : IDisposable {
         }
         this.sessions.Clear();
         this.topics.Clear();
+        this.topicMap.Clear();
         this.retainedMessages.Clear();
+        this.retainedMap.Clear();
         this.inflightMessages.Clear();
         if (this.wal != null) {
             this.wal.Flush();
@@ -170,37 +201,46 @@ public class MqttBroker : IDisposable {
 
     // ---- 主题匹配：带 + / # 通配符的过滤器 vs 具体主题 ----
 
-    // 按 "/" 切分主题/过滤器为层。
-    private static List<string> SplitTopic(string s) {
-        List<string> parts = new List<string>();
-        int len = s.Length;
-        int last = 0;
-        for (int i = 0; i < len; i = i + 1) {
-            if ((s[i] & 255) == 47) {
-                parts.Add(s.Substring(last, i - last));
-                last = i + 1;
-            }
-        }
-        parts.Add(s.Substring(last, len - last));
-        return parts;
-    }
-
     // 过滤器是否匹配具体主题：`#` 匹配剩余所有层，`+` 匹配单层，
-    // 其余按层相等；层数必须一致。
+    // 其余按层相等；零堆分配双指针逐层扫描（免 SplitTopic/Substring 分配）。
     public static bool TopicMatches(string filter, string topic) {
         if (filter == topic) { return true; }
-        if (filter == "#") { return true; }
-        if (filter.IndexOf("+") < 0 && filter.IndexOf("#") < 0) {
-            return false;
+        int fLen = filter.Length;
+        if (fLen == 1 && (filter[0] & 255) == 35) { return true; }
+        int tLen = topic.Length;
+        int fPos = 0;
+        int tPos = 0;
+        while (fPos <= fLen) {
+            int fEnd = fPos;
+            while (fEnd < fLen && (filter[fEnd] & 255) != 47) {
+                fEnd = fEnd + 1;
+            }
+            int fSegLen = fEnd - fPos;
+            // `#` 匹配当前及剩余所有层（包括父级空尾）
+            if (fSegLen == 1 && (filter[fPos] & 255) == 35) {
+                return true;
+            }
+            if (tPos > tLen) {
+                return false;
+            }
+            int tEnd = tPos;
+            while (tEnd < tLen && (topic[tEnd] & 255) != 47) {
+                tEnd = tEnd + 1;
+            }
+            // 非 `+` 段需逐字节相等
+            if (!(fSegLen == 1 && (filter[fPos] & 255) == 43)) {
+                int tSegLen = tEnd - tPos;
+                if (fSegLen != tSegLen) { return false; }
+                for (int k = 0; k < fSegLen; k = k + 1) {
+                    if ((filter[fPos + k] & 255) != (topic[tPos + k] & 255)) {
+                        return false;
+                    }
+                }
+            }
+            fPos = fEnd + 1;
+            tPos = tEnd + 1;
         }
-        List<string> f = SplitTopic(filter);
-        List<string> t = SplitTopic(topic);
-        for (int i = 0; i < f.Count; i = i + 1) {
-            if (f[i] == "#") { return true; }
-            if (i >= t.Count) { return false; }
-            if (f[i] != "+" && f[i] != t[i]) { return false; }
-        }
-        return t.Count == f.Count;
+        return tPos > tLen;
     }
 
     // ---- 报文构建器 ----
@@ -254,34 +294,40 @@ public class MqttBroker : IDisposable {
     // 工业级上限防护：单条保留消息 payload 限制最大 64KB，总保留消息条数上限 4096 条，
     // 超过上限时拒绝新主题存入，防止恶意客户端发布大量随机主题耗尽 Broker 堆内存。
     private void SaveRetained(string topic, string payload, int payloadLen, int qos) {
-        for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
-            MqttRetainedMessage r = this.retainedMessages[i];
-            if (r.topic == topic) {
-                if (payloadLen == 0) {
-                    this.retainedMessages.RemoveAt(i);
-                    if (this.wal != null) {
-                        this.wal.LogRetainDelete(topic);
+        this.EnsureRetainedMapSynced();
+        MqttRetainedMessage existing = null;
+        if (this.retainedMap.TryGetValue(topic, out existing)) {
+            if (payloadLen == 0) {
+                this.retainedMap.Remove(topic);
+                for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
+                    if (this.retainedMessages[i].topic == topic) {
+                        this.retainedMessages.RemoveAt(i);
+                        break;
                     }
-                    return;
-                } else {
-                    int keep = payloadLen;
-                    if (keep > 65536) { keep = 65536; }
-                    r.payload = keep < payload.Length ? payload.Substring(0, keep) : payload;
-                    r.payloadLen = keep;
-                    r.qos = qos;
-                    if (this.wal != null) {
-                        this.wal.LogRetainSet(topic, qos, r.payload);
-                    }
-                    return;
                 }
+                if (this.wal != null) {
+                    this.wal.LogRetainDelete(topic);
+                }
+                return;
             }
+            int keep = payloadLen;
+            if (keep > 65536) { keep = 65536; }
+            existing.payload = keep < payload.Length ? payload.Substring(0, keep) : payload;
+            existing.payloadLen = keep;
+            existing.qos = qos;
+            if (this.wal != null) {
+                this.wal.LogRetainSet(topic, qos, existing.payload);
+            }
+            return;
         }
         if (payloadLen > 0) {
             if (this.retainedMessages.Count >= 4096) { return; }
             int keep = payloadLen;
             if (keep > 65536) { keep = 65536; }
             string safePayload = keep < payload.Length ? payload.Substring(0, keep) : payload;
-            this.retainedMessages.Add(new MqttRetainedMessage(topic, safePayload, keep, qos));
+            MqttRetainedMessage entry = new MqttRetainedMessage(topic, safePayload, keep, qos);
+            this.retainedMessages.Add(entry);
+            this.retainedMap[topic] = entry;
             if (this.wal != null) {
                 this.wal.LogRetainSet(topic, qos, safePayload);
             }
@@ -315,6 +361,7 @@ public class MqttBroker : IDisposable {
     // 采用非阻塞直接发送优先策略，避免单连接拥塞挂起整个广播循环。
     // 发送失败或断开的连接立即标记清理。
     public async int PublishLocal(string topic, string payload, int payloadLen) {
+        if (this.sessions.Count == 0) { return 0; }
         byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int receivers = 0;
@@ -362,25 +409,26 @@ public class MqttBroker : IDisposable {
     // 增长（每个条目还保留整条 lastPayload）。达到上限后新主题
     // 不再建条目，已有主题的计数照常累加。
     private void Touch(string topic, string payload) {
-        for (int i = 0; i < this.topics.Count; i = i + 1) {
-            if (this.topics[i].name == topic) {
-                this.topics[i].messages = this.topics[i].messages + 1;
-                // lastPayload 截到 4 KB：管理接口只是展示"最后一条
-                // 负载"，没有理由替客户端长期保留任意大的字符串。
-                int keep = payload.Length;
-                if (keep > 4096) { keep = 4096; }
-                this.topics[i].lastPayload = payload.Substring(0, keep);
-                return;
+        this.EnsureTopicMapSynced();
+        MqttTopicStat existing = null;
+        if (this.topicMap.TryGetValue(topic, out existing)) {
+            existing.messages = existing.messages + 1;
+            int keep = payload.Length;
+            if (keep > 4096) {
+                existing.lastPayload = payload.Substring(0, 4096);
+            } else {
+                existing.lastPayload = payload;
             }
+            return;
         }
         // 最多跟踪 4096 个主题；足够运维观测用，且上界明确。
         if (this.topics.Count >= 4096) { return; }
         MqttTopicStat t = new MqttTopicStat(topic);
         t.messages = 1;
         int k = payload.Length;
-        if (k > 4096) { k = 4096; }
-        t.lastPayload = payload.Substring(0, k);
+        t.lastPayload = k > 4096 ? payload.Substring(0, 4096) : payload;
         this.topics.Add(t);
+        this.topicMap[topic] = t;
     }
 
     // 管理端注入：以 broker 自身身份发布消息，
@@ -403,6 +451,7 @@ public class MqttBroker : IDisposable {
         if (this.messageHook != null) {
             this.messageHook("", topic, payload, qos, retain);
         }
+        if (this.sessions.Count == 0) { return 0; }
         byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int sent = 0;
@@ -576,9 +625,11 @@ public class MqttBroker : IDisposable {
                     }
                 }
                 this.retainedMessages.Clear();
+                this.retainedMap.Clear();
             }
             return cleared;
         }
+        this.retainedMap.Remove(topic);
         for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
             if (this.retainedMessages[i].topic == topic) {
                 this.retainedMessages.RemoveAt(i);

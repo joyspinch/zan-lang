@@ -25,17 +25,26 @@ public class PitchShift {
         if (ratio <= 0.0001) { return src; }
         int outFrames = (int)((double)src.frames / ratio);
         if (outFrames < 1) { outFrames = 1; }
-        AudioBuffer result = new AudioBuffer(src.sampleRate, src.channels, outFrames);
+        int channels = src.channels;
+        int srcFrames = src.frames;
+        AudioBuffer result = new AudioBuffer(src.sampleRate, channels, outFrames);
+        double[] srcSamples = src.samples;
+        double[] dstSamples = result.samples;
         double step = 1.0 / ratio;
         for (int f = 0; f < outFrames; f = f + 1) {
             double srcPos = (double)f * step;
             int i0 = (int)srcPos;
             int i1 = i0 + 1;
             double frac = srcPos - (double)i0;
-            for (int c = 0; c < src.channels; c = c + 1) {
-                double v0 = src.GetFrame(i0, c);
-                double v1 = src.GetFrame(i1, c);
-                result.SetFrame(f, c, v0 + (v1 - v0) * frac);
+            bool ok0 = i0 >= 0 && i0 < srcFrames;
+            bool ok1 = i1 >= 0 && i1 < srcFrames;
+            int base0 = i0 * channels;
+            int base1 = i1 * channels;
+            int dstBase = f * channels;
+            for (int c = 0; c < channels; c = c + 1) {
+                double v0 = ok0 ? srcSamples[base0 + c] : 0.0;
+                double v1 = ok1 ? srcSamples[base1 + c] : 0.0;
+                dstSamples[dstBase + c] = v0 + (v1 - v0) * frac;
             }
         }
         return result;
@@ -70,30 +79,41 @@ public class PitchShift {
         // 源读取步进：每合成一帧前进 hop / ratio
         double srcStep = (double)hop / ratio;
         int outFrames = src.frames;
-        AudioBuffer result = new AudioBuffer(src.sampleRate, src.channels, outFrames);
-        for (int i = 0; i < result.count; i = i + 1) { result.samples[i] = 0.0; }
+        int channels = src.channels;
+        int srcFrames = src.frames;
+        AudioBuffer result = new AudioBuffer(src.sampleRate, channels, outFrames);
+        double[] srcSamples = src.samples;
+        double[] dstSamples = result.samples;
+        int resCount = result.count;
+
+        // 预计算等功率 OLA 窗表（循环外仅计算一次，彻底消除内层 Math.Sqrt）
+        double[] winGain = new double[frameLen];
+        double invHop = 1.0 / (double)hop;
+        for (int f = 0; f < frameLen; f = f + 1) {
+            if (f < hop) {
+                winGain[f] = 1.0 - (double)f * invHop;
+            } else {
+                double w = (double)(f - hop) * invHop;
+                winGain[f] = Math.Sqrt(1.0 - w * w);
+            }
+        }
 
         int outPos = 0;
         double srcPos = 0.0;
         while (outPos + frameLen <= outFrames) {
             int srcStart = (int)srcPos;
-            // 窗口：前半段淡出、后半段淡入（等功率）
-            for (int f = 0; f < frameLen; f = f + 1) {
-                double w = 0.0;
-                if (f < hop) {
-                    w = 1.0 - (double)f / (double)hop;
-                } else {
-                    w = (double)(f - hop) / (double)hop;
-                }
-                // 等功率：w 与 sqrt(1-w^2) 配对
-                double wFade = w;
-                double wCross = Math.Sqrt(1.0 - w * w);
-                double gain = f < hop ? wFade : wCross;
-                for (int c = 0; c < src.channels; c = c + 1) {
-                    double v = src.GetFrame(srcStart + f, c);
-                    int idx = (outPos + f) * src.channels + c;
-                    if (idx < result.count) {
-                        result.samples[idx] = result.samples[idx] + v * gain;
+            int fMax = frameLen;
+            if (srcStart + fMax > srcFrames) {
+                fMax = srcFrames - srcStart;
+            }
+            int fStart = srcStart < 0 ? -srcStart : 0;
+            for (int f = fStart; f < fMax; f = f + 1) {
+                double gain = winGain[f];
+                int inBase = (srcStart + f) * channels;
+                int outBase = (outPos + f) * channels;
+                if (outBase + channels <= resCount) {
+                    for (int c = 0; c < channels; c = c + 1) {
+                        dstSamples[outBase + c] = dstSamples[outBase + c] + srcSamples[inBase + c] * gain;
                     }
                 }
             }
@@ -112,16 +132,25 @@ public class PitchShift {
         // 输出帧数 = 源帧数 / 步进（降采样 → 变短，采样率与时长一致）。
         int outFrames = (int)((double)src.frames / step);
         if (outFrames < 1) { outFrames = 1; }
-        AudioBuffer result = new AudioBuffer(newSampleRate, src.channels, outFrames);
+        int channels = src.channels;
+        int srcFrames = src.frames;
+        AudioBuffer result = new AudioBuffer(newSampleRate, channels, outFrames);
+        double[] srcSamples = src.samples;
+        double[] dstSamples = result.samples;
         for (int f = 0; f < outFrames; f = f + 1) {
             double srcPos = (double)f * step;
             int i0 = (int)srcPos;
             int i1 = i0 + 1;
             double frac = srcPos - (double)i0;
-            for (int c = 0; c < src.channels; c = c + 1) {
-                double v0 = src.GetFrame(i0, c);
-                double v1 = src.GetFrame(i1, c);
-                result.SetFrame(f, c, v0 + (v1 - v0) * frac);
+            bool ok0 = i0 >= 0 && i0 < srcFrames;
+            bool ok1 = i1 >= 0 && i1 < srcFrames;
+            int base0 = i0 * channels;
+            int base1 = i1 * channels;
+            int dstBase = f * channels;
+            for (int c = 0; c < channels; c = c + 1) {
+                double v0 = ok0 ? srcSamples[base0 + c] : 0.0;
+                double v1 = ok1 ? srcSamples[base1 + c] : 0.0;
+                dstSamples[dstBase + c] = v0 + (v1 - v0) * frac;
             }
         }
         return result;
