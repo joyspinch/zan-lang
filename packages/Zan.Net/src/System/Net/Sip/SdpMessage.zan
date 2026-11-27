@@ -112,13 +112,32 @@ public class SdpMessage {
         return pos;
     }
 
-    // 序列化为规范的 SDP 字符串（两遍精确单缓冲 + 内联整数直写）。
+    private static string SanitizeLine(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        int n = s.Length;
+        bool bad = false;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { bad = true; break; }
+        }
+        if (!bad) { return s; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { continue; }
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    // 序列化为规范的 SDP 字符串（两遍精确单缓冲 + 内联整数直写，过滤 CRLF/NUL 防行注入）。
     public string Serialize() {
-        string oUser = this.originUser != null ? this.originUser : "";
-        string ip = this.connectionIp != null ? this.connectionIp : "";
-        string sName = this.sessionName != null ? this.sessionName : "";
-        string mType = this.mediaType != null ? this.mediaType : "";
+        string oUser = SdpMessage.SanitizeLine(this.originUser);
+        string ip = SdpMessage.SanitizeLine(this.connectionIp);
+        string sName = SdpMessage.SanitizeLine(this.sessionName);
+        string mType = SdpMessage.SanitizeLine(this.mediaType);
         int attrCount = this.attributes.Count;
+        List<string> safeAttrs = new List<string>();
 
         int total =
             4 + SdpMessage.LongDecLen((long)this.version) +                                                  // "v=<ver>\r\n"
@@ -128,8 +147,9 @@ public class SdpMessage {
             7 +                                                                                               // "t=0 0\r\n"
             14 + mType.Length + SdpMessage.LongDecLen((long)this.mediaPort) + SdpMessage.LongDecLen((long)this.payloadType); // "m=<t> <p> RTP/AVP <pt>\r\n"
         for (int i = 0; i < attrCount; i = i + 1) {
-            string a = this.attributes[i];
-            total = total + 4 + (a != null ? a.Length : 0);
+            string a = SdpMessage.SanitizeLine(this.attributes[i]);
+            safeAttrs.Add(a);
+            total = total + 4 + a.Length;
         }
 
         byte[] buf = new byte[total];
@@ -176,9 +196,9 @@ public class SdpMessage {
 
         // a=<attr>\r\n
         for (int i = 0; i < attrCount; i = i + 1) {
-            string a = this.attributes[i];
+            string a = safeAttrs[i];
             buf[p] = (byte)97; buf[p + 1] = (byte)61; p = p + 2;
-            if (a != null && a.Length > 0) {
+            if (a.Length > 0) {
                 NativeMemory.Copy(bp + (nint)p, (nint)a, a.Length);
                 p = p + a.Length;
             }
@@ -200,6 +220,7 @@ public class SdpMessage {
         for (int i = start; i < end; i = i + 1) {
             int d = (s[i] & 255) - 48;
             if (d >= 0 && d <= 9) {
+                if (v > (2147483647 - d) / 10) { return 0; }
                 v = v * 10 + d;
             } else {
                 return 0;
@@ -208,13 +229,14 @@ public class SdpMessage {
         return v;
     }
 
-    // 安全解析非负十进制整数，非法输入返回 0。
+    // 安全解析非负十进制整数，非法输入或溢出返回 0。
     public static int ParseInt(string s) {
         if (s == null || s.Length == 0) { return 0; }
         int v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int d = (s[i] & 255) - 48;
             if (d >= 0 && d <= 9) {
+                if (v > (2147483647 - d) / 10) { return 0; }
                 v = v * 10 + d;
             } else {
                 return 0;

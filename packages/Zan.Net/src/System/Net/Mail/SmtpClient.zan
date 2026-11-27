@@ -47,6 +47,7 @@ public class SmtpClient : IDisposable {
     private bool serverAuth;
     private bool serverPipelining;
     private bool serverEightBitMime;
+    private bool authenticated;
     private string lastResponse;
     private int lastCode;
 
@@ -71,6 +72,7 @@ public class SmtpClient : IDisposable {
         this.serverAuth = false;
         this.serverPipelining = false;
         this.serverEightBitMime = false;
+        this.authenticated = false;
         this.lastResponse = "";
         this.lastCode = 0;
     }
@@ -99,9 +101,19 @@ public class SmtpClient : IDisposable {
         return this;
     }
 
-    // 设置 EHLO 使用的本机域名（默认 "localhost"）。
+    // 设置 EHLO 使用的本机域名（默认 "localhost"），拒绝控制字符与空白防命令注入。
     public SmtpClient LocalDomain(string domain) {
-        this.localDomain = domain;
+        if (domain == null) {
+            this.localDomain = "";
+            return this;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < domain.Length; i = i + 1) {
+            int c = domain[i] & 255;
+            if (c <= 32 || c >= 127) { continue; }
+            sb.Append((char)c);
+        }
+        this.localDomain = sb.ToString();
         return this;
     }
 
@@ -115,6 +127,7 @@ public class SmtpClient : IDisposable {
         if (this.tls != null) { this.tls.Close(); this.tls = null; }
         if (this.conn != null) { this.conn.Close(); this.conn = null; }
         this.open = false;
+        this.authenticated = false;
         this.inbuf = null;
         this.recvTmp = null;
         this.inhead = 0;
@@ -298,23 +311,9 @@ public class SmtpClient : IDisposable {
         return mail;
     }
 
-    // 把任意文本切成 ≤76 字符的行并做 quoted-printable 软换行。
-    // 禁止跨多字节字符切断：按码点边界回退。
+    // 把任意文本编码为 ≤76 字符行的 quoted-printable 并追加到 sb（避免二次切片截断 =XX）。
     private static void QpAppend(StringBuilder sb, string text) {
-        string enc = QuotedPrintableEncode(text);
-        // enc 行已按字符累计（qp 编码后每字符 1..3 字节输出），
-        // 直接按 75 字符切，行尾挂软换行 =\r\n。
-        int start = 0;
-        int n = enc.Length;
-        while (n - start > 75) {
-            int cut = start + 75;
-            // 回退到 '=' 后（不允许把 =XX 切一半）。
-            while (cut > start + 1 && (enc[cut - 1] & 255) == 61) { cut = cut - 1; }
-            sb.Append(enc.Substring(start, cut - start));
-            sb.Append("=\r\n");
-            start = cut;
-        }
-        if (n > start) { sb.Append(enc.Substring(start, n - start)); }
+        sb.Append(QuotedPrintableEncode(text));
     }
 
     // Quoted-printable 编码（RFC 2045 §6.7）：可打印字符直出，
@@ -329,6 +328,10 @@ public class SmtpClient : IDisposable {
             bool printable = c >= 33 && c <= 126 && c != 61;
             bool space = c == 32 || c == 9;
             if (c == 13 || c == 10) {
+                if (lineLen + 3 > 75) {
+                    sb.Append("=\r\n");
+                    lineLen = 0;
+                }
                 // 裸换行编码为 =0D/=0A（正文换行由调用方组织）。
                 sb.Append(c == 13 ? "=0D" : "=0A");
                 lineLen = lineLen + 3;
@@ -575,6 +578,7 @@ public class SmtpClient : IDisposable {
                 return SmtpResult.Fail("starttls", 0, "TLS 握手失败: " + err);
             }
             this.tls = ts;
+            this.authenticated = false;
             this.inhead = 0;
             this.intail = 0;
             SmtpResult eh = await this.EhloAsync();
@@ -587,13 +591,14 @@ public class SmtpClient : IDisposable {
             this.Close();
             return SmtpResult.Fail("starttls", 0, "强制要求 TLS 但链路未加密，拒绝明文发送凭据与邮件 (防降级剥离攻击)");
         }
-        // AUTH。
-        if (this.serverAuth && this.user.Length > 0) {
+        // AUTH（复用已认证连接时不再重复发送 AUTH，避免 503 Already authenticated）。
+        if (!this.authenticated && this.serverAuth && this.user.Length > 0) {
             SmtpResult ar = await this.AuthAsync();
             if (!ar.ok) {
                 this.Close();
                 return ar;
             }
+            this.authenticated = true;
         }
         // MAIL FROM (依对端 8BITMIME 能力自适应协商)。
         string mailCmd = "MAIL FROM:<" + fromClean + ">";

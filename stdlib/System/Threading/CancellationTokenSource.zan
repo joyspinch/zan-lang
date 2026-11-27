@@ -17,20 +17,37 @@ public class CancellationTokenSource : IDisposable {
     // 创建在指定毫秒后自动触发取消的 CancellationTokenSource。
     public static CancellationTokenSource CreateAfter(int delayMs) {
         CancellationTokenSource cts = new CancellationTokenSource();
-        if (delayMs > 0) {
+        if (delayMs <= 0) {
+            cts.Cancel();
+        } else {
             Task.Run(CancellationTokenSource.CancelDelayed(cts, delayMs));
         }
         return cts;
+    }
+
+    private void AddLinked(CancellationTokenRegistration reg) {
+        if (reg == null) { return; }
+        bool disposeNow = false;
+        lock (this) {
+            if (this.isDisposed || this.linkedRegistrations == null || this.token.IsCancellationRequested) {
+                disposeNow = true;
+            } else {
+                this.linkedRegistrations.Add(reg);
+            }
+        }
+        if (disposeNow) {
+            reg.Dispose();
+        }
     }
 
     // 创建联动取消源：当两个指定令牌中任一被取消时，联动源立即取消。
     public static CancellationTokenSource CreateLinkedTokenSource(CancellationToken token1, CancellationToken token2) {
         CancellationTokenSource cts = new CancellationTokenSource();
         if (token1 != null) {
-            cts.linkedRegistrations.Add(token1.Register(() => { cts.Cancel(); }));
+            cts.AddLinked(token1.Register(() => { cts.Cancel(); }));
         }
         if (token2 != null) {
-            cts.linkedRegistrations.Add(token2.Register(() => { cts.Cancel(); }));
+            cts.AddLinked(token2.Register(() => { cts.Cancel(); }));
         }
         return cts;
     }
@@ -42,7 +59,7 @@ public class CancellationTokenSource : IDisposable {
             for (int i = 0; i < tokens.Count; i = i + 1) {
                 CancellationToken t = tokens[i];
                 if (t != null) {
-                    cts.linkedRegistrations.Add(t.Register(() => { cts.Cancel(); }));
+                    cts.AddLinked(t.Register(() => { cts.Cancel(); }));
                 }
             }
         }
@@ -61,20 +78,29 @@ public class CancellationTokenSource : IDisposable {
 
     // 请求取消操作。
     public void Cancel() {
-        if (this.isDisposed) { return; }
+        List<CancellationTokenRegistration> regs = null;
+        lock (this) {
+            if (this.isDisposed) { return; }
+            if (this.linkedRegistrations != null && this.linkedRegistrations.Count > 0) {
+                regs = this.linkedRegistrations;
+                this.linkedRegistrations = new List<CancellationTokenRegistration>();
+            }
+        }
         this.token.CancelInternal();
         // 联动源触发取消后，立即注销向所有父级注册的回调句柄，解除环形依赖与闭包生命周期悬挂
-        if (this.linkedRegistrations != null && this.linkedRegistrations.Count > 0) {
-            for (int i = 0; i < this.linkedRegistrations.Count; i = i + 1) {
-                this.linkedRegistrations[i].Dispose();
+        if (regs != null) {
+            for (int i = 0; i < regs.Count; i = i + 1) {
+                regs[i].Dispose();
             }
-            this.linkedRegistrations.Clear();
+            regs.Clear();
         }
     }
 
     // 在指定毫秒后触发取消。
     public void CancelAfter(int delayMs) {
-        if (this.isDisposed) { return; }
+        lock (this) {
+            if (this.isDisposed) { return; }
+        }
         if (delayMs <= 0) {
             this.Cancel();
             return;
@@ -84,13 +110,18 @@ public class CancellationTokenSource : IDisposable {
 
     // 释放关联资源。
     public void Dispose() {
-        if (this.isDisposed) { return; }
-        this.isDisposed = true;
-        if (this.linkedRegistrations != null) {
-            for (int i = 0; i < this.linkedRegistrations.Count; i = i + 1) {
-                this.linkedRegistrations[i].Dispose();
+        List<CancellationTokenRegistration> regs = null;
+        lock (this) {
+            if (this.isDisposed) { return; }
+            this.isDisposed = true;
+            regs = this.linkedRegistrations;
+            this.linkedRegistrations = null;
+        }
+        if (regs != null) {
+            for (int i = 0; i < regs.Count; i = i + 1) {
+                regs[i].Dispose();
             }
-            this.linkedRegistrations.Clear();
+            regs.Clear();
         }
         this.token.Close();
     }

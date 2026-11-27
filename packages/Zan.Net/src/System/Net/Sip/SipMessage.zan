@@ -283,7 +283,25 @@ public class SipMessage {
         return end;
     }
 
-    // 序列化为线上形式（精确两遍计算 + 单次 byte[] 分配直写，零 StringBuilder）。
+    private static string SanitizeHeader(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        int n = s.Length;
+        bool bad = false;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { bad = true; break; }
+        }
+        if (!bad) { return s; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { continue; }
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    // 序列化为线上形式（精确两遍计算 + 单次 byte[] 分配直写，零 StringBuilder；过滤 CRLF/NUL 防头注入）。
     // Content-Length 自动生成。
     public string Serialize() {
         List<SipHeader> hs = this.headers;
@@ -292,18 +310,27 @@ public class SipMessage {
         int bodyLen = bodyStr.Length;
         int total = 0;
 
+        string meth = "";
+        string u = "";
+        string rsn = "";
         if (this.isRequest) {
-            string meth = this.method != null ? this.method : "";
-            string u = this.uri != null ? this.uri : "";
+            meth = SipMessage.SanitizeHeader(this.method);
+            u = SipMessage.SanitizeHeader(this.uri);
             total = meth.Length + 1 + u.Length + 10; // " " + " SIP/2.0\r\n"
         } else {
-            string rsn = this.reason != null ? this.reason : "";
+            rsn = SipMessage.SanitizeHeader(this.reason);
             total = 8 + SipMessage.IntDecLen(this.status) + 1 + rsn.Length + 2; // "SIP/2.0 " + status + " " + reason + "\r\n"
         }
 
+        List<string> safeNames = new List<string>();
+        List<string> safeVals = new List<string>();
         for (int i = 0; i < hCount; i = i + 1) {
             SipHeader h = hs[i];
-            total = total + h.name.Length + 2 + h.value.Length + 2;
+            string hn = SipMessage.SanitizeHeader(h.name);
+            string hv = SipMessage.SanitizeHeader(h.value);
+            safeNames.Add(hn);
+            safeVals.Add(hv);
+            total = total + hn.Length + 2 + hv.Length + 2;
         }
         int bodyLenDigits = SipMessage.IntDecLen(bodyLen);
         total = total + 16 + bodyLenDigits + 4 + bodyLen; // "Content-Length: " + digits + "\r\n\r\n" + body
@@ -313,14 +340,11 @@ public class SipMessage {
         int pos = 0;
 
         if (this.isRequest) {
-            string meth = this.method != null ? this.method : "";
-            string u = this.uri != null ? this.uri : "";
             if (meth.Length > 0) { NativeMemory.PutString(oPtr, pos, meth, meth.Length); pos = pos + meth.Length; }
             outb[pos] = 32; pos = pos + 1;
             if (u.Length > 0) { NativeMemory.PutString(oPtr, pos, u, u.Length); pos = pos + u.Length; }
             NativeMemory.PutString(oPtr, pos, " SIP/2.0\r\n", 10); pos = pos + 10;
         } else {
-            string rsn = this.reason != null ? this.reason : "";
             NativeMemory.PutString(oPtr, pos, "SIP/2.0 ", 8); pos = pos + 8;
             pos = SipMessage.WriteIntDec(outb, pos, this.status);
             outb[pos] = 32; pos = pos + 1;
@@ -329,9 +353,8 @@ public class SipMessage {
         }
 
         for (int i = 0; i < hCount; i = i + 1) {
-            SipHeader h = hs[i];
-            string hn = h.name;
-            string hv = h.value;
+            string hn = safeNames[i];
+            string hv = safeVals[i];
             if (hn.Length > 0) { NativeMemory.PutString(oPtr, pos, hn, hn.Length); pos = pos + hn.Length; }
             outb[pos] = 58; outb[pos + 1] = 32; pos = pos + 2;
             if (hv.Length > 0) { NativeMemory.PutString(oPtr, pos, hv, hv.Length); pos = pos + hv.Length; }
@@ -347,7 +370,7 @@ public class SipMessage {
         return NativeMemory.GetString(oPtr, 0, total);
     }
 
-    // 安全解析十进制非负整数，非法字符或空串返回 -1。
+    // 安全解析十进制非负整数，非法字符、空串或 32 位溢出返回 -1。
     public static int ParsePositiveInt(string s) {
         if (s == null || s.Length == 0) { return -1; }
         int v = 0;
@@ -355,7 +378,9 @@ public class SipMessage {
         for (int i = 0; i < n; i = i + 1) {
             int c = s[i] & 255;
             if (c < 48 || c > 57) { return -1; }
-            v = v * 10 + (c - 48);
+            int d = c - 48;
+            if (v > (2147483647 - d) / 10) { return -1; }
+            v = v * 10 + d;
         }
         return v;
     }
@@ -366,7 +391,9 @@ public class SipMessage {
         for (int i = start; i < end; i = i + 1) {
             int c = db[i] & 255;
             if (c < 48 || c > 57) { return -1; }
-            v = v * 10 + (c - 48);
+            int d = c - 48;
+            if (v > (2147483647 - d) / 10) { return -1; }
+            v = v * 10 + d;
         }
         return v;
     }

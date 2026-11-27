@@ -11,6 +11,7 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
     public ConcurrentStripe<TKey, TValue>[] stripes;
     public int stripeCount;
     private int stripeMask;
+    private bool disposed;
 
     private static int NextPow2(int n) {
         if (n <= 1) { return 1; }
@@ -26,6 +27,7 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         int n = ConcurrentDictionary<TKey, TValue>.NextPow2(concurrencyLevel);
         this.stripeCount = n;
         this.stripeMask = n - 1;
+        this.disposed = false;
         this.stripes = new ConcurrentStripe<TKey, TValue>[n];
         for (int i = 0; i < n; i = i + 1) {
             this.stripes[i] = new ConcurrentStripe<TKey, TValue>();
@@ -34,14 +36,18 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
 
 
     public void Dispose() {
-        if (this.stripes != null) {
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                if (this.stripes[i] != null) {
-                    this.stripes[i].Dispose();
-                    this.stripes[i] = null;
-                }
-            }
+        ConcurrentStripe<TKey, TValue>[] s = null;
+        lock (this) {
+            if (this.disposed || this.stripes == null) { return; }
+            this.disposed = true;
+            s = this.stripes;
             this.stripes = null;
+        }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s[i] != null) {
+                s[i].Dispose();
+                s[i] = null;
+            }
         }
     }
 
@@ -51,12 +57,48 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         return (h ^ (h >> 16)) & this.stripeMask;
     }
 
-    private ConcurrentStripe<TKey, TValue> RequireStripe(TKey key) {
+    private ConcurrentStripe<TKey, TValue>[] SnapshotStripes() {
         ConcurrentStripe<TKey, TValue>[] s = this.stripes;
-        if (s == null) {
+        if (this.disposed || s == null) {
             throw new ObjectDisposedException("ConcurrentDictionary");
         }
-        return s[this.GetStripeIndex(key)];
+        return s;
+    }
+
+    private ConcurrentStripe<TKey, TValue> RequireStripe(TKey key) {
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        ConcurrentStripe<TKey, TValue> stripe = s[this.GetStripeIndex(key)];
+        if (stripe == null) {
+            throw new ObjectDisposedException("ConcurrentDictionary");
+        }
+        return stripe;
+    }
+
+    private void LockStripes(ConcurrentStripe<TKey, TValue>[] s) {
+        int locked = 0;
+        try {
+            for (int i = 0; i < s.Length; i = i + 1) {
+                ConcurrentStripe<TKey, TValue> st = s[i];
+                if (st == null) {
+                    throw new ObjectDisposedException("ConcurrentDictionary");
+                }
+                st.Lock();
+                locked = i + 1;
+            }
+        } catch (Exception ex) {
+            for (int j = locked - 1; j >= 0; j = j - 1) {
+                s[j].Unlock();
+            }
+            throw ex;
+        }
+    }
+
+    private void UnlockStripes(ConcurrentStripe<TKey, TValue>[] s) {
+        for (int i = s.Length - 1; i >= 0; i = i - 1) {
+            if (s[i] != null) {
+                s[i].Unlock();
+            }
+        }
     }
 
     // 尝试添加键值对。若键已存在则返回 false，不覆盖旧值。
@@ -64,6 +106,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
         stripe.Lock();
         try {
+            if (this.disposed || stripe.map == null) {
+                throw new ObjectDisposedException("ConcurrentDictionary");
+            }
             if (!stripe.map.ContainsKey(key)) {
                 stripe.map[key] = value;
                 return true;
@@ -79,6 +124,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
         stripe.Lock();
         try {
+            if (this.disposed || stripe.map == null) {
+                throw new ObjectDisposedException("ConcurrentDictionary");
+            }
             return stripe.map.TryGetValue(key, out value);
         } finally {
             stripe.Unlock();
@@ -90,6 +138,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
         stripe.Lock();
         try {
+            if (this.disposed || stripe.map == null) {
+                throw new ObjectDisposedException("ConcurrentDictionary");
+            }
             bool ok = stripe.map.TryGetValue(key, out value);
             if (ok) {
                 stripe.map.Remove(key);
@@ -105,6 +156,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
         stripe.Lock();
         try {
+            if (this.disposed || stripe.map == null) {
+                throw new ObjectDisposedException("ConcurrentDictionary");
+            }
             return stripe.map.ContainsKey(key);
         } finally {
             stripe.Unlock();
@@ -116,6 +170,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
         ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
         stripe.Lock();
         try {
+            if (this.disposed || stripe.map == null) {
+                throw new ObjectDisposedException("ConcurrentDictionary");
+            }
             TValue existing;
             if (stripe.map.TryGetValue(key, out existing)) {
                 return existing;
@@ -140,6 +197,9 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
             ConcurrentStripe<TKey, TValue> stripe = this.RequireStripe(key);
             stripe.Lock();
             try {
+                if (this.disposed || stripe.map == null) {
+                    throw new ObjectDisposedException("ConcurrentDictionary");
+                }
                 stripe.map[key] = value;
             } finally {
                 stripe.Unlock();
@@ -149,78 +209,81 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
 
     // 按顺序获取所有条带锁（防止死锁）
     public void LockAll() {
-        ConcurrentStripe<TKey, TValue>[] s = this.stripes;
-        if (s == null) {
-            throw new ObjectDisposedException("ConcurrentDictionary");
-        }
-        for (int i = 0; i < this.stripeCount; i = i + 1) {
-            s[i].Lock();
-        }
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
     }
 
     // 逆序释放所有条带锁
     public void UnlockAll() {
         ConcurrentStripe<TKey, TValue>[] s = this.stripes;
         if (s == null) { return; }
-        for (int i = this.stripeCount - 1; i >= 0; i = i - 1) {
-            s[i].Unlock();
-        }
+        this.UnlockStripes(s);
     }
 
     // 清空字典中的所有项。
     public void Clear() {
-        this.LockAll();
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
         try {
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                this.stripes[i].map.Clear();
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map != null) {
+                    s[i].map.Clear();
+                }
             }
         } finally {
-            this.UnlockAll();
+            this.UnlockStripes(s);
         }
     }
 
     // 当前存储的总项数。
     public int Count() {
-        this.LockAll();
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
         try {
             int total = 0;
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                total = total + this.stripes[i].map.Count;
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map != null) {
+                    total = total + s[i].map.Count;
+                }
             }
             return total;
         } finally {
-            this.UnlockAll();
+            this.UnlockStripes(s);
         }
     }
 
     // 字典是否为空（遇到非空条带立即提前返回）。
     public bool IsEmpty() {
-        this.LockAll();
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
         try {
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                if (this.stripes[i].map.Count > 0) {
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map != null && s[i].map.Count > 0) {
                     return false;
                 }
             }
             return true;
         } finally {
-            this.UnlockAll();
+            this.UnlockStripes(s);
         }
     }
 
     // 获取所有键的列表快照。
     public List<TKey> Keys() {
-        this.LockAll();
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
         try {
             int total = 0;
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                total = total + this.stripes[i].map.Count;
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map != null) {
+                    total = total + s[i].map.Count;
+                }
             }
             List<TKey> list = new List<TKey>();
             list.Reserve(total);
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                if (this.stripes[i].map.Count == 0) { continue; }
-                List<TKey> klist = this.stripes[i].map.Keys;
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map == null || s[i].map.Count == 0) { continue; }
+                List<TKey> klist = s[i].map.Keys;
                 int count = klist.Count;
                 for (int j = 0; j < count; j = j + 1) {
                     list.Add(klist[j]);
@@ -228,23 +291,26 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
             }
             return list;
         } finally {
-            this.UnlockAll();
+            this.UnlockStripes(s);
         }
     }
 
     // 获取所有值的列表快照。
     public List<TValue> Values() {
-        this.LockAll();
+        ConcurrentStripe<TKey, TValue>[] s = this.SnapshotStripes();
+        this.LockStripes(s);
         try {
             int total = 0;
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                total = total + this.stripes[i].map.Count;
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map != null) {
+                    total = total + s[i].map.Count;
+                }
             }
             List<TValue> list = new List<TValue>();
             list.Reserve(total);
-            for (int i = 0; i < this.stripeCount; i = i + 1) {
-                if (this.stripes[i].map.Count == 0) { continue; }
-                List<TValue> vlist = this.stripes[i].map.Values;
+            for (int i = 0; i < s.Length; i = i + 1) {
+                if (s[i].map == null || s[i].map.Count == 0) { continue; }
+                List<TValue> vlist = s[i].map.Values;
                 int count = vlist.Count;
                 for (int j = 0; j < count; j = j + 1) {
                     list.Add(vlist[j]);
@@ -252,7 +318,7 @@ public class ConcurrentDictionary<TKey, TValue> : IDisposable {
             }
             return list;
         } finally {
-            this.UnlockAll();
+            this.UnlockStripes(s);
         }
     }
 }

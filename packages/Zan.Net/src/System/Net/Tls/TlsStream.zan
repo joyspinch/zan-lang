@@ -186,7 +186,10 @@ public class TlsStream : IDisposable {
         int r = this.engine.Step();
         byte[] pending = this.engine.DrainNetwork();
         if (pending != null && pending.Length > 0) {
-            this.EnsurePending(pending.Length);
+            if (!this.EnsurePending(pending.Length)) {
+                this.open = false;
+                return -1;
+            }
             NativeMemory.Copy((nint)this.pendingOut + (nint)this.pendingLen, pending, pending.Length);
             this.pendingLen = this.pendingLen + pending.Length;
         }
@@ -209,16 +212,16 @@ public class TlsStream : IDisposable {
         this.engine.FeedNetwork(b, 0, b.Length);
     }
 
-    private void EnsurePending(int extra) {
-        if (extra <= 0) { return; }
-        if (extra > 1073741824 || this.pendingLen > 1073741824 - extra) { return; }
+    private bool EnsurePending(int extra) {
+        if (extra <= 0) { return true; }
+        if (extra > 1073741824 || this.pendingLen > 1073741824 - extra) { return false; }
         int need = this.pendingLen + extra;
         if (this.pendingOut == null) {
             this.pendingOut = new byte[need + 256];
             this.pendingLen = 0;
-            return;
+            return true;
         }
-        if (need <= this.pendingOut.Length) { return; }
+        if (need <= this.pendingOut.Length) { return true; }
         int size = this.pendingOut.Length;
         if (size < 256) { size = 256; }
         while (size < need && size < 1073741824) {
@@ -231,6 +234,7 @@ public class TlsStream : IDisposable {
             NativeMemory.Copy(nb, this.pendingOut, this.pendingLen);
         }
         this.pendingOut = nb;
+        return true;
     }
 
     // 获取当前连接对端证书的描述文本（形如 issuer=... subject=...）。
@@ -423,7 +427,7 @@ public class TlsStream : IDisposable {
 
     // 接收解密后的字节到调用方提供的缓冲区。正常关闭返回 0，出错返回 -1。
     public async int RecvIntoAsync(string buf, int max) {
-        if (!this.open || this.engine == null || buf == null || max < 0) { return -1; }
+        if (!this.open || this.engine == null || buf == null || max < 0 || max > buf.Length) { return -1; }
         if (max == 0) { return 0; }
         while (true) {
             lock (this.ioSync) {

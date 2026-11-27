@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Interop;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 
 namespace Net.Ssh;
 
@@ -101,7 +103,47 @@ public class SshClient : IDisposable {
 
     public void Connect() {
         this.Close();
-        this.tcp = TcpClient.Connect(this.host, this.port);
+        int timeoutMs = (this.options != null) ? this.options.connectTimeoutMs : 15000;
+        if (timeoutMs > 0) {
+            Socket.Initialize();
+            nint sock = (this.host != null && this.host.IndexOf(":") >= 0)
+                ? Socket.CreateTcp6()
+                : Socket.CreateTcp();
+            if (sock < 0) {
+                throw new SshException(SshError.IoError, "cannot create SSH socket",
+                    this.host + ":" + this.port.ToString());
+            }
+            Socket.SetNonBlocking(sock);
+            int rc = Socket.Connect(sock, this.host, this.port);
+            if (rc < 0) {
+                long startMs = Stopwatch.GetMilliseconds();
+                bool connected = false;
+                while (true) {
+                    int st = Socket.ConnectStatus(sock);
+                    if (st == 0) {
+                        connected = true;
+                        break;
+                    }
+                    if (st != -2) {
+                        break;
+                    }
+                    if (Stopwatch.GetMilliseconds() - startMs >= (long)timeoutMs) {
+                        Socket.Close(sock);
+                        throw new SshException(SshError.IoError, "SSH connection timed out",
+                            this.host + ":" + this.port.ToString());
+                    }
+                    Thread.Sleep(5);
+                }
+                if (!connected) {
+                    Socket.Close(sock);
+                    throw new SshException(SshError.IoError, "cannot connect to SSH server",
+                        this.host + ":" + this.port.ToString());
+                }
+            }
+            this.tcp = TcpClient.FromSocket(sock);
+        } else {
+            this.tcp = TcpClient.Connect(this.host, this.port);
+        }
         if (this.tcp == null || !this.tcp.IsConnected()) {
             if (this.tcp != null) {
                 this.tcp.Close();
@@ -126,7 +168,18 @@ public class SshClient : IDisposable {
         this.SendMessage(SshMessage.KexInit, this.kexInitLocal);
         byte[] remotePayload = this.RecvMessage(SshMessage.KexInit);
         this.kexInitRemote = remotePayload;
-        this.Negotiate(local, SshKexInit.FromPayload(remotePayload));
+        SshKexInit remote = SshKexInit.FromPayload(remotePayload);
+        this.Negotiate(local, remote);
+        if (remote.firstKexPacketFollows) {
+            bool kexGuessed = remote.kexAlgorithms != null && remote.kexAlgorithms.Count > 0
+                && remote.kexAlgorithms[0] == this.negotiatedKex;
+            bool hkGuessed = remote.hostKeyAlgorithms != null && remote.hostKeyAlgorithms.Count > 0
+                && remote.hostKeyAlgorithms[0] == this.negotiatedHostKey;
+            if (!kexGuessed || !hkGuessed) {
+                // RFC 4253 §7.1: discard single wrong guessed KEX packet from peer.
+                byte[] _ignored = this.packets.Recv();
+            }
+        }
         this.RunKex();
         this.SwitchToEncrypted();
     }
@@ -190,8 +243,14 @@ public class SshClient : IDisposable {
             throw new SshException(SshError.Unsupported, "unsupported encryption algorithm", encC2S);
         }
         this.negotiatedCipher = encC2S;
-        if (SshNegotiation.Choose(local.macC2S, remote.macC2S) == null) {
-            throw new SshException(SshError.NoCommonAlgorithm, "no common MAC algorithm");
+        // RFC 5647 / OpenSSH PROTOCOL §1.6: AEAD 算法（如 aes256-gcm@openssh.com）自带认证标签，忽略 MAC 协商。
+        bool isAeadC2S = encC2S == "aes256-gcm@openssh.com";
+        bool isAeadS2C = encS2C == "aes256-gcm@openssh.com";
+        if (!isAeadC2S && SshNegotiation.Choose(local.macC2S, remote.macC2S) == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common C2S MAC algorithm");
+        }
+        if (!isAeadS2C && SshNegotiation.Choose(local.macS2C, remote.macS2C) == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common S2C MAC algorithm");
         }
         string compC2S = SshNegotiation.Choose(local.compressionC2S, remote.compressionC2S);
         string compS2C = SshNegotiation.Choose(local.compressionS2C, remote.compressionS2C);
@@ -433,7 +492,7 @@ public class SshClient : IDisposable {
             && message != SshMessage.ChannelSuccess && message != SshMessage.ChannelFailure) {
             return false;
         }
-        if (payload.Length < 5) { return true; }
+        if (payload.Length < 5) { return false; }
         SshReader cr = new SshReader(payload, 1, payload.Length - 1);
         long recipient = cr.ReadU32();
         return recipient != expectedLocalChannel;
@@ -497,6 +556,12 @@ public class SshClient : IDisposable {
             byte[] payload = this.NextMessage();
             int message = payload[0] & 255;
             this.Trace("exec reply: " + SshMessage.Name(message));
+            if (message == SshMessage.Disconnect) {
+                SshClient.ThrowDisconnect(payload, "server disconnected");
+            }
+            if (SshClient.IsStaleChannelMessage(message, payload, this.localChannel)) {
+                continue;
+            }
             if (message == SshMessage.ChannelSuccess) {
                 this.PrependPending(deferred);
                 return;
@@ -507,9 +572,6 @@ public class SshClient : IDisposable {
             if (message == SshMessage.ChannelClose) {
                 throw new SshException(SshError.ChannelOpenFailed,
                     "exec request was not confirmed (channel closed)");
-            }
-            if (message == SshMessage.Disconnect) {
-                SshClient.ThrowDisconnect(payload, "server disconnected");
             }
             deferred.Add(payload);
         }
@@ -529,6 +591,12 @@ public class SshClient : IDisposable {
             byte[] payload = this.NextMessage();
             int message = payload[0] & 255;
             this.Trace("channel recv: " + SshMessage.Name(message));
+            if (message == SshMessage.Disconnect) {
+                SshClient.ThrowDisconnect(payload, "server disconnected");
+            }
+            if (SshClient.IsStaleChannelMessage(message, payload, this.localChannel)) {
+                continue;
+            }
             SshReader r = new SshReader(payload, 1, payload.Length - 1);
             if (message == SshMessage.ChannelSuccess || message == SshMessage.ChannelEof) {
                 continue;
@@ -569,9 +637,6 @@ public class SshClient : IDisposable {
                 continue;
             }
             if (message == SshMessage.ChannelClose) { break; }
-            if (message == SshMessage.Disconnect) {
-                SshClient.ThrowDisconnect(payload, "server disconnected");
-            }
         }
         result.stdout = outBuf.ToString();
         result.stderr = errBuf.ToString();
@@ -624,18 +689,16 @@ public class SshClient : IDisposable {
     }
 
     private string ReadLine() {
+        // 逐字节读版本行，禁止超前预读吞掉同包粘连的 SSH_MSG_KEXINIT。
         StringBuilder sb = new StringBuilder();
+        byte[] one = new byte[1];
         int maxRaw = SshVersion.MaxLength + 1;
         while (true) {
-            if (this.readPos >= this.readLen) {
-                this.readLen = this.pipe.Read(this.readBuf, 0, this.readBuf.Length);
-                this.readPos = 0;
-                if (this.readLen <= 0) {
-                    throw new SshException(SshError.IoError, "connection closed during version exchange");
-                }
+            int n = this.pipe.Read(one, 0, 1);
+            if (n <= 0) {
+                throw new SshException(SshError.IoError, "connection closed during version exchange");
             }
-            int c = this.readBuf[this.readPos] & 255;
-            this.readPos = this.readPos + 1;
+            int c = one[0] & 255;
             if (c == 10) { break; }
             if (sb.Length >= maxRaw) {
                 throw new SshException(SshError.BadVersion, "identification string is too long");

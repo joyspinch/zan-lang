@@ -618,109 +618,110 @@ public class HttpFramer : IDisposable {
     public async int ReadChunkedBody(HttpRequest req, HttpResponse response, int he,
             int maxBodyBytes) {
         ByteBuffer acc = ByteBuffer.Alloc(4096);
-        int pos = he;  // 线路上的读游标
-        int decoded = 0;
-        while (true) {
-            // 长度行：至少要有一个 LF 才能确定它已完整到达。行内字节
-            // （含扩展）超过 8KB 视为畸形——合法长度行远短于此。
-            int scan = pos;
-            int lf = this.IndexOfLf(scan);
-            while (lf < 0) {
-                if (this.pend.Length() - pos >= 8193) {
-                    acc.Free(); return 400;
+        try {
+            int pos = he;  // 线路上的读游标
+            int decoded = 0;
+            while (true) {
+                // 长度行：至少要有一个 LF 才能确定它已完整到达。行内字节
+                // （含扩展）超过 8KB 视为畸形——合法长度行远短于此。
+                int scan = pos;
+                int lf = this.IndexOfLf(scan);
+                while (lf < 0) {
+                    if (this.pend.Length() - pos >= 8193) {
+                        return 400;
+                    }
+                    scan = this.pend.Length();
+                    int n = await this.FillTo(pos + 8194);
+                    if (n < 0) { return 400; }
+                    if (n == 0) { return -1; }
+                    lf = this.IndexOfLf(scan);
                 }
-                scan = this.pend.Length();
-                int n = await this.FillTo(pos + 8194);
-                if (n < 0) { acc.Free(); return 400; }
-                if (n == 0) { acc.Free(); return -1; }
-                lf = this.IndexOfLf(scan);
-            }
-            if (lf - pos > 8192 || lf == pos || this.pend.ByteAt(lf - 1) != 13) {
-                acc.Free();
-                return 400;
-            }
-            // 长度用 64 位累积。32 位下 "100000000"（2^32）会在最后一位
-            // 回绕成 0，被误当成结束块，剩余字节随即按流水线解析成下一
-            // 条请求（框架错位/请求走私）。上限判定在每位累积之后，size
-            // 始终钳在 maxBodyBytes 内（至多约 2^35），64 位不会溢出。
-            long size = 0;
-            int i = pos;
-            bool any = false;
-            bool bad = false;
-            while (i < lf) {
-                int c = this.pend.ByteAt(i);
-                if (c == 13) {
-                    if (i == lf - 1) { break; }
-                    bad = true; break;
+                if (lf - pos > 8192 || lf == pos || this.pend.ByteAt(lf - 1) != 13) {
+                    return 400;
                 }
-                if (c == 59) { break; }  // ';' 块扩展，忽略其内容
-                int d = HttpFramer.HexVal(c);
-                if (d < 0) { bad = true; break; }
-                if (size > ((long)maxBodyBytes - (long)d) / 16) { acc.Free(); return 413; }
-                size = size * 16 + (long)d;
-                any = true;
-                i = i + 1;
-            }
-            if (bad || !any) { acc.Free(); return 400; }
-            for (int j = i; j < lf - 1; j = j + 1) {
-                int extByte = this.pend.ByteAt(j);
-                if (extByte == 13 || extByte == 10 || extByte == 0 || extByte == 127) {
-                    acc.Free(); return 400;
+                // 长度用 64 位累积。32 位下 "100000000"（2^32）会在最后一位
+                // 回绕成 0，被误当成结束块，剩余字节随即按流水线解析成下一
+                // 条请求（框架错位/请求走私）。上限判定在每位累积之后，size
+                // 始终钳在 maxBodyBytes 内（至多约 2^35），64 位不会溢出。
+                long size = 0;
+                int i = pos;
+                bool any = false;
+                bool bad = false;
+                while (i < lf) {
+                    int c = this.pend.ByteAt(i);
+                    if (c == 13) {
+                        if (i == lf - 1) { break; }
+                        bad = true; break;
+                    }
+                    if (c == 59) { break; }  // ';' 块扩展，忽略其内容
+                    int d = HttpFramer.HexVal(c);
+                    if (d < 0) { bad = true; break; }
+                    if (size > ((long)maxBodyBytes - (long)d) / 16) { return 413; }
+                    size = size * 16 + (long)d;
+                    any = true;
+                    i = i + 1;
                 }
+                if (bad || !any) { return 400; }
+                for (int j = i; j < lf - 1; j = j + 1) {
+                    int extByte = this.pend.ByteAt(j);
+                    if (extByte == 13 || extByte == 10 || extByte == 0 || extByte == 127) {
+                        return 400;
+                    }
+                }
+                pos = lf + 1;
+                if (size == 0) {
+                    // 结束块之后是可选的 trailer，以一个空行收尾。
+                    int end = await this.SkipTrailer(pos);
+                    if (end < 0) { return end == -2 ? 400 : -1; }
+                    pos = end;
+                    break;
+                }
+                if (size > (long)maxBodyBytes - decoded) { return 413; }
+                // 仅保留当前块和紧随其后的分隔符；完整块消费后
+                // Discard 已解码线路前缀，不能让大量微小块把 pend 撑大。
+                while (this.pend.Length() - pos < size + 2) {
+                    int n = await this.FillTo(pos + (int)size + 2);
+                    if (n < 0) { return 400; }
+                    if (n == 0) { return -1; }
+                }
+                // size 已由上面的 maxBodyBytes 判定钳在 int 范围内；零临时串直接拷贝。
+                int chunk = (int)size;
+                if (chunk > 0) {
+                    acc.EnsureRoom(chunk);
+                    NativeMemory.Copy(acc.data + (nint)acc.length, this.pend.Raw() + (nint)pos, chunk);
+                    acc.length = acc.length + chunk;
+                }
+                decoded = decoded + chunk;
+                pos = pos + chunk;
+                // 块数据后必须紧跟 CRLF；缺失说明长度撒了谎。
+                int c1 = this.pend.ByteAt(pos);
+                int c2 = this.pend.ByteAt(pos + 1);
+                if (c1 != 13 || c2 != 10) {
+                    // RFC 9112 chunk-data 必须以 CRLF 结束；裸 LF 会让
+                    // 前置代理与后端对请求边界产生不同解释。
+                    return 400;
+                }
+                pos = pos + 2;
+                this.pend.Discard(pos);
+                pos = 0;
+                this.scanned = 0;
             }
-            pos = lf + 1;
-            if (size == 0) {
-                // 结束块之后是可选的 trailer，以一个空行收尾。
-                int end = await this.SkipTrailer(pos);
-                if (end < 0) { acc.Free(); return end == -2 ? 400 : -1; }
-                pos = end;
-                break;
+            string decodedBody = acc.Str(0, decoded);
+            if (req != null) {
+                req.body = decodedBody;
+                req.bodyLength = decoded;
+                req.contentLength = decoded;
+            } else {
+                response.body = decodedBody;
+                response.bodyBytesLen = decoded;
             }
-            if (size > (long)maxBodyBytes - decoded) { acc.Free(); return 413; }
-            // 仅保留当前块和紧随其后的分隔符；完整块消费后
-            // Discard 已解码线路前缀，不能让大量微小块把 pend 撑大。
-            while (this.pend.Length() - pos < size + 2) {
-                int n = await this.FillTo(pos + (int)size + 2);
-                if (n < 0) { acc.Free(); return 400; }
-                if (n == 0) { acc.Free(); return -1; }
-            }
-            // size 已由上面的 maxBodyBytes 判定钳在 int 范围内；零临时串直接拷贝。
-            int chunk = (int)size;
-            if (chunk > 0) {
-                acc.EnsureRoom(chunk);
-                NativeMemory.Copy(acc.data + (nint)acc.length, this.pend.Raw() + (nint)pos, chunk);
-                acc.length = acc.length + chunk;
-            }
-            decoded = decoded + chunk;
-            pos = pos + chunk;
-            // 块数据后必须紧跟 CRLF；缺失说明长度撒了谎。
-            int c1 = this.pend.ByteAt(pos);
-            int c2 = this.pend.ByteAt(pos + 1);
-            if (c1 != 13 || c2 != 10) {
-                // RFC 9112 chunk-data 必须以 CRLF 结束；裸 LF 会让
-                // 前置代理与后端对请求边界产生不同解释。
-                acc.Free();
-                return 400;
-            }
-            pos = pos + 2;
             this.pend.Discard(pos);
-            pos = 0;
             this.scanned = 0;
+            this.wireBytes = 0;
+            return 0;
+        } finally {
+            acc.Free();
         }
-        string decodedBody = acc.Str(0, decoded);
-        if (req != null) {
-            req.body = decodedBody;
-            req.bodyLength = decoded;
-            req.contentLength = decoded;
-        } else {
-            response.body = decodedBody;
-            response.bodyBytesLen = decoded;
-        }
-        acc.Free();
-        this.pend.Discard(pos);
-        this.scanned = 0;
-        this.wireBytes = 0;
-        return 0;
     }
 
     // 跳过结束块之后的 trailer 头部，返回其后的线路下标；

@@ -113,11 +113,20 @@ public partial class HttpClient {
         for (int i = 0; i < codings.Count; i = i + 1) {
             if (codings[i] != "identity") { identityOnly = false; }
         }
-        if (identityOnly) { return resp; }
+        if (identityOnly) {
+            if (!resp.IsBinary()) { resp.bodyBytesLen = 0; }
+            return resp;
+        }
         // 没有正文就没有可解码的东西（HEAD 响应、空正文 200 都属这类）。
-        // 此时不报错——一个"空的 gzip 正文"和"根本没发正文"在线路上
-        // 分不开，硬解只会得到一个假失败。
-        if (resp.body == null || resp.body.Length == 0) { return resp; }
+        // 压缩负载首字节可能为 0x00，须以真实字节计数 bodyBytesLen 为准而非 strlen(resp.body)。
+        bool wasBinary = resp.IsBinary();
+        int encodedLength = resp.bodyBytesLen > 0
+            ? resp.bodyBytesLen
+            : (resp.body != null ? resp.body.Length : 0);
+        if (encodedLength == 0 || (wasBinary ? resp.bodyBytes == null : resp.body == null)) {
+            if (!wasBinary) { resp.bodyBytesLen = 0; }
+            return resp;
+        }
         HttpBoundedContentDecoder decoder = this.boundedContentDecoder;
         if (decoder == null) {
             decoder = HttpClient.defaultBoundedContentDecoder;
@@ -126,17 +135,17 @@ public partial class HttpClient {
             throw new HttpRequestException("response is " + header
                 + "-encoded but no content decoder with a decode budget is configured");
         }
-        bool wasBinary = resp.IsBinary();
-        int encodedLength = wasBinary ? resp.bodyBytesLen : resp.body.Length;
         int limit = this.ResponseLimit();
         if (encodedLength < 0 || encodedLength > limit
             || (wasBinary && (resp.bodyBytes == null || encodedLength > resp.bodyBytes.Length))) {
             throw new HttpRequestException("encoded response body exceeds budget or has invalid length");
         }
-        // ToBytes uses strlen: copy the tracked count, preserving embedded NUL.
+        // Preserve embedded NUL bytes by copying exact tracked byte count via NativeMemory.Copy.
         byte[] cur = new byte[encodedLength];
-        for (int j = 0; j < encodedLength; j = j + 1) {
-            cur[j] = wasBinary ? resp.bodyBytes[j] : (byte)resp.body[j];
+        if (wasBinary) {
+            NativeMemory.Copy((nint)cur, (nint)resp.bodyBytes, encodedLength);
+        } else {
+            NativeMemory.Copy((nint)cur, (nint)resp.body, encodedLength);
         }
         for (int i = codings.Count - 1; i >= 0; i = i - 1) {
             string coding = codings[i];

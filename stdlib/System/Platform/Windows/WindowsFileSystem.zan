@@ -178,7 +178,10 @@ public class WindowsFileSystem : IPlatformFileSystem {
                     while (more) {
                         string fname = Wide.Read(findData + 44);
                         Span<byte> attr = new Span<byte>(findData, 4);
-                        int rawAttrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
+                        int rawAttrs = (attr[0] & 255)
+                            | ((attr[1] & 255) << 8)
+                            | ((attr[2] & 255) << 16)
+                            | ((attr[3] & 255) << 24);
 
                         // Junction / Symlink (1024) 降级按普通文件收，避免误递归
                         bool isDir = (rawAttrs & 1024) == 0 && (rawAttrs & 16) != 0;
@@ -188,17 +191,30 @@ public class WindowsFileSystem : IPlatformFileSystem {
                         if (fname != "." && fname != ".."
                             && isDir == wantDirs
                             && (includeHidden || !hidden)) {
-                            // 换算 64 位文件尺寸（nFileSizeHigh @ 28, nFileSizeLow @ 32）
+                            // 换算 64 位文件尺寸（nFileSizeHigh @ 28, nFileSizeLow @ 32），
+                            // 全程用 long 移位避免 int32 符号位溢出导致 2-4 GiB 尺寸与 50% 时间戳错乱。
                             Span<byte> szSpan = new Span<byte>(findData + 28, 8);
-                            long high = szSpan[0] + szSpan[1] * 256 + szSpan[2] * 65536 + szSpan[3] * 16777216;
-                            long low = szSpan[4] + szSpan[5] * 256 + szSpan[6] * 65536 + szSpan[7] * 16777216;
-                            long length = (high * 4294967296L) + low;
+                            long high = ((long)(szSpan[0] & 255))
+                                | (((long)(szSpan[1] & 255)) << 8)
+                                | (((long)(szSpan[2] & 255)) << 16)
+                                | (((long)(szSpan[3] & 255)) << 24);
+                            long low = ((long)(szSpan[4] & 255))
+                                | (((long)(szSpan[5] & 255)) << 8)
+                                | (((long)(szSpan[6] & 255)) << 16)
+                                | (((long)(szSpan[7] & 255)) << 24);
+                            long length = (high << 32) | low;
 
                             // 换算最后写入时间（ftLastWriteTime @ 20，100ns 间隔转 Unix 秒）
                             Span<byte> ftSpan = new Span<byte>(findData + 20, 8);
-                            long ftHigh = ftSpan[4] + ftSpan[5] * 256 + ftSpan[6] * 65536 + ftSpan[7] * 16777216;
-                            long ftLow = ftSpan[0] + ftSpan[1] * 256 + ftSpan[2] * 65536 + ftSpan[3] * 16777216;
-                            long ft = (ftHigh * 4294967296L) + ftLow;
+                            long ftHigh = ((long)(ftSpan[4] & 255))
+                                | (((long)(ftSpan[5] & 255)) << 8)
+                                | (((long)(ftSpan[6] & 255)) << 16)
+                                | (((long)(ftSpan[7] & 255)) << 24);
+                            long ftLow = ((long)(ftSpan[0] & 255))
+                                | (((long)(ftSpan[1] & 255)) << 8)
+                                | (((long)(ftSpan[2] & 255)) << 16)
+                                | (((long)(ftSpan[3] & 255)) << 24);
+                            long ft = (ftHigh << 32) | ftLow;
                             long unixSec = 0;
                             if (ft > 116444736000000000L) {
                                 unixSec = (ft - 116444736000000000L) / 10000000L;

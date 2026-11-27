@@ -59,18 +59,18 @@ public partial class TlsEngine {
                         this.Fail("ServerHello X25519 key_share 截断"); return -1;
                     }
                 } else if (extType == 16) {  // alpn (0x0010)
-                    if (extLen >= 3) {
-                        int listLen = r.ReadU16();
-                        int pLen = r.ReadU8();
-                        if (pLen > 0 && pLen <= r.Remaining()) {
-                            byte[] pBytes = r.ReadBytes(pLen);
-                            this.negotiatedAlpn = pBytes.ToStr(0, pLen);
-                        } else {
-                            r.Skip(extLen - 3);
-                        }
-                    } else {
-                        r.Skip(extLen);
+                    int alpnEnd = r.Offset() + extLen;
+                    if (extLen < 4) {
+                        this.Fail("ServerHello ALPN 扩展长度非法"); return -1;
                     }
+                    int listLen = r.ReadU16();
+                    int pLen = r.ReadU8();
+                    if (listLen != extLen - 2 || pLen <= 0 || pLen + 1 != listLen
+                        || r.Offset() + pLen > alpnEnd) {
+                        this.Fail("ServerHello ALPN 扩展格式非法"); return -1;
+                    }
+                    byte[] pBytes = r.ReadBytes(pLen);
+                    this.negotiatedAlpn = pBytes.ToStr(0, pLen);
                 } else {
                     r.Skip(extLen);
                 }
@@ -187,23 +187,24 @@ public partial class TlsEngine {
                 this.Fail("Certificate 扩展数据截断"); return -1;
             }
             if (extType == 5) {
-                // status_request (RFC 8446 §4.4.2.1)
+                // status_request (RFC 8446 §4.4.2.1): 严格限定在当前扩展 extDataLen 边界内。
+                int extEnd = er.Offset() + extDataLen;
                 if (extDataLen >= 4) {
                     int statusType = er.ReadU8();
                     int ocspRespLen = er.ReadU24();
-                    if (statusType == 1 && ocspRespLen > 0 && ocspRespLen <= er.Remaining()) {
+                    if (statusType == 1 && ocspRespLen > 0 && ocspRespLen <= extDataLen - 4) {
                         byte[] ocspDer = er.ReadBytes(ocspRespLen);
                         this.stapledOcsp = OcspResponse.Parse(ocspDer, 0, ocspDer.Length);
-
-                    } else {
-                        er.Skip(extDataLen - 4);
                     }
-                } else {
-                    er.Skip(extDataLen);
                 }
+                int remInExt = extEnd - er.Offset();
+                if (remInExt > 0) { er.Skip(remInExt); }
             } else {
                 er.Skip(extDataLen);
             }
+        }
+        if (er.Remaining() != 0) {
+            this.Fail("Certificate 扩展尾随非法字节"); return -1;
         }
         return 0;
     }

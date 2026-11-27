@@ -8,11 +8,19 @@ namespace System.Collections.Generic;
 // 专为高频音视频数据帧、网卡数据包采集与高吞吐协程/线程流水线设计。
 // 容量自动向上对齐到 2 的幂次，以位与运算代替取模操作，消除锁竞争与中间堆分配。
 public class RingBuffer<T> {
+    [DllImport("crt", EntryPoint = "zan_atomic_int_load")]
+    private static extern long AtomicLoad(long[] cell);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_store")]
+    private static extern void AtomicStore(long[] cell, long value);
+
     public T[] buffer;
     public int capacity;
     public int mask;
     public int head;
     public int tail;
+    private long[] headCell;
+    private long[] tailCell;
 
     public RingBuffer(int capacity) {
         int cap = 2;
@@ -26,6 +34,10 @@ public class RingBuffer<T> {
         this.buffer = new T[cap];
         this.head = 0;
         this.tail = 0;
+        this.headCell = new long[1];
+        this.tailCell = new long[1];
+        AtomicStore(this.headCell, 0L);
+        AtomicStore(this.tailCell, 0L);
     }
 
     public static RingBuffer<T> Create(int capacity) {
@@ -38,8 +50,8 @@ public class RingBuffer<T> {
 
     public int Count {
         get {
-            int h = this.head;
-            int t = this.tail;
+            int h = (int)AtomicLoad(this.headCell);
+            int t = (int)AtomicLoad(this.tailCell);
             if (t >= h) {
                 return t - h;
             }
@@ -48,7 +60,7 @@ public class RingBuffer<T> {
     }
 
     public bool IsEmpty {
-        get { return this.head == this.tail; }
+        get { return (int)AtomicLoad(this.headCell) == (int)AtomicLoad(this.tailCell); }
     }
 
     public bool IsFull {
@@ -57,34 +69,40 @@ public class RingBuffer<T> {
 
     // 尝试写入一项。若缓冲区已满返回 false，不产生阻塞。
     public bool TryWrite(T item) {
-        int nextTail = (this.tail + 1) & this.mask;
-        if (nextTail == this.head) {
+        int t = (int)AtomicLoad(this.tailCell);
+        int nextTail = (t + 1) & this.mask;
+        if (nextTail == (int)AtomicLoad(this.headCell)) {
             return false;
         }
-        this.buffer[this.tail] = item;
+        this.buffer[t] = item;
         this.tail = nextTail;
+        AtomicStore(this.tailCell, (long)nextTail);
         return true;
     }
 
     // 尝试读取一项。若缓冲区为空返回 false。
     public bool TryRead(out T item) {
-        if (this.head == this.tail) {
+        int h = (int)AtomicLoad(this.headCell);
+        if (h == (int)AtomicLoad(this.tailCell)) {
             item = null;
             return false;
         }
-        item = this.buffer[this.head];
-        this.buffer[this.head] = null;
-        this.head = (this.head + 1) & this.mask;
+        item = this.buffer[h];
+        this.buffer[h] = null;
+        int nextHead = (h + 1) & this.mask;
+        this.head = nextHead;
+        AtomicStore(this.headCell, (long)nextHead);
         return true;
     }
 
     // 查看队首元素但不弹出
     public bool TryPeek(out T item) {
-        if (this.head == this.tail) {
+        int h = (int)AtomicLoad(this.headCell);
+        if (h == (int)AtomicLoad(this.tailCell)) {
             item = null;
             return false;
         }
-        item = this.buffer[this.head];
+        item = this.buffer[h];
         return true;
     }
 
@@ -93,11 +111,13 @@ public class RingBuffer<T> {
         if (source == null || count <= 0 || offset < 0 || offset > source.Length || count > source.Length - offset) {
             return 0;
         }
-        int available = (this.capacity - 1) - this.Count;
+        int h = (int)AtomicLoad(this.headCell);
+        int t = (int)AtomicLoad(this.tailCell);
+        int used = t >= h ? (t - h) : (this.capacity - (h - t));
+        int available = (this.capacity - 1) - used;
         int toWrite = count < available ? count : available;
         if (toWrite <= 0) { return 0; }
 
-        int t = this.tail;
         int firstChunk = this.capacity - t;
         if (toWrite <= firstChunk) {
             Array.Copy<T>(source, offset, this.buffer, t, toWrite);
@@ -105,7 +125,9 @@ public class RingBuffer<T> {
             Array.Copy<T>(source, offset, this.buffer, t, firstChunk);
             Array.Copy<T>(source, offset + firstChunk, this.buffer, 0, toWrite - firstChunk);
         }
-        this.tail = (t + toWrite) & this.mask;
+        int nextTail = (t + toWrite) & this.mask;
+        this.tail = nextTail;
+        AtomicStore(this.tailCell, (long)nextTail);
         return toWrite;
     }
 
@@ -114,11 +136,12 @@ public class RingBuffer<T> {
         if (destination == null || count <= 0 || offset < 0 || offset > destination.Length || count > destination.Length - offset) {
             return 0;
         }
-        int available = this.Count;
+        int h = (int)AtomicLoad(this.headCell);
+        int t = (int)AtomicLoad(this.tailCell);
+        int available = t >= h ? (t - h) : (this.capacity - (h - t));
         int toRead = count < available ? count : available;
         if (toRead <= 0) { return 0; }
 
-        int h = this.head;
         int firstChunk = this.capacity - h;
         if (toRead <= firstChunk) {
             Array.Copy<T>(this.buffer, h, destination, offset, toRead);
@@ -130,15 +153,22 @@ public class RingBuffer<T> {
             Array.Copy<T>(this.buffer, 0, destination, offset + firstChunk, secondChunk);
             for (int i = 0; i < secondChunk; i = i + 1) { this.buffer[i] = null; }
         }
-        this.head = (h + toRead) & this.mask;
+        int nextHead = (h + toRead) & this.mask;
+        this.head = nextHead;
+        AtomicStore(this.headCell, (long)nextHead);
         return toRead;
     }
 
     // 清空缓冲区
     public void Clear() {
-        while (this.head != this.tail) {
-            this.buffer[this.head] = null;
-            this.head = (this.head + 1) & this.mask;
+        int h = (int)AtomicLoad(this.headCell);
+        int t = (int)AtomicLoad(this.tailCell);
+        while (h != t) {
+            this.buffer[h] = null;
+            h = (h + 1) & this.mask;
+            this.head = h;
+            AtomicStore(this.headCell, (long)h);
+            t = (int)AtomicLoad(this.tailCell);
         }
     }
 }

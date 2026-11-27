@@ -13,6 +13,8 @@ namespace System.Diagnostics;
 // 可控的命令字符串。（不经 shell、基于 argv 的启动器才是处理不可信参数的
 // 安全之选，使用 RunSafe / CaptureSafe / StartDetachedSafe。）
 public class Process {
+    private static AtomicInt s_capSeq = new AtomicInt(0);
+
     // 将绝对 URI 交给系统关联程序；成功启动处理器返回 true。
     // 不等待处理器退出，不经 shell 解释 URI；无效输入或不支持的平台返回 false。
     public static bool OpenUrl(string url) {
@@ -377,7 +379,8 @@ public class Process {
         string tmpDir = Path.GetTempPath();
         int tick = WinGetTickCount();
         int pid = WinGetCurrentProcessId();
-        string tmp = tmpDir + "zan_cap_" + pid + "_" + tick + ".tmp";
+        long seq = Process.s_capSeq.Increment();
+        string tmp = tmpDir + "zan_cap_" + pid + "_" + tick + "_" + seq + ".tmp";
         try {
             r.exitCode = WinSpawn("(" + cmd + ") > \"" + tmp + "\" 2>&1", true);
             if (File.Exists(tmp)) {
@@ -782,31 +785,36 @@ public class Process {
         }
         nint hReadPipe = WinHandleAt(hRead, 0);
         nint hWritePipe = WinHandleAt(hWrite, 0);
-        int HANDLE_FLAG_INHERIT = 1;
-        if (WinSetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0) == 0) {
-            WinCloseHandle(hReadPipe);
+        byte[] pi = new byte[32];
+        int ok = 0;
+        nint wcmd = 0;
+        try {
+            int HANDLE_FLAG_INHERIT = 1;
+            if (WinSetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0) == 0) {
+                r.exitCode = 0 - 1;
+                return r;
+            }
+
+            byte[] si = new byte[128];
+            si[0] = 104;
+            int STARTF_USESTDHANDLES = 256;
+            WinPutInt(si, 60, STARTF_USESTDHANDLES);
+            WinPutHandle(si, 88, hWritePipe); // hStdOutput
+            WinPutHandle(si, 96, hWritePipe); // hStdError
+
+            int CREATE_NO_WINDOW = 134217728;
+            string cmdline = BuildCommandLine(exe, args);
+            wcmd = Wide.Of(cmdline);
+            ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
+        } finally {
+            if (wcmd != 0) { Wide.Free(wcmd); }
             WinCloseHandle(hWritePipe);
-            r.exitCode = 0 - 1;
-            return r;
+            if (ok == 0) {
+                WinCloseHandle(hReadPipe);
+            }
         }
 
-        byte[] si = new byte[128];
-        si[0] = 104;
-        int STARTF_USESTDHANDLES = 256;
-        WinPutInt(si, 60, STARTF_USESTDHANDLES);
-        WinPutHandle(si, 88, hWritePipe); // hStdOutput
-        WinPutHandle(si, 96, hWritePipe); // hStdError
-
-        byte[] pi = new byte[32];
-        int CREATE_NO_WINDOW = 134217728;
-        string cmdline = BuildCommandLine(exe, args);
-        nint wcmd = Wide.Of(cmdline);
-        int ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
-        Wide.Free(wcmd);
-        WinCloseHandle(hWritePipe);
-
         if (ok == 0) {
-            WinCloseHandle(hReadPipe);
             r.exitCode = 0 - 1;
             return r;
         }
@@ -957,8 +965,12 @@ public class Process {
     public static async Task<ProcessResult> CaptureSafeAsync(string exe, List<string> args) {
         TaskCompletionSource<ProcessResult> tcs = new TaskCompletionSource<ProcessResult>();
         Task.Run(delegate () {
-            ProcessResult res = CaptureSafe(exe, args);
-            tcs.SetResult(res);
+            try {
+                ProcessResult res = CaptureSafe(exe, args);
+                tcs.SetResult(res);
+            } catch (Exception ex) {
+                tcs.SetException(ex);
+            }
         });
         return await tcs.Task;
     }
