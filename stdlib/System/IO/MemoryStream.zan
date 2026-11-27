@@ -9,13 +9,19 @@ public class MemoryStream : Stream {
     int capacity;
     int length;
     int pos;
+    bool closed;
 
     // 构造空流（默认分配 256 字节初始缓冲区）。
     public MemoryStream() {
         this.capacity = 256;
         this.data = NativeMemory.Alloc(this.capacity);
+        if (this.data == 0) {
+            this.capacity = 0;
+            throw new IOException("MemoryStream: out of memory allocating 256 bytes");
+        }
         this.length = 0;
         this.pos = 0;
+        this.closed = false;
     }
 
     // 指定初始容量构造空流。
@@ -25,11 +31,13 @@ public class MemoryStream : Stream {
         this.capacity = cap;
         this.data = NativeMemory.Alloc(cap);
         if (this.data == 0) {
+            this.capacity = 0;
             throw new IOException("MemoryStream: out of memory allocating "
                 + cap + " bytes");
         }
         this.length = 0;
         this.pos = 0;
+        this.closed = false;
     }
 
     // 基于托管字节数组初始化流。
@@ -38,8 +46,14 @@ public class MemoryStream : Stream {
         if (cap < 16) { cap = 16; }
         this.capacity = cap;
         this.data = NativeMemory.Alloc(cap);
+        if (this.data == 0) {
+            this.capacity = 0;
+            throw new IOException("MemoryStream: out of memory allocating "
+                + cap + " bytes");
+        }
         this.length = 0;
         this.pos = 0;
+        this.closed = false;
         if (bytes != null && bytes.Length > 0) {
             NativeMemory.Copy(this.data, (nint)bytes, bytes.Length);
             this.length = bytes.Length;
@@ -54,10 +68,16 @@ public class MemoryStream : Stream {
     // 基于 `s` 字节副本的流，位置为 0
     // （二进制安全：内嵌 NUL 字节会保留）。
     public static MemoryStream FromStr(string s) {
+        if (s == null) {
+            return MemoryStream.Alloc(16);
+        }
         int n = s.Length;
-        MemoryStream ms = MemoryStream.Alloc(n + 1);
-        NativeMemory.PutString(ms.data, 0, s, n);
-        ms.length = n;
+        int cap = n < 2147483647 ? n + 1 : 2147483647;
+        MemoryStream ms = MemoryStream.Alloc(cap);
+        if (n > 0) {
+            NativeMemory.PutString(ms.data, 0, s, n);
+            ms.length = n;
+        }
         return ms;
     }
 
@@ -66,7 +86,8 @@ public class MemoryStream : Stream {
         if (src == 0 || count <= 0) {
             return MemoryStream.Alloc(16);
         }
-        MemoryStream ms = MemoryStream.Alloc(count + 1);
+        int cap = count < 2147483647 ? count + 1 : 2147483647;
+        MemoryStream ms = MemoryStream.Alloc(cap);
         NativeMemory.Copy(ms.data, src, count);
         ms.length = count;
         return ms;
@@ -74,13 +95,13 @@ public class MemoryStream : Stream {
 
     // 目前已写入的字节，以二进制安全字符串返回。
     public string ToStr() {
-        if (this.length <= 0) { return ""; }
+        if (this.closed || this.length <= 0 || this.data == 0) { return ""; }
         return NativeMemory.GetString(this.data, 0, this.length);
     }
 
     // 将整个流内容提取为独立的托管字节数组
     public byte[] ToArray() {
-        if (this.length <= 0 || this.data == 0) {
+        if (this.closed || this.length <= 0 || this.data == 0) {
             return new byte[0];
         }
         byte[] arr = new byte[this.length];
@@ -90,7 +111,7 @@ public class MemoryStream : Stream {
 
     // 直接零分配单字节读取，流结束返回 -1。
     public override int ReadByte() {
-        if (this.capacity == 0 || this.pos >= this.length) { return -1; }
+        if (this.closed || this.capacity == 0 || this.pos >= this.length) { return -1; }
         int v = new Span<byte>(this.data + (nint)this.pos, 1)[0] & 255;
         this.pos = this.pos + 1;
         return v;
@@ -98,6 +119,9 @@ public class MemoryStream : Stream {
 
     // 直接零分配单字节写入（必要时扩容）。
     public override void WriteByte(int b) {
+        if (this.closed) {
+            throw new ObjectDisposedException("MemoryStream");
+        }
         long end = (long)this.pos + 1;
         if (end > 2147483647L) {
             throw new ArgumentException("MemoryStream: write would exceed the 2 GiB limit");
@@ -116,13 +140,20 @@ public class MemoryStream : Stream {
 
     // 扩容到至少 needed 字节（倍增策略）；分配失败或越过 2 GiB 上限抛 IOException。
     void Grow(int needed) {
+        if (this.closed) {
+            throw new ObjectDisposedException("MemoryStream");
+        }
         if (needed <= this.capacity) { return; }
         long cap = this.capacity;
         if (cap < 16) { cap = 16; }
-        while (cap < needed) {
-            cap = cap * 2;
+        while (cap < (long)needed) {
+            cap = cap * 2L;
+            if (cap > 2147483647L) {
+                cap = 2147483647L;
+                break;
+            }
         }
-        if (cap > 2147483647L) {
+        if (cap < (long)needed) {
             throw new IOException("MemoryStream: cannot grow beyond the 2 GiB limit");
         }
         nint bigger = NativeMemory.Alloc((int)cap);
@@ -130,10 +161,10 @@ public class MemoryStream : Stream {
             throw new IOException("MemoryStream: out of memory growing to "
                 + cap + " bytes");
         }
-        if (this.length > 0) {
+        if (this.length > 0 && this.data != 0) {
             NativeMemory.Copy(bigger, this.data, this.length);
         }
-        if (this.capacity > 0) {
+        if (this.capacity > 0 && this.data != 0) {
             NativeMemory.Free(this.data);
         }
         this.data = bigger;
@@ -141,13 +172,13 @@ public class MemoryStream : Stream {
     }
 
     // 未 Close 时为 true。
-    public override bool CanRead() { return this.capacity > 0; }
+    public override bool CanRead() { return !this.closed && this.capacity > 0; }
 
     // 未 Close 时为 true。
-    public override bool CanWrite() { return this.capacity > 0; }
+    public override bool CanWrite() { return !this.closed && this.capacity > 0; }
 
     // 未 Close 时为 true。
-    public override bool CanSeek() { return this.capacity > 0; }
+    public override bool CanSeek() { return !this.closed && this.capacity > 0; }
 
     // 已写入的最高水位字节数。
     public override long Length() { return this.length; }
@@ -176,25 +207,28 @@ public class MemoryStream : Stream {
 
     // 读取最多 count 字节到 buf，返回实际读取数（末尾为 0）。
     public override int ReadInto(nint buf, int count) {
-        if (this.capacity == 0 || count <= 0) { return 0; }
+        if (this.closed || this.capacity == 0 || buf == 0 || count <= 0) { return 0; }
         int avail = this.length - this.pos;
         if (avail <= 0) { return 0; }
         int n = count;
         if (n > avail) { n = avail; }
-        NativeMemory.Copy(buf, this.data + this.pos, n);
+        NativeMemory.Copy(buf, this.data + (nint)this.pos, n);
         this.pos = this.pos + n;
         return n;
     }
 
     // 从 buf 追加 count 字节（必要时扩容），推进位置与最高水位；超过 2 GiB 上限抛 ArgumentException。
     public override int WriteFrom(nint buf, int count) {
-        if (count <= 0) { return 0; }
-        long end = (long)this.pos + count;
+        if (this.closed) {
+            throw new ObjectDisposedException("MemoryStream");
+        }
+        if (buf == 0 || count <= 0) { return 0; }
+        long end = (long)this.pos + (long)count;
         if (end > 2147483647L) {
             throw new ArgumentException("MemoryStream: write would exceed the 2 GiB limit");
         }
         this.Grow((int)end);
-        NativeMemory.Copy(this.data + this.pos, buf, count);
+        NativeMemory.Copy(this.data + (nint)this.pos, buf, count);
         this.pos = this.pos + count;
         if (this.pos > this.length) {
             this.length = this.pos;
@@ -206,7 +240,8 @@ public class MemoryStream : Stream {
 
     // 释放缓冲区；重复调用安全。
     public override void Close() {
-        if (this.capacity > 0) {
+        this.closed = true;
+        if (this.capacity > 0 && this.data != 0) {
             NativeMemory.Free(this.data);
             this.data = 0;
             this.capacity = 0;

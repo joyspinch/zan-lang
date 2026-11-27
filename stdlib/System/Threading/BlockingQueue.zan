@@ -63,21 +63,26 @@ public class BlockingQueue<T> : IDisposable {
 
     public bool Enqueue(T item) {
         while (true) {
-            Mutex.Lock(this.lockHandle);
+            nint lk = this.lockHandle;
+            if (lk == 0) { return false; }
+            Mutex.Lock(lk);
             if (this.closed) {
-                Mutex.Unlock(this.lockHandle);
+                Mutex.Unlock(lk);
                 return false;
             }
             if (this.capacity > 0 && this.items.Count - this.head >= this.capacity) {
                 this.posters = this.posters + 1;
-                Mutex.Unlock(this.lockHandle);
-                Semaphore.Wait(this.slots);
+                nint sl = this.slots;
+                Mutex.Unlock(lk);
+                if (sl == 0) { return false; }
+                Semaphore.Wait(sl);
                 continue;
             }
             bool wake = false;
             this.PushAndCheckWaiterLocked(item, out wake);
-            Mutex.Unlock(this.lockHandle);
-            if (wake) { Semaphore.Release(this.sem); }
+            nint sm = this.sem;
+            Mutex.Unlock(lk);
+            if (wake && sm != 0) { Semaphore.Release(sm); }
             return true;
         }
     }
@@ -86,102 +91,124 @@ public class BlockingQueue<T> : IDisposable {
     public bool EnqueueFor(T item, int timeoutMs) {
         long deadline = timeoutMs >= 0 ? DateTime.GetCurrentUnixMilliseconds() + (long)timeoutMs : -1L;
         while (true) {
-            Mutex.Lock(this.lockHandle);
+            nint lk = this.lockHandle;
+            if (lk == 0) { return false; }
+            Mutex.Lock(lk);
             if (this.closed) {
-                Mutex.Unlock(this.lockHandle);
+                Mutex.Unlock(lk);
                 return false;
             }
             if (this.capacity <= 0 || this.items.Count - this.head < this.capacity) {
                 bool wake = false;
                 this.PushAndCheckWaiterLocked(item, out wake);
-                Mutex.Unlock(this.lockHandle);
-                if (wake) { Semaphore.Release(this.sem); }
+                nint sm = this.sem;
+                Mutex.Unlock(lk);
+                if (wake && sm != 0) { Semaphore.Release(sm); }
                 return true;
             }
             int waitMs = timeoutMs;
             if (deadline >= 0L) {
                 long rem = deadline - DateTime.GetCurrentUnixMilliseconds();
                 if (rem <= 0L) {
-                    Mutex.Unlock(this.lockHandle);
+                    Mutex.Unlock(lk);
                     return false;
                 }
                 waitMs = rem > 2147483647L ? 2147483647 : (int)rem;
             }
             this.posters = this.posters + 1;
-            Mutex.Unlock(this.lockHandle);
-            if (Semaphore.WaitFor(this.slots, waitMs)) { continue; }
-            Mutex.Lock(this.lockHandle);
+            nint sl = this.slots;
+            Mutex.Unlock(lk);
+            if (sl == 0) { return false; }
+            if (Semaphore.WaitFor(sl, waitMs)) { continue; }
+            lk = this.lockHandle;
+            if (lk == 0) { return false; }
+            Mutex.Lock(lk);
             bool parked = this.posters > 0;
             if (parked) { this.posters = this.posters - 1; }
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             if (parked) { return false; }
             // 消费者已配对释放空位，吃掉令牌再重试
-            Semaphore.Wait(this.slots);
+            Semaphore.Wait(sl);
         }
     }
 
     public T TryDequeue() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return this.empty; }
+        Mutex.Lock(lk);
         bool room = false;
         T v = this.TakeAndCheckPosterLocked(out room);
-        Mutex.Unlock(this.lockHandle);
-        if (room) { Semaphore.Release(this.slots); }
+        nint sl = this.slots;
+        Mutex.Unlock(lk);
+        if (room && sl != 0) { Semaphore.Release(sl); }
         return v;
     }
 
     public T DequeueFor(int timeoutMs) {
         long deadline = timeoutMs >= 0 ? DateTime.GetCurrentUnixMilliseconds() + (long)timeoutMs : -1L;
         while (true) {
-            Mutex.Lock(this.lockHandle);
+            nint lk = this.lockHandle;
+            if (lk == 0) { return this.empty; }
+            Mutex.Lock(lk);
             if (this.head < this.items.Count) {
                 bool room = false;
                 T v = this.TakeAndCheckPosterLocked(out room);
-                Mutex.Unlock(this.lockHandle);
-                if (room) { Semaphore.Release(this.slots); }
+                nint sl = this.slots;
+                Mutex.Unlock(lk);
+                if (room && sl != 0) { Semaphore.Release(sl); }
                 return v;
             }
             if (this.closed) {
-                Mutex.Unlock(this.lockHandle);
+                Mutex.Unlock(lk);
                 return this.empty;
             }
             int waitMs = timeoutMs;
             if (deadline >= 0L) {
                 long rem = deadline - DateTime.GetCurrentUnixMilliseconds();
                 if (rem <= 0L) {
-                    Mutex.Unlock(this.lockHandle);
+                    Mutex.Unlock(lk);
                     return this.empty;
                 }
                 waitMs = rem > 2147483647L ? 2147483647 : (int)rem;
             }
             this.waiters = this.waiters + 1;
-            Mutex.Unlock(this.lockHandle);
-            if (Semaphore.WaitFor(this.sem, waitMs)) { continue; }
-            Mutex.Lock(this.lockHandle);
+            nint sm = this.sem;
+            Mutex.Unlock(lk);
+            if (sm == 0) { return this.empty; }
+            if (Semaphore.WaitFor(sm, waitMs)) { continue; }
+            lk = this.lockHandle;
+            if (lk == 0) { return this.empty; }
+            Mutex.Lock(lk);
             bool parked = this.waiters > 0;
             if (parked) { this.waiters = this.waiters - 1; }
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             if (parked) { return this.empty; }
-            Semaphore.Wait(this.sem);
+            Semaphore.Wait(sm);
         }
     }
 
     public T Dequeue() {
         while (true) {
-            Mutex.Lock(this.lockHandle);
+            nint lk = this.lockHandle;
+            if (lk == 0) { return this.empty; }
+            Mutex.Lock(lk);
             if (this.head < this.items.Count) {
                 bool room = false;
                 T v = this.TakeAndCheckPosterLocked(out room);
-                Mutex.Unlock(this.lockHandle);
-                if (room) { Semaphore.Release(this.slots); }
+                nint sl = this.slots;
+                Mutex.Unlock(lk);
+                if (room && sl != 0) { Semaphore.Release(sl); }
                 return v;
             }
             if (this.closed) {
-                Mutex.Unlock(this.lockHandle);
+                Mutex.Unlock(lk);
                 return this.empty;
             }
             this.waiters = this.waiters + 1;
-            Mutex.Unlock(this.lockHandle);
-            Semaphore.Wait(this.sem);
+            nint sm = this.sem;
+            Mutex.Unlock(lk);
+            if (sm == 0) { return this.empty; }
+            Semaphore.Wait(sm);
         }
     }
 
@@ -190,20 +217,26 @@ public class BlockingQueue<T> : IDisposable {
     }
 
     public void CompleteWithFault(string message) {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         this.closed = true;
         this.fault = message;
         int wake = this.waiters;
         this.waiters = 0;
         int free = this.posters;
         this.posters = 0;
-        Mutex.Unlock(this.lockHandle);
-        BlockingQueue<T>.ReleaseWaiters(this.sem, wake);
-        BlockingQueue<T>.ReleaseWaiters(this.slots, free);
+        nint sm = this.sem;
+        nint sl = this.slots;
+        Mutex.Unlock(lk);
+        BlockingQueue<T>.ReleaseWaiters(sm, wake);
+        BlockingQueue<T>.ReleaseWaiters(sl, free);
     }
 
     public void Cancel() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         this.canceled = true;
         this.closed = true;
         this.fault = "";
@@ -213,51 +246,67 @@ public class BlockingQueue<T> : IDisposable {
         this.waiters = 0;
         int free = this.posters;
         this.posters = 0;
-        Mutex.Unlock(this.lockHandle);
-        BlockingQueue<T>.ReleaseWaiters(this.sem, wake);
-        BlockingQueue<T>.ReleaseWaiters(this.slots, free);
+        nint sm = this.sem;
+        nint sl = this.slots;
+        Mutex.Unlock(lk);
+        BlockingQueue<T>.ReleaseWaiters(sm, wake);
+        BlockingQueue<T>.ReleaseWaiters(sl, free);
     }
 
     public bool IsCanceled() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return this.canceled; }
+        Mutex.Lock(lk);
         bool v = this.canceled;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public string GetFault() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return this.fault; }
+        Mutex.Lock(lk);
         string v = this.fault;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public bool IsCompleted() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return true; }
+        Mutex.Lock(lk);
         bool v = this.closed && this.head >= this.items.Count;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public int Count() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return 0; }
+        Mutex.Lock(lk);
         int v = this.items.Count - this.head;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public void Dispose() {
+        if (this.lockHandle != 0) {
+            this.Cancel();
+        }
         if (this.sem != 0) {
-            Semaphore.Destroy(this.sem);
+            nint sm = this.sem;
             this.sem = 0;
+            Semaphore.Destroy(sm);
         }
         if (this.slots != 0) {
-            Semaphore.Destroy(this.slots);
+            nint sl = this.slots;
             this.slots = 0;
+            Semaphore.Destroy(sl);
         }
         if (this.lockHandle != 0) {
-            Mutex.Destroy(this.lockHandle);
+            nint lk = this.lockHandle;
             this.lockHandle = 0;
+            Mutex.Destroy(lk);
         }
     }
 
@@ -269,7 +318,7 @@ public class BlockingQueue<T> : IDisposable {
         if (this.head >= n) {
             this.items.Clear();
             this.head = 0;
-        } else if (this.head >= 64 && this.head * 2 >= n) {
+        } else if (this.head >= 64 && this.head >= n - this.head) {
             List<T> rest = new List<T>();
             rest.Reserve(n - this.head);
             int i = this.head;

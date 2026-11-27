@@ -35,65 +35,83 @@ public class SemaphoreSlim : IDisposable {
 
     // 获取槽位，无空位时阻塞；Cancel 后立即返回且不占槽位。
     public void Wait() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         if (this.canceled != 0 || this.active < this.limit) {
             if (this.canceled == 0) { this.active = this.active + 1; }
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return;
         }
         this.waiters = this.waiters + 1;
-        Mutex.Unlock(this.lockHandle);
+        nint sm = this.sem;
+        Mutex.Unlock(lk);
+        if (sm == 0) { return; }
         // 释放方已移交槽位并计入 active，唤醒后无需重检；Cancel 唤醒时由 IsCanceled 区分。
-        Semaphore.Wait(this.sem);
+        Semaphore.Wait(sm);
     }
 
     // 限时获取槽位（负超时无限等）；拿到返回 true，超时或已 Cancel 返回 false。
     public bool WaitFor(int timeoutMs) {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return false; }
+        Mutex.Lock(lk);
         if (this.canceled != 0) {
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return false;
         }
         if (this.active < this.limit) {
             this.active = this.active + 1;
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return true;
         }
         this.waiters = this.waiters + 1;
-        Mutex.Unlock(this.lockHandle);
-        if (Semaphore.WaitFor(this.sem, timeoutMs)) {
-            Mutex.Lock(this.lockHandle);
+        nint sm = this.sem;
+        Mutex.Unlock(lk);
+        if (sm == 0) { return false; }
+        if (Semaphore.WaitFor(sm, timeoutMs)) {
+            lk = this.lockHandle;
+            if (lk == 0) { return false; }
+            Mutex.Lock(lk);
             bool ok = this.canceled == 0;
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return ok;
         }
 
         // 超时撤回等待；若 waiters 已被释放方消费移交，则补领该信号量许可避免泄漏槽位。
-        Mutex.Lock(this.lockHandle);
+        lk = this.lockHandle;
+        if (lk == 0) { return false; }
+        Mutex.Lock(lk);
         if (this.waiters > 0) {
             this.waiters = this.waiters - 1;
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return false;
         }
-        Mutex.Unlock(this.lockHandle);
-        Semaphore.Wait(this.sem);
-        Mutex.Lock(this.lockHandle);
+        Mutex.Unlock(lk);
+        Semaphore.Wait(sm);
+        lk = this.lockHandle;
+        if (lk == 0) { return false; }
+        Mutex.Lock(lk);
         bool took = this.canceled == 0;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return took;
     }
 
     public bool TryWait() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return false; }
+        Mutex.Lock(lk);
         bool got = this.canceled == 0 && this.active < this.limit;
         if (got) { this.active = this.active + 1; }
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return got;
     }
 
     // 归还槽位并按上限唤醒等待者（Cancel 后仅递减 active 不再唤醒）。
     public void Release() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         if (this.active > 0) { this.active = this.active - 1; }
         bool wake = this.canceled == 0 && this.waiters > 0
             && this.active < this.limit;
@@ -101,14 +119,17 @@ public class SemaphoreSlim : IDisposable {
             this.waiters = this.waiters - 1;
             this.active = this.active + 1;
         }
-        Mutex.Unlock(this.lockHandle);
-        if (wake) { Semaphore.Release(this.sem); }
+        nint sm = this.sem;
+        Mutex.Unlock(lk);
+        if (wake && sm != 0) { Semaphore.Release(sm); }
     }
 
     // 动态调整上限，返回本次放行的等待者数量。
     public int SetLimit(int limit) {
         if (limit < 0) { limit = 0; }
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return 0; }
+        Mutex.Lock(lk);
         this.limit = limit;
         int wake = 0;
         while (this.canceled == 0 && this.waiters > 0
@@ -117,61 +138,82 @@ public class SemaphoreSlim : IDisposable {
             this.active = this.active + 1;
             wake = wake + 1;
         }
-        Mutex.Unlock(this.lockHandle);
-        for (int i = 0; i < wake; i = i + 1) {
-            Semaphore.Release(this.sem);
+        nint sm = this.sem;
+        Mutex.Unlock(lk);
+        if (sm != 0) {
+            for (int i = 0; i < wake; i = i + 1) {
+                Semaphore.Release(sm);
+            }
         }
         return wake;
     }
 
     // 一次性关闭：唤醒所有挂起等待者并拒绝后续准入（之后应调用 Dispose）。
     public void Cancel() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         this.canceled = 1;
         int wake = this.waiters;
         this.waiters = 0;
-        Mutex.Unlock(this.lockHandle);
-        for (int i = 0; i < wake; i = i + 1) {
-            Semaphore.Release(this.sem);
+        nint sm = this.sem;
+        Mutex.Unlock(lk);
+        if (sm != 0) {
+            for (int i = 0; i < wake; i = i + 1) {
+                Semaphore.Release(sm);
+            }
         }
     }
 
     public bool IsCanceled() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return this.canceled != 0; }
+        Mutex.Lock(lk);
         int v = this.canceled;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v != 0;
     }
 
     public int Limit() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return this.limit; }
+        Mutex.Lock(lk);
         int v = this.limit;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public int Active() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return 0; }
+        Mutex.Lock(lk);
         int v = this.active;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public int Waiting() {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return 0; }
+        Mutex.Lock(lk);
         int v = this.waiters;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         return v;
     }
 
     public void Dispose() {
+        if (this.lockHandle != 0) {
+            this.Cancel();
+        }
         if (this.sem != 0) {
-            Semaphore.Destroy(this.sem);
+            nint sm = this.sem;
             this.sem = 0;
+            Semaphore.Destroy(sm);
         }
         if (this.lockHandle != 0) {
-            Mutex.Destroy(this.lockHandle);
+            nint lk = this.lockHandle;
             this.lockHandle = 0;
+            Mutex.Destroy(lk);
         }
     }
 }

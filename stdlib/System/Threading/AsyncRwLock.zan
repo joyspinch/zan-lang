@@ -36,10 +36,11 @@ public class AsyncRwLock : IDisposable {
             if (!this.writer && this.writersWaiting == 0) {
                 this.readers = this.readers + 1;
                 bool wakeNextReader = this.readersWaiting > 0;
+                AsyncGate rgWake = wakeNextReader ? this.readGate : null;
                 Mutex.Unlock(m);
                 // 仅当仍有排队读者时接力补发信号，防止 SignalAll 前后并发入队丢失唤醒。
-                if (wakeNextReader && this.readGate != null) {
-                    this.readGate.Signal();
+                if (rgWake != null) {
+                    rgWake.Signal();
                 }
                 return;
             }
@@ -112,44 +113,45 @@ public class AsyncRwLock : IDisposable {
 
     // 释放排他访问：写者优先，有排队写者时仅唤醒写者；否则一次性 SignalAll 放行全部等待读者。
     public void ExitWrite() {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             return;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         this.writer = false;
         bool hasWriters = this.writersWaiting > 0;
         bool hasReaders = this.readersWaiting > 0;
-        Mutex.Unlock(this.mtx);
-        if (hasWriters) {
-            if (this.writeGate != null) {
-                this.writeGate.Signal();
-            }
-        } else if (hasReaders) {
-            if (this.readGate != null) {
-                this.readGate.SignalAll();
-            }
+        AsyncGate wg = hasWriters ? this.writeGate : null;
+        AsyncGate rg = (!hasWriters && hasReaders) ? this.readGate : null;
+        Mutex.Unlock(m);
+        if (wg != null) {
+            wg.Signal();
+        } else if (rg != null) {
+            rg.SignalAll();
         }
     }
 
     // 当前读线程数（诊断用）。
     public int ReaderCount() {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             return 0;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         int r = this.readers;
-        Mutex.Unlock(this.mtx);
+        Mutex.Unlock(m);
         return r;
     }
 
     // 当前是否有写线程持有锁（诊断用）。
     public bool IsWriteLocked() {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             return false;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         bool w = this.writer;
-        Mutex.Unlock(this.mtx);
+        Mutex.Unlock(m);
         return w;
     }
 
