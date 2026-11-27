@@ -32,12 +32,42 @@ public class SseClient : IDisposable {
         return this.tls != null;
     }
 
+    // 校验请求目标/主机 token 不含空白与控制字符（防 HTTP 请求行/头部走私）。
+    private static bool IsSafeRequestToken(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch <= 32 || ch >= 127) { return false; }
+        }
+        return true;
+    }
+
+    // 校验自定义请求头行合法性：含 ':'，无 CR/LF/NUL/CTL。
+    private static bool IsSafeHeaderLine(string line) {
+        if (line == null || line.Length == 0) { return false; }
+        int colon = line.IndexOf(':');
+        if (colon <= 0) { return false; }
+        for (int i = 0; i < colon; i = i + 1) {
+            int ch = line[i] & 255;
+            if (ch <= 32 || ch >= 127) { return false; }
+        }
+        for (int i = colon + 1; i < line.Length; i = i + 1) {
+            int ch = line[i] & 255;
+            if (ch == 127 || (ch < 32 && ch != 9)) { return false; }
+        }
+        return true;
+    }
+
     // 建立连接并发送订阅请求。服务器拒绝该流时，返回的客户端
     // 其 IsConnected() 为 false。
     public static async SseClient ConnectAsync(string host, int port, string path) {
         SseClient c = new SseClient();
         c.buf = "";
         c.connected = false;
+        if (port <= 0 || port > 65535 || !SseClient.IsSafeRequestToken(host)
+            || !SseClient.IsSafeRequestToken(path)) {
+            return c;
+        }
         c.client = await TcpClient.ConnectAsync(host, port);
         // ConnectAsync 失败/超时按文档返回 null（慢上游正是这种）：
         // 直接解引用是空对象虚调用，进程以 SIGSEGV 小地址崩溃。
@@ -70,14 +100,31 @@ public class SseClient : IDisposable {
         SseClient c = new SseClient();
         c.buf = "";
         c.connected = false;
+        if (port <= 0 || port > 65535 || !SseClient.IsSafeRequestToken(host)
+            || !SseClient.IsSafeRequestToken(path)) {
+            return c;
+        }
+        if (customHeaders != null) {
+            for (int i = 0; i < customHeaders.Count; i = i + 1) {
+                if (!SseClient.IsSafeHeaderLine(customHeaders[i])) {
+                    return c;
+                }
+            }
+        }
         c.client = await TcpClient.ConnectAsync(host, port);
         if (c.client == null) { return c; }
 
         TlsContext ctx = TlsContext.CreateClient();
+        if (ctx == null) {
+            c.client.Close();
+            c.client = null;
+            return c;
+        }
         if (!verifyCert) { ctx.DisableVerify(); }
         TlsStream ts = await TlsStream.ConnectAsync(ctx, c.client.GetSocket(), host, 15000);
         if (ts == null) {
             c.client.Close();
+            c.client = null;
             ctx.Free();
             return c;
         }
@@ -106,14 +153,23 @@ public class SseClient : IDisposable {
         req.Append("\r\n");
 
         byte[] reqBytes = Encoding.UTF8.GetBytes(req.ToString());
-        int sent = await c.tls.SendBytesAsync(reqBytes, 0, reqBytes.Length);
-        if (sent <= 0) {
-            c.Close();
-            return c;
-        }
+        HttpDeadlineToken watch = HttpDeadline.Arm(c.client.GetSocket(), 30000);
+        try {
+            int totalSent = 0;
+            while (totalSent < reqBytes.Length) {
+                int sent = await c.tls.SendBytesAsync(reqBytes, totalSent, reqBytes.Length - totalSent);
+                if (sent <= 0) {
+                    c.Close();
+                    return c;
+                }
+                totalSent = totalSent + sent;
+            }
 
-        bool ok = await c.ReadHandshakeHeadAsync(null);
-        if (!ok) { c.Close(); }
+            bool ok = await c.ReadHandshakeHeadAsync(watch);
+            if (!ok) { c.Close(); }
+        } finally {
+            HttpDeadline.Disarm(watch);
+        }
         return c;
     }
 
@@ -129,6 +185,7 @@ public class SseClient : IDisposable {
             if (this.tls != null) {
                 int rn = await this.tls.RecvBytesAsync(tmp, 0, 4096);
                 if (rn <= 0) { return false; }
+                if (watch != null && HttpDeadline.Expired(watch)) { return false; }
                 chunk = Encoding.UTF8.GetString(tmp, 0, rn);
             } else {
                 chunk = await this.client.RecvAsync(4096);
@@ -146,10 +203,16 @@ public class SseClient : IDisposable {
         }
         if (bodyAt < 0 || headSb.Length < 12) { return false; }
         string head = headSb.ToString();
-        // 状态行必须是 "HTTP/1.x 200"：`" 200 "` 全头扫描会把正文/头里
-        // 恰好带 " 200 " 的 404 也当成功。状态码固定在状态行第 10..12 位。
-        if (head.Substring(0, 5) != "HTTP/" || head.Substring(9, 3) != "200") {
+        // 状态行必须是 "HTTP/1.0 200" 或 "HTTP/1.1 200" 后跟空格或行尾。
+        string proto = head.Substring(0, 9);
+        if ((proto != "HTTP/1.1 " && proto != "HTTP/1.0 ") || head.Substring(9, 3) != "200") {
             return false;
+        }
+        if (head.Length > 12) {
+            int afterCode = head[12] & 255;
+            if (afterCode != 32 && afterCode != 13 && afterCode != 10) {
+                return false;
+            }
         }
         this.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
         this.bufPos = 0;

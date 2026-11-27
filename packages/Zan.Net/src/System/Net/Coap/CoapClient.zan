@@ -24,10 +24,10 @@ public class CoapClient : IDisposable {
     }
 
     // 设置初始 ACK 超时（每次重传翻倍）以及
-    // 重传次数。最坏等待时间为 timeoutMs * (2^retries - 1)。
+    // 重传次数（上限 10 次防退避窗口溢出）。
     public CoapClient SetTimeout(int timeoutMs, int retries) {
         if (timeoutMs > 0) { this.ackTimeoutMs = timeoutMs; }
-        if (retries >= 0) { this.maxRetransmit = retries; }
+        if (retries >= 0) { this.maxRetransmit = retries > 10 ? 10 : retries; }
         return this;
     }
 
@@ -135,6 +135,9 @@ public class CoapClient : IDisposable {
     // 解析 d 的前 n 字节响应数据报；不匹配本次请求或为空 ACK 时返回 null。
     public static CoapResponse ParseResponse(byte[] d, int n, int msgId, int tok) {
         if (d == null || n < 4) { return null; }
+        if (n > d.Length) { n = d.Length; }
+        int ver = (d[0] >> 6) & 3;
+        if (ver != 1) { return null; }  // RFC 7252 §3: CoAP 版本号必须为 1
         int tkl = d[0] & 15;
         if (tkl > 8) { return null; }  // RFC 7252 §3: TKL 9-15 属于保留格式错误
         if (4 + tkl > n) { return null; }  // Token 被截断
@@ -196,11 +199,14 @@ public class CoapClient : IDisposable {
         UdpClient udp = new UdpClient();
         CoapResponse result = null;
         try {
-            int msgId = this.nextMsgId & 65535;
-            this.nextMsgId = (this.nextMsgId % 65535) + 1;
+            int msgId = 0;
+            lock (this) {
+                msgId = this.nextMsgId & 65535;
+                this.nextMsgId = (this.nextMsgId % 65535) + 1;
+            }
             byte[] rtokBytes = RandomNumberGenerator.GetBytes(2);
             int tok = 0;
-            if (rtokBytes != null) {
+            if (rtokBytes != null && rtokBytes.Length >= 2) {
                 tok = ((rtokBytes[0] & 255) << 8) | (rtokBytes[1] & 255);
             } else {
                 tok = (msgId * 31 + 7) & 65535;
@@ -226,7 +232,10 @@ public class CoapClient : IDisposable {
                     result = CoapClient.ParseResponse(rb, rn, msgId, tok);
                 }
                 attempt = attempt + 1;
-                window = window * 2;
+                if (window < 60000) {
+                    window = window * 2;
+                    if (window > 60000) { window = 60000; }
+                }
             }
         } finally {
             udp.Close();

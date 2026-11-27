@@ -206,8 +206,15 @@ public class HttpResponse : IDisposable {
         resp.statusCode = 401;
         resp.statusText = "Unauthorized";
         resp.body = "<h1>401 Unauthorized</h1>";
-        if (realm != null && realm.Length > 0 && !HttpResponse.HasCrlf(realm)) {
-            resp.headers.Add("WWW-Authenticate: Basic realm=\"" + realm + "\"");
+        if (realm != null && realm.Length > 0 && HttpResponse.HeaderFramingSafe(false, realm)) {
+            bool safeQuoted = true;
+            for (int i = 0; i < realm.Length; i = i + 1) {
+                int c = realm[i] & 255;
+                if (c == 34 || c == 92) { safeQuoted = false; break; }
+            }
+            if (safeQuoted) {
+                resp.headers.Add("WWW-Authenticate: Basic realm=\"" + realm + "\"");
+            }
         }
         return resp;
     }
@@ -381,12 +388,25 @@ public class HttpResponse : IDisposable {
         return this;
     }
 
-    // 为响应添加 Set-Cookie 头 (RFC 6265)，单缓冲全内联直写。
+    // 为响应添加 Set-Cookie 头 (RFC 6265)，严格拦截 ';'/'='/CTL 防属性与 CRLF 注入。
     public HttpResponse SetCookie(string name, string val, string path, int maxAge, bool secure, bool httpOnly) {
         if (name == null || name.Length == 0 || val == null) { return this; }
-        if (NativeMemory.IndexOfAny((nint)name, name.Length, 13, 10) >= 0) { return this; }
-        if (val.Length > 0 && NativeMemory.IndexOfAny((nint)val, val.Length, 13, 10) >= 0) { return this; }
-        bool hasPath = path != null && path.Length > 0 && NativeMemory.IndexOfAny((nint)path, path.Length, 13, 10) < 0;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            if (c <= 32 || c >= 127 || c == 59 || c == 61) { return this; }
+        }
+        for (int i = 0; i < val.Length; i = i + 1) {
+            int c = val[i] & 255;
+            if (c < 32 || c >= 127 || c == 59) { return this; }
+        }
+        bool hasPath = false;
+        if (path != null && path.Length > 0) {
+            hasPath = true;
+            for (int i = 0; i < path.Length; i = i + 1) {
+                int c = path[i] & 255;
+                if (c < 32 || c >= 127 || c == 59) { return this; }
+            }
+        }
         int total = 12 + name.Length + 1 + val.Length + (hasPath ? 7 + path.Length : 0)
             + (maxAge >= 0 ? 22 : 0) + (secure ? 8 : 0) + (httpOnly ? 10 : 0);
         byte[] buf = new byte[total];

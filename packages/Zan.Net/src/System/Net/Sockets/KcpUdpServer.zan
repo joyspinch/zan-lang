@@ -61,6 +61,9 @@ public class KcpUdpServer : IDisposable {
     private byte[] recvBuf;
     private List<KcpClientConn> clients;
     private List<KcpPacket> incoming;
+    private int incomingHead;
+    private int maxClients;
+    private int maxIncoming;
     private int nextPeerId;
     private int timeoutMs;
     private int nodelay;
@@ -76,6 +79,9 @@ public class KcpUdpServer : IDisposable {
         this.recvBuf = new byte[4096];
         this.clients = new List<KcpClientConn>();
         this.incoming = new List<KcpPacket>();
+        this.incomingHead = 0;
+        this.maxClients = 1024;
+        this.maxIncoming = 4096;
         this.nextPeerId = 1;
         this.timeoutMs = 15000;
         this.nodelay = 1;
@@ -92,7 +98,15 @@ public class KcpUdpServer : IDisposable {
     }
 
     public int ClientCount { get { return this.clients.Count; } }
-    public int PendingCount { get { return this.incoming.Count; } }
+    public int PendingCount { get { return this.incoming.Count - this.incomingHead; } }
+
+    public void SetMaxClients(int max) {
+        if (max > 0) { this.maxClients = max; }
+    }
+
+    public void SetMaxIncoming(int max) {
+        if (max > 0) { this.maxIncoming = max; }
+    }
 
     public void SetTimeoutMs(int ms) {
         if (ms > 0) { this.timeoutMs = ms; }
@@ -151,7 +165,9 @@ public class KcpUdpServer : IDisposable {
                 for (int r = 0; r < 64; r = r + 1) {
                     byte[] msg = conn.Session.Recv();
                     if (msg == null) { break; }
-                    this.incoming.Add(new KcpPacket(conn.PeerId, conn.Conv, conn.RemoteIp, conn.RemotePort, msg));
+                    if (this.incoming.Count - this.incomingHead < this.maxIncoming) {
+                        this.incoming.Add(new KcpPacket(conn.PeerId, conn.Conv, conn.RemoteIp, conn.RemotePort, msg));
+                    }
                 }
             }
         }
@@ -167,11 +183,23 @@ public class KcpUdpServer : IDisposable {
         }
     }
 
-    // 取出一条已解码的客户端消息；无消息返回 null。
+    // 取出一条已解码的客户端消息（头索引摊还 O(1)）；无消息返回 null。
     public KcpPacket Recv() {
-        if (this.incoming.Count == 0) { return null; }
-        KcpPacket p = this.incoming[0];
-        this.incoming.RemoveAt(0);
+        if (this.incomingHead >= this.incoming.Count) { return null; }
+        KcpPacket p = this.incoming[this.incomingHead];
+        this.incoming[this.incomingHead] = null;
+        this.incomingHead = this.incomingHead + 1;
+        if (this.incomingHead >= this.incoming.Count) {
+            this.incoming.Clear();
+            this.incomingHead = 0;
+        } else if (this.incomingHead >= 256 && this.incomingHead * 2 >= this.incoming.Count) {
+            List<KcpPacket> compacted = new List<KcpPacket>();
+            for (int i = this.incomingHead; i < this.incoming.Count; i = i + 1) {
+                compacted.Add(this.incoming[i]);
+            }
+            this.incoming = compacted;
+            this.incomingHead = 0;
+        }
         return p;
     }
 
@@ -213,6 +241,9 @@ public class KcpUdpServer : IDisposable {
             }
             return existing;
         }
+        if (this.clients.Count >= this.maxClients) {
+            return null;
+        }
         int peerId = this.nextPeerId;
         this.nextPeerId = this.nextPeerId + 1;
 
@@ -246,6 +277,7 @@ public class KcpUdpServer : IDisposable {
         }
         this.clients.Clear();
         this.incoming.Clear();
+        this.incomingHead = 0;
         this.onConnected = null;
         this.onDisconnected = null;
         if (this.ownedUdp && this.udp != null) {

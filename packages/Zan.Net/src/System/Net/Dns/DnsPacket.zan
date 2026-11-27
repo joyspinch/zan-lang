@@ -124,6 +124,7 @@ public class DnsPacket {
 
     // 构建指定 EDNS0 UDP 接收缓冲区上限的 DNS 查询包（单次精确分配，零 List<byte>/Split）
     public static byte[] BuildQuery(string domain, int queryType, int txId, int ednsPayloadSize) {
+        if (ednsPayloadSize > 65535) { ednsPayloadSize = 65535; }
         bool hasEdns = ednsPayloadSize > 512;
         int nameBytes = DnsPacket.MeasureDomainName(domain);
         int total = 12 + nameBytes + 4 + (hasEdns ? 11 : 0);
@@ -178,7 +179,7 @@ public class DnsPacket {
                 break;
             }
             if ((b & 0xC0) == 0xC0) {
-                if (pos + 1 >= len) { break; }
+                if (pos + 1 >= len) { if (!jumped) { outPos = len; } break; }
                 int ptr = ((b & 0x3F) << 8) | (d[pos + 1] & 255);
                 if (!jumped) {
                     outPos = pos + 2;
@@ -190,12 +191,21 @@ public class DnsPacket {
                 continue;
             }
             if ((b & 0xC0) != 0) {
-                // RFC 1035 保留标签类型（01/10），拒绝畸形标签
+                // RFC 1035 保留标签类型（01/10），拒绝畸形标签并推进游标防死循环
+                if (!jumped) { outPos = len; }
                 break;
             }
             pos = pos + 1;
-            if (pos + b > len) { break; }
+            if (pos + b > len) {
+                if (!jumped) { outPos = len; }
+                break;
+            }
             int need = oLen + (oLen > 0 ? 1 : 0) + b;
+            // RFC 1035 §2.3.4: 完整域名总长不超过 255 字节，阻断压缩指针放大炸弹
+            if (need > 255) {
+                if (!jumped) { outPos = len; }
+                break;
+            }
             if (need > tmp.Length) {
                 int nc = tmp.Length * 2;
                 while (nc < need) { nc = nc * 2; }
@@ -234,16 +244,18 @@ public class DnsPacket {
                 return;
             }
             if ((b & 0xC0) == 0xC0) {
-                if (pos + 1 < len) {
-                    outPos = pos + 2;
-                }
+                outPos = (pos + 1 < len) ? (pos + 2) : len;
                 return;
             }
             if ((b & 0xC0) != 0) {
+                outPos = len;
                 return;
             }
             pos = pos + 1;
-            if (pos + b > len) { return; }
+            if (pos + b > len) {
+                outPos = len;
+                return;
+            }
             pos = pos + b;
             outPos = pos;
         }
@@ -446,7 +458,7 @@ public class DnsPacket {
             arRec.recordClass = rclass;
             pkt.additionals.Add(arRec);
 
-            if (rtype == DnsRecordType.OPT) {
+            if (rtype == DnsRecordType.OPT && rclass >= 512) {
                 pkt.ednsPayloadSize = rclass;
             }
         }

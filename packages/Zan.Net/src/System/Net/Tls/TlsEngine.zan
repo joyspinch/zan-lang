@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net;
 using System.Security.Cryptography;
 
 namespace System.Net.Tls;
@@ -27,6 +28,9 @@ public partial class TlsEngine {
     public static int StateClosed = 10;
     public static int StateFailed = 11;
     public static int MaxPreAuthHandshakeBytes = 262144;
+    public static int MaxPostAuthHandshakeBytes = 65536;
+    public static int MaxDummyCcs = 4;
+    public static int MaxNewSessionTickets = 16;
 
     public string host;
     public bool disableVerify;
@@ -74,6 +78,8 @@ public partial class TlsEngine {
     public bool handshakeSignatureVerified;
     public bool receivedEncryptedExtensions;
     public int preAuthHandshakeBytes;
+    public int dummyCcsCount;
+    public int newSessionTicketCount;
     public bool requireOcspStapling;
     public OcspResponse stapledOcsp;
     public bool clientOfferedStatusRequest;
@@ -175,6 +181,8 @@ public partial class TlsEngine {
         this.handshakeSignatureVerified = false;
         this.receivedEncryptedExtensions = false;
         this.preAuthHandshakeBytes = 0;
+        this.dummyCcsCount = 0;
+        this.newSessionTicketCount = 0;
         this.requireOcspStapling = false;
         this.stapledOcsp = null;
         this.clientOfferedStatusRequest = false;
@@ -440,8 +448,15 @@ public partial class TlsEngine {
                 this.Fail("ChangeCipherSpec 载荷非法");
                 return -1;
             }
-            if (this.negotiatedVersion == TlsRecord.VersionTls13 || this.state == StateTls13Handshake || this.state == StateClientHelloSent || this.state == StateServerTls13WaitingFinished) {
-                // TLS 1.3 中间盒兼容性虚拟 CCS 包，忽略跳过
+            if (this.state != StateConnected
+                && (this.negotiatedVersion == TlsRecord.VersionTls13 || this.state == StateTls13Handshake
+                    || this.state == StateClientHelloSent || this.state == StateServerTls13WaitingFinished)) {
+                // RFC 8446 §5：TLS 1.3 仅在握手期间容忍少量中间盒兼容虚拟 CCS 包，握手后与泛洪均拒绝。
+                this.dummyCcsCount = this.dummyCcsCount + 1;
+                if (this.dummyCcsCount > MaxDummyCcs) {
+                    this.Fail("过多的 TLS 1.3 ChangeCipherSpec 记录");
+                    return -1;
+                }
                 return 0;
             }
             if (!this.isServer && this.state == StateTls12WaitingFinished) {
@@ -518,7 +533,37 @@ public partial class TlsEngine {
             return this.ProcessHandshakePayload(payload);
         }
 
-        return 0;
+        // 未建立 readCipher 时收到明文 ApplicationData 等记录一律失败关闭。
+        this.Fail("未加密状态下收到非法 TLS 记录类型: " + ctype);
+        return -1;
+    }
+
+    public bool WriteHandshakeRecordEncrypted(byte[] msg) {
+        if (msg == null || this.writeCipher == null) { return false; }
+        int off = 0;
+        while (off < msg.Length) {
+            int chunk = msg.Length - off;
+            if (chunk > 16384) { chunk = 16384; }
+            byte[] rec = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, msg, off, chunk);
+            if (rec == null) { return false; }
+            this.outNet.WriteBytes(rec);
+            off = off + chunk;
+        }
+        return true;
+    }
+
+    public bool WriteHandshakeRecordPlaintext(int ver, byte[] msg) {
+        if (msg == null) { return false; }
+        int off = 0;
+        while (off < msg.Length) {
+            int chunk = msg.Length - off;
+            if (chunk > 16384) { chunk = 16384; }
+            byte[] rec = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake, ver, msg, off, chunk);
+            if (rec == null) { return false; }
+            this.outNet.WriteBytes(rec);
+            off = off + chunk;
+        }
+        return true;
     }
 
     public int ProcessHandshakePayload(byte[] data) {
@@ -529,6 +574,11 @@ public partial class TlsEngine {
                 return -1;
             }
             this.preAuthHandshakeBytes = this.preAuthHandshakeBytes + data.Length;
+        } else {
+            if (data.Length > MaxPostAuthHandshakeBytes - this.handshakeBuf.Length()) {
+                this.Fail("TLS 握手后控制消息缓冲超限");
+                return -1;
+            }
         }
         this.handshakeBuf.WriteBytes(data);
         while (this.handshakeBuf.Length() >= 4) {
@@ -576,13 +626,15 @@ public partial class TlsEngine {
                 if (!extensions.Has(4)) { this.Fail("EncryptedExtensions 截断"); return -1; }
                 int kind = extensions.ReadU16();
                 int size = extensions.ReadU16();
-                if (!extensions.Has(size) || seen.Contains(kind)
-                    || this.host == null || this.host.Length == 0) {
-                    this.Fail("EncryptedExtensions 无效或未请求的扩展"); return -1;
+                if (!extensions.Has(size) || seen.Contains(kind)) {
+                    this.Fail("EncryptedExtensions 无效或重复的扩展"); return -1;
                 }
                 if (kind == 0) {
-                    // server_name 确认：必须为空。
-                    if (size != 0) { this.Fail("EncryptedExtensions server_name 非空"); return -1; }
+                    // server_name 确认：仅在客户端实际发送了非 IP 字面量 SNI 且载荷为空时合法。
+                    if (size != 0 || this.host == null || this.host.Length == 0
+                        || IPAddress.IsIPv4(this.host) || IPAddress.IsIPv6(this.host)) {
+                        this.Fail("EncryptedExtensions server_name 非法或未请求"); return -1;
+                    }
                     extensions.Skip(size);
                 } else if (kind == 10) {
                     // supported_groups：RFC 8446 允许服务端在 EE 中回送
@@ -654,7 +706,8 @@ public partial class TlsEngine {
             return this.HandleServerHelloDone(fullMsg, body);
         } else if (msgType == TlsRecord.HandshakeClientKeyExchange) {
             if (!this.isServer || this.serverHandshake == null) {
-                return 0;
+                this.Fail("意外的 ClientKeyExchange");
+                return -1;
             }
             return this.serverHandshake(this, msgType, fullMsg, body);
         } else if (msgType == TlsRecord.HandshakeFinished) {
@@ -668,11 +721,31 @@ public partial class TlsEngine {
                 return this.HandleFinished(fullMsg, body);
             }
         } else if (msgType == TlsRecord.HandshakeNewSessionTicket) {
-            // RFC 5077 §3.3 / RFC 8446 §4.6.1：
-            // 服务端发出的 NewSessionTicket 在 TLS 1.2 中位于 Finished 之前，
-            // 必须计入握手 transcript，否则随后 Finished 校验的 verify_data 必败。
-            this.transcript.Update(fullMsg);
-            return 0;
+            // RFC 5077 §3.3 / RFC 8446 §4.6.1：仅服务端向客户端发送；
+            // TLS 1.2 位于 Finished 之前（明文阶段）且计入 transcript；
+            // TLS 1.3 位于握手完成之后且不计入 transcript（防止长连接内存无限增长）。
+            if (this.isServer) {
+                this.Fail("服务端不应收到 NewSessionTicket");
+                return -1;
+            }
+            this.newSessionTicketCount = this.newSessionTicketCount + 1;
+            if (this.newSessionTicketCount > MaxNewSessionTickets) {
+                this.Fail("过多的 NewSessionTicket 消息");
+                return -1;
+            }
+            if (this.negotiatedVersion == TlsRecord.VersionTls12) {
+                if (this.state != StateTls12WaitingFinished || this.readCipher != null) {
+                    this.Fail("TLS 1.2 NewSessionTicket 状态非法");
+                    return -1;
+                }
+                this.transcript.Update(fullMsg);
+                return 0;
+            }
+            if (this.negotiatedVersion == TlsRecord.VersionTls13 && this.state == StateConnected) {
+                return 0;
+            }
+            this.Fail("意外的 NewSessionTicket");
+            return -1;
         } else if (msgType == TlsRecord.HandshakeKeyUpdate) {
             // RFC 8446 §4.6.3：KeyUpdate 要求双方滚动流量密钥；未实现却
             // 静默忽略会让对端切换写密钥后本端所有记录解密失败，连接
@@ -813,8 +886,9 @@ public partial class TlsEngine {
         // 7. extensions
         TlsByteWriter extWriter = new TlsByteWriter();
 
-        // 7.1 server_name (SNI)
-        if (this.host != null && this.host.Length > 0) {
+        // 7.1 server_name (SNI) — RFC 6066 §3 禁止将 IPv4/IPv6 字面量作为 DNS host_name 发送
+        if (this.host != null && this.host.Length > 0 && this.host.Length <= 255
+            && !IPAddress.IsIPv4(this.host) && !IPAddress.IsIPv6(this.host)) {
             extWriter.WriteU16(0);  // ext type 0 (server_name)
             int hostLen = this.host.Length;
             extWriter.WriteU16(hostLen + 5);

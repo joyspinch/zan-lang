@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 
 namespace System.Net.Dns;
 
@@ -41,10 +42,19 @@ public class DnsClient : IDisposable {
         return this;
     }
 
+    // RFC 5452: 优先使用 CSPRNG 生成不可预测事务 ID，防止 DNS 缓存投毒。
     private int NextTxId() {
-        this.nextId = ((this.nextId * 25173) + 13849) & 65535;
-        if (this.nextId == 0) { this.nextId = 1; }
-        return this.nextId;
+        byte[] rnd = RandomNumberGenerator.GetBytes(2);
+        if (rnd != null && rnd.Length >= 2) {
+            int id = ((rnd[0] & 255) << 8) | (rnd[1] & 255);
+            if (id == 0) { id = 1; }
+            return id;
+        }
+        lock (this) {
+            this.nextId = ((this.nextId * 25173) + 13849) & 65535;
+            if (this.nextId == 0) { this.nextId = 1; }
+            return this.nextId;
+        }
     }
 
     private static bool EqualsAsciiIgnoreCase(string a, string b) {
@@ -149,6 +159,11 @@ public class DnsClient : IDisposable {
     // 异步解析 IPv6 地址列表 (Type AAAA)
     public async List<string> ResolveAaaaAsync(string domain) {
         if (domain == null || domain.Length == 0) { return new List<string>(); }
+        if (IPAddress.IsIPv6(domain)) {
+            List<string> direct = new List<string>();
+            direct.Add(domain);
+            return direct;
+        }
         if (DnsClient.EqualsAsciiIgnoreCase(domain, "localhost")
             || DnsClient.EqualsAsciiIgnoreCase(domain, "localhost.localdomain")) {
             List<string> local = new List<string>();
@@ -156,7 +171,7 @@ public class DnsClient : IDisposable {
             return local;
         }
         string hostsIp = DnsClient.LookupHosts(domain);
-        if (hostsIp.Length > 0 && hostsIp.Contains(":")) {
+        if (hostsIp.Length > 0 && IPAddress.IsIPv6(hostsIp)) {
             List<string> mapped = new List<string>();
             mapped.Add(hostsIp);
             return mapped;
@@ -313,31 +328,36 @@ public class DnsClient : IDisposable {
             }
 
             int sent = await client.SendBytesAsync(tcpQuery, tcpQuery.Length);
-            if (sent <= 0) {
+            if (sent < tcpQuery.Length) {
                 return new List<DnsRecord>();
             }
 
-            // RFC 1035 §4.2.2: TCP 报文前置 2 字节大端网络序长度
+            // RFC 1035 §4.2.2: TCP 报文前置 2 字节大端网络序长度，全过程共享统一超时截止线防慢速拖死
+            long deadline = Stopwatch.GetMilliseconds() + (long)this.timeoutMs;
             byte[] prefix = new byte[2];
             int pRead = 0;
             while (pRead < 2) {
+                long left = deadline - Stopwatch.GetMilliseconds();
+                if (left <= 0L) { return new List<DnsRecord>(); }
                 byte[] pBuf = new byte[2 - pRead];
-                int n = await client.RecvBytesAsync(pBuf, 2 - pRead, this.timeoutMs);
+                int n = await client.RecvBytesAsync(pBuf, 2 - pRead, (int)left);
                 if (n <= 0) { return new List<DnsRecord>(); }
                 NativeMemory.Copy((nint)prefix + (nint)pRead, (nint)pBuf, n);
                 pRead = pRead + n;
             }
 
             int msgLen = ((prefix[0] & 255) << 8) | (prefix[1] & 255);
-            if (msgLen <= 0 || msgLen > 65535) {
+            if (msgLen < 12 || msgLen > 65535) {
                 return new List<DnsRecord>();
             }
 
             byte[] respBuf = new byte[msgLen];
             int received = 0;
             while (received < msgLen) {
+                long left = deadline - Stopwatch.GetMilliseconds();
+                if (left <= 0L) { break; }
                 byte[] chunk = new byte[msgLen - received];
-                int r = await client.RecvBytesAsync(chunk, msgLen - received, this.timeoutMs);
+                int r = await client.RecvBytesAsync(chunk, msgLen - received, (int)left);
                 if (r <= 0) { break; }
                 NativeMemory.Copy((nint)respBuf + (nint)received, (nint)chunk, r);
                 received = received + r;

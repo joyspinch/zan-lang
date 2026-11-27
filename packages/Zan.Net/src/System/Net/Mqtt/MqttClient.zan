@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Net.Http;
 using System.Net.Tls;
 using System.Threading;
 
@@ -31,7 +32,6 @@ public class MqttClient : IDisposable {
     private List<MqttPacket> pendingPackets;
     private int pendingHead;
 
-    private Mutex stateLock;
     private bool sendBusy;
     private Queue<AsyncGate> sendWaiters;
     private bool recvBusy;
@@ -59,7 +59,6 @@ public class MqttClient : IDisposable {
         this.verifyTls = true;
         this.pendingPackets = new List<MqttPacket>();
         this.pendingHead = 0;
-        this.stateLock = new Mutex();
         this.sendBusy = false;
         this.sendWaiters = new Queue<AsyncGate>();
         this.recvBusy = false;
@@ -93,70 +92,67 @@ public class MqttClient : IDisposable {
 
     // 线程安全分配下一个报文标识符（Packet Identifier，1-65535）。
     private int GetNextPacketId() {
-        this.stateLock.WaitOne();
-        int pid = this.nextPacketId;
-        this.nextPacketId = this.nextPacketId + 1;
-        if (this.nextPacketId > 65535) {
-            this.nextPacketId = 1;
+        lock (this) {
+            int pid = this.nextPacketId;
+            this.nextPacketId = this.nextPacketId + 1;
+            if (this.nextPacketId > 65535) {
+                this.nextPacketId = 1;
+            }
+            return pid;
         }
-        this.stateLock.ReleaseMutex();
-        return pid;
     }
 
     // ---- 发送互斥锁（协程所有权直接移交，杜绝并发插队与出站报文碎片交错） ----
     private void WakeSendWaiters() {
-        this.stateLock.WaitOne();
-        this.sendBusy = false;
-        while (this.sendWaiters.Count() > 0) {
-            AsyncGate g = this.sendWaiters.Dequeue();
-            g.Signal();
+        lock (this) {
+            this.sendBusy = false;
+            while (this.sendWaiters.Count() > 0) {
+                AsyncGate g = this.sendWaiters.Dequeue();
+                g.Signal();
+            }
         }
-        this.stateLock.ReleaseMutex();
     }
 
     private async bool AcquireSendAsync() {
         AsyncGate g = null;
-        this.stateLock.WaitOne();
-        if (!this.connected || this.conn == null) {
-            this.stateLock.ReleaseMutex();
-            return false;
+        lock (this) {
+            if (!this.connected || this.conn == null) {
+                return false;
+            }
+            if (!this.sendBusy && this.sendWaiters.Count() == 0) {
+                this.sendBusy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            this.sendWaiters.Enqueue(g);
         }
-        if (!this.sendBusy && this.sendWaiters.Count() == 0) {
-            this.sendBusy = true;
-            this.stateLock.ReleaseMutex();
-            return true;
-        }
-        g = new AsyncGate();
-        this.sendWaiters.Enqueue(g);
-        this.stateLock.ReleaseMutex();
 
         await g.Wait();
         g.Close();
 
-        this.stateLock.WaitOne();
-        if (!this.connected || this.conn == null) {
+        lock (this) {
+            if (!this.connected || this.conn == null) {
+                if (this.sendWaiters.Count() > 0) {
+                    AsyncGate next = this.sendWaiters.Dequeue();
+                    next.Signal();
+                } else {
+                    this.sendBusy = false;
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private void ReleaseSend() {
+        lock (this) {
             if (this.sendWaiters.Count() > 0) {
                 AsyncGate next = this.sendWaiters.Dequeue();
                 next.Signal();
             } else {
                 this.sendBusy = false;
             }
-            this.stateLock.ReleaseMutex();
-            return false;
         }
-        this.stateLock.ReleaseMutex();
-        return true;
-    }
-
-    private void ReleaseSend() {
-        this.stateLock.WaitOne();
-        if (this.sendWaiters.Count() > 0) {
-            AsyncGate next = this.sendWaiters.Dequeue();
-            next.Signal();
-        } else {
-            this.sendBusy = false;
-        }
-        this.stateLock.ReleaseMutex();
     }
 
     // 在出站互斥保护下串行发送完整报文，消除 TCP 碎片交织。
@@ -167,7 +163,13 @@ public class MqttClient : IDisposable {
             int sent = -1;
             if (this.connected) {
                 if (this.tls != null) {
-                    sent = await this.tls.SendBytesAsync(packet, length);
+                    int totalSent = 0;
+                    while (totalSent < length) {
+                        int n = await this.tls.SendBytesAsync(packet, totalSent, length - totalSent);
+                        if (n <= 0) { return -1; }
+                        totalSent = totalSent + n;
+                    }
+                    sent = totalSent;
                 } else if (this.conn != null) {
                     sent = await this.conn.SendBytesAsync(packet, length);
                 }
@@ -180,58 +182,55 @@ public class MqttClient : IDisposable {
 
     // ---- 接收互斥锁（串行化底层 MqttReader，杜绝缓冲区指针撕裂与乱序错位） ----
     private void WakeRecvWaiters() {
-        this.stateLock.WaitOne();
-        this.recvBusy = false;
-        while (this.recvWaiters.Count() > 0) {
-            AsyncGate g = this.recvWaiters.Dequeue();
-            g.Signal();
+        lock (this) {
+            this.recvBusy = false;
+            while (this.recvWaiters.Count() > 0) {
+                AsyncGate g = this.recvWaiters.Dequeue();
+                g.Signal();
+            }
         }
-        this.stateLock.ReleaseMutex();
     }
 
     private async bool AcquireRecvAsync() {
         AsyncGate g = null;
-        this.stateLock.WaitOne();
-        if (!this.connected || this.conn == null) {
-            this.stateLock.ReleaseMutex();
-            return false;
+        lock (this) {
+            if (!this.connected || this.conn == null) {
+                return false;
+            }
+            if (!this.recvBusy && this.recvWaiters.Count() == 0) {
+                this.recvBusy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            this.recvWaiters.Enqueue(g);
         }
-        if (!this.recvBusy && this.recvWaiters.Count() == 0) {
-            this.recvBusy = true;
-            this.stateLock.ReleaseMutex();
-            return true;
-        }
-        g = new AsyncGate();
-        this.recvWaiters.Enqueue(g);
-        this.stateLock.ReleaseMutex();
 
         await g.Wait();
         g.Close();
 
-        this.stateLock.WaitOne();
-        if (!this.connected || this.conn == null) {
+        lock (this) {
+            if (!this.connected || this.conn == null) {
+                if (this.recvWaiters.Count() > 0) {
+                    AsyncGate next = this.recvWaiters.Dequeue();
+                    next.Signal();
+                } else {
+                    this.recvBusy = false;
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private void ReleaseRecv() {
+        lock (this) {
             if (this.recvWaiters.Count() > 0) {
                 AsyncGate next = this.recvWaiters.Dequeue();
                 next.Signal();
             } else {
                 this.recvBusy = false;
             }
-            this.stateLock.ReleaseMutex();
-            return false;
         }
-        this.stateLock.ReleaseMutex();
-        return true;
-    }
-
-    private void ReleaseRecv() {
-        this.stateLock.WaitOne();
-        if (this.recvWaiters.Count() > 0) {
-            AsyncGate next = this.recvWaiters.Dequeue();
-            next.Signal();
-        } else {
-            this.recvBusy = false;
-        }
-        this.stateLock.ReleaseMutex();
     }
 
     // 校验报文是否满足期望类型与报文标识符（PID）。
@@ -258,32 +257,30 @@ public class MqttClient : IDisposable {
 
     // 从待处理缓冲队列中原子弹出满足期望的报文。
     private MqttPacket PopPending(int expectedType, int expectedPid) {
-        this.stateLock.WaitOne();
-        if (this.pendingPackets == null || this.pendingHead >= this.pendingPackets.Count) {
-            this.stateLock.ReleaseMutex();
+        lock (this) {
+            if (this.pendingPackets == null || this.pendingHead >= this.pendingPackets.Count) {
+                return null;
+            }
+            for (int i = this.pendingHead; i < this.pendingPackets.Count; i = i + 1) {
+                MqttPacket pkt = this.pendingPackets[i];
+                if (this.MatchPacket(pkt, expectedType, expectedPid)) {
+                    if (i == this.pendingHead) {
+                        this.pendingPackets[i] = null;
+                        this.pendingHead = this.pendingHead + 1;
+                        if (this.pendingHead >= this.pendingPackets.Count) {
+                            this.pendingPackets.Clear();
+                            this.pendingHead = 0;
+                        } else if (this.pendingHead >= 256 && this.pendingHead * 2 >= this.pendingPackets.Count) {
+                            this.CompactPendingLocked();
+                        }
+                    } else {
+                        this.pendingPackets.RemoveAt(i);
+                    }
+                    return pkt;
+                }
+            }
             return null;
         }
-        for (int i = this.pendingHead; i < this.pendingPackets.Count; i = i + 1) {
-            MqttPacket pkt = this.pendingPackets[i];
-            if (this.MatchPacket(pkt, expectedType, expectedPid)) {
-                if (i == this.pendingHead) {
-                    this.pendingPackets[i] = null;
-                    this.pendingHead = this.pendingHead + 1;
-                    if (this.pendingHead >= this.pendingPackets.Count) {
-                        this.pendingPackets.Clear();
-                        this.pendingHead = 0;
-                    } else if (this.pendingHead >= 256 && this.pendingHead * 2 >= this.pendingPackets.Count) {
-                        this.CompactPendingLocked();
-                    }
-                } else {
-                    this.pendingPackets.RemoveAt(i);
-                }
-                this.stateLock.ReleaseMutex();
-                return pkt;
-            }
-        }
-        this.stateLock.ReleaseMutex();
-        return null;
     }
 
     private void CompactPendingLocked() {
@@ -298,21 +295,21 @@ public class MqttClient : IDisposable {
     // 向待处理队列原子放入报文（头索引摊还 O(1) 淘汰，避免满载时每次 RemoveAt(0) O(N) 搬移）。
     private void PushPending(MqttPacket pkt) {
         if (pkt == null) { return; }
-        this.stateLock.WaitOne();
-        if (this.pendingPackets == null) {
-            this.pendingPackets = new List<MqttPacket>();
-            this.pendingHead = 0;
-        }
-        if (this.pendingPackets.Count - this.pendingHead >= 1024) {
-            // 待处理缓冲上限（1024条），淘汰最旧的未消费报文，防止长连接内存无界泄漏
-            this.pendingPackets[this.pendingHead] = null;
-            this.pendingHead = this.pendingHead + 1;
-            if (this.pendingHead >= 512) {
-                this.CompactPendingLocked();
+        lock (this) {
+            if (this.pendingPackets == null) {
+                this.pendingPackets = new List<MqttPacket>();
+                this.pendingHead = 0;
             }
+            if (this.pendingPackets.Count - this.pendingHead >= 1024) {
+                // 待处理缓冲上限（1024条），淘汰最旧的未消费报文，防止长连接内存无界泄漏
+                this.pendingPackets[this.pendingHead] = null;
+                this.pendingHead = this.pendingHead + 1;
+                if (this.pendingHead >= 512) {
+                    this.CompactPendingLocked();
+                }
+            }
+            this.pendingPackets.Add(pkt);
         }
-        this.pendingPackets.Add(pkt);
-        this.stateLock.ReleaseMutex();
     }
 
     // MQTT "remaining length" varint 编码所需的字节数（1-4）。
@@ -374,12 +371,7 @@ public class MqttClient : IDisposable {
 
                 MqttPacket pkt = await this.reader.ReadPacketAsync();
                 if (pkt == null) {
-                    Mutex lk = this.stateLock;
-                    if (lk != null) {
-                        lk.WaitOne();
-                        this.connected = false;
-                        lk.ReleaseMutex();
-                    } else {
+                    lock (this) {
                         this.connected = false;
                     }
                     released = true;
@@ -467,22 +459,31 @@ public class MqttClient : IDisposable {
         mqtt.reader = new MqttReader(mqtt.conn.GetSocket());
 
         byte[] packet = mqtt.BuildConnectPacket();
-        int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
-
-        // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
-        // body 的第 2 字节为连接返回码（0 = 已接受，4 = 用户名/密码错误，5 = 未授权）。
-        MqttPacket ack = await mqtt.reader.ReadPacketAsync();
-        if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
-            mqtt.Abort();
-            return mqtt;
-        }
-        if (ack.bodyLen >= 2 && ack.body != null) {
-            int returnCode = ack.body[1] & 255;
-            mqtt.lastReturnCode = returnCode;
-            if (returnCode == 0) {
-                mqtt.connected = true;
+        HttpDeadlineToken watch = HttpDeadline.Arm(mqtt.conn.GetSocket(), 15000, 15000);
+        try {
+            int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
+            if (sent < packet.Length) {
+                mqtt.Abort();
                 return mqtt;
             }
+
+            // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
+            // body 的第 2 字节为连接返回码（0 = 已接受，4 = 用户名/密码错误，5 = 未授权）。
+            MqttPacket ack = await mqtt.reader.ReadPacketAsync();
+            if (ack == null || ack.packetType != MqttPacketType.CONNACK || HttpDeadline.Expired(watch)) {
+                mqtt.Abort();
+                return mqtt;
+            }
+            if (ack.bodyLen >= 2 && ack.body != null) {
+                int returnCode = ack.body[1] & 255;
+                mqtt.lastReturnCode = returnCode;
+                if (returnCode == 0) {
+                    mqtt.connected = true;
+                    return mqtt;
+                }
+            }
+        } finally {
+            HttpDeadline.Disarm(watch);
         }
         mqtt.Abort();
         return mqtt;
@@ -518,6 +519,10 @@ public class MqttClient : IDisposable {
         if (mqtt.conn == null) { return mqtt; }
 
         mqtt.tlsCtx = TlsContext.CreateClient();
+        if (mqtt.tlsCtx == null) {
+            mqtt.Abort();
+            return mqtt;
+        }
         if (!verifyCert) {
             mqtt.tlsCtx.DisableVerify();
         }
@@ -531,20 +536,33 @@ public class MqttClient : IDisposable {
         mqtt.reader.SetTls(ts);
 
         byte[] packet = mqtt.BuildConnectPacket();
-        int sent = await mqtt.tls.SendBytesAsync(packet, packet.Length);
+        HttpDeadlineToken watch = HttpDeadline.Arm(mqtt.conn.GetSocket(), 15000, 15000);
+        try {
+            int totalSent = 0;
+            while (totalSent < packet.Length) {
+                int sent = await mqtt.tls.SendBytesAsync(packet, totalSent, packet.Length - totalSent);
+                if (sent <= 0) {
+                    mqtt.Abort();
+                    return mqtt;
+                }
+                totalSent = totalSent + sent;
+            }
 
-        MqttPacket ack = await mqtt.reader.ReadPacketAsync();
-        if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
-            mqtt.Abort();
-            return mqtt;
-        }
-        if (ack.bodyLen >= 2 && ack.body != null) {
-            int returnCode = ack.body[1] & 255;
-            mqtt.lastReturnCode = returnCode;
-            if (returnCode == 0) {
-                mqtt.connected = true;
+            MqttPacket ack = await mqtt.reader.ReadPacketAsync();
+            if (ack == null || ack.packetType != MqttPacketType.CONNACK || HttpDeadline.Expired(watch)) {
+                mqtt.Abort();
                 return mqtt;
             }
+            if (ack.bodyLen >= 2 && ack.body != null) {
+                int returnCode = ack.body[1] & 255;
+                mqtt.lastReturnCode = returnCode;
+                if (returnCode == 0) {
+                    mqtt.connected = true;
+                    return mqtt;
+                }
+            }
+        } finally {
+            HttpDeadline.Disarm(watch);
         }
         mqtt.Abort();
         return mqtt;
@@ -558,8 +576,10 @@ public class MqttClient : IDisposable {
 
     // 发布消息并指定 retain 标志，在 IO reactor 上挂起。
     public async int PublishAsync(string topic, string message, int qos, bool retain) {
+        if (qos < 0 || qos > 2) { return -1; }
         int topicLen = topic != null ? topic.Length : 0;
         int msgLen = message != null ? message.Length : 0;
+        if (topicLen <= 0 || topicLen > 65535 || msgLen > 268435455 - 4 - topicLen) { return -1; }
 
         int byte0 = (MqttPacketType.PUBLISH << 4);
         if (qos > 0) {
@@ -632,9 +652,10 @@ public class MqttClient : IDisposable {
 
     // 以原生字节数组切片发布二进制消息，彻底杜绝包含 NUL 字节时被截断。在 IO reactor 上挂起。
     public async int PublishBytesAsync(string topic, byte[] payload, int offset, int count, int qos, bool retain) {
-        if (payload == null || offset < 0 || count < 0 || offset + count > payload.Length) { return -1; }
+        if (qos < 0 || qos > 2 || payload == null || offset < 0 || count < 0 || offset > payload.Length || count > payload.Length - offset) { return -1; }
         int topicLen = topic != null ? topic.Length : 0;
         int msgLen = count;
+        if (topicLen <= 0 || topicLen > 65535 || msgLen > 268435455 - 4 - topicLen) { return -1; }
 
         int byte0 = (MqttPacketType.PUBLISH << 4);
         if (qos > 0) {
@@ -921,9 +942,7 @@ public class MqttClient : IDisposable {
         TlsStream ts = null;
         TlsContext tc = null;
         TcpClient c = null;
-        Mutex lk = this.stateLock;
-        if (lk != null) { lk.WaitOne(); }
-        try {
+        lock (this) {
             this.connected = false;
             ts = this.tls;
             this.tls = null;
@@ -931,8 +950,6 @@ public class MqttClient : IDisposable {
             this.tlsCtx = null;
             c = this.conn;
             this.conn = null;
-        } finally {
-            if (lk != null) { lk.ReleaseMutex(); }
         }
         if (ts != null) { ts.Close(); }
         if (tc != null) { tc.Free(); }
@@ -943,11 +960,6 @@ public class MqttClient : IDisposable {
 
     public void Dispose() {
         this.Abort();
-        if (this.stateLock != null) {
-            Mutex lk = this.stateLock;
-            this.stateLock = null;
-            lk.Close();
-        }
     }
 
     // 连接是否仍存活：CONNACK 返回码为 0 后为 true，

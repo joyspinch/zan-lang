@@ -6,6 +6,7 @@ namespace System.Net.Http.Client;
 // <c>hostOnly</c> 控制回放时是否允许匹配子域。
 // <c>expires</c> 为 0 表示会话 cookie（进程内一直有效）。
 public class CookieJar {
+    private const int MaxCookies = 3000;
     private List<Cookie> items;
     private int expiringCount;
 
@@ -15,8 +16,9 @@ public class CookieJar {
         this.expiringCount = 0;
     }
 
+    // RFC 6265 §5.2: 仅裁剪 SP (0x20) 与 HTAB (0x09)，禁止静默吞掉 CR/LF 等控制字符。
     private static bool IsTrimWs(int c) {
-        return c == 32 || (c >= 9 && c <= 13);
+        return c == 32 || c == 9;
     }
 
     // ASCII 快速转小写：已全小写时零分配原样返回。
@@ -73,39 +75,47 @@ public class CookieJar {
 
     // 已存储的 cookie 条数（过期的不计）。
     public int Count() {
-        this.DropExpired();
-        return this.items.Count;
+        lock (this) {
+            this.DropExpired();
+            return this.items.Count;
+        }
     }
 
     // 按名字取值，没有则返回空串。
     public string Get(string name) {
-        this.DropExpired();
-        int n = this.items.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (this.items[i].Name() == name) { return this.items[i].Value(); }
+        lock (this) {
+            this.DropExpired();
+            int n = this.items.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                if (this.items[i].Name() == name) { return this.items[i].Value(); }
+            }
+            return "";
         }
-        return "";
     }
 
     // 按名字删除，删掉了返回 true。
     public bool Remove(string name) {
-        int n = this.items.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (this.items[i].Name() == name) {
-                if (this.items[i].Expires() > 0) {
-                    this.expiringCount = this.expiringCount - 1;
+        lock (this) {
+            int n = this.items.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                if (this.items[i].Name() == name) {
+                    if (this.items[i].Expires() > 0) {
+                        this.expiringCount = this.expiringCount - 1;
+                    }
+                    this.items.RemoveAt(i);
+                    return true;
                 }
-                this.items.RemoveAt(i);
-                return true;
             }
+            return false;
         }
-        return false;
     }
 
     // 清空存储。
     public void Clear() {
-        this.items.Clear();
-        this.expiringCount = 0;
+        lock (this) {
+            this.items.Clear();
+            this.expiringCount = 0;
+        }
     }
 
     // 吸收一条 Set-Cookie 头的值（不含头名字），<paramref name="host"/> 和
@@ -118,7 +128,44 @@ public class CookieJar {
         string defPath = CookieJar.DefaultPath(requestPath);
         int n = setCookieValue.Length;
         nint sp = (nint)setCookieValue;
-        this.SetCookieSlice(h, defPath, sp, new Span<byte>(sp, n), 0, n);
+        lock (this) {
+            this.SetCookieSlice(h, defPath, sp, new Span<byte>(sp, n), 0, n);
+        }
+    }
+
+    private static bool IsSafeCookieBytes(Span<byte> sb, int start, int end, bool isName) {
+        for (int i = start; i < end; i = i + 1) {
+            int c = sb[i] & 255;
+            if (c < 32 || c == 127 || c == 59) { return false; }
+            if (isName && (c == 32 || c == 61)) { return false; }
+        }
+        return true;
+    }
+
+    // 严格按 RFC 6265 §5.2.2 解析 Max-Age：仅允许可选 '-' 加纯数字，非法返回 false（忽略而非删除），溢出饱和截断。
+    private static bool TryParseMaxAge(Span<byte> sb, int start, int end, out long age) {
+        age = 0L;
+        if (start >= end) { return false; }
+        int i = start;
+        bool neg = false;
+        if ((sb[i] & 255) == 45) {
+            neg = true;
+            i = i + 1;
+        }
+        if (i >= end) { return false; }
+        long val = 0L;
+        long maxSafe = 3153600000L; // 100 年上限，防 now + age 溢出
+        while (i < end) {
+            int ch = sb[i] & 255;
+            if (ch < 48 || ch > 57) { return false; }
+            if (val < maxSafe) {
+                val = val * 10L + (long)(ch - 48);
+                if (val > maxSafe) { val = maxSafe; }
+            }
+            i = i + 1;
+        }
+        age = neg ? (0L - val) : val;
+        return true;
     }
 
     // 零子串原地解析单条 Set-Cookie 值切片 [valStart, valEnd)。
@@ -138,6 +185,10 @@ public class CookieJar {
         int ve = pairEnd;
         while (vs < ve && CookieJar.IsTrimWs(sb[vs] & 255)) { vs = vs + 1; }
         while (ve > vs && CookieJar.IsTrimWs(sb[ve - 1] & 255)) { ve = ve - 1; }
+        if (!CookieJar.IsSafeCookieBytes(sb, ns, ne, true)
+            || !CookieJar.IsSafeCookieBytes(sb, vs, ve, false)) {
+            return;
+        }
 
         string name = NativeMemory.GetString(sp, ns, ne - ns);
         string val = vs < ve ? NativeMemory.GetString(sp, vs, ve - vs) : "";
@@ -199,11 +250,13 @@ public class CookieJar {
                 int fc = sb[ks] & 255;
                 if (fc >= 65 && fc <= 90) { fc = fc + 32; }
                 if (fc == 109 && CookieJar.EqLowerSlice(sb, ks, 7, "max-age")) {
-                    long age = CookieJar.ParseLongSlice(sb, avs, ave);
-                    if (age <= 0) { deleted = true; }
-                    else {
-                        if (nowCache == 0L) { nowCache = CookieJar.NowUnixSeconds(); }
-                        c.expires = nowCache + age;
+                    long age = 0L;
+                    if (CookieJar.TryParseMaxAge(sb, avs, ave, out age)) {
+                        if (age <= 0L) { deleted = true; }
+                        else {
+                            if (nowCache == 0L) { nowCache = CookieJar.NowUnixSeconds(); }
+                            c.expires = nowCache + age;
+                        }
                     }
                 } else if (fc == 101 && CookieJar.EqLowerSlice(sb, ks, 7, "expires")) {
                     long at = CookieJar.ParseHttpDateSlice(sb, avs, ave);
@@ -231,6 +284,15 @@ public class CookieJar {
             }
         }
         if (!deleted) {
+            if (this.items.Count >= MaxCookies) {
+                this.DropExpired();
+                if (this.items.Count >= MaxCookies) {
+                    if (this.items[0].expires > 0) {
+                        this.expiringCount = this.expiringCount - 1;
+                    }
+                    this.items.RemoveAt(0);
+                }
+            }
             this.items.Add(c);
             if (c.expires > 0) {
                 this.expiringCount = this.expiringCount + 1;
@@ -242,6 +304,7 @@ public class CookieJar {
     // <paramref name="secureChannel"/> 为 false 时标了 Secure 的 cookie 不外发。
     // 顺序按 RFC 6265：路径长的在前，同长度按写入顺序。
     public string HeaderValue(string host, string requestPath, bool secureChannel) {
+        lock (this) {
         this.DropExpired();
         int n = this.items.Count;
         if (n == 0) { return ""; }
@@ -336,12 +399,14 @@ public class CookieJar {
             if (cv.Length > 0) { NativeMemory.PutString(op, oPos, cv, cv.Length); oPos = oPos + cv.Length; }
         }
         return NativeMemory.GetString(op, 0, total);
+        }
     }
 
     // 从一段响应头里吸收所有 Set-Cookie 行。<paramref name="head"/> 是
     // 状态行 + 头部（到空行为止即可，多给了也无妨）。
     public void AbsorbHead(string host, string requestPath, string head) {
         if (head == null || head.Length == 0) { return; }
+        lock (this) {
         string hLower = null;
         string defPath = null;
         int pos = 0;
@@ -370,6 +435,7 @@ public class CookieJar {
                 }
             }
             pos = end + 1;
+        }
         }
     }
 

@@ -69,8 +69,13 @@ public class WssClient : IDisposable {
             + "Connection: Upgrade\r\n"
             + "Sec-WebSocket-Key: " + key + "\r\n"
             + "Sec-WebSocket-Version: 13\r\n\r\n";
-        int sent = await client.stream.SendAsync(request, request.Length);
-        if (sent <= 0) { client.CloseNow(); return client; }
+        int totalSent = 0;
+        byte[] reqBytes = request.ToBytes();
+        while (totalSent < reqBytes.Length) {
+            int sent = await client.stream.SendBytesAsync(reqBytes, totalSent, reqBytes.Length - totalSent);
+            if (sent <= 0) { client.CloseNow(); return client; }
+            totalSent = totalSent + sent;
+        }
 
         // 响应头可能被 TLS 记录边界拆开；头之后的字节已是帧
         // （可能含 NUL）。全部落进 reader 的显式长度缓冲。握手接收
@@ -85,7 +90,7 @@ public class WssClient : IDisposable {
                 return client;
             }
             int n = await client.reader.FillMore();
-            if (n == 0) {
+            if (n <= 0) {
                 HttpDeadline.Disarm(watch);
                 client.CloseNow();
                 return client;
@@ -125,6 +130,7 @@ public class WssClient : IDisposable {
 
     // 发送一条 Text 消息（fire-and-forget；发送失败会就地断开）。
     public async void SendText(string text) {
+        if (text == null) { return; }
         await this.session.SendFrame(WsOpcode.Text, text, text.Length);
     }
 

@@ -24,6 +24,7 @@ public class Http2Stream {
     public int maxBodyBytes = 8388608;
     public bool headersReceived;
     public bool suppressBody;
+    private bool gateClosed;
 
     public Http2Stream(int streamId) {
         this.streamId = streamId;
@@ -34,6 +35,7 @@ public class Http2Stream {
         this.errorCode = 0;
         this.completed = false;
         this.gate = new Gate();
+        this.gateClosed = false;
     }
 
     public void AddHeader(string name, string value) {
@@ -69,20 +71,44 @@ public class Http2Stream {
     }
 
     public void Complete() {
-        if (!this.completed) {
-            if (!this.suppressBody && this.declaredLength >= 0 && this.bodyLength != this.declaredLength) { this.Reset(1); return; }
-            this.state = 4; // Closed
-            this.completed = true;
-            this.gate.Signal();
+        lock (this) {
+            if (!this.completed) {
+                if (!this.suppressBody && this.declaredLength >= 0 && this.bodyLength != this.declaredLength) {
+                    this.errorCode = 1;
+                }
+                this.state = 4; // Closed
+                this.completed = true;
+                if (!this.gateClosed && this.gate != null) {
+                    this.gate.Signal();
+                }
+            }
         }
     }
 
     public void Reset(int err) {
-        if (!this.completed) {
-            this.errorCode = err;
-            this.state = 4; // Closed
-            this.completed = true;
-            this.gate.Signal();
+        lock (this) {
+            if (!this.completed) {
+                this.errorCode = err;
+                this.state = 4; // Closed
+                this.completed = true;
+                if (!this.gateClosed && this.gate != null) {
+                    this.gate.Signal();
+                }
+            }
+        }
+    }
+
+    // 幂等安全关闭流等待门，避免与帧循环并发 Signal 产生 Gate UAF。
+    public void CloseGate() {
+        Gate g = null;
+        lock (this) {
+            if (this.gateClosed) { return; }
+            this.gateClosed = true;
+            g = this.gate;
+            this.gate = null;
+        }
+        if (g != null) {
+            g.Close();
         }
     }
 }

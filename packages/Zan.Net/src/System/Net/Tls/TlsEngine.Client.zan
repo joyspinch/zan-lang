@@ -16,6 +16,9 @@ public partial class TlsEngine {
         int legacyVer = r.ReadU16();
         this.serverRandom = r.ReadBytes(32);
         int sidLen = r.ReadU8();
+        if (sidLen > 32 || !r.Has(sidLen + 3)) {
+            this.Fail("ServerHello session_id 长度非法"); return -1;
+        }
         if (sidLen > 0) { r.Skip(sidLen); }
         this.negotiatedCipherSuite = r.ReadU16();
         int comp = r.ReadU8();
@@ -139,8 +142,11 @@ public partial class TlsEngine {
     /* ---- 证书解析与验证 ---- */
 
     private int HandleCertificate(byte[] fullMsg, byte[] body) {
-        if (this.isServer || (this.negotiatedVersion != TlsRecord.VersionTls12 && this.negotiatedVersion != TlsRecord.VersionTls13)
-            || this.peerCert != null) { this.Fail("意外的服务端 Certificate"); return -1; }
+        bool stateOk = (this.negotiatedVersion == TlsRecord.VersionTls13 && this.state == StateTls13Handshake)
+            || (this.negotiatedVersion == TlsRecord.VersionTls12 && this.state == StateTls12Handshake);
+        if (this.isServer || !stateOk || this.peerCert != null) {
+            this.Fail("意外的服务端 Certificate"); return -1;
+        }
         TlsByteReader r = new TlsByteReader(body, 0, body.Length);
         if (this.negotiatedVersion == TlsRecord.VersionTls13) {
             int ctxLen = r.ReadU8();
@@ -211,7 +217,8 @@ public partial class TlsEngine {
 
     // 处理 TLS 1.2 CertificateStatus 握手报文（RFC 6066 §8）
     private int HandleCertificateStatus(byte[] fullMsg, byte[] body) {
-        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null) {
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12
+            || this.state != StateTls12Handshake || this.peerCert == null || this.handshakeSignatureVerified) {
             this.Fail("意外的 CertificateStatus 握手报文"); return -1;
         }
         TlsByteReader r = new TlsByteReader(body, 0, body.Length);
@@ -356,7 +363,8 @@ public partial class TlsEngine {
     }
 
     private int HandleCertificateVerify(byte[] fullMsg, byte[] body) {
-        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls13 || this.peerCert == null
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls13
+            || this.state != StateTls13Handshake || this.peerCert == null
             || this.handshakeSignatureVerified || body.Length < 4) {
             this.Fail("意外的 TLS 1.3 CertificateVerify"); return -1;
         }
@@ -522,9 +530,9 @@ public partial class TlsEngine {
         certBytes[2] = (byte)((certBodyLen >> 8) & 255);
         certBytes[3] = (byte)(certBodyLen & 255);
         this.transcript.Update(certBytes);
-        byte[] recCert = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, certBytes, 0, certBytes.Length);
-        if (recCert == null) { this.Fail("加密客户端 Certificate 失败"); return -1; }
-        this.outNet.WriteBytes(recCert);
+        if (!this.WriteHandshakeRecordEncrypted(certBytes)) {
+            this.Fail("加密客户端 Certificate 失败"); return -1;
+        }
 
         if (chain == null || chain.Count == 0) { return 0; }
         byte[] cvInput = new byte[130];
@@ -594,8 +602,7 @@ public partial class TlsEngine {
         certBytes[2] = (byte)((certBodyLen >> 8) & 255);
         certBytes[3] = (byte)(certBodyLen & 255);
         this.transcript.Update(certBytes);
-        byte[] recCert = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake, TlsRecord.VersionTls12, certBytes, 0, certBytes.Length);
-        this.outNet.WriteBytes(recCert);
+        this.WriteHandshakeRecordPlaintext(TlsRecord.VersionTls12, certBytes);
         return sentCert;
     }
 
@@ -735,7 +742,8 @@ public partial class TlsEngine {
         this.serverX25519Pub = r.ReadBytes(32);
         int scheme = r.ReadU16();
         int sigLen = r.ReadU16();
-        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12
+            || this.state != StateTls12Handshake || this.peerCert == null
             || this.handshakeSignatureVerified || curveType != 3 || namedCurve != 29
             || (scheme != 0x0401 && scheme != 0x0403 && scheme != 0x0804)
             || sigLen <= 0 || sigLen != r.Remaining() || this.clientRandom == null || this.serverRandom == null) {

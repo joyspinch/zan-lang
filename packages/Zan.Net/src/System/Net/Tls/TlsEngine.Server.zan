@@ -46,11 +46,13 @@ public partial class TlsEngine {
             this.Fail("ClientHello cipher_suites 非法"); return -1;
         }
         bool suite13 = false;
-        bool suite12 = false;
+        bool suite12Rsa = false;
+        bool suite12Ec = false;
         for (int i = 0; i < csLen; i = i + 2) {
             int suite = r.ReadU16();
             if (suite == 0x1301) { suite13 = true; }
-            if (suite == 0xc02f || suite == 0xc02b) { suite12 = true; }
+            if (suite == 0xc02f) { suite12Rsa = true; }
+            if (suite == 0xc02b) { suite12Ec = true; }
         }
         int compLen = r.ReadU8();
         if (compLen != 1 || !r.Has(1) || r.ReadU8() != 0) {
@@ -145,15 +147,16 @@ public partial class TlsEngine {
         }
         if (!hasVersions) { offered12 = clientVer == TlsRecord.VersionTls12; }
         if (clientVer != TlsRecord.VersionTls12) { this.Fail("ClientHello legacy_version 不受支持"); return -1; }
-        // 服务端按自身证书叶子公钥类型挑客户端广告过的方案：EC 公钥只认
-        // ECDSA 方案（TLS 1.3 的 0x0805/0x0403 均可，TLS 1.2 仅 0x0403），
-        // RSA 公钥只认 RSA 方案；不匹配按无共同算法拒绝。
-        bool srvSig13 = sig13;
-        bool srvSig12 = sig12;
-        if (this.cachedCert != null && this.cachedCert.HasEcKey()) {
-            srvSig13 = sig13Ec || sig12Ec;
-            srvSig12 = sig12Ec;
+        if (this.cachedCert == null && this.certFile != null && File.Exists(this.certFile)) {
+            this.cachedCert = X509Certificate.FromPemFile(this.certFile);
         }
+        // 服务端按自身证书叶子公钥类型挑客户端广告过的方案与套件：EC 公钥只认
+        // ECDSA 方案（TLS 1.3 的 0x0805/0x0403 均可，TLS 1.2 仅 0x0403）及 0xc02b，
+        // RSA 公钥只认 RSA 方案及 0xc02f；不匹配按无共同算法拒绝。
+        bool ecCert = this.cachedCert != null && this.cachedCert.HasEcKey();
+        bool srvSig13 = ecCert ? (sig13Ec || sig12Ec) : sig13;
+        bool srvSig12 = ecCert ? sig12Ec : sig12;
+        bool suite12 = ecCert ? suite12Ec : suite12Rsa;
         this.transcript.Update(fullMsg);
         if (!this.disableTls13 && offered13 && suite13 && srvSig13 && groupX25519 && clientShare != null) {
             return this.ServerStartTls13(clientShare);
@@ -332,8 +335,10 @@ public partial class TlsEngine {
         certBytes[3] = (byte)(certBodyLen & 255);
 
         this.transcript.Update(certBytes);
-        byte[] recCert = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, certBytes, 0, certBytes.Length);
-        this.outNet.WriteBytes(recCert);
+        if (!this.WriteHandshakeRecordEncrypted(certBytes)) {
+            this.Fail("服务端 TLS 1.3 Certificate 加密分片失败");
+            return -1;
+        }
 
         byte[] cvInput = new byte[130];
         for (int sp = 0; sp < 64; sp = sp + 1) { cvInput[sp] = 32; }
@@ -517,8 +522,10 @@ public partial class TlsEngine {
         certBytes[2] = (byte)((certBodyLen >> 8) & 255);
         certBytes[3] = (byte)(certBodyLen & 255);
         this.transcript.Update(certBytes);
-        byte[] recCert = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake, TlsRecord.VersionTls12, certBytes, 0, certBytes.Length);
-        this.outNet.WriteBytes(recCert);
+        if (!this.WriteHandshakeRecordPlaintext(TlsRecord.VersionTls12, certBytes)) {
+            this.Fail("服务端 TLS 1.2 Certificate 分片封装失败");
+            return -1;
+        }
 
         // 若配置了 OCSP Stapling 响应，发送 CertificateStatus 握手报文 (RFC 6066 §8)
         if (this.serverOcspResponse != null) {
@@ -618,8 +625,11 @@ public partial class TlsEngine {
         return 0;
     }
 
-    private int HandleClientKeyExchange(byte[] fullMsg, byte[] body) {
-        if (this.state != StateServerTls12WaitingClientKeyExchange) { return 0; }
+    public int HandleClientKeyExchange(byte[] fullMsg, byte[] body) {
+        if (!this.isServer || this.state != StateServerTls12WaitingClientKeyExchange) {
+            this.Fail("意外的 ClientKeyExchange");
+            return -1;
+        }
         if (this.requireClientCert && !this.clientCertReceived) {
             this.Fail("客户端未提供要求的客户端证书");
             return -1;
@@ -857,11 +867,21 @@ public partial class TlsEngine {
     }
 
     private int HandleServerFinished(byte[] fullMsg, byte[] body) {
+        if (!this.isServer || this.readCipher == null) {
+            this.Fail("意外的客户端 Finished 或缺少 ChangeCipherSpec");
+            return -1;
+        }
         if (this.requireClientCert && (!this.clientCertReceived || !this.clientCertVerified)) {
             this.Fail("客户端身份未认证");
             return -1;
         }
         if (this.negotiatedVersion == TlsRecord.VersionTls13) {
+            if (this.state != StateServerTls13WaitingFinished
+                || this.clientHsTraffic == null || this.clientHsTraffic.Length != 32
+                || this.clientAppKeyPending == null || this.clientAppIvPending == null) {
+                this.Fail("TLS 1.3 Client Finished 状态非法");
+                return -1;
+            }
             byte[] clientFinishedKey = Hkdf.ExpandLabel(this.clientHsTraffic, "finished", null, 32);
             byte[] th = this.transcript.CurrentHash();
             byte[] expectedVerifyData = Hmac.Sha256(clientFinishedKey, 32, th, 32);
@@ -881,9 +901,17 @@ public partial class TlsEngine {
 
             this.transcript.Update(fullMsg);
             this.readCipher = new TlsCipherState(TlsRecord.VersionTls13, this.clientAppKeyPending, this.clientAppIvPending);
+            this.clientAppKeyPending = null;
+            this.clientAppIvPending = null;
             this.state = StateConnected;
             return 1;
-        } else {
+        } else if (this.negotiatedVersion == TlsRecord.VersionTls12) {
+            if (this.state != StateServerTls12WaitingFinished
+                || this.tls12MasterSecret == null || this.tls12MasterSecret.Length != 48
+                || this.tls12ServerWriteKey == null || this.tls12ServerWriteIv == null) {
+                this.Fail("TLS 1.2 Client Finished 状态非法");
+                return -1;
+            }
             byte[] th = this.transcript.CurrentHash();
             byte[] expectedVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "client finished", th, 12);
             if (body.Length != 12 || expectedVerifyData == null) {
@@ -925,5 +953,7 @@ public partial class TlsEngine {
             this.state = StateConnected;
             return 1;
         }
+        this.Fail("意外的客户端 Finished 版本");
+        return -1;
     }
 }

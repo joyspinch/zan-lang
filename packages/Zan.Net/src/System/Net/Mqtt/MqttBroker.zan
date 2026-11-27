@@ -201,13 +201,20 @@ public class MqttBroker : IDisposable {
 
     // ---- 主题匹配：带 + / # 通配符的过滤器 vs 具体主题 ----
 
-    // 过滤器是否匹配具体主题：`#` 匹配剩余所有层，`+` 匹配单层，
-    // 其余按层相等；零堆分配双指针逐层扫描（免 SplitTopic/Substring 分配）。
+    // 过滤器是否匹配具体主题：`#` 仅可位于过滤器末尾并匹配剩余所有层，`+` 匹配单层，
+    // MQTT 3.1.1 §4.7.2: `$` 开头系统主题不匹配 `#` 或 `+` 开头的通配符过滤器。
     public static bool TopicMatches(string filter, string topic) {
-        if (filter == topic) { return true; }
+        if (filter == null || topic == null || filter.Length == 0 || topic.Length == 0) {
+            return false;
+        }
         int fLen = filter.Length;
-        if (fLen == 1 && (filter[0] & 255) == 35) { return true; }
         int tLen = topic.Length;
+        // MQTT 3.1.1 §4.7.2: '$' 开头主题不得匹配首字符为 '+' 或 '#' 的过滤器
+        if ((topic[0] & 255) == 36 && ((filter[0] & 255) == 35 || (filter[0] & 255) == 43)) {
+            return false;
+        }
+        if (filter == topic) { return true; }
+        if (fLen == 1 && (filter[0] & 255) == 35) { return true; }
         int fPos = 0;
         int tPos = 0;
         while (fPos <= fLen) {
@@ -216,9 +223,9 @@ public class MqttBroker : IDisposable {
                 fEnd = fEnd + 1;
             }
             int fSegLen = fEnd - fPos;
-            // `#` 匹配当前及剩余所有层（包括父级空尾）
+            // MQTT 3.1.1 §4.7.1.2: `#` 必须是过滤器最后一段（后面不能再有 '/'）
             if (fSegLen == 1 && (filter[fPos] & 255) == 35) {
-                return true;
+                return fEnd == fLen;
             }
             if (tPos > tLen) {
                 return false;
@@ -441,6 +448,8 @@ public class MqttBroker : IDisposable {
 
     // 增强发布接口：支持指定 QoS 与 Retain 标记。
     public int Publish(string topic, string payload, int qos, bool retain) {
+        if (topic == null || topic.Length == 0) { return 0; }
+        if (payload == null) { payload = ""; }
         int payloadLen = payload.Length;
         this.msgsIn = this.msgsIn + 1;
         this.bytesIn = this.bytesIn + payloadLen;
@@ -721,48 +730,45 @@ public class MqttBroker : IDisposable {
         sess.connected = true;
         sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
         int cur = 10;
-        if (cur + 2 <= remainLen) {
-            int wireIdLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
-            cur = cur + 2;
-            if (cur + wireIdLen > remainLen) { return false; }
-            int keepIdLen = wireIdLen > 128 ? 128 : wireIdLen;
-            sess.clientId = body.ToStr(cur, keepIdLen);
-            cur = cur + wireIdLen;
-        }
-        if (sess.willFlag && cur + 2 <= remainLen) {
+        if (cur + 2 > remainLen) { return false; }
+        int wireIdLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+        cur = cur + 2;
+        if (cur + wireIdLen > remainLen) { return false; }
+        int keepIdLen = wireIdLen > 128 ? 128 : wireIdLen;
+        sess.clientId = body.ToStr(cur, keepIdLen);
+        cur = cur + wireIdLen;
+        if (sess.willFlag) {
+            if (cur + 2 > remainLen) { return false; }
             int wtLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
             cur = cur + 2;
-            if (cur + wtLen <= remainLen) {
-                sess.willTopic = body.ToStr(cur, wtLen);
-                cur = cur + wtLen;
-            }
-            if (cur + 2 <= remainLen) {
-                int wmLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
-                cur = cur + 2;
-                if (cur + wmLen <= remainLen) {
-                    sess.willMessage = body.ToStr(cur, wmLen);
-                    cur = cur + wmLen;
-                }
-            }
+            if (wtLen <= 0 || cur + wtLen > remainLen) { return false; }
+            sess.willTopic = body.ToStr(cur, wtLen);
+            cur = cur + wtLen;
+            if (cur + 2 > remainLen) { return false; }
+            int wmLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+            cur = cur + 2;
+            if (cur + wmLen > remainLen) { return false; }
+            sess.willMessage = body.ToStr(cur, wmLen);
+            cur = cur + wmLen;
         }
         bool hasUser = (connFlags & 128) != 0;
         bool hasPass = (connFlags & 64) != 0;
         if (!hasUser && hasPass) { return false; } // MQTT-3.1.2-22: password flag must be 0 if username flag is 0
-        if (hasUser && cur + 2 <= remainLen) {
+        if (hasUser) {
+            if (cur + 2 > remainLen) { return false; }
             int uLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
             cur = cur + 2;
-            if (cur + uLen <= remainLen) {
-                sess.username = body.ToStr(cur, uLen);
-                cur = cur + uLen;
-            }
+            if (cur + uLen > remainLen) { return false; }
+            sess.username = body.ToStr(cur, uLen);
+            cur = cur + uLen;
         }
-        if (hasPass && cur + 2 <= remainLen) {
+        if (hasPass) {
+            if (cur + 2 > remainLen) { return false; }
             int pLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
             cur = cur + 2;
-            if (cur + pLen <= remainLen) {
-                sess.password = body.ToStr(cur, pLen);
-                cur = cur + pLen;
-            }
+            if (cur + pLen > remainLen) { return false; }
+            sess.password = body.ToStr(cur, pLen);
+            cur = cur + pLen;
         }
         if (sess.clientId.Length == 0) {
             sess.clientId = "anon-" + Convert.ToString(sess.id);
@@ -871,7 +877,8 @@ public class MqttBroker : IDisposable {
             offset = offset + fLen;
             int reqQos = body[offset] & 255;
             offset = offset + 1;
-            if (reqQos > 2) { reqQos = 2; }
+            // MQTT-3.8.3-4: 请求 QoS 高 6 位必须为 0 且值只能为 0/1/2
+            if (reqQos > 2) { malformed = true; break; }
             if (quotaExceeded) {
                 grantedQos.Add(128);
                 continue;
@@ -936,12 +943,15 @@ public class MqttBroker : IDisposable {
         int pid = ((body[0] & 255) << 8) + (body[1] & 255);
         int offset = 2;
         bool malformed = false;
-        while (offset + 2 <= remainLen) {
+        int filterCount = 0;
+        while (offset < remainLen) {
+            if (offset + 2 > remainLen) { malformed = true; break; }
             int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
             offset = offset + 2;
-            if (offset + fLen > remainLen) { malformed = true; break; }
+            if (fLen <= 0 || offset + fLen > remainLen) { malformed = true; break; }
             string filter = body.ToStr(offset, fLen);
             offset = offset + fLen;
+            filterCount = filterCount + 1;
             int k = 0;
             while (k < sess.subscriptions.Count) {
                 if (sess.subscriptions[k].filter == filter) {
@@ -951,7 +961,7 @@ public class MqttBroker : IDisposable {
                 }
             }
         }
-        if (malformed) { return false; }
+        if (malformed || filterCount == 0) { return false; }
         byte[] unsuback = new byte[5];
         unsuback[0] = (byte)(MqttPacketType.UNSUBACK << 4);
         unsuback[1] = 2;
@@ -1012,12 +1022,8 @@ public class MqttBroker : IDisposable {
                 sess.receivedDisconnect = true;
                 active = false;
             } else if (packetType == MqttPacketType.PUBREL) {
-                if (pkt.flags != 2) { break; } // MQTT-3.6.1-1: PUBREL 固定头 bits 3,2,1,0 必须为 0010
-                // QoS 2 阶段 3：收到客户端 PUBREL，回复 PUBCOMP (7)
-                int relPid = 0;
-                if (remainLen >= 2) {
-                    relPid = ((body[0] & 255) << 8) + (body[1] & 255);
-                }
+                if (pkt.flags != 2 || remainLen != 2) { break; } // MQTT-3.6.1-1: PUBREL flags=0010 且剩余长度恒为 2
+                int relPid = ((body[0] & 255) << 8) + (body[1] & 255);
                 byte[] pubcomp = new byte[5];
                 pubcomp[0] = (byte)(MqttPacketType.PUBCOMP << 4);
                 pubcomp[1] = 2;
@@ -1025,13 +1031,11 @@ public class MqttBroker : IDisposable {
                 pubcomp[3] = (byte)(relPid & 255);
                 int _cp = await Socket.SendAsync(sock, pubcomp, 4);
             } else if (packetType == MqttPacketType.PUBACK || packetType == MqttPacketType.PUBREC || packetType == MqttPacketType.PUBCOMP) {
-                if (pkt.flags != 0) { break; } // MQTT-2.2.2: 确认类报文 flags 必须为 0
+                if (pkt.flags != 0 || remainLen != 2) { break; } // MQTT-2.2.2: 确认类报文 flags=0 且剩余长度恒为 2
                 // 收到确认类报文，更新会话最后活跃时间
                 sess.lastSeen = MqttBroker.Now();
-                if (remainLen >= 2) {
-                    int ackPid = ((body[0] & 255) << 8) + (body[1] & 255);
-                    this.AcknowledgeInflight(sess.clientId, ackPid);
-                }
+                int ackPid = ((body[0] & 255) << 8) + (body[1] & 255);
+                this.AcknowledgeInflight(sess.clientId, ackPid);
             } else {
                 // 未知或保留控制报文类型（如 0 或 15），按协议违规断连
                 break;
