@@ -19,8 +19,13 @@ public class GltfMaterial {
     public float BaseColorA;
     public float MetallicFactor;
     public float RoughnessFactor;
+    public float EmissiveR;
+    public float EmissiveG;
+    public float EmissiveB;
     public string AlphaMode;
     public int BaseColorTextureIndex;
+    public int NormalTextureIndex;
+    public float NormalScale;
 
     public GltfMaterial() {
         this.Name = "";
@@ -30,8 +35,13 @@ public class GltfMaterial {
         this.BaseColorA = 1.0f;
         this.MetallicFactor = 0.0f;
         this.RoughnessFactor = 1.0f;
+        this.EmissiveR = 0.0f;
+        this.EmissiveG = 0.0f;
+        this.EmissiveB = 0.0f;
         this.AlphaMode = "OPAQUE";
         this.BaseColorTextureIndex = -1;
+        this.NormalTextureIndex = -1;
+        this.NormalScale = 1.0f;
     }
 }
 
@@ -147,16 +157,29 @@ public class GltfModel {
         return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
     }
 
+    // 注册指定材质的 normalTexture 到 zan_image 纹理缓存，返回 "mem:..." 纹理键；无纹理或解码失败返回 ""。
+    public string RegisterMaterialNormalTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].NormalTextureIndex;
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
     // 一键实例化为可直接交给 RenderPlan + Renderer3D 渲染的场景树：
-    // 自动上传静态/蒙皮网格、注册材质内嵌纹理、映射 BLEND 透明层（Layer=1）并挂载骨架。
+    // 自动上传静态/蒙皮网格、注册材质内嵌纹理（漫反射 + 法线贴图）、映射自发光与 BLEND 透明层（Layer=1）并挂载骨架。
     public SceneNode InstantiateScene(Canvas canvas, string keyPrefix) {
         SceneNode root = new SceneNode("gltf_root");
         if (canvas == null) { return root; }
         string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
-        // 预先注册每个材质的 baseColorTexture（避免同材质图元重复解码）
+        // 预先注册每个材质的 baseColorTexture 与 normalTexture（避免同材质图元重复解码）
         List<string> matTexKeys = new List<string>();
+        List<string> matNormKeys = new List<string>();
         for (int i = 0; i < this.Materials.Count; i = i + 1) {
             matTexKeys.Add(this.RegisterMaterialBaseColorTexture(i, pfx));
+            matNormKeys.Add(this.RegisterMaterialNormalTexture(i, pfx));
         }
         for (int i = 0; i < this.Primitives.Count; i = i + 1) {
             GltfPrimitive gp = this.Primitives[i];
@@ -179,7 +202,12 @@ public class GltfModel {
                 mat.Alpha = gm.BaseColorA;
                 mat.Metallic = gm.MetallicFactor;
                 mat.Roughness = gm.RoughnessFactor;
+                mat.EmissiveRed = gm.EmissiveR;
+                mat.EmissiveGreen = gm.EmissiveG;
+                mat.EmissiveBlue = gm.EmissiveB;
                 mat.TextureKey = matTexKeys[gp.MaterialIndex];
+                mat.NormalMapKey = matNormKeys[gp.MaterialIndex];
+                mat.NormalScale = gm.NormalScale;
                 if (gm.AlphaMode == "BLEND" || gm.BaseColorA < 0.99f) {
                     node.Layer = 1;
                     node.CastShadow = false;
@@ -408,6 +436,20 @@ public static class GltfLoader {
                 if (bct >= 0) {
                     mat.BaseColorTextureIndex = doc.IntAt(doc.Get(bct, "index"), -1);
                 }
+            }
+            int nt = doc.Get(c, "normalTexture");
+            if (nt >= 0) {
+                mat.NormalTextureIndex = doc.IntAt(doc.Get(nt, "index"), -1);
+                mat.NormalScale = (float)doc.DoubleAt(doc.Get(nt, "scale"), 1.0);
+            }
+            int ef = doc.Get(c, "emissiveFactor");
+            if (ef >= 0 && doc.Count(ef) >= 3) {
+                int e0 = doc.FirstChild(ef);
+                int e1 = doc.NextSibling(e0);
+                int e2 = doc.NextSibling(e1);
+                mat.EmissiveR = (float)doc.DoubleAt(e0, 0.0);
+                mat.EmissiveG = (float)doc.DoubleAt(e1, 0.0);
+                mat.EmissiveB = (float)doc.DoubleAt(e2, 0.0);
             }
             model.Materials.Add(mat);
             c = doc.NextSibling(c);

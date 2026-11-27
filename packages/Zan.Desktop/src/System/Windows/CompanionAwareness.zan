@@ -1,0 +1,424 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 全局用户活跃状态枚举常量（驱动桌宠清醒 / 打盹 / 睡眠与久坐提醒）。
+public static class UserActivityState {
+    public const int Active = 0;
+    public const int Idle = 1;
+    public const int Afk = 2;
+}
+
+// 全局用户活跃/离席（AFK）与连续专注久坐监测器：
+// Windows 下通过 user32!GetLastInputInfo + kernel32!GetTickCount 采集系统级键鼠空闲时长
+// （采用无符号 32-bit 差值自动免疫 49.7 天系统运行回绕）；
+// 同时暴露确定性 Update(nowMs, idleMs) 供跨平台与自动化测试直接驱动。
+public class UserActivityMonitor {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetLastInputInfo")]
+    private static extern int WinGetLastInputInfo(nint plii);
+
+    [DllImport("kernel32", EntryPoint = "GetTickCount")]
+    private static extern uint WinGetTickCount();
+    #endif
+
+    public long IdleThresholdMs;
+    public long AfkThresholdMs;
+    public long BreakIntervalMs;
+    public long BreakResetAfkMs;
+
+    public int State;
+    public long LastIdleMs;
+    public long ContinuousActiveMs;
+    public long ContinuousAfkMs;
+    public bool BreakReminderDue;
+    public int BreakReminderCount;
+
+    private bool initialized;
+    private long lastUpdateMs;
+
+    public UserActivityMonitor(long idleThresholdMs, long afkThresholdMs, long breakIntervalMs, long breakResetAfkMs) {
+        this.IdleThresholdMs = idleThresholdMs > 0 ? idleThresholdMs : 60000;
+        this.AfkThresholdMs = afkThresholdMs >= this.IdleThresholdMs ? afkThresholdMs : 300000;
+        this.BreakIntervalMs = breakIntervalMs > 0 ? breakIntervalMs : 2700000; // 默认 45 分钟
+        this.BreakResetAfkMs = breakResetAfkMs > 0 ? breakResetAfkMs : 120000;  // 离席满 2 分钟清零久坐计时
+        this.State = UserActivityState.Active;
+        this.LastIdleMs = 0;
+        this.ContinuousActiveMs = 0;
+        this.ContinuousAfkMs = 0;
+        this.BreakReminderDue = false;
+        this.BreakReminderCount = 0;
+        this.initialized = false;
+        this.lastUpdateMs = 0;
+    }
+
+    // 读取当前 OS 全局键鼠空闲毫秒数（不可用或非 Windows 返回 -1）。
+    public static long QuerySystemIdleMs() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        if (buf == 0) { return -1; }
+        try {
+            Span<uint> fields = new Span<uint>(buf, 2);
+            fields[0] = 8u; // sizeof(LASTINPUTINFO)
+            fields[1] = 0u;
+            int ok = WinGetLastInputInfo(buf);
+            if (ok == 0) { return -1; }
+            uint nowTick = WinGetTickCount();
+            uint lastTick = fields[1];
+            uint elapsed = unchecked(nowTick - lastTick);
+            return (long)elapsed;
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        #else
+        return -1;
+        #endif
+    }
+
+    // 推进一步状态机；返回本步是否发生了 Active/Idle/Afk 状态切换。
+    public bool Update(long nowMs, long idleMs) {
+        if (idleMs < 0) { idleMs = 0; }
+        long dt = 0;
+        if (this.initialized) {
+            dt = nowMs - this.lastUpdateMs;
+            if (dt < 0) { dt = 0; }
+        } else {
+            this.initialized = true;
+        }
+        this.lastUpdateMs = nowMs;
+        this.LastIdleMs = idleMs;
+
+        int nextState = UserActivityState.Active;
+        if (idleMs >= this.AfkThresholdMs) {
+            nextState = UserActivityState.Afk;
+        } else if (idleMs >= this.IdleThresholdMs) {
+            nextState = UserActivityState.Idle;
+        }
+
+        if (nextState == UserActivityState.Afk) {
+            this.ContinuousAfkMs = this.ContinuousAfkMs + dt;
+            if (this.ContinuousAfkMs >= this.BreakResetAfkMs) {
+                this.ContinuousActiveMs = 0;
+                this.BreakReminderDue = false;
+            }
+        } else {
+            this.ContinuousAfkMs = 0;
+            this.ContinuousActiveMs = this.ContinuousActiveMs + dt;
+            if (!this.BreakReminderDue && this.ContinuousActiveMs >= this.BreakIntervalMs) {
+                this.BreakReminderDue = true;
+                this.BreakReminderCount = this.BreakReminderCount + 1;
+            }
+        }
+
+        bool changed = nextState != this.State;
+        this.State = nextState;
+        return changed;
+    }
+
+    public bool UpdateFromSystem(long nowMs) {
+        long idle = QuerySystemIdleMs();
+        if (idle < 0) { idle = 0; }
+        return this.Update(nowMs, idle);
+    }
+
+    public void AcknowledgeBreakReminder() {
+        this.BreakReminderDue = false;
+        this.ContinuousActiveMs = 0;
+    }
+}
+
+// 桌宠窗口边缘磁吸方位常量。
+public static class SnapEdge {
+    public const int None = 0;
+    public const int Left = 1;
+    public const int Right = 2;
+    public const int Top = 3;
+    public const int Bottom = 4;
+}
+
+// 桌面陪伴窗口拖拽、惯性抛掷、边界防丢失回弹与任务栏/屏幕边缘磁吸物理控制器：
+// - 抓取移动不跳帧并平滑估算抛掷初速度（带最大速度限幅防止鼠标毛刺甩飞）；
+// - 松手后按指数空气阻尼与可选重力滑行；
+// - 撞击 WorkAreaRect 四边按恢复系数回弹并强制钳位在可见工作区内；
+// - 减速至阈值以下且贴近任务栏底边或屏幕左右顶边时自动磁吸停靠。
+public class CompanionDragSnapper {
+    public float X;
+    public float Y;
+    public float VelX;
+    public float VelY;
+    public int Width;
+    public int Height;
+
+    public bool IsDragging;
+    public int SnappedEdge;
+    public float SnapMarginPx;
+    public float SnapSpeedThreshold;
+    public float Friction;
+    public float Restitution;
+    public float GravityY;
+    public float MaxThrowSpeed;
+
+    private float grabOffsetX;
+    private float grabOffsetY;
+    private long lastDragMs;
+
+    public CompanionDragSnapper(float startX, float startY, int width, int height) {
+        this.X = startX;
+        this.Y = startY;
+        this.VelX = 0.0f;
+        this.VelY = 0.0f;
+        this.Width = width > 1 ? width : 128;
+        this.Height = height > 1 ? height : 128;
+        this.IsDragging = false;
+        this.SnappedEdge = SnapEdge.None;
+        this.SnapMarginPx = 24.0f;
+        this.SnapSpeedThreshold = 45.0f;
+        this.Friction = 4.5f;
+        this.Restitution = 0.45f;
+        this.GravityY = 0.0f;
+        this.MaxThrowSpeed = 2400.0f;
+        this.grabOffsetX = 0.0f;
+        this.grabOffsetY = 0.0f;
+        this.lastDragMs = 0;
+    }
+
+    public int IntX { get { return (int)Math.Round((double)this.X); } }
+    public int IntY { get { return (int)Math.Round((double)this.Y); } }
+
+    public void BeginDrag(float cursorX, float cursorY, long nowMs) {
+        this.IsDragging = true;
+        this.SnappedEdge = SnapEdge.None;
+        this.grabOffsetX = cursorX - this.X;
+        this.grabOffsetY = cursorY - this.Y;
+        this.VelX = 0.0f;
+        this.VelY = 0.0f;
+        this.lastDragMs = nowMs;
+    }
+
+    public void DragTo(float cursorX, float cursorY, long nowMs) {
+        if (!this.IsDragging) { return; }
+        float nextX = cursorX - this.grabOffsetX;
+        float nextY = cursorY - this.grabOffsetY;
+        long dtMs = nowMs - this.lastDragMs;
+        if (dtMs > 0) {
+            float dt = (float)dtMs / 1000.0f;
+            float instVx = (nextX - this.X) / dt;
+            float instVy = (nextY - this.Y) / dt;
+            // 指数平滑过滤鼠标采样抖动，保留真实抛掷手感
+            this.VelX = this.VelX * 0.35f + instVx * 0.65f;
+            this.VelY = this.VelY * 0.35f + instVy * 0.65f;
+            float speed = (float)Math.Sqrt((double)(this.VelX * this.VelX + this.VelY * this.VelY));
+            if (speed > this.MaxThrowSpeed && speed > 1e-4f) {
+                float s = this.MaxThrowSpeed / speed;
+                this.VelX = this.VelX * s;
+                this.VelY = this.VelY * s;
+            }
+            this.lastDragMs = nowMs;
+        }
+        this.X = nextX;
+        this.Y = nextY;
+    }
+
+    public void EndDrag() {
+        this.IsDragging = false;
+    }
+
+    public void Step(float dtSec, WorkAreaRect workArea) {
+        if (workArea == null || dtSec <= 0.0f) { return; }
+        if (dtSec > 0.1f) { dtSec = 0.1f; }
+
+        float minX = (float)workArea.Left;
+        float maxX = (float)(workArea.Right - this.Width);
+        if (maxX < minX) { maxX = minX; }
+        float minY = (float)workArea.Top;
+        float maxY = (float)(workArea.Bottom - this.Height);
+        if (maxY < minY) { maxY = minY; }
+
+        if (this.IsDragging) {
+            if (this.X < minX) { this.X = minX; }
+            if (this.X > maxX) { this.X = maxX; }
+            if (this.Y < minY) { this.Y = minY; }
+            if (this.Y > maxY) { this.Y = maxY; }
+            return;
+        }
+
+        // 重力与位置积分
+        this.VelY = this.VelY + this.GravityY * dtSec;
+        this.X = this.X + this.VelX * dtSec;
+        this.Y = this.Y + this.VelY * dtSec;
+
+        // 指数阻尼减速
+        float damp = (float)Math.Exp((double)(0.0f - this.Friction * dtSec));
+        this.VelX = this.VelX * damp;
+        if (this.GravityY == 0.0f) {
+            this.VelY = this.VelY * damp;
+        }
+
+        // 工作区边界碰撞弹性回弹与硬钳位（杜绝甩出可见屏幕）
+        if (this.X < minX) {
+            this.X = minX;
+            if (this.VelX < 0.0f) { this.VelX = (0.0f - this.VelX) * this.Restitution; }
+        } else if (this.X > maxX) {
+            this.X = maxX;
+            if (this.VelX > 0.0f) { this.VelX = (0.0f - this.VelX) * this.Restitution; }
+        }
+        if (this.Y < minY) {
+            this.Y = minY;
+            if (this.VelY < 0.0f) { this.VelY = (0.0f - this.VelY) * this.Restitution; }
+        } else if (this.Y > maxY) {
+            this.Y = maxY;
+            if (this.VelY > 0.0f) { this.VelY = (0.0f - this.VelY) * this.Restitution; }
+        }
+
+        float speed = (float)Math.Sqrt((double)(this.VelX * this.VelX + this.VelY * this.VelY));
+        if (speed <= this.SnapSpeedThreshold) {
+            this.SnappedEdge = SnapEdge.None;
+            float dBottom = maxY - this.Y;
+            float dLeft = this.X - minX;
+            float dRight = maxX - this.X;
+            float dTop = this.Y - minY;
+            // 优先磁吸任务栏底边，其次左右屏幕边，最后顶边
+            if (dBottom <= this.SnapMarginPx) {
+                this.Y = maxY;
+                this.VelY = 0.0f;
+                this.SnappedEdge = SnapEdge.Bottom;
+            } else if (dLeft <= this.SnapMarginPx) {
+                this.X = minX;
+                this.VelX = 0.0f;
+                this.SnappedEdge = SnapEdge.Left;
+            } else if (dRight <= this.SnapMarginPx) {
+                this.X = maxX;
+                this.VelX = 0.0f;
+                this.SnappedEdge = SnapEdge.Right;
+            } else if (dTop <= this.SnapMarginPx) {
+                this.Y = minY;
+                this.VelY = 0.0f;
+                this.SnappedEdge = SnapEdge.Top;
+            }
+            if (speed < 2.0f) {
+                this.VelX = 0.0f;
+                if (this.GravityY == 0.0f || this.Y >= maxY - 0.5f) {
+                    this.VelY = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+// 全局鼠标视线追踪器：把全局光标位置映射为 [-1..1] 平滑眼球/头部注视偏移（含死区与帧率无关阻尼）。
+public class CompanionEyeTracker {
+    public float DeadZonePx;
+    public float MaxRangePx;
+    public float SmoothSpeed;
+    public float LookX;
+    public float LookY;
+
+    public CompanionEyeTracker(float deadZonePx, float maxRangePx, float smoothSpeed) {
+        this.DeadZonePx = deadZonePx >= 0.0f ? deadZonePx : 12.0f;
+        this.MaxRangePx = maxRangePx > this.DeadZonePx + 1.0f ? maxRangePx : 260.0f;
+        this.SmoothSpeed = smoothSpeed > 0.1f ? smoothSpeed : 12.0f;
+        this.LookX = 0.0f;
+        this.LookY = 0.0f;
+    }
+
+    public void Update(float eyeCenterX, float eyeCenterY, float cursorX, float cursorY, float dtSec) {
+        float dx = cursorX - eyeCenterX;
+        float dy = cursorY - eyeCenterY;
+        float dist = (float)Math.Sqrt((double)(dx * dx + dy * dy));
+        float targetX = 0.0f;
+        float targetY = 0.0f;
+        if (dist > this.DeadZonePx && dist > 1e-4f) {
+            float mag = (dist - this.DeadZonePx) / (this.MaxRangePx - this.DeadZonePx);
+            if (mag > 1.0f) { mag = 1.0f; }
+            targetX = (dx / dist) * mag;
+            targetY = (dy / dist) * mag;
+        }
+        if (dtSec <= 0.0f) {
+            this.LookX = targetX;
+            this.LookY = targetY;
+            return;
+        }
+        float alpha = 1.0f - (float)Math.Exp((double)(0.0f - this.SmoothSpeed * dtSec));
+        this.LookX = this.LookX + (targetX - this.LookX) * alpha;
+        this.LookY = this.LookY + (targetY - this.LookY) * alpha;
+    }
+}
+
+// 前台应用感知陪伴模式常量。
+public static class CompanionMood {
+    public const int Default = 0;
+    public const int FocusCoding = 1;
+    public const int Browsing = 2;
+    public const int GamingQuiet = 3;
+    public const int MediaWatch = 4;
+}
+
+internal class AppMoodRule {
+    public string KeywordLower;
+    public int Mood;
+}
+
+// 前台窗口进程名/标题规则匹配器：根据用户当前使用场景（编码/浏览/游戏/影音）自动切换桌宠陪伴姿态。
+public class ForegroundAppMatcher {
+    private List<AppMoodRule> customRules;
+    private List<AppMoodRule> defaultRules;
+
+    public ForegroundAppMatcher() {
+        this.customRules = new List<AppMoodRule>();
+        this.defaultRules = new List<AppMoodRule>();
+        this.AddDefault("code", CompanionMood.FocusCoding);
+        this.AddDefault("devenv", CompanionMood.FocusCoding);
+        this.AddDefault("rider", CompanionMood.FocusCoding);
+        this.AddDefault("idea", CompanionMood.FocusCoding);
+        this.AddDefault("nvim", CompanionMood.FocusCoding);
+        this.AddDefault("steam", CompanionMood.GamingQuiet);
+        this.AddDefault("valorant", CompanionMood.GamingQuiet);
+        this.AddDefault("genshin", CompanionMood.GamingQuiet);
+        this.AddDefault("vlc", CompanionMood.MediaWatch);
+        this.AddDefault("potplayer", CompanionMood.MediaWatch);
+        this.AddDefault("netflix", CompanionMood.MediaWatch);
+        this.AddDefault("chrome", CompanionMood.Browsing);
+        this.AddDefault("msedge", CompanionMood.Browsing);
+        this.AddDefault("firefox", CompanionMood.Browsing);
+    }
+
+    private static string ToAsciiLower(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        return s.ToLower();
+    }
+
+    private void AddDefault(string kw, int mood) {
+        AppMoodRule r = new AppMoodRule();
+        r.KeywordLower = ToAsciiLower(kw);
+        r.Mood = mood;
+        this.defaultRules.Add(r);
+    }
+
+    // 注册自定义规则（优先于内置默认规则匹配）。
+    public void AddRule(string keyword, int mood) {
+        if (keyword == null || keyword.Length == 0) { return; }
+        AppMoodRule r = new AppMoodRule();
+        r.KeywordLower = ToAsciiLower(keyword);
+        r.Mood = mood;
+        this.customRules.Add(r);
+    }
+
+    public int Classify(string processName, string windowTitle) {
+        string proc = ToAsciiLower(processName);
+        string title = ToAsciiLower(windowTitle);
+        for (int i = 0; i < this.customRules.Count; i = i + 1) {
+            AppMoodRule r = this.customRules[i];
+            if (proc.Contains(r.KeywordLower) || title.Contains(r.KeywordLower)) {
+                return r.Mood;
+            }
+        }
+        for (int i = 0; i < this.defaultRules.Count; i = i + 1) {
+            AppMoodRule r = this.defaultRules[i];
+            if (proc.Contains(r.KeywordLower) || title.Contains(r.KeywordLower)) {
+                return r.Mood;
+            }
+        }
+        return CompanionMood.Default;
+    }
+}

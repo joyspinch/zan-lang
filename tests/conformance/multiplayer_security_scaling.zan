@@ -1,0 +1,123 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerSecurityScalingTest {
+    static void Main() {
+        // 1. 标准 SipHash-2-4 官方测试向量（k = 00..0f, 15 字节 00..0e => 0xa129ca6149be45e5）
+        byte[] tv = new byte[15];
+        for (int i = 0; i < 15; i = i + 1) { tv[i] = (byte)i; }
+        ulong k0 = 0x0706050403020100UL;
+        ulong k1 = 0x0f0e0d0c0b0a0908UL;
+        ulong hash = NetPacketAuthenticator.ComputeSipHash24(k0, k1, tv, 0, 15);
+        bool sipOk = hash == 0xa129ca6149be45e5UL;
+        Console.WriteLine("siphash24-rfc-vector: " + Convert.ToString(sipOk ? 1 : 0));
+
+        // 2. UDP 认证封包 + 乱序接收 + 重放拦截 + 字节篡改拦截 + 伪造超大序号防 DoS
+        NetPacketAuthenticator sender = new NetPacketAuthenticator(0x1122334455667788UL, 0x99aabbccddeeff00UL);
+        NetPacketAuthenticator receiver = new NetPacketAuthenticator(0x1122334455667788UL, 0x99aabbccddeeff00UL);
+
+        byte[] p1 = sender.Seal(7, new byte[] { 10, 20, 30 });
+        byte[] p2 = sender.Seal(7, new byte[] { 40, 50, 60 });
+        byte[] p3 = sender.Seal(7, new byte[] { 70, 80, 90 });
+
+        // 乱序先收 p3，再收 p1（窗内允许），重放 p3 必被拒
+        ulong s3;
+        byte[] o3 = receiver.VerifyAndOpen(p3, 7, out s3);
+        ulong s1;
+        byte[] o1 = receiver.VerifyAndOpen(p1, 7, out s1);
+        ulong s3Dup;
+        byte[] o3Dup = receiver.VerifyAndOpen(p3, 7, out s3Dup);
+
+        // 篡改 p2 负载一字节 -> 拒收，且不污染窗内 seq=2
+        byte[] p2Bad = new byte[p2.Length];
+        for (int i = 0; i < p2.Length; i = i + 1) { p2Bad[i] = p2[i]; }
+        p2Bad[p2Bad.Length - 1] = (byte)(p2Bad[p2Bad.Length - 1] ^ 1);
+        ulong s2Bad;
+        byte[] o2Bad = receiver.VerifyAndOpen(p2Bad, 7, out s2Bad);
+
+        // 伪造超大 seq=999999 的恶意包 -> 必须先验 MAC 失败且绝不推进 HighestRecvSeq
+        byte[] forged = new byte[p2.Length];
+        for (int i = 0; i < p2.Length; i = i + 1) { forged[i] = p2[i]; }
+        forged[8] = (byte)0x3f;
+        forged[9] = (byte)0x42;
+        forged[10] = (byte)0x0f;
+        ulong sForged;
+        byte[] oForged = receiver.VerifyAndOpen(forged, 7, out sForged);
+        ulong highestAfterForged = receiver.HighestRecvSeq;
+
+        // 合法 p2 随后到达仍能正常通过，跨 peerId=8 则被拒
+        ulong s2;
+        byte[] o2 = receiver.VerifyAndOpen(p2, 7, out s2);
+        ulong sWrongPeer;
+        byte[] oWrongPeer = receiver.VerifyAndOpen(p2, 8, out sWrongPeer);
+
+        bool authOk = o3 != null && s3 == 3UL && o3[0] == (byte)70
+            && o1 != null && s1 == 1UL && o1[0] == (byte)10
+            && o3Dup == null
+            && o2Bad == null
+            && oForged == null && highestAfterForged == 3UL
+            && o2 != null && s2 == 2UL && o2[0] == (byte)40
+            && oWrongPeer == null
+            && receiver.RejectedTamperCount == 3 && receiver.RejectedReplayCount == 1;
+        Console.WriteLine("packet-auth-antireplay-antidos: " + Convert.ToString(authOk ? 1 : 0));
+
+        // 3. UDP MTU 分片 + 乱序/重复投递重组 + 半包超时回收
+        PacketFragmenter fragger = new PacketFragmenter(64, 4096);
+        byte[] bigMsg = new byte[210];
+        for (int i = 0; i < bigMsg.Length; i = i + 1) { bigMsg[i] = (byte)((i * 37 + 13) & 255); }
+        List<byte[]> frags = fragger.Fragment(bigMsg); // 4 片（64+64+64+18）
+
+        int mid0;
+        byte[] r0 = fragger.ReceiveFragment(frags[3], 1000, out mid0);
+        int mid1;
+        byte[] r1 = fragger.ReceiveFragment(frags[1], 1010, out mid1);
+        // 重复分片幂等
+        int midDup;
+        byte[] rDup = fragger.ReceiveFragment(frags[1], 1015, out midDup);
+        int mid2;
+        byte[] r2 = fragger.ReceiveFragment(frags[0], 1020, out mid2);
+        int mid3;
+        byte[] assembled = fragger.ReceiveFragment(frags[2], 1030, out mid3);
+
+        bool bytesMatch = assembled != null && assembled.Length == bigMsg.Length;
+        if (bytesMatch) {
+            for (int i = 0; i < bigMsg.Length; i = i + 1) {
+                if (assembled[i] != bigMsg[i]) { bytesMatch = false; break; }
+            }
+        }
+        // 半包超时回收测试
+        List<byte[]> halfFrags = fragger.Fragment(bigMsg);
+        int midHalf;
+        fragger.ReceiveFragment(halfFrags[0], 2000, out midHalf);
+        int pendingBefore = fragger.PendingCount;
+        int purged = fragger.PurgeExpired(7500, 5000);
+        int pendingAfter = fragger.PendingCount;
+
+        bool fragOk = frags.Count == 4 && r0 == null && r1 == null && rDup == null && r2 == null
+            && bytesMatch && mid3 == 1
+            && pendingBefore == 1 && purged == 1 && pendingAfter == 0;
+        Console.WriteLine("udp-mtu-fragment-reassembly: " + Convert.ToString(fragOk ? 1 : 0));
+
+        // 4. SpatialInterestGrid 空间 AOI（Enter/Stay/Leave 增量 + 跨格迁移）
+        SpatialInterestGrid aoi = new SpatialInterestGrid(16.0f);
+        aoi.UpsertEntity(1, 0.0f, 0.0f);    // 观察者自己
+        aoi.UpsertEntity(2, 10.0f, 5.0f);   // 近处（视野内）
+        aoi.UpsertEntity(3, -12.0f, 8.0f);  // 近处（视野内）
+        aoi.UpsertEntity(4, 80.0f, 80.0f);  // 远处（视野外）
+
+        AoiDiff d1 = aoi.ComputeSubscriberDiff(1, 0.0f, 0.0f, 25.0f);
+        // 实体 3 远走，实体 4 走入视野，实体 2 留在视野内
+        aoi.UpsertEntity(3, -60.0f, 8.0f);
+        aoi.UpsertEntity(4, 15.0f, 0.0f);
+        AoiDiff d2 = aoi.ComputeSubscriberDiff(1, 0.0f, 0.0f, 25.0f);
+
+        bool aoiOk = d1.Entered.Count == 2 && d1.Stayed.Count == 0 && d1.Left.Count == 0
+            && d2.Entered.Count == 1 && d2.Entered[0] == 4
+            && d2.Stayed.Count == 1 && d2.Stayed[0] == 2
+            && d2.Left.Count == 1 && d2.Left[0] == 3;
+        Console.WriteLine("spatial-aoi-enter-stay-leave: " + Convert.ToString(aoiOk ? 1 : 0));
+    }
+}

@@ -1,0 +1,583 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// RFC 4303 / WireGuard 风格 64-bit 滑动位图防重放窗口：
+// O(1) 空间与时间，允许最多 63 个包的乱序到达，100% 拦截重放与超窗旧包。
+// 安全不变量：调用方必须先 PeekValid -> 校验 MAC -> 校验通过后再调用 Accept 推进窗口，
+// 防止伪造超大 seq 封包 DoS 污染合法接收窗口。
+public class AntiReplayWindow {
+    private bool initialized;
+    private ulong highestSeq;
+    private ulong bitmap;
+
+    public AntiReplayWindow() {
+        this.initialized = false;
+        this.highestSeq = 0UL;
+        this.bitmap = 0UL;
+    }
+
+    public ulong HighestSeq { get { return this.highestSeq; } }
+
+    public bool PeekValid(ulong seq) {
+        if (seq == 0UL) { return false; }
+        if (!this.initialized) { return true; }
+        if (seq > this.highestSeq) { return true; }
+        ulong age = this.highestSeq - seq;
+        if (age >= 64UL) { return false; }
+        ulong mask = 1UL << (int)age;
+        return (this.bitmap & mask) == 0UL;
+    }
+
+    public bool Accept(ulong seq) {
+        if (seq == 0UL) { return false; }
+        if (!this.initialized) {
+            this.initialized = true;
+            this.highestSeq = seq;
+            this.bitmap = 1UL;
+            return true;
+        }
+        if (seq > this.highestSeq) {
+            ulong delta = seq - this.highestSeq;
+            if (delta >= 64UL) {
+                this.bitmap = 1UL;
+            } else {
+                this.bitmap = (this.bitmap << (int)delta) | 1UL;
+            }
+            this.highestSeq = seq;
+            return true;
+        }
+        ulong age = this.highestSeq - seq;
+        if (age >= 64UL) { return false; }
+        ulong mask = 1UL << (int)age;
+        if ((this.bitmap & mask) != 0UL) { return false; }
+        this.bitmap = this.bitmap | mask;
+        return true;
+    }
+
+    public void Reset() {
+        this.initialized = false;
+        this.highestSeq = 0UL;
+        this.bitmap = 0UL;
+    }
+}
+
+// 商业级 UDP 封包认证与防重放器（SipHash-2-4 64-bit 认证标签 + 64-bit 防重放窗口）：
+// 线协议（24 字节头）：[ZSEC(4)][peerId(4)][seq(8)][macTag(8)][payload(N)]。
+// MAC 覆盖 [magic + peerId + seq + payload]，防止跨 Peer 重放、字节篡改与伪造序号 DoS。
+public class NetPacketAuthenticator {
+    public const int HeaderBytes = 24;
+
+    private ulong key0;
+    private ulong key1;
+    private ulong sendSeq;
+    private AntiReplayWindow recvWindow;
+    public int RejectedTamperCount;
+    public int RejectedReplayCount;
+
+    public NetPacketAuthenticator(ulong key0, ulong key1) {
+        this.key0 = key0;
+        this.key1 = key1;
+        this.sendSeq = 0UL;
+        this.recvWindow = new AntiReplayWindow();
+        this.RejectedTamperCount = 0;
+        this.RejectedReplayCount = 0;
+    }
+
+    public ulong CurrentSendSeq { get { return this.sendSeq; } }
+    public ulong HighestRecvSeq { get { return this.recvWindow.HighestSeq; } }
+
+    private static ulong Rotl64(ulong v, int bits) {
+        return (v << bits) | (v >> (64 - bits));
+    }
+
+    private static void SipRound(ref ulong v0, ref ulong v1, ref ulong v2, ref ulong v3) {
+        v0 = v0 + v1; v1 = Rotl64(v1, 13); v1 = v1 ^ v0; v0 = Rotl64(v0, 32);
+        v2 = v2 + v3; v3 = Rotl64(v3, 16); v3 = v3 ^ v2;
+        v0 = v0 + v3; v3 = Rotl64(v3, 21); v3 = v3 ^ v0;
+        v2 = v2 + v1; v1 = Rotl64(v1, 17); v1 = v1 ^ v2; v2 = Rotl64(v2, 32);
+    }
+
+    // 标准 Aumasson-Bernstein SipHash-2-4（64-bit keyed PRF/MAC）。
+    public static ulong ComputeSipHash24(ulong k0, ulong k1, byte[] data, int offset, int length) {
+        if (data == null || offset < 0 || length < 0 || offset + length > data.Length) {
+            return 0UL;
+        }
+        ulong v0 = 0x736f6d6570736575UL ^ k0;
+        ulong v1 = 0x646f72616e646f6dUL ^ k1;
+        ulong v2 = 0x6c7967656e657261UL ^ k0;
+        ulong v3 = 0x7465646279746573UL ^ k1;
+
+        int blocks = length / 8;
+        int pos = offset;
+        for (int i = 0; i < blocks; i = i + 1) {
+            ulong m = ReadU64Le(data, pos);
+            pos = pos + 8;
+            v3 = v3 ^ m;
+            SipRound(ref v0, ref v1, ref v2, ref v3);
+            SipRound(ref v0, ref v1, ref v2, ref v3);
+            v0 = v0 ^ m;
+        }
+
+        ulong b = ((ulong)(length & 255)) << 56;
+        int rem = length - blocks * 8;
+        if (rem >= 7) { b = b | (((ulong)data[pos + 6]) << 48); }
+        if (rem >= 6) { b = b | (((ulong)data[pos + 5]) << 40); }
+        if (rem >= 5) { b = b | (((ulong)data[pos + 4]) << 32); }
+        if (rem >= 4) { b = b | (((ulong)data[pos + 3]) << 24); }
+        if (rem >= 3) { b = b | (((ulong)data[pos + 2]) << 16); }
+        if (rem >= 2) { b = b | (((ulong)data[pos + 1]) << 8); }
+        if (rem >= 1) { b = b | ((ulong)data[pos]); }
+
+        v3 = v3 ^ b;
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        v0 = v0 ^ b;
+
+        v2 = v2 ^ 0xffUL;
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        SipRound(ref v0, ref v1, ref v2, ref v3);
+        return v0 ^ v1 ^ v2 ^ v3;
+    }
+
+    private static ulong ReadU64Le(byte[] buf, int o) {
+        return ((ulong)buf[o])
+            | (((ulong)buf[o + 1]) << 8)
+            | (((ulong)buf[o + 2]) << 16)
+            | (((ulong)buf[o + 3]) << 24)
+            | (((ulong)buf[o + 4]) << 32)
+            | (((ulong)buf[o + 5]) << 40)
+            | (((ulong)buf[o + 6]) << 48)
+            | (((ulong)buf[o + 7]) << 56);
+    }
+
+    private static void WriteU64Le(byte[] buf, int o, ulong v) {
+        buf[o] = (byte)(v & 0xffUL);
+        buf[o + 1] = (byte)((v >> 8) & 0xffUL);
+        buf[o + 2] = (byte)((v >> 16) & 0xffUL);
+        buf[o + 3] = (byte)((v >> 24) & 0xffUL);
+        buf[o + 4] = (byte)((v >> 32) & 0xffUL);
+        buf[o + 5] = (byte)((v >> 40) & 0xffUL);
+        buf[o + 6] = (byte)((v >> 48) & 0xffUL);
+        buf[o + 7] = (byte)((v >> 56) & 0xffUL);
+    }
+
+    private static int ReadI32Le(byte[] buf, int o) {
+        return ((int)buf[o])
+            | (((int)buf[o + 1]) << 8)
+            | (((int)buf[o + 2]) << 16)
+            | (((int)buf[o + 3]) << 24);
+    }
+
+    private static void WriteI32Le(byte[] buf, int o, int v) {
+        buf[o] = (byte)(v & 255);
+        buf[o + 1] = (byte)((v >> 8) & 255);
+        buf[o + 2] = (byte)((v >> 16) & 255);
+        buf[o + 3] = (byte)((v >> 24) & 255);
+    }
+
+    private ulong ComputeEnvelopeTag(int peerId, ulong seq, byte[] payload, int payloadOffset, int payloadLen) {
+        byte[] macInput = new byte[16 + payloadLen];
+        macInput[0] = (byte)90; // 'Z'
+        macInput[1] = (byte)83; // 'S'
+        macInput[2] = (byte)69; // 'E'
+        macInput[3] = (byte)67; // 'C'
+        WriteI32Le(macInput, 4, peerId);
+        WriteU64Le(macInput, 8, seq);
+        for (int i = 0; i < payloadLen; i = i + 1) {
+            macInput[16 + i] = payload[payloadOffset + i];
+        }
+        return ComputeSipHash24(this.key0, this.key1, macInput, 0, macInput.Length);
+    }
+
+    // 封装并签名一个发往对端的 UDP 封包（自动递增 64-bit 序号）。
+    public byte[] Seal(int peerId, byte[] payload) {
+        int len = payload == null ? 0 : payload.Length;
+        this.sendSeq = this.sendSeq + 1UL;
+        ulong seq = this.sendSeq;
+        ulong tag = this.ComputeEnvelopeTag(peerId, seq, payload == null ? new byte[0] : payload, 0, len);
+        byte[] frame = new byte[HeaderBytes + len];
+        frame[0] = (byte)90;
+        frame[1] = (byte)83;
+        frame[2] = (byte)69;
+        frame[3] = (byte)67;
+        WriteI32Le(frame, 4, peerId);
+        WriteU64Le(frame, 8, seq);
+        WriteU64Le(frame, 16, tag);
+        for (int i = 0; i < len; i = i + 1) {
+            frame[HeaderBytes + i] = payload[i];
+        }
+        return frame;
+    }
+
+    // 校验签名与防重放窗口并解包；任何篡改、密钥不符、跨 Peer 或重放返回 null。
+    public byte[] VerifyAndOpen(byte[] packet, int expectedPeerId, out ulong seq) {
+        seq = 0UL;
+        if (packet == null || packet.Length < HeaderBytes) {
+            this.RejectedTamperCount = this.RejectedTamperCount + 1;
+            return null;
+        }
+        if (packet[0] != (byte)90 || packet[1] != (byte)83 || packet[2] != (byte)69 || packet[3] != (byte)67) {
+            this.RejectedTamperCount = this.RejectedTamperCount + 1;
+            return null;
+        }
+        int peerId = ReadI32Le(packet, 4);
+        if (peerId != expectedPeerId) {
+            this.RejectedTamperCount = this.RejectedTamperCount + 1;
+            return null;
+        }
+        ulong pktSeq = ReadU64Le(packet, 8);
+        if (!this.recvWindow.PeekValid(pktSeq)) {
+            this.RejectedReplayCount = this.RejectedReplayCount + 1;
+            return null;
+        }
+        ulong pktTag = ReadU64Le(packet, 16);
+        int payloadLen = packet.Length - HeaderBytes;
+        ulong expectedTag = this.ComputeEnvelopeTag(peerId, pktSeq, packet, HeaderBytes, payloadLen);
+        if ((pktTag ^ expectedTag) != 0UL) {
+            this.RejectedTamperCount = this.RejectedTamperCount + 1;
+            return null;
+        }
+        if (!this.recvWindow.Accept(pktSeq)) {
+            this.RejectedReplayCount = this.RejectedReplayCount + 1;
+            return null;
+        }
+        seq = pktSeq;
+        byte[] outPayload = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i = i + 1) {
+            outPayload[i] = packet[HeaderBytes + i];
+        }
+        return outPayload;
+    }
+}
+
+internal class FragmentAssembly {
+    public int MessageId;
+    public int FragCount;
+    public int ReceivedCount;
+    public int TotalBytes;
+    public long CreatedMs;
+    public byte[][] Chunks;
+}
+
+// UDP MTU 分片与乱序重组器：
+// 线协议（14 字节头）：[ZFRG(4)][messageId(4)][fragIndex(2)][fragCount(2)][chunkLen(2)][chunk(N)]。
+// 支持乱序到达、幂等去重、最大消息字节上限保护与半包超时回收（防内存耗尽攻击）。
+public class PacketFragmenter {
+    public const int HeaderBytes = 14;
+    public int MaxFragmentPayload;
+    public int MaxMessageBytes;
+    public int MaxPendingAssemblies;
+    private int nextMessageId;
+    private List<FragmentAssembly> pending;
+
+    public PacketFragmenter(int maxFragmentPayload, int maxMessageBytes) {
+        this.MaxFragmentPayload = maxFragmentPayload >= 32 ? maxFragmentPayload : 1160;
+        this.MaxMessageBytes = maxMessageBytes >= 256 ? maxMessageBytes : 262144;
+        this.MaxPendingAssemblies = 64;
+        this.nextMessageId = 1;
+        this.pending = new List<FragmentAssembly>();
+    }
+
+    public int PendingCount { get { return this.pending.Count; } }
+
+    public List<byte[]> Fragment(byte[] message) {
+        List<byte[]> result = new List<byte[]>();
+        if (message == null || message.Length == 0 || message.Length > this.MaxMessageBytes) {
+            return result;
+        }
+        int fragCount = (message.Length + this.MaxFragmentPayload - 1) / this.MaxFragmentPayload;
+        if (fragCount <= 0 || fragCount > 255) { return result; }
+        int msgId = this.nextMessageId;
+        this.nextMessageId = msgId + 1;
+
+        int offset = 0;
+        for (int i = 0; i < fragCount; i = i + 1) {
+            int chunkLen = message.Length - offset;
+            if (chunkLen > this.MaxFragmentPayload) { chunkLen = this.MaxFragmentPayload; }
+            byte[] pkt = new byte[HeaderBytes + chunkLen];
+            pkt[0] = (byte)90; // 'Z'
+            pkt[1] = (byte)70; // 'F'
+            pkt[2] = (byte)82; // 'R'
+            pkt[3] = (byte)71; // 'G'
+            pkt[4] = (byte)(msgId & 255);
+            pkt[5] = (byte)((msgId >> 8) & 255);
+            pkt[6] = (byte)((msgId >> 16) & 255);
+            pkt[7] = (byte)((msgId >> 24) & 255);
+            pkt[8] = (byte)(i & 255);
+            pkt[9] = (byte)((i >> 8) & 255);
+            pkt[10] = (byte)(fragCount & 255);
+            pkt[11] = (byte)((fragCount >> 8) & 255);
+            pkt[12] = (byte)(chunkLen & 255);
+            pkt[13] = (byte)((chunkLen >> 8) & 255);
+            for (int k = 0; k < chunkLen; k = k + 1) {
+                pkt[HeaderBytes + k] = message[offset + k];
+            }
+            result.Add(pkt);
+            offset = offset + chunkLen;
+        }
+        return result;
+    }
+
+    // 投喂一个分片包；全部齐备时返回重组后的完整消息并写入 completedMessageId，否则返回 null。
+    public byte[] ReceiveFragment(byte[] packet, long nowMs, out int completedMessageId) {
+        completedMessageId = 0;
+        if (packet == null || packet.Length < HeaderBytes) { return null; }
+        if (packet[0] != (byte)90 || packet[1] != (byte)70 || packet[2] != (byte)82 || packet[3] != (byte)71) {
+            return null;
+        }
+        int msgId = ((int)packet[4]) | (((int)packet[5]) << 8) | (((int)packet[6]) << 16) | (((int)packet[7]) << 24);
+        int fragIdx = ((int)packet[8]) | (((int)packet[9]) << 8);
+        int fragCount = ((int)packet[10]) | (((int)packet[11]) << 8);
+        int chunkLen = ((int)packet[12]) | (((int)packet[13]) << 8);
+        if (fragCount <= 0 || fragCount > 255 || fragIdx < 0 || fragIdx >= fragCount) { return null; }
+        if (chunkLen <= 0 || HeaderBytes + chunkLen != packet.Length) { return null; }
+
+        int slot = -1;
+        for (int i = 0; i < this.pending.Count; i = i + 1) {
+            if (this.pending[i].MessageId == msgId) {
+                slot = i;
+                break;
+            }
+        }
+        FragmentAssembly asm = null;
+        if (slot >= 0) {
+            asm = this.pending[slot];
+            if (asm.FragCount != fragCount) { return null; }
+        } else {
+            if (this.pending.Count >= this.MaxPendingAssemblies) { return null; }
+            asm = new FragmentAssembly();
+            asm.MessageId = msgId;
+            asm.FragCount = fragCount;
+            asm.ReceivedCount = 0;
+            asm.TotalBytes = 0;
+            asm.CreatedMs = nowMs;
+            asm.Chunks = new byte[fragCount][];
+            this.pending.Add(asm);
+            slot = this.pending.Count - 1;
+        }
+
+        if (asm.Chunks[fragIdx] == null) {
+            if (asm.TotalBytes + chunkLen > this.MaxMessageBytes) {
+                this.pending.RemoveAt(slot);
+                return null;
+            }
+            byte[] slice = new byte[chunkLen];
+            for (int k = 0; k < chunkLen; k = k + 1) {
+                slice[k] = packet[HeaderBytes + k];
+            }
+            asm.Chunks[fragIdx] = slice;
+            asm.ReceivedCount = asm.ReceivedCount + 1;
+            asm.TotalBytes = asm.TotalBytes + chunkLen;
+        }
+
+        if (asm.ReceivedCount < asm.FragCount) { return null; }
+
+        byte[] full = new byte[asm.TotalBytes];
+        int dst = 0;
+        for (int i = 0; i < asm.FragCount; i = i + 1) {
+            byte[] c = asm.Chunks[i];
+            for (int k = 0; k < c.Length; k = k + 1) {
+                full[dst] = c[k];
+                dst = dst + 1;
+            }
+        }
+        this.pending.RemoveAt(slot);
+        completedMessageId = msgId;
+        return full;
+    }
+
+    public int PurgeExpired(long nowMs, long timeoutMs) {
+        int removed = 0;
+        int i = 0;
+        while (i < this.pending.Count) {
+            if (nowMs - this.pending[i].CreatedMs >= timeoutMs) {
+                this.pending.RemoveAt(i);
+                removed = removed + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return removed;
+    }
+}
+
+// 空间兴趣管理（AOI）增量变更集：Entered 需下发全量创建包，Stayed 下发差量更新，Left 下发销毁包。
+public class AoiDiff {
+    public List<int> Entered;
+    public List<int> Stayed;
+    public List<int> Left;
+
+    public AoiDiff() {
+        this.Entered = new List<int>();
+        this.Stayed = new List<int>();
+        this.Left = new List<int>();
+    }
+}
+
+internal class AoiEntityRecord {
+    public int EntityId;
+    public float X;
+    public float Z;
+    public int CellX;
+    public int CellZ;
+}
+
+// 固定单元格空间哈希兴趣管理网格（Cell-Based Spatial AOI）：
+// 将百人/千人世界快照广播复杂度从 O(N^2) 降至 O(视野内实体数)。
+public class SpatialInterestGrid {
+    private float cellSize;
+    private Dict<int, AoiEntityRecord> entities;
+    private Dict<long, List<int>> cells;
+    private Dict<int, List<int>> subscriberVisible;
+
+    public SpatialInterestGrid(float cellSize) {
+        this.cellSize = cellSize > 0.1f ? cellSize : 16.0f;
+        this.entities = new Dict<int, AoiEntityRecord>();
+        this.cells = new Dict<long, List<int>>();
+        this.subscriberVisible = new Dict<int, List<int>>();
+    }
+
+    public int EntityCount { get { return this.entities.Count; } }
+
+    private int ToCell(float coord) {
+        double v = (double)coord / (double)this.cellSize;
+        int c = (int)v;
+        if (v < (double)c) { c = c - 1; }
+        return c;
+    }
+
+    private static long PackCell(int cx, int cz) {
+        return (((long)cx) << 32) | (((long)cz) & 0xFFFFFFFFL);
+    }
+
+    private void AddToCell(int cx, int cz, int entityId) {
+        long key = PackCell(cx, cz);
+        List<int> bucket;
+        if (!this.cells.TryGetValue(key, out bucket)) {
+            bucket = new List<int>();
+            this.cells[key] = bucket;
+        }
+        bucket.Add(entityId);
+    }
+
+    private void RemoveFromCell(int cx, int cz, int entityId) {
+        long key = PackCell(cx, cz);
+        List<int> bucket;
+        if (!this.cells.TryGetValue(key, out bucket)) { return; }
+        for (int i = 0; i < bucket.Count; i = i + 1) {
+            if (bucket[i] == entityId) {
+                int last = bucket.Count - 1;
+                bucket[i] = bucket[last];
+                bucket.RemoveAt(last);
+                break;
+            }
+        }
+    }
+
+    public void UpsertEntity(int entityId, float x, float z) {
+        int cx = this.ToCell(x);
+        int cz = this.ToCell(z);
+        AoiEntityRecord rec;
+        if (this.entities.TryGetValue(entityId, out rec)) {
+            if (rec.CellX != cx || rec.CellZ != cz) {
+                this.RemoveFromCell(rec.CellX, rec.CellZ, entityId);
+                this.AddToCell(cx, cz, entityId);
+                rec.CellX = cx;
+                rec.CellZ = cz;
+            }
+            rec.X = x;
+            rec.Z = z;
+            return;
+        }
+        rec = new AoiEntityRecord();
+        rec.EntityId = entityId;
+        rec.X = x;
+        rec.Z = z;
+        rec.CellX = cx;
+        rec.CellZ = cz;
+        this.entities[entityId] = rec;
+        this.AddToCell(cx, cz, entityId);
+    }
+
+    public bool RemoveEntity(int entityId) {
+        AoiEntityRecord rec;
+        if (!this.entities.TryGetValue(entityId, out rec)) { return false; }
+        this.RemoveFromCell(rec.CellX, rec.CellZ, entityId);
+        this.entities.Remove(entityId);
+        return true;
+    }
+
+    public List<int> QueryRadius(float centerX, float centerZ, float radius) {
+        List<int> found = new List<int>();
+        if (radius < 0.0f) { return found; }
+        float r2 = radius * radius;
+        int minCx = this.ToCell(centerX - radius);
+        int maxCx = this.ToCell(centerX + radius);
+        int minCz = this.ToCell(centerZ - radius);
+        int maxCz = this.ToCell(centerZ + radius);
+        for (int cx = minCx; cx <= maxCx; cx = cx + 1) {
+            for (int cz = minCz; cz <= maxCz; cz = cz + 1) {
+                List<int> bucket;
+                if (!this.cells.TryGetValue(PackCell(cx, cz), out bucket)) { continue; }
+                for (int i = 0; i < bucket.Count; i = i + 1) {
+                    int eid = bucket[i];
+                    AoiEntityRecord rec;
+                    if (!this.entities.TryGetValue(eid, out rec)) { continue; }
+                    float dx = rec.X - centerX;
+                    float dz = rec.Z - centerZ;
+                    if (dx * dx + dz * dz <= r2) {
+                        found.Add(eid);
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
+    private static bool ContainsId(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    // 计算订阅者本帧视野内的 Enter / Stay / Leave 增量集合（自动排除订阅者自身）。
+    public AoiDiff ComputeSubscriberDiff(int subscriberId, float viewX, float viewZ, float viewRadius) {
+        AoiDiff diff = new AoiDiff();
+        List<int> raw = this.QueryRadius(viewX, viewZ, viewRadius);
+        List<int> nowVisible = new List<int>();
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            if (raw[i] != subscriberId) {
+                nowVisible.Add(raw[i]);
+            }
+        }
+        List<int> prev;
+        if (!this.subscriberVisible.TryGetValue(subscriberId, out prev)) {
+            prev = new List<int>();
+        }
+        for (int i = 0; i < nowVisible.Count; i = i + 1) {
+            int id = nowVisible[i];
+            if (ContainsId(prev, id)) {
+                diff.Stayed.Add(id);
+            } else {
+                diff.Entered.Add(id);
+            }
+        }
+        for (int i = 0; i < prev.Count; i = i + 1) {
+            int id = prev[i];
+            if (!ContainsId(nowVisible, id)) {
+                diff.Left.Add(id);
+            }
+        }
+        this.subscriberVisible[subscriberId] = nowVisible;
+        return diff;
+    }
+
+    public void RemoveSubscriber(int subscriberId) {
+        this.subscriberVisible.Remove(subscriberId);
+    }
+}

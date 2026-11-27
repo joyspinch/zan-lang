@@ -142,6 +142,7 @@ typedef struct {
 typedef struct {
     zgl_uint program;
     zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
+    zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -189,6 +190,8 @@ static float g_game_point_color[ZAN_GAME_MAX_LIGHTS][3];
 static int g_game_point_count = 0;
 static float g_game_fog_color[3] = { 0.0f, 0.0f, 0.0f };
 static float g_game_fog_params[3] = { 0.0f, 0.0f, 0.0f }; /* enabled, start, invRange */
+static char g_game_normal_key[256] = { 0 };
+static float g_game_normal_scale = 0.0f;
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -423,6 +426,9 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 #define ZAN_GAME_3D_SHADOW_UNIFORMS \
 "uniform sampler2D uShadowMap;\n" \
 "uniform int uShadowOn;\n" \
+"uniform sampler2D uNormalMap;\n" \
+"uniform int uNormalOn;\n" \
+"uniform float uNormalScale;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -455,6 +461,26 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 
 #define ZAN_GAME_3D_LIGHT_SHADOW_BODY \
 "    vec3 N = normalize(v_normal);\n" \
+"    if (uNormalOn != 0 && uNormalScale > 0.0001) {\n" \
+"        vec3 mapN = texture(uNormalMap, v_uv).xyz * 2.0 - 1.0;\n" \
+"        mapN.xy *= uNormalScale;\n" \
+"        vec3 dp1 = dFdx(v_world_pos);\n" \
+"        vec3 dp2 = dFdy(v_world_pos);\n" \
+"        vec2 duv1 = dFdx(v_uv);\n" \
+"        vec2 duv2 = dFdy(v_uv);\n" \
+"        float det = duv1.x * duv2.y - duv1.y * duv2.x;\n" \
+"        if (abs(det) > 1e-10) {\n" \
+"            float invDet = 1.0 / det;\n" \
+"            vec3 T = (dp1 * duv2.y - dp2 * duv1.y) * invDet;\n" \
+"            vec3 B = (dp2 * duv1.x - dp1 * duv2.x) * invDet;\n" \
+"            T = T - N * dot(N, T);\n" \
+"            B = B - N * dot(N, B);\n" \
+"            if (dot(T, T) > 1e-10 && dot(B, B) > 1e-10) {\n" \
+"                mat3 TBN = mat3(normalize(T), normalize(B), N);\n" \
+"                N = normalize(TBN * normalize(mapN));\n" \
+"            }\n" \
+"        }\n" \
+"    }\n" \
 "    vec3 V = (uCamValid != 0) ? normalize(uCamPos - v_world_pos) : vec3(0.0, 0.0, 1.0);\n" \
 "    float rough = clamp(uMaterial.y, 0.05, 1.0);\n" \
 "    float metal = clamp(uMaterial.x, 0.0, 1.0);\n" \
@@ -633,7 +659,51 @@ typedef struct {
     zgl_int u_bloom;
 } zan_game_post_program;
 
+static const char *const ZAN_GAME_SKYBOX_FS =
+"uniform vec3 uCamRight;\n"
+"uniform vec3 uCamUp;\n"
+"uniform vec3 uCamForward;\n"
+"uniform vec2 uProj;\n"
+"uniform vec3 uSunDir;\n"
+"uniform vec3 uSkyTop;\n"
+"uniform vec3 uSkyHorizon;\n"
+"uniform vec3 uGround;\n"
+"in vec2 v_uv;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    float ndcX = v_uv.x * 2.0 - 1.0;\n"
+"    float ndcY = v_uv.y * 2.0 - 1.0;\n"
+"    vec3 rd = normalize(uCamForward + uCamRight * (ndcX * uProj.x) + uCamUp * (ndcY * uProj.y));\n"
+"    vec3 col;\n"
+"    if (rd.y >= 0.0) {\n"
+"        float t = pow(clamp(rd.y, 0.0, 1.0), 0.55);\n"
+"        col = mix(uSkyHorizon, uSkyTop, t);\n"
+"    } else {\n"
+"        float t = pow(clamp(-rd.y, 0.0, 1.0), 0.45);\n"
+"        col = mix(uSkyHorizon, uGround, t);\n"
+"    }\n"
+"    vec3 sdir = normalize(uSunDir);\n"
+"    float sunDot = max(dot(rd, sdir), 0.0);\n"
+"    float sunHalo = pow(sunDot, 24.0) * 0.35;\n"
+"    float sunDisk = smoothstep(0.9965, 0.9992, sunDot) * 1.4;\n"
+"    col += vec3(1.0, 0.94, 0.80) * (sunHalo + sunDisk);\n"
+"    frag = vec4(clamp(col, 0.0, 1.0), 1.0);\n"
+"}\n";
+
+typedef struct {
+    zgl_uint program;
+    zgl_int u_cam_right;
+    zgl_int u_cam_up;
+    zgl_int u_cam_forward;
+    zgl_int u_proj;
+    zgl_int u_sun_dir;
+    zgl_int u_sky_top;
+    zgl_int u_sky_horizon;
+    zgl_int u_ground;
+} zan_game_skybox_program;
+
 static zan_game_post_program g_game_post_prog;
+static zan_game_skybox_program g_game_skybox_prog;
 static zgl_uint g_game_post_fbo;
 static zgl_uint g_game_post_tex;
 static zgl_uint g_game_post_vao;
@@ -644,11 +714,14 @@ static void zan_game_drop_post(void) {
     if (g_game_gl) {
         if (g_game_post_prog.program)
             g_game_gl->DeleteProgram(g_game_post_prog.program);
+        if (g_game_skybox_prog.program)
+            g_game_gl->DeleteProgram(g_game_skybox_prog.program);
         if (g_game_post_fbo) g_game_gl->DeleteFramebuffers(1, &g_game_post_fbo);
         if (g_game_post_tex) g_game_gl->DeleteTextures(1, &g_game_post_tex);
         if (g_game_post_vao) g_game_gl->DeleteVertexArrays(1, &g_game_post_vao);
     }
     memset(&g_game_post_prog, 0, sizeof(g_game_post_prog));
+    memset(&g_game_skybox_prog, 0, sizeof(g_game_skybox_prog));
     g_game_post_fbo = 0;
     g_game_post_tex = 0;
     g_game_post_vao = 0;
@@ -763,7 +836,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
         : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
     char vs_src[4096];
-    char fs_src[6144];
+    char fs_src[8192];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, vs);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, fs);
@@ -783,6 +856,12 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uShadowMap");
     zgl_int shadow_on = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uShadowOn");
+    zgl_int normal_map = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uNormalMap");
+    zgl_int normal_on = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uNormalOn");
+    zgl_int normal_scale = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uNormalScale");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -826,6 +905,9 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_tex = tex;
     prog->u_shadow_map = shadow_map;
     prog->u_shadow_on = shadow_on;
+    prog->u_normal_map = normal_map;
+    prog->u_normal_on = normal_on;
+    prog->u_normal_scale = normal_scale;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -848,7 +930,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
 static zan_game_program *zan_game_skin_program_get(void) {
     if (g_game_skin_prog.program) return &g_game_skin_prog;
     char vs_src[4096];
-    char fs_src[6144];
+    char fs_src[8192];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SKINNED);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_PLAIN);
@@ -866,6 +948,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int tex = g_game_gl->GetUniformLocation(program, "uTex");
     zgl_int shadow_map = g_game_gl->GetUniformLocation(program, "uShadowMap");
     zgl_int shadow_on = g_game_gl->GetUniformLocation(program, "uShadowOn");
+    zgl_int normal_map = g_game_gl->GetUniformLocation(program, "uNormalMap");
+    zgl_int normal_on = g_game_gl->GetUniformLocation(program, "uNormalOn");
+    zgl_int normal_scale = g_game_gl->GetUniformLocation(program, "uNormalScale");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -897,6 +982,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_tex = tex;
     g_game_skin_prog.u_shadow_map = shadow_map;
     g_game_skin_prog.u_shadow_on = shadow_on;
+    g_game_skin_prog.u_normal_map = normal_map;
+    g_game_skin_prog.u_normal_on = normal_on;
+    g_game_skin_prog.u_normal_scale = normal_scale;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1208,6 +1296,24 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->ActiveTexture(ZGL_TEXTURE1);
         gl->BindTexture(ZGL_TEXTURE_2D, use_shadow ? g_game_shadow_tex : 0);
         gl->Uniform1i(prog->u_shadow_map, 1);
+    }
+    zgl_uint ntex = 0;
+    if (g_game_normal_key[0] && g_game_normal_scale > 0.0001f) {
+        const zan_bitmap *nbmp = zan_image_get(g_game_normal_key);
+        if (zan_game_bitmap_valid(nbmp)) {
+            ntex = zan_gui_gpu_texture(nbmp);
+        }
+    }
+    if (prog->u_normal_on >= 0) {
+        gl->Uniform1i(prog->u_normal_on, ntex ? 1 : 0);
+    }
+    if (prog->u_normal_scale >= 0 && gl->Uniform1f) {
+        gl->Uniform1f(prog->u_normal_scale, ntex ? g_game_normal_scale : 0.0f);
+    }
+    if (prog->u_normal_map >= 0) {
+        gl->ActiveTexture(ZGL_TEXTURE0 + 2);
+        gl->BindTexture(ZGL_TEXTURE_2D, ntex);
+        gl->Uniform1i(prog->u_normal_map, 2);
     }
 }
 
@@ -1856,6 +1962,99 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
     gl->BindVertexArray(0);
+    gl->Finish();
+    result = gl->GetError() == ZGL_NO_ERROR;
+
+done:
+    zan_gui_gpu_end(surface_id);
+    return result;
+}
+
+ZAN_GAME_API void zan_game_set_normal_map3d(const char *texture, float scale) {
+    if (!texture || !texture[0] || scale <= 0.0f) {
+        g_game_normal_key[0] = '\0';
+        g_game_normal_scale = 0.0f;
+        return;
+    }
+    snprintf(g_game_normal_key, sizeof(g_game_normal_key), "%s", texture);
+    g_game_normal_scale = scale;
+}
+
+static zan_game_skybox_program *zan_game_skybox_program_get(void) {
+    if (g_game_skybox_prog.program) return &g_game_skybox_prog;
+    char vs_src[1024];
+    char fs_src[2048];
+    const char *head = zan_game_glsl_head();
+    snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
+    snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_SKYBOX_FS);
+    zgl_uint prog = zan_gui_gpu_program(vs_src, fs_src);
+    if (!prog) return NULL;
+    g_game_skybox_prog.program = prog;
+    g_game_skybox_prog.u_cam_right = g_game_gl->GetUniformLocation(prog, "uCamRight");
+    g_game_skybox_prog.u_cam_up = g_game_gl->GetUniformLocation(prog, "uCamUp");
+    g_game_skybox_prog.u_cam_forward = g_game_gl->GetUniformLocation(prog, "uCamForward");
+    g_game_skybox_prog.u_proj = g_game_gl->GetUniformLocation(prog, "uProj");
+    g_game_skybox_prog.u_sun_dir = g_game_gl->GetUniformLocation(prog, "uSunDir");
+    g_game_skybox_prog.u_sky_top = g_game_gl->GetUniformLocation(prog, "uSkyTop");
+    g_game_skybox_prog.u_sky_horizon = g_game_gl->GetUniformLocation(prog, "uSkyHorizon");
+    g_game_skybox_prog.u_ground = g_game_gl->GetUniformLocation(prog, "uGround");
+    return &g_game_skybox_prog;
+}
+
+ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
+    const float *cam_basis9, float tan_half_fov, float aspect,
+    const float *sun_dir3, const float *top_rgb3, const float *horizon_rgb3,
+    const float *ground_rgb3) {
+    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP || !cam_basis9) return 0;
+    zan_gpu_frame frame;
+    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    int32_t result = 0;
+    if (!zan_game_gpu_prepare(&frame)) goto done;
+    zan_game_skybox_program *prog = zan_game_skybox_program_get();
+    if (!prog) goto done;
+    const zan_gl_api *gl = frame.api;
+    if (!g_game_post_vao) {
+        gl->GenVertexArrays(1, &g_game_post_vao);
+        if (!g_game_post_vao) goto done;
+    }
+
+    int clip_x, clip_y, clip_w, clip_h;
+    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+    if (!clip_w || !clip_h) { result = 1; goto done; }
+
+    float sun_d[3] = { 0.4f, 0.7f, 0.5f };
+    float top_c[3] = { 0.14f, 0.36f, 0.76f };
+    float hor_c[3] = { 0.68f, 0.80f, 0.94f };
+    float gnd_c[3] = { 0.24f, 0.22f, 0.20f };
+    if (sun_dir3) { sun_d[0] = sun_dir3[0]; sun_d[1] = sun_dir3[1]; sun_d[2] = sun_dir3[2]; }
+    if (top_rgb3) { top_c[0] = top_rgb3[0]; top_c[1] = top_rgb3[1]; top_c[2] = top_rgb3[2]; }
+    if (horizon_rgb3) { hor_c[0] = horizon_rgb3[0]; hor_c[1] = horizon_rgb3[1]; hor_c[2] = horizon_rgb3[2]; }
+    if (ground_rgb3) { gnd_c[0] = ground_rgb3[0]; gnd_c[1] = ground_rgb3[1]; gnd_c[2] = ground_rgb3[2]; }
+    if (tan_half_fov <= 0.001f) tan_half_fov = 0.57735f;
+    if (aspect <= 0.001f) aspect = (float)frame.width / (float)(frame.height > 0 ? frame.height : 1);
+
+    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+    gl->Viewport(0, 0, frame.width, frame.height);
+    gl->Enable(ZGL_SCISSOR_TEST);
+    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    gl->Disable(ZGL_DEPTH_TEST);
+    if (gl->DepthMask) gl->DepthMask(ZGL_FALSE);
+    gl->Disable(ZGL_BLEND);
+
+    gl->UseProgram(prog->program);
+    if (prog->u_cam_right >= 0) gl->Uniform3fv(prog->u_cam_right, 1, &cam_basis9[0]);
+    if (prog->u_cam_up >= 0) gl->Uniform3fv(prog->u_cam_up, 1, &cam_basis9[3]);
+    if (prog->u_cam_forward >= 0) gl->Uniform3fv(prog->u_cam_forward, 1, &cam_basis9[6]);
+    if (prog->u_proj >= 0) gl->Uniform2f(prog->u_proj, tan_half_fov * aspect, tan_half_fov);
+    if (prog->u_sun_dir >= 0) gl->Uniform3fv(prog->u_sun_dir, 1, sun_d);
+    if (prog->u_sky_top >= 0) gl->Uniform3fv(prog->u_sky_top, 1, top_c);
+    if (prog->u_sky_horizon >= 0) gl->Uniform3fv(prog->u_sky_horizon, 1, hor_c);
+    if (prog->u_ground >= 0) gl->Uniform3fv(prog->u_ground, 1, gnd_c);
+
+    gl->BindVertexArray(g_game_post_vao);
+    gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
+    gl->BindVertexArray(0);
+    if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
 

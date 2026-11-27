@@ -1,0 +1,138 @@
+using System;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+using Game.Assets;
+
+namespace Conf;
+
+class Game3DNormalMapSkyboxTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int R(int argb) { return (argb >> 16) & 255; }
+    private static int G(int argb) { return (argb >> 8) & 255; }
+    private static int B(int argb) { return argb & 255; }
+    private static int Lum(int argb) { return (R(argb) + G(argb) + B(argb)) / 3; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 1. 合成切线空间法线贴图（左半法线偏向 -X，右半法线偏向 +X）并烘焙进纹理缓存
+        Canvas normCv = new Canvas(64, 64);
+        normCv.Clear(unchecked((int)0xFF8080FF));
+        normCv.FillRect(0, 0, 32, 64, unchecked((int)0xFF2080C0));
+        normCv.FillRect(32, 0, 32, 64, unchecked((int)0xFFE080C0));
+        int baked = normCv.BakeSprite("mem:r6_norm_split", 0, 0, 64, 64);
+
+        int quadHandle = cv.MeshUpload(MakeQuad(2.2f, 2.2f));
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        // 强方向光从右侧 (+X) 射向平面（Direction = (-1, 0, 0)）
+        Light rightLight = Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f, new Vector3(-1.0f, 0.0f, 0.0f));
+
+        SceneNode rootFlat = new SceneNode("root_flat");
+        SceneNode nFlat = new SceneNode("quad_flat");
+        nFlat.MeshKey = quadHandle;
+        nFlat.BoundsRadius = 4.0f;
+        nFlat.Material = Material.Solid(0.85f, 0.85f, 0.85f);
+        nFlat.Material.Roughness = 0.7f;
+        rootFlat.AddChild(nFlat);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.12f;
+        plan.AmbientGreen = 0.12f;
+        plan.AmbientBlue = 0.12f;
+        plan.Lights.Add(rightLight);
+        plan.Build(rootFlat);
+
+        Renderer3D renderer = new Renderer3D(16);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int flatL = Lum(zan_gui_read_pixel(cv.SurfaceId(), 40, 64));
+        int flatR = Lum(zan_gui_read_pixel(cv.SurfaceId(), 88, 64));
+        int flatDiff = flatR - flatL;
+        if (flatDiff < 0) { flatDiff = 0 - flatDiff; }
+
+        // 启用法线贴图后，右半面朝向光源变亮，左半面背离光源变暗
+        nFlat.Material.NormalMapKey = "mem:r6_norm_split";
+        nFlat.Material.NormalScale = 1.0f;
+        plan.Build(rootFlat);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int normL = Lum(zan_gui_read_pixel(cv.SurfaceId(), 40, 64));
+        int normR = Lum(zan_gui_read_pixel(cv.SurfaceId(), 88, 64));
+        bool normalOk = baked > 0 && flatDiff <= 3 && normR > normL + 40;
+        Console.WriteLine("gpu-normal-map-shading: " + Convert.ToString(normalOk ? 1 : 0));
+
+        // 2. GPU 程序化天空盒（天顶蓝 / 太阳光晕 / 暗地面梯度）
+        Camera3D skyCam = new Camera3D();
+        skyCam.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        skyCam.Target = new Vector3(0.0f, 0.0f, -1.0f);
+        skyCam.AspectRatio = 1.0f;
+        skyCam.FieldOfView = 1.04719755f;
+
+        Skybox3D sky = Skybox3D.Daylight();
+        sky.SunDirection = new Vector3(0.0f, 0.32f, -1.0f);
+        cv.Clear(unchecked((int)0xFF000000));
+        int skyDrawn = cv.DrawSkybox3D(skyCam, sky);
+        int pxTop = zan_gui_read_pixel(cv.SurfaceId(), 64, 6);
+        int pxSun = zan_gui_read_pixel(cv.SurfaceId(), 64, 36);
+        int pxGround = zan_gui_read_pixel(cv.SurfaceId(), 64, 120);
+        bool skyOk = skyDrawn == 1
+            && B(pxTop) > R(pxTop) + 40 && B(pxTop) > 120
+            && R(pxSun) > 200 && G(pxSun) > 190
+            && Lum(pxGround) < 120 && Lum(pxGround) + 60 < Lum(pxTop)
+            && Lum(pxSun) > Lum(pxTop) + 40;
+        Console.WriteLine("gpu-procedural-skybox: " + Convert.ToString(skyOk ? 1 : 0));
+
+        // 3. Renderer3D 集成天空盒背景 + 前景 3D 物体深度遮挡共存
+        SceneNode rootCombo = new SceneNode("root_combo");
+        SceneNode smallNode = new SceneNode("center_quad");
+        smallNode.MeshKey = cv.MeshUpload(MakeQuad(0.6f, 0.6f));
+        smallNode.BoundsRadius = 2.0f;
+        smallNode.Local.Position = new Vector3(0.0f, 0.0f, -3.5f);
+        smallNode.Material = Material.Emissive(0.95f, 0.15f, 0.15f);
+        rootCombo.AddChild(smallNode);
+
+        plan.Camera = skyCam;
+        plan.Build(rootCombo);
+        renderer.Skybox = sky;
+        cv.Clear(unchecked((int)0xFF000000));
+        int comboOkDraw = renderer.Draw(cv, plan);
+        int pxCenter = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int pxCorner = zan_gui_read_pixel(cv.SurfaceId(), 10, 8);
+        bool comboOk = comboOkDraw == 1
+            && R(pxCenter) > 200 && B(pxCenter) < 80
+            && B(pxCorner) > R(pxCorner) + 40;
+        Console.WriteLine("renderer3d-skybox-scene-combo: " + Convert.ToString(comboOk ? 1 : 0));
+
+        // 4. glTF 2.0 normalTexture + emissiveFactor 解析端到端验证
+        string gltfJson = "{\"asset\":{\"version\":\"2.0\"},\"materials\":[{\"name\":\"brick\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.8,0.6,0.5,1.0],\"metallicFactor\":0.15,\"roughnessFactor\":0.65},\"normalTexture\":{\"index\":0,\"scale\":1.75},\"emissiveFactor\":[0.2,0.8,0.4]}]}";
+        GltfModel model = GltfLoader.LoadGltfBytes(Encoding.UTF8.GetBytes(gltfJson), null, "");
+        bool gltfOk = model != null && model.Materials.Count == 1
+            && model.Materials[0].NormalTextureIndex == 0
+            && model.Materials[0].NormalScale > 1.74f && model.Materials[0].NormalScale < 1.76f
+            && model.Materials[0].EmissiveR > 0.19f && model.Materials[0].EmissiveG > 0.79f && model.Materials[0].EmissiveB > 0.39f;
+        Console.WriteLine("gltf-normal-emissive-parse: " + Convert.ToString(gltfOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

@@ -49,6 +49,8 @@ public class Renderer3D {
     public float FogEnd;
     // 可选 GPU 屏幕空间后处理管线（Exposure / Reinhard / ACES / Vignette / Bloom）；null 时零开销。
     public PostProcess PostProcess;
+    // 可选 GPU 程序化大气天空盒（在 3D 几何体之前绘制，禁写深度）；null 时零开销。
+    public Skybox3D Skybox;
 
     public Renderer3D(int capacity) {
         this.batch = MeshBatch.Create(capacity);
@@ -76,6 +78,7 @@ public class Renderer3D {
         this.FogStart = 10.0f;
         this.FogEnd = 80.0f;
         this.PostProcess = null;
+        this.Skybox = null;
     }
 
     private static Mat4 BuildOrthoGl(float left, float right, float bottom, float top,
@@ -218,24 +221,38 @@ public class Renderer3D {
             return 0;
         }
         int n = plan.Count();
-        if (n <= 0) { return 0; }
+        if (n <= 0) {
+            if (this.Skybox != null) {
+                int skyOk = canvas.DrawSkybox3D(plan.Camera, this.Skybox);
+                if (skyOk == 1 && this.PostProcess != null && this.PostProcess.HasGpuPassEffect()) {
+                    canvas.PostProcess3D(this.PostProcess);
+                }
+                return skyOk;
+            }
+            return 0;
+        }
+        if (this.Skybox != null) {
+            canvas.DrawSkybox3D(plan.Camera, this.Skybox);
+        }
         int pointLightCount = 0;
         if (!this.UseCpuLighting) {
             this.ApplyLights(canvas, plan);
             pointLightCount = this.ApplyPointLights(canvas, plan);
         }
 
-        // 检查本帧是否需要高级多 Pass（阴影 / 蒙皮 / 透明层 / 点光源 / 距离雾 / PBR 高光或自发光）
+        // 检查本帧是否需要高级多 Pass（阴影 / 蒙皮 / 透明层 / 点光源 / 距离雾 / PBR 高光、自发光或法线贴图）
         bool needMultiPass = this.EnableShadows || this.EnableFog || pointLightCount > 0;
         if (!needMultiPass) {
             for (int i = 0; i < n; i = i + 1) {
                 RenderItem it = plan.ItemAt(i);
                 if (it == null) { continue; }
+                bool hasNormalMap = it.NormalMapKey != null && it.NormalMapKey != "" && it.NormalScale > 0.001f;
                 bool hasPbrOrEmissive = it.Metallic > 0.01f
                     || it.Roughness < 0.79f
                     || it.EmissiveRed > 0.001f
                     || it.EmissiveGreen > 0.001f
-                    || it.EmissiveBlue > 0.001f;
+                    || it.EmissiveBlue > 0.001f
+                    || hasNormalMap;
                 if (it.IsSkinned || it.Layer == 1 || hasPbrOrEmissive) {
                     needMultiPass = true;
                     break;
@@ -303,6 +320,7 @@ public class Renderer3D {
             int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
             canvas.SetMaterial3D(it.Metallic, it.Roughness,
                                  it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
+            canvas.SetNormalMap3D(it.NormalMapKey, it.NormalScale);
             Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
             int ok;
             if (it.IsSkinned) {
@@ -327,6 +345,7 @@ public class Renderer3D {
                 int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
                 canvas.SetMaterial3D(it.Metallic, it.Roughness,
                                      it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
+                canvas.SetNormalMap3D(it.NormalMapKey, it.NormalScale);
                 Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
                 int ok;
                 if (it.IsSkinned) {
@@ -343,6 +362,7 @@ public class Renderer3D {
         }
         canvas.EndFrame3D();
         if (shadowActive) { canvas.ShadowClear(); }
+        canvas.SetNormalMap3D("", 0.0f);
         canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
         canvas.SetFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
         canvas.SetPointLights3D(null, null);

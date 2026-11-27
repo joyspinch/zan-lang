@@ -110,6 +110,20 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     int32_t tonemap_mode, float vignette, float bloom_threshold,
     float bloom_intensity);
 
+/* 切线空间法线贴图状态（纹理单元 2，着色器内通过屏幕空间偏导 dFdx/dFdy 构建
+ * 余切帧，零破坏兼容现有 8/12/16 float 静态与蒙皮网格）。
+ * texture 为空或 scale <= 0 时关闭法线贴图（零采样开销）。 */
+ZAN_GAME_API void zan_game_set_normal_map3d(const char *texture, float scale);
+
+/* 程序化 GPU 大气天空盒 Pass（全屏无顶点缓冲三角形，关闭深度写入）：
+ * cam_basis9 = [right.xyz, up.xyz, forward.xyz]（世界空间相机正交基），
+ * tan_half_fov = tan(fovY * 0.5)，aspect = width / height，
+ * sun_dir3 = 指向太阳的世界单位方向，top/horizon/ground_rgb3 = 线性 0..1 颜色。 */
+ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
+    const float *cam_basis9, float tan_half_fov, float aspect,
+    const float *sun_dir3, const float *top_rgb3, const float *horizon_rgb3,
+    const float *ground_rgb3);
+
 #ifdef __cplusplus
 }
 #endif

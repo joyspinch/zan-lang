@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Gui;
 using Game.Animation;
 using Game.Render3D;
@@ -98,6 +99,14 @@ public static class CanvasGameExtensions {
     [DllImport("zan_game")]
     private static extern int zan_game_postprocess3d(int surfaceId, float exposure,
     int tonemapMode, float vignette, float bloomThreshold, float bloomIntensity);
+
+    [DllImport("zan_game")]
+    private static extern void zan_game_set_normal_map3d(string texture, float scale);
+
+    [DllImport("zan_game")]
+    private static extern int zan_game_skybox3d(int surfaceId, nint camBasis9,
+    float tanHalfFov, float aspect, nint sunDir3, nint topRgb3, nint horizonRgb3,
+    nint groundRgb3);
 
     public static int SpriteHandle(this Canvas c, string key) {
         if (c == null) { return 0; }
@@ -484,5 +493,40 @@ public static class CanvasGameExtensions {
         else if (post.Tonemap == TonemapKind.Aces) { mode = 2; }
         return zan_game_postprocess3d(c.SurfaceId(), post.Exposure, mode,
             post.VignetteStrength, post.BloomThreshold, post.BloomIntensity);
+    }
+
+    private static nint skyboxBuf;
+
+    // 设置切线空间法线贴图（textureKey 为空或 scale <= 0 时关闭，零采样开销）。
+    public static void SetNormalMap3D(this Canvas c, string textureKey, float scale) {
+        if (c == null) { return; }
+        string key = textureKey == null ? "" : textureKey;
+        zan_game_set_normal_map3d(key, scale);
+    }
+
+    // 绘制 GPU 程序化大气天空盒（关闭深度写入，宜在 3D 场景几何体之前调用）。
+    public static int DrawSkybox3D(this Canvas c, Camera3D camera, Skybox3D skybox) {
+        if (c == null || camera == null || skybox == null) { return 0; }
+        if (skyboxBuf == 0) { skyboxBuf = NativeMemory.Alloc(21 * 4); }
+        Vector3 fwd = camera.Forward();
+        Vector3 right = camera.Right();
+        Vector3 camUp = Vector3.Normalize(Vector3.Cross(right, fwd));
+        Span<float> b = new Span<float>(skyboxBuf, 21);
+        // [0..8] = camBasis9 (right, up, forward)
+        b[0] = right.X; b[1] = right.Y; b[2] = right.Z;
+        b[3] = camUp.X; b[4] = camUp.Y; b[5] = camUp.Z;
+        b[6] = fwd.X;   b[7] = fwd.Y;   b[8] = fwd.Z;
+        // [9..11] = sunDir3
+        b[9] = skybox.SunDirection.X; b[10] = skybox.SunDirection.Y; b[11] = skybox.SunDirection.Z;
+        // [12..14] = topRgb3
+        b[12] = skybox.TopRed; b[13] = skybox.TopGreen; b[14] = skybox.TopBlue;
+        // [15..17] = horizonRgb3
+        b[15] = skybox.HorizonRed; b[16] = skybox.HorizonGreen; b[17] = skybox.HorizonBlue;
+        // [18..20] = groundRgb3
+        b[18] = skybox.GroundRed; b[19] = skybox.GroundGreen; b[20] = skybox.GroundBlue;
+        float tanHalf = (float)Math.Tan((double)(camera.FieldOfView * 0.5f));
+        float asp = camera.AspectRatio > 0.001f ? camera.AspectRatio : 1.0f;
+        return zan_game_skybox3d(c.SurfaceId(), skyboxBuf, tanHalf, asp,
+            skyboxBuf + 36, skyboxBuf + 48, skyboxBuf + 60, skyboxBuf + 72);
     }
 }

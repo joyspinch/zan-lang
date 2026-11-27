@@ -1,0 +1,74 @@
+using System;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionAwarenessTest {
+    static void Main() {
+        // 1. 全局用户活跃/AFK 与久坐提醒状态机 + Win32 GetLastInputInfo 真机探针
+        long osIdle = UserActivityMonitor.QuerySystemIdleMs();
+        bool osProbeOk = osIdle >= 0;
+
+        UserActivityMonitor mon = new UserActivityMonitor(10000, 60000, 120000, 30000);
+        mon.Update(0, 0);
+        // 连续活跃 125 秒 -> 触发久坐提醒
+        mon.Update(65000, 1000);
+        bool stillActive = mon.State == UserActivityState.Active && !mon.BreakReminderDue;
+        mon.Update(125000, 2000);
+        bool triggeredBreak = mon.BreakReminderDue && mon.BreakReminderCount == 1;
+        // 短暂空闲 15 秒 -> Idle
+        bool toIdle = mon.Update(140000, 15000);
+        bool isIdle = mon.State == UserActivityState.Idle;
+        // 离席满 70 秒，再停留 35 秒（超过 BreakResetAfkMs=30s）-> Afk 且自动清零久坐提醒
+        bool toAfk = mon.Update(150000, 70000);
+        mon.Update(185000, 105000);
+        bool afkCleared = mon.State == UserActivityState.Afk && !mon.BreakReminderDue && mon.ContinuousActiveMs == 0;
+
+        bool activityOk = osProbeOk && stillActive && triggeredBreak && toIdle && isIdle && toAfk && afkCleared;
+        Console.WriteLine("user-activity-afk-break: " + Convert.ToString(activityOk ? 1 : 0));
+
+        // 2. 桌宠拖拽、惯性抛掷、边界回弹防丢失与任务栏/屏幕边缘磁吸
+        WorkAreaRect work = new WorkAreaRect(0, 0, 1920, 1040);
+        CompanionDragSnapper drag = new CompanionDragSnapper(500.0f, 500.0f, 120, 120);
+        drag.GravityY = 1400.0f;
+        drag.Restitution = 0.25f;
+        drag.BeginDrag(560.0f, 560.0f, 1000);
+        drag.DragTo(1850.0f, 700.0f, 1100); // 高速向右下方甩出
+        drag.EndDrag();
+        // 步进 2.5 秒让其撞右边界回弹、受重力落至任务栏顶边并自动磁吸停稳
+        for (int i = 0; i < 150; i = i + 1) {
+            drag.Step(1.0f / 60.0f, work);
+        }
+        bool insideWork = drag.IntX >= 0 && drag.IntX <= 1920 - 120
+            && drag.IntY >= 0 && drag.IntY <= 1040 - 120;
+        // 再测试无重力模式下左边缘低速磁吸
+        CompanionDragSnapper leftSnap = new CompanionDragSnapper(12.0f, 400.0f, 120, 120);
+        leftSnap.Step(1.0f / 60.0f, work);
+        bool snapOk = insideWork && drag.SnappedEdge == SnapEdge.Bottom && drag.IntY == 920
+            && leftSnap.SnappedEdge == SnapEdge.Left && leftSnap.IntX == 0;
+        Console.WriteLine("drag-inertia-clamp-snap: " + Convert.ToString(snapOk ? 1 : 0));
+
+        // 3. 全局视线平滑追踪 + 前台应用陪伴模式分类
+        CompanionEyeTracker eyes = new CompanionEyeTracker(10.0f, 210.0f, 15.0f);
+        // 死区内不动
+        eyes.Update(500.0f, 500.0f, 505.0f, 503.0f, 0.016f);
+        bool inDeadZone = eyes.LookX == 0.0f && eyes.LookY == 0.0f;
+        // 移到正右方远点，连续多帧收敛到 (+1, 0)
+        for (int i = 0; i < 40; i = i + 1) {
+            eyes.Update(500.0f, 500.0f, 900.0f, 500.0f, 0.02f);
+        }
+        bool gazeRight = eyes.LookX > 0.98f && eyes.LookY > -0.02f && eyes.LookY < 0.02f;
+
+        ForegroundAppMatcher matcher = new ForegroundAppMatcher();
+        matcher.AddRule("ZanIDE", CompanionMood.FocusCoding);
+        bool moodOk = matcher.Classify("Code.exe", "main.zan - Visual Studio Code") == CompanionMood.FocusCoding
+            && matcher.Classify("ZanIDE.exe", "Zan Project") == CompanionMood.FocusCoding
+            && matcher.Classify("chrome.exe", "GitHub") == CompanionMood.Browsing
+            && matcher.Classify("steamwebhelper.exe", "Steam") == CompanionMood.GamingQuiet
+            && matcher.Classify("vlc.exe", "Movie.mkv") == CompanionMood.MediaWatch
+            && matcher.Classify("notepad.exe", "Untitled") == CompanionMood.Default;
+
+        bool awareOk = inDeadZone && gazeRight && moodOk;
+        Console.WriteLine("eye-tracker-and-app-mood: " + Convert.ToString(awareOk ? 1 : 0));
+    }
+}
