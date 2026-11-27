@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Messaging.RabbitMQ;
 
@@ -9,6 +10,8 @@ public class AmqpChannel : IDisposable {
     private AmqpConnection conn;
     private bool open;
     private Gate rpcGate;
+    private bool rpcBusy;
+    private Queue<AsyncGate> rpcWaiters;
     private int expectedClass;
     private int expectedMethod;
     private bool rpcSuccess;
@@ -34,6 +37,8 @@ public class AmqpChannel : IDisposable {
         this.conn = conn;
         this.open = true;
         this.rpcGate = new Gate();
+        this.rpcBusy = false;
+        this.rpcWaiters = new Queue<AsyncGate>();
         this.expectedClass = 0;
         this.expectedMethod = 0;
         this.rpcSuccess = false;
@@ -99,11 +104,16 @@ public class AmqpChannel : IDisposable {
         w.FlushBits();
         w.WriteTable(null); // arguments
 
-        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DECLARE_OK);
-        if (ok) {
-            return this.declaredQueue.Length > 0 ? this.declaredQueue : queue;
+        if (!await this.AcquireRpcLockAsync()) { return ""; }
+        try {
+            bool ok = await this.ExecuteRpcLockedAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DECLARE_OK);
+            if (ok) {
+                return this.declaredQueue.Length > 0 ? this.declaredQueue : queue;
+            }
+            return "";
+        } finally {
+            this.ReleaseRpcLock();
         }
-        return "";
     }
 
     // 绑定队列到交换机 (Queue.Bind)
@@ -146,8 +156,13 @@ public class AmqpChannel : IDisposable {
         w.WriteShortString(queue);
         w.WriteBit(false); // nowait
         w.FlushBits();
-        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_PURGE_OK);
-        return ok ? this.messageCount : -1;
+        if (!await this.AcquireRpcLockAsync()) { return -1; }
+        try {
+            bool ok = await this.ExecuteRpcLockedAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_PURGE_OK);
+            return ok ? this.messageCount : -1;
+        } finally {
+            this.ReleaseRpcLock();
+        }
     }
 
     // 删除队列 (Queue.Delete)
@@ -162,8 +177,13 @@ public class AmqpChannel : IDisposable {
         w.WriteBit(ifEmpty);
         w.WriteBit(false); // nowait
         w.FlushBits();
-        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DELETE_OK);
-        return ok ? this.messageCount : -1;
+        if (!await this.AcquireRpcLockAsync()) { return -1; }
+        try {
+            bool ok = await this.ExecuteRpcLockedAsync(w.ToBytes(), AmqpConstants.CLASS_QUEUE, AmqpConstants.METHOD_QUEUE_DELETE_OK);
+            return ok ? this.messageCount : -1;
+        } finally {
+            this.ReleaseRpcLock();
+        }
     }
 
     // 设置消费者流控配额 (Basic.Qos)
@@ -208,16 +228,17 @@ public class AmqpChannel : IDisposable {
         return await this.BasicConsumeAsync(queue, true, handler);
     }
 
-    // 发布二进制消息 (分帧流水发送：Method 帧 -> Content Header 帧 -> Body 帧序列)。
-    // 任一帧发送失败即关闭连接并返回 false——此前三段 SendRawAsync 的返回
-    // 值全部被丢弃、无条件返回 true，连接已断调用方仍以为发布成功。
+    // 发布二进制消息 (单锁原子发送 Method 帧 -> Content Header 帧 -> Body 帧序列，杜绝并发帧交错)。
     public async bool BasicPublishBytesAsync(string exchange, string routingKey, byte[] body, int bodyLen, BasicProperties props) {
-        if (!this.open || this.conn == null) { return false; }
+        AmqpConnection c = this.conn;
+        if (!this.open || c == null) { return false; }
         if (props == null) { props = BasicProperties.CreateDefault(); }
         if (body == null) { bodyLen = 0; }
         if (bodyLen < 0 || (body != null && bodyLen > body.Length)) { return false; }
 
-        // 1. 发送 Basic.Publish 方法帧 (Class 60, Method 40)
+        List<byte[]> frames = new List<byte[]>();
+
+        // 1. 构造 Basic.Publish 方法帧 (Class 60, Method 40)
         AmqpWriter mw = new AmqpWriter();
         mw.WriteShort(AmqpConstants.CLASS_BASIC);
         mw.WriteShort(AmqpConstants.METHOD_BASIC_PUBLISH);
@@ -227,29 +248,19 @@ public class AmqpChannel : IDisposable {
         mw.WriteBit(false); // mandatory
         mw.WriteBit(false); // immediate
         mw.FlushBits();
-        byte[] methodPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, mw.ToBytes(), mw.Length());
-        int sentMethod = await this.conn.SendRawAsync(methodPkt, methodPkt.Length);
-        if (sentMethod < methodPkt.Length) {
-            this.conn.Close();
-            return false;
-        }
+        frames.Add(AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, mw.ToBytes(), mw.Length()));
 
-        // 2. 发送 Content Header 帧 (Type 2: Class 60, Weight 0, BodySize 64-bit, Properties)
+        // 2. 构造 Content Header 帧 (Type 2: Class 60, Weight 0, BodySize 64-bit, Properties)
         AmqpWriter hw = new AmqpWriter();
         hw.WriteShort(AmqpConstants.CLASS_BASIC);
         hw.WriteShort(0); // weight
         hw.WriteLongLong((long)bodyLen); // body size
         props.Encode(hw);
-        byte[] headerPkt = AmqpFrame.Encode(AmqpConstants.FRAME_HEADER, this.channelId, hw.ToBytes(), hw.Length());
-        int sentHeader = await this.conn.SendRawAsync(headerPkt, headerPkt.Length);
-        if (sentHeader < headerPkt.Length) {
-            this.conn.Close();
-            return false;
-        }
+        frames.Add(AmqpFrame.Encode(AmqpConstants.FRAME_HEADER, this.channelId, hw.ToBytes(), hw.Length()));
 
-        // 3. 发送 Content Body 帧 (Type 3: 切片按协商的 frameMax 流水切分)
+        // 3. 构造 Content Body 帧序列 (Type 3: 按协商 frameMax 切分)
         if (bodyLen > 0) {
-            int frameMax = this.conn.FrameMax() - 8;
+            int frameMax = c.FrameMax() - 8;
             if (frameMax <= 0) { frameMax = 131072; }
             int offset = 0;
             while (offset < bodyLen) {
@@ -257,14 +268,14 @@ public class AmqpChannel : IDisposable {
                 if (chunk > frameMax) { chunk = frameMax; }
                 byte[] chunkBuf = new byte[chunk];
                 NativeMemory.Copy((nint)chunkBuf, (nint)body + offset, chunk);
-                byte[] bodyPkt = AmqpFrame.Encode(AmqpConstants.FRAME_BODY, this.channelId, chunkBuf, chunk);
-                int sentBody = await this.conn.SendRawAsync(bodyPkt, bodyPkt.Length);
-                if (sentBody < bodyPkt.Length) {
-                    this.conn.Close();
-                    return false;
-                }
+                frames.Add(AmqpFrame.Encode(AmqpConstants.FRAME_BODY, this.channelId, chunkBuf, chunk));
                 offset = offset + chunk;
             }
+        }
+
+        if (!await c.SendFramesAsync(frames)) {
+            c.Close();
+            return false;
         }
         return true;
     }
@@ -285,14 +296,19 @@ public class AmqpChannel : IDisposable {
         w.FlushBits();
         w.WriteTable(null); // arguments
 
-        bool ok = await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_BASIC, AmqpConstants.METHOD_BASIC_CONSUME_OK);
-        if (ok && this.declaredQueue.Length > 0) {
-            string tag = this.declaredQueue;
-            AmqpConsumer c = new AmqpConsumer(queue, tag, autoAck, handler);
-            this.consumers[tag] = c;
-            return tag;
+        if (!await this.AcquireRpcLockAsync()) { return ""; }
+        try {
+            bool ok = await this.ExecuteRpcLockedAsync(w.ToBytes(), AmqpConstants.CLASS_BASIC, AmqpConstants.METHOD_BASIC_CONSUME_OK);
+            if (ok && this.declaredQueue.Length > 0) {
+                string tag = this.declaredQueue;
+                AmqpConsumer c = new AmqpConsumer(queue, tag, autoAck, handler);
+                this.consumers[tag] = c;
+                return tag;
+            }
+            return "";
+        } finally {
+            this.ReleaseRpcLock();
         }
-        return "";
     }
 
     // 确认单条或多条已接收消息 (Basic.Ack)
@@ -348,7 +364,8 @@ public class AmqpChannel : IDisposable {
 
     // 关闭信道 (Channel.Close)
     public async void CloseAsync() {
-        if (!this.open || this.conn == null) { return; }
+        AmqpConnection c = this.conn;
+        if (!this.open || c == null) { return; }
         AmqpWriter w = new AmqpWriter();
         w.WriteShort(AmqpConstants.CLASS_CHANNEL);
         w.WriteShort(AmqpConstants.METHOD_CHANNEL_CLOSE);
@@ -357,8 +374,11 @@ public class AmqpChannel : IDisposable {
         w.WriteShort(0);
         w.WriteShort(0);
         byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
-        await this.conn.SendRawAsync(pkt, pkt.Length);
+        await c.SendRawAsync(pkt, pkt.Length);
         this.open = false;
+        c.UnregisterChannel(this.channelId);
+        this.conn = null;
+        this.WakeRpcWaiters();
         if (this.rpcGate != null) {
             this.rpcGate.SignalAll();
         }
@@ -366,6 +386,7 @@ public class AmqpChannel : IDisposable {
 
     public void Dispose() {
         this.open = false;
+        this.WakeRpcWaiters();
         if (this.rpcGate != null) {
             this.rpcGate.Close();
             this.rpcGate = null;
@@ -377,22 +398,87 @@ public class AmqpChannel : IDisposable {
         this.conn = null;
     }
 
-    // 同步等待特定 RPC 方法回复
-    private async bool ExecuteRpcAsync(byte[] methodPayload, int expectClass, int expectMethod) {
-        if (!this.open || this.conn == null || this.rpcGate == null) { return false; }
+    private async bool AcquireRpcLockAsync() {
+        while (true) {
+            AsyncGate gate = null;
+            lock (this) {
+                if (!this.open) { return false; }
+                if (!this.rpcBusy) {
+                    this.rpcBusy = true;
+                    return true;
+                }
+                gate = new AsyncGate();
+                this.rpcWaiters.Enqueue(gate);
+            }
+            try {
+                await gate.Wait();
+            } finally {
+                gate.Close();
+            }
+        }
+    }
+
+    private void ReleaseRpcLock() {
+        AsyncGate next = null;
+        lock (this) {
+            this.rpcBusy = false;
+            if (this.rpcWaiters != null && this.rpcWaiters.Count() > 0) {
+                next = this.rpcWaiters.Dequeue();
+            }
+        }
+        if (next != null) { next.Signal(); }
+    }
+
+    private void WakeRpcWaiters() {
+        List<AsyncGate> toWake = null;
+        lock (this) {
+            if (this.rpcWaiters != null && this.rpcWaiters.Count() > 0) {
+                toWake = new List<AsyncGate>();
+                while (this.rpcWaiters.Count() > 0) {
+                    toWake.Add(this.rpcWaiters.Dequeue());
+                }
+            }
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.Count; i = i + 1) {
+                toWake[i].Signal();
+            }
+        }
+    }
+
+    // 同步等待特定 RPC 方法回复（已持有信道 RPC 串行锁时调用）
+    private async bool ExecuteRpcLockedAsync(byte[] methodPayload, int expectClass, int expectMethod) {
+        AmqpConnection c = this.conn;
+        Gate g = this.rpcGate;
+        if (!this.open || c == null || g == null) { return false; }
         this.expectedClass = expectClass;
         this.expectedMethod = expectMethod;
         this.rpcSuccess = false;
         this.rpcError = "";
 
         byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, methodPayload, methodPayload.Length);
-        await this.conn.SendRawAsync(pkt, pkt.Length);
+        int sent = await c.SendRawAsync(pkt, pkt.Length);
+        if (sent < pkt.Length) {
+            this.expectedClass = 0;
+            this.expectedMethod = 0;
+            return false;
+        }
 
         // 在专属 Gate 上异步等待事件唤醒（最多 10000ms 超时）
-        await this.rpcGate.Wait(10000);
+        await g.Wait(10000);
         this.expectedClass = 0;
         this.expectedMethod = 0;
         return this.rpcSuccess;
+    }
+
+    // 同步等待特定 RPC 方法回复（带信道级异步串行化）
+    private async bool ExecuteRpcAsync(byte[] methodPayload, int expectClass, int expectMethod) {
+        if (!await this.AcquireRpcLockAsync()) { return false; }
+        try {
+            return await this.ExecuteRpcLockedAsync(methodPayload, expectClass, expectMethod);
+        } finally {
+            this.ReleaseRpcLock();
+        }
     }
 
     // 内部帧派发处理（由 AmqpConnection 接收循环驱动）

@@ -13,6 +13,7 @@ public class CircuitBreaker : IDisposable {
     public int consecutiveSuccesses;
     public long trippedAtMs;
     public nint mtx;
+    private int halfOpenInFlight;
 
     public CircuitBreaker(int failureThreshold, long breakDurationMs, int successThreshold) {
         this.failureThreshold = failureThreshold > 0 ? failureThreshold : 5;
@@ -22,13 +23,15 @@ public class CircuitBreaker : IDisposable {
         this.consecutiveFailures = 0;
         this.consecutiveSuccesses = 0;
         this.trippedAtMs = 0;
+        this.halfOpenInFlight = 0;
         this.mtx = Mutex.Create();
     }
 
     public void Dispose() {
-        if (this.mtx != 0) {
-            Mutex.Destroy(this.mtx);
+        nint m = this.mtx;
+        if (m != 0) {
             this.mtx = 0;
+            Mutex.Destroy(m);
         }
     }
 
@@ -58,7 +61,12 @@ public class CircuitBreaker : IDisposable {
                 return true;
             }
             if (this.state == CircuitState.HalfOpen) {
-                return true; // 放行单次或少量探测流量
+                // 限制半开态并发探测数不超过剩余所需成功阈值，防止恢复瞬间惊群击穿。
+                if (this.halfOpenInFlight + this.consecutiveSuccesses < this.successThreshold) {
+                    this.halfOpenInFlight = this.halfOpenInFlight + 1;
+                    return true;
+                }
+                return false;
             }
             return false; // Open 状态快速失败
         } finally {
@@ -72,6 +80,9 @@ public class CircuitBreaker : IDisposable {
         Mutex.Lock(this.mtx);
         try {
             if (this.state == CircuitState.HalfOpen) {
+                if (this.halfOpenInFlight > 0) {
+                    this.halfOpenInFlight = this.halfOpenInFlight - 1;
+                }
                 this.consecutiveSuccesses = this.consecutiveSuccesses + 1;
                 if (this.consecutiveSuccesses >= this.successThreshold) {
                     // 半开探测通过，自动愈合恢复至 Closed
@@ -79,6 +90,7 @@ public class CircuitBreaker : IDisposable {
                     this.consecutiveFailures = 0;
                     this.consecutiveSuccesses = 0;
                     this.trippedAtMs = 0;
+                    this.halfOpenInFlight = 0;
                 }
             } else if (this.state == CircuitState.Closed) {
                 this.consecutiveFailures = 0;
@@ -99,6 +111,7 @@ public class CircuitBreaker : IDisposable {
                 this.state = CircuitState.Open;
                 this.trippedAtMs = now;
                 this.consecutiveSuccesses = 0;
+                this.halfOpenInFlight = 0;
             } else if (this.state == CircuitState.Closed) {
                 this.consecutiveFailures = this.consecutiveFailures + 1;
                 if (this.consecutiveFailures >= this.failureThreshold) {
@@ -106,6 +119,7 @@ public class CircuitBreaker : IDisposable {
                     this.state = CircuitState.Open;
                     this.trippedAtMs = now;
                     this.consecutiveSuccesses = 0;
+                    this.halfOpenInFlight = 0;
                 }
             }
         } finally {
@@ -122,6 +136,7 @@ public class CircuitBreaker : IDisposable {
             this.consecutiveFailures = 0;
             this.consecutiveSuccesses = 0;
             this.trippedAtMs = 0;
+            this.halfOpenInFlight = 0;
         } finally {
             Mutex.Unlock(this.mtx);
         }
@@ -133,6 +148,7 @@ public class CircuitBreaker : IDisposable {
             if (now - this.trippedAtMs >= this.breakDurationMs) {
                 this.state = CircuitState.HalfOpen;
                 this.consecutiveSuccesses = 0;
+                this.halfOpenInFlight = 0;
             }
         }
     }

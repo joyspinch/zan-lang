@@ -18,8 +18,9 @@ public class AmqpConnection : IDisposable {
     private nint sock;
     private TlsContext tlsCtx;
     private TlsStream tls;
-    // 协程安全发送锁（跨 await）与同步信道表锁（不跨 await）分离。
-    private AsyncRwLock sendLock;
+    // 协程安全发送门锁（lock(this)+Queue<AsyncGate>，零 OS Mutex 销毁竞态）与同步信道表锁分离。
+    private bool sendBusy;
+    private Queue<AsyncGate> sendWaiters;
     private Mutex chanLock;
     private int channelMax;
     private int frameMax;
@@ -46,7 +47,8 @@ public class AmqpConnection : IDisposable {
         this.sock = -1;
         this.tlsCtx = null;
         this.tls = null;
-        this.sendLock = new AsyncRwLock();
+        this.sendBusy = false;
+        this.sendWaiters = new Queue<AsyncGate>();
         this.chanLock = new Mutex();
         this.channelMax = AmqpConstants.DEFAULT_CHANNEL_MAX;
         this.frameMax = AmqpConstants.DEFAULT_FRAME_MAX;
@@ -119,15 +121,25 @@ public class AmqpConnection : IDisposable {
             }
         }
 
-        // 3. 解析 host 与可选的 port
-        int portColon = rest.IndexOf(":");
-        if (portColon >= 0) {
-            host = rest.Substring(0, portColon);
-            string portStr = rest.Substring(portColon + 1, rest.Length - (portColon + 1));
-            int p = portStr.ToInt32();
-            if (p > 0) { port = p; }
+        // 3. 解析 host 与可选的 port（兼容 IPv6 字面量 [::1]:5672）
+        if (rest.StartsWith("[")) {
+            int closeBracket = rest.IndexOf("]");
+            if (closeBracket > 1) {
+                host = rest.Substring(1, closeBracket - 1);
+                if (closeBracket + 2 <= rest.Length && (rest[closeBracket + 1] & 255) == 58) {
+                    string portStr = rest.Substring(closeBracket + 2, rest.Length - (closeBracket + 2));
+                    int p = portStr.ToInt32();
+                    if (p > 0) { port = p; }
+                }
+            }
         } else {
-            if (rest.Length > 0) {
+            int portColon = rest.IndexOf(":");
+            if (portColon >= 0) {
+                host = rest.Substring(0, portColon);
+                string portStr = rest.Substring(portColon + 1, rest.Length - (portColon + 1));
+                int p = portStr.ToInt32();
+                if (p > 0) { port = p; }
+            } else if (rest.Length > 0) {
                 host = rest;
             }
         }
@@ -147,9 +159,14 @@ public class AmqpConnection : IDisposable {
         Socket.Initialize();
         TcpClient client = await TcpClient.ConnectAsync(conn.host, conn.port);
         if (client == null) {
+            conn.Close();
             return null;
         }
         nint s = client.GetSocket();
+        if (s < 0) {
+            conn.Close();
+            return null;
+        }
         conn.sock = s;
         Socket.SetNoDelay(s);
 
@@ -157,7 +174,6 @@ public class AmqpConnection : IDisposable {
             TlsContext ctx = TlsContext.CreateClient();
             TlsStream ts = await TlsStream.ConnectAsync(ctx, s, conn.host, 10000);
             if (ts == null) {
-                Socket.Close(s);
                 ctx.Free();
                 conn.Close();
                 return null;
@@ -221,24 +237,98 @@ public class AmqpConnection : IDisposable {
         return ch;
     }
 
+    // 注销已关闭的逻辑信道，打破 AmqpConnection <-> AmqpChannel 引用环。
+    internal void UnregisterChannel(int cid) {
+        Mutex clk = this.chanLock;
+        if (clk == null) { return; }
+        clk.WaitOne();
+        try {
+            if (this.channels != null) {
+                this.channels.Remove(cid);
+            }
+        } finally {
+            clk.ReleaseMutex();
+        }
+    }
+
+    private async bool AcquireSendLockAsync() {
+        while (true) {
+            AsyncGate gate = null;
+            lock (this) {
+                if (!this.connected) { return false; }
+                if (!this.sendBusy) {
+                    this.sendBusy = true;
+                    return true;
+                }
+                gate = new AsyncGate();
+                this.sendWaiters.Enqueue(gate);
+            }
+            try {
+                await gate.Wait();
+            } finally {
+                gate.Close();
+            }
+        }
+    }
+
+    private void ReleaseSendLock() {
+        AsyncGate next = null;
+        lock (this) {
+            this.sendBusy = false;
+            if (this.sendWaiters != null && this.sendWaiters.Count() > 0) {
+                next = this.sendWaiters.Dequeue();
+            }
+        }
+        if (next != null) { next.Signal(); }
+    }
+
     // 发送底层网络原始数据包（加协程安全写锁保证多信道写网络原子性）
     internal async int SendRawAsync(byte[] data, int len) {
         if (!this.connected || data == null || len <= 0) { return -1; }
-        AsyncRwLock lk = this.sendLock;
-        if (lk == null) { return -1; }
-        await lk.EnterWrite();
+        if (!await this.AcquireSendLockAsync()) { return -1; }
         int sent = 0;
         try {
             if (!this.connected) { return -1; }
-            if (this.tls != null) {
-                sent = await this.tls.SendBytesAsync(data, 0, len);
-            } else if (this.sock >= 0) {
-                sent = await Socket.SendAsync(this.sock, data, len);
+            TlsStream ts = this.tls;
+            nint s = this.sock;
+            if (ts != null) {
+                sent = await ts.SendBytesAsync(data, 0, len);
+            } else if (s >= 0) {
+                sent = await Socket.SendAsync(s, data, len);
+            } else {
+                return -1;
             }
         } finally {
-            lk.ExitWrite();
+            this.ReleaseSendLock();
         }
         return sent;
+    }
+
+    // 单锁原子发送一组 AMQP 关联帧（Method + Header + Body），防止多协程并发发布帧交错。
+    internal async bool SendFramesAsync(List<byte[]> frames) {
+        if (!this.connected || frames == null || frames.Count == 0) { return false; }
+        if (!await this.AcquireSendLockAsync()) { return false; }
+        try {
+            if (!this.connected) { return false; }
+            TlsStream ts = this.tls;
+            nint s = this.sock;
+            for (int i = 0; i < frames.Count; i = i + 1) {
+                byte[] pkt = frames[i];
+                if (pkt == null || pkt.Length <= 0) { continue; }
+                int sent = 0;
+                if (ts != null) {
+                    sent = await ts.SendBytesAsync(pkt, 0, pkt.Length);
+                } else if (s >= 0) {
+                    sent = await Socket.SendAsync(s, pkt, pkt.Length);
+                } else {
+                    return false;
+                }
+                if (sent < pkt.Length) { return false; }
+            }
+            return true;
+        } finally {
+            this.ReleaseSendLock();
+        }
     }
 
     // 帧接收与分发循环核心
@@ -424,10 +514,14 @@ public class AmqpConnection : IDisposable {
         while (received < count && this.connected) {
             int want = count - received;
             int n = 0;
-            if (this.tls != null) {
-                n = await this.tls.RecvBytesAsync(outBuf, received, want);
+            TlsStream ts = this.tls;
+            nint s = this.sock;
+            if (ts != null) {
+                n = await ts.RecvBytesAsync(outBuf, received, want);
+            } else if (s >= 0) {
+                n = await Socket.RecvPtrAsync(s, (nint)outBuf + (nint)received, want);
             } else {
-                n = await Socket.RecvPtrAsync(this.sock, (nint)outBuf + (nint)received, want);
+                return -1;
             }
             if (n <= 0) {
                 return -1;
@@ -485,10 +579,20 @@ public class AmqpConnection : IDisposable {
                 clk.Close();
             }
         }
-        if (this.sendLock != null) {
-            AsyncRwLock slk = this.sendLock;
-            this.sendLock = null;
-            slk.Close();
+        List<AsyncGate> toWake = null;
+        lock (this) {
+            this.connected = false;
+            if (this.sendWaiters != null && this.sendWaiters.Count() > 0) {
+                toWake = new List<AsyncGate>();
+                while (this.sendWaiters.Count() > 0) {
+                    toWake.Add(this.sendWaiters.Dequeue());
+                }
+            }
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.Count; i = i + 1) {
+                toWake[i].Signal();
+            }
         }
 
         if (this.connGate != null) {

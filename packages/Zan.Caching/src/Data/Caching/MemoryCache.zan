@@ -74,12 +74,12 @@ public class MemoryCache<TValue> : IDisposable {
         }
     }
 
-    private void Enter() { if (this.locked) { Mutex.Lock(this.mutex); } }
-    private void Leave() { if (this.locked) { Mutex.Unlock(this.mutex); } }
+    private void Enter() { if (this.locked && this.mutex != 0) { Mutex.Lock(this.mutex); } }
+    private void Leave() { if (this.locked && this.mutex != 0) { Mutex.Unlock(this.mutex); } }
 
     private static long NowUs() { return Stopwatch.GetMicroseconds(); }
 
-    // ---- 配置（仅在单线程阶段调整；并发期改配置请自行加锁） ----
+    // ---- 配置 ----
 
     public void SetCapacity(int maxEntries) {
         this.Enter();
@@ -96,20 +96,49 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 固定 TTL（写入时刻起算）。
     public void SetTtl(long ttlMs) {
-        this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
-        this.sliding = false;
+        this.Enter();
+        try {
+            this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
+            this.sliding = false;
+        } finally {
+            this.Leave();
+        }
     }
 
     // 滑动 TTL（每次命中续期）。
     public void SetSlidingTtl(long ttlMs) {
-        this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
-        this.sliding = ttlMs > 0;
+        this.Enter();
+        try {
+            this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
+            this.sliding = ttlMs > 0;
+        } finally {
+            this.Leave();
+        }
     }
 
-    public int Capacity() { return this.capacity; }
-    public long TtlMs() { return this.ttlUs / 1000; }
-    public bool IsSliding() { return this.sliding; }
-    public int Count() { return this.used; }
+    public int Capacity() {
+        this.Enter();
+        try { return this.capacity; }
+        finally { this.Leave(); }
+    }
+
+    public long TtlMs() {
+        this.Enter();
+        try { return this.ttlUs / 1000; }
+        finally { this.Leave(); }
+    }
+
+    public bool IsSliding() {
+        this.Enter();
+        try { return this.sliding; }
+        finally { this.Leave(); }
+    }
+
+    public int Count() {
+        this.Enter();
+        try { return this.used; }
+        finally { this.Leave(); }
+    }
 
     // ---- 读写 ----
 
@@ -150,7 +179,7 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 获取缓存项；若未命中则通过 factory 生成并按配置的默认 TTL 回填缓存后返回。
     public TValue GetOrCreate(string key, Func<TValue> factory) {
-        return this.GetOrCreate(key, this.ttlUs / 1000, factory);
+        return this.GetOrCreate(key, this.TtlMs(), factory);
     }
 
     // 获取缓存项；若未命中则通过 factory 生成并按指定 ttlMs 回填缓存后返回。
@@ -171,7 +200,7 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 异步获取缓存项；若未命中则通过异步 factory 生成并按配置的默认 TTL 回填缓存后返回。
     public async TValue GetOrCreateAsync(string key, CacheFactoryAsync<TValue> factory) {
-        return await this.GetOrCreateAsync(key, this.ttlUs / 1000, factory);
+        return await this.GetOrCreateAsync(key, this.TtlMs(), factory);
     }
 
     // 异步获取缓存项；若未命中则通过异步 factory 生成并按指定 ttlMs 回填缓存后返回。
@@ -210,7 +239,7 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 按构造时配置的 TTL 写入。
     public void Set(string key, TValue value) {
-        this.Set(key, value, this.ttlUs / 1000);
+        this.Set(key, value, this.TtlMs());
     }
 
     // ttlMs <= 0 表示该条不过期（覆盖默认 TTL）。

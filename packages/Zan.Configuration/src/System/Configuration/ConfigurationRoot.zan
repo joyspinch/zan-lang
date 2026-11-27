@@ -64,12 +64,25 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
 
     public string Get(string key) {
         if (key == null) { return null; }
-        // 倒序遍历配置提供程序：后添加的源优先级更高
-        for (int i = this.providers.Count - 1; i >= 0; i = i - 1) {
-            string v;
-            if (this.providers[i].TryGet(key, out v)) {
-                return ConfigurationRoot.ResolvePlaceholders(v);
+        string found = null;
+        bool hasFound = false;
+        nint lk = this.syncLock;
+        if (lk != 0) { Mutex.Lock(lk); }
+        try {
+            // 倒序遍历配置提供程序：后添加的源优先级更高
+            for (int i = this.providers.Count - 1; i >= 0; i = i - 1) {
+                string v;
+                if (this.providers[i].TryGet(key, out v)) {
+                    found = v;
+                    hasFound = true;
+                    break;
+                }
             }
+        } finally {
+            if (lk != 0) { Mutex.Unlock(lk); }
+        }
+        if (hasFound) {
+            return ConfigurationRoot.ResolvePlaceholders(found);
         }
         return null;
     }
@@ -112,8 +125,14 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     // 所以全部写入后，任何一个 provider 都能读到新值。
     public void Set(string key, string value) {
         if (key == null) { return; }
-        for (int i = 0; i < this.providers.Count; i = i + 1) {
-            this.providers[i].Set(key, value);
+        nint lk = this.syncLock;
+        if (lk != 0) { Mutex.Lock(lk); }
+        try {
+            for (int i = 0; i < this.providers.Count; i = i + 1) {
+                this.providers[i].Set(key, value);
+            }
+        } finally {
+            if (lk != 0) { Mutex.Unlock(lk); }
         }
     }
 
@@ -124,34 +143,38 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     public List<string> GetKeys() {
         HashSet<string> seen = new HashSet<string>();
         List<string> result = new List<string>();
-        for (int i = 0; i < this.providers.Count; i = i + 1) {
-            List<string> pKeys = this.providers[i].GetKeys();
-            for (int j = 0; j < pKeys.Count; j = j + 1) {
-                string k = pKeys[j];
-                if (!seen.Contains(k)) {
-                    seen.Add(k);
-                    result.Add(k);
+        nint lk = this.syncLock;
+        if (lk != 0) { Mutex.Lock(lk); }
+        try {
+            for (int i = 0; i < this.providers.Count; i = i + 1) {
+                List<string> pKeys = this.providers[i].GetKeys();
+                for (int j = 0; j < pKeys.Count; j = j + 1) {
+                    string k = pKeys[j];
+                    if (!seen.Contains(k)) {
+                        seen.Add(k);
+                        result.Add(k);
+                    }
                 }
             }
+        } finally {
+            if (lk != 0) { Mutex.Unlock(lk); }
         }
         return result;
     }
 
     public void Reload() {
-        for (int i = 0; i < this.providers.Count; i = i + 1) {
-            this.providers[i].Load();
-        }
         List<Action> snapshot = new List<Action>();
         nint lk = this.syncLock;
-        if (lk != 0) {
-            Mutex.Lock(lk);
-            try {
-                for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
-                    snapshot.Add(this.reloadCallbacks[i]);
-                }
-            } finally {
-                Mutex.Unlock(lk);
+        if (lk != 0) { Mutex.Lock(lk); }
+        try {
+            for (int i = 0; i < this.providers.Count; i = i + 1) {
+                this.providers[i].Load();
             }
+            for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
+                snapshot.Add(this.reloadCallbacks[i]);
+            }
+        } finally {
+            if (lk != 0) { Mutex.Unlock(lk); }
         }
 
         for (int i = 0; i < snapshot.Count; i = i + 1) {

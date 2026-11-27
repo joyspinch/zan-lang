@@ -204,8 +204,8 @@ public class KafkaRecord {
         int lastDelta = records.Count - 1;
         bw.WriteInt32(lastDelta);
 
-        // 8. firstTimestamp 与 maxTimestamp (各 8 bytes)
-        long now = DateTime.Now().epochMs;
+        // 8. firstTimestamp 与 maxTimestamp (各 8 bytes，严格 UTC Unix 毫秒)
+        long now = DateTime.GetCurrentUnixMilliseconds();
         bw.WriteInt64(now);
         bw.WriteInt64(now);
 
@@ -235,36 +235,46 @@ public class KafkaRecord {
         return bw.ToBytes();
     }
 
-    // 从二进制字节流解析 RecordBatch 并提取所有消息
+    // 从二进制字节流解析连续的 RecordBatch 序列并提取所有消息
     public static List<KafkaRecord> ParseRecordBatch(byte[] data, int offset, int length) {
         List<KafkaRecord> list = new List<KafkaRecord>();
         if (data == null || length < 61) { return list; } // 最小 RecordBatch 头部长度 61 字节
         KafkaReader r = new KafkaReader(data, offset, length);
 
-        long baseOffset = r.ReadInt64();
-        int batchLen = r.ReadInt32();
-        if (batchLen <= 0 || r.Remaining() < batchLen) { return list; }
+        while (r.Remaining() >= 61) {
+            int batchStart = r.Position();
+            long baseOffset = r.ReadInt64();
+            int batchLen = r.ReadInt32();
+            if (batchLen < 49 || r.Remaining() < batchLen) { break; }
+            int nextBatchPos = batchStart + 12 + batchLen;
 
-        int partitionLeaderEpoch = r.ReadInt32();
-        int magic = r.ReadInt8();
-        if (magic != KafkaConstants.RECORD_BATCH_MAGIC) { return list; }
+            int partitionLeaderEpoch = r.ReadInt32();
+            int magic = r.ReadInt8();
+            if (magic != KafkaConstants.RECORD_BATCH_MAGIC) { break; }
 
-        int crc = r.ReadInt32();
-        int attr = r.ReadInt16();
-        int lastOffsetDelta = r.ReadInt32();
-        long firstTs = r.ReadInt64();
-        long maxTs = r.ReadInt64();
-        long producerId = r.ReadInt64();
-        int producerEpoch = r.ReadInt16();
-        int baseSeq = r.ReadInt32();
+            int crc = r.ReadInt32();
+            int attr = r.ReadInt16();
+            if ((attr & 7) != 0) {
+                // 暂未解压缩的压缩批次跳过整个 batch，避免把密文/压缩流当未压缩记录解析。
+                r.Seek(nextBatchPos);
+                continue;
+            }
+            int lastOffsetDelta = r.ReadInt32();
+            long firstTs = r.ReadInt64();
+            long maxTs = r.ReadInt64();
+            long producerId = r.ReadInt64();
+            int producerEpoch = r.ReadInt16();
+            int baseSeq = r.ReadInt32();
 
-        int recordsCount = r.ReadInt32();
-        if (recordsCount > 0 && recordsCount < 65536) { list.Reserve(recordsCount); }
-        for (int i = 0; i < recordsCount && r.Remaining() > 0; i = i + 1) {
-            KafkaRecord rec = KafkaRecord.DecodeRecord(r, baseOffset, firstTs);
-            if (rec != null) {
+            int recordsCount = r.ReadInt32();
+            if (recordsCount < 0) { break; }
+            if (recordsCount > 0 && recordsCount < 65536) { list.Reserve(list.Count + recordsCount); }
+            for (int i = 0; i < recordsCount && r.Position() < nextBatchPos; i = i + 1) {
+                KafkaRecord rec = KafkaRecord.DecodeRecord(r, baseOffset, firstTs);
+                if (rec == null) { break; }
                 list.Add(rec);
             }
+            r.Seek(nextBatchPos);
         }
         return list;
     }

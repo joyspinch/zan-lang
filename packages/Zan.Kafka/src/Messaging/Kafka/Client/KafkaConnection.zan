@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Interop;
 using System.Net.Sockets;
 using System.Threading;
@@ -13,8 +14,9 @@ public class KafkaConnection {
     private nint sock;
     private bool connected;
     private int nextCorrelationId;
-    // 协程安全 I/O 锁：禁止跨 await 持有 OS Mutex，防止 M:N 协程切换线程导致死锁。
-    private AsyncRwLock ioLock;
+    // 协程安全 I/O 门锁（lock(this)+Queue<AsyncGate>，零 OS Mutex 销毁竞态与泄漏）。
+    private bool ioBusy;
+    private Queue<AsyncGate> ioWaiters;
 
     public KafkaConnection(string host, int port) {
         this.host = host;
@@ -23,7 +25,8 @@ public class KafkaConnection {
         this.sock = -1;
         this.connected = false;
         this.nextCorrelationId = 1;
-        this.ioLock = new AsyncRwLock();
+        this.ioBusy = false;
+        this.ioWaiters = new Queue<AsyncGate>();
     }
 
     public static async KafkaConnection ConnectAsync(string host, int port) {
@@ -47,13 +50,41 @@ public class KafkaConnection {
         return this.connected && this.sock >= 0;
     }
 
+    private async bool AcquireIoLockAsync() {
+        while (true) {
+            AsyncGate gate = null;
+            lock (this) {
+                if (!this.connected || this.sock < 0) { return false; }
+                if (!this.ioBusy) {
+                    this.ioBusy = true;
+                    return true;
+                }
+                gate = new AsyncGate();
+                this.ioWaiters.Enqueue(gate);
+            }
+            try {
+                await gate.Wait();
+            } finally {
+                gate.Close();
+            }
+        }
+    }
+
+    private void ReleaseIoLock() {
+        AsyncGate next = null;
+        lock (this) {
+            this.ioBusy = false;
+            if (this.ioWaiters != null && this.ioWaiters.Count() > 0) {
+                next = this.ioWaiters.Dequeue();
+            }
+        }
+        if (next != null) { next.Signal(); }
+    }
+
     // 发送标准 Kafka 请求并同步等待响应
     public async KafkaReader SendRequestAsync(int apiKey, int apiVersion, byte[] bodyPayload) {
         if (!this.connected || this.sock < 0) { return null; }
-        AsyncRwLock lk = this.ioLock;
-        if (lk == null) { return null; }
-
-        await lk.EnterWrite();
+        if (!await this.AcquireIoLockAsync()) { return null; }
         try {
             if (!this.connected || this.sock < 0) { return null; }
             int cid = this.nextCorrelationId;
@@ -116,7 +147,7 @@ public class KafkaConnection {
 
             return r;
         } finally {
-            lk.ExitWrite();
+            this.ReleaseIoLock();
         }
     }
 
@@ -124,17 +155,15 @@ public class KafkaConnection {
         if (outBuf == null || count <= 0) { return 0; }
         int received = 0;
         while (received < count && this.connected) {
-            int n = await Socket.RecvPtrAsync(this.sock, (nint)outBuf + (nint)received, count - received);
+            nint s = this.sock;
+            if (s < 0) { return -1; }
+            int n = await Socket.RecvPtrAsync(s, (nint)outBuf + (nint)received, count - received);
             if (n <= 0) { return -1; }
             received = received + n;
         }
         return received;
     }
 
-    // 断开套接字，但不动 ioLock。请求进行中的失败分支在持锁状态下走到
-    // 这里——此前直接调 Close 会把 ioLock 销毁并置 null，随后 finally 的
-    // ReleaseMutex 打在空引用/已销毁句柄上。锁的生命周期跟实例走，
-    // 只有 Close/Dispose 销毁。
     void Shutdown() {
         this.connected = false;
         if (this.sock >= 0) {
@@ -144,10 +173,20 @@ public class KafkaConnection {
     }
 
     public void Close() {
-        this.Shutdown();
-        if (this.ioLock != null) {
-            this.ioLock.Close();
-            this.ioLock = null;
+        List<AsyncGate> toWake = null;
+        lock (this) {
+            this.Shutdown();
+            if (this.ioWaiters != null && this.ioWaiters.Count() > 0) {
+                toWake = new List<AsyncGate>();
+                while (this.ioWaiters.Count() > 0) {
+                    toWake.Add(this.ioWaiters.Dequeue());
+                }
+            }
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.Count; i = i + 1) {
+                toWake[i].Signal();
+            }
         }
     }
 

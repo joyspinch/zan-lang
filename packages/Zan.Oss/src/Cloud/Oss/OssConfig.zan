@@ -64,23 +64,43 @@ public class OssConfig {
         string hostPort = slash >= 0 ? url.Substring(0, slash) : url;
         if (hostPort.Length == 0) { return false; }
         int port = tls ? 443 : 80;
-        int colon = -1;
-        for (int i = hostPort.Length - 1; i >= 0; i = i - 1) {
-            int c = hostPort[i] & 255;
-            if (c == 58) { colon = i; break; }
-            if (c < 48 || c > 57) { break; }
-        }
-        if (colon > 0 && colon < hostPort.Length - 1) {
-            int p = 0;
-            bool digits = true;
-            for (int i = colon + 1; i < hostPort.Length; i = i + 1) {
-                int c = hostPort[i] & 255;
-                if (c < 48 || c > 57) { digits = false; break; }
-                p = p * 10 + (c - 48);
-            }
-            if (digits && p > 0 && p < 65536) {
+        if (hostPort.StartsWith("[")) {
+            int close = hostPort.IndexOf("]");
+            if (close <= 1) { return false; }
+            string ipHost = hostPort.Substring(1, close - 1);
+            if (close + 1 < hostPort.Length) {
+                if ((hostPort[close + 1] & 255) != 58 || close + 2 >= hostPort.Length) { return false; }
+                int p = 0;
+                for (int i = close + 2; i < hostPort.Length; i = i + 1) {
+                    int c = hostPort[i] & 255;
+                    if (c < 48 || c > 57) { return false; }
+                    p = p * 10 + (c - 48);
+                    if (p >= 65536) { return false; }
+                }
+                if (p <= 0) { return false; }
                 port = p;
-                hostPort = hostPort.Substring(0, colon);
+            }
+            hostPort = ipHost;
+        } else {
+            // 仅在单冒号时剥离 :port，避免把无括号 IPv6 末段误拆为端口。
+            int firstColon = hostPort.IndexOf(":");
+            int lastColon = -1;
+            for (int i = hostPort.Length - 1; i >= 0; i = i - 1) {
+                if ((hostPort[i] & 255) == 58) { lastColon = i; break; }
+            }
+            if (firstColon > 0 && firstColon == lastColon && lastColon < hostPort.Length - 1) {
+                int p = 0;
+                bool digits = true;
+                for (int i = lastColon + 1; i < hostPort.Length; i = i + 1) {
+                    int c = hostPort[i] & 255;
+                    if (c < 48 || c > 57) { digits = false; break; }
+                    p = p * 10 + (c - 48);
+                    if (p >= 65536) { digits = false; break; }
+                }
+                if (digits && p > 0 && p < 65536) {
+                    port = p;
+                    hostPort = hostPort.Substring(0, lastColon);
+                }
             }
         }
         if (hostPort.Length == 0) { return false; }
@@ -118,13 +138,23 @@ public class OssConfig {
             + s.Substring(at + token.Length);
     }
 
-    // 生成对象键：basePath 前缀 + 相对键（去除两侧多余斜杠）。
+    // 生成对象键：basePath 前缀 + 相对键（单次扫描去除两侧多余斜杠）。
     public string ObjectKey(string key) {
-        string prefix = this.basePath == null ? "" : this.basePath.Trim();
-        while (prefix.StartsWith("/")) { prefix = prefix.Substring(1); }
-        while (prefix.EndsWith("/")) { prefix = prefix.Substring(0, prefix.Length - 1); }
-        string k = key == null ? "" : key;
-        while (k.StartsWith("/")) { k = k.Substring(1); }
+        string rawPrefix = this.basePath == null ? "" : this.basePath.Trim();
+        int pStart = 0;
+        int pEnd = rawPrefix.Length;
+        while (pStart < pEnd && (rawPrefix[pStart] & 255) == 47) { pStart = pStart + 1; }
+        while (pEnd > pStart && (rawPrefix[pEnd - 1] & 255) == 47) { pEnd = pEnd - 1; }
+        string prefix = (pStart == 0 && pEnd == rawPrefix.Length)
+            ? rawPrefix
+            : (pEnd > pStart ? rawPrefix.Substring(pStart, pEnd - pStart) : "");
+
+        string rawKey = key == null ? "" : key;
+        int kStart = 0;
+        int kLen = rawKey.Length;
+        while (kStart < kLen && (rawKey[kStart] & 255) == 47) { kStart = kStart + 1; }
+        string k = kStart == 0 ? rawKey : (kStart < kLen ? rawKey.Substring(kStart, kLen - kStart) : "");
+
         if (prefix.Length == 0) { return k; }
         if (k.Length == 0) { return prefix; }
         return prefix + "/" + k;

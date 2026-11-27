@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace Cloud.Oss;
 
@@ -24,10 +26,73 @@ public class TencentCosSigner {
         return buf.ToStr(0, n);
     }
 
+    private static int CompareAscii(string a, string b) {
+        int la = a == null ? 0 : a.Length;
+        int lb = b == null ? 0 : b.Length;
+        int min = la < lb ? la : lb;
+        for (int i = 0; i < min; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca != cb) { return ca < cb ? -1 : 1; }
+        }
+        return la < lb ? -1 : (la > lb ? 1 : 0);
+    }
+
     /// <summary>HttpString = 小写方法 + "\n/" + 键 + "\n" + 参数 + "\n" + 头 + "\n"。
     /// 本实现用于无查询参数、无签名头的对象级请求。</summary>
     public static string HttpString(string verb, string key) {
         return TencentCosSigner.AsciiLower(verb) + "\n/" + (key == null ? "" : key) + "\n\n\n";
+    }
+
+    /// <summary>带查询参数的 HttpString（按 COS 规范对参数名小写并按字典序排列）。</summary>
+    public static string HttpStringWithQuery(string verb, string key, List<string> queryPairs,
+                                             out string urlParamList) {
+        urlParamList = "";
+        if (queryPairs == null || queryPairs.Count == 0) {
+            return TencentCosSigner.HttpString(verb, key);
+        }
+        List<string> keys = new List<string>();
+        List<string> vals = new List<string>();
+        for (int i = 0; i < queryPairs.Count; i = i + 1) {
+            string p = queryPairs[i];
+            if (p == null || p.Length == 0) { continue; }
+            int eq = p.IndexOf("=");
+            string rawK = eq < 0 ? p : p.Substring(0, eq);
+            string rawV = eq < 0 ? "" : p.Substring(eq + 1);
+            string encK = TencentCosSigner.AsciiLower(OssSigner.Rfc3986(rawK));
+            string encV = OssSigner.Rfc3986(rawV);
+            keys.Add(encK);
+            vals.Add(encV);
+        }
+        int n = keys.Count;
+        // 插入排序按编码后小写参数名升序排列
+        for (int i = 1; i < n; i = i + 1) {
+            string ck = keys[i];
+            string cv = vals[i];
+            int j = i - 1;
+            while (j >= 0 && TencentCosSigner.CompareAscii(keys[j], ck) > 0) {
+                keys[j + 1] = keys[j];
+                vals[j + 1] = vals[j];
+                j = j - 1;
+            }
+            keys[j + 1] = ck;
+            vals[j + 1] = cv;
+        }
+        StringBuilder ksb = new StringBuilder();
+        StringBuilder psb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) {
+                ksb.Append(";");
+                psb.Append("&");
+            }
+            ksb.Append(keys[i]);
+            psb.Append(keys[i]);
+            psb.Append("=");
+            psb.Append(vals[i]);
+        }
+        urlParamList = ksb.ToString();
+        return TencentCosSigner.AsciiLower(verb) + "\n/" + (key == null ? "" : key)
+            + "\n" + psb.ToString() + "\n\n";
     }
 
     /// <summary>待签串：sha1\nkeyTime\nHex(SHA1(HttpString))\n。</summary>
@@ -50,11 +115,18 @@ public class TencentCosSigner {
     /// <summary>一步算出 Authorization 头值。keyTime 形如 "起始;结束"（秒级时间戳）。</summary>
     public static string Authorization(string accessKey, string secretKey, string verb,
                                        string key, string keyTime) {
-        string httpString = TencentCosSigner.HttpString(verb, key);
+        return TencentCosSigner.AuthorizationWithQuery(accessKey, secretKey, verb, key, null, keyTime);
+    }
+
+    /// <summary>带查询参数的 Authorization 头值（用于分块上传等带 query 请求）。</summary>
+    public static string AuthorizationWithQuery(string accessKey, string secretKey, string verb,
+                                                string key, List<string> queryPairs, string keyTime) {
+        string urlParamList = "";
+        string httpString = TencentCosSigner.HttpStringWithQuery(verb, key, queryPairs, out urlParamList);
         string sig = TencentCosSigner.Sign(secretKey, keyTime, httpString);
         return "q-sign-algorithm=sha1&q-ak=" + (accessKey == null ? "" : accessKey)
             + "&q-sign-time=" + keyTime + "&q-key-time=" + keyTime
-            + "&q-header-list=&q-url-param-list=&q-signature=" + sig;
+            + "&q-header-list=&q-url-param-list=" + urlParamList + "&q-signature=" + sig;
     }
 
     /// <summary>签名有效期窗口（秒）：返回 "起始;结束"。</summary>
