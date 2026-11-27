@@ -132,7 +132,7 @@ public class Chunking {
 
         // 1) 切成小段（可能很小，比如每句一段）。
         List<int[]> pieces = new List<int[]>();
-        Chunking.CutRecursive(text, 0, text.Length, maxChars, pieces);
+        Chunking.CutRecursive(text, 0, text.Length, maxChars, 0, pieces);
 
         // 2) 合并相邻小段（合并后不超 maxChars 才合），得到"块边界"。
         List<int> blockStarts = new List<int>();
@@ -179,35 +179,40 @@ public class Chunking {
     }
 
     // 递归切分：把 [lo, hi) 切成不超过 maxChars 的若干段。
+    // sepIndex 限制子段只向更细粒度分隔符降级，且右半段迭代推进消除尾递归栈增长。
     private static void CutRecursive(string text, int lo, int hi, int maxChars,
-    List<int[]> pieces) {
-        int len = hi - lo;
-        if (len <= 0) { return; }
-        if (len <= maxChars) {
-            pieces.Add(new int[] { lo, hi });
-            return;
-        }
-        // 找最优先的分隔符；找到就在那里切，否则按字符边界硬切。
+    int sepIndex, List<int[]> pieces) {
         string[] seps = Chunking.GetSeps();
-        for (int s = 0; s < seps.Length; s = s + 1) {
-            string sep = seps[s];
-            int cut = text.IndexOf(sep, lo);
-            if (cut < 0 || cut >= hi) { continue; }
-            // 分隔符归前一段（保标点）。
-            int segEnd = cut + sep.Length;
-            if (segEnd > hi) { segEnd = hi; }
-            if (segEnd - lo > 0) {
-                Chunking.CutRecursive(text, lo, segEnd, maxChars, pieces);
+        while (hi - lo > maxChars) {
+            bool splitDone = false;
+            for (int s = sepIndex; s < seps.Length; s = s + 1) {
+                string sep = seps[s];
+                int cut = text.IndexOf(sep, lo);
+                if (cut < 0 || cut >= hi) { continue; }
+                // 分隔符归前一段（保标点）；若分隔符恰在末尾无法真切分，则降级试更细分隔符。
+                int segEnd = cut + sep.Length;
+                if (segEnd >= hi) { continue; }
+                if (segEnd > lo) {
+                    Chunking.CutRecursive(text, lo, segEnd, maxChars, s + 1, pieces);
+                    lo = segEnd;
+                    splitDone = true;
+                    break;
+                }
             }
-            Chunking.CutRecursive(text, segEnd, hi, maxChars, pieces);
-            return;
+            if (splitDone) { continue; }
+            // 没有任何分隔符可切：按 maxChars 硬切（切点落在字符边界上，且严格前进不越 hi）。
+            int at = lo + maxChars;
+            if (at > hi) { at = hi; }
+            at = Chunking.ForwardToCharBoundary(text, at);
+            if (at > hi) { at = hi; }
+            if (at <= lo) { at = lo + Chunking.AdvanceOne(text, lo, new int[1]); }
+            if (at > hi) { at = hi; }
+            pieces.Add(new int[] { lo, at });
+            lo = at;
         }
-        // 没有任何分隔符：按 maxChars 硬切（切点落在字符边界上）。
-        int at = lo + maxChars;
-        at = Chunking.ForwardToCharBoundary(text, at);
-        if (at <= lo) { at = Chunking.AdvanceOne(text, lo, new int[1]); }
-        pieces.Add(new int[] { lo, at });
-        Chunking.CutRecursive(text, at, hi, maxChars, pieces);
+        if (hi > lo) {
+            pieces.Add(new int[] { lo, hi });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -348,11 +353,12 @@ public class Chunking {
         int index = 0;
         int lo = 0;
         while (lo < text.Length) {
-            // 找下一个空行（\n\n 或 \r\n\r\n）。
+            // 找下一个空行（\n\n 或 \r\n\r\n，取先出现者）。
             int gap = text.IndexOf("\n\n", lo);
             int gapLen = 2;
-            if (gap < 0) {
-                gap = text.IndexOf("\r\n\r\n", lo);
+            int gapCrlf = text.IndexOf("\r\n\r\n", lo);
+            if (gapCrlf >= 0 && (gap < 0 || gapCrlf < gap)) {
+                gap = gapCrlf;
                 gapLen = 4;
             }
             int hi = gap < 0 ? text.Length : gap;

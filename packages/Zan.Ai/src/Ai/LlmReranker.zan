@@ -89,7 +89,7 @@ public class LlmReranker : IReranker {
                 this.lastError = "重排调用失败：" + this.client.lastError;
                 return null;
             }
-            List<RerankHit> part = LlmReranker.ParseReply(reply, start);
+            List<RerankHit> part = LlmReranker.ParseReply(reply, start, take);
             for (int i = 0; i < part.Count; i = i + 1) { outp.Add(part[i]); }
             start = start + take;
         }
@@ -128,12 +128,16 @@ public class LlmReranker : IReranker {
         return sb.ToString();
     }
 
-    // 解析模型的回复（容错：认不出的行跳过）。
+    // 解析模型的回复（容错：认不出的行与越界编号跳过）。
     //
-    // baseIndex 是本批在原始候选数组里的起始下标（批内编号从 1 起）。
+    // baseIndex 是本批在原始候选数组里的起始下标（批内编号从 1 起），batchCount 为本批条数上限。
     static List<RerankHit> ParseReply(string reply, int baseIndex) {
+        return LlmReranker.ParseReply(reply, baseIndex, 2147483647);
+    }
+
+    static List<RerankHit> ParseReply(string reply, int baseIndex, int batchCount) {
         List<RerankHit> outp = new List<RerankHit>();
-        if (reply == null) { return outp; }
+        if (reply == null || batchCount <= 0) { return outp; }
         List<string> lines = reply.Split("\n");
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i].Trim();
@@ -145,31 +149,47 @@ public class LlmReranker : IReranker {
                 if (c == 32 || c == 9 || c == 58 || c == 44) { sp = k; break; }
             }
             if (sp <= 0) { continue; }
-            int idx = 0;
+            long idxL = 0L;
             bool ok = true;
             for (int k = 0; k < sp; k = k + 1) {
                 int c = line[k] & 255;
                 if (c < 48 || c > 57) { ok = false; break; }
-                idx = idx * 10 + (c - 48);
+                idxL = idxL * 10L + (long)(c - 48);
+                if (idxL > (long)batchCount) { ok = false; break; }
             }
-            if (!ok || idx < 1) { continue; }
-            // 分数：编号之后第一个数字（含小数点）。
+            if (!ok || idxL < 1L) { continue; }
+            int idx = (int)idxL;
+            // 分数：编号之后第一个合法实数（可选负号、至多一个小数点、至少一位数字）。
             double score = 0.0;
             bool got = false;
             int k = sp;
             while (k < line.Length) {
                 int c = line[k] & 255;
-                if (c == 46 || (c >= 48 && c <= 57)) {
+                if (c == 45 || c == 46 || (c >= 48 && c <= 57)) {
                     int numStart = k;
+                    if (c == 45) { k = k + 1; }
+                    int digits = 0;
+                    int dots = 0;
                     while (k < line.Length) {
                         int d = line[k] & 255;
-                        if (d == 46 || (d >= 48 && d <= 57)) {
+                        if (d >= 48 && d <= 57) {
+                            digits = digits + 1;
                             k = k + 1;
-                        } else { break; }
+                        } else if (d == 46 && dots == 0) {
+                            dots = 1;
+                            k = k + 1;
+                        } else {
+                            break;
+                        }
                     }
-                    score = line.Substring(numStart, k - numStart).ToDouble();
-                    got = true;
-                    break;
+                    if (digits > 0) {
+                        score = line.Substring(numStart, k - numStart).ToDouble();
+                        if (score == score) {
+                            got = true;
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 k = k + 1;
             }

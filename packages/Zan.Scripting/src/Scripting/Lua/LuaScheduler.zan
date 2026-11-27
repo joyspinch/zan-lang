@@ -27,7 +27,7 @@ public static class LuaScheduler {
 
     // 初始化调度器并向 Lua 全局环境注册 Async 模块 (Async.Sleep, Async.Yield)。幂等。
     public static void Initialize() {
-        if (LuaScheduler.initialized) { return; }
+        if (LuaScheduler.initialized && Lua.IsInitialized()) { return; }
         Lua.EnsureReady();
 
         // 注册 Async 回调原语
@@ -46,6 +46,14 @@ public static class LuaScheduler {
         LuaScheduler.initialized = true;
     }
 
+    // 随 Lua.Finalize 重置调度器，避免持有失效状态机上的悬空协程。
+    public static void Reset() {
+        LuaScheduler.tasks.Clear();
+        LuaScheduler.s_swapTasks.Clear();
+        LuaScheduler.currentRunningTask = null;
+        LuaScheduler.initialized = false;
+    }
+
     // 启动一段 Lua 代码作为非阻塞协程运行。
     // 如果代码中有 Async.Sleep 或协程出让，它将自动进入调度器挂起并按时唤醒，绝不卡死主循环。
     public static LuaCoroutine Start(string code) {
@@ -53,10 +61,15 @@ public static class LuaScheduler {
         LuaCoroutine co = LuaCoroutine.Create(code);
         ScheduledTask task = new ScheduledTask(co, 0.0, false);
 
-        // 首次驱动执行
+        // 首次驱动执行（保存/恢复外层 currentRunningTask 以支持嵌套重入与异常安全）
+        ScheduledTask prev = LuaScheduler.currentRunningTask;
+        int rc = Lua.LUA_OK;
         LuaScheduler.currentRunningTask = task;
-        int rc = co.Resume();
-        LuaScheduler.currentRunningTask = null;
+        try {
+            rc = co.Resume();
+        } finally {
+            LuaScheduler.currentRunningTask = prev;
+        }
 
         if (rc == Lua.LUA_YIELD) {
             // 挂起出让：加入任务列表在后续每帧 Tick 中按时恢复
@@ -71,9 +84,14 @@ public static class LuaScheduler {
         LuaCoroutine co = LuaCoroutine.CreateFromFunction(funcName);
         ScheduledTask task = new ScheduledTask(co, 0.0, false);
 
+        ScheduledTask prev = LuaScheduler.currentRunningTask;
+        int rc = Lua.LUA_OK;
         LuaScheduler.currentRunningTask = task;
-        int rc = co.Resume(args);
-        LuaScheduler.currentRunningTask = null;
+        try {
+            rc = co.Resume(args);
+        } finally {
+            LuaScheduler.currentRunningTask = prev;
+        }
 
         if (rc == Lua.LUA_YIELD) {
             LuaScheduler.tasks.Add(task);
@@ -85,7 +103,7 @@ public static class LuaScheduler {
     // 完全非阻塞：只检查并唤醒到期任务，顺带平摊微量 GC 预算。
     // 返回值：当前仍存活并在等待的协程任务数量。
     public static int Tick(double deltaSeconds) {
-        if (!LuaScheduler.initialized || LuaScheduler.tasks.Count == 0) {
+        if (!LuaScheduler.initialized || !Lua.IsInitialized() || LuaScheduler.tasks.Count == 0) {
             return 0;
         }
 
@@ -102,9 +120,14 @@ public static class LuaScheduler {
 
             // 检查唤醒条件：已到达等待时间
             if (LuaScheduler.currentTime >= task.WakeTime) {
+                ScheduledTask prev = LuaScheduler.currentRunningTask;
+                int rc = Lua.LUA_OK;
                 LuaScheduler.currentRunningTask = task;
-                int rc = task.Coroutine.Resume();
-                LuaScheduler.currentRunningTask = null;
+                try {
+                    rc = task.Coroutine.Resume();
+                } finally {
+                    LuaScheduler.currentRunningTask = prev;
+                }
 
                 if (rc == Lua.LUA_YIELD) {
                     activeTasks.Add(task);

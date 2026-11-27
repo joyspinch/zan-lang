@@ -63,6 +63,7 @@ public partial class RegexProgram {
     nint pbuf;
     int plen;
     int ppos;
+    int parseDepth;
 
     // 编译期冻结的扁平字节码、128 位 ASCII 字符类位图与扫描预过滤元数据。
     int[] opArr;
@@ -104,6 +105,7 @@ public partial class RegexProgram {
         this.pbuf = 0;
         this.plen = 0;
         this.ppos = 0;
+        this.parseDepth = 0;
         this.opArr = null;
         this.axArr = null;
         this.ayArr = null;
@@ -126,17 +128,22 @@ public partial class RegexProgram {
         p.ignoreCase = ignoreCase;
         p.plen = pattern.Length;
         p.pbuf = NativeMemory.Alloc(p.plen + 1);
-        if (p.plen > 0) { NativeMemory.PutString(p.pbuf, 0, pattern, p.plen); }
-        p.ParseInlineFlags();
-        p.Emit(RegexProgram.OpSave(), 0, 0, 0);
-        p.ParseAlt();
-        if (p.error.Length == 0 && p.ppos < p.plen) {
-            p.error = "unexpected ')' at " + p.ppos;
+        try {
+            if (p.plen > 0) { NativeMemory.PutString(p.pbuf, 0, pattern, p.plen); }
+            p.ParseInlineFlags();
+            p.Emit(RegexProgram.OpSave(), 0, 0, 0);
+            p.ParseAlt();
+            if (p.error.Length == 0 && p.ppos < p.plen) {
+                p.error = "unexpected ')' at " + p.ppos;
+            }
+            p.Emit(RegexProgram.OpSave(), 1, 0, 0);
+            p.Emit(RegexProgram.OpMatch(), 0, 0, 0);
+        } finally {
+            if (p.pbuf != 0) {
+                NativeMemory.Free(p.pbuf);
+                p.pbuf = 0;
+            }
         }
-        p.Emit(RegexProgram.OpSave(), 1, 0, 0);
-        p.Emit(RegexProgram.OpMatch(), 0, 0, 0);
-        NativeMemory.Free(p.pbuf);
-        p.pbuf = 0;
         if (p.error.Length == 0) {
             p.Freeze();
         }
@@ -406,11 +413,12 @@ public partial class RegexProgram {
         return names;
     }
 
-    // 返回 `(cp << 3) | byteLen`，到达末尾返回 -1；非法 UTF-8 回退为 U+FFFD/1 字节以保证前进。
+    // 返回 `(cp << 3) | byteLen`，到达末尾返回 -1；非法 UTF-8（含过长编码、代理项、超 U+10FFFF）回退为 U+FFFD/1 字节以保证前进。
     public static int DecodeAt(nint buf, int len, int sp) {
         if (sp < 0 || sp >= len) { return -1; }
         int b0 = new Span<byte>(buf + sp, 1)[0];
         if (b0 < 128) { return (b0 * 8) | 1; }
+        if (b0 < 194 || b0 > 244) { return (65533 * 8) | 1; }
         int need = 0;
         int cp = 0;
         if (b0 >= 240) {
@@ -419,17 +427,21 @@ public partial class RegexProgram {
         } else if (b0 >= 224) {
             need = 2;
             cp = b0 - 224;
-        } else if (b0 >= 192) {
+        } else {
             need = 1;
             cp = b0 - 192;
-        } else {
-            return (65533 * 8) | 1;
         }
         for (int k = 1; k <= need; k = k + 1) {
             if (sp + k >= len) { return (65533 * 8) | 1; }
             int b = new Span<byte>(buf + sp + k, 1)[0];
             if (b < 128 || b >= 192) { return (65533 * 8) | 1; }
             cp = cp * 64 + (b - 128);
+        }
+        if (need == 2 && (cp < 2048 || (cp >= 55296 && cp <= 57343))) {
+            return (65533 * 8) | 1;
+        }
+        if (need == 3 && (cp < 65536 || cp > 1114111)) {
+            return (65533 * 8) | 1;
         }
         return (cp * 8) | (need + 1);
     }
@@ -439,11 +451,12 @@ public partial class RegexProgram {
         return packed < 0 ? 1 : packed & 7;
     }
 
-    // 直接从 string 解码 UTF-8 码点（零 NativeMemory 拷贝、零 Span 包装）。
+    // 直接从 string 解码 UTF-8 码点（零 NativeMemory 拷贝、零 Span 包装；拒绝过长/代理项/超 U+10FFFF）。
     public static int DecodeStrAt(string s, int len, int sp) {
         if (sp < 0 || sp >= len) { return -1; }
         int b0 = s[sp] & 255;
         if (b0 < 128) { return (b0 << 3) | 1; }
+        if (b0 < 194 || b0 > 244) { return (65533 << 3) | 1; }
         int need = 0;
         int cp = 0;
         if (b0 >= 240) {
@@ -452,17 +465,21 @@ public partial class RegexProgram {
         } else if (b0 >= 224) {
             need = 2;
             cp = b0 - 224;
-        } else if (b0 >= 192) {
+        } else {
             need = 1;
             cp = b0 - 192;
-        } else {
-            return (65533 << 3) | 1;
         }
         for (int k = 1; k <= need; k = k + 1) {
             if (sp + k >= len) { return (65533 << 3) | 1; }
             int b = s[sp + k] & 255;
             if (b < 128 || b >= 192) { return (65533 << 3) | 1; }
             cp = (cp << 6) | (b - 128);
+        }
+        if (need == 2 && (cp < 2048 || (cp >= 55296 && cp <= 57343))) {
+            return (65533 << 3) | 1;
+        }
+        if (need == 3 && (cp < 65536 || cp > 1114111)) {
+            return (65533 << 3) | 1;
         }
         return (cp << 3) | (need + 1);
     }

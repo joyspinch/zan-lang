@@ -214,9 +214,13 @@ public class XmlParser {
         return NativeMemory.GetString(this.basePtr, start, hit - start);
     }
 
-    // 读取 '<!--...-->' 注释（正文原样保留）。
+    // 读取 '<!--...-->' 注释（XML 1.0 §2.5：注释内禁止出现 '--' 且不得以 '-' 紧接 '-->' 结尾）。
     private XmlNode ReadComment() {
-        return XmlNode.NewComment(ReadUntil(4, "-->", "unterminated comment"));
+        string body = ReadUntil(4, "-->", "unterminated comment");
+        if (body.IndexOf("--") >= 0 || (body.Length > 0 && (body[body.Length - 1] & 255) == 45)) {
+            Err("invalid '--' inside XML comment");
+        }
+        return XmlNode.NewComment(body);
     }
 
     // 读取 '<![CDATA[...]]>' 段（在首个 ']]>' 截断）。
@@ -426,7 +430,7 @@ public class XmlParser {
                 if (cp > 1114111) { Err("character reference out of range"); }
                 k = k + 1;
             }
-            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
+            if (!XmlParser.IsValidXmlChar(cp)) {
                 Err("character reference cannot be represented");
             }
             sb.Append(Encoding.Utf8FromCodePoint(cp));
@@ -434,6 +438,14 @@ public class XmlParser {
         }
         Err("unknown entity &" + NativeMemory.GetString(rp, entStart, entLen) + ";");
         return semi + 1;
+    }
+
+    // XML 1.0 §2.2 合法字符范围：#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]。
+    private static bool IsValidXmlChar(int cp) {
+        return cp == 9 || cp == 10 || cp == 13
+            || (cp >= 32 && cp <= 55295)
+            || (cp >= 57344 && cp <= 65533)
+            || (cp >= 65536 && cp <= 1114111);
     }
 
     // 实体解码与 CR 归一（\r\n / \r → \n）；SIMD 双字节扫描 + StringView 零临时字符串冲刷。
@@ -513,8 +525,8 @@ public class XmlParser {
                 if (cp > 1114111) { Err("character reference out of range"); }
                 k = k + 1;
             }
-            // U+0000 装不进以 NUL 结尾的 Zan 字符串；代理区不成码点。
-            if (cp == 0 || (cp >= 55296 && cp <= 57343)) {
+            // XML 1.0 §2.2 字符集约束（含禁 NUL、非法控制字符、代理区与 U+FFFE/U+FFFF）。
+            if (!XmlParser.IsValidXmlChar(cp)) {
                 Err("character reference cannot be represented");
             }
             sb.Append(Encoding.Utf8FromCodePoint(cp));

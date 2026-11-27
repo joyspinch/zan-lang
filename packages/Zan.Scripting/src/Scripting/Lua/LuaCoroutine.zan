@@ -28,19 +28,20 @@ public class LuaCoroutine : IDisposable {
         this.isDead = true;
     }
 
-    // 从一段 Lua 代码创建并准备一个协程（将代码编译为 chunk 压入协程栈顶）。
+    // 从一段 Lua 代码创建并准备一个协程（将代码以文本模式编译为 chunk 压入协程栈顶，拒绝预编译字节码）。
     public static LuaCoroutine Create(string code) {
         Lua.EnsureReady();
         long slot = 0;
         nint co = Lua.NewThread(out slot);
-        LuaLoadFn load = (LuaLoadFn)Lua.addr_loadstring;
-        int rc = load(co, code);
+        int rc = Lua.LoadTextInto(co, code, "=(coroutine)");
         if (rc != 0) {
             LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
             string err = "(load error)";
-            if (ty(co, 0 - 1) == Lua.TSTRING) {
+            int t = ty(co, 0 - 1);
+            if (t == Lua.TSTRING || t == Lua.TNUMBER) {
                 LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
-                err = f(co, 0 - 1, 0);
+                string s = f(co, 0 - 1, 0);
+                if (s != null) { err = s; }
             }
             Lua.DropSlot(slot);
             throw new InvalidOperationException("Lua 协程代码编译失败: " + err);
@@ -79,11 +80,12 @@ public class LuaCoroutine : IDisposable {
     // Lua.LUA_YIELD (1): 主动挂起出让，等待下一次唤醒。
     // 其它: 执行报错（可通过 Error 属性读取详细堆栈）。
     public int Resume(params LuaValue[] args) {
-        if (this.isDead || this.threadState == 0) {
+        if (this.isDead || this.threadState == 0 || !Lua.IsInitialized()) {
             return Lua.LUA_OK;
         }
         this.isStarted = true;
-        // 把传入参数压入协程栈
+        // 把传入参数压入协程栈前先确保栈空间充足
+        Lua.CheckStack(this.threadState, args.Length + 4);
         for (int i = 0; i < args.Length; i = i + 1) {
             args[i].PushTo(this.threadState);
         }
@@ -94,10 +96,22 @@ public class LuaCoroutine : IDisposable {
             this.Dispose();
             return Lua.LUA_OK;
         } else if (rc == Lua.LUA_YIELD) {
+            // 清理协程挂起时留在协程栈顶的返回值，防止反复 yield 造成协程栈无限增长
+            if (nresults > 0 && Lua.addr_settop != 0) {
+                LuaVoidIntFn st = (LuaVoidIntFn)Lua.addr_settop;
+                st(this.threadState, 0);
+            }
             return Lua.LUA_YIELD;
         } else {
-            LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
-            this.error = f(this.threadState, 0 - 1, 0);
+            LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+            int t = ty(this.threadState, 0 - 1);
+            if (t == Lua.TSTRING || t == Lua.TNUMBER) {
+                LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+                string s = f(this.threadState, 0 - 1, 0);
+                this.error = s != null ? s : "(runtime error)";
+            } else {
+                this.error = "(runtime error)";
+            }
             this.Dispose();
             return rc;
         }

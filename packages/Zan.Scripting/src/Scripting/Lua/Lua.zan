@@ -52,6 +52,7 @@ public class Lua {
     public static nint addr_status;
     public static nint addr_gc;
     public static nint addr_xmove;
+    public static nint addr_checkstack;
     private static nint resumeResBuf;
 
     public static int LUA_OK = 0;
@@ -122,6 +123,7 @@ public class Lua {
                 NativeMemory.Free(Lua.resumeResBuf);
                 Lua.resumeResBuf = 0;
             }
+            LuaScheduler.Reset();
             Lua.FreeModule();
         }
     }
@@ -147,7 +149,7 @@ public class Lua {
     public static void Exec(string code) {
         Lua.EnsureReady();
         int mark = Lua.Top();
-        Lua.Load(code);
+        Lua.LoadAt(Lua.state, code, mark);
         Lua.Protected(0, 0, mark, code);
         Lua.SetTop(mark);
     }
@@ -163,7 +165,7 @@ public class Lua {
     public static LuaValue Eval(string code) {
         Lua.EnsureReady();
         int mark = Lua.Top();
-        Lua.Load("return " + code);
+        Lua.LoadAt(Lua.state, "return " + code, mark);
         Lua.Protected(0, 1, mark, code);
         LuaValue v = LuaValue.CaptureTop();
         Lua.SetTop(mark);
@@ -192,6 +194,7 @@ public class Lua {
     public static LuaValue Call(string name, params LuaValue[] args) {
         Lua.EnsureReady();
         int mark = Lua.Top();
+        Lua.CheckStack(Lua.state, args.Length + 4);
         Lua.PushPath(name, mark);
         for (int i = 0; i < args.Length; i = i + 1) { args[i].Push(); }
         Lua.Protected(args.Length, 1, mark, name);
@@ -234,20 +237,28 @@ public class Lua {
         nresults = 0;
         if (Lua.addr_resume == 0 || co == 0) { return Lua.LUA_ERRRUN; }
         LuaResumeFn f = (LuaResumeFn)Lua.addr_resume;
-        nint resBuf = Lua.resumeResBuf;
-        Lua.resumeResBuf = 0;
+        nint resBuf = 0;
+        lock (Lua.stateLock) {
+            resBuf = Lua.resumeResBuf;
+            Lua.resumeResBuf = 0;
+        }
         if (resBuf == 0) { resBuf = NativeMemory.Alloc(4); }
+        NativeMemory.Fill(resBuf, 0, 4);
         try {
             int rc = f(co, Lua.state, nargs, resBuf);
             Span<byte> s = new Span<byte>(resBuf, 4);
             nresults = (int)s[0] | ((int)s[1] << 8) | ((int)s[2] << 16) | ((int)s[3] << 24);
             return rc;
         } finally {
-            if (Lua.resumeResBuf == 0) {
-                Lua.resumeResBuf = resBuf;
-            } else {
-                NativeMemory.Free(resBuf);
+            bool freed = false;
+            lock (Lua.stateLock) {
+                if (Lua.resumeResBuf == 0 && Lua.initialized) {
+                    Lua.resumeResBuf = resBuf;
+                } else {
+                    freed = true;
+                }
             }
+            if (freed) { NativeMemory.Free(resBuf); }
         }
     }
 
@@ -276,6 +287,7 @@ public class Lua {
         try {
             Lua.EnsureReady();
             int mark = Lua.Top();
+            Lua.CheckStack(Lua.state, args.Length + 4);
             Lua.PushPath(name, mark);
             for (int i = 0; i < args.Length; i = i + 1) { args[i].Push(); }
             LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
@@ -529,9 +541,39 @@ public class Lua {
         f(Lua.state, n);
     }
 
-    public static void Load(string code) {
+    public static void CheckStack(nint L, int extra) {
+        if (L == 0 || extra <= 0 || Lua.addr_checkstack == 0) { return; }
+        LuaIdxIntFn f = (LuaIdxIntFn)Lua.addr_checkstack;
+        if (f(L, extra) == 0) {
+            throw new InvalidOperationException("Lua 栈空间不足（lua_checkstack 失败）");
+        }
+    }
+
+    // 仅允许文本模式 ("t") 加载源码，拒绝 \x1bLua 预编译字节码绕过沙箱。
+    public static int LoadTextInto(nint L, string code, string chunkName) {
+        string src = code == null ? "" : code;
+        if (src.Length > 0 && (src[0] & 255) == 27) {
+            LuaPushStrFn ps = (LuaPushStrFn)Lua.addr_pushstring;
+            nint _p = ps(L, "attempt to load a binary chunk (mode is 't')");
+            return Lua.LUA_ERRSYNTAX;
+        }
+        if (Lua.addr_loadbufferx != 0) {
+            LuaLoadBufFn fb = (LuaLoadBufFn)Lua.addr_loadbufferx;
+            return fb(L, (nint)src, (long)src.Length, chunkName, "t");
+        }
         LuaLoadFn f = (LuaLoadFn)Lua.addr_loadstring;
-        if (f(Lua.state, code) != 0) { Lua.Fail("Lua 代码编译失败"); }
+        return f(L, src);
+    }
+
+    public static void LoadAt(nint L, string code, int mark) {
+        if (Lua.LoadTextInto(L, code, "=(chunk)") != 0) {
+            Lua.FailAt("Lua 代码编译失败", mark);
+        }
+    }
+
+    public static void Load(string code) {
+        int mark = Lua.Top();
+        Lua.LoadAt(Lua.state, code, mark);
     }
 
     // 仅宿主内部可达：沙箱已置 nil 脚本侧 load，仅允许文本模式 ("t") 拒绝预编译字节码，加载后立即擦除明文缓冲。
@@ -593,6 +635,7 @@ public class Lua {
                 Lua.SetTop(mark);
                 throw new InvalidOperationException("Lua 找不到函数: " + name);
             }
+            Lua.CheckStack(Lua.state, 4);
             int nextDot = name.IndexOf(".", pos);
             string seg = nextDot < 0 ? name.Substring(pos, n - pos) : name.Substring(pos, nextDot - pos);
             t = gf(Lua.state, 0 - 1, seg);
@@ -678,6 +721,7 @@ public class Lua {
         Lua.addr_status = Interop.Symbol(Lua.mod, "lua_status");
         Lua.addr_gc = Interop.Symbol(Lua.mod, "lua_gc");
         Lua.addr_xmove = Interop.Symbol(Lua.mod, "lua_xmove");
+        Lua.addr_checkstack = Interop.Symbol(Lua.mod, "lua_checkstack");
         if (Lua.addr_geti == 0) { Lua.addr_geti = Lua.addr_rawgeti; }
         if (Lua.addr_seti == 0) { Lua.addr_seti = Lua.addr_rawseti; }
         return Lua.addr_newstate != 0 && Lua.addr_openlibs != 0
@@ -729,6 +773,7 @@ public class Lua {
         Lua.addr_status = 0;
         Lua.addr_gc = 0;
         Lua.addr_xmove = 0;
+        Lua.addr_checkstack = 0;
     }
 
     public static long StoreTop() {

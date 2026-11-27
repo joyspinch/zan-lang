@@ -362,17 +362,56 @@ public class MsgPackReader {
         int mn = b & 15;
         JsonValue obj = JsonValue.NewObject();
         if (mn > 0) {
-            List<string> ks = obj.keys;
-            List<JsonValue> vs = obj.vals;
-            ks.Reserve(mn);
-            vs.Reserve(mn);
+            obj.keys.Reserve(mn);
+            obj.vals.Reserve(mn);
             for (int i = 0; i < mn; i = i + 1) {
                 string key = ReadMapKey(depth + 1);
-                ks.Add(key);
-                vs.Add(ReadValue(depth + 1));
+                JsonValue mv = ReadValue(depth + 1);
+                MsgPackReader.SetObjField(obj, key, mv);
             }
         }
         return obj;
+    }
+
+    // 新建 map 去重写入（小对象线性探测、大对象按需建 keyIndex，避免重复键）。
+    private static void SetObjField(JsonValue obj, string key, JsonValue val) {
+        if (obj.keyIndex != null) {
+            int existing = 0;
+            if (obj.keyIndex.TryGetValue(key, out existing)) {
+                obj.vals[existing] = val;
+                return;
+            }
+            int ni = obj.keys.Count;
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            obj.keyIndex[key] = ni;
+            return;
+        }
+        int cnt = obj.keys.Count;
+        if (cnt < 8) {
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (obj.keys[i] == key) {
+                    obj.vals[i] = val;
+                    return;
+                }
+            }
+            obj.keys.Add(key);
+            obj.vals.Add(val);
+            return;
+        }
+        Dict<string, int> idx = new Dict<string, int>();
+        for (int i = 0; i < cnt; i = i + 1) {
+            idx[obj.keys[i]] = i;
+        }
+        obj.keyIndex = idx;
+        int ex2 = 0;
+        if (idx.TryGetValue(key, out ex2)) {
+            obj.vals[ex2] = val;
+            return;
+        }
+        obj.keys.Add(key);
+        obj.vals.Add(val);
+        idx[key] = cnt;
     }
 
     JsonValue ArrayOf(int n, int depth) {
@@ -395,14 +434,12 @@ public class MsgPackReader {
             throw new MsgPackException("map size out of bounds: " + Convert.ToString(n));
         }
         JsonValue obj = JsonValue.NewObject();
-        List<string> ks = obj.keys;
-        List<JsonValue> vs = obj.vals;
-        if (n > 0 && n <= 4096) { ks.Reserve(n); vs.Reserve(n); }
+        if (n > 0 && n <= 4096) { obj.keys.Reserve(n); obj.vals.Reserve(n); }
         int i = 0;
         while (i < n) {
             string key = ReadMapKey(depth + 1);
-            ks.Add(key);
-            vs.Add(ReadValue(depth + 1));
+            JsonValue mv = ReadValue(depth + 1);
+            MsgPackReader.SetObjField(obj, key, mv);
             i = i + 1;
         }
         return obj;

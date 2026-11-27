@@ -26,7 +26,7 @@ public class CssAttr {
 public class CssPseudo {
     // 伪类名（小写）。
     public string name;
-    // 预解码伪类枚举：1=first-child, 2=last-child, 3=only-child, 4=empty, 5=root, 6=not, 7=nth-child/nth-of-type。
+    // 预解码伪类枚举：1=first-child, 2=last-child, 3=only-child, 4=empty, 5=root, 6=not, 7=nth-child, 8=nth-of-type。
     public int kind;
     // 括号里的参数（":not(.x)" 的 ".x"、":nth-child(2n+1)" 的 "2n+1"）。
     public string arg;
@@ -404,7 +404,7 @@ public class CssSelector {
         }
         if (p.name == "nth-child" || p.name == "nth-of-type") {
             if (!CssSelector.ParseNth(p.arg, p)) { p.unsupported = true; }
-            else { p.kind = 7; }
+            else { p.kind = p.name == "nth-of-type" ? 8 : 7; }
             return p;
         }
         if (p.name == "first-child") { p.kind = 1; return p; }
@@ -426,17 +426,16 @@ public class CssSelector {
         while (this.pos < this.src.Length && HtmlUtil.IsSpace(this.src[this.pos] & 255)) { this.pos = this.pos + 1; }
     }
 
-    // 解析 an+b（"odd"/"even"/"n"/"2n+1"/"3"…）。
+    // 解析 an+b（"odd"/"even"/"n"/"-n+3"/"2n + 1"/"3"…，符合 CSS Syntax An+B）。
     static bool ParseNth(string expr, CssPseudo p) {
         if (expr == null) { return false; }
-        string s = expr.Trim();
+        string s = CssSelector.AsciiLower(expr.Trim());
         if (s.Length == 0) { return false; }
         if (s == "odd") { p.nthA = 2; p.nthB = 1; return true; }
         if (s == "even") { p.nthA = 2; p.nthB = 0; return true; }
         int nAt = -1;
         for (int i = 0; i < s.Length; i = i + 1) {
-            int c = s[i] & 255;
-            if (c == 110 || c == 78) { nAt = i; break; }
+            if ((s[i] & 255) == 110) { nAt = i; break; }
         }
         if (nAt < 0) {
             int v;
@@ -446,13 +445,20 @@ public class CssSelector {
             return true;
         }
         int a;
-        string head = s.Substring(0, nAt);
-        if (head.Length == 0) { a = 1; }
+        string head = s.Substring(0, nAt).Trim();
+        if (head.Length == 0 || head == "+") { a = 1; }
+        else if (head == "-") { a = -1; }
         else if (!CssSelector.ParseIntStrict(head, out a)) { return false; }
-        string tail = s.Substring(nAt + 1);
+        string tail = s.Substring(nAt + 1).Trim();
         int b = 0;
         if (tail.Length > 0) {
-            if (!CssSelector.ParseIntStrict(tail, out b)) { return false; }
+            int sc = tail[0] & 255;
+            if (sc != 43 && sc != 45) { return false; }
+            int j = 1;
+            while (j < tail.Length && HtmlUtil.IsSpace(tail[j] & 255)) { j = j + 1; }
+            if (j >= tail.Length) { return false; }
+            string signedNum = (sc == 45 ? "-" : "+") + tail.Substring(j);
+            if (!CssSelector.ParseIntStrict(signedNum, out b)) { return false; }
         }
         p.nthA = a;
         p.nthB = b;
@@ -491,25 +497,47 @@ public class CssSelector {
         int n = cx.compounds.Count;
         if (n == 0) { return false; }
         if (!CssSelector.MatchCompoundAt(node, cx.compounds[n - 1], elemIdx, elemTotal)) { return false; }
-        return CssSelector.MatchChain(node, cx, n - 2);
+        if (n == 1) { return true; }
+        Dict<HtmlNode, long> failMemo = n >= 3 ? new Dict<HtmlNode, long>() : null;
+        return CssSelector.MatchChain(node, cx, n - 2, failMemo);
     }
 
-    // node 匹配 compound[idx]，再往上找 compound[idx-1] 的匹配。
-    static bool MatchChain(HtmlNode node, CssComplex cx, int idx) {
+    // node 匹配 compound[idx+1]，再往上找 compound[idx] 的匹配；
+    // failMemo 按节点位图缓存已证实失败的 idx（防深 DOM 下多后代/兄弟组合符指数回溯）。
+    static bool MatchChain(HtmlNode node, CssComplex cx, int idx, Dict<HtmlNode, long> failMemo) {
         if (idx < 0) { return true; }
+        if (failMemo != null && idx < 62) {
+            long mask = 0L;
+            if (failMemo.TryGetValue(node, out mask) && (mask & (1L << idx)) != 0L) {
+                return false;
+            }
+        }
         string comb = cx.combinators[idx + 1];
         if (comb == "child") {
             HtmlNode p = node.Parent();
-            if (p == null || !p.IsElement()) { return false; }
-            if (!CssSelector.MatchCompound(p, cx.compounds[idx])) { return false; }
-            return CssSelector.MatchChain(p, cx, idx - 1);
+            if (p != null && p.IsElement()
+                && CssSelector.MatchCompound(p, cx.compounds[idx])
+                && CssSelector.MatchChain(p, cx, idx - 1, failMemo)) {
+                return true;
+            }
+            if (failMemo != null && idx < 62) {
+                long prev = 0L;
+                failMemo.TryGetValue(node, out prev);
+                failMemo[node] = prev | (1L << idx);
+            }
+            return false;
         }
         if (comb == "descendant") {
             HtmlNode p = node.ElementParent();
             while (p != null) {
                 if (CssSelector.MatchCompound(p, cx.compounds[idx])
-                    && CssSelector.MatchChain(p, cx, idx - 1)) { return true; }
+                    && CssSelector.MatchChain(p, cx, idx - 1, failMemo)) { return true; }
                 p = p.ElementParent();
+            }
+            if (failMemo != null && idx < 62) {
+                long prev = 0L;
+                failMemo.TryGetValue(node, out prev);
+                failMemo[node] = prev | (1L << idx);
             }
             return false;
         }
@@ -523,8 +551,13 @@ public class CssSelector {
             if (!sib.IsElement()) { continue; }
             seen = seen + 1;
             if (CssSelector.MatchCompound(sib, cx.compounds[idx])
-                && CssSelector.MatchChain(sib, cx, idx - 1)) { return true; }
+                && CssSelector.MatchChain(sib, cx, idx - 1, failMemo)) { return true; }
             if (comb == "adjacent") { break; }
+        }
+        if (failMemo != null && idx < 62) {
+            long prev = 0L;
+            failMemo.TryGetValue(node, out prev);
+            failMemo[node] = prev | (1L << idx);
         }
         return false;
     }
@@ -614,13 +647,16 @@ public class CssSelector {
         if (pk == 4) { return node.childList == null || node.childList.Count == 0; }
         if (pk == 5) { return node.ElementAncestorCount() == 0; }
         if (pk == 6) { return !CssSelector.MatchSimple(node, p.notCompound); }
-        if (pk == 7) {
-            int idx1 = (elemIdx >= 0 ? elemIdx : CssSelector.ElementIndex(node)) + 1;
-            int a = p.nthA;
-            int b = p.nthB;
-            if (a == 0) { return idx1 == b; }
-            if (a > 0) { return idx1 >= b && (idx1 - b) % a == 0; }
-            return idx1 <= b && (b - idx1) % (-a) == 0;
+        if (pk == 7 || pk == 8) {
+            int idx1 = (pk == 8
+                ? CssSelector.ElementTypeIndex(node)
+                : (elemIdx >= 0 ? elemIdx : CssSelector.ElementIndex(node))) + 1;
+            long idxL = (long)idx1;
+            long aL = (long)p.nthA;
+            long bL = (long)p.nthB;
+            if (aL == 0L) { return idxL == bL; }
+            if (aL > 0L) { return idxL >= bL && (idxL - bL) % aL == 0L; }
+            return idxL <= bL && (bL - idxL) % (0L - aL) == 0L;
         }
         return false;
     }
@@ -655,6 +691,21 @@ public class CssSelector {
         if (limit > parent.childList.Count) { limit = parent.childList.Count; }
         for (int i = 0; i < limit; i = i + 1) {
             if (parent.childList[i].IsElement()) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 前面有多少个同名标签的元素兄弟（:nth-of-type 用）。
+    static int ElementTypeIndex(HtmlNode node) {
+        HtmlNode parent = node.Parent();
+        if (parent == null || parent.childList == null) { return 0; }
+        string tag = node.tag;
+        int n = 0;
+        int limit = node.index;
+        if (limit > parent.childList.Count) { limit = parent.childList.Count; }
+        for (int i = 0; i < limit; i = i + 1) {
+            HtmlNode sib = parent.childList[i];
+            if (sib.IsElement() && sib.tag == tag) { n = n + 1; }
         }
         return n;
     }

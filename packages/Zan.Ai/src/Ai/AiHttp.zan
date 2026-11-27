@@ -21,12 +21,17 @@ internal class AiPostResult {
 internal class AiHttp : IDisposable {
     private static const int MaxCachedClients = 32;
     // 按端点复用连接池。流式通路以 Canonical + "|sse" 区分。
+    private object cacheLock;
     private Dictionary<string, HttpClient> clients;
     private List<string> keyOrder;
+    // 已淘汰但可能仍有并发请求在途的客户端，统一在 Close() 时安全关闭。
+    private List<HttpClient> retired;
 
     public AiHttp() {
+        this.cacheLock = new object();
         this.clients = new Dictionary<string, HttpClient>();
         this.keyOrder = new List<string>();
+        this.retired = new List<HttpClient>();
     }
 
     // 关闭所有出网连接（进程退出前或长寿命客户端空闲时调用）。
@@ -34,21 +39,34 @@ internal class AiHttp : IDisposable {
     // 不关的话，池子里的 keep-alive 连接会一直挂着到进程退出——服务端
     // 那边也是（半开连接）。
     public void Close() {
-        List<string> keys = this.clients.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            this.clients[keys[i]].Close();
+        List<HttpClient> toClose = new List<HttpClient>();
+        lock (this.cacheLock) {
+            List<string> keys = this.clients.Keys;
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                HttpClient c = this.clients[keys[i]];
+                if (c != null) { toClose.Add(c); }
+            }
+            this.clients.Clear();
+            this.keyOrder.Clear();
+            for (int i = 0; i < this.retired.Count; i = i + 1) {
+                if (this.retired[i] != null) { toClose.Add(this.retired[i]); }
+            }
+            this.retired.Clear();
         }
-        this.clients.Clear();
-        this.keyOrder.Clear();
+        for (int i = 0; i < toClose.Count; i = i + 1) {
+            toClose[i].Close();
+        }
     }
 
     public void Dispose() { this.Close(); }
 
     // 从缓存取连接；没有返回 null。
     public HttpClient CacheGet(string key) {
-        HttpClient http = null;
-        if (this.clients.TryGetValue(key, out http)) { return http; }
-        return null;
+        lock (this.cacheLock) {
+            HttpClient http = null;
+            if (this.clients.TryGetValue(key, out http)) { return http; }
+            return null;
+        }
     }
 
     // 出网预算。响应与请求体都有上限，超限的响应不会进内存。
@@ -67,25 +85,27 @@ internal class AiHttp : IDisposable {
         return p;
     }
 
-    // 连接入缓存（客户端在设置完鉴权/策略头之后调用）；超容量上限时淘汰并关闭最早条目。
+    // 连接入缓存（客户端在设置完鉴权/策略头之后调用）；超容量上限时淘汰最早条目（延迟关闭防并发在途请求踩坏）。
     public void CachePut(string key, HttpClient http) {
-        HttpClient prev = null;
-        if (this.clients.TryGetValue(key, out prev)) {
-            if (prev != null && prev != http) { prev.Close(); }
-            this.clients[key] = http;
-            return;
-        }
-        while (this.clients.Count >= AiHttp.MaxCachedClients && this.keyOrder.Count > 0) {
-            string oldest = this.keyOrder[0];
-            this.keyOrder.RemoveAt(0);
-            HttpClient oldClient = null;
-            if (this.clients.TryGetValue(oldest, out oldClient)) {
-                this.clients.Remove(oldest);
-                if (oldClient != null) { oldClient.Close(); }
+        lock (this.cacheLock) {
+            HttpClient prev = null;
+            if (this.clients.TryGetValue(key, out prev)) {
+                if (prev != null && prev != http) { this.retired.Add(prev); }
+                this.clients[key] = http;
+                return;
             }
+            while (this.clients.Count >= AiHttp.MaxCachedClients && this.keyOrder.Count > 0) {
+                string oldest = this.keyOrder[0];
+                this.keyOrder.RemoveAt(0);
+                HttpClient oldClient = null;
+                if (this.clients.TryGetValue(oldest, out oldClient)) {
+                    this.clients.Remove(oldest);
+                    if (oldClient != null) { this.retired.Add(oldClient); }
+                }
+            }
+            this.clients[key] = http;
+            this.keyOrder.Add(key);
         }
-        this.clients[key] = http;
-        this.keyOrder.Add(key);
     }
 
     // 新建一个裸 HttpClient（按端点选 TLS/明文），**不入缓存**——
@@ -116,8 +136,14 @@ internal class AiHttp : IDisposable {
             try {
                 HttpClient http = getClient();
                 HttpResponse resp = await http.SendAsync("POST", getPath(), payload);
-                int status = resp.statusCode;
-                string bodyText = resp.body;
+                int status = 0;
+                string bodyText = "";
+                try {
+                    status = resp.statusCode;
+                    bodyText = resp.body;
+                } finally {
+                    if (resp != null) { resp.Dispose(); }
+                }
                 if (status >= 200 && status < 300) {
                     return new AiPostResult(bodyText, null);
                 }

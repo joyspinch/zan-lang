@@ -297,7 +297,7 @@ public class GeckoNative {
 /// <summary>
 /// 浏览器智能体标签页句柄：承载现代非阻塞协程异步 API (await Task.Delay) 与完整自动化生态
 /// </summary>
-public class FirefoxAgentTab {
+public class FirefoxAgentTab : IDisposable {
     nint viewHandle;
     int contextId;
     int nextEvalId;
@@ -310,6 +310,31 @@ public class FirefoxAgentTab {
         this.nextEvalId = 1000;
         this.evalBusy = false;
         this.evalWaiters = new Queue<AsyncGate>();
+    }
+
+    public void Dispose() {
+        nint h = 0;
+        List<AsyncGate> pending = null;
+        lock (this) {
+            h = this.viewHandle;
+            this.viewHandle = 0;
+            this.evalBusy = false;
+            if (this.evalWaiters.Count() > 0) {
+                pending = new List<AsyncGate>();
+                while (this.evalWaiters.Count() > 0) {
+                    pending.Add(this.evalWaiters.Dequeue());
+                }
+            }
+        }
+        if (pending != null) {
+            for (int i = 0; i < pending.Count; i = i + 1) {
+                pending[i].Signal();
+            }
+        }
+        if (h != 0 && GeckoNative.PfnDestroy != 0) {
+            GeckoActionFn fn = (GeckoActionFn)GeckoNative.PfnDestroy;
+            fn(h);
+        }
     }
 
     private async void AcquireEvalLock() {
@@ -377,19 +402,19 @@ public class FirefoxAgentTab {
     }
 
     public bool IsDone(int evalId) {
-        if (GeckoNative.PfnGetLastEvalId == 0) return false;
+        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalId == 0) return false;
         GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetLastEvalId;
         return fn(this.viewHandle) == evalId;
     }
 
     public string GetResult() {
-        if (GeckoNative.PfnGetLastEvalResult == 0) return "";
+        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalResult == 0) return "";
         GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetLastEvalResult;
         return fn(this.viewHandle);
     }
 
     public bool GetSuccess() {
-        if (GeckoNative.PfnGetLastEvalSuccess == 0) return false;
+        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalSuccess == 0) return false;
         GeckoGetBoolFn fn = (GeckoGetBoolFn)GeckoNative.PfnGetLastEvalSuccess;
         return fn(this.viewHandle);
     }
@@ -589,15 +614,20 @@ public class FirefoxAgentTab {
     /// 异步网络空闲等待状态机 (基于 Necko / Fetch / XHR inFlight 活跃计数器)
     /// </summary>
     public async bool WaitForNetworkIdleAsync(int requiredIdleMs = 500, int timeoutMs = 15000) {
-        int elapsed = 0;
-        while (elapsed < timeoutMs) {
+        if (timeoutMs <= 0) { return false; }
+        long deadline = DateTime.GetCurrentUnixMilliseconds() + (long)timeoutMs;
+        while (true) {
+            long rem = deadline - DateTime.GetCurrentUnixMilliseconds();
+            if (rem <= 0L) { break; }
+            int stepTimeout = rem > 1000L ? 1000 : (int)rem;
             string script = "window.__zan_getNetworkIdleState ? window.__zan_getNetworkIdleState(" + requiredIdleMs.ToString() + ") : '{\"isIdle\":true}';";
-            string res = await this.EvalAsync(script, 1000);
+            string res = await this.EvalAsync(script, stepTimeout);
             if (res.Contains("\"isIdle\":true") || res.Contains("\"isIdle\": true")) {
                 return true;
             }
-            await Task.Delay(100);
-            elapsed = elapsed + 100;
+            long rem2 = deadline - DateTime.GetCurrentUnixMilliseconds();
+            if (rem2 <= 0L) { break; }
+            await Task.Delay(rem2 > 100L ? 100 : (int)rem2);
         }
         return false;
     }
@@ -665,6 +695,7 @@ public class FirefoxAgentSession {
 
     public static FirefoxAgentTab CreateTab(nint parentHwnd, int x, int y, int w, int h, string initialUrl, int contextId, FingerprintProfile profile) {
         if (!GeckoNative.EnsureLoaded()) return null;
+        if (GeckoNative.PfnCreateWithContext == 0) return null;
 
         FingerprintProfile fp = (profile != null) ? profile : FingerprintProfile.CleanDefault();
 
