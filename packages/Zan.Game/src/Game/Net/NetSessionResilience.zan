@@ -1,0 +1,451 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// NTP 四时间戳时钟同步与网络抖动滤波器（服务公网插值与 LagCompensator 时间基准）。
+// 使用 (t0=clientSend, t1=serverRecv, t2=serverSend, t3=clientRecv) 剥离服务端处理耗时，
+// 滑动窗口中位数剔除单次丢包重传毛刺，输出平滑 RTT、RFC3550 Jitter 与 ServerTimeOffsetMs。
+public class NetClockSync {
+    private List<long> recentRtts;
+    private int windowSize;
+    private long smoothedRttMs;
+    private long minRttMs;
+    private long jitterMs;
+    private long lastRttMs;
+    private long serverTimeOffsetMs;
+    private int sampleCount;
+    private int rejectedSpikes;
+
+    public NetClockSync(int windowSize) {
+        this.windowSize = windowSize >= 4 ? windowSize : 16;
+        this.recentRtts = new List<long>();
+        this.smoothedRttMs = 0;
+        this.minRttMs = 0;
+        this.jitterMs = 0;
+        this.lastRttMs = 0;
+        this.serverTimeOffsetMs = 0;
+        this.sampleCount = 0;
+        this.rejectedSpikes = 0;
+    }
+
+    public long RttMs { get { return this.smoothedRttMs; } }
+    public long MinRttMs { get { return this.minRttMs; } }
+    public long JitterMs { get { return this.jitterMs; } }
+    public long ServerTimeOffsetMs { get { return this.serverTimeOffsetMs; } }
+    public int SampleCount { get { return this.sampleCount; } }
+    public int RejectedSpikes { get { return this.rejectedSpikes; } }
+
+    public long EstimateServerTimeMs(long localTimeMs) {
+        return localTimeMs + this.serverTimeOffsetMs;
+    }
+
+    private long ComputeMedianRtt() {
+        int n = this.recentRtts.Count;
+        if (n == 0) { return 0; }
+        long[] copy = new long[n];
+        for (int i = 0; i < n; i = i + 1) { copy[i] = this.recentRtts[i]; }
+        for (int i = 1; i < n; i = i + 1) {
+            long key = copy[i];
+            int j = i - 1;
+            while (j >= 0 && copy[j] > key) {
+                copy[j + 1] = copy[j];
+                j = j - 1;
+            }
+            copy[j + 1] = key;
+        }
+        return copy[n / 2];
+    }
+
+    // 记录一次 Ping/Pong 往返四时间戳，返回 true 表示被采纳，false 表示作为异常尖峰毛刺被剔除。
+    public bool RecordSample(long clientSendMs, long serverRecvMs,
+                             long serverSendMs, long clientRecvMs) {
+        long total = clientRecvMs - clientSendMs;
+        long srvProc = serverSendMs - serverRecvMs;
+        if (srvProc < 0) { srvProc = 0; }
+        long rtt = total - srvProc;
+        if (rtt < 0) { rtt = 0; }
+        long rawOffset = ((serverRecvMs - clientSendMs) + (serverSendMs - clientRecvMs)) / 2;
+
+        if (this.sampleCount >= 4) {
+            long med = this.ComputeMedianRtt();
+            long spikeLimit = med * 2 + 50;
+            if (rtt > spikeLimit) {
+                this.rejectedSpikes = this.rejectedSpikes + 1;
+                return false;
+            }
+        }
+
+        this.recentRtts.Add(rtt);
+        if (this.recentRtts.Count > this.windowSize) {
+            this.recentRtts.RemoveAt(0);
+        }
+
+        if (this.sampleCount == 0) {
+            this.smoothedRttMs = rtt;
+            this.minRttMs = rtt;
+            this.lastRttMs = rtt;
+            this.jitterMs = 0;
+            this.serverTimeOffsetMs = rawOffset;
+        } else {
+            if (rtt < this.minRttMs) { this.minRttMs = rtt; }
+            long diff = rtt - this.lastRttMs;
+            if (diff < 0) { diff = 0 - diff; }
+            this.jitterMs = this.jitterMs + (diff - this.jitterMs) / 4;
+            this.lastRttMs = rtt;
+            this.smoothedRttMs = (this.smoothedRttMs * 3 + rtt) / 4;
+            this.serverTimeOffsetMs = (this.serverTimeOffsetMs * 3 + rawOffset) / 4;
+        }
+        this.sampleCount = this.sampleCount + 1;
+        return true;
+    }
+}
+
+// 可断线重连的玩家会话记录。
+public class NetReconnectSession {
+    public int PeerId;
+    public int EntityId;
+    public int RoomId;
+    public string Token;
+    public bool Disconnected;
+    public long GraceDeadlineMs;
+    public long LastActiveMs;
+
+    public NetReconnectSession(int peerId, int entityId, int roomId, string token, long nowMs) {
+        this.PeerId = peerId;
+        this.EntityId = entityId;
+        this.RoomId = roomId;
+        this.Token = token;
+        this.Disconnected = false;
+        this.GraceDeadlineMs = 0;
+        this.LastActiveMs = nowMs;
+    }
+}
+
+// 断线重连与宽限期席位接管管理器：
+// 玩家网络闪断时保留 EntityId/RoomId 进入宽限期，凭重连 Token 原子接管新 PeerId，
+// 并立即轮换新 Token 杜绝重放攻击；超时宽限期后统一清理释放资源。
+public class NetReconnectManager {
+    private List<NetReconnectSession> sessions;
+    private long gracePeriodMs;
+    private ulong tokenState;
+    private int tokenCounter;
+
+    public NetReconnectManager(long gracePeriodMs) {
+        this.sessions = new List<NetReconnectSession>();
+        this.gracePeriodMs = gracePeriodMs > 0 ? gracePeriodMs : 30000;
+        this.tokenState = 0x517CC1B727220A95UL;
+        this.tokenCounter = 1;
+    }
+
+    public int SessionCount { get { return this.sessions.Count; } }
+
+    private string NextToken(int peerId, int entityId, long nowMs) {
+        this.tokenCounter = this.tokenCounter + 1;
+        ulong x = this.tokenState ^ ((ulong)nowMs * 0x9E3779B97F4A7C15UL)
+            ^ (((ulong)(uint)peerId) << 32) ^ (ulong)(uint)entityId ^ (ulong)(uint)this.tokenCounter;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+        x = x ^ (x >> 31);
+        this.tokenState = x;
+        long lo = (long)(x & 0x7FFFFFFFUL);
+        long hi = (long)((x >> 31) & 0x7FFFFFFFUL);
+        return "ZRT-" + Convert.ToString(this.tokenCounter) + "-" + Convert.ToString(hi) + "-" + Convert.ToString(lo);
+    }
+
+    public NetReconnectSession RegisterSession(int peerId, int entityId, int roomId, long nowMs) {
+        for (int i = 0; i < this.sessions.Count; i = i + 1) {
+            if (this.sessions[i].PeerId == peerId) {
+                this.sessions[i].EntityId = entityId;
+                this.sessions[i].RoomId = roomId;
+                this.sessions[i].Disconnected = false;
+                this.sessions[i].LastActiveMs = nowMs;
+                return this.sessions[i];
+            }
+        }
+        string tok = this.NextToken(peerId, entityId, nowMs);
+        NetReconnectSession s = new NetReconnectSession(peerId, entityId, roomId, tok, nowMs);
+        this.sessions.Add(s);
+        return s;
+    }
+
+    public bool MarkDisconnected(int peerId, long nowMs) {
+        for (int i = 0; i < this.sessions.Count; i = i + 1) {
+            if (this.sessions[i].PeerId == peerId) {
+                this.sessions[i].Disconnected = true;
+                this.sessions[i].GraceDeadlineMs = nowMs + this.gracePeriodMs;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 凭重连 Token 接管会话：验证未过宽限期 -> 绑定 newPeerId -> 立即轮换新 Token（旧 Token 失效）。
+    public NetReconnectSession TryReconnect(string token, int newPeerId, long nowMs) {
+        if (token == null || token == "") { return null; }
+        for (int i = 0; i < this.sessions.Count; i = i + 1) {
+            NetReconnectSession s = this.sessions[i];
+            if (s.Token == token) {
+                if (s.Disconnected && nowMs > s.GraceDeadlineMs) {
+                    return null;
+                }
+                s.PeerId = newPeerId;
+                s.Disconnected = false;
+                s.GraceDeadlineMs = 0;
+                s.LastActiveMs = nowMs;
+                s.Token = this.NextToken(newPeerId, s.EntityId, nowMs);
+                return s;
+            }
+        }
+        return null;
+    }
+
+    public List<NetReconnectSession> PurgeExpired(long nowMs) {
+        List<NetReconnectSession> expired = new List<NetReconnectSession>();
+        for (int i = this.sessions.Count - 1; i >= 0; i = i - 1) {
+            NetReconnectSession s = this.sessions[i];
+            if (s.Disconnected && nowMs > s.GraceDeadlineMs) {
+                expired.Add(s);
+                this.sessions.RemoveAt(i);
+            }
+        }
+        return expired;
+    }
+}
+
+// 可靠游戏事件/RPC 信封（用于技能、开火、拾取、聊天、房间广播等不可丢事件）。
+public class RpcEnvelope {
+    public int Seq;
+    public int EventType;
+    public byte[] Payload;
+
+    public RpcEnvelope(int seq, int eventType, byte[] payload) {
+        this.Seq = seq;
+        this.EventType = eventType;
+        this.Payload = payload != null ? payload : new byte[0];
+    }
+}
+
+internal class PendingRpcSend {
+    public RpcEnvelope Envelope;
+    public byte[] EncodedFrame;
+    public long NextSendMs;
+    public long BackoffMs;
+    public int Attempts;
+
+    public PendingRpcSend(RpcEnvelope env, byte[] frame, long nowMs, long baseBackoffMs) {
+        this.Envelope = env;
+        this.EncodedFrame = frame;
+        this.NextSendMs = nowMs;
+        this.BackoffMs = baseBackoffMs;
+        this.Attempts = 0;
+    }
+}
+
+// 弱网可靠 RPC/事件通道：
+// - 发送端：单调序号 + 指数退避重传队列 + ACK 确认移除 + 超限丢弃计数；
+// - 接收端：滑动历史去重（每条 Event 严格投递一次）+ 重复帧仍回 ACK 修复 ACK 丢失。
+public class ReliableRpcChannel {
+    public const int MAGIC_EVENT = 0x5A525052; // "ZRPR"
+    public const int MAGIC_ACK = 0x5A525041;   // "ZRPA"
+
+    private int nextSeq;
+    private long baseRetryMs;
+    private long maxRetryMs;
+    private int maxAttempts;
+    private List<PendingRpcSend> pending;
+    private List<int> receivedSeqs;
+    private int maxDedupHistory;
+    private int droppedCount;
+
+    public ReliableRpcChannel(long baseRetryMs, long maxRetryMs, int maxAttempts) {
+        this.nextSeq = 1;
+        this.baseRetryMs = baseRetryMs > 0 ? baseRetryMs : 80;
+        this.maxRetryMs = maxRetryMs >= this.baseRetryMs ? maxRetryMs : 800;
+        this.maxAttempts = maxAttempts > 0 ? maxAttempts : 6;
+        this.pending = new List<PendingRpcSend>();
+        this.receivedSeqs = new List<int>();
+        this.maxDedupHistory = 512;
+        this.droppedCount = 0;
+    }
+
+    public int PendingCount { get { return this.pending.Count; } }
+    public int DroppedCount { get { return this.droppedCount; } }
+
+    public static byte[] EncodeEvent(RpcEnvelope env) {
+        int plen = env.Payload != null ? env.Payload.Length : 0;
+        byte[] buf = new byte[16 + plen];
+        WriteI32(buf, 0, MAGIC_EVENT);
+        WriteI32(buf, 4, env.Seq);
+        WriteI32(buf, 8, env.EventType);
+        WriteI32(buf, 12, plen);
+        for (int i = 0; i < plen; i = i + 1) { buf[16 + i] = env.Payload[i]; }
+        return buf;
+    }
+
+    public static RpcEnvelope DecodeEvent(byte[] frame) {
+        if (frame == null || frame.Length < 16) { return null; }
+        if (ReadI32(frame, 0) != MAGIC_EVENT) { return null; }
+        int seq = ReadI32(frame, 4);
+        int evType = ReadI32(frame, 8);
+        int plen = ReadI32(frame, 12);
+        if (plen < 0 || 16 + plen > frame.Length) { return null; }
+        byte[] payload = new byte[plen];
+        for (int i = 0; i < plen; i = i + 1) { payload[i] = frame[16 + i]; }
+        return new RpcEnvelope(seq, evType, payload);
+    }
+
+    public static byte[] EncodeAck(int seq) {
+        byte[] buf = new byte[8];
+        WriteI32(buf, 0, MAGIC_ACK);
+        WriteI32(buf, 4, seq);
+        return buf;
+    }
+
+    public static int DecodeAck(byte[] frame) {
+        if (frame == null || frame.Length < 8) { return 0; }
+        if (ReadI32(frame, 0) != MAGIC_ACK) { return 0; }
+        return ReadI32(frame, 4);
+    }
+
+    public int Enqueue(int eventType, byte[] payload, long nowMs) {
+        int seq = this.nextSeq;
+        this.nextSeq = this.nextSeq + 1;
+        RpcEnvelope env = new RpcEnvelope(seq, eventType, payload);
+        byte[] frame = EncodeEvent(env);
+        this.pending.Add(new PendingRpcSend(env, frame, nowMs, this.baseRetryMs));
+        return seq;
+    }
+
+    // 拉取当前时刻到期需要发送/重传的二进制帧（首次发送与退避重传统一调度）。
+    public List<byte[]> CollectDueTransmissions(long nowMs) {
+        List<byte[]> due = new List<byte[]>();
+        for (int i = this.pending.Count - 1; i >= 0; i = i - 1) {
+            PendingRpcSend p = this.pending[i];
+            if (nowMs >= p.NextSendMs) {
+                if (p.Attempts >= this.maxAttempts) {
+                    this.pending.RemoveAt(i);
+                    this.droppedCount = this.droppedCount + 1;
+                    continue;
+                }
+                due.Add(p.EncodedFrame);
+                p.Attempts = p.Attempts + 1;
+                p.NextSendMs = nowMs + p.BackoffMs;
+                long nextBackoff = p.BackoffMs * 2;
+                p.BackoffMs = nextBackoff <= this.maxRetryMs ? nextBackoff : this.maxRetryMs;
+            }
+        }
+        return due;
+    }
+
+    public bool ProcessAckFrame(byte[] ackFrame) {
+        int seq = DecodeAck(ackFrame);
+        if (seq <= 0) { return false; }
+        for (int i = 0; i < this.pending.Count; i = i + 1) {
+            if (this.pending[i].Envelope.Seq == seq) {
+                this.pending.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 接收一条事件帧：返回待回传的 ACK 帧（即使重复也必须回 ACK），仅首次收到时返回非 null 信封。
+    public RpcEnvelope ReceiveEventFrame(byte[] frame, out byte[] ackFrameOut) {
+        ackFrameOut = null;
+        RpcEnvelope env = DecodeEvent(frame);
+        if (env == null || env.Seq <= 0) { return null; }
+        ackFrameOut = EncodeAck(env.Seq);
+        for (int i = 0; i < this.receivedSeqs.Count; i = i + 1) {
+            if (this.receivedSeqs[i] == env.Seq) {
+                return null; // 重复帧：已回 ACK，不重复投递业务层
+            }
+        }
+        this.receivedSeqs.Add(env.Seq);
+        if (this.receivedSeqs.Count > this.maxDedupHistory) {
+            this.receivedSeqs.RemoveAt(0);
+        }
+        return env;
+    }
+
+    private static void WriteI32(byte[] buf, int pos, int val) {
+        buf[pos] = (byte)(val & 255);
+        buf[pos + 1] = (byte)((val >> 8) & 255);
+        buf[pos + 2] = (byte)((val >> 16) & 255);
+        buf[pos + 3] = (byte)((val >> 24) & 255);
+    }
+
+    private static int ReadI32(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+}
+
+internal class PeerBucketState {
+    public int PeerId;
+    public double Tokens;
+    public long LastMs;
+    public int Violations;
+
+    public PeerBucketState(int peerId, double capacity, long nowMs) {
+        this.PeerId = peerId;
+        this.Tokens = capacity;
+        this.LastMs = nowMs;
+        this.Violations = 0;
+    }
+}
+
+// 每连接令牌桶防洪限流器（抵御恶意客户端高频 UDP/RPC 洪泛攻击）。
+public class PeerRateLimiter {
+    private List<PeerBucketState> buckets;
+    private double capacity;
+    private double refillPerSec;
+
+    public PeerRateLimiter(double capacity, double refillPerSec) {
+        this.buckets = new List<PeerBucketState>();
+        this.capacity = capacity > 0.0 ? capacity : 30.0;
+        this.refillPerSec = refillPerSec > 0.0 ? refillPerSec : 20.0;
+    }
+
+    private PeerBucketState GetOrCreate(int peerId, long nowMs) {
+        for (int i = 0; i < this.buckets.Count; i = i + 1) {
+            if (this.buckets[i].PeerId == peerId) { return this.buckets[i]; }
+        }
+        PeerBucketState b = new PeerBucketState(peerId, this.capacity, nowMs);
+        this.buckets.Add(b);
+        return b;
+    }
+
+    public bool Allow(int peerId, long nowMs, double cost) {
+        if (cost <= 0.0) { cost = 1.0; }
+        PeerBucketState b = this.GetOrCreate(peerId, nowMs);
+        long dtMs = nowMs - b.LastMs;
+        if (dtMs > 0) {
+            double add = ((double)dtMs / 1000.0) * this.refillPerSec;
+            b.Tokens = b.Tokens + add;
+            if (b.Tokens > this.capacity) { b.Tokens = this.capacity; }
+            b.LastMs = nowMs;
+        }
+        if (b.Tokens >= cost) {
+            b.Tokens = b.Tokens - cost;
+            return true;
+        }
+        b.Violations = b.Violations + 1;
+        return false;
+    }
+
+    public int GetViolations(int peerId) {
+        for (int i = 0; i < this.buckets.Count; i = i + 1) {
+            if (this.buckets[i].PeerId == peerId) { return this.buckets[i].Violations; }
+        }
+        return 0;
+    }
+
+    public void RemovePeer(int peerId) {
+        for (int i = this.buckets.Count - 1; i >= 0; i = i - 1) {
+            if (this.buckets[i].PeerId == peerId) { this.buckets.RemoveAt(i); }
+        }
+    }
+}

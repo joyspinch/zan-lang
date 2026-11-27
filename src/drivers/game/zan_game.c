@@ -563,6 +563,99 @@ ZAN_GAME_3D_LIGHT_BODY
 "    frag = vec4(rgb, tex.a * v_tint.a * v_color.a);\n"
 "}\n";
 
+static const char *const ZAN_GAME_POST_VS =
+"out vec2 v_uv;\n"
+"void main() {\n"
+"    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,\n"
+"                  (gl_VertexID == 2) ? 3.0 : -1.0);\n"
+"    v_uv = p * 0.5 + 0.5;\n"
+"    gl_Position = vec4(p, 0.0, 1.0);\n"
+"}\n";
+
+static const char *const ZAN_GAME_POST_FS =
+"uniform sampler2D uScene;\n"
+"uniform vec2 uTexelSize;\n"
+"uniform float uExposure;\n"
+"uniform int uTonemap;\n"
+"uniform float uVignette;\n"
+"uniform vec2 uBloom;\n"
+"in vec2 v_uv;\n"
+"out vec4 frag;\n"
+"vec3 brightPass(vec3 c, float th) {\n"
+"    float lum = max(c.r, max(c.g, c.b));\n"
+"    float excess = max(lum - th, 0.0);\n"
+"    return (lum > 0.0001) ? c * (excess / lum) : vec3(0.0);\n"
+"}\n"
+"void main() {\n"
+"    vec4 src = texture(uScene, v_uv);\n"
+"    vec3 col = src.rgb;\n"
+"    if (uBloom.y > 0.001) {\n"
+"        float th = uBloom.x;\n"
+"        vec3 glow = brightPass(col, th) * 0.16;\n"
+"        vec2 t2 = uTexelSize * 2.0;\n"
+"        vec2 t5 = uTexelSize * 5.0;\n"
+"        vec2 t9 = uTexelSize * 9.0;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2( t2.x, 0.0)).rgb, th) * 0.10;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(-t2.x, 0.0)).rgb, th) * 0.10;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(0.0,  t2.y)).rgb, th) * 0.10;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(0.0, -t2.y)).rgb, th) * 0.10;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2( t5.x,  t5.y)).rgb, th) * 0.07;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(-t5.x,  t5.y)).rgb, th) * 0.07;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2( t5.x, -t5.y)).rgb, th) * 0.07;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(-t5.x, -t5.y)).rgb, th) * 0.07;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2( t9.x, 0.0)).rgb, th) * 0.04;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(-t9.x, 0.0)).rgb, th) * 0.04;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(0.0,  t9.y)).rgb, th) * 0.04;\n"
+"        glow += brightPass(texture(uScene, v_uv + vec2(0.0, -t9.y)).rgb, th) * 0.04;\n"
+"        col += glow * uBloom.y;\n"
+"    }\n"
+"    col *= max(uExposure, 0.0);\n"
+"    if (uTonemap == 1) {\n"
+"        col = col / (vec3(1.0) + col);\n"
+"    } else if (uTonemap == 2) {\n"
+"        col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n"
+"    }\n"
+"    if (uVignette > 0.001) {\n"
+"        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
+"        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
+"        col *= vig;\n"
+"    }\n"
+"    frag = vec4(clamp(col, 0.0, 1.0), src.a);\n"
+"}\n";
+
+typedef struct {
+    zgl_uint program;
+    zgl_int u_scene;
+    zgl_int u_texel_size;
+    zgl_int u_exposure;
+    zgl_int u_tonemap;
+    zgl_int u_vignette;
+    zgl_int u_bloom;
+} zan_game_post_program;
+
+static zan_game_post_program g_game_post_prog;
+static zgl_uint g_game_post_fbo;
+static zgl_uint g_game_post_tex;
+static zgl_uint g_game_post_vao;
+static int g_game_post_w;
+static int g_game_post_h;
+
+static void zan_game_drop_post(void) {
+    if (g_game_gl) {
+        if (g_game_post_prog.program)
+            g_game_gl->DeleteProgram(g_game_post_prog.program);
+        if (g_game_post_fbo) g_game_gl->DeleteFramebuffers(1, &g_game_post_fbo);
+        if (g_game_post_tex) g_game_gl->DeleteTextures(1, &g_game_post_tex);
+        if (g_game_post_vao) g_game_gl->DeleteVertexArrays(1, &g_game_post_vao);
+    }
+    memset(&g_game_post_prog, 0, sizeof(g_game_post_prog));
+    g_game_post_fbo = 0;
+    g_game_post_tex = 0;
+    g_game_post_vao = 0;
+    g_game_post_w = 0;
+    g_game_post_h = 0;
+}
+
 static void zan_game_drop_mesh(zan_game_mesh *mesh) {
     if (mesh->vao) g_game_gl->DeleteVertexArrays(1, &mesh->vao);
     if (mesh->vbo) g_game_gl->DeleteBuffers(1, &mesh->vbo);
@@ -603,6 +696,7 @@ static void zan_game_forget_gpu(void) {
         if (g_game_instance_vbo)
             g_game_gl->DeleteBuffers(1, &g_game_instance_vbo);
         zan_game_drop_shadow();
+        zan_game_drop_post();
     }
     if (g_game_meshes) {
         memset(g_game_meshes, 0, (size_t)g_game_mesh_cap * sizeof(zan_game_mesh));
@@ -1641,6 +1735,127 @@ ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh_id
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+    gl->Finish();
+    result = gl->GetError() == ZGL_NO_ERROR;
+
+done:
+    zan_gui_gpu_end(surface_id);
+    return result;
+}
+
+static zan_game_post_program *zan_game_post_program_get(void) {
+    if (g_game_post_prog.program) return &g_game_post_prog;
+    char vs_src[1024];
+    char fs_src[3072];
+    const char *head = zan_game_glsl_head();
+    snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
+    snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_POST_FS);
+    zgl_uint prog = zan_gui_gpu_program(vs_src, fs_src);
+    if (!prog) return NULL;
+    g_game_post_prog.program = prog;
+    g_game_post_prog.u_scene = g_game_gl->GetUniformLocation(prog, "uScene");
+    g_game_post_prog.u_texel_size = g_game_gl->GetUniformLocation(prog, "uTexelSize");
+    g_game_post_prog.u_exposure = g_game_gl->GetUniformLocation(prog, "uExposure");
+    g_game_post_prog.u_tonemap = g_game_gl->GetUniformLocation(prog, "uTonemap");
+    g_game_post_prog.u_vignette = g_game_gl->GetUniformLocation(prog, "uVignette");
+    g_game_post_prog.u_bloom = g_game_gl->GetUniformLocation(prog, "uBloom");
+    return &g_game_post_prog;
+}
+
+static int zan_game_post_target_ready(const zan_gpu_frame *frame) {
+    const zan_gl_api *gl = frame->api;
+    if (!gl->BlitFramebuffer) return 0;
+    if (g_game_post_fbo && (g_game_post_w != frame->width || g_game_post_h != frame->height)) {
+        if (g_game_post_fbo) gl->DeleteFramebuffers(1, &g_game_post_fbo);
+        if (g_game_post_tex) gl->DeleteTextures(1, &g_game_post_tex);
+        g_game_post_fbo = 0;
+        g_game_post_tex = 0;
+        g_game_post_w = 0;
+        g_game_post_h = 0;
+    }
+    if (!g_game_post_fbo) {
+        gl->GenTextures(1, &g_game_post_tex);
+        if (!g_game_post_tex) return 0;
+        gl->BindTexture(ZGL_TEXTURE_2D, g_game_post_tex);
+        gl->TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, frame->width, frame->height,
+            0, ZGL_RGBA, ZGL_UNSIGNED_BYTE, NULL);
+        gl->TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+        gl->TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+        gl->TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+        gl->TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+        gl->GenFramebuffers(1, &g_game_post_fbo);
+        if (!g_game_post_fbo) {
+            gl->DeleteTextures(1, &g_game_post_tex);
+            g_game_post_tex = 0;
+            return 0;
+        }
+        gl->BindFramebuffer(ZGL_FRAMEBUFFER, g_game_post_fbo);
+        gl->FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+            ZGL_TEXTURE_2D, g_game_post_tex, 0);
+        if (gl->CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE ||
+            gl->GetError() != ZGL_NO_ERROR) {
+            gl->DeleteFramebuffers(1, &g_game_post_fbo);
+            gl->DeleteTextures(1, &g_game_post_tex);
+            g_game_post_fbo = 0;
+            g_game_post_tex = 0;
+            return 0;
+        }
+        g_game_post_w = frame->width;
+        g_game_post_h = frame->height;
+    }
+    if (!g_game_post_vao) {
+        gl->GenVertexArrays(1, &g_game_post_vao);
+        if (!g_game_post_vao) return 0;
+    }
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
+    int32_t tonemap_mode, float vignette, float bloom_threshold,
+    float bloom_intensity) {
+    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    zan_gpu_frame frame;
+    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    int32_t result = 0;
+    if (!zan_game_gpu_prepare(&frame)) goto done;
+    zan_game_post_program *prog = zan_game_post_program_get();
+    if (!prog) goto done;
+    if (!zan_game_post_target_ready(&frame)) goto done;
+
+    int clip_x, clip_y, clip_w, clip_h;
+    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+    if (!clip_w || !clip_h) { result = 1; goto done; }
+
+    const zan_gl_api *gl = frame.api;
+    gl->Disable(ZGL_SCISSOR_TEST);
+    gl->Disable(ZGL_DEPTH_TEST);
+    gl->Disable(ZGL_BLEND);
+
+    /* 纯 GPU VRAM 拷贝原帧颜色到离屏纹理，杜绝同纹理读写反馈循环。 */
+    gl->BindFramebuffer(ZGL_READ_FRAMEBUFFER, frame.framebuffer);
+    gl->BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, g_game_post_fbo);
+    gl->BlitFramebuffer(0, 0, frame.width, frame.height,
+        0, 0, frame.width, frame.height, ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+
+    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+    gl->Viewport(0, 0, frame.width, frame.height);
+    gl->Enable(ZGL_SCISSOR_TEST);
+    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    gl->UseProgram(prog->program);
+    gl->ActiveTexture(ZGL_TEXTURE0);
+    gl->BindTexture(ZGL_TEXTURE_2D, g_game_post_tex);
+    if (prog->u_scene >= 0) gl->Uniform1i(prog->u_scene, 0);
+    if (prog->u_texel_size >= 0) {
+        gl->Uniform2f(prog->u_texel_size,
+            1.0f / (float)frame.width, 1.0f / (float)frame.height);
+    }
+    if (prog->u_exposure >= 0 && gl->Uniform1f) gl->Uniform1f(prog->u_exposure, exposure);
+    if (prog->u_tonemap >= 0) gl->Uniform1i(prog->u_tonemap, tonemap_mode);
+    if (prog->u_vignette >= 0 && gl->Uniform1f) gl->Uniform1f(prog->u_vignette, vignette);
+    if (prog->u_bloom >= 0) gl->Uniform2f(prog->u_bloom, bloom_threshold, bloom_intensity);
+    gl->BindVertexArray(g_game_post_vao);
+    gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
+    gl->BindVertexArray(0);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
 

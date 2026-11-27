@@ -132,28 +132,61 @@ public class Raycast3D {
         }
 
         // 1. 视口像素映射到归一化设备坐标 NDC (-1.0 ~ 1.0)
-        float ndcX = ((float)screenX / (float)viewportW) * 2.0f - 1.0f;
-        float ndcY = 1.0f - ((float)screenY / (float)viewportH) * 2.0f;
+        float ndcX = (((float)screenX + 0.5f) / (float)viewportW) * 2.0f - 1.0f;
+        float ndcY = 1.0f - (((float)screenY + 0.5f) / (float)viewportH) * 2.0f;
 
-        // 2. 利用相机的基底向量推算视锥空间方向
-        // 视线中心方向、相机正上方向、相机正右方向
+        // 2. 构建相机标准正交基（修复俯仰角倾斜时直接用世界 Up 导致射线歪斜的 Bug）
         Vector3 forward = camera.Forward();
         Vector3 right = camera.Right();
-        Vector3 up = camera.Up;
-
-        float tanFovHalf = (float)Math.Tan((double)(camera.FieldOfView * 0.5f));
+        Vector3 camUp = Vector3.Normalize(Vector3.Cross(right, forward));
         float aspect = camera.AspectRatio;
 
-        // 视锥平截头体内射线方向向量
+        if (camera.Orthographic) {
+            float halfH = camera.OrthoHeight;
+            float halfW = halfH * aspect;
+            Vector3 origin = Vector3.Add(
+                camera.Position,
+                Vector3.Add(
+                    Vector3.Multiply(right, ndcX * halfW),
+                    Vector3.Multiply(camUp, ndcY * halfH)
+                )
+            );
+            return new Ray3D(origin, forward);
+        }
+
+        float tanFovHalf = (float)Math.Tan((double)(camera.FieldOfView * 0.5f));
         Vector3 rayDir = Vector3.Add(
             forward,
             Vector3.Add(
                 Vector3.Multiply(right, ndcX * tanFovHalf * aspect),
-                Vector3.Multiply(up, ndcY * tanFovHalf)
+                Vector3.Multiply(camUp, ndcY * tanFovHalf)
             )
         );
 
         return new Ray3D(camera.Position, rayDir);
+    }
+
+    // 世界空间坐标投影到屏幕像素坐标（用于 3D 世界血条、名牌、锁定框与拾取往返校验）。
+    // 返回 false 表示点在相机背面或 w 接近 0。
+    public static bool WorldToScreen(Vector3 worldPos, int viewportW, int viewportH, Camera3D camera,
+                                     out float screenX, out float screenY, out float ndcDepth) {
+        screenX = 0.0f;
+        screenY = 0.0f;
+        ndcDepth = 0.0f;
+        if (camera == null || viewportW <= 0 || viewportH <= 0) { return false; }
+        Mat4 vp = camera.ViewProjectionMatrix();
+        float cx = vp.m[0] * worldPos.X + vp.m[1] * worldPos.Y + vp.m[2] * worldPos.Z + vp.m[3];
+        float cy = vp.m[4] * worldPos.X + vp.m[5] * worldPos.Y + vp.m[6] * worldPos.Z + vp.m[7];
+        float cz = vp.m[8] * worldPos.X + vp.m[9] * worldPos.Y + vp.m[10] * worldPos.Z + vp.m[11];
+        float cw = vp.m[12] * worldPos.X + vp.m[13] * worldPos.Y + vp.m[14] * worldPos.Z + vp.m[15];
+        if (cw <= 0.0001f) { return false; }
+        float invW = 1.0f / cw;
+        float ndcX = cx * invW;
+        float ndcY = cy * invW;
+        ndcDepth = cz * invW;
+        screenX = (ndcX * 0.5f + 0.5f) * (float)viewportW;
+        screenY = (0.5f - ndcY * 0.5f) * (float)viewportH;
+        return true;
     }
 
     // 射线与球体求交检测（兼容转发）
@@ -172,5 +205,73 @@ public class Raycast3D {
     public static bool IntersectAabb(Ray3D ray, Vector3 min, Vector3 max, out float hitDist) {
         if (ray == null) { hitDist = 0.0f; return false; }
         return ray.IntersectAabb(min, max, out hitDist);
+    }
+}
+
+// 3D 场景树射线拾取命中结果。
+public class ScenePickHit {
+    public SceneNode Node;
+    public float Distance;
+    public Vector3 Point;
+
+    public ScenePickHit(SceneNode node, float distance, Vector3 point) {
+        this.Node = node;
+        this.Distance = distance;
+        this.Point = point;
+    }
+}
+
+// 3D 场景树拾取器：遍历层级世界矩阵并用缩放后包围球求交，返回最近的可点击节点。
+public static class ScenePicker3D {
+    public static ScenePickHit Pick(SceneNode root, Ray3D ray) {
+        if (root == null || ray == null) { return null; }
+        ScenePickHit best = null;
+        Mat4 identity = Mat4.Identity();
+        PickRecursive(root, identity, ray, ref best);
+        return best;
+    }
+
+    public static ScenePickHit PickScreen(SceneNode root, int screenX, int screenY,
+                                          int viewportW, int viewportH, Camera3D camera) {
+        if (root == null || camera == null) { return null; }
+        Ray3D ray = Raycast3D.ScreenPointToRay(screenX, screenY, viewportW, viewportH, camera);
+        return Pick(root, ray);
+    }
+
+    private static float ColumnLength(Mat4 m, int col) {
+        float x = m.m[col];
+        float y = m.m[4 + col];
+        float z = m.m[8 + col];
+        return (float)Math.Sqrt((double)(x * x + y * y + z * z));
+    }
+
+    private static void PickRecursive(SceneNode node, Mat4 parentWorld, Ray3D ray, ref ScenePickHit best) {
+        if (node == null || !node.Visible) { return; }
+        Mat4 local = new Mat4();
+        RenderTransform.WriteModelMatrix(local, node.Local);
+        Mat4 world = new Mat4();
+        RenderTransform.MulInto(world, parentWorld, local);
+
+        if (node.MeshKey > 0 && node.BoundsRadius > 0.0f) {
+            float sx = ColumnLength(world, 0);
+            float sy = ColumnLength(world, 1);
+            float sz = ColumnLength(world, 2);
+            float maxS = sx > sy ? sx : sy;
+            if (sz > maxS) { maxS = sz; }
+            float radius = node.BoundsRadius * (maxS > 0.0001f ? maxS : 1.0f);
+            Vector3 center = new Vector3(world.m[3], world.m[7], world.m[11]);
+            float dist;
+            if (ray.IntersectSphere(center, radius, out dist)) {
+                if (best == null || dist < best.Distance) {
+                    best = new ScenePickHit(node, dist, ray.GetPoint(dist));
+                }
+            }
+        }
+
+        if (node.Children != null) {
+            for (int i = 0; i < node.Children.Count; i = i + 1) {
+                PickRecursive(node.Children[i], world, ray, ref best);
+            }
+        }
     }
 }

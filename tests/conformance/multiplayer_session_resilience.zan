@@ -1,0 +1,92 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerSessionResilienceTest {
+    static void Main() {
+        // 1. NTP 四时间戳时钟同步与尖峰毛刺剔除
+        // 真实服务器时钟领先客户端 +5000ms，网络单程延迟 30ms（RTT=60ms），服务端处理 4ms。
+        NetClockSync sync = new NetClockSync(8);
+        sync.RecordSample(1000, 6030, 6034, 1064);
+        sync.RecordSample(2000, 7032, 7036, 2068);
+        sync.RecordSample(3000, 8028, 8032, 3060);
+        sync.RecordSample(4000, 9030, 9034, 4064);
+        // 注入一次 900ms 丢包卡顿毛刺 -> 必须被拒收，不能污染时钟偏差
+        bool spikeAccepted = sync.RecordSample(5000, 10030, 10034, 5934);
+        long estSrv = sync.EstimateServerTimeMs(10000);
+        bool clockOk = !spikeAccepted
+            && sync.RejectedSpikes == 1
+            && sync.RttMs >= 55 && sync.RttMs <= 65
+            && estSrv >= 14990 && estSrv <= 15010;
+        Console.WriteLine("ntp-clock-sync-spike-filter: " + Convert.ToString(clockOk ? 1 : 0));
+
+        // 2. 断线重连令牌、宽限期席位接管与防重放轮换
+        NetReconnectManager rm = new NetReconnectManager(10000);
+        NetReconnectSession s1 = rm.RegisterSession(101, 77, 9, 1000);
+        string tok1 = s1.Token;
+        rm.MarkDisconnected(101, 2000);
+        // 宽限期内（t=5000 <= 12000）凭 tok1 用新连接 PeerId=202 原子接管
+        NetReconnectSession reattached = rm.TryReconnect(tok1, 202, 5000);
+        // 旧 tok1 立即失效（防重放攻击）
+        NetReconnectSession replayAttempt = rm.TryReconnect(tok1, 303, 5100);
+        // 另建一个玩家断线超过宽限期 -> PurgeExpired 准确回收
+        NetReconnectSession s2 = rm.RegisterSession(105, 88, 9, 1000);
+        rm.MarkDisconnected(105, 2000);
+        NetReconnectSession lateAttempt = rm.TryReconnect(s2.Token, 404, 15000);
+        List<NetReconnectSession> expired = rm.PurgeExpired(15000);
+
+        bool reconnectOk = reattached != null
+            && reattached.PeerId == 202
+            && reattached.EntityId == 77
+            && reattached.RoomId == 9
+            && reattached.Token != tok1
+            && replayAttempt == null
+            && lateAttempt == null
+            && expired.Count == 1 && expired[0].EntityId == 88
+            && rm.SessionCount == 1;
+        Console.WriteLine("reconnect-token-grace-takeover: " + Convert.ToString(reconnectOk ? 1 : 0));
+
+        // 3. 弱网可靠 RPC 通道（丢包重传 + ACK 丢失去重 + 精确一次投递）
+        ReliableRpcChannel sender = new ReliableRpcChannel(100, 400, 5);
+        ReliableRpcChannel receiver = new ReliableRpcChannel(100, 400, 5);
+        byte[] payload = new byte[] { 10, 20, 30, 42 };
+        int seq = sender.Enqueue(7, payload, 1000);
+        List<byte[]> firstTx = sender.CollectDueTransmissions(1000);
+        // 首次收到但回程 ACK 丢包
+        byte[] ack1;
+        RpcEnvelope delivered1 = receiver.ReceiveEventFrame(firstTx[0], out ack1);
+        // t=1050 未到 100ms 退避时间 -> 不重传；t=1100 到期重传
+        List<byte[]> earlyTx = sender.CollectDueTransmissions(1050);
+        List<byte[]> retryTx = sender.CollectDueTransmissions(1100);
+        // 接收端再次收到同一帧：必须返回 ACK2，但业务层不得重复投递（返回 null）
+        byte[] ack2;
+        RpcEnvelope deliveredDup = receiver.ReceiveEventFrame(retryTx[0], out ack2);
+        bool ackApplied = sender.ProcessAckFrame(ack2);
+
+        bool rpcOk = seq == 1
+            && firstTx.Count == 1
+            && delivered1 != null && delivered1.EventType == 7 && delivered1.Payload.Length == 4 && delivered1.Payload[3] == 42
+            && earlyTx.Count == 0
+            && retryTx.Count == 1
+            && deliveredDup == null
+            && ack2 != null
+            && ackApplied
+            && sender.PendingCount == 0;
+        Console.WriteLine("reliable-rpc-retransmit-dedup: " + Convert.ToString(rpcOk ? 1 : 0));
+
+        // 4. 每连接令牌桶防洪限流（允许突发 3 包，第 4/5 包拦下计违规，500ms 后补充令牌放行）
+        PeerRateLimiter limiter = new PeerRateLimiter(3.0, 2.0); // 桶容量 3，每秒补 2 个
+        bool a1 = limiter.Allow(9, 1000, 1.0);
+        bool a2 = limiter.Allow(9, 1000, 1.0);
+        bool a3 = limiter.Allow(9, 1000, 1.0);
+        bool a4 = limiter.Allow(9, 1000, 1.0);
+        bool a5 = limiter.Allow(9, 1000, 1.0);
+        bool afterRefill = limiter.Allow(9, 1600, 1.0); // +0.6s -> +1.2 tokens -> 放行
+        bool limiterOk = a1 && a2 && a3 && !a4 && !a5
+            && limiter.GetViolations(9) == 2
+            && afterRefill;
+        Console.WriteLine("peer-rate-limiter-anti-flood: " + Convert.ToString(limiterOk ? 1 : 0));
+    }
+}

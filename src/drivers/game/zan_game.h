@@ -102,6 +102,14 @@ ZAN_GAME_API int32_t zan_game_set_point_lights3d(int32_t count,
 ZAN_GAME_API void zan_game_set_fog3d(int32_t enabled, float r, float g, float b,
     float start_dist, float end_dist);
 
+/* 屏幕空间 GPU 后处理 Pass（Exposure 曝光 + 13-tap 亮部 Bloom 泛光 +
+ * Reinhard / ACES Filmic 色调映射 + 径向 Vignette 暗角）：
+ * 通过离屏颜色纹理 BlitFramebuffer 读写分离，保留原 Alpha 通道。
+ * tonemap_mode: 0 = None/Clamp, 1 = Reinhard, 2 = ACES Filmic。 */
+ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
+    int32_t tonemap_mode, float vignette, float bloom_threshold,
+    float bloom_intensity);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,103 @@
+using System;
+using System.IO;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionRuntimeTest {
+    static void Main() {
+        // 1. 像素级动态鼠标穿透控制器（实体像素 0ms 接管 + 透明区 60ms 迟滞防抖 + 几何热区）
+        CompanionHitPassThrough ctrl = new CompanionHitPassThrough(24, 60);
+        int[] pixels = new int[16]; // 4x4 图：中心 (1,1) 不透明 alpha=220，其余全透明 alpha=0
+        pixels[1 * 4 + 1] = unchecked((int)0xDCFF8800);
+        ctrl.AddCircleZone(20, 20, 5);
+
+        bool hitCenter = ctrl.HitTestArgbPixels(pixels, 4, 4, 1, 1);
+        bool hitBg = ctrl.HitTestArgbPixels(pixels, 4, 4, 0, 0);
+        bool hitZone = ctrl.HitTestZones(22, 22);
+        bool missZone = ctrl.HitTestZones(40, 40);
+
+        // 初始穿透=true -> 移入实体(t=1000) 立即切换为 ClickThrough=false
+        bool ch1 = ctrl.Update(hitCenter, 1000);
+        bool afterEnter = !ctrl.CurrentClickThrough;
+        // 移到透明区(t=1020)，未满 60ms 防抖 -> 保持 ClickThrough=false 不抖动
+        bool ch2 = ctrl.Update(hitBg, 1020);
+        bool ch3 = ctrl.Update(hitBg, 1050);
+        bool stillInteractive = !ctrl.CurrentClickThrough;
+        // 满 60ms(t=1080) -> 平滑切回 ClickThrough=true
+        bool ch4 = ctrl.Update(hitBg, 1080);
+        bool backToPassThrough = ctrl.CurrentClickThrough;
+
+        bool hitPassOk = hitCenter && !hitBg && hitZone && !missZone
+            && ch1 && afterEnter && !ch2 && !ch3 && stillInteractive
+            && ch4 && backToPassThrough && ctrl.TransitionCount == 2;
+        Console.WriteLine("hit-passthrough-controller: " + Convert.ToString(hitPassOk ? 1 : 0));
+
+        // 2. 防掉电原子存档 + 完整性校验 + 主文件被写残后自动从 .bak 无缝回滚修复
+        string basePath = "_scratch/conf_companion_state_83918.json";
+        string bakPath = basePath + ".bak";
+        string tmpPath = basePath + ".tmp";
+        if (File.Exists(basePath)) { File.Delete(basePath); }
+        if (File.Exists(bakPath)) { File.Delete(bakPath); }
+        if (File.Exists(tmpPath)) { File.Delete(tmpPath); }
+
+        CompanionProfile v1 = new CompanionProfile();
+        v1.MonitorIndex = 1;
+        v1.WindowX = -320;
+        v1.WindowY = 640;
+        v1.DockCornerCode = 3;
+        v1.TopMost = true;
+        v1.HideOnFullscreen = true;
+        v1.TotalCompanionSeconds = 3600;
+        v1.LastSavedUnixSec = 1700000000;
+        v1.Extras["petName"] = "Mochi";
+        v1.Extras["coins"] = "950";
+        bool saved1 = CompanionStateStore.SaveAtomic(basePath, v1);
+
+        CompanionProfile v2 = new CompanionProfile();
+        v2.MonitorIndex = 1;
+        v2.WindowX = -200;
+        v2.WindowY = 500;
+        v2.TotalCompanionSeconds = 7200;
+        v2.LastSavedUnixSec = 1700003600;
+        v2.Extras["petName"] = "Mochi";
+        v2.Extras["coins"] = "1800";
+        bool saved2 = CompanionStateStore.SaveAtomic(basePath, v2);
+
+        // 模拟系统掉电把主存档写残截断！
+        File.WriteAllText(basePath, "{\"schema\":1,\"monitor\":1,\"broken_half_write");
+        bool recovered;
+        CompanionProfile loaded = CompanionStateStore.LoadWithRecovery(basePath, out recovered);
+        // 回滚自愈后再次读取主文件，应直接成功且不再触发 backup 恢复
+        bool recoveredAgain;
+        CompanionProfile healed = CompanionStateStore.LoadWithRecovery(basePath, out recoveredAgain);
+
+        bool storeOk = saved1 && saved2
+            && recovered && loaded != null
+            && loaded.WindowX == -320 && loaded.TotalCompanionSeconds == 3600
+            && loaded.Extras["petName"] == "Mochi" && loaded.Extras["coins"] == "950"
+            && !recoveredAgain && healed != null && healed.WindowX == -320;
+
+        if (File.Exists(basePath)) { File.Delete(basePath); }
+        if (File.Exists(bakPath)) { File.Delete(bakPath); }
+        if (File.Exists(tmpPath)) { File.Delete(tmpPath); }
+        Console.WriteLine("atomic-state-backup-recovery: " + Convert.ToString(storeOk ? 1 : 0));
+
+        // 3. 离线挂机收益核算（防系统时钟回拨 + 24h 上限封顶 + 50% 离线折算 + 加成倍率）
+        IdleProgressCalculator calc = new IdleProgressCalculator(2.0, 0.5, 3600, 60);
+        // 正常离线 1000s，双倍月卡加成：1000 * 2.0 * 0.5 * 2.0 = 2000.0
+        IdleRewardResult normal = calc.CalculateOffline(10000, 11000, 2.0);
+        // 超时离线 9000s -> 封顶 3600s：3600 * 2.0 * 0.5 * 1.0 = 3600.0
+        IdleRewardResult capped = calc.CalculateOffline(10000, 19000, 1.0);
+        // 系统时钟回拨（now < last）-> 收益为 0 且告警标记为 true
+        IdleRewardResult rollback = calc.CalculateOffline(10000, 9500, 1.0);
+        // 低于最小结算阈值 60s -> 收益为 0
+        IdleRewardResult tooShort = calc.CalculateOffline(10000, 10030, 1.0);
+
+        bool idleOk = !normal.WasCapped && !normal.ClockRollbackDetected && normal.EffectiveSeconds == 1000 && normal.Reward > 1999.9 && normal.Reward < 2000.1
+            && capped.WasCapped && capped.EffectiveSeconds == 3600 && capped.Reward > 3599.9 && capped.Reward < 3600.1
+            && rollback.ClockRollbackDetected && rollback.EffectiveSeconds == 0 && rollback.Reward == 0.0
+            && !tooShort.ClockRollbackDetected && tooShort.EffectiveSeconds == 0 && tooShort.Reward == 0.0;
+        Console.WriteLine("idle-progress-anti-rollback: " + Convert.ToString(idleOk ? 1 : 0));
+    }
+}

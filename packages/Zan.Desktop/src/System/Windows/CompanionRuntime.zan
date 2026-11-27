@@ -1,0 +1,421 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace System.Windows;
+
+// 动态穿透控制器中的实体命中热区（支持矩形与圆形角色轮廓）。
+public class CompanionHitZone {
+    public bool IsCircle;
+    public int X;
+    public int Y;
+    public int W;
+    public int H;
+    public int Radius;
+
+    public static CompanionHitZone Rect(int x, int y, int w, int h) {
+        CompanionHitZone z = new CompanionHitZone();
+        z.IsCircle = false;
+        z.X = x;
+        z.Y = y;
+        z.W = w;
+        z.H = h;
+        z.Radius = 0;
+        return z;
+    }
+
+    public static CompanionHitZone Circle(int cx, int cy, int radius) {
+        CompanionHitZone z = new CompanionHitZone();
+        z.IsCircle = true;
+        z.X = cx;
+        z.Y = cy;
+        z.W = 0;
+        z.H = 0;
+        z.Radius = radius;
+        return z;
+    }
+
+    public bool Contains(int px, int py) {
+        if (this.IsCircle) {
+            long dx = (long)(px - this.X);
+            long dy = (long)(py - this.Y);
+            long r = (long)this.Radius;
+            return r > 0 && (dx * dx + dy * dy <= r * r);
+        }
+        return px >= this.X && py >= this.Y
+            && px < this.X + this.W && py < this.Y + this.H;
+    }
+}
+
+// 像素级动态鼠标穿透控制器（透明桌面宠物/挂机陪伴软件核心体验组件）：
+// - 光标落在透明背景时自动切为 ClickThrough=true，让用户无感操作底层桌面/浏览器；
+// - 光标移回角色实体像素（Alpha >= Threshold）或命中热区时 0ms 瞬时恢复可点击拖拽；
+// - 离开实体进入透明区带可配迟滞防抖（ExitDebounceMs），避免轮廓边缘抖动频繁刷 OS 样式。
+public class CompanionHitPassThrough {
+    private int alphaThreshold;
+    private long exitDebounceMs;
+    private bool currentClickThrough;
+    private bool pendingPassThrough;
+    private long pendingSinceMs;
+    private int transitionCount;
+    private List<CompanionHitZone> zones;
+
+    public CompanionHitPassThrough(int alphaThreshold, long exitDebounceMs) {
+        this.alphaThreshold = alphaThreshold >= 1 && alphaThreshold <= 255 ? alphaThreshold : 24;
+        this.exitDebounceMs = exitDebounceMs >= 0 ? exitDebounceMs : 60;
+        this.currentClickThrough = true;
+        this.pendingPassThrough = false;
+        this.pendingSinceMs = 0;
+        this.transitionCount = 0;
+        this.zones = new List<CompanionHitZone>();
+    }
+
+    public bool CurrentClickThrough { get { return this.currentClickThrough; } }
+    public int TransitionCount { get { return this.transitionCount; } }
+    public int AlphaThreshold { get { return this.alphaThreshold; } }
+
+    public void AddRectZone(int x, int y, int w, int h) {
+        this.zones.Add(CompanionHitZone.Rect(x, y, w, h));
+    }
+
+    public void AddCircleZone(int cx, int cy, int radius) {
+        this.zones.Add(CompanionHitZone.Circle(cx, cy, radius));
+    }
+
+    public void ClearZones() {
+        this.zones.Clear();
+    }
+
+    public bool HitTestZones(int localX, int localY) {
+        for (int i = 0; i < this.zones.Count; i = i + 1) {
+            if (this.zones[i].Contains(localX, localY)) { return true; }
+        }
+        return false;
+    }
+
+    // 采样 ARGB32 像素数组（0xAARRGGBB）判断光标处是否为不透明实体像素。
+    public bool HitTestArgbPixels(int[] argbPixels, int width, int height, int localX, int localY) {
+        if (argbPixels == null || width <= 0 || height <= 0) { return false; }
+        if (localX < 0 || localY < 0 || localX >= width || localY >= height) { return false; }
+        int idx = localY * width + localX;
+        if (idx < 0 || idx >= argbPixels.Length) { return false; }
+        int alpha = (argbPixels[idx] >> 24) & 255;
+        return alpha >= this.alphaThreshold;
+    }
+
+    // 输入当前帧光标是否命中不透明实体（hitOpaque）与当前单调毫秒时间，
+    // 返回 true 表示 CurrentClickThrough 发生真实状态切换，调用方应同步调用 Window.SetClickThrough。
+    public bool Update(bool hitOpaque, long nowMs) {
+        if (hitOpaque) {
+            this.pendingPassThrough = false;
+            if (this.currentClickThrough) {
+                this.currentClickThrough = false;
+                this.transitionCount = this.transitionCount + 1;
+                return true;
+            }
+            return false;
+        }
+
+        // 光标位于透明区：若本就处于穿透态则无变化；若处于可交互态则应用退出迟滞防抖。
+        if (this.currentClickThrough) {
+            this.pendingPassThrough = false;
+            return false;
+        }
+        if (this.exitDebounceMs <= 0) {
+            this.currentClickThrough = true;
+            this.pendingPassThrough = false;
+            this.transitionCount = this.transitionCount + 1;
+            return true;
+        }
+        if (!this.pendingPassThrough) {
+            this.pendingPassThrough = true;
+            this.pendingSinceMs = nowMs;
+            return false;
+        }
+        if (nowMs - this.pendingSinceMs >= this.exitDebounceMs) {
+            this.currentClickThrough = true;
+            this.pendingPassThrough = false;
+            this.transitionCount = this.transitionCount + 1;
+            return true;
+        }
+        return false;
+    }
+}
+
+// 桌面陪伴持久化档案（保存多屏停靠记忆、穿透/置顶/躲全屏偏好、累计陪伴时长与扩展存档键值）。
+public class CompanionProfile {
+    public int SchemaVersion;
+    public int MonitorIndex;
+    public int WindowX;
+    public int WindowY;
+    public int DockCornerCode;
+    public bool TopMost;
+    public bool ClickThrough;
+    public bool HideOnFullscreen;
+    public bool AutoStart;
+    public long TotalCompanionSeconds;
+    public long LastSavedUnixSec;
+    public Dictionary<string, string> Extras;
+
+    public CompanionProfile() {
+        this.SchemaVersion = 1;
+        this.MonitorIndex = 0;
+        this.WindowX = 0;
+        this.WindowY = 0;
+        this.DockCornerCode = 3; // BottomRight
+        this.TopMost = true;
+        this.ClickThrough = false;
+        this.HideOnFullscreen = true;
+        this.AutoStart = false;
+        this.TotalCompanionSeconds = 0;
+        this.LastSavedUnixSec = 0;
+        this.Extras = new Dictionary<string, string>();
+    }
+}
+
+// 防掉电/强杀崩溃的商业级原子存档器：
+// 写入链路：序列化 JSON + 64 位 FNV-1a 完整性校验码 -> 写 .tmp -> 轮换旧主文件为 .bak -> 替换主文件；
+// 读取链路：校验主文件 JSON 与校验码，若损坏或截断自动无缝回滚 .bak 并自愈主文件。
+public static class CompanionStateStore {
+    private static string EscapeJson(string s) {
+        if (s == null) { return ""; }
+        string res = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch == '\\') { res = res + "\\\\"; }
+            else if (ch == '"') { res = res + "\\\""; }
+            else if (ch == '\n') { res = res + "\\n"; }
+            else if (ch == '\r') { res = res + "\\r"; }
+            else if (ch == '\t') { res = res + "\\t"; }
+            else { res = res + ch.ToString(); }
+        }
+        return res;
+    }
+
+    private static int CompareOrdinal(string a, string b) {
+        int na = a != null ? a.Length : 0;
+        int nb = b != null ? b.Length : 0;
+        int n = na < nb ? na : nb;
+        for (int i = 0; i < n; i = i + 1) {
+            int ca = (int)a[i];
+            int cb = (int)b[i];
+            if (ca != cb) { return ca - cb; }
+        }
+        return na - nb;
+    }
+
+    private static string ComputeChecksum(CompanionProfile p) {
+        string canonical = Convert.ToString(p.SchemaVersion) + "|"
+            + Convert.ToString(p.MonitorIndex) + "|"
+            + Convert.ToString(p.WindowX) + "|"
+            + Convert.ToString(p.WindowY) + "|"
+            + Convert.ToString(p.DockCornerCode) + "|"
+            + (p.TopMost ? "1" : "0") + "|"
+            + (p.ClickThrough ? "1" : "0") + "|"
+            + (p.HideOnFullscreen ? "1" : "0") + "|"
+            + (p.AutoStart ? "1" : "0") + "|"
+            + Convert.ToString(p.TotalCompanionSeconds) + "|"
+            + Convert.ToString(p.LastSavedUnixSec);
+
+        if (p.Extras != null && p.Extras.Count > 0) {
+            List<string> keys = new List<string>();
+            foreach (string ek in p.Extras) { keys.Add(ek); }
+            for (int i = 1; i < keys.Count; i = i + 1) {
+                string key = keys[i];
+                int j = i - 1;
+                while (j >= 0 && CompareOrdinal(keys[j], key) > 0) {
+                    keys[j + 1] = keys[j];
+                    j = j - 1;
+                }
+                keys[j + 1] = key;
+            }
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                string k = keys[i];
+                canonical = canonical + "|" + k + "=" + p.Extras[k];
+            }
+        }
+
+        ulong hash = 14695981039346656037UL;
+        for (int i = 0; i < canonical.Length; i = i + 1) {
+            hash = hash ^ (ulong)(int)canonical[i];
+            hash = hash * 1099511628211UL;
+        }
+        long hi = (long)((hash >> 32) & 0x7FFFFFFFUL);
+        long lo = (long)(hash & 0xFFFFFFFFUL);
+        return Convert.ToString(hi) + "-" + Convert.ToString(lo);
+    }
+
+    private static string Serialize(CompanionProfile p) {
+        string crc = ComputeChecksum(p);
+        string json = "{"
+            + "\"schema\":" + Convert.ToString(p.SchemaVersion) + ","
+            + "\"monitor\":" + Convert.ToString(p.MonitorIndex) + ","
+            + "\"x\":" + Convert.ToString(p.WindowX) + ","
+            + "\"y\":" + Convert.ToString(p.WindowY) + ","
+            + "\"corner\":" + Convert.ToString(p.DockCornerCode) + ","
+            + "\"topMost\":" + (p.TopMost ? "true" : "false") + ","
+            + "\"clickThrough\":" + (p.ClickThrough ? "true" : "false") + ","
+            + "\"hideOnFullscreen\":" + (p.HideOnFullscreen ? "true" : "false") + ","
+            + "\"autoStart\":" + (p.AutoStart ? "true" : "false") + ","
+            + "\"totalSec\":" + Convert.ToString(p.TotalCompanionSeconds) + ","
+            + "\"savedAt\":" + Convert.ToString(p.LastSavedUnixSec) + ","
+            + "\"extras\":{";
+        bool first = true;
+        if (p.Extras != null) {
+            foreach (string k in p.Extras) {
+                if (!first) { json = json + ","; }
+                first = false;
+                json = json + "\"" + EscapeJson(k) + "\":\"" + EscapeJson(p.Extras[k]) + "\"";
+            }
+        }
+        json = json + "},\"crc\":\"" + crc + "\"}";
+        return json;
+    }
+
+    private static CompanionProfile TryParseValidated(string text) {
+        if (text == null || text == "") { return null; }
+        JsonDoc doc = JsonDoc.Parse(text);
+        if (doc == null) { return null; }
+        int crcSlot = doc.Get("crc");
+        if (crcSlot < 0) { return null; }
+        string storedCrc = doc.StrOfSlot(crcSlot);
+
+        CompanionProfile p = new CompanionProfile();
+        p.SchemaVersion = doc.IntAt(doc.Get("schema"), 1);
+        p.MonitorIndex = doc.IntAt(doc.Get("monitor"), 0);
+        p.WindowX = doc.IntAt(doc.Get("x"), 0);
+        p.WindowY = doc.IntAt(doc.Get("y"), 0);
+        p.DockCornerCode = doc.IntAt(doc.Get("corner"), 3);
+        p.TopMost = doc.BoolAt(doc.Get("topMost"), true);
+        p.ClickThrough = doc.BoolAt(doc.Get("clickThrough"), false);
+        p.HideOnFullscreen = doc.BoolAt(doc.Get("hideOnFullscreen"), true);
+        p.AutoStart = doc.BoolAt(doc.Get("autoStart"), false);
+        p.TotalCompanionSeconds = doc.LongAt(doc.Get("totalSec"), 0);
+        p.LastSavedUnixSec = doc.LongAt(doc.Get("savedAt"), 0);
+
+        int ext = doc.Get("extras");
+        if (ext >= 0) {
+            int cnt = doc.Count(ext);
+            for (int i = 0; i < cnt; i = i + 1) {
+                string k = doc.KeyAt(ext, i);
+                int vSlot = doc.ValAt(ext, i);
+                string v = vSlot >= 0 ? doc.StrOfSlot(vSlot) : "";
+                if (k != null && k != "") {
+                    p.Extras[k] = v != null ? v : "";
+                }
+            }
+        }
+
+        if (ComputeChecksum(p) != storedCrc) {
+            return null;
+        }
+        return p;
+    }
+
+    // 原子落盘：写 .tmp -> 备份旧主文件到 .bak -> 覆盖主文件 -> 删除 .tmp。
+    public static bool SaveAtomic(string path, CompanionProfile profile) {
+        if (path == null || path == "" || profile == null) { return false; }
+        string tmpPath = path + ".tmp";
+        string bakPath = path + ".bak";
+        string content = Serialize(profile);
+        try {
+            File.WriteAllText(tmpPath, content);
+            string verify = File.ReadAllText(tmpPath);
+            if (verify != content) { return false; }
+            if (File.Exists(path)) {
+                string prev = File.ReadAllText(path);
+                if (TryParseValidated(prev) != null) {
+                    File.WriteAllText(bakPath, prev);
+                }
+            }
+            File.WriteAllText(path, content);
+            if (File.Exists(tmpPath)) { File.Delete(tmpPath); }
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    // 读取并校验存档：主文件损坏/截断/校验失败时自动回滚 .bak 并修复主文件。
+    public static CompanionProfile LoadWithRecovery(string path, out bool recoveredFromBackup) {
+        recoveredFromBackup = false;
+        if (path == null || path == "") { return null; }
+        if (File.Exists(path)) {
+            try {
+                CompanionProfile primary = TryParseValidated(File.ReadAllText(path));
+                if (primary != null) { return primary; }
+            } catch (Exception) {
+                // 主文件读取异常时走 .bak 兜底
+            }
+        }
+        string bakPath = path + ".bak";
+        if (File.Exists(bakPath)) {
+            try {
+                string bakText = File.ReadAllText(bakPath);
+                CompanionProfile backup = TryParseValidated(bakText);
+                if (backup != null) {
+                    recoveredFromBackup = true;
+                    File.WriteAllText(path, bakText);
+                    return backup;
+                }
+            } catch (Exception) {
+                return null;
+            }
+        }
+        return null;
+    }
+}
+
+// 离线/挂机收益核算结果。
+public class IdleRewardResult {
+    public long RawElapsedSeconds;
+    public long EffectiveSeconds;
+    public double Reward;
+    public bool WasCapped;
+    public bool ClockRollbackDetected;
+
+    public IdleRewardResult(long rawSec, long effSec, double reward, bool capped, bool rollback) {
+        this.RawElapsedSeconds = rawSec;
+        this.EffectiveSeconds = effSec;
+        this.Reward = reward;
+        this.WasCapped = capped;
+        this.ClockRollbackDetected = rollback;
+    }
+}
+
+// 商业挂机游戏离线收益核算器：
+// 内置系统时钟回拨防作弊检测、离线时长封顶（如 24 小时）、离线折算系数与最小结算阈值。
+public class IdleProgressCalculator {
+    public long MaxOfflineSeconds;
+    public long MinClaimSeconds;
+    public double OfflineEfficiency;
+    public double BaseRatePerSecond;
+
+    public IdleProgressCalculator(double baseRatePerSecond, double offlineEfficiency,
+                                  long maxOfflineSeconds, long minClaimSeconds) {
+        this.BaseRatePerSecond = baseRatePerSecond >= 0.0 ? baseRatePerSecond : 1.0;
+        this.OfflineEfficiency = offlineEfficiency >= 0.0 ? offlineEfficiency : 0.5;
+        this.MaxOfflineSeconds = maxOfflineSeconds > 0 ? maxOfflineSeconds : 86400;
+        this.MinClaimSeconds = minClaimSeconds >= 0 ? minClaimSeconds : 0;
+    }
+
+    public IdleRewardResult CalculateOffline(long lastUnixSec, long nowUnixSec, double bonusMultiplier) {
+        if (nowUnixSec < lastUnixSec) {
+            return new IdleRewardResult(nowUnixSec - lastUnixSec, 0, 0.0, false, true);
+        }
+        long elapsed = nowUnixSec - lastUnixSec;
+        if (elapsed < this.MinClaimSeconds) {
+            return new IdleRewardResult(elapsed, 0, 0.0, false, false);
+        }
+        bool capped = false;
+        long eff = elapsed;
+        if (eff > this.MaxOfflineSeconds) {
+            eff = this.MaxOfflineSeconds;
+            capped = true;
+        }
+        double mult = bonusMultiplier > 0.0 ? bonusMultiplier : 1.0;
+        double reward = (double)eff * this.BaseRatePerSecond * this.OfflineEfficiency * mult;
+        return new IdleRewardResult(elapsed, eff, reward, capped, false);
+    }
+}

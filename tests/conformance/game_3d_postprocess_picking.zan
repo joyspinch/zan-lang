@@ -1,0 +1,192 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DPostProcessPickingTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int Lum(int argb) {
+        return (((argb >> 16) & 255) + ((argb >> 8) & 255) + (argb & 255)) / 3;
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        int smallQuad = cv.MeshUpload(MakeQuad(0.4f, 0.4f));
+        int fullQuad = cv.MeshUpload(MakeQuad(4.0f, 4.0f));
+
+        Camera3D orthoCam = new Camera3D();
+        orthoCam.Orthographic = true;
+        orthoCam.OrthoHeight = 2.0f;
+        orthoCam.AspectRatio = 1.0f;
+        orthoCam.Position = new Vector3(0.0f, 0.0f, 5.0f);
+        orthoCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        orthoCam.NearPlane = 0.1f;
+        orthoCam.FarPlane = 20.0f;
+
+        Renderer3D renderer = new Renderer3D(32);
+
+        // 1. GPU 13-tap 亮部 Bloom 泛光实测：
+        // 屏幕中心 [-0.4..0.4]（对应像素 51..77）画亮黄色自发光方块，背景纯黑。
+        // 采样方块外 4px 处 (x=81, y=64)：无 Bloom 时纯黑(0)；开 Bloom 后泛起清晰光晕！
+        SceneNode bloomWorld = new SceneNode("bloom_world");
+        SceneNode core = new SceneNode("core");
+        core.MeshKey = smallQuad;
+        core.Material = Material.Emissive(1.0f, 0.95f, 0.3f);
+        core.BoundsRadius = 2.0f;
+        bloomWorld.AddChild(core);
+
+        RenderPlan bloomPlan = new RenderPlan(orthoCam);
+        bloomPlan.AmbientRed = 0.0f;
+        bloomPlan.AmbientGreen = 0.0f;
+        bloomPlan.AmbientBlue = 0.0f;
+        bloomPlan.Build(bloomWorld);
+
+        renderer.PostProcess = null;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, bloomPlan);
+        int haloNoBloom = Lum(zan_gui_read_pixel(cv.SurfaceId(), 81, 64));
+
+        PostProcess ppBloom = new PostProcess();
+        ppBloom.BloomThreshold = 0.4f;
+        ppBloom.BloomIntensity = 1.6f;
+        renderer.PostProcess = ppBloom;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, bloomPlan);
+        int haloWithBloom = Lum(zan_gui_read_pixel(cv.SurfaceId(), 81, 64));
+        int coreWithBloom = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+        bool bloomOk = haloNoBloom == 0 && haloWithBloom > 15 && coreWithBloom > 180;
+        Console.WriteLine("gpu-postprocess-bloom: " + Convert.ToString(bloomOk ? 1 : 0));
+
+        // 2. GPU 径向 Vignette 暗角实测：
+        // 全屏均匀中灰平面，无暗角时中心与四角等亮；开启 VignetteStrength=0.9 后四角明显压暗。
+        SceneNode flatWorld = new SceneNode("flat_world");
+        SceneNode wall = new SceneNode("wall");
+        wall.MeshKey = fullQuad;
+        wall.Material = Material.Emissive(0.75f, 0.75f, 0.75f);
+        wall.BoundsRadius = 8.0f;
+        flatWorld.AddChild(wall);
+
+        RenderPlan flatPlan = new RenderPlan(orthoCam);
+        flatPlan.AmbientRed = 0.0f;
+        flatPlan.AmbientGreen = 0.0f;
+        flatPlan.AmbientBlue = 0.0f;
+        flatPlan.Build(flatWorld);
+
+        PostProcess ppVig = new PostProcess();
+        ppVig.VignetteStrength = 0.9f;
+        renderer.PostProcess = ppVig;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, flatPlan);
+        int vigCenter = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+        int vigCorner = Lum(zan_gui_read_pixel(cv.SurfaceId(), 4, 4));
+        bool vignetteOk = vigCenter > 170 && vigCenter > vigCorner + 80;
+        Console.WriteLine("gpu-postprocess-vignette: " + Convert.ToString(vignetteOk ? 1 : 0));
+
+        // 3. GPU 曝光 + Reinhard / ACES Filmic 色调映射实测：
+        // 0.75 灰度 * Exposure 1.8 = 1.35：None 裁切到 ~255；Reinhard 压到 1.35/2.35≈0.57(146)；ACES 压到 ~0.88(225)。
+        PostProcess ppNone = new PostProcess();
+        ppNone.Exposure = 1.8f;
+        ppNone.Tonemap = TonemapKind.None;
+        renderer.PostProcess = ppNone;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, flatPlan);
+        int lumNone = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        PostProcess ppRein = new PostProcess();
+        ppRein.Exposure = 1.8f;
+        ppRein.Tonemap = TonemapKind.Reinhard;
+        renderer.PostProcess = ppRein;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, flatPlan);
+        int lumRein = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        PostProcess ppAces = new PostProcess();
+        ppAces.Exposure = 1.8f;
+        ppAces.Tonemap = TonemapKind.Aces;
+        renderer.PostProcess = ppAces;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, flatPlan);
+        int lumAces = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        bool tonemapOk = lumNone >= 250 && lumRein < 165 && lumRein > 125
+            && lumAces < lumNone - 10 && lumAces > lumRein + 40;
+        Console.WriteLine("gpu-postprocess-tonemap: " + Convert.ToString(tonemapOk ? 1 : 0));
+
+        // 4. 俯仰 45 度透视相机 WorldToScreen <-> ScreenPointToRay 精确往返 + 正交相机平行射线
+        Camera3D pitchedCam = new Camera3D();
+        pitchedCam.Orthographic = false;
+        pitchedCam.FieldOfView = 1.04719755f;
+        pitchedCam.SetViewport(800, 600);
+        pitchedCam.Position = new Vector3(0.0f, 10.0f, 10.0f);
+        pitchedCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        pitchedCam.NearPlane = 0.1f;
+        pitchedCam.FarPlane = 100.0f;
+
+        Vector3 targetPt = new Vector3(2.0f, 1.5f, -1.0f);
+        float sx;
+        float sy;
+        float depth;
+        bool projected = Raycast3D.WorldToScreen(targetPt, 800, 600, pitchedCam, out sx, out sy, out depth);
+        Ray3D pickRay = Raycast3D.ScreenPointToRay((int)sx, (int)sy, 800, 600, pitchedCam);
+        float hitD;
+        bool pitchedHit = pickRay.IntersectSphere(targetPt, 0.08f, out hitD);
+
+        Ray3D orthoRay = Raycast3D.ScreenPointToRay(64, 64, 128, 128, orthoCam);
+        float orthoHitD;
+        bool orthoHit = orthoRay.IntersectSphere(new Vector3(0.0f, 0.0f, 0.0f), 0.1f, out orthoHitD);
+
+        bool rayOk = projected && depth > 0.0f && depth < 1.0f && pitchedHit && orthoHit;
+        Console.WriteLine("raycast-pitched-camera: " + Convert.ToString(rayOk ? 1 : 0));
+
+        // 5. ScenePicker3D 层级缩放世界矩阵拾取（忽略不可见节点，命中最近实体节点）
+        SceneNode pickRoot = new SceneNode("pick_root");
+        SceneNode group = new SceneNode("group");
+        group.SetPosition(2.0f, 1.5f, -1.0f);
+        group.SetScale(2.0f, 2.0f, 2.0f);
+
+        SceneNode hiddenFront = new SceneNode("hidden_front");
+        hiddenFront.MeshKey = smallQuad;
+        hiddenFront.BoundsRadius = 1.0f;
+        hiddenFront.Visible = false;
+        hiddenFront.SetPosition(0.0f, 0.5f, 0.5f);
+        group.AddChild(hiddenFront);
+
+        SceneNode targetNode = new SceneNode("target_crystal");
+        targetNode.MeshKey = smallQuad;
+        targetNode.BoundsRadius = 0.4f; // 世界半径 0.8
+        group.AddChild(targetNode);
+
+        SceneNode farNode = new SceneNode("far_pillar");
+        farNode.MeshKey = smallQuad;
+        farNode.BoundsRadius = 0.6f;
+        farNode.SetPosition(0.0f, -3.0f, -3.0f);
+        group.AddChild(farNode);
+
+        pickRoot.AddChild(group);
+
+        ScenePickHit picked = ScenePicker3D.PickScreen(pickRoot, (int)sx, (int)sy, 800, 600, pitchedCam);
+        bool pickerOk = picked != null && picked.Node == targetNode && picked.Distance > 0.0f;
+        Console.WriteLine("scene-picker-3d: " + Convert.ToString(pickerOk ? 1 : 0));
+
+        renderer.Dispose();
+        cv.Destroy();
+    }
+}

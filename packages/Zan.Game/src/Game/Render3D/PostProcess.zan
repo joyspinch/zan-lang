@@ -3,13 +3,8 @@ using System.Numerics;
 
 namespace Game.Render3D;
 
-// 后处理参数。
-//
-// **当前真正参与计算的是曝光、色调映射与雾**——这三项都能按"每个物体
-// 一次"的方式在计划层算完。泛光与暗角是屏幕空间效果，需要整帧缓冲，
-// 当前 GPU 后端没有后处理 pass（TASKS 已登记），所以这两个字段只是
-// 参数契约，暂不参与计算——写在这里是为了将来原生侧接 pass 时接口
-// 不用再改。
+// 后处理参数（同时支持 CPU 计划层逐物计算与 Renderer3D GPU 全屏后处理 Pass）：
+// 涵盖曝光（Exposure）、Reinhard/ACES Filmic 色调映射、线性雾、径向暗角（Vignette）与亮部高光泛光（Bloom）。
 public class PostProcess {
     // 曝光（乘在颜色上，1 = 不变）。
     public float Exposure;
@@ -63,11 +58,31 @@ public class PostProcess {
             r = r / (1.0f + r);
             g = g / (1.0f + g);
             b = b / (1.0f + b);
+        } else if (this.Tonemap == TonemapKind.Aces) {
+            r = AcesCurve(r);
+            g = AcesCurve(g);
+            b = AcesCurve(b);
         }
 
         outRed = Clamp01(r);
         outGreen = Clamp01(g);
         outBlue = Clamp01(b);
+    }
+
+    private static float AcesCurve(float x) {
+        if (x < 0.0f) { x = 0.0f; }
+        return (x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f);
+    }
+
+    // 是否有需要触发 GPU 全屏后处理 Pass 的有效配置。
+    public bool HasGpuPassEffect() {
+        float dExp = this.Exposure - 1.0f;
+        if (dExp < 0.0f) { dExp = 0.0f - dExp; }
+        return dExp > 0.001f
+            || this.Tonemap == TonemapKind.Reinhard
+            || this.Tonemap == TonemapKind.Aces
+            || this.VignetteStrength > 0.001f
+            || this.BloomIntensity > 0.001f;
     }
 
     private static float Clamp01(float value) {
