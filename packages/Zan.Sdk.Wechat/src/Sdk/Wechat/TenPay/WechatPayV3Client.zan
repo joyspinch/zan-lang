@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Json;
 using System.Security.Cryptography;
 using System.Net.External;
@@ -13,6 +14,7 @@ public class WechatPayV3Client {
     WechatApiTransport transport;
     RsaKey merchantKey;
     WechatPayPlatformKeyStore platformKeys;
+    object platformLock;
     string defaultPlatformSerial;
     bool requireResponseSignature;
 
@@ -24,6 +26,7 @@ public class WechatPayV3Client {
             throw new ArgumentException("MerchantPrivateKeyPem 不是有效的 RSA 私钥");
         }
         this.platformKeys = new WechatPayPlatformKeyStore();
+        this.platformLock = new object();
         this.defaultPlatformSerial = config.PlatformSerialNumber;
         this.requireResponseSignature = config.RequireResponseSignature;
         if (config.PlatformSerialNumber.Length > 0
@@ -67,8 +70,10 @@ public class WechatPayV3Client {
     public WechatPayV3Client SetPlatformPublicKey(string serial,
                                                   string publicKeyOrCertificatePem) {
         this.platformKeys.Add(serial, publicKeyOrCertificatePem);
-        this.defaultPlatformSerial = serial;
-        this.requireResponseSignature = true;
+        lock (this.platformLock) {
+            this.defaultPlatformSerial = serial;
+            this.requireResponseSignature = true;
+        }
         return this;
     }
 
@@ -152,6 +157,7 @@ public class WechatPayV3Client {
         if (allowPlain && !target.IsTls()) { downloader.PlainHttpMode(); }
         downloader.Timeout(this.transport.TimeoutMs());
         downloader.SetCallPolicy(this.transport.CallPolicy());
+        this.transport.CopyTlsSecurityTo(downloader);
         WechatRawResponse raw = await downloader.RequestRawAsync("GET", path, "", "", null);
         if (!raw.IsSuccess()) {
             WechatPayV3Client.ThrowHttpError(raw);
@@ -185,12 +191,14 @@ public class WechatPayV3Client {
         string nonce = response.Header("Wechatpay-Nonce");
         string signature = response.Header("Wechatpay-Signature");
         string serial = response.Header("Wechatpay-Serial");
+        bool requireSig;
+        lock (this.platformLock) { requireSig = this.requireResponseSignature; }
         if (timestamp.Length == 0 || nonce.Length == 0 || signature.Length == 0) {
-            return !this.requireResponseSignature;
+            return !requireSig;
         }
         if (!WechatPayV3Client.TimestampFresh(timestamp)) { return false; }
         RsaKey key = this.PlatformKey(serial);
-        if (key == null) { return !this.requireResponseSignature; }
+        if (key == null) { return !requireSig; }
         string message = timestamp + "\n" + nonce + "\n" + response.Body + "\n";
         return key.VerifySha256(message, signature);
     }
@@ -246,8 +254,10 @@ public class WechatPayV3Client {
 
     public RsaKey PlatformKey(string serial) {
         if (serial.Length > 0) { return this.platformKeys.Get(serial); }
-        if (this.defaultPlatformSerial.Length > 0) {
-            RsaKey configured = this.platformKeys.Get(this.defaultPlatformSerial);
+        string defSerial;
+        lock (this.platformLock) { defSerial = this.defaultPlatformSerial; }
+        if (defSerial.Length > 0) {
+            RsaKey configured = this.platformKeys.Get(defSerial);
             if (configured != null) { return configured; }
         }
         return this.platformKeys.First();
@@ -282,7 +292,9 @@ public class WechatPayV3Client {
     }
 
     public string EncryptSensitive(string plaintext) {
-        return this.EncryptSensitiveWithSerial(plaintext, this.defaultPlatformSerial);
+        string defSerial;
+        lock (this.platformLock) { defSerial = this.defaultPlatformSerial; }
+        return this.EncryptSensitiveWithSerial(plaintext, defSerial);
     }
 
     public string EncryptSensitiveWithSerial(string plaintext, string serial) {
@@ -338,8 +350,8 @@ public class WechatPayV3Client {
     // 下载微信支付平台证书；algorithmType 为 RSA、SM2 或 ALL。
     public async WechatRawResponse DownloadCertificatesAsync(string algorithmType) {
         string query = "";
-        if (algorithmType.Length > 0) {
-            query = "algorithm_type=" + algorithmType;
+        if (algorithmType != null && algorithmType.Length > 0) {
+            query = "algorithm_type=" + Encoding.UrlEncode(algorithmType);
         }
         return await this.RequestJsonAsync("GET", "/v3/certificates", query, "");
     }

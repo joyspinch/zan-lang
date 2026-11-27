@@ -369,6 +369,10 @@ public class LicenseClient {
         if (this.state.sessionToken.Length > 0) {
             LicenseCheckResult r = await this.Heartbeat(true);
             if (r.ok) { return r; }
+            // 保留服务端明确拒绝与到期结论，仅在网络层故障时返回 network_fail。
+            if (r.reason == "server_reject" || r.reason == "expired") {
+                return r;
+            }
             return LicenseCheckResult.Fail("network_fail",
                 "无法连接授权服务端确认授权，请检查网络后重试");
         }
@@ -406,6 +410,7 @@ public class LicenseClient {
     // 会话心跳：带 session 调 /api/license/heartbeat，服务端校验座位
     // 与有效期并回发续期窗口；返回的 JSON 即服务端模板的响应契约。
     public async LicenseCheckResult Heartbeat(bool quiet) {
+        this.EnsureLoaded();
         try {
             JsonValue req = JsonValue.NewObject();
             req.Put("product", JsonValue.NewStr(this.product));
@@ -475,9 +480,14 @@ public class LicenseClient {
                 this.state.sessionToken = d.Str("session", "");
                 this.state.expiresAt = d.Long("expires_at", 0);
                 this.state.graceSeconds = d.Int("grace_seconds", 86400);
-                this.state.lastHeartbeat = DateTime.UtcNow().ToUnixSeconds();
+                long now = DateTime.UtcNow().ToUnixSeconds();
+                this.state.lastHeartbeat = now;
                 this.Persist();
-                return this.OkResult(DateTime.UtcNow().ToUnixSeconds());
+                if (this.state.expiresAt != 0 && this.state.expiresAt <= now) {
+                    return LicenseCheckResult.Fail("expired",
+                        "授权已过期，请续费或更换授权");
+                }
+                return this.OkResult(now);
             }
             string msg = env == null ? "激活失败" : env.Str("msg", "激活失败");
             return LicenseCheckResult.Fail("server_reject", msg);
@@ -512,9 +522,14 @@ public class LicenseClient {
                 this.state.sessionToken = d.Str("session", "");
                 this.state.expiresAt = d.Long("expires_at", 0);
                 this.state.graceSeconds = d.Int("grace_seconds", 86400);
-                this.state.lastHeartbeat = DateTime.UtcNow().ToUnixSeconds();
+                long now = DateTime.UtcNow().ToUnixSeconds();
+                this.state.lastHeartbeat = now;
                 this.Persist();
-                return this.OkResult(DateTime.UtcNow().ToUnixSeconds());
+                if (this.state.expiresAt != 0 && this.state.expiresAt <= now) {
+                    return LicenseCheckResult.Fail("expired",
+                        "授权已过期，请续费或更换授权");
+                }
+                return this.OkResult(now);
             }
             string msg = env == null ? "登录失败" : env.Str("msg", "登录失败");
             return LicenseCheckResult.Fail("server_reject", msg);

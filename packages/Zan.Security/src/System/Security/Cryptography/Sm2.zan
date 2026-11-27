@@ -70,6 +70,19 @@ public class Sm2 {
     // 取值 [1, n-1]。将 r 写入 outSig[0..31]，s 写入 outSig[32..63]。
     public static void Sign(BigInt e, BigInt d, BigInt k, string outSig) {
         init();
+        if (outSig == null || outSig.Length < 64) { return; }
+        if (e == null || d == null || k == null) {
+            writeBE32(outSig, 0, BigInt.zero());
+            writeBE32(outSig, 32, BigInt.zero());
+            return;
+        }
+        // GB/T 32918.2 要求私钥 d ∈ [1, n-2]（d == n-1 会导致 1+d ≡ 0 mod n）
+        BigInt nMinus1 = BigInt.sub(N, BigInt.one());
+        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, nMinus1) >= 0) {
+            writeBE32(outSig, 0, BigInt.zero());
+            writeBE32(outSig, 32, BigInt.zero());
+            return;
+        }
         if (k.isZero()) {
             byte[] rb = RandomNumberGenerator.GetBytes(32);
             if (rb == null) {
@@ -77,8 +90,7 @@ public class Sm2 {
                 writeBE32(outSig, 32, BigInt.zero());
                 return;
             }
-            k = BigInt.add(BigInt.mod(BigInt.FromBytesBE(rb, 32),
-                                      BigInt.sub(N, BigInt.one())), BigInt.one());
+            k = BigInt.add(BigInt.mod(BigInt.FromBytesBE(rb, 32), nMinus1), BigInt.one());
         }
         BigInt inv1d = ninv(nmod(BigInt.add(BigInt.one(), d)));
         long[] kl = new long[8];
@@ -89,11 +101,14 @@ public class Sm2 {
             scalarToLimbs(k, kl);
             if (EcField256.ScalarMulG(EcField256.CurveSm2, kl, px, py)) {
                 BigInt r = nmod(BigInt.add(e, EcField256.ToBigInt(px)));
-                BigInt s = nmul(inv1d, nsub(k, nmul(r, d)));
-                if (!(r.isZero()) && !(s.isZero())) {
-                    writeBE32(outSig, 0, r);
-                    writeBE32(outSig, 32, s);
-                    return;
+                BigInt rk = nmod(BigInt.add(r, k));
+                if (!(r.isZero()) && !(rk.isZero())) {
+                    BigInt s = nmul(inv1d, nsub(k, nmul(r, d)));
+                    if (!(s.isZero())) {
+                        writeBE32(outSig, 0, r);
+                        writeBE32(outSig, 32, s);
+                        return;
+                    }
                 }
             }
             k = nmod(BigInt.add(k, BigInt.one()));
@@ -160,8 +175,8 @@ public class Sm2 {
         if (outLen == null || outLen.Count == 0) { return null; }
         outLen[0] = -1;
         if (px == null || py == null || k == null) { return null; }
-        if (msgLen < 0 || msgLen > 2147483591 - 97) { return null; }
-        if (msgLen > 0 && (msg == null || msgLen > msg.Length)) { return null; }
+        if (msgLen <= 0 || msgLen > 2147483591 - 97) { return null; }
+        if (msg == null || msgLen > msg.Length) { return null; }
         if (k.isZero() || BigInt.cmp(k, N) >= 0) { return null; }
 
         EcCurveData cd = EcField256.GetCurve(EcField256.CurveSm2);
@@ -184,6 +199,9 @@ public class Sm2 {
         EcField256.ToBytesBE(kpx, z, 0);
         EcField256.ToBytesBE(kpy, z, 32);
         byte[] t = kdf(z, 64, msgLen);
+        int tNonZero = 0;
+        for (int i = 0; i < msgLen; i = i + 1) { tNonZero = tNonZero | (t[i] & 255); }
+        if (tNonZero == 0) { return null; }
 
         int total = 1 + 64 + 32 + msgLen;
         byte[] outb = new byte[total];

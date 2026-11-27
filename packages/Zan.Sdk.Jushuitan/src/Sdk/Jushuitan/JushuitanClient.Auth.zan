@@ -16,17 +16,51 @@ public partial class JushuitanClient {
         return JushuitanClient.AuthorizationUrl + "?" + JushuitanSign.FormEncode(fields);
     }
 
+    private static bool FixedEquals(string a, string b) {
+        if (a == null || b == null) { return false; }
+        int diff = a.Length ^ b.Length;
+        int n = a.Length < b.Length ? a.Length : b.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            diff = diff | ((a[i] & 255) ^ (b[i] & 255));
+        }
+        return diff == 0;
+    }
+
     // 传入解码后的 GET 查询参数以及本次授权请求保存的预期 state。
     public string VerifyAuthorizationCallback(Dictionary<string, string> fields, string expectedState) {
+        return this.VerifyAuthorizationCallback(fields, expectedState, 0L);
+    }
+
+    // maxAgeSeconds > 0 时额外校验回调 timestamp 与本机 UTC 时间差，防止重放。
+    public string VerifyAuthorizationCallback(Dictionary<string, string> fields, string expectedState, long maxAgeSeconds) {
         JushuitanClient.RequireValue(expectedState, "state");
         string app = "";
         string code = "";
         string state = "";
-        if (fields == null || !fields.TryGetValue("app_key", out app) || app != this.appKey
-            || !fields.TryGetValue("state", out state) || state != expectedState
+        if (fields == null || !fields.TryGetValue("app_key", out app) || !JushuitanClient.FixedEquals(app, this.appKey)
+            || !fields.TryGetValue("state", out state) || !JushuitanClient.FixedEquals(state, expectedState)
             || !fields.TryGetValue("code", out code) || code == null || code.Length == 0
             || !JushuitanSign.Verify(fields, this.appSecret)) {
             throw new JushuitanException("auth.invalidCallback", "授权回调的应用、状态或签名无效", 0, "");
+        }
+        if (maxAgeSeconds > 0L) {
+            string tsStr = "";
+            if (!fields.TryGetValue("timestamp", out tsStr) || tsStr == null || tsStr.Length != 10) {
+                throw new JushuitanException("auth.invalidCallback", "授权回调缺少有效的 10 位 timestamp", 0, "");
+            }
+            long ts = 0L;
+            for (int i = 0; i < tsStr.Length; i = i + 1) {
+                int c = tsStr[i] & 255;
+                if (c < 48 || c > 57) {
+                    throw new JushuitanException("auth.invalidCallback", "授权回调 timestamp 非纯数字", 0, "");
+                }
+                ts = ts * 10L + (long)(c - 48);
+            }
+            long diff = DateTime.UtcNow().ToUnixSeconds() - ts;
+            if (diff < 0L) { diff = 0L - diff; }
+            if (diff > maxAgeSeconds) {
+                throw new JushuitanException("auth.expiredCallback", "授权回调 timestamp 超出允许时间窗口", 0, "");
+            }
         }
         return code;
     }
