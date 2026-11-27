@@ -38,9 +38,17 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh,
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh,
     const float *mvp, const float *model, int32_t color, const char *texture);
 
-/* Alpha 透明混合与深度写入状态控制（应用于后续 draw3d / draw3d_ex /
- * draw3d_skinned / draw3d_batch）。默认 enabled=0, depth_write=1。 */
+/* Alpha/Additive 混合与深度写入状态控制（应用于后续 draw3d / draw3d_ex /
+ * draw3d_skinned / draw3d_batch）。
+ * enabled: 0 = 关闭混合（不透明），1 = 标准 Alpha 混合（SRC_ALPHA, ONE_MINUS_SRC_ALPHA），
+ *          2 = 加法辉光混合（SRC_ALPHA, ONE，用于火焰/剑光/能量拖尾 VFX）。
+ * 默认 enabled=0, depth_write=1。 */
 ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write);
+
+/* 硬件面剔除状态控制（已自动适配 Canvas FBO 顶下 Y 翻转绕序，标准 CCW 正面保持为正面）：
+ * mode: 0 = 关闭剔除（双面 DoubleSided），1 = 剔除背面（Back，闭合实体 ~2x 像素填充提速），
+ *       2 = 剔除正面（Front）。默认 mode=0。 */
+ZAN_GAME_API int32_t zan_game_set_cull3d(int32_t mode);
 
 /* 多 Pass 3D 帧深度缓冲复用边界：begin_frame3d 清一次深度缓冲并开启跨调用
  * 深度保留（不透明静态 + 蒙皮角色 + 透明层共享同一 24-bit 深度缓冲）；

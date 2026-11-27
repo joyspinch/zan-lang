@@ -1,0 +1,185 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 硬件面剔除模式常量。
+public static class CullMode3D {
+    public const int None = 0;   // 双面渲染（DoubleSided）
+    public const int Back = 1;   // 剔除背面（标准 CCW 闭合模型推荐，~2x 像素填充提速）
+    public const int Front = 2;  // 剔除正面（轮廓反转/阴影特化）
+}
+
+// GPU 混合模式常量。
+public static class BlendMode3D {
+    public const int Opaque = 0;
+    public const int Alpha = 1;
+    public const int Additive = 2;
+}
+
+// 3D 面向相机公告牌（Billboard）生成器：
+// 支持全向球面公告牌（火焰/光晕/伤害飘字）与绕 Y 轴圆柱公告牌（草木/角色头顶血条/柱状光效），
+// 自动对齐相机正交基并保持 CCW 正面法线朝向相机。
+public static class Billboard3D {
+    // 生成全向面向相机的 3D 公告牌四边形（含 UV 0..1 与面向相机的法线）。
+    public static Mesh3D BuildSphericalQuad(Vector3 center, float width, float height, Camera3D camera) {
+        Mesh3D mesh = new Mesh3D();
+        if (camera == null || width <= 0.0f || height <= 0.0f) { return mesh; }
+        Vector3 right = camera.Right();
+        Vector3 fwd = camera.Forward();
+        Vector3 up = Vector3.Normalize(Vector3.Cross(right, fwd));
+        Vector3 normal = new Vector3(-fwd.X, -fwd.Y, -fwd.Z);
+        return BuildFromBasis(center, right, up, normal, width * 0.5f, height * 0.5f);
+    }
+
+    // 生成绕世界 Y 轴旋转的圆柱公告牌（保持竖直不仰俯，适合树叶/铭牌/魔法阵柱）。
+    public static Mesh3D BuildCylindricalYQuad(Vector3 center, float width, float height, Camera3D camera) {
+        Mesh3D mesh = new Mesh3D();
+        if (camera == null || width <= 0.0f || height <= 0.0f) { return mesh; }
+        Vector3 toCam = new Vector3(camera.Position.X - center.X, 0.0f, camera.Position.Z - center.Z);
+        float lenSq = toCam.X * toCam.X + toCam.Z * toCam.Z;
+        Vector3 normal = lenSq > 1e-6f ? Vector3.Normalize(toCam) : new Vector3(0.0f, 0.0f, 1.0f);
+        Vector3 up = new Vector3(0.0f, 1.0f, 0.0f);
+        Vector3 right = Vector3.Normalize(Vector3.Cross(up, normal));
+        return BuildFromBasis(center, right, up, normal, width * 0.5f, height * 0.5f);
+    }
+
+    private static Mesh3D BuildFromBasis(Vector3 center, Vector3 right, Vector3 up,
+                                         Vector3 normal, float hw, float hh) {
+        Mesh3D mesh = new Mesh3D();
+        Vector3 rx = new Vector3(right.X * hw, right.Y * hw, right.Z * hw);
+        Vector3 uy = new Vector3(up.X * hh, up.Y * hh, up.Z * hh);
+
+        Vector3 bl = new Vector3(center.X - rx.X - uy.X, center.Y - rx.Y - uy.Y, center.Z - rx.Z - uy.Z);
+        Vector3 br = new Vector3(center.X + rx.X - uy.X, center.Y + rx.Y - uy.Y, center.Z + rx.Z - uy.Z);
+        Vector3 tr = new Vector3(center.X + rx.X + uy.X, center.Y + rx.Y + uy.Y, center.Z + rx.Z + uy.Z);
+        Vector3 tl = new Vector3(center.X - rx.X + uy.X, center.Y - rx.Y + uy.Y, center.Z - rx.Z + uy.Z);
+
+        int i0 = mesh.Vertex(bl.X, bl.Y, bl.Z, normal.X, normal.Y, normal.Z, 0.0f, 1.0f);
+        int i1 = mesh.Vertex(br.X, br.Y, br.Z, normal.X, normal.Y, normal.Z, 1.0f, 1.0f);
+        int i2 = mesh.Vertex(tr.X, tr.Y, tr.Z, normal.X, normal.Y, normal.Z, 1.0f, 0.0f);
+        int i3 = mesh.Vertex(tl.X, tl.Y, tl.Z, normal.X, normal.Y, normal.Z, 0.0f, 0.0f);
+        mesh.Quad(i0, i1, i2, i3);
+        return mesh;
+    }
+}
+
+internal class TrailSample3D {
+    public Vector3 Position;
+    public float AgeSec;
+
+    public TrailSample3D(Vector3 pos) {
+        this.Position = pos;
+        this.AgeSec = 0.0f;
+    }
+}
+
+// 3D 动态丝带拖尾生成器（剑光 / 弹道轨迹 / 冲刺残影）：
+// 维护按生命周期自动衰减的采样点序列，每帧沿视线与切线叉积实时挤出面向相机的双边网格，
+// 自动计算从头部到尾部的宽度锥度（HeadWidth -> TailWidth）与顶点色 Alpha 渐隐，配合 AdditiveBlend 即可渲染辉光剑气。
+public class RibbonTrail3D {
+    public float LifetimeSec;
+    public float MinVertexDistance;
+    public float HeadWidth;
+    public float TailWidth;
+    public int MaxPoints;
+
+    private List<TrailSample3D> points;
+
+    public RibbonTrail3D(float lifetimeSec, float headWidth, float tailWidth, int maxPoints) {
+        this.LifetimeSec = lifetimeSec > 0.01f ? lifetimeSec : 0.4f;
+        this.MinVertexDistance = 0.05f;
+        this.HeadWidth = headWidth > 0.001f ? headWidth : 0.35f;
+        this.TailWidth = tailWidth >= 0.0f ? tailWidth : 0.02f;
+        this.MaxPoints = maxPoints >= 2 ? maxPoints : 64;
+        this.points = new List<TrailSample3D>();
+    }
+
+    public int PointCount { get { return this.points.Count; } }
+
+    public void Clear() {
+        this.points.Clear();
+    }
+
+    // 推进所有采样点年龄并剔除过期尾部点。
+    public void Update(float dtSec) {
+        if (dtSec <= 0.0f) { return; }
+        for (int i = this.points.Count - 1; i >= 0; i = i - 1) {
+            this.points[i].AgeSec = this.points[i].AgeSec + dtSec;
+            if (this.points[i].AgeSec >= this.LifetimeSec) {
+                this.points.RemoveAt(i);
+            }
+        }
+    }
+
+    // 追加新头部世界坐标（若距上一个点小于 MinVertexDistance 则跳过，避免零长度退化切线）。
+    public bool AddPoint(Vector3 worldPos) {
+        if (this.points.Count > 0) {
+            TrailSample3D last = this.points[this.points.Count - 1];
+            float dist = Vector3.Distance(last.Position, worldPos);
+            if (dist < this.MinVertexDistance) { return false; }
+        }
+        this.points.Add(new TrailSample3D(worldPos));
+        while (this.points.Count > this.MaxPoints) {
+            this.points.RemoveAt(0);
+        }
+        return true;
+    }
+
+    // 生成面向相机的顶点色丝带网格（tail->head 渐变 alpha 与宽度）；少于 2 个点返回空网格。
+    public Mesh3D BuildMesh(Vector3 cameraPos, float r, float g, float b) {
+        Mesh3D mesh = new Mesh3D();
+        int n = this.points.Count;
+        if (n < 2) { return mesh; }
+
+        for (int i = 0; i < n; i = i + 1) {
+            Vector3 p = this.points[i].Position;
+            Vector3 tangent;
+            if (i == 0) {
+                tangent = Vector3.Subtract(this.points[1].Position, p);
+            } else if (i == n - 1) {
+                tangent = Vector3.Subtract(p, this.points[n - 2].Position);
+            } else {
+                tangent = Vector3.Subtract(this.points[i + 1].Position, this.points[i - 1].Position);
+            }
+            if (tangent.LengthSquared() < 1e-8f) {
+                tangent = new Vector3(0.0f, 0.0f, 1.0f);
+            } else {
+                tangent = Vector3.Normalize(tangent);
+            }
+
+            Vector3 toCam = Vector3.Subtract(cameraPos, p);
+            if (toCam.LengthSquared() < 1e-8f) {
+                toCam = new Vector3(0.0f, 0.0f, 1.0f);
+            } else {
+                toCam = Vector3.Normalize(toCam);
+            }
+
+            Vector3 side = Vector3.Cross(tangent, toCam);
+            if (side.LengthSquared() < 1e-8f) {
+                side = new Vector3(1.0f, 0.0f, 0.0f);
+            } else {
+                side = Vector3.Normalize(side);
+            }
+
+            // frac = 0 表示最老尾部，1 表示最新头部
+            float frac = (float)i / (float)(n - 1);
+            float lifeAlpha = 1.0f - (this.points[i].AgeSec / this.LifetimeSec);
+            if (lifeAlpha < 0.0f) { lifeAlpha = 0.0f; }
+            float alpha = frac * lifeAlpha;
+            float halfW = (this.TailWidth + (this.HeadWidth - this.TailWidth) * frac) * 0.5f;
+
+            Vector3 pL = new Vector3(p.X - side.X * halfW, p.Y - side.Y * halfW, p.Z - side.Z * halfW);
+            Vector3 pR = new Vector3(p.X + side.X * halfW, p.Y + side.Y * halfW, p.Z + side.Z * halfW);
+            mesh.VertexC(pL.X, pL.Y, pL.Z, toCam.X, toCam.Y, toCam.Z, frac, 0.0f, r, g, b, alpha);
+            mesh.VertexC(pR.X, pR.Y, pR.Z, toCam.X, toCam.Y, toCam.Z, frac, 1.0f, r, g, b, alpha);
+        }
+
+        for (int i = 0; i < n - 1; i = i + 1) {
+            int baseIdx = i * 2;
+            mesh.Quad(baseIdx, baseIdx + 1, baseIdx + 3, baseIdx + 2);
+        }
+        return mesh;
+    }
+}

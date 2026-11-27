@@ -1,0 +1,88 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerOpsDiagnosticsTest {
+    static void Main() {
+        // 1. 实时网络质量监测（EWMA RTT + RFC 3550 Jitter + 64 包滑窗丢包 + 吞吐与 5 级评分）
+        NetQualityMonitor mon = new NetQualityMonitor();
+        mon.RecordTraffic(0, 0, 1000);
+        for (int i = 0; i < 20; i = i + 1) {
+            mon.RecordRtt(32.0f + (float)(i % 2) * 2.0f);
+            mon.RecordPacketOutcome(true);
+        }
+        mon.RecordTraffic(4096, 8192, 2000);
+        bool healthyOk = mon.EvaluateGrade() == NetQualityGrade.Excellent
+            && mon.SmoothedRttMs > 30.0f && mon.SmoothedRttMs < 36.0f
+            && mon.JitterMs < 5.0f
+            && mon.TxBytesPerSec > 4000.0f && mon.RxBytesPerSec > 8000.0f;
+
+        // 注入高丢包与抖动突刺 -> 立刻降级为 Critical
+        for (int i = 0; i < 20; i = i + 1) {
+            mon.RecordRtt(i % 2 == 0 ? 120.0f : 380.0f);
+            mon.RecordPacketOutcome(false);
+        }
+        bool degradedOk = mon.PacketLossRate > 0.45f && mon.EvaluateGrade() == NetQualityGrade.Critical;
+        bool qualityOk = healthyOk && degradedOk;
+        Console.WriteLine("net-quality-monitor-rfc3550: " + Convert.ToString(qualityOk ? 1 : 0));
+
+        // 2. 确定性状态哈希与多数派共识 Desync 探测器
+        TickStateHasher hA = new TickStateHasher();
+        hA.MixEntity(1, 10.5f, 0.0f, -4.25f, 100);
+        hA.MixEntity(2, -3.0f, 1.25f, 8.0f, 85);
+
+        TickStateHasher hB = new TickStateHasher();
+        hB.MixEntity(1, 10.5f, 0.0f, -4.25f, 100);
+        hB.MixEntity(2, -3.0f, 1.25f, 8.0f, 85);
+
+        TickStateHasher hTampered = new TickStateHasher();
+        hTampered.MixEntity(1, 10.5f, 0.0f, -4.25f, 100);
+        hTampered.MixEntity(2, -3.0f, 1.25f, 8.0f, 999); // 篡改血量导致哈希分叉
+
+        NetDesyncDetector det = new NetDesyncDetector(64);
+        // Tick 100：3 端完全一致
+        det.SubmitHash(100, 1, hA.Digest);
+        det.SubmitHash(100, 2, hB.Digest);
+        det.SubmitHash(100, 3, hA.Digest);
+        DesyncReport r100 = det.EvaluateTick(100, 3);
+
+        // Tick 101：Peer 3 篡改偏离多数派（Peer 1 & 2）
+        det.SubmitHash(101, 1, hA.Digest);
+        det.SubmitHash(101, 2, hB.Digest);
+        det.SubmitHash(101, 3, hTampered.Digest);
+        DesyncReport r101 = det.EvaluateTick(101, 3);
+
+        bool desyncOk = hA.Digest == hB.Digest && hA.Digest != hTampered.Digest
+            && !r100.HasDesync
+            && r101.HasDesync && det.FirstDesyncTick == 101
+            && r101.DivergedPeers.Count == 1 && r101.DivergedPeers[0] == 3;
+        Console.WriteLine("net-desync-detector-quorum: " + Convert.ToString(desyncOk ? 1 : 0));
+
+        // 3. 专用游戏服集群调度：装箱选服 + 心跳超时摘除 + 零停机优雅排空
+        NetServerFleetBalancer fleet = new NetServerFleetBalancer(10000);
+        fleet.PreferBinPacking = true;
+        fleet.RegisterOrHeartbeat("ap-1", "ap-east", "10.0.1.1:7777", 3, 4, 0.55f, 1000);
+        fleet.RegisterOrHeartbeat("ap-2", "ap-east", "10.0.1.2:7777", 1, 4, 0.20f, 1000);
+        fleet.RegisterOrHeartbeat("us-1", "us-west", "10.0.2.1:7777", 0, 4, 0.10f, 1000);
+        fleet.RegisterOrHeartbeat("ap-stale", "ap-east", "10.0.1.9:7777", 0, 4, 0.05f, 0);
+
+        // t=15000ms：ap-stale 心跳超 10s 被忽略且清理；ap-1 (剩余 1 位) 优于 ap-2 (剩余 3 位) 被装箱选中并满载
+        fleet.RegisterOrHeartbeat("ap-1", "ap-east", "10.0.1.1:7777", 3, 4, 0.55f, 15000);
+        fleet.RegisterOrHeartbeat("ap-2", "ap-east", "10.0.1.2:7777", 1, 4, 0.20f, 15000);
+        fleet.RegisterOrHeartbeat("us-1", "us-west", "10.0.2.1:7777", 0, 4, 0.10f, 15000);
+        int purged = fleet.PurgeStaleNodes(15000);
+        DedicatedServerNode alloc1 = fleet.AllocateMatch("ap-east", 15000);
+        // 对 ap-2 发起优雅排空 -> 不再接新局，且在跑 1 局未结束前不可停机；释放该局后安全可停机
+        fleet.BeginDrain("ap-2");
+        bool notSafeYet = !fleet.IsSafeToShutdown("ap-2");
+        DedicatedServerNode allocAfterFullAndDrain = fleet.AllocateMatch("ap-east", 15000);
+        fleet.ReleaseMatch("ap-2");
+        bool safeNow = fleet.IsSafeToShutdown("ap-2");
+
+        bool fleetOk = purged == 1
+            && alloc1 != null && alloc1.ServerId == "ap-1" && alloc1.ActiveMatches == 4
+            && notSafeYet && allocAfterFullAndDrain == null && safeNow;
+        Console.WriteLine("net-server-fleet-balancer-drain: " + Convert.ToString(fleetOk ? 1 : 0));
+    }
+}

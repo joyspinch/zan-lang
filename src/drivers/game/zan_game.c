@@ -225,9 +225,10 @@ static zgl_uint g_game_batch_tex = 0;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
-/* Alpha 混合、深度保留、阴影贴图与 GPU 骨骼矩阵全局状态 */
-static int g_game_blend_enabled = 0;
+/* Alpha/Additive 混合、硬件面剔除、深度保留、阴影贴图与 GPU 骨骼矩阵全局状态 */
+static int g_game_blend_enabled = 0; /* 0=off, 1=alpha, 2=additive */
 static int g_game_depth_write = 1;
+static int g_game_cull_mode = 0;     /* 0=off, 1=back, 2=front */
 static int g_game_preserve_depth = 0;
 static zgl_uint g_game_shadow_fbo = 0;
 static zgl_uint g_game_shadow_tex = 0;
@@ -1382,8 +1383,19 @@ static void zan_game_clip(const zan_gpu_frame *frame, int *x, int *y,
     *height = (int)(y1 - y0);
 }
 
+#define ZAN_GAME_GL_FRONT 0x0404
+#define ZAN_GAME_GL_CW    0x0900
+
 static void zan_game_apply_blend_state(const zan_gl_api *gl) {
-    if (g_game_blend_enabled) {
+    if (g_game_blend_enabled == 2) {
+        gl->Enable(ZGL_BLEND);
+        if (gl->BlendFuncSeparate) {
+            gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE,
+                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE);
+        }
+    } else if (g_game_blend_enabled == 1) {
         gl->Enable(ZGL_BLEND);
         if (gl->BlendFuncSeparate) {
             gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
@@ -1397,6 +1409,20 @@ static void zan_game_apply_blend_state(const zan_gl_api *gl) {
     if (gl->DepthMask) {
         gl->DepthMask(g_game_depth_write ? ZGL_TRUE : ZGL_FALSE);
     }
+    if (g_game_cull_mode != 0 && gl->CullFace) {
+        gl->Enable(ZGL_CULL_FACE);
+        /* Canvas FBO 顶点着色器对 clip.y 取反，标准 CCW 正面在 FBO 空间变为 CW */
+        if (gl->FrontFace) gl->FrontFace(ZAN_GAME_GL_CW);
+        gl->CullFace(g_game_cull_mode == 2 ? ZAN_GAME_GL_FRONT : ZGL_BACK);
+    } else {
+        gl->Disable(ZGL_CULL_FACE);
+        if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
+    }
+}
+
+static void zan_game_restore_cull_state(const zan_gl_api *gl) {
+    gl->Disable(ZGL_CULL_FACE);
+    if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
 }
 
 static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program *prog,
@@ -1510,6 +1536,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
+    zan_game_restore_cull_state(gl);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
@@ -1660,6 +1687,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
 ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
     if (surface_id < 0 || surface_id != g_game_batch_surface) return 0;
     if (g_game_gl) {
+        zan_game_restore_cull_state(g_game_gl);
         if (g_game_gl->DepthMask) g_game_gl->DepthMask(ZGL_TRUE);
         g_game_gl->Finish();
     }
@@ -1688,8 +1716,17 @@ ZAN_GAME_API int32_t zan_game_set_lights3d(int32_t count, const float *dirs,
 }
 
 ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write) {
-    g_game_blend_enabled = enabled != 0 ? 1 : 0;
+    g_game_blend_enabled = (enabled == 2) ? 2 : (enabled != 0 ? 1 : 0);
     g_game_depth_write = depth_write != 0 ? 1 : 0;
+    if (g_game_batch_surface >= 0 && g_game_gl) {
+        zan_game_apply_blend_state(g_game_gl);
+    }
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_set_cull3d(int32_t mode) {
+    if (mode < 0 || mode > 2) return 0;
+    g_game_cull_mode = mode;
     if (g_game_batch_surface >= 0 && g_game_gl) {
         zan_game_apply_blend_state(g_game_gl);
     }
@@ -1981,6 +2018,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh_id
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
+    zan_game_restore_cull_state(gl);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
