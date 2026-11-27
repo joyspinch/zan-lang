@@ -1,0 +1,77 @@
+using System;
+using System.IO;
+using Game.Audio;
+using Game.Foundation;
+
+namespace Tests.GameProfileSfx;
+
+// 玩家档案 + 程序化音效配方的契约测试：
+//   档案 —— 纪录只升不降（SubmitBest）/只降不升（SubmitLowest）、计数、开关，
+//           落盘后重开读回；坏档回退备份；InMemory 不碰文件系统；
+//   配方 —— 每个内置名字都有配方、合成长度确定、峰值不削顶；未知名字给 null。
+// 不打开音频设备（SfxBank 构造会开设备，无头 CI 不可依赖）。
+class Program {
+    static void Main() {
+        // 写系统临时目录，不在工作目录（仓库根）留下产物。
+        string root = Path.Combine(Path.GetTempPath(), "zan_game_profile_sfx_test");
+        Environment.SetEnvironmentVariable("ZAN_GAME_DATA_DIR", root);
+        string file = Path.Combine(Path.Combine(root, "demo"), "demo_slot0.json");
+        if (File.Exists(file)) { File.Delete(file); }
+        if (File.Exists(file + ".bak")) { File.Delete(file + ".bak"); }
+
+        GameProfile p = GameProfile.Open("demo");
+        Console.WriteLine("fresh persist=" + Convert.ToString(p.Persistent())
+            + " best=" + Convert.ToString(p.Best("score"))
+            + " has=" + Convert.ToString(p.HasBest("score"))
+            + " muted=" + Convert.ToString(p.Flag("muted", false)));
+        Console.WriteLine("submit 50=" + Convert.ToString(p.SubmitBest("score", 50))
+            + " 40=" + Convert.ToString(p.SubmitBest("score", 40))
+            + " 50=" + Convert.ToString(p.SubmitBest("score", 50))
+            + " 70=" + Convert.ToString(p.SubmitBest("score", 70)));
+        Console.WriteLine("lowest 30=" + Convert.ToString(p.SubmitLowest("time", 30))
+            + " 31=" + Convert.ToString(p.SubmitLowest("time", 31))
+            + " 12=" + Convert.ToString(p.SubmitLowest("time", 12)));
+        p.Add("games", 1);
+        p.Add("games", 2);
+        p.SetFlag("muted", true);
+
+        GameProfile q = GameProfile.Open("demo");
+        Console.WriteLine("reload best=" + Convert.ToString(q.Best("score"))
+            + " time=" + Convert.ToString(q.Best("time"))
+            + " games=" + Convert.ToString(q.Counter("games"))
+            + " muted=" + Convert.ToString(q.Flag("muted", false)));
+
+        // 正式档写坏 → 读备份（上一次 Save 的内容）。
+        File.WriteAllText(file, "{ broken");
+        GameProfile r = GameProfile.Open("demo");
+        Console.WriteLine("corrupt best=" + Convert.ToString(r.Best("score"))
+            + " muted=" + Convert.ToString(r.Flag("muted", false)));
+
+        GameProfile m = GameProfile.InMemory();
+        Console.WriteLine("memory persist=" + Convert.ToString(m.Persistent())
+            + " submit=" + Convert.ToString(m.SubmitBest("score", 1))
+            + " save=" + Convert.ToString(m.Save()));
+
+        File.Delete(file);
+        File.Delete(file + ".bak");
+
+        string[] names = SfxPresets.Names();
+        int ok = 0;
+        for (int i = 0; i < names.Length; i = i + 1) {
+            AudioBuffer b = Synth.Render(SfxPresets.ByName(names[i]));
+            double peak = 0.0;
+            for (int k = 0; k < b.count; k = k + 1) {
+                double v = b.samples[k];
+                if (v < 0.0) { v = -v; }
+                if (v > peak) { peak = v; }
+            }
+            bool sane = b.frames > 0 && b.DurationMs() <= 700.0 && peak > 0.05 && peak < 1.0;
+            if (sane) { ok = ok + 1; }
+            else { Console.WriteLine("bad preset " + names[i]); }
+        }
+        Console.WriteLine("presets=" + Convert.ToString(names.Length) + " sane=" + Convert.ToString(ok)
+            + " unknown=" + Convert.ToString(SfxPresets.ByName("nope") == null));
+        int click = Synth.Render(SfxPresets.Click()).frames;
+        Console.WriteLine("deterministic=" + Convert.ToString(click == Synth.Render(SfxPresets.Click()).frames));
+    }
+}

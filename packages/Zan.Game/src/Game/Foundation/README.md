@@ -54,6 +54,43 @@ Two bases that every shipped game would otherwise rewrite by hand:
 Both bases are pinned by `tests/conformance/game_settings_save.zan` in the
 language repository.
 
+## Player profile, procedural SFX and auto-pause
+
+Three things every shipped game needs and the game templates share:
+
+- `GameProfile` — best scores (`SubmitBest` / `SubmitLowest` return `true` on a
+  new record and save at once), counters (`Add`) and on/off preferences
+  (`Flag` / `SetFlag`, e.g. mute). It lives in the **per-user data folder**
+  (`%LOCALAPPDATA%`, `~/Library/Application Support`, `~/.local/share`, under
+  `ZanGames/<gameId>/`; `ZAN_GAME_DATA_DIR` overrides it), never the working
+  directory, and it writes through `GameSaveStore` (atomic + `.bak`).
+  Headless replays use `GameProfile.InMemory()`: same API, no file system.
+
+  ```zan
+  GameProfile profile = GameProfile.Open("snake");
+  if (profile.SubmitBest("score", score)) { /* show NEW BEST */ }
+  ```
+
+- `SfxPresets` + `SfxBank.AddSynth` — ten short synthesized event sounds
+  (`click select coin hit explode launch powerup success fail error`), so a
+  game has full audio feedback with zero audio files. `bank.AddPresets(names)`
+  renders them at startup; `bank.Warm()` opens the device during loading
+  instead of on the player's first action. Without an audio device every call
+  is a no-op. Recorded WAVs loaded under the same name replace a preset.
+
+  ```zan
+  SfxBank sfx = new SfxBank(new AudioBus());
+  sfx.AddPresets(new string[] { "click", "coin", "fail" });
+  sfx.Warm();
+  sfx.Play("coin");
+  ```
+
+- `GuiHost.WindowActive()` — visible and focused. The host keeps stepping
+  logic while minimized, so real-time games pause themselves when this turns
+  false.
+
+Pinned by `tests/conformance/game_profile_sfx.zan`.
+
 ## Settings panel logic
 
 `SettingsModel` turns a declared `GameSettings` into **rows of choices**

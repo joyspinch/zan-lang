@@ -1,0 +1,153 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace Game.Foundation;
+
+// 玩家档案：最高纪录、累计计数与开关偏好（静音等），按用户落盘。
+//
+// 判据（换个游戏还成立吗）：任何游戏都要"记住最好成绩、玩过几局、
+// 上次是不是静音"。三件事各游戏不该各写一遍：
+//   - **存哪**：用户应用数据目录（Windows %LOCALAPPDATA%、macOS
+//     ~/Library/Application Support、Linux ~/.local/share）下的
+//     ZanGames/<gameId>/——不写工作目录：安装目录可能只读，从别的目录
+//     启动也不该丢纪录；
+//   - **写得稳**：GameSaveStore 原子写 + .bak 回退 + 版本号；
+//   - **无头不落盘**：回放/仿真用 InMemory()，同一套接口不碰文件系统。
+//
+// 键是游戏自定的短字符串（"score"、"level"、"kills"……）。
+public class GameProfile {
+    GameSaveStore store;
+    Dictionary<string, long> bests;
+    Dictionary<string, long> counters;
+    Dictionary<string, bool> flags;
+    bool persist;
+
+    GameProfile() {
+        this.bests = new Dictionary<string, long>();
+        this.counters = new Dictionary<string, long>();
+        this.flags = new Dictionary<string, bool>();
+        this.persist = false;
+        this.store = null;
+    }
+
+    // 打开（不存在即新建）某游戏的档案。ZAN_GAME_DATA_DIR 可改根目录
+    // （测试/便携版用）；用户目录解析不到时退回内存档案。
+    public static GameProfile Open(string gameId) {
+        GameProfile p = new GameProfile();
+        string root = GameProfile.DataRoot();
+        if (root == "" || gameId == null || gameId == "") { return p; }
+        p.store = new GameSaveStore(Path.Combine(root, gameId), gameId, 1);
+        p.persist = true;
+        p.Read();
+        return p;
+    }
+
+    // 只在内存里的档案（无头回放、模糊测试、单元测试）。
+    public static GameProfile InMemory() { return new GameProfile(); }
+
+    // 档案根目录：$ZAN_GAME_DATA_DIR 或 <本地应用数据>/ZanGames。
+    public static string DataRoot() {
+        string env = Interop.EnvVar("ZAN_GAME_DATA_DIR");
+        if (env != "") { return env; }
+        string local = KnownFolders.LocalAppData();
+        if (local == "") { return ""; }
+        return Path.Combine(local, "ZanGames");
+    }
+
+    // 是否落盘（InMemory 或解析不到用户目录时为 false）。
+    public bool Persistent() { return this.persist; }
+
+    // 某项的最好成绩（没有记录为 0）。
+    public long Best(string key) {
+        if (key != null && this.bests.ContainsKey(key)) { return this.bests[key]; }
+        return 0;
+    }
+
+    // 是否有过该项记录。
+    public bool HasBest(string key) { return key != null && this.bests.ContainsKey(key); }
+
+    // 提交一次成绩（越大越好）。刷新纪录返回 true 并立即落盘。
+    public bool SubmitBest(string key, long value) {
+        if (key == null) { return false; }
+        if (this.bests.ContainsKey(key) && this.bests[key] >= value) { return false; }
+        this.bests[key] = value;
+        this.Save();
+        return true;
+    }
+
+    // 提交一次成绩（越小越好，如用时/步数）。刷新纪录返回 true 并立即落盘。
+    public bool SubmitLowest(string key, long value) {
+        if (key == null) { return false; }
+        if (this.bests.ContainsKey(key) && this.bests[key] <= value) { return false; }
+        this.bests[key] = value;
+        this.Save();
+        return true;
+    }
+
+    // 累计计数（局数、击杀……）。
+    public long Counter(string key) {
+        if (key != null && this.counters.ContainsKey(key)) { return this.counters[key]; }
+        return 0;
+    }
+
+    // 计数加 n（不立即落盘，配合 Save 或下一次 SubmitBest/SetFlag 一起写）。
+    public void Add(string key, long n) {
+        if (key == null) { return; }
+        this.counters[key] = this.Counter(key) + n;
+    }
+
+    // 开关偏好。
+    public bool Flag(string key, bool fallback) {
+        if (key != null && this.flags.ContainsKey(key)) { return this.flags[key]; }
+        return fallback;
+    }
+
+    // 设开关并立即落盘。
+    public void SetFlag(string key, bool value) {
+        if (key == null) { return; }
+        this.flags[key] = value;
+        this.Save();
+    }
+
+    // 落盘（内存档案为空操作）。失败返回 false，游戏照常跑。
+    public bool Save() {
+        if (!this.persist || this.store == null) { return false; }
+        JsonValue data = JsonValue.NewObject();
+        data.Put("bests", GameProfile.WriteLongs(this.bests));
+        data.Put("counters", GameProfile.WriteLongs(this.counters));
+        JsonValue fl = JsonValue.NewObject();
+        foreach (string k in this.flags.Keys) { fl.PutBool(k, this.flags[k]); }
+        data.Put("flags", fl);
+        return this.store.Save(0, data);
+    }
+
+    void Read() {
+        JsonValue data = this.store.Load(0);
+        if (data == null || !data.IsObject()) { return; }
+        GameProfile.ReadLongs(data.Get("bests"), this.bests);
+        GameProfile.ReadLongs(data.Get("counters"), this.counters);
+        JsonValue fl = data.Get("flags");
+        if (fl != null && fl.IsObject()) {
+            for (int i = 0; i < fl.Count(); i = i + 1) {
+                string k = fl.KeyAt(i);
+                this.flags[k] = fl.Bool(k, false);
+            }
+        }
+    }
+
+    static JsonValue WriteLongs(Dictionary<string, long> map) {
+        JsonValue o = JsonValue.NewObject();
+        foreach (string k in map.Keys) { o.PutInt(k, map[k]); }
+        return o;
+    }
+
+    static void ReadLongs(JsonValue o, Dictionary<string, long> into) {
+        if (o == null || !o.IsObject()) { return; }
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string k = o.KeyAt(i);
+            into[k] = o.Long(k, 0);
+        }
+    }
+}
