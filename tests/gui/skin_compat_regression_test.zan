@@ -480,6 +480,130 @@ class SkinCompatRegressionTest {
         Check(editorSurfBrutal.RadiusOr(0) == 0, "brutal codeeditor::surface remains sharp");
     }
 
+    static void CheckOverlayBoundsAndMenuStateParity(App app) {
+        Check(app.UseSkin("porcelain"), "load porcelain for overlay/menu/css isolation checks");
+
+        // 1. Custom TitleBar chrome: Drawer, Modal, and RichMenu must stay within ContentBounds
+        bool prevChrome = app.ChromeVisible();
+        app.SetChromeVisible(true);
+        int topY = app.ContentTop();
+        Check(topY > 0, "custom chrome reports positive ContentTop");
+
+        Drawer drawer = new Drawer("Inspector");
+        drawer.Placement("right");
+        drawer.Width(320);
+        drawer.Show();
+        app.overlayHost.Push(app, null, drawer, true);
+        Check(drawer.by == topY && drawer.bh == app.ClientHeight() - topY,
+            "Drawer arranged via OverlayHost stays below TitleBar");
+        Check(drawer.drawerBox.by == topY, "Drawer surface does not cover TitleBar");
+        drawer.Hide();
+
+        Modal modal = new Modal("Confirm");
+        modal.Show();
+        app.overlayHost.Push(app, null, modal, true);
+        Check(modal.by == topY && modal.bh == app.ClientHeight() - topY,
+            "Modal arranged via OverlayHost stays below TitleBar");
+        Check(modal.closeBtn.Icon == "close", "Modal closeBtn uses standard close icon");
+        modal.Hide();
+
+        RichMenu rm = new RichMenu();
+        List<MenuItem> rmItems = new List<MenuItem>();
+        rmItems.Add(MenuItem.Item("Copy", "", 1));
+        rmItems.Add(MenuItem.Item("Paste", "", 2));
+        rm.SetItems(rmItems);
+        Check(!RichMenu.HasLeadingColumn(rmItems), "text-only RichMenu omits redundant icon gutter");
+        rm.ShowAt(app, 20, 0);
+        Check(rm.by >= topY, "RichMenu clamps below custom TitleBar");
+        rm.Close();
+
+        app.SetChromeVisible(prevChrome);
+
+        // 2. Dropdown marks selected item for unified selected-state rendering
+        Dropdown<string> dd = new Dropdown<string>((string s) => s);
+        List<string> ddOpts = new List<string>();
+        ddOpts.Add("Alpha");
+        ddOpts.Add("Beta");
+        dd.Bind(ddOpts);
+        dd.SelectIndex(1);
+        List<MenuItem> synced = dd.SyncItems(app);
+        Check(synced.Count == 2 && !synced[0].selected && synced[1].selected,
+            "Dropdown SyncItems propagates selected index to RichMenu items");
+
+        // 3. Unified hover / active / selected states across all menu/dropdown/select/list/tree widgets
+        List<string> paritySkins = new List<string>();
+        paritySkins.Add("porcelain");
+        paritySkins.Add("obsidian");
+        paritySkins.Add("clay");
+        paritySkins.Add("liquid");
+        paritySkins.Add("brutal");
+        paritySkins.Add("cyber");
+        for (int i = 0; i < paritySkins.Count; i = i + 1) {
+            string sk = paritySkins[i];
+            Check(app.UseSkin(sk), "load skin for menu state parity: " + sk);
+
+            StyleBox richNorm = Style.PartRef(app, "contextmenu", "item", "", "", "", Style.SNormal());
+            Check(richNorm.bg == 0 && richNorm.BorderWOr(0) == 0 && richNorm.shadow == 0,
+                "RichMenu normal item does not inherit contextmenu popup surface on " + sk);
+
+            StyleBox ctxHover = Style.OfRef(app, "button", "contextmenu-item row align-center ghost small", Style.SHover());
+            StyleBox richHover = Style.PartRef(app, "contextmenu", "item", "", "", "", Style.SHover());
+            StyleBox selOptHover = Style.OfRef(app, "button", "select-option align-left", Style.SHover());
+            StyleBox cascHover = Style.PartRef(app, "select", "option", "option", "", "", Style.SHover());
+            StyleBox navHover = Style.OfRef(app, "button", "menu-item row align-center gap-small", Style.SHover());
+            StyleBox listHover = Style.FullRef(app, "listrow", "", "", Style.SHover());
+            StyleBox treeHover = Style.PartRef(app, "treeview", "row", "row", "", "", Style.SHover());
+            Check(ctxHover.bg == app.theme.bgHover && richHover.bg == app.theme.bgHover
+                && selOptHover.bg == app.theme.bgHover && cascHover.bg == app.theme.bgHover
+                && navHover.bg == app.theme.bgHover && listHover.bg == app.theme.bgHover
+                && treeHover.bg == app.theme.bgHover,
+                "hover bg matches theme.bgHover across all menu/select/list/tree widgets on " + sk);
+
+            StyleBox ctxActive = Style.OfRef(app, "button", "contextmenu-item row align-center ghost small", Style.SActive());
+            StyleBox richActive = Style.PartRef(app, "contextmenu", "item", "", "", "", Style.SActive());
+            StyleBox selOptActive = Style.OfRef(app, "button", "select-option align-left", Style.SActive());
+            StyleBox cascActive = Style.PartRef(app, "select", "option", "option", "", "", Style.SActive());
+            StyleBox navActive = Style.OfRef(app, "button", "menu-item row align-center gap-small", Style.SActive());
+            Check(ctxActive.bg == app.theme.bgActive && richActive.bg == app.theme.bgActive
+                && selOptActive.bg == app.theme.bgActive && cascActive.bg == app.theme.bgActive
+                && navActive.bg == app.theme.bgActive,
+                "active bg matches theme.bgActive across all menu/dropdown/select widgets on " + sk);
+
+            StyleBox richSel = Style.PartRef(app, "contextmenu", "item", "", "", "", Style.SSelected());
+            StyleBox selOptSel = Style.OfRef(app, "button", "select-option align-left is-selected", Style.SNormal());
+            StyleBox cascSel = Style.PartRef(app, "select", "option", "option", "", "", Style.SSelected());
+            StyleBox navSel = Style.OfRef(app, "button", "menu-item row align-center gap-small active", Style.SNormal());
+            StyleBox listSel = Style.FullRef(app, "listrow", "", "", Style.SSelected());
+            StyleBox treeSel = Style.PartRef(app, "treeview", "row", "row", "", "", Style.SSelected());
+            Check(richSel.bg != 0 && richSel.bg == selOptSel.bg && cascSel.bg == selOptSel.bg
+                && navSel.bg == selOptSel.bg && listSel.bg == selOptSel.bg && treeSel.bg == selOptSel.bg,
+                "selected bg unified across RichMenu/SelectBox/Cascade/Menu/ListView/TreeView on " + sk);
+            Check(richSel.fg == app.theme.primary && selOptSel.fg == app.theme.primary
+                && cascSel.fg == app.theme.primary && navSel.fg == app.theme.primary,
+                "selected fg unified to theme.primary on " + sk);
+
+            // 4. CSS isolation: internal chrome buttons must not be polluted by global skin rules
+            StyleBox drClose = Style.OfRef(app, "button", "ghost small drawer-close ui-part-btn", Style.SNormal());
+            StyleBox mdClose = Style.OfRef(app, "button", "ghost small modal-close ui-part-btn", Style.SNormal());
+            StyleBox phBack = Style.OfRef(app, "button", "pageheader-back ghost ui-part-btn row align-center justify-center", Style.SNormal());
+            Check(drClose.radius < 100 && mdClose.radius < 100 && phBack.radius < 100,
+                "internal chrome buttons never inherit 999px capsule radius on " + sk);
+            Check(drClose.shadow == 0 && mdClose.shadow == 0 && phBack.shadow == 0,
+                "internal chrome buttons never inherit brutal/card drop shadows on " + sk);
+            Check(drClose.BorderWOr(0) == mdClose.BorderWOr(0) && drClose.bg == mdClose.bg,
+                "Drawer and Modal close buttons resolve identical styling on " + sk);
+        }
+
+        // 5. Dock tooltip painting must not mutate shared cached StyleBox opacity
+        Check(app.UseSkin("porcelain"), "reload porcelain for Dock cache check");
+        StyleBox sharedTipBefore = Style.PartRef(app, "dock", "tooltip", "tooltip", "", "", Style.SNormal());
+        int origOpacity = sharedTipBefore.opacity;
+        StyleBox copiedTip = Style.Part(app, "dock", "tooltip", "tooltip", "", "", Style.SNormal());
+        copiedTip.opacity = 123;
+        StyleBox sharedTipAfter = Style.PartRef(app, "dock", "tooltip", "tooltip", "", "", Style.SNormal());
+        Check(sharedTipAfter.opacity == origOpacity, "Style.Part copy isolates opacity from shared PartRef cache");
+    }
+
     public static void Main() {
         CheckIcons();
         App app = App.CreateOffscreen("Skin compat regression", 800, 600);
@@ -492,6 +616,7 @@ class SkinCompatRegressionTest {
         CheckPressedButtonShadowAndDamage(app);
         CheckAll16Skins(app);
         CheckRoundedCornerGeometry(app);
+        CheckOverlayBoundsAndMenuStateParity(app);
         app.StopLoop();
         app.SetRootControl(null);
         app.canvas.Destroy();
