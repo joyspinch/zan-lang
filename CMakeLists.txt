@@ -3609,6 +3609,19 @@ add_test(NAME conformance_gui_markup_typography_text
 set_tests_properties(conformance_gui_markup_typography_text PROPERTIES
     TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# CSS color: inherit/unset = 未声明（沿用父级）；曾解析成全透明且记为已声明，
+# `button label { color: inherit }` 让游戏 HUD 按钮文字整片隐形。
+add_test(NAME conformance_gui_css_color_inherit
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_color_inherit_test.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css_color_inherit.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_css_color_inherit${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_css_color_inherit PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 set(_cw_publish_doc "${CMAKE_SOURCE_DIR}/tests/gui/cwpublish")
 set(_cw_publish_cwd "${CMAKE_BINARY_DIR}/cases/cwpublish_cwd")
 file(MAKE_DIRECTORY "${_cw_publish_cwd}")
