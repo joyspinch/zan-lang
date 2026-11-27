@@ -27,8 +27,10 @@ public class AudioBus {
     public double fadeTargetGain;
     public int fadePhase;  // 0=None, 1=FadeOut, 2=FadeIn
 
-    // 音效冷却防爆音记录
+    // 音效冷却防爆音记录：剩余冷却（Update 推进）与上次放行的单调时刻。
     Dictionary<string, int> sfxCooldowns;
+    Dictionary<string, long> sfxPlayedAt;
+    Dictionary<string, int> sfxCooldownFull;
 
     public AudioBus() {
         this.masterVolume = 1.0;
@@ -45,6 +47,8 @@ public class AudioBus {
         this.pendingBgmClip = null;
         this.fadePhase = 0;
         this.sfxCooldowns = new Dictionary<string, int>();
+        this.sfxPlayedAt = new Dictionary<string, long>();
+        this.sfxCooldownFull = new Dictionary<string, int>();
     }
 
     // --- 音量与静音控制 ---
@@ -177,17 +181,27 @@ public class AudioBus {
     // --- 音效播放与防爆音限频 ---
 
     // 检查指定音效是否允许播放（若距上次播放超过 cooldownMs 则允许并刷新时间戳）。
+    // 冷却到期有两条路：Update 累计推进（确定性，测试/固定步长用），或
+    // 真实单调钟已过 cooldownMs——宿主忘了每帧调 Update 时音效也不会
+    // "只响一次就永远静音"。
     public bool CanPlaySfx(string sfxKey, int cooldownMs) {
         if (this.sfxMuted || this.masterMuted) {
             return false;
         }
+        long now = Environment.TickCount64;
         if (this.sfxCooldowns.ContainsKey(sfxKey)) {
             int remaining = this.sfxCooldowns[sfxKey];
             if (remaining > 0) {
-                return false;
+                long at = this.sfxPlayedAt.ContainsKey(sfxKey) ? this.sfxPlayedAt[sfxKey] : now;
+                int full = this.sfxCooldownFull.ContainsKey(sfxKey) ? this.sfxCooldownFull[sfxKey] : remaining;
+                if (now - at < (long)full) {
+                    return false;
+                }
             }
         }
         this.sfxCooldowns[sfxKey] = cooldownMs;
+        this.sfxPlayedAt[sfxKey] = now;
+        this.sfxCooldownFull[sfxKey] = cooldownMs;
         return true;
     }
 
