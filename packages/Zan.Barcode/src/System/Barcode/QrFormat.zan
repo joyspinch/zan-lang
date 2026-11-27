@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 
 namespace System.Barcode;
 
@@ -61,24 +62,34 @@ public class QrFormat {
         }
     }
 
-    // 解码 15 位格式信息：找汉明距离最近的合法码字。
-    // 距离 > 3 返回 null（这 15 位不是格式信息）。
-    //
-    // 合法码字只有 32 个（5 位数据 × 各自的 BCH 校验位），所以直接枚举比对
-    // 就行——不需要查表，也就不会有"表写错了"这类 bug。
-    public static QrFormatInfo DecodeBits(int raw) {
-        int best = -1;
-        int bestDist = 99;
+    static int[] cachedCodes = null;
+
+    static int[] FormatCodes() {
+        if (QrFormat.cachedCodes != null) { return QrFormat.cachedCodes; }
+        int[] t = new int[32];
         for (int data = 0; data < 32; data = data + 1) {
             int r = data << 10;
             for (int i = 4; i >= 0; i = i - 1) {
                 if (((r >> (i + 10)) & 1) != 0) { r = r ^ (0x537 << i); }
             }
-            int code = ((data << 10) | r) ^ FORMAT_MASK;
-            int dist = QrFormat.Hamming15(raw, code);
+            t[data] = ((data << 10) | r) ^ FORMAT_MASK;
+        }
+        QrFormat.cachedCodes = t;
+        return t;
+    }
+
+    // 解码 15 位格式信息：找汉明距离最近的合法码字。
+    // 距离 > 3 返回 null（这 15 位不是格式信息）。
+    public static QrFormatInfo DecodeBits(int raw) {
+        int[] codes = QrFormat.FormatCodes();
+        int best = -1;
+        int bestDist = 99;
+        for (int data = 0; data < 32; data = data + 1) {
+            int dist = QrFormat.Hamming15(raw, codes[data]);
             if (dist < bestDist) {
                 bestDist = dist;
                 best = data;
+                if (dist == 0) { break; }
             }
         }
         if (best < 0 || bestDist > 3) { return null; }
@@ -89,14 +100,9 @@ public class QrFormat {
         return info;
     }
 
-    // 两个 15 位值的汉明距离。
+    // 两个 15 位值的汉明距离（硬件 PopCount）。
     static int Hamming15(int a, int b) {
-        int x = a ^ b;
-        int n = 0;
-        for (int i = 0; i < 15; i = i + 1) {
-            if (((x >> i) & 1) != 0) { n = n + 1; }
-        }
-        return n;
+        return BitOperations.PopCount((uint)((a ^ b) & 0x7FFF));
     }
 
     // 从矩阵里读格式信息（两份副本）。

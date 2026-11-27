@@ -106,6 +106,8 @@ public class ByteDecoder {
     }
 
     // Return continuation IDs only. A selected EOS is included and ends generation.
+    // 使用增量 KV-Cache：预填充提示词一次，随后每步仅投影新 token 的 Q/K/V 并复用历史 K/V，
+    // 将 O(T^2·d^2 + T^3·d) 降至 O(T·d^2 + T^2·d)，且消除每步 Tensor 堆分配。
     public List<int> GenerateTokens(string prompt, int maxNewTokens) {
         if (maxNewTokens < 0) { throw new ArgumentException("maxNewTokens cannot be negative"); }
         if (Encoding.GetByteCount(prompt) >= this.ContextLength) {
@@ -113,20 +115,171 @@ public class ByteDecoder {
         }
         List<int> context = ByteTokenizer.Encode(prompt);
         List<int> generated = new List<int>();
-        while (generated.Count < maxNewTokens && context.Count < this.ContextLength) {
-            Tensor logits = this.Forward(context);
-            int row = (context.Count - 1) * ByteTokenizer.VocabSize;
-            int best = 0;
-            for (int id = 1; id < ByteTokenizer.VocabSize; id = id + 1) {
-                if (id != ByteTokenizer.Bos && logits.data[row + id] > logits.data[row + best]) {
-                    best = id;
+        int ctxLimit = this.ContextLength;
+        if (maxNewTokens == 0 || context.Count >= ctxLimit) {
+            return generated;
+        }
+
+        int width = this.tokenEmbedding.Dim(1);
+        int maxSeq = context.Count + maxNewTokens;
+        if (maxSeq > ctxLimit) { maxSeq = ctxLimit; }
+
+        float[] tokW = this.tokenEmbedding.data;
+        float[] posW = this.positionEmbedding.data;
+        float[] qW = this.query.data;
+        float[] kW = this.key.data;
+        float[] vW = this.value.data;
+        float[] oW = this.attentionOutput.data;
+        float[] lmW = this.output.data;
+        float scale = this.scoreScale;
+
+        float[] kCache = new float[maxSeq * width];
+        float[] vCache = new float[maxSeq * width];
+        float[] hBuf = new float[width];
+        float[] qBuf = new float[width];
+        float[] scoresBuf = new float[maxSeq];
+        float[] attnBuf = new float[width];
+        float[] resBuf = new float[width];
+
+        // 1. Prefill: 填充提示词所有位置的 K/V 缓存；最后一个位置的 hidden 保留在 hBuf 供首步解码复用
+        int promptLen = context.Count;
+        for (int p = 0; p < promptLen; p = p + 1) {
+            int tok = context[p];
+            int tBase = tok * width;
+            int pBase = p * width;
+            for (int j = 0; j < width; j = j + 1) {
+                hBuf[j] = tokW[tBase + j] + posW[pBase + j];
+            }
+            int kvBase = p * width;
+            ByteDecoder.MatVecRowMajor(hBuf, kW, width, width, kCache, kvBase);
+            ByteDecoder.MatVecRowMajor(hBuf, vW, width, width, vCache, kvBase);
+        }
+
+        // 2. Autoregressive decode loop (1 token/step using KV-Cache)
+        int curPos = promptLen - 1;
+        while (generated.Count < maxNewTokens && curPos + 1 < ctxLimit) {
+            // 计算当前步 Q = hBuf @ query^T
+            ByteDecoder.MatVecRowMajor(hBuf, qW, width, width, qBuf, 0);
+
+            // 计算因果注意力分数 scores[0..curPos] = (q · kCache[t]) * scale 并做有限性检查
+            int visible = curPos + 1;
+            float maxScore = 0.0f;
+            for (int t = 0; t < visible; t = t + 1) {
+                int kOff = t * width;
+                float dot = 0.0f;
+                for (int j = 0; j < width; j = j + 1) {
+                    dot = dot + qBuf[j] * kCache[kOff + j];
+                }
+                float sc = dot * scale;
+                if ((NativeMemory.AsI32(sc) & 2139095040) == 2139095040) {
+                    throw new ArgumentException("non-finite byte decoder value in attention scores");
+                }
+                scoresBuf[t] = sc;
+                if (t == 0 || sc > maxScore) { maxScore = sc; }
+            }
+
+            // 数值稳定 Softmax
+            float sum = 0.0f;
+            for (int t = 0; t < visible; t = t + 1) {
+                float e = (float)Math.Exp((double)(scoresBuf[t] - maxScore));
+                scoresBuf[t] = e;
+                sum = sum + e;
+            }
+            if (sum == 0.0f) {
+                for (int t = 0; t < visible; t = t + 1) { scoresBuf[t] = 0.0f; }
+            } else {
+                float invSum = 1.0f / sum;
+                for (int t = 0; t < visible; t = t + 1) { scoresBuf[t] = scoresBuf[t] * invSum; }
+            }
+
+            // 加权求和 attended = sum_t probs[t] * vCache[t]
+            for (int j = 0; j < width; j = j + 1) { attnBuf[j] = 0.0f; }
+            for (int t = 0; t < visible; t = t + 1) {
+                float prob = scoresBuf[t];
+                int vOff = t * width;
+                for (int j = 0; j < width; j = j + 1) {
+                    attnBuf[j] = attnBuf[j] + prob * vCache[vOff + j];
                 }
             }
+
+            // 残差连接 residual = hBuf + attended @ attentionOutput^T
+            ByteDecoder.MatVecRowMajor(attnBuf, oW, width, width, resBuf, 0);
+            for (int j = 0; j < width; j = j + 1) {
+                resBuf[j] = hBuf[j] + resBuf[j];
+            }
+
+            // 输出头投影 + argmax（同步校验所有 logits 有限性，保持与 Forward 语义一致）
+            int best = 0;
+            float bestLogit = 0.0f;
+            for (int id = 0; id < ByteTokenizer.VocabSize; id = id + 1) {
+                int rOff = id * width;
+                float logit = 0.0f;
+                for (int j = 0; j < width; j = j + 1) {
+                    logit = logit + resBuf[j] * lmW[rOff + j];
+                }
+                if ((NativeMemory.AsI32(logit) & 2139095040) == 2139095040) {
+                    throw new ArgumentException("non-finite byte decoder value in logits");
+                }
+                if (id == 0) {
+                    best = 0;
+                    bestLogit = logit;
+                } else if (id != ByteTokenizer.Bos && logit > bestLogit) {
+                    best = id;
+                    bestLogit = logit;
+                }
+            }
+
             generated.Add(best);
             if (best == ByteTokenizer.Eos) { break; }
-            context.Add(best);
+
+            curPos = curPos + 1;
+            if (generated.Count < maxNewTokens && curPos + 1 < ctxLimit) {
+                int tBase = best * width;
+                int pBase = curPos * width;
+                for (int j = 0; j < width; j = j + 1) {
+                    hBuf[j] = tokW[tBase + j] + posW[pBase + j];
+                }
+                int kvBase = curPos * width;
+                ByteDecoder.MatVecRowMajor(hBuf, kW, width, width, kCache, kvBase);
+                ByteDecoder.MatVecRowMajor(hBuf, vW, width, width, vCache, kvBase);
+            }
         }
         return generated;
+    }
+
+    private static void MatVecRowMajor(float[] x, float[] w, int outDim, int inDim, float[] dst, int dstOff) {
+        int r = 0;
+        while (r + 3 < outDim) {
+            int o0 = r * inDim;
+            int o1 = o0 + inDim;
+            int o2 = o1 + inDim;
+            int o3 = o2 + inDim;
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+            float s3 = 0.0f;
+            for (int j = 0; j < inDim; j = j + 1) {
+                float xj = x[j];
+                s0 = s0 + xj * w[o0 + j];
+                s1 = s1 + xj * w[o1 + j];
+                s2 = s2 + xj * w[o2 + j];
+                s3 = s3 + xj * w[o3 + j];
+            }
+            dst[dstOff + r] = s0;
+            dst[dstOff + r + 1] = s1;
+            dst[dstOff + r + 2] = s2;
+            dst[dstOff + r + 3] = s3;
+            r = r + 4;
+        }
+        while (r < outDim) {
+            int o0 = r * inDim;
+            float s0 = 0.0f;
+            for (int j = 0; j < inDim; j = j + 1) {
+                s0 = s0 + x[j] * w[o0 + j];
+            }
+            dst[dstOff + r] = s0;
+            r = r + 1;
+        }
     }
 
     public string Generate(string prompt, int maxNewTokens) {

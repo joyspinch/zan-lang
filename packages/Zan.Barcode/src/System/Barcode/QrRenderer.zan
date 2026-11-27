@@ -1,3 +1,5 @@
+using System;
+
 namespace System.Barcode;
 
 // 把模块矩阵画成像素。
@@ -24,21 +26,44 @@ public class QrRenderer {
         if (mx == null || mx.size <= 0) { return new int[0]; }
         if (scale < 1) { scale = 1; }
         if (margin < 0) { margin = 0; }
-        int mods = mx.size + 2 * margin;
+        int msize = mx.size;
+        int mods = msize + 2 * margin;
         int side = mods * scale;
+        int rowBytes = side * 4;
         int[] outp = new int[side * side];
-        for (int i = 0; i < outp.Length; i = i + 1) { outp[i] = light; }
-        for (int row = 0; row < mx.size; row = row + 1) {
-            for (int col = 0; col < mx.size; col = col + 1) {
-                if (!mx.Get(col, row)) { continue; }
-                int x0 = (col + margin) * scale;
-                int y0 = (row + margin) * scale;
-                for (int y = y0; y < y0 + scale; y = y + 1) {
-                    int rowBase = y * side;
-                    for (int x = x0; x < x0 + scale; x = x + 1) {
-                        outp[rowBase + x] = dark;
-                    }
+        nint basePtr = (nint)outp;
+        bool[] modules = mx.modules;
+
+        // 生成单条浅色背景扫描线并按行 NativeMemory.Copy 填充上下静区
+        int marginPx = margin * scale;
+        if (marginPx > 0) {
+            for (int x = 0; x < side; x = x + 1) { outp[x] = light; }
+            for (int y = 1; y < marginPx; y = y + 1) {
+                NativeMemory.Copy(basePtr + y * rowBytes, basePtr, rowBytes);
+            }
+            int botStart = (margin + msize) * scale;
+            for (int y = botStart; y < side; y = y + 1) {
+                NativeMemory.Copy(basePtr + y * rowBytes, basePtr, rowBytes);
+            }
+        }
+        // 每模块行仅渲染首条像素扫描线，再整行 NativeMemory.Copy 复制剩余 scale-1 行
+        for (int row = 0; row < msize; row = row + 1) {
+            int y0 = (row + margin) * scale;
+            int rowBase = y0 * side;
+            int mRow = row * msize;
+            for (int x = 0; x < marginPx; x = x + 1) { outp[rowBase + x] = light; }
+            int px = rowBase + marginPx;
+            for (int col = 0; col < msize; col = col + 1) {
+                int color = modules[mRow + col] ? dark : light;
+                for (int s = 0; s < scale; s = s + 1) {
+                    outp[px + s] = color;
                 }
+                px = px + scale;
+            }
+            for (int x = 0; x < marginPx; x = x + 1) { outp[px + x] = light; }
+            nint srcRow = basePtr + y0 * rowBytes;
+            for (int s = 1; s < scale; s = s + 1) {
+                NativeMemory.Copy(srcRow + s * rowBytes, srcRow, rowBytes);
             }
         }
         return outp;

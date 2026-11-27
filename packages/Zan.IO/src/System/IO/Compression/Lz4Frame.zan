@@ -133,12 +133,12 @@ public class Lz4Frame {
         // 不可信帧头声明的 contentSize 仅作初始缓冲提示且严控上限（≤ 4 MiB），防小包 OOM。
         int maxFrameOut = 536870912;  // 512 MiB 硬上限
         int initCap = 65536;
-        if (hasContentSize && contentSize > 0) {
+        if (hasContentSize && contentSize > 0L) {
             long hint = contentSize;
             if (hint > 4194304L) { hint = 4194304L; }
-            if (hint > (long)initCap) { initCap = (int)hint; }
+            initCap = (int)hint;
         }
-        byte[] out2 = new byte[initCap + 8];
+        byte[] out2 = new byte[initCap];
         int op = 0;
         int cap = initCap;
         while (true) {
@@ -151,37 +151,56 @@ public class Lz4Frame {
             bool stored = (lenField & unchecked((int)0x80000000)) != 0;
             int dlen = lenField & 0x7FFFFFFF;
             if (dlen > src.Length - ip) { return null; }
-            byte[] piece;
             if (stored) {
-                if (dlen > blockMax) { return null; }
-                piece = new byte[dlen];
-                Lz4Frame.Copy(src, ip, piece, 0, dlen);
+                if (dlen > blockMax || dlen > maxFrameOut - op) { return null; }
+                if (dlen > cap - op) {
+                    long need = (long)op + (long)dlen;
+                    long ncap = cap > 0 ? (long)cap : 65536L;
+                    while (ncap < need) { ncap = ncap * 2L; }
+                    if (ncap > (long)maxFrameOut) { ncap = (long)maxFrameOut; }
+                    int newCap = (int)ncap;
+                    byte[] nb = new byte[newCap];
+                    Lz4Frame.Copy(out2, 0, nb, 0, op);
+                    out2 = nb;
+                    cap = newCap;
+                }
+                Lz4Frame.Copy(src, ip, out2, op, dlen);
+                op = op + dlen;
             } else {
-                // 压缩块：解出大小未知 → 先解到块上限。
-                piece = Lz4Block.Decode(src, ip, dlen, blockMax);
-                if (piece == null) { return null; }
+                // 压缩块：直接解码至 out2[op..]，消除每块 4 MiB 临时缓冲与两次整块拷贝。
+                int maxAllowed = blockMax;
+                if (maxAllowed > maxFrameOut - op) { maxAllowed = maxFrameOut - op; }
+                // 若有可信 contentSize 提示且剩余恰好适配，直接解到当前缓冲区避免扩容，
+                // 否则确保预留 maxAllowed 空间（或首次尝试用已知剩余空间，失败再扩容）。
+                int trySpace = cap - op;
+                if (trySpace > maxAllowed) { trySpace = maxAllowed; }
+                int wrote = -1;
+                if (trySpace > 0) {
+                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, trySpace);
+                }
+                if (wrote < 0 && trySpace < maxAllowed) {
+                    long need = (long)op + (long)maxAllowed;
+                    long ncap = cap > 0 ? (long)cap : 65536L;
+                    while (ncap < need) { ncap = ncap * 2L; }
+                    if (ncap > (long)maxFrameOut) { ncap = (long)maxFrameOut; }
+                    int newCap = (int)ncap;
+                    byte[] nb = new byte[newCap];
+                    Lz4Frame.Copy(out2, 0, nb, 0, op);
+                    out2 = nb;
+                    cap = newCap;
+                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, maxAllowed);
+                }
+                if (wrote < 0) { return null; }
+                op = op + wrote;
             }
             ip = ip + dlen;
             if (hasBlockChecksum) {
                 if (4 > src.Length - ip) { return null; }
                 ip = ip + 4;
             }
-            if (piece.Length > maxFrameOut - op) { return null; }
-            if (piece.Length > cap - op) {
-                long need = (long)op + (long)piece.Length;
-                long ncap = (long)cap;
-                while (ncap < need) { ncap = ncap * 2L; }
-                if (ncap > (long)maxFrameOut) { ncap = (long)maxFrameOut; }
-                int newCap = (int)ncap;
-                byte[] nb = new byte[newCap + 8];
-                Lz4Frame.Copy(out2, 0, nb, 0, op);
-                out2 = nb;
-                cap = newCap;
-            }
-            Lz4Frame.Copy(piece, 0, out2, op, piece.Length);
-            op = op + piece.Length;
         }
         if (hasContentSize && (long)op != contentSize) { return null; }
+        if (op == out2.Length) { return out2; }
         byte[] res = new byte[op];
         Lz4Frame.Copy(out2, 0, res, 0, op);
         return res;

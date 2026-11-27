@@ -50,76 +50,128 @@ public class Sha512 {
         return HashCore(msg, len, H0);
     }
 
-    // 纯 Zan 压缩路径：以给定初始哈希值计算 64 字节 SHA-512 状态。
+    private static void CompressBlock(long[] st, long[] w, long[] kArr) {
+        for (int t = 16; t < 80; t = t + 1) {
+            long w15 = w[t - 15];
+            long sv0 = BitOperations.RotateRight(w15, 1) ^ BitOperations.RotateRight(w15, 8) ^ (long)((ulong)w15 >> 7);
+            long w2 = w[t - 2];
+            long sv1 = BitOperations.RotateRight(w2, 19) ^ BitOperations.RotateRight(w2, 61) ^ (long)((ulong)w2 >> 6);
+            w[t] = w[t - 16] + sv0 + w[t - 7] + sv1;
+        }
+        long a = st[0]; long b = st[1]; long c = st[2]; long d = st[3];
+        long e = st[4]; long f = st[5]; long g = st[6]; long hh = st[7];
+        for (int t = 0; t < 80; t = t + 1) {
+            long s1 = BitOperations.RotateRight(e, 14) ^ BitOperations.RotateRight(e, 18) ^ BitOperations.RotateRight(e, 41);
+            long ch = (e & f) ^ ((~e) & g);
+            long t1 = hh + s1 + ch + kArr[t] + w[t];
+            long s0 = BitOperations.RotateRight(a, 28) ^ BitOperations.RotateRight(a, 34) ^ BitOperations.RotateRight(a, 39);
+            long maj = (a & b) ^ (a & c) ^ (b & c);
+            long t2 = s0 + maj;
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        st[0] = st[0] + a; st[1] = st[1] + b; st[2] = st[2] + c; st[3] = st[3] + d;
+        st[4] = st[4] + e; st[5] = st[5] + f; st[6] = st[6] + g; st[7] = st[7] + hh;
+    }
+
+    private static void LoadBlockBytes(byte[] src, int baseOff, long[] w) {
+        for (int t = 0; t < 16; t = t + 1) {
+            int off = baseOff + (t << 3);
+            w[t] = ((long)(src[off] & 255) << 56)
+                 | ((long)(src[off + 1] & 255) << 48)
+                 | ((long)(src[off + 2] & 255) << 40)
+                 | ((long)(src[off + 3] & 255) << 32)
+                 | ((long)(src[off + 4] & 255) << 24)
+                 | ((long)(src[off + 5] & 255) << 16)
+                 | ((long)(src[off + 6] & 255) << 8)
+                 | (long)(src[off + 7] & 255);
+        }
+    }
+
+    // 纯 Zan 流式压缩路径（字节数组版，零整消息拷贝）：以给定初始哈希值计算 64 字节 SHA-512 状态。
+    internal static byte[] HashCoreBytes(byte[] data, int len, long[] h0) {
+        if (len < 0 || (len > 0 && data == null) || h0 == null || h0.Length < 8) { return null; }
+        init();
+        long[] kArr = K;
+        long[] st = new long[8];
+        for (int i = 0; i < 8; i = i + 1) { st[i] = h0[i]; }
+        long[] w = new long[80];
+        int off = 0;
+        while (off + 128 <= len) {
+            LoadBlockBytes(data, off, w);
+            CompressBlock(st, w, kArr);
+            off = off + 128;
+        }
+        int rem = len - off;
+        int tailBlocks = rem + 17 <= 128 ? 1 : 2;
+        int tailLen = tailBlocks * 128;
+        byte[] tail = new byte[tailLen];
+        if (rem > 0) {
+            NativeMemory.Copy((nint)tail, (nint)data + off, rem);
+        }
+        tail[rem] = 0x80;
+        long bitLen = (long)len * 8L;
+        WriteBE64(tail, tailLen - 8, bitLen);
+        LoadBlockBytes(tail, 0, w);
+        CompressBlock(st, w, kArr);
+        if (tailBlocks == 2) {
+            LoadBlockBytes(tail, 128, w);
+            CompressBlock(st, w, kArr);
+        }
+        byte[] outb = new byte[64];
+        WriteBE64(outb, 0, st[0]);  WriteBE64(outb, 8, st[1]);
+        WriteBE64(outb, 16, st[2]); WriteBE64(outb, 24, st[3]);
+        WriteBE64(outb, 32, st[4]); WriteBE64(outb, 40, st[5]);
+        WriteBE64(outb, 48, st[6]); WriteBE64(outb, 56, st[7]);
+        return outb;
+    }
+
+    // 纯 Zan 流式压缩路径（字符串版，零整消息拷贝）：
     // SHA-384 复用同一压缩函数（初始值不同，输出截取前 48 字节）。
     internal static byte[] HashCore(string msg, int len, long[] h0) {
         if (len < 0 || (len > 0 && msg == null) || h0 == null || h0.Length < 8) { return null; }
         init();
         long[] kArr = K;
-        // 填充后的长度：128 的倍数，末尾带 16 字节长度字段
-        int totalBlocks = ((len + 16) / 128) + 1;
-        int padded = totalBlocks * 128;
-        byte[] m = new byte[padded];
-        if (len > 0 && msg != null) {
-            NativeMemory.PutString((nint)m, 0, msg, len);
-        }
-        m[len] = 0x80;
-        // 128 位大端序比特长度；仅使用低 64 位
-        long bitLen = (long)len * 8;
-        m[padded - 8] = (byte)((bitLen >> 56) & 255);
-        m[padded - 7] = (byte)((bitLen >> 48) & 255);
-        m[padded - 6] = (byte)((bitLen >> 40) & 255);
-        m[padded - 5] = (byte)((bitLen >> 32) & 255);
-        m[padded - 4] = (byte)((bitLen >> 24) & 255);
-        m[padded - 3] = (byte)((bitLen >> 16) & 255);
-        m[padded - 2] = (byte)((bitLen >> 8) & 255);
-        m[padded - 1] = (byte)(bitLen & 255);
-
-        long h0v = h0[0]; long h1v = h0[1]; long h2v = h0[2]; long h3v = h0[3];
-        long h4v = h0[4]; long h5v = h0[5]; long h6v = h0[6]; long h7v = h0[7];
+        long[] st = new long[8];
+        for (int i = 0; i < 8; i = i + 1) { st[i] = h0[i]; }
         long[] w = new long[80];
-
-        for (int blk = 0; blk < totalBlocks; blk = blk + 1) {
-            int baseOff = blk * 128;
+        int off = 0;
+        while (off + 128 <= len) {
             for (int t = 0; t < 16; t = t + 1) {
-                int off = baseOff + t * 8;
-                w[t] = ((long)(m[off] & 255) << 56)
-                     | ((long)(m[off + 1] & 255) << 48)
-                     | ((long)(m[off + 2] & 255) << 40)
-                     | ((long)(m[off + 3] & 255) << 32)
-                     | ((long)(m[off + 4] & 255) << 24)
-                     | ((long)(m[off + 5] & 255) << 16)
-                     | ((long)(m[off + 6] & 255) << 8)
-                     | (long)(m[off + 7] & 255);
+                int p = off + (t << 3);
+                w[t] = ((long)(msg[p] & 255) << 56)
+                     | ((long)(msg[p + 1] & 255) << 48)
+                     | ((long)(msg[p + 2] & 255) << 40)
+                     | ((long)(msg[p + 3] & 255) << 32)
+                     | ((long)(msg[p + 4] & 255) << 24)
+                     | ((long)(msg[p + 5] & 255) << 16)
+                     | ((long)(msg[p + 6] & 255) << 8)
+                     | (long)(msg[p + 7] & 255);
             }
-            for (int t = 16; t < 80; t = t + 1) {
-                long w15 = w[t - 15];
-                long sv0 = BitOperations.RotateRight(w15, 1) ^ BitOperations.RotateRight(w15, 8) ^ (long)((ulong)w15 >> 7);
-                long w2 = w[t - 2];
-                long sv1 = BitOperations.RotateRight(w2, 19) ^ BitOperations.RotateRight(w2, 61) ^ (long)((ulong)w2 >> 6);
-                w[t] = w[t - 16] + sv0 + w[t - 7] + sv1;
-            }
-            long a = h0v; long bb = h1v; long c = h2v; long d = h3v;
-            long e = h4v; long f = h5v; long g = h6v; long hh = h7v;
-            for (int t = 0; t < 80; t = t + 1) {
-                long ch = (e & f) ^ ((~e) & g);
-                long bs1 = BitOperations.RotateRight(e, 14) ^ BitOperations.RotateRight(e, 18) ^ BitOperations.RotateRight(e, 41);
-                long temp1 = hh + bs1 + ch + kArr[t] + w[t];
-                long maj = (a & bb) ^ (a & c) ^ (bb & c);
-                long bs0 = BitOperations.RotateRight(a, 28) ^ BitOperations.RotateRight(a, 34) ^ BitOperations.RotateRight(a, 39);
-                long temp2 = bs0 + maj;
-                hh = g; g = f; f = e; e = d + temp1;
-                d = c; c = bb; bb = a; a = temp1 + temp2;
-            }
-            h0v = h0v + a; h1v = h1v + bb; h2v = h2v + c; h3v = h3v + d;
-            h4v = h4v + e; h5v = h5v + f; h6v = h6v + g; h7v = h7v + hh;
+            CompressBlock(st, w, kArr);
+            off = off + 128;
         }
-
+        int rem = len - off;
+        int tailBlocks = rem + 17 <= 128 ? 1 : 2;
+        int tailLen = tailBlocks * 128;
+        byte[] tail = new byte[tailLen];
+        for (int i = 0; i < rem; i = i + 1) {
+            tail[i] = (byte)(msg[off + i] & 255);
+        }
+        tail[rem] = 0x80;
+        long bitLen = (long)len * 8L;
+        WriteBE64(tail, tailLen - 8, bitLen);
+        LoadBlockBytes(tail, 0, w);
+        CompressBlock(st, w, kArr);
+        if (tailBlocks == 2) {
+            LoadBlockBytes(tail, 128, w);
+            CompressBlock(st, w, kArr);
+        }
         byte[] outb = new byte[64];
-        WriteBE64(outb, 0, h0v);  WriteBE64(outb, 8, h1v);
-        WriteBE64(outb, 16, h2v); WriteBE64(outb, 24, h3v);
-        WriteBE64(outb, 32, h4v); WriteBE64(outb, 40, h5v);
-        WriteBE64(outb, 48, h6v); WriteBE64(outb, 56, h7v);
+        WriteBE64(outb, 0, st[0]);  WriteBE64(outb, 8, st[1]);
+        WriteBE64(outb, 16, st[2]); WriteBE64(outb, 24, st[3]);
+        WriteBE64(outb, 32, st[4]); WriteBE64(outb, 40, st[5]);
+        WriteBE64(outb, 48, st[6]); WriteBE64(outb, 56, st[7]);
         return outb;
     }
 
@@ -136,11 +188,15 @@ public class Sha512 {
 
     public static byte[] Hash(byte[] msg, int len) {
         if (msg == null || len <= 0) {
-            string empty = "";
-            return Hash(empty, 0);
+            return Hash("", 0);
         }
-        string s = msg;
-        return Hash(s, len);
+        if (len > msg.Length) { len = msg.Length; }
+        byte[] hw = NativeMemory.Sha512Bytes((nint)msg, (long)len);
+        if (hw != null) {
+            return hw;
+        }
+        init();
+        return HashCoreBytes(msg, len, H0);
     }
 
     public static byte[] Hash(byte[] msg) {

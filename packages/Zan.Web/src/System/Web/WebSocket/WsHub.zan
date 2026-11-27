@@ -9,12 +9,20 @@ public class WsHub {
     private Dictionary<string, List<WsSession>> userMap;
     private Dictionary<string, List<WsSession>> groupMap;
     private List<WsSession> allSessions;
+    // 反向索引：session -> allSessions 下标 / 归属 uid 集合 / 归属 group 集合，
+    // 使 Register/Unregister 降至 O(1) / O(groups(session))，彻底消除 O(U+G+S) 全表扫。
+    private Dictionary<WsSession, int> sessionIndex;
+    private Dictionary<WsSession, List<string>> sessionUsers;
+    private Dictionary<WsSession, List<string>> sessionGroups;
     private IWsBackplane backplane;
 
     public WsHub() {
         this.userMap = new Dictionary<string, List<WsSession>>();
         this.groupMap = new Dictionary<string, List<WsSession>>();
         this.allSessions = new List<WsSession>();
+        this.sessionIndex = new Dictionary<WsSession, int>();
+        this.sessionUsers = new Dictionary<WsSession, List<string>>();
+        this.sessionGroups = new Dictionary<WsSession, List<string>>();
         this.backplane = null;
     }
 
@@ -45,7 +53,8 @@ public class WsHub {
     public void Register(string uid, WsSession session) {
         if (session == null) { return; }
         lock (this) {
-            if (!this.allSessions.Contains(session)) {
+            if (!this.sessionIndex.ContainsKey(session)) {
+                this.sessionIndex[session] = this.allSessions.Count;
                 this.allSessions.Add(session);
             }
             if (uid != null && uid.Length > 0) {
@@ -54,7 +63,13 @@ public class WsHub {
                     uList = new List<WsSession>();
                     this.userMap[uid] = uList;
                 }
-                if (!uList.Contains(session)) {
+                List<string> uNames;
+                if (!this.sessionUsers.TryGetValue(session, out uNames)) {
+                    uNames = new List<string>();
+                    this.sessionUsers[session] = uNames;
+                }
+                if (!uNames.Contains(uid)) {
+                    uNames.Add(uid);
                     uList.Add(session);
                 }
             }
@@ -70,7 +85,13 @@ public class WsHub {
                 gList = new List<WsSession>();
                 this.groupMap[group] = gList;
             }
-            if (!gList.Contains(session)) {
+            List<string> gNames;
+            if (!this.sessionGroups.TryGetValue(session, out gNames)) {
+                gNames = new List<string>();
+                this.sessionGroups[session] = gNames;
+            }
+            if (!gNames.Contains(group)) {
+                gNames.Add(group);
                 gList.Add(session);
             }
         }
@@ -85,29 +106,52 @@ public class WsHub {
                 gList.Remove(session);
                 if (gList.Count == 0) { this.groupMap.Remove(group); }
             }
+            List<string> gNames;
+            if (this.sessionGroups.TryGetValue(session, out gNames)) {
+                gNames.Remove(group);
+                if (gNames.Count == 0) { this.sessionGroups.Remove(session); }
+            }
         }
     }
 
-    // 注销会话
+    // 注销会话（O(1) 交换删除 allSessions + 按反向索引精准移除用户/分组归属）
     public void Unregister(WsSession session) {
         if (session == null) { return; }
         lock (this) {
-            this.allSessions.Remove(session);
-            List<string> ukeys = this.userMap.Keys;
-            for (int i = 0; i < ukeys.Count; i = i + 1) {
-                List<WsSession> uList;
-                if (this.userMap.TryGetValue(ukeys[i], out uList)) {
-                    uList.Remove(session);
-                    if (uList.Count == 0) { this.userMap.Remove(ukeys[i]); }
+            int idx = -1;
+            if (this.sessionIndex.TryGetValue(session, out idx)) {
+                int last = this.allSessions.Count - 1;
+                if (idx != last) {
+                    WsSession moved = this.allSessions[last];
+                    this.allSessions[idx] = moved;
+                    this.sessionIndex[moved] = idx;
                 }
+                this.allSessions.RemoveAt(last);
+                this.sessionIndex.Remove(session);
             }
-            List<string> gkeys = this.groupMap.Keys;
-            for (int i = 0; i < gkeys.Count; i = i + 1) {
-                List<WsSession> gList;
-                if (this.groupMap.TryGetValue(gkeys[i], out gList)) {
-                    gList.Remove(session);
-                    if (gList.Count == 0) { this.groupMap.Remove(gkeys[i]); }
+            List<string> uNames;
+            if (this.sessionUsers.TryGetValue(session, out uNames)) {
+                for (int i = 0; i < uNames.Count; i = i + 1) {
+                    string uid = uNames[i];
+                    List<WsSession> uList;
+                    if (this.userMap.TryGetValue(uid, out uList)) {
+                        uList.Remove(session);
+                        if (uList.Count == 0) { this.userMap.Remove(uid); }
+                    }
                 }
+                this.sessionUsers.Remove(session);
+            }
+            List<string> gNames;
+            if (this.sessionGroups.TryGetValue(session, out gNames)) {
+                for (int i = 0; i < gNames.Count; i = i + 1) {
+                    string grp = gNames[i];
+                    List<WsSession> gList;
+                    if (this.groupMap.TryGetValue(grp, out gList)) {
+                        gList.Remove(session);
+                        if (gList.Count == 0) { this.groupMap.Remove(grp); }
+                    }
+                }
+                this.sessionGroups.Remove(session);
             }
         }
     }
@@ -216,6 +260,9 @@ public class WsHub {
     public void Clear() {
         lock (this) {
             this.allSessions.Clear();
+            this.sessionIndex.Clear();
+            this.sessionUsers.Clear();
+            this.sessionGroups.Clear();
             this.userMap.Clear();
             this.groupMap.Clear();
             this.backplane = null;

@@ -34,10 +34,29 @@ public class QrDecoder {
             throw new BarcodeException(BarcodeError.InvalidImage, "image is empty or malformed");
         }
         // 区分"图里没码"(stage=0)与"找到定位图形但纠错失败"(stage=1)。
+        // Otsu 阈值与全局/局部二值化结果按需惰性复用，避免 4 次重试重复计算。
+        int w = img.width;
+        int h = img.height;
+        int threshold = QrBinarizer.OtsuThreshold(img.luminance, w, h);
+        bool[] globalDark = null;
+        bool[] adaptDark = null;
         int stage = 0;
+        int[] st = new int[1];
         for (int mode = 0; mode < 4; mode = mode + 1) {
-            int[] st = new int[1];
-            QrDecodeResult r = QrDecoder.TryDecode(img, mode, st);
+            st[0] = 0;
+            bool[] dark;
+            if (mode == 0) {
+                globalDark = QrBinarizer.Binarize(img.luminance, w, h, threshold);
+                dark = globalDark;
+            } else if (mode == 1) {
+                dark = QrBinarizer.Denoise(globalDark, w, h);
+            } else if (mode == 2) {
+                adaptDark = QrBinarizer.AdaptiveBinarize(img.luminance, w, h, threshold);
+                dark = adaptDark;
+            } else {
+                dark = QrBinarizer.Denoise(adaptDark, w, h);
+            }
+            QrDecodeResult r = QrDecoder.TryDecodeDark(dark, w, h, st);
             if (r != null) { return r; }
             if (st[0] > stage) { stage = st[0]; }
         }
@@ -48,15 +67,7 @@ public class QrDecoder {
         throw new BarcodeException(BarcodeError.NotFound, "no QR code found in image");
     }
 
-    // mode: 0=全局 1=全局+去噪 2=局部自适应 3=局部自适应+去噪。
-    static QrDecodeResult TryDecode(BarcodeImage img, int mode, int[] stage) {
-        int w = img.width;
-        int h = img.height;
-        int threshold = QrBinarizer.OtsuThreshold(img.luminance, w, h);
-        bool[] dark = (mode == 2 || mode == 3)
-            ? QrBinarizer.AdaptiveBinarize(img.luminance, w, h, threshold)
-            : QrBinarizer.Binarize(img.luminance, w, h, threshold);
-        if (mode == 1 || mode == 3) { dark = QrBinarizer.Denoise(dark, w, h); }
+    static QrDecodeResult TryDecodeDark(bool[] dark, int w, int h, int[] stage) {
 
         List<QrFinderPattern> cands = QrFinder.Find(dark, w, h);
         if (cands.Count < 3) { return null; }
@@ -312,7 +323,13 @@ public class QrDecoder {
             } else if (mode == 2) {
                 if (!QrDecoder.ReadAlnum(br, sb, count)) { return false; }
             } else if (mode == 4) {
+                int before = rawBytes.Count;
                 if (!QrDecoder.ReadByte(br, rawBytes, count)) { return false; }
+                if (count > 0) {
+                    byte[] seg = new byte[count];
+                    for (int bi = 0; bi < count; bi = bi + 1) { seg[bi] = rawBytes[before + bi]; }
+                    sb.Append(Encoding.UTF8.GetString(seg));
+                }
             } else {
                 throw new BarcodeException(BarcodeError.UnsupportedMode, "unknown segment mode " + mode);
             }
@@ -322,7 +339,6 @@ public class QrDecoder {
             byte[] bytes = new byte[rawBytes.Count];
             for (int i = 0; i < rawBytes.Count; i = i + 1) { bytes[i] = rawBytes[i]; }
             res.bytes = bytes;
-            res.text = res.text + Encoding.UTF8.GetString(bytes);
         }
         return true;
     }

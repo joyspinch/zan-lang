@@ -1,0 +1,261 @@
+// Wave 19 纯 .zan 性能优化回归与语义正确性测试：
+// 覆盖 Lunar、SM4 4-lane 位切片、SHA-512/SHA-384/SHA-1、SQL LIKE、QR 编解码渲染、
+// ByteDecoder KV-Cache、WeightFile 解码、JSON Schema/Path/Reader、Web(WsHub/ForwardedHeaders/View)、
+// LZ4 Frame/ContentCoding Deflate。
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Text;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Linq;
+using System.Barcode;
+using Ai.Tensor;
+using System.Json;
+using System.Web;
+using System.Net.Http;
+using System.IO.Compression;
+
+class OptWave19PerfTest {
+    static JsonValue Pair(int a, int b) {
+        JsonValue p = JsonValue.NewArray();
+        p.AppendInt(a);
+        p.AppendInt(b);
+        return p;
+    }
+
+    static bool CheckLunar() {
+        LunarDate d1 = Lunar.FromSolar(2024, 2, 10);
+        if (d1.Year() != 2024 || d1.Month() != 1 || d1.Day() != 1) { return false; }
+        LunarDate d2 = Lunar.FromSolar(1900, 1, 31);
+        if (d2.Year() != 1900 || d2.Month() != 1 || d2.Day() != 1) { return false; }
+        LunarDate d3 = Lunar.FromSolar(2100, 12, 31);
+        if (d3.Year() != 2100) { return false; }
+        if (Lunar.SolarTerm(2024, 2, 4) != "立春") { return false; }
+        if (Lunar.SolarTerm(2024, 2, 5) != "") { return false; }
+        // 超过 JieQiData 197 年数据表时安全返回 "" 且不越界
+        if (Lunar.SolarTerm(2100, 1, 5) != "") { return false; }
+        return true;
+    }
+
+    static bool CheckSm4() {
+        // GB/T 32907-2016 附录 A.1 标准测试向量
+        byte[] key = new byte[] {
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10
+        };
+        byte[] pt = new byte[] {
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10
+        };
+        byte[] ct = Sm4.EncryptBlock(key, pt);
+        string hex = Hex.Encode(ct, 16);
+        if (hex != "681edf34d206965e86b3e94f536e4246") { return false; }
+        byte[] back = Sm4.DecryptBlock(key, ct);
+        for (int i = 0; i < 16; i = i + 1) {
+            if (back[i] != pt[i]) { return false; }
+        }
+        return true;
+    }
+
+    static bool CheckSha() {
+        byte[] abc = Encoding.GetBytes("abc");
+        string s1 = Hex.Encode(Sha1.Hash(abc), 20);
+        if (s1 != "a9993e364706816aba3e25717850c26c9cd0d89d") { return false; }
+        string s384 = Hex.Encode(Sha384.Hash(abc), 48);
+        if (s384 != "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7") { return false; }
+        string s512 = Hex.Encode(Sha512.Hash(abc), 64);
+        if (s512 != "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f") { return false; }
+        // 跨块边界（>128 字节）校验 string 与 byte[] 一致
+        byte[] big = new byte[300];
+        for (int i = 0; i < 300; i = i + 1) { big[i] = (byte)(65 + (i % 26)); }
+        string bigStr = Encoding.GetString(big);
+        byte[] h384b = Sha384.Hash(big);
+        byte[] h384s = Sha384.Hash(bigStr);
+        for (int i = 0; i < 48; i = i + 1) { if (h384b[i] != h384s[i]) { return false; } }
+        return true;
+    }
+
+    static bool CheckLike() {
+        if (Enumerable.LikeMatch("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "%a%a%a%a%a%a%b")) { return false; }
+        if (!Enumerable.LikeMatch("alpha_beta_gamma", "%beta%")) { return false; }
+        if (!Enumerable.LikeMatch("abcd", "a_c_")) { return false; }
+        if (Enumerable.LikeMatch("abc", "a_c_")) { return false; }
+        if (!Enumerable.LikeMatch("", "%%%")) { return false; }
+        return true;
+    }
+
+    static bool CheckQr() {
+        string text = "Zan-Wave19-QR-Verify-0123456789";
+        QrMatrix mx = QrEncoder.Encode(text, QrEcl.M);
+        int[] argb = QrRenderer.ToArgb(mx, 4, 4, unchecked((int)0xFF000000), unchecked((int)0xFFFFFFFF));
+        int dim = (mx.size + 8) * 4;
+        BarcodeImage img = BarcodeImage.FromArgb(dim, dim, argb);
+        QrDecoder.QrDecodeResult dec = QrDecoder.Decode(img);
+        return dec != null && dec.text == text;
+    }
+
+    static bool CheckTensor() {
+        // WeightFile F16 / BF16 / I16 解码
+        JsonValue root = JsonValue.NewObject();
+        int elems = 8;
+        int off = 0;
+        JsonValue s1 = JsonValue.NewObject();
+        s1.PutStr("dtype", "F16"); s1.Put("shape", Pair(elems, 1)); s1.Put("data_offsets", Pair(off, off + elems * 2));
+        root.Put("f16", s1); off = off + elems * 2;
+        JsonValue s2 = JsonValue.NewObject();
+        s2.PutStr("dtype", "BF16"); s2.Put("shape", Pair(elems, 1)); s2.Put("data_offsets", Pair(off, off + elems * 2));
+        root.Put("bf16", s2); off = off + elems * 2;
+        byte[] hdr = Encoding.GetBytes(root.ToJson());
+        byte[] file = new byte[8 + hdr.Length + off];
+        BinaryPrimitives.WriteInt64LittleEndian(file.AsSpan().Slice(0, 8), (long)hdr.Length);
+        NativeMemory.Copy((nint)file + 8, (nint)hdr, hdr.Length);
+        int p = 8 + hdr.Length;
+        // F16 1.0 = 0x3C00
+        for (int i = 0; i < elems; i = i + 1) {
+            file[p] = 0x00; file[p + 1] = 0x3C; p = p + 2;
+        }
+        // BF16 2.0 = 0x4000
+        for (int i = 0; i < elems; i = i + 1) {
+            file[p] = 0x00; file[p + 1] = 0x40; p = p + 2;
+        }
+        WeightFile wf = WeightFile.Load(file);
+        Tensor tf16 = wf.Require("f16");
+        Tensor tbf16 = wf.Require("bf16");
+        if (tf16.data[0] != 1.0f || tbf16.data[0] != 2.0f) { return false; }
+
+        // ByteDecoder KV-Cache 确定性生成
+        string[] names = new string[] {
+            "token_embedding.weight", "position_embedding.weight",
+            "attention.query.weight", "attention.key.weight", "attention.value.weight",
+            "attention.output.weight", "lm_head.weight"
+        };
+        int width = 16;
+        int ctx = 32;
+        int[] rows = new int[] { 258, ctx, width, width, width, width, 258 };
+        JsonValue ckRoot = JsonValue.NewObject();
+        JsonValue meta = JsonValue.NewObject();
+        meta.PutStr("architecture", "zan.byte-attention.v1");
+        ckRoot.Put("__metadata__", meta);
+        int coff = 0;
+        for (int i = 0; i < names.Length; i = i + 1) {
+            JsonValue sp = JsonValue.NewObject();
+            sp.PutStr("dtype", "F32");
+            sp.Put("shape", Pair(rows[i], width));
+            int bytes = rows[i] * width * 4;
+            sp.Put("data_offsets", Pair(coff, coff + bytes));
+            ckRoot.Put(names[i], sp);
+            coff = coff + bytes;
+        }
+        byte[] chdr = Encoding.GetBytes(ckRoot.ToJson());
+        byte[] cfile = new byte[8 + chdr.Length + coff];
+        Span<byte> cspan = cfile.AsSpan();
+        BinaryPrimitives.WriteInt64LittleEndian(cspan.Slice(0, 8), (long)chdr.Length);
+        NativeMemory.Copy((nint)cfile + 8, (nint)chdr, chdr.Length);
+        int cp = 8 + chdr.Length;
+        int seed = 42;
+        for (int t = 0; t < names.Length; t = t + 1) {
+            int n = rows[t] * width;
+            for (int k = 0; k < n; k = k + 1) {
+                seed = seed * 1664525 + 1013904223;
+                float v = (float)((seed >> 16) & 255) / 512.0f - 0.25f;
+                BinaryPrimitives.WriteSingleLittleEndian(cspan.Slice(cp, 4), v);
+                cp = cp + 4;
+            }
+        }
+        ByteDecoder bd = ByteDecoder.Load(cfile);
+        List<int> g1 = bd.GenerateTokens("Hi", 12);
+        List<int> g2 = bd.GenerateTokens("Hi", 12);
+        if (g1.Count != g2.Count || g1.Count == 0) { return false; }
+        for (int i = 0; i < g1.Count; i = i + 1) {
+            if (g1[i] != g2[i]) { return false; }
+        }
+        return true;
+    }
+
+    static bool CheckJson() {
+        // uniqueItems：键序不同但结构等价对象 + 1 与 1.0 等价数字均应判重
+        JsonSchema schema = JsonSchema.Parse("{\"type\":\"array\",\"uniqueItems\":true}");
+        JsonSchemaValidator val = new JsonSchemaValidator(schema);
+        JsonValue dupObj = JsonValue.Parse("[{\"a\":1,\"b\":2},{\"b\":2,\"a\":1}]");
+        if (val.Validate(dupObj).errors.Count == 0) { return false; }
+        JsonValue dupNum = JsonValue.Parse("[1, 1.0]");
+        if (val.Validate(dupNum).errors.Count == 0) { return false; }
+        JsonValue uniq = JsonValue.Parse("[{\"a\":1,\"b\":2},{\"a\":1,\"b\":3},true,false,null]");
+        if (val.Validate(uniq).errors.Count != 0) { return false; }
+
+        // JsonPath 预编译过滤表达式
+        JsonValue doc = JsonValue.Parse("{\"items\":[{\"score\":10,\"tag\":\"a\"},{\"score\":60,\"tag\":\"b\"},{\"score\":80,\"tag\":\"c\"}]}");
+        List<JsonValue> hits = JsonPath.Query(doc, "$.items[?(@.score>=50)].tag");
+        if (hits.Count != 2 || hits[0].AsString("") != "b" || hits[1].AsString("") != "c") { return false; }
+
+        // JsonReader 零分配字面量解析（经 JsonValue.Parse 覆盖 true/false/null）
+        JsonValue lit = JsonValue.Parse("[true,false,null]");
+        if (lit == null || lit.Count() != 3 || !lit.At(0).AsBool(false) || lit.At(1).AsBool(true) || !lit.At(2).IsNull()) { return false; }
+        return true;
+    }
+
+    static bool CheckWeb() {
+        // WsHub O(1) swap-remove
+        WsHub hub = new WsHub();
+        WsSession s1 = new WsSession(null, null, null, null, null);
+        WsSession s2 = new WsSession(null, null, null, null, null);
+        hub.Register("u1", s1);
+        hub.Register("u2", s2);
+        hub.JoinGroup("g1", s1);
+        hub.JoinGroup("g1", s2);
+        hub.Unregister(s1);
+        if (hub.OnlineCount() != 1) { return false; }
+        hub.Unregister(s2);
+        if (hub.OnlineCount() != 0) { return false; }
+
+        // ForwardedHeaders 单遍扫描 + 信任链
+        List<string> trusted = new List<string>();
+        trusted.Add("10.0.0.1");
+        trusted.Add("10.0.0.2");
+        HttpRequest req = new HttpRequest();
+        req.parseStatus = 0;
+        req.rawHeaders = "Host: x\r\nX-Forwarded-For: 198.51.100.7, 10.0.0.2, 10.0.0.1\r\n";
+        if (ForwardedHeaders.Resolve("10.0.0.1", req, trusted) != "198.51.100.7") { return false; }
+
+        // View StringView 零分配转义
+        View v = new View();
+        v.Put("t", "<p>{{x}}</p>");
+        ViewData vd = new ViewData();
+        vd.Set("x", "a<b>c&\"d\"'e'");
+        string outHtml = v.Render("t", vd);
+        return outHtml == "<p>a&lt;b&gt;c&amp;&quot;d&quot;&#39;e&#39;</p>";
+    }
+
+    static bool CheckCompression() {
+        byte[] src = new byte[16384];
+        for (int i = 0; i < src.Length; i = i + 1) {
+            src[i] = (byte)(((i / 8) * 17 + (i % 11) * 5) & 255);
+        }
+        byte[] lz4 = Lz4Frame.Compress(src, 1);
+        byte[] back1 = Lz4Frame.Decompress(lz4);
+        if (back1 == null || back1.Length != src.Length) { return false; }
+        for (int i = 0; i < src.Length; i = i + 1) {
+            if (back1[i] != src[i]) { return false; }
+        }
+        byte[] zc = Deflate.ZlibCompress(src, 6);
+        byte[] back2 = ContentCoding.Decode("deflate", zc);
+        if (back2 == null || back2.Length != src.Length) { return false; }
+        for (int i = 0; i < src.Length; i = i + 1) {
+            if (back2[i] != src[i]) { return false; }
+        }
+        return true;
+    }
+
+    static void Main() {
+        Console.WriteLine(CheckLunar() ? "lunar:ok" : "lunar:fail");
+        Console.WriteLine(CheckSm4() ? "sm4:ok" : "sm4:fail");
+        Console.WriteLine(CheckSha() ? "sha:ok" : "sha:fail");
+        Console.WriteLine(CheckLike() ? "like:ok" : "like:fail");
+        Console.WriteLine(CheckQr() ? "qr:ok" : "qr:fail");
+        Console.WriteLine(CheckTensor() ? "tensor:ok" : "tensor:fail");
+        Console.WriteLine(CheckJson() ? "json:ok" : "json:fail");
+        Console.WriteLine(CheckWeb() ? "web:ok" : "web:fail");
+        Console.WriteLine(CheckCompression() ? "comp:ok" : "comp:fail");
+    }
+}

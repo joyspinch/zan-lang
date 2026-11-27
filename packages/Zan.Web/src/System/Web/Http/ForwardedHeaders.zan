@@ -20,6 +20,7 @@ namespace System.Web;
 public class ForwardedHeaders {
     private bool enabled;
     private List<string> trustedProxies;
+    private HashSet<string> trustedProxySet;
     private bool trustInvalid;
 
     // 头值与链长上限：超出视为畸形，退回对端。
@@ -29,6 +30,7 @@ public class ForwardedHeaders {
     public ForwardedHeaders() {
         this.enabled = false;
         this.trustedProxies = new List<string>();
+        this.trustedProxySet = new HashSet<string>();
         this.trustInvalid = false;
     }
 
@@ -48,7 +50,7 @@ public class ForwardedHeaders {
             this.trustInvalid = true;
             return;
         }
-        if (!this.trustedProxies.Contains(ip)) { this.trustedProxies.Add(ip); }
+        if (this.trustedProxySet.Add(ip)) { this.trustedProxies.Add(ip); }
     }
 
     // 逗号分隔的受托代理名单（配置文件口径）；空串不登记任何代理。
@@ -66,10 +68,10 @@ public class ForwardedHeaders {
     // 校验对端套接字地址是否位于有效受托代理名单中（供 X-Forwarded-Proto 等复用）。
     public bool IsTrustedPeer(string remoteIp) {
         if (!this.enabled || this.trustInvalid) { return false; }
-        if (this.trustedProxies == null || this.trustedProxies.Count == 0) { return false; }
+        if (this.trustedProxySet == null || this.trustedProxySet.Count() == 0) { return false; }
         string peer = ForwardedHeaders.Canonical(remoteIp);
         if (peer.Length == 0) { return false; }
-        return this.trustedProxies.Contains(peer);
+        return this.trustedProxySet.Contains(peer);
     }
 
     // 从 HttpContext 还原真实客户端 IP（规范拼写；对端缺失时答 "unknown"）。
@@ -81,40 +83,83 @@ public class ForwardedHeaders {
         return ForwardedHeaders.Resolve(ctx.RemoteIp(), ctx.Request(), trusted);
     }
 
+    private static bool IsXffName(string s, int start, int end) {
+        while (start < end && (s[start] & 255) <= 32) { start = start + 1; }
+        while (end > start && (s[end - 1] & 255) <= 32) { end = end - 1; }
+        if (end - start != 15) { return false; }
+        string target = "x-forwarded-for";
+        for (int i = 0; i < 15; i = i + 1) {
+            int c = s[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (target[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
     // 纯函数口径（WebApp 与 MVC ClientIp 共用）：peer 为套接字对端，
-    // trusted 为规范拼写的受托代理名单。
+    // trusted 为规范拼写的受托代理名单。单遍零 Split 扫描 rawHeaders 与 XFF 链。
     public static string Resolve(string remoteIp, HttpRequest request, List<string> trusted) {
         string peer = ForwardedHeaders.Canonical(remoteIp);
         if (peer.Length == 0) { return "unknown"; }
         if (trusted == null || trusted.Count == 0 || !trusted.Contains(peer)) { return peer; }
         if (request == null || request.parseStatus != 0) { return peer; }
         // 多行同名 XFF 拼接语义不一（各代理各取一行），出现即不信；
-        // 折行（obs-fold）同理。
+        // 折行（obs-fold）同理。单遍扫描同时定位唯一 XFF 值区间，避免 Split + 二次扫。
+        string raw = request.rawHeaders;
+        int rlen = raw != null ? raw.Length : 0;
         int fields = 0;
-        List<string> lines = request.rawHeaders.Split("\n");
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t')) { return peer; }
-            int colon = line.IndexOf(":");
-            if (colon >= 0 && line.Substring(0, colon).Trim().ToLower() == "x-forwarded-for") {
-                fields = fields + 1;
+        int xffStart = -1;
+        int xffEnd = -1;
+        int pos = 0;
+        while (pos < rlen) {
+            int lineEnd = pos;
+            while (lineEnd < rlen && (raw[lineEnd] & 255) != 10) { lineEnd = lineEnd + 1; }
+            int lineStop = lineEnd;
+            if (lineStop > pos && (raw[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
+            if (lineStop > pos) {
+                int c0 = raw[pos] & 255;
+                if (c0 == 32 || c0 == 9) { return peer; }
+                int colon = pos;
+                while (colon < lineStop && (raw[colon] & 255) != 58) { colon = colon + 1; }
+                if (colon < lineStop && ForwardedHeaders.IsXffName(raw, pos, colon)) {
+                    fields = fields + 1;
+                    if (fields > 1) { return peer; }
+                    int vs = colon + 1;
+                    int ve = lineStop;
+                    while (vs < ve && (raw[vs] & 255) <= 32) { vs = vs + 1; }
+                    while (ve > vs && (raw[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                    xffStart = vs;
+                    xffEnd = ve;
+                }
             }
+            pos = lineEnd + 1;
         }
         // 只认 X-Forwarded-For 一种转发头：X-Real-IP / Forwarded 不并行
         // 采信（多一种头就多一处代理配置可漏改的伪造面）。
         if (fields != 1) { return peer; }
-        string forwarded = request.GetHeader("X-Forwarded-For");
-        if (forwarded.Length == 0 || forwarded.Length > ForwardedHeaders.MaxHeaderLength) { return peer; }
-        List<string> hops = forwarded.Split(",");
-        if (hops.Count > ForwardedHeaders.MaxHops) { return peer; }
-        List<string> addresses = new List<string>();
-        for (int i = 0; i < hops.Count; i = i + 1) {
-            string hop = ForwardedHeaders.Canonical(hops[i].Trim());
+        int xffLen = xffEnd - xffStart;
+        if (xffLen <= 0 || xffLen > ForwardedHeaders.MaxHeaderLength) { return peer; }
+        // 零 Split 扫描逗号分隔的 XFF 跳链（全部跳均校验合法性，再自右向左跳过受托代理）。
+        string[] addresses = new string[ForwardedHeaders.MaxHops];
+        int hopCount = 0;
+        int hp = xffStart;
+        while (hp <= xffEnd) {
+            int comma = hp;
+            while (comma < xffEnd && (raw[comma] & 255) != 44) { comma = comma + 1; }
+            if (hopCount >= ForwardedHeaders.MaxHops) { return peer; }
+            int hs = hp;
+            int he = comma;
+            while (hs < he && (raw[hs] & 255) <= 32) { hs = hs + 1; }
+            while (he > hs && (raw[he - 1] & 255) <= 32) { he = he - 1; }
+            if (he <= hs) { return peer; }
+            string hop = ForwardedHeaders.Canonical(raw.Substring(hs, he - hs));
             if (hop.Length == 0) { return peer; }
-            addresses.Add(hop);
+            addresses[hopCount] = hop;
+            hopCount = hopCount + 1;
+            hp = comma + 1;
         }
         string current = peer;
-        for (int i = addresses.Count - 1; i >= 0; i = i - 1) {
+        for (int i = hopCount - 1; i >= 0; i = i - 1) {
             if (!trusted.Contains(current)) { return current; }
             current = addresses[i];
         }

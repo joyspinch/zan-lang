@@ -33,77 +33,95 @@ public class Sm4 {
     }
 
     // —— S 盒恒定时间核心（B-ID85）——
-    // 曾用静态 S-box 数组直查（缓存时序侧信道可还原密钥/明文）。现与运行时
-    // C 版（rt_hw_accel.c）、AESNI 硬件路径同一同构分解：
+    // 4 字节并行位切片（SWAR Bitslice）Boyar-Peralta 同构电路：
     //   S(x) = M2( AES_S( M1(x) ) ⊕ 0x0f )
-    // M1/M2 为 4→8 位仿射（位选择实现，无查表无分支）；AES_S 为
-    // GF(2^8) mod x^8+x^4+x^3+x+1 的恒定时间逆（Itoh 链 15 乘）+ 仿射 0x63。
-    // 全程固定轮数、按位掩码选择，无数据相关分支与查表。
-
-    // 位选择仿射（4→8 位）：r = c ^ XOR d[i]·bit_i(v)
-    private static int Sel4(int c, int d0, int d1, int d2, int d3, int v) {
-        int r = c;
-        r ^= d0 & (0 - (v & 1));
-        r ^= d1 & (0 - ((v >> 1) & 1));
-        r ^= d2 & (0 - ((v >> 2) & 1));
-        r ^= d3 & (0 - ((v >> 3) & 1));
-        return r;
-    }
-
-    // GF(2^8) mod x^8+x^4+x^3+x+1 恒定时间乘（固定 8 轮移位-规约）
-    private static int GfMul8(int a, int b) {
-        int r = 0;
-        for (int i = 0; i < 8; i = i + 1) {
-            r ^= a & (0 - (b & 1));
-            int hi = (a >> 7) & 1;
-            a = ((a << 1) & 255) ^ (0x1b & (0 - hi));
-            b = (b >> 1) & 255;
-        }
-        return r & 255;
-    }
-
-    // 域内逆：x^254 = x^(250+4)，Itoh 链（固定 15 次域乘），x=0 归 0
-    private static int GfInv8(int x) {
-        int x2 = GfMul8(x, x);
-        int x4 = GfMul8(x2, x2);
-        int x3 = GfMul8(x2, x);
-        int x6 = GfMul8(x3, x3);
-        int x7 = GfMul8(x6, x);
-        int x14 = GfMul8(x7, x7);
-        int x15 = GfMul8(x14, x);
-        int x30 = GfMul8(x15, x15);
-        int x31 = GfMul8(x30, x);
-        int x62 = GfMul8(x31, x31);
-        int x124 = GfMul8(x62, x62);
-        int x125 = GfMul8(x124, x);
-        int x250 = GfMul8(x125, x125);
-        int x252 = GfMul8(x250, x2);
-        int x254 = GfMul8(x252, x2);
-        int nz = ((x | (0 - x)) >> 31) & 1;   // x≠0 → 1
-        return x254 & (0 - nz);
-    }
-
-    // AES S-box（恒定时间）：域逆 + 仿射 0x63
-    private static int AesSboxCt(int u) {
-        int v = GfInv8(u);
-        return (v ^ RotL8(v, 1) ^ RotL8(v, 2) ^ RotL8(v, 3) ^ RotL8(v, 4) ^ 0x63) & 255;
-    }
-
-    // SM4 S-box（恒定时间）：M1 → AES_S ⊕0x0f → M2（M2 低半字节取反）
-    private static int SboxCt(int x) {
-        int u = (Sel4(0x00, 0xa2, 0x49, 0x09, 0x12, (x >> 4) & 15)
-               ^ Sel4(0x01, 0x06, 0x73, 0xe5, 0x56, x & 15)) & 255;
-        int v = (AesSboxCt(u) ^ 0x0f) & 255;
-        return (Sel4(0x00, 0xdc, 0xaf, 0xdd, 0xbf, (v >> 4) & 15)
-              ^ Sel4(0x34, 0x3c, 0xa9, 0xfa, 0xb6, (~v) & 15)) & 255;
-    }
-
-    // 非线性变换 τ：32 位字逐字节过 S 盒
+    // 32 位字的 4 个字节转置为 8 个 4-bit 位平面，在单条无循环、无分支、
+    // 无查表的直线位运算电路中同时完成全部 4 字节的 M1 → AES_S → M2 变换。
+    // 全程固定指令序列，零查表、零数据相关分支（100% 常量时间）。
     private static int Tau(int a) {
-        return ((SboxCt((a >> 24) & 255) << 24) |
-                (SboxCt((a >> 16) & 255) << 16) |
-                (SboxCt((a >> 8) & 255) << 8) |
-                SboxCt(a & 255));
+        // 1. 4×8 位矩阵转置：b0(LSB)..b7(MSB)，每平面低 4 位对应 a 的 4 个字节
+        int b0 = (a & 1) | ((a >> 7) & 2) | ((a >> 14) & 4) | ((a >> 21) & 8);
+        int b1 = ((a >> 1) & 1) | ((a >> 8) & 2) | ((a >> 15) & 4) | ((a >> 22) & 8);
+        int b2 = ((a >> 2) & 1) | ((a >> 9) & 2) | ((a >> 16) & 4) | ((a >> 23) & 8);
+        int b3 = ((a >> 3) & 1) | ((a >> 10) & 2) | ((a >> 17) & 4) | ((a >> 24) & 8);
+        int b4 = ((a >> 4) & 1) | ((a >> 11) & 2) | ((a >> 18) & 4) | ((a >> 25) & 8);
+        int b5 = ((a >> 5) & 1) | ((a >> 12) & 2) | ((a >> 19) & 4) | ((a >> 26) & 8);
+        int b6 = ((a >> 6) & 1) | ((a >> 13) & 2) | ((a >> 20) & 4) | ((a >> 27) & 8);
+        int b7 = ((a >> 7) & 1) | ((a >> 14) & 2) | ((a >> 21) & 4) | ((a >> 28) & 8);
+
+        // 2. SM4 → AES 同构线性输入变换 M1（x0=MSB..x7=LSB 供 Boyar-Peralta 电路）
+        int x7 = b1 ^ b2 ^ b5 ^ b6 ^ 15;
+        int x6 = b0 ^ b1 ^ b3 ^ b4 ^ b7;
+        int x5 = b0 ^ b2 ^ b3;
+        int x4 = b5 ^ b6;
+        int x3 = b1 ^ b3 ^ b7;
+        int x2 = b1 ^ b2 ^ b4;
+        int x1 = b1 ^ b2 ^ b3 ^ b5;
+        int x0 = b2 ^ b4;
+
+        // 3. Boyar-Peralta 常量时间位切片 AES S-box（4 字节并行，零查表零分支）
+        int y14 = x3 ^ x5; int y13 = x0 ^ x6; int y9 = x0 ^ x3; int y8 = x0 ^ x5;
+        int t0 = x1 ^ x2; int y1 = t0 ^ x7; int y4 = y1 ^ x3; int y12 = y13 ^ y14;
+        int y2 = y1 ^ x0; int y5 = y1 ^ x6; int y3 = y5 ^ y8; int t1 = x4 ^ y12;
+        int y15 = t1 ^ x5; int y20 = t1 ^ x1; int y6 = y15 ^ x7; int y10 = y15 ^ t0;
+        int y11 = y20 ^ y9; int y7 = x7 ^ y11; int y17 = y10 ^ y11; int y19 = y10 ^ y8;
+        int y16 = t0 ^ y11; int y21 = y13 ^ y16; int y18 = x0 ^ y16;
+        int t2 = y12 & y15; int t3 = y3 & y6; int t4 = t3 ^ t2; int t5 = y4 & x7;
+        int t6 = t5 ^ t2; int t7 = y13 & y16; int t8 = y5 & y1; int t9 = t8 ^ t7;
+        int t10 = y2 & y7; int t11 = t10 ^ t7; int t12 = y9 & y11; int t13 = y14 & y17;
+        int t14 = t13 ^ t12; int t15 = y8 & y10; int t16 = t15 ^ t12; int t17 = t4 ^ t14;
+        int t18 = t6 ^ t16; int t19 = t9 ^ t14; int t20 = t11 ^ t16; int t21 = t17 ^ y20;
+        int t22 = t18 ^ y19; int t23 = t19 ^ y21; int t24 = t20 ^ y18;
+        int t25 = t21 ^ t22; int t26 = t21 & t23; int t27 = t24 ^ t26; int t28 = t25 & t27;
+        int t29 = t28 ^ t22; int t30 = t23 ^ t24; int t31 = t22 ^ t26; int t32 = t31 & t30;
+        int t33 = t32 ^ t24; int t34 = t23 ^ t33; int t35 = t27 ^ t33; int t36 = t24 & t35;
+        int t37 = t36 ^ t34; int t38 = t27 ^ t36; int t39 = t29 & t38; int t40 = t25 ^ t39;
+        int t41 = t40 ^ t37; int t42 = t29 ^ t33; int t43 = t29 ^ t40; int t44 = t33 ^ t37;
+        int t45 = t42 ^ t41;
+        int z0 = t44 & y15; int z1 = t37 & y6; int z2 = t33 & x7;
+        int z3 = t43 & y16; int z4 = t40 & y1; int z5 = t29 & y7; int z6 = t42 & y11;
+        int z7 = t45 & y17; int z8 = t41 & y10; int z9 = t44 & y12; int z10 = t37 & y3;
+        int z11 = t33 & y4; int z12 = t43 & y13; int z13 = t40 & y5; int z14 = t29 & y2;
+        int z15 = t42 & y9; int z16 = t45 & y14; int z17 = t41 & y8;
+        int t46 = z15 ^ z16; int t47 = z10 ^ z11; int t48 = z5 ^ z13; int t49 = z9 ^ z10;
+        int t50 = z2 ^ z12; int t51 = z2 ^ z5; int t52 = z7 ^ z8; int t53 = z0 ^ z3;
+        int t54 = z6 ^ z7; int t55 = z16 ^ z17; int t56 = z12 ^ t48; int t57 = t50 ^ t53;
+        int t58 = z4 ^ t46; int t59 = z3 ^ t54; int t60 = t46 ^ t57; int t61 = z14 ^ t57;
+        int t62 = t52 ^ t58; int t63 = t49 ^ t58; int t64 = z4 ^ t59; int t65 = t61 ^ t62;
+        int t66 = z1 ^ t63;
+        int s0 = t59 ^ t63;
+        int s6 = t56 ^ (t62 ^ 15);
+        int s7 = t48 ^ (t60 ^ 15);
+        int t67 = t64 ^ t65;
+        int s3 = t53 ^ t66;
+        int s4 = t51 ^ t66;
+        int s5 = t47 ^ t65;
+        int s1 = t64 ^ (s3 ^ 15);
+        int s2 = t55 ^ (t67 ^ 15);
+
+        // 4. AES → SM4 输出仿射变换 M2（已吸收 ⊕0x0f 与低半字节取反抵消）
+        int s20 = s2 ^ s0;
+        int s54 = s5 ^ s4;
+        int s31 = s3 ^ s1;
+        int r0 = s6 ^ s20 ^ s1;
+        int r1 = s54 ^ s20;
+        int r2 = s7 ^ s4 ^ s31 ^ s20 ^ 15;
+        int r3 = s7 ^ s6 ^ s5 ^ s31 ^ s20;
+        int r4 = s7 ^ s54 ^ s31 ^ s0 ^ 15;
+        int r5 = s7 ^ s6 ^ s54 ^ s20 ^ 15;
+        int r6 = s5 ^ s31;
+        int r7 = s6 ^ s54 ^ s31 ^ s20;
+
+        // 5. 逆转置回 32 位打包字
+        int byte0 = (r0 & 1) | ((r1 & 1) << 1) | ((r2 & 1) << 2) | ((r3 & 1) << 3)
+                  | ((r4 & 1) << 4) | ((r5 & 1) << 5) | ((r6 & 1) << 6) | ((r7 & 1) << 7);
+        int byte1 = ((r0 >> 1) & 1) | (((r1 >> 1) & 1) << 1) | (((r2 >> 1) & 1) << 2) | (((r3 >> 1) & 1) << 3)
+                  | (((r4 >> 1) & 1) << 4) | (((r5 >> 1) & 1) << 5) | (((r6 >> 1) & 1) << 6) | (((r7 >> 1) & 1) << 7);
+        int byte2 = ((r0 >> 2) & 1) | (((r1 >> 2) & 1) << 1) | (((r2 >> 2) & 1) << 2) | (((r3 >> 2) & 1) << 3)
+                  | (((r4 >> 2) & 1) << 4) | (((r5 >> 2) & 1) << 5) | (((r6 >> 2) & 1) << 6) | (((r7 >> 2) & 1) << 7);
+        int byte3 = ((r0 >> 3) & 1) | (((r1 >> 3) & 1) << 1) | (((r2 >> 3) & 1) << 2) | (((r3 >> 3) & 1) << 3)
+                  | (((r4 >> 3) & 1) << 4) | (((r5 >> 3) & 1) << 5) | (((r6 >> 3) & 1) << 6) | (((r7 >> 3) & 1) << 7);
+        return byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24);
     }
 
     // 轮函数线性变换 L：B ^ B<<<2 ^ B<<<10 ^ B<<<18 ^ B<<<24

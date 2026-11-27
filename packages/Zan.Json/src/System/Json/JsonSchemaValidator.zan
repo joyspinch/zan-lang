@@ -12,58 +12,81 @@ namespace System.Json;
 public class JsonSchemaValidator {
     JsonSchema schema;
     JsonSchemaResult result;
+    // 惰性路径栈：仅在 Fail 触发时才拼装 JSON Pointer，无错校验路径零字符串分配。
+    List<string> pathKeys;
+    List<int> pathIdxs;
 
     public JsonSchemaValidator(JsonSchema schema) {
         this.schema = schema;
         this.result = new JsonSchemaResult();
+        this.pathKeys = new List<string>();
+        this.pathIdxs = new List<int>();
     }
 
     // 校验一个实例，返回全部错误。
     public JsonSchemaResult Validate(JsonValue instance) {
         this.result = new JsonSchemaResult();
         if (this.schema == null) { return this.result; }
-        this.Check(this.schema.root, instance, "", 0, this.result.errors);
+        this.pathKeys.Clear();
+        this.pathIdxs.Clear();
+        this.Check(this.schema.root, instance, 0, this.result.errors);
         return this.result;
     }
 
-    void Fail(List<JsonSchemaError> sink, string path, string keyword, string message) {
-        sink.Add(new JsonSchemaError(path, keyword, message));
+    string BuildCurrentPath() {
+        int n = this.pathIdxs.Count;
+        if (n == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            sb.Append("/");
+            int idx = this.pathIdxs[i];
+            if (idx >= 0) {
+                sb.Append(Convert.ToString(idx));
+            } else {
+                sb.Append(JsonPointer.Escape(this.pathKeys[i]));
+            }
+        }
+        return sb.ToString();
+    }
+
+    void Fail(List<JsonSchemaError> sink, string keyword, string message) {
+        sink.Add(new JsonSchemaError(this.BuildCurrentPath(), keyword, message));
     }
 
     // 校验实例对一条 schema 的符合性。
-    void Check(JsonValue sch, JsonValue inst, string path, int depth, List<JsonSchemaError> sink) {
+    void Check(JsonValue sch, JsonValue inst, int depth, List<JsonSchemaError> sink) {
         if (sch == null) { return; }
         if (depth > 64) { return; }
         if (sch.IsBool()) {
-            if (!sch.AsBool(true)) { this.Fail(sink, path, "false", "schema is false"); }
+            if (!sch.AsBool(true)) { this.Fail(sink, "false", "schema is false"); }
             return;
         }
         if (!sch.IsObject()) { return; }
         JsonValue refv = sch.Get("$ref");
         if (refv != null && refv.IsString()) {
             JsonValue target = this.ResolveRef(refv.AsString(""));
-            if (target != null) { this.Check(target, inst, path, depth + 1, sink); }
+            if (target != null) { this.Check(target, inst, depth + 1, sink); }
             return;
         }
-        this.CheckType(sch, inst, path, sink);
-        this.CheckEnum(sch, inst, path, sink);
-        this.CheckNumber(sch, inst, path, sink);
-        this.CheckString(sch, inst, path, sink);
-        this.CheckArray(sch, inst, path, depth, sink);
-        this.CheckObject(sch, inst, path, depth, sink);
-        this.CheckCombinators(sch, inst, path, depth, sink);
+        this.CheckType(sch, inst, sink);
+        this.CheckEnum(sch, inst, sink);
+        if (inst.IsNumber()) { this.CheckNumber(sch, inst, sink); }
+        else if (inst.IsString()) { this.CheckString(sch, inst, sink); }
+        else if (inst.IsArray()) { this.CheckArray(sch, inst, depth, sink); }
+        else if (inst.IsObject()) { this.CheckObject(sch, inst, depth, sink); }
+        this.CheckCombinators(sch, inst, depth, sink);
     }
 
     // 实例是否符合这条 schema（不记录错误）。
     bool Matches(JsonValue sch, JsonValue inst, int depth) {
         List<JsonSchemaError> tmp = new List<JsonSchemaError>();
-        this.Check(sch, inst, "", depth + 1, tmp);
+        this.Check(sch, inst, depth + 1, tmp);
         return tmp.Count == 0;
     }
 
     // ---- type / enum / const ----
 
-    void CheckType(JsonValue sch, JsonValue inst, string path, List<JsonSchemaError> sink) {
+    void CheckType(JsonValue sch, JsonValue inst, List<JsonSchemaError> sink) {
         JsonValue t = sch.Get("type");
         if (t == null) { return; }
         bool ok = false;
@@ -77,7 +100,7 @@ public class JsonSchemaValidator {
             }
         }
         if (!ok) {
-            this.Fail(sink, path, "type",
+            this.Fail(sink, "type",
                 "expected " + this.TypeNames(t) + ", got " + this.TypeOf(inst));
         }
     }
@@ -117,7 +140,7 @@ public class JsonSchemaValidator {
         return sb.ToString();
     }
 
-    void CheckEnum(JsonValue sch, JsonValue inst, string path, List<JsonSchemaError> sink) {
+    void CheckEnum(JsonValue sch, JsonValue inst, List<JsonSchemaError> sink) {
         JsonValue en = sch.Get("enum");
         if (en != null && en.IsArray()) {
             bool ok = false;
@@ -125,36 +148,35 @@ public class JsonSchemaValidator {
             for (int i = 0; i < n; i = i + 1) {
                 if (JsonEqual.DeepEquals(inst, en.At(i))) { ok = true; break; }
             }
-            if (!ok) { this.Fail(sink, path, "enum", "value is not one of the enum values"); }
+            if (!ok) { this.Fail(sink, "enum", "value is not one of the enum values"); }
         }
         JsonValue cst = sch.Get("const");
         if (cst != null) {
             if (!JsonEqual.DeepEquals(inst, cst)) {
-                this.Fail(sink, path, "const", "value differs from const");
+                this.Fail(sink, "const", "value differs from const");
             }
         }
     }
 
     // ---- 数字 ----
 
-    void CheckNumber(JsonValue sch, JsonValue inst, string path, List<JsonSchemaError> sink) {
-        if (!inst.IsNumber()) { return; }
+    void CheckNumber(JsonValue sch, JsonValue inst, List<JsonSchemaError> sink) {
         double v = inst.AsDouble(0.0);
         JsonValue min = sch.Get("minimum");
         if (min != null && v < min.AsDouble(0.0)) {
-            this.Fail(sink, path, "minimum", "value is less than minimum");
+            this.Fail(sink, "minimum", "value is less than minimum");
         }
         JsonValue max = sch.Get("maximum");
         if (max != null && v > max.AsDouble(0.0)) {
-            this.Fail(sink, path, "maximum", "value is greater than maximum");
+            this.Fail(sink, "maximum", "value is greater than maximum");
         }
         JsonValue emin = sch.Get("exclusiveMinimum");
         if (emin != null && v <= emin.AsDouble(0.0)) {
-            this.Fail(sink, path, "exclusiveMinimum", "value is not greater than exclusiveMinimum");
+            this.Fail(sink, "exclusiveMinimum", "value is not greater than exclusiveMinimum");
         }
         JsonValue emax = sch.Get("exclusiveMaximum");
         if (emax != null && v >= emax.AsDouble(0.0)) {
-            this.Fail(sink, path, "exclusiveMaximum", "value is not less than exclusiveMaximum");
+            this.Fail(sink, "exclusiveMaximum", "value is not less than exclusiveMaximum");
         }
         JsonValue mult = sch.Get("multipleOf");
         if (mult != null) {
@@ -163,7 +185,7 @@ public class JsonSchemaValidator {
                 double q = v / m;
                 double frac = q - Math.Floor(q);
                 if (frac > 0.0000001 && (1.0 - frac) > 0.0000001) {
-                    this.Fail(sink, path, "multipleOf", "value is not a multiple of multipleOf");
+                    this.Fail(sink, "multipleOf", "value is not a multiple of multipleOf");
                 }
             }
         }
@@ -171,49 +193,141 @@ public class JsonSchemaValidator {
 
     // ---- 字符串 ----
 
-    void CheckString(JsonValue sch, JsonValue inst, string path, List<JsonSchemaError> sink) {
-        if (!inst.IsString()) { return; }
-        string s = inst.AsString("");
-        int len = Encoding.CodePointCount(s);
+    void CheckString(JsonValue sch, JsonValue inst, List<JsonSchemaError> sink) {
         JsonValue min = sch.Get("minLength");
-        if (min != null && len < min.AsInt(0)) {
-            this.Fail(sink, path, "minLength", "string is shorter than minLength");
-        }
         JsonValue max = sch.Get("maxLength");
-        if (max != null && len > max.AsInt(0)) {
-            this.Fail(sink, path, "maxLength", "string is longer than maxLength");
-        }
         JsonValue pat = sch.Get("pattern");
+        if (min == null && max == null && pat == null) { return; }
+        string s = inst.AsString("");
+        if (min != null || max != null) {
+            int len = Encoding.CodePointCount(s);
+            if (min != null && len < min.AsInt(0)) {
+                this.Fail(sink, "minLength", "string is shorter than minLength");
+            }
+            if (max != null && len > max.AsInt(0)) {
+                this.Fail(sink, "maxLength", "string is longer than maxLength");
+            }
+        }
         if (pat != null && pat.IsString()) {
             if (!Regex.IsMatch(s, pat.AsString(""))) {
-                this.Fail(sink, path, "pattern", "string does not match pattern");
+                this.Fail(sink, "pattern", "string does not match pattern");
             }
         }
     }
 
+    // 与 JsonEqual.DeepEquals 一致的结构哈希（DeepEquals(a,b) => HashJson(a)==HashJson(b)）
+    static long HashString(string s) {
+        long h = -3750763034362895579L;
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h ^ (long)(s[i] & 255)) * 1099511628211L;
+        }
+        return h;
+    }
+
+    static long HashJson(JsonValue v, int depth) {
+        if (v == null || v.IsNull()) { return 0x101010101010101L; }
+        if (v.IsBool()) { return v.AsBool(false) ? 0x202020202020202L : 0x303030303030303L; }
+        if (v.IsNumber()) {
+            double d = v.AsDouble(0.0);
+            if (d == 0.0) { return 0x404040404040404L; }
+            long iv = (long)d;
+            if ((double)iv == d) {
+                return (iv ^ 0x404040404040404L) * 1099511628211L;
+            }
+            long scaled = (long)(d * 1000003.0);
+            return (scaled ^ 0x454545454545454L) * 1099511628211L;
+        }
+        if (v.IsString()) {
+            return (JsonSchemaValidator.HashString(v.AsString("")) ^ 0x505050505050505L) * 1099511628211L;
+        }
+        if (depth > 16) { return 0x606060606060606L; }
+        if (v.IsArray()) {
+            int n = v.Count();
+            long h = 0x707070707070707L ^ (long)n;
+            for (int i = 0; i < n; i = i + 1) {
+                h = (h * 1099511628211L) ^ JsonSchemaValidator.HashJson(v.At(i), depth + 1);
+            }
+            return h;
+        }
+        if (v.IsObject()) {
+            int n = v.Count();
+            // 键序无关：对每个 (key, val) 哈希做加法混合（可交换）
+            long acc = 0L;
+            for (int i = 0; i < n; i = i + 1) {
+                long kh = JsonSchemaValidator.HashString(v.KeyAt(i));
+                long vh = JsonSchemaValidator.HashJson(v.ValAt(i), depth + 1);
+                long pair = (kh * -7046029254386353131L) ^ (vh * 1099511628211L);
+                acc = acc + pair;
+            }
+            return (0x808080808080808L ^ (long)n) * 1099511628211L ^ acc;
+        }
+        return 0L;
+    }
+
     // ---- 数组 ----
 
-    void CheckArray(JsonValue sch, JsonValue inst, string path, int depth, List<JsonSchemaError> sink) {
-        if (!inst.IsArray()) { return; }
+    void CheckArray(JsonValue sch, JsonValue inst, int depth, List<JsonSchemaError> sink) {
         int n = inst.Count();
         JsonValue min = sch.Get("minItems");
         if (min != null && n < min.AsInt(0)) {
-            this.Fail(sink, path, "minItems", "array has fewer than minItems items");
+            this.Fail(sink, "minItems", "array has fewer than minItems items");
         }
         JsonValue max = sch.Get("maxItems");
         if (max != null && n > max.AsInt(0)) {
-            this.Fail(sink, path, "maxItems", "array has more than maxItems items");
+            this.Fail(sink, "maxItems", "array has more than maxItems items");
         }
         JsonValue uniq = sch.Get("uniqueItems");
-        if (uniq != null && uniq.AsBool(false)) {
-            for (int i = 0; i < n; i = i + 1) {
+        if (uniq != null && uniq.AsBool(false) && n > 1) {
+            if (n <= 8) {
+                for (int i = 0; i < n; i = i + 1) {
+                    bool dup = false;
+                    JsonValue ai = inst.At(i);
+                    for (int k = i + 1; k < n; k = k + 1) {
+                        if (JsonEqual.DeepEquals(ai, inst.At(k))) { dup = true; break; }
+                    }
+                    if (dup) {
+                        this.Fail(sink, "uniqueItems", "array items are not unique");
+                        break;
+                    }
+                }
+            } else {
+                Dictionary<long, int> firstByHash = new Dictionary<long, int>();
+                Dictionary<long, List<int>> extraByHash = null;
                 bool dup = false;
-                for (int k = i + 1; k < n; k = k + 1) {
-                    if (JsonEqual.DeepEquals(inst.At(i), inst.At(k))) { dup = true; break; }
+                for (int i = 0; i < n; i = i + 1) {
+                    JsonValue item = inst.At(i);
+                    long h = JsonSchemaValidator.HashJson(item, 0);
+                    int prevIdx = 0;
+                    if (!firstByHash.TryGetValue(h, out prevIdx)) {
+                        firstByHash[h] = i;
+                    } else {
+                        if (JsonEqual.DeepEquals(inst.At(prevIdx), item)) {
+                            dup = true;
+                            break;
+                        }
+                        if (extraByHash == null) {
+                            extraByHash = new Dictionary<long, List<int>>();
+                        }
+                        List<int> bucket = null;
+                        if (extraByHash.TryGetValue(h, out bucket)) {
+                            for (int b = 0; b < bucket.Count; b = b + 1) {
+                                if (JsonEqual.DeepEquals(inst.At(bucket[b]), item)) {
+                                    dup = true;
+                                    break;
+                                }
+                            }
+                            if (dup) { break; }
+                            bucket.Add(i);
+                        } else {
+                            bucket = new List<int>();
+                            bucket.Add(i);
+                            extraByHash[h] = bucket;
+                        }
+                    }
                 }
                 if (dup) {
-                    this.Fail(sink, path, "uniqueItems", "array items are not unique");
-                    break;
+                    this.Fail(sink, "uniqueItems", "array items are not unique");
                 }
             }
         }
@@ -222,7 +336,11 @@ public class JsonSchemaValidator {
         if (pre != null && pre.IsArray()) {
             preCount = pre.Count();
             for (int i = 0; i < preCount && i < n; i = i + 1) {
-                this.Check(pre.At(i), inst.At(i), path + "/" + Convert.ToString(i), depth + 1, sink);
+                this.pathKeys.Add("");
+                this.pathIdxs.Add(i);
+                this.Check(pre.At(i), inst.At(i), depth + 1, sink);
+                this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
             }
         }
         JsonValue items = sch.Get("items");
@@ -231,11 +349,19 @@ public class JsonSchemaValidator {
                 // draft-07 的元组写法：逐项对应。
                 int m = items.Count();
                 for (int i = 0; i < m && i < n; i = i + 1) {
-                    this.Check(items.At(i), inst.At(i), path + "/" + Convert.ToString(i), depth + 1, sink);
+                    this.pathKeys.Add("");
+                    this.pathIdxs.Add(i);
+                    this.Check(items.At(i), inst.At(i), depth + 1, sink);
+                    this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                    this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
                 }
             } else {
                 for (int i = preCount; i < n; i = i + 1) {
-                    this.Check(items, inst.At(i), path + "/" + Convert.ToString(i), depth + 1, sink);
+                    this.pathKeys.Add("");
+                    this.pathIdxs.Add(i);
+                    this.Check(items, inst.At(i), depth + 1, sink);
+                    this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                    this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
                 }
             }
         }
@@ -243,52 +369,68 @@ public class JsonSchemaValidator {
 
     // ---- 对象 ----
 
-    void CheckObject(JsonValue sch, JsonValue inst, string path, int depth, List<JsonSchemaError> sink) {
-        if (!inst.IsObject()) { return; }
+    void CheckObject(JsonValue sch, JsonValue inst, int depth, List<JsonSchemaError> sink) {
         JsonValue req = sch.Get("required");
         if (req != null && req.IsArray()) {
             int n = req.Count();
             for (int i = 0; i < n; i = i + 1) {
                 JsonValue k = req.At(i);
-                if (k.IsString() && !inst.Has(k.AsString(""))) {
-                    this.Fail(sink, path, "required", "missing required property '" + k.AsString("") + "'");
+                if (k.IsString()) {
+                    string ks = k.AsString("");
+                    if (!inst.Has(ks)) {
+                        this.Fail(sink, "required", "missing required property '" + ks + "'");
+                    }
                 }
             }
         }
         JsonValue props = sch.Get("properties");
         JsonValue patProps = sch.Get("patternProperties");
         JsonValue addl = sch.Get("additionalProperties");
+        if (props == null && patProps == null && addl == null) { return; }
+        bool hasProps = props != null && props.IsObject();
+        bool hasPatProps = patProps != null && patProps.IsObject();
         int n = inst.Count();
         for (int i = 0; i < n; i = i + 1) {
             string key = inst.KeyAt(i);
             JsonValue val = inst.ValAt(i);
-            string childPath = path + "/" + JsonPointer.Escape(key);
             bool matched = false;
-            if (props != null && props.IsObject()) {
+            if (hasProps) {
                 JsonValue sub = props.Get(key);
                 if (sub != null) {
                     matched = true;
-                    this.Check(sub, val, childPath, depth + 1, sink);
+                    this.pathKeys.Add(key);
+                    this.pathIdxs.Add(-1);
+                    this.Check(sub, val, depth + 1, sink);
+                    this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                    this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
                 }
             }
-            if (patProps != null && patProps.IsObject()) {
+            if (hasPatProps) {
                 int pn = patProps.Count();
                 for (int k = 0; k < pn; k = k + 1) {
                     string pat = patProps.KeyAt(k);
                     if (Regex.IsMatch(key, pat)) {
                         matched = true;
-                        this.Check(patProps.ValAt(k), val, childPath, depth + 1, sink);
+                        this.pathKeys.Add(key);
+                        this.pathIdxs.Add(-1);
+                        this.Check(patProps.ValAt(k), val, depth + 1, sink);
+                        this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                        this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
                     }
                 }
             }
             if (!matched && addl != null) {
                 if (addl.IsBool()) {
                     if (!addl.AsBool(true)) {
-                        this.Fail(sink, path, "additionalProperties",
+                        this.Fail(sink, "additionalProperties",
                             "additional property '" + key + "' is not allowed");
                     }
                 } else {
-                    this.Check(addl, val, childPath, depth + 1, sink);
+                    this.pathKeys.Add(key);
+                    this.pathIdxs.Add(-1);
+                    this.Check(addl, val, depth + 1, sink);
+                    this.pathKeys.RemoveAt(this.pathKeys.Count - 1);
+                    this.pathIdxs.RemoveAt(this.pathIdxs.Count - 1);
                 }
             }
         }
@@ -296,12 +438,12 @@ public class JsonSchemaValidator {
 
     // ---- 组合关键字 ----
 
-    void CheckCombinators(JsonValue sch, JsonValue inst, string path, int depth, List<JsonSchemaError> sink) {
+    void CheckCombinators(JsonValue sch, JsonValue inst, int depth, List<JsonSchemaError> sink) {
         JsonValue all = sch.Get("allOf");
         if (all != null && all.IsArray()) {
             int n = all.Count();
             for (int i = 0; i < n; i = i + 1) {
-                this.Check(all.At(i), inst, path, depth + 1, sink);
+                this.Check(all.At(i), inst, depth + 1, sink);
             }
         }
         JsonValue any = sch.Get("anyOf");
@@ -311,7 +453,7 @@ public class JsonSchemaValidator {
             for (int i = 0; i < n; i = i + 1) {
                 if (this.Matches(any.At(i), inst, depth)) { ok = true; break; }
             }
-            if (!ok) { this.Fail(sink, path, "anyOf", "value does not match any schema in anyOf"); }
+            if (!ok) { this.Fail(sink, "anyOf", "value does not match any schema in anyOf"); }
         }
         JsonValue one = sch.Get("oneOf");
         if (one != null && one.IsArray()) {
@@ -321,14 +463,14 @@ public class JsonSchemaValidator {
                 if (this.Matches(one.At(i), inst, depth)) { hits = hits + 1; }
             }
             if (hits != 1) {
-                this.Fail(sink, path, "oneOf",
+                this.Fail(sink, "oneOf",
                     "value matches " + Convert.ToString(hits) + " schemas in oneOf, expected exactly 1");
             }
         }
         JsonValue notSchema = sch.Get("not");
         if (notSchema != null) {
             if (this.Matches(notSchema, inst, depth)) {
-                this.Fail(sink, path, "not", "value matches the 'not' schema");
+                this.Fail(sink, "not", "value matches the 'not' schema");
             }
         }
     }

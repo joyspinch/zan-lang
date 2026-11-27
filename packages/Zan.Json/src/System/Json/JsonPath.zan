@@ -24,6 +24,12 @@ public class JsonPathSegment {
     public int step;
     // 过滤表达式原文。
     public string filter;
+    // 预解析过滤计划（消除对每个候选元素的重复切串与字面量解析）。
+    internal bool filterCompiled;
+    internal bool filterValid;
+    internal List<string> filterKeys;
+    internal string filterOp;
+    internal JsonValue filterRhs;
 
     public JsonPathSegment() {
         this.kind = 0;
@@ -33,6 +39,11 @@ public class JsonPathSegment {
         this.to = 0;
         this.step = 1;
         this.filter = "";
+        this.filterCompiled = false;
+        this.filterValid = false;
+        this.filterKeys = null;
+        this.filterOp = "";
+        this.filterRhs = null;
     }
 }
 
@@ -293,15 +304,19 @@ public class JsonPath {
             } else if (s.kind == JsonPathSegment.Recurse) {
                 this.CollectRecursive(node, s.name, next);
             } else if (s.kind == JsonPathSegment.Filter) {
+                this.EnsureFilterCompiled(s);
+                if (!s.filterValid) { continue; }
                 if (node.IsArray()) {
                     int n = node.Count();
                     for (int k = 0; k < n; k = k + 1) {
-                        if (this.FilterMatch(node.At(k), s.filter)) { next.Add(node.At(k)); }
+                        JsonValue elem = node.At(k);
+                        if (this.EvalCompiledFilter(elem, s)) { next.Add(elem); }
                     }
                 } else if (node.IsObject()) {
                     int n = node.Count();
                     for (int k = 0; k < n; k = k + 1) {
-                        if (this.FilterMatch(node.ValAt(k), s.filter)) { next.Add(node.ValAt(k)); }
+                        JsonValue elem = node.ValAt(k);
+                        if (this.EvalCompiledFilter(elem, s)) { next.Add(elem); }
                     }
                 }
             }
@@ -344,7 +359,78 @@ public class JsonPath {
         }
     }
 
-    // ---- 过滤条件 ----
+    // ---- 过滤条件（预编译一次，循环零分配求值）----
+
+    void EnsureFilterCompiled(JsonPathSegment s) {
+        if (s.filterCompiled) { return; }
+        s.filterCompiled = true;
+        string e = s.filter == null ? "" : s.filter.Trim();
+        if (e.Length == 0 || (e[0] & 255) != 64) { s.filterValid = false; return; }
+        string[] ops = new string[] { "==", "!=", ">=", "<=", ">", "<" };
+        int opAt = -1;
+        string op = "";
+        for (int i = 0; i < ops.Length; i = i + 1) {
+            int at = e.IndexOf(ops[i]);
+            if (at > 0) { opAt = at; op = ops[i]; break; }
+        }
+        string left = (opAt < 0) ? e : e.Substring(0, opAt).Trim();
+        List<string> keys = new List<string>();
+        if (left != "@") {
+            int n = left.Length;
+            int i = 1;
+            while (i < n) {
+                int c = left[i] & 255;
+                if (c == 46) {
+                    i = i + 1;
+                    int start = i;
+                    while (i < n) {
+                        int cc = left[i] & 255;
+                        if (cc == 46 || cc == 91) { break; }
+                        i = i + 1;
+                    }
+                    keys.Add(left.Substring(start, i - start));
+                    continue;
+                }
+                if (c == 91) {
+                    i = i + 1;
+                    int start = i;
+                    while (i < n && (left[i] & 255) != 93) { i = i + 1; }
+                    string raw = left.Substring(start, i - start).Trim();
+                    if (raw.Length >= 2 && ((raw[0] & 255) == 39 || (raw[0] & 255) == 34)) {
+                        raw = raw.Substring(1, raw.Length - 2);
+                    }
+                    if (i < n) { i = i + 1; }
+                    keys.Add(raw);
+                    continue;
+                }
+                s.filterValid = false;
+                return;
+            }
+        }
+        s.filterKeys = keys;
+        s.filterOp = op;
+        if (opAt >= 0) {
+            string right = e.Substring(opAt + op.Length).Trim();
+            s.filterRhs = this.ParseLiteral(right);
+        } else {
+            s.filterRhs = null;
+        }
+        s.filterValid = true;
+    }
+
+    bool EvalCompiledFilter(JsonValue node, JsonPathSegment s) {
+        JsonValue cur = node;
+        List<string> keys = s.filterKeys;
+        int kn = keys.Count;
+        for (int i = 0; i < kn; i = i + 1) {
+            if (cur == null || !cur.IsObject()) { cur = null; break; }
+            cur = cur.Get(keys[i]);
+        }
+        if (s.filterOp.Length == 0) {
+            return cur != null && !cur.IsNull();
+        }
+        return this.Compare(cur, s.filterRhs, s.filterOp);
+    }
 
     bool FilterMatch(JsonValue node, string expr) {
         string e = expr == null ? "" : expr.Trim();
