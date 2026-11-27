@@ -63,6 +63,30 @@ partial class Irgen {
         H("done:");
         H("  ret void");
         H("}");
+        H("@__zrel_depth = internal thread_local global i64 0");
+        H("declare void @zan_rt_defer_push(i8*, i8*)");
+        H("declare i32 @zan_rt_defer_pending()");
+        H("declare void @zan_rt_defer_drain()");
+        H("define internal void @zrelease_destroy(i8* %p) {");
+        H("entry:");
+        H("  %ds0 = getelementptr i8, i8* %p, i64 -8");
+        H("  %ds = bitcast i8* %ds0 to i8**");
+        H("  %dtor = load i8*, i8** %ds");
+        H("  %hasd = icmp ne i8* %dtor, null");
+        H("  br i1 %hasd, label %rund, label %fr");
+        H("rund:");
+        H("  %fn = bitcast i8* %dtor to void (i8*)*");
+        H("  call void %fn(i8* %p)");
+        H("  br label %fr");
+        H("fr:");
+        // the block starts 24 bytes before the object pointer
+        H("  %hdr = getelementptr i8, i8* %p, i64 -16");
+        H("  %rc = bitcast i8* %hdr to i64*");
+        H("  %base = getelementptr i8, i8* %p, i64 -24");
+        if (gcProbeUsed) { H("  call void @zan_gc_live_remove(i8* %p)"); }
+        EmitArcFree("%base", "%rc");
+        H("  ret void");
+        H("}");
         H("define void @zrelease(i8* %p) {");
         H("entry:");
         H("  %isnull = icmp eq i8* %p, null");
@@ -99,20 +123,27 @@ partial class Irgen {
         H("  %ok = call i1 @zan_rt_weak_destroy_begin(i64 %pv)");
         H("  br i1 %ok, label %dofree, label %done");
         H("dofree:");
-        H("  %ds0 = getelementptr i8, i8* %p, i64 -8");
-        H("  %ds = bitcast i8* %ds0 to i8**");
-        H("  %dtor = load i8*, i8** %ds");
-        H("  %hasd = icmp ne i8* %dtor, null");
-        H("  br i1 %hasd, label %rund, label %fr");
-        H("rund:");
-        H("  %fn = bitcast i8* %dtor to void (i8*)*");
-        H("  call void %fn(i8* %p)");
-        H("  br label %fr");
-        H("fr:");
-        // the block starts 24 bytes before the object pointer
-        H("  %base = getelementptr i8, i8* %p, i64 -24");
-        if (gcProbeUsed) { H("  call void @zan_gc_live_remove(i8* %p)"); }
-        EmitArcFree("%base", "%rc");
+        H("  %depth = load i64, i64* @__zrel_depth");
+        H("  %deep = icmp sge i64 %depth, 256");
+        H("  br i1 %deep, label %defer, label %direct");
+        H("defer:");
+        H("  call void @zan_rt_defer_push(i8* bitcast (void (i8*)* @zrelease_destroy to i8*), i8* %p)");
+        H("  br label %done");
+        H("direct:");
+        H("  %d1 = add i64 %depth, 1");
+        H("  store i64 %d1, i64* @__zrel_depth");
+        H("  call void @zrelease_destroy(i8* %p)");
+        H("  store i64 %depth, i64* @__zrel_depth");
+        H("  %outer = icmp eq i64 %depth, 0");
+        H("  br i1 %outer, label %chkdrain, label %done");
+        H("chkdrain:");
+        H("  %pend = call i32 @zan_rt_defer_pending()");
+        H("  %hasp = icmp ne i32 %pend, 0");
+        H("  br i1 %hasp, label %dodrain, label %done");
+        H("dodrain:");
+        H("  store i64 1, i64* @__zrel_depth");
+        H("  call void @zan_rt_defer_drain()");
+        H("  store i64 0, i64* @__zrel_depth");
         H("  br label %done");
         H("done:");
         H("  ret void");
@@ -425,7 +456,7 @@ partial class Irgen {
     // EnterCallArm / LeaveCallArm.
     void ArmTempNow() {
         if (callArmStack == null || callArmStack.Count == 0) { return; }
-        if (curAsync || !eaActive) { return; }
+        if (!eaActive) { return; }
         // only into a call of THIS function: an inline-generated nested
         // function (lambda, binding accessor) must never arm into its
         // enclosing function's call
@@ -485,7 +516,7 @@ partial class Irgen {
     // temporary moves into an entry slot first. The armed entries
     // ("<llvm type>\t<slot>") are appended to `armed`.
     void ArmArgTemps(int mark, List<string> armed) {
-        if (curAsync || !eaActive) { return; }
+        if (!eaActive) { return; }
         int i = mark;
         while (i < stmtTemps.Count) {
             string op = stmtTemps[i];

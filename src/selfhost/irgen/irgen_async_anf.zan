@@ -247,6 +247,32 @@ partial class Irgen {
     // into a fresh temp declared immediately before the statement, preserving
     // left-to-right await order.
     public int awHoistN;
+    public List<string> anfScopeNames;
+    public List<Node> anfScopeTypes;
+
+    Node AnfScopedLocalType(string name) {
+        if (anfScopeNames == null || name == null || name == "") { return null; }
+        int i = anfScopeNames.Count - 1;
+        while (i >= 0) {
+            if (anfScopeNames[i] == name) { return anfScopeTypes[i]; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    void AnfPushScope(string name, Node ty) {
+        if (anfScopeNames == null || name == null || name == "") { return; }
+        anfScopeNames.Add(name);
+        anfScopeTypes.Add(ty);
+    }
+
+    void AnfPopScope(int mark) {
+        if (anfScopeNames == null) { return; }
+        while (anfScopeNames.Count > mark) {
+            anfScopeNames.RemoveAt(anfScopeNames.Count - 1);
+            anfScopeTypes.RemoveAt(anfScopeTypes.Count - 1);
+        }
+    }
 
     bool ExprHasAwait(Node e) {
         if (e == null) { return false; }
@@ -330,13 +356,7 @@ partial class Irgen {
                 return null;
             }
             if (r.kind == AK.Ident()) {
-                Node rc = binder.FindType(r.sval);
-                if (rc != null) {
-                    Node ms = AwaitTarget(rc, callee.sval, m, callExpr, true);
-                    if (ms != null) { return SubstCallType(ms, null, callExpr); }
-                    return null;
-                }
-                Node vt = DeclTypeOf(m, r.sval);
+                Node vt = anfScopeNames != null ? AnfScopedLocalType(r.sval) : DeclTypeOf(m, r.sval);
                 if (vt != null) {
                     Node rc2 = binder.FindType(vt.sval);
                     if (rc2 != null) {
@@ -345,6 +365,12 @@ partial class Irgen {
                         // type parameters (`Pool<string>` -> T = string)
                         if (mi != null) { return SubstCallType(mi, vt, callExpr); }
                     }
+                }
+                Node rc = binder.FindType(r.sval);
+                if (rc != null) {
+                    Node ms = AwaitTarget(rc, callee.sval, m, callExpr, true);
+                    if (ms != null) { return SubstCallType(ms, null, callExpr); }
+                    return null;
                 }
                 if (cls != null) {
                     Node ft = FieldType(cls, r.sval);
@@ -483,11 +509,13 @@ partial class Irgen {
             return MergeArmTypes(bt, ct);
         }
         if (k == AK.Ident()) {
-            Node dt = DeclTypeOf(m, e.sval);
+            Node dt = anfScopeNames != null ? AnfScopedLocalType(e.sval) : DeclTypeOf(m, e.sval);
             if (dt != null) { return dt; }
             if (cls != null) {
                 Node ft = FieldType(cls, e.sval);
                 if (ft != null) { return ft; }
+                Node sf = FindStaticField(cls, e.sval);
+                if (sf != null) { return sf.type; }
             }
             return null;
         }
@@ -589,6 +617,86 @@ partial class Irgen {
         id.sval = d.sval;
         id.line = e.line; id.col = e.col;
         return id;
+    }
+
+    // Evaluate a call receiver or prior argument into a fresh temp ahead of a
+    // later argument's hoisted await so C# left-to-right evaluation holds even
+    // when the awaited argument mutates the receiver local or shared state.
+    Node AnfSnapshotCallExpr(Node cls, Node m, Node e, List<Node> pre, bool isRecv) {
+        if (e == null) { return e; }
+        int k = e.kind;
+        if (k == AK.IntLit() || k == AK.FloatLit() || k == AK.StringLit() || k == AK.CharLit()
+                || k == AK.BoolLit() || k == AK.NullLit() || k == AK.Lambda()
+                || k == AK.OutArg() || k == AK.ThisExpr() || k == AK.BaseExpr()) {
+            return e;
+        }
+        if (k == AK.Ident()) {
+            if (e.sval == null || e.sval == "" || e.sval.StartsWith("__aw$")) { return e; }
+            Node lt = anfScopeNames != null ? AnfScopedLocalType(e.sval) : DeclTypeOf(m, e.sval);
+            if (lt == null && cls != null) {
+                lt = FieldType(cls, e.sval);
+                if (lt == null) {
+                    Node sf = FindStaticField(cls, e.sval);
+                    if (sf != null) { lt = sf.type; }
+                }
+            }
+            // Not an in-scope value (e.g. static type receiver `Console` / `Program`)
+            if (lt == null) { return e; }
+        }
+        Node t = AnfExprType(cls, m, e);
+        if (t == null) { t = ArgTypeNode(e); }
+        if (t == null || t.sval == null || t.sval == "" || t.sval == "var" || t.sval == "void") { return e; }
+        if (isRecv && IsStructTy(t)) { return e; }
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = CopyType(t);
+        d.b = e;
+        d.line = e.line; d.col = e.col;
+        pre.Add(d);
+        AnfPushScope(d.sval, d.type);
+        Node id = new Node(AK.Ident());
+        id.sval = d.sval;
+        id.argName = e.argName;
+        id.line = e.line; id.col = e.col;
+        return id;
+    }
+
+    void HoistCallChildren(Node cls, Node m, Node call, List<Node> pre) {
+        int lastAw = -1;
+        int j = 0;
+        while (j < call.kids.Count) {
+            if (ExprHasAwait(call.kids[j])) { lastAw = j; }
+            j = j + 1;
+        }
+        if (lastAw >= 0) {
+            if (call.a != null && call.a.kind == AK.MemberAccess()) {
+                call.a.a = HoistExpr(cls, m, call.a.a, pre);
+                call.a.a = AnfSnapshotCallExpr(cls, m, call.a.a, pre, true);
+            } else if (call.a != null) {
+                call.a = HoistExpr(cls, m, call.a, pre);
+                call.a = AnfSnapshotCallExpr(cls, m, call.a, pre, true);
+            }
+            int i = 0;
+            while (i < call.kids.Count) {
+                Node arg = call.kids[i];
+                string aname = arg != null ? arg.argName : null;
+                arg = HoistExpr(cls, m, arg, pre);
+                if (i < lastAw) {
+                    arg = AnfSnapshotCallExpr(cls, m, arg, pre, false);
+                }
+                if (aname != null && aname != "" && arg != null) { arg.argName = aname; }
+                call.kids[i] = arg;
+                i = i + 1;
+            }
+            return;
+        }
+        call.a = HoistExpr(cls, m, call.a, pre);
+        int k = 0;
+        while (k < call.kids.Count) {
+            call.kids[k] = HoistExpr(cls, m, call.kids[k], pre);
+            k = k + 1;
+        }
     }
 
     // Rewrite an expression tree: hoist every embedded await into `pre` and
@@ -722,6 +830,10 @@ partial class Irgen {
                 && !ExprHasAwait(e.a) && ExprHasAwait(e.b)) {
             e.a = SnapshotOperand(m, HoistExpr(cls, m, e.a, pre), pre);
         }
+        if (e.kind == AK.Call()) {
+            HoistCallChildren(cls, m, e, pre);
+            return e;
+        }
         e.a = HoistExpr(cls, m, e.a, pre);
         e.b = HoistExpr(cls, m, e.b, pre);
         e.c = HoistExpr(cls, m, e.c, pre);
@@ -739,6 +851,10 @@ partial class Irgen {
     void HoistInsideRootAwait(Node cls, Node m, Node aw, List<Node> pre) {
         Node call = aw.a;
         if (call == null) { return; }
+        if (call.kind == AK.Call()) {
+            HoistCallChildren(cls, m, call, pre);
+            return;
+        }
         call.a = HoistExpr(cls, m, call.a, pre);
         int i = 0;
         while (i < call.kids.Count) {
@@ -761,8 +877,14 @@ partial class Irgen {
         int k = s.kind;
         if (k == AK.Block()) { NormBlock(cls, m, s); return; }
         if (k == AK.VarDecl()) {
-            if (s.b != null && s.b.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, s.b, pre); return; }
-            s.b = HoistExpr(cls, m, s.b, pre);
+            if (s.b != null && s.b.kind == AK.AwaitExpr()) {
+                HoistInsideRootAwait(cls, m, s.b, pre);
+            } else {
+                s.b = HoistExpr(cls, m, s.b, pre);
+            }
+            Node vty = s.type;
+            if (vty == null || vty.sval == "var") { vty = AnfExprType(cls, m, s.b); }
+            AnfPushScope(s.sval, vty);
             return;
         }
         if (k == AK.ReturnStmt()) {
@@ -811,6 +933,7 @@ partial class Irgen {
             return;
         }
         if (k == AK.ForStmt()) {
+            int fmark = anfScopeNames != null ? anfScopeNames.Count : 0;
             if (s.a != null) { NormStmt(cls, m, s.a, pre); }
             if (s.b != null && ExprHasAwait(s.b)) {
                 List<Node> cpre = new List<Node>();
@@ -842,11 +965,15 @@ partial class Irgen {
                 s.c = sblk;
             }
             s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            AnfPopScope(fmark);
             return;
         }
         if (k == AK.ForeachStmt()) {
             s.b = HoistExpr(cls, m, s.b, pre);
+            int femark = anfScopeNames != null ? anfScopeNames.Count : 0;
+            AnfPushScope(s.sval, s.type);
             s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            AnfPopScope(femark);
             return;
         }
         if (k == AK.DoWhileStmt()) {
@@ -890,6 +1017,7 @@ partial class Irgen {
 
     void NormBlock(Node cls, Node m, Node blk) {
         if (blk == null) { return; }
+        int mark = anfScopeNames != null ? anfScopeNames.Count : 0;
         List<Node> outk = new List<Node>();
         int i = 0;
         while (i < blk.kids.Count) {
@@ -902,15 +1030,26 @@ partial class Irgen {
             i = i + 1;
         }
         blk.kids = outk;
+        AnfPopScope(mark);
     }
 
     void NormalizeAwaits(Node cls, Node m) {
         if (m.d == null) { return; }
         if (CountAwaits(m.d) == 0) { return; }
         awHoistN = 0;
+        anfScopeNames = new List<string>();
+        anfScopeTypes = new List<Node>();
+        int pi = 0;
+        while (pi < m.kids.Count) {
+            Node p = m.kids[pi];
+            if (p.kind == AK.Param()) { AnfPushScope(p.sval, p.type); }
+            pi = pi + 1;
+        }
         Node body = WrapBlock(m.d);
         m.d = body;
         NormBlock(cls, m, body);
+        anfScopeNames = null;
+        anfScopeTypes = null;
     }
     // Detect `await Socket.<Intrinsic>(...)` -- the IO-reactor primitives the
     // C host lowers to zan_io_{wait,recv,accept}_co (ReadReady/WriteReady are a

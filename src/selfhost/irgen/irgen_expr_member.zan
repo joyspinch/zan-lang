@@ -788,6 +788,7 @@ partial class Irgen {
                 if (sg != null && HasMod(sg, MOD.Static())) {
                     Node sc = new Node(AK.Call());
                     sc.line = e.line; sc.col = e.col;
+                    sc.a = e;
                     return EmitStaticCall(tc.sval, "get_" + e.sval, sc);
                 }
             }
@@ -965,14 +966,7 @@ partial class Irgen {
                         ? e.a.sval : e.sval;
                     EmitRuntimeCheckIf(e, rn,
                         "null reference: receiver '" + rnm + "' is null");
-                    if (!ExternSeen("__zan_soft_scratch")) {
-                        externDecls.Add("__zan_soft_scratch");
-                        H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
-                    }
-                    string sb = NT();
-                    L("  " + sb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
-                    string sel = NT();
-                    L("  " + sel + " = select i1 " + rn + ", i8* " + sb + ", i8* " + obj.op);
+                    string sel = EmitSoftBaseSelect(obj.op, rt0, rn);
                     obj = new ExprVal(sel, obj.ty);
                 }
             }
@@ -1146,6 +1140,34 @@ partial class Irgen {
         L("  call void @zan_rt_soft_note(i8* " + tsoft + ")");
         L("  br label %L" + lskip);
         Label(lskip);
+    }
+
+    // Per-thread bounded soft-failure scratch (1 MiB payload + guard pages in
+    // rt_timer_diag.c). Called only on the cold null/OOB branch so the fast path
+    // pays zero overhead and threads never share scratch memory.
+    string EmitSoftBaseSelect(string ptrOp, string ptrTy, string isNull) {
+        if (!ExternSeen("zan_rt_soft_scratch")) {
+            externDecls.Add("zan_rt_soft_scratch");
+            H("declare i8* @zan_rt_soft_scratch()");
+        }
+        string bpre = curLbl;
+        int lslow = NL();
+        int ldone = NL();
+        L("  br i1 " + isNull + ", label %L" + lslow + ", label %L" + ldone);
+        Label(lslow);
+        string raw = NT();
+        L("  " + raw + " = call i8* @zan_rt_soft_scratch()");
+        string scr = raw;
+        if (ptrTy != "i8*") {
+            scr = NT();
+            L("  " + scr + " = bitcast i8* " + raw + " to " + ptrTy);
+        }
+        string bslow = curLbl;
+        L("  br label %L" + ldone);
+        Label(ldone);
+        string res = NT();
+        L("  " + res + " = phi " + ptrTy + " [ " + ptrOp + ", %" + bpre + " ], [ " + scr + ", %" + bslow + " ]");
+        return res;
     }
 
     // 把 i8/i32/i64 的字符值规整到 i32（镜像 C11 char 静态类的截断/扩展口径）。

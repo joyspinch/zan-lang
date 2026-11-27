@@ -108,6 +108,30 @@ partial class Irgen {
         }
     }
 
+    // S12: whether an event subscription target (`Click`, `this.x.Click`,
+    // `child.Changed`, `items[i].Changed`) is rooted at `this` (instance member)
+    // rather than a local/parameter/static member.
+    bool SubscriptionRootedAtThis(Node e) {
+        if (!curHasThis) { return false; }
+        Node cls = binder.FindType(curClass);
+        if (cls == null || cls.kind != AK.ClassDecl()) { return false; }
+        while (e != null) {
+            if (e.kind == AK.ThisExpr()) { return true; }
+            if (e.kind == AK.Ident()) {
+                if (LocalIdx(e.sval) >= 0) { return false; }
+                if (FieldIndex(cls, e.sval) >= 0) { return true; }
+                Node gm = FindMethodUp(cls, "get_" + e.sval);
+                return gm != null && !HasMod(gm, MOD.Static());
+            }
+            if (e.kind == AK.MemberAccess() || e.kind == AK.Index()) {
+                e = e.a;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+
     // ---- assignment ----
     ExprVal GenAssign(Node e) {
         Node target = e.a;
@@ -133,9 +157,16 @@ partial class Irgen {
             StoreTo(e.a, rhs);
             return rhs;
         }
+        // S12: check before HoistCompoundSpine rewrites `e.a` to a hoisted temp.
+        Node prevWeakLam = weakThisLambda;
+        if (e.op == TK.PlusEq() && curHasThis && e.b != null
+                && e.b.kind == AK.Lambda() && SubscriptionRootedAtThis(e.a)) {
+            weakThisLambda = e.b;
+        }
         HoistCompoundSpine(e.a);
         // "a ??= b" lowers to "a = (a ?? b)" reusing the ARC-safe ?? codegen.
         if (e.op == TK.QQEq()) {
+            weakThisLambda = prevWeakLam;
             Node q = new Node(AK.Binary());
             q.op = TK.QQ(); q.a = e.a; q.b = e.b;
             q.line = e.line; q.col = e.col;
@@ -146,6 +177,7 @@ partial class Irgen {
         // compound: load current, apply, store
         ExprVal cur = GenExpr(e.a);
         ExprVal r = GenExpr(e.b);
+        weakThisLambda = prevWeakLam;
         // user-defined operator: a += b -> a = T.op_add(a, b)
         if (ClassOf(cur.ty) != null) {
             int bop = 0;
@@ -391,7 +423,13 @@ partial class Irgen {
                     // receiver.
                     Node sm = FindMethodUp(tc, "set_" + lhs.sval);
                     if (sm != null && HasMod(sm, MOD.Static())) {
-                        EmitPropSet("", MkType(tc.sval), lhs.sval, v);
+                        Node sty = MkType(tc.sval);
+                        List<Node> sargs = ConcreteInstArgs(lhs, tc.sval);
+                        if (sargs != null) {
+                            int sai = 0;
+                            while (sai < sargs.Count) { sty.Add(sargs[sai]); sai = sai + 1; }
+                        }
+                        EmitPropSet("", sty, lhs.sval, v);
                         return;
                     }
                 }
@@ -436,6 +474,24 @@ partial class Irgen {
                 Node fieldTy = SubstRecvTy(FieldType(ocls, lhs.sval), obj.ty);
                 v = ApplyUserConv(fieldTy, v, false);
                 if (!convApplied) { v = StrSlotConv(fieldTy, v); }
+            }
+            if (ocls != null && ocls.kind == AK.ClassDecl()) {
+                string rt0 = MapType(obj.ty);
+                if (IsPtrLL(rt0)) {
+                    string rn = NT();
+                    L("  " + rn + " = icmp eq " + rt0 + " " + obj.op + ", null");
+                    string rnm = lhs.a != null && lhs.a.kind == AK.Ident() && lhs.a.sval != ""
+                        ? lhs.a.sval : lhs.sval;
+                    EmitRuntimeCheckIf(lhs, rn,
+                        "null reference: receiver '" + rnm + "' is null");
+                    int ldo = NL(); int lskip = NL();
+                    L("  br i1 " + rn + ", label %L" + lskip + ", label %L" + ldo);
+                    Label(ldo);
+                    StoreField(obj.op, cn, lhs.sval, v);
+                    L("  br label %L" + lskip);
+                    Label(lskip);
+                    return;
+                }
             }
             StoreField(obj.op, cn, lhs.sval, v);
             return;
@@ -549,14 +605,7 @@ partial class Irgen {
                 EmitRuntimeCheckIf(lhs, soob, "index out of bounds: string store");
                 string sp = NT();
                 L("  " + sp + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);
-                if (!ExternSeen("__zan_soft_scratch")) {
-                    externDecls.Add("__zan_soft_scratch");
-                    H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
-                }
-                string scrs = NT();
-                L("  " + scrs + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
-                string spsel = NT();
-                L("  " + spsel + " = select i1 " + soob + ", i8* " + scrs + ", i8* " + sp);
+                string spsel = EmitSoftBaseSelect(sp, "i8*", soob);
                 string sb = NT();
                 L("  " + sb + " = trunc i64 " + v.op + " to i8");
                 L("  store i8 " + sb + ", i8* " + spsel);
@@ -757,7 +806,15 @@ partial class Irgen {
         // a static property setter takes no receiver: `Custom = 40` inside
         // the class means `Custom.set_Custom(40)`
         if (HasMod(m, MOD.Static())) {
-            L("  call void @" + MethodSym(owner, m) + "(" + MapType(pty) + " " + CallArg(v, pty, false) + ")");
+            string ssym = MethodSym(owner, m);
+            string sptym = MapTypeDecl(pty, owner);
+            string sss = ClassSpecSym(owner, m, recvTy);
+            if (sss != "") {
+                ssym = sss;
+                pty = SubstTP(pty, csNames, csReps);
+                sptym = MapType(pty);
+            }
+            L("  call void @" + ssym + "(" + sptym + " " + CallArg(v, pty, false) + ")");
             return true;
         }
         string thisOp = objOp;

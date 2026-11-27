@@ -197,6 +197,37 @@ partial class Irgen {
         return ReflMetaConst(canon, FormatTypeNode(canon));
     }
 
+    void CollectClassProps(Node cls, List<string> outPropNames, bool isSetter) {
+        if (cls == null) { return; }
+        string prefix = isSetter ? "set_" : "get_";
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && !HasMod(m, MOD.Static()) && m.sval.StartsWith(prefix) && m.sval.Length > 4) {
+                int pcnt = 0;
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    if (m.kids[pi].kind == AK.Param()) { pcnt = pcnt + 1; }
+                    pi = pi + 1;
+                }
+                if ((isSetter && pcnt == 1) || (!isSetter && pcnt == 0)) {
+                    string pname = m.sval.Substring(4, m.sval.Length - 4);
+                    if (IndexOfStr(outPropNames, pname) < 0) {
+                        outPropNames.Add(pname);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        Node baseNode = BaseClassOf(cls);
+        if (baseNode != null && baseNode.sval != "" && baseNode.sval != "object") {
+            Node baseCls = binder.FindType(baseNode.sval);
+            if (baseCls != null) {
+                CollectClassProps(baseCls, outPropNames, isSetter);
+            }
+        }
+    }
+
     void CollectClassMethods(Node cls, List<Node> outMethods, List<string> seenNames) {
         if (cls == null) { return; }
         int i = 0;
@@ -651,8 +682,20 @@ partial class Irgen {
         tb.Append("    i64 " + (isClosedList ? ListSlotOwnership(listElem) : -1) + ",\n");
         tb.Append("    i1 (i8*)* " + accepts + ",\n");
         // B-ID107: full_name (-112 slot), ns-qualified like the C host's
-        // render_type_full; type_attrs (-104 slot); declared attributes (-96 slot)
-        string typeAttrs = (targetCls != null && targetCls.attrBlob != null && targetCls.attrBlob != "") ? targetCls.attrBlob : "";
+        // render_type_full; type_attrs (-104 slot, inherited); declared attributes (-96 slot, own-only)
+        string typeAttrs = "";
+        Node attrCur = targetCls;
+        while (attrCur != null) {
+            if (attrCur.attrBlob != null && attrCur.attrBlob != "") {
+                typeAttrs = typeAttrs + attrCur.attrBlob;
+            }
+            Node bnode = BaseClassOf(attrCur);
+            if (bnode != null && bnode.sval != "" && bnode.sval != "object") {
+                attrCur = binder.FindType(bnode.sval);
+            } else {
+                attrCur = null;
+            }
+        }
         string declaredData = targetCls != null && targetCls.attrDeclaredData != null ? targetCls.attrDeclaredData : "";
         tb.Append("    i8* " + GenConstStr(ReflFullNameOf(disp)) + ",\n");
         tb.Append("    i8* " + GenConstStr(typeAttrs) + ",\n");
@@ -689,12 +732,7 @@ partial class Irgen {
 
     ExprVal EmitTypeInfoProp(ExprVal obj, string name, Node e) {
         if (name == "Name") {
-            ExprVal emptyStr = GenStr("");
-            string rn = NT();
-            L("  " + rn + " = icmp eq i8* " + obj.op + ", null");
-            string r = NT();
-            L("  " + r + " = select i1 " + rn + ", i8* " + emptyStr.op + ", i8* " + obj.op);
-            return new ExprVal(r, MkType("string"));
+            return new ExprVal(obj.op, MkType("string"));
         }
         if (name == "Kind") {
             int lNull = NL();

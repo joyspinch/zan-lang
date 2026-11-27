@@ -169,11 +169,22 @@ partial class Irgen {
         H(g + " = internal global " + lt + " zeroinitializer");
     }
 
+    Node SubstStaticFieldType(string owner, Node fty, List<Node> args) {
+        if (fty == null || args == null || args.Count == 0) { return fty; }
+        Node ocls = binder.FindType(owner);
+        if (ocls == null) { return fty; }
+        List<string> tps = TParams(ocls);
+        if (tps.Count == 0 || tps.Count != args.Count) { return fty; }
+        return SubstTP(fty, tps, args);
+    }
+
     ExprVal LoadStaticField(Node cls, string name, List<Node> args) {
         string owner = StaticFieldOwner(cls, name);
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
         Node fty = sf.type;
+        Node vty = SubstStaticFieldType(owner, fty, args);
+        bool erased = IsErasedTypeDecl(fty, owner);
         // the field's type is written in the OWNING class's scope
         string savedScope = typeScopeCls;
         typeScopeCls = owner;
@@ -187,13 +198,16 @@ partial class Irgen {
         string t = NT();
         L("  " + t + " = load " + lt + ", " + lt + "* " + g);
         typeScopeCls = savedScope;
-        return new ExprVal(t, fty);
+        if (erased) { return FromSlot(t, vty); }
+        return new ExprVal(t, vty);
     }
     void StoreStaticField(Node cls, string name, ExprVal v, List<Node> args) {
         string owner = StaticFieldOwner(cls, name);
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
         Node fty = sf.type;
+        Node vty = SubstStaticFieldType(owner, fty, args);
+        bool erased = IsErasedTypeDecl(fty, owner);
         // the field's type is written in the OWNING class's scope
         string savedScope = typeScopeCls;
         typeScopeCls = owner;
@@ -201,6 +215,22 @@ partial class Irgen {
         DemandStaticType(owner, args);
         EnsureStaticGlobal(owner, name, args, lt);
         string g = StaticGlobal(owner, name, args);
+        if (erased) {
+            typeScopeCls = savedScope;
+            string sv = ToSlot(v, vty);
+            if (ArcManaged(vty) || (vty != null && vty.ival >= 1)) {
+                string old = NT();
+                L("  " + old + " = load i64, i64* " + g);
+                string newVal = Coerce(v, MapType(vty));
+                EmitArcRetain(newVal, vty);
+                L("  store i64 " + sv + ", i64* " + g);
+                ExprVal oldUnpacked = FromSlot(old, vty);
+                EmitArcRelease(oldUnpacked.op, vty);
+            } else {
+                L("  store i64 " + sv + ", i64* " + g);
+            }
+            return;
+        }
         if (IsNullableValue(fty)) {
             StoreNullable(g, v, fty, true);
             typeScopeCls = savedScope;
@@ -850,7 +880,7 @@ partial class Irgen {
         if (ty == null) { return false; }
         // the same type-node derivation GenNew uses, so the element
         // nullable flag and the rank travel identically
-        Node at = MkType(ty.sval); at.ival = 1; at.op = ty.op; at.kids = ty.kids; at.arrRanks = rkl;
+        Node at = MkType(ty.sval); at.ival = 1; at.op = ty.op; at.elemNullable = ty.elemNullable; at.kids = ty.kids; at.arrRanks = rkl;
         Node et = ArrElemOf(at);
         if (et == null || IsNullableValue(et) || IsStructTy(et) || IsFloatTy(et)) { return false; }
         if (MapType(et) != "i64" || IsErasedType(et)) { return false; }

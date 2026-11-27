@@ -581,7 +581,11 @@ partial class Irgen {
         return GenExpr(tree);
     }
 
+    public Node weakThisLambda;
+
     ExprVal GenLambda(Node lam) {
+        bool weakThis = (weakThisLambda != null && weakThisLambda == lam);
+        if (weakThis) { weakThisLambda = null; }
         if (IsTreeLambda(lam)) {
             return GenTreeLambda(lam);
         }
@@ -610,10 +614,15 @@ partial class Irgen {
         // the receiver travels as one more env slot.
         bool capThis = LambdaNeedsThis(lam);
         if (capThis) {
+            Node ccls = binder.FindType(curClass);
+            if (ccls == null || ccls.kind != AK.ClassDecl()) { weakThis = false; }
             caps.Add("this");
             capTy.Add(MkType(curClass));
+        } else {
+            weakThis = false;
         }
         int nc = caps.Count;
+        int weakThisIdx = (capThis && weakThis) ? (nc - 1) : -1;
 
         // A captured local lives in a heap cell: the closure keeps the cell,
         // so a write to the local after the capture stays visible inside the
@@ -634,7 +643,7 @@ partial class Irgen {
         // build the env with the captured values (in the enclosing function)
         string env = "null";
         if (nc > 0) {
-            env = OwnedEnvironment(capTy, capBox);
+            env = OwnedEnvironment(capTy, capBox, weakThisIdx);
             string envi = NT();
             L("  " + envi + " = bitcast i8* " + env + " to i64*");
             int c = 0;
@@ -642,6 +651,14 @@ partial class Irgen {
                 string slot = NT();
                 L("  " + slot + " = getelementptr i64, i64* " + envi + ", i64 " + c);
                 string packed = "0";
+                if (c == weakThisIdx) {
+                    ExprVal cv = ThisReceiver();
+                    string wv = ToSlot(cv, capTy[c]);
+                    L("  store i64 0, i64* " + slot);
+                    EmitWeakStore(slot, wv);
+                    c = c + 1;
+                    continue;
+                }
                 if (capBox[c]) {
                     int li = LocalIdx(caps[c]);
                     string cell = locCell[li];
@@ -786,6 +803,27 @@ partial class Irgen {
                 L("  " + raw + " = load i64, i64* " + slot);
                 string lt = MapType(capTy[c]);
                 if (caps[c] == "this") {
+                    if (c == weakThisIdx) {
+                        // S12 weak this capture: atomically acquire +1 or bail out
+                        // silently when the subscriber has already been destroyed.
+                        string wraw = NT();
+                        L("  " + wraw + " = call i64 @zan_rt_weak_load(i64* " + slot + ")");
+                        string wgone = NT();
+                        L("  " + wgone + " = icmp eq i64 " + wraw + ", 0");
+                        int lDead = NL(); int lLive = NL();
+                        L("  br i1 " + wgone + ", label %L" + lDead + ", label %L" + lLive);
+                        Label(lDead);
+                        ReleaseLocalsFrom(0);
+                        if (curRet == "void") { L("  ret void"); }
+                        else { L("  ret " + curRet + " " + ZeroConst(curRet)); }
+                        Label(lLive);
+                        L("  %this = inttoptr i64 " + wraw + " to " + lt);
+                        string treg = AddLocal("this", capTy[c]);
+                        EA(treg, lt);
+                        L("  store " + lt + " %this, " + lt + "* " + treg);
+                        c = c + 1;
+                        continue;
+                    }
                     // the receiver: the body sees it as `%this`, and a local of
                     // the same name lets a nested closure capture it too
                     L("  %this = inttoptr i64 " + raw + " to " + lt);
