@@ -247,7 +247,17 @@
   `LastIndexOf`、`Contains`、`StartsWith`、`EndsWith`、`Replace`、`Trim`、
   `ToUpper`、`ToLower`、`Split`（→ `List<string>`）、`Equals`；`==` 按内容比较。
   `Dictionary<K,V>`（也可写 `Dict<K,V>`）有 `Add`/`Remove`/`Clear`/
-  `ContainsKey`/`TryGetValue`。
+  `ContainsKey`/`TryGetValue`。注意当 `TryGetValue(k, out v)` 写在短路 `&&`
+  右侧（如 `map != null && map.TryGetValue(k, out v)`）时，编译器确定赋值检查
+  （E2098）不会跨短路认定 `v` 已赋值——须先写初值（`T v = null;` 或 `0`）。
+* **IEEE-754 位重解释与硬件位指令已内建**：直接用 `NativeMemory.AsF32(int)` /
+  `AsF64(long)` / `AsI32(float)` / `AsI64(double)` 与 `System.Numerics.BitOperations`
+  （`PopCount` / `LeadingZeroCount` / `TrailingZeroCount`，参数为有符号 `int`/`long`，
+  不是 `ulong`），严禁手写逐位乘 2 / 归一化循环拼 IEEE-754。
+* **空条件字段访问 `expr?.field` 在引用类型堆字段上的已知 ARC 坑**：当 `expr` 返回
+  临时对象且 `field` 是堆分配的引用字段（如动态拼接的 `string`）时，`emit_null_cond`
+  返回借用字段却被调用方当所有权释放，二次读取会触发 UAF；访问引用类型字段时优先
+  存局部判空（`var x = F(); if (x != null) { ... x.field ... }`）。
 * **lambda 一半返回 null 时**：先把局部变量按显式类型声明好再返回
   （`ValidationResult outp = null; ... return outp;`）——`return null;` 与
   `return value;` 并列时，返回类型推断可能挑中 null 那支。

@@ -84,22 +84,38 @@ program.
 ```
 stdlib/
 ├── System/                          # namespace System（核心基石原语）
+│   ├── Action.zan                   # Action/Func/Predicate 基础委托
+│   ├── AppPath.zan                  # 应用路径解析辅助
+│   ├── Array.zan                    # 数组辅助方法
+│   ├── Binding.zan                  # typed property read/write bindings (Binding<T>)
+│   ├── BitConverter.zan             # 字节与数值位转换
 │   ├── ConsoleColor.zan             # ConsoleColor enum
+│   ├── Convert.zan                  # 进制/Base64/Hex 等转换扩展（与编译器内建 Convert 互补）
 │   ├── DateTime.zan                 # Date and time
+│   ├── Decimal.zan                  # 高精度十进制数
+│   ├── Environment.zan              # 进程/环境变量/目录辅助（与编译器内建 Environment 互补）
+│   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
 │   ├── Guid.zan                     # UUID generation
+│   ├── IDisposable.zan              # 资源释放契约
+│   ├── OperatingSystem.zan          # OS 判定辅助
 │   ├── Random.zan                   # Random numbers (non-cryptographic)
 │   ├── RandomNumberGenerator.zan    # OS CSPRNG bytes
+│   ├── RuntimeInformation.zan       # 平台架构/OS 信息
 │   ├── Stopwatch.zan                # monotonic clock + elapsed timing (QPC / clock_gettime)
-│   ├── TimeSpan.zan                 # Time span
-│   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
-│   ├── Binding.zan                  # typed property read/write bindings (Binding<T>)
+│   ├── StringView.zan               # 零拷贝字符串切片视图
 │   ├── TaskJoin.zan                 # async task join helpers
+│   ├── TimeSpan.zan                 # Time span
+│   ├── TimeZoneInfo.zan             # 时区信息
+│   ├── WeakEventManager.zan         # 弱引用事件管理器
+│   ├── WeakReference.zan            # 弱引用包装
 │   ├── ZanVersion.zan               # version constants
 │   │
 │   ├── Exceptions/                  # namespace System — 核心运行时与IO异常基类（领域异常如 HttpRequest/Json/Regex/Socket 分别归属对应包）
-│   ├── Interop/                     # namespace System — FFI/marshaling: NativeMemory, Marshal, Com, Wide
+│   ├── Interop/                     # namespace System — FFI/marshaling: NativeMemory (Copy/Fill/AsF32/AsF64/AsI32/AsI64), Marshal, SafeHandle, Com, Wide
 │   ├── Extensions/                  # namespace System — ListExtensions, StringExtensions, MemoryExtensions
-│   ├── Diagnostics/                 # namespace System.Diagnostics — Process 子进程派生、输出捕获与 Tracing
+│   ├── Buffers/                     # namespace System.Buffers — ArrayPool 等缓冲池
+│   ├── DependencyInjection/         # namespace System.DependencyInjection — 轻量 DI 容器
+│   ├── Diagnostics/                 # namespace System.Diagnostics — Process 子进程派生、输出捕获与 Tracing/Activity
 │   │
 │   ├── IO/                          # System.IO 原语基石
 │   │   ├── File.zan                 # 基础文件读写与同步/异步双轨 API
@@ -119,7 +135,7 @@ stdlib/
 │   │
 │   ├── Collections/Generic/         # System.Collections.Generic 基础集合容器
 │   │   ├── HashSet.zan              # 哈希集合
-│   │   ├── LinkedList.zan           # 双向链表
+│   │   ├── LinkedList.zan           # 双向链表（含 O(1) AddLastNode/RemoveNode/MoveToLast）
 │   │   ├── Queue.zan                # 连续环形数组 FIFO 队列
 │   │   ├── Stack.zan                # LIFO 栈
 │   │   ├── PriorityQueue.zan        # 最小堆优先队列
@@ -129,38 +145,51 @@ stdlib/
 │   │   └── IEnumerator.zan          # 枚举器接口
 │   │
 │   ├── Numerics/                    # System.Numerics
-│   │   └── MathUtil.zan             # 高精度数学计算
+│   │   ├── BitOperations.zan        # 硬件位操作内建（PopCount/LeadingZeroCount/TrailingZeroCount 等）
+│   │   ├── MathUtil.zan             # 数学工具（Pi/Log/Exp/Clamp/Lerp 等）
+│   │   ├── Vector2/3/4.zan          # 2D/3D/4D float 向量
+│   │   ├── Matrix4x4.zan            # 4x4 矩阵
+│   │   ├── Quaternion.zan           # 四元数
+│   │   ├── Noise.zan                # 确定性噪声
+│   │   ├── RandomExt.zan            # xorshift64* PRNG
+│   │   └── Spline.zan               # 样条曲线
 │   │
 │   ├── Text/                        # System.Text
 │   │   └── Encoding.zan             # UTF-8/16/32 编码解码
 │   │
-│   └── Threading/                   # System.Threading 并发基石（Channel, TaskCompletionSource, Mutex 等）
-│
+│   └── Threading/                   # System.Threading 并发基石（Channel, TaskCompletionSource, CancellationToken, AsyncGate, Mutex, RwLock 等）
+
 packages/                            # 独立拆解的高性能可复用包生态
 ├── Zan.Configuration/               # 配置提供程序体系（IConfiguration, ConfigurationBuilder, JsonFile, EnvFile 等）
 ├── Zan.Json/                        # 完整 JSON 栈：JsonValue, JsonDoc, Schema, JsonPath, JsonPatch
-├── Zan.IO/                          # 扩展 I/O：MemoryMappedFile、DirectoryTree、DirectoryWatcher、Compression (Deflate, GZip, Zip, Tar, Zstd)
-├── Zan.Net/                         # 完整网络栈：Socket, Tcp/Udp, Http/Https, Tls, WebSocket, Mqtt, Sse, Rpc
-├── Zan.Desktop/                     # 桌面与操作系统服务：Process, Display, Device, Media, Clipboard
-├── Zan.Data/                        # 数据访问与持久化：Sqlite, SqlServer, Redis, Orm, ZanDb
-├── Zan.Security/                    # 安全与密码学：Cryptography, Jwt, X509Certificate
-├── Zan.Ai/                          # LLM 运行时：AiClient, AnthropicClient, AiStream, Rag, Embeddings, VectorStore
+├── Zan.Formats/                     # 统一格式生态：CSV, TOML, YAML, CBOR, BSON, MessagePack, Protobuf, INI, XLSX, Markdown, QR
+├── Zan.Xml/                         # XML DOM / XPath / Writer
+├── Zan.IO/                          # 扩展 I/O：MemoryMappedFile、DirectoryTree、DirectoryWatcher、Compression (Deflate, GZip, Zip, Tar, BZip2, Zstd)
+├── Zan.Net/                         # 完整网络栈：Socket, Tcp/Udp, Http/Https, Tls, WebSocket, Mqtt, Modbus, Sse, Rpc
+├── Zan.Web/, Zan.Mvc/               # Web 服务端框架、路由、WsHub、MVC 脚手架与管理后台模块
+├── Zan.Desktop/                     # 桌面与操作系统服务：Automation, TrayIcon, Display, Device, Media, Clipboard
+├── Zan.Data/, Zan.DataFrame/        # 数据访问与持久化（Sqlite, MySql, Postgres, Firebird, SqlServer, TDengine, Redis, Orm, ZanDb）与表格分析（DataFrame/Pivot/Merge/Reshape）
+├── Zan.Caching/, Zan.Diagnostics/   # 高性能内存 LRU 缓存（MemoryCache）与结构化日志/落地端（MemoryLogSink 等）
+├── Zan.Security/, Zan.Ssh/, Zan.Web3/ # 密码学/JWT/X509、SSH 客户端、Web3/RPC/助记词
+├── Zan.Ai/, Zan.Tensor/             # LLM 运行时（AiClient, AiStream, Rag, VectorStore）与张量计算
+├── Zan.Linq/, Zan.Text/, Zan.Globalization/ # LINQ 与惰性 Stream、Regex/文本引擎、多语言与农历
 ├── Zan.Gui/                         # 纯 Zan 自举的 GUI 原生渲染框架
 │   ├── Zan.Gui.Charts/              # 工业级图表组件
 │   ├── Zan.Gui.DataTable/           # 高性能虚拟化表格
 │   ├── Zan.Gui.CodeEditor/          # 代码编辑器与语法高亮
 │   ├── Zan.Gui.Designer/            # 可视化低代码设计器
-│   └── Zan.Gui.Browser/             # WebView 与 CEF 双驱动内嵌浏览器
-├── Zan.Game/                        # 游戏引擎架构、物理与空间划分 (Physics2D, Physics3D, Pathfinding, Factory)
-└── Zan.Linq/, Zan.Csv/, Zan.Xml/, Zan.Yaml/, Zan.Toml/, Zan.Bson/, Zan.Cbor/ # 格式与数据处理
+│   ├── Zan.Gui.Browser/             # WebView 与 CEF 双驱动内嵌浏览器
+│   └── Zan.Gui.Cad/, Zan.Gui.Media/, Zan.Gui.Workplace/
+└── Zan.Game/ (+ Zan.Game.Arpg/Board/Cards/Factory/Idle/Tactics) # 游戏引擎架构、物理、寻路、粒子、程序化生成（WFC）与玩法基座
 ```
 
-**Compiler builtins are not files.** `Console`, `Math`, `String`, `Convert`,
-`Environment`, `List<T>`, `Dict<K,V>`, `StringBuilder` and the array/string
-types are implemented inside the compiler (`src/compiler/builtin_api.c`), so
-there are no `System/Console.zan`, `System/Math.zan`, `System/String.zan`,
-`System/Convert.zan`, `System/Environment.zan`, `Collections/List.zan` or
-`Text/StringBuilder.zan` files. There are no `mod.zan` entry points anywhere:
+**Compiler builtins vs. stdlib files.** `Console`, `Math`, `String`, `List<T>`,
+`Dict<K,V>`, `StringBuilder` and the array/string types are implemented inside
+the compiler (`src/compiler/builtin_api.c`), so there are no `System/Console.zan`,
+`System/Math.zan`, `System/String.zan`, `Collections/List.zan` or
+`Text/StringBuilder.zan` files. `Convert` and `Environment` have compiler
+builtins complemented by source extensions in `stdlib/System/Convert.zan` and
+`stdlib/System/Environment.zan`. There are no `mod.zan` entry points anywhere:
 a namespace is simply a directory (see §4).
 
 ---
@@ -349,10 +378,10 @@ protecting a complete path must also check every ancestor and control concurrent
 directory modification. Missing or unqueryable paths return `false`, so this
 boolean query is not authorization to open or modify a path.
 
-There is no `Stream Open(path, FileMode)` — there is no `FileMode` enum; use
-`FileStream` (`System.IO`) for stream-style access. The `*Async` variants are
-plain synchronous wrappers around the sync methods (no actual `async` IO), as
-noted in their doc comments.
+There is no `File.Open(path, FileMode)` helper on `File` itself — construct a
+`FileStream(path, FileMode, FileAccess)` (`System.IO`) for stream-style access.
+The `*Async` variants on `File` are plain synchronous wrappers around the sync
+methods (no actual `async` IO), as noted in their doc comments.
 
 **Error model (C#-aligned).** Failures throw instead of silently returning
 empty/default values:

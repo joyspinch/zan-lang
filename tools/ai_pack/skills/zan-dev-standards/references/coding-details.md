@@ -156,18 +156,15 @@
   挪进 `[表头]` 区块，同层键序变化是语义不变的（TOML 表无序），拿 JSON
   文本判等会误报失败：递归 `Eqv(a,b)`（对象逐 KeyAt 查 Has+ValAt 递归、
   数组按序递归、标量按类型比）才是正确闸门。
-- **语言事实第七则（Zan.Protobuf/Zan.MsgPack 首日踩出）**：
-  ① 数值类型只有 `int`/`long`/`double`/`bool`——没有 `float`，也没有
-  `sbyte`/`short` 有符号小整型：32 位浮点字段做不了（当文档化取舍写进
-  README），小整型符号扩展手工算（`v >= 128 → v - 256`），别臆测类型
-  存在；② IEEE-754 位型互转没有 reinterpret，配方是复用
-  `TdsMessage.DoubleBits` 归一化构造（**±∞/NaN 必须先收口**——归一化
-  循环对非有限值永不终止）+ `MySqlWire.ieeeToText` 形状的逐位累加解码
-  （各项 2^(b-52) 恰可表示、和精确）；解码侧造 ±∞/NaN 用
-  `Pow2(1024)` 溢出与 `inf - inf`，**不能拿特殊位型递归自造**（位型
-  仍是特殊值，无限递归）；③ 判 NaN 用 `x != x`，判 ±∞ 用
-  `x > 1e308` / `x < -1e308`——`x == x` 对 ∞ 恒真，照 NaN 惯用法写
-  会误报失败。
+- **语言事实第七则（数值类型与 IEEE-754 位重解释现状——已淘汰早期手写绕行）**：
+  ① 数值类型体系已完整支持 `sbyte`/`byte`/`short`/`ushort`/`int`/`uint`/`long`/`ulong`/`float`/`double`/`decimal`/`nint`，不再需要因缺 `float` 或有符号小整型做手写绕行；
+  ② IEEE-754 位型互转直接调用标准库内建重解释原语 `NativeMemory.AsF32(int)`、`NativeMemory.AsF64(long)`、`NativeMemory.AsI32(float)`、`NativeMemory.AsI64(double)`（单条硬件 bitcast，零分支/零精度损失；注意 `AsF32`/`AsF64` 参数分别为 `int`/`long`），严禁再手写逐位乘 2 / 归一化循环拼 IEEE-754；需要硬件位计数/前导尾随零计数时直接用 `System.Numerics.BitOperations`（`PopCount`/`LeadingZeroCount`/`TrailingZeroCount`，参数为有符号 `int`/`long`）；
+  ③ 判 NaN 仍用 `x != x`，判 ±∞ 用 `x > 1e308` / `x < -1e308`（或结合 `AsI64` 检查指数全 1 位型）。
+- **标准库与基础包治理定式（热路径、并发队列与外部脚本转义）**：
+  ① **异步等待队列用 `Queue<AsyncGate>`，禁 `List<AsyncGate>.RemoveAt(0)`**：数据库连接、网络流、TLS/WS/MQTT/Modbus/SSH 等 FIFO 等待者与缓冲淘汰队列一律使用 `System.Collections.Generic.Queue<T>`（注意计数方法为 `.Count()`），消灭 $O(N)$ 首元素搬移；
+  ② **集合判重用 `HashSet<T>`，禁 `Dictionary<T, bool>`**：单次 `seen.Add(key)` 返回 bool 同时完成查重与插入，省掉双倍哈希与布尔值槽位；字典查找优先 `TryGetValue(k, out v)`，遍历值集合用 `.Values` 避免 `Keys` + 二次索引；若 `TryGetValue` 位于 `&&` 短路右侧，须先给 `out` 局部变量赋初值（如 `string s = null;`）以通过编译器确定赋值检查（E2098）；
+  ③ **LRU 与日志环形队列杜绝 $O(N)$ 搬移**：LRU 缓存用 `LinkedList<T>` 新增的 $O(1)$ 节点 API（`AddLastNode`/`RemoveNode`/`MoveToLast`）或侵入式双向链表（`Sweep()` 遍历活跃链而非全槽位数组）；定长历史日志（如 `MemoryLogSink`）用定长数组环形缓冲替代 `List.RemoveAt(0)`；原生 `Mutex` 持有者须实现 `IDisposable` 并以 `try/finally` 保证 `Mutex.Unlock` 不泄漏；
+  ④ **外部边界转义禁止不完整 `.Replace()`**：拼接 JS 字符串（如 `FirefoxAgent`）、AppleScript（`Window.Posix`/`TrayIcon`）或 JSON（`FingerprintProfile`/`JsonRpcBuilder`）必须走完整转义器（覆盖 `\`、`"`、控制字符 `< 0x20`、`\r`/`\n`/`\t` 及 JS 的 U+2028/U+2029），严禁 `Replace("'", "\'")` 这类自欺欺人的空操作。
 - **语言事实第八则（Zan.Yaml 首日踩出）**：① 同类里
   **static 方法调用实例方法不报检查器错**，直到 LLVM verification 才炸
   （`Operand is null`，指向被调函数的 this 实参）——报错不提示

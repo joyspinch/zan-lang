@@ -107,7 +107,7 @@ Integer literals are `int` (32-bit signed) by default. Suffixes:
 $"Hello {name}"             // interpolated string
 ```
 
-Escape sequences: `\n \r \t \\ \" \' \0`（不支持 `\x` / `\u` / `\U` 十六进制与码点转义，也不支持 `$@"..."` 组合形式与 `"""` 原始字符串）。
+Escape sequences: `\n \r \t \\ \" \' \0 \xNNNN \uNNNN`（`\x`/`\u` 均为 4 位十六进制码点，字符串字面量中按 UTF-8 编码写入，字符字面量中求值为对应标量码点；不支持 `\U` / `\b` / `\f`，也不支持 `$@"..."` 组合形式与 `"""` 原始字符串）。
 
 #### Character Literals
 ```
