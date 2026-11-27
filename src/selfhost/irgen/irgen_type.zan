@@ -486,12 +486,27 @@ partial class Irgen {
         return StrEsc.DecodeBytes(raw);
     }
 
-    ExprVal GenStr(string raw) {
-        List<int> bytes = DecodeStr(raw);
-        string bodytxt = "";
+    void AppendIrBytes(StringBuilder sb, List<int> bytes) {
+        string ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
         int i = 0;
-        while (i < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[i]); i = i + 1; }
-        bodytxt = bodytxt + "\\00";
+        while (i < bytes.Count) {
+            int b = bytes[i];
+            if (b >= 32 && b <= 126 && b != 34 && b != 59 && b != 64 && b != 92) {
+                sb.Append(ascii.Substring(b - 32, 1));
+            } else {
+                sb.Append("\\");
+                sb.Append(Hex2(b));
+            }
+            i = i + 1;
+        }
+    }
+
+    string GenStrIndices(string raw) {
+        if (strLitGep.ContainsKey(raw)) { return strLitGep[raw]; }
+        List<int> bytes = DecodeStr(raw);
+        StringBuilder bodytxt = new StringBuilder();
+        AppendIrBytes(bodytxt, bytes);
+        bodytxt.Append("\\00");
         int blen = bytes.Count + 1;
         // managed string header in front of the payload: [i64 cid][i64 len]
         // [i64 magic] -- the same 24-byte shape as an object header, so the
@@ -500,9 +515,20 @@ partial class Irgen {
         strn = strn + 1;
         string g = "@.s" + strn;
         int tlen = 32 + blen;
-        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\", align 8");
+        rawStringGlobals.Append(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt.ToString() + "\", align 8\n");
+        string indices = "[" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 32";
+        strLitGep[raw] = indices;
+        return indices;
+    }
+
+    string GenStrConst(string raw) {
+        return "getelementptr inbounds (" + GenStrIndices(raw) + ")";
+    }
+
+    ExprVal GenStr(string raw) {
+        string indices = GenStrIndices(raw);
         string t = NT();
-        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 32");
+        L("  " + t + " = getelementptr inbounds " + indices);
         return new ExprVal(t, MkType("string"));
     }
 

@@ -15,10 +15,11 @@ namespace Zan;
 // deep for struct fields and shallow (retain) for class fields -- the same
 // split the host's by-value copy makes.
 partial class Irgen {
-    // true when `t` names a struct type (an instance is a heap object here)
+    // true when `t` names a non-nullable struct type (an instance is a heap object here)
     bool IsStructTy(Node t) {
         if (t == null) { return false; }
         if (t.ival >= 1) { return false; }
+        if (IsNullable(t)) { return false; }
         if (IsErasedType(t)) { return false; }
         // the hardware vectors are declared as structs but are first-class
         // values here: they have no heap layout and no instance to copy
@@ -26,6 +27,58 @@ partial class Irgen {
         Node d = binder.FindType(t.sval);
         if (d == null) { return false; }
         return d.kind == AK.StructDecl();
+    }
+
+    bool IsNullableStruct(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (!IsNullable(t)) { return false; }
+        if (IsErasedType(t)) { return false; }
+        if (t.sval == "Vector128" || t.sval == "Vector256") { return false; }
+        Node d = binder.FindType(t.sval);
+        if (d == null) { return false; }
+        return d.kind == AK.StructDecl();
+    }
+
+    bool IsExplicitLayoutStruct(Node t) {
+        if (t == null || t.ival >= 1 || IsErasedType(t)) { return false; }
+        Node d = binder.FindType(t.sval);
+        return d != null && d.kind == AK.StructDecl() && d.layoutExplicit;
+    }
+
+    // Lazily emit `@<cn>_clone(i8* %src) -> i8*` for reflection value-copy semantics.
+    string EnsureStructCloneHelper(Node decl) {
+        if (decl == null || decl.kind != AK.StructDecl() || decl.layoutExplicit) { return "null"; }
+        string cn = decl.sval;
+        string sym = "@" + cn + "_clone";
+        if (structCloneEmitted.ContainsKey(cn)) { return sym; }
+        structCloneEmitted[cn] = true;
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        L("define internal i8* " + sym + "(i8* %src) {");
+        L("entry:");
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq i8* %src, null");
+        int lcopy = NL();
+        int lnil = NL();
+        L("  br i1 " + isNull + ", label %L" + lnil + ", label %L" + lcopy);
+        Label(lnil);
+        L("  ret i8* null");
+        Label(lcopy);
+        string srcTyped = NT();
+        L("  " + srcTyped + " = bitcast i8* %src to %" + cn + "*");
+        string dst = AllocStructObj(cn);
+        InitNestedFields(dst, decl);
+        CopyStructInto(dst, srcTyped, decl);
+        string res = NT();
+        L("  " + res + " = bitcast %" + cn + "* " + dst + " to i8*");
+        L("  ret i8* " + res);
+        L("}");
+        string text = body.ToString();
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        deferred.Append(text);
+        return sym;
     }
 
     // does a value of type `slotTy` have to be copied when it is stored into

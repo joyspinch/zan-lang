@@ -242,22 +242,45 @@ partial class Irgen {
     }
 
     string LocalSlotDtor(Node ty, bool cell) {
-        string name = "@zlocal_dtor_" + ownedDtorSeq;
-        ownedDtorSeq = ownedDtorSeq + 1;
+        string kind = "noop";
+        string lt = "i8*";
+        if (cell) {
+            kind = "cell";
+        } else if (ty != null) {
+            if (ty.ival >= 1) {
+                kind = "arr_" + ArrRankOf(ty);
+                lt = "i64*";
+            } else if (DynamicReferenceType(ty)) {
+                kind = "dynref";
+            } else if (IsDelegate(ty)) {
+                kind = "delegate";
+            } else if (IsStr(ty)) {
+                kind = "str";
+            } else if (ArcManaged(ty)) {
+                kind = "obj";
+            }
+        }
+        if (localDtorCache.ContainsKey(kind)) { return localDtorCache[kind]; }
+        string name = "@zlocal_dtor_" + kind;
+        localDtorCache[kind] = name;
         StringBuilder saved = body;
         int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
         body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
-        string lt = MapType(ty);
-        if (cell) { lt = "i8*"; }
         L("define internal void " + name + "(i8* %slot) {");
         L("entry:");
-        L("  %p = bitcast i8* %slot to " + lt + "*");
-        L("  %value = load " + lt + ", " + lt + "* %p");
-        // Clear before release: a surrounding cleanup landing may visit the
-        // lexical slot again, and it must see an already-consumed owner.
-        L("  store " + lt + " null, " + lt + "* %p");
-        if (cell) { EmitCellRelease("%value"); }
-        else { EmitArcRelease("%value", ty); }
+        if (kind != "noop") {
+            L("  %p = bitcast i8* %slot to " + lt + "*");
+            L("  %value = load " + lt + ", " + lt + "* %p");
+            // Clear before release: a surrounding cleanup landing may visit the
+            // lexical slot again, and it must see an already-consumed owner.
+            L("  store " + lt + " null, " + lt + "* %p");
+            if (kind == "cell") { EmitCellRelease("%value"); }
+            else if (ty.ival >= 1) { EmitArrayRelease("%value", "i64*", ty); }
+            else if (kind == "dynref") { L("  call void @zref_release(i8* %value)"); }
+            else if (kind == "delegate") { L("  call void @zdelegate_release(i8* %value)"); }
+            else if (kind == "str") { L("  call void @zstr_slot_release(i8* %value)"); }
+            else { L("  call void @zrelease(i8* %value)"); }
+        }
         L("  ret void"); L("}");
         deferred.Append(body.ToString());
         body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;

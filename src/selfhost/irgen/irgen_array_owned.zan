@@ -106,12 +106,16 @@ partial class Irgen {
     }
 
     string ArrayTypeKeyGlobal(Node ty, string name) {
-        List<int> bytes = DecodeStr(ArrayTypeKey(ty));
-        string encoded = ""; int i = 0;
-        while (i < bytes.Count) { encoded = encoded + "\\" + Hex2(bytes[i]); i = i + 1; }
+        string tkey = ArrayTypeKey(ty);
+        if (arrKeyCache.ContainsKey(tkey)) { return arrKeyCache[tkey]; }
+        List<int> bytes = DecodeStr(tkey);
+        StringBuilder encoded = new StringBuilder();
+        AppendIrBytes(encoded, bytes);
         int count = bytes.Count + 1;
-        H(name + " = private constant [" + count + " x i8] c\"" + encoded + "\\00\"");
-        return "getelementptr ([" + count + " x i8], [" + count + " x i8]* " + name + ", i64 0, i64 0)";
+        rawStringGlobals.Append(name + " = private unnamed_addr constant [" + count + " x i8] c\"" + encoded.ToString() + "\\00\"\n");
+        string gep = "getelementptr ([" + count + " x i8], [" + count + " x i8]* " + name + ", i64 0, i64 0)";
+        arrKeyCache[tkey] = gep;
+        return gep;
     }
 
     bool ArrayReferenceElement(Node ty) {
@@ -204,6 +208,8 @@ partial class Irgen {
     }
 
     string ArrayDescriptor(Node ty) {
+        string dkey = ArrayTypeKey(ty);
+        if (arrDescCache.ContainsKey(dkey)) { return arrDescCache[dkey]; }
         Node elem = ArrElemOf(ty);
         int innerRank = 1;
         if (elem != null && elem.ival >= 1) { innerRank = ArrRankOf(elem); }
@@ -211,14 +217,16 @@ partial class Irgen {
         arrayDescriptorSeq = arrayDescriptorSeq + 1;
         string key = ArrayTypeKeyGlobal(elem, name + "_key");
         string predicate = ArrayStorePredicate(elem, name + "_accept");
-        H(name + " = internal constant [8 x i64] [i64 " + ArrRankOf(ty)
+        rawStringGlobals.Append(name + " = internal constant [8 x i64] [i64 " + ArrRankOf(ty)
             + ", i64 " + ArrayStride(elem) + ", i64 " + ArrayElementKind(elem)
             + ", i64 " + innerRank
             + ", i64 ptrtoint (i1 (i8*)* " + predicate + " to i64)"
             + ", i64 ptrtoint (i8* " + key + " to i64)"
             + ", i64 ptrtoint (i8* " + ArrayElementCid(elem) + " to i64)"
-            + ", i64 " + (ArrayReferenceElement(elem) ? "1" : "0") + "], align 8");
-        return "getelementptr ([8 x i64], [8 x i64]* " + name + ", i64 0, i64 0)";
+            + ", i64 " + (ArrayReferenceElement(elem) ? "1" : "0") + "], align 8\n");
+        string gep = "getelementptr ([8 x i64], [8 x i64]* " + name + ", i64 0, i64 0)";
+        arrDescCache[dkey] = gep;
+        return gep;
     }
 
     // Creation owns +1; its caller registers exactly one statement temporary.
@@ -245,7 +253,7 @@ partial class Irgen {
     }
 
     void EmitArrayOwnershipRuntime() {
-        H("define i64* @zref_array_descriptor(i8* %p) {");
+        H("define i64* @zref_array_descriptor(i8* %p) nounwind readonly inlinehint {");
         H("entry:");
         H("  %nil = icmp eq i8* %p, null");
         H("  %bits = ptrtoint i8* %p to i64");
@@ -269,7 +277,7 @@ partial class Irgen {
         H("none:");
         H("  ret i64* null");
         H("}");
-        H("define i1 @zarr_shape_exact(i64* %desc, i64 %targetrank, i8* %targetkey) {");
+        H("define i1 @zarr_shape_exact(i64* %desc, i64 %targetrank, i8* %targetkey) nounwind readonly {");
         H("entry:");
         H("  %rank = load i64, i64* %desc");
         H("  %same = icmp eq i64 %rank, %targetrank");

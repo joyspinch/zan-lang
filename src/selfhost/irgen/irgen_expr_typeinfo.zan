@@ -208,11 +208,33 @@ partial class Irgen {
                 Label(lclass);
             }
 
+            List<ExprVal> ctorArgVals = new List<ExprVal>();
+            int eai = 0;
+            while (eai < e.kids.Count) {
+                ctorArgVals.Add(GenExpr(e.kids[eai]));
+                eai = eai + 1;
+            }
+
             int ci = 0;
             while (ci < tidNames.Count) {
                 string cn = tidNames[ci];
                 Node cls = binder.FindType(cn);
-                if (cls != null && cls.kind == AK.ClassDecl() && !HasMod(cls, MOD.Abstract())) {
+                if (cls != null && ((cls.kind == AK.ClassDecl() && !HasMod(cls, MOD.Abstract()))
+                    || (cls.kind == AK.StructDecl() && !cls.layoutExplicit))) {
+                    Node pctor = null;
+                    int cki = 0;
+                    while (cki < cls.kids.Count) {
+                        Node cm = cls.kids[cki];
+                        if (cm.kind == AK.CtorDecl() && !HasMod(cm, MOD.Static()) && MethodAcceptsCall(cm, e)) {
+                            pctor = cm;
+                            break;
+                        }
+                        cki = cki + 1;
+                    }
+                    if (e.kids.Count > 0 && pctor == null) {
+                        ci = ci + 1;
+                        continue;
+                    }
                     int lmatch = NL();
                     int lnext = NL();
                     string cnStr = GenStr(cn).op;
@@ -245,24 +267,23 @@ partial class Irgen {
                     string obj = NT();
                     L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
                     InitNestedFields(obj, cls);
-                    if (IsPolyClass(cls)) {
+                    if (cls.kind == AK.ClassDecl() && IsPolyClass(cls)) {
                         List<string> vslots = new List<string>();
                         CollectVSlots(cls, vslots);
                         string vtp0 = NT();
                         L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
                         L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
                     }
-                    Node pctor = binder.FindCtorArity(cls, e.kids.Count);
                     if (pctor != null) {
                         List<string> cargs = new List<string>();
                         cargs.Add("%" + cn + "* " + obj);
                         int cai = 0;
                         int cpi = 0;
-                        while (cpi < pctor.kids.Count && cai < e.kids.Count) {
+                        while (cpi < pctor.kids.Count && cai < ctorArgVals.Count) {
                             if (pctor.kids[cpi].kind == AK.Param()) {
-                                ExprVal av = GenExpr(e.kids[cai]);
-                                string pt = MapType(pctor.kids[cpi].type);
-                                string cv = Coerce(av, pt);
+                                Node pty = pctor.kids[cpi].type;
+                                string pt = MapType(pty);
+                                string cv = CallArg(ctorArgVals[cai], pty, false);
                                 cargs.Add(pt + " " + cv);
                                 cai = cai + 1;
                             }
@@ -704,8 +725,471 @@ partial class Irgen {
             L("  " + resPt + " = phi i8* [ " + item + ", %L" + lload + " ], [ " + GenConstStr("") + ", %L" + lempty + " ]");
             return new ExprVal(resPt, MkType("string"));
         }
+        if (mname == "GetStaticFieldInt" || mname == "GetStaticFieldLong"
+        || mname == "GetStaticFieldDouble" || mname == "GetStaticFieldBool"
+        || mname == "GetStaticFieldString" || mname == "GetStaticFieldObject"
+        || mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong"
+        || mname == "SetStaticFieldDouble" || mname == "SetStaticFieldBool"
+        || mname == "SetStaticFieldString" || mname == "SetStaticFieldObject") {
+            return EmitTypeInfoStaticField(recv, mname, e);
+        }
+        if (mname == "InvokeStatic" || mname == "InvokeStaticInt" || mname == "InvokeStaticLong"
+        || mname == "InvokeStaticDouble" || mname == "InvokeStaticString"
+        || mname == "InvokeStaticObject" || mname == "InvokeStaticTask") {
+            return EmitTypeInfoStaticInvoke(recv, mname, e);
+        }
         diags.Error("TypeInfo method '" + mname + "' is not supported by the self-hosted compiler yet", e.line, e.col);
         return new ExprVal("null", MkType("object"));
+    }
+
+    // Unbox a Nullable<prim/decimal> (i8* box pointer) into either double or i64 (0 / 0.0 when null).
+    string EmitUnboxNullableNumber(ExprVal value, bool floating, Node call) {
+        string ult = UnderLL(value.ty);
+        string rt = floating ? "double" : "i64";
+        string zval = floating ? "0.0" : "0";
+        string slot = NT();
+        L("  " + slot + " = alloca " + rt);
+        L("  store " + rt + " " + zval + ", " + rt + "* " + slot);
+        int lread = NL();
+        int ldone = NL();
+        string isNn = NT();
+        L("  " + isNn + " = icmp ne i8* " + value.op + ", null");
+        L("  br i1 " + isNn + ", label %L" + lread + ", label %L" + ldone);
+        Label(lread);
+        string bp = NT();
+        L("  " + bp + " = bitcast i8* " + value.op + " to " + ult + "*");
+        string raw = NT();
+        L("  " + raw + " = load " + ult + ", " + ult + "* " + bp);
+        if (ult == DecimalLL()) {
+            string num = DecimalNumber(new ExprVal(raw, MkType("decimal")), floating);
+            L("  store " + rt + " " + num + ", " + rt + "* " + slot);
+        } else if (ult == "double") {
+            if (floating) {
+                L("  store double " + raw + ", double* " + slot);
+            } else {
+                L("  store i64 " + EmitFptosiGuarded(call, raw) + ", i64* " + slot);
+            }
+        } else {
+            if (floating) {
+                string dv = NT();
+                L("  " + dv + " = sitofp i64 " + raw + " to double");
+                L("  store double " + dv + ", double* " + slot);
+            } else {
+                L("  store i64 " + raw + ", i64* " + slot);
+            }
+        }
+        L("  br label %L" + ldone);
+        Label(ldone);
+        string outv = NT();
+        L("  " + outv + " = load " + rt + ", " + rt + "* " + slot);
+        return outv;
+    }
+
+    void CollectStaticFieldsOf(Node cls, string filterName, List<Node> outFields) {
+        Node c = cls;
+        List<string> seen = new List<string>();
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.FieldDecl() && HasMod(m, MOD.Static())
+                    && (filterName == "" || m.sval == filterName)
+                    && IndexOfStr(seen, m.sval) < 0) {
+                    seen.Add(m.sval);
+                    outFields.Add(m);
+                }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+    }
+
+    void CollectStaticMethodsOf(Node cls, string filterName, Node invCall, string mname, List<Node> outMethods) {
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && HasMod(m, MOD.Static())
+                    && (filterName == "" || m.sval == filterName)
+                    && MethodAcceptsCall(m, invCall)
+                    && (mname != "InvokeStaticTask" || HasMod(m, MOD.Async()))) {
+                    outMethods.Add(m);
+                }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+    }
+
+    ExprVal EmitTypeInfoStaticField(ExprVal recv, string mname, Node e) {
+        bool isSet = mname.StartsWith("SetStaticField");
+        string fldName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
+        ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
+        string nmPtr = Coerce(nmVal, "i8*");
+        ExprVal valArg = (isSet && e.kids.Count > 1) ? GenExpr(e.kids[1]) : new ExprVal("0", MkType("int"));
+
+        string retTyLL = "i64";
+        string dfltVal = "0";
+        if (mname == "GetStaticFieldDouble") { retTyLL = "double"; dfltVal = "0.0"; }
+        else if (mname == "GetStaticFieldString") { retTyLL = "i8*"; dfltVal = GenStr("").op; }
+        else if (mname == "GetStaticFieldObject") { retTyLL = "i8*"; dfltVal = "null"; }
+
+        string resSlot = NT();
+        L("  " + resSlot + " = alloca " + retTyLL);
+        L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
+
+        int lend = NL();
+        int lstart = NL();
+        string tiNn = NT();
+        L("  " + tiNn + " = icmp ne i8* " + recv.op + ", null");
+        string nmNn = NT();
+        L("  " + nmNn + " = icmp ne i8* " + nmPtr + ", null");
+        string bothNn = NT();
+        L("  " + bothNn + " = and i1 " + tiNn + ", " + nmNn);
+        L("  br i1 " + bothNn + ", label %L" + lstart + ", label %L" + lend);
+        Label(lstart);
+
+        int ci = 0;
+        while (ci < tidNames.Count) {
+            string cn = tidNames[ci];
+            Node cls = binder.FindType(cn);
+            if (cls != null && (cls.kind == AK.ClassDecl() || cls.kind == AK.StructDecl()) && TParams(cls).Count == 0) {
+                List<Node> sfs = new List<Node>();
+                CollectStaticFieldsOf(cls, fldName, sfs);
+                if (sfs.Count > 0) {
+                    int lcmatch = NL();
+                    int lcnext = NL();
+                    string cnStr = GenStr(cn).op;
+                    string eq = NT();
+                    L("  " + eq + " = call i32 @strcmp(i8* " + recv.op + ", i8* " + cnStr + ")");
+                    string isEq = NT();
+                    L("  " + isEq + " = icmp eq i32 " + eq + ", 0");
+                    L("  br i1 " + isEq + ", label %L" + lcmatch + ", label %L" + lcnext);
+                    Label(lcmatch);
+                    int sfi = 0;
+                    while (sfi < sfs.Count) {
+                        Node sf = sfs[sfi];
+                        int lfmatch = NL();
+                        int lfnext = NL();
+                        if (fldName != "") {
+                            L("  br label %L" + lfmatch);
+                        } else {
+                            string flit = RawCString(sf.sval);
+                            string feq = NT();
+                            L("  " + feq + " = call i32 @strcmp(i8* " + nmPtr + ", i8* " + flit + ")");
+                            string isFeq = NT();
+                            L("  " + isFeq + " = icmp eq i32 " + feq + ", 0");
+                            L("  br i1 " + isFeq + ", label %L" + lfmatch + ", label %L" + lfnext);
+                        }
+                        Label(lfmatch);
+                        List<string> sTemps = stmtTemps;
+                        List<string> sVals = stmtTempValues;
+                        List<string> sOwners = stmtTempOwners;
+                        List<Node> sTypes = stmtTempTypes;
+                        List<List<string>> sArm = callArmStack;
+                        List<Dictionary<string, bool>> sArmSets = callArmSets;
+                        List<StringBuilder> sArmFn = callArmFn;
+                        stmtTemps = new List<string>();
+                        stmtTempValues = new List<string>();
+                        stmtTempOwners = new List<string>();
+                        stmtTempTypes = new List<Node>();
+                        callArmStack = null;
+                        callArmSets = null;
+                        callArmFn = null;
+
+                        Node fty = sf.type;
+                        if (!isSet) {
+                            ExprVal fv = LoadStaticField(cls, sf.sval, null);
+                            if (mname == "GetStaticFieldString") {
+                                if (IsStr(fv.ty)) {
+                                    string sp = Coerce(fv, "i8*");
+                                    EmitArcRetain(sp, MkType("string"));
+                                    L("  store i8* " + sp + ", i8** " + resSlot);
+                                }
+                            } else if (mname == "GetStaticFieldObject") {
+                                if (IsStructTy(fv.ty) && !IsExplicitLayoutStruct(fv.ty)) {
+                                    ExprVal cp = CopyStructValue(fv);
+                                    L("  store i8* " + Coerce(cp, "i8*") + ", i8** " + resSlot);
+                                } else if (IsNullableStruct(fv.ty) && !IsExplicitLayoutStruct(fv.ty)) {
+                                    string cloneSym = EnsureStructCloneHelper(binder.FindType(fv.ty.sval));
+                                    string rawFv = Coerce(fv, "i8*");
+                                    string cloned = NT();
+                                    L("  " + cloned + " = call i8* " + cloneSym + "(i8* " + rawFv + ")");
+                                    L("  store i8* " + cloned + ", i8** " + resSlot);
+                                } else if (fv.ty != null && (IsPtrLL(MapType(fv.ty)) || IsStr(fv.ty))) {
+                                    string sp = Coerce(fv, "i8*");
+                                    EmitArcRetainObject(sp);
+                                    L("  store i8* " + sp + ", i8** " + resSlot);
+                                }
+                            } else if (mname == "GetStaticFieldDouble") {
+                                if (IsDecimal(fv.ty)) {
+                                    L("  store double " + DecimalNumber(fv, true) + ", double* " + resSlot);
+                                } else if (IsNullableValue(fv.ty)) {
+                                    L("  store double " + EmitUnboxNullableNumber(fv, true, e) + ", double* " + resSlot);
+                                } else {
+                                    string ft = MapType(fv.ty);
+                                    if (ft == "double" || ft == "float" || ft == "i1" || ft == "i8" || ft == "i16" || ft == "i32" || ft == "i64") {
+                                        L("  store double " + Coerce(fv, "double") + ", double* " + resSlot);
+                                    }
+                                }
+                            } else {
+                                string iv = "0";
+                                if (IsDecimal(fv.ty)) {
+                                    iv = DecimalNumber(fv, false);
+                                } else if (IsNullableValue(fv.ty)) {
+                                    iv = EmitUnboxNullableNumber(fv, false, e);
+                                } else {
+                                    string ft = MapType(fv.ty);
+                                    if (ft == "double" || ft == "float") {
+                                        string dv = fv.op;
+                                        if (ft == "float") { dv = NT(); L("  " + dv + " = fpext float " + fv.op + " to double"); }
+                                        iv = EmitFptosiGuarded(e, dv);
+                                    } else if (ft == "i1" || ft == "i8" || ft == "i16" || ft == "i32" || ft == "i64") {
+                                        iv = ToI64(fv);
+                                    }
+                                }
+                                if (mname == "GetStaticFieldBool") {
+                                    string nz = NT(); L("  " + nz + " = icmp ne i64 " + iv + ", 0");
+                                    string bz = NT(); L("  " + bz + " = zext i1 " + nz + " to i64");
+                                    L("  store i64 " + bz + ", i64* " + resSlot);
+                                } else {
+                                    L("  store i64 " + iv + ", i64* " + resSlot);
+                                }
+                            }
+                        } else {
+                            // SetStaticField*
+                            string ft = MapType(fty);
+                            if (IsStructTy(fty) && !IsExplicitLayoutStruct(fty)) {
+                                if (mname == "SetStaticFieldObject" && !IsDecimal(valArg.ty) && !IsNullableValue(valArg.ty)
+                                    && (valArg.ty == null || IsPtrLL(MapType(valArg.ty)))) {
+                                    string vraw = Coerce(valArg, "i8*");
+                                    string nn = NT(); L("  " + nn + " = icmp ne i8* " + vraw + ", null");
+                                    int lchk = NL(); int lcopy = NL(); int lskip = NL();
+                                    L("  br i1 " + nn + ", label %L" + lchk + ", label %L" + lskip);
+                                    Label(lchk);
+                                    string ok = EmitClassIdTest(new ExprVal(vraw, MkType("object")), fty.sval);
+                                    L("  br i1 " + ok + ", label %L" + lcopy + ", label %L" + lskip);
+                                    Label(lcopy);
+                                    string typed = NT(); L("  " + typed + " = bitcast i8* " + vraw + " to " + ft);
+                                    ExprVal cp = StructCopyTemp(new ExprVal(typed, fty), fty);
+                                    StoreStaticField(cls, sf.sval, cp, null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                    L("  br label %L" + lskip);
+                                    Label(lskip);
+                                }
+                            } else if (IsNullableStruct(fty) && !IsExplicitLayoutStruct(fty)) {
+                                if (mname == "SetStaticFieldObject" && !IsDecimal(valArg.ty) && !IsNullableValue(valArg.ty)
+                                    && (valArg.ty == null || IsPtrLL(MapType(valArg.ty)))) {
+                                    string vraw = Coerce(valArg, "i8*");
+                                    string isNil = NT(); L("  " + isNil + " = icmp eq i8* " + vraw + ", null");
+                                    int lnil = NL(); int lchk = NL(); int lcopy = NL(); int lskip = NL();
+                                    L("  br i1 " + isNil + ", label %L" + lnil + ", label %L" + lchk);
+                                    Label(lnil);
+                                    StoreStaticField(cls, sf.sval, new ExprVal("null", fty), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                    L("  br label %L" + lskip);
+                                    Label(lchk);
+                                    string ok = EmitClassIdTest(new ExprVal(vraw, MkType("object")), fty.sval);
+                                    L("  br i1 " + ok + ", label %L" + lcopy + ", label %L" + lskip);
+                                    Label(lcopy);
+                                    string typed = NT(); L("  " + typed + " = bitcast i8* " + vraw + " to " + ft);
+                                    ExprVal cp = StructCopyTemp(new ExprVal(typed, MkType(fty.sval)), fty);
+                                    StoreStaticField(cls, sf.sval, new ExprVal(cp.op, fty), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                    L("  br label %L" + lskip);
+                                    Label(lskip);
+                                }
+                            } else if (IsDecimal(fty)) {
+                                if (IsDecimal(valArg.ty) || mname == "SetStaticFieldDouble" || mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong") {
+                                    StoreStaticField(cls, sf.sval, ToDecimal(valArg), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                }
+                            } else if (IsNullableValue(fty)) {
+                                string ult = UnderLL(fty);
+                                if (mname == "SetStaticFieldObject") {
+                                    if (valArg.op == "null") {
+                                        StoreStaticField(cls, sf.sval, new ExprVal("null", fty), null);
+                                        L("  store i64 1, i64* " + resSlot);
+                                    } else if (IsNullableValue(valArg.ty) && UnderLL(valArg.ty) == ult) {
+                                        StoreStaticField(cls, sf.sval, valArg, null);
+                                        L("  store i64 1, i64* " + resSlot);
+                                    } else if (IsDecimal(valArg.ty) && ult == DecimalLL()) {
+                                        StoreStaticField(cls, sf.sval, valArg, null);
+                                        L("  store i64 1, i64* " + resSlot);
+                                    } else if (valArg.ty != null && IsPtrLL(MapType(valArg.ty))) {
+                                        string vraw = Coerce(valArg, "i8*");
+                                        string isNil = NT(); L("  " + isNil + " = icmp eq i8* " + vraw + ", null");
+                                        int lnil = NL(); int lskip = NL();
+                                        L("  br i1 " + isNil + ", label %L" + lnil + ", label %L" + lskip);
+                                        Label(lnil);
+                                        StoreStaticField(cls, sf.sval, new ExprVal("null", fty), null);
+                                        L("  store i64 1, i64* " + resSlot);
+                                        L("  br label %L" + lskip);
+                                        Label(lskip);
+                                    }
+                                } else if (ult == DecimalLL() && (mname == "SetStaticFieldDouble" || mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong")) {
+                                    StoreStaticField(cls, sf.sval, ToDecimal(valArg), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                } else if (ult == "double" && (mname == "SetStaticFieldDouble" || mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong")) {
+                                    StoreStaticField(cls, sf.sval, new ExprVal(Coerce(valArg, "double"), MkType("double")), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                } else if (ult == "i64" && (mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong" || mname == "SetStaticFieldBool")) {
+                                    StoreStaticField(cls, sf.sval, new ExprVal(ToI64(valArg), MkType("long")), null);
+                                    L("  store i64 1, i64* " + resSlot);
+                                }
+                            } else if ((mname == "SetStaticFieldString" && (IsStr(fty) || fty.sval == "object"))
+                                || (mname == "SetStaticFieldObject" && IsPtrLL(ft) && !IsDecimal(valArg.ty))) {
+                                StoreStaticField(cls, sf.sval, valArg, null);
+                                L("  store i64 1, i64* " + resSlot);
+                            } else if (mname == "SetStaticFieldDouble" && (ft == "double" || ft == "float")) {
+                                StoreStaticField(cls, sf.sval, valArg, null);
+                                L("  store i64 1, i64* " + resSlot);
+                            } else if ((mname == "SetStaticFieldInt" || mname == "SetStaticFieldLong" || mname == "SetStaticFieldBool")
+                                && (ft == "i1" || ft == "i8" || ft == "i16" || ft == "i32" || ft == "i64")) {
+                                StoreStaticField(cls, sf.sval, valArg, null);
+                                L("  store i64 1, i64* " + resSlot);
+                            }
+                        }
+
+                        EmitTempReleases();
+                        stmtTemps = sTemps;
+                        stmtTempValues = sVals;
+                        stmtTempOwners = sOwners;
+                        stmtTempTypes = sTypes;
+                        callArmStack = sArm;
+                        callArmSets = sArmSets;
+                        callArmFn = sArmFn;
+                        L("  br label %L" + lend);
+                        Label(lfnext);
+                        sfi = sfi + 1;
+                    }
+                    L("  br label %L" + lend);
+                    Label(lcnext);
+                }
+            }
+            ci = ci + 1;
+        }
+        L("  br label %L" + lend);
+        Label(lend);
+        string retVal = NT();
+        L("  " + retVal + " = load " + retTyLL + ", " + retTyLL + "* " + resSlot);
+        if (isSet || mname == "GetStaticFieldBool") { return new ExprVal(retVal, MkType("bool")); }
+        if (mname == "GetStaticFieldInt") { return new ExprVal(retVal, MkType("int")); }
+        if (mname == "GetStaticFieldLong") { return new ExprVal(retVal, MkType("long")); }
+        if (mname == "GetStaticFieldDouble") { return new ExprVal(retVal, MkType("double")); }
+        Node resTy = MkType(mname == "GetStaticFieldString" ? "string" : "object");
+        AddTemp(retVal, resTy);
+        return new ExprVal(retVal, resTy);
+    }
+
+    ExprVal EmitTypeInfoStaticInvoke(ExprVal recv, string mname, Node e) {
+        string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
+        ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
+        string nmPtr = Coerce(nmVal, "i8*");
+        Node invCall = new Node(AK.Call());
+        invCall.line = e.line;
+        invCall.col = e.col;
+        int ki = 1;
+        while (ki < e.kids.Count) {
+            invCall.Add(e.kids[ki]);
+            ki = ki + 1;
+        }
+
+        string retTyLL = mname == "InvokeStaticDouble" ? "double"
+            : ((mname == "InvokeStaticString" || mname == "InvokeStaticObject") ? "i8*" : "i64");
+        string dfltVal = mname == "InvokeStaticDouble" ? "0.0"
+            : (mname == "InvokeStaticString" ? GenStr("").op : (mname == "InvokeStaticObject" ? "null" : "0"));
+        string resSlot = NT();
+        L("  " + resSlot + " = alloca " + retTyLL);
+        L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
+
+        int lend = NL();
+        int lstart = NL();
+        string tiNn = NT(); L("  " + tiNn + " = icmp ne i8* " + recv.op + ", null");
+        string nmNn = NT(); L("  " + nmNn + " = icmp ne i8* " + nmPtr + ", null");
+        string bothNn = NT(); L("  " + bothNn + " = and i1 " + tiNn + ", " + nmNn);
+        L("  br i1 " + bothNn + ", label %L" + lstart + ", label %L" + lend);
+        Label(lstart);
+
+        int ci = 0;
+        while (ci < tidNames.Count) {
+            string cn = tidNames[ci];
+            Node cls = binder.FindType(cn);
+            if (cls != null && (cls.kind == AK.ClassDecl() || cls.kind == AK.StructDecl()) && TParams(cls).Count == 0) {
+                List<Node> sms = new List<Node>();
+                CollectStaticMethodsOf(cls, methName, invCall, mname, sms);
+                if (sms.Count > 0) {
+                    int lcmatch = NL();
+                    int lcnext = NL();
+                    string cnStr = GenStr(cn).op;
+                    string eq = NT();
+                    L("  " + eq + " = call i32 @strcmp(i8* " + recv.op + ", i8* " + cnStr + ")");
+                    string isEq = NT();
+                    L("  " + isEq + " = icmp eq i32 " + eq + ", 0");
+                    L("  br i1 " + isEq + ", label %L" + lcmatch + ", label %L" + lcnext);
+                    Label(lcmatch);
+                    int smi = 0;
+                    while (smi < sms.Count) {
+                        Node sm = sms[smi];
+                        int lmmatch = NL();
+                        int lmnext = NL();
+                        if (methName != "") {
+                            L("  br label %L" + lmmatch);
+                        } else {
+                            string mlit = RawCString(sm.sval);
+                            string meq = NT();
+                            L("  " + meq + " = call i32 @strcmp(i8* " + nmPtr + ", i8* " + mlit + ")");
+                            string isMeq = NT();
+                            L("  " + isMeq + " = icmp eq i32 " + meq + ", 0");
+                            L("  br i1 " + isMeq + ", label %L" + lmmatch + ", label %L" + lmnext);
+                        }
+                        Label(lmmatch);
+                        List<string> sTemps = stmtTemps;
+                        List<string> sVals = stmtTempValues;
+                        List<string> sOwners = stmtTempOwners;
+                        List<Node> sTypes = stmtTempTypes;
+                        List<List<string>> sArm = callArmStack;
+                        List<Dictionary<string, bool>> sArmSets = callArmSets;
+                        List<StringBuilder> sArmFn = callArmFn;
+                        stmtTemps = new List<string>();
+                        stmtTempValues = new List<string>();
+                        stmtTempOwners = new List<string>();
+                        stmtTempTypes = new List<Node>();
+                        callArmStack = null;
+                        callArmSets = null;
+                        callArmFn = null;
+                        ExprVal cres = EmitStaticCall(cn, sm.sval, invCall);
+                        EmitReflectInvokeStore(mname, cres, e, resSlot, retTyLL);
+                        EmitTempReleases();
+                        stmtTemps = sTemps;
+                        stmtTempValues = sVals;
+                        stmtTempOwners = sOwners;
+                        stmtTempTypes = sTypes;
+                        callArmStack = sArm;
+                        callArmSets = sArmSets;
+                        callArmFn = sArmFn;
+                        L("  br label %L" + lend);
+                        Label(lmnext);
+                        smi = smi + 1;
+                    }
+                    L("  br label %L" + lend);
+                    Label(lcnext);
+                }
+            }
+            ci = ci + 1;
+        }
+        L("  br label %L" + lend);
+        Label(lend);
+        string retVal = NT();
+        L("  " + retVal + " = load " + retTyLL + ", " + retTyLL + "* " + resSlot);
+        if (mname == "InvokeStatic") { return new ExprVal(retVal, MkType("bool")); }
+        if (mname == "InvokeStaticInt") { return new ExprVal(retVal, MkType("int")); }
+        if (mname == "InvokeStaticLong" || mname == "InvokeStaticTask") { return new ExprVal(retVal, MkType("long")); }
+        if (mname == "InvokeStaticDouble") { return new ExprVal(retVal, MkType("double")); }
+        Node resTy = MkType(mname == "InvokeStaticString" ? "string" : "object");
+        AddTemp(retVal, resTy);
+        return new ExprVal(retVal, resTy);
     }
 
     bool MethodAcceptsCall(Node m, Node invCall) {
@@ -737,6 +1221,13 @@ partial class Irgen {
                     && atn.sval != "object" && !MentionsTypeParam(pt)) {
                         return false;
                     }
+                    // Unrelated concrete classes/structs cannot convert to each other
+                    if (!binder.IsPrimitive(atn.sval) && !binder.IsPrimitive(pt.sval)
+                        && atn.sval != "object" && pt.sval != "object" && !bareTypeParam
+                        && atn.ival == 0 && pt.ival == 0
+                        && !binder.IsAssignableFrom(pt.sval, atn.sval)) {
+                        return false;
+                    }
                 }
             }
             i = i + 1;
@@ -761,9 +1252,18 @@ partial class Irgen {
     }
 
     string CoerceReflectInvokeNumber(ExprVal value, string member, Node call) {
+        bool isDouble = member == "InvokeDouble" || member == "InvokeStaticDouble";
+        if (IsDecimal(value.ty)) {
+            string dnum = DecimalNumber(value, isDouble);
+            return isDouble ? dnum : NarrowReflectInvokeInt(dnum, member);
+        }
+        if (IsNullableValue(value.ty)) {
+            string nnum = EmitUnboxNullableNumber(value, isDouble, call);
+            return isDouble ? nnum : NarrowReflectInvokeInt(nnum, member);
+        }
         string source = MapType(value.ty);
         if (source == "double") {
-            if (member == "InvokeDouble") { return value.op; }
+            if (isDouble) { return value.op; }
             return NarrowReflectInvokeInt(EmitFptosiGuarded(call, value.op), member);
         }
 
@@ -774,14 +1274,14 @@ partial class Irgen {
         else if (source == "i64" || source == "i32" || source == "i16" || source == "i8") {
             slot = ToI64(value);
         }
-        if (member == "InvokeDouble") {
+        if (isDouble) {
             return Coerce(new ExprVal(slot, MkType("long")), "double");
         }
         return NarrowReflectInvokeInt(slot, member);
     }
 
     string NarrowReflectInvokeInt(string slot, string member) {
-        if (member != "InvokeInt" || slot == "0") { return slot; }
+        if ((member != "InvokeInt" && member != "InvokeStaticInt") || slot == "0") { return slot; }
         string narrowed = FromI64(slot, "i32");
         string widened = NT();
         L("  " + widened + " = sext i32 " + narrowed + " to i64");
@@ -804,10 +1304,10 @@ partial class Irgen {
 
         ExprVal arg = GenExpr(call.kids[0]);
         if (member == "Add") {
-            int source = ListReflectionSlotKind(arg.ty);
+            int source = arg.op == "null" ? 4 : ListReflectionSlotKind(arg.ty);
             if (source == 0 || IsDelegate(arg.ty)) { return; }
             string added = NT();
-            string value = ToSlot(arg, arg.ty);
+            string value = arg.op == "null" ? "0" : ToSlot(arg, arg.ty);
             L("  " + added + " = call i64 @zlist_reflection_add(i8* " + list + ", i64 " + value + ", i64 " + source + ")");
             L("  store i64 " + added + ", i64* " + result);
             return;
@@ -825,13 +1325,29 @@ partial class Irgen {
         if (invoke == "InvokeString") {
             L("  " + supported + " = icmp eq i64 " + kind + ", 3");
         } else if (invoke == "InvokeObject") {
-            L("  " + supported + " = icmp uge i64 " + kind + ", 3");
+            string is3 = NT(); L("  " + is3 + " = icmp eq i64 " + kind + ", 3");
+            string is4 = NT(); L("  " + is4 + " = icmp eq i64 " + kind + ", 4");
+            string is5 = NT(); L("  " + is5 + " = icmp eq i64 " + kind + ", 5");
+            string is10 = NT(); L("  " + is10 + " = icmp eq i64 " + kind + ", 10");
+            string o1 = NT(); L("  " + o1 + " = or i1 " + is3 + ", " + is4);
+            string o2 = NT(); L("  " + o2 + " = or i1 " + is5 + ", " + is10);
+            L("  " + supported + " = or i1 " + o1 + ", " + o2);
         } else if (invoke == "InvokeDouble") {
-            L("  " + supported + " = icmp eq i64 " + kind + ", 2");
+            string is2 = NT(); L("  " + is2 + " = icmp eq i64 " + kind + ", 2");
+            string is6 = NT(); L("  " + is6 + " = icmp eq i64 " + kind + ", 6");
+            string is8 = NT(); L("  " + is8 + " = icmp eq i64 " + kind + ", 8");
+            string is9 = NT(); L("  " + is9 + " = icmp eq i64 " + kind + ", 9");
+            string o1 = NT(); L("  " + o1 + " = or i1 " + is2 + ", " + is6);
+            string o2 = NT(); L("  " + o2 + " = or i1 " + is8 + ", " + is9);
+            L("  " + supported + " = or i1 " + o1 + ", " + o2);
         } else if (invoke == "Invoke") {
             L("  " + supported + " = icmp ne i64 " + kind + ", 0");
         } else {
-            L("  " + supported + " = icmp eq i64 " + kind + ", 1");
+            string is1 = NT(); L("  " + is1 + " = icmp eq i64 " + kind + ", 1");
+            string is6 = NT(); L("  " + is6 + " = icmp eq i64 " + kind + ", 6");
+            string is7 = NT(); L("  " + is7 + " = icmp eq i64 " + kind + ", 7");
+            string o1 = NT(); L("  " + o1 + " = or i1 " + is1 + ", " + is6);
+            L("  " + supported + " = or i1 " + o1 + ", " + is7);
         }
         L("  " + valid + " = and i1 " + bounds + ", " + supported);
         int read = NL(); int done = NL();
@@ -842,18 +1358,84 @@ partial class Irgen {
         } else {
             string bits = NT();
             L("  " + bits + " = call i64 @zlist_get(i8* " + list + ", i64 " + index + ")");
-            if (invoke == "InvokeObject" || invoke == "InvokeString") {
+            if (invoke == "InvokeString") {
                 string value = NT();
                 L("  " + value + " = inttoptr i64 " + bits + " to i8*");
                 EmitArcRetainObject(value);
                 L("  store i8* " + value + ", i8** " + result);
-            } else if (invoke == "InvokeDouble") {
+            } else if (invoke == "InvokeObject") {
                 string value = NT();
-                L("  " + value + " = bitcast i64 " + bits + " to double");
-                L("  store double " + value + ", double* " + result);
+                L("  " + value + " = inttoptr i64 " + bits + " to i8*");
+                string isSt5 = NT(); L("  " + isSt5 + " = icmp eq i64 " + kind + ", 5");
+                string isSt10 = NT(); L("  " + isSt10 + " = icmp eq i64 " + kind + ", 10");
+                string isSt = NT(); L("  " + isSt + " = or i1 " + isSt5 + ", " + isSt10);
+                int lclone = NL(); int lret = NL();
+                L("  br i1 " + isSt + ", label %L" + lclone + ", label %L" + lret);
+                Label(lclone);
+                string cl = NT();
+                L("  " + cl + " = call i8* @zlist_reflection_clone(i8* " + list + ", i8* " + value + ")");
+                L("  store i8* " + cl + ", i8** " + result);
+                L("  br label %L" + done);
+                Label(lret);
+                EmitArcRetainObject(value);
+                L("  store i8* " + value + ", i8** " + result);
+            } else if (invoke == "InvokeDouble") {
+                int ldbl2 = NL(); int ldec6 = NL(); int lnd8 = NL(); int lnd9 = NL();
+                L("  switch i64 " + kind + ", label %L" + done + " [");
+                L("    i64 2, label %L" + ldbl2);
+                L("    i64 6, label %L" + ldec6);
+                L("    i64 8, label %L" + lnd8);
+                L("    i64 9, label %L" + lnd9);
+                L("  ]");
+                Label(ldbl2);
+                string vd = NT(); L("  " + vd + " = bitcast i64 " + bits + " to double");
+                L("  store double " + vd + ", double* " + result);
+                L("  br label %L" + done);
+                Label(ldec6);
+                ExprVal decv = DecimalUnboxSlot(bits);
+                L("  store double " + DecimalNumber(decv, true) + ", double* " + result);
+                L("  br label %L" + done);
+                Label(lnd8);
+                string nn8 = NT(); L("  " + nn8 + " = icmp ne i64 " + bits + ", 0");
+                int lnd8r = NL();
+                L("  br i1 " + nn8 + ", label %L" + lnd8r + ", label %L" + done);
+                Label(lnd8r);
+                string p8 = NT(); L("  " + p8 + " = inttoptr i64 " + bits + " to double*");
+                string v8 = NT(); L("  " + v8 + " = load double, double* " + p8);
+                L("  store double " + v8 + ", double* " + result);
+                L("  br label %L" + done);
+                Label(lnd9);
+                string nn9 = NT(); L("  " + nn9 + " = icmp ne i64 " + bits + ", 0");
+                int lnd9r = NL();
+                L("  br i1 " + nn9 + ", label %L" + lnd9r + ", label %L" + done);
+                Label(lnd9r);
+                ExprVal decv9 = DecimalUnboxSlot(bits);
+                L("  store double " + DecimalNumber(decv9, true) + ", double* " + result);
             } else {
-                string value = NarrowReflectInvokeInt(bits, invoke);
-                L("  store i64 " + value + ", i64* " + result);
+                int li1 = NL(); int ldec6i = NL(); int lni7 = NL();
+                L("  switch i64 " + kind + ", label %L" + done + " [");
+                L("    i64 1, label %L" + li1);
+                L("    i64 6, label %L" + ldec6i);
+                L("    i64 7, label %L" + lni7);
+                L("  ]");
+                Label(li1);
+                string vi1 = NarrowReflectInvokeInt(bits, invoke);
+                L("  store i64 " + vi1 + ", i64* " + result);
+                L("  br label %L" + done);
+                Label(ldec6i);
+                ExprVal decvi = DecimalUnboxSlot(bits);
+                string vdi = NarrowReflectInvokeInt(DecimalNumber(decvi, false), invoke);
+                L("  store i64 " + vdi + ", i64* " + result);
+                L("  br label %L" + done);
+                Label(lni7);
+                string nn7 = NT(); L("  " + nn7 + " = icmp ne i64 " + bits + ", 0");
+                int lni7r = NL();
+                L("  br i1 " + nn7 + ", label %L" + lni7r + ", label %L" + done);
+                Label(lni7r);
+                string p7 = NT(); L("  " + p7 + " = inttoptr i64 " + bits + " to i64*");
+                string v7 = NT(); L("  " + v7 + " = load i64, i64* " + p7);
+                string vn7 = NarrowReflectInvokeInt(v7, invoke);
+                L("  store i64 " + vn7 + ", i64* " + result);
             }
         }
         L("  br label %L" + done);
@@ -873,20 +1455,21 @@ partial class Irgen {
     }
 
     void EmitReflectInvokeStore(string mname, ExprVal cres, Node e, string resSlot, string retTyLL) {
-        if (mname == "InvokeTask") {
+        if (mname == "InvokeTask" || mname == "InvokeStaticTask") {
             L("  store i64 " + EmitReflectInvokeTaskResult(cres) + ", i64* " + resSlot);
-        } else if (mname == "Invoke") {
+        } else if (mname == "Invoke" || mname == "InvokeStatic") {
             L("  store i64 1, i64* " + resSlot);
-        } else if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble") {
+        } else if (mname == "InvokeInt" || mname == "InvokeLong" || mname == "InvokeDouble"
+            || mname == "InvokeStaticInt" || mname == "InvokeStaticLong" || mname == "InvokeStaticDouble") {
             string number = CoerceReflectInvokeNumber(cres, mname, e);
             L("  store " + retTyLL + " " + number + ", " + retTyLL + "* " + resSlot);
-        } else if (mname == "InvokeString") {
+        } else if (mname == "InvokeString" || mname == "InvokeStaticString") {
             if (IsStr(cres.ty)) {
                 string sptr = Coerce(cres, "i8*");
                 EmitArcRetain(sptr, MkType("string"));
                 L("  store i8* " + sptr + ", i8** " + resSlot);
             }
-        } else if (mname == "InvokeObject") {
+        } else if (mname == "InvokeObject" || mname == "InvokeStaticObject") {
             if (cres.ty != null && (IsPtrLL(MapType(cres.ty)) || IsStr(cres.ty))) {
                 string sptr = Coerce(cres, "i8*");
                 EmitArcRetainObject(sptr);
@@ -907,16 +1490,19 @@ partial class Irgen {
             return IsStr(pty) || pty.sval == "object";
         }
         if (opName == "SetFieldObject") {
-            return IsPtrLL(pt);
+            return IsPtrLL(pt) || IsDecimal(pty);
         }
         if (opName == "SetFieldDouble") {
-            return pt == "double" || pt == "float" || pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8";
+            return pt == "double" || pt == "float" || pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8"
+                || IsDecimal(pty) || IsNullableValue(pty);
         }
         if (opName == "SetFieldInt" || opName == "SetFieldLong") {
-            return pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8" || pt == "double" || pt == "float";
+            return pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8" || pt == "double" || pt == "float"
+                || IsDecimal(pty) || IsNullableValue(pty);
         }
         if (opName == "SetFieldBool") {
-            return pt == "i1" || pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8";
+            return pt == "i1" || pt == "i64" || pt == "i32" || pt == "i16" || pt == "i8"
+                || IsNullableValue(pty);
         }
         return false;
     }
@@ -928,10 +1514,23 @@ partial class Irgen {
         string owner = DeclOwnerOf(cls, m);
         string sym = MethodSym(owner, m);
         Node pty = ParamTypeNode(m, 0);
+        if (IsDecimal(valArg.ty) && !IsDecimal(pty) && !(IsNullableValue(pty) && UnderLL(pty) == DecimalLL())) { return; }
         string pt = MapTypeDecl(pty, owner);
         string vt = MapType(valArg.ty);
         string av = "";
-        if (pt == "double") {
+        if (IsDecimal(pty)) {
+            av = ToDecimal(valArg).op;
+        } else if (IsNullableValue(pty)) {
+            if (valArg.op == "null") {
+                av = "null";
+            } else if (IsNullableValue(valArg.ty)) {
+                av = valArg.op;
+            } else if (IsPtrLL(vt)) {
+                av = "null";
+            } else {
+                av = BoxFor(valArg, pty);
+            }
+        } else if (pt == "double") {
             if (vt == "double") {
                 av = valArg.op;
             } else if (vt == "float") {
@@ -988,29 +1587,49 @@ partial class Irgen {
                 L("  store i8* " + sptr + ", i8** " + resSlot);
             }
         } else if (opName == "GetFieldObject") {
-            if (cres.ty != null && (IsPtrLL(MapType(cres.ty)) || IsStr(cres.ty))) {
+            if (IsStructTy(cres.ty) && !IsExplicitLayoutStruct(cres.ty)) {
+                ExprVal cp = CopyStructValue(cres);
+                L("  store i8* " + Coerce(cp, "i8*") + ", i8** " + resSlot);
+            } else if (IsNullableStruct(cres.ty) && !IsExplicitLayoutStruct(cres.ty)) {
+                string cloneSym = EnsureStructCloneHelper(binder.FindType(cres.ty.sval));
+                string cloned = NT();
+                L("  " + cloned + " = call i8* " + cloneSym + "(i8* " + Coerce(cres, "i8*") + ")");
+                L("  store i8* " + cloned + ", i8** " + resSlot);
+            } else if (cres.ty != null && (IsPtrLL(MapType(cres.ty)) || IsStr(cres.ty))) {
                 string sptr = Coerce(cres, "i8*");
                 EmitArcRetainObject(sptr);
                 L("  store i8* " + sptr + ", i8** " + resSlot);
             }
         } else if (opName == "GetFieldDouble") {
-            string dt = MapType(cres.ty);
-            if (dt == "double" || dt == "float" || dt == "i1" || dt == "i8" || dt == "i16" || dt == "i32" || dt == "i64") {
-                string sd = Coerce(cres, "double");
-                L("  store double " + sd + ", double* " + resSlot);
+            if (IsDecimal(cres.ty)) {
+                L("  store double " + DecimalNumber(cres, true) + ", double* " + resSlot);
+            } else if (IsNullableValue(cres.ty)) {
+                L("  store double " + EmitUnboxNullableNumber(cres, true, e) + ", double* " + resSlot);
+            } else {
+                string dt = MapType(cres.ty);
+                if (dt == "double" || dt == "float" || dt == "i1" || dt == "i8" || dt == "i16" || dt == "i32" || dt == "i64") {
+                    string sd = Coerce(cres, "double");
+                    L("  store double " + sd + ", double* " + resSlot);
+                }
             }
         } else {
-            string t = MapType(cres.ty);
             string iv = "0";
-            if (t == "double" || t == "float") {
-                string fv2 = cres.op;
-                if (t == "float") {
-                    fv2 = NT();
-                    L("  " + fv2 + " = fpext float " + cres.op + " to double");
+            if (IsDecimal(cres.ty)) {
+                iv = DecimalNumber(cres, false);
+            } else if (IsNullableValue(cres.ty)) {
+                iv = EmitUnboxNullableNumber(cres, false, e);
+            } else {
+                string t = MapType(cres.ty);
+                if (t == "double" || t == "float") {
+                    string fv2 = cres.op;
+                    if (t == "float") {
+                        fv2 = NT();
+                        L("  " + fv2 + " = fpext float " + cres.op + " to double");
+                    }
+                    iv = EmitFptosiGuarded(e, fv2);
+                } else if (t == "i1" || t == "i8" || t == "i16" || t == "i32" || t == "i64") {
+                    iv = ToI64(cres);
                 }
-                iv = EmitFptosiGuarded(e, fv2);
-            } else if (t == "i1" || t == "i8" || t == "i16" || t == "i32" || t == "i64") {
-                iv = ToI64(cres);
             }
             L("  store i64 " + iv + ", i64* " + resSlot);
         }
@@ -1265,7 +1884,7 @@ partial class Irgen {
                 while (tii < tidNames.Count) {
                     string cn = tidNames[tii];
                     Node cdecl = binder.FindType(cn);
-                    if (cdecl != null && cdecl.kind == AK.ClassDecl()) {
+                    if (cdecl != null && (cdecl.kind == AK.ClassDecl() || (cdecl.kind == AK.StructDecl() && !cdecl.layoutExplicit))) {
                         List<Node> allM = new List<Node>();
                         List<string> seenM = new List<string>();
                         CollectClassMethods(cdecl, allM, seenM);
@@ -1410,6 +2029,12 @@ partial class Irgen {
                     return GenStr("");
                 }
                 if (mname == "GetFieldInt" || mname == "GetFieldLong") {
+                    if (IsDecimal(fv.ty)) {
+                        return new ExprVal(DecimalNumber(fv, false), MkType(mname == "GetFieldInt" ? "int" : "long"));
+                    }
+                    if (IsNullableValue(fv.ty)) {
+                        return new ExprVal(EmitUnboxNullableNumber(fv, false, e), MkType(mname == "GetFieldInt" ? "int" : "long"));
+                    }
                     string t = MapType(fv.ty);
                     if (t == "i64") { return new ExprVal(fv.op, MkType(mname == "GetFieldInt" ? "int" : "long")); }
                     if (t == "i32") {
@@ -1430,6 +2055,12 @@ partial class Irgen {
                     return new ExprVal("0", MkType(mname == "GetFieldInt" ? "int" : "long"));
                 }
                 if (mname == "GetFieldDouble") {
+                    if (IsDecimal(fv.ty)) {
+                        return new ExprVal(DecimalNumber(fv, true), MkType("double"));
+                    }
+                    if (IsNullableValue(fv.ty)) {
+                        return new ExprVal(EmitUnboxNullableNumber(fv, true, e), MkType("double"));
+                    }
                     string t = MapType(fv.ty);
                     if (t == "double") { return fv; }
                     if (t == "float") {
@@ -1445,6 +2076,12 @@ partial class Irgen {
                     return new ExprVal("0.0", MkType("double"));
                 }
                 if (mname == "GetFieldBool") {
+                    if (IsNullableValue(fv.ty)) {
+                        string nv = EmitUnboxNullableNumber(fv, false, e);
+                        string nz = NT(); L("  " + nz + " = icmp ne i64 " + nv + ", 0");
+                        string z = NT(); L("  " + z + " = zext i1 " + nz + " to i64");
+                        return new ExprVal(z, MkType("bool"));
+                    }
                     string t = MapType(fv.ty);
                     if (t == "i1") {
                         string z = NT();
@@ -1461,6 +2098,17 @@ partial class Irgen {
                     return new ExprVal("0", MkType("bool"));
                 }
                 if (mname == "GetFieldObject") {
+                    if (IsStructTy(fv.ty) && !IsExplicitLayoutStruct(fv.ty)) {
+                        ExprVal cp = StructCopyTemp(fv, fv.ty);
+                        return new ExprVal(Coerce(cp, "i8*"), MkType("object"));
+                    }
+                    if (IsNullableStruct(fv.ty) && !IsExplicitLayoutStruct(fv.ty)) {
+                        string cloneSym = EnsureStructCloneHelper(binder.FindType(fv.ty.sval));
+                        string cloned = NT();
+                        L("  " + cloned + " = call i8* " + cloneSym + "(i8* " + Coerce(fv, "i8*") + ")");
+                        AddTemp(cloned, MkType("object"));
+                        return new ExprVal(cloned, MkType("object"));
+                    }
                     if (fv.ty != null && (IsPtrLL(MapType(fv.ty)) || IsStr(fv.ty))) {
                         return new ExprVal(Coerce(fv, "i8*"), MkType("object"));
                     }
@@ -1531,7 +2179,7 @@ partial class Irgen {
             while (tii < tidNames.Count) {
                 string cn = tidNames[tii];
                 Node cdecl = binder.FindType(cn);
-                if (cdecl != null && cdecl.kind == AK.ClassDecl()) {
+                if (cdecl != null && (cdecl.kind == AK.ClassDecl() || (cdecl.kind == AK.StructDecl() && !cdecl.layoutExplicit))) {
                     bool keep = false;
                     if (fldName != "") {
                         if (isSetOp) { keep = ReflectPropSetterMatches(cdecl, fldName, opName); }
@@ -1712,9 +2360,14 @@ partial class Irgen {
         L("  " + hit + " = and i1 " + slotNn + ", " + recvNn);
 
         if (isSetOp) {
+            string okSlot = "";
+            if (opName == "SetFieldString" || opName == "SetFieldObject") {
+                okSlot = NT();
+                L("  " + okSlot + " = alloca i64");
+                L("  store i64 0, i64* " + okSlot);
+            }
             int lset = NL();
             int lend = NL();
-            string lookupFrom = curLbl;
             L("  br i1 " + hit + ", label %L" + lset + ", label %L" + lend);
             Label(lset);
             string foff_p = NT();
@@ -1735,26 +2388,122 @@ partial class Irgen {
             L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
 
             if (opName == "SetFieldString" || opName == "SetFieldObject") {
-                int lstore = NL();
-                L("  switch i64 " + fkind + ", label %L" + lend + " [");
-                L("    i64 " + ReflFkOf("string") + ", label %L" + lstore);
-                L("    i64 " + ReflFkOf("object") + ", label %L" + lstore);
-                L("  ]");
-                Label(lstore);
-                string sp = NT();
-                L("  " + sp + " = bitcast i8* " + fp + " to i8**");
-                string valOp = Coerce(vVal, "i8*");
-                string old = NT();
-                L("  " + old + " = load i8*, i8** " + sp);
-                // Erased ARC dispatch handles both managed strings and objects.
-                Node refTy = MkType("object");
-                EmitArcRetain(valOp, refTy);
-                L("  store i8* " + valOp + ", i8** " + sp);
-                EmitArcRelease(old, refTy);
-                L("  br label %L" + lend);
+                if (IsDecimal(vVal.ty)) {
+                    int ldec = NL(); int lndec = NL();
+                    L("  switch i64 " + fkind + ", label %L" + lend + " [");
+                    L("    i64 16, label %L" + ldec);
+                    L("    i64 19, label %L" + lndec);
+                    L("  ]");
+                    Label(ldec);
+                    string dp = NT(); L("  " + dp + " = bitcast i8* " + fp + " to " + DecimalLL() + "*");
+                    L("  store " + DecimalLL() + " " + vVal.op + ", " + DecimalLL() + "* " + dp);
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+                    Label(lndec);
+                    string b16 = NT(); L("  " + b16 + " = call i8* @zalloc(i64 16, i8* null, i8* null)");
+                    string b16p = NT(); L("  " + b16p + " = bitcast i8* " + b16 + " to " + DecimalLL() + "*");
+                    L("  store " + DecimalLL() + " " + vVal.op + ", " + DecimalLL() + "* " + b16p);
+                    string sp19 = NT(); L("  " + sp19 + " = bitcast i8* " + fp + " to i8**");
+                    string old19 = NT(); L("  " + old19 + " = load i8*, i8** " + sp19);
+                    L("  store i8* " + b16 + ", i8** " + sp19);
+                    EmitArcRelease(old19, MkType("object"));
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+                } else if (IsNullableValue(vVal.ty)) {
+                    string ult = UnderLL(vVal.ty);
+                    int matchFk = ult == DecimalLL() ? 19 : (ult == "double" ? 18 : 17);
+                    int lnb = NL();
+                    L("  switch i64 " + fkind + ", label %L" + lend + " [");
+                    L("    i64 " + matchFk + ", label %L" + lnb);
+                    L("  ]");
+                    Label(lnb);
+                    string spn = NT(); L("  " + spn + " = bitcast i8* " + fp + " to i8**");
+                    string oldn = NT(); L("  " + oldn + " = load i8*, i8** " + spn);
+                    EmitArcRetain(vVal.op, MkType("object"));
+                    L("  store i8* " + vVal.op + ", i8** " + spn);
+                    EmitArcRelease(oldn, MkType("object"));
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+                } else {
+                    string valOp = Coerce(vVal, "i8*");
+                    int lstore = NL();
+                    int lnullPrim = NL();
+                    int lstruct = NL();
+                    int lnstruct = NL();
+                    L("  switch i64 " + fkind + ", label %L" + lend + " [");
+                    L("    i64 " + ReflFkOf("string") + ", label %L" + lstore);
+                    L("    i64 " + ReflFkOf("object") + ", label %L" + lstore);
+                    L("    i64 17, label %L" + lnullPrim);
+                    L("    i64 18, label %L" + lnullPrim);
+                    L("    i64 19, label %L" + lnullPrim);
+                    L("    i64 20, label %L" + lstruct);
+                    L("    i64 21, label %L" + lnstruct);
+                    L("  ]");
+                    Label(lstore);
+                    string sp = NT();
+                    L("  " + sp + " = bitcast i8* " + fp + " to i8**");
+                    string old = NT();
+                    L("  " + old + " = load i8*, i8** " + sp);
+                    Node refTy = MkType("object");
+                    EmitArcRetain(valOp, refTy);
+                    L("  store i8* " + valOp + ", i8** " + sp);
+                    EmitArcRelease(old, refTy);
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+
+                    Label(lnullPrim);
+                    string npNil = NT(); L("  " + npNil + " = icmp eq i8* " + valOp + ", null");
+                    int lnpSet = NL();
+                    L("  br i1 " + npNil + ", label %L" + lnpSet + ", label %L" + lend);
+                    Label(lnpSet);
+                    string spnp = NT(); L("  " + spnp + " = bitcast i8* " + fp + " to i8**");
+                    string oldnp = NT(); L("  " + oldnp + " = load i8*, i8** " + spnp);
+                    L("  store i8* null, i8** " + spnp);
+                    EmitArcRelease(oldnp, MkType("object"));
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+
+                    Label(lnstruct);
+                    string nsNil = NT(); L("  " + nsNil + " = icmp eq i8* " + valOp + ", null");
+                    L("  br i1 " + nsNil + ", label %L" + lnpSet + ", label %L" + lstruct);
+
+                    Label(lstruct);
+                    string stNn = NT(); L("  " + stNn + " = icmp ne i8* " + valOp + ", null");
+                    int lstFti = NL();
+                    L("  br i1 " + stNn + ", label %L" + lstFti + ", label %L" + lend);
+                    Label(lstFti);
+                    string ftiP = NT(); L("  " + ftiP + " = getelementptr inbounds i8, i8* " + slotP + ", i64 56");
+                    string ftiPP = NT(); L("  " + ftiPP + " = bitcast i8* " + ftiP + " to i8**");
+                    string fti = NT(); L("  " + fti + " = load i8*, i8** " + ftiPP);
+                    string ftiNn = NT(); L("  " + ftiNn + " = icmp ne i8* " + fti + ", null");
+                    int lstAcc = NL();
+                    L("  br i1 " + ftiNn + ", label %L" + lstAcc + ", label %L" + lend);
+                    Label(lstAcc);
+                    string accRaw = NT(); L("  " + accRaw + " = getelementptr i8, i8* " + fti + ", i64 -120");
+                    string accSlot = NT(); L("  " + accSlot + " = bitcast i8* " + accRaw + " to i1 (i8*)**");
+                    string accFn = NT(); L("  " + accFn + " = load i1 (i8*)*, i1 (i8*)** " + accSlot);
+                    string accNn = NT(); L("  " + accNn + " = icmp ne i1 (i8*)* " + accFn + ", null");
+                    int lstCallAcc = NL();
+                    L("  br i1 " + accNn + ", label %L" + lstCallAcc + ", label %L" + lend);
+                    Label(lstCallAcc);
+                    string accOk = NT(); L("  " + accOk + " = call i1 " + accFn + "(i8* " + valOp + ")");
+                    int lstClone = NL();
+                    L("  br i1 " + accOk + ", label %L" + lstClone + ", label %L" + lend);
+                    Label(lstClone);
+                    string clRaw = NT(); L("  " + clRaw + " = getelementptr i8, i8* " + fti + ", i64 -144");
+                    string clSlot = NT(); L("  " + clSlot + " = bitcast i8* " + clRaw + " to i8* (i8*)**");
+                    string clFn = NT(); L("  " + clFn + " = load i8* (i8*)*, i8* (i8*)** " + clSlot);
+                    string clVal = NT(); L("  " + clVal + " = call i8* " + clFn + "(i8* " + valOp + ")");
+                    string sps = NT(); L("  " + sps + " = bitcast i8* " + fp + " to i8**");
+                    string olds = NT(); L("  " + olds + " = load i8*, i8** " + sps);
+                    L("  store i8* " + clVal + ", i8** " + sps);
+                    EmitArcRelease(olds, MkType("object"));
+                    L("  store i64 1, i64* " + okSlot);
+                    L("  br label %L" + lend);
+                }
                 Label(lend);
                 string result = NT();
-                L("  " + result + " = phi i64 [ 0, %" + lookupFrom + " ], [ 0, %L" + lset + " ], [ 1, %L" + lstore + " ]");
+                L("  " + result + " = load i64, i64* " + okSlot);
                 if (propDoneLbl >= 0) {
                     L("  store i64 " + result + ", i64* " + resSlot);
                     L("  br label %L" + propDoneLbl);
@@ -1769,15 +2518,35 @@ partial class Irgen {
                 string val64 = ToI64(vVal);
                 string val1 = NT();
                 L("  " + val1 + " = icmp ne i64 " + val64 + ", 0");
+                int lnb = NL(); int lrawb = NL(); int ldoneb = NL();
+                string isNb = NT(); L("  " + isNb + " = icmp eq i64 " + fkind + ", 17");
+                L("  br i1 " + isNb + ", label %L" + lnb + ", label %L" + lrawb);
+                Label(lnb);
+                string bz64 = NT(); L("  " + bz64 + " = zext i1 " + val1 + " to i64");
+                string bb8 = NT(); L("  " + bb8 + " = call i8* @zalloc(i64 8, i8* null, i8* null)");
+                string bb8p = NT(); L("  " + bb8p + " = bitcast i8* " + bb8 + " to i64*");
+                L("  store i64 " + bz64 + ", i64* " + bb8p);
+                string fpb = NT(); L("  " + fpb + " = bitcast i8* " + fp + " to i8**");
+                string oldb = NT(); L("  " + oldb + " = load i8*, i8** " + fpb);
+                L("  store i8* " + bb8 + ", i8** " + fpb);
+                EmitArcRelease(oldb, MkType("object"));
+                L("  br label %L" + ldoneb);
+                Label(lrawb);
                 string val8 = NT();
                 L("  " + val8 + " = zext i1 " + val1 + " to i8");
                 L("  store i8 " + val8 + ", i8* " + fp);
+                L("  br label %L" + ldoneb);
+                Label(ldoneb);
             } else if (opName == "SetFieldInt" || opName == "SetFieldLong") {
                 string val64 = ToI64(vVal);
                 int l1 = NL();
                 int l2 = NL();
                 int l4 = NL();
                 int l8 = NL();
+                int ldec = NL();
+                int lni17 = NL();
+                int lnd18 = NL();
+                int lnm19 = NL();
                 int ldone = NL();
                 string is1 = NT(); L("  " + is1 + " = icmp eq i64 " + fkind + ", 1");
                 string isByte = NT(); L("  " + isByte + " = icmp eq i64 " + fkind + ", 3");
@@ -1818,6 +2587,48 @@ partial class Irgen {
                 L("  br label %L" + ldone);
 
                 Label(l8);
+                int l8raw = NL();
+                L("  switch i64 " + fkind + ", label %L" + l8raw + " [");
+                L("    i64 16, label %L" + ldec);
+                L("    i64 17, label %L" + lni17);
+                L("    i64 18, label %L" + lnd18);
+                L("    i64 19, label %L" + lnm19);
+                L("  ]");
+                Label(ldec);
+                ExprVal dv16 = ToDecimal(new ExprVal(val64, MkType("long")));
+                string dp16 = NT(); L("  " + dp16 + " = bitcast i8* " + fp + " to " + DecimalLL() + "*");
+                L("  store " + DecimalLL() + " " + dv16.op + ", " + DecimalLL() + "* " + dp16);
+                L("  br label %L" + ldone);
+                Label(lni17);
+                string bx17 = NT(); L("  " + bx17 + " = call i8* @zalloc(i64 8, i8* null, i8* null)");
+                string bx17p = NT(); L("  " + bx17p + " = bitcast i8* " + bx17 + " to i64*");
+                L("  store i64 " + val64 + ", i64* " + bx17p);
+                string fp17 = NT(); L("  " + fp17 + " = bitcast i8* " + fp + " to i8**");
+                string old17 = NT(); L("  " + old17 + " = load i8*, i8** " + fp17);
+                L("  store i8* " + bx17 + ", i8** " + fp17);
+                EmitArcRelease(old17, MkType("object"));
+                L("  br label %L" + ldone);
+                Label(lnd18);
+                string fd18 = NT(); L("  " + fd18 + " = sitofp i64 " + val64 + " to double");
+                string bx18 = NT(); L("  " + bx18 + " = call i8* @zalloc(i64 8, i8* null, i8* null)");
+                string bx18p = NT(); L("  " + bx18p + " = bitcast i8* " + bx18 + " to double*");
+                L("  store double " + fd18 + ", double* " + bx18p);
+                string fp18 = NT(); L("  " + fp18 + " = bitcast i8* " + fp + " to i8**");
+                string old18 = NT(); L("  " + old18 + " = load i8*, i8** " + fp18);
+                L("  store i8* " + bx18 + ", i8** " + fp18);
+                EmitArcRelease(old18, MkType("object"));
+                L("  br label %L" + ldone);
+                Label(lnm19);
+                ExprVal dv19 = ToDecimal(new ExprVal(val64, MkType("long")));
+                string bx19 = NT(); L("  " + bx19 + " = call i8* @zalloc(i64 16, i8* null, i8* null)");
+                string bx19p = NT(); L("  " + bx19p + " = bitcast i8* " + bx19 + " to " + DecimalLL() + "*");
+                L("  store " + DecimalLL() + " " + dv19.op + ", " + DecimalLL() + "* " + bx19p);
+                string fp19 = NT(); L("  " + fp19 + " = bitcast i8* " + fp + " to i8**");
+                string old19b = NT(); L("  " + old19b + " = load i8*, i8** " + fp19);
+                L("  store i8* " + bx19 + ", i8** " + fp19);
+                EmitArcRelease(old19b, MkType("object"));
+                L("  br label %L" + ldone);
+                Label(l8raw);
                 string p64 = NT(); L("  " + p64 + " = bitcast i8* " + fp + " to i64*");
                 L("  store i64 " + val64 + ", i64* " + p64);
                 L("  br label %L" + ldone);
@@ -1827,13 +2638,44 @@ partial class Irgen {
                 string valD = Coerce(vVal, "double");
                 int lflt = NL();
                 int ldbl = NL();
+                int ldecD = NL();
+                int lnd18D = NL();
+                int lnm19D = NL();
                 int ldone = NL();
-                string isFlt = NT(); L("  " + isFlt + " = icmp eq i64 " + fkind + ", 12");
-                L("  br i1 " + isFlt + ", label %L" + lflt + ", label %L" + ldbl);
+                L("  switch i64 " + fkind + ", label %L" + ldbl + " [");
+                L("    i64 12, label %L" + lflt);
+                L("    i64 16, label %L" + ldecD);
+                L("    i64 18, label %L" + lnd18D);
+                L("    i64 19, label %L" + lnm19D);
+                L("  ]");
                 Label(lflt);
                 string valF = NT(); L("  " + valF + " = fptrunc double " + valD + " to float");
                 string pF = NT(); L("  " + pF + " = bitcast i8* " + fp + " to float*");
                 L("  store float " + valF + ", float* " + pF);
+                L("  br label %L" + ldone);
+                Label(ldecD);
+                ExprVal dd16 = ToDecimal(new ExprVal(valD, MkType("double")));
+                string ddp16 = NT(); L("  " + ddp16 + " = bitcast i8* " + fp + " to " + DecimalLL() + "*");
+                L("  store " + DecimalLL() + " " + dd16.op + ", " + DecimalLL() + "* " + ddp16);
+                L("  br label %L" + ldone);
+                Label(lnd18D);
+                string bxd18 = NT(); L("  " + bxd18 + " = call i8* @zalloc(i64 8, i8* null, i8* null)");
+                string bxd18p = NT(); L("  " + bxd18p + " = bitcast i8* " + bxd18 + " to double*");
+                L("  store double " + valD + ", double* " + bxd18p);
+                string fpd18 = NT(); L("  " + fpd18 + " = bitcast i8* " + fp + " to i8**");
+                string oldd18 = NT(); L("  " + oldd18 + " = load i8*, i8** " + fpd18);
+                L("  store i8* " + bxd18 + ", i8** " + fpd18);
+                EmitArcRelease(oldd18, MkType("object"));
+                L("  br label %L" + ldone);
+                Label(lnm19D);
+                ExprVal dd19 = ToDecimal(new ExprVal(valD, MkType("double")));
+                string bxd19 = NT(); L("  " + bxd19 + " = call i8* @zalloc(i64 16, i8* null, i8* null)");
+                string bxd19p = NT(); L("  " + bxd19p + " = bitcast i8* " + bxd19 + " to " + DecimalLL() + "*");
+                L("  store " + DecimalLL() + " " + dd19.op + ", " + DecimalLL() + "* " + bxd19p);
+                string fpd19 = NT(); L("  " + fpd19 + " = bitcast i8* " + fp + " to i8**");
+                string oldd19 = NT(); L("  " + oldd19 + " = load i8*, i8** " + fpd19);
+                L("  store i8* " + bxd19 + ", i8** " + fpd19);
+                EmitArcRelease(oldd19, MkType("object"));
                 L("  br label %L" + ldone);
                 Label(ldbl);
                 string pD = NT(); L("  " + pD + " = bitcast i8* " + fp + " to double*");
@@ -2003,11 +2845,56 @@ partial class Irgen {
             L("  store i64 " + EmitFptosiGuarded(e, vFD) + ", i64* " + resSlot);
             L("  br label %L" + ldone);
             Label(lfpChkD);
-            L("  br i1 " + isD13 + ", label %L" + ldbl + ", label %L" + ldone);
+            int ldec16 = NL(); int lni17 = NL(); int lnd18 = NL(); int lnm19 = NL();
+            L("  switch i64 " + fkind + ", label %L" + ldone + " [");
+            L("    i64 13, label %L" + ldbl);
+            L("    i64 16, label %L" + ldec16);
+            L("    i64 17, label %L" + lni17);
+            L("    i64 18, label %L" + lnd18);
+            L("    i64 19, label %L" + lnm19);
+            L("  ]");
             Label(ldbl);
             string pD = NT(); L("  " + pD + " = bitcast i8* " + fp + " to double*");
             string vD = NT(); L("  " + vD + " = load double, double* " + pD);
             L("  store i64 " + EmitFptosiGuarded(e, vD) + ", i64* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(ldec16);
+            string pDec16 = NT(); L("  " + pDec16 + " = bitcast i8* " + fp + " to " + DecimalLL() + "*");
+            string vDec16 = NT(); L("  " + vDec16 + " = load " + DecimalLL() + ", " + DecimalLL() + "* " + pDec16);
+            L("  store i64 " + DecimalNumber(new ExprVal(vDec16, MkType("decimal")), false) + ", i64* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lni17);
+            string pp17 = NT(); L("  " + pp17 + " = bitcast i8* " + fp + " to i8**");
+            string bx17 = NT(); L("  " + bx17 + " = load i8*, i8** " + pp17);
+            string nn17 = NT(); L("  " + nn17 + " = icmp ne i8* " + bx17 + ", null");
+            int lni17r = NL();
+            L("  br i1 " + nn17 + ", label %L" + lni17r + ", label %L" + ldone);
+            Label(lni17r);
+            string bp17 = NT(); L("  " + bp17 + " = bitcast i8* " + bx17 + " to i64*");
+            string bv17 = NT(); L("  " + bv17 + " = load i64, i64* " + bp17);
+            L("  store i64 " + bv17 + ", i64* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lnd18);
+            string pp18 = NT(); L("  " + pp18 + " = bitcast i8* " + fp + " to i8**");
+            string bx18 = NT(); L("  " + bx18 + " = load i8*, i8** " + pp18);
+            string nn18 = NT(); L("  " + nn18 + " = icmp ne i8* " + bx18 + ", null");
+            int lnd18r = NL();
+            L("  br i1 " + nn18 + ", label %L" + lnd18r + ", label %L" + ldone);
+            Label(lnd18r);
+            string bp18 = NT(); L("  " + bp18 + " = bitcast i8* " + bx18 + " to double*");
+            string bv18 = NT(); L("  " + bv18 + " = load double, double* " + bp18);
+            L("  store i64 " + EmitFptosiGuarded(e, bv18) + ", i64* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lnm19);
+            string pp19 = NT(); L("  " + pp19 + " = bitcast i8* " + fp + " to i8**");
+            string bx19 = NT(); L("  " + bx19 + " = load i8*, i8** " + pp19);
+            string nn19 = NT(); L("  " + nn19 + " = icmp ne i8* " + bx19 + ", null");
+            int lnm19r = NL();
+            L("  br i1 " + nn19 + ", label %L" + lnm19r + ", label %L" + ldone);
+            Label(lnm19r);
+            string bp19 = NT(); L("  " + bp19 + " = bitcast i8* " + bx19 + " to " + DecimalLL() + "*");
+            string bv19 = NT(); L("  " + bv19 + " = load " + DecimalLL() + ", " + DecimalLL() + "* " + bp19);
+            L("  store i64 " + DecimalNumber(new ExprVal(bv19, MkType("decimal")), false) + ", i64* " + resSlot);
             L("  br label %L" + ldone);
 
             Label(ldone);
@@ -2070,17 +2957,60 @@ partial class Irgen {
             L("  store double " + dI32 + ", double* " + resSlot);
             L("  br label %L" + ldone);
             Label(lchkL);
-            string isI64 = NT(); L("  " + isI64 + " = icmp eq i64 " + fkind + ", 8");
-            string isU64 = NT(); L("  " + isU64 + " = icmp eq i64 " + fkind + ", 9");
-            string isEn64 = NT(); L("  " + isEn64 + " = icmp eq i64 " + fkind + ", 11");
-            string is64a = NT(); L("  " + is64a + " = or i1 " + isI64 + ", " + isU64);
-            string is64 = NT(); L("  " + is64 + " = or i1 " + is64a + ", " + isEn64);
-            L("  br i1 " + is64 + ", label %L" + li64 + ", label %L" + ldone);
+            int ldec16d = NL(); int lni17d = NL(); int lnd18d = NL(); int lnm19d = NL();
+            L("  switch i64 " + fkind + ", label %L" + ldone + " [");
+            L("    i64 8, label %L" + li64);
+            L("    i64 9, label %L" + li64);
+            L("    i64 11, label %L" + li64);
+            L("    i64 16, label %L" + ldec16d);
+            L("    i64 17, label %L" + lni17d);
+            L("    i64 18, label %L" + lnd18d);
+            L("    i64 19, label %L" + lnm19d);
+            L("  ]");
             Label(li64);
             string pI64 = NT(); L("  " + pI64 + " = bitcast i8* " + fp + " to i64*");
             string vI64 = NT(); L("  " + vI64 + " = load i64, i64* " + pI64);
             string dI64 = NT(); L("  " + dI64 + " = sitofp i64 " + vI64 + " to double");
             L("  store double " + dI64 + ", double* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(ldec16d);
+            string pDec16d = NT(); L("  " + pDec16d + " = bitcast i8* " + fp + " to " + DecimalLL() + "*");
+            string vDec16d = NT(); L("  " + vDec16d + " = load " + DecimalLL() + ", " + DecimalLL() + "* " + pDec16d);
+            L("  store double " + DecimalNumber(new ExprVal(vDec16d, MkType("decimal")), true) + ", double* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lni17d);
+            string pp17d = NT(); L("  " + pp17d + " = bitcast i8* " + fp + " to i8**");
+            string bx17d = NT(); L("  " + bx17d + " = load i8*, i8** " + pp17d);
+            string nn17d = NT(); L("  " + nn17d + " = icmp ne i8* " + bx17d + ", null");
+            int lni17dr = NL();
+            L("  br i1 " + nn17d + ", label %L" + lni17dr + ", label %L" + ldone);
+            Label(lni17dr);
+            string bp17d = NT(); L("  " + bp17d + " = bitcast i8* " + bx17d + " to i64*");
+            string bv17d = NT(); L("  " + bv17d + " = load i64, i64* " + bp17d);
+            string dv17d = NT(); L("  " + dv17d + " = sitofp i64 " + bv17d + " to double");
+            L("  store double " + dv17d + ", double* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lnd18d);
+            string pp18d = NT(); L("  " + pp18d + " = bitcast i8* " + fp + " to i8**");
+            string bx18d = NT(); L("  " + bx18d + " = load i8*, i8** " + pp18d);
+            string nn18d = NT(); L("  " + nn18d + " = icmp ne i8* " + bx18d + ", null");
+            int lnd18dr = NL();
+            L("  br i1 " + nn18d + ", label %L" + lnd18dr + ", label %L" + ldone);
+            Label(lnd18dr);
+            string bp18d = NT(); L("  " + bp18d + " = bitcast i8* " + bx18d + " to double*");
+            string bv18d = NT(); L("  " + bv18d + " = load double, double* " + bp18d);
+            L("  store double " + bv18d + ", double* " + resSlot);
+            L("  br label %L" + ldone);
+            Label(lnm19d);
+            string pp19d = NT(); L("  " + pp19d + " = bitcast i8* " + fp + " to i8**");
+            string bx19d = NT(); L("  " + bx19d + " = load i8*, i8** " + pp19d);
+            string nn19d = NT(); L("  " + nn19d + " = icmp ne i8* " + bx19d + ", null");
+            int lnm19dr = NL();
+            L("  br i1 " + nn19d + ", label %L" + lnm19dr + ", label %L" + ldone);
+            Label(lnm19dr);
+            string bp19d = NT(); L("  " + bp19d + " = bitcast i8* " + bx19d + " to " + DecimalLL() + "*");
+            string bv19d = NT(); L("  " + bv19d + " = load " + DecimalLL() + ", " + DecimalLL() + "* " + bp19d);
+            L("  store double " + DecimalNumber(new ExprVal(bv19d, MkType("decimal")), true) + ", double* " + resSlot);
             L("  br label %L" + ldone);
             Label(ldone);
             L("  br label %L" + lend);
@@ -2097,16 +3027,19 @@ partial class Irgen {
             }
             int lget = NL();
             int lload = NL();
+            int lstruct = NL();
             int lend = propDoneLbl >= 0 ? propDoneLbl : NL();
             L("  br i1 " + hit + ", label %L" + lget + ", label %L" + lend);
             Label(lget);
             string fkind_p = NT(); L("  " + fkind_p + " = getelementptr inbounds i8, i8* " + slotP + ", i64 16");
             string fkind_i64 = NT(); L("  " + fkind_i64 + " = bitcast i8* " + fkind_p + " to i64*");
             string fkind = NT(); L("  " + fkind + " = load i64, i64* " + fkind_i64);
-            string isObj = NT(); L("  " + isObj + " = icmp eq i64 " + fkind + ", " + ReflFkOf("object"));
-            string isStrO = NT(); L("  " + isStrO + " = icmp eq i64 " + fkind + ", " + ReflFkOf("string"));
-            string isRefO = NT(); L("  " + isRefO + " = or i1 " + isObj + ", " + isStrO);
-            L("  br i1 " + isRefO + ", label %L" + lload + ", label %L" + lend);
+            L("  switch i64 " + fkind + ", label %L" + lend + " [");
+            L("    i64 " + ReflFkOf("string") + ", label %L" + lload);
+            L("    i64 " + ReflFkOf("object") + ", label %L" + lload);
+            L("    i64 20, label %L" + lstruct);
+            L("    i64 21, label %L" + lstruct);
+            L("  ]");
             Label(lload);
             string foff_p = NT(); L("  " + foff_p + " = getelementptr inbounds i8, i8* " + slotP + ", i64 24");
             string foff_i64 = NT(); L("  " + foff_i64 + " = bitcast i8* " + foff_p + " to i64*");
@@ -2116,6 +3049,26 @@ partial class Irgen {
             string val = NT(); L("  " + val + " = load i8*, i8** " + sp);
             EmitArcRetainObject(val);
             L("  store i8* " + val + ", i8** " + resSlot);
+            L("  br label %L" + lend);
+            Label(lstruct);
+            string foff_ps = NT(); L("  " + foff_ps + " = getelementptr inbounds i8, i8* " + slotP + ", i64 24");
+            string foff_i64s = NT(); L("  " + foff_i64s + " = bitcast i8* " + foff_ps + " to i64*");
+            string foffs = NT(); L("  " + foffs + " = load i64, i64* " + foff_i64s);
+            string fps = NT(); L("  " + fps + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foffs);
+            string sps = NT(); L("  " + sps + " = bitcast i8* " + fps + " to i8**");
+            string vals = NT(); L("  " + vals + " = load i8*, i8** " + sps);
+            string valsnn = NT(); L("  " + valsnn + " = icmp ne i8* " + vals + ", null");
+            int lclone = NL();
+            L("  br i1 " + valsnn + ", label %L" + lclone + ", label %L" + lend);
+            Label(lclone);
+            string ftiP = NT(); L("  " + ftiP + " = getelementptr inbounds i8, i8* " + slotP + ", i64 56");
+            string ftiPP = NT(); L("  " + ftiPP + " = bitcast i8* " + ftiP + " to i8**");
+            string fti = NT(); L("  " + fti + " = load i8*, i8** " + ftiPP);
+            string clRaw = NT(); L("  " + clRaw + " = getelementptr i8, i8* " + fti + ", i64 -144");
+            string clSlot = NT(); L("  " + clSlot + " = bitcast i8* " + clRaw + " to i8* (i8*)**");
+            string clFn = NT(); L("  " + clFn + " = load i8* (i8*)*, i8* (i8*)** " + clSlot);
+            string clVal = NT(); L("  " + clVal + " = call i8* " + clFn + "(i8* " + vals + ")");
+            L("  store i8* " + clVal + ", i8** " + resSlot);
             L("  br label %L" + lend);
             Label(lend);
             string ret = NT(); L("  " + ret + " = load i8*, i8** " + resSlot);

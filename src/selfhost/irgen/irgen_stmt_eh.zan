@@ -440,38 +440,49 @@ partial class Irgen {
         EmitRaise();
     }
 
+    // Outlined cold unwind/longjmp helper: keeps hot callers compact and gives
+    // LLVM an explicit cold+noreturn edge instead of inlining ~25 lines per site.
+    void EnsureExcRaiseHelper() {
+        if (excRaiseEmitted) { return; }
+        excRaiseEmitted = true;
+        if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zexc_raise() cold noinline noreturn {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %sp = load i64, i64* @__exc_sp\n");
+        sb.Append("  %has = icmp sgt i64 %sp, 0\n");
+        sb.Append("  br i1 %has, label %handle, label %unhandled\n");
+        sb.Append("unhandled:\n");
+        sb.Append("  call void @exit(i32 70)\n");
+        sb.Append("  unreachable\n");
+        sb.Append("handle:\n");
+        sb.Append("  %sp1 = sub i64 %sp, 1\n");
+        sb.Append("  store i64 %sp1, i64* @__exc_sp\n");
+        sb.Append("  %bufs = load i8*, i8** @__exc_bufs\n");
+        sb.Append("  %bufs2 = bitcast i8* %bufs to [32 x i64]*\n");
+        sb.Append("  %fe = getelementptr [32 x i64], [32 x i64]* %bufs2, i64 %sp1, i64 0\n");
+        sb.Append("  %bufp = bitcast [32 x i64]* %fe to i8*\n");
+        sb.Append("  %pm = load i8*, i8** @zpending_marks\n");
+        sb.Append("  %pm2 = bitcast i8* %pm to i8**\n");
+        sb.Append("  %pms = getelementptr i8*, i8** %pm2, i64 %sp1\n");
+        sb.Append("  %pmv = load i8*, i8** %pms\n");
+        sb.Append("  call void @zpending_unwind(i8* %pmv)\n");
+        sb.Append("  %xm = load i8*, i8** @zexc_marks\n");
+        sb.Append("  %xm2 = bitcast i8* %xm to i8**\n");
+        sb.Append("  %xms = getelementptr i8*, i8** %xm2, i64 %sp1\n");
+        sb.Append("  %xmv = load i8*, i8** %xms\n");
+        sb.Append("  call void @zexc_unwind(i8* %xmv)\n");
+        sb.Append("  call void @longjmp(i8* %bufp, i32 1)\n");
+        sb.Append("  unreachable\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
     // pop the innermost handler and longjmp into its try (the exception
     // object/tid globals already hold the in-flight exception).
     void EmitRaise() {
-        // The exception never crosses a coroutine frame: a coroutine that
-        // has no handler for it puts the exception into its frame and the
-        // awaiter re-throws it in its own context (the C host does the
-        // same, irgen_async.c: emit_async_exc_epilogue). So there is no
-        // cross-frame unwind here any more -- walking the awaiter chain
-        // would free frames that are still alive.
-        string sp = NT();
-        L("  " + sp + " = load i64, i64* @__exc_sp");
-        string hasH = NT();
-        L("  " + hasH + " = icmp sgt i64 " + sp + ", 0");
-        int lhandle = NL(); int lunhandled = NL();
-        L("  br i1 " + hasH + ", label %L" + lhandle + ", label %L" + lunhandled);
-        Label(lunhandled);
-        L("  call void @exit(i32 70)");
-        L("  unreachable");
-        Label(lhandle);
-        string sp1 = NT();
-        L("  " + sp1 + " = sub i64 " + sp + ", 1");
-        L("  store i64 " + sp1 + ", i64* @__exc_sp");
-        // the frame's jmp_buf is re-derived from the depth (B-ID199 round4:
-        // @__exc_stack is retired) -- fresh after any @__exc_grow swap
-        string buf = EmitFrameBuf(sp1);
-        string markp = EmitMarkSlot("@zpending_marks", sp1); string pendingMark = NT();
-        L("  " + pendingMark + " = load i8*, i8** " + markp);
-        L("  call void @zpending_unwind(i8* " + pendingMark + ")");
-        string ownerMarkSlot = EmitMarkSlot("@zexc_marks", sp1); string ownerMark = NT();
-        L("  " + ownerMark + " = load i8*, i8** " + ownerMarkSlot);
-        L("  call void @zexc_unwind(i8* " + ownerMark + ")");
-        L("  call void @longjmp(i8* " + buf + ", i32 1)");
+        EnsureExcRaiseHelper();
+        L("  call void @zexc_raise()");
         L("  unreachable");
         term = true;
     }

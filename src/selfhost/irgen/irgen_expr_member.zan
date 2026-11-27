@@ -1029,25 +1029,50 @@ partial class Irgen {
     // prefixes the location with "<unknown>" -- the same placeholder the C
     // runtime prints when its site file is unavailable.
     string RawCString(string s, bool constant = false) {
-        List<int> bytes = new List<int>();
-        int i = 0;
-        while (i < s.Length) { StrEsc.AddUtf8(bytes, (int)s[i]); i = i + 1; }
-        string txt = "";
-        i = 0;
-        while (i < bytes.Count) { txt = txt + "\\" + Hex2(bytes[i]); i = i + 1; }
-        txt = txt + "\\00";
-        int n = bytes.Count + 1;
-        strn = strn + 1;
-        string g = "@.r" + strn;
-        string declaration = g + " = private unnamed_addr constant [" + n + " x i8] c\"" + txt + "\"";
-        string indices = "[" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0";
-        if (constant) {
-            // Runtime functions also use head, so defer their globals until module scope.
-            rawStringGlobals.Append(declaration);
-            rawStringGlobals.Append("\n");
-            return "getelementptr inbounds (" + indices + ")";
+        string indices = "";
+        if (rawStrGep.ContainsKey(s)) {
+            indices = rawStrGep[s];
+        } else {
+            StringBuilder txt = new StringBuilder();
+            int byteCount = 0;
+            int i = 0;
+            int slen = s.Length;
+            while (i < slen) {
+                int run = i;
+                while (i < slen) {
+                    int c = (int)s[i];
+                    if (c >= 32 && c <= 126 && c != 34 && c != 59 && c != 64 && c != 92) { i = i + 1; }
+                    else { break; }
+                }
+                if (i > run) {
+                    txt.Append(s.Substring(run, i - run));
+                    byteCount = byteCount + (i - run);
+                }
+                if (i < slen) {
+                    int c = (int)s[i];
+                    if (c < 128) {
+                        txt.Append("\\");
+                        txt.Append(Hex2(c));
+                        byteCount = byteCount + 1;
+                    } else {
+                        List<int> u = new List<int>();
+                        StrEsc.AddUtf8(u, c);
+                        int k = 0;
+                        while (k < u.Count) { txt.Append("\\"); txt.Append(Hex2(u[k])); k = k + 1; }
+                        byteCount = byteCount + u.Count;
+                    }
+                    i = i + 1;
+                }
+            }
+            txt.Append("\\00");
+            int n = byteCount + 1;
+            strn = strn + 1;
+            string g = "@.r" + strn;
+            rawStringGlobals.Append(g + " = private unnamed_addr constant [" + n + " x i8] c\"" + txt.ToString() + "\"\n");
+            indices = "[" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0";
+            rawStrGep[s] = indices;
         }
-        H(declaration);
+        if (constant) { return "getelementptr inbounds (" + indices + ")"; }
         string t = NT();
         L("  " + t + " = getelementptr inbounds " + indices);
         return t;
@@ -1087,20 +1112,10 @@ partial class Irgen {
     public bool runtimeChecks = true;
     public bool strictRuntime;
 
-    void EmitRuntimeCheckIf(Node at, string bad, string msg, bool required = false) {
-        if (!runtimeChecks && !required) { return; }
-        // The C host's split-path report (irgen_generics.c emit_runtime_check
-        // -> emit_guard_report3 -> zan_rt_guard_fail3 -> zan_rt_soft_note3)
-        // appends a newline to the message and then another one when it
-        // prints, so a soft diagnostic is "file:line:col: ... msg" followed
-        // by a BLANK line; the hard path prints the single-newline form
-        // before exiting. The location is the expression the check came
-        // from -- for the parse family that is the ARGUMENT node (the
-        // string literal's own line:col).
-        string text = "<unknown>:" + at.line + ":" + at.col
-            + ": runtime error: " + msg + "\n";
-        string tsoft = RawCString(text + "\n");
-        string thard = RawCString(text);
+    void EnsureRtCheckFailHelper() {
+        if (rtCheckFailEmitted) { return; }
+        rtCheckFailEmitted = true;
+        EnsureExcThrowMsgHelper();
         if (!ExternSeen("zan_rt_soft_is_hard")) {
             externDecls.Add("zan_rt_soft_is_hard");
             H("declare i32 @zan_rt_soft_is_hard()");
@@ -1110,34 +1125,46 @@ partial class Irgen {
             H("declare void @zan_rt_soft_note(i8*)");
         }
         if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zrt_check_fail(i8* %tid, i8* %excMsg, i8* %thard, i8* %tsoft, i1 %strict) cold noinline {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %sp = load i64, i64* @__exc_sp\n");
+        sb.Append("  %hasH = icmp sgt i64 %sp, 1\n");
+        sb.Append("  br i1 %hasH, label %do_throw, label %no_throw\n");
+        sb.Append("do_throw:\n");
+        sb.Append("  call void @zexc_throw_msg(i8* %tid, i8* %excMsg)\n");
+        sb.Append("  unreachable\n");
+        sb.Append("no_throw:\n");
+        sb.Append("  br i1 %strict, label %hard, label %chk_hard\n");
+        sb.Append("chk_hard:\n");
+        sb.Append("  %hd = call i32 @zan_rt_soft_is_hard()\n");
+        sb.Append("  %hz = icmp ne i32 %hd, 0\n");
+        sb.Append("  br i1 %hz, label %hard, label %soft\n");
+        sb.Append("hard:\n");
+        sb.Append("  call void @zan_rt_soft_note(i8* %thard)\n");
+        sb.Append("  call void @exit(i32 70)\n");
+        sb.Append("  unreachable\n");
+        sb.Append("soft:\n");
+        sb.Append("  call void @zan_rt_soft_note(i8* %tsoft)\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EmitRuntimeCheckIf(Node at, string bad, string msg, bool required = false) {
+        if (!runtimeChecks && !required) { return; }
+        EnsureRtCheckFailHelper();
+        string text = "<unknown>:" + at.line + ":" + at.col
+            + ": runtime error: " + msg + "\n";
+        string tsoft = RawCString(text + "\n", true);
+        string thard = RawCString(text, true);
+        string tid = InferGuardExceptionTid(msg);
+        string excMsg = GenStrConst(msg);
         int lcheck = NL(); int lskip = NL();
         L("  br i1 " + bad + ", label %L" + lcheck + ", label %L" + lskip);
         Label(lcheck);
-        string sp = NT();
-        L("  " + sp + " = load i64, i64* @__exc_sp");
-        string hasH = NT();
-        L("  " + hasH + " = icmp sgt i64 " + sp + ", 1");
-        int lthrow = NL(); int lnothrow = NL();
-        L("  br i1 " + hasH + ", label %L" + lthrow + ", label %L" + lnothrow);
-        Label(lthrow);
-        string tid = InferGuardExceptionTid(msg);
-        EmitExceptionThrow(tid, msg);
-        Label(lnothrow);
-        int lhard = NL(); int lsoft = NL();
-        string hz = "true";
-        if (!strictRuntime) {
-            string hd = NT();
-            L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
-            hz = NT();
-            L("  " + hz + " = icmp ne i32 " + hd + ", 0");
-        }
-        L("  br i1 " + hz + ", label %L" + lhard + ", label %L" + lsoft);
-        Label(lhard);
-        L("  call void @zan_rt_soft_note(i8* " + thard + ")");
-        L("  call void @exit(i32 70)");
-        L("  unreachable");
-        Label(lsoft);
-        L("  call void @zan_rt_soft_note(i8* " + tsoft + ")");
+        L("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + excMsg
+            + ", i8* " + thard + ", i8* " + tsoft + ", i1 " + (strictRuntime ? "true" : "false") + ")");
         L("  br label %L" + lskip);
         Label(lskip);
     }

@@ -55,13 +55,13 @@ partial class Irgen {
         List<int> reached = new List<int>();
         int i = 0;
         while (i < lnCount) {
-            string ln = modText.Substring(lineStart[i], lineLen[i]);
-            if (ln.StartsWith("define ")) {
+            int ls = lineStart[i];
+            int ll = lineLen[i];
+            if (ll >= 7 && (int)modText[ls] == 100 && modText.Substring(ls, 7) == "define ") {
                 int st = i;
-                string nm = HeadSymbol(ln);
+                string nm = HeadSymbol(modText.Substring(ls, ll));
                 while (i < lnCount) {
-                    string bl = modText.Substring(lineStart[i], lineLen[i]);
-                    if (bl == "}") { break; }
+                    if (lineLen[i] == 1 && (int)modText[lineStart[i]] == 125) { break; }
                     i = i + 1;
                 }
                 defs.Add(nm, defStart.Count);
@@ -85,9 +85,10 @@ partial class Irgen {
                 defRun = defRun + 1;
                 continue;
             }
-            string line = modText.Substring(lineStart[i], lineLen[i]);
-            if (!line.StartsWith("declare ")) {
-                CollectHeadRefs(line, names);
+            int ls = lineStart[i];
+            int ll = lineLen[i];
+            if (!(ll >= 8 && (int)modText[ls] == 100 && modText.Substring(ls, 8) == "declare ")) {
+                CollectHeadRefs(modText.Substring(ls, ll), names);
                 QueueDefinitions(names, defs, reached, pending);
             }
             i = i + 1;
@@ -115,23 +116,45 @@ partial class Irgen {
             QueueDefinitions(names, defs, reached, pending);
         }
 
-        // rebuild the module: skip define blocks that stayed unreachable
+        // rebuild the module: append contiguous kept byte ranges instead of
+        // allocating a Substring per line (cuts millions of short-lived strings).
         StringBuilder result = new StringBuilder();
+        int modLen = modText.Length;
+        int keepFrom = -1;
+        int keepTo = -1;
         i = 0;
         int defIdx = 0;
         while (i < lnCount) {
             if (defIdx < defStart.Count && defStart[defIdx] == i) {
                 if (reached[defIdx] == 0) {
+                    if (keepFrom >= 0) {
+                        result.Append(modText.Substring(keepFrom, keepTo - keepFrom));
+                        keepFrom = -1;
+                    }
                     // drop the whole block: fast-forward past its closing '}'
                     i = defEnd[defIdx] + 1;
                     defIdx = defIdx + 1;
                     continue;
                 }
+                int bEnd = defEnd[defIdx];
+                int segStart = lineStart[i];
+                int segEnd = lineStart[bEnd] + lineLen[bEnd];
+                if (segEnd < modLen && (int)modText[segEnd] == 10) { segEnd = segEnd + 1; }
+                if (keepFrom < 0) { keepFrom = segStart; }
+                keepTo = segEnd;
+                i = bEnd + 1;
                 defIdx = defIdx + 1;
+                continue;
             }
-            result.Append(modText.Substring(lineStart[i], lineLen[i]));
-            result.Append("\n");
+            int segStart2 = lineStart[i];
+            int segEnd2 = segStart2 + lineLen[i];
+            if (segEnd2 < modLen && (int)modText[segEnd2] == 10) { segEnd2 = segEnd2 + 1; }
+            if (keepFrom < 0) { keepFrom = segStart2; }
+            keepTo = segEnd2;
             i = i + 1;
+        }
+        if (keepFrom >= 0) {
+            result.Append(modText.Substring(keepFrom, keepTo - keepFrom));
         }
         return result.ToString();
     }
