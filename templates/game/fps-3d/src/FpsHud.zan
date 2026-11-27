@@ -5,66 +5,268 @@ using Game.Foundation.Gui;
 
 namespace Fps3D;
 
+// 全部玩家可见界面都是一棵常驻的标准 Gui 控件树（Label/Button/Panel），
+// 外观来自本文件的游戏皮肤（深色玻璃面板 + 青色霓虹描边，和场景的冷色
+// 环境光一致）。世界只由 FpsGame.Render 画；这里不在 Canvas 上重画控件。
+//
+// 模式：title（开始页 + 操作说明）/ play（对局 HUD）/ pause（暂停卡）/
+// result（结算卡）。按钮点击只记下 pendingAction，由 FpsLoop 在 Update 里
+// 按当前模式消费，避免在 Gui 回调里改游戏状态。
 public class FpsHud {
     public Panel root;
-    public Label position;
-    public Label backend;
-    public Label viewMode;
+    public Panel status;
+    public Label title;
+    public Label progress;
+    public Label timer;
+    public Label best;
     public Label aim;
+    public Label viewMode;
+    public Label backend;
+    public Label sound;
+    public Label hint;
+    public Label toast;
     public FpsCrosshair crosshair;
+    public Panel veil;
+    public Panel card;
+    public Label heading;
+    public Label badge;
+    public Label[] lines;
+    public Button primary;
+    public Button secondary;
+    public Button tertiary;
     public HudLayer layer;
+    // 被点击的按钮："primary" / "secondary" / "tertiary"；"" = 无
+    public string pendingAction;
+    public string mode;
     FpsGame game;
+    weak Gui.App app;
 
     public FpsHud(Gui.App app, FpsGame game) {
         this.game = game;
+        this.app = app;
+        this.mode = "title";
+        this.pendingAction = "";
         app.UseCss(FpsHud.Css());
         this.root = new Panel("fps-hud");
         this.root.Class = "fps-hud";
-        Panel status = new Panel("fps-status");
-        status.Class = "fps-status";
-        this.root.Add(status);
-        Label title = new Label("3D FIRST-PERSON EXPLORER");
-        title.Class = "fps-title";
-        status.Add(title);
-        this.position = new Label("");
-        this.position.Class = "fps-position";
-        status.Add(this.position);
-        this.backend = new Label("");
-        status.Add(this.backend);
-        this.viewMode = new Label("");
-        status.Add(this.viewMode);
-        this.aim = new Label("");
-        status.Add(this.aim);
+
+        this.status = this.Group(this.root, "fps-status");
+        this.title = this.LabelAt(this.status, "TARGET TAG", "fps-title");
+        this.progress = this.LabelAt(this.status, "", "fps-progress");
+        this.timer = this.LabelAt(this.status, "", "fps-timer");
+        this.best = this.LabelAt(this.status, "", "fps-muted");
+        this.aim = this.LabelAt(this.status, "", "fps-aim");
+        this.viewMode = this.LabelAt(this.status, "", "fps-view");
+        this.backend = this.LabelAt(this.status, "", "fps-backend");
+        this.sound = this.LabelAt(this.root, "", "fps-sound");
+        this.hint = this.LabelAt(this.root, "", "fps-hint");
+        this.toast = this.LabelAt(this.root, "", "fps-toast");
+
         this.crosshair = new FpsCrosshair();
         this.crosshair.Class = "fps-crosshair";
         this.root.Add(this.crosshair);
+
+        this.veil = this.Group(this.root, "fps-veil");
+        this.card = this.Group(this.veil, "fps-card");
+        this.heading = this.LabelAt(this.card, "", "fps-heading");
+        this.badge = this.LabelAt(this.card, "NEW BEST!", "fps-badge");
+        this.lines = new Label[6];
+        for (int i = 0; i < 6; i = i + 1) {
+            this.lines[i] = this.LabelAt(this.card, "", "fps-line");
+        }
+        this.primary = this.ButtonAt(this.card, "fps-btn fps-primary");
+        this.secondary = this.ButtonAt(this.card, "fps-btn");
+        this.tertiary = this.ButtonAt(this.card, "fps-btn");
+        this.primary.Click.Add(() => this.Clicked("primary"));
+        this.secondary.Click.Add(() => this.Clicked("secondary"));
+        this.tertiary.Click.Add(() => this.Clicked("tertiary"));
+
         this.layer = new HudLayer();
         this.layer.Add(this.root);
-        // Preserve the existing raw-Canvas world/HUD geometry, including (640,360).
         this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
         this.layer.Bind(app);
-        this.SyncState(app);
     }
 
-    public void SyncState(Gui.App app) {
-        this.position.SetProp("text", "POS: (" + Convert.ToString((int)game.controller.Position.X)
-            + ", " + Convert.ToString((int)game.controller.Position.Y)
-            + ", " + Convert.ToString((int)game.controller.Position.Z) + ")");
-        bool gpu = game.drawResult > 0;
-        this.backend.SetProp("text", "BACKEND: "
-            + (gpu ? "GPU (OpenGL 3.3)" : "CPU (3D Wireframe Fallback)"));
-        this.backend.Class = gpu ? "fps-backend fps-gpu" : "fps-backend fps-cpu";
+    void Clicked(string which) { this.pendingAction = which; }
+
+    // 取走一次按钮点击（没有返回 ""）
+    public string TakeAction() {
+        string a = this.pendingAction;
+        this.pendingAction = "";
+        return a;
+    }
+
+    // 切换界面模式：清掉旧模式残留的点击，并释放卡片里按钮的焦点/捕获，
+    // 免得之后的 Space/Enter 被隐藏或改了含义的按钮吃掉。
+    public void SetMode(string m) {
+        if (this.mode == m) { return; }
+        this.mode = m;
+        this.pendingAction = "";
+        Gui.App a = this.app;
+        if (a != null) { a.ReleaseInputSubtree(this.veil); }
+    }
+
+    Panel Group(Control parent, string cls) {
+        Panel p = new Panel(cls);
+        p.Class = cls;
+        parent.Add(p);
+        return p;
+    }
+
+    Label LabelAt(Control parent, string text, string cls) {
+        Label l = new Label(text);
+        l.Class = "fps-label " + cls;
+        parent.Add(l);
+        return l;
+    }
+
+    Button ButtonAt(Control parent, string cls) {
+        Button b = new Button("");
+        b.Class = cls;
+        parent.Add(b);
+        return b;
+    }
+
+    // m:ss.d
+    public static string FormatTime(long ms) {
+        if (ms < 0) { ms = 0; }
+        long tenths = ms / 100;
+        long sec = tenths / 10;
+        long min = sec / 60;
+        long s = sec % 60;
+        return Convert.ToString(min) + ":" + (s < 10 ? "0" : "") + Convert.ToString(s)
+            + "." + Convert.ToString(tenths % 10);
+    }
+
+    // view：由 FpsLoop 汇总的界面状态（档案、静音、提示、结算）
+    public void SyncState(Gui.App app, FpsView view) {
+        int n = game.targetCount;
+        this.progress.SetProp("text", "TAGGED  " + Convert.ToString(game.taggedCount) + " / " + Convert.ToString(n));
+        this.timer.SetProp("text", "TIME  " + FpsHud.FormatTime((long)game.elapsedMs));
+        this.best.SetProp("text", view.hasBest ? "BEST  " + FpsHud.FormatTime(view.bestMs) : "BEST  --:--.-");
+        bool taggable = game.AimTaggable();
+        string aimText = "AIM: NO TARGET";
+        if (game.targetHit) {
+            string dist = Convert.ToString((int)game.hitDistance) + "m";
+            if (game.tagged[game.aimIndex]) { aimText = "AIM: ALREADY TAGGED (" + dist + ")"; }
+            else if (taggable) { aimText = "LOCKED (" + dist + ") - CLICK TO TAG"; }
+            else { aimText = "TOO FAR (" + dist + ") - GET WITHIN 30m"; }
+        }
+        this.aim.SetProp("text", aimText);
+        this.aim.Class = taggable ? "fps-label fps-aim fps-locked" : "fps-label fps-aim";
         this.viewMode.SetProp("text", game.freeLookMode
-            ? "VIEW: [FREE LOOK MODE] Click RMB or ESC to release"
-            : "VIEW: [DRAG MODE] Hold RMB/LMB or Click RMB to toggle");
-        this.viewMode.Class = game.freeLookMode ? "fps-view fps-free" : "fps-view fps-drag";
-        this.aim.SetProp("text", game.targetHit
-            ? "LOCKED ON CUBE (DIST: " + Convert.ToString((int)game.hitDistance) + "m)"
-            : "AIM: NO TARGET [WASD MOVE | SPACE/SHIFT ELEVATE]");
-        this.aim.Class = game.targetHit ? "fps-aim fps-locked" : "fps-aim";
-        this.crosshair.Class = game.targetHit ? "fps-crosshair fps-locked" : "fps-crosshair";
+            ? "VIEW: FREE LOOK  (F / right-click to release)"
+            : "VIEW: DRAG  (hold mouse to look, F = free look)");
+        this.viewMode.Class = game.freeLookMode ? "fps-label fps-view fps-free" : "fps-label fps-view";
+        bool gpu = game.drawResult > 0;
+        this.backend.SetProp("text", gpu ? "GPU (OpenGL 3.3)" : "CPU wireframe fallback");
+        this.backend.Class = gpu ? "fps-label fps-backend fps-gpu" : "fps-label fps-backend fps-cpu";
+        this.sound.SetProp("text", view.muted ? "SOUND OFF  [M]" : "SOUND ON  [M]");
+        this.sound.Class = view.muted ? "fps-label fps-sound fps-off" : "fps-label fps-sound";
+        this.hint.SetProp("text", "WASD move  |  hold mouse / F: look  |  SPACE / SHIFT: up / down  |  CLICK: tag  |  P: pause");
+        this.toast.SetProp("text", view.toast);
+        this.toast.Class = view.toastGood ? "fps-label fps-toast fps-good" : "fps-label fps-toast fps-bad";
+        this.crosshair.Class = taggable ? "fps-crosshair fps-locked" : "fps-crosshair";
+
+        bool playing = this.mode == "play";
+        this.status.SetShown(this.mode != "title");
+        this.crosshair.SetShown(playing);
+        this.hint.SetShown(playing && view.showHint);
+        this.toast.SetShown(playing && view.toast != "");
+        this.veil.SetShown(!playing);
+        this.SyncCard(view);
+
+        this.Layout(app);
         this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
         this.layer.SetVisible(app.window.GetHandle() == 0 || app.window.IsVisible());
+    }
+
+    void SyncCard(FpsView view) {
+        string[] t = new string[6] { "", "", "", "", "", "" };
+        string bestText = view.hasBest ? FpsHud.FormatTime(view.bestMs) : "--:--.-";
+        string n = Convert.ToString(game.targetCount);
+        this.badge.SetShown(false);
+        this.tertiary.SetShown(true);
+        if (this.mode == "title") {
+            this.heading.SetProp("text", "TARGET TAG");
+            t[0] = "Tag all " + n + " glowing blocks as fast as you can.";
+            t[1] = "WASD  move          SPACE / SHIFT  fly up / down";
+            t[2] = "Hold a mouse button and drag to look  -  F or right-click: free look";
+            t[3] = "LEFT-CLICK  tag the block in your crosshair (within 30 m)";
+            t[4] = "P / ESC  pause          M  mute";
+            t[5] = "BEST  " + bestText + "      RUNS  " + Convert.ToString(view.plays);
+            this.primary.SetText("START  [ENTER]");
+            this.secondary.SetText("QUIT  [ESC]");
+            this.tertiary.SetShown(false);
+        } else if (this.mode == "pause") {
+            this.heading.SetProp("text", "PAUSED");
+            t[1] = "TAGGED  " + Convert.ToString(game.taggedCount) + " / " + n
+                + "      TIME  " + FpsHud.FormatTime((long)game.elapsedMs);
+            t[2] = "BEST  " + bestText;
+            t[4] = view.autoPaused ? "Paused because the window lost focus." : "The clock is stopped.";
+            this.primary.SetText("RESUME  [P]");
+            this.secondary.SetText("RESTART  [R]");
+            this.tertiary.SetText("QUIT");
+        } else if (this.mode == "result") {
+            this.heading.SetProp("text", "ALL TARGETS TAGGED");
+            this.badge.SetShown(view.newBest);
+            t[1] = "TIME  " + FpsHud.FormatTime(view.lastMs);
+            t[2] = "BEST  " + bestText;
+            t[4] = "RUNS  " + Convert.ToString(view.plays) + "      CLEARS  " + Convert.ToString(view.clears);
+            this.primary.SetText("PLAY AGAIN  [ENTER]");
+            this.secondary.SetText("MENU  [ESC]");
+            this.tertiary.SetText("QUIT");
+        }
+        for (int i = 0; i < 6; i = i + 1) { this.lines[i].SetProp("text", t[i]); }
+    }
+
+    // 以 1280x720 为设计稿按画布等比缩放；dpx 即画布像素
+    void Layout(Gui.App app) {
+        int w = app.canvas.Width();
+        int h = app.canvas.Height();
+        double s = Math.Min((double)w / 1280.0, (double)h / 720.0);
+        if (s <= 0.0) { s = 1.0; }
+        this.Box(this.status, (int)(16 * s), (int)(16 * s), (int)(430 * s), (int)(178 * s), 0);
+        int lw = (int)(400 * s);
+        int lx = (int)(16 * s);
+        this.Box(this.title, lx, (int)(10 * s), lw, (int)(24 * s), (int)(16 * s));
+        this.Box(this.progress, lx, (int)(36 * s), lw, (int)(32 * s), (int)(26 * s));
+        this.Box(this.timer, lx, (int)(70 * s), lw, (int)(28 * s), (int)(22 * s));
+        this.Box(this.best, lx, (int)(100 * s), lw, (int)(20 * s), (int)(15 * s));
+        this.Box(this.aim, lx, (int)(122 * s), lw, (int)(20 * s), (int)(15 * s));
+        this.Box(this.viewMode, lx, (int)(142 * s), lw, (int)(16 * s), (int)(12 * s));
+        this.Box(this.backend, lx, (int)(158 * s), lw, (int)(16 * s), (int)(12 * s));
+        this.Box(this.sound, w - (int)(196 * s), (int)(16 * s), (int)(180 * s), (int)(28 * s), (int)(15 * s));
+        this.Box(this.hint, 0, h - (int)(48 * s), w, (int)(28 * s), (int)(16 * s));
+        this.Box(this.toast, 0, h / 2 + (int)(28 * s), w, (int)(30 * s), (int)(20 * s));
+        int ch = (int)(21 * s);
+        this.Box(this.crosshair, w / 2 - ch / 2, h / 2 - ch / 2, ch, ch, 0);
+
+        this.Box(this.veil, 0, 0, w, h, 0);
+        int cw = (int)(640 * s);
+        int chh = (int)(470 * s);
+        this.Box(this.card, (w - cw) / 2, (h - chh) / 2, cw, chh, 0);
+        this.Box(this.heading, 0, (int)(28 * s), cw, (int)(48 * s), (int)(38 * s));
+        this.Box(this.badge, 0, (int)(80 * s), cw, (int)(30 * s), (int)(22 * s));
+        for (int i = 0; i < 6; i = i + 1) {
+            this.Box(this.lines[i], (int)(24 * s), (int)((118 + i * 32) * s), cw - (int)(48 * s), (int)(28 * s), (int)(17 * s));
+        }
+        int bw = (int)(180 * s);
+        int bh = (int)(48 * s);
+        int by = chh - (int)(80 * s);
+        int count = this.tertiary.visible ? 3 : 2;
+        int gap = (int)(16 * s);
+        int x0 = (cw - (count * bw + (count - 1) * gap)) / 2;
+        this.Box(this.primary, x0, by, bw, bh, (int)(16 * s));
+        this.Box(this.secondary, x0 + bw + gap, by, bw, bh, (int)(16 * s));
+        this.Box(this.tertiary, x0 + 2 * (bw + gap), by, bw, bh, (int)(16 * s));
+    }
+
+    void Box(Control control, int x, int y, int w, int h, int font) {
+        string style = "left:" + Convert.ToString(x) + "dpx;top:" + Convert.ToString(y)
+            + "dpx;width:" + Convert.ToString(w) + "dpx;height:" + Convert.ToString(h) + "dpx";
+        if (font > 0) { style = style + ";font-size:" + Convert.ToString(font) + "dpx"; }
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
     }
 
     public void Render(Gui.App app) {
@@ -78,18 +280,56 @@ public class FpsHud {
 
     public static string Css() {
         return ".fps-hud{position:relative;background:transparent;padding:0;border:0}"
-            + ".fps-status{position:absolute;left:10dpx;top:10dpx;width:490dpx;height:115dpx;"
-            + "padding:0;border:0;background:rgba(0,0,0,0.8)}"
-            + ".fps-status label{position:absolute;left:10dpx;width:480dpx;height:24dpx;"
-            + "padding:0;margin:0;border:0;background:transparent;text-align:left;vertical-align:top}"
-            + ".fps-title{top:8dpx;font-size:16dpx;color:#00e5ff}"
-            + ".fps-position{top:28dpx;font-size:14dpx;color:#fff}"
-            + ".fps-backend{top:48dpx;font-size:13dpx}.fps-gpu{color:#52c41a}.fps-cpu{color:#faad14}"
-            + ".fps-view{top:66dpx;font-size:13dpx}.fps-free{color:#00e5ff}.fps-drag{color:#ffa940}"
-            + ".fps-aim{top:84dpx;font-size:13dpx;color:#aaa}"
-            + ".fps-aim.fps-locked{font-size:14dpx;color:#00ff00}"
-            + ".fps-crosshair{position:absolute;left:632dpx;top:352dpx;width:17dpx;height:17dpx;"
-            + "padding:0;border:0;background:transparent;color:#fff}"
-            + ".fps-crosshair.fps-locked{color:#00ff00}";
+            + ".fps-status,.fps-veil,.fps-card{position:absolute;padding:0;margin:0}"
+            + ".fps-status{background:rgba(4,14,20,0.78);border:1dpx solid rgba(0,229,255,0.35);border-radius:6dpx}"
+            + ".fps-veil{background:rgba(2,8,12,0.72);border:0}"
+            + ".fps-card{background:rgba(6,20,28,0.94);border:2dpx solid #00e5ff;border-radius:10dpx;"
+            + "box-shadow:0 0 24dpx rgba(0,229,255,0.25)}"
+            + "label.fps-label{position:absolute;padding:0;margin:0;border:0;background:transparent;"
+            + "text-align:left;vertical-align:top;color:#e6fbff}"
+            + "label.fps-title{color:#00e5ff}"
+            + "label.fps-progress{color:#ffffff}"
+            + "label.fps-timer{color:#ffd666}"
+            + "label.fps-muted{color:#8fa9b5}"
+            + "label.fps-aim{color:#8fa9b5}label.fps-aim.fps-locked{color:#5cff8a}"
+            + "label.fps-view{color:#ffa940}label.fps-view.fps-free{color:#00e5ff}"
+            + "label.fps-backend{color:#8fa9b5}label.fps-gpu{color:#52c41a}label.fps-cpu{color:#faad14}"
+            + "label.fps-sound{text-align:right;color:#8fa9b5}label.fps-sound.fps-off{color:#ff7875}"
+            + "label.fps-hint{text-align:center;color:#e6fbff}"
+            + "label.fps-toast{text-align:center}label.fps-toast.fps-good{color:#5cff8a}label.fps-toast.fps-bad{color:#ff9c6e}"
+            + "label.fps-heading{text-align:center;color:#00e5ff}"
+            + "label.fps-badge{text-align:center;color:#ffd666}"
+            + "label.fps-line{text-align:center;color:#cfe9f2}"
+            + "button.fps-btn{position:absolute;padding:0;margin:0;justify-content:center;align-items:center;"
+            + "color:#cfe9f2;background:rgba(10,32,42,0.95);border:2dpx solid #3d6170;border-radius:6dpx}"
+            + "button.fps-btn.fps-primary{color:#e6fbff;border-color:#00e5ff;background:#0b3a47}"
+            + "button.fps-btn label{background:transparent;border:0;font-size:inherit;color:inherit;"
+            + "text-align:center;padding:0;margin:0}"
+            + "button.fps-btn:hover{background:#0f5566;color:#ffffff;border-color:#00e5ff}"
+            + "button.fps-btn:active{background:#00e5ff;color:#03161d;border-color:#ffffff}"
+            + "button.fps-btn:focus{border:2dpx solid #ffffff}"
+            + ".fps-crosshair{position:absolute;padding:0;border:0;background:transparent;color:#ffffff}"
+            + ".fps-crosshair.fps-locked{color:#5cff8a}";
+    }
+}
+
+// FpsLoop 汇总给 HUD 的应用层状态（档案、静音、提示、结算），
+// 让 FpsHud 不依赖 GameProfile/音频。
+public class FpsView {
+    public bool hasBest;
+    public long bestMs;
+    public long lastMs;
+    public bool newBest;
+    public long plays;
+    public long clears;
+    public bool muted;
+    public bool showHint;
+    public bool autoPaused;
+    public string toast;
+    public bool toastGood;
+
+    public FpsView() {
+        this.toast = "";
+        this.toastGood = true;
     }
 }

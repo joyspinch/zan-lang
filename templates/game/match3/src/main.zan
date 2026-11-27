@@ -3,32 +3,57 @@ using System.Collections.Generic;
 using Gui;
 using Game.Foundation.Gui;
 using Game.Kit;
+using Game.Audio;
+using Game.Foundation;
 using Match3;
 
 public class Match3Loop : IGuiHostLoop {
     public Match3Game game;
     public Match3Hud hud;
+    public GameProfile profile;
+    public AudioBus bus;
+    public SfxBank sfx;
 
     public void Start(GuiHost host) {
+        // Saves live in the per-user app-data dir (ZanGames/match3), never the cwd.
+        this.profile = GameProfile.Open("match3");
+        this.bus = new AudioBus();
+        this.sfx = new SfxBank(this.bus);
+        Match3Loop.LoadSounds(this.sfx);
         this.game = Match3Game.Create((long)Window.GetTickMs());
-        this.hud = new Match3Hud(host, this.game);
+        this.hud = new Match3Hud(host, this.game, this.profile, this.sfx, this.bus);
         host.SetContentRoot(this.hud.root);
         this.hud.AttachPreparation(host);
     }
 
     public void Event(GuiHost host, int kind, int code) {
-        if (kind == 4) { // KeyDown
-            if (code == 27) { // ESC
-                host.RequestStop();
-            }
+        if (kind == 4 && this.hud != null) { // KeyDown: M mute, P/Esc pause, Enter/Space confirm
+            this.hud.Key(code);
         }
+    }
+
+    // Procedural SFX, tuned for a gem game: glassy select, soft swap whoosh and a
+    // coin chime per cascade level (coin1..coin4 climb in pitch).
+    public static void LoadSounds(SfxBank sfx) {
+        sfx.AddPresets(new string[] { "click", "error", "powerup", "explode", "success", "fail" });
+        sfx.AddSynth("select", SfxPresets.Select().WithSweep(880.0, 1320.0));
+        sfx.AddSynth("swap", SfxPresets.Select().WithWaveform(Waveform.Sine).WithSweep(520.0, 780.0)
+            .WithDuration(0.06));
+        sfx.AddSynth("coin1", SfxPresets.Coin().WithSweep(880.0, 1320.0));
+        sfx.AddSynth("coin2", SfxPresets.Coin().WithSweep(1046.0, 1568.0));
+        sfx.AddSynth("coin3", SfxPresets.Coin().WithSweep(1244.0, 1865.0));
+        sfx.AddSynth("coin4", SfxPresets.Coin().WithSweep(1480.0, 2217.0));
+        sfx.Warm();
     }
 
     public void FixedUpdate(GuiHost host, int dt) {
         this.game.Update((double)dt / 1000.0);
     }
 
-    public void Update(GuiHost host, int dt) { }
+    public void Update(GuiHost host, int dt) {
+        // Advances the audio bus (SFX throttle timers, BGM fades).
+        if (this.bus != null) { this.bus.Update(dt); }
+    }
 
     public void Render(GuiHost host, Canvas c, double alpha) {
         this.game.Render(c);
@@ -42,12 +67,16 @@ public class Match3Loop : IGuiHostLoop {
         if (previous == null) { return; }
         previous.StopPreparation();
         host.SetContentRoot(null);
+        if (this.profile != null) { this.profile.Save(); }
+        if (this.sfx != null) { this.sfx.Dispose(); }
     }
 }
 
 public class App {
     public static void Main() {
         GuiHost host = new GuiHost("Match-3 Puzzle - Zan Game", 720, 960, 60);
+        // UiDriver automation (ZAN_UI_SCRIPT / ZAN_UI_DUMP) must be enabled before the window shows.
+        host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a));
         host.Run(new Match3Loop());
     }
 }

@@ -4,6 +4,7 @@ using Gui;
 using Gui.Backend;
 using Gui.Widget;
 using Game.Kit;
+using Game.Foundation;
 
 public class {{NAME}} {
     static Form form;
@@ -14,6 +15,15 @@ public class {{NAME}} {
     static TrapCatSprite catSprite;
     static int level = 1;
     static long nextSeed;
+    // 外壳：档案（按难度记录胜场/连胜/最少步数）与程序化音效。
+    static GameProfile profile;
+    static AudioBus audioBus;
+    static SfxBank sfx;
+    static int sfxClock;
+    static int hopAt;
+    static bool roundSettled;
+    static bool lastNewBest;
+    static TrapCatResult lastResult;
 
     static Control RequireControl(string id) {
         Control control = root.Find(id);
@@ -31,6 +41,7 @@ public class {{NAME}} {
         App app = form.GetApp();
         ThemeSettings.Enable(app);
         UiDriver.Enable(app);
+        {{NAME}}.SetupShell();
         app.SetPartialFrames(true);
         #if ANDROID
         app.SetChromeVisible(false);
@@ -41,8 +52,9 @@ public class {{NAME}} {
         HtmlHandlers handlers = new HtmlHandlers();
         handlers.AddArg("cell", (string arg) => {{NAME}}.PickCell(arg));
         handlers.AddArg("difficulty", (string arg) => {{NAME}}.SetDifficulty(arg));
-        handlers.Add("new-round", () => {{NAME}}.NewRound());
+        handlers.Add("new-round", () => {{NAME}}.StartRound());
         handlers.Add("undo", () => {{NAME}}.Undo());
+        handlers.Add("mute", () => {{NAME}}.ToggleMute());
         string html = HtmlDocs.Read("src/TrapCat.html");
         root = Html.Load(app, html, handlers, "");
         root.Grow();
@@ -57,7 +69,10 @@ public class {{NAME}} {
         {{NAME}}.SetupBoardArt();
         undo = (Button){{NAME}}.RequireControl("Undo");
         {{NAME}}.NewRound();
-        form.FrameHook(() => {{NAME}}.PublishProbes());
+        form.FrameHook(() => {{NAME}}.OnFrame());
+        // M 静音：没被控件消费的按键都走应用级出口，不依赖焦点在谁身上
+        // （封掉的圆点会失焦）。
+        form.GetApp().OnUnhandledKey((int code) => { if (code == 77) { {{NAME}}.ToggleMute(); } });
         form.Run();
     }
 
@@ -73,30 +88,133 @@ public class {{NAME}} {
         bg.visible = false;
     }
 
+    // 档案与音效只在界面层：TrapCatSim/回放不碰文件与音频。
+    // 自动化脚本（ZAN_UI_SCRIPT）没显式指定存档目录时用内存档案，
+    // 跑回归不会改写玩家的真实纪录。
+    static void SetupShell() {
+        bool scripted = Environment.GetEnvironmentVariable("ZAN_UI_SCRIPT") != "";
+        bool explicitDir = Environment.GetEnvironmentVariable("ZAN_GAME_DATA_DIR") != "";
+        profile = scripted && !explicitDir ? GameProfile.InMemory() : GameProfile.Open("trap-cat");
+        audioBus = new AudioBus();
+        audioBus.SetSfxMuted(profile.Flag("muted", false));
+        sfx = new SfxBank(audioBus);
+        sfx.AddPresets(new string[] { "select", "error", "click", "success", "fail" });
+        // 猫的小跳：比 UI 点按更低更软的“嗒”。
+        sfx.AddSynth("hop", SfxPresets.Click().WithFrequency(540.0).WithDuration(0.020).WithGain(0.12));
+        // 开新局：柔和的三角波上扬，和胜利音同一家族但更短。
+        sfx.AddSynth("round", SfxPresets.Select().WithSweep(440.0, 660.0).WithDuration(0.080).WithGain(0.22));
+        sfx.Warm();
+        sfxClock = Window.GetTickMs();
+        hopAt = 0;
+        lastResult = TrapCatResult.Playing;
+    }
+
+    static void Sfx(string name) {
+        // AudioBus 的限频倒计时靠 Update 推进；Form 没有固定步长，就在播放前补上流逝时间。
+        int now = Window.GetTickMs();
+        int dt = now - sfxClock;
+        sfxClock = now;
+        if (dt > 0) { audioBus.Update(dt); }
+        sfx.Play(name);
+    }
+
+    static string Key(string stat) { return stat + "." + Convert.ToString(level); }
+
+    static void OnFrame() {
+        if (hopAt != 0 && Window.GetTickMs() - hopAt >= 0) {
+            hopAt = 0;
+            {{NAME}}.Sfx("hop");
+        }
+        {{NAME}}.PublishProbes();
+    }
+
+
+    static void ToggleMute() {
+        bool muted = !profile.Flag("muted", false);
+        profile.SetFlag("muted", muted);
+        audioBus.SetSfxMuted(muted);
+        if (!muted) { {{NAME}}.Sfx("click"); }
+        {{NAME}}.Refresh();
+    }
+
+    // 已经开始但没分出胜负就换局，算中途放弃：连胜清零。
+    static void AbandonRound() {
+        if (board.moves > 0 && !roundSettled) {
+            profile.Add({{NAME}}.Key("streak"), 0 - profile.Counter({{NAME}}.Key("streak")));
+            profile.Save();
+        }
+    }
+
     static void NewRound() {
         board.NewRound(level, nextSeed);
         nextSeed++;
+        roundSettled = false;
+        lastNewBest = false;
+        lastResult = TrapCatResult.Playing;
+        hopAt = 0;
         catSprite.Reset(board.cat, board.result);
         {{NAME}}.Refresh();
     }
 
+    static void StartRound() {
+        {{NAME}}.AbandonRound();
+        {{NAME}}.Sfx("round");
+        {{NAME}}.NewRound();
+    }
+
     static void SetDifficulty(string arg) {
+        {{NAME}}.AbandonRound();
         level = Convert.ToInt32(arg);
+        {{NAME}}.Sfx("round");
         {{NAME}}.NewRound();
     }
 
     static void PickCell(string arg) {
-        if (board.Block(Convert.ToInt32(arg))) {
-            catSprite.WalkTo(board.cat, board.result);
-            {{NAME}}.Refresh();
+        if (!board.Block(Convert.ToInt32(arg))) {
+            {{NAME}}.Sfx("error");
+            return;
         }
+        if (board.result == TrapCatResult.Playing) {
+            {{NAME}}.Sfx("select");
+            hopAt = Window.GetTickMs() + 110;
+        }
+        catSprite.WalkTo(board.cat, board.result);
+        {{NAME}}.Settle();
+        {{NAME}}.Refresh();
+    }
+
+    // 每局只结算一次：胜负后悔棋可以复盘，但不会重复计分。
+    static void Settle() {
+        if (board.result == lastResult) { return; }
+        lastResult = board.result;
+        if (board.result == TrapCatResult.Playing) { return; }
+        if (board.result == TrapCatResult.Trapped) { {{NAME}}.Sfx("success"); }
+        else { {{NAME}}.Sfx("fail"); }
+        if (roundSettled) { return; }
+        roundSettled = true;
+        profile.Add("plays", 1);
+        if (board.result == TrapCatResult.Trapped) {
+            profile.Add({{NAME}}.Key("wins"), 1);
+            profile.Add({{NAME}}.Key("streak"), 1);
+            bool streakBest = profile.SubmitBest({{NAME}}.Key("beststreak"), profile.Counter({{NAME}}.Key("streak")));
+            bool movesBest = profile.SubmitLowest({{NAME}}.Key("fewest"), (long)board.moves);
+            lastNewBest = movesBest || (streakBest && profile.Counter({{NAME}}.Key("streak")) > 1);
+        } else {
+            profile.Add({{NAME}}.Key("streak"), 0 - profile.Counter({{NAME}}.Key("streak")));
+        }
+        profile.Save();
     }
 
     static void Undo() {
-        if (board.Undo()) {
-            catSprite.Reset(board.cat, board.result);
-            {{NAME}}.Refresh();
+        if (!board.Undo()) {
+            {{NAME}}.Sfx("error");
+            return;
         }
+        {{NAME}}.Sfx("click");
+        hopAt = 0;
+        lastResult = board.result;
+        catSprite.Reset(board.cat, board.result);
+        {{NAME}}.Refresh();
     }
 
     static void Refresh() {
@@ -106,13 +224,15 @@ public class {{NAME}} {
             if (i == board.cat) { state = "cat"; }
             cell.SetClassIn("open blocked cat", state);
             cell.Text = "";
-            cell.Disabled = board.result != TrapCatResult.Playing || board.blocked[i] || i == board.cat;
+            // 对局中已封点/猫所在点仍可点，点了给“不行”的提示音；分出胜负后整盘锁定。
+            cell.Disabled = board.result != TrapCatResult.Playing;
         }
         for (int i = 0; i < 3; i++) {
             Control mode = {{NAME}}.RequireControl("Level" + Convert.ToString(i));
             mode.SetClassIn("selected", i == level ? "selected" : "");
         }
         undo.Disabled = board.moves == 0;
+        {{NAME}}.RefreshRecords();
         {{NAME}}.RequireControl("Moves").SetProp("text", Convert.ToString(board.moves) + " 步");
         string headline = "猫还在寻找出口";
         string hint = "点击空圆点封路，它会沿最短路线走一步。";
@@ -120,6 +240,7 @@ public class {{NAME}} {
         if (board.result == TrapCatResult.Trapped) {
             headline = "围住了！这只猫服气了";
             hint = "你用了 " + Convert.ToString(board.moves) + " 步切断所有出口，再来一局？";
+            if (lastNewBest) { headline = "围住了！新纪录"; }
             resultClass = "won";
         } else if (board.result == TrapCatResult.Escaped) {
             headline = "哎呀，猫溜走了";
@@ -132,6 +253,22 @@ public class {{NAME}} {
         form.GetApp().RequestRedraw();
     }
 
+    static void RefreshRecords() {
+        long wins = profile.Counter({{NAME}}.Key("wins"));
+        long streak = profile.Counter({{NAME}}.Key("streak"));
+        string text = "胜 " + Convert.ToString(wins)
+            + " · 连胜 " + Convert.ToString(streak) + "（最佳 " + Convert.ToString(profile.Best({{NAME}}.Key("beststreak"))) + "）";
+        if (profile.HasBest({{NAME}}.Key("fewest"))) {
+            text = text + " · 最少 " + Convert.ToString(profile.Best({{NAME}}.Key("fewest"))) + " 步";
+        }
+        {{NAME}}.RequireControl("Records").SetProp("text", text);
+        {{NAME}}.RequireControl("NewBest").visible = board.result == TrapCatResult.Trapped && lastNewBest;
+        bool muted = profile.Flag("muted", false);
+        Button mute = (Button){{NAME}}.RequireControl("Mute");
+        mute.Text = muted ? "音效 关" : "音效 开";
+        mute.SetClassIn("selected", muted ? "" : "selected");
+    }
+
     static void PublishProbes() {
         if (!UiDriver.Active()) { return; }
         UiDriver.SetProbe("trap.moves", Convert.ToString(board.moves));
@@ -139,6 +276,8 @@ public class {{NAME}} {
         UiDriver.SetProbe("trap.level", Convert.ToString(level));
         string result = board.result == TrapCatResult.Trapped ? "won" : (board.result == TrapCatResult.Escaped ? "lost" : "playing");
         UiDriver.SetProbe("trap.result", result);
+        UiDriver.SetProbe("trap.muted", profile.Flag("muted", false) ? "true" : "false");
+        UiDriver.SetProbe("trap.wins", Convert.ToString(profile.Counter({{NAME}}.Key("wins"))));
         for (int i = 0; i < TrapCatBoard.Count; i++) {
             UiDriver.SetProbe("id.Cell" + Convert.ToString(i), Convert.ToString(cells[i].wid));
         }

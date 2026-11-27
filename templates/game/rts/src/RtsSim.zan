@@ -5,8 +5,8 @@ using Game.Foundation;
 // 地形与初始军团固定，种子不参与。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；
 // Bot 是模糊测试用的机器人。改了寻路或避障参数后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 无操作；1 + 格子下标（32 列 × 18 行，按行）= 点击该格中心下达行军令；
-// 1000 = 征召装甲营。
+// 输入编码：0 无操作；1 + 格子下标（32 列 × 18 行，按行）= 右键该格中心，选中单位行军；
+// 1000 = 征召装甲营；2000 = 全选蓝军；3000 + 格子下标 = 以该格为中心框选 5×5 格。
 public class RtsSim : IReplaySim {
     RtsBattle battle;
 
@@ -21,6 +21,14 @@ public class RtsSim : IReplaySim {
                                (cell / cols) * battle.cellSize + battle.cellSize / 2);
         } else if (input == 1000) {
             battle.SpawnReinforcements();
+        } else if (input == 2000) {
+            battle.SelectAll();
+        } else if (input >= 3000 && input < 3000 + cols * rows) {
+            int cell = input - 3000;
+            double cx = (double)((cell % cols) * battle.cellSize + battle.cellSize / 2);
+            double cy = (double)((cell / cols) * battle.cellSize + battle.cellSize / 2);
+            double half = (double)(battle.cellSize * 5 / 2);
+            battle.SelectInRect(cx - half, cy - half, cx + half, cy + half, false);
         }
         battle.TickSimulation(0.05);
     }
@@ -28,16 +36,37 @@ public class RtsSim : IReplaySim {
     public int StateChecksum() {
         StateHasher h = new StateHasher();
         h.Int(battle.units.Count).Int(battle.supplyUsed).Bool(battle.hasTarget)
-         .Real(battle.targetX).Real(battle.targetY);
+         .Real(battle.targetX).Real(battle.targetY)
+         .Int(battle.minerals).Int(battle.blueLost).Int(battle.redLost);
         for (int i = 0; i < battle.units.Count; i = i + 1) {
             RtsUnit u = battle.units[i];
-            h.Real(u.X).Real(u.Y);
+            h.Real(u.X).Real(u.Y).Int(u.Hp).Bool(u.Selected);
         }
         return h.Value();
     }
 
     [Invariant]
     public bool SupplyWithinCap() { return battle.supplyUsed <= battle.supplyMax; }
+
+    // 伤亡账平：出场 - 阵亡 = 在场（两军各自）；人口 = 在场蓝军
+    [Invariant]
+    public bool LossesBalance() {
+        return battle.blueFielded - battle.blueLost == battle.Alive(0)
+            && battle.redFielded - battle.redLost == battle.Alive(1)
+            && battle.supplyUsed == battle.Alive(0);
+    }
+
+    // 帧末不留残血为零的单位（阵亡当帧就清出场）
+    [Invariant]
+    public bool NoDeadOnField() {
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            if (battle.units[i].Hp <= 0) { return false; }
+        }
+        return true;
+    }
+
+    [Invariant]
+    public bool MineralsNonNegative() { return battle.minerals >= 0; }
 
     // 每个单位都在避障器里有槽位（拿不到槽位的单位原地不动）
     [Invariant]
@@ -48,23 +77,25 @@ public class RtsSim : IReplaySim {
         return true;
     }
 
-    // 单位不会被推出战场（留 64px 余量给避障推挤）
+    // 单位不会被推出战场（边缘是墙，RtsBattle 每帧钳回）
     [Invariant]
     public bool UnitsOnField() {
         for (int i = 0; i < battle.units.Count; i = i + 1) {
             RtsUnit u = battle.units[i];
-            if (u.X < -64 || u.Y < -64 || u.X > battle.worldWidth + 64 || u.Y > battle.worldHeight + 64) {
+            if (u.X < 0.0 || u.Y < 0.0 || u.X > (double)battle.worldWidth || u.Y > (double)battle.worldHeight) {
                 return false;
             }
         }
         return true;
     }
 
-    // 机器人：隔一阵在随机格子下达行军令，偶尔征召
+    // 机器人：隔一阵全选或框选、在随机格子下达行军令，偶尔征召
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
         if (roll < 4) { return 1 + rng.NextBelow(32 * 18); }
         if (roll < 6) { return 1000; }
+        if (roll < 8) { return 2000; }
+        if (roll < 10) { return 3000 + rng.NextBelow(32 * 18); }
         return 0;
     }
 }

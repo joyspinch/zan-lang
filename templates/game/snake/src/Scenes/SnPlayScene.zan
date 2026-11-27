@@ -6,16 +6,68 @@ using Game.Foundation.Gui;
 
 public class SnPlayScene : HtmlScene {
     SnGame g;
+    // 音效靠"看状态变化"触发（视图层差分），模拟代码不碰音频。
+    int lastScore;
+    int lastKills;
+    bool lastFever;
+    bool lastRecord;
+    bool lastBoost;
+    bool lastOver;
+    bool wasActive;
+    bool leaving;  // 已请求暂停：切场景前（同帧剩余固定步）不再步进
 
     SnPlayScene(SnGame g) { this.g = g; }
 
     override void OnEnter(Control root) {
-        this.g.StartGame(Window.GetTickMs());
+        int now = Window.GetTickMs();
+        if (this.g.resuming) {
+            // 续局：时钟对齐到现在，暂停期间不补步；冲刺键状态清零，
+            // 免得暂停时按着的键/鼠标在回来后"粘住"。
+            this.g.resuming = false;
+            this.g.lastTick = now;
+            this.g.boostHeld = false;
+            this.g.boostKey = false;
+        } else {
+            this.g.StartGame(now);
+            // 首局给完整操作说明，之后只短暂提醒暂停/静音键。
+            if (this.g.prof.games == 0) {
+                this.g.hintText = "鼠标转向 · 按住左键/空格冲刺 · 吃豆攒狂热 · P/Esc 暂停 · M 静音";
+                this.g.hintUntil = now + 9000;
+            } else {
+                this.g.hintText = "P/Esc 暂停 · M 静音";
+                this.g.hintUntil = now + 2500;
+            }
+        }
+        this.lastScore = this.g.score.Get();
+        this.lastKills = this.g.kills;
+        this.lastFever = this.g.feverOn;
+        this.lastRecord = this.g.wasRecord;
+        this.lastBoost = false;
+        this.lastOver = this.g.over;
+        this.leaving = false;
+        this.wasActive = this.router.Host().WindowActive();
         this.g.EnterHud(this.router.Host().App());
     }
 
     override void OnExit() { this.g.ExitHud(); }
-    override void Update(int dtMs) { this.g.SyncHud(Window.GetTickMs()); }
+
+    override void Update(int dtMs) {
+        if (this.g.shell != null) { this.g.shell.Tick(dtMs); }
+        // 失焦/最小化自动暂停（只认"有焦点 → 失焦"的边沿：启动时窗口
+        // 尚未拿到焦点不算）。演示模式供无人值守截图，不暂停。
+        bool active = this.router.Host().WindowActive();
+        if (this.wasActive && !active && !this.g.over && !this.g.demo) { this.Pause(); }
+        this.wasActive = active;
+        this.g.SyncHud(Window.GetTickMs());
+    }
+
+    void Pause() {
+        if (this.g.over || this.leaving) { return; }
+        this.leaving = true;
+        this.g.boostHeld = false;
+        this.g.boostKey = false;
+        this.router.Go("pause");
+    }
 
     override void Event(int kind, int key) {
         GuiHost host = this.router.Host();
@@ -31,7 +83,9 @@ public class SnPlayScene : HtmlScene {
         } else if (kind == 3 && key == 0) {
             this.g.boostHeld = false;
         } else if (kind == 4) {
-            if (key == 27) { this.router.Go("menu"); }
+            // Esc 不再直接退出对局：先暂停，退出从暂停面板走。
+            if (key == 27 || key == 80) { this.Pause(); }
+            if (key == 77 && this.g.shell != null) { this.g.shell.ToggleMute(); }
             if (key == 32) { this.g.boostKey = true; }
         } else if (kind == 5) {
             if (key == 32) { this.g.boostKey = false; }
@@ -39,8 +93,40 @@ public class SnPlayScene : HtmlScene {
     }
 
     override void FixedStep(int dtMs) {
+        if (this.leaving) { return; }
         this.g.Tick(Window.GetTickMs());
+        this.Feedback();
         if (this.g.over) { this.router.Go("over"); }
+    }
+
+    // 状态差分 → 音效。优先级：阵亡 > 击败 > 狂热 > 新纪录 > 吞豆。
+    void Feedback() {
+        SnShell sh = this.g.shell;
+        int score = this.g.score.Get();
+        bool boost = (this.g.boostHeld || this.g.boostKey) && this.g.me.length > 12 && !this.g.over;
+        if (sh != null) {
+            if (this.g.over && !this.lastOver) {
+                sh.Play("death");
+            } else if (this.g.over) {
+                // 已阵亡：等切到结算，不再出声
+            } else if (this.g.kills > this.lastKills) {
+                sh.Play("kill");
+            } else if (this.g.feverOn && !this.lastFever) {
+                sh.Play("fever");
+            } else if (this.g.wasRecord && !this.lastRecord) {
+                sh.Play("success", 0.7, 400);
+            } else if (score > this.lastScore) {
+                // 磁吸会一口气吸进一串豆：限频 70ms，听起来是连击而不是噪声。
+                sh.Play("eat", 0.8, 70);
+            }
+            if (boost && !this.lastBoost) { sh.Play("boost", 1.0, 250); }
+        }
+        this.lastScore = score;
+        this.lastKills = this.g.kills;
+        this.lastFever = this.g.feverOn;
+        this.lastRecord = this.g.wasRecord;
+        this.lastBoost = boost;
+        this.lastOver = this.g.over;
     }
 
     override void Render(Canvas c, double alpha) {

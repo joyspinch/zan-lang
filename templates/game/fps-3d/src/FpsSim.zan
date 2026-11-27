@@ -8,7 +8,10 @@ using Game.Render3D;
 // 录制（见 README）。
 //
 // 输入编码：0 保持上一帧的按键；1 + 按键位（1 前、2 后、4 左、8 右、16 上升、32 下沉）
-// = 本帧按住的键；100 + 方向（0..7，45° 一档）= 鼠标朝该方向拖 20 像素转视角。
+// = 本帧按住的键；100 + 方向（0..7，45° 一档）= 鼠标朝该方向拖 20 像素转视角；
+// 200 = 左键点击，标记准星对准的目标方块（用上一帧的拾取结果，与游戏里一致）。
+// 计时随固定步长推进，全部标记后冻结；声音、档案与窗口都在 main.zan 的
+// 应用层，仿真不碰。
 public class FpsSim : IReplaySim {
     FpsGame game;
 
@@ -28,6 +31,8 @@ public class FpsSim : IReplaySim {
             int dx = d == 0 || d == 1 || d == 7 ? 20 : (d == 3 || d == 4 || d == 5 ? -20 : 0);
             int dy = d == 1 || d == 2 || d == 3 ? 20 : (d == 5 || d == 6 || d == 7 ? -20 : 0);
             game.OnMouseMove((float)dx, (float)dy);
+        } else if (input == 200) {
+            game.TryTag();
         }
         game.Tick(1.0 / 60.0);
     }
@@ -38,6 +43,7 @@ public class FpsSim : IReplaySim {
         h.Real(p.X).Real(p.Y).Real(p.Z).Real(game.controller.Yaw).Real(game.controller.Pitch)
          .Bool(game.targetHit);
         if (game.targetHit) { h.Real(game.hitDistance); }
+        h.Int(game.TaggedMask()).Bool(game.complete).Long((long)game.elapsedMs);
         return h.Value();
     }
 
@@ -49,9 +55,22 @@ public class FpsSim : IReplaySim {
     [Invariant]
     public bool HitDistanceValid() { return !game.targetHit || (game.hitDistance > 0 && game.hitDistance < 1000); }
 
-    // 机器人：时不时换一组按键，偶尔拖动鼠标转视角
+    // 标记计数与位图一致；全部标记 ⇔ 完成
+    [Invariant]
+    public bool TagCountConsistent() {
+        int n = 0;
+        for (int i = 0; i < game.targetCount; i = i + 1) { if (game.tagged[i]) { n = n + 1; } }
+        return n == game.taggedCount && game.complete == (n == game.targetCount);
+    }
+
+    // 计时非负且有限（1200 帧 = 20 秒，上限给足余量）
+    [Invariant]
+    public bool TimerValid() { return game.elapsedMs >= 0.0 && game.elapsedMs < 100000000.0; }
+
+    // 机器人：时不时换一组按键，偶尔拖动鼠标转视角、点左键标记
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
+        if (roll < 3) { return 200; }
         if (roll < 4) { return 1 + rng.NextBelow(64); }
         if (roll < 10) { return 100 + rng.NextBelow(8); }
         return 0;

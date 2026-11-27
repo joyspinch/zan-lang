@@ -75,9 +75,21 @@ public class SurvivorGame {
     public int killCount;
     public double gameTime;
 
+    // 生死：接触伤害后有短暂无敌（hurtTimer > 0），血量归零即阵亡、逻辑冻结
+    public bool dead;
+    public double hurtTimer;
+
+    // 表现层事件计数（只增不减）：界面层逐帧比对差值来播音效，仿真本身不碰音频
+    public int shotCount;
+    public int hitCount;
+    public int gemCount;
+    public int hurtCount;
+
     // 输入移动轴向
     public double moveX;
     public double moveY;
+    // 按住的方向键（W S A D 与 上 下 左 右 各一位），松开一个键时另一个仍按着就继续走
+    bool[] held;
 
     // 武器自动开火计时
     public double shootCooldown;
@@ -108,6 +120,13 @@ public class SurvivorGame {
         this.expToNext = 50;
         this.killCount = 0;
         this.gameTime = 0.0;
+        this.dead = false;
+        this.hurtTimer = 0.0;
+        this.shotCount = 0;
+        this.hitCount = 0;
+        this.gemCount = 0;
+        this.hurtCount = 0;
+        this.held = new bool[8];
 
         this.moveX = 0.0;
         this.moveY = 0.0;
@@ -146,21 +165,62 @@ public class SurvivorGame {
         gems.Add(new Gem(x, y, exp));
     }
 
+    // 键码 → held 下标：0..3 = W S A D，4..7 = 上 下 左 右；其余 -1
+    static int KeySlot(int keyCode) {
+        if (keyCode == 87) { return 0; }
+        if (keyCode == 83) { return 1; }
+        if (keyCode == 65) { return 2; }
+        if (keyCode == 68) { return 3; }
+        if (keyCode == 38) { return 4; }
+        if (keyCode == 40) { return 5; }
+        if (keyCode == 37) { return 6; }
+        if (keyCode == 39) { return 7; }
+        return -1;
+    }
+
+    // 是否是移动键（界面层据此决定按键归谁）
+    public static bool IsMoveKey(int keyCode) { return SurvivorGame.KeySlot(keyCode) >= 0; }
+
+    void ApplyHeld() {
+        bool up = held[0] || held[4];
+        bool down = held[1] || held[5];
+        bool left = held[2] || held[6];
+        bool right = held[3] || held[7];
+        moveX = (right ? 1.0 : 0.0) - (left ? 1.0 : 0.0);
+        moveY = (down ? 1.0 : 0.0) - (up ? 1.0 : 0.0);
+    }
+
     public void OnKeyDown(int keyCode) {
-        if (keyCode == 87 || keyCode == 38) { moveY = -1.0; } // W or UP
-        if (keyCode == 83 || keyCode == 40) { moveY = 1.0; }  // S or DOWN
-        if (keyCode == 65 || keyCode == 37) { moveX = -1.0; } // A or LEFT
-        if (keyCode == 68 || keyCode == 39) { moveX = 1.0; }  // D or RIGHT
+        int slot = SurvivorGame.KeySlot(keyCode);
+        if (slot < 0) { return; }
+        held[slot] = true;
+        ApplyHeld();
     }
 
     public void OnKeyUp(int keyCode) {
-        if ((keyCode == 87 || keyCode == 38) && moveY < 0.0) { moveY = 0.0; }
-        if ((keyCode == 83 || keyCode == 40) && moveY > 0.0) { moveY = 0.0; }
-        if ((keyCode == 65 || keyCode == 37) && moveX < 0.0) { moveX = 0.0; }
-        if ((keyCode == 68 || keyCode == 39) && moveX > 0.0) { moveX = 0.0; }
+        int slot = SurvivorGame.KeySlot(keyCode);
+        if (slot < 0) { return; }
+        held[slot] = false;
+        ApplyHeld();
     }
 
+    // 暂停/失焦时松开全部方向键（抬键事件可能丢在别的窗口里）
+    public void ReleaseKeys() {
+        for (int i = 0; i < 8; i = i + 1) { held[i] = false; }
+        moveX = 0.0;
+        moveY = 0.0;
+    }
+
+    // 生命比例 0..100（界面血条用）
+    public int HpPercent() { return playerMaxHp > 0 ? playerHp * 100 / playerMaxHp : 0; }
+
     public void Tick(double dt) {
+        // 阵亡后世界冻结，只让震屏与跳字收尾
+        if (dead) {
+            shake.Update(dt);
+            floatingTexts.Update(dt);
+            return;
+        }
         // 顿帧检查：打击凝滞时暂停动力学步进
         if (hitStop.Update(dt)) {
             shake.Update(dt);
@@ -171,6 +231,7 @@ public class SurvivorGame {
         shake.Update(dt);
         floatingTexts.Update(dt);
         gameTime = gameTime + dt;
+        if (hurtTimer > 0.0) { hurtTimer = hurtTimer - dt; }
 
         // 玩家移动与边界约束
         playerX = playerX + moveX * playerSpeed * dt;
@@ -188,6 +249,9 @@ public class SurvivorGame {
         }
 
         // 怪物波次生成
+        // 怪潮随局时加密：0.8 秒一只起步，每过 1 秒缩短 4 毫秒，最快 0.22 秒一只
+        spawnCooldown = 0.8 - gameTime * 0.004;
+        if (spawnCooldown < 0.22) { spawnCooldown = 0.22; }
         spawnTimer = spawnTimer + dt;
         if (spawnTimer >= spawnCooldown) {
             spawnTimer = 0.0;
@@ -220,6 +284,22 @@ public class SurvivorGame {
                 e.y = e.y + (dy / dist) * e.speed * dt;
             }
 
+            // 接触伤害：贴身即掉血，之后 0.6 秒无敌，怪物被弹开一段
+            if (!dead && hurtTimer <= 0.0 && dist < e.radius + 14.0) {
+                playerHp = playerHp - 10;
+                hurtTimer = 0.6;
+                hurtCount = hurtCount + 1;
+                shake.AddTrauma(0.35);
+                if (dist > 0.5) {
+                    e.x = e.x - (dx / dist) * 40.0;
+                    e.y = e.y - (dy / dist) * 40.0;
+                }
+                if (playerHp <= 0) {
+                    playerHp = 0;
+                    dead = true;
+                }
+            }
+
             // 碰撞子弹判定
             for (int j = 0; j < bullets.Count; j = j + 1) {
                 Bullet b = bullets[j];
@@ -231,6 +311,7 @@ public class SurvivorGame {
                 if (bdist <= e.radius + 6.0) {
                     // 命中
                     b.active = false;
+                    hitCount = hitCount + 1;
                     bool isCrit = (killCount % 4 == 0);
                     int dmg = isCrit ? b.damage * 2 : b.damage;
                     e.hp = e.hp - dmg;
@@ -251,6 +332,9 @@ public class SurvivorGame {
             }
         }
 
+        // 本帧阵亡：不再拾取宝石（升级回满血会让"已阵亡"自相矛盾）
+        if (dead) { return; }
+
         // 宝石拾取与升级结算
         for (int i = 0; i < gems.Count; i = i + 1) {
             Gem g = gems[i];
@@ -264,6 +348,7 @@ public class SurvivorGame {
                 g.y = g.y + (gy / gdist) * 350.0 * dt;
                 if (gdist < 15.0) {
                     g.active = false;
+                    gemCount = gemCount + 1;
                     exp = exp + g.expValue;
                     floatingTexts.SpawnHeal(playerX, playerY - 20.0, g.expValue);
                     if (exp >= expToNext) {
@@ -272,6 +357,9 @@ public class SurvivorGame {
                         expToNext = (int)((double)expToNext * 1.4);
                         playerMaxHp = playerMaxHp + 20;
                         playerHp = playerMaxHp;
+                        // 升级强化：射速提高 12%（下限 0.12 秒一发）
+                        shootCooldown = shootCooldown * 0.88;
+                        if (shootCooldown < 0.12) { shootCooldown = 0.12; }
                         shake.AddTrauma(0.25);
                     }
                 }
@@ -300,7 +388,17 @@ public class SurvivorGame {
             double len = Math.Sqrt(dirX * dirX + dirY * dirY);
             if (len > 0.0) {
                 double speed = 450.0;
-                bullets.Add(new Bullet(playerX, playerY, (dirX / len) * speed, (dirY / len) * speed, 25));
+                shotCount = shotCount + 1;
+                double vx = (dirX / len) * speed;
+                double vy = (dirY / len) * speed;
+                // 复用失效子弹槽位：每 0.35 秒一发，不复用的话列表随局时无限增长
+                for (int i = 0; i < bullets.Count; i = i + 1) {
+                    if (!bullets[i].active) {
+                        bullets[i] = new Bullet(playerX, playerY, vx, vy, 25);
+                        return;
+                    }
+                }
+                bullets.Add(new Bullet(playerX, playerY, vx, vy, 25));
             }
         }
     }
@@ -317,8 +415,9 @@ public class SurvivorGame {
         else if (edge == 2) { sx = 1280.0 * offset; sy = 740.0; }
         else { sx = -20.0; sy = 720.0 * offset; }
 
-        int hp = 40 + level * 5;
-        double spd = 70.0 + (level > 5 ? 20.0 : 0.0);
+        // 血量随等级与局时成长（每 20 秒 +6），站桩不升级也躲不过后期怪潮
+        int hp = 40 + level * 5 + ((int)(gameTime / 20.0)) * 6;
+        double spd = 70.0 + (level > 5 ? 20.0 : 0.0) + (gameTime > 120.0 ? 15.0 : 0.0);
         int col = (level % 2 == 0) ? unchecked((int)0xFFCF1322) : unchecked((int)0xFF531DAB);
         // 复用已阵亡的槽位（与 SpawnGem 同法）：每 0.8 秒刷一只，不复用的话列表无限增长
         for (int i = 0; i < enemies.Count; i = i + 1) {
@@ -336,21 +435,32 @@ public class SurvivorGame {
         int shakeX = (int)shake.OffsetX;
         int shakeY = (int)shake.OffsetY;
 
-        // 背景
-        c.DrawRect(0, 0, 1280, 720, unchecked((int)0xFF14141E), 1);
+        // 背景：暗色石板地 + 稀疏网格（随震屏一起抖，地面才有"被震动"的实感）
+        c.FillVGrad(0, 0, 1280, 720, unchecked((int)0xFF1B1A26), unchecked((int)0xFF121119));
+        int gridCol = unchecked((int)0xFF201F2D);
+        for (int gx = (shakeX % 64) - 64; gx < 1280; gx = gx + 64) { c.FillRect(gx, 0, 1, 720, gridCol); }
+        for (int gy = (shakeY % 64) - 64; gy < 720; gy = gy + 64) { c.FillRect(0, gy, 1280, 1, gridCol); }
 
-        // 绘制经验宝石
+        // 经验宝石：青色菱形 + 光晕
         for (int i = 0; i < gems.Count; i = i + 1) {
             Gem g = gems[i];
             if (!g.active) { continue; }
-            c.DrawRect((int)g.x + shakeX - 4, (int)g.y + shakeY - 4, 8, 8, unchecked((int)0xFF00E5FF), 1);
+            int gx2 = (int)g.x + shakeX;
+            int gy2 = (int)g.y + shakeY;
+            c.FillRadial(gx2, gy2, 12, unchecked((int)0xFF00E5FF), 90);
+            SurvivorGame.Diamond(c, gx2, gy2, 6, unchecked((int)0xFF00B8D4));
+            SurvivorGame.Diamond(c, gx2, gy2 - 1, 3, unchecked((int)0xFFB2F5FF));
         }
 
-        // 绘制子弹
+        // 子弹：发光弹丸
         for (int i = 0; i < bullets.Count; i = i + 1) {
             Bullet b = bullets[i];
             if (!b.active) { continue; }
-            c.DrawRect((int)b.x + shakeX - 3, (int)b.y + shakeY - 3, 6, 6, unchecked((int)0xFFFFFF00), 1);
+            int bx = (int)b.x + shakeX;
+            int by = (int)b.y + shakeY;
+            c.FillRadial(bx, by, 10, unchecked((int)0xFFFFD54F), 110);
+            c.FillCircle(bx, by, 4, unchecked((int)0xFFFFE082));
+            c.FillCircle(bx, by, 2, unchecked((int)0xFFFFFFFF));
         }
 
         // 使用 YSortQueue 按底部 Y 坐标排好序后，从上向下渲染遮挡
@@ -373,8 +483,19 @@ public class SurvivorGame {
                 // 渲染玩家自身（绿色武士）
                 int px = (int)playerX + shakeX;
                 int py = (int)playerY + shakeY;
-                c.DrawRect(px - 14, py - 20, 28, 28, unchecked((int)0xFF52C41A), 1);
-                c.DrawRect(px - 10, py - 16, 20, 10, unchecked((int)0xFFFFFFFF), 1); // 眼睛
+                // 受击无敌期间闪烁变红，阵亡后整体变暗红
+                bool flash = hurtTimer > 0.0 && ((int)(hurtTimer * 20.0) % 2 == 0);
+                int body = dead ? unchecked((int)0xFF5C1A1A)
+                    : (flash ? unchecked((int)0xFFFF4D4F) : unchecked((int)0xFF52C41A));
+                // 落影 + 斗篷身体 + 头盔 + 目镜（朝移动方向偏一点）
+                c.FillRoundRect(px - 15, py + 4, 30, 9, 5, unchecked((int)0x66000000));
+                int dark = dead ? unchecked((int)0xFF3A1010) : unchecked((int)0xFF2E7D32);
+                c.FillRoundRect(px - 14, py - 14, 28, 22, 9, dark);
+                c.FillRoundRect(px - 12, py - 13, 24, 18, 8, body);
+                c.FillCircle(px, py - 18, 10, dark);
+                c.FillCircle(px, py - 19, 8, body);
+                int look = moveX > 0.1 ? 2 : (moveX < -0.1 ? -2 : 0);
+                c.FillRoundRect(px - 6 + look, py - 22, 12, 4, 2, unchecked((int)0xFFE8FFE8));
             } else {
                 // 渲染怪物
                 int eIdx = entityId - 1;
@@ -382,12 +503,34 @@ public class SurvivorGame {
                     Enemy e = enemies[eIdx];
                     int ex = (int)e.x + shakeX;
                     int ey = (int)e.y + shakeY;
-                    c.DrawRect(ex - 12, ey - 16, 24, 24, e.color, 1);
+                    // 史莱姆：落影 + 暗边 + 本体 + 高光 + 两只眼
+                    c.FillRoundRect(ex - 13, ey + 4, 26, 8, 4, unchecked((int)0x55000000));
+                    c.FillCircle(ex, ey - 4, 13, SurvivorGame.Shade(e.color));
+                    c.FillCircle(ex, ey - 5, 11, e.color);
+                    c.FillCircle(ex - 4, ey - 10, 3, unchecked((int)0x99FFFFFF));
+                    c.FillCircle(ex - 4, ey - 3, 2, unchecked((int)0xFF101018));
+                    c.FillCircle(ex + 4, ey - 3, 2, unchecked((int)0xFF101018));
                     // Health is a retained Progress in SurvivorHud.
                 }
             }
         }
 
         // Status, enemy health and floating numbers are composed by SurvivorHud.
+    }
+
+    // 扫描线菱形（Canvas 无多边形填充）。
+    static void Diamond(Canvas c, int cx, int cy, int r, int color) {
+        for (int dy = -r; dy <= r; dy = dy + 1) {
+            int half = r - (dy < 0 ? -dy : dy);
+            if (half > 0) { c.FillRect(cx - half, cy + dy, half * 2, 1, color); }
+        }
+    }
+
+    static int Shade(int argb) {
+        int a = (argb >> 24) & 255;
+        int r = ((argb >> 16) & 255) * 55 / 100;
+        int g = ((argb >> 8) & 255) * 55 / 100;
+        int b = (argb & 255) * 55 / 100;
+        return (a << 24) | (r << 16) | (g << 8) | b;
     }
 }

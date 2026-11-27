@@ -36,10 +36,22 @@ public class FpsGame {
     public bool keyUp;
     public bool keyDown;
 
-    // 场景中建筑的 AABB 包围盒（用于射线检测）
+    // 场景中目标方块的 AABB 包围盒（用于射线检测）
     public Vector3[] targetMins;
     public Vector3[] targetMaxs;
     public int targetCount;
+
+    // 目标：用准星点中（标记）全部方块，计时越短越好
+    public const float TagRange = 30.0f;
+    public bool[] tagged;
+    public int taggedCount;
+    // 准星当前对准的目标下标（-1 = 没有）
+    public int aimIndex;
+    // 本局用时（毫秒，只随固定步长推进；全部标记后冻结）
+    public double elapsedMs;
+    public bool complete;
+    // 每个目标的场景节点（标记后换材质）；无头时为空
+    SceneNode[] targetNodes;
 
     public FpsGame() {
         this.camera = new Camera3D();
@@ -78,15 +90,103 @@ public class FpsGame {
         this.keyUp = false;
         this.keyDown = false;
 
-        this.targetCount = 3;
-        this.targetMins = new Vector3[3];
-        this.targetMaxs = new Vector3[3];
         // 准星拾取用的包围盒是游戏数据（不依赖 GPU）：构造时就摆好，无头回放
         // （FpsSim）与上传网格前的第一帧都能做射线检测
-        float[] posX = new float[3] { -4.0f, 0.0f, 4.0f };
-        for (int i = 0; i < 3; i = i + 1) {
-            this.targetMins[i] = new Vector3(posX[i] - 1.0f, 0.0f, -1.0f);
-            this.targetMaxs[i] = new Vector3(posX[i] + 1.0f, 2.0f, 1.0f);
+        this.targetCount = FpsGame.TargetX().Length;
+        this.targetMins = new Vector3[this.targetCount];
+        this.targetMaxs = new Vector3[this.targetCount];
+        float[] tx = FpsGame.TargetX();
+        float[] ty = FpsGame.TargetY();
+        float[] tz = FpsGame.TargetZ();
+        float[] ts = FpsGame.TargetSize();
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            float h = ts[i] * 0.5f;
+            this.targetMins[i] = new Vector3(tx[i] - h, ty[i] - h, tz[i] - h);
+            this.targetMaxs[i] = new Vector3(tx[i] + h, ty[i] + h, tz[i] + h);
+        }
+        this.tagged = new bool[this.targetCount];
+        this.targetNodes = new SceneNode[this.targetCount];
+        this.Reset();
+    }
+
+    // 目标方块布局（中心点与边长，米）：前方三栋原有方块 + 散布四周、
+    // 有的悬空（要 Space 升空或抬头）的五块。
+    public static float[] TargetX() { return new float[8] { -4.0f, 0.0f, 4.0f, -13.0f, 12.0f, 0.0f, -14.0f, 13.0f }; }
+    public static float[] TargetY() { return new float[8] { 1.0f, 1.0f, 1.0f, 1.0f, 1.5f, 6.0f, 4.0f, 0.75f }; }
+    public static float[] TargetZ() { return new float[8] { 0.0f, 0.0f, 0.0f, -10.0f, -8.0f, -14.0f, 10.0f, 14.0f }; }
+    public static float[] TargetSize() { return new float[8] { 2.0f, 2.0f, 2.0f, 2.0f, 3.0f, 2.0f, 2.0f, 1.5f }; }
+    // 未标记时的颜色（0xRRGGBB）；标记后统一变暗为石板灰
+    public static int[] TargetColor() {
+        return new int[8] { 0xFF4D4F, 0x40A9FF, 0x52C41A, 0xFAAD14, 0xB37FEB, 0x13C2C2, 0xFF7A45, 0xF759AB };
+    }
+
+    // 回到出生点、清空标记与计时（重开一局不用重建场景）
+    public void Reset() {
+        this.controller.Position = new Vector3(0.0f, 1.8f, 12.0f);
+        this.controller.Yaw = 0.0f;
+        this.controller.Pitch = 0.0f;
+        this.controller.SyncToCamera(this.camera);
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            this.tagged[i] = false;
+            this.PaintTarget(i);
+        }
+        this.taggedCount = 0;
+        this.aimIndex = -1;
+        this.elapsedMs = 0.0;
+        this.complete = false;
+        this.targetHit = false;
+        this.hitDistance = 0.0f;
+        this.ReleaseKeys();
+    }
+
+    public void ReleaseKeys() {
+        this.keyFwd = false;
+        this.keyBwd = false;
+        this.keyLeft = false;
+        this.keyRight = false;
+        this.keyUp = false;
+        this.keyDown = false;
+    }
+
+    // 标记准星对准的目标。返回：0 = 没对准/太远，1 = 已标记过，
+    // 2 = 标记成功，3 = 标记成功且全部完成。
+    public int TryTag() {
+        if (this.complete) { return 0; }
+        if (this.aimIndex < 0 || this.hitDistance > FpsGame.TagRange) { return 0; }
+        if (this.tagged[this.aimIndex]) { return 1; }
+        this.tagged[this.aimIndex] = true;
+        this.taggedCount = this.taggedCount + 1;
+        this.PaintTarget(this.aimIndex);
+        if (this.taggedCount >= this.targetCount) {
+            this.complete = true;
+            return 3;
+        }
+        return 2;
+    }
+
+    // 已标记位图（回放校验用）
+    public int TaggedMask() {
+        int m = 0;
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            if (this.tagged[i]) { m = m | (1 << i); }
+        }
+        return m;
+    }
+
+    void PaintTarget(int i) {
+        if (this.targetNodes == null || this.targetNodes[i] == null) { return; }
+        Material m = this.targetNodes[i].Material;
+        if (this.tagged[i]) {
+            m.Red = 0.22f; m.Green = 0.26f; m.Blue = 0.3f;
+            m.EmissiveRed = 0.0f; m.EmissiveGreen = 0.0f; m.EmissiveBlue = 0.0f;
+        } else {
+            int c = FpsGame.TargetColor()[i];
+            m.Red = (float)((c >> 16) & 255) / 255.0f;
+            m.Green = (float)((c >> 8) & 255) / 255.0f;
+            m.Blue = (float)(c & 255) / 255.0f;
+            m.EmissiveRed = m.Red * 0.25f;
+            m.EmissiveGreen = m.Green * 0.25f;
+            m.EmissiveBlue = m.Blue * 0.25f;
         }
     }
 
@@ -115,21 +215,20 @@ public class FpsGame {
         Mesh3D cubeMesh = Primitives3D.CreateCube(2.0f, 2.0f, 2.0f);
         int cubeKey = canvas.MeshUpload(cubeMesh);
 
-        // 摆放 3 栋不同颜色的立方体目标
-        float[] posX = new float[3] { -4.0f, 0.0f, 4.0f };
-        float[] colR = new float[3] { 1.0f, 0.2f, 0.2f };
-        float[] colG = new float[3] { 0.2f, 0.6f, 0.8f };
-        float[] colB = new float[3] { 0.2f, 0.9f, 0.2f };
-
-        for (int i = 0; i < 3; i = i + 1) {
-            SceneNode b = new SceneNode("Building_" + Convert.ToString(i));
+        // 摆放目标方块（立方体网格 2m，按边长缩放）
+        float[] tx = FpsGame.TargetX();
+        float[] ty = FpsGame.TargetY();
+        float[] tz = FpsGame.TargetZ();
+        float[] ts = FpsGame.TargetSize();
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            SceneNode b = new SceneNode("Target_" + Convert.ToString(i));
+            float k = ts[i] * 0.5f;
             b.MeshKey = cubeKey;
-            b.BoundsRadius = 2.0f;
-            b.Local = new Transform3D(new Vector3(posX[i], 1.0f, 0.0f), Quaternion.Identity, Vector3.One);
+            b.BoundsRadius = 2.0f * k;
+            b.Local = new Transform3D(new Vector3(tx[i], ty[i], tz[i]), Quaternion.Identity, new Vector3(k, k, k));
             b.Material = new Material();
-            b.Material.Red = colR[i];
-            b.Material.Green = colG[i];
-            b.Material.Blue = colB[i];
+            this.targetNodes[i] = b;
+            this.PaintTarget(i);
             rootNode.Children.Add(b);
         }
     }
@@ -168,6 +267,7 @@ public class FpsGame {
 
         targetHit = false;
         hitDistance = 999999.0f;
+        aimIndex = -1;
 
         for (int i = 0; i < targetCount; i = i + 1) {
             float dist = 0.0f;
@@ -175,9 +275,17 @@ public class FpsGame {
                 if (dist < hitDistance) {
                     hitDistance = dist;
                     targetHit = true;
+                    aimIndex = i;
                 }
             }
         }
+
+        if (!complete) { elapsedMs = elapsedMs + dt * 1000.0; }
+    }
+
+    // 准星对准的是可以标记的目标（未标记且在射程内）
+    public bool AimTaggable() {
+        return aimIndex >= 0 && !tagged[aimIndex] && hitDistance <= FpsGame.TagRange;
     }
 
     public void Render(Canvas c) {
@@ -209,31 +317,31 @@ public class FpsGame {
             Draw3DLine(c, vp, coord, 0.0f, -20.0f, coord, 0.0f, 20.0f, unchecked((int)0xFF2A2A3D));
         }
 
-        // 2. 绘制 3 栋建筑的 12 条棱线
-        float[] posX = new float[3] { -4.0f, 0.0f, 4.0f };
-        int[] colors = new int[3] { unchecked((int)0xFFFF4D4F), unchecked((int)0xFF40A9FF), unchecked((int)0xFF52C41A) };
-
-        for (int b = 0; b < 3; b = b + 1) {
-            float cx = posX[b];
-            int col = colors[b];
+        // 2. 绘制每个目标方块的 12 条棱线（已标记的变暗）
+        for (int b = 0; b < targetCount; b = b + 1) {
+            Vector3 lo = targetMins[b];
+            Vector3 hi = targetMaxs[b];
+            int col = tagged[b] ? unchecked((int)0xFF3A4450) : (unchecked((int)0xFF000000) | FpsGame.TargetColor()[b]);
+            float x0 = lo.X; float y0 = lo.Y; float z0 = lo.Z;
+            float x1 = hi.X; float y1 = hi.Y; float z1 = hi.Z;
 
             // 底面 4 条边
-            Draw3DLine(c, vp, cx - 1.0f, 0.0f, -1.0f, cx + 1.0f, 0.0f, -1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 0.0f, -1.0f, cx + 1.0f, 0.0f,  1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 0.0f,  1.0f, cx - 1.0f, 0.0f,  1.0f, col);
-            Draw3DLine(c, vp, cx - 1.0f, 0.0f,  1.0f, cx - 1.0f, 0.0f, -1.0f, col);
+            Draw3DLine(c, vp, x0, y0, z0, x1, y0, z0, col);
+            Draw3DLine(c, vp, x1, y0, z0, x1, y0, z1, col);
+            Draw3DLine(c, vp, x1, y0, z1, x0, y0, z1, col);
+            Draw3DLine(c, vp, x0, y0, z1, x0, y0, z0, col);
 
             // 顶面 4 条边
-            Draw3DLine(c, vp, cx - 1.0f, 2.0f, -1.0f, cx + 1.0f, 2.0f, -1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 2.0f, -1.0f, cx + 1.0f, 2.0f,  1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 2.0f,  1.0f, cx - 1.0f, 2.0f,  1.0f, col);
-            Draw3DLine(c, vp, cx - 1.0f, 2.0f,  1.0f, cx - 1.0f, 2.0f, -1.0f, col);
+            Draw3DLine(c, vp, x0, y1, z0, x1, y1, z0, col);
+            Draw3DLine(c, vp, x1, y1, z0, x1, y1, z1, col);
+            Draw3DLine(c, vp, x1, y1, z1, x0, y1, z1, col);
+            Draw3DLine(c, vp, x0, y1, z1, x0, y1, z0, col);
 
             // 4 条垂直立柱
-            Draw3DLine(c, vp, cx - 1.0f, 0.0f, -1.0f, cx - 1.0f, 2.0f, -1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 0.0f, -1.0f, cx + 1.0f, 2.0f, -1.0f, col);
-            Draw3DLine(c, vp, cx + 1.0f, 0.0f,  1.0f, cx + 1.0f, 2.0f,  1.0f, col);
-            Draw3DLine(c, vp, cx - 1.0f, 0.0f,  1.0f, cx - 1.0f, 2.0f,  1.0f, col);
+            Draw3DLine(c, vp, x0, y0, z0, x0, y1, z0, col);
+            Draw3DLine(c, vp, x1, y0, z0, x1, y1, z0, col);
+            Draw3DLine(c, vp, x1, y0, z1, x1, y1, z1, col);
+            Draw3DLine(c, vp, x0, y0, z1, x0, y1, z1, col);
         }
     }
 

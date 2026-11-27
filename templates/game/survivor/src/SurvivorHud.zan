@@ -14,6 +14,12 @@ public class SurvivorHud {
     public Progress experience;
     public Label kills;
     public Label time;
+    public Progress health;
+    public Label healthText;
+    public Label best;
+    public Label sound;
+    public Label hint;
+    public SurvivorMenu menu;
     public List<Progress> enemyHealth;
     public List<Label> floating;
     public HudLayer layer;
@@ -22,7 +28,7 @@ public class SurvivorHud {
 
     public SurvivorHud(Gui.App app, SurvivorGame game) {
         this.game = game;
-        app.UseCss(SurvivorHud.Css());
+        app.UseCss(SurvivorHud.Css() + SurvivorMenu.Css());
         this.root = new Panel("survivor-hud");
         this.root.Class = "survivor-hud";
         this.enemyHealth = new List<Progress>();
@@ -52,27 +58,68 @@ public class SurvivorHud {
         this.time = new Label("");
         this.time.Class = "survivor-time";
         bar.Add(this.time);
+        this.health = new Progress(100, 1);
+        this.health.Class = "survivor-health";
+        this.health.showIndicator = false;
+        bar.Add(this.health);
+        this.healthText = new Label("");
+        this.healthText.Class = "survivor-health-text";
+        bar.Add(this.healthText);
         this.root.Add(bar);
+        this.best = new Label("");
+        this.best.Class = "survivor-meta survivor-best";
+        this.root.Add(this.best);
+        this.sound = new Label("");
+        this.sound.Class = "survivor-meta survivor-sound";
+        this.root.Add(this.sound);
+        this.hint = new Label("WASD / ARROWS move  |  weapon fires automatically  |  P / ESC pause  |  M mute");
+        this.hint.Class = "survivor-hint";
+        this.hint.SetShown(false);
+        this.root.Add(this.hint);
+        // 标题/暂停/结算面板最后加入，盖在状态栏与跳字之上
+        this.menu = new SurvivorMenu();
+        this.root.Add(this.menu.root);
         this.layer = new HudLayer();
         this.layer.Add(this.root);
         // This template's world still uses raw Canvas coordinates. Commit the
-        // same full-canvas rectangle before the first event, not first Paint.
-        this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
+        // content rectangle (below the native title-bar chrome, where the world
+        // viewport starts) before the first event, not first Paint — a 0-based
+        // rectangle put the status bar half under the title bar.
+        this.layer.SetBounds(0, app.ContentTop(), app.canvas.Width(), app.canvas.Height() - app.ContentTop());
         this.layer.Bind(app);
         this.SyncState(app);
+    }
+
+    // 重开一局：换上新的游戏对象（血条与跳字控件按槽位复用）
+    public void SetGame(SurvivorGame game) { this.game = game; }
+
+    // 存档相关的元信息：最好成绩与静音状态
+    public void SetMeta(string bestText, bool muted) {
+        this.best.SetProp("text", bestText);
+        this.sound.SetProp("text", muted ? "[M] SOUND OFF" : "[M] SOUND ON");
+        this.sound.Class = muted ? "survivor-meta survivor-sound survivor-muted" : "survivor-meta survivor-sound";
+    }
+
+    // 新手提示（首局开头几秒）
+    public void ShowHint(bool shown) { this.hint.SetShown(shown); }
+
+    public static string Clock(double seconds) {
+        int mins = (int)seconds / 60;
+        int secs = (int)seconds % 60;
+        return (mins < 10 ? "0" : "") + Convert.ToString(mins) + ":" + (secs < 10 ? "0" : "") + Convert.ToString(secs);
     }
 
     public void SyncState(Gui.App app) {
         this.level.SetProp("text", "LV. " + Convert.ToString(game.level));
         this.kills.SetProp("text", "KILLS: " + Convert.ToString(game.killCount));
-        int mins = (int)game.gameTime / 60;
-        int secs = (int)game.gameTime % 60;
-        this.time.SetProp("text", "TIME: " + (mins < 10 ? "0" : "")
-            + Convert.ToString(mins) + ":" + (secs < 10 ? "0" : "") + Convert.ToString(secs));
+        this.time.SetProp("text", "TIME: " + SurvivorHud.Clock(game.gameTime));
+        this.health.SetPercent(game.HpPercent());
+        this.health.Class = game.HpPercent() <= 30 ? "survivor-health survivor-health-low" : "survivor-health";
+        this.healthText.SetProp("text", Convert.ToString(game.playerHp) + "/" + Convert.ToString(game.playerMaxHp));
         this.experience.SetPercent(game.expToNext > 0 ? game.exp * 100 / game.expToNext : 0);
         this.SyncEnemyHealth();
         this.SyncFloating();
-        this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
+        this.layer.SetBounds(0, app.ContentTop(), app.canvas.Width(), app.canvas.Height() - app.ContentTop());
         this.layer.SetVisible(app.window.GetHandle() == 0 || app.window.IsVisible());
     }
 
@@ -85,9 +132,14 @@ public class SurvivorHud {
             this.healthLayer.Add(health);
             this.enemyHealth.Add(health);
         }
-        for (int i = 0; i < this.enemyHealth.Count; i = i + 1) {
-            Enemy enemy = game.enemies[i];
+        // 重开一局后新游戏的槽位可能比控件少：多出的控件隐藏备用
+        int live = game.enemies.Count;
+        for (int i = live; i < this.enemyHealth.Count; i = i + 1) {
+            this.enemyHealth[i].SetShown(false);
+        }
+        for (int i = 0; i < live; i = i + 1) {
             Progress health = this.enemyHealth[i];
+            Enemy enemy = game.enemies[i];
             health.SetShown(enemy.active && enemy.hp < enemy.maxHp);
             if (!health.visible) { continue; }
             health.SetPercent(enemy.maxHp > 0 ? enemy.hp * 100 / enemy.maxHp : 0);
@@ -133,12 +185,26 @@ public class SurvivorHud {
             + ".survivor-status label,.survivor-floating{position:absolute;padding:0;margin:0;"
             + "border:0;background:transparent;vertical-align:top;text-align:left}"
             + ".survivor-status label{top:14dpx;height:30dpx;font-size:20dpx}"
-            + ".survivor-level{left:30dpx;width:80dpx;color:#ffc53d}"
-            + ".survivor-kills{left:550dpx;width:200dpx;color:#ff4d4f}"
-            + ".survivor-time{left:750dpx;width:240dpx;color:#fff}"
+            + ".survivor-level{left:20dpx;width:80dpx;color:#ffc53d}"
+            + ".survivor-health-text{left:690dpx;width:110dpx;color:#e8e8f0}"
+            + ".survivor-kills{left:820dpx;width:180dpx;color:#ff4d4f}"
+            + ".survivor-time{left:1020dpx;width:240dpx;color:#fff}"
+            + ".survivor-meta,.survivor-hint{position:absolute;padding:0;margin:0;border:0;"
+            + "background:transparent;vertical-align:top}"
+            + ".survivor-meta{top:56dpx;height:24dpx;font-size:15dpx;color:#8c8ca6}"
+            + ".survivor-best{left:20dpx;width:600dpx;text-align:left}"
+            + ".survivor-sound{left:1060dpx;width:200dpx;text-align:right;color:#00e5ff}"
+            + ".survivor-muted{color:#ff4d4f}"
+            + ".survivor-hint{left:140dpx;top:620dpx;width:1000dpx;height:32dpx;font-size:18dpx;"
+            + "text-align:center;color:#ffc53d;background:rgba(10,10,16,0.75)}"
             + "progress.survivor-experience,progress.survivor-enemy-health{position:absolute;"
             + "padding:0;margin:0;border:0;border-radius:0;background:transparent;gap:0}"
-            + "progress.survivor-experience{left:110dpx;top:18dpx;width:400dpx;height:14dpx}"
+            + "progress.survivor-health{position:absolute;padding:0;margin:0;border:0;border-radius:0;"
+            + "background:transparent;gap:0;left:460dpx;top:18dpx;width:220dpx;height:14dpx}"
+            + ".survivor-health .progress-track{height:14dpx;background:#3a1f24;border-radius:0}"
+            + ".survivor-health .progress-fill{height:100%;background:#52c41a;border-radius:0}"
+            + ".survivor-health-low .progress-fill{background:#ff4d4f}"
+            + "progress.survivor-experience{left:100dpx;top:18dpx;width:340dpx;height:14dpx}"
             + "progress.survivor-enemy-health{width:24dpx;height:3dpx}"
             + ".survivor-experience .progress-track{height:14dpx;background:#333344;border-radius:0}"
             + ".survivor-experience .progress-fill{height:100%;background:#00e5ff;border-radius:0}"

@@ -1,58 +1,50 @@
 using System;
-using System.IO;
-using Gui;
-using Game.Kit;
-using Game.Foundation.Gui;
+using Game.Foundation;
 
+// 玩家档案：最高分 / 最长长度 / 总局数 / 累计击败，外加静音偏好。
+// 落盘交给 Game.Foundation.GameProfile（用户应用数据目录下的
+// ZanGames/snake/，原子写 + .bak 回退），绝不写工作目录。
+// 字段是读出来的快照，供菜单/结算/对局内"新纪录"判定直接读；
+// 写入一律走 Record / SetMuted。
 public class Profile {
+    GameProfile store;
     int high;
     int longest;
     int games;
     int kills;
-    // false = 只在内存里（无头回放不写存档文件）
-    bool persist = true;
 
-    static string Path() { return "snake_save.txt"; }
+    // 正式游戏：打开 ZanGames/snake 档案（解析不到用户目录时退回内存）。
+    static Profile Open() { return Profile.Wrap(GameProfile.Open("snake")); }
 
-    // 无头回放 / 模糊测试用：从零开始、不读不写存档
-    static Profile InMemory() {
+    // 无头回放 / 模糊测试用：从零开始、不读不写存档。
+    static Profile InMemory() { return Profile.Wrap(GameProfile.InMemory()); }
+
+    static Profile Wrap(GameProfile gp) {
         Profile p = new Profile();
-        p.high = 0; p.longest = 10; p.games = 0; p.kills = 0;
-        p.persist = false;
+        p.store = gp;
+        p.high = (int)gp.Best("score");
+        p.longest = gp.HasBest("length") ? (int)gp.Best("length") : 10;
+        p.games = (int)gp.Counter("games");
+        p.kills = (int)gp.Counter("kills");
         return p;
     }
-    static int ParseInt(string s, int start) {
-        int i = start; int v = 0; bool any = false;
-        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
-        if (!any) { return 0; }
-        return v;
-    }
-    static int ReadKey(List<string> lines, string key, int fb) {
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string ln = lines[i]; int eq = -1; 
-            for (int j = 0; j < ln.Length; j = j + 1) { if (ln[j] == 61) { eq = j; j = ln.Length; } }
-            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+
+    // 记一局。返回本局是否刷新最高分（0 分不算纪录）。
+    bool Record(int score, int length, int roundKills) {
+        this.games = this.games + 1;
+        this.kills = this.kills + roundKills;
+        this.store.Add("games", 1);
+        this.store.Add("kills", roundKills);
+        bool best = false;
+        if (score > 0 && this.store.SubmitBest("score", score)) {
+            best = true;
+            this.high = score;
         }
-        return fb;
+        if (this.store.SubmitBest("length", length) && length > this.longest) { this.longest = length; }
+        this.store.Save();
+        return best;
     }
-    static Profile Load() {
-        Profile p = new Profile();
-        p.high = 0; p.longest = 10; p.games = 0; p.kills = 0;
-        if (File.Exists(Profile.Path())) {
-            List<string> lines = File.ReadAllLines(Profile.Path());
-            p.high = Profile.ReadKey(lines, "high", 0);
-            p.longest = Profile.ReadKey(lines, "longest", 10);
-            p.games = Profile.ReadKey(lines, "games", 0);
-            p.kills = Profile.ReadKey(lines, "kills", 0);
-        }
-        return p;
-    }
-    void Save() {
-        if (!this.persist) { return; }
-        string s = "high=" + this.high + "\nlongest=" + this.longest
-            + "\ngames=" + this.games + "\nkills=" + this.kills + "\n";
-        File.WriteAllText(Profile.Path(), s);
-    }
+
+    bool Muted() { return this.store.Flag("muted", false); }
+    void SetMuted(bool muted) { this.store.SetFlag("muted", muted); }
 }
-
-// 能量糖果实体：尺寸与分值正相关。

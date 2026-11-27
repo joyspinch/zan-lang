@@ -3,12 +3,34 @@ using System.Collections.Generic;
 using Game.Tactics;
 using Game.Core;
 
-// 战场仿真：流场寻路 + RVO 群体避障 + 单位与资源，不碰界面。Program 每 50ms 调
+// 一道行军令：各自一张流场（选中的那一队共用），互不覆盖——先派出的分队不会
+// 因为后一道命令改道。没有单位再引用它时随 ARC 释放。
+public class RtsOrder {
+    public FlowField field;
+    public double x;
+    public double y;
+    public double arriveRadius;
+}
+
+// 本帧的一发射击（界面画曳光、按需出声；仿真只记录，不碰音频）。
+public class RtsShot {
+    public double fromX;
+    public double fromY;
+    public double toX;
+    public double toY;
+    public int team;
+    public int type;
+}
+
+// 战场仿真：流场寻路 + RVO 群体避障 + 交火与伤亡，不碰界面。Program 每 50ms 调
 // TickSimulation 并读它画图；RtsSim 用同一份逻辑做无头回放与机器人模糊
 // （docs/ZAN_STANDARD.md S26/S27）。
+//
+// 规则：蓝军（玩家）从左岸出发，经中央裂谷峡口进攻；红军守右岸，发现蓝军就迎击，
+// 但不越过裂谷右沿（RedBankX），脱战后回驻防点。双方单位自动向射程内最近的敌人
+// 开火。一方全灭即分胜负（Outcome）；时限由界面层计。
 public class RtsBattle {
     // 引擎系统
-    public FlowField flowField;
     public RvoSimulator rvoSim;
     public List<RtsUnit> units;
 
@@ -17,136 +39,349 @@ public class RtsBattle {
     public int worldHeight = 600;
     public int cellSize = 32;
 
-    // 目标集结点
+    // 最近一道行军令的集结点（界面画标记）
     public double targetX = 512.0;
     public double targetY = 300.0;
     public bool hasTarget = false;
 
-    // 资源统计
+    // 资源统计：征召一个装甲营花晶矿，击毁敌军有赏金
     public int minerals = 1500;
     public int power = 100;
-    public int supplyUsed = 24;
+    public int supplyUsed = 0;
     public int supplyMax = 100;
+    public int reinforceCost = 400;
+    public int killBounty = 20;
+
+    // 战况：本帧射击与阵亡（每帧开头清空），累计伤亡
+    public List<RtsShot> shots;
+    public List<RtsUnit> fallen;
+    public int blueLost = 0;
+    public int redLost = 0;
+    public int blueFielded = 0;
+    public int redFielded = 0;
+
+    // 红军行为参数
+    public double redAggroRange = 240.0;
+    public double redBankX = 600.0;
+
+    int nextId = 1;
 
     public RtsBattle() {
-        int cols = worldWidth / cellSize;
-        int rows = worldHeight / cellSize;
-        flowField = FlowField.Create(cols, rows, cellSize);
         rvoSim = RvoSimulator.Create(256, 48);
         units = new List<RtsUnit>();
-        // 构造中央关隘峡谷障碍，孵化初始军团
-        SetupTerrain();
+        shots = new List<RtsShot>();
+        fallen = new List<RtsUnit>();
         SpawnInitialArmies();
     }
 
-    public void SetupTerrain() {
+    // 一张带中央裂谷地形的流场（在第 7~12 行留出峡口，其余是代价 255 的悬崖）。
+    public FlowField NewTerrainField() {
         int cols = worldWidth / cellSize;
         int rows = worldHeight / cellSize;
-
-        // 设置峡谷山体障碍物（在中间留有通道峡口）
+        FlowField f = FlowField.Create(cols, rows, cellSize);
         int midCol = cols / 2;
         for (int r = 0; r < rows; r = r + 1) {
-            // 在中间第 8~12 行留出通路峡口，其余设为不可通行悬崖 (代价 255)
-            if (r < 7 || r > 12) {
-                flowField.SetCost(midCol, r, (byte)255);
-                flowField.SetCost(midCol + 1, r, (byte)255);
+            if (IsCanyonRow(r)) {
+                f.SetCost(midCol, r, (byte)255);
+                f.SetCost(midCol + 1, r, (byte)255);
             }
         }
+        return f;
+    }
+
+    // 该行的裂谷格是悬崖（峡口以外）。
+    public bool IsCanyonRow(int row) { return row < 7 || row > 12; }
+
+    RtsUnit AddUnit(int type, int team, double sx, double sy) {
+        RtsUnit u = RtsUnit.Create(nextId, type, team, sx, sy);
+        nextId = nextId + 1;
+        int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
+        u.RvoSlot = slot;
+        units.Add(u);
+        if (team == 0) {
+            blueFielded = blueFielded + 1;
+            supplyUsed = supplyUsed + 1;
+        } else {
+            redFielded = redFielded + 1;
+        }
+        return u;
     }
 
     public void SpawnInitialArmies() {
-        // 在左侧基地生成蓝方兵团。
+        // 左侧基地：蓝方兵团。
         // 间距要大于单位直径（步兵 18、坦克 32），否则编队糊成一块——
         // 这是贴图版和矢量版的共同要求：矢量圆小，贴图大，占位一样。
         for (int i = 0; i < 40; i = i + 1) {
             int uType = (i % 6 == 0) ? 1 : 0;  // 少量坦克，大量步兵
-            double sx = 60.0 + (double)((i % 8) * 40);
-            double sy = 120.0 + (double)((i / 8) * 44);
-            RtsUnit u = RtsUnit.Create(i + 1, uType, 0, sx, sy);
-            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
-            u.RvoSlot = slot;
-            units.Add(u);
+            AddUnit(uType, 0, 60.0 + (double)((i % 8) * 40), 120.0 + (double)((i / 8) * 44));
+        }
+        // 右岸：红方守军，坦克压在阵中
+        for (int i = 0; i < 54; i = i + 1) {
+            int uType = (i % 4 == 1) ? 1 : 0;
+            AddUnit(uType, 1, 680.0 + (double)((i % 6) * 50), 70.0 + (double)((i / 6) * 58));
         }
     }
 
-    // 征召一个装甲营（10 辆）。人口上限之内才征召——不设上限的话连点按钮会让单位数
-    // 冲破 RVO 避障器的 256 个槽位，新单位拿不到槽位、原地不动。
-    public void SpawnReinforcements() {
-        if (supplyUsed + 10 > supplyMax) { return; }
-        int baseId = units.Count + 1;
+    // 征召一个装甲营（10 辆）：花晶矿，并受人口上限约束——不设上限的话连点按钮会让
+    // 单位数冲破 RVO 避障器的 256 个槽位，新单位拿不到槽位、原地不动。
+    public bool CanReinforce() {
+        return supplyUsed + 10 <= supplyMax && minerals >= reinforceCost;
+    }
+
+    public bool SpawnReinforcements() {
+        if (!CanReinforce()) { return false; }
+        minerals = minerals - reinforceCost;
         for (int i = 0; i < 10; i = i + 1) {
-            double sx = 40.0 + (double)(i * 24);
-            double sy = 80.0;
-            RtsUnit u = RtsUnit.Create(baseId + i, 1, 0, sx, sy);
-            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
-            u.RvoSlot = slot;
-            units.Add(u);
+            AddUnit(1, 0, 40.0 + (double)(i * 24), 80.0);
         }
-        supplyUsed = supplyUsed + 10;
+        return true;
     }
 
-    public void CommandMove(int mouseX, int mouseY) {
-        targetX = (double)mouseX;
-        targetY = (double)mouseY;
-        hasTarget = true;
+    // ---- 选择 ----
 
-        // 1. 刷新宏观流场寻路目标
-        int targetCol = (int)targetX / cellSize;
-        int targetRow = (int)targetY / cellSize;
-        flowField.SetTarget(targetCol, targetRow);
-        flowField.Rebuild();
+    public void ClearSelection() {
+        for (int i = 0; i < units.Count; i = i + 1) { units[i].Selected = false; }
+    }
 
-        // 2. 选中的所有单位（默认全部蓝方单位）设置朝向目标的期望速度
+    // 框选矩形内的蓝军（additive = 追加到现有选择）。返回选中数。
+    public int SelectInRect(double x0, double y0, double x1, double y1, bool additive) {
+        double lx = Math.Min(x0, x1);
+        double hx = Math.Max(x0, x1);
+        double ly = Math.Min(y0, y1);
+        double hy = Math.Max(y0, y1);
+        if (!additive) { ClearSelection(); }
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit u = units[i];
-            u.Selected = true;
+            if (u.Team != 0) { continue; }
+            if (u.X + u.Radius >= lx && u.X - u.Radius <= hx && u.Y + u.Radius >= ly && u.Y - u.Radius <= hy) {
+                u.Selected = true;
+            }
         }
+        return SelectedCount();
+    }
+
+    // 点选：点中的蓝军单位（没点中就清空选择，除非 additive）。返回选中数。
+    public int SelectAt(double x, double y, bool additive) {
+        RtsUnit best = null;
+        double bestD = 0.0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.Team != 0) { continue; }
+            double dx = u.X - x;
+            double dy = u.Y - y;
+            double d = dx * dx + dy * dy;
+            double reach = u.Radius + 6.0;
+            if (d <= reach * reach && (best == null || d < bestD)) {
+                best = u;
+                bestD = d;
+            }
+        }
+        if (!additive) { ClearSelection(); }
+        if (best != null) { best.Selected = true; }
+        return SelectedCount();
+    }
+
+    public int SelectAll() {
+        for (int i = 0; i < units.Count; i = i + 1) { units[i].Selected = units[i].Team == 0; }
+        return SelectedCount();
+    }
+
+    public int SelectedCount() {
+        int n = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Selected) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // ---- 指令 ----
+
+    // 选中的蓝军向 (mouseX, mouseY) 行军。没有选中单位时不下令，返回 0。
+    public int CommandMove(int mouseX, int mouseY) {
+        int n = SelectedCount();
+        if (n == 0) { return 0; }
+        double tx = Math.Max(4.0, Math.Min((double)mouseX, (double)worldWidth - 4.0));
+        double ty = Math.Max(4.0, Math.Min((double)mouseY, (double)worldHeight - 4.0));
+        targetX = tx;
+        targetY = ty;
+        hasTarget = true;
+
+        // 这一队共用一张流场：宏观路径绕开裂谷
+        RtsOrder o = new RtsOrder();
+        o.field = NewTerrainField();
+        o.field.SetTarget((int)tx / cellSize, (int)ty / cellSize);
+        o.field.Rebuild();
+        o.x = tx;
+        o.y = ty;
+        // 大部队挤不进同一个点：到达半径随人数放大
+        o.arriveRadius = 24.0 + 6.0 * Math.Sqrt((double)n);
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Selected) { units[i].Order = o; }
+        }
+        return n;
+    }
+
+    // ---- 战况 ----
+
+    public int Alive(int team) {
+        int n = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Team == team) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 0 = 交战中，1 = 蓝军胜（红军全灭），2 = 红军胜（蓝军全灭）。
+    public int Outcome() {
+        if (Alive(1) == 0) { return 1; }
+        if (Alive(0) == 0) { return 2; }
+        return 0;
+    }
+
+    // 射程内最近的活着的敌人（没有返回 null）。
+    public RtsUnit NearestEnemy(RtsUnit u, double reach) {
+        RtsUnit best = null;
+        double bestD = reach * reach;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit e = units[i];
+            if (e.Team == u.Team || e.Hp <= 0) { continue; }
+            double dx = e.X - u.X;
+            double dy = e.Y - u.Y;
+            double d = dx * dx + dy * dy;
+            if (d <= bestD) {
+                best = e;
+                bestD = d;
+            }
+        }
+        return best;
+    }
+
+    void SteerBlue(RtsUnit u) {
+        RtsOrder o = u.Order;
+        if (o == null) {
+            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+            return;
+        }
+        double dx = o.x - u.X;
+        double dy = o.y - u.Y;
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+        if (dist < o.arriveRadius) {
+            // 已到达集结点：转为驻守
+            u.Order = null;
+            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+            return;
+        }
+        float fx;
+        float fy;
+        o.field.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
+        // 若流场有效，按流场方向全速前进；否则直指目标
+        double vx;
+        double vy;
+        if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
+            vx = (double)fx * u.Speed;
+            vy = (double)fy * u.Speed;
+        } else {
+            vx = (dx / dist) * u.Speed;
+            vy = (dy / dist) * u.Speed;
+        }
+        rvoSim.SetPrefVelocity(u.RvoSlot, vx, vy);
+    }
+
+    void SteerRed(RtsUnit u) {
+        RtsUnit t = NearestEnemy(u, redAggroRange);
+        double gx = u.HomeX;
+        double gy = u.HomeY;
+        if (t != null) {
+            double tdx = t.X - u.X;
+            double tdy = t.Y - u.Y;
+            if (Math.Sqrt(tdx * tdx + tdy * tdy) <= u.Range * 0.85) {
+                rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+                return;
+            }
+            gx = t.X;
+            gy = t.Y;
+        }
+        // 守军不过裂谷：目标点钳在右岸
+        if (gx < redBankX) { gx = redBankX; }
+        double dx = gx - u.X;
+        double dy = gy - u.Y;
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+        if (dist < 8.0) {
+            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+            return;
+        }
+        rvoSim.SetPrefVelocity(u.RvoSlot, (dx / dist) * u.Speed, (dy / dist) * u.Speed);
     }
 
     public void TickSimulation(double dt) {
-        if (!hasTarget) { return; }
+        shots.Clear();
+        fallen.Clear();
 
-        // 1. 根据 FlowField 向量场为每个 Agent 注入宏观期望速度
+        // 1. 意图：蓝军按流场行军，红军迎击/回防
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit u = units[i];
             if (u.RvoSlot < 0) { continue; }
-
-            double dx = targetX - u.X;
-            double dy = targetY - u.Y;
-            double distToTarget = Math.Sqrt(dx * dx + dy * dy);
-
-            if (distToTarget < 25.0) {
-                // 已到达集结点，期望速度归零
-                rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
-            } else {
-                float fx;
-                float fy;
-                flowField.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
-
-                // 若流场有效，按流场方向全速前进；否则直指目标
-                double vx;
-                double vy;
-                if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
-                    vx = (double)fx * u.Speed;
-                    vy = (double)fy * u.Speed;
-                } else {
-                    vx = (dx / distToTarget) * u.Speed;
-                    vy = (dy / distToTarget) * u.Speed;
-                }
-                rvoSim.SetPrefVelocity(u.RvoSlot, vx, vy);
-            }
+            if (u.Team == 0) { SteerBlue(u); } else { SteerRed(u); }
         }
 
         // 2. 微观 RVO2 互斥推挤物理步进计算
         rvoSim.Step(dt);
 
-        // 3. 将 RVO 物理位置同步回逻辑单位
+        // 3. 将 RVO 物理位置同步回逻辑单位。战场边缘是墙：避障推挤只在单位之间，
+        //    大部队压向边缘时会把外圈挤出界，这里钳回场内（同步写回避障器）。
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit u = units[i];
             if (u.RvoSlot >= 0) {
-                u.X = rvoSim.GetX(u.RvoSlot);
-                u.Y = rvoSim.GetY(u.RvoSlot);
+                int slot = u.RvoSlot;
+                double maxX = (double)worldWidth - u.Radius;
+                double maxY = (double)worldHeight - u.Radius;
+                double px = Math.Max(u.Radius, Math.Min(rvoSim.GetX(slot), maxX));
+                double py = Math.Max(u.Radius, Math.Min(rvoSim.GetY(slot), maxY));
+                rvoSim.posX[slot] = px;
+                rvoSim.posY[slot] = py;
+                u.X = px;
+                u.Y = py;
             }
+        }
+
+        // 4. 交火：冷却好的单位打射程内最近的敌人
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.Hp <= 0 || u.Range <= 0.0) { continue; }
+            if (u.Cooldown > 0.0) {
+                u.Cooldown = u.Cooldown - dt;
+                continue;
+            }
+            RtsUnit t = NearestEnemy(u, u.Range);
+            if (t == null) { continue; }
+            t.Hp = t.Hp - u.Damage;
+            u.Cooldown = u.Reload;
+            RtsShot s = new RtsShot();
+            s.fromX = u.X;
+            s.fromY = u.Y;
+            s.toX = t.X;
+            s.toY = t.Y;
+            s.team = u.Team;
+            s.type = u.Type;
+            shots.Add(s);
+        }
+
+        // 5. 清点阵亡：退还避障槽位，记伤亡与赏金
+        for (int i = units.Count - 1; i >= 0; i = i - 1) {
+            RtsUnit u = units[i];
+            if (u.Hp > 0) { continue; }
+            if (u.RvoSlot >= 0) { rvoSim.RemoveAgent(u.RvoSlot); }
+            u.RvoSlot = -1;
+            u.Order = null;
+            fallen.Add(u);
+            if (u.Team == 0) {
+                blueLost = blueLost + 1;
+                supplyUsed = supplyUsed - 1;
+            } else {
+                redLost = redLost + 1;
+                minerals = minerals + killBounty;
+            }
+            units.RemoveAt(i);
         }
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using Gui;
 using Gui.Widget;
+using Game.Foundation;
 using Game.Foundation.Gui;
 
 namespace Match3;
@@ -8,77 +9,328 @@ namespace Match3;
 // One retained tree per loop. Render only consumes the already-laid-out tree.
 // Keep this template's existing raw Canvas coordinates; world viewport migration
 // is a separate change. All overlay paint belongs to standard controls.
+//
+// The HUD is also the game shell: title -> playing <-> paused -> results.
+// Audio (SfxBank) and the player profile (GameProfile) live here, in the view
+// layer; Match3Game / Match3Sim never touch them, so replays stay deterministic.
 public class Match3Hud : UiViewOwner {
+    public const int StateTitle = 0;
+    public const int StatePlaying = 1;
+    public const int StatePaused = 2;
+    public const int StateResults = 3;
+
     public Panel root;
     public Label title;
     public Label score;
     public Label moves;
+    public Label best;
+    public Label tip;
+    public Label keys;
+    public Button pauseButton;
+    public Button muteButton;
+
+    // Title / start screen
+    public Panel titlePanel;
+    public Label titleStats;
+    public Button playButton;
+
+    // Pause
+    public Panel pausePanel;
+    public Button resumeButton;
+    public Button restartButton;
+    public Button quitButton;
+
+    // Results
     public Panel result;
     public Label resultTitle;
+    public Label resultScore;
+    public Label resultBest;
+    public Label resultNewBest;
+    public Label resultStats;
     public Button replay;
+    public Button menuButton;
+
+    public int state;
     Match3Game game;
+    GameProfile profile;
+    SfxBank sfx;
+    AudioBus bus;
+    bool muted;
     weak GuiHost host;
     UiViewScope view;
 
-    public Match3Hud(GuiHost host, Match3Game game) {
+    public Match3Hud(GuiHost host, Match3Game game, GameProfile profile, SfxBank sfx, AudioBus bus) {
         this.host = host;
         this.game = game;
+        this.profile = profile;
+        this.sfx = sfx;
+        this.bus = bus;
+        this.state = StateTitle;
+        this.muted = profile.Flag("muted", false);
+        if (bus != null) { bus.SetSfxMuted(this.muted); }
         host.App().UseCss(Match3Hud.Css());
         this.root = new Panel("match3-hud");
         this.root.Class = "match3-hud";
-        this.title = new Label("CLASSIC MATCH-3");
-        this.title.Class = "match3-title";
-        this.root.Add(this.title);
-        this.score = new Label("");
-        this.score.Class = "match3-score";
-        this.root.Add(this.score);
-        this.moves = new Label("");
-        this.moves.Class = "match3-moves";
-        this.root.Add(this.moves);
-        this.result = new Panel("match3-result");
-        this.result.Class = "match3-result";
-        this.resultTitle = new Label("");
-        this.resultTitle.Class = "match3-result-title";
-        this.result.Add(this.resultTitle);
-        this.replay = new Button("CLICK ANYWHERE TO REPLAY");
-        this.replay.Class = "match3-replay";
-        this.result.Add(this.replay);
-        this.root.Add(this.result);
+        this.title = this.AddLabel(this.root, "CLASSIC MATCH-3", "match3-title");
+        this.score = this.AddLabel(this.root, "", "match3-score");
+        this.moves = this.AddLabel(this.root, "", "match3-moves");
+        this.best = this.AddLabel(this.root, "", "match3-best");
+        this.tip = this.AddLabel(this.root, "TIP: click a gem, then click a neighbour to swap them",
+            "match3-tip");
+        this.keys = this.AddLabel(this.root, "P / ESC  pause        M  sound on/off", "match3-keys");
+        this.pauseButton = this.AddButton(this.root, "PAUSE", "match3-chip match3-pause-btn");
+        this.muteButton = this.AddButton(this.root, "", "match3-chip match3-mute-btn");
+
+        // Start screen: how to play + best, tap anywhere (or the button) to play.
+        this.titlePanel = this.AddPanel("match3-title-panel", "match3-card match3-title-card");
+        this.AddLabel(this.titlePanel, "MATCH-3", "match3-h1");
+        this.AddLabel(this.titlePanel, "Line up gems, chain cascades, beat the target", "match3-sub");
+        this.AddLabel(this.titlePanel, "HOW TO PLAY", "match3-how-head");
+        this.AddLabel(this.titlePanel, "1.  Click a gem, then an adjacent gem to swap", "match3-how match3-how1");
+        this.AddLabel(this.titlePanel, "2.  Swaps must make a line of 3+ same colours", "match3-how match3-how2");
+        this.AddLabel(this.titlePanel, "3.  Falling gems chain cascades: x2, x3 points", "match3-how match3-how3");
+        this.AddLabel(this.titlePanel, "4.  Reach 1500 points within 25 moves", "match3-how match3-how4");
+        this.titleStats = this.AddLabel(this.titlePanel, "", "match3-title-stats");
+        this.playButton = this.AddButton(this.titlePanel, "TAP TO PLAY", "match3-cta match3-play-btn");
+        this.AddLabel(this.titlePanel, "ENTER / SPACE  play     ESC  quit     M  sound", "match3-card-keys");
+
+        // Pause
+        this.pausePanel = this.AddPanel("match3-pause", "match3-card match3-pause-card");
+        this.AddLabel(this.pausePanel, "PAUSED", "match3-h2 match3-pause-head");
+        this.resumeButton = this.AddButton(this.pausePanel, "RESUME", "match3-cta match3-resume-btn");
+        this.restartButton = this.AddButton(this.pausePanel, "RESTART", "match3-ghost match3-restart-btn");
+        this.quitButton = this.AddButton(this.pausePanel, "QUIT GAME", "match3-ghost match3-quit-btn");
+        this.AddLabel(this.pausePanel, "P / ESC  resume", "match3-card-keys match3-pause-keys");
+
+        // Results
+        this.result = this.AddPanel("match3-result", "match3-card match3-result");
+        this.resultTitle = this.AddLabel(this.result, "", "match3-h2 match3-result-title");
+        this.resultScore = this.AddLabel(this.result, "", "match3-result-score");
+        this.resultNewBest = this.AddLabel(this.result, "NEW BEST!", "match3-newbest");
+        this.resultBest = this.AddLabel(this.result, "", "match3-result-best");
+        this.resultStats = this.AddLabel(this.result, "", "match3-result-stats");
+        this.replay = this.AddButton(this.result, "PLAY AGAIN", "match3-cta match3-again-btn");
+        this.menuButton = this.AddButton(this.result, "MENU", "match3-ghost match3-menu-btn");
+        this.AddLabel(this.result, "ENTER  play again     ESC  menu", "match3-card-keys match3-result-keys");
+
         this.SyncState();
     }
 
-    // Loop.Event handles only Esc. Input-pump preview handles every gameplay
-    // down once, preserving left-down selection and anywhere-down replay.
-    public bool PointerDown() {
+    Label AddLabel(Control parent, string text, string cls) {
+        Label l = new Label(text);
+        l.Class = "m3l " + cls;
+        parent.Add(l);
+        return l;
+    }
+
+    Button AddButton(Control parent, string text, string cls) {
+        Button b = new Button(text);
+        b.Class = cls;
+        parent.Add(b);
+        return b;
+    }
+
+    Panel AddPanel(string name, string cls) {
+        Panel p = new Panel(name);
+        p.Class = cls;
+        this.root.Add(p);
+        return p;
+    }
+
+    // ---- sound ----
+
+    public void Play(string name) {
+        if (this.sfx != null) { this.sfx.Play(name); }
+    }
+
+    public void Play(string name, double gain) {
+        if (this.sfx != null) { this.sfx.Play(name, gain); }
+    }
+
+    public void ToggleMute() {
+        this.muted = !this.muted;
+        if (this.bus != null) { this.bus.SetSfxMuted(this.muted); }
+        this.profile.SetFlag("muted", this.muted);
+        this.Play("click");
+        this.SyncState();
+    }
+
+    // ---- flow ----
+
+    public void StartGame() {
+        if (this.state == StatePlaying) { return; }
+        this.game.InitBoard();
+        this.state = StatePlaying;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void Pause() {
+        if (this.state != StatePlaying) { return; }
+        this.state = StatePaused;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void Resume() {
+        if (this.state != StatePaused) { return; }
+        this.state = StatePlaying;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void Restart() {
+        if (this.state != StatePaused) { return; }
+        this.game.InitBoard();
+        this.state = StatePlaying;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void ShowTitle() {
+        if (this.state != StateResults && this.state != StatePaused) { return; }
+        this.state = StateTitle;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void Quit() {
+        GuiHost owner = this.host;
+        if (owner != null) { owner.RequestStop(); }
+    }
+
+    // Keyboard shell: M mute, P/Esc pause toggle, Enter/Space confirm.
+    // Keys a focused standard control already consumed never reach here.
+    public void Key(int code) {
+        if (code == 77) { this.ToggleMute(); return; }               // M
+        if (code == 80 || code == 27) {                              // P / Esc
+            if (this.state == StatePlaying) { this.Pause(); }
+            else if (this.state == StatePaused) { this.Resume(); }
+            else if (this.state == StateResults && code == 27) { this.ShowTitle(); }
+            else if (this.state == StateTitle && code == 27) { this.Quit(); }
+            return;
+        }
+        if (code == 13 || code == 32) {                              // Enter / Space
+            if (this.state == StateTitle) { this.StartGame(); }
+            else if (this.state == StateResults) { this.PlayAgain(); }
+        }
+    }
+
+    public void PlayAgain() {
+        if (this.state != StateResults) { return; }
+        this.game.InitBoard();
+        this.state = StatePlaying;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    // Board clicks while playing; anywhere-tap on the title screen.
+    public bool PointerDown(Control target) {
         GuiHost owner = this.host;
         if (owner == null || owner.App().window.EventButton() != 0) { return false; }
+        if (Match3Hud.InButton(target)) { return false; }
+        if (this.state == StateTitle) {
+            this.StartGame();
+            return true;
+        }
+        if (this.state != StatePlaying) { return false; }
         this.game.OnClick(owner.MouseX(), owner.MouseY());
-        this.SyncState();
+        this.AfterMove();
         return true;
     }
 
-    public void Replay() {
-        // The later Click from an anywhere-left-down restart must not restart
-        // again or select. A standard semantic Button Click uses this same action.
-        if (!this.game.gameOver) { return; }
-        this.game.InitBoard();
+    static bool InButton(Control c) {
+        Control cur = c;
+        while (cur != null) {
+            if (cur is Button) { return true; }
+            cur = cur.Parent();
+        }
+        return false;
+    }
+
+    // Turn the game's last action into sound, and close the round when it ends.
+    void AfterMove() {
+        int act = this.game.lastAction;
+        if (act == Match3Game.ActSelect) {
+            this.Play("select");
+        } else if (act == Match3Game.ActInvalid) {
+            this.Play("error");
+        } else if (act == Match3Game.ActSwap) {
+            int combos = this.game.lastCombos;
+            if (combos < 1) { combos = 1; }
+            if (combos > 4) { combos = 4; }
+            this.Play("swap", 0.7);
+            // Coin pitch climbs with the cascade level.
+            this.Play("coin" + Convert.ToString(combos));
+            if (this.game.lastCombos >= 2) { this.Play("powerup", 0.8); }
+            if (this.game.lastCleared >= 5 || this.game.lastCombos >= 3) { this.Play("explode", 0.7); }
+        }
+        if (this.game.gameOver && this.state == StatePlaying) {
+            this.FinishRound();
+            return;
+        }
+        this.SyncState();
+    }
+
+    public bool lastNewBest;
+
+    void FinishRound() {
+        bool won = this.game.score >= this.game.targetScore;
+        this.profile.Add("plays", 1);
+        if (won) { this.profile.Add("clears", 1); }
+        // SubmitBest saves on a new record; Save() covers the counters otherwise.
+        this.lastNewBest = this.profile.SubmitBest("score", (long)this.game.score);
+        if (!this.lastNewBest) { this.profile.Save(); }
+        this.state = StateResults;
+        this.Play(won ? "success" : "fail");
         this.SyncState();
     }
 
     // Startup/business-event synchronization; never called by Paint.
     public void SyncState() {
-        this.score.SetProp("text", "SCORE: " + Convert.ToString(this.game.score)
-            + " / " + Convert.ToString(this.game.targetScore));
-        this.moves.SetProp("text", "MOVES LEFT: " + Convert.ToString(this.game.movesLeft));
-        if (!this.game.gameOver && this.result.visible) {
-            GuiHost owner = this.host;
-            if (owner != null) { owner.App().ReleaseInputSubtree(this.result); }
-        }
-        this.result.SetShown(this.game.gameOver);
+        bool playing = this.state == StatePlaying;
         bool won = this.game.score >= this.game.targetScore;
-        this.resultTitle.SetProp("text", won ? "STAGE CLEAR!" : "OUT OF MOVES!");
-        this.resultTitle.SetProp("style", won
-            ? "left:120dpx;color:#52c41a" : "left:140dpx;color:#ff4d4f");
+        long bestScore = this.profile.Best("score");
+        long plays = this.profile.Counter("plays");
+        long clears = this.profile.Counter("clears");
+
+        this.score.SetProp("text", "SCORE  " + Convert.ToString(this.game.score)
+            + " / " + Convert.ToString(this.game.targetScore));
+        this.moves.SetProp("text", "MOVES  " + Convert.ToString(this.game.movesLeft));
+        this.moves.SetProp("style", this.game.movesLeft <= 5 ? "color:#ff7875" : "color:#40a9ff");
+        this.best.SetProp("text", "BEST  " + Convert.ToString(bestScore)
+            + "      GAMES  " + Convert.ToString(plays));
+        this.muteButton.SetText(this.muted ? "SOUND: OFF" : "SOUND: ON");
+        this.pauseButton.Disabled.Set(!playing);
+        // Onboarding: the swap hint stays until the first round is finished.
+        this.tip.SetShown(playing && plays == 0);
+
+        this.titleStats.SetProp("text", plays == 0
+            ? "First game - good luck!"
+            : "BEST  " + Convert.ToString(bestScore) + "     GAMES  " + Convert.ToString(plays)
+                + "     CLEARS  " + Convert.ToString(clears));
+
+        this.resultTitle.SetProp("text", won ? "STAGE CLEAR!" : "OUT OF MOVES");
+        this.resultTitle.SetProp("style", won ? "color:#73d13d" : "color:#ff4d4f");
+        this.resultScore.SetProp("text", "SCORE  " + Convert.ToString(this.game.score)
+            + "  /  TARGET  " + Convert.ToString(this.game.targetScore));
+        this.resultBest.SetProp("text", "BEST  " + Convert.ToString(bestScore));
+        this.resultStats.SetProp("text", "GAMES  " + Convert.ToString(plays)
+            + "     CLEARS  " + Convert.ToString(clears)
+            + "     MOVES LEFT  " + Convert.ToString(this.game.movesLeft));
+
+        this.ShowPanel(this.titlePanel, this.state == StateTitle);
+        this.ShowPanel(this.pausePanel, this.state == StatePaused);
+        this.ShowPanel(this.result, this.state == StateResults);
+        this.resultNewBest.SetShown(this.state == StateResults && this.lastNewBest);
+    }
+
+    void ShowPanel(Panel p, bool shown) {
+        if (!shown && p.visible) {
+            GuiHost owner = this.host;
+            if (owner != null) { owner.App().ReleaseInputSubtree(p); }
+        }
+        p.SetShown(shown);
     }
 
     public void AttachPreparation(GuiHost owner) {
@@ -88,7 +340,14 @@ public class Match3Hud : UiViewOwner {
         if (this.view != null) { this.view.Retire(); }
         this.view = new UiViewScope(owner.App(), this, this.root);
         this.root.OnPreviewRouted(this.view.Action("pointer", this.root).Pointer);
-        this.replay.OnClick(this.view.Action("replay", this.replay).Run);
+        this.playButton.OnClick(this.view.Action("play", this.playButton).Run);
+        this.resumeButton.OnClick(this.view.Action("resume", this.resumeButton).Run);
+        this.restartButton.OnClick(this.view.Action("restart", this.restartButton).Run);
+        this.quitButton.OnClick(this.view.Action("quit", this.quitButton).Run);
+        this.replay.OnClick(this.view.Action("again", this.replay).Run);
+        this.menuButton.OnClick(this.view.Action("menu", this.menuButton).Run);
+        this.pauseButton.OnClick(this.view.Action("pause", this.pauseButton).Run);
+        this.muteButton.OnClick(this.view.Action("mute", this.muteButton).Run);
     }
 
     public void StopPreparation() {
@@ -100,38 +359,90 @@ public class Match3Hud : UiViewOwner {
         // The game owns this full-canvas region; the scope owns only its lifetime.
         Control inputRoot = app.rootControl;
         if (inputRoot == null || !inputRoot.ContainsInputControl(this.root)) { return; }
-        view.Layout(0, 0, app.canvas.Width(), app.canvas.Height());
+        // Below the GuiHost title bar (drawn over content on desktop).
+        int top = app.ContentTop();
+        view.Layout(0, top, app.canvas.Width(), app.canvas.Height() - top);
     }
     public void Layout(App app) {
         if (this.view != null) { this.PrepareView(this.view, app); }
     }
     public void ViewAction(string name, Control sender) {
-        if (name == "replay") { this.Replay(); }
+        if (name == "play") { this.StartGame(); }
+        else if (name == "resume") { this.Resume(); }
+        else if (name == "restart") { this.Restart(); }
+        else if (name == "quit") { this.Quit(); }
+        else if (name == "again") { this.PlayAgain(); }
+        else if (name == "menu") { this.ShowTitle(); }
+        else if (name == "pause") { this.Pause(); }
+        else if (name == "mute") { this.ToggleMute(); }
     }
     public void ViewPointer(Control sender, RoutedEventArgs args) {
         if (args.eventName != "PointerDown" && args.eventName != "MouseDown") { return; }
-        if (this.PointerDown()) { args.Handle(); }
+        if (this.PointerDown(args.originalSource)) { args.Handle(); }
     }
 
-    // Original palette and overlay positions. State styling remains in CSS.
+    // Gem-night palette (board #14141f / slots #2a2a3c, gem accents gold/blue/green/red).
+    // Every overlay is a standard Panel/Label/Button skinned here.
     public static string Css() {
         return ".match3-hud{position:relative;background:transparent;padding:0;border:0}"
-            + "label.match3-title,label.match3-score,label.match3-moves,"
-            + "label.match3-result-title{position:absolute;"
-            + "padding:0;margin:0;border:0;background:transparent;vertical-align:top}"
-            + "label.match3-title{left:40dpx;top:50dpx;width:640dpx;height:40dpx;font-size:28dpx;color:#fff}"
-            + "label.match3-score{left:40dpx;top:100dpx;width:356dpx;height:32dpx;font-size:20dpx;color:#ffc53d}"
-            + "label.match3-moves{left:400dpx;top:100dpx;width:300dpx;height:32dpx;font-size:20dpx;color:#40a9ff}"
-            + ".match3-result{position:absolute;left:100dpx;top:400dpx;width:520dpx;height:160dpx;"
-            + "padding:0;border:0;background:rgba(0,0,0,0.8)}"
-            + "label.match3-result-title{left:120dpx;top:40dpx;width:380dpx;height:48dpx;"
-            + "font-size:32dpx;text-align:left}"
-            + "button.match3-replay{position:absolute;left:80dpx;top:100dpx;width:400dpx;height:48dpx;"
-            + "padding:0;margin:0;border:0;border-radius:0;background:transparent;color:#fff;font-size:18dpx;text-align:left;justify-content:flex-start}"
-            + "button.match3-replay label{padding:0;margin:0;color:#fff;font-size:18dpx;text-align:left;vertical-align:top}"
-            + "button.match3-replay:hover{background:rgba(64,169,255,0.12)}"
-            + "button.match3-replay:active{background:rgba(64,169,255,0.2)}"
-            + "button.match3-replay:focus{border:1dpx solid #40a9ff}"
-            + "button.match3-replay:disabled{color:#89a5c4;background:transparent}";
+            + "label.m3l{position:absolute;padding:0;margin:0;border:0;background:transparent;"
+            + "vertical-align:top;text-align:center}"
+            + "label.match3-title{left:40dpx;top:12dpx;width:640dpx;height:40dpx;font-size:30dpx;color:#fff}"
+            + "label.match3-score{left:40dpx;top:62dpx;width:330dpx;height:32dpx;font-size:22dpx;color:#ffc53d;text-align:left}"
+            + "label.match3-moves{left:390dpx;top:62dpx;width:290dpx;height:32dpx;font-size:22dpx;color:#40a9ff;text-align:right}"
+            + "label.match3-best{left:40dpx;top:102dpx;width:640dpx;height:26dpx;font-size:16dpx;color:#a6a6c8}"
+            + "label.match3-tip{left:40dpx;top:708dpx;width:640dpx;height:28dpx;font-size:18dpx;color:#ffe58f}"
+            + "label.match3-keys{left:40dpx;top:862dpx;width:640dpx;height:24dpx;font-size:15dpx;color:#77779a}"
+            // HUD chips (pause / sound) - top corners
+            + "button.match3-chip{position:absolute;top:8dpx;height:30dpx;padding:0;margin:0;"
+            + "justify-content:center;align-items:center;font-size:14dpx;color:#d6d6f0;background:#2a2a3c;"
+            + "border:1dpx solid #4a4a6a;border-radius:15dpx}"
+            + "button.match3-pause-btn{left:16dpx;width:96dpx}"
+            + "button.match3-mute-btn{left:578dpx;width:126dpx}"
+            + "button.match3-chip:hover{background:#3a3a55;border-color:#40a9ff}"
+            + "button.match3-chip:active{background:#46466a}"
+            + "button.match3-chip:focus{border:1dpx solid #40a9ff}"
+            + "button.match3-chip:disabled{color:#5a5a78;background:#22222f;border-color:#33334a}"
+            // Cards (title / pause / results)
+            + ".match3-card{position:absolute;padding:0;margin:0;background:rgba(18,18,30,0.95);"
+            + "border:2dpx solid #9254de;border-radius:18dpx;box-shadow:0 10dpx 30dpx rgba(0,0,0,0.5)}"
+            + ".match3-title-card{left:60dpx;top:158dpx;width:600dpx;height:560dpx}"
+            + ".match3-pause-card{left:160dpx;top:268dpx;width:400dpx;height:340dpx;border-color:#40a9ff}"
+            + ".match3-result{left:80dpx;top:238dpx;width:560dpx;height:420dpx;border-color:#ffc53d}"
+            + "label.match3-h1{left:0;top:34dpx;width:100%;height:60dpx;font-size:48dpx;color:#ffc53d}"
+            + "label.match3-sub{left:0;top:100dpx;width:100%;height:26dpx;font-size:17dpx;color:#b7b7d8}"
+            + "label.match3-how-head{left:0;top:156dpx;width:100%;height:26dpx;font-size:18dpx;color:#40a9ff}"
+            + "label.match3-how{left:60dpx;width:500dpx;height:26dpx;font-size:17dpx;color:#e8e8ff;text-align:left}"
+            + "label.match3-how1{top:194dpx}label.match3-how2{top:226dpx}"
+            + "label.match3-how3{top:258dpx}label.match3-how4{top:290dpx}"
+            + "label.match3-title-stats{left:0;top:340dpx;width:100%;height:26dpx;font-size:17dpx;color:#ffe58f}"
+            + "label.match3-card-keys{left:0;top:510dpx;width:100%;height:22dpx;font-size:14dpx;color:#77779a}"
+            + "label.match3-h2{left:0;top:30dpx;width:100%;height:48dpx;font-size:38dpx;color:#fff}"
+            + "label.match3-result-score{left:0;top:104dpx;width:100%;height:30dpx;font-size:22dpx;color:#ffc53d}"
+            + "label.match3-newbest{left:0;top:146dpx;width:100%;height:30dpx;font-size:24dpx;color:#ff85c0}"
+            + "label.match3-result-best{left:0;top:186dpx;width:100%;height:26dpx;font-size:18dpx;color:#e8e8ff}"
+            + "label.match3-result-stats{left:0;top:220dpx;width:100%;height:24dpx;font-size:15dpx;color:#a6a6c8}"
+            + "label.match3-result-keys{top:380dpx}label.match3-pause-keys{top:300dpx}"
+            // Card buttons: gold call-to-action and outlined secondary
+            + "button.match3-cta,button.match3-ghost{position:absolute;padding:0;margin:0;justify-content:center;"
+            + "align-items:center;border-radius:28dpx}"
+            + "button.match3-cta{font-size:24dpx;color:#1f1f2e;background:linear-gradient(#ffd666,#faad14);"
+            + "border:2dpx solid #fff1b8}"
+            + "button.match3-ghost{font-size:20dpx;color:#e8e8ff;background:#2a2a3c;border:2dpx solid #4a4a6a}"
+            + "button.match3-cta label,button.match3-ghost label,button.match3-chip label{background:transparent;"
+            + "border:0;padding:0;margin:0;font-size:inherit;color:inherit;text-align:center}"
+            + "button.match3-cta:hover{background:linear-gradient(#ffe58f,#ffc53d)}"
+            + "button.match3-cta:active{background:#d48806}"
+            + "button.match3-cta:focus{border:2dpx solid #40a9ff}"
+            + "button.match3-ghost:hover{background:#3a3a55;border-color:#9254de}"
+            + "button.match3-ghost:active{background:#46466a}"
+            + "button.match3-ghost:focus{border:2dpx solid #40a9ff}"
+            + "button.match3-cta:disabled,button.match3-ghost:disabled{color:#5a5a78;background:#22222f;border-color:#33334a}"
+            + "button.match3-play-btn{left:150dpx;top:400dpx;width:300dpx;height:64dpx;font-size:26dpx}"
+            + "button.match3-resume-btn{left:70dpx;top:100dpx;width:260dpx;height:56dpx}"
+            + "button.match3-restart-btn{left:70dpx;top:170dpx;width:260dpx;height:48dpx}"
+            + "button.match3-quit-btn{left:70dpx;top:230dpx;width:260dpx;height:48dpx}"
+            + "button.match3-again-btn{left:60dpx;top:280dpx;width:260dpx;height:60dpx}"
+            + "button.match3-menu-btn{left:340dpx;top:286dpx;width:160dpx;height:48dpx}";
     }
 }

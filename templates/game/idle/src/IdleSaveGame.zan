@@ -1,0 +1,79 @@
+using System;
+using System.IO;
+using System.Json;
+using Game.Foundation;
+using Game.Idle;
+
+// 经济存档：金币、累计收益、点击数、各矿机等级 + 落盘时间（离线收益用）。
+//
+// 存在玩家档案同一根目录下：<GameProfile.DataRoot()>/idle/economy_slot0.json
+// （GameProfile.Open("idle") 用的是同目录下的 idle_slot0.json，两者互不覆盖）。
+// GameSaveStore 负责原子写 + .bak 回退；用户目录解析不到时整个存档静默失效，
+// 游戏照常跑。只在界面层使用——无头回放（IdleSim）不碰它。
+public class IdleSaveGame {
+    GameSaveStore store;
+    string dir;
+
+    IdleSaveGame() {
+        this.store = null;
+        this.dir = "";
+    }
+
+    public static IdleSaveGame Open() {
+        IdleSaveGame g = new IdleSaveGame();
+        string root = GameProfile.DataRoot();
+        if (root == "") { return g; }
+        g.dir = Path.Combine(root, "idle");
+        g.store = new GameSaveStore(g.dir, "economy", 1);
+        return g;
+    }
+
+    // 是否真的落盘（解析不到用户数据目录时为 false）。
+    public bool Persistent() { return this.store != null; }
+
+    // 存档所在目录（README / 统计面板展示用）。
+    public string Directory() { return this.dir; }
+
+    // 当前 Unix 秒。
+    public static long NowSec() { return DateTime.GetCurrentUnixMilliseconds() / 1000; }
+
+    public bool Save(IdleState s, long nowSec) {
+        if (this.store == null || s == null) { return false; }
+        JsonValue d = JsonValue.NewObject();
+        d.PutDouble("gold", s.gold);
+        d.PutDouble("totalEarned", s.totalEarned);
+        d.PutInt("clicks", s.clicks);
+        d.PutInt("savedAtSec", nowSec);
+        JsonValue levels = JsonValue.NewArray();
+        for (int i = 0; i < s.buildings.Count; i = i + 1) {
+            levels.AppendInt((long)s.buildings[i].level);
+        }
+        d.Put("levels", levels);
+        return this.store.Save(0, d);
+    }
+
+    // 读档写回 state；返回存档时的 Unix 秒，没有（或读坏了）存档返回 0。
+    public long Load(IdleState s) {
+        if (this.store == null || s == null) { return 0; }
+        JsonValue d = this.store.Load(0);
+        if (d == null || !d.IsObject()) { return 0; }
+        double gold = d.Double("gold", 0.0);
+        double earned = d.Double("totalEarned", 0.0);
+        if (!(gold >= 0.0)) { gold = 0.0; }
+        if (!(earned >= gold)) { earned = gold; }
+        s.gold = gold;
+        s.totalEarned = earned;
+        long clicks = d.Long("clicks", 0);
+        s.clicks = clicks > 0 ? clicks : 0;
+        JsonValue levels = d.Get("levels");
+        if (levels != null && levels.IsArray()) {
+            int n = levels.Count();
+            if (n > s.buildings.Count) { n = s.buildings.Count; }
+            for (int i = 0; i < n; i = i + 1) {
+                int lv = levels.At(i).AsInt(0);
+                s.buildings[i].level = lv > 0 ? lv : 0;
+            }
+        }
+        return d.Long("savedAtSec", 0);
+    }
+}

@@ -160,6 +160,10 @@ def main():
         menu("checked-paused-back-menu")
         tap(w / 2, h - 196 * unit)
         time.sleep(.5)
+        # 对局中返回键先暂停（与 Esc 同语义，误触不丢局），暂停页再按返回回菜单。
+        back()
+        time.sleep(.5)
+        screenshot("checked-play-back-paused")
         back()
         menu("checked-play-back-menu")
         adb("shell", "input", "keyevent", "3")

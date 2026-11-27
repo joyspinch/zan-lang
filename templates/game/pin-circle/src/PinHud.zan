@@ -11,6 +11,7 @@ namespace PinCircle;
 // world remains in PinView; all player-facing controls use Gui input and skin.
 public class PinHud : UiViewOwner {
     PinWorld game;
+    PinShell shell;
     weak PinView view;
     weak HtmlScene scene;
     weak SceneRouter router;
@@ -21,6 +22,7 @@ public class PinHud : UiViewOwner {
     Action pauseAction;
     Action confirmAction;
     Action backAction;
+    Action muteAction;
     Panel root;
     Panel menu;
     Panel play;
@@ -41,19 +43,24 @@ public class PinHud : UiViewOwner {
     Label caption;
     Label fireCaption;
     Label playHint;
+    Label record;
     Button start;
     Button home;
     Button pause;
     Button confirm;
     Button back;
+    Button mute;
     List<Panel> dots;
     string mode;
     int animationMs;
     bool paused;
+    bool muteShown;
+    bool muteSynced;
 
     PinHud(PinWorld game, PinView view, App app) {
         this.game = game;
         this.view = view;
+        this.shell = view.shell;
         app.UseCss(PinHud.Css());
         this.layer = new HudLayer();
         this.root = new Panel("pin-hud");
@@ -69,7 +76,7 @@ public class PinHud : UiViewOwner {
         this.menu.Add(this.titleArt);
         this.start = this.ButtonAt(this.menu, "▷", "pin-seal", "start");
         this.LabelAt(this.menu, "开 始 挑 战", "pin-paper", "start-caption");
-        this.LabelAt(this.menu, "点击发射  ·  针针入隙  ·  步步进阶", "pin-muted", "menu-hint");
+        this.LabelAt(this.menu, "空格 / 点击发射  ·  P 暂停  ·  M 静音", "pin-muted", "menu-hint");
         this.best = this.LabelAt(this.menu, "", "pin-gold", "best");
         this.play = this.Group(this.root, "pin-play");
         this.home = this.ButtonAt(this.play, "←", "pin-tool", "home");
@@ -85,17 +92,20 @@ public class PinHud : UiViewOwner {
         }
         this.pattern = this.LabelAt(this.play, "", "pin-muted", "pattern");
         this.fireCaption = this.LabelAt(this.play, "轻触发射", "pin-paper", "fire-caption");
-        this.playHint = this.LabelAt(this.play, "点击空白处或按空格  ·  避开针球与针杆", "pin-muted", "play-hint");
+        this.playHint = this.LabelAt(this.play, "点击空白处或按空格发射  ·  避开针球与针杆", "pin-muted", "play-hint");
         this.modal = this.Group(this.root, "pin-modal");
         this.card = this.Group(this.modal, "pin-card");
         this.status = this.LabelAt(this.card, "", "pin-gold", "status");
         this.medal = this.LabelAt(this.card, "◇", "pin-medal", "medal");
         this.heading = this.LabelAt(this.card, "", "pin-paper", "heading");
         this.detail = this.LabelAt(this.card, "", "pin-muted", "detail");
+        this.record = this.LabelAt(this.card, "", "pin-gold", "record");
         this.confirm = this.ButtonAt(this.card, "▷", "pin-seal", "confirm");
         this.caption = this.LabelAt(this.card, "", "pin-paper", "confirm-caption");
         this.back = this.ButtonAt(this.card, "返回主菜单", "pin-back", "back");
         this.hint = this.LabelAt(this.modal, "", "pin-muted", "result-hint");
+        // Sound toggle sits above every page so M and the button stay in sync.
+        this.mute = this.ButtonAt(this.root, "♪", "pin-tool", "mute");
         this.layer.Add(this.root);
         this.layer.SetVisible(false);
     }
@@ -138,11 +148,13 @@ public class PinHud : UiViewOwner {
         this.pauseAction = this.scope.Action("pause", this.pause).Run;
         this.confirmAction = this.scope.Action("confirm", this.confirm).Run;
         this.backAction = this.scope.Action("home", this.back).Run;
+        this.muteAction = this.scope.Action("mute", this.mute).Run;
         this.start.OnClick(this.startAction);
         this.home.OnClick(this.homeAction);
         this.pause.OnClick(this.pauseAction);
         this.confirm.OnClick(this.confirmAction);
         this.back.OnClick(this.backAction);
+        this.mute.OnClick(this.muteAction);
         this.root.OnPreviewRouted(this.scope.Action("world", this.root).Pointer);
         this.Sync(0);
         this.layer.SetVisible(true);
@@ -162,11 +174,13 @@ public class PinHud : UiViewOwner {
         if (this.pauseAction != null) { this.pause.Click.Remove(this.pauseAction); }
         if (this.confirmAction != null) { this.confirm.Click.Remove(this.confirmAction); }
         if (this.backAction != null) { this.back.Click.Remove(this.backAction); }
+        if (this.muteAction != null) { this.mute.Click.Remove(this.muteAction); }
         this.startAction = null;
         this.homeAction = null;
         this.pauseAction = null;
         this.confirmAction = null;
         this.backAction = null;
+        this.muteAction = null;
         this.root.OnPreviewRouted(null);
     }
 
@@ -182,7 +196,11 @@ public class PinHud : UiViewOwner {
         if (wasPaused != this.paused && activeRouter != null) {
             // Release only the controls leaving the active modal/toolbar state.
             App app = activeRouter.Host().App();
-            if (this.paused) { app.ReleaseInputSubtree(this.home); app.ReleaseInputSubtree(this.pause); }
+            if (this.paused) {
+                app.ReleaseInputSubtree(this.home);
+                app.ReleaseInputSubtree(this.pause);
+                app.ReleaseInputSubtree(this.mute);
+            }
             else { app.ReleaseInputSubtree(this.modal); }
         }
         bool result = this.paused || this.mode == "over";
@@ -191,11 +209,25 @@ public class PinHud : UiViewOwner {
         this.home.SetShown(this.mode == "play" && !result);
         this.pause.SetShown(this.mode == "play" && !result);
         this.fireCaption.SetShown(this.mode == "play" && !result);
-        this.playHint.SetShown(this.mode == "play" && !result);
+        // Controls hint: always for first runs, otherwise until the first pin lands.
+        this.playHint.SetShown(this.mode == "play" && !result
+            && (this.game.inserted == 0 || this.Shell().Plays() <= 1));
+        this.mute.SetShown(!result);
+        bool muted = this.Shell().Muted();
+        if (!this.muteSynced || muted != this.muteShown) {
+            this.muteSynced = true;
+            this.muteShown = muted;
+            this.mute.SetText(muted ? "×" : "♪");
+            this.mute.SetProp("class", muted ? "pin-tool pin-tool-off" : "pin-tool");
+        }
         this.remaining.SetProp("text", this.mode == "menu" ? "01" : Convert.ToString(this.game.Remaining()));
         this.rotorCaption.SetProp("text", this.mode == "menu" ? "入 隙" : "待 发 射");
         this.modal.SetShown(result);
-        this.best.SetProp("text", "本次最高   " + this.game.bestLevel + "   关");
+        long bestLevel = this.Shell().BestLevel();
+        long plays = this.Shell().Plays();
+        this.best.SetProp("text", bestLevel > 0
+            ? "最高通关  第 " + bestLevel + " 关   ·   已玩 " + plays + " 局"
+            : (plays > 0 ? "尚未通关   ·   已玩 " + plays + " 局" : "首次挑战  ·  从第 1 关开始"));
         this.level.SetProp("text", "第 " + this.game.level + " 关");
         this.pattern.SetProp("text", this.game.PatternName());
         for (int i = 0; i < this.dots.Count; i = i + 1) {
@@ -203,14 +235,17 @@ public class PinHud : UiViewOwner {
             this.dots[i].SetProp("class", i < this.game.inserted ? "pin-dot pin-dot-filled" : "pin-dot");
         }
         bool won = this.game.state == RoundState.Cleared;
-        this.status.SetProp("text", this.paused ? "TAKE A BREATH" : (won ? "PERFECT TIMING" : "ONE MORE TRY"));
+        bool newBest = !this.paused && won && this.Shell().NewBest();
+        this.status.SetProp("text", this.paused ? "TAKE A BREATH" : (newBest ? "★  NEW BEST  ★" : (won ? "PERFECT TIMING" : "ONE MORE TRY")));
+        this.record.SetProp("text", newBest ? "新纪录  ·  最高通关第 " + this.game.level + " 关"
+            : (this.Shell().BestLevel() > 0 ? "最高通关  第 " + this.Shell().BestLevel() + " 关" : "尚未通关"));
         this.heading.SetProp("text", this.paused ? "蓄 势 待 发" : (won ? "针 针 入 隙" : "再 差 一 瞬"));
         this.detail.SetProp("text", "第 " + this.game.level + " 关   /   已入隙 " + this.game.inserted + " · " + this.game.target);
         this.confirm.SetText(!this.paused && !won ? "↶" : "▷");
         this.medal.SetProp("text", this.paused ? "Ⅱ" : (won ? "✓" : "!"));
         this.medal.SetProp("class", "pin-label pin-medal " + (this.paused ? "pin-gold" : (won ? "pin-jade" : "pin-danger")));
         this.caption.SetProp("text", this.paused ? "继续挑战" : (won ? "开启下一关" : "重试本关"));
-        this.hint.SetProp("text", this.paused ? "P / 空格继续  ·  Esc 返回" : "Enter / 空格继续  ·  Esc 返回");
+        this.hint.SetProp("text", this.paused ? "P / 空格继续  ·  Esc 返回菜单  ·  M 静音" : "Enter / 空格继续  ·  Esc 返回菜单  ·  M 静音");
         this.confirm.Disabled = this.mode == "over" && animationMs < 240;
         // Configure child styles before the shared HUD scope measures them.
         // Enter uses this same path before its first Bind and first input.
@@ -238,6 +273,12 @@ public class PinHud : UiViewOwner {
         HtmlScene active = this.scene;
         SceneRouter owner = this.router;
         if (owner == null || active == null || owner.Current() != active) { return; }
+        PinView view = this.view;
+        if (name == "mute") {
+            if (view != null) { view.ToggleMute(); }
+            return;
+        }
+        if (name == "home") { this.shell.Play("click"); }
         if (name == "home") { owner.Go("menu"); }
         if (name == "start" && active is PinMenuScene) { ((PinMenuScene)active).Start(); }
         if (name == "pause" && active is PinPlayScene) { ((PinPlayScene)active).TogglePause(); }
@@ -293,8 +334,10 @@ public class PinHud : UiViewOwner {
         this.Box(this.best, 0, height-(int)(40*s), width, (int)(28*s), (int)(18*s));
         this.Box(this.home, (int)(20*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(26*s));
         this.Box(this.pause, width-(int)(68*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(24*s));
-        this.Place(this.play, "title", (int)(76*s), (int)(22*s), width-(int)(152*s), (int)(28*s), (int)(18*s));
-        this.Box(this.level, (int)(76*s), (int)(56*s), width-(int)(152*s), (int)(36*s), (int)(27*s));
+        this.Place(this.play, "title", (int)(132*s), (int)(22*s), width-(int)(264*s), (int)(28*s), (int)(18*s));
+        this.Box(this.level, (int)(132*s), (int)(56*s), width-(int)(264*s), (int)(36*s), (int)(27*s));
+        int muteX = this.mode == "menu" ? width-(int)(68*s) : width-(int)(124*s);
+        this.Box(this.mute, muteX, (int)(24*s), (int)(48*s), (int)(48*s), (int)(22*s));
         for (int i = 0; i < this.dots.Count; i = i + 1) {
             int dx = cx + (int)((i * 2 - this.game.target + 1) * 8 * s);
             this.Box(this.dots[i], dx-(int)(3*s), (int)(109*s), (int)(6*s), (int)(6*s), 0);
@@ -308,14 +351,16 @@ public class PinHud : UiViewOwner {
         this.Box(this.card, cardX, y, (int)(400*s), (int)(480*s), 0);
         this.Place(this.card, "status", 0, (int)(32*s), (int)(400*s), (int)(28*s), (int)(18*s));
         this.Place(this.card, "medal", 0, (int)(74*s), (int)(400*s), (int)(64*s), (int)(48*s));
-        this.Box(this.heading, 0, (int)(160*s), (int)(400*s), (int)(48*s), (int)(36*s));
-        this.Box(this.detail, 0, (int)(220*s), (int)(400*s), (int)(28*s), (int)(18*s));
+        this.Box(this.heading, 0, (int)(150*s), (int)(400*s), (int)(48*s), (int)(36*s));
+        this.Box(this.detail, 0, (int)(204*s), (int)(400*s), (int)(26*s), (int)(18*s));
+        this.Box(this.record, 0, (int)(234*s), (int)(400*s), (int)(26*s), (int)(18*s));
         // Buttons remain at the old hit centers while the decorative panel enters.
         this.Box(this.confirm, cx-cardX-(int)(44*s), ry+(int)(36*s)-y, (int)(88*s), (int)(88*s), (int)(36*s));
         this.Box(this.caption, 0, ry+(int)(138*s)-y, (int)(400*s), (int)(36*s), (int)(27*s));
         this.Box(this.back, (int)(124*s), ry+(int)(182*s)-y, (int)(152*s), (int)(48*s), (int)(18*s));
         this.Box(this.hint, 0, height-(int)(44*s), width, (int)(28*s), (int)(18*s));
     }
+    PinShell Shell() { return this.shell; }
     void Place(Control parent, string name, int x, int y, int w, int h, int font) {
         Control child = parent.FindByName(name);
         if (child != null) { this.Box(child, x, y, w, h, font); }
@@ -328,6 +373,7 @@ public class PinHud : UiViewOwner {
     static string Css() {
         return ".pin-hud,.pin-menu,.pin-play{position:relative;background:transparent;padding:0;border:0}"
             + ".pin-menu,.pin-play,.pin-modal,.pin-card,.pin-instrument,.pin-title-art{position:absolute;padding:0;margin:0}"
+            + ".pin-title-art{background:transparent;border:0;box-shadow:none}"
             + ".pin-modal{background:rgba(1,16,20,0.80);border:0}"
             + ".pin-card{background:#051d21;border:2dpx solid #735d37;border-radius:var(--radius-large);box-shadow:0 8dpx 24dpx rgba(0,0,0,0.35)}"
             + "label.pin-label{position:absolute;padding:0;margin:0;border:0;background:transparent;text-align:center;vertical-align:top}"
@@ -338,6 +384,7 @@ public class PinHud : UiViewOwner {
             + "image.pin-seal-art{position:absolute;left:4%;top:4%;width:92%;height:92%;background:transparent;border:0;padding:0}button.pin-seal label{z-index:1}"
             + "button.pin-back{background:transparent;border-color:transparent;color:#89aba8}"
             + "button.pin-tool label,button.pin-seal label,button.pin-back label{background:transparent;border:0;font-size:inherit;color:inherit;text-align:center;padding:0;margin:0}"
+            + "button.pin-tool-off{color:#89aba8;border-color:#ff8b76}"
             + "button.pin-tool:hover,button.pin-seal:hover,button.pin-back:hover{background:#164b45;color:#f7eed6;border-color:#69e4c4}"
             + "button.pin-tool:active,button.pin-seal:active,button.pin-back:active{background:#236758;border-color:#f7eed6}"
             + "button.pin-tool:focus,button.pin-seal:focus,button.pin-back:focus{border:2dpx solid #69e4c4}"

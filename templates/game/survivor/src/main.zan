@@ -1,35 +1,236 @@
 using System;
 using Gui;
+using Game.Foundation;
 using Game.Foundation.Gui;
 using Game.Kit;
 using Survivor;
 
+// 外壳：标题 → 对局 ⇄ 暂停 → 阵亡结算 → 再来一局。存档（最好成绩、局数、静音）
+// 与音效都只在这一层；SurvivorGame 是纯逻辑，回放仿真（SurvivorSim）照常无头跑。
 public class SurvivorLoop : IGuiHostLoop {
     public SurvivorGame game;
     public SurvivorHud hud;
+    GameProfile profile;
+    AudioBus bus;
+    SfxBank sfx;
+    GuiHost host;
+    int state;          // 0 标题 1 对局 2 暂停 3 阵亡演出 4 结算
+    double deathDelay;  // 阵亡到结算面板之间的停顿（秒）
+    bool wasActive;
+    bool hintRun;       // 本局显示新手提示
+    // 上一帧的事件计数（与 SurvivorGame 的只增计数比对出本帧发生了什么）
+    int seenShots;
+    int seenHits;
+    int seenKills;
+    int seenGems;
+    int seenLevel;
+    int seenHurts;
 
     public void Start(GuiHost host) {
+        this.host = host;
+        // 存档在用户数据目录（ZAN_GAME_DATA_DIR 可改），绝不写工作目录
+        this.profile = GameProfile.Open("survivor");
+        this.bus = new AudioBus();
+        this.bus.SetSfxMuted(this.profile.Flag("muted", false));
+        this.sfx = new SfxBank(this.bus);
+        this.sfx.AddPresets(new string[]{ "click", "select", "hit", "coin", "powerup", "fail" });
+        // 本作专属音色：短促低音量的射击声、更闷的击杀爆裂、低频嗡鸣的受伤
+        this.sfx.AddSynth("shot", SfxPresets.Launch().WithSweep(900.0, 520.0).WithDuration(0.035).WithGain(0.08));
+        this.sfx.AddSynth("kill", SfxPresets.Explode().WithDuration(0.07).WithGain(0.26));
+        this.sfx.AddSynth("hurt", SfxPresets.Error().WithFrequency(110.0).WithDuration(0.12).WithGain(0.22));
+        this.sfx.Warm();
+
         this.game = SurvivorGame.Create();
         this.hud = new SurvivorHud(host.App(), this.game);
+        this.WireMenu();
+        this.wasActive = true;
+        this.ShowTitle();
+    }
+
+    void WireMenu() {
+        SurvivorMenu m = this.hud.menu;
+        m.start.OnClick(() => { this.StartRun(); });
+        m.quitGame.OnClick(() => { this.host.RequestStop(); });
+        m.resume.OnClick(() => { this.Resume(); });
+        m.restart.OnClick(() => { this.StartRun(); });
+        m.quitRun.OnClick(() => { this.ShowTitle(); });
+        m.again.OnClick(() => { this.StartRun(); });
+        m.menu.OnClick(() => { this.ShowTitle(); });
+    }
+
+    string BestText() {
+        if (!this.profile.HasBest("time")) { return "BEST: no runs yet"; }
+        return "BEST: " + SurvivorHud.Clock((double)this.profile.Best("time")) + " survived  |  "
+            + Convert.ToString(this.profile.Best("kills")) + " kills  |  LV. "
+            + Convert.ToString(this.profile.Best("level"));
+    }
+
+    void RefreshMeta() { this.hud.SetMeta(this.BestText(), this.bus.IsSfxMuted()); }
+
+    void ShowTitle() {
+        if (this.state == 1 || this.state == 2) { this.sfx.Play("click"); }
+        this.state = 0;
+        this.game.ReleaseKeys();
+        this.hud.ShowHint(false);
+        this.RefreshMeta();
+        this.hud.menu.Show(SurvivorMenu.ModeTitle, "SURVIVOR", false, new string[]{
+            "Survive the endless horde as long as you can.",
+            "MOVE      WASD / ARROW KEYS",
+            "ATTACK    automatic - aims at the nearest enemy",
+            "LEVEL UP  grab cyan gems: full heal, faster fire",
+            "P / ESC pause     M mute     ENTER start",
+            "",
+            this.BestText()
+        }, new string[]{ "", "key", "key", "key", "dim", "", "accent" });
+    }
+
+    void StartRun() {
+        this.sfx.Play("select");
+        this.game = SurvivorGame.Create();
+        this.hud.SetGame(this.game);
+        this.seenShots = 0;
+        this.seenHits = 0;
+        this.seenKills = 0;
+        this.seenGems = 0;
+        this.seenLevel = this.game.level;
+        this.seenHurts = 0;
+        this.deathDelay = 0.0;
+        // 首局（档案里还没有完整局）开头几秒显示操作提示
+        this.hintRun = this.profile.Counter("plays") == 0;
+        this.profile.Add("plays", 1);
+        this.profile.Save();
+        this.hud.menu.Hide();
+        this.state = 1;
+    }
+
+    void Pause() {
+        if (this.state != 1) { return; }
+        this.state = 2;
+        this.game.ReleaseKeys();
+        this.hud.ShowHint(false);
+        this.sfx.Play("click");
+        this.hud.menu.Show(SurvivorMenu.ModePause, "PAUSED", false, new string[]{
+            "",
+            "TIME  " + SurvivorHud.Clock(this.game.gameTime) + "     KILLS  " + Convert.ToString(this.game.killCount)
+                + "     LV. " + Convert.ToString(this.game.level),
+            "HP  " + Convert.ToString(this.game.playerHp) + " / " + Convert.ToString(this.game.playerMaxHp),
+            "",
+            "P / ESC resume     R restart     Q quit to menu",
+            "M toggles sound"
+        }, new string[]{ "", "accent", "", "", "dim", "dim" });
+    }
+
+    void Resume() {
+        if (this.state != 2) { return; }
+        this.sfx.Play("click");
+        this.hud.menu.Hide();
+        this.state = 1;
+    }
+
+    void ShowResults() {
+        this.state = 4;
+        int secs = (int)this.game.gameTime;
+        bool newTime = this.profile.SubmitBest("time", secs);
+        bool newKills = this.profile.SubmitBest("kills", this.game.killCount);
+        bool newLevel = this.profile.SubmitBest("level", this.game.level);
+        this.profile.Add("kills_total", this.game.killCount);
+        this.profile.Save();
+        string record = "";
+        if (newTime && newKills) { record = "NEW BEST TIME & KILLS!"; }
+        else if (newTime) { record = "NEW BEST TIME!"; }
+        else if (newKills) { record = "NEW BEST KILLS!"; }
+        else if (newLevel) { record = "NEW BEST LEVEL!"; }
+        if (record != "") { this.sfx.Play("powerup", 0.8); }
+        this.RefreshMeta();
+        this.hud.menu.Show(SurvivorMenu.ModeResults, "YOU DIED", true, new string[]{
+            "SURVIVED  " + SurvivorHud.Clock(this.game.gameTime),
+            "KILLS  " + Convert.ToString(this.game.killCount) + "     LEVEL  " + Convert.ToString(this.game.level),
+            record,
+            "BEST  " + SurvivorHud.Clock((double)this.profile.Best("time")) + "  |  "
+                + Convert.ToString(this.profile.Best("kills")) + " kills  |  LV. " + Convert.ToString(this.profile.Best("level")),
+            "RUN #" + Convert.ToString(this.profile.Counter("plays")) + "  -  "
+                + Convert.ToString(this.profile.Counter("kills_total")) + " kills all-time",
+            "",
+            "ENTER / R play again     ESC menu"
+        }, new string[]{ "accent", "", "key", "", "dim", "", "dim" });
+    }
+
+    void ToggleMute() {
+        bool muted = !this.bus.IsSfxMuted();
+        this.bus.SetSfxMuted(muted);
+        this.profile.SetFlag("muted", muted);
+        if (!muted) { this.sfx.Play("click"); }
+        this.RefreshMeta();
     }
 
     public void Event(GuiHost host, int kind, int code) {
-        if (kind == 4) { // KeyDown
-            if (code == 27) { // ESC
-                host.RequestStop();
-            } else {
-                this.game.OnKeyDown(code);
-            }
-        } else if (kind == 5) { // KeyUp
+        if (kind == 5) { // KeyUp：方向键总要松开，哪怕面板正开着
             this.game.OnKeyUp(code);
+            return;
+        }
+        if (kind != 4) { return; }
+        // 焦点按钮已经处理了这次按键（空格/回车激活按钮），别再当快捷键用一次
+        if (host.App().IsKeyHandled()) { return; }
+        if (code == 77) { this.ToggleMute(); return; } // M
+        if (this.state == 0) {
+            if (code == 13 || code == 32) { this.StartRun(); }
+            else if (code == 27) { host.RequestStop(); } // 标题页 ESC 退出游戏
+        } else if (this.state == 1) {
+            if (code == 27 || code == 80) { this.Pause(); } // ESC / P
+            else { this.game.OnKeyDown(code); }
+        } else if (this.state == 2) {
+            if (code == 27 || code == 80) { this.Resume(); }
+            else if (code == 82) { this.StartRun(); }   // R
+            else if (code == 81) { this.ShowTitle(); }  // Q
+        } else if (this.state == 4) {
+            if (code == 13 || code == 32 || code == 82) { this.StartRun(); }
+            else if (code == 27) { this.ShowTitle(); }
         }
     }
 
     public void FixedUpdate(GuiHost host, int dt) {
-        this.game.Tick((double)dt / 1000.0);
+        // 标题、暂停、结算时世界静止；阵亡演出期间继续步进让震屏与跳字收尾
+        if (this.state == 1 || this.state == 3) {
+            this.game.Tick((double)dt / 1000.0);
+        }
+    }
+
+    // 逻辑计数 → 音效（射击限频且很轻，避免割草时满屏噪音）
+    void PlayEvents() {
+        if (this.game.shotCount != this.seenShots) { this.sfx.Play("shot", 1.0, 90); }
+        if (this.game.killCount != this.seenKills) { this.sfx.Play("kill", 1.0, 60); }
+        else if (this.game.hitCount != this.seenHits) { this.sfx.Play("hit", 0.45, 70); }
+        if (this.game.gemCount != this.seenGems) { this.sfx.Play("coin", 0.7, 60); }
+        if (this.game.level != this.seenLevel) { this.sfx.Play("powerup"); }
+        if (this.game.hurtCount != this.seenHurts && !this.game.dead) { this.sfx.Play("hurt"); }
+        this.seenShots = this.game.shotCount;
+        this.seenHits = this.game.hitCount;
+        this.seenKills = this.game.killCount;
+        this.seenGems = this.game.gemCount;
+        this.seenLevel = this.game.level;
+        this.seenHurts = this.game.hurtCount;
     }
 
     public void Update(GuiHost host, int dt) {
+        // 失焦/最小化自动暂停：割草游戏切走几秒回来就被围死了
+        bool active = host.WindowActive();
+        if (this.wasActive && !active) { this.Pause(); }
+        this.wasActive = active;
+
+        if (this.state == 1) {
+            this.PlayEvents();
+            this.hud.ShowHint(this.hintRun && this.game.gameTime < 8.0);
+            if (this.game.dead) {
+                this.sfx.Play("fail");
+                this.game.ReleaseKeys();
+                this.hud.ShowHint(false);
+                this.state = 3;
+                this.deathDelay = 1.2;
+            }
+        } else if (this.state == 3) {
+            this.deathDelay = this.deathDelay - (double)dt / 1000.0;
+            if (this.deathDelay <= 0.0) { this.ShowResults(); }
+        }
         this.hud.SyncState(host.App());
     }
 
@@ -40,14 +241,20 @@ public class SurvivorLoop : IGuiHostLoop {
 
     public void Stop(GuiHost host) {
         this.hud.Stop();
-        this.game.moveX = 0.0;
-        this.game.moveY = 0.0;
+        this.game.ReleaseKeys();
+        this.profile.Save();
+        this.sfx.Dispose();
+        // 菜单按钮的点击回调捕获了 this：断开 loop → hud → 按钮 → 回调 → loop 的环
+        this.hud = null;
     }
 }
 
 public class App {
     public static void Main() {
-        GuiHost host = new GuiHost("Survivor Roguelite - Zan Game", 1280, 720, 60);
+        // 第四个参数是固定步长毫秒数：16ms ≈ 60Hz，与回放仿真的 1/60 秒一帧一致
+        GuiHost host = new GuiHost("Survivor Roguelite - Zan Game", 1280, 720, 16);
+        // 自动化（ZAN_UI_SCRIPT / ZAN_UI_DUMP）须在窗口显示前启用；不设环境变量时无副作用
+        host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a));
         host.Run(new SurvivorLoop());
     }
 }

@@ -1,11 +1,19 @@
 using System;
 using Gui;
+using Game.Audio;
+using Game.Foundation;
 using Game.Foundation.Gui;
 using Fps3D;
 
+// 应用层：界面流程（开始页 → 对局 → 暂停/结算 → 重开）、音效、静音与
+// 玩家档案都在这里。FpsGame 只管世界与规则，无头回放（FpsSim）不经过本文件。
 public class FpsLoop : IGuiHostLoop {
     public FpsGame game;
     public FpsHud hud;
+    public FpsView view;
+    public GameProfile profile;
+    public AudioBus bus;
+    public SfxBank sfx;
     public bool sceneInited;
     public int lastMouseX;
     public int lastMouseY;
@@ -14,6 +22,12 @@ public class FpsLoop : IGuiHostLoop {
     public int rightDownX;
     public int rightDownY;
     public bool rightButtonDown;
+
+    // "title" / "play" / "pause" / "result"（与 FpsHud.mode 同步）
+    public string mode;
+    // 本局开始后经过的真实毫秒（新手提示只显示前几秒）
+    public int runShownMs;
+    public int toastMs;
 
     public void Start(GuiHost host) {
         // 关键：切换到 GPU 硬件加速后端 (1 = GL 3.3)，激活 3D 光栅化与深度缓冲管线
@@ -26,6 +40,26 @@ public class FpsLoop : IGuiHostLoop {
         this.game.drawResult = this.game.isGpuBackend ? 1 : 0;
         this.hud = new FpsHud(host.App(), this.game);
 
+        // 档案落在用户数据目录（ZAN_GAME_DATA_DIR 可改），不写工作目录
+        this.profile = GameProfile.Open("fps-3d");
+        this.view = new FpsView();
+        this.view.muted = this.profile.Flag("muted", false);
+        this.bus = new AudioBus();
+        this.bus.SetSfxMuted(this.view.muted);
+        this.sfx = new SfxBank(this.bus);
+        // 本游戏的声音：标记 = 清脆的上扫"叮"，未命中 = 短低音，脚步 = 低通噪声
+        this.sfx.AddSynth("tag", SfxPresets.Coin().WithSweep(1180.0, 2360.0).WithDuration(0.06));
+        this.sfx.AddSynth("miss", SfxPresets.Error().WithFrequency(120.0).WithDuration(0.05).WithGain(0.08));
+        SynthOptions step = new SynthOptions().WithWaveform(Waveform.Noise)
+            .WithDuration(0.03).WithEnvelope(0.001, 0.025, 0.0, 0.03).WithGain(0.12);
+        step.filter = new BiquadFilter(FilterKind.LowPass, 520.0, 0.7, 44100, 1);
+        this.sfx.AddSynth("step", step);
+        this.sfx.AddPresets(new string[] { "click", "select", "success", "powerup" });
+        this.sfx.Warm();
+        this.RefreshProfileView();
+
+        this.mode = "title";
+        this.hud.SetMode("title");
         this.sceneInited = false;
         this.isDragging = false;
         this.rightButtonDown = false;
@@ -35,36 +69,167 @@ public class FpsLoop : IGuiHostLoop {
         this.lastMouseY = host.MouseY();
     }
 
-    public void Event(GuiHost host, int kind, int code) {
-        if (kind == 4) { // KeyDown
-            if (code == 27) { // ESC 键：若处于自由视角模式则退出视角锁定；否则退出程序
-                if (this.game.freeLookMode) {
-                    this.game.freeLookMode = false;
-                } else {
-                    host.RequestStop();
-                }
-            } else if (code == 70) { // 'F' 键：快速切换自由视角模式
+    void RefreshProfileView() {
+        this.view.hasBest = this.profile.HasBest("time");
+        this.view.bestMs = this.profile.Best("time");
+        this.view.plays = this.profile.Counter("plays");
+        this.view.clears = this.profile.Counter("clears");
+    }
+
+    void SetMode(string m) {
+        this.mode = m;
+        this.hud.SetMode(m);
+        // 离开对局一律松开视角与按键（暂停“释放鼠标”）
+        if (m != "play") {
+            this.game.freeLookMode = false;
+            this.isDragging = false;
+            this.rightButtonDown = false;
+            this.game.ReleaseKeys();
+        }
+    }
+
+    void BeginRun(GuiHost host) {
+        this.game.Reset();
+        this.profile.Add("plays", 1);
+        this.profile.Save();
+        this.RefreshProfileView();
+        this.view.newBest = false;
+        this.view.toast = "";
+        this.runShownMs = 0;
+        this.lastMouseX = host.MouseX();
+        this.lastMouseY = host.MouseY();
+        this.SetMode("play");
+    }
+
+    void Pause(bool auto) {
+        if (this.mode != "play") { return; }
+        this.view.autoPaused = auto;
+        this.SetMode("pause");
+        this.sfx.Play("select", 0.6);
+    }
+
+    void Resume(GuiHost host) {
+        this.lastMouseX = host.MouseX();
+        this.lastMouseY = host.MouseY();
+        this.SetMode("play");
+        this.sfx.Play("select", 0.6);
+    }
+
+    void Finish() {
+        long ms = (long)this.game.elapsedMs;
+        this.view.lastMs = ms;
+        this.view.newBest = this.profile.SubmitLowest("time", ms);
+        this.profile.Add("clears", 1);
+        this.profile.Save();
+        this.RefreshProfileView();
+        this.SetMode("result");
+        this.sfx.Play("success");
+        if (this.view.newBest) { this.sfx.Play("powerup", 0.8); }
+    }
+
+    void ToggleMute() {
+        this.view.muted = !this.view.muted;
+        this.bus.SetSfxMuted(this.view.muted);
+        this.profile.SetFlag("muted", this.view.muted);
+        this.profile.Save();
+        this.sfx.Play("click");
+    }
+
+    void Toast(string text, bool good) {
+        this.view.toast = text;
+        this.view.toastGood = good;
+        this.toastMs = 900;
+    }
+
+    void TryTag() {
+        int r = this.game.TryTag();
+        if (r == 3) {
+            this.sfx.Play("tag");
+            this.Finish();
+        } else if (r == 2) {
+            this.sfx.Play("tag");
+            int left = this.game.targetCount - this.game.taggedCount;
+            this.Toast("TAGGED!  " + Convert.ToString(left) + " TO GO", true);
+        } else if (r == 1) {
+            this.sfx.Play("miss", 1.0, 150);
+            this.Toast("ALREADY TAGGED", false);
+        } else if (this.game.targetHit) {
+            this.sfx.Play("miss", 1.0, 150);
+            this.Toast("TOO FAR - GET WITHIN 30m", false);
+        } else {
+            this.sfx.Play("miss", 0.6, 150);
+        }
+    }
+
+    // 菜单/卡片动作：按钮点击与快捷键走同一入口
+    void Act(GuiHost host, string action) {
+        if (action == "") { return; }
+        this.sfx.Play("click");
+        if (this.mode == "title") {
+            if (action == "primary") { this.BeginRun(host); }
+            else if (action == "secondary") { host.RequestStop(); }
+        } else if (this.mode == "pause") {
+            if (action == "primary") { this.Resume(host); }
+            else if (action == "secondary") { this.BeginRun(host); }
+            else if (action == "tertiary") { host.RequestStop(); }
+        } else if (this.mode == "result") {
+            if (action == "primary") { this.BeginRun(host); }
+            else if (action == "secondary") { this.SetMode("title"); }
+            else if (action == "tertiary") { host.RequestStop(); }
+        }
+    }
+
+    void KeyDown(GuiHost host, int code) {
+        if (code == 77) { this.ToggleMute(); return; } // M
+        if (this.mode == "play") {
+            if (code == 27 || code == 80) { this.Pause(false); } // Esc / P
+            else if (code == 70) { // F：切换自由视角
                 this.game.freeLookMode = !this.game.freeLookMode;
                 this.lastMouseX = host.MouseX();
                 this.lastMouseY = host.MouseY();
             } else {
                 this.game.OnKeyDown(code);
             }
-        } else if (kind == 5) { // KeyUp
+            return;
+        }
+        bool confirm = code == 13 || code == 32;
+        if (this.mode == "title") {
+            if (confirm) { this.Act(host, "primary"); }
+            else if (code == 27) { this.Act(host, "secondary"); }
+        } else if (this.mode == "pause") {
+            if (code == 27 || code == 80 || code == 13) { this.Act(host, "primary"); }
+            else if (code == 82) { this.Act(host, "secondary"); } // R
+        } else if (this.mode == "result") {
+            if (confirm || code == 82) { this.Act(host, "primary"); }
+            else if (code == 27) { this.Act(host, "secondary"); }
+        }
+    }
+
+    public void Event(GuiHost host, int kind, int code) {
+        if (kind == 4) { // KeyDown
+            this.KeyDown(host, code);
+            return;
+        }
+        if (kind == 5) { // KeyUp（任何模式都松开，防止暂停时按住的键卡住）
             this.game.OnKeyUp(code);
-        } else if (kind == 2) { // MouseDown (code: 0=左键, 1=右键)
+            return;
+        }
+        if (this.mode != "play") { return; } // 菜单/卡片上的指针交给标准按钮
+        if (kind == 2) { // MouseDown (code: 0=左键, 1=右键)
             int mx = host.MouseX();
             int my = host.MouseY();
             this.isDragging = true;
             this.lastMouseX = mx;
             this.lastMouseY = my;
 
-            if (code == 1) { // 右键按下，记录起始坐标以识别单击与拖拽
+            if (code == 0) { // 左键：标记准星对准的目标
+                this.TryTag();
+            } else if (code == 1) { // 右键按下，记录起始坐标以识别单击与拖拽
                 this.rightButtonDown = true;
                 this.rightDownX = mx;
                 this.rightDownY = my;
             }
-        } else if (kind == 3) { // MouseUp (code: 0=左键, 1=右键)
+        } else if (kind == 3) { // MouseUp
             int mx = host.MouseX();
             int my = host.MouseY();
             this.isDragging = false;
@@ -100,7 +265,14 @@ public class FpsLoop : IGuiHostLoop {
     }
 
     public void FixedUpdate(GuiHost host, int dt) {
+        // 只有对局中推进世界与计时；暂停/菜单/结算时世界静止
+        if (this.mode != "play") { return; }
         this.game.Tick((double)dt / 1000.0);
+        // 脚步：贴地走动时每 ~0.36 秒一声（AudioBus 限频）
+        bool walking = this.game.keyFwd || this.game.keyBwd || this.game.keyLeft || this.game.keyRight;
+        if (walking && this.game.controller.Position.Y < 2.2f) {
+            this.sfx.Play("step", 0.5, 360);
+        }
     }
 
     public void Update(GuiHost host, int dt) {
@@ -108,7 +280,20 @@ public class FpsLoop : IGuiHostLoop {
             this.game.InitScene(host.App().canvas);
             this.sceneInited = true;
         }
-        this.hud.SyncState(host.App());
+        this.bus.Update(dt);
+        // 切走窗口/最小化时自动暂停（主循环在后台仍会步进逻辑）
+        if (this.mode == "play" && !host.WindowActive()) { this.Pause(true); }
+        this.Act(host, this.hud.TakeAction());
+        if (this.mode == "play") {
+            this.runShownMs = this.runShownMs + dt;
+            if (this.toastMs > 0) {
+                this.toastMs = this.toastMs - dt;
+                if (this.toastMs <= 0) { this.view.toast = ""; }
+            }
+        }
+        // 新手提示：前两局全程显示，之后只在开局 8 秒内显示
+        this.view.showHint = this.view.plays <= 2 || this.runShownMs < 8000;
+        this.hud.SyncState(host.App(), this.view);
     }
 
     public void Render(GuiHost host, Canvas c, double alpha) {
@@ -120,18 +305,17 @@ public class FpsLoop : IGuiHostLoop {
         this.hud.Stop();
         this.isDragging = false;
         this.rightButtonDown = false;
-        this.game.keyFwd = false;
-        this.game.keyBwd = false;
-        this.game.keyLeft = false;
-        this.game.keyRight = false;
-        this.game.keyUp = false;
-        this.game.keyDown = false;
+        this.game.ReleaseKeys();
+        this.profile.Save();
+        this.sfx.Dispose();
     }
 }
 
 public class App {
     public static void Main() {
-        GuiHost host = new GuiHost("3D First-Person Explorer - Zan Game", 1280, 720, 60);
+        GuiHost host = new GuiHost("3D First-Person Target Tag - Zan Game", 1280, 720, 60);
+        // UiDriver automation (ZAN_UI_SCRIPT / ZAN_UI_DUMP) must be enabled before the window shows.
+        host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a));
         host.Run(new FpsLoop());
     }
 }

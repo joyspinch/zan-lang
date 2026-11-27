@@ -1,16 +1,95 @@
+// 战场绘制画布控件：把 Program 的绘制挂进 GUI 树，并把指针手势翻译成指挥动作
+// （左键点选 / 拖拽框选，右键行军）。可取焦点，键盘事件经它冒泡到 RtsRoot。
 using System;
 using System.Collections.Generic;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
 using Game.Tactics;
 using Game.Core;
 
 public class BattlefieldView : Control {
-    Program host;
+    weak Program host;  // 回指宿主：weak 断开 Program.view ↔ host 的引用环
+
+    // 左键框选手势（控件坐标系内的屏幕像素）
+    bool dragging = false;
+    int dragX0 = 0;
+    int dragY0 = 0;
+    int dragX1 = 0;
+    int dragY1 = 0;
 
     BattlefieldView(Program host) {
         this.InitControl("battlefield");
         this.host = host;
+    }
+
+    public override int InputFocusCapabilities() { return 1; }
+
+    public bool Dragging() { return this.dragging; }
+    public int DragLeft() { return Math.Min(this.dragX0, this.dragX1); }
+    public int DragTop() { return Math.Min(this.dragY0, this.dragY1); }
+    public int DragWidth() { return this.dragX1 > this.dragX0 ? this.dragX1 - this.dragX0 : this.dragX0 - this.dragX1; }
+    public int DragHeight() { return this.dragY1 > this.dragY0 ? this.dragY1 - this.dragY0 : this.dragY0 - this.dragY1; }
+
+    public void CancelDrag() {
+        this.dragging = false;
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        App app = this.FindApp();
+        if (e.handled || app == null) { return; }
+        this.Focus(app);
+        if (!host.AcceptsBattleInput()) { return; }
+        if (e.button == 1) {
+            // 右键：选中单位向该点行军
+            host.OrderMoveAt(e.x - this.bx, e.y - this.by);
+            e.Handle();
+            return;
+        }
+        if (e.button != 0) { return; }
+        this.dragging = true;
+        this.dragX0 = e.x;
+        this.dragY0 = e.y;
+        this.dragX1 = e.x;
+        this.dragY1 = e.y;
+        app.CapturePointer(this, true);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (!this.dragging) { return; }
+        this.dragX1 = Math.Max(this.bx, Math.Min(e.x, this.bx + this.bw - 1));
+        this.dragY1 = Math.Max(this.by, Math.Min(e.y, this.by + this.bh - 1));
+        App app = this.FindApp();
+        if (app != null) { app.RequestRedraw(); }
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        if (!this.dragging || e.button != 0) { return; }
+        this.dragX1 = Math.Max(this.bx, Math.Min(e.x, this.bx + this.bw - 1));
+        this.dragY1 = Math.Max(this.by, Math.Min(e.y, this.by + this.bh - 1));
+        bool additive = Modifiers.HasShift(e.modifiers);
+        this.CancelDrag();
+        if (!host.AcceptsBattleInput()) { return; }
+        if (this.DragWidth() < 6 && this.DragHeight() < 6) {
+            host.SelectAt(this.dragX1 - this.bx, this.dragY1 - this.by, additive);
+        } else {
+            host.SelectBox(this.DragLeft() - this.bx, this.DragTop() - this.by,
+                           this.DragLeft() + this.DragWidth() - this.bx,
+                           this.DragTop() + this.DragHeight() - this.by, additive);
+        }
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        this.CancelDrag();
     }
 
     override void OnPaint(App app) {

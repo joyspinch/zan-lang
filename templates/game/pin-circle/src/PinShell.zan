@@ -1,0 +1,74 @@
+using System;
+using Game.Audio;
+using Game.Foundation;
+
+namespace PinCircle;
+
+// App-layer shell: player profile (best cleared level, plays, pins) and
+// procedural sound effects. The simulation (PinWorld / PinSim) never sees it,
+// so headless replays stay free of audio, clocks and save files.
+public class PinShell {
+    GameProfile profile;
+    AudioBus bus;
+    SfxBank sfx;
+    bool lastNewBest;
+
+    PinShell() {
+        this.profile = GameProfile.Open("pin-circle");
+        this.bus = new AudioBus();
+        this.sfx = new SfxBank(this.bus);
+        this.sfx.AddPresets(new string[] { "click", "select", "fail", "success", "powerup" });
+        // Pin Circle's own voice: a bright whoosh, rising brass ticks as the
+        // rotor fills, a dull clank on collision and soft rotor cues.
+        this.sfx.AddSynth("launch", SfxPresets.Launch().WithSweep(380.0, 1250.0).WithDuration(0.065));
+        this.sfx.AddSynth("land0", SfxPresets.Coin().WithSweep(1180.0, 1680.0).WithDuration(0.045));
+        this.sfx.AddSynth("land1", SfxPresets.Coin().WithSweep(1320.0, 1880.0).WithDuration(0.045));
+        this.sfx.AddSynth("land2", SfxPresets.Coin().WithSweep(1480.0, 2110.0).WithDuration(0.045));
+        this.sfx.AddSynth("land3", SfxPresets.Coin().WithSweep(1660.0, 2360.0).WithDuration(0.045));
+        this.sfx.AddSynth("clank", SfxPresets.Hit().WithDuration(0.08));
+        this.sfx.AddSynth("reverse", SfxPresets.Select().WithSweep(760.0, 430.0).WithDuration(0.09).WithGain(0.16));
+        this.sfx.AddSynth("surge", SfxPresets.Select().WithSweep(430.0, 760.0).WithDuration(0.07).WithGain(0.12));
+        this.bus.SetSfxMuted(this.profile.Flag("muted", false));
+        this.sfx.Warm();
+    }
+
+    bool Muted() { return this.bus.IsSfxMuted(); }
+
+    void ToggleMute() {
+        bool muted = !this.bus.IsSfxMuted();
+        this.bus.SetSfxMuted(muted);
+        this.profile.SetFlag("muted", muted);
+        this.Play("click");
+    }
+
+    void Tick(int dtMs) { this.bus.Update(dtMs); }
+
+    void Play(string name) { this.sfx.Play(name); }
+    void Play(string name, double gain) { this.sfx.Play(name, gain); }
+
+    // Brass tick pitch climbs with how full the rotor is.
+    void Land(int inserted, int target) {
+        int step = target <= 0 ? 0 : (inserted * 4 - 1) / target;
+        if (step < 0) { step = 0; }
+        if (step > 3) { step = 3; }
+        this.sfx.Play("land" + step);
+    }
+
+    long BestLevel() { return this.profile.Best("level"); }
+    long Plays() { return this.profile.Counter("plays"); }
+    long Pins() { return this.profile.Counter("pins"); }
+    bool NewBest() { return this.lastNewBest; }
+
+    void CountPlay() {
+        this.profile.Add("plays", 1);
+        this.profile.Save();
+    }
+
+    // Records one finished round; returns true when it set a new best cleared level.
+    bool RecordRound(int level, int inserted, bool won) {
+        this.profile.Add("pins", inserted);
+        this.lastNewBest = won && this.profile.SubmitBest("level", level);
+        if (!this.lastNewBest) { this.profile.Save(); }
+        return this.lastNewBest;
+    }
+}
