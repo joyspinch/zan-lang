@@ -10,9 +10,23 @@ class LspProjectManifests {
     public Dictionary<string, bool> Paths = new Dictionary<string, bool>();
 }
 
+public class LspDiskFile {
+    public string Uri;
+    public string FilePath;
+    public string Text;
+
+    public LspDiskFile(string uri, string filePath, string text) {
+        Uri = uri;
+        FilePath = filePath;
+        Text = text;
+    }
+}
+
 public partial class LspServer {
     static string workspaceRoot;
     static Dictionary<string, LspProjectManifests> projectManifests = new Dictionary<string, LspProjectManifests>();
+    static Dictionary<string, List<LspDiskFile>> projectDiskFiles = new Dictionary<string, List<LspDiskFile>>();
+    static Dictionary<string, List<LspSymbol>> projectDiskSymbols = new Dictionary<string, List<LspSymbol>>();
 
     static string WorkspacePath(string uri) {
         if (!uri.StartsWith("file://")) { return ""; }
@@ -195,6 +209,8 @@ public partial class LspServer {
         }
         if (open.Count == 0) {
             projectManifests.Remove(key);
+            projectDiskFiles.Remove(key);
+            projectDiskSymbols.Remove(key);
             return;
         }
 
@@ -215,6 +231,8 @@ public partial class LspServer {
         AppendDiskSources(root, paths, manifests.Paths);
         projectManifests[key] = manifests;
         paths.Sort();
+        List<LspDiskFile> diskFiles = new List<LspDiskFile>();
+        List<LspSymbol> diskSyms = new List<LspSymbol>();
         for (int i = 0; i < paths.Count; i = i + 1) {
             string path = paths[i];
             #if WINDOWS
@@ -227,10 +245,14 @@ public partial class LspServer {
             } catch (IOException ex) {
                 continue;
             }
+            string fileUri = PathToUri(path);
+            diskFiles.Add(new LspDiskFile(fileUri, path, text));
             names.Add("");
             starts.Add(line);
-            line = AppendDiagnosticSource(unit, diagnostics, text, line);
+            line = AppendDiagnosticSourceIndexed(unit, diagnostics, text, line, fileUri, diskSyms);
         }
+        projectDiskFiles[key] = diskFiles;
+        projectDiskSymbols[key] = diskSyms;
 
         diagnostics.SetFiles(names, starts);
         Parser resolver = new Parser(new List<Token>(), diagnostics);
@@ -265,5 +287,737 @@ public partial class LspServer {
         Node source = parser.ParseSourceDecls();
         for (int i = 0; i < source.kids.Count; i = i + 1) { unit.Add(source.kids[i]); }
         return lexer.line + 1;
+    }
+
+    static int AppendDiagnosticSourceIndexed(Node unit, Diags diagnostics, string text,
+            int line, string fileUri, List<LspSymbol> dstSymbols) {
+        Lexer lexer = new Lexer(text);
+        lexer.line = line;
+        List<Token> tokens = lexer.Run();
+        ReadLexerDiagnostics(lexer, diagnostics);
+        int lineOffset = line - 1;
+        CollectTopLevelSymbolsInto(dstSymbols, fileUri, tokens, lineOffset);
+        Parser parser = new Parser(tokens, diagnostics);
+        Node source = parser.ParseSourceDecls();
+        CollectMemberSymbolsInto(dstSymbols, fileUri, source, lineOffset);
+        for (int i = 0; i < source.kids.Count; i = i + 1) { unit.Add(source.kids[i]); }
+        return lexer.line + 1;
+    }
+
+    static string PathToUri(string path) {
+        if (path == null || path == "") { return ""; }
+        string p = path.Replace("\\", "/");
+        if (p.Length >= 2 && p[1] == ':' && p[0] >= 'a' && p[0] <= 'z') {
+            char upper = (char)((int)p[0] - 32);
+            p = Convert.ToString(upper) + p.Substring(1);
+        }
+        string hex = "0123456789ABCDEF";
+        StringBuilder sb = new StringBuilder();
+        if (p.StartsWith("/")) { sb.Append("file://"); }
+        else { sb.Append("file:///"); }
+        int i = 0;
+        while (i < p.Length) {
+            int b = (int)p[i] & 255;
+            bool safe = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+                || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.'
+                || b == '~' || b == '/' || (b == ':' && i == 1);
+            if (safe) {
+                sb.Append(p[i]);
+            } else {
+                sb.Append('%');
+                sb.Append(hex[(b >> 4) & 15]);
+                sb.Append(hex[b & 15]);
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static bool DocInScope(LspDocument active, LspDocument candidate) {
+        if (candidate == null) { return false; }
+        if (active == null || active.ProjectRoot == "") {
+            return candidate.ProjectRoot == "";
+        }
+        return PathKey(candidate.ProjectRoot) == PathKey(active.ProjectRoot);
+    }
+
+    static List<LspDiskFile> ProjectSourcesFor(LspDocument doc) {
+        EnsureInit();
+        List<LspDiskFile> result = new List<LspDiskFile>();
+        int i = 0;
+        while (i < documents.Count) {
+            LspDocument d = documents[i];
+            if (DocInScope(doc, d)) {
+                result.Add(new LspDiskFile(d.Uri, d.FilePath, d.Text));
+            }
+            i = i + 1;
+        }
+        if (doc != null && doc.ProjectRoot != "") {
+            string key = PathKey(doc.ProjectRoot);
+            if (projectDiskFiles.ContainsKey(key)) {
+                List<LspDiskFile> disk = projectDiskFiles[key];
+                int j = 0;
+                while (j < disk.Count) {
+                    result.Add(disk[j]);
+                    j = j + 1;
+                }
+            }
+        }
+        return result;
+    }
+
+    static List<LspSymbol> ProjectSymbolsFor(LspDocument doc) {
+        EnsureInit();
+        Dictionary<string, bool> allowedUris = new Dictionary<string, bool>();
+        int i = 0;
+        while (i < documents.Count) {
+            LspDocument d = documents[i];
+            if (DocInScope(doc, d)) { allowedUris[d.Uri] = true; }
+            i = i + 1;
+        }
+        List<LspSymbol> result = new List<LspSymbol>();
+        i = 0;
+        while (i < symbols.Count) {
+            LspSymbol s = symbols[i];
+            if (allowedUris.ContainsKey(s.Uri)) { result.Add(s); }
+            i = i + 1;
+        }
+        if (doc != null && doc.ProjectRoot != "") {
+            string key = PathKey(doc.ProjectRoot);
+            if (projectDiskSymbols.ContainsKey(key)) {
+                List<LspSymbol> disk = projectDiskSymbols[key];
+                int j = 0;
+                while (j < disk.Count) {
+                    result.Add(disk[j]);
+                    j = j + 1;
+                }
+            }
+        }
+        return result;
+    }
+
+    static string LookupSourceText(LspDocument doc, string targetUri) {
+        LspDocument open = FindDocument(targetUri);
+        if (open != null) { return open.Text; }
+        if (doc != null && doc.ProjectRoot != "") {
+            string key = PathKey(doc.ProjectRoot);
+            if (projectDiskFiles.ContainsKey(key)) {
+                List<LspDiskFile> disk = projectDiskFiles[key];
+                int i = 0;
+                while (i < disk.Count) {
+                    if (disk[i].Uri == targetUri) { return disk[i].Text; }
+                    i = i + 1;
+                }
+            }
+        }
+        List<string> keys = projectDiskFiles.Keys;
+        int k = 0;
+        while (k < keys.Count) {
+            List<LspDiskFile> disk = projectDiskFiles[keys[k]];
+            int i = 0;
+            while (i < disk.Count) {
+                if (disk[i].Uri == targetUri) { return disk[i].Text; }
+                i = i + 1;
+            }
+            k = k + 1;
+        }
+        return null;
+    }
+
+    static LspSymbol FindSymbolFor(LspDocument doc, string name, string receiverType) {
+        List<LspSymbol> pool = ProjectSymbolsFor(doc);
+        if (receiverType != "") {
+            int i = 0;
+            while (i < pool.Count) {
+                LspSymbol s = pool[i];
+                if (s.Name == name && s.ContainerName == receiverType
+                        && s.Kind != LspSymbol.KindCtor()) {
+                    return s;
+                }
+                i = i + 1;
+            }
+        }
+        int j = 0;
+        while (j < pool.Count) {
+            LspSymbol s = pool[j];
+            if (s.Name == name && s.Kind != LspSymbol.KindCtor()) { return s; }
+            j = j + 1;
+        }
+        int k = 0;
+        while (k < pool.Count) {
+            if (pool[k].Name == name) { return pool[k]; }
+            k = k + 1;
+        }
+        return null;
+    }
+
+    static int CountCallArgs(string text, int openParen) {
+        if (text == null || openParen < 0 || openParen >= text.Length || text[openParen] != '(') {
+            return 0;
+        }
+        int i = openParen + 1;
+        int n = text.Length;
+        while (i < n && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n')) {
+            i = i + 1;
+        }
+        if (i >= n || text[i] == ')') { return 0; }
+        int count = 1;
+        int depth = 1;
+        while (i < n && depth > 0) {
+            char ch = text[i];
+            if (ch == '"' || ch == '\'') {
+                char q = ch;
+                i = i + 1;
+                while (i < n && text[i] != q) {
+                    if (text[i] == '\\' && i + 1 < n) { i = i + 1; }
+                    i = i + 1;
+                }
+                if (i < n) { i = i + 1; }
+                continue;
+            }
+            if (ch == '(' || ch == '[' || ch == '{') { depth = depth + 1; }
+            else if (ch == ')' || ch == ']' || ch == '}') { depth = depth - 1; }
+            else if (ch == ',' && depth == 1) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    static LspSymbol FindCallableSymbol(List<LspSymbol> pool, string name,
+            string receiverType, int argCount) {
+        LspSymbol fallbackRecv = null;
+        LspSymbol fallbackGeRecv = null;
+        LspSymbol fallbackAny = null;
+        LspSymbol fallbackGeAny = null;
+        LspSymbol exactAny = null;
+        int i = 0;
+        while (i < pool.Count) {
+            LspSymbol s = pool[i];
+            bool isCall = s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindCtor()
+                || s.Kind == LspSymbol.KindDelegate();
+            if (isCall && s.Name == name && s.ParamNames.Count > 0) {
+                bool recvMatch = receiverType != "" && s.ContainerName == receiverType
+                    && s.Kind != LspSymbol.KindCtor();
+                if (recvMatch) {
+                    if (argCount > 0 && s.ParamNames.Count == argCount) { return s; }
+                    if (argCount > 0 && s.ParamNames.Count >= argCount && fallbackGeRecv == null) {
+                        fallbackGeRecv = s;
+                    }
+                    if (fallbackRecv == null) { fallbackRecv = s; }
+                }
+                if (argCount > 0 && s.ParamNames.Count == argCount && exactAny == null) {
+                    exactAny = s;
+                }
+                if (argCount > 0 && s.ParamNames.Count >= argCount && fallbackGeAny == null) {
+                    fallbackGeAny = s;
+                }
+                if (fallbackAny == null) { fallbackAny = s; }
+            }
+            i = i + 1;
+        }
+        if (fallbackGeRecv != null) { return fallbackGeRecv; }
+        if (fallbackRecv != null) { return fallbackRecv; }
+        if (exactAny != null) { return exactAny; }
+        if (fallbackGeAny != null) { return fallbackGeAny; }
+        return fallbackAny;
+    }
+
+    static string DotReceiverBeforeOffset(string text, int offset) {
+        if (text == null || offset <= 0 || offset > text.Length) { return ""; }
+        int p = offset - 1;
+        while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
+        if (p < 0 || text[p] != '.') { return ""; }
+        p = p - 1;
+        while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
+        if (p < 0 || !IsWordChar(text[p])) { return ""; }
+        int end = p + 1;
+        while (p >= 0 && IsWordChar(text[p])) { p = p - 1; }
+        return text.Substring(p + 1, end - p - 1);
+    }
+
+    static string DotReceiverForWord(string text, int line0, int byteCol0) {
+        if (text == null) { return ""; }
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return ""; }
+        int ws = WordStartAt(text, line0, byteCol0);
+        return DotReceiverBeforeOffset(text, ls + ws);
+    }
+
+    static string DotReceiverBeforeCompletion(string text, int line0, int byteCol0) {
+        if (text == null || byteCol0 <= 0) { return ""; }
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return ""; }
+        int cur = ls + byteCol0;
+        if (cur > text.Length) { cur = text.Length; }
+        while (cur > ls && IsWordChar(text[cur - 1])) { cur = cur - 1; }
+        return DotReceiverBeforeOffset(text, cur);
+    }
+
+    static bool IsTypeSymbolKind(int kind) {
+        return kind == LspSymbol.KindClass() || kind == LspSymbol.KindInterface()
+            || kind == LspSymbol.KindStruct() || kind == LspSymbol.KindEnum();
+    }
+
+    static string ResolveReceiverType(LspDocument doc, string receiverName, int line0) {
+        if (doc == null || receiverName == null || receiverName == "") { return ""; }
+        List<LspSymbol> pool = ProjectSymbolsFor(doc);
+        if (receiverName == "this") {
+            string best = "";
+            int bestLine = -1;
+            int i = 0;
+            while (i < pool.Count) {
+                LspSymbol s = pool[i];
+                if (s.Uri == doc.Uri && IsTypeSymbolKind(s.Kind)
+                        && s.Line - 1 <= line0 && s.Line > bestLine) {
+                    best = s.Name;
+                    bestLine = s.Line;
+                }
+                i = i + 1;
+            }
+            return best;
+        }
+        int ti = 0;
+        while (ti < pool.Count) {
+            LspSymbol s = pool[ti];
+            if (IsTypeSymbolKind(s.Kind) && s.Name == receiverName) {
+                return s.Name;
+            }
+            ti = ti + 1;
+        }
+        // Scan document tokens for `TypeName receiverName` or `var receiverName = new TypeName(...)`.
+        Lexer lx = new Lexer(doc.Text);
+        List<Token> toks = lx.Run();
+        string found = "";
+        int i2 = 0;
+        while (i2 < toks.Count) {
+            if (toks[i2].kind == TK.Ident() && toks[i2].text == receiverName) {
+                if (i2 > 0 && toks[i2 - 1].kind == TK.Var()) {
+                    if (i2 + 3 < toks.Count && toks[i2 + 1].kind == TK.Eq()
+                            && toks[i2 + 2].kind == TK.New()
+                            && toks[i2 + 3].kind == TK.Ident()) {
+                        found = toks[i2 + 3].text;
+                    }
+                } else if (i2 > 0) {
+                    int prev = i2 - 1;
+                    // Skip array/generic suffix such as `Service[]` or `List<Service>`.
+                    if (toks[prev].kind == TK.RBracket()) {
+                        while (prev > 0 && toks[prev].kind != TK.LBracket()) { prev = prev - 1; }
+                        if (prev > 0) { prev = prev - 1; }
+                    }
+                    if (prev >= 0 && toks[prev].kind == TK.Greater()) {
+                        int depth = 1;
+                        prev = prev - 1;
+                        while (prev > 0 && depth > 0) {
+                            if (toks[prev].kind == TK.Greater()) { depth = depth + 1; }
+                            else if (toks[prev].kind == TK.Less()) { depth = depth - 1; }
+                            prev = prev - 1;
+                        }
+                    }
+                    if (prev >= 0 && toks[prev].kind == TK.Ident()
+                            && !IsKeywordWord(toks[prev].text)) {
+                        string candidate = toks[prev].text;
+                        if (toks[i2].line - 1 <= line0 || found == "") {
+                            found = candidate;
+                        }
+                    }
+                }
+            }
+            i2 = i2 + 1;
+        }
+        if (found != "") { return found; }
+        // Fallback: field with matching name in current doc/project whose TypeName is known.
+        int fi = 0;
+        while (fi < pool.Count) {
+            LspSymbol s = pool[fi];
+            if (s.Kind == LspSymbol.KindField() && s.Name == receiverName && s.TypeName != "") {
+                return s.TypeName;
+            }
+            fi = fi + 1;
+        }
+        return "";
+    }
+
+    static string FormatSignatureLabel(LspSymbol sym) {
+        StringBuilder sb = new StringBuilder();
+        if (sym.Kind != LspSymbol.KindCtor() && sym.TypeName != "") {
+            sb.Append(sym.TypeName);
+            sb.Append(' ');
+        }
+        sb.Append(sym.Name);
+        sb.Append('(');
+        int i = 0;
+        while (i < sym.ParamNames.Count) {
+            if (i > 0) { sb.Append(", "); }
+            string pt = i < sym.ParamTypes.Count ? sym.ParamTypes[i] : "";
+            if (pt != "") {
+                sb.Append(pt);
+                sb.Append(' ');
+            }
+            sb.Append(sym.ParamNames[i]);
+            i = i + 1;
+        }
+        sb.Append(')');
+        return sb.ToString();
+    }
+
+    static string SymbolDetail(LspSymbol sym) {
+        if (sym.Kind == LspSymbol.KindMethod() || sym.Kind == LspSymbol.KindCtor()
+                || sym.Kind == LspSymbol.KindDelegate()) {
+            return FormatSignatureLabel(sym);
+        }
+        if (sym.Kind == LspSymbol.KindField() && sym.TypeName != "") {
+            return sym.TypeName + " (" + sym.KindText() + ")";
+        }
+        if (sym.ContainerName != "") {
+            return sym.KindText() + " in " + sym.ContainerName;
+        }
+        return sym.KindText();
+    }
+
+    static string FormatHoverMarkdown(LspSymbol sym) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append('`');
+        if (sym.Kind == LspSymbol.KindMethod() || sym.Kind == LspSymbol.KindCtor()
+                || sym.Kind == LspSymbol.KindDelegate()) {
+            sb.Append(FormatSignatureLabel(sym));
+        } else {
+            sb.Append(sym.Name);
+        }
+        sb.Append("` — ");
+        sb.Append(sym.KindText());
+        if (sym.Kind == LspSymbol.KindField() && sym.TypeName != "") {
+            sb.Append(" (`");
+            sb.Append(sym.TypeName);
+            sb.Append("`)");
+        }
+        if (sym.ContainerName != "") {
+            sb.Append(" in `");
+            sb.Append(sym.ContainerName);
+            sb.Append('`');
+        }
+        sb.Append("\n\ndeclared at ");
+        sb.Append(sym.Uri);
+        sb.Append(':');
+        sb.Append(sym.Line);
+        return sb.ToString();
+    }
+
+    static void HandleWorkspaceSymbol(string id, string pms) {
+        EnsureInit();
+        string query = ExtractJsonField(pms, "query").ToLower();
+        List<LspSymbol> candidates = new List<LspSymbol>();
+        int i = 0;
+        while (i < symbols.Count) {
+            candidates.Add(symbols[i]);
+            i = i + 1;
+        }
+        List<string> pkeys = projectDiskSymbols.Keys;
+        int pk = 0;
+        while (pk < pkeys.Count) {
+            List<LspSymbol> dsyms = projectDiskSymbols[pkeys[pk]];
+            int j = 0;
+            while (j < dsyms.Count) {
+                candidates.Add(dsyms[j]);
+                j = j + 1;
+            }
+            pk = pk + 1;
+        }
+        if (pkeys.Count == 0 && workspaceRoot != null && workspaceRoot != "") {
+            Dictionary<string, bool> overlays = new Dictionary<string, bool>();
+            int oi = 0;
+            while (oi < documents.Count) {
+                if (documents[oi].FilePath != "") {
+                    overlays[PathKey(documents[oi].FilePath)] = true;
+                }
+                oi = oi + 1;
+            }
+            List<string> paths = new List<string>();
+            Dictionary<string, bool> ignoredManifests = new Dictionary<string, bool>();
+            AppendDiskSources(workspaceRoot, paths, ignoredManifests);
+            paths.Sort();
+            int pi = 0;
+            while (pi < paths.Count) {
+                string path = paths[pi];
+                #if WINDOWS
+                path = path.Replace("\\", "/");
+                #endif
+                if (!overlays.ContainsKey(PathKey(path))) {
+                    try {
+                        string text = File.ReadAllText(path);
+                        string furi = PathToUri(path);
+                        Lexer lx = new Lexer(text);
+                        List<Token> toks = lx.Run();
+                        CollectTopLevelSymbolsInto(candidates, furi, toks, 0);
+                        Diags dg = new Diags();
+                        Parser ps = new Parser(toks, dg);
+                        Node unit = ps.ParseSourceDecls();
+                        CollectMemberSymbolsInto(candidates, furi, unit, 0);
+                    } catch (IOException ex) {
+                    }
+                }
+                pi = pi + 1;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":[");
+        int emitted = 0;
+        int ci = 0;
+        while (ci < candidates.Count && emitted < 256) {
+            LspSymbol sym = candidates[ci];
+            ci = ci + 1;
+            if (sym.Name == null || sym.Name == "") { continue; }
+            if (query != "" && !sym.Name.ToLower().Contains(query)) { continue; }
+            string ttext = LookupSourceText(null, sym.Uri);
+            int line0 = sym.Line - 1;
+            if (line0 < 0) { line0 = 0; }
+            int col0 = sym.Col - 1;
+            if (col0 < 0) { col0 = 0; }
+            int u16s = SymColOf(ttext, line0, col0);
+            int u16e = ttext != null
+                ? Utf16ColOf(ttext, line0, col0 + sym.Name.Length)
+                : u16s + sym.Name.Length;
+            if (emitted > 0) { sb.Append(','); }
+            emitted = emitted + 1;
+            sb.Append("{\"name\":");
+            sb.Append(EncodeJsonString(sym.Name));
+            sb.Append(",\"kind\":");
+            sb.Append(sym.SymbolKind());
+            if (sym.ContainerName != "") {
+                sb.Append(",\"containerName\":");
+                sb.Append(EncodeJsonString(sym.ContainerName));
+            }
+            sb.Append(",\"location\":{\"uri\":");
+            sb.Append(EncodeJsonString(sym.Uri));
+            sb.Append(",\"range\":{\"start\":");
+            sb.Append(PosJson(line0, u16s));
+            sb.Append(",\"end\":");
+            sb.Append(PosJson(line0, u16e));
+            sb.Append("}}}");
+        }
+        sb.Append("]}");
+        SendResponse(sb.ToString());
+    }
+
+    static bool IsControlCallKeyword(string w) {
+        return w == "if" || w == "while" || w == "for" || w == "foreach"
+            || w == "switch" || w == "catch" || w == "return" || w == "sizeof"
+            || w == "typeof";
+    }
+
+    static void HandleSignatureHelp(string id, string pms) {
+        string td = ExtractJsonContainer(pms, "textDocument");
+        string uri = ExtractJsonField(td, "uri");
+        string pos = ExtractJsonContainer(pms, "position");
+        int line = ExtractJsonInt(pos, "line", 0);
+        int character = ExtractJsonInt(pos, "character", 0);
+        LspDocument doc = FindDocument(uri);
+        if (doc == null || doc.Text == null) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int ls = LineStartOf(doc.Text, line);
+        if (ls < 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int bcol = ByteColAt(doc.Text, line, character);
+        int cursor = ls + bcol;
+        if (cursor > doc.Text.Length) { cursor = doc.Text.Length; }
+
+        // Forward scan up to cursor so strings/comments (including cursors inside
+        // an open string argument) and nested calls/brackets are tracked accurately.
+        List<int> stackKind = new List<int>();
+        List<int> stackPos = new List<int>();
+        List<int> stackCommas = new List<int>();
+        int p = 0;
+        while (p < cursor) {
+            char c = doc.Text[p];
+            if (c == '/' && p + 1 < cursor && doc.Text[p + 1] == '/') {
+                p = p + 2;
+                while (p < cursor && doc.Text[p] != '\n') { p = p + 1; }
+                continue;
+            }
+            if (c == '/' && p + 1 < cursor && doc.Text[p + 1] == '*') {
+                p = p + 2;
+                while (p + 1 < cursor && !(doc.Text[p] == '*' && doc.Text[p + 1] == '/')) {
+                    p = p + 1;
+                }
+                p = p + 2;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                char q = c;
+                p = p + 1;
+                while (p < cursor && doc.Text[p] != q) {
+                    if (doc.Text[p] == '\\' && p + 1 < cursor) { p = p + 1; }
+                    p = p + 1;
+                }
+                if (p < cursor) { p = p + 1; }
+                continue;
+            }
+            if (c == '(') {
+                stackKind.Add(0);
+                stackPos.Add(p);
+                stackCommas.Add(0);
+            } else if (c == '[') {
+                stackKind.Add(1);
+                stackPos.Add(p);
+                stackCommas.Add(0);
+            } else if (c == '{') {
+                stackKind.Add(2);
+                stackPos.Add(p);
+                stackCommas.Add(0);
+            } else if (c == ')' || c == ']' || c == '}') {
+                int want = c == ')' ? 0 : (c == ']' ? 1 : 2);
+                int top = stackKind.Count - 1;
+                while (top >= 0 && stackKind[top] != want) {
+                    stackKind.RemoveAt(top);
+                    stackPos.RemoveAt(top);
+                    stackCommas.RemoveAt(top);
+                    top = top - 1;
+                }
+                if (top >= 0) {
+                    stackKind.RemoveAt(top);
+                    stackPos.RemoveAt(top);
+                    stackCommas.RemoveAt(top);
+                }
+            } else if (c == ',' && stackKind.Count > 0
+                    && stackKind[stackKind.Count - 1] == 0) {
+                int top = stackCommas.Count - 1;
+                stackCommas[top] = stackCommas[top] + 1;
+            }
+            p = p + 1;
+        }
+        int openParen = -1;
+        int activeParam = 0;
+        if (stackKind.Count > 0 && stackKind[stackKind.Count - 1] == 0) {
+            int top = stackKind.Count - 1;
+            openParen = stackPos[top];
+            activeParam = stackCommas[top];
+        }
+        if (openParen < 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        int wEnd = openParen;
+        while (wEnd > 0 && (doc.Text[wEnd - 1] == ' ' || doc.Text[wEnd - 1] == '\t')) {
+            wEnd = wEnd - 1;
+        }
+        int wStart = wEnd;
+        while (wStart > 0 && IsWordChar(doc.Text[wStart - 1])) { wStart = wStart - 1; }
+        if (wStart == wEnd) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+        string callee = doc.Text.Substring(wStart, wEnd - wStart);
+        if (IsControlCallKeyword(callee)) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+
+        string dotRecv = DotReceiverBeforeOffset(doc.Text, wStart);
+        string recvType = dotRecv != "" ? ResolveReceiverType(doc, dotRecv, line) : "";
+        bool isNew = false;
+        if (dotRecv == "") {
+            int kwEnd = wStart;
+            while (kwEnd > 0 && (doc.Text[kwEnd - 1] == ' ' || doc.Text[kwEnd - 1] == '\t')) {
+                kwEnd = kwEnd - 1;
+            }
+            int kwStart = kwEnd;
+            while (kwStart > 0 && IsWordChar(doc.Text[kwStart - 1])) { kwStart = kwStart - 1; }
+            if (kwEnd - kwStart == 3 && doc.Text.Substring(kwStart, 3) == "new") {
+                isNew = true;
+            }
+        }
+
+        List<LspSymbol> pool = ProjectSymbolsFor(doc);
+        List<LspSymbol> matches = new List<LspSymbol>();
+        Dictionary<string, bool> seenLabels = new Dictionary<string, bool>();
+        int si = 0;
+        while (si < pool.Count) {
+            LspSymbol s = pool[si];
+            si = si + 1;
+            bool ok = false;
+            if (isNew) {
+                ok = s.Kind == LspSymbol.KindCtor()
+                    && (s.Name == callee || s.ContainerName == callee);
+            } else if (recvType != "") {
+                ok = (s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindDelegate())
+                    && s.Name == callee && s.ContainerName == recvType;
+            } else {
+                ok = (s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindCtor()
+                    || s.Kind == LspSymbol.KindDelegate()) && s.Name == callee;
+            }
+            if (ok) {
+                string lbl = FormatSignatureLabel(s);
+                if (!seenLabels.ContainsKey(lbl)) {
+                    seenLabels[lbl] = true;
+                    matches.Add(s);
+                }
+            }
+        }
+        if (matches.Count == 0 && recvType != "") {
+            int fi = 0;
+            while (fi < pool.Count) {
+                LspSymbol s = pool[fi];
+                fi = fi + 1;
+                if ((s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindDelegate())
+                        && s.Name == callee) {
+                    string lbl = FormatSignatureLabel(s);
+                    if (!seenLabels.ContainsKey(lbl)) {
+                        seenLabels[lbl] = true;
+                        matches.Add(s);
+                    }
+                }
+            }
+        }
+        if (matches.Count == 0) {
+            SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
+            return;
+        }
+
+        int activeSig = 0;
+        int ai = 0;
+        while (ai < matches.Count) {
+            if (matches[ai].ParamNames.Count > activeParam) {
+                activeSig = ai;
+                break;
+            }
+            ai = ai + 1;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id);
+        sb.Append(",\"result\":{\"signatures\":[");
+        int mi = 0;
+        while (mi < matches.Count) {
+            LspSymbol sig = matches[mi];
+            if (mi > 0) { sb.Append(','); }
+            sb.Append("{\"label\":");
+            sb.Append(EncodeJsonString(FormatSignatureLabel(sig)));
+            sb.Append(",\"parameters\":[");
+            int pi = 0;
+            while (pi < sig.ParamNames.Count) {
+                if (pi > 0) { sb.Append(','); }
+                string pt = pi < sig.ParamTypes.Count ? sig.ParamTypes[pi] : "";
+                string pl = pt != "" ? pt + " " + sig.ParamNames[pi] : sig.ParamNames[pi];
+                sb.Append("{\"label\":");
+                sb.Append(EncodeJsonString(pl));
+                sb.Append("}");
+                pi = pi + 1;
+            }
+            sb.Append("]}");
+            mi = mi + 1;
+        }
+        sb.Append("],\"activeSignature\":");
+        sb.Append(activeSig);
+        sb.Append(",\"activeParameter\":");
+        sb.Append(activeParam);
+        sb.Append("}}");
+        SendResponse(sb.ToString());
     }
 }

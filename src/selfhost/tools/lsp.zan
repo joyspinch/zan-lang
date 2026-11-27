@@ -50,7 +50,9 @@ public class LspSymbol {
     public int Line;   // 1-based（与前端一致）
     public int Col;    // 1-based
     public List<string> ParamNames;
+    public List<string> ParamTypes;
     public string TypeName;
+    public string ContainerName;
 
     public LspSymbol(string uri, string name, int kind, int line, int col) {
         Uri = uri;
@@ -59,7 +61,9 @@ public class LspSymbol {
         Line = line;
         Col = col;
         ParamNames = new List<string>();
+        ParamTypes = new List<string>();
         TypeName = "";
+        ContainerName = "";
     }
 
     public static int KindClass() { return 0; }
@@ -448,7 +452,34 @@ public partial class LspServer {
     /// 顶层类型声明位置：前端 ParseClass/ParseInterface/ParseEnum 不回填
     /// line/col，声明行从 token 流取（关键字后的标识符）。
     /// delegate 不是关键字 token（上下文关键字），首切片不收。
+    static string FormatTypeRef(Node ty) {
+        if (ty == null || ty.sval == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(ty.sval);
+        if (ty.kids != null && ty.kids.Count > 0) {
+            sb.Append('<');
+            int i = 0;
+            while (i < ty.kids.Count) {
+                if (i > 0) { sb.Append(", "); }
+                sb.Append(FormatTypeRef(ty.kids[i]));
+                i = i + 1;
+            }
+            sb.Append('>');
+        }
+        int r = ty.ival;
+        while (r > 0) {
+            sb.Append("[]");
+            r = r - 1;
+        }
+        return sb.ToString();
+    }
+
     static void CollectTopLevelSymbols(string uri, List<Token> toks) {
+        CollectTopLevelSymbolsInto(symbols, uri, toks, 0);
+    }
+
+    static void CollectTopLevelSymbolsInto(List<LspSymbol> dst, string uri,
+            List<Token> toks, int lineOffset) {
         int i = 0;
         while (i < toks.Count) {
             int k = toks[i].kind;
@@ -463,83 +494,148 @@ public partial class LspServer {
                     else if (k == TK.Enum()) { kind = LspSymbol.KindEnum(); }
                     else if (k == TK.Struct()) { kind = LspSymbol.KindStruct(); }
                     else { kind = LspSymbol.KindClass(); }
-                    symbols.Add(new LspSymbol(uri, toks[j].text, kind,
-                        toks[j].line, toks[j].col));
+                    int line = toks[j].line - lineOffset;
+                    if (line < 1) { line = 1; }
+                    dst.Add(new LspSymbol(uri, toks[j].text, kind,
+                        line, toks[j].col));
                 }
             }
             i = i + 1;
         }
     }
 
-    /// 成员符号（方法/字段/构造器/枚举成员）来自 AST：这些节点的
+    /// 成员符号（方法/字段/构造器/枚举成员/委托）来自 AST：这些节点的
     /// line/col 由前端回填，可直接用。字段的多声明符在 kids 里拍平。
-    /// 接口与类同为 AK.ClassDecl()（mods 带If位），不单独区分。
-    /// namespace 声明递归下钻，覆盖其内层的类型。
+    /// namespace 与嵌套类型递归下钻，并记录 ContainerName 供成员定向查找。
     static void CollectMemberSymbols(string uri, Node unit) {
+        CollectMemberSymbolsInto(symbols, uri, unit, 0);
+    }
+
+    static void CollectMemberSymbolsInto(List<LspSymbol> dst, string uri,
+            Node unit, int lineOffset) {
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.NamespaceDecl()) {
-                CollectMemberSymbols(uri, d);
+                CollectMemberSymbolsInto(dst, uri, d, lineOffset);
             } else if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
-                int j = 0;
-                while (j < d.kids.Count) {
-                    Node m = d.kids[j];
-                    if (m.kind == AK.MethodDecl()) {
-                        LspSymbol msym = new LspSymbol(uri, m.sval,
-                            LspSymbol.KindMethod(), m.line, m.col);
-                        if (m.type != null && m.type.sval != null) {
-                            msym.TypeName = m.type.sval;
-                        }
-                        int pi = 0;
-                        while (pi < m.kids.Count) {
-                            Node p = m.kids[pi];
-                            if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
-                                msym.ParamNames.Add(p.sval);
-                            }
-                            pi = pi + 1;
-                        }
-                        symbols.Add(msym);
-                    } else if (m.kind == AK.FieldDecl()) {
-                        AddFieldSymbol(uri, m);
-                    } else if (m.kind == AK.CtorDecl()) {
-                        LspSymbol csym = new LspSymbol(uri, d.sval,
-                            LspSymbol.KindCtor(), m.line, m.col);
-                        csym.TypeName = d.sval;
-                        int pi = 0;
-                        while (pi < m.kids.Count) {
-                            Node p = m.kids[pi];
-                            if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
-                                csym.ParamNames.Add(p.sval);
-                            }
-                            pi = pi + 1;
-                        }
-                        symbols.Add(csym);
-                    } else if (m.kind == AK.EnumDecl()) {
-                        int k = 0;
-                        while (k < m.kids.Count) {
-                            Node em = m.kids[k];
-                            if (em.kind == AK.EnumMember()) {
-                                symbols.Add(new LspSymbol(uri, em.sval,
-                                    LspSymbol.KindEnum(), em.line, em.col));
-                            }
-                            k = k + 1;
-                        }
-                    }
-                    j = j + 1;
-                }
+                CollectTypeMembersInto(dst, uri, d, lineOffset);
+            } else if (d.kind == AK.EnumDecl()) {
+                CollectEnumMembersInto(dst, uri, d, lineOffset);
+            } else if (d.kind == AK.DelegateDecl()) {
+                CollectDelegateSymbolInto(dst, uri, d, "", lineOffset);
             }
             i = i + 1;
         }
     }
 
-    static void AddFieldSymbol(string uri, Node f) {
-        symbols.Add(new LspSymbol(uri, f.sval, LspSymbol.KindField(),
-            f.line, f.col));
+    static void CollectTypeMembersInto(List<LspSymbol> dst, string uri,
+            Node d, int lineOffset) {
+        string owner = d.sval != null ? d.sval : "";
+        int j = 0;
+        while (j < d.kids.Count) {
+            Node m = d.kids[j];
+            if (m.kind == AK.MethodDecl()) {
+                int line = m.line - lineOffset;
+                if (line < 1) { line = 1; }
+                LspSymbol msym = new LspSymbol(uri, m.sval,
+                    LspSymbol.KindMethod(), line, m.col);
+                msym.ContainerName = owner;
+                msym.TypeName = FormatTypeRef(m.type);
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    Node p = m.kids[pi];
+                    if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
+                        msym.ParamNames.Add(p.sval);
+                        msym.ParamTypes.Add(FormatTypeRef(p.type));
+                    }
+                    pi = pi + 1;
+                }
+                dst.Add(msym);
+            } else if (m.kind == AK.FieldDecl()) {
+                AddFieldSymbolInto(dst, uri, m, owner, lineOffset);
+            } else if (m.kind == AK.CtorDecl()) {
+                int line = m.line - lineOffset;
+                if (line < 1) { line = 1; }
+                LspSymbol csym = new LspSymbol(uri, owner,
+                    LspSymbol.KindCtor(), line, m.col);
+                csym.ContainerName = owner;
+                csym.TypeName = owner;
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    Node p = m.kids[pi];
+                    if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
+                        csym.ParamNames.Add(p.sval);
+                        csym.ParamTypes.Add(FormatTypeRef(p.type));
+                    }
+                    pi = pi + 1;
+                }
+                dst.Add(csym);
+            } else if (m.kind == AK.EnumDecl()) {
+                CollectEnumMembersInto(dst, uri, m, lineOffset);
+            } else if (m.kind == AK.ClassDecl() || m.kind == AK.StructDecl()) {
+                CollectTypeMembersInto(dst, uri, m, lineOffset);
+            } else if (m.kind == AK.DelegateDecl()) {
+                CollectDelegateSymbolInto(dst, uri, m, owner, lineOffset);
+            }
+            j = j + 1;
+        }
+    }
+
+    static void CollectEnumMembersInto(List<LspSymbol> dst, string uri,
+            Node e, int lineOffset) {
+        string owner = e.sval != null ? e.sval : "";
+        int k = 0;
+        while (k < e.kids.Count) {
+            Node em = e.kids[k];
+            if (em.kind == AK.EnumMember()) {
+                int line = em.line - lineOffset;
+                if (line < 1) { line = 1; }
+                LspSymbol esym = new LspSymbol(uri, em.sval,
+                    LspSymbol.KindEnum(), line, em.col);
+                esym.ContainerName = owner;
+                esym.TypeName = owner;
+                dst.Add(esym);
+            }
+            k = k + 1;
+        }
+    }
+
+    static void CollectDelegateSymbolInto(List<LspSymbol> dst, string uri,
+            Node d, string owner, int lineOffset) {
+        int line = d.line - lineOffset;
+        if (line < 1) { line = 1; }
+        LspSymbol dsym = new LspSymbol(uri, d.sval,
+            LspSymbol.KindDelegate(), line, d.col);
+        dsym.ContainerName = owner;
+        dsym.TypeName = FormatTypeRef(d.type);
+        int pi = 0;
+        while (pi < d.kids.Count) {
+            Node p = d.kids[pi];
+            if (p.kind == AK.Param() && p.sval != null && p.sval != "") {
+                dsym.ParamNames.Add(p.sval);
+                dsym.ParamTypes.Add(FormatTypeRef(p.type));
+            }
+            pi = pi + 1;
+        }
+        dst.Add(dsym);
+    }
+
+    static void AddFieldSymbolInto(List<LspSymbol> dst, string uri, Node f,
+            string owner, int lineOffset) {
+        int line = f.line - lineOffset;
+        if (line < 1) { line = 1; }
+        LspSymbol fsym = new LspSymbol(uri, f.sval, LspSymbol.KindField(),
+            line, f.col);
+        fsym.ContainerName = owner;
+        fsym.TypeName = FormatTypeRef(f.type);
+        dst.Add(fsym);
         int i = 0;
         while (i < f.kids.Count) {
             Node k = f.kids[i];
-            if (k.kind == AK.FieldDecl()) { AddFieldSymbol(uri, k); }
+            if (k.kind == AK.FieldDecl()) {
+                AddFieldSymbolInto(dst, uri, k, owner, lineOffset);
+            }
             i = i + 1;
         }
     }
@@ -643,6 +739,19 @@ public partial class LspServer {
             e = e + 1;
         }
         return text.Substring(ls + s, e - s);
+    }
+
+    /// 补全前缀：只取光标左侧连续词字符（光标紧跟 '.' 或空白时为空串，
+    /// 不向左跨越 '.' 吞掉接收者名，也不向右吞掉光标后的标识符）。
+    static string CompletionPrefixAt(string text, int line0, int byteCol0) {
+        if (text == null || byteCol0 <= 0) { return ""; }
+        int ls = LineStartOf(text, line0);
+        if (ls < 0) { return ""; }
+        int cur = ls + byteCol0;
+        if (cur > text.Length) { cur = text.Length; }
+        int start = cur;
+        while (start > ls && IsWordChar(text[start - 1])) { start = start - 1; }
+        return cur > start ? text.Substring(start, cur - start) : "";
     }
 
     /// 行内字节列（0-based）→ UTF-16 code unit 列（LSP 口径）。
@@ -776,10 +885,12 @@ public partial class LspServer {
                 + "\"capabilities\":{"
                 + "\"textDocumentSync\":1,"
                 + "\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},"
+                + "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},"
                 + "\"hoverProvider\":true,"
                 + "\"definitionProvider\":true,"
                 + "\"referencesProvider\":true,"
                 + "\"documentSymbolProvider\":true,"
+                + "\"workspaceSymbolProvider\":true,"
                 + "\"renameProvider\":{\"prepareProvider\":true},"
                 + "\"documentHighlightProvider\":true,"
                 + "\"foldingRangeProvider\":true,"
@@ -914,6 +1025,16 @@ public partial class LspServer {
             return;
         }
 
+        if (method == "workspace/symbol") {
+            HandleWorkspaceSymbol(id, pms);
+            return;
+        }
+
+        if (method == "textDocument/signatureHelp") {
+            HandleSignatureHelp(id, pms);
+            return;
+        }
+
         if (method == "shutdown") {
             if (!shutdownRequested) {
                 shutdownRequested = true;
@@ -942,16 +1063,48 @@ public partial class LspServer {
         int line = ExtractJsonInt(pos, "line", 0);
         int character = ExtractJsonInt(pos, "character", 0);
         string prefix = "";
+        int bcol = 0;
+        string dotRecv = "";
+        string recvType = "";
         LspDocument doc = FindDocument(uri);
         if (doc != null && character > 0) {
-            int bcol = ByteColAt(doc.Text, line, character);
-            if (bcol > 0) { prefix = WordAt(doc.Text, line, bcol - 1); }
+            bcol = ByteColAt(doc.Text, line, character);
+            if (bcol > 0) { prefix = CompletionPrefixAt(doc.Text, line, bcol); }
+            dotRecv = DotReceiverBeforeCompletion(doc.Text, line, bcol);
+            if (dotRecv != "") { recvType = ResolveReceiverType(doc, dotRecv, line); }
         }
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
         sb.Append(id);
         sb.Append(",\"result\":[");
         bool first = true;
+        List<LspSymbol> pool = ProjectSymbolsFor(doc);
+        if (recvType != "") {
+            Dictionary<string, bool> seen = new Dictionary<string, bool>();
+            int mi = 0;
+            while (mi < pool.Count) {
+                LspSymbol sym = pool[mi];
+                if (sym.ContainerName == recvType && IsMemberKind(sym.Kind)
+                        && sym.Kind != LspSymbol.KindCtor()
+                        && (prefix == "" || sym.Name.StartsWith(prefix))
+                        && !seen.ContainsKey(sym.Name)) {
+                    seen[sym.Name] = true;
+                    if (!first) { sb.Append(','); }
+                    first = false;
+                    sb.Append("{\"label\":");
+                    sb.Append(EncodeJsonString(sym.Name));
+                    sb.Append(",\"kind\":");
+                    sb.Append(sym.CompletionKind());
+                    sb.Append(",\"detail\":");
+                    sb.Append(EncodeJsonString(SymbolDetail(sym)));
+                    sb.Append("}");
+                }
+                mi = mi + 1;
+            }
+            sb.Append("]}");
+            SendResponse(sb.ToString());
+            return;
+        }
         List<string> kwList = KeywordList();
         int i = 0;
         while (i < kwList.Count) {
@@ -981,13 +1134,15 @@ public partial class LspServer {
             }
             i = i + 1;
         }
-        // 打开文档的声明符号
-        EnsureInit();
+        // 工程级（打开文档 + 同工程未打开磁盘文件）声明符号
+        Dictionary<string, bool> emitted = new Dictionary<string, bool>();
         i = 0;
-        while (i < symbols.Count) {
-            LspSymbol sym = symbols[i];
+        while (i < pool.Count) {
+            LspSymbol sym = pool[i];
+            string key = sym.Name + "|" + Convert.ToString(sym.Kind);
             if ((prefix == "" || sym.Name.StartsWith(prefix))
-                    && !kwList.Contains(sym.Name)) {
+                    && !kwList.Contains(sym.Name) && !emitted.ContainsKey(key)) {
+                emitted[key] = true;
                 if (!first) { sb.Append(','); }
                 first = false;
                 sb.Append("{\"label\":");
@@ -995,7 +1150,7 @@ public partial class LspServer {
                 sb.Append(",\"kind\":");
                 sb.Append(sym.CompletionKind());
                 sb.Append(",\"detail\":");
-                sb.Append(EncodeJsonString(sym.KindText()));
+                sb.Append(EncodeJsonString(SymbolDetail(sym)));
                 sb.Append("}");
             }
             i = i + 1;
@@ -1022,29 +1177,29 @@ public partial class LspServer {
         int line = ExtractJsonInt(pos, "line", 0);
         int character = ExtractJsonInt(pos, "character", 0);
         string word = "";
+        string recvType = "";
         LspDocument doc = FindDocument(uri);
         if (doc != null) {
-            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+            int bcol = ByteColAt(doc.Text, line, character);
+            word = WordAt(doc.Text, line, bcol);
+            string dotRecv = DotReceiverForWord(doc.Text, line, bcol);
+            if (dotRecv != "") { recvType = ResolveReceiverType(doc, dotRecv, line); }
         }
         if (word.Length == 0) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
-        string kindText = "";
-        string whereTxt = "";
-        LspSymbol sym = FindSymbol(word);
+        string md = "";
+        LspSymbol sym = FindSymbolFor(doc, word, recvType);
         if (sym != null) {
-            kindText = sym.KindText();
-            whereTxt = "declared at " + sym.Uri + ":" + sym.Line;
+            md = FormatHoverMarkdown(sym);
         } else if (IsBuiltinType(word)) {
-            kindText = "built-in type";
-            whereTxt = "zan core";
+            md = "`" + word + "` — built-in type\n\nzan core";
         }
-        if (kindText == "") {
+        if (md == "") {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
-        string md = "`" + word + "` — " + kindText + "\n\n" + whereTxt;
         string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{"
             + "\"contents\":{\"kind\":\"markdown\",\"value\":"
             + EncodeJsonString(md) + "}}}";
@@ -1067,17 +1222,21 @@ public partial class LspServer {
         int line = ExtractJsonInt(pos, "line", 0);
         int character = ExtractJsonInt(pos, "character", 0);
         string word = "";
+        string recvType = "";
         LspDocument doc = FindDocument(uri);
         if (doc != null) {
-            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+            int bcol = ByteColAt(doc.Text, line, character);
+            word = WordAt(doc.Text, line, bcol);
+            string dotRecv = DotReceiverForWord(doc.Text, line, bcol);
+            if (dotRecv != "") { recvType = ResolveReceiverType(doc, dotRecv, line); }
         }
-        LspSymbol sym = word.Length > 0 ? FindSymbol(word) : null;
+        LspSymbol sym = word.Length > 0 ? FindSymbolFor(doc, word, recvType) : null;
         if (sym == null) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
-        LspDocument tdoc = FindDocument(sym.Uri);
-        int tcol = SymColOf(tdoc != null ? tdoc.Text : null, sym.Line - 1, sym.Col - 1);
+        string ttext = LookupSourceText(doc, sym.Uri);
+        int tcol = SymColOf(ttext, sym.Line - 1, sym.Col - 1);
         string res = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":"
             + LocationJson(sym.Uri, sym.Line - 1, tcol) + "}";
         SendResponse(res);
@@ -1089,40 +1248,46 @@ public partial class LspServer {
         string pos = ExtractJsonContainer(pms, "position");
         int line = ExtractJsonInt(pos, "line", 0);
         int character = ExtractJsonInt(pos, "character", 0);
+        string ctx = ExtractJsonContainer(pms, "context");
+        bool includeDecl = !(ctx != "" && ExtractJsonField(ctx, "includeDeclaration") == "false");
         string word = "";
+        string recvType = "";
         LspDocument doc = FindDocument(uri);
         if (doc != null) {
-            word = WordAt(doc.Text, line, ByteColAt(doc.Text, line, character));
+            int bcol = ByteColAt(doc.Text, line, character);
+            word = WordAt(doc.Text, line, bcol);
+            string dotRecv = DotReceiverForWord(doc.Text, line, bcol);
+            if (dotRecv != "") { recvType = ResolveReceiverType(doc, dotRecv, line); }
         }
         if (word.Length == 0) {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":[]}");
             return;
         }
-        // 声明处排最前，随后按打开文档顺序做词边界文本匹配（近似）
+        // 声明处排最前，随后按同工程源码（打开缓冲优先 + 未打开磁盘文件）词边界匹配
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
         sb.Append(id);
         sb.Append(",\"result\":[");
         bool first = true;
-        LspSymbol sym = FindSymbol(word);
-        if (sym != null) {
-            LspDocument tdoc = FindDocument(sym.Uri);
-            int tcol = SymColOf(tdoc != null ? tdoc.Text : null,
-                sym.Line - 1, sym.Col - 1);
+        LspSymbol sym = FindSymbolFor(doc, word, recvType);
+        if (sym != null && includeDecl) {
+            string ttext = LookupSourceText(doc, sym.Uri);
+            int tcol = SymColOf(ttext, sym.Line - 1, sym.Col - 1);
             sb.Append(LocationJson(sym.Uri, sym.Line - 1, tcol));
             first = false;
         }
-        EnsureInit();
+        List<LspDiskFile> sources = ProjectSourcesFor(doc);
         int di = 0;
-        while (di < documents.Count) {
-            LspDocument d = documents[di];
+        while (di < sources.Count) {
+            LspDiskFile d = sources[di];
             List<LspPos> hits = WordPositions(d.Text, word);
             int i = 0;
             while (i < hits.Count) {
                 LspPos p = hits[i];
-                // 声明位置已单独报过，跳过重复
-                if (!(sym != null && d.Uri == sym.Uri
-                        && p.Line == sym.Line - 1 && p.Col == sym.Col - 1)) {
+                // 声明位置已单独报过（或 includeDeclaration=false 时需跳过）
+                bool isDecl = sym != null && d.Uri == sym.Uri
+                    && p.Line == sym.Line - 1 && p.Col == sym.Col - 1;
+                if (!isDecl) {
                     if (!first) { sb.Append(','); }
                     first = false;
                     sb.Append(LocationJson(d.Uri, p.Line,
@@ -1205,16 +1370,16 @@ public partial class LspServer {
             SendResponse("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}");
             return;
         }
-        // WorkspaceEdit.changes 按打开文档顺序拼接，每文档一组词边界命中
-        EnsureInit();
+        // WorkspaceEdit.changes 按同工程源码（打开文档 + 未打开磁盘文件）拼接
+        List<LspDiskFile> sources = ProjectSourcesFor(doc);
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
         sb.Append(id);
         sb.Append(",\"result\":{\"changes\":{");
         bool firstDoc = true;
         int di = 0;
-        while (di < documents.Count) {
-            LspDocument d = documents[di];
+        while (di < sources.Count) {
+            LspDiskFile d = sources[di];
             List<LspPos> hits = WordPositions(d.Text, word);
             if (hits.Count > 0) {
                 if (!firstDoc) { sb.Append(','); }
@@ -1781,17 +1946,12 @@ public partial class LspServer {
                         continue;
                     }
 
-                    LspSymbol methodSym = null;
-                    int si = 0;
-                    while (si < symbols.Count) {
-                        LspSymbol s = symbols[si];
-                        if ((s.Kind == LspSymbol.KindMethod() || s.Kind == LspSymbol.KindCtor())
-                                && s.Name == fnName && s.ParamNames.Count > 0) {
-                            methodSym = s;
-                            break;
-                        }
-                        si = si + 1;
-                    }
+                    LspDocument docRef = FindDocument(uri);
+                    List<LspSymbol> pool = ProjectSymbolsFor(docRef);
+                    string dotRecv = DotReceiverBeforeOffset(text, wStart);
+                    string recvType = dotRecv != "" ? ResolveReceiverType(docRef, dotRecv, lineNum) : "";
+                    int callArgCount = CountCallArgs(text, peek);
+                    LspSymbol methodSym = FindCallableSymbol(pool, fnName, recvType, callArgCount);
 
                     if (methodSym != null) {
                         int argP = peek + 1;
@@ -1948,7 +2108,7 @@ public partial class LspServer {
                 int ttype = -1;
                 int tlenBytes = tok.text.Length;
                 if (tok.kind == TK.Ident()) {
-                    LspSymbol sym = FindSymbol(tok.text);
+                    LspSymbol sym = FindSymbolFor(doc, tok.text, "");
                     if (sym != null) { ttype = SymTokenType(sym); }
                     if (ttype < 0) {
                         // 无符号匹配：首字母大写兜底 type，否则 variable
@@ -2036,7 +2196,8 @@ public partial class LspServer {
             bool mfirst = true;
             while (j < symbols.Count) {
                 LspSymbol m = symbols[j];
-                if (m.Uri == uri && IsMemberKind(m.Kind)) {
+                if (m.Uri == uri && IsMemberKind(m.Kind)
+                        && (m.ContainerName == "" || m.ContainerName == top.Name)) {
                     int mc0 = SymColOf(stext, m.Line - 1, m.Col - 1);
                     if (!mfirst) { sb.Append(','); }
                     mfirst = false;
