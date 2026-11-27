@@ -111,6 +111,7 @@ public partial class App {
     }
     void CancelRoutedPointer() {
         Control target = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
+        Control prevHovered = lastHoveredControl;
         capturedPointerControl = null;
         capturedDragGesture = false;
         pointerDownTarget = null;
@@ -124,6 +125,10 @@ public partial class App {
         pointerDown = false;
         this.RetireRetainedLongPress();
         if (focus != null) { focus.ClearPress(); focus.ClearHover(); }
+        if (prevHovered != null) {
+            RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", prevHovered, mouseX, mouseY, currentPointerType);
+            Control.RouteEvent(prevHovered, leave);
+        }
         if (target != null) {
             RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", target, mouseX, mouseY, currentPointerType);
             Control.RouteEvent(target, cancel);
@@ -150,7 +155,8 @@ public partial class App {
         if (hovered == null) { return null; }
         if (hovered.InputFocusCapabilities() == 0 && !hovered.HasInputClick()
             && hovered.PointerCursor() < 0) {
-            Control ep = App.SurfaceEndpoint(hovered);
+            Control stopRoot = overlayHost != null ? overlayHost.ActiveRoot() : null;
+            Control ep = App.SurfaceEndpoint(hovered, stopRoot);
             if (ep != null) { return ep; }
         }
         return hovered;
@@ -191,10 +197,12 @@ public partial class App {
         focus.SetHovered(hovered != null ? hovered.WidgetId() : -1);
         focus.SetPressed(pressed != null ? pressed.WidgetId() : -1);
         Control cursorNode = pressed != null ? pressed : lastHoveredControl;
+        Control cursorStop = overlayHost != null ? overlayHost.ActiveRoot() : null;
         int cursor = -1;
         while (cursorNode != null) {
             cursor = cursorNode.PointerCursor();
             if (cursor >= 0) { break; }
+            if (cursorStop != null && cursorNode == cursorStop) { break; }
             cursorNode = cursorNode.parent;
         }
         if (cursor == 0) { Window.SetCursor(1); }
@@ -317,7 +325,7 @@ public partial class App {
     }
     public Control GetCapturedPointer() { return this.capturedPointerControl; }
     public bool IsPointerEligible(Control c) {
-        if (c == null) { return false; }
+        if (c == null || overlayPressBlocked) { return false; }
         if (overlayHost != null && overlayHost.HasActive()) {
             Control top = overlayHost.ActiveRoot();
             return top != null && top.ContainsInputControl(c);
@@ -449,6 +457,9 @@ public partial class App {
         if (eventKind == 3 && overlayPressBlocked) {
             overlayPressBlocked = false;
             this.CancelRoutedPointer();
+            return true;
+        }
+        if (overlayPressBlocked && (eventKind == 1 || eventKind == 13)) {
             return true;
         }
         Control popup = overlayHost != null ? overlayHost.ActiveRoot() : null;
@@ -631,7 +642,15 @@ public partial class App {
             if (!assigned && focus != null) { focus.ClearFocus(); }
         }
         if (dispatchTicket != pointerGestureTicket) { return true; }
+        int overlayDepthBefore = overlayHost != null ? overlayHost.Depth() : 0;
         Control.RouteEventTo(target, e, routeStop);
+        if (eventKind == 2 && popup != null
+                && (overlayHost == null || overlayHost.ActiveRoot() == null
+                    || overlayHost.Depth() < overlayDepthBefore)) {
+            overlayPressBlocked = true;
+            this.CancelRoutedPointer();
+            return true;
+        }
         if (dispatchTicket != pointerGestureTicket) { return true; }
         if (eventKind == 1 && !e.handled && pointerDown && routedDragSource != null
                 && dispatchTicket == pointerGestureTicket) {

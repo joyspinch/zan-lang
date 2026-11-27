@@ -642,6 +642,125 @@ class GuiOverlayLayoutEncapsulationTest {
         app.SetRootControl(null);
     }
 
+    class DownCloseButton : Button {
+        weak App targetApp;
+        public DownCloseButton(App a) : base("DownClose") { targetApp = a; }
+        public override void OnPointerDown(RoutedEventArgs e) {
+            base.OnPointerDown(e);
+            if (targetApp != null && targetApp.overlayHost != null) {
+                targetApp.overlayHost.Pop();
+            }
+            e.Handle();
+        }
+    }
+
+    static void TestOverlayMouseIsolationAndIconOnlyEncapsulation(App app) {
+        app.SetOffscreenViewport(800, 600, 150);
+        app.EnableSkins();
+        app.UseSkin("liquid");
+
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("padding: 12; gap: 10;");
+        ScrollColumn sc = new ScrollColumn();
+        sc.Grow();
+        Panel row = Panel.Row();
+        row.SetInlineStyleCss("gap: 10;");
+        SelectBox sel = SelectBox.FromOptions(new List<string>{"选项 A", "选项 B", "选项 C"}, "选择");
+        Button underBtn = new Button("底层按钮");
+        ClickCounter underClicks = new ClickCounter();
+        underBtn.Click.Add(underClicks.Bump);
+        row.Add(sel);
+        row.Add(underBtn);
+        sc.Add(row);
+        Panel spacer = new Panel();
+        spacer.SetInlineStyleCss("height: 700;");
+        sc.Add(spacer);
+        root.Add(sc);
+
+        app.SetRootControl(root);
+        app.BeginOffscreenFrame();
+        root.MeasureTree(app, app.canvas.Width());
+        root.Arrange(0, 0, app.canvas.Width(), app.canvas.Height());
+        root.RenderTree(app);
+        app.RunOverlays();
+        app.EndOffscreenFrame();
+        Drain(app);
+
+        // 1. Open SelectBox: underlying controls are ineligible, outside-dismiss drag + wheel do not bleed through
+        sel.SetOpen(true);
+        app.BeginOffscreenFrame();
+        root.MeasureTree(app, app.canvas.Width());
+        root.Arrange(0, 0, app.canvas.Width(), app.canvas.Height());
+        root.RenderTree(app);
+        app.RunOverlays();
+        app.EndOffscreenFrame();
+        Check(!app.IsPointerEligible(underBtn),
+            "underlying button is not pointer-eligible while SelectBox popup is active");
+
+        int bx = underBtn.bx + underBtn.bw / 2;
+        int by = underBtn.by + underBtn.bh / 2;
+        app.ProcessOffscreenInput(2, bx, by, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, bx + 2, by, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(13, bx + 2, by, 0, -120, 0, 0);
+        Check(!underBtn.IsHovered(app) && !app.IsPointerEligible(underBtn),
+            "outside-dismiss drag must not hover underlying button before release");
+        Check(sc.ScrollTop() == 0,
+            "wheel during outside-dismiss press must not scroll underlying ScrollColumn");
+        app.ProcessOffscreenInput(3, bx + 2, by, 0, 0, 0, 0);
+        Check(underClicks.count == 0,
+            "outside-dismiss release must not click underlying button");
+
+        // 2. Inside-popup PointerDown dismissing popup blocks matching PointerMove/PointerUp from penetrating
+        Panel customPopup = new Panel();
+        customPopup.SetInlineStyleCss("width: 240; height: 120; background: #ffffff;");
+        DownCloseButton closeOnDown = new DownCloseButton(app);
+        customPopup.Add(closeOnDown);
+        app.overlayHost.ShowAt(app, customPopup, underBtn.bx, underBtn.by);
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        app.RunOverlays();
+        app.EndOffscreenFrame();
+        int px = closeOnDown.bx + closeOnDown.bw / 2;
+        int py = closeOnDown.by + closeOnDown.bh / 2;
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, bx, by, 0, 0, 0, 0);
+        Check(!underBtn.IsHovered(app),
+            "PointerMove after PointerDown-dismissed popup must not hover underlying button");
+        app.ProcessOffscreenInput(3, bx, by, 0, 0, 0, 0);
+        Check(underClicks.count == 0,
+            "PointerUp after PointerDown-dismissed popup must not click underlying button");
+
+        // 3. Icon-only Button auto-applies .icon-only with zero horizontal padding
+        Button icoBtn = new Button("");
+        icoBtn.Icon = "arrow-up";
+        icoBtn.UseApp(app);
+        icoBtn.SyncBinding();
+        Check(Style.Has(icoBtn.EffectiveClass(), "icon-only"),
+            "pure icon Button automatically toggles .icon-only class");
+        StyleBox icoBox = icoBtn.ResolveStyle(app, Style.SNormal());
+        Check(icoBox.padL == 0 && icoBox.padR == 0,
+            "icon-only Button resolves zero horizontal padding padL="
+            + Convert.ToString(icoBox.padL) + " padR=" + Convert.ToString(icoBox.padR));
+
+        // 4. Skin encapsulation: liquid datatable::menu & input border contrast; clay checked checkbox background
+        app.UseSkin("liquid");
+        StyleBox dtMenuLiquid = Style.Part(app, "datatable", "menu", "", "", "", Style.SNormal());
+        Check(dtMenuLiquid.blur > 0 && dtMenuLiquid.shadow != 0 && ((dtMenuLiquid.BgOr(0) >> 24) & 255) >= 230,
+            "liquid datatable::menu uses elevated frosted popup surface with blur & shadow");
+        Input liqInput = new Input("test");
+        StyleBox liqInputBox = liqInput.ResolveStyle(app, Style.SNormal());
+        Check((liqInputBox.BorderOr(0) & 0x00FFFFFF) != 0x00FFFFFF,
+            "liquid input uses visible non-white border on bright glass surfaces");
+
+        app.UseSkin("clay");
+        StyleBox clayCheckedBox = Style.Part(app, "checkbox", "box", "", "", "", Style.SChecked());
+        Check((clayCheckedBox.BgOr(0) & 0x00FFFFFF) != 0x00F5F7FC,
+            "clay checked checkbox::box keeps primary accent fill instead of unchecked clay surface");
+
+        underBtn.Click.Clear();
+        app.SetRootControl(null);
+    }
+
     static void Main() {
         Dispatcher.Init();
         App app = App.CreateOffscreen("encapsulation regression", 800, 600);
@@ -655,6 +774,7 @@ class GuiOverlayLayoutEncapsulationTest {
         TestTabPaneScrollBarAndFlexWrapConvergence(app);
         TestInputNumberNarrowWidth(app);
         TestRoundedPopupLayoutAndConcentricRadii(app);
+        TestOverlayMouseIsolationAndIconOnlyEncapsulation(app);
         app.StopLoop();
         app.SetRootControl(null);
         Drain(app);
