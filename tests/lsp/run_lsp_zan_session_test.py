@@ -666,6 +666,164 @@ def check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expe
     derived_path.unlink()
     unrelated_path.unlink()
 
+    # 10. External packages & stdlib member checking, internal visibility, and nested type (Outer.Inner) navigation
+    pkg_dir = workspace / "packages/Acme.Tools/src/Acme/Tools"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    pkg_file = pkg_dir / "PkgHelper.zan"
+    pkg_uri = pkg_file.as_uri()
+    pkg_file.write_text(
+        "namespace Acme.Tools;\n"
+        "public class PkgHelper {\n"
+        "    public int Limit;\n"
+        "    public static int Scale(int factor, int offset) { return factor + offset; }\n"
+        "    internal static int Secret() { return 42; }\n"
+        "    public class Config {\n"
+        "        public int Timeout;\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    pkg_use_uri = (workspace / "app/src/PkgUse.zan").as_uri()
+    pkg_ok_text = (
+        "using Acme.Tools;\n"
+        "namespace App.Client;\n"
+        "class PkgUse {\n"
+        "    static int Run(PkgHelper helper, PkgHelper.Config cfg) {\n"
+        "        return PkgHelper.Scale(2, 3) + helper.Limit + cfg.Timeout;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(pkg_use_uri, pkg_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 1, set())
+    plines = pkg_ok_text.splitlines()
+
+    # 10a. External package navigation + nested qualified type (PkgHelper.Config) completion/def/hover/sig/inlay
+    pkg_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("PkgHelper.Scale") + len("PkgHelper.")},
+    }).get("result") or []
+    pkg_dot_labels = [c["label"] for c in pkg_dot]
+    for want_item in ("Scale", "Limit", "Config"):
+        if want_item not in pkg_dot_labels:
+            fail("external package dot completion", "missing %s in %r" % (want_item, pkg_dot_labels))
+
+    cfg_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("cfg.Timeout") + len("cfg.")},
+    }).get("result") or []
+    if "Timeout" not in [c["label"] for c in cfg_dot]:
+        fail("nested type instance completion", "missing Timeout in %r" % (cfg_dot,))
+
+    def_nested = s.request("textDocument/definition", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 3, "character": plines[3].index("PkgHelper.Config") + len("PkgHelper.") + 2},
+    }).get("result")
+    if not def_nested or def_nested["uri"] != pkg_uri or def_nested["range"]["start"]["line"] != 5:
+        fail("external nested type definition", "expected %s:5, got %r" % (pkg_uri, def_nested))
+
+    hv_pkg = s.request("textDocument/hover", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("Scale") + 1},
+    }).get("result")
+    hv_pkg_val = (hv_pkg or {}).get("contents", {}).get("value", "")
+    if "int Scale(int factor, int offset)" not in hv_pkg_val or "PkgHelper" not in hv_pkg_val:
+        fail("external package hover", "unexpected hover: %r" % (hv_pkg,))
+
+    sig_pkg = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("3)")},
+    }).get("result")
+    if not sig_pkg or sig_pkg.get("activeParameter") != 1 \
+            or "int Scale(int factor, int offset)" not in [x.get("label") for x in sig_pkg.get("signatures") or []]:
+        fail("external package signatureHelp", "unexpected signatureHelp: %r" % (sig_pkg,))
+
+    pkg_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": pkg_use_uri},
+        "range": {"start": {"line": 4, "character": 0}, "end": {"line": 5, "character": 0}},
+    }).get("result") or []
+    pkg_hint_labels = [h.get("label") for h in pkg_hints]
+    if "factor:" not in pkg_hint_labels or "offset:" not in pkg_hint_labels:
+        fail("external package inlayHint", "expected factor:/offset:, got %r" % (pkg_hints,))
+
+    # 10b. External package member checking + cross-module internal visibility diagnostics
+    pkg_bad_text = (
+        "using Acme.Tools;\n"
+        "namespace App.Client;\n"
+        "class PkgUse {\n"
+        "    static int Run(PkgHelper helper) {\n"
+        "        return PkgHelper.BadCall() + helper.BadField + PkgHelper.Secret();\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(pkg_use_uri, 2, pkg_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+
+    # 10c. Real stdlib member checking & navigation (`using System.IO;` -> `Path.Combine`)
+    std_use_uri = (workspace / "app/src/StdUse.zan").as_uri()
+    std_ok_text = (
+        "using System.IO;\n"
+        "class StdUse {\n"
+        "    static string Join() { return Path.Combine(\"a\", \"b\"); }\n"
+        "}\n"
+    )
+    open_doc(std_use_uri, std_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    expect_diag(std_use_uri, 1, set())
+    std_lines = std_ok_text.splitlines()
+
+    std_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": std_use_uri},
+        "position": {"line": 2, "character": std_lines[2].index("Path.Combine") + len("Path.")},
+    }).get("result") or []
+    if "Combine" not in [c["label"] for c in std_dot]:
+        fail("stdlib dot completion", "missing Path.Combine in %r" % ([c["label"] for c in std_dot],))
+
+    def_path = s.request("textDocument/definition", {
+        "textDocument": {"uri": std_use_uri},
+        "position": {"line": 2, "character": std_lines[2].index("Combine") + 1},
+    }).get("result")
+    if not def_path or not def_path.get("uri", "").endswith("/System/IO/Path.zan"):
+        fail("stdlib definition", "expected .../System/IO/Path.zan, got %r" % (def_path,))
+
+    std_bad_text = (
+        "using System.IO;\n"
+        "class StdUse {\n"
+        "    static string Join() { return Path.NotARealMethod(); }\n"
+        "}\n"
+    )
+    change_doc(std_use_uri, 2, std_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    expect_diag(std_use_uri, 2, {"type 'System.IO.Path' has no method 'NotARealMethod'"})
+
+    close_doc(std_use_uri)
+    expect_diag(std_use_uri, 2, set())
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    close_doc(pkg_use_uri)
+    expect_diag(pkg_use_uri, 2, set())
+    expect_diag(caller, 5, set())
+    pkg_file.unlink()
+
     # Restore caller version/text expected by downstream manifest assertions
     helper_path.unlink()
     s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 3}]})

@@ -22,11 +22,28 @@ public class LspDiskFile {
     }
 }
 
+class LspExternalFileCache {
+    public string Uri;
+    public string FilePath;
+    public string Text;
+    public List<LspSymbol> Symbols;
+
+    public LspExternalFileCache(string uri, string filePath, string text, List<LspSymbol> syms) {
+        Uri = uri;
+        FilePath = filePath;
+        Text = text;
+        Symbols = syms;
+    }
+}
+
 public partial class LspServer {
     static string workspaceRoot;
     static Dictionary<string, LspProjectManifests> projectManifests = new Dictionary<string, LspProjectManifests>();
     static Dictionary<string, List<LspDiskFile>> projectDiskFiles = new Dictionary<string, List<LspDiskFile>>();
     static Dictionary<string, List<LspSymbol>> projectDiskSymbols = new Dictionary<string, List<LspSymbol>>();
+    static Dictionary<string, LspExternalFileCache> externalFileCache = new Dictionary<string, LspExternalFileCache>();
+    static Dictionary<string, List<LspSymbol>> projectExternalSymbols = new Dictionary<string, List<LspSymbol>>();
+    static Dictionary<string, List<LspExternalFileCache>> projectExternalFiles = new Dictionary<string, List<LspExternalFileCache>>();
 
     static string WorkspacePath(string uri) {
         if (!uri.StartsWith("file://")) { return ""; }
@@ -130,8 +147,73 @@ public partial class LspServer {
         CollectMemberSymbols(doc.Uri, unit);
         RefreshWorkspaceDiagnostics(doc.ProjectRoot, doc);
         if (doc.ProjectRoot == "") {
-            CheckDiagnostics(unit, diagnostics);
+            AnalyzeStandaloneWithExternals(doc, unit, diagnostics);
             PublishDiagnostics(doc.Uri, doc.Version, DiagArray(diagnostics, doc.Text));
+        }
+    }
+
+    static string StandaloneExternalKey(string uri) {
+        return "standalone:" + PathKey(uri);
+    }
+
+    static void ClearStandaloneExternal(string uri) {
+        string key = StandaloneExternalKey(uri);
+        projectExternalSymbols.Remove(key);
+        projectExternalFiles.Remove(key);
+    }
+
+    static void AnalyzeStandaloneWithExternals(LspDocument doc, Node unit, Diags diagnostics) {
+        List<string> usings = new List<string>();
+        Dictionary<string, bool> seenUsing = new Dictionary<string, bool>();
+        CollectUsingNamespaces(doc.Text, usings, seenUsing);
+        string extKey = StandaloneExternalKey(doc.Uri);
+        if (usings.Count == 0) {
+            projectExternalSymbols.Remove(extKey);
+            projectExternalFiles.Remove(extKey);
+            CheckDiagnostics(unit, diagnostics);
+            return;
+        }
+        Dictionary<string, bool> skipPaths = new Dictionary<string, bool>();
+        if (doc.FilePath != "") { skipPaths[PathKey(doc.FilePath)] = true; }
+        List<LspExternalFileCache> extFiles = new List<LspExternalFileCache>();
+        List<LspSymbol> extSyms = new List<LspSymbol>();
+        CollectExternalForUsings("", usings, skipPaths, extFiles, extSyms);
+        projectExternalFiles[extKey] = extFiles;
+        projectExternalSymbols[extKey] = extSyms;
+        if (extFiles.Count == 0) {
+            CheckDiagnostics(unit, diagnostics);
+            return;
+        }
+        Node merged = new Node(AK.CompUnit());
+        Diags mergedDiags = new Diags();
+        List<string> names = new List<string>();
+        List<int> starts = new List<int>();
+        int line = 1;
+        names.Add(doc.Uri);
+        starts.Add(line);
+        line = AppendDiagnosticSource(merged, mergedDiags, doc.Text, line);
+        int ei = 0;
+        while (ei < extFiles.Count) {
+            names.Add("");
+            starts.Add(line);
+            line = AppendExternalSource(merged, extFiles[ei].Text, line);
+            ei = ei + 1;
+        }
+        mergedDiags.SetFiles(names, starts);
+        Parser resolver = new Parser(new List<Token>(), mergedDiags);
+        resolver.ResolveWorkspace(merged);
+        Binder binder = new Binder();
+        binder.Bind(merged);
+        Checker checker = new Checker(binder, mergedDiags);
+        checker.CheckLsp(merged, true);
+        diagnostics.items.Clear();
+        int di = 0;
+        while (di < mergedDiags.items.Count) {
+            Diag d = mergedDiags.items[di];
+            if (d.line > 0 && mergedDiags.FileOfLine(d.line) == doc.Uri) {
+                diagnostics.Add(new Diag(d.msg, mergedDiags.LineInFile(d.line), d.col, d.warn));
+            }
+            di = di + 1;
         }
     }
 
@@ -211,6 +293,8 @@ public partial class LspServer {
             projectManifests.Remove(key);
             projectDiskFiles.Remove(key);
             projectDiskSymbols.Remove(key);
+            projectExternalSymbols.Remove(key);
+            projectExternalFiles.Remove(key);
             return;
         }
 
@@ -218,9 +302,14 @@ public partial class LspServer {
         Diags diagnostics = new Diags();
         List<string> names = new List<string>();
         List<int> starts = new List<int>();
+        List<string> usings = new List<string>();
+        Dictionary<string, bool> seenUsing = new Dictionary<string, bool>();
+        Dictionary<string, bool> loadedPaths = new Dictionary<string, bool>();
         int line = 1;
         for (int i = 0; i < open.Count; i = i + 1) {
             LspDocument doc = open[i];
+            if (doc.FilePath != "") { loadedPaths[PathKey(doc.FilePath)] = true; }
+            CollectUsingNamespaces(doc.Text, usings, seenUsing);
             names.Add(doc.Uri);
             starts.Add(line);
             line = AppendDiagnosticSource(unit, diagnostics, doc.Text, line);
@@ -238,13 +327,16 @@ public partial class LspServer {
             #if WINDOWS
             path = path.Replace("\\", "/");
             #endif
-            if (overlays.ContainsKey(PathKey(path))) { continue; }
+            string pkey = PathKey(path);
+            if (overlays.ContainsKey(pkey)) { continue; }
+            loadedPaths[pkey] = true;
             string text;
             try {
                 text = File.ReadAllText(path);
             } catch (IOException ex) {
                 continue;
             }
+            CollectUsingNamespaces(text, usings, seenUsing);
             string fileUri = PathToUri(path);
             diskFiles.Add(new LspDiskFile(fileUri, path, text));
             names.Add("");
@@ -253,6 +345,18 @@ public partial class LspServer {
         }
         projectDiskFiles[key] = diskFiles;
         projectDiskSymbols[key] = diskSyms;
+
+        // On-demand stdlib / packages declarations matching project `using` namespaces.
+        List<LspExternalFileCache> extFiles = new List<LspExternalFileCache>();
+        List<LspSymbol> extSyms = new List<LspSymbol>();
+        CollectExternalForUsings(root, usings, loadedPaths, extFiles, extSyms);
+        projectExternalFiles[key] = extFiles;
+        projectExternalSymbols[key] = extSyms;
+        for (int i = 0; i < extFiles.Count; i = i + 1) {
+            names.Add("");
+            starts.Add(line);
+            line = AppendExternalSource(unit, extFiles[i].Text, line);
+        }
 
         diagnostics.SetFiles(names, starts);
         Parser resolver = new Parser(new List<Token>(), diagnostics);
@@ -392,6 +496,24 @@ public partial class LspServer {
                     j = j + 1;
                 }
             }
+            if (projectExternalSymbols.ContainsKey(key)) {
+                List<LspSymbol> ext = projectExternalSymbols[key];
+                int e = 0;
+                while (e < ext.Count) {
+                    result.Add(ext[e]);
+                    e = e + 1;
+                }
+            }
+        } else if (doc != null) {
+            string extKey = StandaloneExternalKey(doc.Uri);
+            if (projectExternalSymbols.ContainsKey(extKey)) {
+                List<LspSymbol> ext = projectExternalSymbols[extKey];
+                int e = 0;
+                while (e < ext.Count) {
+                    result.Add(ext[e]);
+                    e = e + 1;
+                }
+            }
         }
         return result;
     }
@@ -409,6 +531,14 @@ public partial class LspServer {
                     i = i + 1;
                 }
             }
+            if (projectExternalFiles.ContainsKey(key)) {
+                List<LspExternalFileCache> ext = projectExternalFiles[key];
+                int i = 0;
+                while (i < ext.Count) {
+                    if (ext[i].Uri == targetUri) { return ext[i].Text; }
+                    i = i + 1;
+                }
+            }
         }
         List<string> keys = projectDiskFiles.Keys;
         int k = 0;
@@ -421,7 +551,277 @@ public partial class LspServer {
             }
             k = k + 1;
         }
+        List<string> ekeys = externalFileCache.Keys;
+        int ek = 0;
+        while (ek < ekeys.Count) {
+            LspExternalFileCache ef = externalFileCache[ekeys[ek]];
+            if (ef.Uri == targetUri) { return ef.Text; }
+            ek = ek + 1;
+        }
         return null;
+    }
+
+    static string NormalizePathSlashes(string p) {
+        if (p == null || p == "") { return ""; }
+        #if WINDOWS
+        p = p.Replace("\\", "/");
+        #endif
+        while (p.Length > 1 && p.EndsWith("/") && !p.EndsWith(":/")) {
+            p = p.Substring(0, p.Length - 1);
+        }
+        return p;
+    }
+
+    static string FindStdlibRoot() {
+        string env = Environment.GetEnvironmentVariable("ZAN_STDLIB");
+        if (env != null && env != "" && Directory.ExistsOnDisk(env)) {
+            return NormalizePathSlashes(env);
+        }
+        if (workspaceRoot != null && workspaceRoot != "") {
+            string ws = Path.Combine(workspaceRoot, "stdlib");
+            if (Directory.ExistsOnDisk(ws)) { return NormalizePathSlashes(ws); }
+        }
+        string exe = Environment.ProcessPath;
+        if (exe != null && exe != "") {
+            string dir = Path.GetDirectoryName(exe);
+            int up = 0;
+            while (dir != null && dir != "" && up < 4) {
+                string cand = Path.Combine(dir, "stdlib");
+                if (Directory.ExistsOnDisk(cand)) { return NormalizePathSlashes(cand); }
+                string parent = Path.GetDirectoryName(dir);
+                if (parent == dir) { break; }
+                dir = parent;
+                up = up + 1;
+            }
+        }
+        return "";
+    }
+
+    static void AddUniqueDir(List<string> dst, Dictionary<string, bool> seen, string dir) {
+        if (dir == null || dir == "" || !Directory.ExistsOnDisk(dir)) { return; }
+        string norm = NormalizePathSlashes(dir);
+        string key = PathKey(norm);
+        if (!seen.ContainsKey(key)) {
+            seen[key] = true;
+            dst.Add(norm);
+        }
+    }
+
+    static List<string> FindPackageRoots(string projectRoot, string stdlibRoot) {
+        List<string> roots = new List<string>();
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        string env = Environment.GetEnvironmentVariable("ZAN_PACKAGES");
+        if (env != null && env != "") { AddUniqueDir(roots, seen, env); }
+        if (projectRoot != null && projectRoot != "") {
+            AddUniqueDir(roots, seen, Path.Combine(projectRoot, "packages"));
+        }
+        if (workspaceRoot != null && workspaceRoot != "") {
+            AddUniqueDir(roots, seen, Path.Combine(workspaceRoot, "packages"));
+        }
+        if (stdlibRoot != null && stdlibRoot != "") {
+            string repo = Path.GetDirectoryName(stdlibRoot);
+            if (repo != null && repo != "") {
+                AddUniqueDir(roots, seen, Path.Combine(repo, "packages"));
+            }
+        }
+        return roots;
+    }
+
+    static void CollectUsingNamespaces(string text, List<string> dst, Dictionary<string, bool> seen) {
+        if (text == null || text == "" || dst.Count >= 64) { return; }
+        int i = 0;
+        int n = text.Length;
+        while (i < n && dst.Count < 64) {
+            char c = text[i];
+            if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+                while (i < n && text[i] != '\n') { i = i + 1; }
+                continue;
+            }
+            if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+                i = i + 2;
+                while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) { i = i + 1; }
+                if (i + 1 < n) { i = i + 2; }
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                char q = c;
+                i = i + 1;
+                while (i < n && text[i] != q) {
+                    if (text[i] == '\\' && i + 1 < n) { i = i + 1; }
+                    i = i + 1;
+                }
+                if (i < n) { i = i + 1; }
+                continue;
+            }
+            if (c == 'u' && i + 6 < n && text.Substring(i, 5) == "using"
+                    && (i == 0 || !IsWordChar(text[i - 1]))
+                    && !IsWordChar(text[i + 5])) {
+                int p = i + 5;
+                while (p < n && (text[p] == ' ' || text[p] == '\t')) { p = p + 1; }
+                int nsStart = p;
+                while (p < n && (IsWordChar(text[p]) || text[p] == '.')) { p = p + 1; }
+                int nsEnd = p;
+                while (p < n && (text[p] == ' ' || text[p] == '\t')) { p = p + 1; }
+                if (p < n && text[p] == ';' && nsEnd > nsStart) {
+                    string ns = text.Substring(nsStart, nsEnd - nsStart);
+                    if (ns != "static" && !seen.ContainsKey(ns)) {
+                        seen[ns] = true;
+                        dst.Add(ns);
+                    }
+                    i = p + 1;
+                    continue;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    static void AddZanFilesInDir(string dir, List<string> outPaths, Dictionary<string, bool> seenPaths) {
+        if (dir == null || dir == "" || !Directory.ExistsOnDisk(dir) || outPaths.Count >= 128) { return; }
+        List<string> files;
+        try {
+            files = Directory.GetFiles(dir, "*.zan");
+        } catch (IOException ex) {
+            return;
+        }
+        files.Sort();
+        int i = 0;
+        while (i < files.Count && outPaths.Count < 128) {
+            string p = NormalizePathSlashes(files[i]);
+            string pk = PathKey(p);
+            if (p.EndsWith(".zan") && !seenPaths.ContainsKey(pk) && !File.IsReparsePoint(p)) {
+                seenPaths[pk] = true;
+                outPaths.Add(p);
+            }
+            i = i + 1;
+        }
+    }
+
+    static void CollectExternalFilesForNamespace(string ns, string stdlibRoot,
+            List<string> pkgRoots, List<string> outPaths, Dictionary<string, bool> seenPaths) {
+        if (ns == null || ns == "" || outPaths.Count >= 128) { return; }
+        string nsRel = ns.Replace(".", "/");
+        if (stdlibRoot != "") {
+            string sdir = Path.Combine(stdlibRoot, nsRel);
+            AddZanFilesInDir(sdir, outPaths, seenPaths);
+            if (ns == "System") {
+                AddZanFilesInDir(Path.Combine(sdir, "Exceptions"), outPaths, seenPaths);
+            }
+        }
+        int pi = 0;
+        while (pi < pkgRoots.Count && outPaths.Count < 128) {
+            List<string> pkgDirs;
+            try {
+                pkgDirs = Directory.GetDirectoryPaths(pkgRoots[pi]);
+            } catch (IOException ex) {
+                pi = pi + 1;
+                continue;
+            }
+            pkgDirs.Sort();
+            int di = 0;
+            while (di < pkgDirs.Count && outPaths.Count < 128) {
+                string pkgDir = pkgDirs[di];
+                string srcDir = Path.Combine(pkgDir, "src");
+                if (Directory.ExistsOnDisk(srcDir)) {
+                    AddZanFilesInDir(Path.Combine(srcDir, nsRel), outPaths, seenPaths);
+                    if (PathKey(Path.GetFileName(pkgDir)) == PathKey(ns)) {
+                        AddZanFilesInDir(srcDir, outPaths, seenPaths);
+                    }
+                }
+                string stdDir = Path.Combine(pkgDir, "stdlib");
+                if (Directory.ExistsOnDisk(stdDir)) {
+                    AddZanFilesInDir(Path.Combine(stdDir, nsRel), outPaths, seenPaths);
+                }
+                di = di + 1;
+            }
+            pi = pi + 1;
+        }
+    }
+
+    static LspExternalFileCache GetOrLoadExternalFile(string path) {
+        string key = PathKey(path);
+        if (externalFileCache.ContainsKey(key)) { return externalFileCache[key]; }
+        string text;
+        try {
+            text = File.ReadAllText(path);
+        } catch (IOException ex) {
+            return null;
+        }
+        string uri = PathToUri(path);
+        List<LspSymbol> syms = new List<LspSymbol>();
+        Lexer lx = new Lexer(text);
+        List<Token> toks = lx.Run();
+        CollectTopLevelSymbolsInto(syms, uri, toks, 0);
+        Diags ignored = new Diags();
+        Parser ps = new Parser(toks, ignored);
+        Node unit = ps.ParseSourceDecls();
+        CollectMemberSymbolsInto(syms, uri, unit, 0);
+        LspExternalFileCache entry = new LspExternalFileCache(uri, path, text, syms);
+        externalFileCache[key] = entry;
+        return entry;
+    }
+
+    static void CollectExternalForUsings(string projectRoot, List<string> usings,
+            Dictionary<string, bool> skipPaths, List<LspExternalFileCache> outFiles,
+            List<LspSymbol> outSyms) {
+        if (usings.Count == 0) { return; }
+        string stdlibRoot = FindStdlibRoot();
+        List<string> pkgRoots = FindPackageRoots(projectRoot, stdlibRoot);
+        if (stdlibRoot == "" && pkgRoots.Count == 0) { return; }
+        List<string> extPaths = new List<string>();
+        Dictionary<string, bool> seenPaths = new Dictionary<string, bool>();
+        List<string> skipKeys = skipPaths.Keys;
+        int sk = 0;
+        while (sk < skipKeys.Count) {
+            seenPaths[skipKeys[sk]] = true;
+            sk = sk + 1;
+        }
+        int ui = 0;
+        while (ui < usings.Count) {
+            CollectExternalFilesForNamespace(usings[ui], stdlibRoot, pkgRoots, extPaths, seenPaths);
+            ui = ui + 1;
+        }
+        int ei = 0;
+        while (ei < extPaths.Count) {
+            LspExternalFileCache entry = GetOrLoadExternalFile(extPaths[ei]);
+            if (entry != null) {
+                outFiles.Add(entry);
+                int si = 0;
+                while (si < entry.Symbols.Count) {
+                    outSyms.Add(entry.Symbols[si]);
+                    si = si + 1;
+                }
+            }
+            ei = ei + 1;
+        }
+    }
+
+    static void StripMethodBodies(Node node) {
+        if (node == null) { return; }
+        int i = 0;
+        while (i < node.kids.Count) {
+            Node k = node.kids[i];
+            if (k.kind == AK.MethodDecl() || k.kind == AK.CtorDecl()) {
+                // Keep empty block when a body existed so default interface methods stay non-abstract.
+                if (k.d != null) { k.d = new Node(AK.Block()); }
+            } else if (k.kind == AK.NamespaceDecl() || k.kind == AK.ClassDecl()
+                    || k.kind == AK.StructDecl()) {
+                StripMethodBodies(k);
+            }
+            i = i + 1;
+        }
+    }
+
+    static int AppendExternalSource(Node unit, string text, int line) {
+        Lexer lexer = new Lexer(text);
+        lexer.line = line;
+        List<Token> tokens = lexer.Run();
+        Diags ignored = new Diags();
+        Parser parser = new Parser(tokens, ignored);
+        Node source = parser.ParseSourceDecls();
+        StripMethodBodies(source);
+        for (int i = 0; i < source.kids.Count; i = i + 1) { unit.Add(source.kids[i]); }
+        return lexer.line + 1;
     }
 
     static string ShortTypeName(string raw) {
@@ -443,19 +843,29 @@ public partial class LspServer {
         return s;
     }
 
-    static void AttachBaseTypesInto(List<LspSymbol> dst, string uri, Node d, string owner) {
+    static void AttachTypeMetaInto(List<LspSymbol> dst, string uri, Node d,
+            string owner, string parentType, int lineOffset) {
         if (owner == "") { return; }
+        int wantLine = d.line - lineOffset;
         LspSymbol target = null;
+        int bestDist = 1000000;
         int i = dst.Count - 1;
         while (i >= 0) {
             LspSymbol s = dst[i];
             if (s.Uri == uri && IsTypeSymbolKind(s.Kind) && s.Name == owner) {
-                target = s;
-                break;
+                int dist = s.Line - wantLine;
+                if (dist < 0) { dist = -dist; }
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    target = s;
+                }
             }
             i = i - 1;
         }
         if (target == null) { return; }
+        if (parentType != "" && target.ContainerName == "") {
+            target.ContainerName = parentType;
+        }
         if (d.sval2 != null && d.sval2 != "") {
             string b = ShortTypeName(d.sval2);
             if (b != "" && !target.BaseTypes.Contains(b)) { target.BaseTypes.Add(b); }
