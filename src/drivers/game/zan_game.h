@@ -156,6 +156,16 @@ ZAN_GAME_API void zan_game_set_pbr_maps3d(const char *orm_texture,
  * cutoff <= 0 关闭裁切。 */
 ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff);
 
+/* glTF 2.0 自发光贴图（纹理单元 4）：片元自发光 = uEmissive * texture(uEmissiveMap, v_uv).rgb，
+ * 用于局部发光纹理（霓虹/符文/角色眼部/仪表盘）并可直接驱动 Bloom 泛光；texture 为空关闭采样。 */
+ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture);
+
+/* GPU UV 平铺与滚动变换（KHR_texture_transform / 纹理序列帧 Flipbook / 流水特效）：
+ * 顶点着色器输出 v_uv = a_uv * vec2(scale_u, scale_v) + vec2(offset_u, offset_v)。
+ * 缺省 (1, 1, 0, 0) 为恒等变换。 */
+ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
+    float offset_u, float offset_v);
+
 #ifdef __cplusplus
 }
 #endif

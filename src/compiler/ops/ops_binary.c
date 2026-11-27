@@ -409,6 +409,36 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* 无符号窄整型（byte/ushort/char/uint）在二元提升到更宽整数或浮点前必须零扩展，
+         * 避免 A510 收窄后的 i32 uint（如 (x & 0xFF000000U)）在 coerce_int_pair 中被
+         * zan_iwiden 符号扩展成 0xFFFFFFFF_FF000000 后与 i64 常量比较失败。 */
+        {
+            LLVMTypeRef l_ty = LLVMTypeOf(left);
+            LLVMTypeRef r_ty = LLVMTypeOf(right);
+            LLVMTypeKind lk = LLVMGetTypeKind(l_ty);
+            LLVMTypeKind rk = LLVMGetTypeKind(r_ty);
+            if (lk == LLVMIntegerTypeKind && rk == LLVMIntegerTypeKind) {
+                unsigned wl = LLVMGetIntTypeWidth(l_ty);
+                unsigned wr = LLVMGetIntTypeWidth(r_ty);
+                if (wl < wr && (expr_is_unsigned_int(g, expr->binary.left, locals) ||
+                                expr_is_char(g, expr->binary.left, locals))) {
+                    left = LLVMBuildZExt(g->builder, left, r_ty, "ipair.zext");
+                } else if (wr < wl && (expr_is_unsigned_int(g, expr->binary.right, locals) ||
+                                       expr_is_char(g, expr->binary.right, locals))) {
+                    right = LLVMBuildZExt(g->builder, right, l_ty, "ipair.zext");
+                }
+            } else if ((lk == LLVMFloatTypeKind || lk == LLVMDoubleTypeKind) &&
+                       rk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(r_ty) > 1 &&
+                       (expr_is_unsigned_int(g, expr->binary.right, locals) ||
+                        expr_is_char(g, expr->binary.right, locals))) {
+                right = LLVMBuildUIToFP(g->builder, right, l_ty, "fpair.uitofp");
+            } else if ((rk == LLVMFloatTypeKind || rk == LLVMDoubleTypeKind) &&
+                       lk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(l_ty) > 1 &&
+                       (expr_is_unsigned_int(g, expr->binary.left, locals) ||
+                        expr_is_char(g, expr->binary.left, locals))) {
+                left = LLVMBuildUIToFP(g->builder, left, r_ty, "fpair.uitofp");
+            }
+        }
         /* 混合位宽整数与浮点数类型隐式提升转换 */
         coerce_int_pair(g, &left, &right);
 

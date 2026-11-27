@@ -1,0 +1,344 @@
+using System;
+using System.Collections.Generic;
+using System.Management;
+
+namespace System.Windows;
+
+// 操作系统主题与强调色快照（用于桌宠气泡、右键菜单与小组件自动适配系统明暗模式）。
+public class OsThemeSnapshot {
+    public bool AppsUseLightTheme;
+    public bool SystemUsesLightTheme;
+    public uint AccentColorArgb;
+    public bool QueriedFromOs;
+
+    public OsThemeSnapshot(bool appsLight, bool sysLight, uint accentArgb, bool queriedFromOs) {
+        this.AppsUseLightTheme = appsLight;
+        this.SystemUsesLightTheme = sysLight;
+        this.AccentColorArgb = accentArgb;
+        this.QueriedFromOs = queriedFromOs;
+    }
+}
+
+// Windows 系统深浅色模式与强调色只读监听器：
+// 复用同包 System.Management.Registry 只读查询 HKCU Personalize 与 DWM 注册表键。
+public static class WindowsThemeWatcher {
+    private static bool TryReadHkcuDword(string subKey, string valueName, out uint outValue) {
+        outValue = 0U;
+        #if WINDOWS
+        nint h = Registry.OpenKey(Registry.Hkcu(), subKey, false);
+        if (h == 0) { return false; }
+        try {
+            int sentinel = -2147483647;
+            int v = Registry.GetDword(h, valueName, sentinel);
+            if (v != sentinel) {
+                outValue = unchecked((uint)v);
+                return true;
+            }
+        } finally {
+            Registry.CloseKey(h);
+        }
+        #endif
+        return false;
+    }
+
+    // 读取当前 OS 深浅色主题与 DWM 强调色（非 Windows 或键缺失时回退安全默认值）。
+    public static OsThemeSnapshot QueryCurrent() {
+        bool appsLight = true;
+        bool sysLight = true;
+        uint accent = 0xFF0078D4U; // Windows 经典蓝兜底
+        bool anyOk = false;
+
+        string personalize = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+        uint vApps = 1U;
+        if (TryReadHkcuDword(personalize, "AppsUseLightTheme", out vApps)) {
+            appsLight = vApps != 0U;
+            anyOk = true;
+        }
+        uint vSys = 1U;
+        if (TryReadHkcuDword(personalize, "SystemUsesLightTheme", out vSys)) {
+            sysLight = vSys != 0U;
+            anyOk = true;
+        }
+
+        string dwm = "Software\\Microsoft\\Windows\\DWM";
+        uint vColor = 0U;
+        if (TryReadHkcuDword(dwm, "ColorizationColor", out vColor) && (vColor & 0x00FFFFFFU) != 0U) {
+            accent = 0xFF000000U | (vColor & 0x00FFFFFFU);
+            anyOk = true;
+        } else if (TryReadHkcuDword(dwm, "AccentColor", out vColor) && (vColor & 0x00FFFFFFU) != 0U) {
+            // AccentColor 存储为 ABGR，转换为 ARGB
+            uint r = vColor & 255U;
+            uint g = (vColor >> 8) & 255U;
+            uint b = (vColor >> 16) & 255U;
+            accent = 0xFF000000U | (r << 16) | (g << 8) | b;
+            anyOk = true;
+        }
+
+        return new OsThemeSnapshot(appsLight, sysLight, accent, anyOk);
+    }
+
+    // 依据当前明暗模式返回推荐气泡面板背景色（ARGB）。
+    public static uint RecommendedSurfaceArgb(OsThemeSnapshot snap) {
+        if (snap != null && !snap.AppsUseLightTheme) { return 0xF0202225U; }
+        return 0xF5FFFFFFU;
+    }
+
+    // 依据当前明暗模式返回推荐高对比度正文颜色（ARGB）。
+    public static uint RecommendedTextArgb(OsThemeSnapshot snap) {
+        if (snap != null && !snap.AppsUseLightTheme) { return 0xFFF2F3F5U; }
+        return 0xFF1E1F22U;
+    }
+}
+
+// 商业桌宠 2D 桌面物理引擎（Shimeji 风格：鼠标拖拽甩手惯性估算、重力下落、工作区四壁弹性碰撞、地面摩擦减速与稳态落座检测）。
+public class CompanionDesktopPhysics {
+    public float X;
+    public float Y;
+    public float VelX;
+    public float VelY;
+    public float Width;
+    public float Height;
+    public float GravityPxPerSec2;
+    public float AirDragPerSec;
+    public float BounceRestitution;
+    public float GroundFriction;
+    public float MaxThrowSpeed;
+    public bool IsDragging;
+    public bool IsGrounded;
+
+    public CompanionDesktopPhysics(float x, float y, float width, float height) {
+        this.X = x;
+        this.Y = y;
+        this.VelX = 0.0f;
+        this.VelY = 0.0f;
+        this.Width = width > 1.0f ? width : 128.0f;
+        this.Height = height > 1.0f ? height : 128.0f;
+        this.GravityPxPerSec2 = 1800.0f;
+        this.AirDragPerSec = 0.4f;
+        this.BounceRestitution = 0.45f;
+        this.GroundFriction = 0.82f;
+        this.MaxThrowSpeed = 1600.0f;
+        this.IsDragging = false;
+        this.IsGrounded = false;
+    }
+
+    public void BeginDrag(float x, float y) {
+        this.IsDragging = true;
+        this.IsGrounded = false;
+        this.X = x;
+        this.Y = y;
+        this.VelX = 0.0f;
+        this.VelY = 0.0f;
+    }
+
+    // 拖拽移动时使用 EMA 平滑估算手速，松手瞬间自然转化为抛掷初速度。
+    public void UpdateDrag(float x, float y, float dtSec) {
+        if (!this.IsDragging) { return; }
+        if (dtSec > 0.0001f) {
+            float instVx = (x - this.X) / dtSec;
+            float instVy = (y - this.Y) / dtSec;
+            this.VelX = this.VelX * 0.55f + instVx * 0.45f;
+            this.VelY = this.VelY * 0.55f + instVy * 0.45f;
+        }
+        this.X = x;
+        this.Y = y;
+    }
+
+    public void EndDrag() {
+        this.IsDragging = false;
+        this.IsGrounded = false;
+        float speedSq = this.VelX * this.VelX + this.VelY * this.VelY;
+        float maxSq = this.MaxThrowSpeed * this.MaxThrowSpeed;
+        if (speedSq > maxSq && speedSq > 0.0001f) {
+            float scale = this.MaxThrowSpeed / (float)Math.Sqrt((double)speedSq);
+            this.VelX = this.VelX * scale;
+            this.VelY = this.VelY * scale;
+        }
+    }
+
+    // 步进一帧桌面物理：在显示器工作区 [areaLeft..areaRight, areaTop..areaBottom] 内模拟重力、撞墙反弹与落座。
+    public void Step(float dtSec, float areaLeft, float areaTop, float areaRight, float areaBottom) {
+        if (this.IsDragging || dtSec <= 0.0f) { return; }
+        float dt = dtSec > 0.05f ? 0.05f : dtSec;
+
+        if (!this.IsGrounded) {
+            this.VelY = this.VelY + this.GravityPxPerSec2 * dt;
+        }
+        float drag = 1.0f - this.AirDragPerSec * dt;
+        if (drag < 0.0f) { drag = 0.0f; }
+        this.VelX = this.VelX * drag;
+
+        this.X = this.X + this.VelX * dt;
+        this.Y = this.Y + this.VelY * dt;
+
+        float maxX = areaRight - this.Width;
+        if (maxX < areaLeft) { maxX = areaLeft; }
+        float maxY = areaBottom - this.Height;
+        if (maxY < areaTop) { maxY = areaTop; }
+
+        if (this.X < areaLeft) {
+            this.X = areaLeft;
+            if (this.VelX < 0.0f) { this.VelX = -this.VelX * this.BounceRestitution; }
+        } else if (this.X > maxX) {
+            this.X = maxX;
+            if (this.VelX > 0.0f) { this.VelX = -this.VelX * this.BounceRestitution; }
+        }
+
+        if (this.Y < areaTop) {
+            this.Y = areaTop;
+            if (this.VelY < 0.0f) { this.VelY = -this.VelY * this.BounceRestitution; }
+        } else if (this.Y >= maxY) {
+            this.Y = maxY;
+            if (this.VelY > 35.0f) {
+                this.VelY = -this.VelY * this.BounceRestitution;
+                this.VelX = this.VelX * this.GroundFriction;
+                this.IsGrounded = false;
+            } else {
+                this.VelY = 0.0f;
+                this.VelX = this.VelX * this.GroundFriction;
+                if (this.VelX > -8.0f && this.VelX < 8.0f) { this.VelX = 0.0f; }
+                this.IsGrounded = true;
+            }
+        } else {
+            this.IsGrounded = false;
+        }
+    }
+}
+
+// 放置类/挂机桌宠产线节点定义。
+public class IdleGeneratorEntry {
+    public string Id;
+    public string Name;
+    public double BaseCost;
+    public double CostGrowth;
+    public double BaseRatePerSec;
+    public int Owned;
+    public double Multiplier;
+
+    public IdleGeneratorEntry(string id, string name, double baseCost, double costGrowth, double baseRatePerSec) {
+        this.Id = id != null ? id : "";
+        this.Name = name != null ? name : "";
+        this.BaseCost = baseCost > 0.0 ? baseCost : 10.0;
+        this.CostGrowth = costGrowth > 1.0 ? costGrowth : 1.15;
+        this.BaseRatePerSec = baseRatePerSec >= 0.0 ? baseRatePerSec : 0.0;
+        this.Owned = 0;
+        this.Multiplier = 1.0;
+    }
+}
+
+// 商业桌面挂机/放置数值内核（多产线指数涨价、批量精准购买、封顶离线补算与转生 Prestige 永久加成）。
+public class IdleProductionEngine {
+    public double Currency;
+    public double LifetimeCurrency;
+    public int PrestigePoints;
+    public double PrestigeBonusPerPoint;
+    public double GlobalMultiplier;
+    public double MaxOfflineSeconds;
+
+    private List<IdleGeneratorEntry> generators;
+
+    public IdleProductionEngine() {
+        this.Currency = 0.0;
+        this.LifetimeCurrency = 0.0;
+        this.PrestigePoints = 0;
+        this.PrestigeBonusPerPoint = 0.10;
+        this.GlobalMultiplier = 1.0;
+        this.MaxOfflineSeconds = 28800.0; // 默认离线收益封顶 8 小时
+        this.generators = new List<IdleGeneratorEntry>();
+    }
+
+    public int GeneratorCount { get { return this.generators.Count; } }
+
+    public void RegisterGenerator(string id, string name, double baseCost, double costGrowth, double baseRatePerSec) {
+        if (id == null || id == "") { return; }
+        if (this.FindGenerator(id) != null) { return; }
+        this.generators.Add(new IdleGeneratorEntry(id, name, baseCost, costGrowth, baseRatePerSec));
+    }
+
+    public IdleGeneratorEntry FindGenerator(string id) {
+        if (id == null) { return null; }
+        for (int i = 0; i < this.generators.Count; i = i + 1) {
+            if (this.generators[i].Id == id) { return this.generators[i]; }
+        }
+        return null;
+    }
+
+    public double GetNextCost(string id) {
+        IdleGeneratorEntry g = this.FindGenerator(id);
+        if (g == null) { return 0.0; }
+        return g.BaseCost * Math.Pow(g.CostGrowth, (double)g.Owned);
+    }
+
+    // 计算连续购买 count 级的精确总费用（等比求和）。
+    public double GetBulkCost(string id, int count) {
+        IdleGeneratorEntry g = this.FindGenerator(id);
+        if (g == null || count <= 0) { return 0.0; }
+        double first = g.BaseCost * Math.Pow(g.CostGrowth, (double)g.Owned);
+        double r = g.CostGrowth;
+        if (r <= 1.0000001) { return first * (double)count; }
+        return first * (Math.Pow(r, (double)count) - 1.0) / (r - 1.0);
+    }
+
+    public bool TryBuy(string id, int count) {
+        IdleGeneratorEntry g = this.FindGenerator(id);
+        if (g == null || count <= 0) { return false; }
+        double cost = this.GetBulkCost(id, count);
+        if (this.Currency + 1e-9 < cost) { return false; }
+        this.Currency = this.Currency - cost;
+        if (this.Currency < 0.0) { this.Currency = 0.0; }
+        g.Owned = g.Owned + count;
+        return true;
+    }
+
+    public double GetPrestigeMultiplier() {
+        return 1.0 + (double)this.PrestigePoints * this.PrestigeBonusPerPoint;
+    }
+
+    public double GetTotalRatePerSec() {
+        double sum = 0.0;
+        for (int i = 0; i < this.generators.Count; i = i + 1) {
+            IdleGeneratorEntry g = this.generators[i];
+            if (g.Owned > 0) {
+                sum = sum + (double)g.Owned * g.BaseRatePerSec * g.Multiplier;
+            }
+        }
+        return sum * this.GlobalMultiplier * this.GetPrestigeMultiplier();
+    }
+
+    public double Step(double dtSec) {
+        if (dtSec <= 0.0) { return 0.0; }
+        double earned = this.GetTotalRatePerSec() * dtSec;
+        if (earned > 0.0) {
+            this.Currency = this.Currency + earned;
+            this.LifetimeCurrency = this.LifetimeCurrency + earned;
+        }
+        return earned;
+    }
+
+    // 离线挂机收益补算（自动钳位到 MaxOfflineSeconds 封顶上限）。
+    public double ApplyOfflineCatchup(double elapsedSec) {
+        if (elapsedSec <= 0.0) { return 0.0; }
+        double clamped = elapsedSec > this.MaxOfflineSeconds ? this.MaxOfflineSeconds : elapsedSec;
+        return this.Step(clamped);
+    }
+
+    // 预览本次转生/飞升（Prestige）可新增的永久声望点数：floor(sqrt(Lifetime / threshold)) - current。
+    public int PreviewPrestigeGain(double threshold) {
+        if (threshold <= 0.0 || this.LifetimeCurrency < threshold) { return 0; }
+        int totalEligible = (int)Math.Floor(Math.Sqrt(this.LifetimeCurrency / threshold));
+        int gain = totalEligible - this.PrestigePoints;
+        return gain > 0 ? gain : 0;
+    }
+
+    // 执行转生：结算新增永久 Prestige 点数，清零当前货币与各产线数量，保留终身累计与永久声望倍率。
+    public int TryAscend(double threshold) {
+        int gain = this.PreviewPrestigeGain(threshold);
+        if (gain <= 0) { return 0; }
+        this.PrestigePoints = this.PrestigePoints + gain;
+        this.Currency = 0.0;
+        for (int i = 0; i < this.generators.Count; i = i + 1) {
+            this.generators[i].Owned = 0;
+        }
+        return gain;
+    }
+}

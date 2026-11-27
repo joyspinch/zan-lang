@@ -144,6 +144,7 @@ typedef struct {
     zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
+    zgl_int u_emissive_map, u_emissive_on, u_uv_transform;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -205,6 +206,8 @@ static float g_game_normal_scale = 0.0f;
 static char g_game_orm_key[256] = { 0 };
 static float g_game_ao_strength = 1.0f;
 static float g_game_alpha_cutoff = 0.0f;
+static char g_game_emissive_key[256] = { 0 };
+static float g_game_uv_transform[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -279,13 +282,14 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
 "out vec4 v_light_pos;\n"
 "void main() {\n"
 "    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
@@ -301,6 +305,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
@@ -308,7 +313,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "out vec4 v_light_pos;\n"
 "void main() {\n"
 "    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_color = a_color;\n"
@@ -326,6 +331,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "uniform mat4 uBones[64];\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
@@ -341,7 +347,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "    vec4 sp = skin * vec4(a_pos, 1.0);\n"
 "    vec3 sn = normalize(mat3(skin) * a_normal);\n"
 "    vec4 wp = uModel * sp;\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * sn);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
@@ -447,6 +453,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform int uOrmOn;\n" \
 "uniform float uAoStrength;\n" \
 "uniform float uAlphaCutoff;\n" \
+"uniform sampler2D uEmissiveMap;\n" \
+"uniform int uEmissiveOn;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -580,9 +588,10 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 #define ZAN_GAME_3D_FINAL_COMPOSE(BASE_EXPR, ALPHA_EXPR) \
 "    float outAlpha = " ALPHA_EXPR ";\n" \
 "    if (uAlphaCutoff > 0.0001 && outAlpha < uAlphaCutoff) discard;\n" \
-"    vec3 baseRgb = " BASE_EXPR ";\n" \
-"    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
-"    vec3 rgb = baseRgb * mix(light, light * (0.35 + 0.65 * rough), metal) + specTint * specAcc + uEmissive;\n" \
+    "    vec3 baseRgb = " BASE_EXPR ";\n" \
+    "    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
+    "    vec3 emitRgb = (uEmissiveOn != 0) ? (uEmissive * texture(uEmissiveMap, v_uv).rgb) : uEmissive;\n" \
+    "    vec3 rgb = baseRgb * mix(light, light * (0.35 + 0.65 * rough), metal) + specTint * specAcc + emitRgb;\n" \
 "    if (uFogParams.x > 0.5 && uCamValid != 0) {\n" \
 "        float fogDist = length(uCamPos - v_world_pos);\n" \
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
@@ -930,6 +939,12 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uAoStrength");
     zgl_int alpha_cutoff = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
+    zgl_int emissive_map = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uEmissiveMap");
+    zgl_int emissive_on = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uEmissiveOn");
+    zgl_int uv_transform = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uUvTransform");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -987,6 +1002,9 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_orm_on = orm_on;
     prog->u_ao_strength = ao_strength;
     prog->u_alpha_cutoff = alpha_cutoff;
+    prog->u_emissive_map = emissive_map;
+    prog->u_emissive_on = emissive_on;
+    prog->u_uv_transform = uv_transform;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1041,6 +1059,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int orm_on = g_game_gl->GetUniformLocation(program, "uOrmOn");
     zgl_int ao_strength = g_game_gl->GetUniformLocation(program, "uAoStrength");
     zgl_int alpha_cutoff = g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
+    zgl_int emissive_map = g_game_gl->GetUniformLocation(program, "uEmissiveMap");
+    zgl_int emissive_on = g_game_gl->GetUniformLocation(program, "uEmissiveOn");
+    zgl_int uv_transform = g_game_gl->GetUniformLocation(program, "uUvTransform");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1086,6 +1107,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_orm_on = orm_on;
     g_game_skin_prog.u_ao_strength = ao_strength;
     g_game_skin_prog.u_alpha_cutoff = alpha_cutoff;
+    g_game_skin_prog.u_emissive_map = emissive_map;
+    g_game_skin_prog.u_emissive_on = emissive_on;
+    g_game_skin_prog.u_uv_transform = uv_transform;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1481,6 +1505,26 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_alpha_cutoff >= 0 && gl->Uniform1f) {
         gl->Uniform1f(prog->u_alpha_cutoff, g_game_alpha_cutoff);
+    }
+    zgl_uint em_tex = 0;
+    if (g_game_emissive_key[0]) {
+        const zan_bitmap *ebmp = zan_image_get(g_game_emissive_key);
+        if (zan_game_bitmap_valid(ebmp)) {
+            em_tex = zan_gui_gpu_texture(ebmp);
+        }
+    }
+    if (prog->u_emissive_on >= 0) {
+        gl->Uniform1i(prog->u_emissive_on, em_tex ? 1 : 0);
+    }
+    if (prog->u_emissive_map >= 0) {
+        gl->ActiveTexture(ZGL_TEXTURE0 + 4);
+        gl->BindTexture(ZGL_TEXTURE_2D, em_tex);
+        gl->Uniform1i(prog->u_emissive_map, 4);
+    }
+    if (prog->u_uv_transform >= 0) {
+        gl->Uniform4f(prog->u_uv_transform,
+            g_game_uv_transform[0], g_game_uv_transform[1],
+            g_game_uv_transform[2], g_game_uv_transform[3]);
     }
 }
 
@@ -2298,4 +2342,20 @@ ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff) {
     }
     if (cutoff > 1.0f) cutoff = 1.0f;
     g_game_alpha_cutoff = cutoff;
+}
+
+ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture) {
+    if (!texture || !texture[0]) {
+        g_game_emissive_key[0] = '\0';
+        return;
+    }
+    snprintf(g_game_emissive_key, sizeof(g_game_emissive_key), "%s", texture);
+}
+
+ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
+    float offset_u, float offset_v) {
+    g_game_uv_transform[0] = scale_u;
+    g_game_uv_transform[1] = scale_v;
+    g_game_uv_transform[2] = offset_u;
+    g_game_uv_transform[3] = offset_v;
 }
