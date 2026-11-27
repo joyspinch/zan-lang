@@ -12,7 +12,7 @@
 >
 > 2026-11-27 平账：移出已闭账/自然消亡条目七条——已标 `[x]` 的包编译器钩子 B-ID223（MVC 根除）与 B-ID224（Data ORM 根除）；B-ID167（①②⑤ 已落地，`SseLive.zan` 及旧 dialogs `T`/`GetInt` 随 `37b01f8e7` PublishStudio 收口消亡）；B-ID176/B-ID179（`Serialize.zan` 已删，全仓 `data-dock`/`data-fx` 0 命中）；B-ID220/B-ID221（`theme_drawer_probe.ps1` 与 `EmitSymbolsDetach`/`DrainSymbolWorkAsync` 随 `37b01f8e7` 下线移除）。同步清理已提交的批次 0 旧在飞观察与批次 4 三段过期附件（E3090 已修、`Gallery.zan` 已删、collab 旧日志已清），并按最新源码收窄 B-ID170/174/175/206/217 余项口径。
 >
-> 2026-11-28 平账：移出已闭账 B-ID217（`DesktopPlatformBase.zan`/`Win32Platform.zan` 桌面移动硬件桩全部收敛为与 `CapiPlatform` 一致的诚实 unsupported 契约，`SystemTheme` 增补 `SystemThemeMode` 三态，回归钉 `case_hardware_headless` 与 `tests/gui/core_infra_phase2b_test.zan`）与 B-ID206（余项 ② 落地：`IPlatformNetwork`/`WindowsNetwork`/`PosixNetwork` + `Socket.LocalPort` + `TcpListener.GetPort` 支持 `getsockname` 实际端口发现，`zan-lsp --port 0` 回显 `zan-lsp: listening on 127.0.0.1:<port>`，回归钉 `case_tcp_client_listener_lifecycle` 与 `lsp_diag_external_types`）。
+> 2026-11-28 平账：移出已闭账 B-ID217（`DesktopPlatformBase.zan`/`Win32Platform.zan` 桌面移动硬件桩全部收敛为与 `CapiPlatform` 一致的诚实 unsupported 契约，`SystemTheme` 增补 `SystemThemeMode` 三态，回归钉 `case_hardware_headless` 与 `tests/gui/core_infra_phase2b_test.zan`）、B-ID206（余项 ② 落地：`IPlatformNetwork`/`WindowsNetwork`/`PosixNetwork` + `Socket.LocalPort` + `TcpListener.GetPort` 支持 `getsockname` 实际端口发现，`zan-lsp --port 0` 回显 `zan-lsp: listening on 127.0.0.1:<port>`，回归钉 `case_tcp_client_listener_lifecycle` 与 `lsp_diag_external_types`）与 B-ID215（`zan-compiler-internals` 主文件 1304→32 行 + `selfhost-closure.md` 3427→175 行按专题拆成 9 份子参考，修复 5 处陈旧 `src/selfhost/` 路径及 `irgen-llvm.md` §18 错位并三副本同步，全部 `SKILL.md` ≤343 行、全部参考文件 <1200 行）。
 
 ## 未完成（按平账顺序分批）
 
@@ -65,4 +65,3 @@
 
 - [ ] B-ID170 结构收口余项（① Designer 三件套已拆完，`Designer.zan` 现 679 行；`App.zan` 已并入 B-ID174）：余 ② 命名空间三前缀统一（`System.*` 被 stdlib/packages 同名分仓、`Game` 裸名——独立大工程，动前定一尊；`Gui` 已并入 B-ID178）。
 - [ ] B-ID178〔前置 B-ID172～B-ID177〕GUI 分层重构 P7 按层拆命名空间：目录即命名空间，codemod 原子提交（约 1,285 个调用方文件 + 977 处限定引用），兄弟包各占己名，机检切严格（承接 B-ID170 ② 的 Gui 部分）。
-- [ ] B-ID215〔新增，2026-11-17〕skills 大拆分（治理准入 #4 规模违例）：已完成 gui-design、app-migration、zan-development、zan-dev-standards、game-dev 主文件及 verification.md、html-window.md 拆分；余 1 个主文件超标（`zan-compiler-internals/SKILL.md` 1304 行）与 1 个巨型 reference（`zan-compiler-internals/references/selfhost-closure.md` 3427 行，含 5 处陈旧 selfhost 路径），待 B-ID199 在飞批次收口后按主题拆分并三副本同步（规则 13）。
