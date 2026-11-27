@@ -28,9 +28,10 @@
   遮罩随之不在该帧的命中快照里，同一次手势的释放会解析成下层控件的点击。
   存量代码的做法是 `app.ClaimClick()`（认领）+ 组件级提前返回。**新代码不得再新增
   ClaimClick / BlockHitsRect / BlockHits* 这类仲裁调用**（`scripts/gui_layer_rules.py`
-  棘轮拦截）：新浮层复用 `OverlayPopup.Host`、`Layer` 等共享件；统一浮层 OverlayHost 与
-  路由事件落地后整体迁过去。本节以下几条描述的是
-  现行仲裁机制，供维护存量代码。
+  棘轮拦截）：新浮层统一接入 `app.overlayHost`（`OverlayHost.Show` / `ShowAt` / `Push`、
+  独立模态直接调 `Modal.Show(app)` / `Drawer.Show(app)`）或 `Layer` 共享件；旧
+  `App.overlays` / `OverlayPopup.Host` / `Control.OnPaintOverlay` 路径已退场。本节以下
+  几条描述的是历史仲裁机制，供排查存量代码参考。
 
 - **遮罩只挡自身矩形 = 点外面也穿透**：下拉/菜单类的浮层若只
   `BlockHitsRect(自身矩形)`，用户在浮层**外面**点一下时，这次点击照样落回

@@ -11,11 +11,11 @@ Zan GUI 划分为清晰的四层体系：
 ```
 +-------------------------------------------------------------------------+
 |  领域扩展包 (Packages / 独立源码包)                                       |
-|  - Zan.Gui.Charts (高维数据可视化/图表引擎)                                |
-|  - Zan.Industrial (工业 SCADA 组态/仪表/仪器)                             |
+|  - Zan.Gui.Charts / Zan.Gui.DataTable / Zan.Gui.CodeEditor              |
+|  - Zan.Gui.Browser / Zan.Gui.Designer / Zan.Industrial                  |
 +-------------------------------------------------------------------------+
 |  复合组件层 (Gui.Component / 复杂交互控件)                                 |
-|  - CodeEditor, DataTable, TreeView, MarkdownViewer, FilePicker, Dock... |
+|  - TreeView, BandGrid, MarkdownViewer, FilePicker, GraphView, Dock...   |
 +-------------------------------------------------------------------------+
 |  原子控件层 (Gui.Widget / 基础 UI 元素)                                   |
 |  - Button, TextBox, Label, CheckBox, Slider, ProgressBar, QrCode...     |
