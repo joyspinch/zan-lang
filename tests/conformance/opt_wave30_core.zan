@@ -1,0 +1,285 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Ai;
+using Zan.Web;
+using Web3.Rpc;
+using Web3.Types;
+using System.Data;
+using System.Data.Orm;
+using System.Net.Http;
+using System.Json;
+
+public class Program {
+    static void Check(bool cond, string label) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static void TestChunking() {
+        Check(Chunking.EstimateTokens("") == 0, "chunk_est_empty");
+        Check(Chunking.EstimateTokens("abcd") == 1, "chunk_est_ascii4");
+        Check(Chunking.EstimateTokens("你好世界") == 4, "chunk_est_cjk4");
+        Check(Chunking.EstimateTokens("a😀b") == 1, "chunk_est_emoji");
+
+        List<AiChunk> twEmpty = Chunking.TokenWindow("", 10, 2);
+        Check(twEmpty.Count == 0, "chunk_tw_empty");
+
+        List<AiChunk> tw = Chunking.TokenWindow("abcdefghij你好世界klmnop", 3, 1);
+        Check(tw.Count >= 3, "chunk_tw_count");
+        Check(tw[0].start == 0 && tw[0].end > 0 && tw[0].text.Length == tw[0].end - tw[0].start, "chunk_tw_offsets");
+
+        List<AiChunk> sents = Chunking.Sentences("Hello world! 你好世界。How are you? Tail");
+        Check(sents.Count == 4, "chunk_sent_count");
+
+        List<AiChunk> paras = Chunking.Paragraphs("Para1 line1\r\nPara1 line2\r\n\r\nPara2\n\nPara3");
+        Check(paras.Count == 3 && paras[1].text == "Para2" && paras[2].text == "Para3", "chunk_para");
+
+        List<AiChunk> rec = Chunking.Recursive("Alpha beta gamma.\n\nDelta epsilon zeta.\nEta theta iota kappa lambda.", 24, 6);
+        Check(rec.Count >= 2, "chunk_rec_default");
+        for (int i = 0; i < rec.Count; i = i + 1) {
+            Check(rec[i].text.Length == rec[i].end - rec[i].start, "chunk_rec_span");
+        }
+
+        string joined = Chunking.Join(paras, " | ");
+        Check(joined.Contains("Para1 line1") && joined.Contains(" | Para2 | Para3"), "chunk_join");
+        Console.WriteLine("chunking:ok");
+    }
+
+    static void TestMarkdownLite() {
+        Check(MarkdownLite.Html("") == "", "md_empty");
+        string md = "# H1\r\n## H2\r\n### H3\r\n\r\n- item **bold** & `x < y`\r\n- item2 `` **** tail\r\n\r\n1. one\r\n12. twelve\r\n\r\n> quote **a & b**\r\n\r\n```zan\r\nint x = a < b && c > d;\r\n```\r\n\r\nplain \"quoted\" line";
+        string html = MarkdownLite.Html(md);
+        Check(html.Contains("<h3>H1</h3>\n<h4>H2</h4>\n<h5>H3</h5>\n"), "md_headings");
+        Check(html.Contains("<ul>\n<li>item <strong>bold</strong> &amp; <code>x &lt; y</code></li>\n"), "md_ul_both");
+        Check(html.Contains("<li>** tail</li>\n</ul>\n"), "md_empty_marks");
+        Check(html.Contains("<ol>\n<li>one</li>\n<li>twelve</li>\n</ol>\n"), "md_ol");
+        Check(html.Contains("<blockquote><p>quote <strong>a &amp; b</strong></p></blockquote>\n"), "md_quote");
+        Check(html.Contains("<pre><code>int x = a &lt; b &amp;&amp; c &gt; d;\n</code></pre>\n"), "md_code");
+        Check(html.Contains("<p>plain &quot;quoted&quot; line</p>\n"), "md_para_esc");
+
+        // Unclosed code fence at EOF
+        string unclosed = "```\n<b>raw</b>";
+        Check(MarkdownLite.Html(unclosed) == "<pre><code>&lt;b&gt;raw&lt;/b&gt;\n</code></pre>\n", "md_unclosed_fence");
+        Console.WriteLine("markdown:ok");
+    }
+
+    static void TestJsonRpcBuilder() {
+        Address a1 = Address.Parse("0x742d35Cc6634C0532925a3b844Bc454e4438f44e");
+        Address a2 = Address.Parse("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+
+        string bn = JsonRpcBuilder.BlockNumber(0);
+        Check(bn == "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"eth_blockNumber\",\"params\":[]}", "rpc_bn_0");
+
+        string bal = JsonRpcBuilder.GetBalance(a1, "latest", 42);
+        Check(bal.Contains("\"id\":42,\"method\":\"eth_getBalance\",\"params\":[\"0x742d35cc6634c0532925a3b844bc454e4438f44e\",\"latest\"]"), "rpc_bal");
+
+        string tc = JsonRpcBuilder.GetTransactionCount(a1, "", -7);
+        Check(tc.Contains("\"id\":-7,\"method\":\"eth_getTransactionCount\"") && tc.Contains(",\"latest\"]"), "rpc_tc_neg");
+
+        // Call auto-prefixes 0x when missing
+        string call = JsonRpcBuilder.Call(a2, "abcd1234", "pending", 9);
+        Check(call.Contains("\"data\":\"0xabcd1234\"") && call.Contains(",\"pending\"]"), "rpc_call_prefix");
+
+        string eg = JsonRpcBuilder.EstimateGas(a1, a2, "0xdead", "0x100", 11);
+        Check(eg.Contains("\"value\":\"0x100\"") && eg.Contains("\"data\":\"0xdead\""), "rpc_eg");
+
+        string srt = JsonRpcBuilder.SendRawTransaction("cafe01", 12);
+        Check(srt == "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"eth_sendRawTransaction\",\"params\":[\"0xcafe01\"]}", "rpc_rawtx");
+
+        string rec = JsonRpcBuilder.GetTransactionReceipt("0x9b7b", 13);
+        Check(rec == "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"0x9b7b\"]}", "rpc_receipt");
+
+        string esc = JsonRpcBuilder.BuildRequest("m\"\\n\n\t\x01", "[]", 14);
+        Check(esc == "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"m\\\"\\\\n\\n\\t\\u0001\",\"params\":[]}", "rpc_esc");
+        Console.WriteLine("jsonrpc:ok");
+    }
+
+    static void TestOrmSelect() {
+        Meta meta = Meta.Of("W30User", "users")
+            .Col("id", "Id", 0, true, true, true, true, 0)
+            .Col("name", "Name", 3, false, false, false, true, 64)
+            .Col("score", "Score", 0, false, false, false, true, 0)
+            .Col("note", "Note", 3, false, false, false, false, 128)
+            .Seal();
+
+        Check(meta.SelectList(DbProvider.SQLite) == "t.\"id\", t.\"name\", t.\"score\", t.\"note\"", "meta_sel_sqlite");
+        Check(meta.SelectList(DbProvider.MySQL) == "t.`id`, t.`name`, t.`score`, t.`note`", "meta_sel_mysql");
+        Check(meta.SelectList(DbProvider.SqlServer) == "t.[id], t.[name], t.[score], t.[note]", "meta_sel_mssql");
+
+        Select q = Select.Create(null, meta);
+        q.Distinct();
+        q.WhereEq("name", "alice");
+        q.WhereGe("score", 10L);
+        q.WhereLe("score", 99L);
+        List<int> ids = new List<int>();
+        ids.Add(1); ids.Add(2); ids.Add(3);
+        q.WhereIn("id", ids);
+        q.WhereLikeAny("name|note", "ali");
+        q.GroupBy("t.name");
+        q.Having("COUNT(*) > 1");
+        q.OrderBySafeDesc("score");
+        q.OrderBySafe("id");
+        bool badOrderThrew = false;
+        try {
+            q.OrderBySafe("injected; DROP TABLE users");
+        } catch (Exception ex) {
+            badOrderThrew = true;
+        }
+        Check(badOrderThrew, "orm_sel_order_safe_throw");
+        q.Page(2, 20);
+
+        string sql = q.BuildSelect();
+        Check(sql.StartsWith("SELECT DISTINCT t.\"id\", t.\"name\", t.\"score\", t.\"note\" FROM \"users\" t WHERE "), "orm_sel_prefix");
+        Check(sql.Contains("t.\"id\" IN (?, ?, ?)"), "orm_sel_in");
+        Check(sql.Contains("GROUP BY t.name HAVING COUNT(*) > 1"), "orm_sel_gh");
+        Check(sql.Contains("ORDER BY t.\"score\" DESC, t.\"id\""), "orm_sel_order");
+        Check(!sql.Contains("DROP"), "orm_sel_order_safe");
+        Check(sql.Contains("LIMIT 20 OFFSET 20"), "orm_sel_page");
+        Check(q.Params().Count() == 8, "orm_sel_params");
+
+        // Empty WhereIn yields 1=0
+        Select qEmpty = Select.Create(null, meta);
+        qEmpty.WhereIn("id", new List<int>());
+        Check(qEmpty.BuildCount() == "SELECT COUNT(*) FROM \"users\" t WHERE 1 = 0", "orm_empty_in");
+
+        // BuildCol / BuildDto / BuildAgg
+        Select qSub = Select.Create(null, meta);
+        qSub.WhereEq("name", "bob");
+        Check(qSub.BuildCol("t.name") == "SELECT t.name FROM \"users\" t WHERE t.\"name\" = ?", "orm_col");
+        Check(qSub.BuildDto("t.id, t.score") == "SELECT t.id, t.score FROM \"users\" t WHERE t.\"name\" = ?", "orm_dto");
+        Check(qSub.BuildAgg("SUM(t.score)") == "SELECT SUM(t.score) FROM \"users\" t WHERE t.\"name\" = ?", "orm_agg");
+        Console.WriteLine("ormselect:ok");
+    }
+
+    static void TestHttpResponse() {
+        HttpResponse r = HttpResponse.Json("{\"ok\":true}");
+        r.SetHeader("X-Trace", "abc-123");
+        r.SetHeader("Content-Length", "999");        // must be ignored
+        r.SetHeader("Transfer-Encoding", "chunked"); // must be ignored
+        r.SetHeader("Connection", "close");          // must be ignored
+        r.SetHeader("Bad Header", "v");              // invalid token ignored
+        r.SetHeader("X-Ctl", "bad\r\nval");          // CTL ignored
+        r.SetCookie("sid", "xyz", "/", 3600, true, true);
+        r.SetCookie("zero", "0", "", 0, false, false);
+        r.SetCookie("bad\r\n", "v", "/", 10, false, false);
+
+        Check(r.GetHeader("x-trace") == "abc-123", "http_gethdr_ci");
+        Check(r.GetHeader("Content-Length") == "", "http_cl_blocked");
+        Check(r.GetHeader("Missing") == "", "http_missing_hdr");
+
+        string built = r.Build();
+        Check(built.StartsWith("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n"), "http_build_start");
+        Check(built.Contains("Set-Cookie: sid=xyz; Path=/; Max-Age=3600; Secure; HttpOnly\r\n"), "http_cookie_full");
+        Check(built.Contains("Set-Cookie: zero=0; Max-Age=0\r\n"), "http_cookie_zero");
+        Check(built.EndsWith("\r\n\r\n{\"ok\":true}"), "http_build_body");
+
+        HttpResponse parsed = HttpResponse.Parse(built);
+        Check(parsed.statusCode == 200 && parsed.statusText == "OK", "http_parse_status");
+        Check(parsed.contentType == "application/json", "http_parse_ct");
+        Check(parsed.framingHasLength && parsed.framingLength == 11 && !parsed.framingChunked, "http_parse_framing");
+        Check(parsed.body == "{\"ok\":true}", "http_parse_body");
+        Check(parsed.GetHeader("X-TRACE") == "abc-123", "http_parse_hdr");
+
+        // Chunked response
+        HttpResponse ch = HttpResponse.Parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+        Check(ch.statusCode == 200 && ch.framingChunked && !ch.framingHasLength, "http_parse_chunked");
+
+        // Smuggling rejection: TE + CL
+        HttpResponse smug = HttpResponse.Parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello");
+        Check(smug.statusCode == 0, "http_smug_te_cl");
+
+        // Conflicting duplicate CL rejection
+        HttpResponse dupCl = HttpResponse.Parse("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello");
+        Check(dupCl.statusCode == 0, "http_dup_cl_mismatch");
+
+        // 204 forbids Content-Length
+        HttpResponse nc = HttpResponse.NoContent();
+        Check(!nc.Build().Contains("Content-Length"), "http_204_no_cl");
+
+        // ServerError HTML escaping
+        HttpResponse se = HttpResponse.ServerError("<script>'&\"</script>");
+        Check(se.body == "<h1>500 Internal Server Error</h1><p>&lt;script&gt;&#39;&amp;&quot;&lt;/script&gt;</p>", "http_500_esc");
+        Console.WriteLine("httpresp:ok");
+    }
+
+    static void TestJsonSchema() {
+        // 1. Recursive $ref + union types + enum + const + numeric + string UTF-8 + array uniqueItems + combinators
+        string schText = "{"
+            + "\"type\":\"object\","
+            + "\"required\":[\"id\",\"name\",\"tags\",\"node\"],"
+            + "\"properties\":{"
+            + "  \"id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000,\"multipleOf\":5},"
+            + "  \"name\":{\"type\":\"string\",\"minLength\":2,\"maxLength\":6,\"pattern\":\"^[a-zA-Z\\\\u4e00-\\\\u9fff]+$\"},"
+            + "  \"role\":{\"enum\":[\"admin\",\"user\",\"guest\"]},"
+            + "  \"ver\":{\"const\":\"v1\"},"
+            + "  \"score\":{\"type\":[\"number\",\"null\"],\"exclusiveMinimum\":0,\"exclusiveMaximum\":100},"
+            + "  \"tags\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":12,\"uniqueItems\":true,\"items\":{\"type\":\"string\"}},"
+            + "  \"pair\":{\"type\":\"array\",\"prefixItems\":[{\"type\":\"string\"},{\"type\":\"integer\"}],\"items\":{\"type\":\"boolean\"}},"
+            + "  \"choice\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]},"
+            + "  \"notZero\":{\"not\":{\"const\":0}},"
+            + "  \"node\":{\"$ref\":\"#/$defs/tree\"}"
+            + "},"
+            + "\"patternProperties\":{\"^x-\":{\"type\":\"integer\"}},"
+            + "\"additionalProperties\":false,"
+            + "\"$defs\":{"
+            + "  \"tree\":{\"type\":\"object\",\"required\":[\"v\"],\"properties\":{\"v\":{\"type\":\"integer\"},\"next\":{\"anyOf\":[{\"type\":\"null\"},{\"$ref\":\"#/$defs/tree\"}]}}}"
+            + "}"
+            + "}";
+        JsonSchema sch = JsonSchema.Parse(schText);
+        JsonSchemaValidator val = new JsonSchemaValidator(sch);
+
+        JsonValue okDoc = JsonValue.Parse("{"
+            + "\"id\":25,\"name\":\"你好ab\",\"role\":\"admin\",\"ver\":\"v1\",\"score\":99.5,"
+            + "\"tags\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"j\"],"
+            + "\"pair\":[\"k\",7,true,false],\"choice\":12,\"notZero\":1,"
+            + "\"x-extra\":42,"
+            + "\"node\":{\"v\":1,\"next\":{\"v\":2,\"next\":null}}"
+            + "}");
+        JsonSchemaResult rOk = val.Validate(okDoc);
+        Check(rOk.IsValid(), "jschema_valid_doc");
+
+        JsonValue badDoc = JsonValue.Parse("{"
+            + "\"id\":23,\"name\":\"a\",\"role\":\"root\",\"ver\":\"v2\",\"score\":100,"
+            + "\"tags\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"a\"],"
+            + "\"pair\":[\"k\",\"notint\",1],\"choice\":true,\"notZero\":0,"
+            + "\"extraBad\":1,"
+            + "\"node\":{\"v\":\"bad\",\"next\":{\"v\":2,\"next\":\"bad\"}}"
+            + "}");
+        JsonSchemaResult rBad = val.Validate(badDoc);
+        Check(!rBad.IsValid() && rBad.errors.Count >= 10, "jschema_bad_doc_errors");
+
+        // 2. Large object (>12 properties -> Dictionary path) + JSON pointer escaping
+        StringBuilder largeSch = new StringBuilder();
+        largeSch.Append("{\"type\":\"object\",\"properties\":{");
+        for (int i = 0; i < 15; i = i + 1) {
+            if (i > 0) { largeSch.Append(","); }
+            largeSch.Append("\"p" + Convert.ToString(i) + "\":{\"type\":\"integer\"}");
+        }
+        largeSch.Append(",\"a/b~c\":{\"type\":\"string\"}}}");
+        JsonSchemaValidator valLarge = new JsonSchemaValidator(JsonSchema.Parse(largeSch.ToString()));
+        JsonValue largeOk = JsonValue.Parse("{\"p0\":1,\"p14\":15,\"a/b~c\":\"ok\"}");
+        Check(valLarge.Validate(largeOk).IsValid(), "jschema_large_ok");
+        JsonValue largeBad = JsonValue.Parse("{\"p14\":\"str\",\"a/b~c\":123}");
+        JsonSchemaResult rLargeBad = valLarge.Validate(largeBad);
+        Check(!rLargeBad.IsValid() && rLargeBad.errors.Count == 2 && rLargeBad.errors[1].path == "/a~1b~0c", "jschema_large_bad_ptr");
+
+        // 3. Boolean false schema & unresolved $ref
+        JsonSchemaValidator valFalse = new JsonSchemaValidator(JsonSchema.Parse("false"));
+        Check(!valFalse.Validate(JsonValue.Parse("1")).IsValid(), "jschema_false");
+        JsonSchemaValidator valBadRef = new JsonSchemaValidator(JsonSchema.Parse("{\"$ref\":\"#/$defs/missing\"}"));
+        Check(!valBadRef.Validate(JsonValue.Parse("1")).IsValid(), "jschema_bad_ref");
+        Console.WriteLine("jschema:ok");
+    }
+
+    public static void Main(string[] args) {
+        Program.TestChunking();
+        Program.TestMarkdownLite();
+        Program.TestJsonRpcBuilder();
+        Program.TestOrmSelect();
+        Program.TestHttpResponse();
+        Program.TestJsonSchema();
+        Console.WriteLine("ALL_WAVE30_OK");
+    }
+}

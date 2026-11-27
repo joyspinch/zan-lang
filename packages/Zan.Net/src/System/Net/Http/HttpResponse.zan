@@ -4,9 +4,6 @@ namespace System.Net.Http;
 
 // 分块传输的正文来源：服务器发出响应头后反复调用它取下一段正文，
 // 返回 null 或空数组表示正文结束（服务器随后写结束块收尾）。
-//
-// 逐段产出而不是先拼出整个正文，是"长度未知也能开流"的前提：
-// SSE、大文件下载、逐 token 的模型输出都能在第一段到达时就发出去。
 public async delegate byte[] HttpChunkSource();
 
 // HTTP 响应的构建器与解析器。
@@ -14,8 +11,7 @@ public class HttpResponse : IDisposable {
     public int statusCode;
     public string statusText;
     public string body;
-    // 二进制正文（与 body 二选一）。Zan 字符串以 NUL 结尾，
-    // 无法携带任意字节，因此图片/可执行文件等正文走 byte[]。
+    // 二进制正文（与 body 二选一）。
     public byte[] bodyBytes;
     public int bodyBytesLen;
     public string contentType;
@@ -23,18 +19,11 @@ public class HttpResponse : IDisposable {
     public bool keepAlive;
     public int framingLength;
     public bool framingHasLength;
-    // 正文是否按分块传输编码定界。客户端解析时由 ParseFraming 置位，
-    // 服务端发送时由 SetChunked 置位——同一个字段在两端是同一件事：
-    // "这份响应的正文是分块framed的"。
     public bool framingChunked;
-    // 分块正文来源（非 null 时以分块传输编码发送正文）。
     public HttpChunkSource chunkSource;
-    // 正文是否已按 Content-Encoding 解码（gzip / deflate 等）。
     public bool contentDecoded;
-    // 生效的内容编码名（未解码时为空串）。
     public string contentEncoding;
 
-    // 默认构造：200 / keep-alive 的默认状态，由各静态工厂使用。
     public HttpResponse() {
         this.statusCode = 200;
         this.statusText = "OK";
@@ -52,14 +41,12 @@ public class HttpResponse : IDisposable {
         this.contentEncoding = "";
     }
 
-    // 用给定正文创建 200 OK 响应。
     public static HttpResponse Ok(string body) {
         HttpResponse resp = new HttpResponse();
         resp.body = body;
         return resp;
     }
 
-    // 创建 JSON 响应。
     public static HttpResponse Json(string jsonBody) {
         HttpResponse resp = new HttpResponse();
         resp.body = jsonBody;
@@ -67,7 +54,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建纯文本响应。
     public static HttpResponse Text(string text) {
         HttpResponse resp = new HttpResponse();
         resp.body = text;
@@ -75,7 +61,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 HTML 响应。
     public static HttpResponse Html(string html) {
         HttpResponse resp = new HttpResponse();
         resp.body = html;
@@ -83,8 +68,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 用二进制正文创建响应。正文按 <paramref name="len"/> 字节
-    // 原样发送，内嵌 NUL 不会截断报文。
     public static HttpResponse Bytes(byte[] data, int len, string ct) {
         HttpResponse resp = new HttpResponse();
         resp.bodyBytes = data;
@@ -93,74 +76,47 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 正文字节数（文本或二进制）。
     public int BodyLength() {
         if (this.bodyBytes != null) { return this.bodyBytesLen; }
         return this.body.Length;
     }
 
-    // 正文是否为二进制缓冲区。
     public bool IsBinary() { return this.bodyBytes != null; }
 
-    // 字符串是否含 CR/LF（头部注入检查用）。
     public static bool HasCrlf(string s) {
-        return s.IndexOf("\r") >= 0 || s.IndexOf("\n") >= 0;
+        if (s == null || s.Length == 0) { return false; }
+        return NativeMemory.IndexOfAny((nint)s, s.Length, 13, 10) >= 0;
     }
 
-    // 头部名/值是否不含会破坏报文分帧或被下游误读的字符：
-    // 值禁所有控制字符（HTAB 除外）与 DEL——只禁 NUL/CR/LF 会让
-    // 0x01 这类 CTL 溜进报文，宽容下游可能按不同规则切分；名字另禁
-    // 冒号——否则可夹带出第二个头字段（头注入）。名字按 HTTP token
-    // 字符集判定。
-    // <paramref name="isName"/> 为 true 时按名字判定。
     internal static bool HeaderFramingSafe(bool isName, string s) {
         if (s == null) { return false; }
         return HttpResponse.HeaderFramingSafeRange(isName, s, 0, s.Length);
     }
 
     internal static bool HeaderFramingSafeRange(bool isName, string s, int start, int end) {
-        for (int i = start; i < end; i = i + 1) {
-            int ch = s[i] & 255;
-            if (isName) {
-                if (!((ch >= 48 && ch <= 57)
-                    || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)
+        if (isName) {
+            for (int i = start; i < end; i = i + 1) {
+                int ch = s[i] & 255;
+                if (!((ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || ch == 45
+                    || (ch >= 48 && ch <= 57) || ch == 95 || ch == 46
                     || ch == 33 || ch == 35 || ch == 36 || ch == 37
                     || ch == 38 || ch == 39 || ch == 42 || ch == 43
-                    || ch == 45 || ch == 46 || ch == 94 || ch == 95
-                    || ch == 96 || ch == 124 || ch == 126)) { return false; }
-            } else {
-                if (ch == 127 || (ch < 32 && ch != 9)) { return false; }
+                    || ch == 94 || ch == 96 || ch == 124 || ch == 126)) { return false; }
             }
+            return true;
+        }
+        for (int i = start; i < end; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 127 || (ch < 32 && ch != 9)) { return false; }
         }
         return true;
     }
 
-    private static bool IsContentTypeHeader(string s, int start, int len) {
-        if (len != 12) { return false; }
-        int c0 = s[start] & 255; if (c0 != 99 && c0 != 67) { return false; }
-        int c1 = s[start + 1] & 255; if (c1 != 111 && c1 != 79) { return false; }
-        int c2 = s[start + 2] & 255; if (c2 != 110 && c2 != 78) { return false; }
-        int c3 = s[start + 3] & 255; if (c3 != 116 && c3 != 84) { return false; }
-        int c4 = s[start + 4] & 255; if (c4 != 101 && c4 != 69) { return false; }
-        int c5 = s[start + 5] & 255; if (c5 != 110 && c5 != 78) { return false; }
-        int c6 = s[start + 6] & 255; if (c6 != 116 && c6 != 84) { return false; }
-        int c7 = s[start + 7] & 255; if (c7 != 45) { return false; }
-        int c8 = s[start + 8] & 255; if (c8 != 116 && c8 != 84) { return false; }
-        int c9 = s[start + 9] & 255; if (c9 != 121 && c9 != 89) { return false; }
-        int c10 = s[start + 10] & 255; if (c10 != 112 && c10 != 80) { return false; }
-        int c11 = s[start + 11] & 255; if (c11 != 101 && c11 != 69) { return false; }
-        return true;
-    }
-
-    // 头部名与值是否可安全写入：名字非空且无冒号，两者都
-    // 不含分帧字符。请求侧（HttpClient）与响应侧共用同一防线。
     public static bool IsValidHeader(string name, string value) {
-        return name.Length > 0 && HttpResponse.HeaderFramingSafe(true, name)
+        return name != null && name.Length > 0 && HttpResponse.HeaderFramingSafe(true, name)
             && HttpResponse.HeaderFramingSafe(false, value);
     }
 
-    // 创建重定向响应。Location 不允许注入折行；非法值
-    // 被保守拒绝，不产生一个可被下游解释的重定向头。
     public static HttpResponse Redirect(string url) {
         HttpResponse resp = new HttpResponse();
         if (url == null || url.Length == 0 || HttpResponse.HasCrlf(url)) {
@@ -175,7 +131,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 301 Moved Permanently 响应 (RFC 7231 §6.4.2)。Location 不允许 CRLF 注入。
     public static HttpResponse MovedPermanently(string url) {
         HttpResponse resp = new HttpResponse();
         if (url == null || url.Length == 0 || HttpResponse.HasCrlf(url)) {
@@ -190,7 +145,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 307 Temporary Redirect 响应 (RFC 7231 §6.4.7)。保持请求动词重定向，Location 不允许 CRLF 注入。
     public static HttpResponse TemporaryRedirect(string url) {
         HttpResponse resp = new HttpResponse();
         if (url == null || url.Length == 0 || HttpResponse.HasCrlf(url)) {
@@ -205,7 +159,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 308 Permanent Redirect 响应 (RFC 7538)。保持请求动词永久重定向，Location 不允许 CRLF 注入。
     public static HttpResponse PermanentRedirect(string url) {
         HttpResponse resp = new HttpResponse();
         if (url == null || url.Length == 0 || HttpResponse.HasCrlf(url)) {
@@ -220,7 +173,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 201 Created 响应 (RFC 7231 §6.3.2)，可选带 Location 头与正文。
     public static HttpResponse Created(string location, string body) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 201;
@@ -232,7 +184,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 204 No Content 响应 (RFC 7231 §6.3.5)，无正文。
     public static HttpResponse NoContent() {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 204;
@@ -241,7 +192,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 400 Bad Request 响应 (RFC 7231 §6.5.1)，带 HTML 转义的错误描述。
     public static HttpResponse BadRequest(string message) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 400;
@@ -251,7 +201,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 401 Unauthorized 响应 (RFC 7235 §3.1)，可选携带 WWW-Authenticate 标头。
     public static HttpResponse Unauthorized(string realm) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 401;
@@ -263,7 +212,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 403 Forbidden 响应 (RFC 7231 §6.5.3)。
     public static HttpResponse Forbidden(string message) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 403;
@@ -273,7 +221,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 404 Not Found 响应。
     public static HttpResponse NotFound() {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 404;
@@ -282,7 +229,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 405 Method Not Allowed 响应 (RFC 7231 §6.5.5)，携带 Allow 头列出允许的方法。
     public static HttpResponse MethodNotAllowed(string allow) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 405;
@@ -294,7 +240,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 409 Conflict 响应 (RFC 7231 §6.5.8)。
     public static HttpResponse Conflict(string message) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 409;
@@ -304,45 +249,81 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 创建 500 Internal Server Error 响应。message 原样进入
-    // HTML 正文，先做 HTML 转义：消息里常含异常文本、URL 或用户
-    // 输入片段，未转义就是把反射型 XSS 内置在错误页里。
     public static HttpResponse ServerError(string message) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = 500;
         resp.statusText = "Internal Server Error";
-        resp.body = "<h1>500 Internal Server Error</h1><p>"
-            + HttpResponse.EscapeHtmlText(message) + "</p>";
+        string m = message != null ? message : "";
+        int len = m.Length;
+        int extra = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = m[i] & 255;
+            if (c == 38 || c == 39) { extra = extra + 4; }
+            else if (c == 60 || c == 62) { extra = extra + 3; }
+            else if (c == 34) { extra = extra + 5; }
+        }
+        // 单缓冲直出 "<h1>500 Internal Server Error</h1><p>" + escaped + "</p>"
+        byte[] buf = new byte[37 + len + extra + 4];
+        nint dst = (nint)buf;
+        NativeMemory.Copy(dst, (nint)"<h1>500 Internal Server Error</h1><p>", 37);
+        int pos = 37;
+        if (extra == 0) {
+            if (len > 0) { NativeMemory.Copy(dst + (nint)pos, (nint)m, len); pos = pos + len; }
+        } else {
+            nint src = (nint)m;
+            int last = 0;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = m[i] & 255;
+                if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39) {
+                    if (i > last) { NativeMemory.Copy(dst + (nint)pos, src + (nint)last, i - last); pos = pos + (i - last); }
+                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                    else if (c == 34) { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                    else { buf[pos] = 38; buf[pos+1] = 35; buf[pos+2] = 51; buf[pos+3] = 57; buf[pos+4] = 59; pos = pos + 5; }
+                    last = i + 1;
+                }
+            }
+            if (len > last) { NativeMemory.Copy(dst + (nint)pos, src + (nint)last, len - last); pos = pos + (len - last); }
+        }
+        buf[pos] = 60; buf[pos+1] = 47; buf[pos+2] = 112; buf[pos+3] = 62; pos = pos + 4;
+        resp.body = NativeMemory.GetString(dst, 0, pos);
         return resp;
     }
 
-    // 最小 HTML 实体转义（& < > " '），供内嵌消息进正文用。
     private static string EscapeHtmlText(string text) {
         if (text == null) { return ""; }
         int len = text.Length;
-        StringBuilder html = null;
+        int extra = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = text[i] & 255;
+            if (c == 38 || c == 39) { extra = extra + 4; }
+            else if (c == 60 || c == 62) { extra = extra + 3; }
+            else if (c == 34) { extra = extra + 5; }
+        }
+        if (extra == 0) { return text; }
+        byte[] buf = new byte[len + extra];
+        nint dst = (nint)buf;
+        nint src = (nint)text;
+        int pos = 0;
         int last = 0;
         for (int i = 0; i < len; i = i + 1) {
             int c = text[i] & 255;
-            string esc = null;
-            if (c == 38) { esc = "&amp;"; }
-            else if (c == 60) { esc = "&lt;"; }
-            else if (c == 62) { esc = "&gt;"; }
-            else if (c == 34) { esc = "&quot;"; }
-            else if (c == 39) { esc = "&#39;"; }
-            if (esc != null) {
-                if (html == null) { html = new StringBuilder(); }
-                if (i > last) { html.Append(text.Substring(last, i - last)); }
-                html.Append(esc);
+            if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39) {
+                int run = i - last;
+                if (run > 0) { NativeMemory.Copy(dst + (nint)pos, src + (nint)last, run); pos = pos + run; }
+                if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                else if (c == 34) { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                else { buf[pos] = 38; buf[pos+1] = 35; buf[pos+2] = 51; buf[pos+3] = 57; buf[pos+4] = 59; pos = pos + 5; }
                 last = i + 1;
             }
         }
-        if (html == null) { return text; }
-        if (last < len) { html.Append(text.Substring(last, len - last)); }
-        return html.ToString();
+        if (len > last) { NativeMemory.Copy(dst + (nint)pos, src + (nint)last, len - last); pos = pos + (len - last); }
+        return NativeMemory.GetString(dst, 0, pos);
     }
 
-    // 用自定义状态码创建响应。
     public static HttpResponse WithStatus(int code, string text, string body) {
         HttpResponse resp = new HttpResponse();
         resp.statusCode = code;
@@ -351,7 +332,6 @@ public class HttpResponse : IDisposable {
         return resp;
     }
 
-    // 主动释放响应持有的头部存储。
     public void Dispose() {
         if (this.headers != null) {
             this.headers.Clear();
@@ -362,51 +342,85 @@ public class HttpResponse : IDisposable {
         this.chunkSource = null;
     }
 
-    // 设置响应头。定界与连接模式由 BuildHeadersSb 唯一生成；
-    // 拒绝这些保留字段，避免客户端看到相互矛盾的长度或分块边界。
+    // 设置响应头：全内联 token/值校验 + 长度预筛保留字段 + 单缓冲拼装（零跨单元调用）。
     public HttpResponse SetHeader(string name, string headerValue) {
-        if (!HttpResponse.IsValidHeader(name, headerValue)) {
-            return this;
+        if (name == null || headerValue == null) { return this; }
+        int nl = name.Length;
+        if (nl == 0) { return this; }
+        for (int i = 0; i < nl; i = i + 1) {
+            int ch = name[i] & 255;
+            if (!((ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || ch == 45
+                || (ch >= 48 && ch <= 57) || ch == 95 || ch == 46
+                || ch == 33 || ch == 35 || ch == 36 || ch == 37
+                || ch == 38 || ch == 39 || ch == 42 || ch == 43
+                || ch == 94 || ch == 96 || ch == 124 || ch == 126)) { return this; }
         }
-        string lower = name.ToLower();
-        if (lower == "content-length" || lower == "transfer-encoding"
-            || lower == "connection") { return this; }
-        this.headers.Add(name + ": " + headerValue);
+        int vl = headerValue.Length;
+        for (int i = 0; i < vl; i = i + 1) {
+            int ch = headerValue[i] & 255;
+            if (ch == 127 || (ch < 32 && ch != 9)) { return this; }
+        }
+        if (nl == 14) {
+            if (((name[0] & 255) | 32) == 99 && ((name[7] & 255)) == 45
+                && ((name[8] & 255) | 32) == 108 && ((name[13] & 255) | 32) == 104
+                && HttpResponse.EqualsAsciiIgnoreCaseRange(name, 0, 14, "content-length")) { return this; }
+        } else if (nl == 17) {
+            if (((name[0] & 255) | 32) == 116 && ((name[8] & 255)) == 45
+                && HttpResponse.EqualsAsciiIgnoreCaseRange(name, 0, 17, "transfer-encoding")) { return this; }
+        } else if (nl == 10) {
+            if (((name[0] & 255) | 32) == 99 && ((name[9] & 255) | 32) == 110
+                && HttpResponse.EqualsAsciiIgnoreCaseRange(name, 0, 10, "connection")) { return this; }
+        }
+        byte[] buf = new byte[nl + 2 + vl];
+        nint dst = (nint)buf;
+        NativeMemory.Copy(dst, (nint)name, nl);
+        buf[nl] = 58;
+        buf[nl + 1] = 32;
+        if (vl > 0) { NativeMemory.Copy(dst + (nint)(nl + 2), (nint)headerValue, vl); }
+        this.headers.Add(NativeMemory.GetString(dst, 0, nl + 2 + vl));
         return this;
     }
 
-    // 为响应添加 Set-Cookie 头 (RFC 6265)。
-    // 包含名称与值 CRLF 注入校验，支持可选 path、maxAge（秒）、secure 与 httpOnly 防线。
+    // 为响应添加 Set-Cookie 头 (RFC 6265)，单缓冲全内联直写。
     public HttpResponse SetCookie(string name, string val, string path, int maxAge, bool secure, bool httpOnly) {
-        if (name == null || name.Length == 0 || HttpResponse.HasCrlf(name)
-            || val == null || HttpResponse.HasCrlf(val)) {
-            return this;
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(name);
-        sb.Append("=");
-        sb.Append(val);
-        if (path != null && path.Length > 0 && !HttpResponse.HasCrlf(path)) {
-            sb.Append("; Path=");
-            sb.Append(path);
+        if (name == null || name.Length == 0 || val == null) { return this; }
+        if (NativeMemory.IndexOfAny((nint)name, name.Length, 13, 10) >= 0) { return this; }
+        if (val.Length > 0 && NativeMemory.IndexOfAny((nint)val, val.Length, 13, 10) >= 0) { return this; }
+        bool hasPath = path != null && path.Length > 0 && NativeMemory.IndexOfAny((nint)path, path.Length, 13, 10) < 0;
+        int total = 12 + name.Length + 1 + val.Length + (hasPath ? 7 + path.Length : 0)
+            + (maxAge >= 0 ? 22 : 0) + (secure ? 8 : 0) + (httpOnly ? 10 : 0);
+        byte[] buf = new byte[total];
+        nint dst = (nint)buf;
+        NativeMemory.Copy(dst, (nint)"Set-Cookie: ", 12);
+        int pos = 12;
+        NativeMemory.Copy(dst + (nint)pos, (nint)name, name.Length); pos = pos + name.Length;
+        buf[pos] = 61; pos = pos + 1;
+        if (val.Length > 0) { NativeMemory.Copy(dst + (nint)pos, (nint)val, val.Length); pos = pos + val.Length; }
+        if (hasPath) {
+            NativeMemory.Copy(dst + (nint)pos, (nint)"; Path=", 7); pos = pos + 7;
+            NativeMemory.Copy(dst + (nint)pos, (nint)path, path.Length); pos = pos + path.Length;
         }
         if (maxAge >= 0) {
-            sb.Append("; Max-Age=");
-            sb.Append(Convert.ToString(maxAge));
+            NativeMemory.Copy(dst + (nint)pos, (nint)"; Max-Age=", 10); pos = pos + 10;
+            if (maxAge == 0) { buf[pos] = 48; pos = pos + 1; }
+            else {
+                long x = (long)maxAge;
+                int s = pos;
+                while (x > 0L) { buf[pos] = (byte)(48L + (x % 10L)); pos = pos + 1; x = x / 10L; }
+                int lo = s; int hi = pos - 1;
+                while (lo < hi) { byte t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t; lo = lo + 1; hi = hi - 1; }
+            }
         }
-        if (secure) {
-            sb.Append("; Secure");
-        }
-        if (httpOnly) {
-            sb.Append("; HttpOnly");
-        }
-        this.headers.Add("Set-Cookie: " + sb.ToString());
+        if (secure) { NativeMemory.Copy(dst + (nint)pos, (nint)"; Secure", 8); pos = pos + 8; }
+        if (httpOnly) { NativeMemory.Copy(dst + (nint)pos, (nint)"; HttpOnly", 10); pos = pos + 10; }
+        this.headers.Add(NativeMemory.GetString(dst, 0, pos));
         return this;
     }
 
     private static bool EqualsAsciiIgnoreCaseRange(string s, int start, int stop, string target) {
         if (target == null || stop - start != target.Length) { return false; }
-        for (int i = 0; i < target.Length; i = i + 1) {
+        int tlen = target.Length;
+        for (int i = 0; i < tlen; i = i + 1) {
             int a = s[start + i] & 255;
             int b = target[i] & 255;
             if (a >= 65 && a <= 90) { a = a + 32; }
@@ -417,56 +431,61 @@ public class HttpResponse : IDisposable {
     }
 
     public string GetHeader(string name) {
-        if (name.Length == 0 || this.headers == null) { return ""; }
-        for (int i = 0; i < this.headers.Count; i = i + 1) {
+        if (name == null || name.Length == 0 || this.headers == null) { return ""; }
+        int hc = this.headers.Count;
+        int targetLen = name.Length;
+        int firstLow = name[0] & 255;
+        if (firstLow >= 65 && firstLow <= 90) { firstLow = firstLow + 32; }
+        for (int i = 0; i < hc; i = i + 1) {
             string line = this.headers[i];
-            int colon = line.IndexOf(":");
+            int lineLen = line.Length;
+            int colon = NativeMemory.Find((nint)line, 0, 58, lineLen);
             if (colon <= 0) { continue; }
             int l = 0;
             int r = colon;
             while (l < r && (line[l] & 255) <= 32) { l = l + 1; }
             while (r > l && (line[r - 1] & 255) <= 32) { r = r - 1; }
-            if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, l, r, name)) {
-                return line.Substring(colon + 1).Trim();
+            if (r - l != targetLen) { continue; }
+            int c0 = line[l] & 255;
+            if (c0 >= 65 && c0 <= 90) { c0 = c0 + 32; }
+            if (c0 != firstLow) { continue; }
+            bool eq = true;
+            for (int k = 1; k < targetLen; k = k + 1) {
+                int a = line[l + k] & 255;
+                int b = name[k] & 255;
+                if (a >= 65 && a <= 90) { a = a + 32; }
+                if (b >= 65 && b <= 90) { b = b + 32; }
+                if (a != b) { eq = false; break; }
+            }
+            if (eq) {
+                int vs = colon + 1;
+                int ve = lineLen;
+                while (vs < ve && (line[vs] & 255) <= 32) { vs = vs + 1; }
+                while (ve > vs && (line[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                return vs < ve ? line.Substring(vs, ve - vs) : "";
             }
         }
         return "";
     }
 
-    // 设置 content type。
     public HttpResponse SetContentType(string ct) {
         if (!HttpResponse.HasCrlf(ct)) { this.contentType = ct; }
         return this;
     }
 
-    // 设置连接模式。
     public HttpResponse SetKeepAlive(bool keep) {
         this.keepAlive = keep;
         return this;
     }
 
-    // 改用分块传输编码发送正文：正文由 source 逐段产出，服务器在
-    // 发出响应头（Transfer-Encoding: chunked，不带 Content-Length）
-    // 之后反复取下一段并按块写出。source 为 null 时只发一个空正文
-    // （立即写结束块）。source 返回空数组同样表示正文结束。
-    //
-    // 之前设在 body / bodyBytes 上的正文会被忽略——分块路径只认 source。
-    //
-    // 分块传输与 Content-Length 互斥（RFC 9112 §6.1）：两者同时出现
-    // 的响应客户端必须拒收，所以这里由服务器独占定界方式的决定权，
-    // SetHeader 也拒收外部塞进来的 transfer-encoding。
     public HttpResponse SetChunked(HttpChunkSource source) {
         this.chunkSource = source;
         this.framingChunked = true;
         return this;
     }
 
-    // 空的分块正文：只发响应头与结束块（正文长度为零，但仍走分块定界）。
-    public HttpResponse SetChunked() {
-        return this.SetChunked(null);
-    }
+    public HttpResponse SetChunked() { return this.SetChunked(null); }
 
-    // 将状态行与所有头部写入给定的 StringBuilder（含结尾空行 CRLF）。
     public void WriteHeadersTo(StringBuilder sb) {
         int code = this.statusCode;
         if (code == 200 && this.statusText == "OK") {
@@ -496,8 +515,6 @@ public class HttpResponse : IDisposable {
         }
 
         bool statusForbidsContentLength = (code >= 100 && code < 200) || code == 204;
-        // 分块传输与 Content-Length 互斥：只发其中一个。1xx/204/304
-        // 既不能有正文也不能有传输编码，两个头都不发。
         if (this.framingChunked && !statusForbidsContentLength) {
             sb.Append("Transfer-Encoding: chunked\r\n");
         } else if (!statusForbidsContentLength) {
@@ -525,8 +542,6 @@ public class HttpResponse : IDisposable {
         sb.Append("\r\n");
     }
 
-    // 将整个响应（状态行、头部及文本正文）直接写入指定的 StringBuilder。
-    // 供网络层零拷贝 AsView 直出，彻底消除中间 string 堆分配与内存拷贝。
     public void WriteTo(StringBuilder sb) {
         this.WriteHeadersTo(sb);
         if (!this.framingChunked && this.body != null && this.body.Length > 0) {
@@ -534,87 +549,120 @@ public class HttpResponse : IDisposable {
         }
     }
 
-    // 只序列化状态行与头部（含结尾空行）。二进制正文时
-    // 调用方先发这个字符串，再按字节发 <c>bodyBytes</c>。
-    public string BuildHeaders() {
-        StringBuilder sb = HttpBufferPool.Rent();
-        this.WriteHeadersTo(sb);
-        string res = sb.ToString();
-        HttpBufferPool.Return(sb);
-        return res;
+    // 单缓冲全内联直出 HTTP 响应报文（零跨单元辅助调用）。
+    private string BuildDirect(bool includeBody) {
+        int code = this.statusCode;
+        string st = this.statusText != null ? this.statusText : "";
+        string ct = this.contentType != null ? this.contentType : "";
+        bool forbidsCl = (code >= 100 && code < 200) || code == 204;
+        int blen = this.bodyBytes != null ? this.bodyBytesLen : (this.body != null ? this.body.Length : 0);
+        int hc = this.headers.Count;
+        int hdrBytes = 0;
+        for (int i = 0; i < hc; i = i + 1) { hdrBytes = hdrBytes + this.headers[i].Length + 2; }
+        int bodyCopyLen = (includeBody && !this.framingChunked && this.body != null) ? this.body.Length : 0;
+
+        int total = 128 + st.Length + ct.Length + hdrBytes + bodyCopyLen;
+        byte[] buf = new byte[total];
+        nint dst = (nint)buf;
+        int pos = 0;
+
+        if (code == 200 && st == "OK") {
+            NativeMemory.Copy(dst, (nint)"HTTP/1.1 200 OK\r\n", 17); pos = 17;
+        } else {
+            NativeMemory.Copy(dst, (nint)"HTTP/1.1 ", 9); pos = 9;
+            if (code == 0) { buf[pos] = 48; pos = pos + 1; }
+            else {
+                long x = (long)code;
+                if (x < 0L) { buf[pos] = 45; pos = pos + 1; x = -x; }
+                int s = pos;
+                while (x > 0L) { buf[pos] = (byte)(48L + (x % 10L)); pos = pos + 1; x = x / 10L; }
+                int lo = s; int hi = pos - 1;
+                while (lo < hi) { byte t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t; lo = lo + 1; hi = hi - 1; }
+            }
+            buf[pos] = 32; pos = pos + 1;
+            if (st.Length > 0) { NativeMemory.Copy(dst + (nint)pos, (nint)st, st.Length); pos = pos + st.Length; }
+            buf[pos] = 13; buf[pos + 1] = 10; pos = pos + 2;
+        }
+
+        NativeMemory.Copy(dst + (nint)pos, (nint)"Content-Type: ", 14); pos = pos + 14;
+        if (ct.Length > 0) { NativeMemory.Copy(dst + (nint)pos, (nint)ct, ct.Length); pos = pos + ct.Length; }
+        buf[pos] = 13; buf[pos + 1] = 10; pos = pos + 2;
+
+        if (this.framingChunked && !forbidsCl) {
+            NativeMemory.Copy(dst + (nint)pos, (nint)"Transfer-Encoding: chunked\r\n", 28); pos = pos + 28;
+        } else if (!forbidsCl) {
+            NativeMemory.Copy(dst + (nint)pos, (nint)"Content-Length: ", 16); pos = pos + 16;
+            if (blen == 0) { buf[pos] = 48; pos = pos + 1; }
+            else {
+                long x = (long)blen;
+                int s = pos;
+                while (x > 0L) { buf[pos] = (byte)(48L + (x % 10L)); pos = pos + 1; x = x / 10L; }
+                int lo = s; int hi = pos - 1;
+                while (lo < hi) { byte t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t; lo = lo + 1; hi = hi - 1; }
+            }
+            buf[pos] = 13; buf[pos + 1] = 10; pos = pos + 2;
+        }
+
+        if (this.keepAlive) {
+            NativeMemory.Copy(dst + (nint)pos, (nint)"Connection: keep-alive\r\nServer: Zan/1.0\r\n", 41);
+            pos = pos + 41;
+        } else {
+            NativeMemory.Copy(dst + (nint)pos, (nint)"Connection: close\r\nServer: Zan/1.0\r\n", 36);
+            pos = pos + 36;
+        }
+
+        for (int i = 0; i < hc; i = i + 1) {
+            string h = this.headers[i];
+            int hlen = h.Length;
+            if (hlen > 0) { NativeMemory.Copy(dst + (nint)pos, (nint)h, hlen); pos = pos + hlen; }
+            buf[pos] = 13; buf[pos + 1] = 10; pos = pos + 2;
+        }
+        buf[pos] = 13; buf[pos + 1] = 10; pos = pos + 2;
+
+        if (bodyCopyLen > 0) {
+            NativeMemory.Copy(dst + (nint)pos, (nint)this.body, bodyCopyLen);
+            pos = pos + bodyCopyLen;
+        }
+        return NativeMemory.GetString(dst, 0, pos);
     }
 
-    // 将响应序列化为原始 HTTP 响应字符串。仅适用于文本正文；
-    // 头部与正文在同一个 StringBuilder 内完成拼装，消除二次大内存分配。
-    // 二进制正文请用 <see cref="BuildHeaders"/> + <c>bodyBytes</c>。
-    public string Build() {
-        if (this.framingChunked) {
-            // 分块定界的正文只能由分块路径按帧写出。Build 拼出来的
-            // "头 + 裸正文"是一份没有分帧的报文，客户端按 chunked 解析
-            // 必然错位——这里只给头部，宁可让对端等到超时，也不能发一份
-            // 会被误解析的正文。
-            return this.BuildHeaders();
-        }
-        if (this.body == null || this.body.Length == 0) {
-            return this.BuildHeaders();
-        }
-        StringBuilder sb = HttpBufferPool.Rent();
-        this.WriteHeadersTo(sb);
-        sb.Append(this.body);
-        string res = sb.ToString();
-        HttpBufferPool.Return(sb);
-        return res;
-    }
-
-    // 是否为可选空白（SP / HTAB，RFC 7230 OWS）。
-    private static bool IsOws(int c) {
-        return c == 32 || c == 9;
-    }
-
-    // [start, stop) 起点跳过 OWS，返回首个非 OWS 字节下标。
-    private static int TrimOwsStart(string s, int start, int stop) {
-        while (start < stop && HttpResponse.IsOws(s[start] & 255)) {
-            start = start + 1;
-        }
-        return start;
-    }
-
-    // [start, stop) 终点回退 OWS，返回尾后第一个非 OWS 下标。
-    private static int TrimOwsStop(string s, int start, int stop) {
-        while (stop > start && HttpResponse.IsOws(s[stop - 1] & 255)) {
-            stop = stop - 1;
-        }
-        return stop;
-    }
+    public string BuildHeaders() { return this.BuildDirect(false); }
+    public string Build() { return this.BuildDirect(!this.framingChunked); }
 
     public bool ParseFraming() {
         bool sawTe = false;
         bool teChunked = false;
-        for (int i = 0; i < this.headers.Count; i = i + 1) {
+        int hc = this.headers.Count;
+        for (int i = 0; i < hc; i = i + 1) {
             string line = this.headers[i];
-            int colon = line.IndexOf(":");
+            int lineLen = line.Length;
+            int colon = NativeMemory.Find((nint)line, 0, 58, lineLen);
             if (colon <= 0) { continue; }
-            if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, colon, "content-length")) {
-                string value = line.Substring(colon + 1).Trim();
-                if (value.Length == 0) { return false; }
+            if (colon == 14 && HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, 14, "content-length")) {
+                int vs = colon + 1;
+                int ve = lineLen;
+                while (vs < ve && (line[vs] & 255) <= 32) { vs = vs + 1; }
+                while (ve > vs && (line[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                if (vs >= ve) { return false; }
                 long length = 0;
-                for (int j = 0; j < value.Length; j = j + 1) {
-                    int digit = value[j] & 255;
+                for (int j = vs; j < ve; j = j + 1) {
+                    int digit = line[j] & 255;
                     if (digit < 48 || digit > 57) { return false; }
-                    int digitValue = digit - 48;
-                    if (length > (2147483647 - digitValue) / 10) { return false; }
-                    length = length * 10 + digitValue;
+                    int dv = digit - 48;
+                    if (length > (2147483647 - dv) / 10) { return false; }
+                    length = length * 10 + dv;
                 }
-                if (this.framingHasLength && this.framingLength != (int)length) {
-                    return false;
-                }
+                if (this.framingHasLength && this.framingLength != (int)length) { return false; }
                 this.framingHasLength = true;
                 this.framingLength = (int)length;
-            } else if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, colon, "transfer-encoding")) {
-                string value = line.Substring(colon + 1).Trim();
-                if (sawTe || value.Length == 0) { return false; }
+            } else if (colon == 17 && HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, 17, "transfer-encoding")) {
+                int vs = colon + 1;
+                int ve = lineLen;
+                while (vs < ve && (line[vs] & 255) <= 32) { vs = vs + 1; }
+                while (ve > vs && (line[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                if (sawTe || vs >= ve) { return false; }
                 sawTe = true;
-                teChunked = HttpResponse.EqualsAsciiIgnoreCaseRange(value, 0, value.Length, "chunked");
+                teChunked = HttpResponse.EqualsAsciiIgnoreCaseRange(line, vs, ve, "chunked");
             }
         }
         if (sawTe && this.framingHasLength) { return false; }
@@ -623,96 +671,179 @@ public class HttpResponse : IDisposable {
         return true;
     }
 
-    // 状态行严格校验：HTTP/1.0|HTTP/1.1 + 至少一个 OWS +
-    // 三位状态码（1xx-5xx）+ 可选 OWS reason（不含控制字符，HTAB
-    // 除外）。版本与状态码间缺 OWS、状态码带后缀（"HTTP/1.1x 200"）
-    // 或 600+ 一律拒绝——否则状态码可被下游按不同切分方式读出。
-    private static bool ValidStatusLine(string line) {
-        if (line.Length < 12) { return false; }
-        string ver = line.Substring(0, 8);
-        if (ver != "HTTP/1.0" && ver != "HTTP/1.1") { return false; }
-        if (!HttpResponse.IsOws(line[8] & 255)) { return false; }
-        int codeStart = HttpResponse.TrimOwsStart(line, 8, line.Length);
-        if (codeStart + 3 > line.Length) { return false; }
-        int first = (line[codeStart] & 255) - 48;
-        if (first < 1 || first > 5) { return false; }
-        for (int i = codeStart; i < codeStart + 3; i = i + 1) {
-            int c = line[i] & 255;
-            if (c < 48 || c > 57) { return false; }
-        }
-        if (codeStart + 3 < line.Length) {
-            int c4 = line[codeStart + 3] & 255;
-            if (c4 >= 48 && c4 <= 57) { return false; }
-        }
-        for (int i = codeStart + 3; i < line.Length; i = i + 1) {
-            int c = line[i] & 255;
-            if ((c < 32 && c != 9) || c == 127) { return false; }
-        }
-        return true;
-    }
-
-    // 解析原始 HTTP 响应（客户端用法）。状态行、字段行或
-    // 分帧不合法时返回 statusCode=0 的空响应——合法状态码恒 >= 100，
-    // 调用方以 <100 判定拒收并断开链路；绝不把畸形报文解释成
-    // "200 空响应"（响应错位的起点）。
+    // 解析原始 HTTP 响应（全内联单遍扫描：零状态行临时子串、零二次全头扫描、零跨单元辅助调用）。
     public static HttpResponse Parse(string raw) {
         HttpResponse resp = new HttpResponse();
         if (raw == null) { resp.statusCode = 0; return resp; }
         int len = raw.Length;
-        int lineEnd = raw.IndexOf("\r\n");
-        if (lineEnd < 0) { resp.statusCode = 0; return resp; }
-        string statusLine = raw.Substring(0, lineEnd);
-        if (!HttpResponse.ValidStatusLine(statusLine)) {
-            resp.statusCode = 0;
-            return resp;
+        if (len < 14) { resp.statusCode = 0; return resp; }
+        nint ptr = (nint)raw;
+
+        int lineEnd = -1;
+        int scan0 = 0;
+        while (scan0 < len) {
+            int nl = NativeMemory.Find(ptr, scan0, 10, len - scan0);
+            if (nl < 0) { break; }
+            if (nl > 0 && (raw[nl - 1] & 255) == 13) { lineEnd = nl - 1; break; }
+            scan0 = nl + 1;
         }
-        int codeStart = HttpResponse.TrimOwsStart(statusLine, 8,
-            statusLine.Length);
-        resp.statusCode = ((statusLine[codeStart] & 255) - 48) * 100
-            + ((statusLine[codeStart + 1] & 255) - 48) * 10
-            + ((statusLine[codeStart + 2] & 255) - 48);
-        if (codeStart + 3 < statusLine.Length) {
-            int rs = HttpResponse.TrimOwsStart(statusLine, codeStart + 3,
-                statusLine.Length);
-            int rstop = HttpResponse.TrimOwsStop(statusLine, rs,
-                statusLine.Length);
-            resp.statusText = rs < rstop
-                ? statusLine.Substring(rs, rstop - rs) : "";
+        if (lineEnd < 12) { resp.statusCode = 0; return resp; }
+
+        if ((raw[0] & 255) != 72 || (raw[1] & 255) != 84 || (raw[2] & 255) != 84
+            || (raw[3] & 255) != 80 || (raw[4] & 255) != 47 || (raw[5] & 255) != 49
+            || (raw[6] & 255) != 46) {
+            resp.statusCode = 0; return resp;
+        }
+        int minor = raw[7] & 255;
+        if (minor != 48 && minor != 49) { resp.statusCode = 0; return resp; }
+        int sep8 = raw[8] & 255;
+        if (sep8 != 32 && sep8 != 9) { resp.statusCode = 0; return resp; }
+        int codeStart = 8;
+        while (codeStart < lineEnd && ((raw[codeStart] & 255) == 32 || (raw[codeStart] & 255) == 9)) {
+            codeStart = codeStart + 1;
+        }
+        if (codeStart + 3 > lineEnd) { resp.statusCode = 0; return resp; }
+        int d0 = (raw[codeStart] & 255) - 48;
+        int d1 = (raw[codeStart + 1] & 255) - 48;
+        int d2 = (raw[codeStart + 2] & 255) - 48;
+        if (d0 < 1 || d0 > 5 || d1 < 0 || d1 > 9 || d2 < 0 || d2 > 9) {
+            resp.statusCode = 0; return resp;
+        }
+        if (codeStart + 3 < lineEnd) {
+            int c4 = raw[codeStart + 3] & 255;
+            if (c4 >= 48 && c4 <= 57) { resp.statusCode = 0; return resp; }
+            for (int k = codeStart + 3; k < lineEnd; k = k + 1) {
+                int ch = raw[k] & 255;
+                if ((ch < 32 && ch != 9) || ch == 127) { resp.statusCode = 0; return resp; }
+            }
+        }
+
+        resp.statusCode = d0 * 100 + d1 * 10 + d2;
+        if (codeStart + 3 < lineEnd) {
+            int rs = codeStart + 3;
+            while (rs < lineEnd && ((raw[rs] & 255) == 32 || (raw[rs] & 255) == 9)) { rs = rs + 1; }
+            int rstop = lineEnd;
+            while (rstop > rs && ((raw[rstop - 1] & 255) == 32 || (raw[rstop - 1] & 255) == 9)) { rstop = rstop - 1; }
+            int rlen = rstop - rs;
+            if (rlen == 2 && (raw[rs] & 255) == 79 && (raw[rs + 1] & 255) == 75) {
+                resp.statusText = "OK";
+            } else {
+                resp.statusText = rlen > 0 ? raw.Substring(rs, rlen) : "";
+            }
         } else {
             resp.statusText = "";
         }
 
-        // 头部逐行到空行；无冒号、冒号前空白、含控制字符的行整体拒收，
-        // 不再静默跳过（跳过正是走私头存活的缝隙）。
         int pos = lineEnd + 2;
         bool ended = false;
+        bool sawTe = false;
+        bool teChunked = false;
+        bool framingBad = false;
         while (pos < len) {
-            int hEnd = raw.IndexOf("\r\n", pos);
+            int hEnd = -1;
+            int scan = pos;
+            while (scan < len) {
+                int nl = NativeMemory.Find(ptr, scan, 10, len - scan);
+                if (nl < 0) { break; }
+                if (nl > pos && (raw[nl - 1] & 255) == 13) { hEnd = nl - 1; break; }
+                scan = nl + 1;
+            }
             if (hEnd < 0) { resp.statusCode = 0; return resp; }
             if (hEnd == pos) { pos = hEnd + 2; ended = true; break; }
-            int colon = raw.IndexOf(":", pos);
-            if (colon <= pos || colon >= hEnd) {
-                resp.statusCode = 0;
-                return resp;
+
+            int colon = NativeMemory.Find(ptr, pos, 58, hEnd - pos);
+            if (colon <= pos) { resp.statusCode = 0; return resp; }
+
+            // 内联头部名 token 校验
+            for (int k = pos; k < colon; k = k + 1) {
+                int ch = raw[k] & 255;
+                if (!((ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || ch == 45
+                    || (ch >= 48 && ch <= 57) || ch == 95 || ch == 46
+                    || ch == 33 || ch == 35 || ch == 36 || ch == 37
+                    || ch == 38 || ch == 39 || ch == 42 || ch == 43
+                    || ch == 94 || ch == 96 || ch == 124 || ch == 126)) {
+                    resp.statusCode = 0; return resp;
+                }
             }
-            if (!HttpResponse.HeaderFramingSafeRange(true, raw, pos, colon)
-                || !HttpResponse.HeaderFramingSafeRange(false, raw, colon + 1, hEnd)) {
-                resp.statusCode = 0;
-                return resp;
+            // 内联头部值 CTL 校验
+            for (int k = colon + 1; k < hEnd; k = k + 1) {
+                int ch = raw[k] & 255;
+                if (ch == 127 || (ch < 32 && ch != 9)) {
+                    resp.statusCode = 0; return resp;
+                }
             }
-            string headerLine = raw.Substring(pos, hEnd - pos);
-            resp.headers.Add(headerLine);
-            if (HttpResponse.IsContentTypeHeader(raw, pos, colon - pos)) {
-                int valueStart = HttpResponse.TrimOwsStart(raw, colon + 1, hEnd);
-                int valueStop = HttpResponse.TrimOwsStop(raw, valueStart, hEnd);
-                resp.contentType = raw.Substring(valueStart, valueStop - valueStart);
+
+            resp.headers.Add(raw.Substring(pos, hEnd - pos));
+
+            int nameLen = colon - pos;
+            if (nameLen == 12) {
+                if (((raw[pos] & 255) | 32) == 99 && ((raw[pos + 1] & 255) | 32) == 111
+                    && ((raw[pos + 2] & 255) | 32) == 110 && ((raw[pos + 3] & 255) | 32) == 116
+                    && ((raw[pos + 4] & 255) | 32) == 101 && ((raw[pos + 5] & 255) | 32) == 110
+                    && ((raw[pos + 6] & 255) | 32) == 116 && (raw[pos + 7] & 255) == 45
+                    && ((raw[pos + 8] & 255) | 32) == 116 && ((raw[pos + 9] & 255) | 32) == 121
+                    && ((raw[pos + 10] & 255) | 32) == 112 && ((raw[pos + 11] & 255) | 32) == 101) {
+                    int vs = colon + 1;
+                    int ve = hEnd;
+                    while (vs < ve && ((raw[vs] & 255) == 32 || (raw[vs] & 255) == 9)) { vs = vs + 1; }
+                    while (ve > vs && ((raw[ve - 1] & 255) == 32 || (raw[ve - 1] & 255) == 9)) { ve = ve - 1; }
+                    resp.contentType = raw.Substring(vs, ve - vs);
+                }
+            } else if (nameLen == 14 && !framingBad) {
+                if (((raw[pos] & 255) | 32) == 99 && ((raw[pos + 1] & 255) | 32) == 111
+                    && ((raw[pos + 2] & 255) | 32) == 110 && ((raw[pos + 3] & 255) | 32) == 116
+                    && ((raw[pos + 4] & 255) | 32) == 101 && ((raw[pos + 5] & 255) | 32) == 110
+                    && ((raw[pos + 6] & 255) | 32) == 116 && (raw[pos + 7] & 255) == 45
+                    && ((raw[pos + 8] & 255) | 32) == 108 && ((raw[pos + 9] & 255) | 32) == 101
+                    && ((raw[pos + 10] & 255) | 32) == 110 && ((raw[pos + 11] & 255) | 32) == 103
+                    && ((raw[pos + 12] & 255) | 32) == 116 && ((raw[pos + 13] & 255) | 32) == 104) {
+                    int vs = colon + 1;
+                    int ve = hEnd;
+                    while (vs < ve && (raw[vs] & 255) <= 32) { vs = vs + 1; }
+                    while (ve > vs && (raw[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                    if (vs >= ve) {
+                        framingBad = true;
+                    } else {
+                        long cl = 0;
+                        bool okNum = true;
+                        for (int j = vs; j < ve; j = j + 1) {
+                            int dg = raw[j] & 255;
+                            if (dg < 48 || dg > 57) { okNum = false; break; }
+                            int dv = dg - 48;
+                            if (cl > (2147483647 - dv) / 10) { okNum = false; break; }
+                            cl = cl * 10 + dv;
+                        }
+                        if (!okNum) { framingBad = true; }
+                        else if (resp.framingHasLength && resp.framingLength != (int)cl) { framingBad = true; }
+                        else { resp.framingHasLength = true; resp.framingLength = (int)cl; }
+                    }
+                }
+            } else if (nameLen == 17 && !framingBad) {
+                if (((raw[pos] & 255) | 32) == 116 && (raw[pos + 8] & 255) == 45
+                    && HttpResponse.EqualsAsciiIgnoreCaseRange(raw, pos, colon, "transfer-encoding")) {
+                    int vs = colon + 1;
+                    int ve = hEnd;
+                    while (vs < ve && (raw[vs] & 255) <= 32) { vs = vs + 1; }
+                    while (ve > vs && (raw[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                    if (sawTe || vs >= ve) {
+                        framingBad = true;
+                    } else {
+                        sawTe = true;
+                        teChunked = (ve - vs == 7)
+                            && ((raw[vs] & 255) | 32) == 99 && ((raw[vs + 1] & 255) | 32) == 104
+                            && ((raw[vs + 2] & 255) | 32) == 117 && ((raw[vs + 3] & 255) | 32) == 110
+                            && ((raw[vs + 4] & 255) | 32) == 107 && ((raw[vs + 5] & 255) | 32) == 101
+                            && ((raw[vs + 6] & 255) | 32) == 100;
+                    }
+                }
             }
             pos = hEnd + 2;
         }
-        if (!ended || !resp.ParseFraming()) {
+        if (!ended || framingBad || (sawTe && resp.framingHasLength) || (sawTe && !teChunked)) {
             resp.statusCode = 0;
             return resp;
         }
+        resp.framingChunked = sawTe;
         if (pos < len) { resp.body = raw.Substring(pos); }
         return resp;
     }

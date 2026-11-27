@@ -11,150 +11,455 @@ namespace Zan.Web;
    .wiki-page h3/h4 规则按此层级排版，内容标题须让位页面外壳的 h1/h2。 */
 public class MarkdownLite {
 
+    private static byte[] GrowBuf(byte[] buf, int pos, int need) {
+        int cap = buf.Length * 2;
+        while (cap < pos + need) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        if (pos > 0) {
+            NativeMemory.Copy((nint)next, (nint)buf, pos);
+        }
+        return next;
+    }
+
+    // 处理同时含 * 与 ` 的行内片段（冷路径：两遍渲染，第一遍写 scratch，第二遍直写输出）。
+    private static int RenderBothMarkers(ref byte[] buf, ref nint dst, int pos,
+        ref byte[] scratch, string src, nint srcPtr, int start, int end) {
+        int spanLen = end - start;
+        int needScr = spanLen * 6 + 64;
+        if (scratch == null || scratch.Length < needScr) {
+            scratch = new byte[needScr > 256 ? needScr : 256];
+        }
+        nint scrPtr = (nint)scratch;
+        int sp = 0;
+        int f1 = start;
+        while (f1 < end) {
+            int at = -1;
+            for (int i = f1; i + 1 < end; i = i + 1) {
+                if ((src[i] & 255) == 42 && (src[i + 1] & 255) == 42) { at = i; break; }
+            }
+            if (at < 0) { break; }
+            int close = -1;
+            for (int i = at + 2; i + 1 < end; i = i + 1) {
+                if ((src[i] & 255) == 42 && (src[i + 1] & 255) == 42) { close = i; break; }
+            }
+            if (close < 0) { break; }
+            if (close == at + 2) { f1 = at + 2; continue; }
+            // Esc [f1..at)
+            int seg = f1;
+            for (int i = f1; i < at; i = i + 1) {
+                int c = src[i] & 255;
+                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                    if (i > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, i - seg); sp = sp + (i - seg); }
+                    if (c == 38) { scratch[sp] = 38; scratch[sp+1] = 97; scratch[sp+2] = 109; scratch[sp+3] = 112; scratch[sp+4] = 59; sp = sp + 5; }
+                    else if (c == 60) { scratch[sp] = 38; scratch[sp+1] = 108; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else if (c == 62) { scratch[sp] = 38; scratch[sp+1] = 103; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else { scratch[sp] = 38; scratch[sp+1] = 113; scratch[sp+2] = 117; scratch[sp+3] = 111; scratch[sp+4] = 116; scratch[sp+5] = 59; sp = sp + 6; }
+                    seg = i + 1;
+                }
+            }
+            if (at > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, at - seg); sp = sp + (at - seg); }
+            NativeMemory.Copy(scrPtr + (nint)sp, (nint)"<strong>", 8); sp = sp + 8;
+            // Esc [at+2..close)
+            seg = at + 2;
+            for (int i = at + 2; i < close; i = i + 1) {
+                int c = src[i] & 255;
+                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                    if (i > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, i - seg); sp = sp + (i - seg); }
+                    if (c == 38) { scratch[sp] = 38; scratch[sp+1] = 97; scratch[sp+2] = 109; scratch[sp+3] = 112; scratch[sp+4] = 59; sp = sp + 5; }
+                    else if (c == 60) { scratch[sp] = 38; scratch[sp+1] = 108; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else if (c == 62) { scratch[sp] = 38; scratch[sp+1] = 103; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else { scratch[sp] = 38; scratch[sp+1] = 113; scratch[sp+2] = 117; scratch[sp+3] = 111; scratch[sp+4] = 116; scratch[sp+5] = 59; sp = sp + 6; }
+                    seg = i + 1;
+                }
+            }
+            if (close > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, close - seg); sp = sp + (close - seg); }
+            NativeMemory.Copy(scrPtr + (nint)sp, (nint)"</strong>", 9); sp = sp + 9;
+            f1 = close + 2;
+        }
+        if (f1 < end) {
+            int seg = f1;
+            for (int i = f1; i < end; i = i + 1) {
+                int c = src[i] & 255;
+                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                    if (i > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, i - seg); sp = sp + (i - seg); }
+                    if (c == 38) { scratch[sp] = 38; scratch[sp+1] = 97; scratch[sp+2] = 109; scratch[sp+3] = 112; scratch[sp+4] = 59; sp = sp + 5; }
+                    else if (c == 60) { scratch[sp] = 38; scratch[sp+1] = 108; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else if (c == 62) { scratch[sp] = 38; scratch[sp+1] = 103; scratch[sp+2] = 116; scratch[sp+3] = 59; sp = sp + 4; }
+                    else { scratch[sp] = 38; scratch[sp+1] = 113; scratch[sp+2] = 117; scratch[sp+3] = 111; scratch[sp+4] = 116; scratch[sp+5] = 59; sp = sp + 6; }
+                    seg = i + 1;
+                }
+            }
+            if (end > seg) { NativeMemory.Copy(scrPtr + (nint)sp, srcPtr + (nint)seg, end - seg); sp = sp + (end - seg); }
+        }
+
+        // 第二遍：在 scratch[0..sp) 上处理 `code`
+        int maxOut = sp * 7 + 16;
+        if (pos + maxOut > buf.Length) {
+            buf = MarkdownLite.GrowBuf(buf, pos, maxOut);
+            dst = (nint)buf;
+        }
+        int f2 = 0;
+        while (f2 < sp) {
+            int at = NativeMemory.Find(scrPtr, f2, 96, sp - f2);
+            if (at < 0) { break; }
+            int close = NativeMemory.Find(scrPtr, at + 1, 96, sp - (at + 1));
+            if (close < 0) { break; }
+            if (close == at + 1) { f2 = at + 1; continue; }
+            int pre = at - f2;
+            int inner = close - (at + 1);
+            if (pre > 0) { NativeMemory.Copy(dst + (nint)pos, scrPtr + (nint)f2, pre); pos = pos + pre; }
+            NativeMemory.Copy(dst + (nint)pos, (nint)"<code>", 6); pos = pos + 6;
+            if (inner > 0) { NativeMemory.Copy(dst + (nint)pos, scrPtr + (nint)(at + 1), inner); pos = pos + inner; }
+            NativeMemory.Copy(dst + (nint)pos, (nint)"</code>", 7); pos = pos + 7;
+            f2 = close + 1;
+        }
+        int rem = sp - f2;
+        if (rem > 0) { NativeMemory.Copy(dst + (nint)pos, scrPtr + (nint)f2, rem); pos = pos + rem; }
+        return pos;
+    }
+
     public static string Html(string md) {
-        string norm = md.Replace("\r\n", "\n").Replace("\r", "\n");
-        List<string> lines = norm.Split("\n");
-        StringBuilder outp = new StringBuilder();
+        if (md == null || md.Length == 0) { return ""; }
+        int len = md.Length;
+        nint srcPtr = (nint)md;
+        int initCap = len * 2 + 128;
+        byte[] buf = new byte[initCap];
+        nint dst = (nint)buf;
+        byte[] scratch = null;
+        int pos = 0;
+
         bool inCode = false;
         bool inList = false;
         bool inOrder = false;
         bool inQuote = false;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            string trimmed = line.Trim();
-            if (trimmed.StartsWith("```")) {
-                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
+
+        int lineStart = 0;
+        while (true) {
+            int rel = NativeMemory.IndexOfAny(srcPtr + (nint)lineStart, len - lineStart, 13, 10);
+            int lineEnd = rel < 0 ? len : lineStart + rel;
+
+            int tStart = lineStart;
+            int tEnd = lineEnd;
+            while (tStart < tEnd) {
+                int c = md[tStart] & 255;
+                if (c != 32 && (c < 9 || c > 13)) { break; }
+                tStart = tStart + 1;
+            }
+            while (tEnd > tStart) {
+                int c = md[tEnd - 1] & 255;
+                if (c != 32 && (c < 9 || c > 13)) { break; }
+                tEnd = tEnd - 1;
+            }
+            int tLen = tEnd - tStart;
+
+            // 预留本行足够空间（最坏情况：关闭块标签 + 开启块标签 + 6x 转义 + 行内标签），零逐标签扩容/跨单元调用。
+            int lineNeed = (lineEnd - lineStart) * 6 + 96;
+            if (pos + lineNeed > buf.Length) {
+                buf = MarkdownLite.GrowBuf(buf, pos, lineNeed);
+                dst = (nint)buf;
+            }
+
+            if (tLen >= 3 && (md[tStart] & 255) == 96 && (md[tStart + 1] & 255) == 96 && (md[tStart + 2] & 255) == 96) {
+                if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
                 if (inCode) {
-                    outp.Append("</code></pre>\n");
+                    NativeMemory.Copy(dst + (nint)pos, (nint)"</code></pre>\n", 14); pos = pos + 14;
                     inCode = false;
                 } else {
-                    outp.Append("<pre><code>");
+                    NativeMemory.Copy(dst + (nint)pos, (nint)"<pre><code>", 11); pos = pos + 11;
                     inCode = true;
                 }
-                continue;
-            }
-            if (inCode) {
-                outp.Append(Esc(line) + "\n");
-                continue;
-            }
-            if (trimmed.Length == 0) {
-                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-                continue;
-            }
-            if (trimmed.StartsWith("### ")) {
-                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-                outp.Append("<h5>" + Inline(Esc(trimmed.Substring(4)))
-                    + "</h5>\n");
-                continue;
-            }
-            if (trimmed.StartsWith("## ")) {
-                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-                outp.Append("<h4>" + Inline(Esc(trimmed.Substring(3)))
-                    + "</h4>\n");
-                continue;
-            }
-            if (trimmed.StartsWith("# ")) {
-                CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-                outp.Append("<h3>" + Inline(Esc(trimmed.Substring(2)))
-                    + "</h3>\n");
-                continue;
-            }
-            if (trimmed.StartsWith("- ")) {
-                if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
-                CloseQuote(outp, ref inQuote);
-                if (!inList) {
-                    outp.Append("<ul>\n");
-                    inList = true;
+            } else if (inCode) {
+                int seg = lineStart;
+                for (int i = lineStart; i < lineEnd; i = i + 1) {
+                    int c = md[i] & 255;
+                    if (c == 38 || c == 60 || c == 62 || c == 34) {
+                        if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                        if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                        else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                        else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                        else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                        seg = i + 1;
+                    }
                 }
-                outp.Append("<li>" + Inline(Esc(trimmed.Substring(2)))
-                    + "</li>\n");
-                continue;
-            }
-            if (trimmed.StartsWith("> ")) {
-                if (inList) { outp.Append("</ul>\n"); inList = false; }
-                if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
-                if (!inQuote) {
-                    outp.Append("<blockquote>");
-                    inQuote = true;
+                if (lineEnd > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, lineEnd - seg); pos = pos + (lineEnd - seg); }
+                buf[pos] = 10; pos = pos + 1;
+            } else if (tLen == 0) {
+                if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+            } else {
+                int c0 = md[tStart] & 255;
+                int contentStart = tStart;
+                // blockKind: 0=p, 1=h5, 2=h4, 3=h3, 4=ul li, 5=quote p, 6=ol li
+                int blockKind = 0;
+
+                if (c0 == 35 && tLen >= 4 && (md[tStart + 1] & 255) == 35 && (md[tStart + 2] & 255) == 35 && (md[tStart + 3] & 255) == 32) {
+                    if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                    if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                    if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                    buf[pos] = 60; buf[pos+1] = 104; buf[pos+2] = 53; buf[pos+3] = 62; pos = pos + 4;
+                    contentStart = tStart + 4;
+                    blockKind = 1;
+                } else if (c0 == 35 && tLen >= 3 && (md[tStart + 1] & 255) == 35 && (md[tStart + 2] & 255) == 32) {
+                    if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                    if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                    if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                    buf[pos] = 60; buf[pos+1] = 104; buf[pos+2] = 52; buf[pos+3] = 62; pos = pos + 4;
+                    contentStart = tStart + 3;
+                    blockKind = 2;
+                } else if (c0 == 35 && tLen >= 2 && (md[tStart + 1] & 255) == 32) {
+                    if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                    if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                    if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                    buf[pos] = 60; buf[pos+1] = 104; buf[pos+2] = 51; buf[pos+3] = 62; pos = pos + 4;
+                    contentStart = tStart + 2;
+                    blockKind = 3;
+                } else if (c0 == 45 && tLen >= 2 && (md[tStart + 1] & 255) == 32) {
+                    if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                    if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                    if (!inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"<ul>\n", 5); pos = pos + 5; inList = true; }
+                    buf[pos] = 60; buf[pos+1] = 108; buf[pos+2] = 105; buf[pos+3] = 62; pos = pos + 4;
+                    contentStart = tStart + 2;
+                    blockKind = 4;
+                } else if (c0 == 62 && tLen >= 2 && (md[tStart + 1] & 255) == 32) {
+                    if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                    if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                    if (!inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"<blockquote>", 12); pos = pos + 12; inQuote = true; }
+                    buf[pos] = 60; buf[pos+1] = 112; buf[pos+2] = 62; pos = pos + 3;
+                    contentStart = tStart + 2;
+                    blockKind = 5;
+                } else {
+                    int dot = 0;
+                    if (c0 >= 48 && c0 <= 57) {
+                        int d = 1;
+                        while (d < tLen && d <= 4) {
+                            int dc = md[tStart + d] & 255;
+                            if (dc < 48 || dc > 57) { break; }
+                            d = d + 1;
+                        }
+                        if (d <= 4 && d + 1 < tLen && (md[tStart + d] & 255) == 46 && (md[tStart + d + 1] & 255) == 32) {
+                            dot = d + 2;
+                        }
+                    }
+                    if (dot > 0) {
+                        if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                        if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                        if (!inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"<ol>\n", 5); pos = pos + 5; inOrder = true; }
+                        buf[pos] = 60; buf[pos+1] = 108; buf[pos+2] = 105; buf[pos+3] = 62; pos = pos + 4;
+                        contentStart = tStart + dot;
+                        blockKind = 6;
+                    } else {
+                        if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; inQuote = false; }
+                        if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; inList = false; }
+                        if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; inOrder = false; }
+                        buf[pos] = 60; buf[pos+1] = 112; buf[pos+2] = 62; pos = pos + 3;
+                        contentStart = tStart;
+                        blockKind = 0;
+                    }
                 }
-                outp.Append("<p>" + Inline(Esc(trimmed.Substring(2)))
-                    + "</p>");
-                continue;
-            }
-            int dot = OrderDot(trimmed);
-            if (dot > 0) {
-                if (inList) { outp.Append("</ul>\n"); inList = false; }
-                CloseQuote(outp, ref inQuote);
-                if (!inOrder) {
-                    outp.Append("<ol>\n");
-                    inOrder = true;
+
+                // 单遍扫描行内特殊字节，内联直写（零跨单元辅助调用）。
+                bool hasEsc = false;
+                bool hasStar = false;
+                bool hasTick = false;
+                for (int i = contentStart; i < tEnd; i = i + 1) {
+                    int c = md[i] & 255;
+                    if (c == 42) { hasStar = true; }
+                    else if (c == 96) { hasTick = true; }
+                    else if (c == 38 || c == 60 || c == 62 || c == 34) { hasEsc = true; }
                 }
-                outp.Append("<li>"
-                    + Inline(Esc(trimmed.Substring(dot))) + "</li>\n");
-                continue;
+
+                if (!hasStar && !hasTick) {
+                    int n = tEnd - contentStart;
+                    if (n > 0) {
+                        if (!hasEsc) {
+                            NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)contentStart, n);
+                            pos = pos + n;
+                        } else {
+                            int seg = contentStart;
+                            for (int i = contentStart; i < tEnd; i = i + 1) {
+                                int c = md[i] & 255;
+                                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                    if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                    seg = i + 1;
+                                }
+                            }
+                            if (tEnd > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, tEnd - seg); pos = pos + (tEnd - seg); }
+                        }
+                    }
+                } else if (hasStar && hasTick) {
+                    pos = MarkdownLite.RenderBothMarkers(ref buf, ref dst, pos, ref scratch, md, srcPtr, contentStart, tEnd);
+                    if (pos + 32 > buf.Length) {
+                        buf = MarkdownLite.GrowBuf(buf, pos, 32);
+                        dst = (nint)buf;
+                    }
+                } else if (hasStar) {
+                    int from = contentStart;
+                    while (from < tEnd) {
+                        int at = -1;
+                        for (int i = from; i + 1 < tEnd; i = i + 1) {
+                            if ((md[i] & 255) == 42 && (md[i + 1] & 255) == 42) { at = i; break; }
+                        }
+                        if (at < 0) { break; }
+                        int close = -1;
+                        for (int i = at + 2; i + 1 < tEnd; i = i + 1) {
+                            if ((md[i] & 255) == 42 && (md[i + 1] & 255) == 42) { close = i; break; }
+                        }
+                        if (close < 0) { break; }
+                        if (close == at + 2) { from = at + 2; continue; }
+                        if (at > from) {
+                            if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)from, at - from); pos = pos + (at - from); }
+                            else {
+                                int seg = from;
+                                for (int i = from; i < at; i = i + 1) {
+                                    int c = md[i] & 255;
+                                    if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                        if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                        if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                        else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                        else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                        else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                        seg = i + 1;
+                                    }
+                                }
+                                if (at > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, at - seg); pos = pos + (at - seg); }
+                            }
+                        }
+                        NativeMemory.Copy(dst + (nint)pos, (nint)"<strong>", 8); pos = pos + 8;
+                        if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)(at + 2), close - at - 2); pos = pos + (close - at - 2); }
+                        else {
+                            int seg = at + 2;
+                            for (int i = at + 2; i < close; i = i + 1) {
+                                int c = md[i] & 255;
+                                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                    if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                    seg = i + 1;
+                                }
+                            }
+                            if (close > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, close - seg); pos = pos + (close - seg); }
+                        }
+                        NativeMemory.Copy(dst + (nint)pos, (nint)"</strong>", 9); pos = pos + 9;
+                        from = close + 2;
+                    }
+                    if (from < tEnd) {
+                        if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)from, tEnd - from); pos = pos + (tEnd - from); }
+                        else {
+                            int seg = from;
+                            for (int i = from; i < tEnd; i = i + 1) {
+                                int c = md[i] & 255;
+                                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                    if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                    seg = i + 1;
+                                }
+                            }
+                            if (tEnd > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, tEnd - seg); pos = pos + (tEnd - seg); }
+                        }
+                    }
+                } else {
+                    int from = contentStart;
+                    while (from < tEnd) {
+                        int at = NativeMemory.Find(srcPtr, from, 96, tEnd - from);
+                        if (at < 0) { break; }
+                        int close = NativeMemory.Find(srcPtr, at + 1, 96, tEnd - (at + 1));
+                        if (close < 0) { break; }
+                        if (close == at + 1) { from = at + 1; continue; }
+                        if (at > from) {
+                            if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)from, at - from); pos = pos + (at - from); }
+                            else {
+                                int seg = from;
+                                for (int i = from; i < at; i = i + 1) {
+                                    int c = md[i] & 255;
+                                    if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                        if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                        if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                        else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                        else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                        else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                        seg = i + 1;
+                                    }
+                                }
+                                if (at > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, at - seg); pos = pos + (at - seg); }
+                            }
+                        }
+                        NativeMemory.Copy(dst + (nint)pos, (nint)"<code>", 6); pos = pos + 6;
+                        if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)(at + 1), close - at - 1); pos = pos + (close - at - 1); }
+                        else {
+                            int seg = at + 1;
+                            for (int i = at + 1; i < close; i = i + 1) {
+                                int c = md[i] & 255;
+                                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                    if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                    seg = i + 1;
+                                }
+                            }
+                            if (close > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, close - seg); pos = pos + (close - seg); }
+                        }
+                        NativeMemory.Copy(dst + (nint)pos, (nint)"</code>", 7); pos = pos + 7;
+                        from = close + 1;
+                    }
+                    if (from < tEnd) {
+                        if (!hasEsc) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)from, tEnd - from); pos = pos + (tEnd - from); }
+                        else {
+                            int seg = from;
+                            for (int i = from; i < tEnd; i = i + 1) {
+                                int c = md[i] & 255;
+                                if (c == 38 || c == 60 || c == 62 || c == 34) {
+                                    if (i > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, i - seg); pos = pos + (i - seg); }
+                                    if (c == 38) { buf[pos] = 38; buf[pos+1] = 97; buf[pos+2] = 109; buf[pos+3] = 112; buf[pos+4] = 59; pos = pos + 5; }
+                                    else if (c == 60) { buf[pos] = 38; buf[pos+1] = 108; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else if (c == 62) { buf[pos] = 38; buf[pos+1] = 103; buf[pos+2] = 116; buf[pos+3] = 59; pos = pos + 4; }
+                                    else { buf[pos] = 38; buf[pos+1] = 113; buf[pos+2] = 117; buf[pos+3] = 111; buf[pos+4] = 116; buf[pos+5] = 59; pos = pos + 6; }
+                                    seg = i + 1;
+                                }
+                            }
+                            if (tEnd > seg) { NativeMemory.Copy(dst + (nint)pos, srcPtr + (nint)seg, tEnd - seg); pos = pos + (tEnd - seg); }
+                        }
+                    }
+                }
+
+                // 闭合块尾标签
+                if (blockKind == 0) { buf[pos] = 60; buf[pos+1] = 47; buf[pos+2] = 112; buf[pos+3] = 62; buf[pos+4] = 10; pos = pos + 5; }
+                else if (blockKind == 4 || blockKind == 6) { NativeMemory.Copy(dst + (nint)pos, (nint)"</li>\n", 6); pos = pos + 6; }
+                else if (blockKind == 5) { buf[pos] = 60; buf[pos+1] = 47; buf[pos+2] = 112; buf[pos+3] = 62; pos = pos + 4; }
+                else if (blockKind == 3) { NativeMemory.Copy(dst + (nint)pos, (nint)"</h3>\n", 6); pos = pos + 6; }
+                else if (blockKind == 2) { NativeMemory.Copy(dst + (nint)pos, (nint)"</h4>\n", 6); pos = pos + 6; }
+                else { NativeMemory.Copy(dst + (nint)pos, (nint)"</h5>\n", 6); pos = pos + 6; }
             }
-            CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-            outp.Append("<p>" + Inline(Esc(trimmed)) + "</p>\n");
+
+            if (rel < 0) { break; }
+            int nextStart = lineEnd + 1;
+            if ((md[lineEnd] & 255) == 13 && nextStart < len && (md[nextStart] & 255) == 10) {
+                nextStart = nextStart + 1;
+            }
+            lineStart = nextStart;
         }
-        CloseAll(outp, ref inList, ref inOrder, ref inQuote);
-        if (inCode) { outp.Append("</code></pre>\n"); }
-        return outp.ToString();
-    }
 
-    /* "1. " 有序列表前缀检测，返回正文起始下标（0=非有序项）。 */
-    private static int OrderDot(string s) {
-        int n = 0;
-        while (n < s.Length && s[n] >= 48 && s[n] <= 57) { n = n + 1; }
-        if (n == 0 || n > 4 || n + 1 >= s.Length) { return 0; }
-        if (s.Substring(n, 2) != ". ") { return 0; }
-        return n + 2;
-    }
-
-    private static void CloseAll(StringBuilder outp, ref bool inList,
-                         ref bool inOrder, ref bool inQuote) {
-        if (inQuote) { outp.Append("</blockquote>\n"); inQuote = false; }
-        if (inList) { outp.Append("</ul>\n"); inList = false; }
-        if (inOrder) { outp.Append("</ol>\n"); inOrder = false; }
-    }
-
-    private static void CloseQuote(StringBuilder outp, ref bool inQuote) {
-        if (inQuote) { outp.Append("</blockquote>\n"); inQuote = false; }
-    }
-
-    /* 行内标记：**粗体** 与 `代码`；输入应先经过 Esc 转义。 */
-    private static string Inline(string escaped) {
-        string withBold = Marks(escaped, "**", "<strong>",
-            "</strong>");
-        return Marks(withBold, "`", "<code>", "</code>");
-    }
-
-    /* 成对标记替换：找到一对标记之间的文本包上标签；不成对原样保留。 */
-    private static string Marks(string s, string mark, string openTag,
-                        string closeTag) {
-        int from = 0;
-        StringBuilder outp = new StringBuilder();
-        while (from < s.Length) {
-            int at = s.IndexOf(mark, from);
-            if (at < 0) { break; }
-            int end = s.IndexOf(mark, at + mark.Length);
-            if (end < 0) { break; }
-            if (end == at + mark.Length) { from = at + mark.Length; continue; }
-            outp.Append(s.Substring(from, at - from));
-            outp.Append(openTag + s.Substring(at + mark.Length,
-                end - at - mark.Length) + closeTag);
-            from = end + mark.Length;
+        if (pos + 48 > buf.Length) {
+            buf = MarkdownLite.GrowBuf(buf, pos, 48);
+            dst = (nint)buf;
         }
-        if (from < s.Length) { outp.Append(s.Substring(from)); }
-        return outp.ToString();
-    }
-
-    /* 与视图引擎一致的转义面（先转义再叠标记，杜绝注入）。 */
-    private static string Esc(string s) {
-        if (s.IndexOf("<") < 0 && s.IndexOf(">") < 0
-            && s.IndexOf("&") < 0 && s.IndexOf("\"") < 0) {
-            return s;
-        }
-        return s.Replace("&", "&amp;").Replace("<", "&lt;")
-            .Replace(">", "&gt;").Replace("\"", "&quot;");
+        if (inQuote) { NativeMemory.Copy(dst + (nint)pos, (nint)"</blockquote>\n", 14); pos = pos + 14; }
+        if (inList) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ul>\n", 6); pos = pos + 6; }
+        if (inOrder) { NativeMemory.Copy(dst + (nint)pos, (nint)"</ol>\n", 6); pos = pos + 6; }
+        if (inCode) { NativeMemory.Copy(dst + (nint)pos, (nint)"</code></pre>\n", 14); pos = pos + 14; }
+        return pos == 0 ? "" : NativeMemory.GetString(dst, 0, pos);
     }
 }

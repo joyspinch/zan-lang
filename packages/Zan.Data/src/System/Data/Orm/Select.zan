@@ -11,11 +11,15 @@ public class Select {
     public IDbExecutor db;
     public Meta meta;
     public string tbl;
-    private string w;
+    private byte[] wBuf;
+    private int wLen;
     private DbParams ps;
-    private string ob;
-    private string gb;
-    private string h;
+    private byte[] obBuf;
+    private int obLen;
+    private byte[] gbBuf;
+    private int gbLen;
+    private byte[] hBuf;
+    private int hLen;
     private bool distinct;
     internal int limN;
     internal int offN;
@@ -28,41 +32,104 @@ public class Select {
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
-        this.w = "";
+        this.wBuf = null;
+        this.wLen = 0;
         this.ps = new DbParams();
-        this.ob = "";
-        this.gb = "";
-        this.h = "";
+        this.obBuf = null;
+        this.obLen = 0;
+        this.gbBuf = null;
+        this.gbLen = 0;
+        this.hBuf = null;
+        this.hLen = 0;
         this.distinct = false;
         this.limN = -1;
         this.offN = -1;
         this.on = true;
-        this.navOn = new List<bool>();
-        for (int i = 0; i < meta.Navs.Count; i = i + 1) { this.navOn.Add(false); }
+        if (meta.Navs.Count > 0) {
+            this.navOn = new List<bool>();
+            for (int i = 0; i < meta.Navs.Count; i = i + 1) { this.navOn.Add(false); }
+        } else {
+            this.navOn = null;
+        }
         this.forUpdate = false;
     }
 
-    // 为实体创建一个空 SELECT 链。
     public static Select Create(IDbExecutor db, Meta meta) {
         return new Select(db, meta);
     }
 
-    // Freeze SQL inputs before the executor can suspend. A later builder mutation
-    // must not change either the generated statement or its bound values.
+    // 仅在容量不足时调用的冷路径扩容，热路径零跨单元调用、零 byte[] ARC 传参返回。
+    private void GrowW(int need) {
+        int want = this.wLen + need;
+        int cap = this.wBuf == null ? 256 : this.wBuf.Length * 2;
+        while (cap < want) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        if (this.wLen > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.wBuf, this.wLen);
+        }
+        this.wBuf = next;
+    }
+
+    private void GrowOb(int need) {
+        int want = this.obLen + need;
+        int cap = this.obBuf == null ? 96 : this.obBuf.Length * 2;
+        while (cap < want) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        if (this.obLen > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.obBuf, this.obLen);
+        }
+        this.obBuf = next;
+    }
+
+    private void GrowGb(int need) {
+        int want = this.gbLen + need;
+        int cap = this.gbBuf == null ? 64 : this.gbBuf.Length * 2;
+        while (cap < want) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        if (this.gbLen > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.gbBuf, this.gbLen);
+        }
+        this.gbBuf = next;
+    }
+
+    private void GrowH(int need) {
+        int want = this.hLen + need;
+        int cap = this.hBuf == null ? 96 : this.hBuf.Length * 2;
+        while (cap < want) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        if (this.hLen > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.hBuf, this.hLen);
+        }
+        this.hBuf = next;
+    }
+
+    private static byte[] CloneBuf(byte[] src, int len) {
+        if (len <= 0 || src == null) { return null; }
+        byte[] copy = new byte[len];
+        NativeMemory.Copy((nint)copy, (nint)src, len);
+        return copy;
+    }
+
     internal Select Snapshot() {
         Select copy = new Select(this.db, this.meta);
         copy.tbl = this.tbl;
-        copy.w = this.w;
-        copy.ob = this.ob;
-        copy.gb = this.gb;
-        copy.h = this.h;
+        copy.wBuf = Select.CloneBuf(this.wBuf, this.wLen);
+        copy.wLen = this.wLen;
+        copy.obBuf = Select.CloneBuf(this.obBuf, this.obLen);
+        copy.obLen = this.obLen;
+        copy.gbBuf = Select.CloneBuf(this.gbBuf, this.gbLen);
+        copy.gbLen = this.gbLen;
+        copy.hBuf = Select.CloneBuf(this.hBuf, this.hLen);
+        copy.hLen = this.hLen;
         copy.distinct = this.distinct;
         copy.limN = this.limN;
         copy.offN = this.offN;
         copy.on = this.on;
         copy.forUpdate = this.forUpdate;
-        for (int i = 0; i < this.navOn.Count; i = i + 1) {
-            copy.navOn[i] = this.navOn[i];
+        if (this.navOn != null) {
+            for (int i = 0; i < this.navOn.Count; i = i + 1) {
+                copy.navOn[i] = this.navOn[i];
+            }
         }
         for (int i = 0; i < this.ps.Count(); i = i + 1) {
             copy.ps.push(this.ps.KindAt(i), this.ps.TextAt(i), this.ps.IntAt(i), this.ps.DoubleAt(i));
@@ -70,45 +137,68 @@ public class Select {
         return copy;
     }
 
-    // 实体元数据（类型化门面读取列信息用）。
     public Meta Meta() { return this.meta; }
-    // 当前积累的 WHERE 参数（类型化门面直接执行时复用）。
     public DbParams Params() { return this.ps; }
-    // 分组键（类型化门面按分组取值用）。
-    public string GroupKey() { return this.gb; }
-    // 第 i 个导航字段是否被包含。
-    public bool NavOn(int i) { return this.navOn[i]; }
+
+    public string GroupKey() {
+        return this.gbLen == 0 ? "" : NativeMemory.GetString((nint)this.gbBuf, 0, this.gbLen);
+    }
+
+    public bool NavOn(int i) { return this.navOn != null && this.navOn[i]; }
 
     public void GroupBy(string col) {
-        if (this.gb.Length > 0) { this.gb = this.gb + ", " + col; }
-        else { this.gb = col; }
+        int cl = col.Length;
+        int need = (this.gbLen > 0 ? 2 : 0) + cl;
+        if (this.gbBuf == null || this.gbLen + need > this.gbBuf.Length) { this.GrowGb(need); }
+        byte[] b = this.gbBuf;
+        int p = this.gbLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        if (cl > 0) {
+            NativeMemory.Copy((nint)b + (nint)p, (nint)col, cl);
+            p = p + cl;
+        }
+        this.gbLen = p;
     }
 
     public void Having(string condition) {
-        if (this.h.Length > 0) { this.h = this.h + " AND " + condition; }
-        else { this.h = condition; }
+        int cl = condition.Length;
+        int need = (this.hLen > 0 ? 5 : 0) + cl;
+        if (this.hBuf == null || this.hLen + need > this.hBuf.Length) { this.GrowH(need); }
+        byte[] b = this.hBuf;
+        int p = this.hLen;
+        if (p > 0) {
+            b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+            p = p + 5;
+        }
+        if (cl > 0) {
+            NativeMemory.Copy((nint)b + (nint)p, (nint)condition, cl);
+            p = p + cl;
+        }
+        this.hLen = p;
     }
 
-    public void Distinct() {
-        this.distinct = true;
-    }
+    public void Distinct() { this.distinct = true; }
 
-    // WHERE 片段：多个片段以 AND 连接（列名一般带 "t." 别名）。
     public void W(string f) {
         if (!this.on) { return; }
-        if (this.w.Length == 0) { this.w = f; }
-        else { this.w = this.w + " AND " + f; }
+        int fl = f.Length;
+        int need = (this.wLen > 0 ? 5 : 0) + fl;
+        if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
+        byte[] b = this.wBuf;
+        int p = this.wLen;
+        if (p > 0) {
+            b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+            p = p + 5;
+        }
+        if (fl > 0) {
+            NativeMemory.Copy((nint)b + (nint)p, (nint)f, fl);
+            p = p + fl;
+        }
+        this.wLen = p;
     }
 
-    public void Where(string f) {
-        this.W(f);
-    }
+    public void Where(string f) { this.W(f); }
 
-    // lambda 降级出的表达式树：SQL 片段与绑定值都由
-    // <see cref="ExprSql"/> 产出。成员引用先过实体元数据
-    // （B-ID65 fail-closed）：字段名翻译成物理列名（[Column] 改名
-    // 实体不落错列），未知列名抛异常——树与实体形状失配必须在
-    // 构建期现形，不能落成 `t.未知列` 等数据库报错。
     public void WExpr(ExprNode root) {
         if (!this.on) { return; }
         ExprSql.Validate(root);
@@ -118,17 +208,13 @@ public class Select {
         this.W(sb.ToString());
     }
 
-    // 递归解析树里的成员引用：字段名 → 物理列名（就地改写
-    // Name，同一棵树重复使用无碍——解析是幂等的），也接受
-    // 手工拼树直接写列名；两者都不是就抛异常。
     public void BindTreeCols(ExprNode n) {
         if (n == null) { return; }
         if (n.Kind == 0) {
             Col c = this.ColByField(n.Name);
             if (c == null) { c = this.meta.Find(n.Name); }
             if (c == null) {
-                throw new Exception(this.meta.Table +
-                                    " has no column: " + n.Name);
+                throw new Exception(this.meta.Table + " has no column: " + n.Name);
             }
             n.Name = c.Col;
             return;
@@ -137,8 +223,6 @@ public class Select {
         this.BindTreeCols(n.B);
     }
 
-    // 按实体字段名找列（byCol 键是物理列名，字段名走线性表；
-    // 列数是实体规模，逐节点解析的代价可忽略）。
     public Col ColByField(string f) {
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
             Col c = this.meta.Cols[i];
@@ -147,25 +231,34 @@ public class Select {
         return null;
     }
 
-    // 动态列集合等值条件：列名按实体校验，值按列声明类型
-    // 绑定。
     public void WhereDict(DbValues v) {
         if (!this.on) { return; }
-        int i = 0;
-        while (i < v.Count()) {
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        int cnt = v.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             string c = this.meta.Require(v.NameAt(i));
-            this.W("t." + Dialect.QuoteIdentifier(this.Provider(), c) + " = ?");
+            int nl = c.Length;
+            int need = 16 + nl;
+            if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
+            byte[] b = this.wBuf;
+            int p = this.wLen;
+            if (p > 0) {
+                b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+                p = p + 5;
+            }
+            b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+            NativeMemory.Copy((nint)b + (nint)p, (nint)c, nl); p = p + nl;
+            b[p] = cq; b[p + 1] = 32; b[p + 2] = 61; b[p + 3] = 32; b[p + 4] = 63; p = p + 5;
+            this.wLen = p;
             v.BindAs(this.ps, i, this.meta.KindOf(c));
-            i = i + 1;
         }
     }
 
-    // 条件开关：false 期间 W/P* 收集的片段全部失效（ORM 内部
-    // 按条件组合调用）。
     public void CondBegin(bool c) { this.on = c; }
-    // 结束条件区间，恢复片段收集。
     public void CondEnd() { this.on = true; }
-    // 查另一张表（标识符校验，防注入）。
     public void AsTable(string t) { this.tbl = QueryBuilder.RequireIdent(t); }
 
     public int Provider() {
@@ -173,234 +266,346 @@ public class Select {
         return DbProvider.SQLite;
     }
 
-    // WHERE 参数：与 W 片段中占位符的出现顺序一致。
     public void P(string v) { if (this.on) { this.ps.Add(v); } }
-    // WHERE 整数参数。
     public void Pi(int v) { if (this.on) { this.ps.AddInt(v); } }
-    // WHERE 64 位整数参数。
     public void Pl(long v) { if (this.on) { this.ps.AddLong(v); } }
-    // WHERE 浮点参数。
     public void Pd(double v) { if (this.on) { this.ps.AddDouble(v); } }
 
-    /* ---- 值自带条件原语：应用层拼条件的唯一入口 ----
-     * 条件与其值在同一次调用里原子绑定，片段与参数没有分开传递的
-     * 通道，顺序错配在编译期就写不出来。列名按实体元数据校验
-     * （可省略 "t." 别名），不属于实体的列一律抛异常。 */
-
-    // 校验列名属于本实体并补全 "t." 别名；未知列抛异常。
     public string RequireCol(string c) {
         string n = c;
-        if (n.Length > 2 && n.IndexOf("t.") == 0) { n = n.Substring(2); }
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
             throw new Exception(this.meta.Table + " has no column: " + c);
         }
-        return "t." + Dialect.QuoteIdentifier(this.Provider(), n);
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        return "t." + Dialect.QuoteIdentifier(pv, n);
     }
 
-    // column = 文本值。
+    // 统一内联写入 " [AND ]t.<quoted><op>"（Meta.Col 已经 QueryBuilder.RequireIdent 校验，单段无转义）。
+    private void AppendWhereCmp(string c, int opKind) {
+        string n = c;
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
+        if (!this.meta.Has(n)) {
+            throw new Exception(this.meta.Table + " has no column: " + c);
+        }
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        int nl = n.Length;
+        int need = nl + 16;
+        if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
+        byte[] b = this.wBuf;
+        int p = this.wLen;
+        if (p > 0) {
+            b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+            p = p + 5;
+        }
+        b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+        NativeMemory.Copy((nint)b + (nint)p, (nint)n, nl); p = p + nl;
+        b[p] = cq; p = p + 1;
+        if (opKind == 0) { // " = ?"
+            b[p] = 32; b[p + 1] = 61; b[p + 2] = 32; b[p + 3] = 63; p = p + 4;
+        } else if (opKind == 1) { // " >= ?"
+            b[p] = 32; b[p + 1] = 62; b[p + 2] = 61; b[p + 3] = 32; b[p + 4] = 63; p = p + 5;
+        } else { // " <= ?"
+            b[p] = 32; b[p + 1] = 60; b[p + 2] = 61; b[p + 3] = 32; b[p + 4] = 63; p = p + 5;
+        }
+        this.wLen = p;
+    }
+
     public void WhereEq(string c, string v) {
         if (!this.on) { return; }
-        this.W(this.RequireCol(c) + " = ?");
+        this.AppendWhereCmp(c, 0);
         this.ps.Add(v);
     }
 
-    // column = 整数值。
     public void WhereEq(string c, int v) {
         if (!this.on) { return; }
-        this.W(this.RequireCol(c) + " = ?");
+        this.AppendWhereCmp(c, 0);
         this.ps.AddInt(v);
     }
 
-    // column = 64 位整数值。
     public void WhereEq(string c, long v) {
         if (!this.on) { return; }
-        this.W(this.RequireCol(c) + " = ?");
+        this.AppendWhereCmp(c, 0);
         this.ps.AddLong(v);
     }
 
-    // 主键等值条件（自适应主键列名，消除上层对 "id" 字段名的硬编码）。
     public void WherePk(int id) {
         Col pk = this.meta.PkCol();
         string col = pk != null ? pk.Col : "id";
-        this.WhereEq("t." + col, id);
+        this.WhereEq(col, id);
     }
 
     public void WherePk(long id) {
         Col pk = this.meta.PkCol();
         string col = pk != null ? pk.Col : "id";
-        this.WhereEq("t." + col, id);
+        this.WhereEq(col, id);
     }
 
     public void WherePk(string id) {
         Col pk = this.meta.PkCol();
         string col = pk != null ? pk.Col : "id";
-        this.WhereEq("t." + col, id);
+        this.WhereEq(col, id);
     }
 
-    // column &gt;= 整数值。
     public void WhereGe(string c, long v) {
         if (!this.on) { return; }
-        this.W(this.RequireCol(c) + " >= ?");
+        this.AppendWhereCmp(c, 1);
         this.ps.AddLong(v);
     }
 
-    // column &lt;= 整数值。
     public void WhereLe(string c, long v) {
         if (!this.on) { return; }
-        this.W(this.RequireCol(c) + " <= ?");
+        this.AppendWhereCmp(c, 2);
         this.ps.AddLong(v);
     }
 
-    // column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。带 2000 参数安全防御上限。
+    private void AppendWhereInHeadAndMarks(string c, int count) {
+        string n = c;
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
+        if (!this.meta.Has(n)) {
+            throw new Exception(this.meta.Table + " has no column: " + c);
+        }
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        int nl = n.Length;
+        int need = nl + 16 + count * 3;
+        if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
+        byte[] b = this.wBuf;
+        int p = this.wLen;
+        if (p > 0) {
+            b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+            p = p + 5;
+        }
+        b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+        NativeMemory.Copy((nint)b + (nint)p, (nint)n, nl); p = p + nl;
+        b[p] = cq; b[p + 1] = 32; b[p + 2] = 73; b[p + 3] = 78; b[p + 4] = 32; b[p + 5] = 40; b[p + 6] = 63;
+        p = p + 7;
+        for (int i = 1; i < count; i = i + 1) {
+            b[p] = 44; b[p + 1] = 32; b[p + 2] = 63;
+            p = p + 3;
+        }
+        b[p] = 41;
+        this.wLen = p + 1;
+    }
+
     public void WhereIn(string c, List<int> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
-            throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.RequireCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.ps.AddInt(vs[i]);
-        }
-        sb.Append(")");
-        this.W(sb.ToString());
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
+        this.AppendWhereInHeadAndMarks(c, cnt);
+        for (int i = 0; i < cnt; i = i + 1) { this.ps.AddInt(vs[i]); }
     }
 
-    // <see cref="WhereIn"/> 的 long 版本。
     public void WhereIn(string c, List<long> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
-            throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.RequireCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.ps.AddLong(vs[i]);
-        }
-        sb.Append(")");
-        this.W(sb.ToString());
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
+        this.AppendWhereInHeadAndMarks(c, cnt);
+        for (int i = 0; i < cnt; i = i + 1) { this.ps.AddLong(vs[i]); }
     }
 
-    // <see cref="WhereIn"/> 的 string 版本。
     public void WhereIn(string c, List<string> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
-            throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.RequireCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.ps.Add(vs[i]);
-        }
-        sb.Append(")");
-        this.W(sb.ToString());
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
+        this.AppendWhereInHeadAndMarks(c, cnt);
+        for (int i = 0; i < cnt; i = i + 1) { this.ps.Add(vs[i]); }
     }
 
-    // 多列 OR LIKE："username|email" 一并子串匹配同一个值，每列绑定
-    // 自己的参数，列名逐一校验。
     public void WhereLikeAny(string cols, string v) {
         if (!this.on) { return; }
-        List<string> parts = cols.Split("|");
-        StringBuilder sb = new StringBuilder();
-        sb.Append("(");
+        int clen = cols.Length;
+        nint cp = (nint)cols;
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        string pat = "%" + v + "%";
+        int savedWLen = this.wLen;
         int n = 0;
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            string part = parts[i].Trim();
-            if (part.Length == 0) { continue; }
-            if (n > 0) { sb.Append(" OR "); }
-            sb.Append(this.RequireCol(part) + " LIKE ?");
-            this.ps.Add("%" + v + "%");
-            n = n + 1;
+        int pos = 0;
+        while (pos <= clen) {
+            int bar = pos < clen ? NativeMemory.Find(cp, pos, 124, clen - pos) : -1;
+            int segEnd = bar < 0 ? clen : bar;
+            int l = pos;
+            int r = segEnd;
+            while (l < r && (cols[l] & 255) <= 32) { l = l + 1; }
+            while (r > l && (cols[r - 1] & 255) <= 32) { r = r - 1; }
+            if (r > l) {
+                if (r - l > 2 && (cols[l] & 255) == 116 && (cols[l + 1] & 255) == 46) { l = l + 2; }
+                string colName = (l == 0 && r == clen) ? cols : cols.Substring(l, r - l);
+                if (!this.meta.Has(colName)) {
+                    this.wLen = savedWLen;
+                    throw new Exception(this.meta.Table + " has no column: " + colName);
+                }
+                int nl = colName.Length;
+                int need = nl + 20;
+                if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
+                byte[] b = this.wBuf;
+                int p = this.wLen;
+                if (n == 0) {
+                    if (p > 0) {
+                        b[p] = 32; b[p + 1] = 65; b[p + 2] = 78; b[p + 3] = 68; b[p + 4] = 32;
+                        p = p + 5;
+                    }
+                    b[p] = 40; p = p + 1;
+                } else {
+                    b[p] = 32; b[p + 1] = 79; b[p + 2] = 82; b[p + 3] = 32; p = p + 4;
+                }
+                b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+                NativeMemory.Copy((nint)b + (nint)p, (nint)colName, nl); p = p + nl;
+                b[p] = cq; b[p + 1] = 32; b[p + 2] = 76; b[p + 3] = 73; b[p + 4] = 75;
+                b[p + 5] = 69; b[p + 6] = 32; b[p + 7] = 63; p = p + 8;
+                this.wLen = p;
+                this.ps.Add(pat);
+                n = n + 1;
+            }
+            if (bar < 0) { break; }
+            pos = bar + 1;
         }
-        if (n == 0) { throw new Exception("WhereLikeAny without columns"); }
-        sb.Append(")");
-        this.W(sb.ToString());
+        if (n == 0) {
+            this.wLen = savedWLen;
+            throw new Exception("WhereLikeAny without columns");
+        }
+        if (this.wLen + 1 > this.wBuf.Length) { this.GrowW(1); }
+        this.wBuf[this.wLen] = 41;
+        this.wLen = this.wLen + 1;
     }
 
-    // 恒假条件：数据边界为空集时用它表达"一行都不许看"。
     public void WhereNone() {
         if (!this.on) { return; }
         this.W("1 = 0");
     }
 
-    // 声明式条件（<see cref="Cond"/> 列表）落成参数化 WHERE：
-    // LIKE 走多列 OR 匹配，EQ/GE/LE 按宽松数字解析后绑定。
     public void WhereConds(List<Cond> cs) {
         if (cs == null) { return; }
         for (int i = 0; i < cs.Count; i = i + 1) {
             Cond q = cs[i];
-            if (q.kind == "LIKE") {
-                this.WhereLikeAny(q.col, q.value);
-            } else if (q.kind == "EQ") {
-                this.WhereEq(q.col, (int)Cond.Num(q.value));
-            } else if (q.kind == "GE") {
-                this.WhereGe(q.col, Cond.Num(q.value));
-            } else if (q.kind == "LE") {
-                this.WhereLe(q.col, Cond.Num(q.value));
-            } else {
-                throw new Exception("unknown cond kind: " + q.kind);
-            }
+            if (q.kind == "LIKE") { this.WhereLikeAny(q.col, q.value); }
+            else if (q.kind == "EQ") { this.WhereEq(q.col, (int)Cond.Num(q.value)); }
+            else if (q.kind == "GE") { this.WhereGe(q.col, Cond.Num(q.value)); }
+            else if (q.kind == "LE") { this.WhereLe(q.col, Cond.Num(q.value)); }
+            else { throw new Exception("unknown cond kind: " + q.kind); }
         }
     }
 
-    // ORDER BY 追加一列（升序）。
     public void OB(string col) {
-        if (this.ob.Length == 0) { this.ob = col; }
-        else { this.ob = this.ob + ", " + col; }
+        int cl = col.Length;
+        int need = (this.obLen > 0 ? 2 : 0) + cl;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        if (cl > 0) { NativeMemory.Copy((nint)b + (nint)p, (nint)col, cl); p = p + cl; }
+        this.obLen = p;
     }
 
-    // ORDER BY 别名（支持带 DESC/ASC 的原生表达式片段）。
     public void OrderBy(string col) { this.OB(col); }
 
-    // ORDER BY 追加一列（降序）。
-    public void OBD(string col) { this.OB(col + " DESC"); }
-
-    // ORDER BY 白名单版（升序）：列名必须属于本实体
-    // （<see cref="RequireCol"/> 同款校验，未知列抛异常）。ORDER BY
-    // 无法参数化——排序列进的是 SQL 文本，可能来自用户输入（?sort=）
-    // 的列一律走这里，让实体元数据做白名单。
-    public void OrderBySafe(string col) { this.OB(this.RequireCol(col)); }
-
-    // ORDER BY 白名单版（降序）。
-    public void OrderBySafeDesc(string col) { this.OBD(this.RequireCol(col)); }
-
-    // GROUP BY 单列。
-    public void GB(string col) { this.gb = col; }
-    // 便捷：按分组键排序（升序）。
-    public void OBK() { this.OB(this.gb); }
-    // 便捷：按分组键排序（降序）。
-    public void OBDK() { this.OBD(this.gb); }
-
-    // HAVING 片段：多个片段以 AND 连接。
-    public void H(string f) {
-        if (this.h.Length == 0) { this.h = f; }
-        else { this.h = this.h + " AND " + f; }
+    public void OBD(string col) {
+        int cl = col.Length;
+        int need = (this.obLen > 0 ? 2 : 0) + cl + 5;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        if (cl > 0) { NativeMemory.Copy((nint)b + (nint)p, (nint)col, cl); p = p + cl; }
+        b[p] = 32; b[p + 1] = 68; b[p + 2] = 69; b[p + 3] = 83; b[p + 4] = 67;
+        this.obLen = p + 5;
     }
 
+    public void OrderBySafe(string col) {
+        string n = col;
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
+        if (!this.meta.Has(n)) {
+            throw new Exception(this.meta.Table + " has no column: " + col);
+        }
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        int nl = n.Length;
+        int need = nl + 8;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+        NativeMemory.Copy((nint)b + (nint)p, (nint)n, nl); p = p + nl;
+        b[p] = cq;
+        this.obLen = p + 1;
+    }
+
+    public void OrderBySafeDesc(string col) {
+        string n = col;
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
+        if (!this.meta.Has(n)) {
+            throw new Exception(this.meta.Table + " has no column: " + col);
+        }
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+        int nl = n.Length;
+        int need = nl + 13;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        b[p] = 116; b[p + 1] = 46; b[p + 2] = oq; p = p + 3;
+        NativeMemory.Copy((nint)b + (nint)p, (nint)n, nl); p = p + nl;
+        b[p] = cq; b[p + 1] = 32; b[p + 2] = 68; b[p + 3] = 69; b[p + 4] = 83; b[p + 5] = 67;
+        this.obLen = p + 6;
+    }
+
+    public void GB(string col) {
+        this.gbLen = 0;
+        int cl = col.Length;
+        if (cl > 0) {
+            if (this.gbBuf == null || cl > this.gbBuf.Length) { this.GrowGb(cl); }
+            NativeMemory.Copy((nint)this.gbBuf, (nint)col, cl);
+            this.gbLen = cl;
+        }
+    }
+
+    public void OBK() {
+        int gl = this.gbLen;
+        int need = (this.obLen > 0 ? 2 : 0) + gl;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        if (gl > 0) { NativeMemory.Copy((nint)b + (nint)p, (nint)this.gbBuf, gl); p = p + gl; }
+        this.obLen = p;
+    }
+
+    public void OBDK() {
+        int gl = this.gbLen;
+        int need = (this.obLen > 0 ? 2 : 0) + gl + 5;
+        if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
+        byte[] b = this.obBuf;
+        int p = this.obLen;
+        if (p > 0) { b[p] = 44; b[p + 1] = 32; p = p + 2; }
+        if (gl > 0) { NativeMemory.Copy((nint)b + (nint)p, (nint)this.gbBuf, gl); p = p + gl; }
+        b[p] = 32; b[p + 1] = 68; b[p + 2] = 69; b[p + 3] = 83; b[p + 4] = 67;
+        this.obLen = p + 5;
+    }
+
+    public void H(string f) { this.Having(f); }
     public void DISTINCT() { this.distinct = true; }
-    // 行级排他排队锁（SELECT ... FOR UPDATE）。
-    // 在事务/IUnitOfWork 中锁定查询命中的数据行，防止并发协程读取到未提交脏数据或发生超售。
-    // 跨数据库自动适配：MySQL/Postgres/Oracle 追加 " FOR UPDATE"；
-    // SQL Server 方言自动生成 table hint " WITH (UPDLOCK, ROWLOCK)"；
-    // SQLite 无独立行锁（以事务库级排他锁兜底）。
     public void ForUpdate() { this.forUpdate = true; }
     public void ForUpdate(bool enable) { this.forUpdate = enable; }
-
-    // LIMIT n。
     public void Take(int n) { this.limN = n; }
-    // OFFSET n。
     public void SkipN(int n) { this.offN = n; }
 
-    // 1 起始的分页（换算成 LIMIT/OFFSET，方言在 BuildSelect 处理）。
     public void Page(int index, int size) {
         if (index < 1) { index = 1; }
         if (size < 1) { size = 1; }
@@ -410,169 +615,344 @@ public class Select {
         this.offN = (int)off64;
     }
 
-    // 包含第 i 个导航字段（LEFT JOIN + 它的列）。
-    public void Include(int i) { this.navOn[i] = true; }
+    public void Include(int i) {
+        if (this.navOn != null) { this.navOn[i] = true; }
+    }
 
-    // 被包含的导航字段在结果里的起始列号。
     public int NavAt(int i) {
         int at = this.meta.Cols.Count;
-        for (int k = 0; k < i; k = k + 1) {
-            if (this.navOn[k]) { at = at + this.meta.Navs[k].Cols.Count; }
+        if (this.navOn != null) {
+            for (int k = 0; k < i; k = k + 1) {
+                if (this.navOn[k]) { at = at + this.meta.Navs[k].Cols.Count; }
+            }
         }
         return at;
     }
 
-    // 把 WHERE/GROUP BY/HAVING/ORDER BY 片段追加到 SELECT 文本之后。
+    // 单缓冲内联拼接工具：写入整数到已预留足够空间的 byte[]。
+    private static int WriteIntInline(byte[] b, int p, int v) {
+        if (v == 0) { b[p] = 48; return p + 1; }
+        long x = (long)v;
+        if (x < 0L) { b[p] = 45; p = p + 1; x = -x; }
+        int s = p;
+        while (x > 0L) { b[p] = (byte)(48L + (x % 10L)); p = p + 1; x = x / 10L; }
+        int lo = s; int hi = p - 1;
+        while (lo < hi) { byte t = b[lo]; b[lo] = b[hi]; b[hi] = t; lo = lo + 1; hi = hi - 1; }
+        return p;
+    }
+
+    // 单次分配 + 全内联拼装 SELECT / COL / DTO / AGG / COUNT（零中间 StringBuilder / 零跨单元 byte[] 返回）。
+    private string BuildQueryCore(int mode, string customSel, bool includeOrderLimit, bool allowForUpdate, bool requireDbForLock) {
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte oq = 34; byte cq = 34;
+        if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
+        else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
+
+        string selList = (mode == 0 || (mode == 3 && this.distinct && this.gbLen == 0))
+            ? this.meta.SelectList(pv) : "";
+
+        // 统计导航列与 JOIN 总长（仅当存在导航属性时遍历，常见无导航零开销）。
+        int navSelTotal = 0;
+        int navJoinTotal = 0;
+        if (this.navOn != null) {
+            int ncnt = this.meta.Navs.Count;
+            for (int i = 0; i < ncnt; i = i + 1) {
+                if (this.navOn[i]) {
+                    if (mode == 0 || (mode == 3 && this.distinct && this.gbLen == 0)) {
+                        navSelTotal = navSelTotal + this.meta.Navs[i].SelectList(pv).Length;
+                    }
+                    if (mode == 0 || mode == 3) {
+                        navJoinTotal = navJoinTotal + this.meta.Navs[i].Join().Length;
+                    }
+                }
+            }
+        }
+
+        int tblLen = this.tbl.Length;
+        int customLen = customSel != null ? customSel.Length : 0;
+        int totalCap = 128 + selList.Length + customLen + tblLen + navSelTotal + navJoinTotal
+            + this.wLen + this.gbLen + this.hLen + (includeOrderLimit ? this.obLen : 0);
+
+        byte[] buf = new byte[totalCap];
+        nint dst = (nint)buf;
+        int p = 0;
+
+        if (mode == 3) {
+            if (this.gbLen == 0 && !this.distinct) {
+                NativeMemory.Copy(dst, (nint)"SELECT COUNT(*)", 15);
+                p = 15;
+            } else {
+                NativeMemory.Copy(dst, (nint)"SELECT COUNT(*) FROM (SELECT ", 29);
+                p = 29;
+                if (this.distinct && this.gbLen == 0) {
+                    NativeMemory.Copy(dst + (nint)p, (nint)"DISTINCT ", 9);
+                    p = p + 9;
+                    if (selList.Length > 0) {
+                        NativeMemory.Copy(dst + (nint)p, (nint)selList, selList.Length);
+                        p = p + selList.Length;
+                    }
+                    if (this.navOn != null) {
+                        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+                            if (this.navOn[i]) {
+                                string ns = this.meta.Navs[i].SelectList(pv);
+                                if (ns.Length > 0) {
+                                    NativeMemory.Copy(dst + (nint)p, (nint)ns, ns.Length);
+                                    p = p + ns.Length;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    buf[p] = 49; p = p + 1;
+                }
+            }
+        } else {
+            NativeMemory.Copy(dst, (nint)"SELECT ", 7);
+            p = 7;
+            if (mode == 0) {
+                if (this.distinct) {
+                    NativeMemory.Copy(dst + (nint)p, (nint)"DISTINCT ", 9);
+                    p = p + 9;
+                }
+                if (selList.Length > 0) {
+                    NativeMemory.Copy(dst + (nint)p, (nint)selList, selList.Length);
+                    p = p + selList.Length;
+                }
+                if (this.navOn != null) {
+                    for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+                        if (this.navOn[i]) {
+                            string ns = this.meta.Navs[i].SelectList(pv);
+                            if (ns.Length > 0) {
+                                NativeMemory.Copy(dst + (nint)p, (nint)ns, ns.Length);
+                                p = p + ns.Length;
+                            }
+                        }
+                    }
+                }
+            } else if (customLen > 0) {
+                NativeMemory.Copy(dst + (nint)p, (nint)customSel, customLen);
+                p = p + customLen;
+            }
+        }
+
+        // FROM <table> t
+        NativeMemory.Copy(dst + (nint)p, (nint)" FROM ", 6);
+        p = p + 6;
+        buf[p] = oq; p = p + 1;
+        if (tblLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)this.tbl, tblLen);
+            p = p + tblLen;
+        }
+        buf[p] = cq; buf[p + 1] = 32; buf[p + 2] = 116; p = p + 3;
+
+        bool canLock = allowForUpdate && this.forUpdate && (!requireDbForLock || this.db != null);
+        if (canLock && pv == DbProvider.SqlServer) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" WITH (UPDLOCK, ROWLOCK)", 24);
+            p = p + 24;
+        }
+        if ((mode == 0 || mode == 3) && this.navOn != null) {
+            for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+                if (this.navOn[i]) {
+                    string jn = this.meta.Navs[i].Join();
+                    if (jn.Length > 0) {
+                        NativeMemory.Copy(dst + (nint)p, (nint)jn, jn.Length);
+                        p = p + jn.Length;
+                    }
+                }
+            }
+        }
+
+        // WHERE / GROUP BY / HAVING
+        if (this.wLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" WHERE ", 7);
+            p = p + 7;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.wBuf, this.wLen);
+            p = p + this.wLen;
+        }
+        if (this.gbLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" GROUP BY ", 10);
+            p = p + 10;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.gbBuf, this.gbLen);
+            p = p + this.gbLen;
+        }
+        if (this.hLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" HAVING ", 8);
+            p = p + 8;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.hBuf, this.hLen);
+            p = p + this.hLen;
+        }
+
+        if (mode == 3) {
+            if (this.gbLen > 0 || this.distinct) {
+                if (pv == DbProvider.Oracle) {
+                    NativeMemory.Copy(dst + (nint)p, (nint)") cnt", 5);
+                    p = p + 5;
+                } else {
+                    NativeMemory.Copy(dst + (nint)p, (nint)") AS cnt", 8);
+                    p = p + 8;
+                }
+            }
+            return NativeMemory.GetString(dst, 0, p);
+        }
+
+        if (includeOrderLimit) {
+            if (this.obLen > 0) {
+                NativeMemory.Copy(dst + (nint)p, (nint)" ORDER BY ", 10);
+                p = p + 10;
+                NativeMemory.Copy(dst + (nint)p, (nint)this.obBuf, this.obLen);
+                p = p + this.obLen;
+            }
+            if (this.limN >= 0 || this.offN >= 0) {
+                if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
+                    int off = this.offN < 0 ? 0 : this.offN;
+                    if (this.obLen == 0) {
+                        if (pv == DbProvider.SqlServer) {
+                            NativeMemory.Copy(dst + (nint)p, (nint)" ORDER BY (SELECT 0)", 20);
+                            p = p + 20;
+                        } else {
+                            NativeMemory.Copy(dst + (nint)p, (nint)" ORDER BY (SELECT 0 FROM DUAL)", 30);
+                            p = p + 30;
+                        }
+                    }
+                    NativeMemory.Copy(dst + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+                    p = Select.WriteIntInline(buf, p, off);
+                    NativeMemory.Copy(dst + (nint)p, (nint)" ROWS", 5); p = p + 5;
+                    if (this.limN >= 0) {
+                        NativeMemory.Copy(dst + (nint)p, (nint)" FETCH NEXT ", 12); p = p + 12;
+                        p = Select.WriteIntInline(buf, p, this.limN);
+                        NativeMemory.Copy(dst + (nint)p, (nint)" ROWS ONLY", 10); p = p + 10;
+                    }
+                } else {
+                    if (this.limN >= 0) {
+                        NativeMemory.Copy(dst + (nint)p, (nint)" LIMIT ", 7); p = p + 7;
+                        p = Select.WriteIntInline(buf, p, this.limN);
+                    }
+                    if (this.offN >= 0) {
+                        NativeMemory.Copy(dst + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+                        p = Select.WriteIntInline(buf, p, this.offN);
+                    }
+                }
+            }
+            if (canLock) {
+                if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB || pv == DbProvider.PostgreSQL
+                    || pv == DbProvider.Kingbase || pv == DbProvider.OpenGauss || pv == DbProvider.Oracle) {
+                    NativeMemory.Copy(dst + (nint)p, (nint)" FOR UPDATE", 11);
+                    p = p + 11;
+                }
+            }
+        }
+
+        return NativeMemory.GetString(dst, 0, p);
+    }
+
     public string BuildTail() {
-        StringBuilder sb = new StringBuilder();
-        this.Tail(sb);
-        return sb.ToString();
+        int tot = this.wLen + this.gbLen + this.hLen + this.obLen;
+        if (tot == 0) { return ""; }
+        byte[] buf = new byte[tot + 40];
+        nint dst = (nint)buf;
+        int p = 0;
+        if (this.wLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" WHERE ", 7); p = p + 7;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.wBuf, this.wLen); p = p + this.wLen;
+        }
+        if (this.gbLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" GROUP BY ", 10); p = p + 10;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.gbBuf, this.gbLen); p = p + this.gbLen;
+        }
+        if (this.hLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" HAVING ", 8); p = p + 8;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.hBuf, this.hLen); p = p + this.hLen;
+        }
+        if (this.obLen > 0) {
+            NativeMemory.Copy(dst + (nint)p, (nint)" ORDER BY ", 10); p = p + 10;
+            NativeMemory.Copy(dst + (nint)p, (nint)this.obBuf, this.obLen); p = p + this.obLen;
+        }
+        return NativeMemory.GetString(dst, 0, p);
     }
 
     void AppendConditions(StringBuilder sb) {
-        if (this.w.Length > 0) { sb.Append(" WHERE "); sb.Append(this.w); }
-        if (this.gb.Length > 0) { sb.Append(" GROUP BY "); sb.Append(this.gb); }
-        if (this.h.Length > 0) { sb.Append(" HAVING "); sb.Append(this.h); }
+        if (this.wLen > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(NativeMemory.GetString((nint)this.wBuf, 0, this.wLen));
+        }
+        if (this.gbLen > 0) {
+            sb.Append(" GROUP BY ");
+            sb.Append(NativeMemory.GetString((nint)this.gbBuf, 0, this.gbLen));
+        }
+        if (this.hLen > 0) {
+            sb.Append(" HAVING ");
+            sb.Append(NativeMemory.GetString((nint)this.hBuf, 0, this.hLen));
+        }
     }
 
     public void Tail(StringBuilder sb) {
         this.AppendConditions(sb);
-        if (this.ob.Length > 0) { sb.Append(" ORDER BY "); sb.Append(this.ob); }
+        if (this.obLen > 0) {
+            sb.Append(" ORDER BY ");
+            sb.Append(NativeMemory.GetString((nint)this.obBuf, 0, this.obLen));
+        }
     }
 
-    // 追加 LIMIT/OFFSET 或 OFFSET/FETCH 分页子句（按数据库方言）。
     public string BuildLimitOffset() {
         if (this.limN < 0 && this.offN < 0) { return ""; }
-        StringBuilder sb = new StringBuilder();
-        this.AppendLimitOffset(sb);
-        return sb.ToString();
+        int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+        byte[] buf = new byte[96];
+        nint dst = (nint)buf;
+        int p = 0;
+        if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
+            int off = this.offN < 0 ? 0 : this.offN;
+            if (this.obLen == 0) {
+                if (pv == DbProvider.SqlServer) {
+                    NativeMemory.Copy(dst, (nint)" ORDER BY (SELECT 0)", 20); p = 20;
+                } else {
+                    NativeMemory.Copy(dst, (nint)" ORDER BY (SELECT 0 FROM DUAL)", 30); p = 30;
+                }
+            }
+            NativeMemory.Copy(dst + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+            p = Select.WriteIntInline(buf, p, off);
+            NativeMemory.Copy(dst + (nint)p, (nint)" ROWS", 5); p = p + 5;
+            if (this.limN >= 0) {
+                NativeMemory.Copy(dst + (nint)p, (nint)" FETCH NEXT ", 12); p = p + 12;
+                p = Select.WriteIntInline(buf, p, this.limN);
+                NativeMemory.Copy(dst + (nint)p, (nint)" ROWS ONLY", 10); p = p + 10;
+            }
+        } else {
+            if (this.limN >= 0) {
+                NativeMemory.Copy(dst + (nint)p, (nint)" LIMIT ", 7); p = p + 7;
+                p = Select.WriteIntInline(buf, p, this.limN);
+            }
+            if (this.offN >= 0) {
+                NativeMemory.Copy(dst + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+                p = Select.WriteIntInline(buf, p, this.offN);
+            }
+        }
+        return NativeMemory.GetString(dst, 0, p);
     }
 
     public void AppendLimitOffset(StringBuilder sb) {
         if (this.limN < 0 && this.offN < 0) { return; }
-        int pv = this.Provider();
-        if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
-            int off = this.offN;
-            if (off < 0) { off = 0; }
-            if (this.ob.Length == 0) {
-                if (pv == DbProvider.SqlServer) {
-                    sb.Append(" ORDER BY (SELECT 0)");
-                } else {
-                    sb.Append(" ORDER BY (SELECT 0 FROM DUAL)");
-                }
-            }
-            sb.Append(" OFFSET ");
-            sb.Append(Convert.ToString(off));
-            sb.Append(" ROWS");
-            if (this.limN >= 0) {
-                sb.Append(" FETCH NEXT ");
-                sb.Append(Convert.ToString(this.limN));
-                sb.Append(" ROWS ONLY");
-            }
-        } else {
-            if (this.limN >= 0) {
-                sb.Append(" LIMIT ");
-                sb.Append(Convert.ToString(this.limN));
-            }
-            if (this.offN >= 0) {
-                sb.Append(" OFFSET ");
-                sb.Append(Convert.ToString(this.offN));
-            }
-        }
+        sb.Append(this.BuildLimitOffset());
     }
 
-    void AppendColumns(StringBuilder sb) {
-        if (this.distinct) { sb.Append("DISTINCT "); }
-        sb.Append(this.meta.SelectList(this.Provider()));
-        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
-            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].SelectList(this.Provider())); }
-        }
-    }
-
-    void AppendFrom(StringBuilder sb, bool lockRows) {
-        sb.Append(" FROM ");
-        sb.Append(Dialect.QuoteIdentifier(this.Provider(), this.tbl));
-        sb.Append(" t");
-        if (lockRows && this.forUpdate && this.db != null && this.db.GetProvider() == DbProvider.SqlServer) {
-            sb.Append(" WITH (UPDLOCK, ROWLOCK)");
-        }
-        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
-            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].Join()); }
-        }
-    }
-
-    // 实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
-    // OFFSET ... FETCH（且必须有 ORDER BY）。
     public string BuildSelect() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        this.AppendColumns(sb);
-        this.AppendFrom(sb, true);
-        this.Tail(sb);
-        this.AppendLimitOffset(sb);
-        if (this.forUpdate && this.db != null) {
-            int pv = this.db.GetProvider();
-            if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB || pv == DbProvider.PostgreSQL || pv == DbProvider.Kingbase || pv == DbProvider.OpenGauss || pv == DbProvider.Oracle) {
-                sb.Append(" FOR UPDATE");
-            }
-        }
-        return sb.ToString();
+        return this.BuildQueryCore(0, null, true, true, true);
     }
 
-    // 执行实体行查询。
     public DbResult Rows() { return this.db.Query(this.BuildSelect(), this.ps); }
 
-    // 异步执行实体行查询。
     public async DbResult RowsAsync() {
         string sql = this.BuildSelect();
         return await this.db.QueryAsync(sql, this.ps);
     }
 
-    // 单列/投影的 SELECT（按数据库方言分页）。
     public string BuildCol(string col) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        sb.Append(col);
-        sb.Append(" FROM ");
-        sb.Append(Dialect.QuoteIdentifier(this.Provider(), this.tbl));
-        sb.Append(" t");
-        if (this.forUpdate && this.Provider() == DbProvider.SqlServer) {
-            sb.Append(" WITH (UPDLOCK, ROWLOCK)");
-        }
-        this.Tail(sb);
-        this.AppendLimitOffset(sb);
-        if (this.forUpdate) {
-            int pv = this.Provider();
-            if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB || pv == DbProvider.PostgreSQL || pv == DbProvider.Kingbase || pv == DbProvider.OpenGauss || pv == DbProvider.Oracle) {
-                sb.Append(" FOR UPDATE");
-            }
-        }
-        return sb.ToString();
+        return this.BuildQueryCore(1, col, true, true, false);
     }
 
-    // 投影 SELECT 的语句文本（按数据库方言分页）。
     public string BuildDto(string cols) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        sb.Append(cols);
-        sb.Append(" FROM ");
-        sb.Append(Dialect.QuoteIdentifier(this.Provider(), this.tbl));
-        sb.Append(" t");
-        if (this.forUpdate && this.db != null && this.db.GetProvider() == DbProvider.SqlServer) {
-            sb.Append(" WITH (UPDLOCK, ROWLOCK)");
-        }
-        this.Tail(sb);
-        this.AppendLimitOffset(sb);
-        if (this.forUpdate && this.db != null) {
-            int pv = this.db.GetProvider();
-            if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB || pv == DbProvider.PostgreSQL || pv == DbProvider.Kingbase || pv == DbProvider.OpenGauss || pv == DbProvider.Oracle) {
-                sb.Append(" FOR UPDATE");
-            }
-        }
-        return sb.ToString();
+        return this.BuildQueryCore(1, cols, true, true, true);
     }
 
-    // 把结果集第一列抽成字符串列表。
     public List<string> MapCol(DbResult r) {
         List<string> outp = new List<string>();
         if (r == null) { return outp; }
@@ -585,137 +965,92 @@ public class Select {
         return outp;
     }
 
-    // 执行单列查询并返回字符串列表。
     public List<string> ToListCol(string col) {
         return this.MapCol(this.db.Query(this.BuildCol(col), this.ps));
     }
 
-    // <see cref="ToListCol"/> 的异步版本。
     public async List<string> ToListColAsync(string col) {
         string sql = this.BuildCol(col);
         DbResult r = await this.db.QueryAsync(sql, this.ps);
         return this.MapCol(r);
     }
 
-    // 执行投影查询（DTO 列表，LIMIT/OFFSET 分页）。
     public DbResult Dto(string cols) {
         return this.db.Query(this.BuildDto(cols), this.ps);
     }
 
-    // 异步执行投影查询。
     public async DbResult DtoAsync(string cols) {
         string sql = this.BuildDto(cols);
         return await this.db.QueryAsync(sql, this.ps);
     }
 
-    // 只取一行（LIMIT 1）。
     public void One() { this.limN = 1; }
 
-    // 分组后的行数：分组键上的 COUNT 要套一层子查询。
-    // 派生表必须带别名——MySQL/PostgreSQL/SQL Server 对无别名
-    // 的子查询直接报语法错；Oracle 不允许 AS 关键字。
     public string BuildCount() {
-        StringBuilder sb = new StringBuilder();
-        if (this.gb.Length == 0 && !this.distinct) {
-            sb.Append("SELECT COUNT(*)");
-            this.AppendFrom(sb, false);
-            this.AppendConditions(sb);
-            return sb.ToString();
-        }
-        sb.Append("SELECT COUNT(*) FROM (SELECT ");
-        if (this.distinct && this.gb.Length == 0) {
-            this.AppendColumns(sb);
-        } else {
-            sb.Append("1");
-        }
-        this.AppendFrom(sb, false);
-        this.AppendConditions(sb);
-        sb.Append(this.Provider() == DbProvider.Oracle ? ") cnt" : ") AS cnt");
-        return sb.ToString();
+        return this.BuildQueryCore(3, null, false, false, false);
     }
 
-    // 聚合 SELECT 的语句文本（表达式如 "COUNT(*)"、"SUM(t.n)"），
-    // 复用 WHERE/GROUP BY/HAVING，忽略排序与分页。
     public string BuildAgg(string expr) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        sb.Append(expr);
-        sb.Append(" FROM ");
-        sb.Append(Dialect.QuoteIdentifier(this.Provider(), this.tbl));
-        sb.Append(" t");
-        this.AppendConditions(sb);
-        return sb.ToString();
+        return this.BuildQueryCore(2, expr, false, false, false);
     }
 
-    // 执行聚合查询，返回原始结果集。
     public DbResult AggR(string expr) {
         return this.db.Query(this.BuildAgg(expr), this.ps);
     }
 
-    // <see cref="AggR"/> 的异步版本。
     public async DbResult AggRAsync(string expr) {
         string sql = this.BuildAgg(expr);
         return await this.db.QueryAsync(sql, this.ps);
     }
 
-    // 聚合结果取 int；无行时为 0。
     public int AggI(string expr) {
         DbResult r = this.AggR(expr);
         if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetInt(0, 0);
     }
 
-    // 聚合结果取 long；无行时为 0。
     public long AggL(string expr) {
         DbResult r = this.AggR(expr);
         if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetLong(0, 0);
     }
 
-    // 聚合结果取 double；无行时为 0.0。
     public double AggD(string expr) {
         DbResult r = this.AggR(expr);
         if (r == null || r.RowCount() == 0) { return 0.0; }
         return r.GetDouble(0, 0);
     }
 
-    // <see cref="AggI"/> 的异步版本。
     public async int AggIAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
         if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetInt(0, 0);
     }
 
-    // <see cref="AggL"/> 的异步版本。
     public async long AggLAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
         if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetLong(0, 0);
     }
 
-    // <see cref="AggD"/> 的异步版本。
     public async double AggDAsync(string expr) {
         DbResult r = await this.AggRAsync(expr);
         if (r == null || r.RowCount() == 0) { return 0.0; }
         return r.GetDouble(0, 0);
     }
 
-    // 匹配的行数（分组查询时数分组数）。
     public int Count() {
         DbResult r = this.db.Query(this.BuildCount(), this.ps);
         return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 
-    // 异步行数。
     public async int CountAsync() {
         DbResult r = await this.db.QueryAsync(this.BuildCount(), this.ps);
         return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 
-    // 是否存在匹配行。
     public bool Any() { return this.Count() > 0; }
 
-    // 异步判断是否存在匹配行。
     public async bool AnyAsync() {
         int n = await this.CountAsync();
         return n > 0;
