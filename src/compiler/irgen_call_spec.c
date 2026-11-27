@@ -655,8 +655,23 @@ static bool ifc_edge_matches_inst(zan_irgen_t *g, zan_ast_node_t *edge_ref,
     zan_ast_node_t *ea = eargs->items[j];
     if (!ea)
       return false;
-    if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0)
-      return false;
+    if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0) {
+      zan_type_t *sa = sup->type_args[j];
+      if (!sa || !sa->is_canon)
+        return false;
+      zan_type_t *actual = (g && g->binder)
+                               ? zan_binder_resolve_type(g->binder, ea)
+                               : NULL;
+      if (!actual || actual == g->binder->type_error ||
+          !type_is_canon_eligible(actual))
+        return false;
+      if (sa->sym && actual->sym != sa->sym &&
+          (!actual->sym ||
+           (!class_derives_from(actual->sym, sa->sym) &&
+            !class_implements_iface(actual->sym, sa->sym))))
+        return false;
+      continue;
+    }
     zan_istr_t ename;
     if (ea->kind == AST_IDENTIFIER)
       ename = ea->ident.name;
@@ -706,7 +721,27 @@ static bool ifc_edge_matches_inst(zan_irgen_t *g, zan_ast_node_t *edge_ref,
       zan_type_t *sa = sup->type_args[j];
       if (!sa)
         return false;
-      if (var == 1) {
+      if (sa->is_canon) {
+        zan_type_t *actual = NULL;
+        if (g && g->binder) {
+          if (ea->kind == AST_TYPE_REF) {
+            actual = zan_binder_resolve_type(g->binder, ea);
+            if (actual == g->binder->type_error)
+              actual = NULL;
+          } else {
+            zan_symbol_t *asym = zan_binder_lookup(g->binder, ename);
+            if (asym)
+              actual = asym->type;
+          }
+        }
+        if (!actual || !type_is_canon_eligible(actual))
+          return false;
+        if (sa->sym && actual->sym != sa->sym &&
+            (!actual->sym ||
+             (!class_derives_from(actual->sym, sa->sym) &&
+              !class_implements_iface(actual->sym, sa->sym))))
+          return false;
+      } else if (var == 1) {
         if (ename.len == sa->name.len &&
             memcmp(ename.str, sa->name.str, (size_t)ename.len) == 0) {
           /* match */
