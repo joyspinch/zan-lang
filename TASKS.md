@@ -12,7 +12,7 @@
 >
 > 2026-11-27 平账：移出已闭账/自然消亡条目七条——已标 `[x]` 的包编译器钩子 B-ID223（MVC 根除）与 B-ID224（Data ORM 根除）；B-ID167（①②⑤ 已落地，`SseLive.zan` 及旧 dialogs `T`/`GetInt` 随 `37b01f8e7` PublishStudio 收口消亡）；B-ID176/B-ID179（`Serialize.zan` 已删，全仓 `data-dock`/`data-fx` 0 命中）；B-ID220/B-ID221（`theme_drawer_probe.ps1` 与 `EmitSymbolsDetach`/`DrainSymbolWorkAsync` 随 `37b01f8e7` 下线移除）。同步清理已提交的批次 0 旧在飞观察与批次 4 三段过期附件（E3090 已修、`Gallery.zan` 已删、collab 旧日志已清），并按最新源码收窄 B-ID170/174/175/206/217 余项口径。
 >
-> 2026-11-28 平账：移出已闭账 B-ID217（`DesktopPlatformBase.zan`/`Win32Platform.zan` 桌面移动硬件桩全部收敛为与 `CapiPlatform` 一致的诚实 unsupported 契约，`SystemTheme` 增补 `SystemThemeMode` 三态，回归钉 `case_hardware_headless` 与 `tests/gui/core_infra_phase2b_test.zan`）。
+> 2026-11-28 平账：移出已闭账 B-ID217（`DesktopPlatformBase.zan`/`Win32Platform.zan` 桌面移动硬件桩全部收敛为与 `CapiPlatform` 一致的诚实 unsupported 契约，`SystemTheme` 增补 `SystemThemeMode` 三态，回归钉 `case_hardware_headless` 与 `tests/gui/core_infra_phase2b_test.zan`）与 B-ID206（余项 ② 落地：`IPlatformNetwork`/`WindowsNetwork`/`PosixNetwork` + `Socket.LocalPort` + `TcpListener.GetPort` 支持 `getsockname` 实际端口发现，`zan-lsp --port 0` 回显 `zan-lsp: listening on 127.0.0.1:<port>`，回归钉 `case_tcp_client_listener_lifecycle` 与 `lsp_diag_external_types`）。
 
 ## 未完成（按平账顺序分批）
 
@@ -60,7 +60,6 @@
 - [ ] B-ID200〔主线〕zan-lsp 全特性对齐 C 宿主。已落地：首片（commit 7e196a4be）真诊断 + 符号索引；UTF-16 列口径（0a6f49605）；rename/prepareRename、documentHighlight、foldingRange、semanticTokens/full、formatting/rangeFormatting、inlayHint 及跨文件 `publishDiagnostics`（tool_lsp_zan + tool_lsp_zan_session + lsp_diag_external_types 守门）；C 宿主 `--semantic-refs` + MCP `zan_find_refs` 局部变量/参数查询已通过回归。余量为项目级导航、标准库与包成员检查、嵌套限定名/泛型/可见性边界、以及成员与重载身份的 references/rename 语义过滤。边界决议（2026-11-10）：**C 运行时（src/runtime）与 third_party 保留不 zan 化；工具链 + 编译器缺口（B-ID199）是 zan 化主线**。
 - [ ] B-ID201 zan-dap 重写为 Zan（src/dap → src/selfhost/tools/dap.zan 首切片起步）。〔前置 B-ID202〕活进程管道原语已在 Windows 和 Linux 验证；断点事件通道待接入。
 - [ ] B-ID202 stdlib Process 活进程管道原语。`ProcessSpawn` 支持 Windows、Linux 和 macOS 的 stdin 与合并输出管道。Windows 已通过 `unit_process_spawn` 和 `case_process_capture_timeout`，Linux 已通过 `unit_process_spawn` 与 `runtime_proc_contract`。余量为 macOS 实机验证、stderr 分管道、按需的 stdin 二进制写及交叉运行时产物更新。
-- [ ] B-ID206 结构加固余量（① fragment 契约校验与 ③ 诊断去重完整格式化串已于 2026-11-10 落地）：余 ② LSP 端口发现升级——`zan-lsp` bind 成功后经 `getsockname` 回显实际端口，客户端免猜算（Socket 包 + `lsp_main.c` 双端）。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 

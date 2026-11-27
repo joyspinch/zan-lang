@@ -3,6 +3,8 @@
 import argparse
 import json
 import queue
+import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -336,6 +338,59 @@ def run_session(proc, workspace, messages, deadline):
         raise RuntimeError(f"zan-lsp exited with status {code}")
 
 
+def verify_tcp_ephemeral_port(exe, deadline):
+    """B-ID206: --port 0 binds an ephemeral loopback port and echoes actual port via getsockname."""
+    with subprocess.Popen([exe, "--port", "0"], stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        try:
+            line = proc.stdout.readline().decode("utf-8", errors="replace").strip()
+            match = re.fullmatch(r"zan-lsp: listening on 127\.0\.0\.1:(\d+)", line)
+            if not match:
+                raise RuntimeError(f"unexpected --port 0 announcement: {line!r}")
+            port = int(match.group(1))
+            if port <= 0 or port > 65535:
+                raise RuntimeError(f"invalid announced port: {port}")
+
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+                sock.settimeout(10)
+                stream = sock.makefile("rb")
+                def send_tcp(payload):
+                    body = json.dumps(payload).encode("utf-8")
+                    sock.sendall(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+                def recv_tcp():
+                    length = None
+                    while True:
+                        hdr = stream.readline()
+                        if not hdr:
+                            raise EOFError("zan-lsp TCP socket closed")
+                        if hdr in (b"\r\n", b"\n"):
+                            break
+                        if hdr.lower().startswith(b"content-length:"):
+                            length = int(hdr.split(b":", 1)[1].strip())
+                    if length is None:
+                        raise RuntimeError("missing Content-Length over TCP")
+                    return json.loads(stream.read(length).decode("utf-8"))
+
+                send_tcp({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+                init_resp = recv_tcp()
+                if init_resp.get("id") != 1 or "result" not in init_resp:
+                    raise RuntimeError(f"unexpected TCP initialize response: {init_resp!r}")
+                send_tcp({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}})
+                shut_resp = recv_tcp()
+                if shut_resp.get("id") != 2:
+                    raise RuntimeError(f"unexpected TCP shutdown response: {shut_resp!r}")
+                send_tcp({"jsonrpc": "2.0", "method": "exit", "params": {}})
+                stream.close()
+
+            code = proc.wait(timeout=max(5, deadline - time.monotonic()))
+            if code != 0:
+                raise RuntimeError(f"zan-lsp --port 0 exited with status {code}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True)
@@ -368,7 +423,13 @@ def main():
                 proc.wait()
                 reader.join()
 
-    print(f"lsp_diag_suppress: {len(CASES)}/{len(CASES)} documents matched")
+    try:
+        verify_tcp_ephemeral_port(args.exe, time.monotonic() + 30)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"FAIL tcp port 0: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"lsp_diag_suppress: {len(CASES)}/{len(CASES)} documents matched (+ TCP --port 0 OK)")
     return 0
 
 
