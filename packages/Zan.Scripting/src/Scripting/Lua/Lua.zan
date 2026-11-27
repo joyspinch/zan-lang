@@ -102,6 +102,7 @@ public class Lua {
                 throw new InvalidOperationException("无法加载 Lua 动态库: " + libPath);
             }
             if (!Lua.ResolveSymbols()) {
+                Lua.FreeModule();
                 throw new InvalidOperationException("Lua 动态库缺少所需导出符号: " + libPath);
             }
             Lua.resolved = true;
@@ -125,12 +126,13 @@ public class Lua {
         }
     }
 
-    // 沙箱：移除进程/文件/模块、调试库、字节码转储与 GC 操控入口，保留纯计算标准库。
+    // 沙箱：移除进程/文件/环境变量/模块、调试库、字节码转储与 GC 操控入口，保留纯计算标准库。
     public static void Sandbox() {
         Lua.EnsureReady();
-        Lua.Exec("os.execute = nil; os.remove = nil; os.rename = nil; os.exit = nil\n" +
+        Lua.Exec("if os ~= nil then os.execute = nil; os.remove = nil; os.rename = nil; os.exit = nil; os.getenv = nil; os.tmpname = nil; os.setlocale = nil end\n" +
                  "io = nil\ndebug = nil\ncollectgarbage = nil\n" +
                  "if string ~= nil then string.dump = nil end\n" +
+                 "if package ~= nil and package.loaded ~= nil then for k in pairs(package.loaded) do package.loaded[k] = nil end end\n" +
                  "dofile = nil; loadfile = nil; load = nil\nrequire = nil; package = nil\n");
     }
 
@@ -532,26 +534,31 @@ public class Lua {
         if (f(Lua.state, code) != 0) { Lua.Fail("Lua 代码编译失败"); }
     }
 
-    // 仅宿主内部可达：沙箱已置 nil 脚本侧 load，加载后立即擦除明文缓冲。
+    // 仅宿主内部可达：沙箱已置 nil 脚本侧 load，仅允许文本模式 ("t") 拒绝预编译字节码，加载后立即擦除明文缓冲。
     public static void LoadBytes(byte[] chunk, string chunkName) {
         if (chunk == null || chunk.Length == 0) {
             throw new InvalidOperationException("Lua chunk 为空");
         }
+        int mark = Lua.Top();
         LuaLoadBufFn f = (LuaLoadBufFn)Lua.addr_loadbufferx;
-        int rc = f(Lua.state, (nint)chunk, (long)chunk.Length, chunkName, null);
+        int rc = f(Lua.state, (nint)chunk, (long)chunk.Length, chunkName, "t");
         for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
-        if (rc != 0) { Lua.Fail("Lua chunk 编译失败: " + chunkName); }
+        if (rc != 0) { Lua.FailAt("Lua chunk 编译失败: " + chunkName, mark); }
     }
 
     public static void Protected(int nargs, int nres, int mark, string what) {
         LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
-        if (f(Lua.state, nargs, nres, 0, 0, 0) != 0) { Lua.Fail("Lua 执行失败: " + what); }
+        if (f(Lua.state, nargs, nres, 0, 0, 0) != 0) { Lua.FailAt("Lua 执行失败: " + what, mark); }
+    }
+
+    public static void FailAt(string prefix, int mark) {
+        string msg = Lua.TopString();
+        Lua.SetTop(mark);
+        throw new InvalidOperationException(prefix + ": " + msg);
     }
 
     public static void Fail(string prefix) {
-        string msg = Lua.TopString();
-        Lua.SetTop(0);
-        throw new InvalidOperationException(prefix + ": " + msg);
+        Lua.FailAt(prefix, 0);
     }
 
     public static string TopString() {

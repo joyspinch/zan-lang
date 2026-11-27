@@ -9,16 +9,22 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     public Dictionary<string, object> scopedInstances;
     public Dictionary<string, bool> building;
     private Dictionary<string, long> buildingThreads;
+    private Dictionary<long, string> waitingOn;
+    private Dictionary<long, List<string>> transientStacks;
     public ServiceProvider rootProvider;
     public nint syncLock;
+    private object gate;
     public bool isDisposed;
 
     public ServiceProvider(List<ServiceDescriptor> descriptors, ServiceProvider root) {
-        this.syncLock = Mutex.Create();
+        this.syncLock = 0;
+        this.gate = new object();
         this.isDisposed = false;
         this.rootProvider = root;
         this.building = null;
         this.buildingThreads = null;
+        this.waitingOn = null;
+        this.transientStacks = null;
 
         if (descriptors == null && root != null) {
             // 子 scope 共享根容器只读描述表，零分配且 GetService 仅查一次
@@ -78,41 +84,136 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             return this.ResolveCached(this, cache, serviceType, d);
         }
 
-        // 3. Transient
+        // 3. Transient（按线程记录解析栈，捕获循环依赖与超深递归）
         if (d.factory != null) {
-            return d.factory(this);
+            long tid = Thread.CurrentId();
+            if (tid == 0) { tid = 1; }
+            ServiceProvider stackOwner = this.rootProvider != null ? this.rootProvider : this;
+            lock (stackOwner.gate) {
+                if (stackOwner.transientStacks == null) {
+                    stackOwner.transientStacks = new Dictionary<long, List<string>>();
+                }
+                List<string> stack = null;
+                if (!stackOwner.transientStacks.TryGetValue(tid, out stack) || stack == null) {
+                    stack = new List<string>();
+                    stackOwner.transientStacks[tid] = stack;
+                }
+                if (stack.Count >= 64) {
+                    throw new InvalidOperationException(
+                        "Transient dependency resolution depth exceeded limit for service '" + serviceType + "'.");
+                }
+                for (int i = 0; i < stack.Count; i = i + 1) {
+                    if (stack[i] == serviceType) {
+                        throw new InvalidOperationException(
+                            "A circular dependency was detected for the service of type '" + serviceType + "'.");
+                    }
+                }
+                stack.Add(serviceType);
+            }
+            try {
+                return d.factory(this);
+            } finally {
+                lock (stackOwner.gate) {
+                    List<string> stack = null;
+                    if (stackOwner.transientStacks != null &&
+                        stackOwner.transientStacks.TryGetValue(tid, out stack) &&
+                        stack != null && stack.Count > 0) {
+                        stack.RemoveAt(stack.Count - 1);
+                        if (stack.Count == 0) {
+                            stackOwner.transientStacks.Remove(tid);
+                        }
+                    }
+                }
+            }
         }
         return null;
+    }
+
+    private static bool HasCrossThreadCycle(ServiceProvider owner, long selfTid, long targetTid) {
+        if (owner.waitingOn == null || owner.buildingThreads == null) { return false; }
+        long cur = targetTid;
+        for (int hop = 0; hop < 64; hop = hop + 1) {
+            string waitedSvc = null;
+            if (!owner.waitingOn.TryGetValue(cur, out waitedSvc) || waitedSvc == null) {
+                return false;
+            }
+            long holder = 0;
+            if (!owner.buildingThreads.TryGetValue(waitedSvc, out holder)) {
+                return false;
+            }
+            if (holder == selfTid) {
+                return true;
+            }
+            cur = holder;
+        }
+        return false;
     }
 
     private object ResolveCached(ServiceProvider owner, Dictionary<string, object> cache,
                                  string serviceType, ServiceDescriptor d) {
         long tid = Thread.CurrentId();
         if (tid == 0) { tid = 1; }
-        while (true) {
-            Mutex.Lock(owner.syncLock);
-            object existing = null;
-            if (cache.TryGetValue(serviceType, out existing)) {
-                Mutex.Unlock(owner.syncLock);
-                return existing;
-            }
-            if (owner.buildingThreads != null) {
-                long ownerTid = 0;
-                if (owner.buildingThreads.TryGetValue(serviceType, out ownerTid)) {
-                    Mutex.Unlock(owner.syncLock);
-                    if (ownerTid == tid) {
-                        throw new InvalidOperationException(
-                            "A circular dependency was detected for the service of type '" + serviceType + "'.");
+        bool waiting = false;
+        try {
+            while (true) {
+                bool mustWait = false;
+                bool cycleDetected = false;
+                lock (owner.gate) {
+                    object existing = null;
+                    if (cache.TryGetValue(serviceType, out existing)) {
+                        if (waiting && owner.waitingOn != null) {
+                            owner.waitingOn.Remove(tid);
+                            waiting = false;
+                        }
+                        return existing;
                     }
+                    if (owner.buildingThreads != null) {
+                        long ownerTid = 0;
+                        if (owner.buildingThreads.TryGetValue(serviceType, out ownerTid)) {
+                            if (ownerTid == tid || ServiceProvider.HasCrossThreadCycle(owner, tid, ownerTid)) {
+                                if (waiting && owner.waitingOn != null) {
+                                    owner.waitingOn.Remove(tid);
+                                    waiting = false;
+                                }
+                                cycleDetected = true;
+                            } else {
+                                if (owner.waitingOn == null) {
+                                    owner.waitingOn = new Dictionary<long, string>();
+                                }
+                                owner.waitingOn[tid] = serviceType;
+                                waiting = true;
+                                mustWait = true;
+                            }
+                        }
+                    } else {
+                        owner.buildingThreads = new Dictionary<string, long>();
+                    }
+                    if (!mustWait && !cycleDetected) {
+                        if (waiting && owner.waitingOn != null) {
+                            owner.waitingOn.Remove(tid);
+                            waiting = false;
+                        }
+                        owner.buildingThreads[serviceType] = tid;
+                    }
+                }
+                if (cycleDetected) {
+                    throw new InvalidOperationException(
+                        "A circular dependency was detected for the service of type '" + serviceType + "'.");
+                }
+                if (mustWait) {
                     Thread.Sleep(1);
                     continue;
                 }
-            } else {
-                owner.buildingThreads = new Dictionary<string, long>();
+                break;
             }
-            owner.buildingThreads[serviceType] = tid;
-            Mutex.Unlock(owner.syncLock);
-            break;
+        } finally {
+            if (waiting) {
+                lock (owner.gate) {
+                    if (owner.waitingOn != null) {
+                        owner.waitingOn.Remove(tid);
+                    }
+                }
+            }
         }
 
         object created = null;
@@ -121,14 +222,14 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                 created = d.factory(this);
             }
         } finally {
-            Mutex.Lock(owner.syncLock);
-            if (owner.buildingThreads != null) {
-                owner.buildingThreads.Remove(serviceType);
+            lock (owner.gate) {
+                if (owner.buildingThreads != null) {
+                    owner.buildingThreads.Remove(serviceType);
+                }
+                if (created != null) {
+                    cache[serviceType] = created;
+                }
             }
-            if (created != null) {
-                cache[serviceType] = created;
-            }
-            Mutex.Unlock(owner.syncLock);
         }
         return created;
     }
@@ -140,16 +241,13 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     }
 
     private void DisposeInstanceMap(Dictionary<string, object> map) {
-        if (map == null || this.syncLock == 0) { return; }
+        if (map == null) { return; }
         List<object> snapshot = null;
-        Mutex.Lock(this.syncLock);
-        try {
+        lock (this.gate) {
             if (map.Count > 0) {
                 snapshot = map.Values;
                 map.Clear();
             }
-        } finally {
-            Mutex.Unlock(this.syncLock);
         }
         if (snapshot != null) {
             for (int i = 0; i < snapshot.Count; i = i + 1) {
@@ -163,15 +261,12 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     }
 
     public void Dispose() {
-        if (this.isDisposed) { return; }
-        this.isDisposed = true;
+        lock (this.gate) {
+            if (this.isDisposed) { return; }
+            this.isDisposed = true;
+        }
 
         this.DisposeInstanceMap(this.scopedInstances);
         this.DisposeInstanceMap(this.singletons);
-
-        if (this.syncLock != 0) {
-            Mutex.Destroy(this.syncLock);
-            this.syncLock = 0;
-        }
     }
 }

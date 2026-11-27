@@ -14,14 +14,18 @@ public class Sm2 {
 
     static BigInt N;
     static bool ready = false;
+    static object initLock = new object();
 
     private static BigInt hb(string h) { return BigInt.FromBytesBE(Hex.Decode(h), h.Length / 2); }
 
     private static void init() {
         if (ready) { return; }
-        N = hb(NHEX);
-        EcField256.GetCurve(EcField256.CurveSm2);
-        ready = true;
+        lock (Sm2.initLock) {
+            if (ready) { return; }
+            N = hb(NHEX);
+            EcField256.GetCurve(EcField256.CurveSm2);
+            ready = true;
+        }
     }
 
     // 标量运算，模 N
@@ -114,6 +118,7 @@ public class Sm2 {
         EcField256.FromBigInt(px, qx);
         EcField256.FromBigInt(py, qy);
         if (EcField256.Cmp(qx, cd.P) >= 0 || EcField256.Cmp(qy, cd.P) >= 0) { return false; }
+        if (!EcField256.IsOnCurve(EcField256.CurveSm2, qx, qy)) { return false; }
 
         long[] sl = new long[8];
         long[] tl = new long[8];
@@ -152,18 +157,28 @@ public class Sm2 {
     // k 为每条消息的秘密数。outLen[0] 接收密文长度。
     public static byte[] Encrypt(string msg, int msgLen, BigInt px, BigInt py, BigInt k, List<int> outLen) {
         init();
+        if (outLen == null || outLen.Count == 0) { return null; }
+        outLen[0] = -1;
+        if (px == null || py == null || k == null) { return null; }
+        if (msgLen < 0 || msgLen > 2147483591 - 97) { return null; }
+        if (msgLen > 0 && (msg == null || msgLen > msg.Length)) { return null; }
+        if (k.isZero() || BigInt.cmp(k, N) >= 0) { return null; }
+
+        EcCurveData cd = EcField256.GetCurve(EcField256.CurveSm2);
+        long[] qx = new long[8]; long[] qy = new long[8];
+        EcField256.FromBigInt(px, qx);
+        EcField256.FromBigInt(py, qy);
+        if (EcField256.Cmp(qx, cd.P) >= 0 || EcField256.Cmp(qy, cd.P) >= 0) { return null; }
+        if (!EcField256.IsOnCurve(EcField256.CurveSm2, qx, qy)) { return null; }
+
         long[] kl = new long[8];
         scalarToLimbs(k, kl);
 
         long[] c1x = new long[8]; long[] c1y = new long[8];
-        EcField256.ScalarMulG(EcField256.CurveSm2, kl, c1x, c1y);
-
-        long[] qx = new long[8]; long[] qy = new long[8];
-        EcField256.FromBigInt(px, qx);
-        EcField256.FromBigInt(py, qy);
+        if (!EcField256.ScalarMulG(EcField256.CurveSm2, kl, c1x, c1y)) { return null; }
 
         long[] kpx = new long[8]; long[] kpy = new long[8];
-        EcField256.ScalarMulAffine(EcField256.CurveSm2, kl, qx, qy, kpx, kpy);
+        if (!EcField256.ScalarMulAffine(EcField256.CurveSm2, kl, qx, qy, kpx, kpy)) { return null; }
 
         byte[] z = new byte[64];
         EcField256.ToBytesBE(kpx, z, 0);

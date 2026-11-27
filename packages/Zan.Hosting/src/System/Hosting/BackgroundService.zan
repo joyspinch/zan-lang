@@ -26,6 +26,7 @@ public class BackgroundService : IHostedService, IDisposable {
     // 上一轮循环体的耗时（微秒，不含间隔等待）。
     public long lastTickUs = 0;
     public CancellationTokenSource cts = null;
+    private bool loopRunning = false;
 
     public BackgroundService() { }
 
@@ -55,28 +56,40 @@ public class BackgroundService : IHostedService, IDisposable {
     public bool StoppedCleanly() { return this.started && this.stopped; }
 
     public async bool StartAsync(CancellationToken ct) {
-        if (this.started) { return true; }
-        this.started = true;
-        this.stopped = false;
-        if (this.cts != null) { this.cts.Dispose(); }
-        this.cts = new CancellationTokenSource();
-        this.handle = Task.Spawn(this.RunLoop());
+        CancellationTokenSource runCts = null;
+        lock (this) {
+            if (this.started) { return true; }
+            this.started = true;
+            this.stopped = false;
+            this.loopRunning = true;
+            if (this.cts != null) { this.cts.Dispose(); }
+            runCts = new CancellationTokenSource();
+            this.cts = runCts;
+        }
+        this.handle = Task.Spawn(this.RunLoopWith(runCts));
         return true;
     }
 
     public async bool StopAsync(CancellationToken ct) {
         if (!this.started) { return true; }
-        if (this.cts != null) { this.cts.Cancel(); }
+        CancellationTokenSource c = null;
+        lock (this) { c = this.cts; }
+        if (c != null) { c.Cancel(); }
         return await this.Join(3000);
     }
 
     public void Dispose() {
-        CancellationTokenSource c = this.cts;
-        if (c != null) {
+        CancellationTokenSource toCancel = null;
+        CancellationTokenSource toDispose = null;
+        lock (this) {
+            toCancel = this.cts;
             this.cts = null;
-            c.Cancel();
-            c.Dispose();
+            if (toCancel != null && !this.loopRunning) {
+                toDispose = toCancel;
+            }
         }
+        if (toCancel != null) { toCancel.Cancel(); }
+        if (toDispose != null) { toDispose.Dispose(); }
     }
 
     // 有界等待循环退出。Task 侧没有带超时的 WhenAll，用 IsDone 轮询实现，
@@ -91,27 +104,47 @@ public class BackgroundService : IHostedService, IDisposable {
     }
 
     public async void RunLoop() {
-        while (this.cts != null && !this.cts.Token.IsCancellationRequested) {
-            long t0 = Stopwatch.GetMicroseconds();
-            bool more = true;
-            try {
-                more = await this.ExecuteAsync(this.cts.Token);
-            } catch (Exception e) {
-                this.errors = this.errors + 1;
-                this.lastError = e.Message == null ? "threw" : e.Message;
-            } catch {
-                this.errors = this.errors + 1;
-                this.lastError = "threw non-exception";
-            }
-            /* 循环体已经跑了一轮就计数——抛异常的那轮也算，健康状态里
-               "tick 在涨但任务从不成功"是比"循环停了"更早可见的信号。 */
-            this.ticks = this.ticks + 1;
-            this.lastTickUs = Stopwatch.GetMicroseconds() - t0;
-            if (!more) { break; }
-            if (this.cts.Token.IsCancellationRequested) { break; }
-            if (this.intervalMs > 0) { await Task.Delay(this.intervalMs); }
-            else { await Task.Yield(); }
+        CancellationTokenSource localCts = null;
+        lock (this) {
+            localCts = this.cts;
+            this.loopRunning = true;
         }
-        this.stopped = true;
+        await this.RunLoopWith(localCts);
+    }
+
+    private async void RunLoopWith(CancellationTokenSource localCts) {
+        try {
+            while (localCts != null && !localCts.Token.IsCancellationRequested) {
+                long t0 = Stopwatch.GetMicroseconds();
+                bool more = true;
+                try {
+                    more = await this.ExecuteAsync(localCts.Token);
+                } catch (Exception e) {
+                    this.errors = this.errors + 1;
+                    this.lastError = e.Message == null ? "threw" : e.Message;
+                } catch {
+                    this.errors = this.errors + 1;
+                    this.lastError = "threw non-exception";
+                }
+                /* 循环体已经跑了一轮就计数——抛异常的那轮也算，健康状态里
+                   "tick 在涨但任务从不成功"是比"循环停了"更早可见的信号。 */
+                this.ticks = this.ticks + 1;
+                this.lastTickUs = Stopwatch.GetMicroseconds() - t0;
+                if (!more) { break; }
+                if (localCts.Token.IsCancellationRequested) { break; }
+                if (this.intervalMs > 0) { await Task.Delay(this.intervalMs); }
+                else { await Task.Yield(); }
+            }
+        } finally {
+            CancellationTokenSource deferredDispose = null;
+            lock (this) {
+                this.loopRunning = false;
+                this.stopped = true;
+                if (this.cts == null && localCts != null) {
+                    deferredDispose = localCts;
+                }
+            }
+            if (deferredDispose != null) { deferredDispose.Dispose(); }
+        }
     }
 }
