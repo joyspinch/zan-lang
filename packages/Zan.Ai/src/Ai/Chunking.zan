@@ -24,70 +24,124 @@ namespace Ai;
 // **偏移单位是字节不是字符**：Zan 的 `string` 是 UTF-8 字节序列，
 // `s.Length` 与索引都是字节。所以本包的 `start/end` 是字节偏移，
 // 与 `string.Substring` 的口径一致。切分点必须落在字符边界上——
-// 本包的所有切分都经过 `Encoding.DecodeCodePoint` 扫描，保证不会
-// 把一个多字节字符劈成两半（劈开会产出替换字符，块内容就脏了）。
+// 保证不会把一个多字节字符劈成两半。
 //
 // **token 估算的单一口径**：本包所有 token 数都用 `TokenCost`
 // （4 倍整数的刻度：CJK 4、ASCII 1、其它 2，除以 4 得 token 数）。
-// `Chunking.TokenWindow` 的窗口与 `AiClient.EstimateTokens` 的计数
-// 用的是同一把尺子——两处口径不一致是这类库里最常见的 bug 来源
-// （切出来说"每块 100 token"，一算却是 25）。
 
 public class Chunking {
-    static string[] s_seps;
-
-    static string[] GetSeps() {
-        if (s_seps == null) {
-            s_seps = new string[] { "\n\n", "\n", "。", "！", "？", ".", "!", "?", "，", ",", " " };
-        }
-        return s_seps;
-    }
     // ------------------------------------------------------------------
     // token 估算（单一口径）
     // ------------------------------------------------------------------
 
     // 一个字符的 token 成本（**4 倍刻度**的整数）。
-    //
-    // CJK 字符 4（即 1 token——绝大多数中文分词器的经验值）；ASCII
-    // 1（即 ¼ token——英文 BPE 的典型压缩比，4 字符 1 token）；其它
-    // 多字节字符 2（折中）。
-    //
-    // **成本与字节长度是两回事**：一个汉字 3 字节但成本 4；一个 ASCII
-    // 字符 1 字节成本 1。调用方要用字节长度推进游标（`AdvanceOne`），
-    // 不要拿返回值当长度用——把"3 字节 × 4"当成成本会让中文的 token
-    // 数虚高 3 倍。
     public static int TokenCost(string text, int at, int[] scalar) {
         if (at < 0 || at >= text.Length) { return 0; }
+        int b0 = text[at] & 255;
+        if (b0 < 128) {
+            if (scalar != null && scalar.Length > 0) { scalar[0] = b0; }
+            return 1;
+        }
         int used = Encoding.DecodeCodePoint(text, at, scalar);
         int cp = scalar[0];
-        if (cp < 128) { return 1; }             // ASCII：1 刻度
-        if (Chunking.IsCjk(cp)) { return 4; }   // CJK：4 刻度（1 token）
-        return 2;                              // 其它：2 刻度
+        if (cp < 128) { return 1; }
+        if (cp == 12295 || (cp >= 13312 && cp <= 19903)
+            || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)
+            || (cp >= 131072 && cp <= 195103) || (cp >= 196608 && cp <= 205743)) {
+            return 4;
+        }
+        return 2;
+    }
+
+    // 计算 text[lo..hi) 的 4 倍刻度成本和（单遍内联 UTF-8 解码，零数组分配）。
+    private static int EstimateCostRange(string text, int lo, int hi) {
+        int sum = 0;
+        int i = lo;
+        int[] fallback = null;
+        while (i < hi) {
+            int b0 = text[i] & 255;
+            if (b0 < 128) {
+                sum = sum + 1;
+                i = i + 1;
+                continue;
+            }
+            if ((b0 & 224) == 192 && i + 1 < hi) {
+                int b1 = text[i + 1] & 255;
+                if ((b1 & 192) == 128) {
+                    int cp = ((b0 & 31) << 6) | (b1 & 63);
+                    if (cp >= 128) {
+                        // 2 字节 UTF-8 上限 U+07FF，必然非 CJK
+                        sum = sum + 2;
+                        i = i + 2;
+                        continue;
+                    }
+                }
+            } else if ((b0 & 240) == 224 && i + 2 < hi) {
+                int b1 = text[i + 1] & 255;
+                int b2 = text[i + 2] & 255;
+                if ((b1 & 192) == 128 && (b2 & 192) == 128) {
+                    int cp = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63);
+                    if (cp >= 2048 && (cp < 55296 || cp > 57343)) {
+                        if (cp == 12295 || (cp >= 13312 && cp <= 19903)
+                            || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)) {
+                            sum = sum + 4;
+                        } else {
+                            sum = sum + 2;
+                        }
+                        i = i + 3;
+                        continue;
+                    }
+                }
+            } else if ((b0 & 248) == 240 && i + 3 < hi) {
+                int b1 = text[i + 1] & 255;
+                int b2 = text[i + 2] & 255;
+                int b3 = text[i + 3] & 255;
+                if ((b1 & 192) == 128 && (b2 & 192) == 128 && (b3 & 192) == 128) {
+                    int cp = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+                    if (cp >= 65536 && cp <= 1114111) {
+                        if ((cp >= 131072 && cp <= 195103) || (cp >= 196608 && cp <= 205743)) {
+                            sum = sum + 4;
+                        } else {
+                            sum = sum + 2;
+                        }
+                        i = i + 4;
+                        continue;
+                    }
+                }
+            }
+            if (fallback == null) { fallback = new int[1]; }
+            int used = Encoding.DecodeCodePoint(text, i, fallback);
+            int fcp = fallback[0];
+            if (fcp < 128) { sum = sum + 1; }
+            else if (Chunking.IsCjk(fcp)) { sum = sum + 4; }
+            else { sum = sum + 2; }
+            i = i + (used > 0 ? used : 1);
+        }
+        return sum;
     }
 
     // 全文的 token 数（4 倍刻度除以 4，向上取整）。
     public static int EstimateTokens(string text) {
         if (text == null || text.Length == 0) { return 0; }
-        int[] scalar = new int[1];
-        int sum = 0;
-        int i = 0;
-        while (i < text.Length) {
-            sum = sum + Chunking.TokenCost(text, i, scalar);
-            i = i + Chunking.AdvanceOne(text, i, scalar);
-        }
+        int sum = Chunking.EstimateCostRange(text, 0, text.Length);
         return (sum + 3) / 4;
     }
 
     // 从 at 起的那个字符占多少字节（推进游标用）。
     public static int AdvanceOne(string text, int at, int[] scalar) {
+        if (at >= 0 && at < text.Length) {
+            int b0 = text[at] & 255;
+            if (b0 < 128) {
+                if (scalar != null && scalar.Length > 0) { scalar[0] = b0; }
+                return 1;
+            }
+        }
         int used = Encoding.DecodeCodePoint(text, at, scalar);
         if (used <= 0) { return 1; }
         return used;
     }
 
-    // 是否 CJK 码点（与 `System.Data.Search.TextTokenizer.IsCjk` 同口径：
-    // 汉字与标点区）。判定用码点，不用字节——字节判 CJK 会把
-    // UTF-8 的后续字节误当独立字符。
+    // 是否 CJK 码点（与 `System.Data.Search.TextTokenizer.IsCjk` 同口径）。
     public static bool IsCjk(int cp) {
         return cp == 12295 || (cp >= 13312 && cp <= 19903)
         || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)
@@ -110,19 +164,6 @@ public class Chunking {
     // 递归字符分割
     // ------------------------------------------------------------------
 
-    // 递归字符分割：按分隔符逐层降级，直到单段能塞进 maxChars。
-    //
-    // 分隔符优先级：段落（\n\n）→ 单换行（\n）→ 中文句末标点
-    // （。！？）→ 英文句末标点（.!?）→ 中英文逗号（，,）→ 空格 →
-    // 字符。
-    //
-    // maxChars 的单位是**字节**（与 string.Length 一致）。中文文档
-    // 一个字 3 字节，所以 800 字节大约是 260 个汉字。
-    //
-    // overlap 是相邻块的重叠字节数（按块尾回退）。0 表示不重叠。
-    // overlap >= maxChars 时被压到 maxChars - 1（否则块会原地踏步）。
-    //
-    // 返回的块按原文顺序，start/end 是字节偏移。
     public static List<AiChunk> Recursive(string text, int maxChars, int overlap) {
         List<AiChunk> outp = new List<AiChunk>();
         if (text == null || text.Length == 0) { return outp; }
@@ -130,70 +171,111 @@ public class Chunking {
         if (overlap < 0) { overlap = 0; }
         if (overlap >= maxChars) { overlap = maxChars - 1; }
 
-        // 1) 切成小段（可能很小，比如每句一段）。
-        List<int[]> pieces = new List<int[]>();
-        Chunking.CutRecursive(text, 0, text.Length, maxChars, 0, pieces);
+        int len = text.Length;
+        nint ptr = (nint)(text);
 
-        // 2) 合并相邻小段（合并后不超 maxChars 才合），得到"块边界"。
-        List<int> blockStarts = new List<int>();
-        List<int> blockEnds = new List<int>();
+        // 1) 切成小段（扁平并行起止列表，零 int[] 堆分配）。
+        List<int> pieceStarts = new List<int>();
+        List<int> pieceEnds = new List<int>();
+        Chunking.CutRecursive(text, ptr, 0, len, maxChars, 0, pieceStarts, pieceEnds);
+
+        // 2) 合并相邻小段（合并后不超 maxChars 才合），直接产出块（免建 blockStarts/blockEnds 中间表）。
+        int pCount = pieceStarts.Count;
         int i = 0;
-        while (i < pieces.Count) {
-            int curStart = pieces[i][0];
-            int curEnd = pieces[i][1];
+        int blockIdx = 0;
+        int chunkIdx = 0;
+        while (i < pCount) {
+            int curStart = pieceStarts[i];
+            int curEnd = pieceEnds[i];
             i = i + 1;
-            while (i < pieces.Count) {
-                int ps = pieces[i][0];
-                int pe = pieces[i][1];
-                // 合并要连贯（ps <= curEnd），且合起来不超上限。
+            while (i < pCount) {
+                int ps = pieceStarts[i];
+                int pe = pieceEnds[i];
                 if (ps > curEnd) { break; }
                 if (pe - curStart > maxChars) { break; }
                 curEnd = pe;
                 i = i + 1;
             }
-            blockStarts.Add(curStart);
-            blockEnds.Add(curEnd);
-        }
-
-        // 3) 加重叠后产出。重叠靠"把起点往回拉进前一块尾部"实现。
-        int index = 0;
-        int b = 0;
-        while (b < blockStarts.Count) {
-            int start = blockStarts[b];
-            int end = blockEnds[b];
-            if (b > 0 && overlap > 0) {
+            int start = curStart;
+            int end = curEnd;
+            if (blockIdx > 0 && overlap > 0) {
                 int back = start - overlap;
                 if (back < 0) { back = 0; }
                 int aligned = Chunking.BackToCharBoundary(text, back);
                 if (aligned < start) { start = aligned; }
             }
+            blockIdx = blockIdx + 1;
             if (Chunking.HasNonSpace(text, start, end)) {
                 string body = text.Substring(start, end - start);
-                outp.Add(new AiChunk(body, start, end, index,
-                Chunking.EstimateTokens(body)));
-                index = index + 1;
+                int tokens = (Chunking.EstimateCostRange(text, start, end) + 3) / 4;
+                outp.Add(new AiChunk(body, start, end, chunkIdx, tokens));
+                chunkIdx = chunkIdx + 1;
             }
-            b = b + 1;
         }
         return outp;
     }
 
+    // 在 [lo, hi) 区间内查找第 s 个分隔符（严格不越界扫描 hi 之后）。
+    // 分隔符优先级：
+    // 0:"\n\n" 1:"\n" 2:"。" 3:"！" 4:"？" 5:"." 6:"!" 7:"?" 8:"，" 9:"," 10:" "
+    private static int FindSepBounded(string text, nint ptr, int lo, int hi, int s, out int sepLen) {
+        if (s == 0) {
+            sepLen = 2;
+            int pos = lo;
+            int limit = hi - 1;
+            while (pos < limit) {
+                int at = NativeMemory.Find(ptr, pos, 10, limit - pos);
+                if (at < 0) { return -1; }
+                if ((text[at + 1] & 255) == 10) { return at; }
+                pos = at + 1;
+            }
+            return -1;
+        }
+        if (s == 1) { sepLen = 1; return NativeMemory.Find(ptr, lo, 10, hi - lo); }
+        if (s == 5) { sepLen = 1; return NativeMemory.Find(ptr, lo, 46, hi - lo); }
+        if (s == 6) { sepLen = 1; return NativeMemory.Find(ptr, lo, 33, hi - lo); }
+        if (s == 7) { sepLen = 1; return NativeMemory.Find(ptr, lo, 63, hi - lo); }
+        if (s == 9) { sepLen = 1; return NativeMemory.Find(ptr, lo, 44, hi - lo); }
+        if (s == 10) { sepLen = 1; return NativeMemory.Find(ptr, lo, 32, hi - lo); }
+
+        // 3 字节 UTF-8 标点
+        sepLen = 3;
+        int b0 = 239;
+        int b1 = 188;
+        int b2 = 129;
+        if (s == 2) { b0 = 227; b1 = 128; b2 = 130; }       // 。
+        else if (s == 3) { b0 = 239; b1 = 188; b2 = 129; }  // ！
+        else if (s == 4) { b0 = 239; b1 = 188; b2 = 159; }  // ？
+        else { b0 = 239; b1 = 188; b2 = 140; }              // ，
+        int p = lo;
+        int lim3 = hi - 2;
+        while (p < lim3) {
+            int at = NativeMemory.Find(ptr, p, b0, lim3 - p);
+            if (at < 0) { return -1; }
+            if ((text[at + 1] & 255) == b1 && (text[at + 2] & 255) == b2) { return at; }
+            p = at + 1;
+        }
+        return -1;
+    }
+
     // 递归切分：把 [lo, hi) 切成不超过 maxChars 的若干段。
-    // sepIndex 限制子段只向更细粒度分隔符降级，且右半段迭代推进消除尾递归栈增长。
-    private static void CutRecursive(string text, int lo, int hi, int maxChars,
-    int sepIndex, List<int[]> pieces) {
-        string[] seps = Chunking.GetSeps();
+    private static void CutRecursive(string text, nint ptr, int lo, int hi, int maxChars,
+    int sepIndex, List<int> pieceStarts, List<int> pieceEnds) {
         while (hi - lo > maxChars) {
             bool splitDone = false;
-            for (int s = sepIndex; s < seps.Length; s = s + 1) {
-                string sep = seps[s];
-                int cut = text.IndexOf(sep, lo);
-                if (cut < 0 || cut >= hi) { continue; }
-                // 分隔符归前一段（保标点）；若分隔符恰在末尾无法真切分，则降级试更细分隔符。
-                int segEnd = cut + sep.Length;
+            for (int s = sepIndex; s < 11; s = s + 1) {
+                int sepLen = 0;
+                int cut = Chunking.FindSepBounded(text, ptr, lo, hi, s, out sepLen);
+                if (cut < 0) { continue; }
+                int segEnd = cut + sepLen;
                 if (segEnd >= hi) { continue; }
                 if (segEnd > lo) {
-                    Chunking.CutRecursive(text, lo, segEnd, maxChars, s + 1, pieces);
+                    if (segEnd - lo <= maxChars) {
+                        pieceStarts.Add(lo);
+                        pieceEnds.Add(segEnd);
+                    } else {
+                        Chunking.CutRecursive(text, ptr, lo, segEnd, maxChars, s + 1, pieceStarts, pieceEnds);
+                    }
                     lo = segEnd;
                     splitDone = true;
                     break;
@@ -205,13 +287,19 @@ public class Chunking {
             if (at > hi) { at = hi; }
             at = Chunking.ForwardToCharBoundary(text, at);
             if (at > hi) { at = hi; }
-            if (at <= lo) { at = lo + Chunking.AdvanceOne(text, lo, new int[1]); }
+            if (at <= lo) {
+                int b0 = text[lo] & 255;
+                if (b0 < 128) { at = lo + 1; }
+                else { at = lo + Chunking.AdvanceOne(text, lo, new int[1]); }
+            }
             if (at > hi) { at = hi; }
-            pieces.Add(new int[] { lo, at });
+            pieceStarts.Add(lo);
+            pieceEnds.Add(at);
             lo = at;
         }
         if (hi > lo) {
-            pieces.Add(new int[] { lo, hi });
+            pieceStarts.Add(lo);
+            pieceEnds.Add(hi);
         }
     }
 
@@ -219,14 +307,6 @@ public class Chunking {
     // token 窗口
     // ------------------------------------------------------------------
 
-    // 按 token 窗口切：每块最多 windowTokens 个 token，相邻块重叠
-    // overlapTokens 个 token。
-    //
-    // token 数用 `TokenCost` 的同一把尺子（见类注释），所以
-    // `AiChunk.tokens` 与窗口大小是对得上的。
-    //
-    // 步长 = window - overlap（不是 window）——这是滑动窗口的定义：
-    // 相邻两块共享 overlap 个 token。
     public static List<AiChunk> TokenWindow(string text, int windowTokens,
     int overlapTokens) {
         List<AiChunk> outp = new List<AiChunk>();
@@ -235,137 +315,250 @@ public class Chunking {
         if (overlapTokens < 0) { overlapTokens = 0; }
         if (overlapTokens >= windowTokens) { overlapTokens = windowTokens - 1; }
 
+        int len = text.Length;
         int windowCost = windowTokens * 4;
         int overlapCost = overlapTokens * 4;
 
         int lo = 0;
         int index = 0;
-        int[] scalar = new int[1];
-        while (lo < text.Length) {
-            int hi = Chunking.AdvanceCost(text, lo, windowCost, scalar);
-            if (Chunking.HasNonSpace(text, lo, hi)) {
+        int[] fallback = null;
+        while (lo < len) {
+            // 单遍推进窗口：同时累计 4x 成本与非空白标记，避免二次解码。
+            int usedCost = 0;
+            bool hasNonSpace = false;
+            int i = lo;
+            while (i < len) {
+                int b0 = text[i] & 255;
+                int w = 0;
+                int step = 0;
+                if (b0 < 128) {
+                    w = 1;
+                    step = 1;
+                } else if ((b0 & 224) == 192 && i + 1 < len && ((text[i + 1] & 255) & 192) == 128
+                    && (((b0 & 31) << 6) | (text[i + 1] & 63)) >= 128) {
+                    w = 2;
+                    step = 2;
+                } else if ((b0 & 240) == 224 && i + 2 < len
+                    && ((text[i + 1] & 255) & 192) == 128 && ((text[i + 2] & 255) & 192) == 128) {
+                    int cp = ((b0 & 15) << 12) | ((text[i + 1] & 63) << 6) | (text[i + 2] & 63);
+                    if (cp >= 2048 && (cp < 55296 || cp > 57343)) {
+                        w = (cp == 12295 || (cp >= 13312 && cp <= 19903)
+                            || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)) ? 4 : 2;
+                        step = 3;
+                    }
+                } else if ((b0 & 248) == 240 && i + 3 < len
+                    && ((text[i + 1] & 255) & 192) == 128 && ((text[i + 2] & 255) & 192) == 128
+                    && ((text[i + 3] & 255) & 192) == 128) {
+                    int cp = ((b0 & 7) << 18) | ((text[i + 1] & 63) << 12)
+                        | ((text[i + 2] & 63) << 6) | (text[i + 3] & 63);
+                    if (cp >= 65536 && cp <= 1114111) {
+                        w = ((cp >= 131072 && cp <= 195103) || (cp >= 196608 && cp <= 205743)) ? 4 : 2;
+                        step = 4;
+                    }
+                }
+                if (step == 0) {
+                    if (fallback == null) { fallback = new int[1]; }
+                    int u = Encoding.DecodeCodePoint(text, i, fallback);
+                    int fcp = fallback[0];
+                    w = fcp < 128 ? 1 : (Chunking.IsCjk(fcp) ? 4 : 2);
+                    step = u > 0 ? u : 1;
+                }
+                if (usedCost + w > windowCost && i > lo) { break; }
+                usedCost = usedCost + w;
+                if (!hasNonSpace && (b0 != 32 && (b0 < 9 || b0 > 13))) { hasNonSpace = true; }
+                i = i + step;
+            }
+            int hi = i;
+            if (hasNonSpace) {
                 string body = text.Substring(lo, hi - lo);
-                outp.Add(new AiChunk(body, lo, hi, index,
-                Chunking.EstimateTokens(body)));
+                outp.Add(new AiChunk(body, lo, hi, index, (usedCost + 3) / 4));
                 index = index + 1;
             }
-            if (hi >= text.Length) { break; }
-            // 下一块起点：回退 overlapCost 的成本量。
-            int next = Chunking.RetreatCost(text, hi, overlapCost, scalar);
+            if (hi >= len) { break; }
+
+            // 下一块起点：内联回退 overlapCost 的成本量。
+            int next = hi;
+            if (overlapCost > 0) {
+                int rUsed = 0;
+                int cur = hi;
+                while (cur > 0) {
+                    int prev = cur - 1;
+                    while (prev > 0 && ((text[prev] & 255) & 192) == 128) { prev = prev - 1; }
+                    int pb0 = text[prev] & 255;
+                    int pw = 0;
+                    if (pb0 < 128) {
+                        pw = 1;
+                    } else if ((pb0 & 224) == 192 && prev + 1 < len && ((text[prev + 1] & 255) & 192) == 128
+                        && (((pb0 & 31) << 6) | (text[prev + 1] & 63)) >= 128) {
+                        pw = 2;
+                    } else if ((pb0 & 240) == 224 && prev + 2 < len
+                        && ((text[prev + 1] & 255) & 192) == 128 && ((text[prev + 2] & 255) & 192) == 128) {
+                        int pcp = ((pb0 & 15) << 12) | ((text[prev + 1] & 63) << 6) | (text[prev + 2] & 63);
+                        if (pcp >= 2048 && (pcp < 55296 || pcp > 57343)) {
+                            pw = (pcp == 12295 || (pcp >= 13312 && pcp <= 19903)
+                                || (pcp >= 19968 && pcp <= 40959) || (pcp >= 63744 && pcp <= 64255)) ? 4 : 2;
+                        }
+                    } else if ((pb0 & 248) == 240 && prev + 3 < len
+                        && ((text[prev + 1] & 255) & 192) == 128 && ((text[prev + 2] & 255) & 192) == 128
+                        && ((text[prev + 3] & 255) & 192) == 128) {
+                        int pcp = ((pb0 & 7) << 18) | ((text[prev + 1] & 63) << 12)
+                            | ((text[prev + 2] & 63) << 6) | (text[prev + 3] & 63);
+                        if (pcp >= 65536 && pcp <= 1114111) {
+                            pw = ((pcp >= 131072 && pcp <= 195103) || (pcp >= 196608 && pcp <= 205743)) ? 4 : 2;
+                        }
+                    }
+                    if (pw == 0) {
+                        if (fallback == null) { fallback = new int[1]; }
+                        pw = Chunking.TokenCost(text, prev, fallback);
+                    }
+                    if (rUsed + pw > overlapCost) { break; }
+                    rUsed = rUsed + pw;
+                    cur = prev;
+                }
+                next = cur;
+            }
             if (next <= lo) { next = hi; }
             lo = next;
         }
         return outp;
     }
 
-    // 从 lo 起，往前推进至多 cost 的成本量，返回结束位置（字节）。
-    private static int AdvanceCost(string text, int lo, int cost, int[] scalar) {
-        int used = 0;
-        int i = lo;
-        while (i < text.Length) {
-            int w = Chunking.TokenCost(text, i, scalar);
-            if (used + w > cost && i > lo) { break; }
-            used = used + w;
-            i = i + Chunking.AdvanceOne(text, i, scalar);
-        }
-        return i;
-    }
-
-    // 从 hi 往回退至多 cost 的成本量，返回新起点（字节）。
-    private static int RetreatCost(string text, int hi, int cost, int[] scalar) {
-        if (cost <= 0) { return hi; }
-        int used = 0;
-        int i = hi;
-        while (i > 0) {
-            int prev = Chunking.PrevCharStart(text, i);
-            int w = Chunking.TokenCost(text, prev, scalar);
-            if (used + w > cost) { break; }
-            used = used + w;
-            i = prev;
-        }
-        return i;
-    }
-
-    // 前一个字符的起始字节位置。
-    private static int PrevCharStart(string text, int at) {
-        int i = at - 1;
-        while (i > 0) {
-            int c = text[i] & 255;
-            if ((c & 192) != 128) { return i; }   // 不是续字节 → 字符起点
-            i = i - 1;
-        }
-        return 0;
-    }
-
     // ------------------------------------------------------------------
     // 句子 / 段落
     // ------------------------------------------------------------------
 
-    // 按句子切：块大小不均，但每块都是完整句子（保语义）。
-    //
-    // 句末标点（。！？.!?）后算一句边界；紧跟的收束字符（引号/括号）
-    // 归入本句。
     public static List<AiChunk> Sentences(string text) {
         List<AiChunk> outp = new List<AiChunk>();
         if (text == null || text.Length == 0) { return outp; }
+        int len = text.Length;
         int start = 0;
         int index = 0;
         int i = 0;
-        int[] scalar = new int[1];
-        while (i < text.Length) {
-            int used = Encoding.DecodeCodePoint(text, i, scalar);
-            if (used <= 0) { used = 1; }
-            int cp = scalar[0];
-            if (Chunking.IsSentenceEnd(cp)) {
+        int costSum = 0;
+        bool hasNonSpace = false;
+        int[] fallback = null;
+        while (i < len) {
+            int b0 = text[i] & 255;
+            int cp = 0;
+            int used = 0;
+            int w = 0;
+            if (b0 < 128) {
+                cp = b0;
+                used = 1;
+                w = 1;
+            } else if ((b0 & 224) == 192 && i + 1 < len && ((text[i + 1] & 255) & 192) == 128) {
+                int c2 = ((b0 & 31) << 6) | (text[i + 1] & 63);
+                if (c2 >= 128) { cp = c2; used = 2; w = 2; }
+            } else if ((b0 & 240) == 224 && i + 2 < len
+                && ((text[i + 1] & 255) & 192) == 128 && ((text[i + 2] & 255) & 192) == 128) {
+                int c3 = ((b0 & 15) << 12) | ((text[i + 1] & 63) << 6) | (text[i + 2] & 63);
+                if (c3 >= 2048 && (c3 < 55296 || c3 > 57343)) {
+                    cp = c3;
+                    used = 3;
+                    w = (c3 == 12295 || (c3 >= 13312 && c3 <= 19903)
+                        || (c3 >= 19968 && c3 <= 40959) || (c3 >= 63744 && c3 <= 64255)) ? 4 : 2;
+                }
+            } else if ((b0 & 248) == 240 && i + 3 < len
+                && ((text[i + 1] & 255) & 192) == 128 && ((text[i + 2] & 255) & 192) == 128
+                && ((text[i + 3] & 255) & 192) == 128) {
+                int c4 = ((b0 & 7) << 18) | ((text[i + 1] & 63) << 12)
+                    | ((text[i + 2] & 63) << 6) | (text[i + 3] & 63);
+                if (c4 >= 65536 && c4 <= 1114111) {
+                    cp = c4;
+                    used = 4;
+                    w = ((c4 >= 131072 && c4 <= 195103) || (c4 >= 196608 && c4 <= 205743)) ? 4 : 2;
+                }
+            }
+            if (used == 0) {
+                if (fallback == null) { fallback = new int[1]; }
+                int u = Encoding.DecodeCodePoint(text, i, fallback);
+                cp = fallback[0];
+                used = u > 0 ? u : 1;
+                w = cp < 128 ? 1 : (Chunking.IsCjk(cp) ? 4 : 2);
+            }
+            costSum = costSum + w;
+            if (!hasNonSpace && (b0 != 32 && (b0 < 9 || b0 > 13))) { hasNonSpace = true; }
+
+            if (cp == 12290 || cp == 65281 || cp == 65311 || cp == 46 || cp == 33 || cp == 63) {
                 int end = i + used;
-                // 吞掉紧跟的收束字符。
-                while (end < text.Length) {
-                    int u2 = Encoding.DecodeCodePoint(text, end, scalar);
-                    if (u2 <= 0) { break; }
-                    if (!Chunking.IsSentenceClose(scalar[0])) { break; }
+                while (end < len) {
+                    int cb0 = text[end] & 255;
+                    int ccp = 0;
+                    int u2 = 0;
+                    int cw = 0;
+                    if (cb0 < 128) {
+                        ccp = cb0; u2 = 1; cw = 1;
+                    } else if ((cb0 & 240) == 224 && end + 2 < len
+                        && ((text[end + 1] & 255) & 192) == 128 && ((text[end + 2] & 255) & 192) == 128) {
+                        int c3 = ((cb0 & 15) << 12) | ((text[end + 1] & 63) << 6) | (text[end + 2] & 63);
+                        if (c3 >= 2048 && (c3 < 55296 || c3 > 57343)) {
+                            ccp = c3; u2 = 3; cw = 2; // 收束字符 』」』 均非 CJK
+                        }
+                    } else {
+                        if (fallback == null) { fallback = new int[1]; }
+                        u2 = Encoding.DecodeCodePoint(text, end, fallback);
+                        if (u2 <= 0) { break; }
+                        ccp = fallback[0];
+                        cw = ccp < 128 ? 1 : (Chunking.IsCjk(ccp) ? 4 : 2);
+                    }
+                    if (!(ccp == 41 || ccp == 93 || ccp == 34 || ccp == 39
+                        || ccp == 12309 || ccp == 12291 || ccp == 12290)) { break; }
+                    costSum = costSum + cw;
                     end = end + u2;
                 }
-                if (Chunking.HasNonSpace(text, start, end)) {
+                if (hasNonSpace) {
                     string body = text.Substring(start, end - start);
-                    outp.Add(new AiChunk(body, start, end, index,
-                    Chunking.EstimateTokens(body)));
+                    outp.Add(new AiChunk(body, start, end, index, (costSum + 3) / 4));
                     index = index + 1;
                 }
                 start = end;
                 i = end;
+                costSum = 0;
+                hasNonSpace = false;
                 continue;
             }
             i = i + used;
         }
-        // 尾巴（没有句末标点的残余）。
-        if (start < text.Length && Chunking.HasNonSpace(text, start, text.Length)) {
-            string body = text.Substring(start, text.Length - start);
-            outp.Add(new AiChunk(body, start, text.Length, index,
-            Chunking.EstimateTokens(body)));
+        if (start < len && hasNonSpace) {
+            string body = text.Substring(start, len - start);
+            outp.Add(new AiChunk(body, start, len, index, (costSum + 3) / 4));
         }
         return outp;
     }
 
-    // 按段落切（空行分段）。块大小很不均，但保结构。
+    // 按段落切（空行分段）。单遍 NativeMemory.Find('\n') 定位 \n\n 或 \r\n\r\n。
     public static List<AiChunk> Paragraphs(string text) {
         List<AiChunk> outp = new List<AiChunk>();
         if (text == null || text.Length == 0) { return outp; }
+        int len = text.Length;
+        nint ptr = (nint)(text);
         int index = 0;
         int lo = 0;
-        while (lo < text.Length) {
-            // 找下一个空行（\n\n 或 \r\n\r\n，取先出现者）。
-            int gap = text.IndexOf("\n\n", lo);
+        while (lo < len) {
+            int gap = -1;
             int gapLen = 2;
-            int gapCrlf = text.IndexOf("\r\n\r\n", lo);
-            if (gapCrlf >= 0 && (gap < 0 || gapCrlf < gap)) {
-                gap = gapCrlf;
-                gapLen = 4;
+            int scan = lo;
+            while (scan < len) {
+                int nl = NativeMemory.Find(ptr, scan, 10, len - scan);
+                if (nl < 0) { break; }
+                if (nl > lo && (text[nl - 1] & 255) == 13
+                    && nl + 2 < len && (text[nl + 1] & 255) == 13 && (text[nl + 2] & 255) == 10) {
+                    gap = nl - 1;
+                    gapLen = 4;
+                    break;
+                }
+                if (nl + 1 < len && (text[nl + 1] & 255) == 10) {
+                    gap = nl;
+                    gapLen = 2;
+                    break;
+                }
+                scan = nl + 1;
             }
-            int hi = gap < 0 ? text.Length : gap;
+            int hi = gap < 0 ? len : gap;
             if (Chunking.HasNonSpace(text, lo, hi)) {
                 string body = text.Substring(lo, hi - lo);
-                outp.Add(new AiChunk(body, lo, hi, index,
-                Chunking.EstimateTokens(body)));
+                int tokens = (Chunking.EstimateCostRange(text, lo, hi) + 3) / 4;
+                outp.Add(new AiChunk(body, lo, hi, index, tokens));
                 index = index + 1;
             }
             if (gap < 0) { break; }
@@ -382,17 +575,36 @@ public class Chunking {
         return false;
     }
 
-    // 把块拼回一段文本（用给定分隔符）——用于调试与"还原原文"。
+    // 把块拼回一段文本（单次预估总长 + NativeMemory.Copy 直写）。
     public static string Join(List<AiChunk> chunks, string sep) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < chunks.Count; i = i + 1) {
-            if (i > 0) { sb.Append(sep); }
-            sb.Append(chunks[i].text);
+        if (chunks == null || chunks.Count == 0) { return ""; }
+        int n = chunks.Count;
+        if (n == 1) { return chunks[0].text; }
+        int sepLen = sep != null ? sep.Length : 0;
+        int total = sepLen * (n - 1);
+        for (int i = 0; i < n; i = i + 1) {
+            string t = chunks[i].text;
+            if (t != null) { total = total + t.Length; }
         }
-        return sb.ToString();
+        if (total == 0) { return ""; }
+        byte[] buf = new byte[total];
+        nint dst = (nint)(buf);
+        nint sepPtr = sepLen > 0 ? (nint)(sep) : (nint)0;
+        int pos = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0 && sepLen > 0) {
+                NativeMemory.Copy(dst + (nint)pos, sepPtr, sepLen);
+                pos = pos + sepLen;
+            }
+            string t = chunks[i].text;
+            if (t != null && t.Length > 0) {
+                NativeMemory.Copy(dst + (nint)pos, (nint)(t), t.Length);
+                pos = pos + t.Length;
+            }
+        }
+        return NativeMemory.GetString(dst, 0, pos);
     }
 
-    // 从 at 往前退到字符边界（at 可能是字符中间的字节位置）。
     private static int BackToCharBoundary(string text, int at) {
         if (at <= 0) { return 0; }
         if (at >= text.Length) { at = text.Length; }
@@ -405,7 +617,6 @@ public class Chunking {
         return 0;
     }
 
-    // 从 at 往前推到下一个字符边界（at 可能是字符中间的字节位置）。
     private static int ForwardToCharBoundary(string text, int at) {
         if (at >= text.Length) { return text.Length; }
         int i = at;
