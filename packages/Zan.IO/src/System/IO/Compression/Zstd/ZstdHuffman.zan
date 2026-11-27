@@ -173,20 +173,54 @@ public class ZstdHuffman {
     // 解码一路 Huffman 码流，把 count 个字面量写进 dst 的 dstPos 起。
     //
     // 码流是反向的：末字节的结束标记与填充先跳过，然后从高位往低位读。
+    // 内联 64 位位缓冲寄存器，零方法调用、批量 4 字节装填。
     // 失败抛 ZstdException。
     public static void DecodeStream(ZstdHuffmanTable table, byte[] data, int start, int end,
         int count, byte[] dst, int dstPos) {
-        ZstdBackBits br = new ZstdBackBits(data, start, end);
-        if (br.Bad()) {
+        if (end <= start || end > data.Length || start < 0) {
             throw new ZstdException(ZstdError.BadHuffman, "zstd: empty Huffman bitstream");
         }
+        int last = data[end - 1] & 255;
+        if (last == 0) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: empty Huffman bitstream");
+        }
+        int p = ZstdBits.HighBit(last);
+        ulong bitBuf = p > 0 ? (((ulong)(last & ((1 << p) - 1))) << (64 - p)) : 0UL;
+        int bitCount = p;
+        int bp = end - 2;
+
         int log = table.tableLog;
-        for (int i = 0; i < count; i = i + 1) {
-            int v = br.Peek(log);
-            int sym = table.symbol[v] & 255;
-            int nb = table.nbBits[v] & 255;
-            dst[dstPos + i] = (byte)sym;
-            br.Skip(nb);
+        int shift = 64 - log;
+        byte[] symTab = table.symbol;
+        byte[] nbTab = table.nbBits;
+        int dstEnd = dstPos + count;
+        for (int outIdx = dstPos; outIdx < dstEnd; outIdx = outIdx + 1) {
+            if (bitCount < log && bp >= start) {
+                while (bitCount <= 32 && bp - 3 >= start) {
+                    ulong w = (((ulong)(data[bp] & 255)) << 24)
+                        | (((ulong)(data[bp - 1] & 255)) << 16)
+                        | (((ulong)(data[bp - 2] & 255)) << 8)
+                        | ((ulong)(data[bp - 3] & 255));
+                    bitBuf = bitBuf | (w << (32 - bitCount));
+                    bitCount = bitCount + 32;
+                    bp = bp - 4;
+                }
+                while (bitCount <= 56 && bp >= start) {
+                    bitBuf = bitBuf | (((ulong)(data[bp] & 255)) << (56 - bitCount));
+                    bitCount = bitCount + 8;
+                    bp = bp - 1;
+                }
+            }
+            int v = (int)(bitBuf >> shift);
+            dst[outIdx] = symTab[v];
+            int nb = nbTab[v] & 255;
+            if (nb < bitCount) {
+                bitBuf = bitBuf << nb;
+                bitCount = bitCount - nb;
+            } else {
+                bitBuf = 0UL;
+                bitCount = 0;
+            }
         }
     }
 }

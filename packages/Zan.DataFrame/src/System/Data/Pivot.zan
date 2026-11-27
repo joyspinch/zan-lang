@@ -39,45 +39,152 @@ public class Pivot {
             valAt.Add(at);
         }
 
-        // 行标签值 / 列标签值的首次出现顺序，同步归组单元格行号（单趟扫描）。
-        List<string> indexValues = new List<string>();
-        HashSet<string> indexSeen = new HashSet<string>();
-        List<string> columnValues = new List<string>();
-        HashSet<string> colSeen = new HashSet<string>();
-        Dictionary<string, List<int>> cells = new Dictionary<string, List<int>>();
+        // 第一趟：密集整数编码行/列标签，免每行 CellKey 字符串拼接与 List<int> 桶分配。
         int totalRows = df.Rows();
+        DataCol idxCol = df.cols[idxAt];
+        DataCol colCol = df.cols[colAt];
+        List<string> indexValues = new List<string>();
+        Dictionary<string, int> indexMap = new Dictionary<string, int>();
+        List<string> columnValues = new List<string>();
+        Dictionary<string, int> colMap = new Dictionary<string, int>();
+        int[] rowIds = new int[totalRows];
+        int[] colIds = new int[totalRows];
         for (int r = 0; r < totalRows; r = r + 1) {
-            string iv = df.cols[idxAt].GetStr(r);
-            if (indexSeen.Add(iv)) { indexValues.Add(iv); }
-            string cv = df.cols[colAt].GetStr(r);
-            if (colSeen.Add(cv)) { columnValues.Add(cv); }
-            string k = Pivot.CellKey(iv, cv);
-            List<int> bucket;
-            if (!cells.TryGetValue(k, out bucket)) {
-                bucket = new List<int>();
-                cells[k] = bucket;
+            string iv = idxCol.GetStr(r);
+            int ri;
+            if (!indexMap.TryGetValue(iv, out ri)) {
+                ri = indexValues.Count;
+                indexMap[iv] = ri;
+                indexValues.Add(iv);
             }
-            bucket.Add(r);
+            string cv = colCol.GetStr(r);
+            int ci;
+            if (!colMap.TryGetValue(cv, out ci)) {
+                ci = columnValues.Count;
+                colMap[cv] = ci;
+                columnValues.Add(cv);
+            }
+            rowIds[r] = ri;
+            colIds[r] = ci;
         }
 
+        int nIdx = indexValues.Count;
+        int nCol = columnValues.Count;
+        int nVal = valAt.Count;
+        int gridCells = nIdx * nCol;
+
+        // 第二趟：扁平数组流式聚合（支持全部 Agg.Count/Sum/Avg/Min/Max，精确跳过缺失格）。
         DataFrame outp = new DataFrame();
-        outp.cols.Add(DataCol.Create(indexCol, df.cols[idxAt].Kind()));
-        for (int c = 0; c < columnValues.Count; c = c + 1) {
-            for (int v = 0; v < valAt.Count; v = v + 1) {
-                outp.cols.Add(DataCol.Create(columnValues[c] + "_"
-                    + df.cols[valAt[v]].Name(), ColKind.Float));
+        DataCol outIdx = DataCol.Create(indexCol, idxCol.Kind());
+        outIdx.Reserve(nIdx);
+        for (int i = 0; i < nIdx; i = i + 1) { outIdx.Append(indexValues[i]); }
+        outp.cols.Add(outIdx);
+        outp.rowCount = nIdx;
+
+        int totalOutVals = nCol * nVal;
+        for (int c = 0; c < nCol; c = c + 1) {
+            for (int v = 0; v < nVal; v = v + 1) {
+                DataCol vc = DataCol.Create(columnValues[c] + "_" + df.cols[valAt[v]].Name(), ColKind.Float);
+                vc.Reserve(nIdx);
+                outp.cols.Add(vc);
             }
         }
-        for (int i = 0; i < indexValues.Count; i = i + 1) {
-            int row = outp.AddRow();
-            outp.cols[0].PutStr(row, indexValues[i]);
-            for (int c = 0; c < columnValues.Count; c = c + 1) {
-                string k = Pivot.CellKey(indexValues[i], columnValues[c]);
-                List<int> rows;
-                bool hasCell = cells.TryGetValue(k, out rows);
-                for (int v = 0; v < valAt.Count; v = v + 1) {
-                    double val = hasCell ? df.Aggregate(rows, df.cols[valAt[v]].Name(), agg) : 0.0;
-                    outp.cols[1 + c * valAt.Count + v].PutDouble(row, val);
+
+        if (agg == Agg.Count) {
+            int[] cnts = new int[gridCells];
+            for (int r = 0; r < totalRows; r = r + 1) {
+                int cell = rowIds[r] * nCol + colIds[r];
+                cnts[cell] = cnts[cell] + 1;
+            }
+            for (int c = 0; c < nCol; c = c + 1) {
+                for (int v = 0; v < nVal; v = v + 1) {
+                    List<double> dst = outp.cols[1 + c * nVal + v].nums;
+                    for (int i = 0; i < nIdx; i = i + 1) {
+                        dst.Add((double)cnts[i * nCol + c]);
+                    }
+                }
+            }
+            return outp;
+        }
+
+        double[] acc = new double[gridCells];
+        int[] validCnt = new int[gridCells];
+        for (int v = 0; v < nVal; v = v + 1) {
+            if (v > 0) {
+                for (int k = 0; k < gridCells; k = k + 1) { acc[k] = 0.0; validCnt[k] = 0; }
+            }
+            DataCol src = df.cols[valAt[v]];
+            bool hasMiss = src.missing.Count > 0;
+            int kind = src.kind;
+            if (!hasMiss && kind == ColKind.Float) {
+                List<double> nums = src.nums;
+                if (agg == Agg.Sum || agg == Agg.Avg) {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        acc[cell] = acc[cell] + nums[r];
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                } else if (agg == Agg.Max) {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        double x = nums[r];
+                        if (validCnt[cell] == 0 || x > acc[cell]) { acc[cell] = x; }
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                } else {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        double x = nums[r];
+                        if (validCnt[cell] == 0 || x < acc[cell]) { acc[cell] = x; }
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                }
+            } else if (!hasMiss && kind == ColKind.Int) {
+                List<long> ints = src.ints;
+                if (agg == Agg.Sum || agg == Agg.Avg) {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        acc[cell] = acc[cell] + (double)ints[r];
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                } else if (agg == Agg.Max) {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        double x = (double)ints[r];
+                        if (validCnt[cell] == 0 || x > acc[cell]) { acc[cell] = x; }
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                } else {
+                    for (int r = 0; r < totalRows; r = r + 1) {
+                        int cell = rowIds[r] * nCol + colIds[r];
+                        double x = (double)ints[r];
+                        if (validCnt[cell] == 0 || x < acc[cell]) { acc[cell] = x; }
+                        validCnt[cell] = validCnt[cell] + 1;
+                    }
+                }
+            } else {
+                for (int r = 0; r < totalRows; r = r + 1) {
+                    if (hasMiss && src.IsMissing(r)) { continue; }
+                    int cell = rowIds[r] * nCol + colIds[r];
+                    double x = src.GetDouble(r);
+                    if (agg == Agg.Sum || agg == Agg.Avg) {
+                        acc[cell] = acc[cell] + x;
+                    } else if (agg == Agg.Max) {
+                        if (validCnt[cell] == 0 || x > acc[cell]) { acc[cell] = x; }
+                    } else {
+                        if (validCnt[cell] == 0 || x < acc[cell]) { acc[cell] = x; }
+                    }
+                    validCnt[cell] = validCnt[cell] + 1;
+                }
+            }
+            for (int c = 0; c < nCol; c = c + 1) {
+                List<double> dst = outp.cols[1 + c * nVal + v].nums;
+                for (int i = 0; i < nIdx; i = i + 1) {
+                    int cell = i * nCol + c;
+                    int cnt = validCnt[cell];
+                    if (cnt == 0) { dst.Add(0.0); }
+                    else if (agg == Agg.Avg) { dst.Add(acc[cell] / (double)cnt); }
+                    else { dst.Add(acc[cell]); }
                 }
             }
         }
@@ -104,36 +211,55 @@ public class Pivot {
         int colAt = df.ColIndex(columnsCol);
         if (colAt < 0) { throw new InvalidOperationException("Crosstab 没有列: " + columnsCol); }
 
-        List<string> indexValues = new List<string>();
-        HashSet<string> indexSeen = new HashSet<string>();
-        List<string> columnValues = new List<string>();
-        HashSet<string> colSeen = new HashSet<string>();
-        Dictionary<string, int> counts = new Dictionary<string, int>();
         int totalRows = df.Rows();
+        DataCol idxCol = df.cols[idxAt];
+        DataCol colCol = df.cols[colAt];
+        List<string> indexValues = new List<string>();
+        Dictionary<string, int> indexMap = new Dictionary<string, int>();
+        List<string> columnValues = new List<string>();
+        Dictionary<string, int> colMap = new Dictionary<string, int>();
+        int[] rowIds = new int[totalRows];
+        int[] colIds = new int[totalRows];
         for (int r = 0; r < totalRows; r = r + 1) {
-            string iv = df.cols[idxAt].GetStr(r);
-            if (indexSeen.Add(iv)) { indexValues.Add(iv); }
-            string cv = df.cols[colAt].GetStr(r);
-            if (colSeen.Add(cv)) { columnValues.Add(cv); }
-            string k = Pivot.CellKey(iv, cv);
-            int cur;
-            counts[k] = counts.TryGetValue(k, out cur) ? (cur + 1) : 1;
+            string iv = idxCol.GetStr(r);
+            int ri;
+            if (!indexMap.TryGetValue(iv, out ri)) {
+                ri = indexValues.Count;
+                indexMap[iv] = ri;
+                indexValues.Add(iv);
+            }
+            string cv = colCol.GetStr(r);
+            int ci;
+            if (!colMap.TryGetValue(cv, out ci)) {
+                ci = columnValues.Count;
+                colMap[cv] = ci;
+                columnValues.Add(cv);
+            }
+            rowIds[r] = ri;
+            colIds[r] = ci;
+        }
+        int nIdx = indexValues.Count;
+        int nCol = columnValues.Count;
+        int[] cnts = new int[nIdx * nCol];
+        for (int r = 0; r < totalRows; r = r + 1) {
+            int cell = rowIds[r] * nCol + colIds[r];
+            cnts[cell] = cnts[cell] + 1;
         }
 
         DataFrame outp = new DataFrame();
-        outp.cols.Add(DataCol.Create(indexCol, df.cols[idxAt].Kind()));
-        for (int c = 0; c < columnValues.Count; c = c + 1) {
-            outp.cols.Add(DataCol.Create(columnValues[c], ColKind.Int));
-        }
-        for (int i = 0; i < indexValues.Count; i = i + 1) {
-            int row = outp.AddRow();
-            outp.cols[0].PutStr(row, indexValues[i]);
-            for (int c = 0; c < columnValues.Count; c = c + 1) {
-                string k = Pivot.CellKey(indexValues[i], columnValues[c]);
-                int n;
-                if (!counts.TryGetValue(k, out n)) { n = 0; }
-                outp.cols[1 + c].PutLong(row, n);
+        DataCol outIdx = DataCol.Create(indexCol, idxCol.Kind());
+        outIdx.Reserve(nIdx);
+        for (int i = 0; i < nIdx; i = i + 1) { outIdx.Append(indexValues[i]); }
+        outp.cols.Add(outIdx);
+        outp.rowCount = nIdx;
+        for (int c = 0; c < nCol; c = c + 1) {
+            DataCol cc = DataCol.Create(columnValues[c], ColKind.Int);
+            cc.Reserve(nIdx);
+            List<long> dst = cc.ints;
+            for (int i = 0; i < nIdx; i = i + 1) {
+                dst.Add((long)cnts[i * nCol + c]);
             }
+            outp.cols.Add(cc);
         }
         return outp;
     }

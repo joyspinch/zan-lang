@@ -16,28 +16,51 @@ public class Xlsx {
         return Encoding.XmlEscape(s, true, true);
     }
 
+    // 10^0..10^18 预计算表，免每次循环乘算与中间字符串分配。
+    private static double[] pow10D;
+    private static long[] pow10L;
+
+    private static void EnsurePow10() {
+        if (Xlsx.pow10D != null) { return; }
+        double[] pd = new double[19];
+        long[] pl = new long[19];
+        double d = 1.0;
+        long l = 1L;
+        for (int i = 0; i < 19; i = i + 1) {
+            pd[i] = d;
+            pl[i] = l;
+            d = d * 10.0;
+            l = l * 10L;
+        }
+        Xlsx.pow10D = pd;
+        Xlsx.pow10L = pl;
+    }
+
     // 0 → A、25 → Z、26 → AA……（Excel 列引用）。
     public static string ColRef(int c) {
-        string s = "";
+        byte[] buf = new byte[12];
+        int pos = 12;
         int n = c + 1;
-        while (n > 0) {
-            int m = (n - 1) - ((n - 1) / 26) * 26;
-            s = Encoding.Utf8FromCodePoint(65 + m) + s;
-            n = (n - 1) / 26;
+        while (n > 0 && pos > 0) {
+            int nm1 = n - 1;
+            int q = nm1 / 26;
+            int m = nm1 - q * 26;
+            pos = pos - 1;
+            buf[pos] = (byte)(65 + m);
+            n = q;
         }
-        return s;
+        return NativeMemory.GetString((nint)buf + pos, 0, 12 - pos);
     }
 
     // double → 十进制文本：从 0 位小数起逐位尝试，取首个能按
     // 相对容差往返的表示；|v| ≥ 1e15 或非零 |v| < 1e-9 时写科学
-    // 计数法。绝不用 Convert.ToString(double)——它只有约 6 位
-    // 有效数字，123.45 会被写成 123.45（碰巧）但 123.4567 变 123.457。
+    // 计数法。纯数值搜索最短精度，只对命中精度做一次字节缓冲格式化。
     public static string RealToText(double v) {
         if (v == 0.0) { return "0"; }
+        Xlsx.EnsurePow10();
         bool neg = v < 0.0;
-        double a = v;
-        if (neg) { a = 0.0 - a; }
-        if (a >= Xlsx.Pow10(15) || a < 1.0 / Xlsx.Pow10(9)) {
+        double a = neg ? (0.0 - v) : v;
+        if (a >= 1000000000000000.0 || a < 0.000000001) {
             int exp = 0;
             while (a >= 10.0) { a = a / 10.0; exp = exp + 1; }
             while (a < 1.0) { a = a * 10.0; exp = exp - 1; }
@@ -52,70 +75,77 @@ public class Xlsx {
         int digits = 1;
         double t = a;
         while (t >= 10.0) { t = t / 10.0; digits = digits + 1; }
-        string f = Xlsx.Shortest(a, 18 - digits);
-        if (neg) { return "-" + f; }
-        return f;
+        return Xlsx.ShortestSigned(a, 18 - digits, neg);
     }
 
-    // 0..maxDec 位小数逐个尝试，返回首个按相对容差 1e-15
-    // 往返的定点表示；都不行则返回最长表示兜底。
+    // 0..maxDec 位小数纯数值检索，只对最终命中位数做一次无中间串格式化。
     private static string Shortest(double a, int maxDec) {
-        string last = Xlsx.FixedReal(a, maxDec);
+        return Xlsx.ShortestSigned(a, maxDec, false);
+    }
+
+    private static string ShortestSigned(double a, int maxDec, bool neg) {
+        double[] pd = Xlsx.pow10D;
+        double tol = a / 1000000000000000.0;
+        if (maxDec < 0) { maxDec = 0; }
+        if (maxDec > 18) { maxDec = 18; }
+        int winD = maxDec;
+        long winTotal = (long)(a * pd[maxDec] + 0.5);
         for (int d = 0; d <= maxDec; d = d + 1) {
-            string s = Xlsx.FixedReal(a, d);
-            double p = Xlsx.ParseFixed(s);
+            double scale = pd[d];
+            long total = (long)(a * scale + 0.5);
+            double p = d == 0 ? (double)total : ((double)total / scale);
             double diff = p - a;
             if (diff < 0.0) { diff = 0.0 - diff; }
-            if (diff <= a / Xlsx.Pow10(15)) { return s; }
+            if (diff <= tol) {
+                winD = d;
+                winTotal = total;
+                break;
+            }
         }
-        return last;
+        return Xlsx.FormatTotal(winTotal, winD, neg);
     }
 
-    // a >= 0：渲染为恰好 `decimals` 位小数（四舍五入）。
-    private static string FixedReal(double a, int decimals) {
-        double scale = Xlsx.Pow10(decimals);
-        long total = (long)(a * scale + 0.5);
+    private static string FormatTotal(long total, int decimals, bool neg) {
+        byte[] buf = new byte[32];
+        int pos = 32;
         long ip = total;
-        string frac = "";
         if (decimals > 0) {
-            long p = (long)scale;
+            long p = Xlsx.pow10L[decimals];
             ip = total / p;
             long fp = total - ip * p;
-            frac = ".";
-            string fs = Convert.ToString(fp);
-            while (fs.Length < decimals) { fs = "0" + fs; }
-            frac = frac + fs;
+            for (int i = 0; i < decimals; i = i + 1) {
+                long q = fp / 10L;
+                pos = pos - 1;
+                buf[pos] = (byte)(48 + (int)(fp - q * 10L));
+                fp = q;
+            }
+            pos = pos - 1;
+            buf[pos] = 46; // '.'
         }
-        return Convert.ToString(ip) + frac;
-    }
-
-    // 严格十进制解析（我自己生成的文本，格式可控）。
-    private static double ParseFixed(string s) {
-        double v = 0.0;
-        int i = 0;
-        bool neg = false;
-        if (i < s.Length && (int)s[i] == 45) { neg = true; i = i + 1; }
-        while (i < s.Length) {
-            int c = (int)s[i];
-            if (c == 46) { i = i + 1; break; }
-            if (c < 48 || c > 57) { return 0.0; }
-            v = v * 10.0 + (double)(c - 48);
-            i = i + 1;
+        if (ip == 0L) {
+            pos = pos - 1;
+            buf[pos] = 48;
+        } else {
+            while (ip > 0L) {
+                long q = ip / 10L;
+                pos = pos - 1;
+                buf[pos] = (byte)(48 + (int)(ip - q * 10L));
+                ip = q;
+            }
         }
-        double scale = 1.0;
-        while (i < s.Length) {
-            int c = (int)s[i];
-            if (c < 48 || c > 57) { return 0.0; }
-            scale = scale / 10.0;
-            v = v + (double)(c - 48) * scale;
-            i = i + 1;
+        if (neg) {
+            pos = pos - 1;
+            buf[pos] = 45; // '-'
         }
-        if (neg) { return 0.0 - v; }
-        return v;
+        return NativeMemory.GetString((nint)buf + pos, 0, 32 - pos);
     }
 
     // 以 double 表示的 10^n。
     private static double Pow10(int n) {
+        if (n >= 0 && n <= 18) {
+            Xlsx.EnsurePow10();
+            return Xlsx.pow10D[n];
+        }
         double p = 1.0;
         for (int i = 0; i < n; i = i + 1) { p = p * 10.0; }
         return p;

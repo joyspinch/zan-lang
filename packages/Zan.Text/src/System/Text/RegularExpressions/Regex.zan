@@ -281,6 +281,7 @@ public class Regex {
 
     // 替换所有匹配。`replacement` 里 `$1` / `${1}` /
     // `${name}` 是捕获组，`$&amp;` 是整个匹配，`$$` 是字面量 '$'。
+    // 预编译替换模板为扁平段表，直接写入单一 byte[] 缓冲，零中间 string 分配。
     public string Replace(string input, string replacement) {
         int len = input.Length;
         int groups = this.prog.GroupCount();
@@ -289,26 +290,196 @@ public class Regex {
         if (rc == -2) { this.Overflow(0); }
         if (rc < 0) { return input; }
 
-        bool plain = replacement == null || replacement.Length == 0 || replacement.IndexOf("$") < 0;
         string rep = replacement == null ? "" : replacement;
-        StringBuilder sb = new StringBuilder(len + 16);
+        int repLen = rep.Length;
+        nint repPtr = repLen > 0 ? (nint)rep : (nint)0;
+        bool plain = repLen == 0 || NativeMemory.Find(repPtr, 0, 36, repLen) < 0;
+
+        // 预解析含 '$' 的替换模板为 (kind, a, b) 段：
+        // kind=0 表示 rep[a..a+b) 字面量；kind=1 表示捕获组号 a；kind=2 表示单个 '$' 字节。
+        int[] segKind = null;
+        int[] segA = null;
+        int[] segB = null;
+        int segCount = 0;
+        if (!plain) {
+            int maxSeg = repLen + 2;
+            segKind = new int[maxSeg];
+            segA = new int[maxSeg];
+            segB = new int[maxSeg];
+            Span<byte> rbuf = new Span<byte>(repPtr, repLen);
+            int i = 0;
+            int start = 0;
+            while (i < repLen) {
+                int c = rbuf[i] & 255;
+                if (c != 36 || i + 1 >= repLen) {
+                    i = i + 1;
+                    continue;
+                }
+                if (i > start) {
+                    segKind[segCount] = 0;
+                    segA[segCount] = start;
+                    segB[segCount] = i - start;
+                    segCount = segCount + 1;
+                }
+                int d = rbuf[i + 1] & 255;
+                if (d == 36) {
+                    segKind[segCount] = 2;
+                    segA[segCount] = 0;
+                    segB[segCount] = 1;
+                    segCount = segCount + 1;
+                    i = i + 2;
+                    start = i;
+                } else if (d == 38) {
+                    segKind[segCount] = 1;
+                    segA[segCount] = 0;
+                    segB[segCount] = 0;
+                    segCount = segCount + 1;
+                    i = i + 2;
+                    start = i;
+                } else if (d == 123) {
+                    int close = NativeMemory.Find(repPtr, i + 2, 125, repLen - (i + 2));
+                    if (close < 0) {
+                        i = i + 1;
+                        start = i - 1;
+                    } else {
+                        string body = NativeMemory.GetString(repPtr, i + 2, close - i - 2);
+                        int gi = this.RefNumber(body);
+                        if (gi < 0) {
+                            segKind[segCount] = 0;
+                            segA[segCount] = i;
+                            segB[segCount] = close - i + 1;
+                            segCount = segCount + 1;
+                        } else if (gi < groups) {
+                            segKind[segCount] = 1;
+                            segA[segCount] = gi;
+                            segB[segCount] = 0;
+                            segCount = segCount + 1;
+                        }
+                        i = close + 1;
+                        start = i;
+                    }
+                } else if (d >= 48 && d <= 57) {
+                    int gi = d - 48;
+                    int j = i + 2;
+                    while (j < repLen) {
+                        int dj = rbuf[j] & 255;
+                        if (dj >= 48 && dj <= 57 && gi * 10 + (dj - 48) < groups) {
+                            gi = gi * 10 + (dj - 48);
+                            j = j + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (gi < groups) {
+                        segKind[segCount] = 1;
+                        segA[segCount] = gi;
+                        segB[segCount] = 0;
+                        segCount = segCount + 1;
+                    }
+                    i = j;
+                    start = i;
+                } else {
+                    i = i + 1;
+                    start = i - 1;
+                }
+            }
+            if (start < repLen) {
+                segKind[segCount] = 0;
+                segA[segCount] = start;
+                segB[segCount] = repLen - start;
+                segCount = segCount + 1;
+            }
+        }
+
+        int cap = len + 64;
+        byte[] outBuf = new byte[cap];
+        int outLen = 0;
+        nint inPtr = run.inputPtr;
+        int[] caps = run.caps;
         int outPos = 0;
         int at = 0;
         while (true) {
-            int mStart = run.caps[0];
-            int mEnd = run.caps[1];
-            if (mStart > outPos) {
-                sb.Append(input.Substring(outPos, mStart - outPos));
+            int mStart = caps[0];
+            int mEnd = caps[1];
+            int gap = mStart - outPos;
+            if (gap > 0) {
+                if (outLen + gap > cap) {
+                    int ncap = cap * 2;
+                    while (ncap < outLen + gap) { ncap = ncap * 2; }
+                    byte[] nb = new byte[ncap];
+                    if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                    outBuf = nb;
+                    cap = ncap;
+                }
+                NativeMemory.Copy((nint)outBuf + outLen, inPtr + outPos, gap);
+                outLen = outLen + gap;
             }
             if (plain) {
-                sb.Append(rep);
+                if (repLen > 0) {
+                    if (outLen + repLen > cap) {
+                        int ncap = cap * 2;
+                        while (ncap < outLen + repLen) { ncap = ncap * 2; }
+                        byte[] nb = new byte[ncap];
+                        if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                        outBuf = nb;
+                        cap = ncap;
+                    }
+                    NativeMemory.Copy((nint)outBuf + outLen, repPtr, repLen);
+                    outLen = outLen + repLen;
+                }
             } else {
-                this.AppendExpanded(sb, run.inputPtr, run.caps, groups, rep);
+                for (int s = 0; s < segCount; s = s + 1) {
+                    int k = segKind[s];
+                    if (k == 0) {
+                        int slen = segB[s];
+                        if (outLen + slen > cap) {
+                            int ncap = cap * 2;
+                            while (ncap < outLen + slen) { ncap = ncap * 2; }
+                            byte[] nb = new byte[ncap];
+                            if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                            outBuf = nb;
+                            cap = ncap;
+                        }
+                        if (slen == 1) {
+                            outBuf[outLen] = (byte)(rep[segA[s]] & 255);
+                        } else {
+                            NativeMemory.Copy((nint)outBuf + outLen, repPtr + segA[s], slen);
+                        }
+                        outLen = outLen + slen;
+                    } else if (k == 1) {
+                        int gi = segA[s];
+                        int gs = caps[gi * 2];
+                        int ge = caps[gi * 2 + 1];
+                        int glen = ge - gs;
+                        if (gs >= 0 && glen > 0) {
+                            if (outLen + glen > cap) {
+                                int ncap = cap * 2;
+                                while (ncap < outLen + glen) { ncap = ncap * 2; }
+                                byte[] nb = new byte[ncap];
+                                if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                                outBuf = nb;
+                                cap = ncap;
+                            }
+                            NativeMemory.Copy((nint)outBuf + outLen, inPtr + gs, glen);
+                            outLen = outLen + glen;
+                        }
+                    } else {
+                        if (outLen + 1 > cap) {
+                            int ncap = cap * 2;
+                            byte[] nb = new byte[ncap];
+                            if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                            outBuf = nb;
+                            cap = ncap;
+                        }
+                        outBuf[outLen] = 36;
+                        outLen = outLen + 1;
+                    }
+                }
             }
             outPos = mEnd;
             int next = mEnd;
             if (mEnd == mStart) {
-                next = next + RegexProgram.StepWidth(run.inputPtr, len, next);
+                next = next + RegexProgram.StepWidth(inPtr, len, next);
             }
             at = next;
             if (at > len) { break; }
@@ -316,10 +487,18 @@ public class Regex {
             if (rc == -2) { this.Overflow(at); }
             if (rc < 0) { break; }
         }
-        if (outPos < len) {
-            sb.Append(NativeMemory.GetString(run.inputPtr, outPos, len - outPos));
+        int tail = len - outPos;
+        if (tail > 0) {
+            if (outLen + tail > cap) {
+                int ncap = outLen + tail;
+                byte[] nb = new byte[ncap];
+                if (outLen > 0) { NativeMemory.Copy((nint)nb, (nint)outBuf, outLen); }
+                outBuf = nb;
+            }
+            NativeMemory.Copy((nint)outBuf + outLen, inPtr + outPos, tail);
+            outLen = outLen + tail;
         }
-        return sb.ToString();
+        return NativeMemory.GetString((nint)outBuf, 0, outLen);
     }
 
     // 零 Match / 零临时 StringBuilder 直接把替换串展开写入目标 sb。

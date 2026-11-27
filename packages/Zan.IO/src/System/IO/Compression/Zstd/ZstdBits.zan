@@ -1,3 +1,6 @@
+using System;
+using System.Numerics;
+
 namespace System.IO.Compression;
 
 // zstd 用到的两种位流读取器。
@@ -13,12 +16,8 @@ namespace System.IO.Compression;
 public class ZstdBits {
     // 返回 floor(log2(v))（v 必须 ≥ 1）。
     public static int HighBit(int v) {
-        int r = 0;
-        while (v > 1) {
-            v = v >> 1;
-            r = r + 1;
-        }
-        return r;
+        if (v <= 1) { return 0; }
+        return 31 - BitOperations.LeadingZeroCount((uint)v);
     }
 
     // 把 v 的低 bits 位反转（bits ≤ 32）。
@@ -32,7 +31,7 @@ public class ZstdBits {
     }
 }
 
-// 反向位流读取器（FSE 码流 / Huffman 码流）。
+// 反向位流读取器（FSE 码流 / Huffman 码流，64 位左对齐累加器）。
 //
 // 读序：从**最后一个字节**开始往前；每个字节内从 bit7 读到 bit0。
 // **先读到的位是结果值的最高位**。
@@ -43,29 +42,62 @@ public class ZstdBits {
 public class ZstdBackBits {
     byte[] data;
     int start;
-    int end;
+    int bytePos; // 下一个待载入的字节下标（从 end-2 递减至 start）
     int total;   // 可读的总位数
     int cur;     // 已读位数
-    int p;       // 最后一个字节里结束标记所在的位号
+    ulong bitBuf;
+    int bitCount;
     bool bad;    // 区间非法（空区间，或末字节为 0——没有结束标记）
 
     // 建立读取器，区间为 data[start, end)。
     public ZstdBackBits(byte[] src, int start, int end) {
         this.data = src;
         this.start = start;
-        this.end = end;
+        this.bytePos = start - 1;
         this.total = 0;
         this.cur = 0;
-        this.p = 0;
+        this.bitBuf = 0UL;
+        this.bitCount = 0;
         this.bad = true;
         if (end > start && end <= src.Length && start >= 0) {
             int last = src[end - 1] & 255;
             if (last != 0) {
-                this.p = ZstdBits.HighBit(last);
-                this.total = this.p + (end - start - 1) * 8;
+                int p = ZstdBits.HighBit(last);
+                this.total = p + (end - start - 1) * 8;
                 this.bad = false;
+                this.bytePos = end - 2;
+                if (p > 0) {
+                    this.bitBuf = ((ulong)(last & ((1 << p) - 1))) << (64 - p);
+                    this.bitCount = p;
+                }
+                this.Refill();
             }
         }
+    }
+
+    public void Refill() {
+        byte[] d = this.data;
+        int st = this.start;
+        int bp = this.bytePos;
+        int bc = this.bitCount;
+        ulong bb = this.bitBuf;
+        while (bc <= 32 && bp - 3 >= st) {
+            ulong w = (((ulong)(d[bp] & 255)) << 24)
+                | (((ulong)(d[bp - 1] & 255)) << 16)
+                | (((ulong)(d[bp - 2] & 255)) << 8)
+                | ((ulong)(d[bp - 3] & 255));
+            bb = bb | (w << (32 - bc));
+            bc = bc + 32;
+            bp = bp - 4;
+        }
+        while (bc <= 56 && bp >= st) {
+            bb = bb | (((ulong)(d[bp] & 255)) << (56 - bc));
+            bc = bc + 8;
+            bp = bp - 1;
+        }
+        this.bytePos = bp;
+        this.bitCount = bc;
+        this.bitBuf = bb;
     }
 
     // 区间非法（无法作为码流读取）。
@@ -86,92 +118,117 @@ public class ZstdBackBits {
     // 窥视接下来的 n 位（不推进游标）。n ≤ 32。
     public int Peek(int n) {
         if (n <= 0) { return 0; }
-        int val = 0;
-        int left = n;
-        int i = this.cur;
-        // 第一段：最后一个字节里、结束标记下面的那几位（高位先读）。
-        if (i < this.p) {
-            int take = this.p - i;
-            if (take > left) { take = left; }
-            int b = this.data[this.end - 1] & 255;
-            // 先读到的位是 b 的 (p-1-i) 号位，它就是结果值的最高位
-            int part = (b >> (this.p - i - take)) & ((1 << take) - 1);
-            val = part;
-            i = i + take;
-            left = left - take;
+        if (this.bitCount < n && this.bytePos >= this.start) {
+            this.Refill();
         }
-        // 后续：整字节（高位先读 = 字节的自然顺序）。
-        int j = i - this.p;
-        while (left > 0) {
-            int idx = this.end - 2 - (j >> 3);
-            int b = 0;
-            if (idx >= this.start) { b = this.data[idx] & 255; }
-            int off = j & 7;
-            int avail = 8 - off;
-            int take = left < avail ? left : avail;
-            // 读到的位是本字节的 (7-off) 号位往下 take 位，高位在前
-            int part = (b >> (8 - off - take)) & ((1 << take) - 1);
-            val = (val << take) | part;
-            j = j + take;
-            left = left - take;
-        }
-        return val;
+        return (int)(this.bitBuf >> (64 - n));
     }
 
     // 跳过 n 位。
     public void Skip(int n) {
+        if (n <= 0) { return; }
+        if (this.bitCount < n && this.bytePos >= this.start) {
+            this.Refill();
+        }
         this.cur = this.cur + n;
+        if (n < this.bitCount) {
+            this.bitBuf = this.bitBuf << n;
+            this.bitCount = this.bitCount - n;
+        } else {
+            this.bitBuf = 0UL;
+            this.bitCount = 0;
+        }
     }
 
     // 读 n 位（先读到的位是最高位）。
     public int Read(int n) {
-        int v = this.Peek(n);
+        if (n <= 0) { return 0; }
+        if (this.bitCount < n && this.bytePos >= this.start) {
+            this.Refill();
+        }
+        int v = (int)(this.bitBuf >> (64 - n));
         this.cur = this.cur + n;
+        if (n < this.bitCount) {
+            this.bitBuf = this.bitBuf << n;
+            this.bitCount = this.bitCount - n;
+        } else {
+            this.bitBuf = 0UL;
+            this.bitCount = 0;
+        }
         return v;
     }
 }
 
-// 正向位流读取器（FSE 表描述）。
+// 正向位流读取器（FSE 表描述，64 位右对齐累加器）。
 //
 // 读序：从区间开头往后；每个字节内**低位先读**；先读到的位是结果值的
 // **最低位**。
 public class ZstdFwdBits {
     byte[] data;
-    int pos;
+    int bytePos;
     int end;
     int bit;   // 已读的绝对位偏移
+    ulong bitBuf;
+    int bitCount;
 
     // 建立读取器，区间为 data[start, end)。
     public ZstdFwdBits(byte[] src, int start, int end) {
         this.data = src;
-        this.pos = start;
+        this.bytePos = start;
         this.end = end;
         this.bit = 0;
+        this.bitBuf = 0UL;
+        this.bitCount = 0;
+        this.Refill();
+    }
+
+    void Refill() {
+        byte[] d = this.data;
+        int e = this.end;
+        int bp = this.bytePos;
+        int bc = this.bitCount;
+        ulong bb = this.bitBuf;
+        while (bc <= 56 && bp < e) {
+            if (bp >= 0) {
+                bb = bb | (((ulong)(d[bp] & 255)) << bc);
+            }
+            bc = bc + 8;
+            bp = bp + 1;
+        }
+        this.bytePos = bp;
+        this.bitCount = bc;
+        this.bitBuf = bb;
     }
 
     // 窥视接下来的 n 位（不推进游标）。n ≤ 24。
     public int Peek(int n) {
-        int val = 0;
-        for (int i = 0; i < n; i = i + 1) {
-            int idx = this.pos + ((this.bit + i) >> 3);
-            int b = 0;
-            if (idx < this.end && idx >= 0) {
-                b = (this.data[idx] >> ((this.bit + i) & 7)) & 1;
-            }
-            val = val | (b << i);
+        if (n <= 0) { return 0; }
+        if (this.bitCount < n && this.bytePos < this.end) {
+            this.Refill();
         }
-        return val;
+        return (int)(this.bitBuf & ((1UL << n) - 1UL));
     }
 
     // 跳过 n 位。
     public void Skip(int n) {
+        if (n <= 0) { return; }
+        if (this.bitCount < n && this.bytePos < this.end) {
+            this.Refill();
+        }
         this.bit = this.bit + n;
+        if (n < this.bitCount) {
+            this.bitBuf = this.bitBuf >> n;
+            this.bitCount = this.bitCount - n;
+        } else {
+            this.bitBuf = 0UL;
+            this.bitCount = 0;
+        }
     }
 
     // 读 n 位（先读到的位是最低位）。
     public int Read(int n) {
         int v = this.Peek(n);
-        this.bit = this.bit + n;
+        this.Skip(n);
         return v;
     }
 

@@ -114,10 +114,10 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         cpu_surface_round(s, x, y, w, h, radius, corners, fill, border, thickness);
         return;
     }
-    zgl_target *t = (s->id >= 0 && s->id < 64) ? &g_zgl_targets[s->id] : zgl_target_of(s);
-    int fast_blend = (t && t->opaque_dst);
-    if (!fast_blend && g_zgl.count) zgl_flush();
-    int kind = fast_blend ? ZGL_K_SURFACE_FAST : ZGL_K_SURFACE;
+    /* Opaque targets use hardware ZGL_MODE_BLEND directly; transparent targets
+     * automatically route through uStraightOver in zgl_alloc_quad/zgl_flush
+     * for exact straight-alpha compositing. */
+    int kind = ZGL_K_SURFACE_FAST;
     float x0 = (float)x, y0 = (float)y;
     float x1 = (float)(x + w), y1 = (float)(y + h);
     float cx0, cy0, cx1, cy1;
@@ -140,7 +140,6 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         v[30] = cx0; v[31] = cy0; v[32] = cx1; v[33] = cy1;
         v[34] = 0.0f; v[35] = 0.0f; v[36] = 0.0f; v[37] = 0.0f;
     }
-    if (!fast_blend) zgl_flush();
 }
 
 static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,

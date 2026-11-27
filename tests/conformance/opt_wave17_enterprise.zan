@@ -1,0 +1,381 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.Html;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Http.Http2;
+using System.Data;
+using System.Data.Excel;
+using System.Data.Postgres;
+using System.Security.Cryptography;
+using Net.Ssh;
+using Messaging.Kafka;
+using Web3.Types;
+using Web3.Encoding;
+
+class Program {
+    static bool BytesEq(byte[] a, byte[] b) {
+        if (a == null || b == null) { return a == b; }
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    static bool Near(double a, double b, double eps) {
+        double d = a - b;
+        if (d < 0.0) { d = -d; }
+        return d <= eps;
+    }
+
+    static void TestCompression() {
+        // 预期原文: "Wave17 enterprise codec test! " * 25 + bytes(0..63) (814 B)
+        string unit = "Wave17 enterprise codec test! ";
+        byte[] expected = new byte[814];
+        int p = 0;
+        for (int r = 0; r < 25; r = r + 1) {
+            for (int j = 0; j < unit.Length; j = j + 1) {
+                expected[p] = (byte)(unit[j] & 255);
+                p = p + 1;
+            }
+        }
+        for (int i = 0; i < 64; i = i + 1) {
+            expected[p] = (byte)i;
+            p = p + 1;
+        }
+
+        string zstdHex = "28b52ffd602e023d0300e40557617665313720656e746572707269736520636f64656320746573742120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f0100360b957202";
+        byte[] zstdIn = Hex.Decode(zstdHex, zstdHex.Length);
+        byte[] zstdOut = Zstd.Decompress(zstdIn);
+        if (!BytesEq(zstdOut, expected)) { throw new Exception("zstd mismatch"); }
+
+        string bz2Hex = "425a6839314159265359b07c040f000083fb807fffffffffffffff80802e21dd003000b582150c861061308681a301304d3230800008520d32190623231189a61320609a311a00d01155004c4d308681a1a30262326464d0686046f533915abd8b24da28bb772e986debf8309c7a18b1a2964ca9a8ae6596200007b8800f01001ec2003f44007512c32d36e3af6b7e08628f64888800ed966ddbc810019f0d14d5c38f2e7d803fba1068a0c641da83b906083b5063a0d91060832906da0c541820c641dc83110781060832d06083bc5dc914e14242c1f0103c";
+        byte[] bz2In = Hex.Decode(bz2Hex, bz2Hex.Length);
+        byte[] bz2Out = BZip2.Decompress(bz2In);
+        if (!BytesEq(bz2Out, expected)) { throw new Exception("bzip2 mismatch"); }
+
+        Console.WriteLine("compression=OK");
+    }
+
+    static void TestHttp2HeaderBlock() {
+        Http2HeaderBlock blk = new Http2HeaderBlock(2048);
+
+        // 单帧 END_HEADERS 快路径
+        byte[] p1 = new byte[64];
+        for (int i = 0; i < 64; i = i + 1) { p1[i] = (byte)(i + 1); }
+        Http2Frame f1 = new Http2Frame();
+        f1.type = Http2FrameType.HEADERS;
+        f1.flags = Http2Flags.END_HEADERS;
+        f1.streamId = 1;
+        f1.length = 64;
+        byte[] got1 = blk.Accept(f1, p1);
+        if (!BytesEq(got1, p1)) { throw new Exception("h2 single frame mismatch"); }
+
+        // 多帧 HEADERS + CONTINUATION + CONTINUATION(END_HEADERS) 跨扩容拼装
+        byte[] c0 = new byte[300];
+        byte[] c1 = new byte[400];
+        byte[] c2 = new byte[350];
+        for (int i = 0; i < 300; i = i + 1) { c0[i] = (byte)(i & 255); }
+        for (int i = 0; i < 400; i = i + 1) { c1[i] = (byte)((i + 50) & 255); }
+        for (int i = 0; i < 350; i = i + 1) { c2[i] = (byte)((i + 100) & 255); }
+
+        Http2Frame fh = new Http2Frame();
+        fh.type = Http2FrameType.HEADERS;
+        fh.flags = 0;
+        fh.streamId = 3;
+        fh.length = 300;
+        if (blk.Accept(fh, c0) != null) { throw new Exception("h2 expected null 1"); }
+
+        Http2Frame fc1 = new Http2Frame();
+        fc1.type = Http2FrameType.CONTINUATION;
+        fc1.flags = 0;
+        fc1.streamId = 3;
+        fc1.length = 400;
+        if (blk.Accept(fc1, c1) != null) { throw new Exception("h2 expected null 2"); }
+
+        Http2Frame fc2 = new Http2Frame();
+        fc2.type = Http2FrameType.CONTINUATION;
+        fc2.flags = Http2Flags.END_HEADERS;
+        fc2.streamId = 3;
+        fc2.length = 350;
+        byte[] got2 = blk.Accept(fc2, c2);
+        if (got2 == null || got2.Length != 1050) { throw new Exception("h2 multi len"); }
+        for (int i = 0; i < 300; i = i + 1) { if (got2[i] != c0[i]) { throw new Exception("h2 c0"); } }
+        for (int i = 0; i < 400; i = i + 1) { if (got2[300 + i] != c1[i]) { throw new Exception("h2 c1"); } }
+        for (int i = 0; i < 350; i = i + 1) { if (got2[700 + i] != c2[i]) { throw new Exception("h2 c2"); } }
+
+        Console.WriteLine("http2=OK");
+    }
+
+    static async int RunDownloadServer(int port, byte[] resp) {
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", port);
+        Socket.Listen(listener, 8);
+        nint cli = await Socket.AcceptAsync(listener);
+        await Socket.ReadReady(cli);
+        string _req = Socket.Receive(cli, 4096);
+        string payload = NativeMemory.GetString((nint)resp, 0, resp.Length);
+        int _w = await Socket.SendAsync(cli, payload, resp.Length);
+        Socket.Close(cli);
+        Socket.Close(listener);
+        return 1;
+    }
+
+    static async int TestHttpDownload() {
+        Socket.Initialize();
+        // 构造超过 4096B 的响应体，首包将响应头与 body 同写，验证 chunked header + trailing body 零拷贝交接
+        byte[] body = new byte[6000];
+        for (int i = 0; i < 6000; i = i + 1) { body[i] = (byte)((i * 29 + 7) & 255); }
+        string hdr = "HTTP/1.1 200 OK\r\nContent-Length: 6000\r\nConnection: close\r\n\r\n";
+        byte[] resp = new byte[hdr.Length + 6000];
+        for (int i = 0; i < hdr.Length; i = i + 1) { resp[i] = (byte)(hdr[i] & 255); }
+        NativeMemory.Copy((nint)resp + hdr.Length, (nint)body, 6000);
+
+        int port = 19577;
+        Task.Spawn(RunDownloadServer(port, resp));
+        await Task.Delay(50);
+
+        string outFile = "opt_wave17_dl_19577.bin";
+        string progFile = "opt_wave17_dl_19577.prog";
+        if (File.Exists(outFile)) { File.Delete(outFile); }
+        if (File.Exists(progFile)) { File.Delete(progFile); }
+
+        HttpClient client = new HttpClient("127.0.0.1", port);
+        client.SetTimeout(5000);
+        long written = await client.DownloadBinaryToFileAsync("/payload.bin", outFile, progFile);
+        client.Close();
+        await Task.Delay(20);
+        if (written != 6000L) {
+            if (File.Exists(outFile)) { File.Delete(outFile); }
+            if (File.Exists(progFile)) { File.Delete(progFile); }
+            throw new Exception("http download failed: written=" + Convert.ToString(written) + " err=" + client.LastDownloadError());
+        }
+
+        byte[] disk = File.ReadAllBytes(outFile);
+        if (File.Exists(outFile)) { File.Delete(outFile); }
+        if (File.Exists(progFile)) { File.Delete(progFile); }
+
+        if (!BytesEq(disk, body)) {
+            throw new Exception("http download body mismatch");
+        }
+        Console.WriteLine("http_files=OK");
+        return 0;
+    }
+
+    static void TestSshKafkaXlsxPg() {
+        // SSH PacketLayer 加密往返 + 缓存 GCM ctx
+        BlockingQueue<byte[]> q = new BlockingQueue<byte[]>();
+        SshMemoryPipe pipe = new SshMemoryPipe(q, q);
+        SshPacketLayer pkt = new SshPacketLayer(pipe);
+        byte[] key = new byte[32];
+        byte[] iv = new byte[12];
+        for (int i = 0; i < 32; i = i + 1) { key[i] = (byte)(i * 3 + 1); }
+        for (int i = 0; i < 12; i = i + 1) { iv[i] = (byte)(i + 50); }
+        SshCipherState enc = new SshCipherState(); enc.Init(key, iv);
+        SshCipherState dec = new SshCipherState(); dec.Init(key, iv);
+        pkt.outCipher = enc;
+        pkt.inCipher = dec;
+        int[] lens = new int[4];
+        lens[0] = 5; lens[1] = 17; lens[2] = 256; lens[3] = 4096;
+        for (int k = 0; k < 4; k = k + 1) {
+            byte[] m = new byte[lens[k]];
+            for (int i = 0; i < m.Length; i = i + 1) { m[i] = (byte)((i * 19 + k) & 255); }
+            pkt.Send(m);
+            byte[] got = pkt.Recv();
+            if (!BytesEq(got, m)) { throw new Exception("ssh roundtrip"); }
+        }
+
+        // Kafka RecordBatch 零头 & 带头双路径
+        List<KafkaRecord> recs = new List<KafkaRecord>();
+        KafkaRecord r0 = new KafkaRecord("k0", "val-no-headers");
+        r0.timestamp = 1700000001000L;
+        recs.Add(r0);
+        KafkaRecord r1 = new KafkaRecord("k1", "val-with-headers");
+        r1.timestamp = 1700000002000L;
+        r1.headers["trace-id"] = "abc-123";
+        r1.headers["region"] = "cn";
+        recs.Add(r1);
+        byte[] batch = KafkaRecord.BuildRecordBatch(100L, recs);
+        List<KafkaRecord> parsed = KafkaRecord.ParseRecordBatch(batch, 0, batch.Length);
+        if (parsed.Count != 2 || parsed[0].key != "k0" || parsed[0].value != "val-no-headers"
+                || parsed[0].offset != 100L || parsed[1].offset != 101L
+                || parsed[1].headers == null || parsed[1].headers["trace-id"] != "abc-123"
+                || parsed[1].headers["region"] != "cn") {
+            throw new Exception("kafka roundtrip");
+        }
+
+        // Xlsx 数值最短化与列标
+        if (Xlsx.RealToText(0.0) != "0" || Xlsx.RealToText(-0.0) != "0"
+                || Xlsx.RealToText(42.0) != "42" || Xlsx.RealToText(-3.25) != "-3.25"
+                || Xlsx.RealToText(0.125) != "0.125"
+                || Xlsx.ColRef(0) != "A" || Xlsx.ColRef(25) != "Z"
+                || Xlsx.ColRef(26) != "AA" || Xlsx.ColRef(701) != "ZZ"
+                || Xlsx.ColRef(702) != "AAA") {
+            throw new Exception("xlsx format");
+        }
+        double piSample = 3.14159265358979;
+        string piTxt = Xlsx.RealToText(piSample);
+        if (piTxt != "3.14159265358979") { throw new Exception("xlsx pi: " + piTxt); }
+
+        // PgWire PBKDF2-SHA256 与标准测试向量 (password="password", salt="salt", c=4096) 对拍
+        byte[] salt = "salt".ToBytes();
+        byte[] dkPg = PgWire.pbkdf2Sha256("password", salt, salt.Length, 4096);
+        string dkHex = Hex.Encode(dkPg, 32);
+        if (dkHex != "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a") {
+            throw new Exception("pg pbkdf2 mismatch: " + dkHex);
+        }
+        byte[] x1 = PgWire.xor32(dkPg, dkPg);
+        for (int i = 0; i < 32; i = i + 1) {
+            if (x1[i] != 0) { throw new Exception("pg xor32"); }
+        }
+
+        Console.WriteLine("proto_db=OK");
+    }
+
+    static void TestUnicodeRegexHtml() {
+        // UnicodeNormalization: ASCII / CJK 快路径 + 组合记号重排 + NFC/NFD 往返
+        if (UnicodeNormalization.Normalize("Hello ASCII 123!", NormalizationForm.FormC) != "Hello ASCII 123!") {
+            throw new Exception("unicode ascii");
+        }
+        string cjk = "中文性能优化测试";
+        if (UnicodeNormalization.Normalize(cjk, NormalizationForm.FormC) != cjk) {
+            throw new Exception("unicode cjk");
+        }
+        // e + U+0301 -> U+00E9 (é)
+        string decompE = "e\u0301";
+        string nfcE = UnicodeNormalization.Normalize(decompE, NormalizationForm.FormC);
+        if (nfcE != "\u00e9") { throw new Exception("unicode nfc e"); }
+        string nfdE = UnicodeNormalization.Normalize(nfcE, NormalizationForm.FormD);
+        if (nfdE != decompE) { throw new Exception("unicode nfd e"); }
+        // 规范重排: a + U+0301 (CCC 230) + U+0323 (CCC 220) -> a + U+0323 + U+0301
+        string rawOrder = "a\u0301\u0323";
+        string normOrder = UnicodeNormalization.Normalize(rawOrder, NormalizationForm.FormD);
+        if (normOrder != "a\u0323\u0301") { throw new Exception("unicode ccc reorder"); }
+
+        // Regex.Replace: 预编译模板 ($1, ${2}, $$)
+        Regex rx = new Regex("([a-z]+)=([0-9]+)");
+        string r1 = rx.Replace("a=10, b=20!", "${2}:$1($$)");
+        if (r1 != "10:a($), 20:b($)!") { throw new Exception("regex rep1: " + r1); }
+        string r2 = rx.Replace("no match here", "$1");
+        if (r2 != "no match here") { throw new Exception("regex nomatch"); }
+
+        // HtmlNode.HasClass + CssSelector (FindFirst 早停 + 属性/伪类/兄弟 O(1))
+        string html = "<div id=\"root\"><ul class=\"nav main-nav\"><li id=\"i1\" class=\"item active\" data-lang=\"en-US\" data-tags=\"foo bar\">One</li><li id=\"i2\" class=\"item\" data-lang=\"zh\">Two</li><li id=\"i3\" class=\"item last\">Three</li></ul><p id=\"p0\"></p></div>";
+        HtmlDocument doc = HtmlParser.Parse(html);
+        HtmlNode firstItem = CssSelector.Find(doc.root, "ul.nav > li.item:first-child");
+        if (firstItem == null || !firstItem.HasClass("active") || firstItem.HasClass("act")
+                || firstItem.Get("id", "") != "i1") {
+            throw new Exception("css first-child");
+        }
+        List<HtmlNode> lastItems = CssSelector.Query(doc.root, "li.item:last-child");
+        if (lastItems.Count != 1 || lastItems[0].Get("id", "") != "i3") {
+            throw new Exception("css last-child");
+        }
+        List<HtmlNode> langEn = CssSelector.Query(doc.root, "li[data-lang|=\"en\"][data-tags~=\"bar\"]");
+        if (langEn.Count != 1 || langEn[0].Get("id", "") != "i1") {
+            throw new Exception("css attr |= and ~=");
+        }
+        List<HtmlNode> adj = CssSelector.Query(doc.root, "li.active + li.item");
+        if (adj.Count != 1 || adj[0].Get("id", "") != "i2") {
+            throw new Exception("css adjacent sibling");
+        }
+        List<HtmlNode> empties = CssSelector.Query(doc.root, "p:empty");
+        if (empties.Count != 1 || empties[0].Get("id", "") != "p0") {
+            throw new Exception("css empty");
+        }
+
+        Console.WriteLine("text_html=OK");
+    }
+
+    static void TestDataFrameWeb3() {
+        // DataFrame Pivot / Crosstab / Merge (Int & Str) / DataFrameStats
+        DataFrame df = DataFrame.FromCsv("dept,qtr,rev,id\neng,Q1,10.0,1\neng,Q1,20.0,2\neng,Q2,30.0,3\nsales,Q1,40.0,4\nsales,Q2,50.0,5\n");
+        DataFrame pSum = Pivot.PivotTable(df, "dept", "qtr", "rev", Agg.Sum);
+        if (pSum.Rows() != 2 || !Near(pSum.GetFloat(0, 1), 30.0, 1e-9)
+                || !Near(pSum.GetFloat(0, 2), 30.0, 1e-9)
+                || !Near(pSum.GetFloat(1, 1), 40.0, 1e-9)
+                || !Near(pSum.GetFloat(1, 2), 50.0, 1e-9)) {
+            throw new Exception("pivot sum");
+        }
+        DataFrame pAvg = Pivot.PivotTable(df, "dept", "qtr", "rev", Agg.Avg);
+        if (!Near(pAvg.GetFloat(0, 1), 15.0, 1e-9)) { throw new Exception("pivot avg"); }
+        DataFrame ct = Pivot.Crosstab(df, "dept", "qtr");
+        if (ct.GetInt(0, 1) != 2L || ct.GetInt(1, 2) != 1L) { throw new Exception("crosstab"); }
+
+        DataFrame right = DataFrame.FromCsv("id,bonus\n1,100\n3,300\n5,500\n6,600\n");
+        DataFrame inner = Merge.MergeTables(df, right, "id", "id", MergeKind.Inner);
+        if (inner.Rows() != 3 || inner.GetInt(0, 4) != 100L || inner.GetInt(2, 4) != 500L) {
+            throw new Exception("merge inner int");
+        }
+        DataFrame outer = Merge.MergeTables(df, right, "id", "id", MergeKind.Outer);
+        if (outer.Rows() != 6) { throw new Exception("merge outer int"); }
+
+        // DataFrameStats: Column 返回独立副本（改副本不影响原表）+ 只读统计零拷贝
+        List<double> colCopy = DataFrameStats.Column(df, "rev");
+        colCopy[0] = 99999.0;
+        if (!Near(DataFrameStats.Mean(df, "rev"), 30.0, 1e-9)
+                || !Near(DataFrameStats.Median(df, "rev"), 30.0, 1e-9)
+                || !Near(DataFrameStats.Correlation(df, "rev", "id"), 1.0, 1e-9)) {
+            throw new Exception("dataframe stats");
+        }
+
+        // Web3 RLP + ABI
+        List<RlpItem> list = new List<RlpItem>();
+        list.Add(RlpItem.FromLong(0L));
+        list.Add(RlpItem.FromLong(1024L));
+        list.Add(RlpItem.FromString("cat"));
+        byte[] encRlp = Rlp.Encode(RlpItem.FromList(list));
+        // expected: c8 80 82 04 00 83 63 61 74
+        if (Hex.Encode(encRlp, encRlp.Length) != "c88082040083636174") {
+            throw new Exception("rlp encode: " + Hex.Encode(encRlp, encRlp.Length));
+        }
+
+        byte[] rawAddr = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) { rawAddr[i] = (byte)(0x10 + i); }
+        Address addr = new Address(rawAddr);
+        byte[] amtBytes = new byte[4];
+        amtBytes[0] = 0x00; amtBytes[1] = 0x0f; amtBytes[2] = 0x42; amtBytes[3] = 0x40; // 1000000
+        BigInt amt = BigInt.FromBytesBE(amtBytes, 4);
+        byte[] xfer = Abi.EncodeErc20Transfer(addr, amt);
+        if (xfer.Length != 68 || (xfer[0] & 255) != 0xa9 || (xfer[1] & 255) != 0x05
+                || (xfer[2] & 255) != 0x9c || (xfer[3] & 255) != 0xbb) {
+            throw new Exception("abi transfer selector");
+        }
+        Address decAddr = Abi.DecodeAddress(xfer, 4);
+        BigInt decAmt = Abi.DecodeUint256(xfer, 36);
+        byte[] decAmtBe = decAmt.ToBytesBE(4);
+        if (!BytesEq(decAddr.ToBytes(), rawAddr) || !BytesEq(decAmtBe, amtBytes)) {
+            throw new Exception("abi transfer decode");
+        }
+        byte[] bal = Abi.EncodeErc20BalanceOf(addr);
+        if (bal.Length != 36 || (bal[0] & 255) != 0x70 || (bal[1] & 255) != 0xa0
+                || (bal[2] & 255) != 0x82 || (bal[3] & 255) != 0x31) {
+            throw new Exception("abi balanceOf");
+        }
+
+        Console.WriteLine("df_web3=OK");
+    }
+
+    static async int RunAll() {
+        TestCompression();
+        TestHttp2HeaderBlock();
+        int _dl = await TestHttpDownload();
+        TestSshKafkaXlsxPg();
+        TestUnicodeRegexHtml();
+        TestDataFrameWeb3();
+        Console.WriteLine("WAVE17_ALL_OK");
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Program.RunAll();
+    }
+}

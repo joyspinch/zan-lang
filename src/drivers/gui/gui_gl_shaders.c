@@ -59,6 +59,7 @@ ZGL_FS_COMMON
 "uniform sampler2D uAtlas2;\n"
 "uniform sampler2D uAtlas1;\n"
 "uniform sampler2D uAtlas4;\n"
+"uniform int uStraightOver;\n"
 "vec4 over(vec4 src) {\n"
 "    vec4 dst = texelFetch(uDestination, ivec2(gl_FragCoord.xy), 0);\n"
 "    vec4 s = floor(clamp(src, 0.0, 1.0)*255.0 + 0.0001);\n"
@@ -72,10 +73,10 @@ ZGL_FS_COMMON
 "#if ZGL_DUAL_SOURCE\n"
 "layout(location = 0, index = 0) out vec4 o_color;\n"
 "layout(location = 0, index = 1) out vec4 o_cov;\n"
-"void zemit(vec4 c) { o_color = c; o_cov = vec4(c.a); }\n"
+"void zemit(vec4 c) { vec4 r = (uStraightOver != 0) ? over(c) : c; o_color = r; o_cov = vec4(r.a); }\n"
 "#else\n"
 "out vec4 o_color;\n"
-"void zemit(vec4 c) { o_color = c; }\n"
+"void zemit(vec4 c) { o_color = (uStraightOver != 0) ? over(c) : c; }\n"
 "#endif\n"
 "float sd_round(vec2 p, vec2 half_, float r, int mask) {\n"
 "    float rr = r;\n"
@@ -106,6 +107,7 @@ ZGL_FS_COMMON
 "        if (tcov.r + tcov.g + tcov.b <= 0.0) discard;\n"
 "        vec3 c = tcov * v_col0.a;\n"
 "        float ca = max(max(c.r, c.g), c.b);\n"
+"        if (uStraightOver != 0) { zemit(vec4(v_col0.rgb, ca)); return; }\n"
 "#if ZGL_DUAL_SOURCE\n"
 "        o_color = vec4(v_col0.rgb, ca);\n"
 "        o_cov = vec4(c, ca);\n"
@@ -197,7 +199,7 @@ ZGL_FS_COMMON
 "        float alpha = fill + border;\n"
 "        if (alpha <= 0.0) discard;\n"
 "        vec4 src = vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha);\n"
-"        zemit((kind == 8) ? over(src) : src);\n"
+"        zemit((kind == 8 && uStraightOver == 0) ? over(src) : src);\n"
 "        return;\n"
 "    } else if (kind == 10) {\n"
 "        col = ((v_kind.y > 0.5) ? texture(uAtlas4, v_uv) : texture(uAtlas2, v_uv)) * v_col0;\n"
@@ -263,7 +265,7 @@ ZGL_FS_COMMON
 "    if (cov <= 0.0) discard;\n"
 "    vec4 res = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
 "                                             : vec4(col.rgb, col.a * cov);\n"
-"    if (kind == 7) res = over(res);\n"
+"    if (kind == 7 && uStraightOver == 0) res = over(res);\n"
 "    zemit(res);\n"
 "}\n";
 
@@ -507,6 +509,7 @@ static int zgl_init(void) {
     g_zgl.u_atlas2 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas2");
     g_zgl.u_atlas1 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas1");
     g_zgl.u_atlas4 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas4");
+    g_zgl.u_straight_over = gl.GetUniformLocation(g_zgl.prog_shape, "uStraightOver");
 
     /* Bind constant sampler texture units once for the lifetime of each program. */
     gl.UseProgram(g_zgl.prog_shape);
@@ -515,6 +518,8 @@ static int zgl_init(void) {
     if (g_zgl.u_atlas2 >= 0) gl.Uniform1i(g_zgl.u_atlas2, 2);
     if (g_zgl.u_atlas1 >= 0) gl.Uniform1i(g_zgl.u_atlas1, 3);
     if (g_zgl.u_atlas4 >= 0) gl.Uniform1i(g_zgl.u_atlas4, 4);
+    if (g_zgl.u_straight_over >= 0) gl.Uniform1i(g_zgl.u_straight_over, 0);
+    g_zgl.st_straight_over = 0;
     if (g_zgl.prog_blur && g_zgl.u_blur_tex >= 0) {
         gl.UseProgram(g_zgl.prog_blur);
         gl.Uniform1i(g_zgl.u_blur_tex, 0);

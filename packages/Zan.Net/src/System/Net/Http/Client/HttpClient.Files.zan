@@ -612,27 +612,41 @@ public partial class HttpClient {
 
         // 头部是 ASCII，逐字节读到 CRLFCRLF 为止——这样正文的第一个
         // 字节仍留在连接里，不会和头部一起被读进字符串。
-        string one = HttpClient.NewBuffer(2);
+        string headChunk = HttpClient.NewBuffer(4097);
         StringBuilder head = new StringBuilder();
         int seen = 0;
         int hlen = 0;
+        int extraStart = 0;
+        int extraLen = 0;
         bool endOfHead = false;
         bool closed = false;
         int lastHeadGot = 0;
         while (!endOfHead && !closed && hlen < 262144) {
+            int want = 4096;
+            int remHead = 262144 - hlen;
+            if (remHead < want) { want = remHead; }
             int got;
-            if (this.useTls) { got = await stream.RecvIntoAsync(one, 1); }
-            else { got = await Socket.RecvIntoAsync(conn.Sock(), one, 1); }
+            if (this.useTls) { got = await stream.RecvIntoAsync(headChunk, want); }
+            else { got = await Socket.RecvIntoAsync(conn.Sock(), headChunk, want); }
             lastHeadGot = got;
             if (got <= 0) { closed = true; }
             else {
-                int c = one[0] & 255;
-                head.Append(one.Substring(0, 1));
-                hlen = hlen + 1;
-                if (c == 13 && (seen == 0 || seen == 2)) { seen = seen + 1; }
-                else if (c == 10 && (seen == 1 || seen == 3)) { seen = seen + 1; }
-                else { seen = 0; }
-                if (seen == 4) { endOfHead = true; }
+                int headPart = got;
+                for (int i = 0; i < got; i = i + 1) {
+                    int c = headChunk[i] & 255;
+                    if (c == 13 && (seen == 0 || seen == 2)) { seen = seen + 1; }
+                    else if (c == 10 && (seen == 1 || seen == 3)) { seen = seen + 1; }
+                    else { seen = (c == 13) ? 1 : 0; }
+                    if (seen == 4) {
+                        headPart = i + 1;
+                        extraStart = i + 1;
+                        extraLen = got - headPart;
+                        endOfHead = true;
+                        break;
+                    }
+                }
+                head.Append(headChunk.Substring(0, headPart));
+                hlen = hlen + headPart;
                 HttpDeadline.Touch(watch, this.IdleBudget());
             }
         }
@@ -782,7 +796,11 @@ public partial class HttpClient {
         long lastReportMs = 0;
         while (!finished) {
             int n;
-            if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
+            if (extraLen > 0) {
+                NativeMemory.Copy((nint)buf, (nint)headChunk + (nint)extraStart, extraLen);
+                n = extraLen;
+                extraLen = 0;
+            } else if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
             else { n = await Socket.RecvIntoAsync(conn.Sock(), buf, 65536); }
             lastBodyN = n;
             if (n <= 0) { finished = true; }

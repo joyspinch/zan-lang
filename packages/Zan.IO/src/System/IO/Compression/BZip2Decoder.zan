@@ -19,6 +19,8 @@ public class BZip2Decoder {
     static int MaxGroups = 6;
     static int MaxCodeLen = 23;
     static int GroupSize = 50;
+    static int FastBits = 8;
+    static int FastSize = 256;
     static int[] sharedCrcTable = null;
 
     // ---- 输入（文件或内存）----
@@ -27,7 +29,7 @@ public class BZip2Decoder {
     int inLen;
     int inPos;
     byte[] memSrc;
-    int bitBuf;
+    ulong bitBuf;
     int bitCnt;
     bool inEof;
 
@@ -50,6 +52,7 @@ public class BZip2Decoder {
     int[] baseTab;  // 同上
     int[] perm;  // MaxGroups * MaxAlphaSize
     int[] minLens;
+    int[] fastLut;  // MaxGroups * FastSize: (bitLen << 16) | sym，0 表示长码回退
     int[] crcTable;
     int blockCrc;
     int combinedCrc;
@@ -60,11 +63,11 @@ public class BZip2Decoder {
     public BZip2Decoder() {
         this.fp = 0;
         this.ofp = 0;
-        this.inBuf = new byte[65536];
+        this.inBuf = null;
         this.inLen = 0;
         this.inPos = 0;
         this.memSrc = null;
-        this.bitBuf = 0;
+        this.bitBuf = 0UL;
         this.bitCnt = 0;
         this.inEof = false;
         this.outBuf = new byte[262144];
@@ -84,6 +87,7 @@ public class BZip2Decoder {
         this.baseTab = new int[MaxGroups * (MaxCodeLen + 2)];
         this.perm = new int[MaxGroups * MaxAlphaSize];
         this.minLens = new int[MaxGroups];
+        this.fastLut = new int[MaxGroups * FastSize];
         this.tt = null;
         if (BZip2Decoder.sharedCrcTable == null) {
             BZip2Decoder.sharedCrcTable = BZip2Decoder.BuildCrcTable();
@@ -144,21 +148,44 @@ public class BZip2Decoder {
         return b;
     }
 
+    // 批量填满 64 位位缓冲（至多 56 位）。
+    void RefillBits() {
+        byte[] buf = this.inBuf;
+        int ip = this.inPos;
+        int il = this.inLen;
+        ulong bb = this.bitBuf;
+        int bc = this.bitCnt;
+        while (bc <= 56) {
+            if (ip >= il) {
+                this.inPos = ip;
+                this.bitBuf = bb;
+                this.bitCnt = bc;
+                if (!this.Refill()) { return; }
+                buf = this.inBuf;
+                ip = this.inPos;
+                il = this.inLen;
+            }
+            bb = (bb << 8) | (ulong)(buf[ip] & 255);
+            ip = ip + 1;
+            bc = bc + 8;
+        }
+        this.inPos = ip;
+        this.bitBuf = bb;
+        this.bitCnt = bc;
+    }
+
     // 读取 n（1..24）位；输入耗尽返回 -1。
     int GetBits(int n) {
-        while (this.bitCnt < n) {
-            int b = this.NextByte();
-            if (b < 0) {
+        if (this.bitCnt < n) {
+            this.RefillBits();
+            if (this.bitCnt < n) {
                 this.failed = true;
                 return -1;
             }
-            this.bitBuf = (this.bitBuf << 8) | b;
-            this.bitCnt = this.bitCnt + 8;
         }
         int shift = this.bitCnt - n;
-        int v = (this.bitBuf >> shift) & ((1 << n) - 1);
+        int v = (int)((this.bitBuf >> shift) & ((1UL << n) - 1UL));
         this.bitCnt = shift;
-        this.bitBuf = this.bitBuf & ((1 << shift) - 1);
         return v;
     }
 
@@ -213,9 +240,10 @@ public class BZip2Decoder {
         this.inPos = 0;
         this.memOut = new List<byte[]>();
         if (!this.Decode()) { return null; }
-        // 拼接输出块。
+        // 拼接输出块（单块零拷贝直返）。
         long total = this.outTotal;
         if (total > 2147483000) { return null; }  // 内存模式上限
+        if (this.memOut.Count == 1) { return this.memOut[0]; }
         byte[] all = new byte[(int)total];
         int pos = 0;
         for (int i = 0; i < this.memOut.Count; i = i + 1) {
@@ -231,6 +259,7 @@ public class BZip2Decoder {
     // 流式解压 srcPath 到 dstPath；源或目标打不开、解码失败时
     // 返回 false（目标文件可能已写出部分内容）。
     public bool RunFile(string srcPath, string dstPath) {
+        this.inBuf = new byte[65536];
         this.fp = BZip2Decoder.PlatFopen(srcPath, "rb");
         if (this.fp == 0) { return false; }
         this.ofp = BZip2Decoder.PlatFopen(dstPath, "wb");
@@ -363,7 +392,7 @@ public class BZip2Decoder {
             if (!this.BuildDecodeTables(t, alphaSize)) { return false; }
         }
 
-        // --- MTF / RLE2 解码，产出 BWT 后的块 ---
+        // --- MTF / RLE2 解码（内联位缓冲与 8-bit 前缀直查，消除逐符号方法调用与 ref 寻址）---
         int eob = alphaSize - 1;
         for (int i = 0; i < 256; i = i + 1) { this.unzftab[i] = 0; }
         for (int i = 0; i < nInUse; i = i + 1) { this.mtf[i] = this.seqToUnseq[i]; }
@@ -371,84 +400,163 @@ public class BZip2Decoder {
         int groupNo = -1;
         int groupPos = 0;
         int gSel = 0;
+        int fbase = 0;
         int runLen = 0;
         int runBit = 0;
-        int sym = this.NextSymbol(ref groupNo, ref groupPos, ref gSel, nSelectors);
-        if (sym < 0) { return false; }
-        while (sym != eob) {
+        int[] ttArr = this.tt;
+        byte[] mtfArr = this.mtf;
+        int[] unzf = this.unzftab;
+        int[] selArr = this.selector;
+        int[] lut = this.fastLut;
+        byte[] ibuf = this.inBuf;
+        int ipos = this.inPos;
+        int ilen = this.inLen;
+        ulong bbuf = this.bitBuf;
+        int bcnt = this.bitCnt;
+        while (true) {
+            if (groupPos == 0) {
+                groupNo = groupNo + 1;
+                if (groupNo >= nSelectors) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    return false;
+                }
+                groupPos = GroupSize;
+                gSel = selArr[groupNo];
+                fbase = gSel * FastSize;
+            }
+            groupPos = groupPos - 1;
+            if (bcnt < FastBits) {
+                while (bcnt <= 56 && ipos < ilen) {
+                    bbuf = (bbuf << 8) | (ulong)(ibuf[ipos] & 255);
+                    ipos = ipos + 1;
+                    bcnt = bcnt + 8;
+                }
+                if (bcnt < FastBits && this.fp != 0) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    this.RefillBits();
+                    bbuf = this.bitBuf; bcnt = this.bitCnt; ipos = this.inPos; ilen = this.inLen;
+                }
+            }
+            int sym = -1;
+            if (bcnt >= FastBits) {
+                int peek = (int)((bbuf >> (bcnt - FastBits)) & 255UL);
+                int entry = lut[fbase + peek];
+                if (entry != 0) {
+                    bcnt = bcnt - (entry >> 16);
+                    sym = entry & 65535;
+                }
+            }
+            if (sym < 0) {
+                this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                sym = this.DecodeSlowSymbol(gSel);
+                bbuf = this.bitBuf; bcnt = this.bitCnt; ipos = this.inPos; ilen = this.inLen;
+                if (sym < 0) { return false; }
+            }
+            if (sym == eob) { break; }
             if (sym == 0 || sym == 1) {
                 // RUNA / RUNB：二进制增量编码的重复次数。
                 runLen = runLen + ((sym + 1) << runBit);
                 runBit = runBit + 1;
-                if (runBit > 30) { return false; }
+                if (runBit > 30) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    return false;
+                }
             } else {
                 if (runLen > 0) {
-                    int ch = this.mtf[0] & 255;
-                    if (nblock + runLen > blockSize) { return false; }
-                    this.unzftab[ch] = this.unzftab[ch] + runLen;
-                    for (int k = 0; k < runLen; k = k + 1) {
-                        this.tt[nblock + k] = ch;
+                    int ch = mtfArr[0] & 255;
+                    int need = nblock + runLen;
+                    if (need > blockSize) {
+                        this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                        return false;
                     }
-                    nblock = nblock + runLen;
+                    unzf[ch] = unzf[ch] + runLen;
+                    for (int k = 0; k < runLen; k = k + 1) {
+                        ttArr[nblock + k] = ch;
+                    }
+                    nblock = need;
                     runLen = 0;
                     runBit = 0;
                 }
                 // sym-1 为 MTF 列表中的位置。
                 int j = sym - 1;
-                if (j >= nInUse) { return false; }
-                byte tmp = this.mtf[j];
-                while (j > 0) {
-                    this.mtf[j] = this.mtf[j - 1];
-                    j = j - 1;
+                if (j >= nInUse) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    return false;
                 }
-                this.mtf[0] = tmp;
+                byte tmp = mtfArr[j];
+                if (j >= 16) {
+                    NativeMemory.Copy((nint)mtfArr + 1, (nint)mtfArr, j);
+                } else {
+                    while (j > 0) {
+                        mtfArr[j] = mtfArr[j - 1];
+                        j = j - 1;
+                    }
+                }
+                mtfArr[0] = tmp;
                 int ch2 = tmp & 255;
-                if (nblock >= blockSize) { return false; }
-                this.unzftab[ch2] = this.unzftab[ch2] + 1;
-                this.tt[nblock] = ch2;
+                if (nblock >= blockSize) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    return false;
+                }
+                unzf[ch2] = unzf[ch2] + 1;
+                ttArr[nblock] = ch2;
                 nblock = nblock + 1;
             }
-            sym = this.NextSymbol(ref groupNo, ref groupPos, ref gSel, nSelectors);
-            if (sym < 0) { return false; }
         }
+        this.bitBuf = bbuf;
+        this.bitCnt = bcnt;
+        this.inPos = ipos;
         if (runLen > 0) {
-            int ch = this.mtf[0] & 255;
-            if (nblock + runLen > blockSize) { return false; }
-            this.unzftab[ch] = this.unzftab[ch] + runLen;
+            int ch = mtfArr[0] & 255;
+            int need = nblock + runLen;
+            if (need > blockSize) { return false; }
+            unzf[ch] = unzf[ch] + runLen;
             for (int k = 0; k < runLen; k = k + 1) {
-                this.tt[nblock + k] = ch;
+                ttArr[nblock + k] = ch;
             }
-            nblock = nblock + runLen;
+            nblock = need;
         }
         if (nblock == 0 || origPtr >= nblock) { return false; }
 
         // --- 逆 BWT：把后继指针塞进 tt 的高位 ---
-        this.cftab[0] = 0;
-        for (int i = 0; i < 256; i = i + 1) { this.cftab[i + 1] = this.unzftab[i]; }
-        for (int i = 1; i < 257; i = i + 1) { this.cftab[i] = this.cftab[i] + this.cftab[i - 1]; }
+        int[] cf = this.cftab;
+        cf[0] = 0;
+        for (int i = 0; i < 256; i = i + 1) { cf[i + 1] = this.unzftab[i]; }
+        for (int i = 1; i < 257; i = i + 1) { cf[i] = cf[i] + cf[i - 1]; }
         for (int i = 0; i < nblock; i = i + 1) {
-            int ch = this.tt[i] & 255;
-            int p = this.cftab[ch];
-            this.tt[p] = this.tt[p] | (i << 8);
-            this.cftab[ch] = p + 1;
+            int ch = ttArr[i] & 255;
+            int p = cf[ch];
+            ttArr[p] = ttArr[p] | (i << 8);
+            cf[ch] = p + 1;
         }
 
-        // --- RLE1 解码 + CRC ---
-        this.blockCrc = -1;  // 0xFFFFFFFF
-        int tPos = this.tt[origPtr] >> 8;
+        // --- RLE1 解码 + CRC（局部变量化消除每字节方法调用与字段读写）---
+        int crc = -1;  // 0xFFFFFFFF
+        int[] crcTab = this.crcTable;
+        byte[] obuf = this.outBuf;
+        int obufLen = obuf.Length;
+        int opos = this.outPos;
+        int tPos = ttArr[origPtr] >> 8;
         int left = nblock;
         int prev = -1;
         int runCount = 0;
         while (left > 0) {
-            tPos = this.tt[tPos];
+            tPos = ttArr[tPos];
             int ch = tPos & 255;
             tPos = tPos >> 8;
             left = left - 1;
             if (runCount == 4) {
                 // 该字节是额外重复的次数（0..251）。
+                byte pb = (byte)(prev & 255);
                 for (int k = 0; k < ch; k = k + 1) {
-                    this.CrcUpdate(prev);
-                    this.Emit(prev);
+                    crc = (crc << 8) ^ crcTab[((crc >> 24) ^ prev) & 255];
+                    obuf[opos] = pb;
+                    opos = opos + 1;
+                    if (opos == obufLen) {
+                        this.outPos = opos;
+                        this.FlushOut();
+                        opos = 0;
+                    }
                 }
                 runCount = 0;
                 prev = -1;
@@ -460,20 +568,30 @@ public class BZip2Decoder {
                 runCount = 1;
                 prev = ch;
             }
-            this.CrcUpdate(ch);
-            this.Emit(ch);
+            crc = (crc << 8) ^ crcTab[((crc >> 24) ^ ch) & 255];
+            obuf[opos] = (byte)ch;
+            opos = opos + 1;
+            if (opos == obufLen) {
+                this.outPos = opos;
+                this.FlushOut();
+                opos = 0;
+            }
         }
-        int got = (this.blockCrc ^ -1);
+        this.outPos = opos;
+        this.blockCrc = crc;
+        int got = (crc ^ -1);
         if (got != wantCrc) { return false; }
         this.combinedCrc = ((this.combinedCrc << 1) | ((this.combinedCrc >> 31) & 1))
             ^ got;
         return !this.failed;
     }
 
-    // bzip2 的 hbCreateDecodeTables：为一个组构建 limit/base/perm。
+    // bzip2 的 hbCreateDecodeTables：为一个组构建 limit/base/perm 与 9-bit 前缀直查表。
     bool BuildDecodeTables(int t, int alphaSize) {
         int lbase = t * (MaxCodeLen + 2);
         int lenBase = t * MaxAlphaSize;
+        int pbase = t * MaxAlphaSize;
+        int fbase = t * FastSize;
         int minLen = 32;
         int maxLen = 0;
         for (int i = 0; i < alphaSize; i = i + 1) {
@@ -487,7 +605,7 @@ public class BZip2Decoder {
         for (int l = minLen; l <= maxLen; l = l + 1) {
             for (int i = 0; i < alphaSize; i = i + 1) {
                 if (this.len[lenBase + i] == l) {
-                    this.perm[t * MaxAlphaSize + pp] = i;
+                    this.perm[pbase + pp] = i;
                     pp = pp + 1;
                 }
             }
@@ -496,6 +614,7 @@ public class BZip2Decoder {
             this.limit[lbase + i] = 0;
             this.baseTab[lbase + i] = 0;
         }
+        NativeMemory.Fill((nint)this.fastLut + fbase * 4, 0, FastSize * 4);
         int[] cnt = new int[MaxCodeLen + 2];
         for (int i = 0; i < alphaSize; i = i + 1) {
             cnt[this.len[lenBase + i] + 1] = cnt[this.len[lenBase + i] + 1] + 1;
@@ -507,8 +626,25 @@ public class BZip2Decoder {
             this.baseTab[lbase + i] = cnt[i];
         }
         int vec = 0;
+        int pp2 = 0;
         for (int l = minLen; l <= maxLen; l = l + 1) {
-            vec = vec + (this.baseTab[lbase + l + 1] - this.baseTab[lbase + l]);
+            int countL = cnt[l + 1] - cnt[l];
+            if (l <= FastBits && countL > 0) {
+                int shift = FastBits - l;
+                int span = 1 << shift;
+                int lenTag = l << 16;
+                for (int k = 0; k < countL; k = k + 1) {
+                    int entry = lenTag | this.perm[pbase + pp2];
+                    int slot = (vec + k) << shift;
+                    for (int m = 0; m < span; m = m + 1) {
+                        this.fastLut[fbase + slot + m] = entry;
+                    }
+                    pp2 = pp2 + 1;
+                }
+            } else {
+                pp2 = pp2 + countL;
+            }
+            vec = vec + countL;
             this.limit[lbase + l] = vec - 1;
             vec = vec << 1;
         }
@@ -519,15 +655,8 @@ public class BZip2Decoder {
         return true;
     }
 
-    // 取下一个 MTF 符号；每 50 个符号换一次 Huffman 表。
-    int NextSymbol(ref int groupNo, ref int groupPos, ref int gSel, int nSelectors) {
-        if (groupPos == 0) {
-            groupNo = groupNo + 1;
-            if (groupNo >= nSelectors) { return -1; }
-            groupPos = GroupSize;
-            gSel = this.selector[groupNo];
-        }
-        groupPos = groupPos - 1;
+    // 长码（> 9 bit）或流尾剩余位不足 9 bit 时的标准 canonical Huffman 解码回退。
+    int DecodeSlowSymbol(int gSel) {
         int lbase = gSel * (MaxCodeLen + 2);
         int zn = this.minLens[gSel];
         int zvec = this.GetBits(zn);

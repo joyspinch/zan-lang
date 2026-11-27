@@ -9,12 +9,15 @@ public class CssAttr {
     public string name;
     // 操作符：""（存在）、"="、"~="、"|="、"^="、"$="、"*="。
     public string op;
+    // 预解码操作符枚举：0=存在, 1==, 2=~=, 3=|=, 4=^=, 5=$=, 6=*=。
+    public int opKind;
     // 比较值。
     public string value;
 
     public CssAttr() {
         this.name = "";
         this.op = "";
+        this.opKind = 0;
         this.value = "";
     }
 }
@@ -23,6 +26,8 @@ public class CssAttr {
 public class CssPseudo {
     // 伪类名（小写）。
     public string name;
+    // 预解码伪类枚举：1=first-child, 2=last-child, 3=only-child, 4=empty, 5=root, 6=not, 7=nth-child/nth-of-type。
+    public int kind;
     // 括号里的参数（":not(.x)" 的 ".x"、":nth-child(2n+1)" 的 "2n+1"）。
     public string arg;
     // 不支持/解析不了 → 永不匹配。
@@ -35,6 +40,7 @@ public class CssPseudo {
 
     public CssPseudo() {
         this.name = "";
+        this.kind = 0;
         this.arg = "";
         this.unsupported = false;
         this.notCompound = null;
@@ -114,28 +120,89 @@ public class CssSelector {
         p.pos = 0;
         List<CssComplex> list = p.ParseList();
         List<HtmlNode> hits = new List<HtmlNode>();
-        p.Collect(scope, list, hits);
+        bool needCount = CssSelector.ListNeedsElemCount(list);
+        p.Collect(scope, list, hits, needCount);
         return hits;
     }
 
-    // 在 scope 的子树里查第一个（没有返回 null）。
+    // 在 scope 的子树里查第一个（命中即刻早退，不扫描剩余节点）。
     public static HtmlNode Find(HtmlNode scope, string selector) {
-        List<HtmlNode> hits = CssSelector.Query(scope, selector);
-        if (hits.Count == 0) { return null; }
-        return hits[0];
+        if (scope == null) { return null; }
+        CssSelector p = new CssSelector();
+        p.src = selector == null ? "" : selector;
+        p.pos = 0;
+        List<CssComplex> list = p.ParseList();
+        bool needCount = CssSelector.ListNeedsElemCount(list);
+        return p.FindFirst(scope, list, needCount);
     }
 
-    void Collect(HtmlNode scope, List<CssComplex> list, List<HtmlNode> hits) {
-        if (scope.childList == null) { return; }
-        for (int i = 0; i < scope.childList.Count; i = i + 1) {
-            HtmlNode c = scope.childList[i];
-            if (c.IsElement()) {
-                for (int k = 0; k < list.Count; k = k + 1) {
-                    if (CssSelector.MatchComplex(c, list[k])) { hits.Add(c); break; }
-                }
-                this.Collect(c, list, hits);
+    private static bool ListNeedsElemCount(List<CssComplex> list) {
+        for (int k = 0; k < list.Count; k = k + 1) {
+            List<CssCompound> comps = list[k].compounds;
+            if (comps.Count == 0) { continue; }
+            List<CssPseudo> ps = comps[comps.Count - 1].pseudos;
+            for (int j = 0; j < ps.Count; j = j + 1) {
+                int pk = ps[j].kind;
+                if (pk == 2 || pk == 3) { return true; }
             }
         }
+        return false;
+    }
+
+    void Collect(HtmlNode scope, List<CssComplex> list, List<HtmlNode> hits, bool needCount) {
+        List<HtmlNode> children = scope.childList;
+        if (children == null) { return; }
+        int cnt = children.Count;
+        int elemTotal = -1;
+        if (needCount) {
+            elemTotal = 0;
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (children[i].IsElement()) { elemTotal = elemTotal + 1; }
+            }
+        }
+        int elemIdx = 0;
+        int listCnt = list.Count;
+        for (int i = 0; i < cnt; i = i + 1) {
+            HtmlNode c = children[i];
+            if (c.IsElement()) {
+                for (int k = 0; k < listCnt; k = k + 1) {
+                    if (CssSelector.MatchComplexAt(c, list[k], elemIdx, elemTotal)) { hits.Add(c); break; }
+                }
+                elemIdx = elemIdx + 1;
+                if (c.childList != null && c.childList.Count > 0) {
+                    this.Collect(c, list, hits, needCount);
+                }
+            }
+        }
+    }
+
+    HtmlNode FindFirst(HtmlNode scope, List<CssComplex> list, bool needCount) {
+        List<HtmlNode> children = scope.childList;
+        if (children == null) { return null; }
+        int cnt = children.Count;
+        int elemTotal = -1;
+        if (needCount) {
+            elemTotal = 0;
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (children[i].IsElement()) { elemTotal = elemTotal + 1; }
+            }
+        }
+        int elemIdx = 0;
+        int listCnt = list.Count;
+        for (int i = 0; i < cnt; i = i + 1) {
+            HtmlNode c = children[i];
+            if (c.IsElement()) {
+                for (int k = 0; k < listCnt; k = k + 1) {
+                    if (CssSelector.MatchComplexAt(c, list[k], elemIdx, elemTotal)) { return c; }
+                }
+                elemIdx = elemIdx + 1;
+                if (c.childList != null && c.childList.Count > 0) {
+                    HtmlNode found = this.FindFirst(c, list, needCount);
+                    if (found != null) { return found; }
+                }
+            }
+        }
+        return null;
     }
 
     // ---- 解析 ----
@@ -261,21 +328,23 @@ public class CssSelector {
         int c = this.src[this.pos] & 255;
         if (c == 93) { this.pos = this.pos + 1; return a; }   // ']'
         string op = "";
+        int opKind = 0;
         if (c == 61) {
-            op = "=";
+            op = "="; opKind = 1;
             this.pos = this.pos + 1;
         } else if (c == 126 || c == 124 || c == 94 || c == 36 || c == 42) {
-            if (c == 126) { op = "~="; }
-            else if (c == 124) { op = "|="; }
-            else if (c == 94) { op = "^="; }
-            else if (c == 36) { op = "$="; }
-            else { op = "*="; }
+            if (c == 126) { op = "~="; opKind = 2; }
+            else if (c == 124) { op = "|="; opKind = 3; }
+            else if (c == 94) { op = "^="; opKind = 4; }
+            else if (c == 36) { op = "$="; opKind = 5; }
+            else { op = "*="; opKind = 6; }
             this.pos = this.pos + 1;
             if (this.pos < this.src.Length && (this.src[this.pos] & 255) == 61) { this.pos = this.pos + 1; }
         } else {
             return a;
         }
         a.op = op;
+        a.opKind = opKind;
         this.SkipSpace();
         if (this.pos < this.src.Length) {
             int q = this.src[this.pos] & 255;
@@ -330,16 +399,19 @@ public class CssSelector {
             CssCompound sc = sub.ParseCompound();
             if (sub.pos < sub.src.Length) { p.unsupported = true; return p; }
             p.notCompound = sc;
+            p.kind = 6;
             return p;
         }
         if (p.name == "nth-child" || p.name == "nth-of-type") {
             if (!CssSelector.ParseNth(p.arg, p)) { p.unsupported = true; }
+            else { p.kind = 7; }
             return p;
         }
-        if (p.name == "first-child" || p.name == "last-child" || p.name == "only-child"
-            || p.name == "empty" || p.name == "root") {
-            return p;
-        }
+        if (p.name == "first-child") { p.kind = 1; return p; }
+        if (p.name == "last-child") { p.kind = 2; return p; }
+        if (p.name == "only-child") { p.kind = 3; return p; }
+        if (p.name == "empty") { p.kind = 4; return p; }
+        if (p.name == "root") { p.kind = 5; return p; }
         p.unsupported = true;
         return p;
     }
@@ -410,9 +482,13 @@ public class CssSelector {
     // ---- 匹配 ----
 
     static bool MatchComplex(HtmlNode node, CssComplex cx) {
+        return CssSelector.MatchComplexAt(node, cx, -1, -1);
+    }
+
+    static bool MatchComplexAt(HtmlNode node, CssComplex cx, int elemIdx, int elemTotal) {
         int n = cx.compounds.Count;
         if (n == 0) { return false; }
-        if (!CssSelector.MatchCompound(node, cx.compounds[n - 1])) { return false; }
+        if (!CssSelector.MatchCompoundAt(node, cx.compounds[n - 1], elemIdx, elemTotal)) { return false; }
         return CssSelector.MatchChain(node, cx, n - 2);
     }
 
@@ -452,6 +528,10 @@ public class CssSelector {
     }
 
     static bool MatchCompound(HtmlNode node, CssCompound c) {
+        return CssSelector.MatchCompoundAt(node, c, -1, -1);
+    }
+
+    static bool MatchCompoundAt(HtmlNode node, CssCompound c, int elemIdx, int elemTotal) {
         if (c.unsupported) { return false; }
         if (c.tag.Length > 0 && c.tag != "*") {
             if (node.tag != c.tag) { return false; }
@@ -459,14 +539,17 @@ public class CssSelector {
         if (c.id.Length > 0) {
             if (node.Get("id", "") != c.id) { return false; }
         }
-        for (int i = 0; i < c.classes.Count; i = i + 1) {
+        int clsCnt = c.classes.Count;
+        for (int i = 0; i < clsCnt; i = i + 1) {
             if (!node.HasClass(c.classes[i])) { return false; }
         }
-        for (int i = 0; i < c.attrs.Count; i = i + 1) {
+        int attrCnt = c.attrs.Count;
+        for (int i = 0; i < attrCnt; i = i + 1) {
             if (!CssSelector.MatchAttr(node, c.attrs[i])) { return false; }
         }
-        for (int i = 0; i < c.pseudos.Count; i = i + 1) {
-            if (!CssSelector.MatchPseudo(node, c.pseudos[i])) { return false; }
+        int psCnt = c.pseudos.Count;
+        for (int i = 0; i < psCnt; i = i + 1) {
+            if (!CssSelector.MatchPseudoAt(node, c.pseudos[i], elemIdx, elemTotal)) { return false; }
         }
         return true;
     }
@@ -494,45 +577,71 @@ public class CssSelector {
         if (node.attrsMap == null) { return false; }
         string v;
         if (!node.attrsMap.TryGetValue(a.name, out v)) { return false; }
-        if (a.op.Length == 0) { return true; }
-        if (a.op == "=") { return v == a.value; }
-        if (a.op == "~=") { return CssSelector.ContainsWord(v, a.value); }
-        if (a.op == "|=") { return v == a.value || CssSelector.StartsWithDash(v, a.value); }
-        if (a.op == "^=") { return a.value.Length > 0 && v.StartsWith(a.value); }
-        if (a.op == "$=") { return a.value.Length > 0 && v.EndsWith(a.value); }
-        if (a.op == "*=") { return a.value.Length > 0 && v.Contains(a.value); }
+        int k = a.opKind;
+        if (k == 0) { return true; }
+        if (k == 1) { return v == a.value; }
+        if (k == 2) { return CssSelector.ContainsWord(v, a.value); }
+        if (k == 3) { return v == a.value || CssSelector.StartsWithDash(v, a.value); }
+        if (k == 4) { return a.value.Length > 0 && v.StartsWith(a.value); }
+        if (k == 5) { return a.value.Length > 0 && v.EndsWith(a.value); }
+        if (k == 6) { return a.value.Length > 0 && v.Contains(a.value); }
         return false;
     }
 
-    static bool MatchPseudo(HtmlNode node, CssPseudo p) {
+    static bool MatchPseudoAt(HtmlNode node, CssPseudo p, int elemIdx, int elemTotal) {
         if (p.unsupported) { return false; }
-        if (p.name == "first-child") {
-            return node.Parent() != null && CssSelector.ElementIndex(node) == 0;
+        int pk = p.kind;
+        if (pk == 1) {
+            // :first-child
+            if (node.Parent() == null) { return false; }
+            if (elemIdx >= 0) { return elemIdx == 0; }
+            return !CssSelector.HasPrevElementSibling(node);
         }
-        if (p.name == "last-child") {
-            return node.Parent() != null
-                && CssSelector.ElementIndex(node) == CssSelector.ElementCount(node) - 1;
+        if (pk == 2) {
+            // :last-child
+            if (node.Parent() == null) { return false; }
+            if (elemIdx >= 0 && elemTotal >= 0) { return elemIdx == elemTotal - 1; }
+            return !CssSelector.HasNextElementSibling(node);
         }
-        if (p.name == "only-child") {
-            return node.Parent() != null
-                && CssSelector.ElementIndex(node) == 0
-                && CssSelector.ElementCount(node) == 1;
+        if (pk == 3) {
+            // :only-child
+            if (node.Parent() == null) { return false; }
+            if (elemIdx >= 0 && elemTotal >= 0) { return elemIdx == 0 && elemTotal == 1; }
+            return !CssSelector.HasPrevElementSibling(node) && !CssSelector.HasNextElementSibling(node);
         }
-        if (p.name == "empty") { return node.childList == null || node.childList.Count == 0; }
-        if (p.name == "root") { return node.ElementAncestorCount() == 0; }
-        if (p.name == "not") { return !CssSelector.MatchSimple(node, p.notCompound); }
-        if (p.name == "nth-child" || p.name == "nth-of-type") {
-            return CssSelector.MatchNth(node, p.nthA, p.nthB);
+        if (pk == 4) { return node.childList == null || node.childList.Count == 0; }
+        if (pk == 5) { return node.ElementAncestorCount() == 0; }
+        if (pk == 6) { return !CssSelector.MatchSimple(node, p.notCompound); }
+        if (pk == 7) {
+            int idx1 = (elemIdx >= 0 ? elemIdx : CssSelector.ElementIndex(node)) + 1;
+            int a = p.nthA;
+            int b = p.nthB;
+            if (a == 0) { return idx1 == b; }
+            if (a > 0) { return idx1 >= b && (idx1 - b) % a == 0; }
+            return idx1 <= b && (b - idx1) % (-a) == 0;
         }
         return false;
     }
 
-    // an+b 是否命中（序号从 1 起，只数元素兄弟）。
-    static bool MatchNth(HtmlNode node, int a, int b) {
-        int index = CssSelector.ElementIndex(node) + 1;
-        if (a == 0) { return index == b; }
-        if (a > 0) { return index >= b && (index - b) % a == 0; }
-        return index <= b && (b - index) % (-a) == 0;
+    static bool HasPrevElementSibling(HtmlNode node) {
+        HtmlNode parent = node.Parent();
+        if (parent == null || parent.childList == null) { return false; }
+        int limit = node.index;
+        if (limit > parent.childList.Count) { limit = parent.childList.Count; }
+        for (int i = limit - 1; i >= 0; i = i - 1) {
+            if (parent.childList[i].IsElement()) { return true; }
+        }
+        return false;
+    }
+
+    static bool HasNextElementSibling(HtmlNode node) {
+        HtmlNode parent = node.Parent();
+        if (parent == null || parent.childList == null) { return false; }
+        int cnt = parent.childList.Count;
+        for (int i = node.index + 1; i < cnt; i = i + 1) {
+            if (parent.childList[i].IsElement()) { return true; }
+        }
+        return false;
     }
 
     // 前面有多少个元素兄弟。
@@ -548,35 +657,39 @@ public class CssSelector {
         return n;
     }
 
-    // 一共有多少个元素兄弟。
-    static int ElementCount(HtmlNode node) {
-        HtmlNode parent = node.Parent();
-        if (parent == null || parent.childList == null) { return 0; }
-        int n = 0;
-        for (int i = 0; i < parent.childList.Count; i = i + 1) {
-            if (parent.childList[i].IsElement()) { n = n + 1; }
-        }
-        return n;
-    }
-
-    // 值里是否含有整个单词（空白分隔）。
+    // 值里是否含有整个单词（空白分隔，原地字节比对零 Substring 分配）。
     static bool ContainsWord(string v, string word) {
         if (word == null || word.Length == 0) { return false; }
         int n = v.Length;
+        int wl = word.Length;
+        if (n < wl) { return false; }
         int i = 0;
         while (i < n) {
             while (i < n && HtmlUtil.IsSpace(v[i] & 255)) { i = i + 1; }
             int start = i;
             while (i < n && !HtmlUtil.IsSpace(v[i] & 255)) { i = i + 1; }
-            if (i - start == word.Length && v.Substring(start, i - start) == word) { return true; }
+            if (i - start == wl) {
+                bool eq = true;
+                for (int k = 0; k < wl; k = k + 1) {
+                    if ((v[start + k] & 255) != (word[k] & 255)) { eq = false; break; }
+                }
+                if (eq) { return true; }
+            }
         }
         return false;
     }
 
-    // 值等于 word 或以 "word-" 开头。
+    // 值等于 word 或以 "word-" 开头（零拼接分配）。
     static bool StartsWithDash(string v, string word) {
         if (word == null || word.Length == 0) { return false; }
-        if (v == word) { return true; }
-        return v.StartsWith(word + "-");
+        int wl = word.Length;
+        int vl = v.Length;
+        if (vl < wl) { return false; }
+        if (vl == wl) { return v == word; }
+        if ((v[wl] & 255) != 45) { return false; }
+        for (int i = 0; i < wl; i = i + 1) {
+            if ((v[i] & 255) != (word[i] & 255)) { return false; }
+        }
+        return true;
     }
 }

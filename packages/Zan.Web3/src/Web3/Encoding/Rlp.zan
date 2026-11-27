@@ -40,21 +40,17 @@ public class RlpItem {
         if (value == 0) {
             return new RlpItem(new byte[0]);
         }
-        // 计算无前导零的大端序字节
-        byte[] tmp = new byte[8];
-        int count = 0;
-        for (int i = 7; i >= 0; i = i - 1) {
-            tmp[i] = (byte)(value & 255);
-            value = (long)((ulong)value >> 8);
+        ulong u = (ulong)value;
+        int len = 1;
+        ulong t = u >> 8;
+        while (t != 0UL) {
+            len = len + 1;
+            t = t >> 8;
         }
-        int start = 0;
-        while (start < 8 && tmp[start] == 0) {
-            start = start + 1;
-        }
-        int len = 8 - start;
         byte[] b = new byte[len];
-        for (int i = 0; i < len; i = i + 1) {
-            b[i] = tmp[start + i];
+        for (int i = len - 1; i >= 0; i = i - 1) {
+            b[i] = (byte)(u & 255UL);
+            u = u >> 8;
         }
         return new RlpItem(b);
     }
@@ -67,25 +63,92 @@ public class RlpItem {
 // 以太坊黄皮书标准的 RLP (Recursive Length Prefix) 编解码器。
 public class Rlp {
 
-    // 辅助函数：将长度值转为大端序字节数组（无前导零）
-    private static byte[] toBigEndianLen(int length) {
-        if (length == 0) { return new byte[0]; }
-        byte[] tmp = new byte[4];
-        tmp[0] = (byte)((length >> 24) & 255);
-        tmp[1] = (byte)((length >> 16) & 255);
-        tmp[2] = (byte)((length >> 8) & 255);
-        tmp[3] = (byte)(length & 255);
+    private static int BigEndianLenSize(int length) {
+        if (length <= 0xFF) { return 1; }
+        if (length <= 0xFFFF) { return 2; }
+        if (length <= 0xFFFFFF) { return 3; }
+        return 4;
+    }
 
-        int start = 0;
-        while (start < 4 && tmp[start] == 0) {
-            start = start + 1;
+    private static int WriteBigEndianLen(byte[] dst, int pos, int length, int lenOfLen) {
+        for (int i = lenOfLen - 1; i >= 0; i = i - 1) {
+            dst[pos + i] = (byte)(length & 255);
+            length = length >> 8;
         }
-        int len = 4 - start;
-        byte[] res = new byte[len];
-        for (int i = 0; i < len; i = i + 1) {
-            res[i] = tmp[start + i];
+        return pos + lenOfLen;
+    }
+
+    private static int MeasureItem(RlpItem item) {
+        if (item == null) { return 1; }
+        if (item.Type == RlpType.Bytes) {
+            byte[] b = item.RawBytes;
+            if (b == null || b.Length == 0) { return 1; }
+            int blen = b.Length;
+            if (blen == 1 && (b[0] & 255) <= 0x7f) { return 1; }
+            if (blen <= 55) { return 1 + blen; }
+            return 1 + BigEndianLenSize(blen) + blen;
         }
-        return res;
+        int payloadLen = 0;
+        List<RlpItem> items = item.Items;
+        if (items != null) {
+            int cnt = items.Count;
+            for (int i = 0; i < cnt; i = i + 1) {
+                payloadLen = payloadLen + MeasureItem(items[i]);
+            }
+        }
+        if (payloadLen <= 55) { return 1 + payloadLen; }
+        return 1 + BigEndianLenSize(payloadLen) + payloadLen;
+    }
+
+    private static int WriteItem(RlpItem item, byte[] dst, int pos) {
+        if (item == null) {
+            dst[pos] = 0x80;
+            return pos + 1;
+        }
+        if (item.Type == RlpType.Bytes) {
+            byte[] b = item.RawBytes;
+            if (b == null || b.Length == 0) {
+                dst[pos] = 0x80;
+                return pos + 1;
+            }
+            int blen = b.Length;
+            if (blen == 1 && (b[0] & 255) <= 0x7f) {
+                dst[pos] = b[0];
+                return pos + 1;
+            }
+            if (blen <= 55) {
+                dst[pos] = (byte)(0x80 + blen);
+                pos = pos + 1;
+            } else {
+                int lol = BigEndianLenSize(blen);
+                dst[pos] = (byte)(0xb7 + lol);
+                pos = WriteBigEndianLen(dst, pos + 1, blen, lol);
+            }
+            if (blen >= 16) {
+                NativeMemory.Copy((nint)dst + pos, (nint)b, blen);
+            } else {
+                for (int i = 0; i < blen; i = i + 1) { dst[pos + i] = b[i]; }
+            }
+            return pos + blen;
+        }
+        int payloadLen = 0;
+        List<RlpItem> items = item.Items;
+        int cnt = items != null ? items.Count : 0;
+        for (int i = 0; i < cnt; i = i + 1) {
+            payloadLen = payloadLen + MeasureItem(items[i]);
+        }
+        if (payloadLen <= 55) {
+            dst[pos] = (byte)(0xc0 + payloadLen);
+            pos = pos + 1;
+        } else {
+            int lol = BigEndianLenSize(payloadLen);
+            dst[pos] = (byte)(0xf7 + lol);
+            pos = WriteBigEndianLen(dst, pos + 1, payloadLen, lol);
+        }
+        for (int i = 0; i < cnt; i = i + 1) {
+            pos = WriteItem(items[i], dst, pos);
+        }
+        return pos;
     }
 
     // 编码原始字节串
@@ -95,35 +158,27 @@ public class Rlp {
             empty[0] = 0x80;
             return empty;
         }
-
-        // 单字节且在 [0x00, 0x7f] 范围内直接返回本身
-        if (bytes.Length == 1 && (bytes[0] & 255) <= 0x7f) {
+        int blen = bytes.Length;
+        if (blen == 1 && (bytes[0] & 255) <= 0x7f) {
             byte[] single = new byte[1];
             single[0] = bytes[0];
             return single;
         }
-
-        // 长度在 [0, 55] 之间：前缀 0x80 + len
-        if (bytes.Length <= 55) {
-            byte[] res = new byte[1 + bytes.Length];
-            res[0] = (byte)(0x80 + bytes.Length);
-            for (int i = 0; i < bytes.Length; i = i + 1) {
-                res[1 + i] = bytes[i];
+        if (blen <= 55) {
+            byte[] res = new byte[1 + blen];
+            res[0] = (byte)(0x80 + blen);
+            if (blen >= 16) {
+                NativeMemory.Copy((nint)res + 1, (nint)bytes, blen);
+            } else {
+                for (int i = 0; i < blen; i = i + 1) { res[1 + i] = bytes[i]; }
             }
             return res;
         }
-
-        // 长度大于 55 字节：前缀 0xb7 + lenOfLen
-        byte[] lenBytes = toBigEndianLen(bytes.Length);
-        byte[] outb = new byte[1 + lenBytes.Length + bytes.Length];
-        outb[0] = (byte)(0xb7 + lenBytes.Length);
-        for (int i = 0; i < lenBytes.Length; i = i + 1) {
-            outb[1 + i] = lenBytes[i];
-        }
-        int offset = 1 + lenBytes.Length;
-        for (int i = 0; i < bytes.Length; i = i + 1) {
-            outb[offset + i] = bytes[i];
-        }
+        int lol = BigEndianLenSize(blen);
+        byte[] outb = new byte[1 + lol + blen];
+        outb[0] = (byte)(0xb7 + lol);
+        int offset = WriteBigEndianLen(outb, 1, blen, lol);
+        NativeMemory.Copy((nint)outb + offset, (nint)bytes, blen);
         return outb;
     }
 
@@ -136,60 +191,40 @@ public class Rlp {
     // 编码已经序列化的子项列表
     public static byte[] EncodeListRaw(List<byte[]> encodedItems) {
         int totalPayloadLen = 0;
-        if (encodedItems != null) {
-            for (int i = 0; i < encodedItems.Count; i = i + 1) {
-                totalPayloadLen = totalPayloadLen + encodedItems[i].Length;
-            }
+        int cnt = encodedItems != null ? encodedItems.Count : 0;
+        for (int i = 0; i < cnt; i = i + 1) {
+            totalPayloadLen = totalPayloadLen + encodedItems[i].Length;
         }
-
+        byte[] outb;
+        int offset;
         if (totalPayloadLen <= 55) {
-            byte[] res = new byte[1 + totalPayloadLen];
-            res[0] = (byte)(0xc0 + totalPayloadLen);
-            int pos = 1;
-            if (encodedItems != null) {
-                for (int i = 0; i < encodedItems.Count; i = i + 1) {
-                    byte[] item = encodedItems[i];
-                    for (int j = 0; j < item.Length; j = j + 1) {
-                        res[pos] = item[j];
-                        pos = pos + 1;
-                    }
-                }
-            }
-            return res;
+            outb = new byte[1 + totalPayloadLen];
+            outb[0] = (byte)(0xc0 + totalPayloadLen);
+            offset = 1;
+        } else {
+            int lol = BigEndianLenSize(totalPayloadLen);
+            outb = new byte[1 + lol + totalPayloadLen];
+            outb[0] = (byte)(0xf7 + lol);
+            offset = WriteBigEndianLen(outb, 1, totalPayloadLen, lol);
         }
-
-        // 长度大于 55：前缀 0xf7 + lenOfLen
-        byte[] lenBytes = toBigEndianLen(totalPayloadLen);
-        byte[] outb = new byte[1 + lenBytes.Length + totalPayloadLen];
-        outb[0] = (byte)(0xf7 + lenBytes.Length);
-        for (int i = 0; i < lenBytes.Length; i = i + 1) {
-            outb[1 + i] = lenBytes[i];
-        }
-        int offset = 1 + lenBytes.Length;
-        if (encodedItems != null) {
-            for (int i = 0; i < encodedItems.Count; i = i + 1) {
-                byte[] item = encodedItems[i];
-                for (int j = 0; j < item.Length; j = j + 1) {
-                    outb[offset] = item[j];
-                    offset = offset + 1;
-                }
+        for (int i = 0; i < cnt; i = i + 1) {
+            byte[] item = encodedItems[i];
+            int ilen = item.Length;
+            if (ilen >= 16) {
+                NativeMemory.Copy((nint)outb + offset, (nint)item, ilen);
+            } else {
+                for (int j = 0; j < ilen; j = j + 1) { outb[offset + j] = item[j]; }
             }
+            offset = offset + ilen;
         }
         return outb;
     }
 
-    // 递归编码 RlpItem 结构
+    // 递归编码 RlpItem 结构（两遍精算总长直写单一 byte[]，零中间 List<byte[]> 与子数组分配）
     public static byte[] Encode(RlpItem item) {
-        if (item == null) {
-            return EncodeBytes(new byte[0]);
-        }
-        if (item.Type == RlpType.Bytes) {
-            return EncodeBytes(item.RawBytes);
-        }
-        List<byte[]> parts = new List<byte[]>();
-        for (int i = 0; i < item.Items.Count; i = i + 1) {
-            parts.Add(Encode(item.Items[i]));
-        }
-        return EncodeListRaw(parts);
+        int total = MeasureItem(item);
+        byte[] outb = new byte[total];
+        WriteItem(item, outb, 0);
+        return outb;
     }
 }

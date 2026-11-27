@@ -29,6 +29,8 @@ static void (*polyfx)(int32_t,const int32_t *,int32_t,int32_t,int32_t);
 static void (*clip)(int32_t,int32_t,int32_t,int32_t,int32_t);
 static void (*unclip)(int32_t);
 static void (*surface_round)(int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t);
+static void (*shadow_round)(int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t);
+static void (*composite_surface)(int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t);
 #define LOAD(v,n) do { *(void **)(&(v)) = (void *)SYMBOL(n); CHECK(v); } while (0)
 static uint32_t reference[W*H], actual[W*H];
 static int failures;
@@ -71,6 +73,8 @@ int main(int argc,char **argv) {
     LOAD(sector,"zan_gui_fill_sector"); LOAD(line,"zan_gui_draw_line");
     LOAD(poly,"zan_gui_draw_polyline"); LOAD(polyfx,"zan_gui_draw_polyline_fx");
     LOAD(surface_round,"zan_gui_surface_rounded_rect");
+    LOAD(shadow_round,"zan_gui_shadow_rounded_rect");
+    LOAD(composite_surface,"zan_gui_composite_surface");
     LOAD(clip,"zan_gui_push_clip"); LOAD(unclip,"zan_gui_pop_clip");
     if(!backend(1) || strcmp(backend_name(),"gl")) { fprintf(stderr,"SKIP: real GL 3.3 unavailable\n"); return 77; }
     int s=create(W,H); CHECK(s>=0);
@@ -130,6 +134,19 @@ int main(int argc,char **argv) {
         surface_round(s,12,9,63,47,13,fills[f],borders[b],widths[w]); capture(s,actual);
         compare("combined rounded material",4);
     }
+    int layer=create(W,H); CHECK(layer>=0);
+    for(int pass=0;pass<2;pass++) {
+        if(pass) CHECK(backend(1)); else backend(0);
+        clear(layer,0x00000000);
+        shadow_round(layer,17,19,56,28,14,8,(int)0xF5FFFFFFu);
+        shadow_round(layer,25,28,56,28,14,13,(int)0x3C202C44u);
+        surface_round(layer,20,22,56,28,14,(int)0xFFF4F7FCu,(int)0xE8FFFFFFu,1);
+        clear(s,(int)0xFFE4E9F2u);
+        composite_surface(s,layer,0,0,W,H,975,0,1000);
+        capture(s,pass?actual:reference);
+    }
+    compare("scaled transparent layer light shadow",4);
+    destroy(layer);
     destroy(other); destroy(s); backend(0);
     if (failures) return 1;
     puts("GL AA regression passed");

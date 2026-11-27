@@ -19,6 +19,14 @@ public class KafkaRecord {
         this.headers = new Dictionary<string, string>();
     }
 
+    private KafkaRecord(bool initHeaders) {
+        this.offset = 0L;
+        this.timestamp = 0L;
+        this.key = null;
+        this.value = null;
+        this.headers = initHeaders ? new Dictionary<string, string>() : null;
+    }
+
     public KafkaRecord(string key, string value) {
         this.offset = 0L;
         this.timestamp = 0L;
@@ -27,55 +35,86 @@ public class KafkaRecord {
         this.headers = new Dictionary<string, string>();
     }
 
-    // 将单条消息序列化为 Record v2 字节流 (变长 Varint 编码)
-    public byte[] EncodeRecord(long firstTimestamp, int offsetDelta) {
-        KafkaWriter w = new KafkaWriter(64);
-        w.WriteInt8(0); // attributes
+    private static int Varint32Size(int v) {
+        uint u = (uint)((v << 1) ^ (v >> 31));
+        if (u < 128U) { return 1; }
+        if (u < 16384U) { return 2; }
+        if (u < 2097152U) { return 3; }
+        if (u < 268435456U) { return 4; }
+        return 5;
+    }
 
+    private static int Varint64Size(long v) {
+        ulong u = (ulong)((v << 1) ^ (v >> 63));
+        int n = 1;
+        while (u >= 128UL) {
+            u = u >> 7;
+            n = n + 1;
+        }
+        return n;
+    }
+
+    // 将单条消息直写目标 writer（预算 bodyLen 零 scratch 中转与二次拷贝）
+    public void EncodeRecordInto(KafkaWriter dst, long firstTimestamp, int offsetDelta) {
         long tsDelta = this.timestamp > 0L ? this.timestamp - firstTimestamp : 0L;
-        w.WriteVarlong(tsDelta);
-        w.WriteVarint(offsetDelta);
-
-        // Key
-        if (this.key == null) {
-            w.WriteVarint(-1);
+        int kLen = this.key == null ? -1 : this.key.Length;
+        int vLen = this.value == null ? -1 : this.value.Length;
+        int bodyLen = 1 + Varint64Size(tsDelta) + Varint32Size(offsetDelta);
+        bodyLen = bodyLen + Varint32Size(kLen) + (kLen > 0 ? kLen : 0);
+        bodyLen = bodyLen + Varint32Size(vLen) + (vLen > 0 ? vLen : 0);
+        bool hasHeaders = this.headers != null && this.headers.Count > 0;
+        List<string> hkeys = null;
+        if (!hasHeaders) {
+            bodyLen = bodyLen + 1; // varint(0)
         } else {
-            w.WriteVarint(this.key.Length);
-            w.WriteStringRaw(this.key);
-        }
-
-        // Value
-        if (this.value == null) {
-            w.WriteVarint(-1);
-        } else {
-            w.WriteVarint(this.value.Length);
-            w.WriteStringRaw(this.value);
-        }
-
-        // Headers
-        if (this.headers == null || this.headers.Count == 0) {
-            w.WriteVarint(0);
-        } else {
-            List<string> hkeys = this.headers.Keys;
-            w.WriteVarint(hkeys.Count);
+            hkeys = this.headers.Keys;
+            bodyLen = bodyLen + Varint32Size(hkeys.Count);
             for (int i = 0; i < hkeys.Count; i = i + 1) {
                 string hk = hkeys[i];
                 string hv = this.headers[hk];
-                w.WriteVarint(hk.Length);
-                w.WriteStringRaw(hk);
+                bodyLen = bodyLen + Varint32Size(hk.Length) + hk.Length;
                 if (hv == null) {
-                    w.WriteVarint(-1);
+                    bodyLen = bodyLen + 1; // varint(-1) = zigzag 1
                 } else {
-                    w.WriteVarint(hv.Length);
-                    w.WriteStringRaw(hv);
+                    bodyLen = bodyLen + Varint32Size(hv.Length) + hv.Length;
                 }
             }
         }
 
-        byte[] body = w.ToBytes();
-        KafkaWriter res = new KafkaWriter(body.Length + 8);
-        res.WriteVarint(body.Length);
-        res.WriteRaw(body, body.Length);
+        dst.WriteVarint(bodyLen);
+        dst.WriteInt8(0); // attributes
+        dst.WriteVarlong(tsDelta);
+        dst.WriteVarint(offsetDelta);
+
+        dst.WriteVarint(kLen);
+        if (kLen > 0) { dst.WriteStringRaw(this.key); }
+
+        dst.WriteVarint(vLen);
+        if (vLen > 0) { dst.WriteStringRaw(this.value); }
+
+        if (!hasHeaders) {
+            dst.WriteVarint(0);
+        } else {
+            dst.WriteVarint(hkeys.Count);
+            for (int i = 0; i < hkeys.Count; i = i + 1) {
+                string hk = hkeys[i];
+                string hv = this.headers[hk];
+                dst.WriteVarint(hk.Length);
+                dst.WriteStringRaw(hk);
+                if (hv == null) {
+                    dst.WriteVarint(-1);
+                } else {
+                    dst.WriteVarint(hv.Length);
+                    dst.WriteStringRaw(hv);
+                }
+            }
+        }
+    }
+
+    // 将单条消息序列化为 Record v2 字节流 (变长 Varint 编码)
+    public byte[] EncodeRecord(long firstTimestamp, int offsetDelta) {
+        KafkaWriter res = new KafkaWriter(72);
+        this.EncodeRecordInto(res, firstTimestamp, offsetDelta);
         return res.ToBytes();
     }
 
@@ -86,7 +125,7 @@ public class KafkaRecord {
         if (recordLen <= 0 || r.Remaining() < recordLen) { return null; }
         int startPos = r.Position();
 
-        KafkaRecord rec = new KafkaRecord();
+        KafkaRecord rec = new KafkaRecord(false);
         int attr = r.ReadInt8();
         long tsDelta = r.ReadVarlong();
         rec.timestamp = firstTimestamp + tsDelta;
@@ -106,9 +145,10 @@ public class KafkaRecord {
             rec.value = r.ReadStringRaw(valLen);
         }
 
-        // Headers
+        // Headers（零头消息免分配 Dictionary）
         int hCount = r.ReadVarint();
         if (hCount > 0) {
+            rec.headers = new Dictionary<string, string>();
             for (int i = 0; i < hCount; i = i + 1) {
                 int hkLen = r.ReadVarint();
                 string hk = r.ReadStringRaw(hkLen);
@@ -133,7 +173,9 @@ public class KafkaRecord {
     // 构建符合 Kafka 0.11+ 生产标准的 RecordBatch (包含硬件 CRC32C 校验与 Magic=2)
     public static byte[] BuildRecordBatch(long baseOffset, List<KafkaRecord> records) {
         if (records == null || records.Count == 0) { return new byte[0]; }
-        KafkaWriter bw = new KafkaWriter(512);
+        int estCap = 64 + records.Count * 64;
+        if (estCap < 512) { estCap = 512; }
+        KafkaWriter bw = new KafkaWriter(estCap);
 
         // 1. baseOffset (8 bytes)
         bw.WriteInt64(baseOffset);
@@ -175,11 +217,9 @@ public class KafkaRecord {
         // 10. records count (4 bytes)
         bw.WriteInt32(records.Count);
 
-        // 11. 写入每条 Record
+        // 11. 写入每条 Record（预算长度直写，零逐条中间分配与二次拷贝）
         for (int i = 0; i < records.Count; i = i + 1) {
-            KafkaRecord rec = records[i];
-            byte[] rBytes = rec.EncodeRecord(now, i);
-            bw.WriteRaw(rBytes, rBytes.Length);
+            records[i].EncodeRecordInto(bw, now, i);
         }
 
         // 回填 batchLength (从 partitionLeaderEpoch 到结尾的字节长度)
@@ -187,10 +227,9 @@ public class KafkaRecord {
         int batchLen = totalLen - (batchLengthOffset + 4);
         bw.PatchInt32(batchLengthOffset, batchLen);
 
-        // 计算硬件加速 Castagnoli CRC32C (attributes 开始)
-        byte[] fullBytes = bw.ToBytes();
+        // 直接对内部缓冲算硬件加速 Castagnoli CRC32C 并回填，最终只做一次 ToBytes 切片拷贝
         int crcDataLen = totalLen - crcStartOffset;
-        int crcVal = (int)NativeMemory.Crc32C((nint)fullBytes + (nint)crcStartOffset, crcDataLen);
+        int crcVal = (int)NativeMemory.Crc32C((nint)bw.Buffer() + (nint)crcStartOffset, crcDataLen);
         bw.PatchInt32(crcOffset, crcVal);
 
         return bw.ToBytes();
@@ -220,6 +259,7 @@ public class KafkaRecord {
         int baseSeq = r.ReadInt32();
 
         int recordsCount = r.ReadInt32();
+        if (recordsCount > 0 && recordsCount < 65536) { list.Reserve(recordsCount); }
         for (int i = 0; i < recordsCount && r.Remaining() > 0; i = i + 1) {
             KafkaRecord rec = KafkaRecord.DecodeRecord(r, baseOffset, firstTs);
             if (rec != null) {

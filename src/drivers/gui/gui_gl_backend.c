@@ -195,7 +195,7 @@ static struct {
     zgl_uint prog_shape, vao[ZGL_RING_SLOTS], vbo[ZGL_RING_SLOTS];
     zgl_uint prog_blur, prog_blur_comp, blur_vao;
     zgl_int  u_viewport_shape, u_atlas1, u_atlas4, u_coverage,
-             u_destination;
+             u_destination, u_straight_over;
     zgl_int  u_blur_tex, u_blur_uvrect, u_blur_step, u_blur_clamp, u_blur_mode;
     zgl_int  u_bcomp_tex, u_bcomp_vp, u_bcomp_rect, u_bcomp_uvrect, u_bcomp_shape, u_bcomp_clip;
     zgl_uint blur_tex[2], blur_fbo[2];
@@ -220,6 +220,7 @@ static struct {
     int      st_shape_vp_w, st_shape_vp_h;
     int      st_blend;     /* 0=unknown, 1=off, 2=unified_blend, 4=union_max */
     int      st_atlases_bound;
+    int      st_straight_over;
 } g_zgl;
 
 static void zgl_invalidate_state(void) {
@@ -533,6 +534,11 @@ static void zgl_flush(void) {
             shader_over = 0;
         }
     }
+    int straight_over = (g_zgl.mode == ZGL_MODE_BLEND && !t->opaque_dst && shader_over) ? 1 : 0;
+    if (g_zgl.u_straight_over >= 0 && g_zgl.st_straight_over != straight_over) {
+        gl.Uniform1i(g_zgl.u_straight_over, straight_over);
+        g_zgl.st_straight_over = straight_over;
+    }
     if (g_zgl.mode != ZGL_MODE_UNION) {
         gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
     }
@@ -632,6 +638,12 @@ static inline float *zgl_alloc_quad(zan_surface_t *s, int kind,
     if (y1 > cy1) y1 = cy1;
     if (x1 <= x0 || y1 <= y0) return NULL;
 
+    zgl_target *tq = (s->id >= 0 && s->id < 64) ? &g_zgl_targets[s->id] : zgl_target_of(s);
+    int transparent_blend = (g_zgl.mode == ZGL_MODE_BLEND && tq && !tq->opaque_dst);
+    if (transparent_blend && g_zgl.count > 0) {
+        zgl_flush();
+    }
+
     if (g_zgl.mode != ZGL_MODE_UNION && s->id >= 0 && s->id < 64) {
         int ix0 = (x0 >= 0.0f) ? (int)x0 : (int)floorf(x0);
         int iy0 = (y0 >= 0.0f) ? (int)y0 : (int)floorf(y0);
@@ -640,7 +652,7 @@ static inline float *zgl_alloc_quad(zan_surface_t *s, int kind,
         zgl_target_mark_dirty(&g_zgl_targets[s->id], ix0, iy0, ix1, iy1);
     }
 
-    if (kind == ZGL_K_UNION || kind == ZGL_K_SURFACE) {
+    if (transparent_blend || kind == ZGL_K_UNION || kind == ZGL_K_SURFACE) {
         if (!g_zgl.has_shader_over) {
             g_zgl.has_shader_over = 1;
             g_zgl.over_x0 = x0; g_zgl.over_y0 = y0;

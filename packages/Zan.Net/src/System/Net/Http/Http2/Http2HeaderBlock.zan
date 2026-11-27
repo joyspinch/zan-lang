@@ -30,7 +30,7 @@ public class Http2HeaderBlock {
             this.endStream = (frame.flags & Http2Flags.END_STREAM) != 0;
             this.count = 0;
             this.fragments = 0;
-            this.bytes = new byte[this.limit];
+            this.bytes = null;
             if ((frame.flags & Http2Flags.PADDED) != 0) {
                 if (size < 1) { throw new IOException("Missing HTTP2 padding length"); }
                 start = 1;
@@ -45,11 +45,33 @@ public class Http2HeaderBlock {
                 start = start + 5;
                 size = size - 5;
             }
+            // 单帧完结快路径：直接按实际片段长度分配一次并拷贝，免去 64 KiB 暂存缓冲与二次拷贝。
+            if ((frame.flags & Http2Flags.END_HEADERS) != 0) {
+                if (size > this.limit) { throw new IOException("HTTP2 header block limit"); }
+                byte[] single = new byte[size];
+                if (size > 0) { NativeMemory.Copy((nint)single, (nint)payload + start, size); }
+                this.count = size;
+                this.fragments = 1;
+                this.streamId = 0;
+                return single;
+            }
+            int initCap = size < 1024 ? 1024 : size;
+            if (initCap > this.limit) { initCap = this.limit; }
+            this.bytes = new byte[initCap];
         } else if (this.streamId == 0) { throw new IOException("Unexpected HTTP2 continuation"); }
         this.fragments = this.fragments + 1;
         if (this.fragments > 16 || size > this.limit - this.count) { throw new IOException("HTTP2 header block limit"); }
+        int need = this.count + size;
+        if (this.bytes == null || need > this.bytes.Length) {
+            int newCap = this.bytes != null ? this.bytes.Length * 2 : 1024;
+            while (newCap < need) { newCap = newCap * 2; }
+            if (newCap > this.limit) { newCap = this.limit; }
+            byte[] grown = new byte[newCap];
+            if (this.count > 0) { NativeMemory.Copy((nint)grown, (nint)this.bytes, this.count); }
+            this.bytes = grown;
+        }
         if (size > 0) { NativeMemory.Copy((nint)this.bytes + this.count, (nint)payload + start, size); }
-        this.count = this.count + size;
+        this.count = need;
         if ((frame.flags & Http2Flags.END_HEADERS) == 0) { return null; }
         byte[] result = new byte[this.count];
         if (this.count > 0) { NativeMemory.Copy((nint)result, (nint)this.bytes, this.count); }

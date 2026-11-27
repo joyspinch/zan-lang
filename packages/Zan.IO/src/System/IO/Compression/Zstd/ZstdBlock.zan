@@ -13,6 +13,26 @@ public class ZstdBuffer {
         this.len = 0;
     }
 
+    // 预分配精确容量（单帧且已知 Frame_Content_Size 时 ToArray 零拷贝直返）。
+    public void ReserveExact(int exactCap) {
+        if (this.len == 0 && exactCap > 0 && exactCap != this.cap) {
+            this.cap = exactCap;
+            this.buf = new byte[exactCap];
+        } else if (exactCap > this.cap) {
+            this.Ensure(exactCap - this.len);
+        }
+    }
+
+    // 取出已写入的内容（容量恰好匹配时零拷贝直返内部数组）。
+    public byte[] ToArray() {
+        if (this.len == this.cap) {
+            return this.buf;
+        }
+        byte[] r = new byte[this.len];
+        ZstdBuffer.Copy(this.buf, 0, r, 0, this.len);
+        return r;
+    }
+
     // 已写入的字节数。
     public int Length() {
         return this.len;
@@ -63,10 +83,9 @@ public class ZstdBuffer {
 
     // 追加 n 个相同字节。
     public void PutRepeat(byte b, int n) {
+        if (n <= 0) { return; }
         this.Ensure(n);
-        for (int i = 0; i < n; i = i + 1) {
-            this.buf[this.len + i] = b;
-        }
+        NativeMemory.Fill((nint)this.buf + this.len, b & 255, n);
         this.len = this.len + n;
     }
 
@@ -78,13 +97,6 @@ public class ZstdBuffer {
     // 覆盖第 i 个字节。
     public void Set(int i, byte b) {
         this.buf[i] = b;
-    }
-
-    // 取出已写入的内容。
-    public byte[] ToArray() {
-        byte[] r = new byte[this.len];
-        ZstdBuffer.Copy(this.buf, 0, r, 0, this.len);
-        return r;
     }
 
     // 内部数组（供校验和之类的连续读取用；不要改长度）。
@@ -132,9 +144,16 @@ public class ZstdBlockDecoder {
         this.ofTab = null;
         this.mlTab = null;
         this.seqTabValid = false;
-        this.literals = new byte[131072];
+        this.literals = null;
         this.litLen = 0;
         this.litPos = 0;
+    }
+
+    void EnsureLiterals(int need) {
+        if (this.literals != null && this.literals.Length >= need) { return; }
+        int cap = need < 4096 ? 4096 : need;
+        if (cap > 131072) { cap = 131072; }
+        this.literals = new byte[cap];
     }
 
     // 解码一个块（块头已读过；type/size 见调用方）。
@@ -206,9 +225,10 @@ public class ZstdBlockDecoder {
                     | ((data[start + 2] & 255) << 16);
                 regen = regen >> 4;
             }
-            if (regen > blockMax || regen > this.literals.Length) {
+            if (regen > blockMax || regen > 131072) {
                 throw new ZstdException(ZstdError.BadLiterals, "zstd: literals larger than the block allows");
             }
+            this.EnsureLiterals(regen);
             this.litLen = regen;
             this.litPos = 0;
             if (litType == 0) {
@@ -222,9 +242,8 @@ public class ZstdBlockDecoder {
             if (start + lh + 1 > end) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: RLE literals truncated");
             }
-            byte v = data[start + lh];
-            for (int i = 0; i < regen; i = i + 1) {
-                this.literals[i] = v;
+            if (regen > 0) {
+                NativeMemory.Fill((nint)this.literals, data[start + lh] & 255, regen);
             }
             return lh + 1;
         }
@@ -263,9 +282,10 @@ public class ZstdBlockDecoder {
             // v 是有符号 int，算术右移会把符号位带进来，**必须掩掉高 22 位**。
             csize = ((v >> 22) & 0x3FF) | ((data[start + 4] & 255) << 10);
         }
-        if (regen2 > blockMax || regen2 > this.literals.Length) {
+        if (regen2 > blockMax || regen2 > 131072) {
             throw new ZstdException(ZstdError.BadLiterals, "zstd: literals larger than the block allows");
         }
+        this.EnsureLiterals(regen2);
         int body = start + lh2;
         if (body + csize > end) {
             throw new ZstdException(ZstdError.Truncated, "zstd: literals section truncated");
@@ -400,7 +420,7 @@ public class ZstdBlockDecoder {
         return this.mlTab;
     }
 
-    // 解码并执行 nbSeq 条序列。
+    // 解码并执行 nbSeq 条序列（本地缓存表引用减少字段间接寻址）。
     void RunSequences(byte[] data, int start, int end, int nbSeq) {
         ZstdBackBits br = new ZstdBackBits(data, start, end);
         if (br.Bad()) {
@@ -409,88 +429,115 @@ public class ZstdBlockDecoder {
         ZstdFseTable llFse = this.llTab.fse;
         ZstdFseTable ofFse = this.ofTab.fse;
         ZstdFseTable mlFse = this.mlTab.fse;
+        int[] llSym = llFse.symbol;
+        int[] llNb = llFse.nbBits;
+        int[] llNs = llFse.newState;
+        int[] ofSym = ofFse.symbol;
+        int[] ofNb = ofFse.nbBits;
+        int[] ofNs = ofFse.newState;
+        int[] mlSym = mlFse.symbol;
+        int[] mlNb = mlFse.nbBits;
+        int[] mlNs = mlFse.newState;
+        int[] llBase = this.llTab.baseVal;
+        int[] llAdd = this.llTab.addBits;
+        int[] ofBase = this.ofTab.baseVal;
+        int[] ofAdd = this.ofTab.addBits;
+        int[] mlBase = this.mlTab.baseVal;
+        int[] mlAdd = this.mlTab.addBits;
+        int r0 = this.rep0;
+        int r1 = this.rep1;
+        int r2 = this.rep2;
         int llState = br.Read(llFse.tableLog);
         int ofState = br.Read(ofFse.tableLog);
         int mlState = br.Read(mlFse.tableLog);
+        int lastSeq = nbSeq - 1;
         for (int i = 0; i < nbSeq; i = i + 1) {
-            int llCode = llFse.symbol[llState];
-            int mlCode = mlFse.symbol[mlState];
-            int ofCode = ofFse.symbol[ofState];
-            int llBits = this.llTab.addBits[llCode];
-            int mlBits = this.mlTab.addBits[mlCode];
-            int ofBits = this.ofTab.addBits[ofCode];
-            int ll0 = this.llTab.baseVal[llCode] == 0 ? 1 : 0;
+            int llCode = llSym[llState];
+            int mlCode = mlSym[mlState];
+            int ofCode = ofSym[ofState];
+            int llBits = llAdd[llCode];
+            int mlBits = mlAdd[mlCode];
+            int ofBits = ofAdd[ofCode];
+            int llBaseV = llBase[llCode];
+            int ll0 = llBaseV == 0 ? 1 : 0;
             int offset;
             if (ofBits > 1) {
-                // 普通偏移：offset = 基值 + 读到的位
-                offset = this.ofTab.baseVal[ofCode] + br.Read(ofBits);
-                this.rep2 = this.rep1;
-                this.rep1 = this.rep0;
-                this.rep0 = offset;
+                offset = ofBase[ofCode] + br.Read(ofBits);
+                r2 = r1;
+                r1 = r0;
+                r0 = offset;
             } else if (ofBits == 0) {
-                // 偏移值 1：重复最近（或次近）的偏移
-                offset = ll0 == 1 ? this.rep1 : this.rep0;
-                if (ll0 == 1) {
-                    this.rep1 = this.rep0;
-                }
-                this.rep0 = offset;
+                offset = ll0 == 1 ? r1 : r0;
+                if (ll0 == 1) { r1 = r0; }
+                r0 = offset;
             } else {
-                // 偏移码 1：偏移值 2/3（字面量长度为 0 时整体右移一位）
-                int v = this.ofTab.baseVal[ofCode] + ll0 + br.Read(1);
+                int v = ofBase[ofCode] + ll0 + br.Read(1);
                 int temp;
                 if (v == 3) {
-                    temp = this.rep0 - 1;   // 重复码 3 且字面量长度为 0：最近偏移减 1
+                    temp = r0 - 1;
                 } else if (v == 1) {
-                    temp = this.rep1;
+                    temp = r1;
                 } else {
-                    temp = this.rep2;
+                    temp = r2;
                 }
                 if (temp <= 0) {
                     throw new ZstdException(ZstdError.BadOffset, "zstd: invalid repeat offset");
                 }
-                if (v != 1) {
-                    this.rep2 = this.rep1;
-                }
-                this.rep1 = this.rep0;
-                this.rep0 = temp;
+                if (v != 1) { r2 = r1; }
+                r1 = r0;
+                r0 = temp;
                 offset = temp;
             }
             if (offset <= 0) {
                 throw new ZstdException(ZstdError.BadOffset, "zstd: invalid offset");
             }
-            int matchLen = this.mlTab.baseVal[mlCode];
+            int matchLen = mlBase[mlCode];
             if (mlBits > 0) {
                 matchLen = matchLen + br.Read(mlBits);
             }
-            int litLen = this.llTab.baseVal[llCode];
+            int litLen = llBaseV;
             if (llBits > 0) {
                 litLen = litLen + br.Read(llBits);
             }
-            if (i < nbSeq - 1) {
-                // 状态更新：字面量长度 → 匹配长度 → 偏移
-                llState = llFse.newState[llState] + br.Read(llFse.nbBits[llState]);
-                mlState = mlFse.newState[mlState] + br.Read(mlFse.nbBits[mlState]);
-                ofState = ofFse.newState[ofState] + br.Read(ofFse.nbBits[ofState]);
+            if (i < lastSeq) {
+                llState = llNs[llState] + br.Read(llNb[llState]);
+                mlState = mlNs[mlState] + br.Read(mlNb[mlState]);
+                ofState = ofNs[ofState] + br.Read(ofNb[ofState]);
             }
             this.CopyLiterals(litLen);
             this.CopyMatch(offset, matchLen);
         }
+        this.rep0 = r0;
+        this.rep1 = r1;
+        this.rep2 = r2;
         // 剩下的字面量直接追加
         this.CopyLiterals(this.litLen - this.litPos);
     }
 
-    // 从字面量缓冲复制 n 字节到输出。
+    // 从字面量缓冲复制 n 字节到输出（短片段内联拷贝，长片段走 NativeMemory.Copy）。
     void CopyLiterals(int n) {
         if (n < 0 || this.litPos + n > this.litLen) {
             throw new ZstdException(ZstdError.BadSequences, "zstd: literals exhausted");
         }
         if (n > 0) {
-            this.sink.PutBlock(this.literals, this.litPos, n);
-            this.litPos = this.litPos + n;
+            this.sink.Ensure(n);
+            byte[] raw = this.sink.Raw();
+            int dst = this.sink.Length();
+            byte[] lits = this.literals;
+            int lp = this.litPos;
+            if (n < 16) {
+                for (int k = 0; k < n; k = k + 1) {
+                    raw[dst + k] = lits[lp + k];
+                }
+            } else {
+                NativeMemory.Copy((nint)raw + dst, (nint)lits + lp, n);
+            }
+            this.sink.Advance(n);
+            this.litPos = lp + n;
         }
     }
 
-    // 从输出里复制 matchLen 字节（源在 offset 之前，可能与目标重叠）。
+    // 从输出里复制 matchLen 字节（源在 offset 之前，短匹配内联，长匹配走 NativeMemory.Copy/Fill/倍增）。
     void CopyMatch(int offset, int matchLen) {
         int dst = this.sink.Length();
         int src = dst - offset;
@@ -498,15 +545,25 @@ public class ZstdBlockDecoder {
             throw new ZstdException(ZstdError.BadOffset, "zstd: offset points outside the window");
         }
         this.sink.Ensure(matchLen);
-        int n = matchLen;
-        int d = dst;
-        int s = src;
-        while (n > 0) {
-            int k = offset < n ? offset : n;
-            this.sink.CopyWithin(s, d, k);
-            d = d + k;
-            s = s + k;
-            n = n - k;
+        byte[] raw = this.sink.Raw();
+        if (matchLen < 16) {
+            for (int k = 0; k < matchLen; k = k + 1) {
+                raw[dst + k] = raw[src + k];
+            }
+        } else if (offset >= matchLen) {
+            NativeMemory.Copy((nint)raw + dst, (nint)raw + src, matchLen);
+        } else if (offset == 1) {
+            NativeMemory.Fill((nint)raw + dst, raw[src] & 255, matchLen);
+        } else {
+            nint p = (nint)raw;
+            NativeMemory.Copy(p + dst, p + src, offset);
+            int done = offset;
+            while (done < matchLen) {
+                int step = matchLen - done;
+                if (step > done) { step = done; }
+                NativeMemory.Copy(p + dst + done, p + dst, step);
+                done = done + step;
+            }
         }
         this.sink.Advance(matchLen);
     }

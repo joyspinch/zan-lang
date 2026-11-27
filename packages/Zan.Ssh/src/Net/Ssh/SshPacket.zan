@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Interop;
 using System.Security.Cryptography;
 
 namespace Net.Ssh;
@@ -10,12 +11,18 @@ public class SshCipherState {
     public byte[] fixedIv;
     public byte[] counterSeed;
     public long counter;
+    private byte[] gcmCtx;
+    private bool gcmHwReady;
+    private byte[] ivBuf;
 
     public SshCipherState() {
         this.key = null;
         this.fixedIv = null;
         this.counterSeed = null;
         this.counter = 0;
+        this.gcmCtx = null;
+        this.gcmHwReady = false;
+        this.ivBuf = null;
     }
 
     public void Init(byte[] keyBytes, byte[] ivBytes) {
@@ -28,23 +35,27 @@ public class SshCipherState {
         this.key = keyBytes;
         this.fixedIv = new byte[4];
         this.counterSeed = new byte[8];
-        for (int i = 0; i < 4; i = i + 1) { this.fixedIv[i] = ivBytes[i]; }
-        for (int i = 0; i < 8; i = i + 1) { this.counterSeed[i] = ivBytes[4 + i]; }
+        this.ivBuf = new byte[12];
+        NativeMemory.Copy((nint)this.fixedIv, (nint)ivBytes, 4);
+        NativeMemory.Copy((nint)this.ivBuf, (nint)ivBytes, 4);
+        NativeMemory.Copy((nint)this.counterSeed, (nint)ivBytes + 4, 8);
         this.counter = 0;
+        this.gcmCtx = new byte[512];
+        this.gcmHwReady = NativeMemory.AesGcmInit(this.gcmCtx, 512L, keyBytes, keyBytes.Length * 8) == 0L;
     }
 
-    private byte[] NextIv() {
+    private byte[] FillNextIv() {
         if (this.key == null) {
             throw new SshException(SshError.Internal, "cipher state is not initialised");
         }
         if (this.counter >= 0xFFFFFFFFL) {
             throw new SshException(SshError.Internal, "AES-GCM invocation counter overflow");
         }
-        byte[] iv = new byte[12];
-        for (int i = 0; i < 4; i = i + 1) { iv[i] = this.fixedIv[i]; }
+        byte[] iv = this.ivBuf;
+        byte[] seed = this.counterSeed;
         long add = this.counter;
         for (int i = 7; i >= 0; i = i - 1) {
-            int sum = (this.counterSeed[i] & 255) + (int)(add & 255);
+            int sum = (seed[i] & 255) + (int)(add & 255);
             iv[4 + i] = (byte)(sum & 255);
             add = (add >> 8) + (sum >> 8);
         }
@@ -65,27 +76,112 @@ public class SshCipherState {
     }
 
     public byte[] Encrypt(byte[] plaintext, byte[] aad) {
-        byte[] iv = this.NextIv();
-        int aadLen;
+        byte[] iv = this.FillNextIv();
+        int ptLen = plaintext.Length;
+        int aadLen = aad != null ? aad.Length : 0;
+        if (this.gcmHwReady) {
+            byte[] outBuf = new byte[ptLen + 16];
+            nint aadPtr = aadLen > 0 ? (nint)aad : (nint)0;
+            nint ptPtr = ptLen > 0 ? (nint)plaintext : (nint)0;
+            long hwRes = NativeMemory.AesGcmEncryptCtx(this.gcmCtx, iv, aadPtr, (long)aadLen,
+                ptPtr, (long)ptLen, (nint)outBuf, (nint)outBuf + (nint)ptLen);
+            if (hwRes >= 0) {
+                return outBuf;
+            }
+        }
         string aadStr = SshCipherState.FormatAad(aad, out aadLen);
         byte[] tag = new byte[16];
         byte[] ct = AesGcm.Encrypt(this.key.ToStr(0, this.key.Length), this.key.Length,
-            iv.ToStr(0, iv.Length), aadStr, aadLen, plaintext.ToStr(0, plaintext.Length), plaintext.Length, tag);
+            iv.ToStr(0, iv.Length), aadStr, aadLen, plaintext.ToStr(0, ptLen), ptLen, tag);
         if (ct == null) {
             throw new SshException(SshError.Internal, "AES-GCM encryption failed");
         }
         return SshBytes.Concat(ct, tag);
     }
 
+    // 单缓冲直出：4 字节 packet_length(AAD) || 密文 || 16 字节 tag，零二次拼接拷贝。
+    public byte[] EncryptPacket(byte[] plaintext) {
+        byte[] iv = this.FillNextIv();
+        int ptLen = plaintext.Length;
+        byte[] wire = new byte[4 + ptLen + 16];
+        wire[0] = (byte)((ptLen >> 24) & 255);
+        wire[1] = (byte)((ptLen >> 16) & 255);
+        wire[2] = (byte)((ptLen >> 8) & 255);
+        wire[3] = (byte)(ptLen & 255);
+        if (this.gcmHwReady) {
+            nint ptPtr = ptLen > 0 ? (nint)plaintext : (nint)0;
+            long hwRes = NativeMemory.AesGcmEncryptCtx(this.gcmCtx, iv, (nint)wire, 4L,
+                ptPtr, (long)ptLen, (nint)wire + 4, (nint)wire + 4 + (nint)ptLen);
+            if (hwRes >= 0) {
+                return wire;
+            }
+        }
+        byte[] tag = new byte[16];
+        byte[] ct = AesGcm.Encrypt(this.key.ToStr(0, this.key.Length), this.key.Length,
+            iv.ToStr(0, iv.Length), wire.ToStr(0, 4), 4, plaintext.ToStr(0, ptLen), ptLen, tag);
+        if (ct == null) {
+            throw new SshException(SshError.Internal, "AES-GCM encryption failed");
+        }
+        if (ptLen > 0) { NativeMemory.Copy((nint)wire + 4, (nint)ct, ptLen); }
+        NativeMemory.Copy((nint)wire + 4 + (nint)ptLen, (nint)tag, 16);
+        return wire;
+    }
+
     public byte[] Decrypt(byte[] aad, byte[] ciphertext, byte[] tag) {
-        byte[] iv = this.NextIv();
-        int aadLen;
+        byte[] iv = this.FillNextIv();
+        int ctLen = ciphertext.Length;
+        int aadLen = aad != null ? aad.Length : 0;
+        if (this.gcmHwReady && tag != null && tag.Length >= 16) {
+            byte[] plainHw = new byte[ctLen];
+            nint aadPtr = aadLen > 0 ? (nint)aad : (nint)0;
+            nint ctPtr = ctLen > 0 ? (nint)ciphertext : (nint)0;
+            long hwRes = NativeMemory.AesGcmDecryptCtx(this.gcmCtx, iv, aadPtr, (long)aadLen,
+                ctPtr, (long)ctLen, (nint)tag, (nint)plainHw);
+            if (hwRes >= 0) {
+                return plainHw;
+            }
+            if (hwRes == -2) {
+                throw new SshException(SshError.IntegrityFailed,
+                    "AES-GCM authentication failed (packet tampered or key mismatch)");
+            }
+        }
         string aadStr = SshCipherState.FormatAad(aad, out aadLen);
         List<int> ok = new List<int>();
         ok.Add(0);
         byte[] plain = AesGcm.Decrypt(this.key.ToStr(0, this.key.Length), this.key.Length,
-            iv.ToStr(0, iv.Length), aadStr, aadLen, ciphertext.ToStr(0, ciphertext.Length),
-            ciphertext.Length, tag.ToStr(0, tag.Length), ok);
+            iv.ToStr(0, iv.Length), aadStr, aadLen, ciphertext.ToStr(0, ctLen),
+            ctLen, tag.ToStr(0, tag.Length), ok);
+        if (ok[0] != -1 || plain == null) {
+            throw new SshException(SshError.IntegrityFailed,
+                "AES-GCM authentication failed (packet tampered or key mismatch)");
+        }
+        return plain;
+    }
+
+    // 单缓冲解密：输入连续的 ct || tag(16)，免去分片读取与二次分配。
+    public byte[] DecryptPacket(byte[] aad, byte[] ctAndTag, int ctLen) {
+        byte[] iv = this.FillNextIv();
+        int aadLen = aad != null ? aad.Length : 0;
+        if (this.gcmHwReady) {
+            byte[] plainHw = new byte[ctLen];
+            nint aadPtr = aadLen > 0 ? (nint)aad : (nint)0;
+            nint ctPtr = ctLen > 0 ? (nint)ctAndTag : (nint)0;
+            long hwRes = NativeMemory.AesGcmDecryptCtx(this.gcmCtx, iv, aadPtr, (long)aadLen,
+                ctPtr, (long)ctLen, (nint)ctAndTag + (nint)ctLen, (nint)plainHw);
+            if (hwRes >= 0) {
+                return plainHw;
+            }
+            if (hwRes == -2) {
+                throw new SshException(SshError.IntegrityFailed,
+                    "AES-GCM authentication failed (packet tampered or key mismatch)");
+            }
+        }
+        string aadStr = SshCipherState.FormatAad(aad, out aadLen);
+        List<int> ok = new List<int>();
+        ok.Add(0);
+        byte[] plain = AesGcm.Decrypt(this.key.ToStr(0, this.key.Length), this.key.Length,
+            iv.ToStr(0, iv.Length), aadStr, aadLen, ctAndTag.ToStr(0, ctLen),
+            ctLen, ctAndTag.ToStr(ctLen, 16), ok);
         if (ok[0] != -1 || plain == null) {
             throw new SshException(SshError.IntegrityFailed,
                 "AES-GCM authentication failed (packet tampered or key mismatch)");
@@ -118,12 +214,9 @@ public class SshPacketLayer {
             this.seqOut = this.seqOut + 1;
             return;
         }
-        // GCM：4 字节 packet_length 作 AAD，加密 padding_length || payload || padding。
+        // GCM：4 字节 packet_length 作 AAD，单缓冲直出 header || ct || tag。
         byte[] plain = SshPacketLayer.BuildPaddedBlock(payload, 16, 4, 0);
-        byte[] header = new byte[4];
-        SshPacketLayer.WriteU32(header, 0, plain.Length);
-        byte[] sealedBytes = this.outCipher.Encrypt(plain, header);
-        byte[] wire = SshBytes.Concat(header, sealedBytes);
+        byte[] wire = this.outCipher.EncryptPacket(plain);
         this.pipe.WriteExact(wire, 0, wire.Length);
         this.seqOut = this.seqOut + 1;
     }
@@ -145,11 +238,10 @@ public class SshPacketLayer {
         if (packetLength % 16 != 0) {
             throw new SshException(SshError.Malformed, "SSH packet length is not block aligned");
         }
-        byte[] ct = new byte[packetLength];
-        this.pipe.ReadExact(ct, 0, (int)packetLength);
-        byte[] tag = new byte[16];
-        this.pipe.ReadExact(tag, 0, 16);
-        byte[] plain = this.inCipher.Decrypt(header, ct, tag);
+        int ctLen = (int)packetLength;
+        byte[] ctAndTag = new byte[ctLen + 16];
+        this.pipe.ReadExact(ctAndTag, 0, ctLen + 16);
+        byte[] plain = this.inCipher.DecryptPacket(header, ctAndTag, ctLen);
         this.seqIn = this.seqIn + 1;
         return SshPacketLayer.ExtractPayload(plain);
     }
@@ -162,9 +254,11 @@ public class SshPacketLayer {
             SshPacketLayer.WriteU32(outb, 0, packetLength);
         }
         outb[prefixBytes] = (byte)paddingLen;
-        for (int i = 0; i < payload.Length; i = i + 1) { outb[prefixBytes + 1 + i] = payload[i]; }
+        if (payload.Length > 0) {
+            NativeMemory.Copy((nint)outb + prefixBytes + 1, (nint)payload, payload.Length);
+        }
         byte[] padding = SshBytes.RandomBytes(paddingLen);
-        for (int i = 0; i < paddingLen; i = i + 1) { outb[prefixBytes + 1 + payload.Length + i] = padding[i]; }
+        NativeMemory.Copy((nint)outb + prefixBytes + 1 + payload.Length, (nint)padding, paddingLen);
         return outb;
     }
 
@@ -178,7 +272,9 @@ public class SshPacketLayer {
         }
         int payloadLen = block.Length - paddingLen - 1;
         byte[] payload = new byte[payloadLen];
-        for (int i = 0; i < payloadLen; i = i + 1) { payload[i] = block[1 + i]; }
+        if (payloadLen > 0) {
+            NativeMemory.Copy((nint)payload, (nint)block + 1, payloadLen);
+        }
         return payload;
     }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Interop;
+using System.Runtime.Intrinsics;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -375,22 +376,70 @@ public class PgWire {
 
     // RFC 5802 Hi()：PBKDF2-HMAC-SHA256——口令是 HMAC 密钥，
     // 盐后拼大端块序号 1 作消息，迭代异或折叠出 32 字节 SaltedPassword。
-    // PG 10+ 默认口令加密即 SCRAM-SHA-256，这是它的全部口令学。
+    // 预计算 ipad/opad + 乒乓直写硬件 SHA-256 + AVX2 32B 折叠，迭代主循环零堆分配。
     public static byte[] pbkdf2Sha256(string password, byte[] salt, int saltLen,
             int iters) {
         if (iters < 1) { iters = 1; }
-        byte[] pw = PgWire.strToBytes(password, password.Length);
+        int passLen = password != null ? password.Length : 0;
+        int msgMax = saltLen + 4;
+        if (msgMax < 32) { msgMax = 32; }
+        byte[] keyBlk = new byte[64];
+        if (passLen > 64) {
+            if (NativeMemory.Sha256Into((nint)password, (long)passLen, (nint)keyBlk) < 0) {
+                byte[] kh = Sha256.Hash(password, passLen);
+                NativeMemory.Copy((nint)keyBlk, (nint)kh, 32);
+            }
+        } else if (passLen > 0) {
+            NativeMemory.Copy((nint)keyBlk, (nint)password, passLen);
+        }
+
+        byte[] inner = new byte[64 + msgMax];
+        byte[] outer = new byte[96];
+        Vector256 ipadMask = Vector256.Create((byte)0x36);
+        Vector256 opadMask = Vector256.Create((byte)0x5c);
+        Vector256 kLo = Vector256.Load(keyBlk, 0);
+        Vector256 kHi = Vector256.Load(keyBlk, 32);
+        Vector256.Store(inner, 0, Vector256.Xor(kLo, ipadMask));
+        Vector256.Store(inner, 32, Vector256.Xor(kHi, ipadMask));
+        Vector256.Store(outer, 0, Vector256.Xor(kLo, opadMask));
+        Vector256.Store(outer, 32, Vector256.Xor(kHi, opadMask));
+
+        if (saltLen > 0) { NativeMemory.Copy((nint)inner + 64, (nint)salt, saltLen); }
+        inner[64 + saltLen] = 0;
+        inner[64 + saltLen + 1] = 0;
+        inner[64 + saltLen + 2] = 0;
+        inner[64 + saltLen + 3] = 1;
+
+        nint innerPtr = (nint)inner;
+        nint outerPtr = (nint)outer;
+        nint innerMsg = innerPtr + 64;
+        nint outerMsg = outerPtr + 64;
+        byte[] acc = new byte[33];
+
+        // 优先走硬件 SHA-256 乒乓直写快路径；无硬件路径时回退 Hmac.Sha256。
+        if (NativeMemory.Sha256Into(innerPtr, (long)(64 + saltLen + 4), outerMsg) >= 0
+                && NativeMemory.Sha256Into(outerPtr, 96L, innerMsg) >= 0) {
+            Vector256 accV = Vector256.Load(innerMsg);
+            for (int j = 1; j < iters; j = j + 1) {
+                NativeMemory.Sha256Into(innerPtr, 96L, outerMsg);
+                NativeMemory.Sha256Into(outerPtr, 96L, innerMsg);
+                accV = Vector256.Xor(accV, Vector256.Load(innerMsg));
+            }
+            Vector256.Store(acc, 0, accV);
+            return acc;
+        }
+
+        byte[] pw = PgWire.strToBytes(password, passLen);
         byte[] block = new byte[saltLen + 5];
         if (saltLen > 0) { NativeMemory.Copy((nint)block, (nint)salt, saltLen); }
         block[saltLen + 3] = 1;
         byte[] u = Hmac.Sha256(pw, pw.Length, block, saltLen + 4);
-        byte[] acc = new byte[33];
         NativeMemory.Copy((nint)acc, (nint)u, 32);
-        int j = 1;
-        while (j < iters) {
+        int k = 1;
+        while (k < iters) {
             u = Hmac.Sha256(pw, pw.Length, u, 32);
-            for (int i = 0; i < 32; i = i + 1) { acc[i] = (byte)((acc[i] ^ u[i]) & 255); }
-            j = j + 1;
+            Vector256.Store(acc, 0, Vector256.Xor(Vector256.Load(acc, 0), Vector256.Load(u, 0)));
+            k = k + 1;
         }
         return acc;
     }
@@ -398,7 +447,7 @@ public class PgWire {
     // 32 字节按位异或（ClientKey ⊕ ClientSignature → proof）。
     public static byte[] xor32(byte[] a, byte[] b) {
         byte[] r = new byte[33];
-        for (int i = 0; i < 32; i = i + 1) { r[i] = (byte)((a[i] ^ b[i]) & 255); }
+        Vector256.Store(r, 0, Vector256.Xor(Vector256.Load(a, 0), Vector256.Load(b, 0)));
         return r;
     }
 }
