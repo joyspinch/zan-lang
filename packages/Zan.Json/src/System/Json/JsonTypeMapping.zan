@@ -18,6 +18,7 @@ internal enum JsonMemberKind {
 }
 
 internal class JsonMemberMapping {
+    internal int FieldIndex;
     internal string FieldName;
     internal string JsonName;
     internal string OutputName;
@@ -43,9 +44,22 @@ internal class JsonMemberMapping {
     }
 }
 
+internal class JsonTypeMappingLocalCache {
+    internal long LastKey;
+    internal JsonTypeMapping LastMapping;
+    internal Dict<long, JsonTypeMapping> Map;
+
+    internal JsonTypeMappingLocalCache() {
+        this.LastKey = 0L;
+        this.LastMapping = null;
+        this.Map = new Dict<long, JsonTypeMapping>();
+    }
+}
+
 internal class JsonTypeMapping {
     private static Mutex gate = new Mutex();
     private static Dict<long, JsonTypeMapping> cache = new Dict<long, JsonTypeMapping>();
+    private static ThreadLocal<JsonTypeMappingLocalCache> localCache = new ThreadLocal<JsonTypeMappingLocalCache>(() => new JsonTypeMappingLocalCache());
     internal List<JsonMemberMapping> Fields;
     private int[] buckets;
     private int[] next;
@@ -55,17 +69,27 @@ internal class JsonTypeMapping {
         // be shared by distinct closed generic types.
         long key = (long)(nint)type;
         if (key == 0L) { return JsonTypeMapping.Build(type); }
+        JsonTypeMappingLocalCache local = JsonTypeMapping.localCache.Value;
+        if (local.LastKey == key) { return local.LastMapping; }
+        JsonTypeMapping mapping = null;
+        if (local.Map.TryGetValue(key, out mapping)) {
+            local.LastKey = key;
+            local.LastMapping = mapping;
+            return mapping;
+        }
         JsonTypeMapping.gate.WaitOne();
         try {
-            JsonTypeMapping mapping = null;
             if (!JsonTypeMapping.cache.TryGetValue(key, out mapping)) {
                 mapping = JsonTypeMapping.Build(type);
                 JsonTypeMapping.cache.Add(key, mapping);
             }
-            return mapping;
         } finally {
             JsonTypeMapping.gate.ReleaseMutex();
         }
+        local.Map[key] = mapping;
+        local.LastKey = key;
+        local.LastMapping = mapping;
+        return mapping;
     }
 
     private static JsonTypeMapping Build(TypeInfo type) {
@@ -76,6 +100,7 @@ internal class JsonTypeMapping {
             FieldMapping mapping = FieldMapping.Read(type, i);
             if (mapping.Ignored) { continue; }
             JsonMemberMapping field = new JsonMemberMapping();
+            field.FieldIndex = i;
             field.FieldName = type.GetFieldName(i);
             field.JsonName = mapping.Name.Length == 0 ? field.FieldName : mapping.Name;
             field.OutputName = "\"" + field.JsonName + "\":";

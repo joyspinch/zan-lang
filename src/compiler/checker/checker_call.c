@@ -95,7 +95,8 @@ static void checker_unify_method_tp(zan_type_t *dp, zan_type_t *at,
       zan_ast_node_t *tp = tps->items[i];
       if (tp->ident.name.len == dp->name.len &&
           memcmp(tp->ident.name.str, dp->name.str, (size_t)dp->name.len) == 0) {
-        if (!bind[i] && at->kind != TYPE_TYPE_PARAM && at->kind != TYPE_ERROR)
+        if (!bind[i] && at->kind != TYPE_TYPE_PARAM && at->kind != TYPE_ERROR &&
+            at->kind != TYPE_VOID)
           bind[i] = at;
         return;
       }

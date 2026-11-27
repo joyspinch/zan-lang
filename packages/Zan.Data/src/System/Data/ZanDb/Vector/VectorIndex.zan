@@ -24,6 +24,20 @@ public class VectorIndex {
     public List<VectorNode> nodes;
     public Dict<int, int> idSlots;
     public int chunkRows;
+    private int chunkShift;
+    private int chunkMask;
+    // 热路径扁平原语缓存：直接按槽位索引，消除距离评估与图遍历中的 List 索引和对象 ARC 原子操作。
+    private nint[] chunkPtrs;
+    private nint[] codeChunkPtrs;
+    private int[] nodeIds;
+    private byte[] nodeActive;
+    private double[] nodeInvNorms;
+    private double[] nodeQuantScales;
+    private double[] nodeQuantOffsets;
+    private long[] nodeQuantCodeSums;
+    private int l0Cap;
+    private int[] l0Slots;
+    private int[] l0Counts;
     public int entry;
     public int maxLevel;
     public long randomState;
@@ -31,6 +45,13 @@ public class VectorIndex {
     public float[] scratch;
     // 导入期间复用的向量暂存（量化路径逐槽解码用，避免批量堆垃圾）。
     private float[] importScratch;
+    // 写入路径复用的工作区与堆（避免 Add() / Link() 频繁分配 O(N²) visited[] 与临时堆）。
+    private VectorWorkspace addWork;
+    private VectorHeap addCandHeap;
+    private VectorHeap addNearHeap;
+    private VectorHeap addOrderHeap;
+    private VectorHeap addLinkHeap;
+    private int[] addRejected;
     // 二进制快照导入期间的待挂边暂存：pendingEdges 按
     // 「数量, 槽位…」逐层打包，pendingEdgeBase 记每个槽位的起始
     // 下标。边可指向任意槽位（含后位），故全部记录就位后由
@@ -48,6 +69,27 @@ public class VectorIndex {
         this.idSlots = new Dict<int, int>();
         this.chunkRows = 65536 / options.dimensions;
         if (this.chunkRows > 256) { this.chunkRows = 256; }
+        if (this.chunkRows > 0 && (this.chunkRows & (this.chunkRows - 1)) == 0) {
+            int sh = 0;
+            int cr = this.chunkRows;
+            while (cr > 1) { cr = cr >> 1; sh = sh + 1; }
+            this.chunkShift = sh;
+            this.chunkMask = this.chunkRows - 1;
+        } else {
+            this.chunkShift = -1;
+            this.chunkMask = 0;
+        }
+        this.chunkPtrs = new nint[16];
+        this.codeChunkPtrs = new nint[16];
+        this.nodeIds = new int[64];
+        this.nodeActive = new byte[64];
+        this.nodeInvNorms = new double[64];
+        this.nodeQuantScales = new double[64];
+        this.nodeQuantOffsets = new double[64];
+        this.nodeQuantCodeSums = new long[64];
+        this.l0Cap = options.m * 2;
+        this.l0Slots = new int[64 * this.l0Cap];
+        this.l0Counts = new int[64];
         this.entry = -1;
         this.maxLevel = -1;
         long seedValue = (long)options.seed % 2147483646;
@@ -95,23 +137,84 @@ public class VectorIndex {
         return this.ValidateCoordinates(vector, 0);
     }
 
+    private void AppendFloatChunk() {
+        int idx = this.chunks.Count;
+        VectorChunk chunk = new VectorChunk(this.chunkRows * this.options.dimensions);
+        this.chunks.Add(chunk);
+        if (idx >= this.chunkPtrs.Length) {
+            nint[] np = new nint[this.chunkPtrs.Length * 2];
+            for (int i = 0; i < this.chunkPtrs.Length; i = i + 1) { np[i] = this.chunkPtrs[i]; }
+            this.chunkPtrs = np;
+        }
+        this.chunkPtrs[idx] = (nint)chunk.values;
+    }
+
+    private void AppendCodeChunk() {
+        int idx = this.codeChunks.Count;
+        VectorCodeChunk chunk = new VectorCodeChunk(this.chunkRows * this.options.dimensions);
+        this.codeChunks.Add(chunk);
+        if (idx >= this.codeChunkPtrs.Length) {
+            nint[] np = new nint[this.codeChunkPtrs.Length * 2];
+            for (int i = 0; i < this.codeChunkPtrs.Length; i = i + 1) { np[i] = this.codeChunkPtrs[i]; }
+            this.codeChunkPtrs = np;
+        }
+        this.codeChunkPtrs[idx] = (nint)chunk.values;
+    }
+
+    private void RegisterNodeMeta(int slot, int id, int active, double invNorm, double qScale, double qOffset, long qCodeSum) {
+        if (slot >= this.nodeIds.Length) {
+            int cap = this.nodeIds.Length * 2;
+            while (cap <= slot) { cap = cap * 2; }
+            int[] nIds = new int[cap];
+            byte[] nAct = new byte[cap];
+            double[] nInv = new double[cap];
+            double[] nSc = new double[cap];
+            double[] nOff = new double[cap];
+            long[] nSum = new long[cap];
+            int[] nL0C = new int[cap];
+            int[] nL0S = new int[cap * this.l0Cap];
+            int old = this.nodeIds.Length;
+            NativeMemory.Copy((nint)nIds, (nint)this.nodeIds, old * 4);
+            NativeMemory.Copy((nint)nAct, (nint)this.nodeActive, old);
+            NativeMemory.Copy((nint)nInv, (nint)this.nodeInvNorms, old * 8);
+            NativeMemory.Copy((nint)nSc, (nint)this.nodeQuantScales, old * 8);
+            NativeMemory.Copy((nint)nOff, (nint)this.nodeQuantOffsets, old * 8);
+            NativeMemory.Copy((nint)nSum, (nint)this.nodeQuantCodeSums, old * 8);
+            NativeMemory.Copy((nint)nL0C, (nint)this.l0Counts, old * 4);
+            NativeMemory.Copy((nint)nL0S, (nint)this.l0Slots, old * this.l0Cap * 4);
+            this.nodeIds = nIds;
+            this.nodeActive = nAct;
+            this.nodeInvNorms = nInv;
+            this.nodeQuantScales = nSc;
+            this.nodeQuantOffsets = nOff;
+            this.nodeQuantCodeSums = nSum;
+            this.l0Counts = nL0C;
+            this.l0Slots = nL0S;
+        }
+        this.nodeIds[slot] = id;
+        this.nodeActive[slot] = (byte)active;
+        this.nodeInvNorms[slot] = invNorm;
+        this.nodeQuantScales[slot] = qScale;
+        this.nodeQuantOffsets[slot] = qOffset;
+        this.nodeQuantCodeSums[slot] = qCodeSum;
+        this.l0Counts[slot] = 0;
+    }
+
     public void CopyIntoSlot(int slot, float[] vector) {
-        int chunk = slot / this.chunkRows;
+        int chunk = this.chunkShift >= 0 ? (slot >> this.chunkShift) : (slot / this.chunkRows);
         if (chunk == this.chunks.Count) {
-            this.chunks.Add(new VectorChunk(this.chunkRows * this.options.dimensions));
+            this.AppendFloatChunk();
         }
-        VectorChunk owner = this.chunks[chunk];
-        int offset = (slot % this.chunkRows) * this.options.dimensions;
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
-            owner.values[offset + i] = vector[i];
-        }
+        int row = this.chunkShift >= 0 ? (slot & this.chunkMask) : (slot % this.chunkRows);
+        int dims = this.options.dimensions;
+        NativeMemory.Copy(this.chunkPtrs[chunk] + (nint)(row * dims * 4), (nint)vector, dims * 4);
     }
 
     // 槽位量化码存储就位：与 CopyIntoSlot 相同的块增长规则。
     public void EnsureCodeStorage(int slot) {
-        int chunk = slot / this.chunkRows;
+        int chunk = this.chunkShift >= 0 ? (slot >> this.chunkShift) : (slot / this.chunkRows);
         if (chunk == this.codeChunks.Count) {
-            this.codeChunks.Add(new VectorCodeChunk(this.chunkRows * this.options.dimensions));
+            this.AppendCodeChunk();
         }
     }
 
@@ -119,26 +222,39 @@ public class VectorIndex {
     //（与 ValidateCoordinates 同口径），scale/offset 经 out 交付。
     // 非退化向量（max==min）按 1e-12 量程处理，码全落 0。
     public double QuantizeIntoSlot(int slot, float[] vector, out double scale, out double offset) {
+        long codeSum = 0L;
+        return this.QuantizeIntoSlotWithSum(slot, vector, out scale, out offset, out codeSum);
+    }
+
+    private double QuantizeIntoSlotWithSum(int slot, float[] vector, out double scale, out double offset, out long codeSum) {
+        int dims = this.options.dimensions;
         double min = vector[0];
         double max = vector[0];
-        for (int i = 1; i < this.options.dimensions; i = i + 1) {
+        for (int i = 1; i < dims; i = i + 1) {
             double v = vector[i];
             if (v < min) { min = v; }
             if (v > max) { max = v; }
         }
         double range = max - min;
         if (range <= 0) { range = 1e-12; }
-        scale = range / 255;
+        double s = range / 255.0;
+        double invS = 1.0 / s;
+        scale = s;
         offset = min;
         this.EnsureCodeStorage(slot);
         VectorCodeChunk owner = this.codeChunks[slot / this.chunkRows];
-        int at = (slot % this.chunkRows) * this.options.dimensions;
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
-            double q = (vector[i] - min) / scale;
+        byte[] dst = owner.values;
+        int at = (slot % this.chunkRows) * dims;
+        long sumCodes = 0L;
+        for (int i = 0; i < dims; i = i + 1) {
+            double q = (vector[i] - min) * invS;
             if (q < 0) { q = 0; }
             if (q > 255) { q = 255; }
-            owner.values[at + i] = (byte)q;
+            int b = (int)(byte)q;
+            dst[at + i] = (byte)b;
+            sumCodes = sumCodes + (long)b;
         }
+        codeSum = sumCodes;
         return this.ValidateCoordinates(vector, 0);
     }
 
@@ -149,25 +265,64 @@ public class VectorIndex {
     // cosine: 1 - invNq·invNs·(s·Σq·code + o·Σq)，Σq 预存 work.sumQuery；
     // L2: Σ (q - (code·s + o))² 逐维。
     public double DistanceToCode(VectorWorkspace work, int slot) {
-        VectorCodeChunk owner = this.codeChunks[slot / this.chunkRows];
-        int offset = (slot % this.chunkRows) * this.options.dimensions;
-        VectorNode node = this.nodes[slot];
-        double scale = node.quantScale;
-        double shift = node.quantOffset;
-        double sum = 0;
+        int dims = this.options.dimensions;
+        int cIdx = this.chunkShift >= 0 ? (slot >> this.chunkShift) : (slot / this.chunkRows);
+        int row = this.chunkShift >= 0 ? (slot & this.chunkMask) : (slot % this.chunkRows);
+        nint cBase = this.codeChunkPtrs[cIdx] + (nint)(row * dims);
+        nint qBase = (nint)work.query + (nint)(work.offset * 4);
+        double scale = this.nodeQuantScales[slot];
+        double shift = this.nodeQuantOffsets[slot];
+        int limit4 = dims - (dims & 3);
         if (this.options.metric == 1) {
-            for (int i = 0; i < this.options.dimensions; i = i + 1) {
-                double delta = (double)work.query[work.offset + i]
-                - ((double)owner.values[offset + i] * scale + shift);
-                sum = sum + delta * delta;
+            double s0 = 0.0;
+            double s1 = 0.0;
+            double s2 = 0.0;
+            double s3 = 0.0;
+            for (int i = 0; i < limit4; i = i + 4) {
+                Span<byte> c4 = new Span<byte>(cBase + (nint)i, 4);
+                Span<float> q4 = new Span<float>(qBase + (nint)(i * 4), 4);
+                double d0 = (double)q4[0] - ((double)(c4[0] & 255) * scale + shift);
+                double d1 = (double)q4[1] - ((double)(c4[1] & 255) * scale + shift);
+                double d2 = (double)q4[2] - ((double)(c4[2] & 255) * scale + shift);
+                double d3 = (double)q4[3] - ((double)(c4[3] & 255) * scale + shift);
+                s0 = s0 + d0 * d0;
+                s1 = s1 + d1 * d1;
+                s2 = s2 + d2 * d2;
+                s3 = s3 + d3 * d3;
+            }
+            double sum = (s0 + s1) + (s2 + s3);
+            if (limit4 < dims) {
+                Span<byte> codes = new Span<byte>(cBase, dims);
+                Span<float> q = new Span<float>(qBase, dims);
+                for (int i = limit4; i < dims; i = i + 1) {
+                    double delta = (double)q[i] - ((double)(codes[i] & 255) * scale + shift);
+                    sum = sum + delta * delta;
+                }
             }
             return sum;
         }
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
-            sum = sum + (double)work.query[work.offset + i] * (double)owner.values[offset + i];
+        double a0 = 0.0;
+        double a1 = 0.0;
+        double a2 = 0.0;
+        double a3 = 0.0;
+        for (int i = 0; i < limit4; i = i + 4) {
+            Span<byte> c4 = new Span<byte>(cBase + (nint)i, 4);
+            Span<float> q4 = new Span<float>(qBase + (nint)(i * 4), 4);
+            a0 = a0 + (double)q4[0] * (double)(c4[0] & 255);
+            a1 = a1 + (double)q4[1] * (double)(c4[1] & 255);
+            a2 = a2 + (double)q4[2] * (double)(c4[2] & 255);
+            a3 = a3 + (double)q4[3] * (double)(c4[3] & 255);
         }
-        double approx = sum * scale + shift * work.sumQuery;
-        double distance = 1.0 - approx * work.inverseNorm * node.inverseNorm;
+        double dotSum = (a0 + a1) + (a2 + a3);
+        if (limit4 < dims) {
+            Span<byte> codes = new Span<byte>(cBase, dims);
+            Span<float> q = new Span<float>(qBase, dims);
+            for (int i = limit4; i < dims; i = i + 1) {
+                dotSum = dotSum + (double)q[i] * (double)(codes[i] & 255);
+            }
+        }
+        double approx = dotSum * scale + shift * work.sumQuery;
+        double distance = 1.0 - approx * work.inverseNorm * this.nodeInvNorms[slot];
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
         return distance;
@@ -187,39 +342,63 @@ public class VectorIndex {
     public double DistanceTo(VectorWorkspace work, int slot) {
         work.distanceCount = work.distanceCount + 1;
         if (this.options.quantize) { return this.DistanceToCode(work, slot); }
-        VectorChunk owner = this.chunks[slot / this.chunkRows];
-        int offset = (slot % this.chunkRows) * this.options.dimensions;
-        double sum = 0;
         int dims = this.options.dimensions;
-        int simdLimit = dims - (dims % 4);
+        int cIdx = this.chunkShift >= 0 ? (slot >> this.chunkShift) : (slot / this.chunkRows);
+        int row = this.chunkShift >= 0 ? (slot & this.chunkMask) : (slot % this.chunkRows);
+        nint vBase = this.chunkPtrs[cIdx] + (nint)(row * dims * 4);
+        nint qBase = (nint)work.query + (nint)(work.offset * 4);
+        int limit4 = dims - (dims & 3);
         if (this.options.metric == 1) {
-            Vector128 acc = Vector128.Zero;
-            for (int i = 0; i < simdLimit; i = i + 4) {
-                Vector128 q = Vector128.Load(work.query, work.offset + i);
-                Vector128 v = Vector128.Load(owner.values, offset + i);
-                Vector128 diff = Vector128.SubtractFloat(q, v);
-                acc = Vector128.MultiplyAdd(diff, diff, acc);
+            double s0 = 0.0;
+            double s1 = 0.0;
+            double s2 = 0.0;
+            double s3 = 0.0;
+            for (int i = 0; i < limit4; i = i + 4) {
+                nint off = (nint)(i * 4);
+                Span<float> q4 = new Span<float>(qBase + off, 4);
+                Span<float> v4 = new Span<float>(vBase + off, 4);
+                double d0 = (double)q4[0] - (double)v4[0];
+                double d1 = (double)q4[1] - (double)v4[1];
+                double d2 = (double)q4[2] - (double)v4[2];
+                double d3 = (double)q4[3] - (double)v4[3];
+                s0 = s0 + d0 * d0;
+                s1 = s1 + d1 * d1;
+                s2 = s2 + d2 * d2;
+                s3 = s3 + d3 * d3;
             }
-            Vector128.Store(work.scratch, 0, acc);
-            sum = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
-            for (int i = simdLimit; i < dims; i = i + 1) {
-                double delta = (double)work.query[work.offset + i] - (double)owner.values[offset + i];
-                sum = sum + delta * delta;
+            double sum = (s0 + s1) + (s2 + s3);
+            if (limit4 < dims) {
+                Span<float> q = new Span<float>(qBase, dims);
+                Span<float> v = new Span<float>(vBase, dims);
+                for (int i = limit4; i < dims; i = i + 1) {
+                    double delta = (double)q[i] - (double)v[i];
+                    sum = sum + delta * delta;
+                }
             }
             return sum;
         }
-        Vector128 dotAcc = Vector128.Zero;
-        for (int i = 0; i < simdLimit; i = i + 4) {
-            Vector128 q = Vector128.Load(work.query, work.offset + i);
-            Vector128 v = Vector128.Load(owner.values, offset + i);
-            dotAcc = Vector128.MultiplyAdd(q, v, dotAcc);
+        double a0 = 0.0;
+        double a1 = 0.0;
+        double a2 = 0.0;
+        double a3 = 0.0;
+        for (int i = 0; i < limit4; i = i + 4) {
+            nint off = (nint)(i * 4);
+            Span<float> q4 = new Span<float>(qBase + off, 4);
+            Span<float> v4 = new Span<float>(vBase + off, 4);
+            a0 = a0 + (double)q4[0] * (double)v4[0];
+            a1 = a1 + (double)q4[1] * (double)v4[1];
+            a2 = a2 + (double)q4[2] * (double)v4[2];
+            a3 = a3 + (double)q4[3] * (double)v4[3];
         }
-        Vector128.Store(work.scratch, 0, dotAcc);
-        sum = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
-        for (int i = simdLimit; i < dims; i = i + 1) {
-            sum = sum + (double)work.query[work.offset + i] * (double)owner.values[offset + i];
+        double dot = (a0 + a1) + (a2 + a3);
+        if (limit4 < dims) {
+            Span<float> q = new Span<float>(qBase, dims);
+            Span<float> v = new Span<float>(vBase, dims);
+            for (int i = limit4; i < dims; i = i + 1) {
+                dot = dot + (double)q[i] * (double)v[i];
+            }
         }
-        double distance = 1.0 - sum * work.inverseNorm * this.nodes[slot].inverseNorm;
+        double distance = 1.0 - dot * work.inverseNorm * this.nodeInvNorms[slot];
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
         return distance;
@@ -227,80 +406,136 @@ public class VectorIndex {
 
     public double DistanceBetween(int a, int b) {
         if (this.options.quantize) { return this.DistanceBetweenCode(a, b); }
-        VectorChunk ca = this.chunks[a / this.chunkRows];
-        VectorChunk cb = this.chunks[b / this.chunkRows];
-        int oa = (a % this.chunkRows) * this.options.dimensions;
-        int ob = (b % this.chunkRows) * this.options.dimensions;
-        double sum = 0;
         int dims = this.options.dimensions;
-        int simdLimit = dims - (dims % 4);
+        int caIdx = this.chunkShift >= 0 ? (a >> this.chunkShift) : (a / this.chunkRows);
+        int cbIdx = this.chunkShift >= 0 ? (b >> this.chunkShift) : (b / this.chunkRows);
+        int ra = this.chunkShift >= 0 ? (a & this.chunkMask) : (a % this.chunkRows);
+        int rb = this.chunkShift >= 0 ? (b & this.chunkMask) : (b % this.chunkRows);
+        nint aBase = this.chunkPtrs[caIdx] + (nint)(ra * dims * 4);
+        nint bBase = this.chunkPtrs[cbIdx] + (nint)(rb * dims * 4);
+        int limit4 = dims - (dims & 3);
         if (this.options.metric == 1) {
-            Vector128 acc = Vector128.Zero;
-            for (int i = 0; i < simdLimit; i = i + 4) {
-                Vector128 va = Vector128.Load(ca.values, oa + i);
-                Vector128 vb = Vector128.Load(cb.values, ob + i);
-                Vector128 diff = Vector128.SubtractFloat(va, vb);
-                acc = Vector128.MultiplyAdd(diff, diff, acc);
+            double s0 = 0.0;
+            double s1 = 0.0;
+            double s2 = 0.0;
+            double s3 = 0.0;
+            for (int i = 0; i < limit4; i = i + 4) {
+                nint off = (nint)(i * 4);
+                Span<float> va4 = new Span<float>(aBase + off, 4);
+                Span<float> vb4 = new Span<float>(bBase + off, 4);
+                double d0 = (double)va4[0] - (double)vb4[0];
+                double d1 = (double)va4[1] - (double)vb4[1];
+                double d2 = (double)va4[2] - (double)vb4[2];
+                double d3 = (double)va4[3] - (double)vb4[3];
+                s0 = s0 + d0 * d0;
+                s1 = s1 + d1 * d1;
+                s2 = s2 + d2 * d2;
+                s3 = s3 + d3 * d3;
             }
-            Vector128.Store(this.scratch, 0, acc);
-            sum = (double)this.scratch[0] + (double)this.scratch[1] + (double)this.scratch[2] + (double)this.scratch[3];
-            for (int i = simdLimit; i < dims; i = i + 1) {
-                double delta = (double)ca.values[oa + i] - (double)cb.values[ob + i];
-                sum = sum + delta * delta;
+            double sum = (s0 + s1) + (s2 + s3);
+            if (limit4 < dims) {
+                Span<float> va = new Span<float>(aBase, dims);
+                Span<float> vb = new Span<float>(bBase, dims);
+                for (int i = limit4; i < dims; i = i + 1) {
+                    double delta = (double)va[i] - (double)vb[i];
+                    sum = sum + delta * delta;
+                }
             }
             return sum;
         }
-        Vector128 dotAcc = Vector128.Zero;
-        for (int i = 0; i < simdLimit; i = i + 4) {
-            Vector128 va = Vector128.Load(ca.values, oa + i);
-            Vector128 vb = Vector128.Load(cb.values, ob + i);
-            dotAcc = Vector128.MultiplyAdd(va, vb, dotAcc);
+        double a0 = 0.0;
+        double a1 = 0.0;
+        double a2 = 0.0;
+        double a3 = 0.0;
+        for (int i = 0; i < limit4; i = i + 4) {
+            nint off = (nint)(i * 4);
+            Span<float> va4 = new Span<float>(aBase + off, 4);
+            Span<float> vb4 = new Span<float>(bBase + off, 4);
+            a0 = a0 + (double)va4[0] * (double)vb4[0];
+            a1 = a1 + (double)va4[1] * (double)vb4[1];
+            a2 = a2 + (double)va4[2] * (double)vb4[2];
+            a3 = a3 + (double)va4[3] * (double)vb4[3];
         }
-        Vector128.Store(this.scratch, 0, dotAcc);
-        sum = (double)this.scratch[0] + (double)this.scratch[1] + (double)this.scratch[2] + (double)this.scratch[3];
-        for (int i = simdLimit; i < dims; i = i + 1) {
-            sum = sum + (double)ca.values[oa + i] * (double)cb.values[ob + i];
+        double dot = (a0 + a1) + (a2 + a3);
+        if (limit4 < dims) {
+            Span<float> va = new Span<float>(aBase, dims);
+            Span<float> vb = new Span<float>(bBase, dims);
+            for (int i = limit4; i < dims; i = i + 1) {
+                dot = dot + (double)va[i] * (double)vb[i];
+            }
         }
-        double distance = 1.0 - sum * this.nodes[a].inverseNorm * this.nodes[b].inverseNorm;
+        double distance = 1.0 - dot * this.nodeInvNorms[a] * this.nodeInvNorms[b];
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
         return distance;
     }
 
-    // 码间反量化距离（图构建互距）。展开 (ca·sA+oA) 与 (cb·sB+oB)
-    // 的组合项，逐维只扫一遍码。
+    // 码间反量化距离（图构建互距）。余弦模式走 4 路精确整型点积 + 预存码和；
+    // L2 模式 4 路展开；全程直接从扁平数组与定长 Span(4) 读取，零越界分支、零 ARC 原子开销。
     public double DistanceBetweenCode(int a, int b) {
-        VectorCodeChunk ca = this.codeChunks[a / this.chunkRows];
-        VectorCodeChunk cb = this.codeChunks[b / this.chunkRows];
-        int oa = (a % this.chunkRows) * this.options.dimensions;
-        int ob = (b % this.chunkRows) * this.options.dimensions;
-        VectorNode na = this.nodes[a];
-        VectorNode nb = this.nodes[b];
-        double sumAB = 0;
-        double sumA = 0;
-        double sumB = 0;
+        int dims = this.options.dimensions;
+        int caIdx = this.chunkShift >= 0 ? (a >> this.chunkShift) : (a / this.chunkRows);
+        int cbIdx = this.chunkShift >= 0 ? (b >> this.chunkShift) : (b / this.chunkRows);
+        int ra = this.chunkShift >= 0 ? (a & this.chunkMask) : (a % this.chunkRows);
+        int rb = this.chunkShift >= 0 ? (b & this.chunkMask) : (b % this.chunkRows);
+        nint aBase = this.codeChunkPtrs[caIdx] + (nint)(ra * dims);
+        nint bBase = this.codeChunkPtrs[cbIdx] + (nint)(rb * dims);
+        double sA = this.nodeQuantScales[a];
+        double sB = this.nodeQuantScales[b];
+        double oA = this.nodeQuantOffsets[a];
+        double oB = this.nodeQuantOffsets[b];
+        int limit4 = dims - (dims & 3);
         if (this.options.metric == 1) {
-            double sum = 0;
-            for (int i = 0; i < this.options.dimensions; i = i + 1) {
-                double va = (double)ca.values[oa + i] * na.quantScale + na.quantOffset;
-                double vb = (double)cb.values[ob + i] * nb.quantScale + nb.quantOffset;
-                double delta = va - vb;
-                sum = sum + delta * delta;
+            double offDiff = oA - oB;
+            double d0s = 0.0;
+            double d1s = 0.0;
+            double d2s = 0.0;
+            double d3s = 0.0;
+            for (int i = 0; i < limit4; i = i + 4) {
+                Span<byte> va4 = new Span<byte>(aBase + (nint)i, 4);
+                Span<byte> vb4 = new Span<byte>(bBase + (nint)i, 4);
+                double d0 = (double)(va4[0] & 255) * sA - (double)(vb4[0] & 255) * sB + offDiff;
+                double d1 = (double)(va4[1] & 255) * sA - (double)(vb4[1] & 255) * sB + offDiff;
+                double d2 = (double)(va4[2] & 255) * sA - (double)(vb4[2] & 255) * sB + offDiff;
+                double d3 = (double)(va4[3] & 255) * sA - (double)(vb4[3] & 255) * sB + offDiff;
+                d0s = d0s + d0 * d0;
+                d1s = d1s + d1 * d1;
+                d2s = d2s + d2 * d2;
+                d3s = d3s + d3 * d3;
+            }
+            double sum = (d0s + d1s) + (d2s + d3s);
+            if (limit4 < dims) {
+                Span<byte> va = new Span<byte>(aBase, dims);
+                Span<byte> vb = new Span<byte>(bBase, dims);
+                for (int i = limit4; i < dims; i = i + 1) {
+                    double delta = (double)(va[i] & 255) * sA - (double)(vb[i] & 255) * sB + offDiff;
+                    sum = sum + delta * delta;
+                }
             }
             return sum;
         }
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
-            double va = (double)ca.values[oa + i];
-            double vb = (double)cb.values[ob + i];
-            sumAB = sumAB + va * vb;
-            sumA = sumA + va;
-            sumB = sumB + vb;
+        long sumAB = 0L;
+        for (int i = 0; i < limit4; i = i + 4) {
+            Span<byte> va4 = new Span<byte>(aBase + (nint)i, 4);
+            Span<byte> vb4 = new Span<byte>(bBase + (nint)i, 4);
+            int p0 = (va4[0] & 255) * (vb4[0] & 255);
+            int p1 = (va4[1] & 255) * (vb4[1] & 255);
+            int p2 = (va4[2] & 255) * (vb4[2] & 255);
+            int p3 = (va4[3] & 255) * (vb4[3] & 255);
+            sumAB = sumAB + (long)(p0 + p1 + p2 + p3);
         }
-        double approx = na.quantScale * nb.quantScale * sumAB
-        + na.quantScale * nb.quantOffset * sumB
-        + na.quantOffset * nb.quantScale * sumA
-        + na.quantOffset * nb.quantOffset * this.options.dimensions;
-        double distance = 1.0 - approx * na.inverseNorm * nb.inverseNorm;
+        if (limit4 < dims) {
+            Span<byte> va = new Span<byte>(aBase, dims);
+            Span<byte> vb = new Span<byte>(bBase, dims);
+            for (int i = limit4; i < dims; i = i + 1) {
+                sumAB = sumAB + (long)((va[i] & 255) * (vb[i] & 255));
+            }
+        }
+        double approx = sA * sB * (double)sumAB
+        + sA * oB * (double)this.nodeQuantCodeSums[b]
+        + oA * sB * (double)this.nodeQuantCodeSums[a]
+        + oA * oB * (double)dims;
+        double distance = 1.0 - approx * this.nodeInvNorms[a] * this.nodeInvNorms[b];
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
         return distance;
@@ -324,17 +559,20 @@ public class VectorIndex {
     public int Greedy(VectorWorkspace work, int start, int layer) {
         int best = start;
         double bestDistance = this.DistanceTo(work, best);
+        int bestId = this.nodeIds[best];
         bool changed = true;
         while (changed) {
             changed = false;
             VectorNeighbors neighbors = this.nodes[best].layers[layer];
-            for (int i = 0; i < neighbors.count; i = i + 1) {
+            int nCount = neighbors.count;
+            for (int i = 0; i < nCount; i = i + 1) {
                 int candidate = neighbors.slots[i];
                 double distance = this.DistanceTo(work, candidate);
-                if (VectorHeap.Before(distance, this.nodes[candidate].id, candidate,
-                bestDistance, this.nodes[best].id, best)) {
+                int candId = this.nodeIds[candidate];
+                if (distance < bestDistance || (distance == bestDistance && (candId < bestId || (candId == bestId && candidate < best)))) {
                     best = candidate;
                     bestDistance = distance;
+                    bestId = candId;
                     changed = true;
                 }
             }
@@ -346,57 +584,113 @@ public class VectorIndex {
     bool activeOnly, VectorFilter filter) {
         VectorHeap candidates = new VectorHeap(ef + 1, false);
         VectorHeap nearest = new VectorHeap(ef + 1, true);
-        work.epoch = work.epoch + 1;
-        work.visited[start] = work.epoch;
+        this.SearchLayerInto(work, start, layer, ef, activeOnly, filter, candidates, nearest);
+        return nearest;
+    }
+
+    private void SearchLayerInto(VectorWorkspace work, int start, int layer, int ef,
+    bool activeOnly, VectorFilter filter, VectorHeap candidates, VectorHeap nearest) {
+        candidates.count = 0;
+        nearest.count = 0;
+        int epoch = work.epoch + 1;
+        work.epoch = epoch;
+        work.visited[start] = epoch;
         double firstDistance = this.DistanceTo(work, start);
-        candidates.Push(start, this.nodes[start].id, firstDistance);
-        if (this.Admit(start, activeOnly, filter)) { nearest.Push(start, this.nodes[start].id, firstDistance); }
+        int startId = this.nodeIds[start];
+        candidates.Push(start, startId, firstDistance);
+        if (!activeOnly || (this.nodeActive[start] != 0 && (filter == null || filter(startId)))) {
+            nearest.Push(start, startId, firstDistance);
+        }
+        if (layer == 0) {
+            int stride = this.l0Cap;
+            while (candidates.count > 0) {
+                int current = candidates.slots[0];
+                double currentDistance = candidates.distances[0];
+                if (nearest.count >= ef && currentDistance > nearest.distances[0]) { break; }
+                candidates.Pop();
+                int nCount = this.l0Counts[current];
+                int baseIdx = current * stride;
+                for (int i = 0; i < nCount; i = i + 1) {
+                    int neighbor = this.l0Slots[baseIdx + i];
+                    if (work.visited[neighbor] == epoch) { continue; }
+                    work.visited[neighbor] = epoch;
+                    double distance = this.DistanceTo(work, neighbor);
+                    if (nearest.count < ef || distance <= nearest.distances[0]) {
+                        int id = this.nodeIds[neighbor];
+                        candidates.Push(neighbor, id, distance);
+                        if (!activeOnly || (this.nodeActive[neighbor] != 0 && (filter == null || filter(id)))) {
+                            nearest.Push(neighbor, id, distance);
+                            if (nearest.count > ef) { nearest.Pop(); }
+                        }
+                    }
+                }
+            }
+            return;
+        }
         while (candidates.count > 0) {
             int current = candidates.slots[0];
             double currentDistance = candidates.distances[0];
             if (nearest.count >= ef && currentDistance > nearest.distances[0]) { break; }
             candidates.Pop();
             VectorNeighbors neighbors = this.nodes[current].layers[layer];
-            for (int i = 0; i < neighbors.count; i = i + 1) {
+            int nCount = neighbors.count;
+            for (int i = 0; i < nCount; i = i + 1) {
                 int neighbor = neighbors.slots[i];
-                if (work.visited[neighbor] == work.epoch) { continue; }
-                work.visited[neighbor] = work.epoch;
+                if (work.visited[neighbor] == epoch) { continue; }
+                work.visited[neighbor] = epoch;
                 double distance = this.DistanceTo(work, neighbor);
-                int id = this.nodes[neighbor].id;
                 if (nearest.count < ef || distance <= nearest.distances[0]) {
+                    int id = this.nodeIds[neighbor];
                     candidates.Push(neighbor, id, distance);
-                    if (this.Admit(neighbor, activeOnly, filter)) {
+                    if (!activeOnly || (this.nodeActive[neighbor] != 0 && (filter == null || filter(id)))) {
                         nearest.Push(neighbor, id, distance);
                         if (nearest.count > ef) { nearest.Pop(); }
                     }
                 }
             }
         }
-        return nearest;
     }
 
     public VectorNeighbors SelectNeighbors(int center, VectorHeap candidates, int limit) {
-        VectorHeap ordered = new VectorHeap(candidates.count + 1, false);
-        for (int i = 0; i < candidates.count; i = i + 1) {
+        int cCount = candidates.count;
+        if (this.addOrderHeap == null) {
+            this.addOrderHeap = new VectorHeap(cCount + 1, false);
+        }
+        if (this.addRejected == null || this.addRejected.Length < cCount) {
+            int cap = cCount < 64 ? 64 : cCount * 2;
+            this.addRejected = new int[cap];
+        }
+        return this.SelectNeighborsInto(center, candidates, limit, new VectorNeighbors(limit), this.addOrderHeap, this.addRejected);
+    }
+
+    private VectorNeighbors SelectNeighborsInto(int center, VectorHeap candidates, int limit,
+    VectorNeighbors selected, VectorHeap ordered, int[] rejected) {
+        int cCount = candidates.count;
+        ordered.count = 0;
+        for (int i = 0; i < cCount; i = i + 1) {
             ordered.Push(candidates.slots[i], candidates.ids[i], candidates.distances[i]);
         }
-        VectorNeighbors selected = new VectorNeighbors(limit);
-        List<int> rejected = new List<int>();
+        selected.count = 0;
+        int rejCount = 0;
         while (ordered.count > 0 && selected.count < limit) {
             int candidate = ordered.slots[0];
             double distance = ordered.distances[0];
             ordered.Pop();
             if (candidate == center || selected.Contains(candidate)) { continue; }
             bool diverse = true;
-            for (int i = 0; i < selected.count; i = i + 1) {
+            int sc = selected.count;
+            for (int i = 0; i < sc; i = i + 1) {
                 if (this.DistanceBetween(candidate, selected.slots[i]) < distance) { diverse = false; break; }
             }
             if (diverse) {
-                selected.slots[selected.count] = candidate;
-                selected.count = selected.count + 1;
-            } else { rejected.Add(candidate); }
+                selected.slots[sc] = candidate;
+                selected.count = sc + 1;
+            } else {
+                rejected[rejCount] = candidate;
+                rejCount = rejCount + 1;
+            }
         }
-        for (int i = 0; i < rejected.Count && selected.count < limit; i = i + 1) {
+        for (int i = 0; i < rejCount && selected.count < limit; i = i + 1) {
             int candidate = rejected[i];
             if (!selected.Contains(candidate)) {
                 selected.slots[selected.count] = candidate;
@@ -409,18 +703,70 @@ public class VectorIndex {
     public void Link(int from, int to, int layer) {
         VectorNeighbors neighbors = this.nodes[from].layers[layer];
         if (neighbors.Contains(to)) { return; }
-        if (neighbors.count < neighbors.slots.Length) {
-            neighbors.slots[neighbors.count] = to;
-            neighbors.count = neighbors.count + 1;
+        int cap = neighbors.slots.Length;
+        if (neighbors.count < cap) {
+            int idx = neighbors.count;
+            neighbors.slots[idx] = to;
+            neighbors.count = idx + 1;
+            if (layer == 0) {
+                this.l0Slots[from * this.l0Cap + idx] = to;
+                this.l0Counts[from] = idx + 1;
+            }
             return;
         }
-        VectorHeap candidates = new VectorHeap(neighbors.count + 1, false);
-        for (int i = 0; i < neighbors.count; i = i + 1) {
-            int slot = neighbors.slots[i];
-            candidates.Push(slot, this.nodes[slot].id, this.DistanceBetween(from, slot));
+        if (this.addLinkHeap == null) {
+            this.addLinkHeap = new VectorHeap(cap + 2, false);
         }
-        candidates.Push(to, this.nodes[to].id, this.DistanceBetween(from, to));
-        this.nodes[from].layers[layer] = this.SelectNeighbors(from, candidates, neighbors.slots.Length);
+        this.addLinkHeap.count = 0;
+        int nCount = neighbors.count;
+        for (int i = 0; i < nCount; i = i + 1) {
+            int slot = neighbors.slots[i];
+            this.addLinkHeap.Push(slot, this.nodeIds[slot], this.DistanceBetween(from, slot));
+        }
+        this.addLinkHeap.Push(to, this.nodeIds[to], this.DistanceBetween(from, to));
+        if (this.addOrderHeap == null) {
+            this.addOrderHeap = new VectorHeap(this.addLinkHeap.count + 1, false);
+        }
+        if (this.addRejected == null || this.addRejected.Length < this.addLinkHeap.count) {
+            int rcap = this.addLinkHeap.count < 64 ? 64 : this.addLinkHeap.count * 2;
+            this.addRejected = new int[rcap];
+        }
+        this.SelectNeighborsInto(from, this.addLinkHeap, cap, neighbors, this.addOrderHeap, this.addRejected);
+        if (layer == 0) {
+            int nc = neighbors.count;
+            this.l0Counts[from] = nc;
+            int baseIdx = from * this.l0Cap;
+            for (int i = 0; i < nc; i = i + 1) {
+                this.l0Slots[baseIdx + i] = neighbors.slots[i];
+            }
+        }
+    }
+
+    private VectorWorkspace PrepareAddWorkspace(float[] query, int offset, double inverseNorm, double sumQuery) {
+        int needed = this.nodes.Count;
+        VectorWorkspace work = this.addWork;
+        if (work == null) {
+            int cap = needed < 64 ? 64 : needed;
+            work = new VectorWorkspace(query, offset, inverseNorm, cap);
+            this.addWork = work;
+        } else {
+            if (work.visited.Length < needed) {
+                int cap = work.visited.Length * 2;
+                while (cap < needed) { cap = cap * 2; }
+                work.visited = new int[cap];
+                work.epoch = 0;
+            } else if (work.epoch >= 2147483600) {
+                int[] v = work.visited;
+                for (int i = 0; i < v.Length; i = i + 1) { v[i] = 0; }
+                work.epoch = 0;
+            }
+            work.query = query;
+            work.offset = offset;
+            work.inverseNorm = inverseNorm;
+            work.distanceCount = 0;
+        }
+        work.sumQuery = sumQuery;
+        return work;
     }
 
     // 将传入向量一次性复制至紧凑连续存储；更新时保留旧槽位可达性。
@@ -430,30 +776,39 @@ public class VectorIndex {
         if (slot >= 2147483646) { throw new InvalidOperationException("Vector slot capacity exhausted"); }
         double quantScale = 0;
         double quantOffset = 0;
+        long quantCodeSum = 0L;
         if (this.options.quantize) {
-            // 量化模式不驻留 float 块：码 + scale/offset 即全部驻留。
-            this.QuantizeIntoSlot(slot, vector, out quantScale, out quantOffset);
+            // 量化模式不驻留 float 块：码 + scale/offset/codeSum 即全部驻留。
+            this.QuantizeIntoSlotWithSum(slot, vector, out quantScale, out quantOffset, out quantCodeSum);
         } else {
             this.CopyIntoSlot(slot, vector);
         }
         int level = this.NextLevel();
         VectorNode node = new VectorNode(id, level, this.options.m, inverseNorm);
-        if (this.options.quantize) { node.quantScale = quantScale; node.quantOffset = quantOffset; }
+        if (this.options.quantize) {
+            node.quantScale = quantScale;
+            node.quantOffset = quantOffset;
+            node.quantCodeSum = quantCodeSum;
+        }
         this.nodes.Add(node);
+        this.RegisterNodeMeta(slot, id, 1, inverseNorm, quantScale, quantOffset, quantCodeSum);
         int prevSlot = 0;
-        if (this.idSlots.TryGetValue(id, out prevSlot)) { this.nodes[prevSlot].active = 0; }
+        if (this.idSlots.TryGetValue(id, out prevSlot)) {
+            this.nodes[prevSlot].active = 0;
+            this.nodeActive[prevSlot] = (byte)0;
+        }
         this.idSlots[id] = slot;
         if (this.entry < 0) { this.entry = slot; this.maxLevel = level; return; }
         VectorWorkspace work;
         if (this.options.quantize) {
-            work = new VectorWorkspace(vector, 0, inverseNorm, this.nodes.Count);
             double sumQuery = 0;
-            for (int i = 0; i < this.options.dimensions; i = i + 1) { sumQuery = sumQuery + vector[i]; }
-            work.sumQuery = sumQuery;
+            int dims = this.options.dimensions;
+            for (int i = 0; i < dims; i = i + 1) { sumQuery = sumQuery + vector[i]; }
+            work = this.PrepareAddWorkspace(vector, 0, inverseNorm, sumQuery);
         } else {
             VectorChunk owner = this.chunks[slot / this.chunkRows];
             int offset = (slot % this.chunkRows) * this.options.dimensions;
-            work = new VectorWorkspace(owner.values, offset, inverseNorm, this.nodes.Count);
+            work = this.PrepareAddWorkspace(owner.values, offset, inverseNorm, 0.0);
         }
         int current = this.entry;
         for (int layer = this.maxLevel; layer > level; layer = layer - 1) {
@@ -463,10 +818,14 @@ public class VectorIndex {
         if (top > this.maxLevel) { top = this.maxLevel; }
         int constructionEf = this.options.efConstruction;
         if (constructionEf > slot) { constructionEf = slot; }
+        if (this.addCandHeap == null) {
+            this.addCandHeap = new VectorHeap(this.options.efConstruction + 2, false);
+            this.addNearHeap = new VectorHeap(this.options.efConstruction + 2, true);
+        }
         for (int layer = top; layer >= 0; layer = layer - 1) {
-            VectorHeap candidates = this.SearchLayer(work, current, layer, constructionEf, false, null);
-            int next = candidates.NearestSlot();
-            VectorNeighbors selected = this.SelectNeighbors(slot, candidates, this.options.m);
+            this.SearchLayerInto(work, current, layer, constructionEf, false, null, this.addCandHeap, this.addNearHeap);
+            int next = this.addNearHeap.NearestSlot();
+            VectorNeighbors selected = this.SelectNeighbors(slot, this.addNearHeap, this.options.m);
             for (int i = 0; i < selected.count; i = i + 1) {
                 int neighbor = selected.slots[i];
                 this.Link(slot, neighbor, layer);
@@ -481,6 +840,7 @@ public class VectorIndex {
         int slot = 0;
         if (!this.idSlots.TryGetValue(id, out slot)) { return false; }
         this.nodes[slot].active = 0;
+        this.nodeActive[slot] = (byte)0;
         this.idSlots.Remove(id);
         return true;
     }
@@ -647,11 +1007,28 @@ public class VectorIndex {
             active.Pop();
         }
         this.chunks = rebuilt.chunks;
+        this.codeChunks = rebuilt.codeChunks;
+        this.chunkPtrs = rebuilt.chunkPtrs;
+        this.codeChunkPtrs = rebuilt.codeChunkPtrs;
+        this.nodeIds = rebuilt.nodeIds;
+        this.nodeActive = rebuilt.nodeActive;
+        this.nodeInvNorms = rebuilt.nodeInvNorms;
+        this.nodeQuantScales = rebuilt.nodeQuantScales;
+        this.nodeQuantOffsets = rebuilt.nodeQuantOffsets;
+        this.nodeQuantCodeSums = rebuilt.nodeQuantCodeSums;
+        this.l0Slots = rebuilt.l0Slots;
+        this.l0Counts = rebuilt.l0Counts;
         this.nodes = rebuilt.nodes;
         this.idSlots = rebuilt.idSlots;
         this.entry = rebuilt.entry;
         this.maxLevel = rebuilt.maxLevel;
         this.randomState = rebuilt.randomState;
+        this.addWork = null;
+        this.addCandHeap = null;
+        this.addNearHeap = null;
+        this.addOrderHeap = null;
+        this.addLinkHeap = null;
+        this.addRejected = null;
         this.lastDistanceCount.Store(0);
     }
 
@@ -725,6 +1102,7 @@ public class VectorIndex {
             node.active = active;
             result.CopyIntoSlot(slot, vector);
             result.nodes.Add(node);
+            result.RegisterNodeMeta(slot, id, active, inverseNorm, 0.0, 0.0, 0L);
             if (active == 1) {
                 if (result.idSlots.ContainsKey(id)) { throw new ArgumentException("Duplicate active checkpoint id"); }
                 result.idSlots.Add(id, slot);
@@ -750,6 +1128,13 @@ public class VectorIndex {
                     }
                     neighbors.slots[neighbors.count] = target;
                     neighbors.count = neighbors.count + 1;
+                }
+                if (layer == 0) {
+                    result.l0Counts[slot] = neighbors.count;
+                    int baseIdx = slot * result.l0Cap;
+                    for (int i = 0; i < neighbors.count; i = i + 1) {
+                        result.l0Slots[baseIdx + i] = neighbors.slots[i];
+                    }
                 }
             }
         }
@@ -782,9 +1167,9 @@ public class VectorIndex {
 
     // 就位槽位向量存储：与 CopyIntoSlot 相同的块增长规则。
     private void EnsureSlotStorage(int slot) {
-        int chunk = slot / this.chunkRows;
+        int chunk = this.chunkShift >= 0 ? (slot >> this.chunkShift) : (slot / this.chunkRows);
         if (chunk == this.chunks.Count) {
-            this.chunks.Add(new VectorChunk(this.chunkRows * this.options.dimensions));
+            this.AppendFloatChunk();
         }
     }
 
@@ -901,15 +1286,17 @@ public class VectorIndex {
                 b.SeekRead(b.ReadPos() + bytes);
                 double scale = 0;
                 double shift = 0;
+                long codeSum = 0L;
                 double inverseNorm = 0;
                 if (active == 1) {
-                    inverseNorm = this.QuantizeIntoSlot(slot, this.importScratch, out scale, out shift);
+                    inverseNorm = this.QuantizeIntoSlotWithSum(slot, this.importScratch, out scale, out shift, out codeSum);
                 } else {
                     this.EnsureCodeStorage(slot);
                 }
                 node = new VectorNode((int)id, level, this.options.m, inverseNorm);
                 node.quantScale = scale;
                 node.quantOffset = shift;
+                node.quantCodeSum = codeSum;
             } else {
                 this.EnsureSlotStorage(slot);
                 VectorChunk owner = this.chunks[slot / this.chunkRows];
@@ -921,6 +1308,7 @@ public class VectorIndex {
             }
             if (active == 0) { node.active = 0; }
             this.nodes.Add(node);
+            this.RegisterNodeMeta(slot, node.id, active, node.inverseNorm, node.quantScale, node.quantOffset, node.quantCodeSum);
             if (active == 1) {
                 if (this.idSlots.ContainsKey(node.id)) {
                     b.Free();
@@ -982,6 +1370,13 @@ public class VectorIndex {
                     neighbors.slots[i] = target;
                 }
                 neighbors.count = count;
+                if (layer == 0) {
+                    this.l0Counts[slot] = count;
+                    int baseIdx = slot * this.l0Cap;
+                    for (int i = 0; i < count; i = i + 1) {
+                        this.l0Slots[baseIdx + i] = neighbors.slots[i];
+                    }
+                }
             }
         }
         this.pendingEdges = null;

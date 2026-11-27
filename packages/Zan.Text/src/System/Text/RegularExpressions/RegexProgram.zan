@@ -22,6 +22,10 @@ public partial class RegexProgram {
     public static int OpEmptyChk() { return 16; }
     public static int OpLook() { return 17; }
     public static int OpLookEnd() { return 18; }
+    public static int OpClassRepGreedy() { return 19; }
+    public static int OpClassRepLazy() { return 20; }
+    public static int OpAnyRepGreedy() { return 21; }
+    public static int OpAnyRepLazy() { return 22; }
 
     public static int LookAhead() { return 0; }
     public static int LookAheadNeg() { return 1; }
@@ -326,6 +330,57 @@ public partial class RegexProgram {
                 }
             }
         }
+
+        // 4. 窥孔融合：把单 OpClass / OpAny 的 PlusAt/StarAt 循环合并为单条重复指令（原地覆写入口，不移位 PC）
+        int fi = 0;
+        while (fi < n) {
+            if (fi + 3 < n && oa[fi] == 15 && (oa[fi + 1] == 3 || oa[fi + 1] == 2)
+                && oa[fi + 2] == 16 && ya[fi + 2] == fi + 4 && oa[fi + 3] == 6) {
+                int sx = xa[fi + 3];
+                int sy = ya[fi + 3];
+                bool isGreedy = (sx == fi && sy == fi + 4);
+                bool isLazy = (sx == fi + 4 && sy == fi);
+                if (isGreedy || isLazy) {
+                    if (oa[fi + 1] == 3) {
+                        oa[fi] = isGreedy ? 19 : 20;
+                        xa[fi] = xa[fi + 1];
+                        ya[fi] = 1;
+                        za[fi] = fi + 4;
+                    } else {
+                        oa[fi] = isGreedy ? 21 : 22;
+                        xa[fi] = 0;
+                        ya[fi] = 1;
+                        za[fi] = fi + 4;
+                    }
+                    fi = fi + 4;
+                    continue;
+                }
+            }
+            if (fi + 4 < n && oa[fi] == 6 && oa[fi + 1] == 15 && (oa[fi + 2] == 3 || oa[fi + 2] == 2)
+                && oa[fi + 3] == 16 && ya[fi + 3] == fi + 5
+                && oa[fi + 4] == 5 && xa[fi + 4] == fi) {
+                int sx = xa[fi];
+                int sy = ya[fi];
+                bool isGreedy = (sx == fi + 1 && sy == fi + 5);
+                bool isLazy = (sx == fi + 5 && sy == fi + 1);
+                if (isGreedy || isLazy) {
+                    if (oa[fi + 2] == 3) {
+                        oa[fi] = isGreedy ? 19 : 20;
+                        xa[fi] = xa[fi + 2];
+                        ya[fi] = 0;
+                        za[fi] = fi + 5;
+                    } else {
+                        oa[fi] = isGreedy ? 21 : 22;
+                        xa[fi] = 0;
+                        ya[fi] = 0;
+                        za[fi] = fi + 5;
+                    }
+                    fi = fi + 5;
+                    continue;
+                }
+            }
+            fi = fi + 1;
+        }
     }
 
     public string Error() { return this.error; }
@@ -607,6 +662,191 @@ public partial class RegexProgram {
                     if (packed < 0 || !this.ClassHasSlow(ci, packed >> 3)) { return false; }
                     pc = pc + 1;
                     sp = sp + (packed & 7);
+                }
+            } else if (o == 19) {
+                // OpClassRepGreedy: 单条紧循环吞并连续字符类，再从最长处回溯
+                int ci = this.axArr[pc];
+                int minReq = this.ayArr[pc];
+                int nextPc = this.azArr[pc];
+                long mlo = this.clsMaskLo[ci];
+                long mhi = this.clsMaskHi[ci];
+                int startSp = sp;
+                int cur = sp;
+                bool hasNonAscii = false;
+                while (cur < len) {
+                    int b = buf[cur] & 255;
+                    if (b < 128) {
+                        long mask = b < 64 ? mlo : mhi;
+                        if ((mask & (1L << (b & 63))) == 0L) { break; }
+                        cur = cur + 1;
+                    } else {
+                        int packed = RegexProgram.DecodeAt(inpPtr, len, cur);
+                        if (packed < 0 || !this.ClassHasSlow(ci, packed >> 3)) { break; }
+                        hasNonAscii = true;
+                        cur = cur + (packed & 7);
+                    }
+                }
+                if (minReq > 0 && cur == startSp) { return false; }
+                int spanLen = cur - startSp;
+                if (spanLen > 0) {
+                    run.budget = run.budget - spanLen;
+                    if (run.budget <= 0) { run.overflow = true; return false; }
+                }
+                if (!hasNonAscii) {
+                    int minSp = startSp + minReq;
+                    while (cur > minSp) {
+                        if (this.Step(run, nextPc, cur, depth + 1)) { return true; }
+                        if (run.overflow) { return false; }
+                        run.budget = run.budget - 1;
+                        if (run.budget <= 0) { run.overflow = true; return false; }
+                        cur = cur - 1;
+                    }
+                    pc = nextPc;
+                    sp = cur;
+                } else {
+                    int[] pos = new int[spanLen + 1];
+                    int cnt = 0;
+                    int p = startSp;
+                    pos[0] = p;
+                    while (p < cur) {
+                        int b = buf[p] & 255;
+                        p = p + (b < 128 ? 1 : (RegexProgram.DecodeAt(inpPtr, len, p) & 7));
+                        cnt = cnt + 1;
+                        pos[cnt] = p;
+                    }
+                    int idx = cnt;
+                    while (idx > minReq) {
+                        if (this.Step(run, nextPc, pos[idx], depth + 1)) { return true; }
+                        if (run.overflow) { return false; }
+                        run.budget = run.budget - 1;
+                        if (run.budget <= 0) { run.overflow = true; return false; }
+                        idx = idx - 1;
+                    }
+                    pc = nextPc;
+                    sp = pos[minReq];
+                }
+            } else if (o == 20) {
+                // OpClassRepLazy: 先满足 minReq，再逐字符向后尝试
+                int ci = this.axArr[pc];
+                int minReq = this.ayArr[pc];
+                int nextPc = this.azArr[pc];
+                long mlo = this.clsMaskLo[ci];
+                long mhi = this.clsMaskHi[ci];
+                int cur = sp;
+                if (minReq > 0) {
+                    if (cur >= len) { return false; }
+                    int b0 = buf[cur] & 255;
+                    if (b0 < 128) {
+                        long mask = b0 < 64 ? mlo : mhi;
+                        if ((mask & (1L << (b0 & 63))) == 0L) { return false; }
+                        cur = cur + 1;
+                    } else {
+                        int packed = RegexProgram.DecodeAt(inpPtr, len, cur);
+                        if (packed < 0 || !this.ClassHasSlow(ci, packed >> 3)) { return false; }
+                        cur = cur + (packed & 7);
+                    }
+                }
+                while (true) {
+                    if (this.Step(run, nextPc, cur, depth + 1)) { return true; }
+                    if (run.overflow || cur >= len) { return false; }
+                    run.budget = run.budget - 1;
+                    if (run.budget <= 0) { run.overflow = true; return false; }
+                    int b = buf[cur] & 255;
+                    if (b < 128) {
+                        long mask = b < 64 ? mlo : mhi;
+                        if ((mask & (1L << (b & 63))) == 0L) { return false; }
+                        cur = cur + 1;
+                    } else {
+                        int packed = RegexProgram.DecodeAt(inpPtr, len, cur);
+                        if (packed < 0 || !this.ClassHasSlow(ci, packed >> 3)) { return false; }
+                        cur = cur + (packed & 7);
+                    }
+                }
+            } else if (o == 21) {
+                // OpAnyRepGreedy: SIMD memchr 定位行尾，再反向回溯
+                int minReq = this.ayArr[pc];
+                int nextPc = this.azArr[pc];
+                int startSp = sp;
+                int limit = len;
+                if (!this.dotAll && sp < len) {
+                    int nl = NativeMemory.Find(inpPtr, sp, 10, len - sp);
+                    if (nl >= 0) { limit = nl; }
+                }
+                if (minReq > 0 && limit == startSp) { return false; }
+                int spanLen = limit - startSp;
+                if (spanLen > 0) {
+                    run.budget = run.budget - spanLen;
+                    if (run.budget <= 0) { run.overflow = true; return false; }
+                }
+                bool hasNonAscii = false;
+                for (int k = startSp; k < limit; k = k + 1) {
+                    if ((buf[k] & 128) != 0) { hasNonAscii = true; break; }
+                }
+                if (!hasNonAscii) {
+                    int minSp = startSp + minReq;
+                    int cur = limit;
+                    while (cur > minSp) {
+                        if (this.Step(run, nextPc, cur, depth + 1)) { return true; }
+                        if (run.overflow) { return false; }
+                        run.budget = run.budget - 1;
+                        if (run.budget <= 0) { run.overflow = true; return false; }
+                        cur = cur - 1;
+                    }
+                    pc = nextPc;
+                    sp = cur;
+                } else {
+                    int[] pos = new int[spanLen + 1];
+                    int cnt = 0;
+                    int p = startSp;
+                    pos[0] = p;
+                    while (p < limit) {
+                        int b = buf[p] & 255;
+                        p = p + (b < 128 ? 1 : (RegexProgram.DecodeAt(inpPtr, len, p) & 7));
+                        cnt = cnt + 1;
+                        pos[cnt] = p;
+                    }
+                    int idx = cnt;
+                    while (idx > minReq) {
+                        if (this.Step(run, nextPc, pos[idx], depth + 1)) { return true; }
+                        if (run.overflow) { return false; }
+                        run.budget = run.budget - 1;
+                        if (run.budget <= 0) { run.overflow = true; return false; }
+                        idx = idx - 1;
+                    }
+                    pc = nextPc;
+                    sp = pos[minReq];
+                }
+            } else if (o == 22) {
+                // OpAnyRepLazy
+                int minReq = this.ayArr[pc];
+                int nextPc = this.azArr[pc];
+                int cur = sp;
+                if (minReq > 0) {
+                    if (cur >= len) { return false; }
+                    int b0 = buf[cur] & 255;
+                    if (b0 < 128) {
+                        if (!this.dotAll && b0 == 10) { return false; }
+                        cur = cur + 1;
+                    } else {
+                        int packed = RegexProgram.DecodeAt(inpPtr, len, cur);
+                        if (packed < 0) { return false; }
+                        cur = cur + (packed & 7);
+                    }
+                }
+                while (true) {
+                    if (this.Step(run, nextPc, cur, depth + 1)) { return true; }
+                    if (run.overflow || cur >= len) { return false; }
+                    run.budget = run.budget - 1;
+                    if (run.budget <= 0) { run.overflow = true; return false; }
+                    int b = buf[cur] & 255;
+                    if (b < 128) {
+                        if (!this.dotAll && b == 10) { return false; }
+                        cur = cur + 1;
+                    } else {
+                        int packed = RegexProgram.DecodeAt(inpPtr, len, cur);
+                        if (packed < 0) { return false; }
+                        cur = cur + (packed & 7);
+                    }
                 }
             } else if (o == 1) {
                 // OpChar

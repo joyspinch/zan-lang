@@ -32,7 +32,7 @@ bool type_mentions_tp(zan_type_t *t) {
 
 static void unify_method_tp(zan_type_t *dp, zan_type_t *at, zan_ast_list_t *tps,
                             zan_type_t **bind) {
-  if (!dp || !at)
+  if (!dp || !at || at->kind == TYPE_VOID)
     return;
   if (dp->kind == TYPE_TYPE_PARAM) {
     for (int i = 0; i < tps->count; i++) {

@@ -46,6 +46,79 @@ static const uint64_t POW10_U64[20] = {
     10000000000000000000ULL
 };
 
+static const uint128_t POW10_128[29] = {
+    (uint128_t)1ULL,
+    (uint128_t)10ULL,
+    (uint128_t)100ULL,
+    (uint128_t)1000ULL,
+    (uint128_t)10000ULL,
+    (uint128_t)100000ULL,
+    (uint128_t)1000000ULL,
+    (uint128_t)10000000ULL,
+    (uint128_t)100000000ULL,
+    (uint128_t)1000000000ULL,
+    (uint128_t)10000000000ULL,
+    (uint128_t)100000000000ULL,
+    (uint128_t)1000000000000ULL,
+    (uint128_t)10000000000000ULL,
+    (uint128_t)100000000000000ULL,
+    (uint128_t)1000000000000000ULL,
+    (uint128_t)10000000000000000ULL,
+    (uint128_t)100000000000000000ULL,
+    (uint128_t)1000000000000000000ULL,
+    (uint128_t)10000000000000000000ULL,
+    (uint128_t)10000000000000000000ULL * 10ULL,
+    (uint128_t)10000000000000000000ULL * 100ULL,
+    (uint128_t)10000000000000000000ULL * 1000ULL,
+    (uint128_t)10000000000000000000ULL * 10000ULL,
+    (uint128_t)10000000000000000000ULL * 100000ULL,
+    (uint128_t)10000000000000000000ULL * 1000000ULL,
+    (uint128_t)10000000000000000000ULL * 10000000ULL,
+    (uint128_t)10000000000000000000ULL * 100000000ULL,
+    (uint128_t)10000000000000000000ULL * 1000000000ULL
+};
+
+#define M96_CONST ((((uint128_t)1) << 96) - 1)
+static const uint128_t MANTISSA_96_DIV_POW10[29] = {
+    M96_CONST / (uint128_t)1ULL,
+    M96_CONST / (uint128_t)10ULL,
+    M96_CONST / (uint128_t)100ULL,
+    M96_CONST / (uint128_t)1000ULL,
+    M96_CONST / (uint128_t)10000ULL,
+    M96_CONST / (uint128_t)100000ULL,
+    M96_CONST / (uint128_t)1000000ULL,
+    M96_CONST / (uint128_t)10000000ULL,
+    M96_CONST / (uint128_t)100000000ULL,
+    M96_CONST / (uint128_t)1000000000ULL,
+    M96_CONST / (uint128_t)10000000000ULL,
+    M96_CONST / (uint128_t)100000000000ULL,
+    M96_CONST / (uint128_t)1000000000000ULL,
+    M96_CONST / (uint128_t)10000000000000ULL,
+    M96_CONST / (uint128_t)100000000000000ULL,
+    M96_CONST / (uint128_t)1000000000000000ULL,
+    M96_CONST / (uint128_t)10000000000000000ULL,
+    M96_CONST / (uint128_t)100000000000000000ULL,
+    M96_CONST / (uint128_t)1000000000000000000ULL,
+    M96_CONST / (uint128_t)10000000000000000000ULL,
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 10ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 100ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 1000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 10000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 100000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 1000000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 10000000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 100000000ULL),
+    M96_CONST / ((uint128_t)10000000000000000000ULL * 1000000000ULL)
+};
+#undef M96_CONST
+
+static const char DEC_DIGITS200[201] =
+    "0001020304050607080910111213141516171819"
+    "2021222324252627282930313233343536373839"
+    "4041424344454647484950515253545556575859"
+    "6061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+
 static const double POW10_DBL[29] = {
     1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
     1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
@@ -53,8 +126,7 @@ static const double POW10_DBL[29] = {
 };
 
 static inline uint128_t pow10_128(int n) {
-    if (n <= 19) return (uint128_t)POW10_U64[n];
-    return (uint128_t)POW10_U64[19] * (uint128_t)POW10_U64[n - 19];
+    return POW10_128[n];
 }
 
 static inline int nlz32(uint32_t x) {
@@ -116,6 +188,22 @@ static uint128_t u128_divrem(uint128_t num, uint128_t den, uint128_t *rem_out) {
         if (rem_out) *rem_out = (uint128_t)r32;
         return q;
     }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (den <= UINT64_MAX) {
+        uint64_t d = (uint64_t)den;
+        uint64_t hi = (uint64_t)(num >> 64);
+        uint64_t lo = (uint64_t)num;
+        uint64_t q_hi = 0;
+        if (hi >= d) {
+            q_hi = hi / d;
+            hi -= q_hi * d;
+        }
+        uint64_t q_lo, rem;
+        __asm__("divq %4" : "=a"(q_lo), "=d"(rem) : "a"(lo), "d"(hi), "rm"(d));
+        if (rem_out) *rem_out = (uint128_t)rem;
+        return ((uint128_t)q_hi << 64) | (uint128_t)q_lo;
+    }
+#endif
 
     const uint64_t B = 0x100000000ull; /* base 2^32 */
     uint64_t u[6] = {0}, v[4] = {0}, q[5] = {0};
@@ -252,12 +340,73 @@ zan_decimal_t zan_decimal_from_parts(uint32_t lo, uint32_t mid, uint32_t hi, boo
     return make_dec(hi, lo64, is_negative, scale);
 }
 
+#if defined(__SIZEOF_INT128__)
+static inline uint64_t u128_shr_rne_u64(uint128_t num, int shift) {
+    uint64_t q = (uint64_t)(num >> shift);
+    uint128_t half = ((uint128_t)1) << (shift - 1);
+    uint128_t mask = (half << 1) - 1;
+    uint128_t rem = num & mask;
+    if (rem > half || (rem == half && (q & 1ULL))) q++;
+    return q;
+}
+#endif
+
 zan_decimal_t zan_decimal_from_double(double val) {
     if (isnan(val) || isinf(val)) return zan_decimal_zero();
     bool neg = val < 0;
     if (neg) val = -val;
+    if (val == 0.0) return make_dec(0, 0, false, 0);
 
-    /* 将浮点数转换为十进制表示，保留最多 28 位精度 */
+#if defined(__SIZEOF_INT128__)
+    /* 快路径 1：精确整数且 < 1e16（%.16g 恒输出完整整数） */
+    if (val < 1e16) {
+        double tr = trunc(val);
+        if (tr == val) {
+            return make_dec(0, (uint64_t)tr, neg, 0);
+        }
+    }
+    /* 快路径 2：常规十进制范围 [1e-4, 1e16) —— 精确 128 位二进→十进提取，
+     * 与 snprintf("%.16g") 的 16 位有效数字偶舍入结果逐位一致，免 libc 格式化与重解析。 */
+    if (val >= 1e-4 && val < 1e16) {
+        uint64_t bits;
+        memcpy(&bits, &val, sizeof(bits));
+        int e2 = (int)((bits >> 52) & 0x7FFU) - 1023;
+        uint64_t sig = (bits & 0x000FFFFFFFFFFFFFULL) | 0x0010000000000000ULL;
+        int shift = 52 - e2; /* shift in [1, 66] since val < 1e16 and non-integer */
+        if (shift >= 1 && shift <= 66) {
+            int k = (e2 * 1233) >> 12; /* floor(log10(val)) 初估，误差 <= 1 */
+            int scale = 15 - k;
+            if (scale < 0) scale = 0;
+            if (scale > 19) scale = 19;
+            uint64_t q = u128_shr_rne_u64((uint128_t)sig * (uint128_t)POW10_U64[scale], shift);
+            if (q >= 10000000000000000ULL) {
+                if (scale > 0) {
+                    scale--;
+                    q = u128_shr_rne_u64((uint128_t)sig * (uint128_t)POW10_U64[scale], shift);
+                    if (q >= 10000000000000000ULL) {
+                        q /= 10ULL;
+                        if (scale > 0) scale--;
+                    }
+                }
+            } else if (q < 1000000000000000ULL && scale < 19) {
+                int s2 = scale + 1;
+                uint64_t q2 = u128_shr_rne_u64((uint128_t)sig * (uint128_t)POW10_U64[s2], shift);
+                if (q2 < 10000000000000000ULL) {
+                    q = q2;
+                    scale = s2;
+                }
+            }
+            if ((q & 1ULL) == 0ULL) {
+                while (scale >= 4 && (q % 10000ULL) == 0ULL) { q /= 10000ULL; scale -= 4; }
+                while (scale >= 2 && (q % 100ULL) == 0ULL) { q /= 100ULL; scale -= 2; }
+                if (scale > 0 && (q % 10ULL) == 0ULL) { q /= 10ULL; scale--; }
+            }
+            return make_dec(0, q, neg, (uint8_t)scale);
+        }
+    }
+#endif
+
+    /* 极端量级回退（与原有 %.16g 解析契约一致） */
     char buf[64];
     snprintf(buf, sizeof(buf), "%.16g", val);
     zan_decimal_t res;
@@ -336,14 +485,15 @@ static inline zan_decimal_t from_m128(uint128_t m, bool neg, uint8_t scale) {
 static void align_scale(uint128_t *ma, uint8_t *sa, uint128_t *mb, uint8_t *sb) {
     if (*sa == *sb) return;
     if (*sa < *sb) {
+        if (*ma == 0) {
+            *sa = *sb;
+            return;
+        }
         uint8_t diff = *sb - *sa;
-        if (diff <= MAX_SCALE) {
-            uint128_t p = pow10_128(diff);
-            if (*ma <= u128_divrem(MANTISSA_96_MAX, p, NULL)) {
-                *ma *= p;
-                *sa = *sb;
-                return;
-            }
+        if (diff <= MAX_SCALE && *ma <= MANTISSA_96_DIV_POW10[diff]) {
+            *ma *= POW10_128[diff];
+            *sa = *sb;
+            return;
         }
         while (*sa < *sb && *ma <= MANTISSA_96_DIV10) {
             *ma *= 10;
@@ -352,7 +502,7 @@ static void align_scale(uint128_t *ma, uint8_t *sa, uint128_t *mb, uint8_t *sb) 
         if (*sa < *sb) {
             uint8_t rem_d = *sb - *sa;
             if (rem_d <= MAX_SCALE) {
-                *mb = u128_divrem(*mb, pow10_128(rem_d), NULL);
+                *mb = u128_divrem(*mb, POW10_128[rem_d], NULL);
                 *sb = *sa;
             } else {
                 while (*sa < *sb) {
@@ -362,14 +512,15 @@ static void align_scale(uint128_t *ma, uint8_t *sa, uint128_t *mb, uint8_t *sb) 
             }
         }
     } else {
+        if (*mb == 0) {
+            *sb = *sa;
+            return;
+        }
         uint8_t diff = *sa - *sb;
-        if (diff <= MAX_SCALE) {
-            uint128_t p = pow10_128(diff);
-            if (*mb <= u128_divrem(MANTISSA_96_MAX, p, NULL)) {
-                *mb *= p;
-                *sb = *sa;
-                return;
-            }
+        if (diff <= MAX_SCALE && *mb <= MANTISSA_96_DIV_POW10[diff]) {
+            *mb *= POW10_128[diff];
+            *sb = *sa;
+            return;
         }
         while (*sb < *sa && *mb <= MANTISSA_96_DIV10) {
             *mb *= 10;
@@ -378,7 +529,7 @@ static void align_scale(uint128_t *ma, uint8_t *sa, uint128_t *mb, uint8_t *sb) 
         if (*sb < *sa) {
             uint8_t rem_d = *sa - *sb;
             if (rem_d <= MAX_SCALE) {
-                *ma = u128_divrem(*ma, pow10_128(rem_d), NULL);
+                *ma = u128_divrem(*ma, POW10_128[rem_d], NULL);
                 *sa = *sb;
             } else {
                 while (*sb < *sa) {
@@ -461,6 +612,7 @@ static inline void strip_trailing_zeros(uint128_t *quo, int *scale) {
     uint128_t q = *quo;
     int s = *scale;
     if (q == 0) { *scale = 0; return; }
+    if (((uint64_t)q & 1ULL) != 0ULL) return;
     while (s >= 9 && q > UINT64_MAX) {
         uint32_t rem = 0;
         uint128_t next = u128_divrem_u32(q, 1000000000U, &rem);
@@ -477,9 +629,10 @@ static inline void strip_trailing_zeros(uint128_t *quo, int *scale) {
     }
     if (q <= UINT64_MAX) {
         uint64_t q64 = (uint64_t)q;
-        while (s > 0 && (q64 % 10ULL) == 0ULL) {
-            q64 /= 10ULL;
-            s--;
+        if ((q64 & 1ULL) == 0ULL) {
+            while (s >= 4 && (q64 % 10000ULL) == 0ULL) { q64 /= 10000ULL; s -= 4; }
+            while (s >= 2 && (q64 % 100ULL) == 0ULL) { q64 /= 100ULL; s -= 2; }
+            if (s > 0 && (q64 % 10ULL) == 0ULL) { q64 /= 10ULL; s--; }
         }
         q = (uint128_t)q64;
     }
@@ -514,6 +667,26 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
             strip_trailing_zeros(&ma, &scale);
         }
         return from_m128(ma, neg, (uint8_t)scale);
+    }
+
+    /* 快路径：64 位精确整除（ma % mb == 0），免去扩至 28 位再 Knuth D + 去尾零 */
+    if (ma <= UINT64_MAX && mb <= UINT64_MAX) {
+        uint64_t a64 = (uint64_t)ma;
+        uint64_t b64 = (uint64_t)mb;
+        uint64_t q64 = a64 / b64;
+        if (q64 * b64 == a64) {
+            uint128_t q128 = (uint128_t)q64;
+            if (scale < 0) {
+                int grow = -scale;
+                if (grow <= MAX_SCALE && q128 <= MANTISSA_96_DIV_POW10[grow]) {
+                    q128 *= POW10_128[grow];
+                    return make_dec((uint32_t)(q128 >> 64), (uint64_t)q128, neg, 0);
+                }
+            } else {
+                if (scale > 0) strip_trailing_zeros(&q128, &scale);
+                return from_m128(q128, neg, (uint8_t)scale);
+            }
+        }
     }
 
     /* 精度目标提到 28 位 scale（.NET 的目标精度）：分步快乘与原逐位循环停止点严格一致 */
@@ -693,17 +866,37 @@ int zan_decimal_to_string(zan_decimal_t d, char *buf, size_t buf_size) {
         while (m > UINT64_MAX) {
             uint32_t chunk = 0;
             m = u128_divrem_u32(m, 1000000000U, &chunk);
-            for (int k = 0; k < 9; k++) {
-                uint32_t q = chunk / 10U;
-                digits[dpos++] = (char)('0' + (int)(chunk - q * 10U));
+            for (int k = 0; k < 4; k++) {
+                uint32_t q = chunk / 100U;
+                uint32_t r = (chunk - q * 100U) * 2U;
+                digits[dpos++] = DEC_DIGITS200[r + 1];
+                digits[dpos++] = DEC_DIGITS200[r];
                 chunk = q;
             }
+            digits[dpos++] = (char)('0' + (int)chunk);
         }
         uint64_t m64 = (uint64_t)m;
-        while (m64 > 0) {
-            uint64_t q = m64 / 10ULL;
-            digits[dpos++] = (char)('0' + (int)(m64 - q * 10ULL));
+        while (m64 > UINT32_MAX) {
+            uint64_t q = m64 / 100ULL;
+            uint32_t r = (uint32_t)(m64 - q * 100ULL) * 2U;
+            digits[dpos++] = DEC_DIGITS200[r + 1];
+            digits[dpos++] = DEC_DIGITS200[r];
             m64 = q;
+        }
+        uint32_t m32 = (uint32_t)m64;
+        while (m32 >= 100U) {
+            uint32_t q = m32 / 100U;
+            uint32_t r = (m32 - q * 100U) * 2U;
+            digits[dpos++] = DEC_DIGITS200[r + 1];
+            digits[dpos++] = DEC_DIGITS200[r];
+            m32 = q;
+        }
+        if (m32 >= 10U) {
+            uint32_t r = m32 * 2U;
+            digits[dpos++] = DEC_DIGITS200[r + 1];
+            digits[dpos++] = DEC_DIGITS200[r];
+        } else if (m32 > 0U || dpos == 0) {
+            digits[dpos++] = (char)('0' + (int)m32);
         }
     }
 
