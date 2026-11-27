@@ -38,7 +38,7 @@ public class SshExecResult {
 }
 
 // SSH 客户端：连接 → 版本交换/KEX/加密切换 → 认证 → 通道命令执行。
-public class SshClient {
+public class SshClient : IDisposable {
     public string host;
     public int port;
     public string user;
@@ -98,8 +98,13 @@ public class SshClient {
     }
 
     public void Connect() {
+        this.Close();
         this.tcp = TcpClient.Connect(this.host, this.port);
         if (this.tcp == null || !this.tcp.IsConnected()) {
+            if (this.tcp != null) {
+                this.tcp.Close();
+                this.tcp = null;
+            }
             throw new SshException(SshError.IoError, "cannot connect to SSH server",
                 this.host + ":" + this.port.ToString());
         }
@@ -318,8 +323,14 @@ public class SshClient {
         SshReader pk = new SshReader(payload, 1, payload.Length - 1);
         string signedAlg = pk.ReadText();
         byte[] signedKeyBlob = pk.ReadString();
+        // RFC 4252 §7: session_id || SSH_MSG_USERAUTH_REQUEST || user || "ssh-connection" || "publickey" || TRUE || alg || keyBlob
         SshWriter signed2 = new SshWriter(512);
         signed2.WriteString(this.sessionId);
+        signed2.WriteByte(SshMessage.UserAuthRequest);
+        signed2.WriteText(this.user);
+        signed2.WriteText("ssh-connection");
+        signed2.WriteText("publickey");
+        signed2.WriteBool(true);
         signed2.WriteText(signedAlg);
         signed2.WriteString(signedKeyBlob);
         byte[] signature = key.Sign(signed2.ToArray());
@@ -371,9 +382,22 @@ public class SshClient {
         SshExecResult result = new SshExecResult();
         StringBuilder outBuf = new StringBuilder();
         StringBuilder errBuf = new StringBuilder();
-        this.ExecRequest(command);
-        this.CollectChannelOutput(result, outBuf, errBuf);
-        this.CloseChannel();
+        bool failed = true;
+        try {
+            this.ExecRequest(command);
+            this.CollectChannelOutput(result, outBuf, errBuf);
+            failed = false;
+        } finally {
+            if (failed) {
+                try {
+                    this.CloseChannel();
+                } catch (Exception ex) {
+                    // don't-mask: preserve original Exec failure
+                }
+            } else {
+                this.CloseChannel();
+            }
+        }
         return result;
     }
 
@@ -396,8 +420,17 @@ public class SshClient {
         w.WriteU32(2097152);
         w.WriteU32(32768);
         this.SendMessage(SshMessage.ChannelOpen, w.ToArray());
-        byte[] payload = this.packets.Recv();
-        int message = payload[0] & 255;
+        byte[] payload = null;
+        int message = 0;
+        while (true) {
+            payload = this.packets.Recv();
+            message = payload[0] & 255;
+            if (message == SshMessage.Ignore || message == SshMessage.Debug) { continue; }
+            if (message == SshMessage.Disconnect) {
+                SshClient.ThrowDisconnect(payload, "peer disconnected");
+            }
+            break;
+        }
         SshReader r = new SshReader(payload, 1, payload.Length - 1);
         if (message == SshMessage.ChannelOpenFailure) {
             r.ReadU32();
@@ -586,10 +619,15 @@ public class SshClient {
         if (this.pipe != null) {
             this.pipe.Close();
             this.pipe = null;
+            this.tcp = null;
         }
         if (this.tcp != null) {
             this.tcp.Close();
             this.tcp = null;
         }
+    }
+
+    public void Dispose() {
+        this.Close();
     }
 }

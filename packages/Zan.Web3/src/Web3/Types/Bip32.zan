@@ -70,6 +70,26 @@ public class Bip32 {
         return Sha512.Hash(outerStr, 128 + 64);
     }
 
+    private static bool IsAllZero32(byte[] b) {
+        if (b == null || b.Length < 32) { return true; }
+        int acc = 0;
+        for (int i = 0; i < 32; i = i + 1) {
+            acc = acc | (b[i] & 255);
+        }
+        return acc == 0;
+    }
+
+    private static bool IsGteCurveOrderN(byte[] b) {
+        if (b == null || b.Length < 32) { return true; }
+        for (int i = 0; i < 32; i = i + 1) {
+            int bv = b[i] & 255;
+            int nv = CurveOrderN[i];
+            if (bv > nv) { return true; }
+            if (bv < nv) { return false; }
+        }
+        return true;
+    }
+
     // 从助记词派生的 Seed（例如 64 字节）构建 BIP-32 根节点
     public static ExtendedKey FromSeed(byte[] seed) {
         if (seed == null || seed.Length < 16) { return null; }
@@ -82,6 +102,9 @@ public class Bip32 {
         for (int i = 0; i < 32; i = i + 1) {
             masterPriv[i] = (byte)(iHash[i] & 255);
             masterChain[i] = (byte)(iHash[32 + i] & 255);
+        }
+        if (IsAllZero32(masterPriv) || IsGteCurveOrderN(masterPriv)) {
+            return null;
         }
 
         return new ExtendedKey(masterPriv, masterChain, 0, 0);
@@ -132,7 +155,7 @@ public class Bip32 {
     // index: 子索引
     // hardened: 是否强化派生 (i >= 0x80000000)
     public static ExtendedKey DeriveChild(ExtendedKey parent, int index, bool hardened) {
-        if (parent == null || parent.Key == null || parent.ChainCode == null) {
+        if (parent == null || parent.Key == null || parent.ChainCode == null || index < 0) {
             return null;
         }
 
@@ -185,8 +208,10 @@ public class Bip32 {
             ir[i] = (byte)(iHash[32 + i] & 255);
         }
 
-        // childKey = (il + parent.Key) mod n
+        // BIP-32: IL >= n 或 (IL + parent.Key) mod n == 0 非法
+        if (IsGteCurveOrderN(il)) { return null; }
         byte[] childKey = addModN(il, parent.Key);
+        if (IsAllZero32(childKey)) { return null; }
 
         return new ExtendedKey(childKey, ir, parent.Depth + 1, (int)fullIndex);
     }
@@ -211,13 +236,14 @@ public class Bip32 {
                 hardened = true;
                 seg = seg.Substring(0, seg.Length - 1);
             }
+            if (seg.Length == 0) { return null; }
 
             int index = 0;
             for (int j = 0; j < seg.Length; j = j + 1) {
                 int c = seg[j] - 48;
-                if (c >= 0 && c <= 9) {
-                    index = index * 10 + c;
-                }
+                if (c < 0 || c > 9) { return null; }
+                if (index > (2147483647 - c) / 10) { return null; }
+                index = index * 10 + c;
             }
 
             curr = DeriveChild(curr, index, hardened);

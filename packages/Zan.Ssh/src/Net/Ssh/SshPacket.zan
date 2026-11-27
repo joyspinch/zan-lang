@@ -128,10 +128,13 @@ public class SshCipherState {
     }
 
     public byte[] Decrypt(byte[] aad, byte[] ciphertext, byte[] tag) {
+        if (ciphertext == null || tag == null || tag.Length < 16) {
+            throw new SshException(SshError.Malformed, "AES-GCM ciphertext or authentication tag is invalid");
+        }
         byte[] iv = this.FillNextIv();
         int ctLen = ciphertext.Length;
         int aadLen = aad != null ? aad.Length : 0;
-        if (this.gcmHwReady && tag != null && tag.Length >= 16) {
+        if (this.gcmHwReady) {
             byte[] plainHw = new byte[ctLen];
             nint aadPtr = aadLen > 0 ? (nint)aad : (nint)0;
             nint ctPtr = ctLen > 0 ? (nint)ciphertext : (nint)0;
@@ -150,7 +153,7 @@ public class SshCipherState {
         ok.Add(0);
         byte[] plain = AesGcm.Decrypt(this.key.ToStr(0, this.key.Length), this.key.Length,
             iv.ToStr(0, iv.Length), aadStr, aadLen, ciphertext.ToStr(0, ctLen),
-            ctLen, tag.ToStr(0, tag.Length), ok);
+            ctLen, tag.ToStr(0, 16), ok);
         if (ok[0] != -1 || plain == null) {
             throw new SshException(SshError.IntegrityFailed,
                 "AES-GCM authentication failed (packet tampered or key mismatch)");
@@ -160,6 +163,9 @@ public class SshCipherState {
 
     // 单缓冲解密：输入连续的 ct || tag(16)，免去分片读取与二次分配。
     public byte[] DecryptPacket(byte[] aad, byte[] ctAndTag, int ctLen) {
+        if (ctAndTag == null || ctLen < 0 || ctLen > ctAndTag.Length - 16) {
+            throw new SshException(SshError.Malformed, "AES-GCM packet buffer is truncated");
+        }
         byte[] iv = this.FillNextIv();
         int aadLen = aad != null ? aad.Length : 0;
         if (this.gcmHwReady) {
@@ -263,18 +269,16 @@ public class SshPacketLayer {
     }
 
     static byte[] ExtractPayload(byte[] block) {
-        if (block.Length < 5) {
+        if (block == null || block.Length < 5) {
             throw new SshException(SshError.Malformed, "SSH packet is too short");
         }
         int paddingLen = block[0] & 255;
-        if (paddingLen < 4 || paddingLen + 1 > block.Length) {
+        if (paddingLen < 4 || paddingLen + 1 >= block.Length) {
             throw new SshException(SshError.Malformed, "invalid SSH padding length");
         }
         int payloadLen = block.Length - paddingLen - 1;
         byte[] payload = new byte[payloadLen];
-        if (payloadLen > 0) {
-            NativeMemory.Copy((nint)payload, (nint)block + 1, payloadLen);
-        }
+        NativeMemory.Copy((nint)payload, (nint)block + 1, payloadLen);
         return payload;
     }
 

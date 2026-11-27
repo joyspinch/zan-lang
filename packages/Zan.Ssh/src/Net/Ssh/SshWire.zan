@@ -41,11 +41,27 @@ public class SshWriter {
 
     // 扩容（按倍数翻，避免每写一个字节就扩一次）。
     private void Ensure(int extra) {
-        if (this.len + extra <= this.buf.Length) { return; }
-        int cap = this.buf.Length;
-        while (cap < this.len + extra) { cap = cap * 2; }
-        byte[] next = new byte[cap];
-        for (int i = 0; i < this.len; i = i + 1) { next[i] = this.buf[i]; }
+        if (extra < 0) {
+            throw new SshException(SshError.Malformed, "negative write length");
+        }
+        long needed = (long)this.len + (long)extra;
+        if (needed > 2147483647L) {
+            throw new SshException(SshError.PacketTooLarge, "SSH writer buffer overflow");
+        }
+        if (needed <= (long)this.buf.Length) { return; }
+        long cap = (long)this.buf.Length;
+        if (cap < 16L) { cap = 16L; }
+        while (cap < needed) {
+            cap = cap * 2L;
+            if (cap > 2147483647L) {
+                cap = needed;
+                break;
+            }
+        }
+        byte[] next = new byte[(int)cap];
+        if (this.len > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.buf, this.len);
+        }
         this.buf = next;
     }
 
@@ -170,7 +186,9 @@ public class SshWriter {
     // 取已写入内容的副本。
     public byte[] ToArray() {
         byte[] outb = new byte[this.len];
-        for (int i = 0; i < this.len; i = i + 1) { outb[i] = this.buf[i]; }
+        if (this.len > 0) {
+            NativeMemory.Copy((nint)outb, (nint)this.buf, this.len);
+        }
         return outb;
     }
 }
@@ -196,6 +214,18 @@ public class SshReader {
     }
 
     public SshReader(byte[] data, int offset, int length) {
+        if (data == null) {
+            if (offset != 0 || length != 0) {
+                throw new SshException(SshError.Malformed, "null SSH reader buffer");
+            }
+            this.data = null;
+            this.pos = 0;
+            this.limit = 0;
+            return;
+        }
+        if (offset < 0 || length < 0 || offset > data.Length - length) {
+            throw new SshException(SshError.Malformed, "SSH reader slice out of range");
+        }
         this.data = data;
         this.pos = offset;
         this.limit = offset + length;
@@ -208,11 +238,11 @@ public class SshReader {
 
     // 至少还剩 n 个字节吗。
     public bool Has(int count) {
-        return this.pos + count <= this.limit;
+        return count >= 0 && count <= this.limit - this.pos;
     }
 
     private void Need(int count) {
-        if (this.pos + count > this.limit) {
+        if (count < 0 || count > this.limit - this.pos) {
             throw new SshException(SshError.Truncated, "SSH payload truncated",
                 "need " + count.ToString() + " byte(s), have " + this.Remaining().ToString());
         }
@@ -317,8 +347,11 @@ public class SshReader {
         int start = 0;
         while (start < raw.Length && raw[start] == 0) { start = start + 1; }
         if (start >= raw.Length) { return new byte[0]; }
-        byte[] outb = new byte[raw.Length - start];
-        for (int i = 0; i < outb.Length; i = i + 1) { outb[i] = raw[start + i]; }
+        int outLen = raw.Length - start;
+        byte[] outb = new byte[outLen];
+        if (outLen > 0) {
+            NativeMemory.Copy((nint)outb, (nint)raw + (nint)start, outLen);
+        }
         return outb;
     }
 }

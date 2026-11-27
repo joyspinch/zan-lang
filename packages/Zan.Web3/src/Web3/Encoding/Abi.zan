@@ -59,9 +59,14 @@ public class Abi {
     public static byte[] EncodeUint256(BigInt val) {
         if (val == null) { return new byte[32]; }
         byte[] be = val.ToBytesBE(32);
+        if (be == null || be.Length == 0) { return new byte[32]; }
         if (be.Length == 32) { return be; }
         byte[] slot = new byte[32];
-        NativeMemory.Copy((nint)slot, (nint)be, 32);
+        if (be.Length < 32) {
+            NativeMemory.Copy((nint)slot + (nint)(32 - be.Length), (nint)be, be.Length);
+        } else {
+            NativeMemory.Copy((nint)slot, (nint)be + (nint)(be.Length - 32), 32);
+        }
         return slot;
     }
 
@@ -112,7 +117,7 @@ public class Abi {
 
     // 从 32 字节槽位解码 uint256 大整数
     public static BigInt DecodeUint256(byte[] data, int offset) {
-        if (data == null || data.Length < offset + 32) {
+        if (data == null || offset < 0 || offset > data.Length - 32) {
             return BigInt.zero();
         }
         if (offset == 0 && data.Length == 32) {
@@ -129,7 +134,7 @@ public class Abi {
 
     // 从 32 字节槽位解码以太坊地址（取低 20 字节）
     public static Address DecodeAddress(byte[] data, int offset) {
-        if (data == null || data.Length < offset + 32) {
+        if (data == null || offset < 0 || offset > data.Length - 32) {
             return Address.Zero;
         }
         byte[] raw = new byte[20];
@@ -143,7 +148,7 @@ public class Abi {
 
     // 从 32 字节槽位解码布尔值
     public static bool DecodeBool(byte[] data, int offset) {
-        if (data == null || data.Length < offset + 32) {
+        if (data == null || offset < 0 || offset > data.Length - 32) {
             return false;
         }
         return data[offset + 31] != 0;
@@ -155,33 +160,40 @@ public class Abi {
 
     // 解码 Solidity 动态字符串（ABI 格式: 相对偏移量 -> 长度 -> 实际 UTF-8 字节）
     public static string DecodeString(byte[] data, int offset) {
-        if (data == null || data.Length < offset + 64) {
+        if (data == null || offset < 0 || offset > data.Length - 64) {
             return "";
         }
-        // 读取相对偏移量（通常为 32）
-        int relOffset = 0;
+        // 校验高 28 字节为 0，并用 64 位读取相对偏移量防符号溢出与负偏移
+        for (int i = 0; i < 28; i = i + 1) {
+            if (data[offset + i] != 0) { return ""; }
+        }
+        long relOffset = 0L;
         for (int i = 0; i < 4; i = i + 1) {
-            relOffset = (relOffset << 8) | (data[offset + 28 + i] & 255);
+            relOffset = (relOffset << 8) | (long)(data[offset + 28 + i] & 255);
         }
-        int lenSlotOffset = offset + relOffset;
-        if (data.Length < lenSlotOffset + 32) {
+        long maxLenSlot = (long)data.Length - 32L;
+        if (relOffset < 0L || relOffset > maxLenSlot - (long)offset) {
             return "";
         }
+        int lenSlotOffset = offset + (int)relOffset;
 
-        // 读取字符串字节长度
-        int strLen = 0;
-        for (int i = 0; i < 4; i = i + 1) {
-            strLen = (strLen << 8) | (data[lenSlotOffset + 28 + i] & 255);
+        // 校验高 28 字节为 0 并读取字符串字节长度
+        for (int i = 0; i < 28; i = i + 1) {
+            if (data[lenSlotOffset + i] != 0) { return ""; }
         }
-        if (strLen <= 0 || data.Length < lenSlotOffset + 32 + strLen) {
+        long strLenL = 0L;
+        for (int i = 0; i < 4; i = i + 1) {
+            strLenL = (strLenL << 8) | (long)(data[lenSlotOffset + 28 + i] & 255);
+        }
+        long avail = (long)data.Length - (long)lenSlotOffset - 32L;
+        if (strLenL <= 0L || strLenL > avail) {
             return "";
         }
+        int strLen = (int)strLenL;
 
         // 截取字符串实际字节
         byte[] strBytes = new byte[strLen];
-        for (int i = 0; i < strLen; i = i + 1) {
-            strBytes[i] = data[lenSlotOffset + 32 + i];
-        }
+        NativeMemory.Copy((nint)strBytes, (nint)data + (nint)(lenSlotOffset + 32), strLen);
         return strBytes;
     }
 
