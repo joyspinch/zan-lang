@@ -657,26 +657,37 @@ public partial class RecordTable {
             try { this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b); }
             finally { b.Free(); }
 
-            // 2. 批量物理应用至 .ztab 文件
-            for (int i = 0; i < n; i = i + 1) {
-                RecordTxOp op = this.txOps[i];
-                if (op.opType == OP_UPDATE || op.opType == OP_DELETE) {
-                    RecordRow oldRow = this.GetLocked(op.id);
-                    if (oldRow != null) {
-                        this.UnindexRowLocked(oldRow);
-                    }
-                }
-            }
-
+            // 2. 批量物理应用至 .ztab 文件并同步维护索引（支持同事务内 ADD->UPDATE / ADD->DELETE / UPDATE->DELETE）
+            Dictionary<int, RecordRow> txLive = new Dictionary<int, RecordRow>();
             Mutex.Lock(this.ioMtx);
             try {
                 for (int i = 0; i < n; i = i + 1) {
                     RecordTxOp op = this.txOps[i];
                     long off = this.dataOffset + (long)(op.id - 1) * (long)rbytes;
-                    if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
+                    if (op.opType == OP_ADD) {
                         this.RequireIo(this.file.WriteAt(off, (nint)op.row.data, rbytes) == rbytes, "apply transaction row", this.file);
                         this.IndexRowLocked(op.row);
+                        txLive[op.id] = op.row;
+                    } else if (op.opType == OP_UPDATE) {
+                        RecordRow prev = null;
+                        if (txLive.TryGetValue(op.id, out prev)) {
+                            if (prev != null) { this.UnindexRowLocked(prev); }
+                        } else {
+                            byte[] oldBuf = new byte[rbytes];
+                            if (this.file.ReadRaw(off, (nint)oldBuf, rbytes) == rbytes && oldBuf[0] != 0) {
+                                RecordRow oldDisk = new RecordRow(this.schema, oldBuf, op.id, true, this);
+                                this.UnindexRowLocked(oldDisk);
+                            }
+                        }
+                        this.RequireIo(this.file.WriteAt(off, (nint)op.row.data, rbytes) == rbytes, "apply transaction row", this.file);
+                        this.IndexRowLocked(op.row);
+                        txLive[op.id] = op.row;
                     } else if (op.opType == OP_DELETE) {
+                        RecordRow prev = null;
+                        if (txLive.TryGetValue(op.id, out prev)) {
+                            if (prev != null) { this.UnindexRowLocked(prev); }
+                            txLive.Remove(op.id);
+                        }
                         byte[] zeroFlag = new byte[1];
                         zeroFlag[0] = 0;
                         this.RequireIo(this.file.WriteAt(off, (nint)zeroFlag, 1) == 1, "write tombstone", this.file);
@@ -694,13 +705,13 @@ public partial class RecordTable {
         }
     }
 
-    // 回滚事务：丢弃全部暂存，零磁盘脏写
+    // 回滚事务：丢弃全部暂存，零磁盘脏写，并恢复事务内暂存删除所移除的索引
     public void Rollback() {
         this.tlock.EnterWrite();
         try {
             if (!this.inTx) { return; }
             if (this.txOps != null) {
-                for (int i = 0; i < this.txOps.Count; i = i + 1) {
+                for (int i = this.txOps.Count - 1; i >= 0; i = i - 1) {
                     RecordTxOp op = this.txOps[i];
                     if (op.opType == OP_ADD) {
                         this.totalRows = this.totalRows - 1;
@@ -708,6 +719,9 @@ public partial class RecordTable {
                     } else if (op.opType == OP_DELETE) {
                         this.tombstones.Remove(op.id);
                         this.activeRows = this.activeRows + 1;
+                        if (op.row != null) {
+                            this.IndexRowLocked(op.row);
+                        }
                     }
                 }
                 this.txOps.Clear();
@@ -879,6 +893,16 @@ public partial class RecordTable {
                 this.FlushRowBlobsLocked(r);
             }
 
+            if (this.inTx) {
+                for (int i = 0; i < n; i = i + 1) {
+                    RecordRow r = rows[i];
+                    this.txOps.Add(new RecordTxOp(OP_ADD, r.id, r));
+                }
+                this.totalRows = firstId + n - 1;
+                this.activeRows = this.activeRows + n;
+                return;
+            }
+
             // 2. 批量 WAL 帧写入
             this.lastTxSeq = this.lastTxSeq + 1L;
             ByteBuffer b = ByteBuffer.Alloc(17 + n * (5 + rbytes));
@@ -942,7 +966,6 @@ public partial class RecordTable {
         }
 
         if (buf[0] == 0) {
-            this.tombstones[id] = true;
             return null;
         }
         return new RecordRow(this.schema, buf, id, true, this);
@@ -1001,7 +1024,7 @@ public partial class RecordTable {
                 if (oldRow != null) { this.UnindexRowLocked(oldRow); }
                 this.tombstones[id] = true;
                 this.activeRows = this.activeRows - 1;
-                RecordTxOp op = new RecordTxOp(OP_DELETE, id, null);
+                RecordTxOp op = new RecordTxOp(OP_DELETE, id, oldRow);
                 this.txOps.Add(op);
                 return true;
             }

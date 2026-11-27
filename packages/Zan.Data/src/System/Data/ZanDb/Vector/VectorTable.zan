@@ -120,8 +120,15 @@ public class VectorTable : IDisposable {
             indexLoaded = vt.LoadHnswSnapshotLocked();
         }
         if (indexLoaded) {
-            vt.indexedRows = vt.index.nodes.Count;
-            // 标记在 index 中已被软删除的墓碑
+            if (vt.indexedRows < vt.index.nodes.Count) {
+                vt.indexedRows = vt.index.nodes.Count;
+            }
+            for (int si = 0; si < vt.index.nodes.Count; si = si + 1) {
+                int nid = vt.index.nodes[si].id;
+                if (nid > vt.indexedRows) { vt.indexedRows = nid; }
+            }
+            if (vt.indexedRows > vt.totalRows) { vt.indexedRows = vt.totalRows; }
+            // 标记在 index 中已被软删除（或跳过未索引的墓碑）的槽位
             for (int id = 1; id <= vt.indexedRows; id = id + 1) {
                 if (!vt.index.idSlots.ContainsKey(id)) {
                     vt.tombstones[id] = true;
@@ -233,7 +240,7 @@ public class VectorTable : IDisposable {
     }
 
     public void AddBulk(List<float[]> vectors, out int firstId) {
-        this.AddBulk(vectors, out firstId, true);
+        this.AddBulk(vectors, out firstId, false);
     }
 
     public void AddBulk(List<float[]> vectors, out int firstId, bool indexNow) {
@@ -267,6 +274,9 @@ public class VectorTable : IDisposable {
             int newTotal = firstId + n - 1;
             int newActive = newTotal - this.tombstones.Count;
             this.WriteHeaderLocked((long)newTotal, (long)newActive);
+            if (indexNow) {
+                this.CatchUpIndexLocked();
+            }
         } finally { this.tlock.ExitWrite(); }
     }
 
@@ -360,58 +370,96 @@ public class VectorTable : IDisposable {
             this.CatchUpIndexLocked();
             if (this.tombstones.Count == 0 && this.activeRows == this.totalRows) { return; }
             string tmpVec = this.vecPath + ".vac.tmp";
-            File.Delete(tmpVec);
+            string bakVec = this.vecPath + ".bak";
+            if (File.Exists(tmpVec)) { File.Delete(tmpVec); }
+            if (File.Exists(bakVec)) { File.Delete(bakVec); }
 
             PageFile newFile = PageFile.Open(tmpVec);
             if (!newFile.IsOpen()) { return; }
 
             int dims = this.options.dimensions;
             int bytesPerVec = dims * 4;
-            long newTotal = (long)this.activeRows;
-
-            ByteBuffer h = VectorTable.BuildVecHeader(dims, this.options.metric, newTotal, newTotal);
-            newFile.WriteAt(0, h.Raw(), HEADER_SIZE);
-            h.Free();
-
             VectorIndex newIndex = new VectorIndex(this.options);
             int newId = 1;
-            float[] scratchVec = new float[dims];
-            for (int oldId = 1; oldId <= this.totalRows; oldId = oldId + 1) {
-                if (!this.tombstones.ContainsKey(oldId)) {
-                    long offset = (long)HEADER_SIZE + (long)(oldId - 1) * (long)bytesPerVec;
-                    int got = 0;
-                    Mutex.Lock(this.ioMtx);
-                    try {
-                        got = this.file.ReadRaw(offset, (nint)scratchVec, bytesPerVec);
-                    } finally {
-                        Mutex.Unlock(this.ioMtx);
-                    }
-                    if (got == bytesPerVec) {
-                        long off = (long)HEADER_SIZE + (long)(newId - 1) * (long)bytesPerVec;
-                        newFile.WriteAt(off, (nint)scratchVec, bytesPerVec);
-                        float[] copy = new float[dims];
-                        NativeMemory.Copy((nint)copy, (nint)scratchVec, bytesPerVec);
-                        newIndex.Add(newId, copy);
-                        newId = newId + 1;
+            try {
+                long newTotal = (long)this.activeRows;
+                ByteBuffer h = VectorTable.BuildVecHeader(dims, this.options.metric, newTotal, newTotal);
+                int hw = newFile.WriteAt(0, h.Raw(), HEADER_SIZE);
+                h.Free();
+                if (hw != HEADER_SIZE) { throw new IOException("failed to write vacuum vector header"); }
+
+                float[] scratchVec = new float[dims];
+                for (int oldId = 1; oldId <= this.totalRows; oldId = oldId + 1) {
+                    if (!this.tombstones.ContainsKey(oldId)) {
+                        long offset = (long)HEADER_SIZE + (long)(oldId - 1) * (long)bytesPerVec;
+                        int got = 0;
+                        Mutex.Lock(this.ioMtx);
+                        try {
+                            got = this.file.ReadRaw(offset, (nint)scratchVec, bytesPerVec);
+                        } finally {
+                            Mutex.Unlock(this.ioMtx);
+                        }
+                        if (got == bytesPerVec) {
+                            long off = (long)HEADER_SIZE + (long)(newId - 1) * (long)bytesPerVec;
+                            if (newFile.WriteAt(off, (nint)scratchVec, bytesPerVec) != bytesPerVec) {
+                                throw new IOException("failed to write vacuum vector row");
+                            }
+                            float[] copy = new float[dims];
+                            NativeMemory.Copy((nint)copy, (nint)scratchVec, bytesPerVec);
+                            newIndex.Add(newId, copy);
+                            newId = newId + 1;
+                        }
                     }
                 }
+                int writtenRows = newId - 1;
+                if ((long)writtenRows != newTotal) {
+                    ByteBuffer h2 = VectorTable.BuildVecHeader(dims, this.options.metric, (long)writtenRows, (long)writtenRows);
+                    int hw2 = newFile.WriteAt(0, h2.Raw(), HEADER_SIZE);
+                    h2.Free();
+                    if (hw2 != HEADER_SIZE) { throw new IOException("failed to update vacuum vector header"); }
+                }
+                if (!newFile.Sync()) { throw new IOException("failed to sync vacuum vector file"); }
+            } catch (Exception ex) {
+                newFile.Close();
+                if (File.Exists(tmpVec)) { File.Delete(tmpVec); }
+                throw ex;
             }
-
-            newFile.Sync();
             newFile.Close();
             this.file.Close();
 
-            File.Delete(this.vecPath);
-            File.Move(tmpVec, this.vecPath);
-
-            this.file = PageFile.Open(this.vecPath);
-            this.totalRows = this.activeRows;
-            this.indexedRows = this.activeRows;
-            this.tombstones.Clear();
-            this.appendBuf.Clear();
-            this.appendIds.Clear();
-            this.index = newIndex;
-            this.SaveHnswSnapshotLocked();
+            bool backed = false;
+            try {
+                if (File.Exists(this.vecPath)) {
+                    File.Move(this.vecPath, bakVec);
+                    backed = true;
+                }
+                File.Move(tmpVec, this.vecPath);
+                PageFile reopened = PageFile.Open(this.vecPath);
+                if (reopened == null || !reopened.IsOpen()) {
+                    throw new IOException("failed to reopen vacuumed VectorTable");
+                }
+                this.file = reopened;
+                int finalRows = newId - 1;
+                this.totalRows = finalRows;
+                this.activeRows = finalRows;
+                this.indexedRows = finalRows;
+                this.tombstones.Clear();
+                this.appendBuf.Clear();
+                this.appendIds.Clear();
+                this.index = newIndex;
+                this.SaveHnswSnapshotLocked();
+            } catch (Exception ex) {
+                if (this.file != null && this.file.IsOpen()) { this.file.Close(); }
+                if (backed && File.Exists(bakVec)) {
+                    if (File.Exists(this.vecPath)) { File.Delete(this.vecPath); }
+                    File.Move(bakVec, this.vecPath);
+                }
+                if (File.Exists(this.vecPath)) {
+                    this.file = PageFile.Open(this.vecPath);
+                }
+                throw ex;
+            }
+            if (File.Exists(bakVec)) { File.Delete(bakVec); }
         } finally {
             this.tlock.ExitWrite();
         }
@@ -578,7 +626,7 @@ public class VectorTable : IDisposable {
             h.WriteU32((long)this.index.maxLevel);
             h.WriteU32(this.index.randomState);
             h.WriteU64((long)this.index.nodes.Count);
-            h.WriteU32(0); // 留空
+            h.WriteU32((long)this.indexedRows); // 已索引高水位（含被跳过的尾部墓碑）
             snapFile.WriteAt(0, h.Raw(), HEADER_SIZE);
             h.Free();
 
@@ -626,6 +674,7 @@ public class VectorTable : IDisposable {
             int maxLevel = maxLevelRaw == 4294967295L ? -1 : (int)maxLevelRaw;
             int rng = (int)h.ReadU32();
             long count = h.ReadU64();
+            long savedIndexedRows = h.ReadU32();
             h.Free();
 
             if (magic != MAGIC_HNSW || ver != VERSION) {
@@ -665,6 +714,9 @@ public class VectorTable : IDisposable {
                 this.index.ImportBatch(payload);
             }
             this.index.ImportFinish(entry, maxLevel, rng, count);
+            if (savedIndexedRows > 0L && savedIndexedRows <= 2147483647L) {
+                this.indexedRows = (int)savedIndexedRows;
+            }
             snapFile.Close();
             return true;
         } catch (Exception _ex) {

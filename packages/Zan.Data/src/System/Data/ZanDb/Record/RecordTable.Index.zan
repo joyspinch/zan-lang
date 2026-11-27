@@ -498,6 +498,10 @@ public partial class RecordTable {
             Dictionary<string, List<int>> map = null;
             if (this.indexes.TryGetValue(colName, out map)) {
                 int nlen = colName != null ? colName.Length : 0;
+                if (nlen > 255) {
+                    b.Free();
+                    throw new InvalidOperationException("index column name exceeds 255 bytes");
+                }
                 b.WriteU8(nlen);
                 if (nlen > 0) { b.WriteRaw(colName, nlen); }
 
@@ -511,6 +515,10 @@ public partial class RecordTable {
                 for (int k = 0; k < kCount; k = k + 1) {
                     string key = keys[k];
                     int klen = key != null ? key.Length : 0;
+                    if (klen > 65535) {
+                        b.Free();
+                        throw new InvalidOperationException("index key exceeds 65535 bytes");
+                    }
                     b.WriteU16(klen);
                     if (klen > 0) { b.WriteRaw(key, klen); }
                     List<int> idList = null;
@@ -524,15 +532,23 @@ public partial class RecordTable {
             }
         }
 
-        PageFile pf = PageFile.Open(this.idxPath);
+        string tmpIdx = this.idxPath + ".tmp";
+        if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
+        PageFile pf = PageFile.Open(tmpIdx);
         try {
             this.RequireIo(pf != null && pf.IsOpen(), "open index checkpoint", pf);
             this.RequireIo(pf.WriteAt(0, b.Raw(), b.Length()) == b.Length(), "write index checkpoint", pf);
             this.RequireIo(pf.Sync(), "sync index checkpoint", pf);
-        } finally {
-            if (pf != null) { pf.Close(); }
+        } catch (Exception ex) {
+            if (pf != null) { pf.Close(); pf = null; }
+            if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
             b.Free();
+            throw ex;
         }
+        pf.Close();
+        b.Free();
+        if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+        File.Move(tmpIdx, this.idxPath);
     }
 
     // 从 .zidx 文件装载二级索引
@@ -559,35 +575,45 @@ public partial class RecordTable {
         string magic = b.Str(0, 4);
         b.SeekRead(4);
         int ver = (int)b.ReadU32();
-        int idxColCount = (int)b.ReadU32();
+        long idxColCountL = b.ReadU32();
         long tRows = b.ReadU64();
         long aRows = b.ReadU64();
         b.ReadU32(); // reserved
 
-        if (magic != MAGIC_IDX || ver != VERSION || (int)tRows != this.totalRows || (int)aRows != this.activeRows) {
+        if (magic != MAGIC_IDX || ver != VERSION || idxColCountL < 0L || idxColCountL > 4096L
+            || (int)tRows != this.totalRows || (int)aRows != this.activeRows) {
             b.Free();
             return false;
         }
+        int idxColCount = (int)idxColCountL;
 
-        this.indexes.Clear();
-        this.indexKeysSorted.Clear();
+        Dictionary<string, Dictionary<string, List<int>>> newIndexes = new Dictionary<string, Dictionary<string, List<int>>>();
+        Dictionary<string, List<string>> newSorted = new Dictionary<string, List<string>>();
         for (int c = 0; c < idxColCount; c = c + 1) {
+            if (!b.CanRead(1)) { b.Free(); return false; }
             int nlen = b.ReadU8();
+            if (!b.CanRead(nlen + 4)) { b.Free(); return false; }
             string colName = nlen > 0 ? NativeMemory.GetString(b.data, b.rpos, nlen) : "";
             b.SeekRead(b.rpos + nlen);
 
             Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
             List<string> sortedKeys = new List<string>();
-            int kCount = (int)b.ReadU32();
+            long kCountL = b.ReadU32();
+            if (kCountL < 0L || kCountL > (long)b.Remaining()) { b.Free(); return false; }
+            int kCount = (int)kCountL;
             sortedKeys.Reserve(kCount);
             bool alreadySorted = true;
             string prevKey = null;
             for (int k = 0; k < kCount; k = k + 1) {
+                if (!b.CanRead(2)) { b.Free(); return false; }
                 int klen = b.ReadU16();
+                if (!b.CanRead(klen + 4)) { b.Free(); return false; }
                 string key = klen > 0 ? NativeMemory.GetString(b.data, b.rpos, klen) : "";
                 b.SeekRead(b.rpos + klen);
 
-                int idCount = (int)b.ReadU32();
+                long idCountL = b.ReadU32();
+                if (idCountL < 0L || idCountL * 4L > (long)b.Remaining()) { b.Free(); return false; }
+                int idCount = (int)idCountL;
                 List<int> ids = new List<int>();
                 ids.Reserve(idCount);
                 for (int j = 0; j < idCount; j = j + 1) {
@@ -603,9 +629,11 @@ public partial class RecordTable {
             if (!alreadySorted && sortedKeys.Count > 1) {
                 RecordTable.SortKeysOrdinal(sortedKeys, 0, sortedKeys.Count - 1);
             }
-            this.indexes[colName] = map;
-            this.indexKeysSorted[colName] = sortedKeys;
+            newIndexes[colName] = map;
+            newSorted[colName] = sortedKeys;
         }
+        this.indexes = newIndexes;
+        this.indexKeysSorted = newSorted;
         b.Free();
         return true;
     }
@@ -647,8 +675,6 @@ public partial class RecordTable {
                     if (hasTombs && this.tombstones.ContainsKey(curId)) { continue; }
                     int rowOff = k * rbytes;
                     if (chunk[rowOff] == 0) {
-                        this.tombstones[curId] = true;
-                        hasTombs = true;
                         continue;
                     }
                     byte[] buf = new byte[rbytes];
@@ -679,32 +705,56 @@ public partial class RecordTable {
         this.tlock.EnterWrite();
         try {
             if (!this.IsOpen()) { return; }
+            if (this.inTx) { throw new InvalidOperationException("cannot vacuum RecordTable during transaction"); }
             List<string> oldIndexCols = this.indexes.Keys;
             string vacBase = this.tabPath + ".vac";
+            string tmpFile = vacBase + "." + this.name + ".ztab";
+            string tmpBlob = vacBase + "." + this.name + ".zblob";
+            string tmpIdx = vacBase + "." + this.name + ".zidx";
+            string tmpWal = vacBase + "." + this.name + ".zwal";
+            if (File.Exists(tmpFile)) { File.Delete(tmpFile); }
+            if (File.Exists(tmpBlob)) { File.Delete(tmpBlob); }
+            if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
+            if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
+
             RecordTable tmp = RecordTable.Open(vacBase, this.name, this.schema);
-            for (int id = 1; id <= this.totalRows; id = id + 1) {
-                if (!this.tombstones.ContainsKey(id)) {
-                    RecordRow r = this.GetLocked(id);
-                    if (r != null) {
-                        // 预先取出变长内容，确保搬迁至新库新 blob 文件
-                        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
-                            RecordColumn col = this.schema.columns[i];
-                            if (col.dataType == RecordDataType.VarStr) {
-                                r.varStrs[col.name] = r.GetVarStr(col.name);
-                            } else if (col.dataType == RecordDataType.Blob) {
-                                r.blobs[col.name] = r.GetBlob(col.name);
+            int newTotalRows = 0;
+            int newActiveRows = 0;
+            try {
+                for (int id = 1; id <= this.totalRows; id = id + 1) {
+                    if (!this.tombstones.ContainsKey(id)) {
+                        RecordRow r = this.GetLocked(id);
+                        if (r != null) {
+                            // 预先取出变长内容，确保搬迁至新库新 blob 文件
+                            for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+                                RecordColumn col = this.schema.columns[i];
+                                if (col.dataType == RecordDataType.VarStr) {
+                                    r.varStrs[col.name] = r.GetVarStr(col.name);
+                                } else if (col.dataType == RecordDataType.Blob) {
+                                    r.blobs[col.name] = r.GetBlob(col.name);
+                                }
                             }
+                            tmp.Add(r);
                         }
-                        tmp.Add(r);
                     }
                 }
+                // 为新紧凑表重建原有二级索引
+                for (int i = 0; i < oldIndexCols.Count; i = i + 1) {
+                    tmp.EnsureIndex(oldIndexCols[i]);
+                }
+                tmp.Flush();
+                newTotalRows = tmp.TotalRows();
+                newActiveRows = tmp.Count();
+            } catch (Exception ex) {
+                tmp.Close();
+                if (File.Exists(tmpFile)) { File.Delete(tmpFile); }
+                if (File.Exists(tmpBlob)) { File.Delete(tmpBlob); }
+                if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
+                if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
+                throw ex;
             }
-            // 为新紧凑表重建原有二级索引
-            for (int i = 0; i < oldIndexCols.Count; i = i + 1) {
-                tmp.EnsureIndex(oldIndexCols[i]);
-            }
-            tmp.Flush();
             tmp.Close();
+
             this.file.Close();
             if (this.blobFile != null && this.blobFile.IsOpen()) {
                 this.blobFile.Close();
@@ -713,34 +763,77 @@ public partial class RecordTable {
                 this.walFile.Close();
             }
 
-            string tmpFile = vacBase + "." + this.name + ".ztab";
-            string tmpBlob = vacBase + "." + this.name + ".zblob";
-            string tmpIdx = vacBase + "." + this.name + ".zidx";
-            string tmpWal = vacBase + "." + this.name + ".zwal";
+            string bakTab = this.tabPath + ".bak";
+            string bakBlob = this.blobPath + ".bak";
+            string bakIdx = this.idxPath + ".bak";
+            if (File.Exists(bakTab)) { File.Delete(bakTab); }
+            if (File.Exists(bakBlob)) { File.Delete(bakBlob); }
+            if (File.Exists(bakIdx)) { File.Delete(bakIdx); }
 
-            if (File.Exists(this.tabPath)) { File.Delete(this.tabPath); }
-            File.Move(tmpFile, this.tabPath);
-            if (File.Exists(tmpBlob)) {
-                if (File.Exists(this.blobPath)) { File.Delete(this.blobPath); }
-                File.Move(tmpBlob, this.blobPath);
-            }
-            if (File.Exists(tmpIdx)) {
-                if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
-                File.Move(tmpIdx, this.idxPath);
-            } else if (File.Exists(this.idxPath)) {
-                File.Delete(this.idxPath);
-            }
-            if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
-            if (File.Exists(this.walPath)) { File.Delete(this.walPath); }
+            bool tabBacked = false;
+            bool blobBacked = false;
+            bool idxBacked = false;
+            try {
+                if (File.Exists(this.tabPath)) {
+                    File.Move(this.tabPath, bakTab);
+                    tabBacked = true;
+                }
+                if (File.Exists(this.blobPath)) {
+                    File.Move(this.blobPath, bakBlob);
+                    blobBacked = true;
+                }
+                if (File.Exists(this.idxPath)) {
+                    File.Move(this.idxPath, bakIdx);
+                    idxBacked = true;
+                }
 
-            // 重新挂接文件
-            this.file = PageFile.OpenExisting(this.tabPath);
-            this.OpenOrCreateBlobFileLocked();
-            this.OpenOrCreateWalFileLocked();
-            this.totalRows = tmp.TotalRows();
-            this.activeRows = tmp.Count();
-            this.tombstones.Clear();
-            this.LoadIndexesLocked();
+                File.Move(tmpFile, this.tabPath);
+                if (File.Exists(tmpBlob)) {
+                    File.Move(tmpBlob, this.blobPath);
+                }
+                if (File.Exists(tmpIdx)) {
+                    File.Move(tmpIdx, this.idxPath);
+                }
+                if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
+                if (File.Exists(this.walPath)) { File.Delete(this.walPath); }
+
+                PageFile reopened = PageFile.OpenExisting(this.tabPath);
+                if (reopened == null || !reopened.IsOpen()) {
+                    throw new IOException("failed to reopen vacuumed RecordTable");
+                }
+                this.file = reopened;
+                this.OpenOrCreateBlobFileLocked();
+                this.OpenOrCreateWalFileLocked();
+                this.totalRows = newTotalRows;
+                this.activeRows = newActiveRows;
+                this.tombstones.Clear();
+                this.LoadIndexesLocked();
+            } catch (Exception ex) {
+                if (this.file != null && this.file.IsOpen()) { this.file.Close(); }
+                if (this.blobFile != null && this.blobFile.IsOpen()) { this.blobFile.Close(); }
+                if (this.walFile != null && this.walFile.IsOpen()) { this.walFile.Close(); }
+                if (tabBacked && File.Exists(bakTab)) {
+                    if (File.Exists(this.tabPath)) { File.Delete(this.tabPath); }
+                    File.Move(bakTab, this.tabPath);
+                }
+                if (blobBacked && File.Exists(bakBlob)) {
+                    if (File.Exists(this.blobPath)) { File.Delete(this.blobPath); }
+                    File.Move(bakBlob, this.blobPath);
+                }
+                if (idxBacked && File.Exists(bakIdx)) {
+                    if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+                    File.Move(bakIdx, this.idxPath);
+                }
+                if (File.Exists(this.tabPath)) {
+                    this.file = PageFile.OpenExisting(this.tabPath);
+                    this.OpenOrCreateBlobFileLocked();
+                    this.OpenOrCreateWalFileLocked();
+                }
+                throw ex;
+            }
+            if (File.Exists(bakTab)) { File.Delete(bakTab); }
+            if (File.Exists(bakBlob)) { File.Delete(bakBlob); }
+            if (File.Exists(bakIdx)) { File.Delete(bakIdx); }
         } finally {
             this.tlock.ExitWrite();
         }

@@ -220,7 +220,12 @@ public class UnitOfWork : IUnitOfWork {
 
     public void Commit() {
         if (!this.committed && !this.rolledBack && this.conn != null) {
-            this.conn.Commit();
+            try {
+                this.conn.Commit();
+            } catch (Exception ex) {
+                this.DiscardConnection();
+                throw ex;
+            }
             this.committed = true;
             // 事务结束，保存点随之全部作废。
             this.savepoints = new List<string>();
@@ -242,12 +247,16 @@ public class UnitOfWork : IUnitOfWork {
 
     public async bool CommitAsync() {
         if (!this.committed && !this.rolledBack && this.conn != null) {
-            bool ok = await this.conn.CommitAsync();
-            if (ok) {
+            try {
+                bool ok = await this.conn.CommitAsync();
+                if (!ok) { this.DiscardConnection(); return false; }
                 this.committed = true;
                 this.savepoints.Clear();
+                return true;
+            } catch (Exception ex) {
+                this.DiscardConnection();
+                throw ex;
             }
-            return ok;
         }
         return false;
     }
@@ -269,9 +278,9 @@ public class UnitOfWork : IUnitOfWork {
     }
 
     public void Dispose() {
-        if (!this.committed && !this.rolledBack) {
+        if (!this.committed && !this.rolledBack && this.conn != null) {
             try { this.Rollback(); }
-            catch (Exception) { /* Dispose cleanup must not mask the caller's failure. */ }
+            catch (Exception) { this.DiscardConnection(); }
         }
         if (this.conn != null) {
             if (this.pool != null) {

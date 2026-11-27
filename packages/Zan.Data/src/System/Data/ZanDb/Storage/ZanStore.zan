@@ -538,8 +538,12 @@ public partial class ZanStore {
             if (ZanStore.CrashHook != null) { ZanStore.CrashHook("flush_mid_seg"); }
             List<long> ids = this.SegIdList();
             ids.Add(segId);
+            bool firstSaved = false;
+            if (!this.PublishBothTrack(this.seq, segId + 1, ids, out firstSaved)) {
+                if (firstSaved) { published = true; }
+                return;
+            }
             published = true;
-            if (!this.PublishBoth(this.seq, segId + 1, ids)) { return; }
             if (!this.log.Reset()) { this.Fail(this.log.GetError()); return; }
             for (int i = 0; i < keys.Count; i = i + 1) {
                 if (this.tombstones.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
@@ -604,8 +608,12 @@ public partial class ZanStore {
             if (seg == null) { return false; }
             List<long> ids = this.SegIdList();
             ids.Add(segId);
+            bool firstSaved = false;
+            if (!this.PublishBothTrack(newSeq, segId + 1, ids, out firstSaved)) {
+                if (firstSaved) { published = true; }
+                return false;
+            }
             published = true;
-            if (!this.PublishBoth(newSeq, segId + 1, ids)) { return false; }
             if (!this.log.Reset()) { this.Fail(this.log.GetError()); return false; }
             for (int i = 0; i < keys.Count; i = i + 1) {
                 if (this.txDel.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
@@ -637,17 +645,25 @@ public partial class ZanStore {
 
     // 覆盖两个 fallback 槽后，旧段/日志才能退休。第二次失败时
     // 第一份已发布，不可删除它引用的新段，也不可截断/删除旧介质。
-    public bool PublishBoth(long logSeq, long nextId, List<long> ids) {        if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
-    // 第一槽目录项持久化后才能发布第二槽：POSIX 上新建文件的
-    // fsync 不保证目录项落盘，两槽皆失等于整库拒开。
-    if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
-        this.Fail("manifest slot dir sync failed");
-        return false;
+    public bool PublishBoth(long logSeq, long nextId, List<long> ids) {
+        bool firstSaved = false;
+        return this.PublishBothTrack(logSeq, nextId, ids, out firstSaved);
     }
-    if (ZanStore.CrashHook != null) { ZanStore.CrashHook("manifest_mid_slot"); }
-    if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
-    return true;
-}
+
+    private bool PublishBothTrack(long logSeq, long nextId, List<long> ids, out bool firstSaved) {
+        firstSaved = false;
+        if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
+        firstSaved = true;
+        // 第一槽目录项持久化后才能发布第二槽：POSIX 上新建文件的
+        // fsync 不保证目录项落盘，两槽皆失等于整库拒开。
+        if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
+            this.Fail("manifest slot dir sync failed");
+            return false;
+        }
+        if (ZanStore.CrashHook != null) { ZanStore.CrashHook("manifest_mid_slot"); }
+        if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
+        return true;
+    }
 
 public static void CloseWriter(SegmentWriter wtr) {
     if (wtr == null) { return; }

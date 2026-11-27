@@ -117,6 +117,10 @@ public class RecordQuery {
                 });
             }
 
+            if (candidateIds != null && matchedIds.Count > 1) {
+                matchedIds = this.SortIdsAsc(matchedIds);
+            }
+
             if (this.orderDesc && matchedIds.Count > 1) {
                 matchedIds = this.ReverseIds(matchedIds);
             }
@@ -508,10 +512,13 @@ public class RecordQuery {
                 }
                 return true;
             }
-            if (n.Name == ">=" || n.Name == ">" || n.Name == "<=" || n.Name == "<") {
+            if (n.Name == ">=" || n.Name == "<=") {
                 if (n.A != null && n.A.Kind == 0 && n.B != null && n.B.Kind == 1) {
                     return !this.table.HasIndex(n.A.Name);
                 }
+                return true;
+            }
+            if (n.Name == ">" || n.Name == "<") {
                 return true;
             }
             if (n.Name == "&&") {
@@ -641,18 +648,29 @@ public class RecordQuery {
                 return this.EvalNode(n.A, r) || this.EvalNode(n.B, r);
             }
 
-            // 比较运算：数值路径不构造中间字符串，仅混合类型时回退构造字符串
+            // 比较运算：数值路径不构造中间字符串；双整数精确按 64 位 long 比较，避免 Int64 > 2^53 转 double 失真
             double numA = 0.0;
             double numB = 0.0;
+            long intA = 0L;
+            long intB = 0L;
             bool isNumA = false;
             bool isNumB = false;
+            bool isIntA = false;
+            bool isIntB = false;
             string strA = null;
             string strB = null;
 
-            this.EvalValFast(n.A, r, out numA, out isNumA, out strA);
-            this.EvalValFast(n.B, r, out numB, out isNumB, out strB);
+            this.EvalValTyped(n.A, r, out numA, out intA, out isNumA, out isIntA, out strA);
+            this.EvalValTyped(n.B, r, out numB, out intB, out isNumB, out isIntB, out strB);
 
-            if (isNumA && isNumB) {
+            if (isIntA && isIntB) {
+                if (op == "==") { return intA == intB; }
+                if (op == "!=") { return intA != intB; }
+                if (op == "<") { return intA < intB; }
+                if (op == "<=") { return intA <= intB; }
+                if (op == ">") { return intA > intB; }
+                if (op == ">=") { return intA >= intB; }
+            } else if (isNumA && isNumB) {
                 if (op == "==") { return Math.Abs(numA - numB) < 1e-9; }
                 if (op == "!=") { return Math.Abs(numA - numB) >= 1e-9; }
                 if (op == "<") { return numA < numB; }
@@ -701,6 +719,127 @@ public class RecordQuery {
             }
         }
         return true;
+    }
+
+    private List<int> SortIdsAsc(List<int> ids) {
+        int n = ids.Count;
+        bool sorted = true;
+        for (int i = 1; i < n; i = i + 1) {
+            if (ids[i - 1] > ids[i]) { sorted = false; break; }
+        }
+        if (sorted) { return ids; }
+        int[] arr = new int[n];
+        for (int i = 0; i < n; i = i + 1) { arr[i] = ids[i]; }
+        // 自底向上归并排序，O(n log n) 且无递归栈溢出
+        int[] tmp = new int[n];
+        int width = 1;
+        while (width < n) {
+            int left = 0;
+            while (left < n) {
+                int mid = left + width;
+                if (mid > n) { mid = n; }
+                int right = mid + width;
+                if (right > n) { right = n; }
+                int i = left;
+                int j = mid;
+                int k = left;
+                while (i < mid && j < right) {
+                    if (arr[i] <= arr[j]) { tmp[k] = arr[i]; i = i + 1; }
+                    else { tmp[k] = arr[j]; j = j + 1; }
+                    k = k + 1;
+                }
+                while (i < mid) { tmp[k] = arr[i]; i = i + 1; k = k + 1; }
+                while (j < right) { tmp[k] = arr[j]; j = j + 1; k = k + 1; }
+                for (int p = left; p < right; p = p + 1) { arr[p] = tmp[p]; }
+                left = right;
+            }
+            width = width * 2;
+        }
+        List<int> res = new List<int>();
+        res.Reserve(n);
+        for (int i = 0; i < n; i = i + 1) { res.Add(arr[i]); }
+        return res;
+    }
+
+    private void EvalValTyped(ExprNode n, RecordRow r, out double numVal, out long intVal, out bool isNum, out bool isInt, out string strVal) {
+        numVal = 0.0;
+        intVal = 0L;
+        isNum = false;
+        isInt = false;
+        strVal = "";
+        if (n == null) { return; }
+
+        int kind = n.Kind;
+        if (kind == 0) { // Member access
+            string colName = n.Name;
+            if (colName == "id" || colName == "Id") {
+                intVal = (long)r.id;
+                numVal = (double)r.id;
+                isNum = true;
+                isInt = true;
+                return;
+            }
+            RecordColumn col = this.ResolveColCached(colName);
+            if (col == null) { return; }
+
+            int dt = col.dataType;
+            if (dt == RecordDataType.Int32) {
+                int v = r.GetInt32Fast(col);
+                intVal = (long)v;
+                numVal = (double)v;
+                isNum = true;
+                isInt = true;
+            } else if (dt == RecordDataType.Int64) {
+                long v = r.GetInt64Fast(col);
+                intVal = v;
+                numVal = (double)v;
+                isNum = true;
+                isInt = true;
+            } else if (dt == RecordDataType.Float32) {
+                numVal = (double)r.GetFloat32Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Float64) {
+                numVal = r.GetFloat64Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Bool) {
+                long bv = r.GetBoolFast(col) ? 1L : 0L;
+                intVal = bv;
+                numVal = (double)bv;
+                isNum = true;
+                isInt = true;
+            } else if (dt == RecordDataType.FixedStr) {
+                strVal = r.GetStrFast(col);
+                isNum = false;
+            } else if (dt == RecordDataType.VarStr) {
+                strVal = r.GetVarStr(col.name);
+                isNum = false;
+            }
+        } else if (kind == 1) { // Constant
+            int tv = n.TVal;
+            if (tv == 0) {
+                intVal = (long)n.IVal;
+                numVal = (double)n.IVal;
+                isNum = true;
+                isInt = true;
+            } else if (tv == 1) {
+                numVal = n.DVal;
+                isNum = true;
+            } else if (tv == 2) {
+                strVal = n.SVal != null ? n.SVal : "";
+                isNum = false;
+            } else if (tv == 3) {
+                long bv = n.BVal ? 1L : 0L;
+                intVal = bv;
+                numVal = (double)bv;
+                isNum = true;
+                isInt = true;
+            } else if (tv == 5) {
+                intVal = n.LVal;
+                numVal = (double)n.LVal;
+                isNum = true;
+                isInt = true;
+            }
+        }
     }
 
     private void EvalValFast(ExprNode n, RecordRow r, out double numVal, out bool isNum, out string strVal) {

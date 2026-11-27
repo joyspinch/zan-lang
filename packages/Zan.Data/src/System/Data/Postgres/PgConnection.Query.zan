@@ -252,8 +252,19 @@ public partial class PgConnection : IDbConnection {
     }
 
     public async int ExecuteAsync(string sql) {
-        await this.runSimpleAsync(sql, "cannot send the statement");
-        return this.lastAffected;
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { this.lastError = "not connected"; this.fail(); }
+            this.lastError = "";
+            this.lastAffected = 0;
+            byte[] b = PgWire.strToBytes(sql, sql.Length);
+            if (await this.sendMessageAsync(81, b, sql.Length + 1) <= 0) {
+                this.die("cannot send the statement"); this.fail();
+            }
+            await this.readResultsAsync();
+            if (this.hadError) { this.fail(); }
+            return this.lastAffected;
+        } finally { this.ReleaseLock(); }
     }
 
     public async DbResult QueryParamsAsync(string sql, DbParams prms) {
@@ -261,8 +272,16 @@ public partial class PgConnection : IDbConnection {
     }
 
     public async int ExecuteParamsAsync(string sql, DbParams prms) {
-        await this.runExtendedAsync(sql, prms);
-        return this.lastAffected;
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { this.lastError = "not connected"; this.fail(); }
+            this.lastError = "";
+            this.lastAffected = 0;
+            if (!await this.sendExtendedAsync(PgWire.ToDollarParams(sql), prms)) { this.fail(); }
+            await this.readResultsAsync();
+            if (this.hadError) { this.fail(); }
+            return this.lastAffected;
+        } finally { this.ReleaseLock(); }
     }
 
     async bool sendExtendedAsync(string dollarSql, DbParams prms) {
@@ -343,24 +362,14 @@ public partial class PgConnection : IDbConnection {
     public async bool RollbackAsync() { return await this.TransactionCommandAsync("ROLLBACK"); }
 
     // 同步 TLS 发送 Terminate('X')；异步 TLS 直接关套接字由对端以 EOF 收尾。
+    // 不在 Close() 中清空 busy 或群发唤醒等待者，防止活跃持锁者仍在临界区时并发重入。
     public void Close() {
-        List<AsyncGate> toWake = null;
-        lock (this) {
-            if (this.waiters != null && this.waiters.Count() > 0) {
-                toWake = new List<AsyncGate>();
-                while (this.waiters.Count() > 0) {
-                    toWake.Add(this.waiters.Dequeue());
-                }
-            }
-            this.busy = false;
-        }
-        if (toWake != null) {
-            for (int i = 0; i < toWake.Count; i = i + 1) { toWake[i].Signal(); }
-        }
+        bool wasConnected = this.connected;
+        this.connected = false;
         if (this.sock >= 0) {
-            if (this.connected && this.syncTls != null) {
+            if (wasConnected && this.syncTls != null) {
                 this.sendMessageSync(88, this.bb, 0);  // 'X' Terminate
-            } else if (this.connected && this.tls == null) {
+            } else if (wasConnected && this.tls == null) {
                 byte[] bye = new byte[6];
                 bye[0] = 88;
                 bye[1] = 0; bye[2] = 0; bye[3] = 0; bye[4] = 4;

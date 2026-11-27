@@ -996,6 +996,9 @@ public class VectorIndex {
     }
 
     public void Rebuild() {
+        if (this.options.quantize) {
+            throw new InvalidOperationException("Rebuild is not supported in quantized mode without raw vectors");
+        }
         VectorHeap active = new VectorHeap(this.Count() + 1, false);
         for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
             if (this.Current(slot)) { active.Push(slot, this.nodes[slot].id, 0); }
@@ -1033,6 +1036,9 @@ public class VectorIndex {
     }
 
     public JsonValue ExportState() {
+        if (this.options.quantize) {
+            throw new InvalidOperationException("ExportState is not supported in quantized mode; use ExportBatches with VectorSource");
+        }
         JsonValue state = JsonValue.NewObject();
         state.Put("format", JsonValue.NewInt(1));
         state.Put("options", this.options.ToJson());
@@ -1189,24 +1195,28 @@ public class VectorIndex {
     // 直接从紧凑块存储上 memcpy，不逐维装箱。
     public void ExportBatches(VectorBatchSink sink, int batchBytes) {
         if (sink == null) { throw new ArgumentException("Missing vector batch sink"); }
+        if (this.options.quantize) { throw new ArgumentException("quantized checkpoint export requires a vector source"); }
         if (batchBytes < 4096) { batchBytes = 4096; }
         ByteBuffer b = ByteBuffer.Alloc(batchBytes + 4096);
-        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
-            VectorNode node = this.nodes[slot];
-            b.WriteU8(node.active);
-            b.WriteU8(node.level);
-            b.WriteVarInt(node.id);
-            VectorChunk owner = this.chunks[slot / this.chunkRows];
-            int offset = (slot % this.chunkRows) * this.options.dimensions;
-            b.WriteBytes((nint)owner.values + offset * 4, this.options.dimensions * 4);
-            this.WriteNodeEdges(b, node);
-            if (b.Length() >= batchBytes) {
-                sink(b.ToStr());
-                b.Clear();
+        try {
+            for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+                VectorNode node = this.nodes[slot];
+                b.WriteU8(node.active);
+                b.WriteU8(node.level);
+                b.WriteVarInt(node.id);
+                VectorChunk owner = this.chunks[slot / this.chunkRows];
+                int offset = (slot % this.chunkRows) * this.options.dimensions;
+                b.WriteBytes((nint)owner.values + offset * 4, this.options.dimensions * 4);
+                this.WriteNodeEdges(b, node);
+                if (b.Length() >= batchBytes) {
+                    sink(b.ToStr());
+                    b.Clear();
+                }
             }
+            if (b.Length() > 0) { sink(b.ToStr()); }
+        } finally {
+            b.Free();
         }
-        if (b.Length() > 0) { sink(b.ToStr()); }
-        b.Free();
     }
 
     // 量化模式导出：float 块不驻留，原向量经 source 从文档流式
@@ -1221,28 +1231,30 @@ public class VectorIndex {
         int bytes = this.options.dimensions * 4;
         float[] zero = new float[this.options.dimensions];
         ByteBuffer b = ByteBuffer.Alloc(batchBytes + 4096);
-        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
-            VectorNode node = this.nodes[slot];
-            b.WriteU8(node.active);
-            b.WriteU8(node.level);
-            b.WriteVarInt(node.id);
-            float[] vector = zero;
-            if (node.active == 1) {
-                vector = source(node.id);
-                if (vector == null || vector.Length != this.options.dimensions) {
-                    b.Free();
-                    throw new IOException("checkpoint vector source returned invalid vector");
+        try {
+            for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+                VectorNode node = this.nodes[slot];
+                b.WriteU8(node.active);
+                b.WriteU8(node.level);
+                b.WriteVarInt(node.id);
+                float[] vector = zero;
+                if (node.active == 1) {
+                    vector = source(node.id);
+                    if (vector == null || vector.Length != this.options.dimensions) {
+                        throw new IOException("checkpoint vector source returned invalid vector");
+                    }
+                }
+                b.WriteBytes((nint)vector, bytes);
+                this.WriteNodeEdges(b, node);
+                if (b.Length() >= batchBytes) {
+                    sink(b.ToStr());
+                    b.Clear();
                 }
             }
-            b.WriteBytes((nint)vector, bytes);
-            this.WriteNodeEdges(b, node);
-            if (b.Length() >= batchBytes) {
-                sink(b.ToStr());
-                b.Clear();
-            }
+            if (b.Length() > 0) { sink(b.ToStr()); }
+        } finally {
+            b.Free();
         }
-        if (b.Length() > 0) { sink(b.ToStr()); }
-        b.Free();
     }
 
     // 解码一个批次载荷，追加到待接线状态。可分任意多次调用，
@@ -1254,84 +1266,81 @@ public class VectorIndex {
             this.pendingEdgeBase = new List<int>();
         }
         ByteBuffer b = ByteBuffer.FromStr(payload);
-        while (b.Remaining() > 0) {
-            int active = b.ReadU8();
-            int level = b.ReadU8();
-            if (active > 1 || level < 0 || level > 32) {
-                b.Free();
-                throw new ArgumentException("Invalid checkpoint record header");
-            }
-            long id = b.ReadVarInt();
-            if (id < 0 || id > 2147483646) {
-                b.Free();
-                throw new ArgumentException("Invalid checkpoint record id");
-            }
-            int bytes = this.options.dimensions * 4;
-            if (!b.CanRead(bytes)) {
-                b.Free();
-                throw new ArgumentException("Truncated checkpoint vector");
-            }
-            int slot = this.nodes.Count;
-            if (slot >= 2147483646) {
-                b.Free();
-                throw new InvalidOperationException("Vector slot capacity exhausted");
-            }
-            VectorNode node;
-            if (this.options.quantize) {
-                // 量化模式：float 块不驻留，码由暂存向量现建。墓碑槽
-                // 码全零、scale/offset 失效——零向量过不了余弦范数
-                // 校验，必须跳过校验（搜索不会把它当结果返回）。
-                if (this.importScratch == null) { this.importScratch = new float[this.options.dimensions]; }
-                NativeMemory.Copy((nint)this.importScratch, b.Raw() + b.ReadPos(), bytes);
-                b.SeekRead(b.ReadPos() + bytes);
-                double scale = 0;
-                double shift = 0;
-                long codeSum = 0L;
-                double inverseNorm = 0;
-                if (active == 1) {
-                    inverseNorm = this.QuantizeIntoSlotWithSum(slot, this.importScratch, out scale, out shift, out codeSum);
+        try {
+            while (b.Remaining() > 0) {
+                int active = b.ReadU8();
+                int level = b.ReadU8();
+                if (active > 1 || level < 0 || level > 32) {
+                    throw new ArgumentException("Invalid checkpoint record header");
+                }
+                long id = b.ReadVarInt();
+                if (id < 0 || id > 2147483646) {
+                    throw new ArgumentException("Invalid checkpoint record id");
+                }
+                int bytes = this.options.dimensions * 4;
+                if (!b.CanRead(bytes)) {
+                    throw new ArgumentException("Truncated checkpoint vector");
+                }
+                int slot = this.nodes.Count;
+                if (slot >= 2147483646) {
+                    throw new InvalidOperationException("Vector slot capacity exhausted");
+                }
+                VectorNode node;
+                if (this.options.quantize) {
+                    // 量化模式：float 块不驻留，码由暂存向量现建。墓碑槽
+                    // 码全零、scale/offset 失效——零向量过不了余弦范数
+                    // 校验，必须跳过校验（搜索不会把它当结果返回）。
+                    if (this.importScratch == null) { this.importScratch = new float[this.options.dimensions]; }
+                    NativeMemory.Copy((nint)this.importScratch, b.Raw() + b.ReadPos(), bytes);
+                    b.SeekRead(b.ReadPos() + bytes);
+                    double scale = 0;
+                    double shift = 0;
+                    long codeSum = 0L;
+                    double inverseNorm = 0;
+                    if (active == 1) {
+                        inverseNorm = this.QuantizeIntoSlotWithSum(slot, this.importScratch, out scale, out shift, out codeSum);
+                    } else {
+                        this.EnsureCodeStorage(slot);
+                    }
+                    node = new VectorNode((int)id, level, this.options.m, inverseNorm);
+                    node.quantScale = scale;
+                    node.quantOffset = shift;
+                    node.quantCodeSum = codeSum;
                 } else {
-                    this.EnsureCodeStorage(slot);
+                    this.EnsureSlotStorage(slot);
+                    VectorChunk owner = this.chunks[slot / this.chunkRows];
+                    int offset = (slot % this.chunkRows) * this.options.dimensions;
+                    NativeMemory.Copy((nint)owner.values + offset * 4, b.Raw() + b.ReadPos(), bytes);
+                    b.SeekRead(b.ReadPos() + bytes);
+                    double inverseNorm = this.ValidateCoordinates(owner.values, offset);
+                    node = new VectorNode((int)id, level, this.options.m, inverseNorm);
                 }
-                node = new VectorNode((int)id, level, this.options.m, inverseNorm);
-                node.quantScale = scale;
-                node.quantOffset = shift;
-                node.quantCodeSum = codeSum;
-            } else {
-                this.EnsureSlotStorage(slot);
-                VectorChunk owner = this.chunks[slot / this.chunkRows];
-                int offset = (slot % this.chunkRows) * this.options.dimensions;
-                NativeMemory.Copy((nint)owner.values + offset * 4, b.Raw() + b.ReadPos(), bytes);
-                b.SeekRead(b.ReadPos() + bytes);
-                double inverseNorm = this.ValidateCoordinates(owner.values, offset);
-                node = new VectorNode((int)id, level, this.options.m, inverseNorm);
-            }
-            if (active == 0) { node.active = 0; }
-            this.nodes.Add(node);
-            this.RegisterNodeMeta(slot, node.id, active, node.inverseNorm, node.quantScale, node.quantOffset, node.quantCodeSum);
-            if (active == 1) {
-                if (this.idSlots.ContainsKey(node.id)) {
-                    b.Free();
-                    throw new ArgumentException("Duplicate active checkpoint id");
+                if (active == 0) { node.active = 0; }
+                this.nodes.Add(node);
+                this.RegisterNodeMeta(slot, node.id, active, node.inverseNorm, node.quantScale, node.quantOffset, node.quantCodeSum);
+                if (active == 1) {
+                    if (this.idSlots.ContainsKey(node.id)) {
+                        throw new ArgumentException("Duplicate active checkpoint id");
+                    }
+                    this.idSlots.Add(node.id, slot);
                 }
-                this.idSlots.Add(node.id, slot);
-            }
-            this.pendingEdgeBase.Add(this.pendingEdges.Count);
-            for (int layer = 0; layer <= level; layer = layer + 1) {
-                long count = b.ReadVarInt();
-                // 层容量上界 = m×2 ≤ 256（options.Validate 保证），
-                // 越界即格式损坏，直接拒绝。
-                if (count < 0 || count > 256) {
-                    b.Free();
-                    throw new ArgumentException("Invalid checkpoint edge count");
-                }
-                this.pendingEdges.Add((int)count);
-                for (int i = 0; i < (int)count; i = i + 1) {
-                    this.pendingEdges.Add((int)b.ReadVarInt());
+                this.pendingEdgeBase.Add(this.pendingEdges.Count);
+                for (int layer = 0; layer <= level; layer = layer + 1) {
+                    long count = b.ReadVarInt();
+                    // 层容量上界 = m×2 ≤ 256（options.Validate 保证），
+                    // 越界即格式损坏，直接拒绝。
+                    if (count < 0 || count > 256) {
+                        throw new ArgumentException("Invalid checkpoint edge count");
+                    }
+                    this.pendingEdges.Add((int)count);
+                    for (int i = 0; i < (int)count; i = i + 1) {
+                        this.pendingEdges.Add((int)b.ReadVarInt());
+                    }
                 }
             }
+        } finally {
+            b.Free();
         }
-        b.Free();
     }
 
     // 全部批次就位后接线并固化头部校验（与 v1 ImportState 同一口

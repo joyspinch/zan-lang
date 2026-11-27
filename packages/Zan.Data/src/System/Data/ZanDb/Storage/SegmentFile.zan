@@ -416,6 +416,94 @@ public class SegmentFile {
         return 0;
     }
 
+    // 无状态块内顺序查找（始终从偏移 0 起扫，不修改 b.rpos）：供共享 BlockCache 并发点查使用，消除数据竞争。
+    public static int ScanBlockFromStart(ByteBuffer b, string key, out string val) {
+        val = "";
+        nint bufPtr = b.data;
+        int lim = b.length;
+        int pos = 0;
+        if (lim <= 0) { return 0; }
+        Span<byte> sp = new Span<byte>(bufPtr, lim);
+        nint keyPtr = (nint)key;
+        int kLen = key.Length;
+        int keyFirst = kLen > 0 ? (key[0] & 255) : -1;
+        while (pos < lim) {
+            int rop = sp[pos] & 255;
+            pos = pos + 1;
+            if (rop != 1 && rop != 2) { return 0; }
+            if (pos >= lim) { return 0; }
+            int b0 = sp[pos] & 255;
+            pos = pos + 1;
+            int keyLen = b0;
+            if (b0 >= 128) {
+                long kl = (long)(b0 & 127);
+                int shift = 7;
+                while (true) {
+                    if (pos >= lim || shift > 63) { return 0; }
+                    int bx = sp[pos] & 255;
+                    pos = pos + 1;
+                    kl = kl + ((long)(bx & 127) << shift);
+                    if (bx < 128) { break; }
+                    shift = shift + 7;
+                }
+                if (kl < 0 || kl > (long)(lim - pos)) { return 0; }
+                keyLen = (int)kl;
+            } else if (keyLen > lim - pos) {
+                return 0;
+            }
+            int keyOff = pos;
+            pos = pos + keyLen;
+            int valOff = 0;
+            int valLen = 0;
+            if (rop == 1) {
+                if (pos >= lim) { return 0; }
+                int vb0 = sp[pos] & 255;
+                pos = pos + 1;
+                if (vb0 >= 128) {
+                    long vl = (long)(vb0 & 127);
+                    int shift = 7;
+                    while (true) {
+                        if (pos >= lim || shift > 63) { return 0; }
+                        int bx = sp[pos] & 255;
+                        pos = pos + 1;
+                        vl = vl + ((long)(bx & 127) << shift);
+                        if (bx < 128) { break; }
+                        shift = shift + 7;
+                    }
+                    if (vl < 0 || vl > (long)(lim - pos)) { return 0; }
+                    valLen = (int)vl;
+                } else {
+                    if (vb0 > lim - pos) { return 0; }
+                    valLen = vb0;
+                }
+                valOff = pos;
+                pos = pos + valLen;
+            }
+            int minLen = keyLen < kLen ? keyLen : kLen;
+            int cmp = 0;
+            if (minLen > 0) {
+                int r0 = sp[keyOff] & 255;
+                if (r0 != keyFirst) {
+                    cmp = r0 - keyFirst;
+                } else if (minLen > 1) {
+                    cmp = NativeMemory.Compare(bufPtr + (nint)(keyOff + 1), keyPtr + (nint)1, minLen - 1);
+                }
+            }
+            if (cmp == 0) {
+                cmp = keyLen - kLen;
+            }
+            if (cmp == 0) {
+                if (rop == 2) { return 2; }
+                val = NativeMemory.GetString(bufPtr, valOff, valLen);
+                return 1;
+            }
+            if (cmp > 0) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
     // 点查：0=不存在，1=命中（val 为值），
     // 2=墓碑（键在本段被删，查找到此为止）。块腐坏按不存在
     // 处理并留错误痕迹。
@@ -454,9 +542,8 @@ public class SegmentFile {
             cache.Release(pin);
             return 0;
         }
-        // 缓存块会被反复扫描：ScanBlock 依赖读游标，必须先归零。
-        pin.buf.SeekRead(0);
-        int r = SegmentFile.ScanBlock(pin.buf, key, out val);
+        // 缓存块会被多读者并发扫描：使用无状态扫描，绝不修改共享 pin.buf.rpos。
+        int r = SegmentFile.ScanBlockFromStart(pin.buf, key, out val);
         cache.Release(pin);
         return r;
     }

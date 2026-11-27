@@ -8,125 +8,130 @@ public partial class MySqlConnection : IDbConnection {
     public async DbResult QueryAsync(string sql) {
         await this.AcquireLock();
         try {
-            DbResult result = new DbResult();
-            this.hadError = false;
-            this.lastAffected = 0;
-            this.lastError = "";
-            if (!this.connected) {
-                this.hadError = true;
-                this.lastError = "not connected";
-                this.fail();
-            }
-            await this.comQuery(sql);
-            byte[] first = await this.readPacket();
-            if (first == null) {
-                this.hadError = true;
-                this.lastError = "connection closed";
-                this.connected = false;
-                this.fail();
-            }
-            int b0 = first[0] & 255;
-            if (b0 == 255) {
-                int code = (first[1]&255)|((first[2]&255)<<8);
-                this.lastError = "err " + Convert.ToString(code) + ": "
-                    + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
-                this.hadError = true;
-                this.lastNumber = code;
-                this.fail();
-            }
-            if (b0 == 0 || b0 == 254) {
-                // OK 包（无结果集）：偏移 1 处的 lenenc 整数即受影响行数。
-                int p = 1;
-                this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
-                return result;
-            }
-            // 结果集：首个数据包为列数（lenenc）。
-            int pcc = 0;
-            int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
-            result.SetColumnCount(ncols);
-            List<int> colTypes = new List<int>();
-            List<int> colFlags = new List<int>();
-            int c = 0;
-            for (; c < ncols; c = c + 1) {
-                byte[] cd = await this.readPacket();
-                if (cd == null) {
-                    this.lastError = "truncated column definition";
-                    return result;
-                }
-                int p = 0;
-                MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
-                MySqlWire.readLenencStrRaw(cd, ref p);  // schema
-                MySqlWire.readLenencStrRaw(cd, ref p);  // table
-                MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
-                result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
-                MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
-                MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
-                if (p + 9 > cd.Length) {
-                    this.lastError = "truncated column definition";
-                    return result;
-                }
-                colTypes.Add(cd[p + 6] & 255);  // 字符集 2 + 长度 4
-                colFlags.Add((cd[p+7]&255) | ((cd[p+8]&255) << 8));
-            }
-            byte[] colEof = await this.readPacket();  // 结束列定义的 EOF
-            int rowCount = 0;
-            while (true) {
-                byte[] row = await this.readPacket();
-                if (row == null) { break; }
-                if (this.isEof(row)) { break; }
-                int p = 0;
-                List<DbCell> cells = new List<DbCell>();
-                List<string> texts = new List<string>();
-                c = 0;
-                while (c < ncols) {
-                    if (p >= row.Length) {
-                        this.lastError = "truncated row packet";
-                        return result;
-                    }
-                    DbCell cell = new DbCell();
-                    if ((row[p] & 255) == 251) {  // NULL 标记
-                        p = p + 1;
-                        texts.Add("");
-                    } else {
-                        int ct = colTypes[c];
-                        // 整型列直接从线协议按数值解析存 ival，完全免去临时字符串分配与 Convert.ToInt64 开销；
-                        // 无符号 BIGINT 超 long 的回绕会改写 GetString，保留文本通道。
-                        if ((ct == 1 || ct == 2 || ct == 3 || ct == 9 || ct == 13)
-                                || (ct == 8 && (colFlags[c] & 32) == 0)) {
-                            cell.kind = 1;
-                            cell.ival = MySqlWire.readLenencIntRaw(row, ref p);
-                            texts.Add("");
-                        } else {
-                            string v = MySqlWire.readLenencStrRaw(row, ref p);
-                            cell.kind = 2;
-                            texts.Add(v);
-                        }
-                    }
-                    cells.Add(cell);
-                    c = c + 1;
-                }
-                result.AddRowCells(cells, texts);
-                rowCount = rowCount + 1;
-            }
-            this.lastAffected = rowCount;
-            return result;
+            return await this.QueryLockedAsync(sql);
         } finally {
             this.ReleaseLock();
         }
     }
 
-    // 执行非查询语句并返回受影响行数。语句失败时
-    // 抛出 <see cref="DbException"/>。
-    public async int ExecuteAsync(string sql) {
+    private async DbResult QueryLockedAsync(string sql) {
+        DbResult result = new DbResult();
+        this.hadError = false;
+        this.lastAffected = 0;
+        this.lastError = "";
         if (!this.connected) {
+            this.hadError = true;
             this.lastError = "not connected";
             this.fail();
         }
-        DbResult r = await this.QueryAsync(sql);
-        if (this.hadError) {
+        await this.comQuery(sql);
+        byte[] first = await this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
             this.fail();
         }
-        return this.lastAffected;
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            this.lastNumber = code;
+            this.fail();
+        }
+        if (b0 == 0 || b0 == 254) {
+            // OK 包（无结果集）：偏移 1 处的 lenenc 整数即受影响行数。
+            int p = 1;
+            this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
+            return result;
+        }
+        // 结果集：首个数据包为列数（lenenc）。
+        int pcc = 0;
+        int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
+        result.SetColumnCount(ncols);
+        List<int> colTypes = new List<int>();
+        List<int> colFlags = new List<int>();
+        int c = 0;
+        for (; c < ncols; c = c + 1) {
+            byte[] cd = await this.readPacket();
+            if (cd == null) {
+                this.lastError = "truncated column definition";
+                return result;
+            }
+            int p = 0;
+            MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
+            MySqlWire.readLenencStrRaw(cd, ref p);  // schema
+            MySqlWire.readLenencStrRaw(cd, ref p);  // table
+            MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
+            result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
+            MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
+            MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
+            if (p + 9 > cd.Length) {
+                this.lastError = "truncated column definition";
+                return result;
+            }
+            colTypes.Add(cd[p + 6] & 255);  // 字符集 2 + 长度 4
+            colFlags.Add((cd[p+7]&255) | ((cd[p+8]&255) << 8));
+        }
+        byte[] colEof = await this.readPacket();  // 结束列定义的 EOF
+        int rowCount = 0;
+        while (true) {
+            byte[] row = await this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { break; }
+            int p = 0;
+            List<DbCell> cells = new List<DbCell>();
+            List<string> texts = new List<string>();
+            c = 0;
+            while (c < ncols) {
+                if (p >= row.Length) {
+                    this.lastError = "truncated row packet";
+                    return result;
+                }
+                DbCell cell = new DbCell();
+                if ((row[p] & 255) == 251) {  // NULL 标记
+                    p = p + 1;
+                    texts.Add("");
+                } else {
+                    int ct = colTypes[c];
+                    // 整型列直接从线协议按数值解析存 ival，完全免去临时字符串分配与 Convert.ToInt64 开销；
+                    // 无符号 BIGINT 超 long 的回绕会改写 GetString，保留文本通道。
+                    if ((ct == 1 || ct == 2 || ct == 3 || ct == 9 || ct == 13)
+                            || (ct == 8 && (colFlags[c] & 32) == 0)) {
+                        cell.kind = 1;
+                        cell.ival = MySqlWire.readLenencIntRaw(row, ref p);
+                        texts.Add("");
+                    } else {
+                        string v = MySqlWire.readLenencStrRaw(row, ref p);
+                        cell.kind = 2;
+                        texts.Add(v);
+                    }
+                }
+                cells.Add(cell);
+                c = c + 1;
+            }
+            result.AddRowCells(cells, texts);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        return result;
+    }
+
+    // 执行非查询语句并返回受影响行数。语句失败时
+    // 抛出 <see cref="DbException"/>。
+    public async int ExecuteAsync(string sql) {
+        await this.AcquireLock();
+        try {
+            await this.QueryLockedAsync(sql);
+            if (this.hadError) {
+                this.fail();
+            }
+            return this.lastAffected;
+        } finally {
+            this.ReleaseLock();
+        }
     }
 
     // 抛出记录的失败，携带服务器自身的错误
@@ -163,27 +168,44 @@ public partial class MySqlConnection : IDbConnection {
     // 从尾数/指数/符号字段解码 IEEE-754 值。
 
 
+    private static string FormatUnsignedLong(long v) {
+        if (v >= 0L) { return Convert.ToString(v); }
+        long q = ((v >> 1) & 9223372036854775807L) / 5L;
+        long r = v - q * 10L;
+        return Convert.ToString(q) + Convert.ToString((int)r);
+    }
+
     // 在游标 p 处读取给定列类型的一个二进制协议整数值并推进游标，返回 long
-    // （免去格式化成字符串再反解析；无符号 BIGINT 与 ReadBinValueRaw 一样按 long 回绕解释）。
+    // （免去格式化成字符串再反解析；含越界保护）。
     internal static long ReadBinLongRaw(string buf, ref int p, int type, int flags) {
+        int blen = buf != null ? buf.Length : 0;
+        return ReadBinLongBounded(buf, blen, ref p, type, flags);
+    }
+
+    internal static long ReadBinLongBounded(string buf, int blen, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
+        if (buf == null || blen < 0) { return 0L; }
         if (type == 1) {
+            if (p + 1 > blen) { p = blen; return 0L; }
             int v = buf[p] & 255; p = p + 1;
             if (!uns && v > 127) { v = v - 256; }
             return v;
         }
         if (type == 2 || type == 13) {
+            if (p + 2 > blen) { p = blen; return 0L; }
             int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
             if (!uns && v > 32767) { v = v - 65536; }
             return v;
         }
         if (type == 3 || type == 9) {
+            if (p + 4 > blen) { p = blen; return 0L; }
             long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                    | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
             p = p + 4;
             if (!uns && v > 2147483647) { v = v - 4294967296; }
             return v;
         }
+        if (p + 8 > blen) { p = blen; return 0L; }
         long w = 0;
         for (int i = 0; i < 8; i = i + 1) { w = w | ((long)(buf[p+i]&255) << (8*i)); }
         p = p + 8;
@@ -200,18 +222,27 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     public static string ReadBinValueRaw(string buf, ref int p, int type, int flags) {
+        int blen = buf != null ? buf.Length : 0;
+        return ReadBinValueBounded(buf, blen, ref p, type, flags);
+    }
+
+    internal static string ReadBinValueBounded(string buf, int blen, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
+        if (buf == null || blen < 0) { return ""; }
         if (type == 1) {
+            if (p + 1 > blen) { p = blen; return "0"; }
             int v = buf[p] & 255; p = p + 1;
             if (!uns && v > 127) { v = v - 256; }
             return Convert.ToString(v);
         }
         if (type == 2 || type == 13) {
+            if (p + 2 > blen) { p = blen; return "0"; }
             int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
             if (!uns && v > 32767) { v = v - 65536; }
             return Convert.ToString(v);
         }
         if (type == 3 || type == 9) {
+            if (p + 4 > blen) { p = blen; return "0"; }
             long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                    | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
             p = p + 4;
@@ -219,12 +250,14 @@ public partial class MySqlConnection : IDbConnection {
             return Convert.ToString(v);
         }
         if (type == 8) {
+            if (p + 8 > blen) { p = blen; return "0"; }
             long v = 0;
             for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+i]&255) << (8*i)); }
             p = p + 8;
-            return Convert.ToString(v);
+            return uns ? MySqlConnection.FormatUnsignedLong(v) : Convert.ToString(v);
         }
         if (type == 4) {  // FLOAT（IEEE binary32）
+            if (p + 4 > blen) { p = blen; return "0"; }
             long bits = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                       | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
             p = p + 4;
@@ -232,6 +265,7 @@ public partial class MySqlConnection : IDbConnection {
                               bits & 8388607, 127, 23);
         }
         if (type == 5) {  // DOUBLE（IEEE binary64）
+            if (p + 8 > blen) { p = blen; return "0"; }
             long bits = 0; 
             for (int i = 0; i < 8; i = i + 1) { bits = bits | ((long)(buf[p+i]&255) << (8*i)); }
             p = p + 8;
@@ -239,7 +273,9 @@ public partial class MySqlConnection : IDbConnection {
                               bits & 4503599627370495, 1023, 52);
         }
         if (type == 10 || type == 12 || type == 7) {  // DATE / DATETIME / TIMESTAMP
+            if (p + 1 > blen) { p = blen; return "0000-00-00"; }
             int len = buf[p] & 255; p = p + 1;
+            if (len > blen - p) { len = blen - p; }
             int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
             if (len >= 4) {
                 y = (buf[p]&255) | ((buf[p+1]&255)<<8);
@@ -252,7 +288,9 @@ public partial class MySqlConnection : IDbConnection {
             return date + " " + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
         }
         if (type == 11) {  // TIME
+            if (p + 1 > blen) { p = blen; return "00:00:00"; }
             int len = buf[p] & 255; p = p + 1;
+            if (len > blen - p) { len = blen - p; }
             int h = 0; int mi = 0; int s = 0; string sign = "";
             if (len >= 8) {
                 if ((buf[p] & 255) == 1) { sign = "-"; }
@@ -404,123 +442,146 @@ public partial class MySqlConnection : IDbConnection {
     public async DbResult QueryParamsAsync(string sql, DbParams prms) {
         await this.AcquireLock();
         try {
-            DbResult result = new DbResult();
-            this.hadError = false;
-            this.lastAffected = 0;
-            this.lastError = "";
-            if (!this.connected) {
-                this.hadError = true;
-                this.lastError = "not connected";
-                this.fail();
-            }
-            int stmtId = 0;
-            int hit = this.stmtCacheFind(sql);
-            if (hit >= 0) {
-                stmtId = this.stmtCache[hit].id;
-            } else {
-                List<int> ids = new List<int>();
-                bool ok = await this.stmtPrepare(sql, ids);
-                if (!ok) { this.hadError = true; this.fail(); }
-                stmtId = ids[0];
-                await this.stmtCacheAdd(sql, stmtId);
-            }
-            await this.stmtExecute(stmtId, prms);
-            byte[] first = await this.readPacket();
-            if (first == null) {
-                this.hadError = true;
-                this.lastError = "connection closed";
-                this.connected = false;
-                this.fail();
-            }
-            int b0 = first[0] & 255;
-            if (b0 == 255) {
-                int code = (first[1]&255)|((first[2]&255)<<8);
-                this.lastError = "err " + Convert.ToString(code) + ": "
-                    + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
-                this.hadError = true;
-                this.lastNumber = code;
-                this.stmtCacheRemove(stmtId);
-                await this.stmtClose(stmtId);
-                this.fail();
-            }
-            if (b0 == 0 || b0 == 254) {
-                int p = 1;
-                this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
-                return result;
-            }
-            int pcc = 0;
-            int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
-            result.SetColumnCount(ncols);
-            List<int> colTypes = new List<int>();
-            List<int> colFlags = new List<int>();
-            int c = 0;
-            for (; c < ncols; c = c + 1) {
-                byte[] cd = await this.readPacket();
-                int p = 0;
-                MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
-                MySqlWire.readLenencStrRaw(cd, ref p);  // schema
-                MySqlWire.readLenencStrRaw(cd, ref p);  // table
-                MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
-                result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
-                MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
-                MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
-                int ctype = cd[p + 6] & 255;  // 字符集 2 + 长度 4
-                int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
-                colTypes.Add(ctype);
-                colFlags.Add(cflags);
-            }
-            byte[] colEof = await this.readPacket();
-            int rowCount = 0;
-            while (true) {
-                byte[] row = await this.readPacket();
-                if (row == null) { break; }
-                if (this.isEof(row)) { break; }
-                // 二进制行：0x00 头，接着是带 2 位偏移的 null bitmap。
-                int bmLen = (ncols + 9) / 8;
-                int p = 1 + bmLen;
-                List<DbCell> cells = new List<DbCell>();
-                List<string> texts = new List<string>();
-                c = 0;
-                while (c < ncols) {
-                    DbCell cell = new DbCell();
-                    int bit = c + 2;
-                    int nb = row[1 + bit / 8] & 255;
-                    if (((nb >> (bit % 8)) & 1) == 1) {
-                        texts.Add("");
-                    } else {
-                        int ct = colTypes[c];
-                        if (ct == 1 || ct == 2 || ct == 3 || ct == 8
-                                || ct == 9 || ct == 13) {
-                            cell.kind = 1;  // 整型直取
-                            cell.ival = ReadBinLongRaw(row, ref p, ct, colFlags[c]);
-                            texts.Add("");
-                        } else {
-                            cell.kind = 2;
-                            texts.Add(ReadBinValueRaw(row, ref p, ct, colFlags[c]));
-                        }
-                    }
-                    cells.Add(cell);
-                    c = c + 1;
-                }
-                result.AddRowCells(cells, texts);
-                rowCount = rowCount + 1;
-            }
-            this.lastAffected = rowCount;
-            return result;
+            return await this.QueryParamsLockedAsync(sql, prms);
         } finally {
             this.ReleaseLock();
         }
+    }
+
+    private async DbResult QueryParamsLockedAsync(string sql, DbParams prms) {
+        DbResult result = new DbResult();
+        this.hadError = false;
+        this.lastAffected = 0;
+        this.lastError = "";
+        if (!this.connected) {
+            this.hadError = true;
+            this.lastError = "not connected";
+            this.fail();
+        }
+        int stmtId = 0;
+        int hit = this.stmtCacheFind(sql);
+        if (hit >= 0) {
+            stmtId = this.stmtCache[hit].id;
+        } else {
+            List<int> ids = new List<int>();
+            bool ok = await this.stmtPrepare(sql, ids);
+            if (!ok) { this.hadError = true; this.fail(); }
+            stmtId = ids[0];
+            await this.stmtCacheAdd(sql, stmtId);
+        }
+        await this.stmtExecute(stmtId, prms);
+        byte[] first = await this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
+            this.fail();
+        }
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            this.lastNumber = code;
+            this.stmtCacheRemove(stmtId);
+            await this.stmtClose(stmtId);
+            this.fail();
+        }
+        if (b0 == 0 || b0 == 254) {
+            int p = 1;
+            this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
+            return result;
+        }
+        int pcc = 0;
+        int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
+        result.SetColumnCount(ncols);
+        List<int> colTypes = new List<int>();
+        List<int> colFlags = new List<int>();
+        int c = 0;
+        for (; c < ncols; c = c + 1) {
+            byte[] cd = await this.readPacket();
+            if (cd == null) {
+                this.lastError = "truncated column definition";
+                return result;
+            }
+            int p = 0;
+            MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
+            MySqlWire.readLenencStrRaw(cd, ref p);  // schema
+            MySqlWire.readLenencStrRaw(cd, ref p);  // table
+            MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
+            result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
+            MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
+            MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
+            if (p + 9 > cd.Length) {
+                this.lastError = "truncated column definition";
+                return result;
+            }
+            int ctype = cd[p + 6] & 255;  // 字符集 2 + 长度 4
+            int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
+            colTypes.Add(ctype);
+            colFlags.Add(cflags);
+        }
+        byte[] colEof = await this.readPacket();
+        int rowCount = 0;
+        while (true) {
+            byte[] row = await this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { break; }
+            // 二进制行：0x00 头，接着是带 2 位偏移的 null bitmap。
+            int rowLen = this.lastLen >= 0 && this.lastLen <= row.Length ? this.lastLen : row.Length;
+            int bmLen = (ncols + 9) / 8;
+            if (1 + bmLen > rowLen) {
+                this.lastError = "truncated binary row packet";
+                return result;
+            }
+            int p = 1 + bmLen;
+            List<DbCell> cells = new List<DbCell>();
+            List<string> texts = new List<string>();
+            c = 0;
+            while (c < ncols) {
+                DbCell cell = new DbCell();
+                int bit = c + 2;
+                int nb = row[1 + bit / 8] & 255;
+                if (((nb >> (bit % 8)) & 1) == 1) {
+                    texts.Add("");
+                } else {
+                    int ct = colTypes[c];
+                    int cf = colFlags[c];
+                    if ((ct == 1 || ct == 2 || ct == 3 || ct == 9 || ct == 13)
+                            || (ct == 8 && (cf & 32) == 0)) {
+                        cell.kind = 1;  // 整型直取（无符号 BIGINT 走文本通道防 >= 2^63 回绕为负）
+                        cell.ival = ReadBinLongBounded(row, rowLen, ref p, ct, cf);
+                        texts.Add("");
+                    } else {
+                        cell.kind = 2;
+                        texts.Add(ReadBinValueBounded(row, rowLen, ref p, ct, cf));
+                    }
+                }
+                cells.Add(cell);
+                c = c + 1;
+            }
+            result.AddRowCells(cells, texts);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        return result;
     }
 
     // 执行参数化非查询语句；返回受影响行数。
     // 语句失败时抛出 <see cref="DbException"/>，
     // 失败的写入绝不会被误判为「匹配 0 行」。
     public async int ExecuteParamsAsync(string sql, DbParams prms) {
-        DbResult r = await this.QueryParamsAsync(sql, prms);
-        if (this.hadError) {
-            this.fail();
+        await this.AcquireLock();
+        try {
+            await this.QueryParamsLockedAsync(sql, prms);
+            if (this.hadError) {
+                this.fail();
+            }
+            return this.lastAffected;
+        } finally {
+            this.ReleaseLock();
         }
-        return this.lastAffected;
     }
 
     // 参数化标量查询（第一行第一列）。
@@ -623,16 +684,10 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     // 关闭连接。TLS 通道先发 close_notify 再关套接字
-    // （TlsStream.Close 不拥有底层 fd）。安全释放互斥门控并唤醒所有等待者。
+    // （TlsStream.Close 不拥有底层 fd）。不强制清空 busy，
+    // 若当前有活跃持锁者，其底层 I/O 会因关套接字立即返回并通过 finally { ReleaseLock(); } 串行唤醒等待者。
     public void Close() {
         this.connected = false;
-        lock (this) {
-            while (this.waiters != null && this.waiters.Count() > 0) {
-                AsyncGate g = this.waiters.Dequeue();
-                g.Signal();
-            }
-            this.busy = false;
-        }
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;
