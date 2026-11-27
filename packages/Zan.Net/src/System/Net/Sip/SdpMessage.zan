@@ -63,58 +63,144 @@ public class SdpMessage {
         this.attributes.Add(attr);
     }
 
-    // 序列化为规范的 SDP 字符串。
-    public string Serialize() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("v=");
-        sb.Append(Convert.ToString(this.version));
-        sb.Append("\r\n");
-
-        sb.Append("o=");
-        sb.Append(this.originUser);
-        sb.Append(" ");
-        sb.Append(Convert.ToString(this.sessionId));
-        sb.Append(" ");
-        sb.Append(Convert.ToString(this.sessionVersion));
-        sb.Append(" IN IP4 ");
-        sb.Append(this.connectionIp);
-        sb.Append("\r\n");
-
-        sb.Append("s=");
-        sb.Append(this.sessionName);
-        sb.Append("\r\n");
-
-        sb.Append("c=IN IP4 ");
-        sb.Append(this.connectionIp);
-        sb.Append("\r\n");
-
-        sb.Append("t=0 0\r\n");
-
-        sb.Append("m=");
-        sb.Append(this.mediaType);
-        sb.Append(" ");
-        sb.Append(Convert.ToString(this.mediaPort));
-        sb.Append(" RTP/AVP ");
-        sb.Append(Convert.ToString(this.payloadType));
-        sb.Append("\r\n");
-
-        for (int i = 0; i < this.attributes.Count; i = i + 1) {
-            sb.Append("a=");
-            sb.Append(this.attributes[i]);
-            sb.Append("\r\n");
+    private static int LongDecLen(long v) {
+        if (v == 0L) { return 1; }
+        int len = 0;
+        if (v < 0L) {
+            len = 1;
+            if (v == -9223372036854775807L - 1L) { return 20; }
+            v = -v;
         }
-
-        return sb.ToString();
+        while (v > 0L) {
+            len = len + 1;
+            v = v / 10L;
+        }
+        return len;
     }
 
-    // 安全解析非负十进制整数，非法输入返回 0。
-    public static int ParseInt(string s) {
-        if (s == null || s.Length == 0) { return 0; }
+    private static int WriteLongDec(byte[] buf, int pos, long v) {
+        if (v == 0L) {
+            buf[pos] = (byte)48;
+            return pos + 1;
+        }
+        if (v == -9223372036854775807L - 1L) {
+            string minS = "-9223372036854775808";
+            for (int i = 0; i < 20; i = i + 1) { buf[pos + i] = (byte)(minS[i] & 255); }
+            return pos + 20;
+        }
+        if (v < 0L) {
+            buf[pos] = (byte)45;
+            pos = pos + 1;
+            v = -v;
+        }
+        int start = pos;
+        while (v > 0L) {
+            long q = v / 10L;
+            buf[pos] = (byte)(48 + (int)(v - q * 10L));
+            pos = pos + 1;
+            v = q;
+        }
+        int l = start;
+        int r = pos - 1;
+        while (l < r) {
+            byte tmp = buf[l];
+            buf[l] = buf[r];
+            buf[r] = tmp;
+            l = l + 1;
+            r = r - 1;
+        }
+        return pos;
+    }
+
+    // 序列化为规范的 SDP 字符串（两遍精确单缓冲 + 内联整数直写）。
+    public string Serialize() {
+        string oUser = this.originUser != null ? this.originUser : "";
+        string ip = this.connectionIp != null ? this.connectionIp : "";
+        string sName = this.sessionName != null ? this.sessionName : "";
+        string mType = this.mediaType != null ? this.mediaType : "";
+        int attrCount = this.attributes.Count;
+
+        int total =
+            4 + SdpMessage.LongDecLen((long)this.version) +                                                  // "v=<ver>\r\n"
+            14 + oUser.Length + SdpMessage.LongDecLen(this.sessionId) + SdpMessage.LongDecLen(this.sessionVersion) + ip.Length + // "o=<u> <id> <v> IN IP4 <ip>\r\n"
+            4 + sName.Length +                                                                                // "s=<name>\r\n"
+            11 + ip.Length +                                                                                  // "c=IN IP4 <ip>\r\n"
+            7 +                                                                                               // "t=0 0\r\n"
+            14 + mType.Length + SdpMessage.LongDecLen((long)this.mediaPort) + SdpMessage.LongDecLen((long)this.payloadType); // "m=<t> <p> RTP/AVP <pt>\r\n"
+        for (int i = 0; i < attrCount; i = i + 1) {
+            string a = this.attributes[i];
+            total = total + 4 + (a != null ? a.Length : 0);
+        }
+
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int p = 0;
+
+        // v=<version>\r\n
+        buf[p] = (byte)118; buf[p + 1] = (byte)61; p = p + 2;
+        p = SdpMessage.WriteLongDec(buf, p, (long)this.version);
+        buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+
+        // o=<originUser> <sessionId> <sessionVersion> IN IP4 <connectionIp>\r\n
+        buf[p] = (byte)111; buf[p + 1] = (byte)61; p = p + 2;
+        if (oUser.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)oUser, oUser.Length); p = p + oUser.Length; }
+        buf[p] = (byte)32; p = p + 1;
+        p = SdpMessage.WriteLongDec(buf, p, this.sessionId);
+        buf[p] = (byte)32; p = p + 1;
+        p = SdpMessage.WriteLongDec(buf, p, this.sessionVersion);
+        NativeMemory.Copy(bp + (nint)p, (nint)" IN IP4 ", 8); p = p + 8;
+        if (ip.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)ip, ip.Length); p = p + ip.Length; }
+        buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+
+        // s=<sessionName>\r\n
+        buf[p] = (byte)115; buf[p + 1] = (byte)61; p = p + 2;
+        if (sName.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)sName, sName.Length); p = p + sName.Length; }
+        buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+
+        // c=IN IP4 <connectionIp>\r\n
+        NativeMemory.Copy(bp + (nint)p, (nint)"c=IN IP4 ", 9); p = p + 9;
+        if (ip.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)ip, ip.Length); p = p + ip.Length; }
+        buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+
+        // t=0 0\r\n
+        NativeMemory.Copy(bp + (nint)p, (nint)"t=0 0\r\n", 7); p = p + 7;
+
+        // m=<mediaType> <mediaPort> RTP/AVP <payloadType>\r\n
+        buf[p] = (byte)109; buf[p + 1] = (byte)61; p = p + 2;
+        if (mType.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)mType, mType.Length); p = p + mType.Length; }
+        buf[p] = (byte)32; p = p + 1;
+        p = SdpMessage.WriteLongDec(buf, p, (long)this.mediaPort);
+        NativeMemory.Copy(bp + (nint)p, (nint)" RTP/AVP ", 9); p = p + 9;
+        p = SdpMessage.WriteLongDec(buf, p, (long)this.payloadType);
+        buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+
+        // a=<attr>\r\n
+        for (int i = 0; i < attrCount; i = i + 1) {
+            string a = this.attributes[i];
+            buf[p] = (byte)97; buf[p + 1] = (byte)61; p = p + 2;
+            if (a != null && a.Length > 0) {
+                NativeMemory.Copy(bp + (nint)p, (nint)a, a.Length);
+                p = p + a.Length;
+            }
+            buf[p] = (byte)13; buf[p + 1] = (byte)10; p = p + 2;
+        }
+
+        return NativeMemory.GetString(bp, 0, total);
+    }
+
+    private static bool IsTrimWs(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+    }
+
+    private static int ParseIntSlice(string s, int start, int end) {
+        while (start < end && SdpMessage.IsTrimWs(s[start] & 255)) { start = start + 1; }
+        while (end > start && SdpMessage.IsTrimWs(s[end - 1] & 255)) { end = end - 1; }
+        if (start >= end) { return 0; }
         int v = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int c = s[i] & 255;
-            if (c >= 48 && c <= 57) {
-                v = v * 10 + (c - 48);
+        for (int i = start; i < end; i = i + 1) {
+            int d = (s[i] & 255) - 48;
+            if (d >= 0 && d <= 9) {
+                v = v * 10 + d;
             } else {
                 return 0;
             }
@@ -122,93 +208,124 @@ public class SdpMessage {
         return v;
     }
 
-    // 解析 SDP 文本并提取连接信息与媒体端口。
+    // 安全解析非负十进制整数，非法输入返回 0。
+    public static int ParseInt(string s) {
+        if (s == null || s.Length == 0) { return 0; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int d = (s[i] & 255) - 48;
+            if (d >= 0 && d <= 9) {
+                v = v * 10 + d;
+            } else {
+                return 0;
+            }
+        }
+        return v;
+    }
+
+    // 解析 SDP 文本并提取连接信息与媒体端口（SIMD 行扫 + 零中间子串切片）。
     public static SdpMessage Parse(string text) {
         if (text == null || text.Length == 0) { return null; }
         SdpMessage sdp = new SdpMessage();
-        int pos = 0;
+        nint tp = (nint)text;
         int len = text.Length;
+        int pos = 0;
+
         while (pos < len) {
-            int nextLine = SdpMessage.FindLineEnd(text, pos);
-            int lineLen = (nextLine >= 0 ? nextLine : len) - pos;
-            string line = text.Substring(pos, lineLen).Trim();
-            if (line.Length >= 2 && (line[1] & 255) == 61) { // '='
-                int typeChar = line[0] & 255;
-                string val = line.Substring(2, line.Length - 2).Trim();
-                if (typeChar == 99) { // 'c'
-                    // "IN IP4 192.168.1.1"
-                    int lastSp = val.LastIndexOf(" ");
-                    if (lastSp >= 0) {
-                        sdp.connectionIp = val.Substring(lastSp + 1, val.Length - lastSp - 1).Trim();
-                    } else {
-                        sdp.connectionIp = val;
-                    }
-                } else if (typeChar == 109) { // 'm'
-                    // "audio 40000 RTP/AVP 0 8"
-                    int sp1 = val.IndexOf(" ");
-                    if (sp1 > 0) {
-                        sdp.mediaType = val.Substring(0, sp1).Trim();
-                        int sp2 = val.IndexOf(" ", sp1 + 1);
-                        if (sp2 > sp1) {
-                            string portStr = val.Substring(sp1 + 1, sp2 - sp1 - 1).Trim();
-                            int p = SdpMessage.ParseInt(portStr);
-                            if (p >= 0 && p <= 65535) {
-                                sdp.mediaPort = p;
-                            }
-                            int sp3 = val.IndexOf(" ", sp2 + 1);
-                            if (sp3 > sp2) {
-                                // 提取后续第一个格式
-                                string fmtStr = val.Substring(sp3 + 1, val.Length - sp3 - 1).Trim();
-                                int spaceAfterFmt = fmtStr.IndexOf(" ");
-                                if (spaceAfterFmt > 0) {
-                                    fmtStr = fmtStr.Substring(0, spaceAfterFmt).Trim();
+            int relLine = NativeMemory.IndexOfAny(tp + (nint)pos, len - pos, 13, 10);
+            int nextLine = relLine >= 0 ? (pos + relLine) : -1;
+            int lineEnd = nextLine >= 0 ? nextLine : len;
+
+            int ls = pos;
+            int le = lineEnd;
+            while (ls < le && SdpMessage.IsTrimWs(text[ls] & 255)) { ls = ls + 1; }
+            while (le > ls && SdpMessage.IsTrimWs(text[le - 1] & 255)) { le = le - 1; }
+
+            if (le - ls >= 2 && (text[ls + 1] & 255) == 61) { // '='
+                int typeChar = text[ls] & 255;
+                if (typeChar == 99 || typeChar == 109 || typeChar == 115 || typeChar == 97) {
+                    int vs = ls + 2;
+                    int ve = le;
+                    while (vs < ve && SdpMessage.IsTrimWs(text[vs] & 255)) { vs = vs + 1; }
+                    while (ve > vs && SdpMessage.IsTrimWs(text[ve - 1] & 255)) { ve = ve - 1; }
+
+                    if (typeChar == 99) { // 'c'
+                        // "IN IP4 192.168.1.1"
+                        int lastSp = -1;
+                        for (int k = ve - 1; k >= vs; k = k - 1) {
+                            if ((text[k] & 255) == 32) { lastSp = k; break; }
+                        }
+                        if (lastSp >= 0) {
+                            int ips = lastSp + 1;
+                            while (ips < ve && SdpMessage.IsTrimWs(text[ips] & 255)) { ips = ips + 1; }
+                            sdp.connectionIp = text.Substring(ips, ve - ips);
+                        } else {
+                            sdp.connectionIp = text.Substring(vs, ve - vs);
+                        }
+                    } else if (typeChar == 109) { // 'm'
+                        // "audio 40000 RTP/AVP 0 8"
+                        int sp1 = NativeMemory.Find(tp, vs, 32, ve - vs);
+                        if (sp1 > vs) {
+                            int me = sp1;
+                            while (me > vs && SdpMessage.IsTrimWs(text[me - 1] & 255)) { me = me - 1; }
+                            sdp.mediaType = text.Substring(vs, me - vs);
+                            int sp2 = sp1 + 1 < ve ? NativeMemory.Find(tp, sp1 + 1, 32, ve - (sp1 + 1)) : -1;
+                            if (sp2 > sp1) {
+                                int p = SdpMessage.ParseIntSlice(text, sp1 + 1, sp2);
+                                if (p >= 0 && p <= 65535) {
+                                    sdp.mediaPort = p;
                                 }
-                                if (fmtStr.Length > 0) {
-                                    sdp.payloadType = SdpMessage.ParseInt(fmtStr);
+                                int sp3 = sp2 + 1 < ve ? NativeMemory.Find(tp, sp2 + 1, 32, ve - (sp2 + 1)) : -1;
+                                if (sp3 > sp2) {
+                                    int fs = sp3 + 1;
+                                    while (fs < ve && SdpMessage.IsTrimWs(text[fs] & 255)) { fs = fs + 1; }
+                                    if (fs < ve) {
+                                        int spAfter = NativeMemory.Find(tp, fs, 32, ve - fs);
+                                        int fe = (spAfter > fs) ? spAfter : ve;
+                                        sdp.payloadType = SdpMessage.ParseIntSlice(text, fs, fe);
+                                    }
                                 }
                             }
                         }
-                    }
-                } else if (typeChar == 115) { // 's'
-                    sdp.sessionName = val;
-                } else if (typeChar == 97) { // 'a'
-                    sdp.attributes.Add(val);
-                    if (val.StartsWith("rtpmap:")) {
-                        // "rtpmap:0 PCMU/8000"
-                        int colon = val.IndexOf(":");
-                        int sp = val.IndexOf(" ", colon + 1);
-                        if (sp > colon) {
-                            int slash = val.IndexOf("/", sp + 1);
-                            if (slash > sp) {
-                                sdp.codec = val.Substring(sp + 1, slash - sp - 1).Trim();
-                                string rateStr = "";
-                                int slash2 = val.IndexOf("/", slash + 1);
-                                if (slash2 > slash) {
-                                    rateStr = val.Substring(slash + 1, slash2 - slash - 1).Trim();
-                                } else {
-                                    rateStr = val.Substring(slash + 1, val.Length - slash - 1).Trim();
+                    } else if (typeChar == 115) { // 's'
+                        sdp.sessionName = text.Substring(vs, ve - vs);
+                    } else { // 'a' (97)
+                        string val = text.Substring(vs, ve - vs);
+                        sdp.attributes.Add(val);
+                        // 快检 "rtpmap:"
+                        if (ve - vs >= 7
+                            && (text[vs] & 255) == 114
+                            && (text[vs + 1] & 255) == 116
+                            && (text[vs + 2] & 255) == 112
+                            && (text[vs + 3] & 255) == 109
+                            && (text[vs + 4] & 255) == 97
+                            && (text[vs + 5] & 255) == 112
+                            && (text[vs + 6] & 255) == 58) {
+                            int afterColon = vs + 7;
+                            int sp = afterColon < ve ? NativeMemory.Find(tp, afterColon, 32, ve - afterColon) : -1;
+                            if (sp > vs + 6) {
+                                int slash = sp + 1 < ve ? NativeMemory.Find(tp, sp + 1, 47, ve - (sp + 1)) : -1;
+                                if (slash > sp) {
+                                    int cs = sp + 1;
+                                    int ce = slash;
+                                    while (cs < ce && SdpMessage.IsTrimWs(text[cs] & 255)) { cs = cs + 1; }
+                                    while (ce > cs && SdpMessage.IsTrimWs(text[ce - 1] & 255)) { ce = ce - 1; }
+                                    sdp.codec = text.Substring(cs, ce - cs);
+                                    int slash2 = slash + 1 < ve ? NativeMemory.Find(tp, slash + 1, 47, ve - (slash + 1)) : -1;
+                                    int re = slash2 > slash ? slash2 : ve;
+                                    sdp.sampleRate = SdpMessage.ParseIntSlice(text, slash + 1, re);
                                 }
-                                sdp.sampleRate = SdpMessage.ParseInt(rateStr);
                             }
                         }
                     }
                 }
             }
+
             if (nextLine < 0) { break; }
             pos = nextLine;
             if (pos < len && (text[pos] & 255) == 13) { pos = pos + 1; }
             if (pos < len && (text[pos] & 255) == 10) { pos = pos + 1; }
         }
         return sdp;
-    }
-
-    private static int FindLineEnd(string s, int from) {
-        int i = from;
-        while (i < s.Length) {
-            int c = s[i] & 255;
-            if (c == 13 || c == 10) { return i; }
-            i = i + 1;
-        }
-        return -1;
     }
 }

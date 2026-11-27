@@ -29,6 +29,10 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         this.optional = optional;
     }
 
+    private static bool IsTrimWs(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+    }
+
     // 读文件并重建内容。文件不存在时：optional 为真则跳过，
     // 否则抛 FileNotFoundException（配置缺文件是启动期错误，不该静默）。
     public override void Load() {
@@ -39,77 +43,150 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         }
         string text = File.ReadAllText(this.path);
         this.data.Clear();
-        List<string> lines = text.Split("\n");
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            this.ParseLine(lines[i]);
+        int n = text.Length;
+        nint tp = (nint)text;
+        int pos = 0;
+        while (pos < n) {
+            int nl = NativeMemory.Find(tp, pos, 10, n - pos);
+            int end = nl >= 0 ? nl : n;
+            this.ParseLineSlice(text, tp, pos, end);
+            if (nl < 0) { break; }
+            pos = nl + 1;
         }
     }
 
     // 解析一行 "KEY=VALUE"。
     protected void ParseLine(string rawLine) {
-        string line = rawLine.Trim();
-        if (line.Length == 0) { return; }
-        if (line.StartsWith("#")) { return; }
-        if (line.StartsWith("export ")) { line = line.Substring(7).Trim(); }
-        int eq = line.IndexOf("=");
+        if (rawLine == null || rawLine.Length == 0) { return; }
+        this.ParseLineSlice(rawLine, (nint)rawLine, 0, rawLine.Length);
+    }
+
+    private void ParseLineSlice(string text, nint tp, int start, int end) {
+        int s = start;
+        int e = end;
+        while (s < e && EnvFileConfigurationProvider.IsTrimWs(text[s] & 255)) { s = s + 1; }
+        while (e > s && EnvFileConfigurationProvider.IsTrimWs(text[e - 1] & 255)) { e = e - 1; }
+        if (s >= e) { return; }
+        if ((text[s] & 255) == 35) { return; } // '#'
+        if (e - s >= 7
+            && (text[s] & 255) == 101
+            && (text[s + 1] & 255) == 120
+            && (text[s + 2] & 255) == 112
+            && (text[s + 3] & 255) == 111
+            && (text[s + 4] & 255) == 114
+            && (text[s + 5] & 255) == 116
+            && (text[s + 6] & 255) == 32) {
+            s = s + 7;
+            while (s < e && EnvFileConfigurationProvider.IsTrimWs(text[s] & 255)) { s = s + 1; }
+        }
+        int eq = s < e ? NativeMemory.Find(tp, s, 61, e - s) : -1;
         if (eq < 0) { return; }
-        string rawKey = line.Substring(0, eq).Trim();
-        if (rawKey.Length == 0) { return; }
-        string value = EnvFileConfigurationProvider.ParseValue(line.Substring(eq + 1).Trim());
+        int ks = s;
+        int ke = eq;
+        while (ke > ks && EnvFileConfigurationProvider.IsTrimWs(text[ke - 1] & 255)) { ke = ke - 1; }
+        if (ks >= ke) { return; }
+        int vs = eq + 1;
+        int ve = e;
+        while (vs < ve && EnvFileConfigurationProvider.IsTrimWs(text[vs] & 255)) { vs = vs + 1; }
+        string rawKey = text.Substring(ks, ke - ks);
+        string value = EnvFileConfigurationProvider.ParseValueSlice(text, tp, vs, ve);
         this.Set(rawKey, value);
+    }
+
+    private static string ParseValueSlice(string raw, nint rp, int start, int end) {
+        int len = end - start;
+        if (len < 2) {
+            return (start == 0 && end == raw.Length) ? raw : raw.Substring(start, len);
+        }
+        int first = raw[start] & 255;
+        int last = raw[end - 1] & 255;
+        if (first == 34 && last == 34) {
+            return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, end - 1);
+        }
+        if (first == 39 && last == 39) {
+            return raw.Substring(start + 1, len - 2);
+        }
+        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, rp, start, end);
     }
 
     // 取值的字面形式：双引号解转义、单引号取字面量、其余去行尾注释。
     public static string ParseValue(string raw) {
         if (raw == null || raw.Length < 2) { return raw; }
-        int first = raw[0] & 255;
-        int last = raw[raw.Length - 1] & 255;
-        if (first == 34 && last == 34) {
-            return EnvFileConfigurationProvider.Unescape(raw.Substring(1, raw.Length - 2));
+        return EnvFileConfigurationProvider.ParseValueSlice(raw, (nint)raw, 0, raw.Length);
+    }
+
+    private static string StripInlineCommentSlice(string raw, nint rp, int start, int end) {
+        int scan = start + 1;
+        int hash = -1;
+        while (scan < end) {
+            int hit = NativeMemory.Find(rp, scan, 35, end - scan);
+            if (hit < 0) { break; }
+            int prev = raw[hit - 1] & 255;
+            if (prev == 32 || prev == 9) { hash = hit; break; }
+            scan = hit + 1;
         }
-        if (first == 39 && last == 39) {
-            return raw.Substring(1, raw.Length - 2);
+        if (hash < 0) {
+            return (start == 0 && end == raw.Length) ? raw : raw.Substring(start, end - start);
         }
-        return EnvFileConfigurationProvider.StripInlineComment(raw);
+        int ts = start;
+        int te = hash;
+        while (ts < te && EnvFileConfigurationProvider.IsTrimWs(raw[ts] & 255)) { ts = ts + 1; }
+        while (te > ts && EnvFileConfigurationProvider.IsTrimWs(raw[te - 1] & 255)) { te = te - 1; }
+        return raw.Substring(ts, te - ts);
     }
 
     // 去掉未加引号值里的行尾注释：'#' 前有空白才算注释起点。
     public static string StripInlineComment(string raw) {
-        int hash = -1;
-        for (int i = 1; i < raw.Length; i = i + 1) {
-            if ((raw[i] & 255) == 35) {     // '#'
-                int prev = raw[i - 1] & 255;
-                if (prev == 32 || prev == 9) { hash = i; break; }
+        if (raw == null || raw.Length < 2) { return raw; }
+        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, (nint)raw, 0, raw.Length);
+    }
+
+    private static string UnescapeSlice(string text, nint tp, int start, int end) {
+        int len = end - start;
+        if (len <= 0) { return ""; }
+        int firstBs = NativeMemory.Find(tp, start, 92, len);
+        if (firstBs < 0) {
+            return (start == 0 && end == text.Length) ? text : text.Substring(start, len);
+        }
+        byte[] buf = new byte[len];
+        nint bp = (nint)buf;
+        int cur = start;
+        int dst = 0;
+        int hit = firstBs;
+        while (hit >= 0 && hit + 1 < end) {
+            int nextCh = text[hit + 1] & 255;
+            int mapped = 0;
+            if (nextCh == 110) { mapped = 10; }
+            else if (nextCh == 116) { mapped = 9; }
+            else if (nextCh == 114) { mapped = 13; }
+            else if (nextCh == 92) { mapped = 92; }
+            else if (nextCh == 34) { mapped = 34; }
+            if (mapped != 0) {
+                int run = hit - cur;
+                if (run > 0) {
+                    NativeMemory.Copy(bp + (nint)dst, tp + (nint)cur, run);
+                    dst = dst + run;
+                }
+                buf[dst] = (byte)mapped;
+                dst = dst + 1;
+                cur = hit + 2;
+                hit = cur < end ? NativeMemory.Find(tp, cur, 92, end - cur) : -1;
+            } else {
+                int nextSearch = hit + 1;
+                hit = nextSearch < end ? NativeMemory.Find(tp, nextSearch, 92, end - nextSearch) : -1;
             }
         }
-        if (hash < 0) { return raw; }
-        return raw.Substring(0, hash).Trim();
+        int rem = end - cur;
+        if (rem > 0) {
+            NativeMemory.Copy(bp + (nint)dst, tp + (nint)cur, rem);
+            dst = dst + rem;
+        }
+        return NativeMemory.GetString(bp, 0, dst);
     }
 
     // 双引号里的转义展开：\n \t \r \\ \"，其余反斜杠原样保留。
     public static string Unescape(string text) {
         if (text == null) { return ""; }
-        if (text.IndexOf("\\") < 0) { return text; }
-        StringBuilder sb = new StringBuilder();
-        int start = 0;
-        int len = text.Length;
-        for (int i = 0; i < len; i = i + 1) {
-            int c = text[i] & 255;
-            if (c == 92 && i + 1 < len) {      // 反斜杠
-                int n = text[i + 1] & 255;
-                if (n == 110 || n == 116 || n == 114 || n == 92 || n == 34) {
-                    if (i > start) { sb.Append(text.Substring(start, i - start)); }
-                    if (n == 110) { sb.Append("\n"); }
-                    else if (n == 116) { sb.Append("\t"); }
-                    else if (n == 114) { sb.Append("\r"); }
-                    else if (n == 92) { sb.Append("\\"); }
-                    else { sb.Append("\""); }
-                    i = i + 1;
-                    start = i + 1;
-                }
-            }
-        }
-        if (len > start) { sb.Append(text.Substring(start, len - start)); }
-        return sb.ToString();
+        return EnvFileConfigurationProvider.UnescapeSlice(text, (nint)text, 0, text.Length);
     }
 }

@@ -35,8 +35,9 @@ public class RedisOptions {
     }
 
     private static bool EqualsAsciiIgnoreCaseRange(string s, int start, int stop, string lowerLit) {
-        if (stop - start != lowerLit.Length) { return false; }
-        for (int i = 0; i < lowerLit.Length; i = i + 1) {
+        int len = stop - start;
+        if (len != lowerLit.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
             int c = s[start + i] & 255;
             if (c >= 65 && c <= 90) { c = c + 32; }
             if (c != (lowerLit[i] & 255)) { return false; }
@@ -44,116 +45,217 @@ public class RedisOptions {
         return true;
     }
 
-    // 从连接字符串解析配置。
+    private static bool EqualsExactRange(string s, int start, int stop, string lit) {
+        int len = stop - start;
+        if (len != lit.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            if ((s[start + i] & 255) != (lit[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    // 切片直读整数（零子串分配；含非十进制字符时回退 Convert.ToInt 保持 100% 语义一致）。
+    private static int ParseIntSlice(string s, int start, int stop) {
+        if (start >= stop) { return 0; }
+        int i = start;
+        int sign = 1;
+        int c0 = s[i] & 255;
+        if (c0 == 45) { sign = -1; i = i + 1; }
+        else if (c0 == 43) { i = i + 1; }
+        if (i >= stop) { return Convert.ToInt(s.Substring(start, stop - start)); }
+        long acc = 0L;
+        for (; i < stop; i = i + 1) {
+            int d = (s[i] & 255) - 48;
+            if (d < 0 || d > 9) { return Convert.ToInt(s.Substring(start, stop - start)); }
+            acc = acc * 10L + (long)d;
+            if (acc > 2147483648L) { return Convert.ToInt(s.Substring(start, stop - start)); }
+        }
+        long res = sign < 0 ? -acc : acc;
+        return (int)res;
+    }
+
+    // 从连接字符串解析配置（单遍 Span/Find 切片解析，零 Split/Trim/中间子串分配）。
     public static RedisOptions Parse(string connectionString) {
         RedisOptions opt = new RedisOptions();
         if (connectionString == null || connectionString.Length == 0) {
             return opt;
         }
 
-        string str = connectionString.Trim();
-        if (str.StartsWith("redis://") || str.StartsWith("rediss://")) {
-            opt.parseUri(str);
-            return opt;
+        int n = connectionString.Length;
+        int s = 0;
+        int e = n;
+        while (s < e && (connectionString[s] & 255) <= 32) { s = s + 1; }
+        while (e > s && (connectionString[e - 1] & 255) <= 32) { e = e - 1; }
+        if (s >= e) { return opt; }
+
+        nint cp = (nint)connectionString;
+
+        // URI 快检："redis://" (8) / "rediss://" (9)
+        int len = e - s;
+        if (len >= 8
+            && (connectionString[s] & 255) == 114
+            && (connectionString[s + 1] & 255) == 101
+            && (connectionString[s + 2] & 255) == 100
+            && (connectionString[s + 3] & 255) == 105
+            && (connectionString[s + 4] & 255) == 115) {
+            int c5 = connectionString[s + 5] & 255;
+            if (c5 == 58 && (connectionString[s + 6] & 255) == 47 && (connectionString[s + 7] & 255) == 47) {
+                opt.parseUriSlice(connectionString, cp, s + 8, e);
+                return opt;
+            }
+            if (len >= 9 && c5 == 115 && (connectionString[s + 6] & 255) == 58
+                && (connectionString[s + 7] & 255) == 47 && (connectionString[s + 8] & 255) == 47) {
+                opt.ssl = true;
+                opt.parseUriSlice(connectionString, cp, s + 9, e);
+                return opt;
+            }
         }
 
-        // 逗号分隔的键值串：首段可能是 host:port，后续为 key=value
-        List<string> parts = str.Split(",");
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            string p = parts[i].Trim();
-            if (p.Length == 0) { continue; }
+        // 逗号分隔键值串：单遍 NativeMemory.Find 切片 + (长度, 首字节) 跳表分发。
+        int pos = s;
+        while (pos < e) {
+            int comma = NativeMemory.Find(cp, pos, 44, e - pos);
+            int segEnd = comma >= 0 ? comma : e;
+            int ps = pos;
+            int pe = segEnd;
+            while (ps < pe && (connectionString[ps] & 255) <= 32) { ps = ps + 1; }
+            while (pe > ps && (connectionString[pe - 1] & 255) <= 32) { pe = pe - 1; }
+            pos = comma >= 0 ? comma + 1 : e;
+            if (ps >= pe) { continue; }
 
-            int eq = p.IndexOf("=");
+            int eq = NativeMemory.Find(cp, ps, 61, pe - ps);
             if (eq < 0) {
-                // 没有等号，判定为主机端口
-                opt.parseHostPort(p);
-            } else {
-                int kl = 0;
-                int kr = eq;
-                while (kl < kr && (p[kl] & 255) <= 32) { kl = kl + 1; }
-                while (kr > kl && (p[kr - 1] & 255) <= 32) { kr = kr - 1; }
-                string v = p.Substring(eq + 1).Trim();
-                if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "host")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "server")) {
-                    opt.host = v;
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "port")) {
-                    opt.port = Convert.ToInt(v);
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "password")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "pwd")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "pass")) {
-                    opt.password = v;
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "user")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "username")) {
-                    opt.user = v;
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "defaultdatabase")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "database")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "db")) {
-                    opt.database = Convert.ToInt(v);
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "poolsize")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "maxpoolsize")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "pool")) {
-                    opt.poolSize = Convert.ToInt(v);
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "ssl")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "tls")) {
-                    opt.ssl = (v == "true" || v == "1"
-                        || RedisOptions.EqualsAsciiIgnoreCaseRange(v, 0, v.Length, "yes"));
-                } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "connecttimeout")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "timeout")
-                    || RedisOptions.EqualsAsciiIgnoreCaseRange(p, kl, kr, "connecttimeoutms")) {
-                    opt.connectTimeoutMs = Convert.ToInt(v);
+                opt.parseHostPortSlice(connectionString, cp, ps, pe);
+                continue;
+            }
+
+            int kl = ps;
+            int kr = eq;
+            while (kr > kl && (connectionString[kr - 1] & 255) <= 32) { kr = kr - 1; }
+            int vl = eq + 1;
+            int vr = pe;
+            while (vl < vr && (connectionString[vl] & 255) <= 32) { vl = vl + 1; }
+
+            int klen = kr - kl;
+            if (klen <= 0) { continue; }
+            int k0 = connectionString[kl] & 255;
+            if (k0 >= 65 && k0 <= 90) { k0 = k0 + 32; }
+
+            if (klen == 2) {
+                if (k0 == 100 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "db")) {
+                    opt.database = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 3) {
+                if (k0 == 112 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "pwd")) {
+                    opt.password = connectionString.Substring(vl, vr - vl);
+                } else if ((k0 == 115 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "ssl"))
+                        || (k0 == 116 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "tls"))) {
+                    int vlen = vr - vl;
+                    opt.ssl = (vlen == 1 && (connectionString[vl] & 255) == 49)
+                        || (vlen == 4 && RedisOptions.EqualsExactRange(connectionString, vl, vr, "true"))
+                        || (vlen == 3 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, vl, vr, "yes"));
+                }
+            } else if (klen == 4) {
+                if (k0 == 104 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "host")) {
+                    opt.host = connectionString.Substring(vl, vr - vl);
+                } else if (k0 == 112) {
+                    if (RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "port")) {
+                        opt.port = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                    } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "pass")) {
+                        opt.password = connectionString.Substring(vl, vr - vl);
+                    } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "pool")) {
+                        opt.poolSize = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                    }
+                } else if (k0 == 117 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "user")) {
+                    opt.user = connectionString.Substring(vl, vr - vl);
+                }
+            } else if (klen == 6) {
+                if (k0 == 115 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "server")) {
+                    opt.host = connectionString.Substring(vl, vr - vl);
+                }
+            } else if (klen == 7) {
+                if (k0 == 116 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "timeout")) {
+                    opt.connectTimeoutMs = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 8) {
+                if (k0 == 112) {
+                    if (RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "password")) {
+                        opt.password = connectionString.Substring(vl, vr - vl);
+                    } else if (RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "poolsize")) {
+                        opt.poolSize = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                    }
+                } else if (k0 == 117 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "username")) {
+                    opt.user = connectionString.Substring(vl, vr - vl);
+                } else if (k0 == 100 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "database")) {
+                    opt.database = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 11) {
+                if (k0 == 109 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "maxpoolsize")) {
+                    opt.poolSize = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 14) {
+                if (k0 == 99 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "connecttimeout")) {
+                    opt.connectTimeoutMs = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 15) {
+                if (k0 == 100 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "defaultdatabase")) {
+                    opt.database = RedisOptions.ParseIntSlice(connectionString, vl, vr);
+                }
+            } else if (klen == 16) {
+                if (k0 == 99 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "connecttimeoutms")) {
+                    opt.connectTimeoutMs = RedisOptions.ParseIntSlice(connectionString, vl, vr);
                 }
             }
         }
         return opt;
     }
 
-    void parseHostPort(string hp) {
-        int colon = hp.IndexOf(":");
+    void parseHostPortSlice(string s, nint cp, int start, int end) {
+        int colon = NativeMemory.Find(cp, start, 58, end - start);
         if (colon >= 0) {
-            this.host = hp.Substring(0, colon).Trim();
-            string portStr = hp.Substring(colon + 1).Trim();
-            if (portStr.Length > 0) {
-                this.port = Convert.ToInt(portStr);
+            int hl = start;
+            int hr = colon;
+            while (hl < hr && (s[hl] & 255) <= 32) { hl = hl + 1; }
+            while (hr > hl && (s[hr - 1] & 255) <= 32) { hr = hr - 1; }
+            this.host = s.Substring(hl, hr - hl);
+            int pl = colon + 1;
+            int pr = end;
+            while (pl < pr && (s[pl] & 255) <= 32) { pl = pl + 1; }
+            while (pr > pl && (s[pr - 1] & 255) <= 32) { pr = pr - 1; }
+            if (pl < pr) {
+                this.port = RedisOptions.ParseIntSlice(s, pl, pr);
             }
         } else {
-            this.host = hp;
+            this.host = s.Substring(start, end - start);
         }
     }
 
-    void parseUri(string uri) {
-        string rest = uri;
-        if (rest.StartsWith("rediss://")) {
-            this.ssl = true;
-            rest = rest.Substring(9);
-        } else if (rest.StartsWith("redis://")) {
-            rest = rest.Substring(8);
-        }
-
+    void parseUriSlice(string uri, nint cp, int start, int end) {
+        int pos = start;
         // 解析 auth: [user:password@]host[:port][/db]
-        int atIdx = rest.IndexOf("@");
+        int atIdx = pos < end ? NativeMemory.Find(cp, pos, 64, end - pos) : -1;
         if (atIdx >= 0) {
-            string authPart = rest.Substring(0, atIdx);
-            rest = rest.Substring(atIdx + 1);
-            int colonIdx = authPart.IndexOf(":");
+            int colonIdx = atIdx > pos ? NativeMemory.Find(cp, pos, 58, atIdx - pos) : -1;
             if (colonIdx >= 0) {
-                this.user = authPart.Substring(0, colonIdx);
-                this.password = authPart.Substring(colonIdx + 1);
+                this.user = uri.Substring(pos, colonIdx - pos);
+                this.password = uri.Substring(colonIdx + 1, atIdx - colonIdx - 1);
             } else {
-                this.password = authPart;
+                this.password = uri.Substring(pos, atIdx - pos);
             }
+            pos = atIdx + 1;
         }
 
         // 解析路径中的 db: host[:port][/db]
-        int slashIdx = rest.IndexOf("/");
+        int hostEnd = end;
+        int slashIdx = pos < end ? NativeMemory.Find(cp, pos, 47, end - pos) : -1;
         if (slashIdx >= 0) {
-            string dbStr = rest.Substring(slashIdx + 1);
-            rest = rest.Substring(0, slashIdx);
-            if (dbStr.Length > 0) {
-                this.database = Convert.ToInt(dbStr);
+            hostEnd = slashIdx;
+            if (slashIdx + 1 < end) {
+                this.database = RedisOptions.ParseIntSlice(uri, slashIdx + 1, end);
             }
         }
 
         // 剩余为主机与端口
-        this.parseHostPort(rest);
+        this.parseHostPortSlice(uri, cp, pos, hostEnd);
     }
 }

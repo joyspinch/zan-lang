@@ -21,52 +21,155 @@ public class Dialect {
         return true;
     }
 
+    private static bool IsAlreadyQuotedSlice(string ident, int start, int end, int openCh, int closeCh) {
+        int len = end - start;
+        if (len < 2 || (ident[start] & 255) != openCh || (ident[end - 1] & 255) != closeCh) { return false; }
+        for (int i = start + 1; i < end - 1; i = i + 1) {
+            if ((ident[i] & 255) == closeCh) {
+                if (i + 1 < end - 1 && (ident[i + 1] & 255) == closeCh) {
+                    i = i + 1;
+                } else {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static int QuotedSegmentLen(string ident, nint ip, int start, int end, int openCh, int closeCh) {
+        int len = end - start;
+        if (len == 0) { return 0; }
+        if (len == 1 && (ident[start] & 255) == 42) { return 1; }
+        if (Dialect.IsAlreadyQuotedSlice(ident, start, end, openCh, closeCh)) { return len; }
+        int extra = 0;
+        int pos = NativeMemory.Find(ip, start, closeCh, len);
+        while (pos >= 0 && pos < end) {
+            extra = extra + 1;
+            int next = pos + 1;
+            pos = next < end ? NativeMemory.Find(ip, next, closeCh, end - next) : -1;
+        }
+        return len + 2 + extra;
+    }
+
+    private static int WriteQuotedSegment(string ident, nint ip, int start, int end,
+            byte[] bspan, nint bp, int dst, int openCh, int closeCh) {
+        int len = end - start;
+        if (len == 0) { return dst; }
+        if (len == 1 && (ident[start] & 255) == 42) {
+            bspan[dst] = (byte)42;
+            return dst + 1;
+        }
+        if (Dialect.IsAlreadyQuotedSlice(ident, start, end, openCh, closeCh)) {
+            NativeMemory.Copy(bp + (nint)dst, ip + (nint)start, len);
+            return dst + len;
+        }
+        bspan[dst] = (byte)openCh;
+        dst = dst + 1;
+        int cur = start;
+        int hit = NativeMemory.Find(ip, cur, closeCh, end - cur);
+        while (hit >= 0 && hit < end) {
+            int run = hit - cur;
+            if (run > 0) {
+                NativeMemory.Copy(bp + (nint)dst, ip + (nint)cur, run);
+                dst = dst + run;
+            }
+            bspan[dst] = (byte)closeCh;
+            bspan[dst + 1] = (byte)closeCh;
+            dst = dst + 2;
+            cur = hit + 1;
+            hit = cur < end ? NativeMemory.Find(ip, cur, closeCh, end - cur) : -1;
+        }
+        int rem = end - cur;
+        if (rem > 0) {
+            NativeMemory.Copy(bp + (nint)dst, ip + (nint)cur, rem);
+            dst = dst + rem;
+        }
+        bspan[dst] = (byte)closeCh;
+        return dst + 1;
+    }
+
     // 对表名、列名、索引名等标识符按数据库方言进行转义包装，避免保留关键字（如 Order/User/Group/Key/Desc 等）语法崩毁。
     public static string QuoteIdentifier(int p, string ident) {
         if (ident == null || ident.Length == 0) { return ""; }
-        if (ident == "*") { return "*"; }
+        int len = ident.Length;
+        if (len == 1 && (ident[0] & 255) == 42) { return "*"; }
+
+        int openCh = 34;
+        int closeCh = 34;
         if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
-            if (Dialect.IsAlreadyQuoted(ident, '`', '`')) { return ident; }
+            openCh = 96;
+            closeCh = 96;
         } else if (p == DbProvider.SqlServer) {
-            if (Dialect.IsAlreadyQuoted(ident, '[', ']')) { return ident; }
-        } else {
-            if (Dialect.IsAlreadyQuoted(ident, '"', '"')) { return ident; }
+            openCh = 91;
+            closeCh = 93;
         }
 
-        if (ident.Contains(".")) {
-            List<string> parts = ident.Split(".");
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < parts.Count; i = i + 1) {
-                if (i > 0) { sb.Append("."); }
-                sb.Append(Dialect.QuoteIdentifier(p, parts[i]));
+        if (Dialect.IsAlreadyQuotedSlice(ident, 0, len, openCh, closeCh)) { return ident; }
+
+        nint ip = (nint)ident;
+        int firstDot = NativeMemory.Find(ip, 0, 46, len);
+        if (firstDot < 0) {
+            // 单段快路径（零 Split / Replace / 二次拼接）。
+            int hit = NativeMemory.Find(ip, 0, closeCh, len);
+            if (hit < 0) {
+                byte[] buf = new byte[len + 2];
+                nint bp = (nint)buf;
+                buf[0] = (byte)openCh;
+                NativeMemory.Copy(bp + (nint)1, ip, len);
+                buf[len + 1] = (byte)closeCh;
+                return NativeMemory.GetString(bp, 0, len + 2);
             }
-            return sb.ToString();
+            int total = Dialect.QuotedSegmentLen(ident, ip, 0, len, openCh, closeCh);
+            byte[] buf2 = new byte[total];
+            nint bp2 = (nint)buf2;
+            Dialect.WriteQuotedSegment(ident, ip, 0, len, buf2, bp2, 0, openCh, closeCh);
+            return NativeMemory.GetString(bp2, 0, total);
         }
 
-        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
-            string escaped = ident.Replace("`", "``");
-            return "`" + escaped + "`";
+        // 含 '.' 多段标识符：两遍精确单缓冲直写（零 Split/List/StringBuilder）。
+        int totalDot = 0;
+        int s = 0;
+        int dot = firstDot;
+        while (true) {
+            int segEnd = dot >= 0 ? dot : len;
+            totalDot = totalDot + Dialect.QuotedSegmentLen(ident, ip, s, segEnd, openCh, closeCh);
+            if (dot < 0) { break; }
+            totalDot = totalDot + 1;
+            s = dot + 1;
+            dot = s < len ? NativeMemory.Find(ip, s, 46, len - s) : -1;
         }
-        if (p == DbProvider.SqlServer) {
-            string escaped = ident.Replace("]", "]]");
-            return "[" + escaped + "]";
+        byte[] outBuf = new byte[totalDot];
+        nint obp = (nint)outBuf;
+        int dst = 0;
+        s = 0;
+        dot = firstDot;
+        while (true) {
+            int segEnd = dot >= 0 ? dot : len;
+            dst = Dialect.WriteQuotedSegment(ident, ip, s, segEnd, outBuf, obp, dst, openCh, closeCh);
+            if (dot < 0) { break; }
+            outBuf[dst] = (byte)46;
+            dst = dst + 1;
+            s = dot + 1;
+            dot = s < len ? NativeMemory.Find(ip, s, 46, len - s) : -1;
         }
-        // SQLite, PostgreSQL, Oracle, DuckDB, Firebird, DM, Kingbase, OpenGauss 及默认标准方言
-        string escapedDbl = ident.Replace("\"", "\"\"");
-        return "\"" + escapedDbl + "\"";
+        return NativeMemory.GetString(obp, 0, totalDot);
     }
 
     // `?, ?, ?` —— n 个占位符（n 为 0 时是 NULL）。
     public static string Marks(int n) {
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < n) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            i = i + 1;
+        if (n <= 0) { return "NULL"; }
+        if (n == 1) { return "?"; }
+        int total = n * 3 - 2;
+        byte[] buf = new byte[total];
+        buf[0] = (byte)63;
+        int p = 1;
+        for (int i = 1; i < n; i = i + 1) {
+            buf[p] = (byte)44;
+            buf[p + 1] = (byte)32;
+            buf[p + 2] = (byte)63;
+            p = p + 3;
         }
-        if (sb.Length == 0) { sb.Append("NULL"); }
-        return sb.ToString();
+        return NativeMemory.GetString((nint)buf, 0, total);
     }
 
     // 列表是否包含某值。

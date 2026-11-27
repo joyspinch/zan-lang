@@ -45,23 +45,22 @@ public class QueryBuilder {
 
     // 校验 SQL 标识符：[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*
     public static bool IsIdent(string s) {
+        if (s == null) { return false; }
         int n = s.Length;
         if (n == 0) { return false; }
+        int c0 = s[0] & 255;
+        if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95)) { return false; }
         bool prevDot = false;
-        for (int i = 0; i < n; i = i + 1) {
+        for (int i = 1; i < n; i = i + 1) {
             int c = s[i] & 255;
-            bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
-            bool digit = c >= 48 && c <= 57;
-            if (i == 0) {
-                if (!alpha) { return false; }
+            if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95) {
+                prevDot = false;
             } else if (c == 46) {
                 if (prevDot || i == n - 1) { return false; }
                 prevDot = true;
-                continue;
-            } else if (!alpha && !digit) {
+            } else {
                 return false;
             }
-            prevDot = false;
         }
         return true;
     }
@@ -69,6 +68,94 @@ public class QueryBuilder {
     public static string RequireIdent(string s) {
         if (!QueryBuilder.IsIdent(s)) { throw new Exception("unsafe SQL identifier: " + s); }
         return s;
+    }
+
+    // 对已通过 IsIdent 校验的标识符计算方言引号包装后的精确字节数并直接写入缓冲（零中间字符串）。
+    private int OpenQuoteByte() {
+        return this.dialect == SqlDialect.SqlServer ? 91 : 34;
+    }
+
+    private int CloseQuoteByte() {
+        return this.dialect == SqlDialect.SqlServer ? 93 : 34;
+    }
+
+    private static int ValidatedQuotedLen(string ident) {
+        int n = ident.Length;
+        nint ip = (nint)ident;
+        int dots = 0;
+        int pos = NativeMemory.Find(ip, 0, 46, n);
+        while (pos >= 0) {
+            dots = dots + 1;
+            int next = pos + 1;
+            pos = next < n ? NativeMemory.Find(ip, next, 46, n - next) : -1;
+        }
+        return n + (dots + 1) * 2;
+    }
+
+    private static int WriteValidatedQuoted(string ident, byte[] bspan, nint bp, int dst, int openCh, int closeCh) {
+        int n = ident.Length;
+        nint ip = (nint)ident;
+        int start = 0;
+        int dot = NativeMemory.Find(ip, 0, 46, n);
+        if (dot < 0) {
+            bspan[dst] = (byte)openCh;
+            NativeMemory.Copy(bp + (nint)(dst + 1), ip, n);
+            bspan[dst + 1 + n] = (byte)closeCh;
+            return dst + n + 2;
+        }
+        while (true) {
+            int segEnd = dot >= 0 ? dot : n;
+            int segLen = segEnd - start;
+            bspan[dst] = (byte)openCh;
+            NativeMemory.Copy(bp + (nint)(dst + 1), ip + (nint)start, segLen);
+            bspan[dst + 1 + segLen] = (byte)closeCh;
+            dst = dst + segLen + 2;
+            if (dot < 0) { break; }
+            bspan[dst] = (byte)46;
+            dst = dst + 1;
+            start = dot + 1;
+            dot = start < n ? NativeMemory.Find(ip, start, 46, n - start) : -1;
+        }
+        return dst;
+    }
+
+    private static int IntDecLen(int v) {
+        if (v == 0) { return 1; }
+        int len = 0;
+        if (v < 0) {
+            len = 1;
+            if (v == -2147483647 - 1) { return 11; }
+            v = -v;
+        }
+        while (v > 0) { len = len + 1; v = v / 10; }
+        return len;
+    }
+
+    private static int WriteIntDec(byte[] buf, int pos, int v) {
+        if (v == 0) { buf[pos] = (byte)48; return pos + 1; }
+        if (v == -2147483647 - 1) {
+            string ms = "-2147483648";
+            for (int i = 0; i < 11; i = i + 1) { buf[pos + i] = (byte)(ms[i] & 255); }
+            return pos + 11;
+        }
+        if (v < 0) { buf[pos] = (byte)45; pos = pos + 1; v = -v; }
+        int start = pos;
+        while (v > 0) {
+            int q = v / 10;
+            buf[pos] = (byte)(48 + (v - q * 10));
+            pos = pos + 1;
+            v = q;
+        }
+        int l = start;
+        int r = pos - 1;
+        while (l < r) {
+            byte tmp = buf[l];
+            buf[l] = buf[r];
+            buf[r] = tmp;
+            l = l + 1;
+            r = r - 1;
+        }
+        return pos;
     }
 
     // 校验 DDL 列类型文本，拒绝分号与注释符等注入通道。
@@ -91,32 +178,75 @@ public class QueryBuilder {
     public static QueryBuilder DeleteFrom(string table) { return new QueryBuilder(table); }
 
     public QueryBuilder Where(string condition) {
-        this.whereClause = this.whereClause.Length == 0
-            ? condition
-            : this.whereClause + " AND " + condition;
+        int wl = this.whereClause.Length;
+        if (wl == 0) {
+            this.whereClause = condition;
+            return this;
+        }
+        int cl = condition.Length;
+        int total = wl + 5 + cl;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.Copy(bp, (nint)this.whereClause, wl);
+        NativeMemory.Copy(bp + (nint)wl, (nint)" AND ", 5);
+        if (cl > 0) { NativeMemory.Copy(bp + (nint)(wl + 5), (nint)condition, cl); }
+        this.whereClause = NativeMemory.GetString(bp, 0, total);
         return this;
     }
 
     public QueryBuilder OrWhere(string condition) {
-        this.whereClause = this.whereClause.Length == 0
-            ? condition
-            : this.whereClause + " OR " + condition;
+        int wl = this.whereClause.Length;
+        if (wl == 0) {
+            this.whereClause = condition;
+            return this;
+        }
+        int cl = condition.Length;
+        int total = wl + 4 + cl;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.Copy(bp, (nint)this.whereClause, wl);
+        NativeMemory.Copy(bp + (nint)wl, (nint)" OR ", 4);
+        if (cl > 0) { NativeMemory.Copy(bp + (nint)(wl + 4), (nint)condition, cl); }
+        this.whereClause = NativeMemory.GetString(bp, 0, total);
+        return this;
+    }
+
+    // 单缓冲直拼 "<oldWhere>[ AND ]<quotedCol><op>"（零 Quote / 中间拼接分配）。
+    private QueryBuilder AppendWhereQuotedOp(string column, string op) {
+        QueryBuilder.RequireIdent(column);
+        int wl = this.whereClause.Length;
+        int sepLen = wl > 0 ? 5 : 0;
+        int qLen = QueryBuilder.ValidatedQuotedLen(column);
+        int opLen = op.Length;
+        int total = wl + sepLen + qLen + opLen;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int p = 0;
+        if (wl > 0) {
+            NativeMemory.Copy(bp, (nint)this.whereClause, wl);
+            NativeMemory.Copy(bp + (nint)wl, (nint)" AND ", 5);
+            p = wl + 5;
+        }
+        p = QueryBuilder.WriteValidatedQuoted(column, bspan, bp, p, this.OpenQuoteByte(), this.CloseQuoteByte());
+        if (opLen > 0) { NativeMemory.Copy(bp + (nint)p, (nint)op, opLen); }
+        this.whereClause = NativeMemory.GetString(bp, 0, total);
         return this;
     }
 
     private QueryBuilder AppendCmpStr(string column, string op, string val) {
         this.whereParams.Add(val);
-        return this.Where(this.Quote(column) + op);
+        return this.AppendWhereQuotedOp(column, op);
     }
 
     private QueryBuilder AppendCmpInt(string column, string op, int val) {
         this.whereParams.AddInt(val);
-        return this.Where(this.Quote(column) + op);
+        return this.AppendWhereQuotedOp(column, op);
     }
 
     private QueryBuilder AppendCmpLong(string column, string op, long val) {
         this.whereParams.AddLong(val);
-        return this.Where(this.Quote(column) + op);
+        return this.AppendWhereQuotedOp(column, op);
     }
 
     public QueryBuilder WhereEq(string column, string val) { return this.AppendCmpStr(column, " = ?", val); }
@@ -127,42 +257,71 @@ public class QueryBuilder {
 
     public QueryBuilder WhereValueAt(DbValues vals, int i) {
         vals.BindTo(this.whereParams, i);
-        return this.Where(this.Quote(vals.NameAt(i)) + " = ?");
+        return this.AppendWhereQuotedOp(vals.NameAt(i), " = ?");
     }
 
-    private string FormatInClause(string column, string op, int count) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.Quote(column));
-        sb.Append(op);
-        for (int i = 0; i < count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+    private QueryBuilder AppendWhereIn(string column, string op, int count) {
+        QueryBuilder.RequireIdent(column);
+        int wl = this.whereClause.Length;
+        int sepLen = wl > 0 ? 5 : 0;
+        int qLen = QueryBuilder.ValidatedQuotedLen(column);
+        int opLen = op.Length;
+        int marksLen = count == 0 ? 4 : (count * 3 - 2);
+        int total = wl + sepLen + qLen + opLen + marksLen + 1;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int p = 0;
+        if (wl > 0) {
+            NativeMemory.Copy(bp, (nint)this.whereClause, wl);
+            NativeMemory.Copy(bp + (nint)wl, (nint)" AND ", 5);
+            p = wl + 5;
         }
-        if (count == 0) { sb.Append("NULL"); }
-        sb.Append(")");
-        return sb.ToString();
+        p = QueryBuilder.WriteValidatedQuoted(column, bspan, bp, p, this.OpenQuoteByte(), this.CloseQuoteByte());
+        NativeMemory.Copy(bp + (nint)p, (nint)op, opLen);
+        p = p + opLen;
+        if (count == 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)"NULL", 4);
+            p = p + 4;
+        } else {
+            bspan[p] = (byte)63;
+            p = p + 1;
+            for (int i = 1; i < count; i = i + 1) {
+                bspan[p] = (byte)44;
+                bspan[p + 1] = (byte)32;
+                bspan[p + 2] = (byte)63;
+                p = p + 3;
+            }
+        }
+        bspan[p] = (byte)41;
+        this.whereClause = NativeMemory.GetString(bp, 0, total);
+        return this;
     }
 
     public QueryBuilder WhereIn(string column, List<string> values) {
-        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.Add(values[i]); }
-        return this.Where(this.FormatInClause(column, " IN (", values.Count));
+        int n = values.Count;
+        for (int i = 0; i < n; i = i + 1) { this.whereParams.Add(values[i]); }
+        return this.AppendWhereIn(column, " IN (", n);
     }
 
     // 空列表生成 IN (NULL) 恒假；避免非法 IN ()。
     public QueryBuilder WhereInInts(string column, List<int> values) {
-        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.AddInt(values[i]); }
-        return this.Where(this.FormatInClause(column, " IN (", values.Count));
+        int n = values.Count;
+        for (int i = 0; i < n; i = i + 1) { this.whereParams.AddInt(values[i]); }
+        return this.AppendWhereIn(column, " IN (", n);
     }
 
     public QueryBuilder WhereInLongs(string column, List<long> values) {
-        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.AddLong(values[i]); }
-        return this.Where(this.FormatInClause(column, " IN (", values.Count));
+        int n = values.Count;
+        for (int i = 0; i < n; i = i + 1) { this.whereParams.AddLong(values[i]); }
+        return this.AppendWhereIn(column, " IN (", n);
     }
 
     public QueryBuilder WhereNotIn(string column, List<string> values) {
-        if (values.Count == 0) { return this; }
-        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.Add(values[i]); }
-        return this.Where(this.FormatInClause(column, " NOT IN (", values.Count));
+        int n = values.Count;
+        if (n == 0) { return this; }
+        for (int i = 0; i < n; i = i + 1) { this.whereParams.Add(values[i]); }
+        return this.AppendWhereIn(column, " NOT IN (", n);
     }
 
     public QueryBuilder WhereLike(string column, string pattern) { return this.AppendCmpStr(column, " LIKE ?", pattern); }
@@ -174,17 +333,39 @@ public class QueryBuilder {
     public QueryBuilder WhereAnyLike(List<string> columns, string val) {
         int n = columns.Count;
         if (n == 0) { return this; }
-        StringBuilder sb = new StringBuilder();
-        sb.Append("(");
-        string pat = "%" + val + "%";
+        int wl = this.whereClause.Length;
+        int sepLen = wl > 0 ? 5 : 0;
+        int total = wl + sepLen + 2 + (n - 1) * 4 + n * 7; // "(" + ... + ")" + " OR "*(n-1) + " LIKE ?"*n
         for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append(" OR "); }
-            sb.Append(this.Quote(columns[i]));
-            sb.Append(" LIKE ?");
+            string col = QueryBuilder.RequireIdent(columns[i]);
+            total = total + QueryBuilder.ValidatedQuotedLen(col);
+        }
+        string pat = "%" + val + "%";
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int p = 0;
+        if (wl > 0) {
+            NativeMemory.Copy(bp, (nint)this.whereClause, wl);
+            NativeMemory.Copy(bp + (nint)wl, (nint)" AND ", 5);
+            p = wl + 5;
+        }
+        int openCh = this.OpenQuoteByte();
+        int closeCh = this.CloseQuoteByte();
+        bspan[p] = (byte)40; p = p + 1;
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) {
+                NativeMemory.Copy(bp + (nint)p, (nint)" OR ", 4);
+                p = p + 4;
+            }
+            p = QueryBuilder.WriteValidatedQuoted(columns[i], bspan, bp, p, openCh, closeCh);
+            NativeMemory.Copy(bp + (nint)p, (nint)" LIKE ?", 7);
+            p = p + 7;
             this.whereParams.Add(pat);
         }
-        sb.Append(")");
-        return this.Where(sb.ToString());
+        bspan[p] = (byte)41;
+        this.whereClause = NativeMemory.GetString(bp, 0, total);
+        return this;
     }
 
     public QueryBuilder WhereNe(string column, string val) { return this.AppendCmpStr(column, " <> ?", val); }
@@ -197,11 +378,11 @@ public class QueryBuilder {
     public QueryBuilder WhereBetween(string column, string low, string high) {
         this.whereParams.Add(low);
         this.whereParams.Add(high);
-        return this.Where(this.Quote(column) + " BETWEEN ? AND ?");
+        return this.AppendWhereQuotedOp(column, " BETWEEN ? AND ?");
     }
 
-    public QueryBuilder WhereNull(string column) { return this.Where(this.Quote(column) + " IS NULL"); }
-    public QueryBuilder WhereNotNull(string column) { return this.Where(this.Quote(column) + " IS NOT NULL"); }
+    public QueryBuilder WhereNull(string column) { return this.AppendWhereQuotedOp(column, " IS NULL"); }
+    public QueryBuilder WhereNotNull(string column) { return this.AppendWhereQuotedOp(column, " IS NOT NULL"); }
 
     public QueryBuilder OrderBy(string column) {
         this.orderByClause = QueryBuilder.RequireIdent(column);
@@ -244,7 +425,21 @@ public class QueryBuilder {
     }
 
     private QueryBuilder AddJoin(string keyword, string table, string on) {
-        this.joinClause = this.joinClause + keyword + QueryBuilder.RequireIdent(table) + " ON " + on;
+        string t = QueryBuilder.RequireIdent(table);
+        int jl = this.joinClause.Length;
+        int kl = keyword.Length;
+        int tl = t.Length;
+        int ol = on.Length;
+        int total = jl + kl + tl + 4 + ol;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int p = 0;
+        if (jl > 0) { NativeMemory.Copy(bp + (nint)p, (nint)this.joinClause, jl); p = p + jl; }
+        NativeMemory.Copy(bp + (nint)p, (nint)keyword, kl); p = p + kl;
+        NativeMemory.Copy(bp + (nint)p, (nint)t, tl); p = p + tl;
+        NativeMemory.Copy(bp + (nint)p, (nint)" ON ", 4); p = p + 4;
+        if (ol > 0) { NativeMemory.Copy(bp + (nint)p, (nint)on, ol); }
+        this.joinClause = NativeMemory.GetString(bp, 0, total);
         return this;
     }
 
@@ -288,33 +483,106 @@ public class QueryBuilder {
     }
 
     public string BuildSelectParams(string columns) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        if (this.distinct) { sb.Append("DISTINCT "); }
-        sb.Append(columns);
-        sb.Append(" FROM ");
-        sb.Append(this.Quote(this.tableName));
-        this.AppendClauses(sb);
-        return sb.ToString();
+        string tbl = QueryBuilder.RequireIdent(this.tableName);
+        int total = 7 + (this.distinct ? 9 : 0) + columns.Length + 6 + QueryBuilder.ValidatedQuotedLen(tbl);
+        if (this.joinClause.Length > 0) { total = total + this.joinClause.Length; }
+        if (this.whereClause.Length > 0) { total = total + 7 + this.whereClause.Length; }
+        if (this.groupByClause.Length > 0) { total = total + 10 + this.groupByClause.Length; }
+        if (this.havingClause.Length > 0) { total = total + 8 + this.havingClause.Length; }
+        if (this.orderByClause.Length > 0) { total = total + 10 + this.orderByClause.Length; }
+        int off = this.offsetVal < 0 ? 0 : this.offsetVal;
+        if (this.dialect == SqlDialect.Standard) {
+            if (this.limitVal >= 0) { total = total + 7 + QueryBuilder.IntDecLen(this.limitVal); }
+            if (this.offsetVal >= 0) { total = total + 8 + QueryBuilder.IntDecLen(this.offsetVal); }
+        } else if (this.offsetVal >= 0 || this.limitVal >= 0) {
+            total = total + 8 + QueryBuilder.IntDecLen(off) + 5;
+            if (this.limitVal >= 0) { total = total + 12 + QueryBuilder.IntDecLen(this.limitVal) + 10; }
+        }
+
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int p = 0;
+        NativeMemory.Copy(bp + (nint)p, (nint)"SELECT ", 7); p = p + 7;
+        if (this.distinct) { NativeMemory.Copy(bp + (nint)p, (nint)"DISTINCT ", 9); p = p + 9; }
+        if (columns.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)columns, columns.Length); p = p + columns.Length; }
+        NativeMemory.Copy(bp + (nint)p, (nint)" FROM ", 6); p = p + 6;
+        p = QueryBuilder.WriteValidatedQuoted(tbl, bspan, bp, p, this.OpenQuoteByte(), this.CloseQuoteByte());
+
+        if (this.joinClause.Length > 0) { NativeMemory.Copy(bp + (nint)p, (nint)this.joinClause, this.joinClause.Length); p = p + this.joinClause.Length; }
+        if (this.whereClause.Length > 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)" WHERE ", 7); p = p + 7;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.whereClause, this.whereClause.Length); p = p + this.whereClause.Length;
+        }
+        if (this.groupByClause.Length > 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)" GROUP BY ", 10); p = p + 10;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.groupByClause, this.groupByClause.Length); p = p + this.groupByClause.Length;
+        }
+        if (this.havingClause.Length > 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)" HAVING ", 8); p = p + 8;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.havingClause, this.havingClause.Length); p = p + this.havingClause.Length;
+        }
+        if (this.orderByClause.Length > 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)" ORDER BY ", 10); p = p + 10;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.orderByClause, this.orderByClause.Length); p = p + this.orderByClause.Length;
+        }
+        if (this.dialect == SqlDialect.Standard) {
+            if (this.limitVal >= 0) {
+                NativeMemory.Copy(bp + (nint)p, (nint)" LIMIT ", 7); p = p + 7;
+                p = QueryBuilder.WriteIntDec(bspan, p, this.limitVal);
+            }
+            if (this.offsetVal >= 0) {
+                NativeMemory.Copy(bp + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+                p = QueryBuilder.WriteIntDec(bspan, p, this.offsetVal);
+            }
+        } else if (this.offsetVal >= 0 || this.limitVal >= 0) {
+            NativeMemory.Copy(bp + (nint)p, (nint)" OFFSET ", 8); p = p + 8;
+            p = QueryBuilder.WriteIntDec(bspan, p, off);
+            NativeMemory.Copy(bp + (nint)p, (nint)" ROWS", 5); p = p + 5;
+            if (this.limitVal >= 0) {
+                NativeMemory.Copy(bp + (nint)p, (nint)" FETCH NEXT ", 12); p = p + 12;
+                p = QueryBuilder.WriteIntDec(bspan, p, this.limitVal);
+                NativeMemory.Copy(bp + (nint)p, (nint)" ROWS ONLY", 10); p = p + 10;
+            }
+        }
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     public DbParams SelectParams() { return this.whereParams; }
 
     public string BuildInsertParams() {
-        StringBuilder sb = new StringBuilder();
-        StringBuilder vals = new StringBuilder();
-        sb.Append("INSERT INTO ");
-        sb.Append(this.Quote(this.tableName));
-        sb.Append(" (");
-        for (int i = 0; i < this.sets.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); vals.Append(", "); }
-            sb.Append(this.Quote(this.sets[i].column));
-            vals.Append("?");
+        string tbl = QueryBuilder.RequireIdent(this.tableName);
+        int sn = this.sets.Count;
+        int total = 12 + QueryBuilder.ValidatedQuotedLen(tbl) + 2 + 10 + 1; // "INSERT INTO " + tbl + " (" + ") VALUES (" + ")"
+        if (sn > 0) {
+            total = total + (sn - 1) * 2 + (sn * 3 - 2);
+            for (int i = 0; i < sn; i = i + 1) {
+                string col = QueryBuilder.RequireIdent(this.sets[i].column);
+                total = total + QueryBuilder.ValidatedQuotedLen(col);
+            }
         }
-        sb.Append(") VALUES (");
-        sb.Append(vals.ToString());
-        sb.Append(")");
-        return sb.ToString();
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int openCh = this.OpenQuoteByte();
+        int closeCh = this.CloseQuoteByte();
+        int p = 0;
+        NativeMemory.Copy(bp + (nint)p, (nint)"INSERT INTO ", 12); p = p + 12;
+        p = QueryBuilder.WriteValidatedQuoted(tbl, bspan, bp, p, openCh, closeCh);
+        bspan[p] = (byte)32; bspan[p + 1] = (byte)40; p = p + 2;
+        for (int i = 0; i < sn; i = i + 1) {
+            if (i > 0) { bspan[p] = (byte)44; bspan[p + 1] = (byte)32; p = p + 2; }
+            p = QueryBuilder.WriteValidatedQuoted(this.sets[i].column, bspan, bp, p, openCh, closeCh);
+        }
+        NativeMemory.Copy(bp + (nint)p, (nint)") VALUES (", 10); p = p + 10;
+        if (sn > 0) {
+            bspan[p] = (byte)63; p = p + 1;
+            for (int i = 1; i < sn; i = i + 1) {
+                bspan[p] = (byte)44; bspan[p + 1] = (byte)32; bspan[p + 2] = (byte)63; p = p + 3;
+            }
+        }
+        bspan[p] = (byte)41;
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     public DbParams InsertParams() {
@@ -324,20 +592,36 @@ public class QueryBuilder {
     }
 
     public string BuildUpdateParams() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("UPDATE ");
-        sb.Append(this.Quote(this.tableName));
-        sb.Append(" SET ");
-        for (int i = 0; i < this.sets.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.Quote(this.sets[i].column));
-            sb.Append(" = ?");
+        string tbl = QueryBuilder.RequireIdent(this.tableName);
+        int sn = this.sets.Count;
+        int total = 7 + QueryBuilder.ValidatedQuotedLen(tbl) + 5; // "UPDATE " + tbl + " SET "
+        if (sn > 0) {
+            total = total + (sn - 1) * 2 + sn * 4; // ", "*(sn-1) + " = ?"*sn
+            for (int i = 0; i < sn; i = i + 1) {
+                string col = QueryBuilder.RequireIdent(this.sets[i].column);
+                total = total + QueryBuilder.ValidatedQuotedLen(col);
+            }
+        }
+        if (this.whereClause.Length > 0) { total = total + 7 + this.whereClause.Length; }
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int openCh = this.OpenQuoteByte();
+        int closeCh = this.CloseQuoteByte();
+        int p = 0;
+        NativeMemory.Copy(bp + (nint)p, (nint)"UPDATE ", 7); p = p + 7;
+        p = QueryBuilder.WriteValidatedQuoted(tbl, bspan, bp, p, openCh, closeCh);
+        NativeMemory.Copy(bp + (nint)p, (nint)" SET ", 5); p = p + 5;
+        for (int i = 0; i < sn; i = i + 1) {
+            if (i > 0) { bspan[p] = (byte)44; bspan[p + 1] = (byte)32; p = p + 2; }
+            p = QueryBuilder.WriteValidatedQuoted(this.sets[i].column, bspan, bp, p, openCh, closeCh);
+            NativeMemory.Copy(bp + (nint)p, (nint)" = ?", 4); p = p + 4;
         }
         if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
+            NativeMemory.Copy(bp + (nint)p, (nint)" WHERE ", 7); p = p + 7;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.whereClause, this.whereClause.Length);
         }
-        return sb.ToString();
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     public DbParams UpdateParams() {
@@ -355,20 +639,57 @@ public class QueryBuilder {
     }
 
     public string BuildDeleteParams() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("DELETE FROM ");
-        sb.Append(this.Quote(this.tableName));
+        string tbl = QueryBuilder.RequireIdent(this.tableName);
+        int total = 12 + QueryBuilder.ValidatedQuotedLen(tbl);
+        if (this.whereClause.Length > 0) { total = total + 7 + this.whereClause.Length; }
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int p = 0;
+        NativeMemory.Copy(bp + (nint)p, (nint)"DELETE FROM ", 12); p = p + 12;
+        p = QueryBuilder.WriteValidatedQuoted(tbl, bspan, bp, p, this.OpenQuoteByte(), this.CloseQuoteByte());
         if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
+            NativeMemory.Copy(bp + (nint)p, (nint)" WHERE ", 7); p = p + 7;
+            NativeMemory.Copy(bp + (nint)p, (nint)this.whereClause, this.whereClause.Length);
         }
-        return sb.ToString();
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 仅用于无法参数化的 DDL DEFAULT 字面量；DML 一律走 `?` 参数绑定。
     public static string EscapeDdlLiteral(string val) {
         if (val == null || val.Length == 0) { return ""; }
-        if (val.IndexOf("'") < 0) { return val; }
-        return val.Replace("'", "''");
+        int n = val.Length;
+        nint vp = (nint)val;
+        int first = NativeMemory.Find(vp, 0, 39, n);
+        if (first < 0) { return val; }
+        int count = 0;
+        int pos = first;
+        while (pos >= 0) {
+            count = count + 1;
+            int next = pos + 1;
+            pos = next < n ? NativeMemory.Find(vp, next, 39, n - next) : -1;
+        }
+        int total = n + count;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        byte[] bspan = buf;
+        int cur = 0;
+        int dst = 0;
+        int hit = first;
+        while (hit >= 0) {
+            int run = hit - cur;
+            if (run > 0) {
+                NativeMemory.Copy(bp + (nint)dst, vp + (nint)cur, run);
+                dst = dst + run;
+            }
+            bspan[dst] = (byte)39;
+            bspan[dst + 1] = (byte)39;
+            dst = dst + 2;
+            cur = hit + 1;
+            hit = cur < n ? NativeMemory.Find(vp, cur, 39, n - cur) : -1;
+        }
+        int rem = n - cur;
+        if (rem > 0) { NativeMemory.Copy(bp + (nint)dst, vp + (nint)cur, rem); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 }

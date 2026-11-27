@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Redis;
+using System.Data.Search;
+using System.Diagnostics;
+using System.Json;
+using System.Net.Sip;
+
+public class Program {
+    static void TestJsonPath() {
+        string doc =
+            "{\"store\":{\"a.b\":\"dotkey\",\"book\":[" +
+            "{\"title\":\"T1\",\"price\":8.5,\"ok\":true,\"meta\":{\"rank\":1}}," +
+            "{\"title\":\"T2\",\"price\":12.0,\"isbn\":\"111\",\"ok\":false,\"meta\":{\"rank\":3}}," +
+            "{\"title\":\"T3\",\"price\":25.0,\"isbn\":\"222\",\"ok\":true,\"note\":null,\"meta\":{\"rank\":2}}," +
+            "{\"title\":\"T4\",\"price\":50.0,\"ok\":true,\"meta\":{\"rank\":5}}" +
+            "],\"bike\":{\"color\":\"red\",\"price\":19.95}}}";
+        JsonValue root = JsonValue.Parse(doc);
+
+        // Quoted key + wildcard + fused final child
+        Console.WriteLine("jp.dot=" + JsonPath.First(root, "$.store['a.b']", null).AsString(""));
+        List<JsonValue> titles = JsonPath.Query(root, "$.store.book[*].title");
+        Console.WriteLine("jp.wild=" + Convert.ToString(titles.Count) + ":" + titles[0].AsString("") + ":" + titles[3].AsString(""));
+
+        // Slice + fused child + negative index
+        List<JsonValue> sl = JsonPath.Query(root, "$.store.book[1:4:2].title");
+        Console.WriteLine("jp.slice=" + Convert.ToString(sl.Count) + ":" + sl[0].AsString("") + ":" + sl[1].AsString(""));
+        Console.WriteLine("jp.neg=" + JsonPath.First(root, "$.store.book[-1].title", null).AsString(""));
+
+        // Filter: number, scientific, bool, null, string, nested path, existence
+        List<JsonValue> f1 = JsonPath.Query(root, "$.store.book[?(@.price < 1.5e1)].title");
+        Console.WriteLine("jp.fnum=" + Convert.ToString(f1.Count) + ":" + f1[0].AsString("") + ":" + f1[1].AsString(""));
+        List<JsonValue> f2 = JsonPath.Query(root, "$.store.book[?(@.ok == false)].title");
+        Console.WriteLine("jp.fbool=" + Convert.ToString(f2.Count) + ":" + f2[0].AsString(""));
+        List<JsonValue> f3 = JsonPath.Query(root, "$.store.book[?(@.note == null)].title");
+        Console.WriteLine("jp.fnull=" + Convert.ToString(f3.Count) + ":" + f3[0].AsString(""));
+        List<JsonValue> f4 = JsonPath.Query(root, "$.store.book[?(@.meta.rank >= 3)].title");
+        Console.WriteLine("jp.fnest=" + Convert.ToString(f4.Count) + ":" + f4[0].AsString("") + ":" + f4[1].AsString(""));
+
+        // Short-circuit First/Exists on filter + recursive descent + multi-selector
+        JsonValue f1st = JsonPath.First(root, "$.store.book[?(@.isbn)]", null);
+        JsonValue f1stTitle = f1st != null ? f1st.Get("title") : null;
+        Console.WriteLine("jp.f1st=" + (f1stTitle != null ? f1stTitle.AsString("") : ""));
+        Console.WriteLine("jp.exists=" + (JsonPath.Exists(root, "$.store.book[?(@.title == 'T4')]") ? "1" : "0") + ":" + (JsonPath.Exists(root, "$.store.book[?(@.title == 'NO')]") ? "1" : "0"));
+        List<JsonValue> prices = JsonPath.Query(root, "$..price");
+        Console.WriteLine("jp.rec=" + Convert.ToString(prices.Count));
+        List<JsonValue> multi = JsonPath.Query(root, "$.store.book[?(@.title == 'T1')].price, $.store.bike.color");
+        Console.WriteLine("jp.multi=" + Convert.ToString(multi.Count) + ":" + multi[1].AsString(""));
+
+        bool threw = false;
+        try { JsonPath.Query(root, "$.store.book["); } catch (ArgumentException ex) { threw = true; }
+        Console.WriteLine("jp.err=" + (threw ? "1" : "0"));
+    }
+
+    static void TestSdpMessage() {
+        string wire =
+            "v=0\r\n" +
+            "o=alice 2890844526 2 IN IP4 192.168.10.42\r\n" +
+            "s=Wave29 Call\r\n" +
+            "c=IN IP4 192.168.10.42/127\r\n" +
+            "t=0 0\r\n" +
+            "m=audio 49170 RTP/AVP 111 0\r\n" +
+            "a=rtpmap:111 opus/48000/2\r\n" +
+            "a=fmtp:111 minptime=10\r\n" +
+            "a=ptime:20\r\n" +
+            "a=recvonly\r\n";
+        SdpMessage s1 = SdpMessage.Parse(wire);
+        Console.WriteLine("sdp.p1=" + s1.connectionIp + "|" + s1.mediaType + "|" + Convert.ToString(s1.mediaPort)
+            + "|" + Convert.ToString(s1.payloadType) + "|" + s1.codec + "|" + Convert.ToString(s1.sampleRate)
+            + "|" + Convert.ToString(s1.attributes.Count) + "|" + s1.sessionName);
+        s1.sessionId = 777888999L;
+        string ser = s1.Serialize();
+        SdpMessage s2 = SdpMessage.Parse(ser);
+        Console.WriteLine("sdp.rt=" + (s2 != null && s2.connectionIp == s1.connectionIp
+            && s2.mediaPort == s1.mediaPort && s2.payloadType == s1.payloadType
+            && s2.codec == s1.codec && s2.sampleRate == s1.sampleRate
+            && s2.sessionName == s1.sessionName && s2.attributes.Count == s1.attributes.Count ? "1" : "0"));
+
+        // LF-only & missing m= line
+        SdpMessage bad = SdpMessage.Parse("v=0\ns=NoMedia\nc=IN IP4 1.2.3.4\n");
+        Console.WriteLine("sdp.bad=" + (bad == null ? "null" : "ok"));
+    }
+
+    static void TestTextTokenizer() {
+        TextTokenizer t1 = new TextTokenizer();
+        t1.AddWord("c3语言");
+        t1.AddWord("单");
+        Console.WriteLine("tok.norm=" + TextTokenizer.Normalize("Ｈｅｌｌｏ　Ｗｏｒｌｄ！ABC123"));
+
+        List<TextToken> ts = t1.Tokenize("中华人民共和国南京c3语言 c3x 单字");
+        string joined = "";
+        for (int i = 0; i < ts.Count; i = i + 1) {
+            if (i > 0) { joined = joined + ","; }
+            joined = joined + ts[i].text + "/" + Convert.ToString(ts[i].kind) + "@" + Convert.ToString(ts[i].position);
+        }
+        Console.WriteLine("tok.out=" + joined);
+
+        // ExportState / ImportState & order-independent fingerprint
+        JsonValue st = t1.ExportState();
+        TextTokenizer t2 = TextTokenizer.ImportState(st);
+        TextTokenizer t3 = new TextTokenizer();
+        t3.AddWord("单");
+        t3.AddWord("c3语言");
+        Console.WriteLine("tok.fp=" + (t1.Fingerprint() == t2.Fingerprint() && t1.Fingerprint() == t3.Fingerprint() ? "1" : "0"));
+    }
+
+    static void TestPrometheus() {
+        Prometheus p = new Prometheus();
+        List<string> k1 = new List<string>(); k1.Add("m");
+        List<string> v1a = new List<string>(); v1a.Add("a");
+        List<string> v1b = new List<string>(); v1b.Add("x\"y\\z\n");
+
+        List<string> k4 = new List<string>(); k4.Add("a"); k4.Add("b"); k4.Add("c"); k4.Add("d");
+        List<string> v4 = new List<string>(); v4.Add("1"); v4.Add("2"); v4.Add("3"); v4.Add("4");
+
+        // Interleaved registration & dirty names
+        p.CounterIncLabeled("req-cnt!", "Line1\nLine2", 2.0, k1, v1a);
+        p.GaugeSet("g_val", "Gauge help", 42.5);
+        p.CounterIncLabeled("req-cnt!", "Ignored second help", 3.0, k1, v1a);
+        p.CounterIncLabeled("req-cnt!", "Ignored", 1.0, k1, v1b);
+        p.GaugeSetLabeled("quad_g", "Four labels", 7.0, k4, v4);
+        p.GaugeSetLabeled("quad_g", "Four labels", 9.0, k4, v4);
+
+        // Histogram with ascending edges + boundary equality
+        List<double> edges = new List<double>();
+        edges.Add(10.0); edges.Add(50.0);
+        p.HistogramObserve("lat_ms", "Latency", edges, k1, v1a, 10.0);
+        p.HistogramObserve("lat_ms", "Latency", edges, k1, v1a, 60.0);
+
+        // Non-ascending edges check
+        List<double> nonAsc = new List<double>();
+        nonAsc.Add(50.0); nonAsc.Add(10.0);
+        p.HistogramObserve("lat_unsorted", "Unsorted", nonAsc, null, null, 20.0);
+
+        string snap = p.Snapshot();
+        Console.WriteLine("prom.snap:\n" + snap + "prom.fmt="
+            + Prometheus.FormatValue(0.0 / 0.0) + "|"
+            + Prometheus.FormatValue(1.0 / 0.0) + "|"
+            + Prometheus.FormatValue(-1.0 / 0.0));
+    }
+
+    static void TestQueryBuilderAndDialect() {
+        Console.WriteLine("dia.q="
+            + Dialect.QuoteIdentifier(DbProvider.Oracle, "a\"b.c") + "|"
+            + Dialect.QuoteIdentifier(DbProvider.MySQL, "a`b.c") + "|"
+            + Dialect.QuoteIdentifier(DbProvider.SqlServer, "a]b.c") + "|"
+            + Dialect.Marks(0) + "|" + Dialect.Marks(1) + "|" + Dialect.Marks(4));
+
+        List<string> st = new List<string>(); st.Add("open"); st.Add("paid");
+        List<string> lk = new List<string>(); lk.Add("t.a"); lk.Add("t.b");
+        QueryBuilder q = QueryBuilder.From("orders")
+            .Dialect(SqlDialect.Standard)
+            .Distinct()
+            .LeftJoin("users", "users.id = orders.uid")
+            .WhereEq("orders.tenant", "t1")
+            .WhereIn("orders.status", st)
+            .WhereAnyLike(lk, "vip")
+            .WhereNull("orders.deleted_at")
+            .OrderByDesc("orders.id")
+            .Limit(10).Offset(20);
+        Console.WriteLine("qb.sel=" + q.BuildSelectParams("orders.id") + "|p=" + Convert.ToString(q.SelectParams().Count()));
+
+        QueryBuilder ins = QueryBuilder.InsertInto("orders").Dialect(SqlDialect.Standard).Set("a", "1").Set("b", "2");
+        Console.WriteLine("qb.ins=" + ins.BuildInsertParams());
+
+        QueryBuilder upd = QueryBuilder.Update("orders").Dialect(SqlDialect.SqlServer).Set("a", "1").WhereEqLong("id", 99L);
+        Console.WriteLine("qb.upd=" + upd.BuildUpdateParams());
+
+        QueryBuilder del = QueryBuilder.DeleteFrom("orders").WhereLtInt("c", -2147483647 - 1);
+        Console.WriteLine("qb.del=" + del.BuildDeleteParams() + "|p=" + Convert.ToString(del.whereParams.Count()));
+    }
+
+    static void TestRedisAndEnv() {
+        RedisOptions r1 = RedisOptions.Parse("10.0.0.1:6380,pwd=p@ss,db=3,maxPoolSize=16,tls=1,timeout=1500,user=u1");
+        Console.WriteLine("rd.kv=" + r1.host + ":" + Convert.ToString(r1.port) + ":" + Convert.ToString(r1.database)
+            + ":" + r1.user + ":" + r1.password + ":" + Convert.ToString(r1.poolSize)
+            + ":" + (r1.ssl ? "1" : "0") + ":" + Convert.ToString(r1.connectTimeoutMs));
+
+        RedisOptions r2 = RedisOptions.Parse("rediss://svc:tok@cache.local:6390/4");
+        Console.WriteLine("rd.url1=" + r2.host + ":" + Convert.ToString(r2.port) + ":" + Convert.ToString(r2.database)
+            + ":" + r2.user + ":" + r2.password + ":" + (r2.ssl ? "1" : "0"));
+
+        RedisOptions r3 = RedisOptions.Parse("redis://:onlypass@127.0.0.1/2");
+        Console.WriteLine("rd.url2=" + r3.host + ":" + Convert.ToString(r3.port) + ":" + Convert.ToString(r3.database)
+            + ":" + r3.user + ":" + r3.password + ":" + (r3.ssl ? "1" : "0"));
+
+        string e1 = EnvFileConfigurationProvider.ParseValue("\"a\\nb\\tc\\r\\\"d\\\\e\\x\"");
+        Console.WriteLine("env.1=" + Convert.ToString(e1.Length) + ":"
+            + Convert.ToString(e1[1] & 255) + ":" + Convert.ToString(e1[3] & 255) + ":"
+            + Convert.ToString(e1[5] & 255) + ":" + Convert.ToString(e1[6] & 255) + ":"
+            + Convert.ToString(e1[8] & 255) + ":" + e1.Substring(9, e1.Length - 9));
+        Console.WriteLine("env.2=" + EnvFileConfigurationProvider.ParseValue("'raw\\n#notcomment'"));
+        Console.WriteLine("env.3=" + EnvFileConfigurationProvider.ParseValue("val#keep # drop comment"));
+        Console.WriteLine("env.4=" + EnvFileConfigurationProvider.ParseValue("\"clean_fast\""));
+        Console.WriteLine("env.5=" + EnvFileConfigurationProvider.ParseValue(""));
+    }
+
+    public static void Main() {
+        TestJsonPath();
+        TestSdpMessage();
+        TestTextTokenizer();
+        TestPrometheus();
+        TestQueryBuilderAndDialect();
+        TestRedisAndEnv();
+    }
+}
