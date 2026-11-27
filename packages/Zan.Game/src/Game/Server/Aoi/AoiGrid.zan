@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Game.Server.Aoi;
 
@@ -13,12 +14,13 @@ public class AoiGrid {
     public int cols;
     public int rows;
 
-    // 格子内的实体 ID 列表，一维展开：index = y * cols + x
+    // 格子内的实体 ID 列表（惰性分配），一维展开：index = y * cols + x
     private long[][] cellEntities;
     private int[] cellCounts;
 
-    // 全局实体注册表
+    // 全局实体注册表 + O(1) ID 索引
     private AoiEntity[] entities;
+    private Dictionary<long, int> entityIndex;
     private int entityCount;
     private int entityCap;
 
@@ -37,13 +39,10 @@ public class AoiGrid {
         int totalCells = this.cols * this.rows;
         this.cellEntities = new long[totalCells][];
         this.cellCounts = new int[totalCells];
-        for (int i = 0; i < totalCells; i = i + 1) {
-            this.cellEntities[i] = new long[8];
-            this.cellCounts[i] = 0;
-        }
 
         this.entityCap = 128;
         this.entities = new AoiEntity[this.entityCap];
+        this.entityIndex = new Dictionary<long, int>();
         this.entityCount = 0;
     }
 
@@ -223,10 +222,9 @@ public class AoiGrid {
     }
 
     public AoiEntity FindEntity(long id) {
-        for (int i = 0; i < this.entityCount; i = i + 1) {
-            if (this.entities[i] != null && this.entities[i].id == id) {
-                return this.entities[i];
-            }
+        int slot = 0;
+        if (this.entityIndex.TryGetValue(id, out slot)) {
+            return this.entities[slot];
         }
         return null;
     }
@@ -242,24 +240,33 @@ public class AoiGrid {
             this.entityCap = newCap;
         }
         this.entities[this.entityCount] = ent;
+        this.entityIndex[ent.id] = this.entityCount;
         this.entityCount = this.entityCount + 1;
     }
 
     private void RemoveEntity(long id) {
-        for (int i = 0; i < this.entityCount; i = i + 1) {
-            if (this.entities[i] != null && this.entities[i].id == id) {
-                this.entities[i] = this.entities[this.entityCount - 1];
-                this.entities[this.entityCount - 1] = null;
-                this.entityCount = this.entityCount - 1;
-                return;
+        int slot = 0;
+        if (!this.entityIndex.TryGetValue(id, out slot)) { return; }
+        this.entityIndex.Remove(id);
+        int last = this.entityCount - 1;
+        if (slot != last) {
+            AoiEntity moved = this.entities[last];
+            this.entities[slot] = moved;
+            if (moved != null) {
+                this.entityIndex[moved.id] = slot;
             }
         }
+        this.entities[last] = null;
+        this.entityCount = last;
     }
 
     private void AddToCell(int cellIdx, long id) {
         int count = this.cellCounts[cellIdx];
         long[] list = this.cellEntities[cellIdx];
-        if (count >= list.Length) {
+        if (list == null) {
+            list = new long[8];
+            this.cellEntities[cellIdx] = list;
+        } else if (count >= list.Length) {
             long[] n = new long[list.Length * 2];
             for (int i = 0; i < count; i = i + 1) {
                 n[i] = list[i];
@@ -273,7 +280,9 @@ public class AoiGrid {
 
     private void RemoveFromCell(int cellIdx, long id) {
         int count = this.cellCounts[cellIdx];
+        if (count == 0) { return; }
         long[] list = this.cellEntities[cellIdx];
+        if (list == null) { return; }
         for (int i = 0; i < count; i = i + 1) {
             if (list[i] == id) {
                 list[i] = list[count - 1];

@@ -13,6 +13,11 @@ public class YSortQueue {
     public double[] sortYs;
     public int[] tags;          // 自定义标签或额外 Z-Order 偏置
 
+    // 复用归并排序辅助缓冲（大批量时惰性分配一次，稳态零 GC）
+    private int[] scratchIds;
+    private double[] scratchYs;
+    private int[] scratchTags;
+
     public YSortQueue(int capacity) {
         int cap = capacity > 0 ? capacity : 256;
         this.capacity = cap;
@@ -20,6 +25,9 @@ public class YSortQueue {
         this.entityIds = new int[cap];
         this.sortYs = new double[cap];
         this.tags = new int[cap];
+        this.scratchIds = null;
+        this.scratchYs = null;
+        this.scratchTags = null;
     }
 
     public static YSortQueue Create(int capacity) {
@@ -50,18 +58,102 @@ public class YSortQueue {
         return Push(entityId, sortY, 0);
     }
 
-    // 原位排序（升序：sortY 小的排在前面先绘制，底部的排在后面后绘制覆盖上方）。
-    // 采用针对逐帧高度局部有序队列优化的插入排序，热路径零 GC。
+    // 原位稳定排序（升序：sortY 小的排在前面先绘制，底部的排在后面后绘制覆盖上方）。
+    // 小段用插入排序，大队列采用自底向上稳定归并排序（最坏 O(N log N)，复用缓冲零稳态 GC）。
     public void Sort() {
         if (count <= 1) { return; }
 
-        for (int i = 1; i < count; i = i + 1) {
+        if (count <= 32) {
+            this.InsertionSortRange(0, count);
+            return;
+        }
+
+        if (this.scratchIds == null) {
+            this.scratchIds = new int[this.capacity];
+            this.scratchYs = new double[this.capacity];
+            this.scratchTags = new int[this.capacity];
+        }
+
+        // 先对每个长度为 32 的段做插入排序
+        int run = 32;
+        for (int lo = 0; lo < count; lo = lo + run) {
+            int hi = lo + run;
+            if (hi > count) { hi = count; }
+            this.InsertionSortRange(lo, hi);
+        }
+
+        // 自底向上稳定归并
+        int[] srcIds = this.entityIds;
+        double[] srcYs = this.sortYs;
+        int[] srcTags = this.tags;
+        int[] dstIds = this.scratchIds;
+        double[] dstYs = this.scratchYs;
+        int[] dstTags = this.scratchTags;
+
+        int width = run;
+        while (width < count) {
+            for (int lo = 0; lo < count; lo = lo + width * 2) {
+                int mid = lo + width;
+                if (mid > count) { mid = count; }
+                int hi = lo + width * 2;
+                if (hi > count) { hi = count; }
+
+                int i = lo;
+                int j = mid;
+                int k = lo;
+                while (i < mid && j < hi) {
+                    // 稳定比较：相等时取左段元素
+                    if (srcYs[i] < srcYs[j] || (srcYs[i] == srcYs[j] && srcTags[i] <= srcTags[j])) {
+                        dstYs[k] = srcYs[i];
+                        dstIds[k] = srcIds[i];
+                        dstTags[k] = srcTags[i];
+                        i = i + 1;
+                    } else {
+                        dstYs[k] = srcYs[j];
+                        dstIds[k] = srcIds[j];
+                        dstTags[k] = srcTags[j];
+                        j = j + 1;
+                    }
+                    k = k + 1;
+                }
+                while (i < mid) {
+                    dstYs[k] = srcYs[i];
+                    dstIds[k] = srcIds[i];
+                    dstTags[k] = srcTags[i];
+                    i = i + 1;
+                    k = k + 1;
+                }
+                while (j < hi) {
+                    dstYs[k] = srcYs[j];
+                    dstIds[k] = srcIds[j];
+                    dstTags[k] = srcTags[j];
+                    j = j + 1;
+                    k = k + 1;
+                }
+            }
+            int[] tmpIds = srcIds; srcIds = dstIds; dstIds = tmpIds;
+            double[] tmpYs = srcYs; srcYs = dstYs; dstYs = tmpYs;
+            int[] tmpTags = srcTags; srcTags = dstTags; dstTags = tmpTags;
+            width = width * 2;
+        }
+
+        if (srcIds != this.entityIds) {
+            for (int i = 0; i < count; i = i + 1) {
+                this.entityIds[i] = srcIds[i];
+                this.sortYs[i] = srcYs[i];
+                this.tags[i] = srcTags[i];
+            }
+        }
+    }
+
+    private void InsertionSortRange(int lo, int hi) {
+        for (int i = lo + 1; i < hi; i = i + 1) {
             double curY = sortYs[i];
             int curId = entityIds[i];
             int curTag = tags[i];
 
             int j = i - 1;
-            while (j >= 0 && (sortYs[j] > curY || (sortYs[j] == curY && tags[j] > curTag))) {
+            while (j >= lo && (sortYs[j] > curY || (sortYs[j] == curY && tags[j] > curTag))) {
                 sortYs[j + 1] = sortYs[j];
                 entityIds[j + 1] = entityIds[j];
                 tags[j + 1] = tags[j];

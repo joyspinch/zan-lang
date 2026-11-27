@@ -37,20 +37,19 @@ public class Query1<T> {
         }
     }
 
-    // 遍历并带上组件值。
+    // 遍历并带上组件值（O(1) 稠密槽位直读，零哈希查表）。
     public void EachValue(EcsEach2<int, T> fn) {
         if (fn == null) { return; }
         int n = this.store.SlotCount();
         for (int i = 0; i < n; i = i + 1) {
-            int entity = this.store.EntityAt(i);
-            fn(entity, this.store.Get(entity));
+            fn(this.store.EntityAt(i), this.store.ValueAt(i));
         }
     }
 }
 
 // 双组件查询：遍历同时拥有两个组件的实体。
 //
-// 以**元素较少**的那个池为基准遍历（另一池用哈希查），这是 ECS 的
+// 以**元素较少**的那个池为基准遍历（另一池用单次 TryGet 哈希查），这是 ECS 的
 // 标准做法：命中集小的一方决定遍历量。
 public class Query2<T, U> {
     private ComponentStore<T> first;
@@ -64,21 +63,39 @@ public class Query2<T, U> {
     // 同时拥有两个组件的实体数。
     public int Count() {
         int n = 0;
-        int slots = this.first.SlotCount();
-        for (int i = 0; i < slots; i = i + 1) {
-            if (this.second.Has(this.first.EntityAt(i))) { n = n + 1; }
+        int n1 = this.first.SlotCount();
+        int n2 = this.second.SlotCount();
+        if (n1 <= n2) {
+            for (int i = 0; i < n1; i = i + 1) {
+                if (this.second.Has(this.first.EntityAt(i))) { n = n + 1; }
+            }
+        } else {
+            for (int i = 0; i < n2; i = i + 1) {
+                if (this.first.Has(this.second.EntityAt(i))) { n = n + 1; }
+            }
         }
         return n;
     }
 
-    // 遍历并带上两个组件的值。
+    // 遍历并带上两个组件的值（优先遍历较小池，单次 TryGet 替代 Has+Get+Get 三查）。
     public void Each(EcsEach3<int, T, U> fn) {
         if (fn == null) { return; }
-        int slots = this.first.SlotCount();
-        for (int i = 0; i < slots; i = i + 1) {
-            int entity = this.first.EntityAt(i);
-            if (!this.second.Has(entity)) { continue; }
-            fn(entity, this.first.Get(entity), this.second.Get(entity));
+        int n1 = this.first.SlotCount();
+        int n2 = this.second.SlotCount();
+        if (n1 <= n2) {
+            for (int i = 0; i < n1; i = i + 1) {
+                int entity = this.first.EntityAt(i);
+                U secondVal;
+                if (!this.second.TryGet(entity, out secondVal)) { continue; }
+                fn(entity, this.first.ValueAt(i), secondVal);
+            }
+        } else {
+            for (int i = 0; i < n2; i = i + 1) {
+                int entity = this.second.EntityAt(i);
+                T firstVal;
+                if (!this.first.TryGet(entity, out firstVal)) { continue; }
+                fn(entity, firstVal, this.second.ValueAt(i));
+            }
         }
     }
 }

@@ -17,8 +17,10 @@ public class World {
     private List<int> entities;
     // 实体 id → 在 entities 里的槽位（存活判定走这里，O(1)）。
     private Dictionary<int, int> entityIndex;
-    // 本帧请求销毁的实体 id。
+    // 本帧请求销毁的实体 id（保序，供 Flush 回调按请求顺序执行）。
     private List<int> pendingDestroy;
+    // 本帧请求销毁的实体集合（O(1) 去重与 O(N) 压缩）。
+    private HashSet<int> pendingDestroySet;
     // 已注册的系统（按加入顺序）。
     private List<System> systems;
     // 实体销毁时的清理回调（每个组件池注册一个）。
@@ -32,6 +34,7 @@ public class World {
         this.entities = new List<int>();
         this.entityIndex = new Dictionary<int, int>();
         this.pendingDestroy = new List<int>();
+        this.pendingDestroySet = new HashSet<int>();
         this.systems = new List<System>();
         this.cleanups = new List<Action<int>>();
         this.nextId = 1;
@@ -68,9 +71,7 @@ public class World {
     // 重复销毁同一实体只有第一次生效。
     public bool DestroyEntity(int entity) {
         if (!this.IsAlive(entity)) { return false; }
-        for (int i = 0; i < this.pendingDestroy.Count; i = i + 1) {
-            if (this.pendingDestroy[i] == entity) { return false; }
-        }
+        if (!this.pendingDestroySet.Add(entity)) { return false; }
         this.pendingDestroy.Add(entity);
         return true;
     }
@@ -88,24 +89,28 @@ public class World {
         this.RemoveDestroyedEntities();
     }
 
-    // 把待销毁的实体从活实体表里摘掉（原地改，保持创建顺序）。
+    // 把待销毁的实体从活实体表里摘掉（单趟 O(N) 原地压缩，保持创建顺序）。
     public void RemoveDestroyedEntities() {
         if (this.pendingDestroy.Count == 0) { return; }
-        for (int d = this.pendingDestroy.Count - 1; d >= 0; d = d - 1) {
-            int dead = this.pendingDestroy[d];
-            for (int i = this.entities.Count - 1; i >= 0; i = i - 1) {
-                if (this.entities[i] == dead) {
-                    this.entities.RemoveAt(i);
-                    break;
-                }
+        int write = 0;
+        int n = this.entities.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            int id = this.entities[i];
+            if (this.pendingDestroySet.Contains(id)) {
+                this.entityIndex.Remove(id);
+                continue;
             }
+            if (write != i) {
+                this.entities[write] = id;
+                this.entityIndex[id] = write;
+            }
+            write = write + 1;
         }
-        // 槽位整体前移，重建索引。
-        this.entityIndex.Clear();
-        for (int i = 0; i < this.entities.Count; i = i + 1) {
-            this.entityIndex[this.entities[i]] = i;
+        for (int i = n - 1; i >= write; i = i - 1) {
+            this.entities.RemoveAt(i);
         }
         this.pendingDestroy.Clear();
+        this.pendingDestroySet.Clear();
     }
 
     /* ---------- 系统 ---------- */
