@@ -490,6 +490,182 @@ def check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expe
     if any(x.get("name") == "LiveOnly" for x in ws_after):
         fail("overlay close restore", "LiveOnly should disappear after close: %r" % (ws_after,))
 
+    # 9. Inheritance-chain navigation + member/overload-identity semantic references/rename
+    derived_path = workspace / "app/lib/Derived.zan"
+    derived_uri = derived_path.as_uri()
+    unrelated_path = workspace / "app/lib/Unrelated.zan"
+    unrelated_uri = unrelated_path.as_uri()
+    sem_caller_uri = (workspace / "app/src/SemUse.zan").as_uri()
+
+    derived_path.write_text(
+        "namespace Library;\n"
+        "public class BaseService {\n"
+        "    public int BaseTag;\n"
+        "    public int BaseCompute(int seed) { return seed; }\n"
+        "    public virtual int Ping(int v) { return v; }\n"
+        "}\n"
+        "public class DerivedService : BaseService {\n"
+        "    public int DerivedOnly() { return BaseTag; }\n"
+        "    public override int Ping(int v) { return v + 1; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    unrelated_path.write_text(
+        "namespace Library;\n"
+        "public class Unrelated {\n"
+        "    public int Count;\n"
+        "    public static int Compute(string key, int count) { return count; }\n"
+        "    public int Ping(int v) { return v; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    sem_text = (
+        "using Library;\n"
+        "class SemUse {\n"
+        "    static int Run(Service service, DerivedService derived, BaseService baseSvc, Unrelated unrelated) {\n"
+        "        string note = \"Count Compute\"; // Count Compute\n"
+        "        int a = service.Count + unrelated.Count;\n"
+        "        int b = Helper.Compute(\"k\") + Helper.Compute(\"k\", 2) + Unrelated.Compute(\"k\", 2);\n"
+        "        int c = derived.BaseTag + derived.BaseCompute(7) + derived.Ping(1) + baseSvc.Ping(2) + unrelated.Ping(3);\n"
+        "        return a + b + c;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(sem_caller_uri, sem_text)
+    expect_diag(caller, 5, set())
+    expect_diag(sem_caller_uri, 1, set())
+    slines = sem_text.splitlines()
+
+    # 9a. Inherited dot-completion on derived. includes DerivedOnly + BaseTag + BaseCompute + Ping
+    der_comp = s.request("textDocument/completion", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 6, "character": slines[6].index("derived.BaseTag") + len("derived.")},
+    }).get("result") or []
+    der_labels = [c["label"] for c in der_comp]
+    for want_lbl in ("DerivedOnly", "BaseTag", "BaseCompute", "Ping"):
+        if want_lbl not in der_labels:
+            fail("inherited dot completion", "missing %s in %r" % (want_lbl, der_labels))
+    if der_labels.count("Ping") != 1:
+        fail("inherited dot completion dedup", "expected single Ping, got %r" % (der_labels,))
+
+    # 9b. Inherited definition / hover / signatureHelp / inlayHint on derived.BaseCompute(7) & derived.BaseTag
+    def_base_m = s.request("textDocument/definition", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 6, "character": slines[6].index("BaseCompute") + 2},
+    }).get("result")
+    if not def_base_m or def_base_m["uri"] != derived_uri or def_base_m["range"]["start"]["line"] != 3:
+        fail("inherited definition", "expected %s:3, got %r" % (derived_uri, def_base_m))
+
+    hv_base_f = s.request("textDocument/hover", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 6, "character": slines[6].index("BaseTag") + 2},
+    }).get("result")
+    hv_base_val = (hv_base_f or {}).get("contents", {}).get("value", "")
+    if "BaseTag" not in hv_base_val or "BaseService" not in hv_base_val:
+        fail("inherited hover", "expected BaseTag in BaseService, got %r" % (hv_base_f,))
+
+    sig_base = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 6, "character": slines[6].index("7)")},
+    }).get("result")
+    sig_base_labels = [x.get("label") for x in (sig_base or {}).get("signatures") or []]
+    if "int BaseCompute(int seed)" not in sig_base_labels:
+        fail("inherited signatureHelp", "expected BaseCompute(int seed), got %r" % (sig_base,))
+
+    sem_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": sem_caller_uri},
+        "range": {"start": {"line": 6, "character": 0}, "end": {"line": 7, "character": 0}},
+    }).get("result") or []
+    if "seed:" not in [h.get("label") for h in sem_hints]:
+        fail("inherited inlayHint", "expected seed: from BaseService.BaseCompute, got %r" % (sem_hints,))
+
+    # 9c. Overload-aware definition & hover: 1-arg vs 2-arg Helper.Compute
+    def_c1 = s.request("textDocument/definition", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 5, "character": slines[5].index('Helper.Compute("k")') + len("Helper.") + 2},
+    }).get("result")
+    if not def_c1 or def_c1["uri"] != helper_uri or def_c1["range"]["start"]["line"] != 2:
+        fail("overload definition 1-arg", "expected %s:2, got %r" % (helper_uri, def_c1))
+
+    def_c2 = s.request("textDocument/definition", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 5, "character": slines[5].index('Helper.Compute("k", 2)') + len("Helper.") + 2},
+    }).get("result")
+    if not def_c2 or def_c2["uri"] != helper_uri or def_c2["range"]["start"]["line"] != 3:
+        fail("overload definition 2-arg", "expected %s:3, got %r" % (helper_uri, def_c2))
+
+    # 9d. Semantic references & rename on Service.Count: exclude Unrelated.Count, comments, strings
+    cnt_refs = s.request("textDocument/references", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 4, "character": slines[4].index("service.Count") + len("service.") + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    cnt_uris = {r["uri"] for r in cnt_refs}
+    if library not in cnt_uris or sem_caller_uri not in cnt_uris or unrelated_uri in cnt_uris:
+        fail("semantic member references", "expected library+sem_caller without unrelated, got %r" % (cnt_refs,))
+    sem_cnt_hits = [r["range"]["start"] for r in cnt_refs if r["uri"] == sem_caller_uri]
+    if sem_cnt_hits != [{"line": 4, "character": slines[4].index("service.Count") + len("service.")}]:
+        fail("semantic member references filter",
+             "comment/string/unrelated Count leaked: %r" % (sem_cnt_hits,))
+
+    cnt_ren = (s.request("textDocument/rename", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 4, "character": slines[4].index("service.Count") + len("service.") + 1},
+        "newName": "ItemCount",
+    }).get("result") or {}).get("changes") or {}
+    if unrelated_uri in cnt_ren or len(cnt_ren.get(sem_caller_uri) or []) != 1:
+        fail("semantic member rename", "leaked unrelated/comment/string Count: %r" % (cnt_ren,))
+
+    # 9e. Semantic references & rename on 2-arg Helper.Compute: exclude 1-arg overload & Unrelated.Compute
+    c2_col = slines[5].index('Helper.Compute("k", 2)') + len("Helper.")
+    c2_refs = s.request("textDocument/references", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 5, "character": c2_col + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    if any(r["uri"] == unrelated_uri for r in c2_refs):
+        fail("semantic overload references unrelated", "Unrelated.Compute leaked: %r" % (c2_refs,))
+    helper_c2_lines = sorted(r["range"]["start"]["line"] for r in c2_refs if r["uri"] == helper_uri)
+    if helper_c2_lines != [3]:
+        fail("semantic overload references decl", "expected only 2-arg decl line [3], got %r" % (helper_c2_lines,))
+    sem_c2_cols = [r["range"]["start"]["character"] for r in c2_refs if r["uri"] == sem_caller_uri]
+    if sem_c2_cols != [c2_col]:
+        fail("semantic overload references calls", "expected only 2-arg call col [%d], got %r" % (c2_col, sem_c2_cols))
+
+    c2_ren = (s.request("textDocument/rename", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 5, "character": c2_col + 1},
+        "newName": "ComputeMany",
+    }).get("result") or {}).get("changes") or {}
+    if unrelated_uri in c2_ren or len(c2_ren.get(helper_uri) or []) != 1 \
+            or len(c2_ren.get(sem_caller_uri) or []) != 1:
+        fail("semantic overload rename", "expected 1 edit in Helper + 1 in SemUse, got %r" % (c2_ren,))
+
+    # 9f. Semantic references on virtual/override Ping: hits BaseService + DerivedService, excludes Unrelated
+    ping_refs = s.request("textDocument/references", {
+        "textDocument": {"uri": sem_caller_uri},
+        "position": {"line": 6, "character": slines[6].index("derived.Ping") + len("derived.") + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    if any(r["uri"] == unrelated_uri for r in ping_refs):
+        fail("semantic override references", "Unrelated.Ping leaked: %r" % (ping_refs,))
+    der_ping_lines = sorted(r["range"]["start"]["line"] for r in ping_refs if r["uri"] == derived_uri)
+    if der_ping_lines != [4, 8]:
+        fail("semantic override references decls", "expected Base+Derived lines [4,8], got %r" % (der_ping_lines,))
+    sem_ping_cols = sorted(r["range"]["start"]["character"] for r in ping_refs if r["uri"] == sem_caller_uri)
+    want_ping_cols = sorted([
+        slines[6].index("derived.Ping") + len("derived."),
+        slines[6].index("baseSvc.Ping") + len("baseSvc."),
+    ])
+    if sem_ping_cols != want_ping_cols:
+        fail("semantic override references calls", "expected %r, got %r" % (want_ping_cols, sem_ping_cols))
+
+    close_doc(sem_caller_uri)
+    expect_diag(sem_caller_uri, 1, set())
+    expect_diag(caller, 5, set())
+    derived_path.unlink()
+    unrelated_path.unlink()
+
     # Restore caller version/text expected by downstream manifest assertions
     helper_path.unlink()
     s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 3}]})
@@ -905,8 +1081,8 @@ def run_session(exe, workspace):
     if pr is not None:
         fail("prepareRename whitespace", "expected null, got %r" % (pr,))
 
-    # rename Val→Count：声明 + return 共 2 处；CJK 行尾注释里的 Val
-    # 跨文档也命中（词边界近似，含全部打开文档）
+    # rename Val→Count：声明 + return 共 2 处；语义过滤后不应污染无关类 CDemo.Val
+    # 或 CJK 行尾注释里的 Val
     ren = s.request("textDocument/rename", {
         "textDocument": {"uri": OK_URI},
         "position": on_val, "newName": "Count"}).get("result") or {}
@@ -920,16 +1096,9 @@ def run_session(exe, workspace):
     if edits[0]["range"]["end"] != {"line": 1, "character": v1 + 3} or \
             any(e["newText"] != "Count" for e in edits):
         fail("rename", "bad edit shape: %r" % (edits,))
-    # SRC_CJK 第 1 行同款字段声明 + 第 3 行行尾注释，共 2 处
-    cjk_val = (ren.get("changes") or {}).get(CJK_URI)
-    want_cjk = [
-        {"line": 1, "character": line1.index("Val")},
-        {"line": 3, "character": utf16_length(
-            '    string s = "中文备注"; Missing m = null; // 中文尾注 ')},
-    ]
-    if not cjk_val or [e["range"]["start"] for e in cjk_val] != want_cjk:
-        fail("rename cross-doc", "expected CJK_URI hits %r, got %r"
-             % (want_cjk, cjk_val))
+    if CJK_URI in (ren.get("changes") or {}):
+        fail("rename semantic isolation",
+             "unrelated CDemo.Val or comment in CJK_URI must not be renamed: %r" % (ren,))
 
     # rename 非法新名 → null；关键字新名 → error -32602
     for bad in ("9Bad", "a-b", ""):
