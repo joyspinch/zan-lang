@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using Web3.Types;
 
 namespace Web3.Rpc;
@@ -6,9 +7,47 @@ namespace Web3.Rpc;
 // 以太坊标准 JSON-RPC 2.0 请求报文构造器，用于与 Geth/Erigon/Reth/Infura/Alchemy/QuickNode 等节点交互。
 public class JsonRpcBuilder {
 
+    private static void AppendJsonString(StringBuilder sb, string s) {
+        sb.Append("\"");
+        if (s != null) {
+            int n = s.Length;
+            int seg = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                int c = s[i] & 255;
+                string esc = null;
+                if (c == 34) { esc = "\\\""; }
+                else if (c == 92) { esc = "\\\\"; }
+                else if (c == 10) { esc = "\\n"; }
+                else if (c == 13) { esc = "\\r"; }
+                else if (c == 9) { esc = "\\t"; }
+                else if (c == 8) { esc = "\\b"; }
+                else if (c == 12) { esc = "\\f"; }
+                else if (c < 32) {
+                    string hx = "0123456789abcdef";
+                    esc = "\\u00" + hx.Substring((c >> 4) & 15, 1) + hx.Substring(c & 15, 1);
+                }
+                if (esc != null) {
+                    if (i > seg) { sb.Append(s.Substring(seg, i - seg)); }
+                    sb.Append(esc);
+                    seg = i + 1;
+                }
+            }
+            if (n > seg) { sb.Append(s.Substring(seg, n - seg)); }
+        }
+        sb.Append("\"");
+    }
+
     // 基础包装：构建标准 JSON-RPC 请求
     public static string BuildRequest(string method, string paramsJson, int id) {
-        return "{\"jsonrpc\":\"2.0\",\"id\":" + id.ToString() + ",\"method\":\"" + method + "\",\"params\":" + paramsJson + "}";
+        StringBuilder sb = new StringBuilder(96);
+        sb.Append("{\"jsonrpc\":\"2.0\",\"id\":");
+        sb.Append(id.ToString());
+        sb.Append(",\"method\":");
+        JsonRpcBuilder.AppendJsonString(sb, method);
+        sb.Append(",\"params\":");
+        sb.Append(paramsJson != null && paramsJson.Length > 0 ? paramsJson : "[]");
+        sb.Append("}");
+        return sb.ToString();
     }
 
     // eth_blockNumber: 获取当前最新区块号
@@ -30,14 +69,26 @@ public class JsonRpcBuilder {
     public static string GetBalance(Address address, string blockTag, int id) {
         string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
         string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
-        return BuildRequest("eth_getBalance", "[\"" + addrHex + "\",\"" + tag + "\"]", id);
+        StringBuilder p = new StringBuilder(64);
+        p.Append("[");
+        JsonRpcBuilder.AppendJsonString(p, addrHex);
+        p.Append(",");
+        JsonRpcBuilder.AppendJsonString(p, tag);
+        p.Append("]");
+        return BuildRequest("eth_getBalance", p.ToString(), id);
     }
 
     // eth_getTransactionCount: 查询账户地址的已确认交易计数（用于构造交易的 Nonce）
     public static string GetTransactionCount(Address address, string blockTag, int id) {
         string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
         string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
-        return BuildRequest("eth_getTransactionCount", "[\"" + addrHex + "\",\"" + tag + "\"]", id);
+        StringBuilder p = new StringBuilder(64);
+        p.Append("[");
+        JsonRpcBuilder.AppendJsonString(p, addrHex);
+        p.Append(",");
+        JsonRpcBuilder.AppendJsonString(p, tag);
+        p.Append("]");
+        return BuildRequest("eth_getTransactionCount", p.ToString(), id);
     }
 
     // eth_call: 无需 Gas 消耗地调用合约只读方法（例如查询 ERC-20 余额、名称、代币精度）
@@ -48,8 +99,15 @@ public class JsonRpcBuilder {
             data = "0x" + data;
         }
         string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
-        string callObj = "{\"to\":\"" + toHex + "\",\"data\":\"" + data + "\"}";
-        return BuildRequest("eth_call", "[" + callObj + ",\"" + tag + "\"]", id);
+        StringBuilder p = new StringBuilder(96);
+        p.Append("[{\"to\":");
+        JsonRpcBuilder.AppendJsonString(p, toHex);
+        p.Append(",\"data\":");
+        JsonRpcBuilder.AppendJsonString(p, data);
+        p.Append("},");
+        JsonRpcBuilder.AppendJsonString(p, tag);
+        p.Append("]");
+        return BuildRequest("eth_call", p.ToString(), id);
     }
 
     // eth_estimateGas: 预估执行交易所需要的 Gas Limit 数量
@@ -61,24 +119,28 @@ public class JsonRpcBuilder {
             data = "0x" + data;
         }
 
-        string txObj = "{";
+        StringBuilder p = new StringBuilder(128);
+        p.Append("[{");
         bool hasField = false;
         if (fromHex.Length > 0) {
-            txObj = txObj + "\"from\":\"" + fromHex + "\"";
+            p.Append("\"from\":");
+            JsonRpcBuilder.AppendJsonString(p, fromHex);
             hasField = true;
         }
         if (toHex.Length > 0) {
-            if (hasField) { txObj = txObj + ","; }
-            txObj = txObj + "\"to\":\"" + toHex + "\"";
+            if (hasField) { p.Append(","); }
+            p.Append("\"to\":");
+            JsonRpcBuilder.AppendJsonString(p, toHex);
             hasField = true;
         }
         if (data.Length > 0) {
-            if (hasField) { txObj = txObj + ","; }
-            txObj = txObj + "\"data\":\"" + data + "\"";
+            if (hasField) { p.Append(","); }
+            p.Append("\"data\":");
+            JsonRpcBuilder.AppendJsonString(p, data);
         }
-        txObj = txObj + "}";
+        p.Append("}]");
 
-        return BuildRequest("eth_estimateGas", "[" + txObj + "]", id);
+        return BuildRequest("eth_estimateGas", p.ToString(), id);
     }
 
     // eth_sendRawTransaction: 广播已完成签名的原始交易字节串
@@ -87,7 +149,11 @@ public class JsonRpcBuilder {
         if (!hex.StartsWith("0x") && !hex.StartsWith("0X")) {
             hex = "0x" + hex;
         }
-        return BuildRequest("eth_sendRawTransaction", "[\"" + hex + "\"]", id);
+        StringBuilder p = new StringBuilder(hex.Length + 8);
+        p.Append("[");
+        JsonRpcBuilder.AppendJsonString(p, hex);
+        p.Append("]");
+        return BuildRequest("eth_sendRawTransaction", p.ToString(), id);
     }
 
     // eth_getTransactionReceipt: 根据交易哈希查询上链执行回执与状态
@@ -96,6 +162,10 @@ public class JsonRpcBuilder {
         if (!hash.StartsWith("0x") && !hash.StartsWith("0X")) {
             hash = "0x" + hash;
         }
-        return BuildRequest("eth_getTransactionReceipt", "[\"" + hash + "\"]", id);
+        StringBuilder p = new StringBuilder(hash.Length + 8);
+        p.Append("[");
+        JsonRpcBuilder.AppendJsonString(p, hash);
+        p.Append("]");
+        return BuildRequest("eth_getTransactionReceipt", p.ToString(), id);
     }
 }

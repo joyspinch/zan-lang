@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Interop;
 using System.Net.Sockets;
 using System.Text;
 
@@ -64,7 +65,7 @@ public class SshClient {
     private long remoteWindow;
     private long remoteMaxPacket;
     private long windowConsumed;
-    private List<byte[]> pending;
+    private Queue<byte[]> pending;
     private byte[] sharedSecret;
     private byte[] exchangeHash;
 
@@ -93,7 +94,7 @@ public class SshClient {
         this.remoteChannel = 0;
         this.remoteWindow = 0;
         this.remoteMaxPacket = 32768;
-        this.pending = new List<byte[]>();
+        this.pending = new Queue<byte[]>();
     }
 
     public void Connect() {
@@ -446,9 +447,9 @@ public class SshClient {
 
     private void PrependPending(List<byte[]> msgs) {
         if (msgs.Count == 0) { return; }
-        List<byte[]> merged = new List<byte[]>();
-        for (int i = 0; i < msgs.Count; i = i + 1) { merged.Add(msgs[i]); }
-        for (int i = 0; i < this.pending.Count; i = i + 1) { merged.Add(this.pending[i]); }
+        Queue<byte[]> merged = new Queue<byte[]>();
+        for (int i = 0; i < msgs.Count; i = i + 1) { merged.Enqueue(msgs[i]); }
+        while (this.pending.Count() > 0) { merged.Enqueue(this.pending.Dequeue()); }
         this.pending = merged;
     }
 
@@ -521,10 +522,8 @@ public class SshClient {
     }
 
     private byte[] NextMessage() {
-        if (this.pending.Count > 0) {
-            byte[] first = this.pending[0];
-            this.pending.RemoveAt(0);
-            return first;
+        if (this.pending.Count() > 0) {
+            return this.pending.Dequeue();
         }
         return this.packets.Recv();
     }
@@ -532,7 +531,7 @@ public class SshClient {
     private void SendMessage(int message, byte[] payload) {
         byte[] full = new byte[1 + payload.Length];
         full[0] = (byte)(message & 255);
-        for (int i = 0; i < payload.Length; i = i + 1) { full[1 + i] = payload[i]; }
+        if (payload.Length > 0) { NativeMemory.Copy((nint)full + (nint)1, (nint)payload, payload.Length); }
         this.packets.Send(full);
     }
 
@@ -549,7 +548,7 @@ public class SshClient {
                     "expected " + SshMessage.Name(expected) + ", got " + SshMessage.Name(message));
             }
             byte[] body = new byte[payload.Length - 1];
-            for (int i = 0; i < body.Length; i = i + 1) { body[i] = payload[1 + i]; }
+            if (body.Length > 0) { NativeMemory.Copy((nint)body, (nint)payload + (nint)1, body.Length); }
             return body;
         }
     }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace System.Data;
 
@@ -38,27 +39,25 @@ public class Pivot {
             valAt.Add(at);
         }
 
-        // 行标签值 / 列标签值的首次出现顺序。
+        // 行标签值 / 列标签值的首次出现顺序，同步归组单元格行号（单趟扫描）。
         List<string> indexValues = new List<string>();
-        Dictionary<string, bool> indexSeen = new Dictionary<string, bool>();
+        HashSet<string> indexSeen = new HashSet<string>();
         List<string> columnValues = new List<string>();
-        Dictionary<string, bool> colSeen = new Dictionary<string, bool>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            string iv = df.cols[idxAt].GetStr(r);
-            if (!indexSeen.ContainsKey(iv)) { indexSeen[iv] = true; indexValues.Add(iv); }
-            string cv = df.cols[colAt].GetStr(r);
-            if (!colSeen.ContainsKey(cv)) { colSeen[cv] = true; columnValues.Add(cv); }
-        }
-
-        // 每个（行标签, 列标签）组合的行号集合。
-        // 键只含行标签与列标签——值列不进键（一个单元格是"行×列"的
-        // 一组观测，多个值列各自聚合同一组行）。
+        HashSet<string> colSeen = new HashSet<string>();
         Dictionary<string, List<int>> cells = new Dictionary<string, List<int>>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            string k = Pivot.CellKey(df.cols[idxAt].GetStr(r),
-                df.cols[colAt].GetStr(r));
-            if (!cells.ContainsKey(k)) { cells[k] = new List<int>(); }
-            cells[k].Add(r);
+        int totalRows = df.Rows();
+        for (int r = 0; r < totalRows; r = r + 1) {
+            string iv = df.cols[idxAt].GetStr(r);
+            if (indexSeen.Add(iv)) { indexValues.Add(iv); }
+            string cv = df.cols[colAt].GetStr(r);
+            if (colSeen.Add(cv)) { columnValues.Add(cv); }
+            string k = Pivot.CellKey(iv, cv);
+            List<int> bucket;
+            if (!cells.TryGetValue(k, out bucket)) {
+                bucket = new List<int>();
+                cells[k] = bucket;
+            }
+            bucket.Add(r);
         }
 
         DataFrame outp = new DataFrame();
@@ -73,12 +72,11 @@ public class Pivot {
             int row = outp.AddRow();
             outp.cols[0].PutStr(row, indexValues[i]);
             for (int c = 0; c < columnValues.Count; c = c + 1) {
+                string k = Pivot.CellKey(indexValues[i], columnValues[c]);
+                List<int> rows;
+                bool hasCell = cells.TryGetValue(k, out rows);
                 for (int v = 0; v < valAt.Count; v = v + 1) {
-                    string k = Pivot.CellKey(indexValues[i], columnValues[c]);
-                    double val = 0.0;
-                    if (cells.ContainsKey(k)) {
-                        val = df.Aggregate(cells[k], df.cols[valAt[v]].Name(), agg);
-                    }
+                    double val = hasCell ? df.Aggregate(rows, df.cols[valAt[v]].Name(), agg) : 0.0;
                     outp.cols[1 + c * valAt.Count + v].PutDouble(row, val);
                 }
             }
@@ -107,21 +105,19 @@ public class Pivot {
         if (colAt < 0) { throw new InvalidOperationException("Crosstab 没有列: " + columnsCol); }
 
         List<string> indexValues = new List<string>();
-        Dictionary<string, bool> indexSeen = new Dictionary<string, bool>();
+        HashSet<string> indexSeen = new HashSet<string>();
         List<string> columnValues = new List<string>();
-        Dictionary<string, bool> colSeen = new Dictionary<string, bool>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            string iv = df.cols[idxAt].GetStr(r);
-            if (!indexSeen.ContainsKey(iv)) { indexSeen[iv] = true; indexValues.Add(iv); }
-            string cv = df.cols[colAt].GetStr(r);
-            if (!colSeen.ContainsKey(cv)) { colSeen[cv] = true; columnValues.Add(cv); }
-        }
-
+        HashSet<string> colSeen = new HashSet<string>();
         Dictionary<string, int> counts = new Dictionary<string, int>();
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            string k = Pivot.CellKey(df.cols[idxAt].GetStr(r), df.cols[colAt].GetStr(r));
-            if (counts.ContainsKey(k)) { counts[k] = counts[k] + 1; }
-            else { counts[k] = 1; }
+        int totalRows = df.Rows();
+        for (int r = 0; r < totalRows; r = r + 1) {
+            string iv = df.cols[idxAt].GetStr(r);
+            if (indexSeen.Add(iv)) { indexValues.Add(iv); }
+            string cv = df.cols[colAt].GetStr(r);
+            if (colSeen.Add(cv)) { columnValues.Add(cv); }
+            string k = Pivot.CellKey(iv, cv);
+            int cur;
+            counts[k] = counts.TryGetValue(k, out cur) ? (cur + 1) : 1;
         }
 
         DataFrame outp = new DataFrame();
@@ -134,8 +130,8 @@ public class Pivot {
             outp.cols[0].PutStr(row, indexValues[i]);
             for (int c = 0; c < columnValues.Count; c = c + 1) {
                 string k = Pivot.CellKey(indexValues[i], columnValues[c]);
-                int n = 0;
-                if (counts.ContainsKey(k)) { n = counts[k]; }
+                int n;
+                if (!counts.TryGetValue(k, out n)) { n = 0; }
                 outp.cols[1 + c].PutLong(row, n);
             }
         }

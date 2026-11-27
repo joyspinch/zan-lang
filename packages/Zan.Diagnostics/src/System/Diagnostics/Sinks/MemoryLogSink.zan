@@ -9,56 +9,84 @@ namespace System.Diagnostics;
 // 超出容量时丢最旧的（环形语义：诊断看的是最近的，不是全部）。
 public class MemoryLogSink : LogSink {
     public int capacity;
-    List<LogEvent> events;
+    LogEvent[] ring;
+    int head;
+    int count;
 
     public MemoryLogSink() {
         this.capacity = 256;
-        this.events = new List<LogEvent>();
+        this.ring = new LogEvent[256];
+        this.head = 0;
+        this.count = 0;
     }
 
     public MemoryLogSink(int capacity) {
         if (capacity < 1) { capacity = 1; }
         this.capacity = capacity;
-        this.events = new List<LogEvent>();
+        this.ring = new LogEvent[capacity];
+        this.head = 0;
+        this.count = 0;
     }
 
     public override string Name() { return "memory"; }
 
+    private void SyncCapacity() {
+        int cap = this.capacity < 1 ? 1 : this.capacity;
+        if (this.ring != null && this.ring.Length == cap) { return; }
+        LogEvent[] next = new LogEvent[cap];
+        int keep = this.count < cap ? this.count : cap;
+        int skip = this.count - keep;
+        int oldCap = this.ring != null ? this.ring.Length : 0;
+        for (int i = 0; i < keep; i = i + 1) {
+            next[i] = this.ring[(this.head + skip + i) % oldCap];
+        }
+        this.ring = next;
+        this.head = 0;
+        this.count = keep;
+    }
+
     public override void Write(LogEvent e) {
         if (e == null) { return; }
-        this.events.Add(e);
-        int n = this.events.Count;
-        int over = n - this.capacity;
-        if (over > 0) {
-            for (int i = 0; i < over; i = i + 1) {
-                this.events.RemoveAt(0);
-            }
+        this.SyncCapacity();
+        int cap = this.ring.Length;
+        if (this.count < cap) {
+            this.ring[(this.head + this.count) % cap] = e;
+            this.count = this.count + 1;
+        } else {
+            this.ring[this.head] = e;
+            this.head = (this.head + 1) % cap;
         }
     }
 
-    public int Count() { return this.events.Count; }
+    public int Count() { return this.count; }
 
     // 第 i 条（0 为最旧）。越界返回 null。
     public LogEvent At(int i) {
-        if (i < 0 || i >= this.events.Count) { return null; }
-        return this.events[i];
+        if (i < 0 || i >= this.count) { return null; }
+        return this.ring[(this.head + i) % this.ring.Length];
     }
 
     // 最近一条；没有则返回 null。
     public LogEvent Last() {
-        int n = this.events.Count;
-        if (n == 0) { return null; }
-        return this.events[n - 1];
+        if (this.count == 0) { return null; }
+        return this.ring[(this.head + this.count - 1) % this.ring.Length];
     }
 
-    public void Clear() { this.events.Clear(); }
+    public void Clear() {
+        int cap = this.ring != null ? this.ring.Length : 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            this.ring[(this.head + i) % cap] = null;
+        }
+        this.head = 0;
+        this.count = 0;
+    }
 
     // 正文包含 `text` 的事件条数（自测与查看器的常用检索）。
     public int CountContaining(string text) {
         int hit = 0;
-        int n = this.events.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (this.events[i].message.Contains(text)) { hit = hit + 1; }
+        int cap = this.ring != null ? this.ring.Length : 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            if (this.ring[(this.head + i) % cap].message.Contains(text)) { hit = hit + 1; }
         }
         return hit;
     }
