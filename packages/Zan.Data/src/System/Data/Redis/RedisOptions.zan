@@ -64,11 +64,14 @@ public class RedisOptions {
         else if (c0 == 43) { i = i + 1; }
         if (i >= stop) { return Convert.ToInt(s.Substring(start, stop - start)); }
         long acc = 0L;
+        long maxAcc = sign < 0 ? 2147483648L : 2147483647L;
         for (; i < stop; i = i + 1) {
             int d = (s[i] & 255) - 48;
             if (d < 0 || d > 9) { return Convert.ToInt(s.Substring(start, stop - start)); }
             acc = acc * 10L + (long)d;
-            if (acc > 2147483648L) { return Convert.ToInt(s.Substring(start, stop - start)); }
+            if (acc > maxAcc) {
+                throw new ArgumentException("integer out of range in Redis option: " + s.Substring(start, stop - start));
+            }
         }
         long res = sign < 0 ? -acc : acc;
         return (int)res;
@@ -152,7 +155,7 @@ public class RedisOptions {
                         || (k0 == 116 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, kl, kr, "tls"))) {
                     int vlen = vr - vl;
                     opt.ssl = (vlen == 1 && (connectionString[vl] & 255) == 49)
-                        || (vlen == 4 && RedisOptions.EqualsExactRange(connectionString, vl, vr, "true"))
+                        || (vlen == 4 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, vl, vr, "true"))
                         || (vlen == 3 && RedisOptions.EqualsAsciiIgnoreCaseRange(connectionString, vl, vr, "yes"));
                 }
             } else if (klen == 4) {
@@ -211,29 +214,66 @@ public class RedisOptions {
     }
 
     void parseHostPortSlice(string s, nint cp, int start, int end) {
-        int colon = NativeMemory.Find(cp, start, 58, end - start);
+        int hl = start;
+        int hr = end;
+        while (hl < hr && (s[hl] & 255) <= 32) { hl = hl + 1; }
+        while (hr > hl && (s[hr - 1] & 255) <= 32) { hr = hr - 1; }
+        if (hl >= hr) { return; }
+
+        // IPv6 字面量：[::1]:6379 或 [::1]
+        if ((s[hl] & 255) == 91) {
+            int rb = NativeMemory.Find(cp, hl + 1, 93, hr - (hl + 1));
+            if (rb > hl) {
+                this.host = s.Substring(hl + 1, rb - hl - 1);
+                int after = rb + 1;
+                if (after < hr && (s[after] & 255) == 58) {
+                    int pl = after + 1;
+                    int pr = hr;
+                    while (pl < pr && (s[pl] & 255) <= 32) { pl = pl + 1; }
+                    while (pr > pl && (s[pr - 1] & 255) <= 32) { pr = pr - 1; }
+                    if (pl < pr) {
+                        this.port = RedisOptions.ParseIntSlice(s, pl, pr);
+                    }
+                }
+                return;
+            }
+        }
+
+        int colon = NativeMemory.Find(cp, hl, 58, hr - hl);
         if (colon >= 0) {
-            int hl = start;
-            int hr = colon;
-            while (hl < hr && (s[hl] & 255) <= 32) { hl = hl + 1; }
-            while (hr > hl && (s[hr - 1] & 255) <= 32) { hr = hr - 1; }
-            this.host = s.Substring(hl, hr - hl);
+            // 若存在多个冒号（未加括号的裸 IPv6 地址如 ::1），整体作为主机名。
+            int nextColon = colon + 1 < hr ? NativeMemory.Find(cp, colon + 1, 58, hr - (colon + 1)) : -1;
+            if (nextColon >= 0) {
+                this.host = s.Substring(hl, hr - hl);
+                return;
+            }
+            int hEnd = colon;
+            while (hEnd > hl && (s[hEnd - 1] & 255) <= 32) { hEnd = hEnd - 1; }
+            this.host = s.Substring(hl, hEnd - hl);
             int pl = colon + 1;
-            int pr = end;
+            int pr = hr;
             while (pl < pr && (s[pl] & 255) <= 32) { pl = pl + 1; }
             while (pr > pl && (s[pr - 1] & 255) <= 32) { pr = pr - 1; }
             if (pl < pr) {
                 this.port = RedisOptions.ParseIntSlice(s, pl, pr);
             }
         } else {
-            this.host = s.Substring(start, end - start);
+            this.host = s.Substring(hl, hr - hl);
         }
     }
 
     void parseUriSlice(string uri, nint cp, int start, int end) {
         int pos = start;
-        // 解析 auth: [user:password@]host[:port][/db]
-        int atIdx = pos < end ? NativeMemory.Find(cp, pos, 64, end - pos) : -1;
+        // 解析 auth: [user:password@]host[:port][/db]（取 authority 内最后一个 '@'，支持密码含 '@'）
+        int slashIdx = pos < end ? NativeMemory.Find(cp, pos, 47, end - pos) : -1;
+        int authEnd = slashIdx >= 0 ? slashIdx : end;
+        int atIdx = -1;
+        for (int k = authEnd - 1; k >= pos; k = k - 1) {
+            if ((uri[k] & 255) == 64) {
+                atIdx = k;
+                break;
+            }
+        }
         if (atIdx >= 0) {
             int colonIdx = atIdx > pos ? NativeMemory.Find(cp, pos, 58, atIdx - pos) : -1;
             if (colonIdx >= 0) {

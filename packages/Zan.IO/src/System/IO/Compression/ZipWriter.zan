@@ -9,10 +9,17 @@ public class ZipWriter : IDisposable {
     private static extern nint fopen(string path, string mode);
     [DllImport("crt")]
     private static extern int fclose(nint fp);
-    [DllImport("crt")]
-    private static extern int fseek(nint fp, int offset, int origin);
-    [DllImport("crt")]
-    private static extern int ftell(nint fp);
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_fseeki64")]
+    private static extern int fseek64(nint fp, long offset, int origin);
+    [DllImport("crt", EntryPoint = "_ftelli64")]
+    private static extern long ftell64(nint fp);
+    #else
+    [DllImport("crt", EntryPoint = "fseeko")]
+    private static extern int fseek64(nint fp, long offset, int origin);
+    [DllImport("crt", EntryPoint = "ftello")]
+    private static extern long ftell64(nint fp);
+    #endif
     [DllImport("crt")]
     private static extern long fwrite(string buf, long size, long count, nint fp);
     [DllImport("crt", EntryPoint = "zan_file_remove")]
@@ -65,6 +72,12 @@ public class ZipWriter : IDisposable {
     // 一次性写入整个条目（内容已在内存）。级别 0 存储，
     // 1-9 deflate；内容 < 64 字节时自动转为存储。
     public void AddEntry(string name, byte[] data, int level) {
+        if (name == null || name.Length > 65535) {
+            throw new IOException("ZipWriter: entry name exceeds 16-bit ZIP limit");
+        }
+        if (this.names.Count >= 65535) {
+            throw new IOException("ZipWriter: entry count exceeds 16-bit ZIP limit");
+        }
         int crc = Crc32.Compute(data, 0, data.Length, 0);
         int method = Zip.MethodStored;
         byte[] payload = data;
@@ -81,6 +94,12 @@ public class ZipWriter : IDisposable {
     // 开始一个分块条目（先写占位本地头，EndEntry 时回填 CRC 与尺寸），配合 WriteData 喂数据；
     // 级别 0 表示存储，1-9 分块 deflate。
     public void BeginEntry(string name, int level) {
+        if (name == null || name.Length > 65535) {
+            throw new IOException("ZipWriter: entry name exceeds 16-bit ZIP limit");
+        }
+        if (this.names.Count >= 65535) {
+            throw new IOException("ZipWriter: entry count exceeds 16-bit ZIP limit");
+        }
         this.curName = name;
         this.curMethod = level > 0 ? Zip.MethodDeflate : Zip.MethodStored;
         this.curLevel = level;
@@ -129,7 +148,7 @@ public class ZipWriter : IDisposable {
         int off = 0;
         this.BuildHeader(hdr, ref off, this.curName, this.curMethod,
             this.curCrc, this.curCsize, this.curUsize);
-        this.Seek((int)this.curHdrPos);
+        this.Seek(this.curHdrPos);
         this.WriteRaw(hdr, 30);
         this.RecordEntry(this.curHdrPos, this.curName, this.curMethod,
             this.curCrc, this.curCsize, this.curUsize);
@@ -247,13 +266,13 @@ public class ZipWriter : IDisposable {
         Zip.WriteU16(hdr, ref off, 0);  // 额外字段
     }
 
-    // 当前写入位置（距文件头的字节偏移）。
-    long Tell() { return ZipWriter.ftell(this.fp); }
+    // 当前写入位置（距文件头的 64 位字节偏移）。
+    long Tell() { return ZipWriter.ftell64(this.fp); }
 
     // 定位到绝对偏移（回填本地头用）。
-    void Seek(int pos) { ZipWriter.fseek(this.fp, pos, 0); }
+    void Seek(long pos) { ZipWriter.fseek64(this.fp, pos, 0); }
     // 定位到文件尾（继续追加条目）。
-    void SeekEnd() { ZipWriter.fseek(this.fp, 0, 2); }
+    void SeekEnd() { ZipWriter.fseek64(this.fp, 0L, 2); }
 
     // 写入 len 字节；写不满抛 IOException。
     void WriteRaw(byte[] data, int len) {

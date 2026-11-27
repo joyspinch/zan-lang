@@ -182,8 +182,51 @@ public class Dialect {
         return false;
     }
 
-    // WHERE 片段里的 `t.` 别名在 UPDATE/DELETE 上不成立。
-    public static string Unalias(string f) { return f.Replace("t.", ""); }
+    // WHERE 片段里的 `t.` 别名在 UPDATE/DELETE 上不成立（仅移除词边界的独立别名 `t.`，跳过字符串字面量及 `account.id` 等）。
+    public static string Unalias(string f) {
+        if (f == null || f.Length < 2) { return f == null ? "" : f; }
+        int n = f.Length;
+        StringBuilder sb = new StringBuilder();
+        bool inStr = false;
+        int i = 0;
+        while (i < n) {
+            int c = f[i] & 255;
+            if (inStr) {
+                sb.Append(f.Substring(i, 1));
+                if (c == 39) {
+                    if (i + 1 < n && (f[i + 1] & 255) == 39) {
+                        sb.Append("'");
+                        i = i + 2;
+                        continue;
+                    }
+                    inStr = false;
+                }
+                i = i + 1;
+                continue;
+            }
+            if (c == 39) {
+                inStr = true;
+                sb.Append("'");
+                i = i + 1;
+                continue;
+            }
+            if (c == 116 && i + 1 < n && (f[i + 1] & 255) == 46) {
+                bool prevIdent = false;
+                if (i > 0) {
+                    int p = f[i - 1] & 255;
+                    prevIdent = (p >= 48 && p <= 57) || (p >= 65 && p <= 90)
+                        || (p >= 97 && p <= 122) || p == 95 || p == 46;
+                }
+                if (!prevIdent) {
+                    i = i + 2;
+                    continue;
+                }
+            }
+            sb.Append(f.Substring(i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
 
     // 两段参数按顺序合成一段（SET 在前、WHERE 在后）。
     public static DbParams Cat(DbParams a, DbParams b) {
@@ -471,17 +514,22 @@ public class Dialect {
         return new DbParams().Add(nm);
     }
 
-    // CREATE [UNIQUE] INDEX 语句文本（全参数合法标识符校验，防注入）。
+    // CREATE [UNIQUE] INDEX 语句文本（全参数合法标识符校验并按方言引用，防注入与关键字冲突）。
     public static string IndexDdl(int p, string nm, string t, string cols,
                            bool uniq) {
         QueryBuilder.RequireIdent(nm);
         QueryBuilder.RequireIdent(t);
         List<string> parts = cols.Split(",");
+        StringBuilder qcols = new StringBuilder();
         for (int i = 0; i < parts.Count; i = i + 1) {
-            QueryBuilder.RequireIdent(parts[i].Trim());
+            string col = parts[i].Trim();
+            QueryBuilder.RequireIdent(col);
+            if (i > 0) { qcols.Append(", "); }
+            qcols.Append(Dialect.QuoteIdentifier(p, col));
         }
-        return "CREATE " + (uniq ? "UNIQUE " : "") + "INDEX " + nm + " ON "
-            + t + " (" + cols + ")";
+        return "CREATE " + (uniq ? "UNIQUE " : "") + "INDEX "
+            + Dialect.QuoteIdentifier(p, nm) + " ON "
+            + Dialect.QuoteIdentifier(p, t) + " (" + qcols.ToString() + ")";
     }
 
     // 索引不存在时创建；DDL 失败（负返回值）抛 DbException。
@@ -524,6 +572,12 @@ public class Dialect {
         bool largeText = kind == 3 && len == -1;
         if (len <= 0) { len = 255; }
         if (ident) {
+            if (kind == 4) {
+                if (my) { return "BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"; }
+                if (pg) { return "BIGSERIAL PRIMARY KEY"; }
+                if (ms) { return "BIGINT IDENTITY(1,1) PRIMARY KEY"; }
+                return "INTEGER PRIMARY KEY AUTOINCREMENT";
+            }
             if (my) { return "INT NOT NULL AUTO_INCREMENT PRIMARY KEY"; }
             if (pg) { return "SERIAL PRIMARY KEY"; }
             if (ms) { return "INT IDENTITY(1,1) PRIMARY KEY"; }

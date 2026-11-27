@@ -42,95 +42,103 @@ public class Deflate {
         return t;
     }
 
-    // 惰性初始化固定 Huffman 压缩查找表（O(1) 查表，零循环）。
+    // 惰性初始化固定 Huffman 压缩查找表（O(1) 查表，零循环；锁保护 + 哨兵末位发布）。
+    private static object tableGate = new object();
+
     private static void EnsureEncodeTables() {
         if (Deflate.encLitBits != null) { return; }
-        int[] rev = Deflate.RevTable();
-        int[] litBits = new int[256];
-        int[] litLen = new int[256];
-        for (int sym = 0; sym < 144; sym = sym + 1) {
-            litBits[sym] = rev[0x30 + sym];
-            litLen[sym] = 8;
-        }
-        for (int sym = 144; sym < 256; sym = sym + 1) {
-            int c = 0x190 + (sym - 144);
-            litBits[sym] = (rev[c & 255] << 1) | ((c >> 8) & 1);
-            litLen[sym] = 9;
-        }
-        int[] mBits = new int[259];
-        int[] mLen = new int[259];
-        for (int length = 3; length <= 258; length = length + 1) {
-            int code = 257;
-            int baseLen = 3;
-            int extra = 0;
-            for (int li = 0; li < 29; li = li + 1) {
-                if (length < Deflate.LengthBase[li]) { break; }
-                code = 257 + li;
-                baseLen = Deflate.LengthBase[li];
-                extra = Deflate.LengthExtra[li];
+        lock (Deflate.tableGate) {
+            if (Deflate.encLitBits != null) { return; }
+            int[] rev = Deflate.RevTable();
+            int[] litBits = new int[256];
+            int[] litLen = new int[256];
+            for (int sym = 0; sym < 144; sym = sym + 1) {
+                litBits[sym] = rev[0x30 + sym];
+                litLen[sym] = 8;
             }
-            int cbits = 0;
-            int clen = 0;
-            if (code < 280) {
-                cbits = rev[code - 256] >> 1;
-                clen = 7;
-            } else {
-                cbits = rev[0xC0 + (code - 280)];
-                clen = 8;
+            for (int sym = 144; sym < 256; sym = sym + 1) {
+                int c = 0x190 + (sym - 144);
+                litBits[sym] = (rev[c & 255] << 1) | ((c >> 8) & 1);
+                litLen[sym] = 9;
             }
-            mBits[length] = cbits | ((length - baseLen) << clen);
-            mLen[length] = clen + extra;
-        }
-        int[] dSmall = new int[257];
-        for (int d = 1; d <= 256; d = d + 1) {
-            int dc = 0;
-            for (int di = 0; di < 16; di = di + 1) {
-                if (d < Deflate.DistBase[di]) { break; }
-                dc = di;
+            int[] mBits = new int[259];
+            int[] mLen = new int[259];
+            for (int length = 3; length <= 258; length = length + 1) {
+                int code = 257;
+                int baseLen = 3;
+                int extra = 0;
+                for (int li = 0; li < 29; li = li + 1) {
+                    if (length < Deflate.LengthBase[li]) { break; }
+                    code = 257 + li;
+                    baseLen = Deflate.LengthBase[li];
+                    extra = Deflate.LengthExtra[li];
+                }
+                int cbits = 0;
+                int clen = 0;
+                if (code < 280) {
+                    cbits = rev[code - 256] >> 1;
+                    clen = 7;
+                } else {
+                    cbits = rev[0xC0 + (code - 280)];
+                    clen = 8;
+                }
+                mBits[length] = cbits | ((length - baseLen) << clen);
+                mLen[length] = clen + extra;
             }
-            dSmall[d] = dc;
-        }
-        int[] dLarge = new int[256];
-        for (int idx = 0; idx < 256; idx = idx + 1) {
-            int d = (idx << 7) + 1;
-            int dc = 0;
+            int[] dSmall = new int[257];
+            for (int d = 1; d <= 256; d = d + 1) {
+                int dc = 0;
+                for (int di = 0; di < 16; di = di + 1) {
+                    if (d < Deflate.DistBase[di]) { break; }
+                    dc = di;
+                }
+                dSmall[d] = dc;
+            }
+            int[] dLarge = new int[256];
+            for (int idx = 0; idx < 256; idx = idx + 1) {
+                int d = (idx << 7) + 1;
+                int dc = 0;
+                for (int di = 0; di < 30; di = di + 1) {
+                    if (d < Deflate.DistBase[di]) { break; }
+                    dc = di;
+                }
+                dLarge[idx] = dc;
+            }
+            int[] dRev5 = new int[30];
             for (int di = 0; di < 30; di = di + 1) {
-                if (d < Deflate.DistBase[di]) { break; }
-                dc = di;
+                dRev5[di] = rev[di] >> 3;
             }
-            dLarge[idx] = dc;
+            Deflate.encLitLen = litLen;
+            Deflate.encMatchBits = mBits;
+            Deflate.encMatchLen = mLen;
+            Deflate.encDistSmall = dSmall;
+            Deflate.encDistLarge = dLarge;
+            Deflate.encDistRev5 = dRev5;
+            Deflate.encLitBits = litBits;
         }
-        int[] dRev5 = new int[30];
-        for (int di = 0; di < 30; di = di + 1) {
-            dRev5[di] = rev[di] >> 3;
-        }
-        Deflate.encLitBits = litBits;
-        Deflate.encLitLen = litLen;
-        Deflate.encMatchBits = mBits;
-        Deflate.encMatchLen = mLen;
-        Deflate.encDistSmall = dSmall;
-        Deflate.encDistLarge = dLarge;
-        Deflate.encDistRev5 = dRev5;
     }
 
-    // 惰性初始化固定 Huffman 解压表（含 9-bit 主查表，避免每次 Inflate 重建）。
+    // 惰性初始化固定 Huffman 解压表（含 9-bit 主查表，避免每次 Inflate 重建；锁保护 + 哨兵末位发布）。
     private static void EnsureFixedDecodeTables() {
         if (Deflate.fixedLitFast != null) { return; }
-        int[] lc = new int[16];
-        int[] ls = new int[288];
-        int[] lf = new int[512];
-        int[] dc = new int[16];
-        int[] ds = new int[32];
-        int[] df = new int[512];
-        Deflate.FixedTables(lc, ls, dc, ds);
-        Deflate.BuildFastTable(lc, ls, lf);
-        Deflate.BuildFastTable(dc, ds, df);
-        Deflate.fixedLitCount = lc;
-        Deflate.fixedLitSymbol = ls;
-        Deflate.fixedLitFast = lf;
-        Deflate.fixedDistCount = dc;
-        Deflate.fixedDistSymbol = ds;
-        Deflate.fixedDistFast = df;
+        lock (Deflate.tableGate) {
+            if (Deflate.fixedLitFast != null) { return; }
+            int[] lc = new int[16];
+            int[] ls = new int[288];
+            int[] lf = new int[512];
+            int[] dc = new int[16];
+            int[] ds = new int[32];
+            int[] df = new int[512];
+            Deflate.FixedTables(lc, ls, dc, ds);
+            Deflate.BuildFastTable(lc, ls, lf);
+            Deflate.BuildFastTable(dc, ds, df);
+            Deflate.fixedLitCount = lc;
+            Deflate.fixedLitSymbol = ls;
+            Deflate.fixedDistCount = dc;
+            Deflate.fixedDistSymbol = ds;
+            Deflate.fixedDistFast = df;
+            Deflate.fixedLitFast = lf;
+        }
     }
 
     // 根据规范 Huffman 表构建 9-bit LSB 主查找表（高 16 位=码长，低 16 位=符号；0 表示码长 > 9）。

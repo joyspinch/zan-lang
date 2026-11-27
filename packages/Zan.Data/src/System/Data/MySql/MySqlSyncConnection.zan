@@ -108,13 +108,31 @@ public class MySqlSyncConnection : IDbConnection {
         }
     }
 
+    int sendAllSync(byte[] buf, int len) {
+        int off = 0;
+        while (off < len) {
+            int rem = len - off;
+            int sent;
+            if (off == 0) {
+                sent = Socket.Send(this.sock, buf, rem);
+            } else {
+                byte[] tail = new byte[rem + 1];
+                NativeMemory.Copy((nint)tail, (nint)buf + (nint)off, rem);
+                sent = Socket.Send(this.sock, tail, rem);
+            }
+            if (sent <= 0) { return -1; }
+            off = off + sent;
+        }
+        return len;
+    }
+
     // 写入一个协议数据包（4 字节包头 + 有效载荷）。超 16MB 时按 MySQL 规范自动分片。
     int writePacket(string payload, int len, int seq) {
         if (len < 16777215) {
             byte[] buf = new byte[len + 5];
             buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
             NativeMemory.PutString((nint)buf + (nint)4, 0, payload, len);
-            return Socket.Send(this.sock, buf, len + 4);
+            return this.sendAllSync(buf, len + 4);
         }
         int offset = 0;
         int curSeq = seq;
@@ -125,11 +143,18 @@ public class MySqlSyncConnection : IDbConnection {
             byte[] buf = new byte[chunkLen + 5];
             buf[0]=(byte)(chunkLen&255); buf[1]=(byte)((chunkLen>>8)&255); buf[2]=(byte)((chunkLen>>16)&255); buf[3]=(byte)(curSeq&255);
             NativeMemory.PutString((nint)buf + (nint)4, 0, payload.Substring(offset, chunkLen), chunkLen);
-            int r = Socket.Send(this.sock, buf, chunkLen + 4);
+            int r = this.sendAllSync(buf, chunkLen + 4);
             if (r <= 0) { return r; }
             sentTotal = sentTotal + r;
             offset = offset + chunkLen;
             curSeq = (curSeq + 1) & 255;
+        }
+        if (len % 16777215 == 0) {
+            byte[] term = new byte[5];
+            term[3] = (byte)(curSeq & 255);
+            int tr = this.sendAllSync(term, 4);
+            if (tr <= 0) { return tr; }
+            sentTotal = sentTotal + tr;
         }
         return sentTotal;
     }

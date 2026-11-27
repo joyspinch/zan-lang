@@ -23,11 +23,20 @@ public class Window {
         DataCol dst = outp.cols[outAt];
 
         if (agg == Agg.Count) {
-            for (int r = 0; r < n; r = r + 1) {
-                int lo = r - window + 1;
-                if (lo < 0) { lo = 0; }
-                int cnt = r - lo + 1;
-                if (cnt >= need) { dst.PutDouble(r, (double)cnt); }
+            if (src.missing.Count == 0) {
+                for (int r = 0; r < n; r = r + 1) {
+                    int lo = r - window + 1;
+                    if (lo < 0) { lo = 0; }
+                    int cnt = r - lo + 1;
+                    if (cnt >= need) { dst.PutDouble(r, (double)cnt); }
+                }
+            } else {
+                int valid = 0;
+                for (int r = 0; r < n; r = r + 1) {
+                    if (!src.IsMissing(r)) { valid = valid + 1; }
+                    if (r >= window && !src.IsMissing(r - window)) { valid = valid - 1; }
+                    if (valid >= need) { dst.PutDouble(r, (double)valid); }
+                }
             }
             return outp;
         }
@@ -70,9 +79,26 @@ public class Window {
                     return outp;
                 }
                 double runD = 0.0;
+                int badInWin = 0;
                 for (int r = 0; r < n; r = r + 1) {
-                    runD = runD + vals[r];
-                    if (r >= window) { runD = runD - vals[r - window]; }
+                    double vr = vals[r];
+                    if (vr - vr != 0.0) { badInWin = badInWin + 1; }
+                    runD = runD + vr;
+                    bool badExited = false;
+                    if (r >= window) {
+                        double vo = vals[r - window];
+                        if (vo - vo != 0.0) {
+                            badInWin = badInWin - 1;
+                            badExited = true;
+                        }
+                        runD = runD - vo;
+                    }
+                    if (badExited && badInWin == 0) {
+                        int lo = r - window + 1;
+                        if (lo < 0) { lo = 0; }
+                        runD = 0.0;
+                        for (int i = lo; i <= r; i = i + 1) { runD = runD + vals[i]; }
+                    }
                     int cnt = r + 1 < window ? r + 1 : window;
                     if (cnt >= need) {
                         dst.PutDouble(r, agg == Agg.Sum ? runD : runD / (double)cnt);
@@ -134,35 +160,45 @@ public class Window {
                                 valid = valid + 1;
                             }
                         }
-                        if (valid > 0) {
+                        if (valid >= need) {
                             dst.PutDouble(r, agg == Agg.Sum ? s : s / (double)valid);
-                        } else {
-                            dst.PutDouble(r, 0.0);
                         }
                     }
                     return outp;
                 }
                 int valid = 0;
+                int badInWin = 0;
                 double run = 0.0;
                 for (int r = 0; r < n; r = r + 1) {
                     if (miss[r] == 0) {
-                        run = run + vals[r];
+                        double vr = vals[r];
+                        if (vr - vr != 0.0) { badInWin = badInWin + 1; }
+                        run = run + vr;
                         valid = valid + 1;
                     }
+                    bool badExited = false;
                     if (r >= window) {
                         int outIdx = r - window;
                         if (miss[outIdx] == 0) {
-                            run = run - vals[outIdx];
+                            double vo = vals[outIdx];
+                            if (vo - vo != 0.0) {
+                                badInWin = badInWin - 1;
+                                badExited = true;
+                            }
+                            run = run - vo;
                             valid = valid - 1;
                         }
                     }
-                    int cnt = r + 1 < window ? r + 1 : window;
-                    if (cnt >= need) {
-                        if (valid > 0) {
-                            dst.PutDouble(r, agg == Agg.Sum ? run : run / (double)valid);
-                        } else {
-                            dst.PutDouble(r, 0.0);
+                    if (badExited && badInWin == 0) {
+                        int lo = r - window + 1;
+                        if (lo < 0) { lo = 0; }
+                        run = 0.0;
+                        for (int i = lo; i <= r; i = i + 1) {
+                            if (miss[i] == 0) { run = run + vals[i]; }
                         }
+                    }
+                    if (valid >= need) {
+                        dst.PutDouble(r, agg == Agg.Sum ? run : run / (double)valid);
                     }
                 }
                 return outp;
@@ -171,12 +207,15 @@ public class Window {
             int[] dq = new int[n];
             int head = 0;
             int tail = 0;
+            int validMm = 0;
             bool isMax = agg == Agg.Max;
             for (int r = 0; r < n; r = r + 1) {
                 int lo = r - window + 1;
                 if (lo < 0) { lo = 0; }
                 while (head < tail && dq[head] < lo) { head = head + 1; }
+                if (r >= window && miss[r - window] == 0) { validMm = validMm - 1; }
                 if (miss[r] == 0) {
+                    validMm = validMm + 1;
                     double vr = vals[r];
                     if (isMax) {
                         while (head < tail && vals[dq[tail - 1]] <= vr) { tail = tail - 1; }
@@ -186,8 +225,8 @@ public class Window {
                     dq[tail] = r;
                     tail = tail + 1;
                 }
-                if (r - lo + 1 >= need) {
-                    dst.PutDouble(r, head < tail ? vals[dq[head]] : 0.0);
+                if (validMm >= need && head < tail) {
+                    dst.PutDouble(r, vals[dq[head]]);
                 }
             }
             return outp;
@@ -213,14 +252,14 @@ public class Window {
                 sum = sum + v;
                 valid = valid + 1;
             }
-            double res = 0.0;
-            if (valid > 0) {
+            if (valid >= need) {
+                double res = 0.0;
                 if (agg == Agg.Sum) { res = sum; }
                 else if (agg == Agg.Avg) { res = sum / (double)valid; }
                 else if (agg == Agg.Max) { res = high; }
                 else { res = low; }
+                dst.PutDouble(r, res);
             }
-            dst.PutDouble(r, res);
         }
         return outp;
     }
@@ -237,14 +276,25 @@ public class Window {
     public static List<bool> RollingValid(DataFrame df, string valueCol, int window, int minPeriods) {
         List<bool> mask = new List<bool>();
         if (df == null) { return mask; }
-        if (df.ColIndex(valueCol) < 0) { throw new InvalidOperationException("RollingValid 没有列: " + valueCol); }
+        int at = df.ColIndex(valueCol);
+        if (at < 0) { throw new InvalidOperationException("RollingValid 没有列: " + valueCol); }
         if (window < 1) { window = 1; }
         int need = minPeriods < 1 ? 1 : minPeriods;
         if (need > window) { need = window; }
-        for (int r = 0; r < df.Rows(); r = r + 1) {
-            int lo = r - window + 1;
-            if (lo < 0) { lo = 0; }
-            mask.Add((r - lo + 1) >= need);
+        DataCol src = df.cols[at];
+        if (src.missing.Count == 0) {
+            for (int r = 0; r < df.Rows(); r = r + 1) {
+                int lo = r - window + 1;
+                if (lo < 0) { lo = 0; }
+                mask.Add((r - lo + 1) >= need);
+            }
+        } else {
+            int valid = 0;
+            for (int r = 0; r < df.Rows(); r = r + 1) {
+                if (!src.IsMissing(r)) { valid = valid + 1; }
+                if (r >= window && !src.IsMissing(r - window)) { valid = valid - 1; }
+                mask.Add(valid >= need);
+            }
         }
         return mask;
     }
@@ -272,6 +322,7 @@ public class Window {
             double num = 0.0;
             double w = 0.0;
             for (int r = 0; r < n; r = r + 1) {
+                if (src.IsMissing(r)) { continue; }
                 double x = src.GetDouble(r);
                 num = x + decay * num;
                 w = 1.0 + decay * w;
@@ -279,13 +330,18 @@ public class Window {
             }
             return outp;
         }
-        if (n > 0) {
-            double y = src.GetDouble(0);
-            dst.PutDouble(0, y);
-            for (int r = 1; r < n; r = r + 1) {
-                y = alpha * src.GetDouble(r) + decay * y;
-                dst.PutDouble(r, y);
+        bool hasY = false;
+        double y = 0.0;
+        for (int r = 0; r < n; r = r + 1) {
+            if (src.IsMissing(r)) { continue; }
+            double x = src.GetDouble(r);
+            if (!hasY) {
+                y = x;
+                hasY = true;
+            } else {
+                y = alpha * x + decay * y;
             }
+            dst.PutDouble(r, y);
         }
         return outp;
     }
@@ -298,7 +354,7 @@ public class Window {
         return Window.Ewm(df, valueCol, alpha, adjust, "");
     }
 
-    // 差分 x[t] - x[t-periods]；前 periods 行不写值，outCol 空串默认 "<列>_diff"。
+    // 差分 x[t] - x[t-periods]；前 periods 行或任一端缺失时不写值，outCol 空串默认 "<列>_diff"。
     public static DataFrame Diff(DataFrame df, string valueCol, int periods, string outCol) {
         if (df == null) { throw new InvalidOperationException("Diff: 表为 null"); }
         int at = df.ColIndex(valueCol);
@@ -310,6 +366,7 @@ public class Window {
         DataCol dst = outp.cols[outAt];
         int n = outp.Rows();
         for (int r = periods; r < n; r = r + 1) {
+            if (src.IsMissing(r) || src.IsMissing(r - periods)) { continue; }
             double cur = src.GetDouble(r);
             double prev = src.GetDouble(r - periods);
             dst.PutDouble(r, cur - prev);

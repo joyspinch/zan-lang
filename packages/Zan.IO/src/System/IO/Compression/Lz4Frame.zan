@@ -14,16 +14,82 @@ public class Lz4Frame {
     // 规范魔数 0x184D2204（小端存储为 04 22 4D 18）。
     public static int MAGIC = 0x184D2204;
 
+    private static uint Rotl32(uint x, int r) {
+        return (x << r) | (x >> (32 - r));
+    }
+
+    // 标准 XXH32（seed=0），用于计算与校验 LZ4 Frame 描述符头校验字节 HC = (XXH32(desc, 0) >> 8) & 0xFF。
+    private static uint Xxh32(byte[] buf, int off, int len) {
+        uint p1 = 2654435761U;
+        uint p2 = 2246822519U;
+        uint p3 = 3266489917U;
+        uint p4 = 668265263U;
+        uint p5 = 374761393U;
+        uint h32;
+        int p = off;
+        int end = off + len;
+        if (len >= 16) {
+            uint v1 = p1 + p2;
+            uint v2 = p2;
+            uint v3 = 0U;
+            uint v4 = 0U - p1;
+            int limit = end - 16;
+            while (p <= limit) {
+                uint k1 = (uint)(buf[p] & 255) | ((uint)(buf[p + 1] & 255) << 8)
+                    | ((uint)(buf[p + 2] & 255) << 16) | ((uint)(buf[p + 3] & 255) << 24);
+                v1 = Lz4Frame.Rotl32(v1 + k1 * p2, 13) * p1;
+                p = p + 4;
+                uint k2 = (uint)(buf[p] & 255) | ((uint)(buf[p + 1] & 255) << 8)
+                    | ((uint)(buf[p + 2] & 255) << 16) | ((uint)(buf[p + 3] & 255) << 24);
+                v2 = Lz4Frame.Rotl32(v2 + k2 * p2, 13) * p1;
+                p = p + 4;
+                uint k3 = (uint)(buf[p] & 255) | ((uint)(buf[p + 1] & 255) << 8)
+                    | ((uint)(buf[p + 2] & 255) << 16) | ((uint)(buf[p + 3] & 255) << 24);
+                v3 = Lz4Frame.Rotl32(v3 + k3 * p2, 13) * p1;
+                p = p + 4;
+                uint k4 = (uint)(buf[p] & 255) | ((uint)(buf[p + 1] & 255) << 8)
+                    | ((uint)(buf[p + 2] & 255) << 16) | ((uint)(buf[p + 3] & 255) << 24);
+                v4 = Lz4Frame.Rotl32(v4 + k4 * p2, 13) * p1;
+                p = p + 4;
+            }
+            h32 = Lz4Frame.Rotl32(v1, 1) + Lz4Frame.Rotl32(v2, 7)
+                + Lz4Frame.Rotl32(v3, 12) + Lz4Frame.Rotl32(v4, 18);
+        } else {
+            h32 = p5;
+        }
+        h32 = h32 + (uint)len;
+        while (p + 4 <= end) {
+            uint k = (uint)(buf[p] & 255) | ((uint)(buf[p + 1] & 255) << 8)
+                | ((uint)(buf[p + 2] & 255) << 16) | ((uint)(buf[p + 3] & 255) << 24);
+            h32 = Lz4Frame.Rotl32(h32 + k * p3, 17) * p4;
+            p = p + 4;
+        }
+        while (p < end) {
+            h32 = Lz4Frame.Rotl32(h32 + ((uint)(buf[p] & 255)) * p5, 11) * p1;
+            p = p + 1;
+        }
+        h32 = h32 ^ (h32 >> 15);
+        h32 = h32 * p2;
+        h32 = h32 ^ (h32 >> 13);
+        h32 = h32 * p3;
+        h32 = h32 ^ (h32 >> 16);
+        return h32;
+    }
+
     // 压缩为 LZ4 frame（级别 1-9）。contentSize 记入描述符，
     // 解码方可预分配；这是官方 lz4 默认行为。
     // 布局：Magic(4) + FLG + BD + ContentSize(8) + HC(1) + 块... +
-    // EndMark。HC = (描述符字节和 >> 8) & 0xFF，第二级校验。
+    // EndMark。HC = (XXH32(FLG..ContentSize, 0) >> 8) & 0xFF（与官方 lz4 100% 互通）。
     public static byte[] Compress(byte[] data, int level) {
         int n = data == null ? 0 : data.Length;
         // 头 15 字节（magic4 + FLG + BD + Size8 + HC1）+ 块数 ×
-        // 每块最坏 + EndMark。
-        int blocks = (n + 4194303) / 4194304;
-        int worst = 15 + blocks * (Lz4Block.UpperBound(4194304) + 4 + 4) + 4;
+        // 每块最坏 + EndMark（64 位算术防 >508 MiB 溢出）。
+        long blocks = ((long)n + 4194303L) / 4194304L;
+        long worstL = 15L + blocks * ((long)Lz4Block.UpperBound(4194304) + 8L) + 4L;
+        if (worstL > 2147483647L) {
+            throw new InvalidOperationException("Lz4Frame: input exceeds 32-bit buffer limit");
+        }
+        int worst = (int)worstL;
         byte[] out2 = new byte[worst];
         int op = 0;
         // Magic 0x184D2204 小端。
@@ -43,12 +109,8 @@ public class Lz4Frame {
             out2[op] = (byte)((size >> (8 * i)) & 255);
             op = op + 1;
         }
-        // HC：FLG..ContentSize 字节求和 >> 8，写在描述符之后。
-        int h = 0;
-        for (int i = 4; i < op; i = i + 1) {
-            h = h + (out2[i] & 255);
-        }
-        out2[op] = (byte)((h >> 8) & 255);
+        // HC：(XXH32(FLG..ContentSize, 0) >> 8) & 0xFF。
+        out2[op] = (byte)((Lz4Frame.Xxh32(out2, 4, op - 4) >> 8) & 255U);
         op = op + 1;
         // 压缩块循环。
         int pos = 0;
@@ -109,6 +171,7 @@ public class Lz4Frame {
         int bd = src[ip + 1] & 255;
         ip = ip + 2;
         if (((flg >> 6) & 3) != 1) { return null; }   // Version 必须为 01
+        bool blockIndep = (flg & 32) != 0;
         bool hasContentSize = (flg & 8) != 0;
         bool hasDictId = (flg & 1) != 0;
         bool hasBlockChecksum = (flg & 16) != 0;
@@ -125,6 +188,8 @@ public class Lz4Frame {
             ip = ip + 4;
         }
         if (ip >= src.Length) { return null; }
+        int expectedHc = (int)((Lz4Frame.Xxh32(src, 4, ip - 4) >> 8) & 255U);
+        if ((src[ip] & 255) != expectedHc) { return null; }
         ip = ip + 1;  // HC
         // BlockMaxSize：值 4-7 → 64KB/256KB/1MB/4MB；值 0-3 规范
         // 未定义，按 64KB 处理。
@@ -174,9 +239,10 @@ public class Lz4Frame {
                 // 否则确保预留 maxAllowed 空间（或首次尝试用已知剩余空间，失败再扩容）。
                 int trySpace = cap - op;
                 if (trySpace > maxAllowed) { trySpace = maxAllowed; }
+                int prefixLen = blockIndep ? 0 : (op > 65536 ? 65536 : op);
                 int wrote = -1;
                 if (trySpace > 0) {
-                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, trySpace);
+                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, trySpace, prefixLen);
                 }
                 if (wrote < 0 && trySpace < maxAllowed) {
                     long need = (long)op + (long)maxAllowed;
@@ -188,7 +254,7 @@ public class Lz4Frame {
                     Lz4Frame.Copy(out2, 0, nb, 0, op);
                     out2 = nb;
                     cap = newCap;
-                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, maxAllowed);
+                    wrote = Lz4Block.DecodeInto(src, ip, dlen, out2, op, maxAllowed, prefixLen);
                 }
                 if (wrote < 0) { return null; }
                 op = op + wrote;

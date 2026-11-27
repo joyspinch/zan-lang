@@ -148,20 +148,53 @@ public class TdsReader {
         return b;
     }
 
-    // 读取 chars 个代码单元的 UCS-2LE 文本（高于 U+00FF 的单元映射为 '?'）。
+    // 读取 chars 个代码单元的 UTF-16LE/UCS-2LE 文本并解码为合法 UTF-8。
     public string Ucs2(int chars) {
         if (chars <= 0) { return ""; }
-        byte[] t = new byte[chars + 1];
+        int avail = this.Left() / 2;
+        if (chars > avail) { chars = avail; }
+        if (chars <= 0) { return ""; }
+        byte[] t = new byte[chars * 3 + 1];
+        int o = 0;
         for (int i = 0; i < chars; i = i + 1) {
             int lo = U8();
             int hi = U8();
-            if (hi != 0) {
-                t[i] = 63;  // '?'
+            int cu = lo | (hi << 8);
+            if (cu < 128) {
+                t[o] = (byte)cu;
+                o = o + 1;
+            } else if (cu < 2048) {
+                t[o] = (byte)(192 | (cu >> 6));
+                t[o + 1] = (byte)(128 | (cu & 63));
+                o = o + 2;
+            } else if (cu >= 55296 && cu <= 56319 && i + 1 < chars) {
+                int lo2 = this.buf[this.pos] & 255;
+                int hi2 = this.buf[this.pos + 1] & 255;
+                int cu2 = lo2 | (hi2 << 8);
+                if (cu2 >= 56320 && cu2 <= 57343) {
+                    this.pos = this.pos + 2;
+                    i = i + 1;
+                    int cp = 65536 + (((cu - 55296) << 10) | (cu2 - 56320));
+                    t[o] = (byte)(240 | (cp >> 18));
+                    t[o + 1] = (byte)(128 | ((cp >> 12) & 63));
+                    t[o + 2] = (byte)(128 | ((cp >> 6) & 63));
+                    t[o + 3] = (byte)(128 | (cp & 63));
+                    o = o + 4;
+                } else {
+                    t[o] = 239; t[o + 1] = 191; t[o + 2] = 189;
+                    o = o + 3;
+                }
+            } else if (cu >= 55296 && cu <= 57343) {
+                t[o] = 239; t[o + 1] = 191; t[o + 2] = 189;
+                o = o + 3;
             } else {
-                t[i] = (byte)lo;
+                t[o] = (byte)(224 | (cu >> 12));
+                t[o + 1] = (byte)(128 | ((cu >> 6) & 63));
+                t[o + 2] = (byte)(128 | (cu & 63));
+                o = o + 3;
             }
         }
-        return t.ToStr(0, chars);
+        return t.ToStr(0, o);
     }
 
     // B_VARCHAR：一个长度字节，后跟相应数量的 UCS-2 单元。

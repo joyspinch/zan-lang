@@ -197,13 +197,19 @@ public partial class PgConnection : IDbConnection {
     }
 
     // 同步 TLS 收：泵引擎（Step 会消费已喂入的密文）直到能解出
-    // 明文；引擎要更多密文时从套接字收一段喂进去。关闭返回 0。
+    // 明文；引擎要更多密文时从套接字收一段喂进去。关闭返回 0，致命错误返回 -1。
     int tlsRecvSync(byte[] dst, int want) {
         if (this.tlsIn == null) { this.tlsIn = new byte[65537]; }
         while (true) {
             int st = this.syncTls.Step();
-            if (st < 0) { return -1; }
-            if (this.tlsFlushSync() < 0) { return -1; }
+            if (st < 0) {
+                this.lastError = "TLS step failed";
+                return -1;
+            }
+            if (this.tlsFlushSync() < 0) {
+                this.lastError = "TLS flush failed";
+                return -1;
+            }
             int avail = this.syncTls.AvailableAppData();
             if (avail > 0) {
                 int toRead = avail > want ? want : avail;
@@ -212,21 +218,24 @@ public partial class PgConnection : IDbConnection {
             }
             if (this.syncTls.IsClosed()) { return 0; }
             int n = Socket.Recv(this.sock, this.tlsIn, 65536);
-            if (n == -1) { continue; }
-            if (n <= 0) { return 0; }
+            if (n <= 0) { return n < 0 ? -1 : 0; }
             this.syncTls.FeedNetwork(this.tlsIn, 0, n);
         }
     }
 
-    // 同步 TLS 发：加密并冲刷。
+    // 同步 TLS 发：循环加密并冲刷全部字节（防单条 TLS 记录 16 KiB 短写截断）。
     int tlsSendSync(byte[] data, int len) {
-        int r = this.syncTls.SendAppData(data, 0, len);
-        if (r < 0) { return -1; }
-        if (this.tlsFlushSync() < 0) { return -1; }
+        int off = 0;
+        while (off < len) {
+            int r = this.syncTls.SendAppData(data, off, len - off);
+            if (r <= 0) { return -1; }
+            if (this.tlsFlushSync() < 0) { return -1; }
+            off = off + r;
+        }
         return len;
     }
 
-    // 恰好读取 need 字节到 dst 的 off 处；对端关闭返回不足。
+    // 恰好读取 need 字节到 dst 的 off 处；对端关闭或致命错误返回不足。
     int recvExactSync(byte[] dst, int off, int need) {
         if (this.syncTls == null && this.tls != null) {
             this.lastError = "cannot perform sync I/O on async TLS connection";
@@ -241,7 +250,6 @@ public partial class PgConnection : IDbConnection {
             } else {
                 n = Socket.Recv(this.sock, tmp, need - got);
             }
-            if (n == -1) { continue; }
             if (n <= 0) { return got; }
             NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
             got = got + n;
@@ -249,14 +257,28 @@ public partial class PgConnection : IDbConnection {
         return got;
     }
 
-    // 发原始字节（SSLRequest / Startup / TLS 密文）。
+    // 发原始字节（SSLRequest / Startup / TLS 密文），循环发送直至全部写出。
     int sendRawSync(byte[] buf, int len) {
         if (this.syncTls != null) { return this.tlsSendSync(buf, len); }
         if (this.tls != null) {
             this.lastError = "cannot perform sync I/O on async TLS connection";
             return -1;
         }
-        return Socket.Send(this.sock, buf, len);
+        int off = 0;
+        while (off < len) {
+            int rem = len - off;
+            int sent;
+            if (off == 0) {
+                sent = Socket.Send(this.sock, buf, rem);
+            } else {
+                byte[] tail = new byte[rem + 1];
+                NativeMemory.Copy((nint)tail, (nint)buf + (nint)off, rem);
+                sent = Socket.Send(this.sock, tail, rem);
+            }
+            if (sent <= 0) { return -1; }
+            off = off + sent;
+        }
+        return len;
     }
 
     // 发一条前端消息：类型字节 + 大端长度（含自身，不含类型）。

@@ -241,9 +241,23 @@ public class SqliteConnection : IDbConnection {
         if (rc != 0) { this.Fail(rc); }
         nint stmt = HandleFromBuf(ppStmt);
         if (stmt == 0) { return 0; }
-        // pzTail 非空 = 文本里还有第二条语句；或缓存已达上限/同一 SQL 正被并发占用——都按一次性语句处理。
+        // pzTail 指向 sql 中未被消耗的首字节（单条语句通常指向 NUL 终止符）；
+        // 仅当剩余尾部存在非空白字符（第二条语句）时才视为多语句不缓存。
+        nint tailPtr = HandleFromBuf(pzTail);
+        bool hasTrailing = false;
+        if (tailPtr != 0) {
+            long tailOff = (long)(tailPtr - (nint)sql);
+            if (tailOff >= 0 && tailOff < (long)sql.Length) {
+                for (int ti = (int)tailOff; ti < sql.Length; ti = ti + 1) {
+                    if ((sql[ti] & 255) > 32) {
+                        hasTrailing = true;
+                        break;
+                    }
+                }
+            }
+        }
         nint ignore = 0;
-        if (HandleFromBuf(pzTail) == 0
+        if (!hasTrailing
             && this.stmtCache.Count < SqliteConnection.MaxStmtCache
             && !this.stmtCache.TryGetValue(sql, out ignore)) {
             this.stmtCache.Add(sql, stmt);

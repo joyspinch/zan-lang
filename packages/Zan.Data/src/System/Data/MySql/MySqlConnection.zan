@@ -143,7 +143,13 @@ public partial class MySqlConnection : IDbConnection {
         if (this.tls != null) {
             return await this.tls.SendBytesAsync(buf, 0, totalBytes);
         }
-        return await Socket.SendAsync(this.sock, buf, totalBytes);
+        int off = 0;
+        while (off < totalBytes) {
+            int sent = await Socket.SendBytesAsync(this.sock, buf, off, totalBytes - off);
+            if (sent <= 0) { return -1; }
+            off = off + sent;
+        }
+        return totalBytes;
     }
 
     internal async int writePacket(string payload, int len, int seq) {
@@ -242,19 +248,40 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
+        if (der == null || derLen <= 0 || derLen > der.Length) { return null; }
         List<int> c = new List<int>(); c.Add(0);
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
-        c[0] = c[0] + 1; int algLen = MySqlWire.readDerLen(der, c); c[0] = c[0] + algLen;
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        if (c[0] >= derLen) { return null; }
         c[0] = c[0] + 1;
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
-        c[0] = c[0] + 1; int nLen = MySqlWire.readDerLen(der, c);
+        int outerLen = MySqlWire.readDerLen(der, c);
+        if (outerLen < 0 || c[0] + outerLen > derLen) { return null; }
+        if (c[0] >= derLen) { return null; }
+        c[0] = c[0] + 1;
+        int algLen = MySqlWire.readDerLen(der, c);
+        if (algLen < 0 || c[0] + algLen > derLen) { return null; }
+        c[0] = c[0] + algLen;
+        if (c[0] >= derLen) { return null; }
+        c[0] = c[0] + 1;
+        int bitLen = MySqlWire.readDerLen(der, c);
+        if (bitLen <= 0 || c[0] + bitLen > derLen) { return null; }
+        c[0] = c[0] + 1;
+        if (c[0] >= derLen) { return null; }
+        c[0] = c[0] + 1;
+        int innerLen = MySqlWire.readDerLen(der, c);
+        if (innerLen < 0 || c[0] + innerLen > derLen) { return null; }
+        if (c[0] >= derLen) { return null; }
+        c[0] = c[0] + 1;
+        int nLen = MySqlWire.readDerLen(der, c);
+        if (nLen <= 0 || c[0] + nLen > derLen) { return null; }
         int origStart = c[0];
         int nStart = origStart;
         int useLen = nLen;
-        if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
+        if (useLen > 0 && (der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
+        if (useLen <= 0) { return null; }
         c[0] = origStart + nLen;
-        c[0] = c[0] + 1; int eLen = MySqlWire.readDerLen(der, c);
+        if (c[0] >= derLen) { return null; }
+        c[0] = c[0] + 1;
+        int eLen = MySqlWire.readDerLen(der, c);
+        if (eLen <= 0 || c[0] + eLen > derLen) { return null; }
         int eStart = c[0];
         byte[] nBuf = new byte[useLen + 1];
         for (int i = 0; i < useLen; i = i + 1) { nBuf[i] = (byte)(der[nStart + i] & 255); }

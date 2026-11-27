@@ -206,6 +206,7 @@ public class BZip2Decoder {
 
     // 输出一个字节（输出缓冲写满时自动 FlushOut）。
     void Emit(int b) {
+        if (this.failed) { return; }
         this.outBuf[this.outPos] = (byte)(b & 255);
         this.outPos = this.outPos + 1;
         if (this.outPos == this.outBuf.Length) {
@@ -213,14 +214,19 @@ public class BZip2Decoder {
         }
     }
 
-    // 冲出输出缓冲：文件模式写盘（短写标记失败），内存模式累积成块。
+    // 冲出输出缓冲：文件模式写盘（短写标记失败），内存模式流式执行 2 GB 上限防解压炸弹 OOM。
     void FlushOut() {
-        if (this.outPos == 0) { return; }
+        if (this.outPos == 0 || this.failed) { return; }
         this.outTotal = this.outTotal + this.outPos;
         if (this.ofp != 0) {
             long w = BZip2Decoder.PlatFwrite(this.outBuf, 1, this.outPos, this.ofp);
             if (w != (long)this.outPos) { this.failed = true; }
         } else {
+            if (this.outTotal > 2147483000L) {
+                this.failed = true;
+                this.outPos = 0;
+                return;
+            }
             byte[] chunk = new byte[this.outPos];
             NativeMemory.Copy((nint)chunk, (nint)this.outBuf, this.outPos);
             this.memOut.Add(chunk);

@@ -206,8 +206,9 @@ public class ZstdBlockDecoder {
 
     // 解码一个压缩块：字面量段 + 序列段。
     void DecodeCompressed(byte[] data, int start, int end, int blockMax) {
+        int blockStart = this.sink.Length();
         int used = this.DecodeLiterals(data, start, end, blockMax);
-        this.DecodeSequences(data, start + used, end);
+        this.DecodeSequences(data, start + used, end, blockMax, blockStart);
     }
 
     // 解码字面量段。返回消耗的字节数。
@@ -355,7 +356,7 @@ public class ZstdBlockDecoder {
     }
 
     // 解码序列段并执行。
-    void DecodeSequences(byte[] data, int start, int end) {
+    void DecodeSequences(byte[] data, int start, int end, int blockMax, int blockStart) {
         if (start >= end) {
             throw new ZstdException(ZstdError.Truncated, "zstd: sequences section missing");
         }
@@ -381,7 +382,11 @@ public class ZstdBlockDecoder {
         }
         if (nbSeq == 0) {
             // 没有序列：整块内容就是字面量；FSE 表不更新
-            this.CopyLiterals(this.litLen - this.litPos);
+            int remLit = this.litLen - this.litPos;
+            if ((this.sink.Length() - blockStart) + remLit > blockMax) {
+                throw new ZstdException(ZstdError.BadBlock, "zstd: decoded block exceeds blockMax");
+            }
+            this.CopyLiterals(remLit);
             return;
         }
         if (pos >= end) {
@@ -403,7 +408,7 @@ public class ZstdBlockDecoder {
         this.mlTab = this.BuildSeqTable(ZstdSequences.ML, mlMode, data, pos, end, ref used);
         pos = pos + used;
         this.seqTabValid = true;
-        this.RunSequences(data, pos, end, nbSeq);
+        this.RunSequences(data, pos, end, nbSeq, blockMax, blockStart);
     }
 
     // 按模式建（或复用）一张序列码表；返回本次消耗的字节数。
@@ -435,8 +440,8 @@ public class ZstdBlockDecoder {
         return this.mlTab;
     }
 
-    // 解码并执行 nbSeq 条序列（内联 64 位反向位流寄存器并提升输出缓冲游标，消除每序列多次方法调用）。
-    void RunSequences(byte[] data, int start, int end, int nbSeq) {
+    // 解码并执行 nbSeq 条序列（内联 64 位反向位流寄存器并严格守卫下溢、尾余位与 blockMax 上限）。
+    void RunSequences(byte[] data, int start, int end, int nbSeq, int blockMax, int blockStart) {
         if (end <= start || end > data.Length || start < 0) {
             throw new ZstdException(ZstdError.BadSequences, "zstd: empty sequence bitstream");
         }
@@ -489,6 +494,9 @@ public class ZstdBlockDecoder {
         int llState = 0;
         int llLog = llFse.tableLog;
         if (llLog > 0) {
+            if (llLog > bitCount) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+            }
             llState = (int)(bitBuf >> (64 - llLog));
             if (llLog < bitCount) { bitBuf = bitBuf << llLog; bitCount = bitCount - llLog; }
             else { bitBuf = 0UL; bitCount = 0; }
@@ -496,6 +504,9 @@ public class ZstdBlockDecoder {
         int ofState = 0;
         int ofLog = ofFse.tableLog;
         if (ofLog > 0) {
+            if (ofLog > bitCount) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+            }
             ofState = (int)(bitBuf >> (64 - ofLog));
             if (ofLog < bitCount) { bitBuf = bitBuf << ofLog; bitCount = bitCount - ofLog; }
             else { bitBuf = 0UL; bitCount = 0; }
@@ -503,6 +514,9 @@ public class ZstdBlockDecoder {
         int mlState = 0;
         int mlLog = mlFse.tableLog;
         if (mlLog > 0) {
+            if (mlLog > bitCount) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+            }
             mlState = (int)(bitBuf >> (64 - mlLog));
             if (mlLog < bitCount) { bitBuf = bitBuf << mlLog; bitCount = bitCount - mlLog; }
             else { bitBuf = 0UL; bitCount = 0; }
@@ -549,6 +563,9 @@ public class ZstdBlockDecoder {
 
             int offset;
             if (ofBits > 1) {
+                if (ofBits > bitCount) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                }
                 long ofExtra = (long)(bitBuf >> (64 - ofBits));
                 if (ofBits < bitCount) { bitBuf = bitBuf << ofBits; bitCount = bitCount - ofBits; }
                 else { bitBuf = 0UL; bitCount = 0; }
@@ -565,6 +582,9 @@ public class ZstdBlockDecoder {
                 if (ll0 == 1) { r1 = r0; }
                 r0 = offset;
             } else {
+                if (bitCount < 1) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                }
                 int b1 = (int)(bitBuf >> 63);
                 if (1 < bitCount) { bitBuf = bitBuf << 1; bitCount = bitCount - 1; }
                 else { bitBuf = 0UL; bitCount = 0; }
@@ -608,12 +628,18 @@ public class ZstdBlockDecoder {
 
             int matchLen = mlBase[mlCode];
             if (mlBits > 0) {
+                if (mlBits > bitCount) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                }
                 matchLen = matchLen + (int)(bitBuf >> (64 - mlBits));
                 if (mlBits < bitCount) { bitBuf = bitBuf << mlBits; bitCount = bitCount - mlBits; }
                 else { bitBuf = 0UL; bitCount = 0; }
             }
             int litLen = llBaseV;
             if (llBits > 0) {
+                if (llBits > bitCount) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                }
                 litLen = litLen + (int)(bitBuf >> (64 - llBits));
                 if (llBits < bitCount) { bitBuf = bitBuf << llBits; bitCount = bitCount - llBits; }
                 else { bitBuf = 0UL; bitCount = 0; }
@@ -638,6 +664,9 @@ public class ZstdBlockDecoder {
                 }
                 int nb1 = llNb[llState];
                 if (nb1 > 0) {
+                    if (nb1 > bitCount) {
+                        throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                    }
                     llState = llNs[llState] + (int)(bitBuf >> (64 - nb1));
                     if (nb1 < bitCount) { bitBuf = bitBuf << nb1; bitCount = bitCount - nb1; }
                     else { bitBuf = 0UL; bitCount = 0; }
@@ -646,6 +675,9 @@ public class ZstdBlockDecoder {
                 }
                 int nb2 = mlNb[mlState];
                 if (nb2 > 0) {
+                    if (nb2 > bitCount) {
+                        throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                    }
                     mlState = mlNs[mlState] + (int)(bitBuf >> (64 - nb2));
                     if (nb2 < bitCount) { bitBuf = bitBuf << nb2; bitCount = bitCount - nb2; }
                     else { bitBuf = 0UL; bitCount = 0; }
@@ -654,6 +686,9 @@ public class ZstdBlockDecoder {
                 }
                 int nb3 = ofNb[ofState];
                 if (nb3 > 0) {
+                    if (nb3 > bitCount) {
+                        throw new ZstdException(ZstdError.Truncated, "zstd: sequence bitstream truncated");
+                    }
                     ofState = ofNs[ofState] + (int)(bitBuf >> (64 - nb3));
                     if (nb3 < bitCount) { bitBuf = bitBuf << nb3; bitCount = bitCount - nb3; }
                     else { bitBuf = 0UL; bitCount = 0; }
@@ -662,11 +697,14 @@ public class ZstdBlockDecoder {
                 }
             }
 
-            // 合并容量检查与内联字面量 + 匹配拷贝
+            // 合并容量检查与内联字面量 + 匹配拷贝，并严格校验 blockMax 解压输出上限。
             if (litLen < 0 || lp + litLen > litTotal) {
                 throw new ZstdException(ZstdError.BadSequences, "zstd: literals exhausted");
             }
             int needOut = litLen + matchLen;
+            if ((long)(dst - blockStart) + (long)needOut > (long)blockMax) {
+                throw new ZstdException(ZstdError.BadBlock, "zstd: decoded block exceeds blockMax");
+            }
             if (needOut > rawCap - dst) {
                 this.sink.SetLength(dst);
                 this.sink.Ensure(needOut);
@@ -709,13 +747,20 @@ public class ZstdBlockDecoder {
             }
             dst = dst + matchLen;
         }
+        if (bp >= start || bitCount != 0) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: sequence bitstream has trailing unread bits");
+        }
         this.sink.SetLength(dst);
         this.litPos = lp;
         this.rep0 = r0;
         this.rep1 = r1;
         this.rep2 = r2;
-        // 剩下的字面量直接追加
-        this.CopyLiterals(this.litLen - this.litPos);
+        // 剩下的字面量直接追加并再次校验 blockMax 上限
+        int remLit = this.litLen - this.litPos;
+        if ((long)(dst - blockStart) + (long)remLit > (long)blockMax) {
+            throw new ZstdException(ZstdError.BadBlock, "zstd: decoded block exceeds blockMax");
+        }
+        this.CopyLiterals(remLit);
     }
 
     // 从字面量缓冲复制 n 字节到输出（短片段内联拷贝，长片段走 NativeMemory.Copy）。
