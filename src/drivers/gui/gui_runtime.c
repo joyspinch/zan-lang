@@ -1276,6 +1276,38 @@ const zan_gui_backend zan_cpu_backend = {
 #include "gui_gl_backend.c"
 #include "gui_metal_backend.h"
 
+/* 平台文字光栅器（gui_runtime_mac.m 的 CoreText，另一个 TU）画字的唯一入口：
+ * 把已光栅化的 A8 覆盖度串存进共享图集，再走 surface 当前后端的 glyph_run。
+ * 绝不能直接写 s->pixels——GPU 后端（GL）下 FBO 才是权威，CPU 像素既不会
+ * 上传、下次回读还会被整屏覆盖，于是 macOS 默认 Auto(GL) 下全部文字消失。
+ * key/key_len 标识这串文字，key_size 由调用方折入字号/粗细/角度；(x, y) 是
+ * 覆盖度左上角的目标坐标（已含偏移）。裁剪由 glyph_run 按 surface 裁剪窗处理。 */
+void zan_gui_internal_draw_coverage(i64 id, const char *key, int key_len,
+                                    int key_size, int x, int y, int w, int h,
+                                    const unsigned char *cov, u32 color) {
+  if (id < 0 || id >= g_surface_count || !g_surfaces[id])
+    return;
+  if (!key || key_len <= 0 || !cov || w <= 0 || h <= 0)
+    return;
+  zan_surface_t *s = g_surfaces[id];
+  const zan_glyph_tile *tile =
+      zan_atlas_find(ZAN_TILE_HOST_RUN, key_size, key, key_len);
+  if (!tile)
+    tile = zan_atlas_store(ZAN_TILE_HOST_RUN, key_size, key, key_len, w, h, 0,
+                           0, w, cov, 1);
+  if (!tile)
+    return;
+  zan_glyph_item item;
+  item.tile = tile;
+  item.x = x;
+  item.y = y;
+  zan_glyph_run run;
+  run.color = color;
+  run.count = 1;
+  run.items = &item;
+  ZAN_IMPL(s, glyph_run)->glyph_run(s, &run);
+}
+
 EXPORT i32 zan_gui_set_render_backend(i32 mode) {
   const zan_gui_backend *be = NULL;
   if (mode == 1 || mode == 2) {

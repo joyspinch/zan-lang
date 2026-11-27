@@ -1,0 +1,291 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Animation;
+using Game.Assets;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DScenePipelineTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static void WriteU32(List<byte> buf, uint v) {
+        buf.Add((byte)(v & 255u));
+        buf.Add((byte)((v >> 8) & 255u));
+        buf.Add((byte)((v >> 16) & 255u));
+        buf.Add((byte)((v >> 24) & 255u));
+    }
+
+    private static void WriteU16(List<byte> buf, int v) {
+        buf.Add((byte)(v & 255));
+        buf.Add((byte)((v >> 8) & 255));
+    }
+
+    private static void WriteF32(List<byte> buf, float f) {
+        WriteU32(buf, (uint)BitConverter.SingleToInt32Bits(f));
+    }
+
+    private static void Pad4(List<byte> buf, byte padByte) {
+        while ((buf.Count & 3) != 0) { buf.Add(padByte); }
+    }
+
+    // 构造含 1 个蒙皮阻挡板 + 1 个半透明玻璃（BLEND）的 GLB，带 2 骨骼平移动画。
+    private static byte[] BuildMultiLayerGlb() {
+        List<byte> bin = new List<byte>();
+
+        // BV 0: Skinned quad (4 verts, [-0.6..0.6] x [-0.6..0.6], z = 0)
+        int offPos0 = bin.Count;
+        WriteF32(bin, -0.6f); WriteF32(bin, -0.6f); WriteF32(bin, 0.0f);
+        WriteF32(bin,  0.6f); WriteF32(bin, -0.6f); WriteF32(bin, 0.0f);
+        WriteF32(bin,  0.6f); WriteF32(bin,  0.6f); WriteF32(bin, 0.0f);
+        WriteF32(bin, -0.6f); WriteF32(bin,  0.6f); WriteF32(bin, 0.0f);
+        int lenPos0 = bin.Count - offPos0;
+
+        // BV 1: NORMAL (4 verts, +Z)
+        int offNrm = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        }
+        int lenNrm = bin.Count - offNrm;
+
+        // BV 2: JOINTS_0 (all bound to bone 1)
+        int offJnt = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            bin.Add(1); bin.Add(0); bin.Add(0); bin.Add(0);
+        }
+        int lenJnt = bin.Count - offJnt;
+
+        // BV 3: WEIGHTS_0
+        int offWgt = bin.Count;
+        for (int i = 0; i < 4; i = i + 1) {
+            WriteF32(bin, 1.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        }
+        int lenWgt = bin.Count - offWgt;
+
+        // BV 4: INDICES (6 ushorts)
+        int offIdx = bin.Count;
+        WriteU16(bin, 0); WriteU16(bin, 1); WriteU16(bin, 2);
+        WriteU16(bin, 0); WriteU16(bin, 2); WriteU16(bin, 3);
+        int lenIdx = bin.Count - offIdx;
+        Pad4(bin, 0);
+
+        // BV 5: Glass quad covering left side X in [-2.8, -1.2], Y in [-1.5, 1.5], Z = 1.5
+        int offPos1 = bin.Count;
+        WriteF32(bin, -2.8f); WriteF32(bin, -1.5f); WriteF32(bin, 1.5f);
+        WriteF32(bin, -1.2f); WriteF32(bin, -1.5f); WriteF32(bin, 1.5f);
+        WriteF32(bin, -1.2f); WriteF32(bin,  1.5f); WriteF32(bin, 1.5f);
+        WriteF32(bin, -2.8f); WriteF32(bin,  1.5f); WriteF32(bin, 1.5f);
+        int lenPos1 = bin.Count - offPos1;
+
+        // BV 6: Anim times [0.0, 1.0]
+        int offTimes = bin.Count;
+        WriteF32(bin, 0.0f); WriteF32(bin, 1.0f);
+        int lenTimes = bin.Count - offTimes;
+
+        // BV 7: Anim translation [(0,0,0), (1.8,0,0)]
+        int offTrans = bin.Count;
+        WriteF32(bin, 0.0f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        WriteF32(bin, 1.8f); WriteF32(bin, 0.0f); WriteF32(bin, 0.0f);
+        int lenTrans = bin.Count - offTrans;
+        Pad4(bin, 0);
+
+        string json = "{"
+            + "\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":" + bin.Count.ToString() + "}],"
+            + "\"bufferViews\":["
+            + "{\"buffer\":0,\"byteOffset\":" + offPos0.ToString() + ",\"byteLength\":" + lenPos0.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offNrm.ToString() + ",\"byteLength\":" + lenNrm.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offJnt.ToString() + ",\"byteLength\":" + lenJnt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offWgt.ToString() + ",\"byteLength\":" + lenWgt.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offIdx.ToString() + ",\"byteLength\":" + lenIdx.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offPos1.ToString() + ",\"byteLength\":" + lenPos1.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offTimes.ToString() + ",\"byteLength\":" + lenTimes.ToString() + "},"
+            + "{\"buffer\":0,\"byteOffset\":" + offTrans.ToString() + ",\"byteLength\":" + lenTrans.ToString() + "}"
+            + "],"
+            + "\"accessors\":["
+            + "{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":2,\"componentType\":5121,\"count\":4,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":3,\"componentType\":5126,\"count\":4,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":4,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},"
+            + "{\"bufferView\":5,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"
+            + "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}"
+            + "],"
+            + "\"materials\":["
+            + "{\"name\":\"hero_mat\",\"alphaMode\":\"OPAQUE\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.2,0.85,0.3,1.0]}},"
+            + "{\"name\":\"glass_mat\",\"alphaMode\":\"BLEND\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,0.0,0.0,0.5]}}"
+            + "],"
+            + "\"meshes\":["
+            + "{\"name\":\"hero\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"JOINTS_0\":2,\"WEIGHTS_0\":3},\"indices\":4,\"material\":0}]},"
+            + "{\"name\":\"glass\",\"primitives\":[{\"attributes\":{\"POSITION\":5,\"NORMAL\":1},\"indices\":4,\"material\":1}]}"
+            + "],"
+            + "\"nodes\":["
+            + "{\"name\":\"root\",\"children\":[1],\"translation\":[0,0,0]},"
+            + "{\"name\":\"mover\",\"translation\":[0,0,0]}"
+            + "],"
+            + "\"skins\":[{\"joints\":[0,1]}],"
+            + "\"animations\":[{\"name\":\"MoveRight\","
+            + "\"samplers\":[{\"input\":6,\"output\":7,\"interpolation\":\"LINEAR\"}],"
+            + "\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}}]}]"
+            + "}";
+
+        byte[] jsonRaw = Encoding.UTF8.GetBytes(json);
+        List<byte> jsonChunk = new List<byte>();
+        for (int i = 0; i < jsonRaw.Length; i = i + 1) { jsonChunk.Add(jsonRaw[i]); }
+        Pad4(jsonChunk, 32);
+
+        uint totalLen = (uint)(12 + 8 + jsonChunk.Count + 8 + bin.Count);
+        List<byte> glb = new List<byte>();
+        WriteU32(glb, 0x46546C67u);
+        WriteU32(glb, 2u);
+        WriteU32(glb, totalLen);
+        WriteU32(glb, (uint)jsonChunk.Count);
+        WriteU32(glb, 0x4E4F534Au);
+        for (int i = 0; i < jsonChunk.Count; i = i + 1) { glb.Add(jsonChunk[i]); }
+        WriteU32(glb, (uint)bin.Count);
+        WriteU32(glb, 0x004E4942u);
+        for (int i = 0; i < bin.Count; i = i + 1) { glb.Add(bin[i]); }
+        return glb.ToArray();
+    }
+
+    private static Mesh3D MakeQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int Lum(int argb) {
+        return (((argb >> 16) & 255) + ((argb >> 8) & 255) + (argb & 255)) / 3;
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 1. GltfModel.InstantiateScene 一键生成场景树（含蒙皮不透明节点 + BLEND 透明节点）
+        byte[] glb = BuildMultiLayerGlb();
+        GltfModel model = GltfLoader.LoadGlb(glb);
+        SceneNode gltfRoot = model.InstantiateScene(cv, "pipe");
+        bool instOk = gltfRoot.Children.Count == 2
+            && gltfRoot.Children[0].IsSkinned && gltfRoot.Children[0].Layer == 0
+            && gltfRoot.Children[0].Skeleton == model.Skeleton
+            && !gltfRoot.Children[1].IsSkinned && gltfRoot.Children[1].Layer == 1
+            && !gltfRoot.Children[1].CastShadow;
+        Console.WriteLine("gltf-instantiate-scene: " + Convert.ToString(instOk ? 1 : 0));
+
+        // 2. 组装完整商业多 Pass 场景：白色接收背板 + 蒙皮投射体 + 半透明红色玻璃 + 远近遮挡测试体
+        SceneNode world = new SceneNode("world");
+
+        int wallMesh = cv.MeshUpload(MakeQuad(4.0f, 4.0f));
+        SceneNode wall = new SceneNode("wall");
+        wall.MeshKey = wallMesh;
+        wall.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        wall.SetPosition(0.0f, 0.0f, -2.0f);
+        wall.BoundsRadius = 8.0f;
+        wall.CastShadow = false;
+        wall.ReceiveShadow = true;
+        world.AddChild(wall);
+
+        // 远近 24-bit 共享深度遮挡测试（放在下方 y=-2.0，近处纯蓝 Z=-0.5，远处纯绿 Z=-1.5，故意把远处排后绘制）
+        int smallQuad = cv.MeshUpload(MakeQuad(0.6f, 0.5f));
+        SceneNode nearBlue = new SceneNode("near_blue");
+        nearBlue.MeshKey = smallQuad;
+        nearBlue.Material = Material.Solid(0.0f, 0.1f, 1.0f);
+        nearBlue.SetPosition(0.0f, -2.0f, -0.5f);
+        nearBlue.CastShadow = false;
+        nearBlue.ReceiveShadow = false;
+        world.AddChild(nearBlue);
+
+        SceneNode farGreen = new SceneNode("far_green");
+        farGreen.MeshKey = smallQuad;
+        farGreen.Material = Material.Solid(0.0f, 1.0f, 0.1f);
+        farGreen.SetPosition(0.0f, -2.0f, -1.5f);
+        farGreen.CastShadow = false;
+        farGreen.ReceiveShadow = false;
+        world.AddChild(farGreen);
+
+        // 挂载 GLB 实例化子树（hero 在 Z=0 投射阴影，glass 在 Z=+1.5 盖住左侧白墙）
+        gltfRoot.SetPosition(0.0f, 0.0f, 0.0f);
+        world.AddChild(gltfRoot);
+
+        // 正交相机覆盖 X,Y in [-3.2, +3.2]，向 -Z 观察；方向光略斜射（使阴影与投射体在墙上错位便于观测阴影！）
+        Camera3D cam = new Camera3D();
+        cam.Orthographic = true;
+        cam.OrthoHeight = 3.2f;
+        cam.AspectRatio = 1.0f;
+        cam.Position = new Vector3(0.0f, 0.0f, 5.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.NearPlane = 0.1f;
+        cam.FarPlane = 20.0f;
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.18f;
+        plan.AmbientGreen = 0.18f;
+        plan.AmbientBlue = 0.18f;
+        // 光线沿 (0.5, 0, -1) 射向 -Z 和 +X：位于 Z=0, X=0 的 hero 会在 Z=-2 的白墙上向 +X 偏 +1.0 处投下清晰阴影！
+        plan.Lights.Add(Light.DirectionalLight(0.85f, 0.85f, 0.85f, 1.0f, new Vector3(0.5f, 0.0f, -1.0f)));
+
+        Renderer3D renderer = new Renderer3D(64);
+        renderer.EnableShadows = true;
+        renderer.ShadowMapSize = 512;
+        renderer.ShadowBounds = 5.0f;
+        renderer.ShadowDistance = 10.0f;
+        renderer.ShadowFocus = new Vector3(0.0f, 0.0f, -1.0f);
+
+        // Frame 1 (t = 0.0): hero 在 X=0 -> 阴影落在墙上 X=+1.0（像素 x ≈ 84, y = 64）
+        AnimationClip clip = model.FindAnimation("MoveRight");
+        PoseBuffer poseBuf = new PoseBuffer(model.Skeleton.Count());
+        clip.ApplyTo(model.Skeleton, 0.0f, poseBuf);
+        plan.Build(world);
+        cv.Clear(unchecked((int)0xFF000000));
+        int ok0 = renderer.Draw(cv, plan);
+
+        // 采样1：透明红玻璃覆盖左侧白墙（X=-2.0 -> 像素 x ≈ 24, y = 64）-> 红高于绿且保留白色底色（真 Alpha 混合）
+        int pxGlass = zan_gui_read_pixel(cv.SurfaceId(), 24, 64);
+        int gr = (pxGlass >> 16) & 255;
+        int gg = (pxGlass >> 8) & 255;
+        bool blendOk = gr > gg + 50 && gg > 60;
+
+        // 采样2：共享 24-bit 深度遮挡（y = -2.0 经 GL 翻转后位于像素 x = 64, y = 24）-> 蓝色近景遮挡住后画的绿色远景
+        int pxDepth = zan_gui_read_pixel(cv.SurfaceId(), 64, 24);
+        int dg = (pxDepth >> 8) & 255;
+        int db = pxDepth & 255;
+        bool depthOk = db > dg + 80;
+
+        // 采样3：t=0 时墙上阴影区 (x=84, y=64) 明显暗于右侧受光区 (x=114, y=64)
+        int lumShadowT0 = Lum(zan_gui_read_pixel(cv.SurfaceId(), 84, 64));
+        int lumLitT0 = Lum(zan_gui_read_pixel(cv.SurfaceId(), 114, 64));
+
+        // Frame 2 (t = 1.0): 动画把 hero 移到 X=+1.8 -> 阴影随之右移到 X=+2.8（x ≈ 114），原 X=+1.0（x ≈ 84）恢复受光！
+        clip.ApplyTo(model.Skeleton, 1.0f, poseBuf);
+        plan.Build(world);
+        cv.Clear(unchecked((int)0xFF000000));
+        int ok1 = renderer.Draw(cv, plan);
+
+        int lumShadowT1 = Lum(zan_gui_read_pixel(cv.SurfaceId(), 84, 64));
+        int lumLitT1 = Lum(zan_gui_read_pixel(cv.SurfaceId(), 114, 64));
+
+        bool shadowMovedOk = ok0 == 1 && ok1 == 1
+            && (lumLitT0 > lumShadowT0 + 35)
+            && (lumShadowT1 > lumShadowT0 + 35)
+            && (lumLitT0 > lumLitT1 + 35);
+
+        Console.WriteLine("renderer3d-multipass-blend: " + Convert.ToString(blendOk ? 1 : 0));
+        Console.WriteLine("renderer3d-multipass-depth: " + Convert.ToString(depthOk ? 1 : 0));
+        Console.WriteLine("renderer3d-multipass-shadow: " + Convert.ToString(shadowMovedOk ? 1 : 0));
+
+        renderer.Dispose();
+        cv.Destroy();
+    }
+}

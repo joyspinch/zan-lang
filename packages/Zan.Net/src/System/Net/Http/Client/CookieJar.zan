@@ -7,10 +7,68 @@ namespace System.Net.Http.Client;
 // <c>expires</c> 为 0 表示会话 cookie（进程内一直有效）。
 public class CookieJar {
     private List<Cookie> items;
+    private int expiringCount;
 
     // 内部构造：空存储；经 HttpClient.UseCookies() 创建。
     public CookieJar() {
         this.items = new List<Cookie>();
+        this.expiringCount = 0;
+    }
+
+    private static bool IsTrimWs(int c) {
+        return c == 32 || (c >= 9 && c <= 13);
+    }
+
+    // ASCII 快速转小写：已全小写时零分配原样返回。
+    private static string ToLowerFast(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        int n = s.Length;
+        nint sp = (nint)s;
+        Span<byte> sb = new Span<byte>(sp, n);
+        int firstUpper = -1;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = sb[i] & 255;
+            if (c >= 65 && c <= 90) { firstUpper = i; break; }
+        }
+        if (firstUpper < 0) { return s; }
+        byte[] buf = new byte[n];
+        if (firstUpper > 0) { NativeMemory.Copy((nint)buf, sp, firstUpper); }
+        for (int i = firstUpper; i < n; i = i + 1) {
+            int c = sb[i] & 255;
+            buf[i] = (byte)((c >= 65 && c <= 90) ? (c + 32) : c);
+        }
+        return NativeMemory.GetString((nint)buf, 0, n);
+    }
+
+    private static string ToLowerSlice(nint sp, Span<byte> sb, int start, int len) {
+        if (len <= 0) { return ""; }
+        int firstUpper = -1;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = sb[start + i] & 255;
+            if (c >= 65 && c <= 90) { firstUpper = i; break; }
+        }
+        if (firstUpper < 0) { return NativeMemory.GetString(sp, start, len); }
+        byte[] buf = new byte[len];
+        if (firstUpper > 0) { NativeMemory.Copy((nint)buf, sp + (nint)start, firstUpper); }
+        for (int i = firstUpper; i < len; i = i + 1) {
+            int c = sb[start + i] & 255;
+            buf[i] = (byte)((c >= 65 && c <= 90) ? (c + 32) : c);
+        }
+        return NativeMemory.GetString((nint)buf, 0, len);
+    }
+
+    private static bool EqLowerSlice(Span<byte> sb, int start, int len, string lower) {
+        if (len != lower.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            int c = sb[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lower[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    private static long NowUnixSeconds() {
+        return DateTime.GetCurrentUnixMilliseconds() / 1000L;
     }
 
     // 已存储的 cookie 条数（过期的不计）。
@@ -22,7 +80,8 @@ public class CookieJar {
     // 按名字取值，没有则返回空串。
     public string Get(string name) {
         this.DropExpired();
-        for (int i = 0; i < this.items.Count; i = i + 1) {
+        int n = this.items.Count;
+        for (int i = 0; i < n; i = i + 1) {
             if (this.items[i].Name() == name) { return this.items[i].Value(); }
         }
         return "";
@@ -30,8 +89,12 @@ public class CookieJar {
 
     // 按名字删除，删掉了返回 true。
     public bool Remove(string name) {
-        for (int i = 0; i < this.items.Count; i = i + 1) {
+        int n = this.items.Count;
+        for (int i = 0; i < n; i = i + 1) {
             if (this.items[i].Name() == name) {
+                if (this.items[i].Expires() > 0) {
+                    this.expiringCount = this.expiringCount - 1;
+                }
                 this.items.RemoveAt(i);
                 return true;
             }
@@ -42,6 +105,7 @@ public class CookieJar {
     // 清空存储。
     public void Clear() {
         this.items.Clear();
+        this.expiringCount = 0;
     }
 
     // 吸收一条 Set-Cookie 头的值（不含头名字），<paramref name="host"/> 和
@@ -49,77 +113,129 @@ public class CookieJar {
     // 缺失的 Domain / Path。Max-Age=0 或已过去的 Expires 表示删除，
     // 同名同域同路径的旧值被覆盖。
     public void SetCookie(string host, string requestPath, string setCookieValue) {
-        int semi = CookieJar.IndexOfChar(setCookieValue, 59, 0);
-        string pair = setCookieValue;
-        if (semi >= 0) { pair = setCookieValue.Substring(0, semi); }
-        int eq = CookieJar.IndexOfChar(pair, 61, 0);
-        if (eq <= 0) { return; }
-        string name = pair.Substring(0, eq).Trim();
-        if (name.Length == 0) { return; }
-        string h = host != null ? host.ToLower() : "";
-        Cookie c = new Cookie(name,
-            pair.Substring(eq + 1, pair.Length - eq - 1).Trim());
+        if (setCookieValue == null || setCookieValue.Length == 0) { return; }
+        string h = CookieJar.ToLowerFast(host);
+        string defPath = CookieJar.DefaultPath(requestPath);
+        int n = setCookieValue.Length;
+        nint sp = (nint)setCookieValue;
+        this.SetCookieSlice(h, defPath, sp, new Span<byte>(sp, n), 0, n);
+    }
+
+    // 零子串原地解析单条 Set-Cookie 值切片 [valStart, valEnd)。
+    private void SetCookieSlice(string h, string defPath, nint sp, Span<byte> sb, int valStart, int valEnd) {
+        int semi = NativeMemory.Find(sp, valStart, 59, valEnd - valStart); // ';'
+        int pairEnd = semi >= 0 ? semi : valEnd;
+        int eq = NativeMemory.Find(sp, valStart, 61, pairEnd - valStart); // '='
+        if (eq <= valStart) { return; }
+
+        int ns = valStart;
+        int ne = eq;
+        while (ns < ne && CookieJar.IsTrimWs(sb[ns] & 255)) { ns = ns + 1; }
+        while (ne > ns && CookieJar.IsTrimWs(sb[ne - 1] & 255)) { ne = ne - 1; }
+        if (ns >= ne) { return; }
+
+        int vs = eq + 1;
+        int ve = pairEnd;
+        while (vs < ve && CookieJar.IsTrimWs(sb[vs] & 255)) { vs = vs + 1; }
+        while (ve > vs && CookieJar.IsTrimWs(sb[ve - 1] & 255)) { ve = ve - 1; }
+
+        string name = NativeMemory.GetString(sp, ns, ne - ns);
+        string val = vs < ve ? NativeMemory.GetString(sp, vs, ve - vs) : "";
+        Cookie c = new Cookie(name, val);
         c.domain = h;
-        c.path = CookieJar.DefaultPath(requestPath);
+        c.path = defPath;
 
         bool deleted = false;
+        long nowCache = 0L;
         int pos = semi;
-        while (pos >= 0) {
-            int next = CookieJar.IndexOfChar(setCookieValue, 59, pos + 1);
-            int end = next;
-            if (end < 0) { end = setCookieValue.Length; }
-            string attr = setCookieValue.Substring(pos + 1, end - pos - 1).Trim();
+        while (pos >= 0 && pos < valEnd) {
+            int next = NativeMemory.Find(sp, pos + 1, 59, valEnd - (pos + 1));
+            int segEnd = next >= 0 ? next : valEnd;
+            int as0 = pos + 1;
+            int ae0 = segEnd;
             pos = next;
-            if (attr.Length == 0) { continue; }
-            int aeq = CookieJar.IndexOfChar(attr, 61, 0);
-            string aname = attr;
-            string aval = "";
+            while (as0 < ae0 && CookieJar.IsTrimWs(sb[as0] & 255)) { as0 = as0 + 1; }
+            while (ae0 > as0 && CookieJar.IsTrimWs(sb[ae0 - 1] & 255)) { ae0 = ae0 - 1; }
+            if (as0 >= ae0) { continue; }
+
+            int aeq = NativeMemory.Find(sp, as0, 61, ae0 - as0);
+            int ks = as0;
+            int ke = aeq >= 0 ? aeq : ae0;
+            while (ke > ks && CookieJar.IsTrimWs(sb[ke - 1] & 255)) { ke = ke - 1; }
+            int klen = ke - ks;
+
+            int avs = aeq >= 0 ? aeq + 1 : ae0;
+            int ave = ae0;
             if (aeq >= 0) {
-                aname = attr.Substring(0, aeq).Trim();
-                aval = attr.Substring(aeq + 1, attr.Length - aeq - 1).Trim();
+                while (avs < ave && CookieJar.IsTrimWs(sb[avs] & 255)) { avs = avs + 1; }
             }
-            string lower = aname.ToLower();
-            if (lower == "path" && aval.Length > 0 && (aval[0] & 255) == 47) {
-                c.path = aval;
-            } else if (lower == "domain" && aval.Length > 0) {
-                string d = aval.ToLower();
-                if ((d[0] & 255) == 46) { d = d.Substring(1, d.Length - 1); }
-                // 没有可维护的 PSL 时无法判定 co.uk 等多标签公共后缀。
-                // 只接受与响应主机完全相同的 Domain；父域一律拒绝，
-                // 而不是用不完整的后缀硬编码名单放行跨主机种植。
-                if (!CookieJar.DomainAttributeOk(h, d)) {
-                    return;
+            int avlen = ave - avs;
+
+            if (klen == 4 && CookieJar.EqLowerSlice(sb, ks, 4, "path")) {
+                if (avlen > 0 && (sb[avs] & 255) == 47) {
+                    c.path = NativeMemory.GetString(sp, avs, avlen);
                 }
-                // 也不把完全相同的 Domain 扩展到子域：响应主机本身
-                // 可能就是公共后缀，缺少 PSL 时不能安全地识别例外。
-                c.domain = d;
-                c.hostOnly = true;
-            } else if (lower == "secure") {
-                c.secure = true;
-            } else if (lower == "httponly") {
+            } else if (klen == 6) {
+                int fc = sb[ks] & 255;
+                if (fc >= 65 && fc <= 90) { fc = fc + 32; }
+                if (fc == 100 && CookieJar.EqLowerSlice(sb, ks, 6, "domain")) {
+                    if (avlen > 0) {
+                        int ds = avs;
+                        int dlen = avlen;
+                        if ((sb[ds] & 255) == 46) { ds = ds + 1; dlen = dlen - 1; }
+                        string d = CookieJar.ToLowerSlice(sp, sb, ds, dlen);
+                        if (!CookieJar.DomainAttributeOk(h, d)) {
+                            return;
+                        }
+                        c.domain = d;
+                        c.hostOnly = true;
+                    }
+                } else if (fc == 115 && CookieJar.EqLowerSlice(sb, ks, 6, "secure")) {
+                    c.secure = true;
+                }
+            } else if (klen == 8 && CookieJar.EqLowerSlice(sb, ks, 8, "httponly")) {
                 c.httpOnly = true;
-            } else if (lower == "max-age") {
-                long age = CookieJar.ParseLong(aval);
-                if (age <= 0) { deleted = true; }
-                else { c.expires = DateTime.UtcNow().ToUnixSeconds() + age; }
-            } else if (lower == "expires") {
-                long at = CookieJar.ParseHttpDate(aval);
-                if (at > 0) {
-                    if (at <= DateTime.UtcNow().ToUnixSeconds()) { deleted = true; }
-                    else { c.expires = at; }
+            } else if (klen == 7) {
+                int fc = sb[ks] & 255;
+                if (fc >= 65 && fc <= 90) { fc = fc + 32; }
+                if (fc == 109 && CookieJar.EqLowerSlice(sb, ks, 7, "max-age")) {
+                    long age = CookieJar.ParseLongSlice(sb, avs, ave);
+                    if (age <= 0) { deleted = true; }
+                    else {
+                        if (nowCache == 0L) { nowCache = CookieJar.NowUnixSeconds(); }
+                        c.expires = nowCache + age;
+                    }
+                } else if (fc == 101 && CookieJar.EqLowerSlice(sb, ks, 7, "expires")) {
+                    long at = CookieJar.ParseHttpDateSlice(sb, avs, ave);
+                    if (at > 0) {
+                        if (nowCache == 0L) { nowCache = CookieJar.NowUnixSeconds(); }
+                        if (at <= nowCache) { deleted = true; }
+                        else { c.expires = at; }
+                    }
                 }
             }
         }
 
-        for (int i = 0; i < this.items.Count; i = i + 1) {
+        int cnt = this.items.Count;
+        string cName = c.name;
+        string cDomain = c.domain;
+        string cPath = c.path;
+        for (int i = 0; i < cnt; i = i + 1) {
             Cookie old = this.items[i];
-            if (old.Name() == c.Name() && old.Domain() == c.Domain()
-                    && old.Path() == c.Path()) {
+            if (old.name == cName && old.domain == cDomain && old.path == cPath) {
+                if (old.expires > 0) {
+                    this.expiringCount = this.expiringCount - 1;
+                }
                 this.items.RemoveAt(i);
                 break;
             }
         }
-        if (!deleted) { this.items.Add(c); }
+        if (!deleted) {
+            this.items.Add(c);
+            if (c.expires > 0) {
+                this.expiringCount = this.expiringCount + 1;
+            }
+        }
     }
 
     // 该请求应带的 Cookie 头值（"a=1; b=2"），没有匹配的 cookie 则为空串。
@@ -127,99 +243,181 @@ public class CookieJar {
     // 顺序按 RFC 6265：路径长的在前，同长度按写入顺序。
     public string HeaderValue(string host, string requestPath, bool secureChannel) {
         this.DropExpired();
-        string h = host != null ? host.ToLower() : "";
-        string p = CookieJar.PathOnly(requestPath);
-        List<Cookie> hit = new List<Cookie>();
-        for (int i = 0; i < this.items.Count; i = i + 1) {
-            Cookie c = this.items[i];
-            if (c.Secure() && !secureChannel) { continue; }
-            if (!CookieJar.DomainMatches(h, c.Domain(), c.hostOnly)) { continue; }
-            if (!CookieJar.PathMatches(p, c.Path())) { continue; }
-            hit.Add(c);
+        int n = this.items.Count;
+        if (n == 0) { return ""; }
+        string h = CookieJar.ToLowerFast(host);
+
+        // 零分配计算路径切片长度（剥离 '?' / '#'）
+        int pLen = 0;
+        string pSrc = "/";
+        if (requestPath != null && requestPath.Length > 0) {
+            int rl = requestPath.Length;
+            nint rp = (nint)requestPath;
+            int cut = NativeMemory.IndexOfAny(rp, rl, 63, 35); // '?' or '#'
+            if (cut < 0) { cut = rl; }
+            if (cut > 0) {
+                pSrc = requestPath;
+                pLen = cut;
+            } else {
+                pLen = 1;
+            }
+        } else {
+            pLen = 1;
         }
+
+        Span<byte> hSpan = h.Length > 0 ? new Span<byte>((nint)h, h.Length) : new Span<byte>(0, 0);
+        Span<byte> pSpan = new Span<byte>((nint)pSrc, pLen);
+
+        Cookie[] hit = null;
+        int hc = 0;
+        Cookie firstHit = null;
+        for (int i = 0; i < n; i = i + 1) {
+            Cookie c = this.items[i];
+            if (c.secure && !secureChannel) { continue; }
+            if (!CookieJar.DomainMatchesSpan(h, hSpan, c.domain, c.hostOnly)) { continue; }
+            if (!CookieJar.PathMatchesSpan(pSpan, pLen, c.path)) { continue; }
+            if (firstHit == null) {
+                firstHit = c;
+            } else {
+                if (hit == null) {
+                    hit = new Cookie[n];
+                    hit[0] = firstHit;
+                    hc = 1;
+                }
+                hit[hc] = c;
+                hc = hc + 1;
+            }
+        }
+        if (firstHit == null) { return ""; }
+        if (hit == null) {
+            string cn = firstHit.name;
+            string cv = firstHit.Value();
+            int total1 = cn.Length + 1 + cv.Length;
+            byte[] b1 = new byte[total1];
+            nint bp1 = (nint)b1;
+            NativeMemory.PutString(bp1, 0, cn, cn.Length);
+            b1[cn.Length] = 61; // '='
+            if (cv.Length > 0) { NativeMemory.PutString(bp1, cn.Length + 1, cv, cv.Length); }
+            return NativeMemory.GetString(bp1, 0, total1);
+        }
+
         // 插入排序：路径长度降序，相等时保持写入顺序（稳定）。
-        for (int i = 1; i < hit.Count; i = i + 1) {
+        for (int i = 1; i < hc; i = i + 1) {
             Cookie cur = hit[i];
+            int curLen = cur.path.Length;
             int j = i - 1;
-            while (j >= 0 && hit[j].Path().Length < cur.Path().Length) {
+            while (j >= 0 && hit[j].path.Length < curLen) {
                 hit[j + 1] = hit[j];
                 j = j - 1;
             }
             hit[j + 1] = cur;
         }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < hit.Count; i = i + 1) {
-            if (i > 0) { sb.Append("; "); }
-            sb.Append(hit[i].Name());
-            sb.Append("=");
-            sb.Append(hit[i].Value());
+
+        int total = (hc - 1) * 2; // "; "
+        for (int i = 0; i < hc; i = i + 1) {
+            Cookie ck = hit[i];
+            total = total + ck.name.Length + 1 + ck.Value().Length;
         }
-        return sb.ToString();
+        byte[] outb = new byte[total];
+        nint op = (nint)outb;
+        int oPos = 0;
+        for (int i = 0; i < hc; i = i + 1) {
+            if (i > 0) {
+                outb[oPos] = 59; // ';'
+                outb[oPos + 1] = 32; // ' '
+                oPos = oPos + 2;
+            }
+            Cookie ck = hit[i];
+            string cn = ck.name;
+            string cv = ck.Value();
+            if (cn.Length > 0) { NativeMemory.PutString(op, oPos, cn, cn.Length); oPos = oPos + cn.Length; }
+            outb[oPos] = 61; // '='
+            oPos = oPos + 1;
+            if (cv.Length > 0) { NativeMemory.PutString(op, oPos, cv, cv.Length); oPos = oPos + cv.Length; }
+        }
+        return NativeMemory.GetString(op, 0, total);
     }
 
     // 从一段响应头里吸收所有 Set-Cookie 行。<paramref name="head"/> 是
     // 状态行 + 头部（到空行为止即可，多给了也无妨）。
     public void AbsorbHead(string host, string requestPath, string head) {
+        if (head == null || head.Length == 0) { return; }
+        string hLower = null;
+        string defPath = null;
         int pos = 0;
         int len = head.Length;
+        nint hp = (nint)head;
+        Span<byte> hb = new Span<byte>(hp, len);
         while (pos < len) {
-            int end = pos;
-            while (end < len && (head[end] & 255) != 10) { end = end + 1; }
+            int nl = NativeMemory.Find(hp, pos, 10, len - pos);
+            int end = nl < 0 ? len : nl;
             int stop = end;
-            if (stop > pos && (head[stop - 1] & 255) == 13) { stop = stop - 1; }
+            if (stop > pos && (hb[stop - 1] & 255) == 13) { stop = stop - 1; }
             int lineLen = stop - pos;
             if (lineLen == 0) { return; }
-            if (lineLen > 11 && (head[pos + 10] & 255) == 58
-                    && CookieJar.NameEquals(head, pos, "set-cookie")) {
-                this.SetCookie(host, requestPath,
-                    head.Substring(pos + 11, lineLen - 11).Trim());
+            if (lineLen > 11 && (hb[pos + 10] & 255) == 58
+                    && CookieJar.EqLowerSlice(hb, pos, 10, "set-cookie")) {
+                if (hLower == null) {
+                    hLower = CookieJar.ToLowerFast(host);
+                    defPath = CookieJar.DefaultPath(requestPath);
+                }
+                int vs = pos + 11;
+                int ve = stop;
+                while (vs < ve && CookieJar.IsTrimWs(hb[vs] & 255)) { vs = vs + 1; }
+                while (ve > vs && CookieJar.IsTrimWs(hb[ve - 1] & 255)) { ve = ve - 1; }
+                if (vs < ve) {
+                    this.SetCookieSlice(hLower, defPath, hp, hb, vs, ve);
+                }
             }
             pos = end + 1;
         }
     }
 
-    // 丢掉已过期的条目（会话 cookie 的 expires 为 0，永不丢）。
+    // 丢掉已过期的条目（无过期条目时 O(1) 跳过系统时钟调用）。
     private void DropExpired() {
-        long now = DateTime.UtcNow().ToUnixSeconds();
+        if (this.expiringCount <= 0) { return; }
+        long now = CookieJar.NowUnixSeconds();
         int i = 0;
         while (i < this.items.Count) {
             long at = this.items[i].Expires();
-            if (at > 0 && at <= now) { this.items.RemoveAt(i); }
-            else { i = i + 1; }
+            if (at > 0 && at <= now) {
+                this.items.RemoveAt(i);
+                this.expiringCount = this.expiringCount - 1;
+            } else {
+                i = i + 1;
+            }
         }
     }
 
-    // 请求主机 `host` 是否落在 cookie 的域内：host-only 要求完全相等，
-    // 域 cookie 则允许子域（"api.example.com" 命中 "example.com"）。
-    private static bool DomainMatches(string host, string domain, bool hostOnly) {
+    // 零 Substring 域名后缀匹配。
+    private static bool DomainMatchesSpan(string host, Span<byte> hSpan, string domain, bool hostOnly) {
         if (host == domain) { return true; }
         if (hostOnly) { return false; }
         int hl = host.Length;
         int dl = domain.Length;
         if (hl <= dl) { return false; }
-        if (host.Substring(hl - dl, dl) != domain) { return false; }
-        return (host[hl - dl - 1] & 255) == 46;
+        int off = hl - dl;
+        if ((hSpan[off - 1] & 255) != 46) { return false; }
+        Span<byte> dSpan = new Span<byte>((nint)domain, dl);
+        for (int i = 0; i < dl; i = i + 1) {
+            if (hSpan[off + i] != dSpan[i]) { return false; }
+        }
+        return true;
     }
 
-    // 没有 PSL 就无法分辨任意公共后缀与可注册域。Domain 属性
-    // 只接受响应主机的完全相同拼写，且按 host-only 存储；这是
-    // 保守的安全子集，不提供 RFC 6265 的跨子域 Domain 语义。
     private static bool DomainAttributeOk(string host, string domain) {
         if (domain.Length == 0 || host.Length == 0) { return false; }
         if (CookieJar.IsIpHost(host)) { return false; }
         if (host != domain) { return false; }
-        // 单标签顶层域也不能借 Domain 属性种 cookie。
-        for (int i = 0; i < domain.Length; i = i + 1) {
-            if ((domain[i] & 255) == 46) { return true; }
-        }
-        return false;
+        return NativeMemory.Find((nint)domain, 0, 46, domain.Length) >= 0;
     }
 
     // host 是否是 IP 字面量：IPv4 四段全数字，或含 ':' 的 IPv6。
     private static bool IsIpHost(string host) {
         int dots = 0;
-        bool numeric = host.Length > 0;
-        for (int i = 0; i < host.Length; i = i + 1) {
+        int n = host.Length;
+        bool numeric = n > 0;
+        for (int i = 0; i < n; i = i + 1) {
             int c = host[i] & 255;
             if (c == 46) { dots = dots + 1; continue; }
             if (c == 58) { return true; }  // ':' -> IPv6
@@ -228,174 +426,153 @@ public class CookieJar {
         return numeric && dots == 3;
     }
 
-    // RFC 6265 的 path-match：相等、cookie 路径以 "/" 结尾的前缀，
-    // 或前缀之后紧跟一个 "/"。
-    private static bool PathMatches(string path, string cookiePath) {
-        if (path == cookiePath) { return true; }
+    // RFC 6265 的 path-match（零 Substring 字节前缀比较）。
+    private static bool PathMatchesSpan(Span<byte> pSpan, int pLen, string cookiePath) {
         int cl = cookiePath.Length;
-        if (cl == 0 || path.Length <= cl) { return false; }
-        if (path.Substring(0, cl) != cookiePath) { return false; }
-        if ((cookiePath[cl - 1] & 255) == 47) { return true; }
-        return (path[cl] & 255) == 47;
+        if (cl == 0 || pLen < cl) { return false; }
+        if (pLen > cl && (cookiePath[cl - 1] & 255) != 47 && (pSpan[cl] & 255) != 47) {
+            return false;
+        }
+        Span<byte> cSpan = new Span<byte>((nint)cookiePath, cl);
+        for (int i = 0; i < cl; i = i + 1) {
+            if (pSpan[i] != cSpan[i]) { return false; }
+        }
+        return true;
     }
 
     // RFC 6265 的 default-path：请求路径去掉最后一段（"/a/b" -> "/a"）。
     private static string DefaultPath(string requestPath) {
-        string p = CookieJar.PathOnly(requestPath);
-        if (p.Length == 0 || (p[0] & 255) != 47) { return "/"; }
-        int last = 0 - 1;
-        for (int i = 0; i < p.Length; i = i + 1) {
-            if ((p[i] & 255) == 47) { last = i; }
+        if (requestPath == null || requestPath.Length == 0) { return "/"; }
+        int rl = requestPath.Length;
+        nint rp = (nint)requestPath;
+        int cut = NativeMemory.IndexOfAny(rp, rl, 63, 35); // '?' or '#'
+        if (cut < 0) { cut = rl; }
+        if (cut == 0 || (requestPath[0] & 255) != 47) { return "/"; }
+        int last = -1;
+        for (int i = cut - 1; i >= 0; i = i - 1) {
+            if ((requestPath[i] & 255) == 47) { last = i; break; }
         }
         if (last <= 0) { return "/"; }
-        return p.Substring(0, last);
+        return NativeMemory.GetString(rp, 0, last);
     }
 
-    // 去掉查询串和片段，只留路径。
-    private static string PathOnly(string requestPath) {
-        int cut = requestPath.Length;
-        for (int i = 0; i < requestPath.Length; i = i + 1) {
-            int ch = requestPath[i] & 255;
-            if (ch == 63 || ch == 35) { cut = i; break; }
-        }
-        if (cut == 0) { return "/"; }
-        return requestPath.Substring(0, cut);
-    }
-
-    // "Sun, 06 Nov 1994 08:49:37 GMT" -> Unix 秒（解析不出来返回 0）。
-    // 三种 HTTP 日期格式的日/月/年/时分秒都是按记号取的，因此
-    // RFC 1123、RFC 850 和 asctime 都能过。
-    private static long ParseHttpDate(string s) {
-        List<string> tok = CookieJar.Tokens(s);
-        int day = 0 - 1;
-        int month = 0 - 1;
-        int year = 0 - 1;
+    // 零列表分配单遍解析 HTTP 日期（RFC 1123 / RFC 850 / asctime）-> Unix 秒。
+    private static long ParseHttpDateSlice(Span<byte> sb, int start, int end) {
+        int day = -1;
+        int month = -1;
+        int year = -1;
         int hour = 0;
         int minute = 0;
         int second = 0;
         bool haveTime = false;
-        for (int i = 0; i < tok.Count; i = i + 1) {
-            string t = tok[i];
-            if (CookieJar.IndexOfChar(t, 58, 0) >= 0) {
+
+        int i = start;
+        while (i < end) {
+            while (i < end) {
+                int ch = sb[i] & 255;
+                if (ch != 32 && ch != 44 && ch != 45 && ch != 9) { break; }
+                i = i + 1;
+            }
+            if (i >= end) { break; }
+            int ts = i;
+            bool hasColon = false;
+            bool allDigits = true;
+            while (i < end) {
+                int ch = sb[i] & 255;
+                if (ch == 32 || ch == 44 || ch == 45 || ch == 9) { break; }
+                if (ch == 58) { hasColon = true; allDigits = false; }
+                else if (ch < 48 || ch > 57) { allDigits = false; }
+                i = i + 1;
+            }
+            int te = i;
+            int tlen = te - ts;
+
+            if (hasColon) {
                 if (!haveTime) {
-                    List<string> hms = CookieJar.SplitColon(t);
-                    if (hms.Count >= 2) {
-                        hour = (int)CookieJar.ParseLong(hms[0]);
-                        minute = (int)CookieJar.ParseLong(hms[1]);
-                        if (hms.Count >= 3) {
-                            second = (int)CookieJar.ParseLong(hms[2]);
+                    int p = ts;
+                    int c1 = -1;
+                    int c2 = -1;
+                    while (p < te) {
+                        if ((sb[p] & 255) == 58) {
+                            if (c1 < 0) { c1 = p; }
+                            else if (c2 < 0) { c2 = p; break; }
+                        }
+                        p = p + 1;
+                    }
+                    if (c1 >= ts) {
+                        hour = (int)CookieJar.ParseLongSlice(sb, ts, c1);
+                        int mEnd = c2 >= 0 ? c2 : te;
+                        minute = (int)CookieJar.ParseLongSlice(sb, c1 + 1, mEnd);
+                        if (c2 >= 0) {
+                            int sEnd = c2 + 1;
+                            while (sEnd < te && (sb[sEnd] & 255) != 58) { sEnd = sEnd + 1; }
+                            second = (int)CookieJar.ParseLongSlice(sb, c2 + 1, sEnd);
                         }
                         haveTime = true;
                     }
                 }
                 continue;
             }
-            int m = CookieJar.MonthOf(t);
-            if (m > 0) { month = m; continue; }
-            if (!CookieJar.AllDigits(t)) { continue; }
-            long n = CookieJar.ParseLong(t);
-            if (t.Length >= 3) { year = (int)n; }
-            else if (day < 0) { day = (int)n; }
-            else if (year < 0) {
-                // 两位年份：RFC 850 的 "06-Nov-94"。
-                if (n >= 70) { year = (int)(1900 + n); } else { year = (int)(2000 + n); }
+
+            if (allDigits) {
+                long n = CookieJar.ParseLongSlice(sb, ts, te);
+                if (tlen >= 3) { year = (int)n; }
+                else if (day < 0) { day = (int)n; }
+                else if (year < 0) {
+                    if (n >= 70) { year = (int)(1900 + n); } else { year = (int)(2000 + n); }
+                }
+                continue;
+            }
+
+            if (tlen >= 3) {
+                int m = CookieJar.MonthOfSlice(sb, ts);
+                if (m > 0) { month = m; }
             }
         }
+
         if (day < 1 || month < 1 || year < 1601) { return 0; }
-        return DateTime.FromParts(year, month, day, hour, minute, second)
-            .ToUnixSeconds();
+        return (long)DateTime.DaysFromCivil(year, month, day) * 86400L
+            + (long)hour * 3600L + (long)minute * 60L + (long)second;
     }
 
-    // 按空格、逗号和 '-' 切成记号（"06-Nov-1994" -> 06 / Nov / 1994）。
-    private static List<string> Tokens(string s) {
-        List<string> outp = new List<string>();
-        int start = 0 - 1;
-        for (int i = 0; i <= s.Length; i = i + 1) {
-            int ch = 32;
-            if (i < s.Length) { ch = s[i] & 255; }
-            bool sep = ch == 32 || ch == 44 || ch == 45 || ch == 9 || i == s.Length;
-            if (sep) {
-                if (start >= 0) { outp.Add(s.Substring(start, i - start)); }
-                start = 0 - 1;
-            } else if (start < 0) {
-                start = i;
-            }
+    // 3 字母月份缩写首字母跳表（零 Substring/ToLower）。
+    private static int MonthOfSlice(Span<byte> sb, int ts) {
+        int c0 = sb[ts] & 255;
+        int c1 = sb[ts + 1] & 255;
+        int c2 = sb[ts + 2] & 255;
+        if (c0 >= 65 && c0 <= 90) { c0 = c0 + 32; }
+        if (c1 >= 65 && c1 <= 90) { c1 = c1 + 32; }
+        if (c2 >= 65 && c2 <= 90) { c2 = c2 + 32; }
+        int key = (c0 << 16) | (c1 << 8) | c2;
+        switch (key) {
+            case 6971758: return 1;  // "jan"
+            case 6710626: return 2;  // "feb"
+            case 7168370: return 3;  // "mar"
+            case 6385778: return 4;  // "apr"
+            case 7168377: return 5;  // "may"
+            case 6976878: return 6;  // "jun"
+            case 6976876: return 7;  // "jul"
+            case 6387047: return 8;  // "aug"
+            case 7562608: return 9;  // "sep"
+            case 7299956: return 10; // "oct"
+            case 7237494: return 11; // "nov"
+            case 6579555: return 12; // "dec"
+            default:      return 0;
         }
-        return outp;
     }
 
-    // 按冒号切分（"08:49:37" -> 08 / 49 / 37）。
-    private static List<string> SplitColon(string s) {
-        List<string> outp = new List<string>();
-        int start = 0;
-        for (int i = 0; i <= s.Length; i = i + 1) {
-            if (i == s.Length || (s[i] & 255) == 58) {
-                outp.Add(s.Substring(start, i - start));
-                start = i + 1;
-            }
-        }
-        return outp;
-    }
-
-    // 月份英文缩写（前三个字母，大小写不敏感）→ 1..12；不匹配返回 0。
-    private static int MonthOf(string t) {
-        if (t.Length < 3) { return 0; }
-        string m = t.Substring(0, 3).ToLower();
-        if (m == "jan") { return 1; }
-        if (m == "feb") { return 2; }
-        if (m == "mar") { return 3; }
-        if (m == "apr") { return 4; }
-        if (m == "may") { return 5; }
-        if (m == "jun") { return 6; }
-        if (m == "jul") { return 7; }
-        if (m == "aug") { return 8; }
-        if (m == "sep") { return 9; }
-        if (m == "oct") { return 10; }
-        if (m == "nov") { return 11; }
-        if (m == "dec") { return 12; }
-        return 0;
-    }
-
-    // 是否为非空纯数字串。
-    private static bool AllDigits(string s) {
-        if (s.Length == 0) { return false; }
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int ch = s[i] & 255;
-            if (ch < 48 || ch > 57) { return false; }
-        }
-        return true;
-    }
-
-    // 解析十进制整数（可带前导负号），非数字处停止；无数字为 0。
-    private static long ParseLong(string s) {
+    // 解析切片内十进制整数（可带前导负号），非数字处停止；无数字为 0。
+    private static long ParseLongSlice(Span<byte> sb, int start, int end) {
         long n = 0;
         bool neg = false;
-        int i = 0;
-        if (s.Length > 0 && (s[0] & 255) == 45) { neg = true; i = 1; }
-        for (; i < s.Length; i = i + 1) {
-            int ch = s[i] & 255;
+        int i = start;
+        if (i < end && (sb[i] & 255) == 45) { neg = true; i = i + 1; }
+        while (i < end) {
+            int ch = sb[i] & 255;
             if (ch < 48 || ch > 57) { break; }
-            n = n * 10 + (ch - 48);
+            n = n * 10L + (long)(ch - 48);
+            i = i + 1;
         }
-        if (neg) { return 0 - n; }
-        return n;
-    }
-
-    // 从 from 起查找字符 ch 的下标；没有返回 -1。
-    private static int IndexOfChar(string s, int ch, int from) {
-        for (int i = from; i < s.Length; i = i + 1) {
-            if ((s[i] & 255) == ch) { return i; }
-        }
-        return 0 - 1;
-    }
-
-    // head[at..] 的头名字（到冒号前）是否等于 lower（已小写）。
-    private static bool NameEquals(string head, int at, string lower) {
-        for (int i = 0; i < lower.Length; i = i + 1) {
-            int a = head[at + i] & 255;
-            if (a >= 65 && a <= 90) { a = a + 32; }
-            if (a != (lower[i] & 255)) { return false; }
-        }
-        return true;
+        return neg ? (0L - n) : n;
     }
 }

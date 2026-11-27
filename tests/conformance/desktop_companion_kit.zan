@@ -1,0 +1,93 @@
+using System;
+using System.Json;
+using System.Threading;
+using System.Windows;
+using Gui;
+using Gui.Markup;
+using Gui.Widget;
+
+namespace Conf;
+
+class CompanionHtmlForm : Form {
+    public App HostApp() { return this.GetApp(); }
+}
+
+class DesktopCompanionKitTest {
+    static Control NullFactory(string tag) { return null; }
+
+    static void Main() {
+        // 1. 验证 FormBuilder.ConfigureWindow + App.ApplyCompanionMode + HTML data-win-* 声明式属性
+        App app = App.CreateOffscreen("companion-formbuilder", 240, 240);
+        JsonValue cfg = JsonValue.Parse(
+            "{\"winW\":240,\"winH\":240,\"winChrome\":false,\"winTool\":true,"
+            + "\"winTransparent\":true,\"winTopmost\":true,\"winClickThrough\":true}"
+        );
+        FormBuilder.ConfigureWindow(app, cfg);
+        bool fbOk = app.IsTransparent() && app.IsTopmost() && app.IsClickThrough() && app.ToolWindow();
+
+        app.ApplyCompanionMode(true, true, false, true);
+        bool presetOk = app.IsTopmost() && app.IsTransparent() && !app.IsClickThrough() && app.ToolWindow();
+
+        CompanionHtmlForm htmlForm = new CompanionHtmlForm();
+        string doc = "<div data-win-w=\"200\" data-win-h=\"200\" data-win-chrome=\"false\""
+            + " data-win-tool=\"true\" data-win-transparent=\"true\""
+            + " data-win-topmost=\"true\" data-win-click-through=\"true\"></div>";
+        htmlForm.ShowOffscreenHtml(doc, NullFactory);
+        App htmlApp = htmlForm.HostApp();
+        bool htmlOk = htmlApp != null
+            && htmlApp.IsTransparent()
+            && htmlApp.IsTopmost()
+            && htmlApp.IsClickThrough()
+            && htmlApp.ToolWindow();
+        Console.WriteLine("form-declarative-companion: " + Convert.ToString(fbOk && presetOk && htmlOk ? 1 : 0));
+
+        // 2. 验证 DesktopDock 工作区探测、五锚点停靠坐标与越界拖拽钳位
+        WorkAreaRect primary = DesktopDock.GetPrimaryWorkArea();
+        bool primaryOk = primary != null && primary.Width > 0 && primary.Height > 0;
+
+        WorkAreaRect area = new WorkAreaRect(0, 0, 1920, 1040);
+        DockPosition tl = DesktopDock.ComputeCorner(area, 240, 300, DockCorner.TopLeft, 16, 20);
+        DockPosition tr = DesktopDock.ComputeCorner(area, 240, 300, DockCorner.TopRight, 16, 20);
+        DockPosition bl = DesktopDock.ComputeCorner(area, 240, 300, DockCorner.BottomLeft, 16, 20);
+        DockPosition br = DesktopDock.ComputeCorner(area, 240, 300, DockCorner.BottomRight, 16, 20);
+        DockPosition ct = DesktopDock.ComputeCorner(area, 240, 300, DockCorner.Center, 0, 0);
+        DockPosition cl = DesktopDock.ClampToArea(area, -50, 9999, 240, 300);
+
+        bool dockOk = primaryOk
+            && tl.X == 16 && tl.Y == 20
+            && tr.X == 1664 && tr.Y == 20
+            && bl.X == 16 && bl.Y == 720
+            && br.X == 1664 && br.Y == 720
+            && ct.X == 840 && ct.Y == 370
+            && cl.X == 0 && cl.Y == 740;
+        Console.WriteLine("desktop-dock-workarea: " + Convert.ToString(dockOk ? 1 : 0));
+
+        // 3. 验证 CompanionActivityTracker 键鼠计数、闲置时长与 Win32 双钩子启停
+        CompanionActivityTracker.Reset();
+        CompanionActivityTracker.RecordKeyDown(65);
+        CompanionActivityTracker.RecordKeyDown(66);
+        CompanionActivityTracker.RecordMouseEvent(100, 200, 0x0201, 0);
+        CompanionActivityTracker.RecordMouseEvent(100, 200, 0x020A, 120);
+        CompanionActivityTracker.RecordMouseEvent(120, 210, 0x0200, 0);
+        Thread.Sleep(25);
+        long idle = CompanionActivityTracker.IdleMs();
+        bool statsOk = CompanionActivityTracker.KeyDownCount == 2L
+            && CompanionActivityTracker.MouseClickCount == 1L
+            && CompanionActivityTracker.MouseWheelCount == 1L
+            && CompanionActivityTracker.MouseMoveCount == 1L
+            && CompanionActivityTracker.LastKeyVk == 66
+            && CompanionActivityTracker.LastMouseX == 120
+            && CompanionActivityTracker.LastMouseY == 210
+            && idle >= 15L;
+
+        bool hookOk = true;
+        #if WINDOWS
+        bool started = CompanionActivityTracker.Start();
+        bool wasRunning = CompanionActivityTracker.IsRunning;
+        Thread.Sleep(20);
+        CompanionActivityTracker.Stop();
+        hookOk = started && wasRunning && !CompanionActivityTracker.IsRunning;
+        #endif
+        Console.WriteLine("companion-activity-tracker: " + Convert.ToString(statsOk && hookOk ? 1 : 0));
+    }
+}

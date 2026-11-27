@@ -3,48 +3,74 @@ using System.Management;
 
 namespace System.Hardware;
 
+// 系统外观主题三态：区分浅色、深色与当前平台不可观测（Unknown）。
+public enum SystemThemeMode {
+    Unknown = -1,
+    Light = 0,
+    Dark = 1
+}
+
 // 跨平台系统主题与暗黑模式感知门面（SystemTheme）：
 // 在 Windows 下无头读取系统 Personalize 注册表 AppsUseLightTheme，不依赖 GUI 后端；
 // 若已注册 HardwareHost（如移动端容器），优先委派宿主查询。
 public class SystemTheme {
     static bool hasMock;
-    static bool mockDark;
+    static int mockMode = -1;
 
-    // 操作系统当前是否处于深色/暗黑模式（True 为 Dark Mode）
-    public static bool IsDarkMode() {
-        if (SystemTheme.hasMock) { return SystemTheme.mockDark; }
+    // 查询操作系统当前外观主题三态（Unknown / Light / Dark）
+    public static SystemThemeMode Mode() {
+        if (SystemTheme.hasMock) {
+            if (SystemTheme.mockMode == 0) { return SystemThemeMode.Light; }
+            if (SystemTheme.mockMode == 1) { return SystemThemeMode.Dark; }
+            return SystemThemeMode.Unknown;
+        }
         IHardwareHost host = HardwareHost.Current();
-        if (host != null) { return host.IsDarkMode(); }
-        return SystemTheme.NativeIsDarkMode();
+        if (host != null) {
+            return host.IsDarkMode() ? SystemThemeMode.Dark : SystemThemeMode.Light;
+        }
+        return SystemTheme.NativeMode();
+    }
+
+    // 操作系统当前是否处于深色/暗黑模式（True 为 Dark Mode；Unknown 折算为 false）
+    public static bool IsDarkMode() {
+        return SystemTheme.Mode() == SystemThemeMode.Dark;
     }
 
     // 仿真/注入当前主题外观（用于调试暗黑模式配色）
     public static void Inject(bool isDark) {
-        SystemTheme.mockDark = isDark;
+        SystemTheme.mockMode = isDark ? 1 : 0;
+        SystemTheme.hasMock = true;
+    }
+
+    // 仿真/注入三态主题外观（支持测试 Unknown 分支）
+    public static void InjectMode(SystemThemeMode mode) {
+        SystemTheme.mockMode = (int)mode;
         SystemTheme.hasMock = true;
     }
 
     // 清除仿真注入，恢复系统真实查询。
     public static void Reset() {
         SystemTheme.hasMock = false;
-        SystemTheme.mockDark = false;
+        SystemTheme.mockMode = -1;
     }
 
-    static bool NativeIsDarkMode() {
+    static SystemThemeMode NativeMode() {
         #if WINDOWS
         nint k = Registry.OpenKey(
             Registry.Hkcu(),
             "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
             false);
-        if (k == 0) { return false; }
+        if (k == 0) { return SystemThemeMode.Unknown; }
         try {
-            int light = Registry.GetDword(k, "AppsUseLightTheme", 1);
-            return light == 0;
+            int light = Registry.GetDword(k, "AppsUseLightTheme", -1);
+            if (light == 0) { return SystemThemeMode.Dark; }
+            if (light == 1) { return SystemThemeMode.Light; }
+            return SystemThemeMode.Unknown;
         } finally {
             Registry.CloseKey(k);
         }
         #else
-        return false;
+        return SystemThemeMode.Unknown;
         #endif
     }
 }

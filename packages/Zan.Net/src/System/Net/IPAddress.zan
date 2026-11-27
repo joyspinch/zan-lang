@@ -11,189 +11,194 @@ public class IPAddress {
     public static const string IPv6Any      = "::";
     public static const string IPv6Loopback = "::1";
 
-    // 检查字符串是否为严格的点分十进制 IPv4 地址（RFC 791 / RFC 1123）。
-    // 强制四段校验（每段 0..255），禁止前导零（防八进制歧义混淆攻击），
-    // 杜绝空段、连续点号与超出范围的伪 IP。
-    public static bool IsIPv4(string str) {
-        if (str == null || str.Length < 7 || str.Length > 15) { return false; }
+    // 单遍合并 RFC 791 严格校验与 32 位无符号整数解析（零子串分配），非法返回 -1。
+    private static long ParseIPv4Slice(string str, int start, int len) {
+        if (str == null || len < 7 || len > 15) { return -1L; }
+        Span<byte> sb = new Span<byte>((nint)str + (nint)start, len);
+        long val = 0L;
         int part = 0;
         int octet = 0;
         int digits = 0;
-        int len = str.Length;
-        for (int i = 0; i <= len; i = i + 1) {
-            bool atEnd = (i == len);
-            int c = atEnd ? 46 : (str[i] & 255);
+        for (int i = 0; i < len; i = i + 1) {
+            int c = sb[i] & 255;
             if (c == 46) { // '.'
-                if (digits == 0 || octet > 255 || part > 3) { return false; }
+                if (digits == 0 || octet > 255 || part >= 3) { return -1L; }
+                val = (val << 8) | (long)octet;
                 part = part + 1;
                 octet = 0;
                 digits = 0;
             } else {
-                if (c < 48 || c > 57 || digits >= 3) { return false; }
+                int d = c - 48;
+                if (d < 0 || d > 9 || digits >= 3) { return -1L; }
                 // 禁止非零多位数带前导 0 (防八进制混淆解析)
-                if (digits > 0 && octet == 0) { return false; }
-                octet = octet * 10 + (c - 48);
+                if (digits > 0 && octet == 0) { return -1L; }
+                octet = octet * 10 + d;
                 digits = digits + 1;
             }
         }
-        return part == 4;
+        if (part != 3 || digits == 0 || octet > 255) { return -1L; }
+        return (val << 8) | (long)octet;
+    }
+
+    // 检查字符串是否为严格的点分十进制 IPv4 地址（RFC 791 / RFC 1123）。
+    // 强制四段校验（每段 0..255），禁止前导零（防八进制歧义混淆攻击），
+    // 杜绝空段、连续点号与超出范围的伪 IP。
+    public static bool IsIPv4(string str) {
+        if (str == null) { return false; }
+        return IPAddress.ParseIPv4Slice(str, 0, str.Length) >= 0L;
+    }
+
+    private static bool SliceEquals(Span<byte> sb, int len, string target) {
+        if (len != target.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            if ((sb[i] & 255) != (target[i] & 255)) { return false; }
+        }
+        return true;
     }
 
     // 检查字符串是否为规范的 IPv6 地址格式（RFC 4291 / RFC 5952）。
-    // 支持标准 8 组 16 进制、单次 "::" 零压缩表示法以及 RFC 4291 §2.5.5.2 IPv4 映射混合表示（如 ::ffff:192.0.2.1）。
+    // 单遍 Span 扫描同时校验 ":::"、多重 "::"、hex 字符与 IPv4 映射混合地址（零子串）。
     public static bool IsIPv6(string str) {
-        if (str == null || str.Length < 2 || str.Length > 45) { return false; }
-
-        // 支持 RFC 4291 §2.5.5.2 IPv4-Mapped IPv6 混合地址 (例如 "::ffff:192.0.2.1" 或 "0:0:0:0:0:ffff:192.0.2.1")
-        if (str.IndexOf(".", 0) >= 0) {
-            int lastColon = -1;
-            for (int i = str.Length - 1; i >= 0; i = i - 1) {
-                if ((str[i] & 255) == 58) { // ':'
-                    lastColon = i;
-                    break;
-                }
-            }
-            if (lastColon >= 0 && lastColon + 1 < str.Length) {
-                string ipv4Part = str.Substring(lastColon + 1, str.Length - lastColon - 1);
-                string prefixPart = str.Substring(0, lastColon);
-                if (IPAddress.IsIPv4(ipv4Part)) {
-                    if (prefixPart == "::ffff" || prefixPart == "::FFFF"
-                        || prefixPart == "0:0:0:0:0:ffff" || prefixPart == "0:0:0:0:0:FFFF"
-                        || prefixPart == "::") {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
+        if (str == null) { return false; }
+        int len = str.Length;
+        if (len < 2 || len > 45) { return false; }
+        nint sp = (nint)str;
+        Span<byte> sb = new Span<byte>(sp, len);
 
         int colonCount = 0;
-        int doubleColon = -1;
+        int doubleColonCount = 0;
+        int consecutiveColons = 0;
         int groupDigits = 0;
         int groups = 0;
-        int len = str.Length;
+        int lastColon = -1;
 
-        // 查找 "::" 压缩与非法三冒号 ":::"
-        if (str.IndexOf(":::", 0) >= 0) { return false; }
-        int dcIdx = str.IndexOf("::", 0);
-        if (dcIdx >= 0) {
-            // 不能出现多个 "::"
-            if (str.IndexOf("::", dcIdx + 2) >= 0) { return false; }
-            doubleColon = dcIdx;
-        }
-
-        // 逐字符校验：仅允许 16 进制字符和 ':'
-        for (int i = 0; i <= len; i = i + 1) {
-            bool atEnd = (i == len);
-            int c = atEnd ? 58 : (str[i] & 255);
+        for (int i = 0; i < len; i = i + 1) {
+            int c = sb[i] & 255;
             if (c == 58) { // ':'
                 colonCount = colonCount + 1;
+                consecutiveColons = consecutiveColons + 1;
+                lastColon = i;
+                if (consecutiveColons == 2) {
+                    doubleColonCount = doubleColonCount + 1;
+                    if (doubleColonCount > 1) { return false; }
+                } else if (consecutiveColons >= 3) {
+                    return false;
+                }
                 if (groupDigits > 0) {
                     groups = groups + 1;
                     groupDigits = 0;
                 }
+            } else if (c == 46) { // '.' -> RFC 4291 §2.5.5.2 IPv4-Mapped 混合地址
+                if (lastColon < 0) { return false; }
+                int v4Start = lastColon + 1;
+                int v4Len = len - v4Start;
+                if (IPAddress.ParseIPv4Slice(str, v4Start, v4Len) < 0L) { return false; }
+                if (lastColon == 2) {
+                    return IPAddress.SliceEquals(sb, 2, "::");
+                }
+                if (lastColon == 6) {
+                    return IPAddress.SliceEquals(sb, 6, "::ffff") || IPAddress.SliceEquals(sb, 6, "::FFFF");
+                }
+                if (lastColon == 14) {
+                    return IPAddress.SliceEquals(sb, 14, "0:0:0:0:0:ffff") || IPAddress.SliceEquals(sb, 14, "0:0:0:0:0:FFFF");
+                }
+                return false;
             } else {
+                consecutiveColons = 0;
                 bool isHex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
                 if (!isHex || groupDigits >= 4) { return false; }
                 groupDigits = groupDigits + 1;
             }
         }
-
-        if (doubleColon >= 0) {
-            // 有 "::" 压缩，组数必须小于等于 7
-            return groups <= 7;
-        } else {
-            // 无 "::" 压缩，必须恰好 8 组、7 个分隔冒号（加上结尾哨兵共 8 次）
-            return groups == 8 && colonCount == 8;
+        if (groupDigits > 0) {
+            groups = groups + 1;
         }
+        // 结尾哨兵使无压缩形态的 colonCount == 7 对应原逻辑的 8
+        if (doubleColonCount > 0) {
+            return groups <= 7;
+        }
+        return groups == 8 && colonCount == 7;
     }
 
     // 将点分十进制 IPv4 地址解析为 32 位无符号整数（存储在 long 中），非法时返回 -1。
     public static long ParseIPv4(string ip) {
-        if (!IPAddress.IsIPv4(ip)) { return -1; }
-        long val = 0;
-        int octet = 0;
-        int len = ip.Length;
-        for (int i = 0; i <= len; i = i + 1) {
-            bool atEnd = (i == len);
-            int c = atEnd ? 46 : (ip[i] & 255);
-            if (c == 46) {
-                val = (val << 8) | (long)octet;
-                octet = 0;
-            } else {
-                octet = octet * 10 + (c - 48);
-            }
-        }
-        return val;
+        if (ip == null) { return -1L; }
+        return IPAddress.ParseIPv4Slice(ip, 0, ip.Length);
     }
 
-    // 检查 IPv4 地址是否属于指定的 CIDR 子网（RFC 4632，例如 "192.168.1.15" 属于 "192.168.1.0/24"）。
-    // 前缀长度必须在 0..32 之间，输入非法或格式错误时返回 false。
+    // 检查 IPv4 地址是否属于指定的 CIDR 子网（零 Substring + O(1) 位掩码）。
     public static bool IsInSubnet(string ip, string cidr) {
         if (ip == null || cidr == null) { return false; }
-        long ipVal = IPAddress.ParseIPv4(ip);
-        if (ipVal < 0) { return false; }
+        long ipVal = IPAddress.ParseIPv4Slice(ip, 0, ip.Length);
+        if (ipVal < 0L) { return false; }
 
-        int slash = cidr.IndexOf("/", 0);
-        if (slash <= 0 || slash + 1 >= cidr.Length) { return false; }
-        string netStr = cidr.Substring(0, slash);
-        long netVal = IPAddress.ParseIPv4(netStr);
-        if (netVal < 0) { return false; }
-
-        string prefixStr = cidr.Substring(slash + 1, cidr.Length - slash - 1);
-        if (prefixStr.Length == 0 || prefixStr.Length > 2) { return false; }
+        int clen = cidr.Length;
+        int slash = NativeMemory.Find((nint)cidr, 0, 47, clen); // '/'
+        if (slash <= 0 || slash + 1 >= clen) { return false; }
+        int pLen = clen - slash - 1;
+        if (pLen > 2) { return false; }
         int prefix = 0;
-        for (int i = 0; i < prefixStr.Length; i = i + 1) {
-            int c = prefixStr[i] & 255;
-            if (c < 48 || c > 57) { return false; }
-            prefix = prefix * 10 + (c - 48);
+        for (int i = slash + 1; i < clen; i = i + 1) {
+            int d = (cidr[i] & 255) - 48;
+            if (d < 0 || d > 9) { return false; }
+            prefix = prefix * 10 + d;
         }
-        if (prefix < 0 || prefix > 32) { return false; }
+        if (prefix > 32) { return false; }
+        long netVal = IPAddress.ParseIPv4Slice(cidr, 0, slash);
+        if (netVal < 0L) { return false; }
         if (prefix == 0) { return true; }
 
-        // 计算 32 位掩码
-        long mask = 0;
-        for (int k = 0; k < prefix; k = k + 1) {
-            mask = mask | ((long)1 << (31 - k));
-        }
-
+        long mask = (4294967295L << (32 - prefix)) & 4294967295L;
         return (ipVal & mask) == (netVal & mask);
     }
 
     // 检查 IP 是否为本地环回地址（127.0.0.0/8 或 ::1）。
     public static bool IsLoopback(string ip) {
-        if (ip == null || ip.Length == 0) { return false; }
-        if (ip == "::1" || ip == "0:0:0:0:0:0:0:1") { return true; }
-        if (ip.StartsWith("127.")) {
-            return IPAddress.IsIPv4(ip);
+        if (ip == null) { return false; }
+        int len = ip.Length;
+        if (len == 0) { return false; }
+        if (len == 3 && ip == "::1") { return true; }
+        if (len == 15 && ip == "0:0:0:0:0:0:0:1") { return true; }
+        if (len >= 7 && (ip[0] & 255) == 49 && (ip[1] & 255) == 50
+            && (ip[2] & 255) == 55 && (ip[3] & 255) == 46) {
+            return IPAddress.ParseIPv4Slice(ip, 0, len) >= 0L;
         }
         return false;
     }
 
     // 检查 IP 是否为私有内网或链路本地地址（RFC 1918 / RFC 3927 / RFC 4193 / RFC 4291）。
-    // 常用于 SSRF 防御，过滤 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、169.254.0.0/16
-    // 以及 IPv6 的 ULA (fc00::/7) 与 Link-Local (fe80::/10)。
+    // 单次 ParseIPv4 + 4 条位掩码直接判定，消除 5 倍重复解析与 CIDR 串分配。
     public static bool IsPrivate(string ip) {
         if (ip == null || ip.Length == 0) { return false; }
-        if (IPAddress.IsIPv4(ip)) {
-            if (IPAddress.IsInSubnet(ip, "10.0.0.0/8")) { return true; }
-            if (IPAddress.IsInSubnet(ip, "172.16.0.0/12")) { return true; }
-            if (IPAddress.IsInSubnet(ip, "192.168.0.0/16")) { return true; }
-            if (IPAddress.IsInSubnet(ip, "169.254.0.0/16")) { return true; }
+        long v = IPAddress.ParseIPv4Slice(ip, 0, ip.Length);
+        if (v >= 0L) {
+            // 10.0.0.0/8
+            if ((v & 4278190080L) == 167772160L) { return true; }
+            // 172.16.0.0/12
+            if ((v & 4293918720L) == 2886729728L) { return true; }
+            // 192.168.0.0/16
+            if ((v & 4294901760L) == 3232235520L) { return true; }
+            // 169.254.0.0/16
+            if ((v & 4294901760L) == 2851995648L) { return true; }
             return false;
         }
         if (IPAddress.IsIPv6(ip)) {
-            // ULA: fc00::/7 (前缀为 fc 或 fd)
-            if (ip.StartsWith("fc") || ip.StartsWith("FC")
-                || ip.StartsWith("fd") || ip.StartsWith("FD")) {
-                return true;
-            }
-            // Link-Local: fe80::/10
-            if (ip.StartsWith("fe8") || ip.StartsWith("FE8")
-                || ip.StartsWith("fe9") || ip.StartsWith("FE9")
-                || ip.StartsWith("fea") || ip.StartsWith("FEA")
-                || ip.StartsWith("feb") || ip.StartsWith("FEB")) {
-                return true;
+            int c0 = ip[0] & 255;
+            int c1 = ip[1] & 255;
+            if (c0 == 102 || c0 == 70) { // 'f' or 'F'
+                // ULA: fc00::/7 ("fc"/"FC"/"fd"/"FD")
+                if (c0 == 102 && (c1 == 99 || c1 == 100)) { return true; }
+                if (c0 == 70 && (c1 == 67 || c1 == 68)) { return true; }
+                // Link-Local: fe80::/10 ("fe8".."feb" / "FE8".."FEB")
+                if (ip.Length >= 3) {
+                    int c2 = ip[2] & 255;
+                    if (c0 == 102 && c1 == 101 && (c2 == 56 || c2 == 57 || c2 == 97 || c2 == 98)) {
+                        return true;
+                    }
+                    if (c0 == 70 && c1 == 69 && (c2 == 56 || c2 == 57 || c2 == 65 || c2 == 66)) {
+                        return true;
+                    }
+                }
             }
         }
         return false;

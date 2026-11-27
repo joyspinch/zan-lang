@@ -197,9 +197,10 @@ static zgl_uint g_game_batch_tex = 0;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
-/* Alpha 混合、阴影贴图与 GPU 骨骼矩阵全局状态 */
+/* Alpha 混合、深度保留、阴影贴图与 GPU 骨骼矩阵全局状态 */
 static int g_game_blend_enabled = 0;
 static int g_game_depth_write = 1;
+static int g_game_preserve_depth = 0;
 static zgl_uint g_game_shadow_fbo = 0;
 static zgl_uint g_game_shadow_tex = 0;
 static int g_game_shadow_size = 0;
@@ -543,6 +544,7 @@ static void zan_game_forget_gpu(void) {
     g_game_batch_surface = -1;
     g_game_shadow_surface = -1;
     g_game_shadow_ready = 0;
+    g_game_preserve_depth = 0;
     g_game_epoch = 0;
     g_game_gl = NULL;
 }
@@ -1022,7 +1024,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
     gl->Viewport(0, 0, frame.width, frame.height);
     gl->Enable(ZGL_SCISSOR_TEST);
     gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    if (!g_game_blend_enabled) {
+    if (!g_game_blend_enabled && !g_game_preserve_depth) {
         if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
         gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         gl->Clear(ZGL_DEPTH_BUFFER_BIT);
@@ -1232,6 +1234,29 @@ ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write) 
     return 1;
 }
 
+ZAN_GAME_API int32_t zan_game_begin_frame3d(int32_t surface_id) {
+    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    zan_gpu_frame frame;
+    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    int32_t result = 0;
+    if (!zan_game_gpu_prepare(&frame)) goto done;
+    const zan_gl_api *gl = frame.api;
+    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+    if (!zan_game_depth_ready(surface_id, &frame)) goto done;
+    gl->Disable(ZGL_SCISSOR_TEST);
+    if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+    gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+    g_game_preserve_depth = 1;
+    result = gl->GetError() == ZGL_NO_ERROR;
+done:
+    zan_gui_gpu_end(surface_id);
+    return result;
+}
+
+ZAN_GAME_API void zan_game_end_frame3d(void) {
+    g_game_preserve_depth = 0;
+}
+
 static int zan_game_shadow_fbo_ready(const zan_gl_api *gl, int map_size) {
     if (g_game_shadow_fbo && g_game_shadow_size == map_size) return 1;
     zan_game_drop_shadow();
@@ -1410,7 +1435,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh_id
     gl->Viewport(0, 0, frame.width, frame.height);
     gl->Enable(ZGL_SCISSOR_TEST);
     gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    if (!g_game_blend_enabled) {
+    if (!g_game_blend_enabled && !g_game_preserve_depth) {
         if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
         gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         gl->Clear(ZGL_DEPTH_BUFFER_BIT);

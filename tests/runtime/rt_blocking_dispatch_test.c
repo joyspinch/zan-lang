@@ -53,6 +53,9 @@ typedef long LONG;
 static LONG InterlockedIncrement(volatile LONG *count) { return ++*count; }
 static LONG InterlockedDecrement(volatile LONG *count) { return --*count; }
 static int g_dns_wake_fd = -1;
+#if !defined(__linux__)
+static int g_dns_wake_wfd = -1; /* kqueue/select 唤醒管道写端（rt_io.c 同名） */
+#endif
 static int test_create_thread(pthread_t *id, const pthread_attr_t *attr,
                               void *(*run)(void *), void *arg) {
   (void)attr;

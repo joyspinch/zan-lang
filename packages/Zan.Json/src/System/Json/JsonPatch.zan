@@ -35,21 +35,22 @@ public class JsonPatch {
             }
             string name = op.Str("op", "");
             string path = op.Str("path", "");
-            if (name == "add") {
+            int op0 = name.Length > 0 ? (name[0] & 255) : 0;
+            if (op0 == 97 && name == "add") {
                 JsonValue v = op.Get("value");
                 if (v == null) { throw new JsonPatchException("add operation requires 'value'"); }
                 JsonPatch.Add(work, path, v);
-            } else if (name == "remove") {
+            } else if (op0 == 114 && name == "remove") {
                 JsonPatch.Remove(work, path);
-            } else if (name == "replace") {
+            } else if (op0 == 114 && name == "replace") {
                 JsonValue v = op.Get("value");
                 if (v == null) { throw new JsonPatchException("replace operation requires 'value'"); }
                 JsonPatch.Replace(work, path, v);
-            } else if (name == "move") {
+            } else if (op0 == 109 && name == "move") {
                 JsonPatch.Move(work, op.Str("from", ""), path);
-            } else if (name == "copy") {
+            } else if (op0 == 99 && name == "copy") {
                 JsonPatch.Copy(work, op.Str("from", ""), path);
-            } else if (name == "test") {
+            } else if (op0 == 116 && name == "test") {
                 JsonValue v = op.Get("value");
                 if (!JsonEqual.DeepEquals(JsonPatch.Get(work, path), v)) {
                     throw new JsonPatchException("test failed at " + path);
@@ -66,22 +67,33 @@ public class JsonPatch {
         return JsonPatch.Apply(doc, JsonValue.Parse(patchJson));
     }
 
-    // 取指针指向的值（不存在返回 null）。
+    // 流式指针导航取值（零 List<string> 分配；数组段零字符串分配）。
     public static JsonValue Get(JsonValue doc, string pointer) {
-        List<string> parts = JsonPointer.Split(pointer);
+        if (pointer == null || pointer.Length == 0) { return doc; }
+        if ((pointer[0] & 255) != 47) {
+            throw new ArgumentException("JSON Pointer must start with '/': " + pointer);
+        }
         JsonValue cur = doc;
-        for (int i = 0; i < parts.Count; i = i + 1) {
+        int n = pointer.Length;
+        nint pp = (nint)pointer;
+        int i = 1;
+        while (true) {
             if (cur == null) { return null; }
-            string p = parts[i];
+            int slash = i < n ? NativeMemory.Find(pp, i, 47, n - i) : -1;
+            int end = slash < 0 ? n : slash;
+            int segLen = end - i;
             if (cur.IsObject()) {
-                cur = cur.Get(p);
+                string key = JsonPointer.UnescapeSlice(pp, i, segLen);
+                cur = cur.Get(key);
             } else if (cur.IsArray()) {
-                int idx = JsonPatch.IndexOf(p);
+                int idx = JsonPatch.IndexOfSlice(pointer, i, segLen);
                 if (idx < 0 || idx >= cur.Count()) { return null; }
                 cur = cur.At(idx);
             } else {
                 return null;
             }
+            if (slash < 0) { break; }
+            i = slash + 1;
         }
         return cur;
     }
@@ -90,17 +102,19 @@ public class JsonPatch {
     static void Add(JsonValue doc, string pointer, JsonValue value) {
         if (pointer.Length == 0) { throw new JsonPatchException("cannot add at the document root"); }
         JsonValue parent = null;
-        string last = "";
-        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+        int lastStart = 0;
+        int lastLen = 0;
+        if (!JsonPatch.ParentOfSlice(doc, pointer, out parent, out lastStart, out lastLen)) {
             throw new JsonPatchException("no such path: " + pointer);
         }
         if (parent.IsObject()) {
+            string last = JsonPointer.UnescapeSlice((nint)pointer, lastStart, lastLen);
             parent.Set(last, value);
             return;
         }
         if (parent.IsArray()) {
-            if (last == "-") { parent.Append(value); return; }
-            int idx = JsonPatch.IndexOf(last);
+            if (lastLen == 1 && (pointer[lastStart] & 255) == 45) { parent.Append(value); return; }
+            int idx = JsonPatch.IndexOfSlice(pointer, lastStart, lastLen);
             if (idx < 0 || idx > parent.Count()) {
                 throw new JsonPatchException("bad array index in path: " + pointer);
             }
@@ -113,20 +127,22 @@ public class JsonPatch {
     // remove：删掉对象键或数组元素。
     static void Remove(JsonValue doc, string pointer) {
         JsonValue parent = null;
-        string last = "";
-        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+        int lastStart = 0;
+        int lastLen = 0;
+        if (!JsonPatch.ParentOfSlice(doc, pointer, out parent, out lastStart, out lastLen)) {
             throw new JsonPatchException("no such path: " + pointer);
         }
         if (parent.IsObject()) {
+            string last = JsonPointer.UnescapeSlice((nint)pointer, lastStart, lastLen);
             if (!parent.Remove(last)) {
                 throw new JsonPatchException("no such property: " + last);
             }
             return;
         }
         if (parent.IsArray()) {
-            int idx = JsonPatch.IndexOf(last);
+            int idx = JsonPatch.IndexOfSlice(pointer, lastStart, lastLen);
             if (idx < 0 || idx >= parent.Count()) {
-                throw new JsonPatchException("no such array index: " + last);
+                throw new JsonPatchException("no such array index: " + JsonPointer.UnescapeSlice((nint)pointer, lastStart, lastLen));
             }
             parent.RemoveAt(idx);
             return;
@@ -137,19 +153,21 @@ public class JsonPatch {
     // replace：目标必须存在。
     static void Replace(JsonValue doc, string pointer, JsonValue value) {
         JsonValue parent = null;
-        string last = "";
-        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+        int lastStart = 0;
+        int lastLen = 0;
+        if (!JsonPatch.ParentOfSlice(doc, pointer, out parent, out lastStart, out lastLen)) {
             throw new JsonPatchException("no such path: " + pointer);
         }
         if (parent.IsObject()) {
+            string last = JsonPointer.UnescapeSlice((nint)pointer, lastStart, lastLen);
             if (!parent.Has(last)) { throw new JsonPatchException("no such property: " + last); }
             parent.Set(last, value);
             return;
         }
         if (parent.IsArray()) {
-            int idx = JsonPatch.IndexOf(last);
+            int idx = JsonPatch.IndexOfSlice(pointer, lastStart, lastLen);
             if (idx < 0 || idx >= parent.Count()) {
-                throw new JsonPatchException("no such array index: " + last);
+                throw new JsonPatchException("no such array index: " + JsonPointer.UnescapeSlice((nint)pointer, lastStart, lastLen));
             }
             parent.SetAt(idx, value);
             return;
@@ -157,15 +175,44 @@ public class JsonPatch {
         throw new JsonPatchException("cannot replace a scalar at: " + pointer);
     }
 
-    // move：先删 from，再加到 path。
+    // 零拼接前缀检查：判定 path 是否以 from + "/" 开头。
+    private static bool StartsWithPrefixSlash(string path, string from) {
+        int fl = from.Length;
+        if (path.Length <= fl || (path[fl] & 255) != 47) { return false; }
+        for (int i = 0; i < fl; i = i + 1) {
+            if ((path[i] & 255) != (from[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    // move：单次遍历 from 同时取出并删除，再写入 path（消除 Get + Remove 双重导航）。
     static void Move(JsonValue doc, string from, string path) {
         if (from == path) { return; }
-        if (path.StartsWith(from + "/")) {
+        if (JsonPatch.StartsWithPrefixSlash(path, from)) {
             throw new JsonPatchException("cannot move a location into its own child: " + from);
         }
-        JsonValue v = JsonPatch.Get(doc, from);
-        if (v == null) { throw new JsonPatchException("no such path: " + from); }
-        JsonPatch.Remove(doc, from);
+        JsonValue parent = null;
+        int lastStart = 0;
+        int lastLen = 0;
+        if (!JsonPatch.ParentOfSlice(doc, from, out parent, out lastStart, out lastLen)) {
+            throw new JsonPatchException("no such path: " + from);
+        }
+        JsonValue v = null;
+        if (parent.IsObject()) {
+            string last = JsonPointer.UnescapeSlice((nint)from, lastStart, lastLen);
+            v = parent.Get(last);
+            if (v == null) { throw new JsonPatchException("no such path: " + from); }
+            parent.Remove(last);
+        } else if (parent.IsArray()) {
+            int idx = JsonPatch.IndexOfSlice(from, lastStart, lastLen);
+            if (idx < 0 || idx >= parent.Count()) {
+                throw new JsonPatchException("no such path: " + from);
+            }
+            v = parent.At(idx);
+            parent.RemoveAt(idx);
+        } else {
+            throw new JsonPatchException("no such path: " + from);
+        }
         JsonPatch.Add(doc, path, v);
     }
 
@@ -176,29 +223,42 @@ public class JsonPatch {
         JsonPatch.Add(doc, path, v.Clone());
     }
 
-    // 取父节点与最后一段；路径不存在时返回 false。
-    static bool ParentOf(JsonValue doc, string pointer, out JsonValue parent, out string last) {
+    // 流式定位父节点与最后一段切片（零 List<string> 与数组末段零字符串分配）。
+    static bool ParentOfSlice(JsonValue doc, string pointer, out JsonValue parent, out int lastStart, out int lastLen) {
         parent = null;
-        last = "";
-        List<string> parts = JsonPointer.Split(pointer);
-        if (parts.Count == 0) { return false; }
-        last = parts[parts.Count - 1];
+        lastStart = 0;
+        lastLen = 0;
+        if (pointer == null || pointer.Length == 0) { return false; }
+        if ((pointer[0] & 255) != 47) {
+            throw new ArgumentException("JSON Pointer must start with '/': " + pointer);
+        }
+        int n = pointer.Length;
+        nint pp = (nint)pointer;
         JsonValue cur = doc;
-        for (int i = 0; i < parts.Count - 1; i = i + 1) {
+        int i = 1;
+        while (true) {
+            int slash = i < n ? NativeMemory.Find(pp, i, 47, n - i) : -1;
+            if (slash < 0) {
+                if (cur == null) { return false; }
+                lastStart = i;
+                lastLen = n - i;
+                parent = cur;
+                return true;
+            }
             if (cur == null) { return false; }
-            string p = parts[i];
+            int segLen = slash - i;
             if (cur.IsObject()) {
-                cur = cur.Get(p);
+                string key = JsonPointer.UnescapeSlice(pp, i, segLen);
+                cur = cur.Get(key);
             } else if (cur.IsArray()) {
-                int idx = JsonPatch.IndexOf(p);
+                int idx = JsonPatch.IndexOfSlice(pointer, i, segLen);
                 if (idx < 0 || idx >= cur.Count()) { return false; }
                 cur = cur.At(idx);
             } else {
                 return false;
             }
+            i = slash + 1;
         }
-        parent = cur;
-        return parent != null;
     }
 
     // 数组插入（JsonValue 没有 insert 原语，仅搬移 index 之后元素并从尾部弹出）。
@@ -213,17 +273,23 @@ public class JsonPatch {
         for (int i = 0; i < tail.Count; i = i + 1) { arr.Append(tail[i]); }
     }
 
-    // RFC 6901 数组下标：仅允许 "0" 或不带前导零的非负十进制整数；非法返回 -1。
-    static int IndexOf(string s) {
-        if (s == null || s.Length == 0) { return -1; }
-        if (s.Length > 1 && (s[0] & 255) == 48) { return -1; }
+    // RFC 6901 数组下标切片直读（零字符串分配）。
+    static int IndexOfSlice(string s, int start, int len) {
+        if (s == null || len <= 0) { return -1; }
+        if (len > 1 && (s[start] & 255) == 48) { return -1; }
         long v = 0L;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int d = s[i] & 255;
-            if (d < 48 || d > 57) { return -1; }
-            v = v * 10L + (long)(d - 48);
+        for (int i = 0; i < len; i = i + 1) {
+            int d = (s[start + i] & 255) - 48;
+            if (d < 0 || d > 9) { return -1; }
+            v = v * 10L + (long)d;
             if (v > 2147483647L) { return -1; }
         }
         return (int)v;
+    }
+
+    // RFC 6901 数组下标：仅允许 "0" 或不带前导零的非负十进制整数；非法返回 -1。
+    static int IndexOf(string s) {
+        if (s == null || s.Length == 0) { return -1; }
+        return JsonPatch.IndexOfSlice(s, 0, s.Length);
     }
 }
