@@ -473,6 +473,23 @@
   必然卡死"的错误结论。引用前先确认三件事：产物版本、探针口径（平均/最差/
   强制重绘）、机器规格；口径不同的两份数据不可比。基线过期比没有基线更危险，
   因为它带着数字，看起来可信。
+- **Win32 防未响应与原生 GUI 驱动打包四条硬坑（2026-11-27 实证，`2de3707a5`）**：
+  1. **事件泵必须先泵 Win32 消息再排内部队列/VSync 位**：`Win32Shell` 的
+     `PollEvent`/`WaitEvent`/`WaitEventTimeout` 若先返回 `DrainPosted()` 或
+     `HasDisplayFrameReady()`（`VsyncLoop` 每 16ms 置位），在纯软件慢帧下会连续
+     绕过 `PeekMessageW`，超过 5 秒即被 Windows 判为 Ghost Window（未响应）。
+     入口须无条件先做有界 `PeekMessageW(..., PM_REMOVE)`（如上限 64 条，见 `WM_NULL`
+     返 1 防唤醒丢失）。
+  2. **改 `src/drivers/gui/*.c` 后必须经 `scripts/build_gui_driver.ps1` 同步驱动束**：
+     `zanc` 实际链接 `packages/Zan.Gui/src/Gui/drivers/win-x64/{zan_gui.dll,static/libzan_gui.a}`
+     而非 `build/zan_gui.dll`；只跑 CMake 构建不跑驱动打包脚本，ctest 与 `--publish`
+     测到的仍是旧驱动。
+  3. **局部裁剪下 `cpu_blur` 圆角缓存恢复必须按裁剪盒夹紧左右端点**：
+     `mid_x0` 须 `<= cx1`、`mid_x1` 须 `>= cx0`，否则局部裁剪块（如 `conformance_gui_static_glass_cache`
+     的 8×8 圆角区）会越过 `cx1` 污染右侧像素。
+  4. **`zanc --publish` 默认跳过内置 EXE 图标**：不传 `--icon` 时发布产物不含 `.rsrc`
+     段（资源管理器/任务栏显示空白默认图标）；独立发布桌面 GUI 演示或工具若要保留
+     默认图标须显式传 `--default-icon`。
 - **"能跑 + 有存档 + 有设置 + 单文件发布"是基础设施门槛，不是游戏品质门槛**
   （坑出处：arena 等十个阶段一骨架项目——给占位骨架补上存档与设置，这四条
   立刻全绿，但它连玩家输入都没有、美术全是几何图形 + "TODO 位图"）。
