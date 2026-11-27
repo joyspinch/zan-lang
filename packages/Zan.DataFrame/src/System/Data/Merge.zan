@@ -81,137 +81,112 @@ public class Merge {
         bool keepLeft = kind == MergeKind.Left || kind == MergeKind.Outer;
         bool keepRight = kind == MergeKind.Right || kind == MergeKind.Outer;
 
-        // 单整数键快路径：直接以 long 哈希 + 链式行号数组（零 Convert.ToString 与零 List<int> 桶分配）。
+        // 统一列式物化（支持 Inner/Left/Right/Outer）：先以逆序单头链式索引收集 matchedL/matchedR，
+        // 再批量 Gather 物化（零 tailMap、零 List<int> 桶、零逐行 AppendRow）。
+        List<int> matchedL = new List<int>();
+        List<int> matchedR = new List<int>();
+        matchedL.Reserve(leftRows);
+        matchedR.Reserve(leftRows);
+        int[] nextRow = new int[rightRows];
+        bool[] rightMatched = keepRight ? new bool[rightRows] : null;
+
         if (lAt.Count == 1 && left.cols[lAt[0]].kind == ColKind.Int && right.cols[rAt[0]].kind == ColKind.Int
                 && left.cols[lAt[0]].missing.Count == 0 && right.cols[rAt[0]].missing.Count == 0) {
             List<long> rVals = right.cols[rAt[0]].ints;
             List<long> lVals = left.cols[lAt[0]].ints;
             Dictionary<long, int> headMap = new Dictionary<long, int>();
-            Dictionary<long, int> tailMap = new Dictionary<long, int>();
-            int[] nextRow = new int[rightRows];
-            for (int r = 0; r < rightRows; r = r + 1) {
-                nextRow[r] = -1;
+            for (int r = rightRows - 1; r >= 0; r = r - 1) {
                 long kv = rVals[r];
-                int tail;
-                if (tailMap.TryGetValue(kv, out tail)) {
-                    nextRow[tail] = r;
-                    tailMap[kv] = r;
-                } else {
-                    headMap[kv] = r;
-                    tailMap[kv] = r;
-                }
+                int prev = -1;
+                if (headMap.TryGetValue(kv, out prev)) { nextRow[r] = prev; }
+                else { nextRow[r] = -1; }
+                headMap[kv] = r;
             }
-            if (kind == MergeKind.Inner) {
-                // 内连接列式批量 GatherFromList 物化，零逐格分支调度。
-                List<int> matchedL = new List<int>();
-                List<int> matchedR = new List<int>();
-                matchedL.Reserve(leftRows);
-                matchedR.Reserve(leftRows);
-                for (int l = 0; l < leftRows; l = l + 1) {
-                    int rr;
-                    if (!headMap.TryGetValue(lVals[l], out rr)) { continue; }
-                    while (rr >= 0) {
-                        matchedL.Add(l);
-                        matchedR.Add(rr);
-                        rr = nextRow[rr];
-                    }
-                }
-                for (int c = 0; c < leftColCount; c = c + 1) {
-                    outp.cols[c].GatherFromList(left.cols[c], matchedL);
-                }
-                for (int i = 0; i < rightOutCols.Count; i = i + 1) {
-                    outp.cols[leftColCount + i].GatherFromList(right.cols[rightOutCols[i]], matchedR);
-                }
-                outp.rowCount = matchedL.Count;
-                return outp;
-            }
-            bool[] rightMatchedI = keepRight ? new bool[rightRows] : null;
             for (int l = 0; l < leftRows; l = l + 1) {
-                int rr;
+                int rr = -1;
                 if (!headMap.TryGetValue(lVals[l], out rr)) {
                     if (keepLeft) {
-                        Merge.AppendRow(outp, left, l, right, 0 - 1, rightOutCols, lAt, rAt);
+                        matchedL.Add(l);
+                        matchedR.Add(0 - 1);
                     }
                     continue;
                 }
                 while (rr >= 0) {
-                    Merge.AppendRow(outp, left, l, right, rr, rightOutCols, lAt, rAt);
-                    if (keepRight) { rightMatchedI[rr] = true; }
+                    matchedL.Add(l);
+                    matchedR.Add(rr);
+                    if (keepRight) { rightMatched[rr] = true; }
                     rr = nextRow[rr];
                 }
             }
-            if (keepRight) {
-                for (int r = 0; r < rightRows; r = r + 1) {
-                    if (!rightMatchedI[r]) {
-                        Merge.AppendRow(outp, left, 0 - 1, right, r, rightOutCols, lAt, rAt);
-                    }
-                }
+        } else {
+            Dictionary<string, int> headMap = new Dictionary<string, int>();
+            for (int r = rightRows - 1; r >= 0; r = r - 1) {
+                string k = Merge.RowKey(right, r, rAt);
+                int prev = -1;
+                if (headMap.TryGetValue(k, out prev)) { nextRow[r] = prev; }
+                else { nextRow[r] = -1; }
+                headMap[k] = r;
             }
-            return outp;
-        }
-
-        // 通用路径：右表按键分组。
-        Dictionary<string, List<int>> rmap = new Dictionary<string, List<int>>();
-        for (int r = 0; r < rightRows; r = r + 1) {
-            string k = Merge.RowKey(right, r, rAt);
-            List<int> bucket = null;
-            if (!rmap.TryGetValue(k, out bucket)) {
-                bucket = new List<int>();
-                rmap[k] = bucket;
-            }
-            bucket.Add(r);
-        }
-
-        if (kind == MergeKind.Inner) {
-            List<int> matchedL = new List<int>();
-            List<int> matchedR = new List<int>();
-            matchedL.Reserve(leftRows);
-            matchedR.Reserve(leftRows);
             for (int l = 0; l < leftRows; l = l + 1) {
                 string k = Merge.RowKey(left, l, lAt);
-                List<int> matches = null;
-                if (!rmap.TryGetValue(k, out matches)) { continue; }
-                for (int m = 0; m < matches.Count; m = m + 1) {
+                int rr = -1;
+                if (!headMap.TryGetValue(k, out rr)) {
+                    if (keepLeft) {
+                        matchedL.Add(l);
+                        matchedR.Add(0 - 1);
+                    }
+                    continue;
+                }
+                while (rr >= 0) {
                     matchedL.Add(l);
-                    matchedR.Add(matches[m]);
+                    matchedR.Add(rr);
+                    if (keepRight) { rightMatched[rr] = true; }
+                    rr = nextRow[rr];
                 }
             }
+        }
+        bool hasNullLeft = false;
+        if (keepRight) {
+            for (int r = 0; r < rightRows; r = r + 1) {
+                if (!rightMatched[r]) {
+                    matchedL.Add(0 - 1);
+                    matchedR.Add(r);
+                    hasNullLeft = true;
+                }
+            }
+        }
+        if (kind == MergeKind.Inner) {
             for (int c = 0; c < leftColCount; c = c + 1) {
                 outp.cols[c].GatherFromList(left.cols[c], matchedL);
             }
             for (int i = 0; i < rightOutCols.Count; i = i + 1) {
                 outp.cols[leftColCount + i].GatherFromList(right.cols[rightOutCols[i]], matchedR);
             }
-            outp.rowCount = matchedL.Count;
-            return outp;
-        }
-
-        bool[] rightMatched = new bool[rightRows];
-        for (int l = 0; l < leftRows; l = l + 1) {
-            string k = Merge.RowKey(left, l, lAt);
-            List<int> matches = null;
-            if (!rmap.TryGetValue(k, out matches)) {
+        } else {
+            for (int c = 0; c < leftColCount; c = c + 1) {
+                if (!hasNullLeft) {
+                    outp.cols[c].GatherFromList(left.cols[c], matchedL);
+                } else {
+                    int keyIdx = 0 - 1;
+                    for (int i = 0; i < lAt.Count; i = i + 1) {
+                        if (lAt[i] == c) { keyIdx = i; break; }
+                    }
+                    if (keyIdx >= 0) {
+                        outp.cols[c].GatherFromListFallback(left.cols[c], matchedL, right.cols[rAt[keyIdx]], matchedR);
+                    } else {
+                        outp.cols[c].GatherFromListNullable(left.cols[c], matchedL);
+                    }
+                }
+            }
+            for (int i = 0; i < rightOutCols.Count; i = i + 1) {
                 if (keepLeft) {
-                    Merge.AppendRow(outp, left, l, right, 0 - 1, rightOutCols,
-                        lAt, rAt);
-                }
-                continue;
-            }
-            for (int m = 0; m < matches.Count; m = m + 1) {
-                Merge.AppendRow(outp, left, l, right, matches[m], rightOutCols,
-                    lAt, rAt);
-                rightMatched[matches[m]] = true;
-            }
-        }
-
-        if (keepRight) {
-            for (int r = 0; r < rightRows; r = r + 1) {
-                if (!rightMatched[r]) {
-                    Merge.AppendRow(outp, left, 0 - 1, right, r, rightOutCols,
-                        lAt, rAt);
+                    outp.cols[leftColCount + i].GatherFromListNullable(right.cols[rightOutCols[i]], matchedR);
+                } else {
+                    outp.cols[leftColCount + i].GatherFromList(right.cols[rightOutCols[i]], matchedR);
                 }
             }
         }
+        outp.rowCount = matchedL.Count;
         return outp;
     }
 

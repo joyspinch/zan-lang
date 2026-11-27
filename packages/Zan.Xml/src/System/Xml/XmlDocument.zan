@@ -46,10 +46,13 @@ public class XmlDocument {
         return root.Element(name);
     }
 
+    // 预分配空白池，用于单次 StringView 缩进输出。
+    private static string IndentSpaces = "                                ";
+
     // 紧凑序列化：保留全部节点（注释/CDATA/PI/声明），不引入
     // 任何空白。
     public string ToXml() {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(4096);
         for (int i = 0; i < children.Count; i = i + 1) {
             XmlDocument.WriteNode(sb, children[i], 0, false);
         }
@@ -59,7 +62,7 @@ public class XmlDocument {
     // 缩进序列化（2 空格/层）：纯空白文本节点略去；唯一非空
     // 文本子节点的元素行内输出。同样可被 Parse 无损读回。
     public string ToPrettyXml() {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(4096);
         for (int i = 0; i < children.Count; i = i + 1) {
             XmlDocument.WriteNode(sb, children[i], 0, true);
             if (children[i].kind != 0) { sb.Append("\n"); }
@@ -179,15 +182,31 @@ public class XmlDocument {
             sb.Append("]]>");
             return;
         }
+        int tlen = text.Length;
+        nint tp = (nint)text;
+        // 快路径：先用 SIMD memchr 查 ']'，无 ']' 则不可能含 "]]>"，直接整串写入。
+        int rb = NativeMemory.Find(tp, 0, 93, tlen);
+        if (rb < 0 || rb + 2 >= tlen) {
+            sb.Append(text);
+            sb.Append("]]>");
+            return;
+        }
+        int hit = XmlNode.IndexOf(text, "]]>", rb);
+        if (hit < 0) {
+            sb.Append(text);
+            sb.Append("]]>");
+            return;
+        }
         int from = 0;
-        int hit = XmlNode.IndexOf(text, "]]>", from);
         while (hit >= 0) {
-            sb.Append(text.Substring(from, hit + 2 - from));
+            sb.Append(new StringView(tp + (nint)from, hit + 2 - from));
             sb.Append("]]><![CDATA[>");
             from = hit + 3;
             hit = XmlNode.IndexOf(text, "]]>", from);
         }
-        sb.Append(text.Substring(from, text.Length - from));
+        if (from < tlen) {
+            sb.Append(new StringView(tp + (nint)from, tlen - from));
+        }
         sb.Append("]]>");
     }
 
@@ -212,15 +231,19 @@ public class XmlDocument {
         int from = 0;
         for (int i = 0; i < n; i = i + 1) {
             int c = buf[i] & 255;
+            // 所有需转义字符（\t,\n,\r,",&,',<,>）均 <= 62，单分支跳过全部字母与 UTF-8 字节。
+            if (c > 62) { continue; }
             string rep = null;
             if (c == 38) { rep = "&amp;"; }
             else if (c == 60) { rep = "&lt;"; }
             else if (c == 62) { rep = "&gt;"; }
             else if (c == 13) { rep = "&#13;"; }
-            else if (isAttr && c == 34) { rep = "&quot;"; }
-            else if (isAttr && c == 39) { rep = "&#39;"; }
-            else if (isAttr && c == 10) { rep = "&#10;"; }
-            else if (isAttr && c == 9) { rep = "&#9;"; }
+            else if (isAttr) {
+                if (c == 34) { rep = "&quot;"; }
+                else if (c == 39) { rep = "&#39;"; }
+                else if (c == 10) { rep = "&#10;"; }
+                else if (c == 9) { rep = "&#9;"; }
+            }
             if (rep != null) {
                 if (i > from) { sb.Append(new StringView(tp + (nint)from, i - from)); }
                 sb.Append(rep);
@@ -235,9 +258,15 @@ public class XmlDocument {
     }
 
     public static void Indent(StringBuilder sb, int depth, bool pretty) {
-        if (!pretty) { return; }
-        for (int i = 0; i < depth; i = i + 1) {
-            sb.Append("  ");
+        if (!pretty || depth <= 0) { return; }
+        int rem = depth * 2;
+        nint sp = (nint)XmlDocument.IndentSpaces;
+        while (rem >= 32) {
+            sb.Append(XmlDocument.IndentSpaces);
+            rem = rem - 32;
+        }
+        if (rem > 0) {
+            sb.Append(new StringView(sp, rem));
         }
     }
 

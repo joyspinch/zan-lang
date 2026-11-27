@@ -51,7 +51,14 @@ public class Lz4Block {
             }
             if (litLen > 0) {
                 if (litLen > end - ip || litLen > maxOut - op) { return -1; }
-                NativeMemory.Copy(outPtr + op, srcPtr + ip, litLen);
+                if (litLen < 16) {
+                    int dOff = dstOffset + op;
+                    for (int k = 0; k < litLen; k = k + 1) {
+                        dst[dOff + k] = src[ip + k];
+                    }
+                } else {
+                    NativeMemory.Copy(outPtr + op, srcPtr + ip, litLen);
+                }
                 op = op + litLen;
                 ip = ip + litLen;
             }
@@ -75,7 +82,15 @@ public class Lz4Block {
             if (matchLen > maxOut - op) { return -1; }
             int mp = op - matchOff;
             if (matchOff >= matchLen) {
-                NativeMemory.Copy(outPtr + op, outPtr + mp, matchLen);
+                if (matchLen < 16) {
+                    int dOff = dstOffset + op;
+                    int sOff = dstOffset + mp;
+                    for (int k = 0; k < matchLen; k = k + 1) {
+                        dst[dOff + k] = dst[sOff + k];
+                    }
+                } else {
+                    NativeMemory.Copy(outPtr + op, outPtr + mp, matchLen);
+                }
                 op = op + matchLen;
             } else if (matchOff == 1) {
                 NativeMemory.Fill(outPtr + op, dst[dstOffset + mp] & 255, matchLen);
@@ -152,34 +167,45 @@ public class Lz4Block {
         }
         int maxOut = Lz4Block.UpperBound(n);
         byte[] out2 = new byte[maxOut + 8];
-        int[] table = new int[Lz4Block.HASH_SIZE];
-        // 表初始化为 -1（0xFF × 4 = -1，单次 memset 取代 65536 次标量写）。
-        NativeMemory.Fill((nint)table, 255, Lz4Block.HASH_SIZE * 4);
+        // 自适应哈希表尺寸：小块免去 256 KiB 分配与清零，大块保留 64K 桶高命中率。
+        int hashLog = 16;
+        if (n <= 256) { hashLog = 8; }
+        else if (n <= 1024) { hashLog = 10; }
+        else if (n <= 4096) { hashLog = 12; }
+        else if (n <= 16384) { hashLog = 14; }
+        int hashSize = 1 << hashLog;
+        int hashShift = 32 - hashLog;
+        int[] table = new int[hashSize];
+        NativeMemory.Fill((nint)table, 255, hashSize * 4);
         int op = 0;
         int anchor = 0;
         int ip = 0;
         int baseOff = offset;
         int mflimit = n - MIN_MATCH;
         int maxChain = Lz4Block.ChainLength(level);
-        int hashMask = Lz4Block.HASH_SIZE - 1;
+        // LZ4 标准失配加速：不可压区逐步加大探针步长（1 + (miss >> 6)），命中后清零。
+        int miss = 0;
         while (ip <= mflimit) {
             int p0 = baseOff + ip;
             int cur4 = (src[p0] & 255) | ((src[p0 + 1] & 255) << 8)
                 | ((src[p0 + 2] & 255) << 16) | ((src[p0 + 3] & 255) << 24);
-            int h = (int)(((uint)(cur4 * 265443576)) >> 16) & hashMask;
+            int h = (int)(((uint)cur4 * 2654435761U) >> hashShift);
             int cand = table[h];
             table[h] = ip;
             if (cand < 0 || ip - cand > 65535) {
-                ip = ip + 1;
+                ip = ip + 1 + (miss >> 6);
+                miss = miss + 1;
                 continue;
             }
             int q0 = baseOff + cand;
             int cand4 = (src[q0] & 255) | ((src[q0 + 1] & 255) << 8)
                 | ((src[q0 + 2] & 255) << 16) | ((src[q0 + 3] & 255) << 24);
             if (cand4 != cur4) {
-                ip = ip + 1;
+                ip = ip + 1 + (miss >> 6);
+                miss = miss + 1;
                 continue;
             }
+            miss = 0;
             // 找到 4 字节匹配：token 低 4 位承载 matchLen-4 的低段，
             // 再写字面量段。
             int litLen = ip - anchor;
@@ -262,7 +288,13 @@ public class Lz4Block {
             out2[op] = (byte)rest;
             op = op + 1;
         }
-        Lz4Block.CopyBytes(out2, op, src, anchor, litLen);
+        if (litLen < 16) {
+            for (int k = 0; k < litLen; k = k + 1) {
+                out2[op + k] = src[anchor + k];
+            }
+        } else {
+            NativeMemory.Copy((nint)out2 + op, (nint)src + anchor, litLen);
+        }
         return op + litLen;
     }
 

@@ -10,23 +10,33 @@ namespace Formats.Yaml;
 // （JsonValue 本身有序）。多文档、标签、合并键不支持（明确报错或
 // 按普通键，见 README）。
 public class YamlParser {
-    List<YamlLine> lines;  // 词法行实体列表（含虚拟回灌行）
+    // 预分配空白池，用于块标量相对缩进的零临时串输出。
+    private static string SpacePool = "                                ";
+
+    // 扁平词法行三列存储（零 YamlLine 堆对象分配）。
+    List<int> lineIndents;
+    List<string> lineTexts;
+    List<int> lineNos;
     Dict<string, JsonValue> anchors;
+    string[] keyCache;
     int cur;
     int lineCount;
     int lastLineNo;  // 刚消费行的行号（cur 推进后报错用）
 
     // 推进游标：先记行号再前进，之后的报错引用 lastLineNo——
-    // 直接写 lines[cur].lineNo 会越界（键在最后一行时 cur == lineCount）。
+    // 直接写 lineNos[cur] 会越界（键在最后一行时 cur == lineCount）。
     void Advance() {
-        lastLineNo = lines[cur].lineNo;
+        lastLineNo = lineNos[cur];
         cur = cur + 1;
     }
 
     // 构造并做行切分与前导处理（BOM/指令/前导注释/一个 --- 起始符）。
     public YamlParser(string src) {
-        lines = new List<YamlLine>();
+        lineIndents = new List<int>();
+        lineTexts = new List<string>();
+        lineNos = new List<int>();
         anchors = new Dict<string, JsonValue>();
+        keyCache = null;
         // BOM 是编码标记不是内容：文件路径已由 File.ReadAllText 剥过，
         // 网络/内嵌文本（Windows 工具常带 EF BB BF）在这里兜底，不剥
         // 首键会带上三个隐形字节。
@@ -41,6 +51,10 @@ public class YamlParser {
     void SplitLines(string src) {
         int lineNo = 1;
         int n = src.Length;
+        int estLines = (n >> 4) + 8;
+        lineIndents.Reserve(estLines);
+        lineTexts.Reserve(estLines);
+        lineNos.Reserve(estLines);
         nint sp = (nint)src;
         bool hasCr = n > 0 && NativeMemory.Find(sp, 0, 13, n) >= 0;
         if (!hasCr) {
@@ -48,12 +62,12 @@ public class YamlParser {
             while (lineStart <= n) {
                 int nl = lineStart < n ? NativeMemory.Find(sp, lineStart, 10, n - lineStart) : -1;
                 int lineEnd = nl < 0 ? n : nl;
-                PushLineSlice(src, lineStart, lineEnd, lineNo);
+                PushLineSlice(src, sp, lineStart, lineEnd, lineNo);
                 lineNo = lineNo + 1;
                 if (nl < 0) { break; }
                 lineStart = nl + 1;
             }
-            lineCount = lines.Count;
+            lineCount = lineTexts.Count;
             return;
         }
         int lineStart2 = 0;
@@ -61,7 +75,7 @@ public class YamlParser {
         while (i <= n) {
             int c = i < n ? (src[i] & 255) : 10;
             if (c == 13 || c == 10) {
-                PushLineSlice(src, lineStart2, i, lineNo);
+                PushLineSlice(src, sp, lineStart2, i, lineNo);
                 lineNo = lineNo + 1;
                 i = i + 1;
                 if (c == 13 && i < n && (src[i] & 255) == 10) { i = i + 1; }
@@ -70,14 +84,16 @@ public class YamlParser {
                 i = i + 1;
             }
         }
-        lineCount = lines.Count;
+        lineCount = lineTexts.Count;
     }
 
-    void PushLineSlice(string src, int lineStart, int lineEnd, int lineNo) {
+    void PushLineSlice(string src, nint sp, int lineStart, int lineEnd, int lineNo) {
         int ind = lineStart;
         while (ind < lineEnd && (src[ind] & 255) == 32) { ind = ind + 1; }
         if (ind == lineEnd) {
-            lines.Add(new YamlLine(ind - lineStart, "", lineNo));
+            lineIndents.Add(ind - lineStart);
+            lineTexts.Add("");
+            lineNos.Add(lineNo);
             return;
         }
         if ((src[ind] & 255) == 9) {
@@ -91,14 +107,16 @@ public class YamlParser {
                 k = k + 1;
             }
         }
-        lines.Add(new YamlLine(ind - lineStart, src.Substring(ind, lineEnd - ind), lineNo));
+        lineIndents.Add(ind - lineStart);
+        lineTexts.Add(NativeMemory.GetString(sp, ind, lineEnd - ind));
+        lineNos.Add(lineNo);
     }
 
     // 前导：指令行（%）、注释、空行，以及一个 --- 起始符（带内联
     // 内容时回灌为普通行）。
     void SkipPrologue() {
         while (cur < lineCount) {
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             if (t.Length == 0 || t[0] == 35 || t[0] == 37) {  // 空/#/%
                 cur = cur + 1;
                 continue;
@@ -106,8 +124,8 @@ public class YamlParser {
             if (t == "---") { cur = cur + 1; continue; }
             if (t.Length >= 4 && t[0] == 45 && t[1] == 45 && t[2] == 45
                 && t[3] == 32) {  // "--- x"
-                lines[cur].indent = lines[cur].indent + 4;
-                lines[cur].text = t.Substring(4);
+                lineIndents[cur] = lineIndents[cur] + 4;
+                lineTexts[cur] = t.Substring(4);
                 continue;
             }
             break;
@@ -121,15 +139,15 @@ public class YamlParser {
         JsonValue v = ParseBlock(0, 0);
         SkipIgnorable();
         if (cur < lineCount) {
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             if (t == "---" || (t.Length >= 4 && t[0] == 45 && t[1] == 45
                 && t[2] == 45 && t[3] == 32)) {
                 throw new YamlException("multi-document input is not supported"
-                    + " (line " + Convert.ToString(lines[cur].lineNo) + ")");
+                    + " (line " + Convert.ToString(lineNos[cur]) + ")");
             }
             if (t == "...") { return v; }
             throw new YamlException("unexpected content after document (line "
-                + Convert.ToString(lines[cur].lineNo) + ")");
+                + Convert.ToString(lineNos[cur]) + ")");
         }
         return v;
     }
@@ -137,7 +155,7 @@ public class YamlParser {
     // 跳过空行与纯注释行；`...` 文档结束符停在这里由调用方判。
     void SkipIgnorable() {
         while (cur < lineCount) {
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             if (t.Length == 0 || t[0] == 35) { cur = cur + 1; }
             else { break; }
         }
@@ -145,7 +163,8 @@ public class YamlParser {
 
     bool AtDocMarker() {
         if (cur >= lineCount) { return true; }
-        string t = lines[cur].text;
+        string t = lineTexts[cur];
+        if (t.Length != 3) { return false; }
         return t == "..." || t == "---";
     }
 
@@ -157,16 +176,17 @@ public class YamlParser {
         SkipIgnorable();
         if (AtDocMarker()) { return null; }
         if (cur >= lineCount) { return null; }
-        if (lines[cur].indent < minIndent) { return null; }
+        int curInd = lineIndents[cur];
+        if (curInd < minIndent) { return null; }
         if (depth > 512) {
             throw new YamlException("block nesting too deep (line "
-                + Convert.ToString(lines[cur].lineNo) + ")");
+                + Convert.ToString(lineNos[cur]) + ")");
         }
-        string t = lines[cur].text;
+        string t = lineTexts[cur];
         if (t == "-" || (t.Length >= 2 && t[0] == 45 && t[1] == 32)) {
-            return ParseSeq(lines[cur].indent, depth);
+            return ParseSeq(curInd, depth);
         }
-        if (FindKeyColon(t) >= 0) { return ParseMap(lines[cur].indent, depth); }
+        if (FindKeyColon(t) >= 0) { return ParseMap(curInd, depth); }
         return ParseBareNode(depth);
     }
 
@@ -178,53 +198,65 @@ public class YamlParser {
             SkipIgnorable();
             if (AtDocMarker()) { break; }
             if (cur >= lineCount) { break; }
-            if (lines[cur].indent != indent) {
-                if (lines[cur].indent < indent) { break; }
+            int curInd = lineIndents[cur];
+            if (curInd != indent) {
+                if (curInd < indent) { break; }
                 throw new YamlException("bad indentation in mapping (line "
-                    + Convert.ToString(lines[cur].lineNo) + ")");
+                    + Convert.ToString(lineNos[cur]) + ")");
             }
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             int ci = FindKeyColon(t);
             if (ci < 0) {
                 throw new YamlException("expected 'key:' in mapping (line "
-                    + Convert.ToString(lines[cur].lineNo) + ")");
+                    + Convert.ToString(lineNos[cur]) + ")");
             }
-            string key = DecodeKey(t.Substring(0, ci));
-            string rest = "";
+            int ke = ci;
+            while (ke > 0 && (t[ke - 1] & 255) == 32) { ke = ke - 1; }
+            string key;
+            int kc0 = ke > 0 ? (t[0] & 255) : 0;
+            if (ke >= 2 && (kc0 == 34 || kc0 == 39)) {
+                key = DecodeKey(NativeMemory.GetString((nint)t, 0, ke));
+            } else {
+                key = InternKey(t, ke);
+            }
             int vstart = ci + 1;
             int tl = t.Length;
             while (vstart < tl && (t[vstart] & 255) == 32) { vstart = vstart + 1; }
-            if (vstart < tl) { rest = t.Substring(vstart); }
             Advance();
             string anchor = "";
             JsonValue val;
-            if (rest.Length > 0 && rest[0] == 38) {  // &anchor
-                int sp = 1;
-                int rl = rest.Length;
-                while (sp < rl && (rest[sp] & 255) != 32) { sp = sp + 1; }
-                anchor = rest.Substring(1, sp - 1);
-                while (sp < rl && (rest[sp] & 255) == 32) { sp = sp + 1; }
-                rest = sp < rl ? rest.Substring(sp) : "";
+            int vc0 = vstart < tl ? (t[vstart] & 255) : 0;
+            if (vc0 == 38) {  // &anchor
+                int sp = vstart + 1;
+                while (sp < tl && (t[sp] & 255) != 32) { sp = sp + 1; }
+                anchor = NativeMemory.GetString((nint)t, vstart + 1, sp - (vstart + 1));
+                while (sp < tl && (t[sp] & 255) == 32) { sp = sp + 1; }
+                vstart = sp;
+                vc0 = vstart < tl ? (t[vstart] & 255) : 0;
             }
-            if (rest.Length > 0 && (rest[0] == 124 || rest[0] == 62)) {
-                val = ReadBlockScalar(rest, indent);  // | 或 >
-            } else if (rest.Length == 0 || IsCommentOnly(rest)) {
+            if (vstart >= tl || vc0 == 35) {
                 val = ParseBlock(indent + 1, depth + 1);
                 if (val == null) {
                     // 序列子节点允许与键同缩进（key:\n- a）。
                     if (!AtDocMarker() && cur < lineCount
-                        && lines[cur].indent == indent && IsSeqLine(lines[cur].text)) {
+                        && lineIndents[cur] == indent && IsSeqLine(lineTexts[cur])) {
                         val = ParseSeq(indent, depth + 1);
                     } else {
                         val = JsonValue.NewNull();
                     }
                 }
-            } else if (rest[0] == 42) {  // *alias
-                val = ResolveAlias(rest);
-            } else if (rest[0] == 91 || rest[0] == 123) {  // [ 或 {
-                val = ParseJoinedFlow(rest);
+            } else if (vc0 == 124 || vc0 == 62) {
+                val = ReadBlockScalarSlice(t, vstart, tl, indent);  // | 或 >
+            } else if (vc0 == 42) {  // *alias
+                val = ResolveAlias(NativeMemory.GetString((nint)t, vstart, tl - vstart));
+            } else if (vc0 == 91 || vc0 == 123) {  // [ 或 {
+                val = ParseJoinedFlow(NativeMemory.GetString((nint)t, vstart, tl - vstart));
+            } else if (vc0 == 34) {
+                val = JsonValue.NewStr(DecodeDoubleQuotedSlice(t, vstart, tl));
+            } else if (vc0 == 39) {
+                val = JsonValue.NewStr(DecodeSingleQuotedSlice(t, vstart, tl));
             } else {
-                val = ScalarNode(rest);
+                val = ParsePlainSlice(t, vstart, tl);
             }
             if (anchor.Length > 0) { anchors[anchor] = val; }
             if (obj.Has(key)) {
@@ -248,12 +280,12 @@ public class YamlParser {
             SkipIgnorable();
             if (AtDocMarker()) { break; }
             if (cur >= lineCount) { break; }
-            if (lines[cur].indent != indent) { break; }
+            if (lineIndents[cur] != indent) { break; }
             if (depth > 512) {
                 throw new YamlException("block nesting too deep (line "
-                    + Convert.ToString(lines[cur].lineNo) + ")");
+                    + Convert.ToString(lineNos[cur]) + ")");
             }
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             if (!IsSeqLine(t)) { break; }
             if (t.Length == 1) {  // "-" 单独一行
                 Advance();
@@ -265,7 +297,7 @@ public class YamlParser {
             int sp = 1;
             int tl = t.Length;
             while (sp < tl && (t[sp] & 255) == 32) { sp = sp + 1; }
-            string rest = t.Substring(sp);
+            string rest = sp < tl ? NativeMemory.GetString((nint)t, sp, tl - sp) : "";
             int contentCol = indent + sp;
             if (rest.Length == 0) {
                 // "- "（短横后仅空格）等价 "-" 单独成行：null 项。
@@ -280,8 +312,8 @@ public class YamlParser {
                 continue;
             }
             // 压缩形式：把剩余内容回灌为 contentCol 列的虚拟行。
-            lines[cur].indent = contentCol;
-            lines[cur].text = rest;
+            lineIndents[cur] = contentCol;
+            lineTexts[cur] = rest;
             JsonValue item = ParseBlock(contentCol, depth + 1);
             if (item == null) { item = JsonValue.NewNull(); }
             items.Add(item);
@@ -292,8 +324,8 @@ public class YamlParser {
     // ===== 裸标量节点（根/序列压缩项） =====
 
     JsonValue ParseBareNode(int depth) {
-        string t = lines[cur].text;
-        int indent = lines[cur].indent;
+        string t = lineTexts[cur];
+        int indent = lineIndents[cur];
         Advance();
         if (t.Length > 0 && (t[0] == 124 || t[0] == 62)) {
             return ReadBlockScalar(t, indent - 1);
@@ -351,13 +383,140 @@ public class YamlParser {
 
     // ===== 块标量（| 字面 / > 折叠，含 chomping 与显式缩进位） =====
 
+    // 短映射键直映缓存（64 槽，FNV-1a 32 + 逐字节验证），对象序列复用键串零分配。
+    string InternKey(string t, int klen) {
+        if (klen <= 0) { return ""; }
+        nint tp = (nint)t;
+        if (klen > 32) { return NativeMemory.GetString(tp, 0, klen); }
+        if (keyCache == null) { keyCache = new string[64]; }
+        Span<byte> tb = new Span<byte>(tp, klen);
+        uint h = 2166136261U;
+        for (int i = 0; i < klen; i = i + 1) {
+            h = (h ^ (uint)(tb[i] & 255)) * 16777619U;
+        }
+        int slot = (int)(h & 63U);
+        string cached = keyCache[slot];
+        if (cached != null && cached.Length == klen) {
+            Span<byte> cb = new Span<byte>((nint)cached, klen);
+            bool eq = true;
+            for (int i = 0; i < klen; i = i + 1) {
+                if (tb[i] != cb[i]) { eq = false; break; }
+            }
+            if (eq) { return cached; }
+        }
+        string fresh = NativeMemory.GetString(tp, 0, klen);
+        keyCache[slot] = fresh;
+        return fresh;
+    }
+
+    // 直接在行切片 [start, end) 上去行尾注释并解析 plain 标量（整数/布尔/null 零中间串分配）。
+    JsonValue ParsePlainSlice(string t, int start, int end) {
+        int n = end - start;
+        if (n <= 0) { return JsonValue.NewNull(); }
+        nint tp = (nint)t;
+        // 剥除 " #" 行内注释
+        if (n >= 2) {
+            int pos = start + 1;
+            while (pos < end) {
+                int hit = NativeMemory.Find(tp, pos, 35, end - pos);
+                if (hit < 0) { break; }
+                if ((t[hit - 1] & 255) == 32) {
+                    int e = hit;
+                    while (e > start && (t[e - 1] & 255) == 32) { e = e - 1; }
+                    end = e;
+                    n = end - start;
+                    break;
+                }
+                pos = hit + 1;
+            }
+        }
+        if (n <= 0) { return JsonValue.NewNull(); }
+        int c0 = t[start] & 255;
+        // 高频无转义普通字符串直接切片返回，跳过 18 次关键字与数字探测。
+        if (c0 != 126 && c0 != 110 && c0 != 78 && c0 != 116 && c0 != 84
+            && c0 != 102 && c0 != 70 && c0 != 46 && c0 != 43 && c0 != 45
+            && (c0 < 48 || c0 > 57)) {
+            return JsonValue.NewStr(NativeMemory.GetString(tp, start, n));
+        }
+        // 快路径：常见小写 null / true / false / ~ 零串分配
+        if (n == 1 && c0 == 126) { return JsonValue.NewNull(); }
+        if (n == 4 && c0 == 110 && (t[start + 1] & 255) == 117
+            && (t[start + 2] & 255) == 108 && (t[start + 3] & 255) == 108) {
+            return JsonValue.NewNull();
+        }
+        if (n == 4 && c0 == 116 && (t[start + 1] & 255) == 114
+            && (t[start + 2] & 255) == 117 && (t[start + 3] & 255) == 101) {
+            return JsonValue.NewBool(true);
+        }
+        if (n == 5 && c0 == 102 && (t[start + 1] & 255) == 97
+            && (t[start + 2] & 255) == 108 && (t[start + 3] & 255) == 115
+            && (t[start + 4] & 255) == 101) {
+            return JsonValue.NewBool(false);
+        }
+        // 快路径：整数（十进制/0x/0o）直接原地累加，零串分配
+        if ((c0 >= 48 && c0 <= 57) || c0 == 45 || c0 == 43) {
+            bool neg = c0 == 45;
+            int i = (neg || c0 == 43) ? (start + 1) : start;
+            if (i < end) {
+                long v = 0;
+                bool overflow = false;
+                bool isInt = true;
+                if (end > i + 2 && (t[i] & 255) == 48 && (t[i + 1] & 255) == 120) {
+                    int k = i + 2;
+                    while (k < end) {
+                        int d = HexDigit(t[k] & 255);
+                        if (d < 0) { isInt = false; break; }
+                        if (v > 576460752303423487L) { overflow = true; }
+                        v = (v << 4) + d;
+                        k = k + 1;
+                    }
+                    if (isInt) {
+                        if (overflow) { return JsonValue.NewStr(NativeMemory.GetString(tp, start, n)); }
+                        return JsonValue.NewInt(neg ? (0 - v) : v);
+                    }
+                } else if (end > i + 2 && (t[i] & 255) == 48 && (t[i + 1] & 255) == 111) {
+                    int k = i + 2;
+                    while (k < end) {
+                        int c = t[k] & 255;
+                        if (c < 48 || c > 55) { isInt = false; break; }
+                        if (v > 1152921504606846975L) { overflow = true; }
+                        v = (v << 3) + (c - 48);
+                        k = k + 1;
+                    }
+                    if (isInt) {
+                        if (overflow) { return JsonValue.NewStr(NativeMemory.GetString(tp, start, n)); }
+                        return JsonValue.NewInt(neg ? (0 - v) : v);
+                    }
+                } else {
+                    int k = i;
+                    while (k < end) {
+                        int c = t[k] & 255;
+                        if (c < 48 || c > 57) { isInt = false; break; }
+                        if (v > 922337203685477579L) { overflow = true; }
+                        v = v * 10 + (c - 48);
+                        k = k + 1;
+                    }
+                    if (isInt) {
+                        if (overflow) { return JsonValue.NewStr(NativeMemory.GetString(tp, start, n)); }
+                        return JsonValue.NewInt(neg ? (0 - v) : v);
+                    }
+                }
+            }
+        }
+        return TypeScalar(NativeMemory.GetString(tp, start, n));
+    }
+
+    // 块标量切片入口（免分配 header 子串）。
     JsonValue ReadBlockScalar(string header, int parentIndent) {
-        int style = header[0];  // 124=| 62=>
+        return ReadBlockScalarSlice(header, 0, header.Length, parentIndent);
+    }
+
+    JsonValue ReadBlockScalarSlice(string header, int hStart, int hEnd, int parentIndent) {
+        int style = header[hStart] & 255;  // 124=| 62=>
         int chomp = 0;  // 0 clip -1 strip 1 keep
         int explicitInd = 0;
-        int hi = 1;
-        int hl = header.Length;
-        while (hi < hl) {
+        int hi = hStart + 1;
+        while (hi < hEnd) {
             int c = header[hi] & 255;
             if (c == 45) { chomp = -1; }
             else if (c == 43) { chomp = 1; }
@@ -370,13 +529,16 @@ public class YamlParser {
             }
             hi = hi + 1;
         }
-        List<string> linesList = new List<string>();
+        // 单遍流式写入单一 StringBuilder：零 List<string> 与零逐行缩进 StringBuilder 分配。
+        StringBuilder body = new StringBuilder(64);
         int blockIndent = 0;
         int trailingBlanks = 0;
+        int emittedCount = 0;
         if (explicitInd > 0) { blockIndent = parentIndent + explicitInd; }
+        nint spacePtr = (nint)YamlParser.SpacePool;
         while (cur < lineCount) {
-            string raw = lines[cur].text;
-            int ind = lines[cur].indent;
+            string raw = lineTexts[cur];
+            int ind = lineIndents[cur];
             if (raw.Length == 0) {
                 trailingBlanks = trailingBlanks + 1;
                 cur = cur + 1;
@@ -387,52 +549,35 @@ public class YamlParser {
                 blockIndent = ind;
             }
             if (ind < blockIndent) { break; }
-            // 冲洗前续内部空行（仅文件/块末尾的空行留给 trailingBlanks 按 chomp 策略处理）。
-            while (trailingBlanks > 0) {
-                linesList.Add("");
-                trailingBlanks = trailingBlanks - 1;
-            }
-            // lines 存的是剥过行首 ind 空格的文本；比块公共缩进更深的行需还原额外相对缩进空格。
             int extra = ind - blockIndent;
-            if (extra > 0) {
-                StringBuilder pad = new StringBuilder(extra + raw.Length);
-                for (int s = 0; s < extra; s = s + 1) { pad.Append(" "); }
-                pad.Append(raw);
-                linesList.Add(pad.ToString());
-            } else {
-                linesList.Add(raw);
-            }
-            cur = cur + 1;
-        }
-        // StringBuilder 累加：body = body + x 的每行整串拷贝在大块
-        // 标量（万行级）上是 O(n²)。
-        StringBuilder body = new StringBuilder();
-        int n = linesList.Count;
-        if (style == 124) {  // 字面：原样换行
-            int i = 0;
-            while (i < n) {
-                if (i > 0) { body.Append("\n"); }
-                body.Append(linesList[i]);
-                i = i + 1;
-            }
-        } else {  // 折叠：单换行变空格
-            int i = 0;
-            int pending = 0;
-            while (i < n) {
-                string ln = linesList[i];
-                if (ln.Length == 0) { pending = pending + 1; }
-                else {
-                    if (body.Length == 0) { body.Append(ln); }
-                    else if (pending == 0) { body.Append(" "); body.Append(ln); }
-                    else {
-                        int k = 0;
-                        while (k < pending) { body.Append("\n"); k = k + 1; }
-                        body.Append(ln);
-                    }
-                    pending = 0;
+            if (style == 124) {  // 字面：原样换行
+                while (trailingBlanks > 0) {
+                    if (emittedCount > 0) { body.Append("\n"); }
+                    emittedCount = emittedCount + 1;
+                    trailingBlanks = trailingBlanks - 1;
                 }
-                i = i + 1;
+                if (emittedCount > 0) { body.Append("\n"); }
+                emittedCount = emittedCount + 1;
+            } else {  // 折叠：单换行变空格
+                if (body.Length > 0) {
+                    if (trailingBlanks == 0) {
+                        body.Append(" ");
+                    } else {
+                        for (int k = 0; k < trailingBlanks; k = k + 1) { body.Append("\n"); }
+                    }
+                }
+                trailingBlanks = 0;
             }
+            if (extra > 0) {
+                int rem = extra;
+                while (rem >= 32) {
+                    body.Append(YamlParser.SpacePool);
+                    rem = rem - 32;
+                }
+                if (rem > 0) { body.Append(new StringView(spacePtr, rem)); }
+            }
+            body.Append(raw);
+            cur = cur + 1;
         }
         if (chomp == 0) {  // clip
             if (body.Length > 0) { body.Append("\n"); }
@@ -459,7 +604,7 @@ public class YamlParser {
                 throw new YamlException("unterminated flow collection (line "
                     + Convert.ToString(lastLineNo) + ")");
             }
-            string t = lines[cur].text;
+            string t = lineTexts[cur];
             cur = cur + 1;
             if (t.Length == 0) { continue; }
             string part = StripComment(t);
@@ -729,22 +874,26 @@ public class YamlParser {
         return s;
     }
 
-    // 双引标量（整段含首尾引号）解码（无转义快路径零 StringBuilder）。
+    // 双引标量（整段含首尾引号）解码（无转义快路径零 StringBuilder，转义段走 StringView）。
     string DecodeDoubleQuoted(string t) {
+        return DecodeDoubleQuotedSlice(t, 0, t.Length);
+    }
+
+    string DecodeDoubleQuotedSlice(string t, int sliceStart, int sliceEnd) {
         StringBuilder sb = null;
-        int at = 1;
-        int start = 1;
-        int n = t.Length;
-        while (at < n) {
+        int at = sliceStart + 1;
+        int start = at;
+        nint tp = (nint)t;
+        while (at < sliceEnd) {
             int ch = t[at] & 255;
             if (ch == 34) {
-                if (sb == null) { return t.Substring(start, at - start); }
-                if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
+                if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
                 return sb.ToString();
             }
             if (ch == 92) {
-                if (sb == null) { sb = new StringBuilder(); }
-                if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                if (sb == null) { sb = new StringBuilder(sliceEnd - sliceStart); }
+                if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
                 at = at + 1;
                 ReadEscape(t, ref at, sb);
                 start = at;
@@ -752,36 +901,40 @@ public class YamlParser {
             }
             at = at + 1;
         }
-        if (sb == null) { return t.Substring(start, at - start); }
-        if (at > start) { sb.Append(t.Substring(start, at - start)); }
+        if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
+        if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
         return sb.ToString();
     }
 
-    // 单引标量（整段含首尾引号）解码：'' → '（无转义快路径零 StringBuilder）。
+    // 单引标量（整段含首尾引号）解码：'' → '（无转义快路径零 StringBuilder，转义段走 StringView）。
     string DecodeSingleQuoted(string t) {
+        return DecodeSingleQuotedSlice(t, 0, t.Length);
+    }
+
+    string DecodeSingleQuotedSlice(string t, int sliceStart, int sliceEnd) {
         StringBuilder sb = null;
-        int at = 1;
-        int start = 1;
-        int n = t.Length;
-        while (at < n) {
+        int at = sliceStart + 1;
+        int start = at;
+        nint tp = (nint)t;
+        while (at < sliceEnd) {
             int ch = t[at] & 255;
             if (ch == 39) {
-                if (at + 1 < n && (t[at + 1] & 255) == 39) {
-                    if (sb == null) { sb = new StringBuilder(); }
-                    if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                if (at + 1 < sliceEnd && (t[at + 1] & 255) == 39) {
+                    if (sb == null) { sb = new StringBuilder(sliceEnd - sliceStart); }
+                    if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
                     sb.Append("'");
                     at = at + 2;
                     start = at;
                     continue;
                 }
-                if (sb == null) { return t.Substring(start, at - start); }
-                if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
+                if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
                 return sb.ToString();
             }
             at = at + 1;
         }
-        if (sb == null) { return t.Substring(start, at - start); }
-        if (at > start) { sb.Append(t.Substring(start, at - start)); }
+        if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
+        if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
         return sb.ToString();
     }
 
@@ -922,66 +1075,99 @@ public class YamlParser {
         return false;
     }
 
-    // plain 标量 → null/bool/int/float/string（core schema，宽松接受
-    // True/TRUE 等大小写变体）。公开给写侧复用：ToYaml 判断字符串
-    // 是否需要加引号，就看它重新解析会不会变型。
+    // plain 标量 → null/bool/int/float/string（首字节分派 + 单遍整数融合解析，消除普通串 18 次比较）。
     public static JsonValue TypeScalar(string s) {
-        if (s.Length == 0 || s == "~" || s == "null" || s == "Null"
-            || s == "NULL") { return JsonValue.NewNull(); }
-        if (s == "true" || s == "True" || s == "TRUE") {
-            return JsonValue.NewBool(true);
+        int n = s.Length;
+        if (n == 0) { return JsonValue.NewNull(); }
+        int c0 = s[0] & 255;
+        if (c0 == 126) {
+            if (n == 1) { return JsonValue.NewNull(); }
+            return JsonValue.NewStr(s);
         }
-        if (s == "false" || s == "False" || s == "FALSE") {
-            return JsonValue.NewBool(false);
+        if (c0 == 110 || c0 == 78) {
+            if (n == 4 && (s == "null" || s == "Null" || s == "NULL")) { return JsonValue.NewNull(); }
+            return JsonValue.NewStr(s);
         }
-        if (s == ".inf" || s == ".Inf" || s == ".INF"
-            || s == "+.inf" || s == "+.Inf" || s == "+.INF") {
-            return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF0000000000000L));
+        if (c0 == 116 || c0 == 84) {
+            if (n == 4 && (s == "true" || s == "True" || s == "TRUE")) { return JsonValue.NewBool(true); }
+            return JsonValue.NewStr(s);
         }
-        if (s == "-.inf" || s == "-.Inf" || s == "-.INF") {
-            return JsonValue.NewDouble(0.0 - NativeMemory.AsF64(0x7FF0000000000000L));
+        if (c0 == 102 || c0 == 70) {
+            if (n == 5 && (s == "false" || s == "False" || s == "FALSE")) { return JsonValue.NewBool(false); }
+            return JsonValue.NewStr(s);
         }
-        if (s == ".nan" || s == ".NaN" || s == ".NAN") {
-            return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF8000000000000L));
+        if (c0 != 46 && c0 != 43 && c0 != 45 && (c0 < 48 || c0 > 57)) {
+            return JsonValue.NewStr(s);
         }
-        if (IsIntShape(s)) {
-            long v = 0;
-            bool neg = false;
-            int i = 0;
-            int n = s.Length;
-            if (s[0] == 45) { neg = true; i = 1; }
-            else if (s[0] == 43) { i = 1; }
-            bool overflow = false;
-            if (n > i + 1 && s[i] == 48 && (s[i + 1] == 120)) {  // 0x
-                i = i + 2;
-                while (i < n) {
-                    int d = HexDigit(s[i] & 255);
-                    if (d < 0) { return JsonValue.NewStr(s); }
-                    if (v > 576460752303423487) { overflow = true; }
-                    v = (v << 4) + d;
-                    i = i + 1;
+        if (c0 == 46) {
+            if (n == 4) {
+                if (s == ".inf" || s == ".Inf" || s == ".INF") {
+                    return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF0000000000000L));
                 }
-            } else if (n > i + 1 && s[i] == 48 && s[i + 1] == 111) {  // 0o
-                i = i + 2;
-                while (i < n) {
-                    int c = s[i] & 255;
-                    if (c < 48 || c > 55) { return JsonValue.NewStr(s); }
-                    if (v > 1152921504606846975) { overflow = true; }
-                    v = (v << 3) + (c - 48);
-                    i = i + 1;
-                }
-            } else {
-                while (i < n) {
-                    int c = s[i] & 255;
-                    if (c < 48 || c > 57) { return JsonValue.NewStr(s); }
-                    if (v > 922337203685477579) { overflow = true; }
-                    v = v * 10 + (c - 48);
-                    i = i + 1;
+                if (s == ".nan" || s == ".NaN" || s == ".NAN") {
+                    return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF8000000000000L));
                 }
             }
-            if (overflow) { return JsonValue.NewStr(s); }  // 超宽整型保原文
-            if (neg) { v = 0 - v; }
-            return JsonValue.NewInt(v);
+            if (IsFloatShape(s)) { return JsonValue.NewDouble(DoubleOf(s)); }
+            return JsonValue.NewStr(s);
+        }
+        if (c0 == 43 || c0 == 45) {
+            if (n == 5 && (s[1] & 255) == 46) {
+                if (c0 == 43 && (s == "+.inf" || s == "+.Inf" || s == "+.INF")) {
+                    return JsonValue.NewDouble(NativeMemory.AsF64(0x7FF0000000000000L));
+                }
+                if (c0 == 45 && (s == "-.inf" || s == "-.Inf" || s == "-.INF")) {
+                    return JsonValue.NewDouble(0.0 - NativeMemory.AsF64(0x7FF0000000000000L));
+                }
+            }
+        }
+        // 单遍整数快速路径：同时校验形态并累加数值，不合法则顺延浮点评判。
+        bool neg = c0 == 45;
+        int i = (neg || c0 == 43) ? 1 : 0;
+        if (i < n) {
+            long v = 0;
+            bool overflow = false;
+            bool isInt = true;
+            if (n > i + 2 && (s[i] & 255) == 48 && (s[i + 1] & 255) == 120) {  // 0x
+                int k = i + 2;
+                while (k < n) {
+                    int d = HexDigit(s[k] & 255);
+                    if (d < 0) { isInt = false; break; }
+                    if (v > 576460752303423487L) { overflow = true; }
+                    v = (v << 4) + d;
+                    k = k + 1;
+                }
+                if (isInt) {
+                    if (overflow) { return JsonValue.NewStr(s); }
+                    return JsonValue.NewInt(neg ? (0 - v) : v);
+                }
+            } else if (n > i + 2 && (s[i] & 255) == 48 && (s[i + 1] & 255) == 111) {  // 0o
+                int k = i + 2;
+                while (k < n) {
+                    int c = s[k] & 255;
+                    if (c < 48 || c > 55) { isInt = false; break; }
+                    if (v > 1152921504606846975L) { overflow = true; }
+                    v = (v << 3) + (c - 48);
+                    k = k + 1;
+                }
+                if (isInt) {
+                    if (overflow) { return JsonValue.NewStr(s); }
+                    return JsonValue.NewInt(neg ? (0 - v) : v);
+                }
+            } else {
+                int k = i;
+                while (k < n) {
+                    int c = s[k] & 255;
+                    if (c < 48 || c > 57) { isInt = false; break; }
+                    if (v > 922337203685477579L) { overflow = true; }
+                    v = v * 10 + (c - 48);
+                    k = k + 1;
+                }
+                if (isInt) {
+                    if (overflow) { return JsonValue.NewStr(s); }
+                    return JsonValue.NewInt(neg ? (0 - v) : v);
+                }
+            }
         }
         if (IsFloatShape(s)) { return JsonValue.NewDouble(DoubleOf(s)); }
         return JsonValue.NewStr(s);

@@ -19,8 +19,8 @@ public class BZip2Decoder {
     static int MaxGroups = 6;
     static int MaxCodeLen = 23;
     static int GroupSize = 50;
-    static int FastBits = 8;
-    static int FastSize = 256;
+    static int FastBits = 10;
+    static int FastSize = 1024;
     static int[] sharedCrcTable = null;
 
     // ---- 输入（文件或内存）----
@@ -70,7 +70,7 @@ public class BZip2Decoder {
         this.bitBuf = 0UL;
         this.bitCnt = 0;
         this.inEof = false;
-        this.outBuf = new byte[262144];
+        this.outBuf = null;
         this.outPos = 0;
         this.memOut = null;
         this.outTotal = 0;
@@ -81,7 +81,7 @@ public class BZip2Decoder {
         this.cftab = new int[257];
         this.seqToUnseq = new byte[256];
         this.mtf = new byte[256];
-        this.selector = new int[18002];
+        this.selector = null;
         this.len = new int[MaxGroups * MaxAlphaSize];
         this.limit = new int[MaxGroups * (MaxCodeLen + 2)];
         this.baseTab = new int[MaxGroups * (MaxCodeLen + 2)];
@@ -238,6 +238,10 @@ public class BZip2Decoder {
         this.inBuf = data;
         this.inLen = data.Length;
         this.inPos = 0;
+        int obCap = data.Length * 8;
+        if (obCap < 4096) { obCap = 4096; }
+        if (obCap > 262144) { obCap = 262144; }
+        this.outBuf = new byte[obCap];
         this.memOut = new List<byte[]>();
         if (!this.Decode()) { return null; }
         // 拼接输出块（单块零拷贝直返）。
@@ -260,6 +264,7 @@ public class BZip2Decoder {
     // 返回 false（目标文件可能已写出部分内容）。
     public bool RunFile(string srcPath, string dstPath) {
         this.inBuf = new byte[65536];
+        this.outBuf = new byte[262144];
         this.fp = BZip2Decoder.PlatFopen(srcPath, "rb");
         if (this.fp == 0) { return false; }
         this.ofp = BZip2Decoder.PlatFopen(dstPath, "wb");
@@ -293,7 +298,11 @@ public class BZip2Decoder {
         if (b0 != 66 || b1 != 90 || b2 != 104) { return false; }  // "BZh"
         if (lvl < 49 || lvl > 57) { return false; }  // '1'..'9'
         int blockSize = (lvl - 48) * 100000;
-        this.tt = new int[blockSize];
+        // 按需初始分配 tt：小块免去 3.6 MiB 全量清零，大块按需倍增至 blockSize。
+        int initTt = this.memSrc != null ? this.inLen * 8 : 65536;
+        if (initTt < 4096) { initTt = 4096; }
+        if (initTt > blockSize) { initTt = blockSize; }
+        this.tt = new int[initTt];
         this.combinedCrc = 0;
         bool more = true;
         while (more) {
@@ -343,7 +352,10 @@ public class BZip2Decoder {
         int nGroups = this.GetBits(3);
         int nSelectors = this.GetBits(15);
         if (nGroups < 2 || nGroups > MaxGroups) { return false; }
-        if (nSelectors < 1 || nSelectors > this.selector.Length) { return false; }
+        if (nSelectors < 1 || nSelectors > 18002) { return false; }
+        if (this.selector == null || this.selector.Length < nSelectors) {
+            this.selector = new int[nSelectors];
+        }
         int[] pos = new int[MaxGroups];
         for (int i = 0; i < nSelectors; i = i + 1) {
             int j = 0;
@@ -392,7 +404,7 @@ public class BZip2Decoder {
             if (!this.BuildDecodeTables(t, alphaSize)) { return false; }
         }
 
-        // --- MTF / RLE2 解码（内联位缓冲与 8-bit 前缀直查，消除逐符号方法调用与 ref 寻址）---
+        // --- MTF / RLE2 解码（内联位缓冲、10-bit 前缀直查与内联长码回退，消除逐符号方法调用与字段溢出）---
         int eob = alphaSize - 1;
         for (int i = 0; i < 256; i = i + 1) { this.unzftab[i] = 0; }
         for (int i = 0; i < nInUse; i = i + 1) { this.mtf[i] = this.seqToUnseq[i]; }
@@ -404,10 +416,15 @@ public class BZip2Decoder {
         int runLen = 0;
         int runBit = 0;
         int[] ttArr = this.tt;
+        int ttCap = ttArr.Length;
         byte[] mtfArr = this.mtf;
         int[] unzf = this.unzftab;
         int[] selArr = this.selector;
         int[] lut = this.fastLut;
+        int[] limArr = this.limit;
+        int[] baseArr = this.baseTab;
+        int[] permArr = this.perm;
+        int[] minArr = this.minLens;
         byte[] ibuf = this.inBuf;
         int ipos = this.inPos;
         int ilen = this.inLen;
@@ -426,6 +443,15 @@ public class BZip2Decoder {
             }
             groupPos = groupPos - 1;
             if (bcnt < FastBits) {
+                while (bcnt <= 32 && ipos + 3 < ilen) {
+                    ulong w = (((ulong)(ibuf[ipos] & 255)) << 24)
+                        | (((ulong)(ibuf[ipos + 1] & 255)) << 16)
+                        | (((ulong)(ibuf[ipos + 2] & 255)) << 8)
+                        | ((ulong)(ibuf[ipos + 3] & 255));
+                    bbuf = (bbuf << 32) | w;
+                    ipos = ipos + 4;
+                    bcnt = bcnt + 32;
+                }
                 while (bcnt <= 56 && ipos < ilen) {
                     bbuf = (bbuf << 8) | (ulong)(ibuf[ipos] & 255);
                     ipos = ipos + 1;
@@ -439,7 +465,7 @@ public class BZip2Decoder {
             }
             int sym = -1;
             if (bcnt >= FastBits) {
-                int peek = (int)((bbuf >> (bcnt - FastBits)) & 255UL);
+                int peek = (int)((bbuf >> (bcnt - FastBits)) & 1023UL);
                 int entry = lut[fbase + peek];
                 if (entry != 0) {
                     bcnt = bcnt - (entry >> 16);
@@ -447,10 +473,68 @@ public class BZip2Decoder {
                 }
             }
             if (sym < 0) {
-                this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
-                sym = this.DecodeSlowSymbol(gSel);
-                bbuf = this.bitBuf; bcnt = this.bitCnt; ipos = this.inPos; ilen = this.inLen;
-                if (sym < 0) { return false; }
+                // 内联长码（>10 bit）或流尾（<10 bit）canonical Huffman 解码，零方法调用。
+                if (bcnt < MaxCodeLen && ipos < ilen) {
+                    while (bcnt <= 32 && ipos + 3 < ilen) {
+                        ulong w = (((ulong)(ibuf[ipos] & 255)) << 24)
+                            | (((ulong)(ibuf[ipos + 1] & 255)) << 16)
+                            | (((ulong)(ibuf[ipos + 2] & 255)) << 8)
+                            | ((ulong)(ibuf[ipos + 3] & 255));
+                        bbuf = (bbuf << 32) | w;
+                        ipos = ipos + 4;
+                        bcnt = bcnt + 32;
+                    }
+                    while (bcnt <= 56 && ipos < ilen) {
+                        bbuf = (bbuf << 8) | (ulong)(ibuf[ipos] & 255);
+                        ipos = ipos + 1;
+                        bcnt = bcnt + 8;
+                    }
+                }
+                int lbase = gSel * (MaxCodeLen + 2);
+                int zn = minArr[gSel];
+                if (bcnt < zn) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    sym = this.DecodeSlowSymbol(gSel);
+                    bbuf = this.bitBuf; bcnt = this.bitCnt; ipos = this.inPos; ilen = this.inLen;
+                    if (sym < 0) { return false; }
+                } else {
+                    bcnt = bcnt - zn;
+                    int zvec = (int)((bbuf >> bcnt) & ((1UL << zn) - 1UL));
+                    while (zn <= MaxCodeLen && zvec > limArr[lbase + zn]) {
+                        zn = zn + 1;
+                        if (bcnt == 0) {
+                            while (bcnt <= 56 && ipos < ilen) {
+                                bbuf = (bbuf << 8) | (ulong)(ibuf[ipos] & 255);
+                                ipos = ipos + 1;
+                                bcnt = bcnt + 8;
+                            }
+                            if (bcnt == 0) {
+                                if (this.fp != 0) {
+                                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                                    this.RefillBits();
+                                    bbuf = this.bitBuf; bcnt = this.bitCnt; ipos = this.inPos; ilen = this.inLen;
+                                }
+                                if (bcnt == 0) {
+                                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                                    this.failed = true;
+                                    return false;
+                                }
+                            }
+                        }
+                        bcnt = bcnt - 1;
+                        zvec = (zvec << 1) | (int)((bbuf >> bcnt) & 1UL);
+                    }
+                    if (zn > MaxCodeLen) {
+                        this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                        return false;
+                    }
+                    int idx = zvec - baseArr[lbase + zn];
+                    if (idx < 0 || idx >= MaxAlphaSize) {
+                        this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                        return false;
+                    }
+                    sym = permArr[gSel * MaxAlphaSize + idx];
+                }
             }
             if (sym == eob) { break; }
             if (sym == 0 || sym == 1) {
@@ -468,6 +552,10 @@ public class BZip2Decoder {
                     if (need > blockSize) {
                         this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
                         return false;
+                    }
+                    if (need > ttCap) {
+                        ttArr = this.GrowTt(ttArr, nblock, need, blockSize);
+                        ttCap = ttArr.Length;
                     }
                     unzf[ch] = unzf[ch] + runLen;
                     for (int k = 0; k < runLen; k = k + 1) {
@@ -498,6 +586,10 @@ public class BZip2Decoder {
                     this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
                     return false;
                 }
+                if (nblock >= ttCap) {
+                    ttArr = this.GrowTt(ttArr, nblock, nblock + 1, blockSize);
+                    ttCap = ttArr.Length;
+                }
                 unzf[ch2] = unzf[ch2] + 1;
                 ttArr[nblock] = ch2;
                 nblock = nblock + 1;
@@ -510,6 +602,10 @@ public class BZip2Decoder {
             int ch = mtfArr[0] & 255;
             int need = nblock + runLen;
             if (need > blockSize) { return false; }
+            if (need > ttCap) {
+                ttArr = this.GrowTt(ttArr, nblock, need, blockSize);
+                ttCap = ttArr.Length;
+            }
             unzf[ch] = unzf[ch] + runLen;
             for (int k = 0; k < runLen; k = k + 1) {
                 ttArr[nblock + k] = ch;
@@ -586,7 +682,22 @@ public class BZip2Decoder {
         return !this.failed;
     }
 
-    // bzip2 的 hbCreateDecodeTables：为一个组构建 limit/base/perm 与 9-bit 前缀直查表。
+    // 按需扩容 tt 数组（倍增上限为 blockSize）。
+    int[] GrowTt(int[] cur, int used, int need, int blockSize) {
+        int ncap = cur.Length;
+        while (ncap < need) {
+            ncap = ncap * 2;
+            if (ncap > blockSize) { ncap = blockSize; break; }
+        }
+        int[] nxt = new int[ncap];
+        if (used > 0) {
+            NativeMemory.Copy((nint)nxt, (nint)cur, used * 4);
+        }
+        this.tt = nxt;
+        return nxt;
+    }
+
+    // bzip2 的 hbCreateDecodeTables：为一个组构建 limit/base/perm 与 10-bit 前缀直查表。
     bool BuildDecodeTables(int t, int alphaSize) {
         int lbase = t * (MaxCodeLen + 2);
         int lenBase = t * MaxAlphaSize;
@@ -594,39 +705,39 @@ public class BZip2Decoder {
         int fbase = t * FastSize;
         int minLen = 32;
         int maxLen = 0;
+        int[] cnt = new int[MaxCodeLen + 2];
+        int[] lenArr = this.len;
         for (int i = 0; i < alphaSize; i = i + 1) {
-            int l = this.len[lenBase + i];
+            int l = lenArr[lenBase + i];
             if (l > maxLen) { maxLen = l; }
             if (l < minLen) { minLen = l; }
+            if (l >= 0 && l <= MaxCodeLen) {
+                cnt[l + 1] = cnt[l + 1] + 1;
+            }
         }
         if (minLen < 1 || maxLen > MaxCodeLen) { return false; }
         this.minLens[t] = minLen;
-        int pp = 0;
-        for (int l = minLen; l <= maxLen; l = l + 1) {
-            for (int i = 0; i < alphaSize; i = i + 1) {
-                if (this.len[lenBase + i] == l) {
-                    this.perm[pbase + pp] = i;
-                    pp = pp + 1;
-                }
-            }
-        }
-        for (int i = 0; i < MaxCodeLen + 2; i = i + 1) {
-            this.limit[lbase + i] = 0;
-            this.baseTab[lbase + i] = 0;
-        }
-        NativeMemory.Fill((nint)this.fastLut + fbase * 4, 0, FastSize * 4);
-        int[] cnt = new int[MaxCodeLen + 2];
-        for (int i = 0; i < alphaSize; i = i + 1) {
-            cnt[this.len[lenBase + i] + 1] = cnt[this.len[lenBase + i] + 1] + 1;
-        }
         for (int i = 1; i < MaxCodeLen + 2; i = i + 1) {
             cnt[i] = cnt[i] + cnt[i - 1];
         }
+        // 单遍计数排序构建 perm（O(alphaSize) 取代 O(maxLen * alphaSize)）。
+        int[] writePos = new int[MaxCodeLen + 2];
         for (int i = 0; i < MaxCodeLen + 2; i = i + 1) {
+            writePos[i] = cnt[i];
+            this.limit[lbase + i] = 0;
             this.baseTab[lbase + i] = cnt[i];
         }
+        int[] permArr = this.perm;
+        for (int i = 0; i < alphaSize; i = i + 1) {
+            int l = lenArr[lenBase + i];
+            int wp = writePos[l];
+            permArr[pbase + wp] = i;
+            writePos[l] = wp + 1;
+        }
+        NativeMemory.Fill((nint)this.fastLut + fbase * 4, 0, FastSize * 4);
         int vec = 0;
         int pp2 = 0;
+        int[] lut = this.fastLut;
         for (int l = minLen; l <= maxLen; l = l + 1) {
             int countL = cnt[l + 1] - cnt[l];
             if (l <= FastBits && countL > 0) {
@@ -634,10 +745,10 @@ public class BZip2Decoder {
                 int span = 1 << shift;
                 int lenTag = l << 16;
                 for (int k = 0; k < countL; k = k + 1) {
-                    int entry = lenTag | this.perm[pbase + pp2];
-                    int slot = (vec + k) << shift;
+                    int entry = lenTag | permArr[pbase + pp2];
+                    int slot = fbase + ((vec + k) << shift);
                     for (int m = 0; m < span; m = m + 1) {
-                        this.fastLut[fbase + slot + m] = entry;
+                        lut[slot + m] = entry;
                     }
                     pp2 = pp2 + 1;
                 }
