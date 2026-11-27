@@ -132,7 +132,13 @@ public class Http2ServerConnection : IDisposable {
         byte[] block = this.headerBlock.Accept(frame, payload);
         if (frame.type == Http2FrameType.SETTINGS) {
             this.settingsReceived = true;
-            if ((frame.flags & Http2Flags.ACK) != 0) { return; }
+            if ((frame.flags & Http2Flags.ACK) != 0) {
+                if (frame.length != 0) { await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return; }
+                return;
+            }
+            if ((frame.length % 6) != 0 || payload == null || payload.Length < frame.length) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
             for (int p = 0; p < frame.length; p = p + 6) {
                 int id = ((payload[p] & 255) << 8) | (payload[p + 1] & 255);
                 long value = ((long)(payload[p + 2] & 255) << 24) | ((long)(payload[p + 3] & 255) << 16)
@@ -155,6 +161,9 @@ public class Http2ServerConnection : IDisposable {
             byte[] ack = Http2Frame.BuildSettingsAck();
             await this.SendRawAsync(ack, ack.Length);
         } else if (frame.type == Http2FrameType.PING) {
+            if (frame.length != 8 || payload == null || payload.Length < 8) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
             if ((frame.flags & Http2Flags.ACK) == 0) {
                 byte[] ack = Http2Frame.BuildPing(payload, true);
                 await this.SendRawAsync(ack, ack.Length);
@@ -219,6 +228,9 @@ public class Http2ServerConnection : IDisposable {
                 Task.Spawn(this.ProcessAndRespondStreamAsync(stream));
             }
         } else if (frame.type == Http2FrameType.WINDOW_UPDATE) {
+            if (frame.length != 4 || payload == null || payload.Length < 4) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
             int increment = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16) | ((payload[2] & 255) << 8) | (payload[3] & 255);
             if (increment == 0) { throw new IOException("Zero HTTP2 window update"); }
             lock (this.pendingStreams) {
@@ -239,14 +251,25 @@ public class Http2ServerConnection : IDisposable {
                 }
             }
         } else if (frame.type == Http2FrameType.RST_STREAM) {
+            if (frame.length != 4 || payload == null || payload.Length < 4) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
             if (frame.streamId > this.lastStreamId) { throw new IOException("HTTP2 reset on idle stream"); }
             Http2ServerStream stream = this.FindPendingStream(frame.streamId);
             if (stream != null) { stream.reset = true; if (!stream.complete) { this.RemovePendingStream(stream.streamId); } }
         } else if (frame.type == Http2FrameType.PRIORITY) {
+            if (frame.length != 5 || payload == null || payload.Length < 5) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
             int dependency = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16) | ((payload[2] & 255) << 8) | (payload[3] & 255);
             if (dependency == frame.streamId) { throw new IOException("HTTP2 priority self dependency"); }
         } else if (frame.type == Http2FrameType.PUSH_PROMISE) { throw new IOException("Client HTTP2 push is forbidden"); }
-        else if (frame.type == Http2FrameType.GOAWAY) { this.connected = false; }
+        else if (frame.type == Http2FrameType.GOAWAY) {
+            if (frame.length < 8 || payload == null || payload.Length < 8) {
+                await this.FailAsync(Http2Error.FRAME_SIZE_ERROR); return;
+            }
+            this.connected = false;
+        }
     }
     private Http2ServerStream FindPendingStream(int id) {
         lock (this.pendingStreams) {

@@ -86,21 +86,23 @@ public class Channel<T> : IDisposable {
     // 尝试非阻塞写入一项。
     // 若通道已关闭或有界通道已满，则返回 false。
     public bool TryWrite(T item) {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             return false;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         if (this.isClosed) {
-            Mutex.Unlock(this.mtx);
+            Mutex.Unlock(m);
             return false;
         }
         if (this.capacity > 0 && (this.buffer.Count - this.head) >= this.capacity) {
-            Mutex.Unlock(this.mtx);
+            Mutex.Unlock(m);
             return false;
         }
         this.buffer.Add(item);
-        Mutex.Unlock(this.mtx);
-        this.readGate.Signal();
+        AsyncGate rg = this.readGate;
+        Mutex.Unlock(m);
+        if (rg != null) { rg.Signal(); }
         return true;
     }
 
@@ -160,22 +162,24 @@ public class Channel<T> : IDisposable {
     // 尝试非阻塞读取一项。
     // 若缓冲区有数据则取出并返回 true；若通道为空则返回 false。
     public bool TryRead(out T item) {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             item = null;
             return false;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         if (this.head < this.buffer.Count) {
             item = this.PopLocked();
             bool hadBackpressure = this.capacity > 0;
-            Mutex.Unlock(this.mtx);
-            if (hadBackpressure) {
-                this.writeGate.Signal();
+            AsyncGate wg = hadBackpressure ? this.writeGate : null;
+            Mutex.Unlock(m);
+            if (wg != null) {
+                wg.Signal();
             }
             return true;
         }
         item = null;
-        Mutex.Unlock(this.mtx);
+        Mutex.Unlock(m);
         return false;
     }
 

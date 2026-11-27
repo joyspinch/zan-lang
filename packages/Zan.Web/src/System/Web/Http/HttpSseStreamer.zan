@@ -43,14 +43,35 @@ public class HttpSseStreamer {
     // 格式化并发送一条 SSE 事件消息（包含可选事件名称与多行 data 编码）。
     public static async bool Send(HttpContext ctx, string name, string data) {
         if (ctx == null || !ctx.Hijacked() || ctx.Conn() == null) { return false; }
+        if (name == null) { name = ""; }
+        if (data == null) { data = ""; }
         StringBuilder sb = new StringBuilder();
-        if (name.Length > 0) { sb.Append("event: "); sb.Append(name); sb.Append("\n"); }
+        if (name.Length > 0) {
+            // 剔除事件名中的 CR/LF，防止 SSE 帧字段注入
+            StringBuilder cleanName = new StringBuilder();
+            for (int ni = 0; ni < name.Length; ni = ni + 1) {
+                int nc = name[ni] & 255;
+                if (nc != 10 && nc != 13) { cleanName.Append(name.Substring(ni, 1)); }
+            }
+            string safeName = cleanName.ToString();
+            if (safeName.Length > 0) {
+                sb.Append("event: ");
+                sb.Append(safeName);
+                sb.Append("\n");
+            }
+        }
         int start = 0;
-        for (int i = 0; i <= data.Length; i = i + 1) {
-            if (i == data.Length || (data[i] & 255) == 10) {
+        int dlen = data.Length;
+        for (int i = 0; i <= dlen; i = i + 1) {
+            bool atEnd = (i == dlen);
+            int ch = atEnd ? 0 : (data[i] & 255);
+            if (atEnd || ch == 10 || ch == 13) {
                 sb.Append("data: ");
                 sb.Append(data.Substring(start, i - start));
                 sb.Append("\n");
+                if (ch == 13 && i + 1 < dlen && (data[i + 1] & 255) == 10) {
+                    i = i + 1;
+                }
                 start = i + 1;
             }
         }

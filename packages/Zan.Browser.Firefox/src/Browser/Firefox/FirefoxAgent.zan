@@ -125,6 +125,13 @@ public class GeckoNative {
     public static nint XulMod = 0;
     public static nint EmbedMod = 0;
     static bool loaded = false;
+    static object loadLock = new object();
+
+    static bool IsAbsoluteDir(string p) {
+        if (p == null || p.Length == 0) { return false; }
+        if (p[0] == '/' || p[0] == '\\') { return true; }
+        return p.Length >= 2 && p[1] == ':';
+    }
 
     public static nint PfnInit = 0;
     public static nint PfnCreateWithContext = 0;
@@ -153,101 +160,112 @@ public class GeckoNative {
 
     public static bool EnsureLoaded() {
         if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
+        lock (loadLock) {
+            if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
 
-        // 优先受控绝对安装路径与显式环境变量，相对路径兜底置后，降低 DLL 预加载劫持风险
-        List<string> searchPaths = new List<string>();
-        string envDir = Interop.EnvVar("ZAN_GECKO_DIR");
-        if (envDir != null && envDir.Length > 0) {
-            searchPaths.Add(envDir);
-        }
-        searchPaths.Add("D:/project/firefox/sdk/bin/Release");
-        searchPaths.Add("D:/project/firefox/sdk/bin");
-        searchPaths.Add("D:/project/firefox/dist/bin");
-        searchPaths.Add("D:/project/firefox/dist/zan-browser-windows-x64");
-        searchPaths.Add("D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin");
-        searchPaths.Add("/Applications/Firefox.app/Contents/MacOS");
-        searchPaths.Add("/usr/lib/firefox");
-        searchPaths.Add("/usr/local/lib");
-        searchPaths.Add("../dist/zan-browser-windows-x64");
-        searchPaths.Add("bin");
+            // 优先受控绝对安装路径与显式环境变量，相对路径兜底置后，降低 DLL 预加载劫持风险
+            List<string> searchPaths = new List<string>();
+            string envDir = Interop.EnvVar("ZAN_GECKO_DIR");
+            if (envDir != null && envDir.Length > 0) {
+                searchPaths.Add(envDir);
+            }
+            searchPaths.Add("D:/project/firefox/sdk/bin/Release");
+            searchPaths.Add("D:/project/firefox/sdk/bin");
+            searchPaths.Add("D:/project/firefox/dist/bin");
+            searchPaths.Add("D:/project/firefox/dist/zan-browser-windows-x64");
+            searchPaths.Add("D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin");
+            searchPaths.Add("/Applications/Firefox.app/Contents/MacOS");
+            searchPaths.Add("/usr/lib/firefox");
+            searchPaths.Add("/usr/local/lib");
+            searchPaths.Add("../dist/zan-browser-windows-x64");
+            searchPaths.Add("bin");
 
-        string[] embedNames = new string[] {
-            "gecko_embed.dll",
-            "libgecko_embed.dylib",
-            "libgecko_embed.so",
-            "gecko_embed"
-        };
+            string[] embedNames = new string[] {
+                "gecko_embed.dll",
+                "libgecko_embed.dylib",
+                "libgecko_embed.so",
+                "gecko_embed"
+            };
 
-        string[] xulNames = new string[] {
-            "xul.dll",
-            "XUL",
-            "libxul.dylib",
-            "libxul.so",
-            "xul"
-        };
+            string[] xulNames = new string[] {
+                "xul.dll",
+                "XUL",
+                "libxul.dylib",
+                "libxul.so",
+                "xul"
+            };
 
-        // 优先尝试装载高可配置化的跨平台 gecko_embed 动态库 (.dll / .dylib / .so)
-        for (int i = 0; i < searchPaths.Count; i = i + 1) {
-            string p = searchPaths[i];
-            for (int j = 0; j < embedNames.Length; j = j + 1) {
-                string embedPath = Path.Combine(p, embedNames[j]);
-                if (File.Exists(embedPath)) {
-                    #if WINDOWS
-                    SetDllDirectoryA(p);
-                    try {
+            // 优先尝试装载高可配置化的跨平台 gecko_embed 动态库 (.dll / .dylib / .so)
+            for (int i = 0; i < searchPaths.Count; i = i + 1) {
+                string p = searchPaths[i];
+                for (int j = 0; j < embedNames.Length; j = j + 1) {
+                    string embedPath = Path.Combine(p, embedNames[j]);
+                    if (File.Exists(embedPath)) {
+                        #if WINDOWS
+                        if (IsAbsoluteDir(p)) {
+                            SetDllDirectoryA(p);
+                            try {
+                                EmbedMod = Interop.Load(embedPath);
+                            } finally {
+                                SetDllDirectoryA(null);
+                            }
+                        } else {
+                            EmbedMod = Interop.Load(embedPath);
+                        }
+                        #else
                         EmbedMod = Interop.Load(embedPath);
-                    } finally {
-                        SetDllDirectoryA(null);
-                    }
-                    #else
-                    EmbedMod = Interop.Load(embedPath);
-                    #endif
-                    if (EmbedMod != 0) {
-                        PfnCreateViewEx = Interop.Symbol(EmbedMod, "gecko_create_view_ex");
-                        PfnDefaultViewConfig = Interop.Symbol(EmbedMod, "gecko_default_view_config");
-                        break;
+                        #endif
+                        if (EmbedMod != 0) {
+                            PfnCreateViewEx = Interop.Symbol(EmbedMod, "gecko_create_view_ex");
+                            PfnDefaultViewConfig = Interop.Symbol(EmbedMod, "gecko_default_view_config");
+                            break;
+                        }
                     }
                 }
+                if (EmbedMod != 0) break;
             }
-            if (EmbedMod != 0) break;
-        }
 
-        // 装载 C-ABI 核心 xul 动态库
-        for (int i = 0; i < searchPaths.Count; i = i + 1) {
-            string p = searchPaths[i];
-            for (int j = 0; j < xulNames.Length; j = j + 1) {
-                string xulPath = Path.Combine(p, xulNames[j]);
-                if (File.Exists(xulPath)) {
-                    #if WINDOWS
-                    SetDllDirectoryA(p);
-                    try {
+            // 装载 C-ABI 核心 xul 动态库
+            for (int i = 0; i < searchPaths.Count; i = i + 1) {
+                string p = searchPaths[i];
+                for (int j = 0; j < xulNames.Length; j = j + 1) {
+                    string xulPath = Path.Combine(p, xulNames[j]);
+                    if (File.Exists(xulPath)) {
+                        #if WINDOWS
+                        if (IsAbsoluteDir(p)) {
+                            SetDllDirectoryA(p);
+                            try {
+                                XulMod = Interop.Load(xulPath);
+                            } finally {
+                                SetDllDirectoryA(null);
+                            }
+                        } else {
+                            XulMod = Interop.Load(xulPath);
+                        }
+                        #else
                         XulMod = Interop.Load(xulPath);
-                    } finally {
-                        SetDllDirectoryA(null);
-                    }
-                    #else
-                    XulMod = Interop.Load(xulPath);
-                    #endif
-                    if (XulMod != 0) {
-                        ResolveSymbols();
-                        loaded = true;
-                        return true;
+                        #endif
+                        if (XulMod != 0) {
+                            ResolveSymbols();
+                            loaded = true;
+                            return true;
+                        }
                     }
                 }
             }
-        }
 
-        for (int j = 0; j < xulNames.Length; j = j + 1) {
-            XulMod = Interop.Load(xulNames[j]);
-            if (XulMod != 0) {
-                ResolveSymbols();
-                loaded = true;
-                return true;
+            for (int j = 0; j < xulNames.Length; j = j + 1) {
+                XulMod = Interop.Load(xulNames[j]);
+                if (XulMod != 0) {
+                    ResolveSymbols();
+                    loaded = true;
+                    return true;
+                }
             }
-        }
 
-        loaded = (EmbedMod != 0);
-        return loaded;
+            loaded = (EmbedMod != 0);
+            return loaded;
+        }
     }
 
     static void ResolveSymbols() {
