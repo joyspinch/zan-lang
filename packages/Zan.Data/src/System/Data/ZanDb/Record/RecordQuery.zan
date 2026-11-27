@@ -224,16 +224,30 @@ public class RecordQuery {
 
     public int SumInt(string colName) {
         int sum = 0;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.Int32) {
+            this.ExecuteMatchedRows((int id, RecordRow r) => {
+                sum = sum + r.GetInt32(colName);
+            });
+            return sum;
+        }
         this.ExecuteMatchedRows((int id, RecordRow r) => {
-            sum = sum + r.GetInt32(colName);
+            sum = sum + r.GetInt32Fast(col);
         });
         return sum;
     }
 
     public long SumLong(string colName) {
         long sum = 0L;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.Int64) {
+            this.ExecuteMatchedRows((int id, RecordRow r) => {
+                sum = sum + r.GetInt64(colName);
+            });
+            return sum;
+        }
         this.ExecuteMatchedRows((int id, RecordRow r) => {
-            sum = sum + r.GetInt64(colName);
+            sum = sum + r.GetInt64Fast(col);
         });
         return sum;
     }
@@ -312,14 +326,17 @@ public class RecordQuery {
         List<RecordRow> leftRows = this.ToList();
         if (leftRows.Count == 0) { return results; }
 
+        bool leftIsId = leftKeyCol == "id" || leftKeyCol == "Id";
         bool rightIsId = rightKeyCol == "id" || rightKeyCol == "Id";
+        RecordColumn leftCol = leftIsId ? null : this.table.Schema().FindColumn(leftKeyCol);
+        RecordColumn rightCol = rightIsId ? null : rightTable.Schema().FindColumn(rightKeyCol);
         bool rightHasIndex = rightTable.HasIndex(rightKeyCol);
 
         if (rightIsId) {
             // Index-Nested-Loop Join on Primary Key
             for (int i = 0; i < leftRows.Count; i = i + 1) {
                 RecordRow left = leftRows[i];
-                string kStr = this.GetColStr(left, leftKeyCol);
+                string kStr = RecordQuery.GetColStrFor(left, leftCol, leftIsId);
                 int rId = Convert.ToInt32(kStr);
                 RecordRow right = rightTable.Get(rId);
                 if (right != null) {
@@ -335,7 +352,7 @@ public class RecordQuery {
             // Index-Nested-Loop Join on Secondary Index
             for (int i = 0; i < leftRows.Count; i = i + 1) {
                 RecordRow left = leftRows[i];
-                string kStr = this.GetColStr(left, leftKeyCol);
+                string kStr = RecordQuery.GetColStrFor(left, leftCol, leftIsId);
                 List<RecordRow> rightMatches = rightTable.FindByIndex(rightKeyCol, kStr);
                 if (rightMatches != null && rightMatches.Count > 0) {
                     for (int j = 0; j < rightMatches.Count; j = j + 1) {
@@ -354,7 +371,7 @@ public class RecordQuery {
 
         for (int i = 0; i < leftRows.Count; i = i + 1) {
             RecordRow left = leftRows[i];
-            string k = this.GetColStr(left, leftKeyCol);
+            string k = RecordQuery.GetColStrFor(left, leftCol, leftIsId);
             List<RecordRow> bucket = null;
             if (!leftBuckets.TryGetValue(k, out bucket)) {
                 bucket = new List<RecordRow>();
@@ -364,7 +381,7 @@ public class RecordQuery {
         }
 
         rightTable.Scan((int rightId, RecordRow rightRow) => {
-            string rKey = this.GetColStr(rightRow, rightKeyCol);
+            string rKey = RecordQuery.GetColStrFor(rightRow, rightCol, rightIsId);
             List<RecordRow> bucket = null;
             if (leftBuckets.TryGetValue(rKey, out bucket)) {
                 for (int b = 0; b < bucket.Count; b = b + 1) {
@@ -389,21 +406,28 @@ public class RecordQuery {
         return results;
     }
 
+    private static string GetColStrFor(RecordRow r, RecordColumn col, bool isId) {
+        if (r == null) { return ""; }
+        if (isId) { return Convert.ToString(r.id); }
+        if (col == null) { return ""; }
+        int dt = col.dataType;
+        if (dt == RecordDataType.Int32) { return Convert.ToString(r.GetInt32Fast(col)); }
+        if (dt == RecordDataType.Int64) { return Convert.ToString(r.GetInt64Fast(col)); }
+        if (dt == RecordDataType.Float32) { return Convert.ToString((double)r.GetFloat32Fast(col)); }
+        if (dt == RecordDataType.Float64) { return Convert.ToString(r.GetFloat64Fast(col)); }
+        if (dt == RecordDataType.Bool) { return r.GetBoolFast(col) ? "1" : "0"; }
+        if (dt == RecordDataType.FixedStr) { return r.GetStrFast(col); }
+        if (dt == RecordDataType.VarStr) { return r.GetVarStr(col.name); }
+        return "";
+    }
+
     public string GetColStr(RecordRow r, string colName) {
         if (r == null || colName == null) { return ""; }
         if (colName == "id" || colName == "Id") {
             return Convert.ToString(r.id);
         }
         RecordColumn col = r.schema.FindColumn(colName);
-        if (col == null) { return ""; }
-        if (col.dataType == RecordDataType.Int32) { return Convert.ToString(r.GetInt32(colName)); }
-        if (col.dataType == RecordDataType.Int64) { return Convert.ToString(r.GetInt64(colName)); }
-        if (col.dataType == RecordDataType.Float32) { return Convert.ToString((double)r.GetFloat32(colName)); }
-        if (col.dataType == RecordDataType.Float64) { return Convert.ToString(r.GetFloat64(colName)); }
-        if (col.dataType == RecordDataType.Bool) { return r.GetBool(colName) ? "1" : "0"; }
-        if (col.dataType == RecordDataType.FixedStr) { return r.GetStr(colName); }
-        if (col.dataType == RecordDataType.VarStr) { return r.GetVarStr(colName); }
-        return "";
+        return RecordQuery.GetColStrFor(r, col, false);
     }
 
     // ----------------------------------------------------
@@ -576,53 +600,89 @@ public class RecordQuery {
         return "";
     }
 
-    // 内存强类型语法树求值器（0 装箱，直接走读 RecordRow 二进制数据）
+    // 两槽内联列缓存：常见 1~2 列谓词零哈希查表直接命中
+    private string cachedColName0;
+    private RecordColumn cachedCol0;
+    private string cachedColName1;
+    private RecordColumn cachedCol1;
+
+    private RecordColumn ResolveColCached(string colName) {
+        if (colName == this.cachedColName0 && this.cachedCol0 != null) { return this.cachedCol0; }
+        if (colName == this.cachedColName1 && this.cachedCol1 != null) { return this.cachedCol1; }
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col != null) {
+            if (this.cachedCol0 == null) {
+                this.cachedColName0 = colName;
+                this.cachedCol0 = col;
+            } else {
+                this.cachedColName1 = colName;
+                this.cachedCol1 = col;
+            }
+        }
+        return col;
+    }
+
+    // 内存强类型语法树求值器（0 装箱，数值分支免 Convert.ToString 堆分配）
     public bool EvalNode(ExprNode n, RecordRow r) {
         if (n == null) { return true; }
-        if (n.Kind == 4) { // Lambda: p => body
+        int kind = n.Kind;
+        if (kind == 4) { // Lambda: p => body
             return this.EvalNode(n.A, r);
         }
-        if (n.Kind == 5) { // Unary Not: !expr
+        if (kind == 5) { // Unary Not: !expr
             return !this.EvalNode(n.A, r);
         }
-        if (n.Kind == 2) { // Binary
-            if (n.Name == "&&") {
+        if (kind == 2) { // Binary
+            string op = n.Name;
+            if (op == "&&") {
                 return this.EvalNode(n.A, r) && this.EvalNode(n.B, r);
             }
-            if (n.Name == "||") {
+            if (op == "||") {
                 return this.EvalNode(n.A, r) || this.EvalNode(n.B, r);
             }
 
-            // 比较运算
+            // 比较运算：数值路径不构造中间字符串，仅混合类型时回退构造字符串
             double numA = 0.0;
             double numB = 0.0;
             bool isNumA = false;
             bool isNumB = false;
-            string strA = "";
-            string strB = "";
+            string strA = null;
+            string strB = null;
 
-            this.EvalVal(n.A, r, out numA, out isNumA, out strA);
-            this.EvalVal(n.B, r, out numB, out isNumB, out strB);
+            this.EvalValFast(n.A, r, out numA, out isNumA, out strA);
+            this.EvalValFast(n.B, r, out numB, out isNumB, out strB);
 
             if (isNumA && isNumB) {
-                if (n.Name == "==") { return Math.Abs(numA - numB) < 1e-9; }
-                if (n.Name == "!=") { return Math.Abs(numA - numB) >= 1e-9; }
-                if (n.Name == "<") { return numA < numB; }
-                if (n.Name == "<=") { return numA <= numB; }
-                if (n.Name == ">") { return numA > numB; }
-                if (n.Name == ">=") { return numA >= numB; }
+                if (op == "==") { return Math.Abs(numA - numB) < 1e-9; }
+                if (op == "!=") { return Math.Abs(numA - numB) >= 1e-9; }
+                if (op == "<") { return numA < numB; }
+                if (op == "<=") { return numA <= numB; }
+                if (op == ">") { return numA > numB; }
+                if (op == ">=") { return numA >= numB; }
             } else {
+                if (isNumA) {
+                    double ign = 0.0;
+                    bool ignN = false;
+                    this.EvalVal(n.A, r, out ign, out ignN, out strA);
+                }
+                if (isNumB) {
+                    double ign = 0.0;
+                    bool ignN = false;
+                    this.EvalVal(n.B, r, out ign, out ignN, out strB);
+                }
+                if (strA == null) { strA = ""; }
+                if (strB == null) { strB = ""; }
                 int cmp = String.CompareOrdinal(strA, strB);
-                if (n.Name == "==") { return cmp == 0; }
-                if (n.Name == "!=") { return cmp != 0; }
-                if (n.Name == "<") { return cmp < 0; }
-                if (n.Name == "<=") { return cmp <= 0; }
-                if (n.Name == ">") { return cmp > 0; }
-                if (n.Name == ">=") { return cmp >= 0; }
+                if (op == "==") { return cmp == 0; }
+                if (op == "!=") { return cmp != 0; }
+                if (op == "<") { return cmp < 0; }
+                if (op == "<=") { return cmp <= 0; }
+                if (op == ">") { return cmp > 0; }
+                if (op == ">=") { return cmp >= 0; }
             }
             return false;
         }
-        if (n.Kind == 3) { // Method call: StartsWith / EndsWith / Contains
+        if (kind == 3) { // Method call: StartsWith / EndsWith / Contains
             double ignored = 0.0;
             bool isNum = false;
             string target = "";
@@ -643,6 +703,67 @@ public class RecordQuery {
         return true;
     }
 
+    private void EvalValFast(ExprNode n, RecordRow r, out double numVal, out bool isNum, out string strVal) {
+        numVal = 0.0;
+        isNum = false;
+        strVal = "";
+        if (n == null) { return; }
+
+        int kind = n.Kind;
+        if (kind == 0) { // Member access
+            string colName = n.Name;
+            if (colName == "id" || colName == "Id") {
+                numVal = (double)r.id;
+                isNum = true;
+                return;
+            }
+            RecordColumn col = this.ResolveColCached(colName);
+            if (col == null) { return; }
+
+            int dt = col.dataType;
+            if (dt == RecordDataType.Int32) {
+                numVal = (double)r.GetInt32Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Int64) {
+                numVal = (double)r.GetInt64Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Float32) {
+                numVal = (double)r.GetFloat32Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Float64) {
+                numVal = r.GetFloat64Fast(col);
+                isNum = true;
+            } else if (dt == RecordDataType.Bool) {
+                numVal = r.GetBoolFast(col) ? 1.0 : 0.0;
+                isNum = true;
+            } else if (dt == RecordDataType.FixedStr) {
+                strVal = r.GetStrFast(col);
+                isNum = false;
+            } else if (dt == RecordDataType.VarStr) {
+                strVal = r.GetVarStr(col.name);
+                isNum = false;
+            }
+        } else if (kind == 1) { // Constant
+            int tv = n.TVal;
+            if (tv == 0) {
+                numVal = (double)n.IVal;
+                isNum = true;
+            } else if (tv == 1) {
+                numVal = n.DVal;
+                isNum = true;
+            } else if (tv == 2) {
+                strVal = n.SVal != null ? n.SVal : "";
+                isNum = false;
+            } else if (tv == 3) {
+                numVal = n.BVal ? 1.0 : 0.0;
+                isNum = true;
+            } else if (tv == 5) {
+                numVal = (double)n.LVal;
+                isNum = true;
+            }
+        }
+    }
+
     public void EvalVal(ExprNode n, RecordRow r, out double numVal, out bool isNum, out string strVal) {
         numVal = 0.0;
         isNum = false;
@@ -657,35 +778,37 @@ public class RecordQuery {
                 strVal = Convert.ToString(r.id);
                 return;
             }
-            RecordColumn col = this.table.Schema().FindColumn(colName);
+            RecordColumn col = this.ResolveColCached(colName);
             if (col == null) { return; }
 
             if (col.dataType == RecordDataType.Int32) {
-                numVal = (double)r.GetInt32(colName);
+                int v = r.GetInt32Fast(col);
+                numVal = (double)v;
                 isNum = true;
-                strVal = Convert.ToString(r.GetInt32(colName));
+                strVal = Convert.ToString(v);
             } else if (col.dataType == RecordDataType.Int64) {
-                numVal = (double)r.GetInt64(colName);
+                long v = r.GetInt64Fast(col);
+                numVal = (double)v;
                 isNum = true;
-                strVal = Convert.ToString(r.GetInt64(colName));
+                strVal = Convert.ToString(v);
             } else if (col.dataType == RecordDataType.Float32) {
-                numVal = (double)r.GetFloat32(colName);
+                numVal = (double)r.GetFloat32Fast(col);
                 isNum = true;
                 strVal = Convert.ToString(numVal);
             } else if (col.dataType == RecordDataType.Float64) {
-                numVal = r.GetFloat64(colName);
+                numVal = r.GetFloat64Fast(col);
                 isNum = true;
                 strVal = Convert.ToString(numVal);
             } else if (col.dataType == RecordDataType.Bool) {
-                bool b = r.GetBool(colName);
+                bool b = r.GetBoolFast(col);
                 numVal = b ? 1.0 : 0.0;
                 isNum = true;
                 strVal = b ? "1" : "0";
             } else if (col.dataType == RecordDataType.FixedStr) {
-                strVal = r.GetStr(colName);
+                strVal = r.GetStrFast(col);
                 isNum = false;
             } else if (col.dataType == RecordDataType.VarStr) {
-                strVal = r.GetVarStr(colName);
+                strVal = r.GetVarStr(col.name);
                 isNum = false;
             }
         } else if (n.Kind == 1) { // Constant
@@ -712,58 +835,166 @@ public class RecordQuery {
         }
     }
 
+    // Schwartzian Transform 预提取排序键 + O(N log N) 自底向上稳定归并排序（保持与原插入排序完全一致的稳定次序）。
     public void SortResults(List<RecordRow> list) {
+        int n = list.Count;
+        if (n <= 1) { return; }
         RecordColumn col = this.table.Schema().FindColumn(this.orderCol);
         if (col == null) { return; }
 
         bool isNum = col.dataType == RecordDataType.Int32 || col.dataType == RecordDataType.Int64 ||
                      col.dataType == RecordDataType.Float32 || col.dataType == RecordDataType.Float64 ||
                      col.dataType == RecordDataType.Bool;
+        bool desc = this.orderDesc;
 
-        // 插入排序
-        int n = list.Count;
-        for (int i = 1; i < n; i = i + 1) {
-            RecordRow keyRow = list[i];
-            int j = i - 1;
-            while (j >= 0) {
-                RecordRow curRow = list[j];
-                int cmp = 0;
-                if (isNum) {
-                    double vA = this.GetNum(curRow, col);
-                    double vB = this.GetNum(keyRow, col);
-                    if (vA < vB) { cmp = 0 - 1; }
-                    else if (vA > vB) { cmp = 1; }
-                    else { cmp = 0; }
-                } else {
-                    string sA = this.GetStr(curRow, col);
-                    string sB = this.GetStr(keyRow, col);
-                    cmp = String.CompareOrdinal(sA, sB);
-                }
+        int[] idx = new int[n];
+        int[] tmp = new int[n];
+        for (int i = 0; i < n; i = i + 1) { idx[i] = i; }
 
-                if (this.orderDesc) { cmp = 0 - cmp; }
+        if (isNum) {
+            double[] keys = new double[n];
+            int dt = col.dataType;
+            if (dt == RecordDataType.Int32) {
+                for (int i = 0; i < n; i = i + 1) { keys[i] = (double)list[i].GetInt32Fast(col); }
+            } else if (dt == RecordDataType.Int64) {
+                for (int i = 0; i < n; i = i + 1) { keys[i] = (double)list[i].GetInt64Fast(col); }
+            } else if (dt == RecordDataType.Float64) {
+                for (int i = 0; i < n; i = i + 1) { keys[i] = list[i].GetFloat64Fast(col); }
+            } else if (dt == RecordDataType.Float32) {
+                for (int i = 0; i < n; i = i + 1) { keys[i] = (double)list[i].GetFloat32Fast(col); }
+            } else {
+                for (int i = 0; i < n; i = i + 1) { keys[i] = list[i].GetBoolFast(col) ? 1.0 : 0.0; }
+            }
 
-                if (cmp > 0) {
-                    list[j + 1] = list[j];
-                    j = j - 1;
-                } else {
-                    break;
+            // 小区间 (16) 稳定插入排序打底，提升缓存命中率
+            for (int lo = 0; lo < n; lo = lo + 16) {
+                int hi = lo + 16;
+                if (hi > n) { hi = n; }
+                for (int i = lo + 1; i < hi; i = i + 1) {
+                    int ki = idx[i];
+                    double kv = keys[ki];
+                    int j = i - 1;
+                    if (desc) {
+                        while (j >= lo && keys[idx[j]] < kv) {
+                            idx[j + 1] = idx[j];
+                            j = j - 1;
+                        }
+                    } else {
+                        while (j >= lo && keys[idx[j]] > kv) {
+                            idx[j + 1] = idx[j];
+                            j = j - 1;
+                        }
+                    }
+                    idx[j + 1] = ki;
                 }
             }
-            list[j + 1] = keyRow;
+
+            int[] src = idx;
+            int[] dst = tmp;
+            for (int width = 16; width < n; width = width << 1) {
+                for (int lo = 0; lo < n; lo = lo + (width << 1)) {
+                    int mid = lo + width;
+                    if (mid >= n) {
+                        for (int k = lo; k < n; k = k + 1) { dst[k] = src[k]; }
+                        break;
+                    }
+                    int hi = mid + width;
+                    if (hi > n) { hi = n; }
+                    int l = lo;
+                    int r = mid;
+                    int o = lo;
+                    if (desc) {
+                        while (l < mid && r < hi) {
+                            if (keys[src[l]] >= keys[src[r]]) { dst[o] = src[l]; l = l + 1; }
+                            else { dst[o] = src[r]; r = r + 1; }
+                            o = o + 1;
+                        }
+                    } else {
+                        while (l < mid && r < hi) {
+                            if (keys[src[l]] <= keys[src[r]]) { dst[o] = src[l]; l = l + 1; }
+                            else { dst[o] = src[r]; r = r + 1; }
+                            o = o + 1;
+                        }
+                    }
+                    while (l < mid) { dst[o] = src[l]; l = l + 1; o = o + 1; }
+                    while (r < hi) { dst[o] = src[r]; r = r + 1; o = o + 1; }
+                }
+                int[] sw = src; src = dst; dst = sw;
+            }
+            idx = src;
+        } else {
+            string[] keys = new string[n];
+            for (int i = 0; i < n; i = i + 1) {
+                keys[i] = this.GetStr(list[i], col);
+            }
+
+            for (int lo = 0; lo < n; lo = lo + 16) {
+                int hi = lo + 16;
+                if (hi > n) { hi = n; }
+                for (int i = lo + 1; i < hi; i = i + 1) {
+                    int ki = idx[i];
+                    string kv = keys[ki];
+                    int j = i - 1;
+                    while (j >= lo) {
+                        int cmp = String.CompareOrdinal(keys[idx[j]], kv);
+                        if (desc) { cmp = 0 - cmp; }
+                        if (cmp > 0) {
+                            idx[j + 1] = idx[j];
+                            j = j - 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    idx[j + 1] = ki;
+                }
+            }
+
+            int[] src = idx;
+            int[] dst = tmp;
+            for (int width = 16; width < n; width = width << 1) {
+                for (int lo = 0; lo < n; lo = lo + (width << 1)) {
+                    int mid = lo + width;
+                    if (mid >= n) {
+                        for (int k = lo; k < n; k = k + 1) { dst[k] = src[k]; }
+                        break;
+                    }
+                    int hi = mid + width;
+                    if (hi > n) { hi = n; }
+                    int l = lo;
+                    int r = mid;
+                    int o = lo;
+                    while (l < mid && r < hi) {
+                        int cmp = String.CompareOrdinal(keys[src[l]], keys[src[r]]);
+                        if (desc) { cmp = 0 - cmp; }
+                        if (cmp <= 0) { dst[o] = src[l]; l = l + 1; }
+                        else { dst[o] = src[r]; r = r + 1; }
+                        o = o + 1;
+                    }
+                    while (l < mid) { dst[o] = src[l]; l = l + 1; o = o + 1; }
+                    while (r < hi) { dst[o] = src[r]; r = r + 1; o = o + 1; }
+                }
+                int[] sw = src; src = dst; dst = sw;
+            }
+            idx = src;
         }
+
+        RecordRow[] snap = new RecordRow[n];
+        for (int i = 0; i < n; i = i + 1) { snap[i] = list[i]; }
+        for (int i = 0; i < n; i = i + 1) { list[i] = snap[idx[i]]; }
     }
 
     public double GetNum(RecordRow r, RecordColumn col) {
-        if (col.dataType == RecordDataType.Int32) { return (double)r.GetInt32(col.name); }
-        if (col.dataType == RecordDataType.Int64) { return (double)r.GetInt64(col.name); }
-        if (col.dataType == RecordDataType.Float32) { return (double)r.GetFloat32(col.name); }
-        if (col.dataType == RecordDataType.Float64) { return r.GetFloat64(col.name); }
-        if (col.dataType == RecordDataType.Bool) { return r.GetBool(col.name) ? 1.0 : 0.0; }
+        int dt = col.dataType;
+        if (dt == RecordDataType.Int32) { return (double)r.GetInt32Fast(col); }
+        if (dt == RecordDataType.Int64) { return (double)r.GetInt64Fast(col); }
+        if (dt == RecordDataType.Float32) { return (double)r.GetFloat32Fast(col); }
+        if (dt == RecordDataType.Float64) { return r.GetFloat64Fast(col); }
+        if (dt == RecordDataType.Bool) { return r.GetBoolFast(col) ? 1.0 : 0.0; }
         return 0.0;
     }
 
     public string GetStr(RecordRow r, RecordColumn col) {
-        if (col.dataType == RecordDataType.FixedStr) { return r.GetStr(col.name); }
+        if (col.dataType == RecordDataType.FixedStr) { return r.GetStrFast(col); }
         if (col.dataType == RecordDataType.VarStr) { return r.GetVarStr(col.name); }
         return "";
     }

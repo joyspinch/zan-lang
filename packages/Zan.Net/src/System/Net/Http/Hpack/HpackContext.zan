@@ -13,6 +13,13 @@ public class HpackContext {
     public int maxHeaderBytes = 65536;
     public int maxHeaderCount = 128;
     private bool decodeFailed;
+    // O(1) 动态表名称哈希链索引（单调递增序号 + 环形 prevSeq，零额外堆分配，严格保持 RFC 7541 最小索引优先）。
+    private long insertSeq;
+    private int indexedCount;
+    private int ringCap;
+    private int ringMask;
+    private long[] bucketHead;
+    private long[] prevSeq;
 
     public HpackContext(int maxTableSize) {
         this.dynamicTable = new List<HpackHeader>();
@@ -26,6 +33,46 @@ public class HpackContext {
         this.maxTableSize = 4096;
         this.allowedTableSize = 4096;
         this.currentTableSize = 0;
+    }
+
+    private static int HashBucket(string name) {
+        if (name == null) { return 0; }
+        int h = 5381;
+        int len = name.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            h = ((h << 5) + h) ^ (name[i] & 255);
+        }
+        return (h ^ (h >> 8) ^ (h >> 16)) & 255;
+    }
+
+    private void RebuildDynIndex() {
+        int dynCount = this.dynamicTable.Count;
+        int needCap = this.ringCap < 256 ? 256 : this.ringCap;
+        while (needCap <= dynCount) { needCap = needCap * 2; }
+        if (this.bucketHead == null) {
+            this.bucketHead = new long[256];
+        } else {
+            for (int k = 0; k < 256; k = k + 1) { this.bucketHead[k] = 0L; }
+        }
+        if (this.prevSeq == null || this.ringCap != needCap) {
+            this.prevSeq = new long[needCap];
+            this.ringCap = needCap;
+            this.ringMask = needCap - 1;
+        }
+        if (this.insertSeq < (long)dynCount) {
+            this.insertSeq = (long)dynCount;
+        }
+        long curSeq = this.insertSeq;
+        long mask = (long)this.ringMask;
+        // 从最旧条目（大索引）到最新条目（小索引）回填，保证桶头指向最新（最小动态索引）。
+        for (int i = dynCount - 1; i >= 0; i = i - 1) {
+            HpackHeader e = this.dynamicTable[i];
+            int b = HpackContext.HashBucket(e.name);
+            long seq = curSeq - (long)i;
+            this.prevSeq[(int)(seq & mask)] = this.bucketHead[b];
+            this.bucketHead[b] = seq;
+        }
+        this.indexedCount = dynCount;
     }
 
     // 设置动态表最大字节上限（并触发超额淘汰）。
@@ -42,6 +89,7 @@ public class HpackContext {
             this.currentTableSize = this.currentTableSize - oldest.Size();
             this.dynamicTable.RemoveAt(lastIdx);
         }
+        this.indexedCount = this.dynamicTable.Count;
     }
 
     // 向动态表插入新条目（FIFO：插入表头 0，即索引 62 处）。
@@ -52,6 +100,7 @@ public class HpackContext {
             // 单条目超过表上限：按 RFC 7541 §4.3 清空全表
             this.dynamicTable.Clear();
             this.currentTableSize = 0;
+            this.indexedCount = 0;
             return;
         }
         this.EvictToMax(this.maxTableSize - entrySize);
@@ -61,6 +110,18 @@ public class HpackContext {
         }
         this.dynamicTable[0] = entry;
         this.currentTableSize = this.currentTableSize + entrySize;
+
+        int newCount = this.dynamicTable.Count;
+        this.insertSeq = this.insertSeq + 1L;
+        if (this.bucketHead == null || newCount >= this.ringCap) {
+            this.RebuildDynIndex();
+        } else {
+            int b = HpackContext.HashBucket(name);
+            int slot = (int)(this.insertSeq & (long)this.ringMask);
+            this.prevSeq[slot] = this.bucketHead[b];
+            this.bucketHead[b] = this.insertSeq;
+            this.indexedCount = newCount;
+        }
     }
 
     // 根据 1-based 索引检索静态表（1..61）或动态表（62..）。
@@ -75,7 +136,7 @@ public class HpackContext {
         return null;
     }
 
-    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIdx 输出首个匹配，零堆分配）。
+    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIdx 输出首个匹配，O(1) 哈希链查找）。
     private int FindFast(string name, string value, out int outNameIdx) {
         int firstNameIdx = 0;
         int exactStatic = HpackStaticTable.FindFast(name, value, out firstNameIdx);
@@ -84,7 +145,20 @@ public class HpackContext {
             return exactStatic;
         }
         int dynCount = this.dynamicTable.Count;
-        for (int i = 0; i < dynCount; i = i + 1) {
+        if (dynCount == 0) {
+            outNameIdx = firstNameIdx;
+            return 0;
+        }
+        if (this.bucketHead == null || dynCount != this.indexedCount) {
+            this.RebuildDynIndex();
+        }
+        long curSeq = this.insertSeq;
+        long minValid = curSeq - (long)dynCount + 1L;
+        int b = HpackContext.HashBucket(name);
+        long seq = this.bucketHead[b];
+        long mask = (long)this.ringMask;
+        while (seq >= minValid) {
+            int i = (int)(curSeq - seq);
             HpackHeader e = this.dynamicTable[i];
             if (e.name == name) {
                 if (e.value == value) {
@@ -95,6 +169,7 @@ public class HpackContext {
                     firstNameIdx = 62 + i;
                 }
             }
+            seq = this.prevSeq[(int)(seq & mask)];
         }
         outNameIdx = firstNameIdx;
         return 0;

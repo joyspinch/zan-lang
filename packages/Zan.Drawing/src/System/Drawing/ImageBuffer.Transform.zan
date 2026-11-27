@@ -3,18 +3,39 @@ using System;
 namespace System.Drawing;
 
 public partial class ImageBuffer {
-    // 水平镜像翻转（原地修改，零额外分配）。
+    // 水平镜像翻转（原地修改，4 路展开消除逐像素循环开销）。
     public void FlipHorizontal() {
         if (this.IsEmpty || this.Width <= 1) return;
         int w = this.Width;
-        int half = w / 2;
-        for (int y = 0; y < this.Height; y = y + 1) {
-            Span<int> row = new Span<int>(this.Pixels + (nint)(y * this.Stride), w);
-            for (int x = 0; x < half; x = x + 1) {
-                int rx = w - 1 - x;
-                int tmp = row[x];
-                row[x] = row[rx];
-                row[rx] = tmp;
+        int h = this.Height;
+        int stride = this.Stride;
+        nint basePtr = this.Pixels;
+        for (int y = 0; y < h; y = y + 1) {
+            Span<int> row = new Span<int>(basePtr + (nint)(y * stride), w);
+            int l = 0;
+            int r = w - 1;
+            while (l + 3 < r - 3) {
+                int t0 = row[l];
+                int t1 = row[l + 1];
+                int t2 = row[l + 2];
+                int t3 = row[l + 3];
+                row[l] = row[r];
+                row[l + 1] = row[r - 1];
+                row[l + 2] = row[r - 2];
+                row[l + 3] = row[r - 3];
+                row[r] = t0;
+                row[r - 1] = t1;
+                row[r - 2] = t2;
+                row[r - 3] = t3;
+                l = l + 4;
+                r = r - 4;
+            }
+            while (l < r) {
+                int tmp = row[l];
+                row[l] = row[r];
+                row[r] = tmp;
+                l = l + 1;
+                r = r - 1;
             }
         }
     }
@@ -150,25 +171,64 @@ public partial class ImageBuffer {
         System.Drawing.Imaging.ImageCodec.ColorAdjustArgb(this.Pixels, (int)pixels, 0, saturationPercent, false);
     }
 
-    // 复古棕褐色滤镜（Sepia），保留 Alpha。
+    // 复古棕褐色滤镜（Sepia），保留 Alpha（32 位整像素 4 路展开：访存与边界检查降为 1/3）。
     public void Sepia() {
         if (this.IsEmpty) return;
         long pixels = (long)this.Width * (long)this.Height;
         if (pixels <= 0L || pixels * 4L > 2147483647L) return;
         int count = (int)pixels;
-        Span<byte> sp = new Span<byte>(this.Pixels, count * 4);
-        int off = 0;
-        for (int i = 0; i < count; i = i + 1) {
-            int b = (int)sp[off];
-            int g = (int)sp[off + 1];
-            int r = (int)sp[off + 2];
+        Span<int> pix = new Span<int>(this.Pixels, count);
+        int aMask = 255 << 24;
+        int i = 0;
+        while (i + 4 <= count) {
+            int p0 = pix[i];
+            int b0 = p0 & 255; int g0 = (p0 >> 8) & 255; int r0 = (p0 >> 16) & 255;
+            int nr0 = (r0 * 101 + g0 * 197 + b0 * 48) >> 8;
+            int ng0 = (r0 * 89 + g0 * 176 + b0 * 43) >> 8;
+            int nb0 = (r0 * 70 + g0 * 137 + b0 * 34) >> 8;
+            if (nr0 > 255) { nr0 = 255; }
+            if (ng0 > 255) { ng0 = 255; }
+            pix[i] = (p0 & aMask) | (nr0 << 16) | (ng0 << 8) | nb0;
+
+            int p1 = pix[i + 1];
+            int b1 = p1 & 255; int g1 = (p1 >> 8) & 255; int r1 = (p1 >> 16) & 255;
+            int nr1 = (r1 * 101 + g1 * 197 + b1 * 48) >> 8;
+            int ng1 = (r1 * 89 + g1 * 176 + b1 * 43) >> 8;
+            int nb1 = (r1 * 70 + g1 * 137 + b1 * 34) >> 8;
+            if (nr1 > 255) { nr1 = 255; }
+            if (ng1 > 255) { ng1 = 255; }
+            pix[i + 1] = (p1 & aMask) | (nr1 << 16) | (ng1 << 8) | nb1;
+
+            int p2 = pix[i + 2];
+            int b2 = p2 & 255; int g2 = (p2 >> 8) & 255; int r2 = (p2 >> 16) & 255;
+            int nr2 = (r2 * 101 + g2 * 197 + b2 * 48) >> 8;
+            int ng2 = (r2 * 89 + g2 * 176 + b2 * 43) >> 8;
+            int nb2 = (r2 * 70 + g2 * 137 + b2 * 34) >> 8;
+            if (nr2 > 255) { nr2 = 255; }
+            if (ng2 > 255) { ng2 = 255; }
+            pix[i + 2] = (p2 & aMask) | (nr2 << 16) | (ng2 << 8) | nb2;
+
+            int p3 = pix[i + 3];
+            int b3 = p3 & 255; int g3 = (p3 >> 8) & 255; int r3 = (p3 >> 16) & 255;
+            int nr3 = (r3 * 101 + g3 * 197 + b3 * 48) >> 8;
+            int ng3 = (r3 * 89 + g3 * 176 + b3 * 43) >> 8;
+            int nb3 = (r3 * 70 + g3 * 137 + b3 * 34) >> 8;
+            if (nr3 > 255) { nr3 = 255; }
+            if (ng3 > 255) { ng3 = 255; }
+            pix[i + 3] = (p3 & aMask) | (nr3 << 16) | (ng3 << 8) | nb3;
+
+            i = i + 4;
+        }
+        while (i < count) {
+            int p = pix[i];
+            int b = p & 255; int g = (p >> 8) & 255; int r = (p >> 16) & 255;
             int nr = (r * 101 + g * 197 + b * 48) >> 8;
             int ng = (r * 89 + g * 176 + b * 43) >> 8;
             int nb = (r * 70 + g * 137 + b * 34) >> 8;
-            sp[off] = ImageBuffer.ClampInt(nb);
-            sp[off + 1] = ImageBuffer.ClampInt(ng);
-            sp[off + 2] = ImageBuffer.ClampInt(nr);
-            off = off + 4;
+            if (nr > 255) { nr = 255; }
+            if (ng > 255) { ng = 255; }
+            pix[i] = (p & aMask) | (nr << 16) | (ng << 8) | nb;
+            i = i + 1;
         }
     }
 

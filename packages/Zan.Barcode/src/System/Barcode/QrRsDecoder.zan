@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace System.Barcode;
 
-// Reed-Solomon 纠错解码（GF(256)，本原多项式 0x11D，Sugiyama 扩展欧几里得）。
+// Reed-Solomon 纠错解码（GF(256)，本原多项式 0x11D，Berlekamp-Massey + 增量 Chien 搜索 + Forney）。
 // 码字 block[0] 为最高次项；内部多项式一律按升幂下标表示。
 public class QrRsDecoder {
 
@@ -30,84 +30,216 @@ public class QrRsDecoder {
         List<int> positions = QrRsDecoder.ErrorPositions(lambda, n, nerr);
         if (positions == null) { return false; }
 
-        int[] derivative = QrRsDecoder.FormalDerivative(lambda);
-        for (int k = 0; k < positions.Count; k = k + 1) {
+        int[] expArr = QrSpec.GfExpTable();
+        int[] logArr = QrSpec.GfLogTable();
+        Span<int> exp = new Span<int>((nint)expArr, 512);
+        Span<int> log = new Span<int>((nint)logArr, 256);
+
+        int posCnt = positions.Count;
+        for (int k = 0; k < posCnt; k = k + 1) {
             int j = positions[k];
             int d = n - 1 - j;
-            int xLoc = QrSpec.GfAlpha(d);
-            int xInv = QrSpec.GfAlpha(-d);
-            int num = QrRsDecoder.Eval(omega, xInv);
-            int den = QrRsDecoder.Eval(derivative, xInv);
+            int dMod = d % 255;
+            int xLoc = exp[dMod];
+            int xInv = exp[dMod == 0 ? 0 : (255 - dMod)];
+            int num = QrRsDecoder.EvalFast(omega, xInv, exp, log);
+            int den = QrRsDecoder.EvalDerivFast(lambda, xInv, exp, log);
             if (den == 0) { return false; }
-            int magnitude = QrSpec.GfMul(QrSpec.GfMul(xLoc, num), QrSpec.GfInv(den));
+            int magnitude = 0;
+            if (num != 0) {
+                int mIdx = log[xLoc] + log[num] - log[den];
+                if (mIdx < 0) { mIdx = mIdx + 255; }
+                magnitude = exp[mIdx];
+            }
             block[j] = block[j] ^ magnitude;
         }
 
-        int[] check = QrRsDecoder.Syndromes(block, ecLen);
+        // 内联伴随式复核（零二次数组分配）
+        Span<int> blk = new Span<int>((nint)block, n);
         for (int i = 0; i < ecLen; i = i + 1) {
-            if (check[i] != 0) { return false; }
+            int logX = i % 255;
+            int s = 0;
+            for (int j = 0; j < n; j = j + 1) {
+                int bj = blk[j];
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ bj;
+            }
+            if (s != 0) { return false; }
         }
         return true;
     }
 
-    // 伴随式 S_i = r(α^i)，i = 0..ecLen-1。
+    // 伴随式 S_i = r(α^i)，i = 0..ecLen-1（Span 直查 GF 指数/对数表 + 预提 logX，消除逐字节 GfMul 调用）。
     public static int[] Syndromes(int[] block, int ecLen) {
         int[] synd = new int[ecLen];
+        int n = block.Length;
+        if (n == 0 || ecLen <= 0) { return synd; }
+        int[] expArr = QrSpec.GfExpTable();
+        int[] logArr = QrSpec.GfLogTable();
+        Span<int> exp = new Span<int>((nint)expArr, 512);
+        Span<int> log = new Span<int>((nint)logArr, 256);
+        Span<int> blk = new Span<int>((nint)block, n);
+        Span<int> dst = new Span<int>((nint)synd, ecLen);
         for (int i = 0; i < ecLen; i = i + 1) {
-            int x = QrSpec.GfAlpha(i);
+            int logX = i % 255;
             int s = 0;
-            for (int j = 0; j < block.Length; j = j + 1) {
-                s = QrSpec.GfMul(s, x) ^ block[j];
+            int j = 0;
+            while (j + 4 <= n) {
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ blk[j];
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ blk[j + 1];
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ blk[j + 2];
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ blk[j + 3];
+                j = j + 4;
             }
-            synd[i] = s;
+            while (j < n) {
+                s = (s == 0 ? 0 : exp[log[s] + logX]) ^ blk[j];
+                j = j + 1;
+            }
+            dst[i] = s;
         }
         return synd;
     }
 
-    // 扩展欧几里得：返回 [Λ, Ω]（两者必须同按 u_k(0) 归一化），失败返回 null。
+    // Berlekamp-Massey + Forney 求值多项式：返回 [Λ, Ω]（Λ(0)=1 归一化），失败返回 null。
+    // 全程在固定长度工作缓冲原地迭代，消除 Sugiyama 欧几里得的多项式临时堆分配。
     public static int[][] ErrorLocatorAndEvaluator(int[] synd, int ecLen) {
         if (synd == null || ecLen <= 0) { return null; }
-        int[] rPrev = new int[ecLen + 1];
-        rPrev[ecLen] = 1;
         int copyLen = synd.Length < ecLen ? synd.Length : ecLen;
-        int[] rInit = new int[copyLen];
-        Array.Copy(synd, rInit, copyLen);
-        int[] rCur = QrRsDecoder.Trim(rInit);
-        if (QrRsDecoder.Deg(rCur) < 0) { return null; }
-        int[] uPrev = new int[0];
-        int[] uCur = new int[1];
-        uCur[0] = 1;
+        bool allZero = true;
+        for (int i = 0; i < copyLen; i = i + 1) {
+            if (synd[i] != 0) { allZero = false; break; }
+        }
+        if (allZero) { return null; }
 
-        int limit = ecLen / 2;
-        while (QrRsDecoder.Deg(rCur) >= limit) {
-            if (QrRsDecoder.Deg(rCur) < 0) { break; }
-            int[][] qr = QrRsDecoder.DivMod(rPrev, rCur);
-            int[] uNew = QrRsDecoder.Add(uPrev, QrRsDecoder.Mul(qr[0], uCur));
-            rPrev = rCur;
-            rCur = qr[1];
-            uPrev = uCur;
-            uCur = uNew;
+        int[] expArr = QrSpec.GfExpTable();
+        int[] logArr = QrSpec.GfLogTable();
+        Span<int> exp = new Span<int>((nint)expArr, 512);
+        Span<int> log = new Span<int>((nint)logArr, 256);
+
+        int cap = ecLen + 1;
+        // 单块连续暂存缓冲承载 C/B/T/om（必要时末尾附 S），将每块临时堆分配从 5 次压缩至 1 次。
+        bool needCopyS = synd.Length < ecLen;
+        int workLen = cap * 3 + ecLen + (needCopyS ? ecLen : 0);
+        int[] work = new int[workLen];
+        nint wp = (nint)work;
+        Span<int> C = new Span<int>(wp, cap);
+        Span<int> B = new Span<int>(wp + (nint)(cap * 4), cap);
+        Span<int> T = new Span<int>(wp + (nint)(cap * 8), cap);
+        Span<int> om = new Span<int>(wp + (nint)(cap * 12), ecLen);
+        Span<int> S;
+        if (needCopyS) {
+            S = new Span<int>(wp + (nint)((cap * 3 + ecLen) * 4), ecLen);
+            for (int i = 0; i < copyLen; i = i + 1) { S[i] = synd[i]; }
+        } else {
+            S = new Span<int>((nint)synd, ecLen);
         }
-        if (QrRsDecoder.Deg(uCur) <= 0 || uCur[0] == 0) { return null; }
-        int inv = QrSpec.GfInv(uCur[0]);
-        if (inv == 0) { return null; }
-        int[] lambda = new int[uCur.Length];
-        for (int i = 0; i < uCur.Length; i = i + 1) {
-            lambda[i] = QrSpec.GfMul(uCur[i], inv);
+
+        C[0] = 1;
+        B[0] = 1;
+        int L = 0;
+        int bLen = 0;
+        int m = 1;
+        int b = 1;
+
+        for (int step = 0; step < ecLen; step = step + 1) {
+            int d = S[step];
+            for (int i = 1; i <= L; i = i + 1) {
+                int ci = C[i];
+                int si = S[step - i];
+                if (ci != 0 && si != 0) {
+                    d = d ^ exp[log[ci] + log[si]];
+                }
+            }
+            if (d == 0) {
+                m = m + 1;
+                continue;
+            }
+            int logCoef = log[d] - log[b];
+            if (logCoef < 0) { logCoef = logCoef + 255; }
+            if (2 * L <= step) {
+                for (int i = 0; i <= L; i = i + 1) { T[i] = C[i]; }
+                int oldL = L;
+                for (int i = 0; i <= bLen; i = i + 1) {
+                    int bi = B[i];
+                    if (bi != 0 && i + m < cap) {
+                        C[i + m] = C[i + m] ^ exp[log[bi] + logCoef];
+                    }
+                }
+                L = step + 1 - L;
+                for (int i = 0; i <= oldL; i = i + 1) { B[i] = T[i]; }
+                bLen = oldL;
+                b = d;
+                m = 1;
+            } else {
+                for (int i = 0; i <= bLen; i = i + 1) {
+                    int bi = B[i];
+                    if (bi != 0 && i + m < cap) {
+                        C[i + m] = C[i + m] ^ exp[log[bi] + logCoef];
+                    }
+                }
+                m = m + 1;
+            }
         }
-        int[] omega = new int[rCur.Length];
-        for (int i = 0; i < rCur.Length; i = i + 1) {
-            omega[i] = QrSpec.GfMul(rCur[i], inv);
+
+        int degL = L < ecLen ? L : ecLen;
+        while (degL > 0 && C[degL] == 0) { degL = degL - 1; }
+        if (degL <= 0 || C[0] == 0) { return null; }
+
+        int[] lambda = new int[degL + 1];
+        for (int i = 0; i <= degL; i = i + 1) { lambda[i] = C[i]; }
+
+        // Ω(x) = S(x) · Λ(x) mod x^{ecLen}
+        for (int i = 0; i <= degL; i = i + 1) {
+            int li = C[i];
+            if (li == 0) { continue; }
+            int logLi = log[li];
+            int lim = ecLen - i;
+            for (int j = 0; j < lim; j = j + 1) {
+                int sj = S[j];
+                if (sj != 0) {
+                    om[i + j] = om[i + j] ^ exp[logLi + log[sj]];
+                }
+            }
         }
+        int omLen = ecLen;
+        while (omLen > 0 && om[omLen - 1] == 0) { omLen = omLen - 1; }
+        int[] omega = new int[omLen];
+        for (int i = 0; i < omLen; i = i + 1) { omega[i] = om[i]; }
+
         return new int[][]{ lambda, omega };
     }
 
-    // Chien 搜索：找出 Λ(α^{-d}) = 0 的所有下标 n-1-d；数量不符返回 null。
+    // 增量 Chien 搜索：每步仅将各项乘以 α^{-i}，单缓冲切片消除二次分配与逐点重算幂次。
     public static List<int> ErrorPositions(int[] lambda, int n, int expected) {
         List<int> outp = new List<int>();
+        if (lambda == null || lambda.Length == 0) { return null; }
+        int deg = lambda.Length - 1;
+        int[] expArr = QrSpec.GfExpTable();
+        int[] logArr = QrSpec.GfLogTable();
+        Span<int> exp = new Span<int>((nint)expArr, 512);
+        Span<int> log = new Span<int>((nint)logArr, 256);
+
+        int stride = deg + 1;
+        int[] work = new int[stride * 2];
+        nint wp = (nint)work;
+        Span<int> terms = new Span<int>(wp, stride);
+        Span<int> steps = new Span<int>(wp + (nint)(stride * 4), stride);
+        for (int i = 0; i <= deg; i = i + 1) {
+            terms[i] = lambda[i];
+            int im = i % 255;
+            steps[i] = im == 0 ? 0 : (255 - im);
+        }
+
+        int t0 = terms[0];
         for (int d = 0; d < n; d = d + 1) {
-            int p = QrSpec.GfAlpha(-d);
-            if (QrRsDecoder.Eval(lambda, p) == 0) {
+            int val = t0;
+            for (int i = 1; i <= deg; i = i + 1) {
+                int ti = terms[i];
+                if (ti != 0) {
+                    val = val ^ ti;
+                    terms[i] = exp[log[ti] + steps[i]];
+                }
+            }
+            if (val == 0) {
                 outp.Add(n - 1 - d);
             }
         }
@@ -119,96 +251,46 @@ public class QrRsDecoder {
     public static int[] FormalDerivative(int[] lambda) {
         int len = lambda.Length;
         int[] d = new int[len > 0 ? len - 1 : 0];
-        for (int i = 0; i < d.Length; i = i + 1) { d[i] = 0; }
-        for (int i = 1; i < len; i = i + 1) {
-            if ((i & 1) != 0) { d[i - 1] = lambda[i]; }
+        for (int i = 1; i < len; i = i + 2) {
+            d[i - 1] = lambda[i];
         }
         return d;
     }
 
-    // 升幂多项式在点 p 处的值：Σ coeff[i]·p^i。
-    public static int Eval(int[] coeff, int p) {
-        int val = 0;
-        int pw = 1;
-        for (int i = 0; i < coeff.Length; i = i + 1) {
-            if (coeff[i] != 0) { val = val ^ QrSpec.GfMul(coeff[i], pw); }
-            pw = QrSpec.GfMul(pw, p);
+    // 直接对 Λ 的奇次项按 p^2 做 Horner 求值（特征 2 形式导数 Λ'(p)，零数组分配且步数减半）。
+    private static int EvalDerivFast(int[] lambda, int p, Span<int> exp, Span<int> log) {
+        int len = lambda.Length;
+        if (len <= 1) { return 0; }
+        if (p == 0) { return lambda[1]; }
+        int top = ((len - 1) & 1) == 1 ? (len - 1) : (len - 2);
+        int logP2 = log[p] << 1;
+        if (logP2 >= 255) { logP2 = logP2 - 255; }
+        int val = lambda[top];
+        for (int i = top - 2; i >= 1; i = i - 2) {
+            val = (val == 0 ? 0 : exp[log[val] + logP2]) ^ lambda[i];
         }
         return val;
     }
 
-    // ---- 升幂多项式算术 ---------------------------------------------------
-
-    // 去掉最高次的零系数（返回规范形式；全零返回长度 0 的数组）。
-    static int[] Trim(int[] p) {
-        int len = p.Length;
-        while (len > 0 && p[len - 1] == 0) { len = len - 1; }
-        if (len == p.Length) { return p; }
-        int[] outp = new int[len];
-        Array.Copy(p, outp, len);
-        return outp;
+    private static int EvalFast(int[] coeff, int p, Span<int> exp, Span<int> log) {
+        int len = coeff.Length;
+        if (len == 0) { return 0; }
+        if (p == 0) { return coeff[0]; }
+        int logP = log[p];
+        int val = coeff[len - 1];
+        for (int i = len - 2; i >= 0; i = i - 1) {
+            val = (val == 0 ? 0 : exp[log[val] + logP]) ^ coeff[i];
+        }
+        return val;
     }
 
-    // 多项式的次数（长度 0 表示零多项式，次数 -1）。
-    static int Deg(int[] p) {
-        if (p == null) { return -1; }
-        return p.Length - 1;
-    }
-
-    // 多项式加（异或）。
-    static int[] Add(int[] a, int[] b) {
-        int la = a.Length;
-        int lb = b.Length;
-        int n = la > lb ? la : lb;
-        int[] outp = new int[n];
-        for (int i = 0; i < n; i = i + 1) { outp[i] = 0; }
-        for (int i = 0; i < la; i = i + 1) { outp[i] = outp[i] ^ a[i]; }
-        for (int i = 0; i < lb; i = i + 1) { outp[i] = outp[i] ^ b[i]; }
-        return QrRsDecoder.Trim(outp);
-    }
-
-    // 多项式乘。
-    static int[] Mul(int[] a, int[] b) {
-        if (a.Length == 0 || b.Length == 0) { return new int[0]; }
-        int[] outp = new int[a.Length + b.Length - 1];
-        for (int i = 0; i < outp.Length; i = i + 1) { outp[i] = 0; }
-        for (int i = 0; i < a.Length; i = i + 1) {
-            if (a[i] == 0) { continue; }
-            for (int j = 0; j < b.Length; j = j + 1) {
-                if (b[j] == 0) { continue; }
-                outp[i + j] = outp[i + j] ^ QrSpec.GfMul(a[i], b[j]);
-            }
-        }
-        return QrRsDecoder.Trim(outp);
-    }
-
-    // 带余除法：返回 [商, 余]（升幂）；除数为零返回 [0, a]。
-    static int[][] DivMod(int[] a, int[] b) {
-        if (b.Length == 0 || QrRsDecoder.Deg(b) < 0) {
-            return new int[][]{ new int[0], QrRsDecoder.Trim(a) };
-        }
-        int db = QrRsDecoder.Deg(b);
-        int[] rem = QrRsDecoder.Trim(a);
-        int da = QrRsDecoder.Deg(rem);
-        int qLen = da - db + 1;
-        if (qLen < 1) { qLen = 1; }
-        int[] quo = new int[qLen];
-        for (int i = 0; i < qLen; i = i + 1) { quo[i] = 0; }
-        int invLead = QrSpec.GfInv(b[db]);
-        if (invLead == 0) {
-            return new int[][]{ new int[0], rem };
-        }
-        int dr = da;
-        while (dr >= db) {
-            int scale = QrSpec.GfMul(rem[dr], invLead);
-            int shift = dr - db;
-            if (shift < qLen) { quo[shift] = quo[shift] ^ scale; }
-            for (int i = 0; i <= db; i = i + 1) {
-                if (b[i] == 0) { continue; }
-                rem[i + shift] = rem[i + shift] ^ QrSpec.GfMul(scale, b[i]);
-            }
-            while (dr >= 0 && rem[dr] == 0) { dr = dr - 1; }
-        }
-        return new int[][]{ QrRsDecoder.Trim(quo), QrRsDecoder.Trim(rem) };
+    // 升幂多项式在点 p 处的值：Σ coeff[i]·p^i（Horner 递推 + 直接查表）。
+    public static int Eval(int[] coeff, int p) {
+        if (coeff == null || coeff.Length == 0) { return 0; }
+        int[] expArr = QrSpec.GfExpTable();
+        int[] logArr = QrSpec.GfLogTable();
+        Span<int> exp = new Span<int>((nint)expArr, 512);
+        Span<int> log = new Span<int>((nint)logArr, 256);
+        return QrRsDecoder.EvalFast(coeff, p, exp, log);
     }
 }

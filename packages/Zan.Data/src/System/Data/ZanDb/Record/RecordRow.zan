@@ -25,8 +25,13 @@ public class RecordRow {
         this.id = 0;
         this.isActive = true;
         this.table = null;
-        this.varStrs = new Dictionary<string, string>();
-        this.blobs = new Dictionary<string, byte[]>();
+        if (schema != null && schema.hasVarCols) {
+            this.varStrs = new Dictionary<string, string>();
+            this.blobs = new Dictionary<string, byte[]>();
+        } else {
+            this.varStrs = null;
+            this.blobs = null;
+        }
     }
 
     public RecordRow(RecordSchema schema, byte[] raw, int id, bool isActive, RecordTable table = null) {
@@ -35,8 +40,13 @@ public class RecordRow {
         this.id = id;
         this.isActive = isActive;
         this.table = table;
-        this.varStrs = new Dictionary<string, string>();
-        this.blobs = new Dictionary<string, byte[]>();
+        if (schema != null && schema.hasVarCols) {
+            this.varStrs = new Dictionary<string, string>();
+            this.blobs = new Dictionary<string, byte[]>();
+        } else {
+            this.varStrs = null;
+            this.blobs = null;
+        }
     }
 
     public void SetInt32(string colName, int val) {
@@ -69,10 +79,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Int64) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        int off = col.offset;
-        for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((val >> (i * 8)) & 255L);
-        }
+        this.SetInt64Fast(col, val);
     }
 
     public long GetInt64(string colName) {
@@ -80,12 +87,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Int64) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        int off = col.offset;
-        long res = 0L;
-        for (int i = 0; i < 8; i = i + 1) {
-            res = res | (((long)this.data[off + i] & 255L) << (i * 8));
-        }
-        return res;
+        return this.GetInt64Fast(col);
     }
 
     public void SetFloat32(string colName, float val) {
@@ -93,12 +95,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Float32) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        int u = BitConverter.SingleToInt32Bits(val);
-        int off = col.offset;
-        this.data[off] = (byte)(u & 255);
-        this.data[off + 1] = (byte)((u >> 8) & 255);
-        this.data[off + 2] = (byte)((u >> 16) & 255);
-        this.data[off + 3] = (byte)((u >> 24) & 255);
+        this.SetFloat32Fast(col, val);
     }
 
     public float GetFloat32(string colName) {
@@ -106,10 +103,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Float32) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        int off = col.offset;
-        int u = ((int)this.data[off] & 255) | (((int)this.data[off + 1] & 255) << 8) |
-                (((int)this.data[off + 2] & 255) << 16) | (((int)this.data[off + 3] & 255) << 24);
-        return BitConverter.Int32BitsToSingle(u);
+        return this.GetFloat32Fast(col);
     }
 
     public void SetFloat64(string colName, double val) {
@@ -117,11 +111,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Float64) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        long u = BitConverter.DoubleToInt64Bits(val);
-        int off = col.offset;
-        for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((u >> (i * 8)) & 255L);
-        }
+        this.SetFloat64Fast(col, val);
     }
 
     public double GetFloat64(string colName) {
@@ -129,12 +119,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Float64) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
-        int off = col.offset;
-        long u = 0L;
-        for (int i = 0; i < 8; i = i + 1) {
-            u = u | (((long)this.data[off + i] & 255L) << (i * 8));
-        }
-        return BitConverter.Int64BitsToDouble(u);
+        return this.GetFloat64Fast(col);
     }
 
     public void SetStr(string colName, string val) {
@@ -174,10 +159,8 @@ public class RecordRow {
         }
         int off = col.offset;
         int max = col.fixedLen;
-        int len = 0;
-        while (len < max && this.data[off + len] != 0) {
-            len = len + 1;
-        }
+        int nul = max > 0 ? NativeMemory.Find((nint)this.data, off, 0, max) : -1;
+        int len = nul < 0 ? max : (nul - off);
         if (len == 0) { return ""; }
         return Encoding.GetString(this.data, off, len);
     }
@@ -205,67 +188,91 @@ public class RecordRow {
     // ---- 预解析高速存取器（结合 RecordBinding 消除每行列名哈希与线性探针）----
     public void SetInt32Fast(RecordColumn col, int val) {
         if (col == null) { return; }
-        int off = col.offset;
-        this.data[off] = (byte)(val & 255);
-        this.data[off + 1] = (byte)((val >> 8) & 255);
-        this.data[off + 2] = (byte)((val >> 16) & 255);
-        this.data[off + 3] = (byte)((val >> 24) & 255);
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 4);
+        s[0] = (byte)(val & 255);
+        s[1] = (byte)((val >> 8) & 255);
+        s[2] = (byte)((val >> 16) & 255);
+        s[3] = (byte)((val >> 24) & 255);
     }
 
     public int GetInt32Fast(RecordColumn col) {
         if (col == null) { return 0; }
-        int off = col.offset;
-        int b0 = (int)this.data[off] & 255;
-        int b1 = ((int)this.data[off + 1] & 255) << 8;
-        int b2 = ((int)this.data[off + 2] & 255) << 16;
-        int b3 = ((int)this.data[off + 3] & 255) << 24;
-        return b0 | b1 | b2 | b3;
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 4);
+        return ((int)s[0] & 255) | (((int)s[1] & 255) << 8) |
+               (((int)s[2] & 255) << 16) | (((int)s[3] & 255) << 24);
     }
 
     public void SetInt64Fast(RecordColumn col, long val) {
         if (col == null) { return; }
-        int off = col.offset;
-        for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((val >> (i * 8)) & 255L);
-        }
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 8);
+        s[0] = (byte)(val & 255L);
+        s[1] = (byte)((val >> 8) & 255L);
+        s[2] = (byte)((val >> 16) & 255L);
+        s[3] = (byte)((val >> 24) & 255L);
+        s[4] = (byte)((val >> 32) & 255L);
+        s[5] = (byte)((val >> 40) & 255L);
+        s[6] = (byte)((val >> 48) & 255L);
+        s[7] = (byte)((val >> 56) & 255L);
     }
 
     public long GetInt64Fast(RecordColumn col) {
         if (col == null) { return 0L; }
-        int off = col.offset;
-        long res = 0L;
-        for (int i = 0; i < 8; i = i + 1) {
-            res = res | (((long)this.data[off + i] & 255L) << (i * 8));
-        }
-        return res;
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 8);
+        return ((long)s[0] & 255L) | (((long)s[1] & 255L) << 8) |
+               (((long)s[2] & 255L) << 16) | (((long)s[3] & 255L) << 24) |
+               (((long)s[4] & 255L) << 32) | (((long)s[5] & 255L) << 40) |
+               (((long)s[6] & 255L) << 48) | (((long)s[7] & 255L) << 56);
+    }
+
+    public void SetFloat32Fast(RecordColumn col, float val) {
+        if (col == null) { return; }
+        int u = BitConverter.SingleToInt32Bits(val);
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 4);
+        s[0] = (byte)(u & 255);
+        s[1] = (byte)((u >> 8) & 255);
+        s[2] = (byte)((u >> 16) & 255);
+        s[3] = (byte)((u >> 24) & 255);
+    }
+
+    public float GetFloat32Fast(RecordColumn col) {
+        if (col == null) { return 0.0f; }
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 4);
+        int u = ((int)s[0] & 255) | (((int)s[1] & 255) << 8) |
+                (((int)s[2] & 255) << 16) | (((int)s[3] & 255) << 24);
+        return BitConverter.Int32BitsToSingle(u);
     }
 
     public void SetFloat64Fast(RecordColumn col, double val) {
         if (col == null) { return; }
         long u = BitConverter.DoubleToInt64Bits(val);
-        int off = col.offset;
-        for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((u >> (i * 8)) & 255L);
-        }
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 8);
+        s[0] = (byte)(u & 255L);
+        s[1] = (byte)((u >> 8) & 255L);
+        s[2] = (byte)((u >> 16) & 255L);
+        s[3] = (byte)((u >> 24) & 255L);
+        s[4] = (byte)((u >> 32) & 255L);
+        s[5] = (byte)((u >> 40) & 255L);
+        s[6] = (byte)((u >> 48) & 255L);
+        s[7] = (byte)((u >> 56) & 255L);
     }
 
     public double GetFloat64Fast(RecordColumn col) {
         if (col == null) { return 0.0; }
-        int off = col.offset;
-        long u = 0L;
-        for (int i = 0; i < 8; i = i + 1) {
-            u = u | (((long)this.data[off + i] & 255L) << (i * 8));
-        }
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 8);
+        long u = ((long)s[0] & 255L) | (((long)s[1] & 255L) << 8) |
+                 (((long)s[2] & 255L) << 16) | (((long)s[3] & 255L) << 24) |
+                 (((long)s[4] & 255L) << 32) | (((long)s[5] & 255L) << 40) |
+                 (((long)s[6] & 255L) << 48) | (((long)s[7] & 255L) << 56);
         return BitConverter.Int64BitsToDouble(u);
     }
 
     public void SetBoolFast(RecordColumn col, bool val) {
         if (col == null) { return; }
-        int off = col.offset;
-        this.data[off] = (byte)(val ? 1 : 0);
-        this.data[off + 1] = 0;
-        this.data[off + 2] = 0;
-        this.data[off + 3] = 0;
+        Span<byte> s = new Span<byte>((nint)this.data + (nint)col.offset, 4);
+        s[0] = (byte)(val ? 1 : 0);
+        s[1] = 0;
+        s[2] = 0;
+        s[3] = 0;
     }
 
     public bool GetBoolFast(RecordColumn col) {
@@ -298,10 +305,8 @@ public class RecordRow {
         }
         int off = col.offset;
         int max = col.fixedLen;
-        int len = 0;
-        while (len < max && this.data[off + len] != 0) {
-            len = len + 1;
-        }
+        int nul = max > 0 ? NativeMemory.Find((nint)this.data, off, 0, max) : -1;
+        int len = nul < 0 ? max : (nul - off);
         if (len == 0) { return ""; }
         return Encoding.GetString(this.data, off, len);
     }
@@ -312,6 +317,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.VarStr) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
+        if (this.varStrs == null) { this.varStrs = new Dictionary<string, string>(); }
         this.varStrs[colName] = val != null ? val : "";
     }
 
@@ -322,7 +328,7 @@ public class RecordRow {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
         string cachedStr = null;
-        if (this.varStrs.TryGetValue(colName, out cachedStr)) {
+        if (this.varStrs != null && this.varStrs.TryGetValue(colName, out cachedStr)) {
             return cachedStr;
         }
         int off = col.offset;
@@ -336,6 +342,7 @@ public class RecordRow {
         }
         byte[] raw = this.table.ReadBlobBytesLocked((long)bOff, bLen);
         string res = raw != null ? Encoding.GetString(raw, 0, raw.Length) : "";
+        if (this.varStrs == null) { this.varStrs = new Dictionary<string, string>(); }
         this.varStrs[colName] = res;
         return res;
     }
@@ -346,6 +353,7 @@ public class RecordRow {
         if (col == null || col.dataType != RecordDataType.Blob) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
+        if (this.blobs == null) { this.blobs = new Dictionary<string, byte[]>(); }
         this.blobs[colName] = val != null ? val : new byte[0];
     }
 
@@ -356,7 +364,7 @@ public class RecordRow {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
         byte[] cachedBlob = null;
-        if (this.blobs.TryGetValue(colName, out cachedBlob)) {
+        if (this.blobs != null && this.blobs.TryGetValue(colName, out cachedBlob)) {
             return cachedBlob;
         }
         int off = col.offset;
@@ -369,6 +377,7 @@ public class RecordRow {
             throw new InvalidOperationException("cannot fetch Blob without open RecordTable connection");
         }
         byte[] raw = this.table.ReadBlobBytesLocked((long)bOff, bLen);
+        if (this.blobs == null) { this.blobs = new Dictionary<string, byte[]>(); }
         this.blobs[colName] = raw;
         return raw;
     }

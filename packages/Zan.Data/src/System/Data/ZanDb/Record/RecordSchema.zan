@@ -35,10 +35,18 @@ public class RecordColumn {
 public class RecordSchema {
     public List<RecordColumn> columns;
     public int rowBytes; // 定长行宽（4 字节对齐）
+    internal bool hasVarCols;
+    private Dictionary<string, RecordColumn> exactMap;
+    private Dictionary<string, RecordColumn> lowerMap;
+    private int cachedColCount;
 
     public RecordSchema() {
         this.columns = new List<RecordColumn>();
         this.rowBytes = 4; // 保留前 4 字节：flags(1B, 1=有效/0=墓碑) + 3B 保留对齐
+        this.hasVarCols = false;
+        this.exactMap = null;
+        this.lowerMap = null;
+        this.cachedColCount = -1;
     }
 
     public void AddInt32(string name) {
@@ -95,6 +103,7 @@ public class RecordSchema {
         int dt = RecordDataType.VarStr > 0 ? RecordDataType.VarStr : 7;
         this.columns.Add(new RecordColumn(name, dt, 8, off));
         this.rowBytes = this.rowBytes + 8;
+        this.hasVarCols = true;
     }
 
     // 原始大二进制字节块：行内存 8 字节指针 (4B blobOffset + 4B blobLen)
@@ -103,6 +112,40 @@ public class RecordSchema {
         int dt = RecordDataType.Blob > 0 ? RecordDataType.Blob : 8;
         this.columns.Add(new RecordColumn(name, dt, 8, off));
         this.rowBytes = this.rowBytes + 8;
+        this.hasVarCols = true;
+    }
+
+    private static string AsciiLower(string s) {
+        int n = s.Length;
+        bool hasUpper = false;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 65 && c <= 90) { hasUpper = true; break; }
+        }
+        if (!hasUpper) { return s; }
+        byte[] buf = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            buf[i] = (byte)c;
+        }
+        return buf.ToStr(0, n);
+    }
+
+    private void EnsureColMap() {
+        int n = this.columns.Count;
+        if (this.exactMap != null && this.cachedColCount == n) { return; }
+        Dictionary<string, RecordColumn> em = new Dictionary<string, RecordColumn>();
+        Dictionary<string, RecordColumn> lm = new Dictionary<string, RecordColumn>();
+        for (int i = 0; i < n; i = i + 1) {
+            RecordColumn c = this.columns[i];
+            if (!em.ContainsKey(c.name)) { em[c.name] = c; }
+            string low = RecordSchema.AsciiLower(c.name);
+            if (!lm.ContainsKey(low)) { lm[low] = c; }
+        }
+        this.exactMap = em;
+        this.lowerMap = lm;
+        this.cachedColCount = n;
     }
 
     private static bool EqualsAsciiIgnoreCase(string a, string b) {
@@ -120,12 +163,13 @@ public class RecordSchema {
 
     public RecordColumn FindColumn(string name) {
         if (name == null) { return null; }
-        for (int i = 0; i < this.columns.Count; i = i + 1) {
-            if (this.columns[i].name == name) { return this.columns[i]; }
-        }
-        for (int i = 0; i < this.columns.Count; i = i + 1) {
-            if (RecordSchema.EqualsAsciiIgnoreCase(this.columns[i].name, name)) { return this.columns[i]; }
-        }
+        int n = this.columns.Count;
+        if (n == 0) { return null; }
+        this.EnsureColMap();
+        RecordColumn col = null;
+        if (this.exactMap.TryGetValue(name, out col)) { return col; }
+        string low = RecordSchema.AsciiLower(name);
+        if (this.lowerMap.TryGetValue(low, out col)) { return col; }
         return null;
     }
 
@@ -178,6 +222,9 @@ public class RecordSchema {
             }
             string name = Encoding.GetString(nb, 0, nlen);
             s.columns.Add(new RecordColumn(name, dt, flen, off));
+            if (dt == RecordDataType.VarStr || dt == RecordDataType.Blob) {
+                s.hasVarCols = true;
+            }
         }
         return s;
     }

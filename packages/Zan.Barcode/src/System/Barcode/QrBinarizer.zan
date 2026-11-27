@@ -26,25 +26,36 @@ public class QrBinarizer {
         if (totalL <= 0 || totalL > (long)lum.Length || totalL > 2147483591L) { return 128; }
         int total = (int)totalL;
         int[] hist = new int[256];
-        for (int i = 0; i < 256; i = i + 1) { hist[i] = 0; }
-        for (int i = 0; i < total; i = i + 1) {
-            int v = lum[i] & 255;
-            hist[v] = hist[v] + 1;
+        Span<int> hs = new Span<int>((nint)hist, 256);
+        Span<byte> src = new Span<byte>((nint)lum, total);
+        int i = 0;
+        while (i + 4 <= total) {
+            int v0 = src[i] & 255; hs[v0] = hs[v0] + 1;
+            int v1 = src[i + 1] & 255; hs[v1] = hs[v1] + 1;
+            int v2 = src[i + 2] & 255; hs[v2] = hs[v2] + 1;
+            int v3 = src[i + 3] & 255; hs[v3] = hs[v3] + 1;
+            i = i + 4;
+        }
+        while (i < total) {
+            int v = src[i] & 255;
+            hs[v] = hs[v] + 1;
+            i = i + 1;
         }
         long sum = 0;
-        for (int i = 0; i < 256; i = i + 1) {
-            sum = sum + (long)i * hist[i];
+        for (int k = 0; k < 256; k = k + 1) {
+            sum = sum + (long)k * hs[k];
         }
         long sumB = 0;
         int wB = 0;
         double maxVar = -1.0;
         int threshold = 128;
         for (int t = 0; t < 256; t = t + 1) {
-            wB = wB + hist[t];
+            int ht = hs[t];
+            wB = wB + ht;
             if (wB == 0) { continue; }
             int wF = total - wB;
             if (wF == 0) { break; }
-            sumB = sumB + (long)t * hist[t];
+            sumB = sumB + (long)t * ht;
             double mB = (double)sumB / (double)wB;
             double mF = (double)(sum - sumB) / (double)wF;
             double diff = mB - mF;
@@ -57,56 +68,98 @@ public class QrBinarizer {
         return threshold;
     }
 
-    // 全局阈值二值化：返回 true = 深色。
+    // 全局阈值二值化：返回 true = 深色（8 路 Span 展开）。
     public static bool[] Binarize(byte[] lum, int width, int height, int threshold) {
         if (lum == null || width <= 0 || height <= 0) { return new bool[0]; }
         long totalL = (long)width * (long)height;
         if (totalL <= 0 || totalL > (long)lum.Length || totalL > 2147483591L) { return new bool[0]; }
-        bool[] dark = new bool[(int)totalL];
-        for (int i = 0; i < dark.Length; i = i + 1) {
-            dark[i] = (lum[i] & 255) <= threshold;
+        int total = (int)totalL;
+        bool[] dark = new bool[total];
+        Span<byte> src = new Span<byte>((nint)lum, total);
+        Span<bool> dst = new Span<bool>((nint)dark, total);
+        int i = 0;
+        while (i + 8 <= total) {
+            dst[i] = (src[i] & 255) <= threshold;
+            dst[i + 1] = (src[i + 1] & 255) <= threshold;
+            dst[i + 2] = (src[i + 2] & 255) <= threshold;
+            dst[i + 3] = (src[i + 3] & 255) <= threshold;
+            dst[i + 4] = (src[i + 4] & 255) <= threshold;
+            dst[i + 5] = (src[i + 5] & 255) <= threshold;
+            dst[i + 6] = (src[i + 6] & 255) <= threshold;
+            dst[i + 7] = (src[i + 7] & 255) <= threshold;
+            i = i + 8;
+        }
+        while (i < total) {
+            dst[i] = (src[i] & 255) <= threshold;
+            i = i + 1;
         }
         return dark;
     }
 
     // 局部自适应二值化：8x8 块内取 (min+max)/2 当阈值。
-    //
-    // **块内几乎均匀时退回全局阈值**——纯白/纯黑的块用局部阈值会把整块判成
-    // 深色（阈值 = min = max，`<=` 判定全中），那是块边界伪影的来源。
+    // 内部完整 8x8 块走外提 Span<byte>/Span<bool> 8 路展开快路径，边缘非整块走通用裁剪路径。
     public static bool[] AdaptiveBinarize(byte[] lum, int width, int height,
                                            int globalThreshold) {
         if (lum == null || width <= 0 || height <= 0) { return new bool[0]; }
         long totalL = (long)width * (long)height;
         if (totalL <= 0 || totalL > (long)lum.Length || totalL > 2147483591L) { return new bool[0]; }
-        bool[] dark = new bool[(int)totalL];
+        int total = (int)totalL;
+        bool[] dark = new bool[total];
         int bx = (width + BLOCK - 1) / BLOCK;
         int by = (height + BLOCK - 1) / BLOCK;
+        Span<byte> src = new Span<byte>((nint)lum, total);
+        Span<bool> dst = new Span<bool>((nint)dark, total);
         for (int bj = 0; bj < by; bj = bj + 1) {
+            int y0 = bj * BLOCK;
+            int y1 = y0 + BLOCK;
+            bool fullY = y1 <= height;
+            if (!fullY) { y1 = height; }
             for (int bi = 0; bi < bx; bi = bi + 1) {
                 int x0 = bi * BLOCK;
-                int y0 = bj * BLOCK;
                 int x1 = x0 + BLOCK;
-                int y1 = y0 + BLOCK;
-                if (x1 > width) { x1 = width; }
-                if (y1 > height) { y1 = height; }
-                int min = 255;
-                int max = 0;
-                for (int y = y0; y < y1; y = y + 1) {
-                    int row = y * width;
-                    for (int x = x0; x < x1; x = x + 1) {
-                        int v = lum[row + x] & 255;
-                        if (v < min) { min = v; }
-                        if (v > max) { max = v; }
+                if (fullY && x1 <= width) {
+                    int min = 255;
+                    int max = 0;
+                    int row = y0 * width + x0;
+                    for (int dy = 0; dy < 8; dy = dy + 1) {
+                        for (int dx = 0; dx < 8; dx = dx + 1) {
+                            int v = src[row + dx] & 255;
+                            if (v < min) { min = v; }
+                            if (v > max) { max = v; }
+                        }
+                        row = row + width;
                     }
-                }
-                int threshold = globalThreshold;
-                if (max - min > 24) {
-                    threshold = (min + max) / 2;
-                }
-                for (int y = y0; y < y1; y = y + 1) {
-                    int row = y * width;
-                    for (int x = x0; x < x1; x = x + 1) {
-                        dark[row + x] = (lum[row + x] & 255) <= threshold;
+                    int threshold = (max - min > 24) ? ((min + max) >> 1) : globalThreshold;
+                    row = y0 * width + x0;
+                    for (int dy = 0; dy < 8; dy = dy + 1) {
+                        dst[row] = (src[row] & 255) <= threshold;
+                        dst[row + 1] = (src[row + 1] & 255) <= threshold;
+                        dst[row + 2] = (src[row + 2] & 255) <= threshold;
+                        dst[row + 3] = (src[row + 3] & 255) <= threshold;
+                        dst[row + 4] = (src[row + 4] & 255) <= threshold;
+                        dst[row + 5] = (src[row + 5] & 255) <= threshold;
+                        dst[row + 6] = (src[row + 6] & 255) <= threshold;
+                        dst[row + 7] = (src[row + 7] & 255) <= threshold;
+                        row = row + width;
+                    }
+                } else {
+                    if (x1 > width) { x1 = width; }
+                    int min = 255;
+                    int max = 0;
+                    for (int y = y0; y < y1; y = y + 1) {
+                        int row = y * width;
+                        for (int x = x0; x < x1; x = x + 1) {
+                            int v = src[row + x] & 255;
+                            if (v < min) { min = v; }
+                            if (v > max) { max = v; }
+                        }
+                    }
+                    int threshold = (max - min > 24) ? ((min + max) >> 1) : globalThreshold;
+                    for (int y = y0; y < y1; y = y + 1) {
+                        int row = y * width;
+                        for (int x = x0; x < x1; x = x + 1) {
+                            dst[row + x] = (src[row + x] & 255) <= threshold;
+                        }
                     }
                 }
             }
@@ -141,20 +194,26 @@ public class QrBinarizer {
             outp[x] = QrBinarizer.DenoiseBorderPixel(dark, width, height, x, 0);
             outp[lastRow + x] = QrBinarizer.DenoiseBorderPixel(dark, width, height, x, height - 1);
         }
-        // 内部行：左右列边界 + 中间滑窗 3 列和（总邻域固定为 9，>= 5 即多数）
+        // 内部行：左右列边界 + 中间滑窗 3 列和（Span<bool> 消除逐像素边界检查，总邻域固定为 9，>= 5 即多数）
         int w1 = width - 1;
+        nint dp = (nint)dark;
+        nint op = (nint)outp;
         for (int y = 1; y < height - 1; y = y + 1) {
             int r0 = (y - 1) * width;
             int r1 = y * width;
             int r2 = (y + 1) * width;
             outp[r1] = QrBinarizer.DenoiseBorderPixel(dark, width, height, 0, y);
             outp[r1 + w1] = QrBinarizer.DenoiseBorderPixel(dark, width, height, w1, y);
-            int c0 = (dark[r0] ? 1 : 0) + (dark[r1] ? 1 : 0) + (dark[r2] ? 1 : 0);
-            int c1 = (dark[r0 + 1] ? 1 : 0) + (dark[r1 + 1] ? 1 : 0) + (dark[r2 + 1] ? 1 : 0);
+            Span<bool> s0 = new Span<bool>(dp + (nint)r0, width);
+            Span<bool> s1 = new Span<bool>(dp + (nint)r1, width);
+            Span<bool> s2 = new Span<bool>(dp + (nint)r2, width);
+            Span<bool> dst = new Span<bool>(op + (nint)r1, width);
+            int c0 = (s0[0] ? 1 : 0) + (s1[0] ? 1 : 0) + (s2[0] ? 1 : 0);
+            int c1 = (s0[1] ? 1 : 0) + (s1[1] ? 1 : 0) + (s2[1] ? 1 : 0);
             for (int x = 1; x < w1; x = x + 1) {
                 int x2 = x + 1;
-                int c2 = (dark[r0 + x2] ? 1 : 0) + (dark[r1 + x2] ? 1 : 0) + (dark[r2 + x2] ? 1 : 0);
-                outp[r1 + x] = (c0 + c1 + c2) >= 5;
+                int c2 = (s0[x2] ? 1 : 0) + (s1[x2] ? 1 : 0) + (s2[x2] ? 1 : 0);
+                dst[x] = (c0 + c1 + c2) >= 5;
                 c0 = c1;
                 c1 = c2;
             }

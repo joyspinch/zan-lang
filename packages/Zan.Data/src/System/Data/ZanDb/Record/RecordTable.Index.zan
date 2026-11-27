@@ -19,11 +19,43 @@ public partial class RecordTable {
             List<string> sortedKeys = new List<string>();
             this.indexKeysSorted[colName] = sortedKeys;
 
-            // 扫描当前所有活跃行填充索引（收集后一次性 O(K log K) 排序，消除 O(K^2) 插入搬移）
-            for (int id = 1; id <= this.totalRows; id = id + 1) {
-                if (!this.tombstones.ContainsKey(id)) {
-                    RecordRow r = this.GetLocked(id);
-                    if (r != null) {
+            // 批量顺序分块扫描所有活跃行填充索引（64 KiB 块读消除逐行 OS syscall，收集后一次性 O(K log K) 排序）
+            int rbytes = this.schema.rowBytes;
+            int total = this.totalRows;
+            if (rbytes > 0 && total > 0) {
+                int chunkRows = 65536 / rbytes;
+                if (chunkRows < 1) { chunkRows = 1; }
+                if (chunkRows > total) { chunkRows = total; }
+                byte[] chunk = new byte[chunkRows * rbytes];
+                nint chunkPtr = (nint)chunk;
+                int id = 1;
+                while (id <= total) {
+                    int batch = total - id + 1;
+                    if (batch > chunkRows) { batch = chunkRows; }
+                    int wantBytes = batch * rbytes;
+                    long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                    int got = 0;
+                    Mutex.Lock(this.ioMtx);
+                    try {
+                        got = this.file.ReadRaw(off, chunkPtr, wantBytes);
+                    } finally {
+                        Mutex.Unlock(this.ioMtx);
+                    }
+                    int gotRows = got / rbytes;
+                    if (gotRows <= 0) { break; }
+                    bool hasTombs = this.tombstones.Count > 0;
+                    for (int k = 0; k < gotRows; k = k + 1) {
+                        int curId = id + k;
+                        if (hasTombs && this.tombstones.ContainsKey(curId)) { continue; }
+                        int rowOff = k * rbytes;
+                        if (chunk[rowOff] == 0) {
+                            this.tombstones[curId] = true;
+                            hasTombs = true;
+                            continue;
+                        }
+                        byte[] buf = new byte[rbytes];
+                        NativeMemory.Copy((nint)buf, chunkPtr + (nint)rowOff, rbytes);
+                        RecordRow r = new RecordRow(this.schema, buf, curId, true, this);
                         string key = col != null ? RecordTable.ExtractColKeyFor(r, col) : this.ExtractColKey(r, colName);
                         if (key != null) {
                             List<int> bucket = null;
@@ -32,9 +64,11 @@ public partial class RecordTable {
                                 idx[key] = bucket;
                                 sortedKeys.Add(key);
                             }
-                            bucket.Add(id);
+                            bucket.Add(curId);
                         }
                     }
+                    if (gotRows < batch) { break; }
+                    id = id + gotRows;
                 }
             }
             if (sortedKeys.Count > 1) {
@@ -576,19 +610,55 @@ public partial class RecordTable {
         return true;
     }
 
-    // 零拷贝全表顺序扫描
+    // 批量分块全表顺序扫描（64 KiB 连续块读消除逐行加锁与 OS ReadFile syscall，每行仍保留独立所有权缓冲）
     public void Scan(RecordRowVisitor visitor) {
         this.tlock.EnterRead();
         try {
             if (visitor == null || !this.IsOpen()) { return; }
-            for (int id = 1; id <= this.totalRows; id = id + 1) {
-                if (!this.tombstones.ContainsKey(id)) {
-                    RecordRow r = this.GetLocked(id);
-                    if (r != null) {
-                        bool cont = visitor(id, r);
-                        if (!cont) { break; }
-                    }
+            int rbytes = this.schema.rowBytes;
+            int total = this.totalRows;
+            if (rbytes <= 0 || total <= 0) { return; }
+
+            int chunkRows = 65536 / rbytes;
+            if (chunkRows < 1) { chunkRows = 1; }
+            if (chunkRows > total) { chunkRows = total; }
+            byte[] chunk = new byte[chunkRows * rbytes];
+            nint chunkPtr = (nint)chunk;
+
+            int id = 1;
+            while (id <= total) {
+                int batch = total - id + 1;
+                if (batch > chunkRows) { batch = chunkRows; }
+                int wantBytes = batch * rbytes;
+                long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                int got = 0;
+                Mutex.Lock(this.ioMtx);
+                try {
+                    got = this.file.ReadRaw(off, chunkPtr, wantBytes);
+                } finally {
+                    Mutex.Unlock(this.ioMtx);
                 }
+                int gotRows = got / rbytes;
+                if (gotRows <= 0) { break; }
+
+                bool hasTombs = this.tombstones.Count > 0;
+                for (int k = 0; k < gotRows; k = k + 1) {
+                    int curId = id + k;
+                    if (hasTombs && this.tombstones.ContainsKey(curId)) { continue; }
+                    int rowOff = k * rbytes;
+                    if (chunk[rowOff] == 0) {
+                        this.tombstones[curId] = true;
+                        hasTombs = true;
+                        continue;
+                    }
+                    byte[] buf = new byte[rbytes];
+                    NativeMemory.Copy((nint)buf, chunkPtr + (nint)rowOff, rbytes);
+                    RecordRow r = new RecordRow(this.schema, buf, curId, true, this);
+                    bool cont = visitor(curId, r);
+                    if (!cont) { return; }
+                }
+                if (gotRows < batch) { break; }
+                id = id + gotRows;
             }
         } finally {
             this.tlock.ExitRead();

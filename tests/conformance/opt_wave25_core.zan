@@ -1,0 +1,440 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Linq;
+using System.Data.ZanDb;
+using System.Barcode;
+using System.Text.CodePage;
+using System.Drawing;
+using System.Net.Http.Hpack;
+
+class OptWave25Core {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            throw new Exception("FAIL: " + msg);
+        }
+    }
+
+    static void CleanTableFiles(string prefix, string tbl) {
+        File.Delete(prefix + "." + tbl + ".ztab");
+        File.Delete(prefix + "." + tbl + ".zblob");
+        File.Delete(prefix + "." + tbl + ".zidx");
+        File.Delete(prefix + "." + tbl + ".zwal");
+    }
+
+    static void TestZanDbRecordEngine() {
+        string prefix = "_scratch/opt_wave25_zandb";
+        CleanTableFiles(prefix, "items");
+        CleanTableFiles(prefix, "tags");
+        CleanTableFiles(prefix, "varitems");
+
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("group");
+        schema.AddInt32("seq");
+        schema.AddInt64("big");
+        schema.AddFloat32("ratio");
+        schema.AddFloat64("price");
+        schema.AddBool("ok");
+        schema.AddFixedStr("code", 8);
+
+        // Schema FindColumn exact + case-insensitive
+        Check(schema.FindColumn("group") != null, "schema exact");
+        RecordColumn ciCol = schema.FindColumn("GROUP");
+        Check(ciCol != null && ciCol.name == "group", "schema ci");
+        Check(schema.FindColumn("missing") == null, "schema missing");
+
+        RecordTable tbl = RecordTable.Open(prefix, "items", schema);
+        List<RecordRow> rows = new List<RecordRow>();
+        int n = 90;
+        for (int i = 0; i < n; i = i + 1) {
+            RecordRow r = tbl.NewRow();
+            r.SetInt32("group", (i * 7) % 10);
+            r.SetInt32("seq", i);
+            r.SetInt64("big", 10000000000L + (long)i * 1000L);
+            r.SetFloat32("ratio", (float)(i % 13) * 0.5f);
+            r.SetFloat64("price", (double)(i % 17) * 1.25);
+            r.SetBool("ok", (i & 1) == 0);
+            if (i == 0) {
+                r.SetStr("code", "");
+            } else if (i == 1) {
+                // Full 8-byte string with no NUL terminator
+                r.SetStr("code", "ABCDEFGH");
+            } else {
+                r.SetStr("code", "C" + Convert.ToString(100 + (i % 9)));
+            }
+            rows.Add(r);
+        }
+        tbl.AddBulk(rows);
+
+        // Delete a few rows to exercise tombstone skipping in chunked Scan & EnsureIndex
+        Check(tbl.Delete(5), "delete id 5");
+        Check(tbl.Delete(42), "delete id 42");
+        Check(tbl.Delete(90), "delete id 90");
+
+        // Early stop in chunked Scan
+        int seenEarly = 0;
+        tbl.Scan((int id, RecordRow r) => {
+            seenEarly = seenEarly + 1;
+            return seenEarly < 10;
+        });
+        Check(seenEarly == 10, "scan early stop");
+
+        // Verify full fixed string & empty fixed string
+        RecordRow row1 = tbl.Get(1);
+        RecordRow row2 = tbl.Get(2);
+        Check(row1.GetStr("code") == "", "empty fixed str");
+        Check(row2.GetStr("code") == "ABCDEFGH", "full 8-byte fixed str");
+        Check(row2.GetInt64("big") == 10000001000L, "int64 roundtrip");
+        Check(Math.Abs((double)row2.GetFloat32("ratio") - 0.5) < 1e-5, "float32 roundtrip");
+        Check(Math.Abs(row2.GetFloat64("price") - 1.25) < 1e-9, "float64 roundtrip");
+
+        // Multi-column predicate (>2 cols to test 2-slot cache eviction)
+        ExprNode pred = ExprNode.Binary("&&",
+            ExprNode.Binary("&&",
+                ExprNode.Binary(">=", ExprNode.Member("group"), ExprNode.Const(2)),
+                ExprNode.Binary("==", ExprNode.Member("ok"), ExprNode.Const(true))),
+            ExprNode.Binary(">", ExprNode.Member("price"), ExprNode.Const(0.0)));
+
+        // Numeric OrderByDescending stability check (duplicate group keys must keep ascending seq order)
+        List<RecordRow> numSorted = new RecordQuery(tbl).Where(pred).OrderByDescending("group").ToList();
+        Check(numSorted.Count > 20, "numSorted non-trivial count");
+        for (int i = 1; i < numSorted.Count; i = i + 1) {
+            int gPrev = numSorted[i - 1].GetInt32("group");
+            int gCur = numSorted[i].GetInt32("group");
+            Check(gPrev >= gCur, "numeric desc order");
+            if (gPrev == gCur) {
+                Check(numSorted[i - 1].GetInt32("seq") < numSorted[i].GetInt32("seq"), "numeric sort stability");
+            }
+        }
+
+        // String OrderBy stability check (duplicate code keys must keep ascending seq order)
+        List<RecordRow> strSorted = new RecordQuery(tbl).Where(pred).OrderBy("code").ToList();
+        Check(strSorted.Count == numSorted.Count, "strSorted count");
+        for (int i = 1; i < strSorted.Count; i = i + 1) {
+            string cPrev = strSorted[i - 1].GetStr("code");
+            string cCur = strSorted[i].GetStr("code");
+            int cmp = String.CompareOrdinal(cPrev, cCur);
+            Check(cmp <= 0, "str asc order");
+            if (cmp == 0) {
+                Check(strSorted[i - 1].GetInt32("seq") < strSorted[i].GetInt32("seq"), "str sort stability");
+            }
+        }
+
+        // Aggregates & EnsureIndex (batched scan)
+        int manualSum = 0;
+        long manualBig = 0L;
+        for (int i = 0; i < numSorted.Count; i = i + 1) {
+            manualSum = manualSum + numSorted[i].GetInt32("seq");
+            manualBig = manualBig + numSorted[i].GetInt64("big");
+        }
+        Check(new RecordQuery(tbl).Where(pred).SumInt("seq") == manualSum, "SumInt");
+        Check(new RecordQuery(tbl).Where(pred).SumLong("big") == manualBig, "SumLong");
+
+        tbl.EnsureIndex("group");
+        List<RecordRow> idxHits = tbl.FindByIndex("group", "3");
+        Check(idxHits.Count > 0, "EnsureIndex FindByIndex");
+        for (int i = 0; i < idxHits.Count; i = i + 1) {
+            Check(idxHits[i].GetInt32("group") == 3, "index hit value");
+        }
+
+        // Join
+        RecordSchema tSchema = new RecordSchema();
+        tSchema.AddInt32("gid");
+        tSchema.AddFixedStr("label", 16);
+        RecordTable tags = RecordTable.Open(prefix, "tags", tSchema);
+        for (int g = 0; g < 5; g = g + 1) {
+            RecordRow tr = tags.NewRow();
+            tr.SetInt32("gid", g);
+            tr.SetStr("label", "G" + Convert.ToString(g));
+            tags.Add(tr);
+        }
+        List<RecordJoinResult> joined = new RecordQuery(tbl).Where(pred).Join(tags, "group", "gid");
+        Check(joined.Count > 0, "Join results");
+        for (int i = 0; i < joined.Count; i = i + 1) {
+            Check(joined[i].left.GetInt32("group") == joined[i].right.GetInt32("gid"), "Join key match");
+        }
+
+        // VarStr + Blob table (hasVarCols == true)
+        RecordSchema vSchema = new RecordSchema();
+        vSchema.AddInt32("k");
+        vSchema.AddVarStr("note");
+        vSchema.AddBlob("raw");
+        RecordTable vtbl = RecordTable.Open(prefix, "varitems", vSchema);
+        RecordRow vr = vtbl.NewRow();
+        vr.SetInt32("k", 77);
+        vr.SetVarStr("note", "hello-varstr-wave25");
+        vr.SetBlob("raw", new byte[] { 10, 20, 30, 40 });
+        int vid = vtbl.Add(vr);
+        RecordRow vrGot = vtbl.Get(vid);
+        Check(vrGot.GetVarStr("note") == "hello-varstr-wave25", "VarStr roundtrip");
+        byte[] gotBlob = vrGot.GetBlob("raw");
+        Check(gotBlob.Length == 4 && gotBlob[3] == 40, "Blob roundtrip");
+
+        vtbl.Close();
+        tags.Close();
+        tbl.Close();
+        CleanTableFiles(prefix, "items");
+        CleanTableFiles(prefix, "tags");
+        CleanTableFiles(prefix, "varitems");
+    }
+
+    static void TestQrRsDecoder() {
+        int dataLen = 44;
+        int ecLen = 28; // max 14 errors
+        int totalLen = dataLen + ecLen;
+        int[] gen = QrSpec.RsGenerator(ecLen);
+        int[] data = new int[dataLen];
+        for (int i = 0; i < dataLen; i = i + 1) {
+            data[i] = (i * 37 + 11) & 255;
+        }
+        int[] ec = QrSpec.RsRemainder(data, dataLen, gen);
+        int[] orig = new int[totalLen];
+        for (int i = 0; i < dataLen; i = i + 1) { orig[i] = data[i]; }
+        for (int i = 0; i < ecLen; i = i + 1) { orig[dataLen + i] = ec[i]; }
+
+        // 0 errors (clean fast path)
+        int[] blk0 = new int[totalLen];
+        Array.Copy(orig, blk0, totalLen);
+        Check(QrRsDecoder.Decode(blk0, ecLen), "RS 0-error");
+
+        // 1 error at position 0 and last position
+        int[] blk1 = new int[totalLen];
+        Array.Copy(orig, blk1, totalLen);
+        blk1[0] = blk1[0] ^ 0x5A;
+        Check(QrRsDecoder.Decode(blk1, ecLen), "RS 1-error pos 0");
+        Check(blk1[0] == orig[0], "RS 1-error restored");
+
+        // Max capacity: 14 errors (including boundaries & adjacent positions)
+        int[] blkMax = new int[totalLen];
+        Array.Copy(orig, blkMax, totalLen);
+        int[] errPos = new int[] { 0, 1, 5, 11, 12, 20, 29, 35, 43, 44, 51, 60, 70, 71 };
+        for (int i = 0; i < errPos.Length; i = i + 1) {
+            blkMax[errPos[i]] = blkMax[errPos[i]] ^ (1 + ((i * 53 + 7) % 254));
+        }
+        Check(QrRsDecoder.Decode(blkMax, ecLen), "RS max 14-error decode");
+        for (int i = 0; i < totalLen; i = i + 1) {
+            Check(blkMax[i] == orig[i], "RS max 14-error exact restore");
+        }
+
+        // Beyond capacity: 15 errors -> must fail cleanly
+        int[] blkOver = new int[totalLen];
+        Array.Copy(orig, blkOver, totalLen);
+        for (int i = 0; i < 15; i = i + 1) {
+            blkOver[i * 4] = blkOver[i * 4] ^ (0xA1 ^ i);
+        }
+        Check(!QrRsDecoder.Decode(blkOver, ecLen), "RS 15-error must reject");
+    }
+
+    static void TestQrBinarizerAndFinder() {
+        // Odd non-multiple-of-8 dimensions (67x53) for AdaptiveBinarize edge blocks + Denoise
+        int nw = 67;
+        int nh = 53;
+        byte[] img = new byte[nw * nh];
+        for (int y = 0; y < nh; y = y + 1) {
+            for (int x = 0; x < nw; x = x + 1) {
+                img[y * nw + x] = (byte)(((x / 4 + y / 4) & 1) == 0 ? 30 : 225);
+            }
+        }
+        int th = QrBinarizer.OtsuThreshold(img, nw, nh);
+        Check(th >= 30 && th <= 225, "Otsu range");
+        bool[] gDark = QrBinarizer.Binarize(img, nw, nh, th);
+        bool[] aDark = QrBinarizer.AdaptiveBinarize(img, nw, nh, th);
+        Check(gDark.Length == nw * nh && aDark.Length == nw * nh, "binarize lengths");
+        Check(gDark[0] && !gDark[4], "binarize values");
+
+        // Inject isolated salt-and-pepper noise inside a dark 4x4 block and verify Denoise heals it
+        gDark[1 * nw + 1] = false;
+        bool[] den = QrBinarizer.Denoise(gDark, nw, nh);
+        Check(den[1 * nw + 1], "denoise isolated pixel");
+
+        // Full QR encode -> render -> Binarize -> QrFinder.Find
+        QrMatrix m = QrEncoder.Encode("wave25-qr-finder-check", QrEcl.M);
+        int sc = 6;
+        int bd = 4;
+        int w = (m.size + bd * 2) * sc;
+        byte[] qlum = new byte[w * w];
+        for (int y = 0; y < w; y = y + 1) {
+            int my = y / sc - bd;
+            for (int x = 0; x < w; x = x + 1) {
+                int mx = x / sc - bd;
+                bool d = mx >= 0 && my >= 0 && mx < m.size && my < m.size && m.Get(mx, my);
+                qlum[y * w + x] = (byte)(d ? 15 : 240);
+            }
+        }
+        int qth = QrBinarizer.OtsuThreshold(qlum, w, w);
+        bool[] qdark = QrBinarizer.Binarize(qlum, w, w, qth);
+        List<QrFinderPattern> found = QrFinder.Find(qdark, w, w);
+        Check(found.Count >= 3, "finder locates >= 3 patterns");
+        QrDecoder.QrDecodeResult decoded = QrDecoder.Decode(BarcodeImage.FromLuminance(w, w, qlum));
+        Check(decoded != null && decoded.text == "wave25-qr-finder-check", "full QR decode parity");
+    }
+
+    static void TestGbkCodec() {
+        // Pure ASCII, mixed CJK + 2-byte UTF-8 (αβΩ) + ASCII
+        string ascii = "Hello-GBK-1234567890!@#";
+        Check(Gbk.Decode(Gbk.Encode(ascii)) == ascii, "GBK pure ASCII");
+
+        string mixed = "深圳Zan语言2026: αβΩ — 测试数据123!";
+        byte[] enc = Gbk.Encode(mixed);
+        Check(Gbk.Decode(enc) == mixed, "GBK mixed roundtrip");
+        Check(Gbk.Decode(new byte[0]) == "" && Gbk.Encode("").Length == 0, "GBK empty");
+
+        // TrailIndex / TrailByte boundaries
+        Check(Gbk.TrailIndex(0x3F) == -1 && Gbk.TrailIndex(0x7F) == -1 && Gbk.TrailIndex(0xFF) == -1, "GBK invalid trail");
+        Check(Gbk.TrailIndex(0x40) == 0 && Gbk.TrailIndex(0x7E) == 62 && Gbk.TrailIndex(0x80) == 63 && Gbk.TrailIndex(0xFE) == 189, "GBK valid trail");
+
+        // Lenient & strict error handling
+        byte[] badBytes = new byte[] { 65, 0x81, 0x7F, 66 };
+        bool threw = false;
+        try {
+            Gbk.Decode(badBytes);
+        } catch (Exception) {
+            threw = true;
+        }
+        Check(threw, "GBK strict decode throws");
+        string lenDec = Gbk.DecodeLenient(badBytes);
+        Check(lenDec.StartsWith("A") && lenDec.EndsWith("B"), "GBK lenient decode");
+
+        byte[] lenEnc = Gbk.EncodeLenient("测试😀OK");
+        Check(Gbk.Decode(lenEnc) == "测试?OK", "GBK lenient encode emoji");
+        bool encThrew = false;
+        try {
+            Gbk.Encode("测试😀OK");
+        } catch (Exception) {
+            encThrew = true;
+        }
+        Check(encThrew, "GBK strict encode emoji throws");
+    }
+
+    static void TestImageBufferTransforms() {
+        // Non-multiple-of-4 pixel count (7x5 = 35 pixels) for Sepia tail + Alpha preservation + clamping
+        int w = 7;
+        int h = 5;
+        ImageBuffer img = new ImageBuffer(w, h);
+        try {
+            int[] orig = new int[w * h];
+            Span<int> pix = new Span<int>(img.Pixels, w * h);
+            for (int i = 0; i < w * h; i = i + 1) {
+                int a = (i * 37) & 255;
+                int r = (i == 0) ? 255 : ((i * 53) & 255);
+                int g = (i == 0) ? 255 : ((i * 97) & 255);
+                int b = (i == 0) ? 255 : ((i * 131) & 255);
+                int px = (a << 24) | (r << 16) | (g << 8) | b;
+                pix[i] = px;
+                orig[i] = px;
+            }
+            img.Sepia();
+            for (int i = 0; i < w * h; i = i + 1) {
+                int p = orig[i];
+                int a = (p >> 24) & 255;
+                int r = (p >> 16) & 255;
+                int g = (p >> 8) & 255;
+                int b = p & 255;
+                int nr = (r * 101 + g * 197 + b * 48) >> 8;
+                int ng = (r * 89 + g * 176 + b * 43) >> 8;
+                int nb = (r * 70 + g * 137 + b * 34) >> 8;
+                if (nr > 255) { nr = 255; }
+                if (ng > 255) { ng = 255; }
+                if (nb > 255) { nb = 255; }
+                int expected = (a << 24) | (nr << 16) | (ng << 8) | nb;
+                Check(pix[i] == expected, "Sepia exact pixel " + Convert.ToString(i));
+            }
+        } finally {
+            img.Dispose();
+        }
+
+        // FlipHorizontal on odd (17x3) and even (16x2) widths
+        int[] widths = new int[] { 1, 2, 5, 8, 16, 17 };
+        for (int wi = 0; wi < widths.Length; wi = wi + 1) {
+            int fw = widths[wi];
+            int fh = 3;
+            ImageBuffer fimg = new ImageBuffer(fw, fh);
+            try {
+                Span<int> fpix = new Span<int>(fimg.Pixels, fw * fh);
+                for (int y = 0; y < fh; y = y + 1) {
+                    for (int x = 0; x < fw; x = x + 1) {
+                        fpix[y * fw + x] = (y << 16) | x;
+                    }
+                }
+                fimg.FlipHorizontal();
+                for (int y = 0; y < fh; y = y + 1) {
+                    for (int x = 0; x < fw; x = x + 1) {
+                        Check(fpix[y * fw + x] == ((y << 16) | (fw - 1 - x)), "FlipH mirror");
+                    }
+                }
+                fimg.FlipHorizontal();
+                for (int y = 0; y < fh; y = y + 1) {
+                    for (int x = 0; x < fw; x = x + 1) {
+                        Check(fpix[y * fw + x] == ((y << 16) | x), "FlipH double identity");
+                    }
+                }
+            } finally {
+                fimg.Dispose();
+            }
+        }
+    }
+
+    static void TestHpackDynamicIndex() {
+        HpackContext enc = new HpackContext(4096);
+        HpackContext dec = new HpackContext(4096);
+
+        // Duplicate name tie-breaking: newest entry (lowest dynamic index = 62) must win
+        enc.AddHeader("x-dup", "old");
+        enc.AddHeader("x-other", "v1");
+        enc.AddHeader("x-dup", "new");
+        List<int> nameOut = new List<int>();
+        int idxNew = enc.Find("x-dup", "new", nameOut);
+        int idxOld = enc.Find("x-dup", "old", nameOut);
+        Check(idxNew == 62, "HPACK newest exact is 62");
+        Check(idxOld == 64, "HPACK older exact is 64");
+        nameOut.Clear();
+        int miss = enc.Find("x-dup", "unseen", nameOut);
+        Check(miss == 0 && nameOut.Count == 1 && nameOut[0] == 62, "HPACK name-only lowest index 62");
+
+        // Eviction & oversized header clear
+        enc.SetMaxTableSize(100);
+        nameOut.Clear();
+        Check(enc.Find("x-dup", "old", nameOut) == 0, "HPACK evicted old entry");
+        StringBuilder hugeSb = new StringBuilder();
+        for (int z = 0; z < 200; z = z + 1) { hugeSb.Append("z"); }
+        enc.AddHeader("x-huge", hugeSb.ToString());
+        Check(enc.dynamicTable.Count == 0, "HPACK oversized clears table");
+        nameOut.Clear();
+        Check(enc.Find("x-dup", "new", nameOut) == 0 && nameOut.Count == 0, "HPACK cleared lookup miss");
+
+        // Large table exceeding initial ringCap (256+) + full encode/decode parity
+        HpackContext bigEnc = new HpackContext(32768);
+        HpackContext bigDec = new HpackContext(32768);
+        for (int i = 0; i < 300; i = i + 1) {
+            List<HpackHeader> req = new List<HpackHeader>();
+            req.Add(new HpackHeader(":method", "GET"));
+            req.Add(new HpackHeader("x-dyn-" + Convert.ToString(i), "val-" + Convert.ToString(i)));
+            if (i >= 5) {
+                req.Add(new HpackHeader("x-dyn-" + Convert.ToString(i - 5), "val-" + Convert.ToString(i - 5)));
+            }
+            byte[] wire = bigEnc.EncodeHeaders(req, true);
+            List<HpackHeader> back = bigDec.DecodeHeaderBlock(wire, 0, wire.Length);
+            Check(back.Count == req.Count, "HPACK roundtrip count");
+            for (int k = 0; k < req.Count; k = k + 1) {
+                Check(back[k].name == req[k].name && back[k].value == req[k].value, "HPACK roundtrip kv");
+            }
+        }
+        Check(bigEnc.dynamicTable.Count >= 260, "HPACK ring grew past 256");
+    }
+
+    static void Main() {
+        TestZanDbRecordEngine();
+        Console.WriteLine("ZANDB_RECORD_OK");
+        TestQrRsDecoder();
+        Console.WriteLine("QR_RS_OK");
+        TestQrBinarizerAndFinder();
+        Console.WriteLine("QR_IMAGE_OK");
+        TestGbkCodec();
+        Console.WriteLine("GBK_CODEC_OK");
+        TestImageBufferTransforms();
+        Console.WriteLine("IMAGE_TRANSFORM_OK");
+        TestHpackDynamicIndex();
+        Console.WriteLine("HPACK_DYNAMIC_OK");
+        Console.WriteLine("ALL_WAVE25_CORE_OK");
+    }
+}
