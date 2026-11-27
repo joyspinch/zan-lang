@@ -58,7 +58,9 @@ public partial class MySqlConnection : IDbConnection {
             byte[] cd = await this.readPacket();
             if (cd == null) {
                 this.lastError = "truncated column definition";
-                return result;
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
             }
             int p = 0;
             MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
@@ -70,16 +72,45 @@ public partial class MySqlConnection : IDbConnection {
             MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
             if (p + 9 > cd.Length) {
                 this.lastError = "truncated column definition";
-                return result;
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
             }
             colTypes.Add(cd[p + 6] & 255);  // 字符集 2 + 长度 4
             colFlags.Add((cd[p+7]&255) | ((cd[p+8]&255) << 8));
         }
         byte[] colEof = await this.readPacket();  // 结束列定义的 EOF
+        if (colEof == null) {
+            this.lastError = "truncated column EOF packet";
+            this.hadError = true;
+            this.connected = false;
+            this.fail();
+        }
+        if (colEof.Length > 0 && (colEof[0] & 255) == 255) {
+            int code = colEof.Length >= 3 ? ((colEof[1] & 255) | ((colEof[2] & 255) << 8)) : 0;
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + (this.lastLen > 9 ? MySqlWire.bytesToStr(colEof, 9, this.lastLen - 9) : "");
+            this.hadError = true;
+            this.lastNumber = code;
+            this.fail();
+        }
         int rowCount = 0;
         while (true) {
             byte[] row = await this.readPacket();
-            if (row == null) { break; }
+            if (row == null) {
+                this.lastError = "unexpected EOF while reading result rows";
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
+            }
+            if (row.Length > 0 && (row[0] & 255) == 255) {
+                int code = row.Length >= 3 ? ((row[1] & 255) | ((row[2] & 255) << 8)) : 0;
+                this.lastError = "err " + Convert.ToString(code) + ": "
+                    + (this.lastLen > 9 ? MySqlWire.bytesToStr(row, 9, this.lastLen - 9) : "");
+                this.hadError = true;
+                this.lastNumber = code;
+                this.fail();
+            }
             if (this.isEof(row)) { break; }
             int p = 0;
             List<DbCell> cells = new List<DbCell>();
@@ -88,7 +119,9 @@ public partial class MySqlConnection : IDbConnection {
             while (c < ncols) {
                 if (p >= row.Length) {
                     this.lastError = "truncated row packet";
-                    return result;
+                    this.hadError = true;
+                    this.connected = false;
+                    this.fail();
                 }
                 DbCell cell = new DbCell();
                 if ((row[p] & 255) == 251) {  // NULL 标记
@@ -342,14 +375,20 @@ public partial class MySqlConnection : IDbConnection {
     internal async int stmtExecute(int stmtId, DbParams prms) {
         int n = prms.Count();
         int bitmapLen = (n + 7) / 8;
-        int total = 1 + 4 + 1 + 4;
+        long totalL = 10L;
         if (n > 0) {
-            total = total + bitmapLen + 1 + 2 * n;
+            totalL = totalL + (long)bitmapLen + 1L + 2L * (long)n;
             for (int i = 0; i < n; i = i + 1) {
-                if (prms.KindAt(i) == DbParams.KindInt) { total = total + 8; }
-                else if (!prms.IsNull(i)) { total = total + 4 + prms.AsText(i).Length; }
+                if (prms.KindAt(i) == DbParams.KindInt) { totalL = totalL + 8L; }
+                else if (!prms.IsNull(i)) { totalL = totalL + 9L + (long)prms.AsText(i).Length; }
+                if (totalL > 2147483600L) {
+                    this.lastError = "prepared statement payload too large";
+                    this.hadError = true;
+                    return -1;
+                }
             }
         }
+        int total = (int)totalL;
         byte[] pay = new byte[total + 1];
         pay[0] = (byte)(23);  // COM_STMT_EXECUTE
         pay[1] = (byte)(stmtId&255); pay[2] = (byte)((stmtId>>8)&255); pay[3] = (byte)((stmtId>>16)&255); pay[4] = (byte)((stmtId>>24)&255);
@@ -503,7 +542,9 @@ public partial class MySqlConnection : IDbConnection {
             byte[] cd = await this.readPacket();
             if (cd == null) {
                 this.lastError = "truncated column definition";
-                return result;
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
             }
             int p = 0;
             MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
@@ -515,7 +556,9 @@ public partial class MySqlConnection : IDbConnection {
             MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
             if (p + 9 > cd.Length) {
                 this.lastError = "truncated column definition";
-                return result;
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
             }
             int ctype = cd[p + 6] & 255;  // 字符集 2 + 长度 4
             int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
@@ -523,17 +566,46 @@ public partial class MySqlConnection : IDbConnection {
             colFlags.Add(cflags);
         }
         byte[] colEof = await this.readPacket();
+        if (colEof == null) {
+            this.lastError = "truncated column EOF packet";
+            this.hadError = true;
+            this.connected = false;
+            this.fail();
+        }
+        if (colEof.Length > 0 && (colEof[0] & 255) == 255) {
+            int code = colEof.Length >= 3 ? ((colEof[1] & 255) | ((colEof[2] & 255) << 8)) : 0;
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + (this.lastLen > 9 ? MySqlWire.bytesToStr(colEof, 9, this.lastLen - 9) : "");
+            this.hadError = true;
+            this.lastNumber = code;
+            this.fail();
+        }
         int rowCount = 0;
         while (true) {
             byte[] row = await this.readPacket();
-            if (row == null) { break; }
+            if (row == null) {
+                this.lastError = "unexpected EOF while reading binary rows";
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
+            }
+            if (row.Length > 0 && (row[0] & 255) == 255) {
+                int code = row.Length >= 3 ? ((row[1] & 255) | ((row[2] & 255) << 8)) : 0;
+                this.lastError = "err " + Convert.ToString(code) + ": "
+                    + (this.lastLen > 9 ? MySqlWire.bytesToStr(row, 9, this.lastLen - 9) : "");
+                this.hadError = true;
+                this.lastNumber = code;
+                this.fail();
+            }
             if (this.isEof(row)) { break; }
             // 二进制行：0x00 头，接着是带 2 位偏移的 null bitmap。
             int rowLen = this.lastLen >= 0 && this.lastLen <= row.Length ? this.lastLen : row.Length;
             int bmLen = (ncols + 9) / 8;
             if (1 + bmLen > rowLen) {
                 this.lastError = "truncated binary row packet";
-                return result;
+                this.hadError = true;
+                this.connected = false;
+                this.fail();
             }
             int p = 1 + bmLen;
             List<DbCell> cells = new List<DbCell>();

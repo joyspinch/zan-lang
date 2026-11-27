@@ -5,6 +5,18 @@ using System.Text;
 namespace System.Data.Orm;
 
 public class DbSchema {
+    // 按方言引用已校验标识符，防止关键字列名/表名导致语法错误。
+    public static string QuoteIdent(string ident, int provider) {
+        string safe = QueryBuilder.RequireIdent(ident);
+        if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
+            return "`" + safe + "`";
+        }
+        if (provider == DbProvider.SqlServer) {
+            return "[" + safe + "]";
+        }
+        return "\"" + safe + "\"";
+    }
+
     // 表的列名，顺序同表定义；表不存在时是空列表。
     public static async List<string> ColumnsAsync(IDbExecutor db, string table) {
         List<string> cols = new List<string>();
@@ -13,8 +25,24 @@ public class DbSchema {
         DbResult r;
         int nameCol = 0;
         if (p == DbProvider.SQLite) {
-            r = await db.QueryAsync("PRAGMA table_info(" + t + ")");
+            r = await db.QueryAsync("PRAGMA table_info(\"" + t + "\")");
             nameCol = 1;
+        } else if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            r = await db.QueryAsync(
+                "SELECT column_name FROM information_schema.columns "
+                + "WHERE table_schema = DATABASE() AND table_name = ? "
+                + "ORDER BY ordinal_position", new DbParams().Add(t));
+        } else if (p == DbProvider.PostgreSQL || p == DbProvider.Kingbase
+            || p == DbProvider.OpenGauss) {
+            r = await db.QueryAsync(
+                "SELECT column_name FROM information_schema.columns "
+                + "WHERE table_schema = CURRENT_SCHEMA() AND table_name = ? "
+                + "ORDER BY ordinal_position", new DbParams().Add(t));
+        } else if (p == DbProvider.SqlServer) {
+            r = await db.QueryAsync(
+                "SELECT column_name FROM information_schema.columns "
+                + "WHERE table_schema = SCHEMA_NAME() AND table_name = ? "
+                + "ORDER BY ordinal_position", new DbParams().Add(t));
         } else {
             r = await db.QueryAsync(
                 "SELECT column_name FROM information_schema.columns "
@@ -57,6 +85,16 @@ public class DbSchema {
         if (p == DbProvider.SQLite) {
             sql = "SELECT COUNT(*) FROM sqlite_master "
                 + "WHERE type = 'table' AND name = ?";
+        } else if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            sql = "SELECT COUNT(*) FROM information_schema.tables "
+                + "WHERE table_schema = DATABASE() AND table_name = ?";
+        } else if (p == DbProvider.PostgreSQL || p == DbProvider.Kingbase
+            || p == DbProvider.OpenGauss) {
+            sql = "SELECT COUNT(*) FROM information_schema.tables "
+                + "WHERE table_schema = CURRENT_SCHEMA() AND table_name = ?";
+        } else if (p == DbProvider.SqlServer) {
+            sql = "SELECT COUNT(*) FROM information_schema.tables "
+                + "WHERE table_schema = SCHEMA_NAME() AND table_name = ?";
         }
         DbResult r = await db.QueryAsync(sql, new DbParams().Add(table));
         if (r.RowCount() == 0) { return false; }
@@ -85,26 +123,59 @@ public class DbSchema {
         return "VARCHAR(" + Convert.ToString(n) + ")";
     }
 
+    // 严格校验数值字面量：可选单个前导 '-'、至少一位整数数字、至多一个小数点且其后至少一位数字。
+    private static bool IsValidNumericLiteral(string v) {
+        if (v == null || v.Length == 0) { return false; }
+        int i = 0;
+        if ((v[0] & 255) == 45) { i = 1; }
+        if (i >= v.Length) { return false; }
+        int intDigits = 0;
+        while (i < v.Length) {
+            int ch = v[i] & 255;
+            if (ch >= 48 && ch <= 57) {
+                intDigits = intDigits + 1;
+                i = i + 1;
+            } else {
+                break;
+            }
+        }
+        if (intDigits == 0) { return false; }
+        if (i == v.Length) { return true; }
+        if ((v[i] & 255) != 46) { return false; }
+        i = i + 1;
+        int fracDigits = 0;
+        while (i < v.Length) {
+            int ch = v[i] & 255;
+            if (ch >= 48 && ch <= 57) {
+                fracDigits = fracDigits + 1;
+                i = i + 1;
+            } else {
+                return false;
+            }
+        }
+        return fracDigits > 0;
+    }
+
     // 默认值的字面量，无法安全内联时是空串。
     public static string DefaultLiteral(DbColumnDef c) {
+        return DbSchema.DefaultLiteral(c, 0);
+    }
+
+    public static string DefaultLiteral(DbColumnDef c, int provider) {
         string v = c.defText;
-        if (v.Length == 0) { return ""; }
+        if (v == null || v.Length == 0) { return ""; }
         if (c.kind == "int" || c.kind == "long" || c.kind == "bool"
             || c.kind == "decimal" || c.kind == "double"
             || c.kind == "datetime") {
-            for (int i = 0; i < v.Length; i = i + 1) {
-                int ch = v[i] & 255;
-                bool digit = ch >= 48 && ch <= 57;
-                if (!digit && ch != 45 && ch != 46) { return ""; }
-            }
+            if (!DbSchema.IsValidNumericLiteral(v)) { return ""; }
             return v;
         }
-        return "'" + QueryBuilder.EscapeDdlLiteral(v) + "'";
+        return "'" + QueryBuilder.EscapeDdlLiteral(v, provider) + "'";
     }
 
     // 一列的 DDL 片段。
     public static string ColumnSql(DbColumnDef c, int provider) {
-        string colName = QueryBuilder.RequireIdent(c.name);
+        string colName = DbSchema.QuoteIdent(c.name, provider);
         if (c.identity) {
             if (provider == DbProvider.SQLite) {
                 return colName + " INTEGER PRIMARY KEY AUTOINCREMENT";
@@ -118,7 +189,7 @@ public class DbSchema {
         }
         string sql = colName + " " + DbSchema.SqlType(c.kind, c.size, provider);
         if (!c.nullable) { sql = sql + " NOT NULL"; }
-        string lit = DbSchema.DefaultLiteral(c);
+        string lit = DbSchema.DefaultLiteral(c, provider);
         if (lit.Length > 0) { sql = sql + " DEFAULT " + lit; }
         return sql;
     }
@@ -126,7 +197,7 @@ public class DbSchema {
     // 建表语句（列顺序即给定顺序；表已存在时不报错）。
     public static string CreateTableSql(string table, List<DbColumnDef> cols,
                                  int provider) {
-        string t = QueryBuilder.RequireIdent(table);
+        string t = DbSchema.QuoteIdent(table, provider);
         StringBuilder b = new StringBuilder();
         b.Append("CREATE TABLE IF NOT EXISTS ");
         b.Append(t);
@@ -151,9 +222,10 @@ public class DbSchema {
     // 给已有表加一列（不改类型、不删列 —— 那会丢数据）。
     public static async void AddColumnAsync(IDbExecutor db, string table,
                                      DbColumnDef col) {
-        string t = QueryBuilder.RequireIdent(table);
+        int p = db.GetProvider();
+        string t = DbSchema.QuoteIdent(table, p);
         int _n = await db.ExecuteAsync("ALTER TABLE " + t + " ADD COLUMN "
-            + DbSchema.ColumnSql(col, db.GetProvider()));
+            + DbSchema.ColumnSql(col, p));
     }
 
     // 把设计里有、表里没有的列补上，返回补了几列；表还不
@@ -182,15 +254,17 @@ public class DbSchema {
     // 把一张表改名（目标名已被占用时先丢掉目标）。
     public static async void RenameTableAsync(IDbExecutor db, string from,
                                        string to) {
-        string a = QueryBuilder.RequireIdent(from);
-        string b = QueryBuilder.RequireIdent(to);
-        await DbSchema.DropTableAsync(db, b);
+        int p = db.GetProvider();
+        string a = DbSchema.QuoteIdent(from, p);
+        string b = DbSchema.QuoteIdent(to, p);
+        await DbSchema.DropTableAsync(db, to);
         int _n = await db.ExecuteAsync("ALTER TABLE " + a + " RENAME TO " + b);
     }
 
     // 丢掉一张表（不存在也不报错）。
     public static async void DropTableAsync(IDbExecutor db, string table) {
-        string t = QueryBuilder.RequireIdent(table);
+        int p = db.GetProvider();
+        string t = DbSchema.QuoteIdent(table, p);
         int _n = await db.ExecuteAsync("DROP TABLE IF EXISTS " + t);
     }
 

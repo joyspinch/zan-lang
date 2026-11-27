@@ -110,9 +110,12 @@ public class TdsValue {
         if (t == TdsType.TEXT || t == TdsType.NTEXT || t == TdsType.IMAGE) {
             int ptrLen = r.U8();
             if (ptrLen == 0) { return TdsCell.Null(); }
+            if ((long)ptrLen + 12L > r.Left()) { return TdsCell.Null(); }
             r.Skip(ptrLen);
             r.Skip(8);  // timestamp
-            return TdsValue.Text(r, r.U32LE(), t);
+            int len = r.U32LE();
+            if (len < 0 || (long)len > r.Left() || len > 67108864) { return TdsCell.Null(); }
+            return TdsValue.Text(r, len, t);
         }
 
         if (TdsValue.IsLarge(t)) {
@@ -180,6 +183,7 @@ public class TdsValue {
     // 二进制用十六进制，national 类型用 UCS-2，其余
     // 原样输出。
     public static TdsCell Text(TdsReader r, int n, int t) {
+        if (n < 0 || (long)n > r.Left()) { return TdsCell.Null(); }
         if (TdsType.IsBinary(t)) {
             return TdsCell.Of(TdsValue.Hex(r, n));
         }
@@ -191,6 +195,7 @@ public class TdsValue {
 
     // 把 n 字节渲染为 "0x…" 小写十六进制。
     public static string Hex(TdsReader r, int n) {
+        if (n < 0 || (long)n > r.Left() || n > 1073741822) { return "0x"; }
         byte[] buf = new byte[2 + n * 2];
         buf[0] = 48;  // '0'
         buf[1] = 120;  // 'x'
@@ -397,9 +402,19 @@ public class TdsValue {
     // 渲染带 <paramref name="scale"/> 位隐式
     // 小数的整数。
     public static string Scaled(long units, int scale) {
-        bool neg = units < 0;
-        if (neg) { units = 0 - units; }
-        string digits = Convert.ToString(units);
+        if (scale < 0) { scale = 0; }
+        bool neg = units < 0L;
+        string digits;
+        if (neg) {
+            // 避免 long.MinValue 直接取负溢出：转为十进制字符串后剥离 '-'。
+            string s = Convert.ToString(units);
+            digits = s.StartsWith("-") ? s.Substring(1) : s;
+        } else {
+            digits = Convert.ToString(units);
+        }
+        if (scale == 0) {
+            return neg ? ("-" + digits) : digits;
+        }
         if (digits.Length <= scale) {
             StringBuilder sb = new StringBuilder();
             if (neg) { sb.Append("-"); }
@@ -436,8 +451,11 @@ public class TdsValue {
     // TIME/DATETIME2 保存 10^-scale 秒的计数。scale 为 7 时，
     // 一天的量是 8.64e11，因此计数用 <c>long</c>。
     public static string TimeOfDay(long ticks, int scale) {
-        long div = 1;
-        for (int i = 0; i < scale; i = i + 1) { div = div * 10; }
+        if (scale < 0) { scale = 0; }
+        if (scale > 7) { scale = 7; }
+        long div = 1L;
+        for (int i = 0; i < scale; i = i + 1) { div = div * 10L; }
+        if (ticks < 0L) { ticks = 0L; }
         int secs = (int)(ticks / div);
         StringBuilder sb = new StringBuilder();
         sb.Append(TdsValue.Pad2(secs / 3600));
@@ -447,7 +465,7 @@ public class TdsValue {
         sb.Append(TdsValue.Pad2(secs % 60));
         if (scale > 0) {
             sb.Append(".");
-            string frac = Convert.ToString(ticks - secs * div);
+            string frac = Convert.ToString(ticks - (long)secs * div);
             for (int z = frac.Length; z < scale; z = z + 1) { sb.Append("0"); }
             sb.Append(frac);
         }

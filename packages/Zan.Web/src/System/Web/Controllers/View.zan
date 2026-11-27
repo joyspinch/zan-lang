@@ -29,21 +29,36 @@ public class View {
     }
 
     // 清缓存并重读视图目录下全部模板（devReload 打开时每次渲染前调用）。
+    // 先构建新字典再原子切换，避免并发渲染读到半加载字典。
     public void LoadAll() {
-        this.compiled = new Dictionary<string, List<VNode>>();
-        this.LoadRec(this.dir, "");
+        Dictionary<string, List<VNode>> next = new Dictionary<string, List<VNode>>();
+        this.LoadRecInto(next, this.dir, "");
+        lock (this) {
+            this.compiled = next;
+        }
     }
 
     public void Put(string key, string body) {
         List<VNode> nodes = View.Compile(body);
-        if (this.compiled.ContainsKey(key)) {
-            this.compiled[key] = nodes;
-        } else {
-            this.compiled.Add(key, nodes);
+        lock (this) {
+            if (this.compiled.ContainsKey(key)) {
+                this.compiled[key] = nodes;
+            } else {
+                this.compiled.Add(key, nodes);
+            }
         }
     }
 
-    private void LoadRec(string d, string prefix) {
+    private static void PutInto(Dictionary<string, List<VNode>> map, string key, string body) {
+        List<VNode> nodes = View.Compile(body);
+        if (map.ContainsKey(key)) {
+            map[key] = nodes;
+        } else {
+            map.Add(key, nodes);
+        }
+    }
+
+    private void LoadRecInto(Dictionary<string, List<VNode>> map, string d, string prefix) {
         if (!Directory.Exists(d)) { return; }
         List<string> files = Directory.GetFileNames(d);
         for (int i = 0; i < files.Count; i = i + 1) {
@@ -51,26 +66,33 @@ public class View {
             if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
                 string stem = fn.Substring(0, fn.Length - 5);
                 string body = File.ReadAllText(d + "/" + fn);
-                this.Put(prefix + stem, body);
-                if (stem == "layout" && prefix.Length == 0) { this.Put("layout", body); }
+                View.PutInto(map, prefix + stem, body);
+                if (stem == "layout" && prefix.Length == 0) { View.PutInto(map, "layout", body); }
             }
         }
         List<string> dirs = Directory.GetDirectories(d);
         for (int j = 0; j < dirs.Count; j = j + 1) {
             string sub = dirs[j];
             if (sub == "View") {
-                this.LoadRec(d + "/" + sub, prefix);
+                this.LoadRecInto(map, d + "/" + sub, prefix);
             } else {
-                this.LoadRec(d + "/" + sub, prefix + sub + ".");
+                this.LoadRecInto(map, d + "/" + sub, prefix + sub + ".");
             }
         }
     }
 
+    private static string SafeMissingComment(string name) {
+        string escaped = View.HtmlEscape(name != null ? name : "");
+        return "<!-- view not found: " + escaped.Replace("--", "- -") + " -->";
+    }
+
     public string Render(string name, ViewData data) {
         if (this.devReload) { this.LoadAll(); }
+        Dictionary<string, List<VNode>> map;
+        lock (this) { map = this.compiled; }
         List<VNode> nodes = null;
-        if (!this.compiled.TryGetValue(name, out nodes)) {
-            return "<!-- view not found: " + name + " -->";
+        if (name == null || !map.TryGetValue(name, out nodes)) {
+            return View.SafeMissingComment(name);
         }
         StringBuilder sb = new StringBuilder();
         View.Emit(nodes, data, null, null, sb);
@@ -79,19 +101,23 @@ public class View {
 
     public string RenderPage(string name, ViewData data) {
         if (this.devReload) { this.LoadAll(); }
+        Dictionary<string, List<VNode>> map;
+        lock (this) { map = this.compiled; }
         List<VNode> page = null;
-        if (!this.compiled.TryGetValue(name, out page)) {
-            page = View.Compile("<!-- view not found: " + name + " -->");
+        if (name == null || !map.TryGetValue(name, out page)) {
+            // 禁止将缺失视图名送入 View.Compile，杜绝模板注入（SSTI）与注释逃逸（XSS）。
+            page = new List<VNode>();
+            page.Add(new VNode(VNodeKind.Literal, View.SafeMissingComment(name)));
         }
         string layoutKey = "layout";
-        int dot = name.IndexOf(".");
+        int dot = name != null ? name.IndexOf(".") : -1;
         if (dot > 0) {
             string modLayout = name.Substring(0, dot) + ".layout";
-            if (this.compiled.ContainsKey(modLayout)) { layoutKey = modLayout; }
+            if (map.ContainsKey(modLayout)) { layoutKey = modLayout; }
         }
         StringBuilder sb = new StringBuilder();
         List<VNode> layout = null;
-        if (!this.compiled.TryGetValue(layoutKey, out layout)) {
+        if (!map.TryGetValue(layoutKey, out layout)) {
             View.Emit(page, data, null, null, sb);
             return sb.ToString();
         }
