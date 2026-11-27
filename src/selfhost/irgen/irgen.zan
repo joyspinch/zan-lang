@@ -205,8 +205,11 @@ partial class Irgen {
     public List<string> sinitDispatchTables;
     public List<int> sinitDispatchSlots;
     public List<string> sinitVtableTargets;
+    public List<Node> sinitReflectTypes;
+    public List<string> sinitReflectTargets;
     public List<string> sinitExportRoots;
     public List<string> moduleInitSyms;
+    public Dictionary<string, List<Node>> vslotNodesCache;
     public int nativeLibraryDependencyLine;
     // the class instantiation of the method being emitted: a specialized clone
     // of a generic class (`Stat<int>`) carries its concrete type arguments, so
@@ -235,6 +238,8 @@ partial class Irgen {
     public string curResumeSym;
     public int curSubBase;
     public int curAwaitSeq;
+    public int curAsyncCancelLbl;
+    public List<int> asyncJoinOwnedStates;
     public bool usesAsync;
     public bool usesDirList;
     public bool usesStrOps; // Trim/ToUpper/ToLower/Replace/LastIndexOf helpers
@@ -360,7 +365,10 @@ partial class Irgen {
         sinitDispatchTables = new List<string>();
         sinitDispatchSlots = new List<int>();
         sinitVtableTargets = new List<string>();
+        sinitReflectTypes = new List<Node>();
+        sinitReflectTargets = new List<string>();
         sinitExportRoots = new List<string>();
+        vslotNodesCache = new Dictionary<string, List<Node>>();
         moduleInitSyms = new List<string>();
         curInstArgs = new List<Node>();
         curInstCls = "";
@@ -467,6 +475,7 @@ partial class Irgen {
             && !s.StartsWith("    ") && !s.EndsWith(" [")) {
             // LLVM comments must follow the instruction's debug attachment.
             int dispatch = s.IndexOf(" ; zan.dispatch ");
+            if (dispatch < 0) { dispatch = s.IndexOf(" ; zan.rdispatch "); }
             if (dispatch >= 0) {
                 body.Append(s.Substring(0, dispatch));
                 body.Append(", !dbg " + debugLocation);
@@ -661,15 +670,16 @@ partial class Irgen {
         #endif
     }
 
-    // POSIX stdio stream globals (fd 0 stdin / 2 stderr): Darwin's libc
-    // exports them as __stdinp / __stderrp, glibc/musl as stdin / stderr
-    // (the C host's builtin_sys.c picks the same names). Windows reaches
-    // them through __acrt_iob_func instead, so callers branch on hostWin
-    // first. Declares the global on first use and returns "@name".
+    // POSIX stdio stream globals (fd 0 stdin / 1 stdout / 2 stderr): Darwin's
+    // libc exports them as __stdinp / __stdoutp / __stderrp, glibc/musl as
+    // stdin / stdout / stderr (the C host's builtin_sys.c/emit_main.c pick the
+    // same names). Windows reaches them through __acrt_iob_func instead, so
+    // callers branch on hostWin first. Declares the global on first use and
+    // returns "@name".
     string PosixStdStream(int fd) {
-        string name = fd == 0 ? "stdin" : "stderr";
+        string name = fd == 0 ? "stdin" : (fd == 1 ? "stdout" : "stderr");
         #if MACOS
-        name = fd == 0 ? "__stdinp" : "__stderrp";
+        name = fd == 0 ? "__stdinp" : (fd == 1 ? "__stdoutp" : "__stderrp");
         #endif
         if (!ExternSeen(name)) {
             externDecls.Add(name);
@@ -728,6 +738,7 @@ partial class Irgen {
         gcProbeUsed = AstUsesGcProbe(unit);
         if (gcProbeUsed) {
             externDecls.Add("zan_gc_detect_cycles");
+            externDecls.Add("zan_gc_collect_cycles");
             externDecls.Add("zan_gc_write_heap_snapshot");
             externDecls.Add("zan_rt_heap_diagnostics_enable");
             externDecls.Add("zan_rt_heap_mutator_enter");

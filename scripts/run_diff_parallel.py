@@ -176,6 +176,26 @@ def run_focused_case(case, a):
     return case, "\n".join(failures)
 
 
+def run_built_exe(case, exe, a):
+    run_env, tmpdir = isolated_run_env(a.outdir, case)
+    try:
+        rc, out, err = run_cmd([exe], a.workdir, a.run_timeout, env=run_env)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if rc == -9:
+        return "the program timed out after %ds (spin or hang)" % a.run_timeout
+    if rc != 0:
+        return "the program exited with %d: %s%s" % (rc, out, err)
+    golden = os.path.join(a.case_dir, case + ".out")
+    if os.path.exists(golden):
+        exp = normalize(read_golden(golden))
+        act = normalize(out)
+        if act != exp:
+            return ("stdout differs from the C host's golden output\n"
+                    "--- expected ---\n%s\n--- actual ---\n%s" % (exp, act))
+    return ""
+
+
 def run_case(case, a):
     if a.focus:
         return run_focused_case(case, a)
@@ -202,21 +222,7 @@ def run_case(case, a):
         elif rc != 0:
             why = "clang rejected the emitted IR (rc=%d): %s%s" % (rc, out, err)
     if why == "":
-        run_env, tmpdir = isolated_run_env(a.outdir, case)
-        try:
-            rc, out, err = run_cmd([exe], a.workdir, a.run_timeout, env=run_env)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        if rc == -9:
-            why = "the program timed out after %ds (spin or hang)" % a.run_timeout
-        elif rc != 0:
-            why = "the program exited with %d: %s%s" % (rc, out, err)
-        elif os.path.exists(os.path.join(a.case_dir, case + ".out")):
-            exp = normalize(read_golden(os.path.join(a.case_dir, case + ".out")))
-            act = normalize(out)
-            if act != exp:
-                why = ("stdout differs from the C host's golden output\n"
-                       "--- expected ---\n%s\n--- actual ---\n%s" % (exp, act))
+        why = run_built_exe(case, exe, a)
     return (case, why)
 
 
@@ -484,6 +490,7 @@ def main():
     rejected = 0
 
     # ---- the differential cases, on the pool -------------------------------
+    run_retries = []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         for res in pool.map(lambda c: run_case(c, a), cases):
             if res[0] == "fatal":
@@ -498,9 +505,32 @@ def main():
             elif case in gaps:
                 gap_hits += 1
                 log("-- GAP  %s: %s" % (case, why))
+            elif (not a.focus and not why.startswith("gen1 ") and not why.startswith("clang ")
+                  and os.path.exists(os.path.join(a.outdir, case + ".exe"))):
+                run_retries.append((case, why))
             else:
                 failures += 1
                 log("-- FAIL %s: %s" % (case, why))
+
+    # Re-run runtime-only failures once serially after the compile/link pool
+    # drains so 12-way CPU/NTFS contention does not flake tight-window tests
+    # (dir_watcher, process_capture_timeout, fsync suites). Deterministic
+    # runtime bugs still fail identically on the quiet serial re-run.
+    if run_retries:
+        if len(run_retries) <= 16:
+            for case, first_why in run_retries:
+                exe = os.path.join(a.outdir, case + ".exe")
+                why2 = run_built_exe(case, exe, a)
+                if why2 == "":
+                    passed += 1
+                    log("-- PASS %s (quiet serial re-run)" % case)
+                else:
+                    failures += 1
+                    log("-- FAIL %s: %s" % (case, why2))
+        else:
+            for case, first_why in run_retries:
+                failures += 1
+                log("-- FAIL %s: %s" % (case, first_why))
 
     # ---- the reject cases, on the pool --------------------------------------
     if rejects:

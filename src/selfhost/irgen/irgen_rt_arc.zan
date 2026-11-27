@@ -462,7 +462,8 @@ partial class Irgen {
         // enclosing function's call
         if (callArmFn[callArmFn.Count - 1] != entryAllocas) { return; }
         List<string> top = callArmStack[callArmStack.Count - 1];
-        ArmArgTemps(stmtTemps.Count - 1, top);
+        Dictionary<string, bool> topSet = callArmSets[callArmSets.Count - 1];
+        ArmArgTemps(stmtTemps.Count - 1, top, topSet);
     }
 
     // Every call expression brackets its receiver, arguments and the call
@@ -472,22 +473,34 @@ partial class Irgen {
     // call retires them once it has returned. A call expression holds no
     // function exit, so no armed slot outlives its frame.
     public List<List<string>> callArmStack;
+    public List<Dictionary<string, bool>> callArmSets;
     public List<StringBuilder> callArmFn;
     void EnterCallArm() {
         if (callArmStack == null) { callArmStack = new List<List<string>>(); }
+        if (callArmSets == null) { callArmSets = new List<Dictionary<string, bool>>(); }
         if (callArmFn == null) { callArmFn = new List<StringBuilder>(); }
         callArmStack.Add(new List<string>());
+        callArmSets.Add(new Dictionary<string, bool>());
         callArmFn.Add(entryAllocas);
     }
     void LeaveCallArm() {
         List<string> top = callArmStack[callArmStack.Count - 1];
+        Dictionary<string, bool> topSet = callArmSets[callArmSets.Count - 1];
         StringBuilder fn = callArmFn[callArmFn.Count - 1];
         callArmStack.RemoveAt(callArmStack.Count - 1);
+        callArmSets.RemoveAt(callArmSets.Count - 1);
         callArmFn.RemoveAt(callArmFn.Count - 1);
         if (callArmStack.Count > 0 && callArmFn[callArmFn.Count - 1] == fn) {
             List<string> parent = callArmStack[callArmStack.Count - 1];
+            Dictionary<string, bool> parentSet = callArmSets[callArmSets.Count - 1];
             int i = 0;
-            while (i < top.Count) { parent.Add(top[i]); i = i + 1; }
+            while (i < top.Count) {
+                string entry = top[i];
+                parent.Add(entry);
+                int tab = entry.IndexOf("\t");
+                if (tab >= 0) { parentSet[entry.Substring(tab + 1)] = true; }
+                i = i + 1;
+            }
             return;
         }
         if (!term) { RetireArgTemps(top); }
@@ -495,17 +508,11 @@ partial class Irgen {
 
     // Is this slot already armed by a pending call of the current function?
     bool SlotArmedHere(string slot) {
-        if (callArmStack == null) { return false; }
-        string key = "\t" + slot;
+        if (callArmStack == null || callArmSets == null) { return false; }
         int d = 0;
         while (d < callArmStack.Count) {
-            if (callArmFn[d] == entryAllocas) {
-                List<string> l = callArmStack[d];
-                int i = 0;
-                while (i < l.Count) {
-                    if (l[i].EndsWith(key)) { return true; }
-                    i = i + 1;
-                }
+            if (callArmFn[d] == entryAllocas && callArmSets[d].ContainsKey(slot)) {
+                return true;
             }
             d = d + 1;
         }
@@ -515,7 +522,7 @@ partial class Irgen {
     // Arm every temporary in [mark, end) that is not armed yet: a register
     // temporary moves into an entry slot first. The armed entries
     // ("<llvm type>\t<slot>") are appended to `armed`.
-    void ArmArgTemps(int mark, List<string> armed) {
+    void ArmArgTemps(int mark, List<string> armed, Dictionary<string, bool> armedSet) {
         if (!eaActive) { return; }
         int i = mark;
         while (i < stmtTemps.Count) {
@@ -540,6 +547,7 @@ partial class Irgen {
             if (!SlotArmedHere(slot)) {
                 ArmLocalSlot(slot, ty, false);
                 armed.Add(lt + "\t" + slot);
+                armedSet[slot] = true;
             }
             i = i + 1;
         }

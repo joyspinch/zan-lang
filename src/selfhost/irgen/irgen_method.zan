@@ -387,6 +387,34 @@ partial class Irgen {
         }
         L("  store i32 " + mainArgc + ", i32* @__zan_argc");
         L("  store i8** " + mainArgv + ", i8*** @__zan_argv");
+        // Match C host stdout buffering (emit_main.c): delegate to runtime
+        // zan_rt_stdout_setup (unbuffered/line-buffered for pipes/TTYs, block-
+        // buffered for files) with a weak fallback to setvbuf.
+        if (!ExternSeen("zan_rt_stdout_setup")) {
+            externDecls.Add("zan_rt_stdout_setup");
+            if (!ExternSeen("setvbuf")) {
+                externDecls.Add("setvbuf");
+                H("declare i32 @setvbuf(i8*, i8*, i32, i64)");
+            }
+            H("define weak void @zan_rt_stdout_setup(i8* %f, i32 %mode, i64 %sz) {");
+            H("entry:");
+            H("  call i32 @setvbuf(i8* %f, i8* null, i32 %mode, i64 %sz)");
+            H("  ret void");
+            H("}");
+        }
+        string outPtr = NT();
+        if (hostWin) {
+            if (!ExternSeen("__acrt_iob_func")) {
+                externDecls.Add("__acrt_iob_func");
+                H("declare i8* @__acrt_iob_func(i32)");
+            }
+            L("  " + outPtr + " = call i8* @__acrt_iob_func(i32 1)");
+            L("  call void @zan_rt_stdout_setup(i8* " + outPtr + ", i32 4, i64 0)");
+        } else {
+            string sg = PosixStdStream(1);
+            L("  " + outPtr + " = load i8*, i8** " + sg);
+            L("  call void @zan_rt_stdout_setup(i8* " + outPtr + ", i32 1, i64 4096)");
+        }
         // Programs emit UTF-8 bytes; switch the Windows console to code page
         // 65001 so CJK/accented output renders instead of mojibake. Redirected
         // output (pipe/file) keeps its raw UTF-8 bytes.

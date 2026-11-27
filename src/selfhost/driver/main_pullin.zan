@@ -50,6 +50,16 @@ public class PiDir {
     }
 }
 
+public class PiPkgPendingDir {
+    public string dir;
+    public string prefix;
+    public string packageRoot;
+    public bool expanded;
+    public PiPkgPendingDir(string d, string pfx, string root) {
+        dir = d; prefix = pfx; packageRoot = root; expanded = false;
+    }
+}
+
 public partial class Program {
     static bool packagesDisabled;
 
@@ -166,6 +176,8 @@ public partial class Program {
     // `Gui.Styling.Models`) was never reached from `using Gui;` and the
     // type came out undefined.
     static List<PiFile> pkgNsIdx;   // the package sources, keyed by their declared namespace
+    static List<PiPkgPendingDir> pkgPendingDirs;
+    static bool pkgAllExpanded;
     static bool pkgNsIdxBuilt;
     static Dictionary<string, bool> pkgUsageSeen;
     static List<string> pkgUsedRoots;
@@ -182,6 +194,41 @@ public partial class Program {
 
     // The namespace a package file declares, in the 'A/B/C' subdir form.
     // (PiProbeNs below does the probing.)
+
+    // Shallow-scan a package source root (mirroring package_index.c's lazy index):
+    // probe direct .zan files, split System/ one level deeper so System.<Sub>
+    // packages stay independent, and defer deeper directories until queried.
+    static void PiPkgIdxCollectShallow(string dir, string packageRoot, string parentPrefix) {
+        if (dir == null || dir.Length == 0) { return; }
+        string names = Directory.ListNames(dir + "/*");
+        if (names == null || names.Length == 0) { return; }
+        List<string> parts = names.Split("\n");
+        int i = 0;
+        while (i < parts.Count) {
+            string nm = parts[i];
+            nm = nm.Trim();
+            if (nm != "" && nm.Substring(0, 1) != ".") {
+                string full = dir + "/" + nm;
+                if (nm.EndsWith(".zan")) {
+                    PiFile pf = new PiFile(full);
+                    pf.ns = PiProbeNs(full);
+                    pf.packageRoot = packageRoot;
+                    pkgNsIdx.Add(pf);
+                } else if (Directory.Exists(full)) {
+                    if (nm == "drivers" && File.Exists(full + "/driver.manifest")) {
+                        pkgDriverManifests.Add(full + "/driver.manifest");
+                    }
+                    if (parentPrefix == "" && nm == "System") {
+                        PiPkgIdxCollectShallow(full, packageRoot, "System");
+                    } else {
+                        string pfx = parentPrefix != "" ? parentPrefix + "/" + nm : nm;
+                        pkgPendingDirs.Add(new PiPkgPendingDir(full, pfx, packageRoot));
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
 
     // collect every package source under `dir`, with its declared namespace
     static void PiPkgIdxAdd(string dir, string packageRoot) {
@@ -200,7 +247,7 @@ public partial class Program {
                     pf.ns = PiProbeNs(full);
                     pf.packageRoot = packageRoot;
                     pkgNsIdx.Add(pf);
-                } else {
+                } else if (Directory.Exists(full)) {
                     if (nm == "drivers" && File.Exists(full + "/driver.manifest")) {
                         pkgDriverManifests.Add(full + "/driver.manifest");
                     }
@@ -217,10 +264,33 @@ public partial class Program {
         return Directory.Exists(stdlibRoot + "/" + subdir);
     }
 
-    // the package sources that declare `want` (and, when the namespace is
-    // not a standard library one, its descendants)
-    static void PiGlobPkgNs(PiDir d, string want) {
-        bool hierarchical = !PiStdlibHasDir(want);
+    static bool PiPkgPrefixMatches(string prefix, string target, bool hierarchical) {
+        if (prefix == target) { return true; }
+        if (target.Length > prefix.Length && target.StartsWith(prefix) && target[prefix.Length] == '/') {
+            return true;
+        }
+        if (hierarchical && prefix.Length > target.Length && prefix.StartsWith(target) && prefix[target.Length] == '/') {
+            return true;
+        }
+        return false;
+    }
+
+    static void PiPkgExpandMatching(string target, bool hierarchical, bool expandAll) {
+        if (pkgAllExpanded || pkgPendingDirs == null) { return; }
+        int i = 0;
+        while (i < pkgPendingDirs.Count) {
+            PiPkgPendingDir p = pkgPendingDirs[i];
+            if (!p.expanded && (expandAll || PiPkgPrefixMatches(p.prefix, target, hierarchical))) {
+                p.expanded = true;
+                PiPkgIdxAdd(p.dir, p.packageRoot);
+            }
+            i = i + 1;
+        }
+        if (expandAll) { pkgAllExpanded = true; }
+    }
+
+    static int PiGlobPkgNsScan(PiDir d, string want, bool hierarchical) {
+        int matched = 0;
         int i = 0;
         while (i < pkgNsIdx.Count) {
             PiFile f = pkgNsIdx[i];
@@ -232,11 +302,25 @@ public partial class Program {
                     hit = true;
                 }
                 if (hit) {
+                    matched = matched + 1;
                     PiNotePackageUsage(f.packageRoot);
                     if (!PiDirHasFile(d, f.path)) { d.files.Add(new PiFile(f.path)); }
                 }
             }
             i = i + 1;
+        }
+        return matched;
+    }
+
+    // the package sources that declare `want` (and, when the namespace is
+    // not a standard library one, its descendants)
+    static void PiGlobPkgNs(PiDir d, string want) {
+        bool hierarchical = !PiStdlibHasDir(want);
+        if (!pkgAllExpanded) { PiPkgExpandMatching(want, hierarchical, false); }
+        int matched = PiGlobPkgNsScan(d, want, hierarchical);
+        if (matched == 0 && hierarchical && !pkgAllExpanded && !PiInputDeclaresNamespace(want)) {
+            PiPkgExpandMatching(want, true, true);
+            PiGlobPkgNsScan(d, want, hierarchical);
         }
     }
 
@@ -245,12 +329,52 @@ public partial class Program {
     static Dictionary<string, string> pkgRoots;
     static List<string> pkgDriverManifests;
     static List<string> pkgSourceRoots;
+    static Dictionary<string, bool> piKnownNsDirs;
+
+    static bool PiIsStdlibNsDir(string sub) {
+        if (sub == null || sub == "") { return false; }
+        if (piKnownNsDirs == null) { piKnownNsDirs = new Dictionary<string, bool>(); }
+        if (piKnownNsDirs.ContainsKey(sub)) { return piKnownNsDirs[sub]; }
+        bool ok = Directory.Exists(stdlibRoot + "/" + sub);
+        piKnownNsDirs[sub] = ok;
+        return ok;
+    }
+
+    static void PiNoteQualifiedNs(PiFile f, List<Token> toks, int i) {
+        int n = toks.Count;
+        if (i + 4 >= n || toks[i + 1].kind != TK.Dot() || toks[i + 2].kind != TK.Ident()) { return; }
+        string seg0 = toks[i].text;
+        if (seg0 != "System") { return; }
+        string cur = seg0;
+        int j = i + 1;
+        while (j + 1 < n && toks[j].kind == TK.Dot() && toks[j + 1].kind == TK.Ident()) {
+            string next = cur + "/" + toks[j + 1].text;
+            if (!PiIsStdlibNsDir(next)) { break; }
+            cur = next;
+            j = j + 2;
+        }
+        if (cur == seg0) { return; }
+        if (j + 1 >= n || toks[j].kind != TK.Dot() || toks[j + 1].kind != TK.Ident()) { return; }
+        string typeTok = toks[j + 1].text;
+        if (typeTok.Length == 0) { return; }
+        int tc0 = (int)typeTok[0];
+        if (tc0 < 65 || tc0 > 90) { return; }
+        if (f != null) {
+            PiNoteUsing(f, cur);
+        } else {
+            PiReach(cur);
+            PiIntern(typeTok).flagged = 1;
+        }
+    }
+
     // index every package source once (the C host builds the same index
     // once and answers every namespace query from it)
     static void PiPkgIdxEnsure() {
         if (pkgNsIdxBuilt) { return; }
         pkgNsIdxBuilt = true;
         pkgNsIdx = new List<PiFile>();
+        pkgPendingDirs = new List<PiPkgPendingDir>();
+        pkgAllExpanded = false;
         pkgRoots = new Dictionary<string, string>();
         pkgUsageSeen = new Dictionary<string, bool>();
         pkgUsedRoots = new List<string>();
@@ -292,7 +416,7 @@ public partial class Program {
 
     static void PiPkgIdxAddRoot(string root, string packageRoot) {
         pkgSourceRoots.Add(root);
-        PiPkgIdxAdd(root, packageRoot);
+        PiPkgIdxCollectShallow(root, packageRoot, "");
     }
 
     // ---- demand-driven pull-in state ----
@@ -334,6 +458,7 @@ public partial class Program {
 
     static void PiInit() {
         piInputNamespaces = new List<string>();
+        piKnownNsDirs = new Dictionary<string, bool>();
         piTable = new List<PiName>();
         int i = 0;
         while (i < 16384) { piTable.Add(null); i = i + 1; }
@@ -357,12 +482,16 @@ public partial class Program {
         piDirsTail = nd;
     }
 
-    // Record a dotted `using A.B.C;` target (already in 'A/B/C' form) as a
-    // reached directory.
+    // Record a dotted `using A.B.C;` target (already in 'A/B/C' form) on the
+    // candidate file; PiCloseOnce reaches it only if this file is included.
     static void PiNoteUsing(PiFile f, string subdir) {
         if (subdir == "") { return; }
+        int i = 0;
+        while (i < f.usings.Count) {
+            if (f.usings[i] == subdir) { return; }
+            i = i + 1;
+        }
         f.usings.Add(subdir);
-        PiReach(subdir);
     }
 
     // Read `A.B.C` after a USING/NAMESPACE token (index i = first candidate).
@@ -562,7 +691,10 @@ public partial class Program {
                     i = i + 2;
                     continue;
                 }
-                if (prev != TK.Dot()) { lastId = t.text; }
+                if (prev != TK.Dot()) {
+                    lastId = t.text;
+                    PiNoteQualifiedNs(f, toks, i);
+                }
                 f.idents.Add(PiIntern(t.text));
                 // Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin rewrite
                 // (desugar_task_join): the call survives in this file's own
@@ -701,6 +833,7 @@ public partial class Program {
                         PiName name = PiIntern(t.text);
                         if (prev != TK.Dot()) {
                             chain = name.str;
+                            PiNoteQualifiedNs(null, toks, i);
                             // Mirror the parser's Task.WhenAll/WhenAny ->
                             // TaskJoin rewrite (desugar_task_join): flag
                             // TaskJoin when this bare `Task` is followed by

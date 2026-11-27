@@ -52,10 +52,10 @@ partial class Irgen {
     bool AstUsesGcProbe(Node n) {
         if (n == null) { return false; }
         if (n.kind == AK.Call()) {
-            if (n.a != null && (n.a.sval == "DetectCycles" || n.a.sval == "WriteHeapSnapshot")) {
+            if (n.a != null && (n.a.sval == "DetectCycles" || n.a.sval == "CollectCycles" || n.a.sval == "WriteHeapSnapshot")) {
                 return true;
             }
-            if (n.b != null && (n.b.sval == "DetectCycles" || n.b.sval == "WriteHeapSnapshot")) {
+            if (n.b != null && (n.b.sval == "DetectCycles" || n.b.sval == "CollectCycles" || n.b.sval == "WriteHeapSnapshot")) {
                 return true;
             }
         }
@@ -102,27 +102,27 @@ partial class Irgen {
         gcTyNames.Add(cn);
         if (idxs.Count > 0) {
             string fn = "zan_gc_walk_" + cn;
-            H("define void @" + fn + "(i8* %obj, void (i64, i8*)* %cb, i8* %ctx) {");
+            H("define void @" + fn + "(i8* %obj, void (i64*, i8*)* %cb, i8* %ctx) {");
             H("entry:");
             H("  %o = bitcast i8* %obj to %" + cn + "*");
             int seq = 0;
             int k = 0;
             while (k < idxs.Count) {
                 string lt = lts[k];
+                string sp = "%f" + seq;
+                string slot = sp;
                 string v = "%v" + seq;
-                string a = "%a" + seq;
                 string nz = "%nz" + seq;
-                H("  %f" + seq + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idxs[k]);
-                H("  " + v + " = load " + lt + ", " + lt + "* %f" + seq);
-                string addr = v;
+                H("  " + sp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idxs[k]);
                 if (lt != "i64") {
-                    H("  " + a + " = ptrtoint " + lt + " " + v + " to i64");
-                    addr = a;
+                    slot = "%s" + seq;
+                    H("  " + slot + " = bitcast " + lt + "* " + sp + " to i64*");
                 }
-                H("  " + nz + " = icmp ne i64 " + addr + ", 0");
+                H("  " + v + " = load i64, i64* " + slot);
+                H("  " + nz + " = icmp ne i64 " + v + ", 0");
                 H("  br i1 " + nz + ", label %call" + seq + ", label %nx" + seq);
                 H("call" + seq + ":");
-                H("  call void %cb(i64 " + addr + ", i8* %ctx)");
+                H("  call void %cb(i64* " + slot + ", i8* %ctx)");
                 H("  br label %nx" + seq);
                 H("nx" + seq + ":");
                 seq = seq + 1;
@@ -158,7 +158,7 @@ partial class Irgen {
             string walk = gcTyWalks[i];
             string walkRef = " i8* null,";
             if (walk != "") {
-                walkRef = " i8* bitcast (void (i8*, void (i64, i8*)*, i8*)* @" + walk + " to i8*),";
+                walkRef = " i8* bitcast (void (i8*, void (i64*, i8*)*, i8*)* @" + walk + " to i8*),";
             }
             string row = " %zan.gc.ty { i8* " + gcTyCids[i] + "," + walkRef
                 + " i8* getelementptr inbounds ([" + (gcTyNames[i].Length + 1)
@@ -375,9 +375,47 @@ partial class Irgen {
     // immediately.
     void EmitGcHelpers() {
         int k = gcTyCids.Count;
+        string listCid = IsContainerType("List") ? "bitcast (i8** @__tid_List to i8*)" : "";
+        H("define internal void @zan_gc_walk_edges(i8* %obj, void (i64*, i8*)* %cb) {");
+        H("entry:");
+        H("  %cidp = getelementptr i8, i8* %obj, i64 -24");
+        H("  %cids = bitcast i8* %cidp to i8**");
+        H("  %cid = load i8*, i8** %cids");
+        if (listCid != "") {
+            H("  %islist = icmp eq i8* %cid, " + listCid);
+            H("  br i1 %islist, label %list_walk, label %scan_cls");
+            H("list_walk:");
+            H("  %zl = bitcast i8* %obj to %zlist*");
+            H("  %zop = getelementptr %zlist, %zlist* %zl, i32 0, i32 3");
+            H("  %zowns = load i64, i64* %zop");
+            H("  %zhas = icmp ne i64 %zowns, 0");
+            H("  br i1 %zhas, label %list_loop_init, label %out");
+            H("list_loop_init:");
+            H("  %zcp = getelementptr %zlist, %zlist* %zl, i32 0, i32 0");
+            H("  %zcnt = load i64, i64* %zcp");
+            H("  %zdp = getelementptr %zlist, %zlist* %zl, i32 0, i32 2");
+            H("  %zdata = load i64*, i64** %zdp");
+            H("  br label %list_cond");
+            H("list_cond:");
+            H("  %zi = phi i64 [ 0, %list_loop_init ], [ %zin, %list_next ]");
+            H("  %zdone = icmp sge i64 %zi, %zcnt");
+            H("  br i1 %zdone, label %out, label %list_body");
+            H("list_body:");
+            H("  %zslot = getelementptr i64, i64* %zdata, i64 %zi");
+            H("  %zv = load i64, i64* %zslot");
+            H("  %znz = icmp ne i64 %zv, 0");
+            H("  br i1 %znz, label %list_cb, label %list_next");
+            H("list_cb:");
+            H("  call void %cb(i64* %zslot, i8* null)");
+            H("  br label %list_next");
+            H("list_next:");
+            H("  %zin = add i64 %zi, 1");
+            H("  br label %list_cond");
+            H("scan_cls:");
+        }
         if (k == 0) {
-            H("define internal void @zan_gc_walk_edges(i8* %obj, void (i64, i8*)* %cb) {");
-            H("entry:");
+            H("  br label %out");
+            H("out:");
             H("  ret void");
             H("}");
             H("define internal i8* @zan_gc_name_of(i8* %obj) {");
@@ -386,14 +424,9 @@ partial class Irgen {
             H("}");
             return;
         }
-        H("define internal void @zan_gc_walk_edges(i8* %obj, void (i64, i8*)* %cb) {");
-        H("entry:");
-        H("  %cidp = getelementptr i8, i8* %obj, i64 -24");
-        H("  %cids = bitcast i8* %cidp to i8**");
-        H("  %cid = load i8*, i8** %cids");
         H("  br label %cond");
         H("cond:");
-        H("  %j = phi i64 [ 0, %entry ], [ %jn, %next ]");
+        H("  %j = phi i64 [ 0, %" + (listCid != "" ? "scan_cls" : "entry") + " ], [ %jn, %next ]");
         H("  %done = icmp sge i64 %j, " + k);
         H("  br i1 %done, label %out, label %body");
         H("body:");
@@ -408,8 +441,8 @@ partial class Irgen {
         H("  %hasw = icmp ne i8* %tw, null");
         H("  br i1 %hasw, label %call, label %next");
         H("call:");
-        H("  %wfn = bitcast i8* %tw to void (i8*, void (i64, i8*)*, i8*)*");
-        H("  call void %wfn(i8* %obj, void (i64, i8*)* %cb, i8* null)");
+        H("  %wfn = bitcast i8* %tw to void (i8*, void (i64*, i8*)*, i8*)*");
+        H("  call void %wfn(i8* %obj, void (i64*, i8*)* %cb, i8* null)");
         H("  br label %out");
         H("next:");
         H("  %jn = add i64 %j, 1");
@@ -458,8 +491,9 @@ partial class Irgen {
     // scratch (nodes/worklist/tail) lives in globals so the callbacks need
     // no context plumbing -- detect holds the exclusive lock while they run.
     void EmitGcCallbacks() {
-        H("define internal void @zan_gc_cb_irc(i64 %v, i8* %ctx) {");
+        H("define internal void @zan_gc_cb_irc(i64* %slotp, i8* %ctx) {");
         H("entry:");
+        H("  %v = load i64, i64* %slotp");
         H("  %d = load i8*, i8** @zan.gc.dict");
         H("  %np = load i64*, i64** @zan.gc.nodes");
         H("  %vp = inttoptr i64 %v to i8*");
@@ -483,8 +517,9 @@ partial class Irgen {
         H("out:");
         H("  ret void");
         H("}");
-        H("define internal void @zan_gc_cb_mark(i64 %v, i8* %ctx) {");
+        H("define internal void @zan_gc_cb_mark(i64* %slotp, i8* %ctx) {");
         H("entry:");
+        H("  %v = load i64, i64* %slotp");
         H("  %d = load i8*, i8** @zan.gc.dict");
         H("  %np = load i64*, i64** @zan.gc.nodes");
         H("  %vp = inttoptr i64 %v to i8*");
@@ -512,6 +547,34 @@ partial class Irgen {
         H("  store i64 %slot, i64* %wp");
         H("  %t1 = add i64 %t, 1");
         H("  store i64 %t1, i64* @zan.gc.wtail");
+        H("  br label %out");
+        H("out:");
+        H("  ret void");
+        H("}");
+        H("define internal void @zan_gc_cb_clear(i64* %slotp, i8* %ctx) {");
+        H("entry:");
+        H("  %v = load i64, i64* %slotp");
+        H("  %d = load i8*, i8** @zan.gc.dict");
+        H("  %np = load i64*, i64** @zan.gc.nodes");
+        H("  %vp = inttoptr i64 %v to i8*");
+        H("  %s = call i64 @zdict_get(i8* %d, i8* %vp, i64 0)");
+        H("  %hit = icmp ne i64 %s, 0");
+        H("  br i1 %hit, label %chk, label %out");
+        H("chk:");
+        H("  %slot = sub i64 %s, 1");
+        H("  %m5 = mul i64 %slot, 5");
+        H("  %eop = getelementptr i64, i64* %np, i64 %m5");
+        H("  %eo = load i64, i64* %eop");
+        H("  %dead = icmp eq i64 %eo, 0");
+        H("  br i1 %dead, label %out, label %test");
+        H("test:");
+        H("  %m53 = add i64 %m5, 3");
+        H("  %mp = getelementptr i64, i64* %np, i64 %m53");
+        H("  %mk = load i64, i64* %mp");
+        H("  %alive = icmp ne i64 %mk, 0");
+        H("  br i1 %alive, label %out, label %zero");
+        H("zero:");
+        H("  store i64 0, i64* %slotp");
         H("  br label %out");
         H("out:");
         H("  ret void");
@@ -702,7 +765,7 @@ partial class Irgen {
         H("  br i1 %dead2, label %p2t, label %p2w");
         H("p2w:");
         H("  %op2 = inttoptr i64 %eo2 to i8*");
-        H("  call void @zan_gc_walk_edges(i8* %op2, void (i64, i8*)* @zan_gc_cb_irc)");
+        H("  call void @zan_gc_walk_edges(i8* %op2, void (i64*, i8*)* @zan_gc_cb_irc)");
         H("  br label %p2t");
         H("p2t:");
         H("  %i2n = add i64 %i2, 1");
@@ -767,7 +830,7 @@ partial class Irgen {
         H("  %eps = getelementptr i64, i64* %nodes, i64 %m5s");
         H("  %os = load i64, i64* %eps");
         H("  %ops = inttoptr i64 %os to i8*");
-        H("  call void @zan_gc_walk_edges(i8* %ops, void (i64, i8*)* @zan_gc_cb_mark)");
+        H("  call void @zan_gc_walk_edges(i8* %ops, void (i64*, i8*)* @zan_gc_cb_mark)");
         H("  br label %bfst");
         H("bfst:");
         H("  %hn = add i64 %h, 1");
@@ -1123,6 +1186,265 @@ partial class Irgen {
         H("}");
     }
 
+    void EmitGcCollect() {
+        H("define internal i64 @zan_gc_collect_cycles() {");
+        H("entry:");
+        H("  %scan = call i1 @zan_gc_scan_begin()");
+        H("  br i1 %scan, label %locked, label %unavailable");
+        H("unavailable:");
+        H("  ret i64 -1");
+        H("locked:");
+        H("  %d0 = load i8*, i8** @zan.gc.dict");
+        H("  %nd = icmp eq i8* %d0, null");
+        H("  br i1 %nd, label %rzero, label %go");
+        H("go:");
+        H("  %objs = load i8*, i8** @zan.gc.objs");
+        H("  %n = call i64 @zlist_count(i8* %objs)");
+        H("  %empty = icmp eq i64 %n, 0");
+        H("  br i1 %empty, label %rzero, label %alloc");
+        H("rzero:");
+        H("  call void @zan_gc_release()");
+        H("  ret i64 0");
+        H("alloc:");
+        H("  %nb = mul i64 %n, 40");
+        H("  %raw = call i8* @malloc(i64 %nb)");
+        H("  %raw_nil = icmp eq i8* %raw, null");
+        H("  br i1 %raw_nil, label %oom, label %init");
+        H("oom:");
+        H("  call void @zan_gc_release()");
+        H("  ret i64 -1");
+        H("init:");
+        H("  %nodes = bitcast i8* %raw to i64*");
+        H("  store i64* %nodes, i64** @zan.gc.nodes");
+        H("  br label %p1h");
+        H("p1h:");
+        H("  %i1 = phi i64 [ 0, %init ], [ %i1n, %p1t ]");
+        H("  %c1 = icmp sge i64 %i1, %n");
+        H("  br i1 %c1, label %p2h, label %p1b");
+        H("p1b:");
+        H("  %m51 = mul i64 %i1, 5");
+        H("  %ep1 = getelementptr i64, i64* %nodes, i64 %m51");
+        H("  %obj = call i64 @zlist_get(i8* %objs, i64 %i1)");
+        H("  %onz = icmp eq i64 %obj, 0");
+        H("  br i1 %onz, label %p1dead, label %p1live");
+        H("p1dead:");
+        H("  store i64 0, i64* %ep1");
+        H("  %m511 = add i64 %m51, 1");
+        H("  %ed1 = getelementptr i64, i64* %nodes, i64 %m511");
+        H("  store i64 -2, i64* %ed1");
+        H("  %m512 = add i64 %m51, 2");
+        H("  %ed2 = getelementptr i64, i64* %nodes, i64 %m512");
+        H("  store i64 0, i64* %ed2");
+        H("  %m513 = add i64 %m51, 3");
+        H("  %ed3 = getelementptr i64, i64* %nodes, i64 %m513");
+        H("  store i64 0, i64* %ed3");
+        H("  %m514 = add i64 %m51, 4");
+        H("  %ed4 = getelementptr i64, i64* %nodes, i64 %m514");
+        H("  store i64 0, i64* %ed4");
+        H("  br label %p1t");
+        H("p1live:");
+        H("  %op = inttoptr i64 %obj to i8*");
+        H("  %mp = getelementptr i8, i8* %op, i64 -8");
+        H("  %mb = bitcast i8* %mp to i64*");
+        H("  %magic = load i64, i64* %mb");
+        H("  %isstr = icmp eq i64 %magic, 1515082580");
+        H("  br i1 %isstr, label %p1str, label %p1cls");
+        H("p1str:");
+        H("  %sp = getelementptr i8, i8* %op, i64 -32");
+        H("  %sb1 = bitcast i8* %sp to i64*");
+        H("  %rc1 = load i64, i64* %sb1");
+        H("  br label %p1store");
+        H("p1cls:");
+        H("  %cp = getelementptr i8, i8* %op, i64 -16");
+        H("  %cb1 = bitcast i8* %cp to i64*");
+        H("  %rc2 = load i64, i64* %cb1");
+        H("  br label %p1store");
+        H("p1store:");
+        H("  %rc = phi i64 [ %rc1, %p1str ], [ %rc2, %p1cls ]");
+        H("  %coll = phi i64 [ 0, %p1str ], [ 1, %p1cls ]");
+        H("  store i64 %obj, i64* %ep1");
+        H("  %m51a = add i64 %m51, 1");
+        H("  %ea = getelementptr i64, i64* %nodes, i64 %m51a");
+        H("  store i64 %rc, i64* %ea");
+        H("  %m51b = add i64 %m51, 2");
+        H("  %eb = getelementptr i64, i64* %nodes, i64 %m51b");
+        H("  store i64 0, i64* %eb");
+        H("  %m51c = add i64 %m51, 3");
+        H("  %ec = getelementptr i64, i64* %nodes, i64 %m51c");
+        H("  store i64 0, i64* %ec");
+        H("  %m51d = add i64 %m51, 4");
+        H("  %ee = getelementptr i64, i64* %nodes, i64 %m51d");
+        H("  store i64 %coll, i64* %ee");
+        H("  br label %p1t");
+        H("p1t:");
+        H("  %i1n = add i64 %i1, 1");
+        H("  br label %p1h");
+        H("p2h:");
+        H("  %i2 = phi i64 [ 0, %p1h ], [ %i2n, %p2t ]");
+        H("  %c2 = icmp sge i64 %i2, %n");
+        H("  br i1 %c2, label %p3init, label %p2b");
+        H("p2b:");
+        H("  %m52 = mul i64 %i2, 5");
+        H("  %ep2 = getelementptr i64, i64* %nodes, i64 %m52");
+        H("  %eo2 = load i64, i64* %ep2");
+        H("  %dead2 = icmp eq i64 %eo2, 0");
+        H("  br i1 %dead2, label %p2t, label %p2c");
+        H("p2c:");
+        H("  %m52d = add i64 %m52, 4");
+        H("  %col2p = getelementptr i64, i64* %nodes, i64 %m52d");
+        H("  %col2 = load i64, i64* %col2p");
+        H("  %iscol2 = icmp ne i64 %col2, 0");
+        H("  br i1 %iscol2, label %p2w, label %p2t");
+        H("p2w:");
+        H("  %op2 = inttoptr i64 %eo2 to i8*");
+        H("  call void @zan_gc_walk_edges(i8* %op2, void (i64*, i8*)* @zan_gc_cb_irc)");
+        H("  br label %p2t");
+        H("p2t:");
+        H("  %i2n = add i64 %i2, 1");
+        H("  br label %p2h");
+        H("p3init:");
+        H("  %nb8 = mul i64 %n, 8");
+        H("  %wraw = call i8* @malloc(i64 %nb8)");
+        H("  %wraw_nil = icmp eq i8* %wraw, null");
+        H("  br i1 %wraw_nil, label %worklist_oom, label %worklist_init");
+        H("worklist_oom:");
+        H("  call void @free(i8* %raw)");
+        H("  store i64* null, i64** @zan.gc.nodes");
+        H("  br label %oom");
+        H("worklist_init:");
+        H("  %wl = bitcast i8* %wraw to i64*");
+        H("  store i64* %wl, i64** @zan.gc.wl");
+        H("  store i64 0, i64* @zan.gc.wtail");
+        H("  br label %p3h");
+        H("p3h:");
+        H("  %i3 = phi i64 [ 0, %worklist_init ], [ %i3n, %p3t ]");
+        H("  %c3 = icmp sge i64 %i3, %n");
+        H("  br i1 %c3, label %bfsh, label %p3b");
+        H("p3b:");
+        H("  %m53 = mul i64 %i3, 5");
+        H("  %ep3 = getelementptr i64, i64* %nodes, i64 %m53");
+        H("  %eo3 = load i64, i64* %ep3");
+        H("  %dead3 = icmp eq i64 %eo3, 0");
+        H("  br i1 %dead3, label %p3t, label %p3c");
+        H("p3c:");
+        H("  %m53a = add i64 %m53, 1");
+        H("  %rp3 = getelementptr i64, i64* %nodes, i64 %m53a");
+        H("  %rc3 = load i64, i64* %rp3");
+        H("  %m53b = add i64 %m53, 2");
+        H("  %ip3 = getelementptr i64, i64* %nodes, i64 %m53b");
+        H("  %irc3 = load i64, i64* %ip3");
+        H("  %m53d = add i64 %m53, 4");
+        H("  %col3p = getelementptr i64, i64* %nodes, i64 %m53d");
+        H("  %col3 = load i64, i64* %col3p");
+        H("  %nocol3 = icmp eq i64 %col3, 0");
+        H("  %ext = icmp sgt i64 %rc3, %irc3");
+        H("  %nonpos = icmp sle i64 %rc3, 0");
+        H("  %r01 = or i1 %nocol3, %ext");
+        H("  %isroot = or i1 %r01, %nonpos");
+        H("  br i1 %isroot, label %p3root, label %p3t");
+        H("p3root:");
+        H("  %m53c = add i64 %m53, 3");
+        H("  %mkp = getelementptr i64, i64* %nodes, i64 %m53c");
+        H("  store i64 1, i64* %mkp");
+        H("  %t = load i64, i64* @zan.gc.wtail");
+        H("  %wlp = load i64*, i64** @zan.gc.wl");
+        H("  %wp = getelementptr i64, i64* %wlp, i64 %t");
+        H("  store i64 %i3, i64* %wp");
+        H("  %t1 = add i64 %t, 1");
+        H("  store i64 %t1, i64* @zan.gc.wtail");
+        H("  br label %p3t");
+        H("p3t:");
+        H("  %i3n = add i64 %i3, 1");
+        H("  br label %p3h");
+        H("bfsh:");
+        H("  %h = phi i64 [ 0, %p3h ], [ %hn, %bfst ]");
+        H("  %wt = load i64, i64* @zan.gc.wtail");
+        H("  %more = icmp slt i64 %h, %wt");
+        H("  br i1 %more, label %bfsb, label %p4h");
+        H("bfsb:");
+        H("  %wlp2 = load i64*, i64** @zan.gc.wl");
+        H("  %wp2 = getelementptr i64, i64* %wlp2, i64 %h");
+        H("  %s = load i64, i64* %wp2");
+        H("  %m5s = mul i64 %s, 5");
+        H("  %m5sd = add i64 %m5s, 4");
+        H("  %colsp = getelementptr i64, i64* %nodes, i64 %m5sd");
+        H("  %cols = load i64, i64* %colsp");
+        H("  %iscols = icmp ne i64 %cols, 0");
+        H("  br i1 %iscols, label %bfsw, label %bfst");
+        H("bfsw:");
+        H("  %eps = getelementptr i64, i64* %nodes, i64 %m5s");
+        H("  %os = load i64, i64* %eps");
+        H("  %ops = inttoptr i64 %os to i8*");
+        H("  call void @zan_gc_walk_edges(i8* %ops, void (i64*, i8*)* @zan_gc_cb_mark)");
+        H("  br label %bfst");
+        H("bfst:");
+        H("  %hn = add i64 %h, 1");
+        H("  br label %bfsh");
+        H("p4h:");
+        H("  %i4 = phi i64 [ 0, %bfsh ], [ %i4n, %p4t ]");
+        H("  %c4 = icmp sge i64 %i4, %n");
+        H("  br i1 %c4, label %unlock, label %p4b");
+        H("p4b:");
+        H("  %m54 = mul i64 %i4, 5");
+        H("  %ep4 = getelementptr i64, i64* %nodes, i64 %m54");
+        H("  %eo4 = load i64, i64* %ep4");
+        H("  %dead4 = icmp eq i64 %eo4, 0");
+        H("  br i1 %dead4, label %p4t, label %p4c");
+        H("p4c:");
+        H("  %m54c = add i64 %m54, 3");
+        H("  %mkp4 = getelementptr i64, i64* %nodes, i64 %m54c");
+        H("  %mk4 = load i64, i64* %mkp4");
+        H("  %hit4 = icmp ne i64 %mk4, 0");
+        H("  br i1 %hit4, label %p4t, label %p4brk");
+        H("p4brk:");
+        H("  %op4 = inttoptr i64 %eo4 to i8*");
+        H("  call void @zan_gc_walk_edges(i8* %op4, void (i64*, i8*)* @zan_gc_cb_clear)");
+        H("  %rc4p = getelementptr i8, i8* %op4, i64 -16");
+        H("  %rc4s = bitcast i8* %rc4p to i64*");
+        H("  store atomic i64 1, i64* %rc4s release, align 8");
+        H("  br label %p4t");
+        H("p4t:");
+        H("  %i4n = add i64 %i4, 1");
+        H("  br label %p4h");
+        H("unlock:");
+        H("  store i64* null, i64** @zan.gc.nodes");
+        H("  store i64* null, i64** @zan.gc.wl");
+        H("  store i64 0, i64* @zan.gc.wtail");
+        H("  call void @zan_gc_release()");
+        H("  br label %p5h");
+        H("p5h:");
+        H("  %i5 = phi i64 [ 0, %unlock ], [ %i5n, %p5t ]");
+        H("  %freed = phi i64 [ 0, %unlock ], [ %freedn, %p5t ]");
+        H("  %c5 = icmp sge i64 %i5, %n");
+        H("  br i1 %c5, label %clean, label %p5b");
+        H("p5b:");
+        H("  %m55 = mul i64 %i5, 5");
+        H("  %ep5 = getelementptr i64, i64* %nodes, i64 %m55");
+        H("  %eo5 = load i64, i64* %ep5");
+        H("  %dead5 = icmp eq i64 %eo5, 0");
+        H("  br i1 %dead5, label %p5t, label %p5c");
+        H("p5c:");
+        H("  %m55c = add i64 %m55, 3");
+        H("  %mkp5 = getelementptr i64, i64* %nodes, i64 %m55c");
+        H("  %mk5 = load i64, i64* %mkp5");
+        H("  %hit5 = icmp ne i64 %mk5, 0");
+        H("  br i1 %hit5, label %p5t, label %p5free");
+        H("p5free:");
+        H("  %op5 = inttoptr i64 %eo5 to i8*");
+        H("  call void @zrelease(i8* %op5)");
+        H("  %freed1 = add i64 %freed, 1");
+        H("  br label %p5t");
+        H("p5t:");
+        H("  %freedn = phi i64 [ %freed, %p5b ], [ %freed, %p5c ], [ %freed1, %p5free ]");
+        H("  %i5n = add i64 %i5, 1");
+        H("  br label %p5h");
+        H("clean:");
+        H("  call void @free(i8* %raw)");
+        H("  call void @free(i8* %wraw)");
+        H("  ret i64 %freed");
+        H("}");
+    }
+
     // Finalize hook (called from Gen before head/body assembly): the probe
     // runtime is only emitted for programs that call it.
     void EmitGcProbeRuntime() {
@@ -1133,6 +1455,7 @@ partial class Irgen {
         EmitGcHelpers();
         EmitGcCallbacks();
         EmitGcDetect();
+        EmitGcCollect();
         EmitGcSnapshot();
     }
 }

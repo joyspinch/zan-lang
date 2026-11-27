@@ -103,6 +103,45 @@ partial class Irgen {
         return null;
     }
 
+    Node FindInterfaceDefaultImpl(Node ifaceType, ClosedInterfaceDispatch dispatch, Node methodOwner, int depth) {
+        if (ifaceType == null || depth >= 64) { return null; }
+        Node decl = binder.FindType(ifaceType.sval);
+        if (decl == null) { return null; }
+        if (HasMod(decl, MOD.Iface())) {
+            int i = 0;
+            while (i < decl.kids.Count) {
+                Node m = decl.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == dispatch.method.sval && !IsStatic(m)
+                    && m.d != null && IsAsync(m) == IsAsync(dispatch.method)
+                    && MethodParamCount(m) == dispatch.paramTypes.Count) {
+                    int j = 0;
+                    while (j < dispatch.paramTypes.Count) {
+                        if (IsRefParam(m, j) != IsRefParam(dispatch.method, j)) { break; }
+                        Node actual = binder.SubstOwner(ParamTypeNode(m, j), ifaceType);
+                        Node expected = binder.SubstOwner(ParamTypeNode(dispatch.method, j), methodOwner);
+                        if (!binder.SameType(actual, expected)) { break; }
+                        j = j + 1;
+                    }
+                    if (j == dispatch.paramTypes.Count) { return m; }
+                }
+                i = i + 1;
+            }
+        }
+        if (decl.interfaceRefs != null) {
+            int r = 0;
+            while (r < decl.interfaceRefs.Count) {
+                Node found = FindInterfaceDefaultImpl(binder.SubstOwner(decl.interfaceRefs[r], ifaceType), dispatch, methodOwner, depth + 1);
+                if (found != null) { return found; }
+                r = r + 1;
+            }
+        }
+        Node baseTy = binder.BaseType(ifaceType);
+        if (baseTy != null) {
+            return FindInterfaceDefaultImpl(baseTy, dispatch, methodOwner, depth + 1);
+        }
+        return null;
+    }
+
     Node InterfaceImplementation(ClosedInterfaceDispatch dispatch, Node cls, Node instance) {
         Node receiver = instance == null ? MkType(cls.sval) : instance;
         Node bound = FindInterfaceInstance(receiver, dispatch.receiver, 0);
@@ -133,6 +172,9 @@ partial class Irgen {
             }
             cur = binder.BaseType(cur);
         }
+        Node defImpl = FindInterfaceDefaultImpl(receiver, dispatch, methodOwner, 0);
+        if (defImpl != null) { return defImpl; }
+        if (dispatch.method != null && dispatch.method.d != null) { return dispatch.method; }
         return null;
     }
 
@@ -140,6 +182,10 @@ partial class Irgen {
         if (instance == null || !MentionsTPDeep(method)) { return MethodSym(owner, method); }
         List<string> names = TParams(binder.FindType(owner));
         List<Node> args = TypeArgsForAncestor(cls, owner, instance.kids);
+        if (names.Count > 0 && (args == null || args.Count != names.Count)) {
+            Node instOwner = FindInterfaceInstance(instance, MkType(owner), 0);
+            if (instOwner != null && instOwner.kids.Count == names.Count) { args = instOwner.kids; }
+        }
         if (names.Count == 0 || args == null || args.Count != names.Count) { return MethodSym(owner, method); }
         string tag = SpecTagC(method, args, new List<string>(), names, args, "I");
         if (tag == "") { return MethodSym(owner, method); }

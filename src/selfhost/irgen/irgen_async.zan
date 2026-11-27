@@ -71,7 +71,7 @@ partial class Irgen {
         if (retName != "void") { result = FrameGep("%ff", 6); }
         EmitTempReleases();
         EmitAsyncSaveSlots();
-        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        StoreFrameState("%ff", st);
         L("  call void @zan_rt_blocking_checked_co(i8* bitcast (" + MapType(ret) + " (" + paramTypes + ")* @"
             + native + " to i8*), i32 " + args.Count + values + ", i8* %fp, void(i8*)* @" + curResumeSym
             + ", i64* " + result + ", i32* " + status + ")");
@@ -164,7 +164,7 @@ partial class Irgen {
         string subv = sub.op;
         string subh = NT();
         L("  " + subh + " = bitcast i8* " + subv + " to i64*");
-        string orp = FrameGep(subh, 9);
+        string orp = FrameGep(subh, 3);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         if (curAsync) {
@@ -182,8 +182,7 @@ partial class Irgen {
             L("  store i64 " + stepi + ", i64* " + awsp);
             L("  call void @co_ready_child(i8* " + subv + ", void(i8*)* " + orfn + ")");
             EmitAsyncSaveSlots();
-            string stp = FrameGep("%ff", 2);
-            L("  store i64 " + st + ", i64* " + stp);
+            StoreFrameState("%ff", st);
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -214,9 +213,7 @@ partial class Irgen {
             if (trackResult) { AddTemp(rvv, resTy); }
             return new ExprVal(rvv, resTy);
         }
-        string donep = FrameGep(subh, 3);
-        string donepi32 = NT();
-        L("  " + donepi32 + " = bitcast i64* " + donep + " to i32*");
+        string donepi32 = FrameDonePtr(subh);
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
         L("  call void @zan_co_sched_run_until(i32* " + donepi32 + ")");
         // the awaited coroutine may have failed: re-throw its exception here
@@ -244,21 +241,24 @@ partial class Irgen {
         L("  " + errorRecord + " = bitcast i64* " + errorRaw + " to %zan.exception*");
         string activeSlot = FrameGep(subh, 17);
         string active = NT(); L("  " + active + " = load i64, i64* " + activeSlot);
-        string excp = FrameGep(subh, 11);
+        string excp = FrameGep(subh, 9);
         string excv = NT(); L("  " + excv + " = load i64, i64* " + excp);
-        string hasx = NT(); L("  " + hasx + " = icmp ne i64 " + active + ", 0");
+        string hasAct = NT(); L("  " + hasAct + " = icmp ne i64 " + active + ", 0");
+        string hasExc = NT(); L("  " + hasExc + " = icmp ne i64 " + excv + ", 0");
+        string hasx = NT(); L("  " + hasx + " = and i1 " + hasAct + ", " + hasExc);
         int lx = NL(); int lok = NL();
         L("  br i1 " + hasx + ", label %L" + lx + ", label %L" + lok);
         Label(lx);
         string exp = NT(); L("  " + exp + " = inttoptr i64 " + excv + " to i8*");
         L("  store i8* " + exp + ", i8** @__exc_val");
-        string tidp = FrameGep(subh, 12);
+        string tidp = FrameGep(subh, 10);
         string tidv = NT(); L("  " + tidv + " = load i64, i64* " + tidp);
         string tidp2 = NT(); L("  " + tidp2 + " = inttoptr i64 " + tidv + " to i8*");
         L("  store i8* " + tidp2 + ", i8** @__exc_tid");
         L("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* " + errorRecord + ")");
         L("  store i64 0, i64* " + excp);
         L("  store i64 0, i64* " + tidp);
+        L("  store i32 0, i32* " + FrameExcOwnedPtr(subh));
         RestoreExceptionDispatch();
         string consumedFrame = NT();
         L("  " + consumedFrame + " = bitcast i64* " + subh + " to i8*");
@@ -312,7 +312,7 @@ partial class Irgen {
         int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
         int st = seq + 1;
         EmitAsyncSaveSlots();
-        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        StoreFrameState("%ff", st);
         L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
         EmitAsyncSuspend();
         L("  ret void");
@@ -407,10 +407,10 @@ partial class Irgen {
         L("  " + ownerParentBits + " = load i64, i64* " + FrameGep("%ff", 19));
         string ownerParent = FromI64(ownerParentBits, "i8*");
         L("  store i8* " + ownerParent + ", i8** @zexc_owners");
-        string sp = FrameGep("%ff", 2);
-        L("  store i64 -1, i64* " + sp);
-        string dp = FrameGep("%ff", 3);
-        L("  store atomic i64 1, i64* " + dp + " release, align 8");
+        StoreFrameState("%ff", -1);
+        string dp = FrameDonePtr("%ff");
+        L("  store atomic i32 1, i32* " + dp + " release, align 4");
+        L("  call void @zan_join_complete(i8* %fp)");
         string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
         string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
         int lw = NL(); int lr = NL();
@@ -794,7 +794,7 @@ partial class Irgen {
         // the completion epilogue releases locals that the executed path may
         // never have assigned, and sub-task slots are read on resume.
         while (h < nfields) { L("  store i64 0, i64* " + FrameGep("%ff", h)); h = h + 1; }
-        string orp = FrameGep("%ff", 9);
+        string orp = FrameGep("%ff", 3);
         string ori = NT(); L("  " + ori + " = ptrtoint void(i8*)* @" + resumeSym + " to i64");
         L("  store i64 " + ori + ", i64* " + orp);
         string clp = FrameGep("%ff", 7);
@@ -802,6 +802,7 @@ partial class Irgen {
         L("  store i64 " + cli + ", i64* " + clp);
         TaskFrameConfig(raw);
         TaskDiscardConfig(raw, AsyncElemTyOf(m.type));
+        L("  call void @zan_co_live_add(i8* " + raw + ")");
         if (!stat) {
             string ti = ToI64("%this", MapType(thisTy));
             L("  store i64 " + ti + ", i64* " + FrameGep("%ff", thisSlot));
@@ -917,14 +918,18 @@ partial class Irgen {
         // of the coroutine catches and lets the exception leave through the
         // frame (the awaiter re-throws it in its own context).
         asyncTryLbl = new List<int>();
+        asyncJoinOwnedStates = new List<int>();
         EmitAsyncEhPrologue();
+        string st32 = NT();
+        L("  " + st32 + " = load i32, i32* " + FrameStatePtr("%ff"));
         string st = NT();
-        L("  " + st + " = load i64, i64* " + FrameGep("%ff", 2));
+        L("  " + st + " = sext i32 " + st32 + " to i64");
         // Match the 32-bit atomic cancellation flag published to the runtime.
         string cfl = TaskCancelValue("%ff");
         string cfc = NT();
         L("  " + cfc + " = icmp ne i32 " + cfl + ", 0");
         int lCancel = NL();
+        curAsyncCancelLbl = lCancel;
         L("  br i1 " + cfc + ", label %L" + lCancel + ", label %co.dispatch");
         L("co.start:");
         term = false; curLbl = "co.start";
@@ -945,14 +950,17 @@ partial class Irgen {
         {
             string ev = NT(); L("  " + ev + " = load i8*, i8** @__exc_val");
             string evi = NT(); L("  " + evi + " = ptrtoint i8* " + ev + " to i64");
-            L("  store i64 " + evi + ", i64* " + FrameGep("%ff", 11));
+            L("  store i64 " + evi + ", i64* " + FrameGep("%ff", 9));
             string et = NT(); L("  " + et + " = load i8*, i8** @__exc_tid");
             string eti = NT(); L("  " + eti + " = ptrtoint i8* " + et + " to i64");
-            L("  store i64 " + eti + ", i64* " + FrameGep("%ff", 12));
+            L("  store i64 " + eti + ", i64* " + FrameGep("%ff", 10));
             string errorRaw = NT(); string errorRecord = NT();
             L("  " + errorRaw + " = getelementptr i64, i64* %ff, i64 14");
             L("  " + errorRecord + " = bitcast i64* " + errorRaw + " to %zan.exception*");
             L("  call void @zexc_take(%zan.exception* " + errorRecord + ", %zan.exception* @zexc_dispatch)");
+            string own64 = NT(); L("  " + own64 + " = load i64, i64* " + FrameGep("%ff", 17));
+            string own32 = NT(); L("  " + own32 + " = trunc i64 " + own64 + " to i32");
+            L("  store i32 " + own32 + ", i32* " + FrameExcOwnedPtr("%ff"));
             L("  store i8* null, i8** @__exc_val");
             L("  store i8* null, i8** @__exc_tid");
             AsyncPendingDiscard();
@@ -963,6 +971,24 @@ partial class Irgen {
         // it owns, marks itself done and wakes its awaiter. The frame itself
         // is NOT freed here: the awaiter reads the result and frees it.
         Label(lCancel);
+        if (asyncJoinOwnedStates.Count > 0) {
+            int lJoinDrop = NL();
+            int lJoinDone = NL();
+            string jsw = "  switch i64 " + st + ", label %L" + lJoinDone + " [";
+            int ji = 0;
+            while (ji < asyncJoinOwnedStates.Count) {
+                jsw = jsw + " i64 " + asyncJoinOwnedStates[ji] + ", label %L" + lJoinDrop;
+                ji = ji + 1;
+            }
+            L(jsw + " ]");
+            Label(lJoinDrop);
+            string jslot = FrameGep("%ff", curSubBase);
+            string jent = NT(); L("  " + jent + " = load i64, i64* " + jslot);
+            L("  store i64 0, i64* " + jslot);
+            TaskJoinDiscard(jent);
+            L("  br label %L" + lJoinDone);
+            Label(lJoinDone);
+        }
         AsyncPendingDiscard();
         EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, pr, paramBase, lnames, ltypes, localBase, false);
         EmitAsyncComplete("0");

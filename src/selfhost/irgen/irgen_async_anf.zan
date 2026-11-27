@@ -57,6 +57,25 @@ partial class Irgen {
         L("  " + p + " = getelementptr i64, i64* " + bp + ", i64 " + idx);
         return p;
     }
+    string FrameStatePtr(string bp) {
+        string p = NT();
+        L("  " + p + " = bitcast i64* " + FrameGep(bp, 2) + " to i32*");
+        return p;
+    }
+    string FrameDonePtr(string bp) {
+        string sp = FrameStatePtr(bp);
+        string p = NT();
+        L("  " + p + " = getelementptr i32, i32* " + sp + ", i64 1");
+        return p;
+    }
+    void StoreFrameState(string bp, int stVal) {
+        L("  store i32 " + stVal + ", i32* " + FrameStatePtr(bp));
+    }
+    string FrameExcOwnedPtr(string bp) {
+        string p = NT();
+        L("  " + p + " = bitcast i64* " + FrameGep(bp, 11) + " to i32*");
+        return p;
+    }
     // ---- the coroutine's exception plumbing ----
     //
     // The exception-handler stack (@__exc_sp / @__exc_stack / @__exc_bufs)
@@ -171,7 +190,7 @@ partial class Irgen {
         string subv = v.op;
         string subh = NT();
         L("  " + subh + " = bitcast i8* " + subv + " to i64*");
-        string orp = FrameGep(subh, 9);
+        string orp = FrameGep(subh, 3);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
@@ -233,7 +252,7 @@ partial class Irgen {
             Node e = s.a;
             if (e == null) { return false; }
             if (e.kind == AK.AwaitExpr()) { return true; }
-            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) { return true; }
+            if (e.kind == AK.Assignment() && e.op == TK.Eq() && e.b != null && e.b.kind == AK.AwaitExpr()) { return true; }
             return false;
         }
         return false;
@@ -896,7 +915,7 @@ partial class Irgen {
             Node e = s.a;
             if (e == null) { return; }
             if (e.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, e, pre); return; }
-            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) {
+            if (e.kind == AK.Assignment() && e.op == TK.Eq() && e.b != null && e.b.kind == AK.AwaitExpr()) {
                 HoistInsideRootAwait(cls, m, e.b, pre);
                 return;
             }
@@ -1064,7 +1083,7 @@ partial class Irgen {
         string cn = c.a.sval; string mn = c.sval;
         if (cn == "Task" && mn == "Delay") { return true; }
         if (cn == "Task" && mn == "Yield") { return true; }
-        if (cn == "Task" && mn == "JoinWait") { return true; }
+        if (cn == "Task" && (mn == "JoinWait" || mn == "JoinWaitOwned")) { return true; }
         if (cn == "Gate" && mn == "Park") { return true; }
         if (cn != "Socket") { return false; }
         if (mn == "ResolveSockAddr" && callExpr.kids.Count == 4) { return true; }
@@ -1078,16 +1097,88 @@ partial class Irgen {
     ExprVal EmitSocketIntrinsic(Node callExpr) {
         string cn = callExpr.a.a.sval;
         string mn = callExpr.a.sval;
-        if (cn == "Task" && mn == "JoinWait") {
-            // Task.JoinWait returns 2 to signal fallback to TaskJoin.WhenAllPoll / WhenAnyPoll
-            return new ExprVal("2", MkType("int"));
+        if (cn == "Task" && (mn == "JoinWait" || mn == "JoinWaitOwned")) {
+            bool ownedJoin = (mn == "JoinWaitOwned");
+            if (!ExternSeen("zan_join_exc")) {
+                externDecls.Add("zan_join_exc");
+                H("declare i8* @zan_join_exc(i64, i8**, i32*)");
+            }
+            string entry = ArgI64(callExpr.kids[0]);
+            int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+            int st = seq + 1;
+            if (ownedJoin) { asyncJoinOwnedStates.Add(st); }
+            string slot = FrameGep("%ff", curSubBase);
+            L("  store i64 " + entry + ", i64* " + slot);
+            string r32 = NT();
+            L("  " + r32 + " = call i32 @zan_join_wait2(i64 " + entry + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            string r64 = NT();
+            L("  " + r64 + " = zext i32 " + r32 + " to i64");
+            L("  store i64 " + r64 + ", i64* " + FrameGep("%ff", 6));
+            string mustSusp = NT();
+            L("  " + mustSusp + " = icmp eq i32 " + r32 + ", 0");
+            int lpark = NL(); int limm = NL(); int lpost = NL();
+            L("  br i1 " + mustSusp + ", label %L" + lpark + ", label %L" + limm);
+            Label(lpark);
+            EmitAsyncSaveSlots();
+            StoreFrameState("%ff", st);
+            EmitAsyncSuspend();
+            L("  ret void");
+            Label(limm);
+            if (ownedJoin) {
+                string cfl = TaskCancelValue("%ff");
+                string cfc = NT(); L("  " + cfc + " = icmp ne i32 " + cfl + ", 0");
+                int lcanc = NL();
+                L("  br i1 " + cfc + ", label %L" + lcanc + ", label %L" + lpost);
+                Label(lcanc);
+                L("  store i64 0, i64* " + slot);
+                TaskJoinDiscard(entry);
+                L("  br label %L" + curAsyncCancelLbl);
+            } else {
+                L("  br label %L" + lpost);
+            }
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            L("  br label %L" + lpost);
+            Label(lpost);
+            string slot2 = FrameGep("%ff", curSubBase);
+            string entryR = NT(); L("  " + entryR + " = load i64, i64* " + slot2);
+            L("  store i64 0, i64* " + slot2);
+            string tidSlot = NT(); L("  " + tidSlot + " = alloca i8*");
+            L("  store i8* null, i8** " + tidSlot);
+            string ownSlot = NT(); L("  " + ownSlot + " = alloca i32");
+            L("  store i32 0, i32* " + ownSlot);
+            string jexc = NT();
+            L("  " + jexc + " = call i8* @zan_join_exc(i64 " + entryR + ", i8** " + tidSlot + ", i32* " + ownSlot + ")");
+            if (ownedJoin) {
+                L("  call void @zan_join_cancel(i64 " + entryR + ")");
+            }
+            string hasExc = NT(); L("  " + hasExc + " = icmp ne i8* " + jexc + ", null");
+            int lthr = NL(); int lok = NL();
+            L("  br i1 " + hasExc + ", label %L" + lthr + ", label %L" + lok);
+            Label(lthr);
+            string tidV = NT(); L("  " + tidV + " = load i8*, i8** " + tidSlot);
+            string ownV = NT(); L("  " + ownV + " = load i32, i32* " + ownSlot);
+            string own64 = NT(); L("  " + own64 + " = zext i32 " + ownV + " to i64");
+            string isObj = NT(); L("  " + isObj + " = icmp ne i8* " + tidV + ", null");
+            string kind = NT(); L("  " + kind + " = select i1 " + isObj + ", i64 1, i64 2");
+            L("  store i8* " + jexc + ", i8** @__exc_val");
+            L("  store i8* " + tidV + ", i8** @__exc_tid");
+            L("  call void @zexc_publish(i8* " + jexc + ", i8* " + tidV + ", i64 " + kind + ", i64 " + own64 + ")");
+            EmitRaise();
+            Label(lok);
+            string resSlot = FrameGep("%ff", 6);
+            string rv = NT(); L("  " + rv + " = load i64, i64* " + resSlot);
+            L("  store i64 0, i64* " + resSlot);
+            return new ExprVal(rv, MkType("int"));
         }
         int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
         int st = seq + 1;
         if (cn == "Task" && mn == "Delay") {
             string ms = ArgI64(callExpr.kids[0]);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1099,7 +1190,7 @@ partial class Irgen {
         }
         if (cn == "Task" && mn == "Yield") {
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1115,7 +1206,7 @@ partial class Irgen {
             string gt = "";
             if (callExpr.kids.Count == 2) { gt = ArgI64(callExpr.kids[1]); }
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             if (callExpr.kids.Count == 2) {
                 L("  call void @zan_gate_park_ticket(i64 " + gh + ", i64 " + gt + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             } else {
@@ -1133,7 +1224,7 @@ partial class Irgen {
             string fd = ArgI64(callExpr.kids[0]);
             string interest = "1"; if (mn == "WriteReady") { interest = "2"; }
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1161,7 +1252,7 @@ partial class Irgen {
             string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
             string outn = FrameGep("%ff", 6);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1202,7 +1293,7 @@ partial class Irgen {
             string tmo = ArgI64(callExpr.kids[3]);
             string outn = FrameGep("%ff", 6);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_recv_to_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i64 " + tmo + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1220,7 +1311,7 @@ partial class Irgen {
             string fd2 = ArgI64(callExpr.kids[0]);
             string outfd = FrameGep("%ff", 6);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1269,7 +1360,7 @@ partial class Irgen {
             string outp = FrameGep("%ff", 6);
             string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_resolve_sa_co(i8* " + nm + ", i32 " + port32 + ", i8* " + buf + ", i32 " + cap32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1302,7 +1393,7 @@ partial class Irgen {
             string outp = FrameGep("%ff", 6);
             string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            StoreFrameState("%ff", st);
             L("  call void @zan_io_resolve_co(i8* " + host + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
             EmitAsyncSuspend();
             L("  ret void");
@@ -1342,7 +1433,7 @@ partial class Irgen {
         L("  br i1 " + need + ", label %L" + ly + ", label %L" + targetLbl);
         Label(ly);
         EmitAsyncSaveSlots();
-        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        StoreFrameState("%ff", st);
         L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
         EmitAsyncSuspend();
         L("  ret void");

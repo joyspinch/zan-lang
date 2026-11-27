@@ -8,7 +8,9 @@ class StaticInitFunction {
     public bool initBody;
     public List<string> refs;
     public List<int> dispatch;
+    public List<int> rdispatch;
     public List<int> news;
+    public List<int> refls;
     public List<int> edges;
 
     public StaticInitFunction(int start, int end, bool initBody) {
@@ -17,7 +19,9 @@ class StaticInitFunction {
         this.initBody = initBody;
         refs = new List<string>();
         dispatch = new List<int>();
+        rdispatch = new List<int>();
         news = new List<int>();
+        refls = new List<int>();
     }
 }
 
@@ -374,6 +378,23 @@ partial class Irgen {
         if (at >= 0) { L("  ; zan.new @" + sinitSyms[at]); }
     }
 
+    void DemandReflectType(Node ty) {
+        if (ty == null || ty.ival != 0) { return; }
+        int at = StaticInitType(ty.sval, ty.kids);
+        if (at >= 0) { L("  ; zan.refl @" + sinitSyms[at]); }
+    }
+
+    int StaticReflectRecord(Node ty, string target) {
+        int at = sinitReflectTypes.Count;
+        sinitReflectTypes.Add(ty);
+        sinitReflectTargets.Add(target);
+        return at;
+    }
+
+    string StaticReflectMarker(Node ty, string target) {
+        return " ; zan.rdispatch " + StaticReflectRecord(ty, target);
+    }
+
     void DemandExternalType(Node ty) {
         if (ty == null || ty.ival != 0 || IsErasedType(ty)) { return; }
         Node declared = binder.FindType(ty.sval);
@@ -547,10 +568,20 @@ partial class Irgen {
                 if (dm >= 0) {
                     current.dispatch.Add(int.Parse(line.Substring(dm + 16)));
                 } else {
-                    CollectHeadRefs(line, current.refs);
-                    if (line.StartsWith("  ; zan.new @")) {
+                    int rm = line.IndexOf(" ; zan.rdispatch ");
+                    if (rm >= 0) {
+                        current.rdispatch.Add(int.Parse(line.Substring(rm + 17)));
+                    } else if (line.StartsWith("  ; zan.rdispatch ")) {
+                        current.rdispatch.Add(int.Parse(line.Substring(18)));
+                    } else if (line.StartsWith("  ; zan.refl @")) {
                         string sym = HeadSymbol(line);
-                        if (typeIds.ContainsKey(sym)) { current.news.Add(typeIds[sym]); }
+                        if (typeIds.ContainsKey(sym)) { current.refls.Add(typeIds[sym]); }
+                    } else {
+                        CollectHeadRefs(line, current.refs);
+                        if (line.StartsWith("  ; zan.new @")) {
+                            string sym = HeadSymbol(line);
+                            if (typeIds.ContainsKey(sym)) { current.news.Add(typeIds[sym]); }
+                        }
                     }
                 }
             }
@@ -612,9 +643,12 @@ partial class Irgen {
             int nl = modText.IndexOf("\n", pos);
             if (nl < 0) { nl = modText.Length; }
             string line = modText.Substring(pos, nl - pos);
-            if (!line.StartsWith("  ; zan.sinit @") && !line.StartsWith("  ; zan.new @")) {
+            if (!line.StartsWith("  ; zan.sinit @") && !line.StartsWith("  ; zan.new @")
+            && !line.StartsWith("  ; zan.refl @") && !line.StartsWith("  ; zan.rdispatch ")) {
                 int dm = line.IndexOf(" ; zan.dispatch ");
                 if (dm >= 0) { line = line.Substring(0, dm); }
+                int rm = line.IndexOf(" ; zan.rdispatch ");
+                if (rm >= 0) { line = line.Substring(0, rm); }
                 result.Append(line); result.Append("\n");
             }
             pos = nl + 1;
@@ -670,15 +704,28 @@ partial class Irgen {
         }
 
         int[] made = new int[sinitTypes.Count];
+        int[] refl = new int[sinitTypes.Count];
         Node[] classes = new Node[sinitTypes.Count];
         string[] tables = new string[sinitTypes.Count];
         List<int> madeTypes = new List<int>();
+        List<int> reflTypes = new List<int>();
         List<int> callers = new List<int>();
+        List<int> rcallers = new List<int>();
+        Dictionary<string, int> typeIdsByName = new Dictionary<string, int>();
+        i = 0;
+        while (i < sinitTypes.Count) {
+            if (sinitTypes[i].kids.Count == 0 && !typeIdsByName.ContainsKey(sinitTypes[i].sval)) {
+                typeIdsByName[sinitTypes[i].sval] = i;
+            }
+            i = i + 1;
+        }
         int[] edgeMarks = new int[functions.Count];
         int matchedTypes = 0;
+        int matchedRefl = 0;
         int qi = 0;
-        while (qi < queue.Count) {
+        while (qi < queue.Count || matchedTypes < madeTypes.Count || matchedRefl < reflTypes.Count) {
             int priorCallers = callers.Count;
+            int priorRCallers = rcallers.Count;
             while (qi < queue.Count) {
                 int fi = queue[qi]; qi = qi + 1;
                 StaticInitFunction fn = functions[fi];
@@ -706,11 +753,61 @@ partial class Irgen {
                             tables[ti] = specializedTables.ContainsKey(key) ? specializedTables[key] : cls.sval + "_vtable";
                         }
                     }
+                    StaticMarkRefl(ti, refl, reflTypes, typeIdsByName);
                     ri = ri + 1;
                 }
                 fn.news = null;
+                ri = 0;
+                while (ri < fn.refls.Count) {
+                    StaticMarkRefl(fn.refls[ri], refl, reflTypes, typeIdsByName);
+                    ri = ri + 1;
+                }
+                fn.refls = null;
                 if (fn.dispatch.Count > 0) { callers.Add(fi); }
+                if (fn.rdispatch.Count > 0) { rcallers.Add(fi); }
             }
+
+            // Reflective CreateInstance only activates types whose TypeInfo is
+            // reachable in the live graph.
+            i = matchedRefl == reflTypes.Count ? priorRCallers : 0;
+            while (i < rcallers.Count) {
+                int fi = rcallers[i];
+                StaticInitFunction fn = functions[fi];
+                int firstRefl = i < priorRCallers ? matchedRefl : 0;
+                int ri = 0;
+                while (ri < fn.edges.Count) { edgeMarks[fn.edges[ri]] = fi + 1; ri = ri + 1; }
+                int dj = 0;
+                while (dj < fn.rdispatch.Count) {
+                    int rd = fn.rdispatch[dj]; dj = dj + 1;
+                    Node rty = sinitReflectTypes[rd];
+                    string rtarget = sinitReflectTargets[rd];
+                    int rdef = (rtarget != "" && defs.ContainsKey(rtarget)) ? defs[rtarget] : -1;
+                    int mi = firstRefl;
+                    while (mi < reflTypes.Count) {
+                        int ti = reflTypes[mi]; mi = mi + 1;
+                        if (!binder.SameType(rty, sinitTypes[ti])) { continue; }
+                        if (defs.ContainsKey(sinitSyms[ti])) {
+                            StaticReachEdge(defs[sinitSyms[ti]], fi, fn.edges, edgeMarks, live, queue);
+                        }
+                        if (rdef >= 0) {
+                            StaticReachEdge(rdef, fi, fn.edges, edgeMarks, live, queue);
+                        }
+                        if (made[ti] == 0) {
+                            made[ti] = 1;
+                            madeTypes.Add(ti);
+                            Node instTy = sinitTypes[ti];
+                            Node cls = binder.FindType(instTy.sval);
+                            classes[ti] = cls;
+                            if (cls != null) {
+                                string key = cls.sval + "|" + InstTag(instTy.kids);
+                                tables[ti] = specializedTables.ContainsKey(key) ? specializedTables[key] : cls.sval + "_vtable";
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            matchedRefl = reflTypes.Count;
 
             // Each live dispatch sees each allocated type once. Old callers
             // only need the new types. New callers start with all made types.
@@ -750,6 +847,24 @@ partial class Irgen {
                 i = i + 1;
             }
             matchedTypes = madeTypes.Count;
+        }
+    }
+
+    void StaticMarkRefl(int ti, int[] refl, List<int> reflTypes, Dictionary<string, int> typeIdsByName) {
+        if (refl[ti] != 0) { return; }
+        refl[ti] = 1;
+        reflTypes.Add(ti);
+        Node cls = binder.FindType(sinitTypes[ti].sval);
+        if (cls == null) { return; }
+        int fi = 0;
+        while (fi < cls.kids.Count) {
+            Node f = cls.kids[fi];
+            if (f.kind == AK.FieldDecl() && f.type != null && f.type.ival == 0
+            && typeIdsByName.ContainsKey(f.type.sval)) {
+                int fti = typeIdsByName[f.type.sval];
+                if (refl[fti] == 0) { StaticMarkRefl(fti, refl, reflTypes, typeIdsByName); }
+            }
+            fi = fi + 1;
         }
     }
 

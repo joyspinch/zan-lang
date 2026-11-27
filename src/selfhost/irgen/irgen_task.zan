@@ -81,8 +81,12 @@ partial class Irgen {
         H("declare void @zan_task_discard_config(i8*, void(i8*)*)");
         H("declare void @zan_task_discard(i8*)");
         H("declare void @zan_task_retire(i8*, void(i8*)*)");
+        H("declare void @zan_co_live_add(i8*)");
+        H("declare void @zan_co_live_del(i8*)");
         H("declare i64 @zan_join_new(i32, i32)");
         H("declare i32 @zan_join_bind(i64, i8*, i32)");
+        H("declare i32 @zan_join_wait2(i64, i8*, void(i8*)*)");
+        H("declare void @zan_join_complete(i8*)");
         H("declare void @zan_join_cancel(i64)");
         H("declare void @zan_io_wait_co(i64, i32, i8*, void(i8*)*)");
         H("declare void @zan_gate_park(i64, i8*, void(i8*)*)");
@@ -162,10 +166,24 @@ partial class Irgen {
         // fallback (no shipped runtime linked) frees it directly.
         H("define internal void @zexc_frame_free(i8* %p) {");
         H("entry:");
+        H("  call void @zan_co_live_del(i8* %p)");
         H("  %f = bitcast i8* %p to i64*");
         H("  %ep = getelementptr i64, i64* %f, i64 14");
         H("  %error = bitcast i64* %ep to %zan.exception*");
+        // If rt_timer_co transferred the frame's exception into a join snapshot,
+        // it cleared JOIN_OFF_EXC (word 9) and JOIN_OFF_EXC_OWN (word 11 lo).
+        // Skip zexc_drop so we never double-release an exception owned by the join.
+        H("  %exp = getelementptr i64, i64* %f, i64 9");
+        H("  %exv = load i64, i64* %exp");
+        H("  %ex_live = icmp ne i64 %exv, 0");
+        H("  br i1 %ex_live, label %drop_exc, label %clear_exc");
+        H("drop_exc:");
         H("  call void @zexc_drop(%zan.exception* %error)");
+        H("  br label %after_exc");
+        H("clear_exc:");
+        H("  store %zan.exception zeroinitializer, %zan.exception* %error");
+        H("  br label %after_exc");
+        H("after_exc:");
         H("  %saved = load i8*, i8** @zexc_owners");
         H("  %op = getelementptr i64, i64* %f, i64 18");
         H("  %ob = load i64, i64* %op");
@@ -474,9 +492,12 @@ partial class Irgen {
         return r;
     }
     void TaskJoinDiscard(string entry) {
+        if (!ExternSeen("zan_join_exc")) {
+            externDecls.Add("zan_join_exc");
+            H("declare i8* @zan_join_exc(i64, i8**, i32*)");
+        }
         if (!ExternSeen("zjoin_discard")) {
             externDecls.Add("zjoin_discard");
-            H("declare i8* @zan_join_exc(i64, i8**, i32*)");
             H("define internal void @zjoin_discard(i64 %entry) {");
             H("  %owned = alloca i32");
             H("  store i32 0, i32* %owned");
@@ -492,8 +513,10 @@ partial class Irgen {
         L("  call void @zjoin_discard(i64 " + entry + ")");
     }
     string TaskCancelAddress(string header) {
+        string base11 = NT();
+        L("  " + base11 + " = bitcast i64* " + FrameGep(header, 11) + " to i32*");
         string cancel = NT();
-        L("  " + cancel + " = bitcast i64* " + FrameGep(header, 10) + " to i32*");
+        L("  " + cancel + " = getelementptr i32, i32* " + base11 + ", i64 1");
         return cancel;
     }
     string TaskCancelValue(string header) {
@@ -504,16 +527,14 @@ partial class Irgen {
     }
     void TaskFrameConfig(string frame) {
         string header = TaskFrameHeader(frame);
-        string done = NT();
-        L("  " + done + " = bitcast i64* " + FrameGep(header, 3) + " to i32*");
+        string done = FrameDonePtr(header);
         string cancel = TaskCancelAddress(header);
         L("  call void @zan_task_frame_config(i8* " + frame + ", i32* " + done + ", i32* " + cancel + ")");
     }
     string TaskRegister(string frame) {
         TaskFrameConfig(frame);
         string header = TaskFrameHeader(frame);
-        string done = NT();
-        L("  " + done + " = bitcast i64* " + FrameGep(header, 3) + " to i32*");
+        string done = FrameDonePtr(header);
         string token = NT(); L("  " + token + " = call i64 @zan_task_register(i8* " + frame + ", i32* " + done + ")");
         string handle = NT(); L("  " + handle + " = inttoptr i64 " + token + " to i8*");
         return handle;
@@ -685,10 +706,10 @@ partial class Irgen {
         L("  store i64 " + oldDepth + ", i64* @__exc_sp");
         L("  call void @ztask_action_release(i8* %fp)");
         // done = 1，state = -1
-        string dp = FrameGep(fph, 3);
-        L("  store i64 1, i64* " + dp);
-        string sp = FrameGep(fph, 2);
-        L("  store i64 -1, i64* " + sp);
+        StoreFrameState(fph, -1);
+        string dp = FrameDonePtr(fph);
+        L("  store atomic i32 1, i32* " + dp + " release, align 4");
+        L("  call void @zan_join_complete(i8* %fp)");
         // 唤醒等待者（槽 4/5）——与 EmitAsyncComplete 同一套协议
         string awp = FrameGep(fph, 4);
         string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
@@ -774,6 +795,7 @@ partial class Irgen {
         L("  store i64 " + dlgv + ", i64* " + dlgp);
         string step = EmitTaskActionStep();
         TaskDiscardConfig(raw, null);
+        L("  call void @zan_co_live_add(i8* " + raw + ")");
         string handle = TaskRegister(raw);
         L("  call void @zan_co_ready(i8* " + raw + ", void(i8*)* " + step + ")");
         return new ExprVal(handle, MkType("Task"));
@@ -791,8 +813,8 @@ partial class Irgen {
             string reapi = NT(); L("  " + reapi + " = ptrtoint void(i8*)* @__zan_co_reap to i64");
             L("  store i64 " + reapi + ", i64* " + FrameGep(fph, 5));
         }
-        // 帧的槽 9 是自己的 resume 入口（ramp 写的）
-        string orp = FrameGep(fph, 9);
+        // 帧的槽 3 是自己的 resume 入口（ramp 写的）
+        string orp = FrameGep(fph, 3);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
