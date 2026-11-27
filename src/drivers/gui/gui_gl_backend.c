@@ -744,11 +744,53 @@ typedef struct {
 #define ZGL_TILES 4096
 #define ZGL_TILES_MASK (ZGL_TILES - 1)
 static zgl_tile_slot g_zgl_tiles[ZGL_TILES];
+typedef struct {
+    uint64_t serial;
+    int x, y, w, h;
+} zgl_icon_slot;
+#define ZGL_ICON_SLOTS 1024
+#define ZGL_ICON_SLOTS_MASK (ZGL_ICON_SLOTS - 1)
+static zgl_icon_slot g_zgl_icon_slots[ZGL_ICON_SLOTS];
 static struct { int x, y, row_h; } g_zgl_shelf[2];   /* [0] = R8, [1] = RGBA8 */
 
 static void zgl_atlas_reset(void) {
     memset(g_zgl_tiles, 0, sizeof(g_zgl_tiles));
+    memset(g_zgl_icon_slots, 0, sizeof(g_zgl_icon_slots));
     memset(g_zgl_shelf, 0, sizeof(g_zgl_shelf));
+}
+
+static zgl_icon_slot *zgl_icon_atlas_upload(const zan_bitmap *img) {
+    if (!img || !img->serial || !img->pixels || img->width <= 0 || img->height <= 0) return NULL;
+    if (img->width > 96 || img->height > 96) return NULL;
+    zgl_icon_slot *slot = &g_zgl_icon_slots[(img->serial ^ (img->serial >> 10)) & ZGL_ICON_SLOTS_MASK];
+    if (slot->serial == img->serial && slot->w == img->width && slot->h == img->height) {
+        return slot;
+    }
+    if (g_zgl_shelf[1].x + img->width > ZGL_ATLAS_DIM) {
+        g_zgl_shelf[1].x = 0;
+        g_zgl_shelf[1].y += g_zgl_shelf[1].row_h;
+        g_zgl_shelf[1].row_h = 0;
+    }
+    if (g_zgl_shelf[1].y + img->height > ZGL_ATLAS_DIM) {
+        zgl_flush();
+        zgl_atlas_reset();
+    }
+    slot->serial = img->serial;
+    slot->x = g_zgl_shelf[1].x;
+    slot->y = g_zgl_shelf[1].y;
+    slot->w = img->width;
+    slot->h = img->height;
+    g_zgl_shelf[1].x += img->width;
+    if (img->height > g_zgl_shelf[1].row_h) g_zgl_shelf[1].row_h = img->height;
+
+    gl.ActiveTexture(ZGL_TEXTURE4);
+    gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
+    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, img->stride);
+    gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, slot->x, slot->y, slot->w, slot->h,
+                     ZGL_BGRA, ZGL_UNSIGNED_BYTE, img->pixels);
+    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
+    gl.ActiveTexture(ZGL_TEXTURE0);
+    return slot;
 }
 
 static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
@@ -1153,6 +1195,73 @@ static zgl_uint zgl_bitmap_tex(const zan_bitmap *img) {
 
 static void zgl_blit_pixels_batch(zan_surface_t *s, const zan_bitmap *img,
                                   const float *quads, int count) {
+    if (!zan_bitmap_valid(img) || count <= 0) return;
+    int iw = img->width, ih = img->height, i;
+    float fiw = (float)iw, fih = (float)ih;
+
+    /* 桌面 GL 小图/SVG 图标 1:1 整数像素绘制直接合批进常驻 uAtlas4，
+     * 省去按图标切换触发的 zgl_flush()、glGenTextures 与 O(N) 纹理表扫描。 */
+    int use_atlas = (!g_zgl.is_gles && img->serial != 0 && iw <= 96 && ih <= 96);
+    if (use_atlas) {
+        for (i = 0; i < count; i++) {
+            const float *q = quads + i * 10;
+            float dx = q[0], dy = q[1], dw = q[2], dh = q[3];
+            float sx = q[4], sy = q[5], sw = q[6], sh = q[7];
+            if (dw <= 0.0f) dw = fiw;
+            if (dh <= 0.0f) dh = fih;
+            if (sw <= 0.0f) { sx = 0.0f; sw = fiw; }
+            if (sh <= 0.0f) { sy = 0.0f; sh = fih; }
+            if (dw != sw || dh != sh || dx != floorf(dx) || dy != floorf(dy)
+                || sx < 0.0f || sy < 0.0f || sx + sw > fiw || sy + sh > fih) {
+                use_atlas = 0;
+                break;
+            }
+        }
+    }
+
+    if (use_atlas) {
+        if (!zgl_begin(s, ZGL_MODE_BLEND)) {
+            gl_sync_to_cpu(s);
+            cpu_blit_pixels_batch(s, img, quads, count);
+            return;
+        }
+        zgl_icon_slot *slot = zgl_icon_atlas_upload(img);
+        if (slot) {
+            const float inv_atlas = 1.0f / (float)ZGL_ATLAS_DIM;
+            float clip_x0 = (float)s->clip_x0, clip_y0 = (float)s->clip_y0;
+            float clip_x1 = (float)s->clip_x1, clip_y1 = (float)s->clip_y1;
+            zgl_quad sq;
+            memset(&sq, 0, sizeof(sq));
+            sq.kind = ZGL_K_BITMAP;
+            sq.p0 = 1.0f;
+            for (i = 0; i < count; i++) {
+                const float *q = quads + i * 10;
+                float dx = q[0], dy = q[1], dw = q[2], dh = q[3];
+                if (dw <= 0.0f) dw = fiw;
+                if (dh <= 0.0f) dh = fih;
+                float r_x1 = dx + dw, r_y1 = dy + dh;
+                if (r_x1 <= clip_x0 || dx >= clip_x1 || r_y1 <= clip_y0 || dy >= clip_y1) {
+                    continue;
+                }
+                float sx = q[4], sy = q[5], sw = q[6], sh = q[7];
+                u32 tint_raw = *(const u32 *)(q + 8);
+                if (sw <= 0.0f) { sx = 0.0f; sw = fiw; }
+                if (sh <= 0.0f) { sy = 0.0f; sh = fih; }
+                sq.cx = dx + dw * 0.5f;
+                sq.cy = dy + dh * 0.5f;
+                sq.hw = dw * 0.5f;
+                sq.hh = dh * 0.5f;
+                sq.u0 = ((float)slot->x + sx) * inv_atlas;
+                sq.v0 = ((float)slot->y + sy) * inv_atlas;
+                sq.u1 = ((float)slot->x + sx + sw) * inv_atlas;
+                sq.v1 = ((float)slot->y + sy + sh) * inv_atlas;
+                zgl_color(sq.col0, tint_raw, 0);
+                zgl_push(s, &sq, dx, dy, r_x1, r_y1);
+            }
+            return;
+        }
+    }
+
     zgl_uint tex = zgl_bitmap_tex(img);
     if (!tex || !zgl_begin(s, ZGL_MODE_BLEND)) {
         gl_sync_to_cpu(s);
@@ -1163,10 +1272,8 @@ static void zgl_blit_pixels_batch(zan_surface_t *s, const zan_bitmap *img,
         zgl_flush();
         g_zgl.bitmap_tex = tex;
     }
-    int iw = img->width, ih = img->height, i;
     float inv_iw = (iw > 0) ? (1.0f / (float)iw) : 0.0f;
     float inv_ih = (ih > 0) ? (1.0f / (float)ih) : 0.0f;
-    float fiw = (float)iw, fih = (float)ih;
     float clip_x0 = (float)s->clip_x0, clip_y0 = (float)s->clip_y0;
     float clip_x1 = (float)s->clip_x1, clip_y1 = (float)s->clip_y1;
 
