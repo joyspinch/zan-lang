@@ -57,20 +57,47 @@ public class QrFinder {
         }
     }
 
-    // 中位数免疫数据区偶发假命中对均值造成的离群拉偏。
+    static void SiftDown(double[] a, int start, int end) {
+        int root = start;
+        while (root * 2 + 1 <= end) {
+            int child = root * 2 + 1;
+            int swap = root;
+            if (a[swap] < a[child]) { swap = child; }
+            if (child + 1 <= end && a[swap] < a[child + 1]) { swap = child + 1; }
+            if (swap == root) { return; }
+            double tmp = a[root];
+            a[root] = a[swap];
+            a[swap] = tmp;
+            root = swap;
+        }
+    }
+
+    // 中位数免疫数据区偶发假命中对均值造成的离群拉偏；迭代堆排保证最坏 O(M log M)。
     static double Median(List<double> vals) {
         int n = vals.Count;
         if (n <= 0) { return 0; }
         double[] a = new double[n];
         for (int i = 0; i < n; i = i + 1) { a[i] = vals[i]; }
-        for (int i = 1; i < n; i = i + 1) {
-            double key = a[i];
-            int j = i - 1;
-            while (j >= 0 && a[j] > key) {
-                a[j + 1] = a[j];
-                j = j - 1;
+        if (n <= 16) {
+            for (int i = 1; i < n; i = i + 1) {
+                double key = a[i];
+                int j = i - 1;
+                while (j >= 0 && a[j] > key) {
+                    a[j + 1] = a[j];
+                    j = j - 1;
+                }
+                a[j + 1] = key;
             }
-            a[j + 1] = key;
+        } else {
+            for (int start = (n - 2) / 2; start >= 0; start = start - 1) {
+                QrFinder.SiftDown(a, start, n - 1);
+            }
+            for (int end = n - 1; end > 0; end = end - 1) {
+                double tmp = a[end];
+                a[end] = a[0];
+                a[0] = tmp;
+                QrFinder.SiftDown(a, 0, end - 1);
+            }
         }
         if (n % 2 == 1) { return a[n / 2]; }
         return (a[n / 2 - 1] + a[n / 2]) / 2.0;
@@ -114,6 +141,7 @@ public class QrFinder {
         List<QrScanHit> hhits, List<int> hrows,
         List<int> cols, Dict<int, List<int>> byCol) {
         List<Group> groups = new List<Group>();
+        Dict<long, List<Group>> grid = new Dict<long, List<Group>>();
         List<QrScanHit> vhits = new List<QrScanHit>();
         int[] runBuf = new int[5];
         double[] metricBuf = new double[2];
@@ -135,7 +163,7 @@ public class QrFinder {
                     if (bestV == null || v.err < bestV.err) { bestV = v; }
                 }
                 if (bestV == null) { continue; }
-                QrFinder.AddToGroup(groups, h, bestV, row);
+                QrFinder.AddToGroup(groups, grid, h, bestV, row);
             }
         }
         List<QrFinderPattern> outp = new List<QrFinderPattern>();
@@ -152,25 +180,61 @@ public class QrFinder {
         return outp;
     }
 
-    static void AddToGroup(List<Group> groups, QrScanHit h, QrScanHit v, int row) {
+    static long CellKey(int gx, int gy) {
+        return (((long)gx) << 32) | ((long)gy & 0xFFFFFFFFL);
+    }
+
+    static void AddToGroup(List<Group> groups, Dict<long, List<Group>> grid, QrScanHit h, QrScanHit v, int row) {
         double px = h.center;
         double py = v.center;
         double tol = h.moduleSize * 0.5;
         if (tol < 1.5) { tol = 1.5; }
         Group best = null;
         double bestD = 0;
-        for (int g = 0; g < groups.Count; g = g + 1) {
-            double dx = QrFinder.AbsF(px - groups[g].px);
-            double dy = QrFinder.AbsF(py - groups[g].py);
-            if (dx > tol || dy > tol) { continue; }
-            double d = dx + dy;
-            if (best == null || d < bestD) { best = groups[g]; bestD = d; }
+        int cellSize = 16;
+        int gx = (int)(px / (double)cellSize);
+        int gy = (int)(py / (double)cellSize);
+        int rad = (int)(tol / (double)cellSize) + 1;
+        if (groups.Count > 32 && rad <= 4) {
+            for (int dyCell = -rad; dyCell <= rad; dyCell = dyCell + 1) {
+                for (int dxCell = -rad; dxCell <= rad; dxCell = dxCell + 1) {
+                    List<Group> bucket;
+                    if (!grid.TryGetValue(QrFinder.CellKey(gx + dxCell, gy + dyCell), out bucket)) {
+                        continue;
+                    }
+                    for (int g = 0; g < bucket.Count; g = g + 1) {
+                        Group cand = bucket[g];
+                        double dx = QrFinder.AbsF(px - cand.px);
+                        double dy = QrFinder.AbsF(py - cand.py);
+                        if (dx > tol || dy > tol) { continue; }
+                        double d = dx + dy;
+                        if (best == null || d < bestD) { best = cand; bestD = d; }
+                    }
+                }
+            }
+        } else {
+            for (int g = 0; g < groups.Count; g = g + 1) {
+                double dx = QrFinder.AbsF(px - groups[g].px);
+                double dy = QrFinder.AbsF(py - groups[g].py);
+                if (dx > tol || dy > tol) { continue; }
+                double d = dx + dy;
+                if (best == null || d < bestD) { best = groups[g]; bestD = d; }
+            }
         }
         if (best == null) {
             best = new Group();
             best.px = px;
             best.py = py;
             groups.Add(best);
+            long key = QrFinder.CellKey(gx, gy);
+            List<Group> bucket;
+            if (grid.TryGetValue(key, out bucket)) {
+                bucket.Add(best);
+            } else {
+                bucket = new List<Group>();
+                bucket.Add(best);
+                grid.Add(key, bucket);
+            }
         }
         best.xs.Add(h.center);
         best.ys.Add(row);

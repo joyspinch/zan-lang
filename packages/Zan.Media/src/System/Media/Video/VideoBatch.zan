@@ -97,6 +97,8 @@ public class VideoBatch {
         result.Total = total;
         if (total == 0) return result;
 
+        // 并发写入前预分配无碰撞输出路径，防止不同子目录同名文件互相覆写。
+        string[] outputPaths = VideoBatch.ResolveOutputPaths(files, options);
         VideoBatchItemResult[] slots = new VideoBatchItemResult[total];
         int workers = options.Concurrency;
         if (workers < 1) workers = 1;
@@ -105,7 +107,7 @@ public class VideoBatch {
 
         if (workers == 1) {
             for (int i = 0; i < total; i = i + 1) {
-                VideoBatchItemResult item = VideoBatch.ProcessOne(files[i], options);
+                VideoBatchItemResult item = VideoBatch.ProcessOne(files[i], outputPaths[i], options);
                 slots[i] = item;
                 if (options.OnProgress != null) {
                     options.OnProgress(i + 1, total, item.InputPath, item.Succeeded);
@@ -122,7 +124,7 @@ public class VideoBatch {
                             while (true) {
                                 int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
                                 if (idx >= total) break;
-                                VideoBatchItemResult item = VideoBatch.ProcessOne(files[idx], options);
+                                VideoBatchItemResult item = VideoBatch.ProcessOne(files[idx], outputPaths[idx], options);
                                 slots[idx] = item;
                                 int done = (int)AtomicInt.NativeAdd(doneCount, 1);
                                 if (options.OnProgress != null) {
@@ -161,14 +163,46 @@ public class VideoBatch {
         return result;
     }
 
-    private static VideoBatchItemResult ProcessOne(string inputPath, VideoBatchOptions opt) {
+    private static string[] ResolveOutputPaths(List<string> files, VideoBatchOptions opt) {
+        int total = files.Count;
+        string[] paths = new string[total];
+        Dict<string, int> used = new Dict<string, int>();
+        string suffix = "";
+        string ext = "";
+        if (opt.TaskKind == VideoBatchTaskKind.ExtractThumbnail) {
+            ext = ImageBatch.ExtensionForFormat(opt.ThumbnailFormat);
+        } else if (opt.TaskKind == VideoBatchTaskKind.ContactSheet) {
+            suffix = "_sheet";
+            ext = ImageBatch.ExtensionForFormat(opt.ThumbnailFormat);
+        } else if (opt.TaskKind == VideoBatchTaskKind.ExtractAudio) {
+            ext = (opt.OutputExtension == null || opt.OutputExtension == "") ? ".m4a" : opt.OutputExtension;
+        } else {
+            ext = (opt.OutputExtension == null || opt.OutputExtension == "") ? ".mp4" : opt.OutputExtension;
+        }
+        for (int i = 0; i < total; i = i + 1) {
+            string stem = Path.GetFileNameWithoutExtension(files[i]);
+            if (stem == null || stem == "") { stem = "item_" + Convert.ToString(i); }
+            string candidate = Path.Combine(opt.OutputDirectory, stem + suffix + ext);
+            string key = candidate.ToLower();
+            int seq = 2;
+            while (used.ContainsKey(key)) {
+                candidate = Path.Combine(opt.OutputDirectory,
+                    stem + "_" + Convert.ToString(seq) + suffix + ext);
+                key = candidate.ToLower();
+                seq = seq + 1;
+            }
+            used.Add(key, 1);
+            paths[i] = candidate;
+        }
+        return paths;
+    }
+
+    private static VideoBatchItemResult ProcessOne(string inputPath, string outputPath, VideoBatchOptions opt) {
         VideoBatchItemResult res = new VideoBatchItemResult();
         res.InputPath = inputPath;
-        string stem = Path.GetFileNameWithoutExtension(inputPath);
+        res.OutputPath = outputPath;
 
         if (opt.TaskKind == VideoBatchTaskKind.ExtractThumbnail) {
-            string ext = ImageBatch.ExtensionForFormat(opt.ThumbnailFormat);
-            res.OutputPath = Path.Combine(opt.OutputDirectory, stem + ext);
             ImageBuffer frame = VideoDecoder.ExtractFrame(
                 inputPath, opt.ThumbnailTimestampMs, opt.ThumbnailWidth, opt.ThumbnailHeight);
             if (frame.IsEmpty) {
@@ -186,8 +220,6 @@ public class VideoBatch {
         }
 
         if (opt.TaskKind == VideoBatchTaskKind.ContactSheet) {
-            string ext = ImageBatch.ExtensionForFormat(opt.ThumbnailFormat);
-            res.OutputPath = Path.Combine(opt.OutputDirectory, stem + "_sheet" + ext);
             ImageBuffer sheet = VideoProcessor.BuildContactSheet(
                 inputPath, opt.SheetCols, opt.SheetRows,
                 opt.ThumbnailWidth, opt.ThumbnailHeight, opt.SheetGap, (int)0xFF141418);
@@ -206,8 +238,6 @@ public class VideoBatch {
         }
 
         if (opt.TaskKind == VideoBatchTaskKind.ExtractAudio) {
-            string ext = (opt.OutputExtension == null || opt.OutputExtension == "") ? ".m4a" : opt.OutputExtension;
-            res.OutputPath = Path.Combine(opt.OutputDirectory, stem + ext);
             string exe = opt.Transcode != null ? opt.Transcode.FfmpegExecutable : "ffmpeg";
             MediaProcessResult pr = VideoProcessor.ExtractAudio(
                 inputPath, res.OutputPath, opt.AudioCodec, opt.AudioBitrate, exe);
@@ -217,8 +247,6 @@ public class VideoBatch {
         }
 
         // Default: Transcode
-        string outExt = (opt.OutputExtension == null || opt.OutputExtension == "") ? ".mp4" : opt.OutputExtension;
-        res.OutputPath = Path.Combine(opt.OutputDirectory, stem + outExt);
         MediaProcessResult tr = VideoProcessor.Transcode(inputPath, res.OutputPath, opt.Transcode);
         res.Succeeded = tr.Succeeded;
         res.Error = tr.Error;

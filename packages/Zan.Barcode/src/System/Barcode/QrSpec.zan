@@ -142,18 +142,33 @@ public class QrSpec {
     // ---- 功能图形地图 -------------------------------------------------------
 
     // 功能图形（不可放数据/掩码）地图：true = 功能模块，编解码共用同一份实现。
+    static object cacheLock = new object();
     static bool[][] fnCache = null;
+
+    // 内部只读共享模板（编码器/解码器只读访问，保留线程安全双重检查锁，免除每次编码整矩阵复制）。
+    internal static bool[] FunctionMapReadOnly(int ver) {
+        if (ver < 1 || ver > 40) { return QrSpec.BuildFunctionMap(ver); }
+        bool[][] cache = QrSpec.fnCache;
+        if (cache != null) {
+            bool[] hit = cache[ver];
+            if (hit != null) { return hit; }
+        }
+        bool[] cached = null;
+        lock (QrSpec.cacheLock) {
+            if (QrSpec.fnCache == null) { QrSpec.fnCache = new bool[41][]; }
+            cached = QrSpec.fnCache[ver];
+            if (cached == null) {
+                cached = QrSpec.BuildFunctionMap(ver);
+                QrSpec.fnCache[ver] = cached;
+            }
+        }
+        return cached;
+    }
 
     // 覆盖三个定位图形及分隔带、定时/校正图形、版本/格式信息区与固定深色模块。
     // 按版本惰性缓存模板，对外返回安全副本，避免重复标定全矩阵。
     public static bool[] FunctionMap(int ver) {
-        if (ver < 1 || ver > 40) { return QrSpec.BuildFunctionMap(ver); }
-        if (QrSpec.fnCache == null) { QrSpec.fnCache = new bool[41][]; }
-        bool[] cached = QrSpec.fnCache[ver];
-        if (cached == null) {
-            cached = QrSpec.BuildFunctionMap(ver);
-            QrSpec.fnCache[ver] = cached;
-        }
+        bool[] cached = QrSpec.FunctionMapReadOnly(ver);
         bool[] copy = new bool[cached.Length];
         Array.Copy(cached, copy, cached.Length);
         return copy;
@@ -234,21 +249,24 @@ public class QrSpec {
     static int[] gfExp = null;
     static int[] gfLog = null;
 
-    // 首次调用时在局部数组构建完 GF(256) 指数/对数表后再整体发布到静态字段，避免并发读到半初始化态。
+    // 首次调用时在锁内构建完 GF(256) 指数/对数表并先发布 gfLog 再发布 gfExp，避免并发读到半初始化态。
     static void EnsureGf() {
-        if (gfExp != null) { return; }
-        int[] e = new int[512];
-        int[] l = new int[256];
-        int v = 1;
-        for (int i = 0; i < 255; i = i + 1) {
-            e[i] = v;
-            l[v] = i;
-            v = v << 1;
-            if (v >= 256) { v = v ^ 0x11D; }
+        if (gfExp != null && gfLog != null) { return; }
+        lock (QrSpec.cacheLock) {
+            if (gfExp != null && gfLog != null) { return; }
+            int[] e = new int[512];
+            int[] l = new int[256];
+            int v = 1;
+            for (int i = 0; i < 255; i = i + 1) {
+                e[i] = v;
+                l[v] = i;
+                v = v << 1;
+                if (v >= 256) { v = v ^ 0x11D; }
+            }
+            for (int i = 255; i < 512; i = i + 1) { e[i] = e[i - 255]; }
+            gfLog = l;
+            gfExp = e;
         }
-        for (int i = 255; i < 512; i = i + 1) { e[i] = e[i - 255]; }
-        gfExp = e;
-        gfLog = l;
     }
 
     // GF(256) 乘法（任一操作数为 0 时结果为 0）。
@@ -298,19 +316,39 @@ public class QrSpec {
         return result;
     }
 
-    // data 对生成多项式 gen 取模（Nayuki 式），返回 deg 个纠错码字。
-    public static int[] RsRemainder(int[] data, int dataLen, int[] gen) {
+    // 零拷贝切片版 RS 余式计算：将 data[offset..offset+dataLen) 对 gen 取模结果写入 outEc[outOff..outOff+deg)。
+    // 提升 GF 表查表与融合移位+异或为单遍循环，消除每字节两次循环及每次乘法的 EnsureGf 调用。
+    internal static void RsRemainderSlice(int[] data, int offset, int dataLen, int[] gen, int[] outEc, int outOff) {
+        QrSpec.EnsureGf();
+        int[] exp = gfExp;
+        int[] log = gfLog;
         int deg = gen.Length;
-        int[] result = new int[deg];
-        for (int i = 0; i < deg; i = i + 1) { result[i] = 0; }
+        for (int j = 0; j < deg; j = j + 1) { outEc[outOff + j] = 0; }
+        int degM1 = deg - 1;
         for (int i = 0; i < dataLen; i = i + 1) {
-            int factor = data[i] ^ result[0];
-            for (int j = 1; j < deg; j = j + 1) { result[j - 1] = result[j]; }
-            result[deg - 1] = 0;
-            for (int j = 0; j < deg; j = j + 1) {
-                result[j] = result[j] ^ QrSpec.GfMul(gen[j], factor);
+            int factor = data[offset + i] ^ outEc[outOff];
+            if (factor == 0) {
+                for (int j = 0; j < degM1; j = j + 1) {
+                    outEc[outOff + j] = outEc[outOff + j + 1];
+                }
+                outEc[outOff + degM1] = 0;
+            } else {
+                int logF = log[factor];
+                for (int j = 0; j < degM1; j = j + 1) {
+                    int g = gen[j];
+                    int prod = g == 0 ? 0 : exp[log[g] + logF];
+                    outEc[outOff + j] = outEc[outOff + j + 1] ^ prod;
+                }
+                int gLast = gen[degM1];
+                outEc[outOff + degM1] = gLast == 0 ? 0 : exp[log[gLast] + logF];
             }
         }
+    }
+
+    // data 对生成多项式 gen 取模（Nayuki 式），返回 deg 个纠错码字。
+    public static int[] RsRemainder(int[] data, int dataLen, int[] gen) {
+        int[] result = new int[gen.Length];
+        QrSpec.RsRemainderSlice(data, 0, dataLen, gen, result, 0);
         return result;
     }
 }

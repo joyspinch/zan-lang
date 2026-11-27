@@ -123,6 +123,7 @@ public class MediaPlaybackSession : IDisposable {
     public bool Open(string url) {
         if (this.stateAtomic == 0 || this.frameLock == null) return false;
         this.Close();
+        if (this.workerRunning != 0 && AtomicInt.NativeLoad(this.workerRunning) != 0) return false;
         if (url == null || url == "") return false;
         VideoDecoder dec = VideoDecoder.Open(url);
         if (dec == null) return false;
@@ -137,9 +138,12 @@ public class MediaPlaybackSession : IDisposable {
 
         if (dec.Info.HasVideo && dec.Info.Width > 0 && dec.Info.Height > 0) {
             this.frameLock.WaitOne();
-            this.frontFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
-            this.backFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
-            this.frameLock.ReleaseMutex();
+            try {
+                this.frontFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
+                this.backFrame = new ImageBuffer(dec.Info.Width, dec.Info.Height);
+            } finally {
+                this.frameLock.ReleaseMutex();
+            }
         }
 
         this.useAudioClock = false;
@@ -164,11 +168,14 @@ public class MediaPlaybackSession : IDisposable {
                 VideoStepKind k = dec.Step();
                 if (k == VideoStepKind.VideoFrame) {
                     this.frameLock.WaitOne();
-                    if (dec.ReadVideoFrame(this.frontFrame)) {
-                        AtomicInt.NativeStore(this.positionMs, dec.VideoPtsMs);
-                        AtomicInt.NativeAdd(this.frameVersion, 1);
+                    try {
+                        if (dec.ReadVideoFrame(this.frontFrame)) {
+                            AtomicInt.NativeStore(this.positionMs, dec.VideoPtsMs);
+                            AtomicInt.NativeAdd(this.frameVersion, 1);
+                        }
+                    } finally {
+                        this.frameLock.ReleaseMutex();
                     }
-                    this.frameLock.ReleaseMutex();
                     break;
                 } else if (k == VideoStepKind.EndOfStream || k == VideoStepKind.Error) {
                     break;
@@ -182,7 +189,7 @@ public class MediaPlaybackSession : IDisposable {
     }
 
     public void Play() {
-        if (this.decoder == null) return;
+        if (this.decoder == null || this.stateAtomic == 0 || this.workerRunning == 0) return;
         PlaybackState st = this.State;
         if (st == PlaybackState.Ended) {
             AtomicInt.NativeStore(this.seekPending, 0);
@@ -191,9 +198,8 @@ public class MediaPlaybackSession : IDisposable {
         if (this.audioStream != null) {
             this.audioStream.Resume();
         }
-        if (AtomicInt.NativeLoad(this.workerRunning) == 0) {
+        if (AtomicInt.NativeCompareExchange(this.workerRunning, 0, 1) == 0) {
             AtomicInt.NativeStore(this.stopFlag, 0);
-            AtomicInt.NativeStore(this.workerRunning, 1);
             bool started = Thread.Start(() => { this.DecodeLoop(); });
             if (!started) {
                 AtomicInt.NativeStore(this.workerRunning, 0);
@@ -229,10 +235,13 @@ public class MediaPlaybackSession : IDisposable {
             if (k == VideoStepKind.VideoFrame) {
                 if (this.decoder.ReadVideoFrame(this.backFrame)) {
                     this.frameLock.WaitOne();
-                    ImageBuffer tmp = this.frontFrame;
-                    this.frontFrame = this.backFrame;
-                    this.backFrame = tmp;
-                    this.frameLock.ReleaseMutex();
+                    try {
+                        ImageBuffer tmp = this.frontFrame;
+                        this.frontFrame = this.backFrame;
+                        this.backFrame = tmp;
+                    } finally {
+                        this.frameLock.ReleaseMutex();
+                    }
                     AtomicInt.NativeStore(this.positionMs, this.decoder.VideoPtsMs);
                     AtomicInt.NativeAdd(this.frameVersion, 1);
                     return true;
@@ -271,7 +280,7 @@ public class MediaPlaybackSession : IDisposable {
 
     // 将最新解码画面注册到 "mem:" 图像键（供 UI 线程 Canvas.BlitImage 渲染，耗时 < 1ms）。
     public bool PublishFrameToImageKey(string memKey) {
-        if (memKey == null || !memKey.StartsWith("mem:")) return false;
+        if (memKey == null || !memKey.StartsWith("mem:") || this.frameLock == null) return false;
         this.frameLock.WaitOne();
         try {
             if (this.frontFrame == null || this.frontFrame.IsEmpty) return false;
@@ -283,7 +292,7 @@ public class MediaPlaybackSession : IDisposable {
 
     // 将当前画面拷入调用方 ImageBuffer（无头模式或截帧用）。
     public bool CopyCurrentFrameTo(ImageBuffer dst) {
-        if (dst == null || dst.IsEmpty) return false;
+        if (dst == null || dst.IsEmpty || this.frameLock == null) return false;
         this.frameLock.WaitOne();
         try {
             if (this.frontFrame == null || this.frontFrame.IsEmpty) return false;
@@ -378,12 +387,15 @@ public class MediaPlaybackSession : IDisposable {
                         Thread.Sleep(sleepMs);
                     }
 
-                    if (this.backFrame != null && this.decoder.ReadVideoFrame(this.backFrame)) {
+                    if (this.backFrame != null && this.frameLock != null && this.decoder.ReadVideoFrame(this.backFrame)) {
                         this.frameLock.WaitOne();
-                        ImageBuffer tmp = this.frontFrame;
-                        this.frontFrame = this.backFrame;
-                        this.backFrame = tmp;
-                        this.frameLock.ReleaseMutex();
+                        try {
+                            ImageBuffer tmp = this.frontFrame;
+                            this.frontFrame = this.backFrame;
+                            this.backFrame = tmp;
+                        } finally {
+                            this.frameLock.ReleaseMutex();
+                        }
                         AtomicInt.NativeStore(this.positionMs, pts);
                         AtomicInt.NativeAdd(this.frameVersion, 1);
                     }
