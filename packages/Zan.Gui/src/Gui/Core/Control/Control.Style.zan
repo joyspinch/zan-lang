@@ -32,53 +32,91 @@ public partial class Control {
         this.AddStyle("transform: " + expr);
     }
     public void Translate(int dx, int dy) { this.SetMotionOffset(dx, dy); }
+    private void CaptureMotionBase(ControlExtra ex) {
+        if (computedStyle == null || ex == null || ex.motionBaseCaptured) { return; }
+        ex.baseTx = computedStyle.tx;
+        ex.baseTy = computedStyle.ty;
+        ex.baseScale = computedStyle.scale;
+        ex.baseRotate = computedStyle.rotate;
+        ex.baseOpacity = computedStyle.opacity;
+        ex.motionBaseCaptured = true;
+    }
+    private void PatchComputedMotion(ControlExtra ex) {
+        StyleBox b = computedStyle;
+        if (b == null || ex == null) { return; }
+        if (!ex.motionBaseCaptured) {
+            computedStyle = null;
+            return;
+        }
+        b.tx = ex.baseTx + (ex.motionActive ? ex.motionTx : 0);
+        b.ty = ex.baseTy + (ex.motionActive ? ex.motionTy : 0);
+        if (ex.motionActive && ex.motionScale != 1000 && ex.motionScale > 0) {
+            int sc = (int)((long)ex.baseScale * (long)ex.motionScale / 1000);
+            b.scale = sc > 50 ? sc : 50;
+        } else {
+            b.scale = ex.baseScale;
+        }
+        b.rotate = ex.baseRotate + (ex.motionActive ? ex.motionRotate : 0);
+        if (ex.motionActive && ex.motionOpacity < 1000) {
+            int op = ex.motionOpacity < 0 ? 0 : ex.motionOpacity;
+            b.opacity = (int)((long)ex.baseOpacity * (long)op / 1000);
+        } else {
+            b.opacity = ex.baseOpacity;
+        }
+        if (surfaceTarget != null && surfaceTarget != b) { surfaceTarget = null; }
+    }
     public void ScalePct(int pct) {
         ControlExtra ex = this.EnsureExtra();
         int sc = pct > 0 ? pct * 10 : 1000;
         if (ex.motionScale == sc) { return; }
+        if (!ex.motionActive) { this.CaptureMotionBase(ex); }
         ex.motionScale = sc;
         ex.motionActive = ex.motionTx != 0 || ex.motionTy != 0 || sc != 1000
             || ex.motionRotate != 0 || ex.motionOpacity != 1000;
-        computedStyle = null;
+        this.PatchComputedMotion(ex);
     }
     public void Rotate(int deg) {
         ControlExtra ex = this.EnsureExtra();
         if (ex.motionRotate == deg) { return; }
+        if (!ex.motionActive) { this.CaptureMotionBase(ex); }
         ex.motionRotate = deg;
         ex.motionActive = ex.motionTx != 0 || ex.motionTy != 0 || ex.motionScale != 1000
             || deg != 0 || ex.motionOpacity != 1000;
-        computedStyle = null;
+        this.PatchComputedMotion(ex);
     }
     public void SetMotionOffset(int dx, int dy) {
         ControlExtra ex = this.EnsureExtra();
         if (ex.motionActive && ex.motionTx == dx && ex.motionTy == dy) { return; }
+        if (!ex.motionActive) { this.CaptureMotionBase(ex); }
         ex.motionTx = dx;
         ex.motionTy = dy;
         ex.motionActive = dx != 0 || dy != 0 || ex.motionScale != 1000
             || ex.motionRotate != 0 || ex.motionOpacity != 1000;
-        computedStyle = null;
+        this.PatchComputedMotion(ex);
     }
     public void SetMotionTransform(int dx, int dy, int scalePm, int rotateDeg) {
         ControlExtra ex = this.EnsureExtra();
         int sc = scalePm > 0 ? scalePm : 1000;
         if (ex.motionActive && ex.motionTx == dx && ex.motionTy == dy
             && ex.motionScale == sc && ex.motionRotate == rotateDeg) { return; }
+        if (!ex.motionActive) { this.CaptureMotionBase(ex); }
         ex.motionTx = dx;
         ex.motionTy = dy;
         ex.motionScale = sc;
         ex.motionRotate = rotateDeg;
         ex.motionActive = dx != 0 || dy != 0 || sc != 1000
             || rotateDeg != 0 || ex.motionOpacity != 1000;
-        computedStyle = null;
+        this.PatchComputedMotion(ex);
     }
     public void SetMotionOpacity(int opacityPm) {
         ControlExtra ex = this.EnsureExtra();
         int op = opacityPm < 0 ? 0 : (opacityPm > 1000 ? 1000 : opacityPm);
         if (ex.motionOpacity == op) { return; }
+        if (!ex.motionActive) { this.CaptureMotionBase(ex); }
         ex.motionOpacity = op;
         ex.motionActive = ex.motionTx != 0 || ex.motionTy != 0 || ex.motionScale != 1000
             || ex.motionRotate != 0 || op != 1000;
-        computedStyle = null;
+        this.PatchComputedMotion(ex);
     }
     public void ResetMotion() {
         if (this.extra == null || !this.extra.motionActive) { return; }
@@ -88,7 +126,7 @@ public partial class Control {
         this.extra.motionRotate = 0;
         this.extra.motionOpacity = 1000;
         this.extra.motionActive = false;
-        computedStyle = null;
+        this.PatchComputedMotion(this.extra);
     }
     public bool HasMotion() { return this.extra != null && this.extra.motionActive; }
     public int MotionTx() { return this.extra != null && this.extra.motionActive ? this.extra.motionTx : 0; }
@@ -158,8 +196,18 @@ public partial class Control {
     }
     StyleBox ResolveStyleAs(App app, string type, string cls, int state) {
         app = this.ResolveApp(app);
-        return this.RememberComputedStyle(
-            app, this.UncachedStyleAs(app, type, cls, state), type, cls, state);
+        StyleBox box = Style.Full(app, type, cls, name, state);
+        Style.InlineBase(box, this);
+        if (this.extra != null) {
+            this.extra.baseTx = box.tx;
+            this.extra.baseTy = box.ty;
+            this.extra.baseScale = box.scale;
+            this.extra.baseRotate = box.rotate;
+            this.extra.baseOpacity = box.opacity;
+            this.extra.motionBaseCaptured = true;
+        }
+        this.ApplyMotionOverridesTo(box);
+        return this.RememberComputedStyle(app, box, type, cls, state);
     }
     public static StyleBox BareBox(App app, string type, int state) {
         return Style.Full(app, type, "", "", state);
@@ -939,7 +987,10 @@ public partial class Control {
         if (!m.animPaused && sampled != null) {
             int padX = (int)Math.Abs(sampled.tx) + 8;
             int padY = (int)Math.Abs(sampled.ty) + 8;
-            app.RequestAnimationFrameIn(bx - padX, by - padY, bw + padX * 2, bh + padY * 2);
+            if (bw <= 0 || bh <= 0 || app.canvas == null
+                || app.canvas.IsRectInClip(bx - padX, by - padY, bw + padX * 2, bh + padY * 2)) {
+                app.RequestAnimationFrameIn(bx - padX, by - padY, bw + padX * 2, bh + padY * 2);
+            }
         }
         return sampled;
     }

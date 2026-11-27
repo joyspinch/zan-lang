@@ -101,8 +101,17 @@ public partial class App {
         int participantDeadline = this.MinLoopDeadline();
         participantDeadline = ChildWindows.LoopDeadline(this, participantDeadline);
         if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
-        if (needsRedraw || pollPending) {
-            bool explicitPoll = pollPending;
+        bool explicitPoll = pollPending;
+        if (window.GetHandle() != 0 && !window.IsVisible() && !explicitPoll && !Window.frozenTick) {
+            loopPath = 2;
+            if (wakeNextMs >= 0) {
+                int now = Window.GetTickMs();
+                if (now >= wakeNextMs) { result = window.PollEvent(); }
+                else { result = window.WaitEventTimeout(wakeNextMs - now); }
+            } else {
+                result = window.WaitEvent();
+            }
+        } else if (needsRedraw || pollPending) {
             pollPending = false;
             loopPath = 0;
             result = window.PollEvent();
@@ -168,12 +177,32 @@ public partial class App {
         if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return true; }
         if (this.ConsumeRoutedInput(kind)) {
             if (!needsRedraw) { this.PumpDueFrame(); }
+            this.PaceHoverMoveRedraw(explicitPoll, kind, displayReady);
             return true;
         }
         this.FinalizeUnhandledEvent(kind, true);
         if (!needsRedraw) { this.PumpDueFrame(); }
+        this.PaceHoverMoveRedraw(explicitPoll, kind, displayReady);
         this.Stats.Mark("sh.eventend");
         return true;
+    }
+    private void PaceHoverMoveRedraw(bool explicitPoll, int kind, bool displayReady) {
+        if (!needsRedraw || explicitPoll || displayReady || kind != 1
+            || this.inputNeedsFrame || Window.frozenTick || window.GetHandle() == 0) {
+            return;
+        }
+        long nowUs = Stopwatch.GetMicroseconds();
+        long minIntervalUs = (long)(900000.0 / frameCadence.Rate());
+        bool tooSoon = lastPresentUs > 0 && nowUs >= lastPresentUs && (nowUs - lastPresentUs) < minIntervalUs;
+        if (!tooSoon && frameCadence.WaitMilliseconds(nowUs) <= 0) {
+            return;
+        }
+        needsRedraw = false;
+        if (Damage.partialPending && Damage.dmgW > 0 && Damage.dmgH > 0) {
+            this.RequestAnimationFrameIn(Damage.dmgX, Damage.dmgY, Damage.dmgW, Damage.dmgH);
+        } else {
+            this.RequestAnimationFrame();
+        }
     }
     nint WindowHandle() { return window.GetHandle(); }
     bool ApplyEvent(nint evHwnd) {

@@ -133,6 +133,13 @@ public partial class Canvas {
     static string Backend() { return zan_gui_render_backend(); }
     int surfaceId;
     internal int opacityPm;
+    private int[] clipStack;
+    private int clipDepth;
+    private int clipX0;
+    private int clipY0;
+    private int clipX1;
+    private int clipY1;
+    private bool clipActive;
     public int SurfaceId() { surfaceIdExposed = true; return surfaceId; }
     private bool surfaceIdExposed;
     internal bool SurfaceIdExposed() { return surfaceIdExposed; }
@@ -191,9 +198,82 @@ public partial class Canvas {
         }
         zan_gui_fill_rect(surfaceId, x, y, w, h, color);
     }
-    void PushClip(int x, int y, int w, int h) { zan_gui_push_clip(surfaceId, x, y, w, h); }
-    void PopClip() { zan_gui_pop_clip(surfaceId); }
-    void ResetClip() { zan_gui_reset_clip(surfaceId); }
+    void PushClip(int x, int y, int w, int h) {
+        if (this.layerStack == null || this.layerStack.Count == 0) {
+            if (clipDepth < 32) {
+                if (clipStack == null) { clipStack = new int[128]; }
+                int off = clipDepth * 4;
+                if (clipActive) {
+                    clipStack[off] = clipX0;
+                    clipStack[off + 1] = clipY0;
+                    clipStack[off + 2] = clipX1;
+                    clipStack[off + 3] = clipY1;
+                } else {
+                    clipStack[off] = 0;
+                    clipStack[off + 1] = 0;
+                    clipStack[off + 2] = -1;
+                    clipStack[off + 3] = -1;
+                }
+                int nx0 = x;
+                int ny0 = y;
+                int nx1 = x + (w > 0 ? w : 0);
+                int ny1 = y + (h > 0 ? h : 0);
+                if (clipActive) {
+                    if (nx0 < clipX0) { nx0 = clipX0; }
+                    if (ny0 < clipY0) { ny0 = clipY0; }
+                    if (nx1 > clipX1) { nx1 = clipX1; }
+                    if (ny1 > clipY1) { ny1 = clipY1; }
+                }
+                clipX0 = nx0;
+                clipY0 = ny0;
+                clipX1 = nx1;
+                clipY1 = ny1;
+                clipActive = true;
+            }
+            clipDepth = clipDepth + 1;
+        }
+        zan_gui_push_clip(surfaceId, x, y, w, h);
+    }
+    void PopClip() {
+        if (this.layerStack == null || this.layerStack.Count == 0) {
+            if (clipDepth > 0) {
+                clipDepth = clipDepth - 1;
+                if (clipDepth < 32 && clipStack != null) {
+                    int off = clipDepth * 4;
+                    int px1 = clipStack[off + 2];
+                    int py1 = clipStack[off + 3];
+                    if (px1 < 0 && py1 < 0) {
+                        clipActive = false;
+                    } else {
+                        clipX0 = clipStack[off];
+                        clipY0 = clipStack[off + 1];
+                        clipX1 = px1;
+                        clipY1 = py1;
+                        clipActive = true;
+                    }
+                }
+            }
+        }
+        zan_gui_pop_clip(surfaceId);
+    }
+    void ResetClip() {
+        if (this.layerStack == null || this.layerStack.Count == 0) {
+            clipDepth = 0;
+            clipActive = false;
+        }
+        zan_gui_reset_clip(surfaceId);
+    }
+    public bool IsRectInClip(int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) { return false; }
+        if ((this.layerStack != null && this.layerStack.Count > 0) || clipDepth > 32) { return true; }
+        int x1 = x + w;
+        int y1 = y + h;
+        if (clipActive) {
+            return clipX1 > clipX0 && clipY1 > clipY0
+                && x1 > clipX0 && y1 > clipY0 && x < clipX1 && y < clipY1;
+        }
+        return x1 > 0 && y1 > 0 && x < this.Width() && y < this.Height();
+    }
     void DrawRect(int x, int y, int w, int h, int color, int thickness) {
         if (opacityPm < 1000) { color = this.ApplyOpacity(color); }
         if (w <= 0 || h <= 0 || thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
