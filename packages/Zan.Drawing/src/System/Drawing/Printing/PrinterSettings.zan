@@ -32,18 +32,21 @@ public class PrinterSettings {
     public static string DefaultPrinterName() {
         #if WINDOWS
         nint charsOut = NativeMemory.Alloc(4);
+        if (charsOut == 0) { return ""; }
         string name = "";
         try {
             new Span<int>(charsOut, 1)[0] = 0;
             PrinterSettings.GetDefaultPrinterW(0, charsOut);
             int chars = new Span<int>(charsOut, 1)[0];
-            if (chars > 0) {
+            if (chars > 0 && chars <= 1073741823) {
                 nint buffer = NativeMemory.Alloc(chars * 2);
-                try {
-                    int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
-                    if (ok != 0) { name = Wide.Read(buffer); }
-                } finally {
-                    NativeMemory.Free(buffer);
+                if (buffer != 0) {
+                    try {
+                        int ok = PrinterSettings.GetDefaultPrinterW(buffer, charsOut);
+                        if (ok != 0) { name = Wide.Read(buffer); }
+                    } finally {
+                        NativeMemory.Free(buffer);
+                    }
                 }
             }
         } finally {
@@ -80,6 +83,11 @@ public class PrinterSettings {
         List<string> printers = new List<string>();
         nint neededOut = NativeMemory.Alloc(4);
         nint countOut = NativeMemory.Alloc(4);
+        if (neededOut == 0 || countOut == 0) {
+            if (countOut != 0) { NativeMemory.Free(countOut); }
+            if (neededOut != 0) { NativeMemory.Free(neededOut); }
+            return printers;
+        }
         try {
             new Span<int>(neededOut, 1)[0] = 0;
             new Span<int>(countOut, 1)[0] = 0;
@@ -87,20 +95,24 @@ public class PrinterSettings {
             int needed = new Span<int>(neededOut, 1)[0];
             if (needed > 0) {
                 nint buffer = NativeMemory.Alloc(needed);
-                try {
-                    int ok = PrinterSettings.EnumPrintersW(
-                        6, 0, 4, buffer, needed, neededOut, countOut);
-                    if (ok != 0) {
-                        int count = new Span<int>(countOut, 1)[0];
-                        // 在 Win64 目标上 PRINTER_INFO_4W 为 24 字节；pPrinterName 是
-                        // 其第一个指针。
-                        for (int i = 0; i < count; i = i + 1) {
-                            nint name = new Span<nint>(buffer + i * 24, 1)[0];
-                            if (name != 0) { printers.Add(Wide.Read(name)); }
+                if (buffer != 0) {
+                    try {
+                        int ok = PrinterSettings.EnumPrintersW(
+                            6, 0, 4, buffer, needed, neededOut, countOut);
+                        if (ok != 0) {
+                            int count = new Span<int>(countOut, 1)[0];
+                            int maxCount = needed / 24;
+                            if (count > maxCount) { count = maxCount; }
+                            // 在 Win64 目标上 PRINTER_INFO_4W 为 24 字节；pPrinterName 是
+                            // 其第一个指针。
+                            for (int i = 0; i < count; i = i + 1) {
+                                nint name = new Span<nint>(buffer + (nint)((long)i * 24L), 1)[0];
+                                if (name != 0) { printers.Add(Wide.Read(name)); }
+                            }
                         }
+                    } finally {
+                        NativeMemory.Free(buffer);
                     }
-                } finally {
-                    NativeMemory.Free(buffer);
                 }
             }
         } finally {

@@ -38,7 +38,10 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
     public override void Load() {
         if (this.path == null || this.path.Length == 0) { return; }
         if (!File.Exists(this.path)) {
-            if (this.optional) { return; }
+            if (this.optional) {
+                this.data.Clear();
+                return;
+            }
             throw new FileNotFoundException("Configuration file not found: " + this.path);
         }
         string text = File.ReadAllText(this.path);
@@ -87,10 +90,23 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         if (ks >= ke) { return; }
         int vs = eq + 1;
         int ve = e;
-        while (vs < ve && EnvFileConfigurationProvider.IsTrimWs(text[vs] & 255)) { vs = vs + 1; }
+        bool hadLeadingWs = false;
+        while (vs < ve && EnvFileConfigurationProvider.IsTrimWs(text[vs] & 255)) {
+            vs = vs + 1;
+            hadLeadingWs = true;
+        }
         string rawKey = text.Substring(ks, ke - ks);
-        string value = EnvFileConfigurationProvider.ParseValueSlice(text, tp, vs, ve);
+        string value = (hadLeadingWs && vs < ve && (text[vs] & 255) == 35)
+            ? ""
+            : EnvFileConfigurationProvider.ParseValueSlice(text, tp, vs, ve);
         this.Set(rawKey, value);
+    }
+
+    private static bool IsTrailingCommentOrWs(string raw, int pos, int end) {
+        int p = pos;
+        while (p < end && EnvFileConfigurationProvider.IsTrimWs(raw[p] & 255)) { p = p + 1; }
+        if (p >= end) { return true; }
+        return p > pos && (raw[p] & 255) == 35;
     }
 
     private static string ParseValueSlice(string raw, nint rp, int start, int end) {
@@ -100,11 +116,34 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         }
         int first = raw[start] & 255;
         int last = raw[end - 1] & 255;
-        if (first == 34 && last == 34) {
-            return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, end - 1);
+        if (first == 34) {
+            if (last == 34) {
+                return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, end - 1);
+            }
+            int p = start + 1;
+            while (p < end) {
+                int c = raw[p] & 255;
+                if (c == 92) {
+                    p = p + 2;
+                    continue;
+                }
+                if (c == 34) {
+                    if (EnvFileConfigurationProvider.IsTrailingCommentOrWs(raw, p + 1, end)) {
+                        return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, p);
+                    }
+                    break;
+                }
+                p = p + 1;
+            }
         }
-        if (first == 39 && last == 39) {
-            return raw.Substring(start + 1, len - 2);
+        if (first == 39) {
+            if (last == 39) {
+                return raw.Substring(start + 1, len - 2);
+            }
+            int close = NativeMemory.Find(rp, start + 1, 39, end - (start + 1));
+            if (close >= 0 && EnvFileConfigurationProvider.IsTrailingCommentOrWs(raw, close + 1, end)) {
+                return raw.Substring(start + 1, close - (start + 1));
+            }
         }
         return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, rp, start, end);
     }

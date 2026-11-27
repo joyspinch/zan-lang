@@ -132,12 +132,25 @@ public class Tensor {
         return offset;
     }
 
+    // 按最多 536870911 float（2147483644 字节）分块拷贝，规避 NativeMemory.Copy 32 位字节数溢出。
+    private static void CopyFloats(nint dst, nint src, int count) {
+        int maxChunk = 536870911;
+        long done = 0L;
+        int rem = count;
+        while (rem > 0) {
+            int take = rem > maxChunk ? maxChunk : rem;
+            NativeMemory.Copy(dst + (nint)(done * 4L), src + (nint)(done * 4L), take * 4);
+            done = done + (long)take;
+            rem = rem - take;
+        }
+    }
+
     // 深拷贝（整块 memcpy，零逐元素循环）。
     public Tensor Clone() {
         int n = this.data.Length;
         float[] buf = new float[n];
         if (n > 0) {
-            NativeMemory.Copy((nint)buf, (nint)this.data, (nint)((long)n * 4L));
+            Tensor.CopyFloats((nint)buf, (nint)this.data, n);
         }
         return new Tensor(this.Shape(), buf);
     }
@@ -191,20 +204,37 @@ public class Tensor {
         if (start < 0 || len < 0 || start > dim || len > dim - start) {
             throw new ArgumentException("Tensor.Slice: range res of bounds");
         }
-        int outer = 1;
-        for (int i = 0; i < axis; i = i + 1) { outer = outer * this.shape[i]; }
-        int inner = 1;
-        for (int i = axis + 1; i < this.shape.Count; i = i + 1) { inner = inner * this.shape[i]; }
-        long outTotal = (long)outer * (long)len * (long)inner;
+        long outerL = 1L;
+        for (int i = 0; i < axis; i = i + 1) {
+            int d = this.shape[i];
+            if (d > 0 && outerL > 2147483647L / (long)d) {
+                throw new ArgumentException("Tensor.Slice: outer size overflow");
+            }
+            outerL = outerL * (long)d;
+        }
+        long innerL = 1L;
+        for (int i = axis + 1; i < this.shape.Count; i = i + 1) {
+            int d = this.shape[i];
+            if (d > 0 && innerL > 2147483647L / (long)d) {
+                throw new ArgumentException("Tensor.Slice: inner size overflow");
+            }
+            innerL = innerL * (long)d;
+        }
+        long chunkL = (long)len * innerL;
+        if (chunkL > 2147483647L) {
+            throw new ArgumentException("Tensor.Slice: chunk size overflow");
+        }
+        long outTotal = outerL * chunkL;
         if (outTotal > 2147483647L) {
             throw new ArgumentException("Tensor.Slice: output size overflow");
         }
+        int outer = (int)outerL;
+        int inner = (int)innerL;
         List<int> outShape = this.Shape();
         outShape[axis] = len;
         float[] res = new float[(int)outTotal];
-        int chunkElems = len * inner;
-        if (chunkElems > 0) {
-            nint chunkBytes = (nint)((long)chunkElems * 4L);
+        int chunkElems = (int)chunkL;
+        if (chunkElems > 0 && outer > 0) {
             long srcStride = (long)dim * (long)inner;
             long startOff = (long)start * (long)inner;
             nint srcPtr = (nint)this.data;
@@ -212,7 +242,7 @@ public class Tensor {
             for (int o = 0; o < outer; o = o + 1) {
                 long srcBase = (long)o * srcStride + startOff;
                 long dstBase = (long)o * (long)chunkElems;
-                NativeMemory.Copy(dstPtr + (nint)(dstBase * 4L), srcPtr + (nint)(srcBase * 4L), chunkBytes);
+                Tensor.CopyFloats(dstPtr + (nint)(dstBase * 4L), srcPtr + (nint)(srcBase * 4L), chunkElems);
             }
         }
         return new Tensor(outShape, res);

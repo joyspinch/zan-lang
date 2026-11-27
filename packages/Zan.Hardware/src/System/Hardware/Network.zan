@@ -89,29 +89,33 @@ public class Network {
         // 1) 优先探测默认路由出口（8.8.8.8 = 0x08080808）对应的物理/虚拟网卡
         nint idxPtr = NativeMemory.Alloc(4);
         nint row = NativeMemory.Alloc(860);
-        try {
-            new Span<int>(idxPtr, 1)[0] = 0;
-            if (Network.WinGetBestInterface(0x08080808, idxPtr) == 0) {
-                int bestIdx = new Span<int>(idxPtr, 1)[0];
-                // 清零 dwIndex 前后的接口名槽位并写入 dwIndex@512
-                for (int i = 0; i < 860; i = i + 4) {
-                    new Span<int>(row + i, 1)[0] = 0;
+        if (idxPtr != 0 && row != 0) {
+            try {
+                new Span<int>(idxPtr, 1)[0] = 0;
+                if (Network.WinGetBestInterface(0x08080808, idxPtr) == 0) {
+                    int bestIdx = new Span<int>(idxPtr, 1)[0];
+                    // 清零 dwIndex 前后的接口名槽位并写入 dwIndex@512
+                    NativeMemory.Fill(row, 0, 860);
+                    new Span<int>(row + 512, 1)[0] = bestIdx;
+                    if (Network.WinGetIfEntry(row) == 0) {
+                        int ifType = new Span<int>(row + 516, 1)[0];
+                        int oper = new Span<int>(row + 544, 1)[0];
+                        NetworkType best = Network.ClassifyWinIf(ifType, oper);
+                        if (best != NetworkType.None) { return best; }
+                    }
                 }
-                new Span<int>(row + 512, 1)[0] = bestIdx;
-                if (Network.WinGetIfEntry(row) == 0) {
-                    int ifType = new Span<int>(row + 516, 1)[0];
-                    int oper = new Span<int>(row + 544, 1)[0];
-                    NetworkType best = Network.ClassifyWinIf(ifType, oper);
-                    if (best != NetworkType.None) { return best; }
-                }
+            } finally {
+                NativeMemory.Free(idxPtr);
+                NativeMemory.Free(row);
             }
-        } finally {
-            NativeMemory.Free(idxPtr);
-            NativeMemory.Free(row);
+        } else {
+            if (idxPtr != 0) { NativeMemory.Free(idxPtr); }
+            if (row != 0) { NativeMemory.Free(row); }
         }
 
         // 2) 无默认公网路由时（如纯内网服务器），回退扫描 GetIfTable 中处于 Operational 的非回环有 MAC 网卡
         nint sizePtr = NativeMemory.Alloc(4);
+        if (sizePtr == 0) { return NetworkType.Unknown; }
         try {
             new Span<int>(sizePtr, 1)[0] = 0;
             int rc0 = Network.WinGetIfTable(0, sizePtr, 0);
@@ -119,28 +123,39 @@ public class Network {
             if (needed <= 4) {
                 return rc0 == 0 ? NetworkType.None : NetworkType.Unknown;
             }
-            nint tbl = NativeMemory.Alloc((long)needed);
-            try {
-                if (Network.WinGetIfTable(tbl, sizePtr, 0) != 0) {
-                    return NetworkType.Unknown;
+            for (int attempt = 0; attempt < 3; attempt = attempt + 1) {
+                if (needed <= 4) { return NetworkType.Unknown; }
+                nint tbl = NativeMemory.Alloc((long)needed);
+                if (tbl == 0) { return NetworkType.Unknown; }
+                try {
+                    new Span<int>(sizePtr, 1)[0] = needed;
+                    int rc = Network.WinGetIfTable(tbl, sizePtr, 0);
+                    if (rc == 122) {
+                        needed = new Span<int>(sizePtr, 1)[0];
+                        continue;
+                    }
+                    if (rc != 0) {
+                        return NetworkType.Unknown;
+                    }
+                    int count = new Span<int>(tbl, 1)[0];
+                    bool sawEthernet = false;
+                    for (int i = 0; i < count; i = i + 1) {
+                        long baseOff = 4L + (long)i * 860L;
+                        if (baseOff + 860L > (long)needed) { break; }
+                        int ifType = new Span<int>(tbl + (nint)(baseOff + 516L), 1)[0];
+                        int physLen = new Span<int>(tbl + (nint)(baseOff + 528L), 1)[0];
+                        int oper = new Span<int>(tbl + (nint)(baseOff + 544L), 1)[0];
+                        if (physLen <= 0 || oper != 5) { continue; }
+                        if (ifType == 71) { return NetworkType.Wifi; }
+                        if (ifType == 6) { sawEthernet = true; }
+                    }
+                    if (sawEthernet) { return NetworkType.Ethernet; }
+                    return NetworkType.None;
+                } finally {
+                    NativeMemory.Free(tbl);
                 }
-                int count = new Span<int>(tbl, 1)[0];
-                bool sawEthernet = false;
-                for (int i = 0; i < count; i = i + 1) {
-                    long baseOff = 4L + (long)i * 860L;
-                    if (baseOff + 860L > (long)needed) { break; }
-                    int ifType = new Span<int>(tbl + (nint)(baseOff + 516L), 1)[0];
-                    int physLen = new Span<int>(tbl + (nint)(baseOff + 528L), 1)[0];
-                    int oper = new Span<int>(tbl + (nint)(baseOff + 544L), 1)[0];
-                    if (physLen <= 0 || oper != 5) { continue; }
-                    if (ifType == 71) { return NetworkType.Wifi; }
-                    if (ifType == 6) { sawEthernet = true; }
-                }
-                if (sawEthernet) { return NetworkType.Ethernet; }
-                return NetworkType.None;
-            } finally {
-                NativeMemory.Free(tbl);
             }
+            return NetworkType.Unknown;
         } finally {
             NativeMemory.Free(sizePtr);
         }

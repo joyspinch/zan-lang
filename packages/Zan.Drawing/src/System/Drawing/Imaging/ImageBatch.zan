@@ -110,6 +110,7 @@ public class ImageBatch {
         result.Total = total;
         if (total == 0) return result;
 
+        string[] outPaths = ImageBatch.BuildOutputPaths(files, options);
         ImageBatchItemResult[] slots = new ImageBatchItemResult[total];
         int workers = options.Concurrency;
         if (workers < 1) workers = 1;
@@ -118,42 +119,57 @@ public class ImageBatch {
 
         if (workers == 1) {
             for (int i = 0; i < total; i = i + 1) {
-                ImageBatchItemResult item = ImageBatch.ProcessOne(files[i], options);
+                ImageBatchItemResult item = ImageBatch.ProcessOne(files[i], outPaths[i], options);
                 slots[i] = item;
                 if (options.OnProgress != null) {
-                    options.OnProgress(i + 1, total, item.InputPath, item.Succeeded);
+                    try {
+                        options.OnProgress(i + 1, total, item.InputPath, item.Succeeded);
+                    } catch (Exception) {
+                        // 进度回调异常不影响批处理继续执行
+                    }
                 }
             }
         } else {
             nint nextIdx = AtomicInt.NativeCreate(0);
             nint doneCount = AtomicInt.NativeCreate(0);
-            nint activeWorkers = AtomicInt.NativeCreate(workers);
+            nint activeWorkers = AtomicInt.NativeCreate(0);
             try {
                 for (int w = 0; w < workers; w = w + 1) {
-                    bool started = Thread.Start(() => {
-                        try {
-                            while (true) {
-                                int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
-                                if (idx >= total) break;
-                                ImageBatchItemResult item = ImageBatch.ProcessOne(files[idx], options);
-                                slots[idx] = item;
-                                int done = (int)AtomicInt.NativeAdd(doneCount, 1);
-                                if (options.OnProgress != null) {
-                                    options.OnProgress(done, total, item.InputPath, item.Succeeded);
+                    AtomicInt.NativeAdd(activeWorkers, 1);
+                    bool started = false;
+                    try {
+                        started = Thread.Start(() => {
+                            try {
+                                while (true) {
+                                    int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
+                                    if (idx >= total) break;
+                                    ImageBatchItemResult item = ImageBatch.ProcessOne(files[idx], outPaths[idx], options);
+                                    slots[idx] = item;
+                                    int done = (int)AtomicInt.NativeAdd(doneCount, 1);
+                                    if (options.OnProgress != null) {
+                                        try {
+                                            options.OnProgress(done, total, item.InputPath, item.Succeeded);
+                                        } catch (Exception) {
+                                            // 进度回调异常不终止当前工作线程
+                                        }
+                                    }
                                 }
+                            } finally {
+                                AtomicInt.NativeAdd(activeWorkers, -1);
                             }
-                        } finally {
-                            AtomicInt.NativeAdd(activeWorkers, -1);
-                        }
-                    });
+                        });
+                    } catch (Exception) {
+                        started = false;
+                    }
                     if (!started) {
                         AtomicInt.NativeAdd(activeWorkers, -1);
                     }
                 }
+            } finally {
+                // 等待全部已启动工作线程退出后再销毁原生原子句柄，杜绝 UAF
                 while (AtomicInt.NativeLoad(activeWorkers) > 0) {
                     Thread.Sleep(2);
                 }
-            } finally {
                 AtomicInt.NativeDestroy(nextIdx);
                 AtomicInt.NativeDestroy(doneCount);
                 AtomicInt.NativeDestroy(activeWorkers);
@@ -174,20 +190,60 @@ public class ImageBatch {
         return result;
     }
 
-    private static ImageBatchItemResult ProcessOne(string inputPath, ImageBatchOptions opt) {
+    private static string[] BuildOutputPaths(List<string> files, ImageBatchOptions opt) {
+        int n = files.Count;
+        string[] paths = new string[n];
+        string ext = ImageBatch.ExtensionForFormat(opt.OutputFormat);
+        HashSet<string> used = new HashSet<string>();
+        string baseDir = opt.InputDirectory != null ? opt.InputDirectory : "";
+        while (baseDir.Length > 0 && (baseDir[baseDir.Length - 1] == '/' || baseDir[baseDir.Length - 1] == '\\')) {
+            baseDir = baseDir.Substring(0, baseDir.Length - 1);
+        }
+
+        for (int i = 0; i < n; i = i + 1) {
+            string inputPath = files[i];
+            string stem = Path.GetFileNameWithoutExtension(inputPath);
+            string targetDir = opt.OutputDirectory;
+            if (opt.Recursive && baseDir.Length > 0 && inputPath.Length > baseDir.Length
+                && inputPath.StartsWith(baseDir)) {
+                char sep = inputPath[baseDir.Length];
+                if (sep == '/' || sep == '\\') {
+                    string rel = inputPath.Substring(baseDir.Length + 1);
+                    string relDir = Path.GetDirectoryName(rel);
+                    if (relDir != null && relDir != "" && relDir != ".") {
+                        targetDir = Path.Combine(opt.OutputDirectory, relDir);
+                        Directory.CreateDirectoryRecursive(targetDir);
+                    }
+                }
+            }
+            string candidate = Path.Combine(targetDir, stem + ext);
+            string key = candidate.ToLower();
+            if (!used.Add(key)) {
+                int suffix = 2;
+                while (true) {
+                    candidate = Path.Combine(targetDir, stem + "_" + suffix.ToString() + ext);
+                    key = candidate.ToLower();
+                    if (used.Add(key)) { break; }
+                    suffix = suffix + 1;
+                }
+            }
+            paths[i] = candidate;
+        }
+        return paths;
+    }
+
+    private static ImageBatchItemResult ProcessOne(string inputPath, string outputPath, ImageBatchOptions opt) {
         ImageBatchItemResult res = new ImageBatchItemResult();
         res.InputPath = inputPath;
-        string stem = Path.GetFileNameWithoutExtension(inputPath);
-        string ext = ImageBatch.ExtensionForFormat(opt.OutputFormat);
-        res.OutputPath = Path.Combine(opt.OutputDirectory, stem + ext);
+        res.OutputPath = outputPath;
 
-        ImageBuffer cur = ImageBuffer.FromFile(inputPath);
-        if (cur.IsEmpty) {
-            cur.Dispose();
-            res.Error = "decode failed";
-            return res;
-        }
+        ImageBuffer cur = null;
         try {
+            cur = ImageBuffer.FromFile(inputPath);
+            if (cur == null || cur.IsEmpty) {
+                res.Error = "decode failed";
+                return res;
+            }
             if (opt.RotateDegrees == 90 || opt.RotateDegrees == 180 || opt.RotateDegrees == 270) {
                 ImageBuffer rot = opt.RotateDegrees == 90 ? cur.Rotate90()
                     : (opt.RotateDegrees == 180 ? cur.Rotate180() : cur.Rotate270());
@@ -249,8 +305,14 @@ public class ImageBatch {
             }
             res.Succeeded = true;
             return res;
+        } catch (Exception ex) {
+            res.Succeeded = false;
+            res.Error = ex.Message != null && ex.Message != "" ? ex.Message : "processing failed";
+            return res;
         } finally {
-            cur.Dispose();
+            if (cur != null) {
+                cur.Dispose();
+            }
         }
     }
 }
