@@ -51,6 +51,8 @@ public class Lua {
     public static nint addr_yieldk;
     public static nint addr_status;
     public static nint addr_gc;
+    public static nint addr_xmove;
+    private static nint resumeResBuf;
 
     public static int LUA_OK = 0;
     public static int LUA_YIELD = 1;
@@ -105,6 +107,10 @@ public class Lua {
         }
         Lua.state = 0;
         Lua.initialized = false;
+        if (Lua.resumeResBuf != 0) {
+            NativeMemory.Free(Lua.resumeResBuf);
+            Lua.resumeResBuf = 0;
+        }
         Lua.FreeModule();
     }
 
@@ -213,14 +219,20 @@ public class Lua {
         nresults = 0;
         if (Lua.addr_resume == 0 || co == 0) { return Lua.LUA_ERRRUN; }
         LuaResumeFn f = (LuaResumeFn)Lua.addr_resume;
-        nint resBuf = NativeMemory.Alloc(4);
+        nint resBuf = Lua.resumeResBuf;
+        Lua.resumeResBuf = 0;
+        if (resBuf == 0) { resBuf = NativeMemory.Alloc(4); }
         try {
             int rc = f(co, Lua.state, nargs, resBuf);
             Span<byte> s = new Span<byte>(resBuf, 4);
             nresults = (int)s[0] | ((int)s[1] << 8) | ((int)s[2] << 16) | ((int)s[3] << 24);
             return rc;
         } finally {
-            NativeMemory.Free(resBuf);
+            if (Lua.resumeResBuf == 0) {
+                Lua.resumeResBuf = resBuf;
+            } else {
+                NativeMemory.Free(resBuf);
+            }
         }
     }
 
@@ -538,26 +550,42 @@ public class Lua {
     }
 
     public static void PushPath(string name, int mark) {
-        List<string> parts = name.Split(".");
+        if (name == null || name.Length == 0) {
+            Lua.SetTop(mark);
+            throw new InvalidOperationException("Lua 找不到函数: " + (name == null ? "" : name));
+        }
         LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
-        int t = g(Lua.state, parts[0]);
+        int dot = name.IndexOf(".");
+        if (dot < 0) {
+            int t0 = g(Lua.state, name);
+            if (t0 != Lua.TFUNCTION) {
+                Lua.SetTop(mark);
+                throw new InvalidOperationException("Lua 找不到函数: " + name);
+            }
+            return;
+        }
+        int t = g(Lua.state, name.Substring(0, dot));
         LuaGetFieldFn gf = (LuaGetFieldFn)Lua.addr_getfield;
-        for (int i = 1; i < parts.Count; i = i + 1) {
+        int pos = dot + 1;
+        int n = name.Length;
+        while (pos <= n) {
             if (t != Lua.TTABLE) {
                 Lua.SetTop(mark);
                 throw new InvalidOperationException("Lua 找不到函数: " + name);
             }
-            t = gf(Lua.state, 0 - 1, parts[i]);
+            int nextDot = name.IndexOf(".", pos);
+            string seg = nextDot < 0 ? name.Substring(pos, n - pos) : name.Substring(pos, nextDot - pos);
+            t = gf(Lua.state, 0 - 1, seg);
+            if (nextDot < 0) { break; }
+            pos = nextDot + 1;
         }
         if (t != Lua.TFUNCTION) {
             Lua.SetTop(mark);
             throw new InvalidOperationException("Lua 找不到函数: " + name);
         }
-        if (parts.Count > 1) {
-            LuaValue fnv = LuaValue.CaptureTop();
-            Lua.SetTop(mark);
-            fnv.Push();
-        }
+        LuaValue fnv = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        fnv.Push();
     }
 
     public static bool TryResolve() {
@@ -629,6 +657,7 @@ public class Lua {
         Lua.addr_yieldk = Interop.Symbol(Lua.mod, "lua_yieldk");
         Lua.addr_status = Interop.Symbol(Lua.mod, "lua_status");
         Lua.addr_gc = Interop.Symbol(Lua.mod, "lua_gc");
+        Lua.addr_xmove = Interop.Symbol(Lua.mod, "lua_xmove");
         if (Lua.addr_geti == 0) { Lua.addr_geti = Lua.addr_rawgeti; }
         if (Lua.addr_seti == 0) { Lua.addr_seti = Lua.addr_rawseti; }
         return Lua.addr_newstate != 0 && Lua.addr_openlibs != 0
@@ -679,6 +708,7 @@ public class Lua {
         Lua.addr_yieldk = 0;
         Lua.addr_status = 0;
         Lua.addr_gc = 0;
+        Lua.addr_xmove = 0;
     }
 
     public static long StoreTop() {

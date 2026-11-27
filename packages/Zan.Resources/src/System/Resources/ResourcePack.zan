@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 namespace System.Resources;
@@ -13,6 +14,7 @@ public class ResourcePack {
     public byte[] packId;
     public int count;
     public List<PackIndexEntry> index;
+    private Dictionary<string, int> indexMap;
 
     // ---- 共享辅助（writer 同样使用）----
 
@@ -98,22 +100,20 @@ public class ResourcePack {
         int fsz = File.GetSize(path);
         if (fsz < 57) { return null; }
         byte[] hdr = File.ReadBytes(path, 0, 57);
-        if (!checkMagic(hdr)) { return null; }
+        if (hdr == null || hdr.Length < 57 || !checkMagic(hdr)) { return null; }
         int idxLen = loadBE32(hdr, 49);
         int sigLen = loadBE32(hdr, 53);
-        if (idxLen < 4 || 57 + idxLen + sigLen > fsz) { return null; }
+        if (idxLen < 4 || sigLen < 0 || 57L + (long)idxLen + (long)sigLen > (long)fsz) { return null; }
 
         byte[] packId = new byte[17];
         byte[] idxIv = new byte[13];
         byte[] idxTag = new byte[17];
-        int i = 0;
-        for (; i < 16; i = i + 1) { packId[i] = hdr[5 + i]; }
-        i = 0;
-        while (i < 12) { idxIv[i] = hdr[21 + i]; i = i + 1; }
-        i = 0;
-        while (i < 16) { idxTag[i] = hdr[33 + i]; i = i + 1; }
+        for (int i = 0; i < 16; i = i + 1) { packId[i] = hdr[5 + i]; }
+        for (int i = 0; i < 12; i = i + 1) { idxIv[i] = hdr[21 + i]; }
+        for (int i = 0; i < 16; i = i + 1) { idxTag[i] = hdr[33 + i]; }
 
         byte[] idxCt = File.ReadBytes(path, 57, idxLen);
+        if (idxCt == null || idxCt.Length < idxLen) { return null; }
         byte[] ik = indexKey(masterKey, packId);
         List<int> ok = new List<int>(); ok.Add(0);
         byte[] idx = AesGcm.Decrypt(ik, 32, idxIv, hdr, 21, idxCt, idxLen, idxTag, ok);
@@ -126,9 +126,11 @@ public class ResourcePack {
             bool sigOk = false;
             if (sigLen > 0) {
                 byte[] sig = File.ReadBytes(path, 57 + idxLen, sigLen);
-                byte[] nBuf = Hex.Decode(nHex);
-                byte[] eBuf = Hex.Decode(eHex);
-                sigOk = Rsa.VerifyPkcs1Sha256(idx, idxLen, sig, nBuf, nHex.Length / 2, eBuf, eHex.Length / 2);
+                if (sig != null && sig.Length >= sigLen) {
+                    byte[] nBuf = Hex.Decode(nHex);
+                    byte[] eBuf = Hex.Decode(eHex);
+                    sigOk = Rsa.VerifyPkcs1Sha256(idx, idxLen, sig, nBuf, nHex.Length / 2, eBuf, eHex.Length / 2);
+                }
             }
             if (!sigOk) {
                 err[0] = 3;
@@ -136,26 +138,37 @@ public class ResourcePack {
             }
         }
 
+        int cnt = loadBE32(idx, 0);
+        if (cnt < 0 || 4L + 61L * (long)cnt > (long)idxLen) {
+            err[0] = 2;
+            return null;
+        }
         ResourcePack p = new ResourcePack();
         p.path = path;
         p.masterKey = masterKey;
         p.packId = packId;
-        p.count = loadBE32(idx, 0);
+        p.count = cnt;
         p.index = new List<PackIndexEntry>();
-        i = 0;
-        while (i < p.count) {
+        p.indexMap = new Dictionary<string, int>();
+        for (int i = 0; i < p.count; i = i + 1) {
             int rec = 4 + 61 * i;
+            int off = loadBE64(idx, rec + 16);
+            int sz = loadBE64(idx, rec + 24);
+            if (off < 0 || sz < 0 || (long)off + (long)sz > (long)fsz) {
+                err[0] = 2;
+                return null;
+            }
             byte[] nh = new byte[17];
             byte[] iv = new byte[13];
             byte[] tg = new byte[17];
-            int j = 0;
-            for (; j < 16; j = j + 1) { nh[j] = idx[rec + j]; }
-            j = 0;
-            while (j < 12) { iv[j] = idx[rec + 33 + j]; j = j + 1; }
-            j = 0;
-            while (j < 16) { tg[j] = idx[rec + 45 + j]; j = j + 1; }
-            p.index.Add(new PackIndexEntry(nh, loadBE64(idx, rec + 16), loadBE64(idx, rec + 24), iv, tg));
-            i = i + 1;
+            for (int j = 0; j < 16; j = j + 1) { nh[j] = idx[rec + j]; }
+            for (int j = 0; j < 12; j = j + 1) { iv[j] = idx[rec + 33 + j]; }
+            for (int j = 0; j < 16; j = j + 1) { tg[j] = idx[rec + 45 + j]; }
+            p.index.Add(new PackIndexEntry(nh, off, sz, iv, tg));
+            string hk = Hex.Encode(nh, 16);
+            if (!p.indexMap.ContainsKey(hk)) {
+                p.indexMap.Add(hk, i);
+            }
         }
         err[0] = 0;
         return p;
@@ -164,9 +177,19 @@ public class ResourcePack {
     // 返回 pack 内条目数。
     public int Count() { return this.count; }
 
-    // 按名称哈希查找条目下标（逐字节累积比较），未找到返回 -1。
-    public int find(string name) {
+    // 按名称哈希 O(1) 查找条目下标（命中后再逐字节比对 16 字节哈希），未找到返回 -1。
+    private int FindIndex(string name) {
         byte[] nh = nameHash(name);
+        if (this.indexMap != null) {
+            int idx;
+            if (this.indexMap.TryGetValue(Hex.Encode(nh, 16), out idx)) {
+                byte[] h = this.index[idx].hash;
+                int diff = 0;
+                for (int j = 0; j < 16; j = j + 1) { diff = diff | ((h[j] & 255) ^ (nh[j] & 255)); }
+                if (diff == 0) { return idx; }
+            }
+            return -1;
+        }
         for (int i = 0; i < this.count; i = i + 1) {
             byte[] h = this.index[i].hash;
             int diff = 0;
@@ -177,11 +200,11 @@ public class ResourcePack {
     }
 
     // 名称是否存在于 pack。
-    public bool Contains(string name) { return this.find(name) >= 0; }
+    public bool Contains(string name) { return this.FindIndex(name) >= 0; }
 
     // 返回条目负载的字节数；名称未知返回 -1。
     public int SizeOf(string name) {
-        int i = this.find(name);
+        int i = this.FindIndex(name);
         if (i < 0) { return -1; }
         return this.index[i].size;
     }
@@ -192,11 +215,12 @@ public class ResourcePack {
     // 则返回 null（outLen 为 -1）。
     public byte[] Read(string name, List<int> outLen) {
         outLen[0] = -1;
-        int i = this.find(name);
+        int i = this.FindIndex(name);
         if (i < 0) { return null; }
         PackIndexEntry e = this.index[i];
         int sz = e.size;
         byte[] ct = File.ReadBytes(this.path, e.off, sz);
+        if (ct == null || ct.Length < sz) { return null; }
         byte[] ek = entryKey(this.masterKey, this.packId, e.hash);
         List<int> ok = new List<int>(); ok.Add(0);
         byte[] pt = AesGcm.Decrypt(ek, 32, e.iv, e.hash, 16, ct, sz, e.tag, ok);

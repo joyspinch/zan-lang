@@ -324,11 +324,12 @@ public class TensorMath {
     // RMSNorm：沿最后一维 x / sqrt(mean(x²) + eps) * weight（weight 可为 null）。
     public static Tensor RMSNorm(Tensor x, float eps, Tensor weight) {
         int last = x.Dim(x.Rank() - 1);
-        int rows = x.Count() / (last > 0 ? last : 1);
         TensorMath.RequireLastDimMatch("RMSNorm", "weight", weight, last);
         float[] xd = x.data;
-        float[] wd = weight != null ? weight.data : null;
         float[] res = new float[xd.Length];
+        if (last <= 0 || xd.Length == 0) { return new Tensor(x.Shape(), res); }
+        int rows = xd.Length / last;
+        float[] wd = weight != null ? weight.data : null;
         float invLast = 1.0f / (float)last;
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;
@@ -354,13 +355,14 @@ public class TensorMath {
     // LayerNorm：沿最后一维减均值除标准差，weight/bias 可为 null。
     public static Tensor LayerNorm(Tensor x, float eps, Tensor weight, Tensor bias) {
         int last = x.Dim(x.Rank() - 1);
-        int rows = x.Count() / (last > 0 ? last : 1);
         TensorMath.RequireLastDimMatch("LayerNorm", "weight", weight, last);
         TensorMath.RequireLastDimMatch("LayerNorm", "bias", bias, last);
         float[] xd = x.data;
+        float[] res = new float[xd.Length];
+        if (last <= 0 || xd.Length == 0) { return new Tensor(x.Shape(), res); }
+        int rows = xd.Length / last;
         float[] wd = weight != null ? weight.data : null;
         float[] bd = bias != null ? bias.data : null;
-        float[] res = new float[xd.Length];
         float invLast = 1.0f / (float)last;
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;
@@ -505,32 +507,75 @@ public class TensorMath {
         return best;
     }
 
-    // 前 k 大的下标（按值从大到小；同值按原下标升序）。
+    // 堆序比较：在 TopK 小顶堆中，值更小或（同值且下标更大）的元素优先级更低、居于堆顶以便被替换。
+    private static bool TopKWorse(float va, int ia, float vb, int ib) {
+        return va < vb || (va == vb && ia > ib);
+    }
+
+    private static void TopKSiftDown(float[] hVal, int[] hIdx, int size, int pos) {
+        float v = hVal[pos];
+        int id = hIdx[pos];
+        int half = size >> 1;
+        while (pos < half) {
+            int left = (pos << 1) + 1;
+            int right = left + 1;
+            int worst = left;
+            if (right < size && TensorMath.TopKWorse(hVal[right], hIdx[right], hVal[left], hIdx[left])) {
+                worst = right;
+            }
+            if (!TensorMath.TopKWorse(hVal[worst], hIdx[worst], v, id)) {
+                break;
+            }
+            hVal[pos] = hVal[worst];
+            hIdx[pos] = hIdx[worst];
+            pos = worst;
+        }
+        hVal[pos] = v;
+        hIdx[pos] = id;
+    }
+
+    // 前 k 大的下标（按值从大到小；同值按原下标升序；O(n log k) 小顶堆，O(k) 额外空间）。
     public static List<int> TopK(Tensor x, int k) {
         float[] xd = x.data;
         int n = xd.Length;
-        if (k < 0) { k = 0; }
+        if (k <= 0 || n == 0) { return new List<int>(); }
         if (k > n) { k = n; }
-        int[] idx = new int[n];
-        for (int i = 0; i < n; i = i + 1) { idx[i] = i; }
-        // 选择排序：k 很小（采样用），代价可忽略。
+        if (k == 1) {
+            List<int> single = new List<int>();
+            single.Add(TensorMath.ArgMax(x));
+            return single;
+        }
+        float[] hVal = new float[k];
+        int[] hIdx = new int[k];
         for (int i = 0; i < k; i = i + 1) {
-            int best = i;
-            float bestVal = xd[idx[i]];
-            for (int j = i + 1; j < n; j = j + 1) {
-                float v = xd[idx[j]];
-                if (v > bestVal) {
-                    bestVal = v;
-                    best = j;
-                }
+            hVal[i] = xd[i];
+            hIdx[i] = i;
+        }
+        for (int i = (k >> 1) - 1; i >= 0; i = i - 1) {
+            TensorMath.TopKSiftDown(hVal, hIdx, k, i);
+        }
+        for (int i = k; i < n; i = i + 1) {
+            float v = xd[i];
+            if (TensorMath.TopKWorse(hVal[0], hIdx[0], v, i)) {
+                hVal[0] = v;
+                hIdx[0] = i;
+                TensorMath.TopKSiftDown(hVal, hIdx, k, 0);
             }
-            int tmp = idx[i];
-            idx[i] = idx[best];
-            idx[best] = tmp;
+        }
+        int[] sorted = new int[k];
+        int rem = k;
+        for (int i = k - 1; i >= 0; i = i - 1) {
+            sorted[i] = hIdx[0];
+            rem = rem - 1;
+            if (rem > 0) {
+                hVal[0] = hVal[rem];
+                hIdx[0] = hIdx[rem];
+                TensorMath.TopKSiftDown(hVal, hIdx, rem, 0);
+            }
         }
         List<int> res = new List<int>();
         res.Reserve(k);
-        for (int i = 0; i < k; i = i + 1) { res.Add(idx[i]); }
+        for (int i = 0; i < k; i = i + 1) { res.Add(sorted[i]); }
         return res;
     }
 

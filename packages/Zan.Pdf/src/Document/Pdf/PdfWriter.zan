@@ -268,66 +268,102 @@ public static class PdfWriter {
         PdfWriter.WriteEscapedTextSlice(buf, text, 0, text.Length);
     }
 
-    // 直写切片 [start, end) 的转义 PDF 字面量字节流（零 Substring 分配）。
+    // 直写切片 [start, end) 的转义 PDF 字面量字节流（按 UTF-8 码点解码，支持 ASCII 与 Latin-1 U+00A0..U+00FF）。
     private static void WriteEscapedTextSlice(PdfBuffer buf, string text, int start, int end) {
-        for (int i = start; i < end; i = i + 1) {
-            int c = text[i];
-            if (c == 92) {
-                buf.Raw(92); buf.Raw(92);
-            } else if (c == 40) {
-                buf.Raw(92); buf.Raw(40);
-            } else if (c == 41) {
-                buf.Raw(92); buf.Raw(41);
-            } else if (c >= 32 && c <= 126) {
-                buf.Raw((byte)c);
-            } else if (c >= 160 && c <= 255) {
+        int i = start;
+        while (i < end) {
+            int b0 = text[i] & 255;
+            if (b0 < 128) {
+                if (b0 == 92) {
+                    buf.Raw(92); buf.Raw(92);
+                } else if (b0 == 40) {
+                    buf.Raw(92); buf.Raw(40);
+                } else if (b0 == 41) {
+                    buf.Raw(92); buf.Raw(41);
+                } else if (b0 >= 32 && b0 <= 126) {
+                    buf.Raw((byte)b0);
+                } else {
+                    throw new PdfException(PdfError.UnencodableCharacter,
+                        "PdfWriter: the character 0x" + b0.ToString() +
+                        " cannot be encoded with the standard 14 fonts");
+                }
+                i = i + 1;
+            } else if ((b0 == 194 || b0 == 195) && i + 1 < end) {
+                int b1 = text[i + 1] & 255;
+                if ((b1 & 192) != 128) {
+                    throw new PdfException(PdfError.UnencodableCharacter,
+                        "PdfWriter: invalid UTF-8 byte sequence");
+                }
+                int cp = ((b0 & 31) << 6) | (b1 & 63);
+                if (cp < 160 || cp > 255) {
+                    throw new PdfException(PdfError.UnencodableCharacter,
+                        "PdfWriter: the character 0x" + cp.ToString() +
+                        " cannot be encoded with the standard 14 fonts");
+                }
                 buf.Raw(92);
-                buf.Raw((byte)(48 + ((c >> 6) & 7)));
-                buf.Raw((byte)(48 + ((c >> 3) & 7)));
-                buf.Raw((byte)(48 + (c & 7)));
+                buf.Raw((byte)(48 + ((cp >> 6) & 7)));
+                buf.Raw((byte)(48 + ((cp >> 3) & 7)));
+                buf.Raw((byte)(48 + (cp & 7)));
+                i = i + 2;
             } else {
                 throw new PdfException(PdfError.UnencodableCharacter,
-                    "PdfWriter: the character 0x" + c.ToString() +
+                    "PdfWriter: the character 0x" + b0.ToString() +
                     " cannot be encoded with the standard 14 fonts");
             }
         }
     }
 
-    // 转义 PDF 字面量字符串里的特殊字符（公开兼容 API，底层用 StringBuilder 切片拷贝）。
+    // 转义 PDF 字面量字符串里的特殊字符（公开兼容 API，按 UTF-8 码点解码）。
     //
-    // `\`、`(`、`)` 必须转义；非 ASCII 走八进制转义（WinAnsi 的高位区）。
-    // 编码不出来的字符（控制字符、0x7F..0x9F）当场报错——写出去只会得到
-    // 一份显示成方框或直接打不开的文档。
+    // `\`、`(`、`)` 必须转义；Latin-1（U+00A0..U+00FF）走八进制转义（WinAnsi 高位区）。
+    // 编码不出来的字符（控制字符、U+007F..U+009F、> U+00FF）当场报错。
     public static string EscapeText(string text) {
         if (text == null) { return ""; }
         StringBuilder sb = new StringBuilder();
         int len = text.Length;
         int runStart = 0;
-        for (int i = 0; i < len; i = i + 1) {
-            int c = text[i];
-            if (c >= 32 && c <= 126 && c != 92 && c != 40 && c != 41) {
+        int i = 0;
+        while (i < len) {
+            int b0 = text[i] & 255;
+            if (b0 >= 32 && b0 <= 126 && b0 != 92 && b0 != 40 && b0 != 41) {
+                i = i + 1;
                 continue;
             }
             if (i > runStart) {
                 sb.Append(text.Substring(runStart, i - runStart));
             }
-            if (c == 92) {
+            if (b0 == 92) {
                 sb.Append("\\\\");
-            } else if (c == 40) {
+                i = i + 1;
+            } else if (b0 == 40) {
                 sb.Append("\\(");
-            } else if (c == 41) {
+                i = i + 1;
+            } else if (b0 == 41) {
                 sb.Append("\\)");
-            } else if (c >= 160 && c <= 255) {
+                i = i + 1;
+            } else if ((b0 == 194 || b0 == 195) && i + 1 < len) {
+                int b1 = text[i + 1] & 255;
+                if ((b1 & 192) != 128) {
+                    throw new PdfException(PdfError.UnencodableCharacter,
+                        "PdfWriter: invalid UTF-8 byte sequence");
+                }
+                int cp = ((b0 & 31) << 6) | (b1 & 63);
+                if (cp < 160 || cp > 255) {
+                    throw new PdfException(PdfError.UnencodableCharacter,
+                        "PdfWriter: the character 0x" + cp.ToString() +
+                        " cannot be encoded with the standard 14 fonts");
+                }
                 sb.Append("\\");
-                sb.Append((c >> 6) & 7);
-                sb.Append((c >> 3) & 7);
-                sb.Append(c & 7);
+                sb.Append((cp >> 6) & 7);
+                sb.Append((cp >> 3) & 7);
+                sb.Append(cp & 7);
+                i = i + 2;
             } else {
                 throw new PdfException(PdfError.UnencodableCharacter,
-                    "PdfWriter: the character 0x" + c.ToString() +
+                    "PdfWriter: the character 0x" + b0.ToString() +
                     " cannot be encoded with the standard 14 fonts");
             }
-            runStart = i + 1;
+            runStart = i;
         }
         if (runStart == 0) { return text; }
         if (runStart < len) {

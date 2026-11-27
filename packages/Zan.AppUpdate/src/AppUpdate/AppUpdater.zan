@@ -43,21 +43,21 @@ public class AppUpdater {
     public static bool ValidManifest(UpdateManifest manifest) {
         if (manifest == null || manifest.files == null || manifest.files.Count == 0 || manifest.files.Count > 10000) { return false; }
         if (manifest.packageSize <= 0 || manifest.packageSize > 268435456L || !IsHex(manifest.packageSha256, 64, 64)) { return false; }
-        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        HashSet<string> seen = new HashSet<string>();
         long total = 0;
         for (int i = 0; i < manifest.files.Count; i = i + 1) {
             UpdateFileEntry f = manifest.files[i];
             if (f == null || !UpdateFileEntry.SafeRelPath(f.path) || f.path != UpdateFileEntry.NormalizePath(f.path)) { return false; }
             if (f.size < 0 || f.size > 67108864L || !IsHex(f.sha256, 64, 64)) { return false; }
             string key = f.path.ToLower();
-            if (key == "_backup" || key.StartsWith("_backup/") || seen.ContainsKey(key)) { return false; }
+            if (key == "_backup" || key.StartsWith("_backup/") || seen.Contains(key)) { return false; }
             // Parent and child installations may share this tree: no payload may
             // replace another install's lock inode or transaction state.
             List<string> segments = key.Split("/");
             for (int k = 0; k < segments.Count; k = k + 1) {
                 if (segments[k] == "_appupdate" || segments[k] == "_appupdate.lock") { return false; }
             }
-            seen.Add(key, true);
+            seen.Add(key);
             total = total + f.size;
             if (total > 268435456L) { return false; }
         }
@@ -65,7 +65,7 @@ public class AppUpdater {
             string key = manifest.files[i].path.ToLower();
             int slash = key.IndexOf("/");
             while (slash >= 0) {
-                if (seen.ContainsKey(key.Substring(0, slash))) { return false; }
+                if (seen.Contains(key.Substring(0, slash))) { return false; }
                 slash = key.IndexOf("/", slash + 1);
             }
         }
@@ -160,15 +160,23 @@ public class AppUpdater {
         if (bytes == null || bytes.Length != manifest.packageSize || HashBytes(bytes) != manifest.packageSha256.ToLower()) { return null; }
         List<ZipEntry> entries = Zip.Read(bytes);
         if (entries == null || entries.Count != manifest.files.Count) { return null; }
-        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        Dictionary<string, UpdateFileEntry> fileMap = new Dictionary<string, UpdateFileEntry>();
+        for (int i = 0; i < manifest.files.Count; i = i + 1) {
+            UpdateFileEntry mf = manifest.files[i];
+            if (mf != null && mf.path != null && !fileMap.ContainsKey(mf.path)) {
+                fileMap.Add(mf.path, mf);
+            }
+        }
+        HashSet<string> seen = new HashSet<string>();
         for (int i = 0; i < entries.Count; i = i + 1) {
             ZipEntry e = entries[i];
             if (e == null || e.isDirectory || !UpdateFileEntry.SafeRelPath(e.name)) { return null; }
             string rel = UpdateFileEntry.NormalizePath(e.name);
             string key = rel.ToLower();
-            if (seen.ContainsKey(key)) { return null; }
-            seen.Add(key, true);
-            UpdateFileEntry f = manifest.FindFile(rel);
+            if (seen.Contains(key)) { return null; }
+            seen.Add(key);
+            UpdateFileEntry f = null;
+            if (!fileMap.TryGetValue(rel, out f)) { f = manifest.FindFile(rel); }
             if (f == null || f.size != e.uncompressedSize || e.compressedSize < 0 || e.compressedSize > 268435456) { return null; }
             if (e.method != 0 && e.method != 8) { return null; }
             // Disallow Zip.Extract's scan fallback and local/central size disagreement.

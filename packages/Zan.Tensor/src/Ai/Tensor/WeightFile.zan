@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Interop;
 
 namespace Ai.Tensor;
 
@@ -37,9 +38,21 @@ public class WeightFile {
 
     private byte[] file;
     private long dataStart;
+    private Dictionary<string, WeightTensorInfo> tensorIndex;
 
     public static WeightFile Open(string path) {
         return Load(File.ReadAllBytes(path));
+    }
+
+    private void BuildIndex() {
+        Dictionary<string, WeightTensorInfo> idx = new Dictionary<string, WeightTensorInfo>();
+        for (int i = 0; i < this.tensors.Count; i = i + 1) {
+            WeightTensorInfo info = this.tensors[i];
+            if (!idx.ContainsKey(info.name)) {
+                idx[info.name] = info;
+            }
+        }
+        this.tensorIndex = idx;
     }
 
     // 从字节解析（测试与内存场景用；真实文件走 Open）。
@@ -58,6 +71,7 @@ public class WeightFile {
             w.metadataArrays = g.metadataArrays;
             w.tensors = g.tensors;
             w.dataStart = g.dataStart;
+            w.BuildIndex();
             return w;
         }
         // safetensors：8 字节小端头长 + JSON 头。JSON 头一定以 '{' 开头。
@@ -68,21 +82,32 @@ public class WeightFile {
             w.metadataArrays = s.metadataArrays;
             w.tensors = s.tensors;
             w.dataStart = s.dataStart;
+            w.BuildIndex();
             return w;
         }
         throw new Exception("unrecognized weight file format (not GGUF, not safetensors)");
     }
 
-    // 有没有这个张量。
+    // 有没有这个张量（O(1) 哈希查询）。
     public bool Has(string name) {
+        if (name == null) { return false; }
+        if (this.tensorIndex != null) {
+            return this.tensorIndex.ContainsKey(name);
+        }
         for (int i = 0; i < this.tensors.Count; i = i + 1) {
             if (this.tensors[i].name == name) { return true; }
         }
         return false;
     }
 
-    // 张量目录（没有返回 null）。
+    // 张量目录（没有返回 null，O(1) 哈希查询）。
     public WeightTensorInfo Info(string name) {
+        if (name == null) { return null; }
+        if (this.tensorIndex != null) {
+            WeightTensorInfo found = null;
+            if (this.tensorIndex.TryGetValue(name, out found)) { return found; }
+            return null;
+        }
         for (int i = 0; i < this.tensors.Count; i = i + 1) {
             if (this.tensors[i].name == name) { return this.tensors[i]; }
         }
@@ -121,8 +146,14 @@ public class WeightFile {
         string dt = info.dtype;
 
         if (dt == "F32") {
-            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
-            for (int i = 0; i < n; i = i + 1) { out2[i] = r.F32(); }
+            long start = this.dataStart + info.offset;
+            long needBytes = (long)n * 4L;
+            if (start < 0 || info.byteLength < needBytes || start + needBytes > this.file.Length) {
+                throw new ArgumentException("weight tensor data out of file bounds");
+            }
+            if (n > 0) {
+                NativeMemory.Copy((nint)out2, (nint)this.file + (nint)start, (int)needBytes);
+            }
             return new Tensor(info.shape, out2);
         }
         if (dt == "F16") {
@@ -144,24 +175,48 @@ public class WeightFile {
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.F64(); }
             return new Tensor(info.shape, out2);
         }
-        if (dt == "I8" || dt == "U8" || dt == "BOOL") {
+        if (dt == "I8") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I8(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "U8" || dt == "BOOL") {
             BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.U8(); }
             return new Tensor(info.shape, out2);
         }
-        if (dt == "I16" || dt == "U16") {
+        if (dt == "I16") {
             BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I16(); }
             return new Tensor(info.shape, out2);
         }
-        if (dt == "I32" || dt == "U32") {
+        if (dt == "U16") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.U16(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I32") {
             BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I32(); }
             return new Tensor(info.shape, out2);
         }
-        if (dt == "I64" || dt == "U64") {
+        if (dt == "U32") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.U32(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I64") {
             BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I64(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "U64") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) {
+                long v = r.U64();
+                double dv = v >= 0L ? (double)v : (double)(v & 9223372036854775807L) + 9223372036854775808.0;
+                out2[i] = (float)dv;
+            }
             return new Tensor(info.shape, out2);
         }
         if (dt == "Q4_0" || dt == "Q4_1" || dt == "Q5_0" || dt == "Q5_1"
@@ -198,47 +253,68 @@ public class WeightFile {
         int n = (int)info.count;
         int blocks = n / 32;
         BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
-        for (int b = 0; b < blocks; b = b + 1) {
-            int base2 = b * 32;
-            if (dt == "Q8_0") {
+        if (dt == "Q8_0") {
+            for (int b = 0; b < blocks; b = b + 1) {
+                int base2 = b * 32;
                 float d = FloatBits.FromF16Bits(r.U16());
                 for (int i = 0; i < 32; i = i + 1) {
                     out2[base2 + i] = (float)r.I8() * d;
                 }
-                continue;
             }
-            float scale = FloatBits.FromF16Bits(r.U16());
-            float minv = 0.0f;
-            if (dt == "Q4_1" || dt == "Q5_1") {
-                minv = FloatBits.FromF16Bits(r.U16());
+            return;
+        }
+        if (dt == "Q4_0") {
+            for (int b = 0; b < blocks; b = b + 1) {
+                int base2 = b * 32;
+                float scale = FloatBits.FromF16Bits(r.U16());
+                for (int j = 0; j < 16; j = j + 1) {
+                    int qs = r.U8();
+                    out2[base2 + j] = (float)((qs & 15) - 8) * scale;
+                    out2[base2 + j + 16] = (float)(((qs >> 4) & 15) - 8) * scale;
+                }
             }
-            long mask = 0;
-            if (dt == "Q5_0" || dt == "Q5_1") {
-                mask = r.U32();
+            return;
+        }
+        if (dt == "Q4_1") {
+            for (int b = 0; b < blocks; b = b + 1) {
+                int base2 = b * 32;
+                float scale = FloatBits.FromF16Bits(r.U16());
+                float minv = FloatBits.FromF16Bits(r.U16());
+                for (int j = 0; j < 16; j = j + 1) {
+                    int qs = r.U8();
+                    out2[base2 + j] = (float)(qs & 15) * scale + minv;
+                    out2[base2 + j + 16] = (float)((qs >> 4) & 15) * scale + minv;
+                }
             }
-            for (int j = 0; j < 16; j = j + 1) {
-                int qs = r.U8();
-                int lo = qs & 15;
-                int hi = (qs >> 4) & 15;
-                if (dt == "Q4_0") {
-                    out2[base2 + j] = (float)(lo - 8) * scale;
-                    out2[base2 + j + 16] = (float)(hi - 8) * scale;
-                } else if (dt == "Q4_1") {
-                    out2[base2 + j] = (float)lo * scale + minv;
-                    out2[base2 + j + 16] = (float)hi * scale + minv;
-                } else {
+            return;
+        }
+        if (dt == "Q5_0") {
+            for (int b = 0; b < blocks; b = b + 1) {
+                int base2 = b * 32;
+                float scale = FloatBits.FromF16Bits(r.U16());
+                long mask = r.U32();
+                for (int j = 0; j < 16; j = j + 1) {
+                    int qs = r.U8();
                     int xh0 = (int)(((mask >> j) << 4) & 16);
                     int xh1 = (int)((mask >> (j + 12)) & 16);
-                    int q0 = (lo | xh0);
-                    int q1 = (hi | xh1);
-                    if (dt == "Q5_0") {
-                        out2[base2 + j] = (float)(q0 - 16) * scale;
-                        out2[base2 + j + 16] = (float)(q1 - 16) * scale;
-                    } else {
-                        out2[base2 + j] = (float)q0 * scale + minv;
-                        out2[base2 + j + 16] = (float)q1 * scale + minv;
-                    }
+                    out2[base2 + j] = (float)(((qs & 15) | xh0) - 16) * scale;
+                    out2[base2 + j + 16] = (float)((((qs >> 4) & 15) | xh1) - 16) * scale;
                 }
+            }
+            return;
+        }
+        // Q5_1
+        for (int b = 0; b < blocks; b = b + 1) {
+            int base2 = b * 32;
+            float scale = FloatBits.FromF16Bits(r.U16());
+            float minv = FloatBits.FromF16Bits(r.U16());
+            long mask = r.U32();
+            for (int j = 0; j < 16; j = j + 1) {
+                int qs = r.U8();
+                int xh0 = (int)(((mask >> j) << 4) & 16);
+                int xh1 = (int)((mask >> (j + 12)) & 16);
+                out2[base2 + j] = (float)((qs & 15) | xh0) * scale + minv;
+                out2[base2 + j + 16] = (float)(((qs >> 4) & 15) | xh1) * scale + minv;
             }
         }
     }

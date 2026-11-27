@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 
@@ -21,24 +22,25 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
         this.syncLock = Mutex.Create();
     }
 
-    // 占位符 ${VAR:-default} 解析
+    // 占位符 ${VAR:-default} 解析（StringView 零中间切片分配）
     public static string ResolvePlaceholders(string val) {
         if (val == null || val.IndexOf("${") < 0) {
             return val;
         }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(val.Length);
+        nint vp = (nint)val;
         int i = 0;
         int len = val.Length;
         while (i < len) {
             int start = val.IndexOf("${", i);
             if (start < 0) {
-                sb.Append(val.Substring(i, len - i));
+                sb.Append(new StringView(vp + (nint)i, len - i));
                 break;
             }
-            sb.Append(val.Substring(i, start - i));
+            if (start > i) { sb.Append(new StringView(vp + (nint)i, start - i)); }
             int end = val.IndexOf("}", start + 2);
             if (end < 0) {
-                sb.Append(val.Substring(start, len - start));
+                sb.Append(new StringView(vp + (nint)start, len - start));
                 break;
             }
             string expr = val.Substring(start + 2, end - start - 2);
@@ -120,14 +122,19 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     }
 
     public List<string> GetKeys() {
-        Dictionary<string, bool> keySet = new Dictionary<string, bool>();
+        HashSet<string> seen = new HashSet<string>();
+        List<string> result = new List<string>();
         for (int i = 0; i < this.providers.Count; i = i + 1) {
             List<string> pKeys = this.providers[i].GetKeys();
             for (int j = 0; j < pKeys.Count; j = j + 1) {
-                keySet[pKeys[j]] = true;
+                string k = pKeys[j];
+                if (!seen.Contains(k)) {
+                    seen.Add(k);
+                    result.Add(k);
+                }
             }
         }
-        return keySet.Keys;
+        return result;
     }
 
     public void Reload() {
@@ -135,11 +142,17 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
             this.providers[i].Load();
         }
         List<Action> snapshot = new List<Action>();
-        Mutex.Lock(this.syncLock);
-        for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
-            snapshot.Add(this.reloadCallbacks[i]);
+        nint lk = this.syncLock;
+        if (lk != 0) {
+            Mutex.Lock(lk);
+            try {
+                for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
+                    snapshot.Add(this.reloadCallbacks[i]);
+                }
+            } finally {
+                Mutex.Unlock(lk);
+            }
         }
-        Mutex.Unlock(this.syncLock);
 
         for (int i = 0; i < snapshot.Count; i = i + 1) {
             try {
@@ -152,15 +165,21 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
 
     public void OnReload(Action callback) {
         if (callback == null) { return; }
-        Mutex.Lock(this.syncLock);
-        this.reloadCallbacks.Add(callback);
-        Mutex.Unlock(this.syncLock);
+        nint lk = this.syncLock;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
+        try {
+            this.reloadCallbacks.Add(callback);
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     public void Dispose() {
-        if (this.syncLock != 0) {
-            Mutex.Destroy(this.syncLock);
+        nint lk = this.syncLock;
+        if (lk != 0) {
             this.syncLock = 0;
+            Mutex.Destroy(lk);
         }
         if (this.providers != null) {
             this.providers.Clear();

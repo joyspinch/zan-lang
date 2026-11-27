@@ -240,7 +240,7 @@ public class HtmlPolicy {
         if (attr == null || attr.Length == 0) { return false; }
         if (attr.StartsWith("on")) { return false; }
         if (this.allowedAttributes.Contains(attr)) { return true; }
-        List<string> extra = new List<string>();
+        List<string> extra = null;
         if (tag != null && this.tagAttributes.TryGetValue(tag, out extra)) {
             for (int i = 0; i < extra.Count; i = i + 1) {
                 if (extra[i] == attr) { return true; }
@@ -252,14 +252,23 @@ public class HtmlPolicy {
 
 // HTML 消毒器。
 public class HtmlSanitizer {
+    private static HtmlPolicy s_defaultPolicy;
+
+    private static HtmlPolicy DefaultShared() {
+        if (HtmlSanitizer.s_defaultPolicy == null) {
+            HtmlSanitizer.s_defaultPolicy = HtmlPolicy.Default();
+        }
+        return HtmlSanitizer.s_defaultPolicy;
+    }
+
     // 用默认策略消毒。
     public static string Clean(string html) {
-        return HtmlSanitizer.Clean(html, HtmlPolicy.Default());
+        return HtmlSanitizer.Clean(html, HtmlSanitizer.DefaultShared());
     }
 
     // 用给定策略消毒。
     public static string Clean(string html, HtmlPolicy policy) {
-        if (policy == null) { policy = HtmlPolicy.Default(); }
+        if (policy == null) { policy = HtmlSanitizer.DefaultShared(); }
         HtmlDocument doc = HtmlParser.Parse(html);
         StringBuilder sb = new StringBuilder();
         HtmlSanitizer.WriteChildren(doc.root, policy, sb);
@@ -272,7 +281,7 @@ public class HtmlSanitizer {
     // 种绕过就是这么来的），再去掉首尾空白与控制字符。
     public static bool IsSafeUrl(string url, HtmlPolicy policy) {
         if (url == null) { return true; }
-        if (policy == null) { policy = HtmlPolicy.Default(); }
+        if (policy == null) { policy = HtmlSanitizer.DefaultShared(); }
         string s = HtmlSanitizer.CleanUrl(url);
         int n = s.Length;
         int cut = -1;
@@ -293,7 +302,7 @@ public class HtmlSanitizer {
         return policy.allowedSchemes.Contains(scheme);
     }
 
-    // 按浏览器的规则清理 URL（去制表/换行、去首尾空白与控制字符）。
+    // 按浏览器的规则清理 URL（去制表/换行、去首尾空白与控制字符；常见无控制字符 URL 零 StringBuilder 分配）。
     public static string CleanUrl(string url) {
         if (url == null) { return ""; }
         int n = url.Length;
@@ -301,9 +310,19 @@ public class HtmlSanitizer {
         int end = n;
         while (start < end && (url[start] & 255) <= 32) { start = start + 1; }
         while (end > start && (url[end - 1] & 255) <= 32) { end = end - 1; }
+        if (start >= end) { return ""; }
+        int firstCtrl = -1;
+        for (int i = start; i < end; i = i + 1) {
+            int c = url[i] & 255;
+            if (c == 9 || c == 10 || c == 13) { firstCtrl = i; break; }
+        }
+        if (firstCtrl < 0) {
+            if (start == 0 && end == n) { return url; }
+            return url.Substring(start, end - start);
+        }
         StringBuilder sb = new StringBuilder();
         int segStart = start;
-        for (int i = start; i < end; i = i + 1) {
+        for (int i = firstCtrl; i < end; i = i + 1) {
             int c = url[i] & 255;
             if (c == 9 || c == 10 || c == 13) {
                 if (i > segStart) { sb.Append(url.Substring(segStart, i - segStart)); }
@@ -328,8 +347,19 @@ public class HtmlSanitizer {
         }
         if (node.type == HtmlNodeType.Comment) {
             if (!policy.stripComments) {
+                string ct = node.text == null ? "" : node.text;
+                // 中和注释提前闭合序列（--> / --!> / 前导 > 或 -> / 尾随 -），防 KeepComments 模式 XSS 逃逸。
+                if (ct.IndexOf("-->") >= 0) { ct = ct.Replace("-->", "--&gt;"); }
+                if (ct.IndexOf("--!>") >= 0) { ct = ct.Replace("--!>", "--!&gt;"); }
                 sb.Append("<!--");
-                sb.Append(node.text);
+                if ((ct.Length > 0 && (ct[0] & 255) == 62)
+                    || (ct.Length >= 2 && (ct[0] & 255) == 45 && (ct[1] & 255) == 62)) {
+                    sb.Append(" ");
+                }
+                sb.Append(ct);
+                if (ct.Length > 0 && (ct[ct.Length - 1] & 255) == 45) {
+                    sb.Append(" ");
+                }
                 sb.Append("-->");
             }
             return;

@@ -131,8 +131,8 @@ public class LicenseClient {
     // MAC 一起重算，而重算需要本机因子派生的密钥。
     public string StateAuth(LicenseState s) {
         string canonical = LicenseClient.StateCanonical(s);
-        byte[] mac = Hmac.Sha256Mac(this.StateAuthKey(), this.StateAuthKey().Length,
-            canonical, canonical.Length);
+        string key = this.StateAuthKey();
+        byte[] mac = Hmac.Sha256Mac(key, key.Length, canonical, canonical.Length);
         return Hex.Encode(mac, mac.Length);
     }
 
@@ -199,10 +199,22 @@ public class LicenseClient {
 
     // ---- 状态持久化 ----
 
+    // 规范化状态路径单段：拒绝空串、'.'/'..' 及路径分隔符，防止目录遍历。
+    private static string SafeDirSegment(string raw, string fallback) {
+        if (raw == null || raw.Length == 0 || raw == "." || raw == "..") { return fallback; }
+        for (int i = 0; i < raw.Length; i = i + 1) {
+            int c = raw[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95;
+            if (!ok) { return fallback; }
+        }
+        return raw;
+    }
+
     // 状态文件目录：~/.zan-license/<vendor>/<product>/（可整体删除复位）。
     public string StateDir() {
-        string vendorDir = this.vendor != null && this.vendor.Length > 0 ? this.vendor : "default";
-        string productDir = this.product != null && this.product.Length > 0 ? this.product : "app";
+        string vendorDir = LicenseClient.SafeDirSegment(this.vendor, "default");
+        string productDir = LicenseClient.SafeDirSegment(this.product, "app");
         return KnownFolders.Home() + "/.zan-license/" + vendorDir
             + "/" + productDir;
     }
@@ -244,11 +256,13 @@ public class LicenseClient {
         try {
             if (this.state.salt.Length == 0) {
                 byte[] salt = RandomNumberGenerator.GetBytes(32);
-                this.state.salt = salt != null ? Hex.Encode(salt, 32) : "";
+                if (salt == null || salt.Length < 32) { return; }
+                this.state.salt = Hex.Encode(salt, 32);
             }
             // 内存态同步：auth 既写进文件也留在 state 上，Persist 后
             // 不重载文件直接 Check() 也要能过认证。
-            this.state.mac = this.StateAuth(this.state);
+            string mac = this.StateAuth(this.state);
+            this.state.mac = mac;
             Directory.CreateDirectoryRecursive(this.StateDir());
             JsonValue o = JsonValue.NewObject();
             o.Put("mode", JsonValue.NewStr(this.state.mode));
@@ -260,7 +274,7 @@ public class LicenseClient {
             o.Put("grace_seconds", JsonValue.NewInt(this.state.graceSeconds));
             o.Put("last_seen", JsonValue.NewInt(this.state.lastHeartbeat));
             o.Put("salt", JsonValue.NewStr(this.state.salt));
-            o.Put("auth", JsonValue.NewStr(this.StateAuth(this.state)));
+            o.Put("auth", JsonValue.NewStr(mac));
             if (this.state.certSig.Length > 0) {
                 o.Put("sig", JsonValue.NewStr(this.state.certSig));
             }

@@ -4,7 +4,7 @@ namespace Scripting.Lua;
 // 封装 Lua 协程（Coroutine 线程对象）。
 // 协程与主状态机共享全局表与函数，但在独立的栈上运行。
 // 协程在注册表中有固定槽位锚定，离开作用域被 ARC 回收时自动释放槽位。
-public class LuaCoroutine {
+public class LuaCoroutine : IDisposable {
     public nint threadState;
     public long threadSlot;
     public bool isStarted;
@@ -17,6 +17,15 @@ public class LuaCoroutine {
         this.isStarted = false;
         this.isDead = false;
         this.error = "";
+    }
+
+    public void Dispose() {
+        if (this.threadSlot != 0) {
+            Lua.DropSlot(this.threadSlot);
+            this.threadSlot = 0;
+        }
+        this.threadState = 0;
+        this.isDead = true;
     }
 
     // 从一段 Lua 代码创建并准备一个协程（将代码编译为 chunk 压入协程栈顶）。
@@ -44,14 +53,24 @@ public class LuaCoroutine {
         Lua.EnsureReady();
         long slot = 0;
         nint co = Lua.NewThread(out slot);
-        // 将函数推入新协程栈顶
         int mark = Lua.Top();
-        Lua.PushPath(funcName, mark);
-        // 把主栈的值转移到协程中：通过全局表读取
-        LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
-        g(co, funcName);
-        Lua.SetTop(mark);
-        return new LuaCoroutine(co, slot);
+        try {
+            Lua.PushPath(funcName, mark);
+            if (Lua.addr_xmove != 0) {
+                LuaXMoveFn xm = (LuaXMoveFn)Lua.addr_xmove;
+                xm(Lua.state, co, 1);
+            } else {
+                long fnSlot = Lua.StoreTop();
+                Lua.PushSlotTo(co, fnSlot);
+                Lua.DropSlot(fnSlot);
+            }
+            Lua.SetTop(mark);
+            return new LuaCoroutine(co, slot);
+        } catch (Exception ex) {
+            Lua.SetTop(mark);
+            Lua.DropSlot(slot);
+            throw ex;
+        }
     }
 
     // 单步非阻塞恢复协程执行。
@@ -72,14 +91,14 @@ public class LuaCoroutine {
         int nresults = 0;
         int rc = Lua.ResumeThread(this.threadState, args.Length, out nresults);
         if (rc == Lua.LUA_OK) {
-            this.isDead = true;
+            this.Dispose();
             return Lua.LUA_OK;
         } else if (rc == Lua.LUA_YIELD) {
             return Lua.LUA_YIELD;
         } else {
-            this.isDead = true;
             LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
             this.error = f(this.threadState, 0 - 1, 0);
+            this.Dispose();
             return rc;
         }
     }

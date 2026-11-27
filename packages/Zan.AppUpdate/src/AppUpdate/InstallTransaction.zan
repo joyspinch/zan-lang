@@ -84,20 +84,20 @@ internal class InstallTransaction {
             return !File.Exists(root + "/_appupdate");
         }
         if (Directory.GetDirectories(root + "/_appupdate").Count != 0) { return false; }
-        Dictionary<string, bool> allowed = new Dictionary<string, bool>();
-        allowed.Add("journal", true);
-        allowed.Add("journal.tmp", true);
-        allowed.Add("phase", true);
-        allowed.Add("phase.tmp", true);
-        allowed.Add("swap", true);
+        HashSet<string> allowed = new HashSet<string>();
+        allowed.Add("journal");
+        allowed.Add("journal.tmp");
+        allowed.Add("phase");
+        allowed.Add("phase.tmp");
+        allowed.Add("swap");
         for (int i = 0; i < count; i = i + 1) {
-            allowed.Add(Convert.ToString(i) + ".new", true);
-            allowed.Add(Convert.ToString(i) + ".old", true);
-            allowed.Add(Convert.ToString(i) + ".backup", true);
+            allowed.Add(Convert.ToString(i) + ".new");
+            allowed.Add(Convert.ToString(i) + ".old");
+            allowed.Add(Convert.ToString(i) + ".backup");
         }
         List<string> names = Directory.GetFileNames(root + "/_appupdate");
         for (int i = 0; i < names.Count; i = i + 1) {
-            if (!allowed.ContainsKey(names[i])) { return false; }
+            if (!allowed.Contains(names[i])) { return false; }
             Safe(root, "_appupdate/" + names[i]);
         }
         // Remove the phase last: interrupted cleanup must never look like a new
@@ -131,7 +131,15 @@ internal class InstallTransaction {
         plan.PutStr("root", InstallRoot.Identity(root));
         plan.PutStr("expected", Digest(expected.SigningPayload() + ":" + expected.Signature().ToLower()));
         plan.PutStr("backup", backupOld ? "yes" : "no");
-        plan.PutStr("token", Hex.Encode(System.RandomNumberGenerator.GetBytes(16), 16));
+        byte[] tokBytes = System.RandomNumberGenerator.GetBytes(16);
+        if (tokBytes == null || tokBytes.Length < 16) { throw new IOException("Could not generate install token"); }
+        plan.PutStr("token", Hex.Encode(tokBytes, 16));
+        Dictionary<string, ZipEntry> entryMap = new Dictionary<string, ZipEntry>();
+        for (int k = 0; k < entries.Count; k = k + 1) {
+            if (entries[k] != null && entries[k].name != null && !entryMap.ContainsKey(entries[k].name)) {
+                entryMap.Add(entries[k].name, entries[k]);
+            }
+        }
         JsonValue files = JsonValue.NewArray();
         long total = 0;
         for (int i = 0; i < expected.files.Count; i = i + 1) {
@@ -152,9 +160,7 @@ internal class InstallTransaction {
             files.Append(row);
             Safe(root, Slot(i, "new"));
             ZipEntry entry = null;
-            for (int k = 0; k < entries.Count; k = k + 1) {
-                if (entries[k].name == file.path) { entry = entries[k]; break; }
-            }
+            entryMap.TryGetValue(file.path, out entry);
             if (entry == null) { throw new IOException("Missing staged entry"); }
             File.WriteAllBytes(root + "/" + Slot(i, "new"), entry.data);
             AppUpdater.RestoreExecutablePermissionIfNeeded(root + "/" + Slot(i, "new"), entry.data);
