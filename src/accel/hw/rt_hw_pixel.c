@@ -79,11 +79,111 @@ static void pixel_swap_rb_ssse3(uint8_t *dst, const uint8_t *src, int64_t count)
     }
 }
 
+__attribute__((target("avx2")))
+static void pixel_blend_over_avx2(uint8_t *dst, const uint8_t *src, int64_t count) {
+    int64_t i = 0;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i k255 = _mm256_set1_epi16(255);
+    const __m256i k128 = _mm256_set1_epi16(128);
+    const __m256i rgb_mask = _mm256_setr_epi16(-1, -1, -1, 0, -1, -1, -1, 0,
+                                               -1, -1, -1, 0, -1, -1, -1, 0);
+    const __m256i k_alpha_255 = _mm256_setr_epi16(0, 0, 0, 255, 0, 0, 0, 255,
+                                                  0, 0, 0, 255, 0, 0, 0, 255);
+
+    for (; i + 8 <= count; i += 8) {
+        __m256i s = _mm256_loadu_si256((const __m256i *)(src + i * 4));
+        __m256i d = _mm256_loadu_si256((const __m256i *)(dst + i * 4));
+
+        __m256i s_lo = _mm256_unpacklo_epi8(s, zero);
+        __m256i d_lo = _mm256_unpacklo_epi8(d, zero);
+        __m256i s_hi = _mm256_unpackhi_epi8(s, zero);
+        __m256i d_hi = _mm256_unpackhi_epi8(d, zero);
+
+        __m256i sa_0 = _mm256_shufflelo_epi16(s_lo, _MM_SHUFFLE(3, 3, 3, 3));
+        sa_0 = _mm256_shufflehi_epi16(sa_0, _MM_SHUFFLE(3, 3, 3, 3));
+        __m256i inv_sa_0 = _mm256_sub_epi16(k255, sa_0);
+        __m256i sw_0 = _mm256_or_si256(_mm256_and_si256(sa_0, rgb_mask), k_alpha_255);
+
+        __m256i res_lo = _mm256_add_epi16(_mm256_mullo_epi16(s_lo, sw_0),
+                                          _mm256_mullo_epi16(d_lo, inv_sa_0));
+        res_lo = _mm256_add_epi16(res_lo, k128);
+        res_lo = _mm256_srli_epi16(_mm256_add_epi16(res_lo, _mm256_srli_epi16(res_lo, 8)), 8);
+
+        __m256i sa_1 = _mm256_shufflelo_epi16(s_hi, _MM_SHUFFLE(3, 3, 3, 3));
+        sa_1 = _mm256_shufflehi_epi16(sa_1, _MM_SHUFFLE(3, 3, 3, 3));
+        __m256i inv_sa_1 = _mm256_sub_epi16(k255, sa_1);
+        __m256i sw_1 = _mm256_or_si256(_mm256_and_si256(sa_1, rgb_mask), k_alpha_255);
+
+        __m256i res_hi = _mm256_add_epi16(_mm256_mullo_epi16(s_hi, sw_1),
+                                          _mm256_mullo_epi16(d_hi, inv_sa_1));
+        res_hi = _mm256_add_epi16(res_hi, k128);
+        res_hi = _mm256_srli_epi16(_mm256_add_epi16(res_hi, _mm256_srli_epi16(res_hi, 8)), 8);
+
+        __m256i out = _mm256_packus_epi16(res_lo, res_hi);
+        _mm256_storeu_si256((__m256i *)(dst + i * 4), out);
+    }
+    if (i < count) {
+        pixel_blend_over_sse2(dst + i * 4, src + i * 4, count - i);
+    }
+}
+
+__attribute__((target("avx2")))
+static void pixel_swap_rb_avx2(uint8_t *dst, const uint8_t *src, int64_t count) {
+    int64_t i = 0;
+    const __m256i mask = _mm256_setr_epi8(
+        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    for (; i + 8 <= count; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i * 4));
+        v = _mm256_shuffle_epi8(v, mask);
+        _mm256_storeu_si256((__m256i *)(dst + i * 4), v);
+    }
+    if (i < count) {
+        pixel_swap_rb_ssse3(dst + i * 4, src + i * 4, count - i);
+    }
+}
+
+__attribute__((target("avx2")))
+static void pixel_fill_rect_avx2(uint8_t *dst, int64_t stride, int64_t x, int64_t y,
+                                 int64_t w, int64_t h, uint32_t color) {
+    const __m256i cv = _mm256_set1_epi32((int)color);
+    for (int64_t r = 0; r < h; r++) {
+        uint32_t *row = (uint32_t *)(dst + (y + r) * stride + x * 4);
+        int64_t c = 0;
+        for (; c + 8 <= w; c += 8) {
+            _mm256_storeu_si256((__m256i *)(row + c), cv);
+        }
+        for (; c < w; c++) {
+            row[c] = color;
+        }
+    }
+}
+
+__attribute__((target("sse2")))
+static void pixel_fill_rect_sse2(uint8_t *dst, int64_t stride, int64_t x, int64_t y,
+                                 int64_t w, int64_t h, uint32_t color) {
+    const __m128i cv = _mm_set1_epi32((int)color);
+    for (int64_t r = 0; r < h; r++) {
+        uint32_t *row = (uint32_t *)(dst + (y + r) * stride + x * 4);
+        int64_t c = 0;
+        for (; c + 4 <= w; c += 4) {
+            _mm_storeu_si128((__m128i *)(row + c), cv);
+        }
+        for (; c < w; c++) {
+            row[c] = color;
+        }
+    }
+}
+
 #endif
 
 void zan_hw_pixel_blend_over(uint8_t *dst, const uint8_t *src, int64_t count) {
     if (count <= 0 || !dst || !src) return;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (count >= 8 && zan_hw_x86_can(ZAN_HW_AVX2)) {
+        pixel_blend_over_avx2(dst, src, count);
+        return;
+    }
     pixel_blend_over_sse2(dst, src, count);
 #else
     for (int64_t i = 0; i < count; i++) {
@@ -109,6 +209,10 @@ void zan_hw_pixel_blend_over(uint8_t *dst, const uint8_t *src, int64_t count) {
 void zan_hw_pixel_swap_rb(uint8_t *dst, const uint8_t *src, int64_t count) {
     if (count <= 0 || !dst || !src) return;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (count >= 8 && zan_hw_x86_can(ZAN_HW_AVX2)) {
+        pixel_swap_rb_avx2(dst, src, count);
+        return;
+    }
     if (zan_hw_x86_can(ZAN_HW_REQ_PIXEL)) {
         pixel_swap_rb_ssse3(dst, src, count);
         return;
@@ -125,6 +229,16 @@ void zan_hw_pixel_swap_rb(uint8_t *dst, const uint8_t *src, int64_t count) {
 void zan_hw_pixel_fill_rect(uint8_t *dst, int64_t stride, int64_t x, int64_t y,
                             int64_t w, int64_t h, uint32_t color) {
     if (w <= 0 || h <= 0 || !dst) return;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (w >= 8 && zan_hw_x86_can(ZAN_HW_AVX2)) {
+        pixel_fill_rect_avx2(dst, stride, x, y, w, h, color);
+        return;
+    }
+    if (w >= 4 && zan_hw_x86_can(ZAN_HW_SSSE3)) {
+        pixel_fill_rect_sse2(dst, stride, x, y, w, h, color);
+        return;
+    }
+#endif
     for (int64_t r = 0; r < h; r++) {
         uint32_t *row = (uint32_t*)(dst + (y + r) * stride + x * 4);
         for (int64_t c = 0; c < w; c++) {

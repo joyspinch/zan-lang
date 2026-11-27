@@ -13,30 +13,7 @@
   _mm_xor_si128(_mm_slli_epi64(x, n),                                          \
                 _mm_slli_si128(_mm_srli_epi64(x, 64 - (n)), 8))
 
-static const uint64_t g_ghash_s_table[64] = {
-    0x0000000000000000ULL, 0xe608000000000000ULL, 0x0e10000000000000ULL,
-    0xe818000000000000ULL, 0x1c20000000000000ULL, 0xfa28000000000000ULL,
-    0x1230000000000000ULL, 0xf438000000000000ULL, 0x3840000000000000ULL,
-    0xde48000000000000ULL, 0x3650000000000000ULL, 0xd058000000000000ULL,
-    0x2460000000000000ULL, 0xc268000000000000ULL, 0x2a70000000000000ULL,
-    0xcc78000000000000ULL, 0x7080000000000000ULL, 0x9688000000000000ULL,
-    0x7e90000000000000ULL, 0x9898000000000000ULL, 0x6ca0000000000000ULL,
-    0x8aa8000000000000ULL, 0x62b0000000000000ULL, 0x84b8000000000000ULL,
-    0x48c0000000000000ULL, 0xaec8000000000000ULL, 0x46d0000000000000ULL,
-    0xa0d8000000000000ULL, 0x54e0000000000000ULL, 0xb2e8000000000000ULL,
-    0x5af0000000000000ULL, 0xbcf8000000000000ULL, 0xe100000000000000ULL,
-    0x0708000000000000ULL, 0xef10000000000000ULL, 0x0918000000000000ULL,
-    0xfd20000000000000ULL, 0x1b28000000000000ULL, 0xf330000000000000ULL,
-    0x1538000000000000ULL, 0xd940000000000000ULL, 0x3f48000000000000ULL,
-    0xd750000000000000ULL, 0x3158000000000000ULL, 0xc560000000000000ULL,
-    0x2368000000000000ULL, 0xcb70000000000000ULL, 0x2d78000000000000ULL,
-    0x9180000000000000ULL, 0x7788000000000000ULL, 0x9f90000000000000ULL,
-    0x7998000000000000ULL, 0x8da0000000000000ULL, 0x6ba8000000000000ULL,
-    0x83b0000000000000ULL, 0x65b8000000000000ULL, 0xa9c0000000000000ULL,
-    0x4fc8000000000000ULL, 0xa7d0000000000000ULL, 0x41d8000000000000ULL,
-    0xb5e0000000000000ULL, 0x53e8000000000000ULL, 0xbbf0000000000000ULL,
-    0x5df8000000000000ULL};
-
+/* 无查表恒定时间 GF(2^128) 规约：s(low6) 与原 64 项表逐位等价，消除缓存时序侧信道。 */
 __attribute__((target("pclmul,sse4.1"))) static inline __m128i
 zan_ghash_reduce(__m128i lo, __m128i hi) {
   __m128i hi_mask = _mm_set_epi64x((long long)0x8000000000000000ULL, 0);
@@ -47,25 +24,30 @@ zan_ghash_reduce(__m128i lo, __m128i hi) {
   __m128i F =
       _mm_xor_si128(_mm_xor_si128(ZAN_XSHIFT_R(E, 6), ZAN_XSHIFT_R(E, 1)),
                     _mm_xor_si128(E, ZAN_XSHIFT_L(E, 1)));
-  uint64_t low6 = (uint64_t)_mm_cvtsi128_si64(lo) & 0x3F;
-  uint64_t s = g_ghash_s_table[low6];
+  uint64_t low6 = (uint64_t)_mm_cvtsi128_si64(lo) & 0x3FULL;
+  uint64_t s = (low6 << 51) ^ (low6 << 56) ^ (low6 << 57) ^ (low6 << 58) ^
+               ((0ULL - (low6 & 1ULL)) & (0xE1ULL << 56));
   __m128i direct = _mm_xor_si128(ZAN_XSHIFT_L(hi, 1), bit127_lo);
   return _mm_xor_si128(F,
                        _mm_xor_si128(direct, _mm_set_epi64x((long long)s, 0)));
 }
 
+/* 3-PCLMUL Karatsuba 单块 GHASH */
 __attribute__((target("pclmul,sse4.1"))) static inline __m128i
 zan_ghash_step_clmul(__m128i y, __m128i x, __m128i b) {
   __m128i a = _mm_xor_si128(y, x);
   __m128i m0 = _mm_clmulepi64_si128(a, b, 0x00);
   __m128i m3 = _mm_clmulepi64_si128(a, b, 0x11);
-  __m128i mid = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
-                              _mm_clmulepi64_si128(a, b, 0x01));
+  __m128i ax = _mm_xor_si128(a, _mm_srli_si128(a, 8));
+  __m128i bx = _mm_xor_si128(b, _mm_srli_si128(b, 8));
+  __m128i mid = _mm_xor_si128(_mm_clmulepi64_si128(ax, bx, 0x00),
+                              _mm_xor_si128(m0, m3));
   __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
   __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
   return zan_ghash_reduce(lo, hi);
 }
 
+/* 4 路聚合 Karatsuba GHASH：每 64B 仅 12 次 PCLMUL + 1 次规约 */
 __attribute__((target("pclmul,sse4.1"))) static inline __m128i
 zan_ghash_4blocks_clmul(__m128i y, __m128i x0, __m128i x1, __m128i x2,
                         __m128i x3, __m128i h1, __m128i h2, __m128i h3,
@@ -75,32 +57,37 @@ zan_ghash_4blocks_clmul(__m128i y, __m128i x0, __m128i x1, __m128i x2,
   __m128i a2 = x2;
   __m128i a3 = x3;
 
+  __m128i ax0 = _mm_xor_si128(a0, _mm_srli_si128(a0, 8));
+  __m128i hx4 = _mm_xor_si128(h4, _mm_srli_si128(h4, 8));
   __m128i m0_0 = _mm_clmulepi64_si128(a0, h4, 0x00);
   __m128i m3_0 = _mm_clmulepi64_si128(a0, h4, 0x11);
-  __m128i mid_0 = _mm_xor_si128(_mm_clmulepi64_si128(a0, h4, 0x10),
-                                _mm_clmulepi64_si128(a0, h4, 0x01));
+  __m128i mp_0 = _mm_clmulepi64_si128(ax0, hx4, 0x00);
 
+  __m128i ax1 = _mm_xor_si128(a1, _mm_srli_si128(a1, 8));
+  __m128i hx3 = _mm_xor_si128(h3, _mm_srli_si128(h3, 8));
   __m128i m0_1 = _mm_clmulepi64_si128(a1, h3, 0x00);
   __m128i m3_1 = _mm_clmulepi64_si128(a1, h3, 0x11);
-  __m128i mid_1 = _mm_xor_si128(_mm_clmulepi64_si128(a1, h3, 0x10),
-                                _mm_clmulepi64_si128(a1, h3, 0x01));
+  __m128i mp_1 = _mm_clmulepi64_si128(ax1, hx3, 0x00);
 
+  __m128i ax2 = _mm_xor_si128(a2, _mm_srli_si128(a2, 8));
+  __m128i hx2 = _mm_xor_si128(h2, _mm_srli_si128(h2, 8));
   __m128i m0_2 = _mm_clmulepi64_si128(a2, h2, 0x00);
   __m128i m3_2 = _mm_clmulepi64_si128(a2, h2, 0x11);
-  __m128i mid_2 = _mm_xor_si128(_mm_clmulepi64_si128(a2, h2, 0x10),
-                                _mm_clmulepi64_si128(a2, h2, 0x01));
+  __m128i mp_2 = _mm_clmulepi64_si128(ax2, hx2, 0x00);
 
+  __m128i ax3 = _mm_xor_si128(a3, _mm_srli_si128(a3, 8));
+  __m128i hx1 = _mm_xor_si128(h1, _mm_srli_si128(h1, 8));
   __m128i m0_3 = _mm_clmulepi64_si128(a3, h1, 0x00);
   __m128i m3_3 = _mm_clmulepi64_si128(a3, h1, 0x11);
-  __m128i mid_3 = _mm_xor_si128(_mm_clmulepi64_si128(a3, h1, 0x10),
-                                _mm_clmulepi64_si128(a3, h1, 0x01));
+  __m128i mp_3 = _mm_clmulepi64_si128(ax3, hx1, 0x00);
 
   __m128i m0 =
       _mm_xor_si128(_mm_xor_si128(m0_0, m0_1), _mm_xor_si128(m0_2, m0_3));
   __m128i m3 =
       _mm_xor_si128(_mm_xor_si128(m3_0, m3_1), _mm_xor_si128(m3_2, m3_3));
-  __m128i mid =
-      _mm_xor_si128(_mm_xor_si128(mid_0, mid_1), _mm_xor_si128(mid_2, mid_3));
+  __m128i mp =
+      _mm_xor_si128(_mm_xor_si128(mp_0, mp_1), _mm_xor_si128(mp_2, mp_3));
+  __m128i mid = _mm_xor_si128(mp, _mm_xor_si128(m0, m3));
 
   __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
   __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
@@ -117,6 +104,24 @@ zan_ghash_update_clmul(const uint8_t *h16, const uint8_t *data, int64_t len,
   __m128i y = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)y16), BSWAP);
 
   int64_t off = 0;
+  if (len >= 64) {
+    __m128i zero = _mm_setzero_si128();
+    __m128i h2 = zan_ghash_step_clmul(zero, b, b);
+    __m128i h3 = zan_ghash_step_clmul(zero, h2, b);
+    __m128i h4 = zan_ghash_step_clmul(zero, h3, b);
+    while (off + 64 <= len) {
+      __m128i x0 = _mm_shuffle_epi8(
+          _mm_loadu_si128((const __m128i *)(data + off)), BSWAP);
+      __m128i x1 = _mm_shuffle_epi8(
+          _mm_loadu_si128((const __m128i *)(data + off + 16)), BSWAP);
+      __m128i x2 = _mm_shuffle_epi8(
+          _mm_loadu_si128((const __m128i *)(data + off + 32)), BSWAP);
+      __m128i x3 = _mm_shuffle_epi8(
+          _mm_loadu_si128((const __m128i *)(data + off + 48)), BSWAP);
+      y = zan_ghash_4blocks_clmul(y, x0, x1, x2, x3, b, h2, h3, h4);
+      off += 64;
+    }
+  }
   while (off + 16 <= len) {
     __m128i x =
         _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data + off)), BSWAP);

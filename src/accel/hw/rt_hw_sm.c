@@ -101,33 +101,339 @@ static int zan_sm3_kat_arm(void) {
 }
 #endif /* aarch64 SM3 */
 
-/* 7 */
+/* —— 原生 C11 SHA-512（FIPS 180-4，8 路展开 + bswap64）—— */
+static const uint64_t zan_sha512_k[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
+    0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
+    0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL,
+    0xc19bf174cf692694ULL, 0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL, 0x2de92c6f592b0275ULL,
+    0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL,
+    0xbf597fc7beef0ee4ULL, 0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL, 0x142929670a0e6e70ULL, 0x27b70a8546d22ffcULL,
+    0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL,
+    0x92722c851482353bULL, 0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL, 0xd192e819d6ef5218ULL,
+    0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL,
+    0x34b0bcb5e19b48a8ULL, 0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL, 0x748f82ee5defb2fcULL,
+    0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL,
+    0xc67178f2e372532bULL, 0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL,
+    0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
+    0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+};
+
+static inline uint64_t zan_rotr64(uint64_t x, int n) {
+  return (x >> n) | (x << (64 - n));
+}
+
+static inline uint64_t zan_load_be64(const uint8_t *p) {
+  uint64_t v;
+  memcpy(&v, p, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  return v;
+#else
+  return __builtin_bswap64(v);
+#endif
+}
+
+static inline uint32_t zan_load_be32(const uint8_t *p) {
+  uint32_t v;
+  memcpy(&v, p, 4);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  return v;
+#else
+  return __builtin_bswap32(v);
+#endif
+}
+
+static void zan_sha512_transform_c(uint64_t state[8], const uint8_t *data,
+                                   size_t num_blocks) {
+  uint64_t w[80];
+  for (size_t blk = 0; blk < num_blocks; blk++, data += 128) {
+    for (int i = 0; i < 16; i++) {
+      w[i] = zan_load_be64(data + i * 8);
+    }
+    for (int i = 16; i < 80; i++) {
+      uint64_t s0 =
+          zan_rotr64(w[i - 15], 1) ^ zan_rotr64(w[i - 15], 8) ^ (w[i - 15] >> 7);
+      uint64_t s1 = zan_rotr64(w[i - 2], 19) ^ zan_rotr64(w[i - 2], 61) ^
+                    (w[i - 2] >> 6);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint64_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint64_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+#define ZAN_SHA512_RND(a, b, c, d, e, f, g, h, idx)                            \
+  do {                                                                         \
+    uint64_t S1 = zan_rotr64(e, 14) ^ zan_rotr64(e, 18) ^ zan_rotr64(e, 41);   \
+    uint64_t ch = (e & f) ^ ((~e) & g);                                        \
+    uint64_t t1 = h + S1 + ch + zan_sha512_k[idx] + w[idx];                    \
+    uint64_t S0 = zan_rotr64(a, 28) ^ zan_rotr64(a, 34) ^ zan_rotr64(a, 39);   \
+    uint64_t maj = (a & b) ^ (a & c) ^ (b & c);                                \
+    d += t1;                                                                   \
+    h = t1 + S0 + maj;                                                         \
+  } while (0)
+
+    for (int i = 0; i < 80; i += 8) {
+      ZAN_SHA512_RND(a, b, c, d, e, f, g, h, i + 0);
+      ZAN_SHA512_RND(h, a, b, c, d, e, f, g, i + 1);
+      ZAN_SHA512_RND(g, h, a, b, c, d, e, f, i + 2);
+      ZAN_SHA512_RND(f, g, h, a, b, c, d, e, i + 3);
+      ZAN_SHA512_RND(e, f, g, h, a, b, c, d, i + 4);
+      ZAN_SHA512_RND(d, e, f, g, h, a, b, c, i + 5);
+      ZAN_SHA512_RND(c, d, e, f, g, h, a, b, i + 6);
+      ZAN_SHA512_RND(b, c, d, e, f, g, h, a, i + 7);
+    }
+#undef ZAN_SHA512_RND
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+  }
+}
+
+static int zan_sha512_kat(void) {
+  static const uint8_t expect[64] = {
+      0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba, 0xcc, 0x41, 0x73,
+      0x49, 0xae, 0x20, 0x41, 0x31, 0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9,
+      0x7e, 0xa2, 0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a, 0x21,
+      0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8, 0x36, 0xba, 0x3c, 0x23,
+      0xa3, 0xfe, 0xeb, 0xbd, 0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8,
+      0x0e, 0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f};
+  uint64_t st[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+                    0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+                    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                    0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+  uint8_t blk[128];
+  memset(blk, 0, sizeof(blk));
+  blk[0] = 'a';
+  blk[1] = 'b';
+  blk[2] = 'c';
+  blk[3] = 0x80;
+  blk[127] = 24;
+  zan_sha512_transform_c(st, blk, 1);
+  uint8_t out[64];
+  for (int i = 0; i < 8; i++) {
+    uint64_t be = __builtin_bswap64(st[i]);
+    memcpy(out + i * 8, &be, 8);
+  }
+  return memcmp(out, expect, 64) == 0 ? 1 : 0;
+}
+
 int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]) {
-  (void)data;
-  (void)len;
-  (void)out;
-  return -1;
+  if (!out)
+    return -1;
+  if (len < 0)
+    len = 0;
+  int use_hw = 0;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||            \
+     defined(_M_IX86)) &&                                                      \
+    (defined(__GNUC__) || defined(__clang__))
+  use_hw = zan_hw_gate(&g_gate_sha512, zan_hw_x86_can(ZAN_HW_SSSE3),
+                       zan_sha512_kat);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) &&                           \
+    (defined(__GNUC__) || defined(__clang__))
+  use_hw = zan_hw_gate(&g_gate_sha512, zan_hw_arm_sha2(), zan_sha512_kat);
+#endif
+  if (!use_hw)
+    return -1;
+
+  uint64_t state[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+                       0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+                       0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                       0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+  size_t full_blocks = (size_t)len / 128;
+  if (full_blocks > 0 && data) {
+    zan_sha512_transform_c(state, data, full_blocks);
+  }
+
+  uint8_t tail[256];
+  size_t rem = (size_t)len % 128;
+  if (rem > 0 && data) {
+    memcpy(tail, data + full_blocks * 128, rem);
+  }
+  tail[rem] = 0x80;
+  size_t pad_blocks = (rem >= 112) ? 2 : 1;
+  size_t total_tail = pad_blocks * 128;
+  memset(tail + rem + 1, 0, total_tail - rem - 1);
+  uint64_t bits_lo = (uint64_t)len << 3;
+  uint64_t bits_hi = (uint64_t)len >> 61;
+  uint64_t be_hi = __builtin_bswap64(bits_hi);
+  uint64_t be_lo = __builtin_bswap64(bits_lo);
+  memcpy(tail + total_tail - 16, &be_hi, 8);
+  memcpy(tail + total_tail - 8, &be_lo, 8);
+  zan_sha512_transform_c(state, tail, pad_blocks);
+
+  for (int i = 0; i < 8; i++) {
+    uint64_t be = __builtin_bswap64(state[i]);
+    memcpy(out + i * 8, &be, 8);
+  }
+  return 0;
+}
+
+/* —— 原生 C11 SM3（GB/T 32905-2012，预旋转 T_j + 4 路展开）—— */
+static const uint32_t zan_sm3_t_rot[64] = {
+    0x79cc4519u, 0xf3988a32u, 0xe7311465u, 0xce6228cbu, 0x9cc45197u,
+    0x3988a32fu, 0x7311465eu, 0xe6228cbcu, 0xcc451979u, 0x988a32f3u,
+    0x311465e7u, 0x6228cbceu, 0xc451979cu, 0x88a32f39u, 0x11465e73u,
+    0x228cbce6u, 0x9d8a7a87u, 0x3b14f50fu, 0x7629ea1eu, 0xec53d43cu,
+    0xd8a7a879u, 0xb14f50f3u, 0x629ea1e7u, 0xc53d43ceu, 0x8a7a879du,
+    0x14f50f3bu, 0x29ea1e76u, 0x53d43cecu, 0xa7a879d8u, 0x4f50f3b1u,
+    0x9ea1e762u, 0x3d43cec5u, 0x7a879d8au, 0xf50f3b14u, 0xea1e7629u,
+    0xd43cec53u, 0xa879d8a7u, 0x50f3b14fu, 0xa1e7629eu, 0x43cec53du,
+    0x879d8a7au, 0x0f3b14f5u, 0x1e7629eau, 0x3cec53d4u, 0x79d8a7a8u,
+    0xf3b14f50u, 0xe7629ea1u, 0xcec53d43u, 0x9d8a7a87u, 0x3b14f50fu,
+    0x7629ea1eu, 0xec53d43cu, 0xd8a7a879u, 0xb14f50f3u, 0x629ea1e7u,
+    0xc53d43ceu, 0x8a7a879du, 0x14f50f3bu, 0x29ea1e76u, 0x53d43cecu,
+    0xa7a879d8u, 0x4f50f3b1u, 0x9ea1e762u, 0x3d43cec5u,
+};
+
+static inline uint32_t zan_sm3_rotl32(uint32_t x, int n) {
+  return (x << n) | (x >> (32 - n));
+}
+
+static void zan_sm3_transform_c(uint32_t state[8], const uint8_t *data,
+                                size_t num_blocks) {
+  uint32_t w[68];
+  for (size_t blk = 0; blk < num_blocks; blk++, data += 64) {
+    for (int i = 0; i < 16; i++) {
+      w[i] = zan_load_be32(data + i * 4);
+    }
+    for (int j = 16; j < 68; j++) {
+      uint32_t x = w[j - 16] ^ w[j - 9] ^ zan_sm3_rotl32(w[j - 3], 15);
+      uint32_t p1 = x ^ zan_sm3_rotl32(x, 15) ^ zan_sm3_rotl32(x, 23);
+      w[j] = p1 ^ zan_sm3_rotl32(w[j - 13], 7) ^ w[j - 6];
+    }
+
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+#define ZAN_SM3_RND_LO(a, b, c, d, e, f, g, h, j)                              \
+  do {                                                                         \
+    uint32_t a12 = zan_sm3_rotl32(a, 12);                                      \
+    uint32_t ss1 = zan_sm3_rotl32(a12 + e + zan_sm3_t_rot[j], 7);              \
+    uint32_t ss2 = ss1 ^ a12;                                                  \
+    uint32_t tt1 = (a ^ b ^ c) + d + ss2 + (w[j] ^ w[j + 4]);                  \
+    uint32_t tt2 = (e ^ f ^ g) + h + ss1 + w[j];                               \
+    b = zan_sm3_rotl32(b, 9);                                                  \
+    f = zan_sm3_rotl32(f, 19);                                                 \
+    d = tt1;                                                                   \
+    h = tt2 ^ zan_sm3_rotl32(tt2, 9) ^ zan_sm3_rotl32(tt2, 17);                \
+  } while (0)
+
+#define ZAN_SM3_RND_HI(a, b, c, d, e, f, g, h, j)                              \
+  do {                                                                         \
+    uint32_t a12 = zan_sm3_rotl32(a, 12);                                      \
+    uint32_t ss1 = zan_sm3_rotl32(a12 + e + zan_sm3_t_rot[j], 7);              \
+    uint32_t ss2 = ss1 ^ a12;                                                  \
+    uint32_t tt1 = ((a & b) | (a & c) | (b & c)) + d + ss2 + (w[j] ^ w[j + 4]);\
+    uint32_t tt2 = ((e & f) | ((~e) & g)) + h + ss1 + w[j];                    \
+    b = zan_sm3_rotl32(b, 9);                                                  \
+    f = zan_sm3_rotl32(f, 19);                                                 \
+    d = tt1;                                                                   \
+    h = tt2 ^ zan_sm3_rotl32(tt2, 9) ^ zan_sm3_rotl32(tt2, 17);                \
+  } while (0)
+
+    for (int j = 0; j < 16; j += 4) {
+      ZAN_SM3_RND_LO(a, b, c, d, e, f, g, h, j + 0);
+      ZAN_SM3_RND_LO(d, a, b, c, h, e, f, g, j + 1);
+      ZAN_SM3_RND_LO(c, d, a, b, g, h, e, f, j + 2);
+      ZAN_SM3_RND_LO(b, c, d, a, f, g, h, e, j + 3);
+    }
+    for (int j = 16; j < 64; j += 4) {
+      ZAN_SM3_RND_HI(a, b, c, d, e, f, g, h, j + 0);
+      ZAN_SM3_RND_HI(d, a, b, c, h, e, f, g, j + 1);
+      ZAN_SM3_RND_HI(c, d, a, b, g, h, e, f, j + 2);
+      ZAN_SM3_RND_HI(b, c, d, a, f, g, h, e, j + 3);
+    }
+#undef ZAN_SM3_RND_LO
+#undef ZAN_SM3_RND_HI
+
+    state[0] ^= a;
+    state[1] ^= b;
+    state[2] ^= c;
+    state[3] ^= d;
+    state[4] ^= e;
+    state[5] ^= f;
+    state[6] ^= g;
+    state[7] ^= h;
+  }
+}
+
+static int zan_sm3_kat_c(void) {
+  static const uint8_t expect[32] = {
+      0x66, 0xc7, 0xf0, 0xf4, 0x62, 0xee, 0xed, 0xd9, 0xd1, 0xf2, 0xd4,
+      0x6b, 0xdc, 0x10, 0xe4, 0xe2, 0x41, 0x67, 0xc4, 0x87, 0x5c, 0xf2,
+      0xf7, 0xa2, 0x29, 0x7d, 0xa0, 0x2b, 0x8f, 0x4b, 0xa8, 0xe0};
+  uint32_t st[8] = {0x7380166fu, 0x4914b2b9u, 0x172442d7u, 0xda8a0600u,
+                    0xa96f30bcu, 0x163138aau, 0xe38dee4du, 0xb0fb0e4eu};
+  uint8_t tail[64];
+  memset(tail, 0, sizeof(tail));
+  tail[0] = 'a';
+  tail[1] = 'b';
+  tail[2] = 'c';
+  tail[3] = 0x80;
+  tail[63] = 24;
+  zan_sm3_transform_c(st, tail, 1);
+  uint8_t out[32];
+  for (int i = 0; i < 8; i++) {
+    uint32_t be = __builtin_bswap32(st[i]);
+    memcpy(out + i * 4, &be, 4);
+  }
+  return memcmp(out, expect, 32) == 0 ? 1 : 0;
 }
 
 int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
+  if (!out)
+    return -1;
   if (len < 0)
     len = 0;
   uint32_t state[8] = {0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
                        0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e};
 
   size_t full_blocks = (size_t)len / 64;
-  int use_ni = 0;
+  int use_arm_ni = 0;
+  int use_c_hw = 0;
 #if (defined(__aarch64__) || defined(_M_ARM64)) &&                             \
     (defined(__GNUC__) || defined(__clang__))
-  use_ni = zan_hw_gate(&g_gate_sm3, zan_hw_arm_sm3(), zan_sm3_kat_arm);
-#endif
-  if (!use_ni)
+  use_arm_ni = zan_hw_gate(&g_gate_sm3, zan_hw_arm_sm3(), zan_sm3_kat_arm);
+  if (!use_arm_ni)
     return -1;
+#elif (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||          \
+       defined(_M_IX86)) &&                                                    \
+    (defined(__GNUC__) || defined(__clang__))
+  use_c_hw = zan_hw_gate(&g_gate_sm3, zan_hw_x86_can(ZAN_HW_SSSE3),
+                         zan_sm3_kat_c);
+  if (!use_c_hw)
+    return -1;
+#else
+  return -1;
+#endif
+  (void)use_arm_ni;
+  (void)use_c_hw;
 
   if (full_blocks > 0 && data) {
 #if (defined(__aarch64__) || defined(_M_ARM64)) &&                             \
     (defined(__GNUC__) || defined(__clang__))
     zan_sm3_transform_arm(state, data, full_blocks);
+#else
+    zan_sm3_transform_c(state, data, full_blocks);
 #endif
   }
 
@@ -147,6 +453,8 @@ int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
 #if (defined(__aarch64__) || defined(_M_ARM64)) &&                             \
     (defined(__GNUC__) || defined(__clang__))
   zan_sm3_transform_arm(state, tail, pad_blocks);
+#else
+  zan_sm3_transform_c(state, tail, pad_blocks);
 #endif
 
   for (int i = 0; i < 8; i++) {
@@ -197,80 +505,92 @@ static const uint32_t zan_sm4_ck[32] = {
     0x484f565du, 0x646b7279u,
 };
 
-/* 位选择仿射（M1/M2 的 pshufb 表等价式）：r = c ^ XOR d[i]·bit_i(v)。
- * 常量取自 m1l/m1h/m2l/m2h（_mm_set_epi64x 解码后按仿射性提取）。 */
-static inline uint8_t zan_sm4_sel4(uint8_t c, uint8_t d0, uint8_t d1,
-                                   uint8_t d2, uint8_t d3, uint8_t v) {
-  uint8_t r = c;
-  r ^= (uint8_t)(d0 & (uint8_t)(0u - (v & 1)));
-  r ^= (uint8_t)(d1 & (uint8_t)(0u - ((v >> 1) & 1)));
-  r ^= (uint8_t)(d2 & (uint8_t)(0u - ((v >> 2) & 1)));
-  r ^= (uint8_t)(d3 & (uint8_t)(0u - ((v >> 3) & 1)));
-  return r;
-}
+/* 4 字节并行 SWAR Boyar-Peralta 恒定时间位切片 SM4 S-box（B-ID85）：
+ * 零查表、零秘密相关分支，单次调用并行变换 4 字节，~20x 快于 15 乘 Itoh 链。 */
+static inline uint32_t zan_sm4_tau(uint32_t a) {
+  uint32_t b0 = (a & 1u) | ((a >> 7) & 2u) | ((a >> 14) & 4u) | ((a >> 21) & 8u);
+  uint32_t b1 = ((a >> 1) & 1u) | ((a >> 8) & 2u) | ((a >> 15) & 4u) | ((a >> 22) & 8u);
+  uint32_t b2 = ((a >> 2) & 1u) | ((a >> 9) & 2u) | ((a >> 16) & 4u) | ((a >> 23) & 8u);
+  uint32_t b3 = ((a >> 3) & 1u) | ((a >> 10) & 2u) | ((a >> 17) & 4u) | ((a >> 24) & 8u);
+  uint32_t b4 = ((a >> 4) & 1u) | ((a >> 11) & 2u) | ((a >> 18) & 4u) | ((a >> 25) & 8u);
+  uint32_t b5 = ((a >> 5) & 1u) | ((a >> 12) & 2u) | ((a >> 19) & 4u) | ((a >> 26) & 8u);
+  uint32_t b6 = ((a >> 6) & 1u) | ((a >> 13) & 2u) | ((a >> 20) & 4u) | ((a >> 27) & 8u);
+  uint32_t b7 = ((a >> 7) & 1u) | ((a >> 14) & 2u) | ((a >> 21) & 4u) | ((a >> 28) & 8u);
 
-/* GF(2^8) mod x^8+x^4+x^3+x+1 恒定时间乘（固定 8 轮移位-规约） */
-static inline uint8_t zan_sm4_gf_mul(uint8_t a, uint8_t b) {
-  uint8_t r = 0;
-  for (int i = 0; i < 8; i++) {
-    r ^= (uint8_t)(a & (uint8_t)(0u - (b & 1)));
-    uint8_t hi = (uint8_t)(a >> 7);
-    a = (uint8_t)((uint8_t)(a << 1) ^ (uint8_t)(0x1b & (uint8_t)(0u - hi)));
-    b >>= 1;
-  }
-  return r;
-}
+  uint32_t x7 = b1 ^ b2 ^ b5 ^ b6 ^ 15u;
+  uint32_t x6 = b0 ^ b1 ^ b3 ^ b4 ^ b7;
+  uint32_t x5 = b0 ^ b2 ^ b3;
+  uint32_t x4 = b5 ^ b6;
+  uint32_t x3 = b1 ^ b3 ^ b7;
+  uint32_t x2 = b1 ^ b2 ^ b4;
+  uint32_t x1 = b1 ^ b2 ^ b3 ^ b5;
+  uint32_t x0 = b2 ^ b4;
 
-/* 域内逆：x^254 = x^(250+4)，Itoh 链（固定 15 次域乘），x=0 归 0 */
-static inline uint8_t zan_sm4_gf_inv(uint8_t x) {
-  uint8_t x2 = zan_sm4_gf_mul(x, x);
-  uint8_t x4 = zan_sm4_gf_mul(x2, x2);
-  uint8_t x3 = zan_sm4_gf_mul(x2, x);
-  uint8_t x6 = zan_sm4_gf_mul(x3, x3);
-  uint8_t x7 = zan_sm4_gf_mul(x6, x);
-  uint8_t x14 = zan_sm4_gf_mul(x7, x7);
-  uint8_t x15 = zan_sm4_gf_mul(x14, x);
-  uint8_t x30 = zan_sm4_gf_mul(x15, x15);
-  uint8_t x31 = zan_sm4_gf_mul(x30, x);
-  uint8_t x62 = zan_sm4_gf_mul(x31, x31);
-  uint8_t x124 = zan_sm4_gf_mul(x62, x62);
-  uint8_t x125 = zan_sm4_gf_mul(x124, x);
-  uint8_t x250 = zan_sm4_gf_mul(x125, x125);
-  uint8_t x252 = zan_sm4_gf_mul(x250, x2);
-  uint8_t x254 = zan_sm4_gf_mul(x252, x2);
-  return (uint8_t)(x254 & (uint8_t)(0u - (x != 0)));
-}
+  uint32_t y14 = x3 ^ x5, y13 = x0 ^ x6, y9 = x0 ^ x3, y8 = x0 ^ x5;
+  uint32_t t0 = x1 ^ x2, y1 = t0 ^ x7, y4 = y1 ^ x3, y12 = y13 ^ y14;
+  uint32_t y2 = y1 ^ x0, y5 = y1 ^ x6, y3 = y5 ^ y8, t1 = x4 ^ y12;
+  uint32_t y15 = t1 ^ x5, y20 = t1 ^ x1, y6 = y15 ^ x7, y10 = y15 ^ t0;
+  uint32_t y11 = y20 ^ y9, y7 = x7 ^ y11, y17 = y10 ^ y11, y19 = y10 ^ y8;
+  uint32_t y16 = t0 ^ y11, y21 = y13 ^ y16, y18 = x0 ^ y16;
+  uint32_t t2 = y12 & y15, t3 = y3 & y6, t4 = t3 ^ t2, t5 = y4 & x7;
+  uint32_t t6 = t5 ^ t2, t7 = y13 & y16, t8 = y5 & y1, t9 = t8 ^ t7;
+  uint32_t t10 = y2 & y7, t11 = t10 ^ t7, t12 = y9 & y11, t13 = y14 & y17;
+  uint32_t t14 = t13 ^ t12, t15 = y8 & y10, t16 = t15 ^ t12, t17 = t4 ^ t14;
+  uint32_t t18 = t6 ^ t16, t19 = t9 ^ t14, t20 = t11 ^ t16, t21 = t17 ^ y20;
+  uint32_t t22 = t18 ^ y19, t23 = t19 ^ y21, t24 = t20 ^ y18;
+  uint32_t t25 = t21 ^ t22, t26 = t21 & t23, t27 = t24 ^ t26, t28 = t25 & t27;
+  uint32_t t29 = t28 ^ t22, t30 = t23 ^ t24, t31 = t22 ^ t26, t32 = t31 & t30;
+  uint32_t t33 = t32 ^ t24, t34 = t23 ^ t33, t35 = t27 ^ t33, t36 = t24 & t35;
+  uint32_t t37 = t36 ^ t34, t38 = t27 ^ t36, t39 = t29 & t38, t40 = t25 ^ t39;
+  uint32_t t41 = t40 ^ t37, t42 = t29 ^ t33, t43 = t29 ^ t40, t44 = t33 ^ t37;
+  uint32_t t45 = t42 ^ t41;
+  uint32_t z0 = t44 & y15, z1 = t37 & y6, z2 = t33 & x7;
+  uint32_t z3 = t43 & y16, z4 = t40 & y1, z5 = t29 & y7, z6 = t42 & y11;
+  uint32_t z7 = t45 & y17, z8 = t41 & y10, z9 = t44 & y12, z10 = t37 & y3;
+  uint32_t z11 = t33 & y4, z12 = t43 & y13, z13 = t40 & y5, z14 = t29 & y2;
+  uint32_t z15 = t42 & y9, z16 = t45 & y14, z17 = t41 & y8;
+  uint32_t t46 = z15 ^ z16, t47 = z10 ^ z11, t48 = z5 ^ z13, t49 = z9 ^ z10;
+  uint32_t t50 = z2 ^ z12, t51 = z2 ^ z5, t52 = z7 ^ z8, t53 = z0 ^ z3;
+  uint32_t t54 = z6 ^ z7, t55 = z16 ^ z17, t56 = z12 ^ t48, t57 = t50 ^ t53;
+  uint32_t t58 = z4 ^ t46, t59 = z3 ^ t54, t60 = t46 ^ t57, t61 = z14 ^ t57;
+  uint32_t t62 = t52 ^ t58, t63 = t49 ^ t58, t64 = z4 ^ t59, t65 = t61 ^ t62;
+  uint32_t t66 = z1 ^ t63;
+  uint32_t s0 = t59 ^ t63;
+  uint32_t s6 = t56 ^ (t62 ^ 15u);
+  uint32_t s7 = t48 ^ (t60 ^ 15u);
+  uint32_t t67 = t64 ^ t65;
+  uint32_t s3 = t53 ^ t66;
+  uint32_t s4 = t51 ^ t66;
+  uint32_t s5 = t47 ^ t65;
+  uint32_t s1 = t64 ^ (s3 ^ 15u);
+  uint32_t s2 = t55 ^ (t67 ^ 15u);
 
-static inline uint8_t zan_rotl8(uint8_t v, int n) {
-  return (uint8_t)((uint8_t)(v << n) | (uint8_t)(v >> (8 - n)));
-}
+  uint32_t s20 = s2 ^ s0, s54 = s5 ^ s4, s31 = s3 ^ s1;
+  uint32_t r0 = s6 ^ s20 ^ s1;
+  uint32_t r1 = s54 ^ s20;
+  uint32_t r2 = s7 ^ s4 ^ s31 ^ s20 ^ 15u;
+  uint32_t r3 = s7 ^ s6 ^ s5 ^ s31 ^ s20;
+  uint32_t r4 = s7 ^ s54 ^ s31 ^ s0 ^ 15u;
+  uint32_t r5 = s7 ^ s6 ^ s54 ^ s20 ^ 15u;
+  uint32_t r6 = s5 ^ s31;
+  uint32_t r7 = s6 ^ s54 ^ s31 ^ s20;
 
-/* AES S-box（恒定时间）：仿射 = v ^ rotl1 ^ rotl2 ^ rotl3 ^ rotl4 ^ 0x63 */
-static inline uint8_t zan_sm4_aes_sbox(uint8_t u) {
-  uint8_t v = zan_sm4_gf_inv(u);
-  return (uint8_t)(v ^ zan_rotl8(v, 1) ^ zan_rotl8(v, 2) ^ zan_rotl8(v, 3) ^
-                   zan_rotl8(v, 4) ^ 0x63);
-}
-
-/* SM4 S-box 恒定时间合成（M1 → AES_S ⊕0x0f → M2，M2 低半字节取反） */
-static inline uint8_t zan_sm4_sbox(uint8_t x) {
-  uint8_t u =
-      (uint8_t)(zan_sm4_sel4(0x00, 0xa2, 0x49, 0x09, 0x12, (uint8_t)(x >> 4)) ^
-                zan_sm4_sel4(0x01, 0x06, 0x73, 0xe5, 0x56,
-                             (uint8_t)(x & 0x0f)));
-  uint8_t v = (uint8_t)(zan_sm4_aes_sbox(u) ^ 0x0f);
-  return (
-      uint8_t)(zan_sm4_sel4(0x00, 0xdc, 0xaf, 0xdd, 0xbf, (uint8_t)(v >> 4)) ^
-               zan_sm4_sel4(0x34, 0x3c, 0xa9, 0xfa, 0xb6,
-                            (uint8_t)(~v & 0x0f)));
-}
-
-/* 轮函数 τ：4 字节 S-box 并置（恒定时间） */
-static inline uint32_t zan_sm4_tau(uint32_t x) {
-  return ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 24)) << 24) |
-         ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 16)) << 16) |
-         ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 8)) << 8) |
-         (uint32_t)zan_sm4_sbox((uint8_t)x);
+  uint32_t byte0 = (r0 & 1u) | ((r1 & 1u) << 1) | ((r2 & 1u) << 2) |
+                   ((r3 & 1u) << 3) | ((r4 & 1u) << 4) | ((r5 & 1u) << 5) |
+                   ((r6 & 1u) << 6) | ((r7 & 1u) << 7);
+  uint32_t byte1 = ((r0 >> 1) & 1u) | (((r1 >> 1) & 1u) << 1) |
+                   (((r2 >> 1) & 1u) << 2) | (((r3 >> 1) & 1u) << 3) |
+                   (((r4 >> 1) & 1u) << 4) | (((r5 >> 1) & 1u) << 5) |
+                   (((r6 >> 1) & 1u) << 6) | (((r7 >> 1) & 1u) << 7);
+  uint32_t byte2 = ((r0 >> 2) & 1u) | (((r1 >> 2) & 1u) << 1) |
+                   (((r2 >> 2) & 1u) << 2) | (((r3 >> 2) & 1u) << 3) |
+                   (((r4 >> 2) & 1u) << 4) | (((r5 >> 2) & 1u) << 5) |
+                   (((r6 >> 2) & 1u) << 6) | (((r7 >> 2) & 1u) << 7);
+  uint32_t byte3 = ((r0 >> 3) & 1u) | (((r1 >> 3) & 1u) << 1) |
+                   (((r2 >> 3) & 1u) << 2) | (((r3 >> 3) & 1u) << 3) |
+                   (((r4 >> 3) & 1u) << 4) | (((r5 >> 3) & 1u) << 5) |
+                   (((r6 >> 3) & 1u) << 6) | (((r7 >> 3) & 1u) << 7);
+  return byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24);
 }
 
 /* 轮函数 L（加解密）：B ^ <<<2 ^ <<<10 ^ <<<18 ^ <<<24 */
@@ -284,7 +604,53 @@ static inline uint32_t zan_sm4_lp(uint32_t b) {
   return b ^ zan_rotl32(b, 13) ^ zan_rotl32(b, 23);
 }
 
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||            \
+     defined(_M_IX86)) &&                                                      \
+    (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("aes,ssse3"))) static void
+zan_sm4_set_key_aesni(uint32_t rk[32], const uint8_t key[16]) {
+  const __m128i c0f = _mm_set1_epi8(0x0f);
+  const __m128i m1l =
+      _mm_set_epi64x(0xC7C1B4B222245157ULL, 0x9197E2E474720701ULL);
+  const __m128i m1h =
+      _mm_set_epi64x(0xF052B91BF95BB012ULL, 0xE240AB09EB49A200ULL);
+  const __m128i m2l =
+      _mm_set_epi64x(0xEDD14478172BBE82ULL, 0x5B67F2CEA19D0834ULL);
+  const __m128i m2h =
+      _mm_set_epi64x(0x11CDBE62CC1063BFULL, 0xAE7201DD73AFDC00ULL);
+
+  uint32_t K[36];
+  K[0] = zan_load_be32(key + 0) ^ ZAN_SM4_FK0;
+  K[1] = zan_load_be32(key + 4) ^ ZAN_SM4_FK1;
+  K[2] = zan_load_be32(key + 8) ^ ZAN_SM4_FK2;
+  K[3] = zan_load_be32(key + 12) ^ ZAN_SM4_FK3;
+  for (int i = 0; i < 32; i++) {
+    uint32_t w = K[i + 1] ^ K[i + 2] ^ K[i + 3] ^ zan_sm4_ck[i];
+    /* 4 列广播后 ShiftRows 为恒等变换，aesenclast 恒定时间直出同构 S-box */
+    __m128i x = _mm_set1_epi32((int)w);
+    __m128i y = _mm_shuffle_epi8(m1l, _mm_and_si128(x, c0f));
+    x = _mm_xor_si128(
+        _mm_shuffle_epi8(m1h, _mm_and_si128(_mm_srli_epi64(x, 4), c0f)), y);
+    x = _mm_aesenclast_si128(x, c0f);
+    y = _mm_shuffle_epi8(m2l, _mm_andnot_si128(x, c0f));
+    x = _mm_xor_si128(
+        _mm_shuffle_epi8(m2h, _mm_and_si128(_mm_srli_epi64(x, 4), c0f)), y);
+    uint32_t tau = (uint32_t)_mm_cvtsi128_si32(x);
+    K[i + 4] = K[i] ^ zan_sm4_lp(tau);
+    rk[i] = K[i + 4];
+  }
+}
+#endif
+
 static void zan_sm4_set_key(uint32_t rk[32], const uint8_t key[16]) {
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||            \
+     defined(_M_IX86)) &&                                                      \
+    (defined(__GNUC__) || defined(__clang__))
+  if (zan_hw_x86_can(ZAN_HW_REQ_SM4)) {
+    zan_sm4_set_key_aesni(rk, key);
+    return;
+  }
+#endif
   uint32_t K[36];
   for (int i = 0; i < 4; i++) {
     uint32_t w = ((uint32_t)key[i * 4 + 0] << 24) |
