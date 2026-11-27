@@ -997,44 +997,143 @@ partial class Irgen {
         }
     }
 
-    // n-way concatenation with a single allocation: sum the part lengths,
-    // malloc once, memcpy each part in order and NUL-terminate. Replaces the
-    // O(n^2) copying of emitting a chain pairwise.
-    ExprVal StrConcatN(List<Node> parts) {
-        List<string> vals = new List<string>();
-        List<string> lens = new List<string>();
-        string tot = "0";
+    void EnsureStrCatKHelper(int k) {
+        if (k == 2) { if (strCat2Emitted) { return; } strCat2Emitted = true; }
+        else if (k == 3) { if (strCat3Emitted) { return; } strCat3Emitted = true; }
+        else if (k == 4) { if (strCat4Emitted) { return; } strCat4Emitted = true; }
+        else if (k == 5) { if (strCat5Emitted) { return; } strCat5Emitted = true; }
+        else { return; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_cat" + k + "(");
         int i = 0;
-        while (i < parts.Count) {
-            ExprVal v = GenExpr(parts[i]);
-            string s = ToCStr(v);
-            vals.Add(s);
-            lens.Add(StrLen(s));
-            string nt = NT(); L("  " + nt + " = add i64 " + tot + ", " + lens[i]);
+        while (i < k) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("i8* %s" + i);
+            i = i + 1;
+        }
+        sb.Append(") {\nentry:\n");
+        i = 0;
+        while (i < k) {
+            sb.Append("  %l" + i + " = call i64 @zstr_len(i8* %s" + i + ")\n");
+            i = i + 1;
+        }
+        string tot = "%l0";
+        i = 1;
+        while (i < k) {
+            string nt = "%tot" + i;
+            sb.Append("  " + nt + " = add i64 " + tot + ", %l" + i + "\n");
             tot = nt;
             i = i + 1;
         }
-        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
-        string off = "0";
-        i = 0;
-        while (i < parts.Count) {
-            string dst = NT(); L("  " + dst + " = getelementptr i8, i8* " + buf + ", i64 " + off);
-            L("  call i8* @memcpy(i8* " + dst + ", i8* " + vals[i] + ", i64 " + lens[i] + ")");
-            string no = NT(); L("  " + no + " = add i64 " + off + ", " + lens[i]);
-            off = no;
+        sb.Append("  %buf = call i8* @zstr_new(i64 " + tot + ")\n");
+        sb.Append("  call i8* @memcpy(i8* %buf, i8* %s0, i64 %l0)\n");
+        string off = "%l0";
+        i = 1;
+        while (i < k) {
+            sb.Append("  %p" + i + " = getelementptr i8, i8* %buf, i64 " + off + "\n");
+            sb.Append("  call i8* @memcpy(i8* %p" + i + ", i8* %s" + i + ", i64 %l" + i + ")\n");
+            if (i + 1 < k) {
+                string no = "%off" + i;
+                sb.Append("  " + no + " = add i64 " + off + ", %l" + i + "\n");
+                off = no;
+            }
             i = i + 1;
         }
-        return OwnedString(buf);
+        sb.Append("  ret i8* %buf\n}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureStrCatNHelper() {
+        if (strCatNEmitted) { return; }
+        strCatNEmitted = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_catn(i8** %parts, i64 %n) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  br label %sum.cond\n");
+        sb.Append("sum.cond:\n");
+        sb.Append("  %i = phi i64 [ 0, %entry ], [ %i.next, %sum.body ]\n");
+        sb.Append("  %tot = phi i64 [ 0, %entry ], [ %tot.next, %sum.body ]\n");
+        sb.Append("  %more = icmp slt i64 %i, %n\n");
+        sb.Append("  br i1 %more, label %sum.body, label %alloc\n");
+        sb.Append("sum.body:\n");
+        sb.Append("  %sp = getelementptr i8*, i8** %parts, i64 %i\n");
+        sb.Append("  %s = load i8*, i8** %sp\n");
+        sb.Append("  %sl = call i64 @zstr_len(i8* %s)\n");
+        sb.Append("  %tot.next = add i64 %tot, %sl\n");
+        sb.Append("  %i.next = add i64 %i, 1\n");
+        sb.Append("  br label %sum.cond\n");
+        sb.Append("alloc:\n");
+        sb.Append("  %buf = call i8* @zstr_new(i64 %tot)\n");
+        sb.Append("  br label %cpy.cond\n");
+        sb.Append("cpy.cond:\n");
+        sb.Append("  %j = phi i64 [ 0, %alloc ], [ %j.next, %cpy.body ]\n");
+        sb.Append("  %off = phi i64 [ 0, %alloc ], [ %off.next, %cpy.body ]\n");
+        sb.Append("  %cmore = icmp slt i64 %j, %n\n");
+        sb.Append("  br i1 %cmore, label %cpy.body, label %done\n");
+        sb.Append("cpy.body:\n");
+        sb.Append("  %cp = getelementptr i8*, i8** %parts, i64 %j\n");
+        sb.Append("  %cs = load i8*, i8** %cp\n");
+        sb.Append("  %cl = call i64 @zstr_len(i8* %cs)\n");
+        sb.Append("  %dst = getelementptr i8, i8* %buf, i64 %off\n");
+        sb.Append("  call i8* @memcpy(i8* %dst, i8* %cs, i64 %cl)\n");
+        sb.Append("  %off.next = add i64 %off, %cl\n");
+        sb.Append("  %j.next = add i64 %j, 1\n");
+        sb.Append("  br label %cpy.cond\n");
+        sb.Append("done:\n");
+        sb.Append("  ret i8* %buf\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    // n-way concatenation with a single allocation via outlined @zstr_cat2..5 /
+    // @zstr_catn helpers: preserves O(n) single-allocation semantics while
+    // eliminating tens of thousands of repeated @zstr_len/@memcpy IR lines.
+    ExprVal StrConcatN(List<Node> parts) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        while (i < parts.Count) {
+            ExprVal v = GenExpr(parts[i]);
+            vals.Add(ToCStr(v));
+            i = i + 1;
+        }
+        int n = vals.Count;
+        if (n == 0) { return GenStr(""); }
+        if (n == 1) { return new ExprVal(vals[0], MkType("string")); }
+        if (n <= 5) {
+            EnsureStrCatKHelper(n);
+            StringBuilder args = new StringBuilder();
+            i = 0;
+            while (i < n) {
+                if (i > 0) { args.Append(", "); }
+                args.Append("i8* " + vals[i]);
+                i = i + 1;
+            }
+            string buf = NT();
+            L("  " + buf + " = call i8* @zstr_cat" + n + "(" + args.ToString() + ")");
+            return OwnedString(buf);
+        }
+        EnsureStrCatNHelper();
+        string arrTy = "[" + n + " x i8*]";
+        string arrSlot = NT();
+        EA(arrSlot, arrTy);
+        i = 0;
+        while (i < n) {
+            string ep = NT();
+            L("  " + ep + " = getelementptr inbounds " + arrTy + ", " + arrTy + "* " + arrSlot + ", i64 0, i64 " + i);
+            L("  store i8* " + vals[i] + ", i8** " + ep);
+            i = i + 1;
+        }
+        string basePtr = NT();
+        L("  " + basePtr + " = getelementptr inbounds " + arrTy + ", " + arrTy + "* " + arrSlot + ", i64 0, i64 0");
+        string bufN = NT();
+        L("  " + bufN + " = call i8* @zstr_catn(i8** " + basePtr + ", i64 " + n + ")");
+        return OwnedString(bufN);
     }
 
     ExprVal StrConcat(string a, string b) {
-        string la = StrLen(a);
-        string lb = StrLen(b);
-        string tot = NT(); L("  " + tot + " = add i64 " + la + ", " + lb);
-        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
-        L("  call i8* @memcpy(i8* " + buf + ", i8* " + a + ", i64 " + la + ")");
-        string off = NT(); L("  " + off + " = getelementptr i8, i8* " + buf + ", i64 " + la);
-        L("  call i8* @memcpy(i8* " + off + ", i8* " + b + ", i64 " + lb + ")");
+        EnsureStrCatKHelper(2);
+        string buf = NT();
+        L("  " + buf + " = call i8* @zstr_cat2(i8* " + a + ", i8* " + b + ")");
         return OwnedString(buf);
     }
 

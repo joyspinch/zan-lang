@@ -1116,36 +1116,73 @@ partial class Irgen {
         if (rtCheckFailEmitted) { return; }
         rtCheckFailEmitted = true;
         EnsureExcThrowMsgHelper();
-        if (!ExternSeen("zan_rt_soft_is_hard")) {
-            externDecls.Add("zan_rt_soft_is_hard");
-            H("declare i32 @zan_rt_soft_is_hard()");
+        if (!ExternSeen("zan_rt_guard_fail3")) {
+            externDecls.Add("zan_rt_guard_fail3");
+            H("declare void @zan_rt_guard_fail3(i8*, i32, i32, i8*)");
         }
-        if (!ExternSeen("zan_rt_soft_note")) {
-            externDecls.Add("zan_rt_soft_note");
-            H("declare void @zan_rt_soft_note(i8*)");
+        if (strictRuntime && !ExternSeen("zan_rt_set_strict")) {
+            externDecls.Add("zan_rt_set_strict");
+            H("declare void @zan_rt_set_strict()");
         }
-        if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
+        string unkFile = RawCString("<unknown>", true);
         StringBuilder sb = new StringBuilder();
-        sb.Append("define internal void @zrt_check_fail(i8* %tid, i8* %excMsg, i8* %thard, i8* %tsoft, i1 %strict) cold noinline {\n");
+        sb.Append("define internal void @zrt_check_fail(i8* %tid, i8* %msg, i32 %line, i32 %col) cold noinline {\n");
         sb.Append("entry:\n");
         sb.Append("  %sp = load i64, i64* @__exc_sp\n");
         sb.Append("  %hasH = icmp sgt i64 %sp, 1\n");
         sb.Append("  br i1 %hasH, label %do_throw, label %no_throw\n");
         sb.Append("do_throw:\n");
-        sb.Append("  call void @zexc_throw_msg(i8* %tid, i8* %excMsg)\n");
+        sb.Append("  call void @zexc_throw_msg(i8* %tid, i8* %msg)\n");
         sb.Append("  unreachable\n");
         sb.Append("no_throw:\n");
-        sb.Append("  br i1 %strict, label %hard, label %chk_hard\n");
-        sb.Append("chk_hard:\n");
-        sb.Append("  %hd = call i32 @zan_rt_soft_is_hard()\n");
-        sb.Append("  %hz = icmp ne i32 %hd, 0\n");
-        sb.Append("  br i1 %hz, label %hard, label %soft\n");
-        sb.Append("hard:\n");
-        sb.Append("  call void @zan_rt_soft_note(i8* %thard)\n");
-        sb.Append("  call void @exit(i32 70)\n");
-        sb.Append("  unreachable\n");
-        sb.Append("soft:\n");
-        sb.Append("  call void @zan_rt_soft_note(i8* %tsoft)\n");
+        if (strictRuntime) {
+            sb.Append("  call void @zan_rt_set_strict()\n");
+        }
+        sb.Append("  call void @zan_rt_guard_fail3(i8* " + unkFile + ", i32 %line, i32 %col, i8* %msg)\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureRtChkNullHelper() {
+        if (rtChkNullEmitted) { return; }
+        rtChkNullEmitted = true;
+        EnsureRtCheckFailHelper();
+        string tid = GuardExcOrBase("NullReferenceException");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zrt_chk_null(i8* %msg, i32 %line, i32 %col) cold noinline {\n");
+        sb.Append("entry:\n");
+        sb.Append("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* %msg, i32 %line, i32 %col)\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureRtChkListOobHelper() {
+        if (rtChkListOobEmitted) { return; }
+        rtChkListOobEmitted = true;
+        EnsureRtCheckFailHelper();
+        string tid = GuardExcOrBase("IndexOutOfRangeException");
+        string msgOp = GenStrConst("list index out of bounds");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zrt_chk_list_oob(i32 %line, i32 %col) cold noinline {\n");
+        sb.Append("entry:\n");
+        sb.Append("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + msgOp + ", i32 %line, i32 %col)\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureRtChkListNullHelper() {
+        if (rtChkListNullEmitted) { return; }
+        rtChkListNullEmitted = true;
+        EnsureRtCheckFailHelper();
+        string tid = GuardExcOrBase("NullReferenceException");
+        string msgOp = GenStrConst("null reference where a List is required");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zrt_chk_list_null(i32 %line, i32 %col) cold noinline {\n");
+        sb.Append("entry:\n");
+        sb.Append("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + msgOp + ", i32 %line, i32 %col)\n");
         sb.Append("  ret void\n");
         sb.Append("}\n");
         deferred.Append(sb.ToString());
@@ -1153,18 +1190,28 @@ partial class Irgen {
 
     void EmitRuntimeCheckIf(Node at, string bad, string msg, bool required = false) {
         if (!runtimeChecks && !required) { return; }
-        EnsureRtCheckFailHelper();
-        string text = "<unknown>:" + at.line + ":" + at.col
-            + ": runtime error: " + msg + "\n";
-        string tsoft = RawCString(text + "\n", true);
-        string thard = RawCString(text, true);
-        string tid = InferGuardExceptionTid(msg);
-        string excMsg = GenStrConst(msg);
+        int ln = (at != null && at.line > 0) ? at.line : 0;
+        int cl = (at != null && at.col > 0) ? at.col : 0;
         int lcheck = NL(); int lskip = NL();
         L("  br i1 " + bad + ", label %L" + lcheck + ", label %L" + lskip);
         Label(lcheck);
-        L("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + excMsg
-            + ", i8* " + thard + ", i8* " + tsoft + ", i1 " + (strictRuntime ? "true" : "false") + ")");
+        if (msg == "list index out of bounds") {
+            EnsureRtChkListOobHelper();
+            L("  call void @zrt_chk_list_oob(i32 " + ln + ", i32 " + cl + ")");
+        } else if (msg == "null reference where a List is required") {
+            EnsureRtChkListNullHelper();
+            L("  call void @zrt_chk_list_null(i32 " + ln + ", i32 " + cl + ")");
+        } else if (msg.IndexOf("null reference") >= 0 && msg.IndexOf("index") < 0 && msg.IndexOf("bounds") < 0) {
+            EnsureRtChkNullHelper();
+            string excMsg = GenStrConst(msg);
+            L("  call void @zrt_chk_null(i8* " + excMsg + ", i32 " + ln + ", i32 " + cl + ")");
+        } else {
+            EnsureRtCheckFailHelper();
+            string tid = InferGuardExceptionTid(msg);
+            string excMsg = GenStrConst(msg);
+            L("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + excMsg
+                + ", i32 " + ln + ", i32 " + cl + ")");
+        }
         L("  br label %L" + lskip);
         Label(lskip);
     }

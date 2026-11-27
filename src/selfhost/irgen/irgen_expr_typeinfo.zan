@@ -1659,7 +1659,19 @@ partial class Irgen {
             }
 
             Node cls0 = ClassOf(recv.ty);
-            if (cls0 != null && cls0.sval != "object" && methName != "") {
+            bool cls0HasSub = false;
+            if (cls0 != null && cls0.sval != "object") {
+                int sbi = 0;
+                while (sbi < tidNames.Count) {
+                    string scn = tidNames[sbi];
+                    if (scn != cls0.sval && IsSubclassName(scn, cls0.sval)) {
+                        cls0HasSub = true;
+                        break;
+                    }
+                    sbi = sbi + 1;
+                }
+            }
+            if (cls0 != null && cls0.sval != "object" && !cls0HasSub && methName != "") {
                 Node meth = FindMethodUp(cls0, methName);
                 if (meth == null || (mname == "InvokeTask" && !HasMod(meth, MOD.Async()))) {
                     if (mname == "Invoke") { return new ExprVal("0", MkType("bool")); }
@@ -1694,8 +1706,8 @@ partial class Irgen {
                 }
             }
 
-            // Computed method name on a statically typed class receiver: dispatch by strcmp over its method hierarchy.
-            if (cls0 != null && cls0.sval != "object" && methName == "" && e.kids.Count > 0) {
+            // Computed method name on a leaf statically typed class receiver: dispatch by strcmp over its method hierarchy.
+            if (cls0 != null && cls0.sval != "object" && !cls0HasSub && methName == "" && e.kids.Count > 0) {
                 List<Node> allM = new List<Node>();
                 List<string> seenM = new List<string>();
                 CollectClassMethods(cls0, allM, seenM);
@@ -1715,7 +1727,7 @@ partial class Irgen {
                     string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
                     string resSlot = NT();
-                    L("  " + resSlot + " = alloca " + retTyLL);
+                    EA(resSlot, retTyLL);
                     L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
                     int lend = NL();
                     int lchk = NL();
@@ -1777,12 +1789,16 @@ partial class Irgen {
                 }
             }
 
-            // Fallback for object / dynamic receiver: dispatch through candidate classes in tidNames
+            // Fallback for object / polymorphic receiver: dispatch through candidate classes in tidNames
             if (methName != "") {
                 List<string> cands = new List<string>();
                 int tii = 0;
                 while (tii < tidNames.Count) {
                     string cn = tidNames[tii];
+                    if (cls0 != null && cls0.sval != "object" && cn != cls0.sval && !IsSubclassName(cn, cls0.sval)) {
+                        tii = tii + 1;
+                        continue;
+                    }
                     Node cdecl = binder.FindType(cn);
                     if (cdecl != null && ClassHasMethodWithCall(cdecl, methName, invCall)) {
                         if (mname != "InvokeTask" || (FindMethodUp(cdecl, methName) != null && HasMod(FindMethodUp(cdecl, methName), MOD.Async()))) {
@@ -1791,7 +1807,7 @@ partial class Irgen {
                     }
                     tii = tii + 1;
                 }
-                bool isListMeth = mname != "InvokeTask" && IsContainerType("List") && (
+                bool isListMeth = (cls0 == null || cls0.sval == "object") && mname != "InvokeTask" && IsContainerType("List") && (
                     (methName == "Count" && invCall.kids.Count == 0)
                     || ((methName == "Get" || methName == "At" || (methName == "Add" && mname == "Invoke"))
                         && invCall.kids.Count == 1));
@@ -1799,7 +1815,7 @@ partial class Irgen {
                     string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
                     string resSlot = NT();
-                    L("  " + resSlot + " = alloca " + retTyLL);
+                    EA(resSlot, retTyLL);
                     L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
 
                     string cid = NT();
@@ -1876,13 +1892,17 @@ partial class Irgen {
                     }
                 }
             } else if (e.kids.Count > 0) {
-                // Computed method name on an object / dynamic receiver: dispatch by class id then strcmp over matching methods.
+                // Computed method name on an object / polymorphic receiver: dispatch by class id then strcmp over matching methods.
                 ExprVal nmVal = GenExpr(e.kids[0]);
                 string nmPtr = Coerce(nmVal, "i8*");
                 List<string> dynCands = new List<string>();
                 int tii = 0;
                 while (tii < tidNames.Count) {
                     string cn = tidNames[tii];
+                    if (cls0 != null && cls0.sval != "object" && cn != cls0.sval && !IsSubclassName(cn, cls0.sval)) {
+                        tii = tii + 1;
+                        continue;
+                    }
                     Node cdecl = binder.FindType(cn);
                     if (cdecl != null && (cdecl.kind == AK.ClassDecl() || (cdecl.kind == AK.StructDecl() && !cdecl.layoutExplicit))) {
                         List<Node> allM = new List<Node>();
@@ -1907,7 +1927,7 @@ partial class Irgen {
                     string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
                     string resSlot = NT();
-                    L("  " + resSlot + " = alloca " + retTyLL);
+                    EA(resSlot, retTyLL);
                     L("  store " + retTyLL + " " + dfltVal + ", " + retTyLL + "* " + resSlot);
                     int lend = NL();
                     int lchk = NL();

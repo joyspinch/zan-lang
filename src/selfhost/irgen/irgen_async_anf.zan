@@ -1094,6 +1094,23 @@ partial class Irgen {
         ExprVal v = GenExpr(a);
         return ToI64(v.op, MapType(v.ty));
     }
+    void EmitAwaitProfileWait(Node site, string kind) {
+        if (!hasTaskProfile) { return; }
+        if (site == null || site.line <= 0 || diags == null) { return; }
+        string file = diags.FileOfLine(site.line);
+        if (file == null || file == "") { return; }
+        int ln = diags.LineInFile(site.line);
+        int cl = site.col > 0 ? site.col : 0;
+        if (!ExternSeen("zan_task_profile_wait")) {
+            externDecls.Add("zan_task_profile_wait");
+            H("declare void @zan_task_profile_wait(i8*, i8*, i32, i32, i8*)");
+        }
+        string fileOp = RawCString(file, true);
+        string kindOp = RawCString(kind, true);
+        L("  call void @zan_task_profile_wait(i8* %fp, i8* " + fileOp
+            + ", i32 " + ln + ", i32 " + cl + ", i8* " + kindOp + ")");
+    }
+
     ExprVal EmitSocketIntrinsic(Node callExpr) {
         string cn = callExpr.a.a.sval;
         string mn = callExpr.a.sval;
@@ -1121,6 +1138,7 @@ partial class Irgen {
             Label(lpark);
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
+            EmitAwaitProfileWait(callExpr, "join");
             EmitAsyncSuspend();
             L("  ret void");
             Label(limm);
@@ -1145,9 +1163,9 @@ partial class Irgen {
             string slot2 = FrameGep("%ff", curSubBase);
             string entryR = NT(); L("  " + entryR + " = load i64, i64* " + slot2);
             L("  store i64 0, i64* " + slot2);
-            string tidSlot = NT(); L("  " + tidSlot + " = alloca i8*");
+            string tidSlot = NT(); EA(tidSlot, "i8*");
             L("  store i8* null, i8** " + tidSlot);
-            string ownSlot = NT(); L("  " + ownSlot + " = alloca i32");
+            string ownSlot = NT(); EA(ownSlot, "i32");
             L("  store i32 0, i32* " + ownSlot);
             string jexc = NT();
             L("  " + jexc + " = call i8* @zan_join_exc(i64 " + entryR + ", i8** " + tidSlot + ", i32* " + ownSlot + ")");
@@ -1180,6 +1198,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAwaitProfileWait(callExpr, "timer");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1192,6 +1211,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAwaitProfileWait(callExpr, "yield");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1212,6 +1232,7 @@ partial class Irgen {
             } else {
                 L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             }
+            EmitAwaitProfileWait(callExpr, "gate");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1226,6 +1247,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAwaitProfileWait(callExpr, mn == "ReadReady" ? "socket_read_ready" : "socket_write_ready");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1254,6 +1276,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAwaitProfileWait(callExpr, "socket_recv");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1295,6 +1318,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_recv_to_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i64 " + tmo + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAwaitProfileWait(callExpr, "socket_recv_timeout");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1313,6 +1337,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
+            EmitAwaitProfileWait(callExpr, "socket_accept");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1362,6 +1387,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_resolve_sa_co(i8* " + nm + ", i32 " + port32 + ", i8* " + buf + ", i32 " + cap32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAwaitProfileWait(callExpr, "dns");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1395,6 +1421,7 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             StoreFrameState("%ff", st);
             L("  call void @zan_io_resolve_co(i8* " + host + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAwaitProfileWait(callExpr, "dns");
             EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
@@ -1415,11 +1442,22 @@ partial class Irgen {
         return new ExprVal("0", MkType("int"));
     }
 
+    bool HasActiveMonitor() {
+        int i = 0;
+        while (i < finMonSlot.Count) {
+            if (finMonSlot[i] != null) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     // Cooperative preemption point on loop back-edges inside async methods
     // (mirrors C host emit_async_preempt_site): polls @zan_co_poll() and
     // suspends via @zan_co_ready when the scheduler requests a yield.
+    // Never suspend while holding a monitor lock: suspending drops the stack
+    // frame and risks cross-thread unlock or deadlock.
     void EmitAsyncPreemptSite(int targetLbl) {
-        if (!curAsync) {
+        if (!curAsync || HasActiveMonitor()) {
             L("  br label %L" + targetLbl);
             return;
         }
