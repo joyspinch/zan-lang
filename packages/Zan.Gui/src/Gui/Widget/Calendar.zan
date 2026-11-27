@@ -32,6 +32,24 @@ public class Calendar : Control {
     public Control footerBox;
     public Button nowBtn;
     public Button clearBtn;
+    private bool syncedViewInit;
+    private int syncedViewYear = 0 - 1;
+    private int syncedViewMonth = 0 - 1;
+    private bool syncedViewPanel;
+    private DateTime cachedSelDate;
+    private string cachedSelStr;
+    internal DateTime paintTodayRef;
+    internal int paintTodaySeq = 0 - 1;
+    private App cachedPartApp;
+    private int cachedPartGen;
+    private int cachedPartScale;
+    private int cachedPartDpi;
+    private int cachedPartRuleSig;
+    private string cachedPartCls;
+    private string cachedPartName;
+    private StyleBox cachedCellIn;
+    private StyleBox cachedCellOut;
+    private StyleBox cachedTodayBox;
     public Calendar() {
         this.InitControl("calendar");
         this.ClassName = "calendar col";
@@ -243,17 +261,27 @@ public class Calendar : Control {
     }
     public void SyncCalendarView() { this.SyncCalendarView(null); }
     public void SyncCalendarView(App app) {
-        if (titleLabel != null) { titleLabel.Text = Calendar.MonthLabel(viewYear, viewMonth); }
         bool isPanel = (Mode != null && Mode.Get() == "panel");
-        if (todayBtn != null) { todayBtn.Visible = !isPanel; }
-        if (footerBox != null) { footerBox.Visible = isPanel; }
-        this.SyncDisabledButtons();
-        if (cells != null) {
-            for (int i = 0; i < cells.Count; i = i + 1) {
-                DateTime d = Calendar.CellDate(viewYear, viewMonth, i);
-                cells[i].date = d;
+        bool ymChanged = !syncedViewInit || syncedViewYear != viewYear || syncedViewMonth != viewMonth;
+        bool panelChanged = !syncedViewInit || syncedViewPanel != isPanel;
+        if (ymChanged) {
+            if (titleLabel != null) { titleLabel.Text = Calendar.MonthLabel(viewYear, viewMonth); }
+            if (cells != null) {
+                for (int i = 0; i < cells.Count; i = i + 1) {
+                    DateTime d = Calendar.CellDate(viewYear, viewMonth, i);
+                    cells[i].date = d;
+                }
             }
+            syncedViewYear = viewYear;
+            syncedViewMonth = viewMonth;
         }
+        if (panelChanged) {
+            if (todayBtn != null) { todayBtn.Visible = !isPanel; }
+            if (footerBox != null) { footerBox.Visible = isPanel; }
+            syncedViewPanel = isPanel;
+        }
+        syncedViewInit = true;
+        this.SyncDisabledButtons();
     }
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
         Calendar calendar = (Calendar)target;
@@ -307,13 +335,22 @@ public class Calendar : Control {
         if (Value != null) {
             string val = Value.Get();
             if (val == "" || val == null) {
-                if (selected != null) { selected = null; }
+                if (selected != null) { selected = null; cachedSelDate = null; cachedSelStr = ""; }
             } else {
-                string cur = selected != null ? selected.ToDateString() : "";
+                string cur = "";
+                if (selected != null) {
+                    if (cachedSelDate != selected) {
+                        cachedSelDate = selected;
+                        cachedSelStr = selected.ToDateString();
+                    }
+                    cur = cachedSelStr;
+                }
                 if (val != cur) {
                     DateTime d = DateTime.ParseDate(val);
                     if (d != null) {
                         selected = d;
+                        cachedSelDate = d;
+                        cachedSelStr = d.ToDateString();
                         viewYear = d.Year();
                         viewMonth = d.Month();
                     }
@@ -427,13 +464,62 @@ public class Calendar : Control {
             c.DrawLine(bx, top + h * cellH, bx + cellW * 7, top + h * cellH, line, 1);
         }
     }
+    internal DateTime TodayForFrame(App app) {
+        int seq = app != null ? app.frameSeq : 0;
+        if (paintTodayRef == null || paintTodaySeq != seq) {
+            paintTodayRef = Calendar.TodayRef();
+            paintTodaySeq = seq;
+        }
+        return paintTodayRef;
+    }
+    internal void EnsureCellPartCache(App app) {
+        if (app == null) { return; }
+        int rsig = app.CurrentStyleRuleSig();
+        if (cachedCellIn != null && cachedPartApp == app
+                && cachedPartGen == app.bgThemeGen
+                && cachedPartScale == app.metricsScale
+                && cachedPartDpi == app.dpiScale
+                && cachedPartRuleSig == rsig
+                && cachedPartCls == Class
+                && cachedPartName == name) {
+            return;
+        }
+        string outCls = Class + " secondary";
+        StyleBox cin = this.ResolvePartRefAs(app, "calendar", "cell", "label", Class, Style.SNormal());
+        StyleBox cout = this.ResolvePartRefAs(app, "calendar", "cell", "label", outCls, Style.SNormal());
+        StyleBox td = this.ResolvePartRefAs(app, "calendar", "today", "", Class, Style.SNormal());
+        cachedCellIn = cin;
+        cachedCellOut = cout;
+        cachedTodayBox = td;
+        if (Style.ContextDependencyFor(app, "calendar::cell", Class, name) == 0
+                && Style.ContextDependencyFor(app, "calendar::cell", outCls, name) == 0
+                && Style.ContextDependencyFor(app, "calendar::today", Class, name) == 0) {
+            cachedPartApp = app;
+            cachedPartGen = app.bgThemeGen;
+            cachedPartScale = app.metricsScale;
+            cachedPartDpi = app.dpiScale;
+            cachedPartRuleSig = rsig;
+            cachedPartCls = Class;
+            cachedPartName = name;
+        } else {
+            cachedPartApp = null;
+        }
+    }
+    internal StyleBox CachedCellBox(App app, bool inMonth) {
+        this.EnsureCellPartCache(app);
+        return inMonth ? cachedCellIn : cachedCellOut;
+    }
+    internal StyleBox CachedTodayBox(App app) {
+        this.EnsureCellPartCache(app);
+        return cachedTodayBox;
+    }
     public int MarkColor(int tone, int fallback) { return this.MarkColor(this.App, tone, fallback); }
     public int MarkColor(App app, int tone, int fallback) {
         app = this.ResolveApp(app);
         string cls = Class;
         string toneCls = Calendar.ToneClass(tone);
         if (toneCls != "") { cls = Class + " " + toneCls; }
-        StyleBox ms = this.ResolvePartAs(app, "calendar", "mark", "", cls,
+        StyleBox ms = this.ResolvePartRefAs(app, "calendar", "mark", "", cls,
         Style.SNormal());
         return ms.FgOr(fallback != 0 ? fallback : Calendar.ToneColor(app, tone));
     }
@@ -442,6 +528,11 @@ public class CalendarCell : Control {
     public weak Calendar calendar;
     public int index;
     public DateTime date;
+    private int cachedDayNum = 0 - 1;
+    private string cachedDayStr;
+    private int cachedDayFs;
+    private int cachedDayRev = 0 - 1;
+    private int cachedDayW;
     public CalendarCell(Calendar cal, int idx) {
         this.InitControl("calendar-cell");
         this.ClassName = "calendar-cell";
@@ -478,18 +569,22 @@ public class CalendarCell : Control {
         bool dis = calendar.IsDayDisabled(date);
         bool inMonth = (date.Month() == calendar.viewMonth && date.Year() == calendar.viewYear);
         bool sel = calendar.IsSelectedDate(date);
-        bool isToday = date.Equals(Calendar.TodayRef());
+        bool isToday = date.Equals(calendar.TodayForFrame(app));
         int state = Style.SNormal();
         if (!en || dis) { state = Style.SDisabled(); }
         else if (this.isHovered) { state = Style.SHover(); }
         if (sel) { state = state | Style.SSelected(); }
-        string cls = calendar.Class;
-        if (!inMonth) { cls = cls + " secondary"; }
-        StyleBox cellS = calendar.ResolvePartAs(app, "calendar", "cell", "label", cls, state);
+        StyleBox cellS;
+        if (state == Style.SNormal()) {
+            cellS = calendar.CachedCellBox(app, inMonth);
+        } else {
+            string cls = inMonth ? calendar.Class : (calendar.Class + " secondary");
+            cellS = calendar.ResolvePartRefAs(app, "calendar", "cell", "label", cls, state);
+        }
         int bg = cellS.BgOr(0);
         int fg = cellS.FgOr(0);
         if (sel) {
-            StyleBox dayS = calendar.ResolvePartAs(app, "calendar", "day", "", calendar.Class, state);
+            StyleBox dayS = calendar.ResolvePartRefAs(app, "calendar", "day", "", calendar.Class, state);
             bg = dayS.BgOr(bg);
             fg = dayS.FgOr(fg);
         }
@@ -502,35 +597,56 @@ public class CalendarCell : Control {
             }
         }
         int fs = Style.FontFallback(app, "small");
-        string dayStr = Convert.ToString(date.Day());
-        int tw = Canvas.MeasureText(dayStr, fs);
-        int th = Canvas.FontHeight(fs);
+        int dnum = date.Day();
+        if (cachedDayNum != dnum || cachedDayStr == null) {
+            cachedDayNum = dnum;
+            cachedDayStr = Convert.ToString(dnum);
+            cachedDayRev = 0 - 1;
+        }
+        string dayStr = cachedDayStr;
         bool centerDay = isPanel || (calendar.marks.Count == 0 && bh < app.Scale(48));
+        bool needMeasure = centerDay || (isToday && !sel && !isPanel);
+        int tw = 0;
+        if (needMeasure) {
+            int rev = Canvas.TextMetricsRev();
+            if (cachedDayRev == rev && cachedDayFs == fs) {
+                tw = cachedDayW;
+            } else {
+                tw = Canvas.MeasureText(dayStr, fs);
+                cachedDayFs = fs;
+                cachedDayRev = rev;
+                cachedDayW = tw;
+            }
+        }
         int nx = bx + app.Scale(7);
         int ny = by + app.Scale(5);
         if (centerDay) {
             nx = bx + (bw - tw) / 2;
             ny = Canvas.CenterTextY(by, bh, fs);
         }
-        StyleBox todayS = calendar.ResolvePartAs(app, "calendar", "today", "", calendar.Class, Style.SNormal());
-        int todayBg = todayS.BgOr(0);
         int numFg = fg;
-        if (isToday && !sel && todayBg != 0) {
-            if (isPanel) {
-                int ins = app.Scale(2);
-                if (bw > ins * 2 && bh > ins * 2) {
-                    c.FillRoundRect(bx + ins, by + ins, bw - ins * 2, bh - ins * 2, cellR, todayBg);
+        if (isToday && !sel) {
+            StyleBox todayS = calendar.CachedTodayBox(app);
+            int todayBg = todayS.BgOr(0);
+            if (todayBg != 0) {
+                if (isPanel) {
+                    int ins = app.Scale(2);
+                    if (bw > ins * 2 && bh > ins * 2) {
+                        c.FillRoundRect(bx + ins, by + ins, bw - ins * 2, bh - ins * 2, cellR, todayBg);
+                    }
+                } else {
+                    int th = Canvas.FontHeight(fs);
+                    int pillH = Math.Max(th + app.Scale(4), app.Scale(22));
+                    int pillW = Math.Max(tw + app.Scale(10), pillH);
+                    int pillX = nx + tw / 2 - pillW / 2;
+                    int pillY = ny + th / 2 - pillH / 2;
+                    c.FillRoundRect(pillX, pillY, pillW, pillH, pillH / 2, todayBg);
                 }
-            } else {
-                int pillH = Math.Max(th + app.Scale(4), app.Scale(22));
-                int pillW = Math.Max(tw + app.Scale(10), pillH);
-                int pillX = nx + tw / 2 - pillW / 2;
-                int pillY = ny + th / 2 - pillH / 2;
-                c.FillRoundRect(pillX, pillY, pillW, pillH, pillH / 2, todayBg);
+                numFg = todayS.FgOr(fg);
             }
-            numFg = todayS.FgOr(fg);
         }
         c.DrawText(nx, ny, dayStr, numFg, fs);
+        if (calendar.marks.Count == 0) { return; }
         int tinyFs = Style.FontFallback(app, "tiny");
         int lh = tinyFs + tinyFs / 3;
         int my = by + app.Scale(26);

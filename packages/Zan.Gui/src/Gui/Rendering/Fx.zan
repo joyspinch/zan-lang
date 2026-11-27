@@ -143,34 +143,43 @@ public class Fx {
     }
     static void BorderGlow(RenderHost app, int x, int y, int w, int h,
                            int radius, int color, int periodMs, int intensity) {
-        if (app == null) { return; }
+        if (app == null || w <= 2 || h <= 2) { return; }
         Canvas c = app.HostCanvas();
         if (c == null) { return; }
         int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
         int gr = app.HostScale(3);  // 细：约为边框线宽
-        int half = per / 2;
+        if (gr < 2) { gr = 2; }
         int reach = per * 30 / 100;  // 明亮扫描带的半长
         if (reach < 1) { reach = 1; }
         int rim = intensity * 12 / 100;  // 微弱常驻边缘光
-        int stepPx = app.HostScale(4);
-        if (stepPx < 1) { stepPx = 1; }
-        int steps = per / stepPx;
-        if (steps < 48) { steps = 48; }
-        if (steps > 200) { steps = 200; }
-        for (int i = 0; i < steps; i = i + 1) {
-            int d = i * per / steps;
-            int dd = Fx.RingDist(d, head, per, half);
-            int a = rim;
-            if (dd < reach) {
+        if (rim > 0) {
+            c.DrawRoundRect(x, y, w, h, radius, Fx.WithAlpha(color, rim), 1);
+        }
+        int span = reach * 2;
+        int stepPx = app.HostScale(5);
+        if (stepPx < gr) { stepPx = gr; }
+        if (stepPx < 3) { stepPx = 3; }
+        int steps = span / stepPx;
+        if (steps < 16) { steps = 16; }
+        if (steps > 40) { steps = 40; }
+        int boost = intensity - rim;
+        if (boost > 0) {
+            for (int i = 0; i <= steps; i = i + 1) {
+                int off = (i * span / steps) - reach;
+                int dd = off < 0 ? (0 - off) : off;
+                if (dd >= reach) { continue; }
                 int p = Fx.Ease((reach - dd) * 1000 / reach);
-                a = rim + (intensity - rim) * p / 1000;
-            }
-            if (a > 0) {
-                int px = x; int py = y;
-                Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
-                c.FillRadial(px, py, gr, color, a);
+                int a = boost * p / 1000;
+                if (a > 0) {
+                    int d = head + off;
+                    if (d < 0) { d = d + per; }
+                    else if (d >= per) { d = d - per; }
+                    int px = x; int py = y;
+                    Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
+                    c.FillRadial(px, py, gr, color, a);
+                }
             }
         }
         app.RequestAnimationFrameIn(x, y, w, h);
@@ -281,6 +290,32 @@ public class Fx {
             }
             return;
         }
+        // 四条直边直接整段 FillRect，避免按 2px 切线段与三角函数开销。
+        int hStart = x + r;
+        int hEnd = x + w - r;
+        if (hEnd > hStart) {
+            int hx = hStart;
+            while (hx < hEnd) {
+                int seg = dl;
+                if (hx + seg > hEnd) { seg = hEnd - hx; }
+                c.FillRect(hx, y, seg, bw, color);
+                c.FillRect(hx, y + h - bw, seg, bw, color);
+                hx = hx + step;
+            }
+        }
+        int vStart = y + r;
+        int vEnd = y + h - r;
+        if (vEnd > vStart) {
+            int vy = vStart;
+            while (vy < vEnd) {
+                int seg = dl;
+                if (vy + seg > vEnd) { seg = vEnd - vy; }
+                c.FillRect(x, vy, bw, seg, color);
+                c.FillRect(x + w - bw, vy, bw, seg, color);
+                vy = vy + step;
+            }
+        }
+        // 四个圆角 90° 弧段：计算一次第一象限弧点并镜像到四角。
         int half = bw / 2;
         int ix = x + half;
         int iy = y + half;
@@ -288,28 +323,42 @@ public class Fx {
         int ih = h - bw;
         if (iw <= 0 || ih <= 0) { return; }
         int ir = r - half;
-        if (ir < 0) { ir = 0; }
-        int per = Fx.PerimeterLength(iw, ih, ir);
-        if (per <= 0) { return; }
-        int sub = app.HostScale(2);
-        if (sub < 2) { sub = 2; }
+        if (ir <= 0) { return; }
+        int arc = (int)(1.5707963268 * (double)ir + 0.5);
+        if (arc <= 0) { return; }
+        int sub = ir / 4;
+        if (sub < 3) { sub = 3; }
+        double invR = 1.0 / (double)ir;
+        int cxL = ix + ir;
+        int cxR = ix + iw - ir;
+        int cyT = iy + ir;
+        int cyB = iy + ih - ir;
         int d = 0;
-        while (d < per) {
+        while (d < arc) {
             int dEnd = d + dl;
-            if (dEnd > per) { dEnd = per; }
-            int px0 = ix; int py0 = iy;
-            Fx.PerimeterPoint(ix, iy, iw, ih, ir, d, out px0, out py0);
+            if (dEnd > arc) { dEnd = arc; }
+            double a0 = (double)d * invR;
+            int dx0 = (int)((double)ir * Math.Cos(a0) + 0.5);
+            int dy0 = (int)((double)ir * Math.Sin(a0) + 0.5);
             int cur = d + sub;
             while (cur < dEnd) {
-                int px1 = ix; int py1 = iy;
-                Fx.PerimeterPoint(ix, iy, iw, ih, ir, cur, out px1, out py1);
-                c.DrawLine(px0, py0, px1, py1, color, bw);
-                px0 = px1; py0 = py1;
+                double a1 = (double)cur * invR;
+                int dx1 = (int)((double)ir * Math.Cos(a1) + 0.5);
+                int dy1 = (int)((double)ir * Math.Sin(a1) + 0.5);
+                c.DrawLine(cxR + dx0, cyB + dy0, cxR + dx1, cyB + dy1, color, bw);
+                c.DrawLine(cxR + dx0, cyT - dy0, cxR + dx1, cyT - dy1, color, bw);
+                c.DrawLine(cxL - dx0, cyB + dy0, cxL - dx1, cyB + dy1, color, bw);
+                c.DrawLine(cxL - dx0, cyT - dy0, cxL - dx1, cyT - dy1, color, bw);
+                dx0 = dx1; dy0 = dy1;
                 cur = cur + sub;
             }
-            int pxe = ix; int pye = iy;
-            Fx.PerimeterPoint(ix, iy, iw, ih, ir, dEnd, out pxe, out pye);
-            c.DrawLine(px0, py0, pxe, pye, color, bw);
+            double ae = (double)dEnd * invR;
+            int dxe = (int)((double)ir * Math.Cos(ae) + 0.5);
+            int dye = (int)((double)ir * Math.Sin(ae) + 0.5);
+            c.DrawLine(cxR + dx0, cyB + dy0, cxR + dxe, cyB + dye, color, bw);
+            c.DrawLine(cxR + dx0, cyT - dy0, cxR + dxe, cyT - dye, color, bw);
+            c.DrawLine(cxL - dx0, cyB + dy0, cxL - dxe, cyB + dye, color, bw);
+            c.DrawLine(cxL - dx0, cyT - dy0, cxL - dxe, cyT - dye, color, bw);
             d = d + step;
         }
     }
@@ -327,27 +376,32 @@ public class Fx {
         int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
-        int half = per / 2;
         int reach = per * 11 / 100;  // 短促紧凑的亮点
         if (reach < 1) { reach = 1; }
         int rim = 20;  // 微弱常驻边缘光
         int gr = app.HostScale(7);
+        int span = reach * 2;
         int stepPx = app.HostScale(5);
-        if (stepPx < 1) { stepPx = 1; }
-        int steps = per / stepPx;
-        if (steps < 40) { steps = 40; }
-        if (steps > 260) { steps = 260; }
+        if (stepPx < 3) { stepPx = 3; }
+        int steps = span / stepPx;
+        if (steps < 12) { steps = 12; }
+        if (steps > 36) { steps = 36; }
         c.PushClip(x, y, w, h);
         try {
-            for (int i = 0; i < steps; i = i + 1) {
-                int d = i * per / steps;
-                int dd = Fx.RingDist(d, head, per, half);
-                int a = rim;
-                if (dd < reach) {
-                    int p = Fx.Ease((reach - dd) * 1000 / reach);
-                    a = rim + (215 - rim) * p / 1000;
-                }
+            if (rim > 0) {
+                c.DrawRoundRect(x, y, w, h, radius, Fx.WithAlpha(color, rim), 1);
+            }
+            int boost = 215 - rim;
+            for (int i = 0; i <= steps; i = i + 1) {
+                int off = (i * span / steps) - reach;
+                int dd = off < 0 ? (0 - off) : off;
+                if (dd >= reach) { continue; }
+                int p = Fx.Ease((reach - dd) * 1000 / reach);
+                int a = boost * p / 1000;
                 if (a > 0) {
+                    int d = head + off;
+                    if (d < 0) { d = d + per; }
+                    else if (d >= per) { d = d - per; }
                     int px = x; int py = y;
                     Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
                     c.FillRadial(px, py, gr, color, a);
@@ -672,12 +726,29 @@ public class Fx {
         int span = w + bandW * 2;
         int bx = x - bandW + Fx.Saw(app, periodMs > 0 ? periodMs : 1600) * span / 1000;
         int hi = highlightColor != 0 ? highlightColor : (int)0x40FFFFFFu;
-        int clear = Fx.WithAlpha(hi, 0);
-        c.PushClip(x, y, w, h);
-        try {
-            c.FillGradMask(bx, y, bandW, h, 0, Corner.All(), 1, clear, hi, clear);
-        } finally {
-            c.PopClip();
+        int hiA = (hi >> 24) & 255;
+        int mid = bx + bandW / 2;
+        int bEnd = bx + bandW;
+        int xEnd = x + w;
+        if (hiA > 0 && mid > bx) {
+            int l0 = bx > x ? bx : x;
+            int l1 = mid < xEnd ? mid : xEnd;
+            if (l1 > l0) {
+                int a0 = hiA * (l0 - bx) / (mid - bx);
+                int a1 = hiA * (l1 - bx) / (mid - bx);
+                c.FillGradMask(l0, y, l1 - l0, h, 0, Corner.All(), 1,
+                    Fx.WithAlpha(hi, a0), Fx.WithAlpha(hi, (a0 + a1) / 2), Fx.WithAlpha(hi, a1));
+            }
+        }
+        if (hiA > 0 && bEnd > mid) {
+            int r0 = mid > x ? mid : x;
+            int r1 = bEnd < xEnd ? bEnd : xEnd;
+            if (r1 > r0) {
+                int a0 = hiA * (bEnd - r0) / (bEnd - mid);
+                int a1 = hiA * (bEnd - r1) / (bEnd - mid);
+                c.FillGradMask(r0, y, r1 - r0, h, 0, Corner.All(), 1,
+                    Fx.WithAlpha(hi, a0), Fx.WithAlpha(hi, (a0 + a1) / 2), Fx.WithAlpha(hi, a1));
+            }
         }
         app.RequestAnimationFrameIn(x, y, w, h);
     }
