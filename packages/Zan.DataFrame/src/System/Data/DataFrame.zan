@@ -248,7 +248,7 @@ public class DataFrame {
         for (int r = 0; r < old.Count(); r = r + 1) {
             bool miss = old.IsMissing(r);
             if (kind == ColKind.Str) {
-                c.Append(old.GetStr(r));
+                c.Append(miss ? "" : old.GetStr(r));
             } else if (kind == ColKind.Int) {
                 if (miss) { c.AppendLong(0); c.MarkMissing(r); }
                 else { c.AppendLong(old.GetLong(r)); }
@@ -256,7 +256,6 @@ public class DataFrame {
                 if (miss) { c.AppendDouble(0.0); c.MarkMissing(r); }
                 else { c.AppendDouble(old.GetDouble(r)); }
             }
-            if (miss) { c.MarkMissing(r); }
         }
         this.cols[at] = c;
         return this;
@@ -433,7 +432,7 @@ public class DataFrame {
         }
         while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
         while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
-        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
+        NativeMemory.Copy((nint)idx + (nint)lo * 4, (nint)tmp + (nint)lo * 4, (nint)len * 4);
     }
 
     private static void MergeSortFloat(int[] idx, int[] tmp, int lo, int hi, List<double> vals, bool desc) {
@@ -479,7 +478,7 @@ public class DataFrame {
         }
         while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
         while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
-        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
+        NativeMemory.Copy((nint)idx + (nint)lo * 4, (nint)tmp + (nint)lo * 4, (nint)len * 4);
     }
 
     private static void MergeSortStr(int[] idx, int[] tmp, int lo, int hi, List<string> vals, bool desc) {
@@ -525,7 +524,7 @@ public class DataFrame {
         }
         while (a < mid) { tmp[k] = idx[a]; a = a + 1; k = k + 1; }
         while (b < hi) { tmp[k] = idx[b]; b = b + 1; k = k + 1; }
-        NativeMemory.Copy((nint)idx + (nint)(lo * 4), (nint)tmp + (nint)(lo * 4), len * 4);
+        NativeMemory.Copy((nint)idx + (nint)lo * 4, (nint)tmp + (nint)lo * 4, (nint)len * 4);
     }
 
     // 归并排序（稳定）：对 idx[lo, hi) 排序，tmp 为工作缓冲。
@@ -557,10 +556,19 @@ public class DataFrame {
         int kind = key.kind;
         int n = this.rowCount;
         if (kind == ColKind.Int) {
-            // 整数键快路径：直接以 long 哈希，仅在新建组时格式化一次字符串。
+            // 整数键快路径：直接以 long 哈希，仅在新建组时格式化一次字符串；缺失值单独成组，不与 0 碰撞。
             List<long> vals = key.ints;
             Dictionary<long, RowGroup> map = new Dictionary<long, RowGroup>();
+            RowGroup missGroup = null;
             for (int r = 0; r < n; r = r + 1) {
+                if (key.IsMissing(r)) {
+                    if (missGroup == null) {
+                        missGroup = RowGroup.Create("");
+                        groups.Add(missGroup);
+                    }
+                    missGroup.rows.Add(r);
+                    continue;
+                }
                 long k = vals[r];
                 RowGroup g = null;
                 if (!map.TryGetValue(k, out g)) {
@@ -589,7 +597,7 @@ public class DataFrame {
         }
         Dictionary<string, RowGroup> fmap = new Dictionary<string, RowGroup>();
         for (int r = 0; r < n; r = r + 1) {
-            string k = key.GetStr(r);
+            string k = key.IsMissing(r) ? "" : key.GetStr(r);
             RowGroup g = null;
             if (!fmap.TryGetValue(k, out g)) {
                 g = RowGroup.Create(k);
@@ -724,10 +732,16 @@ public class DataFrame {
         List<int> matchedL = new List<int>();
         List<int> matchedR = new List<int>();
         if (lKey.kind == ColKind.Int && rKey.kind == ColKind.Int) {
-            // 双侧整数键：直接 long 哈希，零字符串分配。
+            // 双侧整数键：直接 long 哈希，零字符串分配；缺失值单独分桶，避免与 0 误匹配。
             List<long> rVals = rKey.ints;
             Dictionary<long, List<int>> map = new Dictionary<long, List<int>>();
+            List<int> missingR = null;
             for (int r = 0; r < right.rowCount; r = r + 1) {
+                if (rKey.IsMissing(r)) {
+                    if (missingR == null) { missingR = new List<int>(); }
+                    missingR.Add(r);
+                    continue;
+                }
                 long k = rVals[r];
                 List<int> bucket = null;
                 if (!map.TryGetValue(k, out bucket)) {
@@ -739,7 +753,12 @@ public class DataFrame {
             List<long> lVals = lKey.ints;
             for (int r = 0; r < this.rowCount; r = r + 1) {
                 List<int> matches = null;
-                if (!map.TryGetValue(lVals[r], out matches)) { continue; }
+                if (lKey.IsMissing(r)) {
+                    matches = missingR;
+                    if (matches == null) { continue; }
+                } else if (!map.TryGetValue(lVals[r], out matches)) {
+                    continue;
+                }
                 for (int m = 0; m < matches.Count; m = m + 1) {
                     matchedL.Add(r);
                     matchedR.Add(matches[m]);
@@ -748,7 +767,7 @@ public class DataFrame {
         } else {
             Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
             for (int r = 0; r < right.rowCount; r = r + 1) {
-                string k = rKey.GetStr(r);
+                string k = rKey.IsMissing(r) ? "" : rKey.GetStr(r);
                 List<int> bucket = null;
                 if (!map.TryGetValue(k, out bucket)) {
                     bucket = new List<int>();
@@ -757,7 +776,7 @@ public class DataFrame {
                 bucket.Add(r);
             }
             for (int r = 0; r < this.rowCount; r = r + 1) {
-                string k = lKey.GetStr(r);
+                string k = lKey.IsMissing(r) ? "" : lKey.GetStr(r);
                 List<int> matches = null;
                 if (!map.TryGetValue(k, out matches)) { continue; }
                 for (int m = 0; m < matches.Count; m = m + 1) {

@@ -38,53 +38,56 @@ public class AiStream {
         SseLineReader reader = new SseLineReader();
         bool stopped = false;
         bool failed = false;
-        while (true) {
-            SseDelivery d = await sink.TakeCo();
-            if (d.data.Length > 0) {
-                reader.Feed(d.data);
-                string line = reader.Next();
-                while (line.Length > 0) {
-                    int r = AiStream.HandleLine(line, text, slots, res, onEvent, parse);
-                    if (r == 0) {
-                        stopped = true;
-                        break;
+        try {
+            while (true) {
+                SseDelivery d = await sink.TakeCo();
+                if (d.data.Length > 0) {
+                    reader.Feed(d.data);
+                    string line = reader.Next();
+                    while (line.Length > 0) {
+                        int r = AiStream.HandleLine(line, text, slots, res, onEvent, parse);
+                        if (r == 0) {
+                            stopped = true;
+                            break;
+                        }
+                        if (r < 0) {
+                            failed = true;
+                            break;
+                        }
+                        line = reader.Next();
                     }
-                    if (r < 0) {
-                        failed = true;
-                        break;
-                    }
-                    line = reader.Next();
+                }
+                if (stopped || failed) {
+                    sink.Abort();
+                    break;
+                }
+                if (d.finished) { break; }
+            }
+
+            if (!stopped && !failed) {
+                string rest = reader.Flush();
+                if (rest.Length > 0) {
+                    AiStream.HandleLine(rest, text, slots, res, onEvent, parse);
                 }
             }
-            if (stopped || failed) {
-                sink.Abort();
-                break;
-            }
-            if (d.finished) { break; }
-        }
 
-        if (!stopped && !failed) {
-            string rest = reader.Flush();
-            if (rest.Length > 0) {
-                AiStream.HandleLine(rest, text, slots, res, onEvent, parse);
-            }
-        }
+            res.text = text.ToString();
+            res.toolCalls = AiStream.FinishSlots(slots);
+            res.stopped = stopped;
 
-        res.text = text.ToString();
-        res.toolCalls = AiStream.FinishSlots(slots);
-        res.stopped = stopped;
-
-        if (!stopped && !failed) {
-            string attempt = sink.Attempt();
-            if (attempt.Length > 0 && attempt.StartsWith("err:")) {
-                res.error = "流式请求失败：" + attempt.Substring(4).Trim();
+            if (!stopped && !failed) {
+                string attempt = sink.Attempt();
+                if (attempt.Length > 0 && attempt.StartsWith("err:")) {
+                    res.error = "流式请求失败：" + attempt.Substring(4).Trim();
+                }
             }
+            if (!res.usageReported) {
+                res.usage = new AiUsage(AiClient.EstimateTokens(body),
+                    AiClient.EstimateTokens(res.text), true);
+            }
+        } finally {
+            await AiStream.ReleaseSink(producer, sink);
         }
-        if (!res.usageReported) {
-            res.usage = new AiUsage(AiClient.EstimateTokens(body),
-                AiClient.EstimateTokens(res.text), true);
-        }
-        await AiStream.ReleaseSink(producer, sink);
         return res;
     }
 

@@ -9,16 +9,21 @@ namespace Game.Idle;
 // 资源容器同单位。曲线参数一旦发布不可改——会破坏存量存档的
 // 购买力，改数值只能加新参数并做版本迁移。
 public class Curves {
+    private const long LongMax = 9223372036854775807L;
+
     // 指数成本：第 `owned`（已拥有数，从 0 起）件之后的下一件价格。
     // cost = base * rate^owned，rate 千分比（1150 = ×1.15）。
     // 乘方用循环乘，`owned` 超过 64 时按 64 截断（rate>=1050 时
-    // 价格早已溢出 long，截断点由 ClampLong 收口）。
+    // 价格早已溢出 long，截断点由饱和乘法收口）。
     public static long CostNext(long baseCost, int ratePermille, int owned) {
+        if (baseCost <= 0) { return 0; }
         long c = baseCost;
         int n = owned;
+        if (n < 0) { n = 0; }
         if (n > 64) { n = 64; }
         for (int i = 0; i < n; i = i + 1) {
             c = MulPermille(c, ratePermille);
+            if (c >= Curves.LongMax || c <= 0) { break; }
         }
         return c;
     }
@@ -26,13 +31,14 @@ public class Curves {
     // 从 `owned` 起、连买 `count` 件的总价（批量购买面板用）。
     // 等比求和的整数近似：递推累加（count 上限 1000，防长循环，由 O(N*64) 降至 O(N)）。
     public static long CostBulk(long baseCost, int ratePermille, int owned, int count) {
-        if (count <= 0) { return 0; }
+        if (count <= 0 || baseCost <= 0) { return 0; }
         int n = count;
         if (n > 1000) { n = 1000; }
         long curCost = CostNext(baseCost, ratePermille, owned);
         long total = 0;
         for (int i = 0; i < n; i = i + 1) {
-            total = ClampLong(total + curCost);
+            total = Curves.AddSaturate(total, curCost);
+            if (total >= Curves.LongMax) { return Curves.LongMax; }
             if (owned + i < 64) {
                 curCost = MulPermille(curCost, ratePermille);
             }
@@ -40,35 +46,53 @@ public class Curves {
         return total;
     }
 
-    // 千分比乘法：(v * p) / 1000，四舍五入、long 钳制。
+    // 千分比乘法：(v * p) / 1000，四舍五入、溢出饱和停在 LongMax（绝不回绕成负/0）。
     public static long MulPermille(long v, int p) {
-        long r = (v * (long)p + 500) / 1000;
-        return ClampLong(r);
+        if (v <= 0 || p <= 0) { return 0; }
+        long pl = (long)p;
+        long q = v / 1000L;
+        long rem = v % 1000L;
+        if (q > Curves.LongMax / pl) { return Curves.LongMax; }
+        long hi = q * pl;
+        long lo = (rem * pl + 500L) / 1000L;
+        if (hi > Curves.LongMax - lo) { return Curves.LongMax; }
+        return hi + lo;
     }
 
     // 产出速率：`unitRate * owned`（千分位/秒），乘 prestige 倍率。
     public static long RateAt(long unitRate, int owned, int prestigePermille) {
-        return ClampLong(MulPermille(unitRate * (long)owned, prestigePermille));
+        if (unitRate <= 0 || owned <= 0 || prestigePermille <= 0) { return 0; }
+        long baseRate = unitRate > Curves.LongMax / (long)owned
+            ? Curves.LongMax
+            : unitRate * (long)owned;
+        return MulPermille(baseRate, prestigePermille);
     }
 
     // 等级幂律属性：`base * (level ^ exp)` 的千分位定点近似——
-    // 逐级累乘逼近（level^exp 用循环平方根因式避免 double 漂移，
-    // 精度需求放置类足够）。exp 千分比（1500 = 1.5 次幂）。
+    // 逐级累乘逼近，exp 千分比（1100 = 每级 ×1.10）。饱和后提前退出，步数封顶 1024。
     public static long PowerCurve(long baseVal, int level, int expPermille) {
+        if (baseVal <= 0) { return 0; }
         if (level <= 1) { return baseVal; }
-        /* 逐级复合增长：val *= 1 + (exp-1000)/1000 每级（exp=1100
-         * 即每级 +10%）。指数 > 1000 时增长、< 1000 时衰减，天然
-         * 单调、整数域无漂移。 */
+        if (expPermille <= 0) { return 0; }
         long v = baseVal;
-        int growth = expPermille - 1000;
-        for (int lv = 1; lv < level; lv = lv + 1) {
-            v = ClampLong(v + MulPermille(v, growth));
+        int steps = level - 1;
+        if (steps > 1024) { steps = 1024; }
+        for (int lv = 0; lv < steps; lv = lv + 1) {
+            v = MulPermille(v, expPermille);
+            if (v <= 0 || v >= Curves.LongMax) { break; }
         }
         return v;
     }
 
-    // long 饱和钳制（正向上限，溢出停在 MaxValue 而不是变负——
-    // 放置数值炸表时宁可"卡住"也不能返 0 触发免费购买 bug）。
+    // 非负饱和加法：避免正数相加溢出回绕成负值触发“免费购买”漏洞。
+    private static long AddSaturate(long a, long b) {
+        if (a <= 0) { return b <= 0 ? 0 : b; }
+        if (b <= 0) { return a; }
+        if (a > Curves.LongMax - b) { return Curves.LongMax; }
+        return a + b;
+    }
+
+    // 非负钳制（供外部对单一值做下界保护；乘法/加法饱和由 MulPermille / AddSaturate 在溢出前兜住）。
     public static long ClampLong(long v) {
         if (v < 0) { return 0; }
         return v;

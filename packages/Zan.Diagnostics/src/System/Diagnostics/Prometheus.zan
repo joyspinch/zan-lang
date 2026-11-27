@@ -120,8 +120,9 @@ public class Prometheus {
         for (int i = 0; i < keys.Count; i = i + 1) {
             if (i > 0) { sb.Append(","); }
             sb.Append(keys[i]);
-            sb.Append("=");
-            sb.Append(values[i]);
+            sb.Append("=\"");
+            sb.Append(Prometheus.EscapeValue(values[i]));
+            sb.Append("\"");
         }
         sb.Append("}");
         return sb.ToString();
@@ -219,77 +220,82 @@ public class Prometheus {
 
     // ---- 输出 ----
 
-    // 生成 text/plain; version=0.0.4 全量文本。输出顺序：按注册
-    // 顺序，同 metric 名的所有样本连排；每个 metric 名先输出
-    // # HELP/# TYPE。直方图补 +Inf 桶与 _sum/_count。
+    // 生成 text/plain; version=0.0.4 全量文本。输出顺序：按首次注册的
+    // metric 家族顺序，同 metric 名的所有样本严格连排（即使交错注册也只
+    // 输出一次 # HELP/# TYPE）。直方图 bucketCounts 在 Observe 时已按
+    // 累计语义写入，此处直接输出并补 +Inf 桶与 _sum/_count。
     public string Snapshot() {
         StringBuilder sb = new StringBuilder();
-        string curName = null;
-        bool declared = false;
+        List<string> familyOrder = new List<string>();
+        Dictionary<string, List<Sample>> families = new Dictionary<string, List<Sample>>();
         for (int i = 0; i < this.metrics.Count; i = i + 1) {
             Sample s = this.metrics[i];
-            if (s.name != curName) {
-                curName = s.name;
-                declared = false;
+            List<Sample> grp = null;
+            if (!families.TryGetValue(s.name, out grp)) {
+                grp = new List<Sample>();
+                families[s.name] = grp;
+                familyOrder.Add(s.name);
             }
-            if (!declared) {
-                string h = null;
-                string t = null;
-                if (this.help.TryGetValue(s.name, out h)) {
-                    sb.Append("# HELP ");
-                    sb.Append(s.name);
-                    sb.Append(" ");
-                    sb.Append(h.Replace("\n", " "));
-                    sb.Append("\n");
-                }
-                if (this.types.TryGetValue(s.name, out t)) {
-                    sb.Append("# TYPE ");
-                    sb.Append(s.name);
-                    sb.Append(" ");
-                    sb.Append(t);
-                    sb.Append("\n");
-                }
-                declared = true;
+            grp.Add(s);
+        }
+        for (int f = 0; f < familyOrder.Count; f = f + 1) {
+            string fname = familyOrder[f];
+            string h = null;
+            string t = null;
+            if (this.help.TryGetValue(fname, out h)) {
+                sb.Append("# HELP ");
+                sb.Append(fname);
+                sb.Append(" ");
+                sb.Append(h.Replace("\n", " "));
+                sb.Append("\n");
             }
-            if (s.bucketEdges != null) {
-                // histogram：_bucket{le="..."} 全家。bucket 行的 '}' 由
-                // AppendLabels(braceOpen=true) 收尾，这里不再补。
-                long cum = 0;
-                for (int b = 0; b < s.bucketEdges.Count; b = b + 1) {
-                    cum = cum + s.bucketCounts[b];
+            if (this.types.TryGetValue(fname, out t)) {
+                sb.Append("# TYPE ");
+                sb.Append(fname);
+                sb.Append(" ");
+                sb.Append(t);
+                sb.Append("\n");
+            }
+            List<Sample> grp = families[fname];
+            for (int i = 0; i < grp.Count; i = i + 1) {
+                Sample s = grp[i];
+                if (s.bucketEdges != null) {
+                    // histogram：bucketCounts 在 HistogramObserve 时已累计，直接输出（不二次累加）。
+                    for (int b = 0; b < s.bucketEdges.Count; b = b + 1) {
+                        sb.Append(s.name);
+                        sb.Append("_bucket{le=\"");
+                        sb.Append(Prometheus.FormatValue(s.bucketEdges[b]));
+                        sb.Append("\"");
+                        this.AppendLabels(sb, s, true);
+                        sb.Append(" ");
+                        sb.Append(Prometheus.FormatValue(s.bucketCounts[b]));
+                        sb.Append("\n");
+                    }
                     sb.Append(s.name);
-                    sb.Append("_bucket{le=\"");
-                    sb.Append(Prometheus.FormatValue(s.bucketEdges[b]));
-                    sb.Append("\"");
+                    sb.Append("_bucket{le=\"+Inf\"");
                     this.AppendLabels(sb, s, true);
                     sb.Append(" ");
-                    sb.Append(Prometheus.FormatValue(cum));
+                    sb.Append(Prometheus.FormatValue(s.hCount));
+                    sb.Append("\n");
+                    sb.Append(s.name);
+                    sb.Append("_sum");
+                    this.AppendLabels(sb, s, false);
+                    sb.Append(" ");
+                    sb.Append(Prometheus.FormatValue(s.hSum));
+                    sb.Append("\n");
+                    sb.Append(s.name);
+                    sb.Append("_count");
+                    this.AppendLabels(sb, s, false);
+                    sb.Append(" ");
+                    sb.Append(Prometheus.FormatValue(s.hCount));
+                    sb.Append("\n");
+                } else {
+                    sb.Append(s.name);
+                    this.AppendLabels(sb, s, false);
+                    sb.Append(" ");
+                    sb.Append(Prometheus.FormatValue(s.value));
                     sb.Append("\n");
                 }
-                sb.Append(s.name);
-                sb.Append("_bucket{le=\"+Inf\"");
-                this.AppendLabels(sb, s, true);
-                sb.Append(" ");
-                sb.Append(Prometheus.FormatValue(s.hCount));
-                sb.Append("\n");
-                sb.Append(s.name);
-                sb.Append("_sum");
-                this.AppendLabels(sb, s, false);
-                sb.Append(" ");
-                sb.Append(Prometheus.FormatValue(s.hSum));
-                sb.Append("\n");
-                sb.Append(s.name);
-                sb.Append("_count");
-                this.AppendLabels(sb, s, false);
-                sb.Append(" ");
-                sb.Append(Prometheus.FormatValue(s.hCount));
-                sb.Append("\n");
-            } else {
-                sb.Append(s.name);
-                this.AppendLabels(sb, s, false);
-                sb.Append(" ");
-                sb.Append(Prometheus.FormatValue(s.value));
-                sb.Append("\n");
             }
         }
         return sb.ToString();
