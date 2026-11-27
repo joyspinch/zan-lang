@@ -32,6 +32,25 @@ public class Gbk {
     static int[] reverseBmp;
     // 非 BMP 码点回退表（如存在补充平面映射则懒填充）。
     static Dictionary<int, int> reverseSupp;
+    // 后继字节 0..255 → 列号（0..189）或 -1，消除解码热循环内每次 3 条分支判断。
+    static int[] trailCol;
+
+    static int[] TrailColTable() {
+        if (Gbk.trailCol == null) {
+            int[] t = new int[256];
+            for (int b = 0; b < 256; b = b + 1) {
+                if (b < 0x40 || b > 0xFE || b == 0x7F) {
+                    t[b] = -1;
+                } else if (b > 0x7F) {
+                    t[b] = b - 0x41;
+                } else {
+                    t[b] = b - 0x40;
+                }
+            }
+            Gbk.trailCol = t;
+        }
+        return Gbk.trailCol;
+    }
 
     // 整表码点：把表字符串按码点切开。表里每个槽位一个码点，U+FFFD 表示
     // 该槽位未映射（CP936 本身不映射任何字符到 U+FFFD）。
@@ -105,22 +124,30 @@ public class Gbk {
         // 纯 ASCII 快进。
         if (data.IsAscii(0, n)) { return data.ToStr(0, n); }
 
-        int[] cs = Gbk.Codes();
+        int[] csArr = Gbk.Codes();
+        int[] tcArr = Gbk.TrailColTable();
         int trailCnt = GbkTable.TrailCount;
         // 每个输入字节最多展开为 3 字节 UTF-8（非法单字节 -> 3 字节 U+FFFD；2 字节 GBK -> 最多 4 字节 UTF-8），n*3 恒不越界。
+        if ((long)n * 3L > 2147483591L) {
+            throw new ArgumentException("GBK input exceeds maximum decodable length");
+        }
         byte[] outBuf = new byte[n * 3];
+        Span<byte> src = new Span<byte>((nint)data, n);
+        Span<byte> dst = new Span<byte>((nint)outBuf, n * 3);
+        Span<int> cs = new Span<int>((nint)csArr, csArr.Length);
+        Span<int> tcol = new Span<int>((nint)tcArr, 256);
         int di = 0;
         int i = 0;
         while (i < n) {
-            int b0 = data[i] & 255;
+            int b0 = src[i] & 255;
             if (b0 < 0x80) {
-                outBuf[di] = (byte)b0;
+                dst[di] = (byte)b0;
                 di = di + 1;
                 i = i + 1;
                 while (i < n) {
-                    int bx = data[i] & 255;
+                    int bx = src[i] & 255;
                     if (bx >= 0x80) { break; }
-                    outBuf[di] = (byte)bx;
+                    dst[di] = (byte)bx;
                     di = di + 1;
                     i = i + 1;
                 }
@@ -137,8 +164,8 @@ public class Gbk {
                 bad = true;
                 badKind = 2;
             } else {
-                b1 = data[i + 1] & 255;
-                int col = (b1 < 0x40 || b1 > 0xFE || b1 == 0x7F) ? -1 : (b1 > 0x7F ? b1 - 0x41 : b1 - 0x40);
+                b1 = src[i + 1] & 255;
+                int col = tcol[b1];
                 if (col < 0) {
                     bad = true;
                     badKind = 3;
@@ -161,31 +188,31 @@ public class Gbk {
                     throw new Exception("GBK 非法字节序列（偏移 " +
                         Convert.ToString(i) + "）：" + why);
                 }
-                outBuf[di] = 239;      // 0xEF
-                outBuf[di + 1] = 191;  // 0xBF
-                outBuf[di + 2] = 189;  // 0xBD (U+FFFD)
+                dst[di] = 239;      // 0xEF
+                dst[di + 1] = 191;  // 0xBF
+                dst[di + 2] = 189;  // 0xBD (U+FFFD)
                 di = di + 3;
                 i = i + 1;
                 continue;
             }
-            // 直接把 Unicode 码点编码为 UTF-8 字节写入 outBuf，消除每字符一次堆分配
-            if (cp < 0x80) {
-                outBuf[di] = (byte)cp;
+            // GBK 中文字符 99%+ 落在 U+0800..U+FFFF（3 字节 UTF-8），最热分支置顶。
+            if (cp >= 0x800 && cp < 0x10000) {
+                dst[di] = (byte)(224 | (cp >> 12));
+                dst[di + 1] = (byte)(128 | ((cp >> 6) & 63));
+                dst[di + 2] = (byte)(128 | (cp & 63));
+                di = di + 3;
+            } else if (cp < 0x80) {
+                dst[di] = (byte)cp;
                 di = di + 1;
             } else if (cp < 0x800) {
-                outBuf[di] = (byte)(192 | (cp >> 6));
-                outBuf[di + 1] = (byte)(128 | (cp & 63));
+                dst[di] = (byte)(192 | (cp >> 6));
+                dst[di + 1] = (byte)(128 | (cp & 63));
                 di = di + 2;
-            } else if (cp < 0x10000) {
-                outBuf[di] = (byte)(224 | (cp >> 12));
-                outBuf[di + 1] = (byte)(128 | ((cp >> 6) & 63));
-                outBuf[di + 2] = (byte)(128 | (cp & 63));
-                di = di + 3;
             } else {
-                outBuf[di] = (byte)(240 | (cp >> 18));
-                outBuf[di + 1] = (byte)(128 | ((cp >> 12) & 63));
-                outBuf[di + 2] = (byte)(128 | ((cp >> 6) & 63));
-                outBuf[di + 3] = (byte)(128 | (cp & 63));
+                dst[di] = (byte)(240 | (cp >> 18));
+                dst[di + 1] = (byte)(128 | ((cp >> 12) & 63));
+                dst[di + 2] = (byte)(128 | ((cp >> 6) & 63));
+                dst[di + 3] = (byte)(128 | (cp & 63));
                 di = di + 4;
             }
             i = i + 2;
@@ -219,23 +246,54 @@ public class Gbk {
     static byte[] EncodeCore(string text, bool lenient) {
         if (text == null || text.Length == 0) { return new byte[0]; }
         int n = text.Length;
-        int[] bmp = Gbk.ReverseBmp();
+        int[] bmpArr = Gbk.ReverseBmp();
         // UTF-8 转 GBK 输出字节数恒 <= 输入字节数 n
         byte[] outBuf = new byte[n];
+        Span<byte> dst = new Span<byte>((nint)outBuf, n);
+        Span<int> bmp = new Span<int>((nint)bmpArr, 65536);
         int di = 0;
         int bi = 0;
         while (bi < n) {
             int b0 = text[bi] & 255;
             if (b0 < 0x80) {
-                outBuf[di] = (byte)b0;
+                dst[di] = (byte)b0;
                 di = di + 1;
                 bi = bi + 1;
+                while (bi < n) {
+                    int bx = text[bi] & 255;
+                    if (bx >= 0x80) { break; }
+                    dst[di] = (byte)bx;
+                    di = di + 1;
+                    bi = bi + 1;
+                }
                 continue;
             }
-            long dec = Encoding.DecodeCodePointFast(text, bi);
-            int used = (int)(dec >> 32);
-            if (used <= 0) { break; }
-            int cp = (int)(dec & 0xFFFFFFFFL);
+            int cp = -1;
+            int used = 0;
+            // 内联 3 字节 UTF-8（0xE0..0xEF，覆盖全部中文 BMP 字符）与 2 字节 UTF-8，避免逐字符函数调用。
+            if (b0 >= 0xE0 && b0 <= 0xEF && bi + 2 < n) {
+                int b1 = text[bi + 1] & 255;
+                int b2 = text[bi + 2] & 255;
+                if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                    int c3 = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+                    if (c3 >= 0x800 && (c3 < 0xD800 || c3 > 0xDFFF)) {
+                        cp = c3;
+                        used = 3;
+                    }
+                }
+            } else if (b0 >= 0xC2 && b0 <= 0xDF && bi + 1 < n) {
+                int b1 = text[bi + 1] & 255;
+                if ((b1 & 0xC0) == 0x80) {
+                    cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+                    used = 2;
+                }
+            }
+            if (used == 0) {
+                long dec = Encoding.DecodeCodePointFast(text, bi);
+                used = (int)(dec >> 32);
+                if (used <= 0) { break; }
+                cp = (int)(dec & 0xFFFFFFFFL);
+            }
             bi = bi + used;
             int packed = -1;
             if (cp >= 0 && cp < 65536) {
@@ -245,8 +303,8 @@ public class Gbk {
                 if (Gbk.reverseSupp.TryGetValue(cp, out sp)) { packed = sp; }
             }
             if (packed >= 0) {
-                outBuf[di] = (byte)(packed >> 8);
-                outBuf[di + 1] = (byte)(packed & 255);
+                dst[di] = (byte)(packed >> 8);
+                dst[di + 1] = (byte)(packed & 255);
                 di = di + 2;
                 continue;
             }
@@ -255,7 +313,7 @@ public class Gbk {
                     Encoding.Utf8FromCodePoint(cp) + "（偏移 " +
                     Convert.ToString(bi - used) + "）");
             }
-            outBuf[di] = 63;
+            dst[di] = 63;
             di = di + 1;
         }
         if (di == n) { return outBuf; }

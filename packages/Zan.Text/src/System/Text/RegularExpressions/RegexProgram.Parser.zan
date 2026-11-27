@@ -179,13 +179,15 @@ public partial class RegexProgram {
         this.ApplyQuantifier(start, min, max, lazy);
     }
 
-    // 读取十进制数字串；一个数字都没有时返回 -1。
+    // 读取十进制数字串；一个数字都没有时返回 -1（超出 65535 后饱和保持超界值，防 int 溢出回绕）。
     public int ParseInt() {
         int v = -1;
         int c = this.Peek();
         while (c >= 48 && c <= 57) {
             if (v < 0) { v = 0; }
-            v = v * 10 + (c - 48);
+            if (v <= 65535) {
+                v = v * 10 + (c - 48);
+            }
             this.ppos = this.ppos + 1;
             c = this.Peek();
         }
@@ -217,8 +219,15 @@ public partial class RegexProgram {
             this.Truncate(start);
             return;
         }
-        // {n,m}：保留已发射的副本作为第一次重复
+        // {n,m}：展开前按 64 位预估总指令数，防止嵌套量词触发指令爆炸 OOM。
+        long maxInst = (long)RegexProgram.MaxInstructions();
         if (min == 0) {
+            int reps = max < 0 ? 1 : max;
+            long projected = (long)start + (long)reps * (long)(len + 1);
+            if (projected > maxInst) {
+                this.error = "compiled regex exceeds maximum instruction limit (" + maxInst + ")";
+                return;
+            }
             // 丢弃已发射的主体，重新添加为可选副本
             List<int> bo = new List<int>();
             List<int> bx = new List<int>();
@@ -231,28 +240,37 @@ public partial class RegexProgram {
                 bz.Add(this.az[start + i]);
             }
             this.Truncate(start);
-            int reps = max;
-            if (reps < 0) { reps = 1; }
             for (int r = 0; r < reps; r = r + 1) {
+                if (this.error.Length > 0) { return; }
                 int s = this.Here();
                 this.AppendBody(bo, bx, by, bz, s - start);
+                if (this.error.Length > 0) { return; }
                 this.OptionalAt(s, len, lazy);
             }
+            return;
+        }
+        long tailProjected = (max == -1) ? (long)(len + 4) : (long)(max - min) * (long)(len + 1);
+        long totalProjected = (long)this.Here() + (long)(min - 1) * (long)len + tailProjected;
+        if (totalProjected > maxInst) {
+            this.error = "compiled regex exceeds maximum instruction limit (" + maxInst + ")";
             return;
         }
         int copies = min - 1;
         for (int k = 0; k < copies; k = k + 1) {
             this.CopyRange(start, start + len);
+            if (this.error.Length > 0) { return; }
         }
         if (max == -1) {
             int s = this.Here();
             this.CopyRange(start, start + len);
+            if (this.error.Length > 0) { return; }
             this.StarAt(s, len, lazy);
         } else {
             int extra = max - min;
             for (int e = 0; e < extra; e = e + 1) {
                 int s = this.Here();
                 this.CopyRange(start, start + len);
+                if (this.error.Length > 0) { return; }
                 this.OptionalAt(s, len, lazy);
             }
         }
@@ -262,6 +280,7 @@ public partial class RegexProgram {
     void AppendBody(List<int> bo, List<int> bx, List<int> by, List<int> bz,
                     int delta) {
         for (int i = 0; i < bo.Count; i = i + 1) {
+            if (this.error.Length > 0) { return; }
             int o = bo[i];
             int x = bx[i];
             int y = by[i];
