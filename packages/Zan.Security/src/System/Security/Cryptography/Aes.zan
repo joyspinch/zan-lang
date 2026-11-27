@@ -15,6 +15,7 @@ public class Aes {
     static int[] T0; static int[] T1; static int[] T2; static int[] T3;
     static int[] InvT0; static int[] InvT1; static int[] InvT2; static int[] InvT3;
     static bool inited = false;
+    static object initLock = new object();
 
     // 是否强制要求硬件 AES 加速（AES-NI / ARMv8 Crypto）。
     // 默认 false（平滑回退至纯 Zan T-Table）。若设为 true 且机器无硬件 AES 时，
@@ -50,59 +51,65 @@ public class Aes {
 
     private static void InitTables() {
         if (inited) { return; }
+        lock (Aes.initLock) {
+            if (inited) { return; }
 
-        string hex = "637c777bf26b6fc53001672bfed7ab76"
-        + "ca82c97dfa5947f0add4a2af9ca472c0"
-        + "b7fd9326363ff7cc34a5e5f171d83115"
-        + "04c723c31896059a071280e2eb27b275"
-        + "09832c1a1b6e5aa0523bd6b329e32f84"
-        + "53d100ed20fcb15b6acbbe394a4c58cf"
-        + "d0efaafb434d338545f9027f503c9fa8"
-        + "51a3408f929d38f5bcb6da2110fff3d2"
-        + "cd0c13ec5f974417c4a77e3d645d1973"
-        + "60814fdc222a908846eeb814de5e0bdb"
-        + "e0323a0a4906245cc2d3ac629195e479"
-        + "e7c8376d8dd54ea96c56f4ea657aae08"
-        + "ba78252e1ca6b4c6e8dd741f4bbd8b8a"
-        + "703eb5664803f60e613557b986c11d9e"
-        + "e1f8981169d98e949b1e87e9ce5528df"
-        + "8ca1890dbfe6426841992d0fb054bb16";
+            string hex = "637c777bf26b6fc53001672bfed7ab76"
+            + "ca82c97dfa5947f0add4a2af9ca472c0"
+            + "b7fd9326363ff7cc34a5e5f171d83115"
+            + "04c723c31896059a071280e2eb27b275"
+            + "09832c1a1b6e5aa0523bd6b329e32f84"
+            + "53d100ed20fcb15b6acbbe394a4c58cf"
+            + "d0efaafb434d338545f9027f503c9fa8"
+            + "51a3408f929d38f5bcb6da2110fff3d2"
+            + "cd0c13ec5f974417c4a77e3d645d1973"
+            + "60814fdc222a908846eeb814de5e0bdb"
+            + "e0323a0a4906245cc2d3ac629195e479"
+            + "e7c8376d8dd54ea96c56f4ea657aae08"
+            + "ba78252e1ca6b4c6e8dd741f4bbd8b8a"
+            + "703eb5664803f60e613557b986c11d9e"
+            + "e1f8981169d98e949b1e87e9ce5528df"
+            + "8ca1890dbfe6426841992d0fb054bb16";
 
-        byte[] sbBytes = Hex.Decode(hex);
-        Sbox = new int[256];
-        InvSbox = new int[256];
-        for (int i = 0; i < 256; i = i + 1) {
-            int s = sbBytes[i] & 255;
-            Sbox[i] = s;
-            InvSbox[s] = i;
+            byte[] sbBytes = Hex.Decode(hex);
+            int[] sbox = new int[256];
+            int[] invSbox = new int[256];
+            for (int i = 0; i < 256; i = i + 1) {
+                int s = sbBytes[i] & 255;
+                sbox[i] = s;
+                invSbox[s] = i;
+            }
+
+            int[] t0 = new int[256]; int[] t1 = new int[256]; int[] t2 = new int[256]; int[] t3 = new int[256];
+            int[] it0 = new int[256]; int[] it1 = new int[256]; int[] it2 = new int[256]; int[] it3 = new int[256];
+
+            for (int i = 0; i < 256; i = i + 1) {
+                int s = sbox[i];
+                int s2 = Xtime(s);
+                int s3 = s2 ^ s;
+                int v = (s2 << 24) | (s << 16) | (s << 8) | s3;
+                t0[i] = v;
+                t1[i] = RotR32(v, 8);
+                t2[i] = RotR32(v, 16);
+                t3[i] = RotR32(v, 24);
+
+                int is_ = invSbox[i];
+                int v0e = MulGF(is_, 0x0E);
+                int v09 = MulGF(is_, 0x09);
+                int v0d = MulGF(is_, 0x0D);
+                int v0b = MulGF(is_, 0x0B);
+                int iv = (v0e << 24) | (v09 << 16) | (v0d << 8) | v0b;
+                it0[i] = iv;
+                it1[i] = RotR32(iv, 8);
+                it2[i] = RotR32(iv, 16);
+                it3[i] = RotR32(iv, 24);
+            }
+
+            Sbox = sbox; InvSbox = invSbox;
+            T0 = t0; T1 = t1; T2 = t2; T3 = t3;
+            InvT0 = it0; InvT1 = it1; InvT2 = it2; InvT3 = it3;
+            inited = true;
         }
-
-        T0 = new int[256]; T1 = new int[256]; T2 = new int[256]; T3 = new int[256];
-        InvT0 = new int[256]; InvT1 = new int[256]; InvT2 = new int[256]; InvT3 = new int[256];
-
-        for (int i = 0; i < 256; i = i + 1) {
-            int s = Sbox[i];
-            int s2 = Xtime(s);
-            int s3 = s2 ^ s;
-            int v = (s2 << 24) | (s << 16) | (s << 8) | s3;
-            T0[i] = v;
-            T1[i] = RotR32(v, 8);
-            T2[i] = RotR32(v, 16);
-            T3[i] = RotR32(v, 24);
-
-            int is_ = InvSbox[i];
-            int v0e = MulGF(is_, 0x0E);
-            int v09 = MulGF(is_, 0x09);
-            int v0d = MulGF(is_, 0x0D);
-            int v0b = MulGF(is_, 0x0B);
-            int iv = (v0e << 24) | (v09 << 16) | (v0d << 8) | v0b;
-            InvT0[i] = iv;
-            InvT1[i] = RotR32(iv, 8);
-            InvT2[i] = RotR32(iv, 16);
-            InvT3[i] = RotR32(iv, 24);
-        }
-
-        inited = true;
     }
 
     // -------------------------------------------------------------------------

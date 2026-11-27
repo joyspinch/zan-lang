@@ -43,8 +43,23 @@ public class ArpgSaveRepository : IDisposable {
     // 底层数据库连接。
     public ArpgDatabase Database() { return this.database; }
 
-    // 表 table 是否已存在列 column。
+    // 校验 SQLite 标识符是否仅含 ASCII 字母、数字与下划线且首字符非数字。
+    private static bool IsSafeIdentifier(string name) {
+        if (name == null || name.Length == 0 || name.Length > 128) { return false; }
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            bool isAlpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+            bool isDigit = c >= 48 && c <= 57;
+            if (i == 0 ? !isAlpha : !(isAlpha || isDigit)) { return false; }
+        }
+        return true;
+    }
+
+    // 表 table 是否已存在列 column（对 table 标识符做白名单校验，杜绝 PRAGMA 注入）。
     public bool HasColumn(string table, string column) {
+        if (this.database == null || column == null || !ArpgSaveRepository.IsSafeIdentifier(table)) {
+            return false;
+        }
         DbResult columns = this.database.Query(
             "PRAGMA table_info(" + table + ")");
         for (int i = 0; i < columns.RowCount(); i = i + 1) {
@@ -73,63 +88,70 @@ public class ArpgSaveRepository : IDisposable {
         if (!this.ready || slot == "" || state == null) { return false; }
         SqliteConnection db = this.database.Conn();
         this.database.Begin();
+        bool committed = false;
+        try {
+            db.Delete<ArpgSaveSlotEntity>().WhereEq("slot", slot).ExecuteAffrows();
+            ArpgSaveSlotEntity slotEntity = new ArpgSaveSlotEntity();
+            slotEntity.slot = slot;
+            slotEntity.map_name = state.MapName();
+            slotEntity.hero_x = state.HeroX();
+            slotEntity.hero_y = state.HeroY();
+            slotEntity.hero_direction = state.HeroDirection();
+            slotEntity.hero_level = state.HeroLevel();
+            slotEntity.hero_hp = state.HeroHp();
+            slotEntity.hero_mp = state.HeroMp();
+            slotEntity.hero_experience = state.HeroExperience();
+            slotEntity.hero_rage = state.HeroRage();
+            db.Insert<ArpgSaveSlotEntity>(slotEntity).ExecuteAffrows();
 
-        db.Delete<ArpgSaveSlotEntity>().WhereEq("slot", slot).ExecuteAffrows();
-        ArpgSaveSlotEntity slotEntity = new ArpgSaveSlotEntity();
-        slotEntity.slot = slot;
-        slotEntity.map_name = state.MapName();
-        slotEntity.hero_x = state.HeroX();
-        slotEntity.hero_y = state.HeroY();
-        slotEntity.hero_direction = state.HeroDirection();
-        slotEntity.hero_level = state.HeroLevel();
-        slotEntity.hero_hp = state.HeroHp();
-        slotEntity.hero_mp = state.HeroMp();
-        slotEntity.hero_experience = state.HeroExperience();
-        slotEntity.hero_rage = state.HeroRage();
-        db.Insert<ArpgSaveSlotEntity>(slotEntity).ExecuteAffrows();
+            db.Delete<ArpgSaveItemEntity>().WhereEq("slot", slot).ExecuteAffrows();
+            db.Delete<ArpgSaveEquipmentEntity>().WhereEq("slot", slot).ExecuteAffrows();
+            db.Delete<ArpgSaveSkillEntity>().WhereEq("slot", slot).ExecuteAffrows();
+            db.Delete<ArpgSaveBuffEntity>().WhereEq("slot", slot).ExecuteAffrows();
 
-        db.Delete<ArpgSaveItemEntity>().WhereEq("slot", slot).ExecuteAffrows();
-        db.Delete<ArpgSaveEquipmentEntity>().WhereEq("slot", slot).ExecuteAffrows();
-        db.Delete<ArpgSaveSkillEntity>().WhereEq("slot", slot).ExecuteAffrows();
-        db.Delete<ArpgSaveBuffEntity>().WhereEq("slot", slot).ExecuteAffrows();
+            for (int i = 0; i < state.ItemCount(); i = i + 1) {
+                ArpgSaveItem item = state.ItemAt(i);
+                ArpgSaveItemEntity entity = new ArpgSaveItemEntity();
+                entity.slot = slot;
+                entity.item_name = item.Name();
+                entity.quantity = item.Quantity();
+                db.Insert<ArpgSaveItemEntity>(entity).ExecuteAffrows();
+            }
 
-        for (int i = 0; i < state.ItemCount(); i = i + 1) {
-            ArpgSaveItem item = state.ItemAt(i);
-            ArpgSaveItemEntity entity = new ArpgSaveItemEntity();
-            entity.slot = slot;
-            entity.item_name = item.Name();
-            entity.quantity = item.Quantity();
-            db.Insert<ArpgSaveItemEntity>(entity).ExecuteAffrows();
+            for (int i = 0; i < state.EquipmentCount(); i = i + 1) {
+                ArpgSaveEquipment equip = state.EquipmentAt(i);
+                ArpgSaveEquipmentEntity entity = new ArpgSaveEquipmentEntity();
+                entity.slot = slot;
+                entity.equip_slot = equip.Slot();
+                entity.item_name = equip.ItemName();
+                db.Insert<ArpgSaveEquipmentEntity>(entity).ExecuteAffrows();
+            }
+
+            for (int i = 0; i < state.SkillCount(); i = i + 1) {
+                ArpgSaveSkill skill = state.SkillAt(i);
+                ArpgSaveSkillEntity entity = new ArpgSaveSkillEntity();
+                entity.slot = slot;
+                entity.skill_name = skill.Name();
+                db.Insert<ArpgSaveSkillEntity>(entity).ExecuteAffrows();
+            }
+
+            for (int i = 0; i < state.BuffCount(); i = i + 1) {
+                ArpgSaveBuff buff = state.BuffAt(i);
+                ArpgSaveBuffEntity entity = new ArpgSaveBuffEntity();
+                entity.slot = slot;
+                entity.buff_name = buff.Name();
+                entity.remaining = buff.Remaining();
+                db.Insert<ArpgSaveBuffEntity>(entity).ExecuteAffrows();
+            }
+
+            this.database.Commit();
+            committed = true;
+            return true;
+        } finally {
+            if (!committed) {
+                this.database.Rollback();
+            }
         }
-
-        for (int i = 0; i < state.EquipmentCount(); i = i + 1) {
-            ArpgSaveEquipment equip = state.EquipmentAt(i);
-            ArpgSaveEquipmentEntity entity = new ArpgSaveEquipmentEntity();
-            entity.slot = slot;
-            entity.equip_slot = equip.Slot();
-            entity.item_name = equip.ItemName();
-            db.Insert<ArpgSaveEquipmentEntity>(entity).ExecuteAffrows();
-        }
-
-        for (int i = 0; i < state.SkillCount(); i = i + 1) {
-            ArpgSaveSkill skill = state.SkillAt(i);
-            ArpgSaveSkillEntity entity = new ArpgSaveSkillEntity();
-            entity.slot = slot;
-            entity.skill_name = skill.Name();
-            db.Insert<ArpgSaveSkillEntity>(entity).ExecuteAffrows();
-        }
-
-        for (int i = 0; i < state.BuffCount(); i = i + 1) {
-            ArpgSaveBuff buff = state.BuffAt(i);
-            ArpgSaveBuffEntity entity = new ArpgSaveBuffEntity();
-            entity.slot = slot;
-            entity.buff_name = buff.Name();
-            entity.remaining = buff.Remaining();
-            db.Insert<ArpgSaveBuffEntity>(entity).ExecuteAffrows();
-        }
-
-        this.database.Commit();
-        return true;
     }
 
     // 读取槽位 slot 为 ArpgSaveState：使用 ORM 强类型表达式查询。
@@ -203,13 +225,21 @@ public class ArpgSaveRepository : IDisposable {
         if (!this.ready || slot == "") { return false; }
         SqliteConnection db = this.database.Conn();
         this.database.Begin();
-        db.Delete<ArpgSaveItemEntity>().Where(a => a.slot == slot).ExecuteAffrows();
-        db.Delete<ArpgSaveEquipmentEntity>().Where(a => a.slot == slot).ExecuteAffrows();
-        db.Delete<ArpgSaveSkillEntity>().Where(a => a.slot == slot).ExecuteAffrows();
-        db.Delete<ArpgSaveBuffEntity>().Where(a => a.slot == slot).ExecuteAffrows();
-        int saveResult = db.Delete<ArpgSaveSlotEntity>().Where(a => a.slot == slot).ExecuteAffrows();
-        this.database.Commit();
-        return saveResult > 0;
+        bool committed = false;
+        try {
+            db.Delete<ArpgSaveItemEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+            db.Delete<ArpgSaveEquipmentEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+            db.Delete<ArpgSaveSkillEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+            db.Delete<ArpgSaveBuffEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+            int saveResult = db.Delete<ArpgSaveSlotEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+            this.database.Commit();
+            committed = true;
+            return saveResult > 0;
+        } finally {
+            if (!committed) {
+                this.database.Rollback();
+            }
+        }
     }
 
     // 存档槽位总数；未就绪时返回 0。

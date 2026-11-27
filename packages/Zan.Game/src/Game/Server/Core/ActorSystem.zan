@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 
 namespace Game.Server.Core;
 
-// Actor 调度系统：负责 Actor 生命周期、消息投递与分发调度。
-public class ActorSystem {
+// Actor 调度系统：负责 Actor 生命周期、消息投递与分发调度（O(1) ID 路由，实现 IDisposable 解除 ARC 环）。
+public class ActorSystem : IDisposable {
     private Actor[] actors;
+    private Dictionary<long, int> idToIndex;
     private int capacity;
     private int count;
 
@@ -12,6 +14,7 @@ public class ActorSystem {
         int cap = initialCapacity > 16 ? initialCapacity : 128;
         this.capacity = cap;
         this.actors = new Actor[cap];
+        this.idToIndex = new Dictionary<long, int>();
         this.count = 0;
     }
 
@@ -27,46 +30,61 @@ public class ActorSystem {
         if (actor == null || actor.id == 0L) {
             return false;
         }
-        if (this.Get(actor.id) != null) {
+        if (this.idToIndex.ContainsKey(actor.id)) {
             return false;
         }
         this.EnsureCapacity();
         actor.system = this;
         actor.isAlive = true;
-        this.actors[this.count] = actor;
-        this.count = this.count + 1;
+        int idx = this.count;
+        this.actors[idx] = actor;
+        this.idToIndex[actor.id] = idx;
+        this.count = idx + 1;
 
         actor.OnInit();
         return true;
     }
 
-    // 终止 Actor
+    // 终止 Actor（允许 OnDestroy 内重入 Kill 其它 Actor 而不破坏索引表）
     public bool Kill(long actorId) {
-        for (int i = 0; i < this.count; i = i + 1) {
-            Actor a = this.actors[i];
-            if (a != null && a.id == actorId) {
-                a.isAlive = false;
-                a.OnDestroy();
-                a.system = null;
-                if (a.mailbox != null) {
-                    a.mailbox.Clear();
-                }
-
-                // 交换移除
-                this.actors[i] = this.actors[this.count - 1];
-                this.actors[this.count - 1] = null;
-                this.count = this.count - 1;
-                return true;
-            }
+        int idx = -1;
+        if (!this.idToIndex.TryGetValue(actorId, out idx) || idx < 0 || idx >= this.count) {
+            return false;
         }
-        return false;
+        Actor a = this.actors[idx];
+        if (a == null || a.id != actorId) {
+            return false;
+        }
+        a.isAlive = false;
+        a.system = null;
+        if (a.mailbox != null) {
+            a.mailbox.Clear();
+        }
+        a.OnDestroy();
+
+        // OnDestroy 可能重入修改过 actors 布局，重新查表定位当前槽位
+        if (this.idToIndex.TryGetValue(actorId, out idx) && idx >= 0 && idx < this.count && this.actors[idx] == a) {
+            this.idToIndex.Remove(actorId);
+            int last = this.count - 1;
+            if (idx != last) {
+                Actor moved = this.actors[last];
+                this.actors[idx] = moved;
+                if (moved != null) {
+                    this.idToIndex[moved.id] = idx;
+                }
+            }
+            this.actors[last] = null;
+            this.count = last;
+        }
+        return true;
     }
 
-    // 清空并解除所有 Actor 绑定
+    // 清空并解除所有 Actor 绑定（断开 Actor.system <-> ActorSystem 强引用环）
     public void Clear() {
         for (int i = 0; i < this.count; i = i + 1) {
             Actor a = this.actors[i];
             if (a != null) {
+                a.isAlive = false;
                 a.system = null;
                 if (a.mailbox != null) {
                     a.mailbox.Clear();
@@ -74,13 +92,19 @@ public class ActorSystem {
                 this.actors[i] = null;
             }
         }
+        this.idToIndex.Clear();
         this.count = 0;
     }
 
-    // 查询 Actor
+    public void Dispose() {
+        this.Clear();
+    }
+
+    // O(1) 查询 Actor
     public Actor Get(long actorId) {
-        for (int i = 0; i < this.count; i = i + 1) {
-            Actor a = this.actors[i];
+        int idx = -1;
+        if (this.idToIndex.TryGetValue(actorId, out idx) && idx >= 0 && idx < this.count) {
+            Actor a = this.actors[idx];
             if (a != null && a.id == actorId && a.isAlive) {
                 return a;
             }
@@ -117,19 +141,22 @@ public class ActorSystem {
         return dispatched;
     }
 
-    // 消息派发轮询：单轮最多消费每个 Actor 的 maxPerActor 条消息，防止饥饿
+    // 消息派发轮询：单轮最多消费每个 Actor 的 maxPerActor 条消息，防止饥饿；
+    // 若 OnReceive 内调用 KillSelf() 触发 swap-remove，不跳过被换入的尾部 Actor。
     public int Dispatch(int maxPerActor) {
         int limit = maxPerActor > 0 ? maxPerActor : 16;
         int totalProcessed = 0;
 
-        for (int i = 0; i < this.count; i = i + 1) {
+        int i = 0;
+        while (i < this.count) {
             Actor a = this.actors[i];
             if (a == null || !a.isAlive) {
+                i = i + 1;
                 continue;
             }
 
             int processedThisActor = 0;
-            while (processedThisActor < limit && !a.mailbox.IsEmpty()) {
+            while (processedThisActor < limit && a.isAlive && !a.mailbox.IsEmpty()) {
                 ActorMessage msg = a.mailbox.Dequeue();
                 if (msg != null) {
                     a.OnReceive(msg);
@@ -137,16 +164,23 @@ public class ActorSystem {
                     totalProcessed = totalProcessed + 1;
                 }
             }
+            if (i < this.count && this.actors[i] == a) {
+                i = i + 1;
+            }
         }
         return totalProcessed;
     }
 
-    // 周期心跳驱动
+    // 周期心跳驱动（OnTick 中 KillSelf 不跳过被换入的尾部 Actor）
     public void Tick(long deltaMs) {
-        for (int i = 0; i < this.count; i = i + 1) {
+        int i = 0;
+        while (i < this.count) {
             Actor a = this.actors[i];
             if (a != null && a.isAlive) {
                 a.OnTick(deltaMs);
+            }
+            if (i < this.count && this.actors[i] == a) {
+                i = i + 1;
             }
         }
     }
@@ -154,6 +188,9 @@ public class ActorSystem {
     private void EnsureCapacity() {
         if (this.count < this.capacity) {
             return;
+        }
+        if (this.capacity > 1073741823) {
+            throw new InvalidOperationException("ActorSystem capacity overflow");
         }
         int newCap = this.capacity * 2;
         Actor[] newArr = new Actor[newCap];

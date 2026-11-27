@@ -203,25 +203,39 @@ public class AssetStore {
         return st;
     }
 
-    // 让资源（及其依赖）驻留。
-    //
-    // 依赖先驻留，然后依赖的 depCount +1——因为"本资源驻留"
-    // 这件事本身构成了对依赖的持有。本资源被回收时对应 -1。
+    // 让资源（及其依赖）驻留，检测循环依赖，并在自身加载成功后才对依赖 depCount +1
+    // （避免 LoadBytes 失败时永久泄漏依赖的 depCount）。
     private void EnsureResident(string id) {
+        HashSet<string> visiting = new HashSet<string>();
+        this.EnsureResidentCore(id, visiting);
+    }
+
+    private void EnsureResidentCore(string id, HashSet<string> visiting) {
         AssetEntryState st = this.StateOf(id);
         if (st.loaded) { return; }
-        AssetEntry e = this.manifest.Get(id);
-        if (e != null) {
-            for (int i = 0; i < e.depends.Count; i = i + 1) {
-                string dep = e.depends[i];
-                this.EnsureResident(dep);
-                AssetEntryState dst = this.StateOf(dep);
-                if (dst.loaded) {
-                    dst.depCount = dst.depCount + 1;
+        if (visiting.Contains(id)) {
+            throw new AssetException(AssetError.DependencyFailed, id, "cyclic asset dependency: " + id);
+        }
+        visiting.Add(id);
+        try {
+            AssetEntry e = this.manifest.Get(id);
+            if (e != null) {
+                for (int i = 0; i < e.depends.Count; i = i + 1) {
+                    this.EnsureResidentCore(e.depends[i], visiting);
                 }
             }
+            this.LoadBytes(st);
+            if (e != null) {
+                for (int i = 0; i < e.depends.Count; i = i + 1) {
+                    AssetEntryState dst = this.StateOf(e.depends[i]);
+                    if (dst.loaded) {
+                        dst.depCount = dst.depCount + 1;
+                    }
+                }
+            }
+        } finally {
+            visiting.Remove(id);
         }
-        this.LoadBytes(st);
     }
 
     // 真正从来源读字节。

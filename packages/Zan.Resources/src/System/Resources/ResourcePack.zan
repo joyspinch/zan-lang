@@ -50,14 +50,24 @@ public class ResourcePack {
 
     // 按大端序写入 64 位整数。
     public static void storeBE64(byte[] buf, int off, int v) {
-        for (int i = 0; i < 8; i = i + 1) { buf[off + i] = (byte)(Bits.Shr64(v, 8 * (7 - i)) & 255); }
+        ResourcePack.StoreBE64Long(buf, off, (long)v);
+    }
+
+    // 按大端序写入 64 位长整数。
+    public static void StoreBE64Long(byte[] buf, int off, long v) {
+        for (int i = 0; i < 8; i = i + 1) { buf[off + i] = (byte)(Bits.Shr64(v, 8 * (7 - i)) & 255L); }
+    }
+
+    // 按大端序读取 8 字节为 64 位长整数。
+    public static long LoadBE64Long(string buf, int off) {
+        long v = 0L;
+        for (int i = 0; i < 8; i = i + 1) { v = (v << 8) | (long)(buf[off + i] & 255); }
+        return v;
     }
 
     // 按大端序读取 8 字节为整数。
     public static int loadBE64(string buf, int off) {
-        int v = 0;
-        for (int i = 0; i < 8; i = i + 1) { v = (v << 8) | (buf[off + i] & 255); }
-        return v;
+        return (int)ResourcePack.LoadBE64Long(buf, off);
     }
 
     // 条目名的截断 SHA-256（16 字节）。pack 中只存
@@ -96,7 +106,9 @@ public class ResourcePack {
     // 用于校验 index 签名；传 null 则接受未签名的 pack。
     // <paramref name="err"/>[0]：0 正常，1 IO/magic 错误，2 认证失败，3 签名错误。
     public static ResourcePack Open(string path, string masterKey, string nHex, string eHex, List<int> err) {
+        if (err == null || err.Count == 0) { return null; }
         err[0] = 1;
+        if (path == null || masterKey == null || masterKey.Length < 32) { return null; }
         int fsz = File.GetSize(path);
         if (fsz < 57) { return null; }
         byte[] hdr = File.ReadBytes(path, 0, 57);
@@ -117,19 +129,24 @@ public class ResourcePack {
         byte[] ik = indexKey(masterKey, packId);
         List<int> ok = new List<int>(); ok.Add(0);
         byte[] idx = AesGcm.Decrypt(ik, 32, idxIv, hdr, 21, idxCt, idxLen, idxTag, ok);
-        if (ok[0] == 0) {
+        if (ok[0] == 0 || idx == null || idx.Length < idxLen) {
             err[0] = 2;
             return null;
         }
 
         if (nHex != null && eHex != null) {
             bool sigOk = false;
-            if (sigLen > 0) {
+            int k = nHex.Length / 2;
+            int eLen = eHex.Length / 2;
+            if (sigLen > 0 && k > 0 && eLen > 0 && sigLen == k
+                && (nHex.Length & 1) == 0 && (eHex.Length & 1) == 0) {
                 byte[] sig = File.ReadBytes(path, 57 + idxLen, sigLen);
                 if (sig != null && sig.Length >= sigLen) {
                     byte[] nBuf = Hex.Decode(nHex);
                     byte[] eBuf = Hex.Decode(eHex);
-                    sigOk = Rsa.VerifyPkcs1Sha256(idx, idxLen, sig, nBuf, nHex.Length / 2, eBuf, eHex.Length / 2);
+                    if (nBuf != null && eBuf != null && nBuf.Length >= k && eBuf.Length >= eLen) {
+                        sigOk = Rsa.VerifyPkcs1Sha256(idx, idxLen, sig, nBuf, k, eBuf, eLen);
+                    }
                 }
             }
             if (!sigOk) {
@@ -152,12 +169,14 @@ public class ResourcePack {
         p.indexMap = new Dictionary<string, int>();
         for (int i = 0; i < p.count; i = i + 1) {
             int rec = 4 + 61 * i;
-            int off = loadBE64(idx, rec + 16);
-            int sz = loadBE64(idx, rec + 24);
-            if (off < 0 || sz < 0 || (long)off + (long)sz > (long)fsz) {
+            long offL = ResourcePack.LoadBE64Long(idx, rec + 16);
+            long szL = ResourcePack.LoadBE64Long(idx, rec + 24);
+            if (offL < 0L || szL < 0L || offL > 2147483647L || szL > 2147483647L || offL + szL > (long)fsz) {
                 err[0] = 2;
                 return null;
             }
+            int off = (int)offL;
+            int sz = (int)szL;
             byte[] nh = new byte[17];
             byte[] iv = new byte[13];
             byte[] tg = new byte[17];

@@ -66,9 +66,11 @@ public class RsaKey {
         return -1;
     }
 
-    // 剥掉 PEM 封装（BEGIN/END 行与软换行）后按 Base64 解码为 DER；
-    // 找不到 PEM 边界时返回 null 且 outLen[0] = 0。
+    // 剥掉 PEM 封装（BEGIN/END 行与软换行）后按 Base64 解码为精确长度的 DER；
+    // 找不到 PEM 边界或解码失败时返回 null 且 outLen[0] = 0。
     public static byte[] PemToDer(string pem, List<int> outLen) {
+        if (outLen == null || outLen.Count == 0) { return null; }
+        if (pem == null) { outLen[0] = 0; return null; }
         int begin = RsaKey.Find(pem, "-----BEGIN", 0);
         if (begin < 0) { outLen[0] = 0; return null; }
         int body = RsaKey.Find(pem, "\n", begin);
@@ -94,7 +96,16 @@ public class RsaKey {
         if (start < end) {
             clean.Append(pem.Substring(start, end - start));
         }
-        return Base64.Decode(clean.ToString(), outLen);
+        byte[] raw = Base64.Decode(clean.ToString(), outLen);
+        int n = outLen[0];
+        if (raw == null || n <= 0 || n > raw.Length) {
+            outLen[0] = 0;
+            return null;
+        }
+        if (raw.Length == n) { return raw; }
+        byte[] trimmed = new byte[n];
+        for (int j = 0; j < n; j = j + 1) { trimmed[j] = raw[j]; }
+        return trimmed;
     }
 
     // 读 DER TLV 的长度字段（短/长形式），带完整边界与溢出校验，失败返回 -1。
@@ -349,9 +360,13 @@ public class RsaKey {
 
     // 校验 PKCS#1 v1.5 SHA-256 签名（Base64 编码，长度须等于模数长度）。
     public bool VerifySha256(string message, string signatureBase64) {
+        if (message == null || signatureBase64 == null
+            || this.modulus == null || this.publicExponent == null || this.modulusLength <= 0) {
+            return false;
+        }
         List<int> sigLen = new List<int>(); sigLen.Add(0);
         byte[] sig = Base64.Decode(signatureBase64, sigLen);
-        if (sigLen[0] != this.modulusLength) { return false; }
+        if (sig == null || sigLen[0] != this.modulusLength || sig.Length < this.modulusLength) { return false; }
         return Rsa.VerifyPkcs1Sha256(message, message.Length, sig,
             this.modulus, this.modulusLength,
             this.publicExponent, this.publicExponentLength);
@@ -361,10 +376,15 @@ public class RsaKey {
     // 输出上限约 modLen - 42 字节，超长会失败——常规做法是用本方法
     // 包一个对称密钥再加密正文。
     public string EncryptOaepSha1(string plaintext) {
+        if (plaintext == null || this.modulus == null || this.publicExponent == null || this.modulusLength <= 0) {
+            return "";
+        }
         byte[] seed = RandomNumberGenerator.GetBytes(20);
+        if (seed == null || seed.Length < 20) { return ""; }
         byte[] encrypted = Rsa.EncryptOaep(plaintext, plaintext.Length,
             this.modulus, this.modulusLength,
             this.publicExponent, this.publicExponentLength, 1, seed);
+        if (encrypted == null || encrypted.Length < this.modulusLength) { return ""; }
         return Base64.Encode(encrypted, this.modulusLength);
     }
 }

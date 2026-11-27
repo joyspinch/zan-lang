@@ -39,53 +39,70 @@ public class ResourcePackWriter {
 
     // 写入 pack（masterKey 为 32 字节；nHex/dHex 为 RSA 十六进制参数用于 index 签名，传 null 可跳过）。
     public bool Write(string path, string masterKey, string nHex, string dHex) {
+        if (path == null || masterKey == null || masterKey.Length < 32) { return false; }
         int count = this.entries.Count;
+        long idxLenL = 4L + 61L * (long)count;
+        if (count < 0 || idxLenL > 2147483647L) { return false; }
         int sigLen = 0;
         byte[] nBuf = null;
         byte[] dBuf = null;
-        if (nHex != null && dHex != null) {
+        if (nHex != null || dHex != null) {
+            if (nHex == null || dHex == null || (nHex.Length & 1) != 0 || (dHex.Length & 1) != 0) {
+                return false;
+            }
+            sigLen = nHex.Length / 2;
+            int dLen = dHex.Length / 2;
+            if (sigLen <= 0 || dLen <= 0) { return false; }
             nBuf = Hex.Decode(nHex);
             dBuf = Hex.Decode(dHex);
-            sigLen = nHex.Length / 2;
+            if (nBuf == null || dBuf == null || nBuf.Length < sigLen || dBuf.Length < dLen) {
+                return false;
+            }
         }
 
         byte[] packId = RandomNumberGenerator.GetBytes(16);
         byte[] idxIv = RandomNumberGenerator.GetBytes(12);
         if (packId == null || idxIv == null) { return false; }
 
-        int idxLen = 4 + 61 * count;
-        int dataStart = 57 + idxLen + sigLen;
+        int idxLen = (int)idxLenL;
+        long dataStartL = 57L + idxLenL + (long)sigLen;
+        if (dataStartL > 2147483647L) { return false; }
 
         // 单趟构建明文 index 并用各自 HKDF 派生密钥加密负载。
         byte[] idx = new byte[idxLen + 1];
         ResourcePack.storeBE32(idx, 0, count);
         List<byte[]> cts = new List<byte[]>();
-        int off = dataStart;
+        long off = dataStartL;
         for (int i = 0; i < count; i = i + 1) {
             ResourceEntry entry = this.entries[i];
+            if (entry == null || entry.name == null || entry.len < 0) { return false; }
+            if (off + (long)entry.len > 2147483647L) { return false; }
             byte[] nh = ResourcePack.nameHash(entry.name);
             byte[] iv = RandomNumberGenerator.GetBytes(12);
             if (iv == null) { return false; }
 
             int rec = 4 + 61 * i;
             for (int j = 0; j < 16; j = j + 1) { idx[rec + j] = nh[j]; }
-            ResourcePack.storeBE64(idx, rec + 16, off);
-            ResourcePack.storeBE64(idx, rec + 24, entry.len);
+            ResourcePack.StoreBE64Long(idx, rec + 16, off);
+            ResourcePack.StoreBE64Long(idx, rec + 24, (long)entry.len);
             idx[rec + 32] = 0;  // 标志位（bit0 保留给压缩）
             for (int j = 0; j < 12; j = j + 1) { idx[rec + 33 + j] = iv[j]; }
 
             byte[] ek = ResourcePack.entryKey(masterKey, packId, nh);
             byte[] tag = new byte[17];
             byte[] ct = AesGcm.Encrypt(ek, 32, iv, nh, 16, entry.data, entry.len, tag);
+            if (ct == null || ct.Length < entry.len) { return false; }
             cts.Add(ct);
             for (int j = 0; j < 16; j = j + 1) { idx[rec + 45 + j] = tag[j]; }
-            off = off + entry.len;
+            off = off + (long)entry.len;
         }
 
         // 先对明文 index 签名，再加密。
         byte[] sig = null;
         if (sigLen > 0) {
-            sig = Rsa.SignPkcs1Sha256(idx, idxLen, nBuf, sigLen, dBuf, sigLen);
+            int dLen = dHex.Length / 2;
+            sig = Rsa.SignPkcs1Sha256(idx, idxLen, nBuf, sigLen, dBuf, dLen);
+            if (sig == null || sig.Length < sigLen) { return false; }
         }
 
         byte[] hdr = new byte[58];
@@ -98,15 +115,24 @@ public class ResourcePackWriter {
         byte[] ik = ResourcePack.indexKey(masterKey, packId);
         byte[] idxTag = new byte[17];
         byte[] idxCt = AesGcm.Encrypt(ik, 32, idxIv, hdr, 21, idx, idxLen, idxTag);
+        if (idxCt == null || idxCt.Length < idxLen) { return false; }
         for (int i = 0; i < 16; i = i + 1) { hdr[33 + i] = idxTag[i]; }
 
         nint fp = fopen(path, "wb");
         if (fp == 0) { return false; }
-        fwrite(hdr, 1, 57, fp);
-        fwrite(idxCt, 1, idxLen, fp);
-        if (sigLen > 0) { fwrite(sig, 1, sigLen, fp); }
-        for (int i = 0; i < count; i = i + 1) { fwrite(cts[i], 1, this.entries[i].len, fp); }
-        fclose(fp);
-        return true;
+        bool writeOk = false;
+        try {
+            if (fwrite(hdr, 1, 57, fp) != 57L) { return false; }
+            if (idxLen > 0 && fwrite(idxCt, 1, idxLen, fp) != (long)idxLen) { return false; }
+            if (sigLen > 0 && fwrite(sig, 1, sigLen, fp) != (long)sigLen) { return false; }
+            for (int i = 0; i < count; i = i + 1) {
+                int elen = this.entries[i].len;
+                if (elen > 0 && fwrite(cts[i], 1, elen, fp) != (long)elen) { return false; }
+            }
+            writeOk = true;
+        } finally {
+            if (fclose(fp) != 0) { writeOk = false; }
+        }
+        return writeOk;
     }
 }

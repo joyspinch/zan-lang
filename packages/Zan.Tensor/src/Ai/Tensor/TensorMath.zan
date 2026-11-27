@@ -445,11 +445,15 @@ public class TensorMath {
         int dim = table.Dim(1);
         int vocab = table.Dim(0);
         int n = indices == null ? 0 : indices.Count;
+        long totalElems = (long)n * (long)dim;
+        long rowBytesL = (long)dim * 4L;
+        if (totalElems > 2147483647L || rowBytesL > 2147483647L) {
+            throw new ArgumentException("TensorMath.GatherRows: output size overflow");
+        }
         List<int> shape = new List<int>();
         shape.Add(n);
         shape.Add(dim);
-        float[] res = new float[n * dim];
-        int rowBytes = dim * 4;
+        float[] res = new float[(int)totalElems];
         nint srcPtr = (nint)table.data;
         nint dstPtr = (nint)res;
         for (int i = 0; i < n; i = i + 1) {
@@ -457,8 +461,8 @@ public class TensorMath {
             if (row < 0 || row >= vocab) {
                 throw new ArgumentException("TensorMath.GatherRows: row index out of range");
             }
-            if (rowBytes > 0) {
-                NativeMemory.Copy(dstPtr + (nint)(i * rowBytes), srcPtr + (nint)(row * rowBytes), rowBytes);
+            if (rowBytesL > 0L) {
+                NativeMemory.Copy(dstPtr + (nint)((long)i * rowBytesL), srcPtr + (nint)((long)row * rowBytesL), (int)rowBytesL);
             }
         }
         return new Tensor(shape, res);
@@ -467,23 +471,35 @@ public class TensorMath {
     // 沿第 0 维拼接两个张量（双段整块 memcpy）。
     public static Tensor ConcatRows(Tensor a, Tensor b) {
         if (a.Rank() != b.Rank()) { throw new ArgumentException("TensorMath.ConcatRows: rank mismatch"); }
-        int inner = 1;
+        if (a.Rank() == 0) { throw new ArgumentException("TensorMath.ConcatRows: cannot concat scalar tensors"); }
+        long inner = 1L;
         for (int i = 1; i < a.Rank(); i = i + 1) {
-            if (a.Dim(i) != b.Dim(i)) { throw new ArgumentException("TensorMath.ConcatRows: inner dimension mismatch"); }
-            inner = inner * a.Dim(i);
+            int da = a.Dim(i);
+            if (da != b.Dim(i)) { throw new ArgumentException("TensorMath.ConcatRows: inner dimension mismatch"); }
+            if (da > 0 && inner > 2147483647L / (long)da) {
+                throw new ArgumentException("TensorMath.ConcatRows: inner dimension overflow");
+            }
+            inner = inner * (long)da;
         }
-        int rowsA = a.Dim(0);
-        int rowsB = b.Dim(0);
+        long rowsA = (long)a.Dim(0);
+        long rowsB = (long)b.Dim(0);
+        if (rowsA + rowsB > 2147483647L) {
+            throw new ArgumentException("TensorMath.ConcatRows: row count overflow");
+        }
+        long elemsA = rowsA * inner;
+        long elemsB = rowsB * inner;
+        long totalElems = elemsA + elemsB;
+        if (totalElems > 2147483647L || elemsA * 4L > 2147483647L || elemsB * 4L > 2147483647L) {
+            throw new ArgumentException("TensorMath.ConcatRows: output size overflow");
+        }
         List<int> shape = a.Shape();
-        shape[0] = rowsA + rowsB;
-        int elemsA = rowsA * inner;
-        int elemsB = rowsB * inner;
-        float[] res = new float[elemsA + elemsB];
-        if (elemsA > 0) {
-            NativeMemory.Copy((nint)res, (nint)a.data, elemsA * 4);
+        shape[0] = (int)(rowsA + rowsB);
+        float[] res = new float[(int)totalElems];
+        if (elemsA > 0L) {
+            NativeMemory.Copy((nint)res, (nint)a.data, (int)(elemsA * 4L));
         }
-        if (elemsB > 0) {
-            NativeMemory.Copy((nint)res + (nint)(elemsA * 4), (nint)b.data, elemsB * 4);
+        if (elemsB > 0L) {
+            NativeMemory.Copy((nint)res + (nint)(elemsA * 4L), (nint)b.data, (int)(elemsB * 4L));
         }
         return new Tensor(shape, res);
     }
