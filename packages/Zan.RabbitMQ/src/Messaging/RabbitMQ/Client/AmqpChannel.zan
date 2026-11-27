@@ -379,6 +379,7 @@ public class AmqpChannel : IDisposable {
 
     // 同步等待特定 RPC 方法回复
     private async bool ExecuteRpcAsync(byte[] methodPayload, int expectClass, int expectMethod) {
+        if (!this.open || this.conn == null || this.rpcGate == null) { return false; }
         this.expectedClass = expectClass;
         this.expectedMethod = expectMethod;
         this.rpcSuccess = false;
@@ -454,6 +455,14 @@ public class AmqpChannel : IDisposable {
         BasicProperties props = BasicProperties.Decode(r);
 
         if (this.currentDelivery != null) {
+            if (bodySize < 0L || bodySize > 67108864L) {
+                // 防御畸形负值或超 64 MiB 载荷导致异常分配/OOM
+                this.currentDelivery = null;
+                this.deliveryBodyBuf = null;
+                this.deliveryBodyRemaining = 0;
+                this.deliveryBodyOffset = 0;
+                return;
+            }
             this.currentDelivery.properties = props;
             this.deliveryBodyRemaining = (int)bodySize;
             this.deliveryBodyBuf = new byte[this.deliveryBodyRemaining];
@@ -465,7 +474,7 @@ public class AmqpChannel : IDisposable {
     }
 
     private void HandleBodyFrame(byte[] payload) {
-        if (this.currentDelivery == null || payload == null || payload.Length == 0) { return; }
+        if (this.currentDelivery == null || this.deliveryBodyBuf == null || payload == null || payload.Length == 0) { return; }
         int chunk = payload.Length;
         if (chunk > this.deliveryBodyRemaining) { chunk = this.deliveryBodyRemaining; }
         NativeMemory.Copy((nint)this.deliveryBodyBuf + (nint)this.deliveryBodyOffset, (nint)payload, chunk);
@@ -486,11 +495,9 @@ public class AmqpChannel : IDisposable {
         this.deliveryBodyBuf = null;
 
         // 查找消费者并异步调度触发回调
-        if (this.consumers.ContainsKey(msg.consumerTag)) {
-            AmqpConsumer c = this.consumers[msg.consumerTag];
-            if (c.handler != null) {
-                Task.Spawn(c.handler(this, msg));
-            }
+        AmqpConsumer c = null;
+        if (this.consumers != null && this.consumers.TryGetValue(msg.consumerTag, out c) && c != null && c.handler != null) {
+            Task.Spawn(c.handler(this, msg));
         }
     }
 }

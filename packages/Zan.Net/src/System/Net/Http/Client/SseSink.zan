@@ -56,8 +56,20 @@ public class SseSink {
     public static SseSink ToMemory() { return SseSink.Create("", ""); }
 
     public void Begin() {
-        Mutex.Lock(this.lockHandle);
+        nint newFp = 0;
+        if (this.path != "") {
+            nint t = SseSink.fopen(this.path, "wb");
+            if (t != 0) { SseSink.fclose(t); }
+            newFp = SseSink.fopen(this.path, "ab");
+        }
+        nint lk = this.lockHandle;
+        if (lk == 0) {
+            if (newFp != 0) { SseSink.fclose(newFp); }
+            return;
+        }
+        Mutex.Lock(lk);
         if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+        this.fp = newFp;
         this.parts = new List<string>();
         this.cut = 0;
         this.attempt = "";
@@ -69,28 +81,27 @@ public class SseSink {
         this.responseStatus = 0;
         this.responseHeaders = "";
         this.responseErrorBody = "";
-        Mutex.Unlock(this.lockHandle);
-        if (this.path != "") {
-            nint t = SseSink.fopen(this.path, "wb");
-            if (t != 0) { SseSink.fclose(t); }
-            this.fp = SseSink.fopen(this.path, "ab");
-        }
+        Mutex.Unlock(lk);
     }
 
     public void SetMaxBytes(int bytes) {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         this.maxBytes = bytes > 0 ? bytes : 0;
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
     }
 
     public void Write(string piece) { this.TryWrite(piece); }
 
     public bool TryWrite(string piece) {
-        if (piece.Length == 0) { return true; }
+        if (piece == null || piece.Length == 0) { return true; }
+        nint lk = this.lockHandle;
+        if (lk == 0) { return false; }
         bool signal = false;
         bool overflow = false;
         int limit = 0;
-        Mutex.Lock(this.lockHandle);
+        Mutex.Lock(lk);
         bool stopped = this.aborted || this.overflowed || this.attempt.Length > 0;
         int maxCap = this.maxBytes > 0 ? this.maxBytes : 1073741824;
         if (!stopped && this.total > maxCap - piece.Length) {
@@ -102,14 +113,14 @@ public class SseSink {
                 long _w = SseSink.fwrite(piece, 1, piece.Length, this.fp);
                 this.total = this.total + piece.Length;
             }
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return true;
         } else if (!stopped) {
             this.parts.Add(piece);
             this.total = this.total + piece.Length;
             signal = true;
         }
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         if (overflow) {
             this.Finish("err: stream exceeds " + Convert.ToString(limit) + " bytes");
             return false;
@@ -119,13 +130,15 @@ public class SseSink {
     }
 
     private void StopWith(bool isAbort, string marker) {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         bool already = this.aborted || this.overflowed || this.attempt.Length > 0;
         if (!already) {
             if (isAbort) { this.aborted = true; }
             else { this.overflowed = true; }
         }
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         if (!already) { this.Finish(marker); }
     }
 
@@ -185,15 +198,17 @@ public class SseSink {
     }
 
     public void Finish(string marker) {
-        Mutex.Lock(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
         if (this.attempt.Length > 0) {
-            Mutex.Unlock(this.lockHandle);
+            Mutex.Unlock(lk);
             return;
         }
         if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
         this.attempt = marker;
         if (this.path != "") { this.done = marker; }
-        Mutex.Unlock(this.lockHandle);
+        Mutex.Unlock(lk);
         if (this.donePath != "") {
             nint dp = SseSink.fopen(this.donePath, "ab");
             if (dp != 0) {
@@ -287,11 +302,18 @@ public class SseSink {
 
     // 不提前 Close ready 门：TakeCo(timeoutMs) 遗留的看门狗协程到期仍会 signal，交由 ARC 随 sink 回收。
     public void Dispose() {
-        if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
-        this.ready = null;
-        if (this.lockHandle != 0) {
-            Mutex.Destroy(this.lockHandle);
+        nint lk = this.lockHandle;
+        if (lk != 0) {
             this.lockHandle = 0;
+            Mutex.Lock(lk);
+            this.aborted = true;
+            if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+            Mutex.Unlock(lk);
+            Mutex.Destroy(lk);
+        } else if (this.fp != 0) {
+            SseSink.fclose(this.fp);
+            this.fp = 0;
         }
+        this.ready = null;
     }
 }

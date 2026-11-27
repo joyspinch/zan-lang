@@ -1,7 +1,18 @@
 using System;
+using System.Collections.Generic;
 using Zan.Web.Core;
 
 namespace Zan.Web.Security;
+
+internal class LoginThrottleEntry {
+    public int count;
+    public int windowStart;
+
+    public LoginThrottleEntry(int c, int start) {
+        this.count = c;
+        this.windowStart = start;
+    }
+}
 
 // 登录爆破限流：按账号（大小写/空白归一）记失败次数，窗口内达到阈值
 // 即拒绝后续尝试，直到窗口整体滑出。进程内固定窗实现——每 worker
@@ -13,21 +24,20 @@ namespace Zan.Web.Security;
 // 失败次数，不构成新信息。
 // - 不存在的账号也记失败：否则"账号不存在"路径不受限流，计时侧信道
 // 可枚举有效用户名。
-// - 成功登录清零；键上限封内存，超出淘汰最旧（攻击者换账号扫描时
+// - 成功登录清零；键上限封内存，超出先清过期项再淘汰最旧（攻击者换账号扫描时
 // 最多冲掉自己的限流记录）。
 public class LoginThrottle {
     /* 窗口内第 MaxFails 次失败即锁到窗口滑出。默认 10 次 / 15 分钟：
  十轮爆破 900 秒只试 10 个口令，人工输错也够余量。 */
     public static const int MaxFails = 10;
     public static const int WindowSec = 900;
-    /* 键内存上限：全键三张平行表，超限淘汰最旧（表头近似最旧）。 */
+    /* 键内存上限：Dictionary O(1) 索引，超限先清过期再淘汰最旧窗口。 */
     public static const int MaxKeys = 4096;
 
-    private static List<string> names = new List<string>();
-    private static List<int> counts = new List<int>();
-    private static List<int> windowStart = new List<int>();
+    private static Dictionary<string, LoginThrottleEntry> entries = new Dictionary<string, LoginThrottleEntry>();
 
     public static string Norm(string user) {
+        if (user == null) { return ""; }
         string s = user.Trim().ToLower();
         if (s.Length > 64) { s = s.Substring(0, 64); }
         return s;
@@ -37,40 +47,59 @@ public class LoginThrottle {
     public static bool Allowed(string user) {
         string key = Norm(user);
         if (key.Length == 0) { return true; }
+        Dictionary<string, LoginThrottleEntry> map = LoginThrottle.entries;
+        if (map == null) { return true; }
         int now = WebApp.NowSeconds();
-        lock (names) {
-            int i = IndexOf(key);
-            if (i < 0) { return true; }
-            if (now - windowStart[i] >= WindowSec) {
-                RemoveAt(i);
+        lock (map) {
+            LoginThrottleEntry e = null;
+            if (!map.TryGetValue(key, out e) || e == null) { return true; }
+            if (now - e.windowStart >= WindowSec) {
+                map.Remove(key);
                 return true;
             }
-            return counts[i] < MaxFails;
+            return e.count < MaxFails;
         }
     }
 
-    /* 记一次失败；新键占用若触顶先淘汰最旧。 */
+    /* 记一次失败；新键占用若触顶先清过期项再淘汰最旧。 */
     public static void Fail(string user) {
         string key = Norm(user);
         if (key.Length == 0) { return; }
+        Dictionary<string, LoginThrottleEntry> map = LoginThrottle.entries;
+        if (map == null) { return; }
         int now = WebApp.NowSeconds();
-        lock (names) {
-            int i = IndexOf(key);
-            if (i >= 0) {
-                if (now - windowStart[i] >= WindowSec) {
-                    counts[i] = 1;
-                    windowStart[i] = now;
+        lock (map) {
+            LoginThrottleEntry e = null;
+            if (map.TryGetValue(key, out e) && e != null) {
+                if (now - e.windowStart >= WindowSec) {
+                    e.count = 1;
+                    e.windowStart = now;
                 } else {
-                    counts[i] = counts[i] + 1;
+                    e.count = e.count + 1;
                 }
                 return;
             }
-            if (names.Count >= MaxKeys) {
-                RemoveAt(0);
+            if (map.Count >= MaxKeys) {
+                List<string> keys = map.Keys;
+                string oldestKey = null;
+                int oldestStart = 2147483647;
+                for (int i = 0; i < keys.Count; i = i + 1) {
+                    string k = keys[i];
+                    LoginThrottleEntry cur = null;
+                    if (map.TryGetValue(k, out cur) && cur != null) {
+                        if (now - cur.windowStart >= WindowSec) {
+                            map.Remove(k);
+                        } else if (cur.windowStart < oldestStart) {
+                            oldestStart = cur.windowStart;
+                            oldestKey = k;
+                        }
+                    }
+                }
+                if (map.Count >= MaxKeys && oldestKey != null) {
+                    map.Remove(oldestKey);
+                }
             }
-            names.Add(key);
-            counts.Add(1);
-            windowStart.Add(now);
+            map[key] = new LoginThrottleEntry(1, now);
         }
     }
 
@@ -78,27 +107,15 @@ public class LoginThrottle {
     public static void Clear(string user) {
         string key = Norm(user);
         if (key.Length == 0) { return; }
-        lock (names) {
-            int i = IndexOf(key);
-            if (i >= 0) { RemoveAt(i); }
+        Dictionary<string, LoginThrottleEntry> map = LoginThrottle.entries;
+        if (map == null) { return; }
+        lock (map) {
+            map.Remove(key);
         }
     }
 
     /* 被限流即 true——仅供界面文案，不改变 Login 的应答语义。 */
     public static bool Blocked(string user) {
         return !Allowed(user);
-    }
-
-    private static int IndexOf(string key) {
-        for (int i = 0; i < names.Count; i = i + 1) {
-            if (names[i] == key) { return i; }
-        }
-        return -1;
-    }
-
-    private static void RemoveAt(int i) {
-        names.RemoveAt(i);
-        counts.RemoveAt(i);
-        windowStart.RemoveAt(i);
     }
 }

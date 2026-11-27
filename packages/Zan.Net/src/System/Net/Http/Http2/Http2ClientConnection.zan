@@ -69,6 +69,7 @@ public class Http2ClientConnection : IDisposable {
         Socket.Initialize();
         TcpClient client = await TcpClient.ConnectAsync(host, port);
         if (client == null) {
+            conn.ReleaseTransport();
             return null;
         }
         nint s = client.GetSocket();
@@ -111,6 +112,7 @@ public class Http2ClientConnection : IDisposable {
         Socket.Initialize();
         TcpClient client = await TcpClient.ConnectAsync(host, port);
         if (client == null) {
+            conn.ReleaseTransport();
             return null;
         }
         nint s = client.GetSocket();
@@ -127,11 +129,20 @@ public class Http2ClientConnection : IDisposable {
 
         TlsStream ts = await TlsStream.ConnectAsync(ctx, s, host, 10000);
         if (ts == null) {
+            conn.sock = -1;
             client.Close();
             ctx.Free();
+            conn.ReleaseTransport();
             return null;
         }
-        if (ts.NegotiatedAlpn() != "h2") { ts.Close(); client.Close(); ctx.Free(); return null; }
+        if (ts.NegotiatedAlpn() != "h2") {
+            conn.sock = -1;
+            ts.Close();
+            client.Close();
+            ctx.Free();
+            conn.ReleaseTransport();
+            return null;
+        }
         conn.tls = ts;
         conn.tlsCtx = ctx;
         conn.connected = true;
@@ -421,21 +432,32 @@ public class Http2ClientConnection : IDisposable {
         finally { this.wireGate.Signal(); }
     }
 
-    // 精确读取指定字节数。
+    // 精确读取指定字节数（TLS 与首次明文直读直接落入目标缓冲区，避免逐帧临时分配与逐字节拷贝）。
     private async int ReadExactAsync(byte[] buf, int count) {
+        if (count <= 0) { return 0; }
         int got = 0;
-        byte[] tmp = new byte[count];
-        while (got < count && this.connected) {
-            int n = 0;
-            if (this.tls != null) {
-                n = await this.tls.RecvBytesAsync(tmp, 0, count - got);
-            } else if (this.sock >= 0) {
-                n = await Socket.RecvOv(this.sock, tmp, count - got);
+        if (this.tls != null) {
+            while (got < count && this.connected) {
+                int n = await this.tls.RecvBytesAsync(buf, got, count - got);
+                if (n <= 0) { break; }
+                got = got + n;
             }
-            if (n <= 0) { break; }
-            for (int i = 0; i < n; i = i + 1) {
-                buf[got] = tmp[i];
-                got = got + 1;
+            return got;
+        }
+        byte[] tmp = null;
+        while (got < count && this.connected) {
+            if (this.sock < 0) { break; }
+            if (got == 0) {
+                int n = await Socket.RecvOv(this.sock, buf, count);
+                if (n <= 0) { break; }
+                got = got + n;
+            } else {
+                int remain = count - got;
+                if (tmp == null || tmp.Length < remain) { tmp = new byte[remain]; }
+                int n = await Socket.RecvOv(this.sock, tmp, remain);
+                if (n <= 0) { break; }
+                NativeMemory.Copy((nint)buf + (nint)got, (nint)tmp, n);
+                got = got + n;
             }
         }
         return got;
@@ -453,12 +475,12 @@ public class Http2ClientConnection : IDisposable {
         if (this.tls != null) { this.tls.Close(); this.tls = null; }
         if (this.tlsCtx != null) { this.tlsCtx.Free(); this.tlsCtx = null; }
         if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        if (this.wireGate != null) { this.wireGate.Close(); }
     }
 
     // 发送 WINDOW_UPDATE 帧更新指定流（或连接级 streamId=0）的接收窗口配额
     public void SendWindowUpdate(int streamId, int increment) {
         if (increment <= 0) { return; }
-        byte[] wu = Http2Frame.BuildWindowUpdate(streamId, increment);
         Task.Spawn(this.SendWindowUpdateAsync(streamId, increment));
     }
 

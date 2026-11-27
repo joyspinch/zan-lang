@@ -25,6 +25,7 @@ public partial class MySqlConnection : IDbConnection {
     public bool tlsVerify = true;
     bool busy;
     Queue<AsyncGate> waiters;
+    byte[] hdrBuf;
 
     public MySqlConnection() {
         this.sock = -1;
@@ -36,6 +37,7 @@ public partial class MySqlConnection : IDbConnection {
         this.hadError = false;
         this.stmtCache = new List<PreparedStmt>();
         this.tls = null;
+        this.hdrBuf = new byte[5];
     }
 
     private async bool AcquireLock() {
@@ -66,6 +68,7 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     private async int recvExact(byte[] dst, int off, int need) {
+        if (need <= 0) { return 0; }
         if (this.tls != null) {
             int have = 0;
             while (have < need) {
@@ -76,19 +79,28 @@ public partial class MySqlConnection : IDbConnection {
             return have;
         }
         int got = 0;
-        byte[] tmp = new byte[need + 1];
+        byte[] tmp = null;
         while (got < need) {
-            int n = await Socket.RecvOv(this.sock, tmp, need - got);
-            if (n <= 0) { return got; }
-            NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
-            got = got + n;
+            if (off == 0 && got == 0) {
+                int n = await Socket.RecvOv(this.sock, dst, need);
+                if (n <= 0) { return got; }
+                got = got + n;
+            } else {
+                int remain = need - got;
+                if (tmp == null || tmp.Length < remain) { tmp = new byte[remain + 1]; }
+                int n = await Socket.RecvOv(this.sock, tmp, remain);
+                if (n <= 0) { return got; }
+                NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
+                got = got + n;
+            }
         }
         return got;
     }
 
     internal async byte[] readPacket() {
-        byte[] hdr = new byte[5];
-        byte[] pay = new byte[1];
+        byte[] hdr = this.hdrBuf;
+        if (hdr == null) { hdr = new byte[5]; this.hdrBuf = hdr; }
+        byte[] pay = null;
         int totalLen = 0;
         this.lastLen = -1;
         bool complete = false;
@@ -104,9 +116,13 @@ public partial class MySqlConnection : IDbConnection {
                     return null;
                 }
                 if (len > 0) {
-                    byte[] merged = new byte[nextLen + 1];
-                    if (totalLen > 0) { NativeMemory.Copy((nint)merged, (nint)pay, totalLen); }
-                    pay = merged;
+                    if (totalLen == 0) {
+                        pay = new byte[len + 1];
+                    } else {
+                        byte[] merged = new byte[nextLen + 1];
+                        NativeMemory.Copy((nint)merged, (nint)pay, totalLen);
+                        pay = merged;
+                    }
                     int body = await this.recvExact(pay, totalLen, len);
                     if (body < len) { this.lastError = "truncated MySQL packet body"; return null; }
                 }
@@ -114,7 +130,7 @@ public partial class MySqlConnection : IDbConnection {
                 if (len < MySqlPacketBounds.MaxChunkBytes) {
                     this.lastLen = totalLen;
                     complete = true;
-                    return pay;
+                    return pay != null ? pay : new byte[1];
                 }
             }
         } finally {

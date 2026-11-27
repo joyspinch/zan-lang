@@ -93,11 +93,14 @@ public class HttpConnectionPool : IDisposable {
             long elapsed = Stopwatch.GetMilliseconds() - startMs;
             long remain = budget - elapsed;
             if (remain <= 0) {
-                Mutex.Lock(this.mtx);
-                try {
-                    this.statWaitTimeouts = this.statWaitTimeouts + 1;
-                } finally {
-                    Mutex.Unlock(this.mtx);
+                nint m = this.mtx;
+                if (m != 0) {
+                    Mutex.Lock(m);
+                    try {
+                        this.statWaitTimeouts = this.statWaitTimeouts + 1;
+                    } finally {
+                        Mutex.Unlock(m);
+                    }
                 }
                 throw new HttpRequestException("connection pool wait timeout: all "
                     + Convert.ToString(this.maxConnections) + " connections are busy");
@@ -113,10 +116,11 @@ public class HttpConnectionPool : IDisposable {
 
     // 租借一条可用的空闲连接（若存在且未过期）
     public PooledHttpConnection TryRentIdle() {
-        if (this.mtx == 0) { return null; }
-        List<PooledHttpConnection> expired = new List<PooledHttpConnection>();
+        nint m = this.mtx;
+        if (m == 0) { return null; }
+        List<PooledHttpConnection> expired = null;
         PooledHttpConnection chosen = null;
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         try {
             long idleUs = this.idleTimeoutMs * 1000L;
             long lifeUs = this.maxLifetimeMs * 1000L;
@@ -125,6 +129,7 @@ public class HttpConnectionPool : IDisposable {
                 PooledHttpConnection conn = this.idleList[lastIdx];
                 this.idleList.RemoveAt(lastIdx);
                 if (conn.IsExpired(idleUs, lifeUs) || !conn.IsHealthy()) {
+                    if (expired == null) { expired = new List<PooledHttpConnection>(); }
                     expired.Add(conn);
                     continue;
                 }
@@ -135,13 +140,15 @@ public class HttpConnectionPool : IDisposable {
                 break;
             }
         } finally {
-            Mutex.Unlock(this.mtx);
+            Mutex.Unlock(m);
         }
-        for (int i = 0; i < expired.Count; i = i + 1) {
-            expired[i].Dispose();
-        }
-        if (expired.Count > 0 && this.gate != null) {
-            this.gate.Signal();
+        if (expired != null) {
+            for (int i = 0; i < expired.Count; i = i + 1) {
+                expired[i].Dispose();
+            }
+            if (expired.Count > 0 && this.gate != null) {
+                this.gate.Signal();
+            }
         }
         return chosen;
     }
@@ -178,7 +185,7 @@ public class HttpConnectionPool : IDisposable {
             }
             long idleUs = this.idleTimeoutMs * 1000L;
             long lifeUs = this.maxLifetimeMs * 1000L;
-            if (reusable && !conn.IsExpired(idleUs, lifeUs) && conn.IsHealthy() && this.idleList.Count < this.maxIdleConnections) {
+            if (reusable && !this.disposed && !conn.IsExpired(idleUs, lifeUs) && conn.IsHealthy() && this.idleList.Count < this.maxIdleConnections) {
                 conn.Touch();
                 this.idleList.Add(conn);
             } else {
@@ -280,9 +287,10 @@ public class HttpConnectionPool : IDisposable {
     // 主动清扫空闲连接列表中已过期或异常的连接，释放底层资源并唤醒等待协程。
     // 返回本次清扫释放的连接总数。
     public int SweepExpired() {
-        if (this.mtx == 0) { return 0; }
-        List<PooledHttpConnection> expired = new List<PooledHttpConnection>();
-        Mutex.Lock(this.mtx);
+        nint m = this.mtx;
+        if (m == 0) { return 0; }
+        List<PooledHttpConnection> expired = null;
+        Mutex.Lock(m);
         try {
             long idleUs = this.idleTimeoutMs * 1000L;
             long lifeUs = this.maxLifetimeMs * 1000L;
@@ -291,14 +299,16 @@ public class HttpConnectionPool : IDisposable {
                 PooledHttpConnection conn = this.idleList[i];
                 if (conn.IsExpired(idleUs, lifeUs) || !conn.IsHealthy()) {
                     this.idleList.RemoveAt(i);
+                    if (expired == null) { expired = new List<PooledHttpConnection>(); }
                     expired.Add(conn);
                 } else {
                     i = i + 1;
                 }
             }
         } finally {
-            Mutex.Unlock(this.mtx);
+            Mutex.Unlock(m);
         }
+        if (expired == null) { return 0; }
         for (int j = 0; j < expired.Count; j = j + 1) {
             expired[j].Dispose();
         }

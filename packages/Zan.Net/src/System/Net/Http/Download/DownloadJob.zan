@@ -112,41 +112,50 @@ public class DownloadJob {
     // 在工作线程上开始处理。返回 false = 线程起不来（此时任务
     // 状态为失败，原因见 <see cref="Error"/>）。
     public bool Start() {
-        DownloadJob.Lock();
-        this.stage = DownloadStage.Idle;
-        this.failedStage = DownloadStage.Idle;
-        this.downloadError = "";
-        DownloadJob.Unlock();
         if (this.items.Count == 0 && this.prepare == null) {
             this.SetFail("没有要下载的文件");
             return false;
         }
-        // 单任务语义是被强制的、而不是靠调用方自觉：取消标志和 worker 队列
-        // 是进程级的，两个任务同时跑会互相取消。
-        if (DownloadJob.sCur != null && DownloadJob.sCur.Running()) {
-            this.SetFail("已有下载任务在运行");
-            return false;
-        }
         // 任务入队前固定一份策略快照；每个条目随后都把这份有限预算
         // 绑定到自己的 HttpClient，避免 worker 期间调用方改写策略。
-        this.callPolicy = DownloadJob.SnapshotPolicy(this.callPolicy);
-        DownloadJob.sCancel.Store(0);
+        ExternalCallPolicy snap = DownloadJob.SnapshotPolicy(this.callPolicy);
+        // 原子检查单任务占槽与入队，消除 sCur.Running() 到 sCur = this 之间的 TOCTOU 竞态。
         DownloadJob.Lock();
-        this.stage = DownloadStage.Idle;
-        this.index = 0;
-        this.current = "";
-        if (this.items.Count > 0) {
-            this.stage = DownloadStage.Download;
-            this.current = this.items[0].name;
+        try {
+            if (DownloadJob.sCur != null && DownloadJob.sCur.running) {
+                this.failedStage = this.stage;
+                this.stage = DownloadStage.Failed;
+                this.error = "已有下载任务在运行";
+                return false;
+            }
+            this.callPolicy = snap;
+            if (this.cancelGate != null) { this.cancelGate.Store(0); }
+            if (DownloadJob.sCancel != null) { DownloadJob.sCancel.Store(0); }
+            this.failedStage = DownloadStage.Idle;
+            this.downloadError = "";
+            this.stage = DownloadStage.Idle;
+            this.index = 0;
+            this.current = "";
+            if (this.items.Count > 0) {
+                this.stage = DownloadStage.Download;
+                this.current = this.items[0].name;
+            }
+            this.error = "";
+            this.running = true;
+            DownloadJob.sCur = this;
+            DownloadJob.sPend.Enqueue(this);
+        } finally {
+            DownloadJob.Unlock();
         }
-        this.error = "";
-        this.running = true;
-        DownloadJob.sCur = this;
-        DownloadJob.sPend.Enqueue(this);
-        DownloadJob.Unlock();
         if (!Thread.Start(DownloadJob.Worker)) {
             DownloadJob _drop = DownloadJob.Take();
-            this.SetFail("无法启动下载线程");
+            DownloadJob.Lock();
+            this.running = false;
+            if (DownloadJob.sCur == this) { DownloadJob.sCur = null; }
+            this.failedStage = this.stage;
+            this.stage = DownloadStage.Failed;
+            this.error = "无法启动下载线程";
+            DownloadJob.Unlock();
             return false;
         }
         return true;

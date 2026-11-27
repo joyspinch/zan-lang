@@ -89,10 +89,12 @@ public class HttpBufferPool {
 
     // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
     public static StringBuilder Rent() {
+        HttpBufferStripe[] st = HttpBufferPool.stripes;
+        if (st == null) { return new StringBuilder(); }
         int idx = HttpBufferPool.StripeIndex();
-        StringBuilder sb = HttpBufferPool.PopSb(stripes[idx]);
+        StringBuilder sb = HttpBufferPool.PopSb(st[idx]);
         if (sb != null) { return sb; }
-        sb = HttpBufferPool.PopSb(stripes[(idx + 1) & 15]);
+        sb = HttpBufferPool.PopSb(st[(idx + 1) & 15]);
         if (sb != null) { return sb; }
         return new StringBuilder();
     }
@@ -101,8 +103,10 @@ public class HttpBufferPool {
     public static void Return(StringBuilder sb) {
         if (sb == null) { return; }
         if (sb.Length > maxRetainCapacity) { return; }
+        HttpBufferStripe[] st = HttpBufferPool.stripes;
+        if (st == null) { return; }
         sb.Clear();
-        HttpBufferStripe s = stripes[HttpBufferPool.StripeIndex()];
+        HttpBufferStripe s = st[HttpBufferPool.StripeIndex()];
         Mutex.Lock(s.mu);
         if (s.builders.Count < maxPoolSize) { s.builders.Add(sb); }
         Mutex.Unlock(s.mu);
@@ -111,11 +115,14 @@ public class HttpBufferPool {
     // 租借指定最小容量的字节缓冲区：按 16K / 64K / 256K 梯度分桶，超大直分不回池。
     public static byte[] RentBytes(int minCap) {
         if (minCap > 262144) { return new byte[minCap]; }
-        int idx = HttpBufferPool.StripeIndex();
-        byte[] b = HttpBufferPool.TryPopBucket(stripes[idx], minCap);
-        if (b != null) { return b; }
-        b = HttpBufferPool.TryPopBucket(stripes[(idx + 1) & 15], minCap);
-        if (b != null) { return b; }
+        HttpBufferStripe[] st = HttpBufferPool.stripes;
+        if (st != null) {
+            int idx = HttpBufferPool.StripeIndex();
+            byte[] b = HttpBufferPool.TryPopBucket(st[idx], minCap);
+            if (b != null) { return b; }
+            b = HttpBufferPool.TryPopBucket(st[(idx + 1) & 15], minCap);
+            if (b != null) { return b; }
+        }
         int size = minCap <= 16384 ? 16384 : (minCap <= 65536 ? 65536 : 262144);
         return new byte[size];
     }
@@ -125,7 +132,9 @@ public class HttpBufferPool {
         if (buf == null) { return; }
         int len = buf.Length;
         if (len != 16384 && len != 65536 && len != 262144) { return; }
-        HttpBufferStripe s = stripes[HttpBufferPool.StripeIndex()];
+        HttpBufferStripe[] st = HttpBufferPool.stripes;
+        if (st == null) { return; }
+        HttpBufferStripe s = st[HttpBufferPool.StripeIndex()];
         Mutex.Lock(s.mu);
         if (len == 16384) {
             if (s.pool16k.Count < maxBytePoolSize) { s.pool16k.Add(buf); }

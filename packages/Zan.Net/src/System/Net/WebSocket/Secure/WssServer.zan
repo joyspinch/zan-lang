@@ -23,25 +23,34 @@ public class WssConnection : IDisposable {
     public nint sock;
     public TlsStream stream;
     public bool connected;
-    private Mutex sendLock;
+    // 协程安全发送锁：禁止跨 await 持有 OS Mutex，防止 M:N 调度切换线程导致死锁。
+    private AsyncRwLock sendLock;
 
     public WssConnection(nint sock, TlsStream stream) {
         this.sock = sock;
         this.stream = stream;
         this.connected = true;
-        this.sendLock = new Mutex();
+        this.sendLock = new AsyncRwLock();
+    }
+
+    internal async int SendEncodedAsync(byte[] encoded, int frameLen) {
+        if (encoded == null || frameLen <= 0) { return -1; }
+        AsyncRwLock lk = this.sendLock;
+        if (lk == null) { return -1; }
+        await lk.EnterWrite();
+        try {
+            if (this.stream == null) { return -1; }
+            return await this.stream.SendAsync(encoded, frameLen);
+        } finally {
+            lk.ExitWrite();
+        }
     }
 
     private async int SendRawFrameAsync(int opcode, byte[] data, int len) {
         WsFrame frame = WsFrame.RawFrame(opcode, data, len);
         byte[] encoded = frame.Encode();
         int frameLen = WsFrame.HeaderLen(len) + len;
-        this.sendLock.WaitOne();
-        try {
-            return await this.stream.SendAsync(encoded, frameLen);
-        } finally {
-            this.sendLock.ReleaseMutex();
-        }
+        return await this.SendEncodedAsync(encoded, frameLen);
     }
 
     // 异步发送文本帧（RFC 6455 Opcode 1）
@@ -62,14 +71,10 @@ public class WssConnection : IDisposable {
         if (!this.connected) { return; }
         WsFrame ping = WsFrame.RawFrame(WsOpcode.Ping, new byte[0], 0);
         byte[] encoded = ping.Encode();
-
-        this.sendLock.WaitOne();
         try {
-            await this.stream.SendAsync(encoded, 2);
+            int _r = await this.SendEncodedAsync(encoded, 2);
         } catch (Exception ex) {
             this.connected = false;
-        } finally {
-            this.sendLock.ReleaseMutex();
         }
     }
 
@@ -79,13 +84,10 @@ public class WssConnection : IDisposable {
         this.connected = false;
         WsFrame close = WsFrame.CloseFrame();
         byte[] encoded = close.Encode();
-
-        this.sendLock.WaitOne();
         try {
-            await this.stream.SendAsync(encoded, 2);
+            int _r = await this.SendEncodedAsync(encoded, 2);
         } catch (Exception ex) {
         } finally {
-            this.sendLock.ReleaseMutex();
             if (this.stream != null) { this.stream.Close(); }
             if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
         }
@@ -95,6 +97,10 @@ public class WssConnection : IDisposable {
         this.connected = false;
         if (this.stream != null) { this.stream.Close(); }
         if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        if (this.sendLock != null) {
+            this.sendLock.Close();
+            this.sendLock = null;
+        }
     }
 }
 
@@ -202,16 +208,20 @@ public class WssServer : IDisposable {
     }
 
     private void AddConnection(WssConnection conn) {
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
         try {
             this.connections.Add(conn);
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
         }
     }
 
     private void RemoveConnection(WssConnection conn) {
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 if (this.connections[i] == conn) {
@@ -220,23 +230,27 @@ public class WssServer : IDisposable {
                 }
             }
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
         }
     }
 
     // 向当前所有活跃 WSS 客户端广播文本消息
     public void Broadcast(string message) {
         if (message == null || message.Length == 0) { return; }
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        List<WssConnection> snap = new List<WssConnection>();
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 WssConnection c = this.connections[i];
-                if (c.connected) {
-                    Task.Spawn(c.SendAsync(message));
-                }
+                if (c.connected) { snap.Add(c); }
             }
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
+        }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            Task.Spawn(snap[i].SendAsync(message));
         }
     }
 
@@ -246,19 +260,29 @@ public class WssServer : IDisposable {
         if (this.listener != null) {
             this.listener.Stop();
         }
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        List<WssConnection> snap = new List<WssConnection>();
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
-                this.connections[i].CloseAsync();
+                snap.Add(this.connections[i]);
             }
             this.connections.Clear();
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
+        }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            Task.Spawn(snap[i].CloseAsync());
         }
     }
 
     public void Dispose() {
         this.Stop();
+        if (this.connLock != null) {
+            this.connLock.Close();
+            this.connLock = null;
+        }
     }
 
     // 单条连接生命周期：TLS 握手 → WebSocket Upgrade → 帧循环（Ping/Pong、Close、异常关闭回 1002/1009）。
@@ -348,7 +372,7 @@ public class WssServer : IDisposable {
                     if (total == -2 || total == -3) {
                         // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
                         byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
-                        int _v = await stream.SendAsync(enc, 4);
+                        int _v = await conn.SendEncodedAsync(enc, 4);
                         conn.connected = false;
                         break;
                     }
@@ -367,7 +391,7 @@ public class WssServer : IDisposable {
                 // 控制帧边界、保留 opcode 与 Close code/reason UTF-8。
                 if (!WsFrame.ValidInbound(frame, true)) {
                     byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
-                    int _v = await stream.SendAsync(enc, 4);
+                    int _v = await conn.SendEncodedAsync(enc, 4);
                     conn.connected = false;
                     break;
                 }
@@ -375,14 +399,14 @@ public class WssServer : IDisposable {
                     // §5.5.3：Pong 原样带回 Ping 的应用数据。
                     WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
                     byte[] encoded = pong.Encode();
-                    int _p = await stream.SendAsync(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
+                    int _p = await conn.SendEncodedAsync(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
                     continue;
                 }
                 if (frame.opcode == WsOpcode.Pong) { continue; }
                 if (frame.opcode == WsOpcode.Close) {
                     WsFrame closeResp = WsFrame.CloseFrame();
                     byte[] encoded = closeResp.Encode();
-                    int _c = await stream.SendAsync(encoded, 2);
+                    int _c = await conn.SendEncodedAsync(encoded, 2);
                     conn.connected = false;
                     break;
                 }
@@ -391,14 +415,14 @@ public class WssServer : IDisposable {
                 int feed = asm.Feed(frame);
                 if (feed < 0) {
                     byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
-                    int _v = await stream.SendAsync(enc, 4);
+                    int _v = await conn.SendEncodedAsync(enc, 4);
                     conn.connected = false;
                     break;
                 }
                 if (feed == 0) { continue; }
                 if (!asm.ValidComplete()) {
                     byte[] encUtf = WsFrame.CloseFrameWithCode(1007).Encode();
-                    int _u = await stream.SendAsync(encUtf, 4);
+                    int _u = await conn.SendEncodedAsync(encUtf, 4);
                     conn.connected = false;
                     break;
                 }
@@ -415,7 +439,7 @@ public class WssServer : IDisposable {
                 if (response != null && response.Length > 0 && conn.connected) {
                     if (response.Length > 16777216) {
                         byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
-                        int _big = await stream.SendAsync(encBig, 4);
+                        int _big = await conn.SendEncodedAsync(encBig, 4);
                         conn.connected = false;
                         break;
                     }
@@ -423,7 +447,7 @@ public class WssServer : IDisposable {
                     WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
                     respFrame.opcode = msgOpcode;
                     byte[] respEnc = respFrame.Encode();
-                    int sent = await stream.SendAsync(respEnc, WsFrame.HeaderLen(respLen) + respLen);
+                    int sent = await conn.SendEncodedAsync(respEnc, WsFrame.HeaderLen(respLen) + respLen);
                     if (sent < 0) { conn.connected = false; }
                 }
             }

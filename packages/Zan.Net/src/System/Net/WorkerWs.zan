@@ -11,9 +11,6 @@ namespace System.Net;
 // WebSocket 协议分片：握手、帧循环、连接注册表与 Push。
 // 经 Worker.wsEntry 静态槽延迟接入，调用 WorkerWs.Install() 时才编入构建。
 public class WorkerWs {
-    [DllImport("crt")]
-    private static extern long strlen(string str);
-
     public static void Install() {
         Worker.wsEntry = WorkerWs.HandleWebSocket;
         WorkerWs.EnableSharedBus("zan_ws_worker_bus");
@@ -209,8 +206,8 @@ public class WorkerWs {
     public static async bool Push(Connection c, string data) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        int len = (int)strlen(data);
-        return await WorkerWs.SendFrame(c, link, WsFrame.RawFrame(WsOpcode.Text, data, len), len);
+        int len = data != null ? data.Length : 0;
+        return await WorkerWs.SendFrame(c, link, WsFrame.RawFrame(WsOpcode.Text, data != null ? data : "", len), len);
     }
 
     // 二进制 push：data 可含 NUL，len 为精确字节数（不做 strlen）。
@@ -391,7 +388,7 @@ public class WorkerWs {
             } else {
                 response = message;  // default: echo
             }
-            int respLen = (int)strlen(response);
+            int respLen = response != null ? response.Length : 0;
             if (respLen > 16777216) {
                 active = await WorkerWs.SendCloseAndFlush(writer, client, 1009);
                 break;
@@ -496,12 +493,22 @@ public class WebSocketHub {
         if (conn == null) { return; }
         this.ChanInit();
         Mutex.Lock(this.chanLock);
-        int id = conn.GetId();
-        List<List<Connection>> vals = this.channels.Values;
-        for (int k = 0; k < vals.Count; k = k + 1) {
-            WebSocketHub.RemoveConnFromList(vals[k], id);
+        try {
+            int id = conn.GetId();
+            List<string> keys = this.channels.Keys;
+            for (int k = 0; k < keys.Count; k = k + 1) {
+                string ch = keys[k];
+                List<Connection> list;
+                if (this.channels.TryGetValue(ch, out list)) {
+                    WebSocketHub.RemoveConnFromList(list, id);
+                    if (list.Count == 0) {
+                        this.channels.Remove(ch);
+                    }
+                }
+            }
+        } finally {
+            Mutex.Unlock(this.chanLock);
         }
-        Mutex.Unlock(this.chanLock);
     }
 
     public void Attach(Connection conn, WsWriter writer, TcpClient client) {

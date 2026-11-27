@@ -30,10 +30,17 @@ public class AuthToken {
         return diff == 0;
     }
 
+    private static string cachedSecret = "";
+    private static byte[] cachedKey = null;
+
     public static string EncodeUrl(string raw, int len) {
         string text = Base64.Encode(raw, len).Replace("+", "-").Replace("/", "_");
-        while (text.Length > 0 && text.Substring(text.Length - 1) == "=") {
-            text = text.Substring(0, text.Length - 1);
+        int end = text.Length;
+        while (end > 0 && (text[end - 1] & 255) == 61) {
+            end = end - 1;
+        }
+        if (end < text.Length) {
+            return text.Substring(0, end);
         }
         return text;
     }
@@ -55,7 +62,13 @@ public class AuthToken {
 
     public static byte[] Key() {
         string secret = Secret();
-        return Sha256.Hash(secret, secret.Length);
+        if (AuthToken.cachedKey != null && AuthToken.cachedSecret == secret) {
+            return AuthToken.cachedKey;
+        }
+        byte[] derived = Sha256.Hash(secret, secret.Length);
+        AuthToken.cachedSecret = secret;
+        AuthToken.cachedKey = derived;
+        return derived;
     }
 
     /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion（可选签名 Claims）。不含密码材料，强制登出只需 bump 整数。*/
@@ -79,9 +92,11 @@ public class AuthToken {
             plain, plain.Length, tag);
         if (cipher == null) { return ""; }
         byte[] packed = new byte[12 + cipher.Length + 16];
-        for (int i = 0; i < 12; i = i + 1) { packed[i] = iv[i]; }
-        for (int i = 0; i < cipher.Length; i = i + 1) { packed[12 + i] = cipher[i]; }
-        for (int i = 0; i < 16; i = i + 1) { packed[12 + cipher.Length + i] = tag[i]; }
+        NativeMemory.Copy((nint)packed, (nint)iv, 12);
+        if (cipher.Length > 0) {
+            NativeMemory.Copy((nint)packed + (nint)12, (nint)cipher, cipher.Length);
+        }
+        NativeMemory.Copy((nint)packed + (nint)(12 + cipher.Length), (nint)tag, 16);
         return EncodeUrl(packed, packed.Length);
     }
 
@@ -130,9 +145,9 @@ public class AuthToken {
         byte[] iv = new byte[12];
         byte[] cipher = new byte[cipherLen];
         byte[] tag = new byte[16];
-        for (int i = 0; i < 12; i = i + 1) { iv[i] = packed[i]; }
-        for (int i = 0; i < cipherLen; i = i + 1) { cipher[i] = packed[12 + i]; }
-        for (int i = 0; i < 16; i = i + 1) { tag[i] = packed[12 + cipherLen + i]; }
+        NativeMemory.Copy((nint)iv, (nint)packed, 12);
+        NativeMemory.Copy((nint)cipher, (nint)packed + (nint)12, cipherLen);
+        NativeMemory.Copy((nint)tag, (nint)packed + (nint)(12 + cipherLen), 16);
         byte[] key = Key();
         List<int> ok = new List<int>(); ok.Add(0);
         string aad = "zan.auth.cookie.v1";

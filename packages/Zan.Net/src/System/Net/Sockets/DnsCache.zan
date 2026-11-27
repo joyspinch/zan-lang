@@ -42,6 +42,8 @@ public class DnsCache {
     // 查询缓存。若命中且未过期，将 records 拷贝到 outRecords 并返回地址数量；否则返回 0。
     public static int Lookup(string host, int port, byte[] outRecords) {
         if (host == null || host.Length == 0 || outRecords == null) { return 0; }
+        Dictionary<string, DnsCacheEntry> map = DnsCache.entries;
+        if (map == null) { return 0; }
         DnsCache.EnsureInit();
         string key = DnsCache.MakeKey(host, port);
         long now = Stopwatch.GetMilliseconds();
@@ -49,11 +51,11 @@ public class DnsCache {
         Mutex.Lock(DnsCache.mtx);
         try {
             DnsCacheEntry e = null;
-            if (DnsCache.entries.TryGetValue(key, out e)) {
+            if (map.TryGetValue(key, out e)) {
                 if (now < e.expiryMs) {
                     found = e;
                 } else {
-                    DnsCache.entries.Remove(key);
+                    map.Remove(key);
                 }
             }
         } finally {
@@ -70,24 +72,47 @@ public class DnsCache {
         return 0;
     }
 
-    // 存入缓存。
+    // 存入缓存。容量满时优先清理已过期条目，仍满则仅淘汰最早到期项，避免清空全表引发 DNS 惊群。
     public static void Store(string host, int port, byte[] records, int count) {
         if (host == null || host.Length == 0 || records == null || count <= 0) { return; }
+        Dictionary<string, DnsCacheEntry> map = DnsCache.entries;
+        if (map == null) { return; }
         DnsCache.EnsureInit();
-        string key = DnsCache.MakeKey(host, port);
-        long exp = Stopwatch.GetMilliseconds() + DnsCache.defaultTtlMs;
         int copyLen = count * 32;
-        byte[] copy = new byte[copyLen];
-        if (copyLen > 0) {
-            NativeMemory.Copy((nint)copy, (nint)records, copyLen);
+        if (copyLen > records.Length) {
+            copyLen = (records.Length / 32) * 32;
+            count = copyLen / 32;
         }
+        if (count <= 0) { return; }
+        string key = DnsCache.MakeKey(host, port);
+        long now = Stopwatch.GetMilliseconds();
+        long exp = now + DnsCache.defaultTtlMs;
+        byte[] copy = new byte[copyLen];
+        NativeMemory.Copy((nint)copy, (nint)records, copyLen);
         DnsCacheEntry entry = new DnsCacheEntry(copy, count, exp);
         Mutex.Lock(DnsCache.mtx);
         try {
-            if (DnsCache.entries.Count >= DnsCache.maxEntries) {
-                DnsCache.entries.Clear();
+            if (map.Count >= DnsCache.maxEntries && !map.ContainsKey(key)) {
+                List<string> keys = map.Keys;
+                string oldestKey = null;
+                long oldestExp = 9223372036854775807L;
+                for (int i = 0; i < keys.Count; i = i + 1) {
+                    string k = keys[i];
+                    DnsCacheEntry e = null;
+                    if (map.TryGetValue(k, out e) && e != null) {
+                        if (now >= e.expiryMs) {
+                            map.Remove(k);
+                        } else if (e.expiryMs < oldestExp) {
+                            oldestExp = e.expiryMs;
+                            oldestKey = k;
+                        }
+                    }
+                }
+                if (map.Count >= DnsCache.maxEntries && oldestKey != null) {
+                    map.Remove(oldestKey);
+                }
             }
-            DnsCache.entries[key] = entry;
+            map[key] = entry;
         } finally {
             Mutex.Unlock(DnsCache.mtx);
         }
@@ -96,11 +121,13 @@ public class DnsCache {
     // 驱逐单条记录（用于在连接建立失败时主动清除失效缓存）。
     public static void Invalidate(string host, int port) {
         if (host == null || host.Length == 0) { return; }
+        Dictionary<string, DnsCacheEntry> map = DnsCache.entries;
+        if (map == null) { return; }
         DnsCache.EnsureInit();
         string key = DnsCache.MakeKey(host, port);
         Mutex.Lock(DnsCache.mtx);
         try {
-            DnsCache.entries.Remove(key);
+            map.Remove(key);
         } finally {
             Mutex.Unlock(DnsCache.mtx);
         }
@@ -108,10 +135,12 @@ public class DnsCache {
 
     // 清空全部缓存。
     public static void Clear() {
+        Dictionary<string, DnsCacheEntry> map = DnsCache.entries;
+        if (map == null) { return; }
         DnsCache.EnsureInit();
         Mutex.Lock(DnsCache.mtx);
         try {
-            DnsCache.entries.Clear();
+            map.Clear();
         } finally {
             Mutex.Unlock(DnsCache.mtx);
         }

@@ -22,13 +22,27 @@ public class WebSocketConnection : IDisposable {
     public nint sock;
     public TcpClient client;
     public bool connected;
-    private Mutex sendLock;
+    // 协程安全发送锁：禁止跨 await 持有 OS Mutex，防止 M:N 调度切换线程导致死锁。
+    private AsyncRwLock sendLock;
 
     public WebSocketConnection(nint sock, TcpClient client) {
         this.sock = sock;
         this.client = client;
         this.connected = true;
-        this.sendLock = new Mutex();
+        this.sendLock = new AsyncRwLock();
+    }
+
+    internal async int SendEncodedAsync(byte[] encoded, int frameLen) {
+        if (encoded == null || frameLen <= 0) { return -1; }
+        AsyncRwLock lk = this.sendLock;
+        if (lk == null) { return -1; }
+        await lk.EnterWrite();
+        try {
+            if (this.client == null) { return -1; }
+            return await this.client.SendBytesAsync(encoded, frameLen);
+        } finally {
+            lk.ExitWrite();
+        }
     }
 
     // 异步发送文本帧（RFC 6455 Opcode 1）
@@ -38,14 +52,7 @@ public class WebSocketConnection : IDisposable {
         WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, payload, payload.Length);
         byte[] encoded = frame.Encode();
         int frameLen = WsFrame.HeaderLen(payload.Length) + payload.Length;
-
-        this.sendLock.WaitOne();
-        try {
-            int r = await this.client.SendBytesAsync(encoded, frameLen);
-            return r;
-        } finally {
-            this.sendLock.ReleaseMutex();
-        }
+        return await this.SendEncodedAsync(encoded, frameLen);
     }
 
     // 异步发送二进制帧（RFC 6455 Opcode 2）
@@ -54,14 +61,7 @@ public class WebSocketConnection : IDisposable {
         WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
         byte[] encoded = frame.Encode();
         int frameLen = WsFrame.HeaderLen(len) + len;
-
-        this.sendLock.WaitOne();
-        try {
-            int r = await this.client.SendBytesAsync(encoded, frameLen);
-            return r;
-        } finally {
-            this.sendLock.ReleaseMutex();
-        }
+        return await this.SendEncodedAsync(encoded, frameLen);
     }
 
     // 发送 Ping 探活帧（RFC 6455 Opcode 9）
@@ -69,14 +69,10 @@ public class WebSocketConnection : IDisposable {
         if (!this.connected) { return; }
         WsFrame ping = WsFrame.RawFrame(WsOpcode.Ping, new byte[0], 0);
         byte[] encoded = ping.Encode();
-
-        this.sendLock.WaitOne();
         try {
-            await this.client.SendBytesAsync(encoded, 2);
+            int _r = await this.SendEncodedAsync(encoded, 2);
         } catch (Exception ex) {
             this.connected = false;
-        } finally {
-            this.sendLock.ReleaseMutex();
         }
     }
 
@@ -86,13 +82,10 @@ public class WebSocketConnection : IDisposable {
         this.connected = false;
         WsFrame close = WsFrame.CloseFrame();
         byte[] encoded = close.Encode();
-
-        this.sendLock.WaitOne();
         try {
-            await this.client.SendBytesAsync(encoded, 2);
+            int _r = await this.SendEncodedAsync(encoded, 2);
         } catch (Exception ex) {
         } finally {
-            this.sendLock.ReleaseMutex();
             if (this.client != null) { this.client.Close(); }
             if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
         }
@@ -102,6 +95,10 @@ public class WebSocketConnection : IDisposable {
         this.connected = false;
         if (this.client != null) { this.client.Close(); }
         if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        if (this.sendLock != null) {
+            this.sendLock.Close();
+            this.sendLock = null;
+        }
     }
 }
 
@@ -198,9 +195,10 @@ public class WebSocketServer : IDisposable {
 
     private async void HandleConnection(nint clientSock) {
         WebSocketConnection conn = null;
+        HttpDeadlineToken watch = null;
         try {
             Socket.SetNonBlocking(clientSock);
-            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
             TcpClient client = TcpClient.FromSocket(clientSock);
             WsReader reader = new WsReader(clientSock);
             int headerEnd = -1;
@@ -219,6 +217,7 @@ public class WebSocketServer : IDisposable {
 
             if (!alive || headerEnd < 0) {
                 HttpDeadline.Disarm(watch);
+                watch = null;
                 client.Close();
                 return;
             }
@@ -229,6 +228,7 @@ public class WebSocketServer : IDisposable {
             // 2. 校验 RFC 6455 升级握手格式
             if (!WsHandshake.Valid(req)) {
                 HttpDeadline.Disarm(watch);
+                watch = null;
                 string bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 await client.SendAsync(bad);
                 client.Close();
@@ -238,7 +238,7 @@ public class WebSocketServer : IDisposable {
             string wsKey = req.GetHeader("Sec-WebSocket-Key");
             string acceptKey = Encoding.WebSocketAccept(wsKey);
 
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = HttpBufferPool.Rent();
             sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
             sb.Append("Upgrade: websocket\r\n");
             sb.Append("Connection: Upgrade\r\n");
@@ -246,10 +246,12 @@ public class WebSocketServer : IDisposable {
             sb.Append(acceptKey);
             sb.Append("\r\n\r\n");
             string hs = sb.ToString();
+            HttpBufferPool.Return(sb);
 
             int sent = await client.SendAsync(hs);
             bool timedOut = HttpDeadline.Expired(watch);
             HttpDeadline.Disarm(watch);
+            watch = null;
             if (sent < 0 || timedOut) {
                 client.Close();
                 return;
@@ -267,6 +269,7 @@ public class WebSocketServer : IDisposable {
             // 3. 进入 RFC 6455 帧解码循环
             await this.ServeLoopAsync(conn, reader);
         } finally {
+            HttpDeadline.Disarm(watch);
             if (conn != null) {
                 this.RemoveConnection(conn);
                 if (this.closeHandler != null) {
@@ -292,7 +295,7 @@ public class WebSocketServer : IDisposable {
             while (total < 0) {
                 if (total == -2 || total == -3) {
                     byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
-                    await conn.client.SendBytesAsync(enc, 4);
+                    int _v = await conn.SendEncodedAsync(enc, 4);
                     conn.connected = false;
                     return;
                 }
@@ -310,7 +313,7 @@ public class WebSocketServer : IDisposable {
             // RFC 6455 §5.1: 客户端至服务端的数据帧必须进行掩码处理
             if (!WsFrame.ValidInbound(frame, true)) {
                 byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
-                await conn.client.SendBytesAsync(enc, 4);
+                int _v = await conn.SendEncodedAsync(enc, 4);
                 conn.connected = false;
                 return;
             }
@@ -319,7 +322,7 @@ public class WebSocketServer : IDisposable {
                 // RFC 6455 §5.5.3: 回显 Pong 帧并带回相同应用数据
                 WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
                 byte[] enc = pong.Encode();
-                await conn.client.SendBytesAsync(enc, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
+                int _p = await conn.SendEncodedAsync(enc, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
                 continue;
             }
             if (frame.opcode == WsOpcode.Pong) {
@@ -329,7 +332,7 @@ public class WebSocketServer : IDisposable {
                 // 优雅双向关闭握手
                 WsFrame closeResp = WsFrame.CloseFrame();
                 byte[] enc = closeResp.Encode();
-                await conn.client.SendBytesAsync(enc, 2);
+                int _c = await conn.SendEncodedAsync(enc, 2);
                 conn.connected = false;
                 return;
             }
@@ -338,7 +341,7 @@ public class WebSocketServer : IDisposable {
             int feed = asm.Feed(frame);
             if (feed < 0) {
                 byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
-                await conn.client.SendBytesAsync(enc, 4);
+                int _v = await conn.SendEncodedAsync(enc, 4);
                 conn.connected = false;
                 return;
             }
@@ -347,7 +350,7 @@ public class WebSocketServer : IDisposable {
             if (!asm.ValidComplete()) {
                 // 文本帧包含畸形 UTF-8 字符
                 byte[] encUtf = WsFrame.CloseFrameWithCode(1007).Encode();
-                await conn.client.SendBytesAsync(encUtf, 4);
+                int _u = await conn.SendEncodedAsync(encUtf, 4);
                 conn.connected = false;
                 return;
             }
@@ -368,16 +371,20 @@ public class WebSocketServer : IDisposable {
     }
 
     private void AddConnection(WebSocketConnection conn) {
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
         try {
             this.connections.Add(conn);
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
         }
     }
 
     private void RemoveConnection(WebSocketConnection conn) {
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 if (this.connections[i] == conn) {
@@ -386,23 +393,27 @@ public class WebSocketServer : IDisposable {
                 }
             }
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
         }
     }
 
     // 向当前所有活跃客户端广播文本消息
     public void Broadcast(string message) {
         if (message == null || message.Length == 0) { return; }
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        List<WebSocketConnection> snap = new List<WebSocketConnection>();
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 WebSocketConnection c = this.connections[i];
-                if (c.connected) {
-                    Task.Spawn(c.SendAsync(message));
-                }
+                if (c.connected) { snap.Add(c); }
             }
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
+        }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            Task.Spawn(snap[i].SendAsync(message));
         }
     }
 
@@ -412,18 +423,28 @@ public class WebSocketServer : IDisposable {
         if (this.listener != null) {
             this.listener.Stop();
         }
-        this.connLock.WaitOne();
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        List<WebSocketConnection> snap = new List<WebSocketConnection>();
+        lk.WaitOne();
         try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
-                this.connections[i].CloseAsync();
+                snap.Add(this.connections[i]);
             }
             this.connections.Clear();
         } finally {
-            this.connLock.ReleaseMutex();
+            lk.ReleaseMutex();
+        }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            Task.Spawn(snap[i].CloseAsync());
         }
     }
 
     public void Dispose() {
         this.Stop();
+        if (this.connLock != null) {
+            this.connLock.Close();
+            this.connLock = null;
+        }
     }
 }

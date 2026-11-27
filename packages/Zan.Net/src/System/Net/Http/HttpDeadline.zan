@@ -21,7 +21,9 @@ public class HttpDeadline {
     // totalMs <= 0 表示不设总预算。
     public static HttpDeadlineToken Arm(nint sock, int timeoutMs, int totalMs) {
         if (timeoutMs <= 0 && totalMs <= 0) { return null; }
-        lock (slots) {
+        List<HttpDeadlineSlot> s = HttpDeadline.slots;
+        if (s == null) { return null; }
+        lock (s) {
             nowMs = Stopwatch.GetMilliseconds();
             int phase = timeoutMs;
             if (phase <= 0) { phase = totalMs; }
@@ -31,7 +33,7 @@ public class HttpDeadline {
             if (n > 0) {
                 slot = freeSlots[n - 1];
                 freeSlots.RemoveAt(n - 1);
-                HttpDeadlineSlot old = slots[slot];
+                HttpDeadlineSlot old = s[slot];
                 old.generation = old.generation + 1;
                 if (old.generation <= 0) { old.generation = 1; }
                 old.sock = sock;
@@ -45,11 +47,11 @@ public class HttpDeadline {
             } else {
                 HttpDeadlineSlot created = new HttpDeadlineSlot(sock, nowMs + phase);
                 if (totalMs > 0) { created.totalDeadline = nowMs + totalMs; }
-                slots.Add(created);
-                slot = slots.Count - 1;
+                s.Add(created);
+                slot = s.Count - 1;
             }
             activeCount = activeCount + 1;
-            HttpDeadlineSlot slotObj = slots[slot];
+            HttpDeadlineSlot slotObj = s[slot];
             HttpDeadlineToken token = new HttpDeadlineToken(slot,
                 slotObj.generation, slotObj);
             if (!sweeping) {
@@ -94,9 +96,12 @@ public class HttpDeadline {
             }
             return;
         }
-        lock (slots) {
-            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return; }
-            HttpDeadlineSlot slot = slots[token.slot];
+        List<HttpDeadlineSlot> s = HttpDeadline.slots;
+        if (s == null) { return; }
+        nint expiredSock = -1;
+        lock (s) {
+            if (token.disarmed || token.slot < 0 || token.slot >= s.Count) { return; }
+            HttpDeadlineSlot slot = s[token.slot];
             if (!slot.active || slot.generation != token.generation) { return; }
             // Sweep 已经触发时不能被阶段切换重新武装；否则发送阶段
             // 的超时可能在 await 返回后被 Touch 清掉。
@@ -110,21 +115,22 @@ public class HttpDeadline {
                     slot.deadline = nowMs + 3600000;
                     slot.deadlineMs.Store(slot.deadline);
                     slot.fired = true;
-                    Socket.ShutdownBoth(slot.sock);
+                    expiredSock = slot.sock;
                 }
-                return;
+            } else {
+                long next = 0;
+                if (timeoutMs > 0) { next = nowMs + timeoutMs; }
+                if (slot.totalDeadline > 0
+                    && (next <= 0 || next > slot.totalDeadline)) {
+                    next = slot.totalDeadline;
+                }
+                if (next <= 0) { return; }
+                slot.deadline = next;
+                slot.deadlineMs.Store(next);
+                slot.fired = false;
             }
-            long next = 0;
-            if (timeoutMs > 0) { next = nowMs + timeoutMs; }
-            if (slot.totalDeadline > 0
-                && (next <= 0 || next > slot.totalDeadline)) {
-                next = slot.totalDeadline;
-            }
-            if (next <= 0) { return; }
-            slot.deadline = next;
-            slot.deadlineMs.Store(next);
-            slot.fired = false;
         }
+        if (expiredSock >= 0) { Socket.ShutdownBoth(expiredSock); }
     }
 
     // 当扫描器已对 token 执行挂断时返回 true。
@@ -136,9 +142,11 @@ public class HttpDeadline {
             long expectedGen = (((long)token.generation) << 1) | (long)1;
             return fast.stateGen.Load() == expectedGen && fast.firedFlag.Load() != 0;
         }
-        lock (slots) {
-            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return false; }
-            HttpDeadlineSlot slot = slots[token.slot];
+        List<HttpDeadlineSlot> s = HttpDeadline.slots;
+        if (s == null) { return false; }
+        lock (s) {
+            if (token.disarmed || token.slot < 0 || token.slot >= s.Count) { return false; }
+            HttpDeadlineSlot slot = s[token.slot];
             return slot.active && slot.generation == token.generation
                 && (slot.fired || slot.firedFlag.Load() != 0);
         }
@@ -147,11 +155,13 @@ public class HttpDeadline {
     // 连接结束时释放 token；重复释放安全，旧 token 不能释放新连接。
     public static void Disarm(HttpDeadlineToken token) {
         if (token == null) { return; }
-        lock (slots) {
+        List<HttpDeadlineSlot> s = HttpDeadline.slots;
+        if (s == null) { return; }
+        lock (s) {
             if (token.disarmed) { return; }
             token.disarmed = true;
-            if (token.slot < 0 || token.slot >= slots.Count) { return; }
-            HttpDeadlineSlot slot = slots[token.slot];
+            if (token.slot < 0 || token.slot >= s.Count) { return; }
+            HttpDeadlineSlot slot = s[token.slot];
             if (!slot.active || slot.generation != token.generation) { return; }
             slot.stateGen.Store(((long)slot.generation) << 1);
             slot.active = false;
@@ -166,13 +176,17 @@ public class HttpDeadline {
     // 单次扫描：刷新粗粒度时钟并对过期连接执行挂断
     // （shutdown 而非 close，见类文档）。返回是否仍有活动 token。
     public static bool SweepOnce() {
-        lock (slots) {
+        List<HttpDeadlineSlot> s = HttpDeadline.slots;
+        if (s == null) { return false; }
+        List<nint> expired = null;
+        bool hasActive = false;
+        lock (s) {
             nowMs = Stopwatch.GetMilliseconds();
-            int n = slots.Count;
+            int n = s.Count;
             for (int i = 0; i < n; i = i + 1) {
-                HttpDeadlineSlot slot = slots[i];
-                nint s = slot.sock;
-                if (slot.active && s >= 0 && slot.firedFlag.Load() == 0) {
+                HttpDeadlineSlot slot = s[i];
+                nint sock = slot.sock;
+                if (slot.active && sock >= 0 && slot.firedFlag.Load() == 0) {
                     long cur = slot.deadlineMs.Load();
                     if (nowMs >= cur && slot.firedFlag.CompareExchange(0, 1) == 0) {
                         // fired 保持到归属者查询/Disarm；generation 防止旧 token
@@ -180,12 +194,20 @@ public class HttpDeadline {
                         slot.deadline = nowMs + 3600000;
                         slot.deadlineMs.Store(slot.deadline);
                         slot.fired = true;
-                        Socket.ShutdownBoth(s);
+                        if (expired == null) { expired = new List<nint>(); }
+                        expired.Add(sock);
                     }
                 }
             }
-            return activeCount > 0;
+            hasActive = activeCount > 0;
         }
+        // 在锁外执行系统调用 shutdown，避免阻塞其他连接的 Arm/Disarm。
+        if (expired != null) {
+            for (int i = 0; i < expired.Count; i = i + 1) {
+                Socket.ShutdownBoth(expired[i]);
+            }
+        }
+        return hasActive;
     }
 
     // 每秒扫描一次的常驻协程；只在有活动 token 时存活。
@@ -194,9 +216,11 @@ public class HttpDeadline {
     public static async void Sweep() {
         while (true) {
             await Task.Delay(1000);
+            List<HttpDeadlineSlot> s = HttpDeadline.slots;
+            if (s == null) { return; }
             bool live = HttpDeadline.SweepOnce();
             if (live) { continue; }
-            lock (slots) {
+            lock (s) {
                 if (activeCount > 0) { continue; }
                 sweeping = false;
                 return;

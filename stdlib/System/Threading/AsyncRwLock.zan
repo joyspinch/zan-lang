@@ -30,11 +30,13 @@ public class AsyncRwLock : IDisposable {
     // 或正在等待锁时挂起。无竞争快路径零额外信号。
     public async void EnterRead() {
         while (true) {
-            Mutex.Lock(this.mtx);
+            nint m = this.mtx;
+            if (m == 0) { return; }
+            Mutex.Lock(m);
             if (!this.writer && this.writersWaiting == 0) {
                 this.readers = this.readers + 1;
                 bool wakeNextReader = this.readersWaiting > 0;
-                Mutex.Unlock(this.mtx);
+                Mutex.Unlock(m);
                 // 仅当仍有排队读者时接力补发信号，防止 SignalAll 前后并发入队丢失唤醒。
                 if (wakeNextReader && this.readGate != null) {
                     this.readGate.Signal();
@@ -42,48 +44,69 @@ public class AsyncRwLock : IDisposable {
                 return;
             }
             this.readersWaiting = this.readersWaiting + 1;
-            Mutex.Unlock(this.mtx);
-            await this.readGate.Wait();
-            Mutex.Lock(this.mtx);
-            this.readersWaiting = this.readersWaiting - 1;
-            Mutex.Unlock(this.mtx);
+            AsyncGate rg = this.readGate;
+            Mutex.Unlock(m);
+            bool ok = rg != null && await rg.Wait();
+            m = this.mtx;
+            if (m != 0) {
+                Mutex.Lock(m);
+                if (this.readersWaiting > 0) { this.readersWaiting = this.readersWaiting - 1; }
+                Mutex.Unlock(m);
+            }
+            if (!ok) { return; }
         }
     }
 
     // 释放共享访问。
     public void ExitRead() {
-        if (this.mtx == 0) {
+        nint m = this.mtx;
+        if (m == 0) {
             return;
         }
-        Mutex.Lock(this.mtx);
+        Mutex.Lock(m);
         bool wakeWriter = false;
         if (this.readers > 0) {
             this.readers = this.readers - 1;
             wakeWriter = (this.readers == 0 && this.writersWaiting > 0);
         }
-        Mutex.Unlock(this.mtx);
-        if (wakeWriter && this.writeGate != null) {
-            this.writeGate.Signal();
+        AsyncGate wg = this.writeGate;
+        Mutex.Unlock(m);
+        if (wakeWriter && wg != null) {
+            wg.Signal();
         }
     }
 
     // 获取排他（写）访问；挂起直到所有读线程
     // 以及当前写线程都释放。
     public async void EnterWrite() {
-        Mutex.Lock(this.mtx);
+        nint m = this.mtx;
+        if (m == 0) { return; }
+        Mutex.Lock(m);
         this.writersWaiting = this.writersWaiting + 1;
-        Mutex.Unlock(this.mtx);
+        Mutex.Unlock(m);
 
         while (true) {
-            Mutex.Lock(this.mtx);
+            m = this.mtx;
+            if (m == 0) { return; }
+            Mutex.Lock(m);
             if (!this.writer && this.readers == 0) {
                 this.writersWaiting = this.writersWaiting - 1;
                 this.writer = true;
-                Mutex.Unlock(this.mtx);
+                Mutex.Unlock(m);
                 return;
             }
-            Mutex.Unlock(this.mtx);
-            await this.writeGate.Wait();
+            AsyncGate wg = this.writeGate;
+            Mutex.Unlock(m);
+            bool ok = wg != null && await wg.Wait();
+            if (!ok) {
+                m = this.mtx;
+                if (m != 0) {
+                    Mutex.Lock(m);
+                    if (this.writersWaiting > 0) { this.writersWaiting = this.writersWaiting - 1; }
+                    Mutex.Unlock(m);
+                }
+                return;
+            }
         }
     }
 

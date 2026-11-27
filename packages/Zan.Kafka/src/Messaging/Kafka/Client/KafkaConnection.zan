@@ -13,7 +13,8 @@ public class KafkaConnection {
     private nint sock;
     private bool connected;
     private int nextCorrelationId;
-    private Mutex ioLock;
+    // 协程安全 I/O 锁：禁止跨 await 持有 OS Mutex，防止 M:N 协程切换线程导致死锁。
+    private AsyncRwLock ioLock;
 
     public KafkaConnection(string host, int port) {
         this.host = host;
@@ -22,7 +23,7 @@ public class KafkaConnection {
         this.sock = -1;
         this.connected = false;
         this.nextCorrelationId = 1;
-        this.ioLock = new Mutex();
+        this.ioLock = new AsyncRwLock();
     }
 
     public static async KafkaConnection ConnectAsync(string host, int port) {
@@ -49,9 +50,12 @@ public class KafkaConnection {
     // 发送标准 Kafka 请求并同步等待响应
     public async KafkaReader SendRequestAsync(int apiKey, int apiVersion, byte[] bodyPayload) {
         if (!this.connected || this.sock < 0) { return null; }
+        AsyncRwLock lk = this.ioLock;
+        if (lk == null) { return null; }
 
-        this.ioLock.WaitOne();
+        await lk.EnterWrite();
         try {
+            if (!this.connected || this.sock < 0) { return null; }
             int cid = this.nextCorrelationId;
             this.nextCorrelationId = this.nextCorrelationId + 1;
 
@@ -112,7 +116,7 @@ public class KafkaConnection {
 
             return r;
         } finally {
-            this.ioLock.ReleaseMutex();
+            lk.ExitWrite();
         }
     }
 

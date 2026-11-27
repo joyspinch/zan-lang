@@ -217,6 +217,42 @@ public class SqliteConnection : IDbConnection {
         return 0 - 1;
     }
 
+    // 单连接语句缓存上限：覆盖热路径参数化 SQL，同时避免动态 SQL 无限累积导致语句句柄泄漏。
+    private static const int MaxStmtCache = 256;
+
+    // 从单连接缓存复用或重新 prepare 一条 SQLite 语句。
+    // 空/纯注释 SQL 返回 0（不入缓存）；多语句或已满缓存按一次性语句处理。
+    private nint PrepareOrReuseStmt(string sql, out bool cached) {
+        cached = false;
+        nint hit = 0;
+        if (this.stmtCache.TryGetValue(sql, out hit)) {
+            bool busy = false;
+            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                cached = true;
+                sqlite3_reset(hit);
+                sqlite3_clear_bindings(hit);
+                this.stmtBusy[sql] = true;
+                return hit;
+            }
+        }
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
+        if (rc != 0) { this.Fail(rc); }
+        nint stmt = HandleFromBuf(ppStmt);
+        if (stmt == 0) { return 0; }
+        // pzTail 非空 = 文本里还有第二条语句；或缓存已达上限/同一 SQL 正被并发占用——都按一次性语句处理。
+        nint ignore = 0;
+        if (HandleFromBuf(pzTail) == 0
+            && this.stmtCache.Count < SqliteConnection.MaxStmtCache
+            && !this.stmtCache.TryGetValue(sql, out ignore)) {
+            this.stmtCache.Add(sql, stmt);
+            this.stmtBusy[sql] = true;
+            cached = true;
+        }
+        return stmt;
+    }
+
     // 执行带参数的非查询语句。值按原生方式绑定
     // （绝不内联进 SQL 文本），因此无需转义，
     // 也无法通过值进行注入。占位符为 `?`。
@@ -225,43 +261,17 @@ public class SqliteConnection : IDbConnection {
         if (!this.connected) {
             throw new DbException("not connected", 0, DbProvider.SQLite);
         }
-        nint stmt = 0;
         bool cached = false;
-        byte[] ppStmt = new byte[8];
-        byte[] pzTail = new byte[8];
-        nint hit = 0;
-        if (this.stmtCache.TryGetValue(sql, out hit)) {
-            bool busy = false;
-            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
-                cached = true;
-                stmt = hit;
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
-                this.stmtBusy[sql] = true;
-            }
-        }
-        if (stmt == 0) {
-            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
-                                        ppStmt, pzTail);
-            if (rc != 0) { this.Fail(rc); }
-            stmt = HandleFromBuf(ppStmt);
-            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
-            // 调用临时占用——都按一次性语句处理，不动缓存。
-            nint ignore = 0;
-            if (HandleFromBuf(pzTail) == 0
-                && !this.stmtCache.TryGetValue(sql, out ignore)) {
-                this.stmtCache.Add(sql, stmt);
-                this.stmtBusy[sql] = true;
-                cached = true;
-            }
-        }
-        int brc = BindAll(stmt, prms);
-        if (brc != 0) {
+        nint stmt = this.PrepareOrReuseStmt(sql, out cached);
+        if (stmt == 0) { return 0; }
+        int step = 0;
+        try {
+            int brc = BindAll(stmt, prms);
+            if (brc != 0) { this.Fail(brc); }
+            step = sqlite3_step(stmt);
+        } finally {
             this.ReleaseStmt(sql, stmt, cached);
-            this.Fail(brc);
         }
-        int step = sqlite3_step(stmt);
-        this.ReleaseStmt(sql, stmt, cached);
         if (step != 101) {  // SQLITE_DONE = 101
             if (step == 100) {
                 throw new DbException(
@@ -291,77 +301,49 @@ public class SqliteConnection : IDbConnection {
             throw new DbException("not connected", 0, DbProvider.SQLite);
         }
         DbResult result = new DbResult();
-
-        nint stmt = 0;
         bool cached = false;
-        byte[] ppStmt = new byte[8];
-        byte[] pzTail = new byte[8];
-        nint hit = 0;
-        if (this.stmtCache.TryGetValue(sql, out hit)) {
-            bool busy = false;
-            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
-                cached = true;
-                stmt = hit;
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
-                this.stmtBusy[sql] = true;
-            }
-        }
-        if (stmt == 0) {
-            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
-                                        ppStmt, pzTail);
-            if (rc != 0) { this.Fail(rc); }
-            stmt = HandleFromBuf(ppStmt);
-            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
-            // 调用临时占用——都按一次性语句处理，不动缓存。
-            nint ignore = 0;
-            if (HandleFromBuf(pzTail) == 0
-                && !this.stmtCache.TryGetValue(sql, out ignore)) {
-                this.stmtCache.Add(sql, stmt);
-                this.stmtBusy[sql] = true;
-                cached = true;
-            }
-        }
-        int brc = BindAll(stmt, prms);
-        if (brc != 0) {
-            this.ReleaseStmt(sql, stmt, cached);
-            this.Fail(brc);
-        }
+        nint stmt = this.PrepareOrReuseStmt(sql, out cached);
+        if (stmt == 0) { return result; }
+        int step = 0;
+        try {
+            int brc = BindAll(stmt, prms);
+            if (brc != 0) { this.Fail(brc); }
 
-        int colCount = sqlite3_column_count(stmt);
-        result.SetColumnCount(colCount);
+            int colCount = sqlite3_column_count(stmt);
+            result.SetColumnCount(colCount);
 
-        int c = 0;
-        for (; c < colCount; c = c + 1) {
-            result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
-        }
-
-        int step = sqlite3_step(stmt);
-        while (step == 100) {  // SQLITE_ROW = 100
-            List<DbCell> cells = new List<DbCell>();
-            List<string> texts = new List<string>();
-            c = 0;
-            while (c < colCount) {
-                DbCell cell = new DbCell();
-                int ct = sqlite3_column_type(stmt, c);
-                if (ct == 5) {  // SQLITE_NULL
-                    texts.Add("");
-                } else if (ct == 1) {  // SQLITE_INTEGER：类型化直取，免串物化
-                    cell.kind = 1;
-                    cell.ival = sqlite3_column_int64(stmt, c);
-                    texts.Add("");
-                } else {  // TEXT/REAL/BLOB 沿用文本通道
-                    texts.Add(CopyText(sqlite3_column_text(stmt, c)));
-                    cell.kind = 2;
-                }
-                cells.Add(cell);
-                c = c + 1;
+            int c = 0;
+            for (; c < colCount; c = c + 1) {
+                result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
             }
-            result.AddRowCells(cells, texts);
+
             step = sqlite3_step(stmt);
+            while (step == 100) {  // SQLITE_ROW = 100
+                List<DbCell> cells = new List<DbCell>();
+                List<string> texts = new List<string>();
+                c = 0;
+                while (c < colCount) {
+                    DbCell cell = new DbCell();
+                    int ct = sqlite3_column_type(stmt, c);
+                    if (ct == 5) {  // SQLITE_NULL
+                        texts.Add("");
+                    } else if (ct == 1) {  // SQLITE_INTEGER：类型化直取，免串物化
+                        cell.kind = 1;
+                        cell.ival = sqlite3_column_int64(stmt, c);
+                        texts.Add("");
+                    } else {  // TEXT/REAL/BLOB 沿用文本通道
+                        texts.Add(CopyText(sqlite3_column_text(stmt, c)));
+                        cell.kind = 2;
+                    }
+                    cells.Add(cell);
+                    c = c + 1;
+                }
+                result.AddRowCells(cells, texts);
+                step = sqlite3_step(stmt);
+            }
+        } finally {
+            this.ReleaseStmt(sql, stmt, cached);
         }
-
-        this.ReleaseStmt(sql, stmt, cached);
         if (step != 101) {  // SQLITE_DONE = 101
             this.Fail(step);
         }
@@ -378,33 +360,10 @@ public class SqliteConnection : IDbConnection {
         if (!this.connected) {
             throw new DbException("not connected", 0, DbProvider.SQLite);
         }
-        nint stmt = 0;
         bool cached = false;
-        byte[] ppStmt = new byte[8];
-        byte[] pzTail = new byte[8];
-        nint hit = 0;
-        if (this.stmtCache.TryGetValue(sql, out hit)) {
-            bool busy = false;
-            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
-                cached = true;
-                stmt = hit;
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
-                this.stmtBusy[sql] = true;
-            }
-        }
+        nint stmt = this.PrepareOrReuseStmt(sql, out cached);
         if (stmt == 0) {
-            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
-                                        ppStmt, pzTail);
-            if (rc != 0) { this.Fail(rc); }
-            stmt = HandleFromBuf(ppStmt);
-            nint ignore = 0;
-            if (HandleFromBuf(pzTail) == 0
-                && !this.stmtCache.TryGetValue(sql, out ignore)) {
-                this.stmtCache.Add(sql, stmt);
-                this.stmtBusy[sql] = true;
-                cached = true;
-            }
+            return new SqliteDataReader(this, sql, (nint)0, false);
         }
         int brc = BindAll(stmt, prms);
         if (brc != 0) {
@@ -455,93 +414,67 @@ public class SqliteConnection : IDbConnection {
             throw new DbException("not connected", 0, DbProvider.SQLite);
         }
         DbResult result = new DbResult();
-        nint stmt = 0;
         bool cached = false;
-        byte[] ppStmt = new byte[8];
-        byte[] pzTail = new byte[8];
-        nint hit = 0;
-        if (this.stmtCache.TryGetValue(sql, out hit)) {
-            bool busy = false;
-            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
-                cached = true;
-                stmt = hit;
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
-                this.stmtBusy[sql] = true;
+        nint stmt = this.PrepareOrReuseStmt(sql, out cached);
+        if (stmt == 0) { return result; }
+        int step = 0;
+        try {
+            int brc = BindAll(stmt, prms);
+            if (brc != 0) { this.Fail(brc); }
+            int colCount = sqlite3_column_count(stmt);
+            result.SetColumnCount(colCount);
+            int c = 0;
+            for (; c < colCount; c = c + 1) {
+                result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
             }
-        }
-        if (stmt == 0) {
-            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
-                                        ppStmt, pzTail);
-            if (rc != 0) { this.Fail(rc); }
-            stmt = HandleFromBuf(ppStmt);
-            // pzTail 非空 = 文本里还有第二条语句；或同一 SQL 已被并发
-            // 调用临时占用——都按一次性语句处理，不动缓存。
-            nint ignore = 0;
-            if (HandleFromBuf(pzTail) == 0
-                && !this.stmtCache.TryGetValue(sql, out ignore)) {
-                this.stmtCache.Add(sql, stmt);
-                this.stmtBusy[sql] = true;
-                cached = true;
-            }
-        }
-        int brc = BindAll(stmt, prms);
-        if (brc != 0) {
-            this.ReleaseStmt(sql, stmt, cached);
-            this.Fail(brc);
-        }
-        int colCount = sqlite3_column_count(stmt);
-        result.SetColumnCount(colCount);
-        int c = 0;
-        for (; c < colCount; c = c + 1) {
-            result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
-        }
 
-        // 首个 step 卸载到阻塞线程（排序/索引定位等重活通常在这一步）；之后
-        // 游标已就位，后续 step 多为微秒级——曾每行都 await 卸载，20 行一页
-        // 就是 21 次线程往返。现在后续 step 在协程线程内联执行，按时间片
-        // 让出：一片内联累计超过 InlineSliceUs、或单个 step 超过
-        // InlineStepUs（如过滤扫描跨大量行），下一个 step 重新卸载。最坏
-        // 情况阻塞 reactor 一个 step + 一片。
-        int step = await sqlite3_step(stmt);
-        long sliceStart = Stopwatch.GetMicroseconds();
-        bool inline = true;
-        while (step == 100) {
-            List<DbCell> cells = new List<DbCell>();
-            List<string> texts = new List<string>();
-            c = 0;
-            while (c < colCount) {
-                DbCell cell = new DbCell();
-                int ct = sqlite3_column_type(stmt, c);
-                if (ct == 5) {  // SQLITE_NULL
-                    texts.Add("");
-                } else if (ct == 1) {  // SQLITE_INTEGER：类型化直取，免串物化
-                    cell.kind = 1;
-                    cell.ival = sqlite3_column_int64(stmt, c);
-                    texts.Add("");
-                } else {  // TEXT/REAL/BLOB 沿用文本通道
-                    texts.Add(CopyText(sqlite3_column_text(stmt, c)));
-                    cell.kind = 2;
+            // 首个 step 卸载到阻塞线程（排序/索引定位等重活通常在这一步）；之后
+            // 游标已就位，后续 step 多为微秒级——曾每行都 await 卸载，20 行一页
+            // 就是 21 次线程往返。现在后续 step 在协程线程内联执行，按时间片
+            // 让出：一片内联累计超过 InlineSliceUs、或单个 step 超过
+            // InlineStepUs（如过滤扫描跨大量行），下一个 step 重新卸载。最坏
+            // 情况阻塞 reactor 一个 step + 一片。
+            step = await sqlite3_step(stmt);
+            long sliceStart = Stopwatch.GetMicroseconds();
+            bool inline = true;
+            while (step == 100) {
+                List<DbCell> cells = new List<DbCell>();
+                List<string> texts = new List<string>();
+                c = 0;
+                while (c < colCount) {
+                    DbCell cell = new DbCell();
+                    int ct = sqlite3_column_type(stmt, c);
+                    if (ct == 5) {  // SQLITE_NULL
+                        texts.Add("");
+                    } else if (ct == 1) {  // SQLITE_INTEGER：类型化直取，免串物化
+                        cell.kind = 1;
+                        cell.ival = sqlite3_column_int64(stmt, c);
+                        texts.Add("");
+                    } else {  // TEXT/REAL/BLOB 沿用文本通道
+                        texts.Add(CopyText(sqlite3_column_text(stmt, c)));
+                        cell.kind = 2;
+                    }
+                    cells.Add(cell);
+                    c = c + 1;
                 }
-                cells.Add(cell);
-                c = c + 1;
-            }
-            result.AddRowCells(cells, texts);
-            if (inline) {
-                long t0 = Stopwatch.GetMicroseconds();
-                step = sqlite3_step(stmt);
-                long t1 = Stopwatch.GetMicroseconds();
-                if (t1 - t0 > SqliteConnection.InlineStepUs
-                    || t1 - sliceStart > SqliteConnection.InlineSliceUs) {
-                    inline = false;
+                result.AddRowCells(cells, texts);
+                if (inline) {
+                    long t0 = Stopwatch.GetMicroseconds();
+                    step = sqlite3_step(stmt);
+                    long t1 = Stopwatch.GetMicroseconds();
+                    if (t1 - t0 > SqliteConnection.InlineStepUs
+                        || t1 - sliceStart > SqliteConnection.InlineSliceUs) {
+                        inline = false;
+                    }
+                } else {
+                    step = await sqlite3_step(stmt);
+                    sliceStart = Stopwatch.GetMicroseconds();
+                    inline = true;
                 }
-            } else {
-                step = await sqlite3_step(stmt);
-                sliceStart = Stopwatch.GetMicroseconds();
-                inline = true;
             }
+        } finally {
+            this.ReleaseStmt(sql, stmt, cached);
         }
-        this.ReleaseStmt(sql, stmt, cached);
         if (step != 101) {  // SQLITE_DONE = 101
             this.Fail(step);
         }

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Text;
 using System.Threading;
 using Zan.Web.Core;
 
@@ -22,43 +24,69 @@ public class Presence {
 
     /* 记录一个来自 ip 的打开页面。 */
     public static void Enter(string ip) {
-        Mutex.Lock(Presence.presenceLock);
-        pages = pages + 1;
-        ips.Add(ip);
-        Mutex.Unlock(Presence.presenceLock);
+        nint lk = Presence.presenceLock;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
+        try {
+            pages = pages + 1;
+            ips.Add(ip);
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     /* 移除对应的打开页面。 */
     public static void Leave(string ip) {
-        Mutex.Lock(Presence.presenceLock);
-        if (pages > 0) { pages = pages - 1; }
-        for (int i = 0; i < ips.Count; i = i + 1) {
-            if (ips[i] == ip) {
-                ips.RemoveAt(i);
-                Mutex.Unlock(Presence.presenceLock);
-                return;
+        nint lk = Presence.presenceLock;
+        if (lk == 0) { return; }
+        Mutex.Lock(lk);
+        try {
+            if (pages > 0) { pages = pages - 1; }
+            for (int i = 0; i < ips.Count; i = i + 1) {
+                if (ips[i] == ip) {
+                    int last = ips.Count - 1;
+                    if (i != last) { ips[i] = ips[last]; }
+                    ips.RemoveAt(last);
+                    return;
+                }
             }
+        } finally {
+            Mutex.Unlock(lk);
         }
-        Mutex.Unlock(Presence.presenceLock);
     }
 
     /* 发布本 worker 的页面数与 IP 列表到缓存。 */
     public static async void Publish() {
         int curPages = 0;
-        List<string> snapshotIps = new List<string>();
-        Mutex.Lock(Presence.presenceLock);
-        curPages = pages;
-        int n = ips.Count;
-        if (n <= MaxIps) {
-            for (int i = 0; i < n; i = i + 1) {
-                snapshotIps.Add(ips[i]);
+        List<string> snapshotIps = null;
+        nint lk = Presence.presenceLock;
+        if (lk != 0) {
+            Mutex.Lock(lk);
+            try {
+                curPages = pages;
+                int n = ips.Count;
+                if (n > 0 && n <= MaxIps) {
+                    snapshotIps = new List<string>(n);
+                    for (int i = 0; i < n; i = i + 1) {
+                        snapshotIps.Add(ips[i]);
+                    }
+                }
+            } finally {
+                Mutex.Unlock(lk);
             }
         }
-        Mutex.Unlock(Presence.presenceLock);
 
-        string body = Convert.ToString(curPages);
-        for (int i = 0; i < snapshotIps.Count; i = i + 1) {
-            body = body + "," + snapshotIps[i];
+        string body = "";
+        if (snapshotIps == null || snapshotIps.Count == 0) {
+            body = Convert.ToString(curPages);
+        } else {
+            StringBuilder sb = new StringBuilder(snapshotIps.Count * 16 + 16);
+            sb.Append(Convert.ToString(curPages));
+            for (int i = 0; i < snapshotIps.Count; i = i + 1) {
+                sb.Append(",");
+                sb.Append(snapshotIps[i]);
+            }
+            body = sb.ToString();
         }
         await Cache.SetTtlAsync(Key(ProcessHost.WorkerId()), body,
                                 Ttl);
@@ -73,57 +101,68 @@ public class Presence {
             total = total + Head(v);
         }
         if (total == 0) {
-            Mutex.Lock(Presence.presenceLock);
-            int p = pages;
-            Mutex.Unlock(Presence.presenceLock);
-            return p;
+            return Local();
         }
         return total;
     }
 
     /* 所有 worker 的去重 IP 数，超出列出上限时回退为页面数。 */
     public static async int Visitors() {
-        string seen = ",";
-        int pages = 0;
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        int totalPages = 0;
         int unlisted = 0;
         for (int w = 0; w < MaxWorkers; w = w + 1) {
             string v = await Cache.GetAsync(Key(w));
             if (v.Length == 0) { continue; }
             int count = Head(v);
-            pages = pages + count;
-            List<string> parts = v.Split(",");
-            if (parts.Count <= 1 && count > 0) { unlisted = unlisted + count; }
-            for (int i = 1; i < parts.Count; i = i + 1) {
-                string ip = parts[i];
-                if (ip.Length == 0) { continue; }
-                if (seen.IndexOf("," + ip + ",") >= 0) { continue; }
-                seen = seen + ip + ",";
+            totalPages = totalPages + count;
+            int comma = v.IndexOf(",");
+            if (comma < 0) {
+                if (count > 0) { unlisted = unlisted + count; }
+                continue;
+            }
+            int pos = comma + 1;
+            int vlen = v.Length;
+            while (pos < vlen) {
+                int next = v.IndexOf(",", pos);
+                int end = next >= 0 ? next : vlen;
+                if (end > pos) {
+                    string ip = v.Substring(pos, end - pos);
+                    if (!seen.ContainsKey(ip)) {
+                        seen[ip] = true;
+                    }
+                }
+                if (next < 0) { break; }
+                pos = next + 1;
             }
         }
-        int distinct = 0;
-        List<string> all = seen.Split(",");
-        for (int i = 0; i < all.Count; i = i + 1) {
-            if (all[i].Length > 0) { distinct = distinct + 1; }
-        }
-        distinct = distinct + unlisted;
-        if (pages == 0) { return Local(); }
-        if (distinct > pages) { return pages; }
+        int distinct = seen.Count + unlisted;
+        if (totalPages == 0) { return Local(); }
+        if (distinct > totalPages) { return totalPages; }
         return distinct;
     }
 
     public static int Local() {
-        return pages;
+        nint lk = Presence.presenceLock;
+        if (lk == 0) { return pages; }
+        Mutex.Lock(lk);
+        try {
+            return pages;
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     public static int Head(string slot) {
-        int at = slot.IndexOf(",");
-        string head = slot;
-        if (at >= 0) { head = slot.Substring(0, at); }
+        if (slot == null || slot.Length == 0) { return 0; }
+        int end = slot.IndexOf(",");
+        if (end < 0) { end = slot.Length; }
+        if (end == 0) { return 0; }
         int n = 0;
-        for (int i = 0; i < head.Length; i = i + 1) {
-            string ch = head.Substring(i, 1);
-            if (ch < "0" || ch > "9") { return 0; }
-            n = n * 10 + (Convert.ToInt32(ch));
+        for (int i = 0; i < end; i = i + 1) {
+            int c = slot[i] & 255;
+            if (c < 48 || c > 57) { return 0; }
+            n = n * 10 + (c - 48);
         }
         return n;
     }

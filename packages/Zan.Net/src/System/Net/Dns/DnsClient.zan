@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -22,14 +23,16 @@ public class DnsClient : IDisposable {
         this.dnsServer = "8.8.8.8";
         this.dnsPort = NetConstants.PortDns;
         this.timeoutMs = NetConstants.TimeoutDnsLookupMs;
-        this.nextId = 1000;
+        this.nextId = (int)(Stopwatch.GetMicroseconds() & 65535L);
+        if (this.nextId == 0) { this.nextId = 1; }
     }
 
     public DnsClient(string server, int port) {
         this.dnsServer = server;
         this.dnsPort = port;
         this.timeoutMs = NetConstants.TimeoutDnsLookupMs;
-        this.nextId = 1000;
+        this.nextId = (int)(Stopwatch.GetMicroseconds() & 65535L);
+        if (this.nextId == 0) { this.nextId = 1; }
     }
 
     public DnsClient SetTimeout(int ms) {
@@ -39,7 +42,7 @@ public class DnsClient : IDisposable {
     }
 
     private int NextTxId() {
-        this.nextId = (this.nextId + 1) & 65535;
+        this.nextId = ((this.nextId * 25173) + 13849) & 65535;
         if (this.nextId == 0) { this.nextId = 1; }
         return this.nextId;
     }
@@ -57,7 +60,19 @@ public class DnsClient : IDisposable {
         return true;
     }
 
-    // 从系统 hosts 文件或本地表查询主机名映射
+    private static bool EqualsSliceAsciiIgnoreCase(string line, int start, int len, string domain) {
+        if (len != domain.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            int ca = line[start + i] & 255;
+            int cb = domain[i] & 255;
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    // 从系统 hosts 文件或本地表查询主机名映射（同时支持空格与 Tab 分隔，零中间 Split 分配）
     public static string LookupHosts(string domain) {
         if (domain == null || domain.Length == 0) { return ""; }
         string hostsFile = "";
@@ -70,22 +85,24 @@ public class DnsClient : IDisposable {
         try {
             List<string> lines = File.ReadAllLines(hostsFile);
             for (int i = 0; i < lines.Count; i = i + 1) {
-                string line = lines[i].Trim();
-                if (line.Length == 0 || line.StartsWith("#")) { continue; }
-                int comment = line.IndexOf("#");
-                if (comment >= 0) { line = line.Substring(0, comment).Trim(); }
-                List<string> parts = line.Split(" ");
-                List<string> tokens = new List<string>();
-                for (int p = 0; p < parts.Count; p = p + 1) {
-                    string part = parts[p].Trim();
-                    if (part.Length > 0) { tokens.Add(part); }
-                }
-                if (tokens.Count >= 2) {
-                    string ip = tokens[0];
-                    for (int t = 1; t < tokens.Count; t = t + 1) {
-                        if (DnsClient.EqualsAsciiIgnoreCase(tokens[t], domain)) {
-                            return ip;
-                        }
+                string line = lines[i];
+                if (line == null) { continue; }
+                int end = line.IndexOf("#");
+                if (end < 0) { end = line.Length; }
+                int p = 0;
+                while (p < end && ((line[p] & 255) == 32 || (line[p] & 255) == 9 || (line[p] & 255) == 13)) { p = p + 1; }
+                if (p >= end) { continue; }
+                int ipStart = p;
+                while (p < end && (line[p] & 255) != 32 && (line[p] & 255) != 9 && (line[p] & 255) != 13) { p = p + 1; }
+                int ipLen = p - ipStart;
+                if (ipLen <= 0) { continue; }
+                while (p < end) {
+                    while (p < end && ((line[p] & 255) == 32 || (line[p] & 255) == 9 || (line[p] & 255) == 13)) { p = p + 1; }
+                    if (p >= end) { break; }
+                    int tokStart = p;
+                    while (p < end && (line[p] & 255) != 32 && (line[p] & 255) != 9 && (line[p] & 255) != 13) { p = p + 1; }
+                    if (DnsClient.EqualsSliceAsciiIgnoreCase(line, tokStart, p - tokStart, domain)) {
+                        return line.Substring(ipStart, ipLen);
                     }
                 }
             }
@@ -132,8 +149,8 @@ public class DnsClient : IDisposable {
     // 异步解析 IPv6 地址列表 (Type AAAA)
     public async List<string> ResolveAaaaAsync(string domain) {
         if (domain == null || domain.Length == 0) { return new List<string>(); }
-        string dLow = domain.ToLower();
-        if (dLow == "localhost" || dLow == "localhost.localdomain") {
+        if (DnsClient.EqualsAsciiIgnoreCase(domain, "localhost")
+            || DnsClient.EqualsAsciiIgnoreCase(domain, "localhost.localdomain")) {
             List<string> local = new List<string>();
             local.Add("::1");
             return local;
@@ -291,8 +308,8 @@ public class DnsClient : IDisposable {
             byte[] tcpQuery = new byte[qlen + 2];
             tcpQuery[0] = (byte)((qlen >> 8) & 255);
             tcpQuery[1] = (byte)(qlen & 255);
-            for (int i = 0; i < qlen; i = i + 1) {
-                tcpQuery[i + 2] = queryPkt[i];
+            if (qlen > 0) {
+                NativeMemory.Copy((nint)tcpQuery + (nint)2, (nint)queryPkt, qlen);
             }
 
             int sent = await client.SendBytesAsync(tcpQuery, tcpQuery.Length);
@@ -307,9 +324,7 @@ public class DnsClient : IDisposable {
                 byte[] pBuf = new byte[2 - pRead];
                 int n = await client.RecvBytesAsync(pBuf, 2 - pRead, this.timeoutMs);
                 if (n <= 0) { return new List<DnsRecord>(); }
-                for (int i = 0; i < n; i = i + 1) {
-                    prefix[pRead + i] = pBuf[i];
-                }
+                NativeMemory.Copy((nint)prefix + (nint)pRead, (nint)pBuf, n);
                 pRead = pRead + n;
             }
 
@@ -324,9 +339,7 @@ public class DnsClient : IDisposable {
                 byte[] chunk = new byte[msgLen - received];
                 int r = await client.RecvBytesAsync(chunk, msgLen - received, this.timeoutMs);
                 if (r <= 0) { break; }
-                for (int i = 0; i < r; i = i + 1) {
-                    respBuf[received + i] = chunk[i];
-                }
+                NativeMemory.Copy((nint)respBuf + (nint)received, (nint)chunk, r);
                 received = received + r;
             }
 
