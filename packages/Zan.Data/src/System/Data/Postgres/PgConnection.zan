@@ -58,26 +58,36 @@ public partial class PgConnection : IDbConnection {
     bool busy;
     Queue<AsyncGate> waiters;
 
+    internal bool HasAsyncTls() {
+        return this.tls != null && this.syncTls == null;
+    }
+
     async bool AcquireLock() {
-        if (!this.busy) {
-            this.busy = true;
-            return true;
+        AsyncGate g = null;
+        lock (this) {
+            if (!this.busy) {
+                this.busy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
+            this.waiters.Enqueue(g);
         }
-        AsyncGate g = new AsyncGate();
-        if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
-        this.waiters.Enqueue(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     void ReleaseLock() {
-        if (this.waiters != null && this.waiters.Count() > 0) {
-            AsyncGate g = this.waiters.Dequeue();
-            g.Signal();
-        } else {
-            this.busy = false;
+        AsyncGate g = null;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                g = this.waiters.Dequeue();
+            } else {
+                this.busy = false;
+            }
         }
+        if (g != null) { g.Signal(); }
     }
 
     // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
@@ -218,6 +228,10 @@ public partial class PgConnection : IDbConnection {
 
     // 恰好读取 need 字节到 dst 的 off 处；对端关闭返回不足。
     int recvExactSync(byte[] dst, int off, int need) {
+        if (this.syncTls == null && this.tls != null) {
+            this.lastError = "cannot perform sync I/O on async TLS connection";
+            return 0;
+        }
         int got = 0;
         byte[] tmp = new byte[need + 1];
         while (got < need) {
@@ -238,6 +252,10 @@ public partial class PgConnection : IDbConnection {
     // 发原始字节（SSLRequest / Startup / TLS 密文）。
     int sendRawSync(byte[] buf, int len) {
         if (this.syncTls != null) { return this.tlsSendSync(buf, len); }
+        if (this.tls != null) {
+            this.lastError = "cannot perform sync I/O on async TLS connection";
+            return -1;
+        }
         return Socket.Send(this.sock, buf, len);
     }
 
@@ -727,15 +745,17 @@ public partial class PgConnection : IDbConnection {
                 string saltB64 = PgWire.scramField(serverFirst, "s");
                 int iters = PgWire.scramField(serverFirst, "i").ToInt32();
                 if (!PgWire.hasPrefix(serverNonce, clientNonceB64)
-                        || saltB64.Length == 0 || iters < 1) {
+                        || saltB64.Length == 0 || iters < 1 || iters > 10000000) {
                     this.lastError = "invalid SCRAM server-first-message";
                     return false;
                 }
-                List<int> saltLen = new List<int>();
-                saltLen.Add(0);
-                byte[] salt = Base64.Decode(saltB64, saltLen);
+                byte[] salt = Base64.Decode(saltB64);
+                if (salt == null) {
+                    this.lastError = "invalid SCRAM salt";
+                    return false;
+                }
                 byte[] salted = PgWire.pbkdf2Sha256(this.password, salt,
-                    saltLen[0], iters);
+                    salt.Length, iters);
                 byte[] clientKey = Hmac.Sha256(salted, 32,
                     PgWire.strToBytes("Client Key", 10), 10);
                 byte[] storedKey = Sha256.Hash(clientKey, 32);
@@ -852,15 +872,17 @@ public partial class PgConnection : IDbConnection {
                 string saltB64 = PgWire.scramField(serverFirst, "s");
                 int iters = PgWire.scramField(serverFirst, "i").ToInt32();
                 if (!PgWire.hasPrefix(serverNonce, clientNonceB64)
-                        || saltB64.Length == 0 || iters < 1) {
+                        || saltB64.Length == 0 || iters < 1 || iters > 10000000) {
                     this.lastError = "invalid SCRAM server-first-message";
                     return false;
                 }
-                List<int> saltLen = new List<int>();
-                saltLen.Add(0);
-                byte[] salt = Base64.Decode(saltB64, saltLen);
+                byte[] salt = Base64.Decode(saltB64);
+                if (salt == null) {
+                    this.lastError = "invalid SCRAM salt";
+                    return false;
+                }
                 byte[] salted = PgWire.pbkdf2Sha256(this.password, salt,
-                    saltLen[0], iters);
+                    salt.Length, iters);
                 byte[] clientKey = Hmac.Sha256(salted, 32,
                     PgWire.strToBytes("Client Key", 10), 10);
                 byte[] storedKey = Sha256.Hash(clientKey, 32);

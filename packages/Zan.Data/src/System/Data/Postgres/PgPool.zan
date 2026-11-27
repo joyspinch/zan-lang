@@ -14,12 +14,11 @@ public class PgPool : IDisposable {
         this.core = new PoolCore<PgConnection>(maxSize);
     }
 
-    // 以主机/端口/库/用户/密码构造连接池（内部拼成 conninfo）。
+    // 以主机/端口/库/用户/密码构造连接池（内部按 libpq 规则转义拼成 conninfo）。
     public PgPool(string host, int port, string database, string user,
             string password, int maxSize) : this(
-                "host=" + host + " port=" + Convert.ToString(port)
-                + " dbname=" + database + " user=" + user
-                + " password=" + password, maxSize) {
+                PgConnector.BuildConninfo(host, port, database, user, password),
+                maxSize) {
     }
 
     // 新建一条物理连接（池扩容时由 AcquireAsync 调用）；失败返回 null。
@@ -50,6 +49,21 @@ public class PgPool : IDisposable {
         this.core.Drop(c);
     }
 
+    private async void RollbackAndReturnAsync(PgConnection c) {
+        bool failed = false;
+        try {
+            if (!await c.RollbackAsync()) { failed = true; }
+        } catch (Exception _ex) {
+            failed = true;
+        }
+        c.inTxn = false;
+        if (failed || this.core.IsClosed() || !c.IsConnected()) {
+            this.Discard(c);
+            return;
+        }
+        if (!this.core.Pool(c)) { c.Close(); }
+    }
+
     // 将连接归还连接池；损坏、池已关闭或回滚失败的连接直接关闭丢弃。
     public void Release(PgConnection c) {
         if (c == null) {
@@ -60,6 +74,10 @@ public class PgPool : IDisposable {
             return;
         }
         if (c.inTxn) {
+            if (c.HasAsyncTls()) {
+                Task.Spawn(this.RollbackAndReturnAsync(c));
+                return;
+            }
             bool failed = false;
             try {
                 c.Rollback();

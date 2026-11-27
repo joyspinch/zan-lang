@@ -10,55 +10,49 @@ namespace Messaging;
 // 的引用环（ARC 回收不掉）。改成捕获这个订阅表：通道 → 委托 → 订阅表，
 // 没有环。
 public class SubscriptionList<T> {
-    // 订阅者。
+    // 订阅者槽位（退订后置 null，立即释放闭包引用并 O(1) 判定退订状态）。
     private List<Action<T>> handlers;
-    // 已退订的订阅编号。
-    private List<int> revoked;
+    private int activeCount;
 
     public SubscriptionList() {
         this.handlers = new List<Action<T>>();
-        this.revoked = new List<int>();
+        this.activeCount = 0;
     }
 
     // 订阅（返回订阅编号，供退订用）。
     public int Add(Action<T> handler) {
         this.handlers.Add(handler);
+        if (handler != null) { this.activeCount = this.activeCount + 1; }
         return this.handlers.Count - 1;
     }
 
     // 退订（返回是否真的退订了；编号不存在或已退订都返回 false）。
     public bool Revoke(int subscriptionId) {
         if (subscriptionId < 0 || subscriptionId >= this.handlers.Count) { return false; }
-        for (int i = 0; i < this.revoked.Count; i = i + 1) {
-            if (this.revoked[i] == subscriptionId) { return false; }
-        }
-        this.revoked.Add(subscriptionId);
+        if (this.handlers[subscriptionId] == null) { return false; }
+        this.handlers[subscriptionId] = null;
+        if (this.activeCount > 0) { this.activeCount = this.activeCount - 1; }
         return true;
     }
 
     // 这个订阅编号是否已退订。
     public bool IsRevoked(int subscriptionId) {
-        for (int i = 0; i < this.revoked.Count; i = i + 1) {
-            if (this.revoked[i] == subscriptionId) { return true; }
-        }
-        return false;
+        if (subscriptionId < 0 || subscriptionId >= this.handlers.Count) { return false; }
+        return this.handlers[subscriptionId] == null;
     }
 
     // 有效订阅者数量（已退订的不算）。
     public int Count() {
-        int count = 0;
-        for (int i = 0; i < this.handlers.Count; i = i + 1) {
-            if (!this.IsRevoked(i)) { count = count + 1; }
-        }
-        return count;
+        return this.activeCount;
     }
 
     // 广播：所有有效订阅者都收到（返回被调用的数量）。
     public int Publish(T message) {
         int called = 0;
         for (int i = 0; i < this.handlers.Count; i = i + 1) {
-            if (this.IsRevoked(i)) { continue; }
-            this.handlers[i](message);
+            Action<T> h = this.handlers[i];
+            if (h == null) { continue; }
+            h(message);
             called = called + 1;
         }
         return called;
@@ -67,8 +61,9 @@ public class SubscriptionList<T> {
     // 命令：只投给唯一一个有效订阅者（调用方要保证只有一个）。
     public void PublishOne(T message) {
         for (int i = 0; i < this.handlers.Count; i = i + 1) {
-            if (this.IsRevoked(i)) { continue; }
-            this.handlers[i](message);
+            Action<T> h = this.handlers[i];
+            if (h == null) { continue; }
+            h(message);
             return;
         }
     }

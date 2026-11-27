@@ -48,9 +48,6 @@ public partial class RedisClient {
 
     public bool tlsVerify = true;
 
-    [DllImport("crt")]
-    static extern long strlen(string str);
-
     public RedisClient(string connectionString) {
         this.initPool(RedisOptions.Parse(connectionString));
     }
@@ -214,24 +211,31 @@ public partial class RedisClient {
     }
 
     async bool AcquireLock() {
-        if (!this.busy) {
-            this.busy = true;
-            return true;
+        AsyncGate g = null;
+        lock (this) {
+            if (!this.busy) {
+                this.busy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
+            this.waiters.Enqueue(g);
         }
-        AsyncGate g = new AsyncGate();
-        this.waiters.Enqueue(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     void ReleaseLock() {
-        if (this.waiters != null && this.waiters.Count() > 0) {
-            AsyncGate g = this.waiters.Dequeue();
-            g.Signal();
-        } else {
-            this.busy = false;
+        AsyncGate g = null;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                g = this.waiters.Dequeue();
+            } else {
+                this.busy = false;
+            }
         }
+        if (g != null) { g.Signal(); }
     }
 
     public void Close() {
@@ -239,11 +243,19 @@ public partial class RedisClient {
             this.pool.Close();
             this.pool = null;
         }
-        while (this.waiters != null && this.waiters.Count() > 0) {
-            AsyncGate g = this.waiters.Dequeue();
-            g.Signal();
+        List<AsyncGate> toWake = null;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                toWake = new List<AsyncGate>();
+                while (this.waiters.Count() > 0) {
+                    toWake.Add(this.waiters.Dequeue());
+                }
+            }
+            this.busy = false;
         }
-        this.busy = false;
+        if (toWake != null) {
+            for (int i = 0; i < toWake.Count; i = i + 1) { toWake[i].Signal(); }
+        }
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;
@@ -420,7 +432,7 @@ public partial class RedisClient {
         if (prefix == 43 || prefix == 45) {
             r.kind = prefix == 43 ? RedisReply.STR : RedisReply.ERROR;
             r.str = rest;
-            r.len = (int)strlen(rest);
+            r.len = rest.Length;
             return r;
         }
         long number = 0;
@@ -512,9 +524,9 @@ public partial class RedisClient {
         sb.Append(Convert.ToString(totalCount));
         sb.Append("\r\n");
         for (int i = 0; i < args.Count; i = i + 1) {
-            string a = args[i];
+            string a = args[i] != null ? args[i] : "";
             sb.Append("$");
-            sb.Append(Convert.ToString((int)strlen(a)));
+            sb.Append(Convert.ToString(a.Length));
             sb.Append("\r\n");
             sb.Append(a);
             sb.Append("\r\n");
@@ -584,7 +596,7 @@ public partial class RedisClient {
             return RedisClient.makeErrorReply("connection closed");
         }
         string payload = RedisClient.BuildRespPrefix(args, args.Count).ToString();
-        int expected = (int)strlen(payload);
+        int expected = payload.Length;
         int sent = await this.sendStringExact(payload, expected);
         if (!this.connected || sent <= 0) {
             this.lastError = "connection closed";
@@ -643,7 +655,7 @@ public partial class RedisClient {
         sb.Append(Convert.ToString(blen));
         sb.Append("\r\n");
         string head = sb.ToString();
-        int hlen = (int)strlen(head);
+        int hlen = head.Length;
         if (await this.sendStringExact(head, hlen) != hlen) {
             return RedisClient.makeErrorReply("connection closed");
         }

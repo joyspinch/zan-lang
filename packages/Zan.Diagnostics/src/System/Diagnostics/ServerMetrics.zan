@@ -426,10 +426,14 @@ public class ServerMetrics {
     }
 
     static ServerMetrics inst;
-    static byte[] monoBuf;
+    static object instLock = new object();
     // 进程级共享单例；首次调用时构造，此后所有请求共用一份。
     public static ServerMetrics Global() {
-        if (inst == null) { inst = new ServerMetrics(); }
+        if (inst == null) {
+            lock (instLock) {
+                if (inst == null) { inst = new ServerMetrics(); }
+            }
+        }
         return inst;
     }
 
@@ -466,14 +470,17 @@ public class ServerMetrics {
 
     public void RecordError(long ts, string origin, string detail) {
         long _et = this.errTotal.Increment();
+        ErrorSink sink = this.errSink;
+        bool dbg = this.errDebug;
+        string line = "[" + DateTime.FromUnixSeconds(ts).ToString() + "] "
+            + origin + " | " + detail + "\n";
         lock (this.errLock) {
             this.errors.Add(new ErrEntry(ts, origin, detail));
             while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
+            this.AppendErrLine(line);
         }
-        if (this.errSink != null) { this.errSink(ts, origin, detail); }
-        this.AppendErrLine("[" + DateTime.FromUnixSeconds(ts).ToString() + "] "
-            + origin + " | " + detail + "\n");
-        if (this.errDebug) {
+        if (sink != null) { sink(ts, origin, detail); }
+        if (dbg) {
             Console.WriteLine("[error] " + origin + " | " + detail);
         }
     }
@@ -520,12 +527,7 @@ public class ServerMetrics {
         #if WINDOWS
         return GetTickCount64();
         #else
-        if (monoBuf == null) { monoBuf = new byte[16]; }
-        byte[] tv = monoBuf;
-        int r = gettimeofday(tv, 0);
-        long sec = ServerMetrics.LeInt(tv, 0, 8);
-        long usec = ServerMetrics.LeInt(tv, 8, 8);
-        return sec * 1000 + usec / 1000;
+        return NativeMonotonicUs() / 1000L;
         #endif
     }
 

@@ -60,6 +60,7 @@ public class VectorTable : IDisposable {
             vt.file = PageFile.OpenExisting(vt.vecPath);
             if (!vt.file.IsOpen()) {
                 vt.lastError = "cannot open zvec file: " + vt.file.GetError();
+                vt.Close();
                 return vt;
             }
             // 读取 32 字节头部
@@ -67,7 +68,7 @@ public class VectorTable : IDisposable {
             if (vt.file.ReadAt(0, h, HEADER_SIZE) != HEADER_SIZE) {
                 h.Free();
                 vt.lastError = "truncated zvec header";
-                vt.file.Close();
+                vt.Close();
                 return vt;
             }
             h.SeekRead(0);
@@ -82,7 +83,7 @@ public class VectorTable : IDisposable {
 
             if (magic != MAGIC_VEC || ver != VERSION) {
                 vt.lastError = "invalid zvec magic or version";
-                vt.file.Close();
+                vt.Close();
                 return vt;
             }
             if (vt.options.dimensions <= 0) {
@@ -90,7 +91,7 @@ public class VectorTable : IDisposable {
                 vt.options.metric = metric;
             } else if (vt.options.dimensions != dims) {
                 vt.lastError = "dimensions mismatch: header=" + Convert.ToString(dims) + " opts=" + Convert.ToString(vt.options.dimensions);
-                vt.file.Close();
+                vt.Close();
                 return vt;
             }
             vt.totalRows = (int)total;
@@ -98,11 +99,13 @@ public class VectorTable : IDisposable {
         } else {
             if (vt.options.dimensions <= 0) {
                 vt.lastError = "dimensions must be positive for new VectorTable";
+                vt.Close();
                 return vt;
             }
             vt.file = PageFile.Open(vt.vecPath);
             if (!vt.file.IsOpen()) {
                 vt.lastError = "cannot create zvec file: " + vt.file.GetError();
+                vt.Close();
                 return vt;
             }
             vt.WriteHeaderLocked(0, 0);
@@ -634,6 +637,9 @@ public class VectorTable : IDisposable {
             this.index = new VectorIndex(this.options);
 
             while (offset < fileSize) {
+                if (fileSize - offset < 4L) {
+                    snapFile.Close(); return false;
+                }
                 ByteBuffer lenBuf = ByteBuffer.Alloc(4);
                 if (snapFile.ReadAt(offset, lenBuf, 4) != 4) {
                     lenBuf.Free(); snapFile.Close(); return false;
@@ -642,6 +648,11 @@ public class VectorTable : IDisposable {
                 int batchLen = (int)lenBuf.ReadU32();
                 lenBuf.Free();
                 offset = offset + 4L;
+
+                long remaining = fileSize - offset;
+                if (batchLen <= 0 || (long)batchLen > remaining) {
+                    snapFile.Close(); return false;
+                }
 
                 ByteBuffer payloadBuf = ByteBuffer.Alloc(batchLen);
                 if (snapFile.ReadAt(offset, payloadBuf, batchLen) != batchLen) {
@@ -682,19 +693,24 @@ public class VectorTable : IDisposable {
     }
 
     public void Close() {
-        this.tlock.EnterWrite();
-        try {
-            if (this.file != null && this.file.IsOpen()) {
-                this.FlushLocked();
-                this.file.Close();
+        if (this.tlock != null) {
+            this.tlock.EnterWrite();
+            try {
+                if (this.file != null && this.file.IsOpen()) {
+                    if (this.index != null) { this.FlushLocked(); }
+                    this.file.Close();
+                }
+            } finally {
+                this.tlock.ExitWrite();
+                this.tlock.Close();
+                this.tlock = null;
             }
-        } finally {
-            this.tlock.ExitWrite();
-            this.tlock.Close();
-            if (this.ioMtx != 0) {
-                Mutex.Destroy(this.ioMtx);
-                this.ioMtx = 0;
-            }
+        } else if (this.file != null && this.file.IsOpen()) {
+            this.file.Close();
+        }
+        if (this.ioMtx != 0) {
+            Mutex.Destroy(this.ioMtx);
+            this.ioMtx = 0;
         }
     }
 

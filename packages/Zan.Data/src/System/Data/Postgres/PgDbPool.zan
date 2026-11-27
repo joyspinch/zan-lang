@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Threading;
 
 namespace System.Data.Postgres;
 
@@ -9,11 +10,31 @@ public class PgDbPool : DbPool {
             : base(new PgConnector(conninfo), maxSize) {
     }
 
+    private async void RollbackAndReturnAsync(PgConnection pc) {
+        bool failed = false;
+        try {
+            if (!await pc.RollbackAsync()) { failed = true; }
+        } catch (Exception _ex) {
+            failed = true;
+        }
+        pc.inTxn = false;
+        if (failed || !pc.IsConnected()) {
+            pc.Close();
+            this.Drop(pc);
+            return;
+        }
+        base.Release(pc);
+    }
+
     // 归还前先回滚残留事务，异常或断连则直接关闭并剔除。
     public override void Release(IDbConnection c) {
         if (c is PgConnection) {
             PgConnection pc = (PgConnection)c;
             if (pc.inTxn) {
+                if (pc.HasAsyncTls()) {
+                    Task.Spawn(this.RollbackAndReturnAsync(pc));
+                    return;
+                }
                 bool failed = false;
                 try { pc.Rollback(); } catch (Exception _ex) { failed = true; }
                 pc.inTxn = false;

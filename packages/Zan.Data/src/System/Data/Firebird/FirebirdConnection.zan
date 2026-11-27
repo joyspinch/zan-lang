@@ -30,25 +30,31 @@ public partial class FirebirdConnection : IDbConnection {
     public bool inTxn;
 
     private async bool AcquireLock() {
-        if (!this.busy) {
-            this.busy = true;
-            return true;
+        AsyncGate g = null;
+        lock (this) {
+            if (!this.busy) {
+                this.busy = true;
+                return true;
+            }
+            g = new AsyncGate();
+            if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
+            this.waiters.Enqueue(g);
         }
-        AsyncGate g = new AsyncGate();
-        if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
-        this.waiters.Enqueue(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     private void ReleaseLock() {
-        if (this.waiters != null && this.waiters.Count() > 0) {
-            AsyncGate g = this.waiters.Dequeue();
-            g.Signal();
-        } else {
-            this.busy = false;
+        AsyncGate g = null;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                g = this.waiters.Dequeue();
+            } else {
+                this.busy = false;
+            }
         }
+        if (g != null) { g.Signal(); }
     }
 
     public static int FETCH_ROWS = 400;
@@ -250,9 +256,8 @@ public partial class FirebirdConnection : IDbConnection {
         conn.wantCrypt = wireCrypt;
         bool ok = await conn.handshake(host, port, database, user, password);
         conn.connected = ok;
-        if (!ok && conn.sock >= 0) {
-            Socket.Close(conn.sock);
-            conn.sock = -1;
+        if (!ok) {
+            conn.Close();
         }
         return conn;
     }
