@@ -14,22 +14,38 @@ class MaxBtnDblClickTest {
     [DllImport("user32", EntryPoint = "PostMessageW")]
     static extern int PostMessageW(nint hwnd, int msg, nint wp, nint lp);
 
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
+
     [DllImport("user32", EntryPoint = "IsZoomed")]
     static extern int IsZoomed(nint hwnd);
 
     [DllImport("user32", EntryPoint = "GetWindowRect")]
     static extern int GetWindowRect(nint hwnd, nint rect);
 
+    const int WM_SYSKEYDOWN = 0x0104;
+    const int WM_SYSKEYUP = 0x0105;
+    const int WM_SYSCHAR = 0x0106;
     const int WM_SYSCOMMAND = 0x0112;
     const int WM_NCLBUTTONDBLCLK = 0x00A3;
     const int SC_MAXIMIZE = 0xF030;
+    const int SC_KEYMENU = 0xF100;
     const int SC_RESTORE = 0xF120;
+    const int VK_MENU = 0x12;
+    const int VK_F4 = 0x73;
+    const int VK_F10 = 0x79;
     // NC 消息的 wParam 是 WM_NCHITTEST 的返回码；DefWindowProc 只对
     // HTCAPTION(2) 响应双击（0 = HTERROR，直接忽略）。
     const int HTCAPTION = 2;
 
     static App app;
     static int fails;
+    static int altF4CloseRequests;
+
+    static bool BlockCloseAndRecord() {
+        altF4CloseRequests = altF4CloseRequests + 1;
+        return false;
+    }
 
     static void True(string what, bool got) {
         if (got) { return; }
@@ -98,6 +114,24 @@ class MaxBtnDblClickTest {
         Post(WM_SYSCOMMAND, (nint)SC_MAXIMIZE);
         Pump(8);
         True("re-enabled SC_MAXIMIZE maximizes", IsZoomed(Hwnd()) != 0);
+
+        // ---- Alt / F10 / SC_KEYMENU 不得进入模态系统菜单循环卡死界面；Alt+F4 仍走关闭 ----
+        True("WM_SYSKEYDOWN Alt handled without DefWindowProc menu trap",
+            SendMessageW(Hwnd(), WM_SYSKEYDOWN, (nint)VK_MENU, 0) == 0);
+        True("WM_SYSKEYUP Alt handled without SC_KEYMENU stall",
+            SendMessageW(Hwnd(), WM_SYSKEYUP, (nint)VK_MENU, 0) == 0);
+        True("WM_SYSKEYDOWN F10 handled without menu trap",
+            SendMessageW(Hwnd(), WM_SYSKEYDOWN, (nint)VK_F10, 0) == 0);
+        True("WM_SYSCHAR suppressed without beep",
+            SendMessageW(Hwnd(), WM_SYSCHAR, (nint)97, 0) == 0);
+        True("WM_SYSCOMMAND SC_KEYMENU returns 0 without modal freeze",
+            SendMessageW(Hwnd(), WM_SYSCOMMAND, (nint)SC_KEYMENU, 0) == 0);
+        Pump(4);
+        altF4CloseRequests = 0;
+        app.OnCloseGuard(BlockCloseAndRecord);
+        SendMessageW(Hwnd(), WM_SYSKEYDOWN, (nint)VK_F4, (nint)0x20000000);
+        Pump(8);
+        True("Alt+F4 still reaches close intercept path", altF4CloseRequests >= 1);
 
         Console.WriteLine("maxbtn-dblclick:"
             + Convert.ToString(fails == 0 ? 1 : 0));
