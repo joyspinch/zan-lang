@@ -503,6 +503,81 @@ class GuiOverlayLayoutEncapsulationTest {
         app.SetRootControl(null);
     }
 
+    static void TestDockLayoutAndUpwardOverflow(App app) {
+        app.UseSkin("liquid");
+        Panel root = Panel.Column();
+        root.SetInlineStyleCss("gap: 8; padding: 8;");
+        Panel body = new Panel();
+        body.Grow();
+        int clicked = 0 - 1;
+        Dock dock = new Dock()
+            .Add("home", "Home")
+            .Add("search", "Search")
+            .Add("star", "Featured")
+            .Add("settings", "Settings")
+            .SetActive(2, true);
+        dock.ItemClicked.Add(() => { clicked = dock.ClickedIndex(); });
+        root.Add(body);
+        root.Add(dock);
+        app.SetRootControl(root);
+        root.MeasureTree(app, 800);
+        root.Arrange(0, 0, 800, 600);
+
+        int wantRestH = app.Scale(44 + 8 + 11);
+        Check(dock.prefH == wantRestH && dock.bh == wantRestH,
+            "Dock layout height equals resting tray height without invisible headroom void");
+        Check(dock.by - (body.by + body.bh) <= app.Scale(10),
+            "Sibling Grow content extends down to Dock tray with only column gap");
+
+        app.FreezeAnimClock(2000);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xffffffff);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+        Check(dock.ItemScale(2) > 0.99f && dock.ItemScale(2) < 1.01f, "Dock starts at rest scale 1.0");
+
+        int ix = 0; int iy = 0; int iw = 0; int ih = 0;
+        dock.ItemRect(2, out ix, out iy, out iw, out ih);
+        // 静息态：托盘上方 4px（列间距）与上方内容底缘都不被 Dock 吞掉，托盘左右空白侧也不命中 Dock
+        Check(root.HitTest(ix + iw / 2, dock.by - 4) != dock,
+            "At rest, gap above Dock tray does not hit Dock");
+        Check(root.HitTest(ix + iw / 2, body.by + body.bh - 4) == body,
+            "At rest, bottom edge of sibling content above Dock hits sibling content");
+        Check(root.HitTest(dock.bx + 2, dock.by + dock.bh / 2) == root,
+            "At rest, side wing outside visual Dock tray does not hit Dock");
+
+        // 悬停放大：图标向 dock.by 上方自然溢出，溢出区仍命中 Dock 且可点击
+        app.ProcessOffscreenInput(1, ix + iw / 2, iy + ih / 2, 0, 0, 0, 0);
+        for (int f = 0; f < 20; f = f + 1) {
+            app.FreezeAnimClock(2016 + f * 16);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xffffffff);
+            root.RenderTree(app);
+            app.EndOffscreenFrame();
+        }
+        Check(dock.HoveredIndex() == 2 && dock.ItemScale(2) > 1.45f,
+            "Dock magnifies hovered item smoothly");
+        dock.ItemRect(2, out ix, out iy, out iw, out ih);
+        Check(iy < dock.by, "Magnified Dock icon overflows upward above its layout box");
+        Check(root.HitTest(ix + iw / 2, iy + 4) == dock,
+            "While magnified, upward overflow region still hits Dock");
+        app.ProcessOffscreenInput(2, ix + iw / 2, iy + 4, 0, 0, 0, 0);
+        Check(clicked == 2, "Clicking upward overflow region of magnified icon fires ItemClicked");
+
+        // 移出后平滑回落到 1.0x
+        app.ProcessOffscreenInput(1, 20, 20, 0, 0, 0, 0);
+        for (int f = 0; f < 45; f = f + 1) {
+            app.FreezeAnimClock(2400 + f * 20);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xffffffff);
+            root.RenderTree(app);
+            app.EndOffscreenFrame();
+        }
+        Check(dock.ItemScale(2) < 1.02f && !dock.IsAnimating(), "Dock settles smoothly back to 1.0x");
+        dock.ItemClicked.Clear();
+        app.SetRootControl(null);
+    }
+
     static void Main() {
         Dispatcher.Init();
         App app = App.CreateOffscreen("encapsulation regression", 800, 600);
@@ -512,6 +587,7 @@ class GuiOverlayLayoutEncapsulationTest {
         TestOverlayEventIsolation(app);
         TestTooltipCoordsInPushedLayerAndWrapGuard(app);
         TestStandardComponentEncapsulation(app);
+        TestDockLayoutAndUpwardOverflow(app);
         TestTabPaneScrollBarAndFlexWrapConvergence(app);
         TestInputNumberNarrowWidth(app);
         TestRoundedPopupLayoutAndConcentricRadii(app);

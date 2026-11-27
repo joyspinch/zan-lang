@@ -59,6 +59,10 @@ public class Dock : Control {
     private int lastTooltipIdx = 0 - 1;
     private int lastTickMs;
     private bool animating;
+    private int lastTrayX;
+    private int lastTrayY;
+    private int lastTrayW;
+    private int lastTrayH;
 
     public Dock() {
         this.InitControl("dock");
@@ -178,10 +182,17 @@ public class Dock : Control {
         int gap = app.Scale(this.IconGap);
         int padX = this.TrayPadX(app);
         int restW = n > 0 ? (n * baseSz + (n - 1) * gap + padX * 2) : app.Scale(80);
-        // 预留两侧对称扩张空间，保证鱼眼放大时图标与玻璃托盘居中舒展不裁切
+        // 布局高度仅按静息托盘高度占位（不将 71dp 鱼眼放大/名称胶囊余量静态烤进 prefH
+        // 造成上方大段空白）；悬停放大、轻跳与名称胶囊向 by 上方自然溢出绘制。
         int extraW = (int)((float)baseSz * (this.MaxScale - 1.0f) * 2.2f + 0.5f);
         prefW = restW + extraW;
-        prefH = this.HeadroomPx(app) + baseSz + this.TrayPadTop(app) + this.TrayPadBottom(app);
+        prefH = baseSz + this.TrayPadTop(app) + this.TrayPadBottom(app);
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        base.Arrange(px, py, pw, ph);
+        this.lastTrayW = 0;
+        this.lastTrayH = 0;
     }
 
     private float TargetScaleFor(App app, int idx, int restLeft, int baseSz, int gap) {
@@ -297,6 +308,10 @@ public class Dock : Control {
         trayH = baseSz + padTop + padBot;
         trayX = bx + (bw - trayW) / 2;
         trayY = by + bh - trayH;
+        this.lastTrayX = trayX;
+        this.lastTrayY = trayY;
+        this.lastTrayW = trayW;
+        this.lastTrayH = trayH;
         int baseBottomY = trayY + padTop + baseSz;
         int liftMax = app.Scale(this.LiftPx);
         int cx = trayX + padX;
@@ -330,19 +345,39 @@ public class Dock : Control {
         return 0 - 1;
     }
 
-    public override Control HitTest(int x, int y, int pointerType) {
+    private void TrayBoundsFallback(App app, out int tx, out int ty, out int tw, out int th) {
+        if (this.lastTrayW > 0 && this.lastTrayH > 0) {
+            tx = this.lastTrayX;
+            ty = this.lastTrayY;
+            tw = this.lastTrayW;
+            th = this.lastTrayH;
+            return;
+        }
+        int n = this.Items.Count;
+        int baseSz = app != null ? app.Scale(this.BaseIconSize) : this.BaseIconSize;
+        int gap = app != null ? app.Scale(this.IconGap) : this.IconGap;
+        int padX = app != null ? this.TrayPadX(app) : 12;
+        int padTop = app != null ? this.TrayPadTop(app) : 8;
+        int padBot = app != null ? this.TrayPadBottom(app) : 11;
+        tw = n > 0 ? (n * baseSz + (n - 1) * gap + padX * 2) : (app != null ? app.Scale(80) : 80);
+        th = baseSz + padTop + padBot;
+        tx = bx + (bw - tw) / 2;
+        ty = by + bh - th;
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || bw <= 0 || bh <= 0) { return null; }
-        if (x < bx || x >= bx + bw || y < by || y >= by + bh) { return null; }
         App host = this.FindApp();
-        int baseSz = host != null ? host.Scale(this.BaseIconSize) : this.BaseIconSize;
-        int trayH = baseSz + (host != null ? (this.TrayPadTop(host) + this.TrayPadBottom(host)) : 19);
-        int activeTop = by + bh - trayH;
+        int tx = 0; int ty = 0; int tw = 0; int th = 0;
+        this.TrayBoundsFallback(host, out tx, out ty, out tw, out th);
+        int activeTop = ty;
         if (this.pointerOver) {
+            int baseSz = host != null ? host.Scale(this.BaseIconSize) : this.BaseIconSize;
             int extra = (int)((float)baseSz * (this.MaxScale - 1.0f) + 0.5f)
                 + (host != null ? host.Scale(this.LiftPx) : this.LiftPx);
-            activeTop = activeTop - extra;
+            activeTop = ty - extra;
         }
-        if (y < activeTop) { return null; }
+        if (x < tx || x >= tx + tw || y < activeTop || y >= ty + th) { return null; }
         return this;
     }
 
@@ -461,10 +496,12 @@ public class Dock : Control {
                 int iy = this.drawY[this.lastTooltipIdx];
                 int isz = this.drawS[this.lastTooltipIdx];
                 int tx = ix + (isz - pw) / 2;
-                if (tx < bx + 2) { tx = bx + 2; }
-                if (tx + pw > bx + bw - 2) { tx = bx + bw - 2 - pw; }
+                int minX = 2;
+                int maxX = app.canvas != null ? (app.canvas.Width() - 2 - pw) : (bx + bw - 2 - pw);
+                if (tx < minX) { tx = minX; }
+                if (tx > maxX) { tx = maxX; }
                 int ty = iy - ph - app.Scale(8);
-                if (ty < by + 2) { ty = by + 2; }
+                if (ty < 2) { ty = 2; }
                 int tipOp = (int)(this.tooltipAlpha * 1000.0f + 0.5f);
                 tipStyle.opacity = tipOp;
                 tipStyle.Paint(app, tx, ty, pw, ph);
@@ -474,7 +511,21 @@ public class Dock : Control {
         }
 
         if (this.animating) {
-            app.RequestAnimationFrameIn(bx, by, bw, bh);
+            // 脏区需包含鱼眼放大、轻跳与名称胶囊向 trayY 上方的溢出范围以及托盘阴影，
+            // 避免放大/回落时上方内容区残留拖影。
+            int head = this.HeadroomPx(app) + app.Scale(18);
+            int padS = app.Scale(20);
+            int dy = trayY - head;
+            if (dy < 0) { dy = 0; }
+            int dx = trayX - padS;
+            if (dx < 0) { dx = 0; }
+            int maxW = app.canvas != null ? app.canvas.Width() : (bx + bw);
+            int maxH = app.canvas != null ? app.canvas.Height() : (by + bh);
+            int dx2 = trayX + trayW + padS;
+            if (dx2 > maxW) { dx2 = maxW; }
+            int dy2 = trayY + trayH + padS;
+            if (dy2 > maxH) { dy2 = maxH; }
+            app.RequestAnimationFrameIn(dx, dy, dx2 - dx, dy2 - dy);
         }
     }
 }
