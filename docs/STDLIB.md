@@ -157,7 +157,7 @@ stdlib/
 │   ├── Text/                        # System.Text
 │   │   └── Encoding.zan             # UTF-8/16/32 编码解码
 │   │
-│   └── Threading/                   # System.Threading 并发基石（Channel, TaskCompletionSource, CancellationToken, AsyncGate, Mutex, RwLock 等）
+│   └── Threading/                   # System.Threading 并发基石（Channel, TaskCompletionSource, CancellationToken, AsyncGate, AsyncRwLock, Mutex, RwLock 等）
 
 packages/                            # 独立拆解的高性能可复用包生态
 ├── Zan.Configuration/               # 配置提供程序体系（IConfiguration, ConfigurationBuilder, JsonFile, EnvFile 等）
@@ -722,7 +722,10 @@ awaitable: `SetResult` / `TrySetResult`, `SetException` / `TrySetException`,
 `AtomicInt`, `SharedTable`, `BlockingQueue<T>`, `ThreadLocal<T>`, `Thread`,
 `Timer`, `TaskScheduler`, and `AsyncRuntime` (`SetWorkers` / `SetIoShards` /
 `SetSyncFast`). The M:N work-stealing scheduler is turned on with
-`ZAN_SCHED_WORKERS`.
+`ZAN_SCHED_WORKERS`. Never hold an OS `Mutex` (`Mutex.Lock` / `WaitOne`) across
+an `await` point (a coroutine may resume on another OS thread, causing deadlock
+or cross-thread unlock UB); use `AsyncRwLock` (`EnterRead`/`EnterWrite`) or
+`AsyncGate` for coroutine-safe synchronization across `await`.
 
 `Span<T>` / `ReadOnlySpan<T>` are compiler-builtin slice structs (pointer +
 length) rather than library types — they are the only zero-copy view over
