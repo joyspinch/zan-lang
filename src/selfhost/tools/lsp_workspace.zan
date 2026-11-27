@@ -870,6 +870,10 @@ public partial class LspServer {
             string b = ShortTypeName(d.sval2);
             if (b != "" && !target.BaseTypes.Contains(b)) { target.BaseTypes.Add(b); }
         }
+        if (d.type != null) {
+            string rb = FormatTypeRef(d.type);
+            if (rb != "" && !target.RawBaseTypes.Contains(rb)) { target.RawBaseTypes.Add(rb); }
+        }
         if (d.interfaces != null) {
             int k = 0;
             while (k < d.interfaces.Count) {
@@ -878,6 +882,211 @@ public partial class LspServer {
                 k = k + 1;
             }
         }
+        if (d.interfaceRefs != null) {
+            int k2 = 0;
+            while (k2 < d.interfaceRefs.Count) {
+                string rawItf = FormatTypeRef(d.interfaceRefs[k2]);
+                if (rawItf != "" && !target.RawBaseTypes.Contains(rawItf)) { target.RawBaseTypes.Add(rawItf); }
+                k2 = k2 + 1;
+            }
+        }
+        int tpi = 0;
+        while (tpi < d.kids.Count) {
+            Node tp = d.kids[tpi];
+            if (tp.kind == AK.TypeParam() && tp.sval != null && tp.sval != ""
+                    && !target.TypeParams.Contains(tp.sval)) {
+                target.TypeParams.Add(tp.sval);
+            }
+            tpi = tpi + 1;
+        }
+    }
+
+    static string TrimAscii(string s) {
+        if (s == null || s == "") { return ""; }
+        int a = 0;
+        int b = s.Length;
+        while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) { a = a + 1; }
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+
+    static List<string> SplitTypeArgs(string typeExpr) {
+        List<string> args = new List<string>();
+        if (typeExpr == null || typeExpr == "") { return args; }
+        int lt = typeExpr.IndexOf("<");
+        if (lt < 0) { return args; }
+        int depth = 0;
+        int start = lt + 1;
+        int i = lt;
+        while (i < typeExpr.Length) {
+            char ch = typeExpr[i];
+            if (ch == '<') {
+                depth = depth + 1;
+            } else if (ch == '>') {
+                depth = depth - 1;
+                if (depth == 0) {
+                    string part = TrimAscii(typeExpr.Substring(start, i - start));
+                    if (part != "") { args.Add(part); }
+                    break;
+                }
+            } else if (ch == ',' && depth == 1) {
+                string part = TrimAscii(typeExpr.Substring(start, i - start));
+                if (part != "") { args.Add(part); }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return args;
+    }
+
+    static string SubstituteTypeArgs(string typeExpr, List<string> typeParams, List<string> typeArgs) {
+        if (typeExpr == null || typeExpr == "" || typeParams == null || typeArgs == null
+                || typeParams.Count == 0 || typeArgs.Count == 0) {
+            return typeExpr != null ? typeExpr : "";
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = typeExpr.Length;
+        while (i < n) {
+            if (IsWordChar(typeExpr[i])) {
+                int start = i;
+                while (i < n && IsWordChar(typeExpr[i])) { i = i + 1; }
+                string tok = typeExpr.Substring(start, i - start);
+                string repl = tok;
+                int pi = 0;
+                while (pi < typeParams.Count && pi < typeArgs.Count) {
+                    if (typeParams[pi] == tok) {
+                        repl = typeArgs[pi];
+                        break;
+                    }
+                    pi = pi + 1;
+                }
+                sb.Append(repl);
+            } else {
+                sb.Append(typeExpr[i]);
+                i = i + 1;
+            }
+        }
+        return sb.ToString();
+    }
+
+    static List<string> TypeParamsOf(List<LspSymbol> pool, string shortName) {
+        List<string> res = new List<string>();
+        if (shortName == null || shortName == "") { return res; }
+        int i = 0;
+        while (i < pool.Count) {
+            LspSymbol s = pool[i];
+            if (IsTypeSymbolKind(s.Kind) && s.Name == shortName && s.TypeParams.Count > 0) {
+                int pi = 0;
+                while (pi < s.TypeParams.Count) {
+                    if (!res.Contains(s.TypeParams[pi])) { res.Add(s.TypeParams[pi]); }
+                    pi = pi + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return res;
+    }
+
+    static List<string> TypeAncestorExprs(List<LspSymbol> pool, string typeExpr) {
+        List<string> chain = new List<string>();
+        string clean = TrimAscii(typeExpr);
+        string startShort = ShortTypeName(clean);
+        if (startShort == "") { return chain; }
+        Dictionary<string, bool> visited = new Dictionary<string, bool>();
+        visited[startShort] = true;
+        chain.Add(clean);
+        int head = 0;
+        while (head < chain.Count) {
+            string curExpr = chain[head];
+            head = head + 1;
+            string curShort = ShortTypeName(curExpr);
+            List<string> curArgs = SplitTypeArgs(curExpr);
+            List<string> curParams = TypeParamsOf(pool, curShort);
+            int i = 0;
+            while (i < pool.Count) {
+                LspSymbol s = pool[i];
+                if (IsTypeSymbolKind(s.Kind) && s.Name == curShort) {
+                    List<string> bases = s.RawBaseTypes.Count > 0 ? s.RawBaseTypes : s.BaseTypes;
+                    int bi = 0;
+                    while (bi < bases.Count) {
+                        string nextExpr = SubstituteTypeArgs(bases[bi], curParams, curArgs);
+                        string nextShort = ShortTypeName(nextExpr);
+                        if (nextShort != "" && !visited.ContainsKey(nextShort)) {
+                            visited[nextShort] = true;
+                            chain.Add(nextExpr);
+                        }
+                        bi = bi + 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return chain;
+    }
+
+    static string ResolveMemberReturnType(List<LspSymbol> pool, string ownerTypeExpr,
+            string memberName, bool isCall, int callArgCount) {
+        if (ownerTypeExpr == null || ownerTypeExpr == "" || memberName == null || memberName == "") {
+            return "";
+        }
+        List<string> anc = TypeAncestorExprs(pool, ownerTypeExpr);
+        int ai = 0;
+        while (ai < anc.Count) {
+            string ancExpr = anc[ai];
+            string ownerName = ShortTypeName(ancExpr);
+            List<string> ownerArgs = SplitTypeArgs(ancExpr);
+            List<string> ownerParams = TypeParamsOf(pool, ownerName);
+            if (!isCall) {
+                int ti = 0;
+                while (ti < pool.Count) {
+                    LspSymbol ts = pool[ti];
+                    if (IsTypeSymbolKind(ts.Kind) && ts.ContainerName == ownerName && ts.Name == memberName) {
+                        return ts.Name;
+                    }
+                    ti = ti + 1;
+                }
+            }
+            if (isCall) {
+                LspSymbol fallback = null;
+                int mi = 0;
+                while (mi < pool.Count) {
+                    LspSymbol ms = pool[mi];
+                    if (ms.Kind == LspSymbol.KindMethod() && ms.ContainerName == ownerName
+                            && ms.Name == memberName && ms.TypeName != "") {
+                        if (callArgCount >= 0 && ms.ParamNames.Count == callArgCount) {
+                            return SubstituteTypeArgs(ms.TypeName, ownerParams, ownerArgs);
+                        }
+                        if (fallback == null) { fallback = ms; }
+                    }
+                    mi = mi + 1;
+                }
+                if (fallback != null) {
+                    return SubstituteTypeArgs(fallback.TypeName, ownerParams, ownerArgs);
+                }
+            } else {
+                LspSymbol getterFallback = null;
+                int fi = 0;
+                while (fi < pool.Count) {
+                    LspSymbol fs = pool[fi];
+                    if (fs.ContainerName == ownerName && fs.TypeName != "") {
+                        if (fs.Kind == LspSymbol.KindField() && fs.Name == memberName) {
+                            return SubstituteTypeArgs(fs.TypeName, ownerParams, ownerArgs);
+                        }
+                        if (fs.Kind == LspSymbol.KindMethod() && fs.Name == "get_" + memberName
+                                && getterFallback == null) {
+                            getterFallback = fs;
+                        }
+                    }
+                    fi = fi + 1;
+                }
+                if (getterFallback != null) {
+                    return SubstituteTypeArgs(getterFallback.TypeName, ownerParams, ownerArgs);
+                }
+            }
+            ai = ai + 1;
+        }
+        return "";
     }
 
     static List<string> TypeAncestors(List<LspSymbol> pool, string typeName) {
@@ -1211,6 +1420,48 @@ public partial class LspServer {
         return fallbackAny;
     }
 
+    static int SkipBalancedBackward(string text, int closeIdx, char openCh, char closeCh) {
+        if (closeIdx < 0 || text[closeIdx] != closeCh) { return closeIdx; }
+        int depth = 1;
+        int p = closeIdx - 1;
+        while (p >= 0 && depth > 0) {
+            char ch = text[p];
+            if (ch == '"' || ch == '\'') {
+                char q = ch;
+                p = p - 1;
+                while (p >= 0) {
+                    if (text[p] == q && (p == 0 || text[p - 1] != '\\')) { break; }
+                    p = p - 1;
+                }
+                p = p - 1;
+                continue;
+            }
+            if (ch == closeCh) { depth = depth + 1; }
+            else if (ch == openCh) { depth = depth - 1; }
+            p = p - 1;
+        }
+        return depth == 0 ? p : -2;
+    }
+
+    static bool IsTypeArgChar(char ch) {
+        return IsWordChar(ch) || ch == ' ' || ch == '\t' || ch == ',' || ch == '.'
+            || ch == '<' || ch == '>' || ch == '[' || ch == ']' || ch == '?';
+    }
+
+    static int SkipGenericBackward(string text, int closeIdx) {
+        if (closeIdx < 0 || text[closeIdx] != '>') { return -2; }
+        int depth = 1;
+        int p = closeIdx - 1;
+        while (p >= 0 && depth > 0) {
+            char ch = text[p];
+            if (!IsTypeArgChar(ch)) { return -2; }
+            if (ch == '>') { depth = depth + 1; }
+            else if (ch == '<') { depth = depth - 1; }
+            p = p - 1;
+        }
+        return depth == 0 ? p : -2;
+    }
+
     static string DotReceiverBeforeOffset(string text, int offset) {
         if (text == null || offset <= 0 || offset > text.Length) { return ""; }
         int p = offset - 1;
@@ -1218,10 +1469,56 @@ public partial class LspServer {
         if (p < 0 || text[p] != '.') { return ""; }
         p = p - 1;
         while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
-        if (p < 0 || !IsWordChar(text[p])) { return ""; }
-        int end = p + 1;
-        while (p >= 0 && IsWordChar(text[p])) { p = p - 1; }
-        return text.Substring(p + 1, end - p - 1);
+        if (p < 0) { return ""; }
+        int chainEnd = p + 1;
+        int chainStart = chainEnd;
+        bool parsedAny = false;
+        while (p >= 0) {
+            while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
+            if (p < 0) { break; }
+            bool hadCallOrIndex = false;
+            while (p >= 0) {
+                if (text[p] == ')') {
+                    int np = SkipBalancedBackward(text, p, '(', ')');
+                    if (np < -1) { return ""; }
+                    p = np;
+                    hadCallOrIndex = true;
+                } else if (text[p] == ']') {
+                    int np = SkipBalancedBackward(text, p, '[', ']');
+                    if (np < -1) { return ""; }
+                    p = np;
+                    hadCallOrIndex = true;
+                } else {
+                    break;
+                }
+                while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
+            }
+            if (p >= 0 && text[p] == '>' && (hadCallOrIndex || !parsedAny)) {
+                int np = SkipGenericBackward(text, p);
+                if (np >= -1) {
+                    p = np;
+                    while (p >= 0 && (text[p] == ' ' || text[p] == '\t')) { p = p - 1; }
+                }
+            }
+            if (p < 0 || !IsWordChar(text[p])) { break; }
+            while (p >= 0 && IsWordChar(text[p])) { p = p - 1; }
+            chainStart = p + 1;
+            parsedAny = true;
+            int q = p;
+            while (q >= 0 && (text[q] == ' ' || text[q] == '\t')) { q = q - 1; }
+            if (q >= 0 && text[q] == '.') {
+                p = q - 1;
+                continue;
+            }
+            // Include leading `new ` for `new Box<Service>().`
+            if (q >= 2 && text.Substring(q - 2, 3) == "new"
+                    && (q - 3 < 0 || !IsWordChar(text[q - 3])) && q < p) {
+                chainStart = q - 2;
+            }
+            break;
+        }
+        if (!parsedAny || chainStart >= chainEnd) { return ""; }
+        return TrimAscii(text.Substring(chainStart, chainEnd - chainStart));
     }
 
     static string DotReceiverForWord(string text, int line0, int byteCol0) {
@@ -1247,6 +1544,162 @@ public partial class LspServer {
             || kind == LspSymbol.KindStruct() || kind == LspSymbol.KindEnum();
     }
 
+    static List<string> SplitChainSegments(string expr) {
+        List<string> segs = new List<string>();
+        if (expr == null || expr == "") { return segs; }
+        int depth = 0;
+        int angle = 0;
+        int start = 0;
+        int i = 0;
+        int n = expr.Length;
+        while (i < n) {
+            char ch = expr[i];
+            if (ch == '"' || ch == '\'') {
+                char q = ch;
+                i = i + 1;
+                while (i < n && expr[i] != q) {
+                    if (expr[i] == '\\' && i + 1 < n) { i = i + 1; }
+                    i = i + 1;
+                }
+                if (i < n) { i = i + 1; }
+                continue;
+            }
+            if (ch == '(' || ch == '[' || ch == '{') { depth = depth + 1; }
+            else if (ch == ')' || ch == ']' || ch == '}') { if (depth > 0) { depth = depth - 1; } }
+            else if (ch == '<' && depth == 0) { angle = angle + 1; }
+            else if (ch == '>' && depth == 0 && angle > 0) { angle = angle - 1; }
+            else if (ch == '.' && depth == 0 && angle == 0) {
+                string part = TrimAscii(expr.Substring(start, i - start));
+                if (part != "") { segs.Add(part); }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        string tail = TrimAscii(expr.Substring(start, n - start));
+        if (tail != "") { segs.Add(tail); }
+        return segs;
+    }
+
+    static string SegmentName(string seg) {
+        if (seg == null || seg == "") { return ""; }
+        int i = 0;
+        while (i < seg.Length && IsWordChar(seg[i])) { i = i + 1; }
+        return seg.Substring(0, i);
+    }
+
+    static int SegmentCallArgCount(string seg) {
+        if (seg == null || seg == "") { return -1; }
+        int i = 0;
+        while (i < seg.Length && IsWordChar(seg[i])) { i = i + 1; }
+        while (i < seg.Length && (seg[i] == ' ' || seg[i] == '\t')) { i = i + 1; }
+        if (i < seg.Length && seg[i] == '<') {
+            int depth = 1;
+            i = i + 1;
+            while (i < seg.Length && depth > 0) {
+                if (seg[i] == '<') { depth = depth + 1; }
+                else if (seg[i] == '>') { depth = depth - 1; }
+                i = i + 1;
+            }
+            while (i < seg.Length && (seg[i] == ' ' || seg[i] == '\t')) { i = i + 1; }
+        }
+        if (i < seg.Length && seg[i] == '(') {
+            return CountCallArgs(seg, i);
+        }
+        return -1;
+    }
+
+    static string TokenDisplayText(Token t) {
+        if (t == null) { return ""; }
+        if (t.text != null && t.text != "") { return t.text; }
+        int k = t.kind;
+        if (k == TK.Dot()) { return "."; }
+        if (k == TK.Comma()) { return ", "; }
+        if (k == TK.Less()) { return "<"; }
+        if (k == TK.Greater()) { return ">"; }
+        if (k == TK.LParen()) { return "("; }
+        if (k == TK.RParen()) { return ")"; }
+        if (k == TK.LBracket()) { return "["; }
+        if (k == TK.RBracket()) { return "]"; }
+        if (k == TK.Question()) { return "?"; }
+        if (k == TK.This()) { return "this"; }
+        if (k == TK.Base()) { return "base"; }
+        if (k == TK.New()) { return "new "; }
+        if (k == TK.Int()) { return "int"; }
+        if (k == TK.Long()) { return "long"; }
+        if (k == TK.String()) { return "string"; }
+        if (k == TK.Bool()) { return "bool"; }
+        if (k == TK.Double()) { return "double"; }
+        if (k == TK.Float()) { return "float"; }
+        if (k == TK.Char()) { return "char"; }
+        if (k == TK.Byte()) { return "byte"; }
+        if (k == TK.Short()) { return "short"; }
+        if (k == TK.Uint()) { return "uint"; }
+        if (k == TK.Ulong()) { return "ulong"; }
+        if (k == TK.Ushort()) { return "ushort"; }
+        if (k == TK.Sbyte()) { return "sbyte"; }
+        if (k == TK.Decimal()) { return "decimal"; }
+        if (k == TK.Nint()) { return "nint"; }
+        if (k == TK.Object()) { return "object"; }
+        if (k == TK.Void()) { return "void"; }
+        if (k == TK.True()) { return "true"; }
+        if (k == TK.False()) { return "false"; }
+        if (k == TK.Null()) { return "null"; }
+        return "";
+    }
+
+    static string FormatTypeRangeTokens(List<Token> toks, int startIdx, int endIdx) {
+        if (startIdx < 0 || endIdx < startIdx || endIdx >= toks.Count) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int i = startIdx;
+        while (i <= endIdx) {
+            sb.Append(TokenDisplayText(toks[i]));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string ExtractNewTypeFromTokens(List<Token> toks, int typeStart) {
+        if (typeStart < 0 || typeStart >= toks.Count || toks[typeStart].kind != TK.Ident()) { return ""; }
+        int end = typeStart;
+        while (end + 2 < toks.Count && toks[end + 1].kind == TK.Dot()
+                && toks[end + 2].kind == TK.Ident()) {
+            end = end + 2;
+        }
+        int baseStart = end;
+        if (end + 1 < toks.Count && toks[end + 1].kind == TK.Less()) {
+            int depth = 1;
+            int p = end + 2;
+            while (p < toks.Count && depth > 0) {
+                if (toks[p].kind == TK.Less()) { depth = depth + 1; }
+                else if (toks[p].kind == TK.Greater()) { depth = depth - 1; }
+                if (depth == 0) {
+                    end = p;
+                    break;
+                }
+                p = p + 1;
+            }
+        }
+        return FormatTypeRangeTokens(toks, baseStart, end);
+    }
+
+    static string ExtractExprUntilSemiTokens(List<Token> toks, int startIdx) {
+        if (startIdx < 0 || startIdx >= toks.Count) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        int i = startIdx;
+        while (i < toks.Count) {
+            int k = toks[i].kind;
+            if (depth == 0 && (k == TK.Semicolon() || k == TK.RBrace() || k == TK.Comma())) { break; }
+            if (k == TK.LParen() || k == TK.LBracket() || k == TK.LBrace()) { depth = depth + 1; }
+            else if (k == TK.RParen() || k == TK.RBracket() || k == TK.RBrace()) {
+                if (depth > 0) { depth = depth - 1; }
+            }
+            sb.Append(TokenDisplayText(toks[i]));
+            i = i + 1;
+        }
+        return TrimAscii(sb.ToString());
+    }
+
     static string ResolveReceiverType(LspDocument doc, string receiverName, int line0) {
         if (doc == null || receiverName == null || receiverName == "") { return ""; }
         List<LspSymbol> pool = ProjectSymbolsFor(doc);
@@ -1257,6 +1710,57 @@ public partial class LspServer {
 
     static string ResolveReceiverTypeInTokens(List<LspSymbol> pool, List<Token> toks,
             string text, string receiverName, int line0, string enclosingHint) {
+        return ResolveReceiverExprDepth(pool, toks, text, receiverName, line0, enclosingHint, 0);
+    }
+
+    static string ResolveReceiverExprDepth(List<LspSymbol> pool, List<Token> toks,
+            string text, string receiverExpr, int line0, string enclosingHint, int depth) {
+        if (receiverExpr == null || receiverExpr == "" || depth > 6) { return ""; }
+        string expr = TrimAscii(receiverExpr);
+        if (expr == "") { return ""; }
+        List<string> segs = SplitChainSegments(expr);
+        if (segs.Count == 0) { return ""; }
+
+        string curType = "";
+        string first = segs[0];
+        if (first.StartsWith("new ")) {
+            string rest = TrimAscii(first.Substring(4));
+            int lp = rest.IndexOf("(");
+            if (lp >= 0) { rest = TrimAscii(rest.Substring(0, lp)); }
+            curType = rest;
+        } else {
+            string seg0Name = SegmentName(first);
+            int seg0Args = SegmentCallArgCount(first);
+            if (seg0Args >= 0) {
+                string enc = enclosingHint != "" ? enclosingHint : EnclosingTypeInText(text, line0);
+                if (enc != "") {
+                    curType = ResolveMemberReturnType(pool, enc, seg0Name, true, seg0Args);
+                }
+                if (curType == "") {
+                    LspSymbol csym = FindCallableSymbol(pool, seg0Name, "", seg0Args);
+                    if (csym != null && csym.TypeName != "") { curType = csym.TypeName; }
+                }
+            } else {
+                curType = ResolveSingleIdentTypeInTokens(pool, toks, text, seg0Name, line0, enclosingHint, depth);
+            }
+        }
+        if (curType == "") { return ""; }
+
+        int si = 1;
+        while (si < segs.Count) {
+            string seg = segs[si];
+            string mName = SegmentName(seg);
+            int mArgs = SegmentCallArgCount(seg);
+            if (mName == "") { return ""; }
+            curType = ResolveMemberReturnType(pool, curType, mName, mArgs >= 0, mArgs);
+            if (curType == "") { return ""; }
+            si = si + 1;
+        }
+        return curType;
+    }
+
+    static string ResolveSingleIdentTypeInTokens(List<LspSymbol> pool, List<Token> toks,
+            string text, string receiverName, int line0, string enclosingHint, int depth) {
         if (receiverName == null || receiverName == "") { return ""; }
         if (receiverName == "this") {
             return enclosingHint != "" ? enclosingHint : EnclosingTypeInText(text, line0);
@@ -1264,7 +1768,7 @@ public partial class LspServer {
         if (receiverName == "base") {
             string enc = enclosingHint != "" ? enclosingHint : EnclosingTypeInText(text, line0);
             if (enc != "") {
-                List<string> chain = TypeAncestors(pool, enc);
+                List<string> chain = TypeAncestorExprs(pool, enc);
                 if (chain.Count > 1) { return chain[1]; }
             }
             return "";
@@ -1277,41 +1781,49 @@ public partial class LspServer {
             }
             ti = ti + 1;
         }
-        // Scan file tokens for `TypeName receiverName` or `var receiverName = new TypeName(...)`.
+        // Scan file tokens for `TypeName<Args> receiverName` or `var receiverName = ...`.
         string found = "";
         int i2 = 0;
         while (i2 < toks.Count) {
             if (toks[i2].kind == TK.Ident() && toks[i2].text == receiverName) {
                 if (i2 > 0 && toks[i2 - 1].kind == TK.Var()) {
-                    if (i2 + 3 < toks.Count && toks[i2 + 1].kind == TK.Eq()
-                            && toks[i2 + 2].kind == TK.New()
-                            && toks[i2 + 3].kind == TK.Ident()) {
-                        int nt = i2 + 3;
-                        while (nt + 2 < toks.Count && toks[nt + 1].kind == TK.Dot()
-                                && toks[nt + 2].kind == TK.Ident()) {
-                            nt = nt + 2;
+                    if (i2 + 2 < toks.Count && toks[i2 + 1].kind == TK.Eq()) {
+                        string candidate = "";
+                        if (i2 + 3 < toks.Count && toks[i2 + 2].kind == TK.New()
+                                && toks[i2 + 3].kind == TK.Ident()) {
+                            candidate = ExtractNewTypeFromTokens(toks, i2 + 3);
+                        } else if (depth < 5) {
+                            string rhs = ExtractExprUntilSemiTokens(toks, i2 + 2);
+                            if (rhs != "" && rhs != receiverName) {
+                                candidate = ResolveReceiverExprDepth(pool, toks, text, rhs,
+                                    toks[i2].line - 1, enclosingHint, depth + 1);
+                            }
                         }
-                        found = toks[nt].text;
+                        if (candidate != "" && (toks[i2].line - 1 <= line0 || found == "")) {
+                            found = candidate;
+                        }
                     }
                 } else if (i2 > 0) {
                     int prev = i2 - 1;
-                    // Skip array/generic suffix such as `Service[]` or `List<Service>`.
+                    int typeEnd = prev;
+                    // Skip array suffix `[]` (keep generic `<...>` in typeEnd).
                     if (toks[prev].kind == TK.RBracket()) {
                         while (prev > 0 && toks[prev].kind != TK.LBracket()) { prev = prev - 1; }
                         if (prev > 0) { prev = prev - 1; }
+                        typeEnd = prev;
                     }
                     if (prev >= 0 && toks[prev].kind == TK.Greater()) {
-                        int depth = 1;
+                        int gdepth = 1;
                         prev = prev - 1;
-                        while (prev > 0 && depth > 0) {
-                            if (toks[prev].kind == TK.Greater()) { depth = depth + 1; }
-                            else if (toks[prev].kind == TK.Less()) { depth = depth - 1; }
+                        while (prev > 0 && gdepth > 0) {
+                            if (toks[prev].kind == TK.Greater()) { gdepth = gdepth + 1; }
+                            else if (toks[prev].kind == TK.Less()) { gdepth = gdepth - 1; }
                             prev = prev - 1;
                         }
                     }
                     if (prev >= 0 && toks[prev].kind == TK.Ident()
                             && !IsKeywordWord(toks[prev].text)) {
-                        string candidate = toks[prev].text;
+                        string candidate = FormatTypeRangeTokens(toks, prev, typeEnd);
                         if (toks[i2].line - 1 <= line0 || found == "") {
                             found = candidate;
                         }
@@ -1320,30 +1832,18 @@ public partial class LspServer {
             }
             i2 = i2 + 1;
         }
-        if (found != "") { return ShortTypeName(found); }
+        if (found != "") { return found; }
         // Fallback: field with matching name in enclosing hierarchy first, then project.
         string encOwner = enclosingHint != "" ? enclosingHint : EnclosingTypeInText(text, line0);
         if (encOwner != "") {
-            List<string> chain = TypeAncestors(pool, encOwner);
-            int ci = 0;
-            while (ci < chain.Count) {
-                int fi = 0;
-                while (fi < pool.Count) {
-                    LspSymbol s = pool[fi];
-                    if (s.Kind == LspSymbol.KindField() && s.ContainerName == chain[ci]
-                            && s.Name == receiverName && s.TypeName != "") {
-                        return ShortTypeName(s.TypeName);
-                    }
-                    fi = fi + 1;
-                }
-                ci = ci + 1;
-            }
+            string fty = ResolveMemberReturnType(pool, encOwner, receiverName, false, -1);
+            if (fty != "") { return fty; }
         }
         int fi2 = 0;
         while (fi2 < pool.Count) {
             LspSymbol s = pool[fi2];
             if (s.Kind == LspSymbol.KindField() && s.Name == receiverName && s.TypeName != "") {
-                return ShortTypeName(s.TypeName);
+                return s.TypeName;
             }
             fi2 = fi2 + 1;
         }
@@ -1383,6 +1883,59 @@ public partial class LspServer {
             i = i + 1;
         }
         return count;
+    }
+
+    static string ExtractReceiverChainBeforeDot(List<Token> toks, int dotIdx) {
+        if (dotIdx <= 0 || dotIdx >= toks.Count || toks[dotIdx].kind != TK.Dot()) { return ""; }
+        int endIdx = dotIdx - 1;
+        int p = endIdx;
+        int startIdx = endIdx + 1;
+        while (p >= 0) {
+            bool hadParen = false;
+            while (p >= 0 && (toks[p].kind == TK.RParen() || toks[p].kind == TK.RBracket())) {
+                int openKind = toks[p].kind == TK.RParen() ? TK.LParen() : TK.LBracket();
+                int closeKind = toks[p].kind;
+                int depth = 1;
+                p = p - 1;
+                while (p >= 0 && depth > 0) {
+                    if (toks[p].kind == closeKind) { depth = depth + 1; }
+                    else if (toks[p].kind == openKind) { depth = depth - 1; }
+                    p = p - 1;
+                }
+                if (depth != 0) { return ""; }
+                hadParen = true;
+            }
+            if (p >= 0 && toks[p].kind == TK.Greater() && hadParen) {
+                int gdepth = 1;
+                p = p - 1;
+                while (p >= 0 && gdepth > 0) {
+                    if (toks[p].kind == TK.Greater()) { gdepth = gdepth + 1; }
+                    else if (toks[p].kind == TK.Less()) { gdepth = gdepth - 1; }
+                    p = p - 1;
+                }
+                if (gdepth != 0) { return ""; }
+            }
+            if (p < 0) { break; }
+            int pk = toks[p].kind;
+            if (pk != TK.Ident() && pk != TK.This() && pk != TK.Base()) { break; }
+            startIdx = p;
+            if (p > 0 && toks[p - 1].kind == TK.Dot()) {
+                p = p - 2;
+                continue;
+            }
+            if (p > 0 && toks[p - 1].kind == TK.New()) {
+                startIdx = p - 1;
+            }
+            break;
+        }
+        if (startIdx > endIdx) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int k = startIdx;
+        while (k <= endIdx) {
+            sb.Append(TokenDisplayText(toks[k]));
+            k = k + 1;
+        }
+        return sb.ToString();
     }
 
     static List<LspPos> FindSemanticFileHits(LspDocument activeDoc, LspDiskFile file,
@@ -1439,16 +1992,12 @@ public partial class LspServer {
 
                 if (isMemberTarget) {
                     if (afterDot) {
-                        string recv = "";
-                        if (i >= 2) {
-                            if (toks[i - 2].kind == TK.This()) { recv = "this"; }
-                            else if (toks[i - 2].kind == TK.Base()) { recv = "base"; }
-                            else if (toks[i - 2].kind == TK.Ident()) { recv = toks[i - 2].text; }
-                        }
-                        string rType = recv != ""
-                            ? ResolveReceiverTypeInTokens(pool, toks, file.Text, recv, t.line - 1, encType)
+                        string recvChain = ExtractReceiverChainBeforeDot(toks, i - 1);
+                        string rType = recvChain != ""
+                            ? ResolveReceiverTypeInTokens(pool, toks, file.Text, recvChain, t.line - 1, encType)
                             : "";
-                        if (rType == "" || !family.ContainsKey(rType)) { keep = false; }
+                        string rShort = ShortTypeName(rType);
+                        if (rShort == "" || !family.ContainsKey(rShort)) { keep = false; }
                     } else {
                         if (encType == "" || !family.ContainsKey(encType)) { keep = false; }
                     }
@@ -1491,6 +2040,52 @@ public partial class LspServer {
             i = i + 1;
         }
         return outp;
+    }
+
+    static string SymbolDetailForReceiver(List<LspSymbol> pool, LspSymbol sym, string recvType) {
+        if (sym == null) { return ""; }
+        if (recvType == null || recvType == "" || sym.ContainerName == "") {
+            return SymbolDetail(sym);
+        }
+        List<string> anc = TypeAncestorExprs(pool, recvType);
+        List<string> tParams = new List<string>();
+        List<string> tArgs = new List<string>();
+        int ai = 0;
+        while (ai < anc.Count) {
+            if (ShortTypeName(anc[ai]) == sym.ContainerName) {
+                tParams = TypeParamsOf(pool, sym.ContainerName);
+                tArgs = SplitTypeArgs(anc[ai]);
+                break;
+            }
+            ai = ai + 1;
+        }
+        if (tParams.Count == 0 || tArgs.Count == 0) { return SymbolDetail(sym); }
+        if (sym.Kind == LspSymbol.KindField() && sym.TypeName != "") {
+            return SubstituteTypeArgs(sym.TypeName, tParams, tArgs) + " (" + sym.KindText() + ")";
+        }
+        if (sym.Kind == LspSymbol.KindMethod() || sym.Kind == LspSymbol.KindDelegate()) {
+            StringBuilder sb = new StringBuilder();
+            if (sym.TypeName != "") {
+                sb.Append(SubstituteTypeArgs(sym.TypeName, tParams, tArgs));
+                sb.Append(' ');
+            }
+            sb.Append(sym.Name);
+            sb.Append('(');
+            int pi = 0;
+            while (pi < sym.ParamNames.Count) {
+                if (pi > 0) { sb.Append(", "); }
+                string pt = pi < sym.ParamTypes.Count ? sym.ParamTypes[pi] : "";
+                if (pt != "") {
+                    sb.Append(SubstituteTypeArgs(pt, tParams, tArgs));
+                    sb.Append(' ');
+                }
+                sb.Append(sym.ParamNames[pi]);
+                pi = pi + 1;
+            }
+            sb.Append(')');
+            return sb.ToString();
+        }
+        return SymbolDetail(sym);
     }
 
     static string FormatSignatureLabel(LspSymbol sym) {

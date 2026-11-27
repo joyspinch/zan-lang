@@ -824,6 +824,178 @@ def check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expe
     expect_diag(caller, 5, set())
     pkg_file.unlink()
 
+    # 11. Fine-grained private/protected visibility diagnostics (E2002/E2003 parity with C host)
+    vis_uri = (workspace / "app/src/VisibilityCheck.zan").as_uri()
+    vis_ok_text = (
+        "namespace App;\n"
+        "class Vault {\n"
+        "    private int secret;\n"
+        "    protected int guardVal;\n"
+        "    public int OpenVal;\n"
+        "    private int PeekSecret() { return secret; }\n"
+        "    protected int ReadGuard() { return guardVal; }\n"
+        "    public int SelfCheck() { return secret + PeekSecret() + guardVal + ReadGuard(); }\n"
+        "}\n"
+        "class SubVault : Vault {\n"
+        "    public int OkSub() { return guardVal + ReadGuard() + base.ReadGuard() + OpenVal; }\n"
+        "}\n"
+        "class Outsider {\n"
+        "    public int OkOut(Vault v) { return v.OpenVal; }\n"
+        "}\n"
+    )
+    open_doc(vis_uri, vis_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(vis_uri, 1, set())
+
+    vis_bad_text = (
+        "namespace App;\n"
+        "class Vault {\n"
+        "    private int secret;\n"
+        "    protected int guardVal;\n"
+        "    protected int subGuard;\n"
+        "    public int OpenVal;\n"
+        "    private int PeekSecret() { return secret; }\n"
+        "    private int PeekBase() { return secret; }\n"
+        "    protected int ReadGuard() { return guardVal; }\n"
+        "}\n"
+        "class SubVault : Vault {\n"
+        "    public int BadSub() { return secret + PeekSecret() + base.PeekBase(); }\n"
+        "}\n"
+        "class Outsider {\n"
+        "    public int BadOut(Vault v, SubVault sub) {\n"
+        "        return v.secret + v.PeekSecret() + v.guardVal + v.ReadGuard() + sub.subGuard;\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(vis_uri, 2, vis_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(vis_uri, 2, {
+        "'App.Vault.secret' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.PeekSecret' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.PeekBase' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.secret' is private and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.PeekSecret' is private and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.guardVal' is protected and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.ReadGuard' is protected and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.subGuard' is protected and cannot be accessed from 'App.Outsider'",
+    })
+    close_doc(vis_uri)
+    expect_diag(vis_uri, 2, set())
+    expect_diag(caller, 5, set())
+
+    # 12. Generic type-argument substitution & chained member/call navigation
+    gen_box_path = workspace / "app/src/GenBox.zan"
+    gen_box_uri = gen_box_path.as_uri()
+    gen_box_path.write_text(
+        "namespace App;\n"
+        "class GenService {\n"
+        "    public int Count;\n"
+        "    public int Read(int step) { return Count + step; }\n"
+        "}\n"
+        "class GenBox<T> {\n"
+        "    public T Value;\n"
+        "    public T Get() { return Value; }\n"
+        "}\n"
+        "class GenServiceBox : GenBox<GenService> {\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    gen_use_uri = (workspace / "app/src/GenUse.zan").as_uri()
+    gen_use_text = (
+        "namespace App;\n"
+        "class GenRunner {\n"
+        "    GenService GetService() { return new GenService(); }\n"
+        "    int Run(GenBox<GenService> box, GenServiceBox sbox) {\n"
+        "        var inferred = box.Get();\n"
+        "        int a = box.Value.Count;\n"
+        "        int b = box.Get().Read(7);\n"
+        "        int c = sbox.Value.Count;\n"
+        "        int d = GetService().Read(3);\n"
+        "        return a + b + c + d + inferred.Count;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(gen_use_uri, gen_use_text)
+    expect_diag(caller, 5, set())
+    expect_diag(gen_use_uri, 1, set())
+    glines = gen_use_text.splitlines()
+
+    # 12a. Completion on `box.` substitutes T -> GenService in detail
+    box_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 5, "character": glines[5].index("box.Value") + len("box.")},
+    }).get("result") or []
+    box_detail_map = {c["label"]: c.get("detail", "") for c in box_dot}
+    if "GenService" not in box_detail_map.get("Value", "") or "GenService Get()" not in box_detail_map.get("Get", ""):
+        fail("generic box dot completion detail", "expected substituted GenService details, got %r" % (box_detail_map,))
+
+    # 12b. Chained completions: box.Value., box.Get()., sbox.Value., GetService()., inferred.
+    chain_checks = [
+        ("box.Value.", 5, glines[5].index("box.Value.Count") + len("box.Value.")),
+        ("box.Get().", 6, glines[6].index("box.Get().Read") + len("box.Get().")),
+        ("sbox.Value.", 7, glines[7].index("sbox.Value.Count") + len("sbox.Value.")),
+        ("GetService().", 8, glines[8].index("GetService().Read") + len("GetService().")),
+        ("inferred.", 9, glines[9].index("inferred.Count") + len("inferred.")),
+    ]
+    for label, ln, ch in chain_checks:
+        comp = s.request("textDocument/completion", {
+            "textDocument": {"uri": gen_use_uri},
+            "position": {"line": ln, "character": ch},
+        }).get("result") or []
+        clabels = [c["label"] for c in comp]
+        if "Count" not in clabels or "Read" not in clabels:
+            fail("chained completion " + label, "expected Count/Read in %r" % (clabels,))
+
+    # 12c. Chained definitions jump to GenService.Count (line 2) and GenService.Read (line 3)
+    for label, ln, needle, want_line in [
+        ("box.Value.Count", 5, "box.Value.Count", 2),
+        ("box.Get().Read", 6, "box.Get().Read", 3),
+        ("sbox.Value.Count", 7, "sbox.Value.Count", 2),
+        ("GetService().Read", 8, "GetService().Read", 3),
+        ("inferred.Count", 9, "inferred.Count", 2),
+    ]:
+        col = glines[ln].index(needle) + len(needle) - 2
+        dres = s.request("textDocument/definition", {
+            "textDocument": {"uri": gen_use_uri},
+            "position": {"line": ln, "character": col},
+        }).get("result")
+        if not dres or dres["uri"] != gen_box_uri or dres["range"]["start"]["line"] != want_line:
+            fail("chained definition " + label, "expected %s:%d, got %r" % (gen_box_uri, want_line, dres))
+
+    # 12d. Chained signatureHelp + inlayHint on `box.Get().Read(7)`
+    sig_gen = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 6, "character": glines[6].index("7)")},
+    }).get("result")
+    if not sig_gen or sig_gen.get("activeParameter") != 0 \
+            or "int Read(int step)" not in [x.get("label") for x in sig_gen.get("signatures") or []]:
+        fail("chained generic signatureHelp", "unexpected signatureHelp: %r" % (sig_gen,))
+
+    gen_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": gen_use_uri},
+        "range": {"start": {"line": 6, "character": 0}, "end": {"line": 9, "character": 0}},
+    }).get("result") or []
+    gen_hint_labels = [h.get("label") for h in gen_hints]
+    if gen_hint_labels.count("step:") < 2:
+        fail("chained generic inlayHint", "expected >=2 step: hints, got %r" % (gen_hints,))
+
+    # 12e. Semantic references on `GenService.Read` includes chained calls `box.Get().Read(7)` & `GetService().Read(3)`
+    read_refs = s.request("textDocument/references", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 6, "character": glines[6].index("box.Get().Read") + len("box.Get().") + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    gen_use_ref_lines = sorted(r["range"]["start"]["line"] for r in read_refs if r["uri"] == gen_use_uri)
+    gen_box_ref_lines = sorted(r["range"]["start"]["line"] for r in read_refs if r["uri"] == gen_box_uri)
+    if gen_box_ref_lines != [3] or gen_use_ref_lines != [6, 8]:
+        fail("chained generic references", "expected GenBox:[3] + GenUse:[6,8], got box=%r use=%r" % (
+            gen_box_ref_lines, gen_use_ref_lines))
+
+    close_doc(gen_use_uri)
+    expect_diag(gen_use_uri, 1, set())
+    expect_diag(caller, 5, set())
+    gen_box_path.unlink()
+
     # Restore caller version/text expected by downstream manifest assertions
     helper_path.unlink()
     s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 3}]})

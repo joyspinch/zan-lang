@@ -53,6 +53,7 @@ public partial class Checker {
                                 // (InferType re-runs on one node many times)
     public int inCallArgs;
     bool workspaceDiagnostics;
+    bool lspMode;
 
     public Checker(Binder b, Diags d) {
         binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null; curTargetType = null;
@@ -62,6 +63,8 @@ public partial class Checker {
         scopeByRef = new List<Node>(); scopeLambdaDepth = new List<int>();
         lambdaDepth = 0;
         inCallArgs = 0;
+        workspaceDiagnostics = false;
+        lspMode = false;
     }
 
     public bool IsTreeLambda(Node n) {
@@ -97,33 +100,84 @@ public partial class Checker {
         }
         return ns;
     }
+    bool SameDeclaringType(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        if (a == b) { return true; }
+        string ans = a.nsName != null ? a.nsName : "";
+        string bns = b.nsName != null ? b.nsName : "";
+        return a.sval != "" && a.sval == b.sval && ans == bns;
+    }
     // The class along `cls`'s base chain that declares `name` (field, method
     // or property accessor); null when nobody does.
     Node OwnerUp(Node cls, string name) {
         Node c = cls;
         int cg = 0;
         while (c != null) {
-            if (binder.FindField(c, name) != null || binder.FindMethod(c, name) != null || binder.FindMethod(c, "get_" + name) != null) { return c; }
+            if (binder.FindField(c, name) != null || binder.FindMethod(c, name) != null
+                    || binder.FindMethod(c, "get_" + name) != null
+                    || binder.FindMethod(c, "set_" + name) != null) { return c; }
             c = binder.FindType(c.sval2);
             cg = cg + 1;
             if (cg > 512) { c = null; }
         }
         return null;
     }
+    // The class along `cls`'s base chain that owns exact member node `m`.
+    Node OwnerOfMember(Node cls, Node m) {
+        if (cls == null || m == null) { return null; }
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                if (c.kids[i] == m) { return c; }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        return OwnerUp(cls, m.sval);
+    }
+    string VisibilityMemberName(Node m) {
+        if (m == null || m.sval == null) { return ""; }
+        if ((m.sval.StartsWith("get_") || m.sval.StartsWith("set_")) && m.sval.Length > 4) {
+            return m.sval.Substring(4);
+        }
+        return m.sval;
+    }
     void CheckInternalAccess(Node cls, string name, Node at) {
         if (cls == null || curClass == null) { return; }
         Node owner = OwnerUp(cls, name);
-        if (owner == null || owner == curClass) { return; }
+        if (owner == null || SameDeclaringType(owner, curClass)) { return; }
         Node m = binder.FindField(owner, name);
         if (m == null) { m = binder.FindMethod(owner, name); }
         if (m == null) { m = binder.FindMethod(owner, "get_" + name); }
+        if (m == null) { m = binder.FindMethod(owner, "set_" + name); }
         CheckSelectedInternalAccess(owner, m, at);
     }
     // Overload resolution must check the selected declaration, never a second
     // name-only lookup which can choose a different overload's visibility.
     void CheckSelectedInternalAccess(Node owner, Node m, Node at) {
-        if (owner == null || curClass == null || owner == curClass) { return; }
-        if (m == null || !HasMod(m, MOD.Internal())) { return; }
+        if (owner == null || curClass == null || SameDeclaringType(owner, curClass)) { return; }
+        if (m == null) { return; }
+        if (lspMode) {
+            if (HasMod(m, MOD.Private())) {
+                diags.Error("'" + owner.sval + "." + VisibilityMemberName(m)
+                    + "' is private and cannot be accessed from '" + curClass.sval + "'",
+                    at.line, at.col);
+                return;
+            }
+            if (HasMod(m, MOD.Protected())) {
+                if (!DerivesFromName(curClass.sval, owner.sval)) {
+                    diags.Error("'" + owner.sval + "." + VisibilityMemberName(m)
+                        + "' is protected and cannot be accessed from '" + curClass.sval + "'",
+                        at.line, at.col);
+                }
+                return;
+            }
+        }
+        if (!HasMod(m, MOD.Internal())) { return; }
         string name = m.sval;
         string ons = owner.nsName != null ? owner.nsName : "";
         string cns = curClass.nsName != null ? curClass.nsName : "";
@@ -738,7 +792,9 @@ public partial class Checker {
         ResolvePartialBases(unit);
         ResolveLspInheritance(unit);
         workspaceDiagnostics = workspace;
+        lspMode = true;
         CheckClasses(unit);
+        lspMode = false;
         workspaceDiagnostics = false;
     }
 
