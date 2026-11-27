@@ -692,7 +692,8 @@ public class Deflate {
         int hashMask = hashSize - 1;
         int hashShift = 32 - hashBits;
         int[] head = new int[hashSize];
-        int[] prev = new int[n];
+        // 滑动窗口上限 32768：超过窗口的历史链节点必在 dist > 32768 时截断，prev 只需最多 32768 项。
+        int[] prev = new int[n > 32768 ? 32768 : n];
 
         int outPos = bitPos >> 3;
         int bitCnt = bitPos & 7;
@@ -701,7 +702,7 @@ public class Deflate {
         int pos = 0;
         while (pos < n) {
             int match = 0;
-            int matchLen = 0;
+            int matchLen = 2;
             // 在 pos 处查找最长匹配（3 字节 Knuth 乘法散列），一次计算同时用于查找和插入。
             if (pos + 2 < n) {
                 int b0 = src[pos] & 255;
@@ -710,44 +711,45 @@ public class Deflate {
                 uint key3 = (uint)((b0 << 16) | (b1 << 8) | b2);
                 int h = (int)((key3 * 506832829U) >> hashShift) & hashMask;
                 int cand = head[h];  // 从 1 开始的位置
-                prev[pos] = cand;
+                prev[pos & 32767] = cand;
                 head[h] = pos + 1;
                 byte p0 = (byte)b0;
                 byte p1 = (byte)b1;
+                byte p2 = (byte)b2;
                 int maxLBase = n - pos;
                 if (maxLBase > 258) { maxLBase = 258; }
-                for (int chain = 0; cand > 0 && chain < maxChain; chain = chain + 1) {
+                int minCand = pos - 32767;
+                if (minCand < 1) { minCand = 1; }
+                byte tailEnd = p2;
+                byte tailEndM1 = p1;
+                for (int chain = 0; cand >= minCand && chain < maxChain; chain = chain + 1) {
                     int c0 = cand - 1;
-                    int dist = pos - c0;
-                    if (dist > 32768) { break; }
-                    if (dist > 0) {
-                        // 首尾双剪枝：先验 matchLen 处字符与首 2 字节，最快过滤伪命中
-                        if (matchLen > 0 && matchLen < maxLBase && src[c0 + matchLen] != src[pos + matchLen]) {
-                            cand = prev[c0];
-                            continue;
-                        }
-                        if (src[c0] != p0 || src[c0 + 1] != p1) {
-                            cand = prev[c0];
-                            continue;
-                        }
-                        int l = 2;
-                        while (l + 4 <= maxLBase) {
-                            if (src[c0 + l] != src[pos + l] || src[c0 + l + 1] != src[pos + l + 1] ||
-                                src[c0 + l + 2] != src[pos + l + 2] || src[c0 + l + 3] != src[pos + l + 3]) {
-                                break;
-                            }
-                            l = l + 4;
-                        }
-                        while (l < maxLBase && src[c0 + l] == src[pos + l]) {
-                            l = l + 1;
-                        }
-                        if (l > matchLen) {
-                            matchLen = l;
-                            match = dist;
-                            if (l >= 258) { break; }
-                        }
+                    // 首尾精简剪枝：先验 matchLen 与 matchLen-1 处字符再验首 2 字节，最少边界检查
+                    if (src[c0 + matchLen] != tailEnd
+                        || src[c0 + matchLen - 1] != tailEndM1
+                        || src[c0] != p0 || src[c0 + 1] != p1) {
+                        cand = prev[c0 & 32767];
+                        continue;
                     }
-                    cand = prev[c0];
+                    int l = 2;
+                    while (l + 4 <= maxLBase) {
+                        if (src[c0 + l] != src[pos + l] || src[c0 + l + 1] != src[pos + l + 1] ||
+                            src[c0 + l + 2] != src[pos + l + 2] || src[c0 + l + 3] != src[pos + l + 3]) {
+                            break;
+                        }
+                        l = l + 4;
+                    }
+                    while (l < maxLBase && src[c0 + l] == src[pos + l]) {
+                        l = l + 1;
+                    }
+                    if (l > matchLen) {
+                        matchLen = l;
+                        match = pos - c0;
+                        if (l >= maxLBase) { break; }
+                        tailEnd = src[pos + matchLen];
+                        tailEndM1 = src[pos + matchLen - 1];
+                    }
+                    cand = prev[c0 & 32767];
                 }
             }
             if (matchLen >= 3 && match > 0) {

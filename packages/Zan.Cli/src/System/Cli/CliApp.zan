@@ -63,10 +63,57 @@ public class CliApp {
         return opt;
     }
 
+    // 同单元切片查找长选项（免跨单元调用与 Substring 分配）。
+    private static CliOption MatchLongOption(CliCommand cmd, string s, int start, int len) {
+        List<CliOption> opts = cmd.options;
+        int cnt = opts.Count;
+        if (cnt == 0) { return null; }
+        int first = len > 0 ? (s[start] & 255) : -1;
+        for (int i = 0; i < cnt; i = i + 1) {
+            CliOption o = opts[i];
+            if (o.positional) { continue; }
+            string on = o.name;
+            if (on.Length != len) { continue; }
+            if (len == 0) { return o; }
+            if ((on[0] & 255) != first) { continue; }
+            bool eq = true;
+            for (int k = 1; k < len; k = k + 1) {
+                if ((on[k] & 255) != (s[start + k] & 255)) { eq = false; break; }
+            }
+            if (eq) { return o; }
+        }
+        return null;
+    }
+
+    // 同单元单字节短选项查找（O(1) ASCII 查表，免 1 字符 Substring 与跨单元调用）。
+    private static CliOption MatchShortOption(CliCommand cmd, int ch) {
+        List<CliOption> opts = cmd.options;
+        int cnt = opts.Count;
+        if (cnt == 0) { return null; }
+        if (ch >= 0 && ch < 128) {
+            if (cmd.shortTable == null || cmd.shortTableCount != cnt) {
+                cmd.EnsureShortTable();
+            }
+            CliOption hit = cmd.shortTable[ch];
+            if (hit != null && !hit.positional && hit.shortName.Length == 1
+                && (hit.shortName[0] & 255) == ch) {
+                return hit;
+            }
+        }
+        for (int i = 0; i < cnt; i = i + 1) {
+            CliOption o = opts[i];
+            if (!o.positional && o.shortName.Length == 1 && (o.shortName[0] & 255) == ch) {
+                return o;
+            }
+        }
+        return null;
+    }
+
     // 解析命令行。不抛错：用法错误落在 result.error 里。
     public CliResult Parse(string[] args) {
         CliResult result = new CliResult();
         if (args == null) { args = new string[0]; }
+        int argc = args.Length;
 
         CliCommand cmd = this.root;
         int i = 0;
@@ -82,33 +129,46 @@ public class CliApp {
                 result.command = cmd;
                 return result;
             }
-            if (i >= args.Length) { break; }
+            if (i >= argc) { break; }
             string token = args[i];
-            if (token == null || token == "--") { break; }
-            CliCommand child = cmd.Find(token);
+            if (token == null || (token.Length == 2 && (token[0] & 255) == 45 && (token[1] & 255) == 45)) { break; }
+            CliCommand child = null;
+            List<CliCommand> chs = cmd.children;
+            int ccnt = chs.Count;
+            for (int ci = 0; ci < ccnt; ci = ci + 1) {
+                CliCommand c = chs[ci];
+                if (c.name == token) { child = c; break; }
+                List<string> als = c.aliases;
+                int ac = als.Count;
+                for (int ai = 0; ai < ac; ai = ai + 1) {
+                    if (als[ai] == token) { child = c; break; }
+                }
+                if (child != null) { break; }
+            }
             if (child == null) { break; }
             cmd = child;
             i = i + 1;
         }
         result.command = cmd;
 
-        // 2) 剩下的 token 是当前命令的选项与位置参数。
-        List<string> positionals = new List<string>();
+        // 2) 剩下的 token 是当前命令的选项与位置参数。直接复用 result.positionals。
+        List<string> positionals = result.positionals;
         bool endOfOptions = false;
-        while (i < args.Length) {
+        while (i < argc) {
             string arg = args[i] == null ? "" : args[i];
             if (endOfOptions) {
                 positionals.Add(arg);
                 i = i + 1;
                 continue;
             }
-            if (arg == "--") {
-                endOfOptions = true;
-                i = i + 1;
-                continue;
-            }
-            if (arg.Length >= 2 && arg[0] == '-') {
-                if (arg[1] == '-') {
+            int alen = arg.Length;
+            if (alen >= 2 && (arg[0] & 255) == 45) {
+                if ((arg[1] & 255) == 45) {
+                    if (alen == 2) {
+                        endOfOptions = true;
+                        i = i + 1;
+                        continue;
+                    }
                     i = this.ParseLongOption(cmd, args, i, result);
                 } else {
                     i = this.ParseShortOptions(cmd, args, i, result);
@@ -119,105 +179,148 @@ public class CliApp {
             positionals.Add(arg);
             i = i + 1;
         }
-        result.positionals = positionals;
+
+        List<CliOption> opts = cmd.options;
+        int optCount = opts.Count;
+        int posCount = positionals.Count;
 
         // 3) 有子命令却来了个不认识的词 → 那是敲错的子命令名，不是位置
         //    参数（命令自己也声明了位置参数时才当位置参数看）。
-        if (cmd.children.Count > 0 && positionals.Count > 0
-            && cmd.Positionals().Count == 0) {
-            result.error = "unknown command '" + positionals[0] + "'";
-            return result;
+        if (cmd.children.Count > 0 && posCount > 0) {
+            bool hasDeclaredPos = false;
+            for (int k = 0; k < optCount; k = k + 1) {
+                if (opts[k].positional) { hasDeclaredPos = true; break; }
+            }
+            if (!hasDeclaredPos) {
+                result.error = "unknown command '" + positionals[0] + "'";
+                return result;
+            }
         }
 
         // 4) 位置参数按声明顺序绑定。
-        List<CliOption> pos = cmd.Positionals();
+        if (!this.BindPositionals(cmd, result)) { return result; }
+
+        // 5) 选项校验：必填、类型、默认值。
+        this.ValidateOptions(cmd, result);
+        return result;
+    }
+
+    // 位置参数按声明顺序绑定（直接遍历 cmd.options，免中间 List 分配）。
+    private bool BindPositionals(CliCommand cmd, CliResult result) {
+        List<CliOption> opts = cmd.options;
+        int optCount = opts.Count;
+        List<string> positionals = result.positionals;
+        int posCount = positionals.Count;
         int consumed = 0;
-        for (int k = 0; k < pos.Count; k = k + 1) {
-            CliOption p = pos[k];
+        for (int k = 0; k < optCount; k = k + 1) {
+            CliOption p = opts[k];
+            if (!p.positional) { continue; }
             if (p.variadic) {
-                List<string> got = new List<string>();
-                while (consumed < positionals.Count) {
-                    got.Add(positionals[consumed]);
-                    consumed = consumed + 1;
-                }
-                if (got.Count == 0) {
+                if (consumed >= posCount) {
                     if (p.required) {
                         result.error = "missing required argument <" + p.name + ">";
-                        return result;
+                        return false;
                     }
                 } else {
+                    List<string> got = new List<string>();
+                    while (consumed < posCount) {
+                        got.Add(positionals[consumed]);
+                        consumed = consumed + 1;
+                    }
                     result.multi[p.name] = got;
                     result.values[p.name] = got[0];
                 }
                 continue;
             }
-            if (consumed < positionals.Count) {
+            if (consumed < posCount) {
                 result.values[p.name] = positionals[consumed];
+                if (result.nonMultiKeys == null) { result.nonMultiKeys = new List<string>(); }
+                result.nonMultiKeys.Add(p.name);
                 consumed = consumed + 1;
             } else if (p.required) {
                 result.error = "missing required argument <" + p.name + ">";
-                return result;
+                return false;
             }
         }
-        if (consumed < positionals.Count) {
+        if (consumed < posCount) {
             result.error = "unexpected argument '" + positionals[consumed] + "'";
-            return result;
+            return false;
         }
+        return true;
+    }
 
-        // 5) 选项校验：必填、类型、默认值。
-        for (int k = 0; k < cmd.options.Count; k = k + 1) {
-            CliOption o = cmd.options[k];
+    // 选项校验：必填、类型、默认值。
+    private void ValidateOptions(CliCommand cmd, CliResult result) {
+        List<CliOption> opts = cmd.options;
+        int optCount = opts.Count;
+        bool hasMulti = result.multi.Count > 0;
+        for (int k = 0; k < optCount; k = k + 1) {
+            CliOption o = opts[k];
             if (o.positional) { continue; }
-            if (!result.Has(o.name)) {
+            string curVal;
+            if (!result.values.TryGetValue(o.name, out curVal)) {
                 if (o.required) {
                     result.error = "missing required option --" + o.name;
-                    return result;
+                    return;
                 }
-                if (o.hasDefault) { result.values[o.name] = o.defaultValue; }
+                if (o.hasDefault) {
+                    result.values[o.name] = o.defaultValue;
+                    if (result.nonMultiKeys == null) { result.nonMultiKeys = new List<string>(); }
+                    result.nonMultiKeys.Add(o.name);
+                }
                 continue;
             }
+            int otype = o.type;
+            if (otype == CliType.String) { continue; }
             List<string> vals = null;
-            if (!result.multi.TryGetValue(o.name, out vals) || vals == null || vals.Count == 0) {
-                vals = new List<string>();
-                vals.Add(result.Get(o.name, ""));
+            if (hasMulti && result.multi.TryGetValue(o.name, out vals) && vals != null && vals.Count > 0) {
+                int vCount = vals.Count;
+                for (int vi = 0; vi < vCount; vi = vi + 1) {
+                    string v = vals[vi] == null ? "" : vals[vi];
+                    if (!CliApp.CheckOptionType(o, otype, v, result)) { return; }
+                }
+            } else {
+                string v = curVal == null ? "" : curVal;
+                if (!CliApp.CheckOptionType(o, otype, v, result)) { return; }
             }
-            for (int vi = 0; vi < vals.Count; vi = vi + 1) {
-                string v = vals[vi] == null ? "" : vals[vi];
-                if (o.type == CliType.Int) {
-                    int parsed;
-                    if (!CliValue.TryInt(v, out parsed)) {
-                        result.error = "option --" + o.name
-                            + " expects an integer, got '" + v + "'";
-                        return result;
-                    }
-                } else if (o.type == CliType.Float) {
-                    double parsed;
-                    if (!CliValue.TryFloat(v, out parsed)) {
-                        result.error = "option --" + o.name
-                            + " expects a number, got '" + v + "'";
-                        return result;
-                    }
-                } else if (o.type == CliType.Bool) {
-                    bool parsed;
-                    if (!CliValue.TryBool(v, out parsed)) {
-                        result.error = "option --" + o.name
-                            + " expects a boolean, got '" + v + "'";
-                        return result;
-                    }
+        }
+    }
+
+    private static bool CheckOptionType(CliOption o, int otype, string v, CliResult result) {
+        if (otype == CliType.Int) {
+            int parsed;
+            if (!CliValue.TryInt(v, out parsed)) {
+                result.error = "option --" + o.name + " expects an integer, got '" + v + "'";
+                return false;
+            }
+        } else if (otype == CliType.Float) {
+            double parsed;
+            if (!CliValue.TryFloat(v, out parsed)) {
+                result.error = "option --" + o.name + " expects a number, got '" + v + "'";
+                return false;
+            }
+        } else if (otype == CliType.Bool) {
+            if (v != "true" && v != "false") {
+                bool parsed;
+                if (!CliValue.TryBool(v, out parsed)) {
+                    result.error = "option --" + o.name + " expects a boolean, got '" + v + "'";
+                    return false;
                 }
             }
         }
-        return result;
+        return true;
     }
 
     // 解析当前位置起的一串选项，遇到非选项 token 或数组末尾就停。
     int ParseOptions(CliCommand cmd, string[] args, int i, CliResult result) {
-        while (i < args.Length) {
+        int argc = args.Length;
+        while (i < argc) {
             string arg = args[i];
             if (arg == null) { return i; }
-            if (arg == "--") { return i; }
-            if (arg.Length < 2 || arg[0] != '-') { return i; }
-            if (arg[1] == '-') {
+            int alen = arg.Length;
+            if (alen < 2 || (arg[0] & 255) != 45) { return i; }
+            if ((arg[1] & 255) == 45) {
+                if (alen == 2) { return i; }
                 i = this.ParseLongOption(cmd, args, i, result);
             } else {
                 i = this.ParseShortOptions(cmd, args, i, result);
@@ -229,29 +332,31 @@ public class CliApp {
 
     // 长选项："--name value" / "--name=value" / "--flag"。
     int ParseLongOption(CliCommand cmd, string[] args, int i, CliResult result) {
-        string body = args[i].Substring(2);
-        int eq = body.IndexOf("=");
-        string name = eq < 0 ? body : body.Substring(0, eq);
+        string arg = args[i];
+        int alen = arg.Length;
+        int eq = NativeMemory.Find((nint)arg, 2, 61, alen - 2);
         bool hasInline = eq >= 0;
-        string inline = hasInline ? body.Substring(eq + 1) : "";
-        CliOption opt = cmd.FindOption(name);
+        int nameLen = hasInline ? (eq - 2) : (alen - 2);
+        CliOption opt = CliApp.MatchLongOption(cmd, arg, 2, nameLen);
         if (opt == null) {
-            if (name == "help") {
+            if (nameLen == 4
+                && (arg[2] & 255) == 104 && (arg[3] & 255) == 101
+                && (arg[4] & 255) == 108 && (arg[5] & 255) == 112) {
                 result.help = true;
                 return i + 1;
             }
-            result.error = "unknown option --" + name;
+            result.error = "unknown option --" + arg.Substring(2, nameLen);
             return i + 1;
         }
         string value = "";
         if (opt.type == CliType.Bool) {
-            value = hasInline ? inline : "true";
+            value = hasInline ? arg.Substring(eq + 1) : "true";
         } else if (hasInline) {
-            value = inline;
+            value = arg.Substring(eq + 1);
         } else {
             int next = i + 1;
             if (next >= args.Length) {
-                result.error = "option --" + name + " requires a value";
+                result.error = "option --" + opt.name + " requires a value";
                 return next;
             }
             value = args[next] == null ? "" : args[next];
@@ -263,18 +368,19 @@ public class CliApp {
 
     // 短选项："-v" / "-v value" / "-vvalue" / "-abc"（多个布尔选项）。
     int ParseShortOptions(CliCommand cmd, string[] args, int i, CliResult result) {
-        string body = args[i].Substring(1);
-        int pos = 0;
-        while (pos < body.Length) {
-            string ch = body.Substring(pos, 1);
-            CliOption opt = cmd.FindShort(ch);
+        string arg = args[i];
+        int alen = arg.Length;
+        int pos = 1;
+        while (pos < alen) {
+            int ch = arg[pos] & 255;
+            CliOption opt = CliApp.MatchShortOption(cmd, ch);
             if (opt == null) {
-                if (ch == "h") {
+                if (ch == 104) {
                     result.help = true;
                     pos = pos + 1;
                     continue;
                 }
-                result.error = "unknown option -" + ch;
+                result.error = "unknown option -" + arg.Substring(pos, 1);
                 return i + 1;
             }
             if (opt.type == CliType.Bool) {
@@ -283,13 +389,13 @@ public class CliApp {
                 continue;
             }
             string value = "";
-            if (pos + 1 < body.Length) {
-                value = body.Substring(pos + 1);
-                pos = body.Length;
+            if (pos + 1 < alen) {
+                value = arg.Substring(pos + 1);
+                pos = alen;
             } else {
                 int next = i + 1;
                 if (next >= args.Length) {
-                    result.error = "option -" + ch + " requires a value";
+                    result.error = "option -" + arg.Substring(pos, 1) + " requires a value";
                     return next;
                 }
                 value = args[next] == null ? "" : args[next];
@@ -301,16 +407,23 @@ public class CliApp {
         return i + 1;
     }
 
-    // 记下一个取值（同名重复出现时收进 multi）。
+    // 记下一个取值：单次出现仅写 values（零 List 分配），重复出现时延迟升格至 multi。
     void StoreValue(CliResult result, CliOption opt, string value) {
-        if (opt.name.Length == 0) { return; }
-        result.values[opt.name] = value;
-        List<string> all;
-        if (!result.multi.TryGetValue(opt.name, out all)) {
-            all = new List<string>();
-            result.multi[opt.name] = all;
+        string name = opt.name;
+        if (name.Length == 0) { return; }
+        string prev;
+        if (result.values.TryGetValue(name, out prev)) {
+            result.values[name] = value;
+            List<string> all;
+            if (!result.multi.TryGetValue(name, out all)) {
+                all = new List<string>();
+                all.Add(prev);
+                result.multi[name] = all;
+            }
+            all.Add(value);
+        } else {
+            result.values[name] = value;
         }
-        all.Add(value);
     }
 
     // 解析并执行。返回进程退出码。
@@ -340,146 +453,228 @@ public class CliApp {
         return this.HelpFor(this.root);
     }
 
-    // 某个命令的帮助文本。
-    public string HelpFor(CliCommand cmd) {
-        if (cmd == null) { cmd = this.root; }
-        StringBuilder sb = new StringBuilder();
-
-        string usage = cmd.usageText;
-        if (usage.Length == 0) { usage = this.UsageLine(cmd); }
-        sb.Append("Usage: ");
-        sb.Append(usage);
-        sb.Append("\n");
-
-        if (this.version.Length > 0 && cmd == this.root) {
-            sb.Append("\n");
-            sb.Append("Version: ");
-            sb.Append(this.version);
-            sb.Append("\n");
-        }
-        if (cmd.description.Length > 0) {
-            sb.Append("\n");
-            sb.Append(cmd.description);
-            sb.Append("\n");
-        }
-
-        // 选项：先把标签拼好，算出最大宽度再对齐说明文字。
-        List<string> labels = new List<string>();
-        List<string> helps = new List<string>();
-        for (int i = 0; i < cmd.options.Count; i = i + 1) {
-            CliOption o = cmd.options[i];
-            if (o.positional) { continue; }
-            labels.Add(this.OptionLabel(o));
-            helps.Add(this.OptionHelp(o));
-        }
-        labels.Add("    -h, --help");
-        helps.Add("Show this help");
-
-        if (labels.Count > 0) {
-            sb.Append("\n");
-            sb.Append("Options:\n");
-            int width = 0;
-            for (int i = 0; i < labels.Count; i = i + 1) {
-                if (labels[i].Length > width) { width = labels[i].Length; }
-            }
-            for (int i = 0; i < labels.Count; i = i + 1) {
-                sb.Append("  ");
-                sb.Append(labels[i]);
-                CliApp.AppendSpaces(sb, width - labels[i].Length + 2);
-                sb.Append(helps[i]);
-                sb.Append("\n");
-            }
-        }
-
-        if (cmd.children.Count > 0) {
-            sb.Append("\n");
-            sb.Append("Commands:\n");
-            int width = 0;
-            for (int i = 0; i < cmd.children.Count; i = i + 1) {
-                string n = cmd.children[i].name;
-                if (n.Length > width) { width = n.Length; }
-            }
-            for (int i = 0; i < cmd.children.Count; i = i + 1) {
-                CliCommand c = cmd.children[i];
-                sb.Append("  ");
-                sb.Append(c.name);
-                CliApp.AppendSpaces(sb, width - c.name.Length + 2);
-                sb.Append(c.description);
-                sb.Append("\n");
-            }
-        }
-        return sb.ToString();
-    }
-
-    private static void AppendSpaces(StringBuilder sb, int count) {
-        while (count >= 32) {
-            sb.Append("                                ");
-            count = count - 32;
-        }
-        if (count > 0) {
-            sb.Append("                                ".Substring(0, count));
-        }
-    }
-
-    // 用法行（没有自定义 Usage 时按选项与子命令自动生成）。
-    string UsageLine(CliCommand cmd) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(cmd.Path());
-        List<CliOption> pos = cmd.Positionals();
-        if (pos.Count > 0) { sb.Append(" [options]"); }
-        for (int i = 0; i < pos.Count; i = i + 1) {
-            CliOption p = pos[i];
-            if (p.required) {
-                sb.Append(" <");
-                sb.Append(p.name);
-                sb.Append(">");
-            } else {
-                sb.Append(" [");
-                sb.Append(p.name);
-                sb.Append("]");
-            }
-            if (p.variadic) { sb.Append("..."); }
-        }
-        if (cmd.children.Count > 0) { sb.Append(" <command>"); }
-        return sb.ToString();
-    }
-
-    // 选项标签："-v, --verbose" / "--count <int>"。
-    string OptionLabel(CliOption o) {
-        StringBuilder sb = new StringBuilder();
-        if (o.shortName.Length > 0) {
-            sb.Append("-");
-            sb.Append(o.shortName);
-            sb.Append(", ");
-        } else {
-            sb.Append("    ");
-        }
-        sb.Append("--");
-        sb.Append(o.name);
+    private static int OptionLabelLen(CliOption o) {
+        int len = o.shortName.Length > 0 ? (o.shortName.Length + 3) : 4;
+        len = len + 2 + o.name.Length;
         string t = CliType.Name(o.type);
-        if (t.Length > 0) {
-            sb.Append(" <");
-            sb.Append(t);
-            sb.Append(">");
-        }
-        return sb.ToString();
+        if (t.Length > 0) { len = len + 3 + t.Length; }
+        return len;
     }
 
-    // 选项说明（附默认值与必填标记）。
-    string OptionHelp(CliOption o) {
-        if (!o.required && !o.hasDefault) { return o.helpText; }
-        StringBuilder sb = new StringBuilder();
-        if (o.helpText.Length > 0) { sb.Append(o.helpText); }
+    private static int OptionHelpLen(CliOption o) {
+        int len = o.helpText.Length;
         if (o.required) {
-            if (sb.Length > 0) { sb.Append(" "); }
-            sb.Append("(required)");
+            if (len > 0) { len = len + 1; }
+            len = len + 10; // "(required)"
         }
         if (o.hasDefault) {
-            if (sb.Length > 0) { sb.Append(" "); }
-            sb.Append("(default: ");
-            sb.Append(o.defaultValue);
-            sb.Append(")");
+            if (len > 0) { len = len + 1; }
+            len = len + 11 + o.defaultValue.Length; // "(default: " + val + ")"
         }
-        return sb.ToString();
+        return len;
+    }
+
+    // 某个命令的帮助文本（精确预量 + 单字节缓冲直写，零中间对象/StringBuilder/List）。
+    public string HelpFor(CliCommand cmd) {
+        if (cmd == null) { cmd = this.root; }
+        List<CliOption> opts = cmd.options;
+        int optCount = opts.Count;
+        List<CliCommand> chs = cmd.children;
+        int childCount = chs.Count;
+
+        // Pass 1: 精确计算总字节数与对齐列宽（纯算术，零堆分配）。
+        int total = 8; // "Usage: " + "\n"
+        bool hasPos = false;
+        if (cmd.usageText.Length > 0) {
+            total = total + cmd.usageText.Length;
+        } else {
+            total = total + cmd.path.Length;
+            for (int i = 0; i < optCount; i = i + 1) {
+                CliOption p = opts[i];
+                if (!p.positional) { continue; }
+                if (!hasPos) {
+                    hasPos = true;
+                    total = total + 10; // " [options]"
+                }
+                total = total + 3 + p.name.Length; // " <name>" or " [name]"
+                if (p.variadic) { total = total + 3; } // "..."
+            }
+            if (childCount > 0) { total = total + 10; } // " <command>"
+        }
+        bool showVer = this.version.Length > 0 && cmd == this.root;
+        if (showVer) { total = total + 11 + this.version.Length; } // "\nVersion: " + v + "\n"
+        if (cmd.description.Length > 0) { total = total + 2 + cmd.description.Length; }
+
+        int width = 14; // "    -h, --help".Length
+        for (int i = 0; i < optCount; i = i + 1) {
+            CliOption o = opts[i];
+            if (o.positional) { continue; }
+            int l = CliApp.OptionLabelLen(o);
+            if (l > width) { width = l; }
+        }
+        total = total + 10; // "\nOptions:\n"
+        for (int i = 0; i < optCount; i = i + 1) {
+            CliOption o = opts[i];
+            if (o.positional) { continue; }
+            // "  " (2) + padded label (width + 2) + help + "\n" (1)
+            total = total + 5 + width + CliApp.OptionHelpLen(o);
+        }
+        // "  " + "    -h, --help" + spaces(width - 14 + 2) + "Show this help\n" = 2 + width + 2 + 15
+        total = total + width + 19;
+
+        int cwidth = 0;
+        if (childCount > 0) {
+            total = total + 11; // "\nCommands:\n"
+            for (int i = 0; i < childCount; i = i + 1) {
+                int nl = chs[i].name.Length;
+                if (nl > cwidth) { cwidth = nl; }
+            }
+            for (int i = 0; i < childCount; i = i + 1) {
+                total = total + 5 + cwidth + chs[i].description.Length;
+            }
+        }
+
+        // Pass 2: 单次精确分配并直写。
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int pos = 0;
+        NativeMemory.Copy(bp, (nint)"Usage: ", 7);
+        pos = 7;
+        if (cmd.usageText.Length > 0) {
+            NativeMemory.Copy(bp + (nint)pos, (nint)cmd.usageText, cmd.usageText.Length);
+            pos = pos + cmd.usageText.Length;
+        } else {
+            if (cmd.path.Length > 0) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)cmd.path, cmd.path.Length);
+                pos = pos + cmd.path.Length;
+            }
+            if (hasPos) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)" [options]", 10);
+                pos = pos + 10;
+                for (int i = 0; i < optCount; i = i + 1) {
+                    CliOption p = opts[i];
+                    if (!p.positional) { continue; }
+                    buf[pos] = 32;
+                    buf[pos + 1] = p.required ? (byte)60 : (byte)91;
+                    pos = pos + 2;
+                    int pnl = p.name.Length;
+                    if (pnl > 0) {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)p.name, pnl);
+                        pos = pos + pnl;
+                    }
+                    buf[pos] = p.required ? (byte)62 : (byte)93;
+                    pos = pos + 1;
+                    if (p.variadic) {
+                        buf[pos] = 46; buf[pos + 1] = 46; buf[pos + 2] = 46;
+                        pos = pos + 3;
+                    }
+                }
+            }
+            if (childCount > 0) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)" <command>", 10);
+                pos = pos + 10;
+            }
+        }
+        buf[pos] = 10; pos = pos + 1;
+
+        if (showVer) {
+            NativeMemory.Copy(bp + (nint)pos, (nint)"\nVersion: ", 10);
+            pos = pos + 10;
+            NativeMemory.Copy(bp + (nint)pos, (nint)this.version, this.version.Length);
+            pos = pos + this.version.Length;
+            buf[pos] = 10; pos = pos + 1;
+        }
+        if (cmd.description.Length > 0) {
+            buf[pos] = 10; pos = pos + 1;
+            NativeMemory.Copy(bp + (nint)pos, (nint)cmd.description, cmd.description.Length);
+            pos = pos + cmd.description.Length;
+            buf[pos] = 10; pos = pos + 1;
+        }
+
+        NativeMemory.Copy(bp + (nint)pos, (nint)"\nOptions:\n", 10);
+        pos = pos + 10;
+        for (int i = 0; i < optCount; i = i + 1) {
+            CliOption o = opts[i];
+            if (o.positional) { continue; }
+            buf[pos] = 32; buf[pos + 1] = 32; pos = pos + 2;
+            int lblStart = pos;
+            if (o.shortName.Length > 0) {
+                buf[pos] = 45; pos = pos + 1;
+                NativeMemory.Copy(bp + (nint)pos, (nint)o.shortName, o.shortName.Length);
+                pos = pos + o.shortName.Length;
+                buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2;
+            } else {
+                buf[pos] = 32; buf[pos + 1] = 32; buf[pos + 2] = 32; buf[pos + 3] = 32;
+                pos = pos + 4;
+            }
+            buf[pos] = 45; buf[pos + 1] = 45; pos = pos + 2;
+            if (o.name.Length > 0) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)o.name, o.name.Length);
+                pos = pos + o.name.Length;
+            }
+            string t = CliType.Name(o.type);
+            if (t.Length > 0) {
+                buf[pos] = 32; buf[pos + 1] = 60; pos = pos + 2;
+                NativeMemory.Copy(bp + (nint)pos, (nint)t, t.Length);
+                pos = pos + t.Length;
+                buf[pos] = 62; pos = pos + 1;
+            }
+            int pad = width - (pos - lblStart) + 2;
+            int padEnd = pos + pad;
+            while (pos < padEnd) { buf[pos] = 32; pos = pos + 1; }
+
+            bool any = false;
+            if (o.helpText.Length > 0) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)o.helpText, o.helpText.Length);
+                pos = pos + o.helpText.Length;
+                any = true;
+            }
+            if (o.required) {
+                if (any) { buf[pos] = 32; pos = pos + 1; }
+                NativeMemory.Copy(bp + (nint)pos, (nint)"(required)", 10);
+                pos = pos + 10;
+                any = true;
+            }
+            if (o.hasDefault) {
+                if (any) { buf[pos] = 32; pos = pos + 1; }
+                NativeMemory.Copy(bp + (nint)pos, (nint)"(default: ", 10);
+                pos = pos + 10;
+                if (o.defaultValue.Length > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)o.defaultValue, o.defaultValue.Length);
+                    pos = pos + o.defaultValue.Length;
+                }
+                buf[pos] = 41; pos = pos + 1;
+            }
+            buf[pos] = 10; pos = pos + 1;
+        }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"      -h, --help", 16);
+        pos = pos + 16;
+        int hPadEnd = pos + (width - 14 + 2);
+        while (pos < hPadEnd) { buf[pos] = 32; pos = pos + 1; }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"Show this help\n", 15);
+        pos = pos + 15;
+
+        if (childCount > 0) {
+            NativeMemory.Copy(bp + (nint)pos, (nint)"\nCommands:\n", 11);
+            pos = pos + 11;
+            for (int i = 0; i < childCount; i = i + 1) {
+                CliCommand c = chs[i];
+                buf[pos] = 32; buf[pos + 1] = 32; pos = pos + 2;
+                int nl = c.name.Length;
+                if (nl > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)c.name, nl);
+                    pos = pos + nl;
+                }
+                int cPadEnd = pos + (cwidth - nl + 2);
+                while (pos < cPadEnd) { buf[pos] = 32; pos = pos + 1; }
+                int dl = c.description.Length;
+                if (dl > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)c.description, dl);
+                    pos = pos + dl;
+                }
+                buf[pos] = 10; pos = pos + 1;
+            }
+        }
+        return NativeMemory.GetString(bp, 0, pos);
     }
 }
