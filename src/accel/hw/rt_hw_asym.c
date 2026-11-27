@@ -86,47 +86,47 @@ static inline void zan_fe_tobytes(uint8_t *s, const zan_fe h) {
 }
 
 static inline void zan_fe_add(zan_fe r, const zan_fe a, const zan_fe b) {
-  for (int i = 0; i < 5; i++)
-    r[i] = a[i] + b[i];
-  zan_fe_carry(r);
+  r[0] = a[0] + b[0];
+  r[1] = a[1] + b[1];
+  r[2] = a[2] + b[2];
+  r[3] = a[3] + b[3];
+  r[4] = a[4] + b[4];
 }
 
 static inline void zan_fe_sub(zan_fe r, const zan_fe a, const zan_fe b) {
-  uint64_t two_p0 = 2 * ((1ULL << 51) - 19);
-  uint64_t two_p14 = 2 * ((1ULL << 51) - 1);
+  uint64_t two_p0 = 2ULL * ((1ULL << 51) - 19ULL);
+  uint64_t two_p14 = 2ULL * ((1ULL << 51) - 1ULL);
   r[0] = (a[0] + two_p0) - b[0];
   r[1] = (a[1] + two_p14) - b[1];
   r[2] = (a[2] + two_p14) - b[2];
   r[3] = (a[3] + two_p14) - b[3];
   r[4] = (a[4] + two_p14) - b[4];
-  zan_fe_carry(r);
 }
 
 static inline void zan_fe_mul(zan_fe r, const zan_fe a, const zan_fe b) {
-  uint64_t mask51 = (1ULL << 51) - 1;
-  zan_fe_u128 r0 = (zan_fe_u128)a[0] * b[0] +
-                   (zan_fe_u128)a[1] * ((zan_fe_u128)b[4] * 19) +
-                   (zan_fe_u128)a[2] * ((zan_fe_u128)b[3] * 19) +
-                   (zan_fe_u128)a[3] * ((zan_fe_u128)b[2] * 19) +
-                   (zan_fe_u128)a[4] * ((zan_fe_u128)b[1] * 19);
+  const uint64_t mask51 = (1ULL << 51) - 1ULL;
+  uint64_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4];
+  uint64_t b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3], b4 = b[4];
+  uint64_t b1_19 = b1 * 19ULL;
+  uint64_t b2_19 = b2 * 19ULL;
+  uint64_t b3_19 = b3 * 19ULL;
+  uint64_t b4_19 = b4 * 19ULL;
 
-  zan_fe_u128 r1 = (zan_fe_u128)a[0] * b[1] + (zan_fe_u128)a[1] * b[0] +
-                   (zan_fe_u128)a[2] * ((zan_fe_u128)b[4] * 19) +
-                   (zan_fe_u128)a[3] * ((zan_fe_u128)b[3] * 19) +
-                   (zan_fe_u128)a[4] * ((zan_fe_u128)b[2] * 19);
-
-  zan_fe_u128 r2 = (zan_fe_u128)a[0] * b[2] + (zan_fe_u128)a[1] * b[1] +
-                   (zan_fe_u128)a[2] * b[0] +
-                   (zan_fe_u128)a[3] * ((zan_fe_u128)b[4] * 19) +
-                   (zan_fe_u128)a[4] * ((zan_fe_u128)b[3] * 19);
-
-  zan_fe_u128 r3 = (zan_fe_u128)a[0] * b[3] + (zan_fe_u128)a[1] * b[2] +
-                   (zan_fe_u128)a[2] * b[1] + (zan_fe_u128)a[3] * b[0] +
-                   (zan_fe_u128)a[4] * ((zan_fe_u128)b[4] * 19);
-
-  zan_fe_u128 r4 = (zan_fe_u128)a[0] * b[4] + (zan_fe_u128)a[1] * b[3] +
-                   (zan_fe_u128)a[2] * b[2] + (zan_fe_u128)a[3] * b[1] +
-                   (zan_fe_u128)a[4] * b[0];
+  zan_fe_u128 r0 = (zan_fe_u128)a0 * b0 + (zan_fe_u128)a1 * b4_19 +
+                   (zan_fe_u128)a2 * b3_19 + (zan_fe_u128)a3 * b2_19 +
+                   (zan_fe_u128)a4 * b1_19;
+  zan_fe_u128 r1 = (zan_fe_u128)a0 * b1 + (zan_fe_u128)a1 * b0 +
+                   (zan_fe_u128)a2 * b4_19 + (zan_fe_u128)a3 * b3_19 +
+                   (zan_fe_u128)a4 * b2_19;
+  zan_fe_u128 r2 = (zan_fe_u128)a0 * b2 + (zan_fe_u128)a1 * b1 +
+                   (zan_fe_u128)a2 * b0 + (zan_fe_u128)a3 * b4_19 +
+                   (zan_fe_u128)a4 * b3_19;
+  zan_fe_u128 r3 = (zan_fe_u128)a0 * b3 + (zan_fe_u128)a1 * b2 +
+                   (zan_fe_u128)a2 * b1 + (zan_fe_u128)a3 * b0 +
+                   (zan_fe_u128)a4 * b4_19;
+  zan_fe_u128 r4 = (zan_fe_u128)a0 * b4 + (zan_fe_u128)a1 * b3 +
+                   (zan_fe_u128)a2 * b2 + (zan_fe_u128)a3 * b1 +
+                   (zan_fe_u128)a4 * b0;
 
   uint64_t c0 = (uint64_t)(r0 >> 51);
   r0 &= mask51;
@@ -142,7 +142,7 @@ static inline void zan_fe_mul(zan_fe r, const zan_fe a, const zan_fe b) {
   r4 += c3;
   uint64_t c4 = (uint64_t)(r4 >> 51);
   r4 &= mask51;
-  r0 += (zan_fe_u128)c4 * 19;
+  r0 += (zan_fe_u128)c4 * 19ULL;
   c0 = (uint64_t)(r0 >> 51);
   r0 &= mask51;
   r1 += c0;
@@ -152,18 +152,30 @@ static inline void zan_fe_mul(zan_fe r, const zan_fe a, const zan_fe b) {
   r[2] = (uint64_t)r2;
   r[3] = (uint64_t)r3;
   r[4] = (uint64_t)r4;
-  zan_fe_carry(r);
 }
 
-static inline void zan_fe_sqr(zan_fe r, const zan_fe a) { zan_fe_mul(r, a, a); }
+/* 专用 15 乘 GF(2^255-19) 平方（比通用 25 乘节省 40% 128 位乘法并消除冗余进位） */
+static inline void zan_fe_sqr(zan_fe r, const zan_fe a) {
+  const uint64_t mask51 = (1ULL << 51) - 1ULL;
+  uint64_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4];
+  uint64_t a0_2 = a0 * 2ULL;
+  uint64_t a1_2 = a1 * 2ULL;
+  uint64_t a1_38 = a1 * 38ULL;
+  uint64_t a2_38 = a2 * 38ULL;
+  uint64_t a3_19 = a3 * 19ULL;
+  uint64_t a3_38 = a3 * 38ULL;
+  uint64_t a4_19 = a4 * 19ULL;
 
-static inline void zan_fe_mul121665(zan_fe r, const zan_fe a) {
-  uint64_t mask51 = (1ULL << 51) - 1;
-  zan_fe_u128 r0 = (zan_fe_u128)a[0] * 121665;
-  zan_fe_u128 r1 = (zan_fe_u128)a[1] * 121665;
-  zan_fe_u128 r2 = (zan_fe_u128)a[2] * 121665;
-  zan_fe_u128 r3 = (zan_fe_u128)a[3] * 121665;
-  zan_fe_u128 r4 = (zan_fe_u128)a[4] * 121665;
+  zan_fe_u128 r0 = (zan_fe_u128)a0 * a0 + (zan_fe_u128)a1_38 * a4 +
+                   (zan_fe_u128)a2_38 * a3;
+  zan_fe_u128 r1 = (zan_fe_u128)a0_2 * a1 + (zan_fe_u128)a2_38 * a4 +
+                   (zan_fe_u128)a3_19 * a3;
+  zan_fe_u128 r2 = (zan_fe_u128)a0_2 * a2 + (zan_fe_u128)a1 * a1 +
+                   (zan_fe_u128)a3_38 * a4;
+  zan_fe_u128 r3 = (zan_fe_u128)a0_2 * a3 + (zan_fe_u128)a1_2 * a2 +
+                   (zan_fe_u128)a4_19 * a4;
+  zan_fe_u128 r4 = (zan_fe_u128)a0_2 * a4 + (zan_fe_u128)a1_2 * a3 +
+                   (zan_fe_u128)a2 * a2;
 
   uint64_t c0 = (uint64_t)(r0 >> 51);
   r0 &= mask51;
@@ -179,7 +191,7 @@ static inline void zan_fe_mul121665(zan_fe r, const zan_fe a) {
   r4 += c3;
   uint64_t c4 = (uint64_t)(r4 >> 51);
   r4 &= mask51;
-  r0 += (zan_fe_u128)c4 * 19;
+  r0 += (zan_fe_u128)c4 * 19ULL;
   c0 = (uint64_t)(r0 >> 51);
   r0 &= mask51;
   r1 += c0;
@@ -189,7 +201,40 @@ static inline void zan_fe_mul121665(zan_fe r, const zan_fe a) {
   r[2] = (uint64_t)r2;
   r[3] = (uint64_t)r3;
   r[4] = (uint64_t)r4;
-  zan_fe_carry(r);
+}
+
+static inline void zan_fe_mul121665(zan_fe r, const zan_fe a) {
+  const uint64_t mask51 = (1ULL << 51) - 1ULL;
+  zan_fe_u128 r0 = (zan_fe_u128)a[0] * 121665ULL;
+  zan_fe_u128 r1 = (zan_fe_u128)a[1] * 121665ULL;
+  zan_fe_u128 r2 = (zan_fe_u128)a[2] * 121665ULL;
+  zan_fe_u128 r3 = (zan_fe_u128)a[3] * 121665ULL;
+  zan_fe_u128 r4 = (zan_fe_u128)a[4] * 121665ULL;
+
+  uint64_t c0 = (uint64_t)(r0 >> 51);
+  r0 &= mask51;
+  r1 += c0;
+  uint64_t c1 = (uint64_t)(r1 >> 51);
+  r1 &= mask51;
+  r2 += c1;
+  uint64_t c2 = (uint64_t)(r2 >> 51);
+  r2 &= mask51;
+  r3 += c2;
+  uint64_t c3 = (uint64_t)(r3 >> 51);
+  r3 &= mask51;
+  r4 += c3;
+  uint64_t c4 = (uint64_t)(r4 >> 51);
+  r4 &= mask51;
+  r0 += (zan_fe_u128)c4 * 19ULL;
+  c0 = (uint64_t)(r0 >> 51);
+  r0 &= mask51;
+  r1 += c0;
+
+  r[0] = (uint64_t)r0;
+  r[1] = (uint64_t)r1;
+  r[2] = (uint64_t)r2;
+  r[3] = (uint64_t)r3;
+  r[4] = (uint64_t)r4;
 }
 
 static inline void zan_fe_cswap(zan_fe a, zan_fe b, uint64_t swap) {
@@ -359,10 +404,17 @@ static void zan_store_be64_limbs(const uint64_t *src, int k, uint8_t *dst,
   }
 }
 
+static int zan_limbs_cmp(const uint64_t *a, const uint64_t *b, int k);
+static uint64_t zan_limbs_sub(uint64_t *res, const uint64_t *a,
+                              const uint64_t *b, int k);
+
 static void zan_mont_mul_core(const uint64_t *a, const uint64_t *b,
                               const uint64_t *n, uint64_t n0_inv, int k,
                               uint64_t *res) {
-  uint64_t t[132] = {0};
+  uint64_t t[132];
+  for (int i = 0; i <= k + 1; i++)
+    t[i] = 0;
+
   for (int i = 0; i < k; i++) {
     uint64_t carry = 0;
     uint64_t bi = b[i];
@@ -389,19 +441,91 @@ static void zan_mont_mul_core(const uint64_t *a, const uint64_t *b,
     t[k + 1] = 0;
   }
 
+  /* 常量时间条件减法：t[k] != 0 或 borrow == 0 时选择 sub */
   uint64_t borrow = 0;
   uint64_t sub[66];
   for (int i = 0; i < k; i++) {
     zan_u128_t ni_b = (zan_u128_t)n[i] + borrow;
-    borrow = (t[i] < ni_b) ? 1 : 0;
+    borrow = (t[i] < ni_b) ? 1ULL : 0ULL;
     sub[i] = (uint64_t)(t[i] - ni_b);
   }
-  if (t[k] > 0 || borrow == 0) {
-    for (int i = 0; i < k; i++)
-      res[i] = sub[i];
-  } else {
-    for (int i = 0; i < k; i++)
-      res[i] = t[i];
+  uint64_t tk_nz = (t[k] | (0ULL - t[k])) >> 63;
+  uint64_t mask = 0ULL - (tk_nz | (borrow ^ 1ULL));
+  for (int i = 0; i < k; i++) {
+    res[i] = (sub[i] & mask) | (t[i] & ~mask);
+  }
+}
+
+/* 专用 Montgomery 平方（SOS 对称性减少 ~48% 64x64 乘法 + O(1) 常量时间规约进位） */
+static void zan_mont_sqr_core(const uint64_t *a, const uint64_t *n,
+                              uint64_t n0_inv, int k, uint64_t *res) {
+  uint64_t t[132];
+  int two_k = 2 * k;
+  for (int i = 0; i <= two_k; i++)
+    t[i] = 0;
+
+  /* 1. 非对角项 sum_{i < j} a[i] * a[j] */
+  for (int i = 0; i < k - 1; i++) {
+    uint64_t ai = a[i];
+    uint64_t carry = 0;
+    for (int j = i + 1; j < k; j++) {
+      zan_u128_t cur = (zan_u128_t)t[i + j] + (zan_u128_t)ai * a[j] + carry;
+      t[i + j] = (uint64_t)cur;
+      carry = (uint64_t)(cur >> 64);
+    }
+    t[i + k] = carry;
+  }
+
+  /* 2. 左移 1 位乘 2 */
+  uint64_t sc = 0;
+  for (int i = 0; i < two_k; i++) {
+    uint64_t next_sc = t[i] >> 63;
+    t[i] = (t[i] << 1) | sc;
+    sc = next_sc;
+  }
+  t[two_k] = sc;
+
+  /* 3. 累加对角项 a[i]^2 */
+  uint64_t carry = 0;
+  for (int i = 0; i < k; i++) {
+    zan_u128_t sq = (zan_u128_t)a[i] * a[i];
+    zan_u128_t c0 = (zan_u128_t)t[2 * i] + (uint64_t)sq + carry;
+    t[2 * i] = (uint64_t)c0;
+    zan_u128_t c1 =
+        (zan_u128_t)t[2 * i + 1] + (uint64_t)(sq >> 64) + (uint64_t)(c0 >> 64);
+    t[2 * i + 1] = (uint64_t)c1;
+    carry = (uint64_t)(c1 >> 64);
+  }
+  t[two_k] += carry;
+
+  /* 4. 原地 SOS Montgomery 规约（单变量 c_hi 承接高位进位，无数据依赖循环） */
+  uint64_t c_hi = 0;
+  for (int i = 0; i < k; i++) {
+    uint64_t m = t[i] * n0_inv;
+    uint64_t c = 0;
+    for (int j = 0; j < k; j++) {
+      zan_u128_t cur = (zan_u128_t)t[i + j] + (zan_u128_t)m * n[j] + c;
+      t[i + j] = (uint64_t)cur;
+      c = (uint64_t)(cur >> 64);
+    }
+    zan_u128_t hi_sum = (zan_u128_t)t[i + k] + c + c_hi;
+    t[i + k] = (uint64_t)hi_sum;
+    c_hi = (uint64_t)(hi_sum >> 64);
+  }
+  t[two_k] += c_hi;
+
+  /* 5. 常量时间条件减法 */
+  uint64_t borrow = 0;
+  uint64_t sub[66];
+  for (int i = 0; i < k; i++) {
+    zan_u128_t ni_b = (zan_u128_t)n[i] + borrow;
+    borrow = (t[k + i] < ni_b) ? 1ULL : 0ULL;
+    sub[i] = (uint64_t)(t[k + i] - ni_b);
+  }
+  uint64_t tk_nz = (t[two_k] | (0ULL - t[two_k])) >> 63;
+  uint64_t mask = 0ULL - (tk_nz | (borrow ^ 1ULL));
+  for (int i = 0; i < k; i++) {
+    res[i] = (sub[i] & mask) | (t[k + i] & ~mask);
   }
 }
 
@@ -435,35 +559,91 @@ static int zan_mont_ctx_init(zan_mont_ctx_t *ctx, const uint8_t *mod,
   }
   ctx->n0_inv = (uint64_t)(-(int64_t)inv);
 
+  /* 1. 快速计算 R mod N = 2^(64*k) mod N（常规 RSA 模数 MSB=1 仅需 1 次减法） */
+  int top = k - 1;
+  while (top > 0 && ctx->n[top] == 0)
+    top--;
+  int bitlen = top * 64 + (64 - __builtin_clzll(ctx->n[top]));
   uint64_t x[66] = {0};
-  x[0] = 1;
-  int total_doubles = 64 * k * 2;
-  for (int d = 1; d <= total_doubles; d++) {
-    uint64_t carry = 0;
-    for (int i = 0; i < k; i++) {
-      uint64_t next_carry = x[i] >> 63;
-      x[i] = (x[i] << 1) | carry;
-      carry = next_carry;
-    }
+  if (bitlen == 64 * k) {
     uint64_t borrow = 0;
-    uint64_t sub[66];
     for (int i = 0; i < k; i++) {
       zan_u128_t ni_b = (zan_u128_t)ctx->n[i] + borrow;
-      borrow = (x[i] < ni_b) ? 1 : 0;
-      sub[i] = (uint64_t)(x[i] - ni_b);
+      borrow = (ni_b > 0) ? 1ULL : 0ULL;
+      x[i] = (uint64_t)(0ULL - ni_b);
     }
-    if (carry > 0 || borrow == 0) {
-      for (int i = 0; i < k; i++)
-        x[i] = sub[i];
+  } else {
+    x[bitlen / 64] = 1ULL << (bitlen % 64);
+    zan_limbs_sub(x, x, ctx->n, k);
+    if (zan_limbs_cmp(x, ctx->n, k) >= 0) {
+      zan_limbs_sub(x, x, ctx->n, k);
     }
-    if (d == 64 * k) {
-      for (int i = 0; i < k; i++)
-        ctx->r_mod_n[i] = x[i];
+    int rem_doubles = 64 * k - bitlen;
+    for (int d = 0; d < rem_doubles; d++) {
+      uint64_t carry = 0;
+      for (int i = 0; i < k; i++) {
+        uint64_t next_c = x[i] >> 63;
+        x[i] = (x[i] << 1) | carry;
+        carry = next_c;
+      }
+      uint64_t sub[66];
+      uint64_t borrow = zan_limbs_sub(sub, x, ctx->n, k);
+      if (carry > 0 || borrow == 0) {
+        for (int i = 0; i < k; i++)
+          x[i] = sub[i];
+      }
     }
   }
   for (int i = 0; i < k; i++)
-    ctx->r2_mod_n[i] = x[i];
+    ctx->r_mod_n[i] = x[i];
+
+  /* 2. 对数级平方计算 R^2 mod N = MontPow(M(2), 64*k)：RSA-2048 仅 11 次平方替代 4096 次位倍增 */
+  uint64_t base64[66] = {0};
+  {
+    uint64_t carry = 0;
+    for (int i = 0; i < k; i++) {
+      uint64_t next_c = x[i] >> 63;
+      base64[i] = (x[i] << 1) | carry;
+      carry = next_c;
+    }
+    uint64_t sub[66];
+    uint64_t borrow = zan_limbs_sub(sub, base64, ctx->n, k);
+    if (carry > 0 || borrow == 0) {
+      for (int i = 0; i < k; i++)
+        base64[i] = sub[i];
+    }
+  }
+  for (int s = 0; s < 6; s++) {
+    zan_mont_sqr_core(base64, ctx->n, ctx->n0_inv, k, base64);
+  }
+  int k_bits = 32 - __builtin_clz((unsigned int)k);
+  uint64_t acc[66] = {0};
+  for (int i = 0; i < k; i++)
+    acc[i] = base64[i];
+  for (int b = k_bits - 2; b >= 0; b--) {
+    zan_mont_sqr_core(acc, ctx->n, ctx->n0_inv, k, acc);
+    if ((k >> b) & 1) {
+      zan_mont_mul_core(acc, base64, ctx->n, ctx->n0_inv, k, acc);
+    }
+  }
+  for (int i = 0; i < k; i++)
+    ctx->r2_mod_n[i] = acc[i];
   return 0;
+}
+
+/* 常量时间窗口表选取（顺序扫描全部表项，消除私钥指数缓存侧信道） */
+static void zan_mont_ct_select(const uint64_t table[][66], int tbl_size,
+                               uint32_t idx, int k, uint64_t *out) {
+  for (int i = 0; i < k; i++)
+    out[i] = 0;
+  for (int w = 0; w < tbl_size; w++) {
+    uint64_t diff = (uint64_t)((uint32_t)w ^ idx);
+    uint64_t is_zero = ((diff | (0ULL - diff)) >> 63) ^ 1ULL;
+    uint64_t mask = 0ULL - is_zero;
+    for (int i = 0; i < k; i++) {
+      out[i] |= table[w][i] & mask;
+    }
+  }
 }
 
 static void zan_mont_exp_ctx(const zan_mont_ctx_t *ctx,
@@ -471,16 +651,6 @@ static void zan_mont_exp_ctx(const zan_mont_ctx_t *ctx,
                              const uint64_t *exp_limbs, int e_k,
                              uint64_t *out_limbs) {
   int k = ctx->k;
-  uint64_t table[16][66];
-  for (int i = 0; i < k; i++)
-    table[0][i] = ctx->r_mod_n[i];
-
-  zan_mont_mul_core(base_limbs, ctx->r2_mod_n, ctx->n, ctx->n0_inv, k,
-                    table[1]);
-  for (int w = 2; w < 16; w++) {
-    zan_mont_mul_core(table[w - 1], table[1], ctx->n, ctx->n0_inv, k, table[w]);
-  }
-
   int bitlen = 0;
   for (int i = e_k - 1; i >= 0; i--) {
     if (exp_limbs[i] != 0) {
@@ -490,37 +660,65 @@ static void zan_mont_exp_ctx(const zan_mont_ctx_t *ctx,
   }
 
   uint64_t result[66] = {0};
-  int started = 0;
-  int top_window = (bitlen + 3) / 4 - 1;
-  for (int w_idx = top_window; w_idx >= 0; w_idx--) {
-    int bit_pos = w_idx * 4;
-    int limb_idx = bit_pos / 64;
-    int bit_offset = bit_pos % 64;
-    uint32_t val = (uint32_t)((exp_limbs[limb_idx] >> bit_offset) & 0xF);
-    if (bit_offset > 60 && limb_idx + 1 < e_k) {
-      val |= (uint32_t)((exp_limbs[limb_idx + 1] << (64 - bit_offset)) & 0xF);
-    }
-
-    if (started) {
-      zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
-      zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
-      zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
-      zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
-      if (val > 0) {
-        zan_mont_mul_core(result, table[val], ctx->n, ctx->n0_inv, k, result);
-      }
-    } else {
-      if (val > 0) {
-        for (int i = 0; i < k; i++)
-          result[i] = table[val][i];
-        started = 1;
-      }
-    }
-  }
-
-  if (!started) {
+  if (bitlen == 0) {
     for (int i = 0; i < k; i++)
       result[i] = ctx->r_mod_n[i];
+  } else if (bitlen <= 32) {
+    /* 短公钥指数（如 e=65537 / e=3）直接二进制平方乘，免去 15/31 项预计算表浪费 */
+    uint64_t base_m[66] = {0};
+    zan_mont_mul_core(base_limbs, ctx->r2_mod_n, ctx->n, ctx->n0_inv, k,
+                      base_m);
+    for (int i = 0; i < k; i++)
+      result[i] = base_m[i];
+    uint64_t e0 = exp_limbs[0];
+    for (int b = bitlen - 2; b >= 0; b--) {
+      zan_mont_sqr_core(result, ctx->n, ctx->n0_inv, k, result);
+      if ((e0 >> b) & 1ULL) {
+        zan_mont_mul_core(result, base_m, ctx->n, ctx->n0_inv, k, result);
+      }
+    }
+  } else {
+    /* 长指数 / 私钥指数：常量时间固定窗口（>=256 位用 5-bit 窗口，其余用 4-bit） */
+    int win = (bitlen >= 256) ? 5 : 4;
+    int tbl_size = 1 << win;
+    uint32_t win_mask = (uint32_t)(tbl_size - 1);
+    uint64_t table[32][66];
+
+    for (int i = 0; i < k; i++)
+      table[0][i] = ctx->r_mod_n[i];
+    zan_mont_mul_core(base_limbs, ctx->r2_mod_n, ctx->n, ctx->n0_inv, k,
+                      table[1]);
+    for (int w = 2; w < tbl_size; w++) {
+      if ((w & 1) == 0) {
+        zan_mont_sqr_core(table[w >> 1], ctx->n, ctx->n0_inv, k, table[w]);
+      } else {
+        zan_mont_mul_core(table[w - 1], table[1], ctx->n, ctx->n0_inv, k,
+                          table[w]);
+      }
+    }
+
+    int top_window = (bitlen + win - 1) / win - 1;
+    uint64_t win_val[66];
+    for (int w_idx = top_window; w_idx >= 0; w_idx--) {
+      int bit_pos = w_idx * win;
+      int limb_idx = bit_pos / 64;
+      int bit_offset = bit_pos % 64;
+      uint32_t val = (uint32_t)((exp_limbs[limb_idx] >> bit_offset) & win_mask);
+      if (bit_offset + win > 64 && limb_idx + 1 < e_k) {
+        val |= (uint32_t)((exp_limbs[limb_idx + 1] << (64 - bit_offset)) &
+                          win_mask);
+      }
+
+      if (w_idx == top_window) {
+        zan_mont_ct_select(table, tbl_size, val, k, result);
+      } else {
+        for (int s = 0; s < win; s++) {
+          zan_mont_sqr_core(result, ctx->n, ctx->n0_inv, k, result);
+        }
+        zan_mont_ct_select(table, tbl_size, val, k, win_val);
+        zan_mont_mul_core(result, win_val, ctx->n, ctx->n0_inv, k, result);
+      }
+    }
   }
 
   uint64_t one[66] = {0};

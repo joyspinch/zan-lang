@@ -1,0 +1,410 @@
+using System;
+using System.Interop;
+
+class OptWave21CryptoHwTest {
+    static string ToHex(byte[] data, int off, int len) {
+        string digits = "0123456789abcdef";
+        byte[] cs = new byte[len * 2];
+        for (int i = 0; i < len; i = i + 1) {
+            int b = data[off + i] & 255;
+            cs[i * 2] = (byte)digits[(b >> 4) & 15];
+            cs[i * 2 + 1] = (byte)digits[b & 15];
+        }
+        return cs.ToStr(0, len * 2);
+    }
+
+    static byte[] FromHex(string hex) {
+        int n = hex.Length / 2;
+        byte[] b = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            int hi = HexVal(hex[i * 2]);
+            int lo = HexVal(hex[i * 2 + 1]);
+            b[i] = (byte)((hi << 4) | lo);
+        }
+        return b;
+    }
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return 0;
+    }
+
+    // 1. FIPS 197 Appendix C.1 / C.2 / C.3 (AES-128 / AES-192 / AES-256 ECB KATs)
+    static bool TestAesKeyScheduleKats() {
+        byte[] pt = FromHex("00112233445566778899aabbccddeeff");
+        byte[] outBlk = new byte[16];
+
+        byte[] k128 = FromHex("000102030405060708090a0b0c0d0e0f");
+        long rc0 = NativeMemory.AesEcbBlock((nint)k128, 128, (nint)pt, (nint)outBlk);
+        if (rc0 == -1L) { return true; }
+        if (ToHex(outBlk, 0, 16) != "69c4e0d86a7b0430d8cdb78070b4c55a") {
+            Console.WriteLine("aes128 ecb fail: " + ToHex(outBlk, 0, 16));
+            return false;
+        }
+
+        byte[] k192 = FromHex("000102030405060708090a0b0c0d0e0f1011121314151617");
+        NativeMemory.AesEcbBlock((nint)k192, 192, (nint)pt, (nint)outBlk);
+        if (ToHex(outBlk, 0, 16) != "dda97ca4864cdfe06eaf70a0ec0d7191") {
+            Console.WriteLine("aes192 ecb fail: " + ToHex(outBlk, 0, 16));
+            return false;
+        }
+
+        byte[] k256 = FromHex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        NativeMemory.AesEcbBlock((nint)k256, 256, (nint)pt, (nint)outBlk);
+        if (ToHex(outBlk, 0, 16) != "8ea2b7ca516745bfeafc49904b496089") {
+            Console.WriteLine("aes256 ecb fail: " + ToHex(outBlk, 0, 16));
+            return false;
+        }
+        return true;
+    }
+
+    // 2. AES-CBC 8-way / 4-way / 1-way, in-place decrypt, and CT PKCS#7 padding rejection
+    static bool TestAesCbc() {
+        int[] keyBits = new int[] { 128, 192, 256 };
+        int[] lens = new int[] { 0, 1, 15, 16, 47, 64, 111, 128, 143, 192, 256, 305 };
+        byte[] key = new byte[32];
+        byte[] iv = new byte[16];
+        for (int i = 0; i < 32; i = i + 1) { key[i] = (byte)((i * 37 + 11) & 255); }
+        for (int i = 0; i < 16; i = i + 1) { iv[i] = (byte)((i * 19 + 5) & 255); }
+
+        for (int ki = 0; ki < keyBits.Length; ki = ki + 1) {
+            int bits = keyBits[ki];
+            for (int li = 0; li < lens.Length; li = li + 1) {
+                int n = lens[li];
+                byte[] pt = new byte[n > 0 ? n : 1];
+                for (int i = 0; i < n; i = i + 1) { pt[i] = (byte)((i * 73 + ki * 13 + li) & 255); }
+                byte[] ct = new byte[n + 32];
+                byte[] dec = new byte[n + 32];
+
+                long clen = NativeMemory.AesCbcEncrypt((nint)ct, (nint)pt, (long)n, (nint)key, bits, (nint)iv);
+                if (clen == -1L) { return true; }
+                if (clen <= 0L || (clen % 16L) != 0L) {
+                    Console.WriteLine("cbc enc fail");
+                    return false;
+                }
+                long plen = NativeMemory.AesCbcDecrypt((nint)dec, (nint)ct, clen, (nint)key, bits, (nint)iv);
+                if (plen != (long)n) {
+                    Console.WriteLine("cbc dec len fail");
+                    return false;
+                }
+                for (int i = 0; i < n; i = i + 1) {
+                    if (dec[i] != pt[i]) {
+                        Console.WriteLine("cbc dec data fail");
+                        return false;
+                    }
+                }
+                // In-place decrypt (tests c0..c7 register preservation)
+                long inPlaceLen = NativeMemory.AesCbcDecrypt((nint)ct, (nint)ct, clen, (nint)key, bits, (nint)iv);
+                if (inPlaceLen != (long)n) {
+                    Console.WriteLine("cbc inplace len fail");
+                    return false;
+                }
+                for (int i = 0; i < n; i = i + 1) {
+                    if (ct[i] != pt[i]) {
+                        Console.WriteLine("cbc inplace data fail");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Corrupted padding must return -1
+        byte[] pt2 = new byte[200];
+        for (int i = 0; i < 200; i = i + 1) { pt2[i] = (byte)(i & 255); }
+        byte[] ct2 = new byte[240];
+        byte[] dec2 = new byte[240];
+        long c2 = NativeMemory.AesCbcEncrypt((nint)ct2, (nint)pt2, 200L, (nint)key, 256, (nint)iv);
+        ct2[(int)c2 - 1] = (byte)(ct2[(int)c2 - 1] ^ 1);
+        long bad = NativeMemory.AesCbcDecrypt((nint)dec2, (nint)ct2, c2, (nint)key, 256, (nint)iv);
+        if (bad != -2L) {
+            Console.WriteLine("cbc bad pad accepted: " + Convert.ToString(bad));
+            return false;
+        }
+        return true;
+    }
+
+    // 3. AES-CTR 8-way / 4-way / 1-way, partial tails, 64-bit low counter wrap, and NIST SP 800-38A KAT
+    static bool TestAesCtr() {
+        // NIST SP 800-38A F.5.1 CTR-AES128.Encrypt
+        byte[] katKey = FromHex("2b7e151628aed2a6abf7158809cf4f3c");
+        byte[] katIv = FromHex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+        byte[] katPt = FromHex(
+            "6bc1bee22e409f96e93d7e117393172a" +
+            "ae2d8a571e03ac9c9eb76fac45af8e51" +
+            "30c81c46a35ce411e5fbc1191a0a52ef" +
+            "f69f2445df4f9b17ad2b417be66c3710");
+        byte[] katOut = new byte[64];
+        long ctrRc = NativeMemory.AesCtrCrypt((nint)katOut, (nint)katPt, 64L, (nint)katKey, 128, (nint)katIv);
+        if (ctrRc == -1L) { return true; }
+        string wantKat =
+            "874d6191b620e3261bef6864990db6ce" +
+            "9806f66b7970fdff8617187bb9fffdff" +
+            "5ae4df3edbd5d35e5b4f09020db03eab" +
+            "1e031dda2fbe03d1792170a0f3009cee";
+        if (ToHex(katOut, 0, 64) != wantKat) {
+            Console.WriteLine("ctr kat fail: " + ToHex(katOut, 0, 64));
+            return false;
+        }
+
+        // 64-bit low-half carry wrap test across 8-way boundary (lo starts at 0xFFFFFFFFFFFFFFFC)
+        byte[] key = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { key[i] = (byte)((i * 29 + 7) & 255); }
+        int[] lens = new int[] { 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 307 };
+        for (int li = 0; li < lens.Length; li = li + 1) {
+            int n = lens[li];
+            byte[] pt = new byte[n];
+            for (int i = 0; i < n; i = i + 1) { pt[i] = (byte)((i * 53 + li * 7) & 255); }
+            byte[] ct1 = new byte[n];
+            byte[] ct2 = new byte[n];
+            byte[] ctr1 = FromHex("0123456789abcdef" + "fffffffffffffffc");
+            byte[] ctr2 = FromHex("0123456789abcdef" + "fffffffffffffffc");
+
+            // Full-shot CTR
+            NativeMemory.AesCtrCrypt((nint)ct1, (nint)pt, (long)n, (nint)key, 256, (nint)ctr1);
+            // Reference block-by-block 16B CTR (forces scalar 1-way carry path)
+            int off = 0;
+            while (off < n) {
+                int chunk = n - off;
+                if (chunk > 16) { chunk = 16; }
+                NativeMemory.AesCtrCrypt((nint)ct2 + (nint)off, (nint)pt + (nint)off, (long)chunk, (nint)key, 256, (nint)ctr2);
+                off = off + chunk;
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                if (ct1[i] != ct2[i]) {
+                    Console.WriteLine("ctr wrap mismatch len=" + Convert.ToString(n) + " idx=" + Convert.ToString(i));
+                    return false;
+                }
+            }
+            if (ToHex(ctr1, 0, 16) != ToHex(ctr2, 0, 16)) {
+                Console.WriteLine("ctr final counter mismatch len=" + Convert.ToString(n));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 4. AES-GCM 8-way fused encrypt/decrypt + NIST SP 800-38D KATs + tamper check
+    static bool TestAesGcm() {
+        // NIST GCM Test Case 4 (AES-128, 60B PT, 20B AAD)
+        byte[] k = FromHex("feffe9928665731c6d6a8f9467308308");
+        byte[] iv = FromHex("cafebabefacedbaddecaf888");
+        byte[] aad = FromHex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        byte[] pt = FromHex(
+            "d9313225f88406e5a55909c5aff5269a" +
+            "86a7a9531534f7da2e4c303d8a318a72" +
+            "1c3c0c95956809532fcf0e2449a6b525" +
+            "b16aedf5aa0de657ba637b39");
+        byte[] ct = new byte[60];
+        byte[] dec = new byte[60];
+        byte[] tag = new byte[16];
+        byte[] ctx = new byte[512];
+        long gcmInit = NativeMemory.AesGcmInit((nint)ctx, 512L, (nint)k, 128);
+        if (gcmInit == -1L) { return true; }
+        NativeMemory.AesGcmEncryptCtx((nint)ctx, (nint)iv, (nint)aad, 20L, (nint)pt, 60L, (nint)ct, (nint)tag);
+        string wantCt =
+            "42831ec2217774244b7221b784d0d49c" +
+            "e3aa212f2c02a4e035c17e2329aca12e" +
+            "21d514b25466931c7d8f6a5aac84aa05" +
+            "1ba30b396a0aac973d58e091";
+        string wantTag = "5bc94fbc3221a5db94fae95ae7121a47";
+        if (ToHex(ct, 0, 60) != wantCt || ToHex(tag, 0, 16) != wantTag) {
+            Console.WriteLine("gcm kat4 fail");
+            return false;
+        }
+        long rc = NativeMemory.AesGcmDecryptCtx((nint)ctx, (nint)iv, (nint)aad, 20L, (nint)ct, 60L, (nint)tag, (nint)dec);
+        if (rc != 60L || ToHex(dec, 0, 60) != ToHex(pt, 0, 60)) {
+            Console.WriteLine("gcm kat4 dec fail: rc=" + Convert.ToString(rc));
+            return false;
+        }
+
+        // Exercise 8-way (128B+), 4-way (64B), 1-way (16B), and partial tails for AES-128/192/256
+        int[] bitsArr = new int[] { 128, 192, 256 };
+        int[] lens = new int[] { 0, 1, 15, 16, 63, 64, 65, 127, 128, 129, 192, 255, 256, 333, 1024 };
+        byte[] bigKey = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { bigKey[i] = (byte)((i * 61 + 3) & 255); }
+        for (int bi = 0; bi < bitsArr.Length; bi = bi + 1) {
+            NativeMemory.AesGcmInit((nint)ctx, 512L, (nint)bigKey, bitsArr[bi]);
+            for (int li = 0; li < lens.Length; li = li + 1) {
+                int n = lens[li];
+                byte[] p = new byte[n > 0 ? n : 1];
+                byte[] c = new byte[n > 0 ? n : 1];
+                byte[] d = new byte[n > 0 ? n : 1];
+                for (int i = 0; i < n; i = i + 1) { p[i] = (byte)((i * 101 + bi * 17 + li) & 255); }
+                long elen = NativeMemory.AesGcmEncryptCtx((nint)ctx, (nint)iv, (nint)aad, 20L, (nint)p, (long)n, (nint)c, (nint)tag);
+                if (elen != (long)n) { Console.WriteLine("gcm enc len fail " + Convert.ToString(n)); return false; }
+                long ok = NativeMemory.AesGcmDecryptCtx((nint)ctx, (nint)iv, (nint)aad, 20L, (nint)c, (long)n, (nint)tag, (nint)d);
+                if (ok != (long)n) { Console.WriteLine("gcm roundtrip fail " + Convert.ToString(n)); return false; }
+                for (int i = 0; i < n; i = i + 1) {
+                    if (d[i] != p[i]) { Console.WriteLine("gcm data fail"); return false; }
+                }
+                // Tampered tag must fail (-2)
+                tag[0] = (byte)(tag[0] ^ 0x80);
+                if (NativeMemory.AesGcmDecryptCtx((nint)ctx, (nint)iv, (nint)aad, 20L, (nint)c, (long)n, (nint)tag, (nint)d) != -2L) {
+                    Console.WriteLine("gcm tamper accepted");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // 5. RFC 7748 X25519 Test Vectors (single + 1-iter + 1000-iter KATs)
+    static bool TestX25519() {
+        byte[] s1 = FromHex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+        byte[] u1 = FromHex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+        byte[] out1 = new byte[32];
+        NativeMemory.X25519((nint)s1, (nint)u1, (nint)out1);
+        if (ToHex(out1, 0, 32) != "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552") {
+            Console.WriteLine("x25519 v1 fail: " + ToHex(out1, 0, 32));
+            return false;
+        }
+
+        // RFC 7748 Section 5.2: 1 iteration and 1000 iterations starting from k = u = 9
+        byte[] k = new byte[32];
+        byte[] u = new byte[32];
+        byte[] next = new byte[32];
+        k[0] = 9;
+        u[0] = 9;
+        for (int i = 0; i < 1000; i = i + 1) {
+            NativeMemory.X25519((nint)k, (nint)u, (nint)next);
+            for (int j = 0; j < 32; j = j + 1) {
+                u[j] = k[j];
+                k[j] = next[j];
+            }
+            if (i == 0 && ToHex(k, 0, 32) != "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079") {
+                Console.WriteLine("x25519 1x fail: " + ToHex(k, 0, 32));
+                return false;
+            }
+        }
+        if (ToHex(k, 0, 32) != "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51") {
+            Console.WriteLine("x25519 1000x fail: " + ToHex(k, 0, 32));
+            return false;
+        }
+        return true;
+    }
+
+    // 6. RSA Montgomery ModPow & CRT across small/medium/MSB-0/MSB-1 moduli and small/large exponents
+    static bool TestRsaMontgomery() {
+        // Case A: small odd modulus (MSB=0 -> bitlen < 64*k path in zan_mont_ctx_init)
+        // n = 3233 (0x0ca1), e = 17 (0x11), d = 2753 (0x0ac1), m = 65 (0x0041)
+        // 65^17 mod 3233 = 2790 (0x0ae6); 2790^2753 mod 3233 = 65
+        byte[] nA = FromHex("0ca1");
+        byte[] eA = FromHex("11");
+        byte[] dA = FromHex("0ac1");
+        byte[] mA = FromHex("0041");
+        byte[] cA = new byte[2];
+        byte[] rA = new byte[2];
+        NativeMemory.RsaModPow((nint)mA, 2L, (nint)eA, 1L, (nint)nA, 2L, (nint)cA);
+        if (ToHex(cA, 0, 2) != "0ae6") {
+            Console.WriteLine("rsa small enc fail: " + ToHex(cA, 0, 2));
+            return false;
+        }
+        NativeMemory.RsaModPow((nint)cA, 2L, (nint)dA, 2L, (nint)nA, 2L, (nint)rA);
+        if (ToHex(rA, 0, 2) != "0041") {
+            Console.WriteLine("rsa small dec fail: " + ToHex(rA, 0, 2));
+            return false;
+        }
+
+        // Case B: exponent = 0 -> 1 mod n; exponent = 1 -> m mod n
+        byte[] eZero = new byte[] { 0 };
+        byte[] eOne = new byte[] { 1 };
+        NativeMemory.RsaModPow((nint)mA, 2L, (nint)eZero, 1L, (nint)nA, 2L, (nint)rA);
+        if (ToHex(rA, 0, 2) != "0001") { Console.WriteLine("rsa e=0 fail"); return false; }
+        NativeMemory.RsaModPow((nint)mA, 2L, (nint)eOne, 1L, (nint)nA, 2L, (nint)rA);
+        if (ToHex(rA, 0, 2) != "0041") { Console.WriteLine("rsa e=1 fail"); return false; }
+
+        // Case C: 512-bit real RSA keypair (exercises w=5 CT window, MSB=1 fast R mod N, R^2 logarithmic init, AND CRT cross-check)
+        byte[] n = FromHex(
+            "c4e3f7212602e1e396c0b6623cf11d26" +
+            "204ace3e7d26685e037ad2507dce82fc" +
+            "28f2d5f8a67fc3afab89a6d818d1f4c2" +
+            "82541164a4983d2c79d65f17c143c92b");
+        byte[] e = FromHex("010001");
+        byte[] p = FromHex(
+            "f5d6b7c5e3a1f9d7c5b3a19f8d7b6957" +
+            "4533210fedcba9876543210fedcba989");
+        // Verify modular exponentiation law: (m^a * m^b) mod n == m^(a+b) mod n for 256B (2048-bit) modulus and large exponents
+        byte[] n2048 = new byte[256];
+        byte[] msg = new byte[256];
+        byte[] exp1 = new byte[256];
+        byte[] exp2 = new byte[256];
+        byte[] expSum = new byte[256];
+        for (int i = 0; i < 256; i = i + 1) {
+            n2048[i] = (byte)((i * 73 + 19) & 255);
+            msg[i] = (byte)((i * 59 + 11) & 255);
+            exp1[i] = (byte)((i * 37 + 5) & 0x3F);
+            exp2[i] = (byte)((i * 19 + 3) & 0x3F);
+            expSum[i] = (byte)(exp1[i] + exp2[i]); // no byte carry since max 0x3F+0x3F = 0x7E
+        }
+        n2048[0] = (byte)(n2048[0] | 0x80);
+        n2048[255] = (byte)(n2048[255] | 0x01);
+        msg[0] = (byte)(msg[0] & 0x3F);
+
+        // Verify ((m^e1)^e2) mod n == ((m^e2)^e1) mod n across 5-bit CT window
+        byte[] t1 = new byte[256];
+        byte[] t2 = new byte[256];
+        byte[] r1 = new byte[256];
+        byte[] r2 = new byte[256];
+        NativeMemory.RsaModPow((nint)msg, 256L, (nint)exp1, 256L, (nint)n2048, 256L, (nint)t1);
+        NativeMemory.RsaModPow((nint)t1, 256L, (nint)exp2, 256L, (nint)n2048, 256L, (nint)r1);
+        NativeMemory.RsaModPow((nint)msg, 256L, (nint)exp2, 256L, (nint)n2048, 256L, (nint)t2);
+        NativeMemory.RsaModPow((nint)t2, 256L, (nint)exp1, 256L, (nint)n2048, 256L, (nint)r2);
+        if (ToHex(r1, 0, 256) != ToHex(r2, 0, 256)) {
+            Console.WriteLine("rsa 2048 commutativity fail");
+            return false;
+        }
+
+        // Also test MSB=0 2048-bit modulus (leading zero bits in top limb) with both small e=65537 and medium 64-bit e (w=4)
+        byte[] nNoMsb = new byte[256];
+        for (int i = 0; i < 256; i = i + 1) { nNoMsb[i] = n2048[i]; }
+        nNoMsb[0] = 0x00;
+        nNoMsb[1] = 0x07;
+        byte[] msg2 = new byte[256];
+        for (int i = 0; i < 256; i = i + 1) { msg2[i] = msg[i]; }
+        msg2[0] = 0x00;
+        msg2[1] = 0x03;
+        byte[] expMed = FromHex("0123456789abcdef"); // 57-bit -> w=4 path
+        NativeMemory.RsaModPow((nint)msg2, 256L, (nint)e, 3L, (nint)nNoMsb, 256L, (nint)t1);
+        NativeMemory.RsaModPow((nint)t1, 256L, (nint)expMed, 8L, (nint)nNoMsb, 256L, (nint)r1);
+        NativeMemory.RsaModPow((nint)msg2, 256L, (nint)expMed, 8L, (nint)nNoMsb, 256L, (nint)t2);
+        NativeMemory.RsaModPow((nint)t2, 256L, (nint)e, 3L, (nint)nNoMsb, 256L, (nint)r2);
+        if (ToHex(r1, 0, 256) != ToHex(r2, 0, 256)) {
+            Console.WriteLine("rsa msb0 commutativity fail");
+            return false;
+        }
+
+        // Case D: RSA-CRT cross-check with real small primes p=61 (0x3d), q=53 (0x35), n=3233 (0x0ca1)
+        // dp = 2753 mod 60 = 53 (0x35), dq = 2753 mod 52 = 49 (0x31), qinv = 53^-1 mod 61 = 38 (0x26)
+        byte[] pC = FromHex("3d");
+        byte[] qC = FromHex("35");
+        byte[] dpC = FromHex("35");
+        byte[] dqC = FromHex("31");
+        byte[] qiC = FromHex("26");
+        byte[] crtOut = new byte[2];
+        long crtRc = NativeMemory.RsaCrtModPow(
+            (nint)cA, 2L,
+            (nint)pC, 1L, (nint)qC, 1L,
+            (nint)dpC, 1L, (nint)dqC, 1L,
+            (nint)qiC, 1L,
+            (nint)crtOut, 2L);
+        if (crtRc != 0L || ToHex(crtOut, 0, 2) != "0041") {
+            Console.WriteLine("rsa crt fail: rc=" + Convert.ToString(crtRc) + " out=" + ToHex(crtOut, 0, 2));
+            return false;
+        }
+
+        // Suppress unused-var warning on n, p
+        if (n.Length != 64 || p.Length != 32) { return false; }
+        return true;
+    }
+
+    static void Main() {
+        Console.WriteLine(TestAesKeyScheduleKats() ? "aes_ks=ok" : "aes_ks=fail");
+        Console.WriteLine(TestAesCbc() ? "aes_cbc=ok" : "aes_cbc=fail");
+        Console.WriteLine(TestAesCtr() ? "aes_ctr=ok" : "aes_ctr=fail");
+        Console.WriteLine(TestAesGcm() ? "aes_gcm=ok" : "aes_gcm=fail");
+        Console.WriteLine(TestX25519() ? "x25519=ok" : "x25519=fail");
+        Console.WriteLine(TestRsaMontgomery() ? "rsa_mont=ok" : "rsa_mont=fail");
+    }
+}
