@@ -39,6 +39,9 @@ typedef SRWLOCK pthread_mutex_t;
 #define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
 static int pthread_mutex_lock(pthread_mutex_t *m) { AcquireSRWLockExclusive(m); return 0; }
 static int pthread_mutex_unlock(pthread_mutex_t *m) { ReleaseSRWLockExclusive(m); return 0; }
+typedef CONDITION_VARIABLE pthread_cond_t;
+#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
+static int pthread_cond_signal(pthread_cond_t *c) { WakeConditionVariable(c); return 0; }
 typedef INIT_ONCE pthread_once_t;
 #define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
 struct once_call { void (*fn)(void); };
