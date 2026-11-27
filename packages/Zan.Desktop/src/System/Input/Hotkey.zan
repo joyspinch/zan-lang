@@ -39,6 +39,8 @@ public class Hotkey {
     static HotkeyCallback callback;
 
     // 多热键槽位管理（独立于单槽位 API，支持同时注册多个全局快捷键）。
+    static object slotOpLock = new object();
+    static object slotMapLock = new object();
     static Dict<int, HotkeyCallback> slotCallbacks;
     static int nextSlotId = 0x5B00;
     static int slotPumpRunning;
@@ -58,6 +60,9 @@ public class Hotkey {
 
     [DllImport("user32", EntryPoint = "GetMessageW")]
     private static extern int GetMessageW(nint msg, nint hwnd, int min, int max);
+
+    [DllImport("user32", EntryPoint = "PeekMessageW")]
+    private static extern int PeekMessageW(nint msg, nint hwnd, int min, int max, int removeMsg);
 
     [DllImport("user32", EntryPoint = "PostThreadMessageW")]
     private static extern int PostThreadMessageW(int threadId, int msg, nint wp, nint lp);
@@ -294,45 +299,57 @@ public class Hotkey {
     public static int RegisterSlot(int vk, int mods, HotkeyCallback cb) {
         if (vk == 0 || cb == null) { return 0; }
         #if WINDOWS
-        if (Hotkey.slotCallbacks == null) { Hotkey.slotCallbacks = new Dict<int, HotkeyCallback>(); }
-        if (Hotkey.slotPumpRunning == 0) {
-            Hotkey.slotPumpWantExit = 0;
-            Hotkey.slotThreadId = 0;
-            Thread.Start(Hotkey.SlotPumpThreadEntry);
-            for (int w = 0; Hotkey.slotPumpRunning == 0 && w < 500; w = w + 1) {
-                Thread.Sleep(1);
+        lock (Hotkey.slotOpLock) {
+            if (Hotkey.slotPumpRunning == 0) {
+                Hotkey.slotPumpWantExit = 0;
+                Hotkey.slotThreadId = 0;
+                Thread.Start(Hotkey.SlotPumpThreadEntry);
+                for (int w = 0; Hotkey.slotPumpRunning == 0 && w < 500; w = w + 1) {
+                    Thread.Sleep(1);
+                }
+                if (Hotkey.slotPumpRunning == 0) { return 0; }
             }
-            if (Hotkey.slotPumpRunning == 0) { return 0; }
+            int id = Hotkey.nextSlotId;
+            Hotkey.nextSlotId = Hotkey.nextSlotId + 1;
+            lock (Hotkey.slotMapLock) {
+                if (Hotkey.slotCallbacks == null) { Hotkey.slotCallbacks = new Dict<int, HotkeyCallback>(); }
+                Hotkey.slotCallbacks[id] = cb;
+            }
+            Hotkey.slotPendingId = id;
+            Hotkey.slotPendingMods = mods;
+            Hotkey.slotPendingVk = vk;
+            Hotkey.slotPendingDone = 0;
+            Hotkey.slotPendingOk = 0;
+            int posted = Hotkey.PostThreadMessageW(Hotkey.slotThreadId, 0x8001 /*WM_APP+1*/, (nint)id, 0);
+            if (posted != 0) {
+                for (int w = 0; Hotkey.slotPendingDone == 0 && w < 500; w = w + 1) {
+                    Thread.Sleep(1);
+                }
+            }
+            if (posted == 0 || Hotkey.slotPendingOk == 0) {
+                lock (Hotkey.slotMapLock) {
+                    if (Hotkey.slotCallbacks != null) { Hotkey.slotCallbacks.Remove(id); }
+                }
+                return 0;
+            }
+            return id;
         }
-        int id = Hotkey.nextSlotId;
-        Hotkey.nextSlotId = Hotkey.nextSlotId + 1;
-        Hotkey.slotCallbacks[id] = cb;
-        Hotkey.slotPendingId = id;
-        Hotkey.slotPendingMods = mods;
-        Hotkey.slotPendingVk = vk;
-        Hotkey.slotPendingDone = 0;
-        Hotkey.slotPendingOk = 0;
-        Hotkey.PostThreadMessageW(Hotkey.slotThreadId, 0x8001 /*WM_APP+1*/, (nint)id, 0);
-        for (int w = 0; Hotkey.slotPendingDone == 0 && w < 500; w = w + 1) {
-            Thread.Sleep(1);
-        }
-        if (Hotkey.slotPendingOk == 0) {
-            Hotkey.slotCallbacks.Remove(id);
-            return 0;
-        }
-        return id;
         #elif LINUX || MACOS
-        if (Hotkey.slotCallbacks == null) { Hotkey.slotCallbacks = new Dict<int, HotkeyCallback>(); }
-        int id = Hotkey.nextSlotId;
-        Hotkey.nextSlotId = Hotkey.nextSlotId + 1;
-        if (Hotkey.NativeRegister(id, mods, vk) == 0) { return 0; }
-        Hotkey.slotCallbacks[id] = cb;
-        if (Hotkey.slotPumpRunning == 0) {
-            Hotkey.slotPumpWantExit = 0;
-            Hotkey.slotPumpRunning = 1;
-            Thread.Start(Hotkey.PosixSlotPumpThreadEntry);
+        lock (Hotkey.slotOpLock) {
+            int id = Hotkey.nextSlotId;
+            Hotkey.nextSlotId = Hotkey.nextSlotId + 1;
+            if (Hotkey.NativeRegister(id, mods, vk) == 0) { return 0; }
+            lock (Hotkey.slotMapLock) {
+                if (Hotkey.slotCallbacks == null) { Hotkey.slotCallbacks = new Dict<int, HotkeyCallback>(); }
+                Hotkey.slotCallbacks[id] = cb;
+            }
+            if (Hotkey.slotPumpRunning == 0) {
+                Hotkey.slotPumpWantExit = 0;
+                Hotkey.slotPumpRunning = 1;
+                Thread.Start(Hotkey.PosixSlotPumpThreadEntry);
+            }
+            return id;
         }
-        return id;
         #else
         throw new PlatformNotSupportedException(
             "Global hotkeys are only supported on Windows, Linux, and macOS.");
@@ -343,25 +360,51 @@ public class Hotkey {
     public static bool UnregisterSlot(int id) {
         if (id <= 0) { return false; }
         #if WINDOWS
-        if (Hotkey.slotCallbacks == null || !Hotkey.slotCallbacks.ContainsKey(id)) { return false; }
-        Hotkey.slotPendingId = id;
-        Hotkey.slotPendingDone = 0;
-        Hotkey.slotPendingOk = 0;
-        if (Hotkey.slotPumpRunning != 0 && Hotkey.slotThreadId != 0) {
-            Hotkey.PostThreadMessageW(Hotkey.slotThreadId, 0x8002 /*WM_APP+2*/, (nint)id, 0);
-            for (int w = 0; Hotkey.slotPendingDone == 0 && w < 500; w = w + 1) {
-                Thread.Sleep(1);
+        lock (Hotkey.slotOpLock) {
+            bool exists = false;
+            lock (Hotkey.slotMapLock) {
+                exists = Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(id);
             }
+            if (!exists) { return false; }
+            Hotkey.slotPendingId = id;
+            Hotkey.slotPendingDone = 0;
+            Hotkey.slotPendingOk = 0;
+            if (Hotkey.slotPumpRunning != 0 && Hotkey.slotThreadId != 0) {
+                int posted = Hotkey.PostThreadMessageW(Hotkey.slotThreadId, 0x8002 /*WM_APP+2*/, (nint)id, 0);
+                if (posted != 0) {
+                    for (int w = 0; Hotkey.slotPendingDone == 0 && w < 500; w = w + 1) {
+                        Thread.Sleep(1);
+                    }
+                }
+            }
+            int remaining = 0;
+            lock (Hotkey.slotMapLock) {
+                if (Hotkey.slotCallbacks != null) {
+                    Hotkey.slotCallbacks.Remove(id);
+                    remaining = Hotkey.slotCallbacks.Count;
+                }
+            }
+            if (remaining == 0) { Hotkey.StopSlotPump(); }
+            return true;
         }
-        Hotkey.slotCallbacks.Remove(id);
-        if (Hotkey.slotCallbacks.Count == 0) { Hotkey.StopSlotPump(); }
-        return true;
         #elif LINUX || MACOS
-        if (Hotkey.slotCallbacks == null || !Hotkey.slotCallbacks.ContainsKey(id)) { return false; }
-        Hotkey.NativeUnregister(id);
-        Hotkey.slotCallbacks.Remove(id);
-        if (Hotkey.slotCallbacks.Count == 0) { Hotkey.slotPumpWantExit = 1; }
-        return true;
+        lock (Hotkey.slotOpLock) {
+            bool exists = false;
+            lock (Hotkey.slotMapLock) {
+                exists = Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(id);
+            }
+            if (!exists) { return false; }
+            Hotkey.NativeUnregister(id);
+            int remaining = 0;
+            lock (Hotkey.slotMapLock) {
+                if (Hotkey.slotCallbacks != null) {
+                    Hotkey.slotCallbacks.Remove(id);
+                    remaining = Hotkey.slotCallbacks.Count;
+                }
+            }
+            if (remaining == 0) { Hotkey.slotPumpWantExit = 1; }
+            return true;
+        }
         #else
         return false;
         #endif
@@ -370,10 +413,13 @@ public class Hotkey {
     // 注销所有通过 RegisterSlot 注册的热键。
     public static void UnregisterAllSlots() {
         #if WINDOWS || LINUX || MACOS
-        if (Hotkey.slotCallbacks == null) { return; }
         List<int> ids = new List<int>();
-        foreach (int k in Hotkey.slotCallbacks.Keys) {
-            ids.Add(k);
+        lock (Hotkey.slotMapLock) {
+            if (Hotkey.slotCallbacks != null) {
+                foreach (int k in Hotkey.slotCallbacks.Keys) {
+                    ids.Add(k);
+                }
+            }
         }
         for (int i = 0; i < ids.Count; i = i + 1) {
             Hotkey.UnregisterSlot(ids[i]);
@@ -384,7 +430,9 @@ public class Hotkey {
     // 返回当前通过 RegisterSlot 注册的热键数量。
     public static int SlotCount() {
         #if WINDOWS || LINUX || MACOS
-        return Hotkey.slotCallbacks != null ? Hotkey.slotCallbacks.Count : 0;
+        lock (Hotkey.slotMapLock) {
+            return Hotkey.slotCallbacks != null ? Hotkey.slotCallbacks.Count : 0;
+        }
         #else
         return 0;
         #endif
@@ -406,9 +454,9 @@ public class Hotkey {
     private static void SlotPumpThreadEntry() {
         Hotkey.slotThreadId = Hotkey.GetCurrentThreadId();
         nint msg = NativeMemory.Alloc(64);
-        // 先调用一次 PeekMessage/GetMessage 等价初始化线程队列：
-        // RegisterHotKey(0, ...) 自动创建队列，此处用无害的 PostThreadMessage 触发即可。
-        Hotkey.PostThreadMessageW(Hotkey.slotThreadId, 0x8000 /*WM_APP*/, 0, 0);
+        // 必须通过 PeekMessageW(PM_NOREMOVE) 强制创建当前线程的消息队列，
+        // 否则后续主线程 PostThreadMessageW 会因目标线程无队列而失败。
+        Hotkey.PeekMessageW(msg, (nint)0, 0, 0, 0 /* PM_NOREMOVE */);
         Hotkey.slotPumpRunning = 1;
         try {
             while (Hotkey.slotPumpWantExit == 0) {
@@ -429,18 +477,27 @@ public class Hotkey {
                     // MSG.wParam 在 64-bit Windows 上位于偏移 16（Span<long> 索引 2）。
                     Span<long> ml = new Span<long>(msg, 8);
                     int hitId = (int)ml[2];
-                    if (Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(hitId)) {
-                        HotkeyCallback cb = Hotkey.slotCallbacks[hitId];
-                        if (cb != null) { cb(); }
+                    HotkeyCallback cb = null;
+                    lock (Hotkey.slotMapLock) {
+                        if (Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(hitId)) {
+                            cb = Hotkey.slotCallbacks[hitId];
+                        }
                     }
+                    if (cb != null) { cb(); }
                 }
             }
         } finally {
             NativeMemory.Free(msg);
-            if (Hotkey.slotCallbacks != null) {
-                foreach (int k in Hotkey.slotCallbacks.Keys) {
-                    Hotkey.UnregisterHotKey(0, k);
+            List<int> leftover = new List<int>();
+            lock (Hotkey.slotMapLock) {
+                if (Hotkey.slotCallbacks != null) {
+                    foreach (int k in Hotkey.slotCallbacks.Keys) {
+                        leftover.Add(k);
+                    }
                 }
+            }
+            for (int i = 0; i < leftover.Count; i = i + 1) {
+                Hotkey.UnregisterHotKey(0, leftover[i]);
             }
             Hotkey.slotPumpRunning = 0;
             Hotkey.slotThreadId = 0;
@@ -451,8 +508,13 @@ public class Hotkey {
         try {
             while (Hotkey.slotPumpWantExit == 0) {
                 int ev = Hotkey.NativeNextEvent(100);
-                if (ev > 0 && Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(ev)) {
-                    HotkeyCallback cb = Hotkey.slotCallbacks[ev];
+                if (ev > 0) {
+                    HotkeyCallback cb = null;
+                    lock (Hotkey.slotMapLock) {
+                        if (Hotkey.slotCallbacks != null && Hotkey.slotCallbacks.ContainsKey(ev)) {
+                            cb = Hotkey.slotCallbacks[ev];
+                        }
+                    }
                     if (cb != null) { cb(); }
                 } else if (ev < 0) {
                     break;

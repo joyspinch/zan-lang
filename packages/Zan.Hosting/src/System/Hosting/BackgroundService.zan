@@ -26,6 +26,7 @@ public class BackgroundService : IHostedService, IDisposable {
     // 上一轮循环体的耗时（微秒，不含间隔等待）。
     public long lastTickUs = 0;
     public CancellationTokenSource cts = null;
+    private Gate sleepGate = null;
     private bool loopRunning = false;
 
     public BackgroundService() { }
@@ -57,44 +58,61 @@ public class BackgroundService : IHostedService, IDisposable {
 
     public async bool StartAsync(CancellationToken ct) {
         CancellationTokenSource runCts = null;
+        Gate runGate = null;
         lock (this) {
             if (this.started) { return true; }
             this.started = true;
             this.stopped = false;
             this.loopRunning = true;
             if (this.cts != null) { this.cts.Dispose(); }
+            if (this.sleepGate != null) { this.sleepGate.Close(); }
             runCts = new CancellationTokenSource();
+            runGate = new Gate();
             this.cts = runCts;
+            this.sleepGate = runGate;
         }
-        this.handle = Task.Spawn(this.RunLoopWith(runCts));
+        this.handle = Task.Spawn(this.RunLoopWith(runCts, runGate));
         return true;
     }
 
     public async bool StopAsync(CancellationToken ct) {
         if (!this.started) { return true; }
         CancellationTokenSource c = null;
-        lock (this) { c = this.cts; }
+        Gate g = null;
+        lock (this) {
+            c = this.cts;
+            g = this.sleepGate;
+        }
         if (c != null) { c.Cancel(); }
+        if (g != null) { g.SignalAll(); }
         return await this.Join(3000);
     }
 
     public void Dispose() {
         CancellationTokenSource toCancel = null;
         CancellationTokenSource toDispose = null;
+        Gate toSignal = null;
+        Gate toClose = null;
         lock (this) {
             toCancel = this.cts;
             this.cts = null;
-            if (toCancel != null && !this.loopRunning) {
+            toSignal = this.sleepGate;
+            this.sleepGate = null;
+            if (!this.loopRunning) {
                 toDispose = toCancel;
+                toClose = toSignal;
             }
         }
         if (toCancel != null) { toCancel.Cancel(); }
+        if (toSignal != null) { toSignal.SignalAll(); }
         if (toDispose != null) { toDispose.Dispose(); }
+        if (toClose != null) { toClose.Close(); }
     }
 
     // 有界等待循环退出。Task 侧没有带超时的 WhenAll，用 IsDone 轮询实现，
     // 返回是否真的退出了（false = 超时，循环体里可能有长任务不响应取消）。
     public async bool Join(long timeoutMs) {
+        if (timeoutMs < 0L) { timeoutMs = 0L; }
         long waited = 0;
         while (this.handle != 0 && Task.IsDone(this.handle) == 0 && waited < timeoutMs) {
             await Task.Delay(10);
@@ -105,14 +123,16 @@ public class BackgroundService : IHostedService, IDisposable {
 
     public async void RunLoop() {
         CancellationTokenSource localCts = null;
+        Gate localGate = null;
         lock (this) {
             localCts = this.cts;
+            localGate = this.sleepGate;
             this.loopRunning = true;
         }
-        await this.RunLoopWith(localCts);
+        await this.RunLoopWith(localCts, localGate);
     }
 
-    private async void RunLoopWith(CancellationTokenSource localCts) {
+    private async void RunLoopWith(CancellationTokenSource localCts, Gate localGate) {
         try {
             while (localCts != null && !localCts.Token.IsCancellationRequested) {
                 long t0 = Stopwatch.GetMicroseconds();
@@ -132,19 +152,36 @@ public class BackgroundService : IHostedService, IDisposable {
                 this.lastTickUs = Stopwatch.GetMicroseconds() - t0;
                 if (!more) { break; }
                 if (localCts.Token.IsCancellationRequested) { break; }
-                if (this.intervalMs > 0) { await Task.Delay(this.intervalMs); }
-                else { await Task.Yield(); }
+                long rem = this.intervalMs;
+                if (rem > 0L) {
+                    if (localGate != null) {
+                        while (rem > 0L && !localCts.Token.IsCancellationRequested) {
+                            int chunk = rem > 60000L ? 60000 : (int)rem;
+                            await localGate.Wait(chunk);
+                            rem = rem - (long)chunk;
+                        }
+                    } else {
+                        await Task.Delay(rem);
+                    }
+                } else {
+                    await Task.Yield();
+                }
             }
         } finally {
             CancellationTokenSource deferredDispose = null;
+            Gate deferredClose = null;
             lock (this) {
                 this.loopRunning = false;
                 this.stopped = true;
                 if (this.cts == null && localCts != null) {
                     deferredDispose = localCts;
                 }
+                if (this.sleepGate == null && localGate != null) {
+                    deferredClose = localGate;
+                }
             }
             if (deferredDispose != null) { deferredDispose.Dispose(); }
+            if (deferredClose != null) { deferredClose.Close(); }
         }
     }
 }

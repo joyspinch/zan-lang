@@ -9,7 +9,7 @@ public class AmqpChannel : IDisposable {
     private int channelId;
     private AmqpConnection conn;
     private bool open;
-    private Gate rpcGate;
+    private Gate pendingRpcGate;
     private bool rpcBusy;
     private Queue<AsyncGate> rpcWaiters;
     private int expectedClass;
@@ -19,6 +19,11 @@ public class AmqpChannel : IDisposable {
     private string declaredQueue;
     private int messageCount;
     private int consumerCount;
+
+    // Basic.Consume-Ok 到达瞬间原子注册的待绑定消费者（防 Consume-Ok 后紧随 Basic.Deliver 丢失）
+    private string pendingConsumerQueue;
+    private bool pendingConsumerAutoAck;
+    private AmqpMessageHandler pendingConsumerHandler;
 
     // 活跃消费者表：consumerTag -> AmqpConsumer
     private Dictionary<string, AmqpConsumer> consumers;
@@ -36,7 +41,7 @@ public class AmqpChannel : IDisposable {
         this.channelId = channelId;
         this.conn = conn;
         this.open = true;
-        this.rpcGate = new Gate();
+        this.pendingRpcGate = null;
         this.rpcBusy = false;
         this.rpcWaiters = new Queue<AsyncGate>();
         this.expectedClass = 0;
@@ -46,11 +51,24 @@ public class AmqpChannel : IDisposable {
         this.declaredQueue = "";
         this.messageCount = 0;
         this.consumerCount = 0;
+        this.pendingConsumerQueue = null;
+        this.pendingConsumerAutoAck = false;
+        this.pendingConsumerHandler = null;
         this.consumers = new Dictionary<string, AmqpConsumer>();
         this.currentDelivery = null;
         this.deliveryBodyRemaining = 0;
         this.deliveryBodyBuf = null;
         this.deliveryBodyOffset = 0;
+    }
+
+    // 内部完成 Channel.Open / Channel.Open-Ok 握手
+    internal async bool OpenAsync() {
+        if (!this.open) { return false; }
+        AmqpWriter w = new AmqpWriter();
+        w.WriteShort(AmqpConstants.CLASS_CHANNEL);
+        w.WriteShort(AmqpConstants.METHOD_CHANNEL_OPEN);
+        w.WriteShortString(""); // reserved-1
+        return await this.ExecuteRpcAsync(w.ToBytes(), AmqpConstants.CLASS_CHANNEL, AmqpConstants.METHOD_CHANNEL_OPEN_OK);
     }
 
     // 声明交换机 (Exchange.Declare)
@@ -298,12 +316,18 @@ public class AmqpChannel : IDisposable {
 
         if (!await this.AcquireRpcLockAsync()) { return ""; }
         try {
+            lock (this) {
+                this.pendingConsumerQueue = queue;
+                this.pendingConsumerAutoAck = autoAck;
+                this.pendingConsumerHandler = handler;
+            }
             bool ok = await this.ExecuteRpcLockedAsync(w.ToBytes(), AmqpConstants.CLASS_BASIC, AmqpConstants.METHOD_BASIC_CONSUME_OK);
-            if (ok && this.declaredQueue.Length > 0) {
-                string tag = this.declaredQueue;
-                AmqpConsumer c = new AmqpConsumer(queue, tag, autoAck, handler);
-                this.consumers[tag] = c;
-                return tag;
+            lock (this) {
+                this.pendingConsumerQueue = null;
+                this.pendingConsumerHandler = null;
+                if (ok && this.declaredQueue.Length > 0) {
+                    return this.declaredQueue;
+                }
             }
             return "";
         } finally {
@@ -375,31 +399,42 @@ public class AmqpChannel : IDisposable {
         w.WriteShort(0);
         byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, w.ToBytes(), w.Length());
         await c.SendRawAsync(pkt, pkt.Length);
-        this.open = false;
+        Gate g = null;
+        lock (this) {
+            this.open = false;
+            this.conn = null;
+            g = this.pendingRpcGate;
+            this.pendingRpcGate = null;
+        }
         c.UnregisterChannel(this.channelId);
-        this.conn = null;
         this.WakeRpcWaiters();
-        if (this.rpcGate != null) {
-            this.rpcGate.SignalAll();
+        if (g != null) {
+            g.SignalAll();
         }
     }
 
     public void Dispose() {
-        this.open = false;
-        AmqpConnection c = this.conn;
-        this.conn = null;
+        AmqpConnection c = null;
+        Gate g = null;
+        lock (this) {
+            this.open = false;
+            c = this.conn;
+            this.conn = null;
+            g = this.pendingRpcGate;
+            this.pendingRpcGate = null;
+            this.pendingConsumerQueue = null;
+            this.pendingConsumerHandler = null;
+            if (this.consumers != null) {
+                this.consumers.Clear();
+                this.consumers = null;
+            }
+        }
         if (c != null) {
             c.UnregisterChannel(this.channelId);
         }
         this.WakeRpcWaiters();
-        Gate g = this.rpcGate;
-        this.rpcGate = null;
         if (g != null) {
-            g.Close();
-        }
-        if (this.consumers != null) {
-            this.consumers.Clear();
-            this.consumers = null;
+            g.SignalAll();
         }
     }
 
@@ -451,29 +486,45 @@ public class AmqpChannel : IDisposable {
         }
     }
 
-    // 同步等待特定 RPC 方法回复（已持有信道 RPC 串行锁时调用）
+    // 同步等待特定 RPC 方法回复（已持有信道 RPC 串行锁时调用，每次 RPC 使用独立 Gate 防陈旧信号串扰）
     private async bool ExecuteRpcLockedAsync(byte[] methodPayload, int expectClass, int expectMethod) {
-        AmqpConnection c = this.conn;
-        Gate g = this.rpcGate;
-        if (!this.open || c == null || g == null) { return false; }
-        this.expectedClass = expectClass;
-        this.expectedMethod = expectMethod;
-        this.rpcSuccess = false;
-        this.rpcError = "";
-
-        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, methodPayload, methodPayload.Length);
-        int sent = await c.SendRawAsync(pkt, pkt.Length);
-        if (sent < pkt.Length) {
-            this.expectedClass = 0;
-            this.expectedMethod = 0;
-            return false;
+        AmqpConnection c = null;
+        Gate g = new Gate();
+        lock (this) {
+            c = this.conn;
+            if (!this.open || c == null) {
+                g.Close();
+                return false;
+            }
+            this.expectedClass = expectClass;
+            this.expectedMethod = expectMethod;
+            this.rpcSuccess = false;
+            this.rpcError = "";
+            this.pendingRpcGate = g;
         }
 
-        // 在专属 Gate 上异步等待事件唤醒（最多 10000ms 超时）
-        await g.Wait(10000);
-        this.expectedClass = 0;
-        this.expectedMethod = 0;
-        return this.rpcSuccess;
+        try {
+            byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, this.channelId, methodPayload, methodPayload.Length);
+            int sent = await c.SendRawAsync(pkt, pkt.Length);
+            if (sent < pkt.Length) {
+                return false;
+            }
+
+            // 在本次 RPC 专属 Gate 上异步等待事件唤醒（最多 10000ms 超时）
+            await g.Wait(10000);
+            lock (this) {
+                return this.rpcSuccess;
+            }
+        } finally {
+            lock (this) {
+                if (this.pendingRpcGate == g) {
+                    this.pendingRpcGate = null;
+                }
+                this.expectedClass = 0;
+                this.expectedMethod = 0;
+            }
+            g.Close();
+        }
     }
 
     // 同步等待特定 RPC 方法回复（带信道级异步串行化）
@@ -515,28 +566,56 @@ public class AmqpChannel : IDisposable {
         }
 
         if (cls == AmqpConstants.CLASS_QUEUE && mtd == AmqpConstants.METHOD_QUEUE_DECLARE_OK) {
-            this.declaredQueue = r.ReadShortString();
-            this.messageCount = r.ReadLong();
-            this.consumerCount = r.ReadLong();
+            string qName = r.ReadShortString();
+            int msgCnt = r.ReadLong();
+            int consCnt = r.ReadLong();
+            lock (this) {
+                this.declaredQueue = qName;
+                this.messageCount = msgCnt;
+                this.consumerCount = consCnt;
+            }
         } else if (cls == AmqpConstants.CLASS_QUEUE && (mtd == AmqpConstants.METHOD_QUEUE_PURGE_OK || mtd == AmqpConstants.METHOD_QUEUE_DELETE_OK)) {
-            this.messageCount = r.ReadLong();
+            int msgCnt = r.ReadLong();
+            lock (this) {
+                this.messageCount = msgCnt;
+            }
         } else if (cls == AmqpConstants.CLASS_BASIC && mtd == AmqpConstants.METHOD_BASIC_CONSUME_OK) {
-            this.declaredQueue = r.ReadShortString(); // 保存 consumer-tag
+            string tag = r.ReadShortString(); // 保存 consumer-tag 并在帧循环继续前立即登记消费者
+            lock (this) {
+                this.declaredQueue = tag;
+                if (tag.Length > 0 && this.consumers != null && this.pendingConsumerHandler != null) {
+                    AmqpConsumer c = new AmqpConsumer(
+                        this.pendingConsumerQueue != null ? this.pendingConsumerQueue : "",
+                        tag, this.pendingConsumerAutoAck, this.pendingConsumerHandler);
+                    this.consumers[tag] = c;
+                }
+            }
         }
 
-        if (cls == this.expectedClass && mtd == this.expectedMethod) {
-            this.rpcSuccess = true;
-            Gate g = this.rpcGate;
-            if (g != null) { g.Signal(); }
-        } else if (cls == AmqpConstants.CLASS_CHANNEL && mtd == AmqpConstants.METHOD_CHANNEL_CLOSE) {
+        Gate toSignal = null;
+        bool channelClosedByBroker = false;
+        if (cls == AmqpConstants.CLASS_CHANNEL && mtd == AmqpConstants.METHOD_CHANNEL_CLOSE) {
             int code = r.ReadShort();
             string text = r.ReadShortString();
-            this.rpcSuccess = false;
-            this.rpcError = text;
-            this.open = false;
-            Gate g = this.rpcGate;
-            if (g != null) { g.Signal(); }
+            lock (this) {
+                this.rpcSuccess = false;
+                this.rpcError = text;
+                this.open = false;
+                toSignal = this.pendingRpcGate;
+                this.pendingRpcGate = null;
+            }
+            channelClosedByBroker = true;
+        } else {
+            lock (this) {
+                if (cls == this.expectedClass && mtd == this.expectedMethod) {
+                    this.rpcSuccess = true;
+                    toSignal = this.pendingRpcGate;
+                    this.pendingRpcGate = null;
+                }
+            }
         }
+        if (toSignal != null) { toSignal.Signal(); }
+        if (channelClosedByBroker) { this.WakeRpcWaiters(); }
     }
 
     private void HandleHeaderFrame(byte[] payload) {
@@ -547,7 +626,7 @@ public class AmqpChannel : IDisposable {
         long bodySize = r.ReadLongLong();
         BasicProperties props = BasicProperties.Decode(r);
 
-        if (this.currentDelivery != null) {
+        if (this.currentDelivery != null && cls == AmqpConstants.CLASS_BASIC && this.deliveryBodyBuf == null) {
             if (bodySize < 0L || bodySize > 67108864L) {
                 // 防御畸形负值或超 64 MiB 载荷导致异常分配/OOM
                 this.currentDelivery = null;
@@ -589,7 +668,12 @@ public class AmqpChannel : IDisposable {
 
         // 查找消费者并异步调度触发回调
         AmqpConsumer c = null;
-        if (this.consumers != null && this.consumers.TryGetValue(msg.consumerTag, out c) && c != null && c.handler != null) {
+        lock (this) {
+            if (this.consumers != null) {
+                this.consumers.TryGetValue(msg.consumerTag, out c);
+            }
+        }
+        if (c != null && c.handler != null) {
             Task.Spawn(c.handler(this, msg));
         }
     }

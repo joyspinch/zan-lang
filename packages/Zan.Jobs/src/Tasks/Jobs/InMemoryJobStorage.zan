@@ -11,29 +11,25 @@ namespace Tasks.Jobs;
 //
 // **并发安全**：进程内多线程安全（读写操作全链路走实例互斥锁，多实例互不阻塞）。
 public class InMemoryJobStorage : JobStorage {
-    Mutex syncLock;
+    object syncLock;
     Dictionary<string, JobRecord> index;
 
     public InMemoryJobStorage() {
-        this.syncLock = new Mutex();
+        this.syncLock = new object();
         this.index = new Dictionary<string, JobRecord>();
     }
 
     public override void Append(JobRecord record) {
-        if (record == null) {
-            throw new JobException(JobError.InvalidArgs, "record is null");
+        if (record == null || record.id == null || record.id.Length == 0) {
+            throw new JobException(JobError.InvalidArgs, "record or record id is empty");
         }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             this.index[record.id] = record;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public override List<JobRecord> Snapshot() {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             List<JobRecord> items = new List<JobRecord>();
             List<string> keys = this.index.Keys;
             for (int i = 0; i < keys.Count; i++) {
@@ -41,30 +37,23 @@ public class InMemoryJobStorage : JobStorage {
                 if (this.index.TryGetValue(keys[i], out r)) { items.Add(r); }
             }
             return items;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public override JobRecord Find(string id) {
         if (id == null) { return null; }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord r = null;
             if (this.index.TryGetValue(id, out r)) { return r; }
             return null;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     // 原子领取：可执行校验与置 Processing 在实例锁内一次完成，多 worker
-    // 并发拉取不会重复执行同一任务。锁内直写 index——Append 会二次
-    // WaitOne 同一把不可重入锁，自死锁。
+    // 并发拉取不会重复执行同一任务。
     public override JobRecord Claim(string id, long now, string workerId) {
         if (id == null) { return null; }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord current = null;
             if (!this.index.TryGetValue(id, out current)) { return null; }
             if (!current.IsRunnableAt(now)) { return null; }
@@ -76,38 +65,30 @@ public class InMemoryJobStorage : JobStorage {
             rec.error = "";
             this.index[rec.id] = rec;
             return rec;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public override bool Delete(string id) {
         if (id == null) { return false; }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord r = null;
             if (!this.index.TryGetValue(id, out r) || r == null) { return false; }
             JobRecord rec = r.Copy();
             rec.state = JobState.Deleted;
             this.index[rec.id] = rec;
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public override bool CompleteUnlessDeleted(JobRecord record) {
         if (record == null || record.id == null) { return false; }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord current = null;
             if (this.index.TryGetValue(record.id, out current) && current != null && current.state == JobState.Deleted) {
                 return false;
             }
             this.index[record.id] = record;
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 }

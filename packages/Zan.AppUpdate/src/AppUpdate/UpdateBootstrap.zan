@@ -24,10 +24,23 @@ public class UpdateBootstrap {
     [DllImport("kernel32", EntryPoint = "QueryFullProcessImageNameW")]
     private static extern int QueryFullProcessImageName(nint handle, int flags, nint path, nint length);
     #endif
-    private static string Full(string path) { return Path.GetFullPath(path).Replace("\\", "/"); }
-    private static bool Same(string a, string b) { return Full(a).ToLower() == Full(b).ToLower(); }
-    private static bool Below(string root, string path) { return Full(path).ToLower().StartsWith(Full(root).ToLower() + "/"); }
-    private static string FileHash(string path) { return File.Exists(path) ? AppUpdater.HashBytes(File.ReadAllBytes(path)) : ""; }
+    private static string Full(string path) {
+        if (path == null || path.Length == 0) { return ""; }
+        return Path.GetFullPath(path).Replace("\\", "/");
+    }
+    private static bool Same(string a, string b) {
+        string fa = Full(a); string fb = Full(b);
+        return fa.Length > 0 && fb.Length > 0 && fa.ToLower() == fb.ToLower();
+    }
+    private static bool Below(string root, string path) {
+        string fr = Full(root); string fp = Full(path);
+        return fr.Length > 0 && fp.Length > 0 && fp.ToLower().StartsWith(fr.ToLower() + "/");
+    }
+    private static string FileHash(string path) {
+        if (path == null || path.Length == 0 || !File.Exists(path)) { return ""; }
+        byte[] data = File.ReadAllBytes(path);
+        return data != null ? AppUpdater.HashBytes(data) : "";
+    }
     private static bool Plain(string path) { return path != null && path.Length > 0 && AppUpdater.SafeDestination(path, "bootstrap-probe"); }
     private static JsonValue Load(string path) {
         if (!Plain(path) || !File.Exists(path) || File.GetSize64(path) > 524288) { return null; }
@@ -59,7 +72,8 @@ public class UpdateBootstrap {
             Cleanup(work, name);
             if (!Same(Path.GetDirectoryName(host), target) || !Plain(target) || !Plain(pending)
                 || !Plain(work) || Same(work, target) || Below(target, work)
-                || Same(pending, target)
+                || Same(pending, target) || manifest == null || manifest.packageSha256 == null
+                || !AppUpdater.IsHex(manifest.packageSha256, 64, 64)
                 || !AppUpdater.VerifyManifestSignature(manifest, null) || manifest.FindFile(name) == null) { return false; }
             string sourceManifest = pending + "/manifest.json";
             string releaseZip = pending + "/release.zip";
@@ -72,7 +86,9 @@ public class UpdateBootstrap {
             parent = OpenProcess(1048576 | 4096, 0, CurrentPid());
             string created = parent != 0 ? Created(parent) : "";
             if (created == "" || !Same(Image(parent), host)) { return false; }
-            string token = Hex.Encode(System.RandomNumberGenerator.GetBytes(16), 16);
+            byte[] tokBytes = System.RandomNumberGenerator.GetBytes(16);
+            if (tokBytes == null || tokBytes.Length < 16) { return false; }
+            string token = Hex.Encode(tokBytes, 16);
             string dir = work + "/" + token;
             if (Directory.Exists(dir) || File.Exists(dir)) { return false; }
             Directory.CreateDirectoryRecursive(dir); staged = dir;
@@ -86,15 +102,16 @@ public class UpdateBootstrap {
                 if (!dll.ToLower().EndsWith(".dll")) { continue; }
                 if (!AppUpdater.SafeDestination(target, dll)) { return false; }
                 File.Copy(target + "/" + dll, dir + "/" + dll);
-                JsonValue item = JsonValue.NewObject(); item.PutStr("name", dll); item.PutStr("sha256", FileHash(target + "/" + dll));
-                if (item.Str("sha256", "") != FileHash(dir + "/" + dll)) { return false; }
+                string dllSha = FileHash(target + "/" + dll);
+                if (!AppUpdater.IsHex(dllSha, 64, 64) || dllSha != FileHash(dir + "/" + dll)) { return false; }
+                JsonValue item = JsonValue.NewObject(); item.PutStr("name", dll); item.PutStr("sha256", dllSha);
                 dependencies.Append(item);
             }
             JsonValue args = JsonValue.NewArray();
             if (relaunchArgs != null) {
                 if (relaunchArgs.Length > 64) { return false; }
                 for (int i = 0; i < relaunchArgs.Length; i = i + 1) {
-                    if (relaunchArgs[i].Length > 4096 || relaunchArgs[i] == UpdateBootstrap.Argument) { return false; }
+                    if (relaunchArgs[i] == null || relaunchArgs[i].Length > 4096 || relaunchArgs[i] == UpdateBootstrap.Argument) { return false; }
                     args.AppendStr(relaunchArgs[i]);
                 }
             }
@@ -112,7 +129,11 @@ public class UpdateBootstrap {
             finally { Directory.SetCurrentDirectory(cwd); }
             if (started != 0) { Result(dir, "launch-failed"); return false; }
             for (int i = 0; i < 300; i = i + 1) {
-                if (File.Exists(dir + "/ready") && File.ReadAllText(dir + "/ready") == token) { acknowledged = true; return true; }
+                if (File.Exists(dir + "/ready")) {
+                    string readyToken = "";
+                    try { readyToken = File.ReadAllText(dir + "/ready"); } catch (Exception ex) { readyToken = ""; }
+                    if (readyToken == token) { acknowledged = true; return true; }
+                }
                 if (File.Exists(dir + "/result.json")) { return false; }
                 Thread.Sleep(100);
             }
@@ -188,10 +209,12 @@ public class UpdateBootstrap {
             for (int i = 0; i < dependencies.Count(); i = i + 1) {
                 JsonValue item = dependencies.At(i); if (item == null) { return 31; }
                 string name = item.Str("name", "");
+                string depSha = item.Str("sha256", "").ToLower();
                 if (name != Path.GetFileName(name) || !name.ToLower().EndsWith(".dll")
+                    || !AppUpdater.IsHex(depSha, 64, 64)
                     || !AppUpdater.SafeDestination(dir, name) || !AppUpdater.SafeDestination(target, name)
-                    || FileHash(dir + "/" + name) != item.Str("sha256", "")
-                    || FileHash(target + "/" + name) != item.Str("sha256", "")) { return 31; }
+                    || FileHash(dir + "/" + name) != depSha
+                    || FileHash(target + "/" + name) != depSha) { return 31; }
             }
             JsonValue savedArgs = request.Get("args");
             if (savedArgs == null || !savedArgs.IsArray() || savedArgs.Count() > 64) { return 31; }
@@ -215,11 +238,13 @@ public class UpdateBootstrap {
             }
             UpdateManifest expected = UpdateManifest.LoadFromFile(pending + "/manifest.json");
             UpdateFileEntry image = expected != null ? expected.FindFile(Path.GetFileName(host)) : null;
-            if (image == null || !AppUpdater.VerifyManifestSignature(expected, null) || apply == null || apply(target, pending, manifestHash, true) <= 0
+            if (image == null || image.sha256 == null || !AppUpdater.IsHex(image.sha256, 64, 64)
+                || !AppUpdater.VerifyManifestSignature(expected, null) || apply == null || apply(target, pending, manifestHash, true) <= 0
                 || FileHash(host) != image.sha256.ToLower()) { Result(dir, "apply-failed"); return 36; }
             for (int i = 0; i < expected.files.Count; i = i + 1) {
                 UpdateFileEntry entry = expected.files[i];
-                if (!AppUpdater.SafeDestination(target, entry.path)
+                if (entry == null || entry.sha256 == null || !AppUpdater.IsHex(entry.sha256, 64, 64)
+                    || !AppUpdater.SafeDestination(target, entry.path)
                     || File.GetSize64(target + "/" + entry.path) != entry.size
                     || FileHash(target + "/" + entry.path) != entry.sha256.ToLower()) { Result(dir, "installed-verification-failed"); return 37; }
             }

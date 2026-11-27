@@ -129,25 +129,41 @@ public class Storage {
     [DllImport("crt", EntryPoint = "statvfs")]
     private static extern int StatvfsCall(nint path, nint stat);
 
-    // Linux/macOS 实现：statvfs 读取挂载点容量；调用失败时三个字节
-    // 数保持 0。两平台的 struct statvfs 布局在前五个字段上一致
-    // （bsize/frsize/blocks/bfree/bavail 均为 64 位 @ 0/8/16/24/32）。
+    // Linux/macOS 实现：statvfs 读取挂载点容量；调用失败时三个字节数保持 0。
+    // Linux 64 位 sizeof(struct statvfs) == 112（f_blocks/bfree/bavail 为 64 位 @ 16/24/32）；
+    // macOS 64 位 fsblkcnt_t 为 32 位无符号整型（f_blocks/bfree/bavail @ 16/20/24）。
+    // 按 POSIX 规范，块计数以 f_frsize 为单位（为 0 时回退 f_bsize）。
     private static DiskUsage Statvfs(string path) {
-        // statvfs 接受 UTF-8 的 char*；Zan 字符串本身就是 UTF-8。
-        nint st = NativeMemory.Alloc(96);
+        // 预留 128 字节，覆盖 Linux(112B) 与 macOS(64B) 两平台完整结构体。
+        nint st = NativeMemory.Alloc(128);
         DiskUsage u = new DiskUsage();
         u.name = path;
         try {
+            NativeMemory.Fill(st, 0, 128);
             int ok = Storage.StatvfsCall(path, st);
             if (ok == 0) {
-                Span<long> q = new Span<long>(st, 11);
+                Span<long> q = new Span<long>(st, 14);
                 long bsize = q[0];
-                long blocks = q[2];
-                long bfree = q[3];
-                long bavail = q[4];
-                u.totalBytes = blocks * bsize;
-                u.freeBytes = bfree * bsize;
-                u.availBytes = bavail * bsize;
+                long frsize = q[1];
+                long unit = frsize > 0 ? frsize : bsize;
+                long blocks = 0;
+                long bfree = 0;
+                long bavail = 0;
+                #if MACOS
+                Span<int> d = new Span<int>(st, 8);
+                blocks = (long)d[4] & 0xFFFFFFFFL;
+                bfree = (long)d[5] & 0xFFFFFFFFL;
+                bavail = (long)d[6] & 0xFFFFFFFFL;
+                #else
+                blocks = q[2];
+                bfree = q[3];
+                bavail = q[4];
+                #endif
+                if (unit > 0) {
+                    u.totalBytes = blocks * unit;
+                    u.freeBytes = bfree * unit;
+                    u.availBytes = bavail * unit;
+                }
             }
         } finally {
             NativeMemory.Free(st);

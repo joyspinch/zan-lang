@@ -47,8 +47,12 @@ public class ReleasePackager {
         string packageUrl,
         UpdateProgressCallback cb
     ) {
-        if (!Directory.Exists(appDir)) {
-            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "源应用目录不存在: " + appDir)); }
+        if (appDir == null || appDir.Length == 0 || !Directory.Exists(appDir)) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "源应用目录不存在: " + (appDir != null ? appDir : ""))); }
+            return null;
+        }
+        if (outputZipPath == null || outputZipPath.Length == 0) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "输出 Zip 路径不能为空")); }
             return null;
         }
 
@@ -84,7 +88,11 @@ public class ReleasePackager {
             string fullPath = appDir + "/" + rel;
 
             byte[] fileBytes = File.ReadAllBytes(fullPath);
-            int fileSize = fileBytes != null ? fileBytes.Length : 0;
+            if (fileBytes == null) {
+                if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "无法读取待打包文件: " + fullPath)); }
+                return null;
+            }
+            int fileSize = fileBytes.Length;
             string fileMd5 = Md5.HashToHex(fileBytes);
 
             UpdateFileEntry entry = UpdateFileEntry.Create(rel, fileSize, fileMd5, true);
@@ -97,7 +105,7 @@ public class ReleasePackager {
             zipEntries.Add(ze);
 
             if (cb != null) {
-                int percent = ((i + 1) * 60) / totalFiles;
+                int percent = (int)(((long)(i + 1) * 60L) / (long)totalFiles);
                 cb(UpdateProgressInfo.Progress(UpdatePhase.Checking, percent, i + 1, totalFiles, rel, "已计算 SHA-256 校验码"));
             }
         }
@@ -114,6 +122,10 @@ public class ReleasePackager {
 
         // 使用 Level 6 进行标准 Zip 压缩
         byte[] zipData = Zip.Create(zipEntries, 6);
+        if (zipData == null || zipData.Length == 0) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "生成 Zip 更新包失败")); }
+            return null;
+        }
         File.WriteAllBytes(outputZipPath, zipData);
 
         // 计算生成 Zip 包的整体大小与 MD5
@@ -142,11 +154,13 @@ public class ReleasePackager {
         if (!AppUpdater.IsHex(modulusHex, 512, 1024)) { return ""; }
         if (!AppUpdater.IsHex(privateExponentHex, 2, modulusHex.Length)) { return ""; }
         int k = modulusHex.Length / 2;
+        int dLen = privateExponentHex.Length / 2;
         string payload = manifest.SigningPayload();
         byte[] nBuf = Hex.Decode(modulusHex);
         byte[] dBuf = Hex.Decode(privateExponentHex);
-        byte[] sig = Rsa.SignPkcs1Sha256(payload, payload.Length, nBuf, k, dBuf, privateExponentHex.Length / 2);
-        if (sig == null || k <= 0) { return ""; }
+        if (nBuf == null || dBuf == null || k <= 0 || dLen <= 0 || nBuf.Length < k || dBuf.Length < dLen) { return ""; }
+        byte[] sig = Rsa.SignPkcs1Sha256(payload, payload.Length, nBuf, k, dBuf, dLen);
+        if (sig == null || sig.Length < k) { return ""; }
         string sigHex = Hex.Encode(sig, k);
         if (sigHex.Length != 2 * k) { return ""; }
         manifest.SetSignature(sigHex);

@@ -29,7 +29,7 @@ public class AppHost : IDisposable {
     // 从 DI 容器按服务名取实例登记。取不到、或注册的不是托管服务时返回
     // false——宿主要的是"明确登记"，不在错误类型上静默跳过。
     public bool AddFrom(IServiceProvider sp, string serviceType) {
-        if (sp == null) { return false; }
+        if (sp == null || serviceType == null || serviceType.Length == 0) { return false; }
         object o = sp.GetService(serviceType);
         if (o == null) { return false; }
         if (!(o is IHostedService)) { return false; }
@@ -38,11 +38,12 @@ public class AppHost : IDisposable {
     }
 
     public int Count() { return this.services.Count; }
-    public void SetStopTimeout(long ms) { this.stopTimeoutMs = ms; }
-    public CancellationToken Token() { return this.shutdown.Token; }
-    public bool IsRunning() { return this.started && !this.shutdown.Token.IsCancellationRequested; }
+    public void SetStopTimeout(long ms) { this.stopTimeoutMs = ms < 0L ? 0L : ms; }
+    public CancellationToken Token() { return this.shutdown != null ? this.shutdown.Token : CancellationToken.None; }
+    public bool IsRunning() { return !this.disposed && this.started && this.shutdown != null && !this.shutdown.Token.IsCancellationRequested; }
 
     public async bool StartAsync() {
+        if (this.disposed || this.shutdown == null) { return false; }
         if (this.started) { return true; }
         this.started = true;
         int n = this.services.Count;
@@ -66,7 +67,7 @@ public class AppHost : IDisposable {
     // 逆序停止；每个服务独立超时（悬挂的服务不会拖住整个进程收尾）。
     public async bool StopAsync() {
         if (!this.started) { return true; }
-        this.shutdown.Cancel();
+        if (this.shutdown != null) { this.shutdown.Cancel(); }
         int i = this.services.Count - 1;
         while (i >= 0) {
             IHostedService s = this.services[i];
@@ -81,15 +82,20 @@ public class AppHost : IDisposable {
     // 请求关闭。Cancel 先置位、再放行等待者，两者顺序不能反——先 Signal
     // 后 Cancel 会让 Run 醒来时仍看到"未取消"而重新挂起。
     public void RequestStop() {
-        this.shutdown.Cancel();
-        this.gate.Signal();
+        if (this.disposed) { return; }
+        if (this.shutdown != null) { this.shutdown.Cancel(); }
+        Gate g = this.gate;
+        if (g != null) { g.SignalAll(); }
     }
 
     // 阻塞式运行：启动 → 等关闭请求 → 停止。常规 main 的最后一句。
     public async void Run() {
+        if (this.disposed) { return; }
         await this.StartAsync();
-        while (!this.shutdown.Token.IsCancellationRequested) {
-            await this.gate.Wait();
+        while (!this.disposed && this.shutdown != null && !this.shutdown.Token.IsCancellationRequested) {
+            Gate g = this.gate;
+            if (g == null) { break; }
+            await g.Wait();
         }
         await this.StopAsync();
     }
@@ -128,12 +134,17 @@ public class AppHost : IDisposable {
     public void Dispose() {
         if (this.disposed) { return; }
         this.disposed = true;
-        if (this.shutdown != null) {
-            this.shutdown.Cancel();
-            this.shutdown.Dispose();
+        CancellationTokenSource cts = this.shutdown;
+        this.shutdown = null;
+        if (cts != null) {
+            cts.Cancel();
+            cts.Dispose();
         }
-        if (this.gate != null) {
-            this.gate.Close();
+        Gate g = this.gate;
+        this.gate = null;
+        if (g != null) {
+            g.SignalAll();
+            g.Close();
         }
     }
 }

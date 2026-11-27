@@ -8,14 +8,20 @@ public class Stream<T> {
     public List<T> src;
     public List<Predicate<T>> filters;
     public Predicate<T> takeWhilePred;
+    private List<Predicate<T>> extraTakeWhilePreds;
     public int skipN;
     public int takeN;
     public bool distinct;
 
     public Stream(List<T> src) {
-        this.src = src;
+        if (src != null) {
+            this.src = src;
+        } else {
+            this.src = new List<T>();
+        }
         this.filters = new List<Predicate<T>>();
         this.takeWhilePred = null;
+        this.extraTakeWhilePreds = null;
         this.skipN = 0;
         this.takeN = -1;
         this.distinct = false;
@@ -28,6 +34,12 @@ public class Stream<T> {
             c.filters.Add(this.filters[i]);
         }
         c.takeWhilePred = this.takeWhilePred;
+        if (this.extraTakeWhilePreds != null) {
+            c.extraTakeWhilePreds = new List<Predicate<T>>();
+            for (int i = 0; i < this.extraTakeWhilePreds.Count; i = i + 1) {
+                c.extraTakeWhilePreds.Add(this.extraTakeWhilePreds[i]);
+            }
+        }
         c.skipN = this.skipN;
         c.takeN = this.takeN;
         c.distinct = this.distinct;
@@ -41,7 +53,7 @@ public class Stream<T> {
 
     // 保留满足谓词的元素（中间操作，惰性追加）。多次调用按 AND 组合。
     public Stream<T> Where(Predicate<T> pred) {
-        this.filters.Add(pred);
+        if (pred != null) { this.filters.Add(pred); }
         return this;
     }
 
@@ -54,17 +66,26 @@ public class Stream<T> {
         return this;
     }
 
-    // 截取最多 n 个元素（中间操作，在终结操作时支持极速短路）。
+    // 截取最多 n 个元素（中间操作，在终结操作时支持极速短路；负数归零避免误作无上限）。
     public Stream<T> Take(int n) {
+        if (n < 0) { n = 0; }
         if (this.takeN < 0 || n < this.takeN) {
             this.takeN = n;
         }
         return this;
     }
 
-    // 当谓词返回 true 时持续提取，遇到首个 false 立即终结整条流（中间操作）。
+    // 当谓词返回 true 时持续提取，遇到首个 false 立即终结整条流（中间操作，支持链式叠加）。
     public Stream<T> TakeWhile(Predicate<T> pred) {
-        this.takeWhilePred = pred;
+        if (pred == null) { return this; }
+        if (this.takeWhilePred == null) {
+            this.takeWhilePred = pred;
+        } else {
+            if (this.extraTakeWhilePreds == null) {
+                this.extraTakeWhilePreds = new List<Predicate<T>>();
+            }
+            this.extraTakeWhilePreds.Add(pred);
+        }
         return this;
     }
 
@@ -72,6 +93,20 @@ public class Stream<T> {
     public Stream<T> Distinct() {
         this.distinct = true;
         return this;
+    }
+
+    internal bool MatchesTakeWhile(T item) {
+        if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+            return false;
+        }
+        if (this.extraTakeWhilePreds != null) {
+            for (int i = 0; i < this.extraTakeWhilePreds.Count; i = i + 1) {
+                if (!this.extraTakeWhilePreds[i](item)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private bool MatchesFilters(T item) {
@@ -86,13 +121,13 @@ public class Stream<T> {
     // 使用 selector 变换元素类型并开启新子流（中间操作）。
     public Stream<R> Select<R>(Selector<T, R> selector) {
         List<R> mapped = new List<R>();
-        if (this.takeN == 0) { return new Stream<R>(mapped); }
+        if (this.takeN == 0 || selector == null) { return new Stream<R>(mapped); }
         int skipped = 0;
         HashSet<T> seen = this.distinct ? new HashSet<T>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesTakeWhile(item)) { break; }
             if (!this.MatchesFilters(item)) { continue; }
             if (seen != null && !seen.Add(item)) { continue; }
             if (skipped < this.skipN) {
@@ -117,7 +152,7 @@ public class Stream<T> {
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesTakeWhile(item)) { break; }
             if (!this.MatchesFilters(item)) { continue; }
             if (seen != null && !seen.Add(item)) { continue; }
             if (skipped < this.skipN) {
@@ -159,14 +194,14 @@ public class Stream<T> {
 
     // 流中是否所有满足现有过滤的元素均满足给定谓词（短路，尊重 Skip/Take）。
     public bool All(Predicate<T> pred) {
-        if (this.takeN == 0) { return true; }
+        if (this.takeN == 0 || pred == null) { return true; }
         int skipped = 0;
         int yielded = 0;
         HashSet<T> seen = this.distinct ? new HashSet<T>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesTakeWhile(item)) { break; }
             if (!this.MatchesFilters(item)) { continue; }
             if (seen != null && !seen.Add(item)) { continue; }
             if (skipped < this.skipN) {
@@ -189,7 +224,7 @@ public class Stream<T> {
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesTakeWhile(item)) { break; }
             if (!this.MatchesFilters(item)) { continue; }
             if (seen != null && !seen.Add(item)) { continue; }
             if (skipped < this.skipN) {
@@ -204,14 +239,14 @@ public class Stream<T> {
 
     // 遍历消费流中每一个有效元素。
     public void ForEach(Action<T> action) {
-        if (this.takeN == 0) { return; }
+        if (this.takeN == 0 || action == null) { return; }
         int skipped = 0;
         int yielded = 0;
         HashSet<T> seen = this.distinct ? new HashSet<T>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesTakeWhile(item)) { break; }
             if (!this.MatchesFilters(item)) { continue; }
             if (seen != null && !seen.Add(item)) { continue; }
             if (skipped < this.skipN) {
@@ -289,9 +324,11 @@ public class Stream<T> {
     // 连接另一个流。
     public Stream<T> Concat(Stream<T> other) {
         List<T> current = this.ToList();
-        List<T> next = other.ToList();
-        for (int i = 0; i < next.Count; i = i + 1) {
-            current.Add(next[i]);
+        if (other != null) {
+            List<T> next = other.ToList();
+            for (int i = 0; i < next.Count; i = i + 1) {
+                current.Add(next[i]);
+            }
         }
         return new Stream<T>(current);
     }
@@ -308,6 +345,7 @@ public class StreamEnumerator<T> {
     int index;
     int yielded;
     int skipped;
+    bool done;
     T current;
     HashSet<T> seen;
 
@@ -316,17 +354,21 @@ public class StreamEnumerator<T> {
         this.index = 0;
         this.yielded = 0;
         this.skipped = 0;
-        this.seen = stream.distinct ? new HashSet<T>() : null;
+        this.done = stream == null;
+        this.seen = (stream != null && stream.distinct) ? new HashSet<T>() : null;
     }
 
     public bool MoveNext() {
+        if (this.done) { return false; }
         if (this.stream.takeN >= 0 && this.yielded >= this.stream.takeN) {
+            this.done = true;
             return false;
         }
         while (this.index < this.stream.src.Count) {
             T item = this.stream.src[this.index];
             this.index = this.index + 1;
-            if (this.stream.takeWhilePred != null && !this.stream.takeWhilePred(item)) {
+            if (!this.stream.MatchesTakeWhile(item)) {
+                this.done = true;
                 return false;
             }
             bool pass = true;
@@ -347,6 +389,7 @@ public class StreamEnumerator<T> {
                 return true;
             }
         }
+        this.done = true;
         return false;
     }
 

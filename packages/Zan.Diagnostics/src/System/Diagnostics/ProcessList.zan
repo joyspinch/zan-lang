@@ -219,12 +219,14 @@ public class ProcessList {
         int rp = stat.LastIndexOf(")");
         if (lp < 0 || rp <= lp || rp + 2 > stat.Length) { return null; }
         string rest = stat.Substring(rp + 2, stat.Length - rp - 2);
-        // （comm 之后从 1 起算）第 4 个字段是 ppid，第 20 个字段是 threads。
+        // rest 从第 3 字段 (state) 起算：索引 1 是第 4 字段 (ppid)，索引 17 是第 20 字段 (num_threads)。
         int stateEnd = rest.IndexOf(" ", 0);
         if (stateEnd < 0 || stateEnd + 1 >= rest.Length) { return null; }
-        string ppidTok = rest.Substring(stateEnd + 1, ProcessList.TokenLen(rest, stateEnd + 1));
+        int ppidPos = stateEnd + 1;
+        while (ppidPos < rest.Length && (rest[ppidPos] & 255) == 32) { ppidPos = ppidPos + 1; }
+        string ppidTok = rest.Substring(ppidPos, ProcessList.TokenLen(rest, ppidPos));
         int ppid = ProcessList.ParseInt(ppidTok);
-        int threads = ProcessList.StatField(rest, 19);  // 第 20 个字段（从 1 起算）
+        int threads = ProcessList.StatField(rest, 17);  // 第 20 个字段 num_threads（从第 3 字段起 0-based 为 17）
         ProcessEntry e = new ProcessEntry();
         e.pid = pid;
         e.name = ProcessList.BaseName(stat.Substring(lp + 1, rp - lp - 1));  // comm
@@ -238,16 +240,17 @@ public class ProcessList {
     private static int StatField(string s, int index) {
         int field = 0;
         int i = 0;
-        while (i < s.Length && field < index) {
+        while (i < s.Length) {
+            while (i < s.Length && (s[i] & 255) == 32) { i = i + 1; }
+            if (i >= s.Length) { break; }
             int len = ProcessList.TokenLen(s, i);
-            if (len == 0) { i = i + 1; continue; }
+            if (field == index) {
+                return ProcessList.ParseInt(s.Substring(i, len));
+            }
             field = field + 1;
             i = i + len;
         }
-        if (field != index) { return 0; }
-        int tlen = ProcessList.TokenLen(s, i);
-        if (tlen == 0) { return 0; }
-        return ProcessList.ParseInt(s.Substring(i, tlen));
+        return 0;
     }
 
     // `s` 中从 `from` 起到下一个空格的令牌长度（按字节/单元计）。
@@ -266,15 +269,21 @@ public class ProcessList {
             // 进程已退出或权限不足无法读取 /proc/<pid>/status，返回 -1 标记缺省
             return -1;
         }
-        // VmRSS:   12345 kB
+        // VmRSS:\t   12345 kB
         int idx = status.IndexOf("VmRSS:", 0);
         if (idx < 0) { return -1; }
         int eol = status.IndexOf("\n", idx);
         if (eol < 0) { eol = status.Length; }
-        string line = status.Substring(idx, eol - idx);
-        int kbEnd = line.IndexOf(" ", 6);
-        if (kbEnd < 0) { return -1; }
-        long kb = ProcessList.ParseLong(line.Substring(6, kbEnd - 6).Trim());
+        int p = idx + 6;
+        while (p < eol && (status[p] & 255) <= 32) { p = p + 1; }
+        int numStart = p;
+        while (p < eol) {
+            int c = status[p] & 255;
+            if (c < 48 || c > 57) { break; }
+            p = p + 1;
+        }
+        if (p <= numStart) { return -1; }
+        long kb = ProcessList.ParseLong(status.Substring(numStart, p - numStart));
         if (kb < 0) { return -1; }
         return kb * 1024;
     }

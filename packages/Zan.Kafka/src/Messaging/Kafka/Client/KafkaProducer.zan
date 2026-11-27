@@ -113,8 +113,8 @@ public class KafkaProducer {
 
     // 批量投递多条消息至指定主题与分区
     public async ProduceResult SendBatchAsync(string topic, int partition, List<KafkaRecord> records) {
-        if (!this.IsConnected() || records == null || records.Count == 0) {
-            return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
+        if (!this.IsConnected() || topic == null || topic.Length == 0 || records == null || records.Count == 0) {
+            return new ProduceResult(topic != null ? topic : "", partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
         }
 
         // 1. 构建二进制 RecordBatch (含 CRC32C 硬件校验)
@@ -141,16 +141,25 @@ public class KafkaProducer {
             return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
         }
 
-        // 4. 解析 ProduceResponse v3 响应体
+        // 4. 解析 ProduceResponse v3 响应体（严格校验剩余字节，防截断包被误读为 ERR_NONE=0）
+        if (r.Remaining() < 4) {
+            return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
+        }
         int topicCount = r.ReadArrayHeader();
-        if (topicCount <= 0) {
+        if (topicCount <= 0 || r.Remaining() < 2) {
             return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_UNKNOWN_TOPIC_OR_PARTITION, 0L);
         }
 
         string respTopic = r.ReadString();
+        if (r.Remaining() < 4) {
+            return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
+        }
         int partCount = r.ReadArrayHeader();
         if (partCount <= 0) {
             return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_UNKNOWN_TOPIC_OR_PARTITION, 0L);
+        }
+        if (r.Remaining() < 30) {
+            return new ProduceResult(topic, partition, -1L, KafkaConstants.ERR_NETWORK_EXCEPTION, 0L);
         }
 
         int respPart = r.ReadInt32();

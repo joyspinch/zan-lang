@@ -184,7 +184,11 @@ public class AmqpConnection : IDisposable {
 
         // 1. 发送 8 字节协议头部 (AMQP\x00\x00\x09\x01)
         byte[] protoHdr = AmqpConstants.PROTOCOL_HEADER.ToBytes();
-        int _sp = await conn.SendRawAsync(protoHdr, protoHdr.Length);
+        int sp = await conn.SendRawAsync(protoHdr, protoHdr.Length);
+        if (sp < protoHdr.Length) {
+            conn.Close();
+            return null;
+        }
 
         // 2. 启动后台帧接收调度协程
         Task.Spawn(conn.RunFrameLoopAsync());
@@ -204,34 +208,33 @@ public class AmqpConnection : IDisposable {
         return conn;
     }
 
-    // 申请创建新的逻辑信道 (Channel.Open)
+    // 申请创建新的逻辑信道 (Channel.Open -> Channel.Open-Ok)
     public async AmqpChannel CreateChannelAsync() {
         if (!this.connected) { return null; }
         int cid = 0;
         AmqpChannel ch = null;
         lock (this) {
             if (!this.connected || this.channels == null) { return null; }
-            cid = this.nextChannelId;
-            this.nextChannelId = this.nextChannelId + 1;
+            int maxCid = this.channelMax > 0 && this.channelMax <= 65535 ? this.channelMax : 65535;
+            if (this.channels.Count >= maxCid) { return null; }
+            int cand = this.nextChannelId;
+            for (int tries = 0; tries < maxCid; tries = tries + 1) {
+                if (cand < 1 || cand > maxCid) { cand = 1; }
+                if (!this.channels.ContainsKey(cand)) {
+                    cid = cand;
+                    this.nextChannelId = cand + 1;
+                    if (this.nextChannelId > maxCid) { this.nextChannelId = 1; }
+                    break;
+                }
+                cand = cand + 1;
+            }
+            if (cid <= 0) { return null; }
             ch = new AmqpChannel(cid, this);
             this.channels[cid] = ch;
         }
 
-        // 发送 Channel.Open (Class 20, Method 10)
-        AmqpWriter w = new AmqpWriter();
-        w.WriteShort(AmqpConstants.CLASS_CHANNEL);
-        w.WriteShort(AmqpConstants.METHOD_CHANNEL_OPEN);
-        w.WriteShortString(""); // reserved-1
-        byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, cid, w.ToBytes(), w.Length());
-        int sent = await this.SendRawAsync(pkt, pkt.Length);
-        if (sent < pkt.Length) {
-            this.UnregisterChannel(cid);
-            ch.Dispose();
-            return null;
-        }
-
-        // 等待 Channel.Open-Ok（通过 BasicQosAsync 探测信道可用性，失败立即注销并清理）
-        if (!await ch.BasicQosAsync(0, false)) {
+        // 标准 AMQP 0-9-1 信道打开握手：发送 Channel.Open 并等待 Channel.Open-Ok
+        if (!await ch.OpenAsync()) {
             this.UnregisterChannel(cid);
             ch.Dispose();
             return null;
@@ -435,7 +438,7 @@ public class AmqpConnection : IDisposable {
             int srvHeartbeat = r.ReadShort();
 
             if (srvChannelMax > 0 && srvChannelMax < this.channelMax) { this.channelMax = srvChannelMax; }
-            if (srvFrameMax > 0 && srvFrameMax < this.frameMax) { this.frameMax = srvFrameMax; }
+            if (srvFrameMax >= 4096 && srvFrameMax < this.frameMax) { this.frameMax = srvFrameMax; }
             if (srvHeartbeat > 0) { this.heartbeatSec = srvHeartbeat; }
 
             // 1. 回复 Connection.Tune-Ok
@@ -544,6 +547,7 @@ public class AmqpConnection : IDisposable {
         nint s = -1;
         List<AmqpChannel> toDispose = null;
         List<AsyncGate> toWake = null;
+        Gate cg = null;
         lock (this) {
             this.connected = false;
             ts = this.tls;
@@ -552,6 +556,8 @@ public class AmqpConnection : IDisposable {
             this.tlsCtx = null;
             s = this.sock;
             this.sock = -1;
+            cg = this.connGate;
+            this.connGate = null;
             if (this.channels != null) {
                 toDispose = new List<AmqpChannel>();
                 List<int> keys = this.channels.Keys;
@@ -585,10 +591,9 @@ public class AmqpConnection : IDisposable {
             }
         }
 
-        if (this.connGate != null) {
-            this.connGate.SignalAll();
-            this.connGate.Close();
-            this.connGate = null;
+        if (cg != null) {
+            cg.SignalAll();
+            cg.Close();
         }
     }
 

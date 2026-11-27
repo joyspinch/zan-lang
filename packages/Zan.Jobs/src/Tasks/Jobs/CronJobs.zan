@@ -10,15 +10,17 @@ public class CronJobs {
     JobStorage storage;
     JobWorker worker;
     RetryPolicy policy;
-    Mutex syncLock;
+    object syncLock;
     bool dispatching;
     bool stopped;
 
     public CronJobs(JobStorage storage, JobRegistry registry, RetryPolicy policy) {
+        if (storage == null) { throw new JobException(JobError.InvalidArgs, "job storage is null"); }
+        if (registry == null) { throw new JobException(JobError.InvalidArgs, "job registry is null"); }
         this.storage = storage;
         this.policy = policy != null ? policy : RetryPolicy.Default();
         this.worker = new JobWorker(storage, registry, this.policy);
-        this.syncLock = new Mutex();
+        this.syncLock = new object();
     }
 
     public bool Upsert(string id, string expression, string name, string args) {
@@ -31,8 +33,7 @@ public class CronJobs {
         if (id == null || id == "") { return false; }
         CronExpression cron = CronJobs.ReadCron(expression, hostingDays);
         if (cron == null) { return false; }
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             if (this.stopped) { return false; }
             JobRecord previous = this.storage.Find(id);
             if (previous != null && previous.cron == "") { return false; }
@@ -60,14 +61,12 @@ public class CronJobs {
             record.error = "";
             this.storage.Append(record);
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public bool Remove(string id) {
-        this.syncLock.WaitOne();
-        try {
+        if (id == null || id.Length == 0) { return false; }
+        lock (this.syncLock) {
             if (this.stopped) { return false; }
             JobRecord record = this.storage.Find(id);
             if (record == null || !CronJobs.IsSchedule(record)) { return false; }
@@ -77,14 +76,12 @@ public class CronJobs {
             record.args = "";
             this.storage.Append(record);
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public bool TriggerNow(string id) {
-        this.syncLock.WaitOne();
-        try {
+        if (id == null || id.Length == 0) { return false; }
+        lock (this.syncLock) {
             if (this.stopped) { return false; }
             JobRecord record = this.storage.Find(id);
             if (record == null || !CronJobs.IsSchedule(record) || record.state == JobState.Processing) { return false; }
@@ -93,14 +90,11 @@ public class CronJobs {
             record.endAt = 0;
             this.storage.Append(record);
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     public List<JobRecord> Snapshot() {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             List<JobRecord> result = new List<JobRecord>();
             if (this.stopped) { return result; }
             List<JobRecord> all = this.storage.Snapshot();
@@ -108,20 +102,15 @@ public class CronJobs {
                 if (CronJobs.IsSchedule(record)) { result.Add(record.Copy()); }
             }
             return result;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     // Seal this dispatcher only when idle so its caller can close the storage.
     public bool TryStop() {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             if (this.dispatching) { return false; }
             this.stopped = true;
             return true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
@@ -131,19 +120,16 @@ public class CronJobs {
 
     // The compatibility host supplies its bool callback adapter and fixed delay.
     public int ProcessOnce(CancellationToken token, RetryPolicy policy, Func<JobRecord, JobResult> adapter) {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             if (this.stopped || this.dispatching) { return 0; }
             this.dispatching = true;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
         try {
             long dueAt = DateTime.GetCurrentUnixMilliseconds();
             RetryPolicy retry = policy != null ? policy : this.policy;
             int count = 0;
             foreach (JobRecord candidate in this.Snapshot()) {
-                if (token.IsCancellationRequested) { break; }
+                if (token != null && token.IsCancellationRequested) { break; }
                 if (!CronJobs.IsDue(candidate, dueAt)) { continue; }
                 JobRecord record = this.Claim(candidate.id, dueAt, retry);
                 if (record == null) { continue; }
@@ -153,15 +139,14 @@ public class CronJobs {
             }
             return count;
         } finally {
-            this.syncLock.WaitOne();
-            this.dispatching = false;
-            this.syncLock.ReleaseMutex();
+            lock (this.syncLock) {
+                this.dispatching = false;
+            }
         }
     }
 
     JobRecord Claim(string id, long dueAt, RetryPolicy policy) {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord record = this.storage.Find(id);
             if (record == null || !CronJobs.IsDue(record, dueAt)) { return null; }
             record = record.Copy();
@@ -188,14 +173,11 @@ public class CronJobs {
             record.endAt = 0;
             this.storage.Append(record);
             return record;
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
     void Complete(string id, JobResult result, RetryPolicy policy) {
-        this.syncLock.WaitOne();
-        try {
+        lock (this.syncLock) {
             JobRecord record = this.storage.Find(id);
             // A callback may remove or replace its schedule. Its old outcome
             // must not overwrite that change.
@@ -222,8 +204,6 @@ public class CronJobs {
             record.cronRetriesLeft = 0;
             record.runAt = CronJobs.NextAt(CronJobs.ReadCron(record.cron, record.cronHostingDays), now);
             this.storage.Append(record);
-        } finally {
-            this.syncLock.ReleaseMutex();
         }
     }
 
@@ -241,6 +221,8 @@ public class CronJobs {
         try {
             return CronExpression.Parse(expression);
         } catch (FormatException e) {
+            return null;
+        } catch (OverflowException e) {
             return null;
         } catch (ArgumentException e) {
             return null;

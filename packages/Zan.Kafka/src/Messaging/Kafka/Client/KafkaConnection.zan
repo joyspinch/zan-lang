@@ -99,6 +99,9 @@ public class KafkaConnection {
             byte[] hdrBytes = hw.ToBytes();
 
             int bodyLen = bodyPayload != null ? bodyPayload.Length : 0;
+            if (bodyLen < 0 || (long)hdrBytes.Length + (long)bodyLen > 67108864L) {
+                return null;
+            }
             int totalMsgLen = hdrBytes.Length + bodyLen;
 
             // 2. 发送 4 字节大端总长度 + Header + Body
@@ -124,7 +127,7 @@ public class KafkaConnection {
             }
             int respLen = ((int)lenBuf[0] << 24) | (((int)lenBuf[1] & 255) << 16) |
                           (((int)lenBuf[2] & 255) << 8) | ((int)lenBuf[3] & 255);
-            if (respLen <= 0 || respLen > 67108864) { // 防御性上限 64MB
+            if (respLen < 4 || respLen > 67108864) { // 至少含 4 字节 correlation_id，防御性上限 64MB
                 this.Shutdown();
                 return null;
             }
@@ -166,16 +169,8 @@ public class KafkaConnection {
     }
 
     void Shutdown() {
-        nint s = -1;
-        lock (this) {
-            this.connected = false;
-            s = this.sock;
-            this.sock = -1;
-        }
-        if (s >= 0) {
-            Socket.ShutdownBoth(s);
-            Socket.Close(s);
-        }
+        // 统一走 Close() 以唤醒所有排队在 ioWaiters 上的协程，防止永久挂起。
+        this.Close();
     }
 
     public void Close() {

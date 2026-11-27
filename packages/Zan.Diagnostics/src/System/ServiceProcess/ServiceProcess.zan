@@ -189,21 +189,23 @@ public class ServiceProcess {
         } else if (t.StartsWith("STATE")) {
             info.state = ServiceProcess.ParseState(t);
         } else if (t.StartsWith("PID")) {
-            info.processId = ServiceProcess.ParseInt(ServiceProcess.AfterColon(t));
+            info.processId = ServiceProcess.ParseInt(ServiceProcess.AfterColon(t).Trim());
         }
     }
 
-    // sc 命令是否成功：捕获 stderr 后看首行是否含 FAILED
-    // （成功行是 SERVICE_NAME: / STATE: 4 RUNNING 等）。
+    // sc 命令是否成功：以退出码 0 为主，同时兜底检查输出是否含 FAILED。
     private static bool ScOk(string verb, string name) {
+        if (name == null || name == "") { return false; }
         List<string> args = new List<string>();
         args.Add(verb);
         args.Add(name);
         ProcessResult res = Process.CaptureSafe("sc.exe", args);
+        if (res.exitCode != 0) { return false; }
         List<string> lines = res.lines;
-        if (lines.Count == 0) { return false; }
-        string head = TextUtil.TrimOrEmpty(lines[0]);
-        if (head.IndexOf("FAILED", 0) >= 0) { return false; }
+        if (lines.Count > 0) {
+            string head = TextUtil.TrimOrEmpty(lines[0]);
+            if (head.IndexOf("FAILED", 0) >= 0) { return false; }
+        }
         return true;
     }
 
@@ -244,24 +246,25 @@ public class ServiceProcess {
         }
         return null;
     }
+    #endif
 
-    // 解析前导非负整数，非数字处停止。
+    // 解析前导非负整数（跳过前导空白，非数字处停止）。
     private static int ParseInt(string s) {
-        if (s.Length == 0) { return 0; }
+        if (s == null || s.Length == 0) { return 0; }
+        int i = 0;
+        while (i < s.Length && (s[i] & 255) <= 32) { i = i + 1; }
         int v = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
+        for (; i < s.Length; i = i + 1) {
             int ch = s[i] & 255;
             if (ch < 48 || ch > 57) { break; }
             v = v * 10 + (ch - 48);
         }
         return v;
     }
-    #endif
 
     #if LINUX
-    // 解析 systemctl list-units 输出为服务列表；行内出现子串
-    // `active`（`activating` 亦匹配）记为 4（running），否则 1（stopped），
-    // PID 由 SystemctlPid 补齐。
+    // 解析 systemctl list-units 输出（格式：UNIT LOAD ACTIVE SUB DESCRIPTION）。
+    // 严格按 ACTIVE 列判断（避免把 "inactive" 误判为 "active"），PID 由 SystemctlPid 补齐。
     private static List<ServiceInfo> SystemctlList(List<ServiceInfo> list) {
         List<string> args = new List<string>();
         args.Add("list-units");
@@ -274,20 +277,43 @@ public class ServiceProcess {
         int i = 0;
         while (i < lines.Count) {
             string line = lines[i];
-            int sp = line != null ? line.IndexOf(" ", 0) : -1;
-            if (sp <= 0) { i = i + 1; continue; }
-            string unit = line.Substring(0, sp);
+            if (line == null) { i = i + 1; continue; }
+            List<string> cols = ServiceProcess.SplitCols(line, 4);
+            int uIdx = 0;
+            if (cols.Count > 0 && !cols[0].EndsWith(".service") && cols.Count >= 4 && cols[1].EndsWith(".service")) {
+                uIdx = 1;
+            }
+            if (cols.Count <= uIdx + 2) { i = i + 1; continue; }
+            string unit = cols[uIdx];
             if (!unit.EndsWith(".service")) { i = i + 1; continue; }
+            string activeCol = cols[uIdx + 2];
             ServiceInfo e = new ServiceInfo();
             e.name = unit.Substring(0, unit.Length - 8);
             e.displayName = e.name;
             e.state = 1;
-            if (line.IndexOf("active", 0) >= 0) { e.state = 4; }
+            if (activeCol == "active" || activeCol == "reloading") { e.state = 4; }
+            else if (activeCol == "activating") { e.state = 2; }
+            else if (activeCol == "deactivating") { e.state = 3; }
             e.processId = ServiceProcess.SystemctlPid(e.name);
             list.Add(e);
             i = i + 1;
         }
         return list;
+    }
+
+    // 拆分前 maxCols 个空白分隔列。
+    private static List<string> SplitCols(string line, int maxCols) {
+        List<string> cols = new List<string>();
+        int n = line.Length;
+        int i = 0;
+        while (i < n && cols.Count < maxCols) {
+            while (i < n && (line[i] & 255) <= 32) { i = i + 1; }
+            if (i >= n) { break; }
+            int start = i;
+            while (i < n && (line[i] & 255) > 32) { i = i + 1; }
+            cols.Add(line.Substring(start, i - start));
+        }
+        return cols;
     }
 
     // 查询服务主进程 PID（`systemctl show -p MainPID --value`）；
@@ -300,12 +326,15 @@ public class ServiceProcess {
         args.Add("--value");
         args.Add(name + ".service");
         ProcessResult res = Process.CaptureSafe("systemctl", args);
-        if (res.lines.Count > 0) { return ServiceProcess.ParseInt(res.lines[0]); }
+        if (res.exitCode == 0 && res.lines.Count > 0) {
+            return ServiceProcess.ParseInt(TextUtil.TrimOrEmpty(res.lines[0]));
+        }
         return 0;
     }
 
-    // 执行 systemctl 子命令；输出首行不含 `error` 或无输出视为成功。
+    // 执行 systemctl 子命令；以进程退出码 0 判定成功。
     private static bool Systemctl(string verb, string name) {
+        if (name == null || name == "") { return false; }
         List<string> args = new List<string>();
         if (verb == "disable --now") {
             args.Add("disable");
@@ -315,9 +344,7 @@ public class ServiceProcess {
         }
         args.Add(name + ".service");
         ProcessResult res = Process.CaptureSafe("systemctl", args);
-        List<string> lines = res.lines;
-        return lines.Count == 0 || lines[0] == null
-               || lines[0].IndexOf("error", 0) < 0;
+        return res.exitCode == 0;
     }
     #endif
 

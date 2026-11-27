@@ -22,6 +22,9 @@ public delegate void SysFreeStringFn(nint bstr);
 // SysAllocString — 创建 COM BSTR。
 public delegate nint SysAllocStringFn(nint wide);
 
+// VariantClear — 释放 VARIANT 内部持有的 COM/BSTR 资源。
+public delegate int VariantClearFn(nint variant);
+
 // MSAA (IAccessible) 无障碍元素封装（仅 Windows；其他平台抛 PlatformNotSupportedException）。
 // 每个 UiElement 持有独立 IAccessible 引用，工厂及树遍历/查找返回的新引用均须各自 Dispose()。
 public class UiElement : IDisposable {
@@ -61,6 +64,7 @@ public class UiElement : IDisposable {
     static nint fnWindowFromAcc;
     static nint fnSysFree;
     static nint fnSysAlloc;
+    static nint fnVariantClear;
 
     // 持有的 IAccessible 接口指针（拥有引用，Dispose 释放；0 为空元素）。
     public nint acc;
@@ -146,6 +150,20 @@ public class UiElement : IDisposable {
         string s = Wide.Read(bstr);
         UiElement.FreeBstr(bstr);
         return s;
+    }
+
+    // 清理 VARIANT 内部持有的 BSTR/IDispatch/SAFEARRAY 等 COM 资源。
+    private static void ClearVariant(nint v) {
+        if (v == 0) { return; }
+        int vt = new Span<short>(v, 1)[0];
+        if (vt == 0 || vt == VT_I4) { return; }
+        if (UiElement.fnVariantClear == 0) {
+            UiElement.fnVariantClear = Interop.Entry("oleaut32.dll", "VariantClear");
+        }
+        if (UiElement.fnVariantClear != 0) {
+            VariantClearFn call = (VariantClearFn)UiElement.fnVariantClear;
+            call(v);
+        }
     }
 
     // 构造 VT_I4 的子元素 VARIANT（24 字节，调用方负责 NativeMemory.Free）。
@@ -238,8 +256,11 @@ public class UiElement : IDisposable {
                 hr = call(pt, cell, vcell);
             }
             acc = new Span<long>(cell, 1)[0];
-            child = new Span<int>(vcell + 8, 1)[0];
+            if (new Span<short>(vcell, 1)[0] == VT_I4) {
+                child = new Span<int>(vcell + 8, 1)[0];
+            }
         } finally {
+            UiElement.ClearVariant(vcell);
             NativeMemory.Free(cell);
             NativeMemory.Free(vcell);
         }
@@ -320,6 +341,7 @@ public class UiElement : IDisposable {
                 val = new Span<int>(v + 8, 1)[0];
             }
         } finally {
+            UiElement.ClearVariant(v);
             NativeMemory.Free(child);
             NativeMemory.Free(v);
         }
@@ -478,13 +500,14 @@ public class UiElement : IDisposable {
         List<UiElement> list = new List<UiElement>();
         if (acc == 0) { return list; }
         int n = ChildCount();
-        if (n == 0) { return list; }
-        nint variants = NativeMemory.Alloc(n * 24);
+        if (n <= 0 || (long)n * 24L > 0x7FFFFFFFL) { return list; }
+        int bytes = n * 24;
+        nint variants = NativeMemory.Alloc(bytes);
         nint obtained = NativeMemory.Alloc(8);
         int got = 0;
         int hr = Com.Fail();
         try {
-            NativeMemory.Fill(variants, 0, n * 24);
+            NativeMemory.Fill(variants, 0, bytes);
             new Span<long>(obtained, 1)[0] = 0;
             nint fn = UiElement.ChildrenFn();
             if (fn != 0) {
@@ -492,6 +515,8 @@ public class UiElement : IDisposable {
                 hr = call(acc, 0, n, variants, obtained);
             }
             got = new Span<int>(obtained, 1)[0];
+            if (got < 0) { got = 0; }
+            if (got > n) { got = n; }
         } finally {
             NativeMemory.Free(obtained);
         }
@@ -523,6 +548,7 @@ public class UiElement : IDisposable {
                     nint iacc = resolved;
                     if (iacc == 0) { iacc = Com.Query(raw, IID_IACCESSIBLE); }
                     Com.Release(raw);
+                    new Span<short>(variant, 1)[0] = 0;
                     if (iacc != 0) {
                         list.Add(new UiElement(iacc, CHILD_SELF));
                     }
@@ -531,6 +557,9 @@ public class UiElement : IDisposable {
                 }
             }
         } finally {
+            for (int k = 0; k < got; k = k + 1) {
+                UiElement.ClearVariant(variants + k * 24);
+            }
             NativeMemory.Free(variants);
         }
         return list;
@@ -577,7 +606,11 @@ public class UiElement : IDisposable {
                 (nint)(long)x, (nint)(long)y, v);
             vt = new Span<short>(v, 1)[0];
             raw = new Span<long>(v + 8, 1)[0];
+            if (Com.Ok(hr) && vt == 9 && raw != 0) {
+                new Span<short>(v, 1)[0] = 0;
+            }
         } finally {
+            UiElement.ClearVariant(v);
             NativeMemory.Free(v);
         }
         if (!Com.Ok(hr)) { return new UiElement((nint)0, 0); }

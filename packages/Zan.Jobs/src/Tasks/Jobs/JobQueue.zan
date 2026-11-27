@@ -17,12 +17,15 @@ public class JobQueue {
     // 序号相同），新记录就把旧记录覆盖了：任务看起来"又变回排队中"，
     // 历史和成功状态一起消失。全局计数器 + 前缀 + 时间戳保证唯一。
     static long idCounter = 0;
-    static System.Threading.Mutex idLock = new System.Threading.Mutex();
+    static object idLock = new object();
 
     JobStorage storage;
     string idPrefix;
 
     public JobQueue(JobStorage storage) {
+        if (storage == null) {
+            throw new JobException(JobError.InvalidArgs, "job storage is null");
+        }
         this.storage = storage;
         this.idPrefix = "job";
     }
@@ -34,13 +37,10 @@ public class JobQueue {
 
     // 生成一个任务 id（时间戳 + 进程级自增序号，保证全局不重复）。
     public string NextId() {
-        idLock.WaitOne();
         long seq = 0;
-        try {
+        lock (JobQueue.idLock) {
             idCounter = idCounter + 1;
             seq = idCounter;
-        } finally {
-            idLock.ReleaseMutex();
         }
         long now = DateTime.GetCurrentUnixMilliseconds();
         return this.idPrefix + "-" + now + "-" + seq;
@@ -77,6 +77,9 @@ public class JobQueue {
 
     // 延迟到 `runAtUnixMs`（unix 毫秒）执行。
     public string Schedule(string name, string argsJson, long runAtUnixMs) {
+        if (name == null || name.Length == 0) {
+            throw new JobException(JobError.InvalidName, "job name is empty");
+        }
         string id = this.NextId();
         JobRecord r = new JobRecord();
         r.id = id;
@@ -95,6 +98,9 @@ public class JobQueue {
     // 所以周期任务在存储里是一条条独立记录——好处是"每次执行的历史"
     // 都在，坏处是记录会变多（用 `Compact()` 或定期清理终结记录）。
     public string EnqueueRecurring(string name, string argsJson, long intervalMs) {
+        if (name == null || name.Length == 0) {
+            throw new JobException(JobError.InvalidName, "job name is empty");
+        }
         if (intervalMs <= 0) {
             throw new JobException(JobError.InvalidArgs, "interval must be positive");
         }

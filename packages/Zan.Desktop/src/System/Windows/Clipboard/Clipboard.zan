@@ -71,7 +71,6 @@ public class Clipboard {
         }
         return 0;
     }
-    #endif
 
     private static bool WinCommitClipboardMem(int format, nint mem) {
         if (Clipboard.WinOpenClipboardRetry() == 0) {
@@ -293,10 +292,25 @@ public class Clipboard {
                 "pbcopy cannot publish '" + mime + "' (file lists are not "
                 + "available through the pasteboard tools)");
         }
-        string tmp = Clipboard.TempFile("in");
-        File.WriteAllText(tmp, content);
+        string tmp = "";
+        List<string> mkArgs = new List<string>();
+        mkArgs.Add(Clipboard.TempFile("in") + ".XXXXXX");
+        ProcessResult created = Process.CaptureSafe("mktemp", mkArgs);
+        if (created.Ok()) {
+            tmp = created.Text().Trim();
+        }
+        if (tmp.Length == 0) {
+            tmp = Clipboard.TempFile("in");
+            List<string> umaskArgs = new List<string>();
+            umaskArgs.Add("-c");
+            umaskArgs.Add("umask 077 && : > \"$1\"");
+            umaskArgs.Add("sh");
+            umaskArgs.Add(tmp);
+            Process.RunSafe("/bin/sh", umaskArgs);
+        }
         int rc = -1;
         try {
+            File.WriteAllText(tmp, content);
             List<string> shArgs = new List<string>();
             shArgs.Add("-c");
             if (tool == Clipboard.ToolWayland()) {
@@ -323,7 +337,7 @@ public class Clipboard {
             }
             rc = Process.RunSafe("/bin/sh", shArgs);
         } finally {
-            File.Delete(tmp);
+            if (File.Exists(tmp)) { File.Delete(tmp); }
         }
         return rc == 0;
     }
@@ -379,6 +393,7 @@ public class Clipboard {
 
     // 将 Unicode 文本放入剪贴板。成功返回 true。
     public static bool SetText(string text) {
+        if (text == null) { text = ""; }
         #if WINDOWS
         nint wide = Wide.Of(text);
         nint mem = (nint)0;
@@ -432,17 +447,22 @@ public class Clipboard {
 
     // 将文件列表（CF_HDROP）放入剪贴板。成功返回 true。
     public static bool SetFiles(List<string> paths) {
+        if (paths == null) { return false; }
         #if WINDOWS
         // DROPFILES 头 20 字节 + UTF-16 NUL 分隔路径列表 + 结尾双 NUL。
         int total = 20;
         int i = 0;
         for (; i < paths.Count; i = i + 1) {
+            if (paths[i] == null) { return false; }
             nint w = Wide.Of(paths[i]);
-            total = total + (Wide.Length(w) + 1) * 2;
+            int add = (Wide.Length(w) + 1) * 2;
             Wide.Free(w);
+            if (add < 0 || total > 0x7FFFFFFF - 2 - add) { return false; }
+            total = total + add;
         }
         total = total + 2;
-        nint mem = Clipboard.WinGlobalAlloc(2, total);
+        // GHND (GMEM_MOVEABLE | GMEM_ZEROINIT = 0x0042) 清零 DROPFILES.pt / fNC。
+        nint mem = Clipboard.WinGlobalAlloc(0x0042, total);
         if (mem == 0) { return false; }
         bool committed = false;
         try {
@@ -497,8 +517,10 @@ public class Clipboard {
             nint hdrop = Clipboard.WinGetClipboardData(15);
             if (hdrop != 0) {
                 int count = Clipboard.WinDragQueryFileW(hdrop, 0xFFFFFFFF, 0, 0);
+                if (count < 0) { count = 0; }
                 for (int i = 0; i < count; i = i + 1) {
                     int len = Clipboard.WinDragQueryFileW(hdrop, i, 0, 0);
+                    if (len < 0) { continue; }
                     nint buf = NativeMemory.Alloc((len + 1) * 2 + 2);
                     try {
                         Clipboard.WinDragQueryFileW(hdrop, i, buf, len + 1);
