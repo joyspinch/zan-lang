@@ -137,6 +137,17 @@ ZAN_GAME_API void zan_game_set_hemi_ambient3d(int32_t enabled,
     float sky_r, float sky_g, float sky_b,
     float ground_r, float ground_g, float ground_b);
 
+/* glTF 2.0 标准 PBR ORM 复合贴图（纹理单元 3：R=AO 环境光遮蔽, G=Roughness 粗糙度,
+ * B=Metallic 金属度，与材质标量相乘；ao_strength 控制 AO 对环境光的遮蔽强度 [0..1]）。
+ * orm_texture 为空时关闭采样（零开销）。 */
+ZAN_GAME_API void zan_game_set_pbr_maps3d(const char *orm_texture,
+    float ao_strength);
+
+/* Alpha Cutout 裁切阈值（glTF 2.0 alphaMode="MASK"）：当 cutoff > 0 且片元最终
+ * alpha < cutoff 时执行 discard（跳过颜色与深度写入，用于树叶/栅栏/毛发卡片）；
+ * cutoff <= 0 关闭裁切。 */
+ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff);
+
 #ifdef __cplusplus
 }
 #endif

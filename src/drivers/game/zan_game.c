@@ -143,6 +143,7 @@ typedef struct {
     zgl_uint program;
     zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
+    zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -201,6 +202,9 @@ static float g_game_fog_color[3] = { 0.0f, 0.0f, 0.0f };
 static float g_game_fog_params[3] = { 0.0f, 0.0f, 0.0f }; /* enabled, start, invRange */
 static char g_game_normal_key[256] = { 0 };
 static float g_game_normal_scale = 0.0f;
+static char g_game_orm_key[256] = { 0 };
+static float g_game_ao_strength = 1.0f;
+static float g_game_alpha_cutoff = 0.0f;
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -438,6 +442,10 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform sampler2D uNormalMap;\n" \
 "uniform int uNormalOn;\n" \
 "uniform float uNormalScale;\n" \
+"uniform sampler2D uOrmMap;\n" \
+"uniform int uOrmOn;\n" \
+"uniform float uAoStrength;\n" \
+"uniform float uAlphaCutoff;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -498,11 +506,18 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "        }\n" \
 "    }\n" \
 "    vec3 V = (uCamValid != 0) ? normalize(uCamPos - v_world_pos) : vec3(0.0, 0.0, 1.0);\n" \
+"    float ao = 1.0;\n" \
 "    float rough = clamp(uMaterial.y, 0.05, 1.0);\n" \
 "    float metal = clamp(uMaterial.x, 0.0, 1.0);\n" \
+"    if (uOrmOn != 0) {\n" \
+"        vec3 orm = texture(uOrmMap, v_uv).rgb;\n" \
+"        ao = mix(1.0, orm.r, clamp(uAoStrength, 0.0, 1.0));\n" \
+"        rough = clamp(uMaterial.y * orm.g, 0.05, 1.0);\n" \
+"        metal = clamp(uMaterial.x * orm.b, 0.0, 1.0);\n" \
+"    }\n" \
 "    float specPow = mix(128.0, 4.0, rough * rough);\n" \
 "    float specStrength = (1.0 - rough) * mix(0.35, 1.0, metal);\n" \
-"    vec3 light = (uHemiOn != 0) ? mix(uHemiGround, uHemiSky, clamp(N.y * 0.5 + 0.5, 0.0, 1.0)) : uAmbient;\n" \
+"    vec3 light = ((uHemiOn != 0) ? mix(uHemiGround, uHemiSky, clamp(N.y * 0.5 + 0.5, 0.0, 1.0)) : uAmbient) * ao;\n" \
 "    vec3 specAcc = vec3(0.0);\n" \
 "    for (int i = 0; i < 4; ++i) {\n" \
 "        if (i >= uLightCount) break;\n" \
@@ -562,6 +577,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    }\n"
 
 #define ZAN_GAME_3D_FINAL_COMPOSE(BASE_EXPR, ALPHA_EXPR) \
+"    float outAlpha = " ALPHA_EXPR ";\n" \
+"    if (uAlphaCutoff > 0.0001 && outAlpha < uAlphaCutoff) discard;\n" \
 "    vec3 baseRgb = " BASE_EXPR ";\n" \
 "    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
 "    vec3 rgb = baseRgb * mix(light, light * (0.35 + 0.65 * rough), metal) + specTint * specAcc + uEmissive;\n" \
@@ -570,7 +587,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
 "        rgb = mix(rgb, uFogColor, fogT);\n" \
 "    }\n" \
-"    frag = vec4(rgb, " ALPHA_EXPR ");\n"
+"    frag = vec4(rgb, outAlpha);\n"
 
 static const char *const ZAN_GAME_3D_FS_PLAIN =
 ZAN_GAME_3D_LIGHT_UNIFORMS
@@ -904,6 +921,14 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uNormalOn");
     zgl_int normal_scale = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uNormalScale");
+    zgl_int orm_map = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uOrmMap");
+    zgl_int orm_on = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uOrmOn");
+    zgl_int ao_strength = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAoStrength");
+    zgl_int alpha_cutoff = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -957,6 +982,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_normal_map = normal_map;
     prog->u_normal_on = normal_on;
     prog->u_normal_scale = normal_scale;
+    prog->u_orm_map = orm_map;
+    prog->u_orm_on = orm_on;
+    prog->u_ao_strength = ao_strength;
+    prog->u_alpha_cutoff = alpha_cutoff;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1007,6 +1036,10 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int normal_map = g_game_gl->GetUniformLocation(program, "uNormalMap");
     zgl_int normal_on = g_game_gl->GetUniformLocation(program, "uNormalOn");
     zgl_int normal_scale = g_game_gl->GetUniformLocation(program, "uNormalScale");
+    zgl_int orm_map = g_game_gl->GetUniformLocation(program, "uOrmMap");
+    zgl_int orm_on = g_game_gl->GetUniformLocation(program, "uOrmOn");
+    zgl_int ao_strength = g_game_gl->GetUniformLocation(program, "uAoStrength");
+    zgl_int alpha_cutoff = g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1048,6 +1081,10 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_normal_map = normal_map;
     g_game_skin_prog.u_normal_on = normal_on;
     g_game_skin_prog.u_normal_scale = normal_scale;
+    g_game_skin_prog.u_orm_map = orm_map;
+    g_game_skin_prog.u_orm_on = orm_on;
+    g_game_skin_prog.u_ao_strength = ao_strength;
+    g_game_skin_prog.u_alpha_cutoff = alpha_cutoff;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1397,6 +1434,27 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->ActiveTexture(ZGL_TEXTURE0 + 2);
         gl->BindTexture(ZGL_TEXTURE_2D, ntex);
         gl->Uniform1i(prog->u_normal_map, 2);
+    }
+    zgl_uint orm_tex = 0;
+    if (g_game_orm_key[0]) {
+        const zan_bitmap *obmp = zan_image_get(g_game_orm_key);
+        if (zan_game_bitmap_valid(obmp)) {
+            orm_tex = zan_gui_gpu_texture(obmp);
+        }
+    }
+    if (prog->u_orm_on >= 0) {
+        gl->Uniform1i(prog->u_orm_on, orm_tex ? 1 : 0);
+    }
+    if (prog->u_ao_strength >= 0 && gl->Uniform1f) {
+        gl->Uniform1f(prog->u_ao_strength, orm_tex ? g_game_ao_strength : 0.0f);
+    }
+    if (prog->u_orm_map >= 0) {
+        gl->ActiveTexture(ZGL_TEXTURE0 + 3);
+        gl->BindTexture(ZGL_TEXTURE_2D, orm_tex);
+        gl->Uniform1i(prog->u_orm_map, 3);
+    }
+    if (prog->u_alpha_cutoff >= 0 && gl->Uniform1f) {
+        gl->Uniform1f(prog->u_alpha_cutoff, g_game_alpha_cutoff);
     }
 }
 
@@ -2180,4 +2238,26 @@ ZAN_GAME_API void zan_game_set_hemi_ambient3d(int32_t enabled,
     g_game_hemi_ground[1] = ground_g;
     g_game_hemi_ground[2] = ground_b;
     ++g_game_light_version;
+}
+
+ZAN_GAME_API void zan_game_set_pbr_maps3d(const char *orm_texture,
+    float ao_strength) {
+    if (!orm_texture || !orm_texture[0]) {
+        g_game_orm_key[0] = '\0';
+        g_game_ao_strength = 1.0f;
+        return;
+    }
+    snprintf(g_game_orm_key, sizeof(g_game_orm_key), "%s", orm_texture);
+    if (ao_strength < 0.0f) ao_strength = 0.0f;
+    if (ao_strength > 1.0f) ao_strength = 1.0f;
+    g_game_ao_strength = ao_strength;
+}
+
+ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff) {
+    if (cutoff <= 0.0f) {
+        g_game_alpha_cutoff = 0.0f;
+        return;
+    }
+    if (cutoff > 1.0f) cutoff = 1.0f;
+    g_game_alpha_cutoff = cutoff;
 }

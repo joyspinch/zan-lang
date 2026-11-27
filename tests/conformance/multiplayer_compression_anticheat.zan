@@ -1,0 +1,85 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerCompressionAntiCheatTest {
+    static void Main() {
+        // 1. 位流打包 + 3D 位置量化 + Smallest-Three 4 字节四元数压缩（对比 16 字节省 75% 带宽）
+        NetBitWriter w = new NetBitWriter();
+        w.WriteBool(true);
+        w.WriteRangedInt(42, 10, 73);          // 范围 63 -> 仅需 6 bit
+        w.WriteBits(0x15Au, 9);
+        Vector3 origPos = new Vector3(123.45f, -18.25f, 412.8f);
+        w.WriteQuantizedVec3(origPos, -500.0f, 500.0f, -100.0f, 100.0f, -500.0f, 500.0f, 16);
+        Quaternion origQ = Quaternion.Normalize(new Quaternion(0.25f, -0.60f, 0.35f, 0.67f));
+        w.WriteSmallestThreeQuaternion(origQ, 10); // 2 + 30 = 32 bit = 4 字节
+        byte[] packet = w.ToBytes();
+
+        NetBitReader r = new NetBitReader(packet);
+        bool bVal = r.ReadBool();
+        int ranged = r.ReadRangedInt(10, 73);
+        uint raw9 = r.ReadBits(9);
+        Vector3 decPos = r.ReadQuantizedVec3(-500.0f, 500.0f, -100.0f, 100.0f, -500.0f, 500.0f, 16);
+        Quaternion decQ = r.ReadSmallestThreeQuaternion(10);
+
+        float posErr = Vector3.Distance(origPos, decPos);
+        // 四元数 q 与 -q 表示同一旋转，用 |dot(q1, q2)| 校验角度误差
+        float qDot = origQ.X * decQ.X + origQ.Y * decQ.Y + origQ.Z * decQ.Z + origQ.W * decQ.W;
+        if (qDot < 0.0f) { qDot = -qDot; }
+        bool bitPackOk = !r.HasOverflowed
+            && packet.Length <= 13 // 1 + 6 + 9 + 48 + 32 = 96 bit = 12 字节！
+            && bVal && ranged == 42 && raw9 == 0x15Au
+            && posErr < 0.05f && qDot > 0.9999f;
+        Console.WriteLine("net-bitstream-smallest-three-quat: " + Convert.ToString(bitPackOk ? 1 : 0));
+
+        // 2. 权威服移动与变速齿轮反作弊（正常行走放行 + 瞬移拉回 + 变速齿轮超前拦截 + 累犯踢出）
+        NetMovementAntiCheat ac = new NetMovementAntiCheat();
+        int vInit = ac.ValidateMove(7, new Vector3(0.0f, 0.0f, 0.0f), 0.05f, 1000, 10.0f, 20.0f);
+        // 正常移动：100ms 走了 0.9m（<= 10m/s * 0.1s * 1.15 + 0.35 = 1.5m）
+        int vNormal = ac.ValidateMove(7, new Vector3(0.9f, 0.0f, 0.0f), 0.10f, 1100, 10.0f, 20.0f);
+        // 瞬移外挂：100ms 跳到 x=50m（> teleportThreshold 20m）-> RubberBand，权威坐标仍锁在 0.9m
+        int vTele = ac.ValidateMove(7, new Vector3(50.0f, 0.0f, 0.0f), 0.10f, 1200, 10.0f, 20.0f);
+        Vector3 authAfterTele = ac.GetAuthoritativePosition(7);
+        // 客户端时钟加速（Cheat Engine 2x）：真实过去 100ms 却连续上报 250ms 步长 -> 超出 MaxClockLeadSec(0.25s) 触发违规并累计至 Kick
+        int vClock1 = ac.ValidateMove(7, new Vector3(1.5f, 0.0f, 0.0f), 0.30f, 1300, 10.0f, 20.0f);
+        int vClock2 = ac.ValidateMove(7, new Vector3(2.0f, 0.0f, 0.0f), 0.40f, 1400, 10.0f, 20.0f);
+        int vKick = ac.ValidateMove(7, new Vector3(60.0f, 0.0f, 0.0f), 0.10f, 1500, 10.0f, 20.0f);
+
+        bool antiCheatOk = vInit == MovementVerdict.Accepted
+            && vNormal == MovementVerdict.Accepted
+            && vTele == MovementVerdict.RubberBand
+            && authAfterTele.X > 0.89f && authAfterTele.X < 0.91f
+            && (vClock1 == MovementVerdict.RubberBand || vClock2 == MovementVerdict.RubberBand)
+            && vKick == MovementVerdict.KickSuspectedCheat;
+        Console.WriteLine("net-movement-clock-anticheat: " + Convert.ToString(antiCheatOk ? 1 : 0));
+
+        // 3. 大厅就绪确认屏障（全员接受开局 + 超时 AFK 分离优先重排与惩罚名单）
+        int[] squadA = new int[3];
+        squadA[0] = 101; squadA[1] = 102; squadA[2] = 103;
+        NetMatchReadyCheck rcOk = new NetMatchReadyCheck(5001, squadA, 1000, 10000);
+        rcOk.Accept(101, 2000);
+        rcOk.Accept(102, 3000);
+        bool stillPending = rcOk.State == ReadyCheckState.Pending;
+        rcOk.Accept(103, 4000);
+        bool launched = rcOk.State == ReadyCheckState.ReadyToLaunch;
+
+        int[] squadB = new int[3];
+        squadB[0] = 201; squadB[1] = 202; squadB[2] = 203;
+        NetMatchReadyCheck rcTimeout = new NetMatchReadyCheck(5002, squadB, 1000, 10000);
+        rcTimeout.Accept(201, 2000);
+        rcTimeout.Accept(202, 3500);
+        // 203 挂机超时（nowMs = 12000 >= 1000 + 10000）
+        int stAfter = rcTimeout.UpdateTimeout(12000);
+        List<int> requeue = rcTimeout.GetPriorityRequeuePlayers();
+        List<int> offenders = rcTimeout.GetPenaltyOffenders();
+
+        bool readyCheckOk = stillPending && launched
+            && stAfter == ReadyCheckState.Cancelled
+            && requeue.Count == 2 && requeue[0] == 201 && requeue[1] == 202
+            && offenders.Count == 1 && offenders[0] == 203;
+        Console.WriteLine("net-match-ready-check: " + Convert.ToString(readyCheckOk ? 1 : 0));
+    }
+}

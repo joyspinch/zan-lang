@@ -1,0 +1,165 @@
+using System;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+using Game.Assets;
+
+namespace Conf;
+
+class Game3DPbrOrmCutoutTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int R(int argb) { return (argb >> 16) & 255; }
+    private static int G(int argb) { return (argb >> 8) & 255; }
+    private static int B(int argb) { return argb & 255; }
+    private static int Lum(int argb) { return (R(argb) + G(argb) + B(argb)) / 3; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 1. 烘焙 glTF 2.0 ORM 复合贴图：
+        // 左半：R(AO)=0x1A(~0.10), G(Rough)=0xFF(1.00), B(Metal)=0xFF(1.00)
+        // 右半：R(AO)=0xFF(1.00), G(Rough)=0x1A(~0.10), B(Metal)=0xFF(1.00)
+        Canvas ormCv = new Canvas(64, 64);
+        ormCv.Clear(unchecked((int)0xFFFFFFFF));
+        ormCv.FillRect(0, 0, 32, 64, unchecked((int)0xFF1AFFFF));
+        ormCv.FillRect(32, 0, 32, 64, unchecked((int)0xFFFF1AFF));
+        int ormBaked = ormCv.BakeSprite("mem:r8_orm_split", 0, 0, 64, 64);
+
+        // 2. 烘焙 Alpha-Cutout MASK 贴图：左半实心亮绿（alpha=255），右半全透明（alpha=0）
+        Canvas maskCv = new Canvas(64, 64);
+        maskCv.Clear(0);
+        maskCv.FillRect(0, 0, 32, 64, unchecked((int)0xFF20E040));
+        int maskBaked = maskCv.BakeSprite("mem:r8_cutout_mask", 0, 0, 64, 64);
+
+        int quadHandle = cv.MeshUpload(MakeQuad(2.2f, 2.2f));
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+
+        // 测试 A：ORM R 通道环境光遮蔽（纯环境光下，左半 AO=0.10 远暗于右半 AO=1.0）
+        SceneNode rootAo = new SceneNode("root_ao");
+        SceneNode nAo = new SceneNode("quad_ao");
+        nAo.MeshKey = quadHandle;
+        nAo.BoundsRadius = 4.0f;
+        nAo.Material = Material.Solid(0.9f, 0.9f, 0.9f);
+        nAo.Material.Metallic = 0.0f;
+        nAo.Material.Roughness = 1.0f;
+        nAo.Material.OrmMapKey = "mem:r8_orm_split";
+        nAo.Material.AoStrength = 1.0f;
+        rootAo.AddChild(nAo);
+
+        RenderPlan planAo = new RenderPlan(cam);
+        planAo.AmbientRed = 0.8f;
+        planAo.AmbientGreen = 0.8f;
+        planAo.AmbientBlue = 0.8f;
+        planAo.Build(rootAo);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, planAo);
+        int aoLeft = Lum(zan_gui_read_pixel(cv.SurfaceId(), 40, 64));
+        int aoRight = Lum(zan_gui_read_pixel(cv.SurfaceId(), 88, 64));
+        bool aoOk = ormBaked > 0 && aoLeft < 60 && aoRight > 150 && (aoRight - aoLeft) > 100;
+        Console.WriteLine("pbr-orm-ao-map: " + Convert.ToString(aoOk ? 1 : 0));
+
+        // 测试 B：ORM G/B 通道逐像素粗糙度/金属度高光分离（正面方向光，近中心点采样对比粗糙 vs 光滑高光）
+        SceneNode rootSpec = new SceneNode("root_spec");
+        SceneNode nSpec = new SceneNode("quad_spec");
+        nSpec.MeshKey = quadHandle;
+        nSpec.BoundsRadius = 4.0f;
+        nSpec.Material = Material.Solid(0.45f, 0.45f, 0.45f);
+        nSpec.Material.Metallic = 0.0f;
+        nSpec.Material.Roughness = 1.0f;
+        nSpec.Material.OrmMapKey = "mem:r8_orm_split";
+        nSpec.Material.AoStrength = 0.0f;
+        rootSpec.AddChild(nSpec);
+
+        RenderPlan planSpec = new RenderPlan(cam);
+        planSpec.AmbientRed = 0.05f;
+        planSpec.AmbientGreen = 0.05f;
+        planSpec.AmbientBlue = 0.05f;
+        planSpec.Lights.Add(Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f, new Vector3(0.0f, 0.0f, -1.0f)));
+        planSpec.Build(rootSpec);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, planSpec);
+        int roughL = Lum(zan_gui_read_pixel(cv.SurfaceId(), 58, 64));
+        int smoothR = Lum(zan_gui_read_pixel(cv.SurfaceId(), 70, 64));
+        bool ormSpecOk = smoothR > roughL + 40;
+        Console.WriteLine("pbr-orm-rough-metal-specular: " + Convert.ToString(ormSpecOk ? 1 : 0));
+
+        // 测试 C：Alpha-Cutout MASK 裁切（前景 z=0 绿色左半实心/右半透明，背景 z=-1 纯红）
+        SceneNode rootCut = new SceneNode("root_cut");
+        SceneNode bg = new SceneNode("bg_red");
+        bg.MeshKey = quadHandle;
+        bg.BoundsRadius = 4.0f;
+        bg.Local.Position = new Vector3(0.0f, 0.0f, -1.0f);
+        bg.Material = Material.Emissive(0.95f, 0.08f, 0.08f);
+        rootCut.AddChild(bg);
+
+        SceneNode fg = new SceneNode("fg_mask");
+        fg.MeshKey = quadHandle;
+        fg.BoundsRadius = 4.0f;
+        fg.Local.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        fg.Material = Material.Emissive(1.0f, 1.0f, 1.0f);
+        fg.Material.Red = 1.0f;
+        fg.Material.Green = 1.0f;
+        fg.Material.Blue = 1.0f;
+        fg.Material.EmissiveRed = 0.0f;
+        fg.Material.EmissiveGreen = 0.0f;
+        fg.Material.EmissiveBlue = 0.0f;
+        fg.Material.TextureKey = "mem:r8_cutout_mask";
+        fg.Material.AlphaCutoff = 0.5f;
+        rootCut.AddChild(fg);
+
+        RenderPlan planCut = new RenderPlan(cam);
+        planCut.AmbientRed = 0.9f;
+        planCut.AmbientGreen = 0.9f;
+        planCut.AmbientBlue = 0.9f;
+        planCut.Build(rootCut);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, planCut);
+        int pixL = zan_gui_read_pixel(cv.SurfaceId(), 40, 64);
+        int pixR = zan_gui_read_pixel(cv.SurfaceId(), 88, 64);
+        bool cutoutOk = maskBaked > 0
+            && G(pixL) > R(pixL) + 80
+            && R(pixR) > G(pixR) + 120;
+        Console.WriteLine("pbr-alpha-cutout-mask: " + Convert.ToString(cutoutOk ? 1 : 0));
+
+        // 测试 D：glTF 2.0 材质 ORM/Occlusion/MASK 解析
+        string gltfJson = "{\"asset\":{\"version\":\"2.0\"},"
+            + "\"materials\":[{\"name\":\"foliage_orm\",\"alphaMode\":\"MASK\",\"alphaCutoff\":0.42,"
+            + "\"pbrMetallicRoughness\":{\"metallicFactor\":0.8,\"roughnessFactor\":0.6,"
+            + "\"metallicRoughnessTexture\":{\"index\":1}},"
+            + "\"occlusionTexture\":{\"index\":2,\"strength\":0.75}}]}";
+        GltfModel model = GltfLoader.LoadGltfBytes(Encoding.UTF8.GetBytes(gltfJson), null, "");
+        bool gltfOk = model != null && model.MaterialCount == 1
+            && model.Materials[0].AlphaMode == "MASK"
+            && model.Materials[0].AlphaCutoff > 0.41f && model.Materials[0].AlphaCutoff < 0.43f
+            && model.Materials[0].MetallicRoughnessTextureIndex == 1
+            && model.Materials[0].OcclusionTextureIndex == 2
+            && model.Materials[0].OcclusionStrength > 0.74f && model.Materials[0].OcclusionStrength < 0.76f;
+        Console.WriteLine("gltf-orm-mask-parse: " + Convert.ToString(gltfOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

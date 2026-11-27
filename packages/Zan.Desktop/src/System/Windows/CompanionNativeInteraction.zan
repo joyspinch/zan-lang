@@ -1,0 +1,354 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 活动窗口标题栏可栖息顶边快照（供桌宠爬上/坐在浏览器或 IDE 窗口顶部行走）。
+public class WindowPerchSurface {
+    public nint Hwnd;
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+    public bool CanPerch;
+
+    public WindowPerchSurface() {
+        this.Hwnd = 0;
+        this.Left = 0;
+        this.Top = 0;
+        this.Right = 0;
+        this.Bottom = 0;
+        this.CanPerch = false;
+    }
+
+    public int Width { get { return this.Right > this.Left ? (this.Right - this.Left) : 0; } }
+    public int Height { get { return this.Bottom > this.Top ? (this.Bottom - this.Top) : 0; } }
+
+    public static WindowPerchSurface FromRect(nint hwnd, int left, int top, int right, int bottom, bool canPerch) {
+        WindowPerchSurface s = new WindowPerchSurface();
+        s.Hwnd = hwnd;
+        s.Left = left;
+        s.Top = top;
+        s.Right = right;
+        s.Bottom = bottom;
+        s.CanPerch = canPerch;
+        return s;
+    }
+}
+
+// 活动窗口标题栏栖息追踪器（商业桌宠标志交互：坐在 Chrome/IDE/记事本窗口顶边巡逻与下落）：
+// Windows 下通过 user32!GetForegroundWindow + GetWindowRect + IsWindowVisible + IsIconic + IsZoomed
+// 实时检测可栖息的非最大化前景窗口顶边，自动排除自身句柄、桌面壳与过窄/无顶部净空窗口。
+public static class WindowPerchTracker {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetForegroundWindow")]
+    private static extern nint WinGetForegroundWindow();
+
+    [DllImport("user32", EntryPoint = "GetShellWindow")]
+    private static extern nint WinGetShellWindow();
+
+    [DllImport("user32", EntryPoint = "GetDesktopWindow")]
+    private static extern nint WinGetDesktopWindow();
+
+    [DllImport("user32", EntryPoint = "IsWindowVisible")]
+    private static extern int WinIsWindowVisible(nint hWnd);
+
+    [DllImport("user32", EntryPoint = "IsIconic")]
+    private static extern int WinIsIconic(nint hWnd);
+
+    [DllImport("user32", EntryPoint = "IsZoomed")]
+    private static extern int WinIsZoomed(nint hWnd);
+
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    private static extern int WinGetWindowRect(nint hWnd, nint rectPtr);
+    #endif
+
+    // 查询当前前景窗口是否具备合法标题栏栖息顶边。
+    // minWidthPx: 窗口最小宽度要求；topHeadroomPx: 窗口顶边距屏幕顶部最小留空（防止宠物脑袋被裁出屏外）。
+    public static WindowPerchSurface QueryForegroundPerch(nint selfHwnd, int minWidthPx, int topHeadroomPx) {
+        WindowPerchSurface empty = new WindowPerchSurface();
+        #if WINDOWS
+        nint fg = WinGetForegroundWindow();
+        if (fg == 0 || fg == selfHwnd) { return empty; }
+        if (fg == WinGetShellWindow() || fg == WinGetDesktopWindow()) { return empty; }
+        if (WinIsWindowVisible(fg) == 0) { return empty; }
+        if (WinIsIconic(fg) != 0 || WinIsZoomed(fg) != 0) { return empty; }
+
+        nint rectBuf = NativeMemory.Alloc(16);
+        if (rectBuf == 0) { return empty; }
+        try {
+            int ok = WinGetWindowRect(fg, rectBuf);
+            if (ok == 0) { return empty; }
+            Span<int> r = new Span<int>(rectBuf, 4);
+            int left = r[0];
+            int top = r[1];
+            int right = r[2];
+            int bottom = r[3];
+            int width = right - left;
+            int minW = minWidthPx > 0 ? minWidthPx : 120;
+            bool valid = width >= minW && top >= topHeadroomPx && bottom > top + 40;
+            return WindowPerchSurface.FromRect(fg, left, top, right, bottom, valid);
+        } finally {
+            NativeMemory.Free(rectBuf);
+        }
+        #else
+        return empty;
+        #endif
+    }
+
+    // 判定宠物脚底是否刚好落在前景窗口顶边吸附带内（向上起跳 velY < -20 时不吸附，避免起跳即粘住）。
+    public static bool CanAttachToPerch(int petX, int petY, int petWidth, int petHeight,
+                                        float petVelY, WindowPerchSurface surface, int snapTolerancePx) {
+        if (surface == null || !surface.CanPerch) { return false; }
+        if (petVelY < -20.0f) { return false; }
+        int tol = snapTolerancePx > 0 ? snapTolerancePx : 12;
+        int feetY = petY + petHeight;
+        int dy = feetY - surface.Top;
+        if (dy < -tol || dy > tol) { return false; }
+        int centerX = petX + petWidth / 2;
+        return centerX >= surface.Left && centerX <= surface.Right;
+    }
+
+    // 宠物在活动窗口标题栏顶边巡逻步进：触碰窗口左右角自动折返，绝不走空悬崖。
+    public static bool StepPerchPatrol(float petX, float walkVelX, int petWidth, float dtSec,
+                                       WindowPerchSurface surface, out float nextX, out float nextVelX) {
+        if (surface == null || !surface.CanPerch || surface.Width < petWidth) {
+            nextX = petX;
+            nextVelX = walkVelX;
+            return false;
+        }
+        float minX = (float)surface.Left;
+        float maxX = (float)(surface.Right - petWidth);
+        float nx = petX + walkVelX * dtSec;
+        float nv = walkVelX;
+        if (nx <= minX) {
+            nx = minX;
+            nv = nv < 0.0f ? -nv : nv;
+        } else if (nx >= maxX) {
+            nx = maxX;
+            nv = nv > 0.0f ? -nv : nv;
+        }
+        nextX = nx;
+        nextVelX = nv;
+        return true;
+    }
+}
+
+// Win32 全局热键修饰键常量（MOD_ALT / MOD_CONTROL / MOD_SHIFT / MOD_WIN / MOD_NOREPEAT）。
+public static class HotkeyModifiers {
+    public const uint None = 0x0000u;
+    public const uint Alt = 0x0001u;
+    public const uint Control = 0x0002u;
+    public const uint Shift = 0x0004u;
+    public const uint Win = 0x0008u;
+    public const uint NoRepeat = 0x4000u;
+}
+
+// 系统级全局热键注册表（老板键一键隐藏 / 召唤宠物 / 快捷启停番茄钟）：
+// Windows 下调用 user32!RegisterHotKey / UnregisterHotKey，内置 ID 账本并在退出时一键 UnregisterAll 杜绝系统热键泄漏。
+public class GlobalHotkeyRegistry {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "RegisterHotKey")]
+    private static extern int WinRegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32", EntryPoint = "UnregisterHotKey")]
+    private static extern int WinUnregisterHotKey(nint hWnd, int id);
+    #endif
+
+    private nint targetHwnd;
+    private List<int> registeredIds;
+
+    public GlobalHotkeyRegistry() {
+        this.targetHwnd = 0;
+        this.registeredIds = new List<int>();
+    }
+
+    public GlobalHotkeyRegistry(nint windowHwnd) {
+        this.targetHwnd = windowHwnd;
+        this.registeredIds = new List<int>();
+    }
+
+    public int RegisteredCount { get { return this.registeredIds.Count; } }
+
+    private int FindIndex(int id) {
+        for (int i = 0; i < this.registeredIds.Count; i = i + 1) {
+            if (this.registeredIds[i] == id) { return i; }
+        }
+        return -1;
+    }
+
+    public bool IsRegistered(int id) {
+        return this.FindIndex(id) >= 0;
+    }
+
+    // 注册全局热键；id 已占用或 OS 冲突（被其他软件占用）返回 false。
+    public bool Register(int id, uint modifiers, uint virtualKey) {
+        if (id <= 0 || virtualKey == 0u) { return false; }
+        if (this.FindIndex(id) >= 0) { return false; }
+        #if WINDOWS
+        int ok = WinRegisterHotKey(this.targetHwnd, id, modifiers, virtualKey);
+        if (ok == 0) { return false; }
+        #endif
+        this.registeredIds.Add(id);
+        return true;
+    }
+
+    // 注销单个全局热键。
+    public bool Unregister(int id) {
+        int idx = this.FindIndex(id);
+        if (idx < 0) { return false; }
+        #if WINDOWS
+        WinUnregisterHotKey(this.targetHwnd, id);
+        #endif
+        this.registeredIds.RemoveAt(idx);
+        return true;
+    }
+
+    // 清理本注册表登记的全部系统全局热键（程序退出前调用）。
+    public void UnregisterAll() {
+        while (this.registeredIds.Count > 0) {
+            int last = this.registeredIds[this.registeredIds.Count - 1];
+            this.Unregister(last);
+        }
+    }
+}
+
+// 桌宠对话气泡优先级常量。
+public static class SpeechPriority {
+    public const int Ambient = 0;      // 闲聊/自言自语
+    public const int Interaction = 1;  // 抚摸/喂食反馈
+    public const int Alert = 2;        // 番茄钟/久坐/低电提醒
+    public const int SystemUrgent = 3; // 最高优先级系统提示
+}
+
+// 单条桌宠对话气泡项。
+public class SpeechBubbleItem {
+    public string Category;
+    public string Text;
+    public int Priority;
+    public int DurationMs;
+    public long ShownAtMs;
+
+    public SpeechBubbleItem(string category, string text, int priority, int durationMs) {
+        this.Category = category != null ? category : "";
+        this.Text = text != null ? text : "";
+        this.Priority = priority;
+        this.DurationMs = durationMs > 0 ? durationMs : 3000;
+        this.ShownAtMs = 0;
+    }
+}
+
+// 桌宠对话气泡与通知调度队列：
+// 支持按分类防刷屏冷却、高优抢占低优闲聊、优先级有序排队、打字机逐字显示进度，以及屏幕工作区边界防裁切定位。
+public class CompanionSpeechQueue {
+    public int MaxPending;
+    public float CharsPerSecond;
+
+    private SpeechBubbleItem active;
+    private List<SpeechBubbleItem> pending;
+    private Dictionary<string, long> categoryCooldownUntilMs;
+
+    public CompanionSpeechQueue() {
+        this.MaxPending = 8;
+        this.CharsPerSecond = 24.0f;
+        this.active = null;
+        this.pending = new List<SpeechBubbleItem>();
+        this.categoryCooldownUntilMs = new Dictionary<string, long>();
+    }
+
+    public SpeechBubbleItem Active { get { return this.active; } }
+    public int PendingCount { get { return this.pending.Count; } }
+
+    // 入队一条气泡消息；若同分类仍在冷却期则静默忽略并返回 false；高优消息可立即抢占当前低优气泡。
+    public bool Enqueue(string category, string text, int priority, int durationMs,
+                        int categoryCooldownMs, long nowMs) {
+        if (text == null || text == "") { return false; }
+        string cat = category != null ? category : "";
+        if (cat != "" && categoryCooldownMs > 0) {
+            long until;
+            if (this.categoryCooldownUntilMs.TryGetValue(cat, out until) && nowMs < until) {
+                return false;
+            }
+            this.categoryCooldownUntilMs[cat] = nowMs + (long)categoryCooldownMs;
+        }
+
+        SpeechBubbleItem item = new SpeechBubbleItem(cat, text, priority, durationMs);
+        if (this.active == null) {
+            item.ShownAtMs = nowMs;
+            this.active = item;
+            return true;
+        }
+
+        // 高优先级消息抢占当前低优展示（如番茄钟结束提醒打断日常闲聊）
+        if (priority > this.active.Priority) {
+            item.ShownAtMs = nowMs;
+            this.active = item;
+            return true;
+        }
+
+        if (this.pending.Count >= this.MaxPending) {
+            // 队列满时仅允许替换尾部更低优先级项
+            SpeechBubbleItem tail = this.pending[this.pending.Count - 1];
+            if (priority <= tail.Priority) { return false; }
+            this.pending.RemoveAt(this.pending.Count - 1);
+        }
+
+        // 按优先级降序插入，保持同级 FIFO
+        this.pending.Add(item);
+        int idx = this.pending.Count - 1;
+        while (idx > 0 && this.pending[idx].Priority > this.pending[idx - 1].Priority) {
+            SpeechBubbleItem tmp = this.pending[idx - 1];
+            this.pending[idx - 1] = this.pending[idx];
+            this.pending[idx] = tmp;
+            idx = idx - 1;
+        }
+        return true;
+    }
+
+    // 驱动气泡生命周期：当前气泡超时后自动弹出队列中优先级最高的一条。
+    public SpeechBubbleItem Update(long nowMs) {
+        if (this.active != null && nowMs - this.active.ShownAtMs >= (long)this.active.DurationMs) {
+            this.active = null;
+        }
+        if (this.active == null && this.pending.Count > 0) {
+            SpeechBubbleItem next = this.pending[0];
+            this.pending.RemoveAt(0);
+            next.ShownAtMs = nowMs;
+            this.active = next;
+        }
+        return this.active;
+    }
+
+    // 计算当前气泡在打字机效果下应显示的字符数（0..Text.Length）。
+    public int VisibleCharCount(long nowMs) {
+        if (this.active == null) { return 0; }
+        long elapsed = nowMs - this.active.ShownAtMs;
+        if (elapsed <= 0) { return 0; }
+        int chars = (int)((float)elapsed * this.CharsPerSecond / 1000.0f);
+        if (chars > this.active.Text.Length) { chars = this.active.Text.Length; }
+        return chars;
+    }
+
+    // 将气泡锚定在宠物头顶居中并自动避让工作区四边：上方空间不足时自动翻折到锚点下方，左右严格钳制在屏内。
+    public static void ClampBubbleToWorkArea(int anchorCenterX, int anchorTopY, int anchorBottomY,
+                                             int bubbleW, int bubbleH, int gapPx,
+                                             int workLeft, int workTop, int workRight, int workBottom,
+                                             out int outX, out int outY) {
+        int x = anchorCenterX - bubbleW / 2;
+        if (x < workLeft) { x = workLeft; }
+        if (x + bubbleW > workRight) { x = workRight - bubbleW; }
+        if (x < workLeft) { x = workLeft; }
+
+        int y = anchorTopY - gapPx - bubbleH;
+        if (y < workTop) {
+            y = anchorBottomY + gapPx;
+        }
+        if (y + bubbleH > workBottom) {
+            y = workBottom - bubbleH;
+        }
+        if (y < workTop) { y = workTop; }
+
+        outX = x;
+        outY = y;
+    }
+}

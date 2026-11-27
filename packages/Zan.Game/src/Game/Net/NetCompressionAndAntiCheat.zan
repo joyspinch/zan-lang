@@ -1,0 +1,492 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Net;
+
+// 商业级 UDP 位流编码器（LSB-first 64 位累加缓冲）：
+// 支持任意位宽整数、有界整数最小位宽编码、有界浮点量化、3D 位置量化与 Smallest-Three 四元数压缩
+// （4 字节编码完整 3D 旋转，相比 16 字节原始 float4 节省 75% 带宽）。
+public class NetBitWriter {
+    private const float InvSqrt2 = 0.70710678f;
+
+    private List<byte> bytes;
+    private ulong scratch;
+    private int scratchBits;
+    private int totalBits;
+
+    public NetBitWriter() {
+        this.bytes = new List<byte>();
+        this.scratch = 0ul;
+        this.scratchBits = 0;
+        this.totalBits = 0;
+    }
+
+    public int BitLength { get { return this.totalBits; } }
+    public int ByteLength { get { return (this.totalBits + 7) / 8; } }
+
+    public static int BitsRequired(uint maxVal) {
+        if (maxVal == 0u) { return 1; }
+        int bits = 0;
+        uint v = maxVal;
+        while (v > 0u) {
+            bits = bits + 1;
+            v = v >> 1;
+        }
+        return bits;
+    }
+
+    public void WriteBits(uint value, int bitCount) {
+        if (bitCount <= 0 || bitCount > 32) { return; }
+        uint masked = (bitCount == 32) ? value : (value & ((1u << bitCount) - 1u));
+        this.scratch = this.scratch | ((ulong)masked << this.scratchBits);
+        this.scratchBits = this.scratchBits + bitCount;
+        this.totalBits = this.totalBits + bitCount;
+        while (this.scratchBits >= 8) {
+            this.bytes.Add((byte)(this.scratch & 0xFFul));
+            this.scratch = this.scratch >> 8;
+            this.scratchBits = this.scratchBits - 8;
+        }
+    }
+
+    public void WriteBool(bool value) {
+        this.WriteBits(value ? 1u : 0u, 1);
+    }
+
+    public void WriteRangedInt(int value, int minVal, int maxVal) {
+        if (maxVal <= minVal) { return; }
+        int clamped = value;
+        if (clamped < minVal) { clamped = minVal; }
+        if (clamped > maxVal) { clamped = maxVal; }
+        uint range = (uint)(maxVal - minVal);
+        int bits = BitsRequired(range);
+        this.WriteBits((uint)(clamped - minVal), bits);
+    }
+
+    public void WriteQuantizedFloat(float value, float minVal, float maxVal, int bitCount) {
+        if (bitCount <= 0 || bitCount > 24 || maxVal <= minVal) { return; }
+        float t = (value - minVal) / (maxVal - minVal);
+        if (t < 0.0f) { t = 0.0f; }
+        if (t > 1.0f) { t = 1.0f; }
+        uint maxInt = (1u << bitCount) - 1u;
+        uint q = (uint)Math.Round((double)t * (double)maxInt);
+        if (q > maxInt) { q = maxInt; }
+        this.WriteBits(q, bitCount);
+    }
+
+    public void WriteQuantizedVec3(Vector3 v,
+        float minX, float maxX,
+        float minY, float maxY,
+        float minZ, float maxZ,
+        int bitsPerAxis) {
+        this.WriteQuantizedFloat(v.X, minX, maxX, bitsPerAxis);
+        this.WriteQuantizedFloat(v.Y, minY, maxY, bitsPerAxis);
+        this.WriteQuantizedFloat(v.Z, minZ, maxZ, bitsPerAxis);
+    }
+
+    // Smallest-Three 单位四元数压缩：丢弃绝对值最大分量并保证其为正，编码 2-bit 索引 + 3 个有界分量。
+    // 默认 bitsPerComponent=10 时仅占 32 bit（4 字节），角度误差 < 0.002 rad。
+    public void WriteSmallestThreeQuaternion(Quaternion q, int bitsPerComponent) {
+        int bpc = bitsPerComponent;
+        if (bpc < 6) { bpc = 6; }
+        if (bpc > 15) { bpc = 15; }
+        float lenSq = q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W;
+        float invLen = lenSq > 1e-12f ? (1.0f / (float)Math.Sqrt((double)lenSq)) : 1.0f;
+        float x = q.X * invLen;
+        float y = q.Y * invLen;
+        float z = q.Z * invLen;
+        float w = q.W * invLen;
+
+        float ax = x < 0.0f ? -x : x;
+        float ay = y < 0.0f ? -y : y;
+        float az = z < 0.0f ? -z : z;
+        float aw = w < 0.0f ? -w : w;
+
+        int largest = 0;
+        float maxAbs = ax;
+        if (ay > maxAbs) { maxAbs = ay; largest = 1; }
+        if (az > maxAbs) { maxAbs = az; largest = 2; }
+        if (aw > maxAbs) { maxAbs = aw; largest = 3; }
+
+        float sign = 1.0f;
+        if (largest == 0 && x < 0.0f) { sign = -1.0f; }
+        else if (largest == 1 && y < 0.0f) { sign = -1.0f; }
+        else if (largest == 2 && z < 0.0f) { sign = -1.0f; }
+        else if (largest == 3 && w < 0.0f) { sign = -1.0f; }
+        x = x * sign;
+        y = y * sign;
+        z = z * sign;
+        w = w * sign;
+
+        this.WriteBits((uint)largest, 2);
+        if (largest != 0) { this.WriteQuantizedFloat(x, -InvSqrt2, InvSqrt2, bpc); }
+        if (largest != 1) { this.WriteQuantizedFloat(y, -InvSqrt2, InvSqrt2, bpc); }
+        if (largest != 2) { this.WriteQuantizedFloat(z, -InvSqrt2, InvSqrt2, bpc); }
+        if (largest != 3) { this.WriteQuantizedFloat(w, -InvSqrt2, InvSqrt2, bpc); }
+    }
+
+    public byte[] ToBytes() {
+        int outLen = this.bytes.Count + (this.scratchBits > 0 ? 1 : 0);
+        byte[] result = new byte[outLen];
+        for (int i = 0; i < this.bytes.Count; i = i + 1) {
+            result[i] = this.bytes[i];
+        }
+        if (this.scratchBits > 0) {
+            result[this.bytes.Count] = (byte)(this.scratch & 0xFFul);
+        }
+        return result;
+    }
+}
+
+// 商业级 UDP 位流解码器（与 NetBitWriter 逐位对称，越界安全置 HasOverflowed）。
+public class NetBitReader {
+    private const float InvSqrt2 = 0.70710678f;
+
+    private byte[] data;
+    private int bytePos;
+    private ulong scratch;
+    private int scratchBits;
+    private int bitsRead;
+    private int totalBits;
+    public bool HasOverflowed;
+
+    public NetBitReader(byte[] buffer) {
+        this.data = buffer != null ? buffer : new byte[0];
+        this.bytePos = 0;
+        this.scratch = 0ul;
+        this.scratchBits = 0;
+        this.bitsRead = 0;
+        this.totalBits = this.data.Length * 8;
+        this.HasOverflowed = false;
+    }
+
+    public int BitsRead { get { return this.bitsRead; } }
+    public int BitsRemaining { get { return this.totalBits - this.bitsRead; } }
+
+    public uint ReadBits(int bitCount) {
+        if (bitCount <= 0 || bitCount > 32) { return 0u; }
+        if (this.bitsRead + bitCount > this.totalBits) {
+            this.HasOverflowed = true;
+            return 0u;
+        }
+        while (this.scratchBits < bitCount && this.bytePos < this.data.Length) {
+            this.scratch = this.scratch | ((ulong)this.data[this.bytePos] << this.scratchBits);
+            this.bytePos = this.bytePos + 1;
+            this.scratchBits = this.scratchBits + 8;
+        }
+        ulong mask = (bitCount == 32) ? 0xFFFFFFFFul : ((1ul << bitCount) - 1ul);
+        uint val = (uint)(this.scratch & mask);
+        this.scratch = this.scratch >> bitCount;
+        this.scratchBits = this.scratchBits - bitCount;
+        this.bitsRead = this.bitsRead + bitCount;
+        return val;
+    }
+
+    public bool ReadBool() {
+        return this.ReadBits(1) != 0u;
+    }
+
+    public int ReadRangedInt(int minVal, int maxVal) {
+        if (maxVal <= minVal) { return minVal; }
+        uint range = (uint)(maxVal - minVal);
+        int bits = NetBitWriter.BitsRequired(range);
+        uint offset = this.ReadBits(bits);
+        if (offset > range) {
+            this.HasOverflowed = true;
+            return minVal;
+        }
+        return minVal + (int)offset;
+    }
+
+    public float ReadQuantizedFloat(float minVal, float maxVal, int bitCount) {
+        if (bitCount <= 0 || bitCount > 24 || maxVal <= minVal) { return minVal; }
+        uint q = this.ReadBits(bitCount);
+        uint maxInt = (1u << bitCount) - 1u;
+        float t = (float)q / (float)maxInt;
+        return minVal + t * (maxVal - minVal);
+    }
+
+    public Vector3 ReadQuantizedVec3(
+        float minX, float maxX,
+        float minY, float maxY,
+        float minZ, float maxZ,
+        int bitsPerAxis) {
+        float x = this.ReadQuantizedFloat(minX, maxX, bitsPerAxis);
+        float y = this.ReadQuantizedFloat(minY, maxY, bitsPerAxis);
+        float z = this.ReadQuantizedFloat(minZ, maxZ, bitsPerAxis);
+        return new Vector3(x, y, z);
+    }
+
+    public Quaternion ReadSmallestThreeQuaternion(int bitsPerComponent) {
+        int bpc = bitsPerComponent;
+        if (bpc < 6) { bpc = 6; }
+        if (bpc > 15) { bpc = 15; }
+        int largest = (int)this.ReadBits(2);
+        float c0 = this.ReadQuantizedFloat(-InvSqrt2, InvSqrt2, bpc);
+        float c1 = this.ReadQuantizedFloat(-InvSqrt2, InvSqrt2, bpc);
+        float c2 = this.ReadQuantizedFloat(-InvSqrt2, InvSqrt2, bpc);
+        float rem = 1.0f - (c0 * c0 + c1 * c1 + c2 * c2);
+        float lv = rem > 0.0f ? (float)Math.Sqrt((double)rem) : 0.0f;
+        if (largest == 0) { return new Quaternion(lv, c0, c1, c2); }
+        if (largest == 1) { return new Quaternion(c0, lv, c1, c2); }
+        if (largest == 2) { return new Quaternion(c0, c1, lv, c2); }
+        return new Quaternion(c0, c1, c2, lv);
+    }
+}
+
+// 权威服移动反作弊裁决常量。
+public static class MovementVerdict {
+    public const int Accepted = 0;
+    public const int RubberBand = 1;
+    public const int KickSuspectedCheat = 2;
+}
+
+internal class PeerMovementAudit {
+    public int PeerId;
+    public bool Initialized;
+    public Vector3 LastValidPos;
+    public long LastServerMs;
+    public float ClockLeadSec;
+    public float ViolationScore;
+    public int RejectCount;
+
+    public PeerMovementAudit(int peerId) {
+        this.PeerId = peerId;
+        this.Initialized = false;
+        this.LastValidPos = new Vector3(0.0f, 0.0f, 0.0f);
+        this.LastServerMs = 0;
+        this.ClockLeadSec = 0.0f;
+        this.ViolationScore = 0.0f;
+        this.RejectCount = 0;
+    }
+}
+
+// 服务端权威移动与变速齿轮反作弊校验器：
+// 检测瞬移外挂（Teleport）、超速外挂（Speedhack）与客户端时钟加速（Cheat Engine Speedhack 累计 dt 超前），
+// 支持正常网络抖动宽容度、违规分随时间自然衰减，返回 Accepted / RubberBand（拉回上一次合法坐标）/ Kick。
+public class NetMovementAntiCheat {
+    public float SpeedToleranceMultiplier;
+    public float JitterAllowanceMeters;
+    public float MaxClockLeadSec;
+    public float KickThreshold;
+    public float ViolationDecayPerSec;
+
+    private Dictionary<int, PeerMovementAudit> peers;
+
+    public NetMovementAntiCheat() {
+        this.SpeedToleranceMultiplier = 1.15f;
+        this.JitterAllowanceMeters = 0.35f;
+        this.MaxClockLeadSec = 0.25f;
+        this.KickThreshold = 100.0f;
+        this.ViolationDecayPerSec = 4.0f;
+        this.peers = new Dictionary<int, PeerMovementAudit>();
+    }
+
+    private PeerMovementAudit GetOrCreate(int peerId) {
+        PeerMovementAudit audit;
+        if (this.peers.TryGetValue(peerId, out audit)) { return audit; }
+        audit = new PeerMovementAudit(peerId);
+        this.peers.Add(peerId, audit);
+        return audit;
+    }
+
+    public void RemovePeer(int peerId) {
+        this.peers.Remove(peerId);
+    }
+
+    public Vector3 GetAuthoritativePosition(int peerId) {
+        PeerMovementAudit audit;
+        if (this.peers.TryGetValue(peerId, out audit)) { return audit.LastValidPos; }
+        return new Vector3(0.0f, 0.0f, 0.0f);
+    }
+
+    public float GetViolationScore(int peerId) {
+        PeerMovementAudit audit;
+        if (this.peers.TryGetValue(peerId, out audit)) { return audit.ViolationScore; }
+        return 0.0f;
+    }
+
+    // 校验一次客户端上报的位移与步长；返回 MovementVerdict 常量。
+    public int ValidateMove(int peerId, Vector3 claimedPos, float claimedDtSec,
+                            long serverNowMs, float maxSpeedPerSec, float teleportThreshold) {
+        PeerMovementAudit audit = this.GetOrCreate(peerId);
+        if (!audit.Initialized) {
+            audit.Initialized = true;
+            audit.LastValidPos = claimedPos;
+            audit.LastServerMs = serverNowMs;
+            return MovementVerdict.Accepted;
+        }
+
+        long deltaMs = serverNowMs - audit.LastServerMs;
+        if (deltaMs < 0) { deltaMs = 0; }
+        float serverDtSec = (float)deltaMs / 1000.0f;
+        audit.LastServerMs = serverNowMs;
+
+        // 1. 客户端时钟加速检测（仅累计正向超前，不误伤卡顿掉帧玩家）
+        float dtDiff = claimedDtSec - serverDtSec;
+        audit.ClockLeadSec = audit.ClockLeadSec + dtDiff;
+        if (audit.ClockLeadSec < 0.0f) { audit.ClockLeadSec = 0.0f; }
+
+        bool clockCheat = claimedDtSec < 0.0f || audit.ClockLeadSec > this.MaxClockLeadSec;
+
+        // 2. 位移与瞬移检测
+        float dx = claimedPos.X - audit.LastValidPos.X;
+        float dy = claimedPos.Y - audit.LastValidPos.Y;
+        float dz = claimedPos.Z - audit.LastValidPos.Z;
+        float dist = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+
+        if (teleportThreshold > 0.0f && dist > teleportThreshold) {
+            audit.ViolationScore = audit.ViolationScore + 55.0f;
+            audit.RejectCount = audit.RejectCount + 1;
+            return audit.ViolationScore >= this.KickThreshold
+                ? MovementVerdict.KickSuspectedCheat
+                : MovementVerdict.RubberBand;
+        }
+
+        float effDt = serverDtSec > claimedDtSec ? serverDtSec : claimedDtSec;
+        if (effDt < 0.016f) { effDt = 0.016f; }
+        float maxAllowed = maxSpeedPerSec * effDt * this.SpeedToleranceMultiplier + this.JitterAllowanceMeters;
+        if (dist > maxAllowed) {
+            audit.ViolationScore = audit.ViolationScore + 30.0f;
+            audit.RejectCount = audit.RejectCount + 1;
+            return audit.ViolationScore >= this.KickThreshold
+                ? MovementVerdict.KickSuspectedCheat
+                : MovementVerdict.RubberBand;
+        }
+
+        if (clockCheat) {
+            audit.ViolationScore = audit.ViolationScore + 35.0f;
+            audit.RejectCount = audit.RejectCount + 1;
+            // 扣除本次超前量避免单次抖动连环触发
+            audit.ClockLeadSec = this.MaxClockLeadSec * 0.5f;
+            return audit.ViolationScore >= this.KickThreshold
+                ? MovementVerdict.KickSuspectedCheat
+                : MovementVerdict.RubberBand;
+        }
+
+        // 合法移动：更新权威位置并按时间衰减历史违规分
+        audit.LastValidPos = claimedPos;
+        if (audit.ViolationScore > 0.0f && serverDtSec > 0.0f) {
+            audit.ViolationScore = audit.ViolationScore - this.ViolationDecayPerSec * serverDtSec;
+            if (audit.ViolationScore < 0.0f) { audit.ViolationScore = 0.0f; }
+        }
+        return MovementVerdict.Accepted;
+    }
+}
+
+// 匹配就绪确认阶段状态常量。
+public static class ReadyCheckState {
+    public const int Pending = 0;
+    public const int ReadyToLaunch = 1;
+    public const int Cancelled = 2;
+}
+
+// 匹配成局后的大厅就绪确认屏障（LoL / CS2 / Valorant 商业标配）：
+// 统计每位玩家的接受/拒绝/超时状态；全员接受进入 ReadyToLaunch；
+// 有人拒绝或超时则进入 Cancelled，精确分离“应优先重排的无辜玩家”与“应受逃跑惩罚的违规者”。
+public class NetMatchReadyCheck {
+    public int MatchId;
+    public long StartedAtMs;
+    public long TimeoutMs;
+    public int State;
+
+    private List<int> playerIds;
+    private Dictionary<int, int> responses; // 0=Pending, 1=Accepted, 2=Declined, 3=TimedOut
+
+    public NetMatchReadyCheck(int matchId, int[] players, long startedAtMs, long timeoutMs) {
+        this.MatchId = matchId;
+        this.StartedAtMs = startedAtMs;
+        this.TimeoutMs = timeoutMs > 0 ? timeoutMs : 15000;
+        this.State = ReadyCheckState.Pending;
+        this.playerIds = new List<int>();
+        this.responses = new Dictionary<int, int>();
+        if (players != null) {
+            for (int i = 0; i < players.Length; i = i + 1) {
+                int pid = players[i];
+                if (!this.responses.ContainsKey(pid)) {
+                    this.playerIds.Add(pid);
+                    this.responses.Add(pid, 0);
+                }
+            }
+        }
+    }
+
+    public int AcceptedCount {
+        get {
+            int c = 0;
+            for (int i = 0; i < this.playerIds.Count; i = i + 1) {
+                int st;
+                if (this.responses.TryGetValue(this.playerIds[i], out st) && st == 1) {
+                    c = c + 1;
+                }
+            }
+            return c;
+        }
+    }
+
+    public int TotalPlayers { get { return this.playerIds.Count; } }
+
+    public bool Accept(int playerId, long nowMs) {
+        if (this.State != ReadyCheckState.Pending) { return false; }
+        if (nowMs - this.StartedAtMs >= this.TimeoutMs) {
+            this.UpdateTimeout(nowMs);
+            return false;
+        }
+        int cur;
+        if (!this.responses.TryGetValue(playerId, out cur) || cur != 0) { return false; }
+        this.responses[playerId] = 1;
+        if (this.AcceptedCount == this.playerIds.Count && this.playerIds.Count > 0) {
+            this.State = ReadyCheckState.ReadyToLaunch;
+        }
+        return true;
+    }
+
+    public bool Decline(int playerId, long nowMs) {
+        if (this.State != ReadyCheckState.Pending) { return false; }
+        int cur;
+        if (!this.responses.TryGetValue(playerId, out cur)) { return false; }
+        this.responses[playerId] = 2;
+        this.State = ReadyCheckState.Cancelled;
+        return true;
+    }
+
+    public int UpdateTimeout(long nowMs) {
+        if (this.State != ReadyCheckState.Pending) { return this.State; }
+        if (nowMs - this.StartedAtMs < this.TimeoutMs) { return this.State; }
+        for (int i = 0; i < this.playerIds.Count; i = i + 1) {
+            int pid = this.playerIds[i];
+            int cur;
+            if (this.responses.TryGetValue(pid, out cur) && cur == 0) {
+                this.responses[pid] = 3;
+            }
+        }
+        this.State = ReadyCheckState.Cancelled;
+        return this.State;
+    }
+
+    // 返回取消对局后应获得优先重排资格的无辜玩家（非拒绝且非超时者）。
+    public List<int> GetPriorityRequeuePlayers() {
+        List<int> list = new List<int>();
+        for (int i = 0; i < this.playerIds.Count; i = i + 1) {
+            int pid = this.playerIds[i];
+            int st;
+            if (this.responses.TryGetValue(pid, out st) && st != 2 && st != 3) {
+                list.Add(pid);
+            }
+        }
+        return list;
+    }
+
+    // 返回拒绝或超时 AFK 的违规玩家列表（用于施加匹配冷却惩罚）。
+    public List<int> GetPenaltyOffenders() {
+        List<int> list = new List<int>();
+        for (int i = 0; i < this.playerIds.Count; i = i + 1) {
+            int pid = this.playerIds[i];
+            int st;
+            if (this.responses.TryGetValue(pid, out st) && (st == 2 || st == 3)) {
+                list.Add(pid);
+            }
+        }
+        return list;
+    }
+}
