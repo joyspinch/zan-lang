@@ -16,7 +16,9 @@ partial class Irgen {
             string ov = NT();
             L("  " + ov + " = icmp ne i64 " + w + ", " + t);
             EmitRuntimeCheckIf(e, ov, "integer overflow in checked operation");
-            return ArithResult(w, aw, uns);
+            ExprVal cr = ArithResult(w, aw, uns);
+            cr.exactBits = awu ? -aw : aw;
+            return cr;
         }
         string kind = (awu ? "u" : "s") + (op == TK.Plus() ? "add" : op == TK.Minus() ? "sub" : "mul");
         string fn = "llvm." + kind + ".with.overflow.i64";
@@ -151,10 +153,8 @@ partial class Irgen {
             string r = NT();
             string dflt = "true"; if (isAnd) { dflt = "false"; }
             L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
-            string z = NT();
-            L("  " + z + " = zext i1 " + r + " to i64");
             stmtTemps = svT; stmtTempTypes = svTT;
-            return new ExprVal(z, MkType("bool"));
+            return BoolVal(e, r);
         }
         // null-coalescing "a ?? b": if a is non-null use a, else b. Result is
         // normalised to a single owned (+1) temp so ARC release is balanced in
@@ -259,9 +259,7 @@ partial class Irgen {
                 string nul = "null"; if (!IsPtrLL(ot)) { nul = "0"; }
                 string c = NT();
                 L("  " + c + " = icmp " + cc + " " + ot + " " + ov.op + ", " + nul);
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, c);
             }
         }
         // A chain of 3+ string `+` parts is emitted as one flattened
@@ -318,26 +316,28 @@ partial class Irgen {
             if (fcp != "") {
                 string c = NT();
                 L("  " + c + " = fcmp " + fcp + " double " + da + ", " + db);
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, c);
             }
         }
         // addition: concatenate when either operand is a string, else integer add
         if (op == TK.Plus()) {
             if (IsStr(a.ty) || IsStr(b.ty)) {
-                return StrConcat(ToCStr(a), ToCStr(b));
+                return StrConcat(ToCatStr(a), ToCatStr(b));
             }
             int aw = ArithWidth(e.a, a, e.b, b);
             bool awu = ArithUnsigned(e.a, a, e.b, b);
             if (e.ival == 1) {
                 string checkedValue = EmitCheckedIntArith(e, "add", a.op, b.op, aw, awu);
-                return ArithResult(checkedValue, aw, awu);
+                ExprVal cr = ArithResult(checkedValue, aw, awu);
+                if (aw > 0 && aw < 64) { cr.exactBits = awu ? -aw : aw; }
+                return cr;
             }
             string t = NT();
             L("  " + t + " = add i64 " + a.op + ", " + b.op);
             if (aw < 64) { t = WrapArith(t, aw, awu); }
-            return ArithResult(t, aw, uns);
+            ExprVal ar = ArithResult(t, aw, uns);
+            if (aw > 0 && aw < 64) { ar.exactBits = awu ? -aw : aw; }
+            return ar;
         }
         if (op == TK.EqEq() || op == TK.BangEq()) {
             // lifted equality on nullable value arms (C# lifted operators):
@@ -360,15 +360,11 @@ partial class Irgen {
                         has = aN && bN ? "0" : "1";
                     }
                     if (op == TK.BangEq()) {
-                        string z0 = NT();
-                        L("  " + z0 + " = zext i1 " + has + " to i64");
-                        return new ExprVal(z0, MkType("bool"));
+                        return BoolVal(e, has);
                     }
                     string hn = NT();
                     L("  " + hn + " = xor i1 " + has + ", 1");
-                    string z1 = NT();
-                    L("  " + z1 + " = zext i1 " + hn + " to i64");
-                    return new ExprVal(z1, MkType("bool"));
+                    return BoolVal(e, hn);
                 }
                 string hasA;
                 string hasB;
@@ -445,9 +441,7 @@ partial class Irgen {
                 string cc = "eq"; if (op == TK.BangEq()) { cc = "ne"; }
                 string c = NT();
                 L("  " + c + " = icmp " + cc + " i32 " + r + ", 0");
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, c);
             }
             // a struct without operator== compares by VALUE (C# struct
             // semantics): the self-host's struct is a heap object, so pointer
@@ -455,14 +449,12 @@ partial class Irgen {
             Node sa = ClassOf(a.ty);
             if (sa != null && sa.kind == AK.StructDecl() && b.ty != null && b.ty.sval == a.ty.sval) {
                 string c = EmitStructEq(a, b, a.ty);
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
                 if (op == TK.BangEq()) {
                     string n = NT();
-                    L("  " + n + " = xor i64 " + z + ", 1");
-                    return new ExprVal(n, MkType("bool"));
+                    L("  " + n + " = xor i1 " + c + ", 1");
+                    return BoolVal(e, n);
                 }
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, c);
             }
             // delegate equality (mirrors C host ops_binary.c:211)
             if (a.ty != null && b.ty != null && IsDelegate(a.ty) && IsDelegate(b.ty)) {
@@ -470,13 +462,9 @@ partial class Irgen {
                 if (op == TK.BangEq()) {
                     string neq = NT();
                     L("  " + neq + " = xor i1 " + eq + ", 1");
-                    string zn = NT();
-                    L("  " + zn + " = zext i1 " + neq + " to i64");
-                    return new ExprVal(zn, MkType("bool"));
+                    return BoolVal(e, neq);
                 }
-                string z = NT();
-                L("  " + z + " = zext i1 " + eq + " to i64");
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, eq);
             }
             // reference identity: compare pointer operands as pointers, not i64
             string alt = MapType(a.ty); string blt = MapType(b.ty);
@@ -491,16 +479,12 @@ partial class Irgen {
                 string ccp = "eq"; if (op == TK.BangEq()) { ccp = "ne"; }
                 string cp = NT();
                 L("  " + cp + " = icmp " + ccp + " " + pty + " " + ao + ", " + bo);
-                string zp = NT();
-                L("  " + zp + " = zext i1 " + cp + " to i64");
-                return new ExprVal(zp, MkType("bool"));
+                return BoolVal(e, cp);
             }
             string cc2 = CmpOp(op);
             string c2 = NT();
             L("  " + c2 + " = icmp " + cc2 + " i64 " + a.op + ", " + b.op);
-            string z2 = NT();
-            L("  " + z2 + " = zext i1 " + c2 + " to i64");
-            return new ExprVal(z2, MkType("bool"));
+            return BoolVal(e, c2);
         }
         // string ordering: `<`/`<=`/`>`/`>=` compare content via strcmp, not
         // the raw i8* pointers.
@@ -511,9 +495,7 @@ partial class Irgen {
                 L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
                 string c = NT();
                 L("  " + c + " = icmp " + scp + " i32 " + r + ", 0");
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
-                return new ExprVal(z, MkType("bool"));
+                return BoolVal(e, c);
             }
         }
         string ar = ArithOp(op);
@@ -522,7 +504,9 @@ partial class Irgen {
             bool awu = ArithUnsigned(e.a, a, e.b, b);
             if (e.ival == 1 && (op == TK.Minus() || op == TK.Star())) {
                 string checkedValue = EmitCheckedIntArith(e, ar, a.op, b.op, aw, awu);
-                return ArithResult(checkedValue, aw, awu);
+                ExprVal cr = ArithResult(checkedValue, aw, awu);
+                if (aw > 0 && aw < 64) { cr.exactBits = awu ? -aw : aw; }
+                return cr;
             }
             // peephole: identity simplifications (operands already evaluated)
             if ((op == TK.Plus() || op == TK.Minus()) && b.op == "0") { return a; }
@@ -583,7 +567,9 @@ partial class Irgen {
             ExprVal ck = CheckedArith(e, op, a.op, bs, t, aw, awu, uns);
             if (ck != null) { return ck; }
             if (aw < 64) { t = WrapArith(t, aw, awu); }
-            return ArithResult(t, aw, uns);
+            ExprVal ar2 = ArithResult(t, aw, uns);
+            if (aw > 0 && aw < 64) { ar2.exactBits = awu ? -aw : aw; }
+            return ar2;
         }
         string cp = CmpOp(op);
         if (uns) { cp = UCmpOp(op); }
@@ -649,15 +635,11 @@ partial class Irgen {
                 L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
                 string cs = NT();
                 L("  " + cs + " = icmp " + cp + " i32 " + r + ", 0");
-                string zs = NT();
-                L("  " + zs + " = zext i1 " + cs + " to i64");
-                return new ExprVal(zs, MkType("bool"));
+                return BoolVal(e, cs);
             }
             string c = NT();
             L("  " + c + " = icmp " + cp + " i64 " + a.op + ", " + b.op);
-            string z = NT();
-            L("  " + z + " = zext i1 " + c + " to i64");
-            return new ExprVal(z, MkType("bool"));
+            return BoolVal(e, c);
         }
         return new ExprVal("0", MkType("int"));
     }

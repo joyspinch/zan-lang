@@ -733,10 +733,11 @@ partial class Irgen {
             return r;
         }
         if (IsStr(v.ty) || (v.ty != null && v.ty.sval == "TypeInfo")) {
+            if (v.nonNull) { return v.op; }
             string isNull = NT();
             L("  " + isNull + " = icmp eq i8* " + v.op + ", null");
             string nn = NT();
-            L("  " + nn + " = select i1 " + isNull + ", i8* " + GenStr("").op + ", i8* " + v.op);
+            L("  " + nn + " = select i1 " + isNull + ", i8* " + GenStrConst("") + ", i8* " + v.op);
             return nn;
         }
         if (v.ty != null && v.ty.sval == "StringView") {
@@ -803,6 +804,7 @@ partial class Irgen {
                     if (stmtTemps[live] == stmtTempOwners[i]) {
                         ExprVal existing = new ExprVal(op, MkType("string"));
                         existing.ownerTemp = stmtTempOwners[i];
+                        existing.nonNull = true;
                         return existing;
                     }
                     live = live + 1;
@@ -813,6 +815,7 @@ partial class Irgen {
         AddTemp(op, MkType("string"));
         ExprVal result = new ExprVal(op, MkType("string"));
         result.ownerTemp = stmtTempOwners[stmtTempOwners.Count - 1];
+        result.nonNull = true;
         return result;
     }
 
@@ -1161,17 +1164,20 @@ partial class Irgen {
             i = i + 1;
         }
         sb.Append("  %buf = call i8* @zstr_new(i64 " + tot + ")\n");
-        sb.Append("  call i8* @memcpy(i8* %buf, i8* %s0, i64 %l0)\n");
-        string off = "%l0";
-        i = 1;
+        i = 0;
         while (i < k) {
-            sb.Append("  %p" + i + " = getelementptr i8, i8* %buf, i64 " + off + "\n");
-            sb.Append("  call i8* @memcpy(i8* %p" + i + ", i8* %s" + i + ", i64 %l" + i + ")\n");
-            if (i + 1 < k) {
-                string no = "%off" + i;
-                sb.Append("  " + no + " = add i64 " + off + ", %l" + i + "\n");
-                off = no;
+            sb.Append("  %nz" + i + " = icmp ne i64 %l" + i + ", 0\n");
+            sb.Append("  br i1 %nz" + i + ", label %c" + i + ", label %n" + i + "\n");
+            sb.Append("c" + i + ":\n");
+            if (i == 0) {
+                sb.Append("  call i8* @memcpy(i8* %buf, i8* %s0, i64 %l0)\n");
+            } else {
+                string off = i == 1 ? "%l0" : ("%tot" + (i - 1));
+                sb.Append("  %p" + i + " = getelementptr i8, i8* %buf, i64 " + off + "\n");
+                sb.Append("  call i8* @memcpy(i8* %p" + i + ", i8* %s" + i + ", i64 %l" + i + ")\n");
             }
+            sb.Append("  br label %n" + i + "\n");
+            sb.Append("n" + i + ":\n");
             i = i + 1;
         }
         sb.Append("  ret i8* %buf\n}\n");
@@ -1201,16 +1207,21 @@ partial class Irgen {
         sb.Append("  %buf = call i8* @zstr_new(i64 %tot)\n");
         sb.Append("  br label %cpy.cond\n");
         sb.Append("cpy.cond:\n");
-        sb.Append("  %j = phi i64 [ 0, %alloc ], [ %j.next, %cpy.body ]\n");
-        sb.Append("  %off = phi i64 [ 0, %alloc ], [ %off.next, %cpy.body ]\n");
+        sb.Append("  %j = phi i64 [ 0, %alloc ], [ %j.next, %cpy.next ]\n");
+        sb.Append("  %off = phi i64 [ 0, %alloc ], [ %off.next, %cpy.next ]\n");
         sb.Append("  %cmore = icmp slt i64 %j, %n\n");
         sb.Append("  br i1 %cmore, label %cpy.body, label %done\n");
         sb.Append("cpy.body:\n");
         sb.Append("  %cp = getelementptr i8*, i8** %parts, i64 %j\n");
         sb.Append("  %cs = load i8*, i8** %cp\n");
         sb.Append("  %cl = call i64 @zstr_len(i8* %cs)\n");
+        sb.Append("  %cz = icmp ne i64 %cl, 0\n");
+        sb.Append("  br i1 %cz, label %cpy.do, label %cpy.next\n");
+        sb.Append("cpy.do:\n");
         sb.Append("  %dst = getelementptr i8, i8* %buf, i64 %off\n");
         sb.Append("  call i8* @memcpy(i8* %dst, i8* %cs, i64 %cl)\n");
+        sb.Append("  br label %cpy.next\n");
+        sb.Append("cpy.next:\n");
         sb.Append("  %off.next = add i64 %off, %cl\n");
         sb.Append("  %j.next = add i64 %j, 1\n");
         sb.Append("  br label %cpy.cond\n");
@@ -1220,15 +1231,26 @@ partial class Irgen {
         deferred.Append(sb.ToString());
     }
 
+    // String operand coercion for @zstr_cat2..5 / @zstr_catn: those helpers
+    // treat null i8* identically to "" via @zstr_len + non-zero memcpy guard,
+    // so plain string values can be passed directly without a per-operand
+    // icmp/select null check.
+    string ToCatStr(ExprVal v) {
+        if (v == null || v.op == "null") { return "null"; }
+        if (v.ty != null && !IsNullableValue(v.ty) && IsStr(v.ty)) { return v.op; }
+        return ToCStr(v);
+    }
+
     // n-way concatenation with a single allocation via outlined @zstr_cat2..5 /
     // @zstr_catn helpers: preserves O(n) single-allocation semantics while
     // eliminating tens of thousands of repeated @zstr_len/@memcpy IR lines.
     ExprVal StrConcatN(List<Node> parts) {
         List<string> vals = new List<string>();
+        bool multi = parts.Count >= 2;
         int i = 0;
         while (i < parts.Count) {
             ExprVal v = GenExpr(parts[i]);
-            vals.Add(ToCStr(v));
+            vals.Add(multi ? ToCatStr(v) : ToCStr(v));
             i = i + 1;
         }
         int n = vals.Count;

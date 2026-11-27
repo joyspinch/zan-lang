@@ -489,28 +489,40 @@ partial class Irgen {
         }
         if (ty == null) { return; }
         if (!ArcManaged(ty) && ty.ival < 1) { return; }
-        // ARC 临时值的释放点固定在语句末尾，而它可能生成在某个分支里
-        // （三元、if 分支、循环体）。直接拿寄存器值去释放，会在合并块
-        // 里违反支配关系（LLVM: "Instruction does not dominate all uses"）。
-        // 与 C 宿主 emit_entry_alloca 同法：分支内生成的临时值落一个
-        // entry 槽位，释放时再 load 出来；分支没走时槽位是 null，
-        // zrelease(null) 是空操作。
-        if (eaActive && curLbl != "entry") {
-            string lt = MapType(ty);
-            string reg = NTS();
-            entryAllocas.Append("  " + reg + " = alloca " + lt + "\n");
-            entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
-            L("  store " + lt + " " + op + ", " + lt + "* " + reg);
-            stmtTemps.Add(reg);
-            stmtTempValues.Add(op); stmtTempOwners.Add(reg);
-            stmtTempTypes.Add(ty);
-            ArmTempNow();
-            return;
-        }
+        // Keep temporaries in SSA registers until either a control-flow
+        // terminator (SpillBlockTemps in L()) or call-arg exception arming
+        // (ArmArgTempAt) needs an entry-block %z slot. Straight-line temps
+        // released or transferred within the same basic block need no alloca.
         stmtTemps.Add(op);
         stmtTempValues.Add(op); stmtTempOwners.Add(op);
         stmtTempTypes.Add(ty);
         ArmTempNow();
+    }
+
+    // Spill any unspilled register temporaries to entry-block %z slots before a
+    // control-flow terminator so their eventual release at statement end
+    // remains dominance-valid across CFG merges.
+    void SpillBlockTemps() {
+        if (!eaActive || stmtTemps == null || stmtTemps.Count == 0) { return; }
+        int i = 0;
+        while (i < stmtTemps.Count) {
+            string op = stmtTemps[i];
+            if (op.Length > 1 && op[0] == 37 && op[1] != 122) {
+                Node ty = stmtTempTypes[i];
+                string lt = MapType(ty);
+                string slot = NTS();
+                entryAllocas.Append("  " + slot + " = alloca " + lt + "\n");
+                entryAllocas.Append("  store " + lt + " null, " + lt + "* " + slot + "\n");
+                L("  store " + lt + " " + op + ", " + lt + "* " + slot);
+                stmtTemps[i] = slot;
+                int k = 0;
+                while (k < stmtTempOwners.Count) {
+                    if (stmtTempOwners[k] == op) { stmtTempOwners[k] = slot; }
+                    k = k + 1;
+                }
+            }
+            i = i + 1;
+        }
     }
 
     // Inside a call expression (callArmStack non-empty) the temporary just
