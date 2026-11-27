@@ -196,15 +196,26 @@ static void disc_collect_call(zan_irgen_t *g, zan_ast_node_t *e) {
         if (m->name.len != mname.len ||
             memcmp(m->name.str, mname.str, (size_t)mname.len) != 0) continue;
         if (m->decl->method_decl.type_params.count == 0) continue;
-        zan_type_t *p0 = method_param_type(g, m, 0);
+        zan_type_t *p0 = g->binder->ext_methods[i].recv_type;
+        if (!p0) p0 = method_param_type(g, m, 0);
         if (!p0) continue;
-        /* 接收者须与 this 形参同一定义（List<T> 对 List<int>），否则同名
-         * 重载（Dict 版 Where 等）会被错配出虚假实例。 */
+        /* 接收者须与 this 形参同一定义（List<T> 对 List<int>），或实现
+         * this 接口形参（SqliteConnection 对 IDbExecutor，与 expr_overload.c
+         * 的 ext_receiver_interface_match 口径一致），否则同名重载（Dict 版
+         * Where 等）会被错配出虚假实例。 */
         if (p0->kind != TYPE_TYPE_PARAM) {
-            if (p0->kind != rt->kind) continue;
-            if (p0->name.len != rt->name.len ||
-                (p0->name.len && memcmp(p0->name.str, rt->name.str,
-                                        (size_t)p0->name.len) != 0)) continue;
+            bool iface_match =
+                (p0->kind == TYPE_INTERFACE && p0->type_arg_count == 0 &&
+                 (rt->kind == TYPE_CLASS || rt->kind == TYPE_STRUCT ||
+                  rt->kind == TYPE_INTERFACE) &&
+                 rt->sym && p0->sym &&
+                 zan_binder_class_implements_iface(rt->sym, p0->sym));
+            if (!iface_match) {
+                if (p0->kind != rt->kind) continue;
+                if (p0->name.len != rt->name.len ||
+                    (p0->name.len && memcmp(p0->name.str, rt->name.str,
+                                            (size_t)p0->name.len) != 0)) continue;
+            }
         }
         disc_try_method(g, e, m, recv_obj);
     }

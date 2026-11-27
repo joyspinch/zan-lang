@@ -446,7 +446,10 @@ static zan_symbol_t *canon_chk_resolve_callee_sym(canon_chk_ctx_t *ctx,
         int pcnt = em->method->decl->method_decl.params.count;
         if (pcnt >= 1 && argc <= pcnt - 1) {
           if (!em->recv_type || !em->recv_type->sym || !cs ||
-              em->recv_type->sym == cs)
+              em->recv_type->sym == cs ||
+              (em->recv_type->kind == TYPE_INTERFACE &&
+               em->recv_type->type_arg_count == 0 &&
+               zan_binder_class_implements_iface(cs, em->recv_type->sym)))
             return em->method;
         }
       }
