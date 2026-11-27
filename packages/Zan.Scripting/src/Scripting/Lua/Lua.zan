@@ -74,51 +74,64 @@ public class Lua {
     public static bool initialized;
     // 槽位 1/2 为 Lua 内部占用（LUA_RIDX_MAINTHREAD / LUA_RIDX_GLOBALS）。
     public static long nextSlot;
+    private static object stateLock = new object();
 
     public static bool IsAvailable() { return Lua.TryResolve(); }
-    public static bool IsInitialized() { return Lua.initialized && Lua.state != 0; }
+    public static bool IsInitialized() {
+        lock (Lua.stateLock) {
+            return Lua.initialized && Lua.state != 0;
+        }
+    }
 
     public static void Initialize() {
-        if (Lua.initialized) { return; }
-        if (!Lua.TryResolve()) {
-            throw new InvalidOperationException(
-                "Lua 运行时不可用:未找到 lua54/lua53 动态库(可调用 Lua.LoadPath 指定路径)");
+        lock (Lua.stateLock) {
+            if (Lua.initialized) { return; }
+            if (!Lua.TryResolve()) {
+                throw new InvalidOperationException(
+                    "Lua 运行时不可用:未找到 lua54/lua53 动态库(可调用 Lua.LoadPath 指定路径)");
+            }
+            Lua.OpenState();
         }
-        Lua.OpenState();
     }
 
     public static void LoadPath(string libPath) {
-        Lua.Finalize();
-        Lua.mod = Interop.Load(libPath);
-        if (Lua.mod == 0) {
-            throw new InvalidOperationException("无法加载 Lua 动态库: " + libPath);
+        lock (Lua.stateLock) {
+            Lua.Finalize();
+            Lua.mod = Interop.Load(libPath);
+            if (Lua.mod == 0) {
+                throw new InvalidOperationException("无法加载 Lua 动态库: " + libPath);
+            }
+            if (!Lua.ResolveSymbols()) {
+                throw new InvalidOperationException("Lua 动态库缺少所需导出符号: " + libPath);
+            }
+            Lua.resolved = true;
+            Lua.OpenState();
         }
-        if (!Lua.ResolveSymbols()) {
-            throw new InvalidOperationException("Lua 动态库缺少所需导出符号: " + libPath);
-        }
-        Lua.resolved = true;
-        Lua.OpenState();
     }
 
     public static void Finalize() {
-        if (Lua.state != 0 && Lua.addr_close != 0) {
-            LuaVoid1Fn close = (LuaVoid1Fn)Lua.addr_close;
-            close(Lua.state);
+        lock (Lua.stateLock) {
+            if (Lua.state != 0 && Lua.addr_close != 0) {
+                LuaVoid1Fn close = (LuaVoid1Fn)Lua.addr_close;
+                close(Lua.state);
+            }
+            Lua.state = 0;
+            Lua.initialized = false;
+            if (Lua.resumeResBuf != 0) {
+                NativeMemory.Free(Lua.resumeResBuf);
+                Lua.resumeResBuf = 0;
+            }
+            Lua.FreeModule();
         }
-        Lua.state = 0;
-        Lua.initialized = false;
-        if (Lua.resumeResBuf != 0) {
-            NativeMemory.Free(Lua.resumeResBuf);
-            Lua.resumeResBuf = 0;
-        }
-        Lua.FreeModule();
     }
 
-    // 沙箱：移除进程/文件/模块与字节码逃逸入口，保留纯计算标准库。
+    // 沙箱：移除进程/文件/模块、调试库、字节码转储与 GC 操控入口，保留纯计算标准库。
     public static void Sandbox() {
         Lua.EnsureReady();
         Lua.Exec("os.execute = nil; os.remove = nil; os.rename = nil; os.exit = nil\n" +
-                 "io = nil\ndofile = nil; loadfile = nil; load = nil\nrequire = nil; package = nil\n");
+                 "io = nil\ndebug = nil\ncollectgarbage = nil\n" +
+                 "if string ~= nil then string.dump = nil end\n" +
+                 "dofile = nil; loadfile = nil; load = nil\nrequire = nil; package = nil\n");
     }
 
     public static nint State() { return Lua.state; }
@@ -525,7 +538,7 @@ public class Lua {
             throw new InvalidOperationException("Lua chunk 为空");
         }
         LuaLoadBufFn f = (LuaLoadBufFn)Lua.addr_loadbufferx;
-        int rc = f(Lua.state, chunk, chunk.Length, chunkName, null);
+        int rc = f(Lua.state, (nint)chunk, (long)chunk.Length, chunkName, null);
         for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
         if (rc != 0) { Lua.Fail("Lua chunk 编译失败: " + chunkName); }
     }
@@ -712,11 +725,13 @@ public class Lua {
     }
 
     public static long StoreTop() {
-        long slot = Lua.nextSlot;
-        Lua.nextSlot = Lua.nextSlot + 1;
-        LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        si(Lua.state, Lua.REGISTRY, slot);
-        return slot;
+        lock (Lua.stateLock) {
+            long slot = Lua.nextSlot;
+            Lua.nextSlot = Lua.nextSlot + 1;
+            LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
+            si(Lua.state, Lua.REGISTRY, slot);
+            return slot;
+        }
     }
 
     public static void PushSlotTo(nint L, long slot) {
@@ -735,11 +750,14 @@ public class Lua {
     }
 
     public static void DropSlot(long slot) {
-        if (slot == 0 || Lua.state == 0 || !Lua.resolved) { return; }
-        LuaVoid1Fn nil = (LuaVoid1Fn)Lua.addr_pushnil;
-        nil(Lua.state);
-        LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        si(Lua.state, Lua.REGISTRY, slot);
+        if (slot == 0) { return; }
+        lock (Lua.stateLock) {
+            if (Lua.state == 0 || !Lua.resolved) { return; }
+            LuaVoid1Fn nil = (LuaVoid1Fn)Lua.addr_pushnil;
+            nil(Lua.state);
+            LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
+            si(Lua.state, Lua.REGISTRY, slot);
+        }
     }
 
     public static int TypeOfSlot(long slot) {

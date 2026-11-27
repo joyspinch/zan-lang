@@ -412,7 +412,7 @@ public class MediaPlaybackSession : IDisposable {
             this.audioStream.Flush();
         }
         int wait = 0;
-        while (AtomicInt.NativeLoad(this.workerRunning) != 0 && wait < 500) {
+        while (this.workerRunning != 0 && AtomicInt.NativeLoad(this.workerRunning) != 0 && wait < 1250) {
             Thread.Sleep(4);
             wait = wait + 1;
         }
@@ -420,6 +420,11 @@ public class MediaPlaybackSession : IDisposable {
 
     public void Close() {
         this.Stop();
+        bool workerExited = (this.workerRunning == 0 || AtomicInt.NativeLoad(this.workerRunning) == 0);
+        if (!workerExited) {
+            // 后台解码线程仍被底层原生阻塞：绝不提前销毁 decoder/audioStream/frame，规避并发 UAF。
+            return;
+        }
         if (this.audioStream != null) {
             this.audioStream.Dispose();
             this.audioStream = null;
@@ -430,9 +435,12 @@ public class MediaPlaybackSession : IDisposable {
         }
         if (this.frameLock != null) {
             this.frameLock.WaitOne();
-            if (this.frontFrame != null) { this.frontFrame.Dispose(); this.frontFrame = null; }
-            if (this.backFrame != null) { this.backFrame.Dispose(); this.backFrame = null; }
-            this.frameLock.ReleaseMutex();
+            try {
+                if (this.frontFrame != null) { this.frontFrame.Dispose(); this.frontFrame = null; }
+                if (this.backFrame != null) { this.backFrame.Dispose(); this.backFrame = null; }
+            } finally {
+                this.frameLock.ReleaseMutex();
+            }
         } else {
             if (this.frontFrame != null) { this.frontFrame.Dispose(); this.frontFrame = null; }
             if (this.backFrame != null) { this.backFrame.Dispose(); this.backFrame = null; }
@@ -443,6 +451,10 @@ public class MediaPlaybackSession : IDisposable {
 
     public void Dispose() {
         this.Close();
+        if (this.workerRunning != 0 && AtomicInt.NativeLoad(this.workerRunning) != 0) {
+            // 后台线程尚未退出，保留原子句柄与锁防止线程唤醒后访问已释放内存。
+            return;
+        }
         if (this.stateAtomic != 0) { AtomicInt.NativeDestroy(this.stateAtomic); this.stateAtomic = 0; }
         if (this.stopFlag != 0) { AtomicInt.NativeDestroy(this.stopFlag); this.stopFlag = 0; }
         if (this.workerRunning != 0) { AtomicInt.NativeDestroy(this.workerRunning); this.workerRunning = 0; }

@@ -27,11 +27,15 @@ public class LicenseClient {
     private string vendorKeys = "";
 
     public static LicenseClient shared;
+    private static object sharedLock = new object();
 
     // 进程级共享客户端（绝大多数成品软件只用一个授权）。
     public static LicenseClient Shared() {
-        if (LicenseClient.shared == null) { LicenseClient.shared = new LicenseClient(); }
-        return LicenseClient.shared;
+        if (LicenseClient.shared != null) { return LicenseClient.shared; }
+        lock (LicenseClient.sharedLock) {
+            if (LicenseClient.shared == null) { LicenseClient.shared = new LicenseClient(); }
+            return LicenseClient.shared;
+        }
     }
 
     // 授权服务端地址与厂商名（须与授权服务端部署一致）。
@@ -528,19 +532,23 @@ public class LicenseClient {
         } else {
             cli = new HttpClient(t.Host(), t.Port());
         }
-        ExternalCallPolicy policy = ExternalCallPolicy.Default()
-            .TotalTimeout(15000)
-            .ResponseLimit(4 * 1024 * 1024)
-            .Redirects(0)
-            .RetryNetwork(false)
-            .RetryAttempts(0);
-        if (ExternalTargetPolicy.IsLoopback(t.Host())) { policy.AllowLocalHttp(); }
-        cli.SetCallPolicy(policy);
-        cli.SetTimeout(15000);
-        cli.SetHeader("Content-Type", "application/json");
-        HttpResponse resp = await cli.SendBytesAsync("POST", path, json);
-        if (resp.statusCode < 200 || resp.statusCode >= 300) { return ""; }
-        return resp.body;
+        try {
+            ExternalCallPolicy policy = ExternalCallPolicy.Default()
+                .TotalTimeout(15000)
+                .ResponseLimit(4 * 1024 * 1024)
+                .Redirects(0)
+                .RetryNetwork(false)
+                .RetryAttempts(0);
+            if (ExternalTargetPolicy.IsLoopback(t.Host())) { policy.AllowLocalHttp(); }
+            cli.SetCallPolicy(policy);
+            cli.SetTimeout(15000);
+            cli.SetHeader("Content-Type", "application/json");
+            HttpResponse resp = await cli.SendBytesAsync("POST", path, json);
+            if (resp.statusCode < 200 || resp.statusCode >= 300) { return ""; }
+            return resp.body;
+        } finally {
+            cli.Dispose();
+        }
     }
 
     // 在线登出：通知服务端释放座位后清本地状态。UI 侧有

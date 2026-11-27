@@ -1,44 +1,93 @@
 using System;
+using System.Collections.Generic;
+using System.Threading;
 
 namespace Sdk.Wechat;
 
-// 实例内 access_token 缓存（提前 300 秒过期，避免请求边界失效）。
+// 实例内 access_token 缓存（提前 300 秒过期，避免请求边界失效；协程安全单飞刷新防惊群）。
 public class WechatTokenCache {
     static int TOKEN_SKEW_SECONDS = 300;
 
     string token;
     long expireUnix;
+    bool refreshing;
+    Queue<AsyncGate> waiters;
 
     public WechatTokenCache() {
         this.token = "";
         this.expireUnix = 0;
+        this.refreshing = false;
+        this.waiters = new Queue<AsyncGate>();
     }
 
     public void Set(string accessToken, int expiresIn) {
-        this.token = accessToken == null ? "" : accessToken;
-        int life = expiresIn - TOKEN_SKEW_SECONDS;
-        if (life < 0) { life = 0; }
-        this.expireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+        lock (this) {
+            this.token = accessToken == null ? "" : accessToken;
+            int life = expiresIn - TOKEN_SKEW_SECONDS;
+            if (life < 0) { life = 0; }
+            this.expireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+        }
     }
 
     public string Current() {
-        if (this.token.Length > 0 && DateTime.UtcNow().ToUnixSeconds() < this.expireUnix) {
-            return this.token;
+        lock (this) {
+            if (this.token.Length > 0 && DateTime.UtcNow().ToUnixSeconds() < this.expireUnix) {
+                return this.token;
+            }
+            return "";
         }
-        return "";
+    }
+
+    private void EndRefresh() {
+        List<AsyncGate> toWake = null;
+        lock (this) {
+            this.refreshing = false;
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                toWake = new List<AsyncGate>();
+                while (this.waiters.Count() > 0) {
+                    toWake.Add(this.waiters.Dequeue());
+                }
+            }
+        }
+        if (toWake != null) {
+            for (int i = 0; i < toWake.Count; i = i + 1) {
+                toWake[i].Signal();
+            }
+        }
     }
 
     public async string GetOrFetchAsync(WechatApiTransport transport,
                                         string tokenPath, string errorPrefix) {
-        string cached = this.Current();
-        if (cached.Length > 0) { return cached; }
-
-        WechatResponse resp = await transport.RequestJsonAsync("GET", tokenPath, "");
-        string fetched = resp.Str(WechatCredential.QueryName(WechatCredentialKind.AccessToken), "");
-        if (fetched.Length == 0) {
-            throw new WechatException(errorPrefix + ".badResponse", "响应缺少 access_token", resp.Raw);
+        while (true) {
+            AsyncGate gate = null;
+            lock (this) {
+                if (this.token.Length > 0 && DateTime.UtcNow().ToUnixSeconds() < this.expireUnix) {
+                    return this.token;
+                }
+                if (!this.refreshing) {
+                    this.refreshing = true;
+                    break;
+                }
+                gate = new AsyncGate();
+                this.waiters.Enqueue(gate);
+            }
+            try {
+                await gate.Wait();
+            } finally {
+                gate.Close();
+            }
         }
-        this.Set(fetched, resp.Int("expires_in", 7200));
-        return this.token;
+
+        try {
+            WechatResponse resp = await transport.RequestJsonAsync("GET", tokenPath, "");
+            string fetched = resp.Str(WechatCredential.QueryName(WechatCredentialKind.AccessToken), "");
+            if (fetched.Length == 0) {
+                throw new WechatException(errorPrefix + ".badResponse", "响应缺少 access_token", resp.Raw);
+            }
+            this.Set(fetched, resp.Int("expires_in", 7200));
+            return fetched;
+        } finally {
+            this.EndRefresh();
+        }
     }
 }

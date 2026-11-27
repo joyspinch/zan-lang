@@ -101,7 +101,16 @@ public class WechatPayV2Request {
         sb.Append("<xml>");
         for (int i = 0; i < this.fields.Count; i = i + 1) {
             sb.Append("<"); sb.Append(this.fields[i].name); sb.Append("><![CDATA[");
-            sb.Append(this.fields[i].value);
+            string v = this.fields[i].value == null ? "" : this.fields[i].value;
+            int from = 0;
+            int hit = XmlUtil.IndexOf(v, "]]>", from);
+            while (hit >= 0) {
+                sb.Append(v.Substring(from, hit + 2 - from));
+                sb.Append("]]><![CDATA[>");
+                from = hit + 3;
+                hit = XmlUtil.IndexOf(v, "]]>", from);
+            }
+            sb.Append(from == 0 ? v : v.Substring(from, v.Length - from));
             sb.Append("]]></"); sb.Append(this.fields[i].name); sb.Append(">");
         }
         sb.Append("</xml>");
@@ -110,6 +119,7 @@ public class WechatPayV2Request {
 
     public static WechatPayV2Request ParseXml(string xml) {
         WechatPayV2Request result = new WechatPayV2Request();
+        if (xml == null || xml.Length == 0) { return result; }
         int pos = XmlUtil.IndexOf(xml, "<xml", 0);
         if (pos < 0) { return result; }
         pos = XmlUtil.IndexOf(xml, ">", pos);
@@ -120,12 +130,34 @@ public class WechatPayV2Request {
         while (pos < xmlEnd) {
             int open = XmlUtil.IndexOf(xml, "<", pos);
             if (open < 0 || open >= xmlEnd) { break; }
-            if (open + 1 < xml.Length && (xml[open + 1] & 255) == 47) { break; }
+            if (open + 1 >= xmlEnd) { break; }
+            int nextC = xml[open + 1] & 255;
+            if (nextC == 47) { break; } // '</'
+            if (nextC == 33) { // '<!' comment or declaration
+                if (open + 3 < xmlEnd && (xml[open + 2] & 255) == 45 && (xml[open + 3] & 255) == 45) {
+                    int cEnd = XmlUtil.IndexOf(xml, "-->", open + 4);
+                    if (cEnd < 0 || cEnd >= xmlEnd) { break; }
+                    pos = cEnd + 3;
+                    continue;
+                }
+                int dEnd = XmlUtil.IndexOf(xml, ">", open + 2);
+                if (dEnd < 0 || dEnd >= xmlEnd) { break; }
+                pos = dEnd + 1;
+                continue;
+            }
+            if (nextC == 63) { // '<?' processing instruction
+                int pEnd = XmlUtil.IndexOf(xml, "?>", open + 2);
+                if (pEnd < 0 || pEnd >= xmlEnd) { break; }
+                pos = pEnd + 2;
+                continue;
+            }
             int gt = XmlUtil.IndexOf(xml, ">", open + 1);
-            if (gt < 0) { break; }
-            int nameEnd = gt;
+            if (gt < 0 || gt > xmlEnd) { break; }
+            bool selfClosing = gt > open + 1 && (xml[gt - 1] & 255) == 47;
+            int nameLimit = selfClosing ? gt - 1 : gt;
+            int nameEnd = nameLimit;
             int scan = open + 1;
-            while (scan < gt) {
+            while (scan < nameLimit) {
                 int c = xml[scan] & 255;
                 if (c == 32 || c == 9 || c == 13 || c == 10) {
                     nameEnd = scan; break;
@@ -133,9 +165,17 @@ public class WechatPayV2Request {
                 scan = scan + 1;
             }
             string name = xml.Substring(open + 1, nameEnd - open - 1);
+            if (selfClosing) {
+                if (name.Length > 0) { result.Set(name, ""); }
+                pos = gt + 1;
+                continue;
+            }
             string close = "</" + name + ">";
             int end = XmlUtil.IndexOf(xml, close, gt + 1);
-            if (end < 0 || end > xmlEnd) { break; }
+            if (end < 0 || end > xmlEnd) {
+                pos = gt + 1;
+                continue;
+            }
             string fieldValue = XmlUtil.StripCdata(xml.Substring(gt + 1,
                                                    end - gt - 1));
             result.Set(name, fieldValue);
