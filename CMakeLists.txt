@@ -1801,6 +1801,20 @@ add_test(NAME conformance_gui_docapp_user_main
 set_tests_properties(conformance_gui_docapp_user_main PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# 分区后端下类型名驻留串必须唯一：is/强转按指针比较，单元各复制一份即
+# 跨单元强转失败（GUI 程序在 Form.Create 抛 InvalidCastException）。
+# --check-leaks 与 -O0（conf_gui_ 默认）都会掩盖此缺陷：本例关泄漏门并钉 -O2。
+add_test(NAME conformance_gui_partition_form_cast
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/partition_cast/FormCreateCast.zan
+    "-DZANC_ARGS=--auto-stdlib;--no-check-leaks;-O2${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_partition_form_cast.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_partition_form_cast${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_partition_form_cast PROPERTIES
+    TIMEOUT 300 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 # HeavyControls 查表大小写不敏感（HTML 标签规范小写化 vs PascalCase
 # 注册键）：精确 miss 后必须走不敏感兜底，否则自定义控件静默回落
 # Element——kind 串还在、无任何诊断，事件/布局整体失效。
