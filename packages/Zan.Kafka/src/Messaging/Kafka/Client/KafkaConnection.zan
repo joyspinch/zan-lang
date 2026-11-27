@@ -141,7 +141,8 @@ public class KafkaConnection {
             KafkaReader r = new KafkaReader(respBuf);
             int respCid = r.ReadInt32();
             if (respCid != cid) {
-                // 关联 ID 不匹配
+                // 关联 ID 不匹配说明连接流已失步，必须主动断开重建。
+                this.Shutdown();
                 return null;
             }
 
@@ -165,23 +166,35 @@ public class KafkaConnection {
     }
 
     void Shutdown() {
-        this.connected = false;
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
+        nint s = -1;
+        lock (this) {
+            this.connected = false;
+            s = this.sock;
             this.sock = -1;
+        }
+        if (s >= 0) {
+            Socket.ShutdownBoth(s);
+            Socket.Close(s);
         }
     }
 
     public void Close() {
+        nint s = -1;
         List<AsyncGate> toWake = null;
         lock (this) {
-            this.Shutdown();
+            this.connected = false;
+            s = this.sock;
+            this.sock = -1;
             if (this.ioWaiters != null && this.ioWaiters.Count() > 0) {
                 toWake = new List<AsyncGate>();
                 while (this.ioWaiters.Count() > 0) {
                     toWake.Add(this.ioWaiters.Dequeue());
                 }
             }
+        }
+        if (s >= 0) {
+            Socket.ShutdownBoth(s);
+            Socket.Close(s);
         }
         if (toWake != null) {
             for (int i = 0; i < toWake.Count; i = i + 1) {

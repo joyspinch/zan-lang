@@ -124,35 +124,50 @@ public class KafkaRecord {
         int recordLen = r.ReadVarint();
         if (recordLen <= 0 || r.Remaining() < recordLen) { return null; }
         int startPos = r.Position();
+        int recordEnd = startPos + recordLen;
 
         KafkaRecord rec = new KafkaRecord(false);
+        if (r.Position() >= recordEnd) { return null; }
         int attr = r.ReadInt8();
+        if (r.Position() >= recordEnd) { return null; }
         long tsDelta = r.ReadVarlong();
         rec.timestamp = firstTimestamp + tsDelta;
 
+        if (r.Position() >= recordEnd) { return null; }
         int offsetDelta = r.ReadVarint();
         rec.offset = baseOffset + (long)offsetDelta;
 
         // Key
+        if (r.Position() >= recordEnd) { return null; }
         int keyLen = r.ReadVarint();
+        if (keyLen > recordEnd - r.Position()) { return null; }
         if (keyLen >= 0) {
             rec.key = r.ReadStringRaw(keyLen);
         }
 
         // Value
+        if (r.Position() >= recordEnd) { return null; }
         int valLen = r.ReadVarint();
+        if (valLen > recordEnd - r.Position()) { return null; }
         if (valLen >= 0) {
             rec.value = r.ReadStringRaw(valLen);
         }
 
-        // Headers（零头消息免分配 Dictionary）
+        // Headers（零头消息免分配 Dictionary；严格按记录剩余字节上界防 DoS）
+        if (r.Position() >= recordEnd) { return null; }
         int hCount = r.ReadVarint();
+        int remAfterCount = recordEnd - r.Position();
+        if (hCount < 0 || hCount > remAfterCount / 2) { return null; }
         if (hCount > 0) {
             rec.headers = new Dictionary<string, string>();
             for (int i = 0; i < hCount; i = i + 1) {
+                if (r.Position() >= recordEnd) { return null; }
                 int hkLen = r.ReadVarint();
+                if (hkLen < 0 || hkLen > recordEnd - r.Position()) { return null; }
                 string hk = r.ReadStringRaw(hkLen);
+                if (r.Position() >= recordEnd) { return null; }
                 int hvLen = r.ReadVarint();
+                if (hvLen > recordEnd - r.Position()) { return null; }
                 string hv = "";
                 if (hvLen >= 0) {
                     hv = r.ReadStringRaw(hvLen);
@@ -163,9 +178,8 @@ public class KafkaRecord {
             }
         }
 
-        int consumed = r.Position() - startPos;
-        if (consumed < recordLen) {
-            r.Seek(startPos + recordLen);
+        if (r.Position() < recordEnd) {
+            r.Seek(recordEnd);
         }
         return rec;
     }

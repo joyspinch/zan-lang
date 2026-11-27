@@ -30,20 +30,55 @@ public class S3Signer {
         return sb.Length == 0 ? "/" : sb.ToString();
     }
 
-    // 规范化查询串：入参为按名排序的 "name=value" 列表，在此执行 RFC3986 编码。
+    private static int CompareAscii(string a, string b) {
+        int la = a == null ? 0 : a.Length;
+        int lb = b == null ? 0 : b.Length;
+        int min = la < lb ? la : lb;
+        for (int i = 0; i < min; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca != cb) { return ca < cb ? -1 : 1; }
+        }
+        return la < lb ? -1 : (la > lb ? 1 : 0);
+    }
+
+    // 规范化查询串：按 AWS SigV4 要求对编码后的参数名（及同名参数值）升序排序后拼接。
     public static string CanonicalQuery(List<string> pairs) {
         if (pairs == null || pairs.Count == 0) { return ""; }
-        StringBuilder sb = new StringBuilder();
+        List<string> encNames = new List<string>();
+        List<string> encVals = new List<string>();
         for (int i = 0; i < pairs.Count; i = i + 1) {
             string p = pairs[i];
             if (p == null || p.Length == 0) { continue; }
             int eq = p.IndexOf("=");
             string name = eq < 0 ? p : p.Substring(0, eq);
             string value = eq < 0 ? "" : p.Substring(eq + 1);
-            if (sb.Length > 0) { sb.Append("&"); }
-            sb.Append(OssSigner.Rfc3986(name));
+            encNames.Add(OssSigner.Rfc3986(name));
+            encVals.Add(OssSigner.Rfc3986(value));
+        }
+        int n = encNames.Count;
+        for (int i = 1; i < n; i = i + 1) {
+            string cn = encNames[i];
+            string cv = encVals[i];
+            int j = i - 1;
+            while (j >= 0) {
+                int cmp = S3Signer.CompareAscii(encNames[j], cn);
+                if (cmp < 0 || (cmp == 0 && S3Signer.CompareAscii(encVals[j], cv) <= 0)) {
+                    break;
+                }
+                encNames[j + 1] = encNames[j];
+                encVals[j + 1] = encVals[j];
+                j = j - 1;
+            }
+            encNames[j + 1] = cn;
+            encVals[j + 1] = cv;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { sb.Append("&"); }
+            sb.Append(encNames[i]);
             sb.Append("=");
-            sb.Append(OssSigner.Rfc3986(value));
+            sb.Append(encVals[i]);
         }
         return sb.ToString();
     }

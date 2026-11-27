@@ -18,10 +18,9 @@ public class AmqpConnection : IDisposable {
     private nint sock;
     private TlsContext tlsCtx;
     private TlsStream tls;
-    // 协程安全发送门锁（lock(this)+Queue<AsyncGate>，零 OS Mutex 销毁竞态）与同步信道表锁分离。
+    // 协程安全发送门锁与同步信道表均由 lock(this) 保护，彻底消除 OS Mutex 销毁竞态。
     private bool sendBusy;
     private Queue<AsyncGate> sendWaiters;
-    private Mutex chanLock;
     private int channelMax;
     private int frameMax;
     private int heartbeatSec;
@@ -49,7 +48,6 @@ public class AmqpConnection : IDisposable {
         this.tls = null;
         this.sendBusy = false;
         this.sendWaiters = new Queue<AsyncGate>();
-        this.chanLock = new Mutex();
         this.channelMax = AmqpConstants.DEFAULT_CHANNEL_MAX;
         this.frameMax = AmqpConstants.DEFAULT_FRAME_MAX;
         this.heartbeatSec = AmqpConstants.DEFAULT_HEARTBEAT_SEC;
@@ -209,19 +207,14 @@ public class AmqpConnection : IDisposable {
     // 申请创建新的逻辑信道 (Channel.Open)
     public async AmqpChannel CreateChannelAsync() {
         if (!this.connected) { return null; }
-        Mutex clk = this.chanLock;
-        if (clk == null) { return null; }
         int cid = 0;
         AmqpChannel ch = null;
-        clk.WaitOne();
-        try {
+        lock (this) {
             if (!this.connected || this.channels == null) { return null; }
             cid = this.nextChannelId;
             this.nextChannelId = this.nextChannelId + 1;
             ch = new AmqpChannel(cid, this);
             this.channels[cid] = ch;
-        } finally {
-            clk.ReleaseMutex();
         }
 
         // 发送 Channel.Open (Class 20, Method 10)
@@ -230,24 +223,28 @@ public class AmqpConnection : IDisposable {
         w.WriteShort(AmqpConstants.METHOD_CHANNEL_OPEN);
         w.WriteShortString(""); // reserved-1
         byte[] pkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, cid, w.ToBytes(), w.Length());
-        await this.SendRawAsync(pkt, pkt.Length);
+        int sent = await this.SendRawAsync(pkt, pkt.Length);
+        if (sent < pkt.Length) {
+            this.UnregisterChannel(cid);
+            ch.Dispose();
+            return null;
+        }
 
-        // 等待 Channel.Open-Ok
-        await ch.BasicQosAsync(0, false); // 探测信道可用性
+        // 等待 Channel.Open-Ok（通过 BasicQosAsync 探测信道可用性，失败立即注销并清理）
+        if (!await ch.BasicQosAsync(0, false)) {
+            this.UnregisterChannel(cid);
+            ch.Dispose();
+            return null;
+        }
         return ch;
     }
 
     // 注销已关闭的逻辑信道，打破 AmqpConnection <-> AmqpChannel 引用环。
     internal void UnregisterChannel(int cid) {
-        Mutex clk = this.chanLock;
-        if (clk == null) { return; }
-        clk.WaitOne();
-        try {
+        lock (this) {
             if (this.channels != null) {
                 this.channels.Remove(cid);
             }
-        } finally {
-            clk.ReleaseMutex();
         }
     }
 
@@ -370,15 +367,9 @@ public class AmqpConnection : IDisposable {
                 await this.HandleConnectionFrameAsync(frame);
             } else {
                 AmqpChannel ch = null;
-                Mutex clk = this.chanLock;
-                if (clk != null) {
-                    clk.WaitOne();
-                    try {
-                        if (this.channels != null) {
-                            this.channels.TryGetValue(frame.channel, out ch);
-                        }
-                    } finally {
-                        clk.ReleaseMutex();
+                lock (this) {
+                    if (this.channels != null) {
+                        this.channels.TryGetValue(frame.channel, out ch);
                     }
                 }
                 if (ch != null) {
@@ -475,15 +466,15 @@ public class AmqpConnection : IDisposable {
             int replyCode = r.ReadShort();
             string replyText = r.ReadShortString();
             this.closeReason = replyText;
-            this.connected = false;
 
-            // 回复 Connection.Close-Ok
+            // 先回复 Connection.Close-Ok 再将 connected 置 false，避免 SendRawAsync 提前短路。
             AmqpWriter cw = new AmqpWriter();
             cw.WriteShort(AmqpConstants.CLASS_CONNECTION);
             cw.WriteShort(AmqpConstants.METHOD_CONNECTION_CLOSE_OK);
             byte[] closeOkPkt = AmqpFrame.Encode(AmqpConstants.FRAME_METHOD, 0, cw.ToBytes(), cw.Length());
             await this.SendRawAsync(closeOkPkt, closeOkPkt.Length);
 
+            this.connected = false;
             this.connGate.SignalAll();
         } else if (cls == AmqpConstants.CLASS_CONNECTION && mtd == AmqpConstants.METHOD_CONNECTION_CLOSE_OK) {
             this.connected = false;
@@ -548,45 +539,44 @@ public class AmqpConnection : IDisposable {
     }
 
     public void Close() {
-        this.connected = false;
-        if (this.tls != null) {
-            this.tls.Close();
-            this.tls = null;
-        }
-        if (this.tlsCtx != null) {
-            this.tlsCtx.Free();
-            this.tlsCtx = null;
-        }
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
-            this.sock = -1;
-        }
-        if (this.chanLock != null) {
-            Mutex clk = this.chanLock;
-            this.chanLock = null;
-            clk.WaitOne();
-            try {
-                if (this.channels != null) {
-                    List<int> keys = this.channels.Keys;
-                    for (int i = 0; i < keys.Count; i = i + 1) {
-                        this.channels[keys[i]].Dispose();
-                    }
-                    this.channels.Clear();
-                    this.channels = null;
-                }
-            } finally {
-                clk.ReleaseMutex();
-                clk.Close();
-            }
-        }
+        TlsStream ts = null;
+        TlsContext tctx = null;
+        nint s = -1;
+        List<AmqpChannel> toDispose = null;
         List<AsyncGate> toWake = null;
         lock (this) {
             this.connected = false;
+            ts = this.tls;
+            this.tls = null;
+            tctx = this.tlsCtx;
+            this.tlsCtx = null;
+            s = this.sock;
+            this.sock = -1;
+            if (this.channels != null) {
+                toDispose = new List<AmqpChannel>();
+                List<int> keys = this.channels.Keys;
+                for (int i = 0; i < keys.Count; i = i + 1) {
+                    toDispose.Add(this.channels[keys[i]]);
+                }
+                this.channels.Clear();
+                this.channels = null;
+            }
             if (this.sendWaiters != null && this.sendWaiters.Count() > 0) {
                 toWake = new List<AsyncGate>();
                 while (this.sendWaiters.Count() > 0) {
                     toWake.Add(this.sendWaiters.Dequeue());
                 }
+            }
+        }
+        if (s >= 0) {
+            Socket.ShutdownBoth(s);
+        }
+        if (ts != null) { ts.Close(); }
+        if (tctx != null) { tctx.Free(); }
+        if (s >= 0) { Socket.Close(s); }
+        if (toDispose != null) {
+            for (int i = 0; i < toDispose.Count; i = i + 1) {
+                toDispose[i].Dispose();
             }
         }
         if (toWake != null) {

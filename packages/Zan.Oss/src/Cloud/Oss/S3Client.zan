@@ -19,8 +19,8 @@ public class S3Client : OssClient {
     }
 
     public override string RequestPath(string key) {
-        string prefix = this.config.UsesBucketPrefix() ? "/" + this.config.bucket + "/" : "/";
-        return (key == null || key.Length == 0) ? prefix : prefix + key;
+        string prefix = this.config.UsesBucketPrefix() ? "/" + OssSigner.Rfc3986(this.config.bucket) + "/" : "/";
+        return (key == null || key.Length == 0) ? prefix : prefix + OssClient.EncodePathSegments(key);
     }
 
     public override string BucketRequestPath() {
@@ -50,7 +50,7 @@ public class S3Client : OssClient {
             + "x-amz-content-sha256:" + payloadHash + "\n"
             + "x-amz-date:" + amzDate + "\n";
         string signedHeaders = "host;x-amz-content-sha256;x-amz-date";
-        string canonicalUri = S3Signer.CanonicalUri(this.RequestPath(key));
+        string canonicalUri = this.RequestPath(key);
         string canonicalQuery = S3Signer.CanonicalQuery(queryPairs);
         string canonicalRequest = S3Signer.CanonicalRequest(method, canonicalUri, canonicalQuery,
             canonicalHeaders, signedHeaders, payloadHash);
@@ -72,9 +72,37 @@ public class S3Client : OssClient {
         return OssSigner.Sha256Hex("");
     }
 
+    /// <summary>生成 AWS SigV4 查询参数预签名 URL（兼容所有现代 S3 区域与 MinIO）。</summary>
+    public string GeneratePresignedUrlV4(string key, long expiresSeconds = 900, string method = "GET") {
+        if (key == null || key.Length == 0) { return ""; }
+        string objKey = this.config.ObjectKey(key);
+        long exp = expiresSeconds <= 0 ? 900 : expiresSeconds;
+        if (exp > 604800) { exp = 604800; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string amzDate = OssSigner.AmzDate(now);
+        string dateOnly = OssSigner.AmzDateOnly(now);
+        string scope = S3Signer.Scope(dateOnly, this.config.region, "s3");
+        string credential = this.config.accessKey + "/" + scope;
+        string signedHost = this.SignedHost();
+        string canonicalUri = this.RequestPath(objKey);
+        List<string> q = new List<string>();
+        q.Add("X-Amz-Algorithm=AWS4-HMAC-SHA256");
+        q.Add("X-Amz-Credential=" + credential);
+        q.Add("X-Amz-Date=" + amzDate);
+        q.Add("X-Amz-Expires=" + Convert.ToString(exp));
+        q.Add("X-Amz-SignedHeaders=host");
+        string canonicalQuery = S3Signer.CanonicalQuery(q);
+        string canonicalHeaders = "host:" + signedHost + "\n";
+        string canonicalRequest = S3Signer.CanonicalRequest(method, canonicalUri, canonicalQuery,
+            canonicalHeaders, "host", "UNSIGNED-PAYLOAD");
+        string stringToSign = S3Signer.StringToSign(amzDate, scope, canonicalRequest);
+        byte[] signingKey = S3Signer.SigningKey(this.config.secretKey, dateOnly, this.config.region, "s3");
+        string signature = S3Signer.Signature(signingKey, stringToSign);
+        return this.OriginUrl() + canonicalUri + "?" + canonicalQuery + "&X-Amz-Signature=" + signature;
+    }
+
     public override string PublicUrlFor(string fullKey) {
         if (fullKey == null || fullKey.Length == 0) { return ""; }
-        string scheme = this.config.endpointTls ? "https://" : "http://";
-        return scheme + this.HostName() + "/" + fullKey;
+        return this.OriginUrl() + this.RequestPath(fullKey);
     }
 }

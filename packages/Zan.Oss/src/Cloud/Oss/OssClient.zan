@@ -59,8 +59,37 @@ public class OssClient {
     /// <summary>请求主机（虚拟主机风格时含桶名前缀）。</summary>
     public virtual string HostName() { return this.config.endpointHost; }
 
+    /// <summary>逐段 RFC 3986 编码对象键（保留 '/' 分隔符），防止空格/?/# 破坏请求路径或注入查询串。</summary>
+    public static string EncodePathSegments(string key) {
+        if (key == null || key.Length == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = key.Length;
+        while (i < n) {
+            int slash = key.IndexOf("/", i);
+            int end = slash < 0 ? n : slash;
+            if (end > i) {
+                sb.Append(OssSigner.Rfc3986(key.Substring(i, end - i)));
+            }
+            if (slash < 0) { break; }
+            sb.Append("/");
+            i = slash + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>构造带非默认端口的协议+主机前缀。</summary>
+    protected string OriginUrl() {
+        string scheme = this.config.endpointTls ? "https://" : "http://";
+        int defPort = this.config.endpointTls ? 443 : 80;
+        string portStr = (this.config.endpointPort > 0 && this.config.endpointPort != defPort)
+            ? (":" + Convert.ToString(this.config.endpointPort))
+            : "";
+        return scheme + this.HostName() + portStr;
+    }
+
     /// <summary>对象请求路径（以 '/' 开头）。参数是拼好 basePath 的完整键。</summary>
-    public virtual string RequestPath(string key) { return "/" + key; }
+    public virtual string RequestPath(string key) { return "/" + OssClient.EncodePathSegments(key); }
 
     /// <summary>桶级请求路径（凭证体检用）。</summary>
     public virtual string BucketRequestPath() { return "/"; }
@@ -151,7 +180,7 @@ public class OssClient {
             this.SignRequest(http, "PUT", objKey, ct, body, now);
             http.SetHeader("Content-Type", ct);
             HttpResponse resp = await http.SendBytesAsync("PUT", this.RequestPath(objKey), body, body.Length);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -168,7 +197,7 @@ public class OssClient {
             string objKey = this.config.ObjectKey(key);
             this.SignRequest(http, "GET", objKey, "", null, now);
             HttpResponse resp = await http.SendBytesAsync("GET", this.RequestPath(objKey), new byte[0], 0);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -185,7 +214,7 @@ public class OssClient {
             string objKey = this.config.ObjectKey(key);
             this.SignRequest(http, "HEAD", objKey, "", null, now);
             HttpResponse resp = await http.SendBytesAsync("HEAD", this.RequestPath(objKey), new byte[0], 0);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -202,7 +231,7 @@ public class OssClient {
             string objKey = this.config.ObjectKey(key);
             this.SignRequest(http, "DELETE", objKey, "", null, now);
             HttpResponse resp = await http.SendBytesAsync("DELETE", this.RequestPath(objKey), new byte[0], 0);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -216,17 +245,23 @@ public class OssClient {
         HttpClient http = this.NewClient();
         if (http == null) { return OssResult.Fail("端点配置无效"); }
         int got = 0;
+        string lastErr = "";
         string progress = localPath + ".progress";
         try {
             long now = DateTime.UtcNow().ToUnixSeconds();
             string objKey = this.config.ObjectKey(key);
             this.SignRequest(http, "GET", objKey, "", null, now);
             got = await http.DownloadRangeToFileAsync(this.RequestPath(objKey), localPath, progress);
+            if (got <= 0) {
+                lastErr = http.LastDownloadError();
+            }
         } finally {
             http.Dispose();
         }
+        if (got <= 0) {
+            return OssResult.Fail((lastErr != null && lastErr.Length > 0) ? lastErr : "下载失败（未取得内容）");
+        }
         try { File.Delete(progress); } catch (Exception) { }
-        if (got <= 0) { return OssResult.Fail("下载失败（未取得内容）"); }
         OssResult r = new OssResult();
         r.ok = true;
         r.statusCode = 200;
@@ -254,6 +289,7 @@ public class OssClient {
         HttpClient http = this.NewClient();
         if (http == null) { r.error = "端点配置无效"; return r; }
         HttpResponse resp = null;
+        OssResult res = null;
         try {
             long now = DateTime.UtcNow().ToUnixSeconds();
             string objKey = this.config.ObjectKey(key);
@@ -262,10 +298,11 @@ public class OssClient {
             this.SignRequestWithQuery(http, "POST", objKey, q, ct, null, now);
             http.SetHeader("Content-Type", ct);
             resp = await http.SendBytesAsync("POST", this.RequestPath(objKey) + "?uploads", new byte[0], 0);
+            res = OssResult.Of(resp);
         } finally {
+            if (resp != null) { resp.Dispose(); }
             http.Dispose();
         }
-        OssResult res = OssResult.Of(resp);
         r.ok = res.ok;
         r.statusCode = res.statusCode;
         r.error = res.error;
@@ -300,7 +337,7 @@ public class OssClient {
             http.SetHeader("Content-Type", ct);
             string url = this.RequestPath(objKey) + "?partNumber=" + Convert.ToString(partNumber) + "&uploadId=" + OssSigner.Rfc3986(uploadId);
             HttpResponse resp = await http.SendBytesAsync("PUT", url, partBody, partBody.Length);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -339,7 +376,7 @@ public class OssClient {
             http.SetHeader("Content-Type", ct);
             string url = this.RequestPath(objKey) + "?uploadId=" + OssSigner.Rfc3986(uploadId);
             HttpResponse resp = await http.SendBytesAsync("POST", url, body, body.Length);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -360,7 +397,7 @@ public class OssClient {
             this.SignRequestWithQuery(http, "DELETE", objKey, q, "", null, now);
             string url = this.RequestPath(objKey) + "?uploadId=" + OssSigner.Rfc3986(uploadId);
             HttpResponse resp = await http.SendBytesAsync("DELETE", url, new byte[0], 0);
-            return OssResult.Of(resp);
+            try { return OssResult.Of(resp); } finally { if (resp != null) { resp.Dispose(); } }
         } finally {
             http.Dispose();
         }
@@ -374,16 +411,24 @@ public class OssClient {
         HttpClient http = this.NewClient();
         if (http == null) { return "端点配置无效"; }
         HttpResponse resp = null;
+        int statusCode = 0;
         try {
             long now = DateTime.UtcNow().ToUnixSeconds();
             this.SignRequest(http, "GET", "", "", null, now);
             resp = await http.SendAsync("GET", this.BucketRequestPath(), "");
+            if (resp != null) {
+                statusCode = resp.statusCode;
+            }
         } finally {
+            if (resp != null) { resp.Dispose(); }
             http.Dispose();
         }
-        if (resp.statusCode == 200) { return ""; }
-        if (resp.statusCode == 403) { return "凭证校验失败（403），检查访问密钥对"; }
-        if (resp.statusCode == 404) { return "桶不存在（404），检查桶名与区域"; }
-        return "HTTP " + Convert.ToString(resp.statusCode);
+        if (resp == null) {
+            return "请求失败（无响应）";
+        }
+        if (statusCode == 200) { return ""; }
+        if (statusCode == 403) { return "凭证校验失败（403），检查访问密钥对"; }
+        if (statusCode == 404) { return "桶不存在（404），检查桶名与区域"; }
+        return "HTTP " + Convert.ToString(statusCode);
     }
 }

@@ -15,9 +15,21 @@ public class AliyunOssClient : OssClient {
         return this.config.bucket + "." + this.config.endpointHost;
     }
 
+    private static int CompareAscii(string a, string b) {
+        int la = a == null ? 0 : a.Length;
+        int lb = b == null ? 0 : b.Length;
+        int min = la < lb ? la : lb;
+        for (int i = 0; i < min; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca != cb) { return ca < cb ? -1 : 1; }
+        }
+        return la < lb ? -1 : (la > lb ? 1 : 0);
+    }
+
     public override string RequestPath(string key) {
-        string prefix = this.config.UsesBucketPrefix() ? "/" + this.config.bucket + "/" : "/";
-        return (key == null || key.Length == 0) ? prefix : prefix + key;
+        string prefix = this.config.UsesBucketPrefix() ? "/" + OssSigner.Rfc3986(this.config.bucket) + "/" : "/";
+        return (key == null || key.Length == 0) ? prefix : prefix + OssClient.EncodePathSegments(key);
     }
 
     public override string BucketRequestPath() {
@@ -35,12 +47,29 @@ public class AliyunOssClient : OssClient {
         http.SetHeader("Date", date);
         string resource = "/" + this.config.bucket + "/" + (key == null ? "" : key);
         if (queryPairs != null && queryPairs.Count > 0) {
-            StringBuilder qsb = new StringBuilder();
+            List<string> sorted = new List<string>();
             for (int i = 0; i < queryPairs.Count; i = i + 1) {
-                if (i > 0) { qsb.Append("&"); }
-                qsb.Append(queryPairs[i]);
+                if (queryPairs[i] != null && queryPairs[i].Length > 0) {
+                    sorted.Add(queryPairs[i]);
+                }
             }
-            resource = resource + "?" + qsb.ToString();
+            for (int i = 1; i < sorted.Count; i = i + 1) {
+                string cur = sorted[i];
+                int j = i - 1;
+                while (j >= 0 && AliyunOssClient.CompareAscii(sorted[j], cur) > 0) {
+                    sorted[j + 1] = sorted[j];
+                    j = j - 1;
+                }
+                sorted[j + 1] = cur;
+            }
+            if (sorted.Count > 0) {
+                StringBuilder qsb = new StringBuilder();
+                for (int i = 0; i < sorted.Count; i = i + 1) {
+                    if (i > 0) { qsb.Append("&"); }
+                    qsb.Append(sorted[i]);
+                }
+                resource = resource + "?" + qsb.ToString();
+            }
         }
         string sts = AliyunOssSigner.StringToSign(method, "", contentType, date, resource);
         string sig = AliyunOssSigner.Sign(this.config.secretKey, sts);
@@ -49,7 +78,6 @@ public class AliyunOssClient : OssClient {
 
     public override string PublicUrlFor(string fullKey) {
         if (fullKey == null || fullKey.Length == 0) { return ""; }
-        string scheme = this.config.endpointTls ? "https://" : "http://";
-        return scheme + this.HostName() + "/" + fullKey;
+        return this.OriginUrl() + this.RequestPath(fullKey);
     }
 }
