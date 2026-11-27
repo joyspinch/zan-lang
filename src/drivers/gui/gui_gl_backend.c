@@ -156,13 +156,14 @@ static void zgl_snapshots_drop_surface(int sid) {
     }
 }
 
-/* GPU 模糊缓存：按 slot 复用 Dual-Kawase 结果纹理，背景瓦片未变更或 dirty == 0 时跳过降采样与多趟模糊直出合成。 */
+/* GPU 模糊缓存：按 slot 复用 Dual-Kawase 结果纹理，共用单张 blur_cache_fbo 避免切肤时反复建 FBO 与同步 CheckFramebufferStatus 阻塞管线。 */
 #define ZGL_BLUR_CACHE_SLOTS 64
 typedef struct {
-    zgl_uint tex, fbo;
+    zgl_uint tex;
     int valid;
     int sid, x, y, w, h, radius;
     int bw, bh;
+    int cap_w, cap_h;
     float cu0, cv0, cu1, cv1;
     int base_kind;
     int base_slot;
@@ -172,21 +173,20 @@ typedef struct {
 static zgl_blur_cache_entry g_zgl_blurs[ZGL_BLUR_CACHE_SLOTS];
 
 static void zgl_blur_cache_drop(zgl_blur_cache_entry *c) {
-    if (c->fbo) gl.DeleteFramebuffers(1, &c->fbo);
     if (c->tex) gl.DeleteTextures(1, &c->tex);
     memset(c, 0, sizeof(*c));
 }
 
 static void zgl_blurs_drop_surface(int sid) {
     for (int i = 0; i < ZGL_BLUR_CACHE_SLOTS; i++) {
-        if (g_zgl_blurs[i].fbo && g_zgl_blurs[i].sid == sid)
+        if (g_zgl_blurs[i].tex && g_zgl_blurs[i].sid == sid)
             zgl_blur_cache_drop(&g_zgl_blurs[i]);
     }
 }
 
 static void zgl_blurs_drop_all(void) {
     for (int i = 0; i < ZGL_BLUR_CACHE_SLOTS; i++) {
-        if (g_zgl_blurs[i].fbo || g_zgl_blurs[i].tex)
+        if (g_zgl_blurs[i].tex)
             zgl_blur_cache_drop(&g_zgl_blurs[i]);
     }
 }
@@ -199,6 +199,8 @@ static struct {
     zgl_int  u_blur_tex, u_blur_uvrect, u_blur_step, u_blur_clamp, u_blur_mode;
     zgl_int  u_bcomp_tex, u_bcomp_vp, u_bcomp_rect, u_bcomp_uvrect, u_bcomp_shape, u_bcomp_clip;
     zgl_uint blur_tex[2], blur_fbo[2];
+    zgl_uint blur_cache_fbo;
+    int      blur_cache_fbo_checked;
     int      blur_cap_w, blur_cap_h;
     zgl_uint atlas1, atlas4;
     zgl_int  u_atlas2;
@@ -1465,24 +1467,46 @@ static int zgl_ensure_blur_targets(int need_w, int need_h) {
 }
 
 static int zgl_ensure_blur_cache_slot(zgl_blur_cache_entry *c, int bw, int bh) {
-    if (c->fbo && c->tex && c->bw == bw && c->bh == bh) return 1;
-    zgl_blur_cache_drop(c);
-    zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
-    gl.GenTextures(1, &c->tex);
-    gl.BindTexture(ZGL_TEXTURE_2D, c->tex);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
-    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, bw, bh, 0,
-                  color_fmt, ZGL_UNSIGNED_BYTE, NULL);
-    gl.GenFramebuffers(1, &c->fbo);
-    gl.BindFramebuffer(ZGL_FRAMEBUFFER, c->fbo);
+    if (bw <= 0 || bh <= 0) return 0;
+    int need_alloc = (!c->tex || c->cap_w < bw || c->cap_h < bh
+                      || c->cap_w > bw * 2 + 128 || c->cap_h > bh * 2 + 128);
+    if (need_alloc) {
+        int nw = ((bw + 31) / 32) * 32;
+        int nh = ((bh + 31) / 32) * 32;
+        if (nw < 32) nw = 32;
+        if (nh < 32) nh = 32;
+        zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
+        if (!c->tex) {
+            gl.GenTextures(1, &c->tex);
+            gl.BindTexture(ZGL_TEXTURE_2D, c->tex);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+            gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+        } else {
+            gl.BindTexture(ZGL_TEXTURE_2D, c->tex);
+        }
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, nw, nh, 0,
+                      color_fmt, ZGL_UNSIGNED_BYTE, NULL);
+        c->cap_w = nw;
+        c->cap_h = nh;
+    }
+    if (!g_zgl.blur_cache_fbo) {
+        gl.GenFramebuffers(1, &g_zgl.blur_cache_fbo);
+        g_zgl.blur_cache_fbo_checked = 0;
+    }
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_cache_fbo);
     gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
                             ZGL_TEXTURE_2D, c->tex, 0);
-    if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
-        zgl_blur_cache_drop(c);
-        return 0;
+    if (!g_zgl.blur_cache_fbo_checked) {
+        if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
+            gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+                                    ZGL_TEXTURE_2D, 0, 0);
+            zgl_blur_cache_drop(c);
+            g_zgl.st_fbo = 0;
+            return 0;
+        }
+        g_zgl.blur_cache_fbo_checked = 1;
     }
     c->bw = bw;
     c->bh = bh;
@@ -1648,7 +1672,7 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
         float off = base_off * (1.0f + (float)i * 0.6f);
         int is_last = (i == passes - 1);
         gl.BindFramebuffer(ZGL_FRAMEBUFFER,
-                           (is_last && cached_out) ? ce->fbo : g_zgl.blur_fbo[nxt]);
+                           (is_last && cached_out) ? g_zgl.blur_cache_fbo : g_zgl.blur_fbo[nxt]);
         gl.Viewport(0, 0, bw, bh);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[cur]);
         gl.Uniform4f(g_zgl.u_blur_uvrect, 0.0f, 0.0f, max_u, max_v);
@@ -1663,11 +1687,25 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
     zgl_uint comp_tex = g_zgl.blur_tex[cur];
     float cu0, cu1, cv0, cv1;
     if (cached_out) {
+        float c_inv_w = 1.0f / (float)ce->cap_w;
+        float c_inv_h = 1.0f / (float)ce->cap_h;
+        float c_max_u = (float)bw * c_inv_w;
+        float c_max_v = (float)bh * c_inv_h;
+        float c_lo_u = 0.5f * c_inv_w;
+        float c_hi_u = c_max_u - 0.5f * c_inv_w;
+        float c_lo_v = 0.5f * c_inv_h;
+        float c_hi_v = c_max_v - 0.5f * c_inv_h;
+        if (c_hi_u < c_lo_u) { c_lo_u = 0.5f * c_max_u; c_hi_u = c_lo_u; }
+        if (c_hi_v < c_lo_v) { c_lo_v = 0.5f * c_max_v; c_hi_v = c_lo_v; }
         comp_tex = ce->tex;
-        cu0 = (float)(x - sx0) / (float)sw;
-        cu1 = (float)(x + w - sx0) / (float)sw;
-        cv0 = (float)(sy1 - (y + h)) / (float)sh;
-        cv1 = (float)(sy1 - y) / (float)sh;
+        cu0 = ((float)(x - sx0) / (float)sw) * c_max_u;
+        cu1 = ((float)(x + w - sx0) / (float)sw) * c_max_u;
+        cv0 = ((float)(sy1 - (y + h)) / (float)sh) * c_max_v;
+        cv1 = ((float)(sy1 - y) / (float)sh) * c_max_v;
+        if (cu0 < c_lo_u) cu0 = c_lo_u;
+        if (cu1 > c_hi_u) cu1 = c_hi_u;
+        if (cv0 < c_lo_v) cv0 = c_lo_v;
+        if (cv1 > c_hi_v) cv1 = c_hi_v;
         ce->valid = 1;
         ce->sid = s->id;
         ce->x = x; ce->y = y; ce->w = w; ce->h = h;
@@ -1777,6 +1815,11 @@ void zan_gui_internal_gl_drop_present(void) {
         g_zgl.blur_fbo[i] = 0;
         g_zgl.blur_tex[i] = 0;
     }
+    if (g_zgl.blur_cache_fbo) {
+        gl.DeleteFramebuffers(1, &g_zgl.blur_cache_fbo);
+        g_zgl.blur_cache_fbo = 0;
+    }
+    g_zgl.blur_cache_fbo_checked = 0;
     zgl_blurs_drop_all();
     g_zgl.blur_cap_w = 0;
     g_zgl.blur_cap_h = 0;

@@ -154,25 +154,43 @@ public partial class Win32Shell {
         Win32Shell.evSeq = Win32Shell.evSeq + 1;
         return true;
     }
-    static int PollEvent() {
-        Win32Shell.Init();
-        Win32Shell.ClearEvent();
-        if (Win32Shell.DrainInjected()) { return 0; }
-        if (Win32Shell.DrainPosted()) { return 0; }
+    // 每次轮询/等待前无条件以非阻塞方式泵取有限数量的 Win32 消息，
+    // 确保即便内部 postEvents 或 VSync 标志持续就绪也不会饿死 PeekMessageW 触发“(未响应)”。
+    // 返回值：-1 = 收到 WM_QUIT；1 = 收到 WM_NULL 唤醒信号；0 = 正常。
+    static int PumpPendingMessages() {
         nint msg = Win32Shell.scratchMsg;
-        while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
-            if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }  // WM_QUIT
+        int woke = 0;
+        int count = 0;
+        while (count < 64 && Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
+            count = count + 1;
+            int message = Win32Shell.S32(msg, 8);
+            if (message == 18) { return 0 - 1; }  // WM_QUIT
+            if (message == 0) {
+                woke = 1;
+                continue;
+            }
             Win32Shell.TranslateMessage(msg);
             Win32Shell.DispatchMessageW(msg);
         }
+        return woke;
+    }
+    static int PollEvent() {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        int pumped = Win32Shell.PumpPendingMessages();
+        if (pumped < 0) { return 0 - 1; }
+        if (Win32Shell.DrainInjected()) { return 0; }
         if (Win32Shell.DrainPosted()) { return 0; }
-        return 1;
+        return pumped > 0 ? 0 : 1;
     }
     static int WaitEvent() {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
+        int pumped = Win32Shell.PumpPendingMessages();
+        if (pumped < 0) { return 0 - 1; }
         if (Win32Shell.DrainInjected()) { return 0; }
         if (Win32Shell.DrainPosted()) { return 0; }
+        if (pumped > 0) { return 0; }
         nint msg = Win32Shell.scratchMsg;
         if (Win32Shell.GetMessageW(msg, 0, 0, 0) <= 0) { return 0 - 1; }
         Win32Shell.TranslateMessage(msg);
@@ -183,25 +201,19 @@ public partial class Win32Shell {
     static int WaitEventTimeout(int ms) {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
+        int pumped = Win32Shell.PumpPendingMessages();
+        if (pumped < 0) { return 0 - 1; }
         if (Win32Shell.DrainInjected()) { return 0; }
         if (Win32Shell.DrainPosted()) { return 0; }
-        if (Win32Shell.HasDisplayFrameReady()) { return 0; }
+        if (pumped > 0 || Win32Shell.HasDisplayFrameReady()) { return 0; }
         if (ms < 0) { ms = 0; }
         int start = Win32Shell.TickMs();
-        nint msg = Win32Shell.scratchMsg;
         while (true) {
-            while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
-                int message = Win32Shell.S32(msg, 8);
-                if (message == 18) { return 0 - 1; }
-                if (message == 0) {
-                    if (!Win32Shell.DrainInjected()) { Win32Shell.DrainPosted(); }
-                    return 0;
-                }
-                Win32Shell.TranslateMessage(msg);
-                Win32Shell.DispatchMessageW(msg);
-            }
+            int inner = Win32Shell.PumpPendingMessages();
+            if (inner < 0) { return 0 - 1; }
+            if (Win32Shell.DrainInjected()) { return 0; }
             if (Win32Shell.DrainPosted()) { return 0; }
-            if (Win32Shell.HasDisplayFrameReady()) { return 0; }
+            if (inner > 0 || Win32Shell.HasDisplayFrameReady()) { return 0; }
             int elapsed = Win32Shell.TickMs() - start;
             if (elapsed >= ms) { return 1; }
             int wr = Win32Shell.MsgWaitForMultipleObjects(0, 0, 0,

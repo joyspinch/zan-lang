@@ -458,7 +458,9 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
 
   ZAN_STAT(g_st_blur, (long long)rw * (long long)rh);
   int ds = 1;
-  if (r >= 12) {
+  if (r >= 24 && rw >= 32 && rh >= 32) {
+    ds = 8;
+  } else if (r >= 12) {
     ds = 4;
   } else if (r >= 6) {
     ds = 2;
@@ -495,7 +497,7 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
         dst[di] = row[di] | 0xFF000000u;
     }
   } else {
-    int shift = (ds == 2) ? 2 : 4;
+    int shift = (ds == 2) ? 2 : (ds == 4) ? 4 : 6;
     for (int dj = 0; dj < dh; dj++) {
       int sy0 = dj * ds;
       int sy1 = sy0 + ds;
@@ -577,6 +579,66 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
             sb += (p0 & 0xFFu) + (p1 & 0xFFu) + (p2 & 0xFFu) + (p3 & 0xFFu);
           }
           dst[di] = 0xFF000000u | ((sr >> 4) << 16) | ((sg >> 4) << 8) | (sb >> 4);
+        }
+#endif
+        for (; di < dw; di++) {
+          int sx0 = di * ds;
+          int sx1 = sx0 + ds;
+          if (sx1 > rw)
+            sx1 = rw;
+          int sr = 0, sg = 0, sb = 0, cnt = 0;
+          for (int yy = sy0; yy < sy1; yy++) {
+            const u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+            for (int xx = sx0; xx < sx1; xx++) {
+              u32 px = row[xx];
+              sr += (px >> 16) & 0xFF;
+              sg += (px >> 8) & 0xFF;
+              sb += px & 0xFF;
+              cnt++;
+            }
+          }
+          if (cnt < 1)
+            cnt = 1;
+          dst[di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
+                    ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
+        }
+      } else if (full_y && ds == 8) {
+        int full_dw = rw >> 3;
+        int di = 0;
+#if ZAN_HAS_SSE2
+        const __m128i vz = _mm_setzero_si128();
+        for (; di < full_dw; di++) {
+          int sx = di << 3;
+          __m128i sum = vz;
+          for (int yy = 0; yy < 8; yy++) {
+            const u32 *row = s->pixels + (y0 + sy0 + yy) * s->stride + x0 + sx;
+            __m128i v0 = _mm_loadu_si128((const __m128i *)row);
+            __m128i v1 = _mm_loadu_si128((const __m128i *)(row + 4));
+            sum = _mm_add_epi16(
+                sum,
+                _mm_add_epi16(
+                    _mm_add_epi16(_mm_unpacklo_epi8(v0, vz), _mm_unpackhi_epi8(v0, vz)),
+                    _mm_add_epi16(_mm_unpacklo_epi8(v1, vz), _mm_unpackhi_epi8(v1, vz))));
+          }
+          sum = _mm_add_epi16(sum, _mm_srli_si128(sum, 8));
+          sum = _mm_srli_epi16(sum, 6);
+          __m128i pk = _mm_packus_epi16(sum, vz);
+          dst[di] = (u32)_mm_cvtsi128_si32(pk) | 0xFF000000u;
+        }
+#else
+        for (; di < full_dw; di++) {
+          int sx = di << 3;
+          u32 sr = 0, sg = 0, sb = 0;
+          for (int yy = 0; yy < 8; yy++) {
+            const u32 *row = s->pixels + (y0 + sy0 + yy) * s->stride + x0 + sx;
+            for (int k = 0; k < 8; k++) {
+              u32 px = row[k];
+              sr += (px >> 16) & 0xFFu;
+              sg += (px >> 8) & 0xFFu;
+              sb += px & 0xFFu;
+            }
+          }
+          dst[di] = 0xFF000000u | ((sr >> 6) << 16) | ((sg >> 6) << 8) | (sb >> 6);
         }
 #endif
         for (; di < dw; di++) {
@@ -1085,7 +1147,9 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
         return;
     }
     int mid_x0 = x0 + eff_cr > cx0 ? x0 + eff_cr : cx0;
+    if (mid_x0 > cx1) mid_x0 = cx1;
     int mid_x1 = x0 + rw - eff_cr < cx1 ? x0 + rw - eff_cr : cx1;
+    if (mid_x1 < cx0) mid_x1 = cx0;
     for (int py = cy0; py < cy1; py++) {
         int j = py - y0;
         u32 *dst = s->pixels + (size_t)py * s->stride;
