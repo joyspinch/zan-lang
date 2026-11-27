@@ -279,6 +279,7 @@ def check_workspace(s, workspace):
         s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": library, "type": 2}]})
         expect_diag(caller, 4, messages)
 
+    check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expect_diag)
     check_inheritance(workspace, open_doc, change_doc, close_doc, expect_diag)
     check_inheritance_edges(s, workspace, open_doc, change_doc, close_doc, expect_diag)
     check_nested_types(workspace, open_doc, change_doc, close_doc, expect_diag)
@@ -287,17 +288,226 @@ def check_workspace(s, workspace):
     # the dependency's project, while the open caller stays in app.
     missing = {"undefined type 'Service'"}
     manifest.write_text("name=NestedApp\n", encoding="utf-8")
-    expect_diag(caller, 4, missing)
+    expect_diag(caller, 6, missing)
     manifest.rename(library_manifest)
-    expect_diag(caller, 4, missing)
+    expect_diag(caller, 6, missing)
+    isolated_def = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 0, "character": text.index("Service.Read") + 1},
+    }).get("result")
+    if isolated_def is not None:
+        fail("project boundary definition", "expected null across zan.proj, got %r" % (isolated_def,))
     library_manifest.unlink()
-    expect_diag(caller, 4, set())
+    expect_diag(caller, 6, set())
+    restored_def = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 0, "character": text.index("Service.Read") + 1},
+    }).get("result")
+    if not restored_def or restored_def.get("uri") != library:
+        fail("project boundary definition restore", "expected %s, got %r" % (library, restored_def))
     library_manifest.write_text("name=NestedLib\n", encoding="utf-8")
-    expect_diag(caller, 4, missing)
+    expect_diag(caller, 6, missing)
     library_manifest.unlink()
-    expect_diag(caller, 4, set())
+    expect_diag(caller, 6, set())
     s.expect_quiet(1.2)
     return manifest
+
+
+def check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expect_diag):
+    """B-ID200: project-level definition/hover/completion/references/rename/
+    workspaceSymbol/signatureHelp across unopened disk files with overlay
+    precedence and zan.proj isolation."""
+    caller = (workspace / "app/src/Use.zan").as_uri()
+    library = (workspace / "app/lib/Service.zan").as_uri()
+    helper_path = workspace / "app/lib/Helper.zan"
+    helper_uri = helper_path.as_uri()
+    sibling_uri = (workspace / "app-extra/Types.zan").as_uri()
+
+    helper_path.write_text(
+        "namespace Library;\n"
+        "public class Helper {\n"
+        "    public static int Compute(string key) { return 1; }\n"
+        "    public static int Compute(string key, int count) { return count; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 1}]})
+    expect_diag(caller, 4, set())
+
+    nav_text = (
+        "using Library;\n"
+        "class Use {\n"
+        "    static int Run(Service service) {\n"
+        "        int a = Service.Read() + service.Count;\n"
+        "        int b = Helper.Compute(\"k\", 2);\n"
+        "        return a + b;\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(caller, 5, nav_text)
+    expect_diag(caller, 5, set())
+
+    lines = nav_text.splitlines()
+    # 1. definition into unopened Service.zan: class Service, method Read, field Count
+    def_svc = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 2, "character": lines[2].index("Service") + 1},
+    }).get("result")
+    if not def_svc or def_svc["uri"] != library or def_svc["range"]["start"]["line"] != 0:
+        fail("project definition Service", "expected %s:0, got %r" % (library, def_svc))
+
+    def_read = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("Read") + 1},
+    }).get("result")
+    if not def_read or def_read["uri"] != library or def_read["range"]["start"]["line"] != 1:
+        fail("project definition Read", "expected %s:1, got %r" % (library, def_read))
+
+    def_count = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("Count") + 1},
+    }).get("result")
+    if not def_count or def_count["uri"] != library or def_count["range"]["start"]["line"] != 1:
+        fail("project definition Count", "expected %s:1, got %r" % (library, def_count))
+
+    # 2. hover on unopened Service.Read and service.Count
+    hv_read = s.request("textDocument/hover", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("Read") + 1},
+    }).get("result")
+    hv_val = (hv_read or {}).get("contents", {}).get("value", "")
+    if "Read(" not in hv_val or "Service" not in hv_val or library not in hv_val:
+        fail("project hover Read", "unexpected hover: %r" % (hv_read,))
+
+    hv_count = s.request("textDocument/hover", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("Count") + 1},
+    }).get("result")
+    hv_cval = (hv_count or {}).get("contents", {}).get("value", "")
+    if "Count" not in hv_cval or "field" not in hv_cval or "Service" not in hv_cval:
+        fail("project hover Count", "unexpected hover: %r" % (hv_count,))
+
+    # 3. completion: project symbol + dot-member completion + zan.proj isolation
+    comp_all = s.request("textDocument/completion", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 2, "character": lines[2].index("Service") + 3},
+    }).get("result") or []
+    all_labels = [c["label"] for c in comp_all]
+    if "Service" not in all_labels:
+        fail("project completion", "missing Service in %r" % (all_labels,))
+    if "SiblingOnly" in all_labels or "NestedOnly" in all_labels:
+        fail("project completion isolation", "leaked other project symbols: %r" % (all_labels,))
+
+    comp_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("service.Count") + len("service.")},
+    }).get("result") or []
+    dot_labels = [c["label"] for c in comp_dot]
+    if "Count" not in dot_labels or "Read" not in dot_labels:
+        fail("project dot completion", "expected Service members, got %r" % (dot_labels,))
+    if "Compute" in dot_labels or "class" in dot_labels:
+        fail("project dot completion filter", "non-Service items leaked: %r" % (dot_labels,))
+
+    # 4. references across open Use.zan + unopened Service.zan (excluding app-extra)
+    refs_incl = s.request("textDocument/references", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 2, "character": lines[2].index("Service") + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    ref_uris = {r["uri"] for r in refs_incl}
+    if caller not in ref_uris or library not in ref_uris:
+        fail("project references", "expected both caller and library, got %r" % (refs_incl,))
+    if sibling_uri in ref_uris:
+        fail("project references isolation", "leaked sibling project: %r" % (refs_incl,))
+
+    refs_excl = s.request("textDocument/references", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 2, "character": lines[2].index("Service") + 1},
+        "context": {"includeDeclaration": False},
+    }).get("result") or []
+    if len(refs_excl) >= len(refs_incl):
+        fail("project references includeDeclaration=false",
+             "expected fewer hits without decl: excl=%r incl=%r" % (refs_excl, refs_incl))
+
+    # 5. rename across open Use.zan + unopened Service.zan
+    ren = s.request("textDocument/rename", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 3, "character": lines[3].index("Count") + 1},
+        "newName": "TotalCount",
+    }).get("result")
+    changes = (ren or {}).get("changes") or {}
+    if caller not in changes or library not in changes or sibling_uri in changes:
+        fail("project rename", "expected edits in caller & library only, got %r" % (ren,))
+
+    # 6. workspace/symbol across open + unopened project files
+    ws_syms = s.request("workspace/symbol", {"query": "comp"}).get("result") or []
+    comp_hits = [x for x in ws_syms if x.get("name") == "Compute"
+                 and x.get("containerName") == "Helper"
+                 and x.get("location", {}).get("uri") == helper_uri]
+    if len(comp_hits) < 2:
+        fail("workspace/symbol", "expected 2 Helper.Compute overloads, got %r" % (ws_syms,))
+
+    # 7. signatureHelp across unopened Helper.zan with overload selection
+    sig_cross = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 4, "character": lines[4].index("2)")},
+    }).get("result")
+    if not sig_cross or sig_cross.get("activeParameter") != 1 or sig_cross.get("activeSignature") != 1:
+        fail("project signatureHelp", "expected activeSig=1 activeParam=1, got %r" % (sig_cross,))
+    sig_labels = [x.get("label") for x in sig_cross.get("signatures") or []]
+    if "int Compute(string key)" not in sig_labels or \
+            "int Compute(string key, int count)" not in sig_labels:
+        fail("project signatureHelp labels", "got %r" % (sig_labels,))
+
+    # 7b. inlayHint across unopened Helper.zan
+    proj_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": caller},
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 7, "character": 0}},
+    }).get("result") or []
+    hint_labels = [h.get("label") for h in proj_hints]
+    if "key:" not in hint_labels or "count:" not in hint_labels:
+        fail("project inlayHint", "expected key:/count: from unopened Helper.zan, got %r" % (proj_hints,))
+
+    # 8. live overlay precedence: opening Service.zan supersedes disk without duplicates
+    open_doc(library, "namespace Library;\npublic class Service {\n    public int LiveOnly;\n}\n")
+    expect_diag(caller, 5, {
+        "type 'Library.Service' has no method 'Read'",
+        "type 'Library.Service' has no member 'Count'",
+    })
+    expect_diag(library, 1, set())
+    ws_live = s.request("workspace/symbol", {"query": "liveonly"}).get("result") or []
+    if not any(x.get("name") == "LiveOnly" and x.get("location", {}).get("uri") == library for x in ws_live):
+        fail("overlay workspace/symbol", "expected LiveOnly from live buffer, got %r" % (ws_live,))
+    ws_svc = [x for x in (s.request("workspace/symbol", {"query": "service"}).get("result") or [])
+              if x.get("name") == "Service" and x.get("location", {}).get("uri") == library]
+    if len(ws_svc) != 1:
+        fail("overlay dedup", "expected exactly 1 Service symbol for library, got %r" % (ws_svc,))
+
+    close_doc(library)
+    expect_diag(library, 1, set())
+    expect_diag(caller, 5, set())
+    ws_after = s.request("workspace/symbol", {"query": "liveonly"}).get("result") or []
+    if any(x.get("name") == "LiveOnly" for x in ws_after):
+        fail("overlay close restore", "LiveOnly should disappear after close: %r" % (ws_after,))
+
+    # Restore caller version/text expected by downstream manifest assertions
+    helper_path.unlink()
+    s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 3}]})
+    expect_diag(caller, 5, set())
+    ws_deleted = s.request("workspace/symbol", {"query": "comp"}).get("result") or []
+    if any(x.get("name") == "Compute" and x.get("location", {}).get("uri") == helper_uri
+           for x in ws_deleted):
+        fail("watched file delete eviction", "Helper.Compute still indexed after delete: %r" % (ws_deleted,))
+    def_deleted = s.request("textDocument/definition", {
+        "textDocument": {"uri": caller},
+        "position": {"line": 4, "character": lines[4].index("Helper") + 1},
+    }).get("result")
+    if def_deleted is not None:
+        fail("watched file delete definition", "expected null after Helper.zan delete, got %r" % (def_deleted,))
+    orig_text = ("using Library; class Use { static int Run(Service service) "
+                 "{ return Service.Read() + service.Count; } }")
+    change_doc(caller, 6, orig_text)
+    expect_diag(caller, 6, set())
 
 
 CONTRACTS = (
@@ -530,14 +740,19 @@ def run_session(exe, workspace):
     caps = s.request("initialize", {"rootUri": workspace.as_uri() + "/"}).get(
         "result", {}).get("capabilities", {})
     for key in ("definitionProvider", "referencesProvider",
-                "documentSymbolProvider", "hoverProvider",
-                "completionProvider", "renameProvider",
+                "documentSymbolProvider", "workspaceSymbolProvider",
+                "hoverProvider", "completionProvider",
+                "signatureHelpProvider", "renameProvider",
                 "documentHighlightProvider", "foldingRangeProvider",
                 "documentFormattingProvider", "documentRangeFormattingProvider",
                 "inlayHintProvider",
                 "semanticTokensProvider"):
         if key not in caps:
             fail("initialize", "missing capability %s in %s" % (key, caps))
+    sig_triggers = caps["signatureHelpProvider"].get("triggerCharacters", [])
+    if "(" not in sig_triggers or "," not in sig_triggers:
+        fail("initialize", "signatureHelpProvider triggerCharacters wrong: %r"
+             % (caps["signatureHelpProvider"],))
     sem_legend = caps["semanticTokensProvider"].get("legend", {})
     if sem_legend.get("tokenTypes", [])[2] != "class" or \
             not caps["semanticTokensProvider"].get("full"):
@@ -568,8 +783,13 @@ def run_session(exe, workspace):
         fail("documentSymbol", "Val field missing, got %r" % (children,))
     if children.get("Get", {}).get("kind") != 6:
         fail("documentSymbol", "Get method missing, got %r" % (children,))
+    if "Go" in children:
+        fail("documentSymbol", "ZUse.Go leaked into ZDemo children: %r" % (children,))
     if children["Get"]["range"]["start"]["line"] != 2:
         fail("documentSymbol", "Get on wrong line: %r" % (children["Get"],))
+    use_children = {d["name"]: d for d in top["ZUse"].get("children", [])}
+    if use_children.get("Go", {}).get("kind") != 6 or "Val" in use_children:
+        fail("documentSymbol", "ZUse children wrong: %r" % (use_children,))
 
     # definition: cursor on ZDemo in `ZDemo d = new ZDemo();` (line 5 char 40)
     loc = s.request("textDocument/definition", {
@@ -896,6 +1116,35 @@ def run_session(exe, workspace):
     if len(line4_hints) != 1 or line4_hints[0].get("label") != ": int":
         fail("inlayHint range", "expected only ': int' for line 4, got %r"
              % (line4_hints,))
+
+    # signatureHelp on Greeter.Hello("world", 42) (line 5)
+    hint_line5 = SRC_HINT.splitlines()[5]
+    sig0 = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": HINT_URI},
+        "position": {"line": 5, "character": hint_line5.index('"world"') + 1},
+    }).get("result")
+    if not sig0 or sig0.get("activeParameter") != 0 or sig0.get("activeSignature") != 0:
+        fail("signatureHelp arg0", "got %r" % (sig0,))
+    sigs0 = sig0.get("signatures") or []
+    if len(sigs0) != 1 or sigs0[0].get("label") != "void Hello(string name, int age)":
+        fail("signatureHelp label", "got %r" % (sigs0,))
+    param_labels = [p.get("label") for p in sigs0[0].get("parameters") or []]
+    if param_labels != ["string name", "int age"]:
+        fail("signatureHelp params", "got %r" % (param_labels,))
+
+    sig1 = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": HINT_URI},
+        "position": {"line": 5, "character": hint_line5.index("42")},
+    }).get("result")
+    if not sig1 or sig1.get("activeParameter") != 1:
+        fail("signatureHelp arg1", "expected activeParameter=1, got %r" % (sig1,))
+
+    sig_none = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": HINT_URI},
+        "position": {"line": 0, "character": 2},
+    }).get("result")
+    if sig_none is not None:
+        fail("signatureHelp outside call", "expected null, got %r" % (sig_none,))
 
     s.notify("textDocument/didClose", {"textDocument": {"uri": HINT_URI}})
 
