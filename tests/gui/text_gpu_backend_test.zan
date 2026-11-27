@@ -1,0 +1,49 @@
+// GPU 后端文字回归：macOS 的 CoreText 文字曾直接写 surface 的 CPU 像素，
+// GL 后端下 FBO 才是权威——那份像素不上传、下次回读即被覆盖，Auto(GL)
+// 时所有标签/按钮整片空白（CPU 后端正常，所以离屏用例一直看不出）。
+// 这里两种后端各画一次：文字之后再来一次 GPU 填充、再回读像素，文字必须还在。
+// 没有可用 GL 上下文的机器（无头 CI）SetBackend(Gpu) 返回 0，按通过处理。
+// golden: TEXT_CPU_OK / TEXT_GPU_OK
+using System;
+using Gui;
+
+class TextGpuBackendTest {
+    static int DarkPixels(Canvas c, int x0, int y0, int x1, int y1) {
+        int n = 0;
+        for (int y = y0; y < y1; y = y + 1) {
+            for (int x = x0; x < x1; x = x + 1) {
+                int p = c.GetPixel(x, y);
+                int g = (p >> 8) & 255;
+                if (g < 128) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    static string Run(string name, int mode) {
+        if (Canvas.SetBackend(mode) == 0 && mode != RenderBackend.Cpu()) {
+            // 本机无 GPU 后端：与 CPU 同路，等价通过。
+            Canvas.SetBackend(RenderBackend.Cpu());
+        }
+        Canvas c = new Canvas(200, 64);
+        try {
+            c.Clear(0xffffffff);
+            c.DrawText(8, 12, "Zan 文字 Text", 0xff000000, 24);
+            // 文字之后再来一次后端绘制：旧缺陷下回读会用 FBO 覆盖掉 CPU 写入的字形。
+            c.FillRect(196, 60, 4, 4, 0xff2060a0);
+            int dark = DarkPixels(c, 0, 0, 190, 58);
+            if (dark < 40) {
+                return "TEXT_" + name + "_BLANK dark=" + Convert.ToString(dark);
+            }
+            return "TEXT_" + name + "_OK";
+        } finally {
+            c.Destroy();
+            Canvas.SetBackend(RenderBackend.Cpu());
+        }
+    }
+
+    static void Main() {
+        Console.WriteLine(Run("CPU", RenderBackend.Cpu()));
+        Console.WriteLine(Run("GPU", RenderBackend.Gpu()));
+    }
+}
