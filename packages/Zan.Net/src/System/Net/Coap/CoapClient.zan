@@ -58,6 +58,14 @@ public class CoapClient : IDisposable {
     // 构建一个 CON 请求数据报（4 字节头 + 2 字节 token + Uri-Path 选项 + 负载），长度写入 outLen[0]。
     public byte[] BuildRequest(int code, string path, string payload, int msgId,
                         int tok, List<int> outLen) {
+        int pktLen = 0;
+        byte[] p = this.BuildRequestCore(code, path, payload, msgId, tok, out pktLen);
+        outLen.Add(pktLen);
+        return p;
+    }
+
+    private byte[] BuildRequestCore(int code, string path, string payload, int msgId,
+                        int tok, out int pktLen) {
         if (path == null) { path = ""; }
         if (payload == null) { payload = ""; }
         byte[] p = new byte[4 + 2 + 4 + path.Length * 2 + 32 + 1 + payload.Length + 8];
@@ -79,6 +87,8 @@ public class CoapClient : IDisposable {
         // RFC 7252 §3.1 扩展长度编码：segLen >= 269 时占 2 字节（值 14 + 16 位整数）。
         int prevOpt = 0;
         int segStart = 0;
+        nint pPtr = (nint)p;
+        nint pathPtr = path.Length > 0 ? (nint)path : (nint)0;
         for (int i = 0; i <= path.Length; i = i + 1) {
             bool atEnd = i == path.Length;
             bool atSep = false;
@@ -105,12 +115,8 @@ public class CoapClient : IDisposable {
                         p[o] = (byte)(ext & 255);
                         o = o + 1;
                     }
-                    int k = segStart;
-                    while (k < i) {
-                        p[o] = (byte)(path[k]);
-                        o = o + 1;
-                        k = k + 1;
-                    }
+                    NativeMemory.Copy(pPtr + (nint)o, pathPtr + (nint)segStart, segLen);
+                    o = o + segLen;
                 }
                 segStart = i + 1;
             }
@@ -119,12 +125,10 @@ public class CoapClient : IDisposable {
         if (payload.Length > 0) {
             p[o] = 255;
             o = o + 1;
-            for (int k2 = 0; k2 < payload.Length; k2 = k2 + 1) {
-                p[o] = (byte)(payload[k2]);
-                o = o + 1;
-            }
+            NativeMemory.Copy(pPtr + (nint)o, (nint)payload, payload.Length);
+            o = o + payload.Length;
         }
-        outLen.Add(o);
+        pktLen = o;
         return p;
     }
 
@@ -190,41 +194,43 @@ public class CoapClient : IDisposable {
     // （ok=false）的响应。
     public async CoapResponse RequestAsync(int code, string path, string payload) {
         UdpClient udp = new UdpClient();
-        int msgId = this.nextMsgId & 65535;
-        this.nextMsgId = (this.nextMsgId % 65535) + 1;
-        byte[] rtokBytes = RandomNumberGenerator.GetBytes(2);
-        int tok = 0;
-        if (rtokBytes != null) {
-            tok = ((rtokBytes[0] & 255) << 8) | (rtokBytes[1] & 255);
-        } else {
-            tok = (msgId * 31 + 7) & 65535;
-        }
-        List<int> lenBox = new List<int>();
-        byte[] pkt = BuildRequest(code, path, payload, msgId, tok, lenBox);
-        int pktLen = lenBox[0];
-
-        int attempt = 0;
-        int window = this.ackTimeoutMs;
         CoapResponse result = null;
-        byte[] rb = new byte[2048];
-        while (result == null && attempt <= this.maxRetransmit) {
-            int _s = await udp.SendBytesToAsync(pkt, pktLen, this.host, this.port);
-            long start = Stopwatch.GetMilliseconds();
-            while (result == null) {
-                int elapsed = (int)(Stopwatch.GetMilliseconds() - start);
-                int remain = window - elapsed;
-                if (remain <= 0) { break; }
-                int rn = await udp.RecvBytesFromAsync(rb, 2048, remain);
-                if (rn <= 0) {
-                    // 超时 (rn == -1) 或底层错误 (rn == 0)，直接结束当前窗口
-                    break;
-                }
-                result = CoapClient.ParseResponse(rb, rn, msgId, tok);
+        try {
+            int msgId = this.nextMsgId & 65535;
+            this.nextMsgId = (this.nextMsgId % 65535) + 1;
+            byte[] rtokBytes = RandomNumberGenerator.GetBytes(2);
+            int tok = 0;
+            if (rtokBytes != null) {
+                tok = ((rtokBytes[0] & 255) << 8) | (rtokBytes[1] & 255);
+            } else {
+                tok = (msgId * 31 + 7) & 65535;
             }
-            attempt = attempt + 1;
-            window = window * 2;
+            int pktLen = 0;
+            byte[] pkt = this.BuildRequestCore(code, path, payload, msgId, tok, out pktLen);
+
+            int attempt = 0;
+            int window = this.ackTimeoutMs;
+            byte[] rb = new byte[2048];
+            while (result == null && attempt <= this.maxRetransmit) {
+                int _s = await udp.SendBytesToAsync(pkt, pktLen, this.host, this.port);
+                long start = Stopwatch.GetMilliseconds();
+                while (result == null) {
+                    int elapsed = (int)(Stopwatch.GetMilliseconds() - start);
+                    int remain = window - elapsed;
+                    if (remain <= 0) { break; }
+                    int rn = await udp.RecvBytesFromAsync(rb, 2048, remain);
+                    if (rn <= 0) {
+                        // 超时 (rn == -1) 或底层错误 (rn == 0)，直接结束当前窗口
+                        break;
+                    }
+                    result = CoapClient.ParseResponse(rb, rn, msgId, tok);
+                }
+                attempt = attempt + 1;
+                window = window * 2;
+            }
+        } finally {
+            udp.Close();
         }
-        udp.Close();
         if (result == null) { result = new CoapResponse(0, ""); }
         return result;
     }

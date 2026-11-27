@@ -39,6 +39,7 @@ public class SmtpClient : IDisposable {
     private bool open;
     // 读缓冲：单次 recv 不足一行 / 一封邮件需要多读，全部在此累积。
     private byte[] inbuf;
+    private byte[] recvTmp;
     private int inhead;
     private int intail;
     // 每次会话记录的服务器能力。
@@ -48,9 +49,6 @@ public class SmtpClient : IDisposable {
     private bool serverEightBitMime;
     private string lastResponse;
     private int lastCode;
-
-    [DllImport("crt")]
-    private static extern long strlen(string str);
 
     // 构造客户端：host + 端口（25 明文/STARTTLS，465 隐式 TLS）。
     public SmtpClient(string host, int port) {
@@ -66,6 +64,7 @@ public class SmtpClient : IDisposable {
         this.tls = null;
         this.open = false;
         this.inbuf = null;
+        this.recvTmp = null;
         this.inhead = 0;
         this.intail = 0;
         this.serverStartTls = false;
@@ -117,6 +116,7 @@ public class SmtpClient : IDisposable {
         if (this.conn != null) { this.conn.Close(); this.conn = null; }
         this.open = false;
         this.inbuf = null;
+        this.recvTmp = null;
         this.inhead = 0;
         this.intail = 0;
         this.user = "";
@@ -154,27 +154,26 @@ public class SmtpClient : IDisposable {
     private int incap;
 
     private async int fillMore() {
+        if (this.recvTmp == null) { this.recvTmp = new byte[16385]; }
         if (this.tls != null) {
-            byte[] tmp = new byte[16385];
-            int n = await this.tls.RecvBytesAsync(tmp, 0, 16384);
+            int n = await this.tls.RecvBytesAsync(this.recvTmp, 0, 16384);
             if (n <= 0) { return 0; }
             this.ensureRoom(n);
-            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp, n);
+            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.recvTmp, n);
             this.intail = this.intail + n;
             return n;
         }
         this.ensureRoom(16384);
         nint sock = this.conn.GetSocket();
-        byte[] tmp2 = new byte[16385];
-        int n2 = await Socket.RecvOv(sock, tmp2, 16384);
+        int n2 = await Socket.RecvOv(sock, this.recvTmp, 16384);
         if (n2 <= 0) { return 0; }
         this.ensureRoom(n2);
-        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp2, n2);
+        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.recvTmp, n2);
         this.intail = this.intail + n2;
         return n2;
     }
 
-    // 读一行（不含 CRLF）；对端关闭返回 null。
+    // 读一行（不含 CRLF）；对端关闭或超长返回 null。
     private async string readLineRaw() {
         int scan = this.inhead;
         while (true) {
@@ -185,6 +184,10 @@ public class SmtpClient : IDisposable {
                     return line;
                 }
                 scan = scan + 1;
+            }
+            if (this.intail - this.inhead > 65536) {
+                this.Close();
+                return null;
             }
             int got = await this.fillMore();
             if (got <= 0) { return null; }
@@ -327,18 +330,23 @@ public class SmtpClient : IDisposable {
                 lineLen = lineLen + 3;
                 continue;
             }
-            string piece = printable ? Encoding.CharFromCode(c)
-                : space ? Encoding.CharFromCode(c)
-                : "=" + Encoding.ByteToHex(c).ToUpperAscii();
-            if (space && (i == n - 1 || (text[i + 1] & 255) == 13 || (text[i + 1] & 255) == 10)) {
-                piece = space ? (c == 32 ? "=20" : "=09") : piece;
-            }
-            if (lineLen + piece.Length > 75) {
+            bool trailingSpace = space && (i == n - 1 || (text[i + 1] & 255) == 13 || (text[i + 1] & 255) == 10);
+            bool direct = (printable || space) && !trailingSpace;
+            int need = direct ? 1 : 3;
+            if (lineLen + need > 75) {
                 sb.Append("=\r\n");
                 lineLen = 0;
             }
-            sb.Append(piece);
-            lineLen = lineLen + piece.Length;
+            if (direct) {
+                sb.Append((char)c);
+            } else {
+                int hi = (c >> 4) & 15;
+                int lo = c & 15;
+                sb.Append((char)61);
+                sb.Append((char)(hi < 10 ? 48 + hi : 55 + hi));
+                sb.Append((char)(lo < 10 ? 48 + lo : 55 + lo));
+            }
+            lineLen = lineLen + need;
         }
         return sb.ToString();
     }
@@ -544,31 +552,42 @@ public class SmtpClient : IDisposable {
         // 这里补一次升级重握手。
         if (this.serverStartTls && this.tls == null) {
             if (!await this.writeLine("STARTTLS")) {
+                this.Close();
                 return SmtpResult.Fail("starttls", 0, "写入失败");
             }
             string resp = await this.readResponse();
             if (resp == null || this.lastCode != 220) {
+                this.Close();
                 return SmtpResult.Fail("starttls", this.lastCode, this.lastResponse);
             }
             TlsContext ctx = TlsContext.CreateClient();
             TlsStream ts = await TlsStream.ConnectAsync(ctx, this.conn.GetSocket(),
                                                         this.host, this.timeoutMs);
             if (ts == null) {
-                return SmtpResult.Fail("starttls", 0, "TLS 握手失败: " + ctx.error);
+                string err = ctx.error;
+                this.Close();
+                return SmtpResult.Fail("starttls", 0, "TLS 握手失败: " + err);
             }
             this.tls = ts;
             this.inhead = 0;
             this.intail = 0;
             SmtpResult eh = await this.EhloAsync();
-            if (!eh.ok) { return eh; }
+            if (!eh.ok) {
+                this.Close();
+                return eh;
+            }
         }
         if (this.requireTls && this.tls == null) {
+            this.Close();
             return SmtpResult.Fail("starttls", 0, "强制要求 TLS 但链路未加密，拒绝明文发送凭据与邮件 (防降级剥离攻击)");
         }
         // AUTH。
         if (this.serverAuth && this.user.Length > 0) {
             SmtpResult ar = await this.AuthAsync();
-            if (!ar.ok) { return ar; }
+            if (!ar.ok) {
+                this.Close();
+                return ar;
+            }
         }
         // MAIL FROM (依对端 8BITMIME 能力自适应协商)。
         string mailCmd = "MAIL FROM:<" + fromClean + ">";
@@ -576,6 +595,7 @@ public class SmtpClient : IDisposable {
             mailCmd = mailCmd + " BODY=8BITMIME";
         }
         if (!await this.writeLine(mailCmd)) {
+            this.Close();
             return SmtpResult.Fail("mail", 0, "写入失败");
         }
         await this.readResponse();
@@ -597,6 +617,7 @@ public class SmtpClient : IDisposable {
         }
         // DATA。
         if (!await this.writeLine("DATA")) {
+            this.Close();
             return SmtpResult.Fail("data", 0, "写入失败");
         }
         await this.readResponse();
@@ -610,6 +631,7 @@ public class SmtpClient : IDisposable {
         byte[] body = Encoding.UTF8.GetBytes(mime + ".\r\n");
         int sent = await this.sendBytes(body, body.Length);
         if (sent != body.Length) {
+            this.Close();
             return SmtpResult.Fail("data", 0, "正文写入失败");
         }
         await this.readResponse();

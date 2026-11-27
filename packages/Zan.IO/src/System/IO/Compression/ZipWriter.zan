@@ -120,7 +120,11 @@ public class ZipWriter : IDisposable {
             this.curCsize = this.curCsize + tail.Length;
             this.curChunker = null;
         }
-        // 回填：重写本地头，CRC/尺寸落到固定字段。
+        // 回填：重写本地头，CRC/尺寸落到固定字段（经典 ZIP 非 ZIP64，须守住 32 位边界）。
+        if (this.curHdrPos < 0 || this.curHdrPos > 2147483647L
+            || this.curCsize > 2147483647L || this.curUsize > 2147483647L) {
+            throw new IOException("ZipWriter: entry exceeds 32-bit ZIP limit");
+        }
         byte[] hdr = new byte[30];
         int off = 0;
         this.BuildHeader(hdr, ref off, this.curName, this.curMethod,
@@ -146,7 +150,10 @@ public class ZipWriter : IDisposable {
     public void Close() {
         if (this.fp == 0) { return; }
         long cdPos = this.Tell();
-        int cdSize = 0;
+        if (cdPos < 0 || cdPos > 2147483647L) {
+            throw new IOException("ZipWriter: archive exceeds 32-bit ZIP limit");
+        }
+        long cdSize = 0;
         for (int i = 0; i < this.names.Count; i = i + 1) {
             byte[] rec = new byte[46 + this.names[i].Length];
             int p = 0;
@@ -168,11 +175,14 @@ public class ZipWriter : IDisposable {
             Zip.WriteU16(rec, ref p, 0);  // 内部属性
             Zip.WriteU32(rec, ref p, 0);  // 外部属性
             Zip.WriteU32(rec, ref p, this.offsets[i]);
-            for (int k = 0; k < name.Length; k = k + 1) {
-                rec[p + k] = (byte)name[k];
+            if (name.Length > 0) {
+                NativeMemory.Copy((nint)rec + (nint)p, (nint)name, name.Length);
             }
             this.WriteRaw(rec, rec.Length);
-            cdSize = cdSize + rec.Length;
+            cdSize = cdSize + (long)rec.Length;
+            if (cdSize > 2147483647L) {
+                throw new IOException("ZipWriter: central directory exceeds 32-bit ZIP limit");
+            }
         }
         byte[] eocd = new byte[22];
         int q = 0;
@@ -211,11 +221,11 @@ public class ZipWriter : IDisposable {
         int off = 0;
         this.BuildHeader(hdr, ref off, name, method, crc, csize, usize);
         this.WriteRaw(hdr, 30);
-        byte[] nb = new byte[name.Length];
-        for (int k = 0; k < name.Length; k = k + 1) {
-            nb[k] = (byte)name[k];
+        if (name.Length > 0) {
+            byte[] nb = new byte[name.Length];
+            NativeMemory.Copy((nint)nb, (nint)name, name.Length);
+            this.WriteRaw(nb, nb.Length);
         }
-        this.WriteRaw(nb, nb.Length);
     }
 
     // 把 30 字节本地头字段写进 hdr 自 off 起，并把 off 前移 30（EndEntry 回填时复用）。

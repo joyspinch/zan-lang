@@ -153,7 +153,7 @@ public class WorkerSse {
 }
 
 // SSE 业务连接中枢与广播 Hub 服务（面向对象化封装）
-public class SseHub {
+public class SseHub : IDisposable {
     public List<SseConnection> conns = new List<SseConnection>();
     public nint sseLock = Mutex.Create();
     public WsSharedBus sharedBus = null;
@@ -161,6 +161,21 @@ public class SseHub {
 
     public void SseInit() {
         if (this.sseLock == 0) { this.sseLock = Mutex.Create(); }
+    }
+
+    public void Dispose() {
+        this.DisableSharedBus();
+        nint lk = this.sseLock;
+        if (lk != 0) {
+            this.sseLock = 0;
+            Mutex.Lock(lk);
+            try {
+                this.conns.Clear();
+            } finally {
+                Mutex.Unlock(lk);
+            }
+            Mutex.Destroy(lk);
+        }
     }
 
     public void EnableSharedBus(string busName) {
@@ -180,9 +195,13 @@ public class SseHub {
 
     public void Attach(SseConnection conn) {
         this.SseInit();
-        Mutex.Lock(this.sseLock);
-        this.conns.Add(conn);
-        Mutex.Unlock(this.sseLock);
+        nint lk = this.sseLock;
+        Mutex.Lock(lk);
+        try {
+            this.conns.Add(conn);
+        } finally {
+            Mutex.Unlock(lk);
+        }
         if (this.sharedBus != null) {
             this.sharedBus.OnConnChange(1);
         }
@@ -190,14 +209,18 @@ public class SseHub {
 
     public void Detach(SseConnection conn) {
         this.SseInit();
-        Mutex.Lock(this.sseLock);
-        for (int i = 0; i < this.conns.Count; i = i + 1) {
-            if (this.conns[i] == conn) {
-                this.conns.RemoveAt(i);
-                break;
+        nint lk = this.sseLock;
+        Mutex.Lock(lk);
+        try {
+            for (int i = 0; i < this.conns.Count; i = i + 1) {
+                if (this.conns[i] == conn) {
+                    this.conns.RemoveAt(i);
+                    break;
+                }
             }
+        } finally {
+            Mutex.Unlock(lk);
         }
-        Mutex.Unlock(this.sseLock);
         if (this.sharedBus != null) {
             this.sharedBus.OnConnChange(-1);
         }
@@ -205,10 +228,13 @@ public class SseHub {
 
     public int ConnCount() {
         this.SseInit();
-        Mutex.Lock(this.sseLock);
-        int n = this.conns.Count;
-        Mutex.Unlock(this.sseLock);
-        return n;
+        nint lk = this.sseLock;
+        Mutex.Lock(lk);
+        try {
+            return this.conns.Count;
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     public int ClusterConnCount() {
@@ -220,12 +246,16 @@ public class SseHub {
 
     public async int BroadcastLocal(string eventName, string data) {
         this.SseInit();
-        Mutex.Lock(this.sseLock);
+        nint lk = this.sseLock;
         List<SseConnection> snap = new List<SseConnection>();
-        for (int i = 0; i < this.conns.Count; i = i + 1) {
-            snap.Add(this.conns[i]);
+        Mutex.Lock(lk);
+        try {
+            for (int i = 0; i < this.conns.Count; i = i + 1) {
+                snap.Add(this.conns[i]);
+            }
+        } finally {
+            Mutex.Unlock(lk);
         }
-        Mutex.Unlock(this.sseLock);
         int sent = 0;
         for (int i = 0; i < snap.Count; i = i + 1) {
             SseConnection s = snap[i];

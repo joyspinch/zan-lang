@@ -107,80 +107,82 @@ public class SipClient : IDisposable {
         if (udp == null) {
             udp = new UdpClient();
         }
-        string wire = req.Serialize();
-        long start = Stopwatch.GetMilliseconds();
-        long nextSend = start;
-        int interval = 500;
         bool done = false;
+        try {
+            string wire = req.Serialize();
+            long start = Stopwatch.GetMilliseconds();
+            long nextSend = start;
+            int interval = 500;
 
-        byte[] rb = new byte[65536];
-        while (!done) {
-            long now = Stopwatch.GetMilliseconds();
-            int elapsed = (int)(now - start);
-            if (elapsed >= 32000) { break; }
-            if (now >= nextSend) {
-                int _s = await udp.SendToAsync(wire, this.host, this.port);
-                nextSend = now + interval;
-                interval = interval * 2;
-                if (interval > 4000) { interval = 4000; }
-            }
-            int waitMs = (int)(nextSend - Stopwatch.GetMilliseconds());
-            if (waitMs <= 0) { waitMs = 50; }
-            int remainTotal = 32000 - (int)(Stopwatch.GetMilliseconds() - start);
-            if (remainTotal <= 0) { break; }
-            if (waitMs > remainTotal) { waitMs = remainTotal; }
+            byte[] rb = new byte[65536];
+            while (!done) {
+                long now = Stopwatch.GetMilliseconds();
+                int elapsed = (int)(now - start);
+                if (elapsed >= 32000) { break; }
+                if (now >= nextSend) {
+                    int _s = await udp.SendToAsync(wire, this.host, this.port);
+                    nextSend = now + interval;
+                    interval = interval * 2;
+                    if (interval > 4000) { interval = 4000; }
+                }
+                int waitMs = (int)(nextSend - Stopwatch.GetMilliseconds());
+                if (waitMs <= 0) { waitMs = 50; }
+                int remainTotal = 32000 - (int)(Stopwatch.GetMilliseconds() - start);
+                if (remainTotal <= 0) { break; }
+                if (waitMs > remainTotal) { waitMs = remainTotal; }
 
-            int rn = await udp.RecvBytesFromAsync(rb, 65536, waitMs);
-            if (rn > 0) {
-                string d = rb.ToStr(0, rn);
-                SipMessage resp = SipMessage.Parse(d);
-                if (resp != null && !resp.GetIsRequest()) {
-                    string respCallId = resp.Header("Call-ID");
-                    string respCSeq = resp.Header("CSeq");
-                    // 严格依据 RFC 3261 §17.1.3 核对事务关联：Call-ID 与 CSeq 必须匹配当前呼叫
-                    if (respCallId == callId && respCSeq.StartsWith(Convert.ToString(seq))) {
-                        int status = resp.GetStatus();
-                        call.SetLastStatus(status, resp.GetReason());
+                int rn = await udp.RecvBytesFromAsync(rb, 65536, waitMs);
+                if (rn > 0) {
+                    string d = rb.ToStr(0, rn);
+                    SipMessage resp = SipMessage.Parse(d);
+                    if (resp != null && !resp.GetIsRequest()) {
+                        string respCallId = resp.Header("Call-ID");
+                        string respCSeq = resp.Header("CSeq");
+                        // 严格依据 RFC 3261 §17.1.3 核对事务关联：Call-ID 与 CSeq 必须匹配当前呼叫
+                        if (respCallId == callId && respCSeq.StartsWith(Convert.ToString(seq))) {
+                            int status = resp.GetStatus();
+                            call.SetLastStatus(status, resp.GetReason());
 
-                        // 180 Ringing 或 183 Session Progress：记录远端状态为振铃
-                        if (status == 180 || status == 183) {
-                            call.SetState(SipCallState.Ringing);
-                            string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
-                            if (remoteTag.Length > 0) {
-                                call.SetRemoteTag(remoteTag);
+                            // 180 Ringing 或 183 Session Progress：记录远端状态为振铃
+                            if (status == 180 || status == 183) {
+                                call.SetState(SipCallState.Ringing);
+                                string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                                if (remoteTag.Length > 0) {
+                                    call.SetRemoteTag(remoteTag);
+                                }
+                            } else if (status >= 200 && status < 300) {
+                                // 200 OK：对方接听电话！提取 Remote Tag 与对端 SDP，发送 ACK 确认握手
+                                string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                                if (remoteTag.Length > 0) {
+                                    call.SetRemoteTag(remoteTag);
+                                }
+                                string remoteSdpText = resp.GetBody();
+                                if (remoteSdpText.Length > 0) {
+                                    SdpMessage remoteSdp = SdpMessage.Parse(remoteSdpText);
+                                    call.SetRemoteSdp(remoteSdp);
+                                }
+                                call.SetState(SipCallState.Connected);
+
+                                // 发送 ACK 请求（完成三路握手）
+                                await SendAckAsync(udp, call, calleeUri, branch);
+
+                                // 创建就绪的 RTP 音频流媒体通道
+                                call.GetOrCreateRtpChannel();
+                                done = true;
+                            } else if (status >= 300) {
+                                // 呼叫被拒绝、无人接听或失败（486 Busy, 603 Decline 等）
+                                call.SetState(SipCallState.Terminated);
+                                // RFC 3261 要求对非 2xx 响应也发送 ACK
+                                await SendAckAsync(udp, call, calleeUri, branch);
+                                done = true;
                             }
-                        } else if (status >= 200 && status < 300) {
-                            // 200 OK：对方接听电话！提取 Remote Tag 与对端 SDP，发送 ACK 确认握手
-                            string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
-                            if (remoteTag.Length > 0) {
-                                call.SetRemoteTag(remoteTag);
-                            }
-                            string remoteSdpText = resp.GetBody();
-                            if (remoteSdpText.Length > 0) {
-                                SdpMessage remoteSdp = SdpMessage.Parse(remoteSdpText);
-                                call.SetRemoteSdp(remoteSdp);
-                            }
-                            call.SetState(SipCallState.Connected);
-
-                            // 发送 ACK 请求（完成三路握手）
-                            await SendAckAsync(udp, call, calleeUri, branch);
-
-                            // 创建就绪的 RTP 音频流媒体通道
-                            call.GetOrCreateRtpChannel();
-                            done = true;
-                        } else if (status >= 300) {
-                            // 呼叫被拒绝、无人接听或失败（486 Busy, 603 Decline 等）
-                            call.SetState(SipCallState.Terminated);
-                            // RFC 3261 要求对非 2xx 响应也发送 ACK
-                            await SendAckAsync(udp, call, calleeUri, branch);
-                            done = true;
                         }
                     }
                 }
             }
+        } finally {
+            udp.Close();
         }
-
-        udp.Close();
         if (!done) {
             call.SetState(SipCallState.Terminated);
             call.SetLastStatus(408, "Request Timeout");
@@ -275,45 +277,48 @@ public class SipClient : IDisposable {
         if (udp == null) {
             udp = new UdpClient();
         }
-        string reqCallId = req.Header("Call-ID");
-        string reqCSeq = req.Header("CSeq");
-        string wire = req.Serialize();
-        long start = Stopwatch.GetMilliseconds();
-        long nextSend = start;
-        int interval = 500;
         SipMessage result = null;
-        byte[] rb = new byte[65536];
-        while (result == null) {
-            long now = Stopwatch.GetMilliseconds();
-            int elapsed = (int)(now - start);
-            if (elapsed >= 32000) { break; }
-            if (now >= nextSend) {
-                int _s = await udp.SendToAsync(wire, this.host, this.port);
-                nextSend = now + interval;
-                interval = interval * 2;
-                if (interval > 4000) { interval = 4000; }
-            }
-            int waitMs = (int)(nextSend - Stopwatch.GetMilliseconds());
-            if (waitMs <= 0) { waitMs = 50; }
-            int remainTotal = 32000 - (int)(Stopwatch.GetMilliseconds() - start);
-            if (remainTotal <= 0) { break; }
-            if (waitMs > remainTotal) { waitMs = remainTotal; }
+        try {
+            string reqCallId = req.Header("Call-ID");
+            string reqCSeq = req.Header("CSeq");
+            string wire = req.Serialize();
+            long start = Stopwatch.GetMilliseconds();
+            long nextSend = start;
+            int interval = 500;
+            byte[] rb = new byte[65536];
+            while (result == null) {
+                long now = Stopwatch.GetMilliseconds();
+                int elapsed = (int)(now - start);
+                if (elapsed >= 32000) { break; }
+                if (now >= nextSend) {
+                    int _s = await udp.SendToAsync(wire, this.host, this.port);
+                    nextSend = now + interval;
+                    interval = interval * 2;
+                    if (interval > 4000) { interval = 4000; }
+                }
+                int waitMs = (int)(nextSend - Stopwatch.GetMilliseconds());
+                if (waitMs <= 0) { waitMs = 50; }
+                int remainTotal = 32000 - (int)(Stopwatch.GetMilliseconds() - start);
+                if (remainTotal <= 0) { break; }
+                if (waitMs > remainTotal) { waitMs = remainTotal; }
 
-            int rn = await udp.RecvBytesFromAsync(rb, 65536, waitMs);
-            if (rn > 0) {
-                string d = rb.ToStr(0, rn);
-                SipMessage m = SipMessage.Parse(d);
-                if (m != null && !m.isRequest) {
-                    string respCallId = m.Header("Call-ID");
-                    string respCSeq = m.Header("CSeq");
-                    // 严格核对 RFC 3261 §17.1.3 事务标识：仅接收属于本请求且最终(>=200)的响应
-                    if (respCallId == reqCallId && respCSeq == reqCSeq && m.status >= 200) {
-                        result = m;
+                int rn = await udp.RecvBytesFromAsync(rb, 65536, waitMs);
+                if (rn > 0) {
+                    string d = rb.ToStr(0, rn);
+                    SipMessage m = SipMessage.Parse(d);
+                    if (m != null && !m.isRequest) {
+                        string respCallId = m.Header("Call-ID");
+                        string respCSeq = m.Header("CSeq");
+                        // 严格核对 RFC 3261 §17.1.3 事务标识：仅接收属于本请求且最终(>=200)的响应
+                        if (respCallId == reqCallId && respCSeq == reqCSeq && m.status >= 200) {
+                            result = m;
+                        }
                     }
                 }
             }
+        } finally {
+            udp.Close();
         }
-        udp.Close();
         return result;
     }
 

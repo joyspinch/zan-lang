@@ -412,7 +412,7 @@ public class WorkerWs {
 }
 
 // WebSocket 业务连接中枢与广播 Hub 服务（面向对象化封装）
-public class WebSocketHub {
+public class WebSocketHub : IDisposable {
     public WsSharedBus sharedBus = null;
     public WorkerWsConsumer busConsumer = null;
     public Dict<string, List<Connection>> channels = new Dict<string, List<Connection>>();
@@ -426,6 +426,20 @@ public class WebSocketHub {
 
     public void RegInit() {
         if (this.regLock == 0) { this.regLock = Mutex.Create(); }
+    }
+
+    public void Dispose() {
+        this.Clear();
+        nint cl = this.chanLock;
+        if (cl != 0) {
+            this.chanLock = 0;
+            Mutex.Destroy(cl);
+        }
+        nint rl = this.regLock;
+        if (rl != 0) {
+            this.regLock = 0;
+            Mutex.Destroy(rl);
+        }
     }
 
     public void EnableSharedBus(string busName) {
@@ -446,24 +460,28 @@ public class WebSocketHub {
     public void Join(string channel, Connection conn) {
         if (conn == null || channel == "") { return; }
         this.ChanInit();
-        Mutex.Lock(this.chanLock);
-        List<Connection> list;
-        if (!this.channels.TryGetValue(channel, out list)) {
-            list = new List<Connection>();
-            this.channels.Add(channel, list);
-        }
-        int id = conn.GetId();
-        bool exists = false;
-        for (int i = 0; i < list.Count; i = i + 1) {
-            if (list[i].GetId() == id) {
-                exists = true;
-                break;
+        nint lk = this.chanLock;
+        Mutex.Lock(lk);
+        try {
+            List<Connection> list;
+            if (!this.channels.TryGetValue(channel, out list)) {
+                list = new List<Connection>();
+                this.channels.Add(channel, list);
             }
+            int id = conn.GetId();
+            bool exists = false;
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                list.Add(conn);
+            }
+        } finally {
+            Mutex.Unlock(lk);
         }
-        if (!exists) {
-            list.Add(conn);
-        }
-        Mutex.Unlock(this.chanLock);
     }
 
     private static void RemoveConnFromList(List<Connection> list, int id) {
@@ -478,21 +496,26 @@ public class WebSocketHub {
     public void Leave(string channel, Connection conn) {
         if (conn == null || channel == "") { return; }
         this.ChanInit();
-        Mutex.Lock(this.chanLock);
-        List<Connection> list;
-        if (this.channels.TryGetValue(channel, out list)) {
-            WebSocketHub.RemoveConnFromList(list, conn.GetId());
-            if (list.Count == 0) {
-                this.channels.Remove(channel);
+        nint lk = this.chanLock;
+        Mutex.Lock(lk);
+        try {
+            List<Connection> list;
+            if (this.channels.TryGetValue(channel, out list)) {
+                WebSocketHub.RemoveConnFromList(list, conn.GetId());
+                if (list.Count == 0) {
+                    this.channels.Remove(channel);
+                }
             }
+        } finally {
+            Mutex.Unlock(lk);
         }
-        Mutex.Unlock(this.chanLock);
     }
 
     public void LeaveAllChannels(Connection conn) {
         if (conn == null) { return; }
         this.ChanInit();
-        Mutex.Lock(this.chanLock);
+        nint lk = this.chanLock;
+        Mutex.Lock(lk);
         try {
             int id = conn.GetId();
             List<string> keys = this.channels.Keys;
@@ -507,23 +530,27 @@ public class WebSocketHub {
                 }
             }
         } finally {
-            Mutex.Unlock(this.chanLock);
+            Mutex.Unlock(lk);
         }
     }
 
     public void Attach(Connection conn, WsWriter writer, TcpClient client) {
         this.RegInit();
-        Mutex.Lock(this.regLock);
-        WsLink link = new WsLink();
-        link.conn = conn;
-        link.writer = writer;
-        link.client = client;
-        int id = conn.GetId();
-        if (this.conns.ContainsKey(id)) {
-            this.conns.Remove(id);
+        nint lk = this.regLock;
+        Mutex.Lock(lk);
+        try {
+            WsLink link = new WsLink();
+            link.conn = conn;
+            link.writer = writer;
+            link.client = client;
+            int id = conn.GetId();
+            if (this.conns.ContainsKey(id)) {
+                this.conns.Remove(id);
+            }
+            this.conns.Add(id, link);
+        } finally {
+            Mutex.Unlock(lk);
         }
-        this.conns.Add(id, link);
-        Mutex.Unlock(this.regLock);
         if (this.sharedBus != null) {
             this.sharedBus.OnConnChange(1);
         }
@@ -531,18 +558,22 @@ public class WebSocketHub {
 
     public void ConnRemove(Connection conn) {
         this.RegInit();
-        Mutex.Lock(this.regLock);
-        int id = conn.GetId();
-        WsLink link = null;
-        if (this.conns.TryGetValue(id, out link)) {
-            link.Unlock();
-            while (link.waiters != null && link.waiters.Count() > 0) {
-                AsyncGate g = link.waiters.Dequeue();
-                g.Signal();
+        nint lk = this.regLock;
+        Mutex.Lock(lk);
+        try {
+            int id = conn.GetId();
+            WsLink link = null;
+            if (this.conns.TryGetValue(id, out link)) {
+                link.Unlock();
+                while (link.waiters != null && link.waiters.Count() > 0) {
+                    AsyncGate g = link.waiters.Dequeue();
+                    g.Signal();
+                }
+                this.conns.Remove(id);
             }
-            this.conns.Remove(id);
+        } finally {
+            Mutex.Unlock(lk);
         }
-        Mutex.Unlock(this.regLock);
         this.LeaveAllChannels(conn);
         if (this.sharedBus != null) {
             this.sharedBus.OnConnChange(-1);
@@ -551,19 +582,26 @@ public class WebSocketHub {
 
     public WsLink LinkOf(int id) {
         this.RegInit();
-        Mutex.Lock(this.regLock);
-        WsLink found = null;
-        this.conns.TryGetValue(id, out found);
-        Mutex.Unlock(this.regLock);
-        return found;
+        nint lk = this.regLock;
+        Mutex.Lock(lk);
+        try {
+            WsLink found = null;
+            this.conns.TryGetValue(id, out found);
+            return found;
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     public int ConnCount() {
         this.RegInit();
-        Mutex.Lock(this.regLock);
-        int n = this.conns.Count;
-        Mutex.Unlock(this.regLock);
-        return n;
+        nint lk = this.regLock;
+        Mutex.Lock(lk);
+        try {
+            return this.conns.Count;
+        } finally {
+            Mutex.Unlock(lk);
+        }
     }
 
     public int ClusterConnCount() {

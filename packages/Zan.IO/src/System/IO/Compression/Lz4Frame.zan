@@ -120,23 +120,29 @@ public class Lz4Frame {
             }
             ip = ip + 8;
         }
-        if (hasDictId) { ip = ip + 4; }
+        if (hasDictId) {
+            if (4 > src.Length - ip) { return null; }
+            ip = ip + 4;
+        }
         if (ip >= src.Length) { return null; }
         ip = ip + 1;  // HC
         // BlockMaxSize：值 4-7 → 64KB/256KB/1MB/4MB；值 0-3 规范
         // 未定义，按 64KB 处理。
         int bmaxCode = (bd >> 4) & 7;
         int blockMax = bmaxCode >= 4 ? 65536 << ((bmaxCode - 4) * 2) : 65536;
-        byte[] out2;
-        if (hasContentSize && contentSize >= 0 && contentSize < 1073741824) {
-            out2 = new byte[(int)contentSize + 8];
-        } else {
-            out2 = new byte[65536 + 8];
+        // 不可信帧头声明的 contentSize 仅作初始缓冲提示且严控上限（≤ 4 MiB），防小包 OOM。
+        int maxFrameOut = 536870912;  // 512 MiB 硬上限
+        int initCap = 65536;
+        if (hasContentSize && contentSize > 0) {
+            long hint = contentSize;
+            if (hint > 4194304L) { hint = 4194304L; }
+            if (hint > (long)initCap) { initCap = (int)hint; }
         }
+        byte[] out2 = new byte[initCap + 8];
         int op = 0;
-        int cap = out2.Length;
+        int cap = initCap;
         while (true) {
-            if (ip + 4 > src.Length) { return null; }
+            if (4 > src.Length - ip) { return null; }
             int lenField = (src[ip] & 255) | ((src[ip + 1] & 255) << 8)
                 | ((src[ip + 2] & 255) << 16)
                 | (int)(((uint)(src[ip + 3] & 255)) << 24);
@@ -144,9 +150,10 @@ public class Lz4Frame {
             if (lenField == 0) { break; }  // EndMark
             bool stored = (lenField & unchecked((int)0x80000000)) != 0;
             int dlen = lenField & 0x7FFFFFFF;
-            if (ip + dlen > src.Length) { return null; }
+            if (dlen > src.Length - ip) { return null; }
             byte[] piece;
             if (stored) {
+                if (dlen > blockMax) { return null; }
                 piece = new byte[dlen];
                 Lz4Frame.Copy(src, ip, piece, 0, dlen);
             } else {
@@ -155,18 +162,26 @@ public class Lz4Frame {
                 if (piece == null) { return null; }
             }
             ip = ip + dlen;
-            if (hasBlockChecksum) { ip = ip + 4; }
-            if (op + piece.Length > cap) {
-                int ncap = cap * 2;
-                while (op + piece.Length > ncap) { ncap = ncap * 2; }
-                byte[] nb = new byte[ncap + 8];
+            if (hasBlockChecksum) {
+                if (4 > src.Length - ip) { return null; }
+                ip = ip + 4;
+            }
+            if (piece.Length > maxFrameOut - op) { return null; }
+            if (piece.Length > cap - op) {
+                long need = (long)op + (long)piece.Length;
+                long ncap = (long)cap;
+                while (ncap < need) { ncap = ncap * 2L; }
+                if (ncap > (long)maxFrameOut) { ncap = (long)maxFrameOut; }
+                int newCap = (int)ncap;
+                byte[] nb = new byte[newCap + 8];
                 Lz4Frame.Copy(out2, 0, nb, 0, op);
                 out2 = nb;
-                cap = ncap;
+                cap = newCap;
             }
             Lz4Frame.Copy(piece, 0, out2, op, piece.Length);
             op = op + piece.Length;
         }
+        if (hasContentSize && (long)op != contentSize) { return null; }
         byte[] res = new byte[op];
         Lz4Frame.Copy(out2, 0, res, 0, op);
         return res;

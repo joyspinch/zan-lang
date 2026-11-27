@@ -23,10 +23,13 @@ public class Pop3Client : IDisposable {
     private bool open;
 
     private byte[] inbuf;
+    private byte[] recvTmp;
     private int inhead;
     private int intail;
     private int incap;
     private string lastResponse;
+    private static const int MaxLineBytes = 65536;
+    private static const int MaxMultiLineBytes = 33554432;
 
     public Pop3Client(string host, int port) {
         this.host = host;
@@ -38,6 +41,7 @@ public class Pop3Client : IDisposable {
         this.tls = null;
         this.open = false;
         this.inbuf = null;
+        this.recvTmp = null;
         this.inhead = 0;
         this.intail = 0;
         this.incap = 0;
@@ -100,8 +104,20 @@ public class Pop3Client : IDisposable {
         return Pop3Result.Ok(greeting);
     }
 
+    private static bool HasCommandBreak(string s) {
+        if (s == null) { return true; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { return true; }
+        }
+        return false;
+    }
+
     // 用户名与密码身份鉴权（USER/PASS）。
     public async Pop3Result LoginAsync(string user, string pass) {
+        if (Pop3Client.HasCommandBreak(user) || Pop3Client.HasCommandBreak(pass)) {
+            return Pop3Result.Fail("auth", "POP3 凭据包含非法控制字符");
+        }
         if (!this.open) {
             Pop3Result cr = await this.ConnectAsync();
             if (!cr.ok) { return cr; }
@@ -289,22 +305,21 @@ public class Pop3Client : IDisposable {
     }
 
     private async int fillMore() {
+        if (this.recvTmp == null) { this.recvTmp = new byte[16385]; }
         if (this.tls != null) {
-            byte[] tmp = new byte[16385];
-            int n = await this.tls.RecvBytesAsync(tmp, 0, 16384);
+            int n = await this.tls.RecvBytesAsync(this.recvTmp, 0, 16384);
             if (n <= 0) { return 0; }
             this.ensureRoom(n);
-            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp, n);
+            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.recvTmp, n);
             this.intail = this.intail + n;
             return n;
         }
         this.ensureRoom(16384);
         nint sock = this.conn.GetSocket();
-        byte[] tmp2 = new byte[16385];
-        int n2 = await Socket.RecvOv(sock, tmp2, 16384);
+        int n2 = await Socket.RecvOv(sock, this.recvTmp, 16384);
         if (n2 <= 0) { return 0; }
         this.ensureRoom(n2);
-        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp2, n2);
+        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.recvTmp, n2);
         this.intail = this.intail + n2;
         return n2;
     }
@@ -319,6 +334,10 @@ public class Pop3Client : IDisposable {
                     return line;
                 }
                 scan = scan + 1;
+            }
+            if (this.intail - this.inhead > Pop3Client.MaxLineBytes) {
+                this.Close();
+                return null;
             }
             int got = await this.fillMore();
             if (got <= 0) { return null; }
@@ -335,20 +354,29 @@ public class Pop3Client : IDisposable {
 
     private async string readMultiLineAsync() {
         StringBuilder sb = new StringBuilder();
+        int totalBytes = 0;
         while (true) {
             string line = await this.readLineRaw();
-            if (line == null || line == ".") { break; }
+            if (line == null) { return null; }
+            if (line == ".") { break; }
             if (line.Length >= 2 && (line[0] & 255) == 46 && (line[1] & 255) == 46) {
                 // Byte-unstuffing RFC 1939
                 line = line.Substring(1);
             }
+            int extra = (sb.Length > 0 ? 2 : 0) + line.Length;
+            if (extra > Pop3Client.MaxMultiLineBytes - totalBytes) {
+                this.Close();
+                return null;
+            }
             if (sb.Length > 0) { sb.Append("\r\n"); }
             sb.Append(line);
+            totalBytes = totalBytes + extra;
         }
         return sb.ToString();
     }
 
     private async bool writeLine(string line) {
+        if (Pop3Client.HasCommandBreak(line)) { return false; }
         byte[] buf = Encoding.UTF8.GetBytes(line + "\r\n");
         int n = await this.sendBytes(buf, buf.Length);
         return n == buf.Length;

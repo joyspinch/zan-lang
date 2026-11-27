@@ -63,6 +63,15 @@ public class ForwardedHeaders {
 
     public List<string> TrustedProxies() { return this.trustedProxies; }
 
+    // 校验对端套接字地址是否位于有效受托代理名单中（供 X-Forwarded-Proto 等复用）。
+    public bool IsTrustedPeer(string remoteIp) {
+        if (!this.enabled || this.trustInvalid) { return false; }
+        if (this.trustedProxies == null || this.trustedProxies.Count == 0) { return false; }
+        string peer = ForwardedHeaders.Canonical(remoteIp);
+        if (peer.Length == 0) { return false; }
+        return this.trustedProxies.Contains(peer);
+    }
+
     // 从 HttpContext 还原真实客户端 IP（规范拼写；对端缺失时答 "unknown"）。
     public string ResolveClientIp(HttpContext ctx) {
         if (ctx == null) { return ""; }
@@ -150,12 +159,21 @@ public class ForwardedHeaders {
             return Convert.ToString(words[6] / 256) + "." + Convert.ToString(words[6] % 256)
                 + "." + Convert.ToString(words[7] / 256) + "." + Convert.ToString(words[7] % 256);
         }
-        string result = "";
+        byte[] hex = new byte[39];
+        int p = 0;
         for (int i = 0; i < 8; i = i + 1) {
-            if (i > 0) { result = result + ":"; }
-            result = result + ForwardedHeaders.IpHex(words[i]);
+            if (i > 0) {
+                hex[p] = (byte)58;
+                p = p + 1;
+            }
+            int w = words[i];
+            for (int shift = 12; shift >= 0; shift = shift - 4) {
+                int d = (w >> shift) & 15;
+                hex[p] = (byte)(d < 10 ? 48 + d : 87 + d);
+                p = p + 1;
+            }
         }
-        return result;
+        return NativeMemory.GetString((nint)hex, 0, 39);
     }
 
     private static bool IpGroups(string part, List<int> words) {
@@ -173,11 +191,11 @@ public class ForwardedHeaders {
     }
 
     private static string IpHex(int word) {
-        string digits = "0123456789abcdef";
-        string result = "";
-        for (int shift = 12; shift >= 0; shift = shift - 4) {
-            result = result + digits.Substring((word >> shift) & 15, 1);
+        byte[] hex = new byte[4];
+        for (int i = 0; i < 4; i = i + 1) {
+            int d = (word >> (12 - i * 4)) & 15;
+            hex[i] = (byte)(d < 10 ? 48 + d : 87 + d);
         }
-        return result;
+        return NativeMemory.GetString((nint)hex, 0, 4);
     }
 }

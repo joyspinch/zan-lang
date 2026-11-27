@@ -109,21 +109,30 @@ public class Channel<T> : IDisposable {
     // 若通道已关闭，则返回 false。
     public async bool Write(T item) {
         while (true) {
-            Mutex.Lock(this.mtx);
+            nint m = this.mtx;
+            if (m == 0) {
+                return false;
+            }
+            Mutex.Lock(m);
             if (this.isClosed) {
-                Mutex.Unlock(this.mtx);
+                Mutex.Unlock(m);
                 // 级联广播唤醒：顺手唤醒下一个挂起生产者，保证多生产者全部感知关闭并退出
-                this.writeGate.Signal();
+                AsyncGate wgClose = this.writeGate;
+                if (wgClose != null) { wgClose.Signal(); }
                 return false;
             }
             if (this.capacity == 0 || (this.buffer.Count - this.head) < this.capacity) {
                 this.buffer.Add(item);
-                Mutex.Unlock(this.mtx);
-                this.readGate.Signal();
+                Mutex.Unlock(m);
+                AsyncGate rg = this.readGate;
+                if (rg != null) { rg.Signal(); }
                 return true;
             }
-            Mutex.Unlock(this.mtx);
-            await this.writeGate.Wait();
+            AsyncGate wg = this.writeGate;
+            Mutex.Unlock(m);
+            if (wg == null || !await wg.Wait()) {
+                return false;
+            }
         }
     }
 
@@ -175,25 +184,36 @@ public class Channel<T> : IDisposable {
     // 若通道关闭且缓冲区排空，返回 false；正常读到项返回 true。
     public async bool Read(out T item) {
         while (true) {
-            Mutex.Lock(this.mtx);
+            nint m = this.mtx;
+            if (m == 0) {
+                item = null;
+                return false;
+            }
+            Mutex.Lock(m);
             if (this.head < this.buffer.Count) {
                 item = this.PopLocked();
                 bool hadBackpressure = this.capacity > 0;
-                Mutex.Unlock(this.mtx);
+                Mutex.Unlock(m);
                 if (hadBackpressure) {
-                    this.writeGate.Signal();
+                    AsyncGate wg = this.writeGate;
+                    if (wg != null) { wg.Signal(); }
                 }
                 return true;
             }
             if (this.isClosed) {
                 item = null;
-                Mutex.Unlock(this.mtx);
+                Mutex.Unlock(m);
                 // 级联广播唤醒：顺手唤醒下一个等待者，保证多消费者全部感知关闭并退出
-                this.readGate.Signal();
+                AsyncGate rgClose = this.readGate;
+                if (rgClose != null) { rgClose.Signal(); }
                 return false;
             }
-            Mutex.Unlock(this.mtx);
-            await this.readGate.Wait();
+            AsyncGate rg = this.readGate;
+            Mutex.Unlock(m);
+            if (rg == null || !await rg.Wait()) {
+                item = null;
+                return false;
+            }
         }
     }
 

@@ -12,6 +12,7 @@ public class ModbusClient : IDisposable {
     private int unitId;
     private int nextTid;
     private bool connected;
+    private bool closed;
     private bool busy;
     private Queue<AsyncGate> waiters;
     private string lastError;
@@ -21,6 +22,7 @@ public class ModbusClient : IDisposable {
         this.unitId = 1;
         this.nextTid = 1;
         this.connected = false;
+        this.closed = false;
         this.busy = false;
         this.waiters = new Queue<AsyncGate>();
         this.lastError = "";
@@ -42,16 +44,20 @@ public class ModbusClient : IDisposable {
     public string LastError() { return this.lastError; }
 
     // 关闭连接并安全唤醒所有排队等待的协程（幂等）。
+    // 不在此处提前清 busy：仍在执行中的事务会在 finally 释放，唤醒的等待者见 closed=true 后直接退出。
     public void Close() {
+        TcpClient c = null;
         lock (this) {
+            this.closed = true;
+            this.connected = false;
+            c = this.conn;
+            this.conn = null;
             while (this.waiters != null && this.waiters.Count() > 0) {
                 AsyncGate g = this.waiters.Dequeue();
                 g.Signal();
             }
-            this.busy = false;
         }
-        if (this.conn != null) { this.conn.Close(); }
-        this.connected = false;
+        if (c != null) { c.Close(); }
     }
 
     // 实现 IDisposable 接口，释放网络与等待门资源。
@@ -86,6 +92,7 @@ public class ModbusClient : IDisposable {
     private async bool AcquireLock() {
         AsyncGate g = null;
         lock (this) {
+            if (this.closed || !this.connected) { return false; }
             if (!this.busy) {
                 this.busy = true;
                 return true;
@@ -96,12 +103,15 @@ public class ModbusClient : IDisposable {
         }
         await g.Wait();
         g.Close();
+        lock (this) {
+            if (this.closed || !this.connected) { return false; }
+        }
         return true;
     }
 
     private void ReleaseLock() {
         lock (this) {
-            if (this.waiters != null && this.waiters.Count() > 0) {
+            if (!this.closed && this.waiters != null && this.waiters.Count() > 0) {
                 AsyncGate g = this.waiters.Dequeue();
                 g.Signal();
             } else {
@@ -112,7 +122,9 @@ public class ModbusClient : IDisposable {
 
     // 互斥串行化的请求/响应往返（发送 MBAP + PDU，接收应答 PDU）。
     private async byte[] TransactAsync(byte[] pdu, int pduLen) {
-        await this.AcquireLock();
+        if (!await this.AcquireLock()) {
+            return this.FailFrame("connection closed", false);
+        }
         try {
             return await this.TransactInternalAsync(pdu, pduLen);
         } finally {

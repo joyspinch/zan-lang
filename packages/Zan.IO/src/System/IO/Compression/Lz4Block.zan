@@ -24,11 +24,14 @@ public class Lz4Block {
     // 解码一个 LZ4 block。dst 已知大小时用 maxOut 限制（防恶意
     // 输入撑爆内存）；超出返回 null。输出不足是错误（截断）。
     public static byte[] Decode(byte[] src, int offset, int len, int maxOut) {
-        if (src == null || len < 0 || offset < 0 || offset + len > src.Length) {
+        if (src == null || len < 0 || offset < 0 || offset > src.Length - len || maxOut < 0) {
             return null;
         }
         if (len == 0) {
             return new byte[0];
+        }
+        if (maxOut == 0) {
+            return null;
         }
         byte[] out2 = new byte[maxOut];
         nint outPtr = (nint)out2;
@@ -46,34 +49,37 @@ public class Lz4Block {
                     if (ip >= end) { return null; }
                     int b = src[ip] & 255;
                     ip = ip + 1;
+                    if (b > maxOut - op - litLen || b > end - ip - litLen) { return null; }
                     litLen = litLen + b;
                     if (b != 255) { break; }
                 }
             }
             if (litLen > 0) {
-                if (ip + litLen > end || op + litLen > maxOut) { return null; }
+                if (litLen > end - ip || litLen > maxOut - op) { return null; }
                 NativeMemory.Copy(outPtr + op, srcPtr + ip, litLen);
                 op = op + litLen;
                 ip = ip + litLen;
             }
             if (ip >= end) { break; }  // 最后一个序列只有字面量。
             // 匹配偏移（小端 16 位，1 = 上一字节；0 非法）。
-            if (ip + 2 > end) { return null; }
+            if (2 > end - ip) { return null; }
             int matchOff = (src[ip] & 255) + ((src[ip + 1] & 255) << 8);
             ip = ip + 2;
             if (matchOff == 0 || matchOff > op) { return null; }
             // 匹配长度。
             int matchLen = (token & 15) + 4;
+            if (matchLen > maxOut - op) { return null; }
             if ((token & 15) == 15) {
                 while (true) {
                     if (ip >= end) { return null; }
                     int b = src[ip] & 255;
                     ip = ip + 1;
+                    if (b > maxOut - op - matchLen) { return null; }
                     matchLen = matchLen + b;
                     if (b != 255) { break; }
                 }
             }
-            if (op + matchLen > maxOut) { return null; }
+            if (matchLen > maxOut - op) { return null; }
             // 偏移可能小于匹配长度（重叠复制）——倍增展开：
             // 先逐字节复制 matchOff 字节，此后 [op-done, op) 是完整
             // 周期段，可作为源继续整块搬移（memmove，无重叠）。
