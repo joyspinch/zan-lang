@@ -8,17 +8,21 @@ public class SemaphoreSlim : IDisposable {
     int limit;
     int active;
     int waiters;
+    int signals;
+    int inFlightWaits;
     int canceled;
+    bool disposed;
 
-    nint lockHandle;
     nint sem;
 
     public SemaphoreSlim() {
         this.limit = 1;
         this.active = 0;
         this.waiters = 0;
+        this.signals = 0;
+        this.inFlightWaits = 0;
         this.canceled = 0;
-        this.lockHandle = Mutex.Create();
+        this.disposed = false;
         this.sem = Semaphore.Create(0, 1048576);
     }
 
@@ -27,193 +31,229 @@ public class SemaphoreSlim : IDisposable {
         this.limit = limit;
         this.active = 0;
         this.waiters = 0;
+        this.signals = 0;
+        this.inFlightWaits = 0;
         this.canceled = 0;
-        this.lockHandle = Mutex.Create();
-        // OS 信号量仅用于阻塞等待；实际可用许可为 Mutex 下的 (limit - active)。
+        this.disposed = false;
+        // OS 信号量仅用于阻塞等待；实际可用许可为 lock (this) 下的 (limit - active)。
         this.sem = Semaphore.Create(0, 1048576);
+    }
+
+    private void FinishWait(bool gotSignal) {
+        nint toDestroy = 0;
+        lock (this) {
+            if (gotSignal && this.signals > 0) {
+                this.signals = this.signals - 1;
+            }
+            if (this.waiters > 0) {
+                this.waiters = this.waiters - 1;
+            }
+            if (this.inFlightWaits > 0) {
+                this.inFlightWaits = this.inFlightWaits - 1;
+            }
+            if (this.disposed && this.inFlightWaits == 0 && this.sem != 0) {
+                toDestroy = this.sem;
+                this.sem = 0;
+            }
+        }
+        if (toDestroy != 0) {
+            Semaphore.Destroy(toDestroy);
+        }
     }
 
     // 获取槽位，无空位时阻塞；Cancel 后立即返回且不占槽位。
     public void Wait() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return; }
-        Mutex.Lock(lk);
-        if (this.canceled != 0 || this.active < this.limit) {
-            if (this.canceled == 0) { this.active = this.active + 1; }
-            Mutex.Unlock(lk);
-            return;
+        while (true) {
+            nint sm = 0;
+            lock (this) {
+                if (this.canceled != 0 || this.disposed) {
+                    return;
+                }
+                if (this.active < this.limit) {
+                    this.active = this.active + 1;
+                    return;
+                }
+                sm = this.sem;
+                if (sm == 0) {
+                    return;
+                }
+                this.waiters = this.waiters + 1;
+                this.inFlightWaits = this.inFlightWaits + 1;
+            }
+            bool got = false;
+            try {
+                Semaphore.Wait(sm);
+                got = true;
+            } finally {
+                this.FinishWait(got);
+            }
         }
-        this.waiters = this.waiters + 1;
-        nint sm = this.sem;
-        Mutex.Unlock(lk);
-        if (sm == 0) { return; }
-        // 释放方已移交槽位并计入 active，唤醒后无需重检；Cancel 唤醒时由 IsCanceled 区分。
-        Semaphore.Wait(sm);
     }
 
     // 限时获取槽位（负超时无限等）；拿到返回 true，超时或已 Cancel 返回 false。
     public bool WaitFor(int timeoutMs) {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return false; }
-        Mutex.Lock(lk);
-        if (this.canceled != 0) {
-            Mutex.Unlock(lk);
-            return false;
+        if (timeoutMs == 0) {
+            return this.TryWait();
         }
-        if (this.active < this.limit) {
-            this.active = this.active + 1;
-            Mutex.Unlock(lk);
-            return true;
+        long deadline = timeoutMs > 0 ? Stopwatch.GetMilliseconds() + (long)timeoutMs : 0L;
+        while (true) {
+            nint sm = 0;
+            int waitMs = -1;
+            lock (this) {
+                if (this.canceled != 0 || this.disposed) {
+                    return false;
+                }
+                if (this.active < this.limit) {
+                    this.active = this.active + 1;
+                    return true;
+                }
+                if (timeoutMs > 0) {
+                    long rem = deadline - Stopwatch.GetMilliseconds();
+                    if (rem <= 0L) {
+                        return false;
+                    }
+                    waitMs = rem > 2147483647L ? 2147483647 : (int)rem;
+                }
+                sm = this.sem;
+                if (sm == 0) {
+                    return false;
+                }
+                this.waiters = this.waiters + 1;
+                this.inFlightWaits = this.inFlightWaits + 1;
+            }
+            bool got = false;
+            try {
+                got = Semaphore.WaitFor(sm, waitMs);
+            } finally {
+                this.FinishWait(got);
+            }
+            if (!got) {
+                // 超时后最后一次在锁下检查是否恰有空位可用
+                lock (this) {
+                    if (this.canceled == 0 && !this.disposed && this.active < this.limit) {
+                        this.active = this.active + 1;
+                        return true;
+                    }
+                }
+                return false;
+            }
         }
-        this.waiters = this.waiters + 1;
-        nint sm = this.sem;
-        Mutex.Unlock(lk);
-        if (sm == 0) { return false; }
-        if (Semaphore.WaitFor(sm, timeoutMs)) {
-            lk = this.lockHandle;
-            if (lk == 0) { return false; }
-            Mutex.Lock(lk);
-            bool ok = this.canceled == 0;
-            Mutex.Unlock(lk);
-            return ok;
-        }
-
-        // 超时撤回等待；若 waiters 已被释放方消费移交，则补领该信号量许可避免泄漏槽位。
-        lk = this.lockHandle;
-        if (lk == 0) { return false; }
-        Mutex.Lock(lk);
-        if (this.waiters > 0) {
-            this.waiters = this.waiters - 1;
-            Mutex.Unlock(lk);
-            return false;
-        }
-        Mutex.Unlock(lk);
-        Semaphore.Wait(sm);
-        lk = this.lockHandle;
-        if (lk == 0) { return false; }
-        Mutex.Lock(lk);
-        bool took = this.canceled == 0;
-        Mutex.Unlock(lk);
-        return took;
     }
 
     public bool TryWait() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return false; }
-        Mutex.Lock(lk);
-        bool got = this.canceled == 0 && this.active < this.limit;
-        if (got) { this.active = this.active + 1; }
-        Mutex.Unlock(lk);
-        return got;
+        lock (this) {
+            bool got = this.canceled == 0 && !this.disposed && this.active < this.limit;
+            if (got) { this.active = this.active + 1; }
+            return got;
+        }
     }
 
     // 归还槽位并按上限唤醒等待者（Cancel 后仅递减 active 不再唤醒）。
     public void Release() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return; }
-        Mutex.Lock(lk);
-        if (this.active > 0) { this.active = this.active - 1; }
-        bool wake = this.canceled == 0 && this.waiters > 0
-            && this.active < this.limit;
-        if (wake) {
-            this.waiters = this.waiters - 1;
-            this.active = this.active + 1;
+        nint sm = 0;
+        bool wake = false;
+        lock (this) {
+            if (this.active > 0) { this.active = this.active - 1; }
+            if (this.canceled == 0 && !this.disposed && this.active < this.limit
+                && this.waiters > this.signals && this.sem != 0) {
+                this.signals = this.signals + 1;
+                sm = this.sem;
+                wake = true;
+            }
         }
-        nint sm = this.sem;
-        Mutex.Unlock(lk);
-        if (wake && sm != 0) { Semaphore.Release(sm); }
+        if (wake) { Semaphore.Release(sm); }
     }
 
     // 动态调整上限，返回本次放行的等待者数量。
     public int SetLimit(int limit) {
         if (limit < 0) { limit = 0; }
-        nint lk = this.lockHandle;
-        if (lk == 0) { return 0; }
-        Mutex.Lock(lk);
-        this.limit = limit;
         int wake = 0;
-        while (this.canceled == 0 && this.waiters > 0
-               && this.active < this.limit) {
-            this.waiters = this.waiters - 1;
-            this.active = this.active + 1;
-            wake = wake + 1;
-        }
-        nint sm = this.sem;
-        Mutex.Unlock(lk);
-        if (sm != 0) {
-            for (int i = 0; i < wake; i = i + 1) {
-                Semaphore.Release(sm);
+        nint sm = 0;
+        lock (this) {
+            this.limit = limit;
+            if (this.canceled == 0 && !this.disposed && this.sem != 0) {
+                int avail = this.limit - this.active;
+                int need = this.waiters - this.signals;
+                if (avail > 0 && need > 0) {
+                    wake = avail < need ? avail : need;
+                    this.signals = this.signals + wake;
+                    sm = this.sem;
+                }
             }
+        }
+        for (int i = 0; i < wake; i = i + 1) {
+            Semaphore.Release(sm);
         }
         return wake;
     }
 
     // 一次性关闭：唤醒所有挂起等待者并拒绝后续准入（之后应调用 Dispose）。
     public void Cancel() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return; }
-        Mutex.Lock(lk);
-        this.canceled = 1;
-        int wake = this.waiters;
-        this.waiters = 0;
-        nint sm = this.sem;
-        Mutex.Unlock(lk);
-        if (sm != 0) {
-            for (int i = 0; i < wake; i = i + 1) {
-                Semaphore.Release(sm);
+        int wake = 0;
+        nint sm = 0;
+        lock (this) {
+            this.canceled = 1;
+            if (this.sem != 0 && this.waiters > this.signals) {
+                wake = this.waiters - this.signals;
+                this.signals = this.signals + wake;
+                sm = this.sem;
             }
+        }
+        for (int i = 0; i < wake; i = i + 1) {
+            Semaphore.Release(sm);
         }
     }
 
     public bool IsCanceled() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return this.canceled != 0; }
-        Mutex.Lock(lk);
-        int v = this.canceled;
-        Mutex.Unlock(lk);
-        return v != 0;
+        lock (this) {
+            return this.canceled != 0;
+        }
     }
 
     public int Limit() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return this.limit; }
-        Mutex.Lock(lk);
-        int v = this.limit;
-        Mutex.Unlock(lk);
-        return v;
+        lock (this) {
+            return this.limit;
+        }
     }
 
     public int Active() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return 0; }
-        Mutex.Lock(lk);
-        int v = this.active;
-        Mutex.Unlock(lk);
-        return v;
+        lock (this) {
+            return this.active;
+        }
     }
 
     public int Waiting() {
-        nint lk = this.lockHandle;
-        if (lk == 0) { return 0; }
-        Mutex.Lock(lk);
-        int v = this.waiters;
-        Mutex.Unlock(lk);
-        return v;
+        lock (this) {
+            return this.waiters;
+        }
     }
 
     public void Dispose() {
-        if (this.lockHandle != 0) {
-            this.Cancel();
+        int wake = 0;
+        nint smWake = 0;
+        nint smDestroy = 0;
+        lock (this) {
+            if (this.disposed) {
+                return;
+            }
+            this.disposed = true;
+            this.canceled = 1;
+            if (this.sem != 0) {
+                if (this.inFlightWaits == 0) {
+                    smDestroy = this.sem;
+                    this.sem = 0;
+                } else if (this.waiters > this.signals) {
+                    wake = this.waiters - this.signals;
+                    this.signals = this.signals + wake;
+                    smWake = this.sem;
+                }
+            }
         }
-        if (this.sem != 0) {
-            nint sm = this.sem;
-            this.sem = 0;
-            Semaphore.Destroy(sm);
+        for (int i = 0; i < wake; i = i + 1) {
+            Semaphore.Release(smWake);
         }
-        if (this.lockHandle != 0) {
-            nint lk = this.lockHandle;
-            this.lockHandle = 0;
-            Mutex.Destroy(lk);
+        if (smDestroy != 0) {
+            Semaphore.Destroy(smDestroy);
         }
     }
 }

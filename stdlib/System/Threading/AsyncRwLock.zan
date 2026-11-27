@@ -15,6 +15,7 @@ public class AsyncRwLock : IDisposable {
     public AsyncGate readGate;
     public AsyncGate writeGate;
     public nint mtx;
+    private bool closed;
 
     public AsyncRwLock() {
         this.readers = 0;
@@ -23,56 +24,70 @@ public class AsyncRwLock : IDisposable {
         this.readersWaiting = 0;
         this.readGate = new AsyncGate();
         this.writeGate = new AsyncGate();
-        this.mtx = Mutex.Create();
+        this.mtx = 0;
+        this.closed = false;
     }
 
     // 获取共享（读）访问；当写者持有锁
     // 或正在等待锁时挂起。无竞争快路径零额外信号。
     public async void EnterRead() {
         while (true) {
-            nint m = this.mtx;
-            if (m == 0) { return; }
-            Mutex.Lock(m);
-            if (!this.writer && this.writersWaiting == 0) {
-                this.readers = this.readers + 1;
-                bool wakeNextReader = this.readersWaiting > 0;
-                AsyncGate rgWake = wakeNextReader ? this.readGate : null;
-                Mutex.Unlock(m);
+            AsyncGate rg = null;
+            AsyncGate rgWake = null;
+            bool acquired = false;
+            lock (this) {
+                if (this.closed) {
+                    throw new ObjectDisposedException("AsyncRwLock");
+                }
+                if (!this.writer && this.writersWaiting == 0) {
+                    this.readers = this.readers + 1;
+                    acquired = true;
+                    if (this.readersWaiting > 0) {
+                        rgWake = this.readGate;
+                    }
+                } else {
+                    this.readersWaiting = this.readersWaiting + 1;
+                    rg = this.readGate;
+                }
+            }
+            if (acquired) {
                 // 仅当仍有排队读者时接力补发信号，防止 SignalAll 前后并发入队丢失唤醒。
                 if (rgWake != null) {
                     rgWake.Signal();
                 }
                 return;
             }
-            this.readersWaiting = this.readersWaiting + 1;
-            AsyncGate rg = this.readGate;
-            Mutex.Unlock(m);
-            bool ok = rg != null && await rg.Wait();
-            m = this.mtx;
-            if (m != 0) {
-                Mutex.Lock(m);
-                if (this.readersWaiting > 0) { this.readersWaiting = this.readersWaiting - 1; }
-                Mutex.Unlock(m);
+            bool ok = false;
+            try {
+                ok = rg != null && await rg.Wait();
+            } finally {
+                lock (this) {
+                    if (this.readersWaiting > 0) {
+                        this.readersWaiting = this.readersWaiting - 1;
+                    }
+                }
             }
-            if (!ok) { return; }
+            if (!ok) {
+                throw new ObjectDisposedException("AsyncRwLock");
+            }
         }
     }
 
     // 释放共享访问。
     public void ExitRead() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return;
+        AsyncGate wg = null;
+        lock (this) {
+            if (this.closed) {
+                return;
+            }
+            if (this.readers > 0) {
+                this.readers = this.readers - 1;
+                if (this.readers == 0 && this.writersWaiting > 0) {
+                    wg = this.writeGate;
+                }
+            }
         }
-        Mutex.Lock(m);
-        bool wakeWriter = false;
-        if (this.readers > 0) {
-            this.readers = this.readers - 1;
-            wakeWriter = (this.readers == 0 && this.writersWaiting > 0);
-        }
-        AsyncGate wg = this.writeGate;
-        Mutex.Unlock(m);
-        if (wakeWriter && wg != null) {
+        if (wg != null) {
             wg.Signal();
         }
     }
@@ -80,50 +95,66 @@ public class AsyncRwLock : IDisposable {
     // 获取排他（写）访问；挂起直到所有读线程
     // 以及当前写线程都释放。
     public async void EnterWrite() {
-        nint m = this.mtx;
-        if (m == 0) { return; }
-        Mutex.Lock(m);
-        this.writersWaiting = this.writersWaiting + 1;
-        Mutex.Unlock(m);
-
-        while (true) {
-            m = this.mtx;
-            if (m == 0) { return; }
-            Mutex.Lock(m);
-            if (!this.writer && this.readers == 0) {
-                this.writersWaiting = this.writersWaiting - 1;
-                this.writer = true;
-                Mutex.Unlock(m);
-                return;
+        lock (this) {
+            if (this.closed) {
+                throw new ObjectDisposedException("AsyncRwLock");
             }
-            AsyncGate wg = this.writeGate;
-            Mutex.Unlock(m);
-            bool ok = wg != null && await wg.Wait();
-            if (!ok) {
-                m = this.mtx;
-                if (m != 0) {
-                    Mutex.Lock(m);
-                    if (this.writersWaiting > 0) { this.writersWaiting = this.writersWaiting - 1; }
-                    Mutex.Unlock(m);
+            this.writersWaiting = this.writersWaiting + 1;
+        }
+        bool acquired = false;
+        try {
+            while (true) {
+                AsyncGate wg = null;
+                lock (this) {
+                    if (this.closed) {
+                        throw new ObjectDisposedException("AsyncRwLock");
+                    }
+                    if (!this.writer && this.readers == 0) {
+                        this.writersWaiting = this.writersWaiting - 1;
+                        this.writer = true;
+                        acquired = true;
+                        return;
+                    }
+                    wg = this.writeGate;
                 }
-                return;
+                bool ok = wg != null && await wg.Wait();
+                if (!ok) {
+                    throw new ObjectDisposedException("AsyncRwLock");
+                }
+            }
+        } finally {
+            if (!acquired) {
+                AsyncGate rg = null;
+                lock (this) {
+                    if (this.writersWaiting > 0) {
+                        this.writersWaiting = this.writersWaiting - 1;
+                    }
+                    if (!this.closed && !this.writer && this.writersWaiting == 0 && this.readersWaiting > 0) {
+                        rg = this.readGate;
+                    }
+                }
+                if (rg != null) {
+                    rg.SignalAll();
+                }
             }
         }
     }
 
     // 释放排他访问：写者优先，有排队写者时仅唤醒写者；否则一次性 SignalAll 放行全部等待读者。
     public void ExitWrite() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return;
+        AsyncGate wg = null;
+        AsyncGate rg = null;
+        lock (this) {
+            if (this.closed) {
+                return;
+            }
+            this.writer = false;
+            if (this.writersWaiting > 0) {
+                wg = this.writeGate;
+            } else if (this.readersWaiting > 0) {
+                rg = this.readGate;
+            }
         }
-        Mutex.Lock(m);
-        this.writer = false;
-        bool hasWriters = this.writersWaiting > 0;
-        bool hasReaders = this.readersWaiting > 0;
-        AsyncGate wg = hasWriters ? this.writeGate : null;
-        AsyncGate rg = (!hasWriters && hasReaders) ? this.readGate : null;
-        Mutex.Unlock(m);
         if (wg != null) {
             wg.Signal();
         } else if (rg != null) {
@@ -133,42 +164,43 @@ public class AsyncRwLock : IDisposable {
 
     // 当前读线程数（诊断用）。
     public int ReaderCount() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return 0;
+        lock (this) {
+            if (this.closed) {
+                return 0;
+            }
+            return this.readers;
         }
-        Mutex.Lock(m);
-        int r = this.readers;
-        Mutex.Unlock(m);
-        return r;
     }
 
     // 当前是否有写线程持有锁（诊断用）。
     public bool IsWriteLocked() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return false;
+        lock (this) {
+            if (this.closed) {
+                return false;
+            }
+            return this.writer;
         }
-        Mutex.Lock(m);
-        bool w = this.writer;
-        Mutex.Unlock(m);
-        return w;
     }
 
     // 释放读/写两个门的底层句柄及互斥锁（锁废弃时调用）。
     public void Close() {
-        if (this.readGate != null) {
-            this.readGate.Close();
+        AsyncGate rg = null;
+        AsyncGate wg = null;
+        lock (this) {
+            if (this.closed) {
+                return;
+            }
+            this.closed = true;
+            rg = this.readGate;
             this.readGate = null;
-        }
-        if (this.writeGate != null) {
-            this.writeGate.Close();
+            wg = this.writeGate;
             this.writeGate = null;
         }
-        if (this.mtx != 0) {
-            nint m = this.mtx;
-            this.mtx = 0;
-            Mutex.Destroy(m);
+        if (rg != null) {
+            rg.Close();
+        }
+        if (wg != null) {
+            wg.Close();
         }
     }
 

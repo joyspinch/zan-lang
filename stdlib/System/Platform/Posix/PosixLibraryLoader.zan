@@ -17,10 +17,13 @@ public class PosixLibraryLoader : IPlatformLibraryLoader {
     [DllImport("crt", EntryPoint = "dlerror")]
     private static extern string PosixDlerror();
 
-    #if LINUX
+    #if ANDROID
+    [DllImport("crt", EntryPoint = "__errno")]
+    private static extern nint PosixErrnoLocation();
+    #elif LINUX
     [DllImport("crt", EntryPoint = "__errno_location")]
     private static extern nint PosixErrnoLocation();
-    #elif MACOS
+    #elif MACOS || IOS
     [DllImport("crt", EntryPoint = "__error")]
     private static extern nint PosixErrnoLocation();
     #else
@@ -39,31 +42,36 @@ public class PosixLibraryLoader : IPlatformLibraryLoader {
     }
 
     public nint LoadLibrary(string name) {
-        nint m = PosixLibraryLoader.PosixDlopen(name, PosixLibraryLoader.RtldNowLocal());
-        if (m == 0) {
-            string err = PosixLibraryLoader.PosixDlerror();
-            if (err == null || err.Length == 0) { err = "dlopen failed"; }
-            this.lastError = err;
-        } else {
-            this.lastError = "";
+        lock (this) {
+            nint m = PosixLibraryLoader.PosixDlopen(name, PosixLibraryLoader.RtldNowLocal());
+            if (m == 0) {
+                string err = PosixLibraryLoader.PosixDlerror();
+                if (err == null || err.Length == 0) { err = "dlopen failed"; }
+                this.lastError = err;
+            } else {
+                this.lastError = "";
+            }
+            return m;
         }
-        return m;
     }
 
     public nint GetSymbol(nint handle, string name) {
         if (handle == 0 || name == null) { return 0; }
-        nint sym = PosixLibraryLoader.PosixDlsym(handle, name);
-        if (sym == 0) {
-            string err = PosixLibraryLoader.PosixDlerror();
-            if (err != null && err.Length > 0) {
-                this.lastError = err;
+        lock (this) {
+            PosixLibraryLoader.PosixDlerror();
+            nint sym = PosixLibraryLoader.PosixDlsym(handle, name);
+            if (sym == 0) {
+                string err = PosixLibraryLoader.PosixDlerror();
+                if (err != null && err.Length > 0) {
+                    this.lastError = err;
+                } else {
+                    this.lastError = "symbol not found: " + name;
+                }
             } else {
-                this.lastError = "symbol not found: " + name;
+                this.lastError = "";
             }
-        } else {
-            this.lastError = "";
+            return sym;
         }
-        return sym;
     }
 
     public bool FreeLibrary(nint handle) {
@@ -73,7 +81,9 @@ public class PosixLibraryLoader : IPlatformLibraryLoader {
     }
 
     public string GetLastError() {
-        return this.lastError;
+        lock (this) {
+            return this.lastError;
+        }
     }
 
     public int GetLastSystemError() {
@@ -100,7 +110,7 @@ public class PosixLibraryLoader : IPlatformLibraryLoader {
         if (!mapped.StartsWith("lib")) {
             mapped = "lib" + mapped;
         }
-        #if MACOS
+        #if MACOS || IOS
         if (!mapped.EndsWith(".dylib")) {
             mapped = mapped + ".dylib";
         }

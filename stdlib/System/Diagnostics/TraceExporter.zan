@@ -52,20 +52,23 @@ public class TraceExporter {
             tsMicro = act.startTimeTicks;
         }
         long durMicro = act.durationMs * 1000;
+        if (durMicro < 0) { durMicro = 0; }
 
         TraceEvent evt = new TraceEvent(act.operationName, "trace", "X", tsMicro, 1);
         evt.dur = durMicro;
-        evt.args.Add("traceId", act.traceId);
-        evt.args.Add("spanId", act.spanId);
-        if (act.parentSpanId != null && act.parentSpanId.Length > 0) {
-            evt.args.Add("parentSpanId", act.parentSpanId);
-        }
         if (act.tags != null) {
             foreach (string k in act.tags.Keys) {
                 evt.args.Add(k, act.tags[k]);
             }
         }
-        this.events.Add(evt);
+        evt.args.Add("traceId", act.traceId != null ? act.traceId : "");
+        evt.args.Add("spanId", act.spanId != null ? act.spanId : "");
+        if (act.parentSpanId != null && act.parentSpanId.Length > 0) {
+            evt.args.Add("parentSpanId", act.parentSpanId);
+        }
+        lock (this) {
+            this.events.Add(evt);
+        }
     }
 
     // 手动记录区间事件
@@ -80,51 +83,56 @@ public class TraceExporter {
             tsMicro = startTicks;
             durMicro = endTicks - startTicks;
         }
+        if (durMicro < 0) { durMicro = 0; }
 
         TraceEvent evt = new TraceEvent(name, category, "X", tsMicro, tid);
         evt.dur = durMicro;
-        this.events.Add(evt);
+        lock (this) {
+            this.events.Add(evt);
+        }
     }
 
     // 导出为 Perfetto / Speedscope / Chrome://tracing 兼容的标准 JSON 格式
     public string ToPerfettoJson() {
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"traceEvents\":[");
-        for (int i = 0; i < this.events.Count; i = i + 1) {
-            if (i > 0) { sb.Append(","); }
-            TraceEvent e = this.events[i];
-            sb.Append("{\"name\":\"");
-            Encoding.JsonEscapeTo(sb, e.name);
-            sb.Append("\",\"cat\":\"");
-            Encoding.JsonEscapeTo(sb, e.category);
-            sb.Append("\",\"ph\":\"");
-            Encoding.JsonEscapeTo(sb, e.phase);
-            sb.Append("\",\"ts\":");
-            sb.Append(Convert.ToString(e.ts));
-            if (e.phase == "X") {
-                sb.Append(",\"dur\":");
-                sb.Append(Convert.ToString(e.dur));
-            }
-            sb.Append(",\"pid\":");
-            sb.Append(Convert.ToString(e.pid));
-            sb.Append(",\"tid\":");
-            sb.Append(Convert.ToString(e.tid));
+        lock (this) {
+            for (int i = 0; i < this.events.Count; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                TraceEvent e = this.events[i];
+                sb.Append("{\"name\":\"");
+                Encoding.JsonEscapeTo(sb, e.name);
+                sb.Append("\",\"cat\":\"");
+                Encoding.JsonEscapeTo(sb, e.category);
+                sb.Append("\",\"ph\":\"");
+                Encoding.JsonEscapeTo(sb, e.phase);
+                sb.Append("\",\"ts\":");
+                sb.Append(Convert.ToString(e.ts));
+                if (e.phase == "X") {
+                    sb.Append(",\"dur\":");
+                    sb.Append(Convert.ToString(e.dur));
+                }
+                sb.Append(",\"pid\":");
+                sb.Append(Convert.ToString(e.pid));
+                sb.Append(",\"tid\":");
+                sb.Append(Convert.ToString(e.tid));
 
-            if (e.args.Count > 0) {
-                sb.Append(",\"args\":{");
-                int aIdx = 0;
-                foreach (string k in e.args.Keys) {
-                    if (aIdx > 0) { sb.Append(","); }
-                    sb.Append("\"");
-                    Encoding.JsonEscapeTo(sb, k);
-                    sb.Append("\":\"");
-                    Encoding.JsonEscapeTo(sb, e.args[k]);
-                    sb.Append("\"");
-                    aIdx = aIdx + 1;
+                if (e.args != null && e.args.Count > 0) {
+                    sb.Append(",\"args\":{");
+                    int aIdx = 0;
+                    foreach (string k in e.args.Keys) {
+                        if (aIdx > 0) { sb.Append(","); }
+                        sb.Append("\"");
+                        Encoding.JsonEscapeTo(sb, k);
+                        sb.Append("\":\"");
+                        Encoding.JsonEscapeTo(sb, e.args[k]);
+                        sb.Append("\"");
+                        aIdx = aIdx + 1;
+                    }
+                    sb.Append("}");
                 }
                 sb.Append("}");
             }
-            sb.Append("}");
         }
         sb.Append("],\"displayTimeUnit\":\"ms\"}");
         return sb.ToString();

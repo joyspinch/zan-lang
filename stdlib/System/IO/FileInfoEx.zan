@@ -42,18 +42,16 @@ public class FileInfoEx {
     // “”。
     public static string Version(string path) {
         #if WINDOWS
+        if (path == null || path.Length == 0) { return ""; }
         nint wpath = Wide.Of(path);
-        int size = 0;
-        try {
-            size = FileInfoEx.GetFileVersionInfoSizeW(wpath, 0);
-        } finally {
-            if (size <= 0) { Wide.Free(wpath); }
-        }
-        if (size <= 0) { return ""; }
-
-        nint data = NativeMemory.Alloc(size);
+        if (wpath == 0) { return ""; }
+        nint data = 0;
         string result = "";
         try {
+            int size = FileInfoEx.GetFileVersionInfoSizeW(wpath, 0);
+            if (size <= 0) { return ""; }
+            data = NativeMemory.Alloc(size);
+            if (data == 0) { return ""; }
             int ok = FileInfoEx.GetFileVersionInfoW(wpath, 0, size, data);
             Wide.Free(wpath);
             wpath = 0;
@@ -62,35 +60,40 @@ public class FileInfoEx {
                 nint lenCell = NativeMemory.Alloc(8);
                 nint block = Wide.Of("\\");
                 try {
-                    if (FileInfoEx.VerQueryValueW(data, block, root, lenCell) != 0) {
-                        nint fixedInfo = new Span<nint>(root, 1)[0];
-                        if (fixedInfo != 0) {
-                            // VS_FIXEDFILEINFO: dwSignature[0] dwStrucVersion[1]
-                            // dwFileVersionMS[2] dwFileVersionLS[3]
-                            // dwProductVersionMS[4] dwProductVersionLS[5]
-                            Span<int> ffi = new Span<int>(fixedInfo, 6);
-                            if (ffi[0] == 0xFEEF04BD) {
-                                int fileMs = ffi[2];
-                                int fileLs = ffi[3];
-                                int prodMs = ffi[4];
-                                int prodLs = ffi[5];
-                                // 优先使用非零的产品版本。
-                                int ms = prodMs;
-                                int ls = prodLs;
-                                if (ms == 0 && ls == 0) { ms = fileMs; ls = fileLs; }
-                                result = FileInfoEx.JoinVersion(ms, ls);
+                    if (root != 0 && lenCell != 0 && block != 0) {
+                        new Span<long>(root, 1)[0] = 0;
+                        new Span<long>(lenCell, 1)[0] = 0;
+                        if (FileInfoEx.VerQueryValueW(data, block, root, lenCell) != 0) {
+                            nint fixedInfo = new Span<nint>(root, 1)[0];
+                            int fixedLen = new Span<int>(lenCell, 1)[0];
+                            if (fixedInfo != 0 && fixedLen >= 24) {
+                                // VS_FIXEDFILEINFO: dwSignature[0] dwStrucVersion[1]
+                                // dwFileVersionMS[2] dwFileVersionLS[3]
+                                // dwProductVersionMS[4] dwProductVersionLS[5]
+                                Span<int> ffi = new Span<int>(fixedInfo, 6);
+                                if (ffi[0] == 0xFEEF04BD) {
+                                    int fileMs = ffi[2];
+                                    int fileLs = ffi[3];
+                                    int prodMs = ffi[4];
+                                    int prodLs = ffi[5];
+                                    // 优先使用非零的产品版本。
+                                    int ms = prodMs;
+                                    int ls = prodLs;
+                                    if (ms == 0 && ls == 0) { ms = fileMs; ls = fileLs; }
+                                    result = FileInfoEx.JoinVersion(ms, ls);
+                                }
                             }
                         }
                     }
                 } finally {
-                    Wide.Free(block);
-                    NativeMemory.Free(root);
-                    NativeMemory.Free(lenCell);
+                    if (block != 0) { Wide.Free(block); }
+                    if (root != 0) { NativeMemory.Free(root); }
+                    if (lenCell != 0) { NativeMemory.Free(lenCell); }
                 }
             }
         } finally {
             if (wpath != 0) { Wide.Free(wpath); }
-            NativeMemory.Free(data);
+            if (data != 0) { NativeMemory.Free(data); }
         }
         return result;
         #else
@@ -121,8 +124,14 @@ public class FileInfoEx {
     // 提取失败或平台非 Windows 时返回 0。
     public static nint Icon(string path) {
         #if WINDOWS
+        if (path == null || path.Length == 0) { return 0; }
         nint wpath = Wide.Of(path);
+        if (wpath == 0) { return 0; }
         nint sfi = NativeMemory.Alloc(1024);
+        if (sfi == 0) {
+            Wide.Free(wpath);
+            return 0;
+        }
         nint icon = 0;
         try {
             int flags = FileInfoEx.ShgfiIcon() | FileInfoEx.ShgfiSmallIcon()

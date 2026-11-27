@@ -17,6 +17,9 @@ public class ByteBuffer {
     }
 
     public static ByteBuffer Alloc(int initialCapacity) {
+        if (initialCapacity > 1073741824) {
+            throw new IOException("ByteBuffer: requested capacity exceeds 1GB limit: " + initialCapacity);
+        }
         ByteBuffer b = new ByteBuffer();
         int cap = initialCapacity < 16 ? 16 : initialCapacity;
         b.data = NativeMemory.Alloc(cap);
@@ -36,7 +39,11 @@ public class ByteBuffer {
     }
 
     public static ByteBuffer FromStr(string s) {
+        if (s == null || s.Length == 0) { return ByteBuffer.Alloc(16); }
         int n = s.Length;
+        if (n >= 1073741824) {
+            throw new IOException("ByteBuffer: string exceeds 1GB limit");
+        }
         ByteBuffer b = ByteBuffer.Alloc(n + 1);
         NativeMemory.PutString(b.data, 0, s, n);
         b.length = n;
@@ -88,10 +95,10 @@ public class ByteBuffer {
             throw new IOException("ByteBuffer: requested capacity exceeds 1GB limit: " + cap);
         }
         if (cap > this.capacity) {
-            int c = this.capacity * 2;
+            int c = this.capacity >= 536870912 ? 1073741824 : this.capacity * 2;
             if (c < 16) { c = 16; }
             while (c < cap) {
-                if (c > 1073741824 / 2) {
+                if (c >= 536870912) {
                     c = 1073741824;
                     break;
                 }
@@ -101,8 +108,10 @@ public class ByteBuffer {
             if (grown == 0) {
                 throw new IOException("ByteBuffer: out of memory growing to " + c + " bytes");
             }
-            NativeMemory.Copy(grown, this.data, this.length);
-            if (this.capacity > 0) { NativeMemory.Free(this.data); }
+            if (this.data != 0 && this.length > 0) {
+                NativeMemory.Copy(grown, this.data, this.length);
+            }
+            if (this.capacity > 0 && this.data != 0) { NativeMemory.Free(this.data); }
             this.data = grown;
             this.capacity = c;
         }
@@ -110,7 +119,10 @@ public class ByteBuffer {
     }
 
     public ByteBuffer SetLength(int n) {
-        if (n >= 0 && n <= this.capacity) { this.length = n; }
+        if (n >= 0 && n <= this.capacity) {
+            this.length = n;
+            if (this.rpos > n) { this.rpos = n; }
+        }
         return this;
     }
 
@@ -194,15 +206,15 @@ public class ByteBuffer {
     }
 
     public ByteBuffer WriteBytes(nint src, int count) {
-        if (count <= 0) { return this; }
+        if (src == 0 || count <= 0) { return this; }
         this.EnsureRoom(count);
-        NativeMemory.Copy(this.data + this.length, src, count);
+        NativeMemory.Copy(this.data + (nint)this.length, src, count);
         this.length = this.length + count;
         return this;
     }
 
     public ByteBuffer WriteRaw(string src, int count) {
-        if (count <= 0) { return this; }
+        if (src == null || count <= 0) { return this; }
         this.EnsureRoom(count);
         NativeMemory.PutString(this.data, this.length, src, count);
         this.length = this.length + count;
@@ -378,12 +390,13 @@ public class ByteBuffer {
         int start = 0;
         int clamped = 0;
         this.ClampRange(off, len, out start, out clamped);
-        int n = clamped < other.Length ? clamped : other.Length;
-        if (n > 0) {
-            int r = NativeMemory.Compare(this.data + start, other, n);
+        int oLen = other != null ? other.Length : 0;
+        int n = clamped < oLen ? clamped : oLen;
+        if (n > 0 && this.data != 0) {
+            int r = NativeMemory.Compare(this.data + (nint)start, other, n);
             if (r != 0) { return r < 0 ? -1 : 1; }
         }
-        return clamped - other.Length;
+        return clamped - oLen;
     }
 
     public nint ReadBytes(int count) {
@@ -400,20 +413,27 @@ public class ByteBuffer {
     }
 
     public string ReadString() {
-        int n = (int)this.ReadVarInt();
-        if (n < 0 || !this.CanRead(n)) {
+        int savedPos = this.rpos;
+        long rawN = this.ReadVarInt();
+        if (rawN < 0L || rawN > (long)this.Remaining()) {
+            this.rpos = savedPos;
             throw new InvalidOperationException("ByteBuffer: read past end");
         }
+        int n = (int)rawN;
         string s = NativeMemory.GetString(this.data, this.rpos, n);
         this.rpos = this.rpos + n;
         return s;
     }
 
     public long Crc32(int count) {
+        if (this.data == 0 || count <= 0) { return 0; }
+        if (count > this.length) { count = this.length; }
         return NativeMemory.Crc32(this.data, count) & 4294967295;
     }
 
     public long Crc32C(int count) {
+        if (this.data == 0 || count <= 0) { return 0; }
+        if (count > this.length) { count = this.length; }
         long hw = NativeMemory.Crc32CUpdate(4294967295, this.data, (long)count);
         if (hw >= 0) {
             return hw ^ 4294967295;

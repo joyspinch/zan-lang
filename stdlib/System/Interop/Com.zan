@@ -34,21 +34,26 @@ public delegate void CoTaskMemFreeFn(nint p);
 // 通过 ComVtbl 构建：将回调地址写入 vtable
 // （从 `(nint)handler` 获取），并把对象交还回去。
 public class Com {
-    // ole32 在运行时解析而非链接时解析：
-    // 从不接触 COM 的程序既不会加载也不依赖它。
+    // ole32 / kernel32 在运行时解析并缓存句柄，避免重复 LoadLibrary 累积 OS 引用计数。
     public static nint Ole() {
         if (Com.ole == 0) { Com.ole = Interop.Load("ole32.dll"); }
         return Com.ole;
     }
 
-    // 已解析的 ole32.dll 句柄（0 为未加载）。
+    public static nint Kernel32() {
+        if (Com.kernel32 == 0) { Com.kernel32 = Interop.Load("kernel32.dll"); }
+        return Com.kernel32;
+    }
+
+    // 已解析的 ole32.dll / kernel32.dll 句柄（0 为未加载）。
     public static nint ole;
+    public static nint kernel32;
     // 保存"本线程 COM 已初始化"的 TLS 槽号；-1 表示分配失败。
     public static int comTls = Com.AllocComTls();
 
     // 分配记录 COM 初始化状态的 TLS 槽；失败返回 -1。
     public static int AllocComTls() {
-        nint fn = Interop.Entry("kernel32.dll", "TlsAlloc");
+        nint fn = Interop.Symbol(Com.Kernel32(), "TlsAlloc");
         if (fn == 0) { return 0 - 1; }
         TlsAllocFn alloc = (TlsAllocFn)fn;
         return alloc();
@@ -61,7 +66,7 @@ public class Com {
     public static bool ComInitialized() {
         int tls = Com.ComTls();
         if (tls < 0) { return false; }
-        nint fn = Interop.Entry("kernel32.dll", "TlsGetValue");
+        nint fn = Interop.Symbol(Com.Kernel32(), "TlsGetValue");
         if (fn == 0) { return false; }
         TlsGetValueFn call = (TlsGetValueFn)fn;
         return call(tls) != 0;
@@ -71,7 +76,7 @@ public class Com {
     public static bool SetComInitialized(bool initialized) {
         int tls = Com.ComTls();
         if (tls < 0) { return false; }
-        nint fn = Interop.Entry("kernel32.dll", "TlsSetValue");
+        nint fn = Interop.Symbol(Com.Kernel32(), "TlsSetValue");
         if (fn == 0) { return false; }
         TlsSetValueFn call = (TlsSetValueFn)fn;
         return call(tls, initialized ? (nint)1 : (nint)0) != 0;
@@ -148,6 +153,9 @@ public class Com {
     // 16 字节 GUID（前三个字段为小端，符合 COM 预期）。文本格式
     // 不匹配（长度/连字符位置/十六进制字符）时抛 ArgumentException。
     public static nint Guid(string text) {
+        if (text == null) {
+            throw new ArgumentNullException("text");
+        }
         if (text.Length != 36) {
             throw new ArgumentException(
                 "Com.Guid: expected 36-char GUID, got length "
@@ -173,6 +181,9 @@ public class Com {
             }
         }
         nint g = NativeMemory.Alloc(16);
+        if (g == 0) {
+            throw new Exception("Com.Guid: out of memory");
+        }
         new Span<int>(g, 1)[0] = Com.Hex(text, 0, 8);
         new Span<short>(g + 4, 1)[0] = Com.Hex(text, 9, 4);
         new Span<short>(g + 6, 1)[0] = Com.Hex(text, 14, 4);
@@ -297,13 +308,18 @@ public class Com {
     // 调用单个参数为 out 指针的槽位，返回
     // 被调用者存入的值（失败时返回 0）——所有 COM getter 的通用形式。
     public static nint Get(nint iface, int index) {
+        if (iface == 0) { return 0; }
         nint cell = NativeMemory.Alloc(8);
-        new Span<long>(cell, 1)[0] = 0;
-        int hr = Com.Call1(iface, index, cell);
-        nint v = new Span<long>(cell, 1)[0];
-        NativeMemory.Free(cell);
-        if (!Com.Ok(hr)) { return 0; }
-        return v;
+        if (cell == 0) { return 0; }
+        try {
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call1(iface, index, cell);
+            nint v = new Span<long>(cell, 1)[0];
+            if (!Com.Ok(hr)) { return 0; }
+            return v;
+        } finally {
+            NativeMemory.Free(cell);
+        }
     }
 
     // 返回 CoTaskMemAlloc 分配宽字符串的 getter，封送后释放。
@@ -313,27 +329,38 @@ public class Com {
 
     // 通过 out 指针返回 32 位值（BOOL、枚举、计数）的 getter。
     public static int GetInt(nint iface, int index) {
+        if (iface == 0) { return 0; }
         nint cell = NativeMemory.Alloc(8);
-        new Span<long>(cell, 1)[0] = 0;
-        int hr = Com.Call1(iface, index, cell);
-        int v = new Span<int>(cell, 1)[0];
-        NativeMemory.Free(cell);
-        if (!Com.Ok(hr)) { return 0; }
-        return v;
+        if (cell == 0) { return 0; }
+        try {
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call1(iface, index, cell);
+            int v = new Span<int>(cell, 1)[0];
+            if (!Com.Ok(hr)) { return 0; }
+            return v;
+        } finally {
+            NativeMemory.Free(cell);
+        }
     }
 
     // 以文本 IID 调用 QueryInterface；不支持时返回 0。
     public static nint Query(nint iface, string iid) {
         if (iface == 0) { return 0; }
-        nint g = Com.Guid(iid);
-        nint cell = NativeMemory.Alloc(8);
-        new Span<long>(cell, 1)[0] = 0;
-        int hr = Com.Call2(iface, Com.SlotQueryInterface(), g, cell);
-        nint v = new Span<long>(cell, 1)[0];
-        NativeMemory.Free(cell);
-        NativeMemory.Free(g);
-        if (!Com.Ok(hr)) { return 0; }
-        return v;
+        nint g = 0;
+        nint cell = 0;
+        try {
+            g = Com.Guid(iid);
+            cell = NativeMemory.Alloc(8);
+            if (cell == 0) { return 0; }
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(iface, Com.SlotQueryInterface(), g, cell);
+            nint v = new Span<long>(cell, 1)[0];
+            if (!Com.Ok(hr)) { return 0; }
+            return v;
+        } finally {
+            if (cell != 0) { NativeMemory.Free(cell); }
+            if (g != 0) { NativeMemory.Free(g); }
+        }
     }
 
     // 对借用的接口指针（即回调收到的）
@@ -357,8 +384,11 @@ public class Com {
 
     // 读取 CoTaskMemAlloc 分配的宽字符串出参并释放。
     public static string TakeString(nint p) {
-        string s = Wide.Read(p);
-        Com.Free(p);
-        return s;
+        if (p == 0) { return ""; }
+        try {
+            return Wide.Read(p);
+        } finally {
+            Com.Free(p);
+        }
     }
 }
