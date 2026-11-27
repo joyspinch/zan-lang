@@ -1,0 +1,352 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Numerics;
+using System.Data.ZanDb;
+using System.Barcode;
+using Ai.Tensor;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string name, bool cond) {
+        if (!cond) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static void TestUnicodeCase() {
+        Check("ucase.ascii_upper", UnicodeCase.ToUpper("hello world 123!") == "HELLO WORLD 123!");
+        Check("ucase.ascii_lower", UnicodeCase.ToLower("HELLO WORLD 123!") == "hello world 123!");
+        Check("ucase.ascii_fold", UnicodeCase.CaseFold("AbCdEf09") == "abcdef09");
+        Check("ucase.cjk_passthrough", UnicodeCase.CaseFold("中文测试AbC한글") == "中文测试abc한글");
+        Check("ucase.cjk_upper", UnicodeCase.ToUpper("中文abc한글") == "中文ABC한글");
+        Check("ucase.1to1_latin", UnicodeCase.ToLower("ÄÖÜÉ") == "äöüé");
+        Check("ucase.1to1_upper", UnicodeCase.ToUpper("äöüé") == "ÄÖÜÉ");
+        Check("ucase.1toN_eszett", UnicodeCase.CaseFold("Straße") == "strasse");
+        Check("ucase.eq_1toN_l", UnicodeCase.Equals("Straße", "STRASSE", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_1toN_r", UnicodeCase.Equals("STRASSE", "straße", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_1toN_both", UnicodeCase.Equals("straße", "STRASSE", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_ligature", UnicodeCase.Equals("\uFB01le", "FILE", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_mismatch_len", !UnicodeCase.Equals("Straße", "STRAS", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_mismatch_char", !UnicodeCase.Equals("Straße", "STRASXE", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_empty", UnicodeCase.Equals("", "", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_null_empty", !UnicodeCase.Equals(null, "", StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_null_null", UnicodeCase.Equals(null, null, StringComparison.OrdinalIgnoreCase));
+        Check("ucase.eq_cjk", UnicodeCase.Equals("你好ABC世界", "你好abc世界", StringComparison.OrdinalIgnoreCase));
+        // Normalized equality: NFC é (U+00E9) vs NFD e + combining acute (U+0065 U+0301)
+        Check("ucase.eq_norm_same", UnicodeCase.EqualsNormalized("café", "CAFÉ", true));
+        Check("ucase.eq_norm_nfc_nfd", UnicodeCase.EqualsNormalized("cafe\u0301", "CAF\u00C9", true));
+        Check("ucase.eq_norm_diff", !UnicodeCase.EqualsNormalized("café", "cafe", true));
+    }
+
+    static void TestUnicodeNorm() {
+        string longAscii = "TheQuickBrownFoxJumpsOverTheLazyDog_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        Check("unorm.ascii_nfc", UnicodeNormalization.Normalize(longAscii, NormalizationForm.FormC) == longAscii);
+        Check("unorm.ascii_nfd", UnicodeNormalization.Normalize(longAscii, NormalizationForm.FormD) == longAscii);
+        Check("unorm.is_nfc_ascii", UnicodeNormalization.IsNormalized(longAscii, NormalizationForm.FormC));
+        Check("unorm.is_nfd_ascii", UnicodeNormalization.IsNormalized(longAscii, NormalizationForm.FormD));
+        // NFD -> NFC compose
+        string nfd = "e\u0301";
+        string nfc = "\u00E9";
+        Check("unorm.nfd_to_nfc", UnicodeNormalization.Normalize(nfd, NormalizationForm.FormC) == nfc);
+        Check("unorm.nfc_to_nfd", UnicodeNormalization.Normalize(nfc, NormalizationForm.FormD) == nfd);
+        // Canonical ordering with 2 and 3+ combining marks of different CCC:
+        // U+031B (CCC=216), U+0323 (CCC=220), U+0300 (CCC=230), U+0315 (CCC=232)
+        string unsorted3 = "a\u0315\u0300\u0323\u031B";
+        string sorted3 = "a\u031B\u0323\u0300\u0315";
+        Check("unorm.ccc_sort_4", UnicodeNormalization.Normalize(unsorted3, NormalizationForm.FormD) == sorted3);
+        string unsorted2 = "o\u0301\u0323";
+        string sorted2 = "o\u0323\u0301";
+        Check("unorm.ccc_sort_2", UnicodeNormalization.Normalize(unsorted2, NormalizationForm.FormD) == sorted2);
+        // Hangul compose/decompose roundtrip
+        string hangul = "한글테스트";
+        string hNfd = UnicodeNormalization.Normalize(hangul, NormalizationForm.FormD);
+        Check("unorm.hangul_rt", UnicodeNormalization.Normalize(hNfd, NormalizationForm.FormC) == hangul);
+    }
+
+    static void TestConvert() {
+        // Test all lengths including padding boundaries 0..17, 100 and sentinel byte NUL safety
+        int[] lens = new int[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 100 };
+        for (int li = 0; li < lens.Length; li = li + 1) {
+            int n = lens[li];
+            byte[] src = new byte[n + 4];
+            for (int i = 0; i < n; i = i + 1) { src[i + 2] = (byte)((i * 53 + 17) & 255); }
+            int encCap = ((n + 2) / 3) * 4;
+            byte[] b64 = new byte[encCap + 4];
+            b64[0] = (byte)0xAA;
+            b64[1] = (byte)0xBB;
+            b64[encCap + 2] = (byte)0xCC; // sentinel right after encoded slice!
+            b64[encCap + 3] = (byte)0xDD;
+            int elen = Convert.ToBase64Chars(src, 2, n, b64, 2);
+            Check("conv.b64_elen_" + n, elen == encCap);
+            Check("conv.b64_guard_pre_" + n, (b64[0] & 255) == 0xAA && (b64[1] & 255) == 0xBB);
+            Check("conv.b64_guard_post_" + n, (b64[encCap + 2] & 255) == 0xCC && (b64[encCap + 3] & 255) == 0xDD);
+
+            byte[] dec = new byte[n + 4];
+            dec[0] = (byte)0x55;
+            dec[n + 1] = (byte)0x66;
+            int dlen = Convert.FromBase64Chars(b64, 2, elen, dec, 1);
+            Check("conv.b64_dlen_" + n, dlen == n);
+            Check("conv.b64_dguard_" + n, (dec[0] & 255) == 0x55 && (dec[n + 1] & 255) == 0x66);
+            bool eq = true;
+            for (int i = 0; i < n; i = i + 1) {
+                if (dec[i + 1] != src[i + 2]) { eq = false; break; }
+            }
+            Check("conv.b64_rt_" + n, eq);
+
+            // Hex encode/decode roundtrip (lengths covering 8-byte SIMD/LUT + scalar tail)
+            string hx = Convert.ToHexString(src, 2, n);
+            Check("conv.hex_len_" + n, hx.Length == n * 2);
+            byte[] hb = Convert.FromHexString(hx);
+            Check("conv.hex_dlen_" + n, hb.Length == n);
+            bool heq = true;
+            for (int i = 0; i < n; i = i + 1) {
+                if (hb[i] != src[i + 2]) { heq = false; break; }
+            }
+            Check("conv.hex_rt_" + n, heq);
+        }
+        // Mixed case hex decode
+        byte[] mix = Convert.FromHexString("0a1B2c3D4e5F60798899aAbBcCdDeEfF");
+        Check("conv.hex_mixed", mix.Length == 16 && (mix[0] & 255) == 0x0A && (mix[1] & 255) == 0x1B && (mix[15] & 255) == 0xFF);
+        // Invalid base64 char returns -1
+        byte[] badB64 = new byte[] { (byte)65, (byte)66, (byte)63, (byte)68 }; // "AB?D"
+        byte[] tmpOut = new byte[8];
+        Check("conv.b64_invalid", Convert.FromBase64Chars(badB64, 0, 4, tmpOut, 0) == -1);
+        // Invalid hex char throws with exact index
+        bool threw = false;
+        try {
+            Convert.FromHexString("0123456789abGZ");
+        } catch (ArgumentException ex) {
+            threw = ex.Message.Contains("12");
+        }
+        Check("conv.hex_invalid_idx", threw);
+    }
+
+    static void TestPath() {
+        Check("path.clean_empty", Path.Clean("") == "");
+        Check("path.clean_dot", Path.Clean(".") == "");
+        Check("path.clean_norm", Path.Clean("a/b/../c/./d") == "a/c/d");
+        Check("path.clean_leading_slash", Path.Clean("/a//b/./c") == "a/b/c");
+        Check("path.clean_up", Path.Clean("../../a/b/..") == "../../a");
+        Check("path.clean_backslash", Path.Clean("a\\b\\..\\c") == "a\\c");
+        Check("path.rel_same", Path.GetRelativePath("a/b/c", "a/b/c") == ".");
+        Check("path.rel_child", Path.GetRelativePath("a/b", "a/b/c/d.zan") == "c/d.zan");
+        Check("path.rel_sibling", Path.GetRelativePath("a/b/x", "a/b/y/z.zan") == "../y/z.zan");
+        Check("path.rel_parent", Path.GetRelativePath("a/b/c", "a") == "../..");
+        Check("path.under_true", Path.IsUnder("src/sys", "src/sys/io/Path.zan"));
+        Check("path.under_same", Path.IsUnder("src/sys", "src/sys"));
+        Check("path.under_prefix_collision", !Path.IsUnder("src/sys", "src/system/Path.zan"));
+        Check("path.under_other", !Path.IsUnder("src/sys", Path.Clean("src/sys/../other/x.zan")));
+        Check("path.match_globstar", Path.IsMatch("src/**/System/**/*.zan", "src/pkg/System/IO/Path.zan"));
+        Check("path.match_globstar_zero", Path.IsMatch("src/**/Path.zan", "src/Path.zan"));
+        Check("path.match_wild", Path.IsMatch("a/?.zan", "a/x.zan") && !Path.IsMatch("a/?.zan", "a/xy.zan"));
+        Check("path.match_star", Path.IsMatch("*.zan", "foo.zan") && !Path.IsMatch("*.zan", "a/foo.zan"));
+        Check("path.match_tail_globstar", Path.IsMatch("src/**", "src/a/b/c"));
+    }
+
+    static void TestStreamRW() {
+        // 1. Multi-chunk (>8192 bytes) mixed line endings including CRLF split right on 8192 boundary
+        MemoryStream ms = new MemoryStream();
+        StreamWriter w = StreamWriter.Wrap(ms);
+        // Write 8191 'A's + '\r' (at byte 8191) + '\n' (at byte 8192!)
+        StringBuilder sb = new StringBuilder(8192);
+        for (int i = 0; i < 8191; i = i + 1) { sb.Append("A"); }
+        w.Write(sb.ToString());
+        w.Write("\r\n");
+        w.Write("second_line\r\nthird\r_line\n\nlast_no_nl");
+        w.Flush();
+
+        ms.SeekTo(0);
+        StreamReader r = StreamReader.Wrap(ms);
+        string l1 = r.ReadLine();
+        string l2 = r.ReadLine();
+        string l3 = r.ReadLine();
+        string l4 = r.ReadLine();
+        string l5 = r.ReadLine();
+        string l6 = r.ReadLine();
+        Check("stream.split_crlf_l1", l1 != null && l1.Length == 8191 && l1[0] == 65 && l1[8190] == 65);
+        Check("stream.crlf_l2", l2 == "second_line");
+        Check("stream.strip_inline_cr_l3", l3 == "third_line");
+        Check("stream.empty_l4", l4 == "");
+        Check("stream.eof_no_nl_l5", l5 == "last_no_nl");
+        Check("stream.eof_l6", l6 == null);
+
+        // 2. ReadChar reads single bytes (ASCII via pooled strings, non-ASCII raw byte)
+        MemoryStream ms2 = new MemoryStream();
+        StreamWriter w2 = StreamWriter.Wrap(ms2);
+        w2.Write("A中!");
+        w2.Flush();
+        ms2.SeekTo(0);
+        StreamReader r2 = StreamReader.Wrap(ms2);
+        Check("stream.rc0", r2.ReadChar() == "A");
+        string m1 = r2.ReadChar();
+        string m2 = r2.ReadChar();
+        string m3 = r2.ReadChar();
+        Check("stream.rc_utf8", (m1 + m2 + m3) == "中");
+        Check("stream.rc2", r2.ReadChar() == "!");
+        Check("stream.rc_eof", r2.ReadChar() == "");
+    }
+
+    static void TestNumerics() {
+        Noise n1 = new Noise(12345);
+        Noise n2 = new Noise(12345);
+        Check("num.noise_det_v2", Math.Abs(n1.Value2D(1.3, 2.7) - n2.Value2D(1.3, 2.7)) < 1e-12);
+        Check("num.noise_det_v3", Math.Abs(n1.Value3D(1.3, 2.7, -0.4) - n2.Value3D(1.3, 2.7, -0.4)) < 1e-12);
+        Check("num.noise_det_p2", Math.Abs(n1.Perlin2D(3.1, -1.7) - n2.Perlin2D(3.1, -1.7)) < 1e-12);
+        Check("num.noise_det_p3", Math.Abs(n1.Perlin3D(3.1, -1.7, 0.9) - n2.Perlin3D(3.1, -1.7, 0.9)) < 1e-12);
+        double v2 = n1.Value2D(4.2, 5.8);
+        double v3 = n1.Value3D(4.2, 5.8, 6.1);
+        Check("num.noise_range", v2 >= -1.0 && v2 <= 1.0 && v3 >= -1.0 && v3 <= 1.0);
+
+        Spline sp = new Spline();
+        sp.Add(new Vector3(0.0f, 0.0f, 0.0f));
+        sp.Add(new Vector3(1.0f, 2.0f, 0.0f));
+        sp.Add(new Vector3(2.0f, 0.0f, 1.0f));
+        sp.Add(new Vector3(3.0f, 3.0f, 2.0f));
+        sp.Add(new Vector3(4.0f, 1.0f, 0.5f));
+        Vector3 b0 = sp.EvaluateBezier(0.0f);
+        Vector3 b1 = sp.EvaluateBezier(1.0f);
+        Vector3 bmL = sp.EvaluateBezier(0.4999f);
+        Vector3 bmR = sp.EvaluateBezier(0.5001f);
+        Check("num.bezier_ends", Math.Abs((double)b0.X) < 1e-5 && Math.Abs((double)b1.X - 4.0) < 1e-5);
+        Check("num.bezier_mid_cont", Vector3.Distance(bmL, bmR) < 0.01f);
+        List<Vector3> rs0 = sp.Resample(0);
+        List<Vector3> rs1 = sp.Resample(1);
+        List<Vector3> rs16 = sp.Resample(16);
+        Check("num.resample_counts", rs0.Count == 0 && rs1.Count == 1 && rs16.Count == 16);
+        Check("num.resample_ends", Vector3.Distance(rs16[0], sp.Evaluate(0.0f)) < 1e-4f
+            && Vector3.Distance(rs16[15], sp.Evaluate(1.0f)) < 1e-4f);
+    }
+
+    static void TestTensor() {
+        // Non-multiple-of-4/8 dimensions: A[7, 13] * B[13, 9]
+        int m = 7; int k = 13; int n = 9;
+        float[] ad = new float[m * k];
+        float[] bd = new float[k * n];
+        float[] bt = new float[n * k];
+        float[] vd = new float[k];
+        for (int i = 0; i < m * k; i = i + 1) { ad[i] = (float)((i * 7 % 19) - 9) * 0.25f; }
+        for (int r = 0; r < k; r = r + 1) {
+            for (int c = 0; c < n; c = c + 1) {
+                float val = (float)(((r * 11 + c * 5) % 23) - 11) * 0.25f;
+                bd[r * n + c] = val;
+                bt[c * k + r] = val;
+            }
+            vd[r] = (float)((r * 3 % 11) - 5) * 0.5f;
+        }
+        List<int> sA = new List<int>(); sA.Add(m); sA.Add(k);
+        List<int> sB = new List<int>(); sB.Add(k); sB.Add(n);
+        List<int> sBT = new List<int>(); sBT.Add(n); sBT.Add(k);
+        List<int> sV = new List<int>(); sV.Add(k);
+        Tensor A = new Tensor(sA, ad);
+        Tensor B = new Tensor(sB, bd);
+        Tensor BT = new Tensor(sBT, bt);
+        Tensor V = new Tensor(sV, vd);
+
+        Tensor C1 = TensorMath.MatMulCpu(A, B);
+        Tensor C2 = TensorMath.MatMulRightTransposed(A, BT);
+        bool mmOk = true;
+        for (int r = 0; r < m; r = r + 1) {
+            for (int c = 0; c < n; c = c + 1) {
+                float expected = 0.0f;
+                for (int p = 0; p < k; p = p + 1) { expected = expected + ad[r * k + p] * bd[p * n + c]; }
+                if (Math.Abs((double)(C1.data[r * n + c] - expected)) > 1e-4) { mmOk = false; }
+                if (Math.Abs((double)(C2.data[r * n + c] - expected)) > 1e-4) { mmOk = false; }
+            }
+        }
+        Check("tensor.matmul_odd_dims", mmOk);
+
+        Tensor mv = TensorMath.MatVec(A, V);
+        bool mvOk = true;
+        for (int r = 0; r < m; r = r + 1) {
+            float exp = 0.0f;
+            for (int p = 0; p < k; p = p + 1) { exp = exp + ad[r * k + p] * vd[p]; }
+            if (Math.Abs((double)(mv.data[r] - exp)) > 1e-4) { mvOk = false; }
+        }
+        Check("tensor.matvec", mvOk);
+
+        Tensor sum = TensorMath.Add(A, A);
+        Tensor sc = TensorMath.Scale(A, 2.0f);
+        Tensor sub = TensorMath.Sub(sum, sc);
+        float maxDiff = 0.0f;
+        for (int i = 0; i < sub.data.Length; i = i + 1) {
+            float d = sub.data[i] < 0.0f ? -sub.data[i] : sub.data[i];
+            if (d > maxDiff) { maxDiff = d; }
+        }
+        Check("tensor.elemwise", maxDiff < 1e-5f);
+        float dp = TensorMath.Dot(A, A);
+        float expDp = 0.0f;
+        for (int i = 0; i < ad.Length; i = i + 1) { expDp = expDp + ad[i] * ad[i]; }
+        Check("tensor.dot", Math.Abs((double)(dp - expDp)) < 1e-3);
+    }
+
+    static void TestSegmentAndQr() {
+        // SegmentFile: sorted block with normal keys, tombstone, >128B multi-byte VarInt value, empty value
+        ByteBuffer blk = ByteBuffer.Alloc(4096);
+        StringBuilder bigVal = new StringBuilder(200);
+        for (int i = 0; i < 200; i = i + 1) { bigVal.Append("Z"); }
+        string vBig = bigVal.ToString();
+        // Record 0: "k_001" -> "val1"
+        blk.WriteU8(1); blk.WriteVarInt(5); blk.WriteRaw("k_001", 5); blk.WriteVarInt(4); blk.WriteRaw("val1", 4);
+        // Record 1: "k_002" -> tombstone (op=2)
+        blk.WriteU8(2); blk.WriteVarInt(5); blk.WriteRaw("k_002", 5);
+        // Record 2: "k_003" -> "" (empty value)
+        blk.WriteU8(1); blk.WriteVarInt(5); blk.WriteRaw("k_003", 5); blk.WriteVarInt(0);
+        // Record 3: "k_005" -> 200-byte value (2-byte VarInt!)
+        blk.WriteU8(1); blk.WriteVarInt(5); blk.WriteRaw("k_005", 5); blk.WriteVarInt(200); blk.WriteRaw(vBig, 200);
+
+        string ov;
+        blk.SeekRead(0); Check("seg.hit_first", SegmentFile.ScanBlock(blk, "k_001", out ov) == 1 && ov == "val1");
+        blk.SeekRead(0); Check("seg.tombstone", SegmentFile.ScanBlock(blk, "k_002", out ov) == 2);
+        blk.SeekRead(0); Check("seg.empty_val", SegmentFile.ScanBlock(blk, "k_003", out ov) == 1 && ov == "");
+        blk.SeekRead(0); Check("seg.miss_between", SegmentFile.ScanBlock(blk, "k_004", out ov) == 0);
+        blk.SeekRead(0); Check("seg.hit_bigvarint", SegmentFile.ScanBlock(blk, "k_005", out ov) == 1 && ov == vBig);
+        blk.SeekRead(0); Check("seg.miss_before", SegmentFile.ScanBlock(blk, "k_000", out ov) == 0);
+        blk.SeekRead(0); Check("seg.miss_after", SegmentFile.ScanBlock(blk, "k_999", out ov) == 0);
+        blk.Free();
+
+        // QrEncoder: numeric, alnum, UTF-8, mixed short-run, and Version >= 7 + round-trip scan!
+        string[] qrInputs = new string[] {
+            "01234567890123456789",
+            "HELLO WORLD $%*+-./: 2026",
+            "中文测试 UTF-8 QR 编码 2026!",
+            "https://zan-lang.org/docs/wave24?id=123456789012&tag=ABCDEFGH123456&x=99&msg=ok&long="
+                + "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"
+        };
+        QrEcl[] ecls = new QrEcl[] { QrEcl.L, QrEcl.M, QrEcl.Q, QrEcl.H };
+        for (int i = 0; i < qrInputs.Length; i = i + 1) {
+            QrMatrix mx = QrEncoder.Encode(qrInputs[i], ecls[i]);
+            int[] argb = QrRenderer.ToArgb(mx, 4, 4, 0xFF000000, 0xFFFFFFFF);
+            int side = (mx.size + 8) * 4;
+            BarcodeImage img = BarcodeImage.FromArgb(side, side, argb);
+            BarcodeResult res = BarcodeScanner.Scan(img);
+            Check("qr.rt_" + i, res.text == qrInputs[i]);
+        }
+        // Verify Version >= 7 (multi-block + version info bits)
+        QrMatrix mx7 = QrEncoder.Encode(qrInputs[3], QrEcl.H);
+        Check("qr.ver_ge_7", mx7.version >= 7);
+        int[] argb7 = QrRenderer.ToArgb(mx7, 4, 4, 0xFF000000, 0xFFFFFFFF);
+        int side7 = (mx7.size + 8) * 4;
+        BarcodeResult res7 = BarcodeScanner.Scan(BarcodeImage.FromArgb(side7, side7, argb7));
+        Check("qr.ver7_rt", res7.text == qrInputs[3]);
+    }
+
+    static void Main() {
+        TestUnicodeCase();
+        TestUnicodeNorm();
+        TestConvert();
+        TestPath();
+        TestStreamRW();
+        TestNumerics();
+        TestTensor();
+        TestSegmentAndQr();
+        if (failures == 0) {
+            Console.WriteLine("WAVE24_CORE_OK");
+        } else {
+            Console.WriteLine("WAVE24_FAILURES=" + failures);
+        }
+    }
+}

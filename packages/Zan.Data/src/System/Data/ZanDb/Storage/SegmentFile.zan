@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Interop;
 namespace System.Data.ZanDb;
 
 public delegate bool SegVisit(string key, string val, int op);
@@ -256,9 +257,8 @@ public class SegmentFile {
         return true;
     }
 
-    // 裸解析块内下一条记录：不物化任何字符串，只输出
-    // 键/值在块内的绝对偏移与长度（读游标推进到记录尾）。
-    // 块耗尽或腐坏返回 false。
+    // 裸解析块内下一条记录：不物化任何字符串，直接基于 ByteBuffer 底层指针 + 1 字节 VarInt 快路径，
+    // 消除 CanRead/ReadU8/ReadVarInt 逐条跨函数抛异常 invoke 开销。
     public static bool NextRecordRaw(ByteBuffer b, out int keyOff, out int keyLen,
                               out int valOff, out int valLen, out int op) {
         keyOff = 0;
@@ -266,42 +266,153 @@ public class SegmentFile {
         valOff = 0;
         valLen = 0;
         op = 0;
-        if (!b.CanRead(1)) { return false; }
-        op = b.ReadU8();
-        if (op != 1 && op != 2) { return false; }
-        if (!b.CanRead(1)) { return false; }
-        long klen = b.ReadVarInt();
-        if (klen < 0 || !b.CanRead((int)klen)) { return false; }
-        keyOff = b.ReadPos();
+        int pos = b.rpos;
+        int lim = b.length;
+        if (pos >= lim) { return false; }
+        Span<byte> sp = new Span<byte>(b.data, lim);
+        int rop = sp[pos] & 255;
+        pos = pos + 1;
+        b.rpos = pos;
+        op = rop;
+        if (rop != 1 && rop != 2) { return false; }
+        if (pos >= lim) { return false; }
+        int b0 = sp[pos] & 255;
+        pos = pos + 1;
+        long klen = (long)b0;
+        if (b0 >= 128) {
+            klen = (long)(b0 & 127);
+            int shift = 7;
+            while (true) {
+                if (pos >= lim || shift > 63) { b.rpos = pos; return false; }
+                int bx = sp[pos] & 255;
+                pos = pos + 1;
+                klen = klen + ((long)(bx & 127) << shift);
+                if (bx < 128) { break; }
+                shift = shift + 7;
+            }
+        }
+        b.rpos = pos;
+        if (klen < 0 || klen > (long)(lim - pos)) { return false; }
+        keyOff = pos;
         keyLen = (int)klen;
-        b.SeekRead(keyOff + keyLen);
-        if (op == 2) { return true; }
-        if (!b.CanRead(1)) { return false; }
-        long vlen = b.ReadVarInt();
-        if (vlen < 0 || !b.CanRead((int)vlen)) { return false; }
-        valOff = b.ReadPos();
+        pos = pos + keyLen;
+        b.rpos = pos;
+        if (rop == 2) { return true; }
+        if (pos >= lim) { return false; }
+        int vb0 = sp[pos] & 255;
+        pos = pos + 1;
+        long vlen = (long)vb0;
+        if (vb0 >= 128) {
+            vlen = (long)(vb0 & 127);
+            int shift = 7;
+            while (true) {
+                if (pos >= lim || shift > 63) { b.rpos = pos; return false; }
+                int bx = sp[pos] & 255;
+                pos = pos + 1;
+                vlen = vlen + ((long)(bx & 127) << shift);
+                if (bx < 128) { break; }
+                shift = shift + 7;
+            }
+        }
+        b.rpos = pos;
+        if (vlen < 0 || vlen > (long)(lim - pos)) { return false; }
+        valOff = pos;
         valLen = (int)vlen;
-        b.SeekRead(valOff + valLen);
+        b.rpos = pos + valLen;
         return true;
     }
 
     // 块内顺序查找 key：1=命中（val 为值）、2=墓碑、
-    // 0=不存在（含越过 key 的位置）。读完即止，不做全块解析。
+    // 0=不存在（含越过 key 的位置）。直接内联块字节游标 + 1 字节 VarInt 快路径 + 首字节过滤 + memcmp，
+    // 零抛异常调用、零跳过记录堆分配，退出时同步回写 b.rpos。
     public static int ScanBlock(ByteBuffer b, string key, out string val) {
         val = "";
-        while (true) {
-            string rk;
-            string rv;
-            int rop;
-            if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
-            int cmp = String.CompareOrdinal(rk, key);
+        nint bufPtr = b.data;
+        int lim = b.length;
+        int pos = b.rpos;
+        if (pos >= lim) { return 0; }
+        Span<byte> sp = new Span<byte>(bufPtr, lim);
+        nint keyPtr = (nint)key;
+        int kLen = key.Length;
+        int keyFirst = kLen > 0 ? (key[0] & 255) : -1;
+        while (pos < lim) {
+            int rop = sp[pos] & 255;
+            pos = pos + 1;
+            if (rop != 1 && rop != 2) { b.rpos = pos; return 0; }
+            if (pos >= lim) { b.rpos = pos; return 0; }
+            int b0 = sp[pos] & 255;
+            pos = pos + 1;
+            int keyLen = b0;
+            if (b0 >= 128) {
+                long kl = (long)(b0 & 127);
+                int shift = 7;
+                while (true) {
+                    if (pos >= lim || shift > 63) { b.rpos = pos; return 0; }
+                    int bx = sp[pos] & 255;
+                    pos = pos + 1;
+                    kl = kl + ((long)(bx & 127) << shift);
+                    if (bx < 128) { break; }
+                    shift = shift + 7;
+                }
+                if (kl < 0 || kl > (long)(lim - pos)) { b.rpos = pos; return 0; }
+                keyLen = (int)kl;
+            } else if (keyLen > lim - pos) {
+                b.rpos = pos;
+                return 0;
+            }
+            int keyOff = pos;
+            pos = pos + keyLen;
+            int valOff = 0;
+            int valLen = 0;
+            if (rop == 1) {
+                if (pos >= lim) { b.rpos = pos; return 0; }
+                int vb0 = sp[pos] & 255;
+                pos = pos + 1;
+                if (vb0 >= 128) {
+                    long vl = (long)(vb0 & 127);
+                    int shift = 7;
+                    while (true) {
+                        if (pos >= lim || shift > 63) { b.rpos = pos; return 0; }
+                        int bx = sp[pos] & 255;
+                        pos = pos + 1;
+                        vl = vl + ((long)(bx & 127) << shift);
+                        if (bx < 128) { break; }
+                        shift = shift + 7;
+                    }
+                    if (vl < 0 || vl > (long)(lim - pos)) { b.rpos = pos; return 0; }
+                    valLen = (int)vl;
+                } else {
+                    if (vb0 > lim - pos) { b.rpos = pos; return 0; }
+                    valLen = vb0;
+                }
+                valOff = pos;
+                pos = pos + valLen;
+            }
+            int minLen = keyLen < kLen ? keyLen : kLen;
+            int cmp = 0;
+            if (minLen > 0) {
+                int r0 = sp[keyOff] & 255;
+                if (r0 != keyFirst) {
+                    cmp = r0 - keyFirst;
+                } else if (minLen > 1) {
+                    cmp = NativeMemory.Compare(bufPtr + (nint)(keyOff + 1), keyPtr + (nint)1, minLen - 1);
+                }
+            }
             if (cmp == 0) {
+                cmp = keyLen - kLen;
+            }
+            if (cmp == 0) {
+                b.rpos = pos;
                 if (rop == 2) { return 2; }
-                val = rv;
+                val = NativeMemory.GetString(bufPtr, valOff, valLen);
                 return 1;
             }
-            if (cmp > 0) { return 0; }
+            if (cmp > 0) {
+                b.rpos = pos;
+                return 0;
+            }
         }
+        b.rpos = pos;
         return 0;
     }
 

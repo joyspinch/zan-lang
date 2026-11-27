@@ -10,17 +10,33 @@ public class QrEncoder {
     public static int MODE_BYTE = 4;
 
     static string ALNUM_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+    static int[] alnumLut = null;
+
+    static int[] GetAlnumLut() {
+        int[] t = QrEncoder.alnumLut;
+        if (t != null) { return t; }
+        int[] lut = new int[128];
+        for (int i = 0; i < 128; i = i + 1) { lut[i] = -1; }
+        for (int i = 0; i < 45; i = i + 1) {
+            lut[ALNUM_CHARS[i] & 127] = i;
+        }
+        QrEncoder.alnumLut = lut;
+        return lut;
+    }
 
     public static QrMatrix Encode(string text, QrEcl ecl) {
-        List<QrSegment> segs = QrEncoder.MakeQrSegments(text);
-        int ver = QrEncoder.PickVersion(segs, ecl);
+        int segCount = 0;
+        int[] segModes = null;
+        int[] segStarts = null;
+        int[] segLens = null;
+        QrEncoder.BuildSegmentSpans(text, out segModes, out segStarts, out segLens, out segCount);
+        int ver = QrEncoder.PickVersionSpans(segModes, segLens, segCount, ecl);
         if (ver < 0) {
             throw new BarcodeException(BarcodeError.TooLong, "content too long for QR version 40");
         }
         int totalCw = QrSpec.TotalCodewords(ver);
         int[] cw = new int[totalCw];
-        for (int i = 0; i < totalCw; i = i + 1) { cw[i] = 0; }
-        QrEncoder.WriteQrSegments(segs, ver, ecl, cw);
+        QrEncoder.WriteSegmentSpans(text, segModes, segStarts, segLens, segCount, ver, ecl, cw);
         return QrEncoder.BuildMatrix(ver, ecl, cw);
     }
 
@@ -36,10 +52,8 @@ public class QrEncoder {
     public static bool IsNumeric(int b) { return b >= 48 && b <= 57; }
 
     public static int AlnumValueByte(int c) {
-        for (int i = 0; i < 45; i = i + 1) {
-            if (ALNUM_CHARS[i] == c) { return i; }
-        }
-        return -1;
+        if (c < 0 || c >= 128) { return -1; }
+        return QrEncoder.GetAlnumLut()[c];
     }
 
     public static int SeqByteLen(int lead) {
@@ -49,93 +63,74 @@ public class QrEncoder {
         return 4;
     }
 
-    // 按码点游程切段并将 <=8 字符的短非 Byte 游程折回 Byte（省模式切换头），再合并相邻 Byte 段。
-    static List<QrSegment> MakeQrSegments(string text) {
-        List<QrSegment> outp = new List<QrSegment>();
-        if (text == null || text.Length == 0) { return outp; }
-        List<QrSegment> raw = new List<QrSegment>();
+    static int[] GrowQrInts(int[] arr, int count) {
+        int[] nb = new int[arr.Length * 2];
+        Array.Copy(arr, nb, count);
+        return nb;
+    }
+
+    // 零 Substring、零逐位 List<int> 游程切段：只记录 (mode, start, byteLen)，
+    // 将 <=8 字符短非 Byte 游程折回 Byte 并合并相邻 Byte 段（与原分段结果逐位一致）。
+    static void BuildSegmentSpans(string text, out int[] outModes, out int[] outStarts, out int[] outLens, out int outCount) {
+        if (text == null || text.Length == 0) {
+            outModes = new int[0];
+            outStarts = new int[0];
+            outLens = new int[0];
+            outCount = 0;
+            return;
+        }
+        int[] lut = QrEncoder.GetAlnumLut();
         int len = text.Length;
+        int[] rModes = new int[16];
+        int[] rStarts = new int[16];
+        int[] rLens = new int[16];
+        int rCnt = 0;
         int i = 0;
         while (i < len) {
             int runStart = i;
-            int mode = QrEncoder.ModeOfByte(text[i] & 255, text, i);
-            i = i + QrEncoder.SeqByteLen(text[i] & 255);
+            int b0 = text[i] & 255;
+            int mode = b0 < 128 ? (b0 >= 48 && b0 <= 57 ? MODE_NUMERIC : (lut[b0] >= 0 ? MODE_ALNUM : MODE_BYTE)) : MODE_BYTE;
+            i = i + QrEncoder.SeqByteLen(b0);
             while (i < len) {
-                if (QrEncoder.ModeOfByte(text[i] & 255, text, i) != mode) { break; }
-                i = i + QrEncoder.SeqByteLen(text[i] & 255);
+                int bi = text[i] & 255;
+                int m2 = bi < 128 ? (bi >= 48 && bi <= 57 ? MODE_NUMERIC : (lut[bi] >= 0 ? MODE_ALNUM : MODE_BYTE)) : MODE_BYTE;
+                if (m2 != mode) { break; }
+                i = i + QrEncoder.SeqByteLen(bi);
             }
-            string run = text.Substring(runStart, i - runStart);
-            QrSegment s;
-            if (mode == MODE_NUMERIC) {
-                s = new QrSegment();
-                s.bits = new List<int>();
-                s.mode = MODE_NUMERIC;
-                s.chars = run.Length;
-                s.srcPos = runStart;
-                int j = 0;
-                int n = run.Length;
-                while (j < n) {
-                    int take = n - j;
-                    if (take > 3) { take = 3; }
-                    int v = 0;
-                    for (int k = 0; k < take; k = k + 1) { v = v * 10 + (run[j + k] - 48); }
-                    int bits = take == 3 ? 10 : (take == 2 ? 7 : 4);
-                    for (int b2 = bits - 1; b2 >= 0; b2 = b2 - 1) { s.bits.Add((v >> b2) & 1); }
-                    j = j + take;
-                }
-            } else if (mode == MODE_ALNUM) {
-                s = new QrSegment();
-                s.bits = new List<int>();
-                s.mode = MODE_ALNUM;
-                s.chars = run.Length;
-                s.srcPos = runStart;
-                int j = 0;
-                int n = run.Length;
-                while (j + 2 <= n) {
-                    int v = QrEncoder.AlnumValueByte(run[j] & 255) * 45 + QrEncoder.AlnumValueByte(run[j + 1] & 255);
-                    for (int b2 = 10; b2 >= 0; b2 = b2 - 1) { s.bits.Add((v >> b2) & 1); }
-                    j = j + 2;
-                }
-                if (j < n) {
-                    int v = QrEncoder.AlnumValueByte(run[j] & 255);
-                    for (int b2 = 5; b2 >= 0; b2 = b2 - 1) { s.bits.Add((v >> b2) & 1); }
-                }
+            if (rCnt >= rModes.Length) {
+                rModes = QrEncoder.GrowQrInts(rModes, rCnt);
+                rStarts = QrEncoder.GrowQrInts(rStarts, rCnt);
+                rLens = QrEncoder.GrowQrInts(rLens, rCnt);
+            }
+            rModes[rCnt] = mode;
+            rStarts[rCnt] = runStart;
+            rLens[rCnt] = i - runStart;
+            rCnt = rCnt + 1;
+        }
+        int[] fModes = new int[rCnt];
+        int[] fStarts = new int[rCnt];
+        int[] fLens = new int[rCnt];
+        int fCnt = 0;
+        for (int k = 0; k < rCnt; k = k + 1) {
+            int m = rModes[k];
+            int st = rStarts[k];
+            int sl = rLens[k];
+            if (m != MODE_BYTE && sl <= 8) {
+                m = MODE_BYTE;
+            }
+            if (m == MODE_BYTE && fCnt > 0 && fModes[fCnt - 1] == MODE_BYTE) {
+                fLens[fCnt - 1] = fLens[fCnt - 1] + sl;
             } else {
-                s = QrEncoder.MakeByteRun(run);
-                s.srcPos = runStart;
+                fModes[fCnt] = m;
+                fStarts[fCnt] = st;
+                fLens[fCnt] = sl;
+                fCnt = fCnt + 1;
             }
-            raw.Add(s);
         }
-        for (int k = 0; k < raw.Count; k = k + 1) {
-            QrSegment s = raw[k];
-            if (s.mode != MODE_BYTE && s.chars <= 8) {
-                // 使用构造时记录的 srcPos：相邻 Byte 合并会就地修改 chars，事后累加起点会错位。
-                s = QrEncoder.MakeByteRun(text.Substring(s.srcPos, s.chars));
-            }
-            bool merged = false;
-            if (s.mode == MODE_BYTE && outp.Count > 0) {
-                QrSegment p = outp[outp.Count - 1];
-                if (p.mode == MODE_BYTE) {
-                    for (int j = 0; j < s.bits.Count; j = j + 1) { p.bits.Add(s.bits[j]); }
-                    p.chars = p.chars + s.chars;
-                    merged = true;
-                }
-            }
-            if (!merged) { outp.Add(s); }
-        }
-        return outp;
-    }
-
-    static QrSegment MakeByteRun(string run) {
-        QrSegment s = new QrSegment();
-        s.mode = MODE_BYTE;
-        s.chars = run.Length;
-        s.bits = new List<int>();
-        for (int j = 0; j < run.Length; j = j + 1) {
-            int v = run[j] & 255;
-            for (int b = 7; b >= 0; b = b - 1) { s.bits.Add((v >> b) & 1); }
-        }
-        return s;
+        outModes = fModes;
+        outStarts = fStarts;
+        outLens = fLens;
+        outCount = fCnt;
     }
 
     public static int ModeOfByte(int b, string text, int pos) {
@@ -153,42 +148,102 @@ public class QrEncoder {
         return g == 0 ? 8 : 16;
     }
 
-    static int PickVersion(List<QrSegment> segs, QrEcl ecl) {
+    static int SegmentDataBits(int mode, int chars) {
+        if (mode == MODE_NUMERIC) {
+            int rem = chars % 3;
+            return (chars / 3) * 10 + (rem == 2 ? 7 : (rem == 1 ? 4 : 0));
+        }
+        if (mode == MODE_ALNUM) {
+            return (chars / 2) * 11 + ((chars & 1) != 0 ? 6 : 0);
+        }
+        return chars * 8;
+    }
+
+    static int PickVersionSpans(int[] modes, int[] lens, int count, QrEcl ecl) {
+        int baseBits = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            baseBits = baseBits + 4 + QrEncoder.SegmentDataBits(modes[i], lens[i]);
+        }
         for (int ver = 1; ver <= 40; ver = ver + 1) {
-            int need = 0;
-            for (int i = 0; i < segs.Count; i = i + 1) {
-                QrSegment s = segs[i];
-                need = need + 4 + QrEncoder.CharCountBits(s.mode, ver) + s.bits.Count;
+            int need = baseBits;
+            for (int i = 0; i < count; i = i + 1) {
+                need = need + QrEncoder.CharCountBits(modes[i], ver);
             }
             if (need <= QrSpec.DataCapacity(ver, ecl) * 8) { return ver; }
         }
         return -1;
     }
 
-    static void WriteQrSegments(List<QrSegment> segs, int ver, QrEcl ecl, int[] cw) {
-        List<int> bits = new List<int>();
-        for (int i = 0; i < segs.Count; i = i + 1) {
-            QrSegment s = segs[i];
-            QrEncoder.AppendVal(bits, s.mode, 4);
-            QrEncoder.AppendVal(bits, s.chars, QrEncoder.CharCountBits(s.mode, ver));
-            for (int k = 0; k < s.bits.Count; k = k + 1) { bits.Add(s.bits[k]); }
-        }
-        int cap = QrSpec.DataCapacity(ver, ecl);
-        int term = cap * 8 - bits.Count;
-        if (term > 4) { term = 4; }
-        if (term < 0) { term = 0; }
-        for (int i = 0; i < term; i = i + 1) { bits.Add(0); }
-        int nDataCw = (bits.Count + 7) / 8;
-        for (int i = 0; i < bits.Count; i = i + 1) {
-            if (bits[i] != 0) { cw[i / 8] = cw[i / 8] | (1 << (7 - i % 8)); }
-        }
-        for (int i = nDataCw; i < cap; i = i + 1) {
-            cw[i] = (i - nDataCw) % 2 == 0 ? 0xEC : 0x11;
+    static void PushBits(int[] cw, ref int cwPos, ref ulong bitBuf, ref int bitCnt, int val, int nBits) {
+        bitBuf = (bitBuf << nBits) | ((ulong)val & ((1UL << nBits) - 1UL));
+        bitCnt = bitCnt + nBits;
+        while (bitCnt >= 8) {
+            bitCnt = bitCnt - 8;
+            cw[cwPos] = (int)((bitBuf >> bitCnt) & 255UL);
+            cwPos = cwPos + 1;
         }
     }
 
-    static void AppendVal(List<int> bits, int val, int n) {
-        for (int i = n - 1; i >= 0; i = i - 1) { bits.Add((val >> i) & 1); }
+    // 紧致位打包直接写入 cw：消除全部 List<int> 逐 bit 堆分配与二次 unpack。
+    static void WriteSegmentSpans(string text, int[] modes, int[] starts, int[] lens, int count, int ver, QrEcl ecl, int[] cw) {
+        int[] lut = QrEncoder.GetAlnumLut();
+        ulong bitBuf = 0UL;
+        int bitCnt = 0;
+        int cwPos = 0;
+        int totalBits = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int mode = modes[i];
+            int st = starts[i];
+            int sl = lens[i];
+            int ccBits = QrEncoder.CharCountBits(mode, ver);
+            QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, mode, 4);
+            QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, sl, ccBits);
+            totalBits = totalBits + 4 + ccBits;
+            if (mode == MODE_NUMERIC) {
+                int j = 0;
+                while (j < sl) {
+                    int take = sl - j;
+                    if (take > 3) { take = 3; }
+                    int v = 0;
+                    for (int k = 0; k < take; k = k + 1) { v = v * 10 + ((text[st + j + k] & 255) - 48); }
+                    int nb = take == 3 ? 10 : (take == 2 ? 7 : 4);
+                    QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, v, nb);
+                    totalBits = totalBits + nb;
+                    j = j + take;
+                }
+            } else if (mode == MODE_ALNUM) {
+                int j = 0;
+                while (j + 2 <= sl) {
+                    int v = lut[text[st + j] & 127] * 45 + lut[text[st + j + 1] & 127];
+                    QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, v, 11);
+                    totalBits = totalBits + 11;
+                    j = j + 2;
+                }
+                if (j < sl) {
+                    int v = lut[text[st + j] & 127];
+                    QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, v, 6);
+                    totalBits = totalBits + 6;
+                }
+            } else {
+                for (int j = 0; j < sl; j = j + 1) {
+                    QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, text[st + j] & 255, 8);
+                }
+                totalBits = totalBits + sl * 8;
+            }
+        }
+        int cap = QrSpec.DataCapacity(ver, ecl);
+        int term = cap * 8 - totalBits;
+        if (term > 4) { term = 4; }
+        if (term > 0) {
+            QrEncoder.PushBits(cw, ref cwPos, ref bitBuf, ref bitCnt, 0, term);
+        }
+        if (bitCnt > 0) {
+            cw[cwPos] = (int)((bitBuf << (8 - bitCnt)) & 255UL);
+            cwPos = cwPos + 1;
+        }
+        for (int i = cwPos; i < cap; i = i + 1) {
+            cw[i] = ((i - cwPos) & 1) == 0 ? 0xEC : 0x11;
+        }
     }
 
     static void SetFn(bool[] fn, int size, int x, int y) {
@@ -197,16 +252,20 @@ public class QrEncoder {
     }
 
     // 绘制同心方环功能图形（定位 r=4 留白 dist 2/4；校正 r=2 留白 dist 1）。
-    static void DrawRing(bool[] dark, bool[] fn, int size, int cx, int cy, int radius, int hole1, int hole2) {
+    // 仅写入功能图形的深色模块到 dark（fn 直接共享 QrSpec.FunctionMapReadOnly(ver)，免除重复写入与拷贝）。
+    static void DrawRingDarkOnly(bool[] dark, int size, int cx, int cy, int radius, int hole1, int hole2) {
         for (int dy = -radius; dy <= radius; dy = dy + 1) {
+            int y = cy + dy;
+            if (y < 0 || y >= size) { continue; }
+            int rowBase = y * size;
+            int ady = dy < 0 ? -dy : dy;
             for (int dx = -radius; dx <= radius; dx = dx + 1) {
-                int dist = dy * dy > dx * dx ? dy : dx;
-                if (dist < 0) { dist = -dist; }
                 int x = cx + dx;
-                int y = cy + dy;
-                QrEncoder.SetFn(fn, size, x, y);
-                if (x >= 0 && y >= 0 && x < size && y < size && dist != hole1 && dist != hole2) {
-                    dark[y * size + x] = true;
+                if (x < 0 || x >= size) { continue; }
+                int adx = dx < 0 ? -dx : dx;
+                int dist = ady > adx ? ady : adx;
+                if (dist != hole1 && dist != hole2) {
+                    dark[rowBase + x] = true;
                 }
             }
         }
@@ -221,16 +280,14 @@ public class QrEncoder {
         return (ver << 12) | d;
     }
 
-    static void InitFunctionMatrix(int ver, bool[] dark, bool[] fn, int size) {
-        QrEncoder.DrawRing(dark, fn, size, 3, 3, 4, 2, 4);
-        QrEncoder.DrawRing(dark, fn, size, size - 4, 3, 4, 2, 4);
-        QrEncoder.DrawRing(dark, fn, size, 3, size - 4, 4, 2, 4);
+    static void InitFunctionDark(int ver, bool[] dark, int size) {
+        QrEncoder.DrawRingDarkOnly(dark, size, 3, 3, 4, 2, 4);
+        QrEncoder.DrawRingDarkOnly(dark, size, size - 4, 3, 4, 2, 4);
+        QrEncoder.DrawRingDarkOnly(dark, size, 3, size - 4, 4, 2, 4);
 
-        for (int i = 8; i <= size - 9; i = i + 1) {
-            if (i % 2 == 0) {
-                dark[6 * size + i] = true;
-                dark[i * size + 6] = true;
-            }
+        for (int i = 8; i <= size - 9; i = i + 2) {
+            dark[6 * size + i] = true;
+            dark[i * size + 6] = true;
         }
 
         int[] pos = QrSpec.AlignPattern(ver);
@@ -239,7 +296,7 @@ public class QrEncoder {
             for (int c = 0; c < n; c = c + 1) {
                 bool corner = (r == 0 && c == 0) || (r == 0 && c == n - 1) || (r == n - 1 && c == 0);
                 if (!corner) {
-                    QrEncoder.DrawRing(dark, fn, size, pos[c + 1], pos[r + 1], 2, 1, -1);
+                    QrEncoder.DrawRingDarkOnly(dark, size, pos[c + 1], pos[r + 1], 2, 1, -1);
                 }
             }
         }
@@ -247,28 +304,14 @@ public class QrEncoder {
         if (ver >= 7) {
             int vinfo = QrEncoder.BchVersion(ver);
             for (int i = 0; i < 18; i = i + 1) {
-                int a = i / 3;
-                int b = i % 3;
-                QrEncoder.SetFn(fn, size, a, size - 11 + b);
-                QrEncoder.SetFn(fn, size, size - 11 + b, a);
                 if (((vinfo >> i) & 1) != 0) {
+                    int a = i / 3;
+                    int b = i % 3;
                     dark[(size - 11 + b) * size + a] = true;
                     dark[a * size + (size - 11 + b)] = true;
                 }
             }
         }
-
-        for (int i = 0; i < 9; i = i + 1) {
-            if (i != 6) {
-                QrEncoder.SetFn(fn, size, 8, i);
-                QrEncoder.SetFn(fn, size, i, 8);
-            }
-        }
-        for (int i = 0; i < 8; i = i + 1) {
-            QrEncoder.SetFn(fn, size, size - 1 - i, 8);
-            if (i != 6) { QrEncoder.SetFn(fn, size, 8, size - 1 - i); }
-        }
-        QrEncoder.SetFn(fn, size, 8, size - 8);
         dark[8 * size + (size - 8)] = true;
     }
 
@@ -278,20 +321,17 @@ public class QrEncoder {
         int numBlocks = k1 + k2;
         int ecLen = QrSpec.EcPerBlock(ecl, ver);
         int dataTotal = QrSpec.DataCapacity(ver, ecl);
+        int[] offs = new int[numBlocks];
         int[] lens = new int[numBlocks];
-        List<int[]> chunks = new List<int[]>();
-        List<int[]> ecs = new List<int[]>();
+        int[] ecAll = new int[numBlocks * ecLen];
         int p = 0;
         int[] gen = QrSpec.RsGenerator(ecLen);
         for (int b = 0; b < numBlocks; b = b + 1) {
-            lens[b] = b < k1 ? d1 : d2;
-            int[] chunk = new int[lens[b]];
-            for (int t = 0; t < lens[b]; t = t + 1) {
-                chunk[t] = cw[p];
-                p = p + 1;
-            }
-            chunks.Add(chunk);
-            ecs.Add(QrSpec.RsRemainder(chunk, lens[b], gen));
+            int bl = b < k1 ? d1 : d2;
+            offs[b] = p;
+            lens[b] = bl;
+            QrSpec.RsRemainderSlice(cw, p, bl, gen, ecAll, b * ecLen);
+            p = p + bl;
         }
         int[] blockData = new int[dataTotal + numBlocks * ecLen];
         int w = 0;
@@ -299,14 +339,14 @@ public class QrEncoder {
         for (int t = 0; t < maxLen; t = t + 1) {
             for (int b = 0; b < numBlocks; b = b + 1) {
                 if (t < lens[b]) {
-                    blockData[w] = chunks[b][t];
+                    blockData[w] = cw[offs[b] + t];
                     w = w + 1;
                 }
             }
         }
         for (int t = 0; t < ecLen; t = t + 1) {
             for (int b = 0; b < numBlocks; b = b + 1) {
-                blockData[w] = ecs[b][t];
+                blockData[w] = ecAll[b * ecLen + t];
                 w = w + 1;
             }
         }
@@ -315,17 +355,15 @@ public class QrEncoder {
 
     static QrMatrix BuildMatrix(int ver, QrEcl ecl, int[] cw) {
         int size = ver * 4 + 17;
-        bool[] dark = new bool[size * size];
-        // 功能图形地图须与解码器（QrSpec.FunctionMap）逐位一致。
-        bool[] fn = QrSpec.FunctionMap(ver);
-        for (int i = 0; i < size * size; i = i + 1) { dark[i] = false; }
-        QrEncoder.InitFunctionMatrix(ver, dark, fn, size);
+        int cells = size * size;
+        // 直接共享只读功能图形模板（零矩阵拷贝）。
+        bool[] fn = QrSpec.FunctionMapReadOnly(ver);
+        bool[] finalDark = new bool[cells];
+        QrEncoder.InitFunctionDark(ver, finalDark, size);
 
         int[] blockData = QrEncoder.EncodeBlocksAndInterleave(ver, ecl, cw);
-        bool[] finalDark = new bool[size * size];
-        Array.Copy(dark, finalDark, size * size);
         int bit = 0;
-        int totalCw = blockData.Length;
+        int totalBits = blockData.Length * 8;
         for (int right = size - 1; right >= 1; right = right - 2) {
             int r2 = right <= 6 ? right - 1 : right;
             for (int vert = 0; vert < size; vert = vert + 1) {
@@ -335,8 +373,8 @@ public class QrEncoder {
                     if (j < 6) { upwards = !upwards; }
                     int y = upwards ? size - 1 - vert : vert;
                     int idx = y * size + j;
-                    if (!fn[idx] && bit < totalCw * 8) {
-                        finalDark[idx] = ((blockData[bit / 8] >> (7 - bit % 8)) & 1) != 0;
+                    if (!fn[idx] && bit < totalBits) {
+                        finalDark[idx] = ((blockData[bit >> 3] >> (7 - (bit & 7))) & 1) != 0;
                         bit = bit + 1;
                     }
                 }
@@ -344,7 +382,6 @@ public class QrEncoder {
         }
 
         int bestPenalty = 0x7FFFFFFF;
-        int cells = size * size;
         bool[] cand = new bool[cells];
         bool[] best = new bool[cells];
         for (int m = 0; m < 8; m = m + 1) {
@@ -352,7 +389,9 @@ public class QrEncoder {
             int pen = QrEncoder.Penalty(cand, size);
             if (pen < bestPenalty) {
                 bestPenalty = pen;
-                Array.Copy(cand, best, cells);
+                bool[] swap = best;
+                best = cand;
+                cand = swap;
             }
         }
         QrMatrix mx = new QrMatrix();
@@ -363,13 +402,110 @@ public class QrEncoder {
         return mx;
     }
 
+    // 按 8 种掩码特化循环外分发：消除逐像素 MaskBit 调用与整数除法取模（% 3 改为 0..2 递推计数）。
     static void ApplyMaskInto(bool[] dark, bool[] fn, int size, int mask, QrEcl ecl, bool[] outp) {
         Array.Copy(dark, outp, size * size);
-        for (int y = 0; y < size; y = y + 1) {
-            int rowBase = y * size;
-            for (int x = 0; x < size; x = x + 1) {
-                int idx = rowBase + x;
-                if (!fn[idx] && QrEncoder.MaskBit(mask, x, y)) { outp[idx] = !outp[idx]; }
+        if (mask == 0) {
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                for (int x = y & 1; x < size; x = x + 2) {
+                    int idx = rowBase + x;
+                    if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                }
+            }
+        } else if (mask == 1) {
+            for (int y = 0; y < size; y = y + 2) {
+                int rowBase = y * size;
+                for (int x = 0; x < size; x = x + 1) {
+                    int idx = rowBase + x;
+                    if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                }
+            }
+        } else if (mask == 2) {
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                for (int x = 0; x < size; x = x + 3) {
+                    int idx = rowBase + x;
+                    if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                }
+            }
+        } else if (mask == 3) {
+            int yMod = 0;
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                int startX = yMod == 0 ? 0 : (3 - yMod);
+                for (int x = startX; x < size; x = x + 3) {
+                    int idx = rowBase + x;
+                    if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                }
+                yMod = yMod + 1;
+                if (yMod == 3) { yMod = 0; }
+            }
+        } else if (mask == 4) {
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                int yHalf = (y >> 1) & 1;
+                int xDiv3Par = 0;
+                int xMod3 = 0;
+                for (int x = 0; x < size; x = x + 1) {
+                    if ((xDiv3Par ^ yHalf) == 0) {
+                        int idx = rowBase + x;
+                        if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                    }
+                    xMod3 = xMod3 + 1;
+                    if (xMod3 == 3) { xMod3 = 0; xDiv3Par = xDiv3Par ^ 1; }
+                }
+            }
+        } else if (mask == 5) {
+            int yMod3 = 0;
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                int yOdd = y & 1;
+                int xyMod3 = 0;
+                for (int x = 0; x < size; x = x + 1) {
+                    if (((x & yOdd) == 0) && xyMod3 == 0) {
+                        int idx = rowBase + x;
+                        if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                    }
+                    xyMod3 = xyMod3 + yMod3;
+                    if (xyMod3 >= 3) { xyMod3 = xyMod3 - 3; }
+                }
+                yMod3 = yMod3 + 1;
+                if (yMod3 == 3) { yMod3 = 0; }
+            }
+        } else if (mask == 6) {
+            int yMod3 = 0;
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                int yOdd = y & 1;
+                int xyMod3 = 0;
+                for (int x = 0; x < size; x = x + 1) {
+                    if ((((x & yOdd) + xyMod3) & 1) == 0) {
+                        int idx = rowBase + x;
+                        if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                    }
+                    xyMod3 = xyMod3 + yMod3;
+                    if (xyMod3 >= 3) { xyMod3 = xyMod3 - 3; }
+                }
+                yMod3 = yMod3 + 1;
+                if (yMod3 == 3) { yMod3 = 0; }
+            }
+        } else {
+            int yMod3 = 0;
+            for (int y = 0; y < size; y = y + 1) {
+                int rowBase = y * size;
+                int yOdd = y & 1;
+                int xyMod3 = 0;
+                for (int x = 0; x < size; x = x + 1) {
+                    if (((((x + yOdd) & 1) + xyMod3) & 1) == 0) {
+                        int idx = rowBase + x;
+                        if (!fn[idx]) { outp[idx] = !outp[idx]; }
+                    }
+                    xyMod3 = xyMod3 + yMod3;
+                    if (xyMod3 >= 3) { xyMod3 = xyMod3 - 3; }
+                }
+                yMod3 = yMod3 + 1;
+                if (yMod3 == 3) { yMod3 = 0; }
             }
         }
         int bits = QrFormat.EncodeBits(ecl, mask);

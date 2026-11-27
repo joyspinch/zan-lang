@@ -13,13 +13,17 @@ public class UnicodeCase {
             if (cp >= 65 && cp <= 90) { return cp + 32; }
             return cp;
         }
+        if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3)) {
+            return cp;
+        }
+        int[] tab = UnicodeTables.caseFold1to1;
         int lo = 0;
         int hi = 1425; // UnicodeTables.caseFold1to1.Length / 2 - 1
         while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            int mcp = UnicodeTables.caseFold1to1[mid * 2];
+            int mid = (lo + hi) >> 1;
+            int mcp = tab[mid * 2];
             if (mcp == cp) {
-                return UnicodeTables.caseFold1to1[mid * 2 + 1];
+                return tab[mid * 2 + 1];
             }
             if (mcp < cp) {
                 lo = mid + 1;
@@ -764,6 +768,67 @@ public class UnicodeCase {
         return CaseMapSlot(caseDown1to1, cp);
     }
 
+    private static byte[] GrowByteBuf(byte[] buf, int pos, int need) {
+        int cap = buf.Length * 2;
+        while (cap < need) { cap = cap * 2; }
+        byte[] nb = new byte[cap];
+        if (pos > 0) { NativeMemory.Copy((nint)nb, (nint)buf, pos); }
+        return nb;
+    }
+
+    private static void WriteUtf8CodePoint(ref byte[] buf, ref int pos, int cp) {
+        if (pos + 4 > buf.Length) { buf = GrowByteBuf(buf, pos, pos + 4); }
+        if (cp < 0x80) {
+            buf[pos] = (byte)cp;
+            pos = pos + 1;
+        } else if (cp < 0x800) {
+            buf[pos] = (byte)(0xC0 | (cp >> 6));
+            buf[pos + 1] = (byte)(0x80 | (cp & 0x3F));
+            pos = pos + 2;
+        } else if (cp < 0x10000) {
+            buf[pos] = (byte)(0xE0 | (cp >> 12));
+            buf[pos + 1] = (byte)(0x80 | ((cp >> 6) & 0x3F));
+            buf[pos + 2] = (byte)(0x80 | (cp & 0x3F));
+            pos = pos + 3;
+        } else {
+            buf[pos] = (byte)(0xF0 | (cp >> 18));
+            buf[pos + 1] = (byte)(0x80 | ((cp >> 12) & 0x3F));
+            buf[pos + 2] = (byte)(0x80 | ((cp >> 6) & 0x3F));
+            buf[pos + 3] = (byte)(0x80 | (cp & 0x3F));
+            pos = pos + 4;
+        }
+    }
+
+    private static void AppendRawStr(ref byte[] buf, ref int pos, string m) {
+        int ml = m.Length;
+        if (pos + ml > buf.Length) { buf = GrowByteBuf(buf, pos, pos + ml); }
+        NativeMemory.Copy((nint)buf + (nint)pos, (nint)m, ml);
+        pos = pos + ml;
+    }
+
+    // 将单个码点编码进 32 位整型（小端序字节，低字节为首字节），返回字节数（1..4）。
+    private static int PackUtf8(int cp, out int packed) {
+        if (cp < 0x80) {
+            packed = cp & 0xFF;
+            return 1;
+        }
+        if (cp < 0x800) {
+            packed = (0xC0 | (cp >> 6)) | ((0x80 | (cp & 0x3F)) << 8);
+            return 2;
+        }
+        if (cp < 0x10000) {
+            packed = (0xE0 | (cp >> 12))
+                | ((0x80 | ((cp >> 6) & 0x3F)) << 8)
+                | ((0x80 | (cp & 0x3F)) << 16);
+            return 3;
+        }
+        packed = (0xF0 | (cp >> 18))
+            | ((0x80 | ((cp >> 12) & 0x3F)) << 8)
+            | ((0x80 | ((cp >> 6) & 0x3F)) << 16)
+            | ((0x80 | (cp & 0x3F)) << 24);
+        return 4;
+    }
+
     // 字符串国际化全大小写折叠（Full Case Folding）。
     // 将不同大小写与特殊等价字符映射到规范小写形式（如 "GROSS" 与 "groß" 折叠后均为 "gross"）。
     public static string CaseFold(string s) {
@@ -774,23 +839,54 @@ public class UnicodeCase {
             return s.ToLowerAscii();
         }
 
-        StringBuilder sb = new StringBuilder(slen);
+        byte[] buf = new byte[slen + 16];
+        int pos = 0;
+        nint sPtr = (nint)s;
+        Span<byte> sb = new Span<byte>(sPtr, slen);
         int idx = 0;
         while (idx < slen) {
+            int b0 = sb[idx] & 255;
+            if (b0 < 0x80) {
+                if (pos >= buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                if (b0 >= 65 && b0 <= 90) { b0 = b0 + 32; }
+                buf[pos] = (byte)b0;
+                pos = pos + 1;
+                idx = idx + 1;
+                continue;
+            }
+            if (b0 >= 0xE4 && b0 <= 0xE9 && idx + 2 < slen) {
+                int b1 = sb[idx + 1] & 255;
+                int b2 = sb[idx + 2] & 255;
+                if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                    int cjk = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+                    if (cjk >= 0x4E00 && cjk <= 0x9FFF) {
+                        if (pos + 3 > buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                        buf[pos] = (byte)b0;
+                        buf[pos + 1] = (byte)b1;
+                        buf[pos + 2] = (byte)b2;
+                        pos = pos + 3;
+                        idx = idx + 3;
+                        continue;
+                    }
+                }
+            }
             long res = Encoding.DecodeCodePointFast(s, idx);
             int cp = (int)(res & 0xFFFFFFFFL);
-            idx = idx + (int)(res >> 32);
+            int step = (int)(res >> 32);
+            idx = idx + step;
 
-            string multi = UnicodeTables.CaseFoldMulti(cp);
-            if (multi.Length > 0) {
-                sb.Append(multi);
-                continue;
+            if (cp >= 223) {
+                string multi = UnicodeTables.CaseFoldMulti(cp);
+                if (multi.Length > 0) {
+                    AppendRawStr(ref buf, ref pos, multi);
+                    continue;
+                }
             }
 
             int folded = FoldCodePointSimple(cp);
-            sb.Append(Encoding.Utf8FromCodePoint(folded));
+            WriteUtf8CodePoint(ref buf, ref pos, folded);
         }
-        return sb.ToString();
+        return buf.ToStr(0, pos);
     }
 
     // 字符串 Unicode 大写转换，包含 1:N 完整扩张（如 'ß' -> "SS"）。
@@ -802,23 +898,54 @@ public class UnicodeCase {
             return s.ToUpperAscii();
         }
 
-        StringBuilder sb = new StringBuilder(slen);
+        byte[] buf = new byte[slen + 16];
+        int pos = 0;
+        nint sPtr = (nint)s;
+        Span<byte> sb = new Span<byte>(sPtr, slen);
         int idx = 0;
         while (idx < slen) {
-            long res = Encoding.DecodeCodePointFast(s, idx);
-            int cp = (int)(res & 0xFFFFFFFFL);
-            idx = idx + (int)(res >> 32);
-
-            string multi = UnicodeTables.ToUpperMulti(cp);
-            if (multi.Length > 0) {
-                sb.Append(multi);
+            int b0 = sb[idx] & 255;
+            if (b0 < 0x80) {
+                if (pos >= buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                if (b0 >= 97 && b0 <= 122) { b0 = b0 - 32; }
+                buf[pos] = (byte)b0;
+                pos = pos + 1;
+                idx = idx + 1;
                 continue;
             }
+            if (b0 >= 0xE4 && b0 <= 0xE9 && idx + 2 < slen) {
+                int b1 = sb[idx + 1] & 255;
+                int b2 = sb[idx + 2] & 255;
+                if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                    int cjk = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+                    if (cjk >= 0x4E00 && cjk <= 0x9FFF) {
+                        if (pos + 3 > buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                        buf[pos] = (byte)b0;
+                        buf[pos + 1] = (byte)b1;
+                        buf[pos + 2] = (byte)b2;
+                        pos = pos + 3;
+                        idx = idx + 3;
+                        continue;
+                    }
+                }
+            }
+            long res = Encoding.DecodeCodePointFast(s, idx);
+            int cp = (int)(res & 0xFFFFFFFFL);
+            int step = (int)(res >> 32);
+            idx = idx + step;
 
-            int up = char.ToUpper(cp);
-            sb.Append(Encoding.Utf8FromCodePoint(up));
+            if (cp >= 223) {
+                string multi = UnicodeTables.ToUpperMulti(cp);
+                if (multi.Length > 0) {
+                    AppendRawStr(ref buf, ref pos, multi);
+                    continue;
+                }
+            }
+
+            int up = (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3) ? cp : char.ToUpper(cp);
+            WriteUtf8CodePoint(ref buf, ref pos, up);
         }
-        return sb.ToString();
+        return buf.ToStr(0, pos);
     }
 
     // 字符串 Unicode 小写转换。
@@ -830,17 +957,175 @@ public class UnicodeCase {
             return s.ToLowerAscii();
         }
 
-        StringBuilder sb = new StringBuilder(slen);
+        byte[] buf = new byte[slen + 16];
+        int pos = 0;
+        nint sPtr = (nint)s;
+        Span<byte> sb = new Span<byte>(sPtr, slen);
         int idx = 0;
         while (idx < slen) {
+            int b0 = sb[idx] & 255;
+            if (b0 < 0x80) {
+                if (pos >= buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                if (b0 >= 65 && b0 <= 90) { b0 = b0 + 32; }
+                buf[pos] = (byte)b0;
+                pos = pos + 1;
+                idx = idx + 1;
+                continue;
+            }
+            if (b0 >= 0xE4 && b0 <= 0xE9 && idx + 2 < slen) {
+                int b1 = sb[idx + 1] & 255;
+                int b2 = sb[idx + 2] & 255;
+                if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                    int cjk = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+                    if (cjk >= 0x4E00 && cjk <= 0x9FFF) {
+                        if (pos + 3 > buf.Length) { buf = GrowByteBuf(buf, pos, pos + 16); }
+                        buf[pos] = (byte)b0;
+                        buf[pos + 1] = (byte)b1;
+                        buf[pos + 2] = (byte)b2;
+                        pos = pos + 3;
+                        idx = idx + 3;
+                        continue;
+                    }
+                }
+            }
             long res = Encoding.DecodeCodePointFast(s, idx);
             int cp = (int)(res & 0xFFFFFFFFL);
-            idx = idx + (int)(res >> 32);
+            int step = (int)(res >> 32);
+            idx = idx + step;
 
-            int low = char.ToLower(cp);
-            sb.Append(Encoding.Utf8FromCodePoint(low));
+            int low = (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3) ? cp : char.ToLower(cp);
+            WriteUtf8CodePoint(ref buf, ref pos, low);
         }
-        return sb.ToString();
+        return buf.ToStr(0, pos);
+    }
+
+    // 零分配流式 Full CaseFold 等价比较（首字节失配即早退，逐字节与 CaseFold(a) == CaseFold(b) 完全等价）。
+    private static bool EqualsCaseFoldStreaming(string a, string b) {
+        int lenA = a.Length;
+        int lenB = b.Length;
+        Span<byte> sa = new Span<byte>((nint)a, lenA);
+        Span<byte> sb = new Span<byte>((nint)b, lenB);
+        int ia = 0;
+        int ib = 0;
+        string pendA = null;
+        int paPos = 0;
+        int paLen = 0;
+        int packA = 0;
+        int packACnt = 0;
+        string pendB = null;
+        int pbPos = 0;
+        int pbLen = 0;
+        int packB = 0;
+        int packBCnt = 0;
+
+        while (true) {
+            // 双侧无待消费缓冲时走高速内联 ASCII / CJK 快路径
+            if (paPos >= paLen && packACnt == 0 && pbPos >= pbLen && packBCnt == 0) {
+                while (ia < lenA && ib < lenB) {
+                    int b0a = sa[ia] & 255;
+                    int b0b = sb[ib] & 255;
+                    if (b0a < 0x80 && b0b < 0x80) {
+                        if (b0a != b0b) {
+                            if (b0a >= 65 && b0a <= 90) { b0a = b0a + 32; }
+                            if (b0b >= 65 && b0b <= 90) { b0b = b0b + 32; }
+                            if (b0a != b0b) { return false; }
+                        }
+                        ia = ia + 1;
+                        ib = ib + 1;
+                        continue;
+                    }
+                    if (b0a == b0b && b0a >= 0xE4 && b0a <= 0xE9 && ia + 2 < lenA && ib + 2 < lenB) {
+                        int b1a = sa[ia + 1] & 255;
+                        int b2a = sa[ia + 2] & 255;
+                        if (b1a == (sb[ib + 1] & 255) && b2a == (sb[ib + 2] & 255)
+                            && (b1a & 0xC0) == 0x80 && (b2a & 0xC0) == 0x80) {
+                            int cjk = ((b0a & 0x0F) << 12) | ((b1a & 0x3F) << 6) | (b2a & 0x3F);
+                            if (cjk >= 0x4E00 && cjk <= 0x9FFF) {
+                                ia = ia + 3;
+                                ib = ib + 3;
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // 取 A 侧下一个折叠字节（-1 表示 EOF）
+            int ba = -1;
+            if (paPos < paLen) {
+                ba = pendA[paPos] & 255;
+                paPos = paPos + 1;
+            } else if (packACnt > 0) {
+                ba = packA & 255;
+                packA = packA >> 8;
+                packACnt = packACnt - 1;
+            } else if (ia < lenA) {
+                int rawA = sa[ia] & 255;
+                if (rawA < 0x80) {
+                    if (rawA >= 65 && rawA <= 90) { rawA = rawA + 32; }
+                    ba = rawA;
+                    ia = ia + 1;
+                } else {
+                    long resA = Encoding.DecodeCodePointFast(a, ia);
+                    int cpA = (int)(resA & 0xFFFFFFFFL);
+                    ia = ia + (int)(resA >> 32);
+                    string ma = cpA >= 223 ? UnicodeTables.CaseFoldMulti(cpA) : "";
+                    if (ma.Length > 0) {
+                        pendA = ma;
+                        paLen = ma.Length;
+                        ba = ma[0] & 255;
+                        paPos = 1;
+                    } else {
+                        int foldedA = FoldCodePointSimple(cpA);
+                        int pA;
+                        int nA = PackUtf8(foldedA, out pA);
+                        ba = pA & 255;
+                        packA = pA >> 8;
+                        packACnt = nA - 1;
+                    }
+                }
+            }
+
+            // 取 B 侧下一个折叠字节（-1 表示 EOF）
+            int bb = -1;
+            if (pbPos < pbLen) {
+                bb = pendB[pbPos] & 255;
+                pbPos = pbPos + 1;
+            } else if (packBCnt > 0) {
+                bb = packB & 255;
+                packB = packB >> 8;
+                packBCnt = packBCnt - 1;
+            } else if (ib < lenB) {
+                int rawB = sb[ib] & 255;
+                if (rawB < 0x80) {
+                    if (rawB >= 65 && rawB <= 90) { rawB = rawB + 32; }
+                    bb = rawB;
+                    ib = ib + 1;
+                } else {
+                    long resB = Encoding.DecodeCodePointFast(b, ib);
+                    int cpB = (int)(resB & 0xFFFFFFFFL);
+                    ib = ib + (int)(resB >> 32);
+                    string mb = cpB >= 223 ? UnicodeTables.CaseFoldMulti(cpB) : "";
+                    if (mb.Length > 0) {
+                        pendB = mb;
+                        pbLen = mb.Length;
+                        bb = mb[0] & 255;
+                        pbPos = 1;
+                    } else {
+                        int foldedB = FoldCodePointSimple(cpB);
+                        int pB;
+                        int nB = PackUtf8(foldedB, out pB);
+                        bb = pB & 255;
+                        packB = pB >> 8;
+                        packBCnt = nB - 1;
+                    }
+                }
+            }
+
+            if (ba != bb) { return false; }
+            if (ba < 0) { return true; }
+        }
     }
 
     // 基于 StringComparison 契约的字符串比较。
@@ -859,9 +1144,11 @@ public class UnicodeCase {
                 int lenB = b.Length;
                 if (NativeMemory.IsAscii((nint)a, lenA) && NativeMemory.IsAscii((nint)b, lenB)) {
                     if (lenA != lenB) { return false; }
+                    Span<byte> sa = new Span<byte>((nint)a, lenA);
+                    Span<byte> sb = new Span<byte>((nint)b, lenB);
                     for (int i = 0; i < lenA; i = i + 1) {
-                        int ca = a[i] & 255;
-                        int cb = b[i] & 255;
+                        int ca = sa[i] & 255;
+                        int cb = sb[i] & 255;
                         if (ca == cb) { continue; }
                         if (ca >= 65 && ca <= 90) { ca = ca + 32; }
                         if (cb >= 65 && cb <= 90) { cb = cb + 32; }
@@ -869,7 +1156,7 @@ public class UnicodeCase {
                     }
                     return true;
                 }
-                return CaseFold(a) == CaseFold(b);
+                return EqualsCaseFoldStreaming(a, b);
             default:
                 return a == b;
         }
@@ -881,6 +1168,7 @@ public class UnicodeCase {
     public static bool EqualsNormalized(string a, string b, bool ignoreCase) {
         if (a == null && b == null) { return true; }
         if (a == null || b == null) { return false; }
+        if (a == b) { return true; }
 
         string normA = UnicodeNormalization.Normalize(a, NormalizationForm.FormC);
         string normB = UnicodeNormalization.Normalize(b, NormalizationForm.FormC);
@@ -889,6 +1177,6 @@ public class UnicodeCase {
             return normA == normB;
         }
 
-        return CaseFold(normA) == CaseFold(normB);
+        return Equals(normA, normB, StringComparison.OrdinalIgnoreCase);
     }
 }

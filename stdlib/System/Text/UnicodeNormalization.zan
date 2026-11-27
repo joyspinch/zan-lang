@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Interop;
+using System.Numerics;
 
 namespace System.Text;
 
@@ -106,22 +107,65 @@ public class UnicodeNormalization {
     }
 
     // 规范重排序（Canonical Ordering, NFD 阶段 2）：
-    // 依据 UAX #15，非零 CCC 的组合字符序列必须按 CCC 升序稳定排序。
+    // 依据 UAX #15，仅对非零 CCC 的连续组合字符段按 CCC 升序稳定排序，
+    // 缓存每段 CCC 避免内层插入循环反复二分查找 912 项 CCC 表。
     private static void CanonicalSortArr(int[] cps, int len) {
-        for (int i = 1; i < len; i = i + 1) {
-            int curr = cps[i];
-            int cccB = GetCombiningClass(curr);
-            if (cccB == 0) { continue; }
-            int j = i - 1;
-            while (j >= 0) {
-                int cccA = GetCombiningClass(cps[j]);
-                if (cccA <= cccB || cccA == 0) {
-                    break;
-                }
-                cps[j + 1] = cps[j];
-                j = j - 1;
+        int i = 0;
+        int[] cccBuf = null;
+        while (i < len) {
+            int c0 = GetCombiningClass(cps[i]);
+            if (c0 == 0) {
+                i = i + 1;
+                continue;
             }
-            cps[j + 1] = curr;
+            int start = i;
+            i = i + 1;
+            if (i >= len) { break; }
+            int c1 = GetCombiningClass(cps[i]);
+            if (c1 == 0) {
+                i = i + 1;
+                continue;
+            }
+            int nextI = i + 1;
+            int c2 = nextI < len ? GetCombiningClass(cps[nextI]) : 0;
+            if (c2 == 0) {
+                if (c0 > c1) {
+                    int tmp = cps[start];
+                    cps[start] = cps[i];
+                    cps[i] = tmp;
+                }
+                i = nextI + 1;
+                continue;
+            }
+            if (cccBuf == null) { cccBuf = new int[32]; }
+            cccBuf[0] = c0;
+            cccBuf[1] = c1;
+            cccBuf[2] = c2;
+            int runLen = 3;
+            i = nextI + 1;
+            while (i < len) {
+                int ci = GetCombiningClass(cps[i]);
+                if (ci == 0) { break; }
+                if (runLen >= cccBuf.Length) {
+                    cccBuf = GrowIntBuf(cccBuf, runLen, runLen + 1);
+                }
+                cccBuf[runLen] = ci;
+                runLen = runLen + 1;
+                i = i + 1;
+            }
+            for (int k = 1; k < runLen; k = k + 1) {
+                int keyCcc = cccBuf[k];
+                int keyCp = cps[start + k];
+                int j = k - 1;
+                while (j >= 0 && cccBuf[j] > keyCcc) {
+                    cccBuf[j + 1] = cccBuf[j];
+                    cps[start + j + 1] = cps[start + j];
+                    j = j - 1;
+                }
+                cccBuf[j + 1] = keyCcc;
+                cps[start + j + 1] = keyCp;
+            }
+            i = i + 1;
         }
     }
 
@@ -210,6 +254,10 @@ public class UnicodeNormalization {
         int i = 0;
         if (form == NormalizationForm.FormC) {
             while (i < slen) {
+                while (i + 16 <= slen && Vector128.ExtractMostSignificantBits(Vector128.Load(ptr + (nint)i)) == 0) {
+                    i = i + 16;
+                }
+                if (i >= slen) { break; }
                 int c0 = b[i] & 255;
                 if (c0 < 0x80) {
                     i = i + 1;
@@ -241,6 +289,10 @@ public class UnicodeNormalization {
         }
         // FormD QuickCheck：仅 ASCII/Latin-1 前段 (< 0xC0) 与 CJK 统一表意文字 (0x4E00..0x9FFF)
         while (i < slen) {
+            while (i + 16 <= slen && Vector128.ExtractMostSignificantBits(Vector128.Load(ptr + (nint)i)) == 0) {
+                i = i + 16;
+            }
+            if (i >= slen) { break; }
             int c0 = b[i] & 255;
             if (c0 < 0x80) {
                 i = i + 1;

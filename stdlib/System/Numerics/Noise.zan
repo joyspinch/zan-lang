@@ -7,8 +7,8 @@ namespace System.Numerics;
 // Value2D/3D（值噪声）、Perlin2D/3D（梯度噪声）、Fbm2D（分形叠加）、Ridged2D（脊状变体）。
 public class Noise {
     // 置换表：前 256 项为 0..255 的一个排列，后 256 项复制前 256 项，
-    // 便于用 & 255 做无缝索引。
-    private List<int> perm = new List<int>();
+    // 扁平 int[512] 消除每格点多次 List<int> 索引与边界检查。
+    private int[] perm = new int[512];
 
     // 构造种子（可复现）。
     public long seed;
@@ -16,12 +16,15 @@ public class Noise {
     public Noise(long seed) {
         this.seed = seed;
         RandomExt rng = RandomExt.Seeded(seed);
+        List<int> tmp = new List<int>();
         for (int i = 0; i < 256; i++) {
-            this.perm.Add(i);
+            tmp.Add(i);
         }
-        rng.Shuffle<int>(this.perm);
+        rng.Shuffle<int>(tmp);
         for (int i = 0; i < 256; i++) {
-            this.perm.Add(this.perm[i]);
+            int v = tmp[i];
+            this.perm[i] = v;
+            this.perm[i + 256] = v;
         }
     }
 
@@ -69,7 +72,7 @@ public class Noise {
         return (double)h / 127.5 - 1.0;
     }
 
-    // 二维值噪声。
+    // 二维值噪声（复用格点 X/Y 置换，消除重复查表与 List 间接访问）。
     public double Value2D(double x, double y) {
         double fx = Math.Floor(x);
         double fy = Math.Floor(y);
@@ -77,14 +80,19 @@ public class Noise {
         int yi = (int)fy;
         double u = Noise.Fade(x - fx);
         double v = Noise.Fade(y - fy);
-        double a = this.Hash2(xi, yi);
-        double b = this.Hash2(xi + 1, yi);
-        double c = this.Hash2(xi, yi + 1);
-        double d = this.Hash2(xi + 1, yi + 1);
+        int X = xi & 255;
+        int Y = yi & 255;
+        Span<int> p = new Span<int>((nint)this.perm, 512);
+        int p0 = p[X] + Y;
+        int p1 = p[X + 1] + Y;
+        double a = (double)p[p0] / 127.5 - 1.0;
+        double b = (double)p[p1] / 127.5 - 1.0;
+        double c = (double)p[p0 + 1] / 127.5 - 1.0;
+        double d = (double)p[p1 + 1] / 127.5 - 1.0;
         return Noise.Lerp(Noise.Lerp(a, b, u), Noise.Lerp(c, d, u), v);
     }
 
-    // 三维值噪声。
+    // 三维值噪声（将 24 次哈希表索引合并为 14 次定长 Span 索引）。
     public double Value3D(double x, double y, double z) {
         double fx = Math.Floor(x);
         double fy = Math.Floor(y);
@@ -95,14 +103,24 @@ public class Noise {
         double u = Noise.Fade(x - fx);
         double v = Noise.Fade(y - fy);
         double w = Noise.Fade(z - fz);
-        double a000 = this.Hash3(xi, yi, zi);
-        double a100 = this.Hash3(xi + 1, yi, zi);
-        double a010 = this.Hash3(xi, yi + 1, zi);
-        double a110 = this.Hash3(xi + 1, yi + 1, zi);
-        double a001 = this.Hash3(xi, yi, zi + 1);
-        double a101 = this.Hash3(xi + 1, yi, zi + 1);
-        double a011 = this.Hash3(xi, yi + 1, zi + 1);
-        double a111 = this.Hash3(xi + 1, yi + 1, zi + 1);
+        int X = xi & 255;
+        int Y = yi & 255;
+        int Z = zi & 255;
+        Span<int> p = new Span<int>((nint)this.perm, 512);
+        int a = p[X] + Y;
+        int aa = p[a] + Z;
+        int ab = p[a + 1] + Z;
+        int b = p[X + 1] + Y;
+        int ba = p[b] + Z;
+        int bb = p[b + 1] + Z;
+        double a000 = (double)p[aa] / 127.5 - 1.0;
+        double a100 = (double)p[ba] / 127.5 - 1.0;
+        double a010 = (double)p[ab] / 127.5 - 1.0;
+        double a110 = (double)p[bb] / 127.5 - 1.0;
+        double a001 = (double)p[aa + 1] / 127.5 - 1.0;
+        double a101 = (double)p[ba + 1] / 127.5 - 1.0;
+        double a011 = (double)p[ab + 1] / 127.5 - 1.0;
+        double a111 = (double)p[bb + 1] / 127.5 - 1.0;
         double x00 = Noise.Lerp(a000, a100, u);
         double x10 = Noise.Lerp(a010, a110, u);
         double x01 = Noise.Lerp(a001, a101, u);
@@ -122,14 +140,15 @@ public class Noise {
         double v = Noise.Fade(yf);
         int X = xi & 255;
         int Y = yi & 255;
-        int a = this.perm[X] + Y;
-        int b = this.perm[X + 1] + Y;
+        Span<int> p = new Span<int>((nint)this.perm, 512);
+        int a = p[X] + Y;
+        int b = p[X + 1] + Y;
         double x1 = Noise.Lerp(
-            Noise.Grad2(this.perm[a], xf, yf),
-            Noise.Grad2(this.perm[b], xf - 1.0, yf), u);
+            Noise.Grad2(p[a], xf, yf),
+            Noise.Grad2(p[b], xf - 1.0, yf), u);
         double x2 = Noise.Lerp(
-            Noise.Grad2(this.perm[a + 1], xf, yf - 1.0),
-            Noise.Grad2(this.perm[b + 1], xf - 1.0, yf - 1.0), u);
+            Noise.Grad2(p[a + 1], xf, yf - 1.0),
+            Noise.Grad2(p[b + 1], xf - 1.0, yf - 1.0), u);
         return Noise.Lerp(x1, x2, v);
     }
 
@@ -150,22 +169,23 @@ public class Noise {
         int X = xi & 255;
         int Y = yi & 255;
         int Z = zi & 255;
-        int a = this.perm[X] + Y;
-        int aa = this.perm[a] + Z;
-        int ab = this.perm[a + 1] + Z;
-        int b = this.perm[X + 1] + Y;
-        int ba = this.perm[b] + Z;
-        int bb = this.perm[b + 1] + Z;
+        Span<int> p = new Span<int>((nint)this.perm, 512);
+        int a = p[X] + Y;
+        int aa = p[a] + Z;
+        int ab = p[a + 1] + Z;
+        int b = p[X + 1] + Y;
+        int ba = p[b] + Z;
+        int bb = p[b + 1] + Z;
         double x1 = Noise.Lerp(
-            Noise.Lerp(Noise.Grad3(this.perm[aa], xf, yf, zf),
-                       Noise.Grad3(this.perm[ba], xf - 1.0, yf, zf), u),
-            Noise.Lerp(Noise.Grad3(this.perm[ab], xf, yf - 1.0, zf),
-                       Noise.Grad3(this.perm[bb], xf - 1.0, yf - 1.0, zf), u), v);
+            Noise.Lerp(Noise.Grad3(p[aa], xf, yf, zf),
+                       Noise.Grad3(p[ba], xf - 1.0, yf, zf), u),
+            Noise.Lerp(Noise.Grad3(p[ab], xf, yf - 1.0, zf),
+                       Noise.Grad3(p[bb], xf - 1.0, yf - 1.0, zf), u), v);
         double x2 = Noise.Lerp(
-            Noise.Lerp(Noise.Grad3(this.perm[aa + 1], xf, yf, zf - 1.0),
-                       Noise.Grad3(this.perm[ba + 1], xf - 1.0, yf, zf - 1.0), u),
-            Noise.Lerp(Noise.Grad3(this.perm[ab + 1], xf, yf - 1.0, zf - 1.0),
-                       Noise.Grad3(this.perm[bb + 1], xf - 1.0, yf - 1.0, zf - 1.0), u), v);
+            Noise.Lerp(Noise.Grad3(p[aa + 1], xf, yf, zf - 1.0),
+                       Noise.Grad3(p[ba + 1], xf - 1.0, yf, zf - 1.0), u),
+            Noise.Lerp(Noise.Grad3(p[ab + 1], xf, yf - 1.0, zf - 1.0),
+                       Noise.Grad3(p[bb + 1], xf - 1.0, yf - 1.0, zf - 1.0), u), v);
         return Noise.Lerp(x1, x2, w);
     }
 

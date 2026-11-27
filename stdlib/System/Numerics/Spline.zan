@@ -104,28 +104,54 @@ public class Spline {
         return new Vector3((float)h0, (float)h1, (float)h2);
     }
 
-    // 三次贝塞尔插值：把全部控制点当作一条 n 阶贝塞尔曲线的控制顶点。
+    private static double PowInt(double b, int exp) {
+        double res = 1.0;
+        double cur = b;
+        int e = exp;
+        while (e > 0) {
+            if ((e & 1) != 0) { res = res * cur; }
+            cur = cur * cur;
+            e = e >> 1;
+        }
+        return res;
+    }
+
+    // 三次贝塞尔插值：把全部控制点当作一条 n 阶贝塞尔曲线的控制顶点（对称递推，零 Math.Pow 与零堆分配）。
     public Vector3 EvaluateBezier(float t) {
         int n = this.points.Count;
         if (n == 0) { return Vector3.Zero; }
         if (n == 1) { return this.points[0]; }
         double tt = (double)t;
-        if (tt < 0.0) { tt = 0.0; }
-        if (tt > 1.0) { tt = 1.0; }
+        if (tt <= 0.0) { return this.points[0]; }
+        if (tt >= 1.0) { return this.points[n - 1]; }
         int degree = n - 1;
         double oneMinus = 1.0 - tt;
-        double binom = 1.0;
         double bx = 0.0;
         double by = 0.0;
         double bz = 0.0;
-        for (int i = 0; i <= degree; i++) {
-            double weight = binom * Math.Pow(oneMinus, (double)(degree - i)) * Math.Pow(tt, (double)i);
-            Vector3 p = this.points[i];
-            bx = bx + weight * (double)p.X;
-            by = by + weight * (double)p.Y;
-            bz = bz + weight * (double)p.Z;
-            if (i < degree) {
-                binom = binom * (double)(degree - i) / (double)(i + 1);
+        if (tt <= 0.5) {
+            double ratio = tt / oneMinus;
+            double term = Spline.PowInt(oneMinus, degree);
+            for (int i = 0; i <= degree; i++) {
+                Vector3 p = this.points[i];
+                bx = bx + term * (double)p.X;
+                by = by + term * (double)p.Y;
+                bz = bz + term * (double)p.Z;
+                if (i < degree) {
+                    term = term * ratio * (double)(degree - i) / (double)(i + 1);
+                }
+            }
+        } else {
+            double ratio = oneMinus / tt;
+            double term = Spline.PowInt(tt, degree);
+            for (int i = degree; i >= 0; i--) {
+                Vector3 p = this.points[i];
+                bx = bx + term * (double)p.X;
+                by = by + term * (double)p.Y;
+                bz = bz + term * (double)p.Z;
+                if (i > 0) {
+                    term = term * ratio * (double)i / (double)(degree - i + 1);
+                }
             }
         }
         return new Vector3((float)bx, (float)by, (float)bz);
@@ -175,13 +201,15 @@ public class Spline {
         return (float)total;
     }
 
-    // 等弧长重采样：沿曲线按弧长均匀取 count 个点（首尾必取）。
+    // 等弧长重采样：沿曲线按弧长均匀取 count 个点（首尾必取，扁平数组 + 单调双指针 O(count + steps)）。
     public List<Vector3> Resample(int count) {
         List<Vector3> result = new List<Vector3>();
         int n = this.points.Count;
         if (count <= 0 || n == 0) { return result; }
+        result.Reserve(count);
         if (n == 1) {
-            for (int i = 0; i < count; i++) { result.Add(this.points[0]); }
+            Vector3 only = this.points[0];
+            for (int i = 0; i < count; i++) { result.Add(only); }
             return result;
         }
         if (count == 1) {
@@ -189,42 +217,46 @@ public class Spline {
             return result;
         }
         int steps = count * 8;
-        List<double> cumulative = new List<double>();
-        List<Vector3> samples = new List<Vector3>();
+        double[] cumulative = new double[steps + 1];
+        float[] sx = new float[steps + 1];
+        float[] sy = new float[steps + 1];
+        float[] sz = new float[steps + 1];
         double total = 0.0;
         Vector3 prev = this.Evaluate(0.0f);
-        samples.Add(prev);
-        cumulative.Add(0.0);
+        sx[0] = prev.X;
+        sy[0] = prev.Y;
+        sz[0] = prev.Z;
+        cumulative[0] = 0.0;
+        float invSteps = 1.0f / (float)steps;
         for (int i = 1; i <= steps; i++) {
-            float t = (float)i / (float)steps;
+            float t = (float)i * invSteps;
             Vector3 cur = this.Evaluate(t);
             total = total + (double)Vector3.Distance(prev, cur);
-            samples.Add(cur);
-            cumulative.Add(total);
+            sx[i] = cur.X;
+            sy[i] = cur.Y;
+            sz[i] = cur.Z;
+            cumulative[i] = total;
             prev = cur;
         }
+        int lo = 0;
+        double invCountM1 = 1.0 / (double)(count - 1);
         for (int i = 0; i < count; i++) {
-            double target = total * (double)i / (double)(count - 1);
-            int lo = 0;
-            int hi = steps;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (cumulative[mid] < target) { lo = mid + 1; } else { hi = mid; }
+            double target = total * (double)i * invCountM1;
+            while (lo < steps && cumulative[lo] < target) {
+                lo = lo + 1;
             }
             if (lo > 0 && lo <= steps) {
                 double c0 = cumulative[lo - 1];
                 double c1 = cumulative[lo];
                 double span = c1 - c0;
                 double frac = span > 0.0 ? (target - c0) / span : 0.0;
-                Vector3 p0 = samples[lo - 1];
-                Vector3 p1 = samples[lo];
                 result.Add(new Vector3(
-                    (float)((double)p0.X + ((double)p1.X - (double)p0.X) * frac),
-                    (float)((double)p0.Y + ((double)p1.Y - (double)p0.Y) * frac),
-                    (float)((double)p0.Z + ((double)p1.Z - (double)p0.Z) * frac)
+                    (float)((double)sx[lo - 1] + ((double)sx[lo] - (double)sx[lo - 1]) * frac),
+                    (float)((double)sy[lo - 1] + ((double)sy[lo] - (double)sy[lo - 1]) * frac),
+                    (float)((double)sz[lo - 1] + ((double)sz[lo] - (double)sz[lo - 1]) * frac)
                 ));
             } else {
-                result.Add(this.Evaluate(0.0f));
+                result.Add(new Vector3(sx[0], sy[0], sz[0]));
             }
         }
         return result;

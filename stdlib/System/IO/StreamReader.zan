@@ -5,20 +5,37 @@ namespace System.IO;
 // 基于 Stream 的缓冲文本读取器：按块拉取并逐行解码（兼容 "\n" 与 "\r\n"，字节按 UTF-8 原样传递）。
 // 若由本 reader 打开底层流（如 Open/FromStr），Close 时一并关闭；Wrap 传入的外部流由调用方关闭。
 public class StreamReader : IDisposable {
+    static string[] asciiSingleChars = null;
+
     Stream stream;
     bool owns;
-    string buf;  // 已读取但尚未返回的字节
-    int pos;  // buf 的消费游标
-    bool eof;  // 流中已无更多字节
+    byte[] rawBuf; // 复用读缓冲（零每块 Alloc/GetString/Free）
+    int bufLen;    // rawBuf 当前有效字节数
+    int pos;       // rawBuf 的消费游标
+    bool eof;      // 流中已无更多字节
     int chunk;
 
     public StreamReader() {
         this.stream = null;
         this.owns = false;
-        this.buf = "";
+        this.rawBuf = null;
+        this.bufLen = 0;
         this.pos = 0;
         this.eof = false;
         this.chunk = 8192;
+    }
+
+    private static string[] GetAsciiSingleChars() {
+        string[] t = StreamReader.asciiSingleChars;
+        if (t != null) { return t; }
+        string[] arr = new string[128];
+        byte[] one = new byte[1];
+        for (int i = 0; i < 128; i = i + 1) {
+            one[0] = (byte)i;
+            arr[i] = one.ToStr(0, 1);
+        }
+        StreamReader.asciiSingleChars = arr;
+        return arr;
     }
 
     // 打开文件用于读取。若文件不存在则抛出 FileNotFoundException。
@@ -56,124 +73,149 @@ public class StreamReader : IDisposable {
 
     // 缓冲区为空且流已耗尽时为真。
     public bool EndOfStream() {
-        if (this.pos < this.buf.Length) {
+        if (this.pos < this.bufLen) {
             return false;
         }
         this.Fill();
-        return this.pos >= this.buf.Length;
+        return this.pos >= this.bufLen;
     }
 
-    private void AcceptChunk(string more) {
-        if (more.Length == 0) {
+    // 缓冲区耗尽时直接填充复用字节缓冲（零托管 string 分配与多余拷贝）。
+    void Fill() {
+        if (this.pos < this.bufLen || this.eof) { return; }
+        if (this.rawBuf == null) { this.rawBuf = new byte[this.chunk]; }
+        int n = this.stream.ReadInto((nint)this.rawBuf, this.chunk);
+        if (n <= 0) {
+            this.bufLen = 0;
+            this.pos = 0;
             this.eof = true;
             return;
         }
-        this.buf = more;
+        this.bufLen = n;
         this.pos = 0;
     }
 
-    // 缓冲区耗尽时再拉取一块数据。
-    void Fill() {
-        if (this.pos < this.buf.Length || this.eof) { return; }
-        this.AcceptChunk(this.stream.Read(this.chunk));
-    }
-
-    // 异步拉取一块数据到缓冲区。
+    // 异步拉取一块数据到复用字节缓冲。
     async void FillAsync() {
-        if (this.pos < this.buf.Length || this.eof) { return; }
-        this.AcceptChunk(await this.stream.ReadAsync(this.chunk));
+        if (this.pos < this.bufLen || this.eof) { return; }
+        if (this.rawBuf == null) { this.rawBuf = new byte[this.chunk]; }
+        int n = await this.stream.ReadBytesAsync(this.rawBuf, 0, this.chunk);
+        if (n <= 0) {
+            this.bufLen = 0;
+            this.pos = 0;
+            this.eof = true;
+            return;
+        }
+        this.bufLen = n;
+        this.pos = 0;
     }
 
-    // 读取一个字节作为单字符字符串，结束时返回 ""。
+    // 读取一个字节作为单字符字符串，结束时返回 ""（ASCII 单字节走静态池零分配）。
     public string ReadChar() {
         this.Fill();
-        if (this.pos >= this.buf.Length) {
+        if (this.pos >= this.bufLen) {
             return "";
         }
-        string c = this.buf.Substring(this.pos, 1);
-        this.pos = this.pos + 1;
-        return c;
+        int p = this.pos;
+        this.pos = p + 1;
+        int b = this.rawBuf[p] & 255;
+        if (b < 128) {
+            return StreamReader.GetAsciiSingleChars()[b];
+        }
+        return this.rawBuf.ToStr(p, 1);
     }
 
     // 读取最多 `count` 字节；输入结束时返回 ""。
     public string ReadBlock(int count) {
         if (count <= 0) { return ""; }
         this.Fill();
-        int firstAvail = this.buf.Length - this.pos;
+        int firstAvail = this.bufLen - this.pos;
         if (firstAvail <= 0) { return ""; }
         if (firstAvail >= count) {
-            string fast = this.buf.Substring(this.pos, count);
+            string fast = this.rawBuf.ToStr(this.pos, count);
             this.pos = this.pos + count;
             return fast;
         }
         StringBuilder sb = new StringBuilder(count);
-        sb.Append(new StringView((nint)this.buf + (nint)this.pos, firstAvail));
-        this.pos = this.buf.Length;
+        sb.Append(new StringView((nint)this.rawBuf + (nint)this.pos, firstAvail));
+        this.pos = this.bufLen;
         int need = count - firstAvail;
         while (need > 0) {
             this.Fill();
-            int avail = this.buf.Length - this.pos;
+            int avail = this.bufLen - this.pos;
             if (avail <= 0) {
                 break;
             }
             int take = need < avail ? need : avail;
-            sb.Append(new StringView((nint)this.buf + (nint)this.pos, take));
+            sb.Append(new StringView((nint)this.rawBuf + (nint)this.pos, take));
             this.pos = this.pos + take;
             need = need - take;
         }
         return sb.ToString();
     }
 
-    private static void AppendTrimmedRange(StringBuilder sb, string s, int start, int end) {
-        if (end > start && (s[end - 1] & 255) == 13) {
+    private static void AppendTrimmedRange(StringBuilder sb, byte[] buf, int start, int end) {
+        if (end > start && (buf[end - 1] & 255) == 13) {
             end = end - 1;
         }
         if (end <= start) { return; }
-        int cr = s.IndexOf("\r", start);
-        if (cr < 0 || cr >= end) {
-            sb.Append(new StringView((nint)s + (nint)start, end - start));
+        nint basePtr = (nint)buf;
+        int cr = NativeMemory.Find(basePtr, start, 13, end - start);
+        if (cr < 0) {
+            sb.Append(new StringView(basePtr + (nint)start, end - start));
             return;
         }
-        sb.Append(s.Substring(start, end - start).Replace("\r", ""));
+        int cur = start;
+        while (cur < end) {
+            int hit = NativeMemory.Find(basePtr, cur, 13, end - cur);
+            if (hit < 0) {
+                sb.Append(new StringView(basePtr + (nint)cur, end - cur));
+                break;
+            }
+            if (hit > cur) {
+                sb.Append(new StringView(basePtr + (nint)cur, hit - cur));
+            }
+            cur = hit + 1;
+        }
     }
 
-    // 尝试从当前缓冲直接切出完整一行（零 StringBuilder 分配）；未命中 '\n' 返回 null。
+    // 尝试从当前缓冲直接切出完整一行（memchr 扫 '\n' 与行内 '\r'，零 StringBuilder 分配）；未命中 '\n' 返回 null。
     private string TryTakeBufferedLine() {
-        int nl = this.buf.IndexOf("\n", this.pos);
-        if (nl < 0) { return null; }
         int start = this.pos;
+        nint basePtr = (nint)this.rawBuf;
+        int nl = NativeMemory.Find(basePtr, start, 10, this.bufLen - start);
+        if (nl < 0) { return null; }
         int lineEnd = nl;
-        if (lineEnd > start && (this.buf[lineEnd - 1] & 255) == 13) {
+        if (lineEnd > start && (this.rawBuf[lineEnd - 1] & 255) == 13) {
             lineEnd = lineEnd - 1;
         }
         this.pos = nl + 1;
         if (lineEnd <= start) { return ""; }
-        int cr = this.buf.IndexOf("\r", start);
-        if (cr < 0 || cr >= lineEnd) {
-            return this.buf.Substring(start, lineEnd - start);
+        int cr = NativeMemory.Find(basePtr, start, 13, lineEnd - start);
+        if (cr < 0) {
+            return this.rawBuf.ToStr(start, lineEnd - start);
         }
-        return this.buf.Substring(start, lineEnd - start).Replace("\r", "");
+        return this.rawBuf.ToStr(start, lineEnd - start).Replace("\r", "");
     }
 
     // 从当前 buf 消费至 '\n'；命中返回 true（pos 跳过换行），未命中消费到 buf 尾返回 false。
     private bool ConsumeBufferedLine(StringBuilder sb) {
         int start = this.pos;
-        int nl = this.buf.IndexOf("\n", start);
+        int nl = NativeMemory.Find((nint)this.rawBuf, start, 10, this.bufLen - start);
         if (nl >= 0) {
-            StreamReader.AppendTrimmedRange(sb, this.buf, start, nl);
+            StreamReader.AppendTrimmedRange(sb, this.rawBuf, start, nl);
             this.pos = nl + 1;
             return true;
         }
-        int bufLen = this.buf.Length;
-        StreamReader.AppendTrimmedRange(sb, this.buf, start, bufLen);
-        this.pos = bufLen;
+        StreamReader.AppendTrimmedRange(sb, this.rawBuf, start, this.bufLen);
+        this.pos = this.bufLen;
         return false;
     }
 
     // 读取下一行（不含终止符），输入结束返回 null。
     public string ReadLine() {
         this.Fill();
-        if (this.pos >= this.buf.Length) {
+        if (this.pos >= this.bufLen) {
             return null;
         }
         string fast = this.TryTakeBufferedLine();
@@ -181,7 +223,7 @@ public class StreamReader : IDisposable {
         StringBuilder sb = new StringBuilder();
         while (true) {
             this.Fill();
-            if (this.pos >= this.buf.Length || this.ConsumeBufferedLine(sb)) { break; }
+            if (this.pos >= this.bufLen || this.ConsumeBufferedLine(sb)) { break; }
         }
         return sb.ToString();
     }
@@ -200,7 +242,7 @@ public class StreamReader : IDisposable {
     // 异步读取下一行（不含终止符），输入结束返回 null。
     public async string ReadLineAsync() {
         await this.FillAsync();
-        if (this.pos >= this.buf.Length) {
+        if (this.pos >= this.bufLen) {
             return null;
         }
         string fast = this.TryTakeBufferedLine();
@@ -208,7 +250,7 @@ public class StreamReader : IDisposable {
         StringBuilder sb = new StringBuilder();
         while (true) {
             await this.FillAsync();
-            if (this.pos >= this.buf.Length || this.ConsumeBufferedLine(sb)) { break; }
+            if (this.pos >= this.bufLen || this.ConsumeBufferedLine(sb)) { break; }
         }
         return sb.ToString();
     }
@@ -227,9 +269,9 @@ public class StreamReader : IDisposable {
     // 读取剩余全部内容（含缓冲区）。
     public string ReadToEnd() {
         StringBuilder sb = new StringBuilder();
-        if (this.pos < this.buf.Length) {
-            sb.Append(this.buf.Substring(this.pos, this.buf.Length - this.pos));
-            this.pos = this.buf.Length;
+        if (this.pos < this.bufLen) {
+            sb.Append(new StringView((nint)this.rawBuf + (nint)this.pos, this.bufLen - this.pos));
+            this.pos = this.bufLen;
         }
         if (!this.eof) {
             sb.Append(this.stream.ReadToEnd());
@@ -241,9 +283,9 @@ public class StreamReader : IDisposable {
     // 异步读取剩余全部内容（含缓冲区）。
     public async string ReadToEndAsync() {
         StringBuilder sb = new StringBuilder();
-        if (this.pos < this.buf.Length) {
-            sb.Append(this.buf.Substring(this.pos, this.buf.Length - this.pos));
-            this.pos = this.buf.Length;
+        if (this.pos < this.bufLen) {
+            sb.Append(new StringView((nint)this.rawBuf + (nint)this.pos, this.bufLen - this.pos));
+            this.pos = this.bufLen;
         }
         if (!this.eof) {
             sb.Append(await this.stream.ReadToEndAsync());
@@ -263,7 +305,8 @@ public class StreamReader : IDisposable {
             this.stream.Close();
         }
         this.stream = null;
-        this.buf = "";
+        this.rawBuf = null;
+        this.bufLen = 0;
         this.pos = 0;
         this.eof = true;
     }
