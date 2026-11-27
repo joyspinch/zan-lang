@@ -42,7 +42,7 @@ public class HttpServer : IDisposable {
     public int maxConnections;
     public int maxConnectionsPerIp;
     public int activeConnections;
-    private List<nint> activeSockets;
+    private HashSet<nint> activeSockets;
     private Dictionary<nint, string> socketIps;
     private Dictionary<string, int> ipConnections;
     private int requestTimeout;
@@ -59,7 +59,7 @@ public class HttpServer : IDisposable {
         this.maxConnections = NetConstants.DefaultMaxConnections;
         this.maxConnectionsPerIp = NetConstants.DefaultMaxConnectionsPerIp;
         this.activeConnections = 0;
-        this.activeSockets = new List<nint>();
+        this.activeSockets = new HashSet<nint>();
         this.socketIps = new Dictionary<nint, string>();
         this.ipConnections = new Dictionary<string, int>();
         this.requestTimeout = NetConstants.TimeoutRequestMs;
@@ -192,7 +192,7 @@ public class HttpServer : IDisposable {
         this.acceptLoopDone = true;
     }
 
-    // 互斥申请连接槽位，避免并发 Accept 与断连竞争撕裂 activeSockets 列表。
+    // 互斥申请连接槽位，避免并发 Accept 与断连竞争撕裂 activeSockets 集合（O(1) 哈希集合）。
     private bool TryAcquireConnection(nint clientSock) {
         lock (this) {
             if (this.activeConnections >= this.maxConnections) {
@@ -202,9 +202,7 @@ public class HttpServer : IDisposable {
                 string ip = Socket.RemoteIp(clientSock);
                 if (ip != null && ip.Length > 0) {
                     int cur = 0;
-                    if (this.ipConnections.ContainsKey(ip)) {
-                        cur = this.ipConnections[ip];
-                    }
+                    this.ipConnections.TryGetValue(ip, out cur);
                     if (cur >= this.maxConnectionsPerIp) {
                         return false;
                     }
@@ -218,18 +216,19 @@ public class HttpServer : IDisposable {
         }
     }
 
-    // 互斥释放连接槽位。
+    // 互斥释放连接槽位（O(1)）。
     private void ReleaseConnection(nint clientSock) {
         lock (this) {
             this.activeConnections = this.activeConnections - 1;
             if (this.activeSockets != null) {
                 this.activeSockets.Remove(clientSock);
             }
-            if (this.socketIps != null && this.socketIps.ContainsKey(clientSock)) {
-                string ip = this.socketIps[clientSock];
+            string ip = null;
+            if (this.socketIps != null && this.socketIps.TryGetValue(clientSock, out ip)) {
                 this.socketIps.Remove(clientSock);
-                if (this.ipConnections != null && this.ipConnections.ContainsKey(ip)) {
-                    int c = this.ipConnections[ip] - 1;
+                int cur = 0;
+                if (this.ipConnections != null && this.ipConnections.TryGetValue(ip, out cur)) {
+                    int c = cur - 1;
                     if (c <= 0) {
                         this.ipConnections.Remove(ip);
                     } else {
@@ -542,8 +541,9 @@ public class HttpServer : IDisposable {
         }
         lock (this) {
             if (this.activeSockets != null) {
-                for (int i = 0; i < this.activeSockets.Count; i = i + 1) {
-                    Socket.Close(this.activeSockets[i]);
+                List<nint> socks = this.activeSockets.ToList();
+                for (int i = 0; i < socks.Count; i = i + 1) {
+                    Socket.Close(socks[i]);
                 }
                 this.activeSockets.Clear();
             }

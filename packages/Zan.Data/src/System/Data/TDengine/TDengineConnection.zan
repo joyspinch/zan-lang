@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Json;
 using System.Net.Http;
@@ -39,7 +40,7 @@ public class TDengineConnection : IDbConnection {
     int lastCode;  // taosAdapter 的错误码（响应 JSON 的 `code`）
     int affected;
     bool busy;
-    List<AsyncGate> waiters;
+    Queue<AsyncGate> waiters;
 
     async bool AcquireLock() {
         if (!this.busy) {
@@ -47,17 +48,16 @@ public class TDengineConnection : IDbConnection {
             return true;
         }
         AsyncGate g = new AsyncGate();
-        if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
-        this.waiters.Add(g);
+        if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
+        this.waiters.Enqueue(g);
         await g.Wait();
         g.Close();
         return true;
     }
 
     void ReleaseLock() {
-        if (this.waiters != null && this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
+        if (this.waiters != null && this.waiters.Count() > 0) {
+            AsyncGate g = this.waiters.Dequeue();
             g.Signal();
         } else {
             this.busy = false;
@@ -76,7 +76,7 @@ public class TDengineConnection : IDbConnection {
         this.lastCode = 0;
         this.affected = 0;
         this.busy = false;
-        this.waiters = new List<AsyncGate>();
+        this.waiters = new Queue<AsyncGate>();
     }
 
     // 使用 HTTP Basic 凭据打开连接，不
@@ -750,9 +750,8 @@ public class TDengineConnection : IDbConnection {
 
     // 释放连接状态。安全释放互斥门控并唤醒所有等待者。
     public void Close() {
-        while (this.waiters != null && this.waiters.Count > 0) {
-            AsyncGate g = this.waiters[0];
-            this.waiters.RemoveAt(0);
+        while (this.waiters != null && this.waiters.Count() > 0) {
+            AsyncGate g = this.waiters.Dequeue();
             g.Signal();
         }
         this.busy = false;

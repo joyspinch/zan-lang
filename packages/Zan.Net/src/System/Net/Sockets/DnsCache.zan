@@ -34,27 +34,9 @@ public class DnsCache {
         }
     }
 
-    private static string AsciiLower(string s) {
-        if (s == null || s.Length == 0) { return ""; }
-        int n = s.Length;
-        bool hasUpper = false;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
-            if (c >= 65 && c <= 90) { hasUpper = true; break; }
-        }
-        if (!hasUpper) { return s; }
-        byte[] buf = new byte[n];
-        for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
-            if (c >= 65 && c <= 90) { c = c + 32; }
-            buf[i] = (byte)c;
-        }
-        return buf.ToStr(0, n);
-    }
-
     private static string MakeKey(string host, int port) {
         if (host == null) { host = ""; }
-        return DnsCache.AsciiLower(host) + ":" + Convert.ToString(port);
+        return host.ToLowerAscii() + ":" + Convert.ToString(port);
     }
 
     // 查询缓存。若命中且未过期，将 records 拷贝到 outRecords 并返回地址数量；否则返回 0。
@@ -66,8 +48,8 @@ public class DnsCache {
         DnsCacheEntry found = null;
         Mutex.Lock(DnsCache.mtx);
         try {
-            if (DnsCache.entries.ContainsKey(key)) {
-                DnsCacheEntry e = DnsCache.entries[key];
+            DnsCacheEntry e = null;
+            if (DnsCache.entries.TryGetValue(key, out e)) {
                 if (now < e.expiryMs) {
                     found = e;
                 } else {
@@ -80,8 +62,8 @@ public class DnsCache {
         if (found != null && found.count > 0) {
             int copyLen = found.count * 32;
             if (copyLen > outRecords.Length) { copyLen = outRecords.Length; }
-            for (int i = 0; i < copyLen; i = i + 1) {
-                outRecords[i] = found.records[i];
+            if (copyLen > 0) {
+                NativeMemory.Copy((nint)outRecords, (nint)found.records, copyLen);
             }
             return copyLen / 32;
         }
@@ -94,9 +76,10 @@ public class DnsCache {
         DnsCache.EnsureInit();
         string key = DnsCache.MakeKey(host, port);
         long exp = Stopwatch.GetMilliseconds() + DnsCache.defaultTtlMs;
-        byte[] copy = new byte[count * 32];
-        for (int i = 0; i < copy.Length; i = i + 1) {
-            copy[i] = records[i];
+        int copyLen = count * 32;
+        byte[] copy = new byte[copyLen];
+        if (copyLen > 0) {
+            NativeMemory.Copy((nint)copy, (nint)records, copyLen);
         }
         DnsCacheEntry entry = new DnsCacheEntry(copy, count, exp);
         Mutex.Lock(DnsCache.mtx);
@@ -117,9 +100,7 @@ public class DnsCache {
         string key = DnsCache.MakeKey(host, port);
         Mutex.Lock(DnsCache.mtx);
         try {
-            if (DnsCache.entries.ContainsKey(key)) {
-                DnsCache.entries.Remove(key);
-            }
+            DnsCache.entries.Remove(key);
         } finally {
             Mutex.Unlock(DnsCache.mtx);
         }

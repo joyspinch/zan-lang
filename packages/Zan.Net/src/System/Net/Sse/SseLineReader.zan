@@ -20,38 +20,66 @@ namespace System.Net.Sse;
 // 只需要"按行消费 data: 负载"的流式消费方（AI 流式补全等）用本类。
 // B-ID164：原先 Zan.Ai/Zan.Mvc/ide_zan 各自手写同构逻辑，收拢至此。
 public class SseLineReader {
-    // 还没凑齐一行的残留字节。
+    // 还没凑齐一行的残留字节及已消费游标（游标推进替代每行 Substring 拷贝，O(N^2)->O(N)）。
     private string pending;
+    private int pos;
 
     public SseLineReader() {
         this.pending = "";
+        this.pos = 0;
     }
 
     // 喂进新到的字节。
     public void Feed(string data) {
         if (data == null || data.Length == 0) { return; }
-        this.pending = this.pending + data;
+        int rem = this.pending.Length - this.pos;
+        if (rem <= 0) {
+            this.pending = data;
+            this.pos = 0;
+            return;
+        }
+        if (this.pos > 0) {
+            this.pending = this.pending.Substring(this.pos, rem) + data;
+            this.pos = 0;
+        } else {
+            this.pending = this.pending + data;
+        }
     }
 
     // 取下一行**非空**行（空行是 SSE 的事件分隔符，没有内容，直接跳过）。
     //
     // 没有完整的一行时返回空串。跳过空行不是偷懒：调用方拿"空串"当"没有
     // 更多行了"的信号，若把空行也交出去，调用方就会把"这一批处理完了"
-    //误当成"整个缓冲处理完了"，把后面还没读的行留在缓冲里。
+    // 误当成"整个缓冲处理完了"，把后面还没读的行留在缓冲里。
     public string Next() {
-        while (true) {
-            int nl = this.pending.IndexOf("\n");
+        while (this.pos < this.pending.Length) {
+            int nl = this.pending.IndexOf("\n", this.pos);
             if (nl < 0) { return ""; }
-            string line = this.pending.Substring(0, nl).Trim();
-            this.pending = this.pending.Substring(nl + 1);
+            string line = this.pending.Substring(this.pos, nl - this.pos).Trim();
+            this.pos = nl + 1;
+            if (this.pos >= this.pending.Length) {
+                this.pending = "";
+                this.pos = 0;
+            } else if (this.pos >= 4096 && this.pos * 2 >= this.pending.Length) {
+                this.pending = this.pending.Substring(this.pos);
+                this.pos = 0;
+            }
             if (line.Length > 0) { return line; }
         }
+        return "";
     }
 
     // 流结束时把残留的半行按完整的一行交出来（没有则返回空串）。
     public string Flush() {
-        string rest = this.pending.Trim();
+        int rem = this.pending.Length - this.pos;
+        if (rem <= 0) {
+            this.pending = "";
+            this.pos = 0;
+            return "";
+        }
+        string rest = (this.pos > 0 ? this.pending.Substring(this.pos, rem) : this.pending).Trim();
         this.pending = "";
+        this.pos = 0;
         return rest;
     }
 }

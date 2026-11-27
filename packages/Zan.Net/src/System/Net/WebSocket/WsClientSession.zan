@@ -17,14 +17,14 @@ internal class WsClientSession {
     private bool connected;
     private bool sendBusy;
     private bool receiveBusy;
-    private List<AsyncGate> sendWaiters;
+    private Queue<AsyncGate> sendWaiters;
     private int lastOpcode;
     private int lastLen;
 
     public WsClientSession() {
         this.sync = new object();
         this.assembler = new WsAssembler(16777216);
-        this.sendWaiters = new List<AsyncGate>();
+        this.sendWaiters = new Queue<AsyncGate>();
     }
 
     // Transfer transport ownership only after a successful HTTP upgrade. The
@@ -52,7 +52,7 @@ internal class WsClientSession {
                 return true;
             }
             waiter = new AsyncGate();
-            this.sendWaiters.Add(waiter);
+            this.sendWaiters.Enqueue(waiter);
         }
         await waiter.Wait();
         waiter.Close();
@@ -61,9 +61,8 @@ internal class WsClientSession {
 
     private void ReleaseSend() {
         lock (this.sync) {
-            if (this.sendWaiters.Count > 0) {
-                AsyncGate waiter = this.sendWaiters[0];
-                this.sendWaiters.RemoveAt(0);
+            if (this.sendWaiters.Count() > 0) {
+                AsyncGate waiter = this.sendWaiters.Dequeue();
                 waiter.Signal();
             } else {
                 this.sendBusy = false;
@@ -208,7 +207,7 @@ internal class WsClientSession {
         TcpClient conn = null;
         TlsStream stream = null;
         TlsContext context = null;
-        List<AsyncGate> waiters = null;
+        Queue<AsyncGate> waiters = null;
         lock (this.sync) {
             this.connected = false;
             input = this.reader;
@@ -221,7 +220,7 @@ internal class WsClientSession {
             this.context = null;
             this.sendBusy = false;
             waiters = this.sendWaiters;
-            this.sendWaiters = new List<AsyncGate>();
+            this.sendWaiters = new Queue<AsyncGate>();
         }
         // Stop admission before shutdown; the active FillMore retains ownership
         // until its await completes. Closing outside sync avoids lock inversion
@@ -234,7 +233,7 @@ internal class WsClientSession {
                 if (context != null) { context.Free(); }
             }
         } finally {
-            foreach (AsyncGate waiter in waiters) { waiter.Signal(); }
+            while (waiters.Count() > 0) { waiters.Dequeue().Signal(); }
         }
     }
 

@@ -14,10 +14,14 @@ public class SseClient : IDisposable {
     private TlsStream tls;
     private TlsContext tlsCtx;
     private string buf;
+    private int bufPos;
+    private byte[] tlsReadBuf;
     private bool connected;
 
     public SseClient() {
         this.buf = "";
+        this.bufPos = 0;
+        this.tlsReadBuf = null;
         this.connected = false;
         this.client = null;
         this.tls = null;
@@ -148,6 +152,7 @@ public class SseClient : IDisposable {
             return false;
         }
         this.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
+        this.bufPos = 0;
         this.connected = true;
         return true;
     }
@@ -160,27 +165,34 @@ public class SseClient : IDisposable {
     // （keep-alive 心跳）会被透明跳过。
     public async SseEvent NextAsync() {
         if (!this.connected) { return null; }
-        byte[] tlsTmp = null;
         while (true) {
-            // 事件以空行结束；流中可能使用 \n 或 \r\n。
-            int end = SseText.Find(this.buf, "\n\n", 0);
-            int sepLen = 2;
-            int endCrlf = SseText.Find(this.buf, "\r\n\r\n", 0);
-            if (endCrlf >= 0 && (end < 0 || endCrlf < end)) { end = endCrlf; sepLen = 4; }
-            if (end >= 0) {
-                string block = this.buf.Substring(0, end);
-                this.buf = this.buf.Substring(end + sepLen,
-                                              this.buf.Length - end - sepLen);
-                SseEvent e = ParseBlock(block);
-                if (e != null) { return e; }
-                continue;  // 该块只有注释
+            // 事件以空行结束；流中可能使用 \n 或 \r\n（游标推进消除 O(N^2) 切片拷贝）。
+            if (this.bufPos < this.buf.Length) {
+                int end = this.buf.IndexOf("\n\n", this.bufPos);
+                int sepLen = 2;
+                int endCrlf = this.buf.IndexOf("\r\n\r\n", this.bufPos);
+                if (endCrlf >= 0 && (end < 0 || endCrlf < end)) { end = endCrlf; sepLen = 4; }
+                if (end >= 0) {
+                    string block = this.buf.Substring(this.bufPos, end - this.bufPos);
+                    this.bufPos = end + sepLen;
+                    if (this.bufPos >= this.buf.Length) {
+                        this.buf = "";
+                        this.bufPos = 0;
+                    } else if (this.bufPos >= 4096 && this.bufPos * 2 >= this.buf.Length) {
+                        this.buf = this.buf.Substring(this.bufPos);
+                        this.bufPos = 0;
+                    }
+                    SseEvent e = ParseBlock(block);
+                    if (e != null) { return e; }
+                    continue;  // 该块只有注释
+                }
             }
             string chunk = "";
             if (this.tls != null) {
-                if (tlsTmp == null) { tlsTmp = new byte[4096]; }
-                int rn = await this.tls.RecvBytesAsync(tlsTmp, 0, 4096);
+                if (this.tlsReadBuf == null) { this.tlsReadBuf = new byte[4096]; }
+                int rn = await this.tls.RecvBytesAsync(this.tlsReadBuf, 0, 4096);
                 if (rn > 0) {
-                    chunk = Encoding.UTF8.GetString(tlsTmp, 0, rn);
+                    chunk = Encoding.UTF8.GetString(this.tlsReadBuf, 0, rn);
                 }
             } else if (this.client != null) {
                 chunk = await this.client.RecvAsync(4096);
@@ -189,14 +201,23 @@ public class SseClient : IDisposable {
                 this.connected = false;
                 return null;
             }
+            int rem = this.buf.Length - this.bufPos;
             // 缓冲上限：合法的 SSE 事件以空行收尾，8 MiB 还凑不出一个
             // 空行只可能是对端在发无界垃圾（或彻底违反协议）——此前
             // 无上限，恶意上游可把客户端喂到 OOM。超限按断流处理。
-            if (this.buf.Length + chunk.Length > 8388608) {
+            if (rem + chunk.Length > 8388608) {
                 this.Close();
                 return null;
             }
-            this.buf = this.buf + chunk;
+            if (rem <= 0) {
+                this.buf = chunk;
+                this.bufPos = 0;
+            } else if (this.bufPos > 0) {
+                this.buf = this.buf.Substring(this.bufPos, rem) + chunk;
+                this.bufPos = 0;
+            } else {
+                this.buf = this.buf + chunk;
+            }
         }
         return null;
     }

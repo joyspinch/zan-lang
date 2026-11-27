@@ -11,32 +11,51 @@ namespace System.Net.Http;
 // 迟早会在"长度前缀是大写还是小写""结束块要不要带 trailer"上分叉。
 public class HttpChunkWriter {
     // 块长度的十六进制文本（小写、不带 "0x" 前缀、无前导零）。
-    // 长度是非负 int：4 字节大端足够（int 上限 2^31-1）。
+    // 长度是非负 int：单次栈/数组格式化，消除 byte[4]+ToHexString+Substring 三重分配。
     public static string HexLength(int len) {
         if (len <= 0) { return "0"; }
-        byte[] b = new byte[4];
-        b[0] = (byte)((len >> 24) & 255);
-        b[1] = (byte)((len >> 16) & 255);
-        b[2] = (byte)((len >> 8) & 255);
-        b[3] = (byte)(len & 255);
-        string hex = Convert.ToHexString(b, 0, 4);
-        int start = 0;
-        while (start < 7 && hex[start] == '0') { start = start + 1; }
-        return hex.Substring(start, 8 - start);
+        byte[] buf = new byte[8];
+        int p = 8;
+        int v = len;
+        while (v > 0) {
+            p = p - 1;
+            int d = v & 15;
+            buf[p] = (byte)(d < 10 ? 48 + d : 87 + d);
+            v = v >> 4;
+        }
+        return buf.ToStr(p, 8 - p);
     }
 
-    // 块前缀 "<长度>\r\n" 的字节形式。
+    // 块前缀 "<长度>\r\n" 的字节形式（单次数组分配直接写入）。
     public static byte[] FramePrefix(int len) {
-        return (HttpChunkWriter.HexLength(len) + "\r\n").ToBytes();
+        if (len <= 0) { return new byte[] { 48, 13, 10 }; }
+        int tmp = len;
+        int digits = 0;
+        while (tmp > 0) {
+            digits = digits + 1;
+            tmp = tmp >> 4;
+        }
+        byte[] outb = new byte[digits + 2];
+        int p = digits;
+        int v = len;
+        while (v > 0) {
+            p = p - 1;
+            int d = v & 15;
+            outb[p] = (byte)(d < 10 ? 48 + d : 87 + d);
+            v = v >> 4;
+        }
+        outb[digits] = 13;
+        outb[digits + 1] = 10;
+        return outb;
     }
 
     // 块数据之后的分隔符 "\r\n"。
     public static byte[] FrameSuffix() {
-        return "\r\n".ToBytes();
+        return new byte[] { 13, 10 };
     }
 
     // 结束块 "0\r\n\r\n"（0 块 + 空 trailer）。
     public static byte[] Terminator() {
-        return "0\r\n\r\n".ToBytes();
+        return new byte[] { 48, 13, 10, 13, 10 };
     }
 }

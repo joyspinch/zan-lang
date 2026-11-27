@@ -1,18 +1,19 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 namespace System.Data.ZanDb;
 
 public class BlockCache {
     public Dictionary<long, CachePin> map;
-    public List<long> order;
+    public Queue<long> order;
     public long bytes;
     public long cap;
     public nint mtx;
 
     public BlockCache(long capBytes) {
         this.map = new Dictionary<long, CachePin>();
-        this.order = new List<long>();
+        this.order = new Queue<long>();
         this.bytes = 0;
         this.cap = capBytes;
         this.mtx = Mutex.Create();
@@ -56,14 +57,13 @@ public class BlockCache {
         // 已释放缓冲——块缓存超过 cap 后点查静默失败。
         pin.pins = 1;
         this.map.Add(key, pin);
-        this.order.Add(key);
+        this.order.Enqueue(key);
         this.bytes = this.bytes + pin.size;
-        // 驱逐：从队头起扫一轮，无 pin 的回收，被借用的挪到队尾。
-        int budget = this.order.Count;
+        // 驱逐：从队头起扫一轮，无 pin 的回收，被借用的挪到队尾（O(1) 环形队列）。
+        int budget = this.order.Count();
         while (this.bytes > this.cap && budget > 0) {
             budget = budget - 1;
-            long vk = this.order[0];
-            this.order.RemoveAt(0);
+            long vk = this.order.Dequeue();
             CachePin vp = null;
             this.map.TryGetValue(vk, out vp);
             if (vp == null) { continue; }
@@ -72,7 +72,7 @@ public class BlockCache {
                 this.bytes = this.bytes - vp.size;
                 vp.buf.Free();
             } else {
-                this.order.Add(vk);
+                this.order.Enqueue(vk);
             }
         }
         Mutex.Unlock(this.mtx);
@@ -91,10 +91,9 @@ public class BlockCache {
     public void Close() {
         if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
-        List<long> ks = this.map.Keys;
-        for (int i = 0; i < ks.Count; i = i + 1) {
-            CachePin pin = null;
-            this.map.TryGetValue(ks[i], out pin);
+        List<CachePin> vals = this.map.Values;
+        for (int i = 0; i < vals.Count; i = i + 1) {
+            CachePin pin = vals[i];
             if (pin != null) { pin.buf.Free(); }
         }
         this.map.Clear();

@@ -141,12 +141,20 @@ public class MySqlWire {
         if (h == null || ndl == null || from < 0 || hlen <= 0 || nlen <= 0) { return -1; }
         if (hlen > h.Length) { hlen = h.Length; }
         if (nlen > ndl.Length) { nlen = ndl.Length; }
+        if (from + nlen > hlen) { return -1; }
+        byte first = (byte)(ndl[0] & 255);
+        nint hp = (nint)h;
+        nint np = (nint)ndl;
+        int limit = hlen - nlen;
         int i = from;
-        while (i + nlen <= hlen) {
-             bool ok = true;
-            for (int j = 0; j < nlen; j = j + 1) { if ((h[i + j] & 255) != (ndl[j] & 255)) { ok = false; break; } }
-            if (ok) { return i; }
-            i = i + 1;
+        while (i <= limit) {
+            int rel = NativeMemory.IndexOf(hp + (nint)i, (limit - i) + 1, first);
+            if (rel < 0) { return -1; }
+            int pos = i + rel;
+            if (nlen == 1 || NativeMemory.SequenceEqual(hp + (nint)pos, np, nlen)) {
+                return pos;
+            }
+            i = pos + 1;
         }
         return -1;
     }
@@ -197,8 +205,11 @@ public class MySqlWire {
         return pos + 4;
     }
 
-    // 返回 2 的 e 次幂（循环乘除，避免依赖数学库）。
+    // 返回 2 的 e 次幂（正常范围 O(1) IEEE-754 位构造）。
     public static double pow2(int e) {
+        if (e >= -1022 && e <= 1023) {
+            return NativeMemory.AsF64((long)(e + 1023) << 52);
+        }
         double v = 1.0;
         int i = 0;
         if (e >= 0) {
@@ -219,6 +230,14 @@ public class MySqlWire {
     // 还原浮点数的十进制文本；零（exp=0 且 mant=0）直接返回 "0"。
     public static string ieeeToText(int sign, int exp, long mant, int expBias, int mantBits) {
         if (exp == 0 && mant == 0) { return "0"; }
+        if (expBias == 127 && mantBits == 23) {
+            int bits = ((sign & 1) << 31) | ((exp & 255) << 23) | ((int)mant & 8388607);
+            return Convert.ToString((double)NativeMemory.AsF32(bits));
+        }
+        if (expBias == 1023 && mantBits == 52) {
+            long bits = ((long)(sign & 1) << 63) | ((long)(exp & 2047) << 52) | (mant & 4503599627370495L);
+            return Convert.ToString(NativeMemory.AsF64(bits));
+        }
         double m = 1.0;
         int b = mantBits - 1;
         while (b >= 0) {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Json;
 using System.Text;
 namespace System.Data.Search;
@@ -27,16 +28,15 @@ public class Bm25Index {
 
     public void Add(int id, string text) {
         long order = nextOrder;
-        bool replacing = documents.ContainsKey(id);
-        if (replacing) { order = documents[id].order; }
+        Bm25Document oldDoc;
+        bool replacing = documents.TryGetValue(id, out oldDoc);
+        if (replacing) { order = oldDoc.order; }
         Bm25Document document = new Bm25Document(id, order);
         List<TextToken> tokens = tokenizer.Tokenize(text);
         for (int i = 0; i < tokens.Count; i = i + 1) {
             TextToken token = tokens[i];
             Bm25Term frequency;
-            if (document.terms.ContainsKey(token.text)) {
-                frequency = document.terms[token.text];
-            } else {
+            if (!document.terms.TryGetValue(token.text, out frequency)) {
                 frequency = new Bm25Term(token.text);
                 document.terms[token.text] = frequency;
                 document.termList.Add(frequency);
@@ -48,15 +48,16 @@ public class Bm25Index {
                 frequency.auxiliary = frequency.auxiliary + 1;
             }
         }
-        if (replacing) { Detach(documents[id]); }
+        if (replacing) { Detach(oldDoc); }
         else { nextOrder = nextOrder + 1; }
         documents[id] = document;
         Attach(document);
     }
 
     public void Remove(int id) {
-        if (!documents.ContainsKey(id)) { return; }
-        Detach(documents[id]);
+        Bm25Document doc;
+        if (!documents.TryGetValue(id, out doc)) { return; }
+        Detach(doc);
         documents.Remove(id);
     }
 
@@ -83,26 +84,24 @@ public class Bm25Index {
         if (queryTerms.Count == 0) { return result; }
         double avgdl = (double)totalLen / (double)documents.Count;
         Dictionary<int, Bm25Candidate> scores = new Dictionary<int, Bm25Candidate>();
-        Dictionary<int, int> rejected = new Dictionary<int, int>();
+        HashSet<int> rejected = new HashSet<int>();
         List<Bm25Candidate> candidates = new List<Bm25Candidate>();
         for (int t = 0; t < queryTerms.Count; t = t + 1) {
             Bm25QueryTerm term = queryTerms[t];
-            if (!postings.ContainsKey(term.text)) { continue; }
-            Bm25PostingList list = postings[term.text];
+            Bm25PostingList list;
+            if (!postings.TryGetValue(term.text, out list)) { continue; }
             int df = list.entries.Count;
             double idf = Math.Log(1.0 + ((double)(documents.Count - df) + 0.5)
                 / ((double)df + 0.5));
             for (int p = 0; p < list.entries.Count; p = p + 1) {
                 visitedPostings = visitedPostings + 1;
                 Bm25Posting posting = list.entries[p];
-                if (rejected.ContainsKey(posting.id)) { continue; }
+                if (rejected.Contains(posting.id)) { continue; }
                 Bm25Document document = documents[posting.id];
                 Bm25Candidate candidate;
-                if (scores.ContainsKey(posting.id)) {
-                    candidate = scores[posting.id];
-                } else {
+                if (!scores.TryGetValue(posting.id, out candidate)) {
                     if (filter != null && !filter(posting.id)) {
-                        rejected[posting.id] = 1;
+                        rejected.Add(posting.id);
                         continue;
                     }
                     candidate = new Bm25Candidate(posting.id, document.order);
@@ -252,8 +251,8 @@ public class Bm25Index {
         for (int i = 0; i < tokens.Count; i = i + 1) {
             TextToken token = tokens[i];
             double weight = token.kind == 0 ? 1.0 : auxiliaryWeight;
-            if (seen.ContainsKey(token.text)) {
-                Bm25QueryTerm existing = seen[token.text];
+            Bm25QueryTerm existing;
+            if (seen.TryGetValue(token.text, out existing)) {
                 if (weight > existing.weight) { existing.weight = weight; }
             } else {
                 Bm25QueryTerm term = new Bm25QueryTerm(token.text, weight);
@@ -268,8 +267,7 @@ public class Bm25Index {
         for (int i = 0; i < document.termList.Count; i = i + 1) {
             Bm25Term frequency = document.termList[i];
             Bm25PostingList list;
-            if (postings.ContainsKey(frequency.text)) { list = postings[frequency.text]; }
-            else {
+            if (!postings.TryGetValue(frequency.text, out list)) {
                 list = new Bm25PostingList();
                 postings[frequency.text] = list;
             }

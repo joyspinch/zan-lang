@@ -262,17 +262,20 @@ public class TdsValue {
     // 读取 n(4 或 8) 字节小端位型并按 IEEE 754 渲染浮点文本。
     public static string Float(TdsReader r, int n) {
         if (n == 4) {
-            long bits = r.UIntLE(4);
-            return TdsValue.Ieee((int)((bits >> 31) & 1), (int)((bits >> 23) & 255),
-                                 bits & 8388607, 127, 23);
+            int bits = (int)r.UIntLE(4);
+            if ((bits & 2147483647) == 0) { return "0"; }
+            return Convert.ToString((double)NativeMemory.AsF32(bits));
         }
         long bits = r.UIntLE(8);
-        return TdsValue.Ieee((int)((bits >> 63) & 1), (int)((bits >> 52) & 2047),
-                             bits & 4503599627370495, 1023, 52);
+        if ((bits & 9223372036854775807L) == 0L) { return "0"; }
+        return Convert.ToString(NativeMemory.AsF64(bits));
     }
 
     // 以 double 表示的 2^e（e 可为负）。
     public static double Pow2(int e) {
+        if (e >= -1022 && e <= 1023) {
+            return NativeMemory.AsF64((long)(e + 1023) << 52);
+        }
         double v = 1.0;
         int i = 0;
         if (e >= 0) {
@@ -286,6 +289,14 @@ public class TdsValue {
     // 由 IEEE 754 位型（符号/指数/尾数/偏置/尾数位数）渲染浮点文本。
     public static string Ieee(int sign, int exp, long mant, int bias, int mantBits) {
         if (exp == 0 && mant == 0) { return "0"; }
+        if (bias == 127 && mantBits == 23) {
+            int bits = ((sign & 1) << 31) | ((exp & 255) << 23) | ((int)mant & 8388607);
+            return Convert.ToString((double)NativeMemory.AsF32(bits));
+        }
+        if (bias == 1023 && mantBits == 52) {
+            long bits = ((long)(sign & 1) << 63) | ((long)(exp & 2047) << 52) | (mant & 4503599627370495L);
+            return Convert.ToString(NativeMemory.AsF64(bits));
+        }
         double m = 1.0;
         int b = mantBits - 1;
         while (b >= 0) {
@@ -472,38 +483,46 @@ public class TdsValue {
     }
 
     // 规范 GUID 文本：前三个组在线上是小端，
-    // 后两个是大端。
+    // 后两个是大端。单次 36 字节缓冲渲染，消除中间 List/StringBuilder/16 次子串分配。
     public static string Guid(TdsReader r, int n) {
         if (n < 16) {
             r.Skip(n);
             return "";
         }
-        List<int> raw = new List<int>();
+        byte[] raw = new byte[16];
         for (int k = 0; k < 16; k = k + 1) {
-            raw.Add(r.U8());
+            raw[k] = (byte)r.U8();
         }
         if (n > 16) { r.Skip(n - 16); }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(TdsValue.HexAt(raw, 3));
-        sb.Append(TdsValue.HexAt(raw, 2));
-        sb.Append(TdsValue.HexAt(raw, 1));
-        sb.Append(TdsValue.HexAt(raw, 0));
-        sb.Append("-");
-        sb.Append(TdsValue.HexAt(raw, 5));
-        sb.Append(TdsValue.HexAt(raw, 4));
-        sb.Append("-");
-        sb.Append(TdsValue.HexAt(raw, 7));
-        sb.Append(TdsValue.HexAt(raw, 6));
-        sb.Append("-");
-        sb.Append(TdsValue.HexAt(raw, 8));
-        sb.Append(TdsValue.HexAt(raw, 9));
-        sb.Append("-");
-        int i = 10;
-        while (i < 16) {
-            sb.Append(TdsValue.HexAt(raw, i));
-            i = i + 1;
+        byte[] outb = new byte[36];
+        TdsValue.WriteHexByte(outb, 0, raw[3]);
+        TdsValue.WriteHexByte(outb, 2, raw[2]);
+        TdsValue.WriteHexByte(outb, 4, raw[1]);
+        TdsValue.WriteHexByte(outb, 6, raw[0]);
+        outb[8] = 45;
+        TdsValue.WriteHexByte(outb, 9, raw[5]);
+        TdsValue.WriteHexByte(outb, 11, raw[4]);
+        outb[13] = 45;
+        TdsValue.WriteHexByte(outb, 14, raw[7]);
+        TdsValue.WriteHexByte(outb, 16, raw[6]);
+        outb[18] = 45;
+        TdsValue.WriteHexByte(outb, 19, raw[8]);
+        TdsValue.WriteHexByte(outb, 21, raw[9]);
+        outb[23] = 45;
+        int pos = 24;
+        for (int i = 10; i < 16; i = i + 1) {
+            TdsValue.WriteHexByte(outb, pos, raw[i]);
+            pos = pos + 2;
         }
-        return sb.ToString();
+        return outb.ToStr(0, 36);
+    }
+
+    private static void WriteHexByte(byte[] dst, int pos, byte b) {
+        int v = b & 255;
+        int hi = (v >> 4) & 15;
+        int lo = v & 15;
+        dst[pos] = (byte)(hi < 10 ? hi + 48 : hi + 87);
+        dst[pos + 1] = (byte)(lo < 10 ? lo + 48 : lo + 87);
     }
 
     // 取 raw[i] 的两个十六进制字符。

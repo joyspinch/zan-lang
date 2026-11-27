@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Json;
 using System.Text;
@@ -22,9 +23,10 @@ public partial class Collection {
     // 单写者模型下安全：序列键仍随每次分配落盘（事务覆盖层
     // 会在提交时去重成一帧），崩溃后经重开恢复，缓存作废重读。
     public int nextIdCache;
-    // 进程内热点文档 LRU 缓存池与访问序列，避免重复 I/O 与反序列化。
+    // 进程内热点文档 O(1) LRU 缓存池（双向链表 + 节点映射），避免重复 I/O 与反序列化。
     public Dict<int, JsonValue> docCache;
-    public List<int> docCacheOrder;
+    public LinkedList<int> docCacheOrder;
+    public Dict<int, LinkedListNode<int>> docCacheNodes;
     public int docCacheCapacity;
     public CollectionSearch search;
     // 刀12 线程级并发：整库共享的线程阻塞读写锁（ZanDatabase 持有并下发），
@@ -52,7 +54,8 @@ public partial class Collection {
         this.metaVersion = 0 - 1;
         this.nextIdCache = 0;
         this.docCache = new Dict<int, JsonValue>();
-        this.docCacheOrder = new List<int>();
+        this.docCacheOrder = new LinkedList<int>();
+        this.docCacheNodes = new Dict<int, LinkedListNode<int>>();
         this.docCacheCapacity = 256;
         this.tlock = new RwLock();
         this.cacheMtx = Mutex.Create();
@@ -64,9 +67,6 @@ public partial class Collection {
         c.kv = kv;
         c.rw = rw;
         c.name = name;
-        c.docCache = new Dict<int, JsonValue>();
-        c.docCacheOrder = new List<int>();
-        c.docCacheCapacity = 256;
         c.tlock.Close();
         c.tlock = tlock;
         c.LoadIndexMeta();
@@ -297,12 +297,11 @@ public partial class Collection {
         if (capacity == 0) {
             this.docCache.Clear();
             this.docCacheOrder.Clear();
+            this.docCacheNodes.Clear();
         } else {
-            int pruneMax = this.docCacheOrder.Count;
-            for (int i = 0; i < pruneMax; i = i + 1) {
-                if (this.docCacheOrder.Count <= this.docCacheCapacity) { break; }
-                int evictId = this.docCacheOrder[0];
-                this.docCacheOrder.RemoveAt(0);
+            while (this.docCacheOrder.Count() > this.docCacheCapacity) {
+                int evictId = this.docCacheOrder.RemoveFirst();
+                this.docCacheNodes.Remove(evictId);
                 this.docCache.Remove(evictId);
             }
         }
@@ -329,19 +328,14 @@ public partial class Collection {
         try {
         this.docCache.Clear();
         this.docCacheOrder.Clear();
+        this.docCacheNodes.Clear();
         } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     private void TouchCacheOrder(int id) {
-        int lastIdx = this.docCacheOrder.Count - 1;
-        if (lastIdx >= 0 && this.docCacheOrder[lastIdx] != id) {
-            for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
-                if (this.docCacheOrder[i] == id) {
-                    this.docCacheOrder.RemoveAt(i);
-                    this.docCacheOrder.Add(id);
-                    break;
-                }
-            }
+        LinkedListNode<int> node = null;
+        if (this.docCacheNodes.TryGetValue(id, out node) && node != null) {
+            this.docCacheOrder.MoveToLast(node);
         }
     }
 
@@ -369,13 +363,13 @@ public partial class Collection {
             this.TouchCacheOrder(id);
             return;
         }
-        if (this.docCacheOrder.Count >= this.docCacheCapacity && this.docCacheOrder.Count > 0) {
-            int evictId = this.docCacheOrder[0];
-            this.docCacheOrder.RemoveAt(0);
+        if (this.docCacheOrder.Count() >= this.docCacheCapacity && this.docCacheOrder.Count() > 0) {
+            int evictId = this.docCacheOrder.RemoveFirst();
+            this.docCacheNodes.Remove(evictId);
             this.docCache.Remove(evictId);
         }
         this.docCache[id] = doc.Clone();
-        this.docCacheOrder.Add(id);
+        this.docCacheNodes[id] = this.docCacheOrder.AddLastNode(id);
         } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
@@ -384,13 +378,12 @@ public partial class Collection {
         Mutex.Lock(this.cacheMtx);
         try {
         if (this.docCacheCapacity <= 0) { return; }
-        if (this.docCache.ContainsKey(id)) {
+        LinkedListNode<int> node = null;
+        if (this.docCacheNodes.TryGetValue(id, out node)) {
+            this.docCacheNodes.Remove(id);
             this.docCache.Remove(id);
-            for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
-                if (this.docCacheOrder[i] == id) {
-                    this.docCacheOrder.RemoveAt(i);
-                    break;
-                }
+            if (node != null) {
+                this.docCacheOrder.RemoveNode(node);
             }
         }
         } finally { Mutex.Unlock(this.cacheMtx); }

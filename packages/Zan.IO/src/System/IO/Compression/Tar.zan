@@ -31,9 +31,7 @@ public class Tar {
             Tar.WriteHeader(out2, pos, e);
             pos = pos + 512;
             if (e.data != null && e.data.Length > 0) {
-                for (int k = 0; k < e.data.Length; k = k + 1) {
-                    out2[pos + k] = e.data[k];
-                }
+                NativeMemory.Copy((nint)out2 + (nint)pos, (nint)e.data, e.data.Length);
                 pos = pos + ((e.data.Length + 511) / 512) * 512;
             }
         }
@@ -67,8 +65,8 @@ public class Tar {
             } else if (type == 0 || type == 48) {
                 int isz = (int)size;
                 e.data = new byte[isz];
-                for (int k = 0; k < isz; k = k + 1) {
-                    e.data[k] = tar[pos + 512 + k];
+                if (isz > 0) {
+                    NativeMemory.Copy((nint)e.data, (nint)tar + (nint)(pos + 512), isz);
                 }
             } else {
                 e.isDirectory = false;
@@ -145,13 +143,11 @@ public class Tar {
     private static void WriteStr(byte[] b, int off, string s, int maxLen) {
         int n = s.Length;
         if (n > maxLen) { n = maxLen; }
-        int i = 0;
-        for (; i < n; i = i + 1) {
-            b[off + i] = (byte)s[i];
+        if (n > 0) {
+            NativeMemory.Copy((nint)b + (nint)off, (nint)s, n);
         }
-        while (i < maxLen) {
-            b[off + i] = 0;
-            i = i + 1;
+        if (n < maxLen) {
+            NativeMemory.Fill((nint)b + (nint)(off + n), 0, maxLen - n);
         }
     }
 
@@ -160,34 +156,20 @@ public class Tar {
         int len = 0;
         for (; len < maxLen && b[off + len] != 0; len = len + 1) { }
         if (len == 0) { return ""; }
-        nint buf = NativeMemory.Alloc(len + 1);
-        string s = "";
-        try {
-            for (int i = 0; i < len; i = i + 1) {
-                new Span<byte>(buf + i, 1)[0] = b[off + i];
-            }
-            s = NativeMemory.GetString(buf, 0, len);
-        } finally {
-            NativeMemory.Free(buf);
-        }
-        return s;
+        return b.ToStr(off, len);
     }
 
-    // POSIX 八进制字段（右对齐、末字节 NUL、高位补空格）。
+    // POSIX 八进制字段（右对齐、末字节 NUL、高位补空格，零分配直写）。
     private static void WriteOctal(byte[] b, int off, long v, int fieldLen) {
-        char[] digits = new char[fieldLen];
-        for (int i = 0; i < fieldLen; i = i + 1) { digits[i] = ' '; }
+        NativeMemory.Fill((nint)b + (nint)off, 32, fieldLen);
         int pos = fieldLen - 2;
         long val = v;
         while (val > 0 && pos >= 0) {
-            digits[pos] = (char)('0' + (val & 7));
+            b[off + pos] = (byte)(48 + (int)(val & 7));
             val = val >> 3;
             pos = pos - 1;
         }
-        digits[fieldLen - 1] = '\0';
-        for (int i = 0; i < fieldLen; i = i + 1) {
-            b[off + i] = (byte)digits[i];
-        }
+        b[off + fieldLen - 1] = 0;
     }
 
     // 解析八进制字段（忽略空格与非八进制字符；仅用于 int 范围字段，size 请用 ParseSize）。
