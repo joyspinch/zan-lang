@@ -3,6 +3,7 @@
 #ifdef ZAN_GUI_OHOS
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
@@ -760,30 +761,156 @@ EXPORT i32 zan_gui_set_title(iptr h, const char *t) { (void)h; (void)t; return 0
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
 
-EXPORT i32 zan_gui_wait_event(void) {
-    memset(g_pending_event, 0, sizeof(g_pending_event));
-    while (!oq_pop()) {
-        struct timespec ts = { 0, 4 * 1000 * 1000 }; /* 4ms */
-        nanosleep(&ts, NULL);
+static uint64_t g_oq_wake_seq = 0;
+static uint64_t g_oq_seen_wake_seq = 0;
+static int g_ohos_vsync_resolved = 0;
+static int g_ohos_vsync_failed = 0;
+static void *g_ohos_vsync_handle = NULL;
+static int g_ohos_vsync_pending = 0;
+static int g_ohos_vsync_ready = 0;
+
+typedef void *(*FnOHNativeVSyncCreate)(const char *, unsigned int);
+typedef void (*FnOHNativeVSyncFrameCb)(long long, void *);
+typedef int (*FnOHNativeVSyncRequestFrame)(void *, FnOHNativeVSyncFrameCb, void *);
+static FnOHNativeVSyncRequestFrame g_ohos_vsync_request = NULL;
+
+static void zan_ohos_vsync_cb(long long timestamp, void *data) {
+    (void)timestamp;
+    (void)data;
+    pthread_mutex_lock(&g_oq_lock);
+    g_ohos_vsync_pending = 0;
+    if (g_owin.attached && !g_owin.closed) {
+        g_ohos_vsync_ready = 1;
+        g_oq_wake_seq++;
+        pthread_cond_broadcast(&g_oq_cond);
     }
-    return 0;
+    pthread_mutex_unlock(&g_oq_lock);
 }
 
-EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
-    memset(g_pending_event, 0, sizeof(g_pending_event));
-    if (oq_pop()) { return 0; }
-    int remain = (ms < 0) ? 0 : ms;
-    while (remain > 0) {
-        long step = (remain > 8) ? 8 : (long)remain;
-        struct timespec ts = { 0, step * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-        remain -= (int)step;
-        if (oq_pop()) { return 0; }
+static int zan_ohos_vsync_ensure_locked(void) {
+    if (g_ohos_vsync_failed) return 0;
+    if (!g_ohos_vsync_resolved) {
+        g_ohos_vsync_resolved = 1;
+        void *lib = dlopen("libnative_vsync.so", RTLD_NOW | RTLD_LOCAL);
+        FnOHNativeVSyncCreate fn_create = lib
+            ? (FnOHNativeVSyncCreate)dlsym(lib, "OH_NativeVSync_Create") : NULL;
+        g_ohos_vsync_request = lib
+            ? (FnOHNativeVSyncRequestFrame)dlsym(lib, "OH_NativeVSync_RequestFrame") : NULL;
+        if (!fn_create || !g_ohos_vsync_request) {
+            g_ohos_vsync_failed = 1;
+            return 0;
+        }
+        g_ohos_vsync_handle = fn_create("zan_gui", 7);
+        if (!g_ohos_vsync_handle) {
+            g_ohos_vsync_failed = 1;
+            return 0;
+        }
+    }
+    return g_ohos_vsync_handle != NULL && g_ohos_vsync_request != NULL;
+}
+
+EXPORT i32 zan_gui_request_display_frame(iptr hwnd_val) {
+    (void)hwnd_val;
+    pthread_mutex_lock(&g_oq_lock);
+    if (!g_owin.attached || g_owin.closed || !zan_ohos_vsync_ensure_locked()) {
+        pthread_mutex_unlock(&g_oq_lock);
+        return 0;
+    }
+    if (g_ohos_vsync_pending || g_ohos_vsync_ready) {
+        pthread_mutex_unlock(&g_oq_lock);
+        return 1;
+    }
+    void *handle = g_ohos_vsync_handle;
+    FnOHNativeVSyncRequestFrame req = g_ohos_vsync_request;
+    g_ohos_vsync_pending = 1;
+    pthread_mutex_unlock(&g_oq_lock);
+    if (req(handle, zan_ohos_vsync_cb, NULL) != 0) {
+        pthread_mutex_lock(&g_oq_lock);
+        g_ohos_vsync_pending = 0;
+        pthread_mutex_unlock(&g_oq_lock);
+        return 0;
     }
     return 1;
 }
 
-EXPORT i32 zan_gui_wake(void) { return 0; }
+EXPORT i32 zan_gui_take_display_frame(iptr hwnd_val) {
+    (void)hwnd_val;
+    pthread_mutex_lock(&g_oq_lock);
+    int ready = g_ohos_vsync_ready;
+    if (ready) g_ohos_vsync_ready = 0;
+    pthread_mutex_unlock(&g_oq_lock);
+    return ready ? 1 : 0;
+}
+
+EXPORT i32 zan_gui_wait_event(void) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    for (;;) {
+        if (oq_pop()) return 0;
+        pthread_mutex_lock(&g_oq_lock);
+        if (g_owin.closed && g_oq_head == g_oq_tail) {
+            pthread_mutex_unlock(&g_oq_lock);
+            return -1;
+        }
+        if (g_oq_wake_seq != g_oq_seen_wake_seq || g_ohos_vsync_ready) {
+            g_oq_seen_wake_seq = g_oq_wake_seq;
+            pthread_mutex_unlock(&g_oq_lock);
+            return 0;
+        }
+        if (g_oq_head == g_oq_tail && !ohos_ime_pending_locked()) {
+            pthread_cond_wait(&g_oq_cond, &g_oq_lock);
+        }
+        pthread_mutex_unlock(&g_oq_lock);
+    }
+}
+
+EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (oq_pop()) return 0;
+    if (ms <= 0) {
+        pthread_mutex_lock(&g_oq_lock);
+        int woke = (g_oq_wake_seq != g_oq_seen_wake_seq) || g_ohos_vsync_ready;
+        if (woke) g_oq_seen_wake_seq = g_oq_wake_seq;
+        pthread_mutex_unlock(&g_oq_lock);
+        return woke ? 0 : 1;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += ms / 1000;
+    until.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += 1;
+        until.tv_nsec -= 1000000000L;
+    }
+    for (;;) {
+        if (oq_pop()) return 0;
+        pthread_mutex_lock(&g_oq_lock);
+        if (g_owin.closed && g_oq_head == g_oq_tail) {
+            pthread_mutex_unlock(&g_oq_lock);
+            return -1;
+        }
+        if (g_oq_wake_seq != g_oq_seen_wake_seq || g_ohos_vsync_ready) {
+            g_oq_seen_wake_seq = g_oq_wake_seq;
+            pthread_mutex_unlock(&g_oq_lock);
+            return 0;
+        }
+        if (g_oq_head == g_oq_tail && !ohos_ime_pending_locked()) {
+            int rc = pthread_cond_timedwait(&g_oq_cond, &g_oq_lock, &until);
+            if (rc == ETIMEDOUT) {
+                pthread_mutex_unlock(&g_oq_lock);
+                return oq_pop() ? 0 : 1;
+            }
+        }
+        pthread_mutex_unlock(&g_oq_lock);
+    }
+}
+
+EXPORT i32 zan_gui_wake(void) {
+    pthread_mutex_lock(&g_oq_lock);
+    g_oq_wake_seq++;
+    pthread_cond_broadcast(&g_oq_cond);
+    pthread_mutex_unlock(&g_oq_lock);
+    return 0;
+}
 
 EXPORT i32 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i32 zan_gui_window_height(void) { return g_window_height; }

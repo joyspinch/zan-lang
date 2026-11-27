@@ -3,6 +3,8 @@
 
 #if defined(__linux__)
 
+#include <dlfcn.h>
+
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
 static int g_wake_pipe[2] = { -1, -1 };
@@ -912,6 +914,51 @@ EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
         return 0;
     }
     return 1;
+}
+
+typedef void *(*zan_xrr_get_screen_info_fn)(Display *, Window);
+typedef short (*zan_xrr_current_rate_fn)(void *);
+typedef void (*zan_xrr_free_screen_config_fn)(void *);
+
+static int g_xrr_resolved = 0;
+static zan_xrr_get_screen_info_fn g_xrr_get_screen_info = NULL;
+static zan_xrr_current_rate_fn g_xrr_current_rate = NULL;
+static zan_xrr_free_screen_config_fn g_xrr_free_screen_config = NULL;
+static double g_xrr_cached_hz = 60.0;
+static long long g_xrr_cached_ns = 0;
+
+EXPORT double zan_gui_refresh_rate(iptr hwnd_val) {
+    if (!g_display) return 60.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now_ns = (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+    if (g_xrr_cached_ns > 0 && now_ns - g_xrr_cached_ns < 1000000000LL) {
+        return g_xrr_cached_hz;
+    }
+    if (!g_xrr_resolved) {
+        g_xrr_resolved = 1;
+        void *lib = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
+        if (!lib) lib = dlopen("libXrandr.so", RTLD_LAZY | RTLD_LOCAL);
+        if (lib) {
+            g_xrr_get_screen_info = (zan_xrr_get_screen_info_fn)dlsym(lib, "XRRGetScreenInfo");
+            g_xrr_current_rate = (zan_xrr_current_rate_fn)dlsym(lib, "XRRConfigCurrentRate");
+            g_xrr_free_screen_config = (zan_xrr_free_screen_config_fn)dlsym(lib, "XRRFreeScreenConfigInfo");
+        }
+    }
+    double hz = 60.0;
+    if (g_xrr_get_screen_info && g_xrr_current_rate && g_xrr_free_screen_config) {
+        Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+        if (!xid) xid = DefaultRootWindow(g_display);
+        void *cfg = g_xrr_get_screen_info(g_display, xid);
+        if (cfg) {
+            short rate = g_xrr_current_rate(cfg);
+            g_xrr_free_screen_config(cfg);
+            if (rate > 1 && rate <= 1000) hz = (double)rate;
+        }
+    }
+    g_xrr_cached_hz = hz;
+    g_xrr_cached_ns = now_ns;
+    return hz;
 }
 
 EXPORT i32 zan_gui_window_focused(iptr hwnd_val) {

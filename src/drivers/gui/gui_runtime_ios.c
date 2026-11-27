@@ -787,6 +787,29 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
 EXPORT i32 zan_gui_is_maximized(iptr hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_window_visible(iptr hwnd_val) { (void)hwnd_val; return g_iwin.attached; }
 EXPORT i32 zan_gui_window_focused(iptr hwnd_val) { (void)hwnd_val; return 1; }
+
+EXPORT double zan_gui_refresh_rate(iptr hwnd_val) {
+    (void)hwnd_val;
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    if (g_bridge.objc_getClass && g_bridge.sel_registerName && g_bridge.objc_msgSend) {
+        zan_class_t cls_screen = g_bridge.objc_getClass("UIScreen");
+        if (cls_screen) {
+            typedef zan_id_t (*zan_msg_id0_fn)(zan_id_t, zan_sel_t);
+            typedef intptr_t (*zan_msg_int0_fn)(zan_id_t, zan_sel_t);
+            zan_id_t screen = ((zan_msg_id0_fn)g_bridge.objc_msgSend)(
+                (zan_id_t)cls_screen, g_bridge.sel_registerName("mainScreen"));
+            if (screen) {
+                zan_sel_t sel_fps = g_bridge.sel_registerName("maximumFramesPerSecond");
+                zan_sel_t sel_resp = g_bridge.sel_registerName("respondsToSelector:");
+                if (((zan_msg_bool1_fn)g_bridge.objc_msgSend)(screen, sel_resp, (zan_id_t)sel_fps)) {
+                    intptr_t fps = ((zan_msg_int0_fn)g_bridge.objc_msgSend)(screen, sel_fps);
+                    if (fps > 1 && fps <= 1000) return (double)fps;
+                }
+            }
+        }
+    }
+    return 60.0;
+}
 EXPORT i32 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i32 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr h, i32 n) { (void)h; (void)n; return 0; }

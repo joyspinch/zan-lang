@@ -189,9 +189,15 @@ public partial class App {
         this.SealFormRegion();
         this.TraceFullPresent(27, true);
         window.PresentSurface(canvas.surfaceId, Damage.partialFrame ? -1 : frameDpiRevision);
-        // 清理本帧绘制期间提前到达的陈旧 VBlank 信号；若本帧已请求下一动画帧，
-        // 重新武装等待下一次 VBlank，避免同一刷新周期内连续双帧渲染。
-        if (window.TakeDisplayFrame() && (displayAnimationPending || displayFxPending)) {
+        // 仅在距离上一帧呈现未满 80% 刷新周期时清理同周期陈旧 VBlank 信号并重新武装，
+        // 避免同周期双帧渲染；若高刷屏（120/144/240/360Hz）下本帧已跨周期，则保留
+        // 刚到达的真实下一拍 VBlank，避免掉半帧。
+        long presentNowUs = Stopwatch.GetMicroseconds();
+        long minVblankGapUs = (long)(800000.0 / frameCadence.Rate());
+        bool sameCycleStale = lastPresentUs > 0 && presentNowUs >= lastPresentUs
+            && (presentNowUs - lastPresentUs) < minVblankGapUs;
+        if (sameCycleStale && window.TakeDisplayFrame()
+            && (displayAnimationPending || displayFxPending)) {
             window.RequestDisplayFrame();
         }
         if (!Damage.partialFrame && !Damage.glassDeferred) {
@@ -214,7 +220,7 @@ public partial class App {
         }
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
-        lastPresentUs = Stopwatch.GetMicroseconds();
+        lastPresentUs = presentNowUs;
         focus.UpdateImeSession();
         this.RefreshScrollHover();
         if (!isChildWindow && window != null && window.GetHandle() != 0) { ChildWindows.FoldDeadlines(this); }

@@ -226,6 +226,7 @@ static void ohos_ime_enqueue_operation(ohos_ime_operation *operation) {
     if (g_ime_operation_tail) g_ime_operation_tail->next = operation;
     else g_ime_operation_head = operation;
     g_ime_operation_tail = operation;
+    pthread_cond_signal(&g_oq_cond);
     pthread_mutex_unlock(&g_oq_lock);
 }
 

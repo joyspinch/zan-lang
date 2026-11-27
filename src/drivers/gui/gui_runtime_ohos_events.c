@@ -12,6 +12,7 @@ static int g_oq_head, g_oq_tail;
 static uint64_t g_oq_written, g_oq_read;
 static int g_oq_no_coalesce;
 static pthread_mutex_t g_oq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_oq_cond = PTHREAD_COND_INITIALIZER;
 static int g_pending_event[8];
 static iptr g_event_win;
 static long long g_ev_seq;
@@ -22,11 +23,13 @@ static int oq_push_locked(int kind, int x, int y, int button, int code, int mods
     int has_last = g_oq_head != g_oq_tail && !g_oq_no_coalesce;
     if (kind == 1 && has_last && g_oq[last].e[0] == 1) {
         g_oq[last].e[1] = x; g_oq[last].e[2] = y;
+        pthread_cond_signal(&g_oq_cond);
         return 1;
     }
     if (kind == 13 && has_last && g_oq[last].e[0] == 13) {
         g_oq[last].e[1] = x; g_oq[last].e[2] = y;
         g_oq[last].e[4] += code;
+        pthread_cond_signal(&g_oq_cond);
         return 1;
     }
     int next = (g_oq_tail + 1) % ZAN_OQ_CAP;
@@ -38,6 +41,7 @@ static int oq_push_locked(int kind, int x, int y, int button, int code, int mods
     g_oq_tail = next;
     ++g_oq_written;
     g_oq_no_coalesce = 0;
+    pthread_cond_signal(&g_oq_cond);
     return 1;
 }
 

@@ -17,6 +17,8 @@
 #import <pthread.h>
 #import <dispatch/dispatch.h>
 #include <objc/message.h>
+#include <dlfcn.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2060,6 +2062,111 @@ EXPORT double zan_gui_refresh_rate(iptr hwnd_val) {
         }
     }
     return 60.0;
+}
+
+typedef void *zan_cv_display_link_t;
+typedef int32_t (*zan_cv_output_cb_t)(zan_cv_display_link_t, const void *,
+                                      const void *, uint64_t, uint64_t *, void *);
+typedef int32_t (*zan_cv_create_active_fn)(zan_cv_display_link_t *);
+typedef int32_t (*zan_cv_set_cb_fn)(zan_cv_display_link_t, zan_cv_output_cb_t, void *);
+typedef int32_t (*zan_cv_start_fn)(zan_cv_display_link_t);
+typedef int32_t (*zan_cv_stop_fn)(zan_cv_display_link_t);
+typedef int32_t (*zan_cv_set_display_fn)(zan_cv_display_link_t, uint32_t);
+
+static int g_mac_vsync_resolved = 0;
+static int g_mac_vsync_failed = 0;
+static zan_cv_display_link_t g_mac_vsync_link = NULL;
+static zan_cv_start_fn g_cv_start = NULL;
+static zan_cv_stop_fn g_cv_stop = NULL;
+static zan_cv_set_display_fn g_cv_set_display = NULL;
+static uint32_t g_mac_vsync_display = 0;
+static atomic_int g_mac_vsync_ready = 0;
+static atomic_int g_mac_vsync_armed = 0;
+static atomic_int g_mac_vsync_running = 0;
+static atomic_int g_mac_vsync_idle_ticks = 0;
+
+static int32_t zan_mac_vsync_cb(zan_cv_display_link_t link, const void *inNow,
+                                const void *inOutputTime, uint64_t flagsIn,
+                                uint64_t *flagsOut, void *user) {
+    (void)link; (void)inNow; (void)inOutputTime; (void)flagsIn; (void)flagsOut; (void)user;
+    if (atomic_exchange(&g_mac_vsync_armed, 0) != 0) {
+        atomic_store(&g_mac_vsync_idle_ticks, 0);
+        atomic_store(&g_mac_vsync_ready, 1);
+        zan_gui_wake();
+    } else {
+        int idle = atomic_fetch_add(&g_mac_vsync_idle_ticks, 1) + 1;
+        if (idle == 4 && atomic_load(&g_mac_vsync_running)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (g_mac_vsync_link && g_cv_stop
+                    && !atomic_load(&g_mac_vsync_armed)
+                    && atomic_exchange(&g_mac_vsync_running, 0) != 0) {
+                    g_cv_stop(g_mac_vsync_link);
+                }
+            });
+        }
+    }
+    return 0;
+}
+
+static int zan_mac_vsync_ensure(iptr hwnd_val) {
+    if (g_mac_vsync_failed) return 0;
+    if (!g_mac_vsync_resolved) {
+        g_mac_vsync_resolved = 1;
+        void *cv = dlopen("/System/Library/Frameworks/CoreVideo.framework/CoreVideo",
+                          RTLD_LAZY | RTLD_LOCAL);
+        zan_cv_create_active_fn fn_create = cv ? (zan_cv_create_active_fn)dlsym(cv, "CVDisplayLinkCreateWithActiveCGDisplays") : NULL;
+        zan_cv_set_cb_fn fn_set_cb = cv ? (zan_cv_set_cb_fn)dlsym(cv, "CVDisplayLinkSetOutputCallback") : NULL;
+        g_cv_start = cv ? (zan_cv_start_fn)dlsym(cv, "CVDisplayLinkStart") : NULL;
+        g_cv_stop = cv ? (zan_cv_stop_fn)dlsym(cv, "CVDisplayLinkStop") : NULL;
+        g_cv_set_display = cv ? (zan_cv_set_display_fn)dlsym(cv, "CVDisplayLinkSetCurrentCGDisplay") : NULL;
+        if (!fn_create || !fn_set_cb || !g_cv_start || !g_cv_stop) {
+            g_mac_vsync_failed = 1;
+            return 0;
+        }
+        if (fn_create(&g_mac_vsync_link) != 0 || !g_mac_vsync_link
+            || fn_set_cb(g_mac_vsync_link, zan_mac_vsync_cb, NULL) != 0) {
+            g_mac_vsync_link = NULL;
+            g_mac_vsync_failed = 1;
+            return 0;
+        }
+    }
+    if (g_cv_set_display && g_mac_vsync_link) {
+        zan_mwin_t *mw = mwin_find(hwnd_val);
+        if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+        NSScreen *screen = mw && mw->window ? [mw->window screen] : nil;
+        if (!screen) screen = [NSScreen mainScreen];
+        NSNumber *num = screen ? [[screen deviceDescription] objectForKey:@"NSScreenNumber"] : nil;
+        if (num) {
+            uint32_t did = (uint32_t)[num unsignedIntValue];
+            if (did != 0 && did != g_mac_vsync_display) {
+                g_mac_vsync_display = did;
+                g_cv_set_display(g_mac_vsync_link, did);
+            }
+        }
+    }
+    return g_mac_vsync_link != NULL;
+}
+
+EXPORT i32 zan_gui_request_display_frame(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_request_display_frame(hwnd_val));
+    @autoreleasepool {
+        if (!zan_mac_vsync_ensure(hwnd_val)) return 0;
+        atomic_store(&g_mac_vsync_idle_ticks, 0);
+        atomic_store(&g_mac_vsync_armed, 1);
+        if (atomic_exchange(&g_mac_vsync_running, 1) == 0) {
+            if (g_cv_start(g_mac_vsync_link) != 0) {
+                atomic_store(&g_mac_vsync_running, 0);
+                atomic_store(&g_mac_vsync_armed, 0);
+                return 0;
+            }
+        }
+        return 1;
+    }
+}
+
+EXPORT i32 zan_gui_take_display_frame(iptr hwnd_val) {
+    (void)hwnd_val;
+    return atomic_exchange(&g_mac_vsync_ready, 0) != 0 ? 1 : 0;
 }
 
 /* Report the caret position (client-area px) so an IME's composition/candidate
