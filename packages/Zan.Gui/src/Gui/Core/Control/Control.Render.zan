@@ -52,13 +52,27 @@ public partial class Control {
     }
     void RenderTree(App app) {
         if (!app.ContinuePreparedFrame()) { return; }
-        Control prevCtx = app.styleCtx;
-        app.styleCtx = this;
         bool ownChainPass = Style.chainPassDepth == 0 || Style.chainApp != app;
         if (ownChainPass) { Style.BeginChainPass(app); }
+        Control prevCtx = app.styleCtx;
+        bool ancestorDisabled = parent != null && parent.IsDisabled();
+        bool partialFrame = app.Damage != null && app.Damage.partialFrame;
+        bool perfOn = App.PerfOn();
+        bool paintHashOn = PaintHash.On;
+        Control frameRoot = app.rootControl;
+        int frameGen = app.inputRootGeneration;
+        long frameSeq = app.window.EventSeq();
+        int framePhase = app.inputPreparationTicket;
+        int frameNum = app.frameSeq;
+        int frameStructRev = Control.BindingStructureRevision();
+        int passRuleSig = app.CurrentStyleRuleSig();
+        bool passAnyMedia = (passRuleSig & 1) != 0;
+        long passMediaHash = passAnyMedia ? Style.PassMediaHash(app) : 0L;
+        int passChainSeq = Style.chainApp == app ? Style.chainActiveSeq : 0;
         try {
-            if (this.app == app && this.SkipBoundedPaint(app)) { return; }
-            this.RenderTreeInner(app);
+            this.RenderTreeNode(app, ancestorDisabled, partialFrame, perfOn, paintHashOn,
+                frameRoot, frameGen, frameSeq, framePhase, frameNum, frameStructRev,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
         } finally {
             if (ownChainPass) { Style.EndChainPass(); }
             paintedStyle = null;
@@ -67,33 +81,208 @@ public partial class Control {
     }
     private bool PaintNodeCurrent(App host, Control ownerParent, int revision, int structRev,
     Control root, int generation, long sequence, int phase, int frame) {
-        if (!host.ContinuePreparedFrame() || !host.isRunning) { return false; }
+        if (host.preparationFrameAborted || !host.isRunning) { return false; }
+        if (host.preparedHostFrameValid && !host.ContinuePreparedFrame()) { return false; }
         if (host.rootControl != root || host.inputRootGeneration != generation
             || host.inputPreparationTicket != phase || host.frameSeq != frame) { return false; }
         if (parent == ownerParent && this.app == host && preparingLayoutOwner == null
             && Control.BindingStructureRevision() == structRev
             && this.LayoutRevision() == revision && this.StyleVisible()) {
-            if (host.window.EventSeq() == sequence) { return true; }
-            return false;
+            return host.window.EventSeq() == sequence;
         }
         return this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)
         && this.LayoutNodeCurrent(host, ownerParent, revision) && this.StyleVisible()
         && (ownerParent == null || ownerParent.OwnsLayoutChild(this));
     }
-    void RenderTreeInner(App app) {
-        if (app != null && this.app != app) { this.InheritApp(app); }
-        if (!this.ComputedStyleCurrent(app)) { this.ResolveStyle(app, Style.SNormal()); }
-        if (!this.StyleVisible()) { return; }
+    private void RenderTreeNode(App app, bool ancestorDisabled, bool partialFrame,
+                                bool perfOn, bool paintHashOn,
+                                Control frameRoot, int frameGen, long frameEventSeq,
+                                int framePhase, int frameNum, int frameStructRev,
+                                int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
+        if (app.preparationFrameAborted) { return; }
+        if (app.preparedHostFrameValid && !app.ContinuePreparedFrame()) { return; }
+        if (partialFrame && this.app == app && this.SkipBoundedPaint(app)) { return; }
+        Control prevCtx = app.styleCtx;
+        app.styleCtx = this;
+        if (this.app != app) { this.InheritApp(app); }
+        bool styleOk = (passChainSeq != 0 && Style.chainActiveSeq == passChainSeq)
+            ? this.ComputedStyleCurrentPass(app, passRuleSig, passAnyMedia, passMediaHash, passChainSeq)
+            : this.ComputedStyleCurrent(app);
+        if (!styleOk) { this.ResolveStyle(app, 0); }
+        if (!this.StyleVisible()) {
+            app.styleCtx = prevCtx;
+            return;
+        }
+        bool selfDisabled = ancestorDisabled || this.SelfDisabled();
+        bool prevCompositing = treeCompositing;
+        treeCompositing = true;
+        StyleBox surface = this.ResolvePaintedSurfaceKnown(app, selfDisabled);
+        bool simpleNode = !partialFrame && !perfOn && !paintHashOn
+            && app.paintOffsetX == 0 && app.paintOffsetY == 0
+            && app.canvas.opacityPm == 1000
+            && (surface == null || (surface.tx == 0 && surface.ty == 0
+                && surface.anim != 5 && surface.opacity >= 1000
+                && (surface.scale == 1000 || surface.scale <= 0)
+                && (surface.rotate % 360) == 0));
+        if (simpleNode) {
+            this.RenderTreeNodeSimple(app, surface, selfDisabled, prevCompositing, prevCtx,
+                frameRoot, frameGen, frameEventSeq, framePhase, frameNum, frameStructRev,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            return;
+        }
+        try {
+            this.RenderTreeInner(app, surface, selfDisabled, partialFrame, perfOn, paintHashOn,
+                frameRoot, frameGen, frameEventSeq, framePhase, frameNum, frameStructRev,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+        } finally {
+            treeCompositing = prevCompositing;
+            paintedStyle = null;
+            app.styleCtx = prevCtx;
+        }
+    }
+    private void RenderTreeNodeSimple(App app, StyleBox surface, bool selfDisabled,
+                                      bool prevCompositing, Control prevCtx,
+                                      Control root, int generation, long sequence,
+                                      int phase, int frame, int structRev,
+                                      int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
+        int count = childNodes.Count;
+        StyleBox cs = computedStyle;
+        bool scrollC = cs != null && (cs.overflowX != 0 || cs.overflowY != 0);
+        if (count == 0 && !scrollC && (Tip == null || Tip.Length == 0)
+            && (this.extra == null || this.extra.Paint == null)) {
+            if (!wiresOwnEvents && !styleSurfaceOwned && surface != null) {
+                surface.Paint(app, bx, by, bw, bh);
+            }
+            OnPaint(app);
+            if (surface != null) {
+                surface.treeComposite = false;
+                surface.layerTransformOwned = false;
+            }
+            if (paintedStyle != null) {
+                paintedStyle.treeComposite = false;
+                paintedStyle.layerTransformOwned = false;
+            }
+            paintedStyle = null;
+            treeCompositing = prevCompositing;
+            app.styleCtx = prevCtx;
+            return;
+        }
+        Control ownerParent = parent;
+        int revision = this.LayoutRevision();
+        if (!wiresOwnEvents && !styleSurfaceOwned && surface != null) {
+            surface.Paint(app, bx, by, bw, bh);
+        }
+        OnPaint(app);
+        if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) {
+            if (surface != null) { surface.treeComposite = false; surface.layerTransformOwned = false; }
+            if (paintedStyle != null) { paintedStyle.treeComposite = false; paintedStyle.layerTransformOwned = false; }
+            paintedStyle = null;
+            treeCompositing = prevCompositing;
+            app.styleCtx = prevCtx;
+            return;
+        }
+        if (Tip != null && Tip.Length > 0 && (app.ShouldShowTip(this, bx, by, bw, bh)
+            || app.HoldTip(this))) {
+            int place = Widget.Tooltip.Bottom();
+            if (TipSide == "top") { place = Widget.Tooltip.Top(); }
+            else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
+            else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
+            Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
+        }
+        if (this.extra != null && this.extra.Paint != null && this.extra.Paint.Count() > 0) {
+            this.extra.Paint.Raise(this);
+            if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) {
+                if (surface != null) { surface.treeComposite = false; surface.layerTransformOwned = false; }
+                if (paintedStyle != null) { paintedStyle.treeComposite = false; paintedStyle.layerTransformOwned = false; }
+                paintedStyle = null;
+                treeCompositing = prevCompositing;
+                app.styleCtx = prevCtx;
+                return;
+            }
+        }
+        count = childNodes.Count;
+        cs = computedStyle;
+        scrollC = cs != null && (cs.overflowX != 0 || cs.overflowY != 0);
+        if (count > 0 && !this.ChildControlsRenderedByOwner()) {
+            bool clipKids = scrollC || cs == null || cs.overflow != 0;
+            if (clipKids) {
+                if (scrollC) {
+                    Rect viewport = this.ScrollViewport();
+                    app.canvas.PushClip(viewport.x, viewport.y, viewport.width, viewport.height);
+                    app.PushNativeClip(viewport.x, viewport.y, viewport.width, viewport.height);
+                } else {
+                    app.canvas.PushClip(bx, by, bw, bh);
+                    app.PushNativeClip(bx, by, bw, bh);
+                }
+                try {
+                    this.RenderSimpleChildren(app, count, selfDisabled, ownerParent, revision, structRev,
+                        root, generation, sequence, phase, frame,
+                        passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+                } finally {
+                    app.PopNativeClip();
+                    app.canvas.PopClip();
+                }
+            } else {
+                this.RenderSimpleChildren(app, count, selfDisabled, ownerParent, revision, structRev,
+                    root, generation, sequence, phase, frame,
+                    passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            }
+        }
+        if (scrollC) { this.PaintScrollBars(app); }
+        if (surface != null) {
+            surface.treeComposite = false;
+            surface.layerTransformOwned = false;
+        }
+        if (paintedStyle != null) {
+            paintedStyle.treeComposite = false;
+            paintedStyle.layerTransformOwned = false;
+        }
+        paintedStyle = null;
+        treeCompositing = prevCompositing;
+        app.styleCtx = prevCtx;
+    }
+    private void RenderSimpleChildren(App app, int count, bool selfDisabled, Control ownerParent,
+                                      int revision, int structRev, Control root, int generation,
+                                      long sequence, int phase, int frame,
+                                      int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
+        if (count == 1) {
+            Control child = childNodes[0];
+            if (this.OwnsLayoutChild(child) && this.ChildInViewport(child)) {
+                child.RenderTreeNode(app, selfDisabled, false, false, false,
+                    root, generation, sequence, phase, frame, structRev,
+                    passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            }
+            return;
+        }
+        List<Control> ordered = this.PaintChildrenFast();
+        bool liveList = ordered == childNodes;
+        int i = 0;
+        while (i < count) {
+            if (liveList && i >= ordered.Count) { break; }
+            Control child = ordered[i];
+            if (!this.OwnsLayoutChild(child) || !this.ChildInViewport(child)) { i = i + 1; continue; }
+            child.RenderTreeNode(app, selfDisabled, false, false, false,
+                root, generation, sequence, phase, frame, structRev,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
+            if (liveList && (i >= ordered.Count || ordered[i] != child)) {
+                if (child.parent != this) { count = count - 1; continue; }
+            }
+            i = i + 1;
+        }
+    }
+    private void RenderTreeInner(App app, StyleBox surface, bool selfDisabled,
+                                 bool partialFrame, bool perfOn, bool paintHashOn,
+                                 Control frameRoot, int frameGen, long frameEventSeq,
+                                 int framePhase, int frameNum, int frameStructRev,
+                                 int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
         int origX = bx;
         int origY = by;
         int prevOffX = app.paintOffsetX;
         int prevOffY = app.paintOffsetY;
         int prevOpacity = app.canvas.opacityPm;
-        bool prevCompositing = treeCompositing;
-        treeCompositing = true;
-        StyleBox surface = this.ResolvePaintedSurface(app);
         int localDx = surface != null ? surface.tx : 0;
-        int localDy = surface != null ? surface.ty + surface.FloatOffset(app, origX + prevOffX, origY + prevOffY, bw, bh) : 0;
+        int localDy = surface != null ? surface.ty + (surface.anim == 5 ? surface.FloatOffset(app, origX + prevOffX, origY + prevOffY, bw, bh) : 0) : 0;
         int offX = prevOffX + localDx;
         int offY = prevOffY + localDy;
         int localOpacity = surface != null ? surface.opacity : 1000;
@@ -134,20 +323,13 @@ public partial class Control {
             long sequence = app.window.EventSeq();
             int phase = app.inputPreparationTicket;
             int frame = app.frameSeq;
-            // 卡顿归因：分析器开着时取本节点自己那段绘制（不含子树）
-            // 的耗时，由 App 留住本帧最贵的那一个。整帧只有几毫秒而
-            // 尖尖那一帧到二十多毫秒时，需要知道是哪个控件在花钱。
             int selfT0 = 0;
-            bool selfProf = App.PerfOn();
-            if (selfProf) { selfT0 = Window.GetTickUs(); }
-            // 自段哈希：置换累加器、计本节点自己的命令流，
-            // OnPaint 出口比对——与上面卡顿归因同一段（不含子树，
-            // 子树在下方递归里自成一段自算自比）。
-            bool skipSelf = !pushedLayer && this.CanBoundsCull(app, false);
+            if (perfOn) { selfT0 = Window.GetTickUs(); }
+            bool skipSelf = partialFrame && !pushedLayer && this.CanBoundsCull(app, false);
             if (skipSelf) {
                 app.culledControlPaints = app.culledControlPaints + 1;
             } else {
-                if (PaintHash.On) {
+                if (paintHashOn) {
                     PaintHashToken hashSeg = PaintHash.BeginScope();
                     try {
                         PaintStyleBox(app);
@@ -158,14 +340,16 @@ public partial class Control {
                         PaintHash.Restore(hashSeg);
                     }
                 } else {
-                    PaintStyleBox(app);
+                    if (!wiresOwnEvents && !styleSurfaceOwned && surface != null) {
+                        surface.Paint(app, bx, by, bw, bh);
+                    }
                     OnPaint(app);
                     if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
                 }
-                if (selfProf) {
+                if (perfOn) {
                     app.Stats.Node(this.Kind(), name, Window.GetTickUs() - selfT0);
                 }
-                if (Tip != "" && (app.ShouldShowTip(this, origX, origY, bw, bh)
+                if (Tip != null && Tip.Length > 0 && (app.ShouldShowTip(this, origX, origY, bw, bh)
                 || app.HoldTip(this))) {
                     int place = Widget.Tooltip.Bottom();
                     if (TipSide == "top") { place = Widget.Tooltip.Top(); }
@@ -198,9 +382,12 @@ public partial class Control {
                     bool restoreBounds = pushedLayer || offX != 0 || offY != 0;
                     int paintX = pushedLayer ? 0 : origX + offX;
                     int paintY = pushedLayer ? 0 : origY + offY;
-                    for (int i = 0; i < count; i = i + 1) {
+                    bool liveList = ordered != null && ordered == childNodes;
+                    int i = 0;
+                    while (i < count) {
+                        if (liveList && i >= ordered.Count) { break; }
                         Control child = ordered != null ? ordered[i] : onlyChild;
-                        if (!this.OwnsLayoutChild(child)) { continue; }
+                        if (!this.OwnsLayoutChild(child)) { i = i + 1; continue; }
                         bool inView;
                         if (restoreBounds) {
                             bx = origX;
@@ -211,9 +398,15 @@ public partial class Control {
                         } else {
                             inView = this.ChildInViewport(child);
                         }
-                        if (!inView) { continue; }
-                        child.RenderTree(app);
+                        if (!inView) { i = i + 1; continue; }
+                        child.RenderTreeNode(app, selfDisabled, partialFrame, perfOn, paintHashOn,
+                            root, generation, sequence, phase, frame, structRev,
+                            passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
                         if (!this.PaintNodeCurrent(app, ownerParent, revision, structRev, root, generation, sequence, phase, frame)) { return; }
+                        if (liveList && (i >= ordered.Count || ordered[i] != child)) {
+                            if (child.parent != this) { count = count - 1; continue; }
+                        }
+                        i = i + 1;
                     }
                 } finally {
                     if (clipKids) {
@@ -233,7 +426,6 @@ public partial class Control {
                 paintedStyle.layerTransformOwned = false;
             }
             if (pushedLayer) { app.canvas.PopLayer(); }
-            treeCompositing = prevCompositing;
             bx = origX;
             by = origY;
             app.paintOffsetX = prevOffX;

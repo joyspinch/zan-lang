@@ -450,10 +450,7 @@ public partial class Style {
         }
         return h;
     }
-    static long SelfNodeHash(StyleNode anc) {
-        string ty = anc.StyleType();
-        string cls = anc.EffectiveClass();
-        string nm = anc.StyleNodeName();
+    internal static long SelfNodeHashKnown(StyleNode anc, string ty, string cls, string nm) {
         if (anc.shValid && anc.shType == ty && anc.shClass == cls && anc.shName == nm) {
             return anc.shSelf;
         }
@@ -468,15 +465,41 @@ public partial class Style {
         anc.shValid = true;
         return h;
     }
+    static long SelfNodeHash(StyleNode anc) {
+        return Style.SelfNodeHashKnown(anc, anc.StyleType(), anc.EffectiveClass(), anc.StyleNodeName());
+    }
     static int chainSeq;
     internal static int chainPassDepth;
-    static int chainActiveSeq;
+    internal static int chainActiveSeq;
     internal static weak StyleHost chainApp;
     static bool chainMediaReady;
-    static int chainVpW;
-    static int chainVpH;
-    static int chainDark;
-    static int chainRm;
+    internal static long chainMediaHash;
+    static long MediaHashValue(int w, int h, int dark, int rm) {
+        long mh = 1469598103934665603L;
+        mh = (mh ^ (long)w) * 1099511628211L;
+        mh = (mh ^ (long)h) * 1099511628211L;
+        mh = (mh ^ (long)dark) * 1099511628211L;
+        mh = (mh ^ (long)rm) * 1099511628211L;
+        return mh;
+    }
+    internal static long PassMediaHash(StyleHost app) {
+        if (app == null) { return 0L; }
+        if (Style.chainPassDepth > 0 && Style.chainApp == app) {
+            if (!Style.chainMediaReady) {
+                Style.chainMediaHash = Style.MediaHashValue(
+                    app.CssViewportWidth(), app.CssViewportHeight(),
+                    app.HostIsDark() ? 1 : 0, app.HostReducedMotion() ? 1 : 0);
+                Style.chainMediaReady = true;
+            }
+            return Style.chainMediaHash;
+        }
+        return Style.MediaHashValue(
+            app.CssViewportWidth(), app.CssViewportHeight(),
+            app.HostIsDark() ? 1 : 0, app.HostReducedMotion() ? 1 : 0);
+    }
+    internal static long AncestorChainHashFrom(StyleNode node, StyleHost app, int seq) {
+        return Style.AncestorChainHash(node, app, seq, 0);
+    }
     public static void BeginChainPass(StyleHost app) {
         if (chainPassDepth == 0) {
             chainSeq = chainSeq + 1;
@@ -522,6 +545,46 @@ public partial class Style {
         }
         return h;
     }
+    static long MixMediaHash(StyleHost app, long h) {
+        long mh;
+        if (Style.chainPassDepth > 0 && Style.chainApp == app) {
+            if (!Style.chainMediaReady) {
+                Style.chainMediaHash = Style.MediaHashValue(
+                    app.CssViewportWidth(), app.CssViewportHeight(),
+                    app.HostIsDark() ? 1 : 0, app.HostReducedMotion() ? 1 : 0);
+                Style.chainMediaReady = true;
+            }
+            mh = Style.chainMediaHash;
+        } else {
+            mh = Style.MediaHashValue(
+                app.CssViewportWidth(), app.CssViewportHeight(),
+                app.HostIsDark() ? 1 : 0, app.HostReducedMotion() ? 1 : 0);
+        }
+        return (h ^ mh) * 1099511628211L;
+    }
+    internal static long ContextHashForNode(StyleHost app, StyleNode anc, StyleNode par, int idx,
+                                            int dependency, bool anyMedia,
+                                            string ty, string cls, string nm) {
+        if (app == null) { return 0L; }
+        if (dependency == 0 && !anyMedia) { return 0L; }
+        long h = 1469598103934665603L;
+        if (dependency == 1) {
+            if (anc != null) {
+                int seq = (Style.chainActiveSeq != 0 && Style.chainApp == app) ? Style.chainActiveSeq : 0;
+                if (par != null) {
+                    h = (seq != 0 && par.chSeq == seq) ? par.chVal : Style.AncestorChainHash(par, app, seq, 0);
+                }
+                h = (h ^ Style.SelfNodeHashKnown(anc, ty, cls, nm)) * 1099511628211L;
+                h = (h ^ (long)idx) * 1099511628211L;
+            }
+        } else if (dependency == 2 && anc != null) {
+            h = (h ^ 999983L) * 1099511628211L;
+        }
+        if (anyMedia) {
+            h = Style.MixMediaHash(app, h);
+        }
+        return h;
+    }
     public static long ContextHashFast(StyleHost app, int dependency, bool anyMedia) {
         if (app == null) { return 0L; }
         if (dependency == 0 && !anyMedia) { return 0L; }
@@ -537,27 +600,10 @@ public partial class Style {
                 h = Style.MixHashInt(h, idx);
             }
         } else if (dependency == 2 && app.HostStyleCtx() != null) {
-            h = Style.MixHashInt(h, 999983);
+            h = (h ^ 999983L) * 1099511628211L;
         }
         if (anyMedia) {
-            if (Style.chainPassDepth > 0 && Style.chainApp == app) {
-                if (!Style.chainMediaReady) {
-                    Style.chainVpW = app.CssViewportWidth();
-                    Style.chainVpH = app.CssViewportHeight();
-                    Style.chainDark = app.HostIsDark() ? 1 : 0;
-                    Style.chainRm = app.HostReducedMotion() ? 1 : 0;
-                    Style.chainMediaReady = true;
-                }
-                h = Style.MixHashInt(h, Style.chainVpW);
-                h = Style.MixHashInt(h, Style.chainVpH);
-                h = Style.MixHashInt(h, Style.chainDark);
-                h = Style.MixHashInt(h, Style.chainRm);
-            } else {
-                h = Style.MixHashInt(h, app.CssViewportWidth());
-                h = Style.MixHashInt(h, app.CssViewportHeight());
-                h = Style.MixHashInt(h, app.HostIsDark() ? 1 : 0);
-                h = Style.MixHashInt(h, app.HostReducedMotion() ? 1 : 0);
-            }
+            h = Style.MixMediaHash(app, h);
         }
         return h;
     }

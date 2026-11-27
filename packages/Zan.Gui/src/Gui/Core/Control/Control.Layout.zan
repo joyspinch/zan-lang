@@ -7,13 +7,16 @@ public partial class Control {
     internal bool measureDependsOnWidth;
     private bool measureIntrinsic;
     protected virtual bool UsesBaseFlowOnly() { return this.Kind() == "Control"; }
+    protected virtual bool UsesBaseSyncBinding() { return this.Kind() == "Control"; }
     protected virtual bool IsWidthDependentMeasure() { return false; }
     private bool measuringTree;
+    private int measuringPass;
     private weak App measuringApp;
     private List<App> measuringAncestors;
     private bool syncingBinding;
     private bool PrepareBindings(App app) {
         if (syncingBinding) { return false; }
+        if (this.extra == null && this.UsesBaseSyncBinding()) { return true; }
         Control ownerParent = parent;
         Control root = app != null ? app.rootControl : null;
         int generation = app != null ? app.inputRootGeneration : 0;
@@ -28,33 +31,82 @@ public partial class Control {
         && (app == null || (app.rootControl == root && app.inputRootGeneration == generation
         && (app.window == null || app.window.EventSeq() == sequence)));
     }
-    private void MeasureIntrinsicTree(App app) {
-        bool previous = measureIntrinsic;
-        measureIntrinsic = true;
-        try {
-            this.MeasureTree(app);
-        } finally {
-            measureIntrinsic = previous;
-        }
-    }
     private void PrepareMeasureStyle(App app) {
         Control previous = app.styleCtx;
         app.styleCtx = this;
+        if (this.app != app) { this.InheritApp(app); }
+        if (this.extra == null && this.UsesBaseSyncBinding()) {
+            if (!syncingBinding && (!this.ComputedStyleCurrent(app) || computedStyleState != 0)) {
+                this.ResolveStyle(app, 0);
+            }
+            app.styleCtx = previous;
+            return;
+        }
         try {
-            if (this.app != app) { this.InheritApp(app); }
             if (!this.PrepareBindings(app)) { return; }
-            if (!this.ComputedStyleCurrent(app) || computedStyleState != Style.SNormal()) {
-                this.ResolveStyle(app, Style.SNormal());
+            if (!this.ComputedStyleCurrent(app) || computedStyleState != 0) {
+                this.ResolveStyle(app, 0);
             }
         } finally {
             app.styleCtx = previous;
         }
     }
     public virtual bool SelfManagesOverlayLayout() { return false; }
-    void MeasureTree(App app) { this.MeasureTree(app, -1, false); }
-    private void MeasureTree(App app, int available, bool clamp) {
-        if (measuringTree && (measuringApp == app
-        || (measuringAncestors != null && measuringAncestors.Contains(app)))) { return; }
+    void MeasureTree(App app) { this.MeasureTreeEntry(app, -1, false, false); }
+    private void MeasureTreeEntry(App app, int available, bool clamp, bool intrinsic) {
+        bool ownChainPass = Style.chainPassDepth == 0 || Style.chainApp != app;
+        if (ownChainPass) { Style.BeginChainPass(app); }
+        app.measurePassSeq = app.measurePassSeq + 1;
+        if (app.measurePassSeq == 0) { app.measurePassSeq = 1; }
+        int passId = app.measurePassSeq;
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration;
+        long sequence = app.window != null ? app.window.EventSeq() : 0;
+        int passRuleSig = app.CurrentStyleRuleSig();
+        bool passAnyMedia = (passRuleSig & 1) != 0;
+        long passMediaHash = passAnyMedia ? Style.PassMediaHash(app) : 0L;
+        int passChainSeq = Style.chainApp == app ? Style.chainActiveSeq : 0;
+        Control prevCtx = app.styleCtx;
+        try {
+            this.MeasureTreeNode(app, available, clamp, intrinsic, passId, root, generation, sequence,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+        } finally {
+            app.measurePassSeq = app.measurePassSeq + 1;
+            if (app.measurePassSeq == 0) { app.measurePassSeq = 1; }
+            if (ownChainPass) { Style.EndChainPass(); }
+            app.styleCtx = prevCtx;
+        }
+    }
+    private void MeasureTreeNode(App app, int available, bool clamp, bool intrinsic,
+                                 int passId, Control root, int generation, long sequence,
+                                 int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
+        if ((measuringPass == passId && measuringApp == app)
+            || (measuringTree && (measuringApp == app
+                || (measuringAncestors != null && measuringAncestors.Contains(app))))) { return; }
+        if (measuringTree || (measuringPass != 0 && measuringApp != app)) {
+            this.MeasureTreeSlow(app, available, clamp, intrinsic, passId, root, generation, sequence,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            return;
+        }
+        Control prevCtx = app.styleCtx;
+        int previousWidth = measureWidth;
+        bool prevIntrinsic = measureIntrinsic;
+        int prevPass = measuringPass;
+        app.styleCtx = this;
+        measuringPass = passId;
+        measuringApp = app;
+        measureIntrinsic = intrinsic;
+        this.MeasureTreeInner(app, available, clamp, passId, root, generation, sequence,
+            passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+        measureWidth = previousWidth;
+        measureIntrinsic = prevIntrinsic;
+        measuringPass = prevPass;
+        measuringApp = null;
+        app.styleCtx = prevCtx;
+    }
+    private void MeasureTreeSlow(App app, int available, bool clamp, bool intrinsic,
+                                 int passId, Control root, int generation, long sequence,
+                                 int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
         App previousApp = measuringApp;
         bool previous = measuringTree;
         if (previous) {
@@ -63,17 +115,21 @@ public partial class Control {
         }
         Control prevCtx = app.styleCtx;
         int previousWidth = measureWidth;
+        bool prevIntrinsic = measureIntrinsic;
+        int prevPass = measuringPass;
         app.styleCtx = this;
         measuringTree = true;
+        measuringPass = passId;
         measuringApp = app;
-        bool ownChainPass = Style.chainPassDepth == 0 || Style.chainApp != app;
-        if (ownChainPass) { Style.BeginChainPass(app); }
+        measureIntrinsic = intrinsic;
         try {
-            this.MeasureTreeInner(app, available, clamp);
+            this.MeasureTreeInner(app, available, clamp, passId, root, generation, sequence,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
         } finally {
-            if (ownChainPass) { Style.EndChainPass(); }
             measureWidth = previousWidth;
+            measureIntrinsic = prevIntrinsic;
             measuringTree = previous;
+            measuringPass = prevPass;
             measuringApp = previousApp;
             if (previous) {
                 measuringAncestors.RemoveAt(measuringAncestors.Count - 1);
@@ -86,23 +142,24 @@ public partial class Control {
         int previous = measureWidth;
         measureWidth = width > 0 ? width : 0;
         try {
-            this.MeasureTree(app);
+            this.MeasureTreeEntry(app, -1, false, false);
         } finally {
             measureWidth = previous;
         }
     }
-    private void MeasureTreeInner(App app, int available, bool clamp) {
+    private void MeasureTreeInner(App app, int available, bool clamp,
+                                  int passId, Control root, int generation, long sequence,
+                                  int passRuleSig, bool passAnyMedia, long passMediaHash, int passChainSeq) {
         if (app != null && this.app != app) { this.InheritApp(app); }
         if (!this.PrepareBindings(app)) { return; }
         Control ownerParent = parent;
-        Control root = app.rootControl;
-        int generation = app.inputRootGeneration;
-        long sequence = app.window != null ? app.window.EventSeq() : 0;
         if (this.fillW) { prefW = 0; this.fillW = false; }
         if (this.fillH) { prefH = 0; this.fillH = false; }
-        if (!this.ComputedStyleCurrent(app)
-        || computedStyleState != Style.SNormal()) {
-            this.ResolveStyle(app, Style.SNormal());
+        bool styleOk = computedStyleState == 0 && (passChainSeq != 0 && Style.chainActiveSeq == passChainSeq
+            ? this.ComputedStyleCurrentPass(app, passRuleSig, passAnyMedia, passMediaHash, passChainSeq)
+            : this.ComputedStyleCurrent(app));
+        if (!styleOk) {
+            this.ResolveStyle(app, 0);
         }
         if (available >= 0) {
             int room = available - this.StyleMarL() - this.StyleMarR();
@@ -116,49 +173,56 @@ public partial class Control {
         bool dep = this.IsWidthDependentMeasure() || display == 4
             || (display == 1 && this.StyleWrap() != 0)
             || (computedStyle != null && computedStyle.aspect != 0);
-        bool row = display == 1 && this.StyleFlexDir() != 1;
-        bool intrinsicKids = measureIntrinsic || display == 4 || (row && this.StyleWrap() == 0);
-        bool deferGridKids = false;
         int childCount = childNodes.Count;
-        int childWidth = childCount > 0 && !intrinsicKids && !row ? this.WrapContentWidth() : 0;
-        List<Control> children = childCount == 0 ? childNodes : this.SnapshotChildrenCached();
-        if (childCount > 0 && display == 4 && !measureIntrinsic) {
+        if (childCount > 0) {
+            bool row = display == 1 && this.StyleFlexDir() != 1;
+            bool intrinsicKids = measureIntrinsic || display == 4 || (row && this.StyleWrap() == 0);
+            bool deferGridKids = false;
+            int childWidth = !intrinsicKids && !row ? this.WrapContentWidth() : 0;
+            List<Control> children = this.SnapshotChildrenCached();
+            if (display == 4 && !measureIntrinsic) {
+                for (int i = 0; i < children.Count; i = i + 1) {
+                    Control child = children[i];
+                    if (child.parent != this) { continue; }
+                    child.PrepareMeasureStyle(app);
+                    if (parent != ownerParent || (this.app != app && this.FindApp() != app) || app.rootControl != root
+                    || app.inputRootGeneration != generation
+                    || (app.window != null && app.window.EventSeq() != sequence)) { return; }
+                }
+                List<Control> items = this.GridItems();
+                int gridAvail = this.GridMeasureWidth();
+                int gridGap = this.StyleColGap(this.StyleGap());
+                deferGridKids = this.GridColumnsDefinite(this.PlanGrid(items, gridAvail, gridGap), gridAvail);
+            }
             for (int i = 0; i < children.Count; i = i + 1) {
                 Control child = children[i];
                 if (child.parent != this) { continue; }
-                child.PrepareMeasureStyle(app);
+                if (deferGridKids) {
+                    if (child.StyleVisible() && child.StylePosition() < 2 && child.StyleDisplay() != 2) { continue; }
+                    child.MeasureTreeNode(app, -1, false, false, passId, root, generation, sequence,
+                        passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+                } else if (intrinsicKids) {
+                    child.MeasureTreeNode(app, -1, false, true, passId, root, generation, sequence,
+                        passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+                } else if (!row && childWidth > 0) {
+                    child.MeasureTreeNode(app, childWidth, display == 1, false, passId, root, generation, sequence,
+                        passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+                } else {
+                    child.MeasureTreeNode(app, -1, false, false, passId, root, generation, sequence,
+                        passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+                }
+                if (child.measureDependsOnWidth) { dep = true; }
                 if (parent != ownerParent || (this.app != app && this.FindApp() != app) || app.rootControl != root
                 || app.inputRootGeneration != generation
                 || (app.window != null && app.window.EventSeq() != sequence)) { return; }
             }
-            List<Control> items = this.GridItems();
-            int gridAvail = this.GridMeasureWidth();
-            int gridGap = this.StyleColGap(this.StyleGap());
-            deferGridKids = this.GridColumnsDefinite(this.PlanGrid(items, gridAvail, gridGap), gridAvail);
-        }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control child = children[i];
-            if (child.parent != this) { continue; }
-            if (deferGridKids) {
-                if (child.StyleVisible() && child.StylePosition() < 2 && child.StyleDisplay() != 2) { continue; }
-                child.MeasureTree(app);
-            } else if (intrinsicKids) {
-                child.MeasureIntrinsicTree(app);
-            } else if (!row && childWidth > 0) {
-                child.MeasureInWidth(app, childWidth, display == 1);
-            } else {
-                child.MeasureTree(app);
-            }
-            if (child.measureDependsOnWidth) { dep = true; }
-            if (parent != ownerParent || (this.app != app && this.FindApp() != app) || app.rootControl != root
-            || app.inputRootGeneration != generation
-            || (app.window != null && app.window.EventSeq() != sequence)) { return; }
         }
         measureDependsOnWidth = dep;
         int keepW = prefW;
         int keepH = prefH;
         bool keepSet = prefSet;
         OnMeasure(app);
+        if (childCount == 0 && !keepSet && this.UsesBaseFlowOnly()) { return; }
         if (parent != ownerParent || (this.app != app && this.FindApp() != app) || app.rootControl != root
         || app.inputRootGeneration != generation
         || (app.window != null && app.window.EventSeq() != sequence)) { return; }
@@ -170,7 +234,20 @@ public partial class Control {
         this.MeasureContent(app);
     }
     private void MeasureInWidth(App app, int available, bool clamp) {
-        this.MeasureTree(app, available > 0 ? available : 0, clamp);
+        int passId = app != null ? app.measurePassSeq : 0;
+        if (passId != 0 && Style.chainPassDepth > 0 && Style.chainApp == app) {
+            Control root = app.rootControl;
+            int generation = app.inputRootGeneration;
+            long sequence = app.window != null ? app.window.EventSeq() : 0;
+            int passRuleSig = app.CurrentStyleRuleSig();
+            bool passAnyMedia = (passRuleSig & 1) != 0;
+            long passMediaHash = passAnyMedia ? Style.PassMediaHash(app) : 0L;
+            int passChainSeq = Style.chainApp == app ? Style.chainActiveSeq : 0;
+            this.MeasureTreeNode(app, available > 0 ? available : 0, clamp, false, passId, root, generation, sequence,
+                passRuleSig, passAnyMedia, passMediaHash, passChainSeq);
+            return;
+        }
+        this.MeasureTreeEntry(app, available > 0 ? available : 0, clamp, false);
     }
     protected virtual int WrapContentWidth() {
         int width = measureWidth;
@@ -465,7 +542,9 @@ public partial class Control {
             if (host != null) { host.layoutEventsDirty = true; }
         }
         if ((childNodes == null || childNodes.Count == 0) && this.UsesBaseFlowOnly()) {
-            if (this.IsScrollContainer()) { this.ArrangeScrollTail(); }
+            if (computedStyle != null && (computedStyle.overflowX != 0 || computedStyle.overflowY != 0)) {
+                this.ArrangeScrollTail();
+            }
             return;
         }
         int innerPadL = this.StyleInsetL();
@@ -484,16 +563,19 @@ public partial class Control {
         int pbw = pw;
         int pbh = ph;
         int dispBox = this.StyleDisplay();
+        bool needPositioned = true;
         if (dispBox == 1) {
-            this.ArrangeFlex(cx, cy, cw, ch, innerGap);
+            needPositioned = this.ArrangeFlex(cx, cy, cw, ch, innerGap);
         } else if (dispBox == 4) {
             this.ArrangeGrid(cx, cy, cw, ch);
         } else {
             this.ArrangeFlow(cx, cy, cw, ch, innerGap);
         }
-        this.ArrangePositioned(pbx, pby, pbw, pbh);
-        this.CheckKidsLayout();
-        this.ArrangeScrollTail();
+        if (needPositioned) { this.ArrangePositioned(pbx, pby, pbw, pbh); }
+        if (LayoutLintDiagnostics.AnyActive()) { this.CheckKidsLayout(); }
+        if (computedStyle != null && (computedStyle.overflowX != 0 || computedStyle.overflowY != 0)) {
+            this.ArrangeScrollTail();
+        }
     }
     void ArrangePositioned(int cx, int cy, int cw, int ch) {
         if (childNodes == null || childNodes.Count == 0) { return; }

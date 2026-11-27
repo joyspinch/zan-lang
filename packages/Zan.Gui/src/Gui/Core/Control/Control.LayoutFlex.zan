@@ -16,8 +16,9 @@ public partial class Control {
             mainGap = this.StyleRowGap(baseGap);
             crossGap = this.StyleColGap(baseGap);
         }
+        int wrapMode = this.StyleWrap();
         int wrapMain = 0;
-        if (this.StyleWrap() != 0) {
+        if (wrapMode != 0) {
             wrapMain = flexWrapMain;
             if (row && hintWrapW > 0) { wrapMain = hintWrapW - this.StyleInsetL() - this.StyleInsetR(); }
             if (row && prefW > 0) {
@@ -34,7 +35,7 @@ public partial class Control {
         int crossSum = 0;
         int lines = 0;
         List<Control> flexKids = this.FlexKids();
-        if (app != null && !measureIntrinsic && row && this.StyleWrap() == 0 && measureWidth >= 0) {
+        if (app != null && !measureIntrinsic && row && wrapMode == 0 && measureWidth >= 0) {
             bool anyDep = false;
             for (int k = 0; k < flexKids.Count; k = k + 1) {
                 if (flexKids[k].measureDependsOnWidth) { anyDep = true; break; }
@@ -122,13 +123,13 @@ public partial class Control {
                 this.fillW = true;
             }
         }
-        if (this.StyleWrap() != 0 && flexMeasMain != flexWrapMain) {
+        if (wrapMode != 0 && flexMeasMain != flexWrapMain) {
             flexMeasMain = flexWrapMain;
             app.RequestRedraw();
         }
     }
     List<Control> FlexKids() { return this.PlannedChildren(false, false); }
-    void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
+    bool ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
         bool row = true;
         if (this.StyleFlexDir() == 1) { row = false; }
         int mainBox = cw;
@@ -141,14 +142,15 @@ public partial class Control {
             mainGap = this.StyleRowGap(gapPx);
             crossGap = this.StyleColGap(gapPx);
         }
-        List<Control> items = this.FlexKids();
+        bool anyPos;
+        List<Control> items = this.FlexKidsAndPos(out anyPos);
         int n = items.Count;
-        if (n == 0) { return; }
-        flexWrapMain = mainBox;
+        if (n == 0) { return anyPos; }
         if (this.StyleWrap() == 0) {
             this.ArrangeFlexLine(items, cx, cy, cw, ch, mainGap, row, 0, crossBox);
-            return;
+            return anyPos;
         }
+        flexWrapMain = mainBox;
         List<int> lineFrom = new List<int>();
         List<int> lineTo = new List<int>();
         List<int> lineCross = new List<int>();
@@ -211,6 +213,7 @@ public partial class Control {
             this.ArrangeFlexLineSlice(items, lineFrom[li], lineTo[li], cx, cy, cw, ch, mainGap, row, crossOff, lc);
             crossOff = crossOff + lc + between;
         }
+        return anyPos;
     }
     void ArrangeFlexLine(List<Control> items, int cx, int cy, int cw, int ch,
                          int gapPx, bool row, int crossOff, int crossBox) {
@@ -307,62 +310,59 @@ public partial class Control {
                     flexFloorBuf = null;
                     if (floors == null) { floors = new List<int>(); }
                     else { floors.Clear(); }
-                    try {
-                        int give = room;
+                    int give = room;
+                    i = 0;
+                    while (i < n) {
+                        int f = 0;
+                        Control child = items[start + i];
+                        if (child.StyleShrink() != 0) {
+                            StyleBox style = child.computedStyle;
+                            bool explicitMin = style != null && (row
+                                ? (style.minW >= 0 || style.minWPm >= 0)
+                                : (style.minH >= 0 || style.minHPm >= 0));
+                            int minimum = explicitMin ? 0 : child.MinContentMain(row);
+                            if (row) { f = child.StyleClampW(cw, minimum); }
+                            else { f = child.StyleClampH(ch, minimum); }
+                            if (f > sizes[i]) { f = sizes[i]; }
+                            give = give - sizes[i];
+                        }
+                        floors.Add(f);
+                        i = i + 1;
+                    }
+                    int guard = 0;
+                    while (give < 0 && guard <= n) {
+                        guard = guard + 1;
+                        int pool = 0;
+                        int lastGive = 0 - 1;
                         i = 0;
                         while (i < n) {
-                            int f = 0;
-                            Control child = items[start + i];
-                            if (child.StyleShrink() != 0) {
-                                StyleBox style = child.computedStyle;
-                                bool explicitMin = style != null && (row
-                                    ? (style.minW >= 0 || style.minWPm >= 0)
-                                    : (style.minH >= 0 || style.minHPm >= 0));
-                                int minimum = explicitMin ? 0 : child.MinContentMain(row);
-                                if (row) { f = child.StyleClampW(cw, minimum); }
-                                else { f = child.StyleClampH(ch, minimum); }
-                                if (f > sizes[i]) { f = sizes[i]; }
-                                give = give - sizes[i];
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) {
+                                pool = pool + sizes[i] - floors[i];
+                                lastGive = i;
                             }
-                            floors.Add(f);
                             i = i + 1;
                         }
-                        int guard = 0;
-                        while (give < 0 && guard <= n) {
-                            guard = guard + 1;
-                            int pool = 0;
-                            int lastGive = 0 - 1;
-                            i = 0;
-                            while (i < n) {
-                                if (items[start + i].StyleShrink() != 0
-                                    && sizes[i] - floors[i] > 0) {
-                                    pool = pool + sizes[i] - floors[i];
-                                    lastGive = i;
-                                }
-                                i = i + 1;
+                        if (pool <= 0) { break; }
+                        int taken = 0;
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) {
+                                int cut = give * (sizes[i] - floors[i]) / pool;
+                                if (i == lastGive) { cut = give + taken; }
+                                int want = sizes[i] + cut;
+                                if (want < floors[i]) { want = floors[i]; }
+                                taken = taken + sizes[i] - want;
+                                sizes[i] = want;
                             }
-                            if (pool <= 0) { break; }
-                            int taken = 0;
-                            i = 0;
-                            while (i < n) {
-                                if (items[start + i].StyleShrink() != 0
-                                    && sizes[i] - floors[i] > 0) {
-                                    int cut = give * (sizes[i] - floors[i]) / pool;
-                                    if (i == lastGive) { cut = give + taken; }
-                                    int want = sizes[i] + cut;
-                                    if (want < floors[i]) { want = floors[i]; }
-                                    taken = taken + sizes[i] - want;
-                                    sizes[i] = want;
-                                }
-                                i = i + 1;
-                            }
-                            give = give + taken;
+                            i = i + 1;
                         }
-                    } finally {
-                        if (flexFloorBuf == null) {
-                            floors.Clear();
-                            flexFloorBuf = floors;
-                        }
+                        give = give + taken;
+                    }
+                    if (flexFloorBuf == null) {
+                        floors.Clear();
+                        flexFloorBuf = floors;
                     }
                 }
             }
@@ -378,74 +378,71 @@ public partial class Control {
         List<int> sizes = flexSizeBuf;
         flexSizeBuf = null;
         if (sizes == null) { sizes = new List<int>(); }
-        try {
-            this.FlexLineSizesInto(items, start, end, cw, ch, gapPx, row, sizes);
-            int used = n > 1 ? (n - 1) * gapPx : 0;
-            for (int k = 0; k < n; k = k + 1) {
-                used = used + sizes[k] + items[start + k].MarMain(row);
+        this.FlexLineSizesInto(items, start, end, cw, ch, gapPx, row, sizes);
+        int used = n > 1 ? (n - 1) * gapPx : 0;
+        for (int k = 0; k < n; k = k + 1) {
+            used = used + sizes[k] + items[start + k].MarMain(row);
+        }
+        int free = mainBox - used;
+        if (free < 0) { free = 0; }
+        int i = 0;
+        int offset = 0;
+        int between = gapPx;
+        int justify = 0;
+        if (computedStyle != null) { justify = computedStyle.justify; }
+        if (justify == 1) { offset = free / 2; }
+        else if (justify == 2) { offset = free; }
+        else if (justify == 3 && n > 1) { between = between + free / (n - 1); }
+        else if (justify == 4 && n > 0) {
+            int slot = free / n;
+            offset = slot / 2;
+            between = between + slot;
+        } else if (justify == 5) {
+            int slots = n + 1;
+            offset = free / slots;
+            between = between + offset;
+        }
+        int align = 0;
+        if (computedStyle != null) { align = computedStyle.alignItems; }
+        bool rev = this.StyleFlexReverse();
+        int pos = offset;
+        i = 0;
+        while (i < n) {
+            Control c = items[start + i];
+            int main = sizes[i];
+            int crossAvail = crossBox - c.MarCross(row);
+            if (crossAvail < 0) { crossAvail = 0; }
+            int cross;
+            if (row) { cross = c.StyleHeightIn(ch); } else { cross = c.StyleWidthIn(cw); }
+            bool declaresCross = row ? c.StyleDeclaresHeight() : c.StyleDeclaresWidth();
+            int ratio = c.StyleAspect();
+            if (ratio > 0 && !declaresCross) {
+                if (row) { cross = main * 1000 / ratio; }
+                else { cross = main * ratio / 1000; }
+                declaresCross = true;
             }
-            int free = mainBox - used;
-            if (free < 0) { free = 0; }
-            int i = 0;
-            int offset = 0;
-            int between = gapPx;
-            int justify = 0;
-            if (computedStyle != null) { justify = computedStyle.justify; }
-            if (justify == 1) { offset = free / 2; }
-            else if (justify == 2) { offset = free; }
-            else if (justify == 3 && n > 1) { between = between + free / (n - 1); }
-            else if (justify == 4 && n > 0) {
-                int slot = free / n;
-                offset = slot / 2;
-                between = between + slot;
-            } else if (justify == 5) {
-                int slots = n + 1;
-                offset = free / slots;
-                between = between + offset;
+            int al = c.StyleAlignSelf();
+            if (al < 0) { al = align; }
+            if (cross > crossAvail) { cross = crossAvail; }
+            if (al == 0 && !declaresCross) { cross = crossAvail; }
+            if (cross <= 0) { cross = crossAvail; }
+            int crossPos = 0;
+            if (al == 2) { crossPos = (crossAvail - cross) / 2; }
+            else if (al == 3) { crossPos = crossAvail - cross; }
+            int itemPos = rev ? (mainBox - pos - main - c.MarMain(row)) : pos;
+            if (row) {
+                c.Arrange(cx + itemPos + c.StyleMarL(),
+                          cy + crossOff + crossPos + c.StyleMarT(), main, cross);
+            } else {
+                c.Arrange(cx + crossOff + crossPos + c.StyleMarL(),
+                          cy + itemPos + c.StyleMarT(), cross, main);
             }
-            int align = 0;
-            if (computedStyle != null) { align = computedStyle.alignItems; }
-            bool rev = this.StyleFlexReverse();
-            int pos = offset;
-            i = 0;
-            while (i < n) {
-                Control c = items[start + i];
-                int main = sizes[i];
-                int crossAvail = crossBox - c.MarCross(row);
-                if (crossAvail < 0) { crossAvail = 0; }
-                int cross;
-                if (row) { cross = c.StyleHeightIn(ch); } else { cross = c.StyleWidthIn(cw); }
-                bool declaresCross = row ? c.StyleDeclaresHeight() : c.StyleDeclaresWidth();
-                int ratio = c.StyleAspect();
-                if (ratio > 0 && !declaresCross) {
-                    if (row) { cross = main * 1000 / ratio; }
-                    else { cross = main * ratio / 1000; }
-                    declaresCross = true;
-                }
-                int al = c.StyleAlignSelf();
-                if (al < 0) { al = align; }
-                if (cross > crossAvail) { cross = crossAvail; }
-                if (al == 0 && !declaresCross) { cross = crossAvail; }
-                if (cross <= 0) { cross = crossAvail; }
-                int crossPos = 0;
-                if (al == 2) { crossPos = (crossAvail - cross) / 2; }
-                else if (al == 3) { crossPos = crossAvail - cross; }
-                int itemPos = rev ? (mainBox - pos - main - c.MarMain(row)) : pos;
-                if (row) {
-                    c.Arrange(cx + itemPos + c.StyleMarL(),
-                              cy + crossOff + crossPos + c.StyleMarT(), main, cross);
-                } else {
-                    c.Arrange(cx + crossOff + crossPos + c.StyleMarL(),
-                              cy + itemPos + c.StyleMarT(), cross, main);
-                }
-                pos = pos + main + c.MarMain(row) + between;
-                i = i + 1;
-            }
-        } finally {
-            if (flexSizeBuf == null) {
-                sizes.Clear();
-                flexSizeBuf = sizes;
-            }
+            pos = pos + main + c.MarMain(row) + between;
+            i = i + 1;
+        }
+        if (flexSizeBuf == null) {
+            sizes.Clear();
+            flexSizeBuf = sizes;
         }
     }
     int StyleClampW(int avail, int v) {

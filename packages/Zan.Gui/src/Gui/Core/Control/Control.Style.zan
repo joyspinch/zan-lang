@@ -245,6 +245,22 @@ public partial class Control {
     weak App computedStyleApp;
     int computedStyleDpi;
     bool computedStyleSys;
+    private long ContextHashForControl(App app, int dep, bool anyMedia, string type, string effCls) {
+        if (app == null) { return 0L; }
+        if (dep == 0 && !anyMedia) { return 0L; }
+        if (app.styleCtx == this) {
+            Control par = parent;
+            int idx = 0;
+            if (dep == 1 && par != null) {
+                int hint = childIndex;
+                List<Control> siblings = par.childNodes;
+                idx = (hint >= 0 && hint < siblings.Count && siblings[hint] == this)
+                    ? hint : par.IndexOf(this);
+            }
+            return Style.ContextHashForNode(app, this, par, idx, dep, anyMedia, type, effCls, name);
+        }
+        return Style.ContextHashFast(app, dep, anyMedia);
+    }
     StyleBox RememberComputedStyle(App app, StyleBox box, string type, string cls, int state) {
         int gen = app == null ? 0 : app.bgThemeGen;
         int scale = app == null ? 100 : app.metricsScale;
@@ -264,9 +280,10 @@ public partial class Control {
         computedStyleGen = gen;
         computedStyleScale = scale;
         computedStyleDpi = dpi;
-        computedStyleSys = app != null && app.HostIsolateAppSheet();
+        computedStyleSys = app != null && app.isolateAppSheet;
         computedStyleType = type;
-        computedStyleClass = this.EffectiveClass();
+        string effCls = this.EffectiveClass();
+        computedStyleClass = effCls;
         computedStyleCls = cls;
         computedStyleId = name;
         computedStyleState = state;
@@ -274,8 +291,45 @@ public partial class Control {
         computedStyleDep = dep;
         int rsig = app != null ? app.CurrentStyleRuleSig() : 0;
         computedStyleRuleSig = rsig;
-        computedStyleCtxHash = Style.ContextHashFast(app, dep, (rsig & 1) != 0);
+        computedSelfHash = Style.SelfNodeHashKnown(this, type, effCls, name);
+        computedStyleCtxHash = this.ContextHashForControl(app, dep, (rsig & 1) != 0, type, effCls);
         return box;
+    }
+    internal bool ComputedStyleCurrentPass(App app, int ruleSig, bool anyMedia, long mediaHash, int chainSeq) {
+        if (computedStyle == null || computedStyleApp != app
+            || computedStyleGen != app.bgThemeGen
+            || computedStyleScale != app.metricsScale
+            || computedStyleDpi != app.dpiScale
+            || computedStyleSys != app.isolateAppSheet) { return false; }
+        if (computedStyleRuleSig != ruleSig) {
+            return this.ComputedStyleCurrent(app);
+        }
+        string type = this.StyleType();
+        string effCls = this.EffectiveClass();
+        if (computedStyleType != type || computedStyleClass != effCls
+            || computedStyleCls != effCls || computedStyleId != name) { return false; }
+        int dependency = computedStyleDep;
+        if (dependency == 2) { return false; }
+        if (dependency == 0 && !anyMedia) { return true; }
+        long h = 1469598103934665603L;
+        if (dependency == 1) {
+            Control par = parent;
+            int idx = 0;
+            if (par != null) {
+                h = (chainSeq != 0 && par.chSeq == chainSeq)
+                    ? par.chVal : Style.AncestorChainHashFrom(par, app, chainSeq);
+                int hint = childIndex;
+                List<Control> siblings = par.childNodes;
+                idx = (hint >= 0 && hint < siblings.Count && siblings[hint] == this)
+                    ? hint : par.IndexOf(this);
+            }
+            h = (h ^ computedSelfHash) * 1099511628211L;
+            h = (h ^ (long)idx) * 1099511628211L;
+        }
+        if (anyMedia) {
+            h = (h ^ mediaHash) * 1099511628211L;
+        }
+        return computedStyleCtxHash == h;
     }
     bool ComputedStyleCurrentCore(App app, string type, string effCls, string cls) {
         if (computedStyle == null || computedStyleApp != app
@@ -284,7 +338,8 @@ public partial class Control {
             || computedStyleDpi != (app == null ? 100 : app.dpiScale)
             || computedStyleSys != (app != null && app.isolateAppSheet)
             || computedStyleType != type || computedStyleClass != effCls
-            || computedStyleCls != cls || computedStyleId != name) { return false; }
+            || (cls != effCls && computedStyleCls != cls)
+            || computedStyleId != name) { return false; }
         int ruleSig = app != null ? app.CurrentStyleRuleSig() : 0;
         int dependency = computedStyleDep;
         if (ruleSig != computedStyleRuleSig) {
@@ -295,7 +350,7 @@ public partial class Control {
         if (dependency == 2 && app != null && app.styleCtx != null) { return false; }
         bool anyMedia = (ruleSig & 1) != 0;
         if (dependency == 0 && !anyMedia) { return true; }
-        return computedStyleCtxHash == Style.ContextHashFast(app, dependency, anyMedia);
+        return computedStyleCtxHash == this.ContextHashForControl(app, dependency, anyMedia, type, effCls);
     }
     bool ComputedStyleCurrentAs(App app, string type, string cls) {
         return this.ComputedStyleCurrentCore(app, type, this.EffectiveClass(), cls);
@@ -540,17 +595,25 @@ public partial class Control {
         s.Paint(app, bx, by, bw, bh);
     }
     protected StyleBox ResolvePaintedSurface(App app) {
+        return this.ResolvePaintedSurfaceWithState(app, this.SurfaceState(app));
+    }
+    internal StyleBox ResolvePaintedSurfaceKnown(App app, bool selfDisabled) {
+        return this.ResolvePaintedSurfaceWithState(app, this.SurfaceStateKnown(app, selfDisabled));
+    }
+    private StyleBox ResolvePaintedSurfaceWithState(App app, int state) {
         StyleBox box = computedStyle;
-        int normalState = computedStyleState < 0 ? Style.SNormal() : computedStyleState;
-        int state = this.SurfaceState(app);
+        int normalState = computedStyleState < 0 ? 0 : computedStyleState;
         int key = extra != null ? extra.surfaceTransitionKey : 0;
-        if (surfaceNormal == null && state == normalState && key == 0) {
-            surfaceNormal = box;
-            surfaceTarget = box;
-            surfaceState = state;
+        if (state == normalState && key == 0 && surfaceFrom == null
+            && (surfaceNormal == box || surfaceNormal == null)) {
+            if (surfaceNormal == null) {
+                surfaceNormal = box;
+                surfaceTarget = box;
+                surfaceState = state;
+            }
             if (box != null && box.motion != null) {
                 box = this.ApplyKeyframeAnimation(app, box);
-            } else if (kfAnimName != null && kfAnimName != "") {
+            } else if (kfAnimName != null && kfAnimName.Length > 0) {
                 kfAnimName = "";
                 kfWasPaused = false;
             }
@@ -558,12 +621,10 @@ public partial class Control {
             if (box != null) { box.treeComposite = treeCompositing; }
             return box;
         }
-        if (state != normalState || surfaceNormal != box || surfaceFrom != null || key != 0) {
-            box = this.PaintSurface(app, box, normalState, state, key);
-        }
+        box = this.PaintSurface(app, box, normalState, state, key);
         if (box != null && box.motion != null) {
             box = this.ApplyKeyframeAnimation(app, box);
-        } else if (kfAnimName != null && kfAnimName != "") {
+        } else if (kfAnimName != null && kfAnimName.Length > 0) {
             kfAnimName = "";
             kfWasPaused = false;
         }
@@ -575,15 +636,41 @@ public partial class Control {
     protected int PaintedForeground(StyleBox style, string ownerClass) {
         if (style == null) { return 0; }
         int foreground = style.FgOr(0);
-        if (!style.foregroundDeclared && Style.Has(Class, ownerClass)
+        if (!style.foregroundDeclared && Class != null && Class.Length > 0
+            && Style.Has(Class, ownerClass)
             && parent != null && parent.paintedStyle != null) {
             return parent.paintedStyle.FgOr(foreground);
         }
         return foreground;
     }
     protected virtual Control SurfaceInputOwner() { return this.InputFocusCapabilities() != 0 ? this : null; }
+    internal int cachedPassStateSeq;
+    internal int cachedPassStateVal;
+    internal int SurfaceStateKnown(App app, bool selfDisabled) {
+        int state = computedStyleState < 0 ? 0 : computedStyleState;
+        if (app == null) { return state; }
+        int result;
+        if (selfDisabled) {
+            result = state | Style.SDisabled();
+        } else if (!app.SurfaceInteractiveActive()) {
+            result = state;
+        } else {
+            Control owner = this.SurfaceInputOwner();
+            if (owner == null || owner == this) {
+                result = state | app.RetainedSurfaceStateKnown(this, false);
+            } else {
+                result = state | app.RetainedSurfaceState(owner);
+            }
+        }
+        int seq = Style.chainActiveSeq;
+        if (seq != 0 && Style.chainApp == app) {
+            cachedPassStateSeq = seq;
+            cachedPassStateVal = result;
+        }
+        return result;
+    }
     internal int SurfaceState(App app) {
-        int state = computedStyleState < 0 ? Style.SNormal() : computedStyleState;
+        int state = computedStyleState < 0 ? 0 : computedStyleState;
         if (app == null) { return state; }
         Control owner = this.SurfaceInputOwner();
         return state | app.RetainedSurfaceState(owner != null ? owner : this);
