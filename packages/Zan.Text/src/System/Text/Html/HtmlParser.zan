@@ -15,22 +15,42 @@ namespace System.Text.Html;
 //   - 结束标签找到匹配就一路关到它，找不到就忽略；
 //   - 畸形输入不抛异常：孤立的 '<' 当文本，属性名不合法就跳过。
 public class HtmlParser {
+    private static string[] s_indentCache;
+
     string src;
+    nint srcPtr;
     int len;
     int pos;
     List<HtmlNode> open;
+    string[] nameCache;
 
     public HtmlParser() {
         this.src = "";
+        this.srcPtr = 0;
         this.len = 0;
         this.pos = 0;
         this.open = new List<HtmlNode>();
+        this.nameCache = new string[64];
+    }
+
+    private static string[] GetIndentCache() {
+        if (HtmlParser.s_indentCache == null) {
+            string[] c = new string[17];
+            string cur = "\n";
+            for (int i = 0; i <= 16; i = i + 1) {
+                c[i] = cur;
+                cur = cur + " ";
+            }
+            HtmlParser.s_indentCache = c;
+        }
+        return HtmlParser.s_indentCache;
     }
 
     // 解析 HTML 片段。
     public static HtmlDocument Parse(string html) {
         HtmlParser p = new HtmlParser();
         p.src = html == null ? "" : html;
+        p.srcPtr = (nint)p.src;
         p.len = p.src.Length;
         p.pos = 0;
         HtmlDocument doc = new HtmlDocument();
@@ -39,24 +59,96 @@ public class HtmlParser {
         return doc;
     }
 
+    // 64 槽直接映射小写折叠驻留缓存：命中时零堆分配返回已有小写标签/属性名。
+    string InternLower(int start, int stop) {
+        int n = stop - start;
+        if (n <= 0) { return ""; }
+        if (n > 32) { return HtmlParser.AsciiLowerSlice(this.src, start, stop); }
+        Span<byte> buf = new Span<byte>(this.srcPtr, this.len);
+        int h = -2128831035;
+        bool hasUpper = false;
+        for (int i = start; i < stop; i = i + 1) {
+            int c = buf[i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; hasUpper = true; }
+            h = (h ^ c) * 16777619;
+        }
+        int slot = h & 63;
+        string cached = this.nameCache[slot];
+        if (cached != null && cached.Length == n) {
+            bool eq = true;
+            for (int i = 0; i < n; i = i + 1) {
+                int c = buf[start + i] & 255;
+                if (c >= 65 && c <= 90) { c = c + 32; }
+                if (c != (cached[i] & 255)) { eq = false; break; }
+            }
+            if (eq) { return cached; }
+        }
+        string fresh;
+        if (!hasUpper) {
+            fresh = this.src.Substring(start, n);
+        } else {
+            byte[] outb = new byte[n];
+            for (int i = 0; i < n; i = i + 1) {
+                int c = buf[start + i] & 255;
+                if (c >= 65 && c <= 90) { c = c + 32; }
+                outb[i] = (byte)c;
+            }
+            fresh = outb.ToStr(0, n);
+        }
+        this.nameCache[slot] = fresh;
+        return fresh;
+    }
+
+    string InternPlainSlice(int start, int tlen) {
+        if (tlen <= 0) { return ""; }
+        if (tlen <= 17 && (this.src[start] & 255) == 10) {
+            Span<byte> buf = new Span<byte>(this.srcPtr + (nint)start, tlen);
+            bool allSp = true;
+            for (int i = 1; i < tlen; i = i + 1) {
+                if ((buf[i] & 255) != 32) { allSp = false; break; }
+            }
+            if (allSp) {
+                return HtmlParser.GetIndentCache()[tlen - 1];
+            }
+        }
+        return this.src.Substring(start, tlen);
+    }
+
     void Run() {
-        nint sp = (nint)this.src;
+        nint sp = this.srcPtr;
+        Span<byte> buf = new Span<byte>(sp, this.len);
         while (this.pos < this.len) {
-            int c = this.src[this.pos] & 255;
+            int c = buf[this.pos] & 255;
             if (c != 60) {
                 int start = this.pos;
                 int rem = this.len - (start + 1);
                 int lt = rem > 0 ? NativeMemory.Find(sp, start + 1, 60, rem) : -1;
                 this.pos = lt < 0 ? this.len : lt;
-                this.AddText(HtmlUtil.DecodeEntities(this.src.Substring(start, this.pos - start)));
+                int tlen = this.pos - start;
+                int amp = NativeMemory.Find(sp, start, 38, tlen);
+                if (amp < 0) {
+                    this.AddText(this.InternPlainSlice(start, tlen));
+                } else {
+                    this.AddText(HtmlUtil.DecodeEntitiesSlice(this.src, start, tlen));
+                }
                 continue;
             }
-            if (this.Has("<!--")) { this.ParseComment(); continue; }
-            if (this.Has("<!")) { this.SkipBogus(); continue; }
-            if (this.Has("</")) { this.ParseEndTag(); continue; }
-            if (this.pos + 1 < this.len && HtmlUtil.IsNameStart(this.src[this.pos + 1] & 255)) {
-                this.ParseStartTag();
-                continue;
+            int p1 = this.pos + 1;
+            if (p1 < this.len) {
+                int c1 = buf[p1] & 255;
+                if (c1 == 47) { this.ParseEndTag(); continue; }  // "</"
+                if (c1 == 33) {  // "<!"
+                    if (this.pos + 3 < this.len && (buf[this.pos + 2] & 255) == 45 && (buf[this.pos + 3] & 255) == 45) {
+                        this.ParseComment();
+                    } else {
+                        this.SkipBogus();
+                    }
+                    continue;
+                }
+                if (HtmlUtil.IsNameStart(c1)) {
+                    this.ParseStartTag();
+                    continue;
+                }
             }
             // 孤立的 '<'：当普通文本。
             this.AddText("<");
@@ -133,7 +225,9 @@ public class HtmlParser {
 
     // doctype 之类的声明：整段丢掉。
     void SkipBogus() {
-        int end = this.src.IndexOf(">", this.pos + 2);
+        int from = this.pos + 2;
+        int rem = this.len - from;
+        int end = rem > 0 ? NativeMemory.Find(this.srcPtr, from, 62, rem) : -1;
         if (end < 0) { this.pos = this.len; } else { this.pos = end + 1; }
     }
 
@@ -158,69 +252,106 @@ public class HtmlParser {
     void ParseEndTag() {
         int j = this.pos + 2;
         int nameStart = j;
-        while (j < this.len && HtmlUtil.IsNameChar(this.src[j] & 255)) { j = j + 1; }
-        string name = HtmlParser.AsciiLowerSlice(this.src, nameStart, j);
+        Span<byte> buf = new Span<byte>(this.srcPtr, this.len);
+        while (j < this.len && HtmlUtil.IsNameChar(buf[j] & 255)) { j = j + 1; }
         int rem = this.len - j;
-        int gt = rem > 0 ? NativeMemory.Find((nint)this.src, j, 62, rem) : -1;
+        int gt = rem > 0 ? NativeMemory.Find(this.srcPtr, j, 62, rem) : -1;
         this.pos = gt < 0 ? this.len : gt + 1;
-        if (name.Length > 0) { this.CloseTag(name); }
+        int nlen = j - nameStart;
+        if (nlen <= 0) { return; }
+        int cnt = this.open.Count;
+        if (cnt > 1) {
+            string topTag = this.open[cnt - 1].tag;
+            if (topTag.Length == nlen) {
+                bool eq = true;
+                for (int i = 0; i < nlen; i = i + 1) {
+                    int c = buf[nameStart + i] & 255;
+                    if (c >= 65 && c <= 90) { c = c + 32; }
+                    if (c != (topTag[i] & 255)) { eq = false; break; }
+                }
+                if (eq) {
+                    this.open.RemoveAt(cnt - 1);
+                    return;
+                }
+            }
+        }
+        string name = this.InternLower(nameStart, j);
+        this.CloseTag(name);
     }
 
     void ParseStartTag() {
         int j = this.pos + 1;
         int nameStart = j;
-        while (j < this.len && HtmlUtil.IsNameChar(this.src[j] & 255)) { j = j + 1; }
-        string name = HtmlParser.AsciiLowerSlice(this.src, nameStart, j);
+        Span<byte> buf = new Span<byte>(this.srcPtr, this.len);
+        while (j < this.len && HtmlUtil.IsNameChar(buf[j] & 255)) { j = j + 1; }
+        string name = this.InternLower(nameStart, j);
         HtmlNode node = HtmlNode.Element(name);
 
         while (j < this.len) {
-            while (j < this.len && HtmlUtil.IsSpace(this.src[j] & 255)) { j = j + 1; }
+            while (j < this.len && HtmlUtil.IsSpace(buf[j] & 255)) { j = j + 1; }
             if (j >= this.len) { break; }
-            int c = this.src[j] & 255;
+            int c = buf[j] & 255;
             if (c == 62) { j = j + 1; break; }                                   // '>'
-            if (c == 47 && j + 1 < this.len && (this.src[j + 1] & 255) == 62) { j = j + 2; break; }  // '/>'
+            if (c == 47 && j + 1 < this.len && (buf[j + 1] & 255) == 62) { j = j + 2; break; }  // '/>'
             int attrStart = j;
             while (j < this.len) {
-                int cc = this.src[j] & 255;
+                int cc = buf[j] & 255;
                 if (HtmlUtil.IsSpace(cc) || cc == 61 || cc == 62 || cc == 34 || cc == 39 || cc == 60) { break; }
                 j = j + 1;
             }
             if (j == attrStart) { j = j + 1; continue; }
-            string attrName = HtmlParser.AsciiLowerSlice(this.src, attrStart, j);
-            string value = "";
+            string attrName = this.InternLower(attrStart, j);
+            int vs = 0;
+            int ve = 0;
             int k = j;
-            while (k < this.len && HtmlUtil.IsSpace(this.src[k] & 255)) { k = k + 1; }
-            if (k < this.len && (this.src[k] & 255) == 61) {
+            while (k < this.len && HtmlUtil.IsSpace(buf[k] & 255)) { k = k + 1; }
+            if (k < this.len && (buf[k] & 255) == 61) {
                 k = k + 1;
-                while (k < this.len && HtmlUtil.IsSpace(this.src[k] & 255)) { k = k + 1; }
+                while (k < this.len && HtmlUtil.IsSpace(buf[k] & 255)) { k = k + 1; }
                 if (k < this.len) {
-                    int q = this.src[k] & 255;
+                    int q = buf[k] & 255;
                     if (q == 34 || q == 39) {
                         k = k + 1;
-                        int vs = k;
+                        vs = k;
                         int rem = this.len - k;
-                        int qe = rem > 0 ? NativeMemory.Find((nint)this.src, k, q, rem) : -1;
+                        int qe = rem > 0 ? NativeMemory.Find(this.srcPtr, k, q, rem) : -1;
                         k = qe < 0 ? this.len : qe;
-                        value = this.src.Substring(vs, k - vs);
+                        ve = k;
                         if (k < this.len) { k = k + 1; }
                     } else {
-                        int vs = k;
+                        vs = k;
                         while (k < this.len) {
-                            int cc = this.src[k] & 255;
+                            int cc = buf[k] & 255;
                             if (HtmlUtil.IsSpace(cc) || cc == 62) { break; }
                             k = k + 1;
                         }
-                        value = this.src.Substring(vs, k - vs);
+                        ve = k;
                     }
                 }
                 j = k;
             }
             // HTML 规则：同名属性取第一个。
-            // 属性值里的实体要解码——不解码的话 "javascript&colon;alert(1)"
-            // 这种写法会被当成相对地址放过去，浏览器却是当成 javascript:
-            // 执行的。
-            if (node.attrsMap == null) { node.attrsMap = new Dictionary<string, string>(); }
-            if (!node.attrsMap.ContainsKey(attrName)) { node.attrsMap.Add(attrName, HtmlUtil.DecodeEntities(value)); }
+            // 首个属性免 ContainsKey 二次哈希；无实体短属性值命中 64 槽驻留缓存零分配。
+            Dictionary<string, string> am = node.attrsMap;
+            if (am == null) {
+                am = new Dictionary<string, string>();
+                node.attrsMap = am;
+                int vlen = ve - vs;
+                string decoded = "";
+                if (vlen > 0) {
+                    int amp = NativeMemory.Find(this.srcPtr, vs, 38, vlen);
+                    decoded = amp < 0 ? this.src.Substring(vs, vlen) : HtmlUtil.DecodeEntitiesSlice(this.src, vs, vlen);
+                }
+                am.Add(attrName, decoded);
+            } else if (!am.ContainsKey(attrName)) {
+                int vlen = ve - vs;
+                string decoded = "";
+                if (vlen > 0) {
+                    int amp = NativeMemory.Find(this.srcPtr, vs, 38, vlen);
+                    decoded = amp < 0 ? this.src.Substring(vs, vlen) : HtmlUtil.DecodeEntitiesSlice(this.src, vs, vlen);
+                }
+                am.Add(attrName, decoded);
+            }
         }
         this.pos = j;
 
@@ -238,29 +369,43 @@ public class HtmlParser {
     void ReadRawText(HtmlNode node, string name) {
         string closeTag = "</" + name;
         int at = this.FindIgnoreCase(closeTag, this.pos);
-        string raw;
+        int rawStart = this.pos;
+        int rawEnd;
         if (at < 0) {
-            raw = this.src.Substring(this.pos, this.len - this.pos);
+            rawEnd = this.len;
             this.pos = this.len;
         } else {
-            raw = this.src.Substring(this.pos, at - this.pos);
+            rawEnd = at;
             this.pos = at;
         }
-        if (raw.Length > 0) {
-            string text = raw;
-            if (HtmlUtil.IsEscapableRawTextTag(name)) { text = HtmlUtil.DecodeEntities(raw); }
+        if (rawEnd > rawStart) {
+            string text = HtmlUtil.IsEscapableRawTextTag(name)
+                ? HtmlUtil.DecodeEntitiesSlice(this.src, rawStart, rawEnd - rawStart)
+                : this.src.Substring(rawStart, rawEnd - rawStart);
             node.AppendChild(HtmlNode.TextNode(text));
         }
         if (this.Has(closeTag)) {
             int j = this.pos + closeTag.Length;
-            while (j < this.len && (this.src[j] & 255) != 62) { j = j + 1; }
-            this.pos = j < this.len ? j + 1 : this.len;
+            int rem = this.len - j;
+            int gt = rem > 0 ? NativeMemory.Find(this.srcPtr, j, 62, rem) : -1;
+            this.pos = gt < 0 ? this.len : gt + 1;
         }
     }
 
-    // 开始标签带来的隐式闭合。
+    // 开始标签带来的隐式闭合（栈顶快判，非 <p> 与非列表/表格标签 O(1) 跳过 31 路扫描）。
     void ApplyImpliedEndTags(string name) {
-        if (HtmlParser.ClosesParagraph(name)) { this.CloseTopOf("p"); }
+        int cnt = this.open.Count;
+        if (cnt <= 1) { return; }
+        string top = this.open[cnt - 1].tag;
+        if (top == "p") {
+            if (HtmlParser.ClosesParagraph(name)) {
+                this.open.RemoveAt(cnt - 1);
+            }
+            return;
+        }
+        if (name.Length == 0) { return; }
+        int c0 = name[0] & 255;
+        if (c0 != 108 && c0 != 100 && c0 != 111 && c0 != 116) { return; }
         if (name == "li") {
             this.CloseTopOf("li");
         } else if (name == "dt" || name == "dd") {

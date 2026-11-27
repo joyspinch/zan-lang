@@ -14,6 +14,7 @@ namespace Formats.Toml;
 public class TomlParser {
     // 输入文本与游标。
     string s;
+    nint sPtr;
     int pos;
     int len;
     // 数组/行内表嵌套深度上限（与 Json 读写两侧的约定对称）。
@@ -26,6 +27,8 @@ public class TomlParser {
     JsonValue cur;
     // 已出现的表头路径（段间以字节 1 连接），查重复定义。
     Dict<string, bool> headers;
+    // 64 槽直接映射裸键驻留缓存，消除 [[table]] / 行内表重复字段名分配。
+    string[] keyCache;
     // 整数解析溢出哨兵（ParseIntBase 设置，调用方核对后报错）。
     bool intOverflow;
     // 整数解析非法数字位哨兵（0xGG、0b12 这类；ParseIntBase 设置）。
@@ -44,8 +47,10 @@ public class TomlParser {
         }
         TomlParser p = new TomlParser();
         p.s = src;
+        p.sPtr = (nint)src;
         p.pos = 0;
         p.len = src.Length;
+        p.keyCache = new string[64];
         return p.ReadDocument();
     }
 
@@ -66,12 +71,33 @@ public class TomlParser {
         return root;
     }
 
-    // 表头：[a.b.c] 或 [[arr]]。导航到（或创建）目标表并设为 cur。
+    // 表头：[a.b.c] 或 [[arr]]。单段表头走零 List / 零 StringBuilder 快路径。
     void ReadTableHeader() {
         bool arrayTable = Has("[[");
         pos = pos + (arrayTable ? 2 : 1);
-        List<string> path = ReadKeyPath();
         SkipH();
+        string firstKey = ReadKey();
+        SkipH();
+        if (arrayTable && pos + 1 < len && (s[pos] & 255) == 93 && (s[pos + 1] & 255) == 93) {
+            pos = pos + 2;
+            EndOfLine("table header");
+            cur = NavigateSingleHeader(firstKey, true);
+            return;
+        }
+        if (!arrayTable && CurB() == 93) {
+            pos = pos + 1;
+            EndOfLine("table header");
+            cur = NavigateSingleHeader(firstKey, false);
+            return;
+        }
+        List<string> path = new List<string>();
+        path.Add(firstKey);
+        while (pos < len && CurB() == 46) {
+            pos = pos + 1;
+            SkipH();
+            path.Add(ReadKey());
+            SkipH();
+        }
         if (arrayTable) {
             if (!Has("]]")) { Err("expected ']]'"); }
             pos = pos + 2;
@@ -81,6 +107,39 @@ public class TomlParser {
         }
         EndOfLine("table header");
         cur = NavigateHeader(path, arrayTable);
+    }
+
+    JsonValue NavigateSingleHeader(string last, bool arrayTable) {
+        JsonValue dest = root.Get(last);
+        if (arrayTable) {
+            if (dest == null) {
+                dest = JsonValue.NewArray();
+                int kidx = root.keys.Count;
+                root.keys.Add(last);
+                root.vals.Add(dest);
+                if (root.keyIndex != null) { root.keyIndex[last] = kidx; }
+            } else if (!dest.IsArray()) {
+                Err("'" + last + "' is not an array of tables");
+            }
+            JsonValue elem = JsonValue.NewObject();
+            dest.items.Add(elem);
+            return elem;
+        }
+        if (dest == null) {
+            dest = JsonValue.NewObject();
+            int kidx = root.keys.Count;
+            root.keys.Add(last);
+            root.vals.Add(dest);
+            if (root.keyIndex != null) { root.keyIndex[last] = kidx; }
+        } else if (!dest.IsObject()) {
+            Err("'" + last + "' is not a table");
+        }
+        string key = "\u0001" + last;
+        if (headers.ContainsKey(key)) {
+            Err("table defined twice: " + key);
+        }
+        headers[key] = true;
+        return dest;
     }
 
     // 键值对：path.to.key = value。文档层与表头的对收口到行尾；
@@ -138,16 +197,34 @@ public class TomlParser {
         if (c == 34) { return ReadBasicString(); }  // '"'
         if (c == 39) { return ReadLiteralString(); }  // '\''
         int start = pos;
+        Span<byte> buf = new Span<byte>(sPtr, len);
+        int h = -2128831035;
         while (pos < len) {
-            int d = s[pos] & 255;
+            int d = buf[pos] & 255;
             bool ok = (d >= 97 && d <= 122) || (d >= 65 && d <= 90)
                 || (d >= 48 && d <= 57) || d == 95 || d == 45
                 || d >= 128;  // [A-Za-z0-9_-] + 非 ASCII
             if (!ok) { break; }
+            h = (h ^ d) * 16777619;
             pos = pos + 1;
         }
-        if (pos == start) { Err("expected a key"); }
-        return s.Substring(start, pos - start);
+        int n = pos - start;
+        if (n == 0) { Err("expected a key"); }
+        if (n <= 32) {
+            int slot = h & 63;
+            string cached = keyCache[slot];
+            if (cached != null && cached.Length == n) {
+                bool eq = true;
+                for (int i = 0; i < n; i = i + 1) {
+                    if ((buf[start + i] & 255) != (cached[i] & 255)) { eq = false; break; }
+                }
+                if (eq) { return cached; }
+            }
+            string fresh = s.Substring(start, n);
+            keyCache[slot] = fresh;
+            return fresh;
+        }
+        return s.Substring(start, n);
     }
 
     // 值分派：字符串/数组/行内表/布尔/数字与日期时间。
@@ -164,8 +241,20 @@ public class TomlParser {
         }
         if (c == 91) { return ReadArray(depth); }  // '['
         if (c == 123) { return ReadInlineTable(depth); }  // '{'
-        if (c == 116) { ExpectWord("true"); return JsonValue.NewBool(true); }
-        if (c == 102) { ExpectWord("false"); return JsonValue.NewBool(false); }
+        if (c == 116) {
+            if (pos + 4 <= len && (s[pos + 1] & 255) == 114 && (s[pos + 2] & 255) == 117 && (s[pos + 3] & 255) == 101) {
+                pos = pos + 4;
+                return JsonValue.NewBool(true);
+            }
+            Err("invalid value");
+        }
+        if (c == 102) {
+            if (pos + 5 <= len && (s[pos + 1] & 255) == 97 && (s[pos + 2] & 255) == 108 && (s[pos + 3] & 255) == 115 && (s[pos + 4] & 255) == 101) {
+                pos = pos + 5;
+                return JsonValue.NewBool(false);
+            }
+            Err("invalid value");
+        }
         return ReadNumberOrDatetime();
     }
 
@@ -214,23 +303,40 @@ public class TomlParser {
         return obj;
     }
 
-    // 数字与四种日期时间共用一个 token 扫描：token 取
-    // [0-9A-Za-z+-._:] 加"空格后跟数字"（datetime 的空格分隔形态），
-    // 再按形态分类。下划线分隔符剥掉。
+    // 数字与四种日期时间共用一个 token 扫描：纯十进制短整数走零 Substring 切片快路径，
+    // 其余（日期/浮点/下划线/0x/0o/0b/19位大整数/inf/nan）回落完整解析。
     JsonValue ReadNumberOrDatetime() {
         int start = pos;
+        Span<byte> buf = new Span<byte>(sPtr, len);
+        int dStart = start;
+        bool neg = false;
+        if (pos < len) {
+            int c0 = buf[pos] & 255;
+            if (c0 == 45) { neg = true; dStart = start + 1; pos = pos + 1; }
+            else if (c0 == 43) { dStart = start + 1; pos = pos + 1; }
+        }
+        bool pureDigits = true;
+        long fastVal = 0L;
         while (pos < len) {
-            int c = s[pos] & 255;
-            bool tok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
-                || (c >= 97 && c <= 122) || c == 43 || c == 45
-                || c == 46 || c == 58 || c == 95;  // 数字字母 + - . : _
+            int c = buf[pos] & 255;
+            if (c >= 48 && c <= 57) {
+                if (pureDigits && pos - dStart < 18) {
+                    fastVal = fastVal * 10L + (long)(c - 48);
+                }
+                pos = pos + 1;
+                continue;
+            }
+            bool tok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || c == 43 || c == 45 || c == 46 || c == 58 || c == 95;
             if (tok) {
+                pureDigits = false;
                 pos = pos + 1;
                 continue;
             }
             if (c == 32 && pos + 1 < len) {  // ' '
-                int nxt = s[pos + 1] & 255;
+                int nxt = buf[pos + 1] & 255;
                 if (nxt >= 48 && nxt <= 57) {  // datetime 空格分隔
+                    pureDigits = false;
                     pos = pos + 1;
                     continue;
                 }
@@ -238,6 +344,10 @@ public class TomlParser {
             break;
         }
         if (pos == start) { Err("expected a value"); }
+        int dLen = pos - dStart;
+        if (pureDigits && dLen >= 1 && dLen <= 18) {
+            return JsonValue.NewInt(neg ? -fastVal : fastVal);
+        }
         string tok = s.Substring(start, pos - start);
         string t = NativeMemory.Find((nint)tok, 0, 95, tok.Length) >= 0 ? TomlParser.Strip(tok, "_") : tok;
         // 日期时间：以 4 位年份起头（YYYY-MM-DD...）或纯时间 HH:MM...
@@ -320,13 +430,13 @@ public class TomlParser {
                     pos = pos + 3;
                     return direct;
                 }
-                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
+                if (pos > runStart) { sb.Append(new StringView(sPtr + (nint)runStart, pos - runStart)); }
                 pos = pos + 3;
                 return sb.ToString();
             }
             if (c == 92) {
                 if (sb == null) { sb = new StringBuilder(); }
-                if (pos > runStart) { sb.Append(s.Substring(runStart, pos - runStart)); }
+                if (pos > runStart) { sb.Append(new StringView(sPtr + (nint)runStart, pos - runStart)); }
                 if (TomlParser.LineBackslash(s, pos, len)) {
                     // 行尾反斜杠：吃掉反斜杠 + 空白 + 换行。
                     pos = pos + 1;
@@ -425,7 +535,7 @@ public class TomlParser {
     // 同名子表互不冲突；表数组头（arrayTable）本身允许重复，不查。
     JsonValue NavigateHeader(List<string> path, bool arrayTable) {
         JsonValue t = root;
-        StringBuilder kb = new StringBuilder();
+        StringBuilder kb = arrayTable ? null : new StringBuilder();
         for (int i = 0; i < path.Count - 1; i = i + 1) {
             JsonValue nxt = t.Get(path[i]);
             if (nxt == null) {
@@ -435,16 +545,21 @@ public class TomlParser {
                 && nxt.At(nxt.Count() - 1).IsObject()) {
                 int idx = nxt.Count() - 1;
                 nxt = nxt.At(idx);  // 上一个表数组元素
-                kb.Append("\u0001");
-                kb.Append(path[i]);
-                kb.Append("#" + Convert.ToString(idx));
+                if (kb != null) {
+                    kb.Append("\u0001");
+                    kb.Append(path[i]);
+                    kb.Append("#");
+                    kb.Append(Convert.ToString(idx));
+                }
                 t = nxt;
                 continue;
             } else if (!nxt.IsObject()) {
                 Err("'" + path[i] + "' is not a table");
             }
-            kb.Append("\u0001");
-            kb.Append(path[i]);
+            if (kb != null) {
+                kb.Append("\u0001");
+                kb.Append(path[i]);
+            }
             t = nxt;
         }
         string last = path[path.Count - 1];

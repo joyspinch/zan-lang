@@ -28,13 +28,33 @@ public class HtmlUtil {
         return false;
     }
 
-    // 空元素（没有结束标签，也没有内容）。
+    // 空元素（没有结束标签，也没有内容）；按长度与首字节 O(1) 分派。
     public static bool IsVoidTag(string tag) {
-        if (tag == null || tag.Length == 0) { return false; }
-        return tag == "area" || tag == "base" || tag == "br" || tag == "col"
-            || tag == "embed" || tag == "hr" || tag == "img" || tag == "input"
-            || tag == "link" || tag == "meta" || tag == "param" || tag == "source"
-            || tag == "track" || tag == "wbr";
+        if (tag == null) { return false; }
+        int n = tag.Length;
+        if (n < 2 || n > 6) { return false; }
+        int c0 = tag[0] & 255;
+        if (n == 2) {
+            return (c0 == 98 && tag == "br") || (c0 == 104 && tag == "hr");
+        }
+        if (n == 3) {
+            if (c0 == 105) { return tag == "img"; }
+            if (c0 == 99) { return tag == "col"; }
+            return c0 == 119 && tag == "wbr";
+        }
+        if (n == 4) {
+            if (c0 == 108) { return tag == "link"; }
+            if (c0 == 109) { return tag == "meta"; }
+            if (c0 == 97) { return tag == "area"; }
+            return c0 == 98 && tag == "base";
+        }
+        if (n == 5) {
+            if (c0 == 105) { return tag == "input"; }
+            if (c0 == 101) { return tag == "embed"; }
+            if (c0 == 112) { return tag == "param"; }
+            return c0 == 116 && tag == "track";
+        }
+        return c0 == 115 && tag == "source";
     }
 
     // 原始文本元素：内容按纯文本处理（不解析标签）。
@@ -42,11 +62,47 @@ public class HtmlUtil {
     // script/style 是 RAWTEXT（内容里的实体也不解码）；textarea/title
     // 是 RCDATA（标签照旧解析，实体照旧解码）。
     public static bool IsRawTextTag(string tag) {
-        return tag == "script" || tag == "style";
+        if (tag == null) { return false; }
+        int n = tag.Length;
+        if (n == 6) { return (tag[0] & 255) == 115 && tag == "script"; }
+        if (n == 5) { return (tag[0] & 255) == 115 && tag == "style"; }
+        return false;
     }
 
     public static bool IsEscapableRawTextTag(string tag) {
-        return tag == "textarea" || tag == "title";
+        if (tag == null) { return false; }
+        int n = tag.Length;
+        if (n == 5) { return (tag[0] & 255) == 116 && tag == "title"; }
+        if (n == 8) { return (tag[0] & 255) == 116 && tag == "textarea"; }
+        return false;
+    }
+
+    // 直接将转义结果写入已有 StringBuilder，免去中间 string 分配。
+    public static void EscapeTo(StringBuilder sb, string text, bool isAttr) {
+        if (text == null || text.Length == 0) { return; }
+        int n = text.Length;
+        nint tp = (nint)text;
+        Span<byte> buf = new Span<byte>(tp, n);
+        int from = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = buf[i] & 255;
+            if (c > 62) { continue; }
+            string rep = null;
+            if (c == 38) { rep = "&amp;"; }
+            else if (c == 60) { rep = "&lt;"; }
+            else if (c == 62) { rep = "&gt;"; }
+            else if (isAttr && c == 34) { rep = "&quot;"; }
+            if (rep != null) {
+                if (i > from) { sb.Append(new StringView(tp + (nint)from, i - from)); }
+                sb.Append(rep);
+                from = i + 1;
+            }
+        }
+        if (from == 0) {
+            sb.Append(text);
+        } else if (from < n) {
+            sb.Append(new StringView(tp + (nint)from, n - from));
+        }
     }
 
     // 转义文本内容：& < > 。文本节点里出现这三个字符就必须转义，
@@ -126,12 +182,52 @@ public class HtmlUtil {
         return sb.ToString();
     }
 
+    // 解码切片 [sliceStart, sliceStart + sliceLen) 中的 HTML 实体：
+    // 消除调用方先 Substring 再 DecodeEntities 的双重分配。
+    public static string DecodeEntitiesSlice(string text, int sliceStart, int sliceLen) {
+        if (text == null || sliceLen <= 0) { return ""; }
+        int end = sliceStart + sliceLen;
+        nint tp = (nint)text;
+        int i = NativeMemory.Find(tp, sliceStart, 38, sliceLen);
+        if (i < 0) {
+            if (sliceStart == 0 && sliceLen == text.Length) { return text; }
+            return text.Substring(sliceStart, sliceLen);
+        }
+
+        StringBuilder sb = null;
+        int start = sliceStart;
+        while (i >= 0 && i < end) {
+            string rep = "";
+            int used = 0;
+            if (HtmlUtil.TryEntityRange(text, i, end, out rep, out used)) {
+                if (sb == null) { sb = new StringBuilder(sliceLen); }
+                if (i > start) { sb.Append(new StringView(tp + (nint)start, i - start)); }
+                sb.Append(rep);
+                i = i + used;
+                start = i;
+            } else {
+                i = i + 1;
+            }
+            if (i >= end) { break; }
+            i = NativeMemory.Find(tp, i, 38, end - i);
+        }
+        if (sb == null) {
+            if (sliceStart == 0 && sliceLen == text.Length) { return text; }
+            return text.Substring(sliceStart, sliceLen);
+        }
+        if (start < end) { sb.Append(new StringView(tp + (nint)start, end - start)); }
+        return sb.ToString();
+    }
+
     // 尝试从 at 处解析一个实体。成功时 rep 是替换文本、used 是消耗的
     // 字节数；失败时两者都不动（调用方保留原文）。
     public static bool TryEntity(string text, int at, out string rep, out int used) {
+        return HtmlUtil.TryEntityRange(text, at, text.Length, out rep, out used);
+    }
+
+    public static bool TryEntityRange(string text, int at, int n, out string rep, out int used) {
         rep = "";
         used = 0;
-        int n = text.Length;
         if (at + 1 >= n) { return false; }
         int c = text[at + 1] & 255;
         if (c == 35) {   // '#'

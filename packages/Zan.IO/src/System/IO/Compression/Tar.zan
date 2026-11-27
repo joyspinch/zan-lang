@@ -51,8 +51,11 @@ public class Tar {
         List<TarEntry> entries = new List<TarEntry>();
         int pos = 0;
         while (pos + 512 <= tar.Length) {
-            if (Tar.IsZeroBlock(tar, pos)) { break; }
-            if (tar[pos] == 0) { pos = pos + 512; continue; }
+            if (tar[pos] == 0) {
+                if (Tar.IsZeroBlock(tar, pos)) { break; }
+                pos = pos + 512;
+                continue;
+            }
             int stored = Tar.ParseOctal(tar, pos + 148, 8);
             int computed = Tar.HeaderSum(tar, pos);
             if (stored != computed) { return null; }
@@ -105,46 +108,60 @@ public class Tar {
                 name = name.Substring(0, 100);
             }
         }
-        Tar.WriteStr(b, off, name, 100);
+        Tar.WriteStrZeroed(b, off, name, 100);
         Tar.WriteOctal(b, off + 100, e.mode == 0 ? (e.isDirectory ? 493 : 420) : e.mode, 8);
         Tar.WriteOctal(b, off + 108, 0, 8);
         Tar.WriteOctal(b, off + 116, 0, 8);
         int size = (e.isDirectory || e.data == null) ? 0 : e.data.Length;
         Tar.WriteOctal(b, off + 124, size, 12);
         Tar.WriteOctal(b, off + 136, e.mtime, 12);
-        for (int k = 148; k < 156; k = k + 1) { b[off + k] = 32; }
+        NativeMemory.Fill((nint)b + (nint)(off + 148), 32, 8);
         b[off + 156] = (byte)(e.isDirectory ? 53 : 48);
-        for (int k = 157; k < 257; k = k + 1) { b[off + k] = 0; }
-        Tar.WriteStr(b, off + 257, "ustar", 6);
-        b[off + 263] = 0;
-        Tar.WriteStr(b, off + 265, "00", 2);
-        for (int k = 267; k < 345; k = k + 1) { b[off + k] = 0; }
+        b[off + 257] = 117; b[off + 258] = 115; b[off + 259] = 116; b[off + 260] = 97; b[off + 261] = 114;
+        b[off + 265] = 48; b[off + 266] = 48;
         Tar.WriteOctal(b, off + 329, 0, 8);
         Tar.WriteOctal(b, off + 337, 0, 8);
-        Tar.WriteStr(b, off + 345, prefix, 155);
-        for (int k = 500; k < 512; k = k + 1) { b[off + k] = 0; }
+        if (prefix.Length > 0) {
+            Tar.WriteStrZeroed(b, off + 345, prefix, 155);
+        }
         int sum = Tar.HeaderSum(b, off);
         Tar.WriteOctal(b, off + 148, sum, 8);
     }
 
     // 头部校验和：512 字节求和，校验和字段本身按 8 个
-    // 空格（0x20）计入——与读取端 ParseOctal 的期望一致。
+    // 空格（0x20 = 256）计入；拆分为两段无分支 Span<byte> 4 路展开累加。
     private static int HeaderSum(byte[] b, int off) {
-        int sum = 0;
-        for (int i = 0; i < 512; i = i + 1) {
-            // 校验和字段本身按 8 个空格计。
-            int v = (i >= 148 && i < 156) ? 32 : (b[off + i] & 255);
-            sum = sum + v;
+        Span<byte> s = new Span<byte>((nint)b + (nint)off, 512);
+        int sum = 256;
+        int i = 0;
+        while (i < 148) {
+            sum = sum + (s[i] & 255) + (s[i + 1] & 255) + (s[i + 2] & 255) + (s[i + 3] & 255);
+            i = i + 4;
+        }
+        i = 156;
+        while (i < 512) {
+            sum = sum + (s[i] & 255) + (s[i + 1] & 255) + (s[i + 2] & 255) + (s[i + 3] & 255);
+            i = i + 4;
         }
         return sum;
     }
 
-    // off 处起 512 字节是否全为零（归档结尾的两个零块）。
+    // off 处起 512 字节是否全为零（Span<long> 64 位 8 字节批量判零）。
     private static bool IsZeroBlock(byte[] b, int off) {
-        for (int i = 0; i < 512; i = i + 1) {
-            if (b[off + i] != 0) { return false; }
+        Span<long> w = new Span<long>((nint)b + (nint)off, 64);
+        for (int i = 0; i < 64; i = i + 1) {
+            if (w[i] != 0L) { return false; }
         }
         return true;
+    }
+
+    // 写入已清零缓冲区的定长字符串字段（省去重复 Fill 0）。
+    private static void WriteStrZeroed(byte[] b, int off, string s, int maxLen) {
+        int n = s.Length;
+        if (n > maxLen) { n = maxLen; }
+        if (n > 0) {
+            NativeMemory.Copy((nint)b + (nint)off, (nint)s, n);
+        }
     }
 
     // 把字符串写入定长字段：超出截断，尾部以 NUL 补齐。
@@ -159,32 +176,38 @@ public class Tar {
         }
     }
 
-    // 读取定长字段中 NUL 之前的字符串。
+    // 读取定长字段中 NUL 之前的字符串（SIMD memchr 查找 NUL）。
     private static string ReadStr(byte[] b, int off, int maxLen) {
-        int len = 0;
-        for (; len < maxLen && b[off + len] != 0; len = len + 1) { }
+        if (maxLen <= 0 || b[off] == 0) { return ""; }
+        int hit = NativeMemory.Find((nint)b, off, 0, maxLen);
+        int len = hit < 0 ? maxLen : (hit - off);
         if (len == 0) { return ""; }
         return b.ToStr(off, len);
     }
 
     // POSIX 八进制字段（右对齐、末字节 NUL、高位补空格，零分配直写）。
     private static void WriteOctal(byte[] b, int off, long v, int fieldLen) {
-        NativeMemory.Fill((nint)b + (nint)off, 32, fieldLen);
+        Span<byte> s = new Span<byte>((nint)b + (nint)off, fieldLen);
         int pos = fieldLen - 2;
         long val = v;
         while (val > 0 && pos >= 0) {
-            b[off + pos] = (byte)(48 + (int)(val & 7));
+            s[pos] = (byte)(48 + (int)(val & 7));
             val = val >> 3;
             pos = pos - 1;
         }
-        b[off + fieldLen - 1] = 0;
+        while (pos >= 0) {
+            s[pos] = 32;
+            pos = pos - 1;
+        }
+        s[fieldLen - 1] = 0;
     }
 
     // 解析八进制字段（忽略空格与非八进制字符；仅用于 int 范围字段，size 请用 ParseSize）。
     private static int ParseOctal(byte[] b, int off, int fieldLen) {
+        Span<byte> s = new Span<byte>((nint)b + (nint)off, fieldLen);
         int v = 0;
         for (int i = 0; i < fieldLen; i = i + 1) {
-            int c = b[off + i] & 255;
+            int c = s[i] & 255;
             if (c >= 48 && c <= 55) {
                 v = (v << 3) | (c - 48);
             }
@@ -194,9 +217,10 @@ public class Tar {
 
     // 12 位八进制大数值字段（size/mtime）：用 long 累计防止 32 位截断绕过边界。
     private static long ParseSize(byte[] b, int off) {
+        Span<byte> s = new Span<byte>((nint)b + (nint)off, 12);
         long v = 0;
         for (int i = 0; i < 12; i = i + 1) {
-            int c = b[off + i] & 255;
+            int c = s[i] & 255;
             if (c >= 48 && c <= 55) {
                 v = (v << 3) | (long)(c - 48);
             }

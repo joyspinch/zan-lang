@@ -11,6 +11,15 @@ public enum RlpType {
 
 // RLP 结构化项，可表示单个字节串或嵌套列表
 public class RlpItem {
+    private static byte[] s_emptyBytes;
+
+    private static byte[] EmptyBytes() {
+        if (RlpItem.s_emptyBytes == null) {
+            RlpItem.s_emptyBytes = new byte[0];
+        }
+        return RlpItem.s_emptyBytes;
+    }
+
     public RlpType Type;
     public byte[] RawBytes;
     public List<RlpItem> Items;
@@ -23,7 +32,7 @@ public class RlpItem {
 
     public RlpItem(List<RlpItem> list) {
         Type = RlpType.List;
-        RawBytes = new byte[0];
+        RawBytes = RlpItem.EmptyBytes();
         Items = list != null ? list : new List<RlpItem>();
     }
 
@@ -32,13 +41,13 @@ public class RlpItem {
     }
 
     public static RlpItem FromString(string text) {
-        if (text == null) { return new RlpItem(new byte[0]); }
+        if (text == null) { return new RlpItem(RlpItem.EmptyBytes()); }
         return new RlpItem(text.ToBytes());
     }
 
     public static RlpItem FromLong(long value) {
         if (value == 0) {
-            return new RlpItem(new byte[0]);
+            return new RlpItem(RlpItem.EmptyBytes());
         }
         ulong u = (ulong)value;
         int len = 1;
@@ -60,6 +69,32 @@ public class RlpItem {
     }
 }
 
+// 内部前序度量表：单遍 O(N) 记录每个 List 节点的 payloadLen，写阶段直传 int[] lens
+// 零字段 ARC 负载顺序消费，精确一次分配输出 byte[total]，无扩容拷贝与二次遍历。
+internal class RlpSizePlan {
+    internal int[] lens;
+    internal int count;
+    internal int readPos;
+
+    internal RlpSizePlan() {
+        this.lens = new int[32];
+        this.count = 0;
+        this.readPos = 0;
+    }
+
+    internal int AllocSlot() {
+        int slot = this.count;
+        int[] cur = this.lens;
+        if (slot >= cur.Length) {
+            int[] grown = new int[cur.Length * 2];
+            NativeMemory.Copy((nint)grown, (nint)cur, slot * 4);
+            this.lens = grown;
+        }
+        this.count = slot + 1;
+        return slot;
+    }
+}
+
 // 以太坊黄皮书标准的 RLP (Recursive Length Prefix) 编解码器。
 public class Rlp {
 
@@ -78,65 +113,43 @@ public class Rlp {
         return pos + lenOfLen;
     }
 
-    private static int MeasureItem(RlpItem item) {
-        if (item == null) { return 1; }
-        if (item.Type == RlpType.Bytes) {
-            byte[] b = item.RawBytes;
-            if (b == null || b.Length == 0) { return 1; }
-            int blen = b.Length;
-            if (blen == 1 && (b[0] & 255) <= 0x7f) { return 1; }
-            if (blen <= 55) { return 1 + blen; }
-            return 1 + BigEndianLenSize(blen) + blen;
-        }
+    private static int MeasureList(RlpItem listItem, RlpSizePlan plan) {
+        int slot = plan.AllocSlot();
         int payloadLen = 0;
-        List<RlpItem> items = item.Items;
+        List<RlpItem> items = listItem.Items;
         if (items != null) {
             int cnt = items.Count;
             for (int i = 0; i < cnt; i = i + 1) {
-                payloadLen = payloadLen + MeasureItem(items[i]);
+                RlpItem child = items[i];
+                if (child == null) {
+                    payloadLen = payloadLen + 1;
+                } else if (child.Type == RlpType.Bytes) {
+                    byte[] b = child.RawBytes;
+                    if (b == null || b.Length == 0) {
+                        payloadLen = payloadLen + 1;
+                    } else {
+                        int blen = b.Length;
+                        if (blen == 1 && (b[0] & 255) <= 0x7f) {
+                            payloadLen = payloadLen + 1;
+                        } else if (blen <= 55) {
+                            payloadLen = payloadLen + 1 + blen;
+                        } else {
+                            payloadLen = payloadLen + 1 + BigEndianLenSize(blen) + blen;
+                        }
+                    }
+                } else {
+                    payloadLen = payloadLen + MeasureList(child, plan);
+                }
             }
         }
+        plan.lens[slot] = payloadLen;
         if (payloadLen <= 55) { return 1 + payloadLen; }
         return 1 + BigEndianLenSize(payloadLen) + payloadLen;
     }
 
-    private static int WriteItem(RlpItem item, byte[] dst, int pos) {
-        if (item == null) {
-            dst[pos] = 0x80;
-            return pos + 1;
-        }
-        if (item.Type == RlpType.Bytes) {
-            byte[] b = item.RawBytes;
-            if (b == null || b.Length == 0) {
-                dst[pos] = 0x80;
-                return pos + 1;
-            }
-            int blen = b.Length;
-            if (blen == 1 && (b[0] & 255) <= 0x7f) {
-                dst[pos] = b[0];
-                return pos + 1;
-            }
-            if (blen <= 55) {
-                dst[pos] = (byte)(0x80 + blen);
-                pos = pos + 1;
-            } else {
-                int lol = BigEndianLenSize(blen);
-                dst[pos] = (byte)(0xb7 + lol);
-                pos = WriteBigEndianLen(dst, pos + 1, blen, lol);
-            }
-            if (blen >= 16) {
-                NativeMemory.Copy((nint)dst + pos, (nint)b, blen);
-            } else {
-                for (int i = 0; i < blen; i = i + 1) { dst[pos + i] = b[i]; }
-            }
-            return pos + blen;
-        }
-        int payloadLen = 0;
-        List<RlpItem> items = item.Items;
-        int cnt = items != null ? items.Count : 0;
-        for (int i = 0; i < cnt; i = i + 1) {
-            payloadLen = payloadLen + MeasureItem(items[i]);
-        }
+    private static int WriteList(RlpItem listItem, byte[] dst, nint dstPtr, int pos, int[] lens, RlpSizePlan plan) {
+        int payloadLen = lens[plan.readPos];
+        plan.readPos = plan.readPos + 1;
         if (payloadLen <= 55) {
             dst[pos] = (byte)(0xc0 + payloadLen);
             pos = pos + 1;
@@ -145,8 +158,43 @@ public class Rlp {
             dst[pos] = (byte)(0xf7 + lol);
             pos = WriteBigEndianLen(dst, pos + 1, payloadLen, lol);
         }
+        List<RlpItem> items = listItem.Items;
+        int cnt = items != null ? items.Count : 0;
         for (int i = 0; i < cnt; i = i + 1) {
-            pos = WriteItem(items[i], dst, pos);
+            RlpItem child = items[i];
+            if (child == null) {
+                dst[pos] = 0x80;
+                pos = pos + 1;
+            } else if (child.Type == RlpType.Bytes) {
+                byte[] b = child.RawBytes;
+                if (b == null || b.Length == 0) {
+                    dst[pos] = 0x80;
+                    pos = pos + 1;
+                } else {
+                    int blen = b.Length;
+                    if (blen == 1 && (b[0] & 255) <= 0x7f) {
+                        dst[pos] = b[0];
+                        pos = pos + 1;
+                    } else {
+                        if (blen <= 55) {
+                            dst[pos] = (byte)(0x80 + blen);
+                            pos = pos + 1;
+                        } else {
+                            int lol = BigEndianLenSize(blen);
+                            dst[pos] = (byte)(0xb7 + lol);
+                            pos = WriteBigEndianLen(dst, pos + 1, blen, lol);
+                        }
+                        if (blen >= 16) {
+                            NativeMemory.Copy(dstPtr + (nint)pos, (nint)b, blen);
+                        } else {
+                            for (int k = 0; k < blen; k = k + 1) { dst[pos + k] = b[k]; }
+                        }
+                        pos = pos + blen;
+                    }
+                }
+            } else {
+                pos = WriteList(child, dst, dstPtr, pos, lens, plan);
+            }
         }
         return pos;
     }
@@ -226,11 +274,15 @@ public class Rlp {
         return outb;
     }
 
-    // 递归编码 RlpItem 结构（两遍精算总长直写单一 byte[]，零中间 List<byte[]> 与子数组分配）
+    // 递归编码 RlpItem 结构（严格 O(N) 单遍前序度量 + 精确一次输出分配 + 零子数组分配）
     public static byte[] Encode(RlpItem item) {
-        int total = MeasureItem(item);
+        if (item == null || item.Type == RlpType.Bytes) {
+            return EncodeBytes(item != null ? item.RawBytes : null);
+        }
+        RlpSizePlan plan = new RlpSizePlan();
+        int total = MeasureList(item, plan);
         byte[] outb = new byte[total];
-        WriteItem(item, outb, 0);
+        WriteList(item, outb, (nint)outb, 0, plan.lens, plan);
         return outb;
     }
 }

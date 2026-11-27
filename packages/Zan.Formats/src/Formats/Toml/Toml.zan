@@ -26,8 +26,9 @@ public class Toml {
         if (root == null || !root.IsObject()) {
             throw new TomlException("ToToml: root must be a table");
         }
-        StringBuilder sb = new StringBuilder();
-        Toml.WriteTable(sb, root, new List<string>(), 0);
+        StringBuilder sb = new StringBuilder(4096);
+        byte[] numBuf = new byte[24];
+        Toml.WriteTable(sb, root, new List<string>(), 0, numBuf);
         return sb.ToString();
     }
 
@@ -36,29 +37,50 @@ public class Toml {
         File.WriteAllText(path, Toml.ToToml(root));
     }
 
+    // 零字符串分配写入十进制 64 位整数（复用 24 字节暂存缓冲 + StringView 冲刷）。
+    private static void AppendLong(StringBuilder sb, long v, byte[] numBuf) {
+        if (v == 0L) { sb.Append("0"); return; }
+        if (v == -9223372036854775807L - 1L) { sb.Append("-9223372036854775808"); return; }
+        bool neg = v < 0L;
+        long u = neg ? -v : v;
+        int p = 24;
+        while (u > 0L) {
+            p = p - 1;
+            numBuf[p] = (byte)(48 + (int)(u % 10L));
+            u = u / 10L;
+        }
+        if (neg) {
+            p = p - 1;
+            numBuf[p] = 45;
+        }
+        sb.Append(new StringView((nint)numBuf + (nint)p, 24 - p));
+    }
+
     // 一张表：简单键（标量/数组/空表行内）在前，子表头在后。depth
     // 是子表嵌套深度（环/程序构造的深树在 MaxDepth 处抛）。
-    private static void WriteTable(StringBuilder sb, JsonValue table, List<string> path, int depth) {
+    private static void WriteTable(StringBuilder sb, JsonValue table, List<string> path, int depth, byte[] numBuf) {
         if (depth > Toml.MaxDepth) {
             throw new TomlException("ToToml: nesting too deep (cycle?)");
         }
         int count = table.Count();
+        bool hasSub = false;
         for (int i = 0; i < count; i = i + 1) {
             JsonValue v = table.ValAt(i);
             if (v == null) { continue; }
-            if (v.IsObject() && v.Count() > 0) { continue; }
-            if (v.IsArray() && Toml.AllObjects(v)) { continue; }  // 走表数组头
+            if (v.IsObject() && v.Count() > 0) { hasSub = true; continue; }
+            if (v.IsArray() && Toml.AllObjects(v)) { hasSub = true; continue; }  // 走表数组头
             Toml.WriteKey(sb, table.KeyAt(i));
             sb.Append(" = ");
-            Toml.WriteValue(sb, v, depth + 1);
+            Toml.WriteValue(sb, v, depth + 1, numBuf);
             sb.Append("\n");
         }
+        if (!hasSub) { return; }
         for (int i = 0; i < count; i = i + 1) {
             JsonValue v = table.ValAt(i);
             if (v == null) { continue; }
             if (v.IsObject() && v.Count() > 0) {
                 path.Add(table.KeyAt(i));
-                Toml.WriteSubTable(sb, path, v, false, depth);
+                Toml.WriteSubTable(sb, path, v, false, depth, numBuf);
                 path.RemoveAt(path.Count - 1);
                 continue;
             }
@@ -66,23 +88,23 @@ public class Toml {
                 path.Add(table.KeyAt(i));
                 int arrLen = v.Count();
                 for (int j = 0; j < arrLen; j = j + 1) {
-                    Toml.WriteSubTable(sb, path, v.At(j), true, depth);
+                    Toml.WriteSubTable(sb, path, v.At(j), true, depth, numBuf);
                 }
                 path.RemoveAt(path.Count - 1);
             }
         }
     }
 
-    private static void WriteSubTable(StringBuilder sb, List<string> sub, JsonValue child, bool arrayTable, int depth) {
+    private static void WriteSubTable(StringBuilder sb, List<string> sub, JsonValue child, bool arrayTable, int depth, byte[] numBuf) {
         Toml.Separate(sb);
         Toml.WriteHeader(sb, sub, arrayTable);
         sb.Append("\n");
-        Toml.WriteTable(sb, child, sub, depth + 1);
+        Toml.WriteTable(sb, child, sub, depth + 1, numBuf);
     }
 
     // 值编码：null 非法，标量/数组/行内表全部行内呈现（嵌套对象
     // 在数组里落成行内表，这是它们在 TOML 里唯一的值形态）。
-    private static void WriteValue(StringBuilder sb, JsonValue v, int depth) {
+    private static void WriteValue(StringBuilder sb, JsonValue v, int depth, byte[] numBuf) {
         if (depth > Toml.MaxDepth) {
             throw new TomlException("ToToml: nesting too deep (cycle?)");
         }
@@ -94,7 +116,11 @@ public class Toml {
             return;
         }
         if (v.IsNumber()) {
-            sb.Append(JsonValue.NumText(v));
+            if (v.IsInt()) {
+                Toml.AppendLong(sb, v.AsLong(0), numBuf);
+            } else {
+                sb.Append(JsonValue.NumText(v));
+            }
             return;
         }
         if (v.IsString()) {
@@ -106,7 +132,7 @@ public class Toml {
             int arrLen = v.Count();
             for (int i = 0; i < arrLen; i = i + 1) {
                 if (i > 0) { sb.Append(", "); }
-                Toml.WriteValue(sb, v.At(i), depth + 1);
+                Toml.WriteValue(sb, v.At(i), depth + 1, numBuf);
             }
             sb.Append("]");
             return;
@@ -119,7 +145,7 @@ public class Toml {
             if (i > 0) { sb.Append(", "); }
             Toml.WriteKey(sb, v.KeyAt(i));
             sb.Append(" = ");
-            Toml.WriteValue(sb, v.ValAt(i), depth + 1);
+            Toml.WriteValue(sb, v.ValAt(i), depth + 1, numBuf);
         }
         sb.Append(" }");
     }
@@ -148,26 +174,31 @@ public class Toml {
         Toml.EncodeString(sb, key);
     }
 
-    // 基本字符串编码：\ " 与控制字符转义，非 ASCII 原样（UTF-8）。
+    // 基本字符串编码：\ " 与控制字符转义，非 ASCII 原样（UTF-8）；Span<byte> 快扫 + StringView 冲刷。
     private static void EncodeString(StringBuilder sb, string t) {
         sb.Append("\"");
         int from = 0;
         int n = t.Length;
+        nint tp = (nint)t;
+        Span<byte> buf = new Span<byte>(tp, n);
         for (int i = 0; i < n; i = i + 1) {
-            int c = t[i] & 255;
+            int c = buf[i] & 255;
+            if (c > 92 && c != 127) { continue; }
             string rep = null;
             if (c == 34) { rep = "\\\""; }
             else if (c == 92) { rep = "\\\\"; }
-            else if (c == 8) { rep = "\\b"; }
-            else if (c == 9) { rep = "\\t"; }
-            else if (c == 10) { rep = "\\n"; }
-            else if (c == 12) { rep = "\\f"; }
-            else if (c == 13) { rep = "\\r"; }
-            else if (c < 32 || c == 127) {
-                rep = "\\u00" + Toml.Hex2(c);
+            else if (c < 32) {
+                if (c == 8) { rep = "\\b"; }
+                else if (c == 9) { rep = "\\t"; }
+                else if (c == 10) { rep = "\\n"; }
+                else if (c == 12) { rep = "\\f"; }
+                else if (c == 13) { rep = "\\r"; }
+                else { rep = "\\u00" + Toml.Hex2(c); }
+            } else if (c == 127) {
+                rep = "\\u007F";
             }
             if (rep != null) {
-                if (i > from) { sb.Append(t.Substring(from, i - from)); }
+                if (i > from) { sb.Append(new StringView(tp + (nint)from, i - from)); }
                 sb.Append(rep);
                 from = i + 1;
             }
@@ -175,7 +206,7 @@ public class Toml {
         if (from == 0) {
             sb.Append(t);
         } else if (from < n) {
-            sb.Append(t.Substring(from, n - from));
+            sb.Append(new StringView(tp + (nint)from, n - from));
         }
         sb.Append("\"");
     }

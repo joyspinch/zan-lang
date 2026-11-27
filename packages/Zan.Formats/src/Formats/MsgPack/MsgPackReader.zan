@@ -9,15 +9,19 @@ namespace Formats.MsgPack;
 // 还原成 ISO 8601 UTC 字符串；其他 extension 报错。深度限 512。
 public class MsgPackReader {
     byte[] buf;
+    nint bufPtr;
     int pos;
     int len;
+    string[] keyCache;
 
     // 包装整段字节。
     public MsgPackReader(byte[] data) {
         if (data == null) { throw new MsgPackException("null input buffer"); }
         buf = data;
+        bufPtr = (nint)data;
         pos = 0;
         len = data.Length;
+        keyCache = new string[64];
     }
 
     // 包装切片 [offset, offset+count)。
@@ -26,8 +30,10 @@ public class MsgPackReader {
             throw new MsgPackException("invalid slice range");
         }
         buf = data;
+        bufPtr = (nint)data;
         pos = offset;
         len = offset + count;
+        keyCache = new string[64];
     }
 
     public int U8() {
@@ -77,40 +83,90 @@ public class MsgPackReader {
         return v;
     }
 
-    // 零临时 byte[]，直接从 buf 切片解码 UTF-8 字符串。
+    // 零临时 byte[]，直接从 buf 切片解码 UTF-8 字符串（纯 ASCII 跳过 UTF-8 校验直拷）。
     string TakeString(int n) {
         if (n < 0 || n > len - pos) {
             throw new MsgPackException("truncated at byte "
                 + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
         }
         if (n == 0) { return ""; }
-        string s = Encoding.GetString(buf, pos, n);
-        pos = pos + n;
-        return s;
+        int st = pos;
+        Span<byte> s = new Span<byte>(bufPtr + (nint)st, n);
+        int orBits = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            orBits = orBits | (s[i] & 255);
+        }
+        pos = st + n;
+        if ((orBits & 128) == 0) {
+            return buf.ToStr(st, n);
+        }
+        return Encoding.GetString(buf, st, n);
     }
 
-    // 零 JsonValue 包装直读 map 键字符串。
+    // 64 槽直接映射 ASCII 键驻留缓存：命中时零堆分配返回已有 map 键。
+    string InternMapKey(int n) {
+        if (n < 0 || n > len - pos) {
+            throw new MsgPackException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+        if (n == 0) { return ""; }
+        if (n <= 32) {
+            int st = pos;
+            Span<byte> s = new Span<byte>(bufPtr + (nint)st, n);
+            int h = -2128831035;
+            int orBits = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                int c = s[i] & 255;
+                orBits = orBits | c;
+                h = (h ^ c) * 16777619;
+            }
+            if ((orBits & 128) == 0) {
+                pos = st + n;
+                int slot = h & 63;
+                string cached = keyCache[slot];
+                if (cached != null && cached.Length == n) {
+                    bool eq = true;
+                    for (int i = 0; i < n; i = i + 1) {
+                        if ((s[i] & 255) != (cached[i] & 255)) { eq = false; break; }
+                    }
+                    if (eq) { return cached; }
+                }
+                string fresh = buf.ToStr(st, n);
+                keyCache[slot] = fresh;
+                return fresh;
+            }
+        }
+        string s2 = Encoding.GetString(buf, pos, n);
+        pos = pos + n;
+        return s2;
+    }
+
+    // 零 JsonValue 包装直读 map 键字符串（高频短 ASCII 键走 64 槽驻留缓存）。
     string ReadMapKey(int depth) {
         if (depth > 512) {
             throw new MsgPackException("nesting too deep at byte " + Convert.ToString(pos));
         }
-        int b = U8();
-        if (b >= 160 && b <= 191) { return TakeString(b & 31); }
-        if (b == 217) { return TakeString(U8()); }
-        if (b == 218) { return TakeString(U16BE()); }
+        if (pos >= len) {
+            throw new MsgPackException("truncated at byte " + Convert.ToString(pos));
+        }
+        int b = buf[pos] & 255;
+        pos = pos + 1;
+        if (b >= 160 && b <= 191) { return InternMapKey(b & 31); }
+        if (b == 217) { return InternMapKey(U8()); }
+        if (b == 218) { return InternMapKey(U16BE()); }
         if (b == 219) {
             long nL = U32BE();
             if (nL < 0 || nL > 536870912) {
                 throw new MsgPackException("str length out of bounds at byte " + Convert.ToString(pos));
             }
-            return TakeString((int)nL);
+            return InternMapKey((int)nL);
         }
         if (b >= 196 && b <= 198) {
             long nL = b == 196 ? (long)U8() : (b == 197 ? (long)U16BE() : U32BE());
             if (nL < 0 || nL > 536870912) {
                 throw new MsgPackException("bin length out of bounds at byte " + Convert.ToString(pos));
             }
-            return TakeString((int)nL);
+            return InternMapKey((int)nL);
         }
         throw new MsgPackException("map key is not a string at byte " + Convert.ToString(pos));
     }
@@ -148,112 +204,175 @@ public class MsgPackReader {
             throw new MsgPackException("nesting too deep at byte "
                 + Convert.ToString(pos));
         }
-        int b = U8();
+        if (pos >= len) {
+            throw new MsgPackException("truncated at byte " + Convert.ToString(pos));
+        }
+        int b = buf[pos] & 255;
+        pos = pos + 1;
         if (b < 128) { return JsonValue.NewInt(b); }  // 正 fixint
         if (b >= 224) { return JsonValue.NewInt(b - 256); }  // 负 fixint
-        if (b >= 128 && b <= 143) {  // fixmap
-            int n = b & 15;
-            JsonValue obj = JsonValue.NewObject();
-            List<string> ks = obj.keys;
-            List<JsonValue> vs = obj.vals;
-            if (n > 0) { ks.Reserve(n); vs.Reserve(n); }
-            int i = 0;
-            while (i < n) {
-                string key = ReadMapKey(depth + 1);
-                ks.Add(key);
-                vs.Add(ReadValue(depth + 1));
-                i = i + 1;
+        if (b >= 192) {
+            switch (b) {
+                case 205:  // uint16
+                    if (2 > len - pos) { throw new MsgPackException("truncated at byte " + Convert.ToString(pos)); }
+                    int u16 = ((buf[pos] & 255) << 8) | (buf[pos + 1] & 255);
+                    pos = pos + 2;
+                    return JsonValue.NewInt(u16);
+                case 204:  // uint8
+                    if (pos >= len) { throw new MsgPackException("truncated at byte " + Convert.ToString(pos)); }
+                    int u8 = buf[pos] & 255;
+                    pos = pos + 1;
+                    return JsonValue.NewInt(u8);
+                case 206:  // uint32
+                    return JsonValue.NewInt(U32BE());
+                case 203:  // float64
+                    return JsonValue.NewDouble(BitsDouble(U64BE()));
+                case 194:
+                    return JsonValue.NewBool(false);
+                case 195:
+                    return JsonValue.NewBool(true);
+                case 192:
+                    return JsonValue.NewNull();
+                case 208:  // int8
+                    return JsonValue.NewInt(S8());
+                case 209:  // int16
+                    return JsonValue.NewInt(S16());
+                case 210:  // int32
+                    return JsonValue.NewInt((int)U32BE());
+                case 211:  // int64
+                    return JsonValue.NewInt(U64BE());
+                case 207: {  // uint64
+                    long v = U64BE();
+                    if (v >= 0) { return JsonValue.NewInt(v); }
+                    long hi = (v >> 1) & 9223372036854775807;
+                    return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
+                }
+                case 202:
+                    return JsonValue.NewDouble(BitsSingle((int)U32BE()));
+                case 217:
+                    return JsonValue.NewStr(TakeString(U8()));
+                case 218:
+                    return JsonValue.NewStr(TakeString(U16BE()));
+                case 219: {
+                    long nL = U32BE();
+                    if (nL < 0 || nL > 536870912) {
+                        throw new MsgPackException("str length out of bounds at byte " + Convert.ToString(pos));
+                    }
+                    return JsonValue.NewStr(TakeString((int)nL));
+                }
+                case 220:
+                    return ArrayOf(U16BE(), depth);
+                case 221: {
+                    long nL = U32BE();
+                    if (nL < 0 || nL > 1000000) {
+                        throw new MsgPackException("array length out of bounds: " + Convert.ToString(nL));
+                    }
+                    return ArrayOf((int)nL, depth);
+                }
+                case 222:
+                    return MapOf(U16BE(), depth);
+                case 223: {
+                    long nL = U32BE();
+                    if (nL < 0 || nL > 1000000) {
+                        throw new MsgPackException("map size out of bounds: " + Convert.ToString(nL));
+                    }
+                    return MapOf((int)nL, depth);
+                }
+                case 193:
+                    throw new MsgPackException("reserved code 0xC1 at byte " + Convert.ToString(pos - 1));
+                case 196:
+                case 197:
+                case 198: {
+                    long nL = b == 196 ? (long)U8() : (b == 197 ? (long)U16BE() : U32BE());
+                    if (nL < 0 || nL > 536870912) {
+                        throw new MsgPackException("bin length out of bounds at byte " + Convert.ToString(pos));
+                    }
+                    return JsonValue.NewStr(TakeString((int)nL));
+                }
+                case 199:
+                case 200:
+                case 201: {
+                    long nL = b == 199 ? (long)U8() : (b == 200 ? (long)U16BE() : U32BE());
+                    if (nL < 0 || nL > 536870912) {
+                        throw new MsgPackException("ext length out of bounds at byte " + Convert.ToString(pos));
+                    }
+                    int type = S8();
+                    return ExtValueSlice(type, (int)nL);
+                }
+                case 212:
+                case 213:
+                case 214:
+                case 215:
+                case 216: {
+                    int n = 1 << (b - 212);
+                    int type = S8();
+                    return ExtValueSlice(type, n);
+                }
+                default:
+                    throw new MsgPackException("unknown code 0x"
+                        + Convert.ToString((b >> 4) < 10 ? 48 + (b >> 4) : 87 + (b >> 4))
+                        + Convert.ToString((b & 15) < 10 ? 48 + (b & 15) : 87 + (b & 15))
+                        + " at byte " + Convert.ToString(pos - 1));
             }
-            return obj;
         }
-        if (b >= 144 && b <= 159) {  // fixarray
+        if (b >= 160) {  // fixstr (160..191)
+            return JsonValue.NewStr(TakeString(b & 31));
+        }
+        if (b >= 144) {  // fixarray (144..159)
             int n = b & 15;
             JsonValue arr = JsonValue.NewArray();
-            List<JsonValue> items = arr.items;
-            if (n > 0) { items.Reserve(n); }
-            int i = 0;
-            while (i < n) {
-                items.Add(ReadValue(depth + 1));
-                i = i + 1;
+            if (n > 0) {
+                if (depth + 1 > 512) {
+                    throw new MsgPackException("nesting too deep at byte " + Convert.ToString(pos));
+                }
+                List<JsonValue> items = arr.items;
+                items.Reserve(n);
+                for (int i = 0; i < n; i = i + 1) {
+                    if (pos < len) {
+                        int eb = buf[pos] & 255;
+                        if (eb < 128) {
+                            pos = pos + 1;
+                            items.Add(JsonValue.NewInt(eb));
+                            continue;
+                        }
+                        if (eb == 205 && pos + 2 < len) {
+                            int u16 = ((buf[pos + 1] & 255) << 8) | (buf[pos + 2] & 255);
+                            pos = pos + 3;
+                            items.Add(JsonValue.NewInt(u16));
+                            continue;
+                        }
+                        if (eb == 204 && pos + 1 < len) {
+                            int u8 = buf[pos + 1] & 255;
+                            pos = pos + 2;
+                            items.Add(JsonValue.NewInt(u8));
+                            continue;
+                        }
+                        if (eb >= 224) {
+                            pos = pos + 1;
+                            items.Add(JsonValue.NewInt(eb - 256));
+                            continue;
+                        }
+                    }
+                    items.Add(ReadValue(depth + 1));
+                }
             }
             return arr;
         }
-        if (b >= 160 && b <= 191) {  // fixstr
-            return JsonValue.NewStr(TakeString(b & 31));
-        }
-        if (b == 192) { return JsonValue.NewNull(); }  // nil
-        if (b == 193) {
-            throw new MsgPackException("reserved code 0xC1 at byte "
-                + Convert.ToString(pos - 1));
-        }
-        if (b == 194) { return JsonValue.NewBool(false); }
-        if (b == 195) { return JsonValue.NewBool(true); }
-        if (b >= 196 && b <= 198) {  // bin8/16/32
-            long nL = b == 196 ? (long)U8() : (b == 197 ? (long)U16BE() : U32BE());
-            if (nL < 0 || nL > 536870912) {
-                throw new MsgPackException("bin length out of bounds at byte " + Convert.ToString(pos));
+        // fixmap (128..143)
+        int mn = b & 15;
+        JsonValue obj = JsonValue.NewObject();
+        if (mn > 0) {
+            List<string> ks = obj.keys;
+            List<JsonValue> vs = obj.vals;
+            ks.Reserve(mn);
+            vs.Reserve(mn);
+            for (int i = 0; i < mn; i = i + 1) {
+                string key = ReadMapKey(depth + 1);
+                ks.Add(key);
+                vs.Add(ReadValue(depth + 1));
             }
-            // bin 无文本语义：UTF-8 尽力解码（非法序列 U+FFFD）。
-            return JsonValue.NewStr(TakeString((int)nL));
         }
-        if (b >= 199 && b <= 201) {  // ext8/16/32
-            long nL = b == 199 ? (long)U8() : (b == 200 ? (long)U16BE() : U32BE());
-            if (nL < 0 || nL > 536870912) {
-                throw new MsgPackException("ext length out of bounds at byte " + Convert.ToString(pos));
-            }
-            int type = S8();
-            return ExtValue(type, Take((int)nL));
-        }
-        if (b == 202) { return JsonValue.NewDouble(BitsSingle((int)U32BE())); }
-        if (b == 203) { return JsonValue.NewDouble(BitsDouble(U64BE())); }
-        if (b == 204) { return JsonValue.NewInt(U8()); }  // uint8
-        if (b == 205) { return JsonValue.NewInt(U16BE()); }  // uint16
-        if (b == 206) { return JsonValue.NewInt(U32BE()); }  // uint32
-        if (b == 207) {  // uint64
-            long v = U64BE();
-            if (v >= 0) { return JsonValue.NewInt(v); }
-            // 高位溢出 int64：转 double（53 位有效位之外的精度丢失）。
-            long hi = (v >> 1) & 9223372036854775807;
-            return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
-        }
-        if (b == 208) { return JsonValue.NewInt(S8()); }  // int8
-        if (b == 209) { return JsonValue.NewInt(S16()); }  // int16
-        if (b == 210) { return JsonValue.NewInt((int)U32BE()); }  // int32
-        if (b == 211) { return JsonValue.NewInt(U64BE()); }  // int64
-        if (b >= 212 && b <= 216) {  // fixext 1/2/4/8/16
-            int n = 1 << (b - 212);
-            int type = S8();
-            return ExtValue(type, Take(n));
-        }
-        if (b == 217) { return JsonValue.NewStr(TakeString(U8())); }
-        if (b == 218) { return JsonValue.NewStr(TakeString(U16BE())); }
-        if (b == 219) {
-            long nL = U32BE();
-            if (nL < 0 || nL > 536870912) {
-                throw new MsgPackException("str length out of bounds at byte " + Convert.ToString(pos));
-            }
-            return JsonValue.NewStr(TakeString((int)nL));
-        }
-        if (b == 220) { return ArrayOf(U16BE(), depth); }
-        if (b == 221) {
-            long nL = U32BE();
-            if (nL < 0 || nL > 1000000) {
-                throw new MsgPackException("array length out of bounds: " + Convert.ToString(nL));
-            }
-            return ArrayOf((int)nL, depth);
-        }
-        if (b == 222) { return MapOf(U16BE(), depth); }
-        if (b == 223) {
-            long nL = U32BE();
-            if (nL < 0 || nL > 1000000) {
-                throw new MsgPackException("map size out of bounds: " + Convert.ToString(nL));
-            }
-            return MapOf((int)nL, depth);
-        }
-        throw new MsgPackException("unknown code 0x"
-            + Convert.ToString((b >> 4) < 10 ? 48 + (b >> 4) : 87 + (b >> 4))
-            + Convert.ToString((b & 15) < 10 ? 48 + (b & 15) : 87 + (b & 15))
-            + " at byte " + Convert.ToString(pos - 1));
+        return obj;
     }
 
     JsonValue ArrayOf(int n, int depth) {
@@ -287,6 +406,38 @@ public class MsgPackReader {
             i = i + 1;
         }
         return obj;
+    }
+
+    // extension 零拷贝切片直读：消除 timestamp ext 每次 4/8/12 字节临时数组分配。
+    JsonValue ExtValueSlice(int type, int n) {
+        if (n < 0 || n > len - pos) {
+            throw new MsgPackException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+        }
+        int at = pos;
+        pos = pos + n;
+        if (type != -1) {
+            throw new MsgPackException("unsupported ext type "
+                + Convert.ToString(type) + " at byte "
+                + Convert.ToString(pos));
+        }
+        if (n == 4) {
+            long sec = U32Of(buf, at);
+            return JsonValue.NewStr(IsoFromUnix(sec));
+        }
+        if (n == 8) {
+            long v = U64Of(buf, at);
+            long nanos = (v >> 34) & 1073741823;  // 高 30 位
+            long sec = v & 17179869183;  // 低 34 位（2^34-1）
+            return JsonValue.NewStr(IsoFromUnixNanos(sec, nanos));
+        }
+        if (n == 12) {
+            long nanos = U32Of(buf, at);
+            long sec = U64Of(buf, at + 4);
+            return JsonValue.NewStr(IsoFromUnixNanos(sec, nanos));
+        }
+        throw new MsgPackException("timestamp ext must be 4/8/12 bytes, got "
+            + Convert.ToString(n));
     }
 
     // extension 主体：只认 timestamp（type -1），其余报错。

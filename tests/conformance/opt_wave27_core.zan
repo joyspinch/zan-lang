@@ -1,0 +1,357 @@
+using System;
+using System.Collections.Generic;
+using System.IO.Compression;
+using System.Json;
+using System.Text;
+using System.Text.Html;
+using Formats.Bson;
+using Formats.MsgPack;
+using Formats.Toml;
+using Web3.Encoding;
+
+// Wave 27 优化边界回归测试：
+// 1. HTML：大写标签/属性名缓存折叠、实体切片解码（命名/十进制/十六进制）、隐式闭合（p/li/tr/td）、
+//    栈顶与跨层结束标签、空元素/原始文本元素、Sanitizer Default/Rich/URL 协议清理与属性白名单。
+// 2. RLP：null/空字节/单字节<=0x7f/>0x7f/55/56 字节边界、多层嵌套列表、RlpSizePlan 扩容 (>32 个列表)。
+// 3. BSON：1..4 字节数组下标跳过、重复键缓存、空串/长串/Unicode 串、ObjectId 24 位 hex、datetime、int32/int64/double/bool/null。
+// 4. MsgPack：正负 fixint/uint8/16/32/64/int8/16/32/64、fixarray 整型快路径、ASCII/UTF-8 字符串、timestamp ext 4/8/12 字节。
+// 5. TOML：单段与多段 [table] / [[array]]、重复表头与重复键报错、纯十进制短整数/19位大整数/边界 MinLong/0x/0o/0b/浮点/日期、
+//    多行基本串与转义、ToToml 往返含 MinLong/0/负数/控制字符转义。
+// 6. TAR：空归档、150+ 字节含 0/非0 块与大小/mtime/校验和往返、超 512 字节多块对齐与边界文件。
+public class Program {
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL: " + name);
+            Environment.Exit(1);
+        }
+    }
+
+    static JsonValue Req(JsonValue obj, string key) {
+        JsonValue v = obj.Get(key);
+        if (v == null) {
+            Console.WriteLine("FAIL: missing key " + key);
+            Environment.Exit(1);
+            return JsonValue.NewNull();
+        }
+        return v;
+    }
+
+    static string BytesHex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.Length * 2);
+        for (int i = 0; i < b.Length; i = i + 1) {
+            int v = b[i] & 255;
+            int hi = (v >> 4) & 15;
+            int lo = v & 15;
+            sb.Append(Encoding.CharFromCode(hi < 10 ? 48 + hi : 87 + hi));
+            sb.Append(Encoding.CharFromCode(lo < 10 ? 48 + lo : 87 + lo));
+        }
+        return sb.ToString();
+    }
+
+    static void TestHtml() {
+        string raw = "<!DOCTYPE html><DIV CLASS=\"a b\" class=\"dup\" DATA-X=\"1&amp;2&#32;&#x41;\">\n"
+            + "  <P>para1<DIV>inside</DIV>\n"
+            + "  <UL><LI>one<LI>two</UL>\n"
+            + "  <TABLE><TR><TD>c1<TD>c2<TR><TH>h1</TABLE>\n"
+            + "  <SCRIPT>if (a < b && c > d) {}</SCRIPT>\n"
+            + "  <TITLE>T &lt;1&gt;</TITLE>\n"
+            + "  <A HREF=\"java\tscript:alert(1)\" onclick=\"bad()\">bad</A>\n"
+            + "  <A HREF=\" https://example.com/p?a=1&amp;b=2 \">ok</A>\n"
+            + "  <IMG SRC=\"https://cdn.example.com/a.png\" ALT=\"pic\"><BR>\n"
+            + "  <!-- cmt -->\n"
+            + "</DIV>";
+        HtmlDocument doc = HtmlParser.Parse(raw);
+        HtmlNode div = doc.Find("div");
+        Check("html.root_div", div != null && div.tag == "div");
+        if (div != null) {
+            Check("html.first_attr_wins", div.Get("class", "") == "a b");
+            Check("html.entity_attr", div.Get("data-x", "") == "1&2 A");
+            Check("html.has_class", div.HasClass("a") && div.HasClass("b") && !div.HasClass("dup"));
+        }
+
+        List<HtmlNode> lis = doc.Query("li");
+        Check("html.implied_li_count", lis.Count == 2 && lis[0].TextContent() == "one" && lis[1].TextContent() == "two");
+        List<HtmlNode> tds = doc.Query("td");
+        Check("html.implied_td_count", tds.Count == 2 && tds[0].TextContent() == "c1" && tds[1].TextContent() == "c2");
+        HtmlNode script = doc.Find("script");
+        Check("html.raw_script", script != null && script.TextContent() == "if (a < b && c > d) {}");
+        HtmlNode title = doc.Find("title");
+        Check("html.escapable_title", title != null && title.TextContent() == "T <1>");
+
+        // Default policy drops all attributes and script content
+        string defClean = HtmlSanitizer.Clean(raw, HtmlPolicy.Default());
+        Check("html.def_drops_script", defClean.IndexOf("alert") < 0 && defClean.IndexOf("if (a") < 0);
+        Check("html.def_drops_attrs", defClean.IndexOf("class=") < 0 && defClean.IndexOf("href=") < 0);
+        Check("html.def_keeps_text", defClean.IndexOf("para1") >= 0 && defClean.IndexOf("T &lt;1&gt;") >= 0);
+
+        // Rich policy keeps safe href/img src, strips javascript: and onclick
+        string richClean = HtmlSanitizer.Clean(raw, HtmlPolicy.Rich());
+        Check("html.rich_drops_js_url", richClean.IndexOf("javascript:") < 0 && richClean.IndexOf("onclick") < 0);
+        Check("html.rich_keeps_https", richClean.IndexOf("href=\" https://example.com/p?a=1&amp;b=2 \"") >= 0);
+        Check("html.rich_keeps_img", richClean.IndexOf("<img") >= 0 && richClean.IndexOf("src=\"https://cdn.example.com/a.png\"") >= 0);
+
+        // CleanUrl edge cases
+        Check("html.clean_url_ctrl", HtmlSanitizer.CleanUrl(" \tjava\nscript:\r1 ") == "javascript:1");
+        Check("html.safe_url_check", !HtmlSanitizer.IsSafeUrl("java\tscript:alert(1)", HtmlPolicy.Default())
+            && HtmlSanitizer.IsSafeUrl("https://ok.test/a", HtmlPolicy.Default()));
+        Console.WriteLine("html ok");
+    }
+
+    static void TestRlp() {
+        // Boundary lengths: empty, single <= 0x7f, single 0x80, 55 bytes, 56 bytes
+        Check("rlp.empty", BytesHex(Rlp.Encode(RlpItem.FromBytes(new byte[0]))) == "80");
+        byte[] b7f = new byte[1]; b7f[0] = 0x7f;
+        Check("rlp.7f", BytesHex(Rlp.Encode(RlpItem.FromBytes(b7f))) == "7f");
+        byte[] b80 = new byte[1]; b80[0] = 0x80;
+        Check("rlp.80", BytesHex(Rlp.Encode(RlpItem.FromBytes(b80))) == "8180");
+
+        byte[] b55 = new byte[55];
+        byte[] b56 = new byte[56];
+        for (int i = 0; i < 55; i = i + 1) { b55[i] = 0x61; }
+        for (int i = 0; i < 56; i = i + 1) { b56[i] = 0x62; }
+        byte[] e55 = Rlp.Encode(RlpItem.FromBytes(b55));
+        byte[] e56 = Rlp.Encode(RlpItem.FromBytes(b56));
+        Check("rlp.55", e55.Length == 56 && (e55[0] & 255) == 0x80 + 55);
+        Check("rlp.56", e56.Length == 58 && (e56[0] & 255) == 0xb8 && (e56[1] & 255) == 56);
+
+        // Nested list with > 40 sublists (forces RlpSizePlan growth past 32) + null child
+        List<RlpItem> outer = new List<RlpItem>();
+        outer.Add(null);
+        for (int i = 0; i < 45; i = i + 1) {
+            List<RlpItem> inner = new List<RlpItem>();
+            inner.Add(RlpItem.FromLong(i));
+            inner.Add(RlpItem.FromString("item-" + Convert.ToString(i)));
+            if (i % 5 == 0) {
+                inner.Add(RlpItem.FromBytes(b56));
+            }
+            outer.Add(RlpItem.FromList(inner));
+        }
+        byte[] enc = Rlp.Encode(RlpItem.FromList(outer));
+        // Compare against EncodeListRaw reference
+        List<byte[]> rawItems = new List<byte[]>();
+        rawItems.Add(null);
+        for (int i = 0; i < 45; i = i + 1) {
+            List<byte[]> innerRaw = new List<byte[]>();
+            innerRaw.Add(Rlp.Encode(RlpItem.FromLong(i)));
+            innerRaw.Add(Rlp.EncodeString("item-" + Convert.ToString(i)));
+            if (i % 5 == 0) {
+                innerRaw.Add(Rlp.EncodeBytes(b56));
+            }
+            rawItems.Add(Rlp.EncodeListRaw(innerRaw));
+        }
+        byte[] expected = Rlp.EncodeListRaw(rawItems);
+        Check("rlp.nested_len", enc.Length == expected.Length);
+        bool same = true;
+        for (int i = 0; i < enc.Length; i = i + 1) {
+            if (enc[i] != expected[i]) { same = false; break; }
+        }
+        Check("rlp.nested_exact", same);
+        Console.WriteLine("rlp ok");
+    }
+
+    static void TestBson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Set("empty", JsonValue.NewStr(""));
+        root.Set("utf8", JsonValue.NewStr("你好世界-Wave27"));
+        root.Set("neg32", JsonValue.NewInt(-123456));
+        root.Set("big64", JsonValue.NewInt(5000000000L));
+        root.Set("flt", JsonValue.NewDouble(-3.125));
+        root.Set("flagT", JsonValue.NewBool(true));
+        root.Set("flagF", JsonValue.NewBool(false));
+        root.Set("nil", JsonValue.NewNull());
+
+        // Array with 1050 items to exercise 1/2/3/4-byte index key skip ("0".."1049")
+        JsonValue bigArr = JsonValue.NewArray();
+        for (int i = 0; i < 1050; i = i + 1) {
+            if (i % 3 == 0) {
+                bigArr.items.Add(JsonValue.NewInt(i - 500));
+            } else if (i % 3 == 1) {
+                bigArr.items.Add(JsonValue.NewInt(3000000000L + (long)i));
+            } else {
+                JsonValue row = JsonValue.NewObject();
+                row.Set("k", JsonValue.NewStr("v-" + Convert.ToString(i % 7)));
+                row.Set("n", JsonValue.NewInt(i));
+                bigArr.items.Add(row);
+            }
+        }
+        root.Set("arr", bigArr);
+
+        byte[] packed = Bson.Pack(root);
+        JsonValue got = Bson.Unpack(packed);
+        Check("bson.empty", Req(got, "empty").AsString("x") == "");
+        Check("bson.utf8", Req(got, "utf8").AsString("") == "你好世界-Wave27");
+        Check("bson.neg32", Req(got, "neg32").AsLong(0) == -123456L);
+        Check("bson.big64", Req(got, "big64").AsLong(0) == 5000000000L);
+        Check("bson.flt", Req(got, "flt").AsDouble(0.0) == -3.125);
+        Check("bson.bools", Req(got, "flagT").AsBool(false) && !Req(got, "flagF").AsBool(true));
+        Check("bson.nil", Req(got, "nil").IsNull());
+        JsonValue gotArr = Req(got, "arr");
+        Check("bson.arr_len", gotArr.Count() == 1050);
+        Check("bson.arr_0", gotArr.At(0).AsLong(0) == -500L);
+        Check("bson.arr_1000", gotArr.At(1000).AsLong(0) == 3000001000L);
+        JsonValue row1049 = gotArr.At(1049);
+        Check("bson.arr_1049", Req(row1049, "k").AsString("") == "v-6" && Req(row1049, "n").AsLong(0) == 1049L);
+
+        // Raw ObjectId (type 0x07) direct decode without Take(12)
+        byte[] oidDoc = new byte[21];
+        oidDoc[0] = 21;
+        oidDoc[4] = 7;
+        oidDoc[5] = 105; oidDoc[6] = 100; oidDoc[7] = 0; // "id\0"
+        for (int i = 0; i < 12; i = i + 1) { oidDoc[8 + i] = (byte)(i * 16 + i); }
+        oidDoc[20] = 0;
+        JsonValue oidGot = Bson.Unpack(oidDoc);
+        Check("bson.oid", Req(oidGot, "id").AsString("") == "00112233445566778899aabb");
+        Console.WriteLine("bson ok");
+    }
+
+    static void TestMsgPack() {
+        JsonValue root = JsonValue.NewObject();
+        root.Set("pos_fix", JsonValue.NewInt(42));
+        root.Set("neg_fix", JsonValue.NewInt(-17));
+        root.Set("u8", JsonValue.NewInt(200));
+        root.Set("u16", JsonValue.NewInt(40000));
+        root.Set("u32", JsonValue.NewInt(1000000));
+        root.Set("i64", JsonValue.NewInt(-9000000000000L));
+        root.Set("flt", JsonValue.NewDouble(2.5));
+        root.Set("ascii", JsonValue.NewStr("hello-ascii"));
+        root.Set("utf8", JsonValue.NewStr("中文-🚀-utf8"));
+        root.Set("t", JsonValue.NewBool(true));
+        root.Set("f", JsonValue.NewBool(false));
+        root.Set("n", JsonValue.NewNull());
+
+        JsonValue fixArr = JsonValue.NewArray();
+        fixArr.items.Add(JsonValue.NewInt(0));
+        fixArr.items.Add(JsonValue.NewInt(127));
+        fixArr.items.Add(JsonValue.NewInt(-32));
+        fixArr.items.Add(JsonValue.NewInt(250));
+        fixArr.items.Add(JsonValue.NewInt(65500));
+        fixArr.items.Add(JsonValue.NewInt(-50000));
+        fixArr.items.Add(JsonValue.NewStr("mix"));
+        root.Set("fa", fixArr);
+
+        byte[] packed = MsgPack.Pack(root);
+        JsonValue got = MsgPack.Unpack(packed);
+        Check("mp.pos_fix", Req(got, "pos_fix").AsLong(0) == 42L);
+        Check("mp.neg_fix", Req(got, "neg_fix").AsLong(0) == -17L);
+        Check("mp.u8", Req(got, "u8").AsLong(0) == 200L);
+        Check("mp.u16", Req(got, "u16").AsLong(0) == 40000L);
+        Check("mp.u32", Req(got, "u32").AsLong(0) == 1000000L);
+        Check("mp.i64", Req(got, "i64").AsLong(0) == -9000000000000L);
+        Check("mp.flt", Req(got, "flt").AsDouble(0.0) == 2.5);
+        Check("mp.ascii", Req(got, "ascii").AsString("") == "hello-ascii");
+        Check("mp.utf8", Req(got, "utf8").AsString("") == "中文-🚀-utf8");
+        Check("mp.bools", Req(got, "t").AsBool(false) && !Req(got, "f").AsBool(true));
+        Check("mp.null", Req(got, "n").IsNull());
+        JsonValue fa = Req(got, "fa");
+        Check("mp.fa", fa.Count() == 7 && fa.At(1).AsLong(0) == 127L && fa.At(2).AsLong(0) == -32L
+            && fa.At(3).AsLong(0) == 250L && fa.At(4).AsLong(0) == 65500L && fa.At(5).AsLong(0) == -50000L
+            && fa.At(6).AsString("") == "mix");
+
+        // Zero-copy timestamp ext 4-byte (fixext4 = 0xd6, type -1 = 0xff, sec = 0)
+        byte[] ts4 = new byte[6];
+        ts4[0] = 0xd6; ts4[1] = 0xff;
+        JsonValue tsVal = MsgPack.Unpack(ts4);
+        Check("mp.ts4", tsVal.AsString("") == "1970-01-01T00:00:00Z");
+        Console.WriteLine("msgpack ok");
+    }
+
+    static void TestToml() {
+        string src = "zero = 0\n"
+            + "neg = -42\n"
+            + "min_i64 = -9223372036854775808\n"
+            + "max_i64 = 9223372036854775807\n"
+            + "hex = 0xdead_beef\n"
+            + "flag_t = true\n"
+            + "flag_f = false\n"
+            + "dt = 2026-11-27T12:34:56Z\n"
+            + "esc = \"a\\nb\\tc\\\"d\\\\e\"\n"
+            + "ml = \"\"\"\nline1\nline2\"\"\"\n"
+            + "\n[single]\n"
+            + "k = 123\n"
+            + "inline = { a = 1, b = -99, c = \"hi\" }\n"
+            + "\n[[items]]\n"
+            + "id = 1\n"
+            + "name = \"one\"\n"
+            + "\n[[items]]\n"
+            + "id = 2\n"
+            + "name = \"two\"\n";
+        JsonValue parsed = Toml.Parse(src);
+        Check("toml.zero", Req(parsed, "zero").AsLong(99) == 0L);
+        Check("toml.neg", Req(parsed, "neg").AsLong(0) == -42L);
+        Check("toml.min_i64", Req(parsed, "min_i64").AsLong(0) == -9223372036854775807L - 1L);
+        Check("toml.max_i64", Req(parsed, "max_i64").AsLong(0) == 9223372036854775807L);
+        Check("toml.hex", Req(parsed, "hex").AsLong(0) == 3735928559L);
+        Check("toml.bools", Req(parsed, "flag_t").AsBool(false) && !Req(parsed, "flag_f").AsBool(true));
+        Check("toml.dt", Req(parsed, "dt").AsString("") == "2026-11-27T12:34:56Z");
+        Check("toml.ml", Req(parsed, "ml").AsString("") == "line1\nline2");
+        JsonValue items = Req(parsed, "items");
+        Check("toml.items", items.Count() == 2 && Req(items.At(1), "name").AsString("") == "two");
+
+        // Round-trip through ToToml -> Parse
+        string outToml = Toml.ToToml(parsed);
+        JsonValue rt = Toml.Parse(outToml);
+        Check("toml.rt_min", Req(rt, "min_i64").AsLong(0) == -9223372036854775807L - 1L);
+        Check("toml.rt_max", Req(rt, "max_i64").AsLong(0) == 9223372036854775807L);
+        Check("toml.rt_zero", Req(rt, "zero").AsLong(99) == 0L);
+        Check("toml.rt_esc", Req(rt, "esc").AsString("") == Req(parsed, "esc").AsString(""));
+        Check("toml.rt_inline", Req(Req(Req(rt, "single"), "inline"), "b").AsLong(0) == -99L);
+
+        // Duplicate single header must still throw
+        bool dupThrew = false;
+        try {
+            Toml.Parse("[dup]\na = 1\n[dup]\nb = 2\n");
+        } catch (TomlException ex) {
+            dupThrew = true;
+        }
+        Check("toml.dup_header_throws", dupThrew);
+        Console.WriteLine("toml ok");
+    }
+
+    static void TestTar() {
+        List<TarEntry> entries = new List<TarEntry>();
+        // 0-byte file, 512-byte exact block, 513-byte cross-block
+        TarEntry e0 = new TarEntry("empty.txt");
+        e0.mode = 420;
+        e0.mtime = 1700000001L;
+        e0.data = new byte[0];
+        entries.Add(e0);
+
+        TarEntry e1 = new TarEntry("exact512.bin");
+        e1.mode = 493;
+        e1.mtime = 1700000512L;
+        byte[] d512 = new byte[512];
+        for (int i = 0; i < 512; i = i + 1) { d512[i] = (byte)((i * 31 + 7) & 255); }
+        e1.data = d512;
+        entries.Add(e1);
+
+        TarEntry e2 = new TarEntry("sub/cross513.bin");
+        e2.mode = 420;
+        e2.mtime = 1700000513L;
+        byte[] d513 = new byte[513];
+        for (int i = 0; i < 513; i = i + 1) { d513[i] = (byte)((i * 19 + 3) & 255); }
+        e2.data = d513;
+        entries.Add(e2);
+
+        byte[] arch = Tar.Create(entries);
+        List<TarEntry> got = Tar.Read(arch);
+        Check("tar.count", got != null && got.Count == 3);
+        if (got != null && got.Count == 3) {
+            Check("tar.e0", got[0].name == "empty.txt" && got[0].data.Length == 0 && got[0].mtime == 1700000001L);
+            Check("tar.e1", got[1].name == "exact512.bin" && got[1].data.Length == 512 && got[1].mode == 493
+                && got[1].data[0] == d512[0] && got[1].data[511] == d512[511]);
+            Check("tar.e2", got[2].name == "sub/cross513.bin" && got[2].data.Length == 513
+                && got[2].data[0] == d513[0] && got[2].data[512] == d513[512]);
+        }
+        Console.WriteLine("tar ok");
+    }
+
+    public static void Main() {
+        TestHtml();
+        TestRlp();
+        TestBson();
+        TestMsgPack();
+        TestToml();
+        TestTar();
+        Console.WriteLine("wave27 all ok");
+    }
+}

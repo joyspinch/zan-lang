@@ -14,6 +14,7 @@ public class BsonReader {
     public byte[] buf;
     public int pos;
     public int len;
+    string[] keyCache;
 
     // 包装整段字节。
     public BsonReader(byte[] data) {
@@ -21,6 +22,7 @@ public class BsonReader {
         buf = data;
         pos = 0;
         len = data.Length;
+        keyCache = new string[64];
     }
 
     // 包装切片 [offset, offset+count)。
@@ -31,6 +33,7 @@ public class BsonReader {
         buf = data;
         pos = offset;
         len = offset + count;
+        keyCache = new string[64];
     }
 
     public int U8() {
@@ -119,28 +122,151 @@ public class BsonReader {
                 + Convert.ToString(total) + ")");
         }
         int bodyEnd = lenAt + total;
-        JsonValue v = asArray ? JsonValue.NewArray() : JsonValue.NewObject();
-        while (true) {
-            int typeAt = pos;
-            int t = U8();
-            if (t == 0) {
-                // 终止符：声明长度必须恰好消耗完（多出的尾部字节同属畸形）。
-                if (pos != bodyEnd) {
-                    throw new BsonException("document length mismatch at byte "
-                        + Convert.ToString(lenAt) + " (declares "
-                        + Convert.ToString(total) + ", ends at "
-                        + Convert.ToString(pos) + ")");
+        int limit = bodyEnd < len ? bodyEnd : len;
+        nint bp = (nint)buf;
+        Span<byte> sb = new Span<byte>(bp, len);
+        if (asArray) {
+            JsonValue v = JsonValue.NewArray();
+            List<JsonValue> items = v.items;
+            while (true) {
+                int typeAt = pos;
+                if (pos >= len) {
+                    throw new BsonException("truncated at byte " + Convert.ToString(pos));
                 }
-                return v;
+                int t = sb[pos] & 255;
+                pos = pos + 1;
+                if (t == 0) {
+                    if (pos != bodyEnd) {
+                        throw new BsonException("document length mismatch at byte "
+                            + Convert.ToString(lenAt) + " (declares "
+                            + Convert.ToString(total) + ", ends at "
+                            + Convert.ToString(pos) + ")");
+                    }
+                    return v;
+                }
+                if (typeAt >= bodyEnd) {
+                    throw new BsonException("element past document end at byte "
+                        + Convert.ToString(typeAt));
+                }
+                // 数组下标键 99.9% 为 1..3 字节数字 + NUL，内联直跳免 NativeMemory.Find 调用。
+                if (pos + 1 < limit && (sb[pos] & 255) != 0 && (sb[pos + 1] & 255) == 0) {
+                    pos = pos + 2;
+                } else if (pos + 2 < limit && (sb[pos] & 255) != 0 && (sb[pos + 1] & 255) != 0 && (sb[pos + 2] & 255) == 0) {
+                    pos = pos + 3;
+                } else if (pos + 3 < limit && (sb[pos] & 255) != 0 && (sb[pos + 1] & 255) != 0 && (sb[pos + 2] & 255) != 0 && (sb[pos + 3] & 255) == 0) {
+                    pos = pos + 4;
+                } else {
+                    SkipCStr(bp, bodyEnd);
+                }
+                if (t == 16 && len - pos >= 4) {
+                    int p = pos;
+                    long iv = (long)(sb[p] & 255)
+                        | ((long)(sb[p + 1] & 255) << 8)
+                        | ((long)(sb[p + 2] & 255) << 16)
+                        | ((long)(sb[p + 3] & 255) << 24);
+                    pos = p + 4;
+                    if (iv >= 2147483648) { iv = iv - 4294967296; }
+                    items.Add(JsonValue.NewInt((int)iv));
+                } else if (t == 18 && len - pos >= 8) {
+                    int p = pos;
+                    long lv = (long)(sb[p] & 255)
+                        | ((long)(sb[p + 1] & 255) << 8)
+                        | ((long)(sb[p + 2] & 255) << 16)
+                        | ((long)(sb[p + 3] & 255) << 24)
+                        | ((long)(sb[p + 4] & 255) << 32)
+                        | ((long)(sb[p + 5] & 255) << 40)
+                        | ((long)(sb[p + 6] & 255) << 48)
+                        | ((long)(sb[p + 7] & 255) << 56);
+                    pos = p + 8;
+                    items.Add(JsonValue.NewInt(lv));
+                } else {
+                    items.Add(ReadElement(t, depth));
+                }
             }
-            if (typeAt >= bodyEnd) {
-                throw new BsonException("element past document end at byte "
-                    + Convert.ToString(typeAt));
+        } else {
+            JsonValue v = JsonValue.NewObject();
+            List<string> ks = v.keys;
+            List<JsonValue> vs = v.vals;
+            while (true) {
+                int typeAt = pos;
+                if (pos >= len) {
+                    throw new BsonException("truncated at byte " + Convert.ToString(pos));
+                }
+                int t = sb[pos] & 255;
+                pos = pos + 1;
+                if (t == 0) {
+                    if (pos != bodyEnd) {
+                        throw new BsonException("document length mismatch at byte "
+                            + Convert.ToString(lenAt) + " (declares "
+                            + Convert.ToString(total) + ", ends at "
+                            + Convert.ToString(pos) + ")");
+                    }
+                    return v;
+                }
+                if (typeAt >= bodyEnd) {
+                    throw new BsonException("element past document end at byte "
+                        + Convert.ToString(typeAt));
+                }
+                string name = InternCStr(bp, bodyEnd);
+                ks.Add(name);
+                vs.Add(ReadElement(t, depth));
             }
-            string name = CStr(bodyEnd);
-            JsonValue item = ReadElement(t, depth);
-            if (asArray) { v.items.Add(item); } else { v.keys.Add(name); v.vals.Add(item); }
         }
+    }
+
+    // 数组元素键跳过：零字符串分配，SIMD memchr 直定位终止 NUL。
+    void SkipCStr(nint bp, int bodyEnd) {
+        int start = pos;
+        int limit = bodyEnd < len ? bodyEnd : len;
+        int rem = limit - start;
+        if (rem > 0) {
+            int hit = NativeMemory.Find(bp, start, 0, rem);
+            if (hit >= 0) {
+                pos = hit + 1;
+                return;
+            }
+        }
+        pos = limit;
+        throw new BsonException("unterminated element name at byte "
+            + Convert.ToString(start));
+    }
+
+    // 对象字段名读取 + 64 槽 FNV 直接映射驻留缓存：命中时零字符串堆分配。
+    string InternCStr(nint bp, int bodyEnd) {
+        int start = pos;
+        int limit = bodyEnd < len ? bodyEnd : len;
+        int rem = limit - start;
+        if (rem > 0) {
+            int hit = NativeMemory.Find(bp, start, 0, rem);
+            if (hit >= 0) {
+                int n = hit - start;
+                pos = hit + 1;
+                if (n == 0) { return ""; }
+                if (n <= 32) {
+                    Span<byte> s = new Span<byte>(bp + (nint)start, n);
+                    int h = -2128831035;
+                    for (int i = 0; i < n; i = i + 1) {
+                        h = (h ^ (s[i] & 255)) * 16777619;
+                    }
+                    int slot = h & 63;
+                    string cached = keyCache[slot];
+                    if (cached != null && cached.Length == n) {
+                        bool eq = true;
+                        for (int i = 0; i < n; i = i + 1) {
+                            if ((s[i] & 255) != (cached[i] & 255)) { eq = false; break; }
+                        }
+                        if (eq) { return cached; }
+                    }
+                    string fresh = buf.ToStr(start, n);
+                    keyCache[slot] = fresh;
+                    return fresh;
+                }
+                return buf.ToStr(start, n);
+            }
+        }
+        pos = limit;
+        throw new BsonException("unterminated element name at byte "
+            + Convert.ToString(start));
     }
 
     // cstring 元素名：SIMD 扫描到第一个 NUL（cstring 定义上不含 NUL，
@@ -162,53 +288,67 @@ public class BsonReader {
             + Convert.ToString(start));
     }
 
-    // 按类型字节解码单个元素值（流已定位在值起点）。
+    // 按类型字节解码单个元素值（switch 跳转表 O(1) 分派）。
     public JsonValue ReadElement(int t, int depth) {
-        if (t == 1) {  // double
-            return JsonValue.NewDouble(BitsDouble(U64LE()));
-        }
-        if (t == 2) {  // string
-            return JsonValue.NewStr(ReadString());
-        }
-        if (t == 3) { return ReadDocument(depth + 1, false); }  // document
-        if (t == 4) { return ReadDocument(depth + 1, true); }  // array
-        if (t == 5) {  // binary
-            int n = S32LE();
-            if (n < 0 || n > 536870912) {
-                throw new BsonException("binary length out of bounds at byte " + Convert.ToString(pos));
-            }
-            int subtype = U8();
-            if (subtype == 2) {
-                // 过时的 subtype 0x02：payload 前置 int32 内嵌长度，
-                // 必须与外层一致（n = 4 + inner），不符即畸形。
-                if (n < 4 || S32LE() != n - 4) {
-                    throw new BsonException("binary subtype 0x02 embedded"
-                        + " length mismatch at byte " + Convert.ToString(pos));
+        switch (t) {
+            case 16: return JsonValue.NewInt(S32LE());  // int32
+            case 18: return JsonValue.NewInt(U64LE());  // int64
+            case 2: return JsonValue.NewStr(ReadString());  // string
+            case 1: return JsonValue.NewDouble(BitsDouble(U64LE()));  // double
+            case 3: return ReadDocument(depth + 1, false);  // document
+            case 4: return ReadDocument(depth + 1, true);  // array
+            case 8: {  // bool
+                int bv = U8();
+                if (bv != 0 && bv != 1) {
+                    throw new BsonException("boolean value must be 0x00 or 0x01,"
+                        + " got 0x" + HexByte(bv) + " at byte "
+                        + Convert.ToString(pos - 1));
                 }
-                return JsonValue.NewStr(DecodedText(Take(n - 4)));
+                return JsonValue.NewBool(bv != 0);
             }
-            return JsonValue.NewStr(DecodedText(Take(n)));
-        }
-        if (t == 7) { return JsonValue.NewStr(HexOf(Take(12))); }  // ObjectId
-        if (t == 8) {  // bool
-            int bv = U8();
-            if (bv != 0 && bv != 1) {
-                throw new BsonException("boolean value must be 0x00 or 0x01,"
-                    + " got 0x" + HexByte(bv) + " at byte "
-                    + Convert.ToString(pos - 1));
+            case 10: return JsonValue.NewNull();  // null
+            case 9: return JsonValue.NewStr(IsoFromMs(U64LE()));  // datetime
+            case 7: {  // ObjectId（零临时 byte[12] 切片直转 24 字节 hex）
+                if (12 > len - pos) {
+                    throw new BsonException("truncated at byte " + Convert.ToString(pos) + " (need 12)");
+                }
+                int st = pos;
+                pos = pos + 12;
+                byte[] hex = new byte[24];
+                int di = 0;
+                for (int i = 0; i < 12; i = i + 1) {
+                    int v = buf[st + i] & 255;
+                    int h = (v >> 4) & 15;
+                    int l = v & 15;
+                    hex[di]     = (byte)(h < 10 ? h + 48 : h + 87);
+                    hex[di + 1] = (byte)(l < 10 ? l + 48 : l + 87);
+                    di = di + 2;
+                }
+                return JsonValue.NewStr(hex.ToStr(0, 24));
             }
-            return JsonValue.NewBool(bv != 0);
+            case 5: {  // binary
+                int n = S32LE();
+                if (n < 0 || n > 536870912) {
+                    throw new BsonException("binary length out of bounds at byte " + Convert.ToString(pos));
+                }
+                int subtype = U8();
+                if (subtype == 2) {
+                    if (n < 4 || S32LE() != n - 4) {
+                        throw new BsonException("binary subtype 0x02 embedded"
+                            + " length mismatch at byte " + Convert.ToString(pos));
+                    }
+                    return JsonValue.NewStr(DecodedText(Take(n - 4)));
+                }
+                return JsonValue.NewStr(DecodedText(Take(n)));
+            }
+            default:
+                throw new BsonException("unsupported type 0x"
+                    + HexByte(t) + " at byte " + Convert.ToString(pos - 1));
         }
-        if (t == 9) { return JsonValue.NewStr(IsoFromMs(U64LE())); }  // datetime
-        if (t == 10) { return JsonValue.NewNull(); }  // null
-        if (t == 16) { return JsonValue.NewInt(S32LE()); }  // int32
-        if (t == 18) { return JsonValue.NewInt(U64LE()); }  // int64
-        throw new BsonException("unsupported type 0x"
-            + HexByte(t) + " at byte " + Convert.ToString(pos - 1));
     }
 
     // string 值主体：int32 字节数（含终止 NUL）+ 字节 + NUL，
-    // 末字节必须为 0。直接从 buf 切片解码，消除中间 byte[] 堆分配。
+    // 末字节必须为 0。直接从 buf 切片解码，零中间 byte[] 拷贝。
     public string ReadString() {
         int n = S32LE();
         if (n < 1) {
@@ -227,9 +367,11 @@ public class BsonReader {
             throw new BsonException("string missing NUL terminator at byte "
                 + Convert.ToString(pos + n));
         }
-        string s = buf.ToStr(pos, n - 1);
+        int slen = n - 1;
+        int st = pos;
         pos = pos + n;
-        return s;
+        if (slen == 0) { return ""; }
+        return buf.ToStr(st, slen);
     }
 
     // 12 字节 ObjectId → 24 位小写十六进制。
