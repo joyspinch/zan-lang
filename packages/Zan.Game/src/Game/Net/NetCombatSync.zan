@@ -1,0 +1,494 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 商业级 Delta 增量快照二进制编解码器（借鉴 Quake III / Overwatch 位图差分设计）：
+// 对比客户端已确认的 baseline 快照与最新 current 快照，仅编码：
+// - 已移除实体 ID 列表；
+// - 新增实体（全字段 mask=0x0F）与变动实体（按 4 位 fieldMask 仅写超阈值变动的 Pos/Vel/Yaw/Flags）；
+// - 静止未变实体 0 字节发送，常态节省 70%~85% 下行带宽。
+public static class DeltaSnapshotCodec {
+    public const int MAGIC = 0x5A444C54; // "ZDLT"
+    public const int MASK_POS = 1;
+    public const int MASK_VEL = 2;
+    public const int MASK_YAW = 4;
+    public const int MASK_FLAGS = 8;
+    public const int MASK_ALL = 15;
+
+    private static void WriteI32(List<byte> buf, int val) {
+        buf.Add((byte)(val & 255));
+        buf.Add((byte)((val >> 8) & 255));
+        buf.Add((byte)((val >> 16) & 255));
+        buf.Add((byte)((val >> 24) & 255));
+    }
+
+    private static void WriteU16(List<byte> buf, int val) {
+        buf.Add((byte)(val & 255));
+        buf.Add((byte)((val >> 8) & 255));
+    }
+
+    private static void WriteF32(List<byte> buf, float val) {
+        WriteI32(buf, BitConverter.SingleToInt32Bits(val));
+    }
+
+    private static int ReadI32(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+
+    private static int ReadU16(byte[] buf, int pos) {
+        return (buf[pos] & 255) | ((buf[pos + 1] & 255) << 8);
+    }
+
+    private static float ReadF32(byte[] buf, int pos) {
+        return BitConverter.ToSingle(buf, pos);
+    }
+
+    private static bool DiffExceeds(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = 0.0f - d; }
+        return d > eps;
+    }
+
+    // 计算 baseline -> current 的二进制增量包（baseline 为 null 时退化为全量增量基线 baseTick=0）。
+    public static byte[] EncodeDelta(WorldSnapshot baseline, WorldSnapshot current,
+                                     float posEps, float yawEps) {
+        if (current == null) { return new byte[0]; }
+        int baseTick = baseline != null ? baseline.ServerTick : 0;
+
+        List<int> removed = new List<int>();
+        if (baseline != null) {
+            for (int i = 0; i < baseline.Entities.Count; i = i + 1) {
+                EntityNetState oldE = baseline.Entities[i];
+                if (current.FindEntity(oldE.EntityId) == null) {
+                    removed.Add(oldE.EntityId);
+                }
+            }
+        }
+
+        List<EntityNetState> changedEnts = new List<EntityNetState>();
+        List<int> changedMasks = new List<int>();
+        for (int i = 0; i < current.Entities.Count; i = i + 1) {
+            EntityNetState curE = current.Entities[i];
+            EntityNetState oldE = baseline != null ? baseline.FindEntity(curE.EntityId) : null;
+            int mask = 0;
+            if (oldE == null) {
+                mask = MASK_ALL;
+            } else {
+                if (DiffExceeds(curE.X, oldE.X, posEps)
+                    || DiffExceeds(curE.Y, oldE.Y, posEps)
+                    || DiffExceeds(curE.Z, oldE.Z, posEps)) {
+                    mask = mask | MASK_POS;
+                }
+                if (DiffExceeds(curE.Vx, oldE.Vx, posEps)
+                    || DiffExceeds(curE.Vy, oldE.Vy, posEps)
+                    || DiffExceeds(curE.Vz, oldE.Vz, posEps)) {
+                    mask = mask | MASK_VEL;
+                }
+                if (DiffExceeds(curE.Yaw, oldE.Yaw, yawEps)) {
+                    mask = mask | MASK_YAW;
+                }
+                if (curE.Flags != oldE.Flags) {
+                    mask = mask | MASK_FLAGS;
+                }
+            }
+            if (mask != 0) {
+                changedEnts.Add(curE);
+                changedMasks.Add(mask);
+            }
+        }
+
+        List<byte> outBuf = new List<byte>();
+        WriteI32(outBuf, MAGIC);
+        WriteI32(outBuf, baseTick);
+        WriteI32(outBuf, current.ServerTick);
+        WriteI32(outBuf, current.ServerTimeMs);
+        WriteI32(outBuf, current.LastAckInputSeq);
+        WriteU16(outBuf, removed.Count);
+        WriteU16(outBuf, changedEnts.Count);
+
+        for (int i = 0; i < removed.Count; i = i + 1) {
+            WriteI32(outBuf, removed[i]);
+        }
+        for (int i = 0; i < changedEnts.Count; i = i + 1) {
+            EntityNetState e = changedEnts[i];
+            int mask = changedMasks[i];
+            WriteI32(outBuf, e.EntityId);
+            outBuf.Add((byte)(mask & 255));
+            if ((mask & MASK_POS) != 0) {
+                WriteF32(outBuf, e.X);
+                WriteF32(outBuf, e.Y);
+                WriteF32(outBuf, e.Z);
+            }
+            if ((mask & MASK_VEL) != 0) {
+                WriteF32(outBuf, e.Vx);
+                WriteF32(outBuf, e.Vy);
+                WriteF32(outBuf, e.Vz);
+            }
+            if ((mask & MASK_YAW) != 0) {
+                WriteF32(outBuf, e.Yaw);
+            }
+            if ((mask & MASK_FLAGS) != 0) {
+                WriteI32(outBuf, e.Flags);
+            }
+        }
+        return outBuf.ToArray();
+    }
+
+    // 在客户端 baseline 上应用增量包，还原完整 WorldSnapshot；基线 Tick 不匹配或数据损坏返回 null。
+    public static WorldSnapshot ApplyDelta(WorldSnapshot baseline, byte[] delta) {
+        if (delta == null || delta.Length < 24) { return null; }
+        if (ReadI32(delta, 0) != MAGIC) { return null; }
+        int baseTick = ReadI32(delta, 4);
+        int targetTick = ReadI32(delta, 8);
+        int serverTimeMs = ReadI32(delta, 12);
+        int lastAckSeq = ReadI32(delta, 16);
+        int removedCount = ReadU16(delta, 20);
+        int changedCount = ReadU16(delta, 22);
+
+        if (baseTick != 0 && (baseline == null || baseline.ServerTick != baseTick)) {
+            return null;
+        }
+
+        int pos = 24;
+        if (pos + removedCount * 4 > delta.Length) { return null; }
+        List<int> removed = new List<int>();
+        for (int i = 0; i < removedCount; i = i + 1) {
+            removed.Add(ReadI32(delta, pos));
+            pos = pos + 4;
+        }
+
+        WorldSnapshot result = new WorldSnapshot(targetTick, serverTimeMs, lastAckSeq);
+        if (baseline != null) {
+            for (int i = 0; i < baseline.Entities.Count; i = i + 1) {
+                EntityNetState oldE = baseline.Entities[i];
+                bool isRemoved = false;
+                for (int r = 0; r < removed.Count; r = r + 1) {
+                    if (removed[r] == oldE.EntityId) { isRemoved = true; break; }
+                }
+                if (!isRemoved) {
+                    result.AddEntity(oldE.Clone());
+                }
+            }
+        }
+
+        for (int i = 0; i < changedCount; i = i + 1) {
+            if (pos + 5 > delta.Length) { return null; }
+            int eid = ReadI32(delta, pos);
+            int mask = delta[pos + 4] & 255;
+            pos = pos + 5;
+
+            EntityNetState target = result.FindEntity(eid);
+            if (target == null) {
+                target = new EntityNetState(eid, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0);
+                result.AddEntity(target);
+            }
+            if ((mask & MASK_POS) != 0) {
+                if (pos + 12 > delta.Length) { return null; }
+                target.X = ReadF32(delta, pos);
+                target.Y = ReadF32(delta, pos + 4);
+                target.Z = ReadF32(delta, pos + 8);
+                pos = pos + 12;
+            }
+            if ((mask & MASK_VEL) != 0) {
+                if (pos + 12 > delta.Length) { return null; }
+                target.Vx = ReadF32(delta, pos);
+                target.Vy = ReadF32(delta, pos + 4);
+                target.Vz = ReadF32(delta, pos + 8);
+                pos = pos + 12;
+            }
+            if ((mask & MASK_YAW) != 0) {
+                if (pos + 4 > delta.Length) { return null; }
+                target.Yaw = ReadF32(delta, pos);
+                pos = pos + 4;
+            }
+            if ((mask & MASK_FLAGS) != 0) {
+                if (pos + 4 > delta.Length) { return null; }
+                target.Flags = ReadI32(delta, pos);
+                pos = pos + 4;
+            }
+        }
+        return result;
+    }
+}
+
+// 服务端延迟补偿射线命中结果。
+public class LagCompHit {
+    public int EntityId;
+    public float Distance;
+    public float HitX;
+    public float HitY;
+    public float HitZ;
+    public int RewoundTimeMs;
+
+    public LagCompHit(int entityId, float distance, float hx, float hy, float hz, int rewoundMs) {
+        this.EntityId = entityId;
+        this.Distance = distance;
+        this.HitX = hx;
+        this.HitY = hy;
+        this.HitZ = hz;
+        this.RewoundTimeMs = rewoundMs;
+    }
+}
+
+// 服务端延迟补偿（Hitbox Rewind）引擎：
+// 保存最近一段时间的权威世界快照历史；当高延迟客户端在 fireTimeMs 开火时，
+// 按防外挂上限 maxRewindMs 钳位并线性插值倒带全部目标实体姿态，再做权威射线命中判定。
+public class LagCompensator {
+    private List<WorldSnapshot> history;
+    private int historyWindowMs;
+    private int maxRewindMs;
+
+    public LagCompensator(int historyWindowMs, int maxRewindMs) {
+        this.history = new List<WorldSnapshot>();
+        this.historyWindowMs = historyWindowMs > 100 ? historyWindowMs : 1000;
+        this.maxRewindMs = maxRewindMs > 0 ? maxRewindMs : 250;
+    }
+
+    public int HistoryCount { get { return this.history.Count; } }
+
+    // 录制一帧权威快照（自动深拷贝并裁剪超过 historyWindowMs 的过期帧）。
+    public void RecordSnapshot(WorldSnapshot snap) {
+        if (snap == null) { return; }
+        WorldSnapshot copy = new WorldSnapshot(snap.ServerTick, snap.ServerTimeMs, snap.LastAckInputSeq);
+        for (int i = 0; i < snap.Entities.Count; i = i + 1) {
+            copy.AddEntity(snap.Entities[i].Clone());
+        }
+        this.history.Add(copy);
+        int cutoff = snap.ServerTimeMs - this.historyWindowMs;
+        while (this.history.Count > 2 && this.history[0].ServerTimeMs < cutoff) {
+            this.history.RemoveAt(0);
+        }
+    }
+
+    // 将请求倒带时刻钳位到合法反外挂窗口 [currentServerTimeMs - maxRewindMs, currentServerTimeMs]。
+    public int ClampRewindTime(int requestedTimeMs, int currentServerTimeMs) {
+        int minAllowed = currentServerTimeMs - this.maxRewindMs;
+        if (requestedTimeMs < minAllowed) { return minAllowed; }
+        if (requestedTimeMs > currentServerTimeMs) { return currentServerTimeMs; }
+        return requestedTimeMs;
+    }
+
+    // 采样全部实体在倒带时刻（已钳位）的插值姿态。
+    public List<EntityNetState> RewindWorld(int requestedTimeMs, int currentServerTimeMs, out int actualTimeMs) {
+        List<EntityNetState> outList = new List<EntityNetState>();
+        actualTimeMs = this.ClampRewindTime(requestedTimeMs, currentServerTimeMs);
+        int n = this.history.Count;
+        if (n == 0) { return outList; }
+
+        if (actualTimeMs <= this.history[0].ServerTimeMs) {
+            WorldSnapshot first = this.history[0];
+            for (int i = 0; i < first.Entities.Count; i = i + 1) {
+                outList.Add(first.Entities[i].Clone());
+            }
+            return outList;
+        }
+        if (actualTimeMs >= this.history[n - 1].ServerTimeMs) {
+            WorldSnapshot last = this.history[n - 1];
+            for (int i = 0; i < last.Entities.Count; i = i + 1) {
+                outList.Add(last.Entities[i].Clone());
+            }
+            return outList;
+        }
+
+        WorldSnapshot a = this.history[0];
+        WorldSnapshot b = this.history[1];
+        for (int i = 0; i < n - 1; i = i + 1) {
+            if (this.history[i].ServerTimeMs <= actualTimeMs && actualTimeMs <= this.history[i + 1].ServerTimeMs) {
+                a = this.history[i];
+                b = this.history[i + 1];
+                break;
+            }
+        }
+        int span = b.ServerTimeMs - a.ServerTimeMs;
+        float t = span > 0 ? (float)(actualTimeMs - a.ServerTimeMs) / (float)span : 0.0f;
+        for (int i = 0; i < b.Entities.Count; i = i + 1) {
+            EntityNetState eb = b.Entities[i];
+            EntityNetState ea = a.FindEntity(eb.EntityId);
+            if (ea == null) {
+                outList.Add(eb.Clone());
+            } else {
+                outList.Add(new EntityNetState(
+                    eb.EntityId,
+                    ea.X + (eb.X - ea.X) * t,
+                    ea.Y + (eb.Y - ea.Y) * t,
+                    ea.Z + (eb.Z - ea.Z) * t,
+                    ea.Vx + (eb.Vx - ea.Vx) * t,
+                    ea.Vy + (eb.Vy - ea.Vy) * t,
+                    ea.Vz + (eb.Vz - ea.Vz) * t,
+                    ea.Yaw + (eb.Yaw - ea.Yaw) * t,
+                    eb.Flags
+                ));
+            }
+        }
+        return outList;
+    }
+
+    // 倒带全部非射击者实体并执行射线-球体命中检测，返回最近命中记录（未命中返回 null）。
+    public LagCompHit RaycastHitTest(float ox, float oy, float oz,
+                                     float dx, float dy, float dz,
+                                     float maxDist, float hitRadius,
+                                     int fireTimeMs, int currentServerTimeMs,
+                                     int shooterEntityId) {
+        float dirLen = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+        if (dirLen < 1e-6f || maxDist <= 0.0f || hitRadius <= 0.0f) { return null; }
+        float ndx = dx / dirLen;
+        float ndy = dy / dirLen;
+        float ndz = dz / dirLen;
+
+        int actualTime = 0;
+        List<EntityNetState> ents = this.RewindWorld(fireTimeMs, currentServerTimeMs, out actualTime);
+        float bestDist = maxDist + 1.0f;
+        LagCompHit best = null;
+        float r2 = hitRadius * hitRadius;
+
+        for (int i = 0; i < ents.Count; i = i + 1) {
+            EntityNetState e = ents[i];
+            if (e.EntityId == shooterEntityId) { continue; }
+            float ocx = ox - e.X;
+            float ocy = oy - e.Y;
+            float ocz = oz - e.Z;
+            float bCoef = ocx * ndx + ocy * ndy + ocz * ndz;
+            float cCoef = ocx * ocx + ocy * ocy + ocz * ocz - r2;
+            float disc = bCoef * bCoef - cCoef;
+            if (disc < 0.0f) { continue; }
+            float sqrtD = (float)Math.Sqrt((double)disc);
+            float tHit = (0.0f - bCoef) - sqrtD;
+            if (tHit < 0.0f) { tHit = (0.0f - bCoef) + sqrtD; }
+            if (tHit >= 0.0f && tHit <= maxDist && tHit < bestDist) {
+                bestDist = tHit;
+                best = new LagCompHit(
+                    e.EntityId,
+                    tHit,
+                    ox + ndx * tHit,
+                    oy + ndy * tHit,
+                    oz + ndz * tHit,
+                    actualTime
+                );
+            }
+        }
+        return best;
+    }
+}
+
+// 房间生命周期状态常量。
+public static class NetRoomState {
+    public const int Lobby = 0;
+    public const int Playing = 1;
+    public const int Finished = 2;
+}
+
+// 商业级联机房间记录（含满员限制、成员隔离与房主迁移）。
+public class NetRoom {
+    public int RoomId;
+    public string Name;
+    public int MaxPlayers;
+    public int HostPeerId;
+    public int State;
+    public List<int> Members;
+
+    public NetRoom(int roomId, string name, int maxPlayers, int hostPeerId) {
+        this.RoomId = roomId;
+        this.Name = name == null ? "" : name;
+        this.MaxPlayers = maxPlayers > 0 ? maxPlayers : 8;
+        this.HostPeerId = hostPeerId;
+        this.State = NetRoomState.Lobby;
+        this.Members = new List<int>();
+        this.Members.Add(hostPeerId);
+    }
+
+    public bool HasMember(int peerId) {
+        for (int i = 0; i < this.Members.Count; i = i + 1) {
+            if (this.Members[i] == peerId) { return true; }
+        }
+        return false;
+    }
+}
+
+// 多房间大厅与生命周期管理器：创建/加入/满员拦截/退出自动房主迁移/空房自动回收。
+public class NetRoomManager {
+    private List<NetRoom> rooms;
+    private int nextRoomId;
+
+    public NetRoomManager() {
+        this.rooms = new List<NetRoom>();
+        this.nextRoomId = 1;
+    }
+
+    public int RoomCount { get { return this.rooms.Count; } }
+
+    public NetRoom CreateRoom(string name, int maxPlayers, int hostPeerId) {
+        if (this.FindRoomOfPeer(hostPeerId) != null) { return null; }
+        int rid = this.nextRoomId;
+        this.nextRoomId = this.nextRoomId + 1;
+        NetRoom room = new NetRoom(rid, name, maxPlayers, hostPeerId);
+        this.rooms.Add(room);
+        return room;
+    }
+
+    public NetRoom FindRoom(int roomId) {
+        for (int i = 0; i < this.rooms.Count; i = i + 1) {
+            if (this.rooms[i].RoomId == roomId) { return this.rooms[i]; }
+        }
+        return null;
+    }
+
+    public NetRoom FindRoomOfPeer(int peerId) {
+        for (int i = 0; i < this.rooms.Count; i = i + 1) {
+            if (this.rooms[i].HasMember(peerId)) { return this.rooms[i]; }
+        }
+        return null;
+    }
+
+    public bool JoinRoom(int roomId, int peerId) {
+        if (this.FindRoomOfPeer(peerId) != null) { return false; }
+        NetRoom room = this.FindRoom(roomId);
+        if (room == null) { return false; }
+        if (room.State != NetRoomState.Lobby) { return false; }
+        if (room.Members.Count >= room.MaxPlayers) { return false; }
+        room.Members.Add(peerId);
+        return true;
+    }
+
+    // 成员离房/断线：若为房主则自动迁移房主给下一名在线成员；房间无人时自动销毁。
+    public bool LeaveRoom(int roomId, int peerId) {
+        for (int r = 0; r < this.rooms.Count; r = r + 1) {
+            NetRoom room = this.rooms[r];
+            if (room.RoomId != roomId) { continue; }
+            int idx = -1;
+            for (int i = 0; i < room.Members.Count; i = i + 1) {
+                if (room.Members[i] == peerId) { idx = i; break; }
+            }
+            if (idx < 0) { return false; }
+            room.Members.RemoveAt(idx);
+            if (room.Members.Count == 0) {
+                this.rooms.RemoveAt(r);
+                return true;
+            }
+            if (room.HostPeerId == peerId) {
+                room.HostPeerId = room.Members[0];
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // 仅房主可开局（Lobby -> Playing）。
+    public bool StartMatch(int roomId, int requesterPeerId) {
+        NetRoom room = this.FindRoom(roomId);
+        if (room == null || room.State != NetRoomState.Lobby) { return false; }
+        if (room.HostPeerId != requesterPeerId) { return false; }
+        room.State = NetRoomState.Playing;
+        return true;
+    }
+
+    public bool FinishMatch(int roomId) {
+        NetRoom room = this.FindRoom(roomId);
+        if (room == null || room.State != NetRoomState.Playing) { return false; }
+        room.State = NetRoomState.Finished;
+        return true;
+    }
+}

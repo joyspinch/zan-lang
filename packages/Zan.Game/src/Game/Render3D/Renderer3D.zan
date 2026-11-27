@@ -40,6 +40,13 @@ public class Renderer3D {
     public float ShadowDistance;
     // 可选显式光源 ViewProjection 矩阵（非 null 时优先使用，否则由 plan.Lights 主方向光自动构建）。
     public Mat4 ShadowLightVp;
+    // GPU 线性大气距离雾参数（EnableFog=false 时零开销）。
+    public bool EnableFog;
+    public float FogRed;
+    public float FogGreen;
+    public float FogBlue;
+    public float FogStart;
+    public float FogEnd;
 
     public Renderer3D(int capacity) {
         this.batch = MeshBatch.Create(capacity);
@@ -60,6 +67,12 @@ public class Renderer3D {
         this.ShadowFocus = Vector3.Zero;
         this.ShadowDistance = 20.0f;
         this.ShadowLightVp = null;
+        this.EnableFog = false;
+        this.FogRed = 0.6f;
+        this.FogGreen = 0.7f;
+        this.FogBlue = 0.85f;
+        this.FogStart = 10.0f;
+        this.FogEnd = 80.0f;
     }
 
     private static Mat4 BuildOrthoGl(float left, float right, float bottom, float top,
@@ -158,6 +171,43 @@ public class Renderer3D {
         canvas.SetLights3D(d, c, this.lightAmbient);
     }
 
+    private int ApplyPointLights(Canvas canvas, RenderPlan plan) {
+        int pCount = 0;
+        if (plan.Lights != null) {
+            for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+                Light lt = plan.Lights[i];
+                if (lt != null && lt.Enabled && lt.Kind == LightKind.Point) {
+                    pCount = pCount + 1;
+                    if (pCount == 4) { break; }
+                }
+            }
+        }
+        if (pCount == 0) {
+            canvas.SetPointLights3D(null, null);
+            return 0;
+        }
+        float[] posRange = new float[pCount * 4];
+        float[] cols = new float[pCount * 3];
+        int idx = 0;
+        for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+            Light lt = plan.Lights[i];
+            if (lt != null && lt.Enabled && lt.Kind == LightKind.Point) {
+                posRange[idx * 4 + 0] = lt.Position.X;
+                posRange[idx * 4 + 1] = lt.Position.Y;
+                posRange[idx * 4 + 2] = lt.Position.Z;
+                posRange[idx * 4 + 3] = lt.Range > 0.0f ? lt.Range : 1000.0f;
+                float energy = lt.Intensity;
+                cols[idx * 3 + 0] = lt.Red * energy;
+                cols[idx * 3 + 1] = lt.Green * energy;
+                cols[idx * 3 + 2] = lt.Blue * energy;
+                idx = idx + 1;
+                if (idx == pCount) { break; }
+            }
+        }
+        canvas.SetPointLights3D(posRange, cols);
+        return pCount;
+    }
+
     // 提交一帧。
     public int Draw(Canvas canvas, RenderPlan plan) {
         if (this.batch == null || canvas == null || plan == null
@@ -166,16 +216,24 @@ public class Renderer3D {
         }
         int n = plan.Count();
         if (n <= 0) { return 0; }
+        int pointLightCount = 0;
         if (!this.UseCpuLighting) {
             this.ApplyLights(canvas, plan);
+            pointLightCount = this.ApplyPointLights(canvas, plan);
         }
 
-        // 检查本帧是否需要高级多 Pass（阴影 / GPU 蒙皮 / 透明混合层）
-        bool needMultiPass = this.EnableShadows;
+        // 检查本帧是否需要高级多 Pass（阴影 / 蒙皮 / 透明层 / 点光源 / 距离雾 / PBR 高光或自发光）
+        bool needMultiPass = this.EnableShadows || this.EnableFog || pointLightCount > 0;
         if (!needMultiPass) {
             for (int i = 0; i < n; i = i + 1) {
                 RenderItem it = plan.ItemAt(i);
-                if (it != null && (it.IsSkinned || it.Layer == 1)) {
+                if (it == null) { continue; }
+                bool hasPbrOrEmissive = it.Metallic > 0.01f
+                    || it.Roughness < 0.79f
+                    || it.EmissiveRed > 0.001f
+                    || it.EmissiveGreen > 0.001f
+                    || it.EmissiveBlue > 0.001f;
+                if (it.IsSkinned || it.Layer == 1 || hasPbrOrEmissive) {
                     needMultiPass = true;
                     break;
                 }
@@ -194,6 +252,10 @@ public class Renderer3D {
             }
             return this.batch.Draw(canvas);
         }
+
+        canvas.SetCamera3D(plan.Camera.Position.X, plan.Camera.Position.Y, plan.Camera.Position.Z);
+        canvas.SetFog3D(this.EnableFog, this.FogRed, this.FogGreen, this.FogBlue,
+                        this.FogStart, this.FogEnd);
 
         // Pass 1：方向光 ShadowMap 投射（同时支持静态与 GPU 蒙皮网格）
         bool shadowActive = false;
@@ -218,24 +280,29 @@ public class Renderer3D {
         // 开启跨 Pass 共享 24-bit 深度缓冲帧
         if (canvas.BeginFrame3D() == 0) {
             if (shadowActive) { canvas.ShadowClear(); }
+            canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+            canvas.SetFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+            canvas.SetPointLights3D(null, null);
             return 0;
         }
 
         int drawn = 0;
-        // Pass 2：不透明层（Layer == 0，先静态后/混合蒙皮，共享深度并接收阴影）
+        // Pass 2：不透明层（Layer == 0，静态与蒙皮共享深度，接收阴影/PBR高光/点光源/自发光/距离雾）
         canvas.SetBlend3D(false, true);
         for (int i = 0; i < n; i = i + 1) {
             RenderItem it = plan.ItemAt(i);
             if (it == null || it.MeshKey <= 0 || it.Layer != 0) { continue; }
             RenderTransform.MulInto(this.scratch, vp, it.Model);
             int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-            Mat4 modelForShadow = (shadowActive && it.ReceiveShadow) ? it.Model : null;
+            canvas.SetMaterial3D(it.Metallic, it.Roughness,
+                                 it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
+            Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
             int ok;
             if (it.IsSkinned) {
                 if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
-                ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelMat, tint, it.TextureKey);
             } else {
-                ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelMat, tint, it.TextureKey);
             }
             if (ok == 1) { drawn = drawn + 1; }
         }
@@ -251,13 +318,15 @@ public class Renderer3D {
                 }
                 RenderTransform.MulInto(this.scratch, vp, it.Model);
                 int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-                Mat4 modelForShadow = (shadowActive && it.ReceiveShadow) ? it.Model : null;
+                canvas.SetMaterial3D(it.Metallic, it.Roughness,
+                                     it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
+                Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
                 int ok;
                 if (it.IsSkinned) {
                     if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
-                    ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                    ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelMat, tint, it.TextureKey);
                 } else {
-                    ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                    ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelMat, tint, it.TextureKey);
                 }
                 if (ok == 1) { drawn = drawn + 1; }
             }
@@ -267,6 +336,9 @@ public class Renderer3D {
         }
         canvas.EndFrame3D();
         if (shadowActive) { canvas.ShadowClear(); }
+        canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        canvas.SetFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        canvas.SetPointLights3D(null, null);
         return drawn > 0 ? 1 : 0;
     }
 

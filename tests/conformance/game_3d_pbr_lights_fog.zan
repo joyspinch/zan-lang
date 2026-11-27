@@ -1,0 +1,209 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DPbrLightsFogTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int R(int argb) { return (argb >> 16) & 255; }
+    private static int G(int argb) { return (argb >> 8) & 255; }
+    private static int B(int argb) { return argb & 255; }
+    private static int Lum(int argb) { return (R(argb) + G(argb) + B(argb)) / 3; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int quadMesh = cv.MeshUpload(MakeQuad(1.0f, 1.0f));
+
+        Camera3D cam = new Camera3D();
+        cam.Orthographic = true;
+        cam.OrthoHeight = 3.0f;
+        cam.AspectRatio = 1.0f;
+        cam.Position = new Vector3(0.0f, 0.0f, 5.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.NearPlane = 0.1f;
+        cam.FarPlane = 30.0f;
+
+        Renderer3D renderer = new Renderer3D(32);
+
+        // 1. GPU 自发光验证：全黑零光环境下，自发光青板高亮，普通白板全黑
+        SceneNode scene1 = new SceneNode("s1");
+        SceneNode emNode = new SceneNode("em");
+        emNode.MeshKey = quadMesh;
+        emNode.Material = Material.Emissive(0.0f, 0.9f, 0.9f);
+        emNode.SetPosition(-1.5f, 0.0f, 0.0f);
+        scene1.AddChild(emNode);
+
+        SceneNode darkNode = new SceneNode("dark");
+        darkNode.MeshKey = quadMesh;
+        darkNode.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        darkNode.SetPosition(1.5f, 0.0f, 0.0f);
+        scene1.AddChild(darkNode);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        plan1.AmbientRed = 0.0f;
+        plan1.AmbientGreen = 0.0f;
+        plan1.AmbientBlue = 0.0f;
+        plan1.Build(scene1);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan1);
+        int pxEm = zan_gui_read_pixel(cv.SurfaceId(), 32, 64);
+        int pxDk = zan_gui_read_pixel(cv.SurfaceId(), 96, 64);
+        bool emissiveOk = G(pxEm) > 180 && B(pxEm) > 180 && Lum(pxDk) < 10;
+        Console.WriteLine("gpu-emissive: " + Convert.ToString(emissiveOk ? 1 : 0));
+
+        // 2. GPU 动态点光源距离衰减验证：左侧白板在点光范围内被红光照亮，右侧白板超出射程全黑
+        SceneNode scene2 = new SceneNode("s2");
+        SceneNode nearPt = new SceneNode("near_pt");
+        nearPt.MeshKey = quadMesh;
+        nearPt.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        nearPt.SetPosition(-1.5f, 0.0f, 0.0f);
+        scene2.AddChild(nearPt);
+
+        SceneNode farPt = new SceneNode("far_pt");
+        farPt.MeshKey = quadMesh;
+        farPt.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        farPt.SetPosition(1.5f, 0.0f, 0.0f);
+        scene2.AddChild(farPt);
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        plan2.AmbientRed = 0.0f;
+        plan2.AmbientGreen = 0.0f;
+        plan2.AmbientBlue = 0.0f;
+        plan2.Lights.Add(Light.PointLight(1.0f, 0.0f, 0.0f, 1.5f, new Vector3(-1.5f, 0.0f, 1.0f), 2.5f));
+        plan2.Build(scene2);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan2);
+        int pxNearPt = zan_gui_read_pixel(cv.SurfaceId(), 32, 64);
+        int pxFarPt = zan_gui_read_pixel(cv.SurfaceId(), 96, 64);
+        bool pointOk = R(pxNearPt) > 110 && G(pxNearPt) < 10 && R(pxFarPt) < 10;
+        Console.WriteLine("gpu-point-light-falloff: " + Convert.ToString(pointOk ? 1 : 0));
+
+        // 3. GPU PBR 镜面高光验证：同位置同视角同光线下，光滑高光材质中心亮度显著高于全粗糙哑光材质
+        SceneNode scene3g = new SceneNode("s3g");
+        SceneNode glossy = new SceneNode("glossy");
+        glossy.MeshKey = quadMesh;
+        Material gMat = Material.Solid(0.3f, 0.3f, 0.3f);
+        gMat.Metallic = 0.2f;
+        gMat.Roughness = 0.15f;
+        glossy.Material = gMat;
+        glossy.SetPosition(0.0f, 0.0f, 0.0f);
+        scene3g.AddChild(glossy);
+
+        RenderPlan plan3g = new RenderPlan(cam);
+        plan3g.AmbientRed = 0.1f;
+        plan3g.AmbientGreen = 0.1f;
+        plan3g.AmbientBlue = 0.1f;
+        plan3g.Lights.Add(Light.DirectionalLight(0.9f, 0.9f, 0.9f, 1.0f, new Vector3(0.0f, 0.0f, -1.0f)));
+        plan3g.Build(scene3g);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan3g);
+        int lumGlossy = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        SceneNode scene3m = new SceneNode("s3m");
+        SceneNode matte = new SceneNode("matte");
+        matte.MeshKey = quadMesh;
+        Material mMat = Material.Solid(0.3f, 0.3f, 0.3f);
+        mMat.Metallic = 0.0f;
+        mMat.Roughness = 1.0f;
+        matte.Material = mMat;
+        matte.SetPosition(0.0f, 0.0f, 0.0f);
+        scene3m.AddChild(matte);
+
+        RenderPlan plan3m = new RenderPlan(cam);
+        plan3m.AmbientRed = 0.1f;
+        plan3m.AmbientGreen = 0.1f;
+        plan3m.AmbientBlue = 0.1f;
+        plan3m.Lights.Add(Light.DirectionalLight(0.9f, 0.9f, 0.9f, 1.0f, new Vector3(0.0f, 0.0f, -1.0f)));
+        plan3m.Build(scene3m);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan3m);
+        int lumMatte = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+        bool specOk = lumGlossy > lumMatte + 55;
+        Console.WriteLine("gpu-pbr-specular: " + Convert.ToString(specOk ? 1 : 0));
+
+        // 4. GPU 线性大气距离雾验证：近处红板保持红色，远处红板被蓝色雾完全吞没
+        SceneNode scene4 = new SceneNode("s4");
+        SceneNode nearFog = new SceneNode("near_fog");
+        nearFog.MeshKey = quadMesh;
+        nearFog.Material = Material.Solid(0.9f, 0.1f, 0.1f);
+        nearFog.SetPosition(-1.5f, 0.0f, 2.0f); // 距相机 z=5 约 3.35 (< FogStart=4)
+        scene4.AddChild(nearFog);
+
+        SceneNode farFog = new SceneNode("far_fog");
+        farFog.MeshKey = quadMesh;
+        farFog.Material = Material.Solid(0.9f, 0.1f, 0.1f);
+        farFog.SetPosition(1.5f, 0.0f, -8.0f); // 距相机 z=5 约 13.1 (> FogEnd=10)
+        scene4.AddChild(farFog);
+
+        RenderPlan plan4 = new RenderPlan(cam);
+        plan4.AmbientRed = 0.8f;
+        plan4.AmbientGreen = 0.8f;
+        plan4.AmbientBlue = 0.8f;
+        plan4.Build(scene4);
+        renderer.EnableFog = true;
+        renderer.FogRed = 0.05f;
+        renderer.FogGreen = 0.15f;
+        renderer.FogBlue = 0.95f;
+        renderer.FogStart = 4.0f;
+        renderer.FogEnd = 10.0f;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan4);
+        renderer.EnableFog = false;
+        int pxNearFog = zan_gui_read_pixel(cv.SurfaceId(), 32, 64);
+        int pxFarFog = zan_gui_read_pixel(cv.SurfaceId(), 96, 64);
+        bool fogOk = R(pxNearFog) > B(pxNearFog) + 100 && B(pxFarFog) > R(pxFarFog) + 150;
+        Console.WriteLine("gpu-distance-fog: " + Convert.ToString(fogOk ? 1 : 0));
+
+        // 5. 世界空间法线变换验证：局部法线均为 +Z，经绕 Y 轴 +60° 转向 +X 迎光后比未旋转板显著更亮
+        SceneNode scene5 = new SceneNode("s5");
+        SceneNode facingLight = new SceneNode("rot_pos");
+        facingLight.MeshKey = quadMesh;
+        Material litMat = Material.Solid(1.0f, 1.0f, 1.0f);
+        litMat.Roughness = 0.7f; // 走多 Pass 传 uModel
+        facingLight.Material = litMat;
+        facingLight.SetPosition(-1.5f, 0.0f, 0.0f);
+        facingLight.SetEuler(0.0f, 60.0f, 0.0f);
+        scene5.AddChild(facingLight);
+
+        SceneNode facingAway = new SceneNode("rot_neg");
+        facingAway.MeshKey = quadMesh;
+        facingAway.Material = litMat;
+        facingAway.SetPosition(1.5f, 0.0f, 0.0f);
+        facingAway.SetEuler(0.0f, -60.0f, 0.0f);
+        scene5.AddChild(facingAway);
+
+        RenderPlan plan5 = new RenderPlan(cam);
+        plan5.AmbientRed = 0.0f;
+        plan5.AmbientGreen = 0.0f;
+        plan5.AmbientBlue = 0.0f;
+        // 光从 +X 射向 -X，入射方向 L = (+1, 0, 0)
+        plan5.Lights.Add(Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f, new Vector3(-1.0f, 0.0f, 0.0f)));
+        plan5.Build(scene5);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan5);
+        int lumPos = Lum(zan_gui_read_pixel(cv.SurfaceId(), 32, 64));
+        int lumNeg = Lum(zan_gui_read_pixel(cv.SurfaceId(), 96, 64));
+        bool worldNormOk = lumPos > lumNeg + 80;
+        Console.WriteLine("gpu-world-normal-rotation: " + Convert.ToString(worldNormOk ? 1 : 0));
+
+        renderer.Dispose();
+        cv.Destroy();
+    }
+}

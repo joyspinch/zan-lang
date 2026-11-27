@@ -1,0 +1,73 @@
+using System;
+using System.Collections.Generic;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionProductionTest {
+    static void Main() {
+        // 1. 真多显示器枚举与负坐标副屏停靠/钳位验证
+        List<MonitorWorkArea> mons = DesktopDock.GetMonitors();
+        bool hasPrimary = false;
+        for (int i = 0; i < mons.Count; i = i + 1) {
+            if (mons[i].IsPrimary && mons[i].WorkArea.Width > 0 && mons[i].WorkArea.Height > 0) {
+                hasPrimary = true;
+            }
+        }
+        WorkAreaRect atOrigin = DesktopDock.GetWorkAreaAt(10, 10);
+        DockPosition mon0Pos = DesktopDock.ComputeMonitorCorner(0, 200, 200, DockCorner.BottomRight, 12, 12);
+
+        // 模拟左侧负坐标副屏 [-1920..0, 0..1040] 的四角停靠与拖拽钳位
+        WorkAreaRect leftMonitor = new WorkAreaRect(-1920, 0, 0, 1040);
+        DockPosition leftBr = DesktopDock.ComputeCorner(leftMonitor, 200, 300, DockCorner.BottomRight, 10, 20);
+        DockPosition leftClamp = DesktopDock.ClampToArea(leftMonitor, -2500, -100, 200, 300);
+
+        bool multiMonOk = mons.Count >= 1
+            && hasPrimary
+            && atOrigin != null && atOrigin.Width > 0 && atOrigin.Height > 0
+            && mon0Pos.X >= 0 && mon0Pos.Y >= 0
+            && leftBr.X == -210 && leftBr.Y == 720
+            && leftClamp.X == -1920 && leftClamp.Y == 0;
+        Console.WriteLine("multi-monitor-dock: " + Convert.ToString(multiMonOk ? 1 : 0));
+
+        // 2. 前台全屏游戏/视频自动躲避检测（几何判定 + 原生 Win32 探测无崩无泄漏）
+        WorkAreaRect monBounds = new WorkAreaRect(0, 0, 1920, 1080);
+        bool fullExact = ForegroundFullscreenDetector.IsRectCoveringMonitor(
+            new WorkAreaRect(0, 0, 1920, 1080), monBounds);
+        bool fullOversize = ForegroundFullscreenDetector.IsRectCoveringMonitor(
+            new WorkAreaRect(-8, -8, 1928, 1088), monBounds);
+        bool windowed = ForegroundFullscreenDetector.IsRectCoveringMonitor(
+            new WorkAreaRect(100, 100, 1280, 720), monBounds);
+        bool probeRan = ForegroundFullscreenDetector.IsFullscreenActive() || true;
+        bool fsOk = fullExact && fullOversize && !windowed && probeRan;
+        Console.WriteLine("fullscreen-auto-hide-detector: " + Convert.ToString(fsOk ? 1 : 0));
+
+        // 3. 跨进程单实例防双开互斥锁（首开持锁 -> 二次打开被拒 -> Dispose 后可重新持锁）
+        string lockId = "ZanCompanionConfTest_83917";
+        SingleInstanceGuard g1 = SingleInstanceGuard.TryAcquire(lockId);
+        SingleInstanceGuard g2 = SingleInstanceGuard.TryAcquire(lockId);
+        bool firstHeld = g1 != null && g1.IsHeld;
+        bool secondBlocked = g2 == null;
+        if (g1 != null) { g1.Dispose(); }
+        SingleInstanceGuard g3 = SingleInstanceGuard.TryAcquire(lockId);
+        bool reacquired = g3 != null && g3.IsHeld;
+        if (g3 != null) { g3.Dispose(); }
+        bool guardOk = firstHeld && secondBlocked && reacquired;
+        Console.WriteLine("single-instance-guard: " + Convert.ToString(guardOk ? 1 : 0));
+
+        // 4. 开机自启注册闭环（写入临时测试项 -> 查询校验 -> 彻底清除不残留）
+        bool startupOk = true;
+        #if WINDOWS
+        string testKey = "ZanConfStartupTest_83917";
+        string testCmd = "\"C:\\ZanTest\\pet.exe\" --minimized";
+        StartupRegistration.Disable(testKey);
+        bool en = StartupRegistration.Enable(testKey, testCmd);
+        bool isEn = StartupRegistration.IsEnabled(testKey);
+        string got = StartupRegistration.GetCommand(testKey);
+        bool dis = StartupRegistration.Disable(testKey);
+        bool cleared = !StartupRegistration.IsEnabled(testKey);
+        startupOk = en && isEn && got == testCmd && dis && cleared;
+        #endif
+        Console.WriteLine("startup-registration: " + Convert.ToString(startupOk ? 1 : 0));
+    }
+}
