@@ -1,0 +1,84 @@
+using System;
+using Game.Audio;
+using Game.Foundation;
+
+// 游戏外壳：玩家档案（跨局统计 + 静音偏好）与音效。
+//
+// 只给界面层（Program）用：RunFlow / RoguelikeSim 永远不碰它，于是无头回放
+// 既不落盘也不出声，种子确定性不受影响。
+//
+// 档案落在用户应用数据目录 ZanGames/roguelike/（ZAN_GAME_DATA_DIR 可改根），
+// 不写工作目录。键：
+//   counters  runs（开局次数）· wins（登顶次数）
+//   bests     floor（到过的最高层）· fastest_turns（最快登顶的累计回合数，越小越好）
+//   flags     muted
+public class RogueShell {
+    GameProfile profile;
+    AudioBus bus;
+    SfxBank sfx;
+    bool newBestFloor;
+    bool newFastest;
+
+    public RogueShell() {
+        this.profile = GameProfile.Open("roguelike");
+        this.bus = new AudioBus();
+        this.bus.SetSfxMuted(this.profile.Flag("muted", false));
+        this.sfx = new SfxBank(this.bus);
+        this.sfx.AddPresets(new string[]{ "click", "select", "hit", "explode", "success", "fail", "error" });
+        // 本作自己的声音：出牌是更短更亮的"翻牌"，金币偏低一点像铜钱，
+        // 格挡是一声下滑的闷响（不在通用预设里）。
+        this.sfx.AddSynth("select", SfxPresets.Select().WithSweep(760.0, 1180.0).WithDuration(0.035));
+        this.sfx.AddSynth("coin", SfxPresets.Coin().WithSweep(740.0, 1320.0));
+        this.sfx.AddSynth("block", new SynthOptions().WithWaveform(Waveform.Triangle)
+            .WithSweep(300.0, 150.0).WithDuration(0.080)
+            .WithEnvelope(0.002, 0.060, 0.2, 0.060).WithGain(0.34));
+        this.sfx.Warm();
+        this.newBestFloor = false;
+        this.newFastest = false;
+    }
+
+    // ---- 音效 --------------------------------------------------------------
+
+    public void Play(string name) { this.sfx.Play(name); }
+    public void Play(string name, double gain) { this.sfx.Play(name, gain); }
+
+    public bool Muted() { return this.bus.IsSfxMuted(); }
+
+    // 切换静音并落盘；取消静音时响一声确认。
+    public void ToggleMute() {
+        bool next = !this.bus.IsSfxMuted();
+        this.bus.SetSfxMuted(next);
+        this.profile.SetFlag("muted", next);
+        if (!next) { this.sfx.Play("click"); }
+    }
+
+    // ---- 统计 --------------------------------------------------------------
+
+    public long Runs() { return this.profile.Counter("runs"); }
+    public long Wins() { return this.profile.Counter("wins"); }
+    public long BestFloor() { return this.profile.Best("floor"); }
+    public bool HasFastest() { return this.profile.HasBest("fastest_turns"); }
+    public long FastestTurns() { return this.profile.Best("fastest_turns"); }
+    public bool NewBestFloor() { return this.newBestFloor; }
+    public bool NewFastest() { return this.newFastest; }
+
+    // 开一局：局数 +1 并落盘（中途退出也算玩过一局）。
+    public void BeginRun() {
+        this.newBestFloor = false;
+        this.newFastest = false;
+        this.profile.Add("runs", 1);
+        this.profile.Save();
+    }
+
+    // 一局结束（登顶或阵亡）时调用一次：刷新最高层 / 最快登顶。
+    public void EndRun(bool won, int floor, int turns) {
+        this.newBestFloor = this.profile.SubmitBest("floor", floor);
+        if (won) {
+            this.profile.Add("wins", 1);
+            this.newFastest = this.profile.SubmitLowest("fastest_turns", turns);
+        } else {
+            this.newFastest = false;
+        }
+        this.profile.Save();
+    }
+}
