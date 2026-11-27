@@ -146,6 +146,8 @@ typedef struct {
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
+    zgl_int u_spot_pos, u_spot_dir, u_spot_color, u_spot_count;
+    zgl_int u_hemi_sky, u_hemi_ground, u_hemi_on;
     zgl_int u_fog_color, u_fog_params;
     zgl_int u_bones;
     uint32_t light_version;
@@ -188,6 +190,13 @@ static float g_game_emissive[3] = { 0.0f, 0.0f, 0.0f };
 static float g_game_point_pos[ZAN_GAME_MAX_LIGHTS][4];
 static float g_game_point_color[ZAN_GAME_MAX_LIGHTS][3];
 static int g_game_point_count = 0;
+static float g_game_spot_pos[ZAN_GAME_MAX_LIGHTS][4];
+static float g_game_spot_dir[ZAN_GAME_MAX_LIGHTS][4];
+static float g_game_spot_color[ZAN_GAME_MAX_LIGHTS][4];
+static int g_game_spot_count = 0;
+static float g_game_hemi_sky[3] = { 0.35f, 0.50f, 0.72f };
+static float g_game_hemi_ground[3] = { 0.16f, 0.14f, 0.12f };
+static int g_game_hemi_on = 0;
 static float g_game_fog_color[3] = { 0.0f, 0.0f, 0.0f };
 static float g_game_fog_params[3] = { 0.0f, 0.0f, 0.0f }; /* enabled, start, invRange */
 static char g_game_normal_key[256] = { 0 };
@@ -436,6 +445,13 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uPointPos[4];\n" \
 "uniform vec3 uPointColor[4];\n" \
 "uniform int uPointCount;\n" \
+"uniform vec4 uSpotPos[4];\n" \
+"uniform vec4 uSpotDir[4];\n" \
+"uniform vec4 uSpotColor[4];\n" \
+"uniform int uSpotCount;\n" \
+"uniform vec3 uHemiSky;\n" \
+"uniform vec3 uHemiGround;\n" \
+"uniform int uHemiOn;\n" \
 "uniform vec3 uFogColor;\n" \
 "uniform vec3 uFogParams;\n" \
 "in vec3 v_world_pos;\n" \
@@ -486,7 +502,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    float metal = clamp(uMaterial.x, 0.0, 1.0);\n" \
 "    float specPow = mix(128.0, 4.0, rough * rough);\n" \
 "    float specStrength = (1.0 - rough) * mix(0.35, 1.0, metal);\n" \
-"    vec3 light = uAmbient;\n" \
+"    vec3 light = (uHemiOn != 0) ? mix(uHemiGround, uHemiSky, clamp(N.y * 0.5 + 0.5, 0.0, 1.0)) : uAmbient;\n" \
 "    vec3 specAcc = vec3(0.0);\n" \
 "    for (int i = 0; i < 4; ++i) {\n" \
 "        if (i >= uLightCount) break;\n" \
@@ -515,6 +531,32 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "                vec3 H = normalize(L + V);\n" \
 "                float ndh = max(dot(N, H), 0.0);\n" \
 "                specAcc += uPointColor[p] * (pow(ndh, specPow) * specStrength * att);\n" \
+"            }\n" \
+"        }\n" \
+"    }\n" \
+"    for (int s = 0; s < 4; ++s) {\n" \
+"        if (s >= uSpotCount) break;\n" \
+"        vec3 toL = uSpotPos[s].xyz - v_world_pos;\n" \
+"        float dist = length(toL);\n" \
+"        float rad = uSpotPos[s].w;\n" \
+"        if (rad > 0.0001 && dist < rad) {\n" \
+"            vec3 L = (dist > 0.0001) ? (toL / dist) : vec3(0.0, 1.0, 0.0);\n" \
+"            vec3 sAxis = normalize(uSpotDir[s].xyz);\n" \
+"            float cosAng = dot(-L, sAxis);\n" \
+"            float cosIn = uSpotDir[s].w;\n" \
+"            float cosOut = uSpotColor[s].w;\n" \
+"            float cone = clamp((cosAng - cosOut) / max(cosIn - cosOut, 0.0001), 0.0, 1.0);\n" \
+"            cone = cone * cone * (3.0 - 2.0 * cone);\n" \
+"            if (cone > 0.0001) {\n" \
+"                float att = 1.0 - (dist / rad);\n" \
+"                att = att * att * cone;\n" \
+"                float ndl = max(dot(N, L), 0.0);\n" \
+"                light += uSpotColor[s].rgb * (ndl * att);\n" \
+"                if (uCamValid != 0 && specStrength > 0.001) {\n" \
+"                    vec3 H = normalize(L + V);\n" \
+"                    float ndh = max(dot(N, H), 0.0);\n" \
+"                    specAcc += uSpotColor[s].rgb * (pow(ndh, specPow) * specStrength * att);\n" \
+"                }\n" \
 "            }\n" \
 "        }\n" \
 "    }\n"
@@ -876,6 +918,13 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     zgl_int point_pos = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointPos[0]");
     zgl_int point_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointColor[0]");
     zgl_int point_count = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointCount");
+    zgl_int spot_pos = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotPos[0]");
+    zgl_int spot_dir = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotDir[0]");
+    zgl_int spot_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotColor[0]");
+    zgl_int spot_count = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotCount");
+    zgl_int hemi_sky = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiSky");
+    zgl_int hemi_ground = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiGround");
+    zgl_int hemi_on = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiOn");
     zgl_int fog_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uFogColor");
     zgl_int fog_params = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uFogParams");
     int ok = tex >= 0 && pos == ZAN_GAME_LOC_POS &&
@@ -920,6 +969,13 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_point_pos = point_pos;
     prog->u_point_color = point_color;
     prog->u_point_count = point_count;
+    prog->u_spot_pos = spot_pos;
+    prog->u_spot_dir = spot_dir;
+    prog->u_spot_color = spot_color;
+    prog->u_spot_count = spot_count;
+    prog->u_hemi_sky = hemi_sky;
+    prog->u_hemi_ground = hemi_ground;
+    prog->u_hemi_on = hemi_on;
     prog->u_fog_color = fog_color;
     prog->u_fog_params = fog_params;
     prog->u_bones = -1;
@@ -963,6 +1019,13 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int point_pos = g_game_gl->GetUniformLocation(program, "uPointPos[0]");
     zgl_int point_color = g_game_gl->GetUniformLocation(program, "uPointColor[0]");
     zgl_int point_count = g_game_gl->GetUniformLocation(program, "uPointCount");
+    zgl_int spot_pos = g_game_gl->GetUniformLocation(program, "uSpotPos[0]");
+    zgl_int spot_dir = g_game_gl->GetUniformLocation(program, "uSpotDir[0]");
+    zgl_int spot_color = g_game_gl->GetUniformLocation(program, "uSpotColor[0]");
+    zgl_int spot_count = g_game_gl->GetUniformLocation(program, "uSpotCount");
+    zgl_int hemi_sky = g_game_gl->GetUniformLocation(program, "uHemiSky");
+    zgl_int hemi_ground = g_game_gl->GetUniformLocation(program, "uHemiGround");
+    zgl_int hemi_on = g_game_gl->GetUniformLocation(program, "uHemiOn");
     zgl_int fog_color = g_game_gl->GetUniformLocation(program, "uFogColor");
     zgl_int fog_params = g_game_gl->GetUniformLocation(program, "uFogParams");
     int ok = pos == ZAN_GAME_LOC_POS && normal == ZAN_GAME_LOC_NORMAL &&
@@ -997,6 +1060,13 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_point_pos = point_pos;
     g_game_skin_prog.u_point_color = point_color;
     g_game_skin_prog.u_point_count = point_count;
+    g_game_skin_prog.u_spot_pos = spot_pos;
+    g_game_skin_prog.u_spot_dir = spot_dir;
+    g_game_skin_prog.u_spot_color = spot_color;
+    g_game_skin_prog.u_spot_count = spot_count;
+    g_game_skin_prog.u_hemi_sky = hemi_sky;
+    g_game_skin_prog.u_hemi_ground = hemi_ground;
+    g_game_skin_prog.u_hemi_on = hemi_on;
     g_game_skin_prog.u_fog_color = fog_color;
     g_game_skin_prog.u_fog_params = fog_params;
     g_game_skin_prog.light_version = 0;
@@ -1077,6 +1147,19 @@ static void zan_game_upload_lights(zan_game_program *prog) {
         gl->Uniform3fv(prog->u_point_color, ZAN_GAME_MAX_LIGHTS, &g_game_point_color[0][0]);
     }
     if (prog->u_point_count >= 0) gl->Uniform1i(prog->u_point_count, g_game_point_count);
+    if (prog->u_spot_pos >= 0 && gl->Uniform4fv) {
+        gl->Uniform4fv(prog->u_spot_pos, ZAN_GAME_MAX_LIGHTS, &g_game_spot_pos[0][0]);
+    }
+    if (prog->u_spot_dir >= 0 && gl->Uniform4fv) {
+        gl->Uniform4fv(prog->u_spot_dir, ZAN_GAME_MAX_LIGHTS, &g_game_spot_dir[0][0]);
+    }
+    if (prog->u_spot_color >= 0 && gl->Uniform4fv) {
+        gl->Uniform4fv(prog->u_spot_color, ZAN_GAME_MAX_LIGHTS, &g_game_spot_color[0][0]);
+    }
+    if (prog->u_spot_count >= 0) gl->Uniform1i(prog->u_spot_count, g_game_spot_count);
+    if (prog->u_hemi_sky >= 0) gl->Uniform3fv(prog->u_hemi_sky, 1, g_game_hemi_sky);
+    if (prog->u_hemi_ground >= 0) gl->Uniform3fv(prog->u_hemi_ground, 1, g_game_hemi_ground);
+    if (prog->u_hemi_on >= 0) gl->Uniform1i(prog->u_hemi_on, g_game_hemi_on);
     if (prog->u_fog_color >= 0) gl->Uniform3fv(prog->u_fog_color, 1, g_game_fog_color);
     if (prog->u_fog_params >= 0) gl->Uniform3fv(prog->u_fog_params, 1, g_game_fog_params);
     prog->light_version = g_game_light_version;
@@ -2061,4 +2144,40 @@ ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
 done:
     zan_gui_gpu_end(surface_id);
     return result;
+}
+
+ZAN_GAME_API int32_t zan_game_set_spot_lights3d(int32_t count,
+    const float *pos_range4, const float *dir_inner4, const float *color_outer4) {
+    if (count < 0 || count > ZAN_GAME_MAX_LIGHTS) return 0;
+    if (count > 0 && (!pos_range4 || !dir_inner4 || !color_outer4)) return 0;
+    g_game_spot_count = count;
+    for (int i = 0; i < count; ++i) {
+        g_game_spot_pos[i][0] = pos_range4[i * 4 + 0];
+        g_game_spot_pos[i][1] = pos_range4[i * 4 + 1];
+        g_game_spot_pos[i][2] = pos_range4[i * 4 + 2];
+        g_game_spot_pos[i][3] = pos_range4[i * 4 + 3];
+        g_game_spot_dir[i][0] = dir_inner4[i * 4 + 0];
+        g_game_spot_dir[i][1] = dir_inner4[i * 4 + 1];
+        g_game_spot_dir[i][2] = dir_inner4[i * 4 + 2];
+        g_game_spot_dir[i][3] = dir_inner4[i * 4 + 3];
+        g_game_spot_color[i][0] = color_outer4[i * 4 + 0];
+        g_game_spot_color[i][1] = color_outer4[i * 4 + 1];
+        g_game_spot_color[i][2] = color_outer4[i * 4 + 2];
+        g_game_spot_color[i][3] = color_outer4[i * 4 + 3];
+    }
+    ++g_game_light_version;
+    return 1;
+}
+
+ZAN_GAME_API void zan_game_set_hemi_ambient3d(int32_t enabled,
+    float sky_r, float sky_g, float sky_b,
+    float ground_r, float ground_g, float ground_b) {
+    g_game_hemi_on = enabled ? 1 : 0;
+    g_game_hemi_sky[0] = sky_r;
+    g_game_hemi_sky[1] = sky_g;
+    g_game_hemi_sky[2] = sky_b;
+    g_game_hemi_ground[0] = ground_r;
+    g_game_hemi_ground[1] = ground_g;
+    g_game_hemi_ground[2] = ground_b;
+    ++g_game_light_version;
 }

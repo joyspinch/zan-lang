@@ -1,0 +1,402 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 联机拥塞控制状态常量（Glenn Fiedler Good/Bad 二态拥塞退避算法）。
+public static class NetCongestionMode {
+    public const int Good = 0;
+    public const int Bad = 1;
+}
+
+// 商业级 UDP 拥塞速率调控器（Good/Bad 二态退避 + 指数惩罚窗口防震荡）：
+// - 持续跟踪 EWMA 平滑 RTT 与丢包率；
+// - RTT 超阈或丢包超阈时立刻切入 Bad 态降频（如 30Hz -> 10Hz）保吞吐不雪崩；
+// - 若从 Bad 恢复后短时间内再次触发拥塞，惩罚等待窗口指数翻倍（1s -> 2s -> 4s ... 60s）杜绝高频震荡；
+// - 稳定保持 Good 态达标后惩罚窗口减半回落。
+public class NetCongestionController {
+    public float GoodSendRateHz;
+    public float BadSendRateHz;
+    public float RttBadThresholdMs;
+    public float LossBadThreshold;
+    public float MinPenaltySec;
+    public float MaxPenaltySec;
+    public float GoodStabilitySec;
+
+    public int Mode;
+    public float SmoothedRttMs;
+    public float SmoothedLoss;
+    public float PenaltySec;
+    public int TransitionsToBad;
+    public int TransitionsToGood;
+
+    private bool hasSample;
+    private float goodConditionSec;
+    private float goodModeHoldSec;
+
+    public NetCongestionController(float goodSendRateHz, float badSendRateHz,
+                                   float rttBadThresholdMs, float lossBadThreshold) {
+        this.GoodSendRateHz = goodSendRateHz > 1.0f ? goodSendRateHz : 30.0f;
+        this.BadSendRateHz = badSendRateHz > 1.0f ? badSendRateHz : 10.0f;
+        if (this.BadSendRateHz > this.GoodSendRateHz) {
+            this.BadSendRateHz = this.GoodSendRateHz;
+        }
+        this.RttBadThresholdMs = rttBadThresholdMs > 10.0f ? rttBadThresholdMs : 250.0f;
+        this.LossBadThreshold = lossBadThreshold > 0.0f ? lossBadThreshold : 0.08f;
+        this.MinPenaltySec = 1.0f;
+        this.MaxPenaltySec = 60.0f;
+        this.GoodStabilitySec = 10.0f;
+
+        this.Mode = NetCongestionMode.Good;
+        this.SmoothedRttMs = 0.0f;
+        this.SmoothedLoss = 0.0f;
+        this.PenaltySec = 2.0f;
+        this.TransitionsToBad = 0;
+        this.TransitionsToGood = 0;
+        this.hasSample = false;
+        this.goodConditionSec = 0.0f;
+        this.goodModeHoldSec = 0.0f;
+    }
+
+    public float RecommendedSendRateHz() {
+        return this.Mode == NetCongestionMode.Good ? this.GoodSendRateHz : this.BadSendRateHz;
+    }
+
+    public int SendIntervalMs() {
+        float hz = this.RecommendedSendRateHz();
+        if (hz <= 0.1f) { return 1000; }
+        int ms = (int)Math.Round(1000.0 / (double)hz);
+        return ms > 1 ? ms : 1;
+    }
+
+    // 投喂本周期采样：rttMs 为往返时延，lossRate 为 [0..1] 丢包率，dtSec 为距上次更新秒数。
+    public void Update(float rttMs, float lossRate, float dtSec) {
+        if (rttMs < 0.0f) { rttMs = 0.0f; }
+        if (lossRate < 0.0f) { lossRate = 0.0f; }
+        if (lossRate > 1.0f) { lossRate = 1.0f; }
+        if (dtSec < 0.0f) { dtSec = 0.0f; }
+
+        if (!this.hasSample) {
+            this.SmoothedRttMs = rttMs;
+            this.SmoothedLoss = lossRate;
+            this.hasSample = true;
+        } else {
+            this.SmoothedRttMs = this.SmoothedRttMs * 0.7f + rttMs * 0.3f;
+            this.SmoothedLoss = this.SmoothedLoss * 0.7f + lossRate * 0.3f;
+        }
+
+        bool congested = this.SmoothedRttMs > this.RttBadThresholdMs
+            || this.SmoothedLoss > this.LossBadThreshold;
+
+        if (this.Mode == NetCongestionMode.Good) {
+            if (congested) {
+                this.Mode = NetCongestionMode.Bad;
+                this.TransitionsToBad = this.TransitionsToBad + 1;
+                if (this.goodModeHoldSec < this.GoodStabilitySec) {
+                    this.PenaltySec = this.PenaltySec * 2.0f;
+                    if (this.PenaltySec > this.MaxPenaltySec) {
+                        this.PenaltySec = this.MaxPenaltySec;
+                    }
+                }
+                this.goodConditionSec = 0.0f;
+                this.goodModeHoldSec = 0.0f;
+            } else {
+                this.goodModeHoldSec = this.goodModeHoldSec + dtSec;
+                if (this.goodModeHoldSec >= this.GoodStabilitySec) {
+                    this.PenaltySec = this.PenaltySec * 0.5f;
+                    if (this.PenaltySec < this.MinPenaltySec) {
+                        this.PenaltySec = this.MinPenaltySec;
+                    }
+                    this.goodModeHoldSec = 0.0f;
+                }
+            }
+        } else {
+            if (!congested) {
+                this.goodConditionSec = this.goodConditionSec + dtSec;
+                if (this.goodConditionSec >= this.PenaltySec) {
+                    this.Mode = NetCongestionMode.Good;
+                    this.TransitionsToGood = this.TransitionsToGood + 1;
+                    this.goodConditionSec = 0.0f;
+                    this.goodModeHoldSec = 0.0f;
+                }
+            } else {
+                this.goodConditionSec = 0.0f;
+            }
+        }
+    }
+}
+
+internal class NetPriorityEntry {
+    public int EntityId;
+    public float BasePriority;
+    public int EstimatedBytes;
+    public float Accumulator;
+    public int SendCount;
+}
+
+// 防饥饿实体同步优先级累加调度器（Unreal / Overwatch NetPriority 模型）：
+// 每帧按 BasePriority * distanceWeight * dirtyBoost 累加；打包时按累加值降序填充至 MTU 字节预算；
+// 被选中的实体累加器清零，未选中的继续累积，确保高优近距实体高频同步的同时远距低优实体绝不饿死。
+public class NetPriorityScheduler {
+    private List<NetPriorityEntry> entries;
+
+    public NetPriorityScheduler() {
+        this.entries = new List<NetPriorityEntry>();
+    }
+
+    public int EntityCount { get { return this.entries.Count; } }
+
+    private int FindIndex(int entityId) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].EntityId == entityId) { return i; }
+        }
+        return -1;
+    }
+
+    public void Register(int entityId, float basePriority, int estimatedBytes) {
+        float prio = basePriority > 0.01f ? basePriority : 0.01f;
+        int bytes = estimatedBytes > 1 ? estimatedBytes : 16;
+        int idx = this.FindIndex(entityId);
+        if (idx >= 0) {
+            this.entries[idx].BasePriority = prio;
+            this.entries[idx].EstimatedBytes = bytes;
+            return;
+        }
+        NetPriorityEntry e = new NetPriorityEntry();
+        e.EntityId = entityId;
+        e.BasePriority = prio;
+        e.EstimatedBytes = bytes;
+        e.Accumulator = 0.0f;
+        e.SendCount = 0;
+        this.entries.Add(e);
+    }
+
+    public bool Unregister(int entityId) {
+        int idx = this.FindIndex(entityId);
+        if (idx < 0) { return false; }
+        this.entries.RemoveAt(idx);
+        return true;
+    }
+
+    public void Accumulate(int entityId, float distanceWeight, float dirtyBoost) {
+        int idx = this.FindIndex(entityId);
+        if (idx < 0) { return; }
+        float dw = distanceWeight > 0.0f ? distanceWeight : 0.0f;
+        float db = dirtyBoost > 0.0f ? dirtyBoost : 0.0f;
+        NetPriorityEntry e = this.entries[idx];
+        e.Accumulator = e.Accumulator + e.BasePriority * dw * db;
+    }
+
+    public int GetSendCount(int entityId) {
+        int idx = this.FindIndex(entityId);
+        if (idx < 0) { return 0; }
+        return this.entries[idx].SendCount;
+    }
+
+    // 在 maxBytes 字节预算内选出本帧应同步的实体列表，并清零被选中实体的累加器。
+    public List<int> SelectForBudget(int maxBytes) {
+        List<int> selected = new List<int>();
+        if (maxBytes <= 0 || this.entries.Count == 0) { return selected; }
+
+        int n = this.entries.Count;
+        int[] order = new int[n];
+        for (int i = 0; i < n; i = i + 1) { order[i] = i; }
+        // 插入排序（实体按视野内数量级排序，稳定且零堆外分配）
+        for (int i = 1; i < n; i = i + 1) {
+            int key = order[i];
+            float keyAcc = this.entries[key].Accumulator;
+            int j = i - 1;
+            while (j >= 0 && this.entries[order[j]].Accumulator < keyAcc) {
+                order[j + 1] = order[j];
+                j = j - 1;
+            }
+            order[j + 1] = key;
+        }
+
+        int used = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            NetPriorityEntry e = this.entries[order[i]];
+            if (e.Accumulator <= 0.0f) { continue; }
+            if (used + e.EstimatedBytes <= maxBytes) {
+                used = used + e.EstimatedBytes;
+                e.Accumulator = 0.0f;
+                e.SendCount = e.SendCount + 1;
+                selected.Add(e.EntityId);
+            }
+        }
+        return selected;
+    }
+}
+
+// 匹配排队票据。
+public class MatchTicket {
+    public int PlayerId;
+    public string Region;
+    public int Rating;
+    public long EnqueuedMs;
+
+    public MatchTicket(int playerId, string region, int rating, long enqueuedMs) {
+        this.PlayerId = playerId;
+        this.Region = region == null ? "global" : region;
+        this.Rating = rating;
+        this.EnqueuedMs = enqueuedMs;
+    }
+}
+
+// 匹配成功结果（含按蛇形分队均衡后的队伍列表与两队平均分段）。
+public class MatchFoundResult {
+    public int MatchId;
+    public string Region;
+    public List<List<int>> Teams;
+    public List<int> TeamAverageRatings;
+
+    public MatchFoundResult(int matchId, string region) {
+        this.MatchId = matchId;
+        this.Region = region;
+        this.Teams = new List<List<int>>();
+        this.TeamAverageRatings = new List<int>();
+    }
+}
+
+// 商业级区域 + 扩窗分段（Expanding-Window ELO）匹配器：
+// - 同大区隔离（Region 精确匹配，杜绝跨洲高延迟对局）；
+// - 等待越久允许分差越宽（InitialSpread + SpreadPerSec * waitSec，封顶 MaxSpread），且双方 SLA 同时满足；
+// - 成局后按分段降序蛇形分队（0,1,1,0...），最小化两队实力差。
+public class NetMatchmaker {
+    public int InitialSpread;
+    public float SpreadPerSec;
+    public int MaxSpread;
+
+    private List<MatchTicket> queue;
+    private int nextMatchId;
+
+    public NetMatchmaker(int initialSpread, float spreadPerSec, int maxSpread) {
+        this.InitialSpread = initialSpread >= 0 ? initialSpread : 80;
+        this.SpreadPerSec = spreadPerSec >= 0.0f ? spreadPerSec : 15.0f;
+        this.MaxSpread = maxSpread >= this.InitialSpread ? maxSpread : 500;
+        this.queue = new List<MatchTicket>();
+        this.nextMatchId = 1;
+    }
+
+    public int QueueCount { get { return this.queue.Count; } }
+
+    public bool Enqueue(int playerId, string region, int rating, long nowMs) {
+        for (int i = 0; i < this.queue.Count; i = i + 1) {
+            if (this.queue[i].PlayerId == playerId) { return false; }
+        }
+        this.queue.Add(new MatchTicket(playerId, region, rating, nowMs));
+        return true;
+    }
+
+    public bool Cancel(int playerId) {
+        for (int i = 0; i < this.queue.Count; i = i + 1) {
+            if (this.queue[i].PlayerId == playerId) {
+                this.queue.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public int AllowedSpreadFor(MatchTicket t, long nowMs) {
+        long waitMs = nowMs - t.EnqueuedMs;
+        if (waitMs < 0) { waitMs = 0; }
+        int spread = this.InitialSpread + (int)((double)this.SpreadPerSec * ((double)waitMs / 1000.0));
+        if (spread > this.MaxSpread) { spread = this.MaxSpread; }
+        return spread;
+    }
+
+    private static int AbsInt(int v) { return v < 0 ? 0 - v : v; }
+
+    // 尝试撮合一局（teamCount 支队伍 * teamSize 人）；成功返回 MatchFoundResult 并移除已匹配票据，否则 null。
+    public MatchFoundResult TryMatch(long nowMs, int teamSize, int teamCount) {
+        if (teamSize <= 0 || teamCount <= 0) { return null; }
+        int needed = teamSize * teamCount;
+        if (this.queue.Count < needed) { return null; }
+
+        for (int seedIdx = 0; seedIdx < this.queue.Count; seedIdx = seedIdx + 1) {
+            MatchTicket seed = this.queue[seedIdx];
+            int seedSpread = this.AllowedSpreadFor(seed, nowMs);
+
+            // 收集所有同大区且与 seed 双向分差均达标的候选索引
+            List<int> candidates = new List<int>();
+            candidates.Add(seedIdx);
+            for (int j = 0; j < this.queue.Count; j = j + 1) {
+                if (j == seedIdx) { continue; }
+                MatchTicket other = this.queue[j];
+                if (other.Region != seed.Region) { continue; }
+                int diff = AbsInt(other.Rating - seed.Rating);
+                int otherSpread = this.AllowedSpreadFor(other, nowMs);
+                if (diff <= seedSpread && diff <= otherSpread) {
+                    candidates.Add(j);
+                }
+            }
+            if (candidates.Count < needed) { continue; }
+
+            // 优先挑选与 seed 分差最接近的 needed 名玩家
+            for (int a = 1; a < candidates.Count; a = a + 1) {
+                int key = candidates[a];
+                int keyDiff = AbsInt(this.queue[key].Rating - seed.Rating);
+                int b = a - 1;
+                while (b >= 1 && AbsInt(this.queue[candidates[b]].Rating - seed.Rating) > keyDiff) {
+                    candidates[b + 1] = candidates[b];
+                    b = b - 1;
+                }
+                candidates[b + 1] = key;
+            }
+
+            List<MatchTicket> picked = new List<MatchTicket>();
+            int[] removeIndices = new int[needed];
+            for (int k = 0; k < needed; k = k + 1) {
+                int qi = candidates[k];
+                picked.Add(this.queue[qi]);
+                removeIndices[k] = qi;
+            }
+            // 从高下标到低下标删除，避免位移错乱
+            for (int a = 1; a < needed; a = a + 1) {
+                int key = removeIndices[a];
+                int b = a - 1;
+                while (b >= 0 && removeIndices[b] < key) {
+                    removeIndices[b + 1] = removeIndices[b];
+                    b = b - 1;
+                }
+                removeIndices[b + 1] = key;
+            }
+            for (int k = 0; k < needed; k = k + 1) {
+                this.queue.RemoveAt(removeIndices[k]);
+            }
+
+            // 按 ELO 降序排好，蛇形分队（0,1,1,0...）均衡战力
+            for (int a = 1; a < picked.Count; a = a + 1) {
+                MatchTicket key = picked[a];
+                int b = a - 1;
+                while (b >= 0 && picked[b].Rating < key.Rating) {
+                    picked[b + 1] = picked[b];
+                    b = b - 1;
+                }
+                picked[b + 1] = key;
+            }
+
+            int mid = this.nextMatchId;
+            this.nextMatchId = mid + 1;
+            MatchFoundResult res = new MatchFoundResult(mid, seed.Region);
+            int[] ratingSums = new int[teamCount];
+            for (int t = 0; t < teamCount; t = t + 1) {
+                res.Teams.Add(new List<int>());
+                ratingSums[t] = 0;
+            }
+            for (int k = 0; k < needed; k = k + 1) {
+                int round = k / teamCount;
+                int posInRound = k - round * teamCount;
+                int teamIdx = (round % 2 == 0) ? posInRound : (teamCount - 1 - posInRound);
+                res.Teams[teamIdx].Add(picked[k].PlayerId);
+                ratingSums[teamIdx] = ratingSums[teamIdx] + picked[k].Rating;
+            }
+            for (int t = 0; t < teamCount; t = t + 1) {
+                res.TeamAverageRatings.Add(ratingSums[t] / teamSize);
+            }
+            return res;
+        }
+        return null;
+    }
+}

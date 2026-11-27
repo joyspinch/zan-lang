@@ -1,0 +1,79 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerBandwidthMatchmakingTest {
+    static void Main() {
+        // 1. Glenn Fiedler Good/Bad 拥塞控制 + 抖动惩罚翻倍 + 稳态恢复减半
+        NetCongestionController cc = new NetCongestionController(30.0f, 10.0f, 200.0f, 0.08f);
+        cc.PenaltySec = 2.0f;
+        cc.GoodStabilitySec = 6.0f;
+        cc.Update(40.0f, 0.0f, 1.0f);
+        bool initGood = cc.Mode == NetCongestionMode.Good && cc.RecommendedSendRateHz() > 29.5f;
+
+        // 突发高丢包与高延迟 -> 切 Bad 降频至 10Hz，且因为稳定时间 < 6s，PenaltySec 翻倍至 4.0s
+        cc.Update(320.0f, 0.25f, 1.0f);
+        cc.Update(320.0f, 0.25f, 1.0f);
+        bool droppedBad = cc.Mode == NetCongestionMode.Bad
+            && cc.RecommendedSendRateHz() < 10.5f
+            && cc.SendIntervalMs() == 100
+            && cc.PenaltySec > 3.9f && cc.PenaltySec < 4.1f;
+
+        // 网络恢复健康：前 2 秒仍停留在 Bad（未满 4s 惩罚期），满 4s 后平滑恢复 Good
+        cc.Update(30.0f, 0.0f, 1.0f);
+        cc.Update(30.0f, 0.0f, 1.0f);
+        cc.Update(30.0f, 0.0f, 1.0f);
+        bool holdDuringPenalty = cc.Mode == NetCongestionMode.Bad;
+        for (int i = 0; i < 6; i = i + 1) {
+            cc.Update(30.0f, 0.0f, 1.0f);
+        }
+        bool recoveredGood = cc.Mode == NetCongestionMode.Good && cc.TransitionsToGood == 1;
+
+        // 持续稳定超过 GoodStabilitySec -> PenaltySec 减半回落
+        for (int i = 0; i < 7; i = i + 1) {
+            cc.Update(30.0f, 0.0f, 1.0f);
+        }
+        bool penaltyHalved = cc.PenaltySec < 2.1f;
+
+        bool ccOk = initGood && droppedBad && holdDuringPenalty && recoveredGood && penaltyHalved;
+        Console.WriteLine("congestion-good-bad-backoff: " + Convert.ToString(ccOk ? 1 : 0));
+
+        // 2. 防饥饿 MTU 带宽优先级累加调度器（每帧只够发 1 个实体，低优实体累积后必然轮到绝不饿死）
+        NetPriorityScheduler sched = new NetPriorityScheduler();
+        sched.Register(10, 3.0f, 40); // 高优近处实体
+        sched.Register(20, 1.0f, 40); // 低优远处实体（每帧预算 50 字节只能装下 1 个）
+        for (int tick = 0; tick < 8; tick = tick + 1) {
+            sched.Accumulate(10, 1.0f, 1.0f);
+            sched.Accumulate(20, 1.0f, 1.0f);
+            sched.SelectForBudget(50);
+        }
+        int highSends = sched.GetSendCount(10);
+        int lowSends = sched.GetSendCount(20);
+        bool prioOk = highSends + lowSends == 8 && highSends > lowSends && lowSends >= 2;
+        Console.WriteLine("priority-scheduler-starvation-free: " + Convert.ToString(prioOk ? 1 : 0));
+
+        // 3. 区域隔离 + 扩窗 ELO 匹配 + 蛇形战力均衡分队
+        NetMatchmaker mm = new NetMatchmaker(50, 20.0f, 400);
+        mm.Enqueue(1, "ap-east", 1600, 0);
+        mm.Enqueue(2, "ap-east", 1500, 0);
+        mm.Enqueue(3, "ap-east", 1400, 0);
+        mm.Enqueue(4, "ap-east", 1300, 0);
+        mm.Enqueue(5, "us-west", 1550, 0); // 跨区玩家绝不能混进 ap-east
+
+        // t=0 时初始允许分差仅 50，4 名 ap-east 玩家分差过大暂不成局
+        MatchFoundResult tooEarly = mm.TryMatch(0, 2, 2);
+        // t=15000ms（等待 15 秒）：允许分差扩到 50 + 20*15 = 350，成功撮合 2v2 且不混入 us-west
+        MatchFoundResult matched = mm.TryMatch(15000, 2, 2);
+        // 蛇形分队：Team0=(1600,1300) avg=1450，Team1=(1500,1400) avg=1450，绝对均衡！
+        bool mmOk = tooEarly == null
+            && matched != null
+            && matched.Region == "ap-east"
+            && matched.Teams.Count == 2
+            && matched.Teams[0].Count == 2 && matched.Teams[1].Count == 2
+            && matched.TeamAverageRatings[0] == 1450 && matched.TeamAverageRatings[1] == 1450
+            && mm.QueueCount == 1; // us-west 玩家仍在队列等待本区队友
+        Console.WriteLine("matchmaker-region-elo-snake-draft: " + Convert.ToString(mmOk ? 1 : 0));
+    }
+}

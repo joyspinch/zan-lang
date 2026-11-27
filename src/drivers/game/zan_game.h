@@ -124,6 +124,19 @@ ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
     const float *sun_dir3, const float *top_rgb3, const float *horizon_rgb3,
     const float *ground_rgb3);
 
+/* 动态 GPU 聚光灯（最多 4 盏，支持内外锥角平滑衰减 + 距离衰减 + Blinn-Phong 高光）：
+ * - pos_range4: count*4 float [pos.x, pos.y, pos.z, range]
+ * - dir_inner4: count*4 float [dir.x, dir.y, dir.z, cos(innerAngle)]（dir 为光线射出方向）
+ * - color_outer4: count*4 float [r, g, b, cos(outerAngle)] */
+ZAN_GAME_API int32_t zan_game_set_spot_lights3d(int32_t count,
+    const float *pos_range4, const float *dir_inner4, const float *color_outer4);
+
+/* 半球天空/地面环境光 IBL：按法线 N.y 混合天空顶色与地面反弹色，替代平淡单一环境光；
+ * enabled=0 时保持历史 uAmbient 行为完全不变。 */
+ZAN_GAME_API void zan_game_set_hemi_ambient3d(int32_t enabled,
+    float sky_r, float sky_g, float sky_b,
+    float ground_r, float ground_g, float ground_b);
+
 #ifdef __cplusplus
 }
 #endif

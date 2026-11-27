@@ -1,0 +1,317 @@
+using System;
+
+namespace System.Windows;
+
+// 系统电源与电池状态快照（由 Windows kernel32!GetSystemPowerStatus 采集，跨平台提供安全默认值）。
+public class SystemPowerInfo {
+    public bool OnAcPower;
+    public bool HasBattery;
+    public bool BatterySaverOn;
+    public int BatteryPercent; // 0..100，未知为 -1
+
+    public SystemPowerInfo() {
+        this.OnAcPower = true;
+        this.HasBattery = false;
+        this.BatterySaverOn = false;
+        this.BatteryPercent = -1;
+    }
+
+    public static SystemPowerInfo FromValues(bool onAcPower, bool hasBattery,
+                                             bool batterySaverOn, int batteryPercent) {
+        SystemPowerInfo p = new SystemPowerInfo();
+        p.OnAcPower = onAcPower;
+        p.HasBattery = hasBattery;
+        p.BatterySaverOn = batterySaverOn;
+        p.BatteryPercent = batteryPercent;
+        return p;
+    }
+}
+
+// 桌面陪伴自适应省电帧率调控器（24/7 商业驻留必备）：
+// 综合 OS 电源状态（插电/电池/低电/节电模式）+ 用户活跃态（Active/Idle/Afk）+ 全屏隐藏/最小化，
+// 自动调节目标 FPS 与帧间隔毫秒数，避免在笔记本上耗电或在游戏全屏时抢占 GPU。
+public class CompanionPowerGovernor {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemPowerStatus")]
+    private static extern int WinGetSystemPowerStatus(nint lpSystemPowerStatus);
+    #endif
+
+    public int AcActiveFps;
+    public int BatteryActiveFps;
+    public int BatterySaverFps;
+    public int IdleFps;
+    public int AfkFps;
+    public int HiddenFps;
+    public int LowBatteryThresholdPercent;
+
+    public CompanionPowerGovernor() {
+        this.AcActiveFps = 60;
+        this.BatteryActiveFps = 30;
+        this.BatterySaverFps = 20;
+        this.IdleFps = 15;
+        this.AfkFps = 8;
+        this.HiddenFps = 1;
+        this.LowBatteryThresholdPercent = 20;
+    }
+
+    // 读取真实 OS 电源状态（Windows 走 kernel32!GetSystemPowerStatus，其他平台返回默认交流电）。
+    public static SystemPowerInfo QuerySystemPower() {
+        SystemPowerInfo info = new SystemPowerInfo();
+        #if WINDOWS
+        // SYSTEM_POWER_STATUS = 12 字节：ACLine(0), BatteryFlag(1), LifePercent(2), SystemStatusFlag(3), LifeTime(4..7), FullLifeTime(8..11)
+        nint buf = NativeMemory.Alloc(12);
+        if (buf == 0) { return info; }
+        try {
+            Span<byte> b = new Span<byte>(buf, 12);
+            for (int i = 0; i < 12; i = i + 1) { b[i] = 0; }
+            int ok = WinGetSystemPowerStatus(buf);
+            if (ok != 0) {
+                int ac = (int)b[0];
+                int flag = (int)b[1];
+                int pct = (int)b[2];
+                int saver = (int)b[3];
+                info.OnAcPower = (ac != 0);
+                info.HasBattery = (flag != 128 && flag != 255);
+                info.BatteryPercent = (pct <= 100) ? pct : -1;
+                info.BatterySaverOn = (saver & 1) != 0;
+            }
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        #endif
+        return info;
+    }
+
+    // 计算当前应采用的目标渲染帧率（FPS >= 1）。
+    public int RecommendFps(SystemPowerInfo power, int activityState, bool isOccludedOrHidden) {
+        if (isOccludedOrHidden) {
+            return this.HiddenFps > 0 ? this.HiddenFps : 1;
+        }
+        int cap = this.AcActiveFps;
+        if (power != null) {
+            bool lowBat = !power.OnAcPower && power.HasBattery
+                && power.BatteryPercent >= 0
+                && power.BatteryPercent <= this.LowBatteryThresholdPercent;
+            if (power.BatterySaverOn || lowBat) {
+                cap = this.BatterySaverFps;
+            } else if (!power.OnAcPower) {
+                cap = this.BatteryActiveFps;
+            }
+        }
+        int actFps = cap;
+        if (activityState == UserActivityState.Afk) {
+            actFps = this.AfkFps;
+        } else if (activityState == UserActivityState.Idle) {
+            actFps = this.IdleFps;
+        }
+        int chosen = actFps < cap ? actFps : cap;
+        return chosen > 0 ? chosen : 1;
+    }
+
+    public int RecommendFrameIntervalMs(SystemPowerInfo power, int activityState, bool isOccludedOrHidden) {
+        int fps = this.RecommendFps(power, activityState, isOccludedOrHidden);
+        int ms = 1000 / fps;
+        return ms > 1 ? ms : 1;
+    }
+}
+
+// 跨显示器混合 DPI 协调器：
+// Windows 下通过 user32!MonitorFromRect + shcore!GetDpiForMonitor 获取任意坐标所在显示器的有效 DPI，
+// 提供 96-DPI 逻辑像素 ↔ 物理像素换算以及跨屏拖拽窗口时的尺寸按比例平滑重缩放（防止 4K 150% 拖到 1080p 100% 变巨无霸）。
+public static class MonitorDpiCoordinator {
+    public const int StandardDpi = 96;
+
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "MonitorFromRect")]
+    private static extern nint WinMonitorFromRect(nint rectPtr, int dwFlags);
+
+    [DllImport("shcore", EntryPoint = "GetDpiForMonitor")]
+    private static extern int WinGetDpiForMonitor(nint hmonitor, int dpiType, nint dpiXPtr, nint dpiYPtr);
+    #endif
+
+    // 查询指定桌面物理坐标所在显示器的有效 DPI（96=100%, 120=125%, 144=150%, 192=200%）。
+    public static int QueryDpiAtPoint(int physicalX, int physicalY) {
+        #if WINDOWS
+        nint rectBuf = NativeMemory.Alloc(16);
+        nint dpiBuf = NativeMemory.Alloc(8);
+        if (rectBuf == 0 || dpiBuf == 0) {
+            if (rectBuf != 0) { NativeMemory.Free(rectBuf); }
+            if (dpiBuf != 0) { NativeMemory.Free(dpiBuf); }
+            return StandardDpi;
+        }
+        try {
+            Span<int> r = new Span<int>(rectBuf, 4);
+            r[0] = physicalX;
+            r[1] = physicalY;
+            r[2] = physicalX + 1;
+            r[3] = physicalY + 1;
+            nint hmon = WinMonitorFromRect(rectBuf, 2 /* MONITOR_DEFAULTTONEAREST */);
+            if (hmon != 0) {
+                Span<uint> d = new Span<uint>(dpiBuf, 2);
+                d[0] = 96u;
+                d[1] = 96u;
+                int hr = WinGetDpiForMonitor(hmon, 0 /* MDT_EFFECTIVE_DPI */, dpiBuf, dpiBuf + 4);
+                if (hr == 0 && d[0] >= 48u && d[0] <= 576u) {
+                    return (int)d[0];
+                }
+            }
+        } finally {
+            NativeMemory.Free(rectBuf);
+            NativeMemory.Free(dpiBuf);
+        }
+        #endif
+        int fallback = Screen.Dpi();
+        return fallback > 0 ? fallback : StandardDpi;
+    }
+
+    public static float ScaleFactorFromDpi(int dpi) {
+        int d = dpi > 0 ? dpi : StandardDpi;
+        return (float)d / (float)StandardDpi;
+    }
+
+    public static int LogicalToPhysical(int logicalPx, int dpi) {
+        int d = dpi > 0 ? dpi : StandardDpi;
+        return (int)Math.Round((double)logicalPx * (double)d / (double)StandardDpi);
+    }
+
+    public static int PhysicalToLogical(int physicalPx, int dpi) {
+        int d = dpi > 0 ? dpi : StandardDpi;
+        return (int)Math.Round((double)physicalPx * (double)StandardDpi / (double)d);
+    }
+
+    // 窗口从 oldDpi 显示器跨屏进入 newDpi 显示器时，按比例重算物理像素尺寸并保持逻辑大小恒定。
+    public static int RescaleSizeForDpiChange(int currentPhysicalSize, int oldDpi, int newDpi) {
+        int od = oldDpi > 0 ? oldDpi : StandardDpi;
+        int nd = newDpi > 0 ? newDpi : StandardDpi;
+        int scaled = (int)Math.Round((double)currentPhysicalSize * (double)nd / (double)od);
+        return scaled > 1 ? scaled : 1;
+    }
+}
+
+// 一天作息时段常量（驱动桌宠问候语、光照色调与作息动画）。
+public static class DayPeriod {
+    public const int Dawn = 0;       // 05:00 - 07:59
+    public const int Morning = 1;    // 08:00 - 11:59
+    public const int Afternoon = 2;  // 12:00 - 17:59
+    public const int Evening = 3;    // 18:00 - 22:59
+    public const int LateNight = 4;  // 23:00 - 04:59
+}
+
+// 番茄钟专注周期阶段常量。
+public static class PomodoroPhase {
+    public const int Stopped = 0;
+    public const int Focus = 1;
+    public const int ShortBreak = 2;
+    public const int LongBreak = 3;
+}
+
+// 桌面陪伴日常作息、番茄钟专注与亲密度/精力养成引擎：
+// 确定性时间步进（无隐式时钟耦合，支持离线加速与单元测试），内置互动防刷冷却与每日缓衰减曲线。
+public class CompanionRoutineEngine {
+    public int FocusDurationSec;
+    public int ShortBreakSec;
+    public int LongBreakSec;
+    public int CyclesPerLongBreak;
+
+    public int Phase;
+    public int PhaseRemainingSec;
+    public int CompletedFocusSessions;
+
+    public float Affinity;          // 0..100 亲密度
+    public float Stamina;           // 0..100 精力值
+    public int InteractionCooldownSec;
+    private long lastInteractSec;
+    private bool hasInteracted;
+
+    public CompanionRoutineEngine() {
+        this.FocusDurationSec = 1500; // 25 min
+        this.ShortBreakSec = 300;     // 5 min
+        this.LongBreakSec = 900;      // 15 min
+        this.CyclesPerLongBreak = 4;
+        this.Phase = PomodoroPhase.Stopped;
+        this.PhaseRemainingSec = 0;
+        this.CompletedFocusSessions = 0;
+        this.Affinity = 10.0f;
+        this.Stamina = 100.0f;
+        this.InteractionCooldownSec = 15;
+        this.lastInteractSec = 0;
+        this.hasInteracted = false;
+    }
+
+    public static int ClassifyDayPeriod(int hour24) {
+        int h = hour24 % 24;
+        if (h < 0) { h = h + 24; }
+        if (h >= 5 && h <= 7) { return DayPeriod.Dawn; }
+        if (h >= 8 && h <= 11) { return DayPeriod.Morning; }
+        if (h >= 12 && h <= 17) { return DayPeriod.Afternoon; }
+        if (h >= 18 && h <= 22) { return DayPeriod.Evening; }
+        return DayPeriod.LateNight;
+    }
+
+    public void StartPomodoro() {
+        this.Phase = PomodoroPhase.Focus;
+        this.PhaseRemainingSec = this.FocusDurationSec;
+    }
+
+    public void StopPomodoro() {
+        this.Phase = PomodoroPhase.Stopped;
+        this.PhaseRemainingSec = 0;
+    }
+
+    // 推进番茄钟与精力恢复/亲密度自然缓衰减；返回本步内发生的阶段切换次数。
+    public int AdvanceSeconds(int deltaSec) {
+        if (deltaSec <= 0) { return 0; }
+        // 精力自然恢复（每秒 +0.05），亲密度极慢衰减（防长期不互动）
+        this.Stamina = this.Stamina + (float)deltaSec * 0.05f;
+        if (this.Stamina > 100.0f) { this.Stamina = 100.0f; }
+        if (deltaSec >= 3600) {
+            float hours = (float)deltaSec / 3600.0f;
+            this.Affinity = this.Affinity - hours * 0.25f;
+            if (this.Affinity < 0.0f) { this.Affinity = 0.0f; }
+        }
+
+        if (this.Phase == PomodoroPhase.Stopped) { return 0; }
+        int transitions = 0;
+        int rem = deltaSec;
+        while (rem > 0 && this.Phase != PomodoroPhase.Stopped) {
+            if (rem < this.PhaseRemainingSec) {
+                this.PhaseRemainingSec = this.PhaseRemainingSec - rem;
+                rem = 0;
+            } else {
+                rem = rem - this.PhaseRemainingSec;
+                transitions = transitions + 1;
+                if (this.Phase == PomodoroPhase.Focus) {
+                    this.CompletedFocusSessions = this.CompletedFocusSessions + 1;
+                    this.Affinity = this.Affinity + 2.5f;
+                    if (this.Affinity > 100.0f) { this.Affinity = 100.0f; }
+                    if (this.CyclesPerLongBreak > 0 && (this.CompletedFocusSessions % this.CyclesPerLongBreak == 0)) {
+                        this.Phase = PomodoroPhase.LongBreak;
+                        this.PhaseRemainingSec = this.LongBreakSec;
+                    } else {
+                        this.Phase = PomodoroPhase.ShortBreak;
+                        this.PhaseRemainingSec = this.ShortBreakSec;
+                    }
+                } else {
+                    this.Phase = PomodoroPhase.Focus;
+                    this.PhaseRemainingSec = this.FocusDurationSec;
+                }
+            }
+        }
+        return transitions;
+    }
+
+    // 玩家抚摸/喂食互动（带防刷冷却与精力消耗）；成功加亲密度返回 true，冷却中或精力不足返回 false。
+    public bool TryInteract(long nowSec, float affinityGain, float staminaCost) {
+        if (this.hasInteracted && nowSec - this.lastInteractSec < (long)this.InteractionCooldownSec) {
+            return false;
+        }
+        if (this.Stamina < staminaCost) { return false; }
+        this.hasInteracted = true;
+        this.lastInteractSec = nowSec;
+        this.Stamina = this.Stamina - staminaCost;
+        if (this.Stamina < 0.0f) { this.Stamina = 0.0f; }
+        this.Affinity = this.Affinity + affinityGain;
+        if (this.Affinity > 100.0f) { this.Affinity = 100.0f; }
+        return true;
+    }
+}

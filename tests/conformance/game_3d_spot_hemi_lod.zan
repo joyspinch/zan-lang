@@ -1,0 +1,137 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DSpotHemiLodTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuadWithNormal(float halfW, float halfH, float nx, float ny, float nz) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, nx, ny, nz, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, nx, ny, nz, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, nx, ny, nz, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, nx, ny, nz, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int R(int argb) { return (argb >> 16) & 255; }
+    private static int G(int argb) { return (argb >> 8) & 255; }
+    private static int B(int argb) { return argb & 255; }
+    private static int Lum(int argb) { return (R(argb) + G(argb) + B(argb)) / 3; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        int quadFront = cv.MeshUpload(MakeQuadWithNormal(3.0f, 3.0f, 0.0f, 0.0f, 1.0f));
+        int quadUp = cv.MeshUpload(MakeQuadWithNormal(2.0f, 2.0f, 0.0f, 1.0f, 0.0f));
+        int quadDown = cv.MeshUpload(MakeQuadWithNormal(2.0f, 2.0f, 0.0f, -1.0f, 0.0f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        // 1. GPU 聚光灯：手电筒从 (0,0,3) 垂直照射 (0,0,-1)，内锥 10°、外锥 22°
+        // 中心落在内锥内应明亮，角落落在外锥外应只有微弱环境光
+        SceneNode spotRoot = new SceneNode("spot_root");
+        SceneNode wall = new SceneNode("wall");
+        wall.MeshKey = quadFront;
+        wall.BoundsRadius = 6.0f;
+        wall.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        wall.Material.Roughness = 0.6f;
+        spotRoot.AddChild(wall);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.05f;
+        plan.AmbientGreen = 0.05f;
+        plan.AmbientBlue = 0.05f;
+        plan.Lights.Add(Light.SpotLight(1.0f, 0.9f, 0.7f, 2.0f,
+            new Vector3(0.0f, 0.0f, 3.0f),
+            new Vector3(0.0f, 0.0f, -1.0f),
+            10.0f, 0.17f, 0.38f));
+        plan.Build(spotRoot);
+
+        Renderer3D renderer = new Renderer3D(16);
+        cv.Clear(unchecked((int)0xFF000000));
+        int dSpot = renderer.Draw(cv, plan);
+        int pxCenter = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int pxCorner = zan_gui_read_pixel(cv.SurfaceId(), 10, 10);
+        bool spotOk = dSpot == 1 && Lum(pxCenter) > 160 && Lum(pxCorner) < 35
+            && R(pxCenter) > B(pxCenter) + 15;
+        Console.WriteLine("gpu-spot-light-cone: " + Convert.ToString(spotOk ? 1 : 0));
+
+        // 2. GPU 半球天空/地面环境光 IBL：无方向光/点光/聚光时，
+        // 法线朝上 (+Y) 偏蓝天顶色，法线朝下 (-Y) 偏暖红地面反弹色
+        RenderPlan hemiPlan = new RenderPlan(cam);
+        hemiPlan.AmbientRed = 0.0f;
+        hemiPlan.AmbientGreen = 0.0f;
+        hemiPlan.AmbientBlue = 0.0f;
+
+        SceneNode hemiRoot = new SceneNode("hemi_root");
+        SceneNode topFace = new SceneNode("top_face");
+        topFace.MeshKey = quadUp;
+        topFace.BoundsRadius = 4.0f;
+        topFace.Local.Position = new Vector3(-1.1f, 0.0f, 0.0f);
+        topFace.Local.Scale = new Vector3(0.45f, 0.8f, 1.0f);
+        topFace.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        topFace.Material.Roughness = 1.0f;
+        hemiRoot.AddChild(topFace);
+
+        SceneNode botFace = new SceneNode("bot_face");
+        botFace.MeshKey = quadDown;
+        botFace.BoundsRadius = 4.0f;
+        botFace.Local.Position = new Vector3(1.1f, 0.0f, 0.0f);
+        botFace.Local.Scale = new Vector3(0.45f, 0.8f, 1.0f);
+        botFace.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        botFace.Material.Roughness = 1.0f;
+        hemiRoot.AddChild(botFace);
+
+        hemiPlan.Build(hemiRoot);
+        renderer.EnableHemisphereAmbient = true;
+        renderer.HemiSkyRed = 0.15f; renderer.HemiSkyGreen = 0.35f; renderer.HemiSkyBlue = 0.90f;
+        renderer.HemiGroundRed = 0.85f; renderer.HemiGroundGreen = 0.30f; renderer.HemiGroundBlue = 0.12f;
+        cv.Clear(unchecked((int)0xFF000000));
+        int dHemi = renderer.Draw(cv, hemiPlan);
+        int pxUp = zan_gui_read_pixel(cv.SurfaceId(), 36, 64);
+        int pxDown = zan_gui_read_pixel(cv.SurfaceId(), 92, 64);
+        bool hemiOk = dHemi == 1
+            && B(pxUp) > R(pxUp) + 100
+            && R(pxDown) > B(pxDown) + 100;
+        Console.WriteLine("gpu-hemisphere-ibl-ambient: " + Convert.ToString(hemiOk ? 1 : 0));
+
+        // 3. 迟滞防抖 LodGroup3D（边界防跳变 + 超距自动隐藏 + SceneNode 同步）
+        LodGroup3D lod = new LodGroup3D(2.0f, 80.0f);
+        lod.AddLevel(20.0f, 101); // LOD0 高模
+        lod.AddLevel(50.0f, 102); // LOD1 中模
+        lod.AddLevel(80.0f, 103); // LOD2 低模
+
+        int l0 = lod.SelectLevel(10.0f);      // -> 0
+        int l0Hold = lod.SelectLevel(21.0f);  // 21 < 20+2 -> 仍在 0 不抖动
+        int l1 = lod.SelectLevel(22.5f);      // >= 22 -> 切到 1
+        int l1Hold = lod.SelectLevel(19.0f);  // 19 > 20-2 -> 仍在 1 不回弹
+        int l0Back = lod.SelectLevel(17.5f);  // <= 18 -> 平滑切回 0
+        int l2 = lod.SelectLevel(60.0f);      // -> 2
+        int lCullHold = lod.SelectLevel(81.0f); // 81 < 80+2 -> 仍可见 2
+        int lCulled = lod.SelectLevel(82.5f);   // >= 82 -> 超距剔除 -1
+
+        SceneNode lodNode = new SceneNode("tree");
+        lod.ApplyToNode(lodNode, Vector3.Zero, new Vector3(0.0f, 0.0f, 95.0f));
+        bool hiddenFar = !lodNode.Visible;
+        lod.ApplyToNode(lodNode, Vector3.Zero, new Vector3(0.0f, 0.0f, 12.0f));
+        bool visibleNear = lodNode.Visible && lodNode.MeshKey == 101;
+
+        bool lodOk = l0 == 0 && l0Hold == 0 && l1 == 1 && l1Hold == 1 && l0Back == 0
+            && l2 == 2 && lCullHold == 2 && lCulled == -1 && hiddenFar && visibleNear;
+        Console.WriteLine("lodgroup-hysteresis-cull: " + Convert.ToString(lodOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

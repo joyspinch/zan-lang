@@ -1,0 +1,67 @@
+using System;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionPowerLifeTest {
+    static void Main() {
+        // 1. OS 电源状态实机探针 + 自适应省电帧率调控器
+        SystemPowerInfo realPower = CompanionPowerGovernor.QuerySystemPower();
+        bool osPowerOk = realPower != null && (realPower.BatteryPercent == -1 || (realPower.BatteryPercent >= 0 && realPower.BatteryPercent <= 100));
+
+        CompanionPowerGovernor gov = new CompanionPowerGovernor();
+        int fpsAc = gov.RecommendFps(SystemPowerInfo.FromValues(true, true, false, 100), UserActivityState.Active, false);
+        int fpsBat = gov.RecommendFps(SystemPowerInfo.FromValues(false, true, false, 65), UserActivityState.Active, false);
+        int fpsLowBat = gov.RecommendFps(SystemPowerInfo.FromValues(false, true, false, 15), UserActivityState.Active, false);
+        int fpsSaver = gov.RecommendFps(SystemPowerInfo.FromValues(false, true, true, 80), UserActivityState.Active, false);
+        int fpsIdle = gov.RecommendFps(SystemPowerInfo.FromValues(true, false, false, -1), UserActivityState.Idle, false);
+        int fpsAfk = gov.RecommendFps(SystemPowerInfo.FromValues(false, true, false, 70), UserActivityState.Afk, false);
+        int fpsHidden = gov.RecommendFps(SystemPowerInfo.FromValues(true, false, false, -1), UserActivityState.Active, true);
+        int intervalHidden = gov.RecommendFrameIntervalMs(SystemPowerInfo.FromValues(true, false, false, -1), UserActivityState.Active, true);
+
+        bool powerGovOk = osPowerOk
+            && fpsAc == 60 && fpsBat == 30 && fpsLowBat == 20 && fpsSaver == 20
+            && fpsIdle == 15 && fpsAfk == 8 && fpsHidden == 1 && intervalHidden == 1000;
+        Console.WriteLine("power-governor-adaptive-fps: " + Convert.ToString(powerGovOk ? 1 : 0));
+
+        // 2. 混合 DPI 实机探针（shcore!GetDpiForMonitor）+ 逻辑/物理像素换算与跨屏等比缩放
+        int liveDpi = MonitorDpiCoordinator.QueryDpiAtPoint(10, 10);
+        int phys150 = MonitorDpiCoordinator.LogicalToPhysical(200, 144);     // 200 * 1.5 = 300
+        int backLog = MonitorDpiCoordinator.PhysicalToLogical(phys150, 144); // 300 / 1.5 = 200
+        // 从 4K 150%（144 DPI）拖到 1080p 100%（96 DPI）：物理 300px -> 200px，视觉尺寸恒定
+        int rescaled = MonitorDpiCoordinator.RescaleSizeForDpiChange(300, 144, 96);
+        bool dpiOk = liveDpi >= 48 && liveDpi <= 576
+            && phys150 == 300 && backLog == 200 && rescaled == 200;
+        Console.WriteLine("monitor-dpi-coordinator: " + Convert.ToString(dpiOk ? 1 : 0));
+
+        // 3. 番茄钟周期 + 一天作息分类 + 亲密度防刷冷却与精力曲线
+        CompanionRoutineEngine routine = new CompanionRoutineEngine();
+        routine.FocusDurationSec = 100;
+        routine.ShortBreakSec = 20;
+        routine.LongBreakSec = 60;
+        routine.CyclesPerLongBreak = 2;
+        routine.StartPomodoro();
+
+        // 推进 100s -> 完成第 1 个专注，进入 ShortBreak(20s)，亲密度 +2.5
+        int t1 = routine.AdvanceSeconds(100);
+        bool afterFocus1 = t1 == 1 && routine.Phase == PomodoroPhase.ShortBreak
+            && routine.CompletedFocusSessions == 1 && routine.Affinity > 12.4f;
+        // 再推进 120s（20s 短休 + 100s 第 2 个专注）-> 自动进入 LongBreak(60s)
+        int t2 = routine.AdvanceSeconds(120);
+        bool afterFocus2 = t2 == 2 && routine.Phase == PomodoroPhase.LongBreak
+            && routine.CompletedFocusSessions == 2;
+
+        // 互动防刷冷却测试：t=1000 成功，t=1005 冷却被拒，t=1020 冷却结束再次成功
+        bool i1 = routine.TryInteract(1000, 3.0f, 10.0f);
+        bool i2Blocked = !routine.TryInteract(1005, 3.0f, 10.0f);
+        bool i3 = routine.TryInteract(1020, 3.0f, 10.0f);
+        bool periodsOk = CompanionRoutineEngine.ClassifyDayPeriod(6) == DayPeriod.Dawn
+            && CompanionRoutineEngine.ClassifyDayPeriod(10) == DayPeriod.Morning
+            && CompanionRoutineEngine.ClassifyDayPeriod(15) == DayPeriod.Afternoon
+            && CompanionRoutineEngine.ClassifyDayPeriod(20) == DayPeriod.Evening
+            && CompanionRoutineEngine.ClassifyDayPeriod(2) == DayPeriod.LateNight;
+
+        bool routineOk = afterFocus1 && afterFocus2 && i1 && i2Blocked && i3 && periodsOk;
+        Console.WriteLine("companion-routine-pomodoro-affinity: " + Convert.ToString(routineOk ? 1 : 0));
+    }
+}

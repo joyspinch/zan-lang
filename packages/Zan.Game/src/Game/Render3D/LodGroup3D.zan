@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 单级 3D 网格 LOD 档位（按距离升序排列，MeshKey <= 0 表示超距剔除）。
+public class LodLevel3D {
+    public float MaxDistance;
+    public int MeshKey;
+
+    public LodLevel3D(float maxDistance, int meshKey) {
+        this.MaxDistance = maxDistance > 0.0f ? maxDistance : 1.0f;
+        this.MeshKey = meshKey;
+    }
+}
+
+// 商业级带迟滞防抖（Hysteresis）的 3D 网格 LOD 选择器：
+// 防止相机在距离阈值附近微小移动时网格来回跳变（LOD Popping），
+// 支持超距自动隐藏（CullDistance）并一键应用到目标 SceneNode。
+public class LodGroup3D {
+    private List<LodLevel3D> levels;
+    public float Hysteresis;
+    public float CullDistance;
+    public int CurrentLevel;
+
+    public LodGroup3D(float hysteresis, float cullDistance) {
+        this.levels = new List<LodLevel3D>();
+        this.Hysteresis = hysteresis >= 0.0f ? hysteresis : 1.5f;
+        this.CullDistance = cullDistance;
+        this.CurrentLevel = -1;
+    }
+
+    public int LevelCount { get { return this.levels.Count; } }
+
+    public void AddLevel(float maxDistance, int meshKey) {
+        LodLevel3D lvl = new LodLevel3D(maxDistance, meshKey);
+        int insertAt = this.levels.Count;
+        for (int i = 0; i < this.levels.Count; i = i + 1) {
+            if (maxDistance < this.levels[i].MaxDistance) {
+                insertAt = i;
+                break;
+            }
+        }
+        this.levels.Insert(insertAt, lvl);
+    }
+
+    private int RawLevelForDistance(float distance) {
+        if (this.CullDistance > 0.0f && distance > this.CullDistance) {
+            return -1;
+        }
+        for (int i = 0; i < this.levels.Count; i = i + 1) {
+            if (distance <= this.levels[i].MaxDistance) {
+                return i;
+            }
+        }
+        return this.levels.Count > 0 ? this.levels.Count - 1 : -1;
+    }
+
+    // 根据相机到物体距离选择当前 LOD 索引（-1 表示超距剔除）；自动应用迟滞防抖带。
+    public int SelectLevel(float distance) {
+        if (this.levels.Count == 0) {
+            this.CurrentLevel = -1;
+            return -1;
+        }
+        if (distance < 0.0f) { distance = 0.0f; }
+        int raw = this.RawLevelForDistance(distance);
+        if (this.CurrentLevel < 0 || this.CurrentLevel >= this.levels.Count) {
+            this.CurrentLevel = raw;
+            return raw;
+        }
+        if (raw == this.CurrentLevel) {
+            return this.CurrentLevel;
+        }
+        // 切向更低精度或剔除（拉远）：必须超出当前阈值 + Hysteresis
+        if (raw == -1) {
+            if (this.CullDistance > 0.0f && distance >= this.CullDistance + this.Hysteresis) {
+                this.CurrentLevel = -1;
+            }
+            return this.CurrentLevel;
+        }
+        if (raw > this.CurrentLevel) {
+            float upper = this.levels[this.CurrentLevel].MaxDistance;
+            if (distance >= upper + this.Hysteresis) {
+                this.CurrentLevel = raw;
+            }
+            return this.CurrentLevel;
+        }
+        // 切向更高精度（拉近）：必须小于目标档位阈值 - Hysteresis
+        float lower = this.levels[raw].MaxDistance - this.Hysteresis;
+        if (lower < 0.0f) { lower = 0.0f; }
+        if (distance <= lower) {
+            this.CurrentLevel = raw;
+        }
+        return this.CurrentLevel;
+    }
+
+    public int SelectMeshKey(float distance) {
+        int lvl = this.SelectLevel(distance);
+        if (lvl < 0 || lvl >= this.levels.Count) { return 0; }
+        return this.levels[lvl].MeshKey;
+    }
+
+    // 直接按相机位置刷新 SceneNode 的 MeshKey 与可见性。
+    public int ApplyToNode(SceneNode node, Vector3 cameraPos, Vector3 nodeWorldPos) {
+        if (node == null) { return -1; }
+        float dx = nodeWorldPos.X - cameraPos.X;
+        float dy = nodeWorldPos.Y - cameraPos.Y;
+        float dz = nodeWorldPos.Z - cameraPos.Z;
+        float dist = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+        int lvl = this.SelectLevel(dist);
+        if (lvl < 0) {
+            node.Visible = false;
+            return -1;
+        }
+        node.Visible = true;
+        node.MeshKey = this.levels[lvl].MeshKey;
+        return lvl;
+    }
+}

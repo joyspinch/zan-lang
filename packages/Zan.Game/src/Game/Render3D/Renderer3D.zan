@@ -51,6 +51,14 @@ public class Renderer3D {
     public PostProcess PostProcess;
     // 可选 GPU 程序化大气天空盒（在 3D 几何体之前绘制，禁写深度）；null 时零开销。
     public Skybox3D Skybox;
+    // 可选 GPU 半球天空/地面环境光 IBL（按 N.y 混合天顶与地面反弹色，默认关闭保持向后兼容）。
+    public bool EnableHemisphereAmbient;
+    public float HemiSkyRed;
+    public float HemiSkyGreen;
+    public float HemiSkyBlue;
+    public float HemiGroundRed;
+    public float HemiGroundGreen;
+    public float HemiGroundBlue;
 
     public Renderer3D(int capacity) {
         this.batch = MeshBatch.Create(capacity);
@@ -79,6 +87,26 @@ public class Renderer3D {
         this.FogEnd = 80.0f;
         this.PostProcess = null;
         this.Skybox = null;
+        this.EnableHemisphereAmbient = false;
+        this.HemiSkyRed = 0.32f;
+        this.HemiSkyGreen = 0.48f;
+        this.HemiSkyBlue = 0.72f;
+        this.HemiGroundRed = 0.16f;
+        this.HemiGroundGreen = 0.14f;
+        this.HemiGroundBlue = 0.12f;
+    }
+
+    // 便捷：直接从当前 Skybox 同步天顶/地面颜色作为半球 IBL 环境光并开启。
+    public void SyncHemisphereFromSkybox(float intensity) {
+        if (this.Skybox == null) { return; }
+        float s = intensity > 0.0f ? intensity : 0.45f;
+        this.EnableHemisphereAmbient = true;
+        this.HemiSkyRed = this.Skybox.TopRed * s;
+        this.HemiSkyGreen = this.Skybox.TopGreen * s;
+        this.HemiSkyBlue = this.Skybox.TopBlue * s;
+        this.HemiGroundRed = this.Skybox.GroundRed * s;
+        this.HemiGroundGreen = this.Skybox.GroundGreen * s;
+        this.HemiGroundBlue = this.Skybox.GroundBlue * s;
     }
 
     private static Mat4 BuildOrthoGl(float left, float right, float bottom, float top,
@@ -214,6 +242,57 @@ public class Renderer3D {
         return pCount;
     }
 
+    private int ApplySpotLights(Canvas canvas, RenderPlan plan) {
+        int sCount = 0;
+        if (plan.Lights != null) {
+            for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+                Light lt = plan.Lights[i];
+                if (lt != null && lt.Enabled && lt.Kind == LightKind.Spot) {
+                    sCount = sCount + 1;
+                    if (sCount == 4) { break; }
+                }
+            }
+        }
+        if (sCount == 0) {
+            canvas.SetSpotLights3D(null, null, null);
+            return 0;
+        }
+        float[] posRange = new float[sCount * 4];
+        float[] dirInner = new float[sCount * 4];
+        float[] colOuter = new float[sCount * 4];
+        int idx = 0;
+        for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+            Light lt = plan.Lights[i];
+            if (lt != null && lt.Enabled && lt.Kind == LightKind.Spot) {
+                posRange[idx * 4 + 0] = lt.Position.X;
+                posRange[idx * 4 + 1] = lt.Position.Y;
+                posRange[idx * 4 + 2] = lt.Position.Z;
+                posRange[idx * 4 + 3] = lt.Range > 0.0f ? lt.Range : 1000.0f;
+                Vector3 d = Vector3.Normalize(lt.Direction);
+                float cosIn = (float)Math.Cos((double)lt.InnerAngle);
+                float cosOut = (float)Math.Cos((double)lt.OuterAngle);
+                if (cosIn < cosOut) {
+                    float tmp = cosIn;
+                    cosIn = cosOut;
+                    cosOut = tmp;
+                }
+                dirInner[idx * 4 + 0] = d.X;
+                dirInner[idx * 4 + 1] = d.Y;
+                dirInner[idx * 4 + 2] = d.Z;
+                dirInner[idx * 4 + 3] = cosIn;
+                float energy = lt.Intensity;
+                colOuter[idx * 4 + 0] = lt.Red * energy;
+                colOuter[idx * 4 + 1] = lt.Green * energy;
+                colOuter[idx * 4 + 2] = lt.Blue * energy;
+                colOuter[idx * 4 + 3] = cosOut;
+                idx = idx + 1;
+                if (idx == sCount) { break; }
+            }
+        }
+        canvas.SetSpotLights3D(posRange, dirInner, colOuter);
+        return sCount;
+    }
+
     // 提交一帧。
     public int Draw(Canvas canvas, RenderPlan plan) {
         if (this.batch == null || canvas == null || plan == null
@@ -235,13 +314,16 @@ public class Renderer3D {
             canvas.DrawSkybox3D(plan.Camera, this.Skybox);
         }
         int pointLightCount = 0;
+        int spotLightCount = 0;
         if (!this.UseCpuLighting) {
             this.ApplyLights(canvas, plan);
             pointLightCount = this.ApplyPointLights(canvas, plan);
+            spotLightCount = this.ApplySpotLights(canvas, plan);
         }
 
-        // 检查本帧是否需要高级多 Pass（阴影 / 蒙皮 / 透明层 / 点光源 / 距离雾 / PBR 高光、自发光或法线贴图）
-        bool needMultiPass = this.EnableShadows || this.EnableFog || pointLightCount > 0;
+        // 检查本帧是否需要高级多 Pass（阴影 / 蒙皮 / 透明层 / 点光源 / 聚光灯 / 半球 IBL / 距离雾 / PBR 高光、自发光或法线贴图）
+        bool needMultiPass = this.EnableShadows || this.EnableFog || this.EnableHemisphereAmbient
+            || pointLightCount > 0 || spotLightCount > 0;
         if (!needMultiPass) {
             for (int i = 0; i < n; i = i + 1) {
                 RenderItem it = plan.ItemAt(i);
@@ -280,6 +362,9 @@ public class Renderer3D {
         canvas.SetCamera3D(plan.Camera.Position.X, plan.Camera.Position.Y, plan.Camera.Position.Z);
         canvas.SetFog3D(this.EnableFog, this.FogRed, this.FogGreen, this.FogBlue,
                         this.FogStart, this.FogEnd);
+        canvas.SetHemisphereAmbient3D(this.EnableHemisphereAmbient,
+            this.HemiSkyRed, this.HemiSkyGreen, this.HemiSkyBlue,
+            this.HemiGroundRed, this.HemiGroundGreen, this.HemiGroundBlue);
 
         // Pass 1：方向光 ShadowMap 投射（同时支持静态与 GPU 蒙皮网格）
         bool shadowActive = false;
@@ -306,7 +391,9 @@ public class Renderer3D {
             if (shadowActive) { canvas.ShadowClear(); }
             canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
             canvas.SetFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+            canvas.SetHemisphereAmbient3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
             canvas.SetPointLights3D(null, null);
+            canvas.SetSpotLights3D(null, null, null);
             return 0;
         }
 
@@ -365,7 +452,9 @@ public class Renderer3D {
         canvas.SetNormalMap3D("", 0.0f);
         canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
         canvas.SetFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        canvas.SetHemisphereAmbient3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         canvas.SetPointLights3D(null, null);
+        canvas.SetSpotLights3D(null, null, null);
         if (drawn > 0 && this.PostProcess != null && this.PostProcess.HasGpuPassEffect()) {
             canvas.PostProcess3D(this.PostProcess);
         }
