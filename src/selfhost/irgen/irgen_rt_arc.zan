@@ -300,6 +300,69 @@ partial class Irgen {
         H("miss:");
         H("  ret i8* null");
         H("}");
+        H("define i64 @__zan_refl_method_find_idx(i8* %ti, i8* %name) {");
+        H("entry:");
+        H("  %isnull_ti = icmp eq i8* %ti, null");
+        H("  %isnull_nm = icmp eq i8* %name, null");
+        H("  %bad = or i1 %isnull_ti, %isnull_nm");
+        H("  br i1 %bad, label %miss, label %read");
+        H("read:");
+        H("  %mp_off = getelementptr inbounds i8, i8* %ti, i64 -88");
+        H("  %mp_ptr = bitcast i8* %mp_off to i8**");
+        H("  %mbase = load i8*, i8** %mp_ptr");
+        H("  %mcp_off = getelementptr inbounds i8, i8* %ti, i64 -80");
+        H("  %mcp_ptr = bitcast i8* %mcp_off to i64*");
+        H("  %mcnt = load i64, i64* %mcp_ptr");
+        H("  %noc = icmp sle i64 %mcnt, 0");
+        H("  %nom = icmp eq i8* %mbase, null");
+        H("  %empty = or i1 %noc, %nom");
+        H("  br i1 %empty, label %miss, label %loop_init");
+        H("loop_init:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %idx = phi i64 [ 0, %loop_init ], [ %next_idx, %step ]");
+        H("  %cur_off = mul i64 %idx, 72");
+        H("  %slot = getelementptr inbounds i8, i8* %mbase, i64 %cur_off");
+        H("  %mn_ptr = bitcast i8* %slot to i8**");
+        H("  %mname = load i8*, i8** %mn_ptr");
+        H("  %eq = call i32 @strcmp(i8* %mname, i8* %name)");
+        H("  %hit = icmp eq i32 %eq, 0");
+        H("  br i1 %hit, label %found, label %step");
+        H("step:");
+        H("  %next_idx = add i64 %idx, 1");
+        H("  %cont = icmp slt i64 %next_idx, %mcnt");
+        H("  br i1 %cont, label %loop, label %miss");
+        H("found:");
+        H("  ret i64 %idx");
+        H("miss:");
+        H("  ret i64 -1");
+        H("}");
+        H("define i8* @__zan_refl_method_name_at(i8* %ti, i64 %idx) {");
+        H("entry:");
+        H("  %isnull_ti = icmp eq i8* %ti, null");
+        H("  %neg = icmp slt i64 %idx, 0");
+        H("  %bad = or i1 %isnull_ti, %neg");
+        H("  br i1 %bad, label %miss, label %read");
+        H("read:");
+        H("  %mp_off = getelementptr inbounds i8, i8* %ti, i64 -88");
+        H("  %mp_ptr = bitcast i8* %mp_off to i8**");
+        H("  %mbase = load i8*, i8** %mp_ptr");
+        H("  %mcp_off = getelementptr inbounds i8, i8* %ti, i64 -80");
+        H("  %mcp_ptr = bitcast i8* %mcp_off to i64*");
+        H("  %mcnt = load i64, i64* %mcp_ptr");
+        H("  %nom = icmp eq i8* %mbase, null");
+        H("  %oob = icmp sge i64 %idx, %mcnt");
+        H("  %bad2 = or i1 %nom, %oob");
+        H("  br i1 %bad2, label %miss, label %hit");
+        H("hit:");
+        H("  %off = mul i64 %idx, 72");
+        H("  %slot = getelementptr inbounds i8, i8* %mbase, i64 %off");
+        H("  %mn_ptr = bitcast i8* %slot to i8**");
+        H("  %mname = load i8*, i8** %mn_ptr");
+        H("  ret i8* %mname");
+        H("miss:");
+        H("  ret i8* null");
+        H("}");
     }
 
     // is `t` a heap object carrying an ARC header (class/struct instance or one
@@ -451,19 +514,59 @@ partial class Irgen {
     }
 
     // Inside a call expression (callArmStack non-empty) the temporary just
-    // added is armed on the owner chain at once: a throw from a later
-    // argument, the callee or a built-in operation releases it. See
-    // EnterCallArm / LeaveCallArm.
+    // added is queued for lazy arming: it is armed immediately before any
+    // subsequent call or branch (protecting against throws from later
+    // arguments or the callee), while an outermost call's return value that
+    // finishes with no intervening call/branch is never armed or retired.
     void ArmTempNow() {
         if (callArmStack == null || callArmStack.Count == 0) { return; }
         if (!eaActive) { return; }
-        // only into a call of THIS function: an inline-generated nested
-        // function (lambda, binding accessor) must never arm into its
-        // enclosing function's call
-        if (callArmFn[callArmFn.Count - 1] != entryAllocas) { return; }
-        List<string> top = callArmStack[callArmStack.Count - 1];
-        Dictionary<string, bool> topSet = callArmSets[callArmSets.Count - 1];
-        ArmArgTemps(stmtTemps.Count - 1, top, topSet);
+        int topIdx = callArmStack.Count - 1;
+        if (callArmFn[topIdx] != entryAllocas) { return; }
+        string op = stmtTemps[stmtTemps.Count - 1];
+        if (op == "null" || op.Length == 0 || op[0] != 37) { return; }
+        callArmPending[topIdx].Add(op);
+        hasPendingCallArm = true;
+    }
+
+    bool AnyPendingCallArm() {
+        if (callArmPending == null) { return false; }
+        int i = 0;
+        while (i < callArmPending.Count) {
+            if (callArmPending[i].Count > 0) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void FlushPendingCallArms() {
+        if (!hasPendingCallArm) { return; }
+        if (callArmStack == null || callArmStack.Count == 0 || !eaActive) { return; }
+        int topIdx = callArmStack.Count - 1;
+        if (callArmFn[topIdx] != entryAllocas) { return; }
+        List<string> pend = callArmPending[topIdx];
+        if (pend.Count == 0) {
+            hasPendingCallArm = AnyPendingCallArm();
+            return;
+        }
+        callArmPending[topIdx] = new List<string>();
+        hasPendingCallArm = false;
+        List<string> top = callArmStack[topIdx];
+        Dictionary<string, bool> topSet = callArmSets[topIdx];
+        int p = 0;
+        while (p < pend.Count) {
+            string pOp = pend[p];
+            int idx = stmtTemps.Count - 1;
+            while (idx >= 0) {
+                if (stmtTemps[idx] == pOp) {
+                    ArmArgTempAt(idx, top, topSet);
+                    break;
+                }
+                idx = idx - 1;
+            }
+            p = p + 1;
+        }
+        hasPendingCallArm = AnyPendingCallArm();
     }
 
     // Every call expression brackets its receiver, arguments and the call
@@ -474,25 +577,34 @@ partial class Irgen {
     // function exit, so no armed slot outlives its frame.
     public List<List<string>> callArmStack;
     public List<Dictionary<string, bool>> callArmSets;
+    public List<List<string>> callArmPending;
     public List<StringBuilder> callArmFn;
     void EnterCallArm() {
         if (callArmStack == null) { callArmStack = new List<List<string>>(); }
         if (callArmSets == null) { callArmSets = new List<Dictionary<string, bool>>(); }
+        if (callArmPending == null) { callArmPending = new List<List<string>>(); }
         if (callArmFn == null) { callArmFn = new List<StringBuilder>(); }
+        if (hasPendingCallArm) { FlushPendingCallArms(); }
         callArmStack.Add(new List<string>());
         callArmSets.Add(new Dictionary<string, bool>());
+        callArmPending.Add(new List<string>());
         callArmFn.Add(entryAllocas);
     }
     void LeaveCallArm() {
-        List<string> top = callArmStack[callArmStack.Count - 1];
-        Dictionary<string, bool> topSet = callArmSets[callArmSets.Count - 1];
-        StringBuilder fn = callArmFn[callArmFn.Count - 1];
-        callArmStack.RemoveAt(callArmStack.Count - 1);
-        callArmSets.RemoveAt(callArmSets.Count - 1);
-        callArmFn.RemoveAt(callArmFn.Count - 1);
-        if (callArmStack.Count > 0 && callArmFn[callArmFn.Count - 1] == fn) {
-            List<string> parent = callArmStack[callArmStack.Count - 1];
-            Dictionary<string, bool> parentSet = callArmSets[callArmSets.Count - 1];
+        int last = callArmStack.Count - 1;
+        List<string> top = callArmStack[last];
+        Dictionary<string, bool> topSet = callArmSets[last];
+        List<string> topPend = callArmPending[last];
+        StringBuilder fn = callArmFn[last];
+        callArmStack.RemoveAt(last);
+        callArmSets.RemoveAt(last);
+        callArmPending.RemoveAt(last);
+        callArmFn.RemoveAt(last);
+        if (callArmStack.Count > 0 && callArmFn[callArmStack.Count - 1] == fn) {
+            int pIdx = callArmStack.Count - 1;
+            List<string> parent = callArmStack[pIdx];
+            Dictionary<string, bool> parentSet = callArmSets[pIdx];
+            List<string> parentPend = callArmPending[pIdx];
             int i = 0;
             while (i < top.Count) {
                 string entry = top[i];
@@ -501,8 +613,15 @@ partial class Irgen {
                 if (tab >= 0) { parentSet[entry.Substring(tab + 1)] = true; }
                 i = i + 1;
             }
+            int j = 0;
+            while (j < topPend.Count) {
+                parentPend.Add(topPend[j]);
+                j = j + 1;
+            }
+            hasPendingCallArm = AnyPendingCallArm();
             return;
         }
+        hasPendingCallArm = AnyPendingCallArm();
         if (!term) { RetireArgTemps(top); }
     }
 
@@ -519,6 +638,32 @@ partial class Irgen {
         return false;
     }
 
+    void ArmArgTempAt(int i, List<string> armed, Dictionary<string, bool> armedSet) {
+        string op = stmtTemps[i];
+        Node ty = stmtTempTypes[i];
+        string lt = MapType(ty);
+        string slot = op;
+        bool isSlot = op.Length > 1 && op[1] == 122;
+        if (!isSlot) {
+            if (op == "null" || op.Length == 0 || op[0] != 37) { return; }
+            slot = NTS();
+            entryAllocas.Append("  " + slot + " = alloca " + lt + "\n");
+            entryAllocas.Append("  store " + lt + " null, " + lt + "* " + slot + "\n");
+            L("  store " + lt + " " + op + ", " + lt + "* " + slot);
+            stmtTemps[i] = slot;
+            int k = 0;
+            while (k < stmtTempOwners.Count) {
+                if (stmtTempOwners[k] == op) { stmtTempOwners[k] = slot; }
+                k = k + 1;
+            }
+        }
+        if (!SlotArmedHere(slot)) {
+            ArmLocalSlot(slot, ty, false);
+            armed.Add(lt + "\t" + slot);
+            armedSet[slot] = true;
+        }
+    }
+
     // Arm every temporary in [mark, end) that is not armed yet: a register
     // temporary moves into an entry slot first. The armed entries
     // ("<llvm type>\t<slot>") are appended to `armed`.
@@ -526,29 +671,7 @@ partial class Irgen {
         if (!eaActive) { return; }
         int i = mark;
         while (i < stmtTemps.Count) {
-            string op = stmtTemps[i];
-            Node ty = stmtTempTypes[i];
-            string lt = MapType(ty);
-            string slot = op;
-            bool isSlot = op.Length > 1 && op[1] == 122;
-            if (!isSlot) {
-                if (op == "null" || op.Length == 0 || op[0] != 37) { i = i + 1; continue; }
-                slot = NTS();
-                entryAllocas.Append("  " + slot + " = alloca " + lt + "\n");
-                entryAllocas.Append("  store " + lt + " null, " + lt + "* " + slot + "\n");
-                L("  store " + lt + " " + op + ", " + lt + "* " + slot);
-                stmtTemps[i] = slot;
-                int k = 0;
-                while (k < stmtTempOwners.Count) {
-                    if (stmtTempOwners[k] == op) { stmtTempOwners[k] = slot; }
-                    k = k + 1;
-                }
-            }
-            if (!SlotArmedHere(slot)) {
-                ArmLocalSlot(slot, ty, false);
-                armed.Add(lt + "\t" + slot);
-                armedSet[slot] = true;
-            }
+            ArmArgTempAt(i, armed, armedSet);
             i = i + 1;
         }
     }
@@ -570,11 +693,14 @@ partial class Irgen {
             if (op.Length > 1 && op[1] == 122) {
                 // entry 槽位（%z 前缀）：load 出值再释放
                 string lt = MapType(stmtTempTypes[i]);
-                if (op.EndsWith(".arg.owner")) { RetireLocalSlot(op, lt); }
-                string v = NT();
-                L("  " + v + " = load " + lt + ", " + lt + "* " + op);
-                L("  store " + lt + " null, " + lt + "* " + op);
-                EmitArcRelease(v, stmtTempTypes[i]);
+                if (op.EndsWith(".arg.owner")) {
+                    DropLocalSlot(op, stmtTempTypes[i], lt);
+                } else {
+                    string v = NT();
+                    L("  " + v + " = load " + lt + ", " + lt + "* " + op);
+                    L("  store " + lt + " null, " + lt + "* " + op);
+                    EmitArcRelease(v, stmtTempTypes[i]);
+                }
             } else {
                 EmitArcRelease(op, stmtTempTypes[i]);
             }
@@ -619,10 +745,13 @@ partial class Irgen {
                 L("  " + t + " = load " + lt + ", " + lt + "* " + p);
                 EmitArcRelease(t, locType[i]);
             } else {
-                if (!curAsync || IsDirectAsyncLocal(locReg[i])) { RetireLocalSlot(locReg[i], lt); }
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                L("  store " + lt + " null, " + lt + "* " + locReg[i]);
-                EmitArcRelease(t, locType[i]);
+                if (!curAsync || IsDirectAsyncLocal(locReg[i])) {
+                    DropLocalSlot(locReg[i], locType[i], lt);
+                } else {
+                    L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                    L("  store " + lt + " null, " + lt + "* " + locReg[i]);
+                    EmitArcRelease(t, locType[i]);
+                }
             }
         }
     }

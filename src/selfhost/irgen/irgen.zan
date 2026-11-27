@@ -61,12 +61,20 @@ partial class Irgen {
     bool rtChkNullEmitted;
     bool rtChkListOobEmitted;
     bool rtChkListNullEmitted;
+    bool rtGuardNullObjEmitted;
+    bool listGetChkEmitted;
+    bool listSetChkEmitted;
     bool strCat2Emitted;
     bool strCat3Emitted;
     bool strCat4Emitted;
     bool strCat5Emitted;
     bool strCatNEmitted;
+    bool strFromI64Emitted;
+    bool strFromU64Emitted;
+    bool strFmtI64Emitted;
+    bool strFmtF64Emitted;
     bool hasTaskProfile;
+    bool hasPendingCallArm;
     public int tmp;
     public int lbl;
     public int strn;
@@ -339,12 +347,20 @@ partial class Irgen {
         rtChkNullEmitted = false;
         rtChkListOobEmitted = false;
         rtChkListNullEmitted = false;
+        rtGuardNullObjEmitted = false;
+        listGetChkEmitted = false;
+        listSetChkEmitted = false;
         strCat2Emitted = false;
         strCat3Emitted = false;
         strCat4Emitted = false;
         strCat5Emitted = false;
         strCatNEmitted = false;
+        strFromI64Emitted = false;
+        strFromU64Emitted = false;
+        strFmtI64Emitted = false;
+        strFmtF64Emitted = false;
         hasTaskProfile = false;
+        hasPendingCallArm = false;
         deferred = new StringBuilder(); lamCount = 0;
         entryAllocas = new StringBuilder(); eaActive = false;
         tmp = 0; lbl = 0; strn = 0; term = false;
@@ -454,7 +470,10 @@ partial class Irgen {
         externDecls.Add("fseek"); externDecls.Add("ftell"); externDecls.Add("fread");
         externDecls.Add("fwrite"); externDecls.Add("fclose"); externDecls.Add("_setjmp");
         externDecls.Add("longjmp"); externDecls.Add("exit"); externDecls.Add("atoi");
-        if (hostWin) { externDecls.Add("zan_utf8_argv"); }
+        if (hostWin) {
+            externDecls.Add("zan_utf8_argv");
+            externDecls.Add("_setmode");
+        }
     }
 
     bool ExternSeen(string name) {
@@ -507,6 +526,11 @@ partial class Irgen {
     string NTS() { tmp = tmp + 1; return "%z" + tmp; }
     int NL() { lbl = lbl + 1; return lbl; }
     void L(string s) {
+        if (hasPendingCallArm
+            && (s.IndexOf("call ") >= 0 || s.StartsWith("  br ") || s.StartsWith("  switch ")
+                || s.StartsWith("  ret ") || s.StartsWith("  unreachable"))) {
+            FlushPendingCallArms();
+        }
         if (debugBody != null && body == debugBody && s.StartsWith("  ") && !s.StartsWith("  ;")
             && !s.StartsWith("    ") && !s.EndsWith(" [")) {
             // LLVM comments must follow the instruction's debug attachment.
@@ -534,7 +558,10 @@ partial class Irgen {
         ArmMaterializedLocal(reg, lt);
     }
     void H(string s) { head.Append(s); head.Append("\n"); }
-    void Label(int n) { body.Append("L" + n + ":\n"); term = false; curLbl = "L" + n; }
+    void Label(int n) {
+        if (hasPendingCallArm) { FlushPendingCallArms(); }
+        body.Append("L" + n + ":\n"); term = false; curLbl = "L" + n;
+    }
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
 
@@ -772,6 +799,7 @@ partial class Irgen {
         if (hostWin) {
             H("declare i32 @SetConsoleOutputCP(i32)");
             H("declare i32 @SetConsoleCP(i32)");
+            H("declare i64 @_setmode(i64, i64)");
             H("declare i32 @zan_utf8_argv(i32*, i8***)");
         }
         H("declare void @longjmp(i8*, i32)");
@@ -821,14 +849,25 @@ partial class Irgen {
         // 翻成 CRLF，自举编译器写出的 .ll 因此与 C 宿主写出的不一致，
         // 固定点 gen2==g3 永远不成立（与 stdlib File.WriteAllText 一致）。
         H("@.mode_wb = private unnamed_addr constant [3 x i8] c\"wb\\00\"");
-        H("@.fmt.nl = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"");
-        H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
-        H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
-        H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
-        H("@.fmt.gnl = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"");
-        H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
-        H("@.fmt.unl = private unnamed_addr constant [6 x i8] c\"%llu\\0A\\00\"");
-        H("@.fmt.unn = private unnamed_addr constant [5 x i8] c\"%llu\\00\"");
+        if (hostWin) {
+            H("@.fmt.nl = private unnamed_addr constant [7 x i8] c\"%lld\\0D\\0A\\00\"");
+            H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
+            H("@.fmt.snl = private unnamed_addr constant [5 x i8] c\"%s\\0D\\0A\\00\"");
+            H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+            H("@.fmt.gnl = private unnamed_addr constant [5 x i8] c\"%g\\0D\\0A\\00\"");
+            H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
+            H("@.fmt.unl = private unnamed_addr constant [7 x i8] c\"%llu\\0D\\0A\\00\"");
+            H("@.fmt.unn = private unnamed_addr constant [5 x i8] c\"%llu\\00\"");
+        } else {
+            H("@.fmt.nl = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"");
+            H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
+            H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
+            H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+            H("@.fmt.gnl = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"");
+            H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
+            H("@.fmt.unl = private unnamed_addr constant [6 x i8] c\"%llu\\0A\\00\"");
+            H("@.fmt.unn = private unnamed_addr constant [5 x i8] c\"%llu\\00\"");
+        }
         // Console.Clear / ResetColor: the ANSI escapes the C host emits
         // (irgen_call.c: "\033[2J\033[H" and "\033[0m").
         H("@.esc.clear = private unnamed_addr constant [8 x i8] c\"\\1B[2J\\1B[H\\00\"");

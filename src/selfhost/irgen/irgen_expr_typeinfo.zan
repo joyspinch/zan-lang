@@ -225,7 +225,7 @@ partial class Irgen {
                     int cki = 0;
                     while (cki < cls.kids.Count) {
                         Node cm = cls.kids[cki];
-                        if (cm.kind == AK.CtorDecl() && !HasMod(cm, MOD.Static()) && MethodAcceptsCall(cm, e)) {
+                        if (cm.kind == AK.CtorDecl() && !HasMod(cm, MOD.Static()) && MethodAcceptsCall(cls, cm, e)) {
                             pctor = cm;
                             break;
                         }
@@ -383,6 +383,12 @@ partial class Irgen {
             ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
             string idx = NT();
             L("  " + idx + " = call i64 @__zan_refl_field_find_idx(i8* " + recv.op + ", i8* " + nmVal.op + ")");
+            return new ExprVal(idx, MkType("int"));
+        }
+        if (mname == "FindMethod") {
+            ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
+            string idx = NT();
+            L("  " + idx + " = call i64 @__zan_refl_method_find_idx(i8* " + recv.op + ", i8* " + nmVal.op + ")");
             return new ExprVal(idx, MkType("int"));
         }
         if (mname == "GetMethodName" || mname == "GetMethodReturnType"
@@ -812,7 +818,7 @@ partial class Irgen {
                 Node m = c.kids[i];
                 if (m.kind == AK.MethodDecl() && HasMod(m, MOD.Static())
                     && (filterName == "" || m.sval == filterName)
-                    && MethodAcceptsCall(m, invCall)
+                    && MethodAcceptsCall(cls, m, invCall)
                     && (mname != "InvokeStaticTask" || HasMod(m, MOD.Async()))) {
                     outMethods.Add(m);
                 }
@@ -1192,19 +1198,60 @@ partial class Irgen {
         return new ExprVal(retVal, resTy);
     }
 
-    bool MethodAcceptsCall(Node m, Node invCall) {
+    Node SubstParamForClass(Node cls, Node m, Node pt) {
+        if (cls == null || m == null || pt == null) { return pt; }
+        Node cur = MkType(cls.sval);
+        int depth = 0;
+        while (cur != null && depth < 64) {
+            Node c = binder.FindType(cur.sval);
+            if (c == null) { break; }
+            int i = 0;
+            while (i < c.kids.Count) {
+                if (c.kids[i] == m) {
+                    return binder.SubstOwner(pt, cur);
+                }
+                i = i + 1;
+            }
+            cur = binder.BaseType(cur);
+            depth = depth + 1;
+        }
+        return pt;
+    }
+
+    bool MethodAcceptsCall(Node ownerCls, Node m, Node invCall) {
         if (m == null || invCall == null) { return false; }
+        if (m.kind == AK.MethodDecl() && TParams(m).Count > 0) { return false; }
         int argc = invCall.kids.Count;
         if (!AcceptsArity(m, argc)) { return false; }
+        string ownerName = ownerCls != null ? ownerCls.sval : "";
         int i = 0;
         while (i < argc) {
-            Node pt = ParamTypeNode(m, i);
+            if (IsRefParam(m, i)) { return false; }
+            Node pt = SubstParamForClass(ownerCls, m, ParamTypeNode(m, i));
             Node arg = invCall.kids[i];
             if (pt != null && arg != null) {
+                // An open generic argument does not change the outer parameter type.
+                bool bareTypeParam = pt.ival == 0 && pt.kids.Count == 0 && MentionsTypeParam(pt);
+                if (arg.kind == AK.NullLit() && !bareTypeParam && !IsPtrLL(MapTypeDecl(pt, ownerName))) {
+                    return false;
+                }
                 Node atn = ArgTypeNode(arg);
                 if (atn != null && atn.sval != null && atn.sval != "") {
-                    // An open generic argument does not change the outer parameter type.
-                    bool bareTypeParam = pt.ival == 0 && pt.kids.Count == 0 && MentionsTypeParam(pt);
+                    // `object` (i8*) cannot implicitly unbox to value types (primitives, enums, value structs).
+                    if (atn.sval == "object" && atn.ival == 0 && !bareTypeParam
+                        && !IsPtrLL(MapTypeDecl(pt, ownerName))) {
+                        return false;
+                    }
+                    // Array rank mismatch (unless either side is `object` or a bare type param).
+                    if (atn.ival != pt.ival && !bareTypeParam
+                        && !(pt.sval == "object" && pt.ival == 0)
+                        && !(atn.sval == "object" && atn.ival == 0)) {
+                        return false;
+                    }
+                    // Delegate parameter requires a delegate or object argument.
+                    if (IsDelegate(pt) && !bareTypeParam && atn.sval != "object" && !IsDelegate(atn)) {
+                        return false;
+                    }
                     // `string` is a reference type even though binder.IsPrimitive("string") is true:
                     // never match a numeric/bool argument against a string parameter or vice versa.
                     if (atn.ival == 0 && pt.ival == 0 && pt.sval != "object" && atn.sval != "object" && !bareTypeParam
@@ -1241,7 +1288,7 @@ partial class Irgen {
             int i = 0;
             while (i < c.kids.Count) {
                 Node m = c.kids[i];
-                if (m.kind == AK.MethodDecl() && m.sval == name && MethodAcceptsCall(m, invCall)) {
+                if (m.kind == AK.MethodDecl() && m.sval == name && MethodAcceptsCall(cls, m, invCall)) {
                     return true;
                 }
                 i = i + 1;
@@ -1646,9 +1693,20 @@ partial class Irgen {
             return EmitTypeInfoMethod(ti, "HasMethod", e);
         }
 
-        if (mname == "Invoke" || mname == "InvokeInt" || mname == "InvokeLong"
+        bool isInvokeAt = mname == "InvokeAt" || mname == "InvokeIntAt" || mname == "InvokeLongAt"
+            || mname == "InvokeDoubleAt" || mname == "InvokeStringAt" || mname == "InvokeObjectAt" || mname == "InvokeTaskAt";
+        if (isInvokeAt || mname == "Invoke" || mname == "InvokeInt" || mname == "InvokeLong"
         || mname == "InvokeDouble" || mname == "InvokeString" || mname == "InvokeObject" || mname == "InvokeTask") {
-            string methName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
+            if (isInvokeAt) {
+                if (mname == "InvokeAt") { mname = "Invoke"; }
+                else if (mname == "InvokeIntAt") { mname = "InvokeInt"; }
+                else if (mname == "InvokeLongAt") { mname = "InvokeLong"; }
+                else if (mname == "InvokeDoubleAt") { mname = "InvokeDouble"; }
+                else if (mname == "InvokeStringAt") { mname = "InvokeString"; }
+                else if (mname == "InvokeObjectAt") { mname = "InvokeObject"; }
+                else if (mname == "InvokeTaskAt") { mname = "InvokeTask"; }
+            }
+            string methName = !isInvokeAt && e.kids.Count > 0 && e.kids[0].kind == AK.StringLit() ? e.kids[0].sval : "";
             Node invCall = new Node(AK.Call());
             invCall.line = e.line;
             invCall.col = e.col;
@@ -1715,14 +1773,23 @@ partial class Irgen {
                 int ami = 0;
                 while (ami < allM.Count) {
                     Node am = allM[ami];
-                    if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(am, invCall)
+                    if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(cls0, am, invCall)
                         && (mname != "InvokeTask" || HasMod(am, MOD.Async()))) {
                         matchNames.Add(am.sval);
                     }
                     ami = ami + 1;
                 }
-                ExprVal nmVal = GenExpr(e.kids[0]);
-                string nmPtr = Coerce(nmVal, "i8*");
+                string nmPtr = "null";
+                if (isInvokeAt) {
+                    ExprVal idxVal = GenExpr(e.kids[0]);
+                    string idx64 = ToI64(idxVal);
+                    ExprVal rti = EmitGetType(recv);
+                    nmPtr = NT();
+                    L("  " + nmPtr + " = call i8* @__zan_refl_method_name_at(i8* " + rti.op + ", i64 " + idx64 + ")");
+                } else {
+                    ExprVal nmVal = GenExpr(e.kids[0]);
+                    nmPtr = Coerce(nmVal, "i8*");
+                }
                 if (matchNames.Count > 0) {
                     string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
@@ -1892,9 +1959,19 @@ partial class Irgen {
                     }
                 }
             } else if (e.kids.Count > 0) {
-                // Computed method name on an object / polymorphic receiver: dispatch by class id then strcmp over matching methods.
-                ExprVal nmVal = GenExpr(e.kids[0]);
-                string nmPtr = Coerce(nmVal, "i8*");
+                // Computed method name (or Invoke*At method index) on an object / polymorphic receiver:
+                // resolve method name, then dispatch by class id (including List<T>) and strcmp over matching methods.
+                string nmPtr = "null";
+                if (isInvokeAt) {
+                    ExprVal idxVal = GenExpr(e.kids[0]);
+                    string idx64 = ToI64(idxVal);
+                    ExprVal rti = EmitGetType(recv);
+                    nmPtr = NT();
+                    L("  " + nmPtr + " = call i8* @__zan_refl_method_name_at(i8* " + rti.op + ", i64 " + idx64 + ")");
+                } else {
+                    ExprVal nmVal = GenExpr(e.kids[0]);
+                    nmPtr = Coerce(nmVal, "i8*");
+                }
                 List<string> dynCands = new List<string>();
                 int tii = 0;
                 while (tii < tidNames.Count) {
@@ -1912,7 +1989,7 @@ partial class Irgen {
                         int ami = 0;
                         while (ami < allM.Count) {
                             Node am = allM[ami];
-                            if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(am, invCall)
+                            if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(cdecl, am, invCall)
                                 && (mname != "InvokeTask" || HasMod(am, MOD.Async()))) {
                                 hasAny = true;
                                 break;
@@ -1923,7 +2000,9 @@ partial class Irgen {
                     }
                     tii = tii + 1;
                 }
-                if (dynCands.Count > 0) {
+                bool canDynList = (cls0 == null || cls0.sval == "object") && mname != "InvokeTask" && IsContainerType("List")
+                    && (invCall.kids.Count == 0 || invCall.kids.Count == 1);
+                if (dynCands.Count > 0 || canDynList) {
                     string retTyLL = mname == "InvokeDouble" ? "double" : ((mname == "InvokeString" || mname == "InvokeObject") ? "i8*" : "i64");
                     string dfltVal = (mname == "InvokeDouble") ? "0.0" : ((mname == "InvokeString") ? GenStr("").op : ((mname == "InvokeObject") ? "null" : "0"));
                     string resSlot = NT();
@@ -1939,6 +2018,65 @@ partial class Irgen {
                     Label(lchk);
                     string cid = NT();
                     L("  " + cid + " = call i8* @__zan_class_id(i8* " + rawRecv + ")");
+                    if (canDynList) {
+                        int lmatchList = NL();
+                        int lnextList = NL();
+                        string eqList = NT();
+                        L("  " + eqList + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_List to i8*)");
+                        L("  br i1 " + eqList + ", label %L" + lmatchList + ", label %L" + lnextList);
+                        Label(lmatchList);
+                        List<string> listMeths = new List<string>();
+                        if (invCall.kids.Count == 0) {
+                            listMeths.Add("Count");
+                        } else {
+                            listMeths.Add("Get");
+                            listMeths.Add("At");
+                            if (mname == "Invoke") { listMeths.Add("Add"); }
+                        }
+                        int lmi = 0;
+                        while (lmi < listMeths.Count) {
+                            string lm = listMeths[lmi];
+                            int lmmatch = NL();
+                            int lmnext = NL();
+                            string lit = RawCString(lm);
+                            string eqm = NT();
+                            L("  " + eqm + " = call i32 @strcmp(i8* " + nmPtr + ", i8* " + lit + ")");
+                            string isEqm = NT();
+                            L("  " + isEqm + " = icmp eq i32 " + eqm + ", 0");
+                            L("  br i1 " + isEqm + ", label %L" + lmmatch + ", label %L" + lmnext);
+                            Label(lmmatch);
+                            List<string> sTemps = stmtTemps;
+                            List<string> sVals = stmtTempValues;
+                            List<string> sOwners = stmtTempOwners;
+                            List<Node> sTypes = stmtTempTypes;
+                            List<List<string>> sArm = callArmStack;
+                            List<Dictionary<string, bool>> sArmSets = callArmSets;
+                            List<StringBuilder> sArmFn = callArmFn;
+                            stmtTemps = new List<string>();
+                            stmtTempValues = new List<string>();
+                            stmtTempOwners = new List<string>();
+                            stmtTempTypes = new List<Node>();
+                            callArmStack = null;
+                            callArmSets = null;
+                            callArmFn = null;
+                            string held = HoldCallReceiver(recv);
+                            EmitListReflectionCall(rawRecv, lm, mname, invCall, resSlot);
+                            DropCallReceiver(held, recv.ty);
+                            EmitTempReleases();
+                            stmtTemps = sTemps;
+                            stmtTempValues = sVals;
+                            stmtTempOwners = sOwners;
+                            stmtTempTypes = sTypes;
+                            callArmStack = sArm;
+                            callArmSets = sArmSets;
+                            callArmFn = sArmFn;
+                            L("  br label %L" + lend);
+                            Label(lmnext);
+                            lmi = lmi + 1;
+                        }
+                        L("  br label %L" + lend);
+                        Label(lnextList);
+                    }
                     int ci = 0;
                     while (ci < dynCands.Count) {
                         string cand = dynCands[ci];
@@ -1958,7 +2096,7 @@ partial class Irgen {
                         int ami = 0;
                         while (ami < allM.Count) {
                             Node am = allM[ami];
-                            if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(am, invCall)
+                            if (!HasMod(am, MOD.Static()) && MethodAcceptsCall(cdecl, am, invCall)
                                 && (mname != "InvokeTask" || HasMod(am, MOD.Async()))) {
                                 int lmmatch = NL();
                                 int lmnext = NL();

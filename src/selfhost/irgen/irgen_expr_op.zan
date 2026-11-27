@@ -547,15 +547,154 @@ partial class Irgen {
             vop = d; vty = "double";
         }
         string fp = FmtPatGlobal(pat);
-        string need = NT();
-        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* " + fp + ", " + vty + " " + vop + ")");
-        string need64 = NT(); L("  " + need64 + " = sext i32 " + need + " to i64");
-        string bsz = NT(); L("  " + bsz + " = add i64 " + need64 + ", 1");
-        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
-        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* " + fp + ", " + vty + " " + vop + ")");
-        string managed = WrapManaged(buf);
-        L("  call void @free(i8* " + buf + ")");
-        return new ExprVal(managed, MkType("string"));
+        string r = NT();
+        if (vty == "double") {
+            EnsureStrFmtF64Helper();
+            L("  " + r + " = call i8* @zstr_fmt_f64(i8* " + fp + ", double " + vop + ")");
+        } else {
+            EnsureStrFmtI64Helper();
+            L("  " + r + " = call i8* @zstr_fmt_i64(i8* " + fp + ", i64 " + vop + ")");
+        }
+        return OwnedString(r);
+    }
+
+    void EnsureStrFromI64Helper() {
+        if (strFromI64Emitted) { return; }
+        strFromI64Emitted = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_from_i64(i64 %n) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %buf = alloca [32 x i8]\n");
+        sb.Append("  %neg = icmp slt i64 %n, 0\n");
+        sb.Append("  %negv = sub i64 0, %n\n");
+        sb.Append("  %mag = select i1 %neg, i64 %negv, i64 %n\n");
+        sb.Append("  br label %loop\n");
+        sb.Append("loop:\n");
+        sb.Append("  %v = phi i64 [ %mag, %entry ], [ %q, %loop ]\n");
+        sb.Append("  %pos = phi i64 [ 32, %entry ], [ %npos, %loop ]\n");
+        sb.Append("  %npos = sub i64 %pos, 1\n");
+        sb.Append("  %q = udiv i64 %v, 10\n");
+        sb.Append("  %r = urem i64 %v, 10\n");
+        sb.Append("  %d = add i64 %r, 48\n");
+        sb.Append("  %ch = trunc i64 %d to i8\n");
+        sb.Append("  %ptr = getelementptr inbounds [32 x i8], [32 x i8]* %buf, i64 0, i64 %npos\n");
+        sb.Append("  store i8 %ch, i8* %ptr\n");
+        sb.Append("  %more = icmp ne i64 %q, 0\n");
+        sb.Append("  br i1 %more, label %loop, label %sign\n");
+        sb.Append("sign:\n");
+        sb.Append("  br i1 %neg, label %addminus, label %done\n");
+        sb.Append("addminus:\n");
+        sb.Append("  %mpos = sub i64 %npos, 1\n");
+        sb.Append("  %mptr = getelementptr inbounds [32 x i8], [32 x i8]* %buf, i64 0, i64 %mpos\n");
+        sb.Append("  store i8 45, i8* %mptr\n");
+        sb.Append("  br label %done\n");
+        sb.Append("done:\n");
+        sb.Append("  %start = phi i64 [ %npos, %sign ], [ %mpos, %addminus ]\n");
+        sb.Append("  %len = sub i64 32, %start\n");
+        sb.Append("  %out = call i8* @zstr_new(i64 %len)\n");
+        sb.Append("  %src = getelementptr inbounds [32 x i8], [32 x i8]* %buf, i64 0, i64 %start\n");
+        sb.Append("  call i8* @memcpy(i8* %out, i8* %src, i64 %len)\n");
+        sb.Append("  ret i8* %out\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureStrFromU64Helper() {
+        if (strFromU64Emitted) { return; }
+        strFromU64Emitted = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_from_u64(i64 %n) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %buf = alloca [32 x i8]\n");
+        sb.Append("  br label %loop\n");
+        sb.Append("loop:\n");
+        sb.Append("  %v = phi i64 [ %n, %entry ], [ %q, %loop ]\n");
+        sb.Append("  %pos = phi i64 [ 32, %entry ], [ %npos, %loop ]\n");
+        sb.Append("  %npos = sub i64 %pos, 1\n");
+        sb.Append("  %q = udiv i64 %v, 10\n");
+        sb.Append("  %r = urem i64 %v, 10\n");
+        sb.Append("  %d = add i64 %r, 48\n");
+        sb.Append("  %ch = trunc i64 %d to i8\n");
+        sb.Append("  %ptr = getelementptr inbounds [32 x i8], [32 x i8]* %buf, i64 0, i64 %npos\n");
+        sb.Append("  store i8 %ch, i8* %ptr\n");
+        sb.Append("  %more = icmp ne i64 %q, 0\n");
+        sb.Append("  br i1 %more, label %loop, label %done\n");
+        sb.Append("done:\n");
+        sb.Append("  %len = sub i64 32, %npos\n");
+        sb.Append("  %out = call i8* @zstr_new(i64 %len)\n");
+        sb.Append("  %src = getelementptr inbounds [32 x i8], [32 x i8]* %buf, i64 0, i64 %npos\n");
+        sb.Append("  call i8* @memcpy(i8* %out, i8* %src, i64 %len)\n");
+        sb.Append("  ret i8* %out\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureStrFmtI64Helper() {
+        if (strFmtI64Emitted) { return; }
+        strFmtI64Emitted = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_fmt_i64(i8* %fmt, i64 %v) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %sbuf = alloca [64 x i8]\n");
+        sb.Append("  %sp = getelementptr inbounds [64 x i8], [64 x i8]* %sbuf, i64 0, i64 0\n");
+        sb.Append("  %n32 = call i32 (i8*, i64, i8*, ...) @snprintf(i8* %sp, i64 64, i8* %fmt, i64 %v)\n");
+        sb.Append("  %neg = icmp slt i32 %n32, 0\n");
+        sb.Append("  br i1 %neg, label %empty, label %chk\n");
+        sb.Append("empty:\n");
+        sb.Append("  %e = call i8* @zstr_new(i64 0)\n");
+        sb.Append("  ret i8* %e\n");
+        sb.Append("chk:\n");
+        sb.Append("  %n = zext i32 %n32 to i64\n");
+        sb.Append("  %fits = icmp ult i64 %n, 64\n");
+        sb.Append("  br i1 %fits, label %fast, label %slow\n");
+        sb.Append("fast:\n");
+        sb.Append("  %out = call i8* @zstr_new(i64 %n)\n");
+        sb.Append("  call i8* @memcpy(i8* %out, i8* %sp, i64 %n)\n");
+        sb.Append("  ret i8* %out\n");
+        sb.Append("slow:\n");
+        sb.Append("  %bsz = add i64 %n, 1\n");
+        sb.Append("  %hbuf = call i8* @malloc(i64 %bsz)\n");
+        sb.Append("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* %hbuf, i64 %bsz, i8* %fmt, i64 %v)\n");
+        sb.Append("  %out2 = call i8* @zstr_new(i64 %n)\n");
+        sb.Append("  call i8* @memcpy(i8* %out2, i8* %hbuf, i64 %n)\n");
+        sb.Append("  call void @free(i8* %hbuf)\n");
+        sb.Append("  ret i8* %out2\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureStrFmtF64Helper() {
+        if (strFmtF64Emitted) { return; }
+        strFmtF64Emitted = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zstr_fmt_f64(i8* %fmt, double %v) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %sbuf = alloca [64 x i8]\n");
+        sb.Append("  %sp = getelementptr inbounds [64 x i8], [64 x i8]* %sbuf, i64 0, i64 0\n");
+        sb.Append("  %n32 = call i32 (i8*, i64, i8*, ...) @snprintf(i8* %sp, i64 64, i8* %fmt, double %v)\n");
+        sb.Append("  %neg = icmp slt i32 %n32, 0\n");
+        sb.Append("  br i1 %neg, label %empty, label %chk\n");
+        sb.Append("empty:\n");
+        sb.Append("  %e = call i8* @zstr_new(i64 0)\n");
+        sb.Append("  ret i8* %e\n");
+        sb.Append("chk:\n");
+        sb.Append("  %n = zext i32 %n32 to i64\n");
+        sb.Append("  %fits = icmp ult i64 %n, 64\n");
+        sb.Append("  br i1 %fits, label %fast, label %slow\n");
+        sb.Append("fast:\n");
+        sb.Append("  %out = call i8* @zstr_new(i64 %n)\n");
+        sb.Append("  call i8* @memcpy(i8* %out, i8* %sp, i64 %n)\n");
+        sb.Append("  ret i8* %out\n");
+        sb.Append("slow:\n");
+        sb.Append("  %bsz = add i64 %n, 1\n");
+        sb.Append("  %hbuf = call i8* @malloc(i64 %bsz)\n");
+        sb.Append("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* %hbuf, i64 %bsz, i8* %fmt, double %v)\n");
+        sb.Append("  %out2 = call i8* @zstr_new(i64 %n)\n");
+        sb.Append("  call i8* @memcpy(i8* %out2, i8* %hbuf, i64 %n)\n");
+        sb.Append("  call void @free(i8* %hbuf)\n");
+        sb.Append("  ret i8* %out2\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
     }
 
     // coerce a value to i8* string form (numbers via snprintf)
@@ -640,20 +779,16 @@ partial class Irgen {
             string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
             return r;
         }
-        // integer -> string ("%llu" for ulong so the high bit prints unsigned)
-        string ifmt = "@.fmt.nn";
-        if (IsUlong(v.ty)) { ifmt = "@.fmt.unn"; }
-        string need = NT();
-        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
-        string need64 = NT();
-        L("  " + need64 + " = sext i32 " + need + " to i64");
-        string bsz = NT();
-        L("  " + bsz + " = add i64 " + need64 + ", 1");
-        string buf = NT();
-        L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
-        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
-        string rendered = WrapManaged(buf);
-        L("  call void @free(i8* " + buf + ")");
+        // integer -> string (unsigned base-10 for ulong, signed base-10 otherwise)
+        string rendered = NT();
+        if (IsUlong(v.ty)) {
+            EnsureStrFromU64Helper();
+            L("  " + rendered + " = call i8* @zstr_from_u64(i64 " + v.op + ")");
+        } else {
+            EnsureStrFromI64Helper();
+            L("  " + rendered + " = call i8* @zstr_from_i64(i64 " + v.op + ")");
+        }
+        OwnedString(rendered);
         return rendered;
     }
 

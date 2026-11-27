@@ -180,7 +180,8 @@ partial class Irgen {
                 string ep = NT();
                 L("  " + ep + " = call i8* @zstr_new(i64 0)");
                 string gp = NT();
-                L("  " + gp + " = getelementptr inbounds [4 x i8], [4 x i8]* @.fmt.snl, i64 0, i64 0");
+                int snlLen = hostWin ? 5 : 4;
+                L("  " + gp + " = getelementptr inbounds [" + snlLen + " x i8], [" + snlLen + " x i8]* @.fmt.snl, i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + ep + ")");
                 return new ExprVal("0", MkType("void"));
             }
@@ -210,7 +211,7 @@ partial class Irgen {
                 L("  " + rs + " = select i1 " + isn + ", i8* " + empt.op + ", i8* " + nums);
                 string gp = NT();
                 string fg = "@.fmt.sn"; int fl = 3;
-                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                if (nl) { fg = "@.fmt.snl"; fl = hostWin ? 5 : 4; }
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + rs + ")");
                 return new ExprVal("0", MkType("void"));
@@ -223,7 +224,7 @@ partial class Irgen {
                 string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
                 string gp = NT();
                 string fg = "@.fmt.sn"; int fl = 3;
-                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                if (nl) { fg = "@.fmt.snl"; fl = hostWin ? 5 : 4; }
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + r + ")");
                 return new ExprVal("0", MkType("void"));
@@ -240,7 +241,7 @@ partial class Irgen {
                 else if (a.ty.sval == "char") { sv = CharToStr(a.op); }
                 string gp = NT();
                 string fg = "@.fmt.sn"; int fl = 3;
-                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                if (nl) { fg = "@.fmt.snl"; fl = hostWin ? 5 : 4; }
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + sv + ")");
                 return new ExprVal("0", MkType("void"));
@@ -248,10 +249,10 @@ partial class Irgen {
             // an integer: %llu for ulong (the high bit is data), %lld else
             string gp = NT();
             string fg = "@.fmt.nn"; int fl = 5;
-            if (nl) { fg = "@.fmt.nl"; fl = 6; }
+            if (nl) { fg = "@.fmt.nl"; fl = hostWin ? 7 : 6; }
             if (IsUlong(a.ty)) {
                 fg = "@.fmt.unn"; fl = 5;
-                if (nl) { fg = "@.fmt.unl"; fl = 6; }
+                if (nl) { fg = "@.fmt.unl"; fl = hostWin ? 7 : 6; }
             }
             L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
             L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + a.op + ")");
@@ -960,13 +961,10 @@ partial class Irgen {
             if (cls.kind == AK.ClassDecl()) {
                 string rt0 = MapType(obj.ty);
                 if (IsPtrLL(rt0)) {
-                    string rn = NT();
-                    L("  " + rn + " = icmp eq " + rt0 + " " + obj.op + ", null");
                     string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != ""
                         ? e.a.sval : e.sval;
-                    EmitRuntimeCheckIf(e, rn,
+                    string sel = EmitGuardNullObj(e, obj.op, rt0,
                         "null reference: receiver '" + rnm + "' is null");
-                    string sel = EmitSoftBaseSelect(obj.op, rt0, rn);
                     obj = new ExprVal(sel, obj.ty);
                 }
             }
@@ -1214,6 +1212,108 @@ partial class Irgen {
         }
         L("  br label %L" + lskip);
         Label(lskip);
+    }
+
+    void EnsureRtGuardNullObjHelper() {
+        if (rtGuardNullObjEmitted) { return; }
+        rtGuardNullObjEmitted = true;
+        EnsureRtChkNullHelper();
+        if (!ExternSeen("zan_rt_soft_scratch")) {
+            externDecls.Add("zan_rt_soft_scratch");
+            H("declare i8* @zan_rt_soft_scratch()");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i8* @zrt_guard_null_obj(i8* %p, i8* %msg, i32 %line, i32 %col) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %nil = icmp eq i8* %p, null\n");
+        sb.Append("  br i1 %nil, label %fail, label %ok\n");
+        sb.Append("fail:\n");
+        sb.Append("  call void @zrt_chk_null(i8* %msg, i32 %line, i32 %col)\n");
+        sb.Append("  %s = call i8* @zan_rt_soft_scratch()\n");
+        sb.Append("  ret i8* %s\n");
+        sb.Append("ok:\n");
+        sb.Append("  ret i8* %p\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    string EmitGuardNullObj(Node at, string ptrOp, string ptrTy, string msg) {
+        if (!runtimeChecks) {
+            string rn = NT();
+            L("  " + rn + " = icmp eq " + ptrTy + " " + ptrOp + ", null");
+            return EmitSoftBaseSelect(ptrOp, ptrTy, rn);
+        }
+        EnsureRtGuardNullObjHelper();
+        int ln = (at != null && at.line > 0) ? at.line : 0;
+        int cl = (at != null && at.col > 0) ? at.col : 0;
+        string raw = ptrOp;
+        if (ptrTy != "i8*") {
+            raw = NT();
+            L("  " + raw + " = bitcast " + ptrTy + " " + ptrOp + " to i8*");
+        }
+        string excMsg = GenStrConst(msg);
+        string chk = NT();
+        L("  " + chk + " = call i8* @zrt_guard_null_obj(i8* " + raw + ", i8* " + excMsg + ", i32 " + ln + ", i32 " + cl + ")");
+        if (ptrTy == "i8*") { return chk; }
+        string res = NT();
+        L("  " + res + " = bitcast i8* " + chk + " to " + ptrTy);
+        return res;
+    }
+
+    void EnsureListGetChkHelper() {
+        if (listGetChkEmitted) { return; }
+        listGetChkEmitted = true;
+        EnsureRtChkListNullHelper();
+        EnsureRtChkListOobHelper();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal i64 @zlist_get_chk(i8* %lst, i64 %idx, i32 %line, i32 %col) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %nil = icmp eq i8* %lst, null\n");
+        sb.Append("  br i1 %nil, label %bad_null, label %chk_oob\n");
+        sb.Append("bad_null:\n");
+        sb.Append("  call void @zrt_chk_list_null(i32 %line, i32 %col)\n");
+        sb.Append("  ret i64 0\n");
+        sb.Append("chk_oob:\n");
+        sb.Append("  %cnt = call i64 @zlist_count(i8* %lst)\n");
+        sb.Append("  %oob = icmp uge i64 %idx, %cnt\n");
+        sb.Append("  br i1 %oob, label %bad_oob, label %do_get\n");
+        sb.Append("bad_oob:\n");
+        sb.Append("  call void @zrt_chk_list_oob(i32 %line, i32 %col)\n");
+        sb.Append("  ret i64 0\n");
+        sb.Append("do_get:\n");
+        sb.Append("  %val = call i64 @zlist_get(i8* %lst, i64 %idx)\n");
+        sb.Append("  ret i64 %val\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+    }
+
+    void EnsureListSetChkHelper() {
+        if (listSetChkEmitted) { return; }
+        listSetChkEmitted = true;
+        EnsureRtChkListNullHelper();
+        EnsureRtCheckFailHelper();
+        string tid = GuardExcOrBase("IndexOutOfRangeException");
+        string msgOp = GenStrConst("index out of bounds: List store");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void @zlist_set_chk(i8* %lst, i64 %idx, i64 %val, i32 %line, i32 %col) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  %nil = icmp eq i8* %lst, null\n");
+        sb.Append("  br i1 %nil, label %bad_null, label %chk_oob\n");
+        sb.Append("bad_null:\n");
+        sb.Append("  call void @zrt_chk_list_null(i32 %line, i32 %col)\n");
+        sb.Append("  ret void\n");
+        sb.Append("chk_oob:\n");
+        sb.Append("  %cnt = call i64 @zlist_count(i8* %lst)\n");
+        sb.Append("  %oob = icmp uge i64 %idx, %cnt\n");
+        sb.Append("  br i1 %oob, label %bad_oob, label %do_set\n");
+        sb.Append("bad_oob:\n");
+        sb.Append("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_" + tid + " to i8*), i8* " + msgOp + ", i32 %line, i32 %col)\n");
+        sb.Append("  ret void\n");
+        sb.Append("do_set:\n");
+        sb.Append("  call void @zlist_set(i8* %lst, i64 %idx, i64 %val)\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
     }
 
     // Per-thread bounded soft-failure scratch (1 MiB payload + guard pages in

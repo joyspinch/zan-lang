@@ -480,12 +480,22 @@ partial class Irgen {
                 if (IsPtrLL(rt0)) {
                     string rn = NT();
                     L("  " + rn + " = icmp eq " + rt0 + " " + obj.op + ", null");
-                    string rnm = lhs.a != null && lhs.a.kind == AK.Ident() && lhs.a.sval != ""
-                        ? lhs.a.sval : lhs.sval;
-                    EmitRuntimeCheckIf(lhs, rn,
-                        "null reference: receiver '" + rnm + "' is null");
                     int ldo = NL(); int lskip = NL();
-                    L("  br i1 " + rn + ", label %L" + lskip + ", label %L" + ldo);
+                    if (runtimeChecks) {
+                        int lfail = NL();
+                        L("  br i1 " + rn + ", label %L" + lfail + ", label %L" + ldo);
+                        Label(lfail);
+                        string rnm = lhs.a != null && lhs.a.kind == AK.Ident() && lhs.a.sval != ""
+                            ? lhs.a.sval : lhs.sval;
+                        EnsureRtChkNullHelper();
+                        string excMsg = GenStrConst("null reference: receiver '" + rnm + "' is null");
+                        int ln = (lhs != null && lhs.line > 0) ? lhs.line : 0;
+                        int cl = (lhs != null && lhs.col > 0) ? lhs.col : 0;
+                        L("  call void @zrt_chk_null(i8* " + excMsg + ", i32 " + ln + ", i32 " + cl + ")");
+                        L("  br label %L" + lskip);
+                    } else {
+                        L("  br i1 " + rn + ", label %L" + lskip + ", label %L" + ldo);
+                    }
                     Label(ldo);
                     StoreField(obj.op, cn, lhs.sval, v);
                     L("  br label %L" + lskip);
@@ -503,22 +513,15 @@ partial class Irgen {
                 // A507② 自举半边（List）：zlist_set 曾无界——OOB 直接写穿
                 // 数据区。调用点守卫（这里才知道行:列）：软诊断 + 跳过调用
                 // （ARC 平衡保持：不进入 zlist_set 就不 retain/release）。
-                string lc2 = NT();
-                L("  " + lc2 + " = call i64 @zlist_count(i8* " + obj.op + ")");
-                string lneg2 = NT();
-                L("  " + lneg2 + " = icmp slt i64 " + idx.op + ", 0");
-                string lge2 = NT();
-                L("  " + lge2 + " = icmp sge i64 " + idx.op + ", " + lc2);
-                string loob2 = NT();
-                L("  " + loob2 + " = or i1 " + lneg2 + ", " + lge2);
-                EmitRuntimeCheckIf(lhs, loob2, "index out of bounds: List store");
                 string sv0 = StructElemSlot(v, ListElem(obj.ty));
-                int ldo2 = NL(); int lskip2 = NL();
-                L("  br i1 " + loob2 + ", label %L" + lskip2 + ", label %L" + ldo2);
-                Label(ldo2);
-                L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv0 + ")");
-                L("  br label %L" + lskip2);
-                Label(lskip2);
+                if (runtimeChecks) {
+                    EnsureListSetChkHelper();
+                    int ln2 = (lhs != null && lhs.line > 0) ? lhs.line : 0;
+                    int cl2 = (lhs != null && lhs.col > 0) ? lhs.col : 0;
+                    L("  call void @zlist_set_chk(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv0 + ", i32 " + ln2 + ", i32 " + cl2 + ")");
+                } else {
+                    L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv0 + ")");
+                }
                 return;
             }
             if (IsDictType(obj.ty)) {
