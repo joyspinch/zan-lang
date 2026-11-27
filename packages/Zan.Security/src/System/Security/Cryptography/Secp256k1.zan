@@ -1,205 +1,56 @@
 using System;
+using System.Interop;
 
 namespace System.Security.Cryptography;
 
 // SECG secp256k1 椭圆曲线密码学实现（Koblitz 曲线 SEC 2 标准，比特币与以太坊基石）。
 // 曲线方程：y^2 = x^3 + 7 (mod p)，a = 0, b = 7。
-// 内部点运算采用 Jacobian 投影坐标系，倍点公式针对 a = 0 进行模乘优化。
+// 内部域与点运算委托 EcField256（8x32-bit 定长 Limb + 伪梅森快速约简 + 4-bit 2-Comb G 表 + Shamir 双标量乘）。
 public class Secp256k1 {
 
     static string PHEX  = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
     static string NHEX  = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
-    static string GXHEX = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
-    static string GYHEX = "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8";
 
     static BigInt P;
     static BigInt N;
-    static BigInt GX;
-    static BigInt GY;
-    static BigInt TWO;
-    static BigInt THREE;
-    static BigInt FOUR;
-    static BigInt EIGHT;
     static BigInt HALF_N;
-    static BigInt P_PLUS_1_DIV_4;
     static bool ready = false;
 
     private static BigInt hb(string h) {
         return BigInt.FromBytesBE(Hex.Decode(h), 32);
     }
 
-    private static BigInt fromInt(int v) {
-        byte[] b = new byte[4];
-        b[0] = (byte)((v >> 24) & 255);
-        b[1] = (byte)((v >> 16) & 255);
-        b[2] = (byte)((v >> 8) & 255);
-        b[3] = (byte)(v & 255);
-        return BigInt.FromBytesBE(b, 4);
-    }
-
     private static void init() {
         if (ready) { return; }
         P = hb(PHEX);
         N = hb(NHEX);
-        GX = hb(GXHEX);
-        GY = hb(GYHEX);
-        TWO = fromInt(2);
-        THREE = fromInt(3);
-        FOUR = fromInt(4);
-        EIGHT = fromInt(8);
-
         // HALF_N = N / 2 (用于 EIP-2 低 s 防延展性归约)
         HALF_N = hb("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0");
-
-        // P_PLUS_1_DIV_4 = (P + 1) / 4 (用于 p = 3 mod 4 素数域上的模平方根)
-        P_PLUS_1_DIV_4 = hb("3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C");
-
+        EcField256.GetCurve(EcField256.CurveSecp256k1);
         ready = true;
     }
-
-    // 模 P 域运算（输入输出均保持在 [0, P) 内，免除 Knuth 除法开销）
-    private static BigInt fadd(BigInt x, BigInt y) {
-        BigInt s = BigInt.add(x, y);
-        if (BigInt.cmp(s, P) >= 0) { return BigInt.sub(s, P); }
-        return s;
-    }
-    private static BigInt fsub(BigInt x, BigInt y) {
-        if (BigInt.cmp(x, y) >= 0) { return BigInt.sub(x, y); }
-        return BigInt.sub(BigInt.add(x, P), y);
-    }
-    private static BigInt fmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), P); }
-    private static BigInt fsqr(BigInt x) { return fmul(x, x); }
-    private static BigInt finv(BigInt x) { return BigInt.ModInverse(x, P); }
 
     // 模 N 标量运算
     private static BigInt nmod(BigInt x) { return BigInt.mod(x, N); }
     private static BigInt nmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), N); }
     private static BigInt ninv(BigInt x) { return BigInt.ModInverse(x, N); }
 
-    // Jacobian 投影坐标点 [X, Y, Z]；无穷远点的 Z == 0
-    private static List<BigInt> pt(BigInt x, BigInt y, BigInt z) {
-        List<BigInt> r = new List<BigInt>();
-        r.Add(x);
-        r.Add(y);
-        r.Add(z);
-        return r;
-    }
-
-    private static List<BigInt> inf() {
-        return pt(BigInt.one(), BigInt.one(), BigInt.zero());
-    }
-
-    private static bool isInf(List<BigInt> p) {
-        return p[2].isZero();
-    }
-
-    // a = 0 特化的 Jacobian 倍点算法
-    private static List<BigInt> jdouble(List<BigInt> p) {
-        if (isInf(p)) { return p; }
-        BigInt x1 = p[0];
-        BigInt y1 = p[1];
-        BigInt z1 = p[2];
-
-        // gamma = Y1^2
-        BigInt gamma = fsqr(y1);
-        // beta = 4 * X1 * gamma
-        BigInt beta = fmul(FOUR, fmul(x1, gamma));
-        // alpha = 3 * X1^2 (因 a = 0，省略 a * Z1^4 项)
-        BigInt alpha = fmul(THREE, fsqr(x1));
-        // X3 = alpha^2 - 2 * beta
-        BigInt x3 = fsub(fsqr(alpha), fmul(TWO, beta));
-        // Z3 = 2 * Y1 * Z1
-        BigInt z3 = fmul(TWO, fmul(y1, z1));
-        // Y3 = alpha * (beta - X3) - 8 * gamma^2
-        BigInt y3 = fsub(fmul(alpha, fsub(beta, x3)), fmul(EIGHT, fsqr(gamma)));
-
-        return pt(x3, y3, z3);
-    }
-
-    // Jacobian 点加算法
-    private static List<BigInt> jadd(List<BigInt> pa, List<BigInt> qa) {
-        if (isInf(pa)) { return qa; }
-        if (isInf(qa)) { return pa; }
-
-        BigInt x1 = pa[0]; BigInt y1 = pa[1]; BigInt z1 = pa[2];
-        BigInt x2 = qa[0]; BigInt y2 = qa[1]; BigInt z2 = qa[2];
-
-        BigInt z1z1 = fsqr(z1);
-        BigInt z2z2 = fsqr(z2);
-
-        BigInt u1 = fmul(x1, z2z2);
-        BigInt u2 = fmul(x2, z1z1);
-
-        BigInt s1 = fmul(y1, fmul(z2, z2z2));
-        BigInt s2 = fmul(y2, fmul(z1, z1z1));
-
-        BigInt h = fsub(u2, u1);
-        BigInt r = fsub(s2, s1);
-
-        if (h.isZero()) {
-            if (r.isZero()) {
-                return jdouble(pa);
-            }
-            return inf();
-        }
-
-        BigInt hh = fsqr(h);
-        BigInt hhh = fmul(h, hh);
-        BigInt v = fmul(u1, hh);
-
-        BigInt x3 = fsub(fsub(fsqr(r), hhh), fmul(TWO, v));
-        BigInt y3 = fsub(fmul(r, fsub(v, x3)), fmul(s1, hhh));
-        BigInt z3 = fmul(fmul(z1, z2), h);
-
-        return pt(x3, y3, z3);
-    }
-
-    // 标量乘 k * P
-    private static List<BigInt> scalarMul(BigInt k, List<BigInt> p) {
-        List<BigInt> r = inf();
-        int bits = k.bitLength();
-        for (int i = bits - 1; i >= 0; i = i - 1) {
-            r = jdouble(r);
-            if (k.getBit(i) == 1) {
-                r = jadd(r, p);
-            }
-        }
-        return r;
-    }
-
-    // 转回仿射坐标 (x, y)
-    private static List<BigInt> toAffine(List<BigInt> p) {
-        if (isInf(p)) {
-            return pt(BigInt.zero(), BigInt.zero(), BigInt.zero());
-        }
-        BigInt zinv = finv(p[2]);
-        BigInt zinv2 = fsqr(zinv);
-        BigInt x = fmul(p[0], zinv2);
-        BigInt y = fmul(p[1], fmul(zinv2, zinv));
-        return pt(x, y, BigInt.one());
-    }
-
-    private static List<BigInt> gPoint() {
-        return pt(GX, GY, BigInt.one());
-    }
-
     // 从 32 字节大端私钥派生 64 字节未压缩公钥坐标 (X || Y)，不带 0x04 前缀。
     public static byte[] GetPublicKeyRaw(byte[] privKey32) {
         init();
         if (privKey32 == null || privKey32.Length != 32) { return null; }
-        BigInt d = BigInt.FromBytesBE(privKey32, 32);
-        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, N) >= 0) { return null; }
+        long[] d = new long[8];
+        EcField256.FromBytesBE(privKey32, 0, d);
+        EcCurveData cd = EcField256.GetCurve(EcField256.CurveSecp256k1);
+        if (EcField256.IsZero(d) || EcField256.Cmp(d, cd.N) >= 0) { return null; }
 
-        List<BigInt> aff = toAffine(scalarMul(d, gPoint()));
-        if (isInf(aff)) { return null; }
+        long[] ox = new long[8];
+        long[] oy = new long[8];
+        if (!EcField256.ScalarMulG(EcField256.CurveSecp256k1, d, ox, oy)) { return null; }
 
         byte[] outb = new byte[64];
-        byte[] xb = aff[0].ToBytesBE(32);
-        byte[] yb = aff[1].ToBytesBE(32);
-        for (int i = 0; i < 32; i = i + 1) {
-            outb[i] = (byte)(xb[i] & 255);
-            outb[32 + i] = (byte)(yb[i] & 255);
-        }
+        EcField256.ToBytesBE(ox, outb, 0);
+        EcField256.ToBytesBE(oy, outb, 32);
         return outb;
     }
 
@@ -209,9 +60,7 @@ public class Secp256k1 {
         if (raw == null) { return null; }
         byte[] outb = new byte[65];
         outb[0] = 4;
-        for (int i = 0; i < 64; i = i + 1) {
-            outb[1 + i] = raw[i];
-        }
+        NativeMemory.Copy((nint)outb + 1, (nint)raw, 64);
         return outb;
     }
 
@@ -219,30 +68,25 @@ public class Secp256k1 {
     public static bool VerifyPublicKey(byte[] raw64) {
         init();
         if (raw64 == null || raw64.Length != 64) { return false; }
-        byte[] xb = new byte[32];
-        byte[] yb = new byte[32];
-        for (int i = 0; i < 32; i = i + 1) {
-            xb[i] = raw64[i];
-            yb[i] = raw64[32 + i];
-        }
-        BigInt x = BigInt.FromBytesBE(xb, 32);
-        BigInt y = BigInt.FromBytesBE(yb, 32);
-
-        if (BigInt.cmp(x, P) >= 0 || BigInt.cmp(y, P) >= 0) { return false; }
-
-        BigInt lhs = fsqr(y);
-        BigInt rhs = fadd(fmul(x, fsqr(x)), fromInt(7));
-        return BigInt.cmp(lhs, rhs) == 0;
+        long[] x = new long[8];
+        long[] y = new long[8];
+        EcField256.FromBytesBE(raw64, 0, x);
+        EcField256.FromBytesBE(raw64, 32, y);
+        return EcField256.IsOnCurve(EcField256.CurveSecp256k1, x, y);
     }
 
     private static byte[] hmac256(byte[] key, byte[] p1, byte[] p2, byte[] p3, byte[] p4) {
-        int total = p1.Length + (p2 == null ? 0 : p2.Length) + (p3 == null ? 0 : p3.Length) + (p4 == null ? 0 : p4.Length);
+        int l1 = p1.Length;
+        int l2 = p2 == null ? 0 : p2.Length;
+        int l3 = p3 == null ? 0 : p3.Length;
+        int l4 = p4 == null ? 0 : p4.Length;
+        int total = l1 + l2 + l3 + l4;
         byte[] msg = new byte[total];
         int pos = 0;
-        for (int i = 0; i < p1.Length; i = i + 1) { msg[pos] = p1[i] & 255; pos = pos + 1; }
-        if (p2 != null) { for (int i = 0; i < p2.Length; i = i + 1) { msg[pos] = p2[i] & 255; pos = pos + 1; } }
-        if (p3 != null) { for (int i = 0; i < p3.Length; i = i + 1) { msg[pos] = p3[i] & 255; pos = pos + 1; } }
-        if (p4 != null) { for (int i = 0; i < p4.Length; i = i + 1) { msg[pos] = p4[i] & 255; pos = pos + 1; } }
+        if (l1 > 0) { NativeMemory.Copy((nint)msg + pos, (nint)p1, l1); pos = pos + l1; }
+        if (l2 > 0) { NativeMemory.Copy((nint)msg + pos, (nint)p2, l2); pos = pos + l2; }
+        if (l3 > 0) { NativeMemory.Copy((nint)msg + pos, (nint)p3, l3); pos = pos + l3; }
+        if (l4 > 0) { NativeMemory.Copy((nint)msg + pos, (nint)p4, l4); }
         return Hmac.Compute(Hmac.SHA256, key.ToStr(0, key.Length), key.Length, msg.ToStr(0, total), total);
     }
 
@@ -252,10 +96,13 @@ public class Secp256k1 {
         if (hash32 == null || hash32.Length != 32 || privKey32 == null || privKey32.Length != 32) {
             return null;
         }
-        BigInt d = BigInt.FromBytesBE(privKey32, 32);
-        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, N) >= 0) {
+        EcCurveData cd = EcField256.GetCurve(EcField256.CurveSecp256k1);
+        long[] dl = new long[8];
+        EcField256.FromBytesBE(privKey32, 0, dl);
+        if (EcField256.IsZero(dl) || EcField256.Cmp(dl, cd.N) >= 0) {
             return null;
         }
+        BigInt d = BigInt.FromBytesBE(privKey32, 32);
 
         BigInt e = nmod(BigInt.FromBytesBE(hash32, 32));
         byte[] em = e.ToBytesBE(32);
@@ -269,28 +116,31 @@ public class Secp256k1 {
 
         k = hmac256(k, v, zero, privKey32, em);
         byte[] t = hmac256(k, v, null, null, null);
-        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        NativeMemory.Copy((nint)v, (nint)t, 32);
 
         k = hmac256(k, v, oneb, privKey32, em);
         t = hmac256(k, v, null, null, null);
-        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        NativeMemory.Copy((nint)v, (nint)t, 32);
+
+        long[] kl = new long[8];
+        long[] rx = new long[8];
+        long[] ry = new long[8];
 
         while (true) {
             t = hmac256(k, v, null, null, null);
-            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
-            BigInt kb = BigInt.FromBytesBE(v, 32);
+            NativeMemory.Copy((nint)v, (nint)t, 32);
+            EcField256.FromBytesBE(v, 0, kl);
 
-            if (BigInt.cmp(kb, BigInt.one()) >= 0 && BigInt.cmp(kb, N) < 0) {
-                List<BigInt> aff = toAffine(scalarMul(kb, gPoint()));
-                if (!isInf(aff)) {
-                    BigInt r = nmod(aff[0]);
+            if (!EcField256.IsZero(kl) && EcField256.Cmp(kl, cd.N) < 0) {
+                if (EcField256.ScalarMulG(EcField256.CurveSecp256k1, kl, rx, ry)) {
+                    BigInt r = nmod(EcField256.ToBigInt(rx));
                     if (!r.isZero()) {
+                        BigInt kb = BigInt.FromBytesBE(v, 32);
                         // s = k^-1 * (e + r * d) mod n
                         BigInt s = nmul(ninv(kb), nmod(BigInt.add(e, nmul(r, d))));
                         if (!s.isZero()) {
                             // 基础恢复位 v: 取点 R 的 y 坐标奇偶性 (0 为偶, 1 为奇)
-                            byte[] yb = aff[1].ToBytesBE(32);
-                            int recId = (yb[31] & 1) != 0 ? 1 : 0;
+                            int recId = (int)(ry[0] & 1L);
 
                             // 低 s 防延展规范: 如果 s > n/2，则将 s 翻转为 n - s，并反转恢复奇偶性
                             if (BigInt.cmp(s, HALF_N) > 0) {
@@ -306,7 +156,7 @@ public class Secp256k1 {
 
             k = hmac256(k, v, zero, null, null);
             t = hmac256(k, v, null, null, null);
-            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+            NativeMemory.Copy((nint)v, (nint)t, 32);
         }
     }
 
@@ -316,51 +166,63 @@ public class Secp256k1 {
         if (hash32 == null || hash32.Length != 32 || sig == null) { return null; }
         if (sig.V < 0 || sig.V > 3) { return null; }
 
-        BigInt r = BigInt.FromBytesBE(sig.R, 32);
-        BigInt s = BigInt.FromBytesBE(sig.S, 32);
-        if (BigInt.cmp(r, BigInt.one()) < 0 || BigInt.cmp(r, N) >= 0) { return null; }
-        if (BigInt.cmp(s, BigInt.one()) < 0 || BigInt.cmp(s, N) >= 0) { return null; }
-
-        // 1. 横坐标 x = r
-        BigInt x = r;
-        if (BigInt.cmp(x, P) >= 0) { return null; }
+        EcCurveData cd = EcField256.GetCurve(EcField256.CurveSecp256k1);
+        long[] xl = new long[8];
+        long[] sl = new long[8];
+        EcField256.FromBytesBE(sig.R, 0, xl);
+        EcField256.FromBytesBE(sig.S, 0, sl);
+        if (EcField256.IsZero(xl) || EcField256.Cmp(xl, cd.N) >= 0) { return null; }
+        if (EcField256.IsZero(sl) || EcField256.Cmp(sl, cd.N) >= 0) { return null; }
+        if (EcField256.Cmp(xl, cd.P) >= 0) { return null; }
 
         // 2. 求解 y^2 = x^3 + 7 (mod p) 的平方根: y = (x^3 + 7)^((p+1)/4) mod p
-        BigInt rhs = fadd(fmul(x, fsqr(x)), fromInt(7));
-        BigInt y = BigInt.ModPow(rhs, P_PLUS_1_DIV_4, P);
+        long[] p = cd.P;
+        long[] prod = new long[16];
+        long[] tmp = new long[8];
+        long[] rhs = new long[8];
+        long[] yl = new long[8];
+        long[] seven = new long[8]; seven[0] = 7L;
+
+        EcField256.FeSqr(0, p, tmp, xl, prod);
+        EcField256.FeMul(0, p, rhs, tmp, xl, prod);
+        EcField256.FeAdd(rhs, rhs, seven, p);
+        EcField256.SecpSqrt(yl, rhs);
 
         // 验证平方根有效性
-        if (BigInt.cmp(fsqr(y), rhs) != 0) {
-            return null; // 不是二次剩余，无法在曲线上找到对应的点
+        EcField256.FeSqr(0, p, tmp, yl, prod);
+        if (EcField256.Cmp(tmp, rhs) != 0) {
+            return null;
         }
 
         // 3. 根据 v (低位奇偶性) 匹配 y 的正负
-        byte[] yb = y.ToBytesBE(32);
-        int isOdd = (yb[31] & 1) != 0 ? 1 : 0;
+        int isOdd = (int)(yl[0] & 1L);
         int targetOdd = sig.V & 1;
-        if (isOdd != targetOdd) {
-            y = fsub(P, y);
+        if (isOdd != targetOdd && !EcField256.IsZero(yl)) {
+            EcField256.FeSub(yl, p, yl, p);
         }
 
-        List<BigInt> Rpt = pt(x, y, BigInt.one());
-
-        // 4. 计算 Q = r^-1 * (s * R - e * G)
+        // 4. 计算 Q = r^-1 * (s * R - e * G) = u1 * G + u2 * R（Shamir 联合双标量乘）
+        BigInt r = BigInt.FromBytesBE(sig.R, 32);
+        BigInt s = BigInt.FromBytesBE(sig.S, 32);
         BigInt e = nmod(BigInt.FromBytesBE(hash32, 32));
         BigInt rInv = ninv(r);
         BigInt u1 = nmod(BigInt.sub(N, nmul(e, rInv)));
         BigInt u2 = nmul(s, rInv);
 
-        List<BigInt> Qpt = jadd(scalarMul(u1, gPoint()), scalarMul(u2, Rpt));
-        if (isInf(Qpt)) { return null; }
+        long[] u1l = new long[8];
+        long[] u2l = new long[8];
+        EcField256.FromBigInt(u1, u1l);
+        EcField256.FromBigInt(u2, u2l);
 
-        List<BigInt> aff = toAffine(Qpt);
-        byte[] pub = new byte[64];
-        byte[] qx = aff[0].ToBytesBE(32);
-        byte[] qy = aff[1].ToBytesBE(32);
-        for (int i = 0; i < 32; i = i + 1) {
-            pub[i] = qx[i];
-            pub[32 + i] = qy[i];
+        long[] qx = new long[8];
+        long[] qy = new long[8];
+        if (!EcField256.ShamirMul(EcField256.CurveSecp256k1, u1l, u2l, xl, yl, qx, qy)) {
+            return null;
         }
+
+        byte[] pub = new byte[64];
+        EcField256.ToBytesBE(qx, pub, 0);
+        EcField256.ToBytesBE(qy, pub, 32);
         return pub;
     }
 }

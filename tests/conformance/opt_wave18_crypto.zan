@@ -1,0 +1,206 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace Prog;
+
+class Program {
+    static bool BytesEq(byte[] a, byte[] b, int len) {
+        if (a == null || b == null || a.Length < len || b.Length < len) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            if ((a[i] & 255) != (b[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    static byte[] Make32(int seed) {
+        byte[] k = new byte[32];
+        int x = seed * 1103515245 + 12345;
+        for (int i = 0; i < 32; i = i + 1) {
+            x = x * 1664525 + 1013904223;
+            k[i] = (byte)((x >> 16) & 255);
+        }
+        k[0] = (byte)(k[0] & 0x7F);
+        k[31] = (byte)(k[31] | 1);
+        return k;
+    }
+
+    static void TestSecp256k1() {
+        // 1. priv = 1 -> G
+        byte[] one = new byte[32]; one[31] = 1;
+        byte[] gPub = Secp256k1.GetPublicKeyRaw(one);
+        byte[] expGx = Hex.Decode("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
+        byte[] expGy = Hex.Decode("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8");
+        byte[] expG = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { expG[i] = expGx[i]; expG[32 + i] = expGy[i]; }
+        if (!BytesEq(gPub, expG, 64)) { Console.WriteLine("FAIL secp G"); return; }
+
+        // 2. priv = N - 1 -> (Gx, P - Gy)
+        byte[] nm1 = Hex.Decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140");
+        byte[] negG = Secp256k1.GetPublicKeyRaw(nm1);
+        if (negG == null || !BytesEq(negG, expGx, 32) || !Secp256k1.VerifyPublicKey(negG)) {
+            Console.WriteLine("FAIL secp N-1"); return;
+        }
+        // priv = 0 or N -> null
+        byte[] zero = new byte[32];
+        byte[] nBytes = Hex.Decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+        if (Secp256k1.GetPublicKeyRaw(zero) != null || Secp256k1.GetPublicKeyRaw(nBytes) != null) {
+            Console.WriteLine("FAIL secp bounds"); return;
+        }
+
+        // 3. Sign + Recover + tamper + uncompressed
+        for (int i = 0; i < 4; i = i + 1) {
+            byte[] pk = Make32(10 + i);
+            byte[] h = Make32(50 + i);
+            byte[] pub = Secp256k1.GetPublicKeyRaw(pk);
+            byte[] unc = Secp256k1.GetPublicKeyUncompressed(pk);
+            if (pub == null || unc == null || unc[0] != 4 || !Secp256k1.VerifyPublicKey(pub)) {
+                Console.WriteLine("FAIL secp key"); return;
+            }
+            Secp256k1Signature sig = Secp256k1.Sign(h, pk);
+            if (sig == null) { Console.WriteLine("FAIL secp sign"); return; }
+            byte[] rec = Secp256k1.RecoverPublicKey(h, sig);
+            if (!BytesEq(pub, rec, 64)) { Console.WriteLine("FAIL secp recover"); return; }
+
+            // tamper hash -> recovers different key
+            byte[] h2 = Make32(50 + i);
+            h2[0] = (byte)(h2[0] ^ 1);
+            byte[] rec2 = Secp256k1.RecoverPublicKey(h2, sig);
+            if (rec2 != null && BytesEq(pub, rec2, 64)) { Console.WriteLine("FAIL secp tamper"); return; }
+        }
+        // off-curve point rejected
+        byte[] bad = new byte[64];
+        for (int i = 0; i < 64; i = i + 1) { bad[i] = gPub[i]; }
+        bad[63] = (byte)(bad[63] ^ 1);
+        if (Secp256k1.VerifyPublicKey(bad)) { Console.WriteLine("FAIL secp offcurve"); return; }
+
+        Console.WriteLine("secp256k1=OK");
+    }
+
+    static void TestEcdsaP256() {
+        byte[] one = new byte[32]; one[31] = 1;
+        byte[] gPub = Ecdsa.PublicKeyOf(one);
+        byte[] expGx = Hex.Decode("6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296");
+        byte[] expGy = Hex.Decode("4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
+        if (gPub == null || gPub[0] != 4 || !Ecdsa.ValidPublicKey(gPub, 65)) {
+            Console.WriteLine("FAIL p256 G"); return;
+        }
+        for (int i = 0; i < 32; i = i + 1) {
+            if ((gPub[1 + i] & 255) != (expGx[i] & 255) || (gPub[33 + i] & 255) != (expGy[i] & 255)) {
+                Console.WriteLine("FAIL p256 G coords"); return;
+            }
+        }
+        // bounds
+        byte[] zero = new byte[32];
+        byte[] nBytes = Hex.Decode("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+        if (Ecdsa.PublicKeyOf(zero) != null || Ecdsa.PublicKeyOf(nBytes) != null) {
+            Console.WriteLine("FAIL p256 bounds"); return;
+        }
+        // Sign + Verify + tamper
+        string msg = "Wave 18 ECDSA P-256 conformance payload";
+        for (int i = 0; i < 4; i = i + 1) {
+            byte[] pk = Make32(100 + i);
+            byte[] pub = Ecdsa.PublicKeyOf(pk);
+            List<int> sigLen = new List<int>(); sigLen.Add(0);
+            byte[] sig = Ecdsa.SignSha256Det(msg, msg.Length, pk, sigLen);
+            if (sig == null || sigLen[0] < 8) { Console.WriteLine("FAIL p256 sign"); return; }
+            byte[] px = new byte[32]; byte[] py = new byte[32];
+            for (int j = 0; j < 32; j = j + 1) { px[j] = pub[1 + j]; py[j] = pub[33 + j]; }
+            if (!Ecdsa.VerifySha256(msg, msg.Length, sig, sigLen[0], px, py)) {
+                Console.WriteLine("FAIL p256 verify"); return;
+            }
+            if (Ecdsa.VerifySha256(msg + "!", msg.Length + 1, sig, sigLen[0], px, py)) {
+                Console.WriteLine("FAIL p256 tamper"); return;
+            }
+        }
+        Console.WriteLine("ecdsa_p256=OK");
+    }
+
+    static void TestSm2() {
+        // 1. d = 1 -> G, d = N + 1 -> G
+        List<BigInt> g1 = Sm2.PublicKey(BigInt.one());
+        BigInt expGx = BigInt.FromBytesBE(Hex.Decode("32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7"), 32);
+        BigInt expGy = BigInt.FromBytesBE(Hex.Decode("BC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0"), 32);
+        if (BigInt.cmp(g1[0], expGx) != 0 || BigInt.cmp(g1[1], expGy) != 0) {
+            Console.WriteLine("FAIL sm2 G"); return;
+        }
+        BigInt nVal = BigInt.FromBytesBE(Hex.Decode("FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123"), 32);
+        List<BigInt> gWrap = Sm2.PublicKey(BigInt.add(nVal, BigInt.one()));
+        if (BigInt.cmp(gWrap[0], expGx) != 0 || BigInt.cmp(gWrap[1], expGy) != 0) {
+            Console.WriteLine("FAIL sm2 N+1"); return;
+        }
+
+        // 2. Sign/Verify & Encrypt/Decrypt + tamper rejection
+        string msg = "Wave 18 SM2 GB/T 32918 roundtrip conformance check!";
+        for (int i = 0; i < 3; i = i + 1) {
+            BigInt d = BigInt.FromBytesBE(Make32(200 + i), 32);
+            BigInt e = BigInt.FromBytesBE(Make32(220 + i), 32);
+            BigInt k = BigInt.FromBytesBE(Make32(240 + i), 32);
+            List<BigInt> pub = Sm2.PublicKey(d);
+            byte[] sig = new byte[64];
+            Sm2.Sign(e, d, k, sig);
+            byte[] rb = new byte[32]; byte[] sb = new byte[32];
+            for (int j = 0; j < 32; j = j + 1) { rb[j] = sig[j]; sb[j] = sig[32 + j]; }
+            BigInt r = BigInt.FromBytesBE(rb, 32);
+            BigInt s = BigInt.FromBytesBE(sb, 32);
+            if (!Sm2.Verify(e, pub[0], pub[1], r, s)) { Console.WriteLine("FAIL sm2 verify"); return; }
+            if (Sm2.Verify(BigInt.add(e, BigInt.one()), pub[0], pub[1], r, s)) { Console.WriteLine("FAIL sm2 sig tamper"); return; }
+
+            List<int> cLen = new List<int>(); cLen.Add(0);
+            byte[] cph = Sm2.Encrypt(msg, msg.Length, pub[0], pub[1], k, cLen);
+            List<int> pLen = new List<int>(); pLen.Add(0);
+            byte[] plain = Sm2.Decrypt(cph, cLen[0], d, pLen);
+            if (plain == null || pLen[0] != msg.Length || plain.ToStr(0, pLen[0]) != msg) {
+                Console.WriteLine("FAIL sm2 dec"); return;
+            }
+            // tamper C3 -> rejected
+            cph[70] = (byte)(cph[70] ^ 1);
+            List<int> badLen = new List<int>(); badLen.Add(0);
+            if (Sm2.Decrypt(cph, cLen[0], d, badLen) != null || badLen[0] != -1) {
+                Console.WriteLine("FAIL sm2 c3 tamper"); return;
+            }
+            // off-curve C1 -> rejected
+            cph[70] = (byte)(cph[70] ^ 1);
+            cph[64] = (byte)(cph[64] ^ 1);
+            if (Sm2.Decrypt(cph, cLen[0], d, badLen) != null || badLen[0] != -1) {
+                Console.WriteLine("FAIL sm2 c1 offcurve"); return;
+            }
+        }
+        Console.WriteLine("sm2=OK");
+    }
+
+    static void TestBigIntBits() {
+        // Bits.Shr64 with sign bit set
+        long neg = -1L;
+        if (Bits.Shr64(neg, 1) != 9223372036854775807L || Bits.Shr64(neg, 32) != 4294967295L || Bits.Shr64(neg, 63) != 1L) {
+            Console.WriteLine("FAIL shr64"); return;
+        }
+        // BigInt ModPow (g >= n, exp = 0, n = 1, Fermat check)
+        BigInt p = BigInt.FromBytesBE(Hex.Decode("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"), 32);
+        BigInt a = BigInt.FromBytesBE(Make32(300), 32);
+        BigInt inv = BigInt.ModInverse(a, p);
+        BigInt prod = BigInt.mod(BigInt.mul(a, inv), p);
+        if (BigInt.cmp(prod, BigInt.one()) != 0) { Console.WriteLine("FAIL modinv"); return; }
+
+        // Fermat: a^(p-1) mod p == 1, also test g >= p
+        BigInt pm1 = BigInt.sub(p, BigInt.one());
+        BigInt fermat = BigInt.ModPow(BigInt.add(a, p), pm1, p);
+        if (BigInt.cmp(fermat, BigInt.one()) != 0) { Console.WriteLine("FAIL modpow fermat"); return; }
+
+        BigInt pow0 = BigInt.ModPow(a, BigInt.zero(), p);
+        if (BigInt.cmp(pow0, BigInt.one()) != 0) { Console.WriteLine("FAIL modpow 0"); return; }
+
+        BigInt mod1 = BigInt.ModPow(a, a, BigInt.one());
+        if (!mod1.isZero()) { Console.WriteLine("FAIL modpow 1"); return; }
+
+        Console.WriteLine("bigint_bits=OK");
+    }
+
+    static void Main() {
+        TestSecp256k1();
+        TestEcdsaP256();
+        TestSm2();
+        TestBigIntBits();
+        Console.WriteLine("WAVE18_ALL_OK");
+    }
+}

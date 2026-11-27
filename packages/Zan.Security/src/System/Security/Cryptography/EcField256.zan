@@ -1,0 +1,989 @@
+using System;
+using System.Interop;
+
+namespace System.Security.Cryptography;
+
+// 256-bit 素数域定长 8x32-bit Limb 运算与 Jacobian 椭圆曲线核心引擎。
+// 统一服务于 Secp256k1 (curve=0)、NIST P-256 (curve=1) 与 SM2 (curve=2)：
+// - 8x32-bit 零分配定长 Limb + 36 乘特化平方；
+// - 三曲线专属 Solinas / 伪梅森快速约简（零除法、零堆分配）；
+// - 常数时间 Fermat 加法链模逆 (a^(p-2)) 与 Secp256k1 模平方根 (a^((p+1)/4))；
+// - EFD dbl-2009-l (a=0, 2M+5S) / dbl-2001-b (a=-3, 3M+5S) 与 madd-2007-bl (7M+4S)；
+// - 固定基点 G 预计算 4-bit 2-Comb 表（30 仿射点，Montgomery 批量求逆，仅 31 倍点 + ~60 混合点加）；
+// - Shamir 4-bit 交错窗口双标量乘（u1*G + u2*Q，倍点减半 + 批量仿射混合点加）。
+internal class EcScratch {
+    internal long[] Prod;
+    internal long[] T1;
+    internal long[] T2;
+    internal long[] T3;
+    internal long[] T4;
+    internal long[] T5;
+    internal long[] T6;
+    internal long[] T7;
+    internal long[] T8;
+
+    internal EcScratch() {
+        this.Prod = new long[16];
+        this.T1 = new long[8];
+        this.T2 = new long[8];
+        this.T3 = new long[8];
+        this.T4 = new long[8];
+        this.T5 = new long[8];
+        this.T6 = new long[8];
+        this.T7 = new long[8];
+        this.T8 = new long[8];
+    }
+}
+
+internal class EcCurveData {
+    internal int Curve;
+    internal long[] P;
+    internal long[] N;
+    internal long[] Gx;
+    internal long[] Gy;
+    // 4-bit 2-Comb 表（索引 1..15，每个仿射点占 8 limb）
+    internal long[][] T0X;
+    internal long[][] T0Y;
+    internal long[][] T1X;
+    internal long[][] T1Y;
+    // 4-bit 窗口表 1G..15G（供 Shamir 联合双标量乘使用）
+    internal long[][] TgX;
+    internal long[][] TgY;
+}
+
+public class EcField256 {
+    internal static int CurveSecp256k1 = 0;
+    internal static int CurveP256 = 1;
+    internal static int CurveSm2 = 2;
+
+    private static EcCurveData SecpData;
+    private static EcCurveData P256Data;
+    private static EcCurveData Sm2Data;
+
+    private static long[] MakeLimbs(long l0, long l1, long l2, long l3, long l4, long l5, long l6, long l7) {
+        long[] r = new long[8];
+        r[0] = l0; r[1] = l1; r[2] = l2; r[3] = l3;
+        r[4] = l4; r[5] = l5; r[6] = l6; r[7] = l7;
+        return r;
+    }
+
+    internal static void Copy(long[] dst, long[] src) {
+        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+        dst[4] = src[4]; dst[5] = src[5]; dst[6] = src[6]; dst[7] = src[7];
+    }
+
+    internal static void SetZero(long[] dst) {
+        dst[0] = 0L; dst[1] = 0L; dst[2] = 0L; dst[3] = 0L;
+        dst[4] = 0L; dst[5] = 0L; dst[6] = 0L; dst[7] = 0L;
+    }
+
+    internal static void SetOne(long[] dst) {
+        dst[0] = 1L; dst[1] = 0L; dst[2] = 0L; dst[3] = 0L;
+        dst[4] = 0L; dst[5] = 0L; dst[6] = 0L; dst[7] = 0L;
+    }
+
+    internal static bool IsZero(long[] a) {
+        return (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0L;
+    }
+
+    internal static int Cmp(long[] a, long[] b) {
+        for (int i = 7; i >= 0; i = i - 1) {
+            if (a[i] != b[i]) { return a[i] > b[i] ? 1 : -1; }
+        }
+        return 0;
+    }
+
+    internal static void FromBytesBE(byte[] src, int off, long[] dst) {
+        for (int i = 0; i < 8; i = i + 1) {
+            int p = off + (7 - i) * 4;
+            dst[i] = (((long)(src[p] & 255)) << 24)
+                   | (((long)(src[p + 1] & 255)) << 16)
+                   | (((long)(src[p + 2] & 255)) << 8)
+                   | ((long)(src[p + 3] & 255));
+        }
+    }
+
+    internal static void FromStringBE(string src, int off, long[] dst) {
+        for (int i = 0; i < 8; i = i + 1) {
+            int p = off + (7 - i) * 4;
+            dst[i] = (((long)(src[p] & 255)) << 24)
+                   | (((long)(src[p + 1] & 255)) << 16)
+                   | (((long)(src[p + 2] & 255)) << 8)
+                   | ((long)(src[p + 3] & 255));
+        }
+    }
+
+    internal static void FromBigInt(BigInt b, long[] dst) {
+        for (int i = 0; i < 8; i = i + 1) {
+            dst[i] = b.limb(i);
+        }
+    }
+
+    internal static void ToBytesBE(long[] src, byte[] dst, int off) {
+        for (int i = 0; i < 8; i = i + 1) {
+            long w = src[7 - i];
+            int p = off + i * 4;
+            dst[p]     = (byte)((w >> 24) & 255L);
+            dst[p + 1] = (byte)((w >> 16) & 255L);
+            dst[p + 2] = (byte)((w >> 8) & 255L);
+            dst[p + 3] = (byte)(w & 255L);
+        }
+    }
+
+    internal static BigInt ToBigInt(long[] src) {
+        byte[] b = new byte[32];
+        ToBytesBE(src, b, 0);
+        return BigInt.FromBytesBE(b, 32);
+    }
+
+    private static int GetBit(long[] k, int bit) {
+        return (int)((k[bit >> 5] >> (bit & 31)) & 1L);
+    }
+
+    private static int GetNibble(long[] k, int nib) {
+        int limbIdx = nib >> 3;
+        int shift = (nib & 7) << 2;
+        return (int)((k[limbIdx] >> shift) & 15L);
+    }
+
+    // ===== 256-bit 域加减与小常数倍乘（全部零分配、支持原位别名）=====
+
+    internal static void FeAdd(long[] r, long[] a, long[] b, long[] p) {
+        long carry = 0L;
+        for (int i = 0; i < 8; i = i + 1) {
+            long s = a[i] + b[i] + carry;
+            r[i] = s & 4294967295L;
+            carry = s >> 32;
+        }
+        if (carry != 0L || Cmp(r, p) >= 0) {
+            long borrow = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] - p[i] - borrow;
+                if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+                r[i] = s;
+            }
+        }
+    }
+
+    internal static void FeSub(long[] r, long[] a, long[] b, long[] p) {
+        long borrow = 0L;
+        for (int i = 0; i < 8; i = i + 1) {
+            long s = a[i] - b[i] - borrow;
+            if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+            r[i] = s;
+        }
+        if (borrow != 0L) {
+            long carry = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] + p[i] + carry;
+                r[i] = s & 4294967295L;
+                carry = s >> 32;
+            }
+        }
+    }
+
+    internal static void FeDbl(long[] r, long[] a, long[] p) {
+        long carry = 0L;
+        for (int i = 0; i < 8; i = i + 1) {
+            long s = (a[i] << 1) | carry;
+            r[i] = s & 4294967295L;
+            carry = s >> 32;
+        }
+        if (carry != 0L || Cmp(r, p) >= 0) {
+            long borrow = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] - p[i] - borrow;
+                if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+                r[i] = s;
+            }
+        }
+    }
+
+    internal static void FeMul3(long[] r, long[] a, long[] p, long[] tmp) {
+        FeDbl(tmp, a, p);
+        FeAdd(r, tmp, a, p);
+    }
+
+    // ===== 256-bit 乘法（64 乘）与特化平方（36 乘），ulong 进位零溢出 =====
+
+    private static void Mul256(long[] a, long[] b, long[] t) {
+        ulong a0 = (ulong)a[0]; ulong a1 = (ulong)a[1]; ulong a2 = (ulong)a[2]; ulong a3 = (ulong)a[3];
+        ulong a4 = (ulong)a[4]; ulong a5 = (ulong)a[5]; ulong a6 = (ulong)a[6]; ulong a7 = (ulong)a[7];
+
+        // i = 0：直接初始化 t[0..8]，省去一次 Fill(0)
+        ulong b0 = (ulong)b[0];
+        ulong cur = a0 * b0; t[0] = (long)(cur & 4294967295UL); ulong c = cur >> 32;
+        cur = a1 * b0 + c;   t[1] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a2 * b0 + c;   t[2] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a3 * b0 + c;   t[3] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a4 * b0 + c;   t[4] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a5 * b0 + c;   t[5] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a6 * b0 + c;   t[6] = (long)(cur & 4294967295UL); c = cur >> 32;
+        cur = a7 * b0 + c;   t[7] = (long)(cur & 4294967295UL); t[8] = (long)(cur >> 32);
+
+        for (int j = 1; j < 8; j = j + 1) {
+            ulong bj = (ulong)b[j];
+            cur = (ulong)t[j]     + a0 * bj;     t[j]     = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 1] + a1 * bj + c; t[j + 1] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 2] + a2 * bj + c; t[j + 2] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 3] + a3 * bj + c; t[j + 3] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 4] + a4 * bj + c; t[j + 4] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 5] + a5 * bj + c; t[j + 5] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 6] + a6 * bj + c; t[j + 6] = (long)(cur & 4294967295UL); c = cur >> 32;
+            cur = (ulong)t[j + 7] + a7 * bj + c; t[j + 7] = (long)(cur & 4294967295UL); t[j + 8] = (long)(cur >> 32);
+        }
+    }
+
+    private static void Sqr256(long[] a, long[] t) {
+        // 1. 仅算严格上三角交叉项 a[i]*a[j] (i < j)，共 28 次乘法
+        t[0] = 0L;
+        for (int k = 1; k < 16; k = k + 1) { t[k] = 0L; }
+        for (int i = 0; i < 7; i = i + 1) {
+            ulong ai = (ulong)a[i];
+            ulong c = 0;
+            for (int j = i + 1; j < 8; j = j + 1) {
+                ulong cur = (ulong)t[i + j] + ai * (ulong)a[j] + c;
+                t[i + j] = (long)(cur & 4294967295UL);
+                c = cur >> 32;
+            }
+            t[i + 8] = (long)((ulong)t[i + 8] + c);
+        }
+        // 2. 交叉项整体左移 1 位（×2）
+        ulong sh = 0;
+        for (int k = 1; k < 16; k = k + 1) {
+            ulong v = ((ulong)t[k] << 1) | sh;
+            t[k] = (long)(v & 4294967295UL);
+            sh = v >> 32;
+        }
+        // 3. 累加 8 个对角平方项 a[i]^2
+        ulong carry = 0;
+        for (int i = 0; i < 8; i = i + 1) {
+            ulong ai = (ulong)a[i];
+            ulong sq = ai * ai;
+            ulong lo = (ulong)t[2 * i] + (sq & 4294967295UL) + carry;
+            t[2 * i] = (long)(lo & 4294967295UL);
+            ulong hi = (ulong)t[2 * i + 1] + (sq >> 32) + (lo >> 32);
+            t[2 * i + 1] = (long)(hi & 4294967295UL);
+            carry = hi >> 32;
+        }
+    }
+
+    // ===== 三曲线专属 Solinas / 伪梅森快速约简（512-bit -> [0, P)）=====
+
+    private static void ReduceSecp256k1(long[] t, long[] r, long[] p) {
+        // p = 2^256 - 2^32 - 977 => 2^256 ≡ 2^32 + 977 (mod p)
+        ulong carry = 0;
+        ulong prevHi = 0;
+        for (int i = 0; i < 8; i = i + 1) {
+            ulong hi = (ulong)t[8 + i];
+            ulong v = (ulong)t[i] + hi * 977UL + prevHi + carry;
+            r[i] = (long)(v & 4294967295UL);
+            carry = v >> 32;
+            prevHi = hi;
+        }
+        ulong v8 = prevHi + carry;
+        ulong acc8 = v8 & 4294967295UL;
+        ulong acc9 = v8 >> 32;
+
+        // 第二次折叠 acc8 * (2^32 + 977) + acc9 * 2^32 * (2^32 + 977)
+        ulong s0 = (ulong)r[0] + acc8 * 977UL;
+        r[0] = (long)(s0 & 4294967295UL);
+        ulong s1 = (ulong)r[1] + acc8 + acc9 * 977UL + (s0 >> 32);
+        r[1] = (long)(s1 & 4294967295UL);
+        ulong s2 = (ulong)r[2] + acc9 + (s1 >> 32);
+        r[2] = (long)(s2 & 4294967295UL);
+        ulong c2 = s2 >> 32;
+        for (int i = 3; i < 8; i = i + 1) {
+            ulong si = (ulong)r[i] + c2;
+            r[i] = (long)(si & 4294967295UL);
+            c2 = si >> 32;
+        }
+        if (c2 != 0) {
+            ulong u0 = (ulong)r[0] + c2 * 977UL;
+            r[0] = (long)(u0 & 4294967295UL);
+            ulong u1 = (ulong)r[1] + c2 + (u0 >> 32);
+            r[1] = (long)(u1 & 4294967295UL);
+            ulong k = u1 >> 32;
+            for (int i = 2; i < 8; i = i + 1) {
+                ulong ui = (ulong)r[i] + k;
+                r[i] = (long)(ui & 4294967295UL);
+                k = ui >> 32;
+            }
+        }
+        if (Cmp(r, p) >= 0) {
+            long borrow = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] - p[i] - borrow;
+                if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+                r[i] = s;
+            }
+        }
+    }
+
+    private static void ReduceP256(long[] t, long[] r, long[] p) {
+        // FIPS 186-4 §D.2.3: p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+        long c8 = t[8]; long c9 = t[9]; long c10 = t[10]; long c11 = t[11];
+        long c12 = t[12]; long c13 = t[13]; long c14 = t[14]; long c15 = t[15];
+
+        long s0 = t[0] + c8 + c9 - c11 - c12 - c13 - c14;
+        long s1 = t[1] + c9 + c10 - c12 - c13 - c14 - c15;
+        long s2 = t[2] + c10 + c11 - c13 - c14 - c15;
+        long s3 = t[3] + (c11 << 1) + (c12 << 1) + c13 - c15 - c8 - c9;
+        long s4 = t[4] + (c12 << 1) + (c13 << 1) + c14 - c9 - c10;
+        long s5 = t[5] + (c13 << 1) + (c14 << 1) + c15 - c10 - c11;
+        long s6 = t[6] + (c14 << 1) + (c15 << 1) + c14 + c13 - c8 - c9;
+        long s7 = t[7] + (c15 << 1) + c15 + c8 - c10 - c11 - c12 - c13;
+
+        long v = s0; r[0] = v & 4294967295L; long carry = v >> 32;
+        v = s1 + carry; r[1] = v & 4294967295L; carry = v >> 32;
+        v = s2 + carry; r[2] = v & 4294967295L; carry = v >> 32;
+        v = s3 + carry; r[3] = v & 4294967295L; carry = v >> 32;
+        v = s4 + carry; r[4] = v & 4294967295L; carry = v >> 32;
+        v = s5 + carry; r[5] = v & 4294967295L; carry = v >> 32;
+        v = s6 + carry; r[6] = v & 4294967295L; carry = v >> 32;
+        v = s7 + carry; r[7] = v & 4294967295L; carry = v >> 32;
+
+        while (carry != 0L) {
+            long k = carry;
+            v = r[0] + k; r[0] = v & 4294967295L; carry = v >> 32;
+            v = r[1] + carry; r[1] = v & 4294967295L; carry = v >> 32;
+            v = r[2] + carry; r[2] = v & 4294967295L; carry = v >> 32;
+            v = r[3] - k + carry; r[3] = v & 4294967295L; carry = v >> 32;
+            v = r[4] + carry; r[4] = v & 4294967295L; carry = v >> 32;
+            v = r[5] + carry; r[5] = v & 4294967295L; carry = v >> 32;
+            v = r[6] - k + carry; r[6] = v & 4294967295L; carry = v >> 32;
+            v = r[7] + k + carry; r[7] = v & 4294967295L; carry = v >> 32;
+        }
+        if (Cmp(r, p) >= 0) {
+            long borrow = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] - p[i] - borrow;
+                if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+                r[i] = s;
+            }
+        }
+    }
+
+    private static void ReduceSm2(long[] t, long[] r, long[] p) {
+        // GB/T 32918: p = 2^256 - 2^224 - 2^96 + 2^64 - 1
+        long c8 = t[8]; long c9 = t[9]; long c10 = t[10]; long c11 = t[11];
+        long c12 = t[12]; long c13 = t[13]; long c14 = t[14]; long c15 = t[15];
+
+        long c13_14_15 = c13 + c14 + c15;
+        long s0 = t[0] + c8 + c9 + c10 + c11 + c12 + (c13_14_15 << 1);
+        long s1 = t[1] + c9 + c10 + c11 + c12 + c13 + ((c14 + c15) << 1);
+        long s2 = t[2] - c8 - c9 - c13 - c14;
+        long s3 = t[3] + c8 + c11 + c12 + (c13 << 1) + c14 + c15;
+        long s4 = t[4] + c9 + c12 + c13 + (c14 << 1) + c15;
+        long s5 = t[5] + c10 + c13 + c14 + (c15 << 1);
+        long s6 = t[6] + c11 + c14 + c15;
+        long s7 = t[7] + c8 + c9 + c10 + c11 + ((c12 + c13 + c14 + c15) << 1) + c15;
+
+        long v = s0; r[0] = v & 4294967295L; long carry = v >> 32;
+        v = s1 + carry; r[1] = v & 4294967295L; carry = v >> 32;
+        v = s2 + carry; r[2] = v & 4294967295L; carry = v >> 32;
+        v = s3 + carry; r[3] = v & 4294967295L; carry = v >> 32;
+        v = s4 + carry; r[4] = v & 4294967295L; carry = v >> 32;
+        v = s5 + carry; r[5] = v & 4294967295L; carry = v >> 32;
+        v = s6 + carry; r[6] = v & 4294967295L; carry = v >> 32;
+        v = s7 + carry; r[7] = v & 4294967295L; carry = v >> 32;
+
+        while (carry != 0L) {
+            long k = carry;
+            v = r[0] + k; r[0] = v & 4294967295L; carry = v >> 32;
+            v = r[1] + carry; r[1] = v & 4294967295L; carry = v >> 32;
+            v = r[2] - k + carry; r[2] = v & 4294967295L; carry = v >> 32;
+            v = r[3] + k + carry; r[3] = v & 4294967295L; carry = v >> 32;
+            v = r[4] + carry; r[4] = v & 4294967295L; carry = v >> 32;
+            v = r[5] + carry; r[5] = v & 4294967295L; carry = v >> 32;
+            v = r[6] + carry; r[6] = v & 4294967295L; carry = v >> 32;
+            v = r[7] + k + carry; r[7] = v & 4294967295L; carry = v >> 32;
+        }
+        if (Cmp(r, p) >= 0) {
+            long borrow = 0L;
+            for (int i = 0; i < 8; i = i + 1) {
+                long s = r[i] - p[i] - borrow;
+                if (s < 0L) { s = s + 4294967296L; borrow = 1L; } else { borrow = 0L; }
+                r[i] = s;
+            }
+        }
+    }
+
+    internal static void FeMul(int curve, long[] p, long[] r, long[] a, long[] b, long[] prod) {
+        Mul256(a, b, prod);
+        if (curve == 0) { ReduceSecp256k1(prod, r, p); }
+        else if (curve == 1) { ReduceP256(prod, r, p); }
+        else { ReduceSm2(prod, r, p); }
+    }
+
+    internal static void FeSqr(int curve, long[] p, long[] r, long[] a, long[] prod) {
+        Sqr256(a, prod);
+        if (curve == 0) { ReduceSecp256k1(prod, r, p); }
+        else if (curve == 1) { ReduceP256(prod, r, p); }
+        else { ReduceSm2(prod, r, p); }
+    }
+
+    private static void FeSqrN(int curve, long[] p, long[] r, long[] a, int n, long[] prod) {
+        FeSqr(curve, p, r, a, prod);
+        for (int i = 1; i < n; i = i + 1) {
+            FeSqr(curve, p, r, r, prod);
+        }
+    }
+
+    // ===== 常数时间 Fermat 加法链模逆与模平方根 =====
+
+    internal static void FeInv(int curve, long[] p, long[] r, long[] x, long[] prod) {
+        if (curve == 0) {
+            long[] x2 = new long[8]; long[] x3 = new long[8];
+            long[] x6 = new long[8]; long[] x9 = new long[8];
+            long[] x11 = new long[8]; long[] x22 = new long[8];
+            long[] x44 = new long[8]; long[] x88 = new long[8];
+            long[] x176 = new long[8]; long[] x220 = new long[8];
+            long[] x223 = new long[8]; long[] t = new long[8];
+
+            FeSqr(0, p, t, x, prod); FeMul(0, p, x2, t, x, prod);
+            FeSqr(0, p, t, x2, prod); FeMul(0, p, x3, t, x, prod);
+            FeSqrN(0, p, t, x3, 3, prod); FeMul(0, p, x6, t, x3, prod);
+            FeSqrN(0, p, t, x6, 3, prod); FeMul(0, p, x9, t, x3, prod);
+            FeSqrN(0, p, t, x9, 2, prod); FeMul(0, p, x11, t, x2, prod);
+            FeSqrN(0, p, t, x11, 11, prod); FeMul(0, p, x22, t, x11, prod);
+            FeSqrN(0, p, t, x22, 22, prod); FeMul(0, p, x44, t, x22, prod);
+            FeSqrN(0, p, t, x44, 44, prod); FeMul(0, p, x88, t, x44, prod);
+            FeSqrN(0, p, t, x88, 88, prod); FeMul(0, p, x176, t, x88, prod);
+            FeSqrN(0, p, t, x176, 44, prod); FeMul(0, p, x220, t, x44, prod);
+            FeSqrN(0, p, t, x220, 3, prod); FeMul(0, p, x223, t, x3, prod);
+
+            FeSqrN(0, p, t, x223, 23, prod); FeMul(0, p, t, t, x22, prod);
+            FeSqrN(0, p, t, t, 5, prod); FeMul(0, p, t, t, x, prod);
+            FeSqrN(0, p, t, t, 3, prod); FeMul(0, p, t, t, x2, prod);
+            FeSqrN(0, p, t, t, 2, prod); FeMul(0, p, r, t, x, prod);
+            return;
+        }
+        if (curve == 1) {
+            long[] x2 = new long[8]; long[] x4 = new long[8];
+            long[] x8 = new long[8]; long[] x16 = new long[8];
+            long[] x30 = new long[8]; long[] x32 = new long[8];
+            long[] t = new long[8];
+
+            FeSqr(1, p, t, x, prod); FeMul(1, p, x2, t, x, prod);
+            FeSqrN(1, p, t, x2, 2, prod); FeMul(1, p, x4, t, x2, prod);
+            FeSqrN(1, p, t, x4, 4, prod); FeMul(1, p, x8, t, x4, prod);
+            FeSqrN(1, p, t, x8, 8, prod); FeMul(1, p, x16, t, x8, prod);
+            FeSqrN(1, p, t, x16, 16, prod); FeMul(1, p, x32, t, x16, prod);
+
+            FeSqrN(1, p, t, x16, 8, prod); FeMul(1, p, x30, t, x8, prod);
+            FeSqrN(1, p, t, x30, 4, prod); FeMul(1, p, x30, t, x4, prod);
+            FeSqrN(1, p, t, x30, 2, prod); FeMul(1, p, x30, t, x2, prod);
+
+            FeSqrN(1, p, t, x32, 32, prod); FeMul(1, p, t, t, x, prod);
+            FeSqrN(1, p, t, t, 128, prod); FeMul(1, p, t, t, x32, prod);
+            FeSqrN(1, p, t, t, 32, prod); FeMul(1, p, t, t, x32, prod);
+            FeSqrN(1, p, t, t, 30, prod); FeMul(1, p, t, t, x30, prod);
+            FeSqrN(1, p, t, t, 2, prod); FeMul(1, p, r, t, x, prod);
+            return;
+        }
+        // SM2 (curve == 2)
+        long[] x2 = new long[8]; long[] x4 = new long[8];
+        long[] x8 = new long[8]; long[] x16 = new long[8];
+        long[] x30 = new long[8]; long[] x31 = new long[8];
+        long[] x32 = new long[8]; long[] x64 = new long[8];
+        long[] t = new long[8];
+
+        FeSqr(2, p, t, x, prod); FeMul(2, p, x2, t, x, prod);
+        FeSqrN(2, p, t, x2, 2, prod); FeMul(2, p, x4, t, x2, prod);
+        FeSqrN(2, p, t, x4, 4, prod); FeMul(2, p, x8, t, x4, prod);
+        FeSqrN(2, p, t, x8, 8, prod); FeMul(2, p, x16, t, x8, prod);
+        FeSqrN(2, p, t, x16, 8, prod); FeMul(2, p, x30, t, x8, prod);
+        FeSqrN(2, p, t, x30, 4, prod); FeMul(2, p, x30, t, x4, prod);
+        FeSqrN(2, p, t, x30, 2, prod); FeMul(2, p, x30, t, x2, prod);
+        FeSqr(2, p, t, x30, prod); FeMul(2, p, x31, t, x, prod);
+        FeSqr(2, p, t, x31, prod); FeMul(2, p, x32, t, x, prod);
+        FeSqrN(2, p, t, x32, 32, prod); FeMul(2, p, x64, t, x32, prod);
+
+        FeSqrN(2, p, t, x31, 65, prod); FeMul(2, p, t, t, x64, prod);
+        FeSqrN(2, p, t, t, 64, prod); FeMul(2, p, t, t, x64, prod);
+        FeSqrN(2, p, t, t, 64, prod); FeMul(2, p, t, t, x32, prod);
+        FeSqrN(2, p, t, t, 30, prod); FeMul(2, p, t, t, x30, prod);
+        FeSqrN(2, p, t, t, 2, prod); FeMul(2, p, r, t, x, prod);
+    }
+
+    // Secp256k1 模平方根：r = x^((p+1)/4) mod p
+    internal static void SecpSqrt(long[] r, long[] x) {
+        EcCurveData cd = GetCurve(0);
+        long[] p = cd.P;
+        long[] prod = new long[16];
+        long[] x2 = new long[8]; long[] x3 = new long[8];
+        long[] x6 = new long[8]; long[] x9 = new long[8];
+        long[] x11 = new long[8]; long[] x22 = new long[8];
+        long[] x44 = new long[8]; long[] x88 = new long[8];
+        long[] x176 = new long[8]; long[] x220 = new long[8];
+        long[] x223 = new long[8]; long[] t = new long[8];
+
+        FeSqr(0, p, t, x, prod); FeMul(0, p, x2, t, x, prod);
+        FeSqr(0, p, t, x2, prod); FeMul(0, p, x3, t, x, prod);
+        FeSqrN(0, p, t, x3, 3, prod); FeMul(0, p, x6, t, x3, prod);
+        FeSqrN(0, p, t, x6, 3, prod); FeMul(0, p, x9, t, x3, prod);
+        FeSqrN(0, p, t, x9, 2, prod); FeMul(0, p, x11, t, x2, prod);
+        FeSqrN(0, p, t, x11, 11, prod); FeMul(0, p, x22, t, x11, prod);
+        FeSqrN(0, p, t, x22, 22, prod); FeMul(0, p, x44, t, x22, prod);
+        FeSqrN(0, p, t, x44, 44, prod); FeMul(0, p, x88, t, x44, prod);
+        FeSqrN(0, p, t, x88, 88, prod); FeMul(0, p, x176, t, x88, prod);
+        FeSqrN(0, p, t, x176, 44, prod); FeMul(0, p, x220, t, x44, prod);
+        FeSqrN(0, p, t, x220, 3, prod); FeMul(0, p, x223, t, x3, prod);
+
+        FeSqrN(0, p, t, x223, 23, prod); FeMul(0, p, t, t, x22, prod);
+        FeSqrN(0, p, t, t, 6, prod); FeMul(0, p, t, t, x2, prod);
+        FeSqrN(0, p, r, t, 2, prod);
+    }
+
+    // ===== 原地 Jacobian 点倍与混合 Jacobian-Affine 点加 =====
+
+    private static void PointDouble(int curve, long[] p, long[] rx, long[] ry, long[] rz, EcScratch sc) {
+        if (IsZero(rz)) { return; }
+        long[] prod = sc.Prod;
+        if (curve == 0) {
+            // EFD dbl-2009-l (a = 0): 2M + 5S
+            long[] a = sc.T1;
+            long[] b = sc.T2;
+            long[] c = sc.T3;
+            long[] d = sc.T4;
+            long[] e = sc.T5;
+            long[] f = sc.T6;
+            long[] tmp = sc.T7;
+
+            FeSqr(0, p, a, rx, prod);           // A = X1^2
+            FeSqr(0, p, b, ry, prod);           // B = Y1^2
+            FeSqr(0, p, c, b, prod);            // C = B^2
+            FeAdd(tmp, rx, b, p);
+            FeSqr(0, p, d, tmp, prod);          // (X1 + B)^2
+            FeSub(d, d, a, p);
+            FeSub(d, d, c, p);
+            FeDbl(d, d, p);                     // D = 2*((X1+B)^2 - A - C)
+            FeMul3(e, a, p, tmp);               // E = 3*A
+            FeSqr(0, p, f, e, prod);            // F = E^2
+
+            // Z3 = 2 * Y1 * Z1（先算 Z3，因后面会覆写 rx/ry）
+            FeMul(0, p, tmp, ry, rz, prod);
+            FeDbl(rz, tmp, p);
+
+            // X3 = F - 2*D
+            FeDbl(tmp, d, p);
+            FeSub(rx, f, tmp, p);
+
+            // Y3 = E*(D - X3) - 8*C
+            FeSub(tmp, d, rx, p);
+            FeMul(0, p, ry, e, tmp, prod);
+            FeDbl(c, c, p);
+            FeDbl(c, c, p);
+            FeDbl(c, c, p);
+            FeSub(ry, ry, c, p);
+            return;
+        }
+        // EFD dbl-2001-b (a = -3 mod p，P-256 与 SM2 共用): 3M + 5S
+        long[] delta = sc.T1;
+        long[] gamma = sc.T2;
+        long[] beta = sc.T3;
+        long[] alpha = sc.T4;
+        long[] t5 = sc.T5;
+        long[] t6 = sc.T6;
+        long[] t7 = sc.T7;
+
+        FeSqr(curve, p, delta, rz, prod);       // delta = Z1^2
+        FeSqr(curve, p, gamma, ry, prod);       // gamma = Y1^2
+        FeMul(curve, p, beta, rx, gamma, prod); // beta = X1 * gamma
+
+        FeSub(t5, rx, delta, p);
+        FeAdd(t6, rx, delta, p);
+        FeMul(curve, p, t7, t5, t6, prod);
+        FeMul3(alpha, t7, p, t5);               // alpha = 3*(X1 - delta)*(X1 + delta)
+
+        // Z3 = (Y1 + Z1)^2 - gamma - delta
+        FeAdd(t5, ry, rz, p);
+        FeSqr(curve, p, rz, t5, prod);
+        FeSub(rz, rz, gamma, p);
+        FeSub(rz, rz, delta, p);
+
+        // X3 = alpha^2 - 8*beta
+        FeSqr(curve, p, rx, alpha, prod);
+        FeDbl(t5, beta, p);                     // 2*beta
+        FeDbl(t5, t5, p);                       // 4*beta
+        FeDbl(t6, t5, p);                       // 8*beta
+        FeSub(rx, rx, t6, p);
+
+        // Y3 = alpha*(4*beta - X3) - 8*gamma^2
+        FeSub(t5, t5, rx, p);                   // 4*beta - X3
+        FeMul(curve, p, ry, alpha, t5, prod);
+        FeSqr(curve, p, t6, gamma, prod);       // gamma^2
+        FeDbl(t6, t6, p);
+        FeDbl(t6, t6, p);
+        FeDbl(t6, t6, p);                       // 8*gamma^2
+        FeSub(ry, ry, t6, p);
+    }
+
+    // 混合 Jacobian-Affine 点加（EFD madd-2007-bl: 7M + 4S），要求 (ax, ay) 为有效仿射点 (Z2 = 1)。
+    private static void PointAddMixed(int curve, long[] p, long[] rx, long[] ry, long[] rz, long[] ax, long[] ay, EcScratch sc) {
+        if (IsZero(rz)) {
+            Copy(rx, ax);
+            Copy(ry, ay);
+            SetOne(rz);
+            return;
+        }
+        long[] prod = sc.Prod;
+        long[] z1z1 = sc.T1;
+        long[] u2 = sc.T2;
+        long[] s2 = sc.T3;
+        long[] h = sc.T4;
+        long[] rr = sc.T5;
+        long[] hh = sc.T6;
+        long[] j = sc.T7;
+        long[] v = sc.T8;
+
+        FeSqr(curve, p, z1z1, rz, prod);            // Z1Z1 = Z1^2
+        FeMul(curve, p, u2, ax, z1z1, prod);        // U2 = X2 * Z1Z1
+        FeMul(curve, p, s2, rz, z1z1, prod);
+        FeMul(curve, p, s2, ay, s2, prod);          // S2 = Y2 * Z1 * Z1Z1
+
+        FeSub(h, u2, rx, p);                        // H = U2 - X1
+        FeSub(rr, s2, ry, p);
+        if (IsZero(h)) {
+            if (IsZero(rr)) {
+                PointDouble(curve, p, rx, ry, rz, sc);
+                return;
+            }
+            SetOne(rx); SetOne(ry); SetZero(rz);
+            return;
+        }
+        FeDbl(rr, rr, p);                           // r = 2*(S2 - Y1)
+        FeSqr(curve, p, hh, h, prod);               // HH = H^2
+        FeDbl(u2, hh, p);
+        FeDbl(u2, u2, p);                           // I = 4*HH (复用 u2)
+        FeMul(curve, p, j, h, u2, prod);            // J = H * I
+        FeMul(curve, p, v, rx, u2, prod);           // V = X1 * I
+
+        // X3 = r^2 - J - 2*V
+        FeSqr(curve, p, rx, rr, prod);
+        FeSub(rx, rx, j, p);
+        FeDbl(u2, v, p);
+        FeSub(rx, rx, u2, p);
+
+        // Y3 = r*(V - X3) - 2*Y1*J
+        FeSub(u2, v, rx, p);
+        FeMul(curve, p, u2, rr, u2, prod);
+        FeMul(curve, p, s2, ry, j, prod);
+        FeDbl(s2, s2, p);
+        FeSub(ry, u2, s2, p);
+
+        // Z3 = (Z1 + H)^2 - Z1Z1 - HH
+        FeAdd(u2, rz, h, p);
+        FeSqr(curve, p, rz, u2, prod);
+        FeSub(rz, rz, z1z1, p);
+        FeSub(rz, rz, hh, p);
+    }
+
+    // 批量 Jacobian -> Affine 转换（Montgomery 技巧：N 个点只做 1 次 FeInv）
+    private static void BatchToAffine(int curve, long[] p, long[][] jx, long[][] jy, long[][] jz, int count, long[][] ax, long[][] ay, EcScratch sc) {
+        long[] prod = sc.Prod;
+        long[][] pref = new long[count][];
+        long[] acc = new long[8];
+        SetOne(acc);
+        for (int i = 0; i < count; i = i + 1) {
+            pref[i] = new long[8];
+            Copy(pref[i], acc);
+            if (!IsZero(jz[i])) {
+                FeMul(curve, p, acc, acc, jz[i], prod);
+            }
+        }
+        long[] invAll = new long[8];
+        FeInv(curve, p, invAll, acc, prod);
+
+        long[] iz = sc.T1;
+        long[] iz2 = sc.T2;
+        long[] iz3 = sc.T3;
+        for (int i = count - 1; i >= 0; i = i - 1) {
+            ax[i] = new long[8];
+            ay[i] = new long[8];
+            if (IsZero(jz[i])) {
+                continue;
+            }
+            FeMul(curve, p, iz, invAll, pref[i], prod);
+            FeMul(curve, p, invAll, invAll, jz[i], prod);
+            FeSqr(curve, p, iz2, iz, prod);
+            FeMul(curve, p, iz3, iz2, iz, prod);
+            FeMul(curve, p, ax[i], jx[i], iz2, prod);
+            FeMul(curve, p, ay[i], jy[i], iz3, prod);
+        }
+    }
+
+    // 构建 1P..15P 仿射窗口表（输入 P 为仿射点，仅 1 次批量模逆）
+    private static void BuildWindow4Affine(int curve, long[] p, long[] px, long[] py, long[][] outX, long[][] outY, EcScratch sc) {
+        long[][] jx = new long[15][];
+        long[][] jy = new long[15][];
+        long[][] jz = new long[15][];
+
+        jx[0] = new long[8]; jy[0] = new long[8]; jz[0] = new long[8];
+        Copy(jx[0], px); Copy(jy[0], py); SetOne(jz[0]);
+
+        for (int m = 2; m <= 15; m = m + 1) {
+            jx[m - 1] = new long[8];
+            jy[m - 1] = new long[8];
+            jz[m - 1] = new long[8];
+            if ((m & 1) == 0) {
+                int half = (m >> 1) - 1;
+                Copy(jx[m - 1], jx[half]);
+                Copy(jy[m - 1], jy[half]);
+                Copy(jz[m - 1], jz[half]);
+                PointDouble(curve, p, jx[m - 1], jy[m - 1], jz[m - 1], sc);
+            } else {
+                Copy(jx[m - 1], jx[m - 2]);
+                Copy(jy[m - 1], jy[m - 2]);
+                Copy(jz[m - 1], jz[m - 2]);
+                PointAddMixed(curve, p, jx[m - 1], jy[m - 1], jz[m - 1], px, py, sc);
+            }
+        }
+        long[][] ax = new long[15][];
+        long[][] ay = new long[15][];
+        BatchToAffine(curve, p, jx, jy, jz, 15, ax, ay, sc);
+        for (int m = 1; m <= 15; m = m + 1) {
+            outX[m] = ax[m - 1];
+            outY[m] = ay[m - 1];
+        }
+    }
+
+    // 惰性初始化单条曲线参数、4-bit 2-Comb 表 (T0/T1) 与 4-bit 窗口表 (TG)
+    internal static EcCurveData GetCurve(int curve) {
+        if (curve == 0 && SecpData != null) { return SecpData; }
+        if (curve == 1 && P256Data != null) { return P256Data; }
+        if (curve == 2 && Sm2Data != null) { return Sm2Data; }
+
+        EcCurveData d = new EcCurveData();
+        d.Curve = curve;
+        if (curve == 0) {
+            // secp256k1
+            d.P  = MakeLimbs(0xFFFFFC2FL, 0xFFFFFFFEL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL);
+            d.N  = MakeLimbs(0xD0364141L, 0xBFD25E8CL, 0xAF48A03BL, 0xBAAEDCE6L, 0xFFFFFFFEL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL);
+            d.Gx = MakeLimbs(0x16F81798L, 0x59F2815BL, 0x2DCE28D9L, 0x029BFCDBL, 0xCE870B07L, 0x55A06295L, 0xF9DCBBACL, 0x79BE667EL);
+            d.Gy = MakeLimbs(0xFB10D4B8L, 0x9C47D08FL, 0xA6855419L, 0xFD17B448L, 0x0E1108A8L, 0x5DA4FBFCL, 0x26A3C465L, 0x483ADA77L);
+        } else if (curve == 1) {
+            // NIST P-256
+            d.P  = MakeLimbs(0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0x00000000L, 0x00000000L, 0x00000000L, 0x00000001L, 0xFFFFFFFFL);
+            d.N  = MakeLimbs(0xFC632551L, 0xF3B9CAC2L, 0xA7179E84L, 0xBCE6FAADL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0x00000000L, 0xFFFFFFFFL);
+            d.Gx = MakeLimbs(0xD898C296L, 0xF4A13945L, 0x2DEB33A0L, 0x77037D81L, 0x63A440F2L, 0xF8BCE6E5L, 0xE12C4247L, 0x6B17D1F2L);
+            d.Gy = MakeLimbs(0x37BF51F5L, 0xCBB64068L, 0x6B315ECEL, 0x2BCE3357L, 0x7C0F9E16L, 0x8EE7EB4AL, 0xFE1A7F9BL, 0x4FE342E2L);
+        } else {
+            // SM2
+            d.P  = MakeLimbs(0xFFFFFFFFL, 0xFFFFFFFFL, 0x00000000L, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFEL);
+            d.N  = MakeLimbs(0x39D54123L, 0x53BBF409L, 0x21C6052BL, 0x7203DF6BL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFEL);
+            d.Gx = MakeLimbs(0x334C74C7L, 0x715A4589L, 0xF2660BE1L, 0x8FE30BBFL, 0x6A39C994L, 0x5F990446L, 0x1F198119L, 0x32C4AE2CL);
+            d.Gy = MakeLimbs(0x2139F0A0L, 0x02DF32E5L, 0xC62A4740L, 0xD0A9877CL, 0x6B692153L, 0x59BDCEE3L, 0xF4F6779CL, 0xBC3736A2L);
+        }
+
+        EcScratch sc = new EcScratch();
+        long[] p = d.P;
+
+        // 1. 生成 8 个基点倍点：B[s] = 2^(32*s) * G (s = 0..7)，并一次批量仿射化
+        long[][] bjx = new long[8][];
+        long[][] bjy = new long[8][];
+        long[][] bjz = new long[8][];
+        bjx[0] = new long[8]; bjy[0] = new long[8]; bjz[0] = new long[8];
+        Copy(bjx[0], d.Gx); Copy(bjy[0], d.Gy); SetOne(bjz[0]);
+        for (int s = 1; s < 8; s = s + 1) {
+            bjx[s] = new long[8]; bjy[s] = new long[8]; bjz[s] = new long[8];
+            Copy(bjx[s], bjx[s - 1]); Copy(bjy[s], bjy[s - 1]); Copy(bjz[s], bjz[s - 1]);
+            for (int k = 0; k < 32; k = k + 1) {
+                PointDouble(curve, p, bjx[s], bjy[s], bjz[s], sc);
+            }
+        }
+        long[][] bax = new long[8][];
+        long[][] bay = new long[8][];
+        BatchToAffine(curve, p, bjx, bjy, bjz, 8, bax, bay, sc);
+
+        // 2. 构建 T0 (mask over B[0,2,4,6]) 与 T1 (mask over B[1,3,5,7])，一次批量仿射化 30 个点
+        long[][] cjx = new long[30][];
+        long[][] cjy = new long[30][];
+        long[][] cjz = new long[30][];
+        for (int m = 1; m <= 15; m = m + 1) {
+            // T0[m]
+            long[] rx0 = new long[8]; long[] ry0 = new long[8]; long[] rz0 = new long[8];
+            // T1[m]
+            long[] rx1 = new long[8]; long[] ry1 = new long[8]; long[] rz1 = new long[8];
+            for (int bit = 0; bit < 4; bit = bit + 1) {
+                if (((m >> bit) & 1) != 0) {
+                    PointAddMixed(curve, p, rx0, ry0, rz0, bax[bit * 2], bay[bit * 2], sc);
+                    PointAddMixed(curve, p, rx1, ry1, rz1, bax[bit * 2 + 1], bay[bit * 2 + 1], sc);
+                }
+            }
+            cjx[m - 1] = rx0; cjy[m - 1] = ry0; cjz[m - 1] = rz0;
+            cjx[15 + m - 1] = rx1; cjy[15 + m - 1] = ry1; cjz[15 + m - 1] = rz1;
+        }
+        long[][] cax = new long[30][];
+        long[][] cay = new long[30][];
+        BatchToAffine(curve, p, cjx, cjy, cjz, 30, cax, cay, sc);
+
+        d.T0X = new long[16][]; d.T0Y = new long[16][];
+        d.T1X = new long[16][]; d.T1Y = new long[16][];
+        for (int m = 1; m <= 15; m = m + 1) {
+            d.T0X[m] = cax[m - 1]; d.T0Y[m] = cay[m - 1];
+            d.T1X[m] = cax[15 + m - 1]; d.T1Y[m] = cay[15 + m - 1];
+        }
+
+        // 3. 构建 4-bit 窗口表 TG[1..15] = 1G..15G
+        d.TgX = new long[16][]; d.TgY = new long[16][];
+        BuildWindow4Affine(curve, p, d.Gx, d.Gy, d.TgX, d.TgY, sc);
+
+        // 原子发布只读曲线表
+        if (curve == 0) { SecpData = d; }
+        else if (curve == 1) { P256Data = d; }
+        else { Sm2Data = d; }
+        return d;
+    }
+
+    // ===== 高层标量乘 API（固定基点 2-Comb / 任意点 4-bit 窗口 / Shamir 双标量乘）=====
+
+    private static bool FinishAffine(int curve, long[] p, long[] rx, long[] ry, long[] rz, long[] outX, long[] outY, EcScratch sc) {
+        if (IsZero(rz)) {
+            SetZero(outX);
+            SetZero(outY);
+            return false;
+        }
+        long[] iz = sc.T1;
+        long[] iz2 = sc.T2;
+        long[] iz3 = sc.T3;
+        FeInv(curve, p, iz, rz, sc.Prod);
+        FeSqr(curve, p, iz2, iz, sc.Prod);
+        FeMul(curve, p, iz3, iz2, iz, sc.Prod);
+        FeMul(curve, p, outX, rx, iz2, sc.Prod);
+        FeMul(curve, p, outY, ry, iz3, sc.Prod);
+        return true;
+    }
+
+    // 固定基点标量乘 k * G：仅 31 次倍点 + 至多 64 次混合点加
+    internal static bool ScalarMulG(int curve, long[] k, long[] outX, long[] outY) {
+        EcCurveData cd = GetCurve(curve);
+        long[] p = cd.P;
+        long[][] t0x = cd.T0X; long[][] t0y = cd.T0Y;
+        long[][] t1x = cd.T1X; long[][] t1y = cd.T1Y;
+        EcScratch sc = new EcScratch();
+
+        long[] rx = new long[8];
+        long[] ry = new long[8];
+        long[] rz = new long[8];
+
+        for (int j = 31; j >= 0; j = j - 1) {
+            if (!IsZero(rz)) {
+                PointDouble(curve, p, rx, ry, rz, sc);
+            }
+            int m1 = GetBit(k, j + 32)
+                   | (GetBit(k, j + 96) << 1)
+                   | (GetBit(k, j + 160) << 2)
+                   | (GetBit(k, j + 224) << 3);
+            if (m1 != 0) {
+                PointAddMixed(curve, p, rx, ry, rz, t1x[m1], t1y[m1], sc);
+            }
+            int m0 = GetBit(k, j)
+                   | (GetBit(k, j + 64) << 1)
+                   | (GetBit(k, j + 128) << 2)
+                   | (GetBit(k, j + 192) << 3);
+            if (m0 != 0) {
+                PointAddMixed(curve, p, rx, ry, rz, t0x[m0], t0y[m0], sc);
+            }
+        }
+        return FinishAffine(curve, p, rx, ry, rz, outX, outY, sc);
+    }
+
+    // 任意仿射点标量乘 k * Q（4-bit 窗口 + 批量仿射混合点加）
+    internal static bool ScalarMulAffine(int curve, long[] k, long[] qx, long[] qy, long[] outX, long[] outY) {
+        EcCurveData cd = GetCurve(curve);
+        long[] p = cd.P;
+        EcScratch sc = new EcScratch();
+
+        long[][] tqx = new long[16][];
+        long[][] tqy = new long[16][];
+        BuildWindow4Affine(curve, p, qx, qy, tqx, tqy, sc);
+
+        long[] rx = new long[8];
+        long[] ry = new long[8];
+        long[] rz = new long[8];
+
+        for (int i = 63; i >= 0; i = i - 1) {
+            if (!IsZero(rz)) {
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+            }
+            int nib = GetNibble(k, i);
+            if (nib != 0) {
+                PointAddMixed(curve, p, rx, ry, rz, tqx[nib], tqy[nib], sc);
+            }
+        }
+        return FinishAffine(curve, p, rx, ry, rz, outX, outY, sc);
+    }
+
+    // Shamir 联合 4-bit 交错窗口双标量乘：u1 * G + u2 * Q（倍点减半 + 全混合点加）
+    internal static bool ShamirMul(int curve, long[] u1, long[] u2, long[] qx, long[] qy, long[] outX, long[] outY) {
+        EcCurveData cd = GetCurve(curve);
+        long[] p = cd.P;
+        long[][] tgx = cd.TgX; long[][] tgy = cd.TgY;
+        EcScratch sc = new EcScratch();
+
+        long[][] tqx = new long[16][];
+        long[][] tqy = new long[16][];
+        BuildWindow4Affine(curve, p, qx, qy, tqx, tqy, sc);
+
+        long[] rx = new long[8];
+        long[] ry = new long[8];
+        long[] rz = new long[8];
+
+        for (int i = 63; i >= 0; i = i - 1) {
+            if (!IsZero(rz)) {
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+                PointDouble(curve, p, rx, ry, rz, sc);
+            }
+            int n1 = GetNibble(u1, i);
+            if (n1 != 0) {
+                PointAddMixed(curve, p, rx, ry, rz, tgx[n1], tgy[n1], sc);
+            }
+            int n2 = GetNibble(u2, i);
+            if (n2 != 0) {
+                PointAddMixed(curve, p, rx, ry, rz, tqx[n2], tqy[n2], sc);
+            }
+        }
+        return FinishAffine(curve, p, rx, ry, rz, outX, outY, sc);
+    }
+
+    // 验证仿射点 (x, y) 是否在曲线上（0 <= x, y < p 且满足曲线方程）
+    internal static bool IsOnCurve(int curve, long[] x, long[] y) {
+        EcCurveData cd = GetCurve(curve);
+        long[] p = cd.P;
+        if (Cmp(x, p) >= 0 || Cmp(y, p) >= 0) { return false; }
+        long[] prod = new long[16];
+        long[] lhs = new long[8];
+        long[] rhs = new long[8];
+        long[] tmp = new long[8];
+        FeSqr(curve, p, lhs, y, prod);           // y^2
+        FeSqr(curve, p, tmp, x, prod);           // x^2
+        FeMul(curve, p, rhs, tmp, x, prod);      // x^3
+        if (curve == 0) {
+            // y^2 = x^3 + 7
+            long[] seven = new long[8]; seven[0] = 7L;
+            FeAdd(rhs, rhs, seven, p);
+        } else if (curve == 1) {
+            // y^2 = x^3 - 3x + B_P256
+            long[] threeX = new long[8];
+            FeMul3(threeX, x, p, tmp);
+            FeSub(rhs, rhs, threeX, p);
+            long[] bp = MakeLimbs(0x27D2604BL, 0x3BCE3C3EL, 0xCC53B0F6L, 0x651D06B0L, 0x769886BCL, 0xB3EBBD55L, 0xAA3A93E7L, 0x5AC635D8L);
+            FeAdd(rhs, rhs, bp, p);
+        } else {
+            // y^2 = x^3 - 3x + B_SM2
+            long[] threeX = new long[8];
+            FeMul3(threeX, x, p, tmp);
+            FeSub(rhs, rhs, threeX, p);
+            long[] bs = MakeLimbs(0x4D940E93L, 0xDDBCBD41L, 0x15AB8F92L, 0xF39789F5L, 0xCF6509A7L, 0x4D5A9E4BL, 0x9D9F5E34L, 0x28E9FA9EL);
+            FeAdd(rhs, rhs, bs, p);
+        }
+        return Cmp(lhs, rhs) == 0;
+    }
+}
