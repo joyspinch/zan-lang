@@ -9,7 +9,7 @@ public partial class ListView<T> {
         app = this.ResolveApp(app);
         if (fixedRowHeight > 0) { return app != null ? app.Scale(fixedRowHeight) : fixedRowHeight; }
         if (app == null) { return 32; }
-        StyleBox s = this.ResolveStyleAs(app, "list", Class, Style.SNormal());
+        StyleBox s = this.ResolveStyleCached(app, "list", Class, Style.SNormal());
         return s.HeightOr(app.theme.heightLarge);
     }
     public int HeaderHeight() { return this.HeaderHeight(this.App); }
@@ -64,6 +64,68 @@ public partial class ListView<T> {
         if (control != null && control.IsDisabled()) { return false; }
         return true;
     }
+    private void EnsureListPaintStyles(App app) {
+        int rsig = app.CurrentStyleRuleSig();
+        bool anyMedia = (rsig & 1) != 0;
+        if (lvCacheApp == app && lvCacheGen == app.bgThemeGen
+            && lvCacheScale == app.metricsScale && lvCacheDpi == app.dpiScale
+            && lvCacheRuleSig == rsig && lvCacheCls == Class
+            && lvRowNorm != null
+            && ((lvCacheDep == 0 && !anyMedia)
+                || lvCacheCtxHash == Style.ContextHashFast(app, lvCacheDep, anyMedia))) {
+            return;
+        }
+        lvHeader = Style.PartRef(app, "listview", "header", "", Class, "", Style.SNormal());
+        lvDivider = Style.PartRef(app, "listview", "divider", "", Class, "", Style.SNormal());
+        lvColumn = Style.PartRef(app, "listview", "column", "", Class, "", Style.SNormal());
+        lvRowNorm = Style.FullRef(app, "listrow", "", "", Style.SNormal());
+        lvRowSel = Style.FullRef(app, "listrow", "", "", Style.SSelected());
+        lvRowHover = Style.FullRef(app, "listrow", "", "", Style.SHover());
+        lvCell = Style.PartRef(app, "listview", "cell", "", Class, "", Style.SNormal());
+        string secCls = Class == "" ? "secondary" : (Class + " secondary");
+        lvSecondary = Style.PartRef(app, "listview", "cell", "", secCls, "", Style.SNormal());
+        lvCellOff = Style.PartRef(app, "listview", "cell", "", Class, "", Style.SDisabled());
+        int dep = Style.ContextDependencyFor(app, "listrow", "", "");
+        int d1 = Style.ContextDependencyFor(app, "listview", Class, "");
+        if (d1 > dep) { dep = d1; }
+        int d2 = Style.ContextDependencyFor(app, "listview", secCls, "");
+        if (d2 > dep) { dep = d2; }
+        if (dep < 5) {
+            lvCacheApp = app;
+            lvCacheGen = app.bgThemeGen;
+            lvCacheScale = app.metricsScale;
+            lvCacheDpi = app.dpiScale;
+            lvCacheRuleSig = rsig;
+            lvCacheDep = dep;
+            lvCacheCtxHash = Style.ContextHashFast(app, dep, anyMedia);
+            lvCacheCls = Class;
+        } else {
+            lvCacheApp = null;
+        }
+    }
+    private List<int> ColumnWidthsBuf(int rowW) {
+        if (cachedColWidths == null) { cachedColWidths = new List<int>(); }
+        else { cachedColWidths.Clear(); }
+        if (cols == null || cols.Count == 0) { return cachedColWidths; }
+        if (rowW < 0) { rowW = 0; }
+        int total = 0;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            int wt = cols[i].weight;
+            if (wt <= 0) { wt = 1; }
+            total = total + wt;
+        }
+        if (total <= 0) { return cachedColWidths; }
+        int used = 0;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            int wt = cols[i].weight;
+            if (wt <= 0) { wt = 1; }
+            int cw = (int)((long)rowW * (long)wt / (long)total);
+            if (i == cols.Count - 1) { cw = rowW - used; }
+            used = used + cw;
+            cachedColWidths.Add(cw);
+        }
+        return cachedColWidths;
+    }
     public void PaintEmpty() { this.PaintEmpty(this.App); }
     public void PaintEmpty(App app) {
         if (Empty == null || Empty == "") { return; }
@@ -74,8 +136,8 @@ public partial class ListView<T> {
         int ey = by + headH;
         int eh = bh - headH;
         if (bw <= 0 || eh <= 0) { return; }
-        StyleBox empty = Style.Part(app, "listview", "empty", "", Class, "",
-                                    Style.SNormal());
+        StyleBox empty = Style.PartRef(app, "listview", "empty", "", Class, "",
+                                       Style.SNormal());
         int fs = empty.FontOr(Style.FontFallback(app, "small"));
         int pad = t.paddingMedium;
         int maxW = bw - pad * 2;
@@ -124,12 +186,10 @@ public partial class ListView<T> {
         if (app == null || app.canvas == null) { return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
-        StyleBox header = Style.Part(app, "listview", "header", "", Class, "",
-                                     Style.SNormal());
-        StyleBox divider = Style.Part(app, "listview", "divider", "", Class, "",
-                                      Style.SNormal());
-        StyleBox column = Style.Part(app, "listview", "column", "", Class, "",
-                                      Style.SNormal());
+        this.EnsureListPaintStyles(app);
+        StyleBox header = lvHeader;
+        StyleBox divider = lvDivider;
+        StyleBox column = lvColumn;
         int pad = t.paddingMedium;
         bool flat = Style.Has(Class, "flat");
         int inset = flat ? 0 : 1;
@@ -147,7 +207,7 @@ public partial class ListView<T> {
             bool overflow = !this.Templated() && viewH > 0 && this.Count() * this.RowHeight(app) > viewH;
             if (overflow) { availW = availW - app.Scale(12); }
             if (availW < 0) { availW = 0; }
-            List<int> ws = this.ColumnWidths(availW - pad * 2);
+            List<int> ws = this.ColumnWidthsBuf(availW - pad * 2);
             int cx = (rowsBody != null ? rowsBody.ScrollViewport().x : bx) + pad;
             int headerFont = column.FontOr(Style.FontFallback(app, "tiny"));
             int ty = Canvas.CenterTextY(by, headH, headerFont);
@@ -169,17 +229,14 @@ public partial class ListView<T> {
         if (app == null || app.canvas == null || rowsBody == null || data == null) { return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
-        StyleBox rowNormal = this.BareBox(app, "listrow", Style.SNormal());
-        StyleBox rowSelected = this.BareBox(app, "listrow", Style.SSelected());
-        StyleBox rowHover = this.BareBox(app, "listrow", Style.SHover());
-        StyleBox divider = Style.Part(app, "listview", "divider", "", Class, "",
-                                      Style.SNormal());
-        StyleBox cell = Style.Part(app, "listview", "cell", "", Class, "",
-                                   Style.SNormal());
-        StyleBox secondary = Style.Part(app, "listview", "cell", "", Class + " secondary",
-                                        "", Style.SNormal());
-        StyleBox cellOff = Style.Part(app, "listview", "cell", "", Class, "",
-                                      Style.SDisabled());
+        this.EnsureListPaintStyles(app);
+        StyleBox rowNormal = lvRowNorm;
+        StyleBox rowSelected = lvRowSel;
+        StyleBox rowHover = lvRowHover;
+        StyleBox divider = lvDivider;
+        StyleBox cell = lvCell;
+        StyleBox secondary = lvSecondary;
+        StyleBox cellOff = lvCellOff;
         int cellFont = cell.FontOr(Style.FontFallback(app, "small"));
         int secondaryFont = secondary.FontOr(cellFont);
         int cellOffFont = cellOff.FontOr(cellFont);
@@ -197,7 +254,7 @@ public partial class ListView<T> {
         if (overflow) { rowW = bodyView.width - barW; }
         if (rowW < 0) { rowW = 0; }
         int pad = t.paddingMedium;
-        List<int> ws = this.ColumnWidths(rowW - pad * 2);
+        List<int> ws = this.ColumnWidthsBuf(rowW - pad * 2);
         int hotW = rowW;
         if (overflow) { hotW = rowW - app.Scale(4); }
         if (hotW < 0) { hotW = 0; }
@@ -205,16 +262,17 @@ public partial class ListView<T> {
         if (first < 0) { first = 0; }
         int last = (off + viewH) / rowH;
         if (last >= n) { last = n - 1; }
+        bool trivialSelectable = onlySelectable == null && !this.Templated();
         c.PushClip(bodyView.x, viewY, rowW, viewH);
         try {
             int i = first;
             while (i <= last && i < data.Count) {
                 int ry = viewY + i * rowH - off;
-                int id = this.CommonId() + i;
+                bool rowSelectable = trivialSelectable || this.Selectable(i);
                 if (i == sel || (multi && this.IsMarked(i))) {
                     c.FillRect(bodyView.x, ry, hotW, rowH, rowSelected.BgOr(rowNormal.BgOr(0)));
                 }
-                else if (this.Selectable(i) && hover == i) {
+                else if (rowSelectable && hover == i) {
                     c.FillRect(bodyView.x, ry, hotW, rowH, rowHover.BgOr(0));
                 }
                 if (i > first || off > 0) { c.FillRect(bodyView.x, ry, rowW, 1, divider.BgOr(0)); }
@@ -223,7 +281,7 @@ public partial class ListView<T> {
                     int cw = ws[k];
                     StyleBox cs = k > 0 ? secondary : cell;
                     int csFont = k > 0 ? secondaryFont : cellFont;
-                    if (!this.Selectable(i)) { cs = cellOff; csFont = cellOffFont; }
+                    if (!rowSelectable) { cs = cellOff; csFont = cellOffFont; }
                     int ty = Canvas.CenterTextY(ry, rowH, csFont);
                     string s = Ellipsis.Fit(cols[k].TextOf(data[i]), cw - pad,
                                             csFont);
@@ -256,9 +314,10 @@ public partial class ListView<T> {
         if (overflow) { rowW = bodyView.width - barW; }
         if (rowW < 0) { rowW = 0; }
         Theme t = app.theme;
-        StyleBox rowNormal = this.BareBox(app, "listrow", Style.SNormal());
-        StyleBox rowSelected = this.BareBox(app, "listrow", Style.SSelected());
-        StyleBox rowHover = this.BareBox(app, "listrow", Style.SHover());
+        this.EnsureListPaintStyles(app);
+        StyleBox rowNormal = lvRowNorm;
+        StyleBox rowSelected = lvRowSel;
+        StyleBox rowHover = lvRowHover;
         int hotW = rowW;
         if (overflow) { hotW = rowW - app.Scale(4); }
         if (hotW < 0) { hotW = 0; }
@@ -291,7 +350,7 @@ public partial class ListView<T> {
     public override void OnPaint(App app) {
         if (app == null || app.canvas == null) { return; }
         this.SyncBinding();
-        StyleBox s = this.ResolveStyleAs(app, "list", Class, Style.SNormal());
+        StyleBox s = this.ResolveStyleCached(app, "list", Class, Style.SNormal());
         if (!Style.Has(Class, "flat") && s.bg != 0) {
             app.canvas.SurfaceRoundRect(bx, by, bw, bh,
                 s.RadiusOr(app.theme.borderRadiusMedium),

@@ -12,10 +12,38 @@ static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     int full = zgl_covers_full_surface(s, x, y, w, h);
     if (full && g_gl_state > 0) {
         zgl_target *t0 = zgl_target_of(s);
-        if (t0) t0->cpu_ahead = 0;
+        if (t0) {
+            /* Full-surface clear overwrites every pixel: discard any pending
+             * batch targeting this same surface (or flush another target), then
+             * run hardware glClear directly and leave the batch in BLEND mode
+             * so the first draw of the frame never stalls on a REPLACE->BLEND flush. */
+            if (g_zgl.target == s) {
+                g_zgl.count = 0;
+                g_zgl.has_shader_over = 0;
+            } else if (g_zgl.count) {
+                zgl_flush();
+            }
+            if (g_zgl.st_fbo != t0->fbo) {
+                gl.BindFramebuffer(ZGL_FRAMEBUFFER, t0->fbo);
+                g_zgl.st_fbo = t0->fbo;
+            }
+            gl.Disable(ZGL_SCISSOR_TEST);
+            float col[4];
+            zgl_color(col, c, 0);
+            gl.ClearColor(col[0], col[1], col[2], col[3]);
+            gl.Clear(ZGL_COLOR_BUFFER_BIT);
+            t0->cpu_ahead = 0;
+            t0->gpu_ahead = 1;
+            t0->opaque_dst = opaque ? 1 : 0;
+            zgl_target_reset_base_clear(t0, c);
+            g_zgl.target = s;
+            g_zgl.mode = ZGL_MODE_BLEND;
+            return;
+        }
     }
-    zgl_mode want = (opaque && g_zgl.count && g_zgl.target == s && g_zgl.mode == ZGL_MODE_BLEND)
-                    ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE;
+    /* Partial opaque clears produce bit-identical pixels under ZGL_MODE_BLEND
+     * (src.a == 1.0 => src*1 + dst*0), avoiding REPLACE<->BLEND batch breaks. */
+    zgl_mode want = opaque ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE;
     if (!zgl_begin(s, want)) { cpu_clear_rect(s, x, y, w, h, c); return; }
     zgl_target *t = zgl_target_of(s);
     if (t) {
