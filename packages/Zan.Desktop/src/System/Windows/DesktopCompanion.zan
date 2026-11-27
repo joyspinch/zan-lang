@@ -1,0 +1,214 @@
+using System;
+using System.Input;
+
+namespace System.Windows;
+
+// 桌面可用工作区矩形（已自动扣除 Windows 任务栏等系统保留区）。
+public class WorkAreaRect {
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+
+    public WorkAreaRect(int left, int top, int right, int bottom) {
+        this.Left = left;
+        this.Top = top;
+        this.Right = right;
+        this.Bottom = bottom;
+    }
+
+    public int Width { get { return this.Right - this.Left; } }
+    public int Height { get { return this.Bottom - this.Top; } }
+}
+
+// 桌面停靠目标坐标。
+public class DockPosition {
+    public int X;
+    public int Y;
+
+    public DockPosition(int x, int y) {
+        this.X = x;
+        this.Y = y;
+    }
+}
+
+// 桌面挂机/桌宠四角停靠锚点常量。
+public static class DockCorner {
+    public const int TopLeft = 0;
+    public const int TopRight = 1;
+    public const int BottomLeft = 2;
+    public const int BottomRight = 3;
+    public const int Center = 4;
+}
+
+// 桌面工作区探测与窗口安全停靠/拖拽钳位工具（零 Gui 依赖，可与任意窗口壳组合）。
+public static class DesktopDock {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "SystemParametersInfoW")]
+    private static extern int WinSystemParametersInfoW(int uiAction, int uiParam, nint pvParam, int fWinIni);
+    #endif
+
+    // 查询主显示器扣除任务栏后的可用工作区；不支持或失败时回退到 ScreenWidth x ScreenHeight。
+    public static WorkAreaRect GetPrimaryWorkArea() {
+        #if WINDOWS
+        nint rectBuf = NativeMemory.Alloc(16);
+        try {
+            int ok = DesktopDock.WinSystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, rectBuf, 0);
+            if (ok != 0) {
+                Span<int> sp = new Span<int>(rectBuf, 4);
+                int left = sp[0];
+                int top = sp[1];
+                int right = sp[2];
+                int bottom = sp[3];
+                if (right > left && bottom > top) {
+                    return new WorkAreaRect(left, top, right, bottom);
+                }
+            }
+        } finally {
+            NativeMemory.Free(rectBuf);
+        }
+        #endif
+        int w = Screen.ScreenWidth();
+        int h = Screen.ScreenHeight();
+        if (w <= 0) { w = 1920; }
+        if (h <= 0) { h = 1080; }
+        return new WorkAreaRect(0, 0, w, h);
+    }
+
+    // 计算窗口停靠在指定工作区四角/居中时的安全坐标（自动钳位防止越界）。
+    public static DockPosition ComputeCorner(WorkAreaRect area, int winW, int winH,
+                                             int corner, int marginX, int marginY) {
+        if (area == null) { area = DesktopDock.GetPrimaryWorkArea(); }
+        if (winW < 0) { winW = 0; }
+        if (winH < 0) { winH = 0; }
+        int x = area.Left + marginX;
+        int y = area.Top + marginY;
+        if (corner == DockCorner.TopRight) {
+            x = area.Right - winW - marginX;
+            y = area.Top + marginY;
+        } else if (corner == DockCorner.BottomLeft) {
+            x = area.Left + marginX;
+            y = area.Bottom - winH - marginY;
+        } else if (corner == DockCorner.BottomRight) {
+            x = area.Right - winW - marginX;
+            y = area.Bottom - winH - marginY;
+        } else if (corner == DockCorner.Center) {
+            x = area.Left + (area.Width - winW) / 2;
+            y = area.Top + (area.Height - winH) / 2;
+        }
+        return DesktopDock.ClampToArea(area, x, y, winW, winH);
+    }
+
+    public static DockPosition ComputePrimaryCorner(int winW, int winH, int corner,
+                                                    int marginX, int marginY) {
+        return DesktopDock.ComputeCorner(DesktopDock.GetPrimaryWorkArea(), winW, winH,
+                                         corner, marginX, marginY);
+    }
+
+    // 将拖拽中的桌宠窗口坐标钳位到工作区内部，避免被拖出屏幕或压在任务栏后方。
+    public static DockPosition ClampToArea(WorkAreaRect area, int x, int y, int winW, int winH) {
+        if (area == null) { return new DockPosition(x, y); }
+        int maxX = area.Right - winW;
+        int maxY = area.Bottom - winH;
+        if (maxX < area.Left) { maxX = area.Left; }
+        if (maxY < area.Top) { maxY = area.Top; }
+        if (x < area.Left) { x = area.Left; }
+        if (x > maxX) { x = maxX; }
+        if (y < area.Top) { y = area.Top; }
+        if (y > maxY) { y = maxY; }
+        return new DockPosition(x, y);
+    }
+}
+
+// 桌面挂机/桌宠全局键鼠活跃度与闲置时长追踪器（基于 Hook.InstallBoth，只读观测绝不吞事件）。
+public static class CompanionActivityTracker {
+    private static bool running = false;
+    private static long keyDownCount = 0L;
+    private static long mouseClickCount = 0L;
+    private static long mouseWheelCount = 0L;
+    private static long mouseMoveCount = 0L;
+    private static int lastKeyVk = 0;
+    private static int lastMouseX = 0;
+    private static int lastMouseY = 0;
+    private static long lastActiveTickMs = 0L;
+
+    public static bool IsRunning { get { return CompanionActivityTracker.running; } }
+    public static long KeyDownCount { get { return CompanionActivityTracker.keyDownCount; } }
+    public static long MouseClickCount { get { return CompanionActivityTracker.mouseClickCount; } }
+    public static long MouseWheelCount { get { return CompanionActivityTracker.mouseWheelCount; } }
+    public static long MouseMoveCount { get { return CompanionActivityTracker.mouseMoveCount; } }
+    public static int LastKeyVk { get { return CompanionActivityTracker.lastKeyVk; } }
+    public static int LastMouseX { get { return CompanionActivityTracker.lastMouseX; } }
+    public static int LastMouseY { get { return CompanionActivityTracker.lastMouseY; } }
+
+    // 启动全局键鼠双钩子监听，记录最后活跃时间戳。
+    public static bool Start() {
+        if (CompanionActivityTracker.running) { return true; }
+        CompanionActivityTracker.lastActiveTickMs = Environment.TickCount64;
+        bool ok = Hook.InstallBoth(CompanionActivityTracker.OnKeyboard, CompanionActivityTracker.OnMouse);
+        if (ok) {
+            CompanionActivityTracker.running = true;
+        }
+        return ok;
+    }
+
+    // 卸载全局钩子并停止监听。
+    public static void Stop() {
+        if (!CompanionActivityTracker.running) { return; }
+        Hook.Uninstall();
+        CompanionActivityTracker.running = false;
+    }
+
+    // 清零统计计数并刷新活跃时间戳。
+    public static void Reset() {
+        CompanionActivityTracker.keyDownCount = 0L;
+        CompanionActivityTracker.mouseClickCount = 0L;
+        CompanionActivityTracker.mouseWheelCount = 0L;
+        CompanionActivityTracker.mouseMoveCount = 0L;
+        CompanionActivityTracker.lastKeyVk = 0;
+        CompanionActivityTracker.lastMouseX = 0;
+        CompanionActivityTracker.lastMouseY = 0;
+        CompanionActivityTracker.lastActiveTickMs = Environment.TickCount64;
+    }
+
+    // 距离上次键鼠活动的闲置毫秒数（便于桌宠在用户离开 N 秒后切入打盹/待机动画）。
+    public static long IdleMs() {
+        if (CompanionActivityTracker.lastActiveTickMs <= 0L) { return 0L; }
+        long delta = Environment.TickCount64 - CompanionActivityTracker.lastActiveTickMs;
+        if (delta < 0L) { delta = 0L; }
+        return delta;
+    }
+
+    // 手动注入一次按键活动（供自定义输入源或无头自动化测试使用）。
+    public static void RecordKeyDown(int vk) {
+        CompanionActivityTracker.keyDownCount = CompanionActivityTracker.keyDownCount + 1L;
+        CompanionActivityTracker.lastKeyVk = vk;
+        CompanionActivityTracker.lastActiveTickMs = Environment.TickCount64;
+    }
+
+    // 手动注入一次鼠标活动（兼容 Win32 WM_* 消息号）。
+    public static void RecordMouseEvent(int x, int y, int msg, int data) {
+        CompanionActivityTracker.lastMouseX = x;
+        CompanionActivityTracker.lastMouseY = y;
+        if (msg == 0x0201 || msg == 0x0204 || msg == 0x0207) {
+            CompanionActivityTracker.mouseClickCount = CompanionActivityTracker.mouseClickCount + 1L;
+        } else if (msg == 0x020A) {
+            CompanionActivityTracker.mouseWheelCount = CompanionActivityTracker.mouseWheelCount + 1L;
+        } else if (msg == 0x0200) {
+            CompanionActivityTracker.mouseMoveCount = CompanionActivityTracker.mouseMoveCount + 1L;
+        }
+        CompanionActivityTracker.lastActiveTickMs = Environment.TickCount64;
+    }
+
+    private static bool OnKeyboard(int vk, int scan, int flags, bool injected, bool keyUp) {
+        if (!keyUp) {
+            CompanionActivityTracker.RecordKeyDown(vk);
+        }
+        return false;
+    }
+
+    private static bool OnMouse(int x, int y, int msg, int data, bool injected) {
+        CompanionActivityTracker.RecordMouseEvent(x, y, msg, data);
+        return false;
+    }
+}

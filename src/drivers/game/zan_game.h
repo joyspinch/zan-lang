@@ -42,6 +42,12 @@ ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh,
  * draw3d_skinned / draw3d_batch）。默认 enabled=0, depth_write=1。 */
 ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write);
 
+/* 多 Pass 3D 帧深度缓冲复用边界：begin_frame3d 清一次深度缓冲并开启跨调用
+ * 深度保留（不透明静态 + 蒙皮角色 + 透明层共享同一 24-bit 深度缓冲）；
+ * end_frame3d 恢复单次 draw3d 自动清深度的默认兼容行为。 */
+ZAN_GAME_API int32_t zan_game_begin_frame3d(int32_t surface_id);
+ZAN_GAME_API void zan_game_end_frame3d(void);
+
 /* 单方向光 ShadowMap 渲染 Pass（PCF 3x3 软阴影）：
  * shadow_begin（指定分辨率 256..4096 与光源 ViewProjection 矩阵）→
  * 多次 shadow_draw（投射体网格 + model 矩阵）→ shadow_end（激活主 Pass

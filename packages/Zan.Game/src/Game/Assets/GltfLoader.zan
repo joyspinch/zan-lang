@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Json;
 using System.Numerics;
+using Gui;
 using Game.Animation;
+using Game.Graphics;
 using Game.Render3D;
 
 namespace Game.Assets;
@@ -143,6 +145,50 @@ public class GltfModel {
         if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
         string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
         return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
+    // 一键实例化为可直接交给 RenderPlan + Renderer3D 渲染的场景树：
+    // 自动上传静态/蒙皮网格、注册材质内嵌纹理、映射 BLEND 透明层（Layer=1）并挂载骨架。
+    public SceneNode InstantiateScene(Canvas canvas, string keyPrefix) {
+        SceneNode root = new SceneNode("gltf_root");
+        if (canvas == null) { return root; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        // 预先注册每个材质的 baseColorTexture（避免同材质图元重复解码）
+        List<string> matTexKeys = new List<string>();
+        for (int i = 0; i < this.Materials.Count; i = i + 1) {
+            matTexKeys.Add(this.RegisterMaterialBaseColorTexture(i, pfx));
+        }
+        for (int i = 0; i < this.Primitives.Count; i = i + 1) {
+            GltfPrimitive gp = this.Primitives[i];
+            if (gp == null) { continue; }
+            int handle = gp.IsSkinned
+                ? canvas.MeshUploadSkinned(gp.SkinnedMesh)
+                : canvas.MeshUpload(gp.Mesh);
+            if (handle <= 0) { continue; }
+            SceneNode node = new SceneNode(gp.MeshName != "" ? gp.MeshName : ("prim_" + i.ToString()));
+            node.MeshKey = handle;
+            node.IsSkinned = gp.IsSkinned;
+            if (gp.IsSkinned) { node.Skeleton = this.Skeleton; }
+            node.BoundsRadius = 4.0f;
+            Material mat = new Material();
+            if (gp.MaterialIndex >= 0 && gp.MaterialIndex < this.Materials.Count) {
+                GltfMaterial gm = this.Materials[gp.MaterialIndex];
+                mat.Red = gm.BaseColorR;
+                mat.Green = gm.BaseColorG;
+                mat.Blue = gm.BaseColorB;
+                mat.Alpha = gm.BaseColorA;
+                mat.Metallic = gm.MetallicFactor;
+                mat.Roughness = gm.RoughnessFactor;
+                mat.TextureKey = matTexKeys[gp.MaterialIndex];
+                if (gm.AlphaMode == "BLEND" || gm.BaseColorA < 0.99f) {
+                    node.Layer = 1;
+                    node.CastShadow = false;
+                }
+            }
+            node.Material = mat;
+            root.AddChild(node);
+        }
+        return root;
     }
 }
 

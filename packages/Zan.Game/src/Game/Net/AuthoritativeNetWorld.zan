@@ -1,0 +1,333 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using Game.Server.Aoi;
+
+namespace Game.Net;
+
+// 客户端输入帧二进制编解码器（32 字节小端定长帧，用于 KCP 上行输入指令）。
+public static class ClientInputCodec {
+    public const int MAGIC = 0x5A494E50; // "ZINP"
+    public const int FRAME_BYTES = 32;
+
+    public static byte[] Encode(ClientInputCmd cmd) {
+        if (cmd == null) { return new byte[0]; }
+        byte[] buf = new byte[FRAME_BYTES];
+        WriteI32(buf, 0, MAGIC);
+        WriteI32(buf, 4, cmd.Seq);
+        WriteF32(buf, 8, cmd.MoveX);
+        WriteF32(buf, 12, cmd.MoveY);
+        WriteF32(buf, 16, cmd.MoveZ);
+        WriteF32(buf, 20, cmd.Yaw);
+        WriteI32(buf, 24, cmd.Buttons);
+        WriteF32(buf, 28, cmd.DtSec);
+        return buf;
+    }
+
+    public static ClientInputCmd Decode(byte[] data) {
+        if (data == null || data.Length < FRAME_BYTES) { return null; }
+        if (ReadI32(data, 0) != MAGIC) { return null; }
+        return new ClientInputCmd(
+            ReadI32(data, 4),
+            ReadF32(data, 8),
+            ReadF32(data, 12),
+            ReadF32(data, 16),
+            ReadF32(data, 20),
+            ReadI32(data, 24),
+            ReadF32(data, 28)
+        );
+    }
+
+    private static void WriteI32(byte[] buf, int pos, int val) {
+        buf[pos] = (byte)(val & 255);
+        buf[pos + 1] = (byte)((val >> 8) & 255);
+        buf[pos + 2] = (byte)((val >> 16) & 255);
+        buf[pos + 3] = (byte)((val >> 24) & 255);
+    }
+
+    private static int ReadI32(byte[] buf, int pos) {
+        return (buf[pos] & 255)
+            | ((buf[pos + 1] & 255) << 8)
+            | ((buf[pos + 2] & 255) << 16)
+            | ((buf[pos + 3] & 255) << 24);
+    }
+
+    private static void WriteF32(byte[] buf, int pos, float val) {
+        WriteI32(buf, pos, BitConverter.SingleToInt32Bits(val));
+    }
+
+    private static float ReadF32(byte[] buf, int pos) {
+        return BitConverter.ToSingle(buf, pos);
+    }
+}
+
+// 权威世界中的单个玩家/网络实体记录。
+public class AuthWorldEntity {
+    public int PeerId;
+    public int Conv;
+    public int EntityId;
+    public EntityNetState State;
+    public int LastAckInputSeq;
+
+    public AuthWorldEntity(int peerId, int conv, int entityId, float x, float y, float z) {
+        this.PeerId = peerId;
+        this.Conv = conv;
+        this.EntityId = entityId;
+        this.State = new EntityNetState(entityId, x, y, z, 0.0f, 0.0f, 0.0f, 0.0f, 1);
+        this.LastAckInputSeq = 0;
+    }
+}
+
+// 商业级 AOI 视野过滤权威多人世界服务器：
+// 串联单端口 KcpUdpServer + AoiGrid 九宫格视野裁剪 + 防加速输入校验 + 定制快照广播。
+// 每名客户端只接收自身及九宫格视野范围内的邻近实体快照，并附带专属 LastAckInputSeq 供客户端和解。
+public class AuthoritativeNetWorld : IDisposable {
+    private KcpUdpServer server;
+    private AoiGrid aoi;
+    private List<AuthWorldEntity> entities;
+    private int nextEntityId;
+    private int serverTick;
+    private float moveSpeed;
+    private float maxDtSec;
+
+    public AuthoritativeNetWorld(KcpUdpServer kcpServer, float minX, float minZ,
+                                 float maxX, float maxZ, float aoiCellSize) {
+        this.server = kcpServer;
+        this.aoi = new AoiGrid(minX, minZ, maxX, maxZ, aoiCellSize);
+        this.entities = new List<AuthWorldEntity>();
+        this.nextEntityId = 1;
+        this.serverTick = 0;
+        this.moveSpeed = 10.0f;
+        this.maxDtSec = 0.1f;
+    }
+
+    public static AuthoritativeNetWorld Bind(string host, int port, float minX, float minZ,
+                                             float maxX, float maxZ, float aoiCellSize) {
+        KcpUdpServer srv = KcpUdpServer.Bind(host, port);
+        if (srv == null) { return null; }
+        return new AuthoritativeNetWorld(srv, minX, minZ, maxX, maxZ, aoiCellSize);
+    }
+
+    public KcpUdpServer Transport { get { return this.server; } }
+    public AoiGrid Aoi { get { return this.aoi; } }
+    public int ServerTick { get { return this.serverTick; } }
+    public int EntityCount { get { return this.entities.Count; } }
+
+    public void SetMoveSpeed(float speed) {
+        if (speed > 0.0f) { this.moveSpeed = speed; }
+    }
+
+    public AuthWorldEntity FindByPeerId(int peerId) {
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            if (this.entities[i].PeerId == peerId) { return this.entities[i]; }
+        }
+        return null;
+    }
+
+    public AuthWorldEntity FindByConv(int conv) {
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            if (this.entities[i].Conv == conv) { return this.entities[i]; }
+        }
+        return null;
+    }
+
+    public AuthWorldEntity FindByEntityId(int entityId) {
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            if (this.entities[i].EntityId == entityId) { return this.entities[i]; }
+        }
+        return null;
+    }
+
+    // 权威瞬移/出生点设置（同步刷新 AoiGrid 所在格）。
+    public bool SetEntityPosition(int conv, float x, float y, float z) {
+        AuthWorldEntity ent = this.FindByConv(conv);
+        if (ent == null) { return false; }
+        ent.State.X = x;
+        ent.State.Y = y;
+        ent.State.Z = z;
+        this.aoi.Move((long)ent.EntityId, x, z);
+        return true;
+    }
+
+    // 驱动网络收包、权威输入验证积分与断线清理。返回本轮处理的有效输入条数。
+    public int Poll(int nowMs) {
+        if (this.server == null) { return 0; }
+        this.server.Poll(nowMs);
+        int processed = 0;
+        for (int iter = 0; iter < 256; iter = iter + 1) {
+            KcpPacket pkt = this.server.Recv();
+            if (pkt == null) { break; }
+            AuthWorldEntity ent = this.EnsureEntity(pkt.PeerId, pkt.Conv);
+            ClientInputCmd cmd = ClientInputCodec.Decode(pkt.Payload);
+            if (cmd != null && cmd.Seq > ent.LastAckInputSeq) {
+                this.ApplyAuthoritativeInput(ent, cmd);
+                processed = processed + 1;
+            }
+        }
+        // 清理已超时/断开连接客户端对应的世界实体与 AOI 占位
+        for (int i = this.entities.Count - 1; i >= 0; i = i - 1) {
+            AuthWorldEntity ent = this.entities[i];
+            if (this.server.FindByPeerId(ent.PeerId) == null) {
+                this.aoi.Leave((long)ent.EntityId);
+                this.entities.RemoveAt(i);
+            }
+        }
+        return processed;
+    }
+
+    // 向每名在线客户端下发经过 AoiGrid 九宫格过滤的定制 WorldSnapshot。返回发送客户端数。
+    public int BroadcastSnapshots(int serverTimeMs) {
+        if (this.server == null) { return 0; }
+        this.serverTick = this.serverTick + 1;
+        int sent = 0;
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            AuthWorldEntity viewer = this.entities[i];
+            int cx = this.aoi.ToCellX(viewer.State.X);
+            int cz = this.aoi.ToCellY(viewer.State.Z);
+            long[] visibleIds = this.aoi.GetSurroundEntities(cx, cz, 0L);
+
+            WorldSnapshot snap = new WorldSnapshot(this.serverTick, serverTimeMs, viewer.LastAckInputSeq);
+            bool sawSelf = false;
+            for (int k = 0; k < visibleIds.Length; k = k + 1) {
+                int eid = (int)visibleIds[k];
+                AuthWorldEntity target = this.FindByEntityId(eid);
+                if (target != null) {
+                    snap.AddEntity(target.State.Clone());
+                    if (eid == viewer.EntityId) { sawSelf = true; }
+                }
+            }
+            if (!sawSelf) {
+                snap.AddEntity(viewer.State.Clone());
+            }
+            if (this.server.SendTo(viewer.PeerId, snap.Encode()) == 0) {
+                sent = sent + 1;
+            }
+        }
+        return sent;
+    }
+
+    private AuthWorldEntity EnsureEntity(int peerId, int conv) {
+        AuthWorldEntity existing = this.FindByPeerId(peerId);
+        if (existing != null) { return existing; }
+        int eid = this.nextEntityId;
+        this.nextEntityId = this.nextEntityId + 1;
+        AuthWorldEntity ent = new AuthWorldEntity(peerId, conv, eid, 0.0f, 0.0f, 0.0f);
+        this.entities.Add(ent);
+        this.aoi.Enter((long)eid, 0.0f, 0.0f);
+        return ent;
+    }
+
+    private void ApplyAuthoritativeInput(AuthWorldEntity ent, ClientInputCmd cmd) {
+        // 服务端防作弊钳位：限制单步 dt 与移动输入模长 <= 1.0
+        float dt = cmd.DtSec;
+        if (dt < 0.0f) { dt = 0.0f; }
+        if (dt > this.maxDtSec) { dt = this.maxDtSec; }
+
+        float mx = cmd.MoveX;
+        float my = cmd.MoveY;
+        float mz = cmd.MoveZ;
+        float horizLen = (float)Math.Sqrt((double)(mx * mx + mz * mz));
+        if (horizLen > 1.0f) {
+            mx = mx / horizLen;
+            mz = mz / horizLen;
+        }
+        if (my > 1.0f) { my = 1.0f; }
+        if (my < -1.0f) { my = -1.0f; }
+
+        float vx = mx * this.moveSpeed;
+        float vy = my * this.moveSpeed;
+        float vz = mz * this.moveSpeed;
+        ent.State.Vx = vx;
+        ent.State.Vy = vy;
+        ent.State.Vz = vz;
+        ent.State.X = ent.State.X + vx * dt;
+        ent.State.Y = ent.State.Y + vy * dt;
+        ent.State.Z = ent.State.Z + vz * dt;
+        ent.State.Yaw = cmd.Yaw;
+        ent.State.Flags = cmd.Buttons;
+        ent.LastAckInputSeq = cmd.Seq;
+        this.aoi.Move((long)ent.EntityId, ent.State.X, ent.State.Z);
+    }
+
+    public void Dispose() {
+        this.entities.Clear();
+        if (this.server != null) {
+            this.server.Dispose();
+            this.server = null;
+        }
+    }
+}
+
+// 权威多人世界客户端封装：集成 KcpUdpPeer + SnapshotInterpolator + ClientPredictionBuffer。
+public class AuthoritativeNetClient : IDisposable {
+    private KcpUdpPeer peer;
+    private SnapshotInterpolator interpolator;
+    private ClientPredictionBuffer prediction;
+    private WorldSnapshot latestSnapshot;
+    private List<ClientInputCmd> unacked;
+
+    public AuthoritativeNetClient(KcpUdpPeer udpPeer, int interpDelayMs, int maxExtrapolateMs) {
+        this.peer = udpPeer;
+        this.interpolator = new SnapshotInterpolator(interpDelayMs, maxExtrapolateMs);
+        this.prediction = new ClientPredictionBuffer();
+        this.latestSnapshot = null;
+        this.unacked = new List<ClientInputCmd>();
+    }
+
+    public static AuthoritativeNetClient Bind(string localHost, int localPort, int conv,
+                                              string serverIp, int serverPort, int interpDelayMs) {
+        KcpUdpPeer p = KcpUdpPeer.Bind(localHost, localPort, conv, serverIp, serverPort);
+        if (p == null) { return null; }
+        return new AuthoritativeNetClient(p, interpDelayMs, 150);
+    }
+
+    public SnapshotInterpolator Interpolator { get { return this.interpolator; } }
+    public WorldSnapshot LatestSnapshot { get { return this.latestSnapshot; } }
+    public int LastAckInputSeq { get { return this.interpolator.LastAckInputSeq; } }
+    public int UnackedCount { get { return this.unacked.Count; } }
+
+    // 录制并发送一条客户端输入指令到权威服务器。
+    public ClientInputCmd SendInput(float mx, float my, float mz, float yaw, int buttons, float dtSec) {
+        ClientInputCmd cmd = this.prediction.RecordInput(mx, my, mz, yaw, buttons, dtSec);
+        this.unacked.Add(cmd);
+        if (this.peer != null) {
+            this.peer.Send(ClientInputCodec.Encode(cmd));
+        }
+        return cmd;
+    }
+
+    // 驱动 KCP 收发、解码全部到达的权威快照并自动推进预测和解队列。返回新收快照数。
+    public int Poll(int nowMs) {
+        if (this.peer == null) { return 0; }
+        this.peer.Poll(nowMs);
+        int applied = 0;
+        for (int i = 0; i < 32; i = i + 1) {
+            byte[] raw = this.peer.Recv();
+            if (raw == null) { break; }
+            WorldSnapshot snap = WorldSnapshot.Decode(raw);
+            if (snap != null && this.interpolator.PushSnapshot(snap)) {
+                this.latestSnapshot = snap;
+                this.unacked = this.prediction.AcknowledgeAndPending(snap.LastAckInputSeq);
+                applied = applied + 1;
+            }
+        }
+        return applied;
+    }
+
+    public List<EntityNetState> SampleWorld(int renderTimeMs) {
+        return this.interpolator.Sample(renderTimeMs);
+    }
+
+    public List<ClientInputCmd> PendingUnackedInputs() {
+        return this.unacked;
+    }
+
+    public void Dispose() {
+        this.unacked.Clear();
+        this.latestSnapshot = null;
+        if (this.peer != null) {
+            this.peer.Dispose();
+            this.peer = null;
+        }
+    }
+}

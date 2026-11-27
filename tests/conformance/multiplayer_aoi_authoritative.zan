@@ -1,0 +1,103 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerAoiAuthoritativeTest {
+    static int PumpAll(AuthoritativeNetWorld world, AuthoritativeNetClient a,
+                       AuthoritativeNetClient b, AuthoritativeNetClient c,
+                       int startMs, int steps) {
+        int now = startMs;
+        for (int s = 0; s < steps; s = s + 1) {
+            now = now + 15;
+            a.Poll(now);
+            b.Poll(now);
+            c.Poll(now);
+            world.Poll(now);
+            Thread.Sleep(2);
+        }
+        return now;
+    }
+
+    static bool AbsLe(float x, float target, float eps) {
+        float d = x - target;
+        if (d < 0.0f) { d = 0.0f - d; }
+        return d <= eps;
+    }
+
+    static void Main() {
+        // 地图 [-100, 100] x [-100, 100]，AOI 格边长 20（九宫格视野覆盖 ±1 格，即约 20..40 单位）
+        int srvPort = 39431;
+        AuthoritativeNetWorld world = AuthoritativeNetWorld.Bind("127.0.0.1", srvPort, -100.0f, -100.0f, 100.0f, 100.0f, 20.0f);
+        AuthoritativeNetClient cliA = AuthoritativeNetClient.Bind("127.0.0.1", 39432, 1001, "127.0.0.1", srvPort, 50);
+        AuthoritativeNetClient cliB = AuthoritativeNetClient.Bind("127.0.0.1", 39433, 1002, "127.0.0.1", srvPort, 50);
+        AuthoritativeNetClient cliC = AuthoritativeNetClient.Bind("127.0.0.1", 39434, 1003, "127.0.0.1", srvPort, 50);
+
+        bool allOk = false;
+        bool aoiFilteredOk = false;
+        bool antiCheatReconcileOk = false;
+        bool aoiEnterOk = false;
+
+        if (world != null && cliA != null && cliB != null && cliC != null) {
+            world.SetMoveSpeed(10.0f);
+
+            // 1. 三客户端发送首条握手输入注册进入权威世界
+            cliA.SendInput(0.0f, 0.0f, 0.0f, 0.0f, 1, 0.05f);
+            cliB.SendInput(0.0f, 0.0f, 0.0f, 0.0f, 1, 0.05f);
+            cliC.SendInput(0.0f, 0.0f, 0.0f, 0.0f, 1, 0.05f);
+            int now = PumpAll(world, cliA, cliB, cliC, 100, 15);
+
+            // 布置位置：A=(5,0,5) 与 B=(10,0,5) 同处近邻格；C=(85,0,85) 处于远端格（九宫格之外）
+            world.SetEntityPosition(1001, 5.0f, 0.0f, 5.0f);
+            world.SetEntityPosition(1002, 10.0f, 0.0f, 5.0f);
+            world.SetEntityPosition(1003, 85.0f, 0.0f, 85.0f);
+
+            // 广播第 1 帧快照
+            int sent1 = world.BroadcastSnapshots(now);
+            now = PumpAll(world, cliA, cliB, cliC, now, 15);
+
+            // 验证 AOI 视野过滤：A 和 B 各自只收到 2 个实体（A+B），看不到远处的 C；C 只看到自己（1 个实体）！
+            aoiFilteredOk = world.EntityCount == 3 && sent1 == 3
+                && cliA.LatestSnapshot != null && cliA.LatestSnapshot.Entities.Count == 2
+                && cliB.LatestSnapshot != null && cliB.LatestSnapshot.Entities.Count == 2
+                && cliC.LatestSnapshot != null && cliC.LatestSnapshot.Entities.Count == 1;
+
+            // 2. 验证服务端防加速钳位（客户端恶意传 MoveX=99, DtSec=5.0 -> 服务端钳位至 |v|<=10, dt<=0.1 => 单步最多移 +1.0）
+            //    并验证客户端预测队列按 LastAckInputSeq 自动和解（发出 seq=2,3，等服务器确认到 3 -> UnackedCount==0）
+            cliA.SendInput(99.0f, 0.0f, 0.0f, 1.5f, 2, 5.0f);
+            cliA.SendInput(1.0f, 0.0f, 0.0f, 1.5f, 2, 0.1f);
+            now = PumpAll(world, cliA, cliB, cliC, now, 15);
+            world.BroadcastSnapshots(now);
+            now = PumpAll(world, cliA, cliB, cliC, now, 15);
+
+            AuthWorldEntity entA = world.FindByConv(1001);
+            // 初始 X=5.0 + 钳位两步各 +1.0 = 7.0
+            antiCheatReconcileOk = entA != null
+                && AbsLe(entA.State.X, 7.0f, 0.01f)
+                && cliA.LastAckInputSeq == 3
+                && cliA.UnackedCount == 0
+                && cliA.SampleWorld(now).Count == 2;
+
+            // 3. 验证动态 AOI 进入：C 传送回近邻格 (12, 0, 8) 后广播快照 -> 三端同时看到全部 3 个实体！
+            world.SetEntityPosition(1003, 12.0f, 0.0f, 8.0f);
+            world.BroadcastSnapshots(now + 100);
+            now = PumpAll(world, cliA, cliB, cliC, now + 100, 15);
+            aoiEnterOk = cliA.LatestSnapshot.Entities.Count == 3
+                && cliB.LatestSnapshot.Entities.Count == 3
+                && cliC.LatestSnapshot.Entities.Count == 3;
+
+            allOk = aoiFilteredOk && antiCheatReconcileOk && aoiEnterOk;
+        }
+
+        if (cliA != null) { cliA.Dispose(); }
+        if (cliB != null) { cliB.Dispose(); }
+        if (cliC != null) { cliC.Dispose(); }
+        if (world != null) { world.Dispose(); }
+
+        Console.WriteLine("aoi-visibility-filter: " + Convert.ToString(aoiFilteredOk ? 1 : 0));
+        Console.WriteLine("anticheat-and-reconcile: " + Convert.ToString(antiCheatReconcileOk ? 1 : 0));
+        Console.WriteLine("aoi-dynamic-enter: " + Convert.ToString(aoiEnterOk && allOk ? 1 : 0));
+    }
+}

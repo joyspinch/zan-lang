@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Gui;
 using Game.Graphics;
 
@@ -6,12 +7,12 @@ namespace Game.Render3D;
 
 // 绘制层：把渲染计划提交到画布。
 //
-// **这一层只有一件事**——把 RenderPlan 里的绘制项装进批次并提交。
-// 场景遍历、剔除、光照、排序全在 RenderPlan 里（纯逻辑，可无头断言），
-// 绘制层不重复任何一份逻辑。
-//
-// 返回值语义与 Canvas.DrawMesh3D 一致：1 = GPU 批次已提交；0 = 当前
-// 后端不支持 3D（CPU 兜底档），调用方据此换 2D 回退。
+// **这一层只有一件事**——把 RenderPlan 里的绘制项按商业级多 Pass 管线提交到 GPU：
+// - 常规全不透明静态场景（无阴影/无蒙皮/无透明层）：直通实例化 MeshBatch 极速合批；
+// - 含 ShadowMap 阴影 / GPU 蒙皮角色 / Alpha 混合透明层（Layer == 1）：
+//   Pass 1 方向光 ShadowMap 投射（静态 + 蒙皮动态阴影）→
+//   Pass 2 统一 24-bit 深度缓冲下绘制不透明静态与蒙皮网格（3x3 PCF 软阴影接收）→
+//   Pass 3 按视深从远到近开启 Alpha Blend（depthWrite=false）绘制透明层并恢复状态。
 public class Renderer3D {
     MeshBatch batch;
     Mat4 scratch;
@@ -27,6 +28,18 @@ public class Renderer3D {
 
     // 是否强制使用 CPU 侧光照着色（传入 it.Tint 而非 it.Albedo）；缺省 false（GPU 档着色）。
     public bool UseCpuLighting;
+    // 是否启用主方向光 ShadowMap（3x3 PCF 软阴影）；缺省 false（保持旧合批零开销）。
+    public bool EnableShadows;
+    // ShadowMap 分辨率（256..4096，默认 1024）。
+    public int ShadowMapSize;
+    // 自动计算方向光正交投影时的半边长（世界单位，默认 12.0f）。
+    public float ShadowBounds;
+    // 自动计算方向光时的目标中心点（默认原点）。
+    public Vector3 ShadowFocus;
+    // 自动计算方向光时光源相对目标点的回退距离（默认 20.0f）。
+    public float ShadowDistance;
+    // 可选显式光源 ViewProjection 矩阵（非 null 时优先使用，否则由 plan.Lights 主方向光自动构建）。
+    public Mat4 ShadowLightVp;
 
     public Renderer3D(int capacity) {
         this.batch = MeshBatch.Create(capacity);
@@ -41,6 +54,65 @@ public class Renderer3D {
         this.colors3 = new float[9];
         this.colors4 = new float[12];
         this.UseCpuLighting = false;
+        this.EnableShadows = false;
+        this.ShadowMapSize = 1024;
+        this.ShadowBounds = 12.0f;
+        this.ShadowFocus = Vector3.Zero;
+        this.ShadowDistance = 20.0f;
+        this.ShadowLightVp = null;
+    }
+
+    private static Mat4 BuildOrthoGl(float left, float right, float bottom, float top,
+                                     float nearZ, float farZ) {
+        Mat4 r = Mat4.Identity();
+        float invW = 1.0f / (right - left);
+        float invH = 1.0f / (top - bottom);
+        float invD = 1.0f / (farZ - nearZ);
+        r.m[0] = 2.0f * invW;
+        r.m[5] = 2.0f * invH;
+        r.m[10] = -2.0f * invD;
+        r.m[3] = -(right + left) * invW;
+        r.m[7] = -(top + bottom) * invH;
+        r.m[11] = -(farZ + nearZ) * invD;
+        return r;
+    }
+
+    private Mat4 ResolveShadowLightVp(RenderPlan plan) {
+        if (this.ShadowLightVp != null) { return this.ShadowLightVp; }
+        Vector3 lightDir = new Vector3(0.0f, -1.0f, -0.3f);
+        if (plan.Lights != null) {
+            for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+                Light lt = plan.Lights[i];
+                if (lt != null && lt.Enabled && lt.Kind == LightKind.Directional) {
+                    lightDir = lt.Direction;
+                    break;
+                }
+            }
+        }
+        float len = (float)Math.Sqrt((double)(lightDir.X * lightDir.X + lightDir.Y * lightDir.Y + lightDir.Z * lightDir.Z));
+        if (len < 1e-5f) {
+            lightDir = new Vector3(0.0f, -1.0f, -0.3f);
+            len = (float)Math.Sqrt((double)(lightDir.X * lightDir.X + lightDir.Y * lightDir.Y + lightDir.Z * lightDir.Z));
+        }
+        float dx = lightDir.X / len;
+        float dy = lightDir.Y / len;
+        float dz = lightDir.Z / len;
+        float dist = this.ShadowDistance > 1.0f ? this.ShadowDistance : 20.0f;
+        float ex = this.ShadowFocus.X - dx * dist;
+        float ey = this.ShadowFocus.Y - dy * dist;
+        float ez = this.ShadowFocus.Z - dz * dist;
+        float ux = 0.0f;
+        float uy = 1.0f;
+        float uz = 0.0f;
+        float absY = dy < 0.0f ? 0.0f - dy : dy;
+        if (absY > 0.98f) {
+            uy = 0.0f;
+            uz = 1.0f;
+        }
+        Mat4 view = Mat4.LookAt(ex, ey, ez, this.ShadowFocus.X, this.ShadowFocus.Y, this.ShadowFocus.Z, ux, uy, uz);
+        float half = this.ShadowBounds > 0.1f ? this.ShadowBounds : 12.0f;
+        Mat4 proj = BuildOrthoGl(0.0f - half, half, 0.0f - half, half, 0.5f, dist * 2.5f);
+        return Mat4.Mul(proj, view);
     }
 
     private void ApplyLights(Canvas canvas, RenderPlan plan) {
@@ -97,16 +169,105 @@ public class Renderer3D {
         if (!this.UseCpuLighting) {
             this.ApplyLights(canvas, plan);
         }
+
+        // 检查本帧是否需要高级多 Pass（阴影 / GPU 蒙皮 / 透明混合层）
+        bool needMultiPass = this.EnableShadows;
+        if (!needMultiPass) {
+            for (int i = 0; i < n; i = i + 1) {
+                RenderItem it = plan.ItemAt(i);
+                if (it != null && (it.IsSkinned || it.Layer == 1)) {
+                    needMultiPass = true;
+                    break;
+                }
+            }
+        }
+
         Mat4 vp = plan.Camera.ViewProjectionMatrix();
-        this.batch.Begin();
+        if (!needMultiPass) {
+            this.batch.Begin();
+            for (int i = 0; i < n; i = i + 1) {
+                RenderItem it = plan.ItemAt(i);
+                if (it == null || it.MeshKey <= 0) { continue; }
+                RenderTransform.MulInto(this.scratch, vp, it.Model);
+                int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
+                this.batch.Add(it.MeshKey, it.TextureKey, this.scratch, tint);
+            }
+            return this.batch.Draw(canvas);
+        }
+
+        // Pass 1：方向光 ShadowMap 投射（同时支持静态与 GPU 蒙皮网格）
+        bool shadowActive = false;
+        if (this.EnableShadows) {
+            Mat4 lightVp = this.ResolveShadowLightVp(plan);
+            int mapSz = this.ShadowMapSize >= 256 ? this.ShadowMapSize : 1024;
+            if (canvas.ShadowBegin(mapSz, lightVp) == 1) {
+                for (int i = 0; i < n; i = i + 1) {
+                    RenderItem it = plan.ItemAt(i);
+                    if (it == null || it.MeshKey <= 0 || !it.CastShadow || it.Layer == 1) { continue; }
+                    if (it.IsSkinned) {
+                        if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
+                        canvas.ShadowDrawSkinned(it.MeshKey, it.Model);
+                    } else {
+                        canvas.ShadowDraw(it.MeshKey, it.Model);
+                    }
+                }
+                shadowActive = canvas.ShadowEnd() == 1;
+            }
+        }
+
+        // 开启跨 Pass 共享 24-bit 深度缓冲帧
+        if (canvas.BeginFrame3D() == 0) {
+            if (shadowActive) { canvas.ShadowClear(); }
+            return 0;
+        }
+
+        int drawn = 0;
+        // Pass 2：不透明层（Layer == 0，先静态后/混合蒙皮，共享深度并接收阴影）
+        canvas.SetBlend3D(false, true);
         for (int i = 0; i < n; i = i + 1) {
             RenderItem it = plan.ItemAt(i);
-            if (it == null || it.MeshKey <= 0) { continue; }
+            if (it == null || it.MeshKey <= 0 || it.Layer != 0) { continue; }
             RenderTransform.MulInto(this.scratch, vp, it.Model);
             int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-            this.batch.Add(it.MeshKey, it.TextureKey, this.scratch, tint);
+            Mat4 modelForShadow = (shadowActive && it.ReceiveShadow) ? it.Model : null;
+            int ok;
+            if (it.IsSkinned) {
+                if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
+                ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+            } else {
+                ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+            }
+            if (ok == 1) { drawn = drawn + 1; }
         }
-        return this.batch.Draw(canvas);
+
+        // Pass 3：透明层（Layer == 1，RenderPlan 已按视深从远到近排序；开启 Alpha Blend 且禁写深度）
+        bool hasTransparent = false;
+        for (int i = 0; i < n; i = i + 1) {
+            RenderItem it = plan.ItemAt(i);
+            if (it != null && it.MeshKey > 0 && it.Layer == 1) {
+                if (!hasTransparent) {
+                    canvas.SetBlend3D(true, false);
+                    hasTransparent = true;
+                }
+                RenderTransform.MulInto(this.scratch, vp, it.Model);
+                int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
+                Mat4 modelForShadow = (shadowActive && it.ReceiveShadow) ? it.Model : null;
+                int ok;
+                if (it.IsSkinned) {
+                    if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
+                    ok = canvas.DrawMesh3DSkinned(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                } else {
+                    ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelForShadow, tint, it.TextureKey);
+                }
+                if (ok == 1) { drawn = drawn + 1; }
+            }
+        }
+        if (hasTransparent) {
+            canvas.SetBlend3D(false, true);
+        }
+        canvas.EndFrame3D();
+        if (shadowActive) { canvas.ShadowClear(); }
+        return drawn > 0 ? 1 : 0;
     }
 
     // 释放批次缓冲。此后本对象不可再用。
