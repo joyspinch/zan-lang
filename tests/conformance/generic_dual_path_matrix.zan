@@ -1,0 +1,158 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+
+// S32: Generic dual-path differential parity matrix.
+// Exercises the exact same generic container & helper methods across:
+//   - Monomorphized instantiations: int, double, bool, struct Pair, string, ValueEqBox (has op_eq)
+//   - __Canon + __gctx shared reference instantiations: Alpha, Beta, ITagged
+// Verifies typeof(T), static field isolation, default(T), equality/type tests,
+// List<T>/T[] storage, and reflection metadata match uniformly across both paths.
+
+interface ITagged {
+    string Tag();
+}
+
+struct Pair {
+    public int A;
+    public int B;
+    public Pair(int a, int b) { A = a; B = b; }
+    public override string ToString() => "(" + A + "," + B + ")";
+}
+
+class Alpha : ITagged {
+    public string Name;
+    public Alpha(string n) { Name = n; }
+    public string Tag() => "A:" + Name;
+}
+
+class Beta : ITagged {
+    public string Name;
+    public Beta(string n) { Name = n; }
+    public string Tag() => "B:" + Name;
+}
+
+class ValueEqBox {
+    public int Id;
+    public ValueEqBox(int id) { Id = id; }
+    public override bool Equals(object other) {
+        if (other is ValueEqBox b) { return Id == b.Id; }
+        return false;
+    }
+    public static bool operator ==(ValueEqBox x, ValueEqBox y) {
+        if (x is null && y is null) { return true; }
+        if (x is null || y is null) { return false; }
+        return x.Id == y.Id;
+    }
+    public static bool operator !=(ValueEqBox x, ValueEqBox y) => !(x == y);
+}
+
+class DualBox<T> {
+    public static int Counter = 10;
+    public T Value;
+    public T DefaultSlot;
+    public List<T> Items;
+
+    public DualBox(T initial) {
+        Value = initial;
+        Items = new List<T>();
+        Items.Add(initial);
+        Counter = Counter + 1;
+    }
+
+    public string TypeName() => typeof(T).Name;
+    public int TypeFieldCount() => typeof(T).FieldCount;
+    public T DefaultVal() => DefaultSlot;
+    public bool Matches(object obj) => obj is T;
+    public T RoundTripArray() {
+        T[] arr = new T[2];
+        arr[0] = Value;
+        return arr[0];
+    }
+    public T DefaultArrayElem() {
+        T[] arr = new T[2];
+        return arr[1];
+    }
+}
+
+class Program {
+    static string DescribeGeneric<T>(T sample) {
+        return typeof(T).Name + "|count=" + DualBox<T>.Counter;
+    }
+
+    static void Main() {
+        // 1. Monomorphized value-type instantiations
+        var bInt = new DualBox<int>(42);
+        var bInt2 = new DualBox<int>(42);
+        var bDbl = new DualBox<double>(3.5);
+        var bBool = new DualBox<bool>(true);
+        var bPair = new DualBox<Pair>(new Pair(3, 4));
+        var bStr = new DualBox<string>("zan");
+        var bEq = new DualBox<ValueEqBox>(new ValueEqBox(7));
+
+        // 2. __Canon + __gctx reference-type instantiations
+        var a1 = new Alpha("one");
+        var a2 = new Alpha("two");
+        var b1 = new Beta("x");
+        var bAlpha = new DualBox<Alpha>(a1);
+        var bAlpha2 = new DualBox<Alpha>(a2);
+        var bBeta = new DualBox<Beta>(b1);
+        var bIface = new DualBox<ITagged>(a1);
+
+        // typeof(T).Name parity across both paths
+        Console.WriteLine("type.int=" + bInt.TypeName());
+        Console.WriteLine("type.double=" + bDbl.TypeName());
+        Console.WriteLine("type.bool=" + bBool.TypeName());
+        Console.WriteLine("type.pair=" + bPair.TypeName());
+        Console.WriteLine("type.string=" + bStr.TypeName());
+        Console.WriteLine("type.eqbox=" + bEq.TypeName());
+        Console.WriteLine("type.alpha=" + bAlpha.TypeName());
+        Console.WriteLine("type.beta=" + bBeta.TypeName());
+        Console.WriteLine("type.iface=" + bIface.TypeName());
+
+        // Per-instantiation static field isolation
+        Console.WriteLine("cnt.int=" + DualBox<int>.Counter);
+        Console.WriteLine("cnt.double=" + DualBox<double>.Counter);
+        Console.WriteLine("cnt.alpha=" + DualBox<Alpha>.Counter);
+        Console.WriteLine("cnt.beta=" + DualBox<Beta>.Counter);
+        Console.WriteLine("cnt.iface=" + DualBox<ITagged>.Counter);
+
+        // default(T) parity (zero for value types, null for reference types)
+        Console.WriteLine("def.int=" + bInt.DefaultVal());
+        Console.WriteLine("def.bool=" + bBool.DefaultVal());
+        Pair dp = bPair.DefaultVal();
+        Console.WriteLine("def.pair=" + dp.A + "," + dp.B);
+        Console.WriteLine("def.str.null=" + (bStr.DefaultVal() == null));
+        Console.WriteLine("def.alpha.null=" + (bAlpha.DefaultVal() == null));
+        Console.WriteLine("def.beta.null=" + (bBeta.DefaultVal() == null));
+
+        // Equality & runtime type test parity
+        Console.WriteLine("eq.int.same=" + (bInt.Value == 42));
+        Console.WriteLine("eq.int.diff=" + (bInt.Value == 99));
+        Console.WriteLine("eq.eqbox.same=" + (bEq.Value == new ValueEqBox(7)));
+        Console.WriteLine("eq.eqbox.diff=" + (bEq.Value == new ValueEqBox(8)));
+        Console.WriteLine("eq.alpha.same=" + (bAlpha.Value == a1));
+        Console.WriteLine("eq.alpha.diff=" + (bAlpha.Value == a2));
+        Console.WriteLine("is.alpha.a=" + bAlpha.Matches(a2));
+        Console.WriteLine("is.alpha.b=" + bAlpha.Matches(b1));
+        Console.WriteLine("is.beta.b=" + bBeta.Matches(b1));
+        Console.WriteLine("is.beta.a=" + bBeta.Matches(a1));
+
+        // Array & List round-trip parity
+        Console.WriteLine("rt.int=" + bInt.RoundTripArray() + "|list=" + bInt.Items[0]);
+        Pair rp = bPair.RoundTripArray();
+        Console.WriteLine("rt.pair=" + rp.A + "," + rp.B + "|list=" + bPair.Items[0].A);
+        Console.WriteLine("rt.alpha=" + bAlpha.RoundTripArray().Tag() + "|list=" + bAlpha.Items[0].Tag());
+        Console.WriteLine("rt.beta=" + bBeta.RoundTripArray().Tag() + "|list=" + bBeta.Items[0].Tag());
+        Console.WriteLine("rt.iface=" + bIface.RoundTripArray().Tag());
+
+        // Generic method dispatch & reflection metadata parity
+        Console.WriteLine("fn.int=" + DescribeGeneric<int>(1));
+        Console.WriteLine("fn.alpha=" + DescribeGeneric<Alpha>(a1));
+        Console.WriteLine("fn.beta=" + DescribeGeneric<Beta>(b1));
+        Console.WriteLine("refl.alpha=" + a1.GetType().Name + "|fields=" + bAlpha.TypeFieldCount() + "|f0=" + typeof(Alpha).GetFieldName(0));
+        Console.WriteLine("refl.beta=" + b1.GetType().Name + "|fields=" + bBeta.TypeFieldCount() + "|f0=" + typeof(Beta).GetFieldName(0));
+        Console.WriteLine("refl.pair=" + typeof(Pair).Name + "|fields=" + bPair.TypeFieldCount() + "|f0=" + typeof(Pair).GetFieldName(0));
+        Console.WriteLine("defarr.int=" + bInt.DefaultArrayElem() + "|alpha.null=" + (bAlpha.DefaultArrayElem() == null));
+    }
+}

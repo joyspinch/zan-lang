@@ -287,10 +287,10 @@ debug 下每帧检查。配合**机器人模糊测试**：无头仿真以千倍�
 
 | 编号 | 能力 | 说明 |
 |---|---|---|
-| S30 | 语义规范补全 | SPEC 补写：ARC（参数借用/持有、返回值所有权、闭包捕获、`weak` 置空时机、RC 原子性、析构顺序、异常展开释放）、async（状态机字段生命周期、`await` 前后持有关系、取消语义）、泛型（单态化与擦除两条路径各自保证什么） |
-| S31 | 规则锚定用例 | SPEC 每条规则链接一个 conformance 用例；诊断（S1）反向链接规则 |
-| S32 | 泛型双路径差分 | 同一泛型代码分别以值类型/引用类型实例化，比对 `typeof(T)`、静态字段、默认值、相等性、反射结果 |
-| S33 | 跨平台一致性矩阵 | 同一批 conformance 用例在 Windows / Linux / macOS 输出逐字节一致；平台能力缺失时链接期报错，不静默降级 |
+| S30 | 语义规范补全（已落地） | `docs/SPEC.md` 与 `docs/SPEC.zh-CN.md` 同步补齐形式化规则：ARC（`SPEC-ARC-01..07`：参数借用/持有、返回值/临时量、闭包/弱 `this` 捕获、RC 原子性与 `ZAN_RC_IMMORTAL`、`weak` 先置空再按声明序释放与禁用 `~X()`、异常展开与 `using`、W2111 环检与 `--check-leaks`）、async（`SPEC-ASYNC-01..04`：协程帧/ANF、`await` 前后持有、跨 `await` 异常与 `finally`、原子取消与 `CancellationToken`）、泛型（`SPEC-GEN-01..04`：单态化与 `$__Canon`+`__gctx` 双路径保证） |
+| S31 | 规则锚定用例（已落地） | 规范每条 `[rule:SPEC-*]` 规则链接 conformance / reject 用例及对应诊断码（`E1016`/`W2111`），由 `scripts/check_spec_anchors.py` + `tests/test_spec_anchors.py` 机检存在性、期望文件、诊断一致性与中英零漂移（`--json` 导出规则与诊断反查表） |
+| S32 | 泛型双路径差分（已落地） | `tests/conformance/generic_dual_path_matrix.{zan,out}` 以同一泛型容器/函数同时覆盖单态化（`int`/`double`/`bool`/`struct`/`string`/重载 `==` 类）与 `$__Canon`+`__gctx`（普通引用类、接口），比对 `typeof(T)`、静态字段隔离、默认零值、相等性、`is`/`as` 与反射结果（已入 `tests/selfhost/diff_cases.txt`） |
+| S33 | 跨平台一致性矩阵（已落地） | `tests/cross_platform_matrix.txt`（覆盖全部独立 SPEC 锚定用例与数值/LINQ 不变量）由 `scripts/run_cross_platform_matrix.py` + `tests/test_cross_platform_matrix.py` 执行并产出平台 SHA-256 清单，CI `cross-platform-parity` 汇合比对 Windows / Linux / macOS 逐字节一致；同时探针机检缺失原生 `[DllImport]` 能力时于链接期报错，不静默降级 |
 
 ---
 

@@ -250,7 +250,12 @@ T Max<T>(T a, T b) where T : struct {
 
 **Constraint types:** `where T : struct`（值类型）、`where T : BaseClass`（基类）、`where T : IInterface`（接口）。
 
-**Implementation:** Generics are monomorphized for value types (separate code per type) and use type erasure with virtual dispatch for reference types.
+#### 3.4.1 Dual-Path Compilation & Semantic Guarantees (S30 / S32)
+
+- **`[rule:SPEC-GEN-01]` Monomorphization vs `__Canon` sharing:** Value types (`int`, `double`, `bool`, `struct`, `enum`, `Nullable<T>`), `string`, `Task<T>`/`ValueTask<T>`, `Binding<T>`, and classes that overload `==`/`!=` are monomorphized into specialized layouts and code per type argument. Plain reference classes without `==`/`!=` overloads, `object`, and interfaces share canonicalized `$__Canon` code paired with a per-instantiation `__gctx` runtime dictionary when the generic body contains no unconstrained duck-typed member/operator access on type parameters. *(Anchors: `tests/conformance/generic_dual_path_matrix.zan`, `tests/conformance/generic_canon_gctx.zan`)*
+- **`[rule:SPEC-GEN-02]` Concrete type identity & reflection parity:** Both compilation paths preserve exact concrete type identity: `typeof(T)`, `is T`, `as T`, `(T)x`, and `TypeInfo` queries (`typeof(T).Name`, `typeof(T).FieldCount`) resolve to the concrete type argument (via `__gctx` under `$__Canon`), never to an erased placeholder. *(Anchors: `tests/conformance/generic_dual_path_matrix.zan`, `tests/conformance/generic_canon_gctx.zan`)*
+- **`[rule:SPEC-GEN-03]` Static field isolation & default values:** Static fields on generic types (`Box<T>.Counter`) have distinct storage per concrete instantiation across both monomorphized and `$__Canon` paths (`Box<Alpha>.Counter` and `Box<Beta>.Counter` do not alias). Uninitialized fields and array elements of type `T` are zero-initialized (`0`, `false`, zeroed struct for value types; `null` for reference types; Zan does not provide a `default(T)` expression syntax). *(Anchors: `tests/conformance/generic_dual_path_matrix.zan`, `tests/conformance/generic_statics.zan`)*
+- **`[rule:SPEC-GEN-04]` Constraints & virtual dispatch:** Generic constraints (`struct`, base class, interface) are checked at instantiation time; virtual/interface dispatch on generic classes routes through per-instantiation vtables when overridden bodies depend on `T`. *(Anchors: `tests/conformance/generic_constraints.zan`, `tests/conformance/generic_virtual_dispatch.zan`)*
 
 ---
 
@@ -617,6 +622,17 @@ Collection types (`List<T>`, `Dictionary<K,V>`, arrays) are reference types as
 well: assignment aliases the same storage, so adds, removes and element writes
 through one variable are visible through every alias -- identical to C#. There
 is no copy-on-write collection mode (locked by `cs_list_aliasing`).
+
+### 6.2.1 Formal ARC Ownership & Runtime Rules (S30)
+
+- **`[rule:SPEC-ARC-01]` Parameter ownership (borrow vs callee-retain):** Arguments are passed borrowed at the call boundary. The callee retains ARC-managed by-value parameters into its local slot and releases them on scope exit (unless elided by borrow analysis for read-only non-escaping parameters); `ref`/`out` parameters alias the caller's storage directly without an extra retain/release pair. *(Anchors: `tests/conformance/arc_local_alias_borrow.zan`, `tests/conformance/arc_lookup_owned_arg.zan`)*
+- **`[rule:SPEC-ARC-02]` Return ownership & temporary lifetime:** Functions returning an ARC-managed reference transfer a `+1` owned reference to the caller. Discarded return values and intermediate expression temporaries are retained/armed for cleanup and released deterministically at the enclosing statement boundary. *(Anchors: `tests/conformance/arc_chained_temp.zan`)*
+- **`[rule:SPEC-ARC-03]` Closure capture ownership:** Lambdas retain captured reference values in their closure environment and box mutated captured locals into ARC-managed heap cells. For `+=` event subscriptions whose target is rooted at `this`, a lambda referencing `this` captures `this` weakly so the subscriber's release is not blocked by the subscription. *(Anchors: `tests/conformance/event_weak_this.zan`)*
+- **`[rule:SPEC-ARC-04]` Refcount atomicity & immortal sentinel:** `retain` performs an atomic `monotonic` check against the `ZAN_RC_IMMORTAL` sentinel (skipping writes on static/literal strings and constants) followed by `atomicrmw add monotonic`. `release` performs `atomicrmw sub release` and issues an `acquire` fence when the count transitions `1 -> 0` before teardown (when no debug guard or trace is active and the global weak table is empty, an observed `rc == 1` takes a direct unique-owner teardown fast path). *(Anchors: `tests/conformance/arc_immortal_object_slot.zan`)*
+- **`[rule:SPEC-ARC-05]` Weak zeroing timing, teardown order & no destructors:** On `rc == 0` after the `acquire` fence, `zan_rt_weak_destroy_begin` atomically zeroes all weak slots referencing the object (and aborts teardown if a concurrent weak load revived `rc`) **before** any instance fields are released. Fields are then released in declaration order (`weak` fields unregister; strong fields decrement), with a thread-local deferred release depth (`__zan_arc_rel_depth`) draining deep object graphs iteratively to prevent stack overflow. User destructors (`~X()`) are rejected at compile time with `E1016`. *(Anchors: `tests/conformance/weak_field_lifecycle.zan`, `tests/conformance/arc_deep_tree_drop.zan`, `tests/conformance/arc_deferred_stack.zan`, `tests/selfhost/reject/destructor_declaration.zan`)*
+- **`[rule:SPEC-ARC-06]` Exception unwind & `using` cleanup:** When an exception unwinds a frame, all armed local variables, temporaries, `finally` blocks, and `using` `Dispose()` hooks execute deterministically in reverse lexical order before control transfers to the matching handler. *(Anchors: `tests/conformance/arc_eh_concat_throw.zan`, `tests/conformance/cs_b02_using.zan`)*
+- **`[rule:SPEC-ARC-07]` Cycle lint & exit leak diagnostics:** Strong class-to-class reference cycles in user code emit compile-time warning `W2111` with a `weak` fix-it; runtime `--check-leaks` reports surviving allocations and traces orphan reference cycles at exit (`GC.CollectCycles` is an explicit fallback API, not a background collector). *(Anchors: `tests/conformance/closure_cycle_warning.zan`, `tests/conformance/gc_cycle_detector.zan`)*
+
 ### 6.3 ARC Optimizations
 
 The compiler applies several optimizations to minimize ARC overhead:
@@ -691,6 +707,19 @@ NativeMemory.Free(ptr);
 ```
 
 `unsafe { }` 块与 `fixed (T name = expr)` 语句是合法语法（`fixed` 仅作作用域别名，无 GC 需要固定），但原生访问仍走 `nint`。
+
+### 6.6 Async / Await & Coroutine Semantics (S30)
+
+An `async` method returning `Task` / `Task<T>` (or `ValueTask` / `ValueTask<T>`, desugared to `Task`) compiles to a heap-allocated state-machine coroutine frame driven by a resume function and cooperative scheduler.
+
+- **`[rule:SPEC-ASYNC-01]` Coroutine frame layout & ANF suspension:** Parameters and local variables live across an `await` boundary are stored in the coroutine heap frame. Sub-expressions and computed receivers evaluated before an `await` are normalized (ANF-hoisted) into frame slots so evaluation order and ARC liveness survive suspension; boxed closure cells reload their cell address after each resume, and return values write to the frame's typed `RVAL` slot. *(Anchors: `tests/conformance/async_frame_storage.zan`, `tests/conformance/async_var_locals_across_await.zan`, `tests/conformance/async_boxed_local_release.zan`, `tests/conformance/async_receiver_temp.zan`)*
+- **`[rule:SPEC-ASYNC-02]` Pre-/post-`await` ownership & completion release:** The coroutine frame owns its retained parameter/local slots across all suspension points and releases every armed slot upon normal completion, fault, or cancellation. Completing an `await` transfers the awaited task's `+1` owned result to the awaiter. *(Anchors: `tests/conformance/async_spawn_result_release.zan`, `tests/conformance/async_frame_storage.zan`)*
+- **`[rule:SPEC-ASYNC-03]` Exception propagation & `finally` across `await`:** Each resume arms its exception handler and unarms it on suspension. Unhandled exceptions store the fault on the task and rethrow when awaited; `try`/`catch`/`finally` blocks enclosing an `await` run cleanup deterministically before completing or rethrowing. *(Anchors: `tests/conformance/async_await_exception_finally.zan`, `tests/conformance/async_throw_across_frames.zan`)*
+- **`[rule:SPEC-ASYNC-04]` Cancellation semantics:** The coroutine frame's cancellation flag is loaded with atomic `acquire` at suspension/check points and deferred while executing inside a `finally` or catch-cleanup region so cleanup completes before exiting. `CancellationToken` provides cooperative cancellation via `IsCancellationRequested`, `ThrowIfCancellationRequested()`, and non-blocking multi-waiter `WaitHandle()`. *(Anchors: `tests/conformance/async_cancel.zan`, `tests/conformance/cancellation_token_lifecycle.zan`)*
+
+### 6.7 Cross-Platform Consistency & Fail-Closed Capabilities (S33)
+
+- **`[rule:SPEC-PLAT-01]` Cross-OS byte-identical conformance & link-time capability failure:** Every case in `tests/cross_platform_matrix.txt` (covering all standalone SPEC-anchored conformance tests plus IEEE-754/numeric/LINQ invariants) must produce byte-identical LF-normalized stdout across Windows, Linux, and macOS (verified by `scripts/run_cross_platform_matrix.py` and the CI `cross-platform-parity` join job). When a target platform lacks a required native `[DllImport]` or runtime capability, linking fails closed with a linker/driver error rather than silently degrading at runtime. *(Anchors: `tests/conformance/generic_dual_path_matrix.zan`, `tests/conformance/double_format.zan`, `tests/conformance/float_nan_compare.zan`)*
 
 ---
 

@@ -168,7 +168,7 @@ partial class Irgen {
     // A struct-typed field holds a pointer to a nested instance. Every
     // instance therefore needs its nested instances allocated (zeroed) --
     // otherwise writing a nested field dereferences a null pointer.
-    void InitNestedFields(string obj, Node decl) {
+    void InitNestedFields(string obj, Node decl, Node instTy = null) {
         if (decl == null) { return; }
         if (decl.kind == AK.StructDecl() && decl.layoutExplicit) { return; }
         List<string> names = new List<string>();
@@ -177,15 +177,32 @@ partial class Irgen {
         int fb = FieldBase(decl);
         int i = 0;
         while (i < types.Count) {
-            if (IsStructTy(types[i])) {
-                string cn = types[i].sval;
+            Node rawTy = types[i];
+            Node fty = rawTy;
+            bool erasedSlot = false;
+            if (instTy != null && instTy.kids.Count > 0 && rawTy != null && MentionsTypeParam(rawTy)) {
+                fty = SubstRecvTy(rawTy, instTy);
+                string savedScope = typeScopeCls;
+                typeScopeCls = decl.sval;
+                string physLt = MapType(rawTy);
+                typeScopeCls = savedScope;
+                if (physLt == "i64") { erasedSlot = true; }
+            }
+            if (IsStructTy(fty)) {
+                string cn = fty.sval;
                 string sub = AllocStructObj(cn);
-                string lt = MapType(types[i]);
+                string lt = MapType(fty);
                 string p = NT();
                 L("  " + p + " = getelementptr %" + decl.sval + ", %" + decl.sval + "* " + obj + ", i32 0, i32 " + (fb + i));
-                L("  store " + lt + " " + sub + ", " + lt + "* " + p);
+                if (erasedSlot) {
+                    string iv = NT();
+                    L("  " + iv + " = ptrtoint " + lt + " " + sub + " to i64");
+                    L("  store i64 " + iv + ", i64* " + p);
+                } else {
+                    L("  store " + lt + " " + sub + ", " + lt + "* " + p);
+                }
                 Node ndecl = binder.FindType(cn);
-                InitNestedFields(sub, ndecl);
+                InitNestedFields(sub, ndecl, fty);
             }
             i = i + 1;
         }
