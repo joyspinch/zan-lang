@@ -93,14 +93,6 @@
 改了关卡布局、移动、跳跃或视角参数导致回放分叉时，按 `packages/Zan.Game/src/Game/Foundation/README.md`
 重新录制。
 
-## 已知缺口（模板内绕行，待包/驱动修复）
-
-- **macOS GL 后端 3D 上下颠倒**：Render3D 的输出在 macOS 上整帧上下翻转（HUD 正常；改造前的截图里同样如此）。
-  `FpsScene.FlipWorkaround()` 在 macOS 上把世界、相机、光源沿 X 镜像并把相机倒挂来抵消；驱动修好后删掉即可，
-  `FPS3D_FLIP=0/1` 可强制关/开对照。GPU 后处理 Pass（曝光/ACES/暗角/泛光）默认关闭，`FPS3D_POST=1` 打开。
-- **`RenderPlan.Build` 复用池从不清空**：每帧把上一帧的绘制项再追加进池子，池子无限增长，可见项变多时同一
-  绘制项被重复取出、覆盖地面与建筑。`FpsScene.Render` 每帧新建一份计划绕开。
-
 ## 运行与编译
 
 在当前主仓根目录运行，直接编译模板原始源码，不复制模板树：

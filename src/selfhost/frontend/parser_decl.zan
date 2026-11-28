@@ -34,8 +34,13 @@ public partial class Parser {
         if (Eat(TK.Semicolon())) { return; } // file-scoped
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            int posBefore = pos;
             Node d = ParseTypeDecl();
             if (d != null) { unit.Add(d); }
+            if (pos == posBefore && !At(TK.RBrace()) && !At(TK.Eof())) {
+                RecordUnexpected();
+                SynchronizeTopLevel(true);
+            }
         }
         Expect(TK.RBrace());
         curNs = savedNs;
@@ -57,7 +62,15 @@ public partial class Parser {
         else if (k == TK.Enum()) { d = ParseEnum(mods); }
         else if (k == TK.Ident() && Cur().text == "delegate") { d = ParseDelegate(mods); }
         else if (k == TK.Ident() && Cur().text == "record" && K1() == TK.Ident()) { d = ParseRecord(); }
-        else { Next(); return null; } // unknown: skip token to make progress
+        else if (k == TK.Semicolon() && mods == 0 && (attributes == null || attributes.Count == 0)) {
+            Next();
+            return null;
+        }
+        else {
+            RecordUnexpected();
+            SynchronizeTopLevel(true);
+            return null;
+        }
         if (d != null && userFiles >= 0) { d.fromLib = FileIdxOfLine(declLine) >= userFiles; }
         if (d != null) {
             // nsresolve stamp: the declaring file's namespace and usings;
@@ -279,6 +292,7 @@ public partial class Parser {
         ParseWhereClauses(cls);
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            int posBefore = pos;
             Node m = ParseMember(cls.sval);
             if (m != null) {
                 if (m.kind == AK.MethodDecl()) {
@@ -289,6 +303,10 @@ public partial class Parser {
                 // multi-declarator fields: flatten extra FieldDecl kids
                 int fi = 0;
                 while (fi < m.kids.Count && m.kind == AK.FieldDecl()) { cls.Add(m.kids[fi]); fi = fi + 1; }
+            }
+            if (pos == posBefore && !At(TK.RBrace()) && !At(TK.Eof())) {
+                RecordUnexpected();
+                SynchronizeMember();
             }
         }
         Expect(TK.RBrace());
@@ -313,6 +331,9 @@ public partial class Parser {
         if (At(TK.Less())) {
             Next();
             while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.LBrace()) || At(TK.RBrace()) || At(TK.Colon()) || At(TK.Semicolon())) {
+                    break;
+                }
                 // 方差标记 `out T` 同 delegate 处：只消费标记本身，方差位
                 // 记进 TypeParam.ival（见彼处注释，B-ID63）。
                 long variance = 0;
@@ -323,8 +344,8 @@ public partial class Parser {
                     tp.ival = variance;
                     tp.sval = Next().text;
                     cls.Add(tp);
-                } else { Next(); }
-                Eat(TK.Comma());
+                } else { RecordUnexpected(); Next(); }
+                if (!Eat(TK.Comma())) { break; }
             }
             Expect(TK.Greater());
         }
@@ -356,8 +377,13 @@ public partial class Parser {
         Node prevCls = curClsNode;
         curClsNode = cls;
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            int posBefore = pos;
             Node m = ParseMember(cls.sval);
             AddMember(cls, m);
+            if (pos == posBefore && !At(TK.RBrace()) && !At(TK.Eof())) {
+                RecordUnexpected();
+                SynchronizeMember();
+            }
         }
         curClsNode = prevCls;
         Expect(TK.RBrace());
@@ -472,15 +498,19 @@ public partial class Parser {
         if (At(TK.Ident())) { en.sval = Next().text; }
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
-            Node mem = new Node(AK.EnumMember());
-            if (At(TK.Ident())) {
-                Token mt = Next();
-                mem.sval = mt.text;
-                mem.line = mt.line; mem.col = mt.col;
+            int posBefore = pos;
+            if (!At(TK.Ident())) {
+                RecordUnexpected();
+                if (!Eat(TK.Comma())) { Next(); }
+                continue;
             }
+            Node mem = new Node(AK.EnumMember());
+            Token mt = Next();
+            mem.sval = mt.text;
+            mem.line = mt.line; mem.col = mt.col;
             if (Eat(TK.Eq())) { mem.a = ParseExpr(); }
             en.Add(mem);
-            Eat(TK.Comma());
+            if (!Eat(TK.Comma()) && pos == posBefore) { Next(); }
         }
         Expect(TK.RBrace());
         return en;

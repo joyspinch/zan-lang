@@ -56,6 +56,10 @@ public partial class Parser {
         Expect(TK.LParen());
         bool first = true;
         while (!At(TK.RParen()) && !At(TK.Eof())) {
+            if (At(TK.LBrace()) || At(TK.RBrace()) || At(TK.Semicolon()) || At(TK.Arrow())) {
+                break;
+            }
+            int posBefore = pos;
             Node p = new Node(AK.Param());
             if (first && At(TK.This())) { Next(); fn.ival = 1; } // extension receiver
             // contextual `params` modifier: `params T[] rest`. The declared
@@ -72,6 +76,10 @@ public partial class Parser {
                 p.ival = metadataMode && Cur().text == "out" ? 2 : 1;
                 Next();
             }
+            if (!CanStartType(K())) {
+                RecordUnexpected();
+                break;
+            }
             // the parameter's own position: a diagnostic about it points at
             // the declared type
             Token pt0 = Cur();
@@ -81,7 +89,8 @@ public partial class Parser {
             if (Eat(TK.Eq())) { p.b = ParseExpr(); } // optional default value
             fn.Add(p);
             first = false;
-            if (!Eat(TK.Comma())) { }
+            if (!Eat(TK.Comma())) { break; }
+            if (pos == posBefore) { Next(); }
         }
         Expect(TK.RParen());
     }
@@ -101,6 +110,7 @@ public partial class Parser {
     // deferred code runs on return/break/continue out of the tail too
     void ParseBlockStmtsDefer(Node list) {
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            int posBefore = pos;
             if (K() == TK.Ident() && Cur().text == "defer") {
                 Next();
                 Node d = ParseStmt();
@@ -120,6 +130,10 @@ public partial class Parser {
             }
             Node s = ParseStmt();
             if (s != null) { list.Add(s); }
+            if (pos == posBefore && !At(TK.RBrace()) && !At(TK.Eof())) {
+                RecordUnexpected();
+                SynchronizeStmt();
+            }
         }
     }
 
@@ -357,11 +371,16 @@ public partial class Parser {
         d.sval = "__decon" + Convert.ToString(deconSeq);
         deconSeq = deconSeq + 1;
         while (!At(TK.RParen()) && !At(TK.Eof())) {
+            if (At(TK.Semicolon()) || At(TK.RBrace()) || At(TK.LBrace()) || At(TK.Eq())) {
+                break;
+            }
+            int posBefore = pos;
             Node p = new Node(AK.Param());
             if (LooksLikeTypedParam()) { p.type = ParseType(); }
             if (At(TK.Ident())) { p.sval = Next().text; }
             d.Add(p);
-            Eat(TK.Comma());
+            if (!Eat(TK.Comma())) { break; }
+            if (pos == posBefore) { Next(); }
         }
         Expect(TK.RParen());
         Expect(TK.Eq());
@@ -499,6 +518,7 @@ public partial class Parser {
         Expect(TK.RParen());
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            int caseBefore = pos;
             Node c = new Node(AK.SwitchCase());
             if (Eat(TK.Case())) {
                 if (At(TK.Null())) {
@@ -521,14 +541,21 @@ public partial class Parser {
                 Expect(TK.Colon());
             }
             else if (Eat(TK.Default())) { Expect(TK.Colon()); }
-            else { Next(); }
+            else { RecordUnexpected(); Next(); }
             Node body = new Node(AK.Block());
             while (!At(TK.Case()) && !At(TK.Default()) && !At(TK.RBrace()) && !At(TK.Eof())) {
+                int stmtBefore = pos;
                 Node s = ParseStmt();
                 if (s != null) { body.Add(s); }
+                if (pos == stmtBefore && !At(TK.Case()) && !At(TK.Default())
+                        && !At(TK.RBrace()) && !At(TK.Eof())) {
+                    RecordUnexpected();
+                    SynchronizeStmt();
+                }
             }
             c.b = body;
             n.Add(c);
+            if (pos == caseBefore && !At(TK.RBrace()) && !At(TK.Eof())) { Next(); }
         }
         Expect(TK.RBrace());
         return n;
