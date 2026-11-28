@@ -1,0 +1,189 @@
+using System;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 商业 3D 动作/平台角色运动控制参数（对标 Unreal CMC / Unity CharacterController + Celeste 跳跃手感）：
+// - 地面/空中分离加速度与最大速率、斜坡角度阈值（MaxSlopeCos）与陡坡滑落
+// - 土狼时间（CoyoteTime）离地宽限起跳 + 跳跃预输入缓冲（JumpBufferTime）
+// - 最大自动跨步台阶高度（MaxStepHeight）
+public class CharacterMotorConfig3D {
+    public float MaxRunSpeed;
+    public float GroundAcceleration;
+    public float AirAcceleration;
+    public float Gravity;
+    public float JumpSpeed;
+    public float CoyoteTime;
+    public float JumpBufferTime;
+    public float MaxSlopeCos;
+    public float SlideSpeed;
+    public float MaxStepHeight;
+
+    public CharacterMotorConfig3D() {
+        this.MaxRunSpeed = 6.0f;
+        this.GroundAcceleration = 40.0f;
+        this.AirAcceleration = 14.0f;
+        this.Gravity = 22.0f;
+        this.JumpSpeed = 8.5f;
+        this.CoyoteTime = 0.12f;
+        this.JumpBufferTime = 0.12f;
+        this.MaxSlopeCos = 0.7071f; // 约 45 度
+        this.SlideSpeed = 5.0f;
+        this.MaxStepHeight = 0.45f;
+    }
+}
+
+// 角色运行时状态快照。
+public class CharacterState3D {
+    public Vector3 Position;
+    public Vector3 Velocity;
+    public bool IsGrounded;
+    public bool IsSliding;
+    public float CoyoteTimer;
+    public float JumpBufferTimer;
+    public int JumpCount;
+
+    public CharacterState3D() {
+        this.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        this.Velocity = new Vector3(0.0f, 0.0f, 0.0f);
+        this.IsGrounded = false;
+        this.IsSliding = false;
+        this.CoyoteTimer = 0.0f;
+        this.JumpBufferTimer = 0.0f;
+        this.JumpCount = 0;
+    }
+}
+
+// 3D 角色运动控制器：支持斜坡贴地投影、陡坡下滑、土狼跳、预输入跳跃缓冲与台阶跨越判定。
+public class CharacterController3D {
+    public CharacterMotorConfig3D Config;
+    public CharacterState3D State;
+
+    public CharacterController3D(CharacterMotorConfig3D config) {
+        this.Config = config != null ? config : new CharacterMotorConfig3D();
+        this.State = new CharacterState3D();
+    }
+
+    // 记录一次跳跃按键输入（写入 JumpBufferTimer，允许提前触地起跳）。
+    public void QueueJump() {
+        this.State.JumpBufferTimer = this.Config.JumpBufferTime;
+    }
+
+    // 判定高度差 stepDelta 是否允许直接自动跨步上台阶。
+    public bool CanStepUp(float stepDelta) {
+        return stepDelta > 0.0f && stepDelta <= this.Config.MaxStepHeight;
+    }
+
+    // 执行一帧确定性运动步进：
+    // wishX/wishZ: 归一化平面移动意图；groundY: 当前脚下地面高度（无地面可传极小值）；
+    // groundNormal: 脚下法线（归一化）。
+    public void Step(float dt, float wishX, float wishZ, float groundY, Vector3 groundNormal) {
+        if (dt <= 0.0f) { return; }
+        CharacterMotorConfig3D cfg = this.Config;
+        CharacterState3D st = this.State;
+
+        // 1. 归一化输入并限速
+        float wishLen = (float)Math.Sqrt((double)(wishX * wishX + wishZ * wishZ));
+        float dirX = 0.0f;
+        float dirZ = 0.0f;
+        if (wishLen > 0.0001f) {
+            float scale = wishLen > 1.0f ? (1.0f / wishLen) : 1.0f;
+            dirX = wishX * scale;
+            dirZ = wishZ * scale;
+        }
+
+        // 2. 地面/坡度判定
+        bool nearGround = st.Position.Y <= groundY + 0.05f && st.Velocity.Y <= 0.05f;
+        bool walkableSlope = groundNormal.Y >= cfg.MaxSlopeCos;
+        if (nearGround && walkableSlope) {
+            st.IsGrounded = true;
+            st.IsSliding = false;
+            st.CoyoteTimer = cfg.CoyoteTime;
+            if (st.Position.Y < groundY) {
+                st.Position = new Vector3(st.Position.X, groundY, st.Position.Z);
+            }
+            if (st.Velocity.Y < 0.0f) {
+                st.Velocity = new Vector3(st.Velocity.X, 0.0f, st.Velocity.Z);
+            }
+        } else if (nearGround && !walkableSlope) {
+            // 陡坡：不可站稳，沿斜坡切线向下滑动
+            st.IsGrounded = false;
+            st.IsSliding = true;
+            st.CoyoteTimer = 0.0f;
+            float slopeHoriz = (float)Math.Sqrt((double)(groundNormal.X * groundNormal.X + groundNormal.Z * groundNormal.Z));
+            if (slopeHoriz > 0.0001f) {
+                float sx = (groundNormal.X / slopeHoriz) * cfg.SlideSpeed;
+                float sz = (groundNormal.Z / slopeHoriz) * cfg.SlideSpeed;
+                st.Velocity = new Vector3(sx, -cfg.SlideSpeed * 0.5f, sz);
+            }
+        } else {
+            st.IsGrounded = false;
+            st.IsSliding = false;
+            st.CoyoteTimer = st.CoyoteTimer - dt;
+            if (st.CoyoteTimer < 0.0f) { st.CoyoteTimer = 0.0f; }
+        }
+
+        // 3. 水平速度逼近（地面高响应、空中低控制）
+        if (!st.IsSliding) {
+            float targetVx = dirX * cfg.MaxRunSpeed;
+            float targetVz = dirZ * cfg.MaxRunSpeed;
+            float accel = st.IsGrounded ? cfg.GroundAcceleration : cfg.AirAcceleration;
+            float maxDelta = accel * dt;
+            float vx = MoveToward(st.Velocity.X, targetVx, maxDelta);
+            float vz = MoveToward(st.Velocity.Z, targetVz, maxDelta);
+            st.Velocity = new Vector3(vx, st.Velocity.Y, vz);
+        }
+
+        // 4. 跳跃消费（支持土狼时间 CoyoteTimer > 0 与预输入缓冲 JumpBufferTimer > 0）
+        if (st.JumpBufferTimer > 0.0f) {
+            if (st.IsGrounded || st.CoyoteTimer > 0.0f) {
+                st.Velocity = new Vector3(st.Velocity.X, cfg.JumpSpeed, st.Velocity.Z);
+                st.IsGrounded = false;
+                st.IsSliding = false;
+                st.CoyoteTimer = 0.0f;
+                st.JumpBufferTimer = 0.0f;
+                st.JumpCount = st.JumpCount + 1;
+            } else {
+                st.JumpBufferTimer = st.JumpBufferTimer - dt;
+                if (st.JumpBufferTimer < 0.0f) { st.JumpBufferTimer = 0.0f; }
+            }
+        }
+
+        // 5. 重力积分与位置推进
+        if (!st.IsGrounded) {
+            st.Velocity = new Vector3(st.Velocity.X, st.Velocity.Y - cfg.Gravity * dt, st.Velocity.Z);
+        }
+
+        float nx = st.Position.X + st.Velocity.X * dt;
+        float ny = st.Position.Y + st.Velocity.Y * dt;
+        float nz = st.Position.Z + st.Velocity.Z * dt;
+
+        // 落地夹紧（支持自动跨步或平地着陆）
+        if (ny < groundY && st.Velocity.Y <= 0.0f) {
+            float stepH = groundY - st.Position.Y;
+            if (walkableSlope && (stepH <= 0.0f || this.CanStepUp(stepH))) {
+                ny = groundY;
+                st.Velocity = new Vector3(st.Velocity.X, 0.0f, st.Velocity.Z);
+                st.IsGrounded = true;
+                st.CoyoteTimer = cfg.CoyoteTime;
+                // 着陆瞬间若有跳跃预输入则立即起跳
+                if (st.JumpBufferTimer > 0.0f) {
+                    st.Velocity = new Vector3(st.Velocity.X, cfg.JumpSpeed, st.Velocity.Z);
+                    st.IsGrounded = false;
+                    st.CoyoteTimer = 0.0f;
+                    st.JumpBufferTimer = 0.0f;
+                    st.JumpCount = st.JumpCount + 1;
+                }
+            }
+        }
+
+        st.Position = new Vector3(nx, ny, nz);
+    }
+
+    private static float MoveToward(float current, float target, float maxDelta) {
+        float diff = target - current;
+        if (diff > maxDelta) { return current + maxDelta; }
+        if (diff < -maxDelta) { return current - maxDelta; }
+        return target;
+    }
+}

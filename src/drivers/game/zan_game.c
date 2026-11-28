@@ -149,6 +149,7 @@ typedef struct {
     zgl_int u_triplanar, u_height_fog_params, u_height_fog_color, u_hit_flash;
     zgl_int u_holo_scan_params, u_holo_scan_color;
     zgl_int u_top_cover_params, u_top_cover_color;
+    zgl_int u_wind_params;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -164,6 +165,7 @@ typedef struct {
     zgl_int u_light_vp;
     zgl_int u_model;
     zgl_int u_bones;
+    zgl_int u_wind_params;
 } zan_game_shadow_program;
 
 #define ZAN_GAME_LOC_POS 0
@@ -226,12 +228,14 @@ static float g_game_holo_scan_params[4] = { 0.0f, 12.0f, 0.0f, 0.0f }; /* enable
 static float g_game_holo_scan_color[3] = { 0.0f, 0.9f, 1.0f };
 static float g_game_top_cover_params[4] = { 0.0f, 0.5f, 0.25f, 0.0f }; /* enabled, threshold, sharpness, amount */
 static float g_game_top_cover_color[3] = { 0.95f, 0.97f, 1.0f };
+static float g_game_wind_params[4] = { 0.0f, 1.5f, 0.0f, 1.0f }; /* amplitude, freq, phase, height_scale */
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
 static float g_game_post_film[3] = { 0.0f, 0.0f, 0.0f }; /* sharpen, grain, seed */
 static float g_game_post_cinema[4] = { 0.0f, 0.0f, 16.0f, 0.0f }; /* letterbox, amp, freq, phase */
 static float g_game_post_radial_blur[3] = { 0.0f, 0.5f, 0.5f }; /* strength, cx, cy */
+static float g_game_post_pixelate[2] = { 0.0f, 0.0f }; /* pixel_size, posterize_levels */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -310,17 +314,25 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
 "uniform vec4 uUvTransform;\n"
+"uniform vec4 uWindParams;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
 "out vec4 v_light_pos;\n"
 "void main() {\n"
-"    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    vec4 wp = uModel * vec4(lp, 1.0);\n"
 "    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
-"    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
+"    vec4 clip = uMVP * vec4(lp, 1.0);\n"
 "    gl_Position = clip;\n"
 "}\n";
 
@@ -333,19 +345,27 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
 "uniform vec4 uUvTransform;\n"
+"uniform vec4 uWindParams;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
 "out vec4 v_color;\n"
 "out vec4 v_light_pos;\n"
 "void main() {\n"
-"    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    vec4 wp = uModel * vec4(lp, 1.0);\n"
 "    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_color = a_color;\n"
 "    v_light_pos = uLightVP * wp;\n"
-"    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
+"    vec4 clip = uMVP * vec4(lp, 1.0);\n"
 "    gl_Position = clip;\n"
 "}\n";
 
@@ -359,6 +379,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
 "uniform vec4 uUvTransform;\n"
+"uniform vec4 uWindParams;\n"
 "uniform mat4 uBones[64];\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
@@ -372,6 +393,12 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "           uBones[ji.z] * a_weights.z + uBones[ji.w] * a_weights.w)\n"
 "        : mat4(1.0);\n"
 "    vec4 sp = skin * vec4(a_pos, 1.0);\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(sp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + sp.x * uWindParams.y + sp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        sp.x += ww;\n"
+"        sp.z += ww * 0.35;\n"
+"    }\n"
 "    vec3 sn = normalize(mat3(skin) * a_normal);\n"
 "    vec4 wp = uModel * sp;\n"
 "    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
@@ -386,8 +413,16 @@ static const char *const ZAN_GAME_3D_VS_SHADOW =
 "layout(location = 0) in vec3 a_pos;\n"
 "uniform mat4 uLightVP;\n"
 "uniform mat4 uModel;\n"
+"uniform vec4 uWindParams;\n"
 "void main() {\n"
-"    gl_Position = uLightVP * (uModel * vec4(a_pos, 1.0));\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    gl_Position = uLightVP * (uModel * vec4(lp, 1.0));\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_SHADOW_SKINNED =
@@ -799,6 +834,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostFilm;\n"
 "uniform vec4 uPostCinema;\n"
 "uniform vec3 uPostRadialBlur;\n"
+"uniform vec2 uPostPixelate;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -811,6 +847,10 @@ static const char *const ZAN_GAME_POST_FS =
 "    if (uPostCinema.y > 0.0001) {\n"
 "        float wOff = sin(uv.y * uPostCinema.z + uPostCinema.w) * uPostCinema.y;\n"
 "        uv = clamp(vec2(uv.x + wOff, uv.y), vec2(0.0), vec2(1.0));\n"
+"    }\n"
+"    if (uPostPixelate.x >= 1.5) {\n"
+"        vec2 stepUv = uTexelSize * uPostPixelate.x;\n"
+"        uv = clamp((floor(uv / stepUv) + vec2(0.5)) * stepUv, vec2(0.0), vec2(1.0));\n"
 "    }\n"
 "    vec4 src = texture(uScene, uv);\n"
 "    vec3 col = src.rgb;\n"
@@ -898,6 +938,10 @@ static const char *const ZAN_GAME_POST_FS =
     "        float gNoise = fract(sin(dot(v_uv * 1024.0 + vec2(uPostFilm.z * 17.3, uPostFilm.z * 31.7), vec2(12.9898, 78.233))) * 43758.5453);\n"
     "        col += vec3((gNoise - 0.5) * uPostFilm.y);\n"
     "    }\n"
+    "    if (uPostPixelate.y >= 2.0) {\n"
+    "        float lv = floor(uPostPixelate.y) - 1.0;\n"
+    "        col = floor(clamp(col, 0.0, 1.0) * lv + 0.5) / lv;\n"
+    "    }\n"
     "    if (uPostCinema.x > 0.0005) {\n"
     "        if (v_uv.y < uPostCinema.x || v_uv.y > (1.0 - uPostCinema.x)) {\n"
     "            col = vec3(0.0);\n"
@@ -920,6 +964,7 @@ typedef struct {
     zgl_int u_post_film;
     zgl_int u_post_cinema;
     zgl_int u_post_radial_blur;
+    zgl_int u_post_pixelate;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1167,6 +1212,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uTopCoverParams");
     zgl_int top_cover_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uTopCoverColor");
+    zgl_int wind_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uWindParams");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1241,6 +1288,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_holo_scan_color = holo_scan_color;
     prog->u_top_cover_params = top_cover_params;
     prog->u_top_cover_color = top_cover_color;
+    prog->u_wind_params = wind_params;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1312,6 +1360,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int holo_scan_color = g_game_gl->GetUniformLocation(program, "uHoloScanColor");
     zgl_int top_cover_params = g_game_gl->GetUniformLocation(program, "uTopCoverParams");
     zgl_int top_cover_color = g_game_gl->GetUniformLocation(program, "uTopCoverColor");
+    zgl_int wind_params = g_game_gl->GetUniformLocation(program, "uWindParams");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1374,6 +1423,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_holo_scan_color = holo_scan_color;
     g_game_skin_prog.u_top_cover_params = top_cover_params;
     g_game_skin_prog.u_top_cover_color = top_cover_color;
+    g_game_skin_prog.u_wind_params = wind_params;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1411,6 +1461,7 @@ static zan_game_shadow_program *zan_game_shadow_program_get(void) {
     zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
     zgl_int light_vp = g_game_gl->GetUniformLocation(program, "uLightVP");
     zgl_int model = g_game_gl->GetUniformLocation(program, "uModel");
+    zgl_int wind_params = g_game_gl->GetUniformLocation(program, "uWindParams");
     if (pos != ZAN_GAME_LOC_POS || light_vp < 0 || model < 0 ||
         g_game_gl->GetError() != ZGL_NO_ERROR) {
         g_game_gl->DeleteProgram(program);
@@ -1420,6 +1471,7 @@ static zan_game_shadow_program *zan_game_shadow_program_get(void) {
     g_game_shadow_prog.u_light_vp = light_vp;
     g_game_shadow_prog.u_model = model;
     g_game_shadow_prog.u_bones = -1;
+    g_game_shadow_prog.u_wind_params = wind_params;
     return &g_game_shadow_prog;
 }
 
@@ -1843,6 +1895,11 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_top_cover_color >= 0) {
         gl->Uniform3fv(prog->u_top_cover_color, 1, g_game_top_cover_color);
     }
+    if (prog->u_wind_params >= 0) {
+        gl->Uniform4f(prog->u_wind_params,
+            g_game_wind_params[0], g_game_wind_params[1],
+            g_game_wind_params[2], g_game_wind_params[3]);
+    }
 }
 
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
@@ -2198,6 +2255,11 @@ ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh_id,
     gl->UseProgram(prog->program);
     gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
     gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE, model);
+    if (prog->u_wind_params >= 0) {
+        gl->Uniform4f(prog->u_wind_params,
+            g_game_wind_params[0], g_game_wind_params[1],
+            g_game_wind_params[2], g_game_wind_params[3]);
+    }
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
@@ -2411,6 +2473,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_film = g_game_gl->GetUniformLocation(prog, "uPostFilm");
     g_game_post_prog.u_post_cinema = g_game_gl->GetUniformLocation(prog, "uPostCinema");
     g_game_post_prog.u_post_radial_blur = g_game_gl->GetUniformLocation(prog, "uPostRadialBlur");
+    g_game_post_prog.u_post_pixelate = g_game_gl->GetUniformLocation(prog, "uPostPixelate");
     return &g_game_post_prog;
 }
 
@@ -2524,6 +2587,9 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_radial_blur >= 0) {
         gl->Uniform3fv(prog->u_post_radial_blur, 1, g_game_post_radial_blur);
+    }
+    if (prog->u_post_pixelate >= 0) {
+        gl->Uniform2f(prog->u_post_pixelate, g_game_post_pixelate[0], g_game_post_pixelate[1]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -2850,4 +2916,27 @@ ZAN_GAME_API void zan_game_set_post_radial_blur3d(float strength,
     g_game_post_radial_blur[0] = strength;
     g_game_post_radial_blur[1] = center_x;
     g_game_post_radial_blur[2] = center_y;
+}
+
+ZAN_GAME_API void zan_game_set_wind_sway3d(int32_t enabled, float amplitude,
+    float freq, float phase, float height_scale) {
+    if (!enabled || amplitude <= 0.0f) {
+        g_game_wind_params[0] = 0.0f;
+        return;
+    }
+    if (amplitude > 2.0f) amplitude = 2.0f;
+    g_game_wind_params[0] = amplitude;
+    g_game_wind_params[1] = freq > 0.0f ? freq : 1.5f;
+    g_game_wind_params[2] = phase;
+    g_game_wind_params[3] = height_scale > 0.0f ? height_scale : 1.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
+    float posterize_levels) {
+    if (pixel_size < 0.0f) pixel_size = 0.0f;
+    if (pixel_size > 64.0f) pixel_size = 64.0f;
+    if (posterize_levels < 0.0f) posterize_levels = 0.0f;
+    if (posterize_levels > 64.0f) posterize_levels = 64.0f;
+    g_game_post_pixelate[0] = pixel_size;
+    g_game_post_pixelate[1] = posterize_levels;
 }

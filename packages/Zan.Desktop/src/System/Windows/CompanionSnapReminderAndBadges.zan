@@ -1,0 +1,264 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌面伴侣窗体磁吸停靠边缘类型。
+public enum SnapEdgeKind {
+    None = 0,
+    Left = 1,
+    Right = 2,
+    Top = 3,
+    Bottom = 4
+}
+
+// 单个显示器可用工作区矩形（扣除任务栏区域）。
+public class ScreenWorkArea {
+    public int MonitorIndex;
+    public int Left;
+    public int Top;
+    public int Width;
+    public int Height;
+
+    public ScreenWorkArea(int monitorIndex, int left, int top, int width, int height) {
+        this.MonitorIndex = monitorIndex;
+        this.Left = left;
+        this.Top = top;
+        this.Width = width > 0 ? width : 1920;
+        this.Height = height > 0 ? height : 1080;
+    }
+
+    public int Right() { return this.Left + this.Width; }
+    public int Bottom() { return this.Top + this.Height; }
+}
+
+// 磁吸与工作区钳制结算结果。
+public class SnapPointResult {
+    public int X;
+    public int Y;
+    public int MonitorIndex;
+    public SnapEdgeKind HorizontalEdge;
+    public SnapEdgeKind VerticalEdge;
+
+    public SnapPointResult(int x, int y, int monitorIndex, SnapEdgeKind hEdge, SnapEdgeKind vEdge) {
+        this.X = x;
+        this.Y = y;
+        this.MonitorIndex = monitorIndex;
+        this.HorizontalEdge = hEdge;
+        this.VerticalEdge = vEdge;
+    }
+}
+
+// 商业桌面陪伴多屏边缘磁吸停靠与防出界布局器：
+// - 自动定位窗体中心所在显示器工作区（越界时回落至最近显示器）
+// - 在 SnapMargin 阈值内磁吸至工作区左/右/顶/底边，防止桌宠被拖出屏幕丢失
+public class CompanionScreenSnapLayout {
+    public int SnapMargin;
+    private List<ScreenWorkArea> monitors;
+
+    public CompanionScreenSnapLayout(int snapMargin) {
+        this.SnapMargin = snapMargin >= 0 ? snapMargin : 24;
+        this.monitors = new List<ScreenWorkArea>();
+    }
+
+    public void AddMonitor(ScreenWorkArea area) {
+        if (area != null) { this.monitors.Add(area); }
+    }
+
+    private ScreenWorkArea PickMonitor(int cx, int cy) {
+        if (this.monitors.Count == 0) { return new ScreenWorkArea(0, 0, 0, 1920, 1080); }
+        for (int i = 0; i < this.monitors.Count; i = i + 1) {
+            ScreenWorkArea m = this.monitors[i];
+            if (cx >= m.Left && cx < m.Right() && cy >= m.Top && cy < m.Bottom()) {
+                return m;
+            }
+        }
+        ScreenWorkArea best = this.monitors[0];
+        long bestDistSq = 9223372036854775807L;
+        for (int i = 0; i < this.monitors.Count; i = i + 1) {
+            ScreenWorkArea m = this.monitors[i];
+            int clampedX = cx < m.Left ? m.Left : (cx > m.Right() ? m.Right() : cx);
+            int clampedY = cy < m.Top ? m.Top : (cy > m.Bottom() ? m.Bottom() : cy);
+            long dx = (long)(cx - clampedX);
+            long dy = (long)(cy - clampedY);
+            long d2 = dx * dx + dy * dy;
+            if (d2 < bestDistSq) {
+                bestDistSq = d2;
+                best = m;
+            }
+        }
+        return best;
+    }
+
+    public SnapPointResult ResolvePosition(int rawX, int rawY, int winW, int winH) {
+        int cx = rawX + winW / 2;
+        int cy = rawY + winH / 2;
+        ScreenWorkArea m = this.PickMonitor(cx, cy);
+
+        int maxX = m.Right() - winW;
+        if (maxX < m.Left) { maxX = m.Left; }
+        int maxY = m.Bottom() - winH;
+        if (maxY < m.Top) { maxY = m.Top; }
+
+        int x = rawX;
+        if (x < m.Left) { x = m.Left; }
+        if (x > maxX) { x = maxX; }
+        int y = rawY;
+        if (y < m.Top) { y = m.Top; }
+        if (y > maxY) { y = maxY; }
+
+        SnapEdgeKind hEdge = SnapEdgeKind.None;
+        if (x - m.Left <= this.SnapMargin) {
+            x = m.Left;
+            hEdge = SnapEdgeKind.Left;
+        } else if (maxX - x <= this.SnapMargin) {
+            x = maxX;
+            hEdge = SnapEdgeKind.Right;
+        }
+
+        SnapEdgeKind vEdge = SnapEdgeKind.None;
+        if (y - m.Top <= this.SnapMargin) {
+            y = m.Top;
+            vEdge = SnapEdgeKind.Top;
+        } else if (maxY - y <= this.SnapMargin) {
+            y = maxY;
+            vEdge = SnapEdgeKind.Bottom;
+        }
+
+        return new SnapPointResult(x, y, m.MonitorIndex, hEdge, vEdge);
+    }
+}
+
+// 桌面伴侣提醒任务条目。
+public class CompanionReminderItem {
+    public string ReminderId;
+    public string Message;
+    public long NextTriggerMs;
+    public long RepeatIntervalMs; // 0 = 一次性提醒
+    public bool Active;
+    public int TriggerCount;
+
+    public CompanionReminderItem(string reminderId, string message, long nextTriggerMs, long repeatIntervalMs) {
+        this.ReminderId = reminderId != null ? reminderId : "";
+        this.Message = message != null ? message : "";
+        this.NextTriggerMs = nextTriggerMs;
+        this.RepeatIntervalMs = repeatIntervalMs > 0L ? repeatIntervalMs : 0L;
+        this.Active = true;
+        this.TriggerCount = 0;
+    }
+}
+
+// 商业桌面陪伴定时与周期事件提醒引擎（支持喝水/护眼周期循环、一次性日程与 Snooze 稍后提醒）：
+public class CompanionAlarmReminderEngine {
+    private List<CompanionReminderItem> items;
+
+    public CompanionAlarmReminderEngine() {
+        this.items = new List<CompanionReminderItem>();
+    }
+
+    public void AddReminder(string reminderId, string message, long firstTriggerMs, long repeatIntervalMs) {
+        this.items.Add(new CompanionReminderItem(reminderId, message, firstTriggerMs, repeatIntervalMs));
+    }
+
+    public bool Snooze(string reminderId, long nowMs, long delayMs) {
+        if (delayMs <= 0L) { return false; }
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].ReminderId == reminderId) {
+                this.items[i].Active = true;
+                this.items[i].NextTriggerMs = nowMs + delayMs;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public List<CompanionReminderItem> PollDue(long nowMs) {
+        List<CompanionReminderItem> due = new List<CompanionReminderItem>();
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            CompanionReminderItem it = this.items[i];
+            if (!it.Active || nowMs < it.NextTriggerMs) { continue; }
+            it.TriggerCount = it.TriggerCount + 1;
+            due.Add(it);
+            if (it.RepeatIntervalMs > 0L) {
+                while (it.NextTriggerMs <= nowMs) {
+                    it.NextTriggerMs = it.NextTriggerMs + it.RepeatIntervalMs;
+                }
+            } else {
+                it.Active = false;
+            }
+        }
+        return due;
+    }
+}
+
+// 桌宠互动成就徽章条目。
+public class AchievementBadgeRecord {
+    public string BadgeId;
+    public int TargetCount;
+    public int CurrentCount;
+    public int RewardCoins;
+    public bool Unlocked;
+    public bool RewardClaimed;
+
+    public AchievementBadgeRecord(string badgeId, int targetCount, int rewardCoins) {
+        this.BadgeId = badgeId != null ? badgeId : "";
+        this.TargetCount = targetCount > 0 ? targetCount : 1;
+        this.CurrentCount = 0;
+        this.RewardCoins = rewardCoins > 0 ? rewardCoins : 0;
+        this.Unlocked = false;
+        this.RewardClaimed = false;
+    }
+}
+
+// 商业桌面陪伴互动成就与里程碑看板：
+// - 累加互动计数并在达标瞬间解锁，防重复解锁与重复领奖
+// - 统计总体解锁完成度（0..100）
+public class CompanionBadgeAchievementBoard {
+    private List<AchievementBadgeRecord> badges;
+
+    public CompanionBadgeAchievementBoard() {
+        this.badges = new List<AchievementBadgeRecord>();
+    }
+
+    public void RegisterBadge(string badgeId, int targetCount, int rewardCoins) {
+        this.badges.Add(new AchievementBadgeRecord(badgeId, targetCount, rewardCoins));
+    }
+
+    private AchievementBadgeRecord FindBadge(string badgeId) {
+        if (badgeId == null) { return null; }
+        for (int i = 0; i < this.badges.Count; i = i + 1) {
+            if (this.badges[i].BadgeId == badgeId) { return this.badges[i]; }
+        }
+        return null;
+    }
+
+    // 累加进度；仅在本次调用首次跨越阈值解锁时返回 true。
+    public bool RecordProgress(string badgeId, int delta) {
+        if (delta <= 0) { return false; }
+        AchievementBadgeRecord b = this.FindBadge(badgeId);
+        if (b == null) { return false; }
+        b.CurrentCount = b.CurrentCount + delta;
+        if (!b.Unlocked && b.CurrentCount >= b.TargetCount) {
+            b.Unlocked = true;
+            return true;
+        }
+        return false;
+    }
+
+    // 领取成就一次性奖励，未解锁或已领取均返回 0。
+    public int ClaimReward(string badgeId) {
+        AchievementBadgeRecord b = this.FindBadge(badgeId);
+        if (b == null || !b.Unlocked || b.RewardClaimed) { return 0; }
+        b.RewardClaimed = true;
+        return b.RewardCoins;
+    }
+
+    public int CompletionPercent() {
+        if (this.badges.Count == 0) { return 0; }
+        int unlocked = 0;
+        for (int i = 0; i < this.badges.Count; i = i + 1) {
+            if (this.badges[i].Unlocked) { unlocked = unlocked + 1; }
+        }
+        return (unlocked * 100) / this.badges.Count;
+    }
+}

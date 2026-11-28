@@ -1,0 +1,269 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Net;
+
+// 服务端延迟补偿（Lag Compensation）记录的单帧实体姿态快照。
+public class LagCompPoseSample {
+    public long ServerTimeMs;
+    public Vector3 Center;
+    public float Radius;
+
+    public LagCompPoseSample(long serverTimeMs, Vector3 center, float radius) {
+        this.ServerTimeMs = serverTimeMs;
+        this.Center = center;
+        this.Radius = radius > 0.0f ? radius : 0.5f;
+    }
+}
+
+// 商业 FPS/TPS 服务端延迟补偿命中回溯器（Source Engine / Overwatch 历史姿态回卷）：
+// - 维护单实体按时间递增的有限长度历史快照缓冲
+// - 按客户端开火时刻（受最大回溯窗口 MaxRewindMs 钳制防外挂）在相邻快照间线性插值还原球形受击盒
+// - 执行射线-球体精确相交判定
+public class NetLagCompHitboxTracker {
+    public int MaxHistory;
+    public long MaxRewindMs;
+    private List<LagCompPoseSample> history;
+
+    public NetLagCompHitboxTracker(int maxHistory, long maxRewindMs) {
+        this.MaxHistory = maxHistory > 2 ? maxHistory : 32;
+        this.MaxRewindMs = maxRewindMs > 0L ? maxRewindMs : 250L;
+        this.history = new List<LagCompPoseSample>();
+    }
+
+    public int SampleCount() {
+        return this.history.Count;
+    }
+
+    public bool RecordPose(long serverTimeMs, Vector3 center, float radius) {
+        if (this.history.Count > 0) {
+            LagCompPoseSample last = this.history[this.history.Count - 1];
+            if (serverTimeMs < last.ServerTimeMs) { return false; }
+        }
+        this.history.Add(new LagCompPoseSample(serverTimeMs, center, radius));
+        while (this.history.Count > this.MaxHistory) {
+            this.history.RemoveAt(0);
+        }
+        return true;
+    }
+
+    // 根据当前服务端时刻 nowMs 与客户端声称的开火时刻 clientShotTimeMs（受 MaxRewindMs 钳制）
+    // 计算回溯后的受击球心与半径。
+    public bool SampleRewoundPose(long nowMs, long clientShotTimeMs, out Vector3 outCenter, out float outRadius) {
+        outCenter = new Vector3(0.0f, 0.0f, 0.0f);
+        outRadius = 0.0f;
+        int n = this.history.Count;
+        if (n == 0) { return false; }
+
+        long minAllowed = nowMs - this.MaxRewindMs;
+        long targetMs = clientShotTimeMs;
+        if (targetMs < minAllowed) { targetMs = minAllowed; }
+        if (targetMs > nowMs) { targetMs = nowMs; }
+
+        if (targetMs <= this.history[0].ServerTimeMs) {
+            outCenter = this.history[0].Center;
+            outRadius = this.history[0].Radius;
+            return true;
+        }
+        if (targetMs >= this.history[n - 1].ServerTimeMs) {
+            outCenter = this.history[n - 1].Center;
+            outRadius = this.history[n - 1].Radius;
+            return true;
+        }
+
+        for (int i = 0; i < n - 1; i = i + 1) {
+            LagCompPoseSample a = this.history[i];
+            LagCompPoseSample b = this.history[i + 1];
+            if (targetMs >= a.ServerTimeMs && targetMs <= b.ServerTimeMs) {
+                long span = b.ServerTimeMs - a.ServerTimeMs;
+                float t = span > 0L ? ((float)(targetMs - a.ServerTimeMs) / (float)span) : 0.0f;
+                outCenter = new Vector3(
+                    a.Center.X + (b.Center.X - a.Center.X) * t,
+                    a.Center.Y + (b.Center.Y - a.Center.Y) * t,
+                    a.Center.Z + (b.Center.Z - a.Center.Z) * t);
+                outRadius = a.Radius + (b.Radius - a.Radius) * t;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 执行回溯射线-球体命中检测（rayDir 会自动归一化）。
+    public bool CheckRewoundRayHit(long nowMs, long clientShotTimeMs,
+                                   Vector3 rayOrigin, Vector3 rayDir, float maxRange) {
+        Vector3 center;
+        float radius;
+        if (!this.SampleRewoundPose(nowMs, clientShotTimeMs, out center, out radius)) {
+            return false;
+        }
+        float dirLen = (float)Math.Sqrt((double)(rayDir.X * rayDir.X + rayDir.Y * rayDir.Y + rayDir.Z * rayDir.Z));
+        if (dirLen <= 0.00001f) { return false; }
+        float dx = rayDir.X / dirLen;
+        float dy = rayDir.Y / dirLen;
+        float dz = rayDir.Z / dirLen;
+
+        float ox = rayOrigin.X - center.X;
+        float oy = rayOrigin.Y - center.Y;
+        float oz = rayOrigin.Z - center.Z;
+        float b = ox * dx + oy * dy + oz * dz;
+        float c = (ox * ox + oy * oy + oz * oz) - (radius * radius);
+        float disc = b * b - c;
+        if (disc < 0.0f) { return false; }
+        float sqrtDisc = (float)Math.Sqrt((double)disc);
+        float tHit = -b - sqrtDisc;
+        if (tHit < 0.0f) { tHit = -b + sqrtDisc; }
+        return tHit >= 0.0f && tHit <= maxRange;
+    }
+}
+
+// 玩家抽卡/Boss 稀有掉落保底账本状态。
+public class DropPityState {
+    public int PullsSinceHighRarity;
+    public bool GuaranteedFeaturedNext;
+    public int TotalPulls;
+    public int TotalHighRarityHits;
+    public int TotalFeaturedHits;
+
+    public DropPityState() {
+        this.PullsSinceHighRarity = 0;
+        this.GuaranteedFeaturedNext = false;
+        this.TotalPulls = 0;
+        this.TotalHighRarityHits = 0;
+        this.TotalFeaturedHits = 0;
+    }
+}
+
+// 商业联机抽卡/Boss 掉落双保底账本（软保底线性增率 + 硬保底必出 + 50/50 歪后大保底必中当期 UP）：
+// - 确定性输入 roll01/upRoll01 [0, 1) 便于服务端权威结算与合规审计复算
+public class NetDropPityLedger {
+    public double BaseRate;
+    public int SoftPityStart;
+    public double SoftPityStep;
+    public int HardPityCap;
+    public double FeaturedWinRate;
+
+    public NetDropPityLedger(double baseRate, int softPityStart, double softPityStep,
+                             int hardPityCap, double featuredWinRate) {
+        this.BaseRate = baseRate > 0.0 ? baseRate : 0.006;
+        this.SoftPityStart = softPityStart > 0 ? softPityStart : 74;
+        this.SoftPityStep = softPityStep > 0.0 ? softPityStep : 0.06;
+        this.HardPityCap = hardPityCap >= this.SoftPityStart ? hardPityCap : 90;
+        this.FeaturedWinRate = featuredWinRate > 0.0 ? featuredWinRate : 0.5;
+    }
+
+    // 计算当前下一次抽取的高稀有度生效概率。
+    public double EffectiveRate(DropPityState state) {
+        int nextPull = (state != null ? state.PullsSinceHighRarity : 0) + 1;
+        if (nextPull >= this.HardPityCap) { return 1.0; }
+        if (nextPull < this.SoftPityStart) { return this.BaseRate; }
+        double r = this.BaseRate + (double)(nextPull - this.SoftPityStart + 1) * this.SoftPityStep;
+        return r > 1.0 ? 1.0 : r;
+    }
+
+    // 执行单次抽取结算：返回 0 = 普通，1 = 歪常驻高稀有，2 = 当期 UP 高稀有。
+    public int ResolvePull(DropPityState state, double rarityRoll01, double featuredRoll01) {
+        if (state == null) { return 0; }
+        double rate = this.EffectiveRate(state);
+        state.TotalPulls = state.TotalPulls + 1;
+        state.PullsSinceHighRarity = state.PullsSinceHighRarity + 1;
+
+        if (rarityRoll01 < rate) {
+            state.PullsSinceHighRarity = 0;
+            state.TotalHighRarityHits = state.TotalHighRarityHits + 1;
+            bool hitFeatured = state.GuaranteedFeaturedNext || (featuredRoll01 < this.FeaturedWinRate);
+            if (hitFeatured) {
+                state.GuaranteedFeaturedNext = false;
+                state.TotalFeaturedHits = state.TotalFeaturedHits + 1;
+                return 2;
+            }
+            state.GuaranteedFeaturedNext = true;
+            return 1;
+        }
+        return 0;
+    }
+}
+
+// 实时联机连接质量档位。
+public enum NetQualityTier {
+    Excellent = 0,
+    Good = 1,
+    Degraded = 2,
+    Critical = 3
+}
+
+// 商业实时联机网络质量与自适应降频监控器（EWMA RTT + RFC 3550 Jitter + 滑窗丢包率）：
+// - 动态评估连接健康度并输出建议同步发送频率（Hz）以在弱网下自动降频防拥塞雪崩
+public class NetConnectionQualityMonitor {
+    public double SmoothedRttMs;
+    public double JitterMs;
+    public int WindowSize;
+    private double lastRttMs;
+    private bool hasRttSample;
+    private List<int> ackWindow; // 1=收到, 0=丢包
+
+    public NetConnectionQualityMonitor(int windowSize) {
+        this.SmoothedRttMs = 0.0;
+        this.JitterMs = 0.0;
+        this.WindowSize = windowSize > 4 ? windowSize : 20;
+        this.lastRttMs = 0.0;
+        this.hasRttSample = false;
+        this.ackWindow = new List<int>();
+    }
+
+    public void RecordRttSample(double rttMs) {
+        if (rttMs < 0.0) { rttMs = 0.0; }
+        if (!this.hasRttSample) {
+            this.SmoothedRttMs = rttMs;
+            this.JitterMs = 0.0;
+            this.lastRttMs = rttMs;
+            this.hasRttSample = true;
+            return;
+        }
+        double diff = rttMs - this.lastRttMs;
+        if (diff < 0.0) { diff = -diff; }
+        this.JitterMs = this.JitterMs + (diff - this.JitterMs) / 16.0;
+        this.SmoothedRttMs = this.SmoothedRttMs * 0.875 + rttMs * 0.125;
+        this.lastRttMs = rttMs;
+    }
+
+    public void RecordPacketOutcome(bool received) {
+        this.ackWindow.Add(received ? 1 : 0);
+        while (this.ackWindow.Count > this.WindowSize) {
+            this.ackWindow.RemoveAt(0);
+        }
+    }
+
+    public double PacketLossRate() {
+        int n = this.ackWindow.Count;
+        if (n == 0) { return 0.0; }
+        int lost = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.ackWindow[i] == 0) { lost = lost + 1; }
+        }
+        return (double)lost / (double)n;
+    }
+
+    public NetQualityTier EvaluateTier() {
+        double loss = this.PacketLossRate();
+        if (this.SmoothedRttMs >= 200.0 || loss >= 0.15 || this.JitterMs >= 50.0) {
+            return NetQualityTier.Critical;
+        }
+        if (this.SmoothedRttMs >= 110.0 || loss >= 0.05 || this.JitterMs >= 25.0) {
+            return NetQualityTier.Degraded;
+        }
+        if (this.SmoothedRttMs >= 55.0 || loss >= 0.01 || this.JitterMs >= 10.0) {
+            return NetQualityTier.Good;
+        }
+        return NetQualityTier.Excellent;
+    }
+
+    // 根据网络质量档位给出推荐客户端状态同步频率（Hz）。
+    public int RecommendedSendRateHz() {
+        NetQualityTier tier = this.EvaluateTier();
+        if (tier == NetQualityTier.Excellent) { return 60; }
+        if (tier == NetQualityTier.Good) { return 30; }
+        if (tier == NetQualityTier.Degraded) { return 15; }
+        return 8;
+    }
+}

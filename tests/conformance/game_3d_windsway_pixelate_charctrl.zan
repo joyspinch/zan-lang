@@ -1,0 +1,165 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DWindSwayPixelateCharCtrlTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int ChannelR(int argb) { return (argb >> 16) & 255; }
+    static int ChannelG(int argb) { return (argb >> 8) & 255; }
+    static int ChannelB(int argb) { return argb & 255; }
+
+    static int DistToGrid3(int v) {
+        int d0 = v;
+        int d1 = v > 128 ? (v - 128) : (128 - v);
+        int d2 = 255 - v;
+        int m = d0 < d1 ? d0 : d1;
+        return d2 < m ? d2 : m;
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 1. GPU 顶点微风摇曳：底部 y=0 固定，顶部 y=2 沿 +X 明显摆动
+        Mesh3D blade = new Mesh3D();
+        blade.Vertex(-0.35f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        blade.Vertex( 0.35f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        blade.Vertex( 0.35f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        blade.Vertex(-0.35f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        blade.Triangle(0, 1, 2);
+        blade.Triangle(0, 2, 3);
+        int bladeMesh = cv.MeshUpload(blade);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 1.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 1.0f, 0.0f);
+        cam.FieldOfView = 1.0471975f; // 60 deg
+        cam.AspectRatio = 1.0f;
+
+        Material mat = Material.Emissive(0.10f, 0.90f, 0.20f);
+        SceneNode root = new SceneNode("root");
+        SceneNode node = new SceneNode("blade");
+        node.MeshKey = bladeMesh;
+        node.BoundsRadius = 4.0f;
+        node.Material = mat;
+        root.AddChild(node);
+
+        RenderPlan plan = new RenderPlan(cam);
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        // 基准帧：无风 -> 顶部中心 (64, 34) 为绿色，右侧 (96, 34) 为暗蓝背景
+        cv.Clear(unchecked((int)0xFF0A1020));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+        int topCenterStill = zan_gui_read_pixel(cv.SurfaceId(), 64, 34);
+        int topRightStill = zan_gui_read_pixel(cv.SurfaceId(), 96, 34);
+
+        // 刮风帧：phase=PI/2 (sin=1), amp=0.475 -> 顶部 y=2 向 +X 偏移 +0.95，底部根部仍固定在 x=64
+        mat.WindSwayEnabled = true;
+        mat.WindSwayAmplitude = 0.475f;
+        mat.WindSwayFrequency = 0.0f;
+        mat.WindSwayPhase = 1.5707963f;
+        mat.WindSwayHeightScale = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF0A1020));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+        int topCenterWind = zan_gui_read_pixel(cv.SurfaceId(), 64, 34);
+        int topRightWind = zan_gui_read_pixel(cv.SurfaceId(), 96, 34);
+        int baseCenterWind = zan_gui_read_pixel(cv.SurfaceId(), 64, 92);
+
+        bool windOk = ChannelG(topCenterStill) > 150
+            && ChannelG(topRightStill) < 40
+            && ChannelG(topCenterWind) < 40
+            && ChannelG(topRightWind) > 150
+            && ChannelG(baseCenterWind) > 150;
+        Console.WriteLine("gpu-wind-sway: " + Convert.ToString(windOk ? 1 : 0));
+
+        // 2. GPU 后处理复古像素化 + 3 级色阶量化（PosterizeLevels=3 -> {0, 128, 255}）
+        mat.WindSwayEnabled = false;
+        Mesh3D fullQuad = new Mesh3D();
+        fullQuad.Vertex(-2.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        fullQuad.Vertex( 2.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        fullQuad.Vertex( 2.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        fullQuad.Vertex(-2.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        fullQuad.Triangle(0, 1, 2);
+        fullQuad.Triangle(0, 2, 3);
+        int quadMesh = cv.MeshUpload(fullQuad);
+
+        Material midMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        midMat.EmissiveRed = 0.42f;
+        midMat.EmissiveGreen = 0.82f;
+        midMat.EmissiveBlue = 0.12f;
+        node.MeshKey = quadMesh;
+        node.Material = midMat;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+        int rawPx = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        PostProcess pp = new PostProcess();
+        pp.PixelateSize = 8.0f;
+        pp.PosterizeLevels = 3.0f; // 量化级为 0 / 128 / 255
+        ren.PostProcess = pp;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+        int postPx = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int postNeighbor = zan_gui_read_pixel(cv.SurfaceId(), 67, 64);
+
+        bool postOk = ChannelG(rawPx) > 180 && ChannelG(rawPx) < 230
+            && DistToGrid3(ChannelR(postPx)) <= 4
+            && DistToGrid3(ChannelG(postPx)) <= 4
+            && DistToGrid3(ChannelB(postPx)) <= 4
+            && ChannelG(postPx) >= 250
+            && ChannelB(postPx) <= 4
+            && postPx == postNeighbor;
+        Console.WriteLine("gpu-post-pixelate-posterize: " + Convert.ToString(postOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. 3D 角色运动控制器：地面加速、土狼跳、预输入落地即跳、陡坡滑落与台阶判定
+        CharacterController3D ctrl = new CharacterController3D(new CharacterMotorConfig3D());
+        Vector3 flatUp = new Vector3(0.0f, 1.0f, 0.0f);
+        for (int i = 0; i < 5; i = i + 1) {
+            ctrl.Step(0.05f, 1.0f, 0.0f, 0.0f, flatUp);
+        }
+        bool groundRunOk = ctrl.State.IsGrounded && ctrl.State.Velocity.X > 5.0f;
+
+        // 离开悬崖 0.05s（仍在 0.12s 土狼时间内）触发跳跃
+        ctrl.Step(0.05f, 1.0f, 0.0f, -100.0f, flatUp);
+        bool coyoteReady = !ctrl.State.IsGrounded && ctrl.State.CoyoteTimer > 0.0f;
+        ctrl.QueueJump();
+        ctrl.Step(0.02f, 1.0f, 0.0f, -100.0f, flatUp);
+        bool coyoteJumpOk = ctrl.State.JumpCount == 1 && ctrl.State.Velocity.Y > 7.5f;
+
+        // 空中下落接近地面前预输入跳跃，触地瞬间消费并二连跳起
+        ctrl.State.Position = new Vector3(0.0f, 0.08f, 0.0f);
+        ctrl.State.Velocity = new Vector3(0.0f, -3.0f, 0.0f);
+        ctrl.State.IsGrounded = false;
+        ctrl.State.CoyoteTimer = 0.0f;
+        ctrl.QueueJump();
+        ctrl.Step(0.05f, 0.0f, 0.0f, 0.0f, flatUp);
+        bool bufferJumpOk = ctrl.State.JumpCount == 2 && ctrl.State.Velocity.Y > 8.0f;
+
+        // 陡坡（法线 Y=0.4 < 0.7071）触发滑落 + 台阶跨越上下限判定
+        ctrl.State.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        ctrl.State.Velocity = new Vector3(0.0f, 0.0f, 0.0f);
+        Vector3 steepNormal = new Vector3(0.9165f, 0.4f, 0.0f);
+        ctrl.Step(0.05f, 0.0f, 0.0f, 0.0f, steepNormal);
+        bool steepSlideOk = ctrl.State.IsSliding && ctrl.State.Velocity.X > 4.0f
+            && ctrl.CanStepUp(0.35f) && !ctrl.CanStepUp(0.80f);
+
+        bool ctrlOk = groundRunOk && coyoteReady && coyoteJumpOk && bufferJumpOk && steepSlideOk;
+        Console.WriteLine("render3d-character-controller: " + Convert.ToString(ctrlOk ? 1 : 0));
+    }
+}

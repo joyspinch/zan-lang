@@ -1,0 +1,72 @@
+using System;
+using System.Numerics;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerLagCompPityNetQualityTest {
+    static void Main() {
+        // 1. 服务端延迟补偿命中回溯：目标匀速移动，旧时间戳射线精确命中历史位置，超窗回溯被钳制
+        NetLagCompHitboxTracker tracker = new NetLagCompHitboxTracker(16, 200L);
+        tracker.RecordPose(1000L, new Vector3(0.0f, 0.0f, 0.0f), 0.6f);
+        tracker.RecordPose(1100L, new Vector3(10.0f, 0.0f, 0.0f), 0.6f);
+        tracker.RecordPose(1200L, new Vector3(20.0f, 0.0f, 0.0f), 0.6f);
+        bool backOrderRejected = !tracker.RecordPose(1150L, new Vector3(15.0f, 0.0f, 0.0f), 0.6f);
+
+        // 当前 t=1200ms，客户端声称 t=1050ms 开火（目标插值在 x=5.0），向 (5, 0, 0) 射出射线
+        bool hitAt1050 = tracker.CheckRewoundRayHit(
+            1200L, 1050L, new Vector3(5.0f, 0.0f, -10.0f), new Vector3(0.0f, 0.0f, 1.0f), 30.0f);
+        bool missAtCurrent = !tracker.CheckRewoundRayHit(
+            1200L, 1200L, new Vector3(5.0f, 0.0f, -10.0f), new Vector3(0.0f, 0.0f, 1.0f), 30.0f);
+        // 客户端伪造 t=500ms（超 MaxRewindMs=200ms），被钳制到 t=1000ms (x=0.0)
+        Vector3 clampedPos;
+        float clampedRad;
+        bool clampOk = tracker.SampleRewoundPose(1200L, 500L, out clampedPos, out clampedRad)
+            && clampedPos.X >= -0.01f && clampedPos.X <= 0.01f;
+
+        bool lagOk = backOrderRejected && hitAt1050 && missAtCurrent && clampOk;
+        Console.WriteLine("net-lagcomp-rewind-hit: " + Convert.ToString(lagOk ? 1 : 0));
+
+        // 2. 双保底掉落账本：软保底线性增率 + 硬保底必出 + 50/50 歪后大保底必中 UP
+        NetDropPityLedger ledger = new NetDropPityLedger(0.01, 5, 0.20, 8, 0.5);
+        DropPityState st = new DropPityState();
+        // 前 4 抽未中（保持基础概率 0.01）
+        double rBeforeSoft = ledger.EffectiveRate(st);
+        for (int i = 0; i < 4; i = i + 1) {
+            ledger.ResolvePull(st, 0.99, 0.99);
+        }
+        // 第 5 抽进入软保底（0.01 + 0.20 = 0.21），仍不中直至第 8 抽硬保底（概率 1.0）且歪常驻 (featuredRoll=0.9)
+        double rAtSoft = ledger.EffectiveRate(st);
+        ledger.ResolvePull(st, 0.99, 0.99); // pull 5
+        ledger.ResolvePull(st, 0.99, 0.99); // pull 6
+        ledger.ResolvePull(st, 0.99, 0.99); // pull 7
+        double rAtHard = ledger.EffectiveRate(st);
+        int hardOffBanner = ledger.ResolvePull(st, 0.99, 0.90); // pull 8 -> 硬保底命中但歪 -> return 1, GuaranteedFeaturedNext=true
+        // 下一次高稀有即便 featuredRoll=0.99 也必中当期 UP (return 2)
+        int guaranteedUp = ledger.ResolvePull(st, 0.005, 0.99);
+
+        bool pityOk = rBeforeSoft < 0.011 && rAtSoft > 0.20 && rAtHard >= 1.0
+            && hardOffBanner == 1 && guaranteedUp == 2
+            && !st.GuaranteedFeaturedNext && st.TotalHighRarityHits == 2 && st.TotalFeaturedHits == 1;
+        Console.WriteLine("net-drop-pity-ledger: " + Convert.ToString(pityOk ? 1 : 0));
+
+        // 3. 实时网络质量监控：优网 60Hz -> 恶化丢包/高抖动降频 8Hz
+        NetConnectionQualityMonitor mon = new NetConnectionQualityMonitor(10);
+        for (int i = 0; i < 10; i = i + 1) {
+            mon.RecordRttSample(25.0);
+            mon.RecordPacketOutcome(true);
+        }
+        bool goodOk = mon.EvaluateTier() == NetQualityTier.Excellent && mon.RecommendedSendRateHz() == 60;
+
+        // 注入高延迟与 30% 丢包
+        for (int i = 0; i < 10; i = i + 1) {
+            mon.RecordRttSample((i % 2 == 0) ? 260.0 : 380.0);
+            mon.RecordPacketOutcome(i >= 3); // 3/10 = 30% 丢包
+        }
+        bool badOk = mon.EvaluateTier() == NetQualityTier.Critical
+            && mon.RecommendedSendRateHz() == 8
+            && mon.PacketLossRate() >= 0.29 && mon.JitterMs > 10.0;
+
+        Console.WriteLine("net-quality-adaptive-rate: " + Convert.ToString((goodOk && badOk) ? 1 : 0));
+    }
+}

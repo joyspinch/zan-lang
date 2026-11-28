@@ -235,6 +235,16 @@ ZAN_GAME_API void zan_game_set_top_cover3d(int32_t enabled, float threshold,
 ZAN_GAME_API void zan_game_set_post_radial_blur3d(float strength,
     float center_x, float center_y);
 
+/* GPU 顶点级微风摇曳动画（Vegetation / Flag Wind Sway，零骨骼 GPU 顶点偏移并同步阴影 Pass）：
+ * enabled != 0 且 amplitude > 0 时，按局部高度 max(pos.y, 0) * height_scale 沿 XZ 轴施加正弦相位摇曳。 */
+ZAN_GAME_API void zan_game_set_wind_sway3d(int32_t enabled, float amplitude,
+    float freq, float phase, float height_scale);
+
+/* GPU 后处理复古像素化马赛克与色阶量化（Pixelate Mosaic + Posterize，零额外 Pass）：
+ * pixel_size >= 1.5 按指定像素块尺寸量化采样 UV；posterize_levels >= 2 将输出色阶量化为指定级数。 */
+ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
+    float posterize_levels);
+
 #ifdef __cplusplus
 }
 #endif
