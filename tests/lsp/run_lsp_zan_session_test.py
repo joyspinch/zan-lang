@@ -1653,6 +1653,8 @@ def run_session(exe, workspace):
     if diag is None or diag["diagnostics"] != []:
         fail("didClose", "expected cleared diagnostics, got %r" % (diag,))
 
+    check_parser_recovery(s)
+
     manifest = check_workspace(s, workspace)
 
     # Keep a project document open so an active poller would publish on change.
@@ -1663,6 +1665,213 @@ def run_session(exe, workspace):
     s.expect_quiet(2.2)
     s.notify("exit", None)
     s.expect_exit("exit")
+
+
+def check_parser_recovery(s):
+    """B-ID190: parser error recovery keeps AST, symbols, hover, definition,
+    completion, and downstream semantic diagnostics alive after syntax errors.
+    """
+    # 1. Missing semicolon + incomplete `r.` member access + downstream method
+    rec1_uri = "file:///t/RecovStmt.zan"
+    rec1_src = (
+        "class Recov {\n"
+        "    public int Count;\n"
+        "    public int Broken() {\n"
+        "        int a = 1\n"
+        "        Recov r = new Recov();\n"
+        "        r.\n"
+        "        int b = a + 2;\n"
+        "        MissingType bad = null;\n"
+        "        return b;\n"
+        "    }\n"
+        "    public int Healthy() {\n"
+        "        return Count;\n"
+        "    }\n"
+        "}\n"
+    )
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": rec1_uri, "languageId": "zan", "version": 1, "text": rec1_src}})
+    d1 = s.diag_for(rec1_uri)
+    if d1 is None:
+        fail("recovery stmt/dot diag", "no diagnostics published")
+    msgs1 = [d.get("message", "") for d in d1["diagnostics"]]
+    if not any("syntax error" in m for m in msgs1):
+        fail("recovery stmt/dot diag", "missing syntax error in %r" % (msgs1,))
+    if not any("MissingType" in m for m in msgs1):
+        fail("recovery stmt/dot diag", "missing downstream semantic error in %r" % (msgs1,))
+    if any("undefined type 'r'" in m or "has no member ''" in m for m in msgs1):
+        fail("recovery stmt/dot diag", "unexpected cascade error in %r" % (msgs1,))
+
+    syms1 = s.request("textDocument/documentSymbol", {
+        "textDocument": {"uri": rec1_uri}}).get("result") or []
+    recov_cls = next((x for x in syms1 if x.get("name") == "Recov"), None)
+    if recov_cls is None:
+        fail("recovery stmt/dot documentSymbol", "missing Recov in %r" % (syms1,))
+    recov_children = {c.get("name") for c in (recov_cls.get("children") or [])}
+    for need in ("Count", "Broken", "Healthy"):
+        if need not in recov_children:
+            fail("recovery stmt/dot documentSymbol",
+                 "missing %s in %r" % (need, recov_children))
+
+    # hover & definition on `Count` inside Healthy() (line 11)
+    line11 = rec1_src.splitlines()[11]
+    cnt_col = line11.index("Count")
+    hov1 = s.request("textDocument/hover", {
+        "textDocument": {"uri": rec1_uri},
+        "position": {"line": 11, "character": cnt_col},
+    }).get("result")
+    if not hov1 or "Count" not in str(hov1.get("contents", "")):
+        fail("recovery stmt/dot hover", "expected hover for Count, got %r" % (hov1,))
+
+    def1 = s.request("textDocument/definition", {
+        "textDocument": {"uri": rec1_uri},
+        "position": {"line": 11, "character": cnt_col},
+    }).get("result")
+    def1_loc = def1[0] if isinstance(def1, list) and def1 else def1
+    if not isinstance(def1_loc, dict) or def1_loc.get("range", {}).get("start", {}).get("line") != 1:
+        fail("recovery stmt/dot definition", "expected Count at line 1, got %r" % (def1,))
+
+    # completion still offers `Healthy` declared below syntax errors
+    comp1 = s.request("textDocument/completion", {
+        "textDocument": {"uri": rec1_uri},
+        "position": {"line": 10, "character": 18},  # "Hea" inside Healthy
+    }).get("result")
+    comp_items = comp1.get("items", comp1) if isinstance(comp1, dict) else (comp1 or [])
+    comp_labels = {it.get("label") for it in comp_items}
+    if "Healthy" not in comp_labels:
+        fail("recovery stmt/dot completion", "missing Healthy in %r" % (comp_labels,))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": rec1_uri}})
+
+    # 2. Unclosed param list + malformed member tokens + subsequent class
+    rec2_uri = "file:///t/RecovMember.zan"
+    rec2_src = (
+        "class BrokenParams {\n"
+        "    public int First(int x {\n"
+        "        MissingInside mi = null;\n"
+        "        return x;\n"
+        "    }\n"
+        "    @@@ + 123\n"
+        "    public int AfterGarbage() {\n"
+        "        return 42;\n"
+        "    }\n"
+        "}\n"
+        "class AfterBrokenClass {\n"
+        "    public int Ok;\n"
+        "    public void Check() {\n"
+        "        MissingAfter ma = null;\n"
+        "    }\n"
+        "}\n"
+    )
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": rec2_uri, "languageId": "zan", "version": 1, "text": rec2_src}})
+    d2 = s.diag_for(rec2_uri)
+    if d2 is None:
+        fail("recovery member diag", "no diagnostics published")
+    msgs2 = [d.get("message", "") for d in d2["diagnostics"]]
+    if not any("syntax error" in m for m in msgs2):
+        fail("recovery member diag", "missing syntax error in %r" % (msgs2,))
+    if not any("MissingInside" in m for m in msgs2):
+        fail("recovery member diag", "missing MissingInside in %r" % (msgs2,))
+    if not any("MissingAfter" in m for m in msgs2):
+        fail("recovery member diag", "missing MissingAfter in %r" % (msgs2,))
+
+    syms2 = s.request("textDocument/documentSymbol", {
+        "textDocument": {"uri": rec2_uri}}).get("result") or []
+    by_name2 = {x.get("name"): {c.get("name") for c in (x.get("children") or [])}
+                for x in syms2}
+    if "BrokenParams" not in by_name2 or "AfterBrokenClass" not in by_name2:
+        fail("recovery member documentSymbol", "expected both classes, got %r" % (by_name2,))
+    for need in ("First", "AfterGarbage"):
+        if need not in by_name2["BrokenParams"]:
+            fail("recovery member documentSymbol",
+                 "missing %s in BrokenParams: %r" % (need, by_name2["BrokenParams"]))
+    for need in ("Ok", "Check"):
+        if need not in by_name2["AfterBrokenClass"]:
+            fail("recovery member documentSymbol",
+                 "missing %s in AfterBrokenClass: %r" % (need, by_name2["AfterBrokenClass"]))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": rec2_uri}})
+
+    # 3. Pathological unbalanced tokens + broken property + broken enum + trailing class
+    rec3_uri = "file:///t/RecovPathological.zan"
+    rec3_src = (
+        "))) ]]] ;;; @@@ {{{ }\n"
+        "class StillAlive {\n"
+        "    public int AliveField;\n"
+        "    public int Prop { get; ??? set; }\n"
+        "    public void Check() {\n"
+        "        MissingInStillAlive x = null;\n"
+        "    }\n"
+        "}\n"
+        "enum BrokenEnum { A = 1, + , B = 2 }\n"
+        "class AfterBrokenEnum {\n"
+        "    public int TailField;\n"
+        "}\n"
+    )
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": rec3_uri, "languageId": "zan", "version": 1, "text": rec3_src}})
+    d3 = s.diag_for(rec3_uri)
+    if d3 is None:
+        fail("recovery pathological diag", "no diagnostics published")
+    msgs3 = [d.get("message", "") for d in d3["diagnostics"]]
+    if not any("syntax error" in m for m in msgs3):
+        fail("recovery pathological diag", "missing syntax error in %r" % (msgs3,))
+    if not any("MissingInStillAlive" in m for m in msgs3):
+        fail("recovery pathological diag", "missing MissingInStillAlive in %r" % (msgs3,))
+
+    syms3 = s.request("textDocument/documentSymbol", {
+        "textDocument": {"uri": rec3_uri}}).get("result") or []
+    by_name3 = {x.get("name"): {c.get("name") for c in (x.get("children") or [])}
+                for x in syms3}
+    if "StillAlive" not in by_name3 or "AfterBrokenEnum" not in by_name3:
+        fail("recovery pathological documentSymbol",
+             "expected StillAlive & AfterBrokenEnum, got %r" % (by_name3,))
+    for need in ("AliveField", "Prop", "Check"):
+        if need not in by_name3["StillAlive"]:
+            fail("recovery pathological documentSymbol",
+                 "missing %s in StillAlive: %r" % (need, by_name3["StillAlive"]))
+    if "TailField" not in by_name3["AfterBrokenEnum"]:
+        fail("recovery pathological documentSymbol",
+             "missing TailField in AfterBrokenEnum: %r" % (by_name3["AfterBrokenEnum"],))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": rec3_uri}})
+
+    # 4. Unclosed call arguments + top-level junk before class
+    rec4_uri = "file:///t/RecovCall.zan"
+    rec4_src = (
+        "!!! garbage ???\n"
+        "class TopRecovered {\n"
+        "    public void CallSite() {\n"
+        "        Foo(1, 2\n"
+        "        MissingAfterCall mc = null;\n"
+        "    }\n"
+        "    public int Tail() { return 1; }\n"
+        "}\n"
+    )
+    s.notify("textDocument/didOpen", {"textDocument": {
+        "uri": rec4_uri, "languageId": "zan", "version": 1, "text": rec4_src}})
+    d4 = s.diag_for(rec4_uri)
+    if d4 is None:
+        fail("recovery call/toplevel diag", "no diagnostics published")
+    msgs4 = [d.get("message", "") for d in d4["diagnostics"]]
+    if not any("syntax error" in m for m in msgs4):
+        fail("recovery call/toplevel diag", "missing syntax error in %r" % (msgs4,))
+    if not any("MissingAfterCall" in m for m in msgs4):
+        fail("recovery call/toplevel diag", "missing MissingAfterCall in %r" % (msgs4,))
+
+    syms4 = s.request("textDocument/documentSymbol", {
+        "textDocument": {"uri": rec4_uri}}).get("result") or []
+    by_name4 = {x.get("name"): {c.get("name") for c in (x.get("children") or [])}
+                for x in syms4}
+    if "TopRecovered" not in by_name4:
+        fail("recovery call/toplevel documentSymbol", "missing TopRecovered in %r" % (by_name4,))
+    for need in ("CallSite", "Tail"):
+        if need not in by_name4["TopRecovered"]:
+            fail("recovery call/toplevel documentSymbol",
+                 "missing %s in TopRecovered: %r" % (need, by_name4["TopRecovered"]))
+
+    s.notify("textDocument/didClose", {"textDocument": {"uri": rec4_uri}})
 
 
 if __name__ == "__main__":

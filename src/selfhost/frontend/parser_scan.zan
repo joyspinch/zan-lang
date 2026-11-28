@@ -118,7 +118,11 @@ public partial class Parser {
         while (At(TK.LBracket())) {
             Next(); // [
             while (!At(TK.RBracket()) && !At(TK.Eof())) {
+                if (At(TK.LBrace()) || At(TK.RBrace()) || At(TK.Semicolon()) || IsDeclStarter(K())) {
+                    break;
+                }
                 if (!At(TK.Ident())) {
+                    RecordUnexpected();
                     Next();
                     continue;
                 }
@@ -268,24 +272,148 @@ public partial class Parser {
     Token Next() { Token t = Cur(); if (pos < toks.Count) { pos = pos + 1; } return t; }
     bool At(int k) { return K() == k; }
     bool Eat(int k) { if (K() == k) { pos = pos + 1; return true; } return false; }
-    // On mismatch: record a diagnostic and advance one token (bounded, never
-    // past Eof) so the parser makes forward progress and re-synchronises
-    // instead of silently swallowing the error or spinning.
+    // Suppress cascading syntax errors at the same token position (panic mode):
+    // only the first mismatch at a given token is reported until pos advances.
+    void RecordUnexpected() {
+        if (pos == lastErrPos) { return; }
+        Token c = Cur();
+        if (K() == TK.Eof()) { diags.Error("syntax error: unexpected end of file", c.line, c.col); }
+        else {
+            string what = c.text;
+            if (what == "") { what = TK.Lexeme(c.kind); }
+            if (what == "") { diags.Error("syntax error: unexpected token", c.line, c.col); }
+            else { diags.Error("syntax error: unexpected '" + what + "'", c.line, c.col); }
+        }
+        lastErrPos = pos;
+    }
+
+    bool IsClosingDelim(int k) {
+        return k == TK.RBrace() || k == TK.RParen() || k == TK.RBracket()
+            || k == TK.Semicolon() || k == TK.Comma() || k == TK.Eof();
+    }
+
+    // Delimiters that are virtually inserted on mismatch without consuming the
+    // lookahead token (Roslyn/Clang missing-token recovery, B-ID190).
+    bool IsVirtualDelim(int k) {
+        return k == TK.Semicolon() || k == TK.RParen() || k == TK.RBracket()
+            || k == TK.RBrace() || k == TK.Greater();
+    }
+
+    bool IsDeclStarter(int k) {
+        if (k == TK.Public() || k == TK.Private() || k == TK.Protected()
+                || k == TK.Static() || k == TK.Abstract() || k == TK.Virtual()
+                || k == TK.Override() || k == TK.Sealed() || k == TK.Readonly()
+                || k == TK.Const() || k == TK.Async()
+                || k == TK.Class() || k == TK.Struct() || k == TK.Interface()
+                || k == TK.Enum() || k == TK.Namespace() || k == TK.Using()) {
+            return true;
+        }
+        if (k == TK.Ident()) {
+            string s = Cur().text;
+            if (s == "partial" || s == "internal" || s == "record"
+                    || s == "delegate" || s == "extern" || s == "event"
+                    || s == "weak" || s == "implicit" || s == "explicit") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsStmtStarter(int k) {
+        if (k == TK.If() || k == TK.While() || k == TK.Do() || k == TK.For()
+                || k == TK.Foreach() || k == TK.Return() || k == TK.Switch()
+                || k == TK.Break() || k == TK.Continue() || k == TK.Try()
+                || k == TK.Catch() || k == TK.Finally() || k == TK.Throw()
+                || k == TK.Var() || k == TK.Using() || k == TK.LBrace()
+                || k == TK.RBrace() || k == TK.Case() || k == TK.Default()) {
+            return true;
+        }
+        return IsTypeKeyword(k);
+    }
+
+    bool CanStartType(int k) {
+        return IsTypeKeyword(k) || k == TK.Ident() || k == TK.LParen();
+    }
+
+    bool IsTopTypeKeyword(int k) {
+        return k == TK.Class() || k == TK.Struct() || k == TK.Interface()
+            || k == TK.Enum() || k == TK.Namespace() || k == TK.Using();
+    }
+
+    void SkipBalancedBraces() {
+        if (!At(TK.LBrace())) { return; }
+        int depth = 0;
+        while (!At(TK.Eof())) {
+            if (depth > 0 && IsTopTypeKeyword(K())) { return; }
+            if (At(TK.LBrace())) { depth = depth + 1; Next(); }
+            else if (At(TK.RBrace())) {
+                depth = depth - 1;
+                Next();
+                if (depth <= 0) { return; }
+            } else { Next(); }
+        }
+    }
+
+    // Re-synchronise inside a statement block: always advances at least one
+    // token (except at `}` / EOF) and stops at the next statement boundary.
+    void SynchronizeStmt() {
+        if (At(TK.Eof()) || At(TK.RBrace())) { return; }
+        if (Eat(TK.Semicolon())) { return; }
+        Next();
+        while (!At(TK.Eof()) && !At(TK.RBrace())) {
+            if (Eat(TK.Semicolon())) { return; }
+            if (IsStmtStarter(K()) || IsDeclStarter(K())) { return; }
+            Next();
+        }
+    }
+
+    // Re-synchronise inside a class/struct/interface body: skip malformed
+    // tokens (including any balanced `{ ... }` body) until the next member
+    // starter, `;`, `}`, or EOF.
+    void SynchronizeMember() {
+        if (At(TK.Eof()) || At(TK.RBrace())) { return; }
+        if (Eat(TK.Semicolon())) { return; }
+        if (At(TK.LBrace())) { SkipBalancedBraces(); return; }
+        Next();
+        while (!At(TK.Eof()) && !At(TK.RBrace())) {
+            if (Eat(TK.Semicolon())) { return; }
+            if (At(TK.LBrace())) { SkipBalancedBraces(); return; }
+            if (IsDeclStarter(K()) || At(TK.LBracket()) || At(TK.Tilde())) { return; }
+            Next();
+        }
+    }
+
+    // Re-synchronise at top-level or namespace scope. Does not skip nested
+    // braces blindly so unbalanced `{` before a declaration never swallows the
+    // rest of the file. When stopAtRBrace is true, leaves `}` for an enclosing
+    // `namespace { ... }` loop to consume.
+    void SynchronizeTopLevel(bool stopAtRBrace) {
+        if (At(TK.Eof())) { return; }
+        if (At(TK.RBrace())) {
+            if (!stopAtRBrace) { Next(); }
+            return;
+        }
+        if (Eat(TK.Semicolon())) { return; }
+        Next();
+        while (!At(TK.Eof())) {
+            if (Eat(TK.Semicolon())) { return; }
+            if (At(TK.RBrace()) || IsDeclStarter(K()) || At(TK.LBracket())) { return; }
+            Next();
+        }
+    }
+
+    // On mismatch: record a diagnostic and recover without swallowing
+    // structural boundaries (closing delimiters, `{`, or next statement/decl).
     void Expect(int k) {
         if (Eat(k)) { return; }
-        // Suppress cascading errors at the same position (panic mode): only the
-        // first mismatch at a given token is reported until the parser advances.
-        if (pos != lastErrPos) {
-            Token c = Cur();
-            if (K() == TK.Eof()) { diags.Error("syntax error: unexpected end of file", c.line, c.col); }
-            else {
-                string what = c.text;
-                if (what == "") { what = TK.Lexeme(c.kind); }
-                diags.Error("syntax error: unexpected '" + what + "'", c.line, c.col);
-            }
-            lastErrPos = pos;
+        RecordUnexpected();
+        if (IsVirtualDelim(k)) { return; }
+        int ck = K();
+        if (ck == TK.Eof() || IsClosingDelim(ck) || ck == TK.LBrace()
+                || IsDeclStarter(ck) || IsStmtStarter(ck)) {
+            return;
         }
-        if (K() != TK.Eof()) { pos = pos + 1; }
+        pos = pos + 1;
     }
 
     bool IsTypeKeyword(int k) {
@@ -389,18 +517,34 @@ public partial class Parser {
         }
         else if (IsTypeKeyword(k)) { t.sval = TypeKeywordName(k); Next(); }
         else if (k == TK.Ident()) { t.sval = Next().text; }
-        else { t.sval = "int"; Next(); }
+        else {
+            RecordUnexpected();
+            t.sval = "int";
+            if (!IsClosingDelim(k) && k != TK.LBrace() && !IsDeclStarter(k) && !IsStmtStarter(k)) {
+                Next();
+            }
+        }
         // namespace-qualified name:  Ns.Outer.Inner
         while (At(TK.Dot())) {
             Next();
             if (At(TK.Ident())) { t.sval = t.sval + "." + Next().text; }
+            else { RecordUnexpected(); break; }
         }
         // generic args:  Name < T (, T)* >
         if (At(TK.Less())) {
             Next();
-            t.a = ParseType();
-            t.Add(t.a);
-            while (Eat(TK.Comma())) { t.Add(ParseType()); }
+            if (!At(TK.Greater()) && !At(TK.RBrace()) && !At(TK.LBrace())
+                    && !At(TK.Semicolon()) && !At(TK.RParen()) && !At(TK.Eof())) {
+                t.a = ParseType();
+                t.Add(t.a);
+                while (Eat(TK.Comma())) {
+                    if (At(TK.Greater()) || At(TK.RBrace()) || At(TK.LBrace())
+                            || At(TK.Semicolon()) || At(TK.RParen()) || At(TK.Eof())) {
+                        break;
+                    }
+                    t.Add(ParseType());
+                }
+            }
             Expect(TK.Greater());
         }
         // nullable
@@ -411,7 +555,8 @@ public partial class Parser {
         while (At(TK.LBracket())) {
             Next();
             int commas = 0;
-            while (!At(TK.RBracket()) && !At(TK.Eof())) {
+            while (!At(TK.RBracket()) && !At(TK.Semicolon()) && !At(TK.RBrace())
+                    && !At(TK.LBrace()) && !At(TK.RParen()) && !At(TK.Eof())) {
                 if (At(TK.Comma())) { commas = commas + 1; }
                 Next();
             }
@@ -450,12 +595,14 @@ public partial class Parser {
         else { return; }
         while (At(TK.Dot())) {
             Next();
-            if (At(TK.Ident()) || IsTypeKeyword(K())) { Next(); }
+            if (At(TK.Ident())) { Next(); }
+            else { return; }
         }
         if (At(TK.Less())) {
             int depth = 0;
             Next(); depth = 1;
             while (depth > 0 && !At(TK.Eof())) {
+                if (At(TK.Semicolon()) || At(TK.LBrace()) || At(TK.RBrace())) { return; }
                 if (At(TK.Less())) { depth = depth + 1; }
                 else if (At(TK.Greater())) { depth = depth - 1; }
                 Next();
@@ -464,7 +611,8 @@ public partial class Parser {
         if (At(TK.Question())) { Next(); skipNullable = true; }
         while (At(TK.LBracket())) {
             Next();
-            while (!At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+            while (!At(TK.RBracket()) && !At(TK.Semicolon()) && !At(TK.LBrace())
+                    && !At(TK.RBrace()) && !At(TK.Eof())) { Next(); }
             if (At(TK.RBracket())) { Next(); }
         }
         if (At(TK.Question())) { Next(); skipNullable = true; }
@@ -544,10 +692,15 @@ public partial class Parser {
     public Node ParseSourceDecls() {
         Node unit = new Node(AK.CompUnit());
         while (!At(TK.Eof())) {
+            int posBefore = pos;
             int k = K();
             if (k == TK.Using()) { unit.Add(ParseUsing()); }
             else if (k == TK.Namespace()) { ParseNamespace(unit); }
             else { Node d = ParseTypeDecl(); if (d != null) { unit.Add(d); } }
+            if (pos == posBefore && !At(TK.Eof())) {
+                RecordUnexpected();
+                SynchronizeTopLevel(false);
+            }
         }
         return unit;
     }
