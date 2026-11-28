@@ -1,0 +1,96 @@
+// B-ID186 Wave 10: verify NarrowToDeclared & element-storage parity across
+// remaining selfhost irgen sinks:
+//   1. Tuple deconstruction (int/byte/float narrowing & int->double widening)
+//   2. Dictionary<K,V> key/value narrowing (indexer, Add, ContainsKey, TryGetValue, Remove, collection-init)
+//   3. Generic class field store & object initializer (GBox<int>, GBox<float>)
+//   4. foreach over List<T>, T[] (narrowing & widening stride), and custom IEnumerable
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class GBox<T> {
+    public T Val;
+    public GBox(T v) { Val = v; }
+    public GBox() {}
+}
+
+class LongEnum {
+    long[] data;
+    int idx;
+    public LongEnum(long[] d) { data = d; idx = -1; }
+    public bool MoveNext() { idx = idx + 1; return idx < data.Length; }
+    public long Current => data[idx];
+}
+
+class LongSeq {
+    long[] data;
+    public LongSeq(long[] d) { data = d; }
+    public LongEnum GetEnumerator() { return new LongEnum(data); }
+}
+
+class Program {
+    static long Big() { return 1792488600000; }
+    static double Third() { return 1.0 / 3.0; }
+
+    static async void RunAsyncChecks() {
+        await Task.Delay(1);
+        (int ai, byte ab, float af) = (Big(), Big(), Third());
+        Console.WriteLine("async.decon=" + ai + "," + ab + "," + ((double)af != Third()).ToString().ToLower());
+
+        List<long> ll = new List<long>();
+        ll.Add(Big());
+        foreach (int fi in ll) {
+            await Task.Delay(1);
+            Console.WriteLine("async.fe.list.i=" + fi);
+        }
+    }
+
+    static async void Main() {
+        long big = Big();
+        int narrowI = (int)big;
+
+        // 1. Tuple deconstruction narrowing
+        (int di, byte db, float df) = (big, big, Third());
+        Console.WriteLine("decon=" + di + "," + db + "," + ((double)df != Third()).ToString().ToLower());
+
+        // 2. Dictionary<int, byte> key & value narrowing across operations
+        Dictionary<int, byte> d = new Dictionary<int, byte>();
+        d[big] = big;
+        bool has1 = d.ContainsKey(narrowI);
+        bool has2 = d.ContainsKey(big);
+        byte tv = 0;
+        bool got = d.TryGetValue(narrowI, out tv);
+        Console.WriteLine("dict.idx=" + has1.ToString().ToLower() + "," + has2.ToString().ToLower() + "," + got.ToString().ToLower() + "," + tv + "," + d[narrowI]);
+        bool rem = d.Remove(narrowI);
+        Console.WriteLine("dict.rem=" + rem.ToString().ToLower() + "," + d.Count);
+
+        d.Add(big, big);
+        Console.WriteLine("dict.add=" + d.ContainsKey(narrowI).ToString().ToLower() + "," + d[narrowI]);
+
+        // 3. Generic class field store & object initializer
+        GBox<int> gi = new GBox<int>(0);
+        gi.Val = big;
+        GBox<int> gi2 = new GBox<int> { Val = big };
+        GBox<float> gf = new GBox<float>(0.0);
+        gf.Val = Third();
+        GBox<float> gf2 = new GBox<float> { Val = Third() };
+        Console.WriteLine("gbox=" + gi.Val + "," + gi2.Val + "," + ((double)gf.Val != Third()).ToString().ToLower() + "," + ((double)gf2.Val != Third()).ToString().ToLower());
+
+        // 4. foreach over List<long>, double[], and custom enumerable
+        List<long> ll = new List<long>();
+        ll.Add(big);
+        foreach (int fi in ll) { Console.WriteLine("fe.list.i=" + fi); }
+        foreach (byte fb in ll) { Console.WriteLine("fe.list.b=" + fb); }
+
+        double[] darr = new double[] { Third() };
+        foreach (float af in darr) {
+            Console.WriteLine("fe.darr.f32=" + ((double)af != Third()).ToString().ToLower());
+        }
+
+        LongSeq seq = new LongSeq(new long[] { big });
+        foreach (int ei in seq) { Console.WriteLine("fe.enum.i=" + ei); }
+        foreach (byte eb in seq) { Console.WriteLine("fe.enum.b=" + eb); }
+
+        await RunAsyncChecks();
+    }
+}
