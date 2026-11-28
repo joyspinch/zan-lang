@@ -1,0 +1,283 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌面陪伴闹钟/日程提醒条目。
+public class CompanionAlarmEntry {
+    public int Id;
+    public string Label;
+    public int Hour;
+    public int Minute;
+    public int WeekdayMask; // bit 0..6 对应周日..周六（127=每天）
+    public bool Enabled;
+    public bool IgnoreQuietHours;
+    public int SnoozeUntilMinuteOfDay;
+    public int LastTriggeredDayIndex;
+
+    public CompanionAlarmEntry(int id, string label, int hour, int minute, int weekdayMask, bool ignoreQuietHours) {
+        this.Id = id;
+        this.Label = label != null ? label : "";
+        this.Hour = hour;
+        this.Minute = minute;
+        this.WeekdayMask = weekdayMask;
+        this.Enabled = true;
+        this.IgnoreQuietHours = ignoreQuietHours;
+        this.SnoozeUntilMinuteOfDay = -1;
+        this.LastTriggeredDayIndex = -1000;
+    }
+}
+
+// 商业桌面陪伴闹钟、日程与贪睡（Snooze）提醒调度器：
+// 支持按星期掩码重复、跨午夜免打扰时段（Quiet Hours）静默拦截、贪睡延后与同日防重复触发。
+public class CompanionAlarmAndScheduleBoard {
+    public bool QuietHoursEnabled;
+    public int QuietStartHour;
+    public int QuietEndHour;
+    public int TriggerWindowMinutes;
+
+    private List<CompanionAlarmEntry> alarms;
+    private int nextId;
+
+    public CompanionAlarmAndScheduleBoard() {
+        this.QuietHoursEnabled = false;
+        this.QuietStartHour = 23;
+        this.QuietEndHour = 7;
+        this.TriggerWindowMinutes = 10;
+        this.alarms = new List<CompanionAlarmEntry>();
+        this.nextId = 1;
+    }
+
+    public CompanionAlarmEntry AddAlarm(string label, int hour, int minute, int weekdayMask, bool ignoreQuietHours) {
+        CompanionAlarmEntry a = new CompanionAlarmEntry(this.nextId, label, hour, minute, weekdayMask, ignoreQuietHours);
+        this.nextId = this.nextId + 1;
+        this.alarms.Add(a);
+        return a;
+    }
+
+    public bool IsInQuietHours(int hour) {
+        if (!this.QuietHoursEnabled) { return false; }
+        if (this.QuietStartHour <= this.QuietEndHour) {
+            return hour >= this.QuietStartHour && hour < this.QuietEndHour;
+        }
+        // 跨午夜，如 23:00 .. 07:00
+        return hour >= this.QuietStartHour || hour < this.QuietEndHour;
+    }
+
+    public bool SnoozeAlarm(int alarmId, int currentMinuteOfDay, int snoozeMinutes) {
+        for (int i = 0; i < this.alarms.Count; i = i + 1) {
+            if (this.alarms[i].Id == alarmId) {
+                int s = snoozeMinutes > 0 ? snoozeMinutes : 5;
+                this.alarms[i].SnoozeUntilMinuteOfDay = currentMinuteOfDay + s;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 评估当前时刻应触发的所有提醒（含正常到点与贪睡到期）。
+    public List<CompanionAlarmEntry> EvaluateDue(int dayIndex, int dayOfWeek06, int hour, int minute) {
+        List<CompanionAlarmEntry> due = new List<CompanionAlarmEntry>();
+        int nowMin = hour * 60 + minute;
+        int dayBit = 1 << (dayOfWeek06 & 7);
+        bool quiet = this.IsInQuietHours(hour);
+
+        for (int i = 0; i < this.alarms.Count; i = i + 1) {
+            CompanionAlarmEntry a = this.alarms[i];
+            if (!a.Enabled) { continue; }
+            if (quiet && !a.IgnoreQuietHours) { continue; }
+
+            if (a.SnoozeUntilMinuteOfDay >= 0 && nowMin >= a.SnoozeUntilMinuteOfDay) {
+                a.SnoozeUntilMinuteOfDay = -1;
+                due.Add(a);
+                continue;
+            }
+            if ((a.WeekdayMask & dayBit) == 0) { continue; }
+            if (a.LastTriggeredDayIndex == dayIndex) { continue; }
+            int targetMin = a.Hour * 60 + a.Minute;
+            int win = this.TriggerWindowMinutes > 0 ? this.TriggerWindowMinutes : 1;
+            if (nowMin >= targetMin && nowMin < targetMin + win) {
+                a.LastTriggeredDayIndex = dayIndex;
+                due.Add(a);
+            }
+        }
+        return due;
+    }
+}
+
+// 扭蛋奖池单品记录（rarity: 0=Common, 1=Rare, 2=Epic）。
+public class GachaPrizeItem {
+    public string ItemId;
+    public int Rarity;
+    public int Weight;
+
+    public GachaPrizeItem(string itemId, int rarity, int weight) {
+        this.ItemId = itemId != null ? itemId : "";
+        this.Rarity = rarity;
+        this.Weight = weight > 0 ? weight : 1;
+    }
+}
+
+// 商业桌面陪伴硬保底扭蛋机（Companion Gacha Capsule Machine）：
+// 透明权重抽取 + 确定性 LCG 伪随机 + 硬保底计数（达到 HardPityThreshold 必出最高稀有度 Epic 并重置保底）。
+public class CompanionGachaMachine {
+    public int PullCostCoins;
+    public int HardPityThreshold;
+    public int PityCounter;
+    public int TotalPulls;
+
+    private uint rngState;
+    private List<GachaPrizeItem> pool;
+
+    public CompanionGachaMachine(int pullCostCoins, int hardPityThreshold, uint seed) {
+        this.PullCostCoins = pullCostCoins >= 0 ? pullCostCoins : 50;
+        this.HardPityThreshold = hardPityThreshold >= 2 ? hardPityThreshold : 10;
+        this.PityCounter = 0;
+        this.TotalPulls = 0;
+        this.rngState = seed != 0U ? seed : 2463534242U;
+        this.pool = new List<GachaPrizeItem>();
+    }
+
+    public void AddPrize(string itemId, int rarity, int weight) {
+        this.pool.Add(new GachaPrizeItem(itemId, rarity, weight));
+    }
+
+    private uint NextRand() {
+        this.rngState = unchecked(this.rngState * 1664525U + 1013904223U);
+        return (this.rngState >> 8) & 16777215U;
+    }
+
+    public GachaPrizeItem PullOnce(ref int playerCoins) {
+        if (this.pool.Count == 0 || playerCoins < this.PullCostCoins) { return null; }
+        playerCoins = playerCoins - this.PullCostCoins;
+        this.TotalPulls = this.TotalPulls + 1;
+        this.PityCounter = this.PityCounter + 1;
+
+        bool forceEpic = this.PityCounter >= this.HardPityThreshold;
+        int totalWeight = 0;
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            if (forceEpic && this.pool[i].Rarity < 2) { continue; }
+            totalWeight = totalWeight + this.pool[i].Weight;
+        }
+        if (totalWeight <= 0) {
+            // 池中无 Epic 兜底走全池
+            forceEpic = false;
+            for (int i = 0; i < this.pool.Count; i = i + 1) {
+                totalWeight = totalWeight + this.pool[i].Weight;
+            }
+        }
+
+        int roll = (int)(this.NextRand() % (uint)totalWeight);
+        int accum = 0;
+        GachaPrizeItem picked = this.pool[this.pool.Count - 1];
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            if (forceEpic && this.pool[i].Rarity < 2) { continue; }
+            accum = accum + this.pool[i].Weight;
+            if (roll < accum) {
+                picked = this.pool[i];
+                break;
+            }
+        }
+        if (picked.Rarity >= 2) {
+            this.PityCounter = 0;
+        }
+        return picked;
+    }
+}
+
+// 剪贴板历史/快捷片段条目。
+public class ClipboardSnippetEntry {
+    public int Id;
+    public string Text;
+    public bool Pinned;
+
+    public ClipboardSnippetEntry(int id, string text, bool pinned) {
+        this.Id = id;
+        this.Text = text != null ? text : "";
+        this.Pinned = pinned;
+    }
+}
+
+// 商业桌面陪伴剪贴板历史与密钥防泄漏助手：
+// - 自动拦截疑似密钥/私钥/Bearer Token 防止明文留存历史
+// - 重复复制自动置顶去重、按 MaxUnpinnedHistory 限容同时永久保留 Pinned 快捷常用片段
+public class CompanionClipboardSnippetHelper {
+    public int MaxUnpinnedHistory;
+    public int BlockedSecretCount;
+    private List<ClipboardSnippetEntry> entries;
+    private int nextId;
+
+    public CompanionClipboardSnippetHelper(int maxUnpinnedHistory) {
+        this.MaxUnpinnedHistory = maxUnpinnedHistory >= 2 ? maxUnpinnedHistory : 20;
+        this.BlockedSecretCount = 0;
+        this.entries = new List<ClipboardSnippetEntry>();
+        this.nextId = 1;
+    }
+
+    public int EntryCount { get { return this.entries.Count; } }
+
+    public ClipboardSnippetEntry EntryAt(int index) {
+        if (index < 0 || index >= this.entries.Count) { return null; }
+        return this.entries[index];
+    }
+
+    // 启发式敏感凭据检测：拦截 PEM 私钥、Bearer 令牌与常见 API Key 前缀（sk- / ghp_ / AKIA）。
+    public static bool LooksLikeSecret(string text) {
+        if (text == null || text == "") { return false; }
+        string low = text.ToLower();
+        if (low.IndexOf("-----begin ") >= 0 && low.IndexOf("private key") >= 0) { return true; }
+        if (low.IndexOf("bearer ") >= 0 && text.Length >= 24) { return true; }
+        if (text.IndexOf("sk-") == 0 && text.Length >= 20) { return true; }
+        if (text.IndexOf("ghp_") == 0 && text.Length >= 20) { return true; }
+        if (text.IndexOf("AKIA") == 0 && text.Length >= 16) { return true; }
+        return false;
+    }
+
+    public bool RecordClipboardText(string text) {
+        if (text == null || text == "") { return false; }
+        if (LooksLikeSecret(text)) {
+            this.BlockedSecretCount = this.BlockedSecretCount + 1;
+            return false;
+        }
+        // 已存在则移至顶部去重（保留其 Pinned 状态）
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Text == text) {
+                ClipboardSnippetEntry existing = this.entries[i];
+                this.entries.RemoveAt(i);
+                this.entries.Insert(0, existing);
+                return true;
+            }
+        }
+        this.entries.Insert(0, new ClipboardSnippetEntry(this.nextId, text, false));
+        this.nextId = this.nextId + 1;
+
+        // 仅淘汰最老的非置顶条目，绝不挤掉用户 Pin 住的快捷片段
+        int unpinnedCount = 0;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (!this.entries[i].Pinned) { unpinnedCount = unpinnedCount + 1; }
+        }
+        while (unpinnedCount > this.MaxUnpinnedHistory) {
+            int dropIdx = -1;
+            for (int i = this.entries.Count - 1; i >= 0; i = i - 1) {
+                if (!this.entries[i].Pinned) {
+                    dropIdx = i;
+                    break;
+                }
+            }
+            if (dropIdx < 0) { break; }
+            this.entries.RemoveAt(dropIdx);
+            unpinnedCount = unpinnedCount - 1;
+        }
+        return true;
+    }
+
+    public bool SetPinned(string text, bool pinned) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Text == text) {
+                this.entries[i].Pinned = pinned;
+                return true;
+            }
+        }
+        return false;
+    }
+}

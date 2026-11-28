@@ -145,6 +145,7 @@ typedef struct {
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
     zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light, u_toon;
+    zgl_int u_dissolve, u_dissolve_edge, u_clip_plane, u_clip_on;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -210,6 +211,10 @@ static char g_game_emissive_key[256] = { 0 };
 static float g_game_uv_transform[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
 static float g_game_rim_light[4] = { 0.0f, 0.0f, 0.0f, 3.0f };
 static float g_game_toon[2] = { 0.0f, 0.35f }; /* bands, specular_step */
+static float g_game_dissolve[2] = { 0.0f, 0.08f }; /* threshold, edge_width */
+static float g_game_dissolve_edge[3] = { 1.0f, 0.4f, 0.05f };
+static float g_game_clip_plane[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+static int g_game_clip_on = 0;
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -462,6 +467,10 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform int uEmissiveOn;\n" \
 "uniform vec4 uRimLight;\n" \
 "uniform vec2 uToon;\n" \
+"uniform vec2 uDissolve;\n" \
+"uniform vec3 uDissolveEdge;\n" \
+"uniform vec4 uClipPlane;\n" \
+"uniform int uClipOn;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -593,8 +602,24 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    }\n"
 
 #define ZAN_GAME_3D_FINAL_COMPOSE(BASE_EXPR, ALPHA_EXPR) \
+"    if (uClipOn != 0 && (dot(v_world_pos, uClipPlane.xyz) + uClipPlane.w) < 0.0) discard;\n" \
 "    float outAlpha = " ALPHA_EXPR ";\n" \
 "    if (uAlphaCutoff > 0.0001 && outAlpha < uAlphaCutoff) discard;\n" \
+"    float dissEdgeBoost = 0.0;\n" \
+"    if (uDissolve.x > 0.0001) {\n" \
+"        vec2 dCell = floor(v_uv * 16.0);\n" \
+"        vec2 dF = fract(v_uv * 16.0);\n" \
+"        vec2 dS = dF * dF * (3.0 - 2.0 * dF);\n" \
+"        float h00 = fract(sin(dot(dCell, vec2(127.1, 311.7))) * 43758.5453);\n" \
+"        float h10 = fract(sin(dot(dCell + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);\n" \
+"        float h01 = fract(sin(dot(dCell + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);\n" \
+"        float h11 = fract(sin(dot(dCell + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);\n" \
+"        float dn = mix(mix(h00, h10, dS.x), mix(h01, h11, dS.x), dS.y);\n" \
+"        if (dn < uDissolve.x) discard;\n" \
+"        if (uDissolve.y > 0.0001 && dn < uDissolve.x + uDissolve.y) {\n" \
+"            dissEdgeBoost = (1.0 - (dn - uDissolve.x) / uDissolve.y) * 2.0;\n" \
+"        }\n" \
+"    }\n" \
     "    vec3 baseRgb = " BASE_EXPR ";\n" \
     "    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
     "    vec3 emitRgb = (uEmissiveOn != 0) ? (uEmissive * texture(uEmissiveMap, v_uv).rgb) : uEmissive;\n" \
@@ -611,7 +636,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float sq = smoothstep(spStep - 0.03, spStep + 0.03, sl);\n" \
     "        litSpec = (sl > 0.0001) ? (litSpec * (sq / sl)) : vec3(0.0);\n" \
     "    }\n" \
-    "    vec3 rgb = baseRgb * mix(litDiff, litDiff * (0.35 + 0.65 * rough), metal) + specTint * litSpec + emitRgb;\n" \
+    "    vec3 rgb = baseRgb * mix(litDiff, litDiff * (0.35 + 0.65 * rough), metal) + specTint * litSpec + emitRgb + uDissolveEdge * dissEdgeBoost;\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -1022,6 +1047,14 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uRimLight");
     zgl_int toon = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uToon");
+    zgl_int dissolve = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uDissolve");
+    zgl_int dissolve_edge = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uDissolveEdge");
+    zgl_int clip_plane = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uClipPlane");
+    zgl_int clip_on = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uClipOn");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1084,6 +1117,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_uv_transform = uv_transform;
     prog->u_rim_light = rim_light;
     prog->u_toon = toon;
+    prog->u_dissolve = dissolve;
+    prog->u_dissolve_edge = dissolve_edge;
+    prog->u_clip_plane = clip_plane;
+    prog->u_clip_on = clip_on;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1143,6 +1180,10 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int uv_transform = g_game_gl->GetUniformLocation(program, "uUvTransform");
     zgl_int rim_light = g_game_gl->GetUniformLocation(program, "uRimLight");
     zgl_int toon = g_game_gl->GetUniformLocation(program, "uToon");
+    zgl_int dissolve = g_game_gl->GetUniformLocation(program, "uDissolve");
+    zgl_int dissolve_edge = g_game_gl->GetUniformLocation(program, "uDissolveEdge");
+    zgl_int clip_plane = g_game_gl->GetUniformLocation(program, "uClipPlane");
+    zgl_int clip_on = g_game_gl->GetUniformLocation(program, "uClipOn");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1193,6 +1234,10 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_uv_transform = uv_transform;
     g_game_skin_prog.u_rim_light = rim_light;
     g_game_skin_prog.u_toon = toon;
+    g_game_skin_prog.u_dissolve = dissolve;
+    g_game_skin_prog.u_dissolve_edge = dissolve_edge;
+    g_game_skin_prog.u_clip_plane = clip_plane;
+    g_game_skin_prog.u_clip_on = clip_on;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1616,6 +1661,20 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_toon >= 0) {
         gl->Uniform2f(prog->u_toon, g_game_toon[0], g_game_toon[1]);
+    }
+    if (prog->u_dissolve >= 0) {
+        gl->Uniform2f(prog->u_dissolve, g_game_dissolve[0], g_game_dissolve[1]);
+    }
+    if (prog->u_dissolve_edge >= 0) {
+        gl->Uniform3fv(prog->u_dissolve_edge, 1, g_game_dissolve_edge);
+    }
+    if (prog->u_clip_plane >= 0) {
+        gl->Uniform4f(prog->u_clip_plane,
+            g_game_clip_plane[0], g_game_clip_plane[1],
+            g_game_clip_plane[2], g_game_clip_plane[3]);
+    }
+    if (prog->u_clip_on >= 0) {
+        gl->Uniform1i(prog->u_clip_on, g_game_clip_on);
     }
 }
 
@@ -2493,4 +2552,26 @@ ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_
     if (chromatic_strength > 0.1f) chromatic_strength = 0.1f;
     g_game_post_lens[0] = fxaa_strength;
     g_game_post_lens[1] = chromatic_strength;
+}
+
+ZAN_GAME_API void zan_game_set_dissolve3d(float threshold, float edge_width,
+    float edge_r, float edge_g, float edge_b) {
+    if (threshold < 0.0f) threshold = 0.0f;
+    if (threshold > 1.2f) threshold = 1.2f;
+    if (edge_width < 0.0f) edge_width = 0.0f;
+    if (edge_width > 0.5f) edge_width = 0.5f;
+    g_game_dissolve[0] = threshold;
+    g_game_dissolve[1] = edge_width;
+    g_game_dissolve_edge[0] = edge_r > 0.0f ? edge_r : 0.0f;
+    g_game_dissolve_edge[1] = edge_g > 0.0f ? edge_g : 0.0f;
+    g_game_dissolve_edge[2] = edge_b > 0.0f ? edge_b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_clip_plane3d(int32_t enabled,
+    float nx, float ny, float nz, float d) {
+    g_game_clip_on = enabled ? 1 : 0;
+    g_game_clip_plane[0] = nx;
+    g_game_clip_plane[1] = ny;
+    g_game_clip_plane[2] = nz;
+    g_game_clip_plane[3] = d;
 }

@@ -1,0 +1,119 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DDissolveClipSpatialTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeFullQuad(float halfSize) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int quadH = cv.MeshUpload(MakeFullQuad(1.8f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        // 1. GPU 世界空间裁剪平面（x >= 0 保留，x < 0 丢弃：左半画面纯黑，右半画面纯白）
+        SceneNode rClip = new SceneNode("clip_root");
+        SceneNode nQuad = new SceneNode("quad");
+        nQuad.MeshKey = quadH;
+        nQuad.BoundsRadius = 4.0f;
+        nQuad.Material = Material.Emissive(0.95f, 0.95f, 0.95f);
+        rClip.AddChild(nQuad);
+
+        RenderPlan pClip = new RenderPlan(cam);
+        pClip.AmbientRed = 0.0f; pClip.AmbientGreen = 0.0f; pClip.AmbientBlue = 0.0f;
+        pClip.Build(rClip);
+
+        renderer.EnableClipPlane = true;
+        renderer.ClipPlaneNormalX = 1.0f;
+        renderer.ClipPlaneNormalY = 0.0f;
+        renderer.ClipPlaneNormalZ = 0.0f;
+        renderer.ClipPlaneDistance = 0.0f;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pClip);
+        int pixLeft = zan_gui_read_pixel(cv.SurfaceId(), 32, 64);  // world x < 0 -> clipped!
+        int pixRight = zan_gui_read_pixel(cv.SurfaceId(), 96, 64); // world x > 0 -> visible!
+        renderer.EnableClipPlane = false;
+        bool clipOk = ROf(pixLeft) < 5 && ROf(pixRight) > 220;
+        Console.WriteLine("gpu-world-clip-plane: " + Convert.ToString(clipOk ? 1 : 0));
+
+        // 2. GPU 程序化噪声消融（Dissolve）：
+        // threshold=0.50 + 火焰红橙边缘 -> 画面同时存在已丢弃孔洞（黑色）、未消融实体（灰色）与灼热红橙边缘（R >> B）
+        // threshold=1.05 -> 整块网格完全消融为空
+        Material mDis = Material.Emissive(0.25f, 0.25f, 0.25f);
+        mDis.DissolveThreshold = 0.50f;
+        mDis.DissolveEdgeWidth = 0.25f;
+        mDis.DissolveEdgeRed = 1.0f;
+        mDis.DissolveEdgeGreen = 0.25f;
+        mDis.DissolveEdgeBlue = 0.0f;
+        nQuad.Material = mDis;
+        pClip.Build(rClip);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pClip);
+
+        int holes = 0;
+        int glowingEdges = 0;
+        int solidPixels = 0;
+        for (int y = 24; y < 104; y = y + 4) {
+            for (int x = 24; x < 104; x = x + 4) {
+                int px = zan_gui_read_pixel(cv.SurfaceId(), x, y);
+                int r = ROf(px);
+                int b = BOf(px);
+                if (r < 5 && b < 5) { holes = holes + 1; }
+                else if (r > b + 50) { glowingEdges = glowingEdges + 1; }
+                else if (r > 40 && b > 40) { solidPixels = solidPixels + 1; }
+            }
+        }
+
+        mDis.DissolveThreshold = 1.05f;
+        pClip.Build(rClip);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pClip);
+        int pixGone = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        bool dissolveOk = holes > 20 && glowingEdges > 10 && solidPixels > 10 && ROf(pixGone) < 5;
+        Console.WriteLine("gpu-procedural-dissolve: " + Convert.ToString(dissolveOk ? 1 : 0));
+
+        // 3. SpatialHash3D 宽相空间网格（插入/跨格移动/移除/局部球查询）
+        SpatialHash3D grid = new SpatialHash3D(5.0f);
+        grid.Upsert(1, new Vector3(1.0f, 0.0f, 0.0f), 1.0f);
+        grid.Upsert(2, new Vector3(3.0f, 0.0f, 0.0f), 1.0f);
+        grid.Upsert(3, new Vector3(50.0f, 0.0f, 0.0f), 1.0f);
+        List<int> near1 = grid.QuerySphere(new Vector3(0.0f, 0.0f, 0.0f), 3.5f, 1.0f); // 命中 1 和 2，排除 3
+        // 跨格移动实体 3 到原点附近，并移除实体 1
+        grid.Upsert(3, new Vector3(0.5f, 0.0f, 0.0f), 1.0f);
+        grid.Remove(1);
+        List<int> near2 = grid.QuerySphere(new Vector3(0.0f, 0.0f, 0.0f), 1.5f, 1.0f); // 仅命中移动后的 3
+        bool spatialOk = near1.Count == 2 && near2.Count == 1 && near2[0] == 3 && grid.BodyCount == 2;
+        Console.WriteLine("spatial-hash-3d-broadphase: " + Convert.ToString(spatialOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

@@ -1,0 +1,69 @@
+using System;
+using System.Collections.Generic;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionScheduleGachaClipboardTest {
+    static void Main() {
+        // 1. 闹钟/日程调度：跨午夜免打扰、星期掩码、同日防重、贪睡 Snooze
+        CompanionAlarmAndScheduleBoard sched = new CompanionAlarmAndScheduleBoard();
+        sched.QuietHoursEnabled = true;
+        sched.QuietStartHour = 23;
+        sched.QuietEndHour = 7;
+        // 每天 02:00 的普通提醒在免打扰期间被静默；每天 09:00 的晨会提醒正常触发
+        CompanionAlarmEntry nightNudge = sched.AddAlarm("Drink Water", 2, 0, 127, false);
+        CompanionAlarmEntry standup = sched.AddAlarm("Daily Standup", 9, 0, 1 << 1, false); // 仅周一 (dayOfWeek=1)
+
+        List<CompanionAlarmEntry> dueNight = sched.EvaluateDue(10, 1, 2, 5);   // 凌晨 2 点静默 -> 0
+        List<CompanionAlarmEntry> dueSun = sched.EvaluateDue(10, 0, 9, 5);     // 周日不触发周一闹钟 -> 0
+        List<CompanionAlarmEntry> dueMon = sched.EvaluateDue(10, 1, 9, 5);     // 周一 09:05 -> 命中 standup
+        List<CompanionAlarmEntry> dueDup = sched.EvaluateDue(10, 1, 9, 6);     // 同日防重 -> 0
+        sched.SnoozeAlarm(standup.Id, 9 * 60 + 6, 10);                         // 贪睡 10 分钟 -> 09:16 再次提醒
+        List<CompanionAlarmEntry> dueSnooze = sched.EvaluateDue(10, 1, 9, 16);
+        bool schedOk = nightNudge != null && dueNight.Count == 0 && dueSun.Count == 0
+            && dueMon.Count == 1 && dueMon[0].Id == standup.Id
+            && dueDup.Count == 0
+            && dueSnooze.Count == 1 && dueSnooze[0].Id == standup.Id;
+        Console.WriteLine("companion-alarm-quiet-snooze: " + Convert.ToString(schedOk ? 1 : 0));
+
+        // 2. 硬保底扭蛋机：5 抽硬保底必出 Epic 且出 Epic 后保底计数清零
+        CompanionGachaMachine gacha = new CompanionGachaMachine(10, 5, 1337U);
+        gacha.AddPrize("snack_cookie", 0, 95);
+        gacha.AddPrize("hat_nebula", 2, 1); // 极低概率，验证硬保底在 <=5 抽内必出
+        int coins = 50;
+        bool gotEpic = false;
+        int pullsToEpic = 0;
+        for (int i = 1; i <= 5; i = i + 1) {
+            GachaPrizeItem prize = gacha.PullOnce(ref coins);
+            if (prize != null && prize.Rarity == 2) {
+                gotEpic = true;
+                pullsToEpic = i;
+                break;
+            }
+        }
+        bool gachaOk = gotEpic && pullsToEpic <= 5 && gacha.PityCounter == 0 && coins == 50 - pullsToEpic * 10;
+        Console.WriteLine("companion-gacha-hard-pity: " + Convert.ToString(gachaOk ? 1 : 0));
+
+        // 3. 剪贴板历史助手：密钥防泄漏拦截 + 置顶免疫淘汰 + 重复置顶去重
+        CompanionClipboardSnippetHelper clip = new CompanionClipboardSnippetHelper(2);
+        bool secretBlocked1 = !clip.RecordClipboardText("sk-live-secret-token-1234567890");
+        bool secretBlocked2 = !clip.RecordClipboardText("-----BEGIN RSA PRIVATE KEY-----\nMIIE...");
+        clip.RecordClipboardText("pinned_sig");
+        clip.SetPinned("pinned_sig", true);
+        clip.RecordClipboardText("clip_1");
+        clip.RecordClipboardText("clip_2");
+        clip.RecordClipboardText("clip_3"); // 非置顶上限 2 -> 淘汰 clip_1，但 pinned_sig 必须完好保留！
+        clip.RecordClipboardText("clip_2"); // 重复复制 clip_2 -> 置顶到 index 0 且总数不变
+
+        bool hasPinned = false;
+        for (int i = 0; i < clip.EntryCount; i = i + 1) {
+            ClipboardSnippetEntry e = clip.EntryAt(i);
+            if (e != null && e.Text == "pinned_sig") { hasPinned = true; }
+        }
+        ClipboardSnippetEntry top = clip.EntryAt(0);
+        bool clipOk = secretBlocked1 && secretBlocked2 && clip.BlockedSecretCount == 2
+            && clip.EntryCount == 3 && hasPinned && top != null && top.Text == "clip_2";
+        Console.WriteLine("companion-clipboard-secret-guard: " + Convert.ToString(clipOk ? 1 : 0));
+    }
+}
