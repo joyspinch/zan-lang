@@ -1,0 +1,488 @@
+using System;
+using Gui;
+using Game.Kit;
+
+// 竞技场世界绘制（只画世界，不画任何玩家可点的 UI）：
+// 深空渐变 → 视差星云与星点 → 以玩家为中心渐隐的六边形蜂巢地纹 →
+// 场外警戒斜纹与霓虹围墙 → 豆子 / 能量豆 / 道具球 → 蛇（投影、皮肤、
+// 性格表情、护盾泡、磁场圈、王冠）→ 粒子与冲击波 → 屏幕外道具指引 → 暗角。
+// 配色沿用菜单插画：深蓝紫底、霓虹青 / 品红 / 金色高光。
+public class SnArt {
+    static int camX;
+    static int camY;
+    static int shX;
+    static int shY;
+
+    static int SX(int wx) { return SnGame.VW() / 2 + (wx - SnArt.camX) + SnArt.shX; }
+    static int SY(int wy) { return SnGame.VH() / 2 + (wy - SnArt.camY) + SnArt.shY; }
+    static bool On(int sx, int sy, int m) {
+        return sx > -m && sx < SnGame.VW() + m && sy > -m && sy < SnGame.VH() + m;
+    }
+    // 小整数格坐标的确定性散列（不溢出）。
+    static int Hash(int x, int y) {
+        int h = (x * 7919 + y * 104729 + (x % 97) * (y % 89) * 31 + 1000003) % 100003;
+        if (h < 0) { h = -h; }
+        return h;
+    }
+    static int Ease(int t, int span) {
+        // ease-out quad，返回 0..256
+        if (t >= span) { return 256; }
+        if (t <= 0) { return 0; }
+        int u = 256 - t * 256 / span;
+        return 256 - u * u / 256;
+    }
+
+    static void DrawScene(SnGame g, int wallNow) {
+        Canvas c = g.c;
+        int now = g.simNow;
+        SnArt.shX = 0;
+        SnArt.shY = 0;
+        if (now < g.shakeUntil) {
+            int left = g.shakeUntil - now;
+            int amp = Math.Max(1, g.shakeAmp * left / 400);
+            SnArt.shX = (wallNow * 7 % (amp * 2 + 1)) - amp;
+            SnArt.shY = (wallNow * 13 % (amp * 2 + 1)) - amp;
+        }
+        SnArt.camX = g.me.headX / 256;
+        SnArt.camY = g.me.headY / 256;
+        SnArt.Backdrop(g, c, wallNow);
+        SnArt.Arena(g, c, wallNow);
+        SnArt.Orbs(g, c, wallNow);
+        for (int fi = 0; fi < g.foes.Count; fi = fi + 1) {
+            if (g.foes[fi].kind == 2) { SnArt.DrawWorm(g, c, g.foes[fi], wallNow); }
+        }
+        for (int fi = 0; fi < g.foes.Count; fi = fi + 1) {
+            if (g.foes[fi].kind == 1) { SnArt.DrawWorm(g, c, g.foes[fi], wallNow); }
+        }
+        SnArt.DrawWorm(g, c, g.me, wallNow);
+        SnArt.Effects(g, c);
+        SnArt.PowerPointers(g, c, wallNow);
+        // 暗角：上下边缘压暗，让 HUD 文字有底。
+        int vw = SnGame.VW();
+        int vh = SnGame.VH();
+        CDraw.FillVGrad(c, 0, 0, vw, 110, CDraw.Argb(150, 2, 4, 12), CDraw.Argb(0, 2, 4, 12));
+        CDraw.FillVGrad(c, 0, vh - 120, vw, 120, CDraw.Argb(0, 2, 4, 12), CDraw.Argb(160, 2, 4, 12));
+    }
+
+    static void Backdrop(SnGame g, Canvas c, int wallNow) {
+        int vw = SnGame.VW();
+        int vh = SnGame.VH();
+        CDraw.FillVGrad(c, 0, 0, vw, vh, CDraw.Argb(255, 13, 16, 40), CDraw.Argb(255, 6, 8, 22));
+        // 星云：1/2 视差，700px 一格，三格里亮两格。
+        int pcx = SnArt.camX / 2;
+        int pcy = SnArt.camY / 2;
+        int cell = 700;
+        int gx0 = (pcx - vw / 2) / cell - 1;
+        int gy0 = (pcy - vh / 2) / cell - 1;
+        for (int gx = gx0; gx <= gx0 + vw / cell + 2; gx = gx + 1) {
+            for (int gy = gy0; gy <= gy0 + vh / cell + 2; gy = gy + 1) {
+                int h = SnArt.Hash(gx + 50, gy + 50);
+                if (h % 3 == 0) { continue; }
+                int bx = gx * cell + h % 500 + 100;
+                int by = gy * cell + (h / 7) % 500 + 100;
+                int sx = vw / 2 + bx - pcx;
+                int sy = vh / 2 + by - pcy;
+                int rad = 300 + (h / 13) % 260;
+                int k = (h / 31) % 4;
+                if (k == 0) { CSprite.Glow(c, sx, sy, rad, 120, 60, 210, 40); }
+                if (k == 1) { CSprite.Glow(c, sx, sy, rad, 30, 150, 180, 34); }
+                if (k == 2) { CSprite.Glow(c, sx, sy, rad, 200, 50, 160, 32); }
+                if (k == 3) { CSprite.Glow(c, sx, sy, rad, 50, 90, 220, 36); }
+            }
+        }
+        // 星点：3/4 视差，缓慢闪烁。
+        int qcx = SnArt.camX * 3 / 4;
+        int qcy = SnArt.camY * 3 / 4;
+        int sc = 150;
+        int sx0 = (qcx - vw / 2) / sc - 1;
+        int sy0 = (qcy - vh / 2) / sc - 1;
+        for (int gx = sx0; gx <= sx0 + vw / sc + 2; gx = gx + 1) {
+            for (int gy = sy0; gy <= sy0 + vh / sc + 2; gy = gy + 1) {
+                int h = SnArt.Hash(gx + 300, gy + 700);
+                int px = vw / 2 + gx * sc + h % sc - qcx;
+                int py = vh / 2 + gy * sc + (h / 11) % sc - qcy;
+                int tw = ((wallNow / 40 + h) % 120);
+                if (tw > 60) { tw = 120 - tw; }
+                int a = 50 + (h / 3) % 90 + tw;
+                int r = 1 + (h / 17) % 2;
+                CSprite.Ball(c, px, py, r, 200, 220, 255, Math.Min(230, a));
+            }
+        }
+    }
+
+    // 六边形蜂巢地纹（随离玩家距离渐隐）+ 场外斜纹 + 霓虹围墙。
+    static void Arena(SnGame g, Canvas c, int wallNow) {
+        int vw = SnGame.VW();
+        int vh = SnGame.VH();
+        int R = 46;
+        int hh = 40;  // R * sin60
+        int colW = R * 3 / 2;
+        int rowH = hh * 2;
+        int wx0 = SnArt.camX - vw / 2 - SnArt.shX;
+        int wy0 = SnArt.camY - vh / 2 - SnArt.shY;
+        int c0 = wx0 / colW - 1;
+        int c1 = (wx0 + vw) / colW + 1;
+        int r0 = wy0 / rowH - 1;
+        int r1 = (wy0 + vh) / rowH + 1;
+        int maxD = vw * 3 / 4;
+        for (int ci = c0; ci <= c1; ci = ci + 1) {
+            for (int ri = r0; ri <= r1; ri = ri + 1) {
+                int hx = ci * colW;
+                int hy = ri * rowH + ((ci % 2 + 2) % 2) * hh;
+                if (hx < 0 || hy < 0 || hx > SnGame.WW() || hy > SnGame.WH()) { continue; }
+                int sx = SnArt.SX(hx);
+                int sy = SnArt.SY(hy);
+                int ddx = sx - vw / 2;
+                int ddy = sy - vh / 2;
+                int d = (ddx < 0 ? -ddx : ddx) + (ddy < 0 ? -ddy : ddy);
+                int a = 46 - d * 40 / maxD;
+                if (a < 8) { a = 8; }
+                CDraw.Line(c, sx + R / 2, sy - hh, sx - R / 2, sy - hh, 1, 110, 130, 230, a);
+                CDraw.Line(c, sx + R, sy, sx + R / 2, sy - hh, 1, 110, 130, 230, a);
+                CDraw.Line(c, sx + R / 2, sy + hh, sx + R, sy, 1, 110, 130, 230, a);
+                int h = SnArt.Hash(ci + 400, ri + 400);
+                if (h % 23 == 0) {
+                    // 零星点亮的蜂巢格：慢呼吸，给地面一点"活"的感觉。
+                    int br = (wallNow / 30 + h) % 200;
+                    if (br > 100) { br = 200 - br; }
+                    CSprite.Glow(c, sx, sy, R, 90, 120, 255, 10 + br / 6);
+                }
+            }
+        }
+
+        int hx2 = g.me.headX / 256;
+        int hy2 = g.me.headY / 256;
+        int near = SnGame.WallDist(hx2, hy2);
+        int danger = near < 420 ? (420 - near) * 255 / 420 : 0;
+        int pulse = (wallNow / 6) % 100;
+        if (pulse > 50) { pulse = 100 - pulse; }
+        int left = SnArt.SX(0);
+        int right = SnArt.SX(SnGame.WW());
+        int top = SnArt.SY(0);
+        int bottom = SnArt.SY(SnGame.WH());
+        int outside = CDraw.Argb(255, 4, 4, 12);
+        if (left > 0) { CDraw.FillRect(c, 0, 0, left, vh, outside); SnArt.StripesV(c, 0, left, vh); }
+        if (right < vw) { CDraw.FillRect(c, right, 0, vw - right, vh, outside); SnArt.StripesV(c, right, vw, vh); }
+        if (top > 0) { CDraw.FillRect(c, 0, 0, vw, top, outside); SnArt.StripesH(c, 0, top, vw); }
+        if (bottom < vh) { CDraw.FillRect(c, 0, bottom, vw, vh - bottom, outside); SnArt.StripesH(c, bottom, vh, vw); }
+        int wa = 120 + danger / 3 + pulse;
+        int w = SnGame.Wall();
+        int gr = 255; int gg = 70 + (255 - danger) / 4; int gb = 150 - danger / 4;
+        // 墙体：墙内 24px 是实体带，向场内渐隐 6 层辉光。
+        if (left > -w - 60 && left < vw) {
+            CDraw.FillRect(c, left, top, w, bottom - top, CDraw.Argb(255, 46, 14, 40));
+            for (int k = 0; k < 6; k = k + 1) { CDraw.FillRect(c, left + w + k * 8, top, 8, bottom - top, CDraw.Argb(wa / (k + 2), gr, gg, gb)); }
+            CDraw.FillRect(c, left + w - 2, top, 3, bottom - top, CDraw.Argb(240, 255, 160, 210));
+        }
+        if (right > 0 && right < vw + w + 60) {
+            CDraw.FillRect(c, right - w, top, w, bottom - top, CDraw.Argb(255, 46, 14, 40));
+            for (int k = 0; k < 6; k = k + 1) { CDraw.FillRect(c, right - w - (k + 1) * 8, top, 8, bottom - top, CDraw.Argb(wa / (k + 2), gr, gg, gb)); }
+            CDraw.FillRect(c, right - w - 1, top, 3, bottom - top, CDraw.Argb(240, 255, 160, 210));
+        }
+        if (top > -w - 60 && top < vh) {
+            CDraw.FillRect(c, left, top, right - left, w, CDraw.Argb(255, 46, 14, 40));
+            for (int k = 0; k < 6; k = k + 1) { CDraw.FillRect(c, left + w, top + w + k * 8, right - left - 2 * w, 8, CDraw.Argb(wa / (k + 2), gr, gg, gb)); }
+            CDraw.FillRect(c, left, top + w - 2, right - left, 3, CDraw.Argb(240, 255, 160, 210));
+        }
+        if (bottom > 0 && bottom < vh + w + 60) {
+            CDraw.FillRect(c, left, bottom - w, right - left, w, CDraw.Argb(255, 46, 14, 40));
+            for (int k = 0; k < 6; k = k + 1) { CDraw.FillRect(c, left + w, bottom - w - (k + 1) * 8, right - left - 2 * w, 8, CDraw.Argb(wa / (k + 2), gr, gg, gb)); }
+            CDraw.FillRect(c, left, bottom - w - 1, right - left, 3, CDraw.Argb(240, 255, 160, 210));
+        }
+        // 墙上的信标灯：每 160px 一盏，流水闪烁。
+        for (int k = 0; k <= SnGame.WW() / 160; k = k + 1) {
+            int on = (k + wallNow / 90) % 8 == 0 ? 200 : 70;
+            int bx = SnArt.SX(k * 160);
+            if (bx > -20 && bx < vw + 20) {
+                if (top > -30 && top < vh + 30) { CSprite.Ball(c, bx, top + w / 2, 3, 255, 170, 220, on); }
+                if (bottom > -30 && bottom < vh + 30) { CSprite.Ball(c, bx, bottom - w / 2, 3, 255, 170, 220, on); }
+            }
+        }
+        for (int k = 0; k <= SnGame.WH() / 160; k = k + 1) {
+            int on = (k + wallNow / 90) % 8 == 0 ? 200 : 70;
+            int by = SnArt.SY(k * 160);
+            if (by > -20 && by < vh + 20) {
+                if (left > -30 && left < vw + 30) { CSprite.Ball(c, left + w / 2, by, 3, 255, 170, 220, on); }
+                if (right > -30 && right < vw + 30) { CSprite.Ball(c, right - w / 2, by, 3, 255, 170, 220, on); }
+            }
+        }
+    }
+
+    // 场外警戒斜纹（竖条区 / 横条区，线段按区域端点生成，不越界）。
+    static void StripesV(Canvas c, int x0, int x1, int vh) {
+        for (int k = -x1; k < vh + x1; k = k + 34) {
+            CDraw.Line(c, x0, x0 + k, x1, x1 + k, 6, 120, 30, 70, 60);
+        }
+    }
+    static void StripesH(Canvas c, int y0, int y1, int vw) {
+        for (int k = -y1; k < vw + y1; k = k + 34) {
+            CDraw.Line(c, y0 + k, y0, y1 + k, y1, 6, 120, 30, 70, 60);
+        }
+    }
+
+    static void Orbs(SnGame g, Canvas c, int wallNow) {
+        int now = g.simNow;
+        for (int i = 0; i < g.orbs.Count; i = i + 1) {
+            Orb o = g.orbs[i];
+            int wx = o.x;
+            int wy = o.y;
+            if (o.kind == 1) {
+                int e = SnArt.Ease(now - o.bornAt, 450);
+                wx = o.ox + (o.x - o.ox) * e / 256;
+                wy = o.oy + (o.y - o.oy) * e / 256;
+            }
+            int sx = SnArt.SX(wx);
+            int sy = SnArt.SY(wy);
+            if (!SnArt.On(sx, sy, 40)) { continue; }
+            int pulse = ((wallNow + o.phase * 7) / 90) % 6;
+            if (pulse > 3) { pulse = 6 - pulse; }
+            if (o.kind == 0) {
+                int cr = SnGame.PalR(o.hue); int cg = SnGame.PalG(o.hue); int cb = SnGame.PalB(o.hue);
+                CSprite.Glow(c, sx, sy, o.size + 6 + pulse / 2, cr, cg, cb, 110);
+                CSprite.Ball(c, sx, sy, o.size + pulse / 3, cr, cg, cb, 235);
+                CSprite.Ball(c, sx - o.size / 3, sy - o.size / 3, o.size / 3 + 1, 255, 255, 255, 170);
+            } else if (o.kind == 1) {
+                int fade = now - o.bornAt > 36000 ? 120 : 255;
+                CSprite.Glow(c, sx, sy, o.size * 2 + 6 + pulse, o.cr, o.cg, o.cb, 120 * fade / 255);
+                CSprite.Ball(c, sx, sy, o.size + 1, o.cr, o.cg, o.cb, fade);
+                CSprite.Ball(c, sx, sy, o.size / 2 + 1, 255, 255, 255, 150 * fade / 255);
+            } else {
+                SnArt.PowerOrb(c, o, sx, sy, now, wallNow);
+            }
+        }
+    }
+
+    static void PowerOrb(Canvas c, Orb o, int sx, int sy, int now, int wallNow) {
+        int age = now - o.bornAt;
+        if (age > 19000 && (wallNow / 120) % 2 == 0) { return; }
+        int col = SnSkins.PowerColor(o.power);
+        int r = SnSkins.R(col); int gg = SnSkins.G(col); int b = SnSkins.B(col);
+        int grow = SnArt.Ease(age, 500);
+        int s = o.size * grow / 256;
+        if (s < 2) { return; }
+        int beat = (wallNow + o.phase) % 1200;
+        CSprite.Glow(c, sx, sy, s * 3, r, gg, b, 120);
+        CDraw.CircleStroke(c, sx, sy, s + 6 + beat * 26 / 1200, 2, r, gg, b, 200 - beat * 200 / 1200);
+        CSprite.Ball(c, sx + 2, sy + 4, s + 2, 0, 0, 0, 90);
+        CSprite.Ball(c, sx, sy, s + 2, r, gg, b, 255);
+        CSprite.Ball(c, sx, sy, s - 1, 18, 22, 48, 255);
+        for (int k = 0; k < 3; k = k + 1) {
+            int a = wallNow / 70 + k * 16 / 3;
+            CSprite.Ball(c, sx + SnAi.DirX(a) * (s + 9) / 300, sy + SnAi.DirY(a) * (s + 9) / 300, 2, 255, 255, 255, 200);
+        }
+        if (o.power == 1) {
+            // 马蹄磁铁
+            CDraw.Line(c, sx - 6, sy - 6, sx - 6, sy + 2, 4, r, gg, b, 255);
+            CDraw.Line(c, sx + 6, sy - 6, sx + 6, sy + 2, 4, r, gg, b, 255);
+            CDraw.Line(c, sx - 6, sy + 2, sx, sy + 7, 4, r, gg, b, 255);
+            CDraw.Line(c, sx + 6, sy + 2, sx, sy + 7, 4, r, gg, b, 255);
+            CDraw.FillRect(c, sx - 8, sy - 8, 4, 3, CDraw.Argb(255, 240, 240, 255));
+            CDraw.FillRect(c, sx + 4, sy - 8, 4, 3, CDraw.Argb(255, 240, 240, 255));
+        } else if (o.power == 2) {
+            // 盾徽
+            CDraw.Line(c, sx - 7, sy - 7, sx + 7, sy - 7, 3, r, gg, b, 255);
+            CDraw.Line(c, sx + 7, sy - 7, sx + 7, sy + 1, 3, r, gg, b, 255);
+            CDraw.Line(c, sx + 7, sy + 1, sx, sy + 8, 3, r, gg, b, 255);
+            CDraw.Line(c, sx, sy + 8, sx - 7, sy + 1, 3, r, gg, b, 255);
+            CDraw.Line(c, sx - 7, sy + 1, sx - 7, sy - 7, 3, r, gg, b, 255);
+            CSprite.Ball(c, sx, sy - 1, 3, 230, 255, 255, 255);
+        } else {
+            // 星芒
+            CDraw.Line(c, sx, sy - 9, sx, sy + 9, 3, r, gg, b, 255);
+            CDraw.Line(c, sx - 9, sy, sx + 9, sy, 3, r, gg, b, 255);
+            CDraw.Line(c, sx - 5, sy - 5, sx + 5, sy + 5, 2, 255, 245, 200, 255);
+            CDraw.Line(c, sx - 5, sy + 5, sx + 5, sy - 5, 2, 255, 245, 200, 255);
+            CSprite.Ball(c, sx, sy, 3, 255, 255, 230, 255);
+        }
+    }
+
+    static int Shade(int col, int num, int den) {
+        return SnSkins.Pack(SnSkins.R(col) * num / den, SnSkins.G(col) * num / den, SnSkins.B(col) * num / den);
+    }
+
+    static void DrawWorm(SnGame g, Canvas c, Worm w, int wallNow) {
+        if (!w.alive) { return; }
+        int now = g.simNow;
+        bool player = w.kind == 0;
+        int rad = w.Radius();
+        int grow = player ? 256 : SnArt.Ease(now - w.bornAt, 500);
+        rad = Math.Max(3, rad * (128 + grow / 2) / 256);
+        int n = w.seg.Count;
+        bool ghost = player && now < g.invulnUntil && (wallNow / 80) % 2 == 0;
+        int bodyA = ghost ? 120 : 255;
+        bool boosting = player ? (now - g.lastBoostAt < 60) : w.Boosting(now);
+        // 投影
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int sx = SnArt.SX(w.seg[i].x);
+            int sy = SnArt.SY(w.seg[i].y);
+            if (SnArt.On(sx, sy, 40)) {
+                int s = rad - 3 * i / (n + 1);
+                CSprite.Ball(c, sx + 3, sy + 6, s, 0, 0, 8, ghost ? 30 : 80);
+            }
+        }
+        int baseCol = SnSkins.Pack(w.cr, w.cg, w.cb);
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int sx = SnArt.SX(w.seg[i].x);
+            int sy = SnArt.SY(w.seg[i].y);
+            if (!SnArt.On(sx, sy, 40)) { continue; }
+            int s = rad - 3 * i / (n + 1);
+            int col = baseCol;
+            if (player) {
+                col = SnSkins.Segment(w.skin, i, n, wallNow);
+                if (g.feverOn && i % 2 == 0) {
+                    int hue = (i / 2 + wallNow / 60) % 6;
+                    col = SnSkins.Pack(SnGame.PalR(hue), SnGame.PalG(hue), SnGame.PalB(hue));
+                }
+            } else {
+                col = SnArt.Shade(baseCol, 160 - 55 * i / (n + 1), 160);
+                if (w.persona == 2 && i % 3 == 2) { col = SnArt.Shade(baseCol, 90, 160); }
+                if (w.persona == 3 && i % 4 == 1) { col = SnSkins.Mix(col, SnSkins.Pack(255, 255, 255), 1, 3); }
+                if (w.persona == 1 && i % 5 == 0) { col = SnSkins.Mix(col, SnSkins.Pack(220, 240, 255), 1, 4); }
+                if (w.kind == 2 && i % 2 == 1) { col = SnSkins.Pack(255, 170, 70); }
+            }
+            int cr = SnSkins.R(col); int cg = SnSkins.G(col); int cb = SnSkins.B(col);
+            if (i % 2 == 0) { CSprite.Glow(c, sx, sy, s + (boosting ? 12 : 6), cr, cg, cb, boosting ? 120 : 80); }
+            CSprite.Ball(c, sx, sy, s + 1, cr / 3, cg / 3, cb / 3, bodyA);
+            CSprite.Ball(c, sx, sy, s, cr, cg, cb, bodyA);
+            CSprite.Ball(c, sx - s / 3, sy - s / 2 + 1, s / 3, 255, 255, 255, ghost ? 30 : 70);
+        }
+        int hsx = SnArt.SX(w.seg[0].x);
+        int hsy = SnArt.SY(w.seg[0].y);
+        if (!SnArt.On(hsx, hsy, 300)) { return; }
+        // 玩家光环：护盾泡 / 双倍金晕 / 磁场圈
+        if (player) {
+            if (now < g.doubleUntil) {
+                CSprite.Glow(c, hsx, hsy, rad * 3, 255, 214, 80, 90);
+            }
+            if (now < g.shieldUntil) {
+                int sp = (wallNow / 8) % 60;
+                if (sp > 30) { sp = 60 - sp; }
+                CSprite.Glow(c, hsx, hsy, rad + 22, 96, 230, 255, 70);
+                CDraw.CircleStroke(c, hsx, hsy, rad + 12 + sp / 10, 3, 140, 240, 255, 200);
+            }
+            if (now < g.magnetUntil) {
+                for (int k = 0; k < 24; k = k + 1) {
+                    int a = k * 2 + wallNow / 50;
+                    int ax = hsx + SnAi.DirX(a / 3 * 2 + k % 3) * 240 / 300;
+                    int ay = hsy + SnAi.DirY(a / 3 * 2 + k % 3) * 240 / 300;
+                    if (k % 2 == 0) { CSprite.Ball(c, ax, ay, 2, 255, 110, 140, 110); }
+                }
+                CDraw.CircleStroke(c, hsx, hsy, 240, 1, 255, 110, 140, 50);
+            }
+        }
+        if (!SnArt.On(hsx, hsy, 60)) { return; }
+        // 眼睛：性格表情（猎杀者红瞳 + 怒眉、缠绕者竖瞳、谨慎者大瞳孔）
+        int ex = w.dirY * rad / 256 / 2;
+        int ey = -w.dirX * rad / 256 / 2;
+        int lx = w.dirX * rad / 256 / 3;
+        int ly = w.dirY * rad / 256 / 3;
+        int px2 = w.dirX * rad / 256 / 4;
+        int py2 = w.dirY * rad / 256 / 4;
+        int er = rad / 2;
+        int pr = rad / 4 + 1;
+        int pc = SnSkins.Pack(30, 34, 60);
+        if (w.persona == 2) { pc = SnSkins.Pack(200, 20, 40); }
+        if (w.persona == 3) { pc = SnSkins.Pack(80, 20, 120); }
+        if (w.persona == 1) { pr = rad / 3 + 1; }
+        for (int side = -1; side <= 1; side = side + 2) {
+            int cx = hsx + ex * side + lx;
+            int cy = hsy + ey * side + ly;
+            CSprite.Ball(c, cx, cy, er, 255, 255, 255, 255);
+            if (w.persona == 3) {
+                CDraw.Line(c, cx + px2, cy + py2 - pr, cx + px2, cy + py2 + pr, 3, SnSkins.R(pc), SnSkins.G(pc), SnSkins.B(pc), 255);
+            } else {
+                CSprite.Ball(c, cx + px2, cy + py2, pr, SnSkins.R(pc), SnSkins.G(pc), SnSkins.B(pc), 255);
+            }
+            CSprite.Ball(c, cx + px2 - 1, cy + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
+            if (w.persona == 2) {
+                // 怒眉：从眼外侧上方斜向眼内侧下方
+                int bx0 = cx + ex * side / 2 - w.dirX * rad / 256 / 3;
+                int by0 = cy + ey * side / 2 - w.dirY * rad / 256 / 3;
+                int bx1 = cx - ex * side / 3 + w.dirX * rad / 256 / 5;
+                int by1 = cy - ey * side / 3 + w.dirY * rad / 256 / 5;
+                CDraw.Line(c, bx0 + ex * side / 3, by0 + ey * side / 3, bx1, by1, 3, 40, 0, 10, 255);
+            }
+        }
+        // 排行榜第一戴王冠
+        if (g.board.Count > 0 && g.board[0] == w) {
+            int cy = hsy - rad - 16;
+            int bob = ((wallNow / 40) % 20);
+            if (bob > 10) { bob = 20 - bob; }
+            cy = cy - bob / 3;
+            CSprite.Glow(c, hsx, cy, 22, 255, 210, 80, 90);
+            CDraw.RoundRectFill(c, hsx - 11, cy + 2, 22, 6, 2, 255, 200, 60, 255);
+            CDraw.Line(c, hsx - 10, cy + 3, hsx - 10, cy - 8, 3, 255, 200, 60, 255);
+            CDraw.Line(c, hsx - 10, cy - 8, hsx - 4, cy - 1, 3, 255, 200, 60, 255);
+            CDraw.Line(c, hsx - 4, cy - 1, hsx, cy - 10, 3, 255, 214, 80, 255);
+            CDraw.Line(c, hsx, cy - 10, hsx + 4, cy - 1, 3, 255, 214, 80, 255);
+            CDraw.Line(c, hsx + 4, cy - 1, hsx + 10, cy - 8, 3, 255, 200, 60, 255);
+            CDraw.Line(c, hsx + 10, cy - 8, hsx + 10, cy + 3, 3, 255, 200, 60, 255);
+            CSprite.Ball(c, hsx, cy - 11, 2, 255, 90, 120, 255);
+        }
+    }
+
+    static void Effects(SnGame g, Canvas c) {
+        int now = g.simNow;
+        for (int i = 0; i < g.rings.Count; i = i + 1) {
+            Ring r = g.rings[i];
+            int age = now - r.bornAt;
+            int e = SnArt.Ease(age, r.life);
+            int rad = 6 + r.maxRad * e / 256;
+            int a = 230 - age * 230 / Math.Max(1, r.life);
+            if (a <= 0) { continue; }
+            int sx = SnArt.SX(r.x);
+            int sy = SnArt.SY(r.y);
+            if (!SnArt.On(sx, sy, rad + 10)) { continue; }
+            CDraw.CircleStroke(c, sx, sy, rad, Math.Max(1, 5 - e / 64), r.cr, r.cg, r.cb, a);
+        }
+        for (int i = 0; i < g.parts.Count; i = i + 1) {
+            Particle p = g.parts[i];
+            int age = now - p.bornAt;
+            int alpha = 255 - age * 255 / Math.Max(1, p.life);
+            if (alpha <= 0) { continue; }
+            int sx = SnArt.SX(p.x / 256);
+            int sy = SnArt.SY(p.y / 256);
+            if (!SnArt.On(sx, sy, 20)) { continue; }
+            int s = Math.Max(1, p.size - age * p.size / Math.Max(1, p.life * 2));
+            if (p.size >= 3) { CSprite.Glow(c, sx, sy, s * 3, p.cr, p.cg, p.cb, alpha / 3); }
+            CSprite.Ball(c, sx, sy, s, p.cr, p.cg, p.cb, alpha);
+        }
+    }
+
+    // 屏幕外 1800px 内的道具球：在屏幕边缘画一个带色指引点。
+    static void PowerPointers(SnGame g, Canvas c, int wallNow) {
+        if (!g.me.alive) { return; }
+        int vw = SnGame.VW();
+        int vh = SnGame.VH();
+        for (int i = 0; i < g.orbs.Count; i = i + 1) {
+            Orb o = g.orbs[i];
+            if (o.kind != 2) { continue; }
+            int sx = SnArt.SX(o.x);
+            int sy = SnArt.SY(o.y);
+            if (SnArt.On(sx, sy, -30)) { continue; }
+            int dx = sx - vw / 2;
+            int dy = sy - vh / 2;
+            if (dx * dx + dy * dy > 1800 * 1800) { continue; }
+            int m = 46;
+            int tx = vw / 2 + dx;
+            int ty = vh / 2 + dy;
+            // 沿射线夹到屏幕内框
+            int ax = dx < 0 ? -dx : dx;
+            int ay = dy < 0 ? -dy : dy;
+            int lim = 0;
+            if (ax * (vh / 2 - m) > ay * (vw / 2 - m)) { lim = (vw / 2 - m) * 1000 / Math.Max(1, ax); } else { lim = (vh / 2 - m) * 1000 / Math.Max(1, ay); }
+            tx = vw / 2 + dx * lim / 1000;
+            ty = vh / 2 + dy * lim / 1000;
+            int col = SnSkins.PowerColor(o.power);
+            int beat = (wallNow / 10) % 60;
+            if (beat > 30) { beat = 60 - beat; }
+            CSprite.Glow(c, tx, ty, 18 + beat / 4, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 140);
+            CSprite.Ball(c, tx, ty, 7, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 255);
+            CSprite.Ball(c, tx, ty, 3, 255, 255, 255, 230);
+            int l = Worm.Isq(dx * dx + dy * dy);
+            if (l > 0) {
+                CDraw.Line(c, tx + dx * 10 / l, ty + dy * 10 / l, tx + dx * 20 / l, ty + dy * 20 / l, 3, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 230);
+            }
+        }
+    }
+}

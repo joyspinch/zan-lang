@@ -4,10 +4,12 @@ using Gui;
 using Game.Kit;
 using Game.Foundation.Gui;
 
+// 主菜单：画布画插画背景与标题，HTML 放标语、开始按钮、皮肤选择卡与战绩。
+// 皮肤按钮是标准 Button：已解锁 = 色板渐变底，锁住 = disabled 并显示解锁条件，
+// 当前选中加白框；选择写进档案（Profile.SetSkin）。
 public class SnMenuScene : HtmlScene {
     SnGame g;
-    Element stats;
-    Element muteEl;
+    Control root;
     string bgPath;
     string titlePath;
 
@@ -46,45 +48,84 @@ public class SnMenuScene : HtmlScene {
                 CDraw.BlitImageSrc(c, this.bgPath, 0, 0, vw, vh, sx, sy, sw, sh);
             }
         }
+        // 下半屏压暗，皮肤卡与战绩文字更清楚。
+        CDraw.FillVGrad(c, 0, vh / 2, vw, vh / 2, CDraw.Argb(0, 4, 8, 22), CDraw.Argb(170, 4, 8, 22));
         if (this.titlePath != null) {
             int iw = CDraw.ImageWidth(c, this.titlePath);
             int ih = CDraw.ImageHeight(c, this.titlePath);
             if (iw > 0 && ih > 0) {
                 int tw = vw * 2 / 5;
                 int th = tw * ih / iw;
-                CDraw.BlitImage(c, this.titlePath, (vw - tw) / 2, vh / 7, tw, th);
+                int bob = (Window.GetTickMs() / 30) % 80;
+                if (bob > 40) { bob = 80 - bob; }
+                CDraw.BlitImage(c, this.titlePath, (vw - tw) / 2, vh / 8 + bob / 8, tw, th);
             }
         }
     }
 
     override void OnWire(HtmlHandlers handlers) {
         handlers.Add("start", () => this.Start());
+        handlers.AddArg("skin", (string a) => this.PickSkin(Convert.ToInt32(a)));
     }
 
     override void OnEnter(Control root) {
-        this.stats = null;
-        this.muteEl = null;
-        if (root != null) {
-            Control el = root.Find("stats");
-            if (el != null && el is Element) { this.stats = (Element)el; }
-            Control m = root.Find("mute");
-            if (m != null && m is Element) { this.muteEl = (Element)m; }
+        this.root = root;
+        Profile p = this.g.prof;
+        if (p.games == 0) {
+            SnShell.Text(root, "stats", "第一次来？吃豆变长，别让蛇头撞上大蛇的身体或围墙");
+        } else {
+            string rk = p.topRank > 0 ? " · 最佳排名 #" + p.topRank : "";
+            SnShell.Text(root, "stats", "最高分 " + p.high + " · 最长 " + p.longest
+                + " · 已玩 " + p.games + " 局 · 累计击败 " + p.kills + rk);
         }
-        if (this.stats != null) {
-            if (this.g.prof.games == 0) {
-                this.stats.SetText("第一次来？吃豆变长，别让蛇头撞上大蛇的身体");
-            } else {
-                this.stats.SetText("最高分 " + this.g.prof.high + " · 最长 " + this.g.prof.longest
-                    + " · 已玩 " + this.g.prof.games + " 局 · 累计击败 " + this.g.prof.kills);
-            }
-        }
+        this.SyncSkins();
         this.SyncMute();
     }
 
+    void SyncSkins() {
+        if (this.root == null) { return; }
+        Profile p = this.g.prof;
+        int cur = p.Skin();
+        for (int k = 0; k < SnSkins.Count; k = k + 1) {
+            Control b = this.root.Find("skin" + k);
+            if (b == null) { continue; }
+            bool open = SnSkins.Unlocked(k, p.high, p.kills);
+            b.SetProp("disabled", open ? "false" : "true");
+            b.SetProp("text", open ? SnSkins.Name(k) : SnSkins.Requirement(k));
+            b.SetProp("class", k == cur ? "skin skin-sel" : "skin");
+            // 内联样式：固定宽度、色板渐变底、深色色板配白字、选中加白框。
+            string st = "width:116px";
+            if (open) {
+                st = st + ";background:" + SnSkins.Swatch(k) + ";color:" + (k == 3 ? "#fff4e0" : "#0b1020");
+                if (k == cur) { st = st + ";border:3px solid #ffffff"; }
+            }
+            b.SetProp("style", st);
+        }
+        string goal = SnSkins.NextGoal(p.high, p.kills);
+        SnShell.Text(this.root, "skindesc", "当前皮肤：" + SnSkins.Name(cur) + (goal.Length > 0 ? " · " + goal : " · 全部皮肤已解锁"));
+    }
+
+    void PickSkin(int k) {
+        Profile p = this.g.prof;
+        if (!SnSkins.Unlocked(k, p.high, p.kills)) { return; }
+        if (this.g.shell != null) { this.g.shell.Play("select"); }
+        p.SetSkin(k);
+        this.SyncSkins();
+    }
+
+    // ←/→ 在已解锁皮肤间循环。
+    void CycleSkin(int dir) {
+        Profile p = this.g.prof;
+        int k = p.Skin();
+        for (int i = 0; i < SnSkins.Count; i = i + 1) {
+            k = (k + dir + SnSkins.Count) % SnSkins.Count;
+            if (SnSkins.Unlocked(k, p.high, p.kills)) { this.PickSkin(k); return; }
+        }
+    }
+
     void SyncMute() {
-        if (this.muteEl == null) { return; }
         bool muted = this.g.shell != null && this.g.shell.Muted();
-        this.muteEl.SetText("回车/空格 开始 · Esc 退出游戏 · M 音效：" + (muted ? "关" : "开"));
+        SnShell.Text(this.root, "mute", "回车/空格 开始 · ←/→ 换皮肤 · Esc 退出 · M 音效：" + (muted ? "关" : "开"));
     }
 
     void Start() {
@@ -92,6 +133,8 @@ public class SnMenuScene : HtmlScene {
         this.g.resuming = false;
         this.router.Go("play");
     }
+
+    override void OnExit() { this.root = null; }
 
     override void Update(int dtMs) {
         if (this.g.shell != null) { this.g.shell.Tick(dtMs); }
@@ -101,9 +144,8 @@ public class SnMenuScene : HtmlScene {
         if (kind != 4) { return; }
         if (key == 27) { this.router.Exit(); }
         if (key == 13 || key == 32) { this.Start(); }
+        if (key == 37) { this.CycleSkin(-1); }
+        if (key == 39) { this.CycleSkin(1); }
         if (key == 77 && this.g.shell != null) { this.g.shell.ToggleMute(); this.SyncMute(); }
     }
 }
-
-// 对局：纯 canvas 场景（HtmlFile 为空，无边画布世界直绘）。
-// 转向跟随鼠标，按住左键/空格冲刺；死亡后路由到结算场景。

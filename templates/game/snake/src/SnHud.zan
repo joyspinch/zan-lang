@@ -4,7 +4,10 @@ using Gui;
 using Gui.Widget;
 using Game.Foundation.Gui;
 
-// Persistent HUD. World drawing does not paint or hit-test player UI.
+// 对局 HUD：全部是标准 Gui 控件（Label / Panel / Progress），用游戏自己的
+// 霓虹玻璃皮肤（Css()）。世界绘制不画也不命中任何玩家 UI。
+// 布局：左上分数 / 段位 / 排名；正上威胁等级；右上排行榜 + 击杀播报；
+// 左下道具计时；正下狂热槽；右下小地图；AI 头顶名牌按性格着色。
 public class SnHud {
     weak SnGame game;
     HudLayer layer;
@@ -12,33 +15,93 @@ public class SnHud {
     Label score;
     Label tier;
     Label kills;
+    Label threat;
     Label feverText;
     Label toast;
-    Label mute;   // 静音指示（右上角）
+    Label mute;   // 静音指示
     Label hint;   // 操作提示（首局完整说明，之后短暂提醒暂停/静音键）
     Progress fever;
     SnMinimap minimap;
     List<Label> popLabels;
+    // 排行榜
+    Panel boardBg;
+    Panel boardMe;
+    Label boardTitle;
+    List<Label> rowRank;
+    List<Label> rowName;
+    List<Label> rowScore;
+    // 击杀播报
+    Panel feedBg;
+    List<Label> feedLabels;
+    // 道具计时
+    List<Panel> powBg;
+    List<Label> powText;
+    List<Progress> powBar;
+    List<int> powShown;  // 本帧每个槽位显示的道具编号（0 = 空）
+    // AI 名牌
+    List<Label> tags;
+    List<Worm> tagWorms;
     int now;
+    double sc;
+    int lastW;
+    int lastH;
+
+    int S(int v) { return (int)(v * this.sc); }
 
     SnHud(SnGame game, App app) {
         this.game = game;
         app.UseCss(SnHud.Css());
         this.root = new SnHudRoot(this);
         this.root.Class = "snake-hud";
+        this.tags = new List<Label>();
+        this.tagWorms = new List<Worm>();
+        for (int i = 0; i < 12; i = i + 1) { this.tags.Add(this.AddLabel("snake-tag")); }
         this.score = this.AddLabel("snake-score");
         this.tier = this.AddLabel("snake-tier");
         this.kills = this.AddLabel("snake-kills");
+        this.mute = this.AddLabel("snake-mute");
+        this.mute.SetProp("text", "静音中 · 按 M 恢复");
+        this.threat = this.AddLabel("snake-threat");
         this.feverText = this.AddLabel("snake-fever-text");
         this.feverText.SetProp("text", "狂热 x2");
         this.toast = this.AddLabel("snake-toast");
-        this.mute = this.AddLabel("snake-mute");
-        this.mute.SetProp("text", "静音 · M");
         this.hint = this.AddLabel("snake-hint");
         this.fever = new Progress(0, 1);
         this.fever.Class = "snake-fever";
         this.fever.ShowText(false);
         this.root.Add(this.fever);
+
+        this.boardBg = this.AddPanel("snake-glass");
+        this.boardMe = this.AddPanel("snake-row-me");
+        this.boardTitle = this.AddLabel("snake-board-title");
+        this.boardTitle.SetProp("text", "排行榜");
+        this.rowRank = new List<Label>();
+        this.rowName = new List<Label>();
+        this.rowScore = new List<Label>();
+        for (int i = 0; i < 5; i = i + 1) {
+            this.rowRank.Add(this.AddLabel("snake-row-rank"));
+            this.rowName.Add(this.AddLabel("snake-row-name"));
+            this.rowScore.Add(this.AddLabel("snake-row-score"));
+        }
+        this.feedBg = this.AddPanel("snake-glass snake-feed-bg");
+        this.feedLabels = new List<Label>();
+        for (int i = 0; i < 5; i = i + 1) { this.feedLabels.Add(this.AddLabel("snake-feed")); }
+
+        this.powBg = new List<Panel>();
+        this.powText = new List<Label>();
+        this.powBar = new List<Progress>();
+        this.powShown = new List<int>();
+        for (int i = 0; i < 3; i = i + 1) {
+            this.powBg.Add(this.AddPanel("snake-glass snake-pow"));
+            this.powText.Add(this.AddLabel("snake-pow-text"));
+            Progress bar = new Progress(0, 1);
+            bar.Class = "snake-pow-bar";
+            bar.ShowText(false);
+            this.root.Add(bar);
+            this.powBar.Add(bar);
+            this.powShown.Add(0);
+        }
+
         this.minimap = new SnMinimap(game);
         this.minimap.Class = "snake-minimap";
         this.root.Add(this.minimap);
@@ -54,79 +117,226 @@ public class SnHud {
         this.root.Add(label);
         return label;
     }
+    Panel AddPanel(string cls) {
+        Panel p = new Panel(cls);
+        p.Class = cls;
+        this.root.Add(p);
+        return p;
+    }
     void Enter(App app) {
         if (this.game == null) { return; }
-        this.Sync(Window.GetTickMs());
+        this.Sync(0);
         this.layer.SetVisible(true);
         this.layer.Bind(app);
     }
     void Exit() { this.layer.SetVisible(false); }
-    void Sync(int now) {
-        if (this.game == null) { return; }
+
+    void Sync(int wallNow) {
+        SnGame g = this.game;
+        if (g == null) { return; }
+        int now = g.simNow;
         this.now = now;
-        this.score.SetProp("text", "" + this.game.score.Get());
-        this.tier.SetProp("text", SnGame.TierName(this.game.titleTier) + " · 长度 " + this.game.me.length);
-        this.kills.SetProp("text", "击败 " + this.game.kills);
-        this.kills.SetShown(this.game.kills > 0);
+        this.score.SetProp("text", "" + g.score.Get());
+        this.tier.SetProp("text", SnGame.TierName(g.titleTier) + " · 长度 " + g.me.length);
+        string rk = "排名 #" + Math.Min(g.rank, g.rankCount) + " / " + g.rankCount;
+        if (g.kills > 0) { rk = rk + " · 截杀 " + g.kills; }
+        this.kills.SetProp("text", rk);
+        this.threat.SetProp("text", "威胁 " + g.threat + " · " + SnGame.ThreatName(g.threat));
+        this.threat.SetProp("class", "snake-threat snake-threat-" + Math.Min(3, (g.threat + 1) / 2));
         this.minimap.Sync();
-        this.fever.SetPercent(this.game.fever);
-        this.feverText.SetShown(this.game.feverOn);
-        string hue = this.game.feverOn ? " snake-hue-" + ((now / 80) % 6) : "";
+        this.fever.SetPercent(g.fever);
+        int mult = g.ScoreMult();
+        this.feverText.SetShown(mult > 1);
+        this.feverText.SetProp("text", g.feverOn ? "狂热 x" + mult : "双倍 x" + mult);
+        string hue = g.feverOn ? " snake-hue-" + ((wallNow / 80) % 6) : "";
         this.fever.SetProp("class", "snake-fever" + hue);
-        int age = now - this.game.toastAt;
-        this.toast.SetProp("text", this.game.toastText);
-        this.toast.SetShown(age < 1500);
-        this.mute.SetShown(this.game.shell != null && this.game.shell.Muted());
-        bool hintOn = !this.game.over && now < this.game.hintUntil && this.game.hintText != null;
+        int age = now - g.toastAt;
+        this.toast.SetProp("text", g.toastText);
+        this.toast.SetShown(age < 1600 && age >= 0);
+        this.mute.SetShown(g.shell != null && g.shell.Muted());
+        bool hintOn = !g.over && now < g.hintUntil && g.hintText != null;
         this.hint.SetShown(hintOn);
-        if (hintOn) { this.hint.SetProp("text", this.game.hintText); }
-        // Expiry is a presentation update, never a side effect of painting.
-        for (int i = this.game.pops.Count - 1; i >= 0; i = i - 1) {
-            if (now - this.game.pops[i].bornAt > 950) { this.game.pops.RemoveAt(i); }
+        if (hintOn) { this.hint.SetProp("text", g.hintText); }
+
+        // 排行榜
+        bool meOnBoard = false;
+        for (int i = 0; i < 5; i = i + 1) {
+            bool shown = i < g.board.Count;
+            this.rowRank[i].SetShown(shown);
+            this.rowName[i].SetShown(shown);
+            this.rowScore[i].SetShown(shown);
+            if (!shown) { continue; }
+            Worm w = g.board[i];
+            bool mine = w == g.me;
+            if (mine) { meOnBoard = true; }
+            this.rowRank[i].SetProp("text", "" + (i + 1));
+            this.rowName[i].SetProp("text", mine ? "你" : w.name + "·" + SnSkins.PersonaName(w.persona));
+            this.rowScore[i].SetProp("text", "" + w.score);
         }
-        while (this.popLabels.Count < this.game.pops.Count) {
+        this.boardMe.SetShown(meOnBoard);
+
+        // 击杀播报
+        int fn = g.feed.Count;
+        this.feedBg.SetShown(fn > 0);
+        for (int i = 0; i < 5; i = i + 1) {
+            bool shown = i < fn;
+            this.feedLabels[i].SetShown(shown);
+            if (shown) {
+                FeedItem f = g.feed[i];
+                this.feedLabels[i].SetProp("text", f.text);
+                this.feedLabels[i].SetProp("class", f.mine ? "snake-feed snake-feed-mine" : "snake-feed");
+            }
+        }
+
+        // 道具计时：按到期先后排在左下
+        int slot = 0;
+        for (int p = 1; p <= 3; p = p + 1) {
+            int until = p == 1 ? g.magnetUntil : (p == 2 ? g.shieldUntil : g.doubleUntil);
+            if (until > now && !g.over) {
+                int left = until - now;
+                this.powShown[slot] = p;
+                this.powText[slot].SetProp("text", SnSkins.PowerName(p) + "  " + (left / 1000) + "." + (left % 1000 / 100) + "s");
+                this.powBar[slot].SetPercent(left * 100 / SnSkins.PowerMs(p));
+                this.powBar[slot].SetProp("class", "snake-pow-bar snake-pow-" + p);
+                this.powBg[slot].SetProp("class", "snake-glass snake-pow snake-pow-bg-" + p);
+                slot = slot + 1;
+            }
+        }
+        for (int i = 0; i < 3; i = i + 1) {
+            bool shown = i < slot;
+            if (!shown) { this.powShown[i] = 0; }
+            this.powBg[i].SetShown(shown);
+            this.powText[i].SetShown(shown);
+            this.powBar[i].SetShown(shown);
+        }
+
+        // AI 名牌：屏幕内的有名大蛇，最多 12 个
+        this.tagWorms = new List<Worm>();
+        int halfW = SnGame.VW() / 2 - 20;
+        int halfH = SnGame.VH() / 2 - 20;
+        int cx = g.me.headX / 256;
+        int cy = g.me.headY / 256;
+        for (int i = 0; i < g.foes.Count && this.tagWorms.Count < 12; i = i + 1) {
+            Worm w = g.foes[i];
+            if (!w.alive || w.kind != 1) { continue; }
+            int dx = w.headX / 256 - cx;
+            int dy = w.headY / 256 - cy;
+            // 名牌在蛇头上方 ~50px：头太靠上就不挂，免得压住顶栏。
+            if (dx > -halfW && dx < halfW && dy > -halfH + 110 && dy < halfH) { this.tagWorms.Add(w); }
+        }
+        for (int i = 0; i < 12; i = i + 1) {
+            bool shown = i < this.tagWorms.Count;
+            this.tags[i].SetShown(shown);
+            if (shown) { this.tags[i].SetProp("text", this.tagWorms[i].name); }
+        }
+
+        // Expiry is a presentation update, never a side effect of painting.
+        for (int i = g.pops.Count - 1; i >= 0; i = i - 1) {
+            if (now - g.pops[i].bornAt > 950 || g.pops[i].bornAt > now) { g.pops.RemoveAt(i); }
+        }
+        while (this.popLabels.Count < g.pops.Count) {
             this.popLabels.Add(this.AddLabel("snake-popup"));
         }
         for (int i = 0; i < this.popLabels.Count; i = i + 1) {
             Label label = this.popLabels[i];
-            bool shown = i < this.game.pops.Count;
+            bool shown = i < g.pops.Count;
             label.SetShown(shown);
-            if (shown) { label.SetProp("text", this.game.pops[i].text); }
+            if (shown) { label.SetProp("text", g.pops[i].text); }
         }
+        // 名牌 / 飘字跟随世界坐标：本帧数据刚换过，立即按上次的 HUD 尺寸重排，
+        // 不等下一次 Arrange（否则会挂在旧位置上一帧）。
+        if (this.lastW > 0) { this.Layout(this.lastW, this.lastH); }
     }
     void Render(App app) { this.layer.Paint(app); }
 
     void Layout(int width, int height) {
-        if (this.game == null) { return; }
-        double scale = Math.Min(width / 1280.0, height / 720.0);
-        this.Box(this.score, (int)(28*scale), (int)(18*scale), (int)(460*scale), (int)(68*scale), (int)(63*scale), "");
-        this.Box(this.tier, (int)(30*scale), (int)(84*scale), (int)(460*scale), (int)(28*scale), (int)(18*scale), "");
-        this.Box(this.kills, (int)(30*scale), (int)(114*scale), (int)(400*scale), (int)(28*scale), (int)(18*scale), "");
-        this.Box(this.fever, width/2-(int)(150*scale), height-(int)(30*scale), (int)(300*scale), (int)(12*scale), 0, "");
-        this.Box(this.feverText, width/2-(int)(150*scale), height-(int)(56*scale), (int)(300*scale), (int)(28*scale), (int)(18*scale), "");
-        this.Box(this.toast, 0, (int)(120*scale), width, (int)(48*scale), (int)(36*scale), ";color:rgba(255,235,140," + this.ToastAlpha() + ")");
-        this.Box(this.mute, width-(int)(220*scale), (int)(18*scale), (int)(200*scale), (int)(30*scale), (int)(18*scale), "");
-        this.Box(this.hint, 0, height-(int)(104*scale), width, (int)(34*scale), (int)(22*scale), "");
-        this.Box(this.minimap, width-(int)(180*scale), height-(int)(110*scale), (int)(168*scale), (int)(98*scale), 0, "");
-        int camX = SnGame.WrapP(this.game.me.headX / 256, SnGame.WW());
-        int camY = SnGame.WrapP(this.game.me.headY / 256, SnGame.WH());
+        SnGame g = this.game;
+        if (g == null) { return; }
+        this.lastW = width;
+        this.lastH = height;
+        this.sc = Math.Min(width / 1280.0, height / 720.0);
+        this.Box(this.score, this.S(26), this.S(12), this.S(400), this.S(66), this.S(58), "");
+        this.Box(this.tier, this.S(30), this.S(80), this.S(460), this.S(26), this.S(18), "");
+        this.Box(this.kills, this.S(30), this.S(106), this.S(460), this.S(26), this.S(17), "");
+        this.Box(this.mute, this.S(30), this.S(134), this.S(300), this.S(26), this.S(16), "");
+        this.Box(this.threat, width / 2 - this.S(120), this.S(14), this.S(240), this.S(30), this.S(16), "");
+        this.Box(this.toast, 0, this.S(58), width, this.S(46), this.S(30), ";color:rgba(255,235,140," + this.ToastAlpha() + ")");
+        this.Box(this.fever, width / 2 - this.S(160), height - this.S(30), this.S(320), this.S(12), 0, "");
+        this.Box(this.feverText, width / 2 - this.S(160), height - this.S(58), this.S(320), this.S(26), this.S(18), "");
+        this.Box(this.hint, 0, height - this.S(104), width, this.S(32), this.S(20), "");
+        this.Box(this.minimap, width - this.S(186), height - this.S(116), this.S(172), this.S(102), 0, "");
+
+        // 排行榜（右上）
+        int bx = width - this.S(268);
+        int by = this.S(14);
+        this.Box(this.boardBg, bx, by, this.S(254), this.S(40 + 5 * 28), 0, "");
+        this.Box(this.boardTitle, bx + this.S(14), by + this.S(8), this.S(220), this.S(24), this.S(16), "");
+        int meRow = -1;
+        for (int i = 0; i < 5; i = i + 1) {
+            int ry = by + this.S(38 + i * 28);
+            string col = "";
+            if (i < g.board.Count) {
+                Worm w = g.board[i];
+                if (w == g.me) { meRow = i; col = ";color:" + SnHud.Css3(SnSkins.Base(g.me.skin)); } else { col = ";color:" + SnSkins.PersonaCss(w.persona); }
+            }
+            this.Box(this.rowRank[i], bx + this.S(12), ry, this.S(24), this.S(26), this.S(16), "");
+            this.Box(this.rowName[i], bx + this.S(38), ry, this.S(140), this.S(26), this.S(16), col);
+            this.Box(this.rowScore[i], bx + this.S(150), ry, this.S(90), this.S(26), this.S(16), "");
+        }
+        if (meRow >= 0) { this.Box(this.boardMe, bx + this.S(6), by + this.S(36 + meRow * 28), this.S(242), this.S(28), 0, ""); }
+
+        // 击杀播报（排行榜下方）
+        int fn = Math.Min(5, g.feed.Count);
+        int fy = by + this.S(40 + 5 * 28 + 10);
+        this.Box(this.feedBg, bx, fy, this.S(254), this.S(10 + fn * 26), 0, "");
+        for (int i = 0; i < 5; i = i + 1) {
+            string extra = "";
+            if (i < g.feed.Count) {
+                FeedItem f = g.feed[i];
+                int age = this.now - f.bornAt;
+                double a = age > 3700 ? Math.Max(0, 4500 - age) / 800.0 : 1.0;
+                extra = ";color:rgba(" + f.cr + "," + f.cg + "," + f.cb + "," + a + ")";
+            }
+            this.Box(this.feedLabels[i], bx + this.S(12), fy + this.S(5 + i * 26), this.S(232), this.S(26), this.S(15), extra);
+        }
+
+        // 道具计时（左下）
+        for (int i = 0; i < 3; i = i + 1) {
+            int px = this.S(20 + i * 162);
+            int py = height - this.S(70);
+            this.Box(this.powBg[i], px, py, this.S(150), this.S(52), 0, "");
+            this.Box(this.powText[i], px + this.S(12), py + this.S(6), this.S(130), this.S(26), this.S(17), "");
+            this.Box(this.powBar[i], px + this.S(12), py + this.S(36), this.S(126), this.S(7), 0, "");
+        }
+
+        int camX = g.me.headX / 256;
+        int camY = g.me.headY / 256;
         // The world's short-axis viewport scale and the HUD region share the
         // same transform; long axes extend rather than stretching the stage.
         double worldScale = Math.Min(width / (double)SnGame.VW(), height / (double)SnGame.VH());
-        for (int i = 0; i < this.game.pops.Count; i = i + 1) {
-            Popup p = this.game.pops[i];
+        for (int i = 0; i < this.tagWorms.Count && i < 12; i = i + 1) {
+            Worm w = this.tagWorms[i];
+            int sx = width / 2 + (int)((w.headX / 256 - camX) * worldScale);
+            int sy = height / 2 + (int)((w.headY / 256 - camY - w.Radius() - 34) * worldScale);
+            this.Box(this.tags[i], sx - this.S(70), sy, this.S(140), this.S(22), this.S(14), ";color:" + SnSkins.PersonaCss(w.persona));
+        }
+        for (int i = 0; i < g.pops.Count && i < this.popLabels.Count; i = i + 1) {
+            Popup p = g.pops[i];
             int age = this.now - p.bornAt;
-            int sx = width/2 + (int)(SnGame.WrapD(p.x-camX, SnGame.WW())*worldScale);
-            int sy = height/2 + (int)((SnGame.WrapD(p.y-camY, SnGame.WH())-age/10)*worldScale);
-            int pw = (int)(400*scale);
-            double alpha = Math.Max(0, 255-age*255/950) / 255.0;
-            this.Box(this.popLabels[i], sx-pw/2, sy, pw, (int)(40*scale), (int)(27*scale),
+            int sx = width / 2 + (int)((p.x - camX) * worldScale);
+            int sy = height / 2 + (int)((p.y - camY - age / 10) * worldScale);
+            int pw = this.S(400);
+            double alpha = Math.Max(0, 255 - age * 255 / 950) / 255.0;
+            this.Box(this.popLabels[i], sx - pw / 2, sy, pw, this.S(40), this.S(26),
                 ";color:rgba(" + p.cr + "," + p.cg + "," + p.cb + "," + alpha + ")");
         }
     }
+    static string Css3(int col) {
+        return "rgb(" + SnSkins.R(col) + "," + SnSkins.G(col) + "," + SnSkins.B(col) + ")";
+    }
     double ToastAlpha() {
         int age = this.now - this.game.toastAt;
-        return age > 1100 ? Math.Max(0, 255-(age-1100)*255/400) / 255.0 : 1;
+        return age > 1200 ? Math.Max(0, 255 - (age - 1200) * 255 / 400) / 255.0 : 1;
     }
     void Box(Control control, int x, int y, int w, int h, int font, string extra) {
         string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + w + "dpx;height:" + h + "dpx";
@@ -136,18 +346,34 @@ public class SnHud {
     }
     static string Css() {
         return ".snake-hud{position:relative;padding:0;border:0;background:transparent}"
-            + ".snake-hud label{position:absolute;padding:0;margin:0;border:0;background:transparent;vertical-align:top;text-align:left;text-shadow:1dpx 2dpx 0 rgba(0,0,0,0.6)}"
-            + ".snake-score{color:#ffe678}.snake-tier{color:#aadcff}.snake-kills{color:#ffaabe}"
+            + ".snake-hud label{position:absolute;padding:0;margin:0;border:0;background:transparent;vertical-align:top;text-align:left;text-shadow:1dpx 2dpx 0 rgba(0,0,0,0.65)}"
+            + ".snake-score{color:#ffe678}.snake-tier{color:#aadcff}.snake-kills{color:#ffb3d1}.snake-hud label.snake-mute{color:#ff9db8}"
+            + ".snake-hud label.snake-threat{text-align:center;color:#bfe8ff;background:rgba(10,14,36,0.72);border:1dpx solid rgba(120,150,255,0.45);border-radius:15dpx}"
+            + ".snake-hud label.snake-threat-1{color:#ffe08a;border:1dpx solid rgba(255,200,90,0.6)}"
+            + ".snake-hud label.snake-threat-2{color:#ffa86e;border:1dpx solid rgba(255,140,80,0.7)}"
+            + ".snake-hud label.snake-threat-3{color:#ff6e8c;border:1dpx solid rgba(255,80,120,0.8);background:rgba(50,8,24,0.78)}"
+            + ".snake-glass{position:absolute;padding:0;margin:0;background:rgba(10,14,36,0.72);border:1dpx solid rgba(120,140,255,0.35);border-radius:10dpx}"
+            + ".snake-row-me{position:absolute;padding:0;margin:0;background:rgba(90,235,190,0.16);border:1dpx solid rgba(140,255,210,0.55);border-radius:7dpx}"
+            + ".snake-hud label.snake-board-title{color:#7ddfff}"
+            + ".snake-hud label.snake-row-rank{color:#ffe678;text-align:center}.snake-hud label.snake-row-name{color:#e6f0ff}"
+            + ".snake-hud label.snake-row-score{color:#e6f0ff;text-align:right}"
+            + ".snake-hud label.snake-feed{text-align:right}.snake-hud label.snake-feed-mine{font-weight:bold}"
+            + ".snake-pow-bg-1{border:1dpx solid rgba(255,96,120,0.75)}.snake-pow-bg-2{border:1dpx solid rgba(96,230,255,0.75)}.snake-pow-bg-3{border:1dpx solid rgba(255,214,80,0.75)}"
+            + ".snake-hud label.snake-pow-text{color:#f2f6ff}"
+            + ".snake-pow-bar{position:absolute;padding:0;margin:0;gap:0;border:0;background:transparent}"
+            + ".snake-pow-bar .progress-track{height:100%;background:rgba(255,255,255,0.12);border:0;border-radius:4dpx;padding:0}"
+            + ".snake-pow-bar .progress-fill{height:100%;border:0;border-radius:4dpx;background:#ffffff}"
+            + ".snake-pow-1 .progress-fill{background:#ff6078}.snake-pow-2 .progress-fill{background:#60e6ff}.snake-pow-3 .progress-fill{background:#ffd650}"
+            + ".snake-hud label.snake-tag{text-align:center;text-shadow:0 1dpx 3dpx rgba(0,0,0,0.9)}"
             + ".snake-hud label.snake-fever-text{color:#ffc8f0;text-align:center}.snake-hud label.snake-toast{color:#ffeb8c;text-align:center}.snake-hud label.snake-popup{text-align:center}"
-            + ".snake-hud label.snake-mute{color:#ff9db8;text-align:right}.snake-hud label.snake-hint{color:#dff6ff;text-align:center}"
-            + ".snake-fever{position:absolute;padding:0;margin:0;gap:0;border:0;border-radius:0;background:transparent}"
-            + ".snake-fever .progress-track{height:100%;background:rgba(30,34,60,0.78);border:0;border-radius:0;padding:0}"
-            + ".snake-fever .progress-fill{height:100%;background:#ff8cc8;border:0;border-radius:0}"
+            + ".snake-hud label.snake-hint{color:#dff6ff;text-align:center}"
+            + ".snake-fever{position:absolute;padding:0;margin:0;gap:0;border:0;border-radius:6dpx;background:transparent}"
+            + ".snake-fever .progress-track{height:100%;background:rgba(20,24,56,0.85);border:1dpx solid rgba(255,140,200,0.45);border-radius:6dpx;padding:0}"
+            + ".snake-fever .progress-fill{height:100%;background:#ff8cc8;border:0;border-radius:6dpx}"
             + ".snake-hue-0 .progress-fill{background:#ff6e8c}.snake-hue-1 .progress-fill{background:#ffcd5a}"
             + ".snake-hue-2 .progress-fill{background:#78eb8c}.snake-hue-3 .progress-fill{background:#5aa0ff}"
             + ".snake-hue-4 .progress-fill{background:#aa78ff}.snake-hue-5 .progress-fill{background:#ffeb78}"
-            + ".snake-minimap{color:#8cffd2;position:absolute;padding:0;border:1dpx solid rgba(120,130,190,0.47);border-radius:var(--radius-medium);background:rgba(12,16,34,0.75)}"
+            + ".snake-minimap{color:#8cffd2;position:absolute;padding:0;border:1dpx solid rgba(255,110,170,0.55);border-radius:var(--radius-medium);background:rgba(10,14,36,0.78)}"
             + ".snake-minimap-dot{position:absolute;padding:0;margin:0;border:0;border-radius:var(--radius-full)}.snake-minimap-player{z-index:1}";
     }
 }
-
