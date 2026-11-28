@@ -215,6 +215,16 @@ ZAN_GAME_API void zan_game_set_hit_flash3d(float r, float g, float b, float amou
 ZAN_GAME_API void zan_game_set_post_film3d(float sharpen_strength,
     float grain_strength, float grain_seed);
 
+/* GPU 全息扫描线与能量护盾菲涅尔覆层（Hologram Scanlines + Fresnel Energy Shield）：
+ * enabled != 0 时按世界 Y 轴正弦波扫描线叠加能量发光色（freq 频率、phase 滚动相位、strength 强度）。 */
+ZAN_GAME_API void zan_game_set_holo_scan3d(int32_t enabled, float freq,
+    float phase, float strength, float r, float g, float b);
+
+/* GPU 电影宽银幕黑边与水下/热浪屏幕波纹畸变（Cinema Letterbox + Wave Distortion，零额外 Pass）：
+ * letterbox_ratio [0..0.45] 控制上下黑边占比；distort_amp [0..0.08] 控制横向正弦波畸变幅度。 */
+ZAN_GAME_API void zan_game_set_post_cinema3d(float letterbox_ratio,
+    float distort_amp, float distort_freq, float distort_phase);
+
 #ifdef __cplusplus
 }
 #endif

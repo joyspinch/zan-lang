@@ -1,0 +1,280 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 番茄钟专注阶段枚举。
+public enum HabitFocusPhase {
+    Idle = 0,
+    Focus = 1,
+    ShortBreak = 2,
+    LongBreak = 3
+}
+
+// 商业桌面陪伴番茄钟专注习惯追踪器（Pomodoro Focus & Habit Tracker）：
+// - Focus -> ShortBreak / 每 N 轮进入 LongBreak 完整状态机
+// - 专注完成结算金币与当日达标统计；中途放弃零奖励并计入中断次数
+public class CompanionPomodoroHabitTracker {
+    public HabitFocusPhase Phase;
+    public int FocusDurationSec;
+    public int ShortBreakSec;
+    public int LongBreakSec;
+    public int CyclesPerLongBreak;
+    public int RewardCoinsPerFocus;
+    public int DailyGoal;
+    public int RemainingSec;
+    public int CompletedToday;
+    public int AbortedCount;
+    public int TotalEarnedCoins;
+
+    public CompanionPomodoroHabitTracker(int focusDurationSec, int shortBreakSec,
+                                         int longBreakSec, int cyclesPerLongBreak,
+                                         int rewardCoinsPerFocus, int dailyGoal) {
+        this.Phase = HabitFocusPhase.Idle;
+        this.FocusDurationSec = focusDurationSec > 0 ? focusDurationSec : 1500;
+        this.ShortBreakSec = shortBreakSec > 0 ? shortBreakSec : 300;
+        this.LongBreakSec = longBreakSec > 0 ? longBreakSec : 900;
+        this.CyclesPerLongBreak = cyclesPerLongBreak > 0 ? cyclesPerLongBreak : 4;
+        this.RewardCoinsPerFocus = rewardCoinsPerFocus >= 0 ? rewardCoinsPerFocus : 25;
+        this.DailyGoal = dailyGoal > 0 ? dailyGoal : 4;
+        this.RemainingSec = 0;
+        this.CompletedToday = 0;
+        this.AbortedCount = 0;
+        this.TotalEarnedCoins = 0;
+    }
+
+    public bool StartFocus() {
+        if (this.Phase == HabitFocusPhase.Focus) { return false; }
+        this.Phase = HabitFocusPhase.Focus;
+        this.RemainingSec = this.FocusDurationSec;
+        return true;
+    }
+
+    public bool AbortFocus() {
+        if (this.Phase != HabitFocusPhase.Focus) { return false; }
+        this.Phase = HabitFocusPhase.Idle;
+        this.RemainingSec = 0;
+        this.AbortedCount = this.AbortedCount + 1;
+        return true;
+    }
+
+    public bool IsDailyGoalMet() {
+        return this.CompletedToday >= this.DailyGoal;
+    }
+
+    public void Tick(int elapsedSec, out bool completedFocus, out int earnedCoins) {
+        completedFocus = false;
+        earnedCoins = 0;
+        if (elapsedSec <= 0 || this.Phase == HabitFocusPhase.Idle) { return; }
+
+        this.RemainingSec = this.RemainingSec - elapsedSec;
+        if (this.RemainingSec > 0) { return; }
+
+        if (this.Phase == HabitFocusPhase.Focus) {
+            completedFocus = true;
+            this.CompletedToday = this.CompletedToday + 1;
+            earnedCoins = this.RewardCoinsPerFocus;
+            this.TotalEarnedCoins = this.TotalEarnedCoins + earnedCoins;
+            if (this.CompletedToday % this.CyclesPerLongBreak == 0) {
+                this.Phase = HabitFocusPhase.LongBreak;
+                this.RemainingSec = this.LongBreakSec;
+            } else {
+                this.Phase = HabitFocusPhase.ShortBreak;
+                this.RemainingSec = this.ShortBreakSec;
+            }
+        } else {
+            this.Phase = HabitFocusPhase.Idle;
+            this.RemainingSec = 0;
+        }
+    }
+}
+
+// 桌宠对话气泡条目。
+public class VoiceBubbleEntry {
+    public string Category;
+    public string Text;
+    public int Priority; // 0=Ambient, 1=Reminder, 2=Interactive, 3=Urgent
+    public int DurationSec;
+
+    public VoiceBubbleEntry(string category, string text, int priority, int durationSec) {
+        this.Category = category != null ? category : "general";
+        this.Text = text != null ? text : "";
+        this.Priority = priority;
+        this.DurationSec = durationSec > 0 ? durationSec : 4;
+    }
+}
+
+// 气泡分类冷却记录。
+public class SpeechCategoryCooldown {
+    public string Category;
+    public long NextAllowedSec;
+
+    public SpeechCategoryCooldown(string category, long nextAllowedSec) {
+        this.Category = category;
+        this.NextAllowedSec = nextAllowedSec;
+    }
+}
+
+// 商业桌面陪伴气泡对白调度器（Priority Speech Bubble & Cooldown Queue）：
+// - 同分类消息受冷却时长节流防刷屏（Urgent>=3 豁免冷却并立即抢占当前展示气泡）
+// - 队列按优先级出队，展示到期自动切换下一条高优对白
+public class CompanionSpeechBubbleQueue {
+    public VoiceBubbleEntry ActiveBubble;
+    public long ActiveExpiresAtSec;
+    private List<VoiceBubbleEntry> pending;
+    private List<SpeechCategoryCooldown> cooldowns;
+
+    public CompanionSpeechBubbleQueue() {
+        this.ActiveBubble = null;
+        this.ActiveExpiresAtSec = 0L;
+        this.pending = new List<VoiceBubbleEntry>();
+        this.cooldowns = new List<SpeechCategoryCooldown>();
+    }
+
+    public int PendingCount() {
+        return this.pending.Count;
+    }
+
+    private long GetNextAllowed(string category) {
+        for (int i = 0; i < this.cooldowns.Count; i = i + 1) {
+            if (this.cooldowns[i].Category == category) {
+                return this.cooldowns[i].NextAllowedSec;
+            }
+        }
+        return -1L;
+    }
+
+    private void SetNextAllowed(string category, long nextAllowedSec) {
+        for (int i = 0; i < this.cooldowns.Count; i = i + 1) {
+            if (this.cooldowns[i].Category == category) {
+                this.cooldowns[i].NextAllowedSec = nextAllowedSec;
+                return;
+            }
+        }
+        this.cooldowns.Add(new SpeechCategoryCooldown(category, nextAllowedSec));
+    }
+
+    public bool Enqueue(string category, string text, int priority,
+                        int durationSec, int categoryCooldownSec, long nowSec) {
+        string cat = category != null ? category : "general";
+        if (priority < 3) {
+            long allowedAt = this.GetNextAllowed(cat);
+            if (allowedAt >= 0L && nowSec < allowedAt) { return false; }
+        }
+        if (categoryCooldownSec > 0) {
+            this.SetNextAllowed(cat, nowSec + (long)categoryCooldownSec);
+        }
+
+        VoiceBubbleEntry item = new VoiceBubbleEntry(cat, text, priority, durationSec);
+        if (priority >= 3 || this.ActiveBubble == null) {
+            this.ActiveBubble = item;
+            this.ActiveExpiresAtSec = nowSec + (long)item.DurationSec;
+            return true;
+        }
+        this.pending.Add(item);
+        return true;
+    }
+
+    public void Tick(long nowSec) {
+        if (this.ActiveBubble != null && nowSec < this.ActiveExpiresAtSec) { return; }
+        if (this.pending.Count == 0) {
+            this.ActiveBubble = null;
+            this.ActiveExpiresAtSec = 0L;
+            return;
+        }
+        int bestIdx = 0;
+        for (int i = 1; i < this.pending.Count; i = i + 1) {
+            if (this.pending[i].Priority > this.pending[bestIdx].Priority) {
+                bestIdx = i;
+            }
+        }
+        VoiceBubbleEntry next = this.pending[bestIdx];
+        this.pending.RemoveAt(bestIdx);
+        this.ActiveBubble = next;
+        this.ActiveExpiresAtSec = nowSec + (long)next.DurationSec;
+    }
+}
+
+// 存档备份槽位快照。
+public class SaveBackupSlot {
+    public int Version;
+    public long TimestampSec;
+    public string Payload;
+    public long Checksum;
+
+    public SaveBackupSlot(int version, long timestampSec, string payload, long checksum) {
+        this.Version = version;
+        this.TimestampSec = timestampSec;
+        this.Payload = payload != null ? payload : "";
+        this.Checksum = checksum;
+    }
+}
+
+// 商业桌面陪伴环形自愈存档备份库（Atomic Ring-Buffer Save Vault with FNV-1a Checksum）：
+// - 保留最近 N 个版本快照并计算 FNV-1a 校验和防意外断电/写半截损坏
+// - 加载最新存档时若最新槽位校验失败，自动回退到最近一个校验通过的完好备份
+public class CompanionSaveBackupVault {
+    public int MaxSlots;
+    public int NextVersion;
+    private List<SaveBackupSlot> slots;
+
+    public CompanionSaveBackupVault(int maxSlots) {
+        this.MaxSlots = maxSlots > 0 ? maxSlots : 5;
+        this.NextVersion = 1;
+        this.slots = new List<SaveBackupSlot>();
+    }
+
+    public int SlotCount() {
+        return this.slots.Count;
+    }
+
+    public static long ComputeChecksum(string payload) {
+        string s = payload != null ? payload : "";
+        long h = 2166136261L;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            long ch = (long)s[i];
+            h = (h ^ ch) * 16777619L;
+            h = h & 2147483647L;
+        }
+        return h;
+    }
+
+    public int SaveSnapshot(string payload, long timestampSec) {
+        int ver = this.NextVersion;
+        this.NextVersion = this.NextVersion + 1;
+        long sum = ComputeChecksum(payload);
+        if (this.slots.Count >= this.MaxSlots) {
+            this.slots.RemoveAt(0);
+        }
+        this.slots.Add(new SaveBackupSlot(ver, timestampSec, payload, sum));
+        return ver;
+    }
+
+    // 模拟磁盘扇区损坏/半截写入（不刷新校验和），用于自愈恢复测试或外部注入校验。
+    public bool TamperSlotPayload(int slotIndex, string brokenPayload) {
+        if (slotIndex < 0 || slotIndex >= this.slots.Count) { return false; }
+        this.slots[slotIndex].Payload = brokenPayload != null ? brokenPayload : "";
+        return true;
+    }
+
+    public bool IsSlotIntact(int slotIndex) {
+        if (slotIndex < 0 || slotIndex >= this.slots.Count) { return false; }
+        SaveBackupSlot sl = this.slots[slotIndex];
+        return ComputeChecksum(sl.Payload) == sl.Checksum;
+    }
+
+    public bool LoadLatestValid(out string outPayload, out int outVersion, out int skippedCorrupted) {
+        outPayload = "";
+        outVersion = 0;
+        skippedCorrupted = 0;
+        for (int i = this.slots.Count - 1; i >= 0; i = i - 1) {
+            if (this.IsSlotIntact(i)) {
+                outPayload = this.slots[i].Payload;
+                outVersion = this.slots[i].Version;
+                return true;
+            }
+            skippedCorrupted = skippedCorrupted + 1;
+        }
+        return false;
+    }
+}

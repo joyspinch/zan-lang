@@ -1,0 +1,148 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DHoloScanCinemaSpringCamTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfSize) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int c) { return (c >> 16) & 255; }
+    private static int GOf(int c) { return (c >> 8) & 255; }
+    private static int BOf(int c) { return c & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int meshId = cv.MeshUpload(MakeQuad(1.2f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 2.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        SceneNode root = new SceneNode("root");
+        Material mBase = Material.Emissive(0.15f, 0.15f, 0.15f);
+        SceneNode nQuad = new SceneNode("quad");
+        nQuad.MeshKey = meshId;
+        nQuad.BoundsRadius = 4.0f;
+        nQuad.Material = mBase;
+        root.AddChild(nQuad);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.0f; plan.AmbientGreen = 0.0f; plan.AmbientBlue = 0.0f;
+
+        // 1. GPU 全息扫描线与能量护盾覆层（Holo-Scan）：
+        // 频率 PI，相位 0 -> y=+0.5 处 sin(PI/2)=+1（波峰最亮青色），y=-0.5 处 sin(-PI/2)=-1（波谷最暗）
+        mBase.HoloScanEnabled = false;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int baseTop = zan_gui_read_pixel(cv.SurfaceId(), 64, 38);
+
+        mBase.HoloScanEnabled = true;
+        mBase.HoloScanFrequency = 3.1415926f;
+        mBase.HoloScanPhase = 0.0f;
+        mBase.HoloScanStrength = 0.85f;
+        mBase.HoloScanRed = 0.0f;
+        mBase.HoloScanGreen = 0.9f;
+        mBase.HoloScanBlue = 1.0f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int crestPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 38);  // world y > 0 波峰
+        int troughPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 90); // world y < 0 波谷
+
+        // 相位移动 PI -> 波峰波谷反转
+        mBase.HoloScanPhase = 3.1415926f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int crestFlipped = zan_gui_read_pixel(cv.SurfaceId(), 64, 38);
+        int troughFlipped = zan_gui_read_pixel(cv.SurfaceId(), 64, 90);
+
+        bool holoOk = BOf(baseTop) < 55
+            && BOf(crestPix) > BOf(troughPix) + 90
+            && BOf(troughFlipped) > BOf(crestFlipped) + 90
+            && BOf(crestPix) > 200;
+        Console.WriteLine("gpu-holo-scanline-overlay: " + Convert.ToString(holoOk ? 1 : 0));
+
+        // 2. GPU 电影宽银幕黑边（Letterbox）与水下/热浪波纹畸变（Wave Distortion）
+        // 绘制左红右蓝的垂直高对比场景，再跑单 Pass 后处理验证：
+        // - 上下 20% 黑边归零 (y=8, y=118 均为纯黑 0,0,0)
+        // - 中央分界线 (x=64) 开启水平正弦波纹畸变后偏移进入纯红或纯蓝区
+        mBase.HoloScanEnabled = false;
+        cv.Clear(unchecked((int)0xFF000000));
+        cv.FillRect(0, 0, 64, 128, unchecked((int)0xFFFF1010));
+        cv.FillRect(64, 0, 64, 128, unchecked((int)0xFF1010FF));
+
+        PostProcess post = new PostProcess();
+        post.LetterboxRatio = 0.20f;
+        post.WaveDistortAmplitude = 0.06f;
+        post.WaveDistortFrequency = 6.2831853f;
+        post.WaveDistortPhase = 0.0f;
+        cv.PostProcess3D(post);
+
+        int barTop = zan_gui_read_pixel(cv.SurfaceId(), 64, 8);
+        int barBot = zan_gui_read_pixel(cv.SurfaceId(), 64, 118);
+        int waveUpper = zan_gui_read_pixel(cv.SurfaceId(), 64, 32);
+        int waveLower = zan_gui_read_pixel(cv.SurfaceId(), 64, 96);
+
+        bool cinemaOk = ROf(barTop) == 0 && GOf(barTop) == 0 && BOf(barTop) == 0
+            && ROf(barBot) == 0 && GOf(barBot) == 0 && BOf(barBot) == 0
+            && ((ROf(waveUpper) > BOf(waveUpper) + 150 && BOf(waveLower) > ROf(waveLower) + 150)
+                || (BOf(waveUpper) > ROf(waveUpper) + 150 && ROf(waveLower) > BOf(waveLower) + 150));
+        Console.WriteLine("gpu-post-cinema-letterbox-wave: " + Convert.ToString(cinemaOk ? 1 : 0));
+
+        // 3. 3D 弹簧臂防穿墙回拉与创伤平方抖动衰减
+        CameraSpringRig3D rig = new CameraSpringRig3D(6.0f, 0.8f, 0.2f);
+        Vector3 pivot = new Vector3(0.0f, 1.5f, 0.0f);
+        Vector3 posOpen; Vector3 lookOpen;
+        rig.Update(pivot, 0.0f, 0.0f, 0.016f, out posOpen, out lookOpen);
+        bool openOk = rig.CurrentArmLength > 5.9f && posOpen.Z > 5.9f;
+
+        // 在相机臂路径 Z=3.0 放一个半径 0.8 的墙体球 -> 立即回拉到约 3.0 - (0.8 + 0.2) = 2.0
+        rig.AddObstacleSphere(new Vector3(0.0f, 1.5f, 3.0f), 0.8f);
+        Vector3 posBlocked; Vector3 lookBlocked;
+        rig.Update(pivot, 0.0f, 0.0f, 0.016f, out posBlocked, out lookBlocked);
+        bool pullBackOk = rig.CurrentArmLength >= 1.95f && rig.CurrentArmLength <= 2.05f
+            && posBlocked.Z <= 2.06f;
+
+        // 移除障碍后平滑伸展，且创伤抖动从强到弱衰减归零
+        rig.ClearObstacles();
+        rig.AddTrauma(1.0f);
+        Vector3 posShake1; Vector3 lookShake1;
+        rig.Update(pivot, 0.0f, 0.0f, 0.05f, out posShake1, out lookShake1);
+        float shakeDist1 = (float)Math.Sqrt((double)((posShake1.X * posShake1.X) + ((posShake1.Y - 1.5f) * (posShake1.Y - 1.5f))));
+
+        Vector3 posSettled = posShake1; Vector3 lookSettled = lookShake1;
+        for (int k = 0; k < 20; k = k + 1) {
+            rig.Update(pivot, 0.0f, 0.0f, 0.05f, out posSettled, out lookSettled);
+        }
+        float shakeDistEnd = (float)Math.Sqrt((double)((posSettled.X * posSettled.X) + ((posSettled.Y - 1.5f) * (posSettled.Y - 1.5f))));
+        bool extendAndDecayOk = rig.CurrentArmLength > 5.9f
+            && shakeDist1 > 0.10f
+            && rig.Trauma == 0.0f
+            && shakeDistEnd < 0.001f;
+
+        bool rigOk = openOk && pullBackOk && extendAndDecayOk;
+        Console.WriteLine("camera-spring-rig-3d: " + Convert.ToString(rigOk ? 1 : 0));
+    }
+}

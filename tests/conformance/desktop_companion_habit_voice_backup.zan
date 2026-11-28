@@ -1,0 +1,62 @@
+using System;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionHabitVoiceBackupTest {
+    static void Main() {
+        // 1. 番茄钟专注习惯追踪器：完整专注->短休->第2轮长休 + 中途放弃不给奖 + 每日达标
+        CompanionPomodoroHabitTracker pomo = new CompanionPomodoroHabitTracker(1500, 300, 900, 2, 30, 2);
+        pomo.StartFocus();
+        bool abortOk = pomo.AbortFocus() && pomo.Phase == HabitFocusPhase.Idle && pomo.AbortedCount == 1;
+
+        pomo.StartFocus();
+        bool done1; int coins1;
+        pomo.Tick(1500, out done1, out coins1); // 第 1 轮完成 -> ShortBreak, +30
+        bool shortBreakOk = done1 && coins1 == 30 && pomo.Phase == HabitFocusPhase.ShortBreak && !pomo.IsDailyGoalMet();
+        bool bDone; int bCoins;
+        pomo.Tick(300, out bDone, out bCoins);  // 短休结束 -> Idle
+
+        pomo.StartFocus();
+        bool done2; int coins2;
+        pomo.Tick(1500, out done2, out coins2); // 第 2 轮完成 -> LongBreak, +30, 达成每日目标
+        bool longBreakOk = done2 && coins2 == 30 && pomo.Phase == HabitFocusPhase.LongBreak
+            && pomo.IsDailyGoalMet() && pomo.TotalEarnedCoins == 60;
+
+        bool pomoOk = abortOk && shortBreakOk && pomo.Phase == HabitFocusPhase.LongBreak && longBreakOk;
+        Console.WriteLine("companion-pomodoro-habit: " + Convert.ToString(pomoOk ? 1 : 0));
+
+        // 2. 优先级气泡对白队列：同分类冷却拦截、按优先级出队、Urgent 立即抢占
+        CompanionSpeechBubbleQueue q = new CompanionSpeechBubbleQueue();
+        bool e1 = q.Enqueue("idle", "stretching...", 0, 5, 30, 100L);        // 立即展示 [100..105]
+        bool spamBlocked = !q.Enqueue("idle", "yawn...", 0, 5, 30, 110L);    // 冷却期 30s 内被拦截
+        bool eLow = q.Enqueue("tip", "drink water", 1, 4, 10, 101L);         // 排队 prio=1
+        bool eHigh = q.Enqueue("pet", "thanks for the pat!", 2, 4, 5, 102L); // 排队 prio=2
+        q.Tick(105L); // 首个过期 -> 应优先出队 prio=2 的 pet 对白
+        bool prioPicked = q.ActiveBubble != null && q.ActiveBubble.Text == "thanks for the pat!";
+        // Urgent 立即抢占（无视冷却）
+        bool urgentOk = q.Enqueue("idle", "BATTERY 5%!", 3, 6, 30, 106L)
+            && q.ActiveBubble != null && q.ActiveBubble.Text == "BATTERY 5%!";
+
+        bool speechOk = e1 && spamBlocked && eLow && eHigh && prioPicked && urgentOk;
+        Console.WriteLine("companion-speech-bubble-queue: " + Convert.ToString(speechOk ? 1 : 0));
+
+        // 3. 环形自愈存档备份库：超容滚动淘汰 + 最新槽位损坏时自动回退至最近完好版本
+        CompanionSaveBackupVault vault = new CompanionSaveBackupVault(3);
+        vault.SaveSnapshot("save_v1_coins=10", 1000L);
+        vault.SaveSnapshot("save_v2_coins=25", 2000L);
+        vault.SaveSnapshot("save_v3_coins=40", 3000L);
+        vault.SaveSnapshot("save_v4_coins=99", 4000L); // 淘汰 v1，槽位现存 [v2, v3, v4]
+
+        // 破坏最新槽位 (index=2, v4) 模拟写半截断电损坏
+        vault.TamperSlotPayload(2, "save_v4_CORRUPT!!!");
+        string recovered; int ver; int skipped;
+        bool loadOk = vault.LoadLatestValid(out recovered, out ver, out skipped);
+
+        bool vaultOk = vault.SlotCount() == 3
+            && !vault.IsSlotIntact(2)
+            && vault.IsSlotIntact(1)
+            && loadOk && ver == 3 && recovered == "save_v3_coins=40" && skipped == 1;
+        Console.WriteLine("companion-save-backup-vault: " + Convert.ToString(vaultOk ? 1 : 0));
+    }
+}

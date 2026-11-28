@@ -1,0 +1,72 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerMatchmakingPartyAntiCheatTest {
+    static void Main() {
+        // 1. 扩展窗口 MMR 技能匹配器：大区隔离 + 等待放宽窗口 + 蛇形均衡分队
+        NetSkillMatchmaker mm = new NetSkillMatchmaker(100, 10, 400);
+        mm.Enqueue(1, 1500, "asia", 100L);
+        mm.Enqueue(2, 1620, "asia", 100L);
+        mm.Enqueue(3, 1740, "asia", 100L);
+        mm.Enqueue(4, 1800, "asia", 100L); // 分差 300 > 初始容忍 100
+        mm.Enqueue(5, 1550, "eu",   100L); // 不同大区不得混排
+
+        // t=105 时容忍度 100+50=150 < 300，暂不成局
+        MatchedLobby early = mm.TryFormMatch("asia", 2, 105L);
+        // t=125 时容忍度 100+250=350 >= 300，成局且蛇形分队 (1800+1500=3300 vs 1740+1620=3360, delta=60)
+        MatchedLobby formed = mm.TryFormMatch("asia", 2, 125L);
+        bool mmOk = early == null && formed != null
+            && formed.TeamA.Count == 2 && formed.TeamB.Count == 2
+            && formed.TeamMmrDelta() == 60
+            && mm.QueueCount() == 1; // 仅剩 eu 区玩家 5
+        Console.WriteLine("net-skill-matchmaker: " + Convert.ToString(mmOk ? 1 : 0));
+
+        // 2. 小队状态机：加队、未全员就绪禁排、切模式重置就绪、队长离线自动继任与踢人
+        NetPartyLobbyManager party = new NetPartyLobbyManager(9, 101, 3, "ranked");
+        bool j2 = party.Join(102);
+        bool j3 = party.Join(103);
+        bool fullBlocked = !party.Join(104); // 超过 MaxSize=3
+        party.SetReady(101, true);
+        party.SetReady(102, true);
+        bool notAllReadyBlocked = !party.StartQueue(101); // 103 未就绪
+        party.SetReady(103, true);
+        bool modeResetOk = party.SetGameMode(101, "arena") && !party.AllReady();
+        party.SetReady(101, true);
+        party.SetReady(102, true);
+        party.SetReady(103, true);
+        bool startOk = party.StartQueue(101) && party.InQueue;
+        bool nonLeaderKickBlocked = !party.Kick(102, 103);
+        // 队长 101 退出 -> 顺延 102 为新队长，队列中止，102 可踢出 103
+        bool leaderLeft = party.Leave(101) && party.LeaderId == 102 && !party.InQueue;
+        bool kickOk = party.Kick(102, 103) && party.MemberCount() == 1;
+
+        bool partyOk = j2 && j3 && fullBlocked && notAllReadyBlocked
+            && modeResetOk && startOk && nonLeaderKickBlocked && leaderLeft && kickOk;
+        Console.WriteLine("net-party-lobby-manager: " + Convert.ToString(partyOk ? 1 : 0));
+
+        // 3. 服务端权威移动反作弊：正常移动放行、加速/飞天/瞬移拉回并触发踢线阈值
+        NetMovementAntiCheatValidator ac = new NetMovementAntiCheatValidator(8.0, 12.0, 15.0, 100.0);
+        ac.RegisterPlayer(50, 0.0, 0.0, 0.0);
+
+        double ox; double oy; double oz; string rej;
+        // 合法行走：0.5s 走 3.5m (7 m/s <= 8 * 1.15)
+        bool walkOk = ac.ValidateMove(50, 3.5, 0.0, 0.0, 0.5, out ox, out oy, out oz, out rej)
+            && ox > 3.49 && ox < 3.51;
+        // 加速挂：0.1s 走 2.5m (25 m/s) -> 拒绝并拉回 3.5，记 35 分
+        bool speedCaught = !ac.ValidateMove(50, 6.0, 0.0, 0.0, 0.1, out ox, out oy, out oz, out rej)
+            && rej == "SPEED_HACK" && ox > 3.49 && ox < 3.51;
+        // 飞天挂：0.1s 上升 3.0m (30 m/s) -> 拒绝并拉回 Y=0，累计 75 分
+        bool flyCaught = !ac.ValidateMove(50, 3.5, 3.0, 0.0, 0.1, out ox, out oy, out oz, out rej)
+            && rej == "FLY_HACK" && oy < 0.01;
+        // 瞬移挂：一步跳 50m -> 拒绝拉回，累计 135 >= 100 触发 FlaggedForKick
+        bool tpCaught = !ac.ValidateMove(50, 53.5, 0.0, 0.0, 0.1, out ox, out oy, out oz, out rej)
+            && rej == "TELEPORT" && ox > 3.49 && ox < 3.51;
+        PlayerMoveState st50 = ac.FindPlayer(50);
+        bool kicked = st50 != null && st50.FlaggedForKick;
+
+        bool acOk = walkOk && speedCaught && flyCaught && tpCaught && kicked;
+        Console.WriteLine("net-movement-anticheat: " + Convert.ToString(acOk ? 1 : 0));
+    }
+}

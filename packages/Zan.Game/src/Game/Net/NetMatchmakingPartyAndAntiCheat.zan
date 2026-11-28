@@ -1,0 +1,370 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 匹配池等待票据。
+public class SkillMatchTicket {
+    public int PlayerId;
+    public int Mmr;
+    public string Region;
+    public long EnqueueSec;
+
+    public SkillMatchTicket(int playerId, int mmr, string region, long enqueueSec) {
+        this.PlayerId = playerId;
+        this.Mmr = mmr;
+        this.Region = region != null ? region : "global";
+        this.EnqueueSec = enqueueSec;
+    }
+}
+
+// 匹配成局结果（包含蛇形选秀均衡分队）。
+public class MatchedLobby {
+    public string Region;
+    public List<int> TeamA;
+    public List<int> TeamB;
+    public int TeamAMmrSum;
+    public int TeamBMmrSum;
+
+    public MatchedLobby(string region) {
+        this.Region = region != null ? region : "global";
+        this.TeamA = new List<int>();
+        this.TeamB = new List<int>();
+        this.TeamAMmrSum = 0;
+        this.TeamBMmrSum = 0;
+    }
+
+    public int TeamMmrDelta() {
+        int d = this.TeamAMmrSum - this.TeamBMmrSum;
+        return d < 0 ? -d : d;
+    }
+}
+
+// 商业多人联机扩展窗口 MMR 技能匹配器（Expanding-Window MMR Matchmaker）：
+// - 按大区（Region）严格隔离匹配池，防重入排队
+// - 随等待时长线性放宽可接受分差（baseTol + waitSec * expandPerSec，封顶 maxTol）
+// - 成局后采用蛇形分队（0,3,4,7... vs 1,2,5,6...）最小化两队总分差
+public class NetSkillMatchmaker {
+    public int BaseTolerance;
+    public int ExpandPerSec;
+    public int MaxTolerance;
+    private List<SkillMatchTicket> pool;
+
+    public NetSkillMatchmaker(int baseTolerance, int expandPerSec, int maxTolerance) {
+        this.BaseTolerance = baseTolerance >= 0 ? baseTolerance : 80;
+        this.ExpandPerSec = expandPerSec >= 0 ? expandPerSec : 10;
+        this.MaxTolerance = maxTolerance >= this.BaseTolerance ? maxTolerance : this.BaseTolerance;
+        this.pool = new List<SkillMatchTicket>();
+    }
+
+    public int QueueCount() {
+        return this.pool.Count;
+    }
+
+    public bool Enqueue(int playerId, int mmr, string region, long nowSec) {
+        if (playerId <= 0) { return false; }
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            if (this.pool[i].PlayerId == playerId) { return false; }
+        }
+        this.pool.Add(new SkillMatchTicket(playerId, mmr, region, nowSec));
+        return true;
+    }
+
+    public bool Cancel(int playerId) {
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            if (this.pool[i].PlayerId == playerId) {
+                this.pool.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int AllowedSpread(SkillMatchTicket t, long nowSec) {
+        long waited = nowSec - t.EnqueueSec;
+        if (waited < 0L) { waited = 0L; }
+        long tol = (long)this.BaseTolerance + waited * (long)this.ExpandPerSec;
+        if (tol > (long)this.MaxTolerance) { tol = (long)this.MaxTolerance; }
+        return (int)tol;
+    }
+
+    public MatchedLobby TryFormMatch(string region, int teamSize, long nowSec) {
+        if (teamSize <= 0) { return null; }
+        int need = teamSize * 2;
+        string reg = region != null ? region : "global";
+
+        List<SkillMatchTicket> cand = new List<SkillMatchTicket>();
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            if (this.pool[i].Region == reg) {
+                cand.Add(this.pool[i]);
+            }
+        }
+        if (cand.Count < need) { return null; }
+
+        // 按 MMR 升序排序（插入排序保证稳定性且零额外分配）
+        for (int i = 1; i < cand.Count; i = i + 1) {
+            SkillMatchTicket key = cand[i];
+            int j = i - 1;
+            while (j >= 0 && cand[j].Mmr > key.Mmr) {
+                cand[j + 1] = cand[j];
+                j = j - 1;
+            }
+            cand[j + 1] = key;
+        }
+
+        // 滑动窗口寻找满足所有成员容忍分差的最优连续区间
+        int bestStart = -1;
+        int bestSpread = 2147483647;
+        for (int start = 0; start <= cand.Count - need; start = start + 1) {
+            int spread = cand[start + need - 1].Mmr - cand[start].Mmr;
+            int minTol = 2147483647;
+            for (int k = 0; k < need; k = k + 1) {
+                int tol = this.AllowedSpread(cand[start + k], nowSec);
+                if (tol < minTol) { minTol = tol; }
+            }
+            if (spread <= minTol && spread < bestSpread) {
+                bestSpread = spread;
+                bestStart = start;
+            }
+        }
+        if (bestStart < 0) { return null; }
+
+        MatchedLobby lobby = new MatchedLobby(reg);
+        // 蛇形选秀分队（按降序：0->A, 1->B, 2->B, 3->A...）
+        for (int k = 0; k < need; k = k + 1) {
+            SkillMatchTicket t = cand[bestStart + need - 1 - k];
+            int pairIdx = k / 2;
+            bool toA = (pairIdx % 2 == 0) ? (k % 2 == 0) : (k % 2 == 1);
+            if (toA) {
+                lobby.TeamA.Add(t.PlayerId);
+                lobby.TeamAMmrSum = lobby.TeamAMmrSum + t.Mmr;
+            } else {
+                lobby.TeamB.Add(t.PlayerId);
+                lobby.TeamBMmrSum = lobby.TeamBMmrSum + t.Mmr;
+            }
+            this.Cancel(t.PlayerId);
+        }
+        return lobby;
+    }
+}
+
+// 小队成员状态。
+public class PartyMember {
+    public int PlayerId;
+    public bool IsReady;
+
+    public PartyMember(int playerId) {
+        this.PlayerId = playerId;
+        this.IsReady = false;
+    }
+}
+
+// 商业联机小队/开黑房状态机（Party Lobby & Ready-Check Manager）：
+// - 队长掉线自动顺延继任、仅队长可踢人/切模式
+// - 切换玩法模式自动重置全员 Ready 状态，防误开局
+// - 全员就绪且人数合规方允许进入匹配队列
+public class NetPartyLobbyManager {
+    public int PartyId;
+    public int LeaderId;
+    public int MaxSize;
+    public string GameMode;
+    public bool InQueue;
+    private List<PartyMember> members;
+
+    public NetPartyLobbyManager(int partyId, int leaderId, int maxSize, string gameMode) {
+        this.PartyId = partyId;
+        this.LeaderId = leaderId;
+        this.MaxSize = maxSize > 0 ? maxSize : 4;
+        this.GameMode = gameMode != null ? gameMode : "ranked";
+        this.InQueue = false;
+        this.members = new List<PartyMember>();
+        if (leaderId > 0) {
+            this.members.Add(new PartyMember(leaderId));
+        }
+    }
+
+    public int MemberCount() {
+        return this.members.Count;
+    }
+
+    private int FindIndex(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return i; }
+        }
+        return -1;
+    }
+
+    public bool Join(int playerId) {
+        if (playerId <= 0 || this.InQueue) { return false; }
+        if (this.members.Count >= this.MaxSize) { return false; }
+        if (this.FindIndex(playerId) >= 0) { return false; }
+        this.members.Add(new PartyMember(playerId));
+        if (this.LeaderId <= 0) { this.LeaderId = playerId; }
+        return true;
+    }
+
+    public bool Leave(int playerId) {
+        int idx = this.FindIndex(playerId);
+        if (idx < 0) { return false; }
+        this.members.RemoveAt(idx);
+        this.InQueue = false;
+        if (this.LeaderId == playerId) {
+            this.LeaderId = this.members.Count > 0 ? this.members[0].PlayerId : 0;
+        }
+        return true;
+    }
+
+    public bool Kick(int actorId, int targetId) {
+        if (actorId != this.LeaderId || actorId == targetId) { return false; }
+        return this.Leave(targetId);
+    }
+
+    public bool SetReady(int playerId, bool ready) {
+        int idx = this.FindIndex(playerId);
+        if (idx < 0) { return false; }
+        this.members[idx].IsReady = ready;
+        if (!ready) { this.InQueue = false; }
+        return true;
+    }
+
+    public bool SetGameMode(int actorId, string nextMode) {
+        if (actorId != this.LeaderId || nextMode == null || nextMode == "") { return false; }
+        this.GameMode = nextMode;
+        this.InQueue = false;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            this.members[i].IsReady = false;
+        }
+        return true;
+    }
+
+    public bool AllReady() {
+        if (this.members.Count == 0) { return false; }
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (!this.members[i].IsReady) { return false; }
+        }
+        return true;
+    }
+
+    public bool StartQueue(int actorId) {
+        if (actorId != this.LeaderId || !this.AllReady()) { return false; }
+        this.InQueue = true;
+        return true;
+    }
+}
+
+// 服务端权威玩家运动校验档案。
+public class PlayerMoveState {
+    public int PlayerId;
+    public double AuthX;
+    public double AuthY;
+    public double AuthZ;
+    public double ViolationScore;
+    public bool FlaggedForKick;
+
+    public PlayerMoveState(int playerId, double x, double y, double z) {
+        this.PlayerId = playerId;
+        this.AuthX = x;
+        this.AuthY = y;
+        this.AuthZ = z;
+        this.ViolationScore = 0.0;
+        this.FlaggedForKick = false;
+    }
+}
+
+// 商业实时多人服务端权威移动反作弊校验器（Speed-Hack / Teleport / Fly-Hack Detector）：
+// - 校验水平速度上限（含网络抖动宽容）、瞬移距离与垂直上升速率
+// - 异常帧立即拒绝并返回权威坐标（Rubber-band 拉回），按违规权重记分并随合法移动平滑衰减
+// - 累计违规分越线触发 FlaggedForKick 强制踢下线保护公平性
+public class NetMovementAntiCheatValidator {
+    public double MaxHorizSpeed;
+    public double MaxUpSpeed;
+    public double SpeedGraceFactor;
+    public double TeleportDistance;
+    public double KickThreshold;
+    public double DecayPerSec;
+    private List<PlayerMoveState> states;
+
+    public NetMovementAntiCheatValidator(double maxHorizSpeed, double maxUpSpeed,
+                                         double teleportDistance, double kickThreshold) {
+        this.MaxHorizSpeed = maxHorizSpeed > 0.1 ? maxHorizSpeed : 8.0;
+        this.MaxUpSpeed = maxUpSpeed > 0.1 ? maxUpSpeed : 12.0;
+        this.SpeedGraceFactor = 1.15;
+        this.TeleportDistance = teleportDistance > 1.0 ? teleportDistance : 15.0;
+        this.KickThreshold = kickThreshold > 1.0 ? kickThreshold : 100.0;
+        this.DecayPerSec = 5.0;
+        this.states = new List<PlayerMoveState>();
+    }
+
+    public PlayerMoveState FindPlayer(int playerId) {
+        for (int i = 0; i < this.states.Count; i = i + 1) {
+            if (this.states[i].PlayerId == playerId) { return this.states[i]; }
+        }
+        return null;
+    }
+
+    public void RegisterPlayer(int playerId, double startX, double startY, double startZ) {
+        PlayerMoveState existing = this.FindPlayer(playerId);
+        if (existing != null) {
+            existing.AuthX = startX;
+            existing.AuthY = startY;
+            existing.AuthZ = startZ;
+            existing.ViolationScore = 0.0;
+            existing.FlaggedForKick = false;
+            return;
+        }
+        this.states.Add(new PlayerMoveState(playerId, startX, startY, startZ));
+    }
+
+    public bool ValidateMove(int playerId, double nextX, double nextY, double nextZ,
+                             double dtSec, out double outX, out double outY, out double outZ,
+                             out string rejectReason) {
+        outX = nextX;
+        outY = nextY;
+        outZ = nextZ;
+        rejectReason = "";
+
+        PlayerMoveState st = this.FindPlayer(playerId);
+        if (st == null || dtSec <= 0.0001) {
+            rejectReason = "INVALID_STATE";
+            return false;
+        }
+
+        double dx = nextX - st.AuthX;
+        double dy = nextY - st.AuthY;
+        double dz = nextZ - st.AuthZ;
+        double horizDist = Math.Sqrt(dx * dx + dz * dz);
+        double totalDist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        double horizSpeed = horizDist / dtSec;
+        double upSpeed = dy / dtSec;
+
+        if (totalDist > this.TeleportDistance) {
+            st.ViolationScore = st.ViolationScore + 60.0;
+            if (st.ViolationScore >= this.KickThreshold) { st.FlaggedForKick = true; }
+            outX = st.AuthX; outY = st.AuthY; outZ = st.AuthZ;
+            rejectReason = "TELEPORT";
+            return false;
+        }
+        if (horizSpeed > this.MaxHorizSpeed * this.SpeedGraceFactor) {
+            st.ViolationScore = st.ViolationScore + 35.0;
+            if (st.ViolationScore >= this.KickThreshold) { st.FlaggedForKick = true; }
+            outX = st.AuthX; outY = st.AuthY; outZ = st.AuthZ;
+            rejectReason = "SPEED_HACK";
+            return false;
+        }
+        if (upSpeed > this.MaxUpSpeed * this.SpeedGraceFactor) {
+            st.ViolationScore = st.ViolationScore + 40.0;
+            if (st.ViolationScore >= this.KickThreshold) { st.FlaggedForKick = true; }
+            outX = st.AuthX; outY = st.AuthY; outZ = st.AuthZ;
+            rejectReason = "FLY_HACK";
+            return false;
+        }
+
+        // 合法帧：更新权威坐标并按时间自然衰减违规分
+        st.AuthX = nextX;
+        st.AuthY = nextY;
+        st.AuthZ = nextZ;
+        st.ViolationScore = st.ViolationScore - this.DecayPerSec * dtSec;
+        if (st.ViolationScore < 0.0) { st.ViolationScore = 0.0; }
+        return true;
+    }
+}

@@ -1,0 +1,147 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 相机弹簧臂遮挡球体障碍。
+public class CameraObstacleSphere {
+    public Vector3 Center;
+    public float Radius;
+
+    public CameraObstacleSphere(Vector3 center, float radius) {
+        this.Center = center;
+        this.Radius = radius > 0.0f ? radius : 0.1f;
+    }
+}
+
+// 商业第三人称 3D 弹簧臂相机控制器（Unreal USpringArmComponent 风格）：
+// - 指数阻尼平滑追踪目标锚点，帧率无关
+// - 球体探针防穿墙回拉（遇到遮挡立即收缩，遮挡消失后平滑恢复臂长）
+// - Trauma^2 创伤平方非线性镜头抖动与线性衰减
+public class CameraSpringRig3D {
+    public float TargetArmLength;
+    public float MinArmLength;
+    public float CurrentArmLength;
+    public float ProbeRadius;
+    public float FollowStiffness;
+    public float ExtendSpeed;
+    public float Trauma;
+    public float TraumaDecayRate;
+    public float MaxShakeOffset;
+    public Vector3 SmoothedPivot;
+    private bool hasPivot;
+    private float shakeClock;
+    private List<CameraObstacleSphere> obstacles;
+
+    public CameraSpringRig3D(float targetArmLength, float minArmLength, float probeRadius) {
+        this.TargetArmLength = targetArmLength > 0.5f ? targetArmLength : 5.0f;
+        this.MinArmLength = minArmLength > 0.1f ? minArmLength : 0.6f;
+        this.CurrentArmLength = this.TargetArmLength;
+        this.ProbeRadius = probeRadius >= 0.0f ? probeRadius : 0.25f;
+        this.FollowStiffness = 12.0f;
+        this.ExtendSpeed = 6.0f;
+        this.Trauma = 0.0f;
+        this.TraumaDecayRate = 1.6f;
+        this.MaxShakeOffset = 0.35f;
+        this.SmoothedPivot = new Vector3(0.0f, 0.0f, 0.0f);
+        this.hasPivot = false;
+        this.shakeClock = 0.0f;
+        this.obstacles = new List<CameraObstacleSphere>();
+    }
+
+    public void ClearObstacles() {
+        this.obstacles.Clear();
+    }
+
+    public void AddObstacleSphere(Vector3 center, float radius) {
+        this.obstacles.Add(new CameraObstacleSphere(center, radius));
+    }
+
+    public void AddTrauma(float amount) {
+        if (amount <= 0.0f) { return; }
+        this.Trauma = this.Trauma + amount;
+        if (this.Trauma > 1.0f) { this.Trauma = 1.0f; }
+    }
+
+    private float ComputeClearArmLength(Vector3 pivot, Vector3 armDir, float desiredLen) {
+        float bestLen = desiredLen;
+        for (int i = 0; i < this.obstacles.Count; i = i + 1) {
+            CameraObstacleSphere ob = this.obstacles[i];
+            double ox = (double)pivot.X - (double)ob.Center.X;
+            double oy = (double)pivot.Y - (double)ob.Center.Y;
+            double oz = (double)pivot.Z - (double)ob.Center.Z;
+            double r = (double)(ob.Radius + this.ProbeRadius);
+
+            double b = ox * (double)armDir.X + oy * (double)armDir.Y + oz * (double)armDir.Z;
+            double c = ox * ox + oy * oy + oz * oz - r * r;
+            if (c <= 0.0) {
+                bestLen = this.MinArmLength;
+                continue;
+            }
+            double disc = b * b - c;
+            if (disc < 0.0) { continue; }
+            double hitDist = -b - Math.Sqrt(disc);
+            if (hitDist >= 0.0 && hitDist < (double)bestLen) {
+                float candidate = (float)hitDist;
+                if (candidate < this.MinArmLength) { candidate = this.MinArmLength; }
+                bestLen = candidate;
+            }
+        }
+        return bestLen;
+    }
+
+    public void Update(Vector3 targetPivot, float yawRad, float pitchRad, float dt,
+                       out Vector3 outCameraPos, out Vector3 outLookAt) {
+        float step = dt > 0.0f ? dt : 0.0f;
+        if (!this.hasPivot) {
+            this.SmoothedPivot = targetPivot;
+            this.hasPivot = true;
+        } else if (step > 0.0f) {
+            float alpha = 1.0f - (float)MathUtil.Exp(-(double)(this.FollowStiffness * step));
+            if (alpha < 0.0f) { alpha = 0.0f; }
+            if (alpha > 1.0f) { alpha = 1.0f; }
+            this.SmoothedPivot = new Vector3(
+                this.SmoothedPivot.X + (targetPivot.X - this.SmoothedPivot.X) * alpha,
+                this.SmoothedPivot.Y + (targetPivot.Y - this.SmoothedPivot.Y) * alpha,
+                this.SmoothedPivot.Z + (targetPivot.Z - this.SmoothedPivot.Z) * alpha);
+        }
+
+        // 从枢轴指向相机的单位臂方向（yaw=0, pitch=0 时相机位于 +Z）
+        double cy = Math.Cos((double)yawRad);
+        double sy = Math.Sin((double)yawRad);
+        double cp = Math.Cos((double)pitchRad);
+        double sp = Math.Sin((double)pitchRad);
+        Vector3 armDir = new Vector3((float)(sy * cp), (float)sp, (float)(cy * cp));
+        Vector3 right = new Vector3((float)cy, 0.0f, (float)(-sy));
+        Vector3 up = new Vector3((float)(-sy * sp), (float)cp, (float)(-cy * sp));
+
+        float clearLen = this.ComputeClearArmLength(this.SmoothedPivot, armDir, this.TargetArmLength);
+        if (clearLen < this.CurrentArmLength) {
+            // 遇墙立即回拉避免穿模
+            this.CurrentArmLength = clearLen;
+        } else if (step > 0.0f) {
+            float nextLen = this.CurrentArmLength + this.ExtendSpeed * step;
+            this.CurrentArmLength = nextLen > clearLen ? clearLen : nextLen;
+        }
+
+        this.shakeClock = this.shakeClock + step;
+        float shakeMag = this.Trauma * this.Trauma * this.MaxShakeOffset;
+        float sx = 0.0f;
+        float syOff = 0.0f;
+        if (shakeMag > 0.00001f) {
+            sx = (float)Math.Sin((double)(this.shakeClock * 37.0f + 1.1f)) * shakeMag;
+            syOff = (float)Math.Cos((double)(this.shakeClock * 43.0f + 2.3f)) * shakeMag;
+        }
+        if (step > 0.0f && this.Trauma > 0.0f) {
+            this.Trauma = this.Trauma - this.TraumaDecayRate * step;
+            if (this.Trauma < 0.0f) { this.Trauma = 0.0f; }
+        }
+
+        outCameraPos = new Vector3(
+            this.SmoothedPivot.X + armDir.X * this.CurrentArmLength + right.X * sx + up.X * syOff,
+            this.SmoothedPivot.Y + armDir.Y * this.CurrentArmLength + right.Y * sx + up.Y * syOff,
+            this.SmoothedPivot.Z + armDir.Z * this.CurrentArmLength + right.Z * sx + up.Z * syOff);
+        outLookAt = this.SmoothedPivot;
+    }
+}
