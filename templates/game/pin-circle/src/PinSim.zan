@@ -3,9 +3,10 @@ using Game.Foundation;
 
 // 回放与回归（docs/ZAN_STANDARD.md S26/S27）：PinWorld 以固定 16ms 一帧无头推进。
 // replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
-// 改了手感参数（转速、飞针速度、碰撞）后回放分叉，就重新录制（见 README）。
+// 改了手感参数（转速、飞针速度、碰撞、关卡表）后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 无操作；1 发射；2 暂停/继续；3 下一回合（过关进下一关、失败重开本关）。
+// 输入编码：0 无操作；1 发射；2 暂停/继续；3 下一回合（过关进下一关、失败重开本关）；
+// 4 关卡选择（按帧号挑 1..40 关，让机器人覆盖变速、反转、摇摆与首领多环）。
 public class PinSim : IReplaySim {
     const int FrameMs = 16;
     PinWorld world;
@@ -25,14 +26,17 @@ public class PinSim : IReplaySim {
         } else if (input == 3 && world.state != RoundState.Playing) {
             int next = world.state == RoundState.Cleared ? world.level + 1 : world.level;
             world.StartRound(next, seed + frame);
+        } else if (input == 4) {
+            world.StartRound(1 + (frame / 7) % PinLevels.Count, seed + frame);
         }
         world.Step(PinSim.FrameMs);
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        h.Int(world.level).Int(world.inserted).Int((int)world.state).Int(world.elapsedMs)
-         .Bool(world.flying).Bool(world.paused).Real(world.rotation).Real(world.shotRadius);
+        h.Int(world.level).Int(world.phase).Int(world.inserted).Int((int)world.state).Int(world.elapsedMs)
+         .Int(world.phaseTimeMs).Int(world.interludeMs).Int(world.closeCount)
+         .Bool(world.flying).Bool(world.paused).Real(world.rotation).Real(world.shotRadius).Real(world.wobble);
         h.Int(world.pins.Count);
         for (int i = 0; i < world.pins.Count; i = i + 1) { h.Real(world.pins[i].angle); }
         return h.Value();
@@ -44,16 +48,32 @@ public class PinSim : IReplaySim {
     [Invariant]
     public bool RotationWrapped() { return world.rotation >= 0 && world.rotation < 6.2832; }
 
-    // 飞针只在发射半径与针座半径之间
+    // 飞针只在发射半径与针座半径之间（摇摆机关偏心时针座半径略小）
     [Invariant]
-    public bool ShotInFlightRange() { return world.shotRadius >= 144 && world.shotRadius <= 312; }
+    public bool ShotInFlightRange() { return world.shotRadius >= 136 && world.shotRadius <= 312; }
 
-    // 机器人：时不时发射，回合结束后过一会儿点下一回合，极少暂停
+    // 关卡与首领环序号不越界；盘上针数 = 预置 + 本环已入隙
+    [Invariant]
+    public bool PhaseInRange() {
+        if (world.level < 1 || world.level > PinLevels.Count) { return false; }
+        if (world.phase < 0 || world.phase >= world.PhaseCount()) { return false; }
+        return world.pins.Count == world.Phase().presets.Count + world.inserted;
+    }
+
+    // 换环间歇期不能有飞针；摇摆幅度不超过关卡设定
+    [Invariant]
+    public bool InterludeHoldsFire() {
+        if (world.interludeMs > 0 && world.flying) { return false; }
+        return Math.Abs(world.wobble) <= world.Phase().wobblePx + 0.0001;
+    }
+
+    // 机器人：时不时发射，回合结束后过一会儿点下一回合，偶尔跳关，极少暂停
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(1000);
         if (roll < 50) { return 1; }
-        if (roll < 80) { return 3; }
-        if (roll < 84) { return 2; }
+        if (roll < 74) { return 3; }
+        if (roll < 78) { return 4; }
+        if (roll < 82) { return 2; }
         return 0;
     }
 }

@@ -5,6 +5,9 @@ using Gui;
 using Game.Kit;
 using Game.Foundation.Gui;
 
+// 对局状态与模拟规则（无头可跑）：玩家、AI、豆子、道具、排行榜、威胁升级。
+// AI 决策在 SnAi，绘制在 SnArt，HUD 在 SnHud——这里不碰窗口、音频与时钟：
+// 所有计时都读模拟时钟 simNow（只随 Tick 的步长前进，暂停时冻结）。
 public class SnGame {
     GuiHost host;
     Canvas c;
@@ -13,42 +16,68 @@ public class SnGame {
     Rng rng;
 
     Worm me;
-    List<Worm> foes;  // hunters + snakelets
+    List<Worm> foes;  // 有名字的 AI 大蛇 + 小蛇猎物
     List<Orb> orbs;
     List<Particle> parts;
     List<Popup> pops;
+    List<Ring> rings;
+    List<FeedItem> feed;
+    List<Worm> board;  // 排行榜前 5（含玩家）
 
     bool over;  // 死亡即置位，SnPlayScene 据此路由到结算场景
     Protected score;
     int kills;
     int lastTick;
+    int simNow;  // 模拟时钟 ms（Tick 步长累加；暂停不走）
     int mouseX;
     int mouseY;
     bool boostHeld;
     bool boostKey;
+    int autoMode;  // 自动驾驶：0 关 1 开 2 开并冲刺（回放机器人 / 演示）
     int fever;  // 0..100
     bool feverOn;
     int titleTier;
     int toastAt;
     string toastText;
     int shakeUntil;
+    int shakeAmp;
     string deathBy;
+    string killerName;  // 致命一击的蛇名（撞墙为空）
+    int killerPersona;
     bool wasRecord;
     bool newBest;  // 本局结算刷新了档案最高分（结算场景显示 NEW BEST）
     bool demo;
 
+    // 道具（到期时刻，模拟时钟）
+    int magnetUntil;
+    int shieldUntil;
+    int doubleUntil;
+    int invulnUntil;  // 护盾破碎后的短暂无敌
+    int nextPowerAt;
+    int powersTaken;
+    int shieldBreaks;
+    // 威胁等级 0..6（随分数上升）与排行榜
+    int threat;
+    int rank;
+    int bestRank;
+    int rankCount;
+    int nameSeq;
+    int aiDeaths;  // AI 之间 / 撞墙的阵亡数（平衡统计）
+    int boostFxAt;
+    int lastBoostAt;
+    List<int> unlockedNow;  // 本局结算新解锁的皮肤编号
+
     // ----- 视图/应用层状态（模拟步进从不读写，无头回放下保持默认）-----
     SnShell shell;   // 音效 + 静音；无头为 null
     bool resuming;   // 从暂停回到对局：SnPlayScene.OnEnter 续局而非重开
-    int hintUntil;   // 操作提示显示到何时（墙钟 ms）
+    int hintUntil;   // 操作提示显示到何时（模拟时钟 ms）
     string hintText;
+    int hitStopUntil;  // 击杀顿帧（墙钟，视图层）
 
-    // 环面世界坐标与视口尺寸定义。
-    // 视口按宿主舞台每帧延展（宽窗多看宽度）：VW/VH 是当前帧的舞台
-    // 逻辑尺寸，帧首在 SyncStage 更新——布局锚定它即可满铺任意窗口，
-    // 否则长轴超出的部分就是宿主 margin 底色的空条。
+    // 竞技场：有边界的矩形（撞墙出局），视口按宿主舞台每帧延展。
     static int WW() { return 6400; }
     static int WH() { return 3600; }
+    static int Wall() { return 24; }
     static int VW() { return vw > 0 ? vw : 1280; }
     static int VH() { return vh > 0 ? vh : 720; }
 
@@ -60,23 +89,20 @@ public class SnGame {
     static int vw;
     static int vh;
 
-    // 环面坐标轴最短有向差值计算。
-    static int WrapD(int d, int m) {
-        int v = d % m;
-        if (v < 0) { v = v + m; }
-        if (v > m / 2) { v = v - m; }
-        return v;
-    }
-    static int WrapP(int v, int m) {
-        int p = v % m;
-        if (p < 0) { p = p + m; }
-        return p;
-    }
-    // 环面两点间欧式距离平方。
+    // 竞技场有边界，坐标不再环绕：保留两个函数名供绘制/AI 统一取差值与取点。
+    static int WrapD(int d, int m) { return d; }
+    static int WrapP(int v, int m) { return v; }
     static int Dist2(int ax, int ay, int bx, int by) {
-        int dx = SnGame.WrapD(ax - bx, SnGame.WW());
-        int dy = SnGame.WrapD(ay - by, SnGame.WH());
+        int dx = ax - bx;
+        int dy = ay - by;
         return dx * dx + dy * dy;
+    }
+    static int ClampX(int x, int m) { return Math.Max(m, Math.Min(SnGame.WW() - m, x)); }
+    static int ClampY(int y, int m) { return Math.Max(m, Math.Min(SnGame.WH() - m, y)); }
+    // 离最近墙的距离（px）。
+    static int WallDist(int x, int y) {
+        int d = Math.Min(x, SnGame.WW() - x);
+        return Math.Min(d, Math.Min(y, SnGame.WH() - y));
     }
 
     // 糖果球与发热状态调色板。
@@ -101,13 +127,27 @@ public class SnGame {
         return 0;
     }
 
-    // 攻击性等级 0..6：分数越高猎手越凶（拦截半径、预判提前量、
-    // 横切频率、速度全部随档位上探）。
-    int Aggro() {
-        int a = this.score.Get() / 100;
-        if (a > 6) { a = 6; }
-        return a;
+    // 威胁等级：分数门槛。每升一级猎手更快、拦截更远、横切更勤；
+    // 2/4/6 级各增援一条大蛇（猎杀者 / 缠绕者交替）。
+    static int ThreatAt(int s) {
+        if (s >= 4200) { return 6; }
+        if (s >= 2900) { return 5; }
+        if (s >= 1900) { return 4; }
+        if (s >= 1100) { return 3; }
+        if (s >= 550) { return 2; }
+        if (s >= 200) { return 1; }
+        return 0;
     }
+    static string ThreatName(int t) {
+        if (t <= 0) { return "平静"; }
+        if (t == 1) { return "骚动"; }
+        if (t == 2) { return "警戒"; }
+        if (t == 3) { return "围猎"; }
+        if (t == 4) { return "狂潮"; }
+        if (t == 5) { return "绝境"; }
+        return "王者试炼";
+    }
+    int Aggro() { return this.threat; }
 
     static SnGame Create(GuiHost h) {
         SnGame g = SnGame.Make(Profile.Open(), (long)Window.GetTickMs() + 987654321);
@@ -130,14 +170,22 @@ public class SnGame {
         g.prof = prof;
         g.rng = Rng.Seed(seed);
         g.me = Worm.Make(0, 90, 235, 190);
+        g.me.name = "你";
         g.foes = new List<Worm>();
         g.orbs = new List<Orb>();
         g.parts = new List<Particle>();
         g.pops = new List<Popup>();
+        g.rings = new List<Ring>();
+        g.feed = new List<FeedItem>();
+        g.board = new List<Worm>();
+        g.unlockedNow = new List<int>();
+        g.score = Protected.Of(0);
         g.over = false;
         g.mouseX = 900;
         g.mouseY = 360;
         g.demo = false;
+        g.rank = 1;
+        g.bestRank = 99;
         return g;
     }
 
@@ -145,67 +193,138 @@ public class SnGame {
 
     void SpawnOrb() {
         Orb o = new Orb();
-        o.x = this.rng.Range(0, SnGame.WW());
-        o.y = this.rng.Range(0, SnGame.WH());
+        o.x = this.rng.Range(60, SnGame.WW() - 60);
+        o.y = this.rng.Range(60, SnGame.WH() - 60);
         o.size = 4 + this.rng.Range(0, 6);
         o.hue = this.rng.Range(0, 6);
         o.phase = this.rng.Range(0, 1000);
-        this.orbs.Add(o);
-    }
-    void DropOrbAt(int px, int py, int size) {
-        Orb o = new Orb();
-        o.x = SnGame.WrapP(px, SnGame.WW());
-        o.y = SnGame.WrapP(py, SnGame.WH());
-        o.size = size;
-        o.hue = this.rng.Range(0, 6);
-        o.phase = this.rng.Range(0, 1000);
+        o.bornAt = this.simNow;
         this.orbs.Add(o);
     }
 
+    // 死亡能量豆：从死亡点 (fx,fy) 炸开，落到 (px,py)。
+    void DropDeathOrb(int fx, int fy, int px, int py, int size, int col) {
+        Orb o = new Orb();
+        o.kind = 1;
+        o.ox = fx;
+        o.oy = fy;
+        o.x = SnGame.ClampX(px, 40);
+        o.y = SnGame.ClampY(py, 40);
+        o.size = size;
+        o.hue = this.rng.Range(0, 6);
+        o.phase = this.rng.Range(0, 1000);
+        o.cr = SnSkins.R(col); o.cg = SnSkins.G(col); o.cb = SnSkins.B(col);
+        o.bornAt = this.simNow;
+        this.orbs.Add(o);
+    }
+
+    int PowerOrbCount() {
+        int n = 0;
+        for (int i = 0; i < this.orbs.Count; i = i + 1) { if (this.orbs[i].kind == 2) { n = n + 1; } }
+        return n;
+    }
+
+    // 道具球刷在玩家附近一圈（450..1000px），让"去不去抢"成为抉择。
+    void SpawnPower() {
+        int hx = this.me.headX / 256;
+        int hy = this.me.headY / 256;
+        Orb o = new Orb();
+        o.kind = 2;
+        o.power = 1 + this.rng.Range(0, 3);
+        int a = this.rng.Range(0, 16);
+        int d = 450 + this.rng.Range(0, 550);
+        o.x = SnGame.ClampX(hx + SnAi.DirX(a) * d / 300, 160);
+        o.y = SnGame.ClampY(hy + SnAi.DirY(a) * d / 300, 160);
+        o.size = 14;
+        o.phase = this.rng.Range(0, 1000);
+        o.bornAt = this.simNow;
+        this.orbs.Add(o);
+    }
+
+    // 有名字的 AI：槽位性格固定，重生换新名字。
+    void NameFoe(Worm w) {
+        for (int guard = 0; guard < 20; guard = guard + 1) {
+            string n = SnAi.NameAt(this.nameSeq);
+            this.nameSeq = this.nameSeq + 1;
+            bool used = false;
+            for (int i = 0; i < this.foes.Count; i = i + 1) {
+                Worm o = this.foes[i];
+                if (o != w && o.alive && o.kind == 1 && o.name == n) { used = true; }
+            }
+            if (!used) { w.name = n; return; }
+        }
+        w.name = SnAi.NameAt(this.nameSeq);
+    }
+
     void SpawnFoe(Worm w, int now) {
-        // 生成于玩家安全视野之外。
+        // 生成于玩家安全视野之外、离墙有余量。
         int px = 0; int py = 0;
+        int hx = this.me.headX / 256;
+        int hy = this.me.headY / 256;
         for (int guard = 0; guard < 60; guard = guard + 1) {
-            px = this.rng.Range(0, SnGame.WW());
-            py = this.rng.Range(0, SnGame.WH());
-            if (SnGame.Dist2(px, py, this.me.headX / 256, this.me.headY / 256) > 500 * 500) { guard = 60; }
+            px = this.rng.Range(300, SnGame.WW() - 300);
+            py = this.rng.Range(300, SnGame.WH() - 300);
+            if (SnGame.Dist2(px, py, hx, hy) > 900 * 900) { guard = 60; }
         }
         int dx = 1; int dy = 0;
         if (this.rng.Range(0, 2) == 1) { dx = -1; }
         if (this.rng.Range(0, 2) == 1) { dx = 0; dy = 1; if (this.rng.Range(0, 2) == 1) { dy = -1; } }
         if (w.kind == 1) {
-            w.Spawn(px, py, dx, dy, 18 + this.rng.Range(0, 26), 168);
+            int len = 16 + this.rng.Range(0, 22) + this.threat * 8;
+            w.Spawn(px, py, dx, dy, len, SnAi.BaseSpeed(w.persona));
+            w.score = len * 4 + this.threat * 40;
+            w.orbit = this.rng.Range(0, 2) == 1 ? 1 : -1;
+            this.NameFoe(w);
         } else {
             w.Spawn(px, py, dx, dy, 5 + this.rng.Range(0, 5), 130);
+            w.score = 0;
         }
+        w.bornAt = now;
+        w.thinkAt = now + this.rng.Range(0, 90);
+        w.cutAt = now + 2000;
+        this.AddRing(px, py, 600, 70, w.cr, w.cg, w.cb);
+    }
+
+    Worm MakeFoe(int persona) {
+        int col = SnSkins.PersonaColor(persona);
+        Worm w = Worm.Make(1, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col));
+        w.persona = persona;
+        return w;
     }
 
     void StartGame(int now) {
+        this.simNow = 0;
         this.me.kind = 0;
+        this.me.skin = this.prof.Skin();
+        int baseCol = SnSkins.Base(this.me.skin);
+        this.me.cr = SnSkins.R(baseCol); this.me.cg = SnSkins.G(baseCol); this.me.cb = SnSkins.B(baseCol);
         this.me.Spawn(SnGame.WW() / 2, SnGame.WH() / 2, 1, 0, 14, 205);
+        this.me.score = 0;
         this.foes = new List<Worm>();
-        int i = 0;
-        for (; i < 7; i = i + 1) {
-            Worm w = Worm.Make(1, 200, 120, 255);
-            int m = i % 4;
-            if (m == 1) { w.cr = 255; w.cg = 160; w.cb = 80; }
-            if (m == 2) { w.cr = 90; w.cg = 160; w.cb = 255; }
-            if (m == 3) { w.cr = 255; w.cg = 110; w.cb = 140; }
-            this.SpawnFoe(w, now);
-            this.foes.Add(w);
-        }
-        i = 0;
-        while (i < 10) {
-            Worm w = Worm.Make(2, 255, 220, 130);
-            this.SpawnFoe(w, now);
-            this.foes.Add(w);
-            i = i + 1;
-        }
         this.orbs = new List<Orb>();
-        i = 0;
-        while (i < 520) { this.SpawnOrb(); i = i + 1; }
         this.parts = new List<Particle>();
         this.pops = new List<Popup>();
+        this.rings = new List<Ring>();
+        this.feed = new List<FeedItem>();
+        this.board = new List<Worm>();
+        this.unlockedNow = new List<int>();
+        this.threat = 0;
+        this.nameSeq = this.rng.Range(0, 16);
+        // 开局阵容：谨慎者 ×3、猎杀者 ×2、缠绕者 ×1，外加 10 条小蛇。
+        int[] lineup = new int[] { 1, 2, 1, 3, 1, 2 };
+        for (int i = 0; i < lineup.Length; i = i + 1) {
+            Worm w = this.MakeFoe(lineup[i]);
+            this.SpawnFoe(w, 0);
+            this.foes.Add(w);
+        }
+        for (int i = 0; i < 10; i = i + 1) {
+            Worm w = Worm.Make(2, 255, 214, 110);
+            this.SpawnFoe(w, 0);
+            this.foes.Add(w);
+        }
+        int n = 0;
+        while (n < 560) { this.SpawnOrb(); n = n + 1; }
+        this.rings = new List<Ring>();
         this.score = Protected.Of(0);
         this.kills = 0;
         this.fever = 0;
@@ -213,12 +332,27 @@ public class SnGame {
         this.titleTier = 0;
         this.toastAt = -9999;
         this.toastText = "";
+        this.shakeUntil = 0;
         this.wasRecord = false;
         this.newBest = false;
         this.over = false;
+        this.deathBy = "";
+        this.killerName = "";
         this.lastTick = now;
         this.boostHeld = false;
         this.boostKey = false;
+        this.magnetUntil = 0;
+        this.shieldUntil = 0;
+        this.doubleUntil = 0;
+        this.invulnUntil = 3000;  // 出生保护：开局 3 秒半透明无敌
+        this.nextPowerAt = 3500;
+        this.powersTaken = 0;
+        this.shieldBreaks = 0;
+        this.aiDeaths = 0;
+        this.rank = 99;
+        this.bestRank = 99;
+        this.hintUntil = 0;
+        this.UpdateBoard();
     }
 
     // ----- feedback ------------------------------------------------------
@@ -227,45 +361,100 @@ public class SnGame {
         this.toastText = t;
         this.toastAt = now;
     }
+    void Feed(string t, int col, bool mine) {
+        if (this.feed.Count >= 5) { this.feed.RemoveAt(0); }
+        FeedItem f = new FeedItem();
+        f.text = t;
+        f.bornAt = this.simNow;
+        f.cr = SnSkins.R(col); f.cg = SnSkins.G(col); f.cb = SnSkins.B(col);
+        f.mine = mine;
+        this.feed.Add(f);
+    }
     void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
         if (this.pops.Count > 24) { this.pops.RemoveAt(0); }
         Popup p = new Popup();
-        p.x = SnGame.WrapP(px, SnGame.WW());
-        p.y = SnGame.WrapP(py, SnGame.WH());
+        p.x = px;
+        p.y = py;
         p.text = t;
         p.bornAt = now;
         p.cr = cr; p.cg = cg; p.cb = cb;
         this.pops.Add(p);
     }
+    void AddRing(int px, int py, int life, int maxRad, int cr, int cg, int cb) {
+        if (this.rings.Count > 24) { this.rings.RemoveAt(0); }
+        Ring r = new Ring();
+        r.x = px; r.y = py;
+        r.bornAt = this.simNow;
+        r.life = life;
+        r.maxRad = maxRad;
+        r.cr = cr; r.cg = cg; r.cb = cb;
+        this.rings.Add(r);
+    }
     void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
-        if (this.parts.Count > 220) { return; }
+        this.BurstEx(px, py, n, now, cr, cg, cb, 60, 200, 700, 3);
+    }
+    void BurstEx(int px, int py, int n, int now, int cr, int cg, int cb, int spdLo, int spdSpan, int life, int size) {
+        if (this.parts.Count > 420) { return; }
         for (int i = 0; i < n; i = i + 1) {
             Particle p = new Particle();
-            p.x = SnGame.WrapP(px, SnGame.WW()) * 256;
-            p.y = SnGame.WrapP(py, SnGame.WH()) * 256;
+            p.x = px * 256;
+            p.y = py * 256;
             int a = this.rng.Range(0, 16);
-            int spd = 60 + this.rng.Range(0, 140);
-            int ux = 0; int uy = 0;
-            int q = a % 4;
-            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
-            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
-            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
-            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
-            p.vx = ux * spd / 256;
-            p.vy = uy * spd / 256;
+            int spd = spdLo + this.rng.Range(0, spdSpan);
+            p.vx = SnAi.DirX(a) * spd / 300;
+            p.vy = SnAi.DirY(a) * spd / 300;
             p.bornAt = now;
+            p.life = life - this.rng.Range(0, life / 3);
+            p.size = size + this.rng.Range(0, 2);
             p.cr = cr; p.cg = cg; p.cb = cb;
             this.parts.Add(p);
         }
     }
+    void Shake(int ms, int amp) {
+        if (this.simNow + ms > this.shakeUntil) { this.shakeUntil = this.simNow + ms; }
+        this.shakeAmp = amp;
+    }
 
     // ----- simulation ----------------------------------------------------
 
+    int ScoreMult() {
+        int m = 1;
+        if (this.feverOn) { m = m * 2; }
+        if (this.simNow < this.doubleUntil) { m = m * 2; }
+        return m;
+    }
+
+    void AddScore(int gain) {
+        this.score.Set(this.score.Get() + gain);
+        this.me.score = this.score.Get();
+        if (!this.wasRecord && this.prof.high > 0 && this.score.Get() > this.prof.high) {
+            this.wasRecord = true;
+            this.Toast("新纪录诞生！", this.simNow);
+        }
+    }
+
+    void TakePower(Orb o, int now) {
+        int until = now + SnSkins.PowerMs(o.power);
+        int col = SnSkins.PowerColor(o.power);
+        if (o.power == 1) { this.magnetUntil = until; this.Toast("磁铁！吸豆范围扩大三倍", now); }
+        if (o.power == 2) { this.shieldUntil = until; this.Toast("护盾！可抵挡一次致命碰撞", now); }
+        if (o.power == 3) { this.doubleUntil = until; this.Toast("双倍得分！与狂热叠加可达 x4", now); }
+        this.powersTaken = this.powersTaken + 1;
+        this.AddRing(o.x, o.y, 520, 90, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col));
+        this.BurstEx(o.x, o.y, 16, now, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 120, 260, 650, 3);
+        this.AddPop(o.x, o.y, SnSkins.PowerName(o.power), now, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col));
+    }
+
     void EatOrb(int idx, int now) {
         Orb o = this.orbs[idx];
-        int gain = o.size;
-        if (this.feverOn) { gain = gain * 2; }
-        this.score.Set(this.score.Get() + gain);
+        if (o.kind == 2) {
+            this.TakePower(o, now);
+            this.orbs.RemoveAt(idx);
+            return;
+        }
+        int gain = o.size * this.ScoreMult();
+        if (o.kind == 1) { gain = gain + 2 * this.ScoreMult(); }
+        this.AddScore(gain);
         int add = 1;
         if (o.size >= 7) { add = 2; }
         this.me.length = this.me.length + add;
@@ -273,192 +462,202 @@ public class SnGame {
             this.fever = this.fever + o.size;
             if (this.fever >= 100) { this.fever = 100; this.feverOn = true; this.Toast("狂热时刻！双倍得分", now); }
         }
-        this.Burst(o.x, o.y, 6, now, SnGame.PalR(o.hue), SnGame.PalG(o.hue), SnGame.PalB(o.hue));
-        if (o.size >= 7 || this.feverOn) {
-            this.AddPop(o.x, o.y, "+" + gain, now, SnGame.PalR(o.hue), SnGame.PalG(o.hue), SnGame.PalB(o.hue));
+        int cr = SnGame.PalR(o.hue); int cg = SnGame.PalG(o.hue); int cb = SnGame.PalB(o.hue);
+        if (o.kind == 1) { cr = o.cr; cg = o.cg; cb = o.cb; }
+        this.BurstEx(o.x, o.y, 5, now, cr, cg, cb, 40, 120, 420, 2);
+        // 飘字只给值钱的豆（大豆 / 能量豆），磁铁连吸时不刷成一串。
+        if ((o.size >= 9 || o.kind == 1) && this.pops.Count < 6) {
+            this.AddPop(o.x, o.y, "+" + gain, now, cr, cg, cb);
         }
+        bool respawn = o.kind == 0;
         this.orbs.RemoveAt(idx);
-        this.SpawnOrb();
+        if (respawn) { this.SpawnOrb(); }
         int tier = SnGame.TierAt(this.me.length);
         if (tier > this.titleTier) {
             this.titleTier = tier;
             this.Toast("进化：" + SnGame.TierName(tier), now);
         }
-        if (!this.wasRecord && this.prof.high > 0 && this.score.Get() > this.prof.high) {
-            this.wasRecord = true;
-            this.Toast("新纪录诞生！", now);
-        }
     }
 
-    void KillFoe(Worm w, int now, bool eaten) {
-        for (int i = 0; i < w.seg.Count; i = i + 1) {
-            if (i % 2 == 0) { this.DropOrbAt(w.seg[i].x + this.rng.Range(-8, 17), w.seg[i].y + this.rng.Range(-8, 17), 6 + this.rng.Range(0, 4)); }
+    // 蛇阵亡：炸成能量豆。cause 0 撞上玩家 1 被玩家吞掉（小蛇）2 撞墙 3 撞上别的 AI。
+    void KillFoe(Worm w, int now, int cause, Worm killer) {
+        int col = SnSkins.Pack(w.cr, w.cg, w.cb);
+        int hx = w.seg[0].x;
+        int hy = w.seg[0].y;
+        int step = w.seg.Count > 80 ? 3 : 2;
+        for (int i = 0; i < w.seg.Count; i = i + step) {
+            int sx = w.seg[i].x;
+            int sy = w.seg[i].y;
+            int a = this.rng.Range(0, 16);
+            int d = 10 + this.rng.Range(0, 34);
+            this.DropDeathOrb(sx, sy, sx + SnAi.DirX(a) * d / 300, sy + SnAi.DirY(a) * d / 300, 6 + this.rng.Range(0, 4), col);
         }
-        this.Burst(w.seg[0].x, w.seg[0].y, 14, now, w.cr, w.cg, w.cb);
+        this.BurstEx(hx, hy, 22, now, w.cr, w.cg, w.cb, 80, 320, 900, 4);
+        this.AddRing(hx, hy, 650, 130, w.cr, w.cg, w.cb);
         w.alive = false;
-        this.kills = this.kills + 1;
-        int gain = w.length * 2;
-        this.score.Set(this.score.Get() + gain);
-        if (eaten) {
-            this.me.length = this.me.length + w.length / 2;
-            w.respawnAt = now + 7000;
-            this.AddPop(w.seg[0].x, w.seg[0].y, "美餐 +" + gain, now, 255, 235, 130);
-            this.Toast("吃掉了一条小蛇！", now);
+        w.respawnAt = now + (w.kind == 1 ? 5500 : 7000);
+        if (cause == 0 || cause == 1) {
+            this.kills = this.kills + 1;
+            int gain = w.length * 2 * this.ScoreMult();
+            this.AddScore(gain);
+            if (cause == 1) {
+                this.me.length = this.me.length + w.length / 2;
+                this.AddPop(hx, hy, "美餐 +" + gain, now, 255, 235, 130);
+                this.Toast("吃掉了一条小蛇！", now);
+            } else {
+                this.AddPop(hx, hy, "截杀 +" + gain, now, 255, 235, 130);
+                this.Feed("你 截杀了 " + w.name, SnSkins.Base(this.me.skin), true);
+                this.Toast("截杀 " + w.name + "！", now);
+                this.Shake(260, 5);
+            }
         } else {
-            w.respawnAt = now + 5000;
-            this.AddPop(w.seg[0].x, w.seg[0].y, "击败 +" + gain, now, 255, 235, 130);
-            this.Toast("漂亮！对手炸成了能量豆", now);
+            this.aiDeaths = this.aiDeaths + 1;
+            if (w.kind == 1) {
+                if (cause == 3 && killer != null) {
+                    killer.score = killer.score + w.length * 2;
+                    killer.length = Math.Min(SnAi.MaxLen(), killer.length + w.length / 4);
+                    this.Feed(w.name + " 撞上了 " + killer.name, col, false);
+                } else {
+                    this.Feed(w.name + " 撞墙出局", col, false);
+                }
+            }
         }
     }
 
-    void Die(int now, string why) {
+    void Die(int now, string why, string killer) {
         this.me.alive = false;
         this.over = true;
         this.deathBy = why;
-        this.shakeUntil = now + 450;
+        this.killerName = killer;
+        this.killerPersona = 0;
+        for (int i = 0; i < this.foes.Count; i = i + 1) {
+            if (this.foes[i].kind == 1 && this.foes[i].name == killer) { this.killerPersona = this.foes[i].persona; }
+        }
+        this.Shake(520, 9);
+        int col = SnSkins.Base(this.me.skin);
+        this.BurstEx(this.me.headX / 256, this.me.headY / 256, 30, now, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 80, 360, 1000, 4);
+        this.AddRing(this.me.headX / 256, this.me.headY / 256, 700, 160, 255, 255, 255);
+        this.UpdateBoard();
+        int bestBefore = this.prof.high;
+        int killsBefore = this.prof.kills;
         // 无头回放的档案是 InMemory，不落盘。
-        this.newBest = this.prof.Record(this.score.Get(), this.me.length, this.kills);
+        this.newBest = this.prof.Record(this.score.Get(), this.me.length, this.kills, this.bestRank);
+        this.unlockedNow = new List<int>();
+        for (int k = 1; k < SnSkins.Count; k = k + 1) {
+            if (!SnSkins.Unlocked(k, bestBefore, killsBefore) && SnSkins.Unlocked(k, this.prof.high, this.prof.kills)) {
+                this.unlockedNow.Add(k);
+            }
+        }
+        this.Feed(killer.Length > 0 ? killer + " 截杀了 你" : "你 撞墙出局", SnSkins.Pack(255, 120, 140), true);
     }
 
-    // 检测点是否命中身体分段（环面度量）。
+    // 致命碰撞：护盾在身就吞掉这一下并给 1.5s 无敌，否则阵亡。
+    bool Fatal(int now, string why, string killer) {
+        if (now < this.invulnUntil) { return false; }
+        if (now < this.shieldUntil) {
+            this.shieldUntil = 0;
+            this.invulnUntil = now + 1500;
+            this.shieldBreaks = this.shieldBreaks + 1;
+            int hx = this.me.headX / 256;
+            int hy = this.me.headY / 256;
+            this.AddRing(hx, hy, 600, 120, 96, 230, 255);
+            this.BurstEx(hx, hy, 20, now, 96, 230, 255, 100, 300, 700, 3);
+            this.Toast("护盾碎裂！挡下了致命一击", now);
+            this.Shake(300, 6);
+            return false;
+        }
+        this.Die(now, why, killer);
+        return true;
+    }
+
+    // 检测点是否命中身体分段。
     bool HitsBody(Worm w, int hx, int hy, int fromSeg, int rad) {
         if (!w.alive) { return false; }
+        int rr = rad + w.Radius() - 4;
+        int r2 = rr * rr;
         int i = fromSeg;
         while (i < w.seg.Count) {
-            int rr = rad + w.Radius() - 4;
-            if (SnGame.Dist2(SnGame.WrapP(w.seg[i].x, SnGame.WW()), SnGame.WrapP(w.seg[i].y, SnGame.WH()), hx, hy) < rr * rr) { return true; }
+            int dx = w.seg[i].x - hx;
+            if (dx < rr && dx > -rr) {
+                int dy = w.seg[i].y - hy;
+                if (dx * dx + dy * dy < r2) { return true; }
+            }
             i = i + 1;
         }
         return false;
     }
 
-    void AiThink(Worm w, int now) {
-        if (now < w.thinkAt) { return; }
-        w.thinkAt = now + 90;
-        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
-        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
-        int phx = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
-        int phy = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
-        int pd2 = SnGame.Dist2(hx, hy, phx, phy);
-
-        if (w.kind == 2) {
-            // 猎物 AI：规避邻近玩家并随机漫游。
-            if (pd2 < 260 * 260 && this.me.alive) {
-                int fx = SnGame.WrapD(hx - phx, SnGame.WW());
-                int fy = SnGame.WrapD(hy - phy, SnGame.WH());
-                w.tgtX = SnGame.WrapP(hx + fx * 4, SnGame.WW());
-                w.tgtY = SnGame.WrapP(hy + fy * 4, SnGame.WH());
-                w.tgtUntil = now + 300;
-            } else if (now >= w.tgtUntil) {
-                w.tgtX = this.rng.Range(0, SnGame.WW());
-                w.tgtY = this.rng.Range(0, SnGame.WH());
-                w.tgtUntil = now + 2200 + this.rng.Range(0, 2000);
-            }
-        } else {
-            // 猎手 AI：锁定目标或截击玩家。
-            // 攻击性随分数上探：拦截半径 420→900，预判提前量 120→264。
-            int aggro = this.Aggro();
-            bool intercept = false;
-            int irange = 420 + aggro * 80;
-            if (this.me.alive && w.length > this.me.length && pd2 < irange * irange) { intercept = true; }
-            if (intercept) {
-                int lead = 120 + aggro * 24;
-                int aheadX = phx + this.me.dirX * lead / 256;
-                int aheadY = phy + this.me.dirY * lead / 256;
-                w.tgtX = SnGame.WrapP(aheadX, SnGame.WW());
-                w.tgtY = SnGame.WrapP(aheadY, SnGame.WH());
-                w.tgtUntil = now + 250;
-            } else if (now >= w.tgtUntil) {
-                // 采样探测最近糖果球目标。
-                int best = -1; int bd = 999999999;
-                int i = 0;
-                while (i < this.orbs.Count) {
-                    Orb o = this.orbs[i];
-                    int d = SnGame.Dist2(o.x, o.y, hx, hy);
-                    if (d < bd) { bd = d; best = i; }
-                    i = i + 3;
-                }
-                if (best >= 0) {
-                    w.tgtX = this.orbs[best].x;
-                    w.tgtY = this.orbs[best].y;
-                } else {
-                    w.tgtX = this.rng.Range(0, SnGame.WW());
-                    w.tgtY = this.rng.Range(0, SnGame.WH());
-                }
-                w.tgtUntil = now + 1500;
-            }
-            // 防追尾与碰撞规避逻辑。
-            int probeX = SnGame.WrapP(hx + w.dirX * 70 / 256, SnGame.WW());
-            int probeY = SnGame.WrapP(hy + w.dirY * 70 / 256, SnGame.WH());
-            if (this.me.alive && this.HitsBody(this.me, probeX, probeY, 3, w.Radius())) {
-                w.tgtX = SnGame.WrapP(hx + w.dirY * 200 / 256, SnGame.WW());
-                w.tgtY = SnGame.WrapP(hy - w.dirX * 200 / 256, SnGame.WH());
-                w.tgtUntil = now + 400;
-            }
-            // 突然横切（aggro 解锁）：朝向瞬间钉到玩家头前方的拦截点，
-            // 一帧内完成甩头，随后照常平滑追点——冷却随 aggro 从 5.2s
-            // 压到 2.2s，高分段逼近"步步紧逼"。
-            if (aggro > 0 && this.me.alive && now >= w.cutAt) {
-                int crange = 340 + aggro * 60;
-                if (pd2 < crange * crange) {
-                    w.cutAt = now + 5200 - aggro * 500;
-                    int ix = phx + this.me.dirX * (140 + aggro * 24) / 256;
-                    int iy = phy + this.me.dirY * (140 + aggro * 24) / 256;
-                    int vx = SnGame.WrapD(ix - hx, SnGame.WW());
-                    int vy = SnGame.WrapD(iy - hy, SnGame.WH());
-                    int vl = Worm.Isq(vx * vx + vy * vy);
-                    if (vl > 12) {
-                        w.dirX = vx * 256 / vl;
-                        w.dirY = vy * 256 / vl;
-                        w.tgtX = SnGame.WrapP(ix, SnGame.WW());
-                        w.tgtY = SnGame.WrapP(iy, SnGame.WH());
-                        w.tgtUntil = now + 400;
-                    }
-                }
-            }
-        }
-    }
-
     void SteerToTarget(Worm w, int dt) {
-        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
-        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
-        int vx = SnGame.WrapD(w.tgtX - hx, SnGame.WW());
-        int vy = SnGame.WrapD(w.tgtY - hy, SnGame.WH());
+        int hx = w.headX / 256;
+        int hy = w.headY / 256;
+        int vx = w.tgtX - hx;
+        int vy = w.tgtY - hy;
         int vl = Worm.Isq(vx * vx + vy * vy);
         if (vl < 12) { return; }
         w.Steer(vx * 256 / vl, vy * 256 / vl, dt);
     }
 
-    void StepFoe(Worm w, int dt, int now) {
-        if (!w.alive) {
-            if (now >= w.respawnAt && !this.over) { this.SpawnFoe(w, now); }
-            return;
+    // 排行榜：玩家 + 活着的有名 AI，按分数降序取前 5。
+    void UpdateBoard() {
+        this.me.score = this.score.Get();
+        List<Worm> all = new List<Worm>();
+        if (this.me.alive) { all.Add(this.me); }
+        for (int i = 0; i < this.foes.Count; i = i + 1) {
+            Worm w = this.foes[i];
+            if (w.alive && w.kind == 1) { all.Add(w); }
         }
-        this.AiThink(w, now);
-        this.SteerToTarget(w, dt);
-        int wspd = w.speed;
-        if (w.kind == 1) {
-            int aggro = this.Aggro();
-            if (aggro > 0) { wspd = wspd + 6 * aggro; }
-        }
-        w.Advance(wspd, dt);
-        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
-        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
-        // AI 吞噬糖果获得成长。
-        int i = this.orbs.Count - 1;
-        while (i >= 0) {
-            Orb o = this.orbs[i];
-            int rr = w.Radius() + o.size;
-            if (SnGame.Dist2(o.x, o.y, hx, hy) < rr * rr) {
-                this.orbs.RemoveAt(i);
-                this.SpawnOrb();
-                if (w.kind == 1) { w.length = w.length + 1; }
+        this.board = new List<Worm>();
+        List<bool> used = new List<bool>();
+        for (int i = 0; i < all.Count; i = i + 1) { used.Add(false); }
+        for (int k = 0; k < 5 && k < all.Count; k = k + 1) {
+            int best = -1;
+            for (int i = 0; i < all.Count; i = i + 1) {
+                if (!used[i] && (best < 0 || all[i].score > all[best].score)) { best = i; }
             }
-            i = i - 1;
+            used[best] = true;
+            this.board.Add(all[best]);
         }
-        // 猎手头部撞击判定与销毁。
-        if (this.me.alive && this.HitsBody(this.me, hx, hy, 2, w.Radius())) {
-            this.KillFoe(w, now, false);
+        int r = 1;
+        for (int i = 0; i < this.foes.Count; i = i + 1) {
+            Worm w = this.foes[i];
+            if (w.alive && w.kind == 1 && w.score > this.me.score) { r = r + 1; }
+        }
+        this.rank = r;
+        this.rankCount = all.Count;
+        if (!this.me.alive) { this.rankCount = this.rankCount + 1; }
+        if (this.simNow >= 2000 && r < this.bestRank) {
+            if (r == 1 && this.bestRank > 1 && this.bestRank < 99) { this.Toast("登顶！你是全场第一", this.simNow); }
+            this.bestRank = r;
+        }
+    }
+
+    void Escalate(int now) {
+        int t = SnGame.ThreatAt(this.score.Get());
+        if (t <= this.threat) { return; }
+        this.threat = t;
+        if (t == 2 || t == 4 || t == 6) {
+            Worm w = this.MakeFoe(t == 4 ? 3 : 2);
+            this.SpawnFoe(w, now);
+            this.foes.Add(w);
+            this.Toast("威胁 " + t + " 级 · " + SnGame.ThreatName(t) + "：" + w.name + " 加入猎场", now);
+        } else {
+            this.Toast("威胁 " + t + " 级 · " + SnGame.ThreatName(t) + "：猎手更快更凶", now);
+        }
+    }
+
+    void StepPowers(int now) {
+        for (int i = this.orbs.Count - 1; i >= 0; i = i - 1) {
+            Orb o = this.orbs[i];
+            if (o.kind == 2 && now - o.bornAt > 22000) { this.orbs.RemoveAt(i); }
+        }
+        if (now >= this.nextPowerAt) {
+            this.nextPowerAt = now + 7000 + this.rng.Range(0, 5000);
+            if (this.PowerOrbCount() < 3) { this.SpawnPower(); }
+        }
+        // 死亡能量豆 40 秒后消散，免得满场堆积。
+        for (int i = this.orbs.Count - 1; i >= 0; i = i - 1) {
+            Orb o = this.orbs[i];
+            if (o.kind == 1 && now - o.bornAt > 40000) { this.orbs.RemoveAt(i); }
         }
     }
 
@@ -468,14 +667,13 @@ public class SnGame {
         if (dt < 0) { dt = 0; }
         if (dt > 50) { dt = 50; }
         if (dt == 0) { return; }
+        this.simNow = this.simNow + dt;
+        now = this.simNow;
 
-        // 玩家转向控制：跟随光标位置。
-        if (this.demo) {
-            if (now >= this.me.tgtUntil) {
-                this.me.tgtX = this.rng.Range(0, SnGame.WW());
-                this.me.tgtY = this.rng.Range(0, SnGame.WH());
-                this.me.tgtUntil = now + 1600;
-            }
+        // 玩家转向：自动驾驶（回放机器人 / 演示）或跟随光标。
+        bool autoBoost = false;
+        if (this.demo || this.autoMode > 0) {
+            autoBoost = SnAi.AutoPilot(this, now) && this.autoMode == 2;
             this.SteerToTarget(this.me, dt);
         } else {
             int vx = this.mouseX - SnGame.VW() / 2;
@@ -484,12 +682,12 @@ public class SnGame {
             if (vl > 18) { this.me.Steer(vx * 256 / vl, vy * 256 / vl, dt); }
         }
 
-        // boost：纯加速，不再消耗长度（长度只增不减——冲刺扣长度的
-        // 旧设计让玩家在不知情中越跑越短，观感就是个 bug）。
-        bool boosting = (this.boostHeld || this.boostKey) && this.me.length > 12;
+        // boost：纯加速，不消耗长度（长度只增不减）。
+        bool boosting = (this.boostHeld || this.boostKey || autoBoost) && this.me.length > 12;
         int spd = this.me.speed;
         if (boosting) {
             spd = spd * 170 / 100;
+            this.lastBoostAt = now;
         }
         if (this.feverOn) {
             spd = spd + 20;
@@ -497,192 +695,120 @@ public class SnGame {
             if (this.fever <= 0) { this.fever = 0; this.feverOn = false; }
         }
         this.me.Advance(spd, dt);
-        int hx = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
-        int hy = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
+        int hx = this.me.headX / 256;
+        int hy = this.me.headY / 256;
 
-        int fi = 0;
-        for (; fi < this.foes.Count; fi = fi + 1) {
+        // 竞技场边界：撞墙出局（护盾把蛇头弹回场内）。
+        int wm = SnGame.Wall() + this.me.Radius() / 2;
+        if (hx < wm || hx > SnGame.WW() - wm || hy < wm || hy > SnGame.WH() - wm) {
+            if (!this.Fatal(now, "撞上了竞技场边界", "")) {
+                if (hx < wm || hx > SnGame.WW() - wm) { this.me.dirX = -this.me.dirX; }
+                if (hy < wm || hy > SnGame.WH() - wm) { this.me.dirY = -this.me.dirY; }
+                this.me.headX = SnGame.ClampX(hx, wm + 2) * 256;
+                this.me.headY = SnGame.ClampY(hy, wm + 2) * 256;
+                hx = this.me.headX / 256;
+                hy = this.me.headY / 256;
+            } else {
+                return;
+            }
+        }
+
+        for (int fi = 0; fi < this.foes.Count; fi = fi + 1) {
             Worm w = this.foes[fi];
             if (w.alive) {
                 if (w.kind == 1) {
-                    if (this.HitsBody(w, hx, hy, 1, this.me.Radius())) { this.Die(now, "撞上了对手的身体"); return; }
+                    if (this.HitsBody(w, hx, hy, 1, this.me.Radius())) {
+                        if (this.Fatal(now, "被 " + w.name + " 截杀", w.name)) { return; }
+                    }
                 } else {
-                    if (this.HitsBody(w, hx, hy, 0, this.me.Radius())) { this.KillFoe(w, now, true); }
+                    if (this.HitsBody(w, hx, hy, 0, this.me.Radius())) { this.KillFoe(w, now, 1, null); }
                 }
             }
         }
 
+        bool magnet = now < this.magnetUntil;
+        int mrad = magnet ? 240 : 78;
         int i = this.orbs.Count - 1;
         while (i >= 0) {
             Orb o = this.orbs[i];
-            int dx = SnGame.WrapD(o.x - hx, SnGame.WW());
-            int dy = SnGame.WrapD(o.y - hy, SnGame.WH());
-            int d2 = dx * dx + dy * dy;
-            if (d2 < 78 * 78 && d2 > 4) {
-                int d = Worm.Isq(d2);
-                // 吸力必须压过当前蛇速（含冲刺/狂热加成）：固定 260px/s
-                // 的吸力在冲刺 348px/s 时追不上头，糖果会吊在磁吸圈
-                // 边缘一路跟跑。取 1.5 倍蛇速 + 120，圈内 0.3s 内捕获。
-                int pull = (spd * 3 / 2 + 120) * dt / 1000;
-                o.x = SnGame.WrapP(o.x - dx * pull / d, SnGame.WW());
-                o.y = SnGame.WrapP(o.y - dy * pull / d, SnGame.WH());
-                dx = SnGame.WrapD(o.x - hx, SnGame.WW());
-                dy = SnGame.WrapD(o.y - hy, SnGame.WH());
-                d2 = dx * dx + dy * dy;
+            int dx = o.x - hx;
+            int dy = o.y - hy;
+            if (dx < mrad && dx > -mrad && dy < mrad && dy > -mrad) {
+                int d2 = dx * dx + dy * dy;
+                if (o.kind != 2 && d2 < mrad * mrad && d2 > 4) {
+                    int d = Worm.Isq(d2);
+                    // 吸力必须压过当前蛇速（含冲刺/狂热加成）：取 1.5 倍蛇速 + 120，
+                    // 圈内 0.3s 内捕获；磁铁再加一档，大圈也能及时吸到嘴边。
+                    int pull = (spd * 3 / 2 + (magnet ? 260 : 120)) * dt / 1000;
+                    o.x = o.x - dx * pull / d;
+                    o.y = o.y - dy * pull / d;
+                    o.ox = o.x; o.oy = o.y;
+                    dx = o.x - hx;
+                    dy = o.y - hy;
+                    d2 = dx * dx + dy * dy;
+                }
+                int rr = this.me.Radius() + o.size + 2;
+                if (d2 < rr * rr) { this.EatOrb(i, now); }
             }
-            int rr = this.me.Radius() + o.size + 2;
-            if (d2 < rr * rr) { this.EatOrb(i, now); }
             i = i - 1;
         }
 
         if (!this.feverOn && this.fever > 0 && now % 3 == 0) { this.fever = this.fever - 1; }
 
-        fi = 0;
-        while (fi < this.foes.Count) {
-            this.StepFoe(this.foes[fi], dt, now);
-            fi = fi + 1;
+        for (int fi = 0; fi < this.foes.Count; fi = fi + 1) {
+            SnAi.StepFoe(this, this.foes[fi], dt, now);
+        }
+
+        this.StepPowers(now);
+        this.Escalate(now);
+        this.UpdateBoard();
+
+        // 冲刺尾焰：每 40ms 从蛇尾附近喷两粒火花。
+        if (boosting && now >= this.boostFxAt && this.me.seg.Count > 2) {
+            this.boostFxAt = now + 40;
+            int col = SnSkins.Segment(this.me.skin, 1, this.me.seg.Count, now);
+            SegmentPoint tail = this.me.seg[Math.Min(this.me.seg.Count - 1, 3)];
+            this.BurstEx(tail.x, tail.y, 2, now, SnSkins.R(col), SnSkins.G(col), SnSkins.B(col), 20, 60, 380, 2);
         }
 
         // particles
         int pi = this.parts.Count - 1;
         while (pi >= 0) {
             Particle p = this.parts[pi];
-            if (now - p.bornAt > 700) {
+            if (now - p.bornAt > p.life) {
                 this.parts.RemoveAt(pi);
             } else {
                 p.x = p.x + p.vx * dt / 4;
                 p.y = p.y + p.vy * dt / 4;
+                p.vx = p.vx * 61 / 64;
+                p.vy = p.vy * 61 / 64;
             }
             pi = pi - 1;
         }
-    }
-
-    // ----- rendering -------------------------------------------------------
-
-    // 世界坐标至屏幕坐标投影转换（以玩家头部为中心）。
-    int camX;
-    int camY;
-    int ScrX(int wx) { return SnGame.VW() / 2 + SnGame.WrapD(wx - this.camX, SnGame.WW()); }
-    int ScrY(int wy) { return SnGame.VH() / 2 + SnGame.WrapD(wy - this.camY, SnGame.WH()); }
-    bool OnScreen(int sx, int sy, int m) {
-        return sx > -m && sx < SnGame.VW() + m && sy > -m && sy < SnGame.VH() + m;
-    }
-
-    void DrawWorm(Worm w, int now, int shX, int shY) {
-        if (!w.alive) { return; }
-        int rad = w.Radius();
-        bool rainbow = w.kind == 0 && this.feverOn;
-        int i = w.seg.Count - 1;
-        while (i >= 0) {
-            int sx = this.ScrX(SnGame.WrapP(w.seg[i].x, SnGame.WW())) + shX;
-            int sy = this.ScrY(SnGame.WrapP(w.seg[i].y, SnGame.WH())) + shY;
-            if (this.OnScreen(sx, sy, 40)) {
-                int s = rad - 3 * i / (w.seg.Count + 1);
-                int cr = w.cr; int cg = w.cg; int cb = w.cb;
-                if (rainbow) {
-                    int hue = (i * 2 + now / 60) % 6;
-                    cr = SnGame.PalR(hue); cg = SnGame.PalG(hue); cb = SnGame.PalB(hue);
-                } else {
-                    int fade = 55 * i / (w.seg.Count + 1);
-                    cr = cr - cr * fade / 160;
-                    cg = cg - cg * fade / 160;
-                    cb = cb - cb * fade / 160;
-                    if (i % 4 == 1) {
-                        cr = cr + (255 - cr) / 3;
-                        cg = cg + (255 - cg) / 3;
-                        cb = cb + (255 - cb) / 3;
-                    }
-                }
-                if (i % 2 == 0) { CSprite.Glow(this.c, sx, sy, s + 6, cr, cg, cb, 90); }
-                CSprite.Ball(this.c, sx, sy, s, cr, cg, cb, 255);
-                CSprite.Ball(this.c, sx - s / 3, sy - s / 2 + 1, s / 3, 255, 255, 255, 60);
-            }
-            i = i - 1;
+        for (int ri = this.rings.Count - 1; ri >= 0; ri = ri - 1) {
+            if (now - this.rings[ri].bornAt > this.rings[ri].life) { this.rings.RemoveAt(ri); }
         }
-        // eyes
-        int hsx = this.ScrX(SnGame.WrapP(w.seg[0].x, SnGame.WW())) + shX;
-        int hsy = this.ScrY(SnGame.WrapP(w.seg[0].y, SnGame.WH())) + shY;
-        if (this.OnScreen(hsx, hsy, 60)) {
-            int ex = w.dirY * rad / 256 / 2;
-            int ey = -w.dirX * rad / 256 / 2;
-            int lx = w.dirX * rad / 256 / 3;
-            int ly = w.dirY * rad / 256 / 3;
-            CSprite.Ball(this.c, hsx + ex + lx, hsy + ey + ly, rad / 2, 255, 255, 255, 255);
-            CSprite.Ball(this.c, hsx - ex + lx, hsy - ey + ly, rad / 2, 255, 255, 255, 255);
-            int px2 = w.dirX * rad / 256 / 4;
-            int py2 = w.dirY * rad / 256 / 4;
-            CSprite.Ball(this.c, hsx + ex + lx + px2, hsy + ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
-            CSprite.Ball(this.c, hsx - ex + lx + px2, hsy - ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
-            CSprite.Ball(this.c, hsx + ex + lx + px2 - 1, hsy + ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
-            CSprite.Ball(this.c, hsx - ex + lx + px2 - 1, hsy - ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
+        for (int k = this.feed.Count - 1; k >= 0; k = k - 1) {
+            if (now - this.feed[k].bornAt > 4500) { this.feed.RemoveAt(k); }
         }
     }
 
-    void DrawScene(int now) {
-        int shX = 0; int shY = 0;
-        if (now < this.shakeUntil) {
-            int left = this.shakeUntil - now;
-            int amp = left / 70 + 1;
-            shX = (now * 7 % (amp * 2 + 1)) - amp;
-            shY = (now * 13 % (amp * 2 + 1)) - amp;
-        }
-        this.camX = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
-        this.camY = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
-
-        // 视口背景点阵直接绘制。
-        int gx0 = this.camX - SnGame.VW() / 2;
-        int gy0 = this.camY - SnGame.VH() / 2;
-        int gxw = gx0 - SnGame.WrapP(gx0, 40);
-        int dotCol = CDraw.Argb(26, 120, 140, 210);
-        while (gxw < gx0 + SnGame.VW() + 40) {
-            int gyw = gy0 - SnGame.WrapP(gy0, 40);
-            while (gyw < gy0 + SnGame.VH() + 40) {
-                CDraw.FillRect(this.c,
-                    this.ScrX(SnGame.WrapP(gxw, SnGame.WW())) + shX,
-                    this.ScrY(SnGame.WrapP(gyw, SnGame.WH())) + shY, 2, 2, dotCol);
-                gyw = gyw + 40;
-            }
-            gxw = gxw + 40;
-        }
-
-        // orbs
-        for (int i = 0; i < this.orbs.Count; i = i + 1) {
-            Orb o = this.orbs[i];
-            int sx = this.ScrX(o.x) + shX;
-            int sy = this.ScrY(o.y) + shY;
-            if (this.OnScreen(sx, sy, 24)) {
-                int pulse = ((now + o.phase * 7) / 90) % 6;
-                if (pulse > 3) { pulse = 6 - pulse; }
-                int cr = SnGame.PalR(o.hue); int cg = SnGame.PalG(o.hue); int cb = SnGame.PalB(o.hue);
-                CSprite.Glow(this.c, sx, sy, o.size + 5 + pulse / 2, cr, cg, cb, 110);
-                CSprite.Ball(this.c, sx, sy, o.size + pulse / 3, cr, cg, cb, 235);
-                CSprite.Ball(this.c, sx - o.size / 3, sy - o.size / 3, o.size / 3 + 1, 255, 255, 255, 170);
-            }
-        }
-
-        // 实体绘制分层：AI 居底，玩家置顶。
-        int fi = 0;
-        for (; fi < this.foes.Count; fi = fi + 1) {
-            this.DrawWorm(this.foes[fi], now, shX, shY);
-        }
-        this.DrawWorm(this.me, now, shX, shY);
-
-        // particles
-        int pi = 0;
-        for (; pi < this.parts.Count; pi = pi + 1) {
-            Particle p = this.parts[pi];
-            int age = now - p.bornAt;
-            int alpha = 255 - age * 255 / 700;
-            int sx = this.ScrX(SnGame.WrapP(p.x / 256, SnGame.WW())) + shX;
-            int sy = this.ScrY(SnGame.WrapP(p.y / 256, SnGame.WH())) + shY;
-            if (this.OnScreen(sx, sy, 20)) {
-                CSprite.Ball(this.c, sx, sy, 3, p.cr, p.cg, p.cb, alpha);
-            }
-        }
+    // ----- 开发者作弊（ZAN_SNAKE_DEV=1 才由 SnPlayScene 调用；默认关闭）-----
+    void DevScore(int n) { this.AddScore(n); this.me.length = this.me.length + n / 20; }
+    void DevPowers() {
+        this.magnetUntil = this.simNow + SnSkins.PowerMs(1);
+        this.shieldUntil = this.simNow + SnSkins.PowerMs(2);
+        this.doubleUntil = this.simNow + SnSkins.PowerMs(3);
     }
-
-    void DrawPlay(int now) {
-        this.DrawScene(now);
+    void DevDie() {
+        Worm k = null;
+        for (int i = 0; i < this.foes.Count; i = i + 1) {
+            Worm w = this.foes[i];
+            if (w.alive && w.kind == 1 && (k == null || w.score > k.score)) { k = w; }
+        }
+        this.shieldUntil = 0;
+        this.invulnUntil = 0;
+        if (k != null) { this.Die(this.simNow, "被 " + k.name + " 截杀", k.name); }
     }
 
     void EnterHud(App app) {
@@ -693,18 +819,10 @@ public class SnGame {
     void SyncHud(int now) { if (this.hud != null) { this.hud.Sync(now); } }
     void RenderHud(App app) { if (this.hud != null) { this.hud.Render(app); } }
 
-    // ----- input -----------------------------------------------------------
-    // 键码是 Gui 键码空间：27=Esc、13=回车、32=空格。
-    // 菜单/结算的按键与按钮在 HTML 场景类里（SnMenuScene/SnOverScene），
-    // 对局的转向/冲刺输入在 SnPlayScene.Event。
+    void DrawPlay(int wallNow) { SnArt.DrawScene(this, wallNow); }
 
     void Tick(int now) {
         if (this.over) { return; }
         this.Step(now);
     }
 }
-
-// ----- HTML 场景层（SceneRouter）--------------------------------------------
-
-// 主菜单：整屏 HTML+CSS，data-on-click="start" 直达处理器，
-// 档案成绩在 OnEnter 里回填到 id="stats"。

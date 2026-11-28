@@ -2,126 +2,143 @@ using System;
 using System.Collections.Generic;
 using Game.Foundation;
 
-// 一局肉鸽的全部可变状态：种子、层数、生命、牌组、当前层候选节点。
+// 一局肉鸽的全部可变状态：种子、进阶、幕、地图位置、生命、金币、牌组、遗物。
 //
-// 这里是"肉鸽"的核心约定：**一切随机都出自 run.random**，而 run.random
-// 由种子决定。于是同一颗种子必然给出同一张地图、同一批敌人、同一组奖励
-// 三选一——这既让一局可以被复盘/存档，也天然支持每日挑战种子。
-//
-// 牌组只存卡 id（纯数据）：牌面定义在 CardLibrary 里共享，所以存档只要
-// 存这一串字符串 + 种子 + 层数 + 生命就够了。
+// 核心约定：**一切随机都出自 run.random**，而 run.random 由种子决定——同一颗种子
+// 必然给出同一张地图、同一批敌人、同一组奖励与商店货架（每场战斗的洗牌/意图
+// 随机源也从种子派生）。牌组和遗物都只存 id（纯数据）。
 public class RunState {
-    // 本局种子。同种子 = 同一局。
     int seed;
-    // 本局随机源（确定性 PCG）。
+    int ascension;
     DeterministicRandom random;
-    // 当前层数，从 1 开始；0 表示还没开局。
-    int floor;
-    // 玩家当前生命与生命上限。
-    int hp;
-    int maxHp;
-    // 累计击杀与金币。
-    int kills;
-    int gold;
-    // 牌组：卡 id 列表。
-    List<string> deck;
-    // 当前层的候选节点。
-    List<MapNode> nodes;
+    public int act;
+    public int hp;
+    public int maxHp;
+    public int gold;
+    public int kills;
+    // 已走过的节点数（跨幕累计，"第 N 层"）。
+    public int floors;
+    public List<string> deck;
+    public List<string> relics;
+    public ActMap map;
+    // 当前所在节点（-1 = 本幕刚开始，还没走第一步）。
+    public int pos;
+    // 本局已经遇过的奇遇（不重复）。
+    public List<int> seenEvents;
+    // 商店删牌服务的价格（每用一次 +25）。
+    public int removeCost;
 
-    RunState(int seed, CardLibrary library) {
+    RunState(int seed, int ascension, CardLibrary library) {
         this.seed = seed;
+        this.ascension = ascension;
         this.random = new DeterministicRandom(seed);
-        this.floor = 0;
-        this.maxHp = 60;
-        this.hp = 60;
+        this.act = 0;
+        this.maxHp = 72 - ascension * 3;
+        this.hp = this.maxHp;
+        this.gold = 99;
         this.kills = 0;
-        this.gold = 0;
+        this.floors = 0;
+        this.pos = -1;
+        this.removeCost = 75;
         this.deck = new List<string>();
-        this.nodes = new List<MapNode>();
+        this.relics = new List<string>();
+        this.seenEvents = new List<int>();
         for (int i = 0; i < library.StarterCount(); i = i + 1) {
             this.deck.Add(library.StarterAt(i));
         }
+        this.relics.Add("ember_blood");
     }
 
-    // 本局种子。
     int Seed() { return this.seed; }
-    // 当前层数。
-    int Floor() { return this.floor; }
-    // 当前生命。
+    int Ascension() { return this.ascension; }
+    int Floor() { return this.floors; }
     int Hp() { return this.hp; }
-    // 生命上限。
     int MaxHp() { return this.maxHp; }
-    // 累计击杀。
     int Kills() { return this.kills; }
-    // 金币。
     int Gold() { return this.gold; }
-    // 牌组（只读引用，调用方只追加）。
     List<string> Deck() { return this.deck; }
-    // 当前层候选节点。
-    List<MapNode> Nodes() { return this.nodes; }
 
-    // 推进一层并生成候选节点。
-    //
-    // 层数编排就是肉鸽的难度曲线：第 1 层给"战斗 or 宝箱"的温和取舍，
-    // 第 2 层换成"精英 or 普通"的硬取舍，第 3 层是 Boss。
-    // 两个候选的先后顺序也由种子决定，所以同种子的路线走向完全一致。
-    void BuildFloor() {
-        this.nodes.Clear();
-        this.floor = this.floor + 1;
-        if (this.floor == 1) {
-            this.nodes.Add(new MapNode(0, "沼泽史莱姆", 30, 5));
-            this.nodes.Add(new MapNode(2, "", 0, 0));
-        } else if (this.floor == 2) {
-            this.nodes.Add(new MapNode(1, "骷髅骑士", 48, 8));
-            this.nodes.Add(new MapNode(0, "骷髅兵", 34, 6));
-        } else {
-            this.nodes.Add(new MapNode(3, "深渊守卫", 80, 12));
-        }
-        if (this.nodes.Count == 2 && this.random.NextBelow(2) == 1) {
-            MapNode swap = this.nodes[0];
-            this.nodes[0] = this.nodes[1];
-            this.nodes[1] = swap;
-        }
+    // 进入下一幕：新地图，回到起点；幕间回复一半已损生命。
+    void NextAct() {
+        this.act = this.act + 1;
+        this.map = new ActMap(this.random);
+        this.pos = -1;
+        if (this.act > 1) { this.Heal((this.maxHp - this.hp) / 2); }
     }
 
-    // 往牌组里加一张卡（卡 id）。
-    void AddCard(string cardId) { this.deck.Add(cardId); }
+    // 当前可以走的节点：本幕起点是第 0 行全部，之后是当前节点的连线。
+    List<MapNode> Choices() {
+        List<MapNode> list = new List<MapNode>();
+        if (this.map == null) { return list; }
+        if (this.pos < 0) { return this.map.RowNodes(0); }
+        MapNode at = this.map.nodes[this.pos];
+        for (int i = 0; i < at.next.Count; i = i + 1) { list.Add(this.map.nodes[at.next[i]]); }
+        return list;
+    }
 
-    // 战斗结算后回写生命：残留格挡算进生命（格挡不跨战斗）。
+    void MoveTo(MapNode node) {
+        node.visited = true;
+        this.pos = node.index;
+        this.floors = this.floors + 1;
+    }
+
+    bool HasRelic(string id) {
+        for (int i = 0; i < this.relics.Count; i = i + 1) {
+            if (this.relics[i] == id) { return true; }
+        }
+        return false;
+    }
+
     void SetHp(int value) {
         if (value < 0) { value = 0; }
         if (value > this.maxHp) { value = this.maxHp; }
         this.hp = value;
     }
 
-    // 回复生命。
     void Heal(int amount) { this.SetHp(this.hp + amount); }
 
-    // 记一次击杀。
-    void AddKill(int gold) {
-        this.kills = this.kills + 1;
-        this.gold = this.gold + gold;
+    void AddMaxHp(int amount) {
+        this.maxHp = this.maxHp + amount;
+        if (this.maxHp < 1) { this.maxHp = 1; }
+        this.SetHp(this.hp + (amount > 0 ? amount : 0));
     }
 
-    // 用本局随机源取 [0, bound) 的整数——地图、敌人、奖励全部走这里，
-    // 所以同种子必然给出同一局。随机源不对外暴露，避免别处绕过它。
-    int Roll(int bound) { return this.random.NextBelow(bound); }
+    // 拿金币（贪婪指环 +50%）；返回实得。
+    int AddGold(int amount) {
+        if (this.HasRelic("greed_ring")) { amount = amount * 3 / 2; }
+        this.gold = this.gold + amount;
+        return amount;
+    }
 
-    // 抽三张互不相同的奖励卡，写进 choices（先清空）。
-    //
-    // 走的是本局随机源，所以同种子必然给出同一组三选一——这是肉鸽
-    // "可复盘/可分享种子"的地基，也是回归测试能断言的点。
-    void DrawRewards(CardLibrary library, List<string> choices) {
-        choices.Clear();
-        int guard = 0;
-        while (choices.Count < 3 && guard < 64) {
-            guard = guard + 1;
-            string id = library.RewardAt(this.Roll(library.RewardCount()));
-            bool duplicated = false;
-            for (int i = 0; i < choices.Count; i = i + 1) {
-                if (choices[i] == id) { duplicated = true; }
-            }
-            if (!duplicated) { choices.Add(id); }
+    // 用本局随机源取 [0, bound)——地图、敌人、奖励、商店、奇遇全部走这里。
+    int Roll(int bound) { return bound <= 1 ? 0 : this.random.NextBelow(bound); }
+
+    // 敌人强度随进阶提升：每级 +6% 生命。
+    int ScaleEnemyHp(int hp) { return hp * (100 + this.ascension * 6) / 100; }
+
+    // 牌组里可升级的位置（未升级的牌）。
+    List<int> Upgradable() {
+        List<int> list = new List<int>();
+        for (int i = 0; i < this.deck.Count; i = i + 1) {
+            if (!CardLibrary.IsUpgraded(this.deck[i])) { list.Add(i); }
         }
+        return list;
+    }
+
+    // 随机升级 n 张（可选只升攻击牌）；返回升级了几张。
+    int UpgradeRandom(int n, CardLibrary library, bool attacksOnly) {
+        int done = 0;
+        for (int k = 0; k < n; k = k + 1) {
+            List<int> pool = new List<int>();
+            List<int> all = this.Upgradable();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                if (!attacksOnly || library.Find(this.deck[all[i]]).Category() == "attack") { pool.Add(all[i]); }
+            }
+            if (pool.Count == 0) { return done; }
+            int at = pool[this.Roll(pool.Count)];
+            this.deck[at] = CardLibrary.UpgradeOf(this.deck[at]);
+            done = done + 1;
+        }
+        return done;
     }
 }

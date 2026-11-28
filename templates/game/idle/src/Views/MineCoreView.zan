@@ -5,19 +5,388 @@ using Gui.Widget;
 using Gui.Animation;
 using Game.Idle;
 
+// 矿洞场景（世界画面，不是控件）：岩层背景、熔岩池、分层辉光、旋转切面的地心矿晶、
+// 点击脉冲环、金矿石、金币/火花粒子与飘字。整块是一个自绘 Control，只负责画世界；
+// 按钮、数字、面板全是标准 Gui 控件，不在这里画。
+//
+// 矿晶是 8 个外顶点 + 8 个内顶点组成的宝石：每个切面按"面朝向 vs 左上方光源"取明暗，
+// 宝石一转，亮面跟着流动。超载时整块烧红、转速加快；淘金狂潮时转金色。
 public class MineCoreView : Control {
-    weak Program host;
+    MineEconomy eco;
+    ParticleSystem particles;
+    FloatingTextManager fct;
 
-    MineCoreView(Program host) {
+    // 输入：最近一次按下的窗口坐标（OnClick 时读取）
+    int downX;
+    int downY;
+
+    // 动效状态
+    double rot;            // 矿晶转角（度）
+    double spinBoost;      // 点击带来的额外转速，指数衰减
+    double scale;          // 点击放大 → 弹回（Tween 驱动）
+    Tween scaleTween;
+    SquashAndStretch juice;
+    double[] ringAge;      // 脉冲环（秒，<0 = 空槽）
+    int[] ringColor;
+    double flash;          // 金矿石敲开 / 超载点火的整屏闪光（1 → 0）
+    double goldenFx;       // 金矿石冒出动画（0 → 1）
+    double goldenX;        // 金矿石位置（视图内 0..1）
+    double goldenY;
+    int lastMs;
+    int emberAcc;
+
+    // 最近一次绘制的几何（命中测试用）
+    int coreCx;
+    int coreCy;
+    int coreR;
+    int goldCx;
+    int goldCy;
+
+    MineCoreView(MineEconomy eco, ParticleSystem particles, FloatingTextManager fct) {
         this.InitControl("minecore");
-        this.host = host;
+        this.eco = eco;
+        this.particles = particles;
+        this.fct = fct;
+        this.scale = 1.0;
+        this.juice = SquashAndStretch.Create();
+        this.ringAge = new double[8];
+        this.ringColor = new int[8];
+        for (int i = 0; i < 8; i = i + 1) { this.ringAge[i] = -1.0; }
+        this.goldenX = 0.78;
+        this.goldenY = 0.3;
+        this.lastMs = 0;
+        this.emberAcc = 0;
+    }
+
+    public int DownX { get { return downX; } }
+    public int DownY { get { return downY; } }
+    public int CoreX { get { return coreCx; } }
+    public int CoreY { get { return coreCy; } }
+    public int FloorY { get { return this.by + this.bh - 22; } }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        downX = e.x;
+        downY = e.y;
+    }
+
+    // 点击点是否落在金矿石上（金矿石半径 16，命中放宽到 30）。
+    public bool HitsGolden(int x, int y) {
+        if (!eco.GoldenVisible) { return false; }
+        int dx = x - goldCx;
+        int dy = y - goldCy;
+        return dx * dx + dy * dy <= 30 * 30;
+    }
+
+    public void PlaceGolden(double fx, double fy) {
+        goldenX = fx;
+        goldenY = fy;
+        goldenFx = 0.0;
+    }
+
+    public int GoldenScreenX { get { return goldCx; } }
+    public int GoldenScreenY { get { return goldCy; } }
+
+    // 敲一下矿晶：放大弹回 + 挤压 + 脉冲环 + 加速旋转。
+    public void Kick(bool big) {
+        juice.Trigger(big ? 0.5 : 0.3);
+        spinBoost = spinBoost + (big ? 260.0 : 120.0);
+        if (spinBoost > 600.0) { spinBoost = 600.0; }
+        this.AddRing(big ? 0xFFFFE08A : 0xFFFFB050);
+        if (scaleTween != null) { scaleTween.Stop(); }
+        float peak = big ? 1.28f : 1.16f;
+        scaleTween = AnimationTimeline.To(peak, 1.0f, 380, EaseType.BackOut, (float val) => { scale = (double)val; });
+    }
+
+    public void Flash() { flash = 1.0; }
+
+    public void AddRing(int color) {
+        int slot = 0;
+        double oldest = -2.0;
+        for (int i = 0; i < 8; i = i + 1) {
+            if (ringAge[i] < 0.0) { slot = i; oldest = 99.0; break; }
+            if (ringAge[i] > oldest) { oldest = ringAge[i]; slot = i; }
+        }
+        ringAge[slot] = 0.0;
+        ringColor[slot] = color;
+    }
+
+    // 每帧推进动效（Program 的动画定时器调用，dt 秒）。
+    public void Animate(double dt) {
+        double speed = 14.0 + spinBoost;
+        if (eco.OverdriveActive) { speed = speed + 46.0; }
+        if (eco.RushActive) { speed = speed + 30.0; }
+        rot = rot + speed * dt;
+        if (rot > 360.0) { rot = rot - 360.0; }
+        spinBoost = spinBoost * Math.Pow(0.08, dt);
+        juice.Update(dt);
+        for (int i = 0; i < 8; i = i + 1) {
+            if (ringAge[i] >= 0.0) {
+                ringAge[i] = ringAge[i] + dt;
+                if (ringAge[i] > 0.7) { ringAge[i] = -1.0; }
+            }
+        }
+        if (flash > 0.0) { flash = flash - dt * 2.5; if (flash < 0.0) { flash = 0.0; } }
+        if (eco.GoldenVisible && goldenFx < 1.0) { goldenFx = goldenFx + dt * 3.0; if (goldenFx > 1.0) { goldenFx = 1.0; } }
+        // 熔岩池冒余烬：超载时更密
+        emberAcc = emberAcc + (eco.OverdriveActive ? 3 : 1);
+        if (emberAcc >= 6 && this.bw > 40) {
+            emberAcc = 0;
+            int t = Window.GetTickMs();
+            double ex = (double)(this.bx + 24 + (int)(((long)t * 7919L) % (long)(this.bw - 48)));
+            particles.Ember(ex, (double)(this.by + this.bh - 16));
+        }
     }
 
     override void OnPaint(App app) {
         base.OnPaint(app);
         Canvas c = app.canvas;
-        host.RenderMiningArea(c, this.bx, this.by, this.bw, this.bh);
+        int x = this.bx;
+        int y = this.by;
+        int w = this.bw;
+        int h = this.bh;
+        if (w < 40 || h < 40) { return; }
+        int t = Window.GetTickMs();
+        double ts = (double)(t % 1000000) / 1000.0;
+
+        c.PushClip(x, y, w, h);
+        this.PaintCave(c, x, y, w, h, ts);
+
+        // 矿晶几何
+        int cx = x + w / 2;
+        int cy = y + h / 2 - 6;
+        double baseR = (double)(w < h ? w : h) * 0.25;
+        double r = baseR * scale;
+        coreCx = cx;
+        coreCy = cy;
+        coreR = (int)r;
+        double pulse = 0.5 + 0.5 * Math.Sin(ts * 2.4);
+
+        this.PaintGlow(c, cx, cy, r, pulse, ts);
+        this.PaintRings(c, cx, cy, r);
+        this.PaintGem(c, cx, cy, r * juice.ScaleX, r * juice.ScaleY, rot, this.Palette(), true);
+
+        if (eco.GoldenVisible) {
+            this.PaintGolden(c, x, y, w, h, ts);
+        } else {
+            goldCx = -1000;
+            goldCy = -1000;
+        }
+
+        particles.Render(c);
+        fct.Render(c, null);
+
+        if (flash > 0.0) {
+            int a = (int)(flash * 90.0);
+            c.FillRect(x, y, w, h, (a << 24) | 0xFFE6A0);
+        }
+        // 内描边：让矿洞像嵌在面板里的一块视窗
+        c.DrawRoundRect(x, y, w, h, 12, 0x66000000, 3);
+        c.DrawRoundRect(x + 1, y + 1, w - 2, h - 2, 11, 0x33FFB060, 1);
+        c.PopClip();
+    }
+
+    // ---- 场景层 -----------------------------------------------------------
+
+    void PaintCave(Canvas c, int x, int y, int w, int h, double ts) {
+        c.FillRoundRect(x, y, w, h, 12, 0xFF120A06);
+        // 顶部冷、底部被熔岩烤热：两团大径向光代替竖直渐变
+        c.FillRadial(x + w / 2, y + h + 30, h, 0xFFB8420C, 120);
+        c.FillRadial(x + w / 4, y - 20, h / 2, 0xFF3A2416, 120);
+        // 三条起伏的岩层
+        this.Stratum(c, x, y + h * 22 / 100, w, 7, 0.031, 1.0, 0xFF24160E);
+        this.Stratum(c, x, y + h * 48 / 100, w, 10, 0.022, 2.3, 0xFF1E120B);
+        this.Stratum(c, x, y + h * 74 / 100, w, 8, 0.027, 4.1, 0xFF2A170C);
+        // 岩壁里的矿点：固定位置，忽明忽暗
+        for (int i = 0; i < 22; i = i + 1) {
+            int px = x + 10 + (int)(((long)(i * 2654435761L) >> 7) % (long)(w - 20));
+            int py = y + 10 + (int)(((long)(i * 40503L + 17L) * 7L) % (long)(h - 40));
+            double tw = 0.5 + 0.5 * Math.Sin(ts * (1.3 + (double)(i % 5) * 0.4) + (double)i);
+            int a = 60 + (int)(tw * 150.0);
+            int col = i % 3 == 0 ? 0xFFD9A441 : (i % 3 == 1 ? 0xFFB86A2A : 0xFF7FD6C8);
+            c.FillCircle(px, py, 1 + i % 3, (a << 24) | (col & 0xFFFFFF));
+        }
+        // 熔岩池
+        int ly = y + h - 18;
+        double lp = 0.5 + 0.5 * Math.Sin(ts * 1.7);
+        c.FillRadial(x + w / 2, ly + 6, w / 2, 0xFFFF6A1A, 70 + (int)(lp * 50.0));
+        c.FillRoundRect(x + 8, ly, w - 16, 26, 10, 0xFF8A2406);
+        c.FillRoundRect(x + 14, ly + 3, w - 28, 8, 4, 0xFFFF7A1A);
+        for (int i = 0; i < 6; i = i + 1) {
+            double bx2 = (double)(x + 24) + (double)(w - 48) * ((double)i / 5.0);
+            double bob = Math.Sin(ts * 2.0 + (double)i * 1.7);
+            c.FillCircle((int)bx2, ly + 6 + (int)(bob * 2.0), 3 + (int)(Math.Abs(bob) * 2.0), 0xFFFFC04A);
+        }
+    }
+
+    void Stratum(Canvas c, int x, int y0, int w, int thick, double freq, double phase, int color) {
+        for (int sx = 0; sx < w; sx = sx + 6) {
+            double wy = Math.Sin((double)sx * freq + phase) * 6.0 + Math.Sin((double)sx * freq * 2.7 + phase * 1.9) * 2.5;
+            c.FillRect(x + sx, y0 + (int)wy, 6, thick, color);
+            c.FillRect(x + sx, y0 + (int)wy, 6, 1, 0x22FFD8A0);
+        }
+    }
+
+    void PaintGlow(Canvas c, int cx, int cy, double r, double pulse, double ts) {
+        int hot = eco.OverdriveActive ? 0xFFFF3A10 : (eco.RushActive ? 0xFFFFD040 : 0xFFFF7A1A);
+        int warm = eco.OverdriveActive ? 0xFFFFB040 : (eco.RushActive ? 0xFFFFF0A0 : 0xFFFFC060);
+        c.FillRadial(cx, cy, (int)(r * 2.7), hot, 70 + (int)(pulse * 50.0));
+        c.FillRadial(cx, cy, (int)(r * 1.8), warm, 90 + (int)(pulse * 60.0));
+        // 慢转的光束
+        int rays = 12;
+        int a0 = (int)(0.0 - rot * 0.45);
+        for (int i = 0; i < rays; i = i + 1) {
+            int a = a0 + i * 360 / rays;
+            int len = (int)(r * (1.9 + 0.25 * Math.Sin(ts * 1.5 + (double)i)));
+            c.FillSector(cx, cy, (int)(r * 0.9), len, a, a + 7, 0x26FFD890);
+        }
+    }
+
+    void PaintRings(Canvas c, int cx, int cy, double r) {
+        for (int i = 0; i < 8; i = i + 1) {
+            double age = ringAge[i];
+            if (age < 0.0) { continue; }
+            double k = age / 0.7;
+            int rr = (int)(r * (1.0 + k * 1.3));
+            int a = (int)((1.0 - k) * 220.0);
+            if (a <= 0) { continue; }
+            c.DrawCircle(cx, cy, rr, (a << 24) | (ringColor[i] & 0xFFFFFF), 4 - (int)(k * 3.0));
+        }
+    }
+
+    // 4 段色板：暗 → 深 → 亮 → 高光。
+    int[] Palette() {
+        if (eco.OverdriveActive) { return new int[] { 0xFF5A0A02, 0xFFC4220A, 0xFFFF7A2A, 0xFFFFE0B0 }; }
+        if (eco.RushActive) { return new int[] { 0xFF5A3A00, 0xFFC08A10, 0xFFFFD84A, 0xFFFFF8D8 }; }
+        return new int[] { 0xFF4A1604, 0xFFA8400C, 0xFFF58A1E, 0xFFFFDC8A };
+    }
+
+    static int Lerp(int a, int b, double t) {
+        if (t <= 0.0) { return a; }
+        if (t >= 1.0) { return b; }
+        int ar = (a >> 16) & 255;
+        int ag = (a >> 8) & 255;
+        int ab = a & 255;
+        int br = (b >> 16) & 255;
+        int bg = (b >> 8) & 255;
+        int bb = b & 255;
+        int rr = ar + (int)((double)(br - ar) * t);
+        int rg = ag + (int)((double)(bg - ag) * t);
+        int rb = ab + (int)((double)(bb - ab) * t);
+        return (int)0xFF000000 | (rr << 16) | (rg << 8) | rb;
+    }
+
+    static int Shade(int[] pal, double t) {
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+        double s = t * 3.0;
+        int seg = (int)s;
+        if (seg >= 3) { return pal[3]; }
+        return Lerp(pal[seg], pal[seg + 1], s - (double)seg);
+    }
+
+    // 宝石：外环 8 顶点（长短交替）+ 内环 8 顶点 + 台面。每个切面按法线朝向取明暗。
+    void PaintGem(Canvas c, int cx, int cy, double rx, double ry, double rotDeg, int[] pal, bool edges) {
+        double d2r = 3.14159265 / 180.0;
+        double light = -125.0 * d2r;
+        int n = 8;
+        double[] ox = new double[n];
+        double[] oy = new double[n];
+        double[] ix = new double[n];
+        double[] iy = new double[n];
+        for (int k = 0; k < n; k = k + 1) {
+            double a = (rotDeg + (double)k * 45.0) * d2r;
+            double rr = k % 2 == 0 ? 1.0 : 0.84;
+            ox[k] = (double)cx + Math.Cos(a) * rx * rr;
+            oy[k] = (double)cy + Math.Sin(a) * ry * rr;
+            double ai = a + 22.5 * d2r;
+            ix[k] = (double)cx + Math.Cos(ai) * rx * 0.5;
+            iy[k] = (double)cy + Math.Sin(ai) * ry * 0.5;
+        }
+        // 底层阴影
+        c.FillCircle(cx + 4, cy + 7, (int)(rx * 0.95), 0x55000000);
+        for (int k = 0; k < n; k = k + 1) {
+            int k1 = (k + 1) % n;
+            int km = (k + n - 1) % n;
+            double a = (rotDeg + (double)k * 45.0) * d2r;
+            // 冠面：外 k、外 k+1、内 k
+            double faceA = a + 22.5 * d2r;
+            double lit = 0.5 + 0.5 * Math.Cos(faceA - light);
+            FillTri(c, ox[k], oy[k], ox[k1], oy[k1], ix[k], iy[k], Shade(pal, 0.15 + lit * 0.75));
+            // 腰面：外 k、内 k-1、内 k
+            double lit2 = 0.5 + 0.5 * Math.Cos(a - light);
+            FillTri(c, ox[k], oy[k], ix[km], iy[km], ix[k], iy[k], Shade(pal, 0.05 + lit2 * 0.6));
+        }
+        // 台面：内环扇形，整体偏亮
+        for (int k = 0; k < n; k = k + 1) {
+            int k1 = (k + 1) % n;
+            double a = (rotDeg + (double)k * 45.0 + 45.0) * d2r;
+            double lit = 0.5 + 0.5 * Math.Cos(a - light);
+            FillTri(c, (double)cx, (double)cy, ix[k], iy[k], ix[k1], iy[k1], Shade(pal, 0.62 + lit * 0.38));
+        }
+        if (edges) {
+            for (int k = 0; k < n; k = k + 1) {
+                int k1 = (k + 1) % n;
+                c.DrawLine((int)ox[k], (int)oy[k], (int)ox[k1], (int)oy[k1], 0xAAFFE8B0, 2);
+                c.DrawLine((int)ix[k], (int)iy[k], (int)ix[k1], (int)iy[k1], 0x66FFF4D8, 1);
+                c.DrawLine((int)ox[k], (int)oy[k], (int)ix[k], (int)iy[k], 0x40FFF0C8, 1);
+            }
+        }
+        // 左上高光
+        c.FillRadial(cx - (int)(rx * 0.32), cy - (int)(ry * 0.36), (int)(rx * 0.34), 0xFFFFFFFF, 150);
+    }
+
+    // 扫描线填三角形（逐行 FillRect；画布没有多边形填充）。
+    static void FillTri(Canvas c, double x0, double y0, double x1, double y1, double x2, double y2, int color) {
+        // 按 y 排序
+        if (y1 < y0) { double tx = x0; x0 = x1; x1 = tx; double ty = y0; y0 = y1; y1 = ty; }
+        if (y2 < y0) { double tx = x0; x0 = x2; x2 = tx; double ty = y0; y0 = y2; y2 = ty; }
+        if (y2 < y1) { double tx = x1; x1 = x2; x2 = tx; double ty = y1; y1 = y2; y2 = ty; }
+        int ya = (int)Math.Floor(y0 + 0.5);
+        int yb = (int)Math.Floor(y2 + 0.5);
+        for (int yy = ya; yy < yb; yy = yy + 1) {
+            double fy = (double)yy + 0.5;
+            double xa = Edge(x0, y0, x2, y2, fy);
+            double xb = fy < y1 ? Edge(x0, y0, x1, y1, fy) : Edge(x1, y1, x2, y2, fy);
+            if (xb < xa) { double tmp = xa; xa = xb; xb = tmp; }
+            int l = (int)Math.Floor(xa + 0.5);
+            int r = (int)Math.Floor(xb + 0.5);
+            if (r > l) { c.FillRect(l, yy, r - l, 1, color); }
+        }
+    }
+
+    static double Edge(double xa, double ya, double xb, double yb, double y) {
+        double dy = yb - ya;
+        if (dy > -0.0001 && dy < 0.0001) { return xa; }
+        return xa + (xb - xa) * (y - ya) / dy;
+    }
+
+    // 金矿石：金色辉光 + 小宝石 + 倒计时环 + 提示字。
+    void PaintGolden(Canvas c, int x, int y, int w, int h, double ts) {
+        double appear = goldenFx;
+        double bob = Math.Sin(ts * 3.2) * 4.0;
+        int gx = x + (int)(goldenX * (double)w);
+        int gy = y + (int)(goldenY * (double)h + bob);
+        goldCx = gx;
+        goldCy = gy;
+        double pulse = 0.5 + 0.5 * Math.Sin(ts * 6.0);
+        double r = 15.0 * (0.4 + 0.6 * appear);
+        c.FillRadial(gx, gy, (int)(r * 3.2), 0xFFFFD040, 120 + (int)(pulse * 90.0));
+        for (int i = 0; i < 6; i = i + 1) {
+            int a = (int)(ts * 90.0) + i * 60;
+            c.FillSector(gx, gy, (int)(r * 1.1), (int)(r * 2.4), a, a + 10, 0x55FFF0A0);
+        }
+        int[] gold = new int[] { 0xFF6A4400, 0xFFD49A10, 0xFFFFE066, 0xFFFFFBE0 };
+        this.PaintGem(c, gx, gy, r, r, ts * 160.0, gold, true);
+        // 剩余时间环
+        double frac = eco.goldenLeft / MineEconomy.GoldenLife;
+        int sweep = (int)(frac * 360.0);
+        if (sweep > 0) {
+            c.FillSector(gx, gy, (int)(r + 7.0), (int)(r + 10.0), -90, -90 + sweep, 0xDDFFE680);
+        }
+        string tip = "金矿石！";
+        int tw = Canvas.MeasureText(tip, 13);
+        c.DrawText(gx - tw / 2 + 1, gy - (int)r - 30 + 1, tip, 0xCC000000, 13);
+        c.DrawText(gx - tw / 2, gy - (int)r - 30, tip, 0xFFFFE680, 13);
     }
 }
-
-// 建筑升级行 UI 绑定实体（消除 buyButtons / levelLabels / costLabels 平行列表反模式）。

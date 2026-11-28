@@ -1,0 +1,206 @@
+using System;
+using System.Collections.Generic;
+using Game.Cards;
+using Game.Foundation;
+
+// 一个"会玩"的机器人：看意图叠甲、能斩杀就斩杀、先打能力牌、选路看血量、
+// 商店先买遗物再删打击。它只读 RunFlow、只输出回放输入编码（见 RoguelikeSim），
+// 所以和玩家走的是同一套规则。
+//
+// 两个用途：RoguelikeSim.Bot 拿它做模糊测试（掺一点随机乱按），平衡探针拿它
+// 跑几百局统计胜率——"像样的玩家"大约三成能登顶，就说明曲线不是 0% 也不是 100%。
+public class RogueBot {
+    // 当前局面下的一步（回放输入编码）。
+    public static int Decide(RunFlow f, DeterministicRandom rng) {
+        int p = f.phase;
+        if (p == RunFlow.Menu()) { return 1; }
+        if (p == RunFlow.Over()) { return 50; }
+        if (p == RunFlow.MapPhase()) { return RogueBot.ChooseNode(f, rng); }
+        if (p == RunFlow.Fight()) { return RogueBot.ChooseCard(f); }
+        if (p == RunFlow.Loot()) { return RogueBot.ChooseLoot(f); }
+        if (p == RunFlow.Camp()) { return f.run.hp * 100 < f.run.maxHp * 55 ? 60 : 61; }
+        if (p == RunFlow.Store()) { return RogueBot.ChooseShop(f); }
+        if (p == RunFlow.Encounter()) { return RogueBot.ChooseEvent(f); }
+        if (p == RunFlow.Pick()) { return RogueBot.ChoosePick(f); }
+        return 0;
+    }
+
+    // ---- 地图：血多打精英，血少找篝火，有钱逛商店 -----------------------------
+
+    static int ChooseNode(RunFlow f, DeterministicRandom rng) {
+        List<MapNode> choices = f.run.Choices();
+        int hpPct = f.run.hp * 100 / f.run.maxHp;
+        int best = 0;
+        int bestScore = -9999;
+        for (int i = 0; i < choices.Count; i = i + 1) {
+            int k = choices[i].kind;
+            int s = 50;
+            if (k == MapNode.Elite()) { s = hpPct > 75 ? 70 : (hpPct > 55 ? 35 : 0); }
+            else if (k == MapNode.Campfire()) { s = hpPct < 50 ? 95 : 35; }
+            else if (k == MapNode.Shop()) { s = f.run.gold >= 150 ? 80 : (f.run.gold >= 90 ? 50 : 15); }
+            else if (k == MapNode.Event()) { s = 48; }
+            else if (k == MapNode.Treasure() || k == MapNode.Boss()) { s = 100; }
+            s = s + rng.NextBelow(20);
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        return 10 + best;
+    }
+
+    // ---- 战斗：每张能打的牌估个分，最高分 > 0 就打，否则结束回合 --------------
+
+    static int ChooseCard(RunFlow f) {
+        Battle b = f.battle;
+        CardZone hand = b.Hand();
+        int best = -1;
+        int bestScore = 0;
+        for (int i = 0; i < hand.Count(); i = i + 1) {
+            if (!b.CanPlay(i)) { continue; }
+            int s = RogueBot.ScorePlay(b, hand.At(i).Definition(), hand);
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        return best >= 0 ? 20 + best : 30;
+    }
+
+    static int ScorePlay(Battle b, CardDefinition d, CardZone hand) {
+        Fighter p = b.player;
+        Fighter e = b.enemy;
+        int dmg = 0;
+        int block = 0;
+        int s = 0;
+        for (int i = 0; i < d.EffectCount(); i = i + 1) {
+            int k = d.EffectAt(i).Kind();
+            int n = d.EffectAt(i).Amount();
+            if (k == CardFx.Damage()) { dmg = dmg + b.PreviewDamage(n); }
+            else if (k == CardFx.BlockDamage()) { dmg = dmg + b.PreviewDamage(p.block); }
+            else if (k == CardFx.Block()) { block = block + n; }
+            else if (k == CardFx.Heal()) { int miss = p.maxHp - p.hp; s = s + (n < miss ? n : miss) * 8; }
+            else if (k == CardFx.Draw()) { s = s + n * 30; }
+            else if (k == CardFx.Energy()) { s = s + n * 45; }
+            else if (k == CardFx.Strength()) { s = s + n * 40; }
+            else if (k == CardFx.Vulnerable()) { s = s + (e.vulnerable > 0 ? 15 : 60) + n * 10; }
+            else if (k == CardFx.Weak()) { s = s + (b.IncomingDamage() > 0 ? 50 : 15) + n * 8; }
+            else if (k == CardFx.Poison()) { s = s + n * (e.hp > 30 ? 22 : 10); }
+            else if (k == CardFx.DoublePoison()) { s = s + e.poison * 15; }
+            else if (k == CardFx.LoseHp()) { s = s - n * 12; }
+            else if (k >= CardFx.PowerStrength()) { s = s + 220 + n * 20; }
+        }
+        int need = b.IncomingDamage() - p.block;
+        if (need < 0) { need = 0; }
+        if (dmg > 0) {
+            int left = e.hp + e.block;
+            if (dmg >= left) { return 5000; }
+            s = s + dmg * 10;
+        }
+        if (block > 0) {
+            int useful = block < need ? block : need;
+            s = s + useful * 14 + (block - useful) * 1;
+        }
+        int cost = d.Cost();
+        return cost <= 0 ? s + 5 : s / cost;
+    }
+
+    // ---- 战利品 ----------------------------------------------------------------
+
+    static int ChooseLoot(RunFlow f) {
+        if (!f.relicDone) { return 45 + RogueBot.BestRelic(f.relicChoices); }
+        if (f.cardDone || f.rewardChoices.Count == 0) { return 44; }
+        int best = 0;
+        int bestScore = -1;
+        for (int i = 0; i < f.rewardChoices.Count; i = i + 1) {
+            int s = RogueBot.CardValue(f.rewardChoices[i]);
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        if (bestScore < 40 && f.run.deck.Count >= 18) { return 44; }
+        return 40 + best;
+    }
+
+    static int BestRelic(List<string> ids) {
+        string[] order = new string[]{ "ember_crown", "demon_horn", "star_box", "titan_heart" };
+        for (int o = 0; o < order.Length; o = o + 1) {
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                if (ids[i] == order[o]) { return i; }
+            }
+        }
+        return 0;
+    }
+
+    // 牌的价值（选奖励、逛商店、挑升级）。
+    public static int CardValue(string id) {
+        string b = CardLibrary.BaseId(id);
+        int v = 35;
+        if (b == "strike") { v = 5; } else if (b == "guard") { v = 8; } else if (b == "bash") { v = 30; }
+        else if (b == "twin") { v = 40; } else if (b == "venom") { v = 45; } else if (b == "daze") { v = 42; }
+        else if (b == "quick") { v = 40; } else if (b == "slam") { v = 28; } else if (b == "drain") { v = 36; }
+        else if (b == "sunder") { v = 42; } else if (b == "heavy") { v = 50; } else if (b == "flurry") { v = 48; }
+        else if (b == "bloodblade") { v = 50; } else if (b == "judgement") { v = 65; } else if (b == "parry") { v = 46; }
+        else if (b == "ironwall") { v = 45; } else if (b == "toxin") { v = 45; } else if (b == "hold") { v = 40; }
+        else if (b == "surge") { v = 38; } else if (b == "hex") { v = 46; } else if (b == "mend") { v = 30; }
+        else if (b == "offering") { v = 50; } else if (b == "catalyst") { v = 34; } else if (b == "rally") { v = 42; }
+        else if (b == "laststand") { v = 55; } else if (b == "aegis") { v = 60; } else if (b == "focus") { v = 55; }
+        else if (b == "plating") { v = 50; } else if (b == "thorns") { v = 38; } else if (b == "noxious") { v = 60; }
+        else if (b == "insight") { v = 55; } else if (b == "demon") { v = 70; }
+        return CardLibrary.IsUpgraded(id) ? v + 10 : v;
+    }
+
+    // ---- 商店：遗物 > 删一张打击 > 好牌 > 走人 --------------------------------
+
+    static int ChooseShop(RunFlow f) {
+        for (int i = 0; i < f.shopRelics.Count; i = i + 1) {
+            if (f.CanBuyRelic(i)) { return 86 + i; }
+        }
+        if (f.CanRemove() && RogueBot.CountBase(f, "strike") > 0) { return 88; }
+        int best = -1;
+        int bestScore = 52;
+        for (int i = 0; i < f.shopCards.Count; i = i + 1) {
+            if (!f.CanBuyCard(i)) { continue; }
+            int s = RogueBot.CardValue(f.shopCards[i]);
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        return best >= 0 ? 80 + best : 89;
+    }
+
+    static int CountBase(RunFlow f, string id) {
+        int n = 0;
+        for (int i = 0; i < f.run.deck.Count; i = i + 1) {
+            if (CardLibrary.BaseId(f.run.deck[i]) == id) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // ---- 奇遇：血多就冒险，血少就保守 ----------------------------------------
+
+    static int ChooseEvent(RunFlow f) {
+        if (f.eventDone) { return 79; }
+        int id = f.eventId;
+        int hpPct = f.run.hp * 100 / f.run.maxHp;
+        int want = f.events.OptionCount(id) - 1;
+        if (id == 0) { want = hpPct > 45 ? 0 : 1; }
+        else if (id == 1) { want = f.run.gold >= 60 ? 0 : (hpPct > 50 ? 1 : 2); }
+        else if (id == 2) { want = 0; }
+        else if (id == 3) { want = hpPct > 50 ? 0 : 1; }
+        else if (id == 4) { want = hpPct < 75 ? 0 : 1; }
+        else if (id == 6) { want = 0; }
+        else if (id == 7) { want = f.run.gold >= 90 ? 0 : 2; }
+        if (!f.events.Enabled(f, id, want)) {
+            want = f.events.OptionCount(id) - 1;
+            for (int i = 0; i < f.events.OptionCount(id); i = i + 1) {
+                if (f.events.Enabled(f, id, i)) { want = i; break; }
+            }
+        }
+        return 70 + want;
+    }
+
+    // ---- 选牌：升级挑最值的，移除先打击后防御 ---------------------------------
+
+    static int ChoosePick(RunFlow f) {
+        int best = 0;
+        int bestScore = -99999;
+        for (int i = 0; i < f.pickList.Count; i = i + 1) {
+            string id = f.run.deck[f.pickList[i]];
+            int v = RogueBot.CardValue(id);
+            int s = f.pickPurpose == 1 ? v : -v;
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        return 100 + best;
+    }
+}

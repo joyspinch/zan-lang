@@ -27,9 +27,11 @@ public class PinView {
     string red;
     PinHud hud;
     PinShell shell;
+    PinFx fx;
 
     PinView() {
         this.shell = new PinShell();
+        this.fx = new PinFx();
         this.backdrop = Assets.Find("assets/backdrop.jpg");
         this.rotor = Assets.Find("assets/rotor.png");
         this.jade = Assets.Find("assets/jade.png");
@@ -57,6 +59,8 @@ public class PinView {
         UiDriver.SetProbe("pin.state", Convert.ToString((int)game.state));
         UiDriver.SetProbe("pin.muted", this.shell.Muted() ? "1" : "0");
         UiDriver.SetProbe("pin.best", Convert.ToString(this.shell.BestLevel()));
+        UiDriver.SetProbe("pin.phase", Convert.ToString(game.phase));
+        UiDriver.SetProbe("pin.stars", Convert.ToString(this.shell.TotalStars()));
     }
 
     int Dp(double value) { return (int)(value * this.unit); }
@@ -118,7 +122,23 @@ public class PinView {
         this.Orb(c, hx, hy, preset, failed);
     }
 
-    void Halo(Canvas c, int cx, int cy, double rotation) {
+    // Translucent needle for fly-outs and grow-ins (bitmaps have no alpha
+    // control, so the head is painted as a lit sphere instead).
+    void GhostNeedle(Canvas c, int cx, int cy, double angle, double radius, double length, int color, int alpha) {
+        double dx = Math.Cos(angle);
+        double dy = Math.Sin(angle);
+        int hx = cx + this.Gp(dx * radius);
+        int hy = cy + this.Gp(dy * radius);
+        int tx = cx + this.Gp(dx * (radius - length));
+        int ty = cy + this.Gp(dy * (radius - length));
+        this.Line(c, tx, ty, hx, hy, this.Gp(PinWorld.ShaftWidth), color, alpha);
+        int r = this.Gp(PinWorld.HeadRadius);
+        this.Circle(c, hx, hy + this.Dp(2), r, PinView.Ink, alpha / 2);
+        this.Circle(c, hx, hy, r, color, alpha);
+        this.Circle(c, hx - r / 3, hy - r / 3, r / 3, PinView.Paper, alpha * 2 / 3);
+    }
+
+    void Halo(Canvas c, int cx, int cy, double rotation, bool warn, int timeMs) {
         this.Ring(c, cx, cy, this.Gp(170), this.Dp(1), PinView.Gold, 46);
         this.Ring(c, cx, cy, this.Gp(178), this.Dp(1), PinView.Jade, 26);
         for (int i = 0; i < 60; i = i + 1) {
@@ -128,65 +148,148 @@ public class PinView {
                 cx + this.Gp(Math.Cos(a) * 178), cy + this.Gp(Math.Sin(a) * 178),
                 this.Dp(1), PinView.Gold, i % 5 == 0 ? 136 : 48);
         }
-        this.Arc(c, cx, cy, 244, rotation - 0.6, 0.45, PinView.Jade, 120);
-        this.Arc(c, cx, cy, 244, rotation + 2.54, 0.45, PinView.Gold, 96);
+        // Reversal telegraph: the orbit arcs blink red just before a sudden flip.
+        bool blink = warn && (timeMs / 90) % 2 == 0;
+        this.Arc(c, cx, cy, 244, rotation - 0.6, 0.45, blink ? PinView.Danger : PinView.Jade, blink ? 230 : 120);
+        this.Arc(c, cx, cy, 244, rotation + 2.54, 0.45, blink ? PinView.Danger : PinView.Gold, blink ? 230 : 96);
+        if (warn) {
+            this.Ring(c, cx, cy, this.Gp(178), this.Dp(2), PinView.Danger, blink ? 120 : 40);
+        }
     }
 
-    void Rotor(Canvas c, int cx, int cy, double rotation) {
-        this.Circle(c, cx, cy + this.Dp(7), this.Gp(PinWorld.DiskRadius + 5), PinView.Ink, 128);
-        this.ImageCentered(c, this.rotor, cx, cy, this.Gp(PinWorld.DiskRadius * 2));
-        double a = rotation - PinWorld.Down;
-        this.Circle(c, cx + this.Gp(Math.Cos(a) * 49), cy + this.Gp(Math.Sin(a) * 49), this.Dp(3), PinView.Jade, 255);
+    // Boss rotors wear one brass ring per remaining phase; each shatters in turn.
+    void Rotor(Canvas c, int cx, int cy, double rotation, double scale, int rings) {
+        this.Circle(c, cx, cy + this.Dp(7), this.Gp((PinWorld.DiskRadius + 5) * scale), PinView.Ink, 128);
+        for (int k = rings; k >= 1; k = k - 1) {
+            int rr = this.Gp((PinWorld.DiskRadius + 3 + 7 * k) * scale);
+            this.Ring(c, cx, cy, rr, this.Gp(4), PinView.Ink, 150);
+            this.Ring(c, cx, cy, rr, this.Gp(3), k == 1 ? PinView.Gold : PinView.Danger, 220);
+            for (int i = 0; i < 6; i = i + 1) {
+                double a = rotation * (k % 2 == 0 ? -0.5 : 0.5) + i * PinWorld.Tau / 6.0;
+                this.Circle(c, cx + (int)(Math.Cos(a) * rr), cy + (int)(Math.Sin(a) * rr), this.Gp(2.4), PinView.Paper, 200);
+            }
+        }
+        this.ImageCentered(c, this.rotor, cx, cy, this.Gp(PinWorld.DiskRadius * 2 * scale));
+        double a0 = rotation - PinWorld.Down;
+        this.Circle(c, cx + this.Gp(Math.Cos(a0) * 49 * scale), cy + this.Gp(Math.Sin(a0) * 49 * scale), this.Dp(3), PinView.Jade, 255);
     }
 
     void Impact(Canvas c, PinWorld game, int cx, int cy) {
-        if (game.pulseMs <= 0) { return; }
-        bool failed = game.state == RoundState.Failed;
-        double t = 1 - game.pulseMs / (failed ? 400.0 : 240.0);
+        PinFx fx = this.fx;
+        if (fx.ringMs <= 0) { return; }
+        double t = 1 - fx.ringMs / 280.0;
+        if (t < 0) { t = 0; }
         double ease = Easing.Evaluate(EaseType.CubicOut, t);
         int alpha = (int)((1 - t) * 220);
-        int color = failed ? PinView.Danger : PinView.Jade;
-        this.Ring(c, cx, cy, this.Gp(PinWorld.DiskRadius + 4 + ease * 30), this.Dp(2), color, alpha);
-        int sx = cx;
-        int sy = cy + this.Gp(game.shotRadius);
-        if (!failed && game.pins.Count > 0) {
-            double a = game.pins[game.pins.Count - 1].angle + game.rotation;
-            sx = cx + this.Gp(Math.Cos(a) * PinWorld.PinRadius);
-            sy = cy + this.Gp(Math.Sin(a) * PinWorld.PinRadius);
+        this.Ring(c, cx, cy, this.Gp(PinWorld.DiskRadius + 4 + ease * 34), this.Dp(2), PinView.Jade, alpha);
+        this.Ring(c, cx, cy, this.Gp(PinWorld.DiskRadius + 2 + ease * 18), this.Dp(1), PinView.Gold, alpha);
+    }
+
+    void Sparks(Canvas c, int cx, int cy) {
+        List<Spark> list = this.fx.sparks;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            Spark s = list[i];
+            int alpha = (int)(255.0 * s.life / s.max);
+            int x = cx + this.Gp(s.x);
+            int y = cy + this.Gp(s.y);
+            this.Line(c, x, y, x - this.Gp(s.vx * 0.018), y - this.Gp(s.vy * 0.018), this.Dp(s.size), s.color, alpha * 2 / 3);
+            this.Circle(c, x, y, this.Dp(s.size), s.color, alpha);
         }
-        for (int i = 0; i < 10; i = i + 1) {
-            double a = i * PinWorld.Tau / 10.0 + 0.2;
-            double dist = 12 + ease * 34;
-            this.Line(c, sx + this.Dp(Math.Cos(a) * dist), sy + this.Dp(Math.Sin(a) * dist),
-                sx + this.Dp(Math.Cos(a) * (dist + 5)), sy + this.Dp(Math.Sin(a) * (dist + 5)), this.Dp(2), color, alpha);
+    }
+
+    // Wobbling rotors show their travel with two brass brackets on the axis.
+    void SwayGuides(Canvas c, PinWorld game, int cx, int cy) {
+        double amp = game.Phase().wobblePx;
+        if (amp <= 0) { return; }
+        int reach = this.Gp(amp + PinWorld.DiskRadius + 12);
+        for (int side = -1; side <= 1; side = side + 2) {
+            int x = cx + side * reach;
+            this.Line(c, x, cy - this.Dp(16), x, cy + this.Dp(16), this.Dp(2), PinView.Gold, 150);
+            this.Line(c, x, cy - this.Dp(16), x - side * this.Dp(7), cy - this.Dp(16), this.Dp(2), PinView.Gold, 150);
+            this.Line(c, x, cy + this.Dp(16), x - side * this.Dp(7), cy + this.Dp(16), this.Dp(2), PinView.Gold, 150);
         }
+        this.Line(c, cx - reach, cy, cx + reach, cy, this.Dp(1), PinView.Gold, 40);
     }
 
     void Play(Canvas c, PinWorld game) {
         this.DrawBackground(c);
-        int cx = this.CenterX();
-        int cy = this.CenterY();
-        if (game.state == RoundState.Failed && game.pulseMs > 0) {
-            cx = cx + this.Dp(Math.Sin(game.pulseMs / 22.0) * 5 * game.pulseMs / 400.0);
+        PinFx fx = this.fx;
+        int cx = this.CenterX() + this.Dp(fx.ShakeX());
+        int cy = this.CenterY() + this.Dp(fx.ShakeY());
+        double rotation = game.rotation + fx.extraRotation;
+        int rx = cx + this.Gp(game.wobble);
+        int ry = cy + this.Gp(fx.recoilY);
+        this.Halo(c, cx, cy, rotation, game.FlipWarning() && !game.paused, fx.clock);
+        this.SwayGuides(c, game, cx, cy);
+        this.Impact(c, game, rx, ry);
+        // Boss ring burst: the previous ring's pins fly off and fade.
+        if (fx.burstMs > 0) {
+            double t = Math.Min(1.0, fx.burstMs / 900.0);
+            double reach = PinWorld.PinRadius + Easing.Evaluate(EaseType.CubicOut, t) * 260;
+            int bx = cx + this.Gp(fx.burstWobble);
+            for (int i = 0; i < fx.burstAngles.Count; i = i + 1) {
+                double a = fx.burstAngles[i] + fx.burstRotation + t * (i % 2 == 0 ? 0.6 : -0.6);
+                this.GhostNeedle(c, bx, cy, a, reach, PinWorld.ShaftLength * (1 - t * 0.5),
+                    fx.burstPreset[i] ? PinView.Gold : PinView.Jade, (int)(230 * (1 - t)));
+            }
         }
-        this.Halo(c, cx, cy, game.rotation);
-        this.Impact(c, game, cx, cy);
+        double grow = game.Armed() ? 1.0 : Easing.Evaluate(EaseType.CubicOut, 1.0 - game.interludeMs / (double)PinWorld.InterludeMs);
+        double fly = fx.FlyOut();
         for (int i = 0; i < game.pins.Count; i = i + 1) {
             Pin p = game.pins[i];
-            this.Needle(c, cx, cy, p.angle + game.rotation, PinWorld.PinRadius, p.preset, false);
+            double a = p.angle + rotation;
+            if (fly > 0) {
+                double reach = PinWorld.PinRadius + fly * fly * 300;
+                this.GhostNeedle(c, rx, ry, a, reach, PinWorld.ShaftLength, p.preset ? PinView.Gold : PinView.Jade, (int)(255 * (1 - fly)));
+            } else if (grow < 1.0) {
+                double r = PinWorld.DiskRadius + (PinWorld.PinRadius - PinWorld.DiskRadius) * grow;
+                this.GhostNeedle(c, rx, ry, a, r, (r - PinWorld.DiskRadius) * 0.98, p.preset ? PinView.Gold : PinView.Jade, (int)(80 + 175 * grow));
+            } else {
+                this.Needle(c, rx, ry, a, PinWorld.PinRadius, p.preset, false);
+                // Clear flourish: a glint runs round the pins before they fly.
+                if (fx.clearing && fx.clearMs < 640 && i * 50 <= fx.clearMs && fx.clearMs < i * 50 + 160) {
+                    int hx = rx + this.Gp(Math.Cos(a) * PinWorld.PinRadius);
+                    int hy = ry + this.Gp(Math.Sin(a) * PinWorld.PinRadius);
+                    this.Circle(c, hx, hy, this.Gp(14), PinView.Paper, 90);
+                    this.Ring(c, hx, hy, this.Gp(17), this.Dp(2), PinView.Gold, 200);
+                }
+            }
         }
-        if (game.state == RoundState.Playing || game.flying) {
+        if (game.state == RoundState.Playing) {
             int ly = this.ActionY();
             this.Ring(c, this.CenterX(), ly, this.Dp(27), this.Dp(1), PinView.Gold, 90);
             this.Ring(c, this.CenterX(), ly, this.Dp(32), this.Dp(1), PinView.Jade, 50);
             if (game.flying) {
                 int fy = cy + this.Gp(game.shotRadius);
-                this.Line(c, cx, fy + this.Dp(16), cx, fy + this.Dp(38), this.Dp(4), PinView.Jade, 64);
+                this.Line(c, cx, fy + this.Dp(16), cx, fy + this.Dp(44), this.Dp(5), PinView.Jade, 54);
+                this.Line(c, cx, fy + this.Dp(16), cx, fy + this.Dp(30), this.Dp(3), PinView.Paper, 70);
+                this.Needle(c, cx, cy, PinWorld.Down, game.shotRadius, false, false);
+            } else if (game.Armed()) {
+                this.Needle(c, cx, cy, PinWorld.Down, PinWorld.LaunchRadius, false, false);
+            } else {
+                // Reloading between boss rings: a gold arc fills around the launcher.
+                double k = 1.0 - game.interludeMs / (double)PinWorld.InterludeMs;
+                this.Arc(c, this.CenterX(), ly, 22, -PinWorld.Down, PinWorld.Tau * k, PinView.Gold, 220);
             }
-            this.Needle(c, cx, cy, PinWorld.Down, game.flying ? game.shotRadius : PinWorld.LaunchRadius,
-                false, game.state == RoundState.Failed);
+        } else if (fx.failing) {
+            // The deflected needle tumbles away in slow motion.
+            double a = PinWorld.Down + fx.needleAngle;
+            int hx = cx + this.Gp(fx.needleX);
+            int hy = cy + this.Gp(fx.needleY);
+            this.Line(c, hx, hy, hx - this.Gp(Math.Cos(a) * PinWorld.ShaftLength), hy - this.Gp(Math.Sin(a) * PinWorld.ShaftLength),
+                this.Gp(PinWorld.ShaftWidth), PinView.Danger, 255);
+            this.Orb(c, hx, hy, false, true);
         }
-        this.Rotor(c, cx, cy, game.rotation);
+        int rings = game.PhaseCount() - game.phase - 1;
+        if (game.state == RoundState.Cleared) { rings = 0; }
+        double pulse = fx.ringMs > 0 ? 1.0 + 0.07 * Math.Sin(fx.ringMs / 280.0 * 3.14159) : 1.0;
+        this.Rotor(c, rx, ry, rotation, pulse, rings);
+        this.Sparks(c, cx, cy);
+        if (fx.flashMs > 0) {
+            int alpha = fx.flashMs * 90 / 420;
+            CDraw.FillVGrad(c, 0, 0, this.w, this.h / 5, CDraw.Argb(alpha, 255, 90, 70), CDraw.Argb(0, 255, 90, 70));
+            CDraw.FillVGrad(c, 0, this.h * 4 / 5, this.w, this.h / 5, CDraw.Argb(0, 255, 90, 70), CDraw.Argb(alpha, 255, 90, 70));
+        }
     }
 
     void Menu(Canvas c, double timeMs, PinWorld game) {
@@ -194,13 +297,25 @@ public class PinView {
         int cx = this.CenterX();
         int cy = this.CenterY() + this.Dp(36);
         double rotation = timeMs / 3200.0;
-        this.Halo(c, cx, cy, rotation);
+        this.Halo(c, cx, cy, rotation, false, 0);
         for (int i = 0; i < 9; i = i + 1) {
             this.Needle(c, cx, cy, i * PinWorld.Tau / 9.0 + rotation, PinWorld.PinRadius, i % 3 != 0, false);
         }
-        this.Rotor(c, cx, cy, rotation);
+        this.Rotor(c, cx, cy, rotation, 1.0, 0);
         double breathe = Math.Sin(timeMs / 800.0) * 0.5 + 0.5;
         this.Ring(c, cx, this.MenuActionY(), this.Dp(54 + breathe * 4), this.Dp(1), PinView.Jade, (int)(30 + breathe * 40));
+    }
+
+    // Level select: the dial idles behind the grid as a slow brass orrery.
+    void SelectBackdrop(Canvas c, int timeMs) {
+        this.DrawBackground(c);
+        int cx = this.CenterX();
+        int cy = this.h / 2;
+        double rotation = timeMs / 5200.0;
+        this.Ring(c, cx, cy, this.Gp(250), this.Dp(1), PinView.Gold, 34);
+        this.Ring(c, cx, cy, this.Gp(300), this.Dp(1), PinView.Jade, 22);
+        this.Arc(c, cx, cy, 250, rotation, 0.8, PinView.Gold, 70);
+        this.Arc(c, cx, cy, 300, -rotation * 0.7 + 2.0, 0.6, PinView.Jade, 60);
     }
 
     void Result(Canvas c, PinWorld game, bool paused, int timeMs) {

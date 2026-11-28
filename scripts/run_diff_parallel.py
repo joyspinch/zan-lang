@@ -226,10 +226,47 @@ def run_case(case, a):
     return (case, why)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_DIAG_LOC_RE = re.compile(r"^.*?:\d+:\d+:\s*(error|warning):\s*(.+)$")
+_DIAG_BARE_RE = re.compile(r"^(error|warning):\s*(.+)$")
+_DIAG_CODE_RE = re.compile(r"^\[([EW]\d{4})\]\s*(.*)$")
+
+
+def extract_diag_signatures(text):
+    """Normalize compiler diagnostics to '<CODE>: <summary>' (or 'NONE: <summary>'),
+    stripping ANSI escapes and file/line/col positions (B-ID188)."""
+    clean = _ANSI_RE.sub("", text)
+    sigs = []
+    for raw in clean.splitlines():
+        line = raw.strip()
+        m = _DIAG_LOC_RE.match(line) or _DIAG_BARE_RE.match(line)
+        if not m:
+            continue
+        msg = m.group(2).strip()
+        cm = _DIAG_CODE_RE.match(msg)
+        if cm:
+            sigs.append("%s: %s" % (cm.group(1), cm.group(2)))
+        else:
+            sigs.append("NONE: %s" % msg)
+    return sigs
+
+
+def load_stderr_golden(path):
+    sigs = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            s = raw.strip()
+            if s == "" or s.startswith("#"):
+                continue
+            sigs.append(s)
+    return sigs
+
+
 def run_focused_reject(name, text, hosttext, count, a):
     src = os.path.join(a.reject_dir, name + ".zan")
     helper = os.path.join(a.reject_dir, name + "_helper.zan")
     extras = [helper] if os.path.isfile(helper) else []
+    golden_path = os.path.join(a.reject_dir, name + ".stderr")
     failures = []
     for compiler in ("host", "gen1"):
         output = os.path.join(a.outdir, "reject_%s.%s" % (name, "host.exe" if compiler == "host" else "ll"))
@@ -238,7 +275,7 @@ def run_focused_reject(name, text, hosttext, count, a):
         command = ([a.zanc, src] + extras + ["--auto-stdlib", "--package-project", a.workdir, "-o", output]
                    if compiler == "host" else [a.gen1, output, src] + extras)
         rc, out, err = stage(a, name + "." + compiler + ".reject", command, a.emit_timeout)
-        diagnostic = re.sub(r"\x1b\[[0-9;]*m", "", out + "\n" + err)
+        diagnostic = _ANSI_RE.sub("", out + "\n" + err)
         expected = hosttext if compiler == "host" else text
         if rc < 1 or rc > 125:
             failures.append("%s must reject normally, got exit %d" % (compiler, rc))
@@ -249,6 +286,12 @@ def run_focused_reject(name, text, hosttext, count, a):
         actual_count = len(re.findall(r"^.*:\d+:\d+:\s*error:", diagnostic, re.MULTILINE))
         if actual_count != count:
             failures.append("%s emitted %d diagnostic(s), expected %d" % (compiler, actual_count, count))
+        if compiler == "gen1" and os.path.isfile(golden_path):
+            expected_sigs = load_stderr_golden(golden_path)
+            actual_sigs = extract_diag_signatures(diagnostic)
+            if actual_sigs != expected_sigs:
+                failures.append("gen1 stderr golden mismatch (%s): expected %r, got %r"
+                                % (golden_path, expected_sigs, actual_sigs))
     if failures:
         return "reject", name, "FAIL", "\n".join(failures)
     log("-- REJECT %s: host/gen1 refused with matching diagnostic and count %d" % (name, count))
@@ -261,6 +304,10 @@ def run_reject(name, text, hosttext, a):
     src = os.path.join(a.reject_dir, name + ".zan")
     if not os.path.exists(src):
         return ("fatal", "reject case source not found: %s" % src)
+    golden_path = os.path.join(a.reject_dir, name + ".stderr")
+    if not os.path.exists(golden_path):
+        return ("reject", name, "FAIL",
+                "missing reject stderr golden: %s (B-ID188)" % golden_path)
     extra = os.path.join(a.reject_dir, name + "_helper.zan")
     extra_args = [extra] if os.path.exists(extra) else []
     ll = os.path.join(a.outdir, "reject_%s.ll" % name)
@@ -275,10 +322,21 @@ def run_reject(name, text, hosttext, a):
         return ("reject", name, "FAIL", "the self-hosted compiler accepted a program it must reject")
     if os.path.exists(ll):
         return ("reject", name, "FAIL", "the self-hosted compiler wrote IR for a program it must reject")
-    if text != "" and text not in (out + err):
+    combined = out + "\n" + err
+    expected_sigs = load_stderr_golden(golden_path)
+    actual_sigs = extract_diag_signatures(combined)
+    if not expected_sigs:
+        return ("reject", name, "FAIL",
+                "empty reject stderr golden: %s (B-ID188)" % golden_path)
+    if actual_sigs != expected_sigs:
+        return ("reject", name, "FAIL",
+                "stderr golden mismatch (%s):\n  expected: %r\n  actual:   %r"
+                % (golden_path, expected_sigs, actual_sigs))
+    if text != "" and text not in combined:
         return ("reject", name, "FAIL",
                 "the diagnostic does not contain '%s' -- refused for another reason" % text)
-    log("-- REJECT %s: refused as expected" % name)
+    log("-- REJECT %s: refused as expected (matched %d golden diagnostic(s))"
+        % (name, len(expected_sigs)))
 
     if hosttext != "":
         hexe = os.path.join(a.outdir, "reject_%s_host.exe" % name)
@@ -325,8 +383,8 @@ def main():
     ap.add_argument("--run-timeout", type=int, default=30)
     a = ap.parse_args()
 
-    if not a.focus and not a.cases:
-        ap.error("--cases is required unless --focus is supplied")
+    if not a.focus and not a.cases and not a.rejects:
+        ap.error("--cases or --rejects is required unless --focus is supplied")
     if a.only and not a.focus:
         ap.error("--only requires --focus")
     if a.focus and (not a.clang or not a.rtobjs or not a.log_dir):
@@ -466,6 +524,9 @@ def main():
             inputs += case_helpers(a.case_dir, case)
         for name, _, _ in rejects:
             inputs.append(os.path.join(a.reject_dir, name + ".zan"))
+            stderr_golden = os.path.join(a.reject_dir, name + ".stderr")
+            if os.path.isfile(stderr_golden):
+                inputs.append(stderr_golden)
             helper = os.path.join(a.reject_dir, name + "_helper.zan")
             if os.path.isfile(helper):
                 inputs.append(helper)

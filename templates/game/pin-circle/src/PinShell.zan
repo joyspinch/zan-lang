@@ -4,14 +4,19 @@ using Game.Foundation;
 
 namespace PinCircle;
 
-// App-layer shell: player profile (best cleared level, plays, pins) and
-// procedural sound effects. The simulation (PinWorld / PinSim) never sees it,
+// App-layer shell: player profile (best cleared level, per-level stars,
+// plays, pins) and procedural sound effects. The simulation (PinWorld / PinSim) never sees it,
 // so headless replays stay free of audio, clocks and save files.
 public class PinShell {
     GameProfile profile;
     AudioBus bus;
     SfxBank sfx;
     bool lastNewBest;
+    bool lastNewStars;
+    int lastStars;
+    int attemptLevel;
+    int attempts;
+    bool unlockAll;
 
     PinShell() {
         this.profile = GameProfile.Open("pin-circle");
@@ -28,6 +33,17 @@ public class PinShell {
         this.sfx.AddSynth("clank", SfxPresets.Hit().WithDuration(0.08));
         this.sfx.AddSynth("reverse", SfxPresets.Select().WithSweep(760.0, 430.0).WithDuration(0.09).WithGain(0.16));
         this.sfx.AddSynth("surge", SfxPresets.Select().WithSweep(430.0, 760.0).WithDuration(0.07).WithGain(0.12));
+        // Juice: a glassy "close!" chime, a warning tick before a sudden
+        // reversal, the boss ring shattering, star pops and a slow-mo groan.
+        this.sfx.AddSynth("close", SfxPresets.Coin().WithSweep(2100.0, 2900.0).WithDuration(0.07).WithGain(0.22));
+        this.sfx.AddSynth("warn", SfxPresets.Select().WithSweep(980.0, 980.0).WithDuration(0.035).WithGain(0.10));
+        this.sfx.AddSynth("shatter", SfxPresets.Explode().WithSweep(520.0, 140.0).WithDuration(0.22).WithGain(0.30));
+        this.sfx.AddSynth("star1", SfxPresets.Coin().WithSweep(880.0, 1320.0).WithDuration(0.09));
+        this.sfx.AddSynth("star2", SfxPresets.Coin().WithSweep(1100.0, 1650.0).WithDuration(0.09));
+        this.sfx.AddSynth("star3", SfxPresets.Coin().WithSweep(1320.0, 1980.0).WithDuration(0.12));
+        this.sfx.AddSynth("slowmo", SfxPresets.Hit().WithSweep(240.0, 70.0).WithDuration(0.42).WithGain(0.28));
+        // Debug only, off by default: PIN_UNLOCK_ALL=1 opens every level (captures/QA).
+        this.unlockAll = Interop.EnvVar("PIN_UNLOCK_ALL") == "1";
         this.bus.SetSfxMuted(this.profile.Flag("muted", false));
         this.sfx.Warm();
     }
@@ -55,6 +71,41 @@ public class PinShell {
     }
 
     long BestLevel() { return this.profile.Best("level"); }
+    int Stars(int level) { return (int)this.profile.Best("stars" + level); }
+    int LastStars() { return this.lastStars; }
+    bool NewStars() { return this.lastNewStars; }
+    int Attempts() { return this.attempts; }
+    long Closes() { return this.profile.Counter("closes"); }
+
+    // Highest level the player may start: one past the best clear.
+    int Unlocked() {
+        if (this.unlockAll) { return PinLevels.Count; }
+        int open = (int)this.BestLevel() + 1;
+        return open > PinLevels.Count ? PinLevels.Count : open;
+    }
+
+    // The level "continue" starts: the first unlocked level without a clear.
+    int NextLevel() { return this.Unlocked(); }
+
+    int TotalStars() {
+        int total = 0;
+        for (int i = 1; i <= PinLevels.Count; i = i + 1) { total = total + this.Stars(i); }
+        return total;
+    }
+
+    // Each StartRound passes through here; retries of the same level count up.
+    void BeginAttempt(int level) {
+        if (level != this.attemptLevel) {
+            this.attemptLevel = level;
+            this.attempts = 0;
+        }
+        this.attempts = this.attempts + 1;
+    }
+
+    // Stars: 1 for the clear, +1 with no retry, +1 inside the par time.
+    static int Score(bool firstTry, int elapsedMs, int parMs) {
+        return 1 + (firstTry ? 1 : 0) + (elapsedMs <= parMs ? 1 : 0);
+    }
     long Plays() { return this.profile.Counter("plays"); }
     long Pins() { return this.profile.Counter("pins"); }
     bool NewBest() { return this.lastNewBest; }
@@ -65,10 +116,13 @@ public class PinShell {
     }
 
     // Records one finished round; returns true when it set a new best cleared level.
-    bool RecordRound(int level, int inserted, bool won) {
+    bool RecordRound(int level, int inserted, bool won, int elapsedMs, int parMs, int closes) {
         this.profile.Add("pins", inserted);
+        this.profile.Add("closes", closes);
+        this.lastStars = won ? PinShell.Score(this.attempts <= 1, elapsedMs, parMs) : 0;
+        this.lastNewStars = won && this.profile.SubmitBest("stars" + level, this.lastStars);
         this.lastNewBest = won && this.profile.SubmitBest("level", level);
-        if (!this.lastNewBest) { this.profile.Save(); }
+        if (!this.lastNewBest && !this.lastNewStars) { this.profile.Save(); }
         return this.lastNewBest;
     }
 }

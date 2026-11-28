@@ -5,12 +5,11 @@ using Game.Foundation;
 // 固定 16ms 一帧推进。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是
 // 模糊测试用的机器人。改了手感或 AI 后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 保持上一帧的方向；1..16 转向第 (输入-1) 个方向（16 等分圆周，0 = 向右，
-// 顺时针）；17..32 同上并按住冲刺；99 阵亡后重开一局。
+// 输入编码：0 保持上一帧的操作；1..16 转向第 (输入-1) 个方向（16 等分圆周，0 = 向右，
+// 顺时针）；17..32 同上并按住冲刺；33 自动驾驶（避险、避墙、抢道具、吃豆）；
+// 34 自动驾驶并在追道具时冲刺；99 阵亡后重开一局。
 public class SnakeSim : IReplaySim {
     const int FrameMs = 16;
-    static int[] DirX = new int[] { 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115, 0, 115, 212, 277 };
-    static int[] DirY = new int[] { 0, 115, 212, 277, 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115 };
     SnGame g;
     int now;
 
@@ -23,9 +22,13 @@ public class SnakeSim : IReplaySim {
     public void Step(int frame, int input) {
         if (input >= 1 && input <= 32) {
             int d = (input - 1) % 16;
-            g.mouseX = SnGame.VW() / 2 + SnakeSim.DirX[d];
-            g.mouseY = SnGame.VH() / 2 + SnakeSim.DirY[d];
+            g.autoMode = 0;
+            g.mouseX = SnGame.VW() / 2 + SnAi.DirX(d);
+            g.mouseY = SnGame.VH() / 2 + SnAi.DirY(d);
             g.boostKey = input > 16;
+        } else if (input == 33 || input == 34) {
+            g.autoMode = input - 32;
+            g.boostKey = false;
         } else if (input == 99 && g.over) {
             g.StartGame(now);
         }
@@ -36,10 +39,11 @@ public class SnakeSim : IReplaySim {
     public int StateChecksum() {
         StateHasher h = new StateHasher();
         h.Bool(g.over).Int(g.score.Get()).Int(g.kills).Int(g.fever)
-         .Int(g.me.headX).Int(g.me.headY).Int(g.me.length).Int(g.orbs.Count);
+         .Int(g.me.headX).Int(g.me.headY).Int(g.me.length).Int(g.orbs.Count)
+         .Int(g.threat).Int(g.rank).Int(g.magnetUntil).Int(g.shieldUntil).Int(g.doubleUntil).Int(g.aiDeaths);
         for (int i = 0; i < g.foes.Count; i = i + 1) {
             Worm w = g.foes[i];
-            h.Bool(w.alive).Int(w.headX).Int(w.headY).Int(w.length);
+            h.Bool(w.alive).Int(w.headX).Int(w.headY).Int(w.length).Int(w.score);
         }
         return h.Value();
     }
@@ -54,11 +58,51 @@ public class SnakeSim : IReplaySim {
     [Invariant]
     public bool LengthSane() { return g.me.length >= 14; }
 
-    // 机器人：每隔一阵换个方向，偶尔冲刺；阵亡后过一会儿重开
+    // 竞技场有边界：活着的蛇头一律在墙内
+    [Invariant]
+    public bool InsideArena() {
+        if (g.me.alive && SnGame.WallDist(g.me.headX / 256, g.me.headY / 256) < 0) { return false; }
+        for (int i = 0; i < g.foes.Count; i = i + 1) {
+            Worm w = g.foes[i];
+            if (w.alive && SnGame.WallDist(w.headX / 256, w.headY / 256) < 0) { return false; }
+        }
+        return true;
+    }
+
+    // 道具计时不超过各自时长；场上道具球最多 3 个
+    [Invariant]
+    public bool PowersSane() {
+        if (g.magnetUntil > g.simNow + SnSkins.PowerMs(1)) { return false; }
+        if (g.shieldUntil > g.simNow + SnSkins.PowerMs(2)) { return false; }
+        if (g.doubleUntil > g.simNow + SnSkins.PowerMs(3)) { return false; }
+        return g.PowerOrbCount() <= 3;
+    }
+
+    // 威胁等级与分数门槛一致（只升不降）；排名在 1..参赛数
+    [Invariant]
+    public bool ThreatAndRankSane() {
+        if (g.threat != SnGame.ThreatAt(g.score.Get())) { return false; }
+        return g.rank >= 1 && g.rank <= g.rankCount && g.board.Count <= 5;
+    }
+
+    // AI 长度不超上限；排行榜按分数降序
+    [Invariant]
+    public bool BoardSorted() {
+        for (int i = 1; i < g.board.Count; i = i + 1) {
+            if (g.board[i].score > g.board[i - 1].score) { return false; }
+        }
+        for (int i = 0; i < g.foes.Count; i = i + 1) {
+            if (g.foes[i].length > SnAi.MaxLen() + 2) { return false; }
+        }
+        return true;
+    }
+
+    // 机器人：大多数时候开自动驾驶（会抢道具、避墙），夹杂随机转向与冲刺；阵亡后过一会儿重开
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
-        if (roll < 8) { return 1 + rng.NextBelow(32); }
-        if (roll < 10) { return 99; }
+        if (roll < 3) { return 33 + rng.NextBelow(2); }
+        if (roll < 5) { return 1 + rng.NextBelow(32); }
+        if (roll < 7) { return 99; }
         return 0;
     }
 }

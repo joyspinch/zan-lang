@@ -5,8 +5,9 @@ using Game.Foundation.Gui;
 using Game.Kit;
 using Survivor;
 
-// 外壳：标题 → 对局 ⇄ 暂停 → 阵亡结算 → 再来一局。存档（最好成绩、局数、静音）
-// 与音效都只在这一层；SurvivorGame 是纯逻辑，回放仿真（SurvivorSim）照常无头跑。
+// 外壳：标题（选角）→ 对局 ⇄ 暂停，对局中升级三选一 → 阵亡结算 → 再来一局。
+// 存档（最好成绩、角色解锁、局数、静音、上次选的角色）与音效都只在这一层；
+// SurvivorGame 是纯逻辑，回放仿真（SurvivorSim）照常无头跑。
 public class SurvivorLoop : IGuiHostLoop {
     public SurvivorGame game;
     public SurvivorHud hud;
@@ -18,6 +19,13 @@ public class SurvivorLoop : IGuiHostLoop {
     double deathDelay;  // 阵亡到结算面板之间的停顿（秒）
     bool wasActive;
     bool hintRun;       // 本局显示新手提示
+    int hero;           // 选中的角色
+    long runSeed;
+    double clock;       // 表现用的连续时间（草摆动、符文呼吸）
+    double frameDt;
+    // 调试捷径（默认关闭）：SURVIVOR_DEBUG_WARP="秒,等级" 让新开的一局直接快进，用于截取后期画面
+    double warpSeconds;
+    int warpLevel;
     // 上一帧的事件计数（与 SurvivorGame 的只增计数比对出本帧发生了什么）
     int seenShots;
     int seenHits;
@@ -25,6 +33,11 @@ public class SurvivorLoop : IGuiHostLoop {
     int seenGems;
     int seenLevel;
     int seenHurts;
+    int seenZaps;
+    int seenBlasts;
+    int seenPickups;
+    int seenAnnounce;
+    bool seenChoosing;
 
     public void Start(GuiHost host) {
         this.host = host;
@@ -33,14 +46,30 @@ public class SurvivorLoop : IGuiHostLoop {
         this.bus = new AudioBus();
         this.bus.SetSfxMuted(this.profile.Flag("muted", false));
         this.sfx = new SfxBank(this.bus);
-        this.sfx.AddPresets(new string[]{ "click", "select", "hit", "coin", "powerup", "fail" });
-        // 本作专属音色：短促低音量的射击声、更闷的击杀爆裂、低频嗡鸣的受伤
-        this.sfx.AddSynth("shot", SfxPresets.Launch().WithSweep(900.0, 520.0).WithDuration(0.035).WithGain(0.08));
-        this.sfx.AddSynth("kill", SfxPresets.Explode().WithDuration(0.07).WithGain(0.26));
+        this.sfx.AddPresets(new string[]{ "click", "select", "coin", "powerup", "fail", "success" });
+        // 本作专属音色：短促低音量的射击、闷响击杀、低频受伤、电弧、爆炸、首领号角
+        this.sfx.AddSynth("shot", SfxPresets.Launch().WithSweep(900.0, 520.0).WithDuration(0.035).WithGain(0.07));
+        this.sfx.AddSynth("hit", SfxPresets.Hit().WithDuration(0.025).WithGain(0.18));
+        this.sfx.AddSynth("kill", SfxPresets.Explode().WithDuration(0.07).WithGain(0.22));
         this.sfx.AddSynth("hurt", SfxPresets.Error().WithFrequency(110.0).WithDuration(0.12).WithGain(0.22));
+        this.sfx.AddSynth("zap", SfxPresets.Launch().WithSweep(2400.0, 300.0).WithDuration(0.09).WithGain(0.12));
+        this.sfx.AddSynth("blast", SfxPresets.Explode().WithDuration(0.22).WithGain(0.3));
+        this.sfx.AddSynth("gem", SfxPresets.Coin().WithSweep(1400.0, 2100.0).WithDuration(0.03).WithGain(0.08));
+        this.sfx.AddSynth("boss", SfxPresets.Fail().WithSweep(160.0, 70.0).WithDuration(0.6).WithGain(0.3));
+        this.sfx.AddSynth("levelup", SfxPresets.PowerUp().WithSweep(520.0, 1560.0).WithDuration(0.28).WithGain(0.26));
         this.sfx.Warm();
 
-        this.game = SurvivorGame.Create();
+        string warp = Environment.GetEnvironmentVariable("SURVIVOR_DEBUG_WARP");
+        if (warp != "") {
+            int comma = warp.IndexOf(",");
+            string secs = comma > 0 ? warp.Substring(0, comma) : warp;
+            this.warpSeconds = Convert.ToDouble(secs);
+            this.warpLevel = comma > 0 ? Convert.ToInt32(warp.Substring(comma + 1)) : 1;
+        }
+        this.hero = (int)this.profile.Counter("hero");
+        if (!this.HeroUnlocked(this.hero)) { this.hero = 0; }
+        this.runSeed = this.profile.Counter("plays") * 7919 + 20261127;
+        this.game = SurvivorGame.Create(this.runSeed, this.hero);
         this.hud = new SurvivorHud(host.App(), this.game);
         this.WireMenu();
         this.wasActive = true;
@@ -58,48 +87,92 @@ public class SurvivorLoop : IGuiHostLoop {
         m.menu.OnClick(() => { this.ShowTitle(); });
     }
 
+    long BestSeconds() { return this.profile.HasBest("time") ? this.profile.Best("time") : 0; }
+
+    bool HeroUnlocked(int id) {
+        return id >= 0 && id < SurvivorData.CharacterCount && this.BestSeconds() >= (long)SurvivorData.CharacterUnlockSeconds(id);
+    }
+
     string BestText() {
         if (!this.profile.HasBest("time")) { return "BEST: no runs yet"; }
-        return "BEST: " + SurvivorHud.Clock((double)this.profile.Best("time")) + " survived  |  "
-            + Convert.ToString(this.profile.Best("kills")) + " kills  |  LV. "
-            + Convert.ToString(this.profile.Best("level"));
+        return "BEST  " + SurvivorHud.Clock((double)this.profile.Best("time")) + "   |   "
+            + Convert.ToString(this.profile.Best("kills")) + " kills   |   LV " + Convert.ToString(this.profile.Best("level"));
+    }
+
+    string NextUnlockText() {
+        for (int i = 1; i < SurvivorData.CharacterCount; i = i + 1) {
+            if (!this.HeroUnlocked(i)) {
+                return "Next unlock: " + SurvivorData.CharacterName(i) + " at " + SurvivorHud.Clock((double)SurvivorData.CharacterUnlockSeconds(i))
+                    + " survived";
+            }
+        }
+        return "All heroes unlocked. Can you outlast the Abyss Warden?";
     }
 
     void RefreshMeta() { this.hud.SetMeta(this.BestText(), this.bus.IsSfxMuted()); }
 
     void ShowTitle() {
-        if (this.state == 1 || this.state == 2) { this.sfx.Play("click"); }
+        if (this.state == 1 || this.state == 2 || this.state == 4) { this.sfx.Play("click"); }
         this.state = 0;
         this.game.ReleaseKeys();
+        // 标题背景：所选角色站在空旷的墓野里
+        this.game = SurvivorGame.Create(this.runSeed, this.hero);
+        this.hud.SetGame(this.game);
         this.hud.ShowHint(false);
+        this.hud.ShowPlay(false);
         this.RefreshMeta();
         this.hud.menu.Show(SurvivorMenu.ModeTitle, "SURVIVOR", false, new string[]{
-            "Survive the endless horde as long as you can.",
-            "MOVE      WASD / ARROW KEYS",
-            "ATTACK    automatic - aims at the nearest enemy",
-            "LEVEL UP  grab cyan gems: full heal, faster fire",
-            "P / ESC pause     M mute     ENTER start",
-            "",
-            this.BestText()
-        }, new string[]{ "", "key", "key", "key", "dim", "", "accent" });
+            "Hold out against the endless dead. Every level makes you stronger.",
+            "WASD / ARROWS move   -   weapons fire on their own   -   P pause   -   M mute",
+            this.BestText(),
+            this.NextUnlockText()
+        }, new string[]{ "", "dim", "accent", "dim" }, new int[]{ 100, 136, 420, 450 });
+        this.hud.menu.SetHeroes(this.hero, this.BestSeconds());
+    }
+
+    void SelectHero(int id) {
+        if (!this.HeroUnlocked(id) || id == this.hero) { return; }
+        this.hero = id;
+        this.profile.Add("hero", (long)id - this.profile.Counter("hero"));
+        this.profile.Save();
+        this.sfx.Play("select");
+        this.game = SurvivorGame.Create(this.runSeed, this.hero);
+        this.hud.SetGame(this.game);
+        this.hud.menu.SetHeroes(this.hero, this.BestSeconds());
+    }
+
+    void CycleHero(int delta) {
+        for (int k = 1; k <= SurvivorData.CharacterCount; k = k + 1) {
+            int id = (this.hero + delta * k + SurvivorData.CharacterCount * 4) % SurvivorData.CharacterCount;
+            if (this.HeroUnlocked(id)) { this.SelectHero(id); return; }
+        }
     }
 
     void StartRun() {
         this.sfx.Play("select");
-        this.game = SurvivorGame.Create();
+        this.runSeed = this.profile.Counter("plays") * 7919 + 20261127;
+        this.game = SurvivorGame.Create(this.runSeed, this.hero);
+        if (this.warpSeconds > 0.0) { this.game.DebugWarp(this.warpSeconds, this.warpLevel); }
+        if (Environment.GetEnvironmentVariable("SURVIVOR_DEBUG_LEVELUP") != "") { this.game.DebugLevelUp(); }
         this.hud.SetGame(this.game);
         this.seenShots = 0;
         this.seenHits = 0;
-        this.seenKills = 0;
+        this.seenKills = this.game.killCount;
         this.seenGems = 0;
         this.seenLevel = this.game.level;
         this.seenHurts = 0;
+        this.seenZaps = 0;
+        this.seenBlasts = 0;
+        this.seenPickups = 0;
+        this.seenAnnounce = 0;
+        this.seenChoosing = false;
         this.deathDelay = 0.0;
         // 首局（档案里还没有完整局）开头几秒显示操作提示
         this.hintRun = this.profile.Counter("plays") == 0;
         this.profile.Add("plays", 1);
         this.profile.Save();
         this.hud.menu.Hide();
+        this.hud.ShowPlay(true);
         this.state = 1;
     }
 
@@ -110,14 +183,13 @@ public class SurvivorLoop : IGuiHostLoop {
         this.hud.ShowHint(false);
         this.sfx.Play("click");
         this.hud.menu.Show(SurvivorMenu.ModePause, "PAUSED", false, new string[]{
-            "",
-            "TIME  " + SurvivorHud.Clock(this.game.gameTime) + "     KILLS  " + Convert.ToString(this.game.killCount)
-                + "     LV. " + Convert.ToString(this.game.level),
-            "HP  " + Convert.ToString(this.game.playerHp) + " / " + Convert.ToString(this.game.playerMaxHp),
-            "",
-            "P / ESC resume     R restart     Q quit to menu",
-            "M toggles sound"
-        }, new string[]{ "", "accent", "", "", "dim", "dim" });
+            "TIME  " + SurvivorHud.Clock(this.game.gameTime) + "      KILLS  " + Convert.ToString(this.game.killCount)
+                + "      LV " + Convert.ToString(this.game.level),
+            "HP  " + Convert.ToString(this.game.playerHp) + " / " + Convert.ToString(this.game.playerMaxHp)
+                + "      " + SurvivorData.CharacterName(this.game.character),
+            "P / ESC resume      R restart      Q quit to title      M sound"
+        }, new string[]{ "accent", "", "dim" }, new int[]{ 108, 140, 312 });
+        this.hud.menu.ShowBuild(this.game, false, 210);
     }
 
     void Resume() {
@@ -129,30 +201,41 @@ public class SurvivorLoop : IGuiHostLoop {
 
     void ShowResults() {
         this.state = 4;
+        long bestBefore = this.BestSeconds();
         int secs = (int)this.game.gameTime;
         bool newTime = this.profile.SubmitBest("time", secs);
         bool newKills = this.profile.SubmitBest("kills", this.game.killCount);
         bool newLevel = this.profile.SubmitBest("level", this.game.level);
         this.profile.Add("kills_total", this.game.killCount);
+        this.profile.Add("bosses_total", this.game.bossKills);
         this.profile.Save();
         string record = "";
         if (newTime && newKills) { record = "NEW BEST TIME & KILLS!"; }
         else if (newTime) { record = "NEW BEST TIME!"; }
         else if (newKills) { record = "NEW BEST KILLS!"; }
         else if (newLevel) { record = "NEW BEST LEVEL!"; }
-        if (record != "") { this.sfx.Play("powerup", 0.8); }
+        string unlock = "";
+        for (int i = 1; i < SurvivorData.CharacterCount; i = i + 1) {
+            long need = (long)SurvivorData.CharacterUnlockSeconds(i);
+            if (bestBefore < need && this.BestSeconds() >= need) {
+                unlock = unlock == "" ? SurvivorData.CharacterName(i) : unlock + " & " + SurvivorData.CharacterName(i);
+            }
+        }
+        if (unlock != "") {
+            unlock = (unlock.Contains("&") ? "NEW HEROES UNLOCKED: " : "NEW HERO UNLOCKED: ") + unlock + "!";
+            this.sfx.Play("success");
+        }
+        else if (record != "") { this.sfx.Play("powerup", 0.8); }
         this.RefreshMeta();
+        string bosses = this.game.bossKills > 0 ? "      BOSSES  " + Convert.ToString(this.game.bossKills) : "";
         this.hud.menu.Show(SurvivorMenu.ModeResults, "YOU DIED", true, new string[]{
             "SURVIVED  " + SurvivorHud.Clock(this.game.gameTime),
-            "KILLS  " + Convert.ToString(this.game.killCount) + "     LEVEL  " + Convert.ToString(this.game.level),
-            record,
-            "BEST  " + SurvivorHud.Clock((double)this.profile.Best("time")) + "  |  "
-                + Convert.ToString(this.profile.Best("kills")) + " kills  |  LV. " + Convert.ToString(this.profile.Best("level")),
-            "RUN #" + Convert.ToString(this.profile.Counter("plays")) + "  -  "
-                + Convert.ToString(this.profile.Counter("kills_total")) + " kills all-time",
-            "",
-            "ENTER / R play again     ESC menu"
-        }, new string[]{ "accent", "", "key", "", "dim", "", "dim" });
+            "KILLS  " + Convert.ToString(this.game.killCount) + "      LEVEL  " + Convert.ToString(this.game.level) + bosses,
+            unlock != "" ? unlock : record,
+            this.BestText() + "      RUN #" + Convert.ToString(this.profile.Counter("plays")),
+            unlock != "" ? "" : this.NextUnlockText()
+        }, new string[]{ "big", "", unlock != "" ? "key" : "accent", "dim", "dim" }, new int[]{ 100, 150, 186, 438, 464 });
+        this.hud.menu.ShowBuild(this.game, true, 230);
     }
 
     void ToggleMute() {
@@ -161,6 +244,12 @@ public class SurvivorLoop : IGuiHostLoop {
         this.profile.SetFlag("muted", muted);
         if (!muted) { this.sfx.Play("click"); }
         this.RefreshMeta();
+    }
+
+    void Pick(int index) {
+        if (this.state != 1 || !this.game.choosing || !this.hud.cards.Ready()) { return; }
+        this.game.Choose(index);
+        this.sfx.Play("select");
     }
 
     public void Event(GuiHost host, int kind, int code) {
@@ -175,9 +264,19 @@ public class SurvivorLoop : IGuiHostLoop {
         if (this.state == 0) {
             if (code == 13 || code == 32) { this.StartRun(); }
             else if (code == 27) { host.RequestStop(); } // 标题页 ESC 退出游戏
+            else if (code == 37 || code == 65) { this.CycleHero(-1); }
+            else if (code == 39 || code == 68) { this.CycleHero(1); }
+            else if (code >= 49 && code <= 51) { this.SelectHero(code - 49); }
         } else if (this.state == 1) {
-            if (code == 27 || code == 80) { this.Pause(); } // ESC / P
-            else { this.game.OnKeyDown(code); }
+            if (code == 27 || code == 80) { this.Pause(); return; } // ESC / P
+            if (this.game.choosing) {
+                // 三选一：1/2/3 直接选，左右移动高亮，回车/空格确认；移动键照样记下按住状态
+                if (code >= 49 && code <= 51) { this.Pick(code - 49); return; }
+                if (code == 13 || code == 32) { this.Pick(this.hud.cards.selected); return; }
+                if (code == 37 || code == 65) { this.hud.cards.Move(-1); this.sfx.Play("click"); }
+                else if (code == 39 || code == 68) { this.hud.cards.Move(1); this.sfx.Play("click"); }
+            }
+            this.game.OnKeyDown(code);
         } else if (this.state == 2) {
             if (code == 27 || code == 80) { this.Resume(); }
             else if (code == 82) { this.StartRun(); }   // R
@@ -189,53 +288,71 @@ public class SurvivorLoop : IGuiHostLoop {
     }
 
     public void FixedUpdate(GuiHost host, int dt) {
-        // 标题、暂停、结算时世界静止；阵亡演出期间继续步进让震屏与跳字收尾
+        // 标题、暂停、结算时世界静止；阵亡演出期间继续步进让震屏与粒子收尾
         if (this.state == 1 || this.state == 3) {
             this.game.Tick((double)dt / 1000.0);
         }
     }
 
-    // 逻辑计数 → 音效（射击限频且很轻，避免割草时满屏噪音）
+    // 逻辑计数 → 音效（射击/命中限频且很轻，避免割草时满屏噪音）
     void PlayEvents() {
-        if (this.game.shotCount != this.seenShots) { this.sfx.Play("shot", 1.0, 90); }
-        if (this.game.killCount != this.seenKills) { this.sfx.Play("kill", 1.0, 60); }
-        else if (this.game.hitCount != this.seenHits) { this.sfx.Play("hit", 0.45, 70); }
-        if (this.game.gemCount != this.seenGems) { this.sfx.Play("coin", 0.7, 60); }
-        if (this.game.level != this.seenLevel) { this.sfx.Play("powerup"); }
-        if (this.game.hurtCount != this.seenHurts && !this.game.dead) { this.sfx.Play("hurt"); }
+        if (this.game.shotCount != this.seenShots) { this.sfx.Play("shot", 1.0, 110); }
+        if (this.game.killCount != this.seenKills) { this.sfx.Play("kill", 1.0, 70); }
+        else if (this.game.hitCount != this.seenHits) { this.sfx.Play("hit", 0.6, 80); }
+        if (this.game.gemCount != this.seenGems) { this.sfx.Play("gem", 0.8, 45); }
+        if (this.game.zapCount != this.seenZaps) { this.sfx.Play("zap", 1.0, 120); }
+        if (this.game.blastCount != this.seenBlasts) { this.sfx.Play("blast", 1.0, 90); }
+        if (this.game.pickupCount != this.seenPickups) { this.sfx.Play("powerup", 0.7); }
+        if (this.game.announceSerial != this.seenAnnounce && this.game.bossIndex >= 0 && this.seenAnnounce >= 0) {
+            if (this.game.announce.Contains("AWAKENS") || this.game.announce.Contains("RISES")) { this.sfx.Play("boss"); }
+        }
+        if (this.game.choosing && !this.seenChoosing) { this.sfx.Play("levelup"); }
+        if (this.game.hurtCount != this.seenHurts && !this.game.dead) { this.sfx.Play("hurt", 1.0, 120); }
         this.seenShots = this.game.shotCount;
         this.seenHits = this.game.hitCount;
         this.seenKills = this.game.killCount;
         this.seenGems = this.game.gemCount;
         this.seenLevel = this.game.level;
         this.seenHurts = this.game.hurtCount;
+        this.seenZaps = this.game.zapCount;
+        this.seenBlasts = this.game.blastCount;
+        this.seenPickups = this.game.pickupCount;
+        this.seenAnnounce = this.game.announceSerial;
+        this.seenChoosing = this.game.choosing;
     }
 
     public void Update(GuiHost host, int dt) {
+        this.frameDt = (double)dt / 1000.0;
+        this.clock = this.clock + this.frameDt;
         // 失焦/最小化自动暂停：割草游戏切走几秒回来就被围死了
         bool active = host.WindowActive();
         if (this.wasActive && !active) { this.Pause(); }
         this.wasActive = active;
 
-        if (this.state == 1) {
+        if (this.state == 0) {
+            int h = this.hud.menu.TakeHeroClick();
+            if (h >= 0) { this.SelectHero(h); }
+        } else if (this.state == 1) {
+            int c = this.hud.cards.TakeClick();
+            if (c >= 0) { this.Pick(c); }
             this.PlayEvents();
-            this.hud.ShowHint(this.hintRun && this.game.gameTime < 8.0);
+            this.hud.ShowHint(this.hintRun && this.game.gameTime < 10.0 && !this.game.choosing);
             if (this.game.dead) {
                 this.sfx.Play("fail");
                 this.game.ReleaseKeys();
                 this.hud.ShowHint(false);
                 this.state = 3;
-                this.deathDelay = 1.2;
+                this.deathDelay = 1.4;
             }
         } else if (this.state == 3) {
-            this.deathDelay = this.deathDelay - (double)dt / 1000.0;
+            this.deathDelay = this.deathDelay - this.frameDt;
             if (this.deathDelay <= 0.0) { this.ShowResults(); }
         }
-        this.hud.SyncState(host.App());
+        this.hud.SyncState(host.App(), this.state == 1 ? this.frameDt : 0.0);
     }
 
     public void Render(GuiHost host, Canvas c, double alpha) {
-        this.game.Render(c);
+        this.game.Render(c, host.App().ContentTop(), this.clock);
         this.hud.Render(host.App());
     }
 

@@ -1,107 +1,104 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-using Game.Foundation.Gui;
+using Game.Foundation;
 using Game.Kit;
 using Game.Graphics;
 
 namespace Survivor;
 
-public class Enemy {
-    public double x;
-    public double y;
-    public int hp;
-    public int maxHp;
-    public double speed;
-    public bool active;
-    public int color;
-    public double radius;
+// 纯逻辑核心（无窗口、无音频、无时钟、无存档）：玩家、经验与三选一升级、刷怪波次、相机。
+// 武器/怪物/伤害在 SurvivorCombat.zan，绘制在 SurvivorRender.zan（同一个 partial class）。
+// 所有随机都来自种子：rng 管玩法，fx 管纯表现的粒子（改特效不会让回放分叉）。
+public partial class SurvivorGame {
+    public long seed;
+    public int character;
+    DeterministicRandom rng;
+    DeterministicRandom fx;
 
-    public Enemy(double x, double y, int hp, double speed, int color) {
-        this.x = x;
-        this.y = y;
-        this.hp = hp;
-        this.maxHp = hp;
-        this.speed = speed;
-        this.active = true;
-        this.color = color;
-        this.radius = 12.0;
-    }
-}
-
-public class Bullet {
-    public double x;
-    public double y;
-    public double vx;
-    public double vy;
-    public int damage;
-    public bool active;
-    public double lifetime;
-
-    public Bullet(double x, double y, double vx, double vy, int damage) {
-        this.x = x;
-        this.y = y;
-        this.vx = vx;
-        this.vy = vy;
-        this.damage = damage;
-        this.active = true;
-        this.lifetime = 2.0;
-    }
-}
-
-public class Gem {
-    public double x;
-    public double y;
-    public int expValue;
-    public bool active;
-
-    public Gem(double x, double y, int exp) {
-        this.x = x;
-        this.y = y;
-        this.expValue = exp;
-        this.active = true;
-    }
-}
-
-public class SurvivorGame {
+    // 玩家
     public double playerX;
     public double playerY;
-    public double playerSpeed;
+    public double baseSpeed;
+    public int baseMaxHp;
     public int playerHp;
     public int playerMaxHp;
+    public int facing;          // -1 朝左 / 1 朝右
+    public double walkPhase;    // 走路摆动相位
+    public bool moving;
+    public bool dead;
+    public double hurtTimer;    // 受击后的无敌时间
+    public double regenTimer;
+
+    // 成长
     public int level;
     public int exp;
     public int expToNext;
     public int killCount;
     public double gameTime;
+    public int[] weaponLv;
+    public int[] passiveLv;
+    public List<int> weaponOrder;   // 获得顺序（HUD 图标行与结算按这个排）
+    public List<int> passiveOrder;
+    public int[] weaponDamage;      // 每把武器本局造成的总伤害（结算页展示）
 
-    // 生死：接触伤害后有短暂无敌（hurtTimer > 0），血量归零即阵亡、逻辑冻结
-    public bool dead;
-    public double hurtTimer;
+    // 三选一升级：choosing 时世界冻结，等界面调用 Choose(i)
+    public bool choosing;
+    public int pendingLevels;
+    public int[] options;
+    public int optionCount;
+    public double levelFlash;       // 选完卡后的光环爆发（表现）
 
-    // 表现层事件计数（只增不减）：界面层逐帧比对差值来播音效，仿真本身不碰音频
+    // 表现层事件计数（只增不减）：外壳逐帧比对差值来播音效，仿真本身不碰音频
     public int shotCount;
     public int hitCount;
     public int gemCount;
     public int hurtCount;
+    public int zapCount;
+    public int blastCount;
+    public int pickupCount;
+    public int chooseCount;
+    public int bossKills;
+    public int eliteKills;
+
+    // 公告横幅（“首领苏醒”等），announceSerial 变化即新公告
+    public string announce;
+    public int announceSerial;
+    public double announceTimer;
+    public int bossIndex;           // 当前首领所在槽位，-1 = 无
 
     // 输入移动轴向
     public double moveX;
     public double moveY;
-    // 按住的方向键（W S A D 与 上 下 左 右 各一位），松开一个键时另一个仍按着就继续走
     bool[] held;
 
-    // 武器自动开火计时
-    public double shootCooldown;
-    public double shootTimer;
+    // 武器计时
+    double boltTimer;
+    double chainTimer;
+    double glaiveTimer;
+    double auraTimer;
+    public double bladeAngle;
+    public double auraPulse;
+    int chainSerial;
 
-    // 怪物波次生成计时
-    public double spawnCooldown;
-    public double spawnTimer;
+    // 波次
+    double spawnTimer;
+    int eventsDone;
+    double nextPeriodic;
+    int periodicCount;
+
+    // 相机中心（世界坐标）
+    public double camX;
+    public double camY;
 
     public List<Enemy> enemies;
-    public List<Bullet> bullets;
+    public List<Shot> shots;
+    public List<EnemyShot> enemyShots;
     public List<Gem> gems;
+    public List<Particle> particles;
+    public List<Zap> zaps;
+    public List<Blast> blasts;
+    int particleCursor;
 
     // 手感与视觉组件
     public GameFeel.ScreenShake shake;
@@ -109,61 +106,59 @@ public class SurvivorGame {
     public FloatingTextPool floatingTexts;
     public YSortQueue ySorter;
 
-    public SurvivorGame() {
-        this.playerX = 640.0;
-        this.playerY = 360.0;
-        this.playerSpeed = 160.0;
-        this.playerHp = 100;
-        this.playerMaxHp = 100;
+    public SurvivorGame(long seed, int character) {
+        this.seed = seed;
+        this.character = character < 0 || character >= SurvivorData.CharacterCount ? 0 : character;
+        this.rng = new DeterministicRandom(seed * 7919 + 17);
+        this.fx = new DeterministicRandom(seed * 104729 + 3);
+        this.playerX = SurvivorData.WorldW * 0.5;
+        this.playerY = SurvivorData.WorldH * 0.5;
+        this.camX = this.playerX;
+        this.camY = this.playerY;
+        this.baseSpeed = SurvivorData.CharacterSpeed(this.character);
+        this.baseMaxHp = SurvivorData.CharacterHp(this.character);
+        this.playerMaxHp = this.baseMaxHp;
+        this.playerHp = this.baseMaxHp;
+        this.facing = 1;
         this.level = 1;
         this.exp = 0;
-        this.expToNext = 50;
-        this.killCount = 0;
-        this.gameTime = 0.0;
-        this.dead = false;
-        this.hurtTimer = 0.0;
-        this.shotCount = 0;
-        this.hitCount = 0;
-        this.gemCount = 0;
-        this.hurtCount = 0;
+        this.expToNext = SurvivorData.ExpForLevel(1);
+        this.weaponLv = new int[SurvivorData.WeaponCount];
+        this.passiveLv = new int[SurvivorData.PassiveCount];
+        this.weaponDamage = new int[SurvivorData.WeaponCount];
+        this.weaponOrder = new List<int>();
+        this.passiveOrder = new List<int>();
+        this.options = new int[3];
+        this.optionCount = 0;
+        this.announce = "";
+        this.bossIndex = -1;
         this.held = new bool[8];
-
-        this.moveX = 0.0;
-        this.moveY = 0.0;
-
-        this.shootCooldown = 0.35;
-        this.shootTimer = 0.0;
-
-        this.spawnCooldown = 0.8;
-        this.spawnTimer = 0.0;
-
+        this.boltTimer = 0.4;
+        this.chainTimer = 1.0;
+        this.glaiveTimer = 0.8;
+        this.spawnTimer = 0.5;
+        this.nextPeriodic = 420.0;
         this.enemies = new List<Enemy>();
-        this.bullets = new List<Bullet>();
+        this.shots = new List<Shot>();
+        this.enemyShots = new List<EnemyShot>();
         this.gems = new List<Gem>();
-
+        this.particles = new List<Particle>();
+        for (int i = 0; i < 360; i = i + 1) { this.particles.Add(new Particle()); }
+        this.zaps = new List<Zap>();
+        this.blasts = new List<Blast>();
         this.shake = new GameFeel.ScreenShake();
+        this.shake.maxOffsetX = 14.0;
+        this.shake.maxOffsetY = 14.0;
         this.hitStop = new GameFeel.HitStop();
         this.floatingTexts = new FloatingTextPool(64);
-        this.ySorter = new YSortQueue(256);
+        this.ySorter = new YSortQueue(512);
+        this.AddWeapon(SurvivorData.CharacterWeapon(this.character));
     }
 
-    public static SurvivorGame Create() {
-        return new SurvivorGame();
-    }
+    public static SurvivorGame Create() { return new SurvivorGame(1, 0); }
+    public static SurvivorGame Create(long seed, int character) { return new SurvivorGame(seed, character); }
 
-    public void SpawnGem(double x, double y, int exp) {
-        for (int i = 0; i < gems.Count; i = i + 1) {
-            Gem g = gems[i];
-            if (!g.active) {
-                g.x = x;
-                g.y = y;
-                g.expValue = exp;
-                g.active = true;
-                return;
-            }
-        }
-        gems.Add(new Gem(x, y, exp));
-    }
+    // ---------------- 输入 ----------------
 
     // 键码 → held 下标：0..3 = W S A D，4..7 = 上 下 左 右；其余 -1
     static int KeySlot(int keyCode) {
@@ -178,7 +173,6 @@ public class SurvivorGame {
         return -1;
     }
 
-    // 是否是移动键（界面层据此决定按键归谁）
     public static bool IsMoveKey(int keyCode) { return SurvivorGame.KeySlot(keyCode) >= 0; }
 
     void ApplyHeld() {
@@ -204,333 +198,434 @@ public class SurvivorGame {
         ApplyHeld();
     }
 
-    // 暂停/失焦时松开全部方向键（抬键事件可能丢在别的窗口里）
     public void ReleaseKeys() {
         for (int i = 0; i < 8; i = i + 1) { held[i] = false; }
         moveX = 0.0;
         moveY = 0.0;
     }
 
-    // 生命比例 0..100（界面血条用）
+    // ---------------- 派生属性 ----------------
+
     public int HpPercent() { return playerMaxHp > 0 ? playerHp * 100 / playerMaxHp : 0; }
+    public double MoveSpeed() { return baseSpeed * (1.0 + 0.1 * (double)passiveLv[SurvivorData.PBoots]); }
+    public double MagnetRange() { return 90.0 * (1.0 + 0.4 * (double)passiveLv[SurvivorData.PMagnet]) + (character == 2 ? 24.0 : 0.0); }
+    public double CooldownMul() { return 1.0 - 0.08 * (double)passiveLv[SurvivorData.PHourglass]; }
+    public bool HasWeapon(int id) { return weaponLv[id] > 0; }
+
+    void AddWeapon(int id) {
+        if (weaponLv[id] == 0) { weaponOrder.Add(id); }
+        weaponLv[id] = weaponLv[id] + 1;
+    }
+
+    void AddPassive(int id) {
+        if (passiveLv[id] == 0) { passiveOrder.Add(id); }
+        passiveLv[id] = passiveLv[id] + 1;
+        if (id == SurvivorData.PHeart) {
+            playerMaxHp = baseMaxHp + 20 * passiveLv[id];
+            Heal(20);
+        }
+    }
+
+    public void Heal(int amount) {
+        if (dead || amount <= 0) { return; }
+        int before = playerHp;
+        playerHp = playerHp + amount;
+        if (playerHp > playerMaxHp) { playerHp = playerMaxHp; }
+        if (playerHp > before) { floatingTexts.SpawnHeal(playerX, playerY - 46.0, playerHp - before); }
+    }
+
+    // ---------------- 升级三选一 ----------------
+
+    public static bool OptionIsWeapon(int code) { return code >= 0 && code < 10; }
+    public static bool OptionIsPassive(int code) { return code >= 10 && code < 20; }
+
+    // 选项拿到后的等级（卡面上写“LV 3”或“NEW”）
+    public int OptionNextLevel(int code) {
+        if (SurvivorGame.OptionIsWeapon(code)) { return weaponLv[code] + 1; }
+        if (SurvivorGame.OptionIsPassive(code)) { return passiveLv[code - 10] + 1; }
+        return 0;
+    }
+
+    public static string OptionName(int code) {
+        if (SurvivorGame.OptionIsWeapon(code)) { return SurvivorData.WeaponName(code); }
+        if (SurvivorGame.OptionIsPassive(code)) { return SurvivorData.PassiveName(code - 10); }
+        return "Healing Draught";
+    }
+
+    public string OptionText(int code) {
+        int lv = this.OptionNextLevel(code);
+        if (SurvivorGame.OptionIsWeapon(code)) { return SurvivorData.WeaponText(code, lv); }
+        if (SurvivorGame.OptionIsPassive(code)) { return SurvivorData.PassiveText(code - 10, lv); }
+        return "Restore 40 HP. Everything is maxed out!";
+    }
+
+    void RollOptions() {
+        List<int> pool = new List<int>();
+        for (int w = 0; w < SurvivorData.WeaponCount; w = w + 1) {
+            if (weaponLv[w] > 0) {
+                if (weaponLv[w] < SurvivorData.WeaponMaxLevel(w)) { pool.Add(w); pool.Add(w); }
+            } else if (weaponOrder.Count < SurvivorData.MaxWeaponSlots) {
+                pool.Add(w);
+            }
+        }
+        for (int p = 0; p < SurvivorData.PassiveCount; p = p + 1) {
+            if (passiveLv[p] > 0) {
+                if (passiveLv[p] < SurvivorData.PassiveMaxLevel(p)) { pool.Add(10 + p); }
+            } else if (passiveOrder.Count < SurvivorData.MaxPassiveSlots) {
+                pool.Add(10 + p);
+            }
+        }
+        optionCount = 0;
+        while (optionCount < 3 && pool.Count > 0) {
+            int pick = pool[rng.NextBelow(pool.Count)];
+            options[optionCount] = pick;
+            optionCount = optionCount + 1;
+            // 同一项可能在池里出现两次（已有武器加权），选中后全部移除
+            for (int k = pool.Count - 1; k >= 0; k = k - 1) {
+                if (pool[k] == pick) { pool.RemoveAt(k); }
+            }
+        }
+        if (optionCount == 0) {
+            options[0] = SurvivorData.OptionHeal;
+            optionCount = 1;
+        }
+    }
+
+    void BeginChoice() {
+        if (choosing || pendingLevels <= 0) { return; }
+        choosing = true;
+        RollOptions();
+    }
+
+    // 选第 index 张卡（越界按第一张）
+    public void Choose(int index) {
+        if (!choosing) { return; }
+        if (index < 0 || index >= optionCount) { index = 0; }
+        int code = options[index];
+        if (SurvivorGame.OptionIsWeapon(code)) { AddWeapon(code); }
+        else if (SurvivorGame.OptionIsPassive(code)) { AddPassive(code - 10); }
+        else { Heal(40); }
+        chooseCount = chooseCount + 1;
+        pendingLevels = pendingLevels - 1;
+        levelFlash = 0.7;
+        shake.AddTrauma(0.2);
+        for (int i = 0; i < 18; i = i + 1) {
+            double a = (double)i / 18.0 * SurvivorData.Pi * 2.0;
+            SpawnParticle(1, playerX, playerY - 18.0, Math.Cos(a) * 260.0, Math.Sin(a) * 260.0,
+                0.45, unchecked((int)0xFFFFE082), 3.0);
+        }
+        choosing = false;
+        if (pendingLevels > 0) { BeginChoice(); }
+    }
+
+    void GainExp(int amount) {
+        exp = exp + amount;
+        while (exp >= expToNext) {
+            exp = exp - expToNext;
+            level = level + 1;
+            expToNext = SurvivorData.ExpForLevel(level);
+            pendingLevels = pendingLevels + 1;
+        }
+    }
+
+    // ---------------- 主步进 ----------------
 
     public void Tick(double dt) {
-        // 阵亡后世界冻结，只让震屏与跳字收尾
+        if (choosing) { return; }   // 三选一时整个世界静止
         if (dead) {
             shake.Update(dt);
             floatingTexts.Update(dt);
+            UpdateFx(dt);
             return;
         }
-        // 顿帧检查：打击凝滞时暂停动力学步进
         if (hitStop.Update(dt)) {
             shake.Update(dt);
-            floatingTexts.Update(dt);
             return;
         }
-
         shake.Update(dt);
         floatingTexts.Update(dt);
         gameTime = gameTime + dt;
         if (hurtTimer > 0.0) { hurtTimer = hurtTimer - dt; }
+        if (levelFlash > 0.0) { levelFlash = levelFlash - dt; }
+        if (announceTimer > 0.0) { announceTimer = announceTimer - dt; }
 
-        // 玩家移动与边界约束
-        playerX = playerX + moveX * playerSpeed * dt;
-        playerY = playerY + moveY * playerSpeed * dt;
-        if (playerX < 30.0) { playerX = 30.0; }
-        if (playerX > 1250.0) { playerX = 1250.0; }
-        if (playerY < 80.0) { playerY = 80.0; }
-        if (playerY > 690.0) { playerY = 690.0; }
-
-        // 武器自动开火逻辑
-        shootTimer = shootTimer + dt;
-        if (shootTimer >= shootCooldown) {
-            shootTimer = 0.0;
-            AutoShootNearest();
-        }
-
-        // 怪物波次生成
-        // 怪潮随局时加密：0.8 秒一只起步，每过 1 秒缩短 4 毫秒，最快 0.22 秒一只
-        spawnCooldown = 0.8 - gameTime * 0.004;
-        if (spawnCooldown < 0.22) { spawnCooldown = 0.22; }
-        spawnTimer = spawnTimer + dt;
-        if (spawnTimer >= spawnCooldown) {
-            spawnTimer = 0.0;
-            SpawnHordeEnemy();
-        }
-
-        // 推进子弹
-        for (int i = 0; i < bullets.Count; i = i + 1) {
-            Bullet b = bullets[i];
-            if (!b.active) { continue; }
-            b.x = b.x + b.vx * dt;
-            b.y = b.y + b.vy * dt;
-            b.lifetime = b.lifetime - dt;
-            if (b.lifetime <= 0.0 || b.x < 0.0 || b.x > 1280.0 || b.y < 0.0 || b.y > 720.0) {
-                b.active = false;
-            }
-        }
-
-        // 推进怪物并检测受击与伤害
-        for (int i = 0; i < enemies.Count; i = i + 1) {
-            Enemy e = enemies[i];
-            if (!e.active) { continue; }
-
-            // 朝玩家追踪移动
-            double dx = playerX - e.x;
-            double dy = playerY - e.y;
-            double dist = Math.Sqrt(dx * dx + dy * dy);
-            if (dist > 5.0) {
-                e.x = e.x + (dx / dist) * e.speed * dt;
-                e.y = e.y + (dy / dist) * e.speed * dt;
-            }
-
-            // 接触伤害：贴身即掉血，之后 0.6 秒无敌，怪物被弹开一段
-            if (!dead && hurtTimer <= 0.0 && dist < e.radius + 14.0) {
-                playerHp = playerHp - 10;
-                hurtTimer = 0.6;
-                hurtCount = hurtCount + 1;
-                shake.AddTrauma(0.35);
-                if (dist > 0.5) {
-                    e.x = e.x - (dx / dist) * 40.0;
-                    e.y = e.y - (dy / dist) * 40.0;
-                }
-                if (playerHp <= 0) {
-                    playerHp = 0;
-                    dead = true;
-                }
-            }
-
-            // 碰撞子弹判定
-            for (int j = 0; j < bullets.Count; j = j + 1) {
-                Bullet b = bullets[j];
-                if (!b.active) { continue; }
-
-                double bdx = b.x - e.x;
-                double bdy = b.y - e.y;
-                double bdist = Math.Sqrt(bdx * bdx + bdy * bdy);
-                if (bdist <= e.radius + 6.0) {
-                    // 命中
-                    b.active = false;
-                    hitCount = hitCount + 1;
-                    bool isCrit = (killCount % 4 == 0);
-                    int dmg = isCrit ? b.damage * 2 : b.damage;
-                    e.hp = e.hp - dmg;
-                    floatingTexts.SpawnDamage(e.x, e.y - 10.0, dmg, isCrit);
-
-                    if (isCrit) {
-                        hitStop.Freeze(0.04);
-                    }
-
-                    if (e.hp <= 0) {
-                        e.active = false;
-                        killCount = killCount + 1;
-                        shake.AddTrauma(0.12);
-                        this.SpawnGem(e.x, e.y, 15);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 本帧阵亡：不再拾取宝石（升级回满血会让"已阵亡"自相矛盾）
+        UpdatePlayer(dt);
+        UpdateWaves(dt);
+        UpdateWeapons(dt);
+        UpdateShots(dt);
+        UpdateEnemies(dt);
         if (dead) { return; }
+        UpdateEnemyShots(dt);
+        if (dead) { return; }
+        UpdateGems(dt);
+        UpdateFx(dt);
+        UpdateCamera(dt);
+        if (pendingLevels > 0) { BeginChoice(); }
+    }
 
-        // 宝石拾取与升级结算
-        for (int i = 0; i < gems.Count; i = i + 1) {
-            Gem g = gems[i];
-            if (!g.active) { continue; }
-            double gx = playerX - g.x;
-            double gy = playerY - g.y;
-            double gdist = Math.Sqrt(gx * gx + gy * gy);
-            // 拾取磁吸范围 60 像素
-            if (gdist < 60.0) {
-                g.x = g.x + (gx / gdist) * 350.0 * dt;
-                g.y = g.y + (gy / gdist) * 350.0 * dt;
-                if (gdist < 15.0) {
-                    g.active = false;
-                    gemCount = gemCount + 1;
-                    exp = exp + g.expValue;
-                    floatingTexts.SpawnHeal(playerX, playerY - 20.0, g.expValue);
-                    if (exp >= expToNext) {
-                        level = level + 1;
-                        exp = exp - expToNext;
-                        expToNext = (int)((double)expToNext * 1.4);
-                        playerMaxHp = playerMaxHp + 20;
-                        playerHp = playerMaxHp;
-                        // 升级强化：射速提高 12%（下限 0.12 秒一发）
-                        shootCooldown = shootCooldown * 0.88;
-                        if (shootCooldown < 0.12) { shootCooldown = 0.12; }
-                        shake.AddTrauma(0.25);
-                    }
-                }
+    void UpdatePlayer(double dt) {
+        double mx = moveX;
+        double my = moveY;
+        double len = Math.Sqrt(mx * mx + my * my);
+        moving = len > 0.01;
+        if (moving) {
+            double spd = MoveSpeed();
+            playerX = playerX + mx / len * spd * dt;
+            playerY = playerY + my / len * spd * dt;
+            walkPhase = walkPhase + dt * 11.0;
+            if (mx > 0.1) { facing = 1; } else if (mx < -0.1) { facing = -1; }
+        } else {
+            walkPhase = 0.0;
+        }
+        if (playerX < 40.0) { playerX = 40.0; }
+        if (playerX > SurvivorData.WorldW - 40.0) { playerX = SurvivorData.WorldW - 40.0; }
+        if (playerY < 40.0) { playerY = 40.0; }
+        if (playerY > SurvivorData.WorldH - 40.0) { playerY = SurvivorData.WorldH - 40.0; }
+    }
+
+    void UpdateCamera(double dt) {
+        double k = dt * 7.0;
+        if (k > 1.0) { k = 1.0; }
+        camX = camX + (playerX - camX) * k;
+        camY = camY + (playerY - camY) * k;
+        if (camX < 640.0) { camX = 640.0; }
+        if (camX > SurvivorData.WorldW - 640.0) { camX = SurvivorData.WorldW - 640.0; }
+        if (camY < 360.0) { camY = 360.0; }
+        if (camY > SurvivorData.WorldH - 360.0) { camY = SurvivorData.WorldH - 360.0; }
+    }
+
+    void Announce(string text) {
+        announce = text;
+        announceSerial = announceSerial + 1;
+        announceTimer = 2.8;
+    }
+
+    // ---------------- 波次 ----------------
+
+    // 怪物血量倍率：每 90 秒 +100%，6 分钟后陡增
+    public double HpScale() {
+        double s = 1.0 + gameTime / 90.0;
+        if (gameTime > 360.0) { s = s + (gameTime - 360.0) / 35.0; }
+        if (gameTime > 480.0) { s = s + (gameTime - 480.0) / 15.0; }
+        return s;
+    }
+
+    int ActiveEnemies() {
+        int n = 0;
+        for (int i = 0; i < enemies.Count; i = i + 1) { if (enemies[i].active) { n = n + 1; } }
+        return n;
+    }
+
+    // 按局时挑一种普通怪：组成随时间变化（先只有食尸鬼，再加蝙蝠、吐酸怪、蛮兵、自爆怪）
+    int PickKind() {
+        double t = gameTime;
+        int ghoul = 100;
+        int bat = 0;
+        int spit = 0;
+        int brute = 0;
+        int bomb = 0;
+        if (t >= 40.0) { ghoul = 70; bat = 30; }
+        if (t >= 90.0) { ghoul = 45; bat = 25; spit = 15; brute = 15; }
+        if (t >= 150.0) { ghoul = 30; bat = 20; spit = 15; brute = 20; bomb = 15; }
+        if (t >= 210.0) { ghoul = 20; bat = 20; spit = 15; brute = 25; bomb = 20; }
+        if (t >= 300.0) { ghoul = 15; bat = 20; spit = 20; brute = 25; bomb = 20; }
+        int r = rng.NextBelow(ghoul + bat + spit + brute + bomb);
+        if (r < ghoul) { return SurvivorData.KGhoul; }
+        r = r - ghoul;
+        if (r < bat) { return SurvivorData.KBat; }
+        r = r - bat;
+        if (r < spit) { return SurvivorData.KSpitter; }
+        r = r - spit;
+        if (r < brute) { return SurvivorData.KBrute; }
+        return SurvivorData.KBomber;
+    }
+
+    void UpdateWaves(double dt) {
+        bool bossAlive = bossIndex >= 0;
+        double interval = 0.72 - gameTime * 0.0024;
+        if (interval < 0.16) { interval = 0.16; }
+        if (bossAlive) { interval = interval * 1.8; }
+        spawnTimer = spawnTimer - dt;
+        if (spawnTimer <= 0.0) {
+            spawnTimer = interval;
+            int batch = 1 + (gameTime >= 8.0 ? 1 : 0) + (int)(gameTime / 75.0);
+            for (int b = 0; b < batch; b = b + 1) {
+                if (ActiveEnemies() >= (gameTime > 420.0 ? 340 : 280)) { break; }
+                double sx = 0.0;
+                double sy = 0.0;
+                SpawnPoint(out sx, out sy);
+                SpawnEnemy(PickKind(), 0, sx, sy);
             }
+        }
+        // 固定事件：蝙蝠群、亡者合围、精英、首领
+        RunEvent(0, 55.0);
+        RunEvent(1, 120.0);
+        RunEvent(2, 150.0);
+        RunEvent(3, 180.0);
+        RunEvent(4, 240.0);
+        RunEvent(5, 270.0);
+        RunEvent(6, 300.0);
+        RunEvent(7, 330.0);
+        RunEvent(8, 360.0);
+        // 6 分钟后：每 50 秒轮流来精英 / 蝙蝠群 / 合围
+        if (gameTime >= nextPeriodic) {
+            nextPeriodic = nextPeriodic + 50.0;
+            int which = periodicCount % 3;
+            periodicCount = periodicCount + 1;
+            if (which == 0) { SpawnElite(); }
+            else if (which == 1) { SpawnRing(SurvivorData.KBat, 30, 540.0, "BAT SWARM!"); }
+            else { SpawnRing(SurvivorData.KBrute, 18, 560.0, "THE BRUTES CLOSE IN"); }
         }
     }
 
-    private void AutoShootNearest() {
-        Enemy nearest = null;
-        double minDist = 999999.0;
-        for (int i = 0; i < enemies.Count; i = i + 1) {
-            Enemy e = enemies[i];
-            if (!e.active) { continue; }
-            double dx = e.x - playerX;
-            double dy = e.y - playerY;
-            double d = Math.Sqrt(dx * dx + dy * dy);
-            if (d < minDist) {
-                minDist = d;
-                nearest = e;
-            }
-        }
+    void RunEvent(int id, double at) {
+        int bit = 1 << id;
+        if ((eventsDone & bit) != 0 || gameTime < at) { return; }
+        eventsDone = eventsDone | bit;
+        if (id == 0) { SpawnRing(SurvivorData.KBat, 14, 520.0, "BAT SWARM!"); }
+        else if (id == 1 || id == 4 || id == 6) { SpawnElite(); }
+        else if (id == 2) { SpawnRing(SurvivorData.KGhoul, 22, 480.0, "THE DEAD ENCIRCLE YOU"); }
+        else if (id == 3) { SpawnBoss(0); }
+        else if (id == 5) { SpawnRing(SurvivorData.KBat, 24, 540.0, "BAT SWARM!"); }
+        else if (id == 7) { SpawnRing(SurvivorData.KBomber, 16, 520.0, "VOLATILE HORDE"); }
+        else if (id == 8) { SpawnBoss(1); }
+    }
 
-        if (nearest != null && minDist <= 500.0) {
-            double dirX = nearest.x - playerX;
-            double dirY = nearest.y - playerY;
-            double len = Math.Sqrt(dirX * dirX + dirY * dirY);
-            if (len > 0.0) {
-                double speed = 450.0;
-                shotCount = shotCount + 1;
-                double vx = (dirX / len) * speed;
-                double vy = (dirY / len) * speed;
-                // 复用失效子弹槽位：每 0.35 秒一发，不复用的话列表随局时无限增长
-                for (int i = 0; i < bullets.Count; i = i + 1) {
-                    if (!bullets[i].active) {
-                        bullets[i] = new Bullet(playerX, playerY, vx, vy, 25);
-                        return;
-                    }
-                }
-                bullets.Add(new Bullet(playerX, playerY, vx, vy, 25));
-            }
+    // 刷在镜头外一圈（视野 1280x720 外沿 + 余量），钳在世界内
+    void SpawnPoint(out double sx, out double sy) {
+        int side = rng.NextBelow(4);
+        double u = rng.NextDouble();
+        double hw = 720.0;
+        double hh = 440.0;
+        if (side == 0) { sx = camX - hw + u * hw * 2.0; sy = camY - hh; }
+        else if (side == 1) { sx = camX + hw; sy = camY - hh + u * hh * 2.0; }
+        else if (side == 2) { sx = camX - hw + u * hw * 2.0; sy = camY + hh; }
+        else { sx = camX - hw; sy = camY - hh + u * hh * 2.0; }
+        if (sx < 30.0) { sx = 30.0; }
+        if (sx > SurvivorData.WorldW - 30.0) { sx = SurvivorData.WorldW - 30.0; }
+        if (sy < 30.0) { sy = 30.0; }
+        if (sy > SurvivorData.WorldH - 30.0) { sy = SurvivorData.WorldH - 30.0; }
+    }
+
+    void SpawnRing(int kind, int count, double radius, string text) {
+        Announce(text);
+        for (int i = 0; i < count; i = i + 1) {
+            double a = (double)i / (double)count * SurvivorData.Pi * 2.0;
+            double sx = playerX + Math.Cos(a) * radius;
+            double sy = playerY + Math.Sin(a) * radius;
+            if (sx < 30.0 || sy < 30.0 || sx > SurvivorData.WorldW - 30.0 || sy > SurvivorData.WorldH - 30.0) { continue; }
+            if (ActiveEnemies() >= 380) { break; }
+            SpawnEnemy(kind, 0, sx, sy);
         }
     }
 
-    private void SpawnHordeEnemy() {
-        // 沿屏幕外边缘随机方位生成
-        int edge = (int)(gameTime * 7.0) % 4;
+    void SpawnElite() {
         double sx = 0.0;
         double sy = 0.0;
-        double offset = ((int)(gameTime * 31.0) % 100) / 100.0;
+        SpawnPoint(out sx, out sy);
+        SpawnEnemy(SurvivorData.KElite, 0, sx, sy);
+        Announce("A DREAD KNIGHT APPROACHES");
+    }
 
-        if (edge == 0) { sx = 1280.0 * offset; sy = -20.0; }
-        else if (edge == 1) { sx = 1300.0; sy = 720.0 * offset; }
-        else if (edge == 2) { sx = 1280.0 * offset; sy = 740.0; }
-        else { sx = -20.0; sy = 720.0 * offset; }
+    void SpawnBoss(int variant) {
+        double sx = 0.0;
+        double sy = 0.0;
+        SpawnPoint(out sx, out sy);
+        int slot = SpawnEnemy(SurvivorData.KBoss, variant, sx, sy);
+        bossIndex = slot;
+        Announce(variant == 0 ? "THE BONE COLOSSUS AWAKENS" : "THE ABYSS WARDEN RISES");
+        shake.AddTrauma(0.5);
+    }
 
-        // 血量随等级与局时成长（每 20 秒 +6），站桩不升级也躲不过后期怪潮
-        int hp = 40 + level * 5 + ((int)(gameTime / 20.0)) * 6;
-        double spd = 70.0 + (level > 5 ? 20.0 : 0.0) + (gameTime > 120.0 ? 15.0 : 0.0);
-        int col = (level % 2 == 0) ? unchecked((int)0xFFCF1322) : unchecked((int)0xFF531DAB);
-        // 复用已阵亡的槽位（与 SpawnGem 同法）：每 0.8 秒刷一只，不复用的话列表无限增长
+    // 返回槽位；死槽复用，列表大小有上界
+    int SpawnEnemy(int kind, int variant, double x, double y) {
+        int slot = -1;
         for (int i = 0; i < enemies.Count; i = i + 1) {
-            if (!enemies[i].active) {
-                enemies[i] = new Enemy(sx, sy, hp, spd, col);
-                return;
-            }
+            if (!enemies[i].active && i != bossIndex) { slot = i; break; }
         }
-        enemies.Add(new Enemy(sx, sy, hp, spd, col));
+        if (slot < 0) {
+            enemies.Add(new Enemy());
+            slot = enemies.Count - 1;
+        }
+        Enemy e = enemies[slot];
+        e.kind = kind;
+        e.variant = variant;
+        e.x = x;
+        e.y = y;
+        e.kx = 0.0;
+        e.ky = 0.0;
+        e.active = true;
+        e.flash = 0.0;
+        e.phase = rng.NextDouble() * 6.0;
+        e.state = 0;
+        e.stateTimer = 0.0;
+        e.attackTimer = rng.NextDouble() * 1.5;
+        e.ringTimer = 0.0;
+        e.summonTimer = 0.0;
+        e.dirX = 0.0;
+        e.dirY = 0.0;
+        e.slow = 0.0;
+        e.bladeCd = 0.0;
+        e.glaiveCd = 0.0;
+        e.mark = 0;
+        double hpBase = 12.0;
+        double spd = 52.0;
+        double r = 12.0;
+        int dmg = 8;
+        int xp = 1;
+        if (kind == SurvivorData.KBat) { hpBase = 6.0; spd = 104.0; r = 10.0; dmg = 5; xp = 1; }
+        else if (kind == SurvivorData.KBrute) { hpBase = 70.0; spd = 36.0; r = 20.0; dmg = 16; xp = 5; }
+        else if (kind == SurvivorData.KSpitter) { hpBase = 20.0; spd = 50.0; r = 13.0; dmg = 6; xp = 2; }
+        else if (kind == SurvivorData.KBomber) { hpBase = 16.0; spd = 70.0; r = 13.0; dmg = 6; xp = 2; }
+        else if (kind == SurvivorData.KElite) { hpBase = 480.0; spd = 46.0; r = 24.0; dmg = 22; xp = 25; }
+        else if (kind == SurvivorData.KBoss) {
+            hpBase = variant == 0 ? 1000.0 : 1800.0;
+            spd = variant == 0 ? 64.0 : 72.0;
+            r = 40.0;
+            dmg = 25;
+            xp = 60;
+            e.attackTimer = 0.0;
+        }
+        double scale = HpScale();
+        if (kind == SurvivorData.KBoss) { scale = 1.0 + (scale - 1.0) * 0.35; }
+        e.maxHp = (int)(hpBase * scale);
+        e.hp = e.maxHp;
+        double t = gameTime > 480.0 ? 480.0 : gameTime;
+        e.speed = spd * (1.0 + t / 1200.0);
+        // 7 分钟后怪潮越跑越快：放风筝的打法也终有极限
+        if (gameTime > 420.0 && kind != SurvivorData.KBoss) { e.speed = e.speed * (1.0 + (gameTime - 420.0) / 300.0); }
+        e.radius = r;
+        e.damage = gameTime > 360.0 ? dmg + dmg / 2 : dmg;
+        e.xp = xp;
+        return slot;
     }
 
-    public void Render(Canvas c) {
-        if (c == null) { return; }
+    // ---------------- 调试 / 测试捷径 ----------------
 
-        int shakeX = (int)shake.OffsetX;
-        int shakeY = (int)shake.OffsetY;
+    // 调试：立刻攒满本级经验（下一帧弹出三选一），用于截取升级界面
+    public void DebugLevelUp() { GainExp(expToNext - exp); }
 
-        // 背景：暗色石板地 + 稀疏网格（随震屏一起抖，地面才有"被震动"的实感）
-        c.FillVGrad(0, 0, 1280, 720, unchecked((int)0xFF1B1A26), unchecked((int)0xFF121119));
-        int gridCol = unchecked((int)0xFF201F2D);
-        for (int gx = (shakeX % 64) - 64; gx < 1280; gx = gx + 64) { c.FillRect(gx, 0, 1, 720, gridCol); }
-        for (int gy = (shakeY % 64) - 64; gy < 720; gy = gy + 64) { c.FillRect(0, gy, 1280, 1, gridCol); }
-
-        // 经验宝石：青色菱形 + 光晕
-        for (int i = 0; i < gems.Count; i = i + 1) {
-            Gem g = gems[i];
-            if (!g.active) { continue; }
-            int gx2 = (int)g.x + shakeX;
-            int gy2 = (int)g.y + shakeY;
-            c.FillRadial(gx2, gy2, 12, unchecked((int)0xFF00E5FF), 90);
-            SurvivorGame.Diamond(c, gx2, gy2, 6, unchecked((int)0xFF00B8D4));
-            SurvivorGame.Diamond(c, gx2, gy2 - 1, 3, unchecked((int)0xFFB2F5FF));
+    // 直接快进到 seconds 秒、level 级（按随机选卡升级），已过的固定事件标记为已发生。
+    // 仿真用它让机器人摸到首领与后期怪；外壳只在设了调试环境变量时调用。
+    public void DebugWarp(double seconds, int targetLevel) {
+        gameTime = seconds;
+        double[] at = new double[]{ 55.0, 120.0, 150.0, 180.0, 240.0, 270.0, 300.0, 330.0, 360.0 };
+        for (int i = 0; i < at.Length; i = i + 1) {
+            if (at[i] < seconds) { eventsDone = eventsDone | (1 << i); }
         }
-
-        // 子弹：发光弹丸
-        for (int i = 0; i < bullets.Count; i = i + 1) {
-            Bullet b = bullets[i];
-            if (!b.active) { continue; }
-            int bx = (int)b.x + shakeX;
-            int by = (int)b.y + shakeY;
-            c.FillRadial(bx, by, 10, unchecked((int)0xFFFFD54F), 110);
-            c.FillCircle(bx, by, 4, unchecked((int)0xFFFFE082));
-            c.FillCircle(bx, by, 2, unchecked((int)0xFFFFFFFF));
+        if (seconds > 420.0) { nextPeriodic = seconds + 20.0; }
+        while (level < targetLevel) {
+            level = level + 1;
+            pendingLevels = 1;
+            choosing = false;
+            BeginChoice();
+            Choose(rng.NextBelow(optionCount));
         }
-
-        // 使用 YSortQueue 按底部 Y 坐标排好序后，从上向下渲染遮挡
-        ySorter.Clear();
-        // 玩家实体 ID 设为 0
-        ySorter.Push(0, playerY);
-
-        for (int i = 0; i < enemies.Count; i = i + 1) {
-            Enemy e = enemies[i];
-            if (!e.active) { continue; }
-            // 怪物实体 ID 设为 i + 1
-            ySorter.Push(i + 1, e.y);
-        }
-
-        ySorter.Sort();
-
-        for (int i = 0; i < ySorter.Count; i = i + 1) {
-            int entityId = ySorter.GetEntityId(i);
-            if (entityId == 0) {
-                // 渲染玩家自身（绿色武士）
-                int px = (int)playerX + shakeX;
-                int py = (int)playerY + shakeY;
-                // 受击无敌期间闪烁变红，阵亡后整体变暗红
-                bool flash = hurtTimer > 0.0 && ((int)(hurtTimer * 20.0) % 2 == 0);
-                int body = dead ? unchecked((int)0xFF5C1A1A)
-                    : (flash ? unchecked((int)0xFFFF4D4F) : unchecked((int)0xFF52C41A));
-                // 落影 + 斗篷身体 + 头盔 + 目镜（朝移动方向偏一点）
-                c.FillRoundRect(px - 15, py + 4, 30, 9, 5, unchecked((int)0x66000000));
-                int dark = dead ? unchecked((int)0xFF3A1010) : unchecked((int)0xFF2E7D32);
-                c.FillRoundRect(px - 14, py - 14, 28, 22, 9, dark);
-                c.FillRoundRect(px - 12, py - 13, 24, 18, 8, body);
-                c.FillCircle(px, py - 18, 10, dark);
-                c.FillCircle(px, py - 19, 8, body);
-                int look = moveX > 0.1 ? 2 : (moveX < -0.1 ? -2 : 0);
-                c.FillRoundRect(px - 6 + look, py - 22, 12, 4, 2, unchecked((int)0xFFE8FFE8));
-            } else {
-                // 渲染怪物
-                int eIdx = entityId - 1;
-                if (eIdx >= 0 && eIdx < enemies.Count) {
-                    Enemy e = enemies[eIdx];
-                    int ex = (int)e.x + shakeX;
-                    int ey = (int)e.y + shakeY;
-                    // 史莱姆：落影 + 暗边 + 本体 + 高光 + 两只眼
-                    c.FillRoundRect(ex - 13, ey + 4, 26, 8, 4, unchecked((int)0x55000000));
-                    c.FillCircle(ex, ey - 4, 13, SurvivorGame.Shade(e.color));
-                    c.FillCircle(ex, ey - 5, 11, e.color);
-                    c.FillCircle(ex - 4, ey - 10, 3, unchecked((int)0x99FFFFFF));
-                    c.FillCircle(ex - 4, ey - 3, 2, unchecked((int)0xFF101018));
-                    c.FillCircle(ex + 4, ey - 3, 2, unchecked((int)0xFF101018));
-                    // Health is a retained Progress in SurvivorHud.
-                }
-            }
-        }
-
-        // Status, enemy health and floating numbers are composed by SurvivorHud.
-    }
-
-    // 扫描线菱形（Canvas 无多边形填充）。
-    static void Diamond(Canvas c, int cx, int cy, int r, int color) {
-        for (int dy = -r; dy <= r; dy = dy + 1) {
-            int half = r - (dy < 0 ? -dy : dy);
-            if (half > 0) { c.FillRect(cx - half, cy + dy, half * 2, 1, color); }
-        }
-    }
-
-    static int Shade(int argb) {
-        int a = (argb >> 24) & 255;
-        int r = ((argb >> 16) & 255) * 55 / 100;
-        int g = ((argb >> 8) & 255) * 55 / 100;
-        int b = (argb & 255) * 55 / 100;
-        return (a << 24) | (r << 16) | (g << 8) | b;
+        expToNext = SurvivorData.ExpForLevel(level);
+        exp = 0;
+        playerHp = playerMaxHp;
+        levelFlash = 0.0;
+        for (int i = 0; i < particles.Count; i = i + 1) { particles[i].active = false; }
+        floatingTexts = new FloatingTextPool(64);
     }
 }

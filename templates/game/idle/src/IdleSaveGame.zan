@@ -4,19 +4,29 @@ using System.Json;
 using Game.Foundation;
 using Game.Idle;
 
-// 经济存档：金币、累计收益、点击数、各矿机等级 + 落盘时间（离线收益用）。
+// 经济存档：整个 MineEconomy（金币、本轮/终身累计、矿机等级、地心晶、成就、增益计时、
+// 金矿石随机数状态、购买模式）+ 落盘时间（离线收益用）。
 //
 // 存在玩家档案同一根目录下：<GameProfile.DataRoot()>/idle/economy_slot0.json
 // （GameProfile.Open("idle") 用的是同目录下的 idle_slot0.json，两者互不覆盖）。
 // GameSaveStore 负责原子写 + .bak 回退；用户目录解析不到时整个存档静默失效，
 // 游戏照常跑。只在界面层使用——无头回放（IdleSim）不碰它。
+//
+// 格式版本（数据里的 "format"，GameSaveStore 外层 "version" 同步）：
+//   1（第一版）：gold / totalEarned / clicks / levels[6] / savedAtSec，没有 format 字段；
+//   2（当前）  ：见 Save()。读到 1 版时迁移：totalEarned 同时记作本轮与终身累计，
+//               新增的两座矿机为 0 级，其余字段取默认；下次存档即写成 2 版。
 public class IdleSaveGame {
+    public const int Format = 2;
+
     GameSaveStore store;
     string dir;
+    int loadedFormat;
 
     IdleSaveGame() {
         this.store = null;
         this.dir = "";
+        this.loadedFormat = 0;
     }
 
     public static IdleSaveGame Open() {
@@ -24,7 +34,7 @@ public class IdleSaveGame {
         string root = GameProfile.DataRoot();
         if (root == "") { return g; }
         g.dir = Path.Combine(root, "idle");
-        g.store = new GameSaveStore(g.dir, "economy", 1);
+        g.store = new GameSaveStore(g.dir, "economy", Format);
         return g;
     }
 
@@ -34,46 +44,102 @@ public class IdleSaveGame {
     // 存档所在目录（README / 统计面板展示用）。
     public string Directory() { return this.dir; }
 
+    // 上次读到的存档格式（0 = 没有存档；1 = 从第一版迁移而来）。
+    public int LoadedFormat() { return this.loadedFormat; }
+
     // 当前 Unix 秒。
     public static long NowSec() { return DateTime.GetCurrentUnixMilliseconds() / 1000; }
 
-    public bool Save(IdleState s, long nowSec) {
-        if (this.store == null || s == null) { return false; }
+    public bool Save(MineEconomy e, long nowSec) {
+        if (this.store == null || e == null) { return false; }
         JsonValue d = JsonValue.NewObject();
-        d.PutDouble("gold", s.gold);
-        d.PutDouble("totalEarned", s.totalEarned);
-        d.PutInt("clicks", s.clicks);
+        d.PutInt("format", Format);
+        d.PutDouble("gold", e.Gold);
+        d.PutDouble("runEarned", e.RunEarned);
+        d.PutDouble("lifetimeEarned", e.lifetimeEarned);
+        d.PutInt("clicks", e.Clicks);
         d.PutInt("savedAtSec", nowSec);
         JsonValue levels = JsonValue.NewArray();
-        for (int i = 0; i < s.buildings.Count; i = i + 1) {
-            levels.AppendInt((long)s.buildings[i].level);
+        for (int i = 0; i < e.Buildings.Count; i = i + 1) {
+            levels.AppendInt((long)e.Buildings[i].level);
         }
         d.Put("levels", levels);
+        d.PutInt("crystals", e.crystals);
+        d.PutInt("prestiges", e.prestiges);
+        d.PutInt("achieved", e.achieved);
+        d.PutInt("goldenClicks", e.goldenClicks);
+        d.PutInt("overdriveUses", e.overdriveUses);
+        d.PutDouble("overdriveLeft", e.overdriveLeft);
+        d.PutDouble("overdriveCooldown", e.overdriveCooldown);
+        d.PutDouble("rushLeft", e.rushLeft);
+        d.PutDouble("goldenTimer", e.goldenTimer);
+        d.PutInt("rng", e.rng.State());
+        d.PutInt("buyMode", (long)e.buyMode);
         return this.store.Save(0, d);
     }
 
-    // 读档写回 state；返回存档时的 Unix 秒，没有（或读坏了）存档返回 0。
-    public long Load(IdleState s) {
-        if (this.store == null || s == null) { return 0; }
+    // 读档写回 e；返回存档时的 Unix 秒，没有（或读坏了）存档返回 0。
+    public long Load(MineEconomy e) {
+        this.loadedFormat = 0;
+        if (this.store == null || e == null) { return 0; }
         JsonValue d = this.store.Load(0);
         if (d == null || !d.IsObject()) { return 0; }
-        double gold = d.Double("gold", 0.0);
-        double earned = d.Double("totalEarned", 0.0);
-        if (!(gold >= 0.0)) { gold = 0.0; }
-        if (!(earned >= gold)) { earned = gold; }
-        s.gold = gold;
-        s.totalEarned = earned;
+        int format = d.Int("format", 1);
+        this.loadedFormat = format;
+
+        double gold = NonNeg(d.Double("gold", 0.0));
+        double run;
+        double life;
+        if (format >= 2) {
+            run = NonNeg(d.Double("runEarned", 0.0));
+            life = NonNeg(d.Double("lifetimeEarned", 0.0));
+        } else {
+            // 1 版只有一个累计：没转生过，本轮 = 终身。
+            run = NonNeg(d.Double("totalEarned", 0.0));
+            life = run;
+        }
+        if (run < gold) { run = gold; }
+        if (life < run) { life = run; }
+        e.state.gold = gold;
+        e.state.totalEarned = run;
+        e.lifetimeEarned = life;
         long clicks = d.Long("clicks", 0);
-        s.clicks = clicks > 0 ? clicks : 0;
+        e.state.clicks = clicks > 0 ? clicks : 0;
         JsonValue levels = d.Get("levels");
         if (levels != null && levels.IsArray()) {
             int n = levels.Count();
-            if (n > s.buildings.Count) { n = s.buildings.Count; }
+            if (n > e.Buildings.Count) { n = e.Buildings.Count; }
             for (int i = 0; i < n; i = i + 1) {
                 int lv = levels.At(i).AsInt(0);
-                s.buildings[i].level = lv > 0 ? lv : 0;
+                e.Buildings[i].level = lv > 0 ? lv : 0;
             }
         }
+        if (format >= 2) {
+            e.crystals = NonNegLong(d.Long("crystals", 0));
+            e.prestiges = NonNegLong(d.Long("prestiges", 0));
+            e.achieved = d.Long("achieved", 0) & ((1L << MineAchievements.Count) - 1L);
+            e.goldenClicks = NonNegLong(d.Long("goldenClicks", 0));
+            e.overdriveUses = NonNegLong(d.Long("overdriveUses", 0));
+            e.overdriveLeft = Clamp(d.Double("overdriveLeft", 0.0), MineEconomy.OverdriveSeconds);
+            e.overdriveCooldown = Clamp(d.Double("overdriveCooldown", 0.0), MineEconomy.OverdriveCooldown);
+            if (e.overdriveLeft > 0.0 && e.overdriveCooldown < e.overdriveLeft) { e.overdriveCooldown = e.overdriveLeft; }
+            e.rushLeft = Clamp(d.Double("rushLeft", 0.0), MineEconomy.RushSeconds);
+            e.goldenTimer = Clamp(d.Double("goldenTimer", (double)MineEconomy.GoldenMinGap), (double)MineEconomy.GoldenMaxGap);
+            long rs = d.Long("rng", 0);
+            if (rs != 0) { e.rng.Restore(rs); }
+            e.SetBuyMode(d.Int("buyMode", 1));
+        }
+        // 迁移来的进度可能早已够格某些成就：读档后补判一次（不弹庆祝，界面会排空事件）。
+        e.CheckAchievements();
         return d.Long("savedAtSec", 0);
+    }
+
+    static double NonNeg(double v) { return v >= 0.0 ? v : 0.0; }
+
+    static long NonNegLong(long v) { return v > 0 ? v : 0; }
+
+    static double Clamp(double v, double hi) {
+        if (!(v >= 0.0)) { return 0.0; }
+        return v > hi ? hi : v;
     }
 }

@@ -2,46 +2,119 @@ using System;
 using Game.Foundation;
 using Game.Idle;
 
-// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：放置经济（Game.Idle.IdleState + 本游戏的
-// MineCatalog 矿机表）以界面同样的 100ms 一帧无头推进。经济无随机，种子不参与。
-// replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
-// 改了矿机价格或产出后回放分叉，就重新录制（见 README）。
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：本游戏的经济（MineEconomy：里程碑、批量购买、
+// 金矿石、熔炉超载、成就、地心转生）以界面同样的 100ms 一帧无头推进。金矿石的刷新间隔与
+// 奖励只来自种子。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的
+// 机器人。改了数值后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 无操作；1 手动开采一次；10 + i 升级第 i 座矿机（钱不够时无效）。
+// 输入编码：0 无操作；1 手动开采；2 敲金矿石；3 开熔炉超载；4 地心转生；
+//           5 / 6 / 7 购买模式 ×1 / ×10 / 最大；10 + i 按当前模式购买第 i 座矿机。
 public class IdleSim : IReplaySim {
-    IdleState state;
+    MineEconomy eco;
+    long lastAchieved;
+    long lastCrystals;
 
-    public void Reset(long seed) { state = new IdleState(MineCatalog.Create()); }
+    public void Reset(long seed) {
+        eco = new MineEconomy(seed);
+        lastAchieved = 0;
+        lastCrystals = 0;
+    }
 
     public void Step(int frame, int input) {
+        lastAchieved = eco.achieved;
+        lastCrystals = eco.crystals;
         if (input == 1) {
-            state.Mine();
-        } else if (input >= 10 && input < 10 + state.buildings.Count) {
-            state.UpgradeBuilding(input - 10);
+            eco.Mine();
+        } else if (input == 2) {
+            eco.ClickGolden();
+        } else if (input == 3) {
+            eco.ActivateOverdrive();
+        } else if (input == 4) {
+            eco.Prestige();
+        } else if (input == 5) {
+            eco.SetBuyMode(1);
+        } else if (input == 6) {
+            eco.SetBuyMode(10);
+        } else if (input == 7) {
+            eco.SetBuyMode(0);
+        } else if (input >= 10 && input < 10 + eco.Buildings.Count) {
+            eco.Buy(input - 10);
         }
-        state.Tick(0.1);
+        eco.Step(0.1);
+        int arg;
+        while (eco.PollEvent(out arg) != 0) { }
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        h.Real(state.gold).Real(state.totalEarned).Long(state.clicks);
-        for (int i = 0; i < state.buildings.Count; i = i + 1) { h.Int(state.buildings[i].level); }
+        h.Real(eco.Gold).Real(eco.RunEarned).Real(eco.lifetimeEarned).Long(eco.Clicks);
+        for (int i = 0; i < eco.Buildings.Count; i = i + 1) { h.Int(eco.Buildings[i].level); }
+        h.Long(eco.crystals).Long(eco.achieved).Long(eco.goldenClicks).Long(eco.overdriveUses);
+        h.Real(eco.overdriveLeft).Real(eco.overdriveCooldown).Real(eco.rushLeft);
+        h.Real(eco.goldenLeft).Real(eco.goldenTimer).Int(eco.buyMode);
         return h.Value();
     }
 
     // 钱不会花成负数
     [Invariant]
-    public bool GoldNotNegative() { return state.gold >= 0; }
+    public bool GoldNotNegative() { return eco.Gold >= 0.0; }
 
-    // 手里的钱不会多于累计赚到的钱（花钱只减少 gold）
+    // 手里的钱不会多于本轮累计赚到的钱（花钱只减少金币）
     [Invariant]
-    public bool GoldWithinEarned() { return state.gold <= state.totalEarned + 0.001; }
+    public bool GoldWithinEarned() { return eco.Gold <= eco.RunEarned + 0.001; }
 
-    // 机器人：狂点开采，攒到钱就随机升级一座矿机
+    // 终身累计 ≥ 本轮累计（转生只清本轮）
+    [Invariant]
+    public bool LifetimeCoversRun() { return eco.lifetimeEarned + 0.001 >= eco.RunEarned; }
+
+    // 增益计时都在合法区间，超载开着时冷却一定在走
+    [Invariant]
+    public bool BoostTimersBounded() {
+        if (eco.overdriveLeft < 0.0 || eco.overdriveLeft > MineEconomy.OverdriveSeconds) { return false; }
+        if (eco.overdriveCooldown < 0.0 || eco.overdriveCooldown > MineEconomy.OverdriveCooldown) { return false; }
+        if (eco.rushLeft < 0.0 || eco.rushLeft > MineEconomy.RushSeconds) { return false; }
+        if (eco.goldenLeft < 0.0 || eco.goldenLeft > MineEconomy.GoldenLife) { return false; }
+        if (eco.overdriveLeft > 0.0 && eco.overdriveCooldown <= 0.0) { return false; }
+        return true;
+    }
+
+    // 成就只增不减；地心晶只增不减
+    [Invariant]
+    public bool PermanentProgressMonotonic() {
+        if ((eco.achieved & lastAchieved) != lastAchieved) { return false; }
+        return eco.crystals >= lastCrystals;
+    }
+
+    // 永久倍率与成就数一致，倍率不低于 1
+    [Invariant]
+    public bool MultiplierConsistent() {
+        double expect = (1.0 + MineEconomy.CrystalBonus * (double)eco.crystals)
+            * (1.0 + MineEconomy.AchievementBonus * (double)eco.AchievementCount);
+        double m = eco.PermanentMult;
+        return m >= 1.0 && m - expect < 0.000001 && expect - m < 0.000001;
+    }
+
+    // 里程碑倍率：每座矿机的基础产出 = 基础值 × 等级 × 2^里程碑数
+    [Invariant]
+    public bool MilestoneOutputConsistent() {
+        for (int i = 0; i < eco.Buildings.Count; i = i + 1) {
+            IdleBuilding b = eco.Buildings[i];
+            double expect = (double)b.baseDps * (double)b.level;
+            for (int k = 0; k < MineEconomy.MilestonesAt(b.level); k = k + 1) { expect = expect * 2.0; }
+            if (MineEconomy.RawDpsAt(b, b.level) != expect) { return false; }
+        }
+        return true;
+    }
+
+    // 机器人：狂点开采、见金矿石就敲、超载好了就开、偶尔换购买模式、攒到钱就随机买矿机
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
-        if (roll < 60) { return 1; }
-        if (roll < 75) { return 10 + rng.NextBelow(6); }
+        if (roll < 50) { return 1; }
+        if (roll < 58) { return 2; }
+        if (roll < 60) { return 3; }
+        if (roll < 64) { return 5 + rng.NextBelow(3); }
+        if (roll < 80) { return 10 + rng.NextBelow(MineCatalog.Count); }
+        if (roll == 99) { return 4; }
         return 0;
     }
 }

@@ -1,74 +1,293 @@
-// 战场特效：曳光与爆炸残影。纯表现层——从 RtsBattle 每帧的 shots/fallen 取事件，
-// 按界面帧衰减；暂停时不推进（Tick 只在交战中调用）。
+// 战场特效（纯表现层）：炮口焰、曳光、炮弹弧线、命中火花、爆炸（闪光 + 冲击波 + 碎片 +
+// 烟团 + 焦痕）、行军令落点脉冲、出厂跃迁环、交矿飘字、链路易主脉冲与震屏。
+// 从 RtsBattle 每帧的 shots/fallen/deposits/spawned 取事件，按界面帧的真实毫秒推进；
+// 暂停时不推进（Update 只在交战中调用）。坐标都是世界坐标，Render 时减去镜头偏移。
 using System;
 using System.Collections.Generic;
 using Gui;
 
 public class FxMark {
-    public int kind;  // 0 曳光, 1 爆炸
-    public double x0;
-    public double y0;
+    public int kind;
+    public double x;
+    public double y;
     public double x1;
     public double y1;
-    public int team;
-    public int life;
-    public int maxLife;
-    public int size;
+    public double vx;
+    public double vy;
+    public double life;
+    public double maxLife;
+    public double size;
+    public int color;
+    public string text;
 }
 
 public class BattleFx {
-    List<FxMark> marks = new List<FxMark>();
+    public const int Tracer = 0;
+    public const int Flash = 1;
+    public const int Spark = 2;
+    public const int Shock = 3;
+    public const int Debris = 4;
+    public const int Smoke = 5;
+    public const int Scorch = 6;
+    public const int Ping = 7;
+    public const int Warp = 8;
+    public const int Float = 9;
+    public const int Shell = 10;
+    public const int Pulse = 11;
 
-    public void Clear() { this.marks.Clear(); }
+    List<FxMark> marks = new List<FxMark>();
+    List<FxMark> decals = new List<FxMark>();
+    long seed = 12345;
+    double shake = 0.0;
+    double clock = 0.0;
+
+    public void Clear() {
+        this.marks.Clear();
+        this.decals.Clear();
+        this.shake = 0.0;
+    }
+
+    public int Count() { return this.marks.Count; }
+
+    // 表现层的小随机（不进仿真，不影响回放）
+    double Rand() {
+        this.seed = (this.seed * (long)1103515245 + (long)12345) % (long)2147483648;
+        int v = (int)((this.seed >> 8) & (long)0xFFFF);
+        return (double)v / 65535.0;
+    }
+
+    FxMark Add(int kind, double x, double y, double life, double size, int color) {
+        FxMark m = new FxMark();
+        m.kind = kind;
+        m.x = x;
+        m.y = y;
+        m.life = life;
+        m.maxLife = life;
+        m.size = size;
+        m.color = color;
+        if (kind == Scorch) {
+            if (this.decals.Count > 60) { this.decals.RemoveAt(0); }
+            this.decals.Add(m);
+        } else if (this.marks.Count < 1400) {
+            this.marks.Add(m);
+        }
+        return m;
+    }
+
+    public void AddShake(double amount) {
+        if (amount > this.shake) { this.shake = amount; }
+    }
+
+    public double ShakeX() { return this.shake * Math.Sin(this.clock * 61.0); }
+    public double ShakeY() { return this.shake * Math.Cos(this.clock * 47.0); }
 
     public void AddShot(RtsShot s) {
-        FxMark m = new FxMark();
-        m.kind = 0;
-        m.x0 = s.fromX;
-        m.y0 = s.fromY;
-        m.x1 = s.toX;
-        m.y1 = s.toY;
-        m.team = s.team;
-        m.size = s.type == 1 ? 2 : 1;
-        m.life = 3;
-        m.maxLife = 3;
-        this.marks.Add(m);
+        double c = Math.Cos(s.facing);
+        double sn = Math.Sin(s.facing);
+        double reach = RtsUnit.RadiusOf(s.type) + (s.type == RtsUnit.Artillery ? 12.0 : 4.0);
+        double mx = s.fromX + c * reach;
+        double my = s.fromY + sn * reach;
+        bool blue = s.team == 0;
+        int tracer = blue ? 0xFF9FE8FF : 0xFFFFB0A0;
+        if (s.type == RtsUnit.Artillery) {
+            this.Add(Flash, mx, my, 0.12, 11.0, 0xFFFFE6A0);
+            FxMark smoke = this.Add(Smoke, mx, my, 0.9, 7.0, 0x8890A0B0);
+            smoke.vx = c * 14.0;
+            smoke.vy = sn * 14.0 - 6.0;
+            FxMark shell = this.Add(Shell, mx, my, 0.45, 3.0, 0xFFFFF2C0);
+            shell.x1 = s.toX;
+            shell.y1 = s.toY;
+            return;
+        }
+        if (s.type == RtsUnit.Tank || s.type == RtsUnit.Hq) {
+            this.Add(Flash, mx, my, 0.09, s.type == RtsUnit.Hq ? 7.0 : 9.0, 0xFFFFF0B0);
+            FxMark t = this.Add(Tracer, mx, my, 0.12, 3.0, s.type == RtsUnit.Hq ? (blue ? 0xFF5FDCFF : 0xFFFF6A7A) : tracer);
+            t.x1 = s.toX;
+            t.y1 = s.toY;
+            this.Impact(s.toX, s.toY, 4, 0xFFFFD27A);
+            this.Add(Flash, s.toX, s.toY, 0.1, 7.0, 0xFFFFB050);
+            return;
+        }
+        this.Add(Flash, mx, my, 0.06, 4.0, 0xFFFFF4C8);
+        FxMark tr = this.Add(Tracer, mx, my, 0.07, 1.0, tracer);
+        tr.x1 = s.toX + (this.Rand() - 0.5) * 6.0;
+        tr.y1 = s.toY + (this.Rand() - 0.5) * 6.0;
+        if (this.Rand() < 0.5) { this.Impact(tr.x1, tr.y1, 2, 0xFFFFE08A); }
     }
 
-    public void AddBlast(RtsUnit u) {
-        FxMark m = new FxMark();
-        m.kind = 1;
-        m.x0 = u.X;
-        m.y0 = u.Y;
-        m.team = u.Team;
-        m.size = (int)u.Radius;
-        m.life = 10;
-        m.maxLife = 10;
-        this.marks.Add(m);
-    }
-
-    public void Tick() {
-        for (int i = this.marks.Count - 1; i >= 0; i = i - 1) {
-            FxMark m = this.marks[i];
-            m.life = m.life - 1;
-            if (m.life <= 0) { this.marks.RemoveAt(i); }
+    void Impact(double x, double y, int n, int color) {
+        for (int i = 0; i < n; i = i + 1) {
+            double a = this.Rand() * Math.PI * 2.0;
+            double sp = 40.0 + this.Rand() * 90.0;
+            FxMark m = this.Add(Spark, x, y, 0.18 + this.Rand() * 0.12, 1.5, color);
+            m.vx = Math.Cos(a) * sp;
+            m.vy = Math.Sin(a) * sp;
         }
     }
 
-    public void Render(Canvas c, int bx, int by) {
+    // 爆炸：规模按单位体量（步兵小、坦克/炮兵大、指挥中心巨大）。
+    public void AddBlast(RtsUnit u) {
+        double r = u.Radius;
+        double scale = u.Type == RtsUnit.Infantry ? 0.8 : (u.IsBuilding() ? 2.4 : 1.4);
+        this.Explosion(u.X, u.Y, r * scale + 6.0, u.Type == RtsUnit.Infantry ? 4 : (u.IsBuilding() ? 26 : 10));
+        if (u.Type == RtsUnit.Tank || u.Type == RtsUnit.Artillery || u.Type == RtsUnit.Miner) { this.AddShake(3.5); }
+        if (u.IsBuilding()) {
+            this.AddShake(12.0);
+            for (int i = 0; i < 5; i = i + 1) {
+                this.Explosion(u.X + (this.Rand() - 0.5) * 80.0, u.Y + (this.Rand() - 0.5) * 80.0, 22.0, 6);
+            }
+        }
+    }
+
+    public void Explosion(double x, double y, double radius, int debris) {
+        this.Add(Flash, x, y, 0.16, radius * 1.4, 0xFFFFF0C0);
+        this.Add(Flash, x, y, 0.42, radius, 0xFFFF8A2A);
+        this.Add(Shock, x, y, 0.38, radius * 2.0, 0xFFFFD08A);
+        this.Add(Scorch, x, y, 7.0, radius * 0.9, 0x000000);
+        for (int i = 0; i < debris; i = i + 1) {
+            double a = this.Rand() * Math.PI * 2.0;
+            double sp = 50.0 + this.Rand() * 140.0;
+            FxMark d = this.Add(Debris, x, y, 0.35 + this.Rand() * 0.35, 1.5 + this.Rand() * 1.5,
+                this.Rand() < 0.5 ? 0xFFFFC060 : 0xFF5A4A3A);
+            d.vx = Math.Cos(a) * sp;
+            d.vy = Math.Sin(a) * sp;
+        }
+        int puffs = 2 + debris / 4;
+        for (int i = 0; i < puffs; i = i + 1) {
+            FxMark s = this.Add(Smoke, x + (this.Rand() - 0.5) * radius, y + (this.Rand() - 0.5) * radius,
+                0.9 + this.Rand() * 0.8, radius * 0.5 + 3.0, 0x99303842);
+            s.vx = (this.Rand() - 0.5) * 20.0;
+            s.vy = -10.0 - this.Rand() * 16.0;
+        }
+    }
+
+    // 行军令落点：外扩光环 + 四个向内收的箭头（绿 = 行军，红 = 攻击，青 = 集结点）。
+    public void AddPing(double x, double y, int kind) {
+        int col = kind == 2 ? 0xFFFF5468 : (kind == 3 ? 0xFF5FDCFF : 0xFF46F0A0);
+        this.Add(Ping, x, y, 0.6, 24.0, col);
+    }
+
+    public void AddWarp(double x, double y, int team) {
+        this.Add(Warp, x, y, 0.5, 20.0, team == 0 ? 0xFF5FDCFF : 0xFFFF6A7A);
+    }
+
+    public void AddFloat(double x, double y, string text, int color) {
+        FxMark m = this.Add(Float, x, y, 0.9, 13.0, color);
+        m.text = text;
+        m.vy = -28.0;
+    }
+
+    public void AddPulse(double x, double y, double radius, int color) {
+        this.Add(Pulse, x, y, 0.9, radius, color);
+    }
+
+    public void Update(double dt) {
+        this.clock = this.clock + dt;
+        this.shake = Math.Max(0.0, this.shake - dt * 30.0);
+        for (int i = this.marks.Count - 1; i >= 0; i = i - 1) {
+            FxMark m = this.marks[i];
+            m.life = m.life - dt;
+            if (m.life <= 0.0) {
+                if (m.kind == Shell) {
+                    // 炮弹落地：小爆炸
+                    this.Explosion(m.x1, m.y1, 14.0, 5);
+                    this.AddShake(1.5);
+                }
+                this.marks.RemoveAt(i);
+                continue;
+            }
+            if (m.kind == Spark || m.kind == Debris || m.kind == Smoke || m.kind == Float) {
+                m.x = m.x + m.vx * dt;
+                m.y = m.y + m.vy * dt;
+                double drag = m.kind == Smoke ? 0.6 : 3.0;
+                m.vx = m.vx * Math.Max(0.0, 1.0 - drag * dt);
+                m.vy = m.vy * Math.Max(0.0, 1.0 - drag * dt);
+            }
+        }
+        for (int i = this.decals.Count - 1; i >= 0; i = i - 1) {
+            FxMark d = this.decals[i];
+            d.life = d.life - dt;
+            if (d.life <= 0.0) { this.decals.RemoveAt(i); }
+        }
+    }
+
+    static int WithAlpha(int color, double a) {
+        int ai = (int)(a * (double)((color >> 24) & 255));
+        if (ai < 0) { ai = 0; }
+        if (ai > 255) { ai = 255; }
+        return (ai << 24) | (color & 0x00FFFFFF);
+    }
+
+    // 地面层：焦痕（画在单位下面）。
+    public void RenderGround(Canvas c, double ox, double oy) {
+        for (int i = 0; i < this.decals.Count; i = i + 1) {
+            FxMark d = this.decals[i];
+            double t = d.life / d.maxLife;
+            int a = (int)(110.0 * Math.Min(1.0, t * 2.0));
+            c.FillCircle((int)(d.x - ox), (int)(d.y - oy), (int)d.size, (a << 24) | 0x0A0806);
+            c.FillCircle((int)(d.x - ox), (int)(d.y - oy), (int)(d.size * 0.55), ((a * 3 / 4) << 24) | 0x000000);
+        }
+    }
+
+    // 空中层：画在单位上面。
+    public void Render(Canvas c, double ox, double oy) {
         for (int i = 0; i < this.marks.Count; i = i + 1) {
             FxMark m = this.marks[i];
-            if (m.kind == 0) {
-                int col = m.team == 0 ? 0xDD93C5FD : 0xDDFCA5A5;
-                c.DrawLine(bx + (int)m.x0, by + (int)m.y0, bx + (int)m.x1, by + (int)m.y1, col, m.size);
-                c.FillCircle(bx + (int)m.x1, by + (int)m.y1, m.size + 1, 0xEEFDE68A);
-            } else {
-                // 爆炸：外扩的火环 + 渐隐焦痕
-                int age = m.maxLife - m.life;
-                int r = m.size + age * 2;
-                int alpha = (m.life * 255) / m.maxLife;
-                c.FillCircle(bx + (int)m.x0, by + (int)m.y0, r, (alpha / 2 << 24) | 0x00F97316);
-                c.DrawCircle(bx + (int)m.x0, by + (int)m.y0, r + 2, (alpha << 24) | 0x00FDE68A, 2);
+            double t = m.life / m.maxLife;  // 1 → 0
+            double age = 1.0 - t;
+            int x = (int)(m.x - ox);
+            int y = (int)(m.y - oy);
+            if (m.kind == Tracer) {
+                int x1 = (int)(m.x1 - ox);
+                int y1 = (int)(m.y1 - oy);
+                if (m.size >= 2.0) { c.DrawLine(x, y, x1, y1, BattleFx.WithAlpha(m.color, 0.35 * t), (int)m.size + 3); }
+                c.DrawLine(x, y, x1, y1, BattleFx.WithAlpha(m.color, t), (int)m.size);
+            } else if (m.kind == Flash) {
+                int r = (int)(m.size * (0.6 + 0.4 * t));
+                c.FillRadial(x, y, r + 2, BattleFx.WithAlpha(m.color, t), (int)(255.0 * t));
+            } else if (m.kind == Spark) {
+                c.FillRect(x, y, 2, 2, BattleFx.WithAlpha(m.color, t));
+            } else if (m.kind == Debris) {
+                int s = (int)m.size + 1;
+                c.FillRect(x, y, s, s, BattleFx.WithAlpha(m.color, Math.Min(1.0, t * 1.6)));
+            } else if (m.kind == Smoke) {
+                int r = (int)(m.size * (1.0 + age * 1.6));
+                c.FillCircle(x, y, r, BattleFx.WithAlpha(m.color, t * 0.8));
+            } else if (m.kind == Shock) {
+                int r = (int)(m.size * (0.2 + 0.8 * age));
+                c.DrawCircle(x, y, r, BattleFx.WithAlpha(m.color, t * 0.8), 2);
+            } else if (m.kind == Shell) {
+                // 炮弹沿抛物线飞向落点，带一段拖尾
+                double x0 = m.x;
+                double y0 = m.y;
+                double px = x0 + (m.x1 - x0) * age;
+                double py = y0 + (m.y1 - y0) * age - Math.Sin(age * Math.PI) * 40.0;
+                double qa = Math.Max(0.0, age - 0.12);
+                double qx = x0 + (m.x1 - x0) * qa;
+                double qy = y0 + (m.y1 - y0) * qa - Math.Sin(qa * Math.PI) * 40.0;
+                c.DrawLine((int)(qx - ox), (int)(qy - oy), (int)(px - ox), (int)(py - oy), 0x88FFD08A, 2);
+                c.FillCircle((int)(px - ox), (int)(py - oy), 3, m.color);
+                c.FillCircle((int)(m.x1 - ox), (int)(m.y1 - oy), 6, BattleFx.WithAlpha(0x66FF5A3A, 0.4 + 0.6 * age));
+            } else if (m.kind == Ping) {
+                int r = (int)(6.0 + m.size * age);
+                c.DrawCircle(x, y, r, BattleFx.WithAlpha(m.color, t), 2);
+                c.DrawCircle(x, y, (int)(4.0 + 6.0 * t), BattleFx.WithAlpha(m.color, t), 2);
+                int arm = (int)(10.0 + 14.0 * t);
+                c.DrawLine(x - arm - 6, y, x - arm, y, BattleFx.WithAlpha(m.color, t), 2);
+                c.DrawLine(x + arm, y, x + arm + 6, y, BattleFx.WithAlpha(m.color, t), 2);
+                c.DrawLine(x, y - arm - 6, x, y - arm, BattleFx.WithAlpha(m.color, t), 2);
+                c.DrawLine(x, y + arm, x, y + arm + 6, BattleFx.WithAlpha(m.color, t), 2);
+            } else if (m.kind == Warp) {
+                int r = (int)(m.size * (1.2 - age));
+                c.DrawCircle(x, y, r, BattleFx.WithAlpha(m.color, t), 2);
+                c.FillRadial(x, y, (int)(m.size * 0.8), BattleFx.WithAlpha(m.color, t * 0.6), (int)(160.0 * t));
+            } else if (m.kind == Float) {
+                c.DrawTextBold(x - 12 + 1, y + 1, m.text, BattleFx.WithAlpha(0xFF000000, t), 13);
+                c.DrawTextBold(x - 12, y, m.text, BattleFx.WithAlpha(m.color, Math.Min(1.0, t * 2.0)), 13);
+            } else if (m.kind == Pulse) {
+                int r = (int)(m.size * (0.5 + age));
+                c.DrawCircle(x, y, r, BattleFx.WithAlpha(m.color, t), 3);
+                c.DrawCircle(x, y, r + 8, BattleFx.WithAlpha(m.color, t * 0.4), 2);
             }
         }
     }

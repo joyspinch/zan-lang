@@ -12,16 +12,12 @@ public enum RlpType {
 // RLP 结构化项，可表示单个字节串或嵌套列表
 public class RlpItem {
     private static byte[] s_emptyBytes;
-    private static string emptyLock = "Zan.RlpItem.Empty";
 
     private static byte[] EmptyBytes() {
-        if (RlpItem.s_emptyBytes != null) { return RlpItem.s_emptyBytes; }
-        lock (RlpItem.emptyLock) {
-            if (RlpItem.s_emptyBytes == null) {
-                RlpItem.s_emptyBytes = new byte[0];
-            }
-            return RlpItem.s_emptyBytes;
+        if (RlpItem.s_emptyBytes == null) {
+            RlpItem.s_emptyBytes = new byte[0];
         }
+        return RlpItem.s_emptyBytes;
     }
 
     public RlpType Type;
@@ -117,46 +113,38 @@ public class Rlp {
         return pos + lenOfLen;
     }
 
-    private static int MeasureList(RlpItem listItem, RlpSizePlan plan, int depth) {
-        if (depth > 128) { throw new ArgumentException("Rlp.Encode: nesting depth exceeds limit"); }
+    private static int MeasureList(RlpItem listItem, RlpSizePlan plan) {
         int slot = plan.AllocSlot();
-        long payloadLen = 0L;
+        int payloadLen = 0;
         List<RlpItem> items = listItem.Items;
         if (items != null) {
             int cnt = items.Count;
             for (int i = 0; i < cnt; i = i + 1) {
                 RlpItem child = items[i];
                 if (child == null) {
-                    payloadLen = payloadLen + 1L;
+                    payloadLen = payloadLen + 1;
                 } else if (child.Type == RlpType.Bytes) {
                     byte[] b = child.RawBytes;
                     if (b == null || b.Length == 0) {
-                        payloadLen = payloadLen + 1L;
+                        payloadLen = payloadLen + 1;
                     } else {
                         int blen = b.Length;
                         if (blen == 1 && (b[0] & 255) <= 0x7f) {
-                            payloadLen = payloadLen + 1L;
+                            payloadLen = payloadLen + 1;
                         } else if (blen <= 55) {
-                            payloadLen = payloadLen + 1L + (long)blen;
+                            payloadLen = payloadLen + 1 + blen;
                         } else {
-                            payloadLen = payloadLen + 1L + (long)BigEndianLenSize(blen) + (long)blen;
+                            payloadLen = payloadLen + 1 + BigEndianLenSize(blen) + blen;
                         }
                     }
                 } else {
-                    payloadLen = payloadLen + (long)MeasureList(child, plan, depth + 1);
-                }
-                if (payloadLen > 2147483640L) {
-                    throw new ArgumentException("Rlp.Encode: encoded payload exceeds 2 GiB limit");
+                    payloadLen = payloadLen + MeasureList(child, plan);
                 }
             }
         }
-        int pLen = (int)payloadLen;
-        plan.lens[slot] = pLen;
-        long total = pLen <= 55 ? (1L + payloadLen) : (1L + (long)BigEndianLenSize(pLen) + payloadLen);
-        if (total > 2147483647L) {
-            throw new ArgumentException("Rlp.Encode: encoded size exceeds 2 GiB limit");
-        }
-        return (int)total;
+        plan.lens[slot] = payloadLen;
+        if (payloadLen <= 55) { return 1 + payloadLen; }
+        return 1 + BigEndianLenSize(payloadLen) + payloadLen;
     }
 
     private static int WriteList(RlpItem listItem, byte[] dst, nint dstPtr, int pos, int[] lens, RlpSizePlan plan) {
@@ -235,9 +223,6 @@ public class Rlp {
             return res;
         }
         int lol = BigEndianLenSize(blen);
-        if ((long)blen > 2147483647L - 1L - (long)lol) {
-            throw new ArgumentException("Rlp.EncodeBytes: input exceeds 2 GiB limit");
-        }
         byte[] outb = new byte[1 + lol + blen];
         outb[0] = (byte)(0xb7 + lol);
         int offset = WriteBigEndianLen(outb, 1, blen, lol);
@@ -253,16 +238,12 @@ public class Rlp {
 
     // 编码已经序列化的子项列表
     public static byte[] EncodeListRaw(List<byte[]> encodedItems) {
-        long totalPayloadLenL = 0L;
+        int totalPayloadLen = 0;
         int cnt = encodedItems != null ? encodedItems.Count : 0;
         for (int i = 0; i < cnt; i = i + 1) {
             byte[] it = encodedItems[i];
-            totalPayloadLenL = totalPayloadLenL + (it != null ? (long)it.Length : 1L);
-            if (totalPayloadLenL > 2147483640L) {
-                throw new ArgumentException("Rlp.EncodeListRaw: encoded payload exceeds 2 GiB limit");
-            }
+            totalPayloadLen = totalPayloadLen + (it != null ? it.Length : 1);
         }
-        int totalPayloadLen = (int)totalPayloadLenL;
         byte[] outb;
         int offset;
         if (totalPayloadLen <= 55) {
@@ -299,7 +280,7 @@ public class Rlp {
             return EncodeBytes(item != null ? item.RawBytes : null);
         }
         RlpSizePlan plan = new RlpSizePlan();
-        int total = MeasureList(item, plan, 0);
+        int total = MeasureList(item, plan);
         byte[] outb = new byte[total];
         WriteList(item, outb, (nint)outb, 0, plan.lens, plan);
         return outb;

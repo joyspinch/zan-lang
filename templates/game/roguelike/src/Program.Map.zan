@@ -1,0 +1,126 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Game.Cards;
+
+// 地图页：左边分岔地图（MapBoard 画连线，节点是标准按钮），右边本幕信息与图例。
+public partial class Program {
+
+    static string ActName(int act) {
+        if (act == 1) { return "地牢"; }
+        if (act == 2) { return "墓城"; }
+        return "深渊";
+    }
+
+    static string ActBlurb(int act) {
+        if (act == 1) { return "潮湿的地牢里，骸骨君王守着通往墓城的阶梯。"; }
+        if (act == 2) { return "墓城的钟声不停，腐化女巫在钟楼上等你。"; }
+        return "深渊的尽头只有一扇门，和守门的那个东西。";
+    }
+
+    void BuildMap() {
+        RunState r = this.flow.run;
+        this.BuildTopBar("选择路线");
+        Panel body = this.Row("rg-fill");
+        body.Gap(12);
+
+        List<MapNode> choices = r.Choices();
+        MapBoard board = new MapBoard(r.map, r.pos);
+        board.Class = "rg-map";
+        board.Pad(10);
+        for (int row = ActMap.Rows(); row >= 0; row = row - 1) {
+            Panel line = this.Row("rg-map-row");
+            List<MapNode> nodes = r.map.RowNodes(row);
+            if (row == ActMap.Rows()) {
+                MapNode boss = nodes[0];
+                Button b = this.MapNodeButton(boss, choices);
+                board.Bind(boss.index, b);
+                line.With(b);
+            } else {
+                for (int c = 0; c < ActMap.Cols(); c = c + 1) {
+                    Panel slot = this.Row("rg-map-slot");
+                    MapNode at = null;
+                    for (int k = 0; k < nodes.Count; k = k + 1) {
+                        if (nodes[k].col == c) { at = nodes[k]; }
+                    }
+                    if (at != null) {
+                        // 种子决定的水平微偏：一侧垫一块空白，节点就偏开几像素。
+                        if (at.jitter > 0) { slot.With(this.Gap(at.jitter * 2)); }
+                        Button b = this.MapNodeButton(at, choices);
+                        board.Bind(at.index, b);
+                        slot.With(b);
+                        if (at.jitter < 0) { slot.With(this.Gap(-at.jitter * 2)); }
+                    }
+                    line.With(slot);
+                }
+            }
+            board.With(line);
+        }
+        body.With(board);
+        body.With(this.MapSide(choices));
+        root.With(body);
+    }
+
+    Panel Gap(int width) {
+        Panel p = this.Row("rg-gap");
+        p.Prefer(width, 2);
+        return p;
+    }
+
+    // 一个节点按钮：可走 = 亮、可点；走过 = 暗金；当前位置 = 金环；其余锁定（禁用态）。
+    Button MapNodeButton(MapNode n, List<MapNode> choices) {
+        bool avail = false;
+        int pick = -1;
+        for (int i = 0; i < choices.Count; i = i + 1) {
+            if (choices[i].index == n.index) { avail = true; pick = i; }
+        }
+        bool here = n.index == this.flow.run.pos;
+        Label glyph = this.Txt(MapNode.Glyph(n.kind), "rg-mglyph" + (n.kind == MapNode.Boss() ? " rg-mglyph-boss" : ""));
+        Button b = new Button(glyph);
+        string state = avail ? "rg-ms-avail" : (here ? "rg-ms-here" : (n.visited ? "rg-ms-done" : "rg-ms-locked"));
+        b.Class = "rg-mnode rg-mk-" + n.kind + " " + state + (n.kind == MapNode.Boss() ? " rg-mnode-boss" : "");
+        b.name = avail ? "go" + pick : "node" + n.index;
+        string tip = MapNode.KindHint(n.kind);
+        if (n.kind == MapNode.Boss()) {
+            EnemyDef boss = this.flow.bestiary.Pick(this.flow.run.act, 2, 0, false);
+            tip = "Boss：" + boss.name + "——" + boss.blurb;
+        }
+        if (here) { tip = tip + "（你在这里）"; }
+        else if (n.visited) { tip = tip + "（已走过）"; }
+        b.Tip = tip;
+        if (avail) {
+            b.OnClick(() => { this.EnterNode(n); });
+        } else {
+            b.Disabled = true;
+        }
+        return b;
+    }
+
+    // 右栏：本幕标题、下一步可去哪、图例、牌组与遗物概况。
+    Panel MapSide(List<MapNode> choices) {
+        RunState r = this.flow.run;
+        Panel side = this.Col("rg-panel rg-map-side");
+        side.Pad(16);
+        side.Gap(8);
+        side.With(this.Txt("第 " + r.act + " 幕 · " + Program.ActName(r.act), "rg-h2"));
+        side.With(this.Para(Program.ActBlurb(r.act), "rg-dim rg-wrap"));
+        if (this.toast != "") { side.With(this.Txt(this.toast, "rg-toast")); }
+        else if (this.flow.lastNote != "") { side.With(this.Txt(this.flow.lastNote, "rg-toast")); }
+        side.With(this.Txt("图例", "rg-cap"));
+        int[] kinds = new int[]{ MapNode.Battle(), MapNode.Elite(), MapNode.Event(), MapNode.Shop(),
+                                 MapNode.Campfire(), MapNode.Treasure(), MapNode.Boss() };
+        for (int i = 0; i < kinds.Length; i = i + 1) {
+            Panel line = this.Row("rg-mid");
+            line.Gap(10);
+            Label g = this.Txt(MapNode.Glyph(kinds[i]), "rg-legend-dot rg-mk-" + kinds[i]);
+            line.With(g);
+            line.With(this.Txt(MapNode.KindHint(kinds[i]), "rg-text-sm"));
+            side.With(line);
+        }
+        side.With(this.Spacer());
+        side.With(this.Txt(choices.Count > 0 ? "点亮着的节点前进（" + choices.Count + " 条路）" : "", "rg-dim"));
+        return side;
+    }
+}

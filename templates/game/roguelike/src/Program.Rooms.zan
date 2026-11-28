@@ -1,0 +1,355 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Game.Cards;
+
+// 战利品、篝火、商店、奇遇、选牌（升级 / 移除）五种"房间"。
+public partial class Program {
+
+    // ---- 战利品 ----------------------------------------------------------------
+
+    void BuildLoot() {
+        this.BuildTopBar(this.flow.node != null && this.flow.node.kind == MapNode.Treasure() ? "宝箱" : "战利品");
+        Panel page = this.Col("rg-fill rg-center");
+        page.Gap(12);
+        bool chest = this.flow.rewardChoices.Count == 0;
+        page.With(this.Txt(chest ? "宝箱开了！" : (this.flow.relicChoices.Count > 0 ? "Boss 倒下了！" : "胜利！"), "rg-h3 rg-center"));
+
+        Panel gains = this.Row("rg-mid rg-center");
+        gains.Gap(12);
+        if (chest) { gains.With(new SceneArt("chest", 120)); }
+        if (this.flow.rewardGold > 0) { gains.With(this.Txt("+" + this.flow.rewardGold + " 金币", "rg-gain rg-gain-gold")); }
+        if (this.flow.rewardRelic != "" && this.flow.relicChoices.Count == 0) {
+            gains.With(this.RelicCard(this.flow.rewardRelic, false, -1));
+        }
+        page.With(gains);
+
+        if (this.flow.relicChoices.Count > 0) {
+            page.With(this.Txt(this.flow.relicDone ? "已选：" + this.flow.relicBook.Name(this.flow.rewardRelic)
+                : "选一件 Boss 遗物（整局生效）", "rg-text rg-ember rg-center"));
+            Panel row = this.Row("rg-mid rg-center");
+            row.Gap(14);
+            for (int i = 0; i < this.flow.relicChoices.Count; i = i + 1) {
+                row.With(this.RelicCard(this.flow.relicChoices[i], !this.flow.relicDone, i));
+            }
+            page.With(row);
+        }
+
+        if (!chest && !this.flow.cardDone) {
+            page.With(this.Txt("选一张牌加入牌组", "rg-text rg-center"));
+            Panel row = this.Row("rg-mid rg-center");
+            row.Gap(28);
+            for (int i = 0; i < this.flow.rewardChoices.Count; i = i + 1) {
+                row.With(this.RewardCard(this.flow.rewardChoices[i], i));
+            }
+            page.With(row);
+        }
+        Panel actions = this.Row("rg-center");
+        actions.Gap(12);
+        Button skip = new Button(chest || this.flow.cardDone ? "继续前进" : "跳过（保持牌组精简）");
+        skip.Class = chest || this.flow.cardDone ? "rg-cta rg-big-btn" : "rg-btn";
+        skip.name = "skip";
+        if (!this.flow.relicDone && (chest || this.flow.cardDone)) { skip.Disabled = true; }
+        skip.OnClick(() => {
+            int prev = this.flow.phase;
+            this.flow.SkipCards();
+            this.shell.Play("click");
+            this.AfterStep(prev);
+        });
+        actions.With(skip);
+        page.With(actions);
+        root.With(page);
+    }
+
+    // 遗物卡：大号徽章 + 名字 + 效果；index ≥ 0 时可点（Boss 遗物三选一）。
+    Button RelicCard(string id, bool pickable, int index) {
+        Panel face = this.Col("rg-relic-face rg-mid");
+        face.Gap(4);
+        face.With(this.Txt(this.flow.relicBook.Glyph(id), "rg-relic-big" + (this.flow.relicBook.Tier(id) == RelicBook.BossTier() ? " rg-relic-boss" : "")));
+        face.With(this.Txt(this.flow.relicBook.Name(id), "rg-text rg-gold rg-center"));
+        face.With(this.Para(this.flow.relicBook.Desc(id), "rg-dim rg-center rg-wrap"));
+        Button b = new Button(face);
+        b.Class = "rg-relic-card";
+        b.Tip = this.flow.relicBook.Name(id) + "：" + this.flow.relicBook.Desc(id);
+        if (index >= 0 && pickable) {
+            b.OnClick(() => {
+                int prev = this.flow.phase;
+                this.flow.TakeRelic(index);
+                this.shell.Play("power");
+                this.AfterStep(prev);
+            });
+        } else if (index >= 0) {
+            b.Disabled = true;
+        }
+        return b;
+    }
+
+    Panel RewardCard(string cardId, int index) {
+        CardDefinition def = this.flow.library.Find(cardId);
+        Panel col = this.Col("rg-mid");
+        col.Gap(6);
+        Button card = new Button(this.CardFace(def, true, null));
+        card.Class = "rg-card rg-card-big rg-card-" + def.Category() + (CardLibrary.IsUpgraded(cardId) ? " rg-card-up" : "");
+        card.Tip = CardLibrary.Glossary(def);
+        card.name = "reward" + index;
+        card.OnClick(() => { this.TakeReward(index); });
+        col.With(card);
+        col.With(this.Txt(CardLibrary.RarityName(this.flow.library.RarityOf(cardId)), "rg-rarity rg-rarity-" + this.flow.library.RarityOf(cardId)));
+        return col;
+    }
+
+    void TakeReward(int index) {
+        int prev = this.flow.phase;
+        this.flow.TakeReward(index);
+        this.shell.Play("coin");
+        this.AfterStep(prev);
+    }
+
+    // ---- 篝火 ------------------------------------------------------------------
+
+    void BuildCamp() {
+        RunState r = this.flow.run;
+        this.BuildTopBar("篝火");
+        Panel page = this.Row("rg-fill rg-center rg-mid");
+        page.Gap(40);
+        page.With(new SceneArt("campfire", 300));
+        Panel col = this.Col("rg-mid");
+        col.Gap(14);
+        col.With(this.Txt("篝火旁", "rg-h1"));
+        col.With(this.Txt("火光很暖。今晚只来得及做一件事。", "rg-text"));
+        int heal = r.maxHp * 3 / 10;
+        int real = r.maxHp - r.hp < heal ? r.maxHp - r.hp : heal;
+        Button rest = this.RoomOption("休息", "回复 " + heal + " 生命（" + r.hp + " → " + (r.hp + real) + "）", "rg-opt-rest");
+        rest.name = "rest";
+        rest.OnClick(() => {
+            int prev = this.flow.phase;
+            this.flow.Rest();
+            this.toast = this.flow.lastNote;
+            this.shell.Play("heal");
+            this.AfterStep(prev);
+        });
+        col.With(rest);
+        Button smith = this.RoomOption("锻造", "升级牌组里的一张牌（数值更高，部分费用降低）", "rg-opt-smith");
+        smith.name = "smith";
+        if (r.Upgradable().Count == 0) { smith.Disabled = true; }
+        smith.OnClick(() => { this.flow.Smith(); this.shell.Play("click"); this.BuildUi(); });
+        col.With(smith);
+        page.With(col);
+        root.With(page);
+    }
+
+    // 房间里的一个大选项：标题 + 一行说明，整块是一个标准按钮。
+    Button RoomOption(string title, string desc, string cls) {
+        Panel face = this.Col("rg-opt-face");
+        face.Gap(2);
+        face.With(this.Txt(title, "rg-opt-title"));
+        face.With(this.Txt(desc, "rg-opt-desc"));
+        Button b = new Button(face);
+        b.Class = "rg-opt " + cls;
+        return b;
+    }
+
+    // ---- 商店 ------------------------------------------------------------------
+
+    void BuildShop() {
+        RunState r = this.flow.run;
+        this.BuildTopBar("商店");
+        Panel page = this.Row("rg-fill");
+        page.Gap(16);
+        Panel keeper = this.Col("rg-panel rg-shop-keeper rg-mid");
+        keeper.Pad(14);
+        keeper.Gap(8);
+        keeper.With(new SceneArt("merchant", 210));
+        keeper.With(this.Txt("骷髅商人", "rg-h2"));
+        keeper.With(this.Txt("「金币换力量，公平交易。」", "rg-dim"));
+        keeper.With(this.Txt("「删牌也行——那是门手艺。」", "rg-dim"));
+        keeper.With(this.Txt("你有 " + r.gold + " 金币", "rg-gain rg-gain-gold"));
+        keeper.With(this.Spacer());
+        Button leave = new Button("离开商店");
+        leave.Class = "rg-cta rg-big-btn";
+        leave.name = "leave";
+        leave.OnClick(() => {
+            int prev = this.flow.phase;
+            this.flow.LeaveShop();
+            this.shell.Play("click");
+            this.AfterStep(prev);
+        });
+        keeper.With(leave);
+        page.With(keeper);
+
+        Panel wares = this.Col("rg-fill");
+        wares.Gap(10);
+        wares.With(this.Txt("卡牌", "rg-cap"));
+        Panel cards = this.Row("rg-mid");
+        cards.Gap(10);
+        for (int i = 0; i < this.flow.shopCards.Count; i = i + 1) { cards.With(this.ShopCard(i)); }
+        wares.With(cards);
+        wares.With(this.Txt("遗物与服务", "rg-cap"));
+        Panel row = this.Row("rg-mid");
+        row.Gap(12);
+        for (int i = 0; i < this.flow.shopRelics.Count; i = i + 1) { row.With(this.ShopRelic(i)); }
+        Button remove = this.RoomOption("删牌服务 · " + r.removeCost + " 金币",
+            this.flow.removeUsed ? "本店已经帮你删过一张了" : "从牌组移除一张牌（每用一次涨价 25）", "rg-opt-remove");
+        remove.name = "remove";
+        if (!this.flow.CanRemove()) { remove.Disabled = true; }
+        remove.OnClick(() => { this.flow.BuyRemoval(); this.shell.Play("click"); this.BuildUi(); });
+        row.With(remove);
+        wares.With(row);
+        page.With(wares);
+        root.With(page);
+    }
+
+    Panel ShopCard(int i) {
+        string id = this.flow.shopCards[i];
+        CardDefinition def = this.flow.library.Find(id);
+        bool sold = this.flow.shopSold[i];
+        Panel col = this.Col("rg-mid");
+        col.Gap(6);
+        Button card = new Button(this.CardFace(def, true, null));
+        card.Class = "rg-card rg-card-shop rg-card-" + def.Category() + (sold ? " rg-sold" : "");
+        card.Tip = CardLibrary.Glossary(def);
+        card.name = "buy" + i;
+        if (!this.flow.CanBuyCard(i)) { card.Disabled = true; }
+        card.OnClick(() => { this.flow.BuyCard(i); this.shell.Play("buy"); this.BuildUi(); });
+        col.With(card);
+        bool afford = this.flow.run.gold >= this.flow.shopPrices[i];
+        col.With(this.Txt(sold ? "已售出" : this.flow.shopPrices[i] + " 金币", sold ? "rg-price rg-price-sold" : (afford ? "rg-price" : "rg-price rg-price-poor")));
+        return col;
+    }
+
+    Panel ShopRelic(int i) {
+        string id = this.flow.shopRelics[i];
+        bool sold = this.flow.shopRelicSold[i];
+        Panel col = this.Col("rg-mid");
+        col.Gap(6);
+        Button b = this.RelicCard(id, false, -1);
+        b.name = "relic" + i;
+        if (!this.flow.CanBuyRelic(i)) { b.Disabled = true; }
+        else { b.OnClick(() => { this.flow.BuyRelic(i); this.shell.Play("buy"); this.shell.Play("power", 0.6); this.BuildUi(); }); }
+        col.With(b);
+        bool afford = this.flow.run.gold >= this.flow.shopRelicPrices[i];
+        col.With(this.Txt(sold ? "已售出" : this.flow.shopRelicPrices[i] + " 金币", sold ? "rg-price rg-price-sold" : (afford ? "rg-price" : "rg-price rg-price-poor")));
+        return col;
+    }
+
+    // ---- 奇遇 ------------------------------------------------------------------
+
+    void BuildEvent() {
+        int id = this.flow.eventId;
+        RunEvents ev = this.flow.events;
+        this.BuildTopBar("奇遇 · " + ev.Title(id));
+        Panel page = this.Row("rg-fill rg-center rg-mid");
+        page.Gap(36);
+        page.With(new SceneArt(id == 4 || id == 6 ? "altar" : (id == 1 ? "campfire" : (id == 3 ? "chest" : (id == 5 || id == 7 ? "merchant" : "altar"))), 260));
+        Panel col = this.Col("rg-panel rg-event");
+        col.Pad(22);
+        col.Gap(12);
+        col.With(this.Txt(ev.Title(id), "rg-h1"));
+        col.With(this.Para(ev.Text(id), "rg-text rg-wrap"));
+        if (!this.flow.eventDone) {
+            for (int i = 0; i < ev.OptionCount(id); i = i + 1) {
+                int option = i;
+                string text = ev.Option(id, i);
+                int cut = text.IndexOf("：");
+                Button b = this.RoomOption(cut > 0 ? text.Substring(0, cut) : text,
+                    cut > 0 ? text.Substring(cut + "：".Length) : "什么也不做，继续赶路", "rg-opt-event");
+                b.name = "opt" + i;
+                if (!ev.Enabled(this.flow, id, i)) { b.Disabled = true; b.Tip = "条件不足"; }
+                b.OnClick(() => {
+                    int prev = this.flow.phase;
+                    int gold = this.flow.run.gold;
+                    int hp = this.flow.run.hp;
+                    this.flow.ChooseEvent(option);
+                    if (this.flow.run.hp < hp) { this.shell.Play("hit", 0.8); }
+                    else if (this.flow.run.gold > gold) { this.shell.Play("coin"); }
+                    else { this.shell.Play("click"); }
+                    this.AfterStep(prev);
+                });
+                col.With(b);
+            }
+        } else {
+            col.With(this.Txt(this.flow.eventResult, "rg-toast"));
+            Button go = new Button("继续前进");
+            go.Class = "rg-cta rg-big-btn";
+            go.name = "continue";
+            go.OnClick(() => {
+                int prev = this.flow.phase;
+                this.flow.EventContinue();
+                this.shell.Play("click");
+                this.AfterStep(prev);
+            });
+            col.With(go);
+        }
+        page.With(col);
+        root.With(page);
+    }
+
+    // ---- 选牌（升级 / 移除） ----------------------------------------------------
+
+    void BuildPicker() {
+        int purpose = this.flow.pickPurpose;
+        string title = purpose == 1 ? "锻造：选一张牌升级" : "选一张牌移出牌组";
+        this.BuildTopBar(title);
+        Panel head = this.Row("rg-mid");
+        head.Gap(12);
+        head.With(this.Txt(purpose == 1 ? "升级后的牌数值更高，部分费用降低" : "牌组越精，好牌抽得越勤", "rg-text"));
+        head.With(this.Spacer());
+        head.With(this.Txt(purpose == 1 ? "悬停查看升级后的效果" : (this.flow.pickPrice > 0 ? "花费 " + this.flow.pickPrice + " 金币" : "免费"), "rg-dim"));
+        Button cancel = new Button("取消");
+        cancel.Class = "rg-btn";
+        cancel.name = "cancel";
+        cancel.OnClick(() => { this.flow.CancelPick(); this.shell.Play("click"); this.BuildUi(); });
+        head.With(cancel);
+        root.With(head);
+
+        Panel grid = this.Col("rg-fill");
+        grid.Gap(8);
+        Panel line = null;
+        for (int i = 0; i < this.flow.pickList.Count; i = i + 1) {
+            if (i % 6 == 0) {
+                line = this.Row("");
+                line.Gap(8);
+                grid.With(line);
+            }
+            line.With(this.PickChip(i, purpose));
+        }
+        root.With(grid);
+    }
+
+    // 牌组里的一张牌（紧凑条）：费用 + 名字 + 第一行效果；升级模式下第二行是升级后。
+    Button PickChip(int i, int purpose) {
+        string id = this.flow.run.deck[this.flow.pickList[i]];
+        CardDefinition def = this.flow.library.Find(id);
+        Panel face = this.Col("rg-chipcard-face");
+        face.Gap(2);
+        Panel top = this.Row("rg-mid");
+        top.Gap(6);
+        top.With(this.Txt(Convert.ToString(def.Cost()), "rg-cost rg-cost-sm"));
+        top.With(this.Txt(def.Name(), "rg-chipcard-name"));
+        face.With(top);
+        List<string> lines = CardLibrary.Describe(def);
+        string now = lines.Count > 0 ? lines[0] : "";
+        if (purpose == 1) {
+            CardDefinition up = this.flow.library.Find(CardLibrary.UpgradeOf(id));
+            List<string> upLines = CardLibrary.Describe(up);
+            face.With(this.Txt(now, "rg-chipcard-fx"));
+            face.With(this.Txt("→ " + (upLines.Count > 0 ? upLines[0] : "") + (up.Cost() < def.Cost() ? "，费用 " + up.Cost() : ""), "rg-chipcard-up"));
+        } else {
+            face.With(this.Txt(now, "rg-chipcard-fx"));
+        }
+        Button b = new Button(face);
+        b.Class = "rg-chipcard rg-chipcard-" + def.Category();
+        b.Tip = purpose == 1 ? CardLibrary.Glossary(this.flow.library.Find(CardLibrary.UpgradeOf(id))) : CardLibrary.Glossary(def);
+        b.name = "pick" + i;
+        b.OnClick(() => {
+            int prev = this.flow.phase;
+            this.flow.PickCard(i);
+            this.toast = this.flow.lastNote;
+            this.shell.Play(purpose == 1 ? "upgrade" : "hex");
+            this.AfterStep(prev);
+        });
+        return b;
+    }
+}

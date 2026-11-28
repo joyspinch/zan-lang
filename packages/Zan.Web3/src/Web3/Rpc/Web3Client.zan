@@ -1,7 +1,6 @@
 using System;
 using System.Json;
 using System.Security.Cryptography;
-using System.Threading;
 using Web3.Types;
 using Web3.Encoding;
 
@@ -71,18 +70,6 @@ public class Web3Client {
         parseUrl(RpcUrl);
     }
 
-    private static int ParseStrictPort(string portStr) {
-        if (portStr == null || portStr.Length == 0 || portStr.Length > 5) { return -1; }
-        int p = 0;
-        for (int i = 0; i < portStr.Length; i = i + 1) {
-            int c = (portStr[i] & 255) - 48;
-            if (c < 0 || c > 9) { return -1; }
-            p = p * 10 + c;
-        }
-        if (p < 1 || p > 65535) { return -1; }
-        return p;
-    }
-
     // 解析标准 HTTP / HTTPS RPC URL
     private void parseUrl(string url) {
         string u = url.Trim();
@@ -114,8 +101,13 @@ public class Web3Client {
                 string rest = Host.Substring(rb + 1);
                 Host = Host.Substring(1, rb - 1);
                 if (rest.StartsWith(":")) {
-                    int p = Web3Client.ParseStrictPort(rest.Substring(1));
-                    if (p > 0) { Port = p; }
+                    string portStr = rest.Substring(1);
+                    int p = 0;
+                    for (int i = 0; i < portStr.Length; i = i + 1) {
+                        int c = portStr[i] - 48;
+                        if (c >= 0 && c <= 9) { p = p * 10 + c; }
+                    }
+                    if (p > 0 && p <= 65535) { Port = p; }
                 }
             }
         } else {
@@ -123,26 +115,14 @@ public class Web3Client {
             if (colonIdx >= 0) {
                 string portStr = Host.Substring(colonIdx + 1);
                 Host = Host.Substring(0, colonIdx);
-                int p = Web3Client.ParseStrictPort(portStr);
-                if (p > 0) { Port = p; }
+                int p = 0;
+                for (int i = 0; i < portStr.Length; i = i + 1) {
+                    int c = portStr[i] - 48;
+                    if (c >= 0 && c <= 9) { p = p * 10 + c; }
+                }
+                if (p > 0 && p <= 65535) { Port = p; }
             }
         }
-    }
-
-    // 解析以太坊 JSON-RPC QUANTITY 十六进制字符串为 BigInt（支持变长与奇数长度如 "0x0"、"0x123"）
-    public static BigInt DecodeQuantity(string hex) {
-        if (hex == null) { return BigInt.zero(); }
-        string clean = hex.Trim();
-        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
-            clean = clean.Substring(2);
-        }
-        if (clean.Length == 0 || clean.Length > 64) { return BigInt.zero(); }
-        if ((clean.Length & 1) != 0) {
-            clean = "0" + clean;
-        }
-        byte[] raw = Hex.Decode(clean, clean.Length);
-        if (raw == null || raw.Length == 0) { return BigInt.zero(); }
-        return BigInt.FromBytesBE(raw, raw.Length);
     }
 
     // 十六进制字符串转为 long 整数（处理形如 "0x1b4" 或 "0x0"；非法字符返回 0）
@@ -255,13 +235,13 @@ public class Web3Client {
     // 查询账户以太币余额 (Wei)
     public BigInt GetBalance(Address address, string blockTag) {
         string res = SendPrebuiltRequest(JsonRpcBuilder.GetBalance(address, blockTag, NextRequestId()));
-        return Web3Client.DecodeQuantity(res);
+        return Abi.DecodeUint256(res);
     }
 
     // 查询网络当前实时 Gas 价格 (Wei)
     public BigInt GetGasPrice() {
         string res = SendPrebuiltRequest(JsonRpcBuilder.GasPrice(NextRequestId()));
-        return Web3Client.DecodeQuantity(res);
+        return Abi.DecodeUint256(res);
     }
 
     // 动态估算交易所需 GasLimit (eth_estimateGas)
@@ -330,16 +310,13 @@ public class Web3Client {
         return receipt;
     }
 
-    // 轮询等待交易上链打包并返回回执 (生产必备，带退避休眠避免忙等打满节点)
+    // 轮询等待交易上链打包并返回回执 (生产必备)
     public TransactionReceipt WaitForTransactionReceipt(string txHash, int maxRetries) {
         int retries = maxRetries > 0 ? maxRetries : 30;
         for (int i = 0; i < retries; i = i + 1) {
             TransactionReceipt receipt = GetTransactionReceipt(txHash);
             if (receipt != null && receipt.BlockNumber > 0) {
                 return receipt;
-            }
-            if (i + 1 < retries) {
-                Thread.Sleep(500);
             }
         }
         return null;

@@ -1,0 +1,345 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Fps3D;
+
+// 菜单层：开始页、选关、暂停卡、结算卡。全部是标准 Panel / Label / Button，
+// 外观来自 FpsSkin。按钮点击只记下 pending 动作，由 FpsLoop 在 Update 里按当前模式消费：
+// "b0".."b3" = 卡片按钮，"play0".."play5" = 选关卡片的 PLAY，"back" = 选关返回。
+public class FpsMenu {
+    public Panel veil;
+    Panel card;
+    Label heading;
+    Label sub;
+    Label badge;
+    Label[] lines;
+    Label[] medalRow;
+    Button[] buttons;
+
+    Panel select;
+    Label selHeading;
+    Label selSub;
+    Panel[] tiles;
+    Label[] tNum;
+    Label[] tName;
+    Label[] tBlurb;
+    Label[] tMedal;
+    Label[] tBest;
+    Label[] tTimes;
+    Label[] tShard;
+    Button[] tPlay;
+    Button back;
+
+    string mode;
+    string pending;
+    FpsGame game;
+    FpsStage[] defs;
+
+    public FpsMenu(Gui.App app, Panel root, FpsGame game) {
+        this.game = game;
+        this.mode = "title";
+        this.pending = "";
+        int n = FpsStages.Count();
+        this.defs = new FpsStage[n];
+        for (int i = 0; i < n; i = i + 1) { this.defs[i] = FpsStages.Build(i); }
+
+        this.veil = FpsHud.Group(root, "fps-veil");
+        this.card = FpsHud.Group(this.veil, "fps-card");
+        this.heading = FpsHud.Text(this.card, "", "fps-heading");
+        this.sub = FpsHud.Text(this.card, "", "fps-sub");
+        this.badge = FpsHud.Text(this.card, "", "fps-badge");
+        this.lines = new Label[6];
+        for (int i = 0; i < 6; i = i + 1) { this.lines[i] = FpsHud.Text(this.card, "", "fps-line"); }
+        this.medalRow = new Label[4];
+        for (int i = 0; i < 4; i = i + 1) { this.medalRow[i] = FpsHud.Text(this.card, "", "fps-mrow"); }
+        this.buttons = new Button[4];
+        for (int i = 0; i < 4; i = i + 1) {
+            this.buttons[i] = FpsMenu.ButtonAt(this.card, "fps-btn");
+            string tag = "b" + Convert.ToString(i);
+            this.buttons[i].Click.Add(() => this.Clicked(tag));
+        }
+
+        this.select = FpsHud.Group(this.veil, "fps-select");
+        this.selHeading = FpsHud.Text(this.select, "SELECT STAGE", "fps-heading");
+        this.selSub = FpsHud.Text(this.select, "", "fps-sub");
+        this.tiles = new Panel[n];
+        this.tNum = new Label[n];
+        this.tName = new Label[n];
+        this.tBlurb = new Label[n];
+        this.tMedal = new Label[n];
+        this.tBest = new Label[n];
+        this.tTimes = new Label[n];
+        this.tShard = new Label[n];
+        this.tPlay = new Button[n];
+        for (int i = 0; i < n; i = i + 1) {
+            Panel t = FpsHud.Group(this.select, "fps-tile");
+            this.tiles[i] = t;
+            this.tNum[i] = FpsHud.Text(t, "", "fps-tnum");
+            this.tName[i] = FpsHud.Text(t, "", "fps-tname");
+            this.tBlurb[i] = FpsHud.Text(t, "", "fps-tblurb");
+            this.tMedal[i] = FpsHud.Text(t, "", "fps-tmedal");
+            this.tBest[i] = FpsHud.Text(t, "", "fps-tbest");
+            this.tTimes[i] = FpsHud.Text(t, "", "fps-ttimes");
+            this.tShard[i] = FpsHud.Text(t, "", "fps-tshard");
+            this.tPlay[i] = FpsMenu.ButtonAt(t, "fps-btn fps-tplay");
+            string tag = "play" + Convert.ToString(i);
+            this.tPlay[i].Click.Add(() => this.Clicked(tag));
+        }
+        this.back = FpsMenu.ButtonAt(this.select, "fps-btn");
+        this.back.SetText("BACK  [ESC]");
+        this.back.Click.Add(() => this.Clicked("back"));
+    }
+
+    static Button ButtonAt(Control parent, string cls) {
+        Button b = new Button("");
+        b.Class = cls;
+        parent.Add(b);
+        return b;
+    }
+
+    void Clicked(string which) { this.pending = which; }
+
+    public string TakeAction() {
+        string a = this.pending;
+        this.pending = "";
+        return a;
+    }
+
+    public void SetMode(string m) {
+        this.mode = m;
+        this.pending = "";
+    }
+
+    public FpsStage Def(int i) { return this.defs[i]; }
+
+    public void Sync(Gui.App app, FpsView view, int w, int h, double s, int top) {
+        bool menu = this.mode == "title" || this.mode == "pause" || this.mode == "result" || this.mode == "select";
+        this.veil.SetShown(menu);
+        if (!menu) { return; }
+        FpsHud.Box(this.veil, 0, 0, w, h, 0);
+        FpsHud.SetClass(this.veil, this.mode == "title" || this.mode == "select" ? "fps-veil fps-veil-soft" : "fps-veil");
+        bool sel = this.mode == "select";
+        this.card.SetShown(!sel);
+        this.select.SetShown(sel);
+        if (sel) { this.SyncSelect(view, w, h, s, top); }
+        else { this.SyncCard(view, w, h, s, top); }
+    }
+
+    void SyncCard(FpsView view, int w, int h, double s, int top) {
+        string[] t = new string[6] { "", "", "", "", "", "" };
+        string[] b = new string[4] { "", "", "", "" };
+        string[] lc = new string[6] { "fps-line", "fps-line", "fps-line", "fps-line", "fps-line", "fps-line" };
+        int stage = this.game.stageIndex;
+        FpsStage st = this.game.stage;
+        bool title = this.mode == "title";
+        string badgeText = "";
+        string badgeCls = "fps-badge";
+        this.SetMedalRow(view, title);
+        if (title) {
+            FpsHud.SetText(this.heading, "TARGET TAG");
+            FpsHud.SetText(this.sub, "N E O N    T I M E    T R I A L");
+            t[0] = "Tag every glowing target as fast as you can.";
+            t[1] = "Chain tags within 2 s for COMBO time bonuses.";
+            t[2] = "Ringed targets only count from their matching pad.";
+            t[3] = "Find the hidden gold shard in each stage for -2 s.";
+            t[5] = "WASD move   SPACE jump   SHIFT sprint   drag / F look   CLICK tag";
+            lc[5] = "fps-line fps-dim";
+            b[0] = "PLAY  STAGE " + Convert.ToString(view.selected + 1) + "  [ENTER]";
+            b[1] = "STAGE SELECT  [S]";
+            b[2] = "QUIT  [ESC]";
+        } else if (this.mode == "pause") {
+            FpsHud.SetText(this.heading, "PAUSED");
+            FpsHud.SetText(this.sub, "STAGE " + Convert.ToString(stage + 1) + "  " + st.Name);
+            t[0] = "TIME  " + FpsHud.FormatTime(this.game.NetMs()) + "        TAGGED  " + Convert.ToString(this.game.taggedCount)
+                + " / " + Convert.ToString(this.game.targetCount);
+            lc[0] = "fps-line fps-strong";
+            t[1] = view.hasBest[stage] ? "BEST  " + FpsHud.FormatTime(view.bestMs[stage]) + "   " + FpsStages.MedalName(st.MedalFor(view.bestMs[stage])) : "BEST  --:--.-";
+            t[2] = "GOLD " + FpsHud.FormatTime(st.Gold) + "    SILVER " + FpsHud.FormatTime(st.Silver) + "    BRONZE " + FpsHud.FormatTime(st.Bronze);
+            lc[2] = "fps-line fps-dim";
+            t[4] = view.autoPaused ? "Paused because the window lost focus." : "The clock is stopped.";
+            t[5] = "R restart    M sound    F free look    P resume";
+            lc[5] = "fps-line fps-dim";
+            b[0] = "RESUME  [P]";
+            b[1] = "RESTART  [R]";
+            b[2] = "STAGES";
+            b[3] = "QUIT";
+        } else {
+            FpsHud.SetText(this.heading, "STAGE CLEAR");
+            FpsHud.SetText(this.sub, "STAGE " + Convert.ToString(stage + 1) + "  " + st.Name);
+            badgeText = view.medal > 0 ? FpsStages.MedalName(view.medal) + " MEDAL" : "NO MEDAL";
+            badgeCls = "fps-badge " + FpsHud.MedalClass(view.medal);
+            t[0] = FpsHud.FormatTime(view.lastNet);
+            lc[0] = "fps-line fps-big " + FpsHud.MedalClass(view.medal);
+            string br = "raw " + FpsHud.FormatTime(view.lastRaw);
+            if (view.lastCombo > 0) { br = br + "    combo  -" + FpsHud.Secs((double)view.lastCombo); }
+            if (view.lastShard > 0) { br = br + "    shard  -" + FpsHud.Secs((double)view.lastShard); }
+            t[1] = br;
+            lc[1] = "fps-line fps-dim";
+            t[2] = view.newBest ? "NEW BEST!   " + FpsHud.FormatTime(view.bestMs[stage]) : "BEST  " + FpsHud.FormatTime(view.bestMs[stage]);
+            lc[2] = view.newBest ? "fps-line fps-strong fps-gold" : "fps-line";
+            t[3] = "BEST COMBO  x" + Convert.ToString(view.bestCombo) + (view.shardFound[stage] ? "      SHARD  FOUND" : "      SHARD  not found");
+            if (view.medal == 3) { t[4] = "Gold secured. Can you shave it further?"; }
+            else if (view.medal == 2) { t[4] = "Next: GOLD at " + FpsHud.FormatTime(st.Gold); }
+            else if (view.medal == 1) { t[4] = "Next: SILVER at " + FpsHud.FormatTime(st.Silver); }
+            else { t[4] = "Next: BRONZE at " + FpsHud.FormatTime(st.Bronze); }
+            if (view.unlockedNext) {
+                t[5] = "STAGE " + Convert.ToString(stage + 2) + " UNLOCKED";
+                lc[5] = "fps-line fps-strong fps-accent";
+            }
+            bool hasNext = stage + 1 < FpsStages.Count();
+            b[0] = hasNext ? "NEXT STAGE  [ENTER]" : "STAGE SELECT  [ENTER]";
+            b[1] = "RETRY  [R]";
+            b[2] = "STAGES  [ESC]";
+        }
+        FpsHud.SetText(this.badge, badgeText);
+        FpsHud.SetClass(this.badge, "fps-label " + badgeCls);
+        this.badge.SetShown(badgeText != "");
+        for (int i = 0; i < 6; i = i + 1) {
+            FpsHud.SetText(this.lines[i], t[i]);
+            FpsHud.SetClass(this.lines[i], "fps-label " + lc[i]);
+        }
+        int count = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            this.buttons[i].SetShown(b[i] != "");
+            if (b[i] != "") {
+                this.buttons[i].SetText(b[i]);
+                count = count + 1;
+            }
+            FpsHud.SetClass(this.buttons[i], i == 0 ? "fps-btn fps-primary" : "fps-btn");
+        }
+
+        if (title) {
+            // 开始页：左侧竖版卡片，右侧留给环飞的竞技场
+            int cw = (int)(540 * s);
+            int chh = (int)(600 * s);
+            int cy = top + ((h - top) - chh) / 2;
+            FpsHud.Box(this.card, (int)(56 * s), cy, cw, chh, 0);
+            FpsHud.SetClass(this.card, "fps-card fps-card-title");
+            FpsHud.Box(this.heading, (int)(36 * s), (int)(34 * s), cw - (int)(72 * s), (int)(70 * s), (int)(58 * s));
+            FpsHud.Box(this.sub, (int)(40 * s), (int)(104 * s), cw - (int)(80 * s), (int)(22 * s), (int)(15 * s));
+            FpsHud.SetClass(this.heading, "fps-label fps-heading fps-left");
+            FpsHud.SetClass(this.sub, "fps-label fps-sub fps-left");
+            for (int i = 0; i < 6; i = i + 1) {
+                FpsHud.Box(this.lines[i], (int)(40 * s), (int)((150 + i * 28) * s), cw - (int)(80 * s), (int)(24 * s), (int)(i == 5 ? 13 * s : 16 * s));
+                FpsHud.SetClass(this.lines[i], "fps-label " + lc[i] + " fps-left");
+            }
+            int my = (int)(332 * s);
+            int mw = (cw - (int)(80 * s)) / 4;
+            for (int i = 0; i < 4; i = i + 1) {
+                FpsHud.Box(this.medalRow[i], (int)(40 * s) + i * mw, my, mw, (int)(48 * s), (int)(15 * s));
+            }
+            int bw = cw - (int)(80 * s);
+            int bh = (int)(50 * s);
+            for (int i = 0; i < 4; i = i + 1) {
+                FpsHud.Box(this.buttons[i], (int)(40 * s), (int)((410 + i * 60) * s), bw, bh, (int)(18 * s));
+            }
+            return;
+        }
+
+        int cw2 = (int)(640 * s);
+        int ch2 = (int)(520 * s);
+        FpsHud.Box(this.card, (w - cw2) / 2, top + ((h - top) - ch2) / 2, cw2, ch2, 0);
+        FpsHud.SetClass(this.card, this.mode == "result" ? "fps-card fps-card-result" : "fps-card");
+        FpsHud.SetClass(this.heading, "fps-label fps-heading");
+        FpsHud.SetClass(this.sub, "fps-label fps-sub");
+        FpsHud.Box(this.heading, 0, (int)(26 * s), cw2, (int)(52 * s), (int)(42 * s));
+        FpsHud.Box(this.sub, 0, (int)(80 * s), cw2, (int)(22 * s), (int)(15 * s));
+        FpsHud.Box(this.badge, (cw2 - (int)(260 * s)) / 2, (int)(112 * s), (int)(260 * s), (int)(38 * s), (int)(20 * s));
+        int y0 = this.mode == "result" ? 160 : 128;
+        for (int i = 0; i < 6; i = i + 1) {
+            int lh = 30;
+            int fs = 17;
+            int y = y0 + i * 34;
+            if (this.mode == "result" && i == 0) { lh = 58; fs = 50; }
+            if (this.mode == "result" && i > 0) { y = y0 + 34 + i * 33; }
+            FpsHud.Box(this.lines[i], (int)(24 * s), (int)(y * s), cw2 - (int)(48 * s), (int)(lh * s), (int)(fs * s));
+        }
+        int gap = (int)(14 * s);
+        int bw2 = (cw2 - (int)(48 * s) - (count - 1) * gap) / (count > 0 ? count : 1);
+        int bh2 = (int)(50 * s);
+        int by = ch2 - (int)(78 * s);
+        int x = (int)(24 * s);
+        for (int i = 0; i < 4; i = i + 1) {
+            if (b[i] == "") { continue; }
+            FpsHud.Box(this.buttons[i], x, by, bw2, bh2, (int)(16 * s));
+            x = x + bw2 + gap;
+        }
+    }
+
+    // 开始页的奖牌汇总：金/银/铜个数 + 碎片数
+    void SetMedalRow(FpsView view, bool show) {
+        int gold = 0;
+        int silver = 0;
+        int bronze = 0;
+        int shards = 0;
+        for (int i = 0; i < FpsStages.Count(); i = i + 1) {
+            int m = view.MedalOf(i, this.defs[i]);
+            if (m == 3) { gold = gold + 1; }
+            else if (m == 2) { silver = silver + 1; }
+            else if (m == 1) { bronze = bronze + 1; }
+            if (view.shardFound[i]) { shards = shards + 1; }
+        }
+        FpsHud.SetText(this.medalRow[0], "GOLD  " + Convert.ToString(gold));
+        FpsHud.SetText(this.medalRow[1], "SILVER  " + Convert.ToString(silver));
+        FpsHud.SetText(this.medalRow[2], "BRONZE  " + Convert.ToString(bronze));
+        FpsHud.SetText(this.medalRow[3], "SHARDS  " + Convert.ToString(shards) + "/" + Convert.ToString(FpsStages.Count()));
+        FpsHud.SetClass(this.medalRow[0], "fps-label fps-mrow fps-gold");
+        FpsHud.SetClass(this.medalRow[1], "fps-label fps-mrow fps-silver");
+        FpsHud.SetClass(this.medalRow[2], "fps-label fps-mrow fps-bronze");
+        FpsHud.SetClass(this.medalRow[3], "fps-label fps-mrow fps-shardc");
+        for (int i = 0; i < 4; i = i + 1) { this.medalRow[i].SetShown(show); }
+    }
+
+    void SyncSelect(FpsView view, int w, int h, double s, int top) {
+        int n = FpsStages.Count();
+        int pw = (int)(1140 * s);
+        int ph = (int)(620 * s);
+        int px = (w - pw) / 2;
+        int py = top + ((h - top) - ph) / 2;
+        FpsHud.Box(this.select, px, py, pw, ph, 0);
+        FpsHud.Box(this.selHeading, 0, (int)(18 * s), pw, (int)(46 * s), (int)(36 * s));
+        FpsHud.Box(this.selSub, 0, (int)(64 * s), pw, (int)(20 * s), (int)(14 * s));
+        FpsHud.SetText(this.selSub, "ARROWS choose   ENTER play   ESC back   -   clear a stage to unlock the next");
+        int cols = 3;
+        int gap = (int)(18 * s);
+        int tw = (pw - (int)(48 * s) - (cols - 1) * gap) / cols;
+        int th = (int)(218 * s);
+        for (int i = 0; i < n; i = i + 1) {
+            FpsStage d = this.defs[i];
+            int col = i % cols;
+            int row = i / cols;
+            int tx = (int)(24 * s) + col * (tw + gap);
+            int ty = (int)(100 * s) + row * (th + gap);
+            bool locked = !view.unlocked[i];
+            int medal = view.MedalOf(i, d);
+            string cls = "fps-tile";
+            if (locked) { cls = cls + " fps-tile-locked"; }
+            if (i == view.selected) { cls = cls + " fps-tile-sel"; }
+            FpsHud.SetClass(this.tiles[i], cls);
+            FpsHud.Box(this.tiles[i], tx, ty, tw, th, 0);
+            int iw = tw - (int)(32 * s);
+            FpsHud.Box(this.tNum[i], (int)(16 * s), (int)(12 * s), iw, (int)(18 * s), (int)(13 * s));
+            FpsHud.Box(this.tName[i], (int)(16 * s), (int)(30 * s), iw, (int)(32 * s), (int)(26 * s));
+            FpsHud.Box(this.tBlurb[i], (int)(16 * s), (int)(64 * s), iw, (int)(38 * s), (int)(12 * s));
+            FpsHud.Box(this.tMedal[i], (int)(16 * s), (int)(106 * s), iw, (int)(22 * s), (int)(16 * s));
+            FpsHud.Box(this.tBest[i], (int)(16 * s), (int)(130 * s), iw, (int)(20 * s), (int)(14 * s));
+            FpsHud.Box(this.tTimes[i], (int)(16 * s), (int)(152 * s), iw, (int)(18 * s), (int)(11 * s));
+            FpsHud.Box(this.tShard[i], (int)(16 * s), (int)(180 * s), (int)(150 * s), (int)(22 * s), (int)(12 * s));
+            FpsHud.Box(this.tPlay[i], tw - (int)(136 * s), th - (int)(50 * s), (int)(120 * s), (int)(36 * s), (int)(15 * s));
+            FpsHud.SetText(this.tNum[i], "STAGE " + (i + 1 < 10 ? "0" : "") + Convert.ToString(i + 1) + "   " + Convert.ToString(d.Targets.Count) + " TARGETS");
+            FpsHud.SetText(this.tName[i], d.Name);
+            FpsHud.SetText(this.tBlurb[i], locked ? "Clear stage " + Convert.ToString(i) + " to unlock." : d.Blurb);
+            FpsHud.SetText(this.tMedal[i], locked ? "LOCKED" : (medal > 0 ? FpsStages.MedalName(medal) + " MEDAL" : (view.hasBest[i] ? "CLEARED" : "NOT PLAYED")));
+            FpsHud.SetClass(this.tMedal[i], "fps-label fps-tmedal " + (locked ? "fps-nomedal" : FpsHud.MedalClass(medal)));
+            FpsHud.SetText(this.tBest[i], view.hasBest[i] ? "BEST  " + FpsHud.FormatTime(view.bestMs[i]) : "BEST  --:--.-");
+            FpsHud.SetText(this.tTimes[i], "G " + FpsHud.FormatTime(d.Gold) + "   S " + FpsHud.FormatTime(d.Silver) + "   B " + FpsHud.FormatTime(d.Bronze));
+            FpsHud.SetText(this.tShard[i], view.shardFound[i] ? "SHARD FOUND" : "SHARD  ?");
+            FpsHud.SetClass(this.tShard[i], view.shardFound[i] ? "fps-label fps-tshard fps-gold" : "fps-label fps-tshard");
+            this.tPlay[i].SetText(locked ? "LOCKED" : "PLAY");
+            this.tPlay[i].Disabled = locked;
+            FpsHud.SetClass(this.tPlay[i], i == view.selected && !locked ? "fps-btn fps-tplay fps-primary" : "fps-btn fps-tplay");
+        }
+        FpsHud.Box(this.back, (pw - (int)(220 * s)) / 2, ph - (int)(66 * s), (int)(220 * s), (int)(46 * s), (int)(16 * s));
+    }
+}

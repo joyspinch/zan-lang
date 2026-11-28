@@ -1,12 +1,34 @@
 # 见缝插针 · 星环机关
 
-点击发射针球，把本关所有针插入旋转机关。碰到已有针球或针杆即失败；重试从当前关开始。第 4 关起加入变速，第 7 关起加入平滑反转，更高关卡增加针数与转速。
+点击发射针球，把本关所有针插入旋转机关。碰到已有针球或针杆即失败；重试从当前关开始。
 
-深青金属背景、黄铜机关与青玉针球贯穿主菜单、对局、暂停和结算。发射带光迹，成功入隙有火花与光环，碰撞有红色反馈，结算带入场动效。默认舞台为 600×900 竖屏；调整窗口后等比缩放游戏几何，绘制和点击使用同一套坐标换算。青玉表示玩家插针，黄铜表示预置针，红色表示碰撞。
+## 关卡与进度
+
+`src/PinLevels.zan` 是手工编排的 40 关曲线，分四章，每章第 10 关是首领关：
+
+| 章节 | 关卡 | 引入的机制 |
+| --- | --- | --- |
+| 第一章 · 初转 | 1–10 | 匀速与逆旋、预置针阵（均布 / 针墙 / 半月扇面），第 4 关起**变速脉冲**，第 7 关起**骤停反转** |
+| 第二章 · 变奏 | 11–20 | 更急的脉冲与反转、**往返摆动**（来回摆但整体前进，所有缺口都会转到发射口） |
+| 第三章 · 摇摆 | 21–30 | **摇摆机关**：转盘在发射轴两侧左右漂移，入针角度随之偏移；两侧黄铜卡尺标出摆幅 |
+| 第四章 · 星环 | 31–40 | 全部机制叠加，最大针数 |
+
+- **首领关**（10/20/30/40）有 2–3 个“环”：转盘外圈每个黄铜环代表一个待破的阶段；插满本环后旧针炸飞、铜环碎裂，约 0.9 秒换环间歇（发射口金色进度弧）后下一环带着新针阵与新机制登场。
+- **骤停反转**提前约 0.5 秒预警：轨道弧与外环闪红、机制标签变红并有提示音。
+- **星级**：通关 ★；未重试一次过 +★（重试、R 键重开都算重试）；在限时内通关 +★。对局顶部实时显示两项可得星状态与剩余限时。限时由无头机器人校准（见下）。
+- **解锁**：通关第 N 关解锁第 N+1 关。主菜单圆形机关“继续”第一个未通关的已解锁关卡；“选择关卡”打开选关网格（标准按钮皮肤：已通关显示星级，下一关青光描边，首领关金色描边并带“首领”标，未解锁虚线框），可点击或用方向键 + Enter 选择。
+
+## 手感与反馈
+
+插针时转盘被顶起回弹、针座迸出火花环、黄铜清响随填充升调；贴着已有针插入（间隙 < 0.2 弧度）弹出“CLOSE!”并有清脆提示；通关时针依次闪光、转盘加速旋转后所有针向外飞散、中央“通关”字样弹出，结算卡三颗星依次弹入并各有升调音；失败时 70ms 顿帧 + 约 0.2 倍慢动作，撞针翻滚弹落，屏幕震动并泛红，再回到实时。全部效果在 `src/PinFx.zan`，只读世界状态，仿真不依赖它。
+
+深青金属背景、黄铜机关与青玉针球贯穿主菜单、选关、对局、暂停和结算。默认舞台为 600×900 竖屏；调整窗口后等比缩放游戏几何，绘制和点击使用同一套坐标换算。青玉表示玩家插针，黄铜表示预置针，红色表示碰撞。
 
 | 操作 | 功能 |
 | --- | --- |
-| 菜单圆形机关 / Enter / 空格 | 开始挑战 |
+| 菜单圆形机关 / Enter / 空格 | 继续第一个未通关关卡 |
+| 菜单“选择关卡” / L | 打开选关网格（暂停与结算页也可按 L 或点“选择关卡”） |
+| 选关页 方向键 / Enter / 点击格子 / Esc | 移动选择 / 开始所选关 / 直接开始 / 返回菜单 |
 | 点击游戏空白区域或底部针球 / 空格 | 发射一根针 |
 | 右上暂停图标 / P / Esc | 暂停（窗口失焦或最小化时自动暂停） |
 | 暂停页圆形机关 / P / 空格 | 恢复，恢复这一击不会发射 |
@@ -19,17 +41,23 @@
 
 ## 音效与存档
 
-- 音效全部由 `Game.Foundation.SfxPresets` 程序化合成，无音频素材：发射呼啸、针球入隙的黄铜清响（越接近满盘音高越高）、碰撞闷响与失败下滑、过关上扬、刷新纪录、按钮点按，以及第 4–6 关变速加速、第 7 关起反转时的轻提示音。没有音频设备时静默运行。
-- 存档用 `GameProfile.Open("pin-circle")`：最高通关关卡（`level`）、开局次数（`plays`）、累计入隙针数（`pins`）与静音开关（`muted`）。主菜单底部显示最高通关与已玩局数；结算卡显示最高通关，刷新纪录时标题变为 `NEW BEST` 并显示“新纪录”。
+- 音效全部由 `Game.Foundation.SfxPresets` 程序化合成（`.WithSweep` 调音），无音频素材：发射呼啸、入隙黄铜清响（越接近满盘音高越高）、险中“CLOSE!”清音、反转预警滴答、变速加速提示、首领换环碎裂声、碰撞闷响 + 慢动作下沉音、过关上扬、三颗星依次升调、刷新纪录与按钮点按。没有音频设备时静默运行。
+- 存档用 `GameProfile.Open("pin-circle")`：最高通关关卡（`level`，决定解锁）、每关最佳星级（`stars<N>`）、开局次数（`plays`）、累计入隙针数（`pins`）、累计险中次数（`closes`）与静音开关（`muted`）。主菜单与选关页显示总星数；结算卡显示用时/限时、本关最佳星级，刷新纪录时标题变为 `NEW BEST`。
+- 调试开关（默认关闭）：环境变量 `PIN_UNLOCK_ALL=1` 解锁全部关卡，用于截图与 QA。
 - 存档位置：Windows `%LOCALAPPDATA%\ZanGames\pin-circle\`、macOS `~/Library/Application Support/ZanGames/pin-circle/`、Linux `~/.local/share/ZanGames/pin-circle/`；设置环境变量 `ZAN_GAME_DATA_DIR` 可改根目录（测试/便携版）。从不写工作目录。
-- 无头回放（`src/PinSim.zan` + `replays/bot.replay`）只驱动 `PinWorld`，不接触音频与存档。
+- 无头回放（`src/PinSim.zan` + `replays/bot.replay`）只驱动 `PinWorld`，不接触音频与存档。输入 4 让机器人按帧号跳到 1–40 任一关，覆盖变速、反转、摇摆与首领多环；`[Invariant]` 额外检查关卡/环序号、盘上针数守恒、换环间歇不能有飞针、摇摆不超幅。改关卡表后按 Game.Foundation README 重录回放。
+
+## 平衡
+
+关卡限时与难度曲线用无头仿真校准：三种机器人在每关 24 个初始角度上打（“专家”每次都在安全窗口发射；“熟练”约 130ms 反应、±3 帧抖动、两针间犹豫 10–20 帧；“手潮”±5 帧抖动更保守）。熟练机器人胜率大致为第一章 ~95%、第二章 ~75–90%、第三章开头回落再爬升、第四章 ~40–80%，首领关略低于同章平均；专家 100% 通关全部 40 关（每关可解）。限时 = 熟练机器人平均通关用时 × 1.5（取整到 0.5 秒，个别离群关手调）。
 
 ## 文件
 
-- `src/PinWorld.zan`、`src/Entities/`：独立固定步长仿真、关卡参数、针球与针杆碰撞。
+- `src/PinWorld.zan`、`src/PinLevels.zan`、`src/Entities/`：独立固定步长仿真、40 关关卡表（多环、变速、反转、摆动、摇摆）、针球与针杆碰撞、险中判定。
+- `src/PinFx.zan`：表现层反馈（火花、回弹、横幅、通关飞散、失败慢动作），不进仿真。
 - `src/PinShell.zan`：应用层外壳——玩家档案与音效库，仿真不引用。
 - `src/PinView.zan`、`src/PinHud.zan`：素材绘制、标准组件 HUD、动效、舞台坐标与点击几何；HUD 在共享测量前配置当前区域。
-- `src/main.zan`、`src/Scenes/`：程序入口、菜单、游戏和结算场景，以及鼠标与键盘输入。
+- `src/main.zan`、`src/Scenes/`：程序入口、菜单、选关、游戏和结算场景，以及鼠标与键盘输入。
 - `assets/`：背景、机关、三种针球和标题图片。
 - `template.manifest`、`zan.proj`：IDE 模板发现与工程入口，无固定平台。
 
@@ -106,7 +134,7 @@ python tests/templates/pin-circle/run.py
 Set-Location D:/project/zan-lang
 & ./scripts/build_gate.ps1 -Name build -Script {
     New-Item -ItemType Directory -Force build/cases | Out-Null
-    build/zanc.exe tests/templates/pin-circle/world_test.zan templates/game/pin-circle/src/PinWorld.zan templates/game/pin-circle/src/Entities --auto-stdlib --package-project . -o build/cases/pin_circle_world-test.exe
+    build/zanc.exe tests/templates/pin-circle/world_test.zan templates/game/pin-circle/src/PinWorld.zan templates/game/pin-circle/src/PinLevels.zan templates/game/pin-circle/src/Entities --auto-stdlib --package-project . -o build/cases/pin_circle_world-test.exe
 }
 build/cases/pin_circle_world-test.exe
 ```

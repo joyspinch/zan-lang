@@ -1,17 +1,19 @@
 using System;
 using Game.Foundation;
 
-// 玩家档案：最高分 / 最长长度 / 总局数 / 累计击败，外加静音偏好。
+// 玩家档案：最高分 / 最长长度 / 总局数 / 累计击败 / 最佳排名，外加静音偏好与所选皮肤。
 // 落盘交给 Game.Foundation.GameProfile（用户应用数据目录下的
 // ZanGames/snake/，原子写 + .bak 回退），绝不写工作目录。
 // 字段是读出来的快照，供菜单/结算/对局内"新纪录"判定直接读；
-// 写入一律走 Record / SetMuted。
+// 写入一律走 Record / SetMuted / SetSkin。皮肤解锁由最高分与累计击败推导（SnSkins.Unlocked），
+// 不单独存"已解锁"位，规则改了老档案自动按新门槛算。
 public class Profile {
     GameProfile store;
     int high;
     int longest;
     int games;
     int kills;
+    int topRank;  // 历史最佳排名（0 = 还没有）
 
     // 正式游戏：打开 ZanGames/snake 档案（解析不到用户目录时退回内存）。
     static Profile Open() { return Profile.Wrap(GameProfile.Open("snake")); }
@@ -26,11 +28,12 @@ public class Profile {
         p.longest = gp.HasBest("length") ? (int)gp.Best("length") : 10;
         p.games = (int)gp.Counter("games");
         p.kills = (int)gp.Counter("kills");
+        p.topRank = gp.HasBest("rank") ? (int)gp.Best("rank") : 0;
         return p;
     }
 
     // 记一局。返回本局是否刷新最高分（0 分不算纪录）。
-    bool Record(int score, int length, int roundKills) {
+    bool Record(int score, int length, int roundKills, int bestRank) {
         this.games = this.games + 1;
         this.kills = this.kills + roundKills;
         this.store.Add("games", 1);
@@ -41,10 +44,23 @@ public class Profile {
             this.high = score;
         }
         if (this.store.SubmitBest("length", length) && length > this.longest) { this.longest = length; }
+        if (bestRank > 0 && bestRank < 99 && this.store.SubmitLowest("rank", bestRank)) { this.topRank = bestRank; }
         this.store.Save();
         return best;
     }
 
     bool Muted() { return this.store.Flag("muted", false); }
     void SetMuted(bool muted) { this.store.SetFlag("muted", muted); }
+
+    // 所选皮肤（计数器存编号；锁住的皮肤读出时回落到 0）。
+    int Skin() {
+        int k = (int)this.store.Counter("skin");
+        if (k < 0 || k >= SnSkins.Count || !SnSkins.Unlocked(k, this.high, this.kills)) { return 0; }
+        return k;
+    }
+    void SetSkin(int k) {
+        if (k < 0 || k >= SnSkins.Count || !SnSkins.Unlocked(k, this.high, this.kills)) { return; }
+        this.store.Add("skin", k - this.store.Counter("skin"));
+        this.store.Save();
+    }
 }

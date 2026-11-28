@@ -4,21 +4,33 @@ using Game.Foundation.Gui;
 using PinCircle;
 
 public class PinPlayScene : HtmlScene {
+    const int FailHoldMs = 1250;
+    const int ClearHoldMs = 1550;
     PinWorld game;
     PinView view;
     int resultWait;
     int pauseTime;
     bool hostActive;
     bool hostSeen;
+    bool autoplay;
+    int autoWait;
 
-    PinPlayScene(PinWorld game, PinView view) { this.game = game; this.view = view; }
+    PinPlayScene(PinWorld game, PinView view) {
+        this.game = game;
+        this.view = view;
+        // Debug only, off by default: fires whenever a shot is safe (captures/QA).
+        this.autoplay = Interop.EnvVar("PIN_AUTOPLAY") == "1";
+    }
 
     override void OnEnter(Control root) {
         this.resultWait = 0;
         this.pauseTime = 0;
         this.hostSeen = false;
+        this.view.fx.Reset();
+        this.view.shell.BeginAttempt(this.game.level);
         this.view.EnterHud(this.router, this, this.game, "play");
-        Console.WriteLine("ROUND level=" + this.game.level + " target=" + this.game.target);
+        Console.WriteLine("ROUND level=" + this.game.level + " target=" + this.game.target
+            + " phases=" + this.game.PhaseCount() + " attempt=" + this.view.shell.Attempts());
     }
 
     override void Event(int kind, int key) {
@@ -29,6 +41,7 @@ public class PinPlayScene : HtmlScene {
             if (key == 80) { this.TogglePause(); }
             if (key == 82) { this.Restart(); }
             if (key == 77) { this.view.ToggleMute(); }
+            if (key == 76 && this.game.paused) { this.view.shell.Play("click"); this.router.Go("select"); }
             if (key == 32 && !this.view.spaceHeld) {
                 this.view.spaceHeld = true;
                 if (this.game.paused) { this.TogglePause(); } else { this.Fire(); }
@@ -68,9 +81,12 @@ public class PinPlayScene : HtmlScene {
         }
     }
 
+    // A restart counts as a retry: the "first try" star is gone for this level.
     void Restart() {
         this.view.shell.Play("click");
         this.game.StartRound(this.game.level, 0);
+        this.view.shell.BeginAttempt(this.game.level);
+        this.view.fx.Reset();
         this.resultWait = 0;
         this.pauseTime = 0;
         this.view.SyncHud(0);
@@ -92,41 +108,58 @@ public class PinPlayScene : HtmlScene {
         this.view.shell.Tick(dtMs);
         this.WatchFocus();
         this.pauseTime = this.game.paused ? this.pauseTime + dtMs : 0;
+        if (this.game.paused) { return; }
+        if (this.autoplay && this.game.state == RoundState.Playing && !this.game.flying) {
+            this.autoWait = this.autoWait + dtMs;
+            if (this.autoWait >= 260 && this.game.SafeShot()) { this.autoWait = 0; this.Fire(); }
+        }
         RoundState before = this.game.state;
-        int inserted = this.game.inserted;
-        int elapsed = this.game.elapsedMs;
-        double speed = this.game.AngularSpeed();
+        int inserted = this.game.totalInserted;
+        int phase = this.game.phase;
+        this.view.fx.Before(this.game);
         this.game.Step(dtMs);
-        this.Cues(before, inserted, elapsed, speed);
+        this.view.fx.After(this.game);
+        this.view.fx.Tick(dtMs);
+        this.Cues(before, inserted, phase);
         if (this.game.state != RoundState.Playing) {
             this.resultWait = this.resultWait + dtMs;
-            if (this.resultWait >= 400) { this.router.Go("over"); }
+            int hold = this.game.state == RoundState.Cleared ? PinPlayScene.ClearHoldMs : PinPlayScene.FailHoldMs;
+            if (this.resultWait >= hold) { this.router.Go("over"); }
         }
     }
 
     // Audio reads world state before/after a step; the world itself stays silent.
-    void Cues(RoundState before, int inserted, int elapsed, double speed) {
+    void Cues(RoundState before, int inserted, int phase) {
         PinShell shell = this.view.shell;
-        if (this.game.inserted > inserted) { shell.Land(this.game.inserted, this.game.target); }
+        if (this.game.totalInserted > inserted) {
+            shell.Land(this.game.inserted == 0 ? this.game.target : this.game.inserted, this.game.target);
+            if (this.game.lastClose) { shell.Play("close"); }
+        }
+        if (this.game.phase != phase) { shell.Play("shatter"); shell.Play("surge"); }
         if (before == RoundState.Playing && this.game.state != RoundState.Playing) {
             bool won = this.game.state == RoundState.Cleared;
             if (won) {
                 shell.Play("success");
             } else {
                 shell.Play("clank");
-                shell.Play("fail");
+                shell.Play("slowmo");
+                shell.Play("fail", 0.7);
             }
-            shell.RecordRound(this.game.level, this.game.inserted, won);
+            shell.RecordRound(this.game.level, this.game.totalInserted, won,
+                this.game.elapsedMs, this.game.ParMs(), this.game.closeCount);
+            Console.WriteLine("END level=" + this.game.level + " won=" + (won ? 1 : 0) + " elapsed=" + this.game.elapsedMs
+                + " stars=" + shell.LastStars());
             return;
         }
-        if (this.game.state != RoundState.Playing || this.game.paused || this.game.elapsedMs == elapsed) { return; }
-        if (this.game.level >= 7) {
-            double now = this.game.AngularSpeed();
-            if ((speed > 0 && now <= 0) || (speed < 0 && now >= 0)) { shell.Play("reverse", 0.8); }
-        } else if (this.game.level >= 4) {
+        if (this.game.state != RoundState.Playing) { return; }
+        if (this.view.fx.warnEdge) { shell.Play("warn"); }
+        PinPhase p = this.game.Phase();
+        if (p.pulseAmp > 0 && p.pulseMs > 0) {
             // Speed wave turns from slowing to surging.
-            if (Math.Sin(elapsed / 650.0) < 0 && Math.Sin(this.game.elapsedMs / 650.0) >= 0) {
-                shell.Play("surge", 0.7);
+            int prev = this.game.phaseTimeMs - 16;
+            if (prev > 0 && Math.Sin(prev * PinWorld.Tau / p.pulseMs) < 0
+                && Math.Sin(this.game.phaseTimeMs * PinWorld.Tau / p.pulseMs) >= 0) {
+                shell.Play("surge", 0.6);
             }
         }
     }

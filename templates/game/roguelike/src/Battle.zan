@@ -1,0 +1,265 @@
+using System;
+using System.Collections.Generic;
+using Game.Cards;
+using Game.Foundation;
+
+// 一场战斗的全部规则：能量、抽牌、出牌结算、敌人意图与回合推进。
+//
+// 牌堆用引擎的 CardDeck（抽牌堆 / 手牌 / 弃牌堆 / 消耗堆四区，弃牌堆抽空自动洗回，
+// 保留牌不弃），牌面用 CardDefinition；结算在这里自己写，因为本作的关键词
+// （中毒、虚弱、能力、消耗、保留、多段意图）超出了引擎 CardBattle 的固定规则。
+//
+// 回合顺序：
+//   玩家回合开始：格挡清零 → 中毒发作 → 能力（力量/施毒）→ 回满能量 → 抽牌
+//   玩家出牌……结束回合：金属化/山铜护符加格挡 → 弃手牌（保留牌留下）→ 虚弱/易伤 -1
+//   敌人回合：格挡清零 → 中毒发作 → 执行意图（格挡/强化 → 攻击 → 削弱）→ 虚弱/易伤 -1
+//   → 亮出下一个意图 → 下一个玩家回合
+// 随机只有两处，都由种子派生：CardDeck 的洗牌、本场的意图随机源。
+public class Battle {
+    public Fighter player;
+    public Fighter enemy;
+    public EnemyDef def;
+    public CardDeck deck;
+    public int energy;
+    public int maxEnergy;
+    public int handSize;
+    public int turn;
+    public int winner;
+    public EnemyMove intent;
+    public List<BattleEvent> events;
+    CardLibrary library;
+    List<string> relics;
+    DeterministicRandom rng;
+    int moveIndex;
+    int lastMove;
+
+    public Battle(CardLibrary library, List<string> relics, EnemyDef def, int enemyHp,
+                  int playerHp, int playerMaxHp, List<string> deckIds, int seed) {
+        this.library = library;
+        this.relics = relics;
+        this.def = def;
+        this.player = new Fighter("攀登者", playerHp, playerMaxHp);
+        this.enemy = new Fighter(def.name, enemyHp, enemyHp);
+        this.deck = new CardDeck(seed);
+        this.rng = new DeterministicRandom(seed * 31 + 7);
+        this.events = new List<BattleEvent>();
+        this.winner = -1;
+        this.turn = 0;
+        this.moveIndex = 0;
+        this.lastMove = -1;
+        this.maxEnergy = 3 + (this.HasRelic("ember_crown") ? 1 : 0);
+        this.handSize = 5;
+        for (int i = 0; i < deckIds.Count; i = i + 1) {
+            CardDefinition cd = library.Find(deckIds[i]);
+            CardInstance inst = this.deck.Add(cd);
+            if (inst != null && CardLibrary.Has(cd, CardFx.Retain())) { inst.SetRetained(true); }
+        }
+    }
+
+    public bool HasRelic(string id) {
+        for (int i = 0; i < this.relics.Count; i = i + 1) {
+            if (this.relics[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    void Note(string kind, int who, int amount, int extra, string text) {
+        this.events.Add(new BattleEvent(kind, who, amount, extra, text));
+    }
+
+    // 开场：遗物的开场效果 → 洗牌 → 亮出第一个意图 → 第一个玩家回合。
+    public void Start() {
+        this.events.Clear();
+        if (this.HasRelic("anchor")) { this.player.AddBlock(10); this.Note("block", 0, 10, 0, "沉船之锚"); }
+        if (this.HasRelic("vajra")) { this.player.strength = this.player.strength + 1; this.Note("buff", 0, 1, 0, "金刚杵"); }
+        if (this.HasRelic("demon_horn")) { this.player.strength = this.player.strength + 3; this.Note("buff", 0, 3, 0, "恶魔之角"); }
+        if (this.HasRelic("bronze_scales")) { this.player.thorns = this.player.thorns + 3; }
+        if (this.HasRelic("blood_vial")) { this.Note("heal", 0, this.player.Heal(3), 0, "血瓶"); }
+        if (this.HasRelic("marbles")) { this.enemy.vulnerable = this.enemy.vulnerable + 1; this.Note("debuff", 1, 1, 0, "易伤"); }
+        if (this.HasRelic("red_mask")) { this.enemy.weakness = this.enemy.weakness + 1; this.Note("debuff", 1, 1, 0, "虚弱"); }
+        if (this.HasRelic("venom_sac")) { this.enemy.poison = this.enemy.poison + 4; this.Note("debuff", 1, 4, 0, "中毒"); }
+        this.deck.ShuffleDraw();
+        this.ChooseIntent();
+        this.StartPlayerTurn();
+    }
+
+    // ---- 玩家回合 ------------------------------------------------------------
+
+    void StartPlayerTurn() {
+        if (this.winner >= 0) { return; }
+        this.turn = this.turn + 1;
+        this.player.block = 0;
+        int burn = this.player.TickPoison();
+        if (burn > 0) { this.Note("poison", 0, burn, 0, "中毒"); }
+        if (this.CheckWinner()) { return; }
+        if (this.player.strengthPerTurn > 0) {
+            this.player.strength = this.player.strength + this.player.strengthPerTurn;
+            this.Note("buff", 0, this.player.strengthPerTurn, 0, "恶魔形态");
+        }
+        if (this.player.poisonPerTurn > 0) {
+            this.enemy.poison = this.enemy.poison + this.player.poisonPerTurn;
+            this.Note("debuff", 1, this.player.poisonPerTurn, 0, "中毒");
+        }
+        this.energy = this.maxEnergy;
+        int draw = this.handSize + this.player.drawPerTurn + (this.HasRelic("star_box") ? 1 : 0);
+        if (this.turn == 1) {
+            if (this.HasRelic("lantern")) { this.energy = this.energy + 1; }
+            if (this.HasRelic("serpent_ring")) { draw = draw + 2; }
+        }
+        this.DrawCards(draw);
+    }
+
+    // 抽牌（手牌上限 10）：返回实际抽到的张数。
+    int DrawCards(int n) {
+        int got = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.deck.Hand().Count() >= 10) { break; }
+            if (this.deck.DrawOne() == null) { break; }
+            got = got + 1;
+        }
+        return got;
+    }
+
+    public bool CanPlay(int handIndex) {
+        if (this.winner >= 0 || handIndex < 0 || handIndex >= this.deck.Hand().Count()) { return false; }
+        CardDefinition d = this.deck.Hand().At(handIndex).Definition();
+        return d != null && d.Cost() <= this.energy;
+    }
+
+    // 打出一张手牌：扣能量 → 逐条结算效果 → 能力/消耗牌移出本场，其余进弃牌堆。
+    public bool Play(int handIndex) {
+        this.events.Clear();
+        if (!this.CanPlay(handIndex)) { return false; }
+        CardInstance inst = this.deck.Hand().At(handIndex);
+        CardDefinition d = inst.Definition();
+        this.energy = this.energy - d.Cost();
+        this.Note("play", 1, handIndex, d.Cost(), d.Id());
+        for (int i = 0; i < d.EffectCount() && this.winner < 0; i = i + 1) {
+            CardEffect fx = d.EffectAt(i);
+            this.Resolve(fx.Kind(), fx.Amount());
+        }
+        int at = this.deck.Hand().IndexOfInstance(inst.InstanceId());
+        if (at >= 0) {
+            if (d.Category() == "power" || CardLibrary.Has(d, CardFx.Exhaust())) {
+                this.deck.ExhaustFromHand(at);
+            } else {
+                this.deck.DiscardFromHand(at);
+            }
+        }
+        this.CheckWinner();
+        return true;
+    }
+
+    void Resolve(int k, int n) {
+        Fighter p = this.player;
+        Fighter e = this.enemy;
+        if (k == CardFx.Damage()) { this.Strike(n); }
+        else if (k == CardFx.BlockDamage()) { this.Strike(p.block); }
+        else if (k == CardFx.Block()) { p.AddBlock(n); this.Note("block", 0, n, 0, ""); }
+        else if (k == CardFx.Heal()) { this.Note("heal", 0, p.Heal(n), 0, ""); }
+        else if (k == CardFx.Draw()) { this.Note("draw", 0, this.DrawCards(n), 0, ""); }
+        else if (k == CardFx.Energy()) { this.energy = this.energy + n; this.Note("energy", 0, n, 0, ""); }
+        else if (k == CardFx.Strength()) { p.strength = p.strength + n; this.Note("buff", 0, n, 0, "力量"); }
+        else if (k == CardFx.Vulnerable()) { e.vulnerable = e.vulnerable + n; this.Note("debuff", 1, n, 0, "易伤"); }
+        else if (k == CardFx.Weak()) { e.weakness = e.weakness + n; this.Note("debuff", 1, n, 0, "虚弱"); }
+        else if (k == CardFx.Poison()) { e.poison = e.poison + n; this.Note("debuff", 1, n, 0, "中毒"); }
+        else if (k == CardFx.DoublePoison()) { this.Note("debuff", 1, e.poison, 0, "中毒"); e.poison = e.poison * 2; }
+        else if (k == CardFx.LoseHp()) { this.Note("lose", 0, p.LoseHp(n), 0, ""); }
+        else if (k == CardFx.PowerStrength()) { p.strengthPerTurn = p.strengthPerTurn + n; this.Note("buff", 0, n, 0, "恶魔形态"); }
+        else if (k == CardFx.PowerPlating()) { p.platingPerTurn = p.platingPerTurn + n; this.Note("buff", 0, n, 0, "金属化"); }
+        else if (k == CardFx.PowerPoison()) { p.poisonPerTurn = p.poisonPerTurn + n; this.Note("buff", 0, n, 0, "剧毒"); }
+        else if (k == CardFx.PowerDraw()) { p.drawPerTurn = p.drawPerTurn + n; this.Note("buff", 0, n, 0, "灵感"); }
+        else if (k == CardFx.PowerThorns()) { p.thorns = p.thorns + n; this.Note("buff", 0, n, 0, "荆棘"); }
+        this.CheckWinner();
+    }
+
+    // 攀登者的一段攻击。
+    void Strike(int raw) {
+        int dmg = Fighter.AttackValue(raw, this.player, this.enemy);
+        int lost = this.enemy.Absorb(dmg);
+        this.Note("hit", 1, lost, dmg - lost, "");
+    }
+
+    // ---- 敌人回合 ------------------------------------------------------------
+
+    public void EndTurn() {
+        this.events.Clear();
+        if (this.winner >= 0) { return; }
+        Fighter p = this.player;
+        Fighter e = this.enemy;
+        if (p.platingPerTurn > 0) { p.AddBlock(p.platingPerTurn); this.Note("block", 0, p.platingPerTurn, 0, "金属化"); }
+        if (p.block == 0 && this.HasRelic("orichalcum")) { p.AddBlock(6); this.Note("block", 0, 6, 0, "山铜护符"); }
+        this.deck.DiscardHand();
+        p.TickDebuffs();
+
+        e.block = 0;
+        int burn = e.TickPoison();
+        if (burn > 0) { this.Note("poison", 1, burn, 0, "中毒"); }
+        if (this.CheckWinner()) { return; }
+
+        EnemyMove m = this.intent;
+        if (m.block > 0) { e.AddBlock(m.block); this.Note("block", 1, m.block, 0, m.name); }
+        if (m.strength > 0) { e.strength = e.strength + m.strength; this.Note("buff", 1, m.strength, 0, m.name); }
+        if (m.heal > 0) { this.Note("heal", 1, e.Heal(m.heal), 0, m.name); }
+        if (m.damage > 0) {
+            for (int h = 0; h < m.hits; h = h + 1) {
+                int dmg = Fighter.AttackValue(m.damage, e, p);
+                int lost = p.Absorb(dmg);
+                this.Note("hit", 0, lost, dmg - lost, m.name);
+                if (p.thorns > 0) { this.Note("thorns", 1, e.LoseHp(p.thorns), 0, "荆棘"); }
+                if (!p.Alive() || !e.Alive()) { break; }
+            }
+        }
+        if (m.weakness > 0) { p.weakness = p.weakness + m.weakness; this.Note("debuff", 0, m.weakness, 0, "虚弱"); }
+        if (m.vulnerable > 0) { p.vulnerable = p.vulnerable + m.vulnerable; this.Note("debuff", 0, m.vulnerable, 0, "易伤"); }
+        if (m.poison > 0) { p.poison = p.poison + m.poison; this.Note("debuff", 0, m.poison, 0, "中毒"); }
+        e.TickDebuffs();
+        if (this.CheckWinner()) { return; }
+        this.ChooseIntent();
+        this.StartPlayerTurn();
+    }
+
+    // 下一个意图：按敌人的出招方式（循环 / 随机不连出 / 开场招 + 循环）。
+    void ChooseIntent() {
+        int n = this.def.moves.Count;
+        int idx = 0;
+        if (this.def.mode == 1) {
+            idx = this.rng.NextBelow(n);
+            if (idx == this.lastMove && n > 1) { idx = (idx + 1 + this.rng.NextBelow(n - 1)) % n; }
+        } else if (this.def.mode == 2) {
+            idx = this.moveIndex == 0 || n < 2 ? 0 : 1 + (this.moveIndex - 1) % (n - 1);
+        } else {
+            idx = this.moveIndex % n;
+        }
+        this.moveIndex = this.moveIndex + 1;
+        this.lastMove = idx;
+        this.intent = this.def.moves[idx];
+    }
+
+    bool CheckWinner() {
+        if (this.winner >= 0) { return true; }
+        if (!this.enemy.Alive()) { this.winner = 0; }
+        else if (!this.player.Alive()) { this.winner = 1; }
+        return this.winner >= 0;
+    }
+
+    // ---- 只读（界面与机器人） ------------------------------------------------
+
+    // 意图的单段伤害（已算双方力量/虚弱/易伤）；不攻击返回 0。
+    public int IntentHit() {
+        if (this.intent == null || this.intent.damage <= 0) { return 0; }
+        return Fighter.AttackValue(this.intent.damage, this.enemy, this.player);
+    }
+
+    // 意图的总伤害（多段相加）。
+    public int IncomingDamage() {
+        if (this.intent == null) { return 0; }
+        return this.IntentHit() * this.intent.hits;
+    }
+
+    // 一张攻击牌按当前状态实际能打多少（界面在牌面上显示、机器人估值）。
+    public int PreviewDamage(int raw) { return Fighter.AttackValue(raw, this.player, this.enemy); }
+
+    public CardZone Hand() { return this.deck.Hand(); }
+    public int Winner() { return this.winner; }
+}

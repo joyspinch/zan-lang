@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+
+// 一幕的分岔地图：7 行 × 5 列的格子上走出 4 条自下而上的路，路过的格子成为节点，
+// 第 7 行（下标 6）全部连到顶上的 Boss。
+//
+// 规则（都由本局随机源决定，同种子同一张图）：
+//   · 每步向左上/正上/右上走一格；若会与已有连线交叉就改走正上——地图永不交叉。
+//   · 第 0 行全是普通战斗（开局好读），第 3 行是宝箱，第 6 行是篝火（Boss 前回血/锻造）。
+//   · 其余按权重：战斗 46 · 奇遇 22 · 精英 14（第 2 行起）· 商店 9 · 篝火 9（第 2 行起）。
+//   · 每幕至少一个精英、一个商店。
+public class ActMap {
+    public static int Rows() { return 7; }
+    public static int Cols() { return 5; }
+
+    public List<MapNode> nodes;
+    public int boss;
+    int[] grid;
+
+    public ActMap(DeterministicRandom rng) {
+        this.nodes = new List<MapNode>();
+        int rows = ActMap.Rows();
+        int cols = ActMap.Cols();
+        this.grid = new int[rows * cols];
+        for (int i = 0; i < rows * cols; i = i + 1) { this.grid[i] = -1; }
+
+        int first = -1;
+        for (int p = 0; p < 4; p = p + 1) {
+            int c = rng.NextBelow(cols);
+            if (p == 1 && c == first) { c = (c + 2) % cols; }
+            if (p == 0) { first = c; }
+            MapNode at = this.NodeAt(0, c);
+            for (int r = 1; r < rows; r = r + 1) {
+                int nc = c + rng.NextBelow(3) - 1;
+                if (nc < 0) { nc = 0; }
+                if (nc >= cols) { nc = cols - 1; }
+                if (nc != c && this.Crosses(r - 1, c, nc)) { nc = c; }
+                MapNode to = this.NodeAt(r, nc);
+                if (!at.Links(to.index)) { at.next.Add(to.index); }
+                at = to;
+                c = nc;
+            }
+        }
+        MapNode top = new MapNode(this.nodes.Count, rows, cols / 2);
+        top.kind = MapNode.Boss();
+        this.nodes.Add(top);
+        this.boss = top.index;
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            if (this.nodes[i].row == rows - 1) { this.nodes[i].next.Add(this.boss); }
+        }
+        this.AssignKinds(rng);
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            this.nodes[i].jitter = rng.NextBelow(25) - 12;
+        }
+    }
+
+    MapNode NodeAt(int r, int c) {
+        int key = r * ActMap.Cols() + c;
+        if (this.grid[key] >= 0) { return this.nodes[this.grid[key]]; }
+        MapNode n = new MapNode(this.nodes.Count, r, c);
+        this.nodes.Add(n);
+        this.grid[key] = n.index;
+        return n;
+    }
+
+    // 从 (r, c) 斜走到 (r+1, nc) 会不会与已有的反向斜线交叉。
+    bool Crosses(int r, int c, int nc) {
+        int side = this.grid[r * ActMap.Cols() + nc];
+        if (side < 0) { return false; }
+        int back = this.grid[(r + 1) * ActMap.Cols() + c];
+        return back >= 0 && this.nodes[side].Links(back);
+    }
+
+    void AssignKinds(DeterministicRandom rng) {
+        int last = ActMap.Rows() - 1;
+        bool elite = false;
+        bool shop = false;
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            MapNode n = this.nodes[i];
+            if (n.kind == MapNode.Boss()) { continue; }
+            if (n.row == 0) { n.kind = MapNode.Battle(); }
+            else if (n.row == 3) { n.kind = MapNode.Treasure(); }
+            else if (n.row == last) { n.kind = MapNode.Campfire(); }
+            else {
+                int roll = rng.NextBelow(100);
+                if (roll < 46) { n.kind = MapNode.Battle(); }
+                else if (roll < 68) { n.kind = MapNode.Event(); }
+                else if (roll < 82) { n.kind = n.row >= 2 ? MapNode.Elite() : MapNode.Battle(); }
+                else if (roll < 91) { n.kind = MapNode.Shop(); }
+                else { n.kind = n.row >= 2 ? MapNode.Campfire() : MapNode.Event(); }
+            }
+            if (n.kind == MapNode.Elite()) { elite = true; }
+            if (n.kind == MapNode.Shop()) { shop = true; }
+        }
+        if (!elite) { this.Force(MapNode.Elite(), 4, rng); }
+        if (!shop) { this.Force(MapNode.Shop(), 2, rng); }
+    }
+
+    // 保底：把第 row 行（没有就上下找）的一个普通战斗/奇遇改成指定类型。
+    void Force(int kind, int row, DeterministicRandom rng) {
+        for (int d = 0; d < 3; d = d + 1) {
+            List<MapNode> pool = new List<MapNode>();
+            for (int i = 0; i < this.nodes.Count; i = i + 1) {
+                MapNode n = this.nodes[i];
+                bool rowOk = n.row == row + d || n.row == row - d;
+                if (rowOk && n.row > 0 && n.row != 3 && n.row < ActMap.Rows() - 1
+                    && (n.kind == MapNode.Battle() || n.kind == MapNode.Event())) { pool.Add(n); }
+            }
+            if (pool.Count > 0) {
+                pool[rng.NextBelow(pool.Count)].kind = kind;
+                return;
+            }
+        }
+    }
+
+    // 某一行的全部节点（按列排好）。
+    public List<MapNode> RowNodes(int row) {
+        List<MapNode> list = new List<MapNode>();
+        for (int c = 0; c < ActMap.Cols(); c = c + 1) {
+            if (row < ActMap.Rows()) {
+                int k = this.grid[row * ActMap.Cols() + c];
+                if (k >= 0) { list.Add(this.nodes[k]); }
+            }
+        }
+        if (row == ActMap.Rows()) { list.Add(this.nodes[this.boss]); }
+        return list;
+    }
+}

@@ -1,0 +1,576 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// 界面：顶栏（关卡 / 目标 / 警报 / 计时 / 晶矿 / 人口 / 暂停 / 静音）、中央战场视口、
+// 底部指挥台（战术雷达 + 选中单位面板 + 指挥中心生产线），以及作战地图 / 暂停 / 战报三张弹层。
+// 全部是标准控件，外观只走 tx- 语义类（Views/RtsSkin.zan）。
+public partial class Program {
+    // 顶栏
+    Label lblMission;
+    Label lblGoal;
+    Progress barGoal;
+    Label lblGoalNum;
+    Label lblAlert;
+    Label lblTime;
+    Label lblMin;
+    Label lblPop;
+    Button btnPause;
+    Button btnMute;
+
+    // 选中面板
+    Image imgPortrait;
+    Label lblSelName;
+    Label lblSelCount;
+    Label lblSelStats;
+    Label lblSelCounter;
+    Progress barSelHp;
+
+    // 生产线
+    Button[] btnBuild = new Button[4];
+    Label lblQueue;
+    Label lblProd;
+    Progress barProd;
+    Button btnCancel;
+
+    // 弹层
+    RtsModal cardMenu;
+    RtsModal cardPause;
+    RtsModal cardResult;
+    RtsModal shownCard;
+    Button[] btnDiff = new Button[3];
+    Button[] btnMission = new Button[3];
+    Label lblBriefName;
+    Label lblBriefGoal;
+    Label lblBriefEnemy;
+    Label lblBriefStars;
+    Label lblBriefBest;
+    Label lblBriefTip;
+    Label lblCampaign;
+    Label lblPauseGoal;
+    Label lblResultHead;
+    Label lblResultStars;
+    Label lblStar1;
+    Label lblStar2;
+    Label lblStar3;
+    Label lblResultTime;
+    Label lblResultArmy;
+    Label lblResultEco;
+    Label lblResultBest;
+    Label lblResultNew;
+    Button btnNext;
+    bool lastWon = false;
+
+    // 生产按钮顺序：步兵 坦克 炮兵 采矿车（快捷键 Q W E R）
+    int[] buildTypes = new int[] { 0, 1, 3, 2 };
+    string[] buildKeys = new string[] { "Q", "W", "E", "R" };
+
+    // ---- 小工具 ----
+
+    Panel Row(string cls) {
+        Panel p = Panel.Row();
+        p.Class = cls;
+        return p;
+    }
+
+    Panel Col(string cls) {
+        Panel p = Panel.Column();
+        p.Class = cls;
+        return p;
+    }
+
+    Label Txt(Panel parent, string text, string cls) {
+        Label l = new Label(text);
+        l.Class = cls;
+        parent.With(l);
+        return l;
+    }
+
+    Button Btn(string text, string cls, Action a) {
+        Button b = new Button(text);
+        b.Class = cls;
+        b.OnClick(() => {
+            sfx.Play("click");
+            a();
+            if (state == StatePlaying) { view.Focus(app); }
+        });
+        return b;
+    }
+
+    Progress Bar(string cls) {
+        Progress p = new Progress(0, 1);
+        p.IsShowText = false;
+        p.SwitchClass("tx-bar", true);
+        if (cls != "") { p.SwitchClass(cls, true); }
+        return p;
+    }
+
+    string PortraitOf(int type) {
+        if (type == RtsUnit.Tank) { return this.tankPath; }
+        if (type == RtsUnit.Miner) { return this.minerPath; }
+        if (type == RtsUnit.Artillery) { return sprites.portraitArtillery != "" ? sprites.portraitArtillery : this.tankPath; }
+        if (type == RtsUnit.Infantry) { return this.infantryPath; }
+        return "";
+    }
+
+    // ---- 搭建 ----
+
+    void BuildUi() {
+        RtsRoot root = new RtsRoot(this);
+        root.Class = "tx-root";
+        root.SetProp("style", "position:absolute; left:0; top:0; right:0; bottom:0;");
+        root.Pad(8);
+        root.Gap(8);
+        form.Add(root);
+
+        BuildTopBar(root);
+        view = new BattlefieldView(this);
+        view.Grow();
+        root.With(view);
+        BuildCommandBar(root);
+
+        BuildMenuCard();
+        BuildPauseCard();
+        BuildResultCard();
+    }
+
+    void BuildTopBar(Panel root) {
+        Panel bar = this.Row("tx-topbar");
+        bar.Pad(8);
+        bar.Gap(14);
+        lblMission = this.Txt(bar, "", "tx-chip-label");
+        lblGoal = this.Txt(bar, "", "tx-text");
+        barGoal = this.Bar("tx-obj");
+        bar.With(barGoal);
+        lblGoalNum = this.Txt(bar, "", "tx-text tx-amber");
+        bar.With(this.Row("tx-spacer"));
+        lblAlert = this.Txt(bar, "", "tx-alert");
+        lblTime = this.Txt(bar, "", "tx-hud");
+        lblMin = this.Txt(bar, "", "tx-hud tx-cyan");
+        lblPop = this.Txt(bar, "", "tx-hud");
+        Button pause = this.Btn("⏸ 暂停", "tx-icon", () => {
+            if (state == StatePlaying) { Pause(); } else if (state == StatePaused) { Resume(); }
+        });
+        btnPause = pause;
+        bar.With(pause);
+        btnMute = new Button("");
+        btnMute.Class = "tx-icon";
+        btnMute.OnClick(() => {
+            ToggleMute();
+            if (state == StatePlaying) { view.Focus(app); }
+        });
+        bar.With(btnMute);
+        root.With(bar);
+    }
+
+    void BuildCommandBar(Panel root) {
+        Panel cmd = this.Row("tx-command");
+        cmd.Gap(8);
+
+        // 1. 战术雷达
+        Panel mapFrame = this.Col("tx-mapframe");
+        mapFrame.Pad(6);
+        mapFrame.Gap(4);
+        this.Txt(mapFrame, "战术雷达 · 点击移动镜头 · 右键下令", "tx-cap");
+        minimap = new MinimapView(this);
+        minimap.Prefer(240, 144);
+        mapFrame.With(minimap);
+        cmd.With(mapFrame);
+
+        // 2. 选中单位
+        Panel sel = this.Row("tx-panel tx-sel");
+        sel.Pad(10);
+        sel.Gap(12);
+        imgPortrait = new Image("", "", "contain");
+        imgPortrait.Class = "tx-portrait";
+        sel.With(imgPortrait);
+        Panel stats = this.Col("tx-statcol");
+        stats.Gap(4);
+        lblSelName = this.Txt(stats, "", "tx-h2");
+        lblSelCount = this.Txt(stats, "", "tx-dim");
+        barSelHp = this.Bar("tx-hp");
+        stats.With(barSelHp);
+        lblSelStats = this.Txt(stats, "", "tx-text");
+        lblSelCounter = this.Txt(stats, "", "tx-text tx-amber");
+        sel.With(stats);
+        cmd.With(sel);
+
+        // 3. 指挥中心生产线
+        Panel prod = this.Col("tx-panel tx-prod-panel");
+        prod.Pad(10);
+        prod.Gap(6);
+        Panel head = this.Row("tx-row-mid");
+        head.Gap(10);
+        this.Txt(head, "指挥中心 · 生产线", "tx-big tx-cyan");
+        lblQueue = this.Txt(head, "", "tx-text");
+        head.With(this.Row("tx-spacer"));
+        Button cancel = this.Btn("✕ 取消 (X)", "tx-icon", () => { CancelProduction(); });
+        btnCancel = cancel;
+        head.With(cancel);
+        prod.With(head);
+        Panel buttons = this.Row("");
+        buttons.Gap(8);
+        for (int i = 0; i < 4; i = i + 1) {
+            int type = buildTypes[i];
+            Button b = new Button("");
+            b.Class = "tx-build";
+            b.OnClick(() => {
+                Produce(type);
+                view.Focus(app);
+            });
+            btnBuild[i] = b;
+            buttons.With(b);
+        }
+        prod.With(buttons);
+        Panel line = this.Row("tx-row-mid");
+        line.Gap(10);
+        lblProd = this.Txt(line, "", "tx-dim");
+        prod.With(line);
+        barProd = this.Bar("tx-prod");
+        prod.With(barProd);
+        cmd.With(prod);
+
+        root.With(cmd);
+    }
+
+    RtsModal NewCard(string title, int width) {
+        RtsModal m = new RtsModal(this, title);
+        m.Width(width);
+        return m;
+    }
+
+    void BuildMenuCard() {
+        cardMenu = this.NewCard("⚔ 裂谷战役 · 作战地图", 700);
+        Panel body = Panel.Column();
+        body.Gap(10);
+
+        Panel diff = this.Row("tx-chipbox");
+        diff.Gap(8);
+        this.Txt(diff, "难度 (D)", "tx-dim");
+        for (int d = 0; d < 3; d = d + 1) {
+            int dd = d;
+            btnDiff[d] = this.Btn(RtsMission.DifficultyName(d), "tx-chip", () => { PickDifficulty(dd); });
+            diff.With(btnDiff[d]);
+        }
+        diff.With(this.Row("tx-spacer"));
+        lblCampaign = this.Txt(diff, "", "tx-text tx-amber");
+        body.With(diff);
+
+        Panel missions = this.Row("");
+        missions.Gap(10);
+        for (int m = 0; m < RtsMission.Count; m = m + 1) {
+            int mm = m;
+            btnMission[m] = this.Btn("", "tx-mission", () => { PickMission(mm); });
+            missions.With(btnMission[m]);
+        }
+        body.With(missions);
+
+        Panel brief = this.Col("tx-brief");
+        brief.Pad(12);
+        brief.Gap(5);
+        lblBriefName = this.Txt(brief, "", "tx-h3");
+        lblBriefGoal = this.Txt(brief, "", "tx-text tx-white");
+        lblBriefEnemy = this.Txt(brief, "", "tx-text");
+        lblBriefStars = this.Txt(brief, "", "tx-text tx-amber");
+        lblBriefBest = this.Txt(brief, "", "tx-dim");
+        body.With(brief);
+
+        this.Txt(body, "兵种克制：步兵 ▶ 炮兵 ▶ 坦克 ▶ 步兵（克制方伤害约 ×2）", "tx-text tx-cyan");
+        this.Txt(body, "左键点选 / 拖拽框选（Shift 追加）· 右键行军 · Shift+右键 攻击移动 · A 全选部队 · S 采矿车 · H 基地", "tx-dim");
+        this.Txt(body, "Q/W/E/R 生产步兵/坦克/炮兵/采矿车 · X 取消 · 方向键或鼠标贴边移动镜头 · P 暂停 · M 静音", "tx-dim");
+        lblBriefTip = this.Txt(body, "新兵提示：先按 R 多造两台采矿车，再用 A 全选部队，右键峡口中央的上行链路。", "tx-text tx-green");
+        cardMenu.Content(body);
+        List<Control> acts = new List<Control>();
+        acts.Add(this.Btn("▶ 出击 (Enter)", "tx-cta", () => { StartBattle(); }));
+        acts.Add(this.Btn("退出", "tx-btn", () => { Quit(); }));
+        cardMenu.Actions(acts);
+    }
+
+    void BuildPauseCard() {
+        cardPause = this.NewCard("⏸ 战斗暂停", 520);
+        Panel body = Panel.Column();
+        body.Gap(6);
+        this.Txt(body, "战场时间已冻结。", "tx-h2");
+        lblPauseGoal = this.Txt(body, "", "tx-text");
+        this.Txt(body, "P / Esc 继续 · R 重新开始", "tx-dim");
+        cardPause.Content(body);
+        List<Control> acts = new List<Control>();
+        acts.Add(this.Btn("▶ 继续", "tx-cta", () => { Resume(); }));
+        acts.Add(this.Btn("↻ 重新开始", "tx-btn", () => { StartBattle(); }));
+        acts.Add(this.Btn("作战地图", "tx-btn", () => { ShowMenu(); }));
+        cardPause.Actions(acts);
+    }
+
+    void BuildResultCard() {
+        cardResult = this.NewCard("战报", 560);
+        Panel body = Panel.Column();
+        body.Gap(5);
+        lblResultHead = this.Txt(body, "", "tx-h2 tx-center");
+        lblResultStars = this.Txt(body, "", "tx-stars");
+        lblStar1 = this.Txt(body, "", "tx-text");
+        lblStar2 = this.Txt(body, "", "tx-text");
+        lblStar3 = this.Txt(body, "", "tx-text");
+        lblResultTime = this.Txt(body, "", "tx-text");
+        lblResultArmy = this.Txt(body, "", "tx-text");
+        lblResultEco = this.Txt(body, "", "tx-text");
+        lblResultBest = this.Txt(body, "", "tx-dim");
+        lblResultNew = this.Txt(body, "", "tx-newbest");
+        cardResult.Content(body);
+        List<Control> acts = new List<Control>();
+        Button next = this.Btn("▶ 下一关 (Enter)", "tx-cta", () => { NextMission(); });
+        btnNext = next;
+        acts.Add(next);
+        acts.Add(this.Btn("↻ 再战 (R)", "tx-btn", () => { StartBattle(); }));
+        acts.Add(this.Btn("作战地图", "tx-btn", () => { ShowMenu(); }));
+        cardResult.Actions(acts);
+    }
+
+    // ---- 作战地图 ----
+
+    void PickMission(int m) {
+        if (m < 0 || m >= RtsMission.Count) { return; }
+        if (!this.Unlocked(m)) {
+            sfx.Play("error", 0.4);
+            return;
+        }
+        missionIndex = m;
+        RefreshMenu();
+    }
+
+    void PickDifficulty(int d) {
+        difficulty = d;
+        RefreshMenu();
+    }
+
+    void RefreshMenu() {
+        for (int d = 0; d < 3; d = d + 1) { btnDiff[d].Class = d == difficulty ? "tx-chip-on" : "tx-chip"; }
+        for (int m = 0; m < RtsMission.Count; m = m + 1) {
+            RtsMission def = RtsMission.Get(m, difficulty);
+            bool open = this.Unlocked(m);
+            string text = open ? def.code + "  " + def.name + "   " + Program.StarText(this.StarsOf(m, difficulty))
+                               : "🔒 " + def.code + "  " + def.name;
+            btnMission[m].Text.Set(text);
+            btnMission[m].Class = m == missionIndex ? "tx-mission-on" : "tx-mission";
+            btnMission[m].Disabled.Set(!open);
+        }
+        RtsMission sel = RtsMission.Get(missionIndex, difficulty);
+        lblBriefName.Text.Set("任务 " + sel.code + " · " + sel.name + "（" + RtsMission.DifficultyName(difficulty) + "）");
+        lblBriefGoal.Text.Set("🎯 " + sel.goalText + " · 时限 " + Program.Clock((long)sel.timeLimitTicks * TickMs, false));
+        lblBriefEnemy.Text.Set("敌情：" + sel.enemyText);
+        lblBriefStars.Text.Set("★ 完成目标 · ★★ " + Program.Clock((long)sel.parTicks * TickMs, false)
+            + " 内完成 · ★★★ 同时指挥中心完好 ≥ " + Convert.ToString(RtsMission.HqIntegrityForStar) + "%");
+        string mk = this.MissionKey(missionIndex, difficulty);
+        string best = "本难度最佳：" + Program.StarText(this.StarsOf(missionIndex, difficulty));
+        if (profile.HasBest(mk + "_fast")) { best = best + " · 最快 " + Program.Clock(profile.Best(mk + "_fast"), true); }
+        lblBriefBest.Text.Set(best);
+        lblCampaign.Text.Set("战役星数 ★ " + Convert.ToString(this.TotalStars()) + " / " + Convert.ToString(RtsMission.Count * 9));
+        lblBriefTip.SetShown(profile.Counter("plays") == 0);
+        app.RequestRedraw();
+    }
+
+    // ---- 战报 ----
+
+    void FillResult(bool won, int stars, int prevStars, bool newBest, bool firstClear, int hqPct) {
+        lastWon = won;
+        RtsMission m = battle.mission;
+        cardResult.Title(won ? "🏆 任务完成 · " + m.name : "💀 任务失败 · " + m.name);
+        string reason;
+        if (won) {
+            reason = m.goal == RtsMission.GoalHoldUplink && battle.teams[1].hq.Hp > 0 ? "上行链路控制达成，裂谷通讯归我军所有" : "红军指挥中心已被摧毁";
+        } else if (battle.teams[0].hq.Hp <= 0) {
+            reason = "我军指挥中心被摧毁";
+        } else {
+            reason = "时限已到，目标未完成";
+        }
+        lblResultHead.Text.Set(reason);
+        lblResultHead.Class = won ? "tx-h2 tx-center tx-green" : "tx-h2 tx-center tx-red";
+        lblResultStars.Text.Set(Program.StarText(stars));
+        lblResultStars.SetShown(won);
+        int ticks = battle.ticks;
+        lblStar1.Text.Set((won ? "✔ " : "✖ ") + m.goalText);
+        lblStar2.Text.Set((won && ticks <= m.parTicks ? "✔ " : "✖ ") + "在 " + Program.Clock((long)m.parTicks * TickMs, false) + " 内完成");
+        lblStar3.Text.Set((stars >= 3 ? "✔ " : "✖ ") + "并保持指挥中心完好 ≥ " + Convert.ToString(RtsMission.HqIntegrityForStar)
+            + "%（本局 " + Convert.ToString(hqPct) + "%）");
+        lblStar1.Class = won ? "tx-text tx-green" : "tx-text tx-red";
+        lblStar2.Class = won && ticks <= m.parTicks ? "tx-text tx-green" : "tx-text tx-dim";
+        lblStar3.Class = stars >= 3 ? "tx-text tx-green" : "tx-text tx-dim";
+        lblResultTime.Text.Set("作战用时  " + Program.Clock((long)ticks * TickMs, true) + " · 难度 " + RtsMission.DifficultyName(m.difficulty));
+        lblResultArmy.Text.Set("我军损失 " + Convert.ToString(battle.teams[0].lost) + " / 出动 " + Convert.ToString(battle.teams[0].fielded)
+            + " · 歼敌 " + Convert.ToString(battle.teams[1].lost) + " · 红军攻势 " + Convert.ToString(battle.ai.waveNo) + " 波");
+        lblResultEco.Text.Set("采矿 " + Convert.ToString(battle.teams[0].deposited) + " 晶矿 · 链路控制 "
+            + Convert.ToString(battle.teams[0].holdTicks / 20) + " 秒");
+        string mk = this.MissionKey(missionIndex, difficulty);
+        string best = "本难度最佳 " + Program.StarText(this.StarsOf(missionIndex, difficulty));
+        if (profile.HasBest(mk + "_fast")) { best = best + " · 最快 " + Program.Clock(profile.Best(mk + "_fast"), true); }
+        best = best + " · 战役星数 " + Convert.ToString(this.TotalStars()) + "/" + Convert.ToString(RtsMission.Count * 9);
+        lblResultBest.Text.Set(best);
+        string news = "";
+        if (firstClear && missionIndex + 1 < RtsMission.Count) {
+            news = "🔓 解锁新任务：" + RtsMission.Get(missionIndex + 1, difficulty).name;
+        } else if (won && stars > prevStars) {
+            news = "★ 新星级纪录！";
+        } else if (newBest) {
+            news = "★ 新纪录！最快胜利";
+        }
+        lblResultNew.Text.Set(news);
+        lblResultNew.SetShown(news != "");
+        bool hasNext = won && missionIndex + 1 < RtsMission.Count;
+        btnNext.SetShown(hasNext);
+    }
+
+    // ---- 弹层 ----
+
+    // 只显示一张弹层（null = 全部收起，战场重新接收输入）。
+    void ShowCard(RtsModal which) {
+        if (shownCard != null && shownCard != which) {
+            RtsModal old = shownCard;
+            shownCard = null;
+            old.Hide();
+        }
+        shownCard = which;
+        if (which != null) { PushCard(); }
+        app.RequestRedraw();
+    }
+
+    void PushCard() {
+        RtsModal m = shownCard;
+        if (m == null) { return; }
+        m.Show();
+        app.overlayHost.Push(app, null, m, true);
+        m.Focus(app);
+    }
+
+    // 窗口失焦时 overlayHost 会收起全部弹层：流程还停在作战地图/暂停/战报时补回来。
+    void EnsureCardShown() {
+        if (shownCard == null || app.overlayHost == null) { return; }
+        if (app.overlayHost.ActiveRoot() != shownCard) { PushCard(); }
+    }
+
+    // ---- HUD 同步 ----
+
+    void SyncHud() {
+        RtsMission m = battle.mission;
+        RtsTeam me = battle.teams[0];
+        lblMission.Text.Set(m.code + " " + m.name + " · " + RtsMission.DifficultyName(m.difficulty));
+        if (m.goal == RtsMission.GoalHoldUplink) {
+            lblGoal.Text.Set("🎯 控制上行链路");
+            int pct = me.holdTicks * 100 / Math.Max(1, m.holdTicksToWin);
+            barGoal.SetPercent(Math.Min(100, pct));
+            lblGoalNum.Text.Set(Convert.ToString(me.holdTicks / 20) + "/" + Convert.ToString(m.holdTicksToWin / 20) + " 秒");
+        } else {
+            lblGoal.Text.Set("🎯 摧毁红军指挥中心");
+            int pct = 100 - battle.HqPercent(1);
+            barGoal.SetPercent(pct);
+            lblGoalNum.Text.Set("敌基地 " + Convert.ToString(battle.HqPercent(1)) + "%");
+        }
+        bool showAlert = alertLeft > 0.0 && alertText != "" && state == StatePlaying;
+        lblAlert.SetShown(showAlert);
+        if (showAlert) {
+            lblAlert.Text.Set(alertText);
+            lblAlert.Class = alertRed ? "tx-alert tx-alert-red" : "tx-alert";
+        }
+        int left = battle.TimeLeftTicks();
+        lblTime.Text.Set("⏱ " + Program.Clock((long)left * TickMs, false));
+        lblTime.Class = state == StatePlaying && left < 600 ? "tx-hud tx-red" : "tx-hud";
+        lblMin.Text.Set("💎 " + Convert.ToString(me.minerals));
+        lblPop.Text.Set("👥 " + Convert.ToString(me.supplyUsed) + "/" + Convert.ToString(me.supplyMax));
+        lblPop.Class = me.supplyUsed + 2 > me.supplyMax ? "tx-hud tx-amber" : "tx-hud";
+        btnPause.Text.Set(state == StatePaused ? "▶ 继续" : "⏸ 暂停");
+        btnPause.Disabled.Set(state != StatePlaying && state != StatePaused);
+        btnMute.Text.Set(muted ? "🔇 静音" : "🔊 音效");
+        this.SyncSelection();
+        this.SyncProduction();
+    }
+
+    void SyncSelection() {
+        int[] count = new int[5];
+        int total = 0;
+        int hp = 0;
+        int maxHp = 0;
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            RtsUnit u = battle.units[i];
+            if (!u.Selected) { continue; }
+            count[u.Type] = count[u.Type] + 1;
+            total = total + 1;
+            hp = hp + u.Hp;
+            maxHp = maxHp + u.MaxHp;
+        }
+        int main = -1;
+        for (int t = 0; t < 5; t = t + 1) {
+            if (count[t] > 0 && (main < 0 || count[t] > count[main])) { main = t; }
+        }
+        if (total == 0) {
+            RtsUnit hq = battle.teams[0].hq;
+            imgPortrait.Src.Set("");
+            lblSelName.Text.Set("未选中单位");
+            lblSelCount.Text.Set("部队 " + Convert.ToString(battle.CountType(0, RtsUnit.Infantry) + battle.CountType(0, RtsUnit.Tank)
+                + battle.CountType(0, RtsUnit.Artillery)) + " · 采矿车 " + Convert.ToString(battle.CountType(0, RtsUnit.Miner)));
+            barSelHp.SetPercent(battle.HqPercent(0));
+            lblSelStats.Text.Set("指挥中心 " + Convert.ToString(Math.Max(0, hq.Hp)) + " / " + Convert.ToString(hq.MaxHp));
+            lblSelCounter.Text.Set("拖拽框选部队，A 全选，H 选中基地");
+            return;
+        }
+        imgPortrait.Src.Set(main == RtsUnit.Hq ? "" : this.PortraitOf(main));
+        string mix = "";
+        for (int t = 0; t < 5; t = t + 1) {
+            if (count[t] == 0) { continue; }
+            if (mix != "") { mix = mix + " · "; }
+            mix = mix + RtsUnit.NameOf(t) + " ×" + Convert.ToString(count[t]);
+        }
+        int kinds = 0;
+        for (int t = 0; t < 5; t = t + 1) {
+            if (count[t] > 0) { kinds = kinds + 1; }
+        }
+        string title = kinds > 1 ? "混编部队 ×" + Convert.ToString(total) : RtsUnit.NameOf(main) + "编队 ×" + Convert.ToString(total);
+        lblSelName.Text.Set(total == 1 ? RtsUnit.NameOf(main) : title);
+        lblSelCount.Text.Set(mix);
+        barSelHp.SetPercent(maxHp > 0 ? hp * 100 / maxHp : 0);
+        lblSelStats.Text.Set("❤ " + Convert.ToString(hp) + "/" + Convert.ToString(maxHp)
+            + (RtsUnit.DamageOf(main) > 0 ? "  ⚔ " + Convert.ToString(RtsUnit.DamageOf(main)) + "  ◎ " + Convert.ToString((int)RtsUnit.RangeOf(main)) : "")
+            + (main == RtsUnit.Hq ? "" : "  ➤ " + Convert.ToString((int)RtsUnit.SpeedOf(main))));
+        if (main == RtsUnit.Hq) {
+            lblSelCounter.Text.Set("右键地面设置集结点 · Q/W/E/R 生产");
+        } else if (main == RtsUnit.Miner) {
+            lblSelCounter.Text.Set("自动往返矿区；右键可临时调度");
+        } else {
+            lblSelCounter.Text.Set("克制 " + RtsUnit.NameOf(RtsUnit.Beats(main)) + " · 怕 " + RtsUnit.NameOf(RtsUnit.BeatenBy(main))
+                + (main == RtsUnit.Artillery ? " · 溅射" : ""));
+        }
+    }
+
+    void SyncProduction() {
+        RtsTeam me = battle.teams[0];
+        for (int i = 0; i < 4; i = i + 1) {
+            int type = buildTypes[i];
+            int queued = battle.QueuedType(0, type);
+            btnBuild[i].Text.Set(buildKeys[i] + " " + RtsUnit.NameOf(type) + " 💎" + Convert.ToString(RtsUnit.CostOf(type))
+                + (queued > 0 ? " ×" + Convert.ToString(queued) : ""));
+            btnBuild[i].Disabled.Set(state != StatePlaying || !battle.CanQueue(0, type));
+        }
+        string q = "";
+        for (int i = 0; i < RtsBattle.QueueMax; i = i + 1) { q = q + (i < me.queue.Count ? "▣" : "□"); }
+        lblQueue.Text.Set(q);
+        btnCancel.Disabled.Set(state != StatePlaying || me.queue.Count == 0);
+        if (me.queue.Count > 0) {
+            int type = me.queue[0];
+            int pct = me.progress * 100 / RtsUnit.BuildTicksOf(type);
+            barProd.SetPercent(pct);
+            lblProd.Text.Set("生产中：" + RtsUnit.NameOf(type) + "  " + Convert.ToString(pct) + "%  · 人口 "
+                + Convert.ToString(RtsUnit.SupplyOf(type)));
+        } else {
+            barProd.SetPercent(0);
+            lblProd.Text.Set("生产线空闲 · 晶矿来自采矿车与上行链路");
+        }
+    }
+
+    // 时钟文本：mm:ss（tenths = 带十分位）
+    static string Clock(long ms, bool tenths) {
+        long sec = ms / 1000;
+        long m = sec / 60;
+        long s = sec % 60;
+        string t = (m < 10 ? "0" : "") + Convert.ToString(m) + ":" + (s < 10 ? "0" : "") + Convert.ToString(s);
+        if (tenths) { t = t + "." + Convert.ToString((ms % 1000) / 100); }
+        return t;
+    }
+}

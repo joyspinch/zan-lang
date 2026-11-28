@@ -9,6 +9,7 @@ public class TrapCatSprite : Control {
     const int PoseCount = 256;
     const int PoseMs = 5;
     const int HopMs = 240;
+    const int DashMs = 520;
     const double Tau = 6.283185307179586;
     Button[] cells;
     int fromCell = TrapCatBoard.Center;
@@ -20,6 +21,12 @@ public class TrapCatSprite : Control {
     int cachedSize;
     int cachedMood = -1;
     TrapCatResult result;
+    // 逃脱冲刺：落到边缘后沿起跳方向再冲出棋盘几格，然后消失。
+    bool dashing;
+    int dashFromX;
+    int dashFromY;
+    int dashToX;
+    int dashToY;
 
     TrapCatSprite(Button[] boardCells) {
         InitControl("CatSprite");
@@ -41,6 +48,17 @@ public class TrapCatSprite : Control {
         hopStart = 0;
         danceStart = Window.GetTickMs();
         result = state;
+        dashing = false;
+    }
+
+    // 冲刺结束后猫已离场（不再绘制）。
+    bool Gone() {
+        return dashing && Window.GetTickMs() - hopStart >= TrapCatSprite.HopMs + TrapCatSprite.DashMs;
+    }
+
+    bool Dashing() {
+        long t = Window.GetTickMs() - hopStart;
+        return dashing && t >= TrapCatSprite.HopMs && t < TrapCatSprite.HopMs + TrapCatSprite.DashMs;
     }
 
     bool Moving() {
@@ -65,6 +83,19 @@ public class TrapCatSprite : Control {
         toCell = cell;
         hopStart = now;
         result = state;
+        dashing = state == TrapCatResult.Escaped;
+        if (dashing) {
+            Button target = cells[cell];
+            dashFromX = target.bx + target.bw / 2;
+            dashFromY = target.by + target.bh / 2;
+            int dx = dashFromX - x;
+            int dy = dashFromY - y;
+            if (dx == 0 && dy == 0) { dx = dashFromX < source.bx ? -1 : 1; }
+            double len = Math.Sqrt((double)(dx * dx + dy * dy));
+            double reach = target.bw * 4.0;
+            dashToX = dashFromX + (int)(dx / len * reach);
+            dashToY = dashFromY + (int)(dy / len * reach);
+        }
     }
 
     override void OnPaint(App app) {
@@ -76,12 +107,28 @@ public class TrapCatSprite : Control {
         int x = target.bx + target.bw / 2;
         int y = target.by + target.bh / 2;
         int rise = 0;
+        if (this.Gone()) {
+            bw = 0;
+            bh = 0;
+            UiDriver.SetProbe("trap.cat.moving", "false");
+            return;
+        }
+        // 两格的“猛扑”跳得更高。
+        double arc = this.HopArc(target);
         if (this.Moving()) {
             double t = (double)(now - hopStart) / TrapCatSprite.HopMs;
             double f = Easing.Evaluate(EaseType.SineInOut, t);
             x = (int)(hopFromX * (1.0 - f) + x * f);
             y = (int)(hopFromY * (1.0 - f) + y * f);
-            rise = (int)(Math.Sin(t * TrapCatSprite.Tau / 2.0) * target.bh * 0.28);
+            rise = (int)(Math.Sin(t * TrapCatSprite.Tau / 2.0) * target.bh * arc);
+            mood = 1;
+        } else if (this.Dashing()) {
+            double t = (double)(now - hopStart - TrapCatSprite.HopMs) / TrapCatSprite.DashMs;
+            double f = Easing.Evaluate(EaseType.QuadIn, t);
+            x = (int)(dashFromX * (1.0 - f) + dashToX * f);
+            y = (int)(dashFromY * (1.0 - f) + dashToY * f);
+            // 冲刺时连续小碎步。
+            rise = (int)(Math.Abs(Math.Sin(t * TrapCatSprite.Tau * 2.0)) * target.bh * 0.16);
             mood = 1;
         }
         int size = target.bw * 8 / 5;
@@ -122,13 +169,39 @@ public class TrapCatSprite : Control {
             int minY = hopFromY < ty ? hopFromY : ty;
             int maxX = hopFromX > tx ? hopFromX : tx;
             int maxY = hopFromY > ty ? hopFromY : ty;
-            int lift = (int)(target.bh * 0.28);
+            int lift = (int)(target.bh * arc);
             rx = minX - size / 2;
             ry = minY + target.bh / 4 - height * 132 / 144 - lift;
             rw = maxX - minX + size;
             rh = maxY - minY + height + lift;
         }
+        if (dashing && !this.Gone()) {
+            int minX = dashFromX < dashToX ? dashFromX : dashToX;
+            int minY = dashFromY < dashToY ? dashFromY : dashToY;
+            int maxX = dashFromX > dashToX ? dashFromX : dashToX;
+            int maxY = dashFromY > dashToY ? dashFromY : dashToY;
+            int lift = (int)(target.bh * arc);
+            int dl = minX - size / 2 < rx ? minX - size / 2 : rx;
+            int dt = minY + target.bh / 4 - height * 132 / 144 - lift;
+            if (ry < dt) { dt = ry; }
+            int dr = maxX + size / 2 > rx + rw ? maxX + size / 2 : rx + rw;
+            int db = maxY + target.bh / 4 + height;
+            if (ry + rh > db) { db = ry + rh; }
+            rx = dl;
+            ry = dt;
+            rw = dr - dl;
+            rh = db - dt;
+        }
         app.RequestAnimationFrameIn(rx, ry, rw, rh);
+    }
+
+    double HopArc(Button target) {
+        if (target.bw <= 0) { return 0.28; }
+        int tx = target.bx + target.bw / 2;
+        int ty = target.by + target.bh / 2;
+        double span = Math.Sqrt((double)((tx - hopFromX) * (tx - hopFromX) + (ty - hopFromY) * (ty - hopFromY)));
+        double cellsAcross = span / (target.bw * 1.2);
+        return cellsAcross > 1.4 ? 0.62 : 0.28;
     }
 
     static string PoseSvg(int frame, int mood) {

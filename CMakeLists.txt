@@ -9044,6 +9044,7 @@ set(_lspzan_srcs
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/token.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/ast.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/diag.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/diag_codes.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/lexer.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser.zan
   ${CMAKE_SOURCE_DIR}/src/selfhost/frontend/parser_scan.zan
@@ -9121,6 +9122,10 @@ if(Python3_Interpreter_FOUND)
       --burn-exe ${_dap_burn}
       --burn-src ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget_burn.zan)
   set_tests_properties(tool_dap_zan_session PROPERTIES TIMEOUT 300)
+
+  add_test(NAME policy_diag_codes_sync
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/scripts/gen_diag_codes.py --check)
+  set_tests_properties(policy_diag_codes_sync PROPERTIES TIMEOUT 30 LABELS "full;standard;smoke")
 endif()
 
 if(Python3_Interpreter_FOUND)

@@ -1,0 +1,281 @@
+using System;
+
+// AI 决策与步进：三种性格的大蛇 + 小蛇猎物，外加玩家的自动驾驶（回放机器人 / 演示）。
+// 性格即颜色（SnSkins.PersonaColor）：
+//   谨慎者（天蓝）——比你小就躲，只在大你一半时才拦截，专心吃豆；
+//   猎杀者（猩红）——敢于以小搏大，冲刺预判截击，分数越高横切越勤；
+//   缠绕者（紫罗兰）——绕着你转圈收口，想把你困死在自己身体里。
+// 所有随机只出自 SnGame.rng，时间只用模拟时钟，回放确定。
+public class SnAi {
+    static int[] dx16 = new int[] { 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115, 0, 115, 212, 277 };
+    static int[] dy16 = new int[] { 0, 115, 212, 277, 300, 277, 212, 115, 0, -115, -212, -277, -300, -277, -212, -115 };
+    static string[] names = new string[] { "疾风", "毒牙", "暗影", "赤焰", "雷霆", "青鳞", "夜枭", "碧波",
+        "银环", "墨玉", "霜刃", "紫电", "流萤", "狂澜", "寒星", "烈日" };
+
+    // 16 等分方向向量（模 300），0 = 向右，顺时针。
+    static int DirX(int a) { return SnAi.dx16[((a % 16) + 16) % 16]; }
+    static int DirY(int a) { return SnAi.dy16[((a % 16) + 16) % 16]; }
+    static string NameAt(int i) { return SnAi.names[((i % 16) + 16) % 16]; }
+
+    static int BaseSpeed(int persona) {
+        if (persona == 1) { return 160; }
+        if (persona == 2) { return 174; }
+        return 170;
+    }
+    static int MaxLen() { return 170; }
+
+    // 朝 (x,y) 定目标点，目标一律夹在场内，免得 AI 追着点撞墙。
+    static void Aim(Worm w, int x, int y, int until) {
+        w.tgtX = SnGame.ClampX(x, 140);
+        w.tgtY = SnGame.ClampY(y, 140);
+        w.tgtUntil = until;
+    }
+
+    // 最近的豆（抽样），死亡能量豆加权更香。
+    static void SeekOrb(SnGame g, Worm w, int hx, int hy, int now) {
+        int best = -1;
+        int bd = 2000000000;
+        for (int i = w.thinkAt % 3; i < g.orbs.Count; i = i + 3) {
+            Orb o = g.orbs[i];
+            if (o.kind == 2) { continue; }
+            int d = SnGame.Dist2(o.x, o.y, hx, hy);
+            if (o.kind == 1) { d = d / 3; }
+            if (d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0) {
+            SnAi.Aim(w, g.orbs[best].x, g.orbs[best].y, now + 1500);
+        } else {
+            SnAi.Aim(w, g.rng.Range(0, SnGame.WW()), g.rng.Range(0, SnGame.WH()), now + 1500);
+        }
+    }
+
+    static void Flee(Worm w, int hx, int hy, int fromX, int fromY, int now) {
+        int fx = hx - fromX;
+        int fy = hy - fromY;
+        SnAi.Aim(w, hx + fx * 4, hy + fy * 4, now + 350);
+    }
+
+    static void AiThink(SnGame g, Worm w, int now) {
+        if (now < w.thinkAt) { return; }
+        w.thinkAt = now + (w.persona == 1 ? 120 : 90);
+        int hx = w.headX / 256;
+        int hy = w.headY / 256;
+        Worm me = g.me;
+        int phx = me.headX / 256;
+        int phy = me.headY / 256;
+        int pd2 = SnGame.Dist2(hx, hy, phx, phy);
+        int aggro = g.Aggro();
+
+        if (w.kind == 2) {
+            // 猎物：规避邻近玩家并随机漫游。
+            if (pd2 < 260 * 260 && me.alive) {
+                SnAi.Flee(w, hx, hy, phx, phy, now);
+            } else if (now >= w.tgtUntil) {
+                SnAi.Aim(w, g.rng.Range(0, SnGame.WW()), g.rng.Range(0, SnGame.WH()), now + 2200 + g.rng.Range(0, 2000));
+            }
+        } else if (w.persona == 1) {
+            // 谨慎者
+            if (me.alive && pd2 < 300 * 300 && me.length * 3 >= w.length * 2) {
+                SnAi.Flee(w, hx, hy, phx, phy, now);
+            } else if (me.alive && w.length * 2 > me.length * 3 && pd2 < 320 * 320) {
+                SnAi.Aim(w, phx + me.dirX * 100 / 256, phy + me.dirY * 100 / 256, now + 250);
+            } else if (now >= w.tgtUntil) {
+                SnAi.SeekOrb(g, w, hx, hy, now);
+            }
+        } else if (w.persona == 2) {
+            // 猎杀者：拦截半径 340（平静期）/ 460→940，预判提前量 120→264，近身冲刺。
+            int irange = aggro == 0 ? 340 : 460 + aggro * 80;
+            if (me.alive && w.length * 4 >= me.length * 3 && pd2 < irange * irange) {
+                int lead = 120 + aggro * 24;
+                SnAi.Aim(w, phx + me.dirX * lead / 256, phy + me.dirY * lead / 256, now + 250);
+                if (pd2 < 380 * 380) { w.boostUntil = now + 320; }
+            } else if (now >= w.tgtUntil) {
+                SnAi.SeekOrb(g, w, hx, hy, now);
+            }
+            // 突然横切（威胁 ≥1 解锁）：朝向一帧钉到玩家头前方的拦截点，
+            // 冷却随威胁从 4.7s 压到 2.2s。
+            if (aggro > 0 && me.alive && now >= w.cutAt) {
+                int crange = 340 + aggro * 60;
+                if (pd2 < crange * crange) {
+                    w.cutAt = now + 5200 - aggro * 500;
+                    int ix = phx + me.dirX * (140 + aggro * 24) / 256;
+                    int iy = phy + me.dirY * (140 + aggro * 24) / 256;
+                    int vx = ix - hx;
+                    int vy = iy - hy;
+                    int vl = Worm.Isq(vx * vx + vy * vy);
+                    if (vl > 12) {
+                        w.dirX = vx * 256 / vl;
+                        w.dirY = vy * 256 / vl;
+                        SnAi.Aim(w, ix, iy, now + 400);
+                        w.boostUntil = now + 450;
+                    }
+                }
+            }
+        } else {
+            // 缠绕者：把"玩家→自己"的向量转 70° 当目标，绕你收口。
+            int orange = 520 + aggro * 50;
+            if (me.alive && w.length >= 24 && pd2 < orange * orange) {
+                int fx = hx - phx;
+                int fy = hy - phy;
+                int rx = (fx * 88 - w.orbit * fy * 240) / 256;
+                int ry = (w.orbit * fx * 240 + fy * 88) / 256;
+                int rl = Worm.Isq(rx * rx + ry * ry);
+                if (rl < 1) { rl = 1; }
+                int rad = 130 + w.Radius() * 3 + me.Radius() * 2 - aggro * 6;
+                SnAi.Aim(w, phx + rx * rad / rl, phy + ry * rad / rl, now + 200);
+                if (pd2 < 300 * 300) { w.boostUntil = now + 200; }
+            } else if (now >= w.tgtUntil) {
+                SnAi.SeekOrb(g, w, hx, hy, now);
+            }
+        }
+
+        if (w.kind == 1) {
+            // 防撞：前方探针碰到玩家身体就侧闪（谨慎者也躲其他大蛇）。
+            int probeX = hx + w.dirX * 70 / 256;
+            int probeY = hy + w.dirY * 70 / 256;
+            bool danger = me.alive && g.HitsBody(me, probeX, probeY, 3, w.Radius());
+            if (!danger && w.persona == 1) {
+                int px2 = hx + w.dirX * 95 / 256;
+                int py2 = hy + w.dirY * 95 / 256;
+                for (int i = 0; i < g.foes.Count && !danger; i = i + 1) {
+                    Worm o = g.foes[i];
+                    if (o != w && o.kind == 1 && g.HitsBody(o, px2, py2, 0, w.Radius())) { danger = true; }
+                }
+            }
+            if (danger) {
+                SnAi.Aim(w, hx + w.dirY * 200 / 256 * w.orbit, hy - w.dirX * 200 / 256 * w.orbit, now + 400);
+            }
+        }
+        // 撞墙预警优先：前方 170px 贴墙就掉头往场心。
+        int ax = hx + w.dirX * 170 / 256;
+        int ay = hy + w.dirY * 170 / 256;
+        if (SnGame.WallDist(ax, ay) < 90 || SnGame.WallDist(hx, hy) < 110) {
+            int cx = SnGame.WW() / 2 - hx;
+            int cy = SnGame.WH() / 2 - hy;
+            int cl = Worm.Isq(cx * cx + cy * cy);
+            if (cl < 1) { cl = 1; }
+            SnAi.Aim(w, hx + cx * 320 / cl, hy + cy * 320 / cl, now + 500);
+        }
+    }
+
+    static void StepFoe(SnGame g, Worm w, int dt, int now) {
+        if (!w.alive) {
+            if (now >= w.respawnAt && !g.over) { g.SpawnFoe(w, now); }
+            return;
+        }
+        SnAi.AiThink(g, w, now);
+        g.SteerToTarget(w, dt);
+        int wspd = w.speed;
+        if (w.kind == 1) { wspd = wspd + 6 * g.Aggro(); }
+        bool boost = w.Boosting(now);
+        if (boost) { wspd = wspd * 145 / 100; }
+        w.Advance(wspd, dt);
+        int hx = w.headX / 256;
+        int hy = w.headY / 256;
+        if (boost && now % 64 < dt && w.seg.Count > 3) {
+            SegmentPoint tail = w.seg[3];
+            g.BurstEx(tail.x, tail.y, 1, now, w.cr, w.cg, w.cb, 20, 50, 340, 2);
+        }
+        // 撞墙出局。
+        if (SnGame.WallDist(hx, hy) < SnGame.Wall() + w.Radius() / 2) {
+            g.KillFoe(w, now, 2, null);
+            return;
+        }
+        // 吞豆成长（道具球只给玩家）。
+        int rad = w.Radius();
+        for (int i = g.orbs.Count - 1; i >= 0; i = i - 1) {
+            Orb o = g.orbs[i];
+            if (o.kind == 2) { continue; }
+            int rr = rad + o.size;
+            int ddx = o.x - hx;
+            if (ddx < rr && ddx > -rr) {
+                int ddy = o.y - hy;
+                if (ddx * ddx + ddy * ddy < rr * rr) {
+                    bool respawn = o.kind == 0;
+                    g.orbs.RemoveAt(i);
+                    if (respawn) { g.SpawnOrb(); }
+                    if (w.kind == 1) {
+                        w.length = Math.Min(SnAi.MaxLen(), w.length + 1);
+                        w.score = w.score + o.size * 2;
+                    }
+                }
+            }
+        }
+        // 撞上玩家身体：AI 阵亡，记玩家一杀。
+        if (g.me.alive && g.HitsBody(g.me, hx, hy, 2, rad)) {
+            g.KillFoe(w, now, w.kind == 2 ? 1 : 0, null);
+            return;
+        }
+        if (w.kind == 1) {
+            for (int i = 0; i < g.foes.Count; i = i + 1) {
+                Worm o = g.foes[i];
+                if (o == w || !o.alive) { continue; }
+                if (o.kind == 1) {
+                    // 大蛇互撞：撞上者阵亡，被撞者记功。
+                    if (g.HitsBody(o, hx, hy, 1, rad)) {
+                        g.KillFoe(w, now, 3, o);
+                        return;
+                    }
+                } else if (g.HitsBody(o, hx, hy, 0, rad)) {
+                    // 大蛇吞小蛇。
+                    g.KillFoe(o, now, 3, w);
+                }
+            }
+        }
+    }
+
+    // 玩家自动驾驶：避险 > 避墙 > 抢道具 > 吃豆。返回是否值得冲刺。
+    static bool AutoPilot(SnGame g, int now) {
+        Worm me = g.me;
+        int hx = me.headX / 256;
+        int hy = me.headY / 256;
+        if (now < me.tgtUntil && now < me.thinkAt) { return me.boostUntil > now; }
+        me.thinkAt = now + 120;
+        int rad = me.Radius();
+        int px = hx + me.dirX * 90 / 256;
+        int py = hy + me.dirY * 90 / 256;
+        for (int i = 0; i < g.foes.Count; i = i + 1) {
+            Worm o = g.foes[i];
+            if (o.kind == 1 && g.HitsBody(o, px, py, 0, rad)) {
+                int side = SnGame.WallDist(hx + me.dirY * 200 / 256, hy - me.dirX * 200 / 256)
+                    > SnGame.WallDist(hx - me.dirY * 200 / 256, hy + me.dirX * 200 / 256) ? 1 : -1;
+                SnAi.Aim(me, hx + me.dirY * 220 / 256 * side, hy - me.dirX * 220 / 256 * side, now + 260);
+                me.boostUntil = 0;
+                return false;
+            }
+        }
+        int ax = hx + me.dirX * 200 / 256;
+        int ay = hy + me.dirY * 200 / 256;
+        if (SnGame.WallDist(ax, ay) < 110) {
+            SnAi.Aim(me, SnGame.WW() / 2, SnGame.WH() / 2, now + 400);
+            me.boostUntil = 0;
+            return false;
+        }
+        int best = -1;
+        int bd = 2000000000;
+        for (int i = 0; i < g.orbs.Count; i = i + 1) {
+            Orb o = g.orbs[i];
+            int ddx = o.x - hx;
+            int ddy = o.y - hy;
+            if (o.kind == 2) {
+                if (ddx * ddx + ddy * ddy < 1100 * 1100) {
+                    SnAi.Aim(me, o.x, o.y, now + 300);
+                    me.boostUntil = now + 300;
+                    return true;
+                }
+                continue;
+            }
+            if (ddx > 700 || ddx < -700 || ddy > 700 || ddy < -700) { continue; }
+            int d = (ddx * ddx + ddy * ddy) / (o.size * o.size);
+            if (o.kind == 1) { d = d / 2; }
+            if (d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0) {
+            SnAi.Aim(me, g.orbs[best].x, g.orbs[best].y, now + 400);
+        } else {
+            SnAi.Aim(me, g.rng.Range(400, SnGame.WW() - 400), g.rng.Range(400, SnGame.WH() - 400), now + 1500);
+        }
+        me.boostUntil = 0;
+        return false;
+    }
+}

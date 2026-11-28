@@ -11,13 +11,15 @@ using Game.Foundation;
 // 不写工作目录。键：
 //   counters  runs（开局次数）· wins（登顶次数）
 //   bests     floor（到过的最高层）· fastest_turns（最快登顶的累计回合数，越小越好）
-//   flags     muted
+//             asc_cleared（通关过的最高进阶 +1；解锁下一级进阶）
+//   flags     muted · seen_<id>（图鉴：见过的敌人）
 public class RogueShell {
     GameProfile profile;
     AudioBus bus;
     SfxBank sfx;
     bool newBestFloor;
     bool newFastest;
+    bool unlockedAsc;
 
     public RogueShell() {
         this.profile = GameProfile.Open("roguelike");
@@ -32,6 +34,18 @@ public class RogueShell {
         this.sfx.AddSynth("block", new SynthOptions().WithWaveform(Waveform.Triangle)
             .WithSweep(300.0, 150.0).WithDuration(0.080)
             .WithEnvelope(0.002, 0.060, 0.2, 0.060).WithGain(0.34));
+        // 能力牌/升级：上扬的 PowerUp；回血：柔和正弦上滑；中毒/削弱：低沉的方波下滑；
+        // 重击（≥15）：更低更长的 Hit；购买：短促铜钱声。
+        this.sfx.AddSynth("power", SfxPresets.PowerUp().WithSweep(330.0, 990.0).WithDuration(0.22));
+        this.sfx.AddSynth("upgrade", SfxPresets.PowerUp().WithSweep(520.0, 1560.0).WithDuration(0.18));
+        this.sfx.AddSynth("heal", new SynthOptions().WithWaveform(Waveform.Sine)
+            .WithSweep(440.0, 880.0).WithDuration(0.20)
+            .WithEnvelope(0.010, 0.080, 0.4, 0.100).WithGain(0.30));
+        this.sfx.AddSynth("hex", new SynthOptions().WithWaveform(Waveform.Square)
+            .WithSweep(260.0, 120.0).WithDuration(0.16)
+            .WithEnvelope(0.004, 0.060, 0.3, 0.080).WithGain(0.18));
+        this.sfx.AddSynth("heavy", SfxPresets.Hit().WithSweep(220.0, 60.0).WithDuration(0.16));
+        this.sfx.AddSynth("buy", SfxPresets.Coin().WithSweep(980.0, 1480.0).WithDuration(0.06));
         this.sfx.Warm();
         this.newBestFloor = false;
         this.newFastest = false;
@@ -61,21 +75,41 @@ public class RogueShell {
     public long FastestTurns() { return this.profile.Best("fastest_turns"); }
     public bool NewBestFloor() { return this.newBestFloor; }
     public bool NewFastest() { return this.newFastest; }
+    public bool UnlockedAscension() { return this.unlockedAsc; }
+
+    // 进阶：登顶一次解锁下一级（最多 5 级）。返回当前可选的最高进阶。
+    public int MaxAscension() {
+        long n = this.profile.HasBest("asc_cleared") ? this.profile.Best("asc_cleared") : 0;
+        return n > 5 ? 5 : (int)n;
+    }
+
+    // 图鉴：见过多少种敌人（遇到即记）。
+    public void SeeEnemy(string id) {
+        if (!this.profile.Flag("seen_" + id, false)) {
+            this.profile.SetFlag("seen_" + id, true);
+            this.profile.Save();
+        }
+    }
+    public bool Seen(string id) { return this.profile.Flag("seen_" + id, false); }
 
     // 开一局：局数 +1 并落盘（中途退出也算玩过一局）。
     public void BeginRun() {
         this.newBestFloor = false;
         this.newFastest = false;
+        this.unlockedAsc = false;
         this.profile.Add("runs", 1);
         this.profile.Save();
     }
 
     // 一局结束（登顶或阵亡）时调用一次：刷新最高层 / 最快登顶。
-    public void EndRun(bool won, int floor, int turns) {
+    public void EndRun(bool won, int floor, int turns, int ascension) {
         this.newBestFloor = this.profile.SubmitBest("floor", floor);
         if (won) {
             this.profile.Add("wins", 1);
             this.newFastest = this.profile.SubmitLowest("fastest_turns", turns);
+            int before = this.MaxAscension();
+            this.profile.SubmitBest("asc_cleared", ascension + 1);
+            this.unlockedAsc = this.MaxAscension() > before;
         } else {
             this.newFastest = false;
         }

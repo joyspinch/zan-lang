@@ -1,0 +1,253 @@
+using System;
+using Gui;
+using Game.Foundation;
+
+namespace Match3;
+
+// Presentation-only effects: particles, line beams, shock rings, lightning
+// bolts, floating score text, the cascade combo word and screen shake.
+// Driven by the same fixed step as the rules (so replays stay identical) but
+// it owns its own random stream and is never folded into the state checksum.
+public class Match3Fx {
+    public const int MaxParts = 320;
+    public const int MaxBeams = 16;
+    public const int MaxRings = 16;
+    public const int MaxBolts = 64;
+    public const int MaxTexts = 16;
+
+    // particles: kind 0 spark, 1 shard, 2 star
+    public double[] px;
+    public double[] py;
+    public double[] pvx;
+    public double[] pvy;
+    public double[] plife;
+    public double[] pmax;
+    public int[] pcolor;
+    public int[] psize;
+    public int[] pkind;
+
+    // beams: horizontal (dir 0, pos = y) or vertical (dir 1, pos = x)
+    public int[] beamDir;
+    public int[] beamPos;
+    public int[] beamColor;
+    public double[] beamT;
+
+    // shock rings
+    public int[] ringX;
+    public int[] ringY;
+    public int[] ringR;
+    public int[] ringColor;
+    public double[] ringT;
+
+    // colour-bomb lightning
+    public int[] boltX0;
+    public int[] boltY0;
+    public int[] boltX1;
+    public int[] boltY1;
+    public int[] boltColor;
+    public double[] boltT;
+
+    // floating texts
+    public string[] textStr;
+    public double[] textX;
+    public double[] textY;
+    public int[] textColor;
+    public int[] textSize;
+    public double[] textT;
+
+    // combo word in the middle of the board
+    public string comboWord;
+    public int comboColor;
+    public double comboT;
+
+    // screen shake
+    public double trauma;
+    public double shakeX;
+    public double shakeY;
+    public double clock;
+
+    DeterministicRandom rng;
+
+    public Match3Fx() {
+        this.rng = new DeterministicRandom(7331);
+        this.px = new double[MaxParts];
+        this.py = new double[MaxParts];
+        this.pvx = new double[MaxParts];
+        this.pvy = new double[MaxParts];
+        this.plife = new double[MaxParts];
+        this.pmax = new double[MaxParts];
+        this.pcolor = new int[MaxParts];
+        this.psize = new int[MaxParts];
+        this.pkind = new int[MaxParts];
+        this.beamDir = new int[MaxBeams];
+        this.beamPos = new int[MaxBeams];
+        this.beamColor = new int[MaxBeams];
+        this.beamT = new double[MaxBeams];
+        this.ringX = new int[MaxRings];
+        this.ringY = new int[MaxRings];
+        this.ringR = new int[MaxRings];
+        this.ringColor = new int[MaxRings];
+        this.ringT = new double[MaxRings];
+        this.boltX0 = new int[MaxBolts];
+        this.boltY0 = new int[MaxBolts];
+        this.boltX1 = new int[MaxBolts];
+        this.boltY1 = new int[MaxBolts];
+        this.boltColor = new int[MaxBolts];
+        this.boltT = new double[MaxBolts];
+        this.textStr = new string[MaxTexts];
+        this.textX = new double[MaxTexts];
+        this.textY = new double[MaxTexts];
+        this.textColor = new int[MaxTexts];
+        this.textSize = new int[MaxTexts];
+        this.textT = new double[MaxTexts];
+        this.comboWord = "";
+        this.comboT = 0.0;
+        this.Clear();
+    }
+
+    public void Clear() {
+        for (int i = 0; i < MaxParts; i = i + 1) { this.plife[i] = 0.0; }
+        for (int i = 0; i < MaxBeams; i = i + 1) { this.beamT[i] = 0.0; }
+        for (int i = 0; i < MaxRings; i = i + 1) { this.ringT[i] = 0.0; }
+        for (int i = 0; i < MaxBolts; i = i + 1) { this.boltT[i] = 0.0; }
+        for (int i = 0; i < MaxTexts; i = i + 1) { this.textT[i] = 0.0; }
+        this.comboT = 0.0;
+        this.trauma = 0.0;
+        this.shakeX = 0.0;
+        this.shakeY = 0.0;
+    }
+
+    double Rand(double lo, double hi) { return lo + (hi - lo) * this.rng.NextDouble(); }
+
+    int FreeSlot(double[] life, int n) {
+        int best = 0;
+        double low = 1.0e9;
+        for (int i = 0; i < n; i = i + 1) {
+            if (life[i] <= 0.0) { return i; }
+            if (life[i] < low) { low = life[i]; best = i; }
+        }
+        return best;
+    }
+
+    public void Particle(double x, double y, double vx, double vy, double life, int color, int size, int kind) {
+        int i = this.FreeSlot(this.plife, MaxParts);
+        this.px[i] = x;
+        this.py[i] = y;
+        this.pvx[i] = vx;
+        this.pvy[i] = vy;
+        this.plife[i] = life;
+        this.pmax[i] = life;
+        this.pcolor[i] = color;
+        this.psize[i] = size;
+        this.pkind[i] = kind;
+    }
+
+    // A popped gem bursting: fast sparks, a few tumbling shards and one star.
+    public void Burst(double x, double y, int color, int count) {
+        for (int k = 0; k < count; k = k + 1) {
+            double a = this.Rand(0.0, 6.2831853);
+            double sp = this.Rand(90.0, 320.0);
+            int kind = k % 4 == 0 ? 1 : 0;
+            this.Particle(x, y, Math.Cos(a) * sp, Math.Sin(a) * sp - 60.0, this.Rand(0.35, 0.7),
+                color, kind == 1 ? (int)this.Rand(4.0, 7.0) : (int)this.Rand(2.0, 5.0), kind);
+        }
+        this.Particle(x, y, this.Rand(-30.0, 30.0), -120.0, 0.6, unchecked((int)0xFFFFFFFF), 7, 2);
+    }
+
+    // Gentle rising sparkles (selection, special creation, star celebration).
+    public void Sparkle(double x, double y, int color, int count, double spread) {
+        for (int k = 0; k < count; k = k + 1) {
+            this.Particle(x + this.Rand(-spread, spread), y + this.Rand(-spread, spread),
+                this.Rand(-40.0, 40.0), this.Rand(-140.0, -40.0), this.Rand(0.5, 1.0), color,
+                (int)this.Rand(3.0, 7.0), 2);
+        }
+    }
+
+    // Confetti rain for the results screen.
+    public void Confetti(double x, double y, int[] colors, int count) {
+        for (int k = 0; k < count; k = k + 1) {
+            double a = this.Rand(-2.6, -0.5);
+            double sp = this.Rand(200.0, 520.0);
+            this.Particle(x, y, Math.Cos(a) * sp, Math.Sin(a) * sp, this.Rand(1.2, 2.2),
+                colors[k % colors.Length], (int)this.Rand(5.0, 9.0), 1);
+        }
+    }
+
+    public void Beam(int dir, int pos, int color) {
+        int i = this.FreeSlot(this.beamT, MaxBeams);
+        this.beamDir[i] = dir;
+        this.beamPos[i] = pos;
+        this.beamColor[i] = color;
+        this.beamT[i] = 0.45;
+    }
+
+    public void Ring(int x, int y, int radius, int color) {
+        int i = this.FreeSlot(this.ringT, MaxRings);
+        this.ringX[i] = x;
+        this.ringY[i] = y;
+        this.ringR[i] = radius;
+        this.ringColor[i] = color;
+        this.ringT[i] = 0.5;
+    }
+
+    public void Bolt(int x0, int y0, int x1, int y1, int color) {
+        int i = this.FreeSlot(this.boltT, MaxBolts);
+        this.boltX0[i] = x0;
+        this.boltY0[i] = y0;
+        this.boltX1[i] = x1;
+        this.boltY1[i] = y1;
+        this.boltColor[i] = color;
+        this.boltT[i] = 0.4;
+    }
+
+    public void Text(double x, double y, string s, int color, int size) {
+        int i = this.FreeSlot(this.textT, MaxTexts);
+        this.textStr[i] = s;
+        this.textX[i] = x;
+        this.textY[i] = y;
+        this.textColor[i] = color;
+        this.textSize[i] = size;
+        this.textT[i] = 1.0;
+    }
+
+    public void Combo(string word, int color) {
+        this.comboWord = word;
+        this.comboColor = color;
+        this.comboT = 1.25;
+    }
+
+    public void Shake(double amount) {
+        this.trauma = this.trauma + amount;
+        if (this.trauma > 1.0) { this.trauma = 1.0; }
+    }
+
+    public void Update(double dt) {
+        this.clock = this.clock + dt;
+        for (int i = 0; i < MaxParts; i = i + 1) {
+            if (this.plife[i] <= 0.0) { continue; }
+            this.plife[i] = this.plife[i] - dt;
+            this.px[i] = this.px[i] + this.pvx[i] * dt;
+            this.py[i] = this.py[i] + this.pvy[i] * dt;
+            double grav = this.pkind[i] == 2 ? 60.0 : 520.0;
+            this.pvy[i] = this.pvy[i] + grav * dt;
+            this.pvx[i] = this.pvx[i] * (1.0 - 1.6 * dt);
+        }
+        for (int i = 0; i < MaxBeams; i = i + 1) { if (this.beamT[i] > 0.0) { this.beamT[i] = this.beamT[i] - dt; } }
+        for (int i = 0; i < MaxRings; i = i + 1) { if (this.ringT[i] > 0.0) { this.ringT[i] = this.ringT[i] - dt; } }
+        for (int i = 0; i < MaxBolts; i = i + 1) { if (this.boltT[i] > 0.0) { this.boltT[i] = this.boltT[i] - dt; } }
+        for (int i = 0; i < MaxTexts; i = i + 1) {
+            if (this.textT[i] > 0.0) {
+                this.textT[i] = this.textT[i] - dt;
+                this.textY[i] = this.textY[i] - 46.0 * dt;
+            }
+        }
+        if (this.comboT > 0.0) { this.comboT = this.comboT - dt; }
+        if (this.trauma > 0.0) {
+            this.trauma = this.trauma - 1.8 * dt;
+            if (this.trauma < 0.0) { this.trauma = 0.0; }
+        }
+        double s = this.trauma * this.trauma * 14.0;
+        this.shakeX = s * Math.Sin(this.clock * 71.0);
+        this.shakeY = s * Math.Cos(this.clock * 57.0);
+    }
+}

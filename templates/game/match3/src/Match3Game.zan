@@ -1,357 +1,1085 @@
 using System;
-using System.Collections.Generic;
 using Gui;
-using Game.Foundation.Gui;
 using Game.Match3;
-using Game.Kit;
 using Game.Foundation;
 
 namespace Match3;
 
+// Rules + timing for one level. Match3Board (packages/Zan.Game) stores the
+// grid and does the swaps; this class layers the template's own rules on top:
+// special gems, crates, jelly, goals and a phase machine that plays every
+// step out over time (swap -> pop -> fall -> cascade ...). The phase timers
+// run on the fixed step, so the headless Match3Sim and the window play the
+// exact same game; drawing lives in Match3Painter, sound/profile in the HUD.
+//
+// Cell value = colour | special << 4 | crateHp << 8.
+//   colour 0 empty, 1..6 gems, 7 crate, 8 colour bomb.
+//   special 1 row stripe, 2 column stripe, 3 area bomb (gems only).
 public class Match3Game {
     public const int Cols = 8;
     public const int Rows = 8;
-    public const int TileSize = 64;
-    public const int BoardStartX = 104;
-    public const int BoardStartY = 200;
+    public const int Cells = 64;
+    public const int TileSize = 72;
+    public const int BoardStartX = 72;
+    public const int BoardStartY = 198;
 
-    public Match3Board board;
-    public FloatingTextPool floatingTexts;
+    public const int Crate = 7;
+    public const int Bomb = 8;
+    public const int SpNone = 0;
+    public const int SpRow = 1;
+    public const int SpCol = 2;
+    public const int SpArea = 3;
 
-    public int score;
-    public int movesLeft;
-    public int targetScore;
-    public bool gameOver;
+    public const int PhIdle = 0;
+    public const int PhSwap = 1;
+    public const int PhSwapBack = 2;
+    public const int PhPop = 3;
+    public const int PhFall = 4;
+    public const int PhShuffle = 5;
+    public const int PhBonus = 6;
+    public const int PhOver = 7;
 
-    // 选中状态
-    public int selectedCol;
-    public int selectedRow;
-    public bool hasSelection;
+    public const double SwapTime = 0.16;
+    public const double SwapBackTime = 0.34;
+    public const double PopTime = 0.24;
+    public const double ShuffleTime = 0.75;
+    public const double BonusStep = 0.14;
+    public const double HintDelay = 5.0;
+    public const double Gravity = 3400.0;
+    public const int BonusPerMove = 150;
 
-    // 宝石配色 (AARRGGBB)
-    public int[] gemColors;
-
-    // 最近一次点击的结果（仅供界面层播音效/做反馈，不进校验和、不改规则）：
-    // 0 无、1 选中、2 有效交换、3 无效交换、4 取消选中
+    // Last click result (view feedback only; never part of the checksum).
     public const int ActNone = 0;
     public const int ActSelect = 1;
     public const int ActSwap = 2;
     public const int ActInvalid = 3;
     public const int ActDeselect = 4;
+
+    // Sound cues raised by the rules; the HUD drains sfxMask each frame.
+    public const int SfxPop = 1;
+    public const int SfxCreate = 2;
+    public const int SfxStripe = 4;
+    public const int SfxArea = 8;
+    public const int SfxBomb = 16;
+    public const int SfxLand = 32;
+    public const int SfxShuffle = 64;
+    public const int SfxBonus = 128;
+    public const int SfxCrate = 256;
+    public const int SfxJelly = 512;
+    public const int SfxSwap = 1024;
+    public const int SfxInvalid = 2048;
+    public const int SfxWin = 4096;
+    public const int SfxLose = 8192;
+    public const int SfxSelect = 16384;
+
+    public Match3Board board;
+    public DeterministicRandom rng;
+    DeterministicRandom visRng;
+    public Match3Fx fx;
+    public Match3Level level;
+    public int levelIndex;
+
+    public int score;
+    public int movesLeft;
+    public bool gameOver;
+    public bool won;
+    public int phase;
+    public double phaseT;
+    public double clock;
+    public int cascade;
+    public int bestCascade;
+    public int specialsMade;
+    public int revision;
+
+    // goals
+    public int[] jelly;
+    public int jellyLeft;
+    public int cratesLeft;
+    public int[] collected;
+
+    // selection / hint
+    public int selectedCol;
+    public int selectedRow;
+    public bool hasSelection;
+    public double idleT;
+    public bool hintOn;
+    public int hintA;
+    public int hintB;
+    public int hoverX;
+    public int hoverY;
+
+    // swap animation
+    public int swapA;
+    public int swapB;
+
+    // per-cell animation
+    public double[] drop;
+    public double[] vel;
+    public bool[] popping;
+    public int[] popVal;
+    public double[] flash;
+
+    // resolution scratch
+    bool[] mark;
+    bool[] fired;
+    public int[] createVal;
+    int[] hLen;
+    int[] vLen;
+    int[] groupOf;
+    int[] stack;
+    bool[] crateHit;
+
     public int lastAction;
     public int lastCleared;
     public int lastCombos;
+    public int sfxMask;
+    public int sfxCascade;
 
-    // 无效交换的红框闪烁（纯表现，秒）
-    public double invalidFlash;
-    public int invalidC1;
-    public int invalidR1;
-    public int invalidC2;
-    public int invalidR2;
+    public Match3Game() : this(20260101, 0) { }
 
-    // 开盘与补子的唯一随机源：同一种子同一局（回放 replays/ 依赖这一点）
-    public DeterministicRandom rng;
+    public Match3Game(long seed) : this(seed, 0) { }
 
-    public Match3Game() : this(20260101) { }
-
-    public Match3Game(long seed) {
+    public Match3Game(long seed, int levelIndex) {
         this.rng = new DeterministicRandom(seed);
+        this.visRng = new DeterministicRandom(seed ^ 99991);
         this.board = new Match3Board(Cols, Rows);
-        this.floatingTexts = new FloatingTextPool(32);
+        this.fx = new Match3Fx();
+        this.jelly = new int[Cells];
+        this.collected = new int[9];
+        this.drop = new double[Cells];
+        this.vel = new double[Cells];
+        this.popping = new bool[Cells];
+        this.popVal = new int[Cells];
+        this.flash = new double[Cells];
+        this.mark = new bool[Cells];
+        this.fired = new bool[Cells];
+        this.createVal = new int[Cells];
+        this.hLen = new int[Cells];
+        this.vLen = new int[Cells];
+        this.groupOf = new int[Cells];
+        this.stack = new int[Cells];
+        this.crateHit = new bool[Cells];
+        this.hoverX = -1;
+        this.hoverY = -1;
+        this.LoadLevel(levelIndex);
+    }
+
+    public static Match3Game Create(long seed) { return new Match3Game(seed, 0); }
+
+    // ---- cell helpers ----
+
+    public static int ColorOf(int v) { return v & 15; }
+    public static int SpecialOf(int v) { return (v >> 4) & 15; }
+    public static int HpOf(int v) { return (v >> 8) & 15; }
+    public static int Gem(int color, int special) { return color | (special << 4); }
+    public static int MakeCrate(int hp) { return Crate | (hp << 8); }
+    public static bool IsCrate(int v) { return (v & 15) == Crate; }
+    public static int MatchColor(int v) {
+        int c = v & 15;
+        return (c >= 1 && c <= 6) ? c : 0;
+    }
+    public static bool Swappable(int v) {
+        int c = v & 15;
+        return (c >= 1 && c <= 6) || c == Bomb;
+    }
+    public static int CellX(int c) { return BoardStartX + c * TileSize + TileSize / 2; }
+    public static int CellY(int r) { return BoardStartY + r * TileSize + TileSize / 2; }
+
+    int At(int c, int r) { return this.board.Get(c, r); }
+
+    // ---- level flow ----
+
+    public void LoadLevel(int index) {
+        if (index < 0) { index = 0; }
+        if (index >= Match3Levels.Count) { index = Match3Levels.Count - 1; }
+        this.levelIndex = index;
+        this.level = Match3Levels.Get(index);
         this.score = 0;
-        this.movesLeft = 25;
-        this.targetScore = 1500;
+        this.movesLeft = this.level.moves;
         this.gameOver = false;
-        this.selectedCol = -1;
-        this.selectedRow = -1;
+        this.won = false;
+        this.phase = PhIdle;
+        this.phaseT = 0.0;
+        this.cascade = 0;
+        this.bestCascade = 0;
+        this.specialsMade = 0;
         this.hasSelection = false;
+        this.idleT = 0.0;
+        this.hintOn = false;
         this.lastAction = ActNone;
         this.lastCleared = 0;
         this.lastCombos = 0;
-        this.invalidFlash = 0.0;
-
-        this.gemColors = new int[7];
-        this.gemColors[0] = unchecked((int)0x00000000); // 0 为空
-        this.gemColors[1] = unchecked((int)0xFFFF4D4F); // 红：火宝石
-        this.gemColors[2] = unchecked((int)0xFF40A9FF); // 蓝：冰宝石
-        this.gemColors[3] = unchecked((int)0xFF73D13D); // 绿：翡翠
-        this.gemColors[4] = unchecked((int)0xFFFFC53D); // 黄：金曜石
-        this.gemColors[5] = unchecked((int)0xFF9254DE); // 紫：紫水晶
-        this.gemColors[6] = unchecked((int)0xFFFF7A45); // 橙：太阳石
-
-        InitBoard();
+        for (int i = 0; i < 9; i = i + 1) { this.collected[i] = 0; }
+        this.jellyLeft = 0;
+        for (int r = 0; r < Rows; r = r + 1) {
+            for (int c = 0; c < Cols; c = c + 1) {
+                char ch = this.level.LayoutAt(c, r);
+                int j = 0;
+                if (ch == 'j' || ch == 'x' || ch == 'X') { j = 1; }
+                if (ch == 'J') { j = 2; }
+                this.jelly[r * Cols + c] = j;
+                if (j > 0) { this.jellyLeft = this.jellyLeft + 1; }
+            }
+        }
+        for (int i = 0; i < Cells; i = i + 1) {
+            this.drop[i] = 0.0;
+            this.vel[i] = 0.0;
+            this.popping[i] = false;
+            this.flash[i] = 0.0;
+            this.createVal[i] = 0;
+        }
+        this.fx.Clear();
+        this.Deal();
+        this.cratesLeft = 0;
+        for (int i = 0; i < Cells; i = i + 1) {
+            if (IsCrate(this.board.grid[i])) { this.cratesLeft = this.cratesLeft + 1; }
+        }
+        // Drop the opening board in from above, column by column.
+        for (int r = 0; r < Rows; r = r + 1) {
+            for (int c = 0; c < Cols; c = c + 1) {
+                this.drop[r * Cols + c] = (double)(TileSize * (Rows + 1) + c * 26 + (Rows - r) * 6);
+            }
+        }
+        this.phase = PhFall;
+        this.revision = this.revision + 1;
     }
 
-    public static Match3Game Create() {
-        return new Match3Game();
-    }
+    // Replay the current level (the click-after-game-over path the sim uses).
+    public void InitBoard() { this.LoadLevel(this.levelIndex); }
 
-    // 界面开局用时钟当种子（每次一盘新局）；回放走 Match3Game(seed) 固定种子
-    public static Match3Game Create(long seed) {
-        return new Match3Game(seed);
-    }
-
-    // 随机发一盘：逐格取色，避开会和左边两格或上边两格连成三连的颜色（开局没有
-    // 现成的消除）；发出来的盘面一步可走都没有就重发——开局必须有棋可下。
+    // Random board from the layout: crates where the layout says, gems
+    // elsewhere with no ready-made line, and at least one legal move.
     public void Deal() {
+        int colors = this.level.colors;
         for (int attempt = 0; attempt < 100; attempt = attempt + 1) {
             for (int r = 0; r < Rows; r = r + 1) {
                 for (int c = 0; c < Cols; c = c + 1) {
-                    int val = 1 + rng.NextBelow(6);
-                    for (int guard = 0; guard < 6; guard = guard + 1) {
-                        bool row3 = c >= 2 && board.Get(c - 1, r) == val && board.Get(c - 2, r) == val;
-                        bool col3 = r >= 2 && board.Get(c, r - 1) == val && board.Get(c, r - 2) == val;
+                    char ch = this.level.LayoutAt(c, r);
+                    if (ch == 'c' || ch == 'x') { this.board.Set(c, r, MakeCrate(1)); continue; }
+                    if (ch == 'C' || ch == 'X') { this.board.Set(c, r, MakeCrate(2)); continue; }
+                    int val = 1 + this.rng.NextBelow(colors);
+                    for (int guard = 0; guard < colors; guard = guard + 1) {
+                        bool row3 = c >= 2 && MatchColor(At(c - 1, r)) == val && MatchColor(At(c - 2, r)) == val;
+                        bool col3 = r >= 2 && MatchColor(At(c, r - 1)) == val && MatchColor(At(c, r - 2)) == val;
                         if (!row3 && !col3) { break; }
-                        val = val % 6 + 1;
+                        val = val % colors + 1;
                     }
-                    board.Set(c, r, val);
+                    this.board.Set(c, r, val);
                 }
             }
-            if (HasAnyMove()) { return; }
+            if (this.HasAnyMove()) { return; }
         }
     }
 
-    // 盘面上是否还有一步能消除的交换
-    public bool HasAnyMove() {
-        for (int r = 0; r < Rows; r = r + 1) {
-            for (int c = 0; c < Cols; c = c + 1) {
-                if (c + 1 < Cols && board.CanSwap(c, r, c + 1, r)) { return true; }
-                if (r + 1 < Rows && board.CanSwap(c, r, c, r + 1)) { return true; }
+    public bool GoalMet() {
+        int g = this.level.goal;
+        if (g == Match3Levels.GoalScore) { return this.score >= this.level.target; }
+        if (g == Match3Levels.GoalJelly) { return this.jellyLeft <= 0; }
+        if (g == Match3Levels.GoalCrates) { return this.cratesLeft <= 0; }
+        for (int i = 0; i < this.level.collectColor.Length; i = i + 1) {
+            if (this.collected[this.level.collectColor[i]] < this.level.collectCount[i]) { return false; }
+        }
+        return true;
+    }
+
+    // 0..1 goal progress (HUD meter and the bot's level report).
+    public int GoalRemaining(int slot) {
+        int g = this.level.goal;
+        if (g == Match3Levels.GoalScore) {
+            int left = this.level.target - this.score;
+            return left > 0 ? left : 0;
+        }
+        if (g == Match3Levels.GoalJelly) { return this.jellyLeft; }
+        if (g == Match3Levels.GoalCrates) { return this.cratesLeft; }
+        if (slot < 0 || slot >= this.level.collectColor.Length) { return 0; }
+        int need = this.level.collectCount[slot] - this.collected[this.level.collectColor[slot]];
+        return need > 0 ? need : 0;
+    }
+
+    public int Stars() {
+        if (!this.won) { return 0; }
+        if (this.score >= this.level.star3) { return 3; }
+        if (this.score >= this.level.star2) { return 2; }
+        return 1;
+    }
+
+    // ---- move legality ----
+
+    bool MatchAt(int c, int r) {
+        int col = MatchColor(At(c, r));
+        if (col == 0) { return false; }
+        int n = 1;
+        for (int x = c - 1; x >= 0 && MatchColor(At(x, r)) == col; x = x - 1) { n = n + 1; }
+        for (int x = c + 1; x < Cols && MatchColor(At(x, r)) == col; x = x + 1) { n = n + 1; }
+        if (n >= 3) { return true; }
+        n = 1;
+        for (int y = r - 1; y >= 0 && MatchColor(At(c, y)) == col; y = y - 1) { n = n + 1; }
+        for (int y = r + 1; y < Rows && MatchColor(At(c, y)) == col; y = y + 1) { n = n + 1; }
+        return n >= 3;
+    }
+
+    public bool ValidSwap(int c1, int r1, int c2, int r2) {
+        if (!Match3Board.IsAdjacent(c1, r1, c2, r2)) { return false; }
+        int v1 = At(c1, r1);
+        int v2 = At(c2, r2);
+        if (!Swappable(v1) || !Swappable(v2)) { return false; }
+        if (ColorOf(v1) == Bomb || ColorOf(v2) == Bomb) { return true; }
+        if (SpecialOf(v1) > 0 && SpecialOf(v2) > 0) { return true; }
+        if (ColorOf(v1) == ColorOf(v2)) { return false; }
+        this.board.Swap(c1, r1, c2, r2);
+        bool ok = this.MatchAt(c1, r1) || this.MatchAt(c2, r2);
+        this.board.Swap(c1, r1, c2, r2);
+        return ok;
+    }
+
+    public bool HasAnyMove() { return this.FindMove(0) >= 0; }
+
+    // Rough worth of a legal swap for the hint (and the balance bot): cleared
+    // cells, specials it builds or sets off, and how much it helps the goal.
+    public int MoveValue(int c1, int r1, int c2, int r2) {
+        int v1 = At(c1, r1);
+        int v2 = At(c2, r2);
+        if (ColorOf(v1) == Bomb || ColorOf(v2) == Bomb) {
+            return (ColorOf(v1) == Bomb && ColorOf(v2) == Bomb) ? 400 : 160 + (SpecialOf(v1) + SpecialOf(v2)) * 40;
+        }
+        if (SpecialOf(v1) > 0 && SpecialOf(v2) > 0) { return 220; }
+        this.board.Swap(c1, r1, c2, r2);
+        this.ClearScratch();
+        this.FindMatches(r2 * Cols + c2, r1 * Cols + c1);
+        int value = 0;
+        for (int i = 0; i < Cells; i = i + 1) {
+            if (!this.mark[i]) { continue; }
+            int v = this.board.grid[i];
+            value = value + 10 + (SpecialOf(v) > 0 ? 50 : 0) + this.jelly[i] * 14;
+            int col = MatchColor(v);
+            for (int k = 0; k < this.level.collectColor.Length; k = k + 1) {
+                if (this.level.collectColor[k] == col && this.GoalRemaining(k) > 0) { value = value + 8; }
+            }
+            int c = i % Cols;
+            int r = i / Cols;
+            if (c > 0 && IsCrate(this.board.grid[i - 1])) { value = value + 16; }
+            if (c < Cols - 1 && IsCrate(this.board.grid[i + 1])) { value = value + 16; }
+            if (r > 0 && IsCrate(this.board.grid[i - Cols])) { value = value + 16; }
+            if (r < Rows - 1 && IsCrate(this.board.grid[i + Cols])) { value = value + 16; }
+            value = value + r;
+            int cv = this.createVal[i];
+            if (cv != 0) { value = value + (ColorOf(cv) == Bomb ? 120 : (SpecialOf(cv) == SpArea ? 70 : 45)); }
+        }
+        this.ClearScratch();
+        this.board.Swap(c1, r1, c2, r2);
+        return value;
+    }
+
+    // Best legal swap as cell*2 + (0 right, 1 down), or -1.
+    public int BestMove() {
+        int best = -1;
+        int bestV = -1;
+        for (int i = 0; i < Cells; i = i + 1) {
+            int c = i % Cols;
+            int r = i / Cols;
+            for (int d = 0; d < 2; d = d + 1) {
+                int c2 = d == 0 ? c + 1 : c;
+                int r2 = d == 0 ? r : r + 1;
+                if (c2 >= Cols || r2 >= Rows || !this.ValidSwap(c, r, c2, r2)) { continue; }
+                int v = this.MoveValue(c, r, c2, r2);
+                if (v > bestV) { bestV = v; best = i * 2 + d; }
             }
         }
-        return false;
+        return best;
     }
 
-    public void InitBoard() {
-        Deal();
-        score = 0;
-        movesLeft = 25;
-        gameOver = false;
-        hasSelection = false;
-        invalidFlash = 0.0;
+    // First legal swap scanning from `start`; returns cell*2 + (0 right, 1 down).
+    public int FindMove(int start) {
+        for (int k = 0; k < Cells; k = k + 1) {
+            int i = (start + k) % Cells;
+            int c = i % Cols;
+            int r = i / Cols;
+            if (c + 1 < Cols && this.ValidSwap(c, r, c + 1, r)) { return i * 2; }
+            if (r + 1 < Rows && this.ValidSwap(c, r, c, r + 1)) { return i * 2 + 1; }
+        }
+        return -1;
     }
 
-    // 玩家点击坐标处理
+    // ---- input ----
+
     public void OnClick(int px, int py) {
-        lastAction = ActNone;
-        lastCleared = 0;
-        lastCombos = 0;
-        if (gameOver) {
-            // 点击任意处重新开局
-            InitBoard();
+        this.lastAction = ActNone;
+        this.lastCleared = 0;
+        this.lastCombos = 0;
+        if (this.gameOver) {
+            this.InitBoard();
             return;
         }
-
+        if (this.phase != PhIdle) { return; }
         int relX = px - BoardStartX;
         int relY = py - BoardStartY;
-        if (relX < 0 || relY < 0) { return; }
-
-        int col = relX / TileSize;
-        int row = relY / TileSize;
+        int col = relX >= 0 ? relX / TileSize : -1;
+        int row = relY >= 0 ? relY / TileSize : -1;
         if (col < 0 || col >= Cols || row < 0 || row >= Rows) {
-            if (hasSelection) { lastAction = ActDeselect; }
-            hasSelection = false;
+            if (this.hasSelection) { this.lastAction = ActDeselect; }
+            this.hasSelection = false;
             return;
         }
+        this.idleT = 0.0;
+        if (this.hintOn) { this.revision = this.revision + 1; }
+        this.hintOn = false;
+        if (!this.hasSelection) {
+            if (Swappable(At(col, row))) {
+                this.selectedCol = col;
+                this.selectedRow = row;
+                this.hasSelection = true;
+                this.lastAction = ActSelect;
+                this.sfxMask = this.sfxMask | SfxSelect;
+            }
+            return;
+        }
+        if (col == this.selectedCol && row == this.selectedRow) {
+            this.hasSelection = false;
+            this.lastAction = ActDeselect;
+            return;
+        }
+        if (Match3Board.IsAdjacent(col, row, this.selectedCol, this.selectedRow)) {
+            this.hasSelection = false;
+            this.BeginSwap(this.selectedCol, this.selectedRow, col, row);
+            return;
+        }
+        if (Swappable(At(col, row))) {
+            this.selectedCol = col;
+            this.selectedRow = row;
+            this.lastAction = ActSelect;
+            this.sfxMask = this.sfxMask | SfxSelect;
+        }
+    }
 
-        if (!hasSelection) {
-            selectedCol = col;
-            selectedRow = row;
-            hasSelection = true;
-            lastAction = ActSelect;
+    void BeginSwap(int c1, int r1, int c2, int r2) {
+        if (this.movesLeft <= 0) { return; }
+        this.swapA = r1 * Cols + c1;
+        this.swapB = r2 * Cols + c2;
+        this.phaseT = 0.0;
+        if (this.ValidSwap(c1, r1, c2, r2)) {
+            this.board.Swap(c1, r1, c2, r2);
+            this.movesLeft = this.movesLeft - 1;
+            this.phase = PhSwap;
+            this.lastAction = ActSwap;
+            this.sfxMask = this.sfxMask | SfxSwap;
+            this.revision = this.revision + 1;
         } else {
-            // 判断是否相邻
-            int dc = (int)Math.Abs((double)(col - selectedCol));
-            int dr = (int)Math.Abs((double)(row - selectedRow));
-            if ((dc == 1 && dr == 0) || (dc == 0 && dr == 1)) {
-                // 尝试交换
-                TrySwap(selectedCol, selectedRow, col, row);
-                hasSelection = false;
-            } else {
-                // 点击了不相邻格子，切换选中
-                selectedCol = col;
-                selectedRow = row;
-                hasSelection = true;
-                lastAction = ActSelect;
+            this.phase = PhSwapBack;
+            this.lastAction = ActInvalid;
+            this.sfxMask = this.sfxMask | SfxInvalid;
+        }
+    }
+
+    // ---- resolution ----
+
+    public void ClearMarks() { this.ClearScratch(); }
+
+    void ClearScratch() {
+        for (int i = 0; i < Cells; i = i + 1) {
+            this.mark[i] = false;
+            this.fired[i] = false;
+            this.createVal[i] = 0;
+        }
+    }
+
+    // The swap just finished sliding: special combos fire, otherwise the
+    // ordinary line matches (with the moved gems choosing where specials spawn).
+    void ResolveSwap() {
+        this.ClearScratch();
+        this.cascade = 1;
+        int a = this.swapA;
+        int b = this.swapB;
+        int va = this.board.grid[a];
+        int vb = this.board.grid[b];
+        if (ColorOf(va) == Bomb || ColorOf(vb) == Bomb) {
+            this.BombSwap(a, b);
+        } else if (SpecialOf(va) > 0 && SpecialOf(vb) > 0) {
+            this.ComboSwap(a, b);
+        } else {
+            this.FindMatches(b, a);
+        }
+        this.BeginPop();
+    }
+
+    void BombSwap(int a, int b) {
+        int va = this.board.grid[a];
+        int vb = this.board.grid[b];
+        int bombCell = ColorOf(vb) == Bomb ? b : a;
+        int other = bombCell == a ? b : a;
+        int vo = this.board.grid[other];
+        int bx = CellX(bombCell % Cols);
+        int by = CellY(bombCell / Cols);
+        this.fx.Shake(0.7);
+        this.fx.Ring(bx, by, 260, unchecked((int)0xFFFFFFFF));
+        this.sfxMask = this.sfxMask | SfxBomb;
+        this.mark[a] = true;
+        this.mark[b] = true;
+        this.fired[a] = true;
+        this.fired[b] = true;
+        if (ColorOf(vo) == Bomb) {
+            // Two colour bombs: the whole board goes.
+            for (int i = 0; i < Cells; i = i + 1) { this.mark[i] = true; }
+            this.fx.Combo("BOARD WIPE!", unchecked((int)0xFFFFE58F));
+            return;
+        }
+        int target = ColorOf(vo);
+        int sp = SpecialOf(vo);
+        for (int i = 0; i < Cells; i = i + 1) {
+            int v = this.board.grid[i];
+            if (MatchColor(v) != target) { continue; }
+            if (sp > 0 && i != other) {
+                int conv = sp == SpArea ? SpArea : ((i % Cols + i / Cols) % 2 == 0 ? SpRow : SpCol);
+                this.board.grid[i] = Gem(target, conv);
+                this.flash[i] = 0.3;
+            }
+            this.mark[i] = true;
+            this.fx.Bolt(bx, by, CellX(i % Cols), CellY(i / Cols), Match3Painter.GemColor(target));
+        }
+        if (sp > 0) { this.fired[other] = false; }
+    }
+
+    void ComboSwap(int a, int b) {
+        int sa = SpecialOf(this.board.grid[a]);
+        int sb = SpecialOf(this.board.grid[b]);
+        int c = b % Cols;
+        int r = b / Cols;
+        this.mark[a] = true;
+        this.mark[b] = true;
+        this.fired[a] = true;
+        this.fired[b] = true;
+        int areas = (sa == SpArea ? 1 : 0) + (sb == SpArea ? 1 : 0);
+        this.fx.Shake(0.5);
+        if (areas == 2) {
+            this.MarkBox(c, r, 2);
+            this.fx.Ring(CellX(c), CellY(r), 220, unchecked((int)0xFFFFD666));
+            this.fx.Combo("MEGA BLAST!", unchecked((int)0xFFFFC53D));
+            this.sfxMask = this.sfxMask | SfxArea;
+        } else if (areas == 1) {
+            for (int d = -1; d <= 1; d = d + 1) {
+                this.MarkRow(r + d);
+                this.MarkCol(c + d);
+            }
+            this.fx.Combo("CROSS FIRE!", unchecked((int)0xFF69C0FF));
+            this.sfxMask = this.sfxMask | SfxStripe | SfxArea;
+        } else {
+            this.MarkRow(r);
+            this.MarkCol(c);
+            this.fx.Combo("CROSS!", unchecked((int)0xFF69C0FF));
+            this.sfxMask = this.sfxMask | SfxStripe;
+        }
+    }
+
+    void MarkRow(int r) {
+        if (r < 0 || r >= Rows) { return; }
+        for (int c = 0; c < Cols; c = c + 1) { this.mark[r * Cols + c] = true; }
+        this.fx.Beam(0, CellY(r), unchecked((int)0xFFFFFFFF));
+    }
+
+    void MarkCol(int c) {
+        if (c < 0 || c >= Cols) { return; }
+        for (int r = 0; r < Rows; r = r + 1) { this.mark[r * Cols + c] = true; }
+        this.fx.Beam(1, CellX(c), unchecked((int)0xFFFFFFFF));
+    }
+
+    void MarkBox(int c0, int r0, int radius) {
+        for (int r = r0 - radius; r <= r0 + radius; r = r + 1) {
+            for (int c = c0 - radius; c <= c0 + radius; c = c + 1) {
+                if (c >= 0 && c < Cols && r >= 0 && r < Rows) { this.mark[r * Cols + c] = true; }
             }
         }
     }
 
-    private void TrySwap(int c1, int r1, int c2, int r2) {
-        if (movesLeft <= 0) { return; }
-
-        bool valid = board.CanSwap(c1, r1, c2, r2);
-        if (valid) {
-            board.Swap(c1, r1, c2, r2);
-            movesLeft = movesLeft - 1;
-
-            // 产生连续掉落结算
-            int[] incoming = new int[Cols * Rows];
-            for (int i = 0; i < incoming.Length; i = i + 1) {
-                incoming[i] = 1 + rng.NextBelow(6);
+    // Scan rows/columns for 3+ lines, group touching lines of one colour and
+    // decide what each group leaves behind: 5 in a line -> colour bomb,
+    // an L/T/+ crossing -> area bomb, 4 in a line -> striped gem.
+    public int FindMatches(int pref1, int pref2) {
+        for (int i = 0; i < Cells; i = i + 1) {
+            this.hLen[i] = 0;
+            this.vLen[i] = 0;
+            this.groupOf[i] = -1;
+        }
+        for (int r = 0; r < Rows; r = r + 1) {
+            int c = 0;
+            while (c < Cols) {
+                int col = MatchColor(At(c, r));
+                int e = c + 1;
+                while (col != 0 && e < Cols && MatchColor(At(e, r)) == col) { e = e + 1; }
+                if (col != 0 && e - c >= 3) {
+                    for (int k = c; k < e; k = k + 1) { this.hLen[r * Cols + k] = e - c; }
+                }
+                c = e;
             }
-            int inIdx = 0;
-            int totalCleared = 0;
-            int combos = 0;
-            board.ResolveCascades(incoming, ref inIdx, out totalCleared, out combos);
-
-            lastAction = ActSwap;
-            lastCleared = totalCleared;
-            lastCombos = combos;
-            int earnedScore = totalCleared * 10 * (combos > 0 ? combos : 1);
-            score = score + earnedScore;
-
-            double spawnX = (double)(BoardStartX + c2 * TileSize + TileSize / 2);
-            double spawnY = (double)(BoardStartY + r2 * TileSize);
-            floatingTexts.SpawnDamage(spawnX, spawnY, earnedScore, combos > 1);
-
-            if (score >= targetScore || movesLeft <= 0) {
-                gameOver = true;
-            } else if (!HasAnyMove()) {
-                // 死局：洗牌重发，分数与剩余步数保留
-                Deal();
+        }
+        for (int c = 0; c < Cols; c = c + 1) {
+            int r = 0;
+            while (r < Rows) {
+                int col = MatchColor(At(c, r));
+                int e = r + 1;
+                while (col != 0 && e < Rows && MatchColor(At(c, e)) == col) { e = e + 1; }
+                if (col != 0 && e - r >= 3) {
+                    for (int k = r; k < e; k = k + 1) { this.vLen[k * Cols + c] = e - r; }
+                }
+                r = e;
             }
-        } else {
-            // 换了也连不成三个：规则上不消耗步数，只给反馈
-            lastAction = ActInvalid;
-            invalidFlash = 0.35;
-            invalidC1 = c1;
-            invalidR1 = r1;
-            invalidC2 = c2;
-            invalidR2 = r2;
+        }
+        int groups = 0;
+        for (int seed = 0; seed < Cells; seed = seed + 1) {
+            if (this.groupOf[seed] >= 0) { continue; }
+            if (this.hLen[seed] < 3 && this.vLen[seed] < 3) { continue; }
+            int color = MatchColor(this.board.grid[seed]);
+            int top = 0;
+            this.stack[top] = seed;
+            top = top + 1;
+            this.groupOf[seed] = groups;
+            int maxH = 0;
+            int maxV = 0;
+            int cross = -1;
+            int pref = -1;
+            int hCell = -1;
+            int vCell = -1;
+            while (top > 0) {
+                top = top - 1;
+                int i = this.stack[top];
+                this.mark[i] = true;
+                if (this.hLen[i] > maxH) { maxH = this.hLen[i]; hCell = i; }
+                if (this.vLen[i] > maxV) { maxV = this.vLen[i]; vCell = i; }
+                if (this.hLen[i] >= 3 && this.vLen[i] >= 3 && cross < 0) { cross = i; }
+                if (i == pref1 || (i == pref2 && pref < 0)) { pref = i; }
+                int c = i % Cols;
+                int r = i / Cols;
+                for (int d = 0; d < 4; d = d + 1) {
+                    int nc = c + (d == 0 ? 1 : (d == 1 ? -1 : 0));
+                    int nr = r + (d == 2 ? 1 : (d == 3 ? -1 : 0));
+                    if (nc < 0 || nc >= Cols || nr < 0 || nr >= Rows) { continue; }
+                    int n = nr * Cols + nc;
+                    if (this.groupOf[n] >= 0) { continue; }
+                    if (this.hLen[n] < 3 && this.vLen[n] < 3) { continue; }
+                    if (MatchColor(this.board.grid[n]) != color) { continue; }
+                    this.groupOf[n] = groups;
+                    this.stack[top] = n;
+                    top = top + 1;
+                }
+            }
+            groups = groups + 1;
+            int made = 0;
+            int at = -1;
+            if (maxH >= 5 || maxV >= 5) {
+                made = Bomb;
+                at = maxH >= 5 ? hCell : vCell;
+            } else if (cross >= 0) {
+                made = Gem(color, SpArea);
+                at = cross;
+            } else if (maxH == 4) {
+                made = Gem(color, SpCol);
+                at = hCell;
+            } else if (maxV == 4) {
+                made = Gem(color, SpRow);
+                at = vCell;
+            }
+            if (made != 0) {
+                if (pref >= 0) { at = pref; }
+                this.createVal[at] = made;
+            }
+        }
+        return groups;
+    }
+
+    int MostCommonColor() {
+        int best = 1;
+        int bestN = -1;
+        for (int col = 1; col <= 6; col = col + 1) {
+            int n = 0;
+            for (int i = 0; i < Cells; i = i + 1) {
+                if (!this.mark[i] && MatchColor(this.board.grid[i]) == col) { n = n + 1; }
+            }
+            if (n > bestN) { bestN = n; best = col; }
+        }
+        return best;
+    }
+
+    // Marked specials go off (and can set off more), crates next to the blast
+    // crack, then every marked cell starts its pop.
+    void BeginPop() {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int i = 0; i < Cells; i = i + 1) {
+                if (!this.mark[i] || this.fired[i]) { continue; }
+                int v = this.board.grid[i];
+                int col = ColorOf(v);
+                int sp = SpecialOf(v);
+                int c = i % Cols;
+                int r = i / Cols;
+                if (col == Bomb) {
+                    this.fired[i] = true;
+                    changed = true;
+                    int target = this.MostCommonColor();
+                    for (int k = 0; k < Cells; k = k + 1) {
+                        if (MatchColor(this.board.grid[k]) == target) {
+                            this.mark[k] = true;
+                            this.fx.Bolt(CellX(c), CellY(r), CellX(k % Cols), CellY(k / Cols),
+                                Match3Painter.GemColor(target));
+                        }
+                    }
+                    this.fx.Shake(0.6);
+                    this.sfxMask = this.sfxMask | SfxBomb;
+                } else if (col >= 1 && col <= 6 && sp > 0) {
+                    this.fired[i] = true;
+                    changed = true;
+                    if (sp == SpRow) {
+                        this.MarkRow(r);
+                        this.sfxMask = this.sfxMask | SfxStripe;
+                        this.fx.Shake(0.25);
+                    } else if (sp == SpCol) {
+                        this.MarkCol(c);
+                        this.sfxMask = this.sfxMask | SfxStripe;
+                        this.fx.Shake(0.25);
+                    } else {
+                        this.MarkBox(c, r, 1);
+                        this.fx.Ring(CellX(c), CellY(r), 130, Match3Painter.GemColor(col));
+                        this.sfxMask = this.sfxMask | SfxArea;
+                        this.fx.Shake(0.45);
+                    }
+                }
+            }
+        }
+        // Crates: hit when blasted or when a cleared gem sits right next to them.
+        for (int i = 0; i < Cells; i = i + 1) {
+            this.crateHit[i] = false;
+            if (!IsCrate(this.board.grid[i])) { continue; }
+            bool hit = this.mark[i];
+            int c = i % Cols;
+            int r = i / Cols;
+            if (!hit && c > 0 && this.mark[i - 1] && !IsCrate(this.board.grid[i - 1])) { hit = true; }
+            if (!hit && c < Cols - 1 && this.mark[i + 1] && !IsCrate(this.board.grid[i + 1])) { hit = true; }
+            if (!hit && r > 0 && this.mark[i - Cols] && !IsCrate(this.board.grid[i - Cols])) { hit = true; }
+            if (!hit && r < Rows - 1 && this.mark[i + Cols] && !IsCrate(this.board.grid[i + Cols])) { hit = true; }
+            this.crateHit[i] = hit;
+        }
+        int gems = 0;
+        int crates = 0;
+        int specials = 0;
+        int sx = 0;
+        int sy = 0;
+        int n = 0;
+        for (int i = 0; i < Cells; i = i + 1) {
+            int v = this.board.grid[i];
+            int x = CellX(i % Cols);
+            int y = CellY(i / Cols);
+            if (IsCrate(v)) {
+                this.mark[i] = false;
+                if (!this.crateHit[i]) { continue; }
+                int hp = HpOf(v) - 1;
+                this.sfxMask = this.sfxMask | SfxCrate;
+                if (hp > 0) {
+                    this.board.grid[i] = MakeCrate(hp);
+                    this.flash[i] = 0.35;
+                    this.fx.Burst((double)x, (double)y, unchecked((int)0xFFB0B8C8), 6);
+                    continue;
+                }
+                this.mark[i] = true;
+                crates = crates + 1;
+                this.cratesLeft = this.cratesLeft - 1;
+                this.fx.Burst((double)x, (double)y, unchecked((int)0xFFC08A4E), 14);
+            }
+            if (!this.mark[i]) { continue; }
+            if (v == 0) { this.mark[i] = false; continue; }
+            this.popping[i] = true;
+            this.popVal[i] = v;
+            int col = ColorOf(v);
+            if (col >= 1 && col <= 6) {
+                gems = gems + 1;
+                this.collected[col] = this.collected[col] + 1;
+                this.fx.Burst((double)x, (double)y, Match3Painter.GemColor(col), 9);
+                if (SpecialOf(v) > 0) { specials = specials + 1; }
+            } else if (col == Bomb) {
+                specials = specials + 1;
+                this.fx.Burst((double)x, (double)y, unchecked((int)0xFFFFFFFF), 16);
+            }
+            if (this.jelly[i] > 0) {
+                this.jelly[i] = this.jelly[i] - 1;
+                if (this.jelly[i] == 0) { this.jellyLeft = this.jellyLeft - 1; }
+                this.sfxMask = this.sfxMask | SfxJelly;
+                this.fx.Burst((double)x, (double)y, unchecked((int)0xFFFF85C0), 5);
+            }
+            sx = sx + x;
+            sy = sy + y;
+            n = n + 1;
+        }
+        int made = 0;
+        for (int i = 0; i < Cells; i = i + 1) {
+            int cv = this.createVal[i];
+            if (cv == 0) { continue; }
+            made = made + 1;
+            this.specialsMade = this.specialsMade + 1;
+            made = made + (ColorOf(cv) == Bomb ? 2 : (SpecialOf(cv) == SpArea ? 1 : 0));
+            this.fx.Sparkle((double)CellX(i % Cols), (double)CellY(i / Cols), unchecked((int)0xFFFFFFFF), 10, 20.0);
+            this.sfxMask = this.sfxMask | SfxCreate;
+        }
+        int earned = gems * 10 * this.cascade + crates * 50 + specials * 60 + made * 60;
+        this.score = this.score + earned;
+        this.lastCleared = this.lastCleared + gems;
+        if (this.cascade > this.bestCascade) { this.bestCascade = this.cascade; }
+        this.sfxCascade = this.cascade;
+        this.sfxMask = this.sfxMask | SfxPop;
+        if (n > 0 && earned > 0) {
+            int tc = this.cascade >= 3 ? unchecked((int)0xFFFFD666) : unchecked((int)0xFFFFFFFF);
+            this.fx.Text((double)(sx / n), (double)(sy / n), "+" + Convert.ToString(earned), tc,
+                earned >= 300 ? 30 : 24);
+        }
+        if (this.cascade >= 2) { this.fx.Combo(Match3Game.ComboWord(this.cascade), Match3Game.ComboTint(this.cascade)); }
+        this.phase = PhPop;
+        this.phaseT = 0.0;
+        this.revision = this.revision + 1;
+    }
+
+    public static string ComboWord(int cascade) {
+        if (cascade <= 2) { return "SWEET!"; }
+        if (cascade == 3) { return "GREAT!"; }
+        if (cascade == 4) { return "AMAZING!"; }
+        if (cascade == 5) { return "INCREDIBLE!"; }
+        return "DIVINE!";
+    }
+
+    static int ComboTint(int cascade) {
+        if (cascade <= 2) { return unchecked((int)0xFF95DE64); }
+        if (cascade == 3) { return unchecked((int)0xFF69C0FF); }
+        if (cascade == 4) { return unchecked((int)0xFFFF85C0); }
+        return unchecked((int)0xFFFFD666);
+    }
+
+    void FinishPop() {
+        for (int i = 0; i < Cells; i = i + 1) {
+            if (!this.popping[i]) { continue; }
+            this.popping[i] = false;
+            int cv = this.createVal[i];
+            this.board.grid[i] = cv;
+            if (cv != 0) { this.flash[i] = 0.45; }
+        }
+        this.ClearScratch();
+        this.Collapse();
+        this.phase = PhFall;
+        this.phaseT = 0.0;
+    }
+
+    // Gravity + refill with per-cell drop offsets, so the painter can let each
+    // gem fall (and bounce) from where it was.
+    void Collapse() {
+        for (int c = 0; c < Cols; c = c + 1) {
+            int write = Rows - 1;
+            for (int r = Rows - 1; r >= 0; r = r - 1) {
+                int i = r * Cols + c;
+                int v = this.board.grid[i];
+                if (v == 0) { continue; }
+                if (r != write) {
+                    int w = write * Cols + c;
+                    this.drop[w] = this.drop[i] + (double)((write - r) * TileSize);
+                    this.vel[w] = this.vel[i];
+                    this.flash[w] = this.flash[i];
+                    this.drop[i] = 0.0;
+                    this.vel[i] = 0.0;
+                    this.flash[i] = 0.0;
+                }
+                write = write - 1;
+            }
+        }
+        this.board.ApplyGravity();
+        for (int c = 0; c < Cols; c = c + 1) {
+            int empty = 0;
+            for (int r = 0; r < Rows; r = r + 1) {
+                if (this.board.grid[r * Cols + c] == 0) { empty = empty + 1; }
+            }
+            for (int r = 0; r < empty; r = r + 1) {
+                int i = r * Cols + c;
+                this.board.grid[i] = 1 + this.rng.NextBelow(this.level.colors);
+                this.drop[i] = (double)(empty * TileSize + 12);
+                this.vel[i] = 0.0;
+                this.flash[i] = 0.0;
+            }
         }
     }
+
+    // Board stopped moving: chain the next cascade or close the move.
+    void AfterSettle() {
+        this.ClearScratch();
+        if (this.FindMatches(-1, -1) > 0) {
+            this.cascade = this.cascade + 1;
+            this.BeginPop();
+            return;
+        }
+        this.lastCombos = this.cascade;
+        this.cascade = 0;
+        this.revision = this.revision + 1;
+        if (this.GoalMet()) {
+            this.won = true;
+            this.phase = PhBonus;
+            this.phaseT = 0.0;
+            this.fx.Combo(this.movesLeft > 0 ? "GEM RUSH!" : "COMPLETE!", unchecked((int)0xFFFFD666));
+            return;
+        }
+        if (this.movesLeft <= 0) {
+            this.EndGame();
+            return;
+        }
+        if (!this.HasAnyMove()) {
+            this.Shuffle();
+            return;
+        }
+        this.phase = PhIdle;
+        this.idleT = 0.0;
+    }
+
+    void EndGame() {
+        this.gameOver = true;
+        this.phase = PhOver;
+        this.hasSelection = false;
+        this.hintOn = false;
+        this.sfxMask = this.sfxMask | (this.won ? SfxWin : SfxLose);
+        this.revision = this.revision + 1;
+    }
+
+    // No legal move left: shuffle the gems (crates stay put) until the board
+    // has a move and no ready-made line.
+    void Shuffle() {
+        for (int attempt = 0; attempt < 60; attempt = attempt + 1) {
+            for (int i = Cells - 1; i > 0; i = i - 1) {
+                if (!Swappable(this.board.grid[i])) { continue; }
+                int j = this.rng.NextBelow(i + 1);
+                if (!Swappable(this.board.grid[j])) { continue; }
+                int t = this.board.grid[i];
+                this.board.grid[i] = this.board.grid[j];
+                this.board.grid[j] = t;
+            }
+            this.ClearScratch();
+            bool lines = this.FindMatches(-1, -1) > 0;
+            this.ClearScratch();
+            if (!lines && this.HasAnyMove()) { break; }
+            if (attempt == 59) {
+                for (int i = 0; i < Cells; i = i + 1) {
+                    if (MatchColor(this.board.grid[i]) != 0) {
+                        this.board.grid[i] = 1 + this.rng.NextBelow(this.level.colors);
+                    }
+                }
+            }
+        }
+        this.phase = PhShuffle;
+        this.phaseT = 0.0;
+        this.sfxMask = this.sfxMask | SfxShuffle;
+        this.fx.Combo("SHUFFLE!", unchecked((int)0xFFB37FEB));
+    }
+
+    // ---- stepping ----
 
     public void Update(double dt) {
-        floatingTexts.Update(dt);
-        if (invalidFlash > 0.0) {
-            invalidFlash = invalidFlash - dt;
-            if (invalidFlash < 0.0) { invalidFlash = 0.0; }
+        this.clock = this.clock + dt;
+        this.fx.Update(dt);
+        for (int i = 0; i < Cells; i = i + 1) {
+            if (this.flash[i] > 0.0) { this.flash[i] = this.flash[i] - dt; }
         }
-    }
-
-    public void Render(Canvas c) {
-        if (c == null) { return; }
-
-        // 背景：深紫夜空渐变
-        c.FillVGrad(0, 0, 720, 960, unchecked((int)0xFF221A3A), unchecked((int)0xFF12101E));
-
-        // 棋盘底座：圆角深槽 + 细描边
-        int boardW = Cols * TileSize;
-        int boardH = Rows * TileSize;
-        c.FillRoundRect(BoardStartX - 10, BoardStartY - 10, boardW + 20, boardH + 20, 18,
-            unchecked((int)0xFF0E0C18));
-        c.DrawRoundRect(BoardStartX - 10, BoardStartY - 10, boardW + 20, boardH + 20, 18,
-            unchecked((int)0xFF4B3D7A), 2);
-
-        // 绘制格子与宝石
-        for (int r = 0; r < Rows; r = r + 1) {
-            for (int col = 0; col < Cols; col = col + 1) {
-                int gx = BoardStartX + col * TileSize;
-                int gy = BoardStartY + r * TileSize;
-
-                // 槽位底色（棋盘格）
-                int slotColor = ((col + r) % 2 == 0) ? unchecked((int)0xFF231E36) : unchecked((int)0xFF2B2542);
-                c.FillRoundRect(gx + 2, gy + 2, TileSize - 4, TileSize - 4, 10, slotColor);
-
-                bool selected = hasSelection && selectedCol == col && selectedRow == r;
-                if (selected) {
-                    c.FillRoundRect(gx + 2, gy + 2, TileSize - 4, TileSize - 4, 10, unchecked((int)0xFF4A3F72));
+        this.phaseT = this.phaseT + dt;
+        if (this.phase == PhIdle) {
+            if (!this.gameOver) {
+                this.idleT = this.idleT + dt;
+                if (this.idleT >= HintDelay && !this.hintOn) {
+                    int m = this.BestMove();
+                    if (m >= 0) {
+                        this.hintOn = true;
+                        this.hintA = m / 2;
+                        this.hintB = (m % 2 == 0) ? this.hintA + 1 : this.hintA + Cols;
+                        this.revision = this.revision + 1;
+                    }
                 }
-
-                int val = board.Get(col, r);
-                if (val >= 1 && val <= 6) {
-                    int grow = selected ? 3 : 0;
-                    this.DrawGem(c, val, gx + TileSize / 2, gy + TileSize / 2, 23 + grow);
-                }
-
-                if (selected) {
-                    c.DrawRoundRect(gx + 1, gy + 1, TileSize - 2, TileSize - 2, 11, unchecked((int)0xFFFFFFFF), 3);
+            }
+        } else if (this.phase == PhSwap) {
+            if (this.phaseT >= SwapTime) { this.ResolveSwap(); }
+        } else if (this.phase == PhSwapBack) {
+            if (this.phaseT >= SwapBackTime) { this.phase = PhIdle; }
+        } else if (this.phase == PhPop) {
+            if (this.phaseT >= PopTime) { this.FinishPop(); }
+        } else if (this.phase == PhFall) {
+            this.StepFall(dt);
+        } else if (this.phase == PhShuffle) {
+            if (this.phaseT >= ShuffleTime) { this.AfterSettle(); }
+        } else if (this.phase == PhBonus) {
+            if (this.phaseT >= BonusStep) {
+                this.phaseT = 0.0;
+                if (this.movesLeft > 0) {
+                    this.movesLeft = this.movesLeft - 1;
+                    this.score = this.score + BonusPerMove;
+                    int cell = this.visRng.NextBelow(Cells);
+                    int x = CellX(cell % Cols);
+                    int y = CellY(cell / Cols);
+                    int col = MatchColor(this.board.grid[cell]);
+                    this.fx.Burst((double)x, (double)y, col > 0 ? Match3Painter.GemColor(col) : unchecked((int)0xFFFFE58F), 12);
+                    this.fx.Text((double)x, (double)y, "+" + Convert.ToString(BonusPerMove), unchecked((int)0xFFFFE58F), 22);
+                    this.flash[cell] = 0.3;
+                    this.sfxMask = this.sfxMask | SfxBonus;
+                    this.revision = this.revision + 1;
+                } else {
+                    this.EndGame();
                 }
             }
         }
-
-        // 无效交换：两格红框闪一下
-        if (invalidFlash > 0.0) {
-            int red = unchecked((int)0xFFFF4D4F);
-            c.DrawRect(BoardStartX + invalidC1 * TileSize + 1, BoardStartY + invalidR1 * TileSize + 1,
-                TileSize - 2, TileSize - 2, red, 3);
-            c.DrawRect(BoardStartX + invalidC2 * TileSize + 1, BoardStartY + invalidR2 * TileSize + 1,
-                TileSize - 2, TileSize - 2, red, 3);
-        }
-
-        // 渲染消除飘字
-        floatingTexts.Draw(c);
-
-        // Persistent HUD is composed after the unchanged world and floating scores.
     }
 
-    // 宝石：每种颜色一个独立轮廓（色弱玩家靠形状也能分辨），
-    // 底影 + 本体 + 内层亮面 + 高光点四层。
-    void DrawGem(Canvas c, int kind, int cx, int cy, int r) {
-        int body = gemColors[kind];
-        int dark = Match3Game.Shade(body, 55);
-        int light = Match3Game.Tint(body, 45);
-        // 落影
-        this.GemShape(c, kind, cx + 2, cy + 3, r, unchecked((int)0x66000000));
-        // 描边（暗色本体略大一圈）
-        this.GemShape(c, kind, cx, cy, r, dark);
-        // 本体
-        this.GemShape(c, kind, cx, cy, r - 3, body);
-        // 内层亮面（上移一点，模拟顶光）
-        this.GemShape(c, kind, cx, cy - r / 6, r * 11 / 20, light);
-        // 高光点
-        c.FillCircle(cx - r / 3, cy - r / 3, r / 6 + 1, unchecked((int)0xDDFFFFFF));
-    }
-
-    // 1 圆 / 2 圆角方 / 3 菱形 / 4 三角 / 5 六边形 / 6 心形
-    void GemShape(Canvas c, int kind, int cx, int cy, int r, int color) {
-        if (r <= 1) { return; }
-        if (kind == 1) { c.FillCircle(cx, cy, r, color); return; }
-        if (kind == 2) { c.FillRoundRect(cx - r * 9 / 10, cy - r * 9 / 10, r * 9 / 5, r * 9 / 5, r / 3, color); return; }
-        if (kind == 6) {
-            int lobe = r * 11 / 20;
-            c.FillCircle(cx - lobe * 4 / 5, cy - r / 4, lobe, color);
-            c.FillCircle(cx + lobe * 4 / 5, cy - r / 4, lobe, color);
-            Match3Game.Scan(c, 3, cx, cy + r / 8, r * 17 / 20, color);
-            return;
-        }
-        if (kind == 4) { Match3Game.Scan(c, 4, cx, cy + r / 8, r * 23 / 20, color); return; }
-        Match3Game.Scan(c, kind, cx, cy, r, color);
-    }
-
-    // 扫描线填充：逐 2px 行按半宽画矩形（Canvas 无多边形填充）。
-    static void Scan(Canvas c, int kind, int cx, int cy, int r, int color) {
-        for (int dy = -r; dy < r; dy = dy + 2) {
-            int y = dy + 1;
-            int ay = y < 0 ? -y : y;
-            int half = 0;
-            if (kind == 3) {                       // 菱形 / 心形下尖
-                half = r - ay;
-            } else if (kind == 4) {                // 正三角（尖朝上）
-                half = (dy + r) * 3 / 5;
-            } else {                               // 六边形（平顶）
-                int edge = r * 86 / 100;
-                if (ay > edge) { continue; }
-                half = r - (ay * 58 / 100);
+    void StepFall(double dt) {
+        bool moving = false;
+        bool landed = false;
+        for (int i = 0; i < Cells; i = i + 1) {
+            if (this.drop[i] <= 0.0 && this.vel[i] == 0.0) { continue; }
+            this.vel[i] = this.vel[i] + Gravity * dt;
+            if (this.vel[i] > 2200.0) { this.vel[i] = 2200.0; }
+            this.drop[i] = this.drop[i] - this.vel[i] * dt;
+            if (this.drop[i] <= 0.0) {
+                this.drop[i] = 0.0;
+                if (this.vel[i] > 420.0) {
+                    this.vel[i] = -this.vel[i] * 0.16;
+                    landed = true;
+                } else {
+                    this.vel[i] = 0.0;
+                }
             }
-            if (half > 0) { c.FillRect(cx - half, cy + dy, half * 2, 2, color); }
+            if (this.drop[i] > 0.0 || this.vel[i] != 0.0) { moving = true; }
         }
+        if (landed) { this.sfxMask = this.sfxMask | SfxLand; }
+        if (!moving) { this.AfterSettle(); }
     }
 
-    static int Shade(int argb, int pct) {
-        int a = (argb >> 24) & 255;
-        int rr = ((argb >> 16) & 255) * (100 - pct) / 100;
-        int gg = ((argb >> 8) & 255) * (100 - pct) / 100;
-        int bb = (argb & 255) * (100 - pct) / 100;
-        return (a << 24) | (rr << 16) | (gg << 8) | bb;
+    // ---- debug helpers (only reachable with MATCH3_DEBUG=1) ----
+
+    public void DebugSpecials() {
+        if (this.phase != PhIdle) { return; }
+        int[] cells = new int[] { 9, 14, 27, 36, 50 };
+        for (int k = 0; k < cells.Length; k = k + 1) {
+            int i = cells[k];
+            int v = this.board.grid[i];
+            if (MatchColor(v) == 0) { continue; }
+            if (k == 4) { this.board.grid[i] = Bomb; }
+            else { this.board.grid[i] = Gem(MatchColor(v), k == 0 ? SpRow : (k == 1 ? SpCol : SpArea)); }
+            this.flash[i] = 0.4;
+        }
+        this.revision = this.revision + 1;
     }
 
-    static int Tint(int argb, int pct) {
-        int a = (argb >> 24) & 255;
-        int rr = (argb >> 16) & 255; rr = rr + (255 - rr) * pct / 100;
-        int gg = (argb >> 8) & 255; gg = gg + (255 - gg) * pct / 100;
-        int bb = argb & 255; bb = bb + (255 - bb) * pct / 100;
-        return (a << 24) | (rr << 16) | (gg << 8) | bb;
+    public void DebugWin() {
+        if (this.phase != PhIdle) { return; }
+        int g = this.level.goal;
+        if (g == Match3Levels.GoalScore) { this.score = this.level.star3; }
+        for (int i = 0; i < this.level.collectColor.Length; i = i + 1) {
+            this.collected[this.level.collectColor[i]] = this.level.collectCount[i];
+        }
+        for (int i = 0; i < Cells; i = i + 1) { this.jelly[i] = 0; }
+        this.jellyLeft = 0;
+        this.cratesLeft = 0;
+        this.score = this.score + this.level.star2;
+        this.AfterSettle();
     }
+
+    public void DebugLose() {
+        if (this.phase != PhIdle) { return; }
+        this.movesLeft = 0;
+        this.AfterSettle();
+    }
+
+    public void Render(Canvas c, int top) { Match3Painter.Draw(c, this, top); }
 }

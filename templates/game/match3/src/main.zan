@@ -20,7 +20,11 @@ public class Match3Loop : IGuiHostLoop {
         this.bus = new AudioBus();
         this.sfx = new SfxBank(this.bus);
         Match3Loop.LoadSounds(this.sfx);
-        this.game = Match3Game.Create((long)Window.GetTickMs());
+        // MATCH3_SEED pins the board RNG (screenshots, bug reports); default is the clock.
+        long seed = (long)Window.GetTickMs();
+        string fixedSeed = Environment.GetEnvironmentVariable("MATCH3_SEED");
+        if (fixedSeed != null && fixedSeed != "") { seed = (long)Convert.ToInt32(fixedSeed); }
+        this.game = Match3Game.Create(seed);
         this.hud = new Match3Hud(host, this.game, this.profile, this.sfx, this.bus);
         host.SetContentRoot(this.hud.root);
         this.hud.AttachPreparation(host);
@@ -32,32 +36,56 @@ public class Match3Loop : IGuiHostLoop {
         }
     }
 
-    // Procedural SFX, tuned for a gem game: glassy select, soft swap whoosh and a
-    // coin chime per cascade level (coin1..coin4 climb in pitch).
+    // Procedural SFX tuned for a gem game: glassy select, soft swap whoosh,
+    // a coin chime per cascade level, laser for stripes, zap for colour bombs,
+    // a woody thud for crates and a rising three-note chime for result stars.
     public static void LoadSounds(SfxBank sfx) {
         sfx.AddPresets(new string[] { "click", "error", "powerup", "explode", "success", "fail" });
         sfx.AddSynth("select", SfxPresets.Select().WithSweep(880.0, 1320.0));
         sfx.AddSynth("swap", SfxPresets.Select().WithWaveform(Waveform.Sine).WithSweep(520.0, 780.0)
             .WithDuration(0.06));
+        sfx.AddSynth("whoosh", SfxPresets.Launch().WithSweep(180.0, 520.0).WithDuration(0.14).WithGain(0.10));
         sfx.AddSynth("coin1", SfxPresets.Coin().WithSweep(880.0, 1320.0));
         sfx.AddSynth("coin2", SfxPresets.Coin().WithSweep(1046.0, 1568.0));
         sfx.AddSynth("coin3", SfxPresets.Coin().WithSweep(1244.0, 1865.0));
         sfx.AddSynth("coin4", SfxPresets.Coin().WithSweep(1480.0, 2217.0));
+        sfx.AddSynth("create", SfxPresets.PowerUp().WithSweep(660.0, 1760.0).WithDuration(0.18));
+        sfx.AddSynth("laser", SfxPresets.Launch().WithSweep(1800.0, 300.0).WithDuration(0.16));
+        sfx.AddSynth("zap", SfxPresets.Launch().WithSweep(300.0, 2400.0).WithDuration(0.28).WithGain(0.2));
+        sfx.AddSynth("crate", SfxPresets.Hit().WithDuration(0.06).WithGain(0.4));
+        sfx.AddSynth("jelly", SfxPresets.Select().WithWaveform(Waveform.Sine).WithSweep(300.0, 180.0)
+            .WithDuration(0.08));
+        sfx.AddSynth("land", SfxPresets.Hit().WithDuration(0.02).WithGain(0.15));
+        sfx.AddSynth("shuffle", SfxPresets.PowerUp().WithSweep(1320.0, 440.0).WithDuration(0.3));
+        sfx.AddSynth("bonus", SfxPresets.Coin().WithSweep(1568.0, 2637.0).WithDuration(0.05));
+        sfx.AddSynth("star1", SfxPresets.Success().WithSweep(784.0, 1046.0).WithDuration(0.2));
+        sfx.AddSynth("star2", SfxPresets.Success().WithSweep(988.0, 1318.0).WithDuration(0.2));
+        sfx.AddSynth("star3", SfxPresets.Success().WithSweep(1175.0, 1568.0).WithDuration(0.28));
         sfx.Warm();
     }
 
     public void FixedUpdate(GuiHost host, int dt) {
-        this.game.Update((double)dt / 1000.0);
+        // The board only runs while a level is on screen (pause freezes it).
+        int st = this.hud.state;
+        if (st == Match3Hud.StatePlaying || st == Match3Hud.StateResults) {
+            this.game.Update((double)dt / 1000.0);
+        }
     }
 
     public void Update(GuiHost host, int dt) {
         // Advances the audio bus (SFX throttle timers, BGM fades).
         if (this.bus != null) { this.bus.Update(dt); }
+        if (this.hud != null) { this.hud.Tick((double)dt / 1000.0); }
+        // Everything on screen animates (twinkles, idle hint timer, gem pulses):
+        // keep frames coming even when no input or control change asks for one.
+        host.App().RequestRedraw();
     }
 
     public void Render(GuiHost host, Canvas c, double alpha) {
-        this.game.Render(c);
+        int top = host.App().ContentTop();
+        Match3Scenes.DrawScene(c, this.hud, top);
         this.hud.root.RenderTree(host.App());
+        Match3Scenes.DrawOverlay(c, this.hud, top);
     }
 
     public void Stop(GuiHost host) {
@@ -74,7 +102,7 @@ public class Match3Loop : IGuiHostLoop {
 
 public class App {
     public static void Main() {
-        GuiHost host = new GuiHost("Match-3 Puzzle - Zan Game", 720, 960, 60);
+        GuiHost host = new GuiHost("Gem Cascade - Zan Game", 720, 960, 60);
         // UiDriver automation (ZAN_UI_SCRIPT / ZAN_UI_DUMP) must be enabled before the window shows.
         host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a));
         host.Run(new Match3Loop());

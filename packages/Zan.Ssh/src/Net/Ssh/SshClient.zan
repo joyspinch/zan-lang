@@ -113,38 +113,34 @@ public class SshClient : IDisposable {
                 throw new SshException(SshError.IoError, "cannot create SSH socket",
                     this.host + ":" + this.port.ToString());
             }
-            bool adopted = false;
-            try {
-                Socket.SetNonBlocking(sock);
-                int rc = Socket.Connect(sock, this.host, this.port);
-                if (rc < 0) {
-                    long startMs = Stopwatch.GetMilliseconds();
-                    bool connected = false;
-                    while (true) {
-                        int st = Socket.ConnectStatus(sock);
-                        if (st == 0) {
-                            connected = true;
-                            break;
-                        }
-                        if (st != -2) {
-                            break;
-                        }
-                        if (Stopwatch.GetMilliseconds() - startMs >= (long)timeoutMs) {
-                            throw new SshException(SshError.IoError, "SSH connection timed out",
-                                this.host + ":" + this.port.ToString());
-                        }
-                        Thread.Sleep(5);
+            Socket.SetNonBlocking(sock);
+            int rc = Socket.Connect(sock, this.host, this.port);
+            if (rc < 0) {
+                long startMs = Stopwatch.GetMilliseconds();
+                bool connected = false;
+                while (true) {
+                    int st = Socket.ConnectStatus(sock);
+                    if (st == 0) {
+                        connected = true;
+                        break;
                     }
-                    if (!connected) {
-                        throw new SshException(SshError.IoError, "cannot connect to SSH server",
+                    if (st != -2) {
+                        break;
+                    }
+                    if (Stopwatch.GetMilliseconds() - startMs >= (long)timeoutMs) {
+                        Socket.Close(sock);
+                        throw new SshException(SshError.IoError, "SSH connection timed out",
                             this.host + ":" + this.port.ToString());
                     }
+                    Thread.Sleep(5);
                 }
-                this.tcp = TcpClient.FromSocket(sock);
-                adopted = true;
-            } finally {
-                if (!adopted) { Socket.Close(sock); }
+                if (!connected) {
+                    Socket.Close(sock);
+                    throw new SshException(SshError.IoError, "cannot connect to SSH server",
+                        this.host + ":" + this.port.ToString());
+                }
             }
+            this.tcp = TcpClient.FromSocket(sock);
         } else {
             this.tcp = TcpClient.Connect(this.host, this.port);
         }
@@ -156,9 +152,7 @@ public class SshClient : IDisposable {
             throw new SshException(SshError.IoError, "cannot connect to SSH server",
                 this.host + ":" + this.port.ToString());
         }
-        SshSocketPipe sockPipe = SshSocketPipe.FromClient(this.tcp);
-        if (timeoutMs > 0) { sockPipe.ioTimeoutMs = timeoutMs; }
-        this.pipe = sockPipe;
+        this.pipe = SshSocketPipe.FromClient(this.tcp);
         this.packets = new SshPacketLayer(this.pipe);
     }
 
@@ -191,12 +185,10 @@ public class SshClient : IDisposable {
     }
 
     private void ExchangeVersions() {
-        string swVer = (this.options != null && this.options.softwareVersion != null)
-            ? this.options.softwareVersion : "ZanSsh_0.1";
-        string ident = SshVersion.Build(swVer);
+        string ident = SshVersion.Build(this.options.softwareVersion);
         byte[] raw = Encoding.UTF8.GetBytes(ident);
         this.pipe.WriteExact(raw, 0, raw.Length);
-        this.localVersion = Encoding.UTF8.GetBytes(SshVersion.Prefix + swVer);
+        this.localVersion = Encoding.UTF8.GetBytes(SshVersion.Prefix + this.options.softwareVersion);
 
         int guard = 0;
         while (true) {
@@ -562,9 +554,6 @@ public class SshClient : IDisposable {
         List<byte[]> deferred = new List<byte[]>();
         while (true) {
             byte[] payload = this.NextMessage();
-            if (payload == null || payload.Length == 0) {
-                throw new SshException(SshError.Malformed, "empty SSH packet during exec");
-            }
             int message = payload[0] & 255;
             this.Trace("exec reply: " + SshMessage.Name(message));
             if (message == SshMessage.Disconnect) {
@@ -584,9 +573,6 @@ public class SshClient : IDisposable {
                 throw new SshException(SshError.ChannelOpenFailed,
                     "exec request was not confirmed (channel closed)");
             }
-            if (deferred.Count >= 4096) {
-                throw new SshException(SshError.Malformed, "too many deferred packets before exec confirmation");
-            }
             deferred.Add(payload);
         }
     }
@@ -601,13 +587,8 @@ public class SshClient : IDisposable {
 
     private void CollectChannelOutput(SshExecResult result, StringBuilder outBuf, StringBuilder errBuf) {
         this.windowConsumed = 0;
-        long totalOutputBytes = 0L;
-        long maxOutputBytes = 67108864L; // 64 MiB 防恶意对端无限撑爆内存
         while (true) {
             byte[] payload = this.NextMessage();
-            if (payload == null || payload.Length == 0) {
-                throw new SshException(SshError.Malformed, "empty SSH channel packet");
-            }
             int message = payload[0] & 255;
             this.Trace("channel recv: " + SshMessage.Name(message));
             if (message == SshMessage.Disconnect) {
@@ -626,10 +607,6 @@ public class SshClient : IDisposable {
             if (message == SshMessage.ChannelData) {
                 r.ReadU32();
                 byte[] data = r.ReadString();
-                totalOutputBytes = totalOutputBytes + (long)data.Length;
-                if (totalOutputBytes > maxOutputBytes) {
-                    throw new SshException(SshError.PacketTooLarge, "SSH command output exceeds 64 MiB limit");
-                }
                 outBuf.Append(data.ToStr(0, data.Length));
                 this.windowConsumed = this.windowConsumed + (long)data.Length;
                 this.MaybeAdjustWindow();
@@ -639,10 +616,6 @@ public class SshClient : IDisposable {
                 r.ReadU32();
                 r.ReadU32();
                 byte[] data = r.ReadString();
-                totalOutputBytes = totalOutputBytes + (long)data.Length;
-                if (totalOutputBytes > maxOutputBytes) {
-                    throw new SshException(SshError.PacketTooLarge, "SSH command output exceeds 64 MiB limit");
-                }
                 errBuf.Append(data.ToStr(0, data.Length));
                 this.windowConsumed = this.windowConsumed + (long)data.Length;
                 this.MaybeAdjustWindow();
@@ -698,20 +671,10 @@ public class SshClient : IDisposable {
     }
 
     private byte[] RecvMessage(int expected) {
-        int ignoredCount = 0;
         while (true) {
             byte[] payload = this.packets.Recv();
-            if (payload == null || payload.Length == 0) {
-                throw new SshException(SshError.Malformed, "empty SSH packet");
-            }
             int message = payload[0] & 255;
-            if (message == SshMessage.Ignore || message == SshMessage.Debug) {
-                ignoredCount = ignoredCount + 1;
-                if (ignoredCount > 16) {
-                    throw new SshException(SshError.Malformed, "too many consecutive SSH ignore/debug messages");
-                }
-                continue;
-            }
+            if (message == SshMessage.Ignore || message == SshMessage.Debug) { continue; }
             if (message == SshMessage.Disconnect) {
                 SshClient.ThrowDisconnect(payload, "peer disconnected");
             }

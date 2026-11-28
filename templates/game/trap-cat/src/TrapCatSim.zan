@@ -5,33 +5,53 @@ using Game.Foundation;
 // 仿真，不碰窗口。replays/ 下的回放由 `zan-check` 无头重放、逐校验点比对；Bot
 // 是模糊测试用的机器人。改了棋盘规则后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 无操作；1..81 封住第 (输入-1) 个圆点；100 悔一步；200 开新局。
+// 输入编码：0 无操作；1..81 封住第 (输入-1) 个圆点；100 悔一步；200 开新局（无尽·经典）；
+// 300..329 开第 (输入-300) 关；400 采纳提示（封住 Hint 给出的格子）。
 public class TrapCatSim : IReplaySim {
     TrapCatBoard board;
     long seed;
     int rounds;
+    int campaign;
+    int hints;
+    int lastHint;
 
     public void Reset(long seed) {
         this.seed = seed;
         rounds = 0;
+        campaign = -1;
+        hints = 0;
+        lastHint = -1;
         board = new TrapCatBoard();
         board.NewRound(1, seed);
     }
 
     public void Step(int frame, int input) {
+        lastHint = -1;
         if (input >= 1 && input <= TrapCatBoard.Count) {
             board.Block(input - 1);
         } else if (input == 100) {
             board.Undo();
         } else if (input == 200) {
             rounds = rounds + 1;
+            campaign = -1;
             board.NewRound(1, seed + rounds);
+        } else if (input >= 300 && input < 300 + TrapCatLevels.Count) {
+            rounds = rounds + 1;
+            campaign = input - 300;
+            TrapCatLevels.Get(campaign).Apply(board);
+        } else if (input == 400) {
+            lastHint = board.Hint();
+            if (lastHint >= 0) {
+                hints = hints + 1;
+                board.Block(lastHint);
+            }
         }
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
         h.Int(board.cat).Int(board.moves).Int((int)board.result).Int(rounds);
+        h.Int(campaign).Int(board.skill).Int(board.budget).Int(hints).Bool(board.outOfFences);
         for (int i = 0; i < TrapCatBoard.Count; i++) { h.Bool(board.blocked[i]); }
         return h.Value();
     }
@@ -46,11 +66,35 @@ public class TrapCatSim : IReplaySim {
     [Invariant]
     public bool MovesInRange() { return board.moves >= 0 && board.moves < TrapCatBoard.Count; }
 
-    // 机器人：多数时候随机封一个点，偶尔悔棋或开新局
+    // 闯关的篱笆预算是硬上限：落子数永远不超过预算
+    [Invariant]
+    public bool FencesWithinBudget() { return board.budget == 0 || board.moves <= board.budget; }
+
+    // “篱笆用完”只在有预算的关卡、用满预算、且没围住时出现
+    [Invariant]
+    public bool OutOfFencesOnlyWhenSpent() {
+        if (!board.outOfFences) { return true; }
+        return board.budget > 0 && board.moves == board.budget && board.result == TrapCatResult.Escaped;
+    }
+
+    // 猫只有在会蹦的关卡里才可能一回合走两格
+    [Invariant]
+    public bool LeapsOnlyForPouncers() { return board.lastLeap <= 1 || board.pounceEvery > 0; }
+
+    // 提示给出的格子一定是一个合法落点（封得住的空地，且不是猫）
+    [Invariant]
+    public bool HintIsLegal() {
+        if (lastHint < 0) { return true; }
+        return board.blocked[lastHint] && lastHint != board.cat;
+    }
+
+    // 机器人：多数时候随机封一个点；会采纳提示、悔棋、开新局，也会跳到任意一关
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
         if (roll < 3) { return 100; }
         if (roll < 5) { return 200; }
+        if (roll < 8) { return 300 + rng.NextBelow(TrapCatLevels.Count); }
+        if (roll < 20) { return 400; }
         return 1 + rng.NextBelow(TrapCatBoard.Count);
     }
 }

@@ -13,10 +13,18 @@ public class SnPlayScene : HtmlScene {
     bool lastRecord;
     bool lastBoost;
     bool lastOver;
+    int lastPowers;
+    int lastShield;
+    int lastThreat;
+    int lastAiDeaths;
+    bool dev;  // ZAN_SNAKE_DEV=1：J +300 分 / U 全道具 / K 立即阵亡（截图与调平衡用，默认关）
     bool wasActive;
     bool leaving;  // 已请求暂停：切场景前（同帧剩余固定步）不再步进
 
-    SnPlayScene(SnGame g) { this.g = g; }
+    SnPlayScene(SnGame g) {
+        this.g = g;
+        this.dev = Environment.GetEnvironmentVariable("ZAN_SNAKE_DEV") == "1";
+    }
 
     override void OnEnter(Control root) {
         int now = Window.GetTickMs();
@@ -29,13 +37,16 @@ public class SnPlayScene : HtmlScene {
             this.g.boostKey = false;
         } else {
             this.g.StartGame(now);
+            // 开发者开关下 ZAN_SNAKE_AUTO=1 让玩家蛇走自动驾驶（无人值守截图 / 试玩 AI 平衡）。
+            this.g.autoMode = this.dev && Environment.GetEnvironmentVariable("ZAN_SNAKE_AUTO") == "1" ? 1 : 0;
             // 首局给完整操作说明，之后只短暂提醒暂停/静音键。
+            // 提示计时走模拟时钟（StartGame 已归零）。
             if (this.g.prof.games == 0) {
-                this.g.hintText = "鼠标转向 · 按住左键/空格冲刺 · 吃豆攒狂热 · P/Esc 暂停 · M 静音";
-                this.g.hintUntil = now + 9000;
+                this.g.hintText = "鼠标转向 · 按住左键/空格冲刺 · 抢彩色道具球 · 别碰围墙 · P/Esc 暂停";
+                this.g.hintUntil = 9000;
             } else {
                 this.g.hintText = "P/Esc 暂停 · M 静音";
-                this.g.hintUntil = now + 2500;
+                this.g.hintUntil = 2500;
             }
         }
         this.lastScore = this.g.score.Get();
@@ -44,6 +55,10 @@ public class SnPlayScene : HtmlScene {
         this.lastRecord = this.g.wasRecord;
         this.lastBoost = false;
         this.lastOver = this.g.over;
+        this.lastPowers = this.g.powersTaken;
+        this.lastShield = this.g.shieldBreaks;
+        this.lastThreat = this.g.threat;
+        this.lastAiDeaths = this.g.aiDeaths;
         this.leaving = false;
         this.wasActive = this.router.Host().WindowActive();
         this.g.EnterHud(this.router.Host().App());
@@ -54,9 +69,9 @@ public class SnPlayScene : HtmlScene {
     override void Update(int dtMs) {
         if (this.g.shell != null) { this.g.shell.Tick(dtMs); }
         // 失焦/最小化自动暂停（只认"有焦点 → 失焦"的边沿：启动时窗口
-        // 尚未拿到焦点不算）。演示模式供无人值守截图，不暂停。
+        // 尚未拿到焦点不算）。演示模式与开发者开关（无人值守截图）不暂停。
         bool active = this.router.Host().WindowActive();
-        if (this.wasActive && !active && !this.g.over && !this.g.demo) { this.Pause(); }
+        if (this.wasActive && !active && !this.g.over && !this.g.demo && !this.dev) { this.Pause(); }
         this.wasActive = active;
         this.g.SyncHud(Window.GetTickMs());
     }
@@ -87,6 +102,9 @@ public class SnPlayScene : HtmlScene {
             if (key == 27 || key == 80) { this.Pause(); }
             if (key == 77 && this.g.shell != null) { this.g.shell.ToggleMute(); }
             if (key == 32) { this.g.boostKey = true; }
+            if (this.dev && key == 74) { this.g.DevScore(300); }
+            if (this.dev && key == 85) { this.g.DevPowers(); }
+            if (this.dev && key == 75) { this.g.DevDie(); }
         } else if (kind == 5) {
             if (key == 32) { this.g.boostKey = false; }
         }
@@ -94,7 +112,10 @@ public class SnPlayScene : HtmlScene {
 
     override void FixedStep(int dtMs) {
         if (this.leaving) { return; }
-        this.g.Tick(Window.GetTickMs());
+        int wall = Window.GetTickMs();
+        // 截杀顿帧：世界停 70ms，让"咔"的一下落到手上。
+        if (wall < this.g.hitStopUntil) { this.g.lastTick = wall; return; }
+        this.g.Tick(wall);
         this.Feedback();
         if (this.g.over) { this.router.Go("over"); }
     }
@@ -111,6 +132,13 @@ public class SnPlayScene : HtmlScene {
                 // 已阵亡：等切到结算，不再出声
             } else if (this.g.kills > this.lastKills) {
                 sh.Play("kill");
+                this.g.hitStopUntil = Window.GetTickMs() + 70;
+            } else if (this.g.shieldBreaks > this.lastShield) {
+                sh.Play("shield");
+            } else if (this.g.powersTaken > this.lastPowers) {
+                sh.Play("power");
+            } else if (this.g.threat > this.lastThreat) {
+                sh.Play("alarm");
             } else if (this.g.feverOn && !this.lastFever) {
                 sh.Play("fever");
             } else if (this.g.wasRecord && !this.lastRecord) {
@@ -120,6 +148,7 @@ public class SnPlayScene : HtmlScene {
                 sh.Play("eat", 0.8, 70);
             }
             if (boost && !this.lastBoost) { sh.Play("boost", 1.0, 250); }
+            if (this.g.aiDeaths > this.lastAiDeaths && !this.g.over) { sh.Play("kill", 0.3, 400); }
         }
         this.lastScore = score;
         this.lastKills = this.g.kills;
@@ -127,6 +156,10 @@ public class SnPlayScene : HtmlScene {
         this.lastRecord = this.g.wasRecord;
         this.lastBoost = boost;
         this.lastOver = this.g.over;
+        this.lastPowers = this.g.powersTaken;
+        this.lastShield = this.g.shieldBreaks;
+        this.lastThreat = this.g.threat;
+        this.lastAiDeaths = this.g.aiDeaths;
     }
 
     override void Render(Canvas c, double alpha) {

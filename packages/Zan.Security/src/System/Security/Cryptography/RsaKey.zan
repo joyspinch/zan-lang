@@ -121,10 +121,7 @@ public class RsaKey {
             return b;
         }
         int bytes = b - 128;
-        if (bytes < 1 || bytes > 4 || bytes > der.Length - pos) { return -1; }
-        int first = der[pos] & 255;
-        if (bytes == 1 && first < 128) { return -1; }
-        if (bytes > 1 && first == 0) { return -1; }
+        if (bytes < 1 || bytes > 4 || pos + bytes > der.Length) { return -1; }
         int result = 0;
         for (int i = 0; i < bytes; i = i + 1) {
             int nextByte = der[pos + i] & 255;
@@ -135,36 +132,6 @@ public class RsaKey {
         cursor[0] = pos;
         if (result < 0 || result > der.Length - pos) { return -1; }
         return result;
-    }
-
-    // 校验 AlgorithmIdentifier 内容是否为标准 rsaEncryption OID (1.2.840.113549.1.1.1)，
-    // 可选紧跟 DER NULL (05 00)，不允许尾部多余字节。
-    private static bool IsRsaAlgorithmIdentifier(string der, int start, int end) {
-        if (der == null || start < 0 || end < start || end > der.Length) { return false; }
-        int len = end - start;
-        if (len != 11 && len != 13) { return false; }
-        if ((der[start + 0] & 255) != 6 || (der[start + 1] & 255) != 9
-            || (der[start + 2] & 255) != 42 || (der[start + 3] & 255) != 134
-            || (der[start + 4] & 255) != 72 || (der[start + 5] & 255) != 134
-            || (der[start + 6] & 255) != 247 || (der[start + 7] & 255) != 13
-            || (der[start + 8] & 255) != 1 || (der[start + 9] & 255) != 1
-            || (der[start + 10] & 255) != 1) {
-            return false;
-        }
-        if (len == 13) {
-            return (der[start + 11] & 255) == 5 && (der[start + 12] & 255) == 0;
-        }
-        return true;
-    }
-
-    // 校验 RSA 公钥模数 n 与指数 e 的基本密码学合法性：
-    // n 为奇数且至少 512 位（<= 4096 位），e 为 >= 3 的奇数且 <= 64 位。
-    private static bool IsValidRsaParams(byte[] n, int nLen, byte[] e, int eLen) {
-        if (n == null || e == null || nLen < 64 || nLen > 512 || eLen < 1 || eLen > 8) { return false; }
-        if ((n[0] & 255) == 0 || (n[nLen - 1] & 1) == 0) { return false; }
-        if ((e[eLen - 1] & 1) == 0) { return false; }
-        if (eLen == 1 && (e[0] & 255) < 3) { return false; }
-        return true;
     }
 
     // 期望 `tag` 并进入其内容，返回内容结束下标；越界或 tag 不符返回 -1。
@@ -191,14 +158,10 @@ public class RsaKey {
         int rawLen = RsaKey.ReadLength(der, cursor);
         if (rawLen <= 0) { outLen[0] = 0; return null; }
         int rawStart = cursor[0];
-        if (rawLen > der.Length - rawStart) { outLen[0] = 0; return null; }
-        int b0 = der[rawStart] & 255;
-        // 严格 DER 非负整数：拒绝负数（最高位为 1）及非最短前导 0x00
-        if ((b0 & 128) != 0) { outLen[0] = 0; return null; }
-        if (rawLen > 1 && b0 == 0 && (der[rawStart + 1] & 128) == 0) { outLen[0] = 0; return null; }
+        if (rawStart + rawLen > der.Length) { outLen[0] = 0; return null; }
         int start = rawStart;
         int len = rawLen;
-        if (len > 1 && b0 == 0) {
+        if (len > 1 && (der[start] & 255) == 0) {
             start = start + 1;
             len = len - 1;
         }
@@ -213,11 +176,10 @@ public class RsaKey {
     // 结构不符返回 null。
     private static RsaKey ParsePkcs1Private(string der, int offset) {
         List<int> c = new List<int>(); c.Add(offset);
-        int seqEnd = RsaKey.Enter(der, c, 48);
-        if (seqEnd < 0) { return null; }
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
         List<int> len = new List<int>(); len.Add(0);
         byte[] version = RsaKey.ReadIntegerSafe(der, c, len);
-        if (version == null || len[0] != 1 || (version[0] & 255) > 1) { return null; }
+        if (version == null) { return null; }
         RsaKey key = new RsaKey();
         key.modulus = RsaKey.ReadIntegerSafe(der, c, len);
         key.modulusLength = len[0];
@@ -226,26 +188,22 @@ public class RsaKey {
         key.privateExponent = RsaKey.ReadIntegerSafe(der, c, len);
         key.privateExponentLength = len[0];
         if (key.modulus == null || key.publicExponent == null
-            || key.privateExponent == null
-            || !RsaKey.IsValidRsaParams(key.modulus, key.modulusLength, key.publicExponent, key.publicExponentLength)
-            || key.privateExponentLength <= 0 || c[0] > seqEnd) { return null; }
+            || key.privateExponent == null) { return null; }
 
         // 解析 CRT 五分量（若存在）
-        if (c[0] < seqEnd) {
-            key.prime1 = RsaKey.ReadIntegerSafe(der, c, len);
-            key.prime1Length = len[0];
-            key.prime2 = RsaKey.ReadIntegerSafe(der, c, len);
-            key.prime2Length = len[0];
-            key.exponent1 = RsaKey.ReadIntegerSafe(der, c, len);
-            key.exponent1Length = len[0];
-            key.exponent2 = RsaKey.ReadIntegerSafe(der, c, len);
-            key.exponent2Length = len[0];
-            key.coefficient = RsaKey.ReadIntegerSafe(der, c, len);
-            key.coefficientLength = len[0];
-            if (key.prime1 != null && key.prime2 != null && key.exponent1 != null
-                && key.exponent2 != null && key.coefficient != null && c[0] <= seqEnd) {
-                key.hasCrt = true;
-            }
+        key.prime1 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.prime1Length = len[0];
+        key.prime2 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.prime2Length = len[0];
+        key.exponent1 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.exponent1Length = len[0];
+        key.exponent2 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.exponent2Length = len[0];
+        key.coefficient = RsaKey.ReadIntegerSafe(der, c, len);
+        key.coefficientLength = len[0];
+        if (key.prime1 != null && key.prime2 != null && key.exponent1 != null
+            && key.exponent2 != null && key.coefficient != null) {
+            key.hasCrt = true;
         }
         return key;
     }
@@ -257,33 +215,28 @@ public class RsaKey {
         if (pos < 0 || pos >= der.Length) { return -1; }
         cursor[0] = pos + 1;  // 标签
         int len = RsaKey.ReadLength(der, cursor);
-        if (len < 0 || len > der.Length - cursor[0]) { return -1; }
+        if (len < 0) { return -1; }
         int end = cursor[0] + len;
+        if (end > der.Length) { return -1; }
         cursor[0] = end;
         return end;
     }
 
-    // 解析 SubjectPublicKeyInfo：校验 rsaEncryption AlgorithmIdentifier，取 BIT STRING
+    // 解析 SubjectPublicKeyInfo：跳过 AlgorithmIdentifier，取 BIT STRING
     // 内的 PKCS#1 公钥。结构不符或越界返回 null。
     private static RsaKey ParseSpkiPublic(string der, int offset) {
         List<int> c = new List<int>(); c.Add(offset);
-        int spkiEnd = RsaKey.Enter(der, c, 48);
-        if (spkiEnd < 0) { return null; }
-        if (c[0] >= spkiEnd || (der[c[0]] & 255) != 48) { return null; }
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
+        if (c[0] >= der.Length || (der[c[0]] & 255) != 48) { return null; }
         int algorithmEnd = RsaKey.Enter(der, c, 48);
-        if (algorithmEnd < 0 || algorithmEnd >= spkiEnd) { return null; }
-        if (!RsaKey.IsRsaAlgorithmIdentifier(der, c[0], algorithmEnd)) { return null; }
+        if (algorithmEnd < 0 || algorithmEnd >= der.Length) { return null; }
         c[0] = algorithmEnd;
         if ((der[c[0]] & 255) != 3) { return null; }
         c[0] = c[0] + 1;
         int bitLen = RsaKey.ReadLength(der, c);
-        if (bitLen < 2 || bitLen > spkiEnd - c[0]) { return null; }
-        int bitEnd = c[0] + bitLen;
-        if (bitEnd != spkiEnd) { return null; }
-        // BIT STRING 未用位字节必须为 0
-        if ((der[c[0]] & 255) != 0) { return null; }
-        c[0] = c[0] + 1;
-        return RsaKey.ParsePkcs1PublicBounded(der, c[0], bitEnd);
+        if (bitLen < 2 || c[0] + bitLen > der.Length) { return null; }
+        c[0] = c[0] + 1;  // 未用位（unused-bits）字节
+        return RsaKey.ParsePkcs1Public(der, c[0]);
     }
 
     // 解析 X.509 证书：定位 tbsCertificate 的 SubjectPublicKeyInfo 并取其
@@ -304,26 +257,18 @@ public class RsaKey {
         return RsaKey.ParseSpkiPublic(der, c[0]);
     }
 
-    // 解析 PKCS#1 RSAPublicKey（n, e）；结构不符或含尾部垃圾字节返回 null。
-    private static RsaKey ParsePkcs1PublicBounded(string der, int offset, int expectedEnd) {
+    // 解析 PKCS#1 RSAPublicKey（n, e）；结构不符返回 null。
+    private static RsaKey ParsePkcs1Public(string der, int offset) {
         List<int> c = new List<int>(); c.Add(offset);
-        int seqEnd = RsaKey.Enter(der, c, 48);
-        if (seqEnd < 0 || (expectedEnd > 0 && seqEnd != expectedEnd)) { return null; }
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
         List<int> len = new List<int>(); len.Add(0);
         RsaKey key = new RsaKey();
         key.modulus = RsaKey.ReadIntegerSafe(der, c, len);
         key.modulusLength = len[0];
         key.publicExponent = RsaKey.ReadIntegerSafe(der, c, len);
         key.publicExponentLength = len[0];
-        if (key.modulus == null || key.publicExponent == null || c[0] != seqEnd) { return null; }
-        if (!RsaKey.IsValidRsaParams(key.modulus, key.modulusLength, key.publicExponent, key.publicExponentLength)) {
-            return null;
-        }
+        if (key.modulus == null || key.publicExponent == null) { return null; }
         return key;
-    }
-
-    private static RsaKey ParsePkcs1Public(string der, int offset) {
-        return RsaKey.ParsePkcs1PublicBounded(der, offset, der != null ? der.Length : 0);
     }
 
     // 从 PEM 私钥加载：支持 PKCS#1（BEGIN RSA PRIVATE KEY）与
@@ -333,25 +278,21 @@ public class RsaKey {
         byte[] der = RsaKey.PemToDer(pem, derLen);
         if (der == null || derLen[0] < 8) { return null; }
         List<int> c = new List<int>(); c.Add(0);
-        int outerEnd = RsaKey.Enter(der, c, 48);
-        if (outerEnd < 0 || outerEnd != derLen[0]) { return null; }
+        if (RsaKey.Enter(der, c, 48) < 0) { return null; }
         List<int> tmp = new List<int>(); tmp.Add(0);
         byte[] version = RsaKey.ReadIntegerSafe(der, c, tmp);
-        if (version == null || c[0] >= outerEnd) { return null; }
+        if (version == null || c[0] >= der.Length) { return null; }
         if ((der[c[0]] & 255) == 2) {
             return RsaKey.ParsePkcs1Private(der, 0);
         }
-        // PKCS#8 PrivateKeyInfo：version 必须为 0，AlgorithmIdentifier 必须为 rsaEncryption
-        if (tmp[0] != 1 || (version[0] & 255) != 0) { return null; }
         if ((der[c[0]] & 255) != 48) { return null; }
         int algorithmEnd = RsaKey.Enter(der, c, 48);
-        if (algorithmEnd < 0 || algorithmEnd >= outerEnd) { return null; }
-        if (!RsaKey.IsRsaAlgorithmIdentifier(der, c[0], algorithmEnd)) { return null; }
+        if (algorithmEnd < 0 || algorithmEnd >= der.Length) { return null; }
         c[0] = algorithmEnd;
         if ((der[c[0]] & 255) != 4) { return null; }
         c[0] = c[0] + 1;
         int innerLen = RsaKey.ReadLength(der, c);
-        if (innerLen < 8 || innerLen > outerEnd - c[0]) { return null; }
+        if (innerLen < 8 || c[0] + innerLen > der.Length) { return null; }
         return RsaKey.ParsePkcs1Private(der, c[0]);
     }
 

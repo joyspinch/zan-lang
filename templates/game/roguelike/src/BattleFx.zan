@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+// 战斗演出的时间线：把规则层记下的 BattleEvent 排成一串带延时的小动画。
+//
+// 界面每次操作都会重建控件树，所以演出状态不能放在控件里——它放在这里，
+// 由 Program 持有、跨重建存活；BattleStage（场景）和 FxLayer（最上层）只是
+// 每帧按当前时间读它来画。规则层完全不知道它存在，回放不受影响。
+//
+// 一条演出（FxItem）：kind + 作用方 who（0 攀登者 / 1 敌人）+ 起止时间 + 数值/文字/颜色。
+//   num 飘字 · shake 抖动 · flash 受击闪白 · shield 护盾弹出 · slash 斩痕
+//   lunge 扑击（攻击方前冲）· aura 增减益光尘 · fly 飞牌（手牌 → 目标）
+public class BattleFx {
+    public List<FxItem> items;
+    // 场景每帧登记的两位角色中心（窗口坐标），飞牌与飘字据此定位。
+    public int heroX;
+    public int heroY;
+    public int enemyX;
+    public int enemyY;
+
+    public BattleFx() {
+        this.items = new List<FxItem>();
+    }
+
+    public static int Now() { return Window.GetTickMs(); }
+
+    public FxItem Add(string kind, int who, int delay, int dur) {
+        FxItem it = new FxItem();
+        it.kind = kind;
+        it.who = who;
+        it.start = BattleFx.Now() + delay;
+        it.dur = dur;
+        it.text = "";
+        this.items.Add(it);
+        return it;
+    }
+
+    // 飘字：text 为空时显示数值。
+    public void Num(int who, int delay, string text, int color, int size) {
+        FxItem it = this.Add("num", who, delay, 1000);
+        it.text = text;
+        it.color = color;
+        it.value = size;
+        // 同一时刻的多个飘字左右错开，不叠成一团。
+        int same = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            FxItem o = this.items[i];
+            if (o != it && o.kind == "num" && o.who == who && o.start > it.start - 160 && o.start < it.start + 160) { same = same + 1; }
+        }
+        it.extra = same * 34;
+    }
+
+    // 飞牌：从手牌原位置飞向目标（who），落点时间 = delay + dur。
+    public void Fly(string name, string category, int x, int y, int w, int h, int who, int cost) {
+        FxItem it = this.Add("fly", who, 0, 280);
+        it.text = name;
+        it.text2 = category;
+        it.x = x;
+        it.y = y;
+        it.w = w;
+        it.h = h;
+        it.value = cost;
+    }
+
+    // 把一次操作产生的事件排进时间线；start 是第一件事的延时（飞牌落点）。
+    public void Feed(List<BattleEvent> events, int start) {
+        int t = start;
+        for (int i = 0; i < events.Count; i = i + 1) {
+            BattleEvent e = events[i];
+            string k = e.kind;
+            int w = e.who;
+            if (k == "hit") {
+                int foe = 1 - w;
+                if (w == 0) { this.Add("lunge", foe, t, 300); t = t + 110; }
+                this.Add("slash", w, t, 260);
+                if (e.amount > 0) {
+                    this.Add("shake", w, t, 340).value = e.amount >= 15 ? 16 : (e.amount >= 8 ? 11 : 7);
+                    this.Add("flash", w, t, 220);
+                    this.Num(w, t, "-" + e.amount, (int)0xFFFF5A44, e.amount >= 15 ? 46 : 38);
+                }
+                if (e.extra > 0) {
+                    this.Add("shield", w, t, 420).value = 1;
+                    if (e.amount == 0) { this.Num(w, t, "格挡", (int)0xFF8FD0FF, 28); }
+                }
+                t = t + 230;
+            } else if (k == "block") {
+                this.Add("shield", w, t, 520);
+                this.Num(w, t, "+" + e.amount + " 格挡", (int)0xFF8FD0FF, 26);
+                t = t + 120;
+            } else if (k == "poison") {
+                this.Add("aura", w, t, 700).color = (int)0xFF8CFF5A;
+                this.Num(w, t, "-" + e.amount, (int)0xFF9CFF6A, 34);
+                t = t + 200;
+            } else if (k == "heal") {
+                if (e.amount > 0) {
+                    this.Add("aura", w, t, 700).color = (int)0xFF7AF0A0;
+                    this.Num(w, t, "+" + e.amount, (int)0xFF7AF0A0, 32);
+                    t = t + 120;
+                }
+            } else if (k == "buff") {
+                this.Add("aura", w, t, 800).color = (int)0xFFFFCF5A;
+                this.Num(w, t, e.text + " +" + e.amount, (int)0xFFFFD27A, 24);
+                t = t + 120;
+            } else if (k == "debuff") {
+                this.Add("aura", w, t, 800).color = (int)0xFFC08AFF;
+                this.Num(w, t, e.text + " " + e.amount, (int)0xFFD2A8FF, 24);
+                t = t + 120;
+            } else if (k == "thorns") {
+                this.Add("shake", w, t, 220).value = 5;
+                this.Num(w, t, "-" + e.amount, (int)0xFFFFA040, 28);
+            } else if (k == "lose") {
+                this.Add("flash", w, t, 200);
+                this.Num(w, t, "-" + e.amount, (int)0xFFFF5A44, 30);
+                t = t + 100;
+            }
+        }
+    }
+
+    // 某人当前的抖动位移（像素，衰减正弦）。
+    public int ShakeX(int who, int now) {
+        int dx = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            FxItem it = this.items[i];
+            if (it.kind != "shake" || it.who != who) { continue; }
+            double t = it.T(now);
+            if (t <= 0.0 || t >= 1.0) { continue; }
+            dx = dx + (int)(Math.Sin(t * 37.0) * it.value * (1.0 - t));
+        }
+        return dx;
+    }
+
+    // 扑击位移：前冲再收回（攻击方朝对手方向）。
+    public int LungeX(int who, int now) {
+        int dx = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            FxItem it = this.items[i];
+            if (it.kind != "lunge" || it.who != who) { continue; }
+            double t = it.T(now);
+            if (t <= 0.0 || t >= 1.0) { continue; }
+            double k = t < 0.35 ? t / 0.35 : (1.0 - t) / 0.65;
+            dx = dx + (int)(k * k * 46.0) * (who == 0 ? 1 : -1);
+        }
+        return dx;
+    }
+
+    // 闪白强度 0..1000。
+    public int Flash(int who, int now) {
+        int best = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            FxItem it = this.items[i];
+            if (it.kind != "flash" || it.who != who) { continue; }
+            double t = it.T(now);
+            if (t <= 0.0 || t >= 1.0) { continue; }
+            int v = (int)((1.0 - t) * 900.0);
+            if (v > best) { best = v; }
+        }
+        return best;
+    }
+
+    // 还有没播完的演出（含延时中的）。
+    public bool Busy(int now) {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (now < this.items[i].start + this.items[i].dur) { return true; }
+        }
+        return false;
+    }
+
+    // 丢掉播完的。
+    public void Prune(int now) {
+        for (int i = this.items.Count - 1; i >= 0; i = i - 1) {
+            if (now >= this.items[i].start + this.items[i].dur) { this.items.RemoveAt(i); }
+        }
+    }
+
+    public void Clear() { this.items.Clear(); }
+}

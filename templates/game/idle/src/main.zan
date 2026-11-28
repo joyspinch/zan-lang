@@ -7,15 +7,24 @@ using Gui.Animation;
 using Game.Foundation;
 using Game.Idle;
 
+// 放置矿工：点地心矿晶开采金币 → 买矿机自动挖 → 里程碑翻倍 → 金矿石 / 熔炉超载冲刺 →
+// 攒够矿脉深度做地心转生，换永久加成的地心晶，再来一轮更快的。
+//
+// 规则全在 Model/MineEconomy（与无头回放 IdleSim 同一份）；这里只有界面、反馈、音效、
+// 存档与离线结算。界面全是标准 Gui 控件 + MineSkin 语义类；只有矿洞场景（MineCoreView）
+// 是自绘的世界画面。
 public class Program {
-    // 离线收益上限（小时）与自动存档间隔（毫秒）。
+    // 离线收益上限（小时）、自动存档间隔与动画帧间隔（毫秒）。
     const double OfflineCapHours = 8.0;
     const int AutosaveMs = 20000;
+    const int AnimMs = 33;
 
     Form form;
     App app;
-    IdleState state;
+    MineEconomy eco;
     ParticleSystem particles;
+    FloatingTextManager fct;
+    Random uiRnd;
 
     // 外壳：玩家档案（统计/静音）、经济存档、音效
     GameProfile profile;
@@ -25,44 +34,42 @@ public class Program {
     bool muted;
     bool firstSession;
 
-    // 界面控件
+    // 顶栏
     Label lblGold;
     Label lblDps;
-    Label lblClickPower;
-    Label lblStatus;
+    Label lblCrystals;
+    Label lblCrystalSub;
+    Button btnAch;
     Button btnMute;
-    List<BuildingUiRow> buildingUiRows;
-    Progress autoMineBar;
+    // 左栏：矿洞与操作
     MineCoreView coreView;
+    Button btnMine;
+    Button btnBoost;
+    Label buffOd;
+    Label buffRush;
+    Label buffIdle;
+    Label lblDepth;
+    Progress depthBar;
+    Button btnPrestige;
+    Label lblStatus;
+    // 右栏：矿机
+    List<BuildingCard> cards;
+    List<Button> modeButtons;
+    MineDialogs dialogs;
 
-    // 统计 / 离线收益弹窗（标准 Modal 控件）
-    Modal statsModal;
-    Label statGold;
-    Label statDps;
-    Label statLifetime;
-    Label statBestDps;
-    Label statClicks;
-    Label statSessions;
-    Label statSave;
-    Modal welcomeModal;
-    Label welcomeGold;
-    Label welcomeTime;
-    bool welcomePending;
-
-    // 核心反应炉动画与打击动效系统
-    double coreScale = 1.0;
-    Tween coreTween;
-    double autoProgress = 0.0;
-    SquashAndStretch coreJuice;
-    FloatingTextManager fctManager;
-
-    // 实时结算 / 存档 / 统计同步的游标
+    // 游标
     int lastTickMs;
+    int lastAnimMs;
     int lastAudioMs;
     double syncedEarned;
     long syncedClicks;
-    double nextMilestone;
     int statusUntilMs;
+    bool welcomePending;
+    double offlineGold;
+    long offlineElapsed;
+    long offlineCapped;
+    string lastBoostText;
+    bool lastPrestigeReady;
 
     static void Main() {
         Program p = new Program();
@@ -72,80 +79,74 @@ public class Program {
     void Run() {
         form = Form.CreateDark("放置矿工 · 地心开采 (Idle Miner)", 1024, 640);
         app = form.GetApp();
-        app.UseSkin("graphite");
+        // 游戏自己的皮肤（UseSkin 会盖掉 UseCss，所以不再叠桌面皮肤）
+        app.UseCss(MineSkin.Css());
         UiDriver.Enable(app);
-        Canvas.SetBackend(1);  // 启用 GL 硬件加速后端
-
-        // 绑定 AnimationTimeline，按需驱动出帧
+        Canvas.SetBackend(1);  // GL 硬件加速后端
         AnimationTimeline.Shared.BindApp(app);
 
-        state = new IdleState(MineCatalog.Create());
+        uiRnd = new Random();
+        eco = new MineEconomy(DateTime.GetCurrentUnixMilliseconds());
         particles = ParticleSystem.Create();
-        coreJuice = SquashAndStretch.Create();
-        fctManager = FloatingTextManager.Create(64);
-        buildingUiRows = new List<BuildingUiRow>();
+        fct = FloatingTextManager.Create(64);
+        cards = new List<BuildingCard>();
+        modeButtons = new List<Button>();
+        lastBoostText = "";
 
         OpenShell();
-        long offlineGold = LoadEconomy();
+        LoadEconomy();
+        ApplyDebugCheat();
 
+        dialogs = new MineDialogs();
         BuildUi();
-        BuildStatsModal();
-        BuildWelcomeModal(offlineGold);
-        UpdateLabels();
+        WireDialogs();
+        if (welcomePending) {
+            dialogs.SetWelcome(offlineGold, offlineElapsed, offlineCapped, OfflineCapHours);
+        }
+        // 读档补判出来的成就不庆祝，直接排空
+        int arg;
+        while (eco.PollEvent(out arg) != 0) { }
+        RefreshAll();
 
         lastTickMs = Window.GetTickMs();
+        lastAnimMs = lastTickMs;
         lastAudioMs = lastTickMs;
 
-        // 核心游戏逻辑时钟：按真实流逝时间结算（窗口失焦/最小化时定时器可能被
-        // 降频，按实际毫秒补算才不少给钱；放置游戏不暂停）。
+        // 经济时钟：按真实流逝时间结算（窗口失焦/最小化时定时器可能被降频，按实际毫秒
+        // 补算才不少给钱；放置游戏不暂停）。
         form.Every(100, () => {
             int now = Window.GetTickMs();
             double dt = (double)(now - lastTickMs) / 1000.0;
             lastTickMs = now;
             if (dt < 0.0) { dt = 0.0; }
             if (dt > 60.0) { dt = 60.0; }
-            state.Tick(dt);
-
-            // 步进打击物理振荡与飘字池
-            coreJuice.Update(0.1);
-            fctManager.Update(0.1);
-
-            // 更新自动采矿进度条
-            autoProgress = autoProgress + 0.1;
-            if (autoProgress >= 1.0) {
-                autoProgress = 0.0;
-            }
-            if (autoMineBar != null) {
-                autoMineBar.SetPercent((int)(autoProgress * 100.0));
-            }
-
-            // 更新粒子与重绘
-            if (particles.HasActiveParticles || fctManager.ActiveCount > 0) {
-                if (particles.HasActiveParticles) {
-                    particles.Update(0.1);
-                }
-                app.RequestRedraw();
-            }
-
-            CheckMilestone();
-            UpdateLabels();
+            eco.Step(dt);
+            DrainEvents();
+            RefreshAll();
         });
 
-        // 自动存档
+        // 动画时钟：矿晶旋转、辉光脉动、粒子与飘字（~30fps）。
+        form.Every(AnimMs, () => {
+            int now = Window.GetTickMs();
+            double dt = (double)(now - lastAnimMs) / 1000.0;
+            lastAnimMs = now;
+            if (dt <= 0.0) { return; }
+            if (dt > 0.25) { dt = 0.25; }
+            coreView.Animate(dt);
+            particles.Update(dt);
+            fct.Update(dt);
+            app.RequestRedraw();
+        });
+
         form.Every(AutosaveMs, () => { Persist(); });
-
         form.FrameHook(() => { OnFrame(); });
-        // M 静音：没被控件消费的按键（焦点落空或在按钮上）都走这里。
-        app.OnUnhandledKey((int code) => { if (code == 77) { ToggleMute(); } });
-        // 失焦：顺手存一档（继续挂机收益，不暂停）。
+        app.OnUnhandledKey((int code) => { OnKey(code); });
         app.OnWindowBlur(() => { Persist(); });
-
         form.OnExit(() => {
             Persist();
             particles.Dispose();
             sfx.Dispose();
         });
-
         form.Run();
     }
 
@@ -159,10 +160,13 @@ public class Program {
 
         bus = new AudioBus();
         sfx = new SfxBank(bus);
-        // 本游戏的声音：轻敲矿石（很轻、限频）、买到矿机（金币）、钱不够（错误）、
-        // 里程碑（升级音）、离线收益到账（成功）、普通按钮（选择）。
+        // 本游戏的声音：敲矿（轻、限频）、金币（买到矿机）、钱不够、里程碑（升级音）、
+        // 成就 / 离线到账（成功）、金矿石（高亮叮）、超载点火（锯齿上扫）、转生（长上扬）。
         sfx.AddSynth("ore", SfxPresets.Hit().WithGain(0.10));
         sfx.AddSynth("coin", SfxPresets.Coin().WithSweep(1180.0, 1980.0));
+        sfx.AddSynth("golden", SfxPresets.Coin().WithSweep(1600.0, 2900.0).WithDuration(0.16));
+        sfx.AddSynth("ignite", SfxPresets.Launch().WithSweep(120.0, 520.0).WithDuration(0.30));
+        sfx.AddSynth("rebirth", SfxPresets.PowerUp().WithSweep(220.0, 1760.0).WithDuration(0.6));
         sfx.AddPresets(new string[] { "error", "powerup", "success", "select" });
         sfx.Warm();
         muted = profile.Flag("muted", false);
@@ -171,50 +175,64 @@ public class Program {
         save = IdleSaveGame.Open();
     }
 
-    // 读档并结算离线收益，返回本次离线入账的金币（没有则 0）。
-    long LoadEconomy() {
-        long savedAt = save.Load(state);
-        syncedEarned = state.totalEarned;
-        syncedClicks = state.clicks;
-        long offline = 0;
-        if (savedAt > 0) {
-            OfflineRewardCalculator calc = OfflineRewardCalculator.Create(OfflineCapHours, state.TotalDps);
-            long elapsedSec;
-            long cappedSec;
-            double rewardGold;
-            calc.CalculateReward(savedAt, IdleSaveGame.NowSec(), out elapsedSec, out cappedSec, out rewardGold);
-            if (cappedSec >= 30 && rewardGold >= 1.0) {
-                state.AddGold(rewardGold);
-                offline = ClampLong(rewardGold);
-                welcomePending = true;
-                offlineElapsed = elapsedSec;
-                offlineCapped = cappedSec;
-            }
+    // 读档并结算离线收益（按稳态秒产，不含临时增益）。
+    void LoadEconomy() {
+        long savedAt = save.Load(eco);
+        syncedEarned = eco.lifetimeEarned;
+        syncedClicks = eco.Clicks;
+        if (savedAt <= 0) { return; }
+        OfflineRewardCalculator calc = OfflineRewardCalculator.Create(OfflineCapHours, eco.SteadyDps);
+        long elapsedSec;
+        long cappedSec;
+        double rewardGold;
+        calc.CalculateReward(savedAt, IdleSaveGame.NowSec(), out elapsedSec, out cappedSec, out rewardGold);
+        if (cappedSec >= 30 && rewardGold >= 1.0) {
+            eco.AddGold(rewardGold);
+            offlineGold = rewardGold;
+            offlineElapsed = elapsedSec;
+            offlineCapped = cappedSec;
+            welcomePending = true;
         }
-        // 已越过的里程碑不重复庆祝
-        nextMilestone = 1000.0;
-        while (nextMilestone <= state.totalEarned) { nextMilestone = nextMilestone * 10.0; }
-        return offline;
     }
-    long offlineElapsed;
-    long offlineCapped;
 
-    // 落盘：经济存档 + 统计（累计开采、点击、最高秒产）。
+    // 调试捷径（默认关）：IDLE_DEBUG=rich 直接给到可转生的本轮累计；=golden 让金矿石 2 秒后出现；
+    // =boost 立即点燃超载。只供截图/验收走到后期状态，不进存档以外的任何东西。
+    void ApplyDebugCheat() {
+        string mode = Environment.GetEnvironmentVariable("IDLE_DEBUG");
+        if (mode == null || mode == "") { return; }
+        if (mode.Contains("rich")) {
+            eco.AddGold(2600000000.0);
+            int[] lv = new int[] { 120, 105, 90, 72, 55, 38, 22, 6 };
+            for (int i = 0; i < lv.Length && i < eco.Buildings.Count; i = i + 1) { eco.Buildings[i].level = lv[i]; }
+            if (eco.Clicks == 0) { eco.Mine(); }
+            eco.CheckAchievements();
+        }
+        if (mode.Contains("golden")) {
+            if (eco.Clicks == 0) { eco.Mine(); }
+            eco.goldenTimer = 2.0;
+        }
+        if (mode.Contains("boost")) {
+            eco.overdriveCooldown = 0.0;
+            eco.ActivateOverdrive();
+        }
+    }
+
+    // 落盘：经济存档 + 档案统计（终身开采、点击、最高秒产、转生）。
     void Persist() {
-        long nowSec = IdleSaveGame.NowSec();
-        save.Save(state, nowSec);
-        double earnedDelta = state.totalEarned - syncedEarned;
+        save.Save(eco, IdleSaveGame.NowSec());
+        double earnedDelta = eco.lifetimeEarned - syncedEarned;
         if (earnedDelta >= 1.0) {
             long add = ClampLong(earnedDelta);
             profile.Add("mined", add);
             syncedEarned = syncedEarned + (double)add;
         }
-        if (state.clicks > syncedClicks) {
-            profile.Add("clicks", state.clicks - syncedClicks);
-            syncedClicks = state.clicks;
+        if (eco.Clicks > syncedClicks) {
+            profile.Add("clicks", eco.Clicks - syncedClicks);
+            syncedClicks = eco.Clicks;
         }
+        profile.SubmitBest("crystals", eco.crystals);
         // SubmitBest 刷新纪录时自己会落盘；否则这里补一次
-        if (!profile.SubmitBest("bestGps", ClampLong(state.TotalDps))) {
+        if (!profile.SubmitBest("bestGps", ClampLong(eco.SteadyDps))) {
             profile.Save();
         }
     }
@@ -225,411 +243,549 @@ public class Program {
         muted = !muted;
         bus.SetSfxMuted(muted);
         profile.SetFlag("muted", muted);
-        if (btnMute != null) { btnMute.Text = muted ? "🔇 静音 (M)" : "🔊 音效 (M)"; }
-        ShowStatus(muted ? "音效已关闭（按 M 恢复）" : "音效已开启");
+        btnMute.Text = muted ? "🔇" : "🔊";
+        ShowStatus(muted ? "音效已关闭（按 M 恢复）" : "音效已开启", false);
         if (!muted) { Play("select"); }
-        app.RequestRedraw();
     }
 
-    // 每圈主循环：推进音效冷却、读 M 键、失焦即存档、首帧弹离线收益。
+    void OnKey(int code) {
+        if (code == 77) { ToggleMute(); }                 // M
+        else if (code == 66) { TryOverdrive(); }          // B
+        else if (code == 49) { SetMode(1); }              // 1
+        else if (code == 50) { SetMode(10); }             // 2
+        else if (code == 51) { SetMode(0); }              // 3
+        else if (code == 71 && eco.GoldenVisible) {       // G：键盘也能敲金矿石
+            CollectGolden();
+        }
+    }
+
+    // 每圈主循环：推进音效冷却、首帧弹离线收益、状态条过期、探针。
     void OnFrame() {
         int now = Window.GetTickMs();
         int dms = now - lastAudioMs;
         lastAudioMs = now;
         if (dms > 0) { bus.Update(dms); }
 
-        if (welcomePending && welcomeModal != null) {
+        if (welcomePending) {
             welcomePending = false;
-            welcomeModal.Show();
-            app.overlayHost.Push(app, null, welcomeModal, true);
+            OpenModal(dialogs.welcome);
             Play("success");
         }
-
         if (statusUntilMs != 0 && now >= statusUntilMs) {
             statusUntilMs = 0;
             lblStatus.Text = DefaultStatus();
-            app.RequestRedraw();
+            lblStatus.SwitchClass("mn-status-hot", false);
         }
         PublishProbes();
     }
 
     string DefaultStatus() {
-        if (firstSession && state.TotalDps <= 0.0) {
-            return "新手提示：点矿晶开采金币 → 右侧升级矿机，之后关掉游戏也在挖（离线最多 8 小时）。M 键静音。";
+        if (firstSession && eco.TotalLevels == 0) {
+            return "新手提示：点矿晶开采金币 → 点右边的矿机卡购买 → 关掉游戏也在挖（离线最多 8 小时）。";
         }
-        return "每 20 秒自动存档 · 离线收益最多 8 小时 · M 键静音";
+        if (eco.CanPrestige) { return "◆ 矿脉已够深：可以地心转生，换永久加成的地心晶了。"; }
+        return "里程碑 Lv25/50/100 产出翻倍 · B 超载 · 1/2/3 购买数量 · M 静音";
     }
 
-    void ShowStatus(string text) {
-        if (lblStatus == null) { return; }
+    void ShowStatus(string text, bool hot) {
         lblStatus.Text = text;
-        statusUntilMs = Window.GetTickMs() + 3000;
+        lblStatus.SwitchClass("mn-status-hot", hot);
+        statusUntilMs = Window.GetTickMs() + (hot ? 4000 : 3000);
         if (statusUntilMs == 0) { statusUntilMs = 1; }
     }
 
-    void CheckMilestone() {
-        if (state.totalEarned < nextMilestone) { return; }
-        double reached = nextMilestone;
-        while (nextMilestone <= state.totalEarned) { nextMilestone = nextMilestone * 10.0; }
-        Play("powerup");
-        ShowStatus("🏆 里程碑：累计开采 " + FormatNumber(reached) + " 金币！");
-        if (coreView != null) {
-            fctManager.SpawnGold((double)(coreView.bx + coreView.bw / 2 - 30), (double)(coreView.by + 30), FormatNumber(reached) + "!");
-        }
+    void OpenModal(Modal m) {
+        m.Show();
+        app.overlayHost.Push(app, null, m, true);
+        app.RequestRedraw();
     }
 
     void PublishProbes() {
         if (!UiDriver.Active()) { return; }
-        UiDriver.SetProbe("idle.gold", Convert.ToString(ClampLong(state.gold)));
+        UiDriver.SetProbe("idle.gold", Convert.ToString(ClampLong(eco.Gold)));
         UiDriver.SetProbe("idle.muted", muted ? "1" : "0");
         UiDriver.SetProbe("idle.levels", LevelsText());
         UiDriver.SetProbe("idle.persistent", save.Persistent() ? "1" : "0");
-        UiDriver.SetProbe("idle.welcome", welcomeModal != null && welcomeModal.IsOpen() ? "1" : "0");
+        UiDriver.SetProbe("idle.welcome", dialogs.welcome.IsOpen() ? "1" : "0");
+        UiDriver.SetProbe("idle.crystals", Convert.ToString(eco.crystals));
+        UiDriver.SetProbe("idle.prestiges", Convert.ToString(eco.prestiges));
+        UiDriver.SetProbe("idle.ach", Convert.ToString(eco.AchievementCount));
+        UiDriver.SetProbe("idle.mode", Convert.ToString(eco.buyMode));
+        UiDriver.SetProbe("idle.golden", eco.GoldenVisible ? "1" : "0");
+        UiDriver.SetProbe("idle.goldenClicks", Convert.ToString(eco.goldenClicks));
+        UiDriver.SetProbe("idle.overdrive", eco.OverdriveActive ? "1" : "0");
+        UiDriver.SetProbe("idle.format", Convert.ToString(save.LoadedFormat()));
     }
 
     string LevelsText() {
         string s = "";
-        for (int i = 0; i < state.buildings.Count; i = i + 1) {
+        for (int i = 0; i < eco.Buildings.Count; i = i + 1) {
             if (i > 0) { s = s + ","; }
-            s = s + Convert.ToString(state.buildings[i].level);
+            s = s + Convert.ToString(eco.Buildings[i].level);
         }
         return s;
     }
 
     // ---- 界面 -----------------------------------------------------------
 
-    void BuildUi() {
-        Panel root = Panel.Column();
-        root.Pad(16);
-        root.Gap(12);
-        form.Add(root);
-
-        // 1. 顶部资源栏
-        Panel topBar = Panel.Row();
-        topBar.Class = "card";
-        topBar.Pad(12);
-        topBar.Gap(20);
-        topBar.Prefer(0, 64);
-        root.With(topBar);
-
-        Label title = new Label("⚒ 放置矿工");
-        title.Class = "title strong";
-        topBar.With(title);
-
-        lblGold = new Label("金币: 0");
-        lblGold.Class = "large strong yellow";
-        topBar.With(lblGold);
-
-        lblDps = new Label("秒产: +0/s");
-        lblDps.Class = "medium green";
-        topBar.With(lblDps);
-
-        lblClickPower = new Label("单次挖掘: +1");
-        lblClickPower.Class = "medium cyan";
-        topBar.With(lblClickPower);
-
-        Button btnStats = new Button("📊 采矿统计");
-        btnStats.Class = "secondary";
-        btnStats.OnClick(() => {
-            Play("select");
-            OpenStats();
-        });
-        topBar.With(btnStats);
-
-        btnMute = new Button(muted ? "🔇 静音 (M)" : "🔊 音效 (M)");
-        btnMute.Class = "secondary";
-        btnMute.Tip = "开关音效（快捷键 M）";
-        btnMute.OnClick(() => {
-            ToggleMute();
-        });
-        topBar.With(btnMute);
-
-        // 2. 主体区（双栏：左侧开采核心，右侧建筑生产线）
-        Panel mainRow = Panel.Row();
-        mainRow.Gap(16);
-        mainRow.Grow();
-        root.With(mainRow);
-
-        // 左栏：矿石操作台
-        Panel leftCol = Panel.Column();
-        leftCol.Class = "card";
-        leftCol.Pad(16);
-        leftCol.Gap(14);
-        leftCol.Prefer(340, 0);
-        mainRow.With(leftCol);
-
-        Label coreTitle = new Label("地心矿晶核心");
-        coreTitle.Class = "title medium";
-        leftCol.With(coreTitle);
-
-        // 自定义矿石核心视图
-        coreView = new MineCoreView(this);
-        coreView.Prefer(300, 200);
-        coreView.OnClick(() => {
-            DoMine(coreView.bx + coreView.bw / 2, coreView.by + coreView.bh / 2);
-        });
-        leftCol.With(coreView);
-
-        Button btnMine = new Button("🔨 立即开采");
-        btnMine.Class = "primary large";
-        btnMine.Prefer(0, 48);
-        btnMine.OnClick(() => {
-            DoMine(coreView.bx + coreView.bw / 2, coreView.by + coreView.bh / 2);
-        });
-        leftCol.With(btnMine);
-
-        Label lblAuto = new Label("自动开采循环");
-        lblAuto.Class = "secondary small";
-        leftCol.With(lblAuto);
-
-        autoMineBar = new Progress(0, 1);
-        autoMineBar.SetPercent(0);
-        autoMineBar.Prefer(0, 16);
-        leftCol.With(autoMineBar);
-
-        lblStatus = new Label(DefaultStatus());
-        lblStatus.Class = "secondary small";
-        lblStatus.SetWrap(true);
-        leftCol.With(lblStatus);
-
-        // 右栏：工业建筑列表
-        Panel rightCol = Panel.Column();
-        rightCol.Class = "card";
-        rightCol.Pad(12);
-        rightCol.Gap(8);
-        rightCol.Grow();
-        mainRow.With(rightCol);
-
-        Label listTitle = new Label("自动化生产矩阵");
-        listTitle.Class = "title medium";
-        rightCol.With(listTitle);
-
-        List<IdleBuilding> list = state.Buildings;
-        for (int i = 0; i < list.Count; i = i + 1) {
-            IdleBuilding b = list[i];
-            int idx = i;
-
-            Panel item = Panel.Row();
-            item.Class = "subcard";
-            item.Pad(8);
-            item.Gap(12);
-            item.Prefer(0, 62);
-            rightCol.With(item);
-
-            Panel infoCol = Panel.Column();
-            infoCol.Gap(2);
-            infoCol.Grow();
-            item.With(infoCol);
-
-            Label nameLbl = new Label(b.Name);
-            nameLbl.Class = "strong";
-            infoCol.With(nameLbl);
-
-            Label descLbl = new Label(b.Desc);
-            descLbl.Class = "secondary tiny";
-            infoCol.With(descLbl);
-
-            Label lvLbl = new Label("Lv." + Convert.ToString(b.Level));
-            lvLbl.Class = "cyan strong";
-            item.With(lvLbl);
-
-            Label costLbl = new Label("💰 " + Convert.ToString(b.Cost));
-            costLbl.Class = "yellow";
-            item.With(costLbl);
-
-            // 买不起时不禁用按钮：点下去要有"钱不够"的反馈，而不是毫无反应。
-            Button btnBuy = new Button("升级");
-            btnBuy.Class = "primary";
-            btnBuy.Prefer(70, 36);
-            btnBuy.OnClick(() => {
-                TryUpgrade(idx);
-            });
-            item.With(btnBuy);
-            buildingUiRows.Add(new BuildingUiRow(btnBuy, lvLbl, costLbl));
-        }
+    static Panel Col(string cls) {
+        Panel p = Panel.Column();
+        if (cls != "") { p.Class = cls; }
+        return p;
     }
 
-    void BuildStatsModal() {
-        statsModal = new Modal("📊 采矿统计");
-        statsModal.Width(460);
-        Panel body = Panel.Column();
-        body.Gap(8);
-        statGold = StatLine(body);
-        statDps = StatLine(body);
-        statBestDps = StatLine(body);
-        statLifetime = StatLine(body);
-        statClicks = StatLine(body);
-        statSessions = StatLine(body);
-        statSave = StatLine(body);
-        statSave.Class = "secondary small";
-        statSave.SetWrap(true);
-        statsModal.Content(body);
-        statsModal.OkText("关闭");
-        statsModal.Actions(new List<Control> { statsModal.okBtn });
-        statsModal.OnOk(() => { statsModal.Hide(); });
+    static Panel Row(string cls) {
+        Panel p = Panel.Row();
+        if (cls != "") { p.Class = cls; }
+        return p;
     }
 
-    Label StatLine(Panel into) {
-        Label l = new Label("");
-        l.Class = "medium";
-        into.With(l);
+    static Label Txt(string text, string cls) {
+        Label l = new Label(text);
+        l.Class = cls;
         return l;
     }
 
-    void OpenStats() {
-        // 打开前先把统计同步进档案，面板上的"累计"才是最新的
-        Persist();
-        statGold.Text = "当前金币：" + FormatNumber(state.Gold);
-        statDps.Text = "当前秒产：+" + FormatNumber(state.TotalDps) + "/s";
-        statBestDps.Text = "最高秒产：+" + FormatNumber((double)profile.Best("bestGps")) + "/s";
-        statLifetime.Text = "累计开采：" + FormatNumber((double)profile.Counter("mined")) + " 金币";
-        statClicks.Text = "手动开采：" + Convert.ToString(profile.Counter("clicks")) + " 次";
-        statSessions.Text = "上线次数：" + Convert.ToString(profile.Counter("sessions"));
-        statSave.Text = save.Persistent()
-            ? "存档：" + save.Directory() + "（每 20 秒、失焦与退出时自动保存）"
-            : "存档：未找到用户数据目录，本次进度不会保存";
-        statsModal.Show();
-        app.overlayHost.Push(app, null, statsModal, true);
-        app.RequestRedraw();
+    void BuildUi() {
+        Panel root = Col("mn-root");
+        root.Pad(14);
+        root.Gap(12);
+        form.Add(root);
+        root.With(BuildHeader());
+
+        Panel body = Row("mn-fill");
+        body.Gap(12);
+        root.With(body);
+        body.With(BuildMinePanel());
+        body.With(BuildBuildingPanel());
     }
 
-    void BuildWelcomeModal(long offlineGold) {
-        welcomeModal = new Modal("⛏ 欢迎回来！");
-        welcomeModal.Width(420);
-        Panel body = Panel.Column();
-        body.Gap(10);
-        Label lead = new Label("你不在的时候，矿机一直在挖：");
-        lead.Class = "secondary";
-        body.With(lead);
-        welcomeGold = new Label("+" + FormatNumber((double)offlineGold) + " 金币");
-        welcomeGold.Class = "title strong yellow";
-        body.With(welcomeGold);
-        string away = "离线 " + OfflineRewardCalculator.FormatDuration(offlineElapsed);
-        if (offlineElapsed > offlineCapped) {
-            away = away + "（收益按上限 " + OfflineRewardCalculator.FormatDuration(offlineCapped) + " 结算）";
+    // 顶栏：标题 · 大号金币 · 秒产 · 地心晶 · 成就 / 统计 / 静音。
+    Panel BuildHeader() {
+        Panel bar = Row("mn-header");
+        bar.Pad(10);
+        bar.Gap(22);
+        bar.Prefer(0, 70);
+
+        Panel logo = Col("mn-stat");
+        logo.With(Txt("⚒ 放置矿工", "mn-logo"));
+        logo.With(Txt("地心开采 · IDLE MINER", "mn-logo-sub"));
+        bar.With(logo);
+
+        Panel gold = Col("mn-stat");
+        gold.With(Txt("金币", "mn-cap"));
+        lblGold = Txt("0", "mn-gold");
+        lblGold.name = "gold";
+        gold.With(lblGold);
+        bar.With(gold);
+
+        Panel dps = Col("mn-stat");
+        dps.With(Txt("每秒产出", "mn-cap"));
+        lblDps = Txt("+0/秒", "mn-rate");
+        dps.With(lblDps);
+        bar.With(dps);
+
+        bar.With(Col("mn-spacer"));
+
+        Panel chip = Row("mn-crystal-chip");
+        chip.With(Txt("◆", "mn-crystal"));
+        Panel cc = Col("mn-stat");
+        lblCrystals = Txt("0 地心晶", "mn-crystal");
+        cc.With(lblCrystals);
+        lblCrystalSub = Txt("全产出 +0%", "mn-crystal-sub");
+        cc.With(lblCrystalSub);
+        chip.With(cc);
+        chip.Tip = "地心晶：每枚让全部产出永久 +10%；成就每个再 +2%。转生不会清零。";
+        bar.With(chip);
+
+        Panel chips = Row("mn-mid");
+        chips.Gap(6);
+        btnAch = new Button("🏆 0/16");
+        btnAch.Class = "mn-chip";
+        btnAch.name = "achievements";
+        btnAch.Tip = "成就墙";
+        btnAch.OnClick(() => {
+            Play("select");
+            dialogs.RefreshAchievements(eco);
+            OpenModal(dialogs.achievements);
+        });
+        chips.With(btnAch);
+        Button btnStats = new Button("📊 统计");
+        btnStats.Class = "mn-chip";
+        btnStats.name = "stats";
+        btnStats.OnClick(() => {
+            Play("select");
+            Persist();
+            dialogs.RefreshStats(eco, profile, save);
+            OpenModal(dialogs.stats);
+        });
+        chips.With(btnStats);
+        btnMute = new Button(muted ? "🔇" : "🔊");
+        btnMute.Class = "mn-chip";
+        btnMute.name = "mute";
+        btnMute.Tip = "开关音效（快捷键 M）";
+        btnMute.OnClick(() => { ToggleMute(); });
+        chips.With(btnMute);
+        bar.With(chips);
+        return bar;
+    }
+
+    // 左栏：矿洞场景 · 开采 / 超载 · 增益 · 矿脉深度与转生 · 状态条。
+    Panel BuildMinePanel() {
+        Panel col = Col("mn-panel");
+        col.Pad(12);
+        col.Gap(9);
+        col.Prefer(352, 0);
+
+        Panel head = Row("mn-mid");
+        head.Gap(6);
+        head.With(Txt("地心矿晶", "mn-h2"));
+        head.With(Col("mn-spacer"));
+        buffIdle = Txt("无增益", "mn-buff mn-buff-idle");
+        head.With(buffIdle);
+        buffOd = Txt("", "mn-buff mn-buff-od");
+        buffOd.SetShown(false);
+        head.With(buffOd);
+        buffRush = Txt("", "mn-buff mn-buff-rush");
+        buffRush.SetShown(false);
+        head.With(buffRush);
+        col.With(head);
+
+        coreView = new MineCoreView(eco, particles, fct);
+        coreView.Grow();
+        coreView.OnClick(() => {
+            int x = coreView.DownX;
+            int y = coreView.DownY;
+            if (coreView.HitsGolden(x, y)) {
+                CollectGolden();
+            } else {
+                DoMine((double)x, (double)y);
+            }
+        });
+        col.With(coreView);
+
+        Panel actions = Row("");
+        actions.Gap(8);
+        btnMine = new Button("⚒ 开采");
+        btnMine.Class = "mn-cta";
+        btnMine.name = "mine";
+        btnMine.Grow();
+        btnMine.Prefer(0, 46);
+        btnMine.OnClick(() => { DoMine((double)coreView.CoreX, (double)coreView.CoreY); });
+        actions.With(btnMine);
+        btnBoost = new Button("🔥 超载");
+        btnBoost.Class = "mn-boost";
+        btnBoost.name = "boost";
+        btnBoost.Prefer(128, 46);
+        btnBoost.Tip = "熔炉超载：30 秒内全部产出 ×2，冷却 4 分钟（快捷键 B）";
+        btnBoost.OnClick(() => { TryOverdrive(); });
+        actions.With(btnBoost);
+        col.With(actions);
+
+        Panel depthHead = Row("mn-mid");
+        depthHead.With(Txt("矿脉深度", "mn-cap"));
+        depthHead.With(Col("mn-spacer"));
+        lblDepth = Txt("", "mn-dim");
+        depthHead.With(lblDepth);
+        col.With(depthHead);
+
+        Panel depthRow = Row("mn-mid");
+        depthRow.Gap(10);
+        depthBar = new Progress(0, 1);
+        depthBar.Class = "mn-depth";
+        depthBar.IsShowText = false;
+        depthRow.With(depthBar);
+        btnPrestige = new Button("◆ 转生");
+        lastPrestigeReady = eco.CanPrestige;
+        btnPrestige.Class = lastPrestigeReady ? "mn-prestige" : "mn-prestige mn-prestige-off";
+        btnPrestige.name = "prestige";
+        btnPrestige.Prefer(150, 38);
+        btnPrestige.Tip = "本轮累计开采满 2B 后可以地心转生";
+        btnPrestige.OnClick(() => { AskPrestige(); });
+        depthRow.With(btnPrestige);
+        col.With(depthRow);
+
+        lblStatus = Txt(DefaultStatus(), "mn-status");
+        lblStatus.SetWrap(true);
+        lblStatus.Prefer(0, 46);
+        col.With(lblStatus);
+        return col;
+    }
+
+    // 右栏：购买模式开关 + 2×4 矿机卡。
+    Panel BuildBuildingPanel() {
+        Panel col = Col("mn-panel");
+        col.Pad(12);
+        col.Gap(8);
+        col.Grow();
+
+        Panel head = Row("mn-mid");
+        head.Gap(6);
+        head.With(Txt("采矿矩阵", "mn-h2"));
+        head.With(Txt("  每座矿机到 Lv25 / 50 / 100 产出翻倍", "mn-dim"));
+        head.With(Col("mn-spacer"));
+        string[] labels = new string[] { "×1", "×10", "最大" };
+        int[] modes = new int[] { 1, 10, 0 };
+        for (int i = 0; i < 3; i = i + 1) {
+            int mode = modes[i];
+            Button b = new Button(labels[i]);
+            b.Class = "mn-seg";
+            b.name = "mode" + Convert.ToString(i + 1);
+            b.Tip = "购买数量（快捷键 " + Convert.ToString(i + 1) + "）";
+            b.OnClick(() => { SetMode(mode); });
+            head.With(b);
+            modeButtons.Add(b);
         }
-        welcomeTime = new Label(away);
-        welcomeTime.Class = "secondary small";
-        welcomeTime.SetWrap(true);
-        body.With(welcomeTime);
-        welcomeModal.Content(body);
-        welcomeModal.OkText("收下");
-        welcomeModal.Actions(new List<Control> { welcomeModal.okBtn });
-        welcomeModal.OnOk(() => {
-            welcomeModal.Hide();
+        col.With(head);
+
+        Panel row = null;
+        for (int i = 0; i < eco.Buildings.Count; i = i + 1) {
+            if (i % 2 == 0) {
+                row = Row("");
+                row.Gap(10);
+                col.With(row);
+            }
+            int idx = i;
+            BuildingCard card = new BuildingCard(i);
+            card.button.OnClick(() => { TryBuy(idx); });
+            row.With(card.button);
+            cards.Add(card);
+        }
+        return col;
+    }
+
+    void WireDialogs() {
+        dialogs.welcome.OnOk(() => {
+            dialogs.welcome.Hide();
             Play("coin");
+            particles.Burst((double)coreView.CoreX, (double)coreView.CoreY, 24, (double)coreView.FloorY);
+        });
+        dialogs.stats.OnOk(() => { dialogs.stats.Hide(); });
+        dialogs.achievements.OnOk(() => { dialogs.achievements.Hide(); });
+        dialogs.prestige.OnOk(() => {
+            dialogs.prestige.Hide();
+            DoPrestige();
         });
     }
 
-    // 手动点击矿石开采。
+    // ---- 动作 -------------------------------------------------------------
+
     void DoMine(double x, double y) {
-        state.Mine();
+        double gain = eco.Mine();
         Play("ore");
-
-        // 1. 触发弹簧阻尼打击感挤压与回弹
-        coreJuice.Trigger(0.35);
-
-        // 2. 每 5 下一次"暴击"跳字（纯视觉节奏），金币飘字是真实入账
-        bool isCrit = state.clicks % 5 == 0;
-        fctManager.SpawnDamage(x - 20.0, y - 15.0, state.ClickPower * (isCrit ? 2 : 1), isCrit);
-        fctManager.SpawnGold(x + 10.0, y - 25.0, Convert.ToString(state.ClickPower));
-
-        // 3. 矿晶动画
-        coreScale = 1.25;
-        if (coreTween != null) { coreTween.Stop(); }
-        coreTween = AnimationTimeline.To(1.25f, 1.0f, 350, EaseType.BackOut, (float val) => {
-            coreScale = (double)val;
-            app.RequestRedraw();
-        });
-
-        // 4. 喷射飞行动画金币与火花
-        particles.Burst(x, y, 6);
-
-        CheckMilestone();
-        UpdateLabels();
-        app.RequestRedraw();
+        firstSession = firstSession && eco.TotalLevels == 0;
+        coreView.Kick(false);
+        int coins = eco.RushActive ? 7 : 4;
+        particles.Burst(x, y, coins, (double)coreView.FloorY);
+        bool crit = eco.Clicks % 10 == 0;
+        fct.Spawn(x - 18.0 + (double)uiRnd.NextBelow(24), y - 30.0, "+" + MineFormat.Num(gain),
+            eco.RushActive ? 0xFFF080 : 0xFFD34D, crit ? 1.4 : 1.0, crit, 0.8);
+        DrainEvents();
+        RefreshAll();
     }
 
-    void TryUpgrade(int idx) {
-        IdleBuilding b = state.buildings[idx];
-        double cost = (double)b.Cost;
-        if (state.UpgradeBuilding(idx)) {
-            Play("coin");
-            ShowStatus("✔ " + b.Name + " 升到 Lv." + Convert.ToString(b.Level) + "，秒产 +" + FormatNumber(state.TotalDps) + "/s");
-            firstSession = false;
+    void CollectGolden() {
+        int gx = coreView.GoldenScreenX;
+        int gy = coreView.GoldenScreenY;
+        int outcome = eco.ClickGolden();
+        if (outcome == 0) { return; }
+        Play("golden");
+        coreView.Flash();
+        coreView.Kick(true);
+        particles.Burst((double)gx, (double)gy, 26, (double)coreView.FloorY);
+        particles.Ring((double)gx, (double)gy, 14, 0xFFFFE680);
+        if (outcome == 1) {
+            fct.Spawn((double)gx - 40.0, (double)gy - 40.0, "金矿脉 +" + MineFormat.Num(eco.lastGain), 0xFFE066, 1.5, true, 1.4);
+            ShowStatus("✨ 金矿脉！一口气挖出 " + MineFormat.Num(eco.lastGain) + " 金币", true);
+        } else {
+            fct.Spawn((double)gx - 40.0, (double)gy - 40.0, "淘金狂潮 ×7！", 0xFFF080, 1.5, true, 1.4);
+            ShowStatus("✨ 淘金狂潮：12 秒内手动开采 ×7——快点矿晶！", true);
+        }
+        DrainEvents();
+        RefreshAll();
+    }
+
+    void TryOverdrive() {
+        if (eco.ActivateOverdrive()) {
+            Play("ignite");
+            coreView.Flash();
+            coreView.Kick(true);
+            particles.Ring((double)coreView.CoreX, (double)coreView.CoreY, 18, 0xFFFF7A3A);
+            ShowStatus("🔥 熔炉超载！30 秒内全部产出 ×2", true);
+        } else if (eco.OverdriveActive) {
+            ShowStatus("熔炉正在超载中，还剩 " + MineFormat.Secs(eco.overdriveLeft), false);
         } else {
             Play("error");
-            ShowStatus("金币不足：" + b.Name + " 还差 " + FormatNumber(cost - state.gold));
+            ShowStatus("熔炉还在冷却：" + MineFormat.Secs(eco.overdriveCooldown) + " 后可再次超载", false);
         }
-        UpdateLabels();
+        DrainEvents();
+        RefreshAll();
+    }
+
+    void SetMode(int mode) {
+        eco.SetBuyMode(mode);
+        Play("select");
+        RefreshAll();
+    }
+
+    void TryBuy(int idx) {
+        IdleBuilding b = eco.Buildings[idx];
+        if (!BuildingCard.Revealed(eco, idx)) {
+            Play("error");
+            ShowStatus("这条矿脉还没勘探到：先买下「" + eco.Buildings[idx - 1].Name + "」", false);
+            return;
+        }
+        double cost = eco.BuyCost(idx);
+        int got = eco.Buy(idx);
+        if (got > 0) {
+            Play("coin");
+            firstSession = false;
+            ShowStatus("✔ " + b.Name + " +" + Convert.ToString(got) + " 级 → Lv" + Convert.ToString(b.level)
+                + "，秒产 +" + MineFormat.Num(eco.Dps) + "/秒", false);
+            particles.Burst((double)coreView.CoreX, (double)coreView.CoreY - 10.0, 5, (double)coreView.FloorY);
+        } else {
+            Play("error");
+            ShowStatus("金币不足：" + b.Name + " 还差 " + MineFormat.Num(cost - eco.Gold), false);
+        }
+        DrainEvents();
+        RefreshAll();
+    }
+
+    void AskPrestige() {
+        if (!eco.CanPrestige) {
+            Play("error");
+            ShowStatus("矿脉还不够深：本轮累计开采 " + MineFormat.Num(eco.RunEarned) + " / "
+                + MineFormat.Num(MineEconomy.PrestigeGate) + " 才能转生", false);
+            return;
+        }
+        Play("select");
+        dialogs.RefreshPrestige(eco);
+        OpenModal(dialogs.prestige);
+    }
+
+    void DoPrestige() {
+        long gain = eco.Prestige();
+        if (gain <= 0) { return; }
+        Play("rebirth");
+        coreView.Flash();
+        coreView.Kick(true);
+        particles.Ring((double)coreView.CoreX, (double)coreView.CoreY, 24, 0xFF8FF2E6);
+        fct.Spawn((double)coreView.CoreX - 50.0, (double)coreView.CoreY - 60.0, "+" + Convert.ToString(gain) + " ◆ 地心晶", 0x8FF2E6, 1.5, true, 1.8);
+        ShowStatus("◆ 地心转生完成：+" + Convert.ToString(gain) + " 地心晶，全产出 " + MineFormat.Pct(eco.PermanentMult)
+            + "。新的一轮，冲！", true);
+        DrainEvents();
+        Persist();
+        RefreshAll();
+    }
+
+    // 排空经济事件，逐个给反馈。
+    void DrainEvents() {
+        int arg;
+        int k = eco.PollEvent(out arg);
+        while (k != 0) {
+            if (k == MineEconomy.EvMilestone) {
+                int idx = arg / 10000;
+                int lv = arg % 10000;
+                Play("powerup");
+                coreView.AddRing(0xFFFFE08A);
+                ShowStatus("🏅 " + eco.Buildings[idx].Name + " 达到 Lv" + Convert.ToString(lv) + "：产出 ×2！", true);
+                fct.Spawn((double)coreView.CoreX - 30.0, (double)coreView.CoreY - 70.0, "产出 ×2!", 0xFFB347, 1.4, true, 1.2);
+            } else if (k == MineEconomy.EvAchievement) {
+                Play("success");
+                profile.SetFlag("ach" + Convert.ToString(arg), true);
+                ShowStatus("🏆 成就解锁：" + MineAchievements.Name(arg) + "（" + MineAchievements.Desc(arg) + "）· 全产出 +2%", true);
+                coreView.AddRing(0xFFFFD27A);
+            } else if (k == MineEconomy.EvGoldenSpawn) {
+                // 放在矿晶左右两侧的岩壁上，别压住矿晶
+                double gx = 0.13 + (double)uiRnd.NextBelow(14) * 0.01;
+                if (uiRnd.NextBelow(2) == 1) { gx = 1.0 - gx; }
+                coreView.PlaceGolden(gx, 0.2 + (double)uiRnd.NextBelow(42) * 0.01);
+                Play("golden");
+                ShowStatus("✨ 金矿石冒出来了！13 秒内点它（或按 G）", true);
+            } else if (k == MineEconomy.EvGoldenLost) {
+                ShowStatus("金矿石沉回岩层了……下次快一点", false);
+            } else if (k == MineEconomy.EvOverdriveReady) {
+                Play("select");
+                ShowStatus("🔥 熔炉冷却完毕：可以再次超载（B）", false);
+            } else if (k == MineEconomy.EvOverdriveEnd) {
+                ShowStatus("熔炉超载结束，进入冷却", false);
+            }
+            k = eco.PollEvent(out arg);
+        }
+    }
+
+    // ---- 刷新 -------------------------------------------------------------
+
+    void RefreshAll() {
+        Put(lblGold, MineFormat.Big(eco.Gold));
+        Put(lblDps, "+" + MineFormat.Num(eco.Dps) + "/秒");
+        Put(lblCrystals, Convert.ToString(eco.crystals) + " 地心晶");
+        Put(lblCrystalSub, "全产出 " + MineFormat.Pct(eco.PermanentMult));
+        PutB(btnAch, "🏆 " + Convert.ToString(eco.AchievementCount) + "/" + Convert.ToString(MineAchievements.Count));
+        PutB(btnMine, "⚒ 开采  +" + MineFormat.Num(eco.ClickPower));
+
+        // 超载按钮：就绪 / 生效中（白热）/ 冷却（禁用）
+        string bt;
+        if (eco.OverdriveActive) { bt = "🔥 " + MineFormat.Secs(eco.overdriveLeft); }
+        else if (eco.OverdriveReady) { bt = "🔥 超载"; }
+        else { bt = "冷却 " + MineFormat.Secs(eco.overdriveCooldown); }
+        if (bt != lastBoostText) {
+            lastBoostText = bt;
+            btnBoost.Text = bt;
+            btnBoost.SwitchClass("mn-boost-on", eco.OverdriveActive);
+            // 冷却中不禁用：点了要告诉玩家还要等多久
+            btnBoost.SwitchClass("mn-boost-off", !eco.OverdriveActive && !eco.OverdriveReady);
+        }
+
+        // 增益徽章
+        buffOd.SetShown(eco.OverdriveActive);
+        if (eco.OverdriveActive) { buffOd.Text = "超载 ×2 · " + MineFormat.Secs(eco.overdriveLeft); }
+        buffRush.SetShown(eco.RushActive);
+        if (eco.RushActive) { buffRush.Text = "淘金 ×7 · " + MineFormat.Secs(eco.rushLeft); }
+        buffIdle.SetShown(!eco.OverdriveActive && !eco.RushActive);
+
+        // 矿脉深度 / 转生
+        double frac = eco.RunEarned / MineEconomy.PrestigeGate;
+        if (frac > 1.0) { frac = 1.0; }
+        depthBar.SetPercent((int)(frac * 100.0));
+        bool ready = eco.CanPrestige;
+        if (ready) {
+            Put(lblDepth, "可转生：+" + Convert.ToString(eco.PendingCrystals) + " ◆");
+            PutB(btnPrestige, "◆ 转生 " + Convert.ToString(eco.PendingCrystals));
+        } else {
+            Put(lblDepth, MineFormat.Num(eco.RunEarned) + " / " + MineFormat.Num(MineEconomy.PrestigeGate));
+            PutB(btnPrestige, "◆ 转生");
+        }
+        if (ready != lastPrestigeReady) {
+            lastPrestigeReady = ready;
+            // 不够深也不禁用：点了会报还差多少
+            btnPrestige.SwitchClass("mn-prestige-off", !ready);
+            if (ready) {
+                Play("powerup");
+                ShowStatus("◆ 矿脉已够深：可以地心转生了！", true);
+            }
+        }
+
+        for (int i = 0; i < modeButtons.Count; i = i + 1) {
+            int m = i == 0 ? 1 : (i == 1 ? 10 : 0);
+            modeButtons[i].SwitchClass("mn-seg-on", eco.buyMode == m);
+        }
+        for (int i = 0; i < cards.Count; i = i + 1) { cards[i].Refresh(eco); }
         app.RequestRedraw();
     }
 
-    // 由 MineCoreView 驱动绘制动态矿石、打击形变、粒子和高性能飘字。
-    void RenderMiningArea(Canvas c, int bx, int by, int bw, int bh) {
-        int cx = bx + bw / 2;
-        int cy = by + bh / 2;
-
-        // 根据 coreJuice 的弹性缩放与 coreScale 计算动态核心尺寸
-        int baseR = (int)(55.0 * coreScale);
-        int rx = (int)((double)baseR * coreJuice.ScaleX);
-        int ry = (int)((double)baseR * coreJuice.ScaleY);
-        int r = (rx + ry) / 2;
-
-        // 外层能量光晕
-        c.FillCircle(cx, cy, r + 15, 0x22F59E0B);
-        c.FillCircle(cx, cy, r + 8, 0x44F59E0B);
-
-        // 晶体六边形或多层圆环（响应打击缩放）
-        c.FillCircle(cx, cy, r, 0xFFD97706);
-        c.DrawCircle(cx, cy, r, 0xFFFDE68A, 3);
-        c.FillCircle(cx, cy, (int)(r * 0.7), 0xFFF59E0B);
-        c.FillCircle(cx, cy, (int)(r * 0.4), 0xFFFEF3C7);
-
-        // 绘制粒子
-        particles.Render(c);
-
-        // 绘制高性能无 GC 飘字
-        fctManager.Render(c, null);
+    // 文本没变就不动控件（省掉每 100ms 的重排）。
+    static void Put(Label l, string t) {
+        if (l.Text.Get() != t) { l.Text = t; }
     }
 
-    void UpdateLabels() {
-        if (lblGold != null) {
-            lblGold.Text = "金币: " + FormatNumber(state.Gold);
-        }
-        if (lblDps != null) {
-            lblDps.Text = "秒产: +" + FormatNumber(state.TotalDps) + "/s";
-        }
-        if (lblClickPower != null) {
-            lblClickPower.Text = "单次挖掘: +" + Convert.ToString(state.ClickPower);
-        }
-
-        List<IdleBuilding> list = state.Buildings;
-        for (int i = 0; i < list.Count; i = i + 1) {
-            IdleBuilding b = list[i];
-            if (i < buildingUiRows.Count) {
-                BuildingUiRow row = buildingUiRows[i];
-                row.levelLabel.Text = "Lv." + Convert.ToString(b.Level);
-                row.costLabel.Text = "💰 " + FormatNumber((double)b.Cost);
-                bool canAfford = state.CanAfford(b);
-                if (canAfford != row.affordable) {
-                    row.affordable = canAfford;
-                    row.buyButton.SwitchClass("primary", canAfford);
-                    row.buyButton.SwitchClass("secondary", !canAfford);
-                }
-            }
-        }
+    static void PutB(Button b, string t) {
+        if (b.Text.Get() != t) { b.Text = t; }
     }
 
     static long ClampLong(double n) {
         if (!(n > 0.0)) { return 0; }
         if (n >= 9.0e18) { return 9000000000000000000L; }
         return (long)n;
-    }
-
-    // 千进制后缀（K/M/B/T/Qa…），长线放置超过 B 也不会显示成 "1000.0B"。
-    string FormatNumber(double n) {
-        if (n < 0.0) { return "-" + BigNum.Short(ClampLong(0.0 - n)); }
-        return BigNum.Short(ClampLong(n));
     }
 }

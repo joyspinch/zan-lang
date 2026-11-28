@@ -6,56 +6,89 @@ using Game.Foundation.Gui;
 
 namespace Match3;
 
-// One retained tree per loop. Render only consumes the already-laid-out tree.
-// Keep this template's existing raw Canvas coordinates; world viewport migration
-// is a separate change. All overlay paint belongs to standard controls.
-//
-// The HUD is also the game shell: title -> playing <-> paused -> results.
-// Audio (SfxBank) and the player profile (GameProfile) live here, in the view
-// layer; Match3Game / Match3Sim never touch them, so replays stay deterministic.
+// The game shell: title -> level map -> playing <-> paused -> results.
+// One retained tree of standard Panel / Label / Button / Progress controls,
+// skinned in Css() with the game's night-violet + gold art language; the
+// canvas only paints world art (board, map path, stars, effects) and icons.
+// Audio (SfxBank) and progress (GameProfile) live here in the view layer;
+// Match3Game / Match3Sim never touch them, so replays stay deterministic.
 public class Match3Hud : UiViewOwner {
     public const int StateTitle = 0;
-    public const int StatePlaying = 1;
-    public const int StatePaused = 2;
-    public const int StateResults = 3;
+    public const int StateMap = 1;
+    public const int StatePlaying = 2;
+    public const int StatePaused = 3;
+    public const int StateResults = 4;
 
     public Panel root;
-    public Label title;
-    public Label score;
-    public Label moves;
-    public Label best;
-    public Label tip;
-    public Label keys;
+    public Label levelTitle;
     public Button pauseButton;
     public Button muteButton;
+    public Button mapBackButton;
+    public Label tip;
+    public Label keys;
 
-    // Title / start screen
+    // in-game pods
+    public Panel movesPod;
+    public Label movesValue;
+    public Panel goalPod;
+    public Label goalCaption;
+    public Label[] goalItems;
+    public Panel scorePod;
+    public Label scoreValue;
+    public Progress scoreMeter;
+
+    // level intro banner
+    public Panel banner;
+    public Label bannerTitle;
+    public Label bannerGoal;
+    public Label bannerMoves;
+    public double bannerT;
+
+    // title
     public Panel titlePanel;
     public Label titleStats;
     public Button playButton;
 
-    // Pause
+    // level map
+    public Panel mapPanel;
+    public Label mapStars;
+    public Button[] nodes;
+
+    // pause
     public Panel pausePanel;
+    public Label pauseGoal;
     public Button resumeButton;
     public Button restartButton;
-    public Button quitButton;
+    public Button pauseMapButton;
 
-    // Results
+    // results
     public Panel result;
     public Label resultTitle;
     public Label resultScore;
-    public Label resultBest;
     public Label resultNewBest;
+    public Label resultBest;
     public Label resultStats;
-    public Button replay;
-    public Button menuButton;
+    public Button nextButton;
+    public Button retryButton;
+    public Button resultMapButton;
 
     public int state;
-    Match3Game game;
-    GameProfile profile;
+    public Match3Game game;
+    public GameProfile profile;
+    public Match3Fx uiFx;
+    public double clock;
+    public double resultT;
+    public int resultStars;
+    public int starsShown;
+    public bool lastNewBest;
+    public bool debug;
     SfxBank sfx;
     AudioBus bus;
     bool muted;
+    int seenRev;
+    bool pressed;
+    int pressX;
+    int pressY;
     weak GuiHost host;
     UiViewScope view;
 
@@ -65,54 +98,91 @@ public class Match3Hud : UiViewOwner {
         this.profile = profile;
         this.sfx = sfx;
         this.bus = bus;
+        this.uiFx = new Match3Fx();
         this.state = StateTitle;
+        this.seenRev = -1;
+        this.debug = Environment.GetEnvironmentVariable("MATCH3_DEBUG") == "1";
         this.muted = profile.Flag("muted", false);
         if (bus != null) { bus.SetSfxMuted(this.muted); }
         host.App().UseCss(Match3Hud.Css());
         this.root = new Panel("match3-hud");
         this.root.Class = "match3-hud";
-        this.title = this.AddLabel(this.root, "CLASSIC MATCH-3", "match3-title");
-        this.score = this.AddLabel(this.root, "", "match3-score");
-        this.moves = this.AddLabel(this.root, "", "match3-moves");
-        this.best = this.AddLabel(this.root, "", "match3-best");
-        this.tip = this.AddLabel(this.root, "TIP: click a gem, then click a neighbour to swap them",
-            "match3-tip");
-        this.keys = this.AddLabel(this.root, "P / ESC  pause        M  sound on/off", "match3-keys");
-        this.pauseButton = this.AddButton(this.root, "PAUSE", "match3-chip match3-pause-btn");
-        this.muteButton = this.AddButton(this.root, "", "match3-chip match3-mute-btn");
 
-        // Start screen: how to play + best, tap anywhere (or the button) to play.
-        this.titlePanel = this.AddPanel("match3-title-panel", "match3-card match3-title-card");
-        this.AddLabel(this.titlePanel, "MATCH-3", "match3-h1");
-        this.AddLabel(this.titlePanel, "Line up gems, chain cascades, beat the target", "match3-sub");
-        this.AddLabel(this.titlePanel, "HOW TO PLAY", "match3-how-head");
-        this.AddLabel(this.titlePanel, "1.  Click a gem, then an adjacent gem to swap", "match3-how match3-how1");
-        this.AddLabel(this.titlePanel, "2.  Swaps must make a line of 3+ same colours", "match3-how match3-how2");
-        this.AddLabel(this.titlePanel, "3.  Falling gems chain cascades: x2, x3 points", "match3-how match3-how3");
-        this.AddLabel(this.titlePanel, "4.  Reach 1500 points within 25 moves", "match3-how match3-how4");
-        this.titleStats = this.AddLabel(this.titlePanel, "", "match3-title-stats");
-        this.playButton = this.AddButton(this.titlePanel, "TAP TO PLAY", "match3-cta match3-play-btn");
-        this.AddLabel(this.titlePanel, "ENTER / SPACE  play     ESC  quit     M  sound", "match3-card-keys");
+        this.levelTitle = this.AddLabel(this.root, "", "m3-level-title");
+        this.tip = this.AddLabel(this.root, "", "m3-tip");
+        this.keys = this.AddLabel(this.root, "", "m3-keys");
+
+        this.movesPod = this.AddPanel(this.root, "m3-moves", "m3-pod m3-moves-pod");
+        this.AddLabel(this.movesPod, "MOVES", "m3-cap");
+        this.movesValue = this.AddLabel(this.movesPod, "", "m3-moves-value");
+        this.goalPod = this.AddPanel(this.root, "m3-goal", "m3-pod m3-goal-pod");
+        this.goalCaption = this.AddLabel(this.goalPod, "GOAL", "m3-cap");
+        this.goalItems = new Label[3];
+        for (int i = 0; i < 3; i = i + 1) {
+            this.goalItems[i] = this.AddLabel(this.goalPod, "", "m3-goal-item");
+        }
+        this.scorePod = this.AddPanel(this.root, "m3-score", "m3-pod m3-score-pod");
+        this.AddLabel(this.scorePod, "SCORE", "m3-cap");
+        this.scoreValue = this.AddLabel(this.scorePod, "", "m3-score-value");
+        this.scoreMeter = new Progress(0, 0);
+        this.scoreMeter.Class = "m3-meter";
+        this.scoreMeter.ShowText(false);
+        this.scoreMeter.StrokeWidth(10);
+        this.scoreMeter.FillColor(unchecked((int)0xFFFFC53D));
+        this.scoreMeter.RailColor(unchecked((int)0xFF2A2048));
+        this.scorePod.Add(this.scoreMeter);
+
+        this.banner = this.AddPanel(this.root, "m3-banner", "m3-card m3-banner");
+        this.bannerTitle = this.AddLabel(this.banner, "", "m3-banner-title");
+        this.bannerGoal = this.AddLabel(this.banner, "", "m3-banner-goal");
+        this.bannerMoves = this.AddLabel(this.banner, "", "m3-banner-moves");
+
+        // Title
+        this.titlePanel = this.AddPanel(this.root, "m3-title", "m3-card m3-title-card");
+        this.AddLabel(this.titlePanel, "GEM CASCADE", "m3-h1");
+        this.AddLabel(this.titlePanel, "A match-3 journey through 24 starlit levels", "m3-sub");
+        this.AddLabel(this.titlePanel, "SPECIAL GEMS", "m3-how-head");
+        this.AddLabel(this.titlePanel, "Line of 4  ->  STRIPED gem clears a line", "m3-how m3-how1");
+        this.AddLabel(this.titlePanel, "L or T shape  ->  AREA BOMB blasts 3x3", "m3-how m3-how2");
+        this.AddLabel(this.titlePanel, "Line of 5  ->  COLOUR BOMB clears a colour", "m3-how m3-how3");
+        this.AddLabel(this.titlePanel, "Swap two specials together for a super combo", "m3-how m3-how4");
+        this.titleStats = this.AddLabel(this.titlePanel, "", "m3-title-stats");
+        this.playButton = this.AddButton(this.titlePanel, "PLAY", "m3-cta m3-play-btn");
+        this.AddLabel(this.titlePanel, "ENTER  play     ESC  quit     M  sound", "m3-card-keys m3-title-keys");
+
+        // Level map: 24 nodes on a winding path (path + stars painted by Match3Scenes).
+        this.mapPanel = this.AddPanel(this.root, "m3-map", "m3-map");
+        this.mapStars = this.AddLabel(this.mapPanel, "", "m3-map-stars");
+        this.nodes = new Button[Match3Levels.Count];
+        for (int i = 0; i < Match3Levels.Count; i = i + 1) {
+            this.nodes[i] = this.AddButton(this.mapPanel, Convert.ToString(i + 1), "m3-node " + Match3Skin.NodeClass(i));
+        }
 
         // Pause
-        this.pausePanel = this.AddPanel("match3-pause", "match3-card match3-pause-card");
-        this.AddLabel(this.pausePanel, "PAUSED", "match3-h2 match3-pause-head");
-        this.resumeButton = this.AddButton(this.pausePanel, "RESUME", "match3-cta match3-resume-btn");
-        this.restartButton = this.AddButton(this.pausePanel, "RESTART", "match3-ghost match3-restart-btn");
-        this.quitButton = this.AddButton(this.pausePanel, "QUIT GAME", "match3-ghost match3-quit-btn");
-        this.AddLabel(this.pausePanel, "P / ESC  resume", "match3-card-keys match3-pause-keys");
+        this.pausePanel = this.AddPanel(this.root, "m3-pause", "m3-card m3-pause-card");
+        this.AddLabel(this.pausePanel, "PAUSED", "m3-h2");
+        this.pauseGoal = this.AddLabel(this.pausePanel, "", "m3-pause-goal");
+        this.resumeButton = this.AddButton(this.pausePanel, "RESUME", "m3-cta m3-resume-btn");
+        this.restartButton = this.AddButton(this.pausePanel, "RESTART LEVEL", "m3-ghost m3-restart-btn");
+        this.pauseMapButton = this.AddButton(this.pausePanel, "LEVEL MAP", "m3-ghost m3-pmap-btn");
+        this.AddLabel(this.pausePanel, "P / ESC  resume", "m3-card-keys m3-pause-keys");
 
-        // Results
-        this.result = this.AddPanel("match3-result", "match3-card match3-result");
-        this.resultTitle = this.AddLabel(this.result, "", "match3-h2 match3-result-title");
-        this.resultScore = this.AddLabel(this.result, "", "match3-result-score");
-        this.resultNewBest = this.AddLabel(this.result, "NEW BEST!", "match3-newbest");
-        this.resultBest = this.AddLabel(this.result, "", "match3-result-best");
-        this.resultStats = this.AddLabel(this.result, "", "match3-result-stats");
-        this.replay = this.AddButton(this.result, "PLAY AGAIN", "match3-cta match3-again-btn");
-        this.menuButton = this.AddButton(this.result, "MENU", "match3-ghost match3-menu-btn");
-        this.AddLabel(this.result, "ENTER  play again     ESC  menu", "match3-card-keys match3-result-keys");
+        // Results (the stars are painted above the card by Match3Scenes)
+        this.result = this.AddPanel(this.root, "m3-result", "m3-card m3-result");
+        this.resultTitle = this.AddLabel(this.result, "", "m3-h2 m3-result-title");
+        this.resultScore = this.AddLabel(this.result, "", "m3-result-score");
+        this.resultNewBest = this.AddLabel(this.result, "NEW BEST!", "m3-newbest");
+        this.resultBest = this.AddLabel(this.result, "", "m3-result-best");
+        this.resultStats = this.AddLabel(this.result, "", "m3-result-stats");
+        this.nextButton = this.AddButton(this.result, "NEXT LEVEL", "m3-cta m3-next-btn");
+        this.retryButton = this.AddButton(this.result, "REPLAY", "m3-ghost m3-retry-btn");
+        this.resultMapButton = this.AddButton(this.result, "LEVEL MAP", "m3-ghost m3-rmap-btn");
+        this.AddLabel(this.result, "ENTER  continue     ESC  level map", "m3-card-keys m3-result-keys");
 
+        // Chips last so they stay on top.
+        this.pauseButton = this.AddButton(this.root, "PAUSE", "m3-chip m3-pause-btn");
+        this.mapBackButton = this.AddButton(this.root, "MENU", "m3-chip m3-back-btn");
+        this.muteButton = this.AddButton(this.root, "", "m3-chip m3-mute-btn");
         this.SyncState();
     }
 
@@ -130,11 +200,37 @@ public class Match3Hud : UiViewOwner {
         return b;
     }
 
-    Panel AddPanel(string name, string cls) {
+    Panel AddPanel(Control parent, string name, string cls) {
         Panel p = new Panel(name);
         p.Class = cls;
-        this.root.Add(p);
+        parent.Add(p);
         return p;
+    }
+
+    // ---- progress ----
+
+    public static string StarKey(int index) { return "stars_" + Convert.ToString(index + 1); }
+    public static string ScoreKey(int index) { return "score_" + Convert.ToString(index + 1); }
+
+    public int StarsOf(int index) { return (int)this.profile.Best(StarKey(index)); }
+
+    public bool Unlocked(int index) {
+        if (index <= 0 || this.debug) { return true; }
+        return this.StarsOf(index - 1) > 0;
+    }
+
+    public int TotalStars() {
+        int n = 0;
+        for (int i = 0; i < Match3Levels.Count; i = i + 1) { n = n + this.StarsOf(i); }
+        return n;
+    }
+
+    // First unlocked level without stars (the glowing "you are here" node).
+    public int CurrentLevel() {
+        for (int i = 0; i < Match3Levels.Count; i = i + 1) {
+            if (this.StarsOf(i) == 0) { return i; }
+        }
+        return Match3Levels.Count - 1;
     }
 
     // ---- sound ----
@@ -151,17 +247,33 @@ public class Match3Hud : UiViewOwner {
         this.muted = !this.muted;
         if (this.bus != null) { this.bus.SetSfxMuted(this.muted); }
         this.profile.SetFlag("muted", this.muted);
+        this.profile.Save();
         this.Play("click");
         this.SyncState();
     }
 
     // ---- flow ----
 
-    public void StartGame() {
-        if (this.state == StatePlaying) { return; }
-        this.game.InitBoard();
-        this.state = StatePlaying;
+    public void ShowMap() {
+        this.state = StateMap;
         this.Play("click");
+        this.SyncState();
+    }
+
+    public void ShowTitle() {
+        this.state = StateTitle;
+        this.Play("click");
+        this.SyncState();
+    }
+
+    public void StartLevel(int index) {
+        if (!this.Unlocked(index)) { this.Play("error"); return; }
+        this.game.LoadLevel(index);
+        this.state = StatePlaying;
+        this.bannerT = 2.6;
+        this.pressed = false;
+        this.Play("click");
+        this.Play("whoosh", 0.8);
         this.SyncState();
     }
 
@@ -179,64 +291,85 @@ public class Match3Hud : UiViewOwner {
         this.SyncState();
     }
 
-    public void Restart() {
-        if (this.state != StatePaused) { return; }
-        this.game.InitBoard();
-        this.state = StatePlaying;
-        this.Play("click");
-        this.SyncState();
-    }
-
-    public void ShowTitle() {
-        if (this.state != StateResults && this.state != StatePaused) { return; }
-        this.state = StateTitle;
-        this.Play("click");
-        this.SyncState();
-    }
-
     public void Quit() {
         GuiHost owner = this.host;
         if (owner != null) { owner.RequestStop(); }
     }
 
-    // Keyboard shell: M mute, P/Esc pause toggle, Enter/Space confirm.
-    // Keys a focused standard control already consumed never reach here.
+    public void Next() {
+        if (this.state != StateResults) { return; }
+        int i = this.game.levelIndex;
+        if (this.game.won && i + 1 < Match3Levels.Count) { this.StartLevel(i + 1); }
+        else { this.StartLevel(i); }
+    }
+
+    // Keyboard shell: M mute, P/Esc pause, Enter/Space confirm. Keys a focused
+    // standard control consumed never reach here.
     public void Key(int code) {
         if (code == 77) { this.ToggleMute(); return; }               // M
+        if (this.debug && this.state == StatePlaying) {
+            if (code == 68) { this.game.DebugSpecials(); return; }   // D
+            if (code == 87) { this.game.DebugWin(); return; }        // W
+            if (code == 76) { this.game.DebugLose(); return; }       // L
+        }
         if (code == 80 || code == 27) {                              // P / Esc
             if (this.state == StatePlaying) { this.Pause(); }
             else if (this.state == StatePaused) { this.Resume(); }
-            else if (this.state == StateResults && code == 27) { this.ShowTitle(); }
-            else if (this.state == StateTitle && code == 27) { this.Quit(); }
+            else if (code == 27 && (this.state == StateResults || this.state == StateMap)) {
+                if (this.state == StateMap) { this.ShowTitle(); } else { this.ShowMap(); }
+            }
+            else if (code == 27 && this.state == StateTitle) { this.Quit(); }
             return;
         }
         if (code == 13 || code == 32) {                              // Enter / Space
-            if (this.state == StateTitle) { this.StartGame(); }
-            else if (this.state == StateResults) { this.PlayAgain(); }
+            if (this.state == StateTitle) { this.ShowMap(); }
+            else if (this.state == StateMap) { this.StartLevel(this.CurrentLevel()); }
+            else if (this.state == StateResults) { this.Next(); }
         }
     }
 
-    public void PlayAgain() {
-        if (this.state != StateResults) { return; }
-        this.game.InitBoard();
-        this.state = StatePlaying;
-        this.Play("click");
-        this.SyncState();
+    int DesignX() {
+        GuiHost owner = this.host;
+        return owner == null ? -1 : owner.App().mouseX;
     }
 
-    // Board clicks while playing; anywhere-tap on the title screen.
+    int DesignY() {
+        GuiHost owner = this.host;
+        return owner == null ? -1 : owner.App().mouseY - owner.App().ContentTop();
+    }
+
+    // Board press: click-click or press-and-drag toward a neighbour.
     public bool PointerDown(Control target) {
         GuiHost owner = this.host;
         if (owner == null || owner.App().window.EventButton() != 0) { return false; }
         if (Match3Hud.InButton(target)) { return false; }
         if (this.state == StateTitle) {
-            this.StartGame();
+            this.ShowMap();
             return true;
         }
         if (this.state != StatePlaying) { return false; }
-        this.game.OnClick(owner.MouseX(), owner.MouseY());
-        this.AfterMove();
+        this.bannerT = this.bannerT > 0.3 ? 0.3 : this.bannerT;
+        this.pressX = this.DesignX();
+        this.pressY = this.DesignY();
+        this.pressed = true;
+        this.game.OnClick(this.pressX, this.pressY);
         return true;
+    }
+
+    public void PointerUp() {
+        if (!this.pressed) { return; }
+        this.pressed = false;
+        if (this.state != StatePlaying || !this.game.hasSelection) { return; }
+        int dx = this.DesignX() - this.pressX;
+        int dy = this.DesignY() - this.pressY;
+        int adx = dx < 0 ? -dx : dx;
+        int ady = dy < 0 ? -dy : dy;
+        if (adx < 22 && ady < 22) { return; }
+        int c = this.game.selectedCol;
+        int r = this.game.selectedRow;
+        if (adx > ady) { c = c + (dx > 0 ? 1 : -1); } else { r = r + (dy > 0 ? 1 : -1); }
+        if (c < 0 || c >= Match3Game.Cols || r < 0 || r >= Match3Game.Rows) { return; }
+        this.game.OnClick(Match3Game.CellX(c), Match3Game.CellY(r));
     }
 
     static bool InButton(Control c) {
@@ -248,81 +381,208 @@ public class Match3Hud : UiViewOwner {
         return false;
     }
 
-    // Turn the game's last action into sound, and close the round when it ends.
-    void AfterMove() {
-        int act = this.game.lastAction;
-        if (act == Match3Game.ActSelect) {
-            this.Play("select");
-        } else if (act == Match3Game.ActInvalid) {
-            this.Play("error");
-        } else if (act == Match3Game.ActSwap) {
-            int combos = this.game.lastCombos;
-            if (combos < 1) { combos = 1; }
-            if (combos > 4) { combos = 4; }
-            this.Play("swap", 0.7);
-            // Coin pitch climbs with the cascade level.
-            this.Play("coin" + Convert.ToString(combos));
-            if (this.game.lastCombos >= 2) { this.Play("powerup", 0.8); }
-            if (this.game.lastCleared >= 5 || this.game.lastCombos >= 3) { this.Play("explode", 0.7); }
+    // ---- per-frame (Update, never Paint) ----
+
+    public void Tick(double dt) {
+        this.clock = this.clock + dt;
+        this.uiFx.Update(dt);
+        GuiHost owner = this.host;
+        if (owner != null) {
+            this.game.hoverX = this.state == StatePlaying ? this.DesignX() : -1;
+            this.game.hoverY = this.state == StatePlaying ? this.DesignY() : -1;
         }
-        if (this.game.gameOver && this.state == StatePlaying) {
+        this.DrainSounds();
+        if (this.bannerT > 0.0) {
+            this.bannerT = this.bannerT - dt;
+            if (this.bannerT <= 0.0) { this.SyncState(); }
+        }
+        if (this.state == StatePlaying && this.game.gameOver) {
             this.FinishRound();
             return;
         }
-        this.SyncState();
+        if (this.game.revision != this.seenRev) {
+            this.seenRev = this.game.revision;
+            this.SyncState();
+        }
+        if (this.state == StateResults) {
+            this.resultT = this.resultT + dt;
+            // Stars pop in one by one: burst + rising chime.
+            while (this.starsShown < this.resultStars && this.resultT >= 0.55 + 0.45 * (double)this.starsShown) {
+                int k = this.starsShown;
+                this.starsShown = k + 1;
+                int sx = Match3Scenes.ResultStarX(k);
+                int sy = Match3Scenes.ResultStarY(k);
+                this.uiFx.Burst((double)sx, (double)sy, unchecked((int)0xFFFFD666), 22);
+                this.uiFx.Sparkle((double)sx, (double)sy, unchecked((int)0xFFFFFFFF), 10, 30.0);
+                this.uiFx.Ring(sx, sy, 90, unchecked((int)0xFFFFE58F));
+                this.Play("star" + Convert.ToString(k + 1));
+                if (this.starsShown == this.resultStars && this.resultStars == 3) {
+                    this.uiFx.Confetti(120.0, 260.0, Match3Scenes.ConfettiColors(), 40);
+                    this.uiFx.Confetti(600.0, 260.0, Match3Scenes.ConfettiColors(), 40);
+                    this.Play("success", 0.7);
+                }
+            }
+        }
     }
 
-    public bool lastNewBest;
+    void DrainSounds() {
+        int m = this.game.sfxMask;
+        this.game.sfxMask = 0;
+        if (m == 0 || this.state != StatePlaying) { return; }
+        if ((m & Match3Game.SfxSelect) != 0) { this.Play("select"); }
+        if ((m & Match3Game.SfxSwap) != 0) { this.Play("swap", 0.8); }
+        if ((m & Match3Game.SfxInvalid) != 0) { this.Play("error"); }
+        if ((m & Match3Game.SfxPop) != 0) {
+            int lv = this.game.sfxCascade;
+            if (lv < 1) { lv = 1; }
+            if (lv > 4) { lv = 4; }
+            this.Play("coin" + Convert.ToString(lv));
+            if (this.game.sfxCascade >= 3) { this.Play("powerup", 0.6); }
+        }
+        if ((m & Match3Game.SfxCreate) != 0) { this.Play("create", 0.8); }
+        if ((m & Match3Game.SfxStripe) != 0) { this.Play("laser"); }
+        if ((m & Match3Game.SfxArea) != 0) { this.Play("explode", 0.8); }
+        if ((m & Match3Game.SfxBomb) != 0) { this.Play("zap"); this.Play("explode"); }
+        if ((m & Match3Game.SfxCrate) != 0) { this.Play("crate"); }
+        if ((m & Match3Game.SfxJelly) != 0) { this.Play("jelly", 0.7); }
+        if ((m & Match3Game.SfxLand) != 0) { this.Play("land", 0.35); }
+        if ((m & Match3Game.SfxShuffle) != 0) { this.Play("shuffle"); }
+        if ((m & Match3Game.SfxBonus) != 0) { this.Play("bonus", 0.7); }
+    }
 
     void FinishRound() {
-        bool won = this.game.score >= this.game.targetScore;
+        bool won = this.game.won;
+        int i = this.game.levelIndex;
         this.profile.Add("plays", 1);
-        if (won) { this.profile.Add("clears", 1); }
-        // SubmitBest saves on a new record; Save() covers the counters otherwise.
-        this.lastNewBest = this.profile.SubmitBest("score", (long)this.game.score);
-        if (!this.lastNewBest) { this.profile.Save(); }
+        this.resultStars = this.game.Stars();
+        this.lastNewBest = false;
+        if (won) {
+            this.profile.Add("clears", 1);
+            this.profile.SubmitBest(StarKey(i), (long)this.resultStars);
+            this.lastNewBest = this.profile.SubmitBest(ScoreKey(i), (long)this.game.score);
+        }
+        this.profile.Save();
         this.state = StateResults;
+        this.resultT = 0.0;
+        this.starsShown = 0;
         this.Play(won ? "success" : "fail");
         this.SyncState();
     }
 
-    // Startup/business-event synchronization; never called by Paint.
+    // Startup / business-event synchronisation; never called by Paint.
     public void SyncState() {
         bool playing = this.state == StatePlaying;
-        bool won = this.game.score >= this.game.targetScore;
-        long bestScore = this.profile.Best("score");
+        bool inLevel = playing || this.state == StatePaused || this.state == StateResults;
+        Match3Game g = this.game;
+        Match3Level lv = g.level;
         long plays = this.profile.Counter("plays");
-        long clears = this.profile.Counter("clears");
 
-        this.score.SetProp("text", "SCORE  " + Convert.ToString(this.game.score)
-            + " / " + Convert.ToString(this.game.targetScore));
-        this.moves.SetProp("text", "MOVES  " + Convert.ToString(this.game.movesLeft));
-        this.moves.SetProp("style", this.game.movesLeft <= 5 ? "color:#ff7875" : "color:#40a9ff");
-        this.best.SetProp("text", "BEST  " + Convert.ToString(bestScore)
-            + "      GAMES  " + Convert.ToString(plays));
+        if (inLevel) { this.levelTitle.SetProp("text", "LEVEL " + Convert.ToString(lv.number)); }
+        else if (this.state == StateMap) { this.levelTitle.SetProp("text", "LEVEL MAP"); }
+        this.levelTitle.SetShown(this.state != StateTitle);
+        this.movesValue.SetProp("text", Convert.ToString(g.movesLeft));
+        this.movesValue.SetProp("style", g.movesLeft <= 5 ? "color:#ff7875" : "color:#ffffff");
+        this.scoreValue.SetProp("text", Convert.ToString(g.score));
+        int pct = lv.star3 > 0 ? g.score * 100 / lv.star3 : 0;
+        this.scoreMeter.SetPercent(pct > 100 ? 100 : pct);
+        this.SyncGoal();
         this.muteButton.SetText(this.muted ? "SOUND: OFF" : "SOUND: ON");
         this.pauseButton.Disabled.Set(!playing);
-        // Onboarding: the swap hint stays until the first round is finished.
-        this.tip.SetShown(playing && plays == 0);
+        this.pauseButton.SetShown(inLevel);
+        this.mapBackButton.SetShown(this.state == StateMap);
+        bool pods = playing || this.state == StatePaused;
+        this.movesPod.SetShown(pods);
+        this.goalPod.SetShown(pods);
+        this.scorePod.SetShown(pods);
 
+        string tipText = "";
+        if (playing && g.hintOn) { tipText = "Hint: swap the two glowing gems"; }
+        else if (playing && lv.tip != "" && this.StarsOf(g.levelIndex) == 0) { tipText = lv.tip; }
+        this.tip.SetProp("text", tipText);
+        this.tip.SetShown(tipText != "");
+        string keyText = "";
+        if (inLevel) { keyText = "Click or drag gems to swap      P / ESC  pause      M  sound"; }
+        else if (this.state == StateMap) { keyText = "Click a level to play      ENTER  next level      ESC  menu"; }
+        this.keys.SetProp("text", keyText);
+        this.keys.SetShown(keyText != "");
+
+        this.bannerTitle.SetProp("text", "LEVEL " + Convert.ToString(lv.number));
+        this.bannerGoal.SetProp("text", Match3Levels.GoalText(lv));
+        this.bannerMoves.SetProp("text", "in " + Convert.ToString(lv.moves) + " moves");
+        this.pauseGoal.SetProp("text", Match3Levels.GoalText(lv) + "  -  " + Convert.ToString(g.movesLeft) + " moves left");
+
+        int total = this.TotalStars();
         this.titleStats.SetProp("text", plays == 0
-            ? "First game - good luck!"
-            : "BEST  " + Convert.ToString(bestScore) + "     GAMES  " + Convert.ToString(plays)
-                + "     CLEARS  " + Convert.ToString(clears));
+            ? "24 levels  -  earn up to 3 stars on each"
+            : "STARS  " + Convert.ToString(total) + " / " + Convert.ToString(Match3Levels.Count * 3)
+                + "      GAMES  " + Convert.ToString(plays));
+        this.mapStars.SetProp("text", Convert.ToString(total) + " / " + Convert.ToString(Match3Levels.Count * 3));
+        int cur = this.CurrentLevel();
+        for (int i = 0; i < Match3Levels.Count; i = i + 1) {
+            bool open = this.Unlocked(i);
+            string cls = "m3-node " + Match3Skin.NodeClass(i);
+            if (!open) { cls = cls + " m3-node-locked"; }
+            else if (this.StarsOf(i) > 0) { cls = cls + " m3-node-done"; }
+            if (i == cur && open) { cls = cls + " m3-node-next"; }
+            this.nodes[i].Class = cls;
+            this.nodes[i].Disabled.Set(!open);
+        }
 
-        this.resultTitle.SetProp("text", won ? "STAGE CLEAR!" : "OUT OF MOVES");
-        this.resultTitle.SetProp("style", won ? "color:#73d13d" : "color:#ff4d4f");
-        this.resultScore.SetProp("text", "SCORE  " + Convert.ToString(this.game.score)
-            + "  /  TARGET  " + Convert.ToString(this.game.targetScore));
-        this.resultBest.SetProp("text", "BEST  " + Convert.ToString(bestScore));
-        this.resultStats.SetProp("text", "GAMES  " + Convert.ToString(plays)
-            + "     CLEARS  " + Convert.ToString(clears)
-            + "     MOVES LEFT  " + Convert.ToString(this.game.movesLeft));
+        bool won = g.won;
+        bool hasNext = g.levelIndex + 1 < Match3Levels.Count;
+        this.resultTitle.SetProp("text", won ? "LEVEL " + Convert.ToString(lv.number) + " COMPLETE!" : "OUT OF MOVES");
+        this.resultTitle.SetProp("style", won ? "color:#ffd666" : "color:#ff7875");
+        this.resultScore.SetProp("text", "SCORE  " + Convert.ToString(g.score));
+        this.resultBest.SetProp("text", won
+            ? "BEST  " + Convert.ToString(this.profile.Best(ScoreKey(g.levelIndex)))
+            : Match3Hud.LossReason(g));
+        this.resultStats.SetProp("text", "BEST CHAIN  x" + Convert.ToString(g.bestCascade)
+            + "      SPECIALS  " + Convert.ToString(g.specialsMade)
+            + "      TOTAL STARS  " + Convert.ToString(total));
+        this.nextButton.SetText(won ? (hasNext ? "NEXT LEVEL" : "PLAY AGAIN") : "TRY AGAIN");
+        this.retryButton.SetShown(won);
+        this.resultMapButton.Class = won ? "m3-ghost m3-rmap-btn" : "m3-ghost m3-rmap-btn m3-rmap-solo";
 
         this.ShowPanel(this.titlePanel, this.state == StateTitle);
+        this.ShowPanel(this.mapPanel, this.state == StateMap);
         this.ShowPanel(this.pausePanel, this.state == StatePaused);
         this.ShowPanel(this.result, this.state == StateResults);
+        this.ShowPanel(this.banner, playing && this.bannerT > 0.0);
         this.resultNewBest.SetShown(this.state == StateResults && this.lastNewBest);
+    }
+
+    static string LossReason(Match3Game g) {
+        int lg = g.level.goal;
+        if (lg == Match3Levels.GoalScore) { return Convert.ToString(g.GoalRemaining(0)) + " points short - so close!"; }
+        if (lg == Match3Levels.GoalJelly) { return Convert.ToString(g.jellyLeft) + " jelly tiles left"; }
+        if (lg == Match3Levels.GoalCrates) { return Convert.ToString(g.cratesLeft) + " crates left"; }
+        int left = 0;
+        for (int i = 0; i < g.level.collectColor.Length; i = i + 1) { left = left + g.GoalRemaining(i); }
+        return Convert.ToString(left) + " gems still to collect";
+    }
+
+    // Goal pod: up to three icon + count slots (icons painted by Match3Scenes).
+    void SyncGoal() {
+        Match3Level lv = this.game.level;
+        int n = Match3Scenes.GoalSlots(lv);
+        for (int i = 0; i < 3; i = i + 1) {
+            Label l = this.goalItems[i];
+            if (i >= n) { l.SetShown(false); continue; }
+            l.SetShown(true);
+            int left = this.game.GoalRemaining(i);
+            string text = left > 0 ? Convert.ToString(left) : "DONE";
+            if (lv.goal == Match3Levels.GoalScore) { text = left > 0 ? Convert.ToString(lv.target) : "DONE"; }
+            l.SetProp("text", text);
+            int x = Match3Scenes.GoalIconX(n, i) - Match3Scenes.GoalPodX + 22;
+            l.SetProp("style", "left:" + Convert.ToString(x) + "dpx;"
+                + (left > 0 ? "color:#ffffff" : "color:#95de64"));
+        }
+        string cap = "GOAL";
+        if (lv.goal == Match3Levels.GoalScore) { cap = "REACH SCORE"; }
+        if (lv.goal == Match3Levels.GoalCollect) { cap = "COLLECT"; }
+        if (lv.goal == Match3Levels.GoalJelly) { cap = "CLEAR JELLY"; }
+        if (lv.goal == Match3Levels.GoalCrates) { cap = "BREAK CRATES"; }
+        this.goalCaption.SetProp("text", cap);
     }
 
     void ShowPanel(Panel p, bool shown) {
@@ -343,11 +603,16 @@ public class Match3Hud : UiViewOwner {
         this.playButton.OnClick(this.view.Action("play", this.playButton).Run);
         this.resumeButton.OnClick(this.view.Action("resume", this.resumeButton).Run);
         this.restartButton.OnClick(this.view.Action("restart", this.restartButton).Run);
-        this.quitButton.OnClick(this.view.Action("quit", this.quitButton).Run);
-        this.replay.OnClick(this.view.Action("again", this.replay).Run);
-        this.menuButton.OnClick(this.view.Action("menu", this.menuButton).Run);
+        this.pauseMapButton.OnClick(this.view.Action("map", this.pauseMapButton).Run);
+        this.nextButton.OnClick(this.view.Action("next", this.nextButton).Run);
+        this.retryButton.OnClick(this.view.Action("restart", this.retryButton).Run);
+        this.resultMapButton.OnClick(this.view.Action("map", this.resultMapButton).Run);
         this.pauseButton.OnClick(this.view.Action("pause", this.pauseButton).Run);
         this.muteButton.OnClick(this.view.Action("mute", this.muteButton).Run);
+        this.mapBackButton.OnClick(this.view.Action("title", this.mapBackButton).Run);
+        for (int i = 0; i < Match3Levels.Count; i = i + 1) {
+            this.nodes[i].OnClick(this.view.Action("level", this.nodes[i]).Run);
+        }
     }
 
     public void StopPreparation() {
@@ -367,82 +632,26 @@ public class Match3Hud : UiViewOwner {
         if (this.view != null) { this.PrepareView(this.view, app); }
     }
     public void ViewAction(string name, Control sender) {
-        if (name == "play") { this.StartGame(); }
+        if (name == "play") { this.ShowMap(); }
         else if (name == "resume") { this.Resume(); }
-        else if (name == "restart") { this.Restart(); }
-        else if (name == "quit") { this.Quit(); }
-        else if (name == "again") { this.PlayAgain(); }
-        else if (name == "menu") { this.ShowTitle(); }
+        else if (name == "restart") { this.StartLevel(this.game.levelIndex); }
+        else if (name == "map") { this.ShowMap(); }
+        else if (name == "next") { this.Next(); }
         else if (name == "pause") { this.Pause(); }
         else if (name == "mute") { this.ToggleMute(); }
+        else if (name == "title") { this.ShowTitle(); }
+        else if (name == "level") {
+            for (int i = 0; i < Match3Levels.Count; i = i + 1) {
+                if (this.nodes[i] == sender) { this.StartLevel(i); return; }
+            }
+        }
     }
     public void ViewPointer(Control sender, RoutedEventArgs args) {
-        if (args.eventName != "PointerDown" && args.eventName != "MouseDown") { return; }
+        string ev = args.eventName;
+        if (ev == "PointerUp" || ev == "MouseUp") { this.PointerUp(); return; }
+        if (ev != "PointerDown" && ev != "MouseDown") { return; }
         if (this.PointerDown(args.originalSource)) { args.Handle(); }
     }
 
-    // Gem-night palette (board #14141f / slots #2a2a3c, gem accents gold/blue/green/red).
-    // Every overlay is a standard Panel/Label/Button skinned here.
-    public static string Css() {
-        return ".match3-hud{position:relative;background:transparent;padding:0;border:0}"
-            + "label.m3l{position:absolute;padding:0;margin:0;border:0;background:transparent;"
-            + "vertical-align:top;text-align:center}"
-            + "label.match3-title{left:40dpx;top:12dpx;width:640dpx;height:40dpx;font-size:30dpx;color:#fff}"
-            + "label.match3-score{left:40dpx;top:62dpx;width:330dpx;height:32dpx;font-size:22dpx;color:#ffc53d;text-align:left}"
-            + "label.match3-moves{left:390dpx;top:62dpx;width:290dpx;height:32dpx;font-size:22dpx;color:#40a9ff;text-align:right}"
-            + "label.match3-best{left:40dpx;top:102dpx;width:640dpx;height:26dpx;font-size:16dpx;color:#a6a6c8}"
-            + "label.match3-tip{left:40dpx;top:708dpx;width:640dpx;height:28dpx;font-size:18dpx;color:#ffe58f}"
-            + "label.match3-keys{left:40dpx;top:862dpx;width:640dpx;height:24dpx;font-size:15dpx;color:#77779a}"
-            // HUD chips (pause / sound) - top corners
-            + "button.match3-chip{position:absolute;top:8dpx;height:30dpx;padding:0;margin:0;"
-            + "justify-content:center;align-items:center;font-size:14dpx;color:#d6d6f0;background:#2a2a3c;"
-            + "border:1dpx solid #4a4a6a;border-radius:15dpx}"
-            + "button.match3-pause-btn{left:16dpx;width:96dpx}"
-            + "button.match3-mute-btn{left:578dpx;width:126dpx}"
-            + "button.match3-chip:hover{background:#3a3a55;border-color:#40a9ff}"
-            + "button.match3-chip:active{background:#46466a}"
-            + "button.match3-chip:focus{border:1dpx solid #40a9ff}"
-            + "button.match3-chip:disabled{color:#5a5a78;background:#22222f;border-color:#33334a}"
-            // Cards (title / pause / results)
-            + ".match3-card{position:absolute;padding:0;margin:0;background:rgba(18,18,30,0.95);"
-            + "border:2dpx solid #9254de;border-radius:18dpx;box-shadow:0 10dpx 30dpx rgba(0,0,0,0.5)}"
-            + ".match3-title-card{left:60dpx;top:158dpx;width:600dpx;height:560dpx}"
-            + ".match3-pause-card{left:160dpx;top:268dpx;width:400dpx;height:340dpx;border-color:#40a9ff}"
-            + ".match3-result{left:80dpx;top:238dpx;width:560dpx;height:420dpx;border-color:#ffc53d}"
-            + "label.match3-h1{left:0;top:34dpx;width:100%;height:60dpx;font-size:48dpx;color:#ffc53d}"
-            + "label.match3-sub{left:0;top:100dpx;width:100%;height:26dpx;font-size:17dpx;color:#b7b7d8}"
-            + "label.match3-how-head{left:0;top:156dpx;width:100%;height:26dpx;font-size:18dpx;color:#40a9ff}"
-            + "label.match3-how{left:60dpx;width:500dpx;height:26dpx;font-size:17dpx;color:#e8e8ff;text-align:left}"
-            + "label.match3-how1{top:194dpx}label.match3-how2{top:226dpx}"
-            + "label.match3-how3{top:258dpx}label.match3-how4{top:290dpx}"
-            + "label.match3-title-stats{left:0;top:340dpx;width:100%;height:26dpx;font-size:17dpx;color:#ffe58f}"
-            + "label.match3-card-keys{left:0;top:510dpx;width:100%;height:22dpx;font-size:14dpx;color:#77779a}"
-            + "label.match3-h2{left:0;top:30dpx;width:100%;height:48dpx;font-size:38dpx;color:#fff}"
-            + "label.match3-result-score{left:0;top:104dpx;width:100%;height:30dpx;font-size:22dpx;color:#ffc53d}"
-            + "label.match3-newbest{left:0;top:146dpx;width:100%;height:30dpx;font-size:24dpx;color:#ff85c0}"
-            + "label.match3-result-best{left:0;top:186dpx;width:100%;height:26dpx;font-size:18dpx;color:#e8e8ff}"
-            + "label.match3-result-stats{left:0;top:220dpx;width:100%;height:24dpx;font-size:15dpx;color:#a6a6c8}"
-            + "label.match3-result-keys{top:380dpx}label.match3-pause-keys{top:300dpx}"
-            // Card buttons: gold call-to-action and outlined secondary
-            + "button.match3-cta,button.match3-ghost{position:absolute;padding:0;margin:0;justify-content:center;"
-            + "align-items:center;border-radius:28dpx}"
-            + "button.match3-cta{font-size:24dpx;color:#1f1f2e;background:linear-gradient(#ffd666,#faad14);"
-            + "border:2dpx solid #fff1b8}"
-            + "button.match3-ghost{font-size:20dpx;color:#e8e8ff;background:#2a2a3c;border:2dpx solid #4a4a6a}"
-            + "button.match3-cta label,button.match3-ghost label,button.match3-chip label{background:transparent;"
-            + "border:0;padding:0;margin:0;font-size:inherit;color:inherit;text-align:center}"
-            + "button.match3-cta:hover{background:linear-gradient(#ffe58f,#ffc53d)}"
-            + "button.match3-cta:active{background:#d48806}"
-            + "button.match3-cta:focus{border:2dpx solid #40a9ff}"
-            + "button.match3-ghost:hover{background:#3a3a55;border-color:#9254de}"
-            + "button.match3-ghost:active{background:#46466a}"
-            + "button.match3-ghost:focus{border:2dpx solid #40a9ff}"
-            + "button.match3-cta:disabled,button.match3-ghost:disabled{color:#5a5a78;background:#22222f;border-color:#33334a}"
-            + "button.match3-play-btn{left:150dpx;top:400dpx;width:300dpx;height:64dpx;font-size:26dpx}"
-            + "button.match3-resume-btn{left:70dpx;top:100dpx;width:260dpx;height:56dpx}"
-            + "button.match3-restart-btn{left:70dpx;top:170dpx;width:260dpx;height:48dpx}"
-            + "button.match3-quit-btn{left:70dpx;top:230dpx;width:260dpx;height:48dpx}"
-            + "button.match3-again-btn{left:60dpx;top:280dpx;width:260dpx;height:60dpx}"
-            + "button.match3-menu-btn{left:340dpx;top:286dpx;width:160dpx;height:48dpx}";
-    }
+    public static string Css() { return Match3Skin.Css(); }
 }
