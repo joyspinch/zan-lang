@@ -1,0 +1,206 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 联机语音通道模式。
+public enum VoiceChannelMode {
+    Team = 0,
+    Squad = 1,
+    Proximity = 2
+}
+
+// 语音成员实时状态。
+public class VoiceMemberState {
+    public int PlayerId;
+    public int TeamId;
+    public int SquadId;
+    public bool IsLeader;
+    public bool Muted;
+    public bool Deafened;
+    public bool Speaking;
+    public VoiceChannelMode Mode;
+
+    public VoiceMemberState(int playerId, int teamId, int squadId, bool isLeader) {
+        this.PlayerId = playerId;
+        this.TeamId = teamId;
+        this.SquadId = squadId;
+        this.IsLeader = isLeader;
+        this.Muted = false;
+        this.Deafened = false;
+        this.Speaking = false;
+        this.Mode = VoiceChannelMode.Team;
+    }
+}
+
+// 商业联机战术语音路由与闪避器：支持队伍/小队/近距离衰减路由、静音耳聋隔离与队长优先压低（Ducking）。
+public class NetTeamVoiceChannelRouter {
+    private List<VoiceMemberState> members;
+    public float ProximityMaxDist;
+    public float LeaderDuckGain;
+
+    public NetTeamVoiceChannelRouter(float proximityMaxDist, float leaderDuckGain) {
+        this.members = new List<VoiceMemberState>();
+        this.ProximityMaxDist = proximityMaxDist > 0.1f ? proximityMaxDist : 25.0f;
+        this.LeaderDuckGain = leaderDuckGain >= 0.0f && leaderDuckGain <= 1.0f ? leaderDuckGain : 0.35f;
+    }
+
+    public void RegisterMember(int playerId, int teamId, int squadId, bool isLeader) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return; }
+        }
+        this.members.Add(new VoiceMemberState(playerId, teamId, squadId, isLeader));
+    }
+
+    public VoiceMemberState FindMember(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return this.members[i]; }
+        }
+        return null;
+    }
+
+    public bool SetSpeaking(int playerId, bool speaking) {
+        VoiceMemberState m = this.FindMember(playerId);
+        if (m == null) { return false; }
+        m.Speaking = speaking;
+        return true;
+    }
+
+    public bool SetChannelMode(int playerId, VoiceChannelMode mode) {
+        VoiceMemberState m = this.FindMember(playerId);
+        if (m == null) { return false; }
+        m.Mode = mode;
+        return true;
+    }
+
+    // 计算 speakerId 传给 listenerId 在距离 distance 处的最终监听增益（0 表示不可听见，1 为满音量）。
+    public float ComputeListenGain(int speakerId, int listenerId, float distance) {
+        if (speakerId == listenerId) { return 0.0f; }
+        VoiceMemberState sp = this.FindMember(speakerId);
+        VoiceMemberState ls = this.FindMember(listenerId);
+        if (sp == null || ls == null) { return 0.0f; }
+        if (!sp.Speaking || sp.Muted || ls.Deafened) { return 0.0f; }
+
+        float gain = 0.0f;
+        if (sp.Mode == VoiceChannelMode.Team) {
+            gain = (sp.TeamId == ls.TeamId) ? 1.0f : 0.0f;
+        } else if (sp.Mode == VoiceChannelMode.Squad) {
+            gain = (sp.TeamId == ls.TeamId && sp.SquadId == ls.SquadId) ? 1.0f : 0.0f;
+        } else {
+            if (distance < this.ProximityMaxDist) {
+                float t = 1.0f - (distance / this.ProximityMaxDist);
+                gain = t > 0.0f ? t : 0.0f;
+            }
+        }
+        if (gain <= 0.0f) { return 0.0f; }
+        if (!sp.IsLeader) {
+            for (int i = 0; i < this.members.Count; i = i + 1) {
+                VoiceMemberState m = this.members[i];
+                if (m.IsLeader && m.Speaking && !m.Muted && m.TeamId == ls.TeamId) {
+                    gain = gain * this.LeaderDuckGain;
+                    break;
+                }
+            }
+        }
+        return gain;
+    }
+}
+
+// 选禁阶段步骤类型。
+public enum DraftStepKind {
+    Ban = 0,
+    Pick = 1
+}
+
+// 商业竞技 BP 选禁状态机：严格按步骤表轮转、拦截重复或已禁英雄、支持超时自动顺延兜底选人。
+public class NetPickBanDraftController {
+    private List<int> stepTeams;
+    private List<DraftStepKind> stepKinds;
+    private List<int> bannedHeroes;
+    private List<int> pickedHeroes;
+    public int CurrentStep;
+
+    public NetPickBanDraftController() {
+        this.stepTeams = new List<int>();
+        this.stepKinds = new List<DraftStepKind>();
+        this.bannedHeroes = new List<int>();
+        this.pickedHeroes = new List<int>();
+        this.CurrentStep = 0;
+    }
+
+    public void AddStep(int teamId, DraftStepKind kind) {
+        this.stepTeams.Add(teamId);
+        this.stepKinds.Add(kind);
+    }
+
+    public bool IsFinished() {
+        return this.CurrentStep >= this.stepTeams.Count;
+    }
+
+    public bool IsHeroTakenOrBanned(int heroId) {
+        for (int i = 0; i < this.bannedHeroes.Count; i = i + 1) {
+            if (this.bannedHeroes[i] == heroId) { return true; }
+        }
+        for (int i = 0; i < this.pickedHeroes.Count; i = i + 1) {
+            if (this.pickedHeroes[i] == heroId) { return true; }
+        }
+        return false;
+    }
+
+    public bool TrySubmitChoice(int teamId, int heroId) {
+        if (this.IsFinished()) { return false; }
+        if (this.stepTeams[this.CurrentStep] != teamId) { return false; }
+        if (this.IsHeroTakenOrBanned(heroId)) { return false; }
+        if (this.stepKinds[this.CurrentStep] == DraftStepKind.Ban) {
+            this.bannedHeroes.Add(heroId);
+        } else {
+            this.pickedHeroes.Add(heroId);
+        }
+        this.CurrentStep = this.CurrentStep + 1;
+        return true;
+    }
+
+    // 当前席位超时时从候选池自动选中首位未被禁选的英雄。
+    public int AutoResolveTimeout(List<int> fallbackRoster) {
+        if (this.IsFinished()) { return -1; }
+        int team = this.stepTeams[this.CurrentStep];
+        for (int i = 0; i < fallbackRoster.Count; i = i + 1) {
+            int hid = fallbackRoster[i];
+            if (this.TrySubmitChoice(team, hid)) { return hid; }
+        }
+        return -1;
+    }
+}
+
+// 商业联机客户端时钟偏移平滑器：过滤突发延迟毛刺（Outlier Rejection）并以限速渐进（Slew Rate）收敛，永不时钟回跳。
+public class NetClientClockDriftSmoother {
+    public double CurrentOffsetMs;
+    public double MaxOutlierJumpMs;
+    public double MaxSlewMsPerSec;
+    private bool initialized;
+
+    public NetClientClockDriftSmoother(double maxOutlierJumpMs, double maxSlewMsPerSec) {
+        this.CurrentOffsetMs = 0.0;
+        this.MaxOutlierJumpMs = maxOutlierJumpMs > 0.0 ? maxOutlierJumpMs : 80.0;
+        this.MaxSlewMsPerSec = maxSlewMsPerSec > 0.0 ? maxSlewMsPerSec : 20.0;
+        this.initialized = false;
+    }
+
+    public bool IngestSample(double measuredOffsetMs, double dtSec) {
+        if (!this.initialized) {
+            this.CurrentOffsetMs = measuredOffsetMs;
+            this.initialized = true;
+            return true;
+        }
+        double diff = measuredOffsetMs - this.CurrentOffsetMs;
+        double absDiff = diff < 0.0 ? -diff : diff;
+        if (absDiff > this.MaxOutlierJumpMs) {
+            return false; // 拒绝网络毛刺样本
+        }
+        double maxStep = this.MaxSlewMsPerSec * (dtSec > 0.0 ? dtSec : 0.016);
+        if (diff > maxStep) { diff = maxStep; }
+        else if (diff < -maxStep) { diff = -maxStep; }
+        this.CurrentOffsetMs = this.CurrentOffsetMs + diff;
+        return true;
+    }
+}

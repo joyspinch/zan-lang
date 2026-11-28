@@ -383,6 +383,15 @@ ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
     float shadow_r, float shadow_g, float shadow_b,
     float high_r, float high_g, float high_b);
 
+/* GPU 3D 屏幕空间 4x4 Bayer 有序抖动渐隐透明（Ordered Dither Alpha Fade，零贴图零半透明排序伪影）：
+ * enabled != 0 时按屏幕像素坐标与 4x4 Bayer 阈值矩阵精确剔除片段，opacity [0..1]，pixel_scale [1..8]。 */
+ZAN_GAME_API void zan_game_set_pixel_dither_fade3d(int32_t enabled,
+    float opacity, float pixel_scale);
+
+/* GPU 后处理 Kuwahara 保边油画笔触滤镜（Oil-Painting Brushstroke，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制风格化混合强度，radius [1..4] 控制笔触采样半径（保边去噪）。 */
+ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius);
+
 #ifdef __cplusplus
 }
 #endif
