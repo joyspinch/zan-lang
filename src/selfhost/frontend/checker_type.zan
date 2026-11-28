@@ -238,13 +238,18 @@ public partial class Checker {
             if (ot == null && e.a != null && e.a.kind == AK.Ident()) {
                 Node staticCls = binder.FindType(e.a.sval);
                 if (staticCls != null && (staticCls.kind == AK.ClassDecl() || staticCls.kind == AK.StructDecl())) {
+                    Node staticTy = null;
+                    if (e.d != null && e.d.sval == "__typeargs") {
+                        staticTy = MkType(staticCls.sval);
+                        staticTy.kids = e.d.kids;
+                    }
                     Node sf = FieldUp(staticCls, e.sval);
                     if (sf != null && (sf.mods / MOD.Static()) - ((sf.mods / MOD.Static()) / 2) * 2 == 1) {
-                        return sf.type;
+                        return staticTy != null ? binder.MemberType(staticTy, e.sval) : sf.type;
                     }
                     Node sg = MethodUp(staticCls, "get_" + e.sval);
                     if (sg != null && (sg.mods / MOD.Static()) - ((sg.mods / MOD.Static()) / 2) * 2 == 1) {
-                        return sg.type;
+                        return staticTy != null ? binder.MemberType(staticTy, e.sval) : sg.type;
                     }
                 }
             }
@@ -351,10 +356,15 @@ public partial class Checker {
                 Node cls = ClassOf(ot);
                 if (cls == null) { cls = StaticRecv(callee.a); }
                 if (cls != null) {
-                    Node receiver = CallReceiverType(e, cls, ot);
+                    Node callOt = ot;
+                    if (callOt == null && callee.d != null && callee.d.sval == "__typeargs") {
+                        callOt = MkType(cls.sval);
+                        callOt.kids = callee.d.kids;
+                    }
+                    Node receiver = CallReceiverType(e, cls, callOt);
                     Node m = MethodUpCallForType(cls, callee.sval, e, receiver);
                     if (m != null) {
-                        Node ret = SubstCallReturnType(m.type, cls, ot, m, e);
+                        Node ret = SubstCallReturnType(m.type, cls, callOt, m, e);
                         return LiftNullCondType(e, ret);
                     }
                 }
@@ -991,6 +1001,52 @@ public partial class Checker {
 
     // `valueNull` marks a null literal: the C host types it as `object`, so
     // that is the name its diagnostics print.
+    bool InvariantTypeArgMismatch(Node ta, Node va) {
+        if (ta == null || va == null) { return false; }
+        if (ta.sval == "" || va.sval == "" || ta.sval == "var" || va.sval == "var") { return false; }
+        if (binder.IsTypeParam(ta.sval) || binder.IsTypeParam(va.sval)) { return false; }
+        if (ta.ival != va.ival) { return true; }
+        if (ta.ival >= 1) { return !SameTypeShape(ta, va) || ta.arrRanks != va.arrRanks; }
+        if (IsValueType(ta) || IsValueType(va) || ta.sval == "string" || va.sval == "string") {
+            return !SameTypeShape(ta, va);
+        }
+        if (ta.sval == va.sval) {
+            if (ta.kids.Count != va.kids.Count
+                && (ta.sval == "Func" || ta.sval == "Action" || ta.sval == "Tuple")) {
+                return true;
+            }
+            if (ta.kids.Count > 0 && ta.kids.Count == va.kids.Count) {
+                int i = 0;
+                while (i < ta.kids.Count) {
+                    if (InvariantTypeArgMismatch(ta.kids[i], va.kids[i])) { return true; }
+                    i = i + 1;
+                }
+            }
+        }
+        return false;
+    }
+
+    Node FindImplInterfaceArgs(Node cur, string targetName, int depth) {
+        if (cur == null || depth >= 32) { return null; }
+        if (cur.sval == targetName) { return cur; }
+        Node decl = binder.FindType(cur.sval);
+        if (decl == null) { return null; }
+        if (decl.interfaceRefs != null) {
+            int i = 0;
+            while (i < decl.interfaceRefs.Count) {
+                Node cand = binder.SubstOwner(decl.interfaceRefs[i], cur);
+                Node found = FindImplInterfaceArgs(cand, targetName, depth + 1);
+                if (found != null) { return found; }
+                i = i + 1;
+            }
+        }
+        Node baseTy = binder.BaseType(cur);
+        if (baseTy != null) {
+            return FindImplInterfaceArgs(baseTy, targetName, depth + 1);
+        }
+        return null;
+    }
+
     void CheckAssignable(Node target, Node valueTy, bool valueNull,
                          string what, int line, int col) {
         CheckErasedArrayConversion(target, valueTy, valueNull, line, col);
@@ -1036,11 +1092,11 @@ public partial class Checker {
                 + ": no implicit conversion", line, col);
             return;
         }
-        // Invariant generic / tuple type argument check (B-ID186 Wave 4):
+        // Invariant generic / tuple type argument check (B-ID186 Wave 4 + Wave 13):
         // when both sides share the same outer constructor (e.g. List<T>,
-        // Dictionary<K,V>, Tuple<...>), concrete value-type or sealed string
-        // type arguments must match identically (`List<int>` != `List<long>`,
-        // `(int, int)` != `(int, long)`).
+        // Dictionary<K,V>, Tuple<...>, Channel<T>), concrete value-type, string,
+        // array, or nested invariant generic type arguments must match identically
+        // (`List<int>` != `List<long>`, `List<Func<short>>` != `List<Func<int>>`).
         if (tn == vn && tn != "Func" && tn != "Action" && tn != "Predicate"
             && tn != "Task" && tn != "ValueTask" && tn != "IEnumerable") {
             if (tn == "Tuple" && target.kids.Count != valueTy.kids.Count) {
@@ -1051,20 +1107,40 @@ public partial class Checker {
             if (target.kids.Count > 0 && target.kids.Count == valueTy.kids.Count) {
                 int gi = 0;
                 while (gi < target.kids.Count) {
-                    Node ta = target.kids[gi];
-                    Node va = valueTy.kids[gi];
-                    if (ta != null && va != null
-                        && ta.sval != "" && va.sval != ""
-                        && ta.sval != "var" && va.sval != "var"
-                        && !binder.IsTypeParam(ta.sval) && !binder.IsTypeParam(va.sval)
-                        && !SameTypeShape(ta, va)
-                        && (IsValueType(ta) || IsValueType(va)
-                            || ta.sval == "string" || va.sval == "string")) {
+                    if (InvariantTypeArgMismatch(target.kids[gi], valueTy.kids[gi])) {
                         diags.Error("[E2024] cannot convert '" + TyDisplay(valueTy) + "' to '" + TyDisplay(target)
                             + "' in " + what + ": no implicit conversion", line, col);
                         return;
                     }
                     gi = gi + 1;
+                }
+            }
+        }
+        // Generic interface conversion check (B-ID186 Wave 13): when assigning a
+        // concrete class/struct to an instantiated generic interface (e.g.
+        // `BoxSource<sbyte> src = new IntBox()` where `IntBox : BoxSource<int>`),
+        // reject mismatched invariant type arguments with [E2024].
+        if (tn != vn && target.kids.Count > 0 && tcat == 7 && vcat == 7) {
+            Node tdecl = binder.FindType(tn);
+            Node vdecl = binder.FindType(vn);
+            if (tdecl != null && (tdecl.mods / MOD.Iface()) - ((tdecl.mods / MOD.Iface()) / 2) * 2 == 1
+                && vdecl != null && (vdecl.kind == AK.ClassDecl() || vdecl.kind == AK.StructDecl())) {
+                Node implIf = FindImplInterfaceArgs(valueTy, tn, 0);
+                if (implIf != null && implIf.kids.Count == target.kids.Count) {
+                    int tpIdx = 0;
+                    int ti = 0;
+                    while (ti < tdecl.kids.Count && tpIdx < target.kids.Count) {
+                        Node tp = tdecl.kids[ti];
+                        if (tp.kind == AK.TypeParam()) {
+                            if (tp.ival == 0 && InvariantTypeArgMismatch(target.kids[tpIdx], implIf.kids[tpIdx])) {
+                                diags.Error("[E2024] cannot convert '" + TyDisplay(valueTy) + "' to '" + TyDisplay(target)
+                                    + "' in " + what + ": no implicit conversion", line, col);
+                                return;
+                            }
+                            tpIdx = tpIdx + 1;
+                        }
+                        ti = ti + 1;
+                    }
                 }
             }
         }
