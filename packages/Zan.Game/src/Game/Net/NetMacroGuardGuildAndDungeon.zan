@@ -1,0 +1,233 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 商业竞技服务端输入节拍反宏检测器（Anti-Macro / Autoclicker Cadence Guard）：
+// - 追踪滑动窗口内相邻按键间隔（ms）
+// - 拦截低于人类生理下限（MinIntervalMs）的超高速连发
+// - 检测样本方差极低的“恒定毫秒机械脚本节拍”（stdDev < MechanicalStdDevThreshold）
+public class NetInputCadenceGuard {
+    public long MinIntervalMs;
+    public int WindowSize;
+    public double MechanicalStdDevMs;
+    public int FastViolationCount;
+    private long lastEventMs;
+    private bool hasLast;
+    private List<long> intervals;
+
+    public NetInputCadenceGuard(long minIntervalMs, int windowSize, double mechanicalStdDevMs) {
+        this.MinIntervalMs = minIntervalMs > 0L ? minIntervalMs : 35L;
+        this.WindowSize = windowSize >= 4 ? windowSize : 8;
+        this.MechanicalStdDevMs = mechanicalStdDevMs > 0.0 ? mechanicalStdDevMs : 2.5;
+        this.FastViolationCount = 0;
+        this.lastEventMs = 0L;
+        this.hasLast = false;
+        this.intervals = new List<long>();
+    }
+
+    // 记录一次输入时刻；若快于 MinIntervalMs 返回 false（违规拒收）并累加违规计数。
+    public bool RecordInput(long eventTimeMs) {
+        if (!this.hasLast) {
+            this.lastEventMs = eventTimeMs;
+            this.hasLast = true;
+            return true;
+        }
+        long delta = eventTimeMs - this.lastEventMs;
+        this.lastEventMs = eventTimeMs;
+        if (delta < 0L) { return false; }
+        if (delta < this.MinIntervalMs) {
+            this.FastViolationCount = this.FastViolationCount + 1;
+            return false;
+        }
+        this.intervals.Add(delta);
+        while (this.intervals.Count > this.WindowSize) {
+            this.intervals.RemoveAt(0);
+        }
+        return true;
+    }
+
+    // 计算当前窗口按键间隔标准差（ms），样本不足时返回 -1.0。
+    public double IntervalStdDevMs() {
+        int n = this.intervals.Count;
+        if (n < this.WindowSize) { return -1.0; }
+        double sum = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            sum = sum + (double)this.intervals[i];
+        }
+        double mean = sum / (double)n;
+        double varSum = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            double d = (double)this.intervals[i] - mean;
+            varSum = varSum + d * d;
+        }
+        return Math.Sqrt(varSum / (double)n);
+    }
+
+    // 若已采集满窗口且标准差低于 MechanicalStdDevMs，判定疑似脚本连发宏。
+    public bool IsSuspectedMacro() {
+        double sd = this.IntervalStdDevMs();
+        return sd >= 0.0 && sd < this.MechanicalStdDevMs;
+    }
+}
+
+// 公会/战队成员贡献度条目。
+public class GuildMemberContribution {
+    public int PlayerId;
+    public int TotalPoints;
+    public int TodayPoints;
+    public int LastDonateDay;
+
+    public GuildMemberContribution(int playerId, int dayNumber) {
+        this.PlayerId = playerId;
+        this.TotalPoints = 0;
+        this.TodayPoints = 0;
+        this.LastDonateDay = dayNumber;
+    }
+}
+
+// 商业 MMO 公会捐献与贡献度账本（每日限额防刷 + 公会经验自动升级 + 贡献度排行）：
+public class NetGuildContributionLedger {
+    public int DailyCapPerMember;
+    public int XpPerLevel;
+    public int GuildLevel;
+    public int GuildXp;
+    private List<GuildMemberContribution> members;
+
+    public NetGuildContributionLedger(int dailyCapPerMember, int xpPerLevel) {
+        this.DailyCapPerMember = dailyCapPerMember > 0 ? dailyCapPerMember : 500;
+        this.XpPerLevel = xpPerLevel > 0 ? xpPerLevel : 1000;
+        this.GuildLevel = 1;
+        this.GuildXp = 0;
+        this.members = new List<GuildMemberContribution>();
+    }
+
+    private GuildMemberContribution GetOrCreate(int playerId, int dayNumber) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return this.members[i]; }
+        }
+        GuildMemberContribution m = new GuildMemberContribution(playerId, dayNumber);
+        this.members.Add(m);
+        return m;
+    }
+
+    // 执行捐献：受每日单人上限钳制，返回实际入账贡献值（超出当日上限则返回 0）。
+    public int Donate(int playerId, int amount, int dayNumber) {
+        if (amount <= 0) { return 0; }
+        GuildMemberContribution m = this.GetOrCreate(playerId, dayNumber);
+        if (dayNumber > m.LastDonateDay) {
+            m.LastDonateDay = dayNumber;
+            m.TodayPoints = 0;
+        }
+        int remain = this.DailyCapPerMember - m.TodayPoints;
+        if (remain <= 0) { return 0; }
+        int accepted = amount < remain ? amount : remain;
+        m.TodayPoints = m.TodayPoints + accepted;
+        m.TotalPoints = m.TotalPoints + accepted;
+        this.GuildXp = this.GuildXp + accepted;
+        while (this.GuildXp >= this.XpPerLevel) {
+            this.GuildXp = this.GuildXp - this.XpPerLevel;
+            this.GuildLevel = this.GuildLevel + 1;
+        }
+        return accepted;
+    }
+
+    public int GetTotalContribution(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return this.members[i].TotalPoints; }
+        }
+        return 0;
+    }
+
+    public int TopContributorPlayerId() {
+        int bestId = -1;
+        int bestPts = -1;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].TotalPoints > bestPts) {
+                bestPts = this.members[i].TotalPoints;
+                bestId = this.members[i].PlayerId;
+            }
+        }
+        return bestId;
+    }
+}
+
+// 副本竞速通关记录。
+public class DungeonClearEntry {
+    public int SquadId;
+    public long ClearTimeMs;
+    public long CompletedAtMs;
+
+    public DungeonClearEntry(int squadId, long clearTimeMs, long completedAtMs) {
+        this.SquadId = squadId;
+        this.ClearTimeMs = clearTimeMs;
+        this.CompletedAtMs = completedAtMs;
+    }
+}
+
+// 商业多人副本首通认证（Realm First）与竞速最快通关榜：
+// - 首位通关队伍永久锁定 RealmFirstSquadId
+// - 同队伍重复通关仅当 ClearTimeMs 更短时刷新最快记录，按用时升序排位
+public class NetDungeonSpeedrunBoard {
+    public int RealmFirstSquadId;
+    public long RealmFirstAtMs;
+    private List<DungeonClearEntry> entries;
+
+    public NetDungeonSpeedrunBoard() {
+        this.RealmFirstSquadId = -1;
+        this.RealmFirstAtMs = 0L;
+        this.entries = new List<DungeonClearEntry>();
+    }
+
+    public int EntryCount() {
+        return this.entries.Count;
+    }
+
+    // 提交一次通关成绩；若创造首通或刷新该队个人最快用时返回 true。
+    public bool SubmitClear(int squadId, long clearTimeMs, long completedAtMs) {
+        if (squadId <= 0 || clearTimeMs <= 0L) { return false; }
+        if (this.RealmFirstSquadId < 0) {
+            this.RealmFirstSquadId = squadId;
+            this.RealmFirstAtMs = completedAtMs;
+        }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].SquadId == squadId) {
+                if (clearTimeMs < this.entries[i].ClearTimeMs) {
+                    this.entries[i].ClearTimeMs = clearTimeMs;
+                    this.entries[i].CompletedAtMs = completedAtMs;
+                    this.SortByFastest();
+                    return true;
+                }
+                return false;
+            }
+        }
+        this.entries.Add(new DungeonClearEntry(squadId, clearTimeMs, completedAtMs));
+        this.SortByFastest();
+        return true;
+    }
+
+    private void SortByFastest() {
+        int n = this.entries.Count;
+        for (int i = 1; i < n; i = i + 1) {
+            DungeonClearEntry key = this.entries[i];
+            int j = i - 1;
+            while (j >= 0 && this.IsFaster(key, this.entries[j])) {
+                this.entries[j + 1] = this.entries[j];
+                j = j - 1;
+            }
+            this.entries[j + 1] = key;
+        }
+    }
+
+    private bool IsFaster(DungeonClearEntry a, DungeonClearEntry b) {
+        if (a.ClearTimeMs != b.ClearTimeMs) { return a.ClearTimeMs < b.ClearTimeMs; }
+        return a.CompletedAtMs < b.CompletedAtMs;
+    }
+
+    public int GetRank(int squadId) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].SquadId == squadId) { return i + 1; }
+        }
+        return 0;
+    }
+}

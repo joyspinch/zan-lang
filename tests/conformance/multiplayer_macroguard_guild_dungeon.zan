@@ -1,0 +1,60 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerMacroGuardGuildDungeonTest {
+    static void Main() {
+        // 1. 竞技反宏节拍检测：拦截超高速连点 + 识别恒定毫秒机械脚本 vs 人类自然抖动
+        NetInputCadenceGuard macroGuard = new NetInputCadenceGuard(35L, 6, 3.0);
+        macroGuard.RecordInput(1000L);
+        bool fastBlocked = !macroGuard.RecordInput(1015L); // 15ms < 35ms 拦截
+        long t = 1100L;
+        for (int i = 0; i < 7; i = i + 1) {
+            macroGuard.RecordInput(t);
+            t = t + 50L; // 精确恒定 50ms 机械宏节拍，填满 6 样本滑窗
+        }
+        bool macroDetected = fastBlocked && macroGuard.FastViolationCount == 1
+            && macroGuard.IsSuspectedMacro();
+
+        NetInputCadenceGuard humanGuard = new NetInputCadenceGuard(35L, 6, 3.0);
+        humanGuard.RecordInput(1000L);
+        humanGuard.RecordInput(1080L); // 80
+        humanGuard.RecordInput(1195L); // 115
+        humanGuard.RecordInput(1265L); // 70
+        humanGuard.RecordInput(1405L); // 140
+        humanGuard.RecordInput(1495L); // 90
+        humanGuard.RecordInput(1625L); // 130
+        bool humanClean = !humanGuard.IsSuspectedMacro() && humanGuard.IntervalStdDevMs() > 15.0;
+
+        Console.WriteLine("net-input-cadence-guard: " + Convert.ToString((macroDetected && humanClean) ? 1 : 0));
+
+        // 2. 公会捐献与贡献度账本：每日上限钳制、跨日重置、自动升级与头号贡献者
+        NetGuildContributionLedger guild = new NetGuildContributionLedger(500, 1000);
+        int d1 = guild.Donate(101, 400, 1);
+        int d2 = guild.Donate(101, 300, 1); // 当日仅剩 100 额度
+        int d3 = guild.Donate(101, 100, 1); // 当日已满 -> 0
+        int d4 = guild.Donate(102, 500, 1); // 总 XP 达 1000 -> 升至 Lv.2
+        int d5 = guild.Donate(102, 200, 2); // 第 2 天刷新额度 -> 102 总贡献 700 超过 101(500)
+
+        bool guildOk = d1 == 400 && d2 == 100 && d3 == 0 && d4 == 500 && d5 == 200
+            && guild.GuildLevel == 2 && guild.GuildXp == 200
+            && guild.GetTotalContribution(101) == 500
+            && guild.GetTotalContribution(102) == 700
+            && guild.TopContributorPlayerId() == 102;
+        Console.WriteLine("net-guild-contribution-ledger: " + Convert.ToString(guildOk ? 1 : 0));
+
+        // 3. 副本首通认证与竞速榜：首通永久锁定、仅更短用时刷新、升序排位
+        NetDungeonSpeedrunBoard board = new NetDungeonSpeedrunBoard();
+        bool c1 = board.SubmitClear(10, 180000L, 1000L); // 队 10 拿下首通
+        bool c2 = board.SubmitClear(20, 150000L, 2000L); // 队 20 更短用时登顶竞速第 1
+        bool slowerIgnored = !board.SubmitClear(10, 195000L, 3000L); // 更慢不覆盖
+        bool pbUpdated = board.SubmitClear(10, 140000L, 4000L);      // 队 10 刷新个人最佳反超登顶
+
+        bool dungeonOk = c1 && c2 && slowerIgnored && pbUpdated
+            && board.RealmFirstSquadId == 10
+            && board.GetRank(10) == 1 && board.GetRank(20) == 2
+            && board.EntryCount() == 2;
+        Console.WriteLine("net-dungeon-speedrun-board: " + Convert.ToString(dungeonOk ? 1 : 0));
+    }
+}

@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 3D 动态武器刀光/导弹尾迹单个采样节点。
+public class RibbonNode3D {
+    public Vector3 Position;
+    public float Age;
+
+    public RibbonNode3D(Vector3 pos, float age) {
+        this.Position = pos;
+        this.Age = age;
+    }
+}
+
+// 商业 3D 动作/射击游戏动态丝带尾迹生成器（Sword Slash / Projectile Trail Ribbon）：
+// - 按最小采样间距（MinStepDist）追加控制点并受 MaxNodes 上限约束
+// - 随时间自动老化并剔除过期尾部节点
+// - 沿轨迹切线与参考法线（如相机前向或世界上向量）叉乘展开宽度线性渐细的带状 Mesh3D
+public class TrailRibbon3D {
+    public int MaxNodes;
+    public float LifetimeSec;
+    public float MinStepDist;
+    public float StartWidth;
+    public float EndWidth;
+    private List<RibbonNode3D> nodes;
+
+    public TrailRibbon3D(int maxNodes, float lifetimeSec, float minStepDist,
+                         float startWidth, float endWidth) {
+        this.MaxNodes = maxNodes > 2 ? maxNodes : 32;
+        this.LifetimeSec = lifetimeSec > 0.01f ? lifetimeSec : 0.4f;
+        this.MinStepDist = minStepDist >= 0.0f ? minStepDist : 0.05f;
+        this.StartWidth = startWidth > 0.0f ? startWidth : 0.4f;
+        this.EndWidth = endWidth >= 0.0f ? endWidth : 0.02f;
+        this.nodes = new List<RibbonNode3D>();
+    }
+
+    public int NodeCount() {
+        return this.nodes.Count;
+    }
+
+    public void Clear() {
+        this.nodes.Clear();
+    }
+
+    // 尝试追加新的尾部采样点；若距上一个点小于 MinStepDist 则忽略以防零长度切线退化。
+    public bool PushSample(Vector3 pos) {
+        int n = this.nodes.Count;
+        if (n > 0) {
+            Vector3 prev = this.nodes[n - 1].Position;
+            float dx = pos.X - prev.X;
+            float dy = pos.Y - prev.Y;
+            float dz = pos.Z - prev.Z;
+            float dist = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+            if (dist < this.MinStepDist) { return false; }
+        }
+        this.nodes.Add(new RibbonNode3D(pos, 0.0f));
+        while (this.nodes.Count > this.MaxNodes) {
+            this.nodes.RemoveAt(0);
+        }
+        return true;
+    }
+
+    // 推进节点年龄并自动回收超时旧点。
+    public void Update(float dt) {
+        if (dt <= 0.0f) { return; }
+        int i = 0;
+        while (i < this.nodes.Count) {
+            RibbonNode3D nd = this.nodes[i];
+            nd.Age = nd.Age + dt;
+            if (nd.Age >= this.LifetimeSec) {
+                this.nodes.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    // 基于当前存活节点构建连续双面丝带 Mesh3D（n 个节点生成 2*n 个顶点与 2*(n-1) 个三角形）。
+    public Mesh3D BuildRibbonMesh(Vector3 viewNormal) {
+        Mesh3D mesh = new Mesh3D();
+        int n = this.nodes.Count;
+        if (n < 2) { return mesh; }
+
+        float vLen = (float)Math.Sqrt((double)(viewNormal.X * viewNormal.X + viewNormal.Y * viewNormal.Y + viewNormal.Z * viewNormal.Z));
+        float vx = vLen > 0.0001f ? (viewNormal.X / vLen) : 0.0f;
+        float vy = vLen > 0.0001f ? (viewNormal.Y / vLen) : 1.0f;
+        float vz = vLen > 0.0001f ? (viewNormal.Z / vLen) : 0.0f;
+
+        for (int i = 0; i < n; i = i + 1) {
+            RibbonNode3D cur = this.nodes[i];
+            Vector3 pPrev = i > 0 ? this.nodes[i - 1].Position : cur.Position;
+            Vector3 pNext = i + 1 < n ? this.nodes[i + 1].Position : cur.Position;
+            float tx = pNext.X - pPrev.X;
+            float ty = pNext.Y - pPrev.Y;
+            float tz = pNext.Z - pPrev.Z;
+            // side = normalize(cross(tangent, viewNormal))
+            float sx = ty * vz - tz * vy;
+            float sy = tz * vx - tx * vz;
+            float sz = tx * vy - ty * vx;
+            float sLen = (float)Math.Sqrt((double)(sx * sx + sy * sy + sz * sz));
+            if (sLen > 0.0001f) {
+                sx = sx / sLen;
+                sy = sy / sLen;
+                sz = sz / sLen;
+            } else {
+                sx = 1.0f; sy = 0.0f; sz = 0.0f;
+            }
+
+            // 年龄越大（尾部）越细；最新点（头部）使用 StartWidth
+            float ageRatio = cur.Age / this.LifetimeSec;
+            if (ageRatio < 0.0f) { ageRatio = 0.0f; }
+            if (ageRatio > 1.0f) { ageRatio = 1.0f; }
+            float halfW = (this.StartWidth + (this.EndWidth - this.StartWidth) * ageRatio) * 0.5f;
+            float u = (float)i / (float)(n - 1);
+
+            mesh.Vertex(
+                cur.Position.X - sx * halfW,
+                cur.Position.Y - sy * halfW,
+                cur.Position.Z - sz * halfW,
+                vx, vy, vz, u, 0.0f);
+            mesh.Vertex(
+                cur.Position.X + sx * halfW,
+                cur.Position.Y + sy * halfW,
+                cur.Position.Z + sz * halfW,
+                vx, vy, vz, u, 1.0f);
+        }
+
+        for (int i = 0; i < n - 1; i = i + 1) {
+            int b = i * 2;
+            mesh.Triangle(b + 0, b + 2, b + 3);
+            mesh.Triangle(b + 0, b + 3, b + 1);
+        }
+        return mesh;
+    }
+}

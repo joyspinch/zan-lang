@@ -150,6 +150,7 @@ typedef struct {
     zgl_int u_holo_scan_params, u_holo_scan_color;
     zgl_int u_top_cover_params, u_top_cover_color;
     zgl_int u_wind_params, u_dist_fade;
+    zgl_int u_world_grid_params, u_world_grid_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -230,6 +231,8 @@ static float g_game_top_cover_params[4] = { 0.0f, 0.5f, 0.25f, 0.0f }; /* enable
 static float g_game_top_cover_color[3] = { 0.95f, 0.97f, 1.0f };
 static float g_game_wind_params[4] = { 0.0f, 1.5f, 0.0f, 1.0f }; /* amplitude, freq, phase, height_scale */
 static float g_game_dist_fade[3] = { 0.0f, 0.5f, 2.0f }; /* enabled, start_dist, end_dist */
+static float g_game_world_grid_params[4] = { 0.0f, 1.0f, 0.05f, 0.0f }; /* enabled, cell_size, line_width, strength */
+static float g_game_world_grid_color[3] = { 0.0f, 0.9f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -239,6 +242,7 @@ static float g_game_post_radial_blur[3] = { 0.0f, 0.5f, 0.5f }; /* strength, cx,
 static float g_game_post_pixelate[2] = { 0.0f, 0.0f }; /* pixel_size, posterize_levels */
 static float g_game_post_duotone_dark[4] = { 0.0f, 0.05f, 0.0f, 0.0f }; /* dark_r, g, b, strength */
 static float g_game_post_duotone_light[3] = { 0.2f, 1.0f, 0.35f }; /* light_r, g, b */
+static float g_game_post_crt[4] = { 0.0f, 64.0f, 0.0f, 1.0f }; /* intensity, count, curvature, glow_boost */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -535,6 +539,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uTopCoverParams;\n" \
 "uniform vec3 uTopCoverColor;\n" \
 "uniform vec3 uDistFade;\n" \
+"uniform vec4 uWorldGridParams;\n" \
+"uniform vec3 uWorldGridColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -719,6 +725,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        litSpec = (sl > 0.0001) ? (litSpec * (sq / sl)) : vec3(0.0);\n" \
     "    }\n" \
     "    vec3 rgb = baseRgb * mix(litDiff, litDiff * (0.35 + 0.65 * rough), metal) + specTint * litSpec + emitRgb + uDissolveEdge * dissEdgeBoost;\n" \
+    "    if (uWorldGridParams.x > 0.5 && uWorldGridParams.w > 0.0005) {\n" \
+    "        float gCell = max(uWorldGridParams.y, 0.05);\n" \
+    "        vec2 gCoord = v_world_pos.xz / gCell;\n" \
+    "        vec2 gDist = abs(fract(gCoord - 0.5) - 0.5);\n" \
+    "        vec2 gFw = max(fwidth(gCoord), vec2(0.001));\n" \
+    "        float gHalf = clamp(uWorldGridParams.z, 0.005, 0.45);\n" \
+    "        vec2 gLine = smoothstep(gHalf + gFw, max(gHalf - gFw, 0.0), gDist);\n" \
+    "        float gMask = max(gLine.x, gLine.y) * clamp(uWorldGridParams.w, 0.0, 1.0);\n" \
+    "        rgb = mix(rgb, uWorldGridColor, gMask);\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -854,6 +870,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uPostPixelate;\n"
 "uniform vec4 uPostDuotoneDark;\n"
 "uniform vec3 uPostDuotoneLight;\n"
+"uniform vec4 uPostCrt;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -866,6 +883,17 @@ static const char *const ZAN_GAME_POST_FS =
 "    if (uPostCinema.y > 0.0001) {\n"
 "        float wOff = sin(uv.y * uPostCinema.z + uPostCinema.w) * uPostCinema.y;\n"
 "        uv = clamp(vec2(uv.x + wOff, uv.y), vec2(0.0), vec2(1.0));\n"
+"    }\n"
+"    bool crtOutOfBounds = false;\n"
+"    if (uPostCrt.z > 0.0005) {\n"
+"        vec2 cc = uv * 2.0 - vec2(1.0);\n"
+"        float r2 = dot(cc, cc);\n"
+"        cc = cc * (1.0 + uPostCrt.z * r2);\n"
+"        uv = cc * 0.5 + vec2(0.5);\n"
+"        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {\n"
+"            crtOutOfBounds = true;\n"
+"        }\n"
+"        uv = clamp(uv, vec2(0.0), vec2(1.0));\n"
 "    }\n"
 "    if (uPostPixelate.x >= 1.5) {\n"
 "        vec2 stepUv = uTexelSize * uPostPixelate.x;\n"
@@ -966,6 +994,14 @@ static const char *const ZAN_GAME_POST_FS =
     "        float lv = floor(uPostPixelate.y) - 1.0;\n"
     "        col = floor(clamp(col, 0.0, 1.0) * lv + 0.5) / lv;\n"
     "    }\n"
+    "    if (uPostCrt.x > 0.0005) {\n"
+    "        float sWave = 0.5 + 0.5 * sin(uv.y * uPostCrt.y * 6.2831853);\n"
+    "        float sMul = (1.0 - clamp(uPostCrt.x, 0.0, 0.95) * (1.0 - sWave)) * max(uPostCrt.w, 0.1);\n"
+    "        col *= sMul;\n"
+    "    }\n"
+    "    if (crtOutOfBounds) {\n"
+    "        col = vec3(0.0);\n"
+    "    }\n"
     "    if (uPostCinema.x > 0.0005) {\n"
     "        if (v_uv.y < uPostCinema.x || v_uv.y > (1.0 - uPostCinema.x)) {\n"
     "            col = vec3(0.0);\n"
@@ -991,6 +1027,7 @@ typedef struct {
     zgl_int u_post_pixelate;
     zgl_int u_post_duotone_dark;
     zgl_int u_post_duotone_light;
+    zgl_int u_post_crt;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1242,6 +1279,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uWindParams");
     zgl_int dist_fade = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uDistFade");
+    zgl_int world_grid_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uWorldGridParams");
+    zgl_int world_grid_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uWorldGridColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1318,6 +1359,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_top_cover_color = top_cover_color;
     prog->u_wind_params = wind_params;
     prog->u_dist_fade = dist_fade;
+    prog->u_world_grid_params = world_grid_params;
+    prog->u_world_grid_color = world_grid_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1391,6 +1434,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int top_cover_color = g_game_gl->GetUniformLocation(program, "uTopCoverColor");
     zgl_int wind_params = g_game_gl->GetUniformLocation(program, "uWindParams");
     zgl_int dist_fade = g_game_gl->GetUniformLocation(program, "uDistFade");
+    zgl_int world_grid_params = g_game_gl->GetUniformLocation(program, "uWorldGridParams");
+    zgl_int world_grid_color = g_game_gl->GetUniformLocation(program, "uWorldGridColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1455,6 +1500,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_top_cover_color = top_cover_color;
     g_game_skin_prog.u_wind_params = wind_params;
     g_game_skin_prog.u_dist_fade = dist_fade;
+    g_game_skin_prog.u_world_grid_params = world_grid_params;
+    g_game_skin_prog.u_world_grid_color = world_grid_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1933,6 +1980,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_dist_fade >= 0) {
         gl->Uniform3fv(prog->u_dist_fade, 1, g_game_dist_fade);
+    }
+    if (prog->u_world_grid_params >= 0) {
+        gl->Uniform4f(prog->u_world_grid_params,
+            g_game_world_grid_params[0], g_game_world_grid_params[1],
+            g_game_world_grid_params[2], g_game_world_grid_params[3]);
+    }
+    if (prog->u_world_grid_color >= 0) {
+        gl->Uniform3fv(prog->u_world_grid_color, 1, g_game_world_grid_color);
     }
 }
 
@@ -2510,6 +2565,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_pixelate = g_game_gl->GetUniformLocation(prog, "uPostPixelate");
     g_game_post_prog.u_post_duotone_dark = g_game_gl->GetUniformLocation(prog, "uPostDuotoneDark");
     g_game_post_prog.u_post_duotone_light = g_game_gl->GetUniformLocation(prog, "uPostDuotoneLight");
+    g_game_post_prog.u_post_crt = g_game_gl->GetUniformLocation(prog, "uPostCrt");
     return &g_game_post_prog;
 }
 
@@ -2634,6 +2690,11 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_duotone_light >= 0) {
         gl->Uniform3fv(prog->u_post_duotone_light, 1, g_game_post_duotone_light);
+    }
+    if (prog->u_post_crt >= 0) {
+        gl->Uniform4f(prog->u_post_crt,
+            g_game_post_crt[0], g_game_post_crt[1],
+            g_game_post_crt[2], g_game_post_crt[3]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3004,4 +3065,33 @@ ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
     g_game_post_duotone_light[0] = light_r > 0.0f ? light_r : 0.0f;
     g_game_post_duotone_light[1] = light_g > 0.0f ? light_g : 0.0f;
     g_game_post_duotone_light[2] = light_b > 0.0f ? light_b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_world_grid3d(int32_t enabled, float cell_size,
+    float line_width, float strength, float r, float g, float b) {
+    g_game_world_grid_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_world_grid_params[1] = cell_size > 0.05f ? cell_size : 1.0f;
+    if (line_width < 0.005f) line_width = 0.005f;
+    if (line_width > 0.45f) line_width = 0.45f;
+    g_game_world_grid_params[2] = line_width;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    g_game_world_grid_params[3] = strength;
+    g_game_world_grid_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_world_grid_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_world_grid_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
+    float scanline_count, float curvature, float glow_boost) {
+    if (scanline_intensity < 0.0f) scanline_intensity = 0.0f;
+    if (scanline_intensity > 0.95f) scanline_intensity = 0.95f;
+    if (scanline_count < 2.0f) scanline_count = 64.0f;
+    if (curvature < 0.0f) curvature = 0.0f;
+    if (curvature > 0.5f) curvature = 0.5f;
+    if (glow_boost < 0.1f) glow_boost = 1.0f;
+    g_game_post_crt[0] = scanline_intensity;
+    g_game_post_crt[1] = scanline_count;
+    g_game_post_crt[2] = curvature;
+    g_game_post_crt[3] = glow_boost;
 }

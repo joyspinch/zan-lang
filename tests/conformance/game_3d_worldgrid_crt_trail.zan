@@ -1,0 +1,124 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DWorldGridCrtTrailTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int ChannelR(int argb) { return (argb >> 16) & 255; }
+    static int ChannelG(int argb) { return (argb >> 8) & 255; }
+    static int ChannelB(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 1. GPU 世界空间抗锯齿程序化网格（水平 XZ 地面）
+        Mesh3D floor = new Mesh3D();
+        floor.Vertex(-4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f);
+        floor.Vertex(-4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+        floor.Triangle(0, 2, 1);
+        floor.Triangle(0, 3, 2);
+        int floorMesh = cv.MeshUpload(floor);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 4.0f, 0.001f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.FieldOfView = 1.0471975f;
+        cam.AspectRatio = 1.0f;
+
+        Material mat = Material.Solid(0.0f, 0.0f, 0.0f);
+        mat.EmissiveRed = 0.10f;
+        mat.EmissiveGreen = 0.10f;
+        mat.EmissiveBlue = 0.10f;
+        mat.WorldGridEnabled = true;
+        mat.WorldGridCellSize = 2.0f;
+        mat.WorldGridLineWidth = 0.10f;
+        mat.WorldGridStrength = 1.0f;
+        mat.WorldGridRed = 0.0f;
+        mat.WorldGridGreen = 0.95f;
+        mat.WorldGridBlue = 1.0f;
+
+        SceneNode root = new SceneNode("root");
+        SceneNode node = new SceneNode("floor");
+        node.MeshKey = floorMesh;
+        node.BoundsRadius = 8.0f;
+        node.Material = mat;
+        root.AddChild(node);
+
+        RenderPlan plan = new RenderPlan(cam);
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+
+        // 中心 (64, 64) 对应世界原点 (0, 0) 格线交点 -> 亮青色；(92, 92) 对应格心 (~1.0, ~1.0) -> 深灰底色
+        int linePx = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int cellPx = zan_gui_read_pixel(cv.SurfaceId(), 92, 92);
+        bool gridOk = ChannelG(linePx) > 200 && ChannelB(linePx) > 200 && ChannelR(linePx) < 40
+            && ChannelG(cellPx) < 60 && ChannelB(cellPx) < 60;
+        Console.WriteLine("gpu-world-grid: " + Convert.ToString(gridOk ? 1 : 0));
+
+        // 2. GPU 后处理复古 CRT 扫描线与曲面桶形畸变
+        mat.WorldGridEnabled = false;
+        mat.EmissiveRed = 0.90f;
+        mat.EmissiveGreen = 0.90f;
+        mat.EmissiveBlue = 0.90f;
+
+        PostProcess pp = new PostProcess();
+        pp.CrtScanlineIntensity = 0.80f;
+        pp.CrtScanlineCount = 32.0f;
+        pp.CrtCurvature = 0.25f;
+        pp.CrtGlowBoost = 1.0f;
+        ren.PostProcess = pp;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan.Build(root);
+        ren.Draw(cv, plan);
+
+        int cornerPx = zan_gui_read_pixel(cv.SurfaceId(), 1, 1);
+        int minG = 255;
+        int maxG = 0;
+        for (int y = 56; y < 72; y = y + 1) {
+            int g = ChannelG(zan_gui_read_pixel(cv.SurfaceId(), 64, y));
+            if (g < minG) { minG = g; }
+            if (g > maxG) { maxG = g; }
+        }
+        bool crtOk = ChannelR(cornerPx) < 5 && ChannelG(cornerPx) < 5 && ChannelB(cornerPx) < 5
+            && maxG > 190 && minG < 90 && (maxG - minG) > 100;
+        Console.WriteLine("gpu-post-crt-scanline: " + Convert.ToString(crtOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. 3D 武器刀光动态丝带：最小间距过滤、顶点/三角形生成与超时老化清理
+        TrailRibbon3D ribbon = new TrailRibbon3D(16, 0.5f, 0.2f, 0.5f, 0.05f);
+        bool s1 = ribbon.PushSample(new Vector3(0.0f, 0.0f, 0.0f));
+        bool tinyIgnored = !ribbon.PushSample(new Vector3(0.05f, 0.0f, 0.0f)); // 小于 MinStepDist=0.2
+        ribbon.Update(0.15f);
+        bool s2 = ribbon.PushSample(new Vector3(1.0f, 0.0f, 0.0f));
+        ribbon.Update(0.15f);
+        bool s3 = ribbon.PushSample(new Vector3(2.0f, 0.5f, 0.0f));
+        ribbon.Update(0.15f);
+        bool s4 = ribbon.PushSample(new Vector3(3.0f, 0.2f, 0.0f));
+
+        Mesh3D rMesh = ribbon.BuildRibbonMesh(new Vector3(0.0f, 0.0f, 1.0f));
+        int verts4 = rMesh.VertexCount(); // 4 节点 * 2 = 8 顶点
+        ribbon.Update(0.10f);             // s1 总龄 0.55s >= 0.5s 被淘汰 -> 剩 3 节点
+        int afterPrune = ribbon.NodeCount();
+        ribbon.Update(0.60f);             // 全部过期清空
+        int afterClear = ribbon.NodeCount();
+
+        bool trailOk = s1 && tinyIgnored && s2 && s3 && s4
+            && verts4 == 8 && afterPrune == 3 && afterClear == 0;
+        Console.WriteLine("render3d-trail-ribbon: " + Convert.ToString(trailOk ? 1 : 0));
+    }
+}

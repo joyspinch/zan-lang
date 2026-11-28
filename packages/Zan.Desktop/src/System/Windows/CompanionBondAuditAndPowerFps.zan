@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌宠羁绊等级里程碑解锁项。
+public class BondMilestoneUnlock {
+    public int RequiredLevel;
+    public string UnlockId;
+
+    public BondMilestoneUnlock(int requiredLevel, string unlockId) {
+        this.RequiredLevel = requiredLevel > 0 ? requiredLevel : 1;
+        this.UnlockId = unlockId != null ? unlockId : "";
+    }
+}
+
+// 商业桌面陪伴好感度/羁绊等级树：
+// - 每日互动经验上限（DailyXpCap）防刷，跨日自动刷新额度
+// - 经验溢出自动连升多级并动态判定解锁的专属动作/语音/称号
+public class CompanionAffectionBondTree {
+    public int Level;
+    public int CurrentXp;
+    public int XpPerLevel;
+    public int DailyXpCap;
+    public int TodayXpEarned;
+    public int ActiveDay;
+    private List<BondMilestoneUnlock> milestones;
+
+    public CompanionAffectionBondTree(int xpPerLevel, int dailyXpCap, int startDay) {
+        this.Level = 1;
+        this.CurrentXp = 0;
+        this.XpPerLevel = xpPerLevel > 0 ? xpPerLevel : 100;
+        this.DailyXpCap = dailyXpCap > 0 ? dailyXpCap : 200;
+        this.TodayXpEarned = 0;
+        this.ActiveDay = startDay;
+        this.milestones = new List<BondMilestoneUnlock>();
+    }
+
+    public void RegisterMilestone(int requiredLevel, string unlockId) {
+        this.milestones.Add(new BondMilestoneUnlock(requiredLevel, unlockId));
+    }
+
+    // 增加互动好感经验，返回实际生效入账经验值。
+    public int GrantBondXp(int amount, int dayNumber) {
+        if (amount <= 0) { return 0; }
+        if (dayNumber > this.ActiveDay) {
+            this.ActiveDay = dayNumber;
+            this.TodayXpEarned = 0;
+        }
+        int remain = this.DailyXpCap - this.TodayXpEarned;
+        if (remain <= 0) { return 0; }
+        int applied = amount < remain ? amount : remain;
+        this.TodayXpEarned = this.TodayXpEarned + applied;
+        this.CurrentXp = this.CurrentXp + applied;
+        while (this.CurrentXp >= this.XpPerLevel) {
+            this.CurrentXp = this.CurrentXp - this.XpPerLevel;
+            this.Level = this.Level + 1;
+        }
+        return applied;
+    }
+
+    public bool IsMilestoneUnlocked(string unlockId) {
+        for (int i = 0; i < this.milestones.Count; i = i + 1) {
+            if (this.milestones[i].UnlockId == unlockId) {
+                return this.Level >= this.milestones[i].RequiredLevel;
+            }
+        }
+        return false;
+    }
+}
+
+// 本地桌宠行为审计事件记录。
+public class CompanionAuditEntry {
+    public long TimestampMs;
+    public string Category;
+    public string Detail;
+
+    public CompanionAuditEntry(long timestampMs, string category, string detail) {
+        this.TimestampMs = timestampMs;
+        this.Category = category != null ? category : "";
+        this.Detail = detail != null ? detail : "";
+    }
+}
+
+// 商业桌面陪伴定长环形事件审计日志（零无限内存膨胀，支持类别筛选与最近 N 条导出）：
+public class CompanionRingEventLog {
+    public int Capacity;
+    private List<CompanionAuditEntry> entries;
+
+    public CompanionRingEventLog(int capacity) {
+        this.Capacity = capacity > 0 ? capacity : 64;
+        this.entries = new List<CompanionAuditEntry>();
+    }
+
+    public int Count() {
+        return this.entries.Count;
+    }
+
+    public void Append(long timestampMs, string category, string detail) {
+        this.entries.Add(new CompanionAuditEntry(timestampMs, category, detail));
+        while (this.entries.Count > this.Capacity) {
+            this.entries.RemoveAt(0);
+        }
+    }
+
+    public List<CompanionAuditEntry> QueryByCategory(string category) {
+        List<CompanionAuditEntry> res = new List<CompanionAuditEntry>();
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Category == category) {
+                res.Add(this.entries[i]);
+            }
+        }
+        return res;
+    }
+
+    public CompanionAuditEntry Latest() {
+        if (this.entries.Count == 0) { return null; }
+        return this.entries[this.entries.Count - 1];
+    }
+}
+
+// 桌宠低耗电自适应帧率档位。
+public enum PowerPacingMode {
+    Active60 = 0,
+    Normal30 = 1,
+    EcoIdle12 = 2,
+    Hibernated2 = 3
+}
+
+// 商业桌面陪伴低耗电自适应帧率调度器：
+// - 综合交互活跃度、空闲时长、窗口遮挡/最小化与电池供电状态动态选择帧率档位
+// - 显著降低常驻桌宠后台 GPU/CPU 占用与笔记本续航损耗
+public class CompanionAdaptiveFramePacer {
+    public int IdleDowngradeSec;
+    public int HibernateSec;
+
+    public CompanionAdaptiveFramePacer(int idleDowngradeSec, int hibernateSec) {
+        this.IdleDowngradeSec = idleDowngradeSec > 0 ? idleDowngradeSec : 15;
+        this.HibernateSec = hibernateSec > this.IdleDowngradeSec ? hibernateSec : 120;
+    }
+
+    public PowerPacingMode ResolveMode(bool windowOccludedOrMinimized, bool interactingNow,
+                                       bool onBatterySaver, int idleSeconds) {
+        if (windowOccludedOrMinimized || idleSeconds >= this.HibernateSec) {
+            return PowerPacingMode.Hibernated2;
+        }
+        if (interactingNow) {
+            return onBatterySaver ? PowerPacingMode.Normal30 : PowerPacingMode.Active60;
+        }
+        if (onBatterySaver || idleSeconds >= this.IdleDowngradeSec) {
+            return PowerPacingMode.EcoIdle12;
+        }
+        return PowerPacingMode.Normal30;
+    }
+
+    public int TargetFps(PowerPacingMode mode) {
+        if (mode == PowerPacingMode.Active60) { return 60; }
+        if (mode == PowerPacingMode.Normal30) { return 30; }
+        if (mode == PowerPacingMode.EcoIdle12) { return 12; }
+        return 2;
+    }
+
+    public int FrameIntervalMs(PowerPacingMode mode) {
+        int fps = this.TargetFps(mode);
+        return 1000 / fps;
+    }
+}

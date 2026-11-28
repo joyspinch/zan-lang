@@ -257,6 +257,17 @@ ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
     float dark_r, float dark_g, float dark_b,
     float light_r, float light_g, float light_b);
 
+/* GPU 世界空间抗锯齿程序化网格（World-Space Procedural Grid，适用于战棋/RTS/模拟建造/场景编辑器）：
+ * enabled != 0 时按 cell_size 与 fwidth 硬件导数抗锯齿绘制 XZ 平面网格线并按 strength 混入输出。 */
+ZAN_GAME_API void zan_game_set_world_grid3d(int32_t enabled, float cell_size,
+    float line_width, float strength, float r, float g, float b);
+
+/* GPU 后处理复古 CRT 扫描线与曲面桶形畸变（CRT Scanlines + Barrel Curvature，零额外 Pass）：
+ * scanline_intensity [0..0.95] 控制扫描线压暗深度，scanline_count 控制纵向条纹周期，
+ * curvature [0..0.5] 控制桶形曲面弯曲与黑边，glow_boost 控制扫描线亮度补偿。 */
+ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
+    float scanline_count, float curvature, float glow_boost);
+
 #ifdef __cplusplus
 }
 #endif
