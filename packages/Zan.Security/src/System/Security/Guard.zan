@@ -32,6 +32,7 @@ public class Guard {
 
     // Guard 是否已启动（Arm 幂等标记）。
     static bool armed;
+    private static string armLock = "Zan.Guard.Arm";
     // 时钟偏差连续计次；连续两次超出阈值才终止（单次可能是调度抖动）。
     static int strikes;
     static long baseTick;  // GetTickCount64 基准（墙上时钟毫秒）
@@ -44,22 +45,24 @@ public class Guard {
     // 启动防护：一次性的反附加、计时基准以及后台
     // 看门狗。可安全调用一次；重复调用会被忽略。
     public static void Arm() {
-        if (Guard.armed) { return; }
-        Guard.armed = true;
-        Guard.strikes = 0;
+        lock (Guard.armLock) {
+            if (Guard.armed) { return; }
+            Guard.armed = true;
+            Guard.strikes = 0;
 
-        #if WINDOWS
-        Guard.qpcFreq = Guard.ZanStopwatchFrequency();
-        Guard.baseQpc = Guard.ZanStopwatchTicks();
-        Guard.baseTick = Guard.WinGetTickCount64();
-        Guard.CheckOnce();
-        #elif MACOS
-        Guard.PosixPtrace(31, 0, 0, 0);  // PT_DENY_ATTACH
-        #else
-        if (Guard.PosixPtrace(0, 0, 0, 0) < 0) { Guard.Trip(); }  // PTRACE_TRACEME
-        #endif
+            #if WINDOWS
+            Guard.qpcFreq = Guard.ZanStopwatchFrequency();
+            Guard.baseQpc = Guard.ZanStopwatchTicks();
+            Guard.baseTick = Guard.WinGetTickCount64();
+            Guard.CheckOnce();
+            #elif MACOS
+            Guard.PosixPtrace(31, 0, 0, 0);  // PT_DENY_ATTACH
+            #else
+            if (Guard.PosixPtrace(0, 0, 0, 0) < 0) { Guard.Trip(); }  // PTRACE_TRACEME
+            #endif
 
-        Thread.Start(Guard.Watch);
+            Thread.Start(Guard.Watch);
+        }
     }
 
     // 一次廉价的内联检查：检测是否有调试器附加。游戏也可
@@ -93,7 +96,9 @@ public class Guard {
             // 远超出调度器抖动范围。
             if (Guard.qpcFreq > 0) {
                 long nowQpc = Guard.ZanStopwatchTicks();
-                long qpcMs = (nowQpc - Guard.baseQpc) / (Guard.qpcFreq / 1000);
+                long deltaTicks = nowQpc - Guard.baseQpc;
+                long qpcMs = (deltaTicks / Guard.qpcFreq) * 1000L
+                    + ((deltaTicks % Guard.qpcFreq) * 1000L) / Guard.qpcFreq;
                 long tickMs = Guard.WinGetTickCount64() - Guard.baseTick;
                 if (tickMs > 3000) {
                     long diff = qpcMs - tickMs;

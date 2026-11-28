@@ -761,20 +761,33 @@ public class X509Certificate {
             int keyEnd = Tlv(der, bitsEnd, p, 48);
             if (keyEnd != bitsEnd) { return null; }
             int nEnd = Tlv(der, keyEnd, p, 2);
-            if (nEnd < 0) { return null; }
+            if (nEnd < 0 || nEnd <= p[0]) { return null; }
             int nStart = p[0];
-            if (nEnd - nStart > 1 && (der[nStart] & 255) == 0) { nStart = nStart + 1; }
+            int nFirst = der[nStart] & 255;
+            if ((nFirst & 128) != 0) { return null; }
+            if (nEnd - nStart > 1 && nFirst == 0) {
+                if ((der[nStart + 1] & 128) == 0) { return null; }
+                nStart = nStart + 1;
+            }
             cert.rsaNLen = nEnd - nStart;
-            if (cert.rsaNLen < 64 || cert.rsaNLen > 512) { return null; }
+            if (cert.rsaNLen < 64 || cert.rsaNLen > 512 || (der[nEnd - 1] & 1) == 0) { return null; }
             cert.rsaN = new byte[cert.rsaNLen];
             NativeMemory.Copy(cert.rsaN, (nint)der + (nint)nStart, cert.rsaNLen);
             p[0] = nEnd;
             int eEnd = Tlv(der, keyEnd, p, 2);
-            if (eEnd != keyEnd) { return null; }
-            cert.rsaELen = eEnd - p[0];
-            if (cert.rsaELen < 1 || cert.rsaELen > 8) { return null; }
+            if (eEnd != keyEnd || eEnd <= p[0]) { return null; }
+            int eStart = p[0];
+            int eFirst = der[eStart] & 255;
+            if ((eFirst & 128) != 0) { return null; }
+            if (eEnd - eStart > 1 && eFirst == 0) {
+                if ((der[eStart + 1] & 128) == 0) { return null; }
+                eStart = eStart + 1;
+            }
+            cert.rsaELen = eEnd - eStart;
+            if (cert.rsaELen < 1 || cert.rsaELen > 8 || (der[eEnd - 1] & 1) == 0) { return null; }
+            if (cert.rsaELen == 1 && (der[eStart] & 255) < 3) { return null; }
             cert.rsaE = new byte[cert.rsaELen];
-            NativeMemory.Copy(cert.rsaE, (nint)der + (nint)p[0], cert.rsaELen);
+            NativeMemory.Copy(cert.rsaE, (nint)der + (nint)eStart, cert.rsaELen);
             p[0] = spkiEnd;
         }
         int exEnd = Tlv(der, tbsEnd, p, 163);
@@ -846,7 +859,12 @@ public class X509Certificate {
                 cert.hasKeyUsage = true;
                 int be = Tlv(der, octEnd, p, 3);
                 if (be != octEnd || be - p[0] < 2) { return null; }
+                int unusedBits = der[p[0]] & 255;
+                if (unusedBits > 7) { return null; }
                 int flags = der[p[0] + 1] & 255;
+                if (be - p[0] == 2) {
+                    flags = flags & ((255 << unusedBits) & 255);
+                }
                 cert.digitalSignature = (flags & 128) != 0;
                 cert.keyCertSign = (flags & 4) != 0;
             } else if (Oid(der, oidAt, oidLen, 85, 29, 17)) {

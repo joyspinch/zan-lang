@@ -53,13 +53,18 @@ public class Account {
         return new Account(raw);
     }
 
-    // 随机生成全新的强加密私钥并创建账户
+    // 随机生成全新的强加密私钥并创建账户（拒绝落到 0 或 >= secp256k1.n 的极端私钥）
     public static Account CreateRandom() {
         byte[] priv = new byte[32];
-        if (RandomNumberGenerator.Fill(priv, 32) != 32) {
-            throw new Exception("CSPRNG failed to generate private key");
+        for (int attempt = 0; attempt < 16; attempt = attempt + 1) {
+            if (RandomNumberGenerator.Fill(priv, 32) != 32) {
+                throw new Exception("CSPRNG failed to generate private key");
+            }
+            if (Secp256k1.GetPublicKeyRaw(priv) != null) {
+                return new Account(priv);
+            }
         }
-        return new Account(priv);
+        throw new Exception("CSPRNG failed to generate valid secp256k1 private key");
     }
 
     // 对 32 字节哈希值进行纯 Secp256k1 ECDSA 签名
@@ -186,8 +191,9 @@ public class Account {
 
     // 符合以太坊 EIP-712 标准的结构化类型数据签名 (DeFi 挂单/授权/Permit 规范)
     public string SignTypedData(Eip712Domain domain, byte[] structHash32) {
-        if (domain == null || structHash32 == null) { return null; }
+        if (domain == null || structHash32 == null || structHash32.Length != 32) { return null; }
         byte[] hash = Eip712.HashTypedData(domain, structHash32);
+        if (hash == null || hash.Length != 32) { return null; }
         Secp256k1Signature sig = Secp256k1.Sign(hash, PrivateKey);
         if (sig == null) { return null; }
 
@@ -203,7 +209,8 @@ public class Account {
 
     // 校验 EIP-712 结构化数据签名是否合法有效
     public static bool VerifyTypedData(Eip712Domain domain, byte[] structHash32, string signatureHex, Address expectedSigner) {
-        if (domain == null || structHash32 == null || signatureHex == null || expectedSigner == null) { return false; }
+        if (domain == null || structHash32 == null || structHash32.Length != 32
+            || signatureHex == null || expectedSigner == null) { return false; }
         string clean = signatureHex.Trim();
         if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
             clean = clean.Substring(2);
@@ -227,6 +234,7 @@ public class Account {
 
         Secp256k1Signature sig = new Secp256k1Signature(r, s, v);
         byte[] hash = Eip712.HashTypedData(domain, structHash32);
+        if (hash == null || hash.Length != 32) { return false; }
 
         Address recovered = Address.Recover(hash, sig);
         if (recovered == null) { return false; }

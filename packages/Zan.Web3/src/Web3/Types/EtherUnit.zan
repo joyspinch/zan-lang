@@ -10,18 +10,27 @@ public class EtherUnit {
     public static long WeiPerGwei = 1000000000L; // 10^9
 
     private static BigInt _weiPerEther;
+    private static BigInt _weiPerGwei;
     private static bool _ready = false;
+    private static string initLock = "Zan.EtherUnit.Init";
 
-    private static void init() {
-        if (_ready) { return; }
-        // 10^18 = 0x0DE0B6B3A7640000
+    private static BigInt FromNonNegLong(long val) {
+        if (val <= 0L) { return BigInt.zero(); }
         byte[] b = new byte[8];
-        long val = 1000000000000000000L;
         for (int i = 0; i < 8; i = i + 1) {
             b[7 - i] = (byte)((val >> (i * 8)) & 255);
         }
-        _weiPerEther = BigInt.FromBytesBE(b, 8);
-        _ready = true;
+        return BigInt.FromBytesBE(b, 8);
+    }
+
+    private static void init() {
+        if (_ready) { return; }
+        lock (EtherUnit.initLock) {
+            if (_ready) { return; }
+            _weiPerEther = FromNonNegLong(1000000000000000000L);
+            _weiPerGwei = FromNonNegLong(WeiPerGwei);
+            _ready = true;
+        }
     }
 
     public static BigInt WeiPerEther() {
@@ -29,25 +38,26 @@ public class EtherUnit {
         return _weiPerEther;
     }
 
-    // 从 Gwei 构造 Wei 大整数
+    // 从 Gwei 构造 Wei 大整数（使用 BigInt 乘法，避免 > 9.22 ETH 时 64 位有符号溢出）
     public static BigInt FromGwei(long gwei) {
-        if (gwei <= 0) { return BigInt.zero(); }
-        long weiTotal = gwei * WeiPerGwei;
-        byte[] b = new byte[8];
-        for (int i = 0; i < 8; i = i + 1) {
-            b[7 - i] = (byte)((weiTotal >> (i * 8)) & 255);
-        }
-        return BigInt.FromBytesBE(b, 8);
+        if (gwei <= 0L) { return BigInt.zero(); }
+        init();
+        return BigInt.mul(FromNonNegLong(gwei), _weiPerGwei);
     }
 
-    // 将 Wei 转为整数 Gwei（提取 64 位范围安全转换）
+    // 将任意精度 Wei 大整数除以 10^9 转为整数 Gwei（超过 long.MaxValue 时饱和返回 long.MaxValue）
     public static long ToGwei(BigInt wei) {
-        if (wei == null || wei.isZero()) { return 0; }
-        byte[] bytes = wei.ToBytesBE(8);
-        long val = 0;
-        for (int i = 0; i < 8; i = i + 1) {
-            val = (val << 8) | (long)(bytes[i] & 255);
+        if (wei == null || wei.isZero()) { return 0L; }
+        int n = wei.count();
+        ulong rem = 0UL;
+        ulong q = 0UL;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            ulong cur = (rem << 32) | (ulong)(wei.limb(i) & 4294967295L);
+            ulong digit = cur / 1000000000UL;
+            rem = cur % 1000000000UL;
+            if (q > 2147483647UL) { return 9223372036854775807L; }
+            q = (q << 32) | digit;
         }
-        return val / WeiPerGwei;
+        return (long)q;
     }
 }
