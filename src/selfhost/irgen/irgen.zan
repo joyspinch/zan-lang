@@ -307,6 +307,8 @@ partial class Irgen {
     public List<int> asyncBoxIdx;
     public int asyncForeachBase;   // first frame slot of the foreach loop temps
     public int asyncForeachNext;   // next foreach temp slot to hand out
+    public List<Node> asyncPatternNodes;
+    public List<int> asyncPatternSlots;
     public bool curAsyncThis;
     public int curAsyncThisSlot;
     public Node curAsyncThisTy;
@@ -1207,23 +1209,18 @@ partial class Irgen {
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
             if (m.kind == AK.FieldDecl() && !IsStatic(m) && m.b != null) {
-                // each initializer is a statement of its own: the store
-                // retains, and the initializer's owned temporaries (the
-                // `new H()` itself) are released after it -- they were never
-                // released, so every `public H State = new H();` leaked one
-                // reference (list_removeat_owned_receiver)
-                List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
-                List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
-                stmtTemps = new List<string>(); stmtTempValues = new List<string>();
-                stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+                // each initializer is a statement of its own: bracket with
+                // BranchTempScope so temps are armed against throwing
+                // initializers and released after storing into the field.
+                BranchTempScope fiBts = EnterBranchTempScope();
                 ExprVal v = null;
                 // a Binding<T> field takes a fresh Binding object (the C
                 // host's emit_binding_value)
                 if (IsBindingTy(m.type)) { v = GenBindingValue(m.b, m.type); }
                 if (v == null) { v = GenExpr(m.b); }
+                v = ApplyUserConv(m.type, v, false);
                 StoreField(thisOp, cls.sval, m.sval, v);
-                EmitTempReleases();
-                stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
+                LeaveBranchTempScope(fiBts);
             }
             i = i + 1;
         }

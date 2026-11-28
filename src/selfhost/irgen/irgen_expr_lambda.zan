@@ -769,6 +769,11 @@ partial class Irgen {
         int sLoopScope = loopScopeBase;
         List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
         List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+        List<List<string>> sArmStack = callArmStack;
+        List<Dictionary<string, bool>> sArmSets = callArmSets;
+        List<List<string>> sArmPending = callArmPending;
+        List<StringBuilder> sArmFn = callArmFn;
+        bool sHasPend = hasPendingCallArm;
         List<Node> sFinBodies = finBodies;
         List<int> sFinLive = finLive;
         List<int> sFinActive = finActive;
@@ -783,6 +788,8 @@ partial class Irgen {
         bool sAsync = curAsync;
         body = new StringBuilder();
         entryAllocas = new StringBuilder(); eaActive = true;
+        callArmStack = null; callArmSets = null; callArmPending = null;
+        callArmFn = null; hasPendingCallArm = false;
         tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
         locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
@@ -915,40 +922,47 @@ partial class Irgen {
                 else { L("  ret " + curRet + " " + ZeroConst(curRet)); }
             }
         } else {
-            stmtTemps = new List<string>(); stmtTempValues = new List<string>();
-            stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+            ResetStmtTemps();
+            EnterCallArm();
             ExprVal rv = GenExpr(lam.a);
             if (curRet == "void") {
+                LeaveCallArm();
                 EmitTempReleases();
                 ReleaseLocalsFrom(0);
                 L("  ret void");
-            } else if (IsNullableValue(retTy)) {
-                string rvs = BoxFor(rv, retTy);
-                EmitArcRetain(rvs, retTy);
-                EmitTempReleases();
-                ReleaseLocalsFrom(0);
-                L("  ret i8* " + rvs);
             } else {
-                string rvs = "";
-                if (IsErasedType(retTy) && MapType(rv.ty) != "i64") {
-                    // erased return slot: pack the concrete value (double via
-                    // bitcast, pointers via ptrtoint) instead of Coerce
-                    EmitArcRetain(rv.op, rv.ty);
-                    rvs = ToSlot(rv, rv.ty);
+                rv = ApplyUserConv(retTy, rv, false);
+                if (!convApplied) { rv = StrSlotConv(retTy, rv); }
+                if (IsNullableValue(retTy)) {
+                    string rvs = BoxFor(rv, retTy);
+                    EmitArcRetain(rvs, retTy);
+                    LeaveCallArm();
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret i8* " + rvs);
                 } else {
-                    // the retain reads the PRE-coercion value: Coerce packs a
-                    // pointer into an erased i64 slot via ptrtoint, and
-                    // retaining the packed integer as i8* is invalid IR
-                    // (B-ID199 r9, generic_delegate_overload:
-                    // `zretain(i8* %t36)` where %t36 = ptrtoint). Same shape
-                    // as the erased-slot branch above.
-                    rv = NarrowToDeclared(rv, retTy);
-                    EmitArcRetain(rv.op, rv.ty);
-                    rvs = Coerce(rv, curRet);
+                    string rvs = "";
+                    if (IsErasedType(retTy) && MapType(rv.ty) != "i64") {
+                        // erased return slot: pack the concrete value (double via
+                        // bitcast, pointers via ptrtoint) instead of Coerce
+                        EmitArcRetain(rv.op, rv.ty);
+                        rvs = ToSlot(rv, rv.ty);
+                    } else {
+                        // the retain reads the PRE-coercion value: Coerce packs a
+                        // pointer into an erased i64 slot via ptrtoint, and
+                        // retaining the packed integer as i8* is invalid IR
+                        // (B-ID199 r9, generic_delegate_overload:
+                        // `zretain(i8* %t36)` where %t36 = ptrtoint). Same shape
+                        // as the erased-slot branch above.
+                        rv = NarrowToDeclared(rv, retTy);
+                        EmitArcRetain(rv.op, rv.ty);
+                        rvs = Coerce(rv, curRet);
+                    }
+                    LeaveCallArm();
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret " + curRet + " " + rvs);
                 }
-                EmitTempReleases();
-                ReleaseLocalsFrom(0);
-                L("  ret " + curRet + " " + rvs);
             }
         }
         L("}");
@@ -975,6 +989,8 @@ partial class Irgen {
         brkTarget = sBrk; contTarget = sCont;
         loopScopeBase = sLoopScope;
         stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
+        callArmStack = sArmStack; callArmSets = sArmSets; callArmPending = sArmPending;
+        callArmFn = sArmFn; hasPendingCallArm = sHasPend;
         finBodies = sFinBodies; finLive = sFinLive; finActive = sFinActive;
         finMonSlot = sFinMonSlot;
         catchExcVal = sCatchExcVal; catchExcTid = sCatchExcTid;
