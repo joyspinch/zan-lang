@@ -1,0 +1,907 @@
+using System;
+
+namespace Game.Graphics.Gpu;
+
+// 纯 Zan 3D 渲染管线主入口：帧会话、单次/蒙皮/实例化批/真光照实例批、阴影、天空盒与后处理。
+internal static class GameGpuRenderer {
+    private static bool shadowOwnsGpu;
+
+    private static void SetVec3(GlApi gl, int loc, float x, float y, float z) {
+        if (loc < 0) { return; }
+        nint p = GameGpuState.FloatBuf + GameGpuState.OffTmpVec;
+        Span<float> v = new Span<float>(p, 3);
+        v[0] = x; v[1] = y; v[2] = z;
+        gl.Uniform3fv(loc, 1, p);
+    }
+
+    private static void ComputeClip(GpuFrameInfo frame, out int x, out int y, out int w, out int h) {
+        long x0 = frame.ClipX;
+        long y0 = frame.ClipY;
+        long x1 = x0 + frame.ClipW;
+        long y1 = y0 + frame.ClipH;
+        if (x0 < 0L) { x0 = 0L; }
+        if (y0 < 0L) { y0 = 0L; }
+        if (x1 > (long)frame.Width) { x1 = (long)frame.Width; }
+        if (y1 > (long)frame.Height) { y1 = (long)frame.Height; }
+        if (frame.ClipW <= 0 || frame.ClipH <= 0 || x1 <= x0 || y1 <= y0) {
+            x = 0; y = 0; w = 0; h = 0;
+            return;
+        }
+        x = (int)x0;
+        y = frame.Height - (int)y1;
+        w = (int)(x1 - x0);
+        h = (int)(y1 - y0);
+    }
+
+    public static void ApplyBlendState(GlApi gl) {
+        if (GameGpuState.CurBlend != GameGpuState.BlendEnabled) {
+            if (GameGpuState.BlendEnabled == 2) {
+                gl.Enable(GlBridge.BLEND);
+                if (gl.HasBlendFuncSeparate) {
+                    gl.BlendFuncSeparate(GlBridge.SRC_ALPHA, GlBridge.ONE, GlBridge.ONE, GlBridge.ONE_MINUS_SRC_ALPHA);
+                } else {
+                    gl.BlendFunc(GlBridge.SRC_ALPHA, GlBridge.ONE);
+                }
+            } else if (GameGpuState.BlendEnabled == 1) {
+                gl.Enable(GlBridge.BLEND);
+                if (gl.HasBlendFuncSeparate) {
+                    gl.BlendFuncSeparate(GlBridge.SRC_ALPHA, GlBridge.ONE_MINUS_SRC_ALPHA, GlBridge.ONE, GlBridge.ONE_MINUS_SRC_ALPHA);
+                } else {
+                    gl.BlendFunc(GlBridge.SRC_ALPHA, GlBridge.ONE_MINUS_SRC_ALPHA);
+                }
+            } else {
+                gl.Disable(GlBridge.BLEND);
+            }
+            GameGpuState.CurBlend = GameGpuState.BlendEnabled;
+        }
+        if (GameGpuState.CurDepthWrite != GameGpuState.DepthWrite) {
+            if (gl.HasDepthMask) {
+                gl.DepthMask(GameGpuState.DepthWrite != 0 ? (byte)1 : (byte)0);
+            }
+            GameGpuState.CurDepthWrite = GameGpuState.DepthWrite;
+        }
+        if (GameGpuState.CurCull != GameGpuState.CullMode) {
+            if (GameGpuState.CullMode != 0 && gl.HasCullFace) {
+                gl.Enable(GlBridge.CULL_FACE);
+                if (gl.HasFrontFace) { gl.FrontFace(GlBridge.CCW); }
+                gl.CullFace(GameGpuState.CullMode == 2 ? GlBridge.FRONT : GlBridge.BACK);
+            } else {
+                gl.Disable(GlBridge.CULL_FACE);
+                if (gl.HasFrontFace) { gl.FrontFace(GlBridge.CCW); }
+            }
+            GameGpuState.CurCull = GameGpuState.CullMode;
+        }
+    }
+
+    private static void RestoreCullState(GlApi gl) {
+        gl.Disable(GlBridge.CULL_FACE);
+        if (gl.HasFrontFace) { gl.FrontFace(GlBridge.CCW); }
+        GameGpuState.CurCull = -1;
+    }
+
+    private static void UploadLights(GlApi gl, GpuProgram prog) {
+        if (prog.LightVersion == GameGpuState.LightVersion) { return; }
+        nint fb = GameGpuState.FloatBuf;
+        gl.Uniform3fv(prog.ULightDir, GameGpuState.MaxLights, fb + GameGpuState.OffLightDir);
+        gl.Uniform3fv(prog.ULightColor, GameGpuState.MaxLights, fb + GameGpuState.OffLightColor);
+        gl.Uniform1i(prog.ULightCount, GameGpuState.LightCount);
+        gl.Uniform3fv(prog.UAmbient, 1, fb + GameGpuState.OffAmbient);
+        if (prog.UCamPos >= 0) { gl.Uniform3fv(prog.UCamPos, 1, fb + GameGpuState.OffCamPos); }
+        if (prog.UCamValid >= 0) { gl.Uniform1i(prog.UCamValid, GameGpuState.CamValid); }
+        if (prog.UPointPos >= 0 && gl.HasUniform4fv) {
+            gl.Uniform4fv(prog.UPointPos, GameGpuState.MaxLights, fb + GameGpuState.OffPointPos);
+        }
+        if (prog.UPointColor >= 0) {
+            gl.Uniform3fv(prog.UPointColor, GameGpuState.MaxLights, fb + GameGpuState.OffPointColor);
+        }
+        if (prog.UPointCount >= 0) { gl.Uniform1i(prog.UPointCount, GameGpuState.PointCount); }
+        if (prog.USpotPos >= 0 && gl.HasUniform4fv) {
+            gl.Uniform4fv(prog.USpotPos, GameGpuState.MaxLights, fb + GameGpuState.OffSpotPos);
+        }
+        if (prog.USpotDir >= 0 && gl.HasUniform4fv) {
+            gl.Uniform4fv(prog.USpotDir, GameGpuState.MaxLights, fb + GameGpuState.OffSpotDir);
+        }
+        if (prog.USpotColor >= 0 && gl.HasUniform4fv) {
+            gl.Uniform4fv(prog.USpotColor, GameGpuState.MaxLights, fb + GameGpuState.OffSpotColor);
+        }
+        if (prog.USpotCount >= 0) { gl.Uniform1i(prog.USpotCount, GameGpuState.SpotCount); }
+        if (prog.UHemiSky >= 0) { gl.Uniform3fv(prog.UHemiSky, 1, fb + GameGpuState.OffHemiSky); }
+        if (prog.UHemiGround >= 0) { gl.Uniform3fv(prog.UHemiGround, 1, fb + GameGpuState.OffHemiGround); }
+        if (prog.UHemiOn >= 0) { gl.Uniform1i(prog.UHemiOn, GameGpuState.HemiOn); }
+        if (prog.UFogColor >= 0) { gl.Uniform3fv(prog.UFogColor, 1, fb + GameGpuState.OffFogColor); }
+        if (prog.UFogParams >= 0) { gl.Uniform3fv(prog.UFogParams, 1, fb + GameGpuState.OffFogParams); }
+        if (prog.UHeightFogParams >= 0) {
+            gl.Uniform4f(prog.UHeightFogParams, GameGpuState.HeightFogBaseY, GameGpuState.HeightFogFalloff, GameGpuState.HeightFogMax, GameGpuState.HeightFogOn);
+        }
+        SetVec3(gl, prog.UHeightFogColor, GameGpuState.HeightFogR, GameGpuState.HeightFogG, GameGpuState.HeightFogB);
+        if (prog.UClipPlane >= 0) {
+            gl.Uniform4f(prog.UClipPlane, GameGpuState.ClipNx, GameGpuState.ClipNy, GameGpuState.ClipNz, GameGpuState.ClipD);
+        }
+        if (prog.UClipOn >= 0) { gl.Uniform1i(prog.UClipOn, GameGpuState.ClipOn); }
+        prog.LightVersion = GameGpuState.LightVersion;
+    }
+
+    private static void UploadVfxUniforms(GlApi gl, GpuProgram prog) {
+        if (prog.VfxVersion == GameGpuState.VfxVersion) { return; }
+        if (prog.URimLight >= 0) { gl.Uniform4f(prog.URimLight, GameGpuState.RimR, GameGpuState.RimG, GameGpuState.RimB, GameGpuState.RimPow); }
+        if (prog.UToon >= 0) { gl.Uniform2f(prog.UToon, GameGpuState.ToonBands, GameGpuState.ToonSpecStep); }
+        if (prog.UDissolve >= 0) { gl.Uniform2f(prog.UDissolve, GameGpuState.DissolveThresh, GameGpuState.DissolveEdgeW); }
+        SetVec3(gl, prog.UDissolveEdge, GameGpuState.DissolveR, GameGpuState.DissolveG, GameGpuState.DissolveB);
+        SetVec3(gl, prog.UTriplanar, GameGpuState.TriplanarOn, GameGpuState.TriplanarScale, GameGpuState.TriplanarSharp);
+        if (prog.UHitFlash >= 0) { gl.Uniform4f(prog.UHitFlash, GameGpuState.HitFlashR, GameGpuState.HitFlashG, GameGpuState.HitFlashB, GameGpuState.HitFlashAmt); }
+        if (prog.UHoloScanParams >= 0) { gl.Uniform4f(prog.UHoloScanParams, GameGpuState.HoloOn, GameGpuState.HoloFreq, GameGpuState.HoloPhase, GameGpuState.HoloStr); }
+        SetVec3(gl, prog.UHoloScanColor, GameGpuState.HoloR, GameGpuState.HoloG, GameGpuState.HoloB);
+        if (prog.UTopCoverParams >= 0) { gl.Uniform4f(prog.UTopCoverParams, GameGpuState.TopCoverOn, GameGpuState.TopCoverThresh, GameGpuState.TopCoverSharp, GameGpuState.TopCoverAmt); }
+        SetVec3(gl, prog.UTopCoverColor, GameGpuState.TopCoverR, GameGpuState.TopCoverG, GameGpuState.TopCoverB);
+        if (prog.UWindParams >= 0) { gl.Uniform4f(prog.UWindParams, GameGpuState.WindAmp, GameGpuState.WindFreq, GameGpuState.WindPhase, GameGpuState.WindHScale); }
+        SetVec3(gl, prog.UDistFade, GameGpuState.DistFadeOn, GameGpuState.DistFadeStart, GameGpuState.DistFadeEnd);
+        if (prog.UWorldGridParams >= 0) { gl.Uniform4f(prog.UWorldGridParams, GameGpuState.WorldGridOn, GameGpuState.WorldGridCell, GameGpuState.WorldGridLine, GameGpuState.WorldGridStr); }
+        SetVec3(gl, prog.UWorldGridColor, GameGpuState.WorldGridR, GameGpuState.WorldGridG, GameGpuState.WorldGridB);
+        if (prog.UCausticsParams >= 0) { gl.Uniform4f(prog.UCausticsParams, GameGpuState.CausticsOn, GameGpuState.CausticsScale, GameGpuState.CausticsPhase, GameGpuState.CausticsStr); }
+        SetVec3(gl, prog.UCausticsColor, GameGpuState.CausticsR, GameGpuState.CausticsG, GameGpuState.CausticsB);
+        if (prog.UIceFrostParams >= 0) { gl.Uniform4f(prog.UIceFrostParams, GameGpuState.IceOn, GameGpuState.IceScale, GameGpuState.IceGlint, GameGpuState.IceFresnel); }
+        SetVec3(gl, prog.UIceFrostColor, GameGpuState.IceR, GameGpuState.IceG, GameGpuState.IceB);
+        if (prog.ULavaCrustParams >= 0) { gl.Uniform4f(prog.ULavaCrustParams, GameGpuState.LavaOn, GameGpuState.LavaScale, GameGpuState.LavaPhase, GameGpuState.LavaCrack); }
+        if (prog.ULavaCrustColor >= 0) { gl.Uniform4f(prog.ULavaCrustColor, GameGpuState.LavaR, GameGpuState.LavaG, GameGpuState.LavaB, GameGpuState.LavaStr); }
+        if (prog.UIridescenceParams >= 0) { gl.Uniform4f(prog.UIridescenceParams, GameGpuState.IridOn, GameGpuState.IridThick, GameGpuState.IridPhase, GameGpuState.IridStr); }
+        if (prog.USonarOriginRadius >= 0) { gl.Uniform4f(prog.USonarOriginRadius, GameGpuState.SonarOx, GameGpuState.SonarOy, GameGpuState.SonarOz, GameGpuState.SonarRadius); }
+        SetVec3(gl, prog.USonarStyle, GameGpuState.SonarOn, GameGpuState.SonarWidth, GameGpuState.SonarStr);
+        SetVec3(gl, prog.USonarColor, GameGpuState.SonarR, GameGpuState.SonarG, GameGpuState.SonarB);
+        if (prog.UForceFieldParams >= 0) { gl.Uniform4f(prog.UForceFieldParams, GameGpuState.ForceOn, GameGpuState.ForceScale, GameGpuState.ForcePhase, GameGpuState.ForceEdge); }
+        if (prog.UForceFieldColor >= 0) { gl.Uniform4f(prog.UForceFieldColor, GameGpuState.ForceR, GameGpuState.ForceG, GameGpuState.ForceB, GameGpuState.ForceStr); }
+        if (prog.URainRipplesParams >= 0) { gl.Uniform4f(prog.URainRipplesParams, GameGpuState.RainOn, GameGpuState.RainScale, GameGpuState.RainPhase, GameGpuState.RainStr); }
+        SetVec3(gl, prog.URainRipplesColor, GameGpuState.RainR, GameGpuState.RainG, GameGpuState.RainB);
+        SetVec3(gl, prog.UXrayParams, GameGpuState.XrayOn, GameGpuState.XrayPow, GameGpuState.XrayStr);
+        SetVec3(gl, prog.UXrayColor, GameGpuState.XrayR, GameGpuState.XrayG, GameGpuState.XrayB);
+        if (prog.UPortalVortexParams >= 0) { gl.Uniform4f(prog.UPortalVortexParams, GameGpuState.PortalOn, GameGpuState.PortalTurns, GameGpuState.PortalPhase, GameGpuState.PortalStr); }
+        SetVec3(gl, prog.UPortalVortexColor, GameGpuState.PortalR, GameGpuState.PortalG, GameGpuState.PortalB);
+        if (prog.UBlueprintWireParams >= 0) { gl.Uniform4f(prog.UBlueprintWireParams, GameGpuState.BlueprintOn, GameGpuState.BlueprintDens, GameGpuState.BlueprintLine, GameGpuState.BlueprintStr); }
+        SetVec3(gl, prog.UBlueprintWireColor, GameGpuState.BlueprintR, GameGpuState.BlueprintG, GameGpuState.BlueprintB);
+        if (prog.UHeatHazeParams >= 0) { gl.Uniform4f(prog.UHeatHazeParams, GameGpuState.HeatOn, GameGpuState.HeatFreq, GameGpuState.HeatPhase, GameGpuState.HeatStr); }
+        SetVec3(gl, prog.UHeatHazeColor, GameGpuState.HeatR, GameGpuState.HeatG, GameGpuState.HeatB);
+        SetVec3(gl, prog.UPixelDitherParams, GameGpuState.DitherOn, GameGpuState.DitherOpacity, GameGpuState.DitherScale);
+        SetVec3(gl, prog.UCrosshatchParams, GameGpuState.HatchOn, GameGpuState.HatchDens, GameGpuState.HatchStr);
+        SetVec3(gl, prog.UCrosshatchColor, GameGpuState.HatchR, GameGpuState.HatchG, GameGpuState.HatchB);
+        if (prog.UAnisoBrushedParams >= 0) { gl.Uniform4f(prog.UAnisoBrushedParams, GameGpuState.AnisoOn, GameGpuState.AnisoFreq, GameGpuState.AnisoVal, GameGpuState.AnisoStr); }
+        SetVec3(gl, prog.UAnisoBrushedColor, GameGpuState.AnisoR, GameGpuState.AnisoG, GameGpuState.AnisoB);
+        if (prog.UVelvetSheenParams >= 0) { gl.Uniform4f(prog.UVelvetSheenParams, GameGpuState.VelvetOn, GameGpuState.VelvetRough, GameGpuState.VelvetWeave, GameGpuState.VelvetStr); }
+        SetVec3(gl, prog.UVelvetSheenColor, GameGpuState.VelvetR, GameGpuState.VelvetG, GameGpuState.VelvetB);
+        if (prog.USubsurfaceParams >= 0) { gl.Uniform4f(prog.USubsurfaceParams, GameGpuState.SssOn, GameGpuState.SssWrap, GameGpuState.SssTrans, GameGpuState.SssPow); }
+        SetVec3(gl, prog.USubsurfaceColor, GameGpuState.SssR, GameGpuState.SssG, GameGpuState.SssB);
+        prog.VfxVersion = GameGpuState.VfxVersion;
+    }
+
+    private static void BindShadowAndMatUniforms(GlApi gl, GpuProgram prog, nint model, bool allowShadow) {
+        nint fb = GameGpuState.FloatBuf;
+        if (prog.UModel >= 0) {
+            gl.UniformMatrix4fv(prog.UModel, 1, 0, model != 0 ? model : (fb + GameGpuState.OffIdentityMat4));
+        }
+        int useShadow = (GameGpuState.ShadowReady && GameGpuState.ShadowTex != 0u && allowShadow) ? 1 : 0;
+        if (prog.ShadowVersion != GameGpuState.ShadowVersion || prog.LastUseShadow != useShadow) {
+            if (prog.ULightVp >= 0) {
+                gl.UniformMatrix4fv(prog.ULightVp, 1, 0, fb + GameGpuState.OffShadowLightVp);
+            }
+            if (prog.UShadowOn >= 0) { gl.Uniform1i(prog.UShadowOn, useShadow); }
+            prog.ShadowVersion = GameGpuState.ShadowVersion;
+            prog.LastUseShadow = useShadow;
+        }
+        if (prog.UShadowMap >= 0) {
+            GameGpuResources.BindTexUnit(gl, 1, useShadow != 0 ? GameGpuState.ShadowTex : 0u);
+        }
+        if (prog.MatVersion != GameGpuState.MatVersion) {
+            if (prog.UMaterial >= 0) { gl.Uniform2f(prog.UMaterial, GameGpuState.MatMetallic, GameGpuState.MatRoughness); }
+            if (prog.UEmissive >= 0) { gl.Uniform3fv(prog.UEmissive, 1, fb + GameGpuState.OffEmissive); }
+            uint ntex = (GameGpuState.NormalKey.Length > 0 && GameGpuState.NormalScale > 0.0001f)
+                ? GameGpuResources.ResolveTex(GameGpuState.NormalKey, false) : 0u;
+            if (prog.UNormalOn >= 0) { gl.Uniform1i(prog.UNormalOn, ntex != 0u ? 1 : 0); }
+            if (prog.UNormalScale >= 0 && gl.HasUniform1f) { gl.Uniform1f(prog.UNormalScale, ntex != 0u ? GameGpuState.NormalScale : 0.0f); }
+            if (prog.UNormalMap >= 0) { GameGpuResources.BindTexUnit(gl, 2, ntex); }
+            uint ormTex = GameGpuState.OrmKey.Length > 0 ? GameGpuResources.ResolveTex(GameGpuState.OrmKey, false) : 0u;
+            if (prog.UOrmOn >= 0) { gl.Uniform1i(prog.UOrmOn, ormTex != 0u ? 1 : 0); }
+            if (prog.UAoStrength >= 0 && gl.HasUniform1f) { gl.Uniform1f(prog.UAoStrength, ormTex != 0u ? GameGpuState.AoStrength : 0.0f); }
+            if (prog.UOrmMap >= 0) { GameGpuResources.BindTexUnit(gl, 3, ormTex); }
+            if (prog.UAlphaCutoff >= 0 && gl.HasUniform1f) { gl.Uniform1f(prog.UAlphaCutoff, GameGpuState.AlphaCutoff); }
+            uint emTex = GameGpuState.EmissiveKey.Length > 0 ? GameGpuResources.ResolveTex(GameGpuState.EmissiveKey, false) : 0u;
+            if (prog.UEmissiveOn >= 0) { gl.Uniform1i(prog.UEmissiveOn, emTex != 0u ? 1 : 0); }
+            if (prog.UEmissiveMap >= 0) { GameGpuResources.BindTexUnit(gl, 4, emTex); }
+            if (prog.UUvTransform >= 0) {
+                gl.Uniform4f(prog.UUvTransform, GameGpuState.UvScaleU, GameGpuState.UvScaleV, GameGpuState.UvOffsetU, GameGpuState.UvOffsetV);
+            }
+            prog.MatVersion = GameGpuState.MatVersion;
+        } else {
+            if (GameGpuState.NormalKey.Length > 0 && GameGpuState.NormalScale > 0.0001f && prog.UNormalMap >= 0) {
+                GameGpuResources.BindTexUnit(gl, 2, GameGpuResources.ResolveTex(GameGpuState.NormalKey, false));
+            }
+            if (GameGpuState.OrmKey.Length > 0 && prog.UOrmMap >= 0) {
+                GameGpuResources.BindTexUnit(gl, 3, GameGpuResources.ResolveTex(GameGpuState.OrmKey, false));
+            }
+            if (GameGpuState.EmissiveKey.Length > 0 && prog.UEmissiveMap >= 0) {
+                GameGpuResources.BindTexUnit(gl, 4, GameGpuResources.ResolveTex(GameGpuState.EmissiveKey, false));
+            }
+        }
+        UploadVfxUniforms(gl, prog);
+    }
+
+    // ---- 帧会话 ----
+
+    public static int BeginFrame3D(int surfaceId) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap) { return 0; }
+        if (GameGpuState.FrameSurface >= 0) { EndFrame3D(); }
+        GpuFrameInfo frame;
+        if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+        if (!GameGpuResources.Prepare(frame)) {
+            GlBridge.GpuEnd(surfaceId);
+            return 0;
+        }
+        GameGpuState.InvalidateGlCache();
+        GameGpuState.TexCacheGen = GameGpuState.TexCacheGen + 1u;
+
+        GlApi gl = GameGpuState.Gl;
+        gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+        if (!GameGpuResources.DepthReady(surfaceId, frame)) {
+            GlBridge.GpuEnd(surfaceId);
+            return 0;
+        }
+        gl.Disable(GlBridge.SCISSOR_TEST);
+        if (gl.HasDepthMask) { gl.DepthMask(1); }
+        GameGpuState.CurDepthWrite = 1;
+        gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        gl.Clear(GlBridge.DEPTH_BUFFER_BIT);
+
+        int cx; int cy; int cw; int ch;
+        ComputeClip(frame, out cx, out cy, out cw, out ch);
+        gl.Viewport(0, 0, frame.Width, frame.Height);
+        gl.Enable(GlBridge.SCISSOR_TEST);
+        if (cw > 0 && ch > 0) { gl.Scissor(cx, cy, cw, ch); }
+        gl.Enable(GlBridge.DEPTH_TEST);
+        gl.DepthFunc(GlBridge.LEQUAL);
+
+        GameGpuState.FrameGpu = frame;
+        GameGpuState.FrameSurface = surfaceId;
+        GameGpuState.FrameClipEmpty = (cw == 0 || ch == 0);
+        GameGpuState.PreserveDepth = 1;
+        return 1;
+    }
+
+    public static void EndFrame3D() {
+        if (GameGpuState.FrameSurface >= 0) {
+            int sid = GameGpuState.FrameSurface;
+            GlApi gl = GameGpuState.Gl;
+            if (gl != null) {
+                gl.BindVertexArray(0u);
+                RestoreCullState(gl);
+                if (gl.HasDepthMask) { gl.DepthMask(1); }
+                gl.Disable(GlBridge.DEPTH_TEST);
+                gl.Disable(GlBridge.BLEND);
+            }
+            GameGpuState.FrameSurface = -1;
+            GameGpuState.FrameClipEmpty = false;
+            GlBridge.GpuEnd(sid);
+            GameGpuState.InvalidateGlCache();
+        }
+        GameGpuState.PreserveDepth = 0;
+    }
+
+    // ---- 单次 3D 与蒙皮绘制 ----
+
+    public static int Draw3DEx(int surfaceId, int meshId, nint mvp, nint model, int color, string texture) {
+        GameGpuState.EnsureInit();
+        if (mvp == 0 || meshId <= 0 || surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap) { return 0; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            if (GameGpuState.FrameClipEmpty) { return 1; }
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+            GameGpuState.InvalidateGlCache();
+            GameGpuState.TexCacheGen = GameGpuState.TexCacheGen + 1u;
+        }
+        int result = 0;
+        if (GameGpuResources.PrepareFast(frame)) {
+            GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+            GpuProgram prog = mesh != null ? GameGpuResources.GetProgram(mesh.Colored, 0) : null;
+            if (mesh != null && prog != null) {
+                GlApi gl = GameGpuState.Gl;
+                bool drawOk = true;
+                if (!inFrame) {
+                    int cx; int cy; int cw; int ch;
+                    ComputeClip(frame, out cx, out cy, out cw, out ch);
+                    if (cw == 0 || ch == 0) {
+                        result = 1;
+                        drawOk = false;
+                    } else {
+                        gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+                        if (!GameGpuResources.DepthReady(surfaceId, frame)) {
+                            drawOk = false;
+                        } else {
+                            gl.Viewport(0, 0, frame.Width, frame.Height);
+                            gl.Enable(GlBridge.SCISSOR_TEST);
+                            gl.Scissor(cx, cy, cw, ch);
+                            if (GameGpuState.BlendEnabled == 0 && GameGpuState.PreserveDepth == 0) {
+                                if (gl.HasDepthMask) { gl.DepthMask(1); }
+                                GameGpuState.CurDepthWrite = 1;
+                                gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                                gl.Clear(GlBridge.DEPTH_BUFFER_BIT);
+                            }
+                            gl.Enable(GlBridge.DEPTH_TEST);
+                            gl.DepthFunc(GlBridge.LEQUAL);
+                        }
+                    }
+                }
+                if (drawOk) {
+                    uint tex = GameGpuResources.ResolveTex(texture, true);
+                    if (tex != 0u) {
+                        ApplyBlendState(gl);
+                        GameGpuResources.UseProgram(gl, prog);
+                        UploadLights(gl, prog);
+                        gl.UniformMatrix4fv(prog.UMvp, 1, 0, mvp);
+                        BindShadowAndMatUniforms(gl, prog, model, model != 0);
+                        uint argb = (uint)color;
+                        gl.Uniform4f(prog.UColor,
+                            (float)((argb >> 16) & 255u) / 255.0f,
+                            (float)((argb >> 8) & 255u) / 255.0f,
+                            (float)(argb & 255u) / 255.0f,
+                            (float)((argb >> 24) & 255u) / 255.0f);
+                        GameGpuResources.BindTexUnit(gl, 0, tex);
+                        gl.BindVertexArray(mesh.Vao);
+                        gl.DrawElements(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0);
+                        if (!inFrame) {
+                            gl.BindVertexArray(0u);
+                            RestoreCullState(gl);
+                            if (gl.HasDepthMask) { gl.DepthMask(1); }
+                        }
+                        result = 1;
+                    }
+                }
+            }
+        }
+        if (!inFrame) {
+            GlBridge.GpuEnd(surfaceId);
+            GameGpuState.InvalidateGlCache();
+        }
+        return result;
+    }
+
+    public static int Draw3D(int surfaceId, int meshId, nint mvp, int color, string texture) {
+        return Draw3DEx(surfaceId, meshId, mvp, 0, color, texture);
+    }
+
+    public static int Draw3DSkinned(int surfaceId, int meshId, nint mvp, nint model, int color, string texture) {
+        GameGpuState.EnsureInit();
+        if (mvp == 0 || meshId <= 0 || surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap) { return 0; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            if (GameGpuState.FrameClipEmpty) { return 1; }
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+            GameGpuState.InvalidateGlCache();
+            GameGpuState.TexCacheGen = GameGpuState.TexCacheGen + 1u;
+        }
+        int result = 0;
+        if (GameGpuResources.PrepareFast(frame)) {
+            GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+            GpuProgram prog = (mesh != null && mesh.Skinned) ? GameGpuResources.GetSkinProgram() : null;
+            if (mesh != null && prog != null) {
+                GlApi gl = GameGpuState.Gl;
+                bool drawOk = true;
+                if (!inFrame) {
+                    int cx; int cy; int cw; int ch;
+                    ComputeClip(frame, out cx, out cy, out cw, out ch);
+                    if (cw == 0 || ch == 0) {
+                        result = 1;
+                        drawOk = false;
+                    } else {
+                        gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+                        if (!GameGpuResources.DepthReady(surfaceId, frame)) {
+                            drawOk = false;
+                        } else {
+                            gl.Viewport(0, 0, frame.Width, frame.Height);
+                            gl.Enable(GlBridge.SCISSOR_TEST);
+                            gl.Scissor(cx, cy, cw, ch);
+                            if (GameGpuState.BlendEnabled == 0 && GameGpuState.PreserveDepth == 0) {
+                                if (gl.HasDepthMask) { gl.DepthMask(1); }
+                                GameGpuState.CurDepthWrite = 1;
+                                gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                                gl.Clear(GlBridge.DEPTH_BUFFER_BIT);
+                            }
+                            gl.Enable(GlBridge.DEPTH_TEST);
+                            gl.DepthFunc(GlBridge.LEQUAL);
+                        }
+                    }
+                }
+                if (drawOk) {
+                    uint tex = GameGpuResources.ResolveTex(texture, true);
+                    if (tex != 0u) {
+                        ApplyBlendState(gl);
+                        GameGpuResources.UseProgram(gl, prog);
+                        UploadLights(gl, prog);
+                        gl.UniformMatrix4fv(prog.UMvp, 1, 0, mvp);
+                        gl.UniformMatrix4fv(prog.UBones, GameGpuState.MaxBones, 0, GameGpuState.FloatBuf + GameGpuState.OffBones);
+                        BindShadowAndMatUniforms(gl, prog, model, model != 0);
+                        uint argb = (uint)color;
+                        gl.Uniform4f(prog.UColor,
+                            (float)((argb >> 16) & 255u) / 255.0f,
+                            (float)((argb >> 8) & 255u) / 255.0f,
+                            (float)(argb & 255u) / 255.0f,
+                            (float)((argb >> 24) & 255u) / 255.0f);
+                        GameGpuResources.BindTexUnit(gl, 0, tex);
+                        gl.BindVertexArray(mesh.Vao);
+                        gl.DrawElements(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0);
+                        if (!inFrame) {
+                            gl.BindVertexArray(0u);
+                            RestoreCullState(gl);
+                            if (gl.HasDepthMask) { gl.DepthMask(1); }
+                        }
+                        result = 1;
+                    }
+                }
+            }
+        }
+        if (!inFrame) {
+            GlBridge.GpuEnd(surfaceId);
+            GameGpuState.InvalidateGlCache();
+        }
+        return result;
+    }
+
+    // ---- 实例化批量绘制（含 MVP 旧批与全真光照 Model 批） ----
+
+    public static int Draw3DBatchBegin(int surfaceId) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap || GameGpuState.BatchSurface != -1) { return 0; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+            GameGpuState.InvalidateGlCache();
+            GameGpuState.TexCacheGen = GameGpuState.TexCacheGen + 1u;
+        }
+        if (!GameGpuResources.PrepareFast(frame)) {
+            if (!inFrame) { GlBridge.GpuEnd(surfaceId); }
+            return 0;
+        }
+        GlApi gl = GameGpuState.Gl;
+        if (!GameGpuResources.EnsureInstanceVbo(gl)) {
+            if (!inFrame) { GlBridge.GpuEnd(surfaceId); }
+            return 0;
+        }
+        bool clipEmpty = GameGpuState.FrameClipEmpty;
+        if (!inFrame) {
+            int cx; int cy; int cw; int ch;
+            ComputeClip(frame, out cx, out cy, out cw, out ch);
+            clipEmpty = (cw == 0 || ch == 0);
+            gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+            if (!GameGpuResources.DepthReady(surfaceId, frame)) {
+                GlBridge.GpuEnd(surfaceId);
+                return 0;
+            }
+            gl.Viewport(0, 0, frame.Width, frame.Height);
+            gl.Enable(GlBridge.SCISSOR_TEST);
+            gl.Scissor(cx, cy, cw, ch);
+            if (GameGpuState.PreserveDepth == 0) {
+                if (gl.HasDepthMask) { gl.DepthMask(1); }
+                GameGpuState.CurDepthWrite = 1;
+                gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                gl.Clear(GlBridge.DEPTH_BUFFER_BIT);
+            }
+            gl.Enable(GlBridge.DEPTH_TEST);
+            gl.DepthFunc(GlBridge.LEQUAL);
+        }
+        ApplyBlendState(gl);
+        GameGpuState.BatchFrame = frame;
+        GameGpuState.BatchClipEmpty = clipEmpty;
+        GameGpuState.BatchSurface = surfaceId;
+        GameGpuState.BatchOwnsGpu = !inFrame;
+        GameGpuState.BatchProg = 0u;
+        GameGpuState.BatchTex = 0u;
+        return 1;
+    }
+
+    public static int Draw3DBatch(int surfaceId, int meshId, string texture, nint instances, int count) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.BatchSurface || instances == 0
+            || count <= 0 || count > GameGpuState.InstanceCap || meshId <= 0) { return 0; }
+        GpuFrameInfo frame = GameGpuState.BatchFrame;
+        if (!GameGpuResources.PrepareFast(frame)) { return 0; }
+        GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+        if (mesh == null) { return 0; }
+        GpuProgram prog = GameGpuResources.GetProgram(mesh.Colored, 1);
+        if (prog == null || GameGpuResources.InstanceVbo == 0u) { return 0; }
+        if (GameGpuState.BatchClipEmpty) { return 1; }
+
+        uint tex = GameGpuResources.ResolveTex(texture, true);
+        if (tex == 0u) { return 0; }
+        GlApi gl = GameGpuState.Gl;
+        GameGpuResources.UploadInstances(gl, instances, count);
+        if (!GameGpuResources.MeshInstReady(mesh, gl)) { return 0; }
+        ApplyBlendState(gl);
+        GameGpuResources.UseProgram(gl, prog);
+        UploadLights(gl, prog);
+        GameGpuResources.BindTexUnit(gl, 0, tex);
+        gl.BindVertexArray(mesh.Vao);
+        gl.DrawElementsInstanced(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0, count);
+        return 1;
+    }
+
+    public static int Draw3DBatchLit(int surfaceId, int meshId, string texture, nint vp, nint instances, int count) {
+        if (surfaceId < 0 || vp == 0 || instances == 0
+            || count <= 0 || count > GameGpuState.InstanceCap || meshId <= 0) { return 0; }
+        GpuFrameInfo frame;
+        bool clipEmpty = false;
+        if (surfaceId == GameGpuState.BatchSurface) {
+            frame = GameGpuState.BatchFrame;
+            clipEmpty = GameGpuState.BatchClipEmpty;
+        } else if (surfaceId == GameGpuState.FrameSurface) {
+            frame = GameGpuState.FrameGpu;
+            clipEmpty = GameGpuState.FrameClipEmpty;
+        } else {
+            return 0;
+        }
+        if (clipEmpty) { return 1; }
+        if (!GameGpuResources.PrepareFast(frame)) { return 0; }
+        GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+        if (mesh == null) { return 0; }
+        GpuProgram prog = GameGpuResources.GetProgram(mesh.Colored, 2);
+        if (prog == null) { return 0; }
+        GlApi gl = GameGpuState.Gl;
+        if (!GameGpuResources.EnsureInstanceVbo(gl)) { return 0; }
+        uint tex = GameGpuResources.ResolveTex(texture, true);
+        if (tex == 0u) { return 0; }
+
+        GameGpuResources.UploadInstances(gl, instances, count);
+        if (!GameGpuResources.MeshInstReady(mesh, gl)) { return 0; }
+        ApplyBlendState(gl);
+        GameGpuResources.UseProgram(gl, prog);
+        UploadLights(gl, prog);
+        gl.UniformMatrix4fv(prog.UVp, 1, 0, vp);
+        BindShadowAndMatUniforms(gl, prog, 0, true);
+        GameGpuResources.BindTexUnit(gl, 0, tex);
+        gl.BindVertexArray(mesh.Vao);
+        gl.DrawElementsInstanced(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0, count);
+        return 1;
+    }
+
+    public static int Draw3DBatchEnd(int surfaceId) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.BatchSurface) { return 0; }
+        bool ownsGpu = GameGpuState.BatchOwnsGpu;
+        GlApi gl = GameGpuState.Gl;
+        if (gl != null && ownsGpu) {
+            gl.BindVertexArray(0u);
+            RestoreCullState(gl);
+            if (gl.HasDepthMask) { gl.DepthMask(1); }
+        }
+        GameGpuState.BatchSurface = -1;
+        GameGpuState.BatchOwnsGpu = false;
+        GameGpuState.BatchClipEmpty = false;
+        GameGpuState.BatchProg = 0u;
+        GameGpuState.BatchTex = 0u;
+        if (ownsGpu) {
+            GlBridge.GpuEnd(surfaceId);
+            GameGpuState.InvalidateGlCache();
+        }
+        return 1;
+    }
+
+    // ---- 阴影贴图通道 ----
+
+    public static int ShadowBegin(int surfaceId, int mapSize, nint lightVp) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap || lightVp == 0
+            || GameGpuState.ShadowSurface != -1 || GameGpuState.BatchSurface != -1) { return 0; }
+        if (mapSize < 128) { mapSize = 128; }
+        if (mapSize > 2048) { mapSize = 2048; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+        }
+        if (!GameGpuResources.Prepare(frame) || GameGpuResources.GetShadowProgram() == null) {
+            if (!inFrame) { GlBridge.GpuEnd(surfaceId); }
+            return 0;
+        }
+        GlApi gl = GameGpuState.Gl;
+        if (!GameGpuResources.ShadowFboReady(gl, mapSize)) {
+            if (!inFrame) { GlBridge.GpuEnd(surfaceId); }
+            return 0;
+        }
+        NativeMemory.Copy(GameGpuState.FloatBuf + GameGpuState.OffShadowLightVp, lightVp, 64);
+        gl.BindFramebuffer(GlBridge.FRAMEBUFFER, GameGpuState.ShadowFbo);
+        gl.Viewport(0, 0, mapSize, mapSize);
+        gl.Disable(GlBridge.SCISSOR_TEST);
+        if (gl.HasColorMask) { gl.ColorMask(0, 0, 0, 0); }
+        if (gl.HasDepthMask) { gl.DepthMask(1); }
+        gl.Enable(GlBridge.DEPTH_TEST);
+        gl.DepthFunc(GlBridge.LEQUAL);
+        gl.Disable(GlBridge.BLEND);
+        gl.Disable(GlBridge.CULL_FACE);
+        if (gl.HasPolygonOffset) {
+            gl.Enable(GlBridge.POLYGON_OFFSET_FILL);
+            gl.PolygonOffset(2.0f, 4.0f);
+        }
+        gl.Clear(GlBridge.DEPTH_BUFFER_BIT);
+        GameGpuState.ShadowFrame = frame;
+        GameGpuState.ShadowSurface = surfaceId;
+        shadowOwnsGpu = !inFrame;
+        GameGpuState.ShadowCurProg = 0u;
+        GameGpuState.ShadowReady = false;
+        GameGpuState.ShadowVersion = GameGpuState.ShadowVersion + 1u;
+        return 1;
+    }
+
+    public static int ShadowDraw(int surfaceId, int meshId, nint model) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.ShadowSurface || meshId <= 0 || model == 0) { return 0; }
+        GpuFrameInfo frame = GameGpuState.ShadowFrame;
+        if (!GameGpuResources.PrepareFast(frame)) { return 0; }
+        GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+        if (mesh == null) { return 0; }
+        GpuShadowProgram prog = GameGpuResources.GetShadowProgram();
+        if (prog == null) { return 0; }
+        GlApi gl = GameGpuState.Gl;
+        if (GameGpuState.ShadowCurProg != prog.Program) {
+            gl.UseProgram(prog.Program);
+            gl.UniformMatrix4fv(prog.ULightVp, 1, 0, GameGpuState.FloatBuf + GameGpuState.OffShadowLightVp);
+            GameGpuState.ShadowCurProg = prog.Program;
+        }
+        gl.UniformMatrix4fv(prog.UModel, 1, 0, model);
+        if (prog.UWindParams >= 0) {
+            gl.Uniform4f(prog.UWindParams, GameGpuState.WindAmp, GameGpuState.WindFreq, GameGpuState.WindPhase, GameGpuState.WindHScale);
+        }
+        gl.BindVertexArray(mesh.Vao);
+        gl.DrawElements(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0);
+        return 1;
+    }
+
+    public static int ShadowDrawBatch(int surfaceId, int meshId, nint instances, int count) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.ShadowSurface || meshId <= 0
+            || instances == 0 || count <= 0 || count > GameGpuState.InstanceCap) { return 0; }
+        GpuFrameInfo frame = GameGpuState.ShadowFrame;
+        if (!GameGpuResources.PrepareFast(frame)) { return 0; }
+        GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+        if (mesh == null) { return 0; }
+        GpuShadowProgram prog = GameGpuResources.GetShadowInstProgram();
+        if (prog == null) { return 0; }
+        GlApi gl = GameGpuState.Gl;
+        if (!GameGpuResources.EnsureInstanceVbo(gl)) { return 0; }
+        GameGpuResources.UploadInstances(gl, instances, count);
+        if (!GameGpuResources.MeshInstReady(mesh, gl)) { return 0; }
+        if (GameGpuState.ShadowCurProg != prog.Program) {
+            gl.UseProgram(prog.Program);
+            gl.UniformMatrix4fv(prog.ULightVp, 1, 0, GameGpuState.FloatBuf + GameGpuState.OffShadowLightVp);
+            GameGpuState.ShadowCurProg = prog.Program;
+        }
+        if (prog.UWindParams >= 0) {
+            gl.Uniform4f(prog.UWindParams, GameGpuState.WindAmp, GameGpuState.WindFreq, GameGpuState.WindPhase, GameGpuState.WindHScale);
+        }
+        gl.BindVertexArray(mesh.Vao);
+        gl.DrawElementsInstanced(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0, count);
+        return 1;
+    }
+
+    public static int ShadowDrawSkinned(int surfaceId, int meshId, nint model) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.ShadowSurface || meshId <= 0 || model == 0) { return 0; }
+        GpuFrameInfo frame = GameGpuState.ShadowFrame;
+        if (!GameGpuResources.PrepareFast(frame)) { return 0; }
+        GpuMesh mesh = GameGpuResources.FindMesh(meshId, frame.Epoch);
+        if (mesh == null || !mesh.Skinned) { return 0; }
+        GpuShadowProgram prog = GameGpuResources.GetShadowSkinProgram();
+        if (prog == null) { return 0; }
+        GlApi gl = GameGpuState.Gl;
+        if (GameGpuState.ShadowCurProg != prog.Program) {
+            gl.UseProgram(prog.Program);
+            gl.UniformMatrix4fv(prog.ULightVp, 1, 0, GameGpuState.FloatBuf + GameGpuState.OffShadowLightVp);
+            GameGpuState.ShadowCurProg = prog.Program;
+        }
+        gl.UniformMatrix4fv(prog.UModel, 1, 0, model);
+        gl.UniformMatrix4fv(prog.UBones, GameGpuState.MaxBones, 0, GameGpuState.FloatBuf + GameGpuState.OffBones);
+        gl.BindVertexArray(mesh.Vao);
+        gl.DrawElements(GlBridge.TRIANGLES, mesh.IndexCount, GlBridge.UNSIGNED_SHORT, 0);
+        return 1;
+    }
+
+    public static int ShadowEnd(int surfaceId) {
+        if (surfaceId < 0 || surfaceId != GameGpuState.ShadowSurface) { return 0; }
+        bool owns = shadowOwnsGpu;
+        GlApi gl = GameGpuState.Gl;
+        if (gl != null) {
+            gl.BindVertexArray(0u);
+            if (gl.HasPolygonOffset) { gl.Disable(GlBridge.POLYGON_OFFSET_FILL); }
+            if (gl.HasColorMask) { gl.ColorMask(1, 1, 1, 1); }
+            gl.BindFramebuffer(GlBridge.FRAMEBUFFER, GameGpuState.ShadowFrame.Framebuffer);
+            if (!owns) {
+                int cx; int cy; int cw; int ch;
+                ComputeClip(GameGpuState.FrameGpu, out cx, out cy, out cw, out ch);
+                gl.Viewport(0, 0, GameGpuState.FrameGpu.Width, GameGpuState.FrameGpu.Height);
+                gl.Enable(GlBridge.SCISSOR_TEST);
+                if (cw > 0 && ch > 0) { gl.Scissor(cx, cy, cw, ch); }
+                gl.Enable(GlBridge.DEPTH_TEST);
+                gl.DepthFunc(GlBridge.LEQUAL);
+            }
+        }
+        GameGpuState.ShadowSurface = -1;
+        shadowOwnsGpu = false;
+        GameGpuState.ShadowCurProg = 0u;
+        GameGpuState.ShadowReady = true;
+        GameGpuState.ShadowVersion = GameGpuState.ShadowVersion + 1u;
+        if (owns) { GlBridge.GpuEnd(surfaceId); }
+        GameGpuState.InvalidateGlCache();
+        return 1;
+    }
+
+    public static void ShadowClear() {
+        if (GameGpuState.ShadowReady) {
+            GameGpuState.ShadowReady = false;
+            GameGpuState.ShadowVersion = GameGpuState.ShadowVersion + 1u;
+        }
+    }
+
+    // ---- 天空盒与全屏后处理 ----
+
+    public static int Skybox3D(int surfaceId, nint camBasis9, float tanHalfFov, float aspect,
+                               nint sunDir3, nint topRgb3, nint horizonRgb3, nint groundRgb3) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap || camBasis9 == 0) { return 0; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            if (GameGpuState.FrameClipEmpty) { return 1; }
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+        }
+        int result = 0;
+        if (GameGpuResources.PrepareFast(frame)) {
+            GpuSkyboxProgram prog = GameGpuResources.GetSkyboxProgram();
+            GlApi gl = GameGpuState.Gl;
+            if (prog != null) {
+                if (GameGpuResources.PostVao == 0u) {
+                    GameGpuResources.PostVao = GlBridge.GenOne(gl.GenVertexArrays);
+                }
+                if (GameGpuResources.PostVao != 0u) {
+                    int cx; int cy; int cw; int ch;
+                    ComputeClip(frame, out cx, out cy, out cw, out ch);
+                    if (cw == 0 || ch == 0) {
+                        result = 1;
+                    } else {
+                        if (tanHalfFov <= 0.001f) { tanHalfFov = 0.57735f; }
+                        if (aspect <= 0.001f) { aspect = (float)frame.Width / (float)(frame.Height > 0 ? frame.Height : 1); }
+                        if (!inFrame) {
+                            gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+                            gl.Viewport(0, 0, frame.Width, frame.Height);
+                            gl.Enable(GlBridge.SCISSOR_TEST);
+                            gl.Scissor(cx, cy, cw, ch);
+                        }
+                        gl.Disable(GlBridge.DEPTH_TEST);
+                        if (gl.HasDepthMask) { gl.DepthMask(0); }
+                        gl.Disable(GlBridge.BLEND);
+
+                        gl.UseProgram(prog.Program);
+                        if (prog.UCamRight >= 0) { gl.Uniform3fv(prog.UCamRight, 1, camBasis9); }
+                        if (prog.UCamUp >= 0) { gl.Uniform3fv(prog.UCamUp, 1, camBasis9 + 12); }
+                        if (prog.UCamForward >= 0) { gl.Uniform3fv(prog.UCamForward, 1, camBasis9 + 24); }
+                        if (prog.UProj >= 0) { gl.Uniform2f(prog.UProj, tanHalfFov * aspect, tanHalfFov); }
+                        if (sunDir3 != 0) { if (prog.USunDir >= 0) { gl.Uniform3fv(prog.USunDir, 1, sunDir3); } }
+                        else { SetVec3(gl, prog.USunDir, 0.4f, 0.7f, 0.5f); }
+                        if (topRgb3 != 0) { if (prog.USkyTop >= 0) { gl.Uniform3fv(prog.USkyTop, 1, topRgb3); } }
+                        else { SetVec3(gl, prog.USkyTop, 0.14f, 0.36f, 0.76f); }
+                        if (horizonRgb3 != 0) { if (prog.USkyHorizon >= 0) { gl.Uniform3fv(prog.USkyHorizon, 1, horizonRgb3); } }
+                        else { SetVec3(gl, prog.USkyHorizon, 0.68f, 0.80f, 0.94f); }
+                        if (groundRgb3 != 0) { if (prog.UGround >= 0) { gl.Uniform3fv(prog.UGround, 1, groundRgb3); } }
+                        else { SetVec3(gl, prog.UGround, 0.24f, 0.22f, 0.20f); }
+
+                        gl.BindVertexArray(GameGpuResources.PostVao);
+                        gl.DrawArrays(GlBridge.TRIANGLES, 0, 3);
+                        gl.BindVertexArray(0u);
+                        if (gl.HasDepthMask) { gl.DepthMask(1); }
+                        if (inFrame) {
+                            gl.Enable(GlBridge.DEPTH_TEST);
+                            gl.DepthFunc(GlBridge.LEQUAL);
+                            GameGpuState.CurProg = 0u;
+                            GameGpuState.CurBlend = 0;
+                            GameGpuState.CurDepthWrite = 1;
+                        }
+                        result = 1;
+                    }
+                }
+            }
+        }
+        if (!inFrame) {
+            GameGpuState.InvalidateGlCache();
+            GlBridge.GpuEnd(surfaceId);
+        }
+        return result;
+    }
+
+    public static int PostProcess3D(int surfaceId, float exposure, int tonemapMode,
+                                    float vignette, float bloomThreshold, float bloomIntensity) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap) { return 0; }
+        bool inFrame = GameGpuState.FrameSurface == surfaceId;
+        GpuFrameInfo frame;
+        if (inFrame) {
+            frame = GameGpuState.FrameGpu;
+        } else {
+            if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+        }
+        int result = 0;
+        if (GameGpuResources.Prepare(frame)) {
+            GpuPostProgram prog = GameGpuResources.GetPostProgram();
+            if (prog != null && GameGpuResources.PostTargetReady(frame)) {
+                int cx; int cy; int cw; int ch;
+                ComputeClip(frame, out cx, out cy, out cw, out ch);
+                if (cw == 0 || ch == 0) {
+                    result = 1;
+                } else {
+                    GlApi gl = GameGpuState.Gl;
+                    gl.Disable(GlBridge.SCISSOR_TEST);
+                    gl.Disable(GlBridge.DEPTH_TEST);
+                    gl.Disable(GlBridge.BLEND);
+
+                    gl.BindFramebuffer(GlBridge.READ_FRAMEBUFFER, frame.Framebuffer);
+                    gl.BindFramebuffer(GlBridge.DRAW_FRAMEBUFFER, GameGpuResources.PostFbo);
+                    gl.BlitFramebuffer(0, 0, frame.Width, frame.Height, 0, 0, frame.Width, frame.Height, GlBridge.COLOR_BUFFER_BIT, GlBridge.NEAREST);
+
+                    gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+                    gl.Viewport(0, 0, frame.Width, frame.Height);
+                    gl.Enable(GlBridge.SCISSOR_TEST);
+                    gl.Scissor(cx, cy, cw, ch);
+                    gl.UseProgram(prog.Program);
+                    gl.ActiveTexture(GlBridge.TEXTURE0);
+                    gl.BindTexture(GlBridge.TEXTURE_2D, GameGpuResources.PostTex);
+                    if (prog.UScene >= 0) { gl.Uniform1i(prog.UScene, 0); }
+                    if (prog.UTexelSize >= 0) { gl.Uniform2f(prog.UTexelSize, 1.0f / (float)frame.Width, 1.0f / (float)frame.Height); }
+                    if (prog.UExposure >= 0 && gl.HasUniform1f) { gl.Uniform1f(prog.UExposure, exposure); }
+                    if (prog.UTonemap >= 0) { gl.Uniform1i(prog.UTonemap, tonemapMode); }
+                    if (prog.UVignette >= 0 && gl.HasUniform1f) { gl.Uniform1f(prog.UVignette, vignette); }
+                    if (prog.UBloom >= 0) { gl.Uniform2f(prog.UBloom, bloomThreshold, bloomIntensity); }
+                    if (prog.UColorGrade >= 0) { gl.Uniform2f(prog.UColorGrade, GameGpuState.ColorSat, GameGpuState.ColorCon); }
+                    SetVec3(gl, prog.UColorTint, GameGpuState.ColorTintR, GameGpuState.ColorTintG, GameGpuState.ColorTintB);
+                    if (prog.UPostLens >= 0) { gl.Uniform2f(prog.UPostLens, GameGpuState.PostFxaa, GameGpuState.PostChromatic); }
+                    SetVec3(gl, prog.UPostFilm, GameGpuState.PostSharpen, GameGpuState.PostGrain, GameGpuState.PostGrainSeed);
+                    if (prog.UPostCinema >= 0) { gl.Uniform4f(prog.UPostCinema, GameGpuState.PostLetterbox, GameGpuState.PostDistortAmp, GameGpuState.PostDistortFreq, GameGpuState.PostDistortPhase); }
+                    SetVec3(gl, prog.UPostRadialBlur, GameGpuState.PostRadialStr, GameGpuState.PostRadialCx, GameGpuState.PostRadialCy);
+                    if (prog.UPostPixelate >= 0) { gl.Uniform2f(prog.UPostPixelate, GameGpuState.PostPixelSize, GameGpuState.PostPosterize); }
+                    if (prog.UPostDuotoneDark >= 0) { gl.Uniform4f(prog.UPostDuotoneDark, GameGpuState.PostDuoDarkR, GameGpuState.PostDuoDarkG, GameGpuState.PostDuoDarkB, GameGpuState.PostDuoStr); }
+                    SetVec3(gl, prog.UPostDuotoneLight, GameGpuState.PostDuoLightR, GameGpuState.PostDuoLightG, GameGpuState.PostDuoLightB);
+                    if (prog.UPostCrt >= 0) { gl.Uniform4f(prog.UPostCrt, GameGpuState.PostCrtInt, GameGpuState.PostCrtCount, GameGpuState.PostCrtCurve, GameGpuState.PostCrtGlow); }
+                    if (prog.UPostOutlineParams >= 0) { gl.Uniform2f(prog.UPostOutlineParams, GameGpuState.PostOutlineStr, GameGpuState.PostOutlineThresh); }
+                    SetVec3(gl, prog.UPostOutlineColor, GameGpuState.PostOutlineR, GameGpuState.PostOutlineG, GameGpuState.PostOutlineB);
+                    SetVec3(gl, prog.UPostThermal, GameGpuState.PostThermalStr, GameGpuState.PostThermalSens, GameGpuState.PostThermalCold);
+                    if (prog.UPostFlashParams >= 0) { gl.Uniform2f(prog.UPostFlashParams, GameGpuState.PostFlashEdge, GameGpuState.PostFlashStr); }
+                    SetVec3(gl, prog.UPostFlashColor, GameGpuState.PostFlashR, GameGpuState.PostFlashG, GameGpuState.PostFlashB);
+                    if (prog.UPostNightVision >= 0) { gl.Uniform4f(prog.UPostNightVision, GameGpuState.PostNvStr, GameGpuState.PostNvGain, GameGpuState.PostNvNoise, GameGpuState.PostNvSeed); }
+                    SetVec3(gl, prog.UPostHalftone, GameGpuState.PostHalftoneStr, GameGpuState.PostHalftoneScale, GameGpuState.PostHalftoneCon);
+                    SetVec3(gl, prog.UPostGlitch, GameGpuState.PostGlitchInt, GameGpuState.PostGlitchSlices, GameGpuState.PostGlitchSeed);
+                    SetVec3(gl, prog.UPostTiltShift, GameGpuState.PostTiltStr, GameGpuState.PostTiltY, GameGpuState.PostTiltBand);
+                    if (prog.UPostFrostParams >= 0) { gl.Uniform2f(prog.UPostFrostParams, GameGpuState.PostFrostInt, GameGpuState.PostFrostRad); }
+                    SetVec3(gl, prog.UPostFrostColor, GameGpuState.PostFrostR, GameGpuState.PostFrostG, GameGpuState.PostFrostB);
+                    SetVec3(gl, prog.UPostSepia, GameGpuState.PostSepiaStr, GameGpuState.PostSepiaScratch, GameGpuState.PostSepiaSeed);
+                    if (prog.UPostStreakParams >= 0) { gl.Uniform2f(prog.UPostStreakParams, GameGpuState.PostStreakStr, GameGpuState.PostStreakThresh); }
+                    SetVec3(gl, prog.UPostStreakColor, GameGpuState.PostStreakR, GameGpuState.PostStreakG, GameGpuState.PostStreakB);
+                    if (prog.UPostSplitParams >= 0) { gl.Uniform2f(prog.UPostSplitParams, GameGpuState.PostSplitStr, GameGpuState.PostSplitBal); }
+                    SetVec3(gl, prog.UPostSplitShadow, GameGpuState.PostSplitShR, GameGpuState.PostSplitShG, GameGpuState.PostSplitShB);
+                    SetVec3(gl, prog.UPostSplitHigh, GameGpuState.PostSplitHiR, GameGpuState.PostSplitHiG, GameGpuState.PostSplitHiB);
+                    if (prog.UPostOilPaint >= 0) { gl.Uniform2f(prog.UPostOilPaint, GameGpuState.PostOilStr, GameGpuState.PostOilRad); }
+                    if (prog.UPostScopeBlur >= 0) { gl.Uniform2f(prog.UPostScopeBlur, GameGpuState.PostScopeStr, GameGpuState.PostScopeClear); }
+                    if (prog.UPostDaltonize >= 0) { gl.Uniform2f(prog.UPostDaltonize, GameGpuState.PostDaltonMode, GameGpuState.PostDaltonStr); }
+                    if (prog.UPostLensDistort >= 0) { gl.Uniform2f(prog.UPostLensDistort, GameGpuState.PostLensK1, GameGpuState.PostLensZoom); }
+                    if (prog.UPostGodRays >= 0) { gl.Uniform4f(prog.UPostGodRays, GameGpuState.PostGodStr, GameGpuState.PostGodDecay, GameGpuState.PostGodLx, GameGpuState.PostGodLy); }
+
+                    gl.BindVertexArray(GameGpuResources.PostVao);
+                    gl.DrawArrays(GlBridge.TRIANGLES, 0, 3);
+                    gl.BindVertexArray(0u);
+                    result = 1;
+                }
+            }
+        }
+        GameGpuState.InvalidateGlCache();
+        if (!inFrame) { GlBridge.GpuEnd(surfaceId); }
+        return result;
+    }
+}

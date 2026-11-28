@@ -1,0 +1,469 @@
+using System;
+using System.Text;
+
+namespace Game.Graphics.Gpu;
+
+// 零开销原生 OpenGL 函数指针委托签名（由 zan_gui_gpu_begin 吐出的 zan_gl_api 指针表强转绑定）
+internal delegate void GlVoidFn();
+internal delegate void GlUintFn(uint a);
+internal delegate void GlByteFn(byte a);
+internal delegate void GlFourByteFn(byte a, byte b, byte c, byte d);
+internal delegate uint GlRetUintFn();
+internal delegate uint GlUintRetUintFn(uint a);
+internal delegate nint GlUintRetPtrFn(uint a);
+internal delegate void GlTwoUintFn(uint a, uint b);
+internal delegate void GlFourUintFn(uint a, uint b, uint c, uint d);
+internal delegate void GlFourIntFn(int a, int b, int c, int d);
+internal delegate void GlFourFloatFn(float a, float b, float c, float d);
+internal delegate void GlTwoFloatFn(float a, float b);
+internal delegate void GlUintIntFn(uint a, int b);
+internal delegate void GlDrawArraysFn(uint mode, int first, int count);
+internal delegate void GlDrawElementsFn(uint mode, int count, uint type, nint indices);
+internal delegate void GlDrawElementsInstFn(uint mode, int count, uint type, nint indices, int primcount);
+internal delegate int GlGetLocFn(uint prog, nint name);
+internal delegate void GlUniform1iFn(int loc, int v0);
+internal delegate void GlUniform1fFn(int loc, float v0);
+internal delegate void GlUniform2fFn(int loc, float v0, float v1);
+internal delegate void GlUniform4fFn(int loc, float v0, float v1, float v2, float v3);
+internal delegate void GlUniformVecFn(int loc, int count, nint ptr);
+internal delegate void GlUniformMat4Fn(int loc, int count, byte transpose, nint ptr);
+internal delegate void GlGenDelFn(int n, nint ids);
+internal delegate void GlBufferDataFn(uint target, nint size, nint data, uint usage);
+internal delegate void GlBufferSubDataFn(uint target, nint offset, nint size, nint data);
+internal delegate void GlVertexAttribPtrFn(uint idx, int size, uint type, byte norm, int stride, nint offset);
+internal delegate void GlTexParamIFn(uint target, uint pname, int param);
+internal delegate void GlTexImage2DFn(uint target, int level, int internalFmt, int w, int h, int border, uint fmt, uint type, nint pixels);
+internal delegate void GlFboTex2DFn(uint target, uint attachment, uint texTarget, uint texture, int level);
+internal delegate void GlRbStorageFn(uint target, uint internalFmt, int w, int h);
+internal delegate void GlFboRbFn(uint target, uint attachment, uint rbTarget, uint renderbuffer);
+internal delegate void GlBlitFboFn(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, uint mask, uint filter);
+
+internal struct GpuFrameInfo {
+    public nint ApiPtr;
+    public uint Framebuffer;
+    public int Width;
+    public int Height;
+    public int ClipX;
+    public int ClipY;
+    public int ClipW;
+    public int ClipH;
+    public ulong Epoch;
+}
+
+internal struct BitmapView {
+    public nint Pixels;
+    public int Width;
+    public int Height;
+    public int Stride;
+    public ulong Serial;
+}
+
+// 缓存从 zan_gl_api 表绑定的全部 GL 3.3 / GLES 3.0 函数委托，仅在 api 表指针变化时重建。
+internal sealed class GlApi {
+    public nint RawPtr;
+
+    public GlUintFn Enable;
+    public GlUintFn Disable;
+    public GlTwoUintFn BlendFunc;
+    public GlFourUintFn BlendFuncSeparate;
+    public GlFourIntFn Viewport;
+    public GlFourIntFn Scissor;
+    public GlFourFloatFn ClearColor;
+    public GlUintFn Clear;
+    public GlVoidFn Flush;
+    public GlVoidFn Finish;
+    public GlRetUintFn GetError;
+    public GlUintRetPtrFn GetString;
+    public GlDrawArraysFn DrawArrays;
+    public GlDrawElementsFn DrawElements;
+    public GlDrawElementsInstFn DrawElementsInstanced;
+    public GlUintFn DepthFunc;
+    public GlUintFn UseProgram;
+    public GlUintFn DeleteProgram;
+    public GlGetLocFn GetUniformLocation;
+    public GlGetLocFn GetAttribLocation;
+    public GlUniform1iFn Uniform1i;
+    public GlUniform2fFn Uniform2f;
+    public GlUniformVecFn Uniform3fv;
+    public GlUniform4fFn Uniform4f;
+    public GlUniformMat4Fn UniformMatrix4fv;
+    public GlGenDelFn GenBuffers;
+    public GlGenDelFn DeleteBuffers;
+    public GlTwoUintFn BindBuffer;
+    public GlBufferDataFn BufferData;
+    public GlGenDelFn GenVertexArrays;
+    public GlGenDelFn DeleteVertexArrays;
+    public GlUintFn BindVertexArray;
+    public GlUintFn EnableVertexAttribArray;
+    public GlVertexAttribPtrFn VertexAttribPointer;
+    public GlTwoUintFn VertexAttribDivisor;
+    public GlBufferSubDataFn BufferSubData;
+    public GlGenDelFn GenTextures;
+    public GlGenDelFn DeleteTextures;
+    public GlTwoUintFn BindTexture;
+    public GlUintFn ActiveTexture;
+    public GlTexParamIFn TexParameteri;
+    public GlTexImage2DFn TexImage2D;
+    public GlGenDelFn GenFramebuffers;
+    public GlGenDelFn DeleteFramebuffers;
+    public GlTwoUintFn BindFramebuffer;
+    public GlFboTex2DFn FramebufferTexture2D;
+    public GlGenDelFn GenRenderbuffers;
+    public GlGenDelFn DeleteRenderbuffers;
+    public GlTwoUintFn BindRenderbuffer;
+    public GlRbStorageFn RenderbufferStorage;
+    public GlFboRbFn FramebufferRenderbuffer;
+    public GlUintRetUintFn CheckFramebufferStatus;
+    public GlBlitFboFn BlitFramebuffer;
+    public GlTwoFloatFn PolygonOffset;
+    public GlByteFn DepthMask;
+    public GlFourByteFn ColorMask;
+    public GlUintFn CullFace;
+    public GlUintFn FrontFace;
+    public GlUniform1fFn Uniform1f;
+    public GlUniformVecFn Uniform4fv;
+
+    public bool HasBlendFuncSeparate;
+    public bool HasBlitFramebuffer;
+    public bool HasDepthMask;
+    public bool HasColorMask;
+    public bool HasCullFace;
+    public bool HasFrontFace;
+    public bool HasUniform1f;
+    public bool HasUniform4fv;
+    public bool HasPolygonOffset;
+
+    public static GlApi Bind(nint apiPtr) {
+        GlApi g = new GlApi();
+        g.RawPtr = apiPtr;
+        g.Enable = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 0);
+        g.Disable = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 1);
+        g.BlendFunc = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 2);
+        nint pBfs = GlBridge.LoadApiSlot(apiPtr, 3);
+        g.HasBlendFuncSeparate = pBfs != 0;
+        if (pBfs != 0) { g.BlendFuncSeparate = (GlFourUintFn)pBfs; }
+        g.Viewport = (GlFourIntFn)GlBridge.LoadApiSlot(apiPtr, 4);
+        g.Scissor = (GlFourIntFn)GlBridge.LoadApiSlot(apiPtr, 5);
+        g.ClearColor = (GlFourFloatFn)GlBridge.LoadApiSlot(apiPtr, 6);
+        g.Clear = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 7);
+        g.Flush = (GlVoidFn)GlBridge.LoadApiSlot(apiPtr, 9);
+        g.Finish = (GlVoidFn)GlBridge.LoadApiSlot(apiPtr, 10);
+        g.GetError = (GlRetUintFn)GlBridge.LoadApiSlot(apiPtr, 11);
+        g.GetString = (GlUintRetPtrFn)GlBridge.LoadApiSlot(apiPtr, 12);
+        g.DrawArrays = (GlDrawArraysFn)GlBridge.LoadApiSlot(apiPtr, 13);
+        g.DrawElements = (GlDrawElementsFn)GlBridge.LoadApiSlot(apiPtr, 14);
+        g.DrawElementsInstanced = (GlDrawElementsInstFn)GlBridge.LoadApiSlot(apiPtr, 15);
+        g.DepthFunc = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 16);
+        g.UseProgram = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 29);
+        g.DeleteProgram = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 30);
+        g.GetUniformLocation = (GlGetLocFn)GlBridge.LoadApiSlot(apiPtr, 31);
+        g.GetAttribLocation = (GlGetLocFn)GlBridge.LoadApiSlot(apiPtr, 32);
+        g.Uniform1i = (GlUniform1iFn)GlBridge.LoadApiSlot(apiPtr, 33);
+        g.Uniform2f = (GlUniform2fFn)GlBridge.LoadApiSlot(apiPtr, 34);
+        g.Uniform3fv = (GlUniformVecFn)GlBridge.LoadApiSlot(apiPtr, 35);
+        g.Uniform4f = (GlUniform4fFn)GlBridge.LoadApiSlot(apiPtr, 36);
+        g.UniformMatrix4fv = (GlUniformMat4Fn)GlBridge.LoadApiSlot(apiPtr, 37);
+        g.GenBuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 38);
+        g.DeleteBuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 39);
+        g.BindBuffer = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 40);
+        g.BufferData = (GlBufferDataFn)GlBridge.LoadApiSlot(apiPtr, 41);
+        g.GenVertexArrays = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 42);
+        g.DeleteVertexArrays = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 43);
+        g.BindVertexArray = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 44);
+        g.EnableVertexAttribArray = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 45);
+        g.VertexAttribPointer = (GlVertexAttribPtrFn)GlBridge.LoadApiSlot(apiPtr, 46);
+        g.VertexAttribDivisor = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 47);
+        g.BufferSubData = (GlBufferSubDataFn)GlBridge.LoadApiSlot(apiPtr, 48);
+        g.GenTextures = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 49);
+        g.DeleteTextures = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 50);
+        g.BindTexture = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 51);
+        g.ActiveTexture = (GlUintFn)GlBridge.LoadApiSlot(apiPtr, 52);
+        g.TexParameteri = (GlTexParamIFn)GlBridge.LoadApiSlot(apiPtr, 53);
+        g.TexImage2D = (GlTexImage2DFn)GlBridge.LoadApiSlot(apiPtr, 54);
+        g.GenFramebuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 56);
+        g.DeleteFramebuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 57);
+        g.BindFramebuffer = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 58);
+        g.FramebufferTexture2D = (GlFboTex2DFn)GlBridge.LoadApiSlot(apiPtr, 59);
+        g.GenRenderbuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 60);
+        g.DeleteRenderbuffers = (GlGenDelFn)GlBridge.LoadApiSlot(apiPtr, 61);
+        g.BindRenderbuffer = (GlTwoUintFn)GlBridge.LoadApiSlot(apiPtr, 62);
+        g.RenderbufferStorage = (GlRbStorageFn)GlBridge.LoadApiSlot(apiPtr, 63);
+        g.FramebufferRenderbuffer = (GlFboRbFn)GlBridge.LoadApiSlot(apiPtr, 64);
+        g.CheckFramebufferStatus = (GlUintRetUintFn)GlBridge.LoadApiSlot(apiPtr, 65);
+        nint pBlit = GlBridge.LoadApiSlot(apiPtr, 66);
+        g.HasBlitFramebuffer = pBlit != 0;
+        if (pBlit != 0) { g.BlitFramebuffer = (GlBlitFboFn)pBlit; }
+
+        nint pPoly = GlBridge.LoadApiSlot(apiPtr, 68);
+        g.HasPolygonOffset = pPoly != 0;
+        if (pPoly != 0) { g.PolygonOffset = (GlTwoFloatFn)pPoly; }
+
+        nint pDm = GlBridge.LoadApiSlot(apiPtr, 69);
+        g.HasDepthMask = pDm != 0;
+        if (pDm != 0) { g.DepthMask = (GlByteFn)pDm; }
+
+        nint pCm = GlBridge.LoadApiSlot(apiPtr, 70);
+        g.HasColorMask = pCm != 0;
+        if (pCm != 0) { g.ColorMask = (GlFourByteFn)pCm; }
+
+        nint pCf = GlBridge.LoadApiSlot(apiPtr, 71);
+        g.HasCullFace = pCf != 0;
+        if (pCf != 0) { g.CullFace = (GlUintFn)pCf; }
+
+        nint pFf = GlBridge.LoadApiSlot(apiPtr, 72);
+        g.HasFrontFace = pFf != 0;
+        if (pFf != 0) { g.FrontFace = (GlUintFn)pFf; }
+
+        nint pU1f = GlBridge.LoadApiSlot(apiPtr, 79);
+        g.HasUniform1f = pU1f != 0;
+        if (pU1f != 0) { g.Uniform1f = (GlUniform1fFn)pU1f; }
+
+        nint pU4fv = GlBridge.LoadApiSlot(apiPtr, 80);
+        g.HasUniform4fv = pU4fv != 0;
+        if (pU4fv != 0) { g.Uniform4fv = (GlUniformVecFn)pU4fv; }
+
+        return g;
+    }
+}
+
+// 跨平台极薄原生桥：仅对接全平台已导出的 zan_gui_gpu_* / zan_image_* 入口。
+internal static class GlBridge {
+    public const uint TRIANGLES = 0x0004u;
+    public const uint SRC_ALPHA = 0x0302u;
+    public const uint ONE_MINUS_SRC_ALPHA = 0x0303u;
+    public const uint ONE = 1u;
+    public const uint BLEND = 0x0BE2u;
+    public const uint SCISSOR_TEST = 0x0C11u;
+    public const uint TEXTURE_2D = 0x0DE1u;
+    public const uint UNSIGNED_BYTE = 0x1401u;
+    public const uint UNSIGNED_SHORT = 0x1403u;
+    public const uint UNSIGNED_INT = 0x1405u;
+    public const uint FLOAT = 0x1406u;
+    public const uint RGBA = 0x1908u;
+    public const uint RGBA8 = 0x8058u;
+    public const uint NEAREST = 0x2600u;
+    public const uint LINEAR = 0x2601u;
+    public const uint DEPTH_TEST = 0x0B71u;
+    public const uint LEQUAL = 0x0203u;
+    public const uint DEPTH_COMPONENT = 0x1902u;
+    public const uint DEPTH_COMPONENT16 = 0x81A5u;
+    public const uint DEPTH_COMPONENT24 = 0x81A6u;
+    public const uint DEPTH_ATTACHMENT = 0x8D00u;
+    public const uint RENDERBUFFER = 0x8D41u;
+    public const uint ELEMENT_ARRAY_BUFFER = 0x8893u;
+    public const uint DEPTH_BUFFER_BIT = 0x00000100u;
+    public const uint COLOR_BUFFER_BIT = 0x00004000u;
+    public const uint TEXTURE_MAG_FILTER = 0x2800u;
+    public const uint TEXTURE_MIN_FILTER = 0x2801u;
+    public const uint TEXTURE_WRAP_S = 0x2802u;
+    public const uint TEXTURE_WRAP_T = 0x2803u;
+    public const uint CLAMP_TO_EDGE = 0x812Fu;
+    public const uint TEXTURE0 = 0x84C0u;
+    public const uint ARRAY_BUFFER = 0x8892u;
+    public const uint STREAM_DRAW = 0x88E0u;
+    public const uint STATIC_DRAW = 0x88E4u;
+    public const uint FRAMEBUFFER = 0x8D40u;
+    public const uint COLOR_ATTACHMENT0 = 0x8CE0u;
+    public const uint FRAMEBUFFER_COMPLETE = 0x8CD5u;
+    public const uint READ_FRAMEBUFFER = 0x8CA8u;
+    public const uint DRAW_FRAMEBUFFER = 0x8CA9u;
+    public const uint VERSION = 0x1F02u;
+    public const uint CULL_FACE = 0x0B44u;
+    public const uint FRONT = 0x0404u;
+    public const uint BACK = 0x0405u;
+    public const uint CCW = 0x0901u;
+    public const uint POLYGON_OFFSET_FILL = 0x8037u;
+
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_gpu_begin(int surfaceId, nint frameOut);
+    [DllImport("zan_gui")]
+    private static extern void zan_gui_gpu_end(int surfaceId);
+    [DllImport("zan_gui")]
+    private static extern uint zan_gui_gpu_program(string vs, string fs);
+    [DllImport("zan_gui")]
+    private static extern uint zan_gui_gpu_texture(nint bitmap);
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_gpu_register_cleanup(nint callback);
+    [DllImport("zan_gui")]
+    private static extern nint zan_gui_surface_bitmap(int surfaceId);
+    [DllImport("zan_gui")]
+    private static extern void zan_gui_blit_pixels_batch(int surfaceId, nint bitmap, nint quads, int count);
+
+    [DllImport("zan_image")]
+    private static extern nint zan_image_get(string key);
+    [DllImport("zan_image")]
+    private static extern int zan_image_register_argb(string key, nint pixels, int w, int h, int stride);
+
+    private static nint frameScratch;
+    private static nint cstrScratch;
+    private static nint uintScratch;
+    private static nint whitePixelBuf;
+    private static nint whiteBitmapBuf;
+
+    public static int PtrSize() {
+#if WASM
+        return 4;
+#else
+        return 8;
+#endif
+    }
+
+    public static nint LoadApiSlot(nint table, int slot) {
+        int ps = PtrSize();
+        return new Span<nint>(table + (nint)(slot * ps), 1)[0];
+    }
+
+    public static bool GpuBegin(int surfaceId, out GpuFrameInfo info) {
+        info = new GpuFrameInfo();
+        if (frameScratch == 0) {
+            frameScratch = NativeMemory.Alloc(64);
+        }
+        NativeMemory.Fill(frameScratch, 0, 64);
+        if (zan_gui_gpu_begin(surfaceId, frameScratch) == 0) {
+            return false;
+        }
+        int ps = PtrSize();
+        info.ApiPtr = new Span<nint>(frameScratch, 1)[0];
+        info.Framebuffer = new Span<uint>(frameScratch + (nint)ps, 1)[0];
+        info.Width = new Span<int>(frameScratch + (nint)(ps + 4), 1)[0];
+        info.Height = new Span<int>(frameScratch + (nint)(ps + 8), 1)[0];
+        info.ClipX = new Span<int>(frameScratch + (nint)(ps + 12), 1)[0];
+        info.ClipY = new Span<int>(frameScratch + (nint)(ps + 16), 1)[0];
+        info.ClipW = new Span<int>(frameScratch + (nint)(ps + 20), 1)[0];
+        info.ClipH = new Span<int>(frameScratch + (nint)(ps + 24), 1)[0];
+        int epochOff = ps == 8 ? 40 : 32;
+        info.Epoch = new Span<ulong>(frameScratch + (nint)epochOff, 1)[0];
+        return info.ApiPtr != 0;
+    }
+
+    public static void GpuEnd(int surfaceId) {
+        zan_gui_gpu_end(surfaceId);
+    }
+
+    public static uint GpuProgram(string vs, string fs) {
+        return zan_gui_gpu_program(vs, fs);
+    }
+
+    public static uint GpuTexture(nint bitmapPtr) {
+        if (bitmapPtr == 0) { return 0u; }
+        return zan_gui_gpu_texture(bitmapPtr);
+    }
+
+    public static nint WhiteBitmapPtr() {
+        if (whiteBitmapBuf == 0) {
+            int ps = PtrSize();
+            whitePixelBuf = NativeMemory.Alloc(4);
+            new Span<uint>(whitePixelBuf, 1)[0] = 0xFFFFFFFFu;
+            int sz = ps == 8 ? 32 : 24;
+            whiteBitmapBuf = NativeMemory.Alloc(sz);
+            NativeMemory.Fill(whiteBitmapBuf, 0, sz);
+            new Span<nint>(whiteBitmapBuf, 1)[0] = whitePixelBuf;
+            new Span<int>(whiteBitmapBuf + (nint)ps, 1)[0] = 1;
+            new Span<int>(whiteBitmapBuf + (nint)(ps + 4), 1)[0] = 1;
+            new Span<int>(whiteBitmapBuf + (nint)(ps + 8), 1)[0] = 1;
+            int serOff = ps == 8 ? 24 : 16;
+            new Span<ulong>(whiteBitmapBuf + (nint)serOff, 1)[0] = 1UL;
+        }
+        return whiteBitmapBuf;
+    }
+
+    public static int RegisterCleanup(nint callback) {
+        return zan_gui_gpu_register_cleanup(callback);
+    }
+
+    public static nint SurfaceBitmap(int surfaceId) {
+        return zan_gui_surface_bitmap(surfaceId);
+    }
+
+    public static void BlitPixelsBatch(int surfaceId, nint bitmap, nint quads, int count) {
+        zan_gui_blit_pixels_batch(surfaceId, bitmap, quads, count);
+    }
+
+    public static nint ImageGet(string key) {
+        if (key == null || key.Length == 0) { return 0; }
+        return zan_image_get(key);
+    }
+
+    public static int ImageRegisterArgb(string key, nint pixels, int w, int h, int stride) {
+        return zan_image_register_argb(key, pixels, w, h, stride);
+    }
+
+    public static bool ReadBitmap(nint ptr, out BitmapView view) {
+        view = new BitmapView();
+        if (ptr == 0) { return false; }
+        int ps = PtrSize();
+        view.Pixels = new Span<nint>(ptr, 1)[0];
+        view.Width = new Span<int>(ptr + (nint)ps, 1)[0];
+        view.Height = new Span<int>(ptr + (nint)(ps + 4), 1)[0];
+        view.Stride = new Span<int>(ptr + (nint)(ps + 8), 1)[0];
+        int serOff = ps == 8 ? 24 : 16;
+        view.Serial = new Span<ulong>(ptr + (nint)serOff, 1)[0];
+        return view.Pixels != 0 && view.Width > 0 && view.Height > 0 && view.Stride >= view.Width;
+    }
+
+    public static int UniformLoc(GlApi gl, uint prog, string name) {
+        if (prog == 0u || name == null) { return -1; }
+        if (cstrScratch == 0) {
+            cstrScratch = NativeMemory.Alloc(128);
+        }
+        int len = name.Length;
+        if (len > 126) { len = 126; }
+        Span<byte> buf = new Span<byte>(cstrScratch, 128);
+        for (int i = 0; i < len; i = i + 1) {
+            buf[i] = (byte)name[i];
+        }
+        buf[len] = 0;
+        return gl.GetUniformLocation(prog, cstrScratch);
+    }
+
+    public static int AttribLoc(GlApi gl, uint prog, string name) {
+        if (prog == 0u || name == null) { return -1; }
+        if (cstrScratch == 0) {
+            cstrScratch = NativeMemory.Alloc(128);
+        }
+        int len = name.Length;
+        if (len > 126) { len = 126; }
+        Span<byte> buf = new Span<byte>(cstrScratch, 128);
+        for (int i = 0; i < len; i = i + 1) {
+            buf[i] = (byte)name[i];
+        }
+        buf[len] = 0;
+        return gl.GetAttribLocation(prog, cstrScratch);
+    }
+
+    public static uint GenOne(GlGenDelFn genFn) {
+        if (uintScratch == 0) { uintScratch = NativeMemory.Alloc(8); }
+        new Span<uint>(uintScratch, 1)[0] = 0u;
+        genFn(1, uintScratch);
+        return new Span<uint>(uintScratch, 1)[0];
+    }
+
+    public static void DeleteOne(GlGenDelFn delFn, uint id) {
+        if (id == 0u) { return; }
+        if (uintScratch == 0) { uintScratch = NativeMemory.Alloc(8); }
+        new Span<uint>(uintScratch, 1)[0] = id;
+        delFn(1, uintScratch);
+    }
+
+    public static bool IsGlesVersion(GlApi gl) {
+#if ANDROID || OHOS
+        return true;
+#else
+        if (gl == null || gl.GetString == null) { return false; }
+        nint verPtr = gl.GetString(VERSION);
+        if (verPtr == 0) { return false; }
+        // 检查前 64 字节中是否包含 "OpenGL ES"
+        Span<byte> b = new Span<byte>(verPtr, 64);
+        int len = 0;
+        while (len < 64 && b[len] != 0) { len = len + 1; }
+        for (int i = 0; i + 9 <= len; i = i + 1) {
+            if (b[i] == 79 && b[i + 1] == 112 && b[i + 2] == 101 && b[i + 3] == 110
+                && b[i + 4] == 71 && b[i + 5] == 76 && b[i + 6] == 32
+                && b[i + 7] == 69 && b[i + 8] == 83) {
+                return true;
+            }
+        }
+        return false;
+#endif
+    }
+}

@@ -1,0 +1,1021 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Graphics.Gpu;
+
+internal sealed class TexCacheEntry {
+    public string Key;
+    public nint BitmapPtr;
+    public ulong Serial;
+    public uint Tex;
+    public uint Gen;
+}
+
+// 全部 3D 光照/材质/阴影/骨骼/VFX/后处理状态、4 组脏版本号、GL 状态镜像缓存与 2D 精灵注册表。
+internal static class GameGpuState {
+    public const int MaxLights = 4;
+    public const int MaxBones = 64;
+    public const int SurfaceCap = 64;
+    public const int InstanceCap = 4096;
+    public const int InstanceFloats = 20;
+    public const int TexCacheCap = 8;
+    public const int SpriteCap = 4096;
+
+    // 连续非托管浮点缓冲区布局（单位：字节；直接传给 glUniform3fv/4fv/Matrix4fv 零堆分配）
+    public const int OffLightDir = 0;            // 12 floats (48B)
+    public const int OffLightColor = 48;         // 12 floats (48B)
+    public const int OffAmbient = 96;            // 3 floats  (12B)
+    public const int OffCamPos = 112;            // 3 floats  (12B)
+    public const int OffEmissive = 128;          // 3 floats  (12B)
+    public const int OffPointPos = 144;          // 16 floats (64B)
+    public const int OffPointColor = 208;        // 12 floats (48B)
+    public const int OffSpotPos = 256;           // 16 floats (64B)
+    public const int OffSpotDir = 320;           // 16 floats (64B)
+    public const int OffSpotColor = 384;         // 16 floats (64B)
+    public const int OffHemiSky = 448;           // 3 floats  (12B)
+    public const int OffHemiGround = 464;        // 3 floats  (12B)
+    public const int OffFogColor = 480;          // 3 floats  (12B)
+    public const int OffFogParams = 496;         // 3 floats  (12B)
+    public const int OffShadowLightVp = 512;     // 16 floats (64B)
+    public const int OffIdentityMat4 = 576;      // 16 floats (64B)
+    public const int OffTmpVec = 640;            // 16 floats (64B, 临时 vec3/vec4 上传槽)
+    public const int OffBones = 704;             // 64*16 floats (4096B)
+    public const int TotalFloatBufBytes = 4800;
+
+    public static nint FloatBuf;
+    private static bool initialized;
+
+    // 核心光照/材质/混合/裁剪/阴影/骨骼标量与键
+    public static int LightCount = 1;
+    public static int CamValid = 0;
+    public static float MatMetallic = 0.0f;
+    public static float MatRoughness = 1.0f;
+    public static int PointCount = 0;
+    public static int SpotCount = 0;
+    public static int HemiOn = 0;
+    public static string NormalKey = "";
+    public static float NormalScale = 0.0f;
+    public static string OrmKey = "";
+    public static float AoStrength = 1.0f;
+    public static float AlphaCutoff = 0.0f;
+    public static string EmissiveKey = "";
+    public static float UvScaleU = 1.0f;
+    public static float UvScaleV = 1.0f;
+    public static float UvOffsetU = 0.0f;
+    public static float UvOffsetV = 0.0f;
+
+    public static int BlendEnabled = 0;
+    public static int DepthWrite = 1;
+    public static int CullMode = 0;
+    public static int PreserveDepth = 0;
+    public static int BoneCount = 0;
+
+    // 3D VFX 状态
+    public static float RimR; public static float RimG; public static float RimB; public static float RimPow = 3.0f;
+    public static float ToonBands; public static float ToonSpecStep = 0.35f;
+    public static float DissolveThresh; public static float DissolveEdgeW = 0.08f;
+    public static float DissolveR = 1.0f; public static float DissolveG = 0.4f; public static float DissolveB = 0.05f;
+    public static int ClipOn;
+    public static float ClipNx; public static float ClipNy = 1.0f; public static float ClipNz; public static float ClipD;
+    public static float TriplanarOn; public static float TriplanarScale = 1.0f; public static float TriplanarSharp = 4.0f;
+    public static float HeightFogBaseY; public static float HeightFogFalloff = 1.0f;
+    public static float HeightFogMax = 0.8f; public static float HeightFogOn;
+    public static float HeightFogR = 0.6f; public static float HeightFogG = 0.7f; public static float HeightFogB = 0.85f;
+    public static float HitFlashR = 1.0f; public static float HitFlashG = 1.0f; public static float HitFlashB = 1.0f; public static float HitFlashAmt;
+    public static float HoloOn; public static float HoloFreq = 12.0f; public static float HoloPhase; public static float HoloStr;
+    public static float HoloR; public static float HoloG = 0.9f; public static float HoloB = 1.0f;
+    public static float TopCoverOn; public static float TopCoverThresh = 0.5f; public static float TopCoverSharp = 0.25f; public static float TopCoverAmt;
+    public static float TopCoverR = 0.95f; public static float TopCoverG = 0.97f; public static float TopCoverB = 1.0f;
+    public static float WindAmp; public static float WindFreq = 1.5f; public static float WindPhase; public static float WindHScale = 1.0f;
+    public static float DistFadeOn; public static float DistFadeStart = 0.5f; public static float DistFadeEnd = 2.0f;
+    public static float WorldGridOn; public static float WorldGridCell = 1.0f; public static float WorldGridLine = 0.05f; public static float WorldGridStr;
+    public static float WorldGridR; public static float WorldGridG = 0.9f; public static float WorldGridB = 1.0f;
+    public static float CausticsOn; public static float CausticsScale = 1.0f; public static float CausticsPhase; public static float CausticsStr;
+    public static float CausticsR = 0.4f; public static float CausticsG = 0.9f; public static float CausticsB = 1.0f;
+    public static float IceOn; public static float IceScale = 2.0f; public static float IceGlint; public static float IceFresnel = 2.5f;
+    public static float IceR = 0.65f; public static float IceG = 0.92f; public static float IceB = 1.0f;
+    public static float LavaOn; public static float LavaScale = 1.5f; public static float LavaPhase; public static float LavaCrack = 0.18f;
+    public static float LavaR = 1.0f; public static float LavaG = 0.35f; public static float LavaB = 0.04f; public static float LavaStr;
+    public static float IridOn; public static float IridThick = 2.0f; public static float IridPhase; public static float IridStr;
+    public static float SonarOx; public static float SonarOy; public static float SonarOz; public static float SonarRadius = 1.0f;
+    public static float SonarOn; public static float SonarWidth = 0.6f; public static float SonarStr;
+    public static float SonarR = 0.1f; public static float SonarG = 0.9f; public static float SonarB = 1.0f;
+    public static float ForceOn; public static float ForceScale = 2.0f; public static float ForcePhase; public static float ForceEdge = 0.10f;
+    public static float ForceR = 0.1f; public static float ForceG = 0.75f; public static float ForceB = 1.0f; public static float ForceStr;
+    public static float RainOn; public static float RainScale = 2.0f; public static float RainPhase; public static float RainStr;
+    public static float RainR = 0.75f; public static float RainG = 0.88f; public static float RainB = 1.0f;
+    public static float XrayOn; public static float XrayPow = 2.5f; public static float XrayStr;
+    public static float XrayR = 0.2f; public static float XrayG = 0.85f; public static float XrayB = 1.0f;
+    public static float PortalOn; public static float PortalTurns = 3.0f; public static float PortalPhase; public static float PortalStr;
+    public static float PortalR = 0.55f; public static float PortalG = 0.25f; public static float PortalB = 1.0f;
+    public static float BlueprintOn; public static float BlueprintDens = 2.0f; public static float BlueprintLine = 0.06f; public static float BlueprintStr;
+    public static float BlueprintR = 0.15f; public static float BlueprintG = 0.78f; public static float BlueprintB = 1.0f;
+    public static float HeatOn; public static float HeatFreq = 4.0f; public static float HeatPhase; public static float HeatStr;
+    public static float HeatR = 1.0f; public static float HeatG = 0.55f; public static float HeatB = 0.18f;
+    public static float DitherOn; public static float DitherOpacity = 1.0f; public static float DitherScale = 1.0f;
+    public static float HatchOn; public static float HatchDens = 8.0f; public static float HatchStr;
+    public static float HatchR = 0.05f; public static float HatchG = 0.05f; public static float HatchB = 0.08f;
+    public static float AnisoOn; public static float AnisoFreq = 12.0f; public static float AnisoVal = 16.0f; public static float AnisoStr;
+    public static float AnisoR = 0.85f; public static float AnisoG = 0.90f; public static float AnisoB = 1.0f;
+    public static float VelvetOn; public static float VelvetRough = 0.35f; public static float VelvetWeave = 16.0f; public static float VelvetStr;
+    public static float VelvetR = 0.95f; public static float VelvetG = 0.78f; public static float VelvetB = 1.0f;
+    public static float SssOn; public static float SssWrap = 0.5f; public static float SssTrans; public static float SssPow = 3.0f;
+    public static float SssR = 1.0f; public static float SssG = 0.35f; public static float SssB = 0.20f;
+
+    // 后处理状态
+    public static float ColorSat = 1.0f; public static float ColorCon = 1.0f;
+    public static float ColorTintR = 1.0f; public static float ColorTintG = 1.0f; public static float ColorTintB = 1.0f;
+    public static float PostFxaa; public static float PostChromatic;
+    public static float PostSharpen; public static float PostGrain; public static float PostGrainSeed;
+    public static float PostLetterbox; public static float PostDistortAmp; public static float PostDistortFreq = 16.0f; public static float PostDistortPhase;
+    public static float PostRadialStr; public static float PostRadialCx = 0.5f; public static float PostRadialCy = 0.5f;
+    public static float PostPixelSize; public static float PostPosterize;
+    public static float PostDuoDarkR; public static float PostDuoDarkG = 0.05f; public static float PostDuoDarkB; public static float PostDuoStr;
+    public static float PostDuoLightR = 0.2f; public static float PostDuoLightG = 1.0f; public static float PostDuoLightB = 0.35f;
+    public static float PostCrtInt; public static float PostCrtCount = 64.0f; public static float PostCrtCurve; public static float PostCrtGlow = 1.0f;
+    public static float PostOutlineStr; public static float PostOutlineThresh = 0.2f;
+    public static float PostOutlineR; public static float PostOutlineG; public static float PostOutlineB;
+    public static float PostThermalStr; public static float PostThermalSens = 1.0f; public static float PostThermalCold;
+    public static float PostFlashEdge; public static float PostFlashStr;
+    public static float PostFlashR = 1.0f; public static float PostFlashG = 0.05f; public static float PostFlashB = 0.05f;
+    public static float PostNvStr; public static float PostNvGain = 3.0f; public static float PostNvNoise = 0.06f; public static float PostNvSeed;
+    public static float PostHalftoneStr; public static float PostHalftoneScale = 6.0f; public static float PostHalftoneCon = 1.0f;
+    public static float PostGlitchInt; public static float PostGlitchSlices = 24.0f; public static float PostGlitchSeed;
+    public static float PostTiltStr; public static float PostTiltY = 0.5f; public static float PostTiltBand = 0.15f;
+    public static float PostFrostInt; public static float PostFrostRad = 0.45f;
+    public static float PostFrostR = 0.55f; public static float PostFrostG = 0.88f; public static float PostFrostB = 1.0f;
+    public static float PostSepiaStr; public static float PostSepiaScratch; public static float PostSepiaSeed;
+    public static float PostStreakStr; public static float PostStreakThresh = 0.75f;
+    public static float PostStreakR = 0.25f; public static float PostStreakG = 0.78f; public static float PostStreakB = 1.0f;
+    public static float PostSplitStr; public static float PostSplitBal;
+    public static float PostSplitShR = 0.05f; public static float PostSplitShG = 0.35f; public static float PostSplitShB = 0.95f;
+    public static float PostSplitHiR = 1.0f; public static float PostSplitHiG = 0.58f; public static float PostSplitHiB = 0.15f;
+    public static float PostOilStr; public static float PostOilRad = 2.0f;
+    public static float PostScopeStr; public static float PostScopeClear = 0.45f;
+    public static float PostDaltonMode; public static float PostDaltonStr;
+    public static float PostLensK1; public static float PostLensZoom = 1.0f;
+    public static float PostGodStr; public static float PostGodDecay = 0.92f; public static float PostGodLx = 0.5f; public static float PostGodLy = 0.5f;
+
+    // 脏版本号
+    public static uint LightVersion = 1u;
+    public static uint MatVersion = 1u;
+    public static uint ShadowVersion = 1u;
+    public static uint VfxVersion = 1u;
+
+    // GL 镜像缓存与会话状态
+    public static GlApi Gl;
+    public static ulong Epoch;
+    public static int FrameSurface = -1;
+    public static GpuFrameInfo FrameGpu;
+    public static bool FrameClipEmpty;
+    public static int BatchSurface = -1;
+    public static bool BatchOwnsGpu;
+    public static GpuFrameInfo BatchFrame;
+    public static bool BatchClipEmpty;
+    public static uint BatchProg;
+    public static uint BatchTex;
+    public static uint CurProg;
+    public static uint[] CurTex;
+    public static int CurBlend = -1;
+    public static int CurDepthWrite = -1;
+    public static int CurCull = -1;
+    public static uint ShadowCurProg;
+    public static uint WhiteTex;
+
+    public static TexCacheEntry[] TexCache;
+    public static uint TexCacheGen = 1u;
+    public static int TexCacheNext;
+
+    // 阴影状态
+    public static uint ShadowFbo;
+    public static uint ShadowTex;
+    public static int ShadowSize;
+    public static bool ShadowReady;
+    public static int ShadowSurface = -1;
+    public static GpuFrameInfo ShadowFrame;
+
+    // 2D 精灵注册表
+    private static List<string> sprites;
+    private static Dictionary<string, int> spriteMap;
+
+    public static void EnsureInit() {
+        if (initialized) { return; }
+        initialized = true;
+        FloatBuf = NativeMemory.Alloc(TotalFloatBufBytes);
+        NativeMemory.Fill(FloatBuf, 0, TotalFloatBufBytes);
+        Span<float> f = new Span<float>(FloatBuf, TotalFloatBufBytes / 4);
+        // 缺省键光（与旧固定着色器逐位一致）
+        f[OffLightDir / 4 + 0] = 0.4f;
+        f[OffLightDir / 4 + 1] = 0.8f;
+        f[OffLightDir / 4 + 2] = 0.6f;
+        f[OffLightColor / 4 + 0] = 0.45f;
+        f[OffLightColor / 4 + 1] = 0.45f;
+        f[OffLightColor / 4 + 2] = 0.45f;
+        f[OffAmbient / 4 + 0] = 0.55f;
+        f[OffAmbient / 4 + 1] = 0.55f;
+        f[OffAmbient / 4 + 2] = 0.55f;
+        f[OffHemiSky / 4 + 0] = 0.35f;
+        f[OffHemiSky / 4 + 1] = 0.50f;
+        f[OffHemiSky / 4 + 2] = 0.72f;
+        f[OffHemiGround / 4 + 0] = 0.16f;
+        f[OffHemiGround / 4 + 1] = 0.14f;
+        f[OffHemiGround / 4 + 2] = 0.12f;
+        // 单位矩阵：ShadowLightVp、IdentityMat4 及全部 64 块骨骼
+        WriteIdentity(f, OffShadowLightVp / 4);
+        WriteIdentity(f, OffIdentityMat4 / 4);
+        for (int i = 0; i < MaxBones; i = i + 1) {
+            WriteIdentity(f, OffBones / 4 + i * 16);
+        }
+        CurTex = new uint[5];
+        TexCache = new TexCacheEntry[TexCacheCap];
+        for (int i = 0; i < TexCacheCap; i = i + 1) {
+            TexCache[i] = new TexCacheEntry();
+        }
+        sprites = new List<string>();
+        spriteMap = new Dictionary<string, int>();
+    }
+
+    private static void WriteIdentity(Span<float> f, int baseIdx) {
+        for (int i = 0; i < 16; i = i + 1) { f[baseIdx + i] = 0.0f; }
+        f[baseIdx + 0] = 1.0f;
+        f[baseIdx + 5] = 1.0f;
+        f[baseIdx + 10] = 1.0f;
+        f[baseIdx + 15] = 1.0f;
+    }
+
+    public static void InvalidateGlCache() {
+        CurProg = 0u;
+        if (CurTex != null) {
+            for (int i = 0; i < 5; i = i + 1) { CurTex[i] = 0u; }
+        }
+        CurBlend = -1;
+        CurDepthWrite = -1;
+        CurCull = -1;
+        ShadowCurProg = 0u;
+    }
+
+    // ---- 2D 精灵烘焙与批量提交 ----
+
+    public static int SpriteHandle(string key) {
+        EnsureInit();
+        if (key == null || key.Length == 0 || key.Length >= 512) { return 0; }
+        int existing = 0;
+        if (spriteMap.TryGetValue(key, out existing)) { return existing; }
+        if (sprites.Count >= SpriteCap) { return 0; }
+        BitmapView bv;
+        if (!GlBridge.ReadBitmap(GlBridge.ImageGet(key), out bv)) { return 0; }
+        sprites.Add(key);
+        int h = sprites.Count;
+        spriteMap[key] = h;
+        return h;
+    }
+
+    public static int BakeSprite(string key, int surfaceId, int x, int y, int width, int height) {
+        EnsureInit();
+        if (key == null || key.Length == 0) { return 0; }
+        string fullKey = key.StartsWith("mem:") ? key : ("mem:" + key);
+        if (fullKey.Length >= 512) { return 0; }
+        int existing = 0;
+        bool hasExisting = spriteMap.TryGetValue(fullKey, out existing);
+        if (!hasExisting && sprites.Count >= SpriteCap) { return 0; }
+        BitmapView src;
+        if (!GlBridge.ReadBitmap(GlBridge.SurfaceBitmap(surfaceId), out src)) { return 0; }
+        long bx = x;
+        long by = y;
+        long bw = width > 0 ? width : src.Width;
+        long bh = height > 0 ? height : src.Height;
+        if (bx < 0) { bw = bw + bx; bx = 0; }
+        if (by < 0) { bh = bh + by; by = 0; }
+        if (bx >= src.Width || by >= src.Height) { return 0; }
+        if (bw > src.Width - bx) { bw = src.Width - bx; }
+        if (bh > src.Height - by) { bh = src.Height - by; }
+        if (bw <= 0 || bh <= 0) { return 0; }
+        nint slice = src.Pixels + (nint)((by * (long)src.Stride + bx) * 4L);
+        if (GlBridge.ImageRegisterArgb(fullKey, slice, (int)bw, (int)bh, src.Stride) <= 0) {
+            return 0;
+        }
+        if (hasExisting) { return existing; }
+        sprites.Add(fullKey);
+        int h = sprites.Count;
+        spriteMap[fullKey] = h;
+        return h;
+    }
+
+    public static void SpriteBatch(int surfaceId, int handle, nint quads, int count) {
+        EnsureInit();
+        if (quads == 0 || count <= 0 || handle <= 0 || handle > sprites.Count) { return; }
+        nint bmpPtr = GlBridge.ImageGet(sprites[handle - 1]);
+        BitmapView bv;
+        if (!GlBridge.ReadBitmap(bmpPtr, out bv)) { return; }
+        GlBridge.BlitPixelsBatch(surfaceId, bmpPtr, quads, count);
+    }
+
+    // ---- 核心 3D 状态 Setter（全量 compare-before-write 维护脏版本号）----
+
+    public static int SetLights3D(int count, nint dirs, nint colors, nint ambient) {
+        EnsureInit();
+        if (count < 0 || count > MaxLights) { return 0; }
+        if (count > 0 && (dirs == 0 || colors == 0)) { return 0; }
+        if (count > 0) {
+            NativeMemory.Copy(FloatBuf + OffLightDir, dirs, count * 12);
+            NativeMemory.Copy(FloatBuf + OffLightColor, colors, count * 12);
+        }
+        LightCount = count;
+        if (ambient != 0) {
+            NativeMemory.Copy(FloatBuf + OffAmbient, ambient, 12);
+        }
+        LightVersion = LightVersion + 1u;
+        return 1;
+    }
+
+    public static int SetBlend3D(int enabled, int depthWrite) {
+        BlendEnabled = (enabled == 2) ? 2 : (enabled != 0 ? 1 : 0);
+        DepthWrite = depthWrite != 0 ? 1 : 0;
+        if (BatchSurface >= 0 && Gl != null) {
+            GameGpuRenderer.ApplyBlendState(Gl);
+        }
+        return 1;
+    }
+
+    public static int SetCull3D(int mode) {
+        if (mode < 0 || mode > 2) { return 0; }
+        CullMode = mode;
+        if (BatchSurface >= 0 && Gl != null) {
+            GameGpuRenderer.ApplyBlendState(Gl);
+        }
+        return 1;
+    }
+
+    public static void SetCamera3D(float x, float y, float z) {
+        EnsureInit();
+        Span<float> cp = new Span<float>(FloatBuf + OffCamPos, 3);
+        if (CamValid != 0 && cp[0] == x && cp[1] == y && cp[2] == z) { return; }
+        cp[0] = x; cp[1] = y; cp[2] = z;
+        CamValid = 1;
+        LightVersion = LightVersion + 1u;
+    }
+
+    public static void SetMaterial3D(float metallic, float roughness, float emR, float emG, float emB) {
+        EnsureInit();
+        if (metallic < 0.0f) { metallic = 0.0f; }
+        if (metallic > 1.0f) { metallic = 1.0f; }
+        if (roughness < 0.05f) { roughness = 0.05f; }
+        if (roughness > 1.0f) { roughness = 1.0f; }
+        Span<float> em = new Span<float>(FloatBuf + OffEmissive, 3);
+        if (MatMetallic == metallic && MatRoughness == roughness
+            && em[0] == emR && em[1] == emG && em[2] == emB) { return; }
+        MatMetallic = metallic;
+        MatRoughness = roughness;
+        em[0] = emR; em[1] = emG; em[2] = emB;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static int SetPointLights3D(int count, nint posRange4, nint colors3) {
+        EnsureInit();
+        if (count < 0 || count > MaxLights) { return 0; }
+        if (count > 0 && (posRange4 == 0 || colors3 == 0)) { return 0; }
+        NativeMemory.Fill(FloatBuf + OffPointPos, 0, MaxLights * 16);
+        NativeMemory.Fill(FloatBuf + OffPointColor, 0, MaxLights * 12);
+        if (count > 0) {
+            NativeMemory.Copy(FloatBuf + OffPointPos, posRange4, count * 16);
+            NativeMemory.Copy(FloatBuf + OffPointColor, colors3, count * 12);
+        }
+        PointCount = count;
+        LightVersion = LightVersion + 1u;
+        return 1;
+    }
+
+    public static int SetSpotLights3D(int count, nint posRange4, nint dirInner4, nint colorOuter4) {
+        EnsureInit();
+        if (count < 0 || count > MaxLights) { return 0; }
+        if (count > 0 && (posRange4 == 0 || dirInner4 == 0 || colorOuter4 == 0)) { return 0; }
+        SpotCount = count;
+        if (count > 0) {
+            NativeMemory.Copy(FloatBuf + OffSpotPos, posRange4, count * 16);
+            NativeMemory.Copy(FloatBuf + OffSpotDir, dirInner4, count * 16);
+            NativeMemory.Copy(FloatBuf + OffSpotColor, colorOuter4, count * 16);
+        }
+        LightVersion = LightVersion + 1u;
+        return 1;
+    }
+
+    public static void SetHemiAmbient3D(int enabled, float sr, float sg, float sb, float gr, float gg, float gb) {
+        EnsureInit();
+        HemiOn = enabled != 0 ? 1 : 0;
+        Span<float> hs = new Span<float>(FloatBuf + OffHemiSky, 3);
+        Span<float> hg = new Span<float>(FloatBuf + OffHemiGround, 3);
+        hs[0] = sr; hs[1] = sg; hs[2] = sb;
+        hg[0] = gr; hg[1] = gg; hg[2] = gb;
+        LightVersion = LightVersion + 1u;
+    }
+
+    public static void SetFog3D(int enabled, float r, float g, float b, float startDist, float endDist) {
+        EnsureInit();
+        float span = endDist - startDist;
+        if (span < 0.0001f) { span = 0.0001f; }
+        float on = enabled != 0 ? 1.0f : 0.0f;
+        float invSpan = 1.0f / span;
+        Span<float> fc = new Span<float>(FloatBuf + OffFogColor, 3);
+        Span<float> fp = new Span<float>(FloatBuf + OffFogParams, 3);
+        if (fp[0] == on && fp[1] == startDist && fp[2] == invSpan
+            && fc[0] == r && fc[1] == g && fc[2] == b) { return; }
+        fc[0] = r; fc[1] = g; fc[2] = b;
+        fp[0] = on; fp[1] = startDist; fp[2] = invSpan;
+        LightVersion = LightVersion + 1u;
+    }
+
+    public static int SetBones3D(int count, nint matrices16) {
+        EnsureInit();
+        if (count < 0 || count > MaxBones) { return 0; }
+        if (count > 0 && matrices16 == 0) { return 0; }
+        if (count > 0) {
+            NativeMemory.Copy(FloatBuf + OffBones, matrices16, count * 64);
+        }
+        for (int i = count; i < MaxBones; i = i + 1) {
+            NativeMemory.Copy(FloatBuf + OffBones + i * 64, FloatBuf + OffIdentityMat4, 64);
+        }
+        BoneCount = count;
+        return 1;
+    }
+
+    public static void SetNormalMap3D(string texture, float scale) {
+        if (texture == null || texture.Length == 0 || scale <= 0.0f) {
+            if (NormalKey == "" && NormalScale == 0.0f) { return; }
+            NormalKey = "";
+            NormalScale = 0.0f;
+            MatVersion = MatVersion + 1u;
+            return;
+        }
+        if (NormalScale == scale && NormalKey == texture) { return; }
+        NormalKey = texture;
+        NormalScale = scale;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static void SetPbrMaps3D(string ormTexture, float aoStrength) {
+        if (ormTexture == null || ormTexture.Length == 0) {
+            if (OrmKey == "" && AoStrength == 1.0f) { return; }
+            OrmKey = "";
+            AoStrength = 1.0f;
+            MatVersion = MatVersion + 1u;
+            return;
+        }
+        if (aoStrength < 0.0f) { aoStrength = 0.0f; }
+        if (aoStrength > 1.0f) { aoStrength = 1.0f; }
+        if (AoStrength == aoStrength && OrmKey == ormTexture) { return; }
+        OrmKey = ormTexture;
+        AoStrength = aoStrength;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static void SetAlphaCutoff3D(float cutoff) {
+        if (cutoff <= 0.0f) { cutoff = 0.0f; }
+        else if (cutoff > 1.0f) { cutoff = 1.0f; }
+        if (AlphaCutoff == cutoff) { return; }
+        AlphaCutoff = cutoff;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static void SetEmissiveMap3D(string texture) {
+        if (texture == null || texture.Length == 0) {
+            if (EmissiveKey == "") { return; }
+            EmissiveKey = "";
+            MatVersion = MatVersion + 1u;
+            return;
+        }
+        if (EmissiveKey == texture) { return; }
+        EmissiveKey = texture;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static void SetUvTransform3D(float su, float sv, float ou, float ov) {
+        if (UvScaleU == su && UvScaleV == sv && UvOffsetU == ou && UvOffsetV == ov) { return; }
+        UvScaleU = su; UvScaleV = sv; UvOffsetU = ou; UvOffsetV = ov;
+        MatVersion = MatVersion + 1u;
+    }
+
+    public static void SetClipPlane3D(int enabled, float nx, float ny, float nz, float d) {
+        int on = enabled != 0 ? 1 : 0;
+        if (ClipOn == on && ClipNx == nx && ClipNy == ny && ClipNz == nz && ClipD == d) { return; }
+        ClipOn = on; ClipNx = nx; ClipNy = ny; ClipNz = nz; ClipD = d;
+        LightVersion = LightVersion + 1u;
+    }
+
+    public static void SetHeightFog3D(int enabled, float baseY, float falloff, float maxDens, float r, float g, float b) {
+        float p1 = falloff > 0.001f ? falloff : 0.001f;
+        if (maxDens < 0.0f) { maxDens = 0.0f; }
+        if (maxDens > 1.0f) { maxDens = 1.0f; }
+        float p3 = enabled != 0 ? 1.0f : 0.0f;
+        float cr = r > 0.0f ? r : 0.0f;
+        float cg = g > 0.0f ? g : 0.0f;
+        float cb = b > 0.0f ? b : 0.0f;
+        if (HeightFogBaseY == baseY && HeightFogFalloff == p1 && HeightFogMax == maxDens
+            && HeightFogOn == p3 && HeightFogR == cr && HeightFogG == cg && HeightFogB == cb) { return; }
+        HeightFogBaseY = baseY; HeightFogFalloff = p1; HeightFogMax = maxDens; HeightFogOn = p3;
+        HeightFogR = cr; HeightFogG = cg; HeightFogB = cb;
+        LightVersion = LightVersion + 1u;
+    }
+
+    // ---- VFX Setters ----
+
+    public static void SetRimLight3D(float r, float g, float b, float power) {
+        float nr = r > 0.0f ? r : 0.0f; float ng = g > 0.0f ? g : 0.0f; float nb = b > 0.0f ? b : 0.0f;
+        float np = power >= 0.25f ? power : 0.25f;
+        if (RimR == nr && RimG == ng && RimB == nb && RimPow == np) { return; }
+        RimR = nr; RimG = ng; RimB = nb; RimPow = np;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetToonShading3D(float bands, float specStep) {
+        float nb = bands >= 2.0f ? bands : 0.0f;
+        if (specStep < 0.05f) { specStep = 0.05f; }
+        if (specStep > 0.98f) { specStep = 0.98f; }
+        if (ToonBands == nb && ToonSpecStep == specStep) { return; }
+        ToonBands = nb; ToonSpecStep = specStep;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetDissolve3D(float threshold, float edgeWidth, float r, float g, float b) {
+        if (threshold < 0.0f) { threshold = 0.0f; }
+        if (threshold > 1.2f) { threshold = 1.2f; }
+        if (edgeWidth < 0.0f) { edgeWidth = 0.0f; }
+        if (edgeWidth > 0.5f) { edgeWidth = 0.5f; }
+        float er = r > 0.0f ? r : 0.0f; float eg = g > 0.0f ? g : 0.0f; float eb = b > 0.0f ? b : 0.0f;
+        if (DissolveThresh == threshold && DissolveEdgeW == edgeWidth
+            && DissolveR == er && DissolveG == eg && DissolveB == eb) { return; }
+        DissolveThresh = threshold; DissolveEdgeW = edgeWidth;
+        DissolveR = er; DissolveG = eg; DissolveB = eb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetTriplanar3D(int enabled, float scale, float sharpness) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.0001f ? scale : 1.0f;
+        float p2 = sharpness >= 1.0f ? sharpness : 4.0f;
+        if (TriplanarOn == p0 && TriplanarScale == p1 && TriplanarSharp == p2) { return; }
+        TriplanarOn = p0; TriplanarScale = p1; TriplanarSharp = p2;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetHitFlash3D(float r, float g, float b, float amount) {
+        float nr = r > 0.0f ? r : 0.0f; float ng = g > 0.0f ? g : 0.0f; float nb = b > 0.0f ? b : 0.0f;
+        if (amount < 0.0f) { amount = 0.0f; }
+        if (amount > 1.0f) { amount = 1.0f; }
+        if (HitFlashR == nr && HitFlashG == ng && HitFlashB == nb && HitFlashAmt == amount) { return; }
+        HitFlashR = nr; HitFlashG = ng; HitFlashB = nb; HitFlashAmt = amount;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetHoloScan3D(int enabled, float freq, float phase, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = freq > 0.001f ? freq : 12.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 2.0f) { strength = 2.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (HoloOn == p0 && HoloFreq == p1 && HoloPhase == phase && HoloStr == strength
+            && HoloR == cr && HoloG == cg && HoloB == cb) { return; }
+        HoloOn = p0; HoloFreq = p1; HoloPhase = phase; HoloStr = strength;
+        HoloR = cr; HoloG = cg; HoloB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetTopCover3D(int enabled, float threshold, float sharpness, float amount, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (threshold < -1.0f) { threshold = -1.0f; }
+        if (threshold > 1.0f) { threshold = 1.0f; }
+        if (sharpness < 0.01f) { sharpness = 0.01f; }
+        if (sharpness > 1.0f) { sharpness = 1.0f; }
+        if (amount < 0.0f) { amount = 0.0f; }
+        if (amount > 1.0f) { amount = 1.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (TopCoverOn == p0 && TopCoverThresh == threshold && TopCoverSharp == sharpness
+            && TopCoverAmt == amount && TopCoverR == cr && TopCoverG == cg && TopCoverB == cb) { return; }
+        TopCoverOn = p0; TopCoverThresh = threshold; TopCoverSharp = sharpness; TopCoverAmt = amount;
+        TopCoverR = cr; TopCoverG = cg; TopCoverB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetWindSway3D(int enabled, float amplitude, float freq, float phase, float heightScale) {
+        if (enabled == 0 || amplitude <= 0.0f) {
+            if (WindAmp == 0.0f) { return; }
+            WindAmp = 0.0f;
+            VfxVersion = VfxVersion + 1u;
+            return;
+        }
+        if (amplitude > 2.0f) { amplitude = 2.0f; }
+        float p1 = freq > 0.0f ? freq : 1.5f;
+        float p3 = heightScale > 0.0f ? heightScale : 1.0f;
+        if (WindAmp == amplitude && WindFreq == p1 && WindPhase == phase && WindHScale == p3) { return; }
+        WindAmp = amplitude; WindFreq = p1; WindPhase = phase; WindHScale = p3;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetDistanceFade3D(int enabled, float startDist, float endDist) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (DistFadeOn == p0 && DistFadeStart == startDist && DistFadeEnd == endDist) { return; }
+        DistFadeOn = p0; DistFadeStart = startDist; DistFadeEnd = endDist;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetWorldGrid3D(int enabled, float cellSize, float lineWidth, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = cellSize > 0.05f ? cellSize : 1.0f;
+        if (lineWidth < 0.005f) { lineWidth = 0.005f; }
+        if (lineWidth > 0.45f) { lineWidth = 0.45f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 1.0f) { strength = 1.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (WorldGridOn == p0 && WorldGridCell == p1 && WorldGridLine == lineWidth
+            && WorldGridStr == strength && WorldGridR == cr && WorldGridG == cg && WorldGridB == cb) { return; }
+        WorldGridOn = p0; WorldGridCell = p1; WorldGridLine = lineWidth; WorldGridStr = strength;
+        WorldGridR = cr; WorldGridG = cg; WorldGridB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetWaterCaustics3D(int enabled, float scale, float phase, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.1f ? scale : 1.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 2.0f) { strength = 2.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (CausticsOn == p0 && CausticsScale == p1 && CausticsPhase == phase
+            && CausticsStr == strength && CausticsR == cr && CausticsG == cg && CausticsB == cb) { return; }
+        CausticsOn = p0; CausticsScale = p1; CausticsPhase = phase; CausticsStr = strength;
+        CausticsR = cr; CausticsG = cg; CausticsB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetIceFrost3D(int enabled, float scale, float glintStr, float fresnelPow, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.2f ? scale : 2.0f;
+        if (glintStr < 0.0f) { glintStr = 0.0f; }
+        if (glintStr > 2.0f) { glintStr = 2.0f; }
+        if (fresnelPow < 0.5f) { fresnelPow = 0.5f; }
+        if (fresnelPow > 8.0f) { fresnelPow = 8.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (IceOn == p0 && IceScale == p1 && IceGlint == glintStr && IceFresnel == fresnelPow
+            && IceR == cr && IceG == cg && IceB == cb) { return; }
+        IceOn = p0; IceScale = p1; IceGlint = glintStr; IceFresnel = fresnelPow;
+        IceR = cr; IceG = cg; IceB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetLavaCrust3D(int enabled, float scale, float phase, float crackWidth, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.2f ? scale : 1.5f;
+        if (crackWidth < 0.02f) { crackWidth = 0.02f; }
+        if (crackWidth > 0.6f) { crackWidth = 0.6f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (LavaOn == p0 && LavaScale == p1 && LavaPhase == phase && LavaCrack == crackWidth
+            && LavaR == cr && LavaG == cg && LavaB == cb && LavaStr == strength) { return; }
+        LavaOn = p0; LavaScale = p1; LavaPhase = phase; LavaCrack = crackWidth;
+        LavaR = cr; LavaG = cg; LavaB = cb; LavaStr = strength;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetIridescence3D(int enabled, float filmThick, float phaseShift, float strength) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (filmThick < 0.5f) { filmThick = 0.5f; }
+        if (filmThick > 6.0f) { filmThick = 6.0f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 2.0f) { strength = 2.0f; }
+        if (IridOn == p0 && IridThick == filmThick && IridPhase == phaseShift && IridStr == strength) { return; }
+        IridOn = p0; IridThick = filmThick; IridPhase = phaseShift; IridStr = strength;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetSonarPulse3D(int enabled, float ox, float oy, float oz, float radius, float ringWidth, float strength, float r, float g, float b) {
+        float nr = radius > 0.05f ? radius : 0.05f;
+        float s0 = enabled != 0 ? 1.0f : 0.0f;
+        float s1 = ringWidth > 0.05f ? ringWidth : 0.05f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (SonarOx == ox && SonarOy == oy && SonarOz == oz && SonarRadius == nr
+            && SonarOn == s0 && SonarWidth == s1 && SonarStr == strength
+            && SonarR == cr && SonarG == cg && SonarB == cb) { return; }
+        SonarOx = ox; SonarOy = oy; SonarOz = oz; SonarRadius = nr;
+        SonarOn = s0; SonarWidth = s1; SonarStr = strength;
+        SonarR = cr; SonarG = cg; SonarB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetForceFieldHex3D(int enabled, float scale, float phase, float edgeWidth, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.25f ? scale : 2.0f;
+        if (edgeWidth < 0.02f) { edgeWidth = 0.02f; }
+        if (edgeWidth > 0.35f) { edgeWidth = 0.35f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (ForceOn == p0 && ForceScale == p1 && ForcePhase == phase && ForceEdge == edgeWidth
+            && ForceR == cr && ForceG == cg && ForceB == cb && ForceStr == strength) { return; }
+        ForceOn = p0; ForceScale = p1; ForcePhase = phase; ForceEdge = edgeWidth;
+        ForceR = cr; ForceG = cg; ForceB = cb; ForceStr = strength;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetRainRipples3D(int enabled, float scale, float phase, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = scale > 0.25f ? scale : 2.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (RainOn == p0 && RainScale == p1 && RainPhase == phase && RainStr == strength
+            && RainR == cr && RainG == cg && RainB == cb) { return; }
+        RainOn = p0; RainScale = p1; RainPhase = phase; RainStr = strength;
+        RainR = cr; RainG = cg; RainB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetXraySilhouette3D(int enabled, float power, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (power < 0.5f) { power = 0.5f; }
+        if (power > 8.0f) { power = 8.0f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (XrayOn == p0 && XrayPow == power && XrayStr == strength
+            && XrayR == cr && XrayG == cg && XrayB == cb) { return; }
+        XrayOn = p0; XrayPow = power; XrayStr = strength;
+        XrayR = cr; XrayG = cg; XrayB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetPortalVortex3D(int enabled, float swirlTurns, float phase, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (PortalOn == p0 && PortalTurns == swirlTurns && PortalPhase == phase
+            && PortalStr == strength && PortalR == cr && PortalG == cg && PortalB == cb) { return; }
+        PortalOn = p0; PortalTurns = swirlTurns; PortalPhase = phase; PortalStr = strength;
+        PortalR = cr; PortalG = cg; PortalB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetBlueprintWire3D(int enabled, float gridDensity, float lineWidth, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = gridDensity > 0.25f ? gridDensity : 2.0f;
+        if (lineWidth < 0.01f) { lineWidth = 0.01f; }
+        if (lineWidth > 0.25f) { lineWidth = 0.25f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (BlueprintOn == p0 && BlueprintDens == p1 && BlueprintLine == lineWidth
+            && BlueprintStr == strength && BlueprintR == cr && BlueprintG == cg && BlueprintB == cb) { return; }
+        BlueprintOn = p0; BlueprintDens = p1; BlueprintLine = lineWidth; BlueprintStr = strength;
+        BlueprintR = cr; BlueprintG = cg; BlueprintB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetHeatHazeShimmer3D(int enabled, float freq, float phase, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = freq > 0.5f ? freq : 4.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (HeatOn == p0 && HeatFreq == p1 && HeatPhase == phase && HeatStr == strength
+            && HeatR == cr && HeatG == cg && HeatB == cb) { return; }
+        HeatOn = p0; HeatFreq = p1; HeatPhase = phase; HeatStr = strength;
+        HeatR = cr; HeatG = cg; HeatB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetPixelDitherFade3D(int enabled, float opacity, float pixelScale) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (opacity < 0.0f) { opacity = 0.0f; }
+        if (opacity > 1.0f) { opacity = 1.0f; }
+        if (pixelScale < 1.0f) { pixelScale = 1.0f; }
+        if (pixelScale > 8.0f) { pixelScale = 8.0f; }
+        if (DitherOn == p0 && DitherOpacity == opacity && DitherScale == pixelScale) { return; }
+        DitherOn = p0; DitherOpacity = opacity; DitherScale = pixelScale;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetCrosshatchInk3D(int enabled, float density, float inkStrength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = density > 2.0f ? density : 8.0f;
+        if (inkStrength < 0.0f) { inkStrength = 0.0f; }
+        if (inkStrength > 1.0f) { inkStrength = 1.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (HatchOn == p0 && HatchDens == p1 && HatchStr == inkStrength
+            && HatchR == cr && HatchG == cg && HatchB == cb) { return; }
+        HatchOn = p0; HatchDens = p1; HatchStr = inkStrength;
+        HatchR = cr; HatchG = cg; HatchB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetAnisoBrushed3D(int enabled, float grainFreq, float anisotropy, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        float p1 = grainFreq > 1.0f ? grainFreq : 12.0f;
+        if (anisotropy < 2.0f) { anisotropy = 2.0f; }
+        if (anisotropy > 64.0f) { anisotropy = 64.0f; }
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (AnisoOn == p0 && AnisoFreq == p1 && AnisoVal == anisotropy && AnisoStr == strength
+            && AnisoR == cr && AnisoG == cg && AnisoB == cb) { return; }
+        AnisoOn = p0; AnisoFreq = p1; AnisoVal = anisotropy; AnisoStr = strength;
+        AnisoR = cr; AnisoG = cg; AnisoB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetVelvetSheen3D(int enabled, float roughness, float weaveFreq, float strength, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (roughness < 0.12f) { roughness = 0.12f; }
+        if (roughness > 1.0f) { roughness = 1.0f; }
+        float p2 = weaveFreq > 2.0f ? weaveFreq : 16.0f;
+        if (strength < 0.0f) { strength = 0.0f; }
+        if (strength > 3.0f) { strength = 3.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (VelvetOn == p0 && VelvetRough == roughness && VelvetWeave == p2 && VelvetStr == strength
+            && VelvetR == cr && VelvetG == cg && VelvetB == cb) { return; }
+        VelvetOn = p0; VelvetRough = roughness; VelvetWeave = p2; VelvetStr = strength;
+        VelvetR = cr; VelvetG = cg; VelvetB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    public static void SetSubsurfaceWrap3D(int enabled, float wrap, float translucency, float power, float r, float g, float b) {
+        float p0 = enabled != 0 ? 1.0f : 0.0f;
+        if (wrap < 0.0f) { wrap = 0.0f; }
+        if (wrap > 1.0f) { wrap = 1.0f; }
+        if (translucency < 0.0f) { translucency = 0.0f; }
+        if (translucency > 2.0f) { translucency = 2.0f; }
+        if (power < 1.0f) { power = 1.0f; }
+        if (power > 8.0f) { power = 8.0f; }
+        float cr = r > 0.0f ? r : 0.0f; float cg = g > 0.0f ? g : 0.0f; float cb = b > 0.0f ? b : 0.0f;
+        if (SssOn == p0 && SssWrap == wrap && SssTrans == translucency && SssPow == power
+            && SssR == cr && SssG == cg && SssB == cb) { return; }
+        SssOn = p0; SssWrap = wrap; SssTrans = translucency; SssPow = power;
+        SssR = cr; SssG = cg; SssB = cb;
+        VfxVersion = VfxVersion + 1u;
+    }
+
+    // ---- PostProcess Setters ----
+
+    public static void SetColorGrade3D(float sat, float con, float tr, float tg, float tb) {
+        ColorSat = sat >= 0.0f ? sat : 0.0f;
+        ColorCon = con >= 0.0f ? con : 0.0f;
+        ColorTintR = tr >= 0.0f ? tr : 0.0f;
+        ColorTintG = tg >= 0.0f ? tg : 0.0f;
+        ColorTintB = tb >= 0.0f ? tb : 0.0f;
+    }
+
+    public static void SetPostLens3D(float fxaa, float chromatic) {
+        if (fxaa < 0.0f) { fxaa = 0.0f; } if (fxaa > 1.0f) { fxaa = 1.0f; }
+        if (chromatic < 0.0f) { chromatic = 0.0f; } if (chromatic > 0.1f) { chromatic = 0.1f; }
+        PostFxaa = fxaa; PostChromatic = chromatic;
+    }
+
+    public static void SetPostFilm3D(float sharpen, float grain, float seed) {
+        if (sharpen < 0.0f) { sharpen = 0.0f; } if (sharpen > 2.0f) { sharpen = 2.0f; }
+        if (grain < 0.0f) { grain = 0.0f; } if (grain > 0.5f) { grain = 0.5f; }
+        PostSharpen = sharpen; PostGrain = grain; PostGrainSeed = seed;
+    }
+
+    public static void SetPostCinema3D(float letterbox, float amp, float freq, float phase) {
+        if (letterbox < 0.0f) { letterbox = 0.0f; } if (letterbox > 0.45f) { letterbox = 0.45f; }
+        if (amp < 0.0f) { amp = 0.0f; } if (amp > 0.08f) { amp = 0.08f; }
+        PostLetterbox = letterbox; PostDistortAmp = amp;
+        PostDistortFreq = freq > 0.001f ? freq : 16.0f; PostDistortPhase = phase;
+    }
+
+    public static void SetPostRadialBlur3D(float str, float cx, float cy) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 0.15f) { str = 0.15f; }
+        if (cx < 0.0f) { cx = 0.0f; } if (cx > 1.0f) { cx = 1.0f; }
+        if (cy < 0.0f) { cy = 0.0f; } if (cy > 1.0f) { cy = 1.0f; }
+        PostRadialStr = str; PostRadialCx = cx; PostRadialCy = cy;
+    }
+
+    public static void SetPostPixelate3D(float pxSize, float posterize) {
+        if (pxSize < 0.0f) { pxSize = 0.0f; } if (pxSize > 64.0f) { pxSize = 64.0f; }
+        if (posterize < 0.0f) { posterize = 0.0f; } if (posterize > 64.0f) { posterize = 64.0f; }
+        PostPixelSize = pxSize; PostPosterize = posterize;
+    }
+
+    public static void SetPostDuotone3D(float str, float dr, float dg, float db, float lr, float lg, float lb) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        PostDuoDarkR = dr > 0.0f ? dr : 0.0f; PostDuoDarkG = dg > 0.0f ? dg : 0.0f; PostDuoDarkB = db > 0.0f ? db : 0.0f;
+        PostDuoStr = str;
+        PostDuoLightR = lr > 0.0f ? lr : 0.0f; PostDuoLightG = lg > 0.0f ? lg : 0.0f; PostDuoLightB = lb > 0.0f ? lb : 0.0f;
+    }
+
+    public static void SetPostCrtScanline3D(float intensity, float count, float curvature, float glowBoost) {
+        if (intensity < 0.0f) { intensity = 0.0f; } if (intensity > 0.95f) { intensity = 0.95f; }
+        if (count < 2.0f) { count = 64.0f; }
+        if (curvature < 0.0f) { curvature = 0.0f; } if (curvature > 0.5f) { curvature = 0.5f; }
+        if (glowBoost < 0.1f) { glowBoost = 1.0f; }
+        PostCrtInt = intensity; PostCrtCount = count; PostCrtCurve = curvature; PostCrtGlow = glowBoost;
+    }
+
+    public static void SetPostEdgeOutline3D(float str, float thresh, float r, float g, float b) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (thresh < 0.02f) { thresh = 0.02f; } if (thresh > 1.0f) { thresh = 1.0f; }
+        PostOutlineStr = str; PostOutlineThresh = thresh;
+        PostOutlineR = r > 0.0f ? r : 0.0f; PostOutlineG = g > 0.0f ? g : 0.0f; PostOutlineB = b > 0.0f ? b : 0.0f;
+    }
+
+    public static void SetPostThermalHeat3D(float str, float sens, float cold) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (sens < 0.1f) { sens = 0.1f; } if (sens > 5.0f) { sens = 5.0f; }
+        if (cold < -0.5f) { cold = -0.5f; } if (cold > 0.5f) { cold = 0.5f; }
+        PostThermalStr = str; PostThermalSens = sens; PostThermalCold = cold;
+    }
+
+    public static void SetPostScreenTintFlash3D(float edge, float flash, float r, float g, float b) {
+        if (edge < 0.0f) { edge = 0.0f; } if (edge > 1.0f) { edge = 1.0f; }
+        if (flash < 0.0f) { flash = 0.0f; } if (flash > 1.0f) { flash = 1.0f; }
+        PostFlashEdge = edge; PostFlashStr = flash;
+        PostFlashR = r > 0.0f ? r : 0.0f; PostFlashG = g > 0.0f ? g : 0.0f; PostFlashB = b > 0.0f ? b : 0.0f;
+    }
+
+    public static void SetPostNightVision3D(float str, float gain, float noise, float seed) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (gain < 0.25f) { gain = 0.25f; } if (gain > 8.0f) { gain = 8.0f; }
+        if (noise < 0.0f) { noise = 0.0f; } if (noise > 0.5f) { noise = 0.5f; }
+        PostNvStr = str; PostNvGain = gain; PostNvNoise = noise; PostNvSeed = seed;
+    }
+
+    public static void SetPostHalftoneComic3D(float str, float dotScale, float con) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (dotScale < 2.0f) { dotScale = 2.0f; } if (dotScale > 32.0f) { dotScale = 32.0f; }
+        if (con < 0.25f) { con = 0.25f; } if (con > 3.0f) { con = 3.0f; }
+        PostHalftoneStr = str; PostHalftoneScale = dotScale; PostHalftoneCon = con;
+    }
+
+    public static void SetPostGlitchRgb3D(float intensity, float slices, float seed) {
+        if (intensity < 0.0f) { intensity = 0.0f; } if (intensity > 1.0f) { intensity = 1.0f; }
+        if (slices < 4.0f) { slices = 4.0f; } if (slices > 128.0f) { slices = 128.0f; }
+        PostGlitchInt = intensity; PostGlitchSlices = slices; PostGlitchSeed = seed;
+    }
+
+    public static void SetPostTiltShift3D(float str, float focusY, float focusBand) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (focusY < 0.0f) { focusY = 0.0f; } if (focusY > 1.0f) { focusY = 1.0f; }
+        if (focusBand < 0.02f) { focusBand = 0.02f; } if (focusBand > 0.45f) { focusBand = 0.45f; }
+        PostTiltStr = str; PostTiltY = focusY; PostTiltBand = focusBand;
+    }
+
+    public static void SetPostVignetteFrost3D(float intensity, float radius, float r, float g, float b) {
+        if (intensity < 0.0f) { intensity = 0.0f; } if (intensity > 1.0f) { intensity = 1.0f; }
+        if (radius < 0.15f) { radius = 0.15f; } if (radius > 0.95f) { radius = 0.95f; }
+        PostFrostInt = intensity; PostFrostRad = radius;
+        PostFrostR = r > 0.0f ? r : 0.0f; PostFrostG = g > 0.0f ? g : 0.0f; PostFrostB = b > 0.0f ? b : 0.0f;
+    }
+
+    public static void SetPostSepiaVintage3D(float str, float scratch, float seed) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (scratch < 0.0f) { scratch = 0.0f; } if (scratch > 1.0f) { scratch = 1.0f; }
+        PostSepiaStr = str; PostSepiaScratch = scratch; PostSepiaSeed = seed;
+    }
+
+    public static void SetPostSunBloomStreak3D(float str, float thresh, float r, float g, float b) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 3.0f) { str = 3.0f; }
+        if (thresh < 0.0f) { thresh = 0.0f; } if (thresh > 2.0f) { thresh = 2.0f; }
+        PostStreakStr = str; PostStreakThresh = thresh;
+        PostStreakR = r > 0.0f ? r : 0.0f; PostStreakG = g > 0.0f ? g : 0.0f; PostStreakB = b > 0.0f ? b : 0.0f;
+    }
+
+    public static void SetPostSplitTone3D(float str, float bal, float sr, float sg, float sb, float hr, float hg, float hb) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (bal < -1.0f) { bal = -1.0f; } if (bal > 1.0f) { bal = 1.0f; }
+        PostSplitStr = str; PostSplitBal = bal;
+        PostSplitShR = sr > 0.0f ? sr : 0.0f; PostSplitShG = sg > 0.0f ? sg : 0.0f; PostSplitShB = sb > 0.0f ? sb : 0.0f;
+        PostSplitHiR = hr > 0.0f ? hr : 0.0f; PostSplitHiG = hg > 0.0f ? hg : 0.0f; PostSplitHiB = hb > 0.0f ? hb : 0.0f;
+    }
+
+    public static void SetPostOilPaint3D(float str, float radius) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (radius < 1.0f) { radius = 1.0f; } if (radius > 4.0f) { radius = 4.0f; }
+        PostOilStr = str; PostOilRad = radius;
+    }
+
+    public static void SetPostScopeEdgeBlur3D(float str, float clearRadius) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        if (clearRadius < 0.1f) { clearRadius = 0.1f; } if (clearRadius > 1.0f) { clearRadius = 1.0f; }
+        PostScopeStr = str; PostScopeClear = clearRadius;
+    }
+
+    public static void SetPostDaltonize3D(float mode, float str) {
+        if (mode < 0.0f) { mode = 0.0f; } if (mode > 3.0f) { mode = 3.0f; }
+        if (str < 0.0f) { str = 0.0f; } if (str > 1.0f) { str = 1.0f; }
+        PostDaltonMode = mode; PostDaltonStr = str;
+    }
+
+    public static void SetPostLensDistort3D(float k1, float zoom) {
+        if (k1 < -0.6f) { k1 = -0.6f; } if (k1 > 0.6f) { k1 = 0.6f; }
+        if (zoom < 0.5f) { zoom = 0.5f; } if (zoom > 1.5f) { zoom = 1.5f; }
+        PostLensK1 = k1; PostLensZoom = zoom;
+    }
+
+    public static void SetPostGodRays3D(float str, float decay, float lx, float ly) {
+        if (str < 0.0f) { str = 0.0f; } if (str > 2.0f) { str = 2.0f; }
+        if (decay < 0.70f) { decay = 0.70f; } if (decay > 0.99f) { decay = 0.99f; }
+        if (lx < 0.0f) { lx = 0.0f; } if (lx > 1.0f) { lx = 1.0f; }
+        if (ly < 0.0f) { ly = 0.0f; } if (ly > 1.0f) { ly = 1.0f; }
+        PostGodStr = str; PostGodDecay = decay; PostGodLx = lx; PostGodLy = ly;
+    }
+}
