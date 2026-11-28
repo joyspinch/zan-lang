@@ -113,9 +113,14 @@ public class ExprSql {
         return true;
     }
 
+    private static int MAX_DEPTH = 128;
+
     // 单遍校验并测量精确字节数（供 Validate 与超大表达式回退路径共用）。
-    private static int ValidateAndMeasure(ExprNode n) {
+    private static int ValidateAndMeasure(ExprNode n, int depth) {
         if (n == null) { throw new NotSupportedException("SQL expression is missing a node"); }
+        if (depth > ExprSql.MAX_DEPTH) {
+            throw new NotSupportedException("SQL expression exceeds maximum nesting depth");
+        }
         int kind = n.Kind;
         if (kind == 2) {
             string op = n.Name;
@@ -124,11 +129,11 @@ public class ExprSql {
             if (opLen == 2) {
                 int c0 = op[0] & 255;
                 int c1 = op[1] & 255;
-                if (c0 == 38 && c1 == 38) { return 7 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B); }
-                if (c0 == 124 && c1 == 124) { return 6 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B); }
+                if (c0 == 38 && c1 == 38) { return 7 + ValidateAndMeasure(n.A, depth + 1) + ValidateAndMeasure(n.B, depth + 1); }
+                if (c0 == 124 && c1 == 124) { return 6 + ValidateAndMeasure(n.A, depth + 1) + ValidateAndMeasure(n.B, depth + 1); }
                 if (c1 == 61 && (c0 == 61 || c0 == 33)) {
-                    int laLen = ValidateAndMeasure(n.A);
-                    int lbLen = ValidateAndMeasure(n.B);
+                    int laLen = ValidateAndMeasure(n.A, depth + 1);
+                    int lbLen = ValidateAndMeasure(n.B, depth + 1);
                     bool la = n.A.Kind == 1 && n.A.TVal == 4;
                     bool lb = n.B.Kind == 1 && n.B.TVal == 4;
                     if (la && lb) { return 3; }
@@ -137,14 +142,14 @@ public class ExprSql {
                     return (c0 == 61 ? 5 : 6) + laLen + lbLen;
                 }
                 if (c1 == 61 && (c0 == 60 || c0 == 62)) {
-                    return 6 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B);
+                    return 6 + ValidateAndMeasure(n.A, depth + 1) + ValidateAndMeasure(n.B, depth + 1);
                 }
                 throw new NotSupportedException("Unsupported SQL operator: " + op);
             }
             if (opLen == 1) {
                 int c0 = op[0] & 255;
                 if (c0 == 60 || c0 == 62 || c0 == 43 || c0 == 45 || c0 == 42 || c0 == 47 || c0 == 37) {
-                    return 5 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B);
+                    return 5 + ValidateAndMeasure(n.A, depth + 1) + ValidateAndMeasure(n.B, depth + 1);
                 }
             }
             throw new NotSupportedException("Unsupported SQL operator: " + op);
@@ -172,12 +177,12 @@ public class ExprSql {
             if (n.TVal < 0 || n.TVal > 5) { throw new NotSupportedException("Unsupported SQL constant type"); }
             return 1;
         }
-        if (kind == 4) { return ValidateAndMeasure(n.A); }
-        if (kind == 5) { return 6 + ValidateAndMeasure(n.A); }
+        if (kind == 4) { return ValidateAndMeasure(n.A, depth + 1); }
+        if (kind == 5) { return 6 + ValidateAndMeasure(n.A, depth + 1); }
         if (kind == 3) {
             string fn = n.Name;
             if (fn == "StartsWith" || fn == "EndsWith" || fn == "Contains") {
-                int recvLen = ValidateAndMeasure(n.A);
+                int recvLen = ValidateAndMeasure(n.A, depth + 1);
                 ExprNode arg = n.B;
                 if (arg == null) { throw new NotSupportedException("SQL expression requires a constant value"); }
                 if (!(arg.Kind == 1 && (arg.TVal == 2 || arg.TVal == 0 || arg.TVal == 5))) {
@@ -186,17 +191,17 @@ public class ExprSql {
                 return recvLen + 18;
             }
         }
-        throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
+        throw new NotSupportedException("Unsupported SQL expression: " + (n.Name != null ? n.Name : ""));
     }
 
     // Validate before binding: rejected subtrees must not leave stray parameters.
     public static void Validate(ExprNode n) {
-        ExprSql.ValidateAndMeasure(n);
+        ExprSql.ValidateAndMeasure(n, 0);
     }
 
     // 零 ref/out 单遍快路径：-1 表示非法节点（交 Validate 抛原异常），-2 表示超出当前缓冲需精确测量重跑。
-    private static int RenderFast(ExprNode n, byte[] buf, int cap, int pos, List<DbParam> items) {
-        if (n == null) { return -1; }
+    private static int RenderFast(ExprNode n, byte[] buf, int cap, int pos, List<DbParam> items, int depth) {
+        if (n == null || depth > ExprSql.MAX_DEPTH) { return -1; }
         int kind = n.Kind;
         if (kind == 2) {
             string op = n.Name;
@@ -208,12 +213,12 @@ public class ExprSql {
                 if (c0 == 38 && c1 == 38) {
                     if (pos + 7 > cap) { return -2; }
                     buf[pos] = 40; pos = pos + 1;
-                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 6 > cap) { return -2; }
                     buf[pos] = 32; buf[pos + 1] = 65; buf[pos + 2] = 78; buf[pos + 3] = 68; buf[pos + 4] = 32;
                     pos = pos + 5;
-                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 1 > cap) { return -2; }
                     buf[pos] = 41;
@@ -222,12 +227,12 @@ public class ExprSql {
                 if (c0 == 124 && c1 == 124) {
                     if (pos + 6 > cap) { return -2; }
                     buf[pos] = 40; pos = pos + 1;
-                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 5 > cap) { return -2; }
                     buf[pos] = 32; buf[pos + 1] = 79; buf[pos + 2] = 82; buf[pos + 3] = 32;
                     pos = pos + 4;
-                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 1 > cap) { return -2; }
                     buf[pos] = 41;
@@ -247,7 +252,7 @@ public class ExprSql {
                     if (la || lb) {
                         if (pos + 14 > cap) { return -2; }
                         buf[pos] = 40; pos = pos + 1;
-                        pos = ExprSql.RenderFast(la ? nb : na, buf, cap, pos, items);
+                        pos = ExprSql.RenderFast(la ? nb : na, buf, cap, pos, items, depth + 1);
                         if (pos < 0) { return pos; }
                         if (c0 == 61) {
                             if (pos + 9 > cap) { return -2; }
@@ -263,7 +268,7 @@ public class ExprSql {
                     }
                     if (pos + 6 > cap) { return -2; }
                     buf[pos] = 40; pos = pos + 1;
-                    pos = ExprSql.RenderFast(na, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(na, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (c0 == 61) {
                         if (pos + 4 > cap) { return -2; }
@@ -274,7 +279,7 @@ public class ExprSql {
                         buf[pos] = 32; buf[pos + 1] = 60; buf[pos + 2] = 62; buf[pos + 3] = 32;
                         pos = pos + 4;
                     }
-                    pos = ExprSql.RenderFast(nb, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(nb, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 1 > cap) { return -2; }
                     buf[pos] = 41;
@@ -283,12 +288,12 @@ public class ExprSql {
                 if (c1 == 61 && (c0 == 60 || c0 == 62)) {
                     if (pos + 6 > cap) { return -2; }
                     buf[pos] = 40; pos = pos + 1;
-                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 5 > cap) { return -2; }
                     buf[pos] = 32; buf[pos + 1] = (byte)c0; buf[pos + 2] = 61; buf[pos + 3] = 32;
                     pos = pos + 4;
-                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 1 > cap) { return -2; }
                     buf[pos] = 41;
@@ -301,12 +306,12 @@ public class ExprSql {
                 if (c0 == 60 || c0 == 62 || c0 == 43 || c0 == 45 || c0 == 42 || c0 == 47 || c0 == 37) {
                     if (pos + 5 > cap) { return -2; }
                     buf[pos] = 40; pos = pos + 1;
-                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 4 > cap) { return -2; }
                     buf[pos] = 32; buf[pos + 1] = (byte)c0; buf[pos + 2] = 32;
                     pos = pos + 3;
-                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items, depth + 1);
                     if (pos < 0) { return pos; }
                     if (pos + 1 > cap) { return -2; }
                     buf[pos] = 41;
@@ -335,20 +340,23 @@ public class ExprSql {
                 }
             }
             if (safe) { return dst + nLen; }
-            if (pos + nLen * 2 + 4 > cap) { return -2; }
+            if (dst + 1 > cap) { return -2; }
             buf[dst] = 34;
             dst = dst + 1;
             for (int i = 0; i < nLen; i = i + 1) {
                 int c = nm[i] & 255;
                 if (c < 32) { return -1; }
                 if (c == 34) {
+                    if (dst + 2 > cap) { return -2; }
                     buf[dst] = 34; buf[dst + 1] = 34;
                     dst = dst + 2;
                 } else {
+                    if (dst + 1 > cap) { return -2; }
                     buf[dst] = (byte)c;
                     dst = dst + 1;
                 }
             }
+            if (dst + 1 > cap) { return -2; }
             buf[dst] = 34;
             return dst + 1;
         }
@@ -381,7 +389,7 @@ public class ExprSql {
             else if (fn == "EndsWith") { wrap = 2; }
             else if (fn == "Contains") { wrap = 3; }
             else { return -1; }
-            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
             if (pos < 0) { return pos; }
             ExprNode arg = n.B;
             if (arg == null) { return -1; }
@@ -405,22 +413,23 @@ public class ExprSql {
             if (pos + 6 > cap) { return -2; }
             buf[pos] = 78; buf[pos + 1] = 79; buf[pos + 2] = 84; buf[pos + 3] = 32; buf[pos + 4] = 40;
             pos = pos + 5;
-            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1);
             if (pos < 0) { return pos; }
             if (pos + 1 > cap) { return -2; }
             buf[pos] = 41;
             return pos + 1;
         }
-        if (kind == 4) { return ExprSql.RenderFast(n.A, buf, cap, pos, items); }
+        if (kind == 4) { return ExprSql.RenderFast(n.A, buf, cap, pos, items, depth + 1); }
         return -1;
     }
 
     // 为以 n 为根的树构建 WHERE 片段。
     public static void Build(ExprNode n, StringBuilder sb, DbParams ps) {
+        if (sb == null || ps == null) { throw new ArgumentNullException("sb/ps"); }
         List<DbParam> items = ps.items;
         int savedParams = items.Count;
         byte[] buf = new byte[512];
-        int len = ExprSql.RenderFast(n, buf, 512, 0, items);
+        int len = ExprSql.RenderFast(n, buf, 512, 0, items, 0);
         if (len >= 0) {
             if (len > 0) { sb.Append(NativeMemory.GetString((nint)buf, 0, len)); }
             return;
@@ -429,13 +438,19 @@ public class ExprSql {
             items.RemoveAt(items.Count - 1);
         }
         if (len == -1) {
-            ExprSql.ValidateAndMeasure(n);
+            ExprSql.ValidateAndMeasure(n, 0);
             return;
         }
-        int exact = ExprSql.ValidateAndMeasure(n);
+        int exact = ExprSql.ValidateAndMeasure(n, 0);
         if (exact <= 0) { return; }
         byte[] big = new byte[exact + 16];
-        int bigLen = ExprSql.RenderFast(n, big, exact + 16, 0, items);
+        int bigLen = ExprSql.RenderFast(n, big, exact + 16, 0, items, 0);
+        if (bigLen < 0) {
+            while (items.Count > savedParams) {
+                items.RemoveAt(items.Count - 1);
+            }
+            throw new NotSupportedException("SQL expression rendering failed");
+        }
         if (bigLen > 0) {
             sb.Append(NativeMemory.GetString((nint)big, 0, bigLen));
         }
