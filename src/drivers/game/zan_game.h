@@ -288,6 +288,16 @@ ZAN_GAME_API void zan_game_set_ice_frost3d(int32_t enabled, float scale,
 ZAN_GAME_API void zan_game_set_post_thermal_heat3d(float strength,
     float sensitivity, float cold_shift);
 
+/* GPU 世界空间岩浆裂纹发光覆层（Lava Crust / Cracked Magma，零贴图零额外 Pass）：
+ * enabled != 0 时沿世界空间应力裂纹场透出脉动熔岩自发光，crack_width [0.02..0.6]，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_lava_crust3d(int32_t enabled, float scale,
+    float phase, float crack_width, float strength, float r, float g, float b);
+
+/* GPU 后处理屏幕边缘受击红晕与全屏闪光弹致盲叠加（Screen Edge Damage + Flashbang，单 Pass 零额外 FBO）：
+ * edge_strength [0..1] 仅染色屏幕四周边缘（中心零污染），flash_strength [0..1] 控制全屏致盲混入。 */
+ZAN_GAME_API void zan_game_set_post_screen_tint_flash3d(float edge_strength,
+    float flash_strength, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

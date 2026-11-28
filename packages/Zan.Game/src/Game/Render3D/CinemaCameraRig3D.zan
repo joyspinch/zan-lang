@@ -1,0 +1,130 @@
+using System;
+
+namespace Game.Render3D;
+
+// 创伤衰减相机震屏控制器（Trauma-based Camera Shake，平方创伤曲线 + 双频非对称振荡）。
+public class CameraShakeImpulse3D {
+    public float Trauma;
+    public float DecayPerSec;
+    public float MaxOffset;
+    public float Frequency;
+    private float clock;
+
+    public CameraShakeImpulse3D(float decayPerSec, float maxOffset, float frequency) {
+        this.Trauma = 0.0f;
+        this.DecayPerSec = decayPerSec > 0.05f ? decayPerSec : 1.5f;
+        this.MaxOffset = maxOffset > 0.0f ? maxOffset : 0.35f;
+        this.Frequency = frequency > 1.0f ? frequency : 22.0f;
+        this.clock = 0.0f;
+    }
+
+    public void AddTrauma(float amount) {
+        if (amount <= 0.0f) { return; }
+        this.Trauma = this.Trauma + amount;
+        if (this.Trauma > 1.0f) { this.Trauma = 1.0f; }
+    }
+
+    public Vector3 SampleAndStep(float dtSec) {
+        if (dtSec > 0.0f) {
+            this.clock = this.clock + dtSec;
+        }
+        float shake = this.Trauma * this.Trauma;
+        float ox = 0.0f;
+        float oy = 0.0f;
+        float oz = 0.0f;
+        if (shake > 0.0001f) {
+            double t = (double)(this.clock * this.Frequency);
+            ox = (float)Math.Sin(t * 1.13 + 0.7) * this.MaxOffset * shake;
+            oy = (float)Math.Cos(t * 1.37 + 1.9) * this.MaxOffset * shake;
+            oz = (float)Math.Sin(t * 0.89 + 3.1) * (this.MaxOffset * 0.4f) * shake;
+        }
+        if (dtSec > 0.0f && this.Trauma > 0.0f) {
+            this.Trauma = this.Trauma - this.DecayPerSec * dtSec;
+            if (this.Trauma < 0.0f) { this.Trauma = 0.0f; }
+        }
+        return new Vector3(ox, oy, oz);
+    }
+}
+
+// 商用第三人称弹簧臂轨道相机：支持俯仰钳位、防穿墙障碍拉近（ResolveArmDistance）、平滑追焦与创伤震屏。
+public class SpringArmCameraRig3D {
+    public Vector3 Pivot;
+    public float YawRad;
+    public float PitchRad;
+    public float MinPitchRad;
+    public float MaxPitchRad;
+    public float TargetArmLength;
+    public float CurrentArmLength;
+    public float MinArmLength;
+    public float FollowSharpness;
+    public float CollisionMargin;
+    public CameraShakeImpulse3D Shake;
+
+    public SpringArmCameraRig3D(float targetArmLength, float minArmLength, float followSharpness) {
+        this.Pivot = new Vector3(0.0f, 0.0f, 0.0f);
+        this.YawRad = 0.0f;
+        this.PitchRad = 0.35f;
+        this.MinPitchRad = -0.75f;
+        this.MaxPitchRad = 1.25f;
+        this.TargetArmLength = targetArmLength > 0.5f ? targetArmLength : 6.0f;
+        this.CurrentArmLength = this.TargetArmLength;
+        this.MinArmLength = minArmLength > 0.2f ? minArmLength : 0.8f;
+        this.FollowSharpness = followSharpness > 0.5f ? followSharpness : 10.0f;
+        this.CollisionMargin = 0.25f;
+        this.Shake = new CameraShakeImpulse3D(1.8f, 0.3f, 24.0f);
+    }
+
+    public void RotateOrbit(float deltaYawRad, float deltaPitchRad) {
+        this.YawRad = this.YawRad + deltaYawRad;
+        this.PitchRad = this.PitchRad + deltaPitchRad;
+        if (this.PitchRad < this.MinPitchRad) { this.PitchRad = this.MinPitchRad; }
+        if (this.PitchRad > this.MaxPitchRad) { this.PitchRad = this.MaxPitchRad; }
+    }
+
+    // 障碍拉近：若射线检测到障碍距离 < 目标臂长则即时回缩防穿墙，无障碍时平滑恢复。
+    public float ResolveArmDistance(float obstacleHitDist, float dtSec) {
+        float desired = this.TargetArmLength;
+        if (obstacleHitDist > 0.0f) {
+            float safe = obstacleHitDist - this.CollisionMargin;
+            if (safe < this.MinArmLength) { safe = this.MinArmLength; }
+            if (safe < desired) { desired = safe; }
+        }
+        if (desired < this.CurrentArmLength) {
+            this.CurrentArmLength = desired;
+        } else {
+            float alpha = dtSec > 0.0f ? (1.0f - (float)Math.Exp((double)(-this.FollowSharpness * dtSec))) : 1.0f;
+            this.CurrentArmLength = this.CurrentArmLength + (desired - this.CurrentArmLength) * alpha;
+        }
+        return this.CurrentArmLength;
+    }
+
+    public void UpdateCamera(Camera3D camera, Vector3 targetPivot, float obstacleHitDist, float dtSec) {
+        if (camera == null) { return; }
+        float alpha = dtSec > 0.0f ? (1.0f - (float)Math.Exp((double)(-this.FollowSharpness * dtSec))) : 1.0f;
+        this.Pivot = new Vector3(
+            this.Pivot.X + (targetPivot.X - this.Pivot.X) * alpha,
+            this.Pivot.Y + (targetPivot.Y - this.Pivot.Y) * alpha,
+            this.Pivot.Z + (targetPivot.Z - this.Pivot.Z) * alpha);
+
+        float arm = this.ResolveArmDistance(obstacleHitDist, dtSec);
+        double cosP = Math.Cos((double)this.PitchRad);
+        double sinP = Math.Sin((double)this.PitchRad);
+        double sinY = Math.Sin((double)this.YawRad);
+        double cosY = Math.Cos((double)this.YawRad);
+
+        Vector3 offset = new Vector3(
+            (float)(sinY * cosP) * arm,
+            (float)sinP * arm,
+            (float)(cosY * cosP) * arm);
+        Vector3 shakeVec = this.Shake.SampleAndStep(dtSec);
+
+        camera.Position = new Vector3(
+            this.Pivot.X + offset.X + shakeVec.X,
+            this.Pivot.Y + offset.Y + shakeVec.Y,
+            this.Pivot.Z + offset.Z + shakeVec.Z);
+        camera.Target = new Vector3(
+            this.Pivot.X + shakeVec.X * 0.25f,
+            this.Pivot.Y + shakeVec.Y * 0.25f,
+            this.Pivot.Z + shakeVec.Z * 0.25f);
+    }
+}

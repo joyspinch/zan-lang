@@ -1,0 +1,54 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerReplayClanWarSanctionTest {
+    static void Main() {
+        // 1. 对局回放高光书签与时间轴定位：乱序插入自动升序、二分定位、倍速推进与标签过滤
+        NetMatchReplayTimeline tl = new NetMatchReplayTimeline(600000L);
+        tl.AddBookmark(180000L, "teamfight", 10, "Dragon pit ace");
+        tl.AddBookmark(45000L, "first_blood", 7, "Mid solo kill");
+        tl.AddBookmark(320000L, "teamfight", 12, "Baron steal");
+
+        ReplayBookmarkEvent at200k = tl.SeekAt(200000L);
+        tl.SetPlaybackRate(2.0);
+        long afterAdv = tl.AdvanceRealMs(5000L); // 200000 + 5000*2 = 210000
+        List<ReplayBookmarkEvent> fights = tl.FilterByTag("teamfight");
+
+        bool replayOk = tl.BookmarkCount() == 3
+            && at200k != null && at200k.TimeMs == 180000L && at200k.ActorPlayerId == 10
+            && afterAdv == 210000L
+            && fights.Count == 2 && fights[1].TimeMs == 320000L;
+        Console.WriteLine("net-match-replay-timeline: " + Convert.ToString(replayOk ? 1 : 0));
+
+        // 2. 公会战赛季积分榜：胜负积3分/平积1分、同分按净胜分多级决胜排名
+        NetClanWarLeaderboard cw = new NetClanWarLeaderboard(3, 1);
+        cw.RecordMatch(101, 20, 102, 10); // 101: 3pts (+10), 102: 0pts (-10)
+        cw.RecordMatch(103, 30, 102, 5);  // 103: 3pts (+25), 102: 0pts (-35)
+        cw.RecordMatch(101, 15, 103, 15); // 平局各+1 -> 103: 4pts (+25) 领跑, 101: 4pts (+10) 第 2
+
+        ClanWarScoreboardEntry top = cw.Leader();
+        bool clanOk = top != null && top.ClanId == 103 && top.Points == 4 && top.PointDiff == 25
+            && cw.GetRank(103) == 1 && cw.GetRank(101) == 2 && cw.GetRank(102) == 3;
+        Console.WriteLine("net-clan-war-leaderboard: " + Convert.ToString(clanOk ? 1 : 0));
+
+        // 3. 风控封禁与申诉复核账本：分域隔离、限时自动解封、永久封禁与申诉人工撤销
+        NetAccountSanctionBook book = new NetAccountSanctionBook();
+        int sChat = book.IssueSanction(500, "chat", "spam", 1000L, 5000L);     // 禁言至 6000L
+        int sPerm = book.IssueSanction(501, "global", "aimbot", 1000L, 0L);    // 全服永封
+
+        bool chatRestricted = book.IsRestricted(500, "chat", 3000L) && !book.IsRestricted(500, "ranked", 3000L);
+        bool chatExpired = !book.IsRestricted(500, "chat", 7000L);
+        bool globalBlocksRanked = book.IsRestricted(501, "ranked", 999999L);
+
+        bool appealed = book.SubmitAppeal(sPerm);
+        bool revoked = book.ReviewAppeal(sPerm, true);
+        bool clearedAfterRevoke = !book.IsRestricted(501, "ranked", 999999L);
+
+        bool sanctionOk = sChat == 1 && sPerm == 2 && chatRestricted && chatExpired
+            && globalBlocksRanked && appealed && revoked && clearedAfterRevoke;
+        Console.WriteLine("net-account-sanction-book: " + Convert.ToString(sanctionOk ? 1 : 0));
+    }
+}

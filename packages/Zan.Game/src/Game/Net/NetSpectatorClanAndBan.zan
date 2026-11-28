@@ -1,0 +1,266 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+public class ReplayBookmarkEvent {
+    public long TimeMs;
+    public string Tag;
+    public int ActorPlayerId;
+    public string Summary;
+
+    public ReplayBookmarkEvent(long timeMs, string tag, int actorPlayerId, string summary) {
+        this.TimeMs = timeMs >= 0L ? timeMs : 0L;
+        this.Tag = tag == null ? "" : tag;
+        this.ActorPlayerId = actorPlayerId;
+        this.Summary = summary == null ? "" : summary;
+    }
+}
+
+// 商用对局回放高光书签与时间轴定位器：按时间升序归档、倍速推进（0.25x..4x）、标签筛选与二分定位。
+public class NetMatchReplayTimeline {
+    public long DurationMs;
+    public long CursorMs;
+    public double PlaybackRate;
+    private List<ReplayBookmarkEvent> bookmarks;
+
+    public NetMatchReplayTimeline(long durationMs) {
+        this.DurationMs = durationMs > 0L ? durationMs : 0L;
+        this.CursorMs = 0L;
+        this.PlaybackRate = 1.0;
+        this.bookmarks = new List<ReplayBookmarkEvent>();
+    }
+
+    public void AddBookmark(long timeMs, string tag, int actorPlayerId, string summary) {
+        long t = timeMs < 0L ? 0L : timeMs;
+        if (t > this.DurationMs) { this.DurationMs = t; }
+        ReplayBookmarkEvent ev = new ReplayBookmarkEvent(t, tag, actorPlayerId, summary);
+        int pos = this.bookmarks.Count;
+        for (int i = 0; i < this.bookmarks.Count; i = i + 1) {
+            if (t < this.bookmarks[i].TimeMs) {
+                pos = i;
+                break;
+            }
+        }
+        this.bookmarks.Insert(pos, ev);
+    }
+
+    public void SetPlaybackRate(double rate) {
+        if (rate < 0.25) { rate = 0.25; }
+        if (rate > 4.0) { rate = 4.0; }
+        this.PlaybackRate = rate;
+    }
+
+    public long AdvanceRealMs(long realDeltaMs) {
+        if (realDeltaMs <= 0L) { return this.CursorMs; }
+        long scaled = (long)((double)realDeltaMs * this.PlaybackRate);
+        this.CursorMs = this.CursorMs + scaled;
+        if (this.CursorMs > this.DurationMs) { this.CursorMs = this.DurationMs; }
+        return this.CursorMs;
+    }
+
+    public ReplayBookmarkEvent SeekAt(long targetMs) {
+        long clamped = targetMs < 0L ? 0L : (targetMs > this.DurationMs ? this.DurationMs : targetMs);
+        this.CursorMs = clamped;
+        int lo = 0;
+        int hi = this.bookmarks.Count - 1;
+        int best = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (this.bookmarks[mid].TimeMs <= clamped) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return best >= 0 ? this.bookmarks[best] : null;
+    }
+
+    public List<ReplayBookmarkEvent> FilterByTag(string tag) {
+        List<ReplayBookmarkEvent> list = new List<ReplayBookmarkEvent>();
+        if (tag == null) { return list; }
+        for (int i = 0; i < this.bookmarks.Count; i = i + 1) {
+            if (this.bookmarks[i].Tag == tag) {
+                list.Add(this.bookmarks[i]);
+            }
+        }
+        return list;
+    }
+
+    public int BookmarkCount() {
+        return this.bookmarks.Count;
+    }
+}
+
+public class ClanWarScoreboardEntry {
+    public int ClanId;
+    public int Points;
+    public int Wins;
+    public int Losses;
+    public int PointDiff;
+
+    public ClanWarScoreboardEntry(int clanId) {
+        this.ClanId = clanId;
+        this.Points = 0;
+        this.Wins = 0;
+        this.Losses = 0;
+        this.PointDiff = 0;
+    }
+}
+
+// 商用公会战赛季积分榜：支持胜负积分、多级决胜排序（总分 -> 胜场 -> 净胜分）与精确排名。
+public class NetClanWarLeaderboard {
+    private int winPoints;
+    private int drawPoints;
+    private List<ClanWarScoreboardEntry> entries;
+
+    public NetClanWarLeaderboard(int winPoints, int drawPoints) {
+        this.winPoints = winPoints > 0 ? winPoints : 3;
+        this.drawPoints = drawPoints >= 0 ? drawPoints : 1;
+        this.entries = new List<ClanWarScoreboardEntry>();
+    }
+
+    public void RecordMatch(int clanA, int scoreA, int clanB, int scoreB) {
+        if (clanA == clanB) { return; }
+        ClanWarScoreboardEntry a = this.GetOrCreate(clanA);
+        ClanWarScoreboardEntry b = this.GetOrCreate(clanB);
+        int diff = scoreA - scoreB;
+        a.PointDiff = a.PointDiff + diff;
+        b.PointDiff = b.PointDiff - diff;
+        if (scoreA > scoreB) {
+            a.Wins = a.Wins + 1;
+            a.Points = a.Points + this.winPoints;
+            b.Losses = b.Losses + 1;
+        } else if (scoreB > scoreA) {
+            b.Wins = b.Wins + 1;
+            b.Points = b.Points + this.winPoints;
+            a.Losses = a.Losses + 1;
+        } else {
+            a.Points = a.Points + this.drawPoints;
+            b.Points = b.Points + this.drawPoints;
+        }
+        this.SortDescending();
+    }
+
+    public int GetRank(int clanId) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].ClanId == clanId) { return i + 1; }
+        }
+        return -1;
+    }
+
+    public ClanWarScoreboardEntry Leader() {
+        return this.entries.Count > 0 ? this.entries[0] : null;
+    }
+
+    private ClanWarScoreboardEntry GetOrCreate(int clanId) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].ClanId == clanId) { return this.entries[i]; }
+        }
+        ClanWarScoreboardEntry created = new ClanWarScoreboardEntry(clanId);
+        this.entries.Add(created);
+        return created;
+    }
+
+    private void SortDescending() {
+        for (int i = 1; i < this.entries.Count; i = i + 1) {
+            ClanWarScoreboardEntry cur = this.entries[i];
+            int j = i - 1;
+            while (j >= 0 && IsBetter(cur, this.entries[j])) {
+                this.entries[j + 1] = this.entries[j];
+                j = j - 1;
+            }
+            this.entries[j + 1] = cur;
+        }
+    }
+
+    private static bool IsBetter(ClanWarScoreboardEntry a, ClanWarScoreboardEntry b) {
+        if (a.Points != b.Points) { return a.Points > b.Points; }
+        if (a.Wins != b.Wins) { return a.Wins > b.Wins; }
+        if (a.PointDiff != b.PointDiff) { return a.PointDiff > b.PointDiff; }
+        return a.ClanId < b.ClanId;
+    }
+}
+
+public enum BanAppealStatus {
+    None = 0,
+    PendingReview = 1,
+    Upheld = 2,
+    Revoked = 3
+}
+
+public class AccountSanctionRecord {
+    public int SanctionId;
+    public int PlayerId;
+    public string Scope;
+    public string Reason;
+    public long ExpiresAtMs;
+    public bool Permanent;
+    public BanAppealStatus AppealStatus;
+
+    public AccountSanctionRecord(int sanctionId, int playerId, string scope, string reason, long expiresAtMs, bool permanent) {
+        this.SanctionId = sanctionId;
+        this.PlayerId = playerId;
+        this.Scope = scope == null ? "global" : scope;
+        this.Reason = reason == null ? "" : reason;
+        this.ExpiresAtMs = expiresAtMs;
+        this.Permanent = permanent;
+        this.AppealStatus = BanAppealStatus.None;
+    }
+}
+
+// 商用风控封禁与申诉复核账本：支持分域封禁（chat/ranked/global）、限时解封、永久封禁与申诉撤销。
+public class NetAccountSanctionBook {
+    private List<AccountSanctionRecord> records;
+    private int nextId;
+
+    public NetAccountSanctionBook() {
+        this.records = new List<AccountSanctionRecord>();
+        this.nextId = 1;
+    }
+
+    public int IssueSanction(int playerId, string scope, string reason, long nowMs, long durationMs) {
+        int id = this.nextId;
+        this.nextId = this.nextId + 1;
+        bool permanent = durationMs <= 0L;
+        long exp = permanent ? 0L : (nowMs + durationMs);
+        this.records.Add(new AccountSanctionRecord(id, playerId, scope, reason, exp, permanent));
+        return id;
+    }
+
+    public bool IsRestricted(int playerId, string scope, long nowMs) {
+        string targetScope = scope == null ? "global" : scope;
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            AccountSanctionRecord r = this.records[i];
+            if (r.PlayerId != playerId) { continue; }
+            if (r.AppealStatus == BanAppealStatus.Revoked) { continue; }
+            if (r.Scope != "global" && r.Scope != targetScope) { continue; }
+            if (r.Permanent || nowMs < r.ExpiresAtMs) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public bool SubmitAppeal(int sanctionId) {
+        AccountSanctionRecord r = this.Find(sanctionId);
+        if (r == null || r.AppealStatus != BanAppealStatus.None) { return false; }
+        r.AppealStatus = BanAppealStatus.PendingReview;
+        return true;
+    }
+
+    public bool ReviewAppeal(int sanctionId, bool revokeSanction) {
+        AccountSanctionRecord r = this.Find(sanctionId);
+        if (r == null || r.AppealStatus != BanAppealStatus.PendingReview) { return false; }
+        r.AppealStatus = revokeSanction ? BanAppealStatus.Revoked : BanAppealStatus.Upheld;
+        return true;
+    }
+
+    private AccountSanctionRecord Find(int sanctionId) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].SanctionId == sanctionId) { return this.records[i]; }
+        }
+        return null;
+    }
+}

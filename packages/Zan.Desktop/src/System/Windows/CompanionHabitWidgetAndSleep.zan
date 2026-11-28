@@ -1,0 +1,244 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+public class HabitCheckinItem {
+    public string HabitId;
+    public int CurrentStreak;
+    public int BestStreak;
+    public int LastCheckedDay;
+    public int TotalCompletions;
+
+    public HabitCheckinItem(string habitId) {
+        this.HabitId = habitId == null ? "" : habitId;
+        this.CurrentStreak = 0;
+        this.BestStreak = 0;
+        this.LastCheckedDay = -999999;
+        this.TotalCompletions = 0;
+    }
+}
+
+// 桌面伴侣每日习惯打卡与连击看板：防同日重复打卡、连续天数追踪、断签归零与当日完成率统计。
+public class CompanionHabitStreakBoard {
+    private List<HabitCheckinItem> habits;
+
+    public CompanionHabitStreakBoard() {
+        this.habits = new List<HabitCheckinItem>();
+    }
+
+    public bool RegisterHabit(string habitId) {
+        if (habitId == null || habitId == "" || this.Find(habitId) != null) { return false; }
+        this.habits.Add(new HabitCheckinItem(habitId));
+        return true;
+    }
+
+    public bool CheckIn(string habitId, int dayIndex) {
+        HabitCheckinItem item = this.Find(habitId);
+        if (item == null || item.LastCheckedDay == dayIndex || dayIndex < item.LastCheckedDay) {
+            return false;
+        }
+        if (item.LastCheckedDay == dayIndex - 1) {
+            item.CurrentStreak = item.CurrentStreak + 1;
+        } else {
+            item.CurrentStreak = 1;
+        }
+        if (item.CurrentStreak > item.BestStreak) {
+            item.BestStreak = item.CurrentStreak;
+        }
+        item.LastCheckedDay = dayIndex;
+        item.TotalCompletions = item.TotalCompletions + 1;
+        return true;
+    }
+
+    public HabitCheckinItem GetHabit(string habitId) {
+        return this.Find(habitId);
+    }
+
+    public double CompletionRateOnDay(int dayIndex) {
+        if (this.habits.Count == 0) { return 0.0; }
+        int done = 0;
+        for (int i = 0; i < this.habits.Count; i = i + 1) {
+            if (this.habits[i].LastCheckedDay == dayIndex) {
+                done = done + 1;
+            }
+        }
+        return (double)done / (double)this.habits.Count;
+    }
+
+    private HabitCheckinItem Find(string habitId) {
+        for (int i = 0; i < this.habits.Count; i = i + 1) {
+            if (this.habits[i].HabitId == habitId) { return this.habits[i]; }
+        }
+        return null;
+    }
+}
+
+public enum WidgetDockAnchor {
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3,
+    Center = 4
+}
+
+public class DesktopWidgetRect {
+    public string WidgetId;
+    public int X;
+    public int Y;
+    public int Width;
+    public int Height;
+
+    public DesktopWidgetRect(string widgetId, int x, int y, int width, int height) {
+        this.WidgetId = widgetId == null ? "" : widgetId;
+        this.X = x;
+        this.Y = y;
+        this.Width = width > 1 ? width : 1;
+        this.Height = height > 1 ? height : 1;
+    }
+
+    public bool Overlaps(DesktopWidgetRect other) {
+        if (other == null) { return false; }
+        return this.X < (other.X + other.Width)
+            && (this.X + this.Width) > other.X
+            && this.Y < (other.Y + other.Height)
+            && (this.Y + this.Height) > other.Y;
+    }
+}
+
+// 桌面伴侣微件贴边网格布局器：支持四角/居中锚点、多微件自动防重叠顺移与工作区边界钳制。
+public class CompanionWidgetDockGrid {
+    public int ScreenWidth;
+    public int ScreenHeight;
+    public int MarginPx;
+    public int GapPx;
+    private List<DesktopWidgetRect> placed;
+
+    public CompanionWidgetDockGrid(int screenWidth, int screenHeight, int marginPx, int gapPx) {
+        this.ScreenWidth = screenWidth > 100 ? screenWidth : 1920;
+        this.ScreenHeight = screenHeight > 100 ? screenHeight : 1080;
+        this.MarginPx = marginPx >= 0 ? marginPx : 16;
+        this.GapPx = gapPx >= 0 ? gapPx : 12;
+        this.placed = new List<DesktopWidgetRect>();
+    }
+
+    public DesktopWidgetRect PlaceWidget(string widgetId, int width, int height, WidgetDockAnchor anchor) {
+        int x = this.MarginPx;
+        int y = this.MarginPx;
+        int stepY = height + this.GapPx;
+
+        if (anchor == WidgetDockAnchor.TopRight) {
+            x = this.ScreenWidth - this.MarginPx - width;
+            y = this.MarginPx;
+        } else if (anchor == WidgetDockAnchor.BottomLeft) {
+            x = this.MarginPx;
+            y = this.ScreenHeight - this.MarginPx - height;
+            stepY = -(height + this.GapPx);
+        } else if (anchor == WidgetDockAnchor.BottomRight) {
+            x = this.ScreenWidth - this.MarginPx - width;
+            y = this.ScreenHeight - this.MarginPx - height;
+            stepY = -(height + this.GapPx);
+        } else if (anchor == WidgetDockAnchor.Center) {
+            x = (this.ScreenWidth - width) / 2;
+            y = (this.ScreenHeight - height) / 2;
+        }
+
+        DesktopWidgetRect cand = new DesktopWidgetRect(widgetId, Clamp(x, 0, this.ScreenWidth - width),
+            Clamp(y, 0, this.ScreenHeight - height), width, height);
+
+        for (int tries = 0; tries < 16; tries = tries + 1) {
+            if (!this.HasOverlap(cand)) { break; }
+            cand.Y = Clamp(cand.Y + stepY, this.MarginPx, this.ScreenHeight - this.MarginPx - height);
+        }
+        this.placed.Add(cand);
+        return cand;
+    }
+
+    public int PlacedCount() {
+        return this.placed.Count;
+    }
+
+    private bool HasOverlap(DesktopWidgetRect cand) {
+        for (int i = 0; i < this.placed.Count; i = i + 1) {
+            if (cand.Overlaps(this.placed[i])) { return true; }
+        }
+        return false;
+    }
+
+    private static int Clamp(int v, int lo, int hi) {
+        if (hi < lo) { return lo; }
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+}
+
+public enum SleepReminderStage {
+    Awake = 0,
+    WindDown = 1,
+    Bedtime = 2,
+    LateNightLock = 3
+}
+
+// 桌面伴侣深夜护眼与睡眠守护策略：支持跨午夜作息窗口、渐进式四档提醒与临时延后（Snooze）。
+public class CompanionBedtimeGuard {
+    public int WindDownMinute;
+    public int BedtimeMinute;
+    public int WakeMinute;
+    private int snoozeUntilMinute;
+    private bool snoozeActive;
+
+    public CompanionBedtimeGuard(int windDownMinute, int bedtimeMinute, int wakeMinute) {
+        this.WindDownMinute = NormalizeMinute(windDownMinute);
+        this.BedtimeMinute = NormalizeMinute(bedtimeMinute);
+        this.WakeMinute = NormalizeMinute(wakeMinute);
+        this.snoozeUntilMinute = 0;
+        this.snoozeActive = false;
+    }
+
+    public void Snooze(int currentMinuteOfDay, int snoozeMinutes) {
+        int dur = snoozeMinutes > 0 ? snoozeMinutes : 15;
+        this.snoozeUntilMinute = NormalizeMinute(currentMinuteOfDay + dur);
+        this.snoozeActive = true;
+    }
+
+    public SleepReminderStage EvaluateStage(int currentMinuteOfDay) {
+        int now = NormalizeMinute(currentMinuteOfDay);
+        if (!IsInCircularRange(now, this.WindDownMinute, this.WakeMinute)) {
+            this.snoozeActive = false;
+            return SleepReminderStage.Awake;
+        }
+        if (this.snoozeActive) {
+            int rem = CircularForwardDistance(now, this.snoozeUntilMinute);
+            if (rem > 0 && rem <= 180) {
+                return SleepReminderStage.WindDown;
+            }
+            this.snoozeActive = false;
+        }
+        if (!IsInCircularRange(now, this.BedtimeMinute, this.WakeMinute)) {
+            return SleepReminderStage.WindDown;
+        }
+        int pastBedtime = CircularForwardDistance(this.BedtimeMinute, now);
+        if (pastBedtime >= 60) {
+            return SleepReminderStage.LateNightLock;
+        }
+        return SleepReminderStage.Bedtime;
+    }
+
+    private static int NormalizeMinute(int m) {
+        int r = m % 1440;
+        return r < 0 ? (r + 1440) : r;
+    }
+
+    private static int CircularForwardDistance(int fromMin, int toMin) {
+        int d = toMin - fromMin;
+        return d < 0 ? (d + 1440) : d;
+    }
+
+    private static bool IsInCircularRange(int value, int start, int end) {
+        if (start <= end) {
+            return value >= start && value < end;
+        }
+        return value >= start || value < end;
+    }
+}
