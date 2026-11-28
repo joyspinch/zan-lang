@@ -1,0 +1,126 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Game.Animation;
+using Game.Assets;
+using Game.Render3D;
+
+namespace T;
+
+// Game.Render3D 通用件（CPU 侧）：InstanceBuffer 扩容、StaticMeshBaker 世界 UV / 绕序 / 伪 AO、
+// PropLibrary 包围盒与摆放、CharacterRig 在 0.01 根缩放骨架上的姿态与双手 IK。
+class Program {
+    static string R(float v) { return (Math.Round(v * 100.0f) / 100.0).ToString(); }
+    static void F(List<byte> b, float f) {
+        int bits = BitConverter.SingleToInt32Bits(f);
+        b.Add((byte)(bits & 255)); b.Add((byte)((bits >> 8) & 255)); b.Add((byte)((bits >> 16) & 255)); b.Add((byte)((bits >> 24) & 255));
+    }
+    static void U16(List<byte> b, int v) { b.Add((byte)(v & 255)); b.Add((byte)((v >> 8) & 255)); }
+
+    static GltfModel Load(string json, List<byte> bin) {
+        byte[] raw = new byte[bin.Count];
+        for (int i = 0; i < bin.Count; i = i + 1) { raw[i] = bin[i]; }
+        string j = json.Replace("@LEN@", raw.Length.ToString()).Replace("@B64@", Convert.ToBase64String(raw));
+        return GltfLoader.LoadGltfBytes(Encoding.GetBytes(j), null, "");
+    }
+
+    static void Main() {
+        // ---- InstanceBuffer ----
+        InstanceBuffer ib = new InstanceBuffer(2);
+        for (int i = 0; i < 5; i = i + 1) { ib.Box(i * 2.0f, 0.5f, 0.0f, 1.0f, 1.0f, 1.0f, unchecked((int)0xFFFF0000)); }
+        Console.WriteLine("inst count=" + ib.Count.ToString() + " cap>=5=" + (ib.Capacity >= 5).ToString() + " tx4=" + R(ib.At(4, 12)) + " red=" + R(ib.At(4, 16)));
+
+        // ---- StaticMeshBaker ----
+        InstanceBuffer wall = new InstanceBuffer(4);
+        wall.Box(1.0f, 1.5f, 0.0f, 4.0f, 3.0f, 0.2f, unchecked((int)0xFF808080));
+        List<Mesh3D> ms = StaticMeshBaker.BakeBoxes(wall, 2.0f, 0.0f);
+        Mesh3D m = ms[0];
+        float[] v = m.VertexArray();
+        int st = m.StrideFloats();
+        // 找 +z 面上 (x=3,y=3) 的顶点：UV = (x, -y) / 2
+        string uv = "?"; float lowShade = 2.0f;
+        for (int k = 0; k + st <= v.Length; k = k + st) {
+            if (v[k + 5] > 0.9f && Math.Abs(v[k] - 3.0f) < 0.01f && Math.Abs(v[k + 1] - 3.0f) < 0.01f) { uv = R(v[k + 6]) + "," + R(v[k + 7]); }
+            if (v[k + 5] > 0.9f && v[k + 1] < 0.01f && v[k + 8] < lowShade) { lowShade = v[k + 8]; }
+        }
+        // 三角形朝外：第一个三角形法线与顶点法线同向
+        ushort[] ix = m.IndexArray();
+        float ax = v[ix[1] * st] - v[ix[0] * st]; float ay = v[ix[1] * st + 1] - v[ix[0] * st + 1]; float az = v[ix[1] * st + 2] - v[ix[0] * st + 2];
+        float bx = v[ix[2] * st] - v[ix[0] * st]; float by = v[ix[2] * st + 1] - v[ix[0] * st + 1]; float bz = v[ix[2] * st + 2] - v[ix[0] * st + 2];
+        float cx = ay * bz - az * by; float cy = az * bx - ax * bz; float cz = ax * by - ay * bx;
+        float dot = cx * v[ix[0] * st + 3] + cy * v[ix[0] * st + 4] + cz * v[ix[0] * st + 5];
+        Console.WriteLine("bake meshes=" + ms.Count.ToString() + " verts=" + m.VertexCount().ToString() + " tris=" + (m.IndexCount() / 3).ToString() + " uv=" + uv + " groundShade=" + R(lowShade) + " outward=" + (dot > 0).ToString());
+        BakedMeshSet bset = new BakedMeshSet();
+        PbrMaterial mat = new PbrMaterial();
+        bset.AddBoxes(wall, mat);
+        Console.WriteLine("bakedset pending=" + bset.MeshCount().ToString());
+
+        // ---- PropLibrary：内存里的 1×2×1 立方柱，底面在 y=-1 ----
+        List<byte> pb = new List<byte>();
+        float[] P = new float[] { -0.5f, -1.0f, -0.5f, 0.5f, -1.0f, -0.5f, 0.5f, 1.0f, 0.5f, -0.5f, 1.0f, 0.5f };
+        for (int i = 0; i < P.Length; i = i + 1) { F(pb, P[i]); }
+        U16(pb, 0); U16(pb, 1); U16(pb, 2); U16(pb, 0); U16(pb, 2); U16(pb, 3);
+        string pj = "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":@LEN@,\"uri\":\"data:application/octet-stream;base64,@B64@\"}],"
+            + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":48},{\"buffer\":0,\"byteOffset\":48,\"byteLength\":12}],"
+            + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-0.5,-1,-0.5],\"max\":[0.5,1,0.5]},{\"bufferView\":1,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}],"
+            + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1}]}],\"nodes\":[{\"mesh\":0}]}";
+        PropLibrary lib = new PropLibrary("");
+        PropAsset pa = lib.Register("pillar", Load(pj, pb));
+        Mat4 pm = lib.Place("pillar", 10.0f, 0.0f, 5.0f, 0.0f, 2.0f);
+        float hx; float hz; float h;
+        pa.Footprint(1.5708f, 2.0f, out hx, out hz, out h);
+        Console.WriteLine("prop size=" + R(pa.SizeX()) + "x" + R(pa.SizeY()) + "x" + R(pa.SizeZ()) + " inst=" + pa.Instances.Count.ToString()
+            + " baseY=" + R(pm.m[5] * -1.0f + pm.m[7]) + " cx=" + R(pm.m[3]) + " foot=" + R(hx) + "," + R(hz) + "," + R(h) + " missing=" + (lib.Get("nope") == null).ToString());
+
+        // ---- CharacterRig：Armature(0.01) → 厘米制人形骨架 + 一个蒙皮三角形 ----
+        List<byte> cb = new List<byte>();
+        string[] names = new string[] { "Hips", "Spine", "Spine01", "Spine02", "RightArm", "RightForeArm", "RightHand", "LeftArm", "LeftForeArm", "LeftHand" };
+        int[] parent = new int[] { -1, 0, 1, 2, 3, 4, 5, 3, 7, 8 };
+        float[] tx = new float[] { 0, 0, 0, 0, -20, -28, -25, 20, 28, 25 };
+        float[] ty = new float[] { 100, 10, 10, 15, 5, 0, 0, 5, 0, 0 };
+        // 全局（厘米）用于逆绑定矩阵
+        float[] gx = new float[10]; float[] gy = new float[10];
+        for (int i = 0; i < 10; i = i + 1) { gx[i] = tx[i] + (parent[i] >= 0 ? gx[parent[i]] : 0); gy[i] = ty[i] + (parent[i] >= 0 ? gy[parent[i]] : 0); }
+        for (int i = 0; i < 10; i = i + 1) {
+            F(cb, 100); F(cb, 0); F(cb, 0); F(cb, 0); F(cb, 0); F(cb, 100); F(cb, 0); F(cb, 0);
+            F(cb, 0); F(cb, 0); F(cb, 100); F(cb, 0); F(cb, -gx[i]); F(cb, -gy[i]); F(cb, 0); F(cb, 1);
+        }
+        int offPos = cb.Count;
+        float[] tri = new float[] { 0, 1, 0, 0.1f, 1, 0, 0, 1.1f, 0 };
+        for (int i = 0; i < tri.Length; i = i + 1) { F(cb, tri[i]); }
+        int offJ = cb.Count;
+        for (int i = 0; i < 3; i = i + 1) { cb.Add(0); cb.Add(0); cb.Add(0); cb.Add(0); }
+        int offW = cb.Count;
+        for (int i = 0; i < 3; i = i + 1) { F(cb, 1); F(cb, 0); F(cb, 0); F(cb, 0); }
+        int offI = cb.Count;
+        U16(cb, 0); U16(cb, 1); U16(cb, 2); U16(cb, 0);
+        StringBuilder nodes = new StringBuilder();
+        nodes.Append("{\"name\":\"Armature\",\"scale\":[0.01,0.01,0.01],\"children\":[1]},{\"mesh\":0,\"skin\":0,\"name\":\"Body\"}");
+        for (int i = 0; i < 10; i = i + 1) {
+            StringBuilder kids = new StringBuilder();
+            for (int k = 0; k < 10; k = k + 1) { if (parent[k] == i) { if (kids.Length > 0) { kids.Append(","); } kids.Append((k + 2).ToString()); } }
+            nodes.Append(",{\"name\":\"" + names[i] + "\",\"translation\":[" + tx[i].ToString() + "," + ty[i].ToString() + ",0]" + (kids.Length > 0 ? ",\"children\":[" + kids.ToString() + "]" : "") + "}");
+        }
+        string armKids = "1,2";
+        string cj = "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":@LEN@,\"uri\":\"data:application/octet-stream;base64,@B64@\"}],"
+            + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":640},{\"buffer\":0,\"byteOffset\":" + offPos.ToString() + ",\"byteLength\":36},"
+            + "{\"buffer\":0,\"byteOffset\":" + offJ.ToString() + ",\"byteLength\":12},{\"buffer\":0,\"byteOffset\":" + offW.ToString() + ",\"byteLength\":48},{\"buffer\":0,\"byteOffset\":" + offI.ToString() + ",\"byteLength\":6}],"
+            + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":10,\"type\":\"MAT4\"},{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[0,1,0],\"max\":[0.1,1.1,0]},"
+            + "{\"bufferView\":2,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"},{\"bufferView\":3,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"},{\"bufferView\":4,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+            + "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":1,\"JOINTS_0\":2,\"WEIGHTS_0\":3},\"indices\":4}]}],"
+            + "\"nodes\":[" + nodes.ToString().Replace("\"children\":[1]}", "\"children\":[" + armKids + "]}") + "],"
+            + "\"skins\":[{\"joints\":[2,3,4,5,6,7,8,9,10,11],\"inverseBindMatrices\":0}]}";
+        GltfModel cm = Load(cj, cb);
+        CharacterRig rig = new CharacterRig();
+        bool ok = rig.Init(null, cm, null, new HumanoidBones(), "walk", "run");
+        float[] bind = rig.Pose(0.0f, 0.0f, 0.0f, false, false);
+        Vector3 hips = rig.Skeleton.WorldPosition(rig.Skeleton.IndexOf("Hips"));
+        float[] aim = rig.Pose(0.0f, 0.0f, 0.0f, false, true);
+        // 右手目标：上胸椎前方 0.26、右侧 0.14、上方 0.12（米）
+        Vector3 chest = rig.Skeleton.WorldPosition(rig.Skeleton.IndexOf("Spine02"));
+        float ex = chest.X - 0.14f - rig.HandX; float ey = chest.Y + 0.12f - rig.HandY; float ez = chest.Z + 0.26f - rig.HandZ;
+        float err = MathF.Sqrt(ex * ex + ey * ey + ez * ez);
+        Console.WriteLine("rig ok=" + ok.ToString() + " bones=" + (bind.Length / 16).ToString() + " hipsY=" + R(hips.Y) + " bindSkinTx=" + R(bind[12]) + " handErr<5cm=" + (err < 0.05f).ToString());
+    }
+}

@@ -1,0 +1,213 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+
+namespace Game.Render3D;
+
+// 实例缓冲：每实例 20 float = 列主序 Model 矩阵 16 + 线性 tint RGBA 4，
+// 直接喂 Canvas.DrawMesh3DBatchLit / ShadowDrawBatch。单位立方体（-1..1）用 Box/BoxYaw 摆放。
+public class InstanceBuffer {
+    public nint Ptr;
+    public int Count;
+    public int Capacity;
+
+    public InstanceBuffer(int capacity) {
+        this.Capacity = capacity < 1 ? 1 : capacity;
+        this.Ptr = NativeMemory.Alloc(this.Capacity * 80);
+        this.Count = 0;
+    }
+
+    public void Clear() { this.Count = 0; }
+
+    // 行主序 Mat4 → 列主序写入；容量满时自动扩容。
+    public void Add(Mat4 m, int argb) {
+        if (this.Count >= this.Capacity) { this.Grow(); }
+        Span<float> d = new Span<float>(this.Ptr + this.Count * 80, 20);
+        float[] a = m.m;
+        d[0] = a[0]; d[1] = a[4]; d[2] = a[8]; d[3] = a[12];
+        d[4] = a[1]; d[5] = a[5]; d[6] = a[9]; d[7] = a[13];
+        d[8] = a[2]; d[9] = a[6]; d[10] = a[10]; d[11] = a[14];
+        d[12] = a[3]; d[13] = a[7]; d[14] = a[11]; d[15] = a[15];
+        d[16] = (float)((argb >> 16) & 255) / 255.0f;
+        d[17] = (float)((argb >> 8) & 255) / 255.0f;
+        d[18] = (float)(argb & 255) / 255.0f;
+        d[19] = (float)((argb >> 24) & 255) / 255.0f;
+        this.Count = this.Count + 1;
+    }
+
+    // 轴对齐盒：中心 + 全尺寸。
+    public void Box(float cx, float cy, float cz, float sx, float sy, float sz, int argb) {
+        Mat4 m = Mat4.Scale(sx * 0.5f, sy * 0.5f, sz * 0.5f);
+        m.m[3] = cx; m.m[7] = cy; m.m[11] = cz;
+        this.Add(m, argb);
+    }
+
+    // 绕 y 旋转的盒。
+    public void BoxYaw(float cx, float cy, float cz, float sx, float sy, float sz, float yaw, int argb) {
+        Mat4 m = Mat4.Mul(Mat4.RotateAxis(0.0f, 1.0f, 0.0f, yaw), Mat4.Scale(sx * 0.5f, sy * 0.5f, sz * 0.5f));
+        m.m[3] = cx; m.m[7] = cy; m.m[11] = cz;
+        this.Add(m, argb);
+    }
+
+    // 读回第 i 个实例的列主序数据（16 矩阵 + 4 tint）。
+    public float At(int i, int k) {
+        return new Span<float>(this.Ptr + i * 80, 20)[k];
+    }
+
+    private void Grow() {
+        int nc = this.Capacity * 2;
+        nint np = NativeMemory.Alloc(nc * 80);
+        Span<float> src = new Span<float>(this.Ptr, this.Count * 20);
+        Span<float> dst = new Span<float>(np, nc * 20);
+        for (int i = 0; i < this.Count * 20; i = i + 1) { dst[i] = src[i]; }
+        NativeMemory.Free(this.Ptr);
+        this.Ptr = np;
+        this.Capacity = nc;
+    }
+}
+
+// PBR 材质参数：颜色 / 法线 / ORM（AO-粗糙-金属）贴图键 + 系数。
+public class PbrMaterial {
+    public string Albedo;
+    public string Normal;
+    public string Orm;
+    public float Metallic;
+    public float Roughness;
+    public float UvSize;        // 一张贴图覆盖的世界尺寸（米）
+    public float TintMix;       // 实例颜色混入比例（0 = 只用贴图颜色，1 = 完全乘实例色）
+    public float NormalScale;
+
+    public PbrMaterial() {
+        this.Albedo = ""; this.Normal = ""; this.Orm = "";
+        this.Metallic = 0.0f; this.Roughness = 0.9f; this.UvSize = 2.0f; this.TintMix = 1.0f; this.NormalScale = 1.0f;
+    }
+
+    // 绑定到后续 3D 绘制（法线/ORM 为全局状态）。
+    public void Bind(Canvas c) {
+        c.SetMaterial3D(this.Metallic, this.Roughness, 0.0f, 0.0f, 0.0f);
+        c.SetTriplanar3D(false, 1.0f, 4.0f);
+        c.SetNormalMap3D(this.Normal, this.Normal != "" ? this.NormalScale : 0.0f);
+        c.SetPbrMaps3D(this.Orm, this.Orm != "" ? 1.0f : 0.0f);
+    }
+
+    public static void Unbind(Canvas c) {
+        c.SetNormalMap3D("", 0.0f);
+        c.SetPbrMaps3D("", 0.0f);
+    }
+}
+
+// 静态烘焙：把单位立方体实例合成大网格。每个面按世界平面投影生成 UV（贴图密度处处一致，
+// 依赖 3D 材质纹理的 REPEAT 环绕），实例色按 TintMix 混入顶点色，墙根按高度压暗做伪 AO。
+public static class StaticMeshBaker {
+    public static int MaxVertsPerMesh = 60000;
+    public static float GroundAoHeight = 0.6f;
+    public static float GroundAoStrength = 0.22f;
+
+    public static List<Mesh3D> BakeBoxes(InstanceBuffer boxes, float uvSize, float tintMix) {
+        List<Mesh3D> meshes = new List<Mesh3D>();
+        Mesh3D m = new Mesh3D();
+        float inv = uvSize > 0.0f ? 1.0f / uvSize : 0.0f;
+        for (int i = 0; i < boxes.Count; i = i + 1) {
+            if (m.VertexCount() + 24 > MaxVertsPerMesh) { meshes.Add(m); m = new Mesh3D(); }
+            Span<float> d = new Span<float>(boxes.Ptr + i * 80, 20);
+            float cr = 1.0f + (d[16] - 1.0f) * tintMix;
+            float cg = 1.0f + (d[17] - 1.0f) * tintMix;
+            float cb = 1.0f + (d[18] - 1.0f) * tintMix;
+            for (int f = 0; f < 6; f = f + 1) {
+                int ax = f / 2; float sg = (f % 2 == 0) ? 1.0f : -1.0f;
+                float nxl = ax == 0 ? sg : 0.0f; float nyl = ax == 1 ? sg : 0.0f; float nzl = ax == 2 ? sg : 0.0f;
+                float nx = d[0] * nxl + d[4] * nyl + d[8] * nzl;
+                float ny = d[1] * nxl + d[5] * nyl + d[9] * nzl;
+                float nz = d[2] * nxl + d[6] * nyl + d[10] * nzl;
+                float nl = MathF.Sqrt(nx * nx + ny * ny + nz * nz);
+                if (nl < 1e-6f) { continue; }
+                nx = nx / nl; ny = ny / nl; nz = nz / nl;
+                float anx = MathF.Abs(nx); float any = MathF.Abs(ny); float anz = MathF.Abs(nz);
+                int plane = (any >= anx && any >= anz) ? 1 : (anx >= anz ? 0 : 2);
+                int ua = (ax + 1) % 3; int va = (ax + 2) % 3;
+                int[] idx = new int[4];
+                float[] px = new float[4]; float[] py = new float[4]; float[] pz = new float[4];
+                for (int q = 0; q < 4; q = q + 1) {
+                    float su = (q == 1 || q == 2) ? 1.0f : -1.0f;
+                    float sv = (q >= 2) ? 1.0f : -1.0f;
+                    float lx = 0.0f; float ly = 0.0f; float lz = 0.0f;
+                    if (ax == 0) { lx = sg; } else if (ax == 1) { ly = sg; } else { lz = sg; }
+                    if (ua == 0) { lx = su; } else if (ua == 1) { ly = su; } else { lz = su; }
+                    if (va == 0) { lx = sv; } else if (va == 1) { ly = sv; } else { lz = sv; }
+                    float wx = d[0] * lx + d[4] * ly + d[8] * lz + d[12];
+                    float wy = d[1] * lx + d[5] * ly + d[9] * lz + d[13];
+                    float wz = d[2] * lx + d[6] * ly + d[10] * lz + d[14];
+                    px[q] = wx; py[q] = wy; pz[q] = wz;
+                    float u; float v;
+                    if (plane == 1) { u = wx; v = wz; } else if (plane == 0) { u = wz; v = -wy; } else { u = wx; v = -wy; }
+                    float shade = 1.0f;
+                    if (ax == 1 && sg < 0.0f) { shade = 0.65f; }
+                    else if (ax != 1 && GroundAoHeight > 0.0f && wy < GroundAoHeight) {
+                        float k = wy < 0.0f ? 0.0f : wy / GroundAoHeight;
+                        shade = 1.0f - GroundAoStrength + GroundAoStrength * k;
+                    }
+                    idx[q] = m.VertexC(wx, wy, wz, nx, ny, nz, u * inv, v * inv, cr * shade, cg * shade, cb * shade, 1.0f);
+                }
+                // 绕序与法线同向（外侧 CCW）
+                float ex1 = px[1] - px[0]; float ey1 = py[1] - py[0]; float ez1 = pz[1] - pz[0];
+                float ex2 = px[2] - px[0]; float ey2 = py[2] - py[0]; float ez2 = pz[2] - pz[0];
+                float cx = ey1 * ez2 - ez1 * ey2; float cy = ez1 * ex2 - ex1 * ez2; float cz = ex1 * ey2 - ey1 * ex2;
+                if (cx * nx + cy * ny + cz * nz >= 0.0f) { m.Triangle(idx[0], idx[1], idx[2]); m.Triangle(idx[0], idx[2], idx[3]); }
+                else { m.Triangle(idx[0], idx[2], idx[1]); m.Triangle(idx[0], idx[3], idx[2]); }
+            }
+        }
+        if (m.VertexCount() > 0) { meshes.Add(m); }
+        return meshes;
+    }
+}
+
+// 一组按材质烘焙好的静态网格：负责上传、主 Pass 绘制与阴影投射。
+public class BakedMeshSet {
+    private List<int> meshIds;
+    private List<PbrMaterial> mats;
+    private List<Mesh3D> pending;
+    private List<PbrMaterial> pendingMats;
+
+    public BakedMeshSet() {
+        this.meshIds = new List<int>(); this.mats = new List<PbrMaterial>();
+        this.pending = new List<Mesh3D>(); this.pendingMats = new List<PbrMaterial>();
+    }
+
+    // 烘焙一种材质的盒子（CPU 侧，可在没有画布时调用）。
+    public void AddBoxes(InstanceBuffer boxes, PbrMaterial mat) {
+        if (boxes == null || boxes.Count == 0) { return; }
+        List<Mesh3D> ms = StaticMeshBaker.BakeBoxes(boxes, mat.UvSize, mat.TintMix);
+        for (int i = 0; i < ms.Count; i = i + 1) { this.pending.Add(ms[i]); this.pendingMats.Add(mat); }
+    }
+
+    public int MeshCount() { return this.meshIds.Count + this.pending.Count; }
+
+    // 上传待上传网格（需要 GPU 画布）。
+    public void Upload(Canvas c) {
+        for (int i = 0; i < this.pending.Count; i = i + 1) {
+            int id = c.MeshUpload(this.pending[i]);
+            if (id > 0) { this.meshIds.Add(id); this.mats.Add(this.pendingMats[i]); }
+        }
+        this.pending.Clear(); this.pendingMats.Clear();
+    }
+
+    public void DrawShadows(Canvas c) {
+        this.Upload(c);
+        Mat4 id = Mat4.Identity();
+        for (int i = 0; i < this.meshIds.Count; i = i + 1) { c.ShadowDraw(this.meshIds[i], id); }
+    }
+
+    // 主 Pass（在 BeginFrame3D..EndFrame3D 内调用）。
+    public void Draw(Canvas c, Mat4 vp) {
+        this.Upload(c);
+        Mat4 id = Mat4.Identity();
+        PbrMaterial last = null;
+        for (int i = 0; i < this.meshIds.Count; i = i + 1) {
+            PbrMaterial m = this.mats[i];
+            if (m != last) { m.Bind(c); last = m; }
+            c.DrawMesh3DEx(this.meshIds[i], vp, id, unchecked((int)0xFFFFFFFF), m.Albedo);
+        }
+        PbrMaterial.Unbind(c);
+    }
+}

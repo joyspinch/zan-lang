@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Game.Graphics;
+using Game.Assets;
+
+namespace Game.Render3D;
+
+// 一件 GLB 道具：CPU 侧模型与包围盒；上传后按图元记录网格与 PBR 贴图；Instances 为摆放实例。
+public class PropAsset {
+    public string Name;
+    public GltfModel Model;
+    public bool Uploaded;
+    public List<int> MeshIds;
+    public List<PbrMaterial> Materials;
+    public float MinX; public float MinY; public float MinZ;
+    public float MaxX; public float MaxY; public float MaxZ;
+    public InstanceBuffer Instances;
+
+    public PropAsset(string name) {
+        this.Name = name;
+        this.MeshIds = new List<int>();
+        this.Materials = new List<PbrMaterial>();
+        this.Instances = new InstanceBuffer(64);
+        this.MinX = 1e9f; this.MinY = 1e9f; this.MinZ = 1e9f;
+        this.MaxX = -1e9f; this.MaxY = -1e9f; this.MaxZ = -1e9f;
+    }
+
+    public float SizeX() { return this.MaxX - this.MinX; }
+    public float SizeY() { return this.MaxY - this.MinY; }
+    public float SizeZ() { return this.MaxZ - this.MinZ; }
+
+    // 摆放矩阵：模型底面贴在 y、水平中心对准 (x,z)、绕 y 旋转、等比缩放。
+    public Mat4 Placement(float x, float y, float z, float yaw, float scale) {
+        float cx = (this.MinX + this.MaxX) * 0.5f; float cz = (this.MinZ + this.MaxZ) * 0.5f;
+        return Mat4.Mul(Mat4.Translate(x, y, z), Mat4.Mul(Mat4.RotateAxis(0.0f, 1.0f, 0.0f, yaw),
+            Mat4.Mul(Mat4.Scale(scale, scale, scale), Mat4.Translate(-cx, -this.MinY, -cz))));
+    }
+
+    // 摆放后的水平半尺寸（考虑旋转）与顶面高度。
+    public void Footprint(float yaw, float scale, out float halfX, out float halfZ, out float height) {
+        float hx = this.SizeX() * 0.5f * scale; float hz = this.SizeZ() * 0.5f * scale;
+        float c = MathF.Abs(MathF.Cos(yaw)); float s = MathF.Abs(MathF.Sin(yaw));
+        halfX = c * hx + s * hz; halfZ = s * hx + c * hz;
+        height = this.SizeY() * scale;
+    }
+}
+
+// GLB 道具库：按名字从目录加载（<dir>/<name>.glb），同名道具的全部实例一批绘制。
+// 地图生成阶段只用 CPU 数据（包围盒/摆放）；有 GPU 画布后首次绘制时上传。
+public class PropLibrary {
+    public string Directory;
+    private Dictionary<string, PropAsset> assets;
+    private List<PropAsset> order;
+
+    public PropLibrary(string directory) {
+        this.Directory = directory == null ? "" : directory;
+        this.assets = new Dictionary<string, PropAsset>();
+        this.order = new List<PropAsset>();
+    }
+
+    public List<PropAsset> All() { return this.order; }
+
+    // 加载（带缓存）；文件不存在或解析失败返回 null。
+    public PropAsset Get(string name) {
+        if (this.assets.ContainsKey(name)) { return this.assets[name]; }
+        PropAsset p = null;
+        string path = Path.Combine(this.Directory, name + ".glb");
+        if (this.Directory != "" && File.Exists(path)) {
+            GltfModel m = GltfLoader.LoadFile(path);
+            if (m != null && m.Primitives.Count > 0) { p = PropLibrary.FromModel(name, m); }
+        }
+        this.assets[name] = p;
+        if (p != null) { this.order.Add(p); }
+        return p;
+    }
+
+    // 直接注册内存中的模型（测试 / 程序生成）。
+    public PropAsset Register(string name, GltfModel m) {
+        PropAsset p = PropLibrary.FromModel(name, m);
+        this.assets[name] = p;
+        this.order.Add(p);
+        return p;
+    }
+
+    private static PropAsset FromModel(string name, GltfModel m) {
+        PropAsset p = new PropAsset(name);
+        p.Model = m;
+        for (int i = 0; i < m.Primitives.Count; i = i + 1) {
+            Mesh3D mesh = m.Primitives[i].Mesh;
+            if (mesh == null) { continue; }
+            float[] v = mesh.VertexArray();
+            int st = mesh.StrideFloats();
+            for (int k = 0; k + 2 < v.Length; k = k + st) {
+                if (v[k] < p.MinX) { p.MinX = v[k]; } if (v[k] > p.MaxX) { p.MaxX = v[k]; }
+                if (v[k + 1] < p.MinY) { p.MinY = v[k + 1]; } if (v[k + 1] > p.MaxY) { p.MaxY = v[k + 1]; }
+                if (v[k + 2] < p.MinZ) { p.MinZ = v[k + 2]; } if (v[k + 2] > p.MaxZ) { p.MaxZ = v[k + 2]; }
+            }
+        }
+        if (p.MinX > p.MaxX) { p.MinX = 0; p.MaxX = 0; p.MinY = 0; p.MaxY = 0; p.MinZ = 0; p.MaxZ = 0; }
+        return p;
+    }
+
+    // 摆一个实例，返回摆放矩阵（没有该道具返回 null）。
+    public Mat4 Place(string name, float x, float y, float z, float yaw, float scale) {
+        PropAsset p = this.Get(name);
+        if (p == null) { return null; }
+        Mat4 m = p.Placement(x, y, z, yaw, scale);
+        p.Instances.Add(m, unchecked((int)0xFFFFFFFF));
+        return m;
+    }
+
+    public void ClearInstances() {
+        for (int i = 0; i < this.order.Count; i = i + 1) { this.order[i].Instances.Clear(); }
+    }
+
+    public void Upload(Canvas c, PropAsset p) {
+        if (p == null || p.Uploaded) { return; }
+        p.Uploaded = true;
+        GltfModel m = p.Model;
+        for (int i = 0; i < m.Primitives.Count; i = i + 1) {
+            GltfPrimitive pr = m.Primitives[i];
+            if (pr.Mesh == null) { continue; }
+            int id = c.MeshUpload(pr.Mesh);
+            if (id <= 0) { continue; }
+            PbrMaterial mat = new PbrMaterial();
+            mat.UvSize = 1.0f;
+            if (pr.MaterialIndex >= 0 && pr.MaterialIndex < m.Materials.Count) {
+                GltfMaterial gm = m.Materials[pr.MaterialIndex];
+                mat.Albedo = PropLibrary.TextureKey(p, gm.BaseColorTextureIndex);
+                mat.Normal = PropLibrary.TextureKey(p, gm.NormalTextureIndex);
+                mat.Orm = PropLibrary.TextureKey(p, gm.MetallicRoughnessTextureIndex);
+                mat.Metallic = gm.MetallicFactor;
+                mat.Roughness = gm.RoughnessFactor;
+            }
+            p.MeshIds.Add(id);
+            p.Materials.Add(mat);
+        }
+    }
+
+    // glTF 纹理索引 → 已注册的纹理键（首次注册解码）。
+    public static string TextureKey(PropAsset p, int texIndex) {
+        GltfModel m = p.Model;
+        if (texIndex < 0 || texIndex >= m.Textures.Count) { return ""; }
+        int img = m.Textures[texIndex].ImageIndex;
+        if (img < 0 || img >= m.Images.Count) { return ""; }
+        GltfImageData d = m.Images[img];
+        if (d.RegisteredKey != "") { return d.RegisteredKey; }
+        return d.RegisterAsTexture("prop_" + p.Name + "_" + img.ToString());
+    }
+
+    public void DrawShadows(Canvas c) {
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            PropAsset p = this.order[i];
+            if (p.Instances.Count == 0) { continue; }
+            this.Upload(c, p);
+            for (int k = 0; k < p.MeshIds.Count; k = k + 1) { c.ShadowDrawBatch(p.MeshIds[k], p.Instances.Ptr, p.Instances.Count); }
+        }
+    }
+
+    // 主 Pass（在 BeginFrame3D..EndFrame3D 内调用）。
+    public void Draw(Canvas c, Mat4 vp) {
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            PropAsset p = this.order[i];
+            if (p.Instances.Count == 0) { continue; }
+            this.Upload(c, p);
+            for (int k = 0; k < p.MeshIds.Count; k = k + 1) {
+                PbrMaterial mat = p.Materials[k];
+                mat.Bind(c);
+                c.DrawMesh3DBatchLit(p.MeshIds[k], mat.Albedo, vp, p.Instances.Ptr, p.Instances.Count);
+            }
+        }
+        PbrMaterial.Unbind(c);
+    }
+}

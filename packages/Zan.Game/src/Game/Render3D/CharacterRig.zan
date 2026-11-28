@@ -1,0 +1,196 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Assets;
+using Game.Animation;
+
+namespace Game.Render3D;
+
+// 人形骨骼名映射（默认是常见的 Mixamo 风格命名；不同资产可改）。
+public class HumanoidBones {
+    public string Hips = "Hips";
+    public string SpineLow = "Spine";
+    public string SpineMid = "Spine01";
+    public string SpineHigh = "Spine02";
+    public string LeftUpLeg = "LeftUpLeg"; public string LeftLeg = "LeftLeg"; public string LeftFoot = "LeftFoot";
+    public string RightUpLeg = "RightUpLeg"; public string RightLeg = "RightLeg"; public string RightFoot = "RightFoot";
+    public string LeftArm = "LeftArm"; public string LeftForeArm = "LeftForeArm"; public string LeftHand = "LeftHand";
+    public string RightArm = "RightArm"; public string RightForeArm = "RightForeArm"; public string RightHand = "RightHand";
+}
+
+// 一次蒙皮绘制（主 Pass 与阴影 Pass 共用同一组骨骼矩阵）。
+public class SkinnedDraw {
+    public int Mesh;
+    public Mat4 Model;
+    public float[] Bones;
+    public int BoneCount;
+    public int Tint;
+}
+
+// 蒙皮人物：glTF 片段动画（走/跑按速度切换，相位由调用方按位移推进）+ 程序化叠加层：
+// 脊柱俯仰、蹲伏、双手 IK 持枪。模型空间约定：+y 上、+z 前（glTF），+x 为角色左侧。
+public class CharacterRig {
+    public bool Ok;
+    public int Mesh;
+    public int MeshLod;
+    public PbrMaterial Material;
+    public Skeleton Skeleton;
+    public AnimationClip Walk;
+    public AnimationClip Run;
+    public float RunThreshold = 3.6f;      // 米/秒，超过用跑步片段
+    public float IdleThreshold = 0.25f;
+    public float HandX; public float HandY; public float HandZ;   // 最近一次右手（模型空间，米）
+    private PoseBuffer pose;
+    private GltfModel model;
+    private int iSpineLow; private int iSpineMid; private int iSpineHigh;
+    private int iLUp; private int iLLeg; private int iLFoot; private int iRUp; private int iRLeg; private int iRFoot;
+    private int iLArm; private int iLFore; private int iLHand; private int iRArm; private int iRFore; private int iRHand;
+    // IK 手位（相对上胸椎，米）
+    public float RightHandFwd = 0.26f; public float RightHandSide = -0.14f; public float RightHandUp = 0.12f;
+    public float LeftHandFwd = 0.52f; public float LeftHandSide = 0.02f; public float LeftHandUp = 0.14f;
+
+    // 从 GLB 加载（lodPath 可为空）；失败 Ok = false。
+    public bool Load(Canvas c, string path, string lodPath, HumanoidBones names, string walkClip, string runClip) {
+        this.Ok = false;
+        GltfModel m = GltfLoader.LoadFile(path);
+        if (m == null || m.Skeleton == null) { return false; }
+        return this.Init(c, m, lodPath == null || lodPath == "" ? null : GltfLoader.LoadFile(lodPath), names, walkClip, runClip);
+    }
+
+    public bool Init(Canvas c, GltfModel m, GltfModel lod, HumanoidBones names, string walkClip, string runClip) {
+        this.model = m;
+        GltfPrimitive pr = CharacterRig.FirstSkinned(m);
+        if (pr == null) { return false; }
+        this.Mesh = c != null ? c.MeshUploadSkinned(pr.SkinnedMesh) : 0;
+        this.MeshLod = this.Mesh;
+        if (lod != null && c != null) {
+            GltfPrimitive lp = CharacterRig.FirstSkinned(lod);
+            if (lp != null) { int id = c.MeshUploadSkinned(lp.SkinnedMesh); if (id > 0) { this.MeshLod = id; } }
+        }
+        this.Material = new PbrMaterial();
+        if (pr.MaterialIndex >= 0 && pr.MaterialIndex < m.Materials.Count) {
+            GltfMaterial gm = m.Materials[pr.MaterialIndex];
+            this.Material.Albedo = this.TextureKey(gm.BaseColorTextureIndex);
+            this.Material.Normal = this.TextureKey(gm.NormalTextureIndex);
+            this.Material.Orm = this.TextureKey(gm.MetallicRoughnessTextureIndex);
+            this.Material.Metallic = 0.0f; this.Material.Roughness = 1.0f;
+        }
+        this.Skeleton = m.Skeleton;
+        this.pose = new PoseBuffer(this.Skeleton.Count());
+        for (int i = 0; i < m.Animations.Count; i = i + 1) {
+            AnimationClip a = m.Animations[i];
+            if (a.Name == walkClip) { this.Walk = a; } else if (a.Name == runClip) { this.Run = a; }
+        }
+        Skeleton s = this.Skeleton;
+        HumanoidBones n = names == null ? new HumanoidBones() : names;
+        this.iSpineLow = s.IndexOf(n.SpineLow); this.iSpineMid = s.IndexOf(n.SpineMid); this.iSpineHigh = s.IndexOf(n.SpineHigh);
+        this.iLUp = s.IndexOf(n.LeftUpLeg); this.iLLeg = s.IndexOf(n.LeftLeg); this.iLFoot = s.IndexOf(n.LeftFoot);
+        this.iRUp = s.IndexOf(n.RightUpLeg); this.iRLeg = s.IndexOf(n.RightLeg); this.iRFoot = s.IndexOf(n.RightFoot);
+        this.iLArm = s.IndexOf(n.LeftArm); this.iLFore = s.IndexOf(n.LeftForeArm); this.iLHand = s.IndexOf(n.LeftHand);
+        this.iRArm = s.IndexOf(n.RightArm); this.iRFore = s.IndexOf(n.RightForeArm); this.iRHand = s.IndexOf(n.RightHand);
+        this.Ok = (c == null || this.Mesh > 0) && s.IndexOf(n.Hips) >= 0;
+        return this.Ok;
+    }
+
+    private static GltfPrimitive FirstSkinned(GltfModel m) {
+        for (int i = 0; i < m.Primitives.Count; i = i + 1) { if (m.Primitives[i].IsSkinned) { return m.Primitives[i]; } }
+        return null;
+    }
+
+    private string TextureKey(int texIndex) {
+        GltfModel m = this.model;
+        if (texIndex < 0 || texIndex >= m.Textures.Count) { return ""; }
+        int img = m.Textures[texIndex].ImageIndex;
+        if (img < 0 || img >= m.Images.Count) { return ""; }
+        GltfImageData d = m.Images[img];
+        if (d.RegisteredKey != "") { return d.RegisteredKey; }
+        return d.RegisterAsTexture("rig_" + img.ToString() + "_" + m.Images.Count.ToString());
+    }
+
+    // 在模型空间绕 axis 旋转骨骼 angle（不依赖骨骼本地轴向）。
+    public void RotateWorld(int bone, Vector3 axis, float angle) {
+        if (bone < 0 || angle == 0.0f) { return; }
+        Skeleton s = this.Skeleton;
+        Bone b = s.At(bone);
+        if (b == null) { return; }
+        Quaternion parentW = s.RootTransform.Rotation;
+        int par = b.ParentIndex;
+        if (par >= 0) { parentW = s.WorldPose(par).Rotation; }
+        Transform3D local = s.LocalPose(bone);
+        Quaternion r = Quaternion.FromAxisAngle(axis, angle);
+        Quaternion inv = Quaternion.Inverse(parentW);
+        local.Rotation = Quaternion.Normalize(Quaternion.Multiply(Quaternion.Multiply(Quaternion.Multiply(inv, r), parentW), local.Rotation));
+        s.SetLocalPose(bone, local);
+        s.ComputeWorldPoses();
+    }
+
+    // 计算一帧姿态并返回骨骼矩阵。phase 为步态周期数（小数部分即片段进度），speed 米/秒。
+    public float[] Pose(float phase, float speed, float pitch, bool crouch, bool aimIk) {
+        Skeleton s = this.Skeleton;
+        s.ResetToBindPose();
+        AnimationClip clip = speed > this.RunThreshold && this.Run != null ? this.Run : this.Walk;
+        if (clip != null) {
+            float t = speed < this.IdleThreshold ? clip.Duration * 0.02f : (phase - MathF.Floor(phase)) * clip.Duration;
+            clip.ApplyTo(s, t, this.pose);
+        }
+        s.ComputeWorldPoses();
+        Vector3 right = new Vector3(1.0f, 0.0f, 0.0f);
+        if (crouch) {
+            this.RotateWorld(this.iLUp, right, -1.1f); this.RotateWorld(this.iRUp, right, -1.1f);
+            this.RotateWorld(this.iLLeg, right, 1.9f); this.RotateWorld(this.iRLeg, right, 1.9f);
+            this.RotateWorld(this.iLFoot, right, -0.8f); this.RotateWorld(this.iRFoot, right, -0.8f);
+            this.RotateWorld(this.iSpineLow, right, 0.35f);
+        }
+        float pp = -pitch * 0.3f;
+        this.RotateWorld(this.iSpineLow, right, pp); this.RotateWorld(this.iSpineMid, right, pp); this.RotateWorld(this.iSpineHigh, right, pp);
+        if (aimIk && this.iSpineHigh >= 0 && this.iRHand >= 0 && this.iLHand >= 0) {
+            Transform3D chest = s.WorldPose(this.iSpineHigh);
+            // 方向向量取刚体部分：世界姿势含根缩放时先归一化
+            Vector3 fwd = Vector3.Normalize(chest.TransformDirection(new Vector3(0.0f, 0.0f, 1.0f)));
+            Vector3 up = Vector3.Normalize(chest.TransformDirection(new Vector3(0.0f, 1.0f, 0.0f)));
+            Vector3 side = Vector3.Normalize(chest.TransformDirection(new Vector3(1.0f, 0.0f, 0.0f)));
+            Vector3 cp = chest.Position;
+            Vector3 rh = Vector3.Add(cp, Vector3.Add(Vector3.Multiply(fwd, this.RightHandFwd), Vector3.Add(Vector3.Multiply(side, this.RightHandSide), Vector3.Multiply(up, this.RightHandUp))));
+            Vector3 lh = Vector3.Add(cp, Vector3.Add(Vector3.Multiply(fwd, this.LeftHandFwd), Vector3.Add(Vector3.Multiply(side, this.LeftHandSide), Vector3.Multiply(up, this.LeftHandUp))));
+            Vector3 down = new Vector3(0.0f, -1.0f, 0.0f);
+            TwoBoneIk.Solve(s, this.iRArm, this.iRFore, this.iRHand, rh, Vector3.Add(rh, Vector3.Add(Vector3.Multiply(side, -0.6f), Vector3.Multiply(down, 0.8f))));
+            TwoBoneIk.Solve(s, this.iLArm, this.iLFore, this.iLHand, lh, Vector3.Add(lh, Vector3.Add(Vector3.Multiply(side, 0.6f), Vector3.Multiply(down, 0.8f))));
+            s.ComputeWorldPoses();
+        }
+        if (this.iRHand >= 0) {
+            Vector3 hw = s.WorldPosition(this.iRHand);
+            this.HandX = hw.X; this.HandY = hw.Y; this.HandZ = hw.Z;
+        }
+        return SkinnedMesh3D.BuildBoneMatrices(s);
+    }
+
+    // 便捷：生成一次绘制记录（distance 超过 lodDistance 用低模）。
+    public SkinnedDraw MakeDraw(Mat4 model, float[] bones, int tint, float distance, float lodDistance) {
+        SkinnedDraw d = new SkinnedDraw();
+        d.Mesh = distance > lodDistance ? this.MeshLod : this.Mesh;
+        d.Model = model; d.Bones = bones; d.BoneCount = bones.Length / 16; d.Tint = tint;
+        return d;
+    }
+
+    public void DrawShadows(Canvas c, List<SkinnedDraw> draws, int count) {
+        for (int i = 0; i < count; i = i + 1) {
+            SkinnedDraw d = draws[i];
+            c.SetBones3D(d.Bones, d.BoneCount);
+            c.ShadowDrawSkinned(d.Mesh, d.Model);
+        }
+    }
+
+    // 主 Pass（在 BeginFrame3D..EndFrame3D 内调用）。
+    public void Draw(Canvas c, Mat4 vp, List<SkinnedDraw> draws, int count) {
+        if (count == 0) { return; }
+        this.Material.Bind(c);
+        for (int i = 0; i < count; i = i + 1) {
+            SkinnedDraw d = draws[i];
+            c.SetBones3D(d.Bones, d.BoneCount);
+            c.DrawMesh3DSkinned(d.Mesh, Mat4.Mul(vp, d.Model), d.Model, d.Tint, this.Material.Albedo);
+        }
+        PbrMaterial.Unbind(c);
+    }
+}
