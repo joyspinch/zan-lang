@@ -64,19 +64,47 @@ public class RetryPolicy {
         double cap = (this.maxDelayMs > 0L) ? (double)this.maxDelayMs : 4611686018427387904.0;
         double delay = (double)this.baseDelayMs;
         if (delay > cap) { delay = cap; }
-        for (int i = 1; i < failedAttempts; i++) {
-            delay = delay * mult;
-            if (!(delay >= 0.0) || (delay - delay) != 0.0 || delay >= cap) {
-                delay = cap;
-                break;
+        if (failedAttempts > 1) {
+            if (mult == 0.0) {
+                delay = 0.0;
+            } else if (mult != 1.0) {
+                // 快速幂 O(log n) 避免 multiplier <= 1 时 failedAttempts=int.MaxValue 触发十亿次循环 DoS。
+                int exp = failedAttempts - 1;
+                double factor = mult;
+                while (exp > 0) {
+                    if ((exp & 1) != 0) {
+                        delay = delay * factor;
+                        if (!(delay >= 0.0) || (delay - delay) != 0.0 || delay >= cap) {
+                            delay = cap;
+                            break;
+                        }
+                        if (delay < 1.0 && mult < 1.0) {
+                            delay = 0.0;
+                            break;
+                        }
+                    }
+                    exp = exp >> 1;
+                    if (exp > 0) {
+                        factor = factor * factor;
+                        if (factor == 0.0) { delay = 0.0; break; }
+                        if (!(factor >= 0.0) || (factor - factor) != 0.0 || factor >= cap) {
+                            delay = cap;
+                            break;
+                        }
+                    }
+                }
             }
         }
         if (delay > cap) { delay = cap; }
         long ms = (long)delay;
         if (ms < 0L) { ms = 0L; }
         if (this.jitter && ms > 0L) {
-            // 抖动到 [0.5x, 1.5x]：既可能略早也可能略晚，但不会挤在一起。
-            double factor = 0.5 + this.rng.NextDouble();
+            // 抖动到 [0.5x, 1.5x]：既可能略早也可能略晚，但不会挤在一起；加锁保护共享 Random。
+            double rval = 0.0;
+            lock (this) {
+                rval = this.rng.NextDouble();
+            }
+            double factor = 0.5 + rval;
             double j = (double)ms * factor;
             if (j >= 4611686018427387904.0) {
                 ms = 4611686018427387904L;

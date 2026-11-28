@@ -43,6 +43,15 @@ public class Embeddings {
     // 解析 /v1/embeddings JSON 响应（按 index 归位并校验同维）；失败返回 null 并写 client.lastError。
     public static AiEmbedding ParseResponse(AiClient client, string raw,
     int expected, bool normalize) {
+        if (client == null) { return null; }
+        if (expected < 0) {
+            client.lastError = "嵌入期望数量非法";
+            return null;
+        }
+        if (raw == null || raw.Length == 0) {
+            client.lastError = "嵌入服务返回的内容无法解析";
+            return null;
+        }
         // JsonDoc.Parse 扁平线性解析，零多余树状堆分配与垃圾回收开销
         JsonDoc doc = null;
         try {
@@ -124,7 +133,7 @@ public class Embeddings {
         int p = doc.IntAt(doc.Get(u, "prompt_tokens"), 0);
         int t = doc.IntAt(doc.Get(u, "total_tokens"), 0);
         if (p <= 0 && t <= 0) { return new AiUsage(); }
-        return new AiUsage(p, t, false);
+        return new AiUsage(p > 0 ? p : t, 0, false);
     }
 
     // 向量化（不归一化）。
@@ -138,19 +147,20 @@ public class Embeddings {
         if (chunks == null) { return null; }
         List<string> texts = new List<string>();
         for (int i = 0; i < chunks.Count; i = i + 1) {
-            texts.Add(chunks[i].text);
+            AiChunk c = chunks[i];
+            texts.Add((c != null && c.text != null) ? c.text : "");
         }
         return await Embeddings.Embed(client, texts, normalize);
     }
 
-    // 就地归一化到单位长度。零向量保持零（除零会得 NaN）。
+    // 就地归一化到单位长度。零向量与非有限向量保持不变（除零/NaN 会污染后续检索）。
     public static void Normalize(List<double> v) {
         if (v == null || v.Count == 0) { return; }
         double sum = 0.0;
         for (int i = 0; i < v.Count; i = i + 1) {
             sum = sum + v[i] * v[i];
         }
-        if (sum <= 0.0) { return; }
+        if (!(sum > 0.0 && sum <= 1.0e308)) { return; }
         double inv = 1.0 / Math.Sqrt(sum);
         for (int i = 0; i < v.Count; i = i + 1) {
             v[i] = v[i] * inv;

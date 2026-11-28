@@ -102,7 +102,7 @@ public class Prometheus {
             int c = name[i] & 255;
             bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
                 || c == 95 || (allowColon && c == 58)
-                || (i > 0 && c >= 48 && c <= 57);
+                || (w > 0 && c >= 48 && c <= 57);
             if (ok) {
                 buf[w] = (byte)c;
                 w = w + 1;
@@ -217,9 +217,16 @@ public class Prometheus {
             this.types.Add(name, type);
             string header = "";
             if (helpText != null && helpText.Length > 0) {
-                string cleanHelp = NativeMemory.Find((nint)helpText, 0, 10, helpText.Length) >= 0
-                    ? helpText.Replace("\n", " ")
-                    : helpText;
+                string cleanHelp = helpText;
+                if (NativeMemory.Find((nint)cleanHelp, 0, 92, cleanHelp.Length) >= 0) {
+                    cleanHelp = cleanHelp.Replace("\\", "\\\\");
+                }
+                if (NativeMemory.Find((nint)cleanHelp, 0, 13, cleanHelp.Length) >= 0) {
+                    cleanHelp = cleanHelp.Replace("\r", " ");
+                }
+                if (NativeMemory.Find((nint)cleanHelp, 0, 10, cleanHelp.Length) >= 0) {
+                    cleanHelp = cleanHelp.Replace("\n", " ");
+                }
                 this.help.Add(name, cleanHelp);
                 header = "# HELP " + name + " " + cleanHelp + "\n# TYPE " + name + " " + type + "\n";
             } else {
@@ -368,9 +375,12 @@ public class Prometheus {
 
     public void CounterIncLabeled(string name, string helpText, double delta,
                                   List<string> labelKeys, List<string> labelValues) {
-        Sample s = this.FindOrCreate(name, "counter", helpText, labelKeys, labelValues);
-        if (s == null) { return; }
-        s.value = s.value + delta;
+        if (!(delta >= 0.0) || delta != delta) { return; }
+        lock (this) {
+            Sample s = this.FindOrCreate(name, "counter", helpText, labelKeys, labelValues);
+            if (s == null) { return; }
+            s.value = s.value + delta;
+        }
     }
 
     // 仪表：直接设值。
@@ -380,9 +390,11 @@ public class Prometheus {
 
     public void GaugeSetLabeled(string name, string helpText, double value,
                                 List<string> labelKeys, List<string> labelValues) {
-        Sample s = this.FindOrCreate(name, "gauge", helpText, labelKeys, labelValues);
-        if (s == null) { return; }
-        s.value = value;
+        lock (this) {
+            Sample s = this.FindOrCreate(name, "gauge", helpText, labelKeys, labelValues);
+            if (s == null) { return; }
+            s.value = value;
+        }
     }
 
     // 直方图：edges 升序桶上沿（如 10/50/100/500/1000，单位自定）。
@@ -391,47 +403,57 @@ public class Prometheus {
     public void HistogramObserve(string name, string helpText, List<double> edges,
                                  List<string> labelKeys, List<string> labelValues,
                                  double v) {
-        Sample s = this.FindOrCreate(name, "histogram", helpText, labelKeys, labelValues);
-        if (s == null) { return; }
-        if (s.fastEdges == null) {
-            int en = edges.Count;
-            s.bucketEdges = new List<double>();
-            s.bucketCounts = new List<long>();
-            double[] fe = new double[en];
-            long[] fc = new long[en];
-            string[] fp = new string[en];
-            bool asc = true;
-            for (int i = 0; i < en; i = i + 1) {
-                double edge = edges[i];
-                if (i > 0 && edge < fe[i - 1]) { asc = false; }
-                fe[i] = edge;
-                fc[i] = 0L;
-                fp[i] = s.name + "_bucket{le=\"" + Prometheus.FormatValue(edge) + "\"" + s.cachedLabelInner + " ";
-                s.bucketEdges.Add(edge);
-                s.bucketCounts.Add(0);
+        if (v != v) { return; }
+        lock (this) {
+            Sample s = this.FindOrCreate(name, "histogram", helpText, labelKeys, labelValues);
+            if (s == null) { return; }
+            if (s.fastEdges == null) {
+                int rawEn = edges != null ? edges.Count : 0;
+                List<double> cleanEdges = new List<double>();
+                for (int i = 0; i < rawEn; i = i + 1) {
+                    double e = edges[i];
+                    if (e != e) { continue; }
+                    cleanEdges.Add(e);
+                }
+                int en = cleanEdges.Count;
+                s.bucketEdges = new List<double>();
+                s.bucketCounts = new List<long>();
+                double[] fe = new double[en];
+                long[] fc = new long[en];
+                string[] fp = new string[en];
+                bool asc = true;
+                for (int i = 0; i < en; i = i + 1) {
+                    double edge = cleanEdges[i];
+                    if (i > 0 && edge < fe[i - 1]) { asc = false; }
+                    fe[i] = edge;
+                    fc[i] = 0L;
+                    fp[i] = s.name + "_bucket{le=\"" + Prometheus.FormatValue(edge) + "\"" + s.cachedLabelInner + " ";
+                    s.bucketEdges.Add(edge);
+                    s.bucketCounts.Add(0);
+                }
+                s.fastEdges = fe;
+                s.fastCounts = fc;
+                s.fastBucketPrefixes = fp;
+                s.edgesAscending = asc;
+                s.cachedInfPrefix = s.name + "_bucket{le=\"+Inf\"" + s.cachedLabelInner + " ";
+                s.cachedSumPrefix = s.name + "_sum" + s.cachedLabelBrace + " ";
+                s.cachedCountPrefix = s.name + "_count" + s.cachedLabelBrace + " ";
             }
-            s.fastEdges = fe;
-            s.fastCounts = fc;
-            s.fastBucketPrefixes = fp;
-            s.edgesAscending = asc;
-            s.cachedInfPrefix = s.name + "_bucket{le=\"+Inf\"" + s.cachedLabelInner + " ";
-            s.cachedSumPrefix = s.name + "_sum" + s.cachedLabelBrace + " ";
-            s.cachedCountPrefix = s.name + "_count" + s.cachedLabelBrace + " ";
-        }
-        s.hCount = s.hCount + 1;
-        s.hSum = s.hSum + v;
-        double[] be = s.fastEdges;
-        long[] bc = s.fastCounts;
-        int bn = be.Length;
-        if (s.edgesAscending) {
-            for (int i = bn - 1; i >= 0; i = i - 1) {
-                if (v > be[i]) { break; }
-                bc[i] = bc[i] + 1L;
-            }
-        } else {
-            for (int i = 0; i < bn; i = i + 1) {
-                if (v <= be[i]) {
+            s.hCount = s.hCount + 1;
+            s.hSum = s.hSum + v;
+            double[] be = s.fastEdges;
+            long[] bc = s.fastCounts;
+            int bn = be.Length;
+            if (s.edgesAscending) {
+                for (int i = bn - 1; i >= 0; i = i - 1) {
+                    if (v > be[i]) { break; }
                     bc[i] = bc[i] + 1L;
+                }
+            } else {
+                for (int i = 0; i < bn; i = i + 1) {
+                    if (v <= be[i]) {
+                        bc[i] = bc[i] + 1L;
+                    }
                 }
             }
         }
@@ -469,13 +491,25 @@ public class Prometheus {
     }
 
     private static byte[] EnsureCap(byte[] buf, int need, out nint bp) {
+        if (need < 0) {
+            throw new InvalidOperationException("Prometheus snapshot buffer overflow");
+        }
         if (need <= buf.Length) {
             bp = (nint)buf;
             return buf;
         }
-        int newCap = buf.Length * 2;
-        while (newCap < need) { newCap = newCap * 2; }
-        byte[] grown = new byte[newCap];
+        long newCap = (long)buf.Length * 2L;
+        if (newCap < 512L) { newCap = 512L; }
+        while (newCap < (long)need) {
+            newCap = newCap * 2L;
+        }
+        if (newCap > 2147483591L) {
+            if ((long)need > 2147483591L) {
+                throw new InvalidOperationException("Prometheus snapshot exceeds max buffer size");
+            }
+            newCap = 2147483591L;
+        }
+        byte[] grown = new byte[(int)newCap];
         NativeMemory.Copy((nint)grown, (nint)buf, buf.Length);
         bp = (nint)grown;
         return grown;
@@ -548,39 +582,42 @@ public class Prometheus {
     // 输出一次 # HELP/# TYPE）。直方图 bucketCounts 在 Observe 时已按
     // 累计语义写入，此处直接输出并补 +Inf 桶与 _sum/_count。
     public string Snapshot() {
-        int fc = this.familyOrder.Count;
-        if (fc == 0) { return ""; }
-        int initCap = this.metrics.Count * 256 + fc * 96;
-        if (initCap < 512) { initCap = 512; }
-        byte[] buf = new byte[initCap];
-        nint bp = (nint)buf;
-        int pos = 0;
+        lock (this) {
+            int fc = this.familyOrder.Count;
+            if (fc == 0) { return ""; }
+            long initCapL = (long)this.metrics.Count * 256L + (long)fc * 96L;
+            if (initCapL < 512L) { initCapL = 512L; }
+            if (initCapL > 67108864L) { initCapL = 67108864L; }
+            byte[] buf = new byte[(int)initCapL];
+            nint bp = (nint)buf;
+            int pos = 0;
 
-        for (int f = 0; f < fc; f = f + 1) {
-            string fname = this.familyOrder[f];
-            string hdr = null;
-            if (this.familyHeaders.TryGetValue(fname, out hdr)) {
-                pos = Prometheus.AppendStr(ref buf, ref bp, pos, hdr);
-            }
-            Sample s = null;
-            this.familyHead.TryGetValue(fname, out s);
-            while (s != null) {
-                if (s.fastEdges != null) {
-                    string[] bps = s.fastBucketPrefixes;
-                    long[] bcs = s.fastCounts;
-                    int bn = bps.Length;
-                    for (int b = 0; b < bn; b = b + 1) {
-                        pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, bps[b], bcs[b]);
-                    }
-                    pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, s.cachedInfPrefix, s.hCount);
-                    pos = Prometheus.AppendDoubleLine(ref buf, ref bp, pos, s.cachedSumPrefix, s.hSum);
-                    pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, s.cachedCountPrefix, s.hCount);
-                } else {
-                    pos = Prometheus.AppendDoubleLine(ref buf, ref bp, pos, s.cachedSamplePrefix, s.value);
+            for (int f = 0; f < fc; f = f + 1) {
+                string fname = this.familyOrder[f];
+                string hdr = null;
+                if (this.familyHeaders.TryGetValue(fname, out hdr)) {
+                    pos = Prometheus.AppendStr(ref buf, ref bp, pos, hdr);
                 }
-                s = s.familyNext;
+                Sample s = null;
+                this.familyHead.TryGetValue(fname, out s);
+                while (s != null) {
+                    if (s.fastEdges != null) {
+                        string[] bps = s.fastBucketPrefixes;
+                        long[] bcs = s.fastCounts;
+                        int bn = bps.Length;
+                        for (int b = 0; b < bn; b = b + 1) {
+                            pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, bps[b], bcs[b]);
+                        }
+                        pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, s.cachedInfPrefix, s.hCount);
+                        pos = Prometheus.AppendDoubleLine(ref buf, ref bp, pos, s.cachedSumPrefix, s.hSum);
+                        pos = Prometheus.AppendCountLine(ref buf, ref bp, pos, s.cachedCountPrefix, s.hCount);
+                    } else {
+                        pos = Prometheus.AppendDoubleLine(ref buf, ref bp, pos, s.cachedSamplePrefix, s.value);
+                    }
+                    s = s.familyNext;
+                }
             }
+            return NativeMemory.GetString(bp, 0, pos);
         }
-        return NativeMemory.GetString(bp, 0, pos);
     }
 }

@@ -52,10 +52,37 @@ public class OssConfig {
         this.callPolicy = null;
     }
 
+    // 校验主机名 / 桶名 / 区域标签（只允许 [A-Za-z0-9.-]，禁止 URL authority/Host/SSRF 注入字符）。
+    internal static bool IsSafeHostText(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 45 || c == 46;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    internal static bool IsSafeIpv6Host(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 70)
+                || (c >= 97 && c <= 102) || c == 58 || c == 46;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
     // 解析端点。返回 false 表示端点为空或格式非法；无 scheme 时默认按 HTTPS 处理。
     public bool Parse() {
         string url = this.endpoint == null ? "" : this.endpoint.Trim();
         if (url.Length == 0) { return false; }
+        for (int i = 0; i < url.Length; i = i + 1) {
+            int c = url[i] & 255;
+            if (c <= 32 || c == 127 || c == 63 || c == 35 || c == 92) { return false; }
+        }
         bool tls = true;
         if (url.StartsWith("https://")) { url = url.Substring(8); }
         else if (url.StartsWith("http://")) { url = url.Substring(7); tls = false; }
@@ -64,10 +91,12 @@ public class OssConfig {
         string hostPort = slash >= 0 ? url.Substring(0, slash) : url;
         if (hostPort.Length == 0) { return false; }
         int port = tls ? 443 : 80;
+        bool isIpv6 = false;
         if (hostPort.StartsWith("[")) {
             int close = hostPort.IndexOf("]");
             if (close <= 1) { return false; }
             string ipHost = hostPort.Substring(1, close - 1);
+            if (!OssConfig.IsSafeIpv6Host(ipHost)) { return false; }
             if (close + 1 < hostPort.Length) {
                 if ((hostPort[close + 1] & 255) != 58 || close + 2 >= hostPort.Length) { return false; }
                 int p = 0;
@@ -81,23 +110,29 @@ public class OssConfig {
                 port = p;
             }
             hostPort = ipHost;
+            isIpv6 = true;
         } else {
-            // 仅在单冒号时剥离 :port，避免把无括号 IPv6 末段误拆为端口。
+            // 仅在单冒号时剥离 :port，非法端口（如 :0 / :99999 / :abc）必须直接拒绝而非静默拼入主机名。
             int firstColon = hostPort.IndexOf(":");
             int lastColon = -1;
             for (int i = hostPort.Length - 1; i >= 0; i = i - 1) {
                 if ((hostPort[i] & 255) == 58) { lastColon = i; break; }
             }
-            if (firstColon > 0 && firstColon == lastColon && lastColon < hostPort.Length - 1) {
-                int p = 0;
-                bool digits = true;
-                for (int i = lastColon + 1; i < hostPort.Length; i = i + 1) {
-                    int c = hostPort[i] & 255;
-                    if (c < 48 || c > 57) { digits = false; break; }
-                    p = p * 10 + (c - 48);
-                    if (p >= 65536) { digits = false; break; }
-                }
-                if (digits && p > 0 && p < 65536) {
+            if (firstColon >= 0) {
+                if (firstColon == 0 || firstColon != lastColon) {
+                    // 无括号多冒号仅当为合法 IPv6 字面量时放行。
+                    if (!OssConfig.IsSafeIpv6Host(hostPort)) { return false; }
+                    isIpv6 = true;
+                } else {
+                    if (lastColon >= hostPort.Length - 1) { return false; }
+                    int p = 0;
+                    for (int i = lastColon + 1; i < hostPort.Length; i = i + 1) {
+                        int c = hostPort[i] & 255;
+                        if (c < 48 || c > 57) { return false; }
+                        p = p * 10 + (c - 48);
+                        if (p >= 65536) { return false; }
+                    }
+                    if (p <= 0 || p >= 65536) { return false; }
                     port = p;
                     hostPort = hostPort.Substring(0, lastColon);
                 }
@@ -107,10 +142,12 @@ public class OssConfig {
         // 端点里带 {bucket} 占位 = 用户指定了完整的桶主机：替换占位，
         // 并按虚拟主机风格走（客户端不再自己拼桶名前缀）。
         if (hostPort.Contains("{bucket}")) {
+            if (!OssConfig.IsSafeHostText(this.bucket)) { return false; }
             hostPort = OssConfig.Substitute(hostPort, "{bucket}", this.bucket);
             this.hostHasBucket = true;
             this.pathStyle = false;
         }
+        if (!isIpv6 && !OssConfig.IsSafeHostText(hostPort)) { return false; }
         this.endpointHost = hostPort;
         this.endpointPort = port;
         this.endpointTls = tls;

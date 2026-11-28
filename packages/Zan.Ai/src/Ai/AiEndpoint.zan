@@ -30,6 +30,9 @@ public class AiEndpoint {
     public string Canonical() {
         string scheme = this.tls ? "https://" : "http://";
         string authority = this.host;
+        if (authority != null && authority.IndexOf(":") >= 0 && !authority.StartsWith("[")) {
+            authority = "[" + authority + "]";
+        }
         if ((this.tls && this.port != 443) || (!this.tls && this.port != 80)) {
             authority = authority + ":" + Convert.ToString(this.port);
         }
@@ -38,9 +41,8 @@ public class AiEndpoint {
 
     // 解析 base URL。失败返回 null。
     //
-    // 失败的情形：没有 scheme、host 为空、路径里有 userinfo（@）或
-    // fragment（#）——这两者能骗过朴素的字符串拼接（把凭据或片段
-    // 拼进请求行）。
+    // 失败的情形：没有 scheme、host 为空、含空白/控制字符/fragment(#)/
+    // 反斜杠(\)/userinfo(@)。非法端口回落到默认端口（443/80）。
     public static AiEndpoint Parse(string url) {
         if (url == null) { return null; }
         AiEndpoint e = new AiEndpoint();
@@ -56,8 +58,12 @@ public class AiEndpoint {
         } else {
             return null;
         }
-        int hash = rest.IndexOf("#");
-        if (hash >= 0) { return null; }
+        for (int i = 0; i < rest.Length; i = i + 1) {
+            int c = rest[i] & 255;
+            if (c <= 32 || c == 127 || c == 35 || c == 92) {
+                return null;
+            }
+        }
         int slash = rest.IndexOf("/");
         string hostPort = rest;
         e.path = "";
@@ -72,8 +78,8 @@ public class AiEndpoint {
         if (plen < e.path.Length) {
             e.path = e.path.Substring(0, plen);
         }
-        // userinfo（"user:pass@host"）不合法——凭据要走 header，不进 URL。
-        if (hostPort.IndexOf("@") >= 0) { return null; }
+        // userinfo（"user:pass@host"）与权威段里的 '?' 不合法——凭据要走 header，不进 URL。
+        if (hostPort.IndexOf("@") >= 0 || hostPort.IndexOf("?") >= 0) { return null; }
         if (hostPort.StartsWith("[")) {
             int rb = hostPort.IndexOf("]");
             if (rb <= 1) { return null; }
@@ -84,7 +90,8 @@ public class AiEndpoint {
             }
         } else {
             int colon = hostPort.IndexOf(":");
-            if (colon > 0) {
+            if (colon >= 0) {
+                if (colon == 0) { return null; }
                 e.host = hostPort.Substring(0, colon);
                 string portText = hostPort.Substring(colon + 1);
                 e.port = AiEndpoint.ParsePort(portText, e.port);
@@ -96,15 +103,16 @@ public class AiEndpoint {
         return e;
     }
 
-    // 端口解析：全数字才认，否则用默认值。
+    // 端口解析：全数字且在 1..65535 之间才认，否则回落到默认值（防超长串溢出）。
     private static int ParsePort(string text, int dflt) {
-        if (text.Length == 0) { return dflt; }
+        if (text == null || text.Length == 0 || text.Length > 5) { return dflt; }
+        int p = 0;
         for (int i = 0; i < text.Length; i = i + 1) {
             int c = text[i] & 255;
             if (c < 48 || c > 57) { return dflt; }
+            p = p * 10 + (c - 48);
         }
-        long p = text.ToInt64();
         if (p < 1 || p > 65535) { return dflt; }
-        return (int)p;
+        return p;
     }
 }

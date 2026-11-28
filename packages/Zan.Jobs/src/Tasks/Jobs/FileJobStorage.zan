@@ -20,8 +20,8 @@ namespace Tasks.Jobs;
 //   存储的另一个进程通常是另一个服务实例，宁可让这次入队失败重试，
 //   也不要两个进程互相覆盖数据）。
 public class FileJobStorage : JobStorage {
-    // 所有实例共享的进程内写锁（同进程多实例也串行）。
-    static Mutex writeLock = new Mutex();
+    // 所有实例共享的进程内写锁（.rodata 常量监视器，零静态 OS Mutex 句柄泄漏）。
+    private static string writeLock = "Tasks.Jobs.FileJobStorage.writeLock";
 
     string path;
     string lockPath;
@@ -58,16 +58,13 @@ public class FileJobStorage : JobStorage {
 
     // 重新读一遍存储文件（外部改了文件、或要丢弃内存状态时用）。
     public void Reload() {
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock("");
             try {
                 this.ReloadInternal();
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
@@ -93,27 +90,40 @@ public class FileJobStorage : JobStorage {
     }
 
     public override void Append(JobRecord record) {
-        if (record == null) {
-            throw new JobException(JobError.InvalidArgs, "record is null");
+        if (record == null || record.id == null || record.id.Length == 0) {
+            throw new JobException(JobError.InvalidArgs, "record or record id is empty");
         }
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock(record.id);
             try {
                 this.AppendLocked(record);
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
+        }
+    }
+
+    public override bool TryInsert(JobRecord record) {
+        if (record == null || record.id == null || record.id.Length == 0) {
+            throw new JobException(JobError.InvalidArgs, "record or record id is empty");
+        }
+        lock (FileJobStorage.writeLock) {
+            long handle = this.AcquireFileLock(record.id);
+            try {
+                this.ReloadInternal();
+                if (this.index.ContainsKey(record.id)) { return false; }
+                this.AppendLocked(record);
+                return true;
+            } finally {
+                File.Unlock(handle);
+            }
         }
     }
 
     // 原子领取：在进程内写锁与跨进程文件锁内一次完成重放、校验与置 Processing。
     public override JobRecord Claim(string id, long now, string workerId) {
         if (id == null) { return null; }
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock(id);
             try {
                 this.ReloadInternal();
@@ -131,15 +141,12 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
     public override bool Delete(string id) {
         if (id == null) { return false; }
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock(id);
             try {
                 this.ReloadInternal();
@@ -152,15 +159,12 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
     public override bool CompleteUnlessDeleted(JobRecord record) {
-        if (record == null || record.id == null) { return false; }
-        writeLock.WaitOne();
-        try {
+        if (record == null || record.id == null || record.id.Length == 0) { return false; }
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock(record.id);
             try {
                 this.ReloadInternal();
@@ -173,14 +177,11 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
     public override List<JobRecord> Snapshot() {
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock("");
             try {
                 this.ReloadInternal();
@@ -188,8 +189,6 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
@@ -207,8 +206,7 @@ public class FileJobStorage : JobStorage {
 
     public override JobRecord Find(string id) {
         if (id == null) { return null; }
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = this.AcquireFileLock(id);
             try {
                 this.ReloadInternal();
@@ -218,8 +216,6 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 
@@ -228,8 +224,7 @@ public class FileJobStorage : JobStorage {
     // 折叠前从文件重建 index：内存 index 可能落后（同进程其它实例或另
     // 一进程已追加新任务），直接折叠内存态会把新任务从文件里抹掉。
     public override void Compact() {
-        writeLock.WaitOne();
-        try {
+        lock (FileJobStorage.writeLock) {
             long handle = File.TryLock(this.lockPath);
             if (handle == 0) {
                 throw new JobException(JobError.StorageFailure,
@@ -249,8 +244,6 @@ public class FileJobStorage : JobStorage {
             } finally {
                 File.Unlock(handle);
             }
-        } finally {
-            writeLock.ReleaseMutex();
         }
     }
 }

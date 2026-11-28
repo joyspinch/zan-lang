@@ -234,11 +234,13 @@ public class TrayIcon {
         return true;
         #elif LINUX || MACOS
         if (TrayIcon.posixLive != 0) { return false; }
+        string safePath = iconPath != null ? iconPath : "";
+        string safeTip = tooltip != null ? tooltip : "";
         TrayIcon.userCb = cb;
         #if LINUX
-        int started = TrayIcon.NativeStartPixels(ImageCodec.View(iconPath), iconPath, tooltip);
+        int started = TrayIcon.NativeStartPixels(ImageCodec.View(safePath), safePath, safeTip);
         #else
-        int started = TrayIcon.NativeStart(iconPath, tooltip);
+        int started = TrayIcon.NativeStart(safePath, safeTip);
         #endif
         if (started == 0) {
             TrayIcon.userCb = null;
@@ -285,20 +287,24 @@ public class TrayIcon {
 
     // 修改当前图标的悬停提示文本。
     public static bool SetTooltip(string tooltip) {
+        string safeTip = tooltip != null ? tooltip : "";
         #if WINDOWS
         if (TrayIcon.trayHwnd == 0) { return false; }
-        string safeTip = tooltip != null ? tooltip : "";
         TrayIcon.trayTooltip = safeTip;
         nint data = TrayIcon.BuildDataFor(TrayIcon.trayHwnd, safeTip, "", "", 0, 0);
         if (data == 0) { return false; }
-        // 仅 NIF_TIP。
-        new Span<int>(data + 20, 1)[0] = 0x0004;
-        int ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
-        NativeMemory.Free(data);
+        int ok = 0;
+        try {
+            // 仅 NIF_TIP。
+            new Span<int>(data + 20, 1)[0] = 0x0004;
+            ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
+        } finally {
+            NativeMemory.Free(data);
+        }
         return ok != 0;
         #elif LINUX || MACOS
         if (TrayIcon.posixLive == 0) { return false; }
-        return TrayIcon.NativeSetTooltip(tooltip) != 0;
+        return TrayIcon.NativeSetTooltip(safeTip) != 0;
         #else
         TrayIcon.ThrowNotSupported();
         return false;
@@ -309,14 +315,20 @@ public class TrayIcon {
     // 1 = 信息，2 = 警告，3 = 错误。`timeoutMs` 为显示时长
     // （新版 Windows 会忽略超过 30 秒的值）。
     public static bool ShowBalloon(string title, string text, int iconKind, int timeoutMs) {
+        string safeTitleArg = title != null ? title : "";
+        string safeTextArg = text != null ? text : "";
         #if WINDOWS
         if (TrayIcon.trayHwnd == 0) { return false; }
-        nint data = TrayIcon.BuildData("", title, text, iconKind, timeoutMs);
+        nint data = TrayIcon.BuildData("", safeTitleArg, safeTextArg, iconKind, timeoutMs);
         if (data == 0) { return false; }
-        // 仅 NIF_INFO。
-        new Span<int>(data + 20, 1)[0] = 0x0010;
-        int ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
-        NativeMemory.Free(data);
+        int ok = 0;
+        try {
+            // 仅 NIF_INFO。
+            new Span<int>(data + 20, 1)[0] = 0x0010;
+            ok = TrayIcon.WinShellNotifyIcon(1 /* NIM_MODIFY */, data);
+        } finally {
+            NativeMemory.Free(data);
+        }
         return ok != 0;
         #elif LINUX
         if (TrayIcon.posixLive == 0) { return false; }
@@ -332,13 +344,13 @@ public class TrayIcon {
             args.Add(Convert.ToString(timeoutMs));
         }
         args.Add("--");
-        args.Add(title);
-        args.Add(text);
+        args.Add(safeTitleArg);
+        args.Add(safeTextArg);
         return Process.CaptureSafe("notify-send", args).exitCode == 0;
         #elif MACOS
         if (TrayIcon.posixLive == 0) { return false; }
-        string safeText = (text != null ? text : "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
-        string safeTitle = (title != null ? title : "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+        string safeText = safeTextArg.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+        string safeTitle = safeTitleArg.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
         List<string> osaArgs = new List<string>();
         osaArgs.Add("-e");
         osaArgs.Add("display notification \"" + safeText + "\" with title \"" + safeTitle + "\"");
@@ -450,22 +462,25 @@ public class TrayIcon {
     // 托盘事件泵：把原生队列里的动作变成 Zan 回调。回调在这个
     // 线程上执行（与 Windows 一致）。
     private static void PosixPumpEntry() {
-        while (true) {
-            int ev = TrayIcon.NativeNextEvent(200);
-            if (ev == 0) {
-                if (TrayIcon.posixLive == 0) { break; }
-                continue;
-            }
-            if (ev < 0) { break; }              // 后端已停
-            if (ev >= 65536) {
-                if (TrayIcon.menuCb != null) {
-                    TrayIcon.menuCb(ev - 65536);
+        try {
+            while (true) {
+                int ev = TrayIcon.NativeNextEvent(200);
+                if (ev == 0) {
+                    if (TrayIcon.posixLive == 0) { break; }
+                    continue;
                 }
-            } else if (TrayIcon.userCb != null) {
-                TrayIcon.userCb(ev);
+                if (ev < 0) { break; }              // 后端已停
+                if (ev >= 65536) {
+                    TrayMenuCallback mcb = TrayIcon.menuCb;
+                    if (mcb != null) { mcb(ev - 65536); }
+                } else {
+                    TrayIconCallback ucb = TrayIcon.userCb;
+                    if (ucb != null) { ucb(ev); }
+                }
             }
+        } finally {
+            TrayIcon.posixPumpStop = 1;
         }
-        TrayIcon.posixPumpStop = 1;
     }
     #endif
 
@@ -478,39 +493,47 @@ public class TrayIcon {
         if (items == null || items.Count == 0) { return; }
         nint menu = TrayIcon.WinCreatePopupMenu();
         if (menu == 0) { return; }
-        for (int i = 0; i < items.Count; i = i + 1) {
-            TrayMenuItem it = items[i];
-            if (it == null) { continue; }
-            if (it.separator) {
-                TrayIcon.WinAppendMenuW(menu, 0x0800 /* MF_SEPARATOR */, 0, 0);
-                continue;
-            }
-            int flags = 0;                            // MF_STRING
-            if (it.disabled) { flags = flags | 0x0003; }   // MF_GRAYED|MF_DISABLED
-            if (it.checkMark) { flags = flags | 0x0008; }  // MF_CHECKED
-            nint label = Wide.Of(it.text);
-            TrayIcon.WinAppendMenuW(menu, flags, (nint)it.id, label);
-            Wide.Free(label);
-        }
-        nint pt = NativeMemory.Alloc(8);
-        int px = 0;
-        int py = 0;
+        int cmd = 0;
         try {
-            TrayIcon.ZeroMem(pt, 8);
-            TrayIcon.WinGetCursorPos(pt);
-            Span<int> xy = new Span<int>(pt, 2);
-            px = xy[0];
-            py = xy[1];
+            for (int i = 0; i < items.Count; i = i + 1) {
+                TrayMenuItem it = items[i];
+                if (it == null) { continue; }
+                if (it.separator) {
+                    TrayIcon.WinAppendMenuW(menu, 0x0800 /* MF_SEPARATOR */, 0, 0);
+                    continue;
+                }
+                int flags = 0;                            // MF_STRING
+                if (it.disabled) { flags = flags | 0x0003; }   // MF_GRAYED|MF_DISABLED
+                if (it.checkMark) { flags = flags | 0x0008; }  // MF_CHECKED
+                nint label = Wide.Of(it.text != null ? it.text : "");
+                try {
+                    TrayIcon.WinAppendMenuW(menu, flags, (nint)it.id, label);
+                } finally {
+                    Wide.Free(label);
+                }
+            }
+            nint pt = NativeMemory.Alloc(8);
+            int px = 0;
+            int py = 0;
+            try {
+                TrayIcon.ZeroMem(pt, 8);
+                TrayIcon.WinGetCursorPos(pt);
+                Span<int> xy = new Span<int>(pt, 2);
+                px = xy[0];
+                py = xy[1];
+            } finally {
+                NativeMemory.Free(pt);
+            }
+            TrayIcon.WinSetForegroundWindow(TrayIcon.trayHwnd);
+            cmd = TrayIcon.WinTrackPopupMenuEx(menu, 0x0100 | 0x0002 | 0x0080,
+                                               px, py, TrayIcon.trayHwnd, 0);
         } finally {
-            NativeMemory.Free(pt);
+            TrayIcon.WinDestroyMenu(menu);
         }
-        TrayIcon.WinSetForegroundWindow(TrayIcon.trayHwnd);
-        int cmd = TrayIcon.WinTrackPopupMenuEx(menu, 0x0100 | 0x0002 | 0x0080,
-                                              px, py, TrayIcon.trayHwnd, 0);
-        TrayIcon.WinDestroyMenu(menu);
         // 菜单关闭后需要一条空消息，否则下一次弹出可能不响应。
         TrayIcon.WinPostMessageW(TrayIcon.trayHwnd, 0 /* WM_NULL */, 0, 0);
-        if (cmd > 0 && TrayIcon.menuCb != null) { TrayIcon.menuCb(cmd); }
+        TrayMenuCallback mcb = TrayIcon.menuCb;
+        if (cmd > 0 && mcb != null) { mcb(cmd); }
     }
 
     // 在托盘线程上运行：注册窗口类，创建
@@ -563,18 +586,22 @@ public class TrayIcon {
             }
         } finally {
             NativeMemory.Free(msg);
+            TrayIcon.Notify(2 /* NIM_DELETE */);
+            TrayIcon.DestroyIcons();
+            TrayIcon.WinDestroyWindow(hwnd);
+            TrayIcon.trayHwnd = 0;
         }
-        TrayIcon.Notify(2 /* NIM_DELETE */);
-        TrayIcon.DestroyIcons();
-        TrayIcon.WinDestroyWindow(hwnd);
-        TrayIcon.trayHwnd = 0;
     }
 
     // 注册 "TaskbarCreated" 广播消息并返回其消息 id。
     private static int RegisterTaskbarCreated() {
         nint name = Wide.Of("TaskbarCreated");
-        int msg = TrayIcon.WinRegisterWindowMessageW(name);
-        Wide.Free(name);
+        int msg = 0;
+        try {
+            msg = TrayIcon.WinRegisterWindowMessageW(name);
+        } finally {
+            Wide.Free(name);
+        }
         return msg;
     }
 
@@ -585,10 +612,13 @@ public class TrayIcon {
         if (TrayIcon.trayIcon != 0) { return; }
         nint icon = 0;
         int owned = 0;
-        if (TrayIcon.trayIconPath != "") {
+        if (TrayIcon.trayIconPath != null && TrayIcon.trayIconPath != "") {
             nint wpath = Wide.Of(TrayIcon.trayIconPath);
-            icon = TrayIcon.WinLoadImageW(0, wpath, 1, 0, 0, 0x50);
-            Wide.Free(wpath);
+            try {
+                icon = TrayIcon.WinLoadImageW(0, wpath, 1, 0, 0, 0x50);
+            } finally {
+                Wide.Free(wpath);
+            }
             if (icon != 0) {
                 owned = 1;
                 TrayIcon.trayIconSource = "path";
@@ -643,13 +673,16 @@ public class TrayIcon {
 
     private static void SetVersionHwnd(nint hwnd) {
         nint data = NativeMemory.Alloc(976);
-        TrayIcon.ZeroMem(data, 976);
-        new Span<int>(data, 1)[0] = 976;
-        new Span<long>(data + 8, 1)[0] = hwnd;
-        new Span<int>(data + 16, 1)[0] = 1;       // uID
-        new Span<int>(data + 816, 1)[0] = 4;      // NOTIFYICON_VERSION_4
-        TrayIcon.WinShellNotifyIcon(4 /* NIM_SETVERSION */, data);
-        NativeMemory.Free(data);
+        try {
+            TrayIcon.ZeroMem(data, 976);
+            new Span<int>(data, 1)[0] = 976;
+            new Span<long>(data + 8, 1)[0] = hwnd;
+            new Span<int>(data + 16, 1)[0] = 1;       // uID
+            new Span<int>(data + 816, 1)[0] = 4;      // NOTIFYICON_VERSION_4
+            TrayIcon.WinShellNotifyIcon(4 /* NIM_SETVERSION */, data);
+        } finally {
+            NativeMemory.Free(data);
+        }
     }
 
     // 以当前图标状态发送 Shell_NotifyIconW 消息。
@@ -661,8 +694,12 @@ public class TrayIcon {
         string tip = TrayIcon.trayTooltip != null ? TrayIcon.trayTooltip : "";
         nint data = TrayIcon.BuildDataFor(hwnd, tip, "", "", 0, 0);
         if (data == 0) { return false; }
-        int ok = TrayIcon.WinShellNotifyIcon(msg, data);
-        NativeMemory.Free(data);
+        int ok = 0;
+        try {
+            ok = TrayIcon.WinShellNotifyIcon(msg, data);
+        } finally {
+            NativeMemory.Free(data);
+        }
         return ok != 0;
     }
 
@@ -711,13 +748,16 @@ public class TrayIcon {
 
     // 将 Zan 字符串复制到固定大小的 WCHAR 字段（units 含结尾 NUL）。
     private static void PutWide(nint dst, string s, int units) {
-        if (s == null || s == "") { return; }
+        if (s == null || s == "" || units <= 0) { return; }
         nint w = Wide.Of(s);
-        int len = Wide.Length(w);
-        if (len >= units) { len = units - 1; }
-        NativeMemory.Copy(dst, w, len * 2);
-        new Span<ushort>(dst + len * 2, 1)[0] = 0;
-        Wide.Free(w);
+        try {
+            int len = Wide.Length(w);
+            if (len >= units) { len = units - 1; }
+            NativeMemory.Copy(dst, w, len * 2);
+            new Span<ushort>(dst + len * 2, 1)[0] = 0;
+        } finally {
+            Wide.Free(w);
+        }
     }
 
     // 把 p 起 bytes 字节清零。
@@ -731,13 +771,14 @@ public class TrayIcon {
         if (msg == 0x8000 /* WM_APP */) {
             // NOTIFYICON_VERSION_4 下 LOWORD(lParam) 为鼠标事件消息，HIWORD(lParam) 为图标 ID。
             int l = (int)lp & 0xFFFF;
-            if (TrayIcon.userCb != null) {
+            TrayIconCallback ucb = TrayIcon.userCb;
+            if (ucb != null) {
                 int action = 0;
                 if (l == 0x0201) { action = 1; }      // WM_LBUTTONDOWN
                 if (l == 0x0203) { action = 2; }      // WM_LBUTTONDBLCLK
                 if (l == 0x0204) { action = 3; }      // WM_RBUTTONDOWN
                 if (l == 0x0207) { action = 4; }      // WM_MBUTTONDOWN
-                if (action != 0) { TrayIcon.userCb(action); }
+                if (action != 0) { ucb(action); }
             }
             // 右键抬起 / 菜单键：弹出托盘菜单。用抬起而不是按下，
             // 与系统托盘图标一致。

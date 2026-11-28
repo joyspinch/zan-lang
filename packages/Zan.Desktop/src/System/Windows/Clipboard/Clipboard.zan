@@ -77,9 +77,13 @@ public class Clipboard {
             Clipboard.WinGlobalFree(mem);
             return false;
         }
-        Clipboard.WinEmptyClipboard();
-        nint ok = Clipboard.WinSetClipboardData(format, mem);
-        Clipboard.WinCloseClipboard();
+        nint ok = 0;
+        try {
+            Clipboard.WinEmptyClipboard();
+            ok = Clipboard.WinSetClipboardData(format, mem);
+        } finally {
+            Clipboard.WinCloseClipboard();
+        }
         if (ok == 0) {
             Clipboard.WinGlobalFree(mem);
             return false;
@@ -400,6 +404,7 @@ public class Clipboard {
         bool committed = false;
         try {
             int units = Wide.Length(wide);
+            if (units < 0 || units > 0x3FFFFFFE) { return false; }
             mem = Clipboard.WinGlobalAlloc(2 /*GMEM_MOVEABLE*/, (units + 1) * 2);
             if (mem == 0) { return false; }
             nint dst = Clipboard.WinGlobalLock(mem);
@@ -425,8 +430,11 @@ public class Clipboard {
     public static void Clear() {
         #if WINDOWS
         if (Clipboard.WinOpenClipboardRetry() != 0) {
-            Clipboard.WinEmptyClipboard();
-            Clipboard.WinCloseClipboard();
+            try {
+                Clipboard.WinEmptyClipboard();
+            } finally {
+                Clipboard.WinCloseClipboard();
+            }
         }
         #else
         int tool = Clipboard.PosixTool();
@@ -500,6 +508,7 @@ public class Clipboard {
         // file:// URI，CRLF 分隔
         StringBuilder sb = new StringBuilder();
         for (int k = 0; k < paths.Count; k = k + 1) {
+            if (paths[k] == null || paths[k].Length == 0) { continue; }
             sb.Append(Clipboard.FileUri(paths[k]) + "\r\n");
         }
         return Clipboard.PosixWrite(Clipboard.PosixTool(),
@@ -520,7 +529,7 @@ public class Clipboard {
                 if (count < 0) { count = 0; }
                 for (int i = 0; i < count; i = i + 1) {
                     int len = Clipboard.WinDragQueryFileW(hdrop, i, 0, 0);
-                    if (len < 0) { continue; }
+                    if (len < 0 || len > 0x3FFFFFFD) { continue; }
                     nint buf = NativeMemory.Alloc((len + 1) * 2 + 2);
                     try {
                         Clipboard.WinDragQueryFileW(hdrop, i, buf, len + 1);
@@ -556,14 +565,17 @@ public class Clipboard {
         List<int> list = new List<int>();
         #if WINDOWS
         if (Clipboard.WinOpenClipboardRetry() == 0) { return list; }
-        int fmt = 0;
-        bool done = false;
-        while (!done) {
-            fmt = Clipboard.WinEnumClipboardFormats(fmt);
-            if (fmt == 0) { done = true; }
-            else { list.Add(fmt); }
+        try {
+            int fmt = 0;
+            bool done = false;
+            while (!done) {
+                fmt = Clipboard.WinEnumClipboardFormats(fmt);
+                if (fmt == 0) { done = true; }
+                else { list.Add(fmt); }
+            }
+        } finally {
+            Clipboard.WinCloseClipboard();
         }
-        Clipboard.WinCloseClipboard();
         #else
         // POSIX 上格式是 MIME 字符串，没有数值 id；报告这里能用
         // Windows 常量表达的那两个，其余请用 MimeTypes()
@@ -585,10 +597,15 @@ public class Clipboard {
     // 注册（或查找）自定义格式名。返回的
     // id 在进程生命周期内保持稳定。
     public static int RegisterFormat(string name) {
+        if (name == null || name.Length == 0) { return 0; }
         #if WINDOWS
         nint w = Wide.Of(name);
-        int id = Clipboard.WinRegisterClipboardFormat(w);
-        Wide.Free(w);
+        int id = 0;
+        try {
+            id = Clipboard.WinRegisterClipboardFormat(w);
+        } finally {
+            Wide.Free(w);
+        }
         return id;
         #else
         // 在 X11/Wayland 上格式就是 MIME 字符串本身，不存在"注册后得到一个
@@ -663,6 +680,7 @@ public class Clipboard {
 
     // 本地路径 -> file:// URI（uri-list 需要百分号转义）。
     public static string FileUri(string path) {
+        if (path == null || path.Length == 0) { return ""; }
         string full = path;
         if (!Path.IsPathRooted(full)) {
             full = Path.Combine(Directory.GetCurrentDirectory(), full);
@@ -703,7 +721,7 @@ public class Clipboard {
 
     // file:// URI -> 本地路径；不是本机 file URI 时返回 ""。
     public static string PathFromUri(string uri) {
-        if (!uri.StartsWith("file://")) { return ""; }
+        if (uri == null || !uri.StartsWith("file://")) { return ""; }
         string rest = uri.Substring(7, uri.Length - 7);
         // file://host/path：空 host 与 localhost 才是本机文件，不能把远端路径当本机。
         int slash = rest.IndexOf("/");

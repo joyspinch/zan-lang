@@ -39,23 +39,26 @@ public class Power {
         // BatteryFullLifeTime(4).
         nint buf = NativeMemory.Alloc(16);
         PowerStatus s = new PowerStatus();
+        s.batteryPercent = -1;
+        s.batteryLifeSeconds = -1;
         try {
-            Power.WinGetSystemPowerStatus(buf);
+            NativeMemory.Fill(buf, 0, 16);
+            if (Power.WinGetSystemPowerStatus(buf) == 0) { return s; }
             Span<byte> b = new Span<byte>(buf, 16);
             Span<int> w = new Span<int>(buf + 4, 2);
-            int ac = b[0];
-            int flag = b[1];
-            int pct = b[2];
+            int ac = b[0] & 255;
+            int flag = b[1] & 255;
+            int pct = b[2] & 255;
             // ACLineStatus：1 = 在线（AC），0 = 离线（电池）。
-            s.onBattery = ac != 1;
-            if (pct == 255) { s.batteryPercent = -1; }  // 未知
+            s.onBattery = ac == 0;
+            if (pct == 255 || pct > 100) { s.batteryPercent = -1; }  // 未知
             else { s.batteryPercent = pct; }
-            if (flag == 255) {
-                // 系统没有电池。
+            if (flag == 255 || (flag & 128) != 0) {
+                // 系统没有电池（BATTERY_FLAG_NO_BATTERY = 128）或状态未知（255）。
                 s.batteryPercent = -1;
             }
             int life = w[0];
-            if (life == 0xFFFFFFFF) { s.batteryLifeSeconds = -1; }
+            if (life == 0xFFFFFFFF || life < 0) { s.batteryLifeSeconds = -1; }
             else { s.batteryLifeSeconds = life; }
         } finally {
             NativeMemory.Free(buf);
@@ -79,16 +82,22 @@ public class Power {
         }
         string status = Power.SysClass("status");
         s.onBattery = status == "Discharging";
-        int energyNow = Power.SysInt("energy_now");
-        int energyFull = Power.SysInt("energy_full");
-        int powerNow = Power.SysInt("power_now");
-        if (energyFull > 0 && energyNow >= 0) {
-            s.batteryPercent = energyNow * 100 / energyFull;
-            if (s.batteryPercent > 100) { s.batteryPercent = 100; }
+        long energyNow = Power.SysLong("energy_now");
+        long energyFull = Power.SysLong("energy_full");
+        long powerNow = Power.SysLong("power_now");
+        if (energyFull > 0L && energyNow >= 0L) {
+            long pct = energyNow > 92233720368547758L
+                ? (energyNow / (energyFull / 100L > 0L ? energyFull / 100L : 1L))
+                : (energyNow * 100L / energyFull);
+            if (pct > 100L) { pct = 100L; }
+            s.batteryPercent = (int)pct;
         }
-        if (powerNow > 0 && energyNow > 0) {
+        if (powerNow > 0L && energyNow > 0L) {
             // energy_now 单位为 µWh，power_now 单位为 µW -> 先得到小时，再换算为秒。
-            s.batteryLifeSeconds = (long)energyNow * 3600 / powerNow;
+            long sec = energyNow > 2562047788015215L
+                ? (energyNow / powerNow) * 3600L
+                : (energyNow * 3600L) / powerNow;
+            s.batteryLifeSeconds = sec;
         }
         return s;
     }
@@ -128,21 +137,23 @@ public class Power {
         return "";
     }
 
-    // 读数字属性；缺失或非法时为 -1。
-    private static int SysInt(string field) {
+    // 读长整型数字属性；缺失或非法时为 -1。
+    private static long SysLong(string field) {
         string v = Power.SysClass(field);
-        if (v == "") { return -1; }
-        return Power.ParseInt(v);
+        if (v == "") { return -1L; }
+        return Power.ParseLong(v);
     }
 
-    // 十进制解析为 int；空串或含非数字返回 -1。
-    private static int ParseInt(string s) {
-        if (s == null || s.Length == 0) { return -1; }
-        int v = 0;
+    // 十进制解析为非负 long；空串、含非数字或溢出返回 -1。
+    private static long ParseLong(string s) {
+        if (s == null || s.Length == 0) { return -1L; }
+        long v = 0L;
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
-            if (c < 0x30 || c > 0x39) { return -1; }
-            v = v * 10 + (c - 0x30);
+            if (c < 0x30 || c > 0x39) { return -1L; }
+            long d = (long)(c - 0x30);
+            if (v > (9223372036854775807L - d) / 10L) { return -1L; }
+            v = v * 10L + d;
         }
         return v;
     }
@@ -174,17 +185,17 @@ public class Power {
         int pctMark = text.IndexOf("%;", 0);
         if (pctMark > 0) {
             int e = pctMark - 1;
-            int v = 0;
-            int mul = 1;
+            long v = 0L;
+            long mul = 1L;
             while (e >= 0 && (text[e] & 255) >= 48
-                   && (text[e] & 255) <= 57) {
-                v = v + ((text[e] & 255) - 48) * mul;
-                mul = mul * 10;
+                   && (text[e] & 255) <= 57 && mul <= 1000L) {
+                v = v + (long)((text[e] & 255) - 48) * mul;
+                mul = mul * 10L;
                 e = e - 1;
             }
-            if (mul > 1) {
-                s.batteryPercent = v;
-                if (s.batteryPercent > 100) { s.batteryPercent = 100; }
+            if (mul > 1L) {
+                if (v > 100L) { v = 100L; }
+                s.batteryPercent = (int)v;
             }
         }
         // 续航："H:MM remaining"；"(no estimate)" 时冒号缺失。
@@ -199,13 +210,13 @@ public class Power {
                 e = e - 1;
             }
             if (colon > 0) {
-                int hours = 0;
-                int mul = 1;
+                long hours = 0L;
+                long mul = 1L;
                 int e2 = colon - 1;
                 while (e2 >= 0 && (text[e2] & 255) >= 48
-                       && (text[e2] & 255) <= 57) {
-                    hours = hours + ((text[e2] & 255) - 48) * mul;
-                    mul = mul * 10;
+                       && (text[e2] & 255) <= 57 && mul <= 100000L) {
+                    hours = hours + (long)((text[e2] & 255) - 48) * mul;
+                    mul = mul * 10L;
                     e2 = e2 - 1;
                 }
                 int minutes = -1;
@@ -217,8 +228,8 @@ public class Power {
                     minutes = ((text[colon + 1] & 255) - 48) * 10
                         + ((text[colon + 2] & 255) - 48);
                 }
-                if (mul > 1 && minutes >= 0) {
-                    s.batteryLifeSeconds = hours * 3600 + minutes * 60;
+                if (mul > 1L && minutes >= 0) {
+                    s.batteryLifeSeconds = hours * 3600L + (long)minutes * 60L;
                 }
             }
         }

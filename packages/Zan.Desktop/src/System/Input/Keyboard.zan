@@ -103,8 +103,8 @@ public class Keyboard {
     // 将 `text` 作为字面 Unicode 文本输入——与键盘布局无关，
     // 对 CJK 和符号安全（使用 KEYEVENTF_UNICODE 而非 VK 码）。
     public static void SendText(string text) {
+        if (text == null || text.Length == 0) { return; }
         #if WINDOWS
-        if (text == null) { return; }
         int i = 0;
         int len = text.Length;
         while (i < len) {
@@ -152,45 +152,48 @@ public class Keyboard {
         return;
         #endif
         List<int> held = new List<int>();
-        int i = 0;
-        int len = macro.Length;
-        while (i < len) {
-            int b0 = macro[i] & 255;
-            if (b0 == 123) { // '{'
-                int close = macro.IndexOf("}", i + 1);
-                if (close < 0) { break; }  // 花括号未闭合：停止
-                string name = macro.Substring(i + 1, close - i - 1);
-                int vk = Keyboard.VK(name);
-                if (vk != 0) {
-                    Keyboard.Down(vk);
-                    held.Add(vk);
-                }
-                i = close + 1;
-            } else if (b0 == 125) { // '}'
-                i = i + 1;  // 多余的右花括号：忽略
-            } else {
-                // 直到下一个花括号（或末尾）的字面文本段。
-                int b = macro.IndexOf("{", i);
-                if (b < 0) { b = len; }
-                if (b - i == 1) {
-                    int c = macro[i] & 255;
-                    if ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
-                        || (c >= 0x30 && c <= 0x39)) {
-                        Keyboard.Press((c >= 0x61 && c <= 0x7A) ? (c - 0x20) : c);
-                        i = b;
-                        continue;
+        try {
+            int i = 0;
+            int len = macro.Length;
+            while (i < len) {
+                int b0 = macro[i] & 255;
+                if (b0 == 123) { // '{'
+                    int close = macro.IndexOf("}", i + 1);
+                    if (close < 0) { break; }  // 花括号未闭合：停止
+                    string name = macro.Substring(i + 1, close - i - 1);
+                    int vk = Keyboard.VK(name);
+                    if (vk != 0) {
+                        Keyboard.Down(vk);
+                        held.Add(vk);
                     }
+                    i = close + 1;
+                } else if (b0 == 125) { // '}'
+                    i = i + 1;  // 多余的右花括号：忽略
+                } else {
+                    // 直到下一个花括号（或末尾）的字面文本段。
+                    int b = macro.IndexOf("{", i);
+                    if (b < 0) { b = len; }
+                    if (b - i == 1) {
+                        int c = macro[i] & 255;
+                        if ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+                            || (c >= 0x30 && c <= 0x39)) {
+                            Keyboard.Press((c >= 0x61 && c <= 0x7A) ? (c - 0x20) : c);
+                            i = b;
+                            continue;
+                        }
+                    }
+                    string text = macro.Substring(i, b - i);
+                    if (text != "") { Keyboard.SendText(text); }
+                    i = b;
                 }
-                string text = macro.Substring(i, b - i);
-                if (text != "") { Keyboard.SendText(text); }
-                i = b;
             }
-        }
-        // 按按下的相反顺序释放修饰键。
-        int j = held.Count - 1;
-        while (j >= 0) {
-            Keyboard.Up(held[j]);
-            j = j - 1;
+        } finally {
+            // 按按下的相反顺序释放修饰键，避免异常路径导致修饰键卡死。
+            int j = held.Count - 1;
+            while (j >= 0) {
+                Keyboard.Up(held[j]);
+                j = j - 1;
+            }
         }
     }
 
@@ -293,6 +296,7 @@ public class Keyboard {
     // 修饰键、功能键、导航键以及单个字母/数字；
     // 未知名称返回 0。
     public static int VK(string name) {
+        if (name == null || name.Length == 0) { return 0; }
         string n = name.ToUpper();
         if (n == "CTRL" || n == "CONTROL") { return 0x11; }
         if (n == "SHIFT") { return 0x10; }
@@ -569,14 +573,14 @@ public class Keyboard {
     }
     #endif
 
-    // `v` 的小写十六进制（无前导零），用于 VK-0x 显示名称。
+    // `v` 的小写十六进制（无前导零，按无符号 32 位展开），用于 VK-0x 显示名称。
     private static string Hex(int v) {
         if (v == 0) { return "0"; }
         byte[] buf = new byte[8];
         int pos = 8;
-        int n = v;
+        long n = (long)(uint)v;
         while (n > 0) {
-            int d = n & 15;
+            int d = (int)(n & 15L);
             pos = pos - 1;
             buf[pos] = (byte)(d < 10 ? d + 48 : d + 87);
             n = n >> 4;
@@ -607,16 +611,17 @@ public class Keyboard {
         return (int)(Encoding.DecodeCodePointFast(ch, 0) & 0xFFFFFFFFL);
     }
 
-    // 解析非负十进制整数；格式错误返回 -1。
+    // 解析非负十进制整数；格式错误或溢出返回 -1。
     private static int ParseInt(string s) {
         if (s == null || s.Length == 0) { return -1; }
-        int v = 0;
+        long v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
             if (c < 0x30 || c > 0x39) { return -1; }
-            v = v * 10 + (c - 0x30);
+            v = v * 10L + (long)(c - 0x30);
+            if (v > 2147483647L) { return -1; }
         }
-        return v;
+        return (int)v;
     }
 
     // 0..25 对应 "A".."Z"。

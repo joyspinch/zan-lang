@@ -125,7 +125,7 @@ public class GeckoNative {
     public static nint XulMod = 0;
     public static nint EmbedMod = 0;
     static bool loaded = false;
-    static object loadLock = new object();
+    private static string loadLock = "Browser.Firefox.GeckoNative.loadLock";
 
     static bool IsAbsoluteDir(string p) {
         if (p == null || p.Length == 0) { return false; }
@@ -159,26 +159,18 @@ public class GeckoNative {
     public static nint PfnDefaultViewConfig = 0;
 
     public static bool EnsureLoaded() {
-        if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
-        lock (loadLock) {
+        lock (GeckoNative.loadLock) {
             if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
 
-            // 优先受控绝对安装路径与显式环境变量，相对路径兜底置后，降低 DLL 预加载劫持风险
+            // 仅从显式环境变量或受控系统绝对安装路径查找，拒绝硬编码开发路径与相对路径劫持
             List<string> searchPaths = new List<string>();
             string envDir = Interop.EnvVar("ZAN_GECKO_DIR");
-            if (envDir != null && envDir.Length > 0) {
+            if (envDir != null && envDir.Length > 0 && IsAbsoluteDir(envDir)) {
                 searchPaths.Add(envDir);
             }
-            searchPaths.Add("D:/project/firefox/sdk/bin/Release");
-            searchPaths.Add("D:/project/firefox/sdk/bin");
-            searchPaths.Add("D:/project/firefox/dist/bin");
-            searchPaths.Add("D:/project/firefox/dist/zan-browser-windows-x64");
-            searchPaths.Add("D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin");
             searchPaths.Add("/Applications/Firefox.app/Contents/MacOS");
             searchPaths.Add("/usr/lib/firefox");
             searchPaths.Add("/usr/local/lib");
-            searchPaths.Add("../dist/zan-browser-windows-x64");
-            searchPaths.Add("bin");
 
             string[] embedNames = new string[] {
                 "gecko_embed.dll",
@@ -302,6 +294,8 @@ public class FirefoxAgentTab : IDisposable {
     int contextId;
     int nextEvalId;
     bool evalBusy;
+    bool disposed;
+    int activeNativeCalls;
     Queue<AsyncGate> evalWaiters;
 
     public FirefoxAgentTab(nint handle, int userContextId) {
@@ -309,15 +303,43 @@ public class FirefoxAgentTab : IDisposable {
         this.contextId = userContextId;
         this.nextEvalId = 1000;
         this.evalBusy = false;
+        this.disposed = false;
+        this.activeNativeCalls = 0;
         this.evalWaiters = new Queue<AsyncGate>();
+    }
+
+    private nint AcquireNativeHandle() {
+        lock (this) {
+            if (this.disposed || this.viewHandle == 0) { return 0; }
+            this.activeNativeCalls = this.activeNativeCalls + 1;
+            return this.viewHandle;
+        }
+    }
+
+    private void ReleaseNativeHandle() {
+        nint toDestroy = 0;
+        lock (this) {
+            this.activeNativeCalls = this.activeNativeCalls - 1;
+            if (this.disposed && this.activeNativeCalls == 0 && this.viewHandle != 0) {
+                toDestroy = this.viewHandle;
+                this.viewHandle = 0;
+            }
+        }
+        if (toDestroy != 0 && GeckoNative.PfnDestroy != 0) {
+            GeckoActionFn fn = (GeckoActionFn)GeckoNative.PfnDestroy;
+            fn(toDestroy);
+        }
     }
 
     public void Dispose() {
         nint h = 0;
         List<AsyncGate> pending = null;
         lock (this) {
-            h = this.viewHandle;
-            this.viewHandle = 0;
+            this.disposed = true;
+            if (this.activeNativeCalls == 0 && this.viewHandle != 0) {
+                h = this.viewHandle;
+                this.viewHandle = 0;
+            }
             this.evalBusy = false;
             if (this.evalWaiters.Count() > 0) {
                 pending = new List<AsyncGate>();
@@ -337,86 +359,142 @@ public class FirefoxAgentTab : IDisposable {
         }
     }
 
-    private async void AcquireEvalLock() {
-        AsyncGate gate = null;
-        lock (this) {
-            if (!this.evalBusy) {
-                this.evalBusy = true;
-                return;
+    private async bool AcquireEvalLock() {
+        while (true) {
+            AsyncGate gate = null;
+            lock (this) {
+                if (this.disposed || this.viewHandle == 0) { return false; }
+                if (!this.evalBusy) {
+                    this.evalBusy = true;
+                    return true;
+                }
+                gate = new AsyncGate();
+                this.evalWaiters.Enqueue(gate);
             }
-            gate = new AsyncGate();
-            this.evalWaiters.Enqueue(gate);
+            try {
+                await gate.Wait();
+            } finally {
+                gate.Close();
+            }
         }
-        await gate.Wait();
     }
 
     private void ReleaseEvalLock() {
         AsyncGate next = null;
         lock (this) {
+            this.evalBusy = false;
             if (this.evalWaiters.Count() > 0) {
                 next = this.evalWaiters.Dequeue();
-            } else {
-                this.evalBusy = false;
             }
         }
         if (next != null) { next.Signal(); }
     }
 
-    public nint GetHandle() { return this.viewHandle; }
+    public nint GetHandle() {
+        lock (this) { return this.disposed ? 0 : this.viewHandle; }
+    }
     public int GetContextId() { return this.contextId; }
 
     public int GetViewId() {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetViewId == 0) return 0;
-        GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetViewId;
-        return fn(this.viewHandle);
+        if (GeckoNative.PfnGetViewId == 0) return 0;
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return 0;
+        try {
+            GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetViewId;
+            return fn(h);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public void Navigate(string url) {
-        if (this.viewHandle == 0 || GeckoNative.PfnNavigate == 0) return;
-        GeckoNavigateFn fn = (GeckoNavigateFn)GeckoNative.PfnNavigate;
-        fn(this.viewHandle, url);
+        if (GeckoNative.PfnNavigate == 0) return;
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return;
+        try {
+            GeckoNavigateFn fn = (GeckoNavigateFn)GeckoNative.PfnNavigate;
+            fn(h, url == null ? "" : url);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public string Title() {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetTitle == 0) return "";
-        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetTitle;
-        return fn(this.viewHandle);
+        if (GeckoNative.PfnGetTitle == 0) return "";
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return "";
+        try {
+            GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetTitle;
+            return fn(h);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public string Url() {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetUrl == 0) return "";
-        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetUrl;
-        return fn(this.viewHandle);
+        if (GeckoNative.PfnGetUrl == 0) return "";
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return "";
+        try {
+            GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetUrl;
+            return fn(h);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public int ExecuteScriptAsync(string script) {
-        if (this.viewHandle == 0 || GeckoNative.PfnExecuteScript == 0) return -1;
-        int id = 0;
-        lock (this) {
-            this.nextEvalId = this.nextEvalId + 1;
-            id = this.nextEvalId;
+        if (GeckoNative.PfnExecuteScript == 0) return -1;
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return -1;
+        try {
+            int id = 0;
+            lock (this) {
+                this.nextEvalId = this.nextEvalId + 1;
+                id = this.nextEvalId;
+            }
+            GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)GeckoNative.PfnExecuteScript;
+            fn(h, script == null ? "" : script, id);
+            return id;
+        } finally {
+            this.ReleaseNativeHandle();
         }
-        GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)GeckoNative.PfnExecuteScript;
-        fn(this.viewHandle, script, id);
-        return id;
     }
 
     public bool IsDone(int evalId) {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalId == 0) return false;
-        GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetLastEvalId;
-        return fn(this.viewHandle) == evalId;
+        if (GeckoNative.PfnGetLastEvalId == 0) return false;
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return false;
+        try {
+            GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetLastEvalId;
+            return fn(h) == evalId;
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public string GetResult() {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalResult == 0) return "";
-        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetLastEvalResult;
-        return fn(this.viewHandle);
+        if (GeckoNative.PfnGetLastEvalResult == 0) return "";
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return "";
+        try {
+            GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetLastEvalResult;
+            return fn(h);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     public bool GetSuccess() {
-        if (this.viewHandle == 0 || GeckoNative.PfnGetLastEvalSuccess == 0) return false;
-        GeckoGetBoolFn fn = (GeckoGetBoolFn)GeckoNative.PfnGetLastEvalSuccess;
-        return fn(this.viewHandle);
+        if (GeckoNative.PfnGetLastEvalSuccess == 0) return false;
+        nint h = this.AcquireNativeHandle();
+        if (h == 0) return false;
+        try {
+            GeckoGetBoolFn fn = (GeckoGetBoolFn)GeckoNative.PfnGetLastEvalSuccess;
+            return fn(h);
+        } finally {
+            this.ReleaseNativeHandle();
+        }
     }
 
     // =========================================================================
@@ -427,17 +505,18 @@ public class FirefoxAgentTab : IDisposable {
     /// 核心异步非阻塞求值 (基于 await Task.Delay 协程挂起，零线程开销，让出事件循环；按标签页串行化防止单槽 lastEvalId 竞态)
     /// </summary>
     public async string EvalAsync(string script, int timeoutMs = 8000) {
-        await this.AcquireEvalLock();
+        if (!await this.AcquireEvalLock()) { return ""; }
         try {
             int id = this.ExecuteScriptAsync(script);
             if (id < 0) return "";
-            int elapsed = 0;
-            while (elapsed < timeoutMs) {
+            long elapsed = 0L;
+            long limit = timeoutMs < 0 ? 0L : (long)timeoutMs;
+            while (elapsed < limit) {
                 if (this.IsDone(id)) {
                     return this.GetResult();
                 }
                 await Task.Delay(16);
-                elapsed = elapsed + 16;
+                elapsed = elapsed + 16L;
             }
             return "";
         } finally {
@@ -570,18 +649,21 @@ public class FirefoxAgentTab : IDisposable {
     /// 异步结果驱动全分支竞速等待状态机 (成功/报错/消失/跳转全分支竞速，抛弃低效 Sleep)
     /// </summary>
     public async string WaitForOutcomeAsync(string success = "", string error = "", string gone = "", string url = "", int timeoutMs = 10000) {
+        int safeTimeout = timeoutMs < 0 ? 0 : timeoutMs;
         StringBuilder sb = new StringBuilder();
         sb.Append("ZanAgent.waitForOutcome({");
         bool hasField = false;
-        if (success != "") { sb.Append(" success: "); sb.Append(JsQuote(success)); hasField = true; }
-        if (error != "") { if (hasField) { sb.Append(","); } sb.Append(" error: "); sb.Append(JsQuote(error)); hasField = true; }
-        if (gone != "") { if (hasField) { sb.Append(","); } sb.Append(" gone: "); sb.Append(JsQuote(gone)); hasField = true; }
-        if (url != "") { if (hasField) { sb.Append(","); } sb.Append(" url: "); sb.Append(JsQuote(url)); hasField = true; }
+        if (success != null && success != "") { sb.Append(" success: "); sb.Append(JsQuote(success)); hasField = true; }
+        if (error != null && error != "") { if (hasField) { sb.Append(","); } sb.Append(" error: "); sb.Append(JsQuote(error)); hasField = true; }
+        if (gone != null && gone != "") { if (hasField) { sb.Append(","); } sb.Append(" gone: "); sb.Append(JsQuote(gone)); hasField = true; }
+        if (url != null && url != "") { if (hasField) { sb.Append(","); } sb.Append(" url: "); sb.Append(JsQuote(url)); hasField = true; }
         if (hasField) { sb.Append(","); }
         sb.Append(" timeoutMs: ");
-        sb.Append(timeoutMs.ToString());
+        sb.Append(safeTimeout.ToString());
         sb.Append(" });");
-        return await this.EvalAsync(sb.ToString(), timeoutMs + 1000);
+        long evalTimeout = (long)safeTimeout + 1000L;
+        int clamped = evalTimeout > 2147483647L ? 2147483647 : (int)evalTimeout;
+        return await this.EvalAsync(sb.ToString(), clamped);
     }
 
     /// <summary>

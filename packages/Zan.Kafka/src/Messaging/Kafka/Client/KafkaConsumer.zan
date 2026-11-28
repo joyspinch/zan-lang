@@ -53,12 +53,14 @@ public class KafkaConsumer {
         KafkaReader r = await this.conn.SendRequestAsync(KafkaConstants.API_LIST_OFFSETS, 1, w.ToBytes());
         if (r == null) { return -1L; }
 
+        if (r.Remaining() < 4) { return -1L; }
         int topicCount = r.ReadArrayHeader();
-        if (topicCount <= 0) { return -1L; }
+        if (topicCount <= 0 || r.Remaining() < 2) { return -1L; }
 
         string respTopic = r.ReadString();
+        if (r.Remaining() < 4) { return -1L; }
         int partCount = r.ReadArrayHeader();
-        if (partCount <= 0) { return -1L; }
+        if (partCount <= 0 || r.Remaining() < 22) { return -1L; }
 
         int respPart = r.ReadInt32();
         int errCode = r.ReadInt16();
@@ -115,13 +117,15 @@ public class KafkaConsumer {
 
         // 3. 解析 FetchResponse v5（分区头含 last_stable_offset 与
         //    log_start_offset，随后是 aborted_transactions 数组）
+        if (r.Remaining() < 8) { this.lastErrorCode = KafkaConstants.ERR_NETWORK_EXCEPTION; return result; }
         int throttleTimeMs = r.ReadInt32();
         int topicCount = r.ReadArrayHeader();
-        if (topicCount <= 0) { return result; }
+        if (topicCount <= 0 || r.Remaining() < 2) { return result; }
 
         string respTopic = r.ReadString();
+        if (r.Remaining() < 4) { this.lastErrorCode = KafkaConstants.ERR_NETWORK_EXCEPTION; return result; }
         int partCount = r.ReadArrayHeader();
-        if (partCount <= 0) { return result; }
+        if (partCount <= 0 || r.Remaining() < 34) { this.lastErrorCode = KafkaConstants.ERR_NETWORK_EXCEPTION; return result; }
 
         int respPart = r.ReadInt32();
         int errCode = r.ReadInt16();
@@ -133,6 +137,7 @@ public class KafkaConsumer {
 
         // aborted_transactions 数组（按剩余字节校验防 DoS）
         int abortCount = r.ReadArrayHeader();
+        if (abortCount < 0) { return result; }
         if (abortCount > 0) {
             if (abortCount > r.Remaining() / 16) { return result; }
             for (int a = 0; a < abortCount && r.Remaining() >= 16; a = a + 1) {
@@ -140,6 +145,7 @@ public class KafkaConsumer {
                 long firstOff = r.ReadInt64();
             }
         }
+        if (r.Remaining() < 4) { return result; }
 
         // record_set 二进制消息块 (32-bit length prefix + RecordBatch bytes)
         byte[] recordSetBytes = r.ReadBytes();

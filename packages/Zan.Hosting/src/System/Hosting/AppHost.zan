@@ -17,6 +17,7 @@ public class AppHost : IDisposable {
     public int stopFailures = 0;
     public int stoppedCount = 0;
     private bool disposed = false;
+    private int gateWaiters = 0;
 
     public AppHost() { }
 
@@ -82,9 +83,14 @@ public class AppHost : IDisposable {
     // 请求关闭。Cancel 先置位、再放行等待者，两者顺序不能反——先 Signal
     // 后 Cancel 会让 Run 醒来时仍看到"未取消"而重新挂起。
     public void RequestStop() {
-        if (this.disposed) { return; }
-        if (this.shutdown != null) { this.shutdown.Cancel(); }
-        Gate g = this.gate;
+        CancellationTokenSource cts = null;
+        Gate g = null;
+        lock (this) {
+            if (this.disposed) { return; }
+            cts = this.shutdown;
+            g = this.gate;
+        }
+        if (cts != null) { cts.Cancel(); }
         if (g != null) { g.SignalAll(); }
     }
 
@@ -92,10 +98,29 @@ public class AppHost : IDisposable {
     public async void Run() {
         if (this.disposed) { return; }
         await this.StartAsync();
-        while (!this.disposed && this.shutdown != null && !this.shutdown.Token.IsCancellationRequested) {
-            Gate g = this.gate;
-            if (g == null) { break; }
-            await g.Wait();
+        while (true) {
+            Gate g = null;
+            lock (this) {
+                if (this.disposed || this.shutdown == null || this.shutdown.Token.IsCancellationRequested) {
+                    break;
+                }
+                g = this.gate;
+                if (g == null) { break; }
+                this.gateWaiters = this.gateWaiters + 1;
+            }
+            try {
+                await g.Wait();
+            } finally {
+                Gate closeNow = null;
+                lock (this) {
+                    this.gateWaiters = this.gateWaiters - 1;
+                    if (this.disposed && this.gateWaiters == 0 && this.gate == g) {
+                        closeNow = this.gate;
+                        this.gate = null;
+                    }
+                }
+                if (closeNow != null) { closeNow.Close(); }
+            }
         }
         await this.StopAsync();
     }
@@ -115,8 +140,11 @@ public class AppHost : IDisposable {
     // 等待（进程退出前不会为它再等下去）。
     private async bool StopOne(IHostedService s) {
         long h = 0;
+        CancellationTokenSource cts = null;
+        lock (this) { cts = this.shutdown; }
+        CancellationToken ct = cts != null ? cts.Token : CancellationToken.None;
         try {
-            h = Task.Spawn(s.StopAsync(this.shutdown.Token));
+            h = Task.Spawn(s.StopAsync(ct));
         } catch (Exception _e) {
             return false;
         } catch {
@@ -132,19 +160,29 @@ public class AppHost : IDisposable {
     }
 
     public void Dispose() {
-        if (this.disposed) { return; }
-        this.disposed = true;
-        CancellationTokenSource cts = this.shutdown;
-        this.shutdown = null;
+        CancellationTokenSource cts = null;
+        Gate signalGate = null;
+        Gate closeGate = null;
+        lock (this) {
+            if (this.disposed) { return; }
+            this.disposed = true;
+            cts = this.shutdown;
+            this.shutdown = null;
+            signalGate = this.gate;
+            if (this.gate != null && this.gateWaiters == 0) {
+                closeGate = this.gate;
+                this.gate = null;
+            }
+        }
         if (cts != null) {
             cts.Cancel();
             cts.Dispose();
         }
-        Gate g = this.gate;
-        this.gate = null;
-        if (g != null) {
-            g.SignalAll();
-            g.Close();
+        if (signalGate != null) {
+            signalGate.SignalAll();
+        }
+        if (closeGate != null) {
+            closeGate.Close();
         }
     }
 }

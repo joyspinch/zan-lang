@@ -30,8 +30,14 @@ public class AiStream {
     public static async AiStreamResult Pump(HttpClient http, string path, string body,
     AiStreamFn onEvent, AiStreamParserFn parse) {
         AiStreamResult res = new AiStreamResult();
+        if (http == null || parse == null) {
+            res.error = "流式请求参数无效";
+            return res;
+        }
+        string reqPath = path == null ? "" : path;
+        string reqBody = body == null ? "" : body;
         SseSink sink = SseSink.ToMemory();
-        long producer = Task.Spawn(http.PostSseToSinkAsync(path, body, sink));
+        long producer = 0;
 
         StringBuilder text = new StringBuilder();
         List<AiToolSlot> slots = new List<AiToolSlot>();
@@ -39,6 +45,7 @@ public class AiStream {
         bool stopped = false;
         bool failed = false;
         try {
+            producer = Task.Spawn(http.PostSseToSinkAsync(reqPath, reqBody, sink));
             while (true) {
                 SseDelivery d = await sink.TakeCo();
                 if (d.data.Length > 0) {
@@ -87,7 +94,7 @@ public class AiStream {
                 }
             }
             if (!res.usageReported) {
-                res.usage = new AiUsage(AiClient.EstimateTokens(body),
+                res.usage = new AiUsage(AiClient.EstimateTokens(reqBody),
                     AiClient.EstimateTokens(res.text), true);
             }
         } finally {
@@ -99,16 +106,18 @@ public class AiStream {
     // 仅在 producer 退出后释放 sink，避免写入悬空互斥量。
     internal static async void ReleaseSink(long producer, SseSink sink) {
         if (sink == null) { return; }
-        if (Task.IsDone(producer) == 0) {
-            sink.Abort();
-        }
-        int fast = 50;
-        while (Task.IsDone(producer) == 0) {
-            if (fast > 0) {
-                await Task.Delay(4);
-                fast = fast - 1;
-            } else {
-                await Task.Delay(16);
+        if (producer != 0) {
+            if (Task.IsDone(producer) == 0) {
+                sink.Abort();
+            }
+            int fast = 50;
+            while (Task.IsDone(producer) == 0) {
+                if (fast > 0) {
+                    await Task.Delay(4);
+                    fast = fast - 1;
+                } else {
+                    await Task.Delay(16);
+                }
             }
         }
         sink.Dispose();
@@ -128,17 +137,18 @@ public class AiStream {
                 res.error = e.error;
                 return -1;
             }
-            if (e.kind == "delta") { text.Append(e.text); }
+            if (e.kind == "delta" && e.text != null) { text.Append(e.text); }
             if (e.kind == "tool") { AiStream.ApplyTool(slots, e); }
             if (e.kind == "usage") {
                 // 增量合并输入/输出 token（Anthropic 分两帧下发）。
                 if (e.inputTokens > 0) { res.usage.promptTokens = e.inputTokens; }
                 if (e.outputTokens > 0) { res.usage.completionTokens = e.outputTokens; }
-                res.usage.totalTokens = res.usage.promptTokens + res.usage.completionTokens;
+                long sum = (long)res.usage.promptTokens + (long)res.usage.completionTokens;
+                res.usage.totalTokens = sum > 2147483647L ? 2147483647 : (int)sum;
                 res.usage.estimated = false;
                 res.usageReported = true;
             }
-            if (e.kind == "done" && e.finishReason.Length > 0) {
+            if (e.kind == "done" && e.finishReason != null && e.finishReason.Length > 0) {
                 res.finishReason = e.finishReason;
             }
             if (onEvent != null && !onEvent(e)) { return 0; }

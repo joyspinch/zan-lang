@@ -19,19 +19,22 @@ public class WechatPayV3Client {
     bool requireResponseSignature;
 
     public WechatPayV3Client(WechatPayV3Config config) {
+        if (config == null) {
+            throw new ArgumentException("WechatPayV3Config 不能为空");
+        }
         this.config = config;
         this.transport = new WechatApiTransport("api.mch.weixin.qq.com");
-        this.merchantKey = RsaKey.FromPrivatePem(config.MerchantPrivateKeyPem);
+        this.merchantKey = RsaKey.FromPrivatePem(config.MerchantPrivateKeyPem == null ? "" : config.MerchantPrivateKeyPem);
         if (this.merchantKey == null || !this.merchantKey.HasPrivateKey()) {
             throw new ArgumentException("MerchantPrivateKeyPem 不是有效的 RSA 私钥");
         }
         this.platformKeys = new WechatPayPlatformKeyStore();
         this.platformLock = new object();
-        this.defaultPlatformSerial = config.PlatformSerialNumber;
+        this.defaultPlatformSerial = config.PlatformSerialNumber == null ? "" : config.PlatformSerialNumber;
         this.requireResponseSignature = config.RequireResponseSignature;
-        if (config.PlatformSerialNumber.Length > 0
-            && config.PlatformPublicKeyPem.Length > 0) {
-            this.platformKeys.Add(config.PlatformSerialNumber,
+        if (this.defaultPlatformSerial.Length > 0
+            && config.PlatformPublicKeyPem != null && config.PlatformPublicKeyPem.Length > 0) {
+            this.platformKeys.Add(this.defaultPlatformSerial,
                                   config.PlatformPublicKeyPem);
         }
     }
@@ -138,6 +141,9 @@ public class WechatPayV3Client {
     public async WechatRawResponse RequestMultipartAsync(string method, string path,
                                                          string query,
                                                          WechatMultipart multipart) {
+        if (multipart == null) {
+            throw new ArgumentException("WechatMultipart 不能为空");
+        }
         string body = multipart.Body();
         return await this.RequestAsync(method, path, query, body,
                                        multipart.ContentType());
@@ -187,26 +193,30 @@ public class WechatPayV3Client {
     }
 
     public bool VerifyResponse(WechatRawResponse response) {
+        if (response == null) { return false; }
         string timestamp = response.Header("Wechatpay-Timestamp");
         string nonce = response.Header("Wechatpay-Nonce");
         string signature = response.Header("Wechatpay-Signature");
         string serial = response.Header("Wechatpay-Serial");
         bool requireSig;
         lock (this.platformLock) { requireSig = this.requireResponseSignature; }
-        if (timestamp.Length == 0 || nonce.Length == 0 || signature.Length == 0) {
+        if (timestamp == null || timestamp.Length == 0
+            || nonce == null || nonce.Length == 0
+            || signature == null || signature.Length == 0) {
             return !requireSig;
         }
         if (!WechatPayV3Client.TimestampFresh(timestamp)) { return false; }
         RsaKey key = this.PlatformKey(serial);
         if (key == null) { return !requireSig; }
-        string message = timestamp + "\n" + nonce + "\n" + response.Body + "\n";
+        string body = response.Body == null ? "" : response.Body;
+        string message = timestamp + "\n" + nonce + "\n" + body + "\n";
         return key.VerifySha256(message, signature);
     }
 
     // 通知/响应时间戳必须新鲜：|now - ts| ≤ 300 秒（官方建议窗口），
     // 截获的历史"支付成功"通知不能无限期重放。非纯十进制一律拒绝。
     public static bool TimestampFresh(string timestamp) {
-        if (timestamp.Length == 0 || timestamp.Length > 12) { return false; }
+        if (timestamp == null || timestamp.Length == 0 || timestamp.Length > 12) { return false; }
         long ts = 0;
         for (int i = 0; i < timestamp.Length; i = i + 1) {
             int c = timestamp[i] & 255;
@@ -222,9 +232,10 @@ public class WechatPayV3Client {
     public bool VerifyNotification(string timestamp, string nonce, string body,
                                    string signature, string serial) {
         if (!WechatPayV3Client.TimestampFresh(timestamp)) { return false; }
+        if (nonce == null || signature == null || signature.Length == 0) { return false; }
         RsaKey key = this.PlatformKey(serial);
         if (key == null) { return false; }
-        string message = timestamp + "\n" + nonce + "\n" + body + "\n";
+        string message = timestamp + "\n" + nonce + "\n" + (body == null ? "" : body) + "\n";
         return key.VerifySha256(message, signature);
     }
 
@@ -234,10 +245,12 @@ public class WechatPayV3Client {
                                                 string expectedSerial,
                                                 string publicKeyPem) {
         if (!WechatPayV3Client.TimestampFresh(timestamp)) { return false; }
-        if (expectedSerial.Length > 0 && serial != expectedSerial) { return false; }
+        if (nonce == null || signature == null || signature.Length == 0
+            || publicKeyPem == null || publicKeyPem.Length == 0) { return false; }
+        if (expectedSerial != null && expectedSerial.Length > 0 && serial != expectedSerial) { return false; }
         RsaKey key = RsaKey.FromPublicPem(publicKeyPem);
         if (key == null) { return false; }
-        string message = timestamp + "\n" + nonce + "\n" + body + "\n";
+        string message = timestamp + "\n" + nonce + "\n" + (body == null ? "" : body) + "\n";
         return key.VerifySha256(message, signature);
     }
 
@@ -246,17 +259,17 @@ public class WechatPayV3Client {
                                                string signature, string serial) {
         if (!this.VerifyNotification(timestamp, nonce, body, signature, serial)) {
             throw new WechatException("tenpay.signatureInvalid",
-                "微信支付通知签名或时间戳校验失败", body);
+                "微信支付通知签名或时间戳校验失败", body == null ? "" : body);
         }
         WechatPayNotification notice = WechatPayNotification.Parse(body);
         return notice.DecryptResource(this);
     }
 
     public RsaKey PlatformKey(string serial) {
-        if (serial.Length > 0) { return this.platformKeys.Get(serial); }
+        if (serial != null && serial.Length > 0) { return this.platformKeys.Get(serial); }
         string defSerial;
         lock (this.platformLock) { defSerial = this.defaultPlatformSerial; }
-        if (defSerial.Length > 0) {
+        if (defSerial != null && defSerial.Length > 0) {
             RsaKey configured = this.platformKeys.Get(defSerial);
             if (configured != null) { return configured; }
         }
@@ -271,19 +284,23 @@ public class WechatPayV3Client {
 
     public static string DecryptResourceWithKey(string apiKey, string ciphertextBase64,
                                          string nonce, string associatedData) {
-        if (apiKey.Length != 32) {
+        if (apiKey == null || apiKey.Length != 32) {
             throw new ArgumentException("API 密钥必须是 32 字节");
         }
+        if (ciphertextBase64 == null || ciphertextBase64.Length == 0 || nonce == null || nonce.Length != 12) {
+            throw new ArgumentException("微信支付 AES-GCM 密文或 nonce 无效");
+        }
+        string aad = associatedData == null ? "" : associatedData;
         List<int> totalLen = new List<int>(); totalLen.Add(0);
         byte[] encrypted = Base64.Decode(ciphertextBase64, totalLen);
-        if (encrypted == null || totalLen[0] < 16 || nonce.Length != 12) {
+        if (encrypted == null || totalLen[0] < 16 || totalLen[0] > encrypted.Length) {
             throw new ArgumentException("微信支付 AES-GCM 密文或 nonce 无效");
         }
         int cipherLen = totalLen[0] - 16;
         string tag = encrypted.ToStr(cipherLen, 16);
         List<int> ok = new List<int>(); ok.Add(0);
         byte[] plain = AesGcm.Decrypt(apiKey, 32, nonce,
-            associatedData, associatedData.Length, encrypted, cipherLen, tag, ok);
+            aad, aad.Length, encrypted, cipherLen, tag, ok);
         if (plain == null || ok[0] == 0) {
             throw new WechatException("tenpay.decryptFailed",
                                       "微信支付 AES-GCM 标签验证失败", "");
@@ -314,10 +331,11 @@ public class WechatPayV3Client {
 
     // 生成小程序/JSAPI 调起微信支付（wx.requestPayment / WeixinJSBridge）所需 JSON 参数。
     public string BuildJsapiPayParams(string appId, string prepayId) {
-        string useAppId = appId.Length > 0 ? appId : this.config.AppId;
+        string useAppId = (appId != null && appId.Length > 0) ? appId : this.config.AppId;
+        string safePrepay = prepayId == null ? "" : prepayId;
         long ts = DateTime.UtcNow().ToUnixSeconds();
         string nonce = WechatPayV3Client.RandomNonceHex();
-        string pkg = "prepay_id=" + prepayId;
+        string pkg = "prepay_id=" + safePrepay;
         string paySign = this.SignAppMessage(useAppId, pkg, ts, nonce);
         JsonValue obj = JsonValue.NewObject();
         obj.Put("appId", JsonValue.NewStr(useAppId));
@@ -331,15 +349,16 @@ public class WechatPayV3Client {
 
     // 生成原生 App 调起微信支付所需 JSON 参数。
     public string BuildAppPayParams(string appId, string partnerId, string prepayId) {
-        string useAppId = appId.Length > 0 ? appId : this.config.AppId;
-        string usePartner = partnerId.Length > 0 ? partnerId : this.config.MerchantId;
+        string useAppId = (appId != null && appId.Length > 0) ? appId : this.config.AppId;
+        string usePartner = (partnerId != null && partnerId.Length > 0) ? partnerId : this.config.MerchantId;
+        string safePrepay = prepayId == null ? "" : prepayId;
         long ts = DateTime.UtcNow().ToUnixSeconds();
         string nonce = WechatPayV3Client.RandomNonceHex();
-        string sign = this.SignAppMessage(useAppId, prepayId, ts, nonce);
+        string sign = this.SignAppMessage(useAppId, safePrepay, ts, nonce);
         JsonValue obj = JsonValue.NewObject();
         obj.Put("appid", JsonValue.NewStr(useAppId));
         obj.Put("partnerid", JsonValue.NewStr(usePartner));
-        obj.Put("prepayid", JsonValue.NewStr(prepayId));
+        obj.Put("prepayid", JsonValue.NewStr(safePrepay));
         obj.Put("package", JsonValue.NewStr("Sign=WXPay"));
         obj.Put("noncestr", JsonValue.NewStr(nonce));
         obj.Put("timestamp", JsonValue.NewStr(Convert.ToString(ts)));

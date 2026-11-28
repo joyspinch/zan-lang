@@ -85,27 +85,38 @@ internal class AiHttp : IDisposable {
         return p;
     }
 
-    // 连接入缓存（客户端在设置完鉴权/策略头之后调用）；超容量上限时淘汰最早条目（延迟关闭防并发在途请求踩坏）。
-    public void CachePut(string key, HttpClient http) {
+    // 连接入缓存（客户端在设置完鉴权/策略头之后调用）；若并发竞争已有同键条目，
+    // 返回已有实例并立即在锁外关闭未发布副本；超容量上限时淘汰最早条目（延迟至 Close 安全关闭）。
+    public HttpClient CacheGetOrPut(string key, HttpClient candidate) {
+        HttpClient toCloseNow = null;
+        HttpClient winner = candidate;
         lock (this.cacheLock) {
-            HttpClient prev = null;
-            if (this.clients.TryGetValue(key, out prev)) {
-                if (prev != null && prev != http) { this.retired.Add(prev); }
-                this.clients[key] = http;
-                return;
-            }
-            while (this.clients.Count >= AiHttp.MaxCachedClients && this.keyOrder.Count > 0) {
-                string oldest = this.keyOrder[0];
-                this.keyOrder.RemoveAt(0);
-                HttpClient oldClient = null;
-                if (this.clients.TryGetValue(oldest, out oldClient)) {
-                    this.clients.Remove(oldest);
-                    if (oldClient != null) { this.retired.Add(oldClient); }
+            HttpClient existing = null;
+            if (this.clients.TryGetValue(key, out existing) && existing != null) {
+                winner = existing;
+                if (candidate != null && candidate != existing) {
+                    toCloseNow = candidate;
                 }
+            } else {
+                while (this.clients.Count >= AiHttp.MaxCachedClients && this.keyOrder.Count > 0) {
+                    string oldest = this.keyOrder[0];
+                    this.keyOrder.RemoveAt(0);
+                    HttpClient oldClient = null;
+                    if (this.clients.TryGetValue(oldest, out oldClient)) {
+                        this.clients.Remove(oldest);
+                        if (oldClient != null) { this.retired.Add(oldClient); }
+                    }
+                }
+                this.clients[key] = candidate;
+                this.keyOrder.Add(key);
             }
-            this.clients[key] = http;
-            this.keyOrder.Add(key);
         }
+        if (toCloseNow != null) { toCloseNow.Close(); }
+        return winner;
+    }
+
+    public void CachePut(string key, HttpClient http) {
+        this.CacheGetOrPut(key, http);
     }
 
     // 新建一个裸 HttpClient（按端点选 TLS/明文），**不入缓存**——

@@ -52,10 +52,12 @@ public class Display {
         #elif LINUX
         List<string> dargs = new List<string>();
         ProcessResult r = Process.CaptureSafe("xdpyinfo", dargs);
-        for (int i = 0; i < r.lines.Count; i = i + 1) {
-            string line = r.lines[i];
-            if (line.IndexOf("depth of root window") >= 0) {
-                return Display.FirstInt(line);
+        if (r.lines != null) {
+            for (int i = 0; i < r.lines.Count; i = i + 1) {
+                string line = r.lines[i];
+                if (line != null && line.IndexOf("depth of root window") >= 0) {
+                    return Display.FirstInt(line);
+                }
             }
         }
         return 0;
@@ -84,12 +86,14 @@ public class Display {
     public static List<DisplayInfo> Monitors() {
         List<DisplayInfo> list = new List<DisplayInfo>();
         #if WINDOWS
-        Display.monitorResults = list;
-        Display.monitorProc = Display.WinMonitorProc;
-        try {
-            Display.WinEnumDisplayMonitors(0, 0, Display.monitorProc, 0);
-        } finally {
-            Display.monitorResults = null;
+        lock (Display.enumLock) {
+            Display.monitorResults = list;
+            Display.monitorProc = Display.WinMonitorProc;
+            try {
+                Display.WinEnumDisplayMonitors(0, 0, Display.monitorProc, 0);
+            } finally {
+                Display.monitorResults = null;
+            }
         }
         #elif MACOS
         JsonValue snapshot = Display.MacSnapshot();
@@ -284,13 +288,18 @@ public class Display {
 
     // 一行里的刷新率（四舍五入到整数 Hz；拿不到时为 0）。
     private static int RateOf(string line) {
+        if (line == null) { return 0; }
         // "60.02*+" / "60.000000 Hz (current)"
         int i = 0;
         while (i < line.Length) {
             if (Display.IsDigit(line[i] & 255)) {
-                int s = i;
-                while (i < line.Length && Display.IsDigit(line[i] & 255)) { i = i + 1; }
-                int whole = Convert.ToInt(line.Substring(s, i - s));
+                long whole = 0;
+                bool overflow = false;
+                while (i < line.Length && Display.IsDigit(line[i] & 255)) {
+                    whole = whole * 10L + (long)((line[i] & 255) - 48);
+                    if (whole > 2147483646L) { overflow = true; }
+                    i = i + 1;
+                }
                 int frac = 0;
                 if (i < line.Length && line[i] == 46) {   // '.'
                     i = i + 1;
@@ -300,8 +309,9 @@ public class Display {
                     while (i < line.Length && Display.IsDigit(line[i] & 255)) {
                         i = i + 1;
                     }
-                    if (frac >= 5) { whole = whole + 1; }
-                    return whole;
+                    if (overflow) { return 0; }
+                    if (frac >= 5) { whole = whole + 1L; }
+                    return (int)whole;
                 }
                 // 没有小数部分的整数不是刷新率（那是模式宽度）
                 if (i < line.Length && line[i] == 120) { i = i + 1; }   // 'x'
@@ -318,12 +328,18 @@ public class Display {
     // 一行里的所有十进制整数（按出现顺序）。
     private static List<int> Ints(string line) {
         List<int> nums = new List<int>();
+        if (line == null) { return nums; }
         int i = 0;
         while (i < line.Length) {
             if (Display.IsDigit(line[i] & 255)) {
-                int s = i;
-                while (i < line.Length && Display.IsDigit(line[i] & 255)) { i = i + 1; }
-                nums.Add(Convert.ToInt(line.Substring(s, i - s)));
+                long v = 0;
+                bool overflow = false;
+                while (i < line.Length && Display.IsDigit(line[i] & 255)) {
+                    v = v * 10L + (long)((line[i] & 255) - 48);
+                    if (v > 2147483647L) { overflow = true; }
+                    i = i + 1;
+                }
+                if (!overflow) { nums.Add((int)v); }
             } else {
                 i = i + 1;
             }
@@ -356,6 +372,9 @@ public class Display {
     [DllImport("user32", EntryPoint = "MonitorFromPoint")]
     private static extern nint WinMonitorFromPoint(nint pt, int flags);
 
+    // 串行化 Win32 EnumDisplayMonitors 对静态结果列表的写入（静态 .rodata 字符串避免堆锁泄漏）。
+    static string enumLock = "System.Management.Display.enumLock";
+
     // 原生显示器枚举回调（WINAPI）。
     static MonitorEnumProc monitorProc;
 
@@ -364,8 +383,10 @@ public class Display {
     // 枚举回调：读 MONITORINFOEXW 与该屏当前 DEVMODEW 组装 DisplayInfo；
     // 返回 1 继续枚举。结果写入 monitorResults。
     private static int WinMonitorProc(nint monitor, nint hdc, nint rect, nint data) {
+        if (Display.monitorResults == null) { return 0; }
         nint info = NativeMemory.Alloc(112);
         try {
+            NativeMemory.Fill(info, 0, 112);
             new Span<int>(info, 2)[0] = 104;   // cbSize
             if (Display.WinGetMonitorInfoW(monitor, info) != 0) {
                 Span<int> mi = new Span<int>(info, 10);
@@ -380,6 +401,7 @@ public class Display {
                 // 该显示器当前的显示模式。
                 nint dev = NativeMemory.Alloc(220);
                 try {
+                    NativeMemory.Fill(dev, 0, 220);
                     new Span<int>(dev, 55)[17] = 220;   // dmSize @ 68
                     int ok = Display.WinEnumDisplaySettingsW(info + 40, 0xFFFFFFFF, dev);
                     if (ok != 0) {
@@ -405,6 +427,7 @@ public class Display {
         nint dev = NativeMemory.Alloc(220);
         int v = 0;
         try {
+            NativeMemory.Fill(dev, 0, 220);
             new Span<int>(dev, 55)[17] = 220;   // dmSize @ 68
             int ok = Display.WinEnumDisplaySettingsW(0, mode, dev);
             if (ok != 0) {

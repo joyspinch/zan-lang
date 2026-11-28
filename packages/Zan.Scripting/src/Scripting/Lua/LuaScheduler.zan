@@ -20,10 +20,11 @@ public class ScheduledTask {
 // 底层通过协程出让让出执行权，完全不卡死、不阻塞主线程。
 public static class LuaScheduler {
     public static List<ScheduledTask> tasks = new List<ScheduledTask>();
-    static List<ScheduledTask> s_swapTasks = new List<ScheduledTask>();
+    static List<ScheduledTask> s_swapTasks = null;
     public static double currentTime = 0.0;
     public static ScheduledTask currentRunningTask = null;
     public static bool initialized = false;
+    private static long clearGen = 0;
 
     // 初始化调度器并向 Lua 全局环境注册 Async 模块 (Async.Sleep, Async.Yield)。幂等。
     public static void Initialize() {
@@ -48,8 +49,12 @@ public static class LuaScheduler {
 
     // 随 Lua.Finalize 重置调度器，避免持有失效状态机上的悬空协程。
     public static void Reset() {
-        LuaScheduler.tasks.Clear();
-        LuaScheduler.s_swapTasks.Clear();
+        LuaScheduler.clearGen = LuaScheduler.clearGen + 1;
+        if (LuaScheduler.tasks != null) { LuaScheduler.tasks.Clear(); }
+        if (LuaScheduler.s_swapTasks != null) {
+            LuaScheduler.s_swapTasks.Clear();
+            LuaScheduler.s_swapTasks = null;
+        }
         LuaScheduler.currentRunningTask = null;
         LuaScheduler.initialized = false;
     }
@@ -103,18 +108,27 @@ public static class LuaScheduler {
     // 完全非阻塞：只检查并唤醒到期任务，顺带平摊微量 GC 预算。
     // 返回值：当前仍存活并在等待的协程任务数量。
     public static int Tick(double deltaSeconds) {
-        if (!LuaScheduler.initialized || !Lua.IsInitialized() || LuaScheduler.tasks.Count == 0) {
+        if (!LuaScheduler.initialized || !Lua.IsInitialized() || LuaScheduler.tasks == null || LuaScheduler.tasks.Count == 0) {
             return 0;
+        }
+        if (!(deltaSeconds >= 0.0 && deltaSeconds <= 1.0e308)) {
+            deltaSeconds = 0.0;
         }
 
         LuaScheduler.currentTime = LuaScheduler.currentTime + deltaSeconds;
-        LuaScheduler.s_swapTasks.Clear();
+        long gen = LuaScheduler.clearGen;
+        if (LuaScheduler.s_swapTasks == null) {
+            LuaScheduler.s_swapTasks = new List<ScheduledTask>();
+        } else {
+            LuaScheduler.s_swapTasks.Clear();
+        }
         List<ScheduledTask> activeTasks = LuaScheduler.s_swapTasks;
         List<ScheduledTask> oldTasks = LuaScheduler.tasks;
 
         for (int i = 0; i < oldTasks.Count; i = i + 1) {
+            if (LuaScheduler.clearGen != gen) { break; }
             ScheduledTask task = oldTasks[i];
-            if (task.Coroutine.IsDone()) {
+            if (task == null || task.Coroutine == null || task.Coroutine.IsDone()) {
                 continue;
             }
 
@@ -129,7 +143,7 @@ public static class LuaScheduler {
                     LuaScheduler.currentRunningTask = prev;
                 }
 
-                if (rc == Lua.LUA_YIELD) {
+                if (rc == Lua.LUA_YIELD && LuaScheduler.clearGen == gen) {
                     activeTasks.Add(task);
                 }
             } else {
@@ -138,6 +152,10 @@ public static class LuaScheduler {
         }
 
         oldTasks.Clear();
+        if (LuaScheduler.clearGen != gen) {
+            activeTasks.Clear();
+            return LuaScheduler.tasks != null ? LuaScheduler.tasks.Count : 0;
+        }
         LuaScheduler.tasks = activeTasks;
         LuaScheduler.s_swapTasks = oldTasks;
 
@@ -149,12 +167,14 @@ public static class LuaScheduler {
 
     // 当前活跃任务数。
     public static int ActiveCount() {
-        return LuaScheduler.tasks.Count;
+        return LuaScheduler.tasks != null ? LuaScheduler.tasks.Count : 0;
     }
 
     // 清空并取消所有当前正在挂起的协程任务。
     public static void Clear() {
-        LuaScheduler.tasks.Clear();
+        LuaScheduler.clearGen = LuaScheduler.clearGen + 1;
+        if (LuaScheduler.tasks != null) { LuaScheduler.tasks.Clear(); }
+        if (LuaScheduler.s_swapTasks != null) { LuaScheduler.s_swapTasks.Clear(); }
         LuaScheduler.currentRunningTask = null;
     }
 
@@ -162,6 +182,9 @@ public static class LuaScheduler {
 
     private static int NativeSleep(nint L) {
         double seconds = Lua.ArgDouble(L, 1);
+        if (!(seconds >= 0.0 && seconds <= 1.0e308)) {
+            seconds = 0.0;
+        }
         if (LuaScheduler.currentRunningTask != null) {
             LuaScheduler.currentRunningTask.WakeTime = LuaScheduler.currentTime + seconds;
             LuaScheduler.currentRunningTask.IsWaitingTimer = true;

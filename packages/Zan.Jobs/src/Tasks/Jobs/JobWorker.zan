@@ -23,6 +23,9 @@ public class JobWorker {
     int loopGeneration;
 
     public JobWorker(JobStorage storage, JobRegistry registry, RetryPolicy policy) {
+        if (registry == null) {
+            throw new JobException(JobError.InvalidArgs, "job registry is null");
+        }
         this.storage = storage;
         this.registry = registry;
         this.policy = policy != null ? policy : RetryPolicy.Default();
@@ -31,6 +34,12 @@ public class JobWorker {
         this.pollMs = 200;
         this.running = false;
         this.loopGeneration = 0;
+    }
+
+    private static long AddSaturating(long baseTs, long delta) {
+        if (delta <= 0L) { return baseTs; }
+        if (baseTs > 9223372036854775807L - delta) { return 9223372036854775807L; }
+        return baseTs + delta;
     }
 
     // 换掉用于生成周期任务下一次 id 的队列（让 worker 与调度器共用
@@ -144,7 +153,7 @@ public class JobWorker {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
             rec.error = "no handler registered for job: " + rec.name;
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
 
@@ -152,7 +161,7 @@ public class JobWorker {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
             rec.error = "async handler must be executed via ProcessJobAsync";
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
         JobResult result = JobWorker.InvokeSync(handler, rec.args);
@@ -160,7 +169,7 @@ public class JobWorker {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
             rec.error = "handler returned null result";
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
 
@@ -181,7 +190,7 @@ public class JobWorker {
         if (result.retryable && rec.attempts < this.policy.maxAttempts) {
             rec.state = JobState.Failed;
             rec.retry = rec.attempts;
-            rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
+            rec.runAt = JobWorker.AddSaturating(finishedAt, this.policy.DelayFor(rec.attempts));
             this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
@@ -242,7 +251,7 @@ public class JobWorker {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
             rec.error = "no handler registered for job: " + rec.name;
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
 
@@ -260,7 +269,7 @@ public class JobWorker {
             rec.state = JobState.Dead;
             rec.endAt = DateTime.GetCurrentUnixMilliseconds();
             rec.error = "handler returned null result";
-            this.storage.Append(rec);
+            this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
 
@@ -281,7 +290,7 @@ public class JobWorker {
         if (result.retryable && rec.attempts < this.policy.maxAttempts) {
             rec.state = JobState.Failed;
             rec.retry = rec.attempts;
-            rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
+            rec.runAt = JobWorker.AddSaturating(finishedAt, this.policy.DelayFor(rec.attempts));
             this.storage.CompleteUnlessDeleted(rec);
             return rec;
         }
@@ -296,7 +305,7 @@ public class JobWorker {
         JobRecord next = rec.Copy();
         next.id = this.queue.NextId();
         next.state = JobState.Enqueued;
-        next.runAt = now + rec.interval;
+        next.runAt = JobWorker.AddSaturating(now, rec.interval);
         next.retry = 0;
         next.attempts = 0;
         next.startAt = 0;

@@ -2,6 +2,8 @@ using System;
 using System.Diagnostics;
 namespace Scripting.Lua;
 
+internal delegate int LuaResume53Fn(nint co, nint from, int nargs);
+
 // 进程内 Lua 5.3/5.4 动态嵌入（运行期解析符号；LuaValue 借注册表槽位绑定 ARC 生命周期）。
 public class Lua {
     public static int REGISTRY = 0 - 1001000;
@@ -73,9 +75,10 @@ public class Lua {
 
     public static bool resolved;
     public static bool initialized;
+    private static bool isLua54;
     // 槽位 1/2 为 Lua 内部占用（LUA_RIDX_MAINTHREAD / LUA_RIDX_GLOBALS）。
     public static long nextSlot;
-    private static object stateLock = new object();
+    private static string stateLock = "Scripting.Lua.Lua.stateLock";
 
     public static bool IsAvailable() { return Lua.TryResolve(); }
     public static bool IsInitialized() {
@@ -183,9 +186,10 @@ public class Lua {
     }
 
     public static void SetGlobal(string name, LuaValue v) {
+        if (name == null || name.Length == 0) { return; }
         Lua.EnsureReady();
         int mark = Lua.Top();
-        v.Push();
+        if (v != null) { v.Push(); } else { Lua.PushSlot(0); }
         LuaVoidStrFn s = (LuaVoidStrFn)Lua.addr_setglobal;
         s(Lua.state, name);
         Lua.SetTop(mark);
@@ -194,10 +198,13 @@ public class Lua {
     public static LuaValue Call(string name, params LuaValue[] args) {
         Lua.EnsureReady();
         int mark = Lua.Top();
-        Lua.CheckStack(Lua.state, args.Length + 4);
+        int argc = args == null ? 0 : args.Length;
+        Lua.CheckStack(Lua.state, argc + 4);
         Lua.PushPath(name, mark);
-        for (int i = 0; i < args.Length; i = i + 1) { args[i].Push(); }
-        Lua.Protected(args.Length, 1, mark, name);
+        for (int i = 0; i < argc; i = i + 1) {
+            if (args[i] != null) { args[i].Push(); } else { Lua.PushSlot(0); }
+        }
+        Lua.Protected(argc, 1, mark, name);
         LuaValue v = LuaValue.CaptureTop();
         Lua.SetTop(mark);
         return v;
@@ -236,6 +243,15 @@ public class Lua {
     public static int ResumeThread(nint co, int nargs, out int nresults) {
         nresults = 0;
         if (Lua.addr_resume == 0 || co == 0) { return Lua.LUA_ERRRUN; }
+        if (!Lua.isLua54) {
+            LuaResume53Fn f53 = (LuaResume53Fn)Lua.addr_resume;
+            int rc53 = f53(co, Lua.state, nargs);
+            if (Lua.addr_gettop != 0) {
+                LuaIntFn gt = (LuaIntFn)Lua.addr_gettop;
+                nresults = gt(co);
+            }
+            return rc53;
+        }
         LuaResumeFn f = (LuaResumeFn)Lua.addr_resume;
         nint resBuf = 0;
         lock (Lua.stateLock) {
@@ -287,11 +303,14 @@ public class Lua {
         try {
             Lua.EnsureReady();
             int mark = Lua.Top();
-            Lua.CheckStack(Lua.state, args.Length + 4);
+            int argc = args == null ? 0 : args.Length;
+            Lua.CheckStack(Lua.state, argc + 4);
             Lua.PushPath(name, mark);
-            for (int i = 0; i < args.Length; i = i + 1) { args[i].Push(); }
+            for (int i = 0; i < argc; i = i + 1) {
+                if (args[i] != null) { args[i].Push(); } else { Lua.PushSlot(0); }
+            }
             LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
-            int rc = f(Lua.state, args.Length, 1, 0, 0, 0);
+            int rc = f(Lua.state, argc, 1, 0, 0, 0);
             if (rc != 0) {
                 error = Lua.TopString();
                 Lua.SetTop(mark);
@@ -307,17 +326,19 @@ public class Lua {
 
     public static void ExecEncrypted(byte[] cipherBytes, string key, string chunkName) {
         if (cipherBytes == null || cipherBytes.Length == 0) { return; }
+        string safeKey = key == null ? "" : key;
+        string safeName = chunkName == null ? "=(encrypted)" : chunkName;
         byte[] plain = new byte[cipherBytes.Length];
         try {
-            int klen = key.Length;
+            int klen = safeKey.Length;
             if (klen == 0) {
                 for (int i = 0; i < cipherBytes.Length; i = i + 1) { plain[i] = cipherBytes[i]; }
             } else {
                 for (int i = 0; i < cipherBytes.Length; i = i + 1) {
-                    plain[i] = (byte)(cipherBytes[i] ^ (byte)key[i % klen]);
+                    plain[i] = (byte)(cipherBytes[i] ^ (byte)safeKey[i % klen]);
                 }
             }
-            Lua.ExecBytes(plain, chunkName);
+            Lua.ExecBytes(plain, safeName);
         } finally {
             for (int i = 0; i < plain.Length; i = i + 1) { plain[i] = 0; }
         }
@@ -354,7 +375,7 @@ public class Lua {
     public static LuaValue FromStr(string s) {
         Lua.EnsureReady();
         LuaPushStrFn f = (LuaPushStrFn)Lua.addr_pushstring;
-        nint _p = f(Lua.state, s);
+        nint _p = f(Lua.state, s == null ? "" : s);
         return LuaValue.CaptureTop();
     }
 
@@ -368,11 +389,12 @@ public class Lua {
     public static LuaValue FromList(List<LuaValue> items) {
         Lua.EnsureReady();
         int mark = Lua.Top();
+        int count = items == null ? 0 : items.Count;
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
-        ct(Lua.state, items.Count, 0);
+        ct(Lua.state, count, 0);
         LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        for (int i = 0; i < items.Count; i = i + 1) {
-            items[i].Push();
+        for (int i = 0; i < count; i = i + 1) {
+            if (items[i] != null) { items[i].Push(); } else { Lua.PushSlot(0); }
             si(Lua.state, 0 - 2, (long)(i + 1));
         }
         LuaValue t = LuaValue.CaptureTop();
@@ -384,11 +406,12 @@ public class Lua {
     public static LuaValue FromListDouble(List<double> items) {
         Lua.EnsureReady();
         int mark = Lua.Top();
+        int count = items == null ? 0 : items.Count;
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
-        ct(Lua.state, items.Count, 0);
+        ct(Lua.state, count, 0);
         LuaPushNumFn push = (LuaPushNumFn)Lua.addr_pushnumber;
         LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        for (int i = 0; i < items.Count; i = i + 1) {
+        for (int i = 0; i < count; i = i + 1) {
             push(Lua.state, items[i]);
             si(Lua.state, 0 - 2, (long)(i + 1));
         }
@@ -400,11 +423,12 @@ public class Lua {
     public static LuaValue FromListLong(List<long> items) {
         Lua.EnsureReady();
         int mark = Lua.Top();
+        int count = items == null ? 0 : items.Count;
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
-        ct(Lua.state, items.Count, 0);
+        ct(Lua.state, count, 0);
         LuaPushIntFn push = (LuaPushIntFn)Lua.addr_pushinteger;
         LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        for (int i = 0; i < items.Count; i = i + 1) {
+        for (int i = 0; i < count; i = i + 1) {
             push(Lua.state, items[i]);
             si(Lua.state, 0 - 2, (long)(i + 1));
         }
@@ -416,12 +440,13 @@ public class Lua {
     public static LuaValue FromListStr(List<string> items) {
         Lua.EnsureReady();
         int mark = Lua.Top();
+        int count = items == null ? 0 : items.Count;
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
-        ct(Lua.state, items.Count, 0);
+        ct(Lua.state, count, 0);
         LuaPushStrFn push = (LuaPushStrFn)Lua.addr_pushstring;
         LuaSetIFn si = (LuaSetIFn)Lua.addr_rawseti;
-        for (int i = 0; i < items.Count; i = i + 1) {
-            nint _p = push(Lua.state, items[i]);
+        for (int i = 0; i < count; i = i + 1) {
+            nint _p = push(Lua.state, items[i] == null ? "" : items[i]);
             si(Lua.state, 0 - 2, (long)(i + 1));
         }
         LuaValue t = LuaValue.CaptureTop();
@@ -433,11 +458,18 @@ public class Lua {
         Lua.EnsureReady();
         int mark = Lua.Top();
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
+        if (map == null) {
+            ct(Lua.state, 0, 0);
+            LuaValue empty = LuaValue.CaptureTop();
+            Lua.SetTop(mark);
+            return empty;
+        }
         List<string> keys = map.Keys;
         ct(Lua.state, 0, keys.Count);
         LuaSetFieldFn sf = (LuaSetFieldFn)Lua.addr_setfield;
         for (int i = 0; i < keys.Count; i = i + 1) {
-            map[keys[i]].Push();
+            LuaValue v = map[keys[i]];
+            if (v != null) { v.Push(); } else { Lua.PushSlot(0); }
             sf(Lua.state, 0 - 2, keys[i]);
         }
         LuaValue t = LuaValue.CaptureTop();
@@ -449,12 +481,19 @@ public class Lua {
         Lua.EnsureReady();
         int mark = Lua.Top();
         LuaCreateTableFn ct = (LuaCreateTableFn)Lua.addr_createtable;
+        if (map == null) {
+            ct(Lua.state, 0, 0);
+            LuaValue empty = LuaValue.CaptureTop();
+            Lua.SetTop(mark);
+            return empty;
+        }
         List<string> keys = map.Keys;
         ct(Lua.state, 0, keys.Count);
         LuaPushStrFn push = (LuaPushStrFn)Lua.addr_pushstring;
         LuaSetFieldFn sf = (LuaSetFieldFn)Lua.addr_setfield;
         for (int i = 0; i < keys.Count; i = i + 1) {
-            nint _p = push(Lua.state, map[keys[i]]);
+            string v = map[keys[i]];
+            nint _p = push(Lua.state, v == null ? "" : v);
             sf(Lua.state, 0 - 2, keys[i]);
         }
         LuaValue t = LuaValue.CaptureTop();
@@ -581,11 +620,15 @@ public class Lua {
         if (chunk == null || chunk.Length == 0) {
             throw new InvalidOperationException("Lua chunk 为空");
         }
+        if (Lua.addr_loadbufferx == 0) {
+            for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
+            throw new InvalidOperationException("当前 Lua 动态库缺少 luaL_loadbufferx 导出符号");
+        }
         int mark = Lua.Top();
         LuaLoadBufFn f = (LuaLoadBufFn)Lua.addr_loadbufferx;
-        int rc = f(Lua.state, (nint)chunk, (long)chunk.Length, chunkName, "t");
+        int rc = f(Lua.state, (nint)chunk, (long)chunk.Length, chunkName == null ? "=(chunk)" : chunkName, "t");
         for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
-        if (rc != 0) { Lua.FailAt("Lua chunk 编译失败: " + chunkName, mark); }
+        if (rc != 0) { Lua.FailAt("Lua chunk 编译失败: " + (chunkName == null ? "" : chunkName), mark); }
     }
 
     public static void Protected(int nargs, int nres, int mark, string what) {
@@ -652,35 +695,37 @@ public class Lua {
     }
 
     public static bool TryResolve() {
-        if (Lua.resolved) { return true; }
-        if (Lua.mod == 0) {
-            string[] cands = new string[] {
-                "lua54.dll", "lua53.dll", "lua5.4.dll", "lua5.3.dll",
-                "liblua5.4.so", "liblua5.3.so", "liblua54.so", "liblua53.so",
-                "liblua.so.5.4", "liblua.so.5.3", "liblua.so",
-                "liblua5.4.dylib", "liblua5.3.dylib", "liblua.dylib"
-            };
-            // 先查 exe 旁（--publish 随附副本），防 Windows CWD/PATH 劫持。
-            string appdir = ProcessHost.AppDir();
-            if (appdir != "") {
-                for (int i = 0; i < cands.Length; i = i + 1) {
-                    Lua.mod = Interop.Load(appdir + "/" + cands[i]);
+        lock (Lua.stateLock) {
+            if (Lua.resolved) { return true; }
+            if (Lua.mod == 0) {
+                string[] cands = new string[] {
+                    "lua54.dll", "lua53.dll", "lua5.4.dll", "lua5.3.dll",
+                    "liblua5.4.so", "liblua5.3.so", "liblua54.so", "liblua53.so",
+                    "liblua.so.5.4", "liblua.so.5.3", "liblua.so",
+                    "liblua5.4.dylib", "liblua5.3.dylib", "liblua.dylib"
+                };
+                // 先查 exe 旁（--publish 随附副本），防 Windows CWD/PATH 劫持。
+                string appdir = ProcessHost.AppDir();
+                if (appdir != "") {
+                    for (int i = 0; i < cands.Length; i = i + 1) {
+                        Lua.mod = Interop.Load(appdir + "/" + cands[i]);
+                        if (Lua.mod != 0) { break; }
+                    }
+                }
+                for (int i = 0; Lua.mod == 0 && i < cands.Length; i = i + 1) {
+                    Lua.mod = Interop.Load(cands[i]);
                     if (Lua.mod != 0) { break; }
                 }
+                if (Lua.mod == 0) { return false; }
             }
-            for (int i = 0; Lua.mod == 0 && i < cands.Length; i = i + 1) {
-                Lua.mod = Interop.Load(cands[i]);
-                if (Lua.mod != 0) { break; }
+            if (!Lua.ResolveSymbols()) {
+                Interop.Unload(Lua.mod);
+                Lua.mod = 0;
+                return false;
             }
-            if (Lua.mod == 0) { return false; }
+            Lua.resolved = true;
+            return true;
         }
-        if (!Lua.ResolveSymbols()) {
-            Interop.Unload(Lua.mod);
-            Lua.mod = 0;
-            return false;
-        }
-        Lua.resolved = true;
-        return true;
     }
 
     public static bool ResolveSymbols() {
@@ -724,8 +769,9 @@ public class Lua {
         Lua.addr_checkstack = Interop.Symbol(Lua.mod, "lua_checkstack");
         if (Lua.addr_geti == 0) { Lua.addr_geti = Lua.addr_rawgeti; }
         if (Lua.addr_seti == 0) { Lua.addr_seti = Lua.addr_rawseti; }
+        Lua.isLua54 = Interop.Symbol(Lua.mod, "lua_newuserdatauv") != 0;
         return Lua.addr_newstate != 0 && Lua.addr_openlibs != 0
-            && Lua.addr_loadstring != 0 && Lua.addr_pcallk != 0
+            && Lua.addr_loadstring != 0 && Lua.addr_loadbufferx != 0 && Lua.addr_pcallk != 0
             && Lua.addr_rawgeti != 0 && Lua.addr_rawseti != 0
             && Lua.addr_tolstring != 0 && Lua.addr_createtable != 0;
     }
@@ -736,6 +782,7 @@ public class Lua {
             Lua.mod = 0;
         }
         Lua.resolved = false;
+        Lua.isLua54 = false;
         Lua.addr_newstate = 0;
         Lua.addr_openlibs = 0;
         Lua.addr_close = 0;

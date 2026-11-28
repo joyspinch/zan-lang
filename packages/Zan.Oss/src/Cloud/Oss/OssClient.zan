@@ -15,10 +15,32 @@ public class OssClient {
     public OssConfig config;
 
     public OssClient(OssConfig cfg) {
-        this.config = cfg;
+        this.config = cfg != null ? cfg : new OssConfig();
         // 端点只在 config 上给了 URL 时才需要解析；自己解析一次，调用方
         // 不必记得调 Parse()。
-        if (this.config.endpointHost.Length == 0) { this.config.Parse(); }
+        if (this.config.endpointHost == null || this.config.endpointHost.Length == 0) {
+            this.config.Parse();
+        }
+    }
+
+    internal static bool IsSafeHttpMethod(string m) {
+        if (m == null || m.Length == 0 || m.Length > 16) { return false; }
+        for (int i = 0; i < m.Length; i = i + 1) {
+            int c = m[i] & 255;
+            bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 45;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    internal static bool ContainsCrLf(string s) {
+        if (s == null) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 10 || c == 13) { return true; }
+        }
+        return false;
     }
 
     private static bool EqualsAsciiIgnoreCase(string a, string lowerLit) {
@@ -119,16 +141,14 @@ public class OssClient {
     /// method: 默认为 "GET"（下载/预览），也可传 "PUT"（前端直传上传）。
     /// expiresSeconds: 有效期（秒），默认 900 秒（15 分钟）。</summary>
     public virtual string GeneratePresignedUrl(string key, long expiresSeconds = 900, string method = "GET") {
-        if (key == null || key.Length == 0) { return ""; }
+        if (key == null || key.Length == 0 || !OssClient.IsSafeHttpMethod(method)) { return ""; }
         string objKey = this.config.ObjectKey(key);
-        string scheme = this.config.endpointTls ? "https://" : "http://";
-        string portStr = "";
-        if ((this.config.endpointTls && this.config.endpointPort != 443) ||
-            (!this.config.endpointTls && this.config.endpointPort != 80)) {
-            portStr = ":" + Convert.ToString(this.config.endpointPort);
-        }
-        string baseUrl = scheme + this.HostName() + portStr + this.RequestPath(objKey);
-        long expiresTimestamp = DateTime.UtcNow().ToUnixSeconds() + (expiresSeconds <= 0 ? 900 : expiresSeconds);
+        if (OssClient.ContainsCrLf(objKey) || OssClient.ContainsCrLf(this.config.bucket)) { return ""; }
+        string baseUrl = this.OriginUrl() + this.RequestPath(objKey);
+        long exp = expiresSeconds <= 0 ? 900 : expiresSeconds;
+        if (exp > 604800L) { exp = 604800L; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        long expiresTimestamp = now > (9223372036854775807L - exp) ? 9223372036854775807L : (now + exp);
         string expStr = Convert.ToString(expiresTimestamp);
 
         if (OssClient.IsAliyunDriver(this.config.driver)) {
@@ -154,12 +174,20 @@ public class OssClient {
 
     /// <summary>建一个连到该端点的 HTTP 客户端。端点没解析出来返回 null。</summary>
     public HttpClient NewClient() {
-        if (this.config.endpointHost.Length == 0) { return null; }
+        if (this.config == null || this.config.endpointHost == null || this.config.endpointHost.Length == 0) {
+            return null;
+        }
+        string host = this.HostName();
+        if (host == null || host.Length == 0 || OssClient.ContainsCrLf(host)
+            || (!OssConfig.IsSafeHostText(host) && !OssConfig.IsSafeIpv6Host(host))) {
+            return null;
+        }
+        int port = this.config.endpointPort > 0 ? this.config.endpointPort : (this.config.endpointTls ? 443 : 80);
         HttpClient http;
         if (this.config.endpointTls) {
-            http = HttpClient.CreateHttps(this.HostName(), this.config.endpointPort);
+            http = HttpClient.CreateHttps(host, port);
         } else {
-            http = new HttpClient(this.HostName(), this.config.endpointPort);
+            http = new HttpClient(host, port);
         }
         http.SetTimeout(this.config.timeoutMs);
         if (this.config.callPolicy != null) { http.SetCallPolicy(this.config.callPolicy); }
@@ -240,6 +268,7 @@ public class OssClient {
     /// <summary>流式下载到本地文件。先 HEAD 校验状态——直接落盘会把 404 的
     /// 错误正文当素材存下来，事后只表现为"图片坏了"。</summary>
     public async OssResult GetToFile(string key, string localPath) {
+        if (localPath == null || localPath.Length == 0) { return OssResult.Fail("本地路径为空"); }
         OssResult head = await this.Head(key);
         if (!head.ok) { return head; }
         HttpClient http = this.NewClient();
@@ -354,6 +383,7 @@ public class OssClient {
         sb.Append("<CompleteMultipartUpload>");
         for (int i = 0; i < parts.Count; i = i + 1) {
             OssUploadPart p = parts[i];
+            if (p == null) { continue; }
             sb.Append("<Part><PartNumber>");
             sb.Append(Convert.ToString(p.partNumber));
             sb.Append("</PartNumber><ETag>");
@@ -405,7 +435,8 @@ public class OssClient {
 
     /// <summary>凭证体检：发一次桶级签名请求。返回错误文本（空串 = 通过）。</summary>
     public async string Check() {
-        if (this.config.accessKey.Length == 0 || this.config.secretKey.Length == 0) {
+        if (this.config == null || this.config.accessKey == null || this.config.accessKey.Length == 0
+            || this.config.secretKey == null || this.config.secretKey.Length == 0) {
             return "访问凭证未配置";
         }
         HttpClient http = this.NewClient();

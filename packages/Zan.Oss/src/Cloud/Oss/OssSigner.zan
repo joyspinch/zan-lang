@@ -8,29 +8,20 @@ namespace Cloud.Oss;
 /// Base64/十六进制、两种日期格式。单独成实体，是为了签名算法能脱离网络
 /// 单独编译、离线对账。</summary>
 public class OssSigner {
-    // 256B RFC 3986 字符分类表：1 = 非保留字符 (A-Z a-z 0-9 - _ . ~)，2 = '/'，0 = 需百分号编码。
-    private static byte[] unreservedLut;
     private static const string DAY_NAMES = "SunMonTueWedThuFriSat";
     private static const string MONTH_NAMES = "JanFebMarAprMayJunJulAugSepOctNovDec";
 
-    private static byte[] EnsureLut() {
-        if (OssSigner.unreservedLut == null) {
-            byte[] t = new byte[256];
-            for (int c = 65; c <= 90; c = c + 1) { t[c] = 1; }
-            for (int c = 97; c <= 122; c = c + 1) { t[c] = 1; }
-            for (int c = 48; c <= 57; c = c + 1) { t[c] = 1; }
-            t[45] = 1;   // '-'
-            t[95] = 1;   // '_'
-            t[46] = 1;   // '.'
-            t[126] = 1;  // '~'
-            t[47] = 2;   // '/'
-            OssSigner.unreservedLut = t;
-        }
-        return OssSigner.unreservedLut;
+    // RFC 3986 字符分类（纯寄存器判断，零静态堆表与并发初始化竞态）：
+    // 1 = 非保留字符 (A-Z a-z 0-9 - _ . ~)，2 = '/'，0 = 需百分号编码。
+    private static int Rfc3986Class(int c) {
+        if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+            || c == 45 || c == 95 || c == 46 || c == 126) { return 1; }
+        if (c == 47) { return 2; }
+        return 0;
     }
 
     /// <summary>RFC 3986 百分号编码：除 A-Z a-z 0-9 与 - _ . ~ 外全部转义，
-    /// 空格转 %20（不是 +）。256B 查表 + 精确单次 byte[] 分配，零 HexByte/Substring。</summary>
+    /// 空格转 %20（不是 +）。精确单次 byte[] 分配，零 HexByte/Substring。</summary>
     public static string Rfc3986(string s) {
         if (s == null || s.Length == 0) { return ""; }
         return OssSigner.Rfc3986Slice(s, 0, s.Length, false);
@@ -39,10 +30,9 @@ public class OssSigner {
     internal static string Rfc3986Slice(string s, int start, int end, bool keepSlash) {
         int len = end - start;
         if (len <= 0) { return ""; }
-        byte[] lut = OssSigner.EnsureLut();
         int escCount = 0;
         for (int i = start; i < end; i = i + 1) {
-            int cls = lut[s[i] & 255] & 255;
+            int cls = OssSigner.Rfc3986Class(s[i] & 255);
             if (cls == 0 || (!keepSlash && cls == 2)) {
                 escCount = escCount + 1;
             }
@@ -56,7 +46,7 @@ public class OssSigner {
         int di = 0;
         for (int i = start; i < end; i = i + 1) {
             int c = s[i] & 255;
-            int cls = lut[c] & 255;
+            int cls = OssSigner.Rfc3986Class(c);
             if (cls == 1 || (keepSlash && cls == 2)) {
                 buf[di] = (byte)c;
                 di = di + 1;
@@ -77,10 +67,9 @@ public class OssSigner {
         if (path == null || path.Length == 0) { return "/"; }
         int len = path.Length;
         int needLead = (path[0] & 255) == 47 ? 0 : 1;
-        byte[] lut = OssSigner.EnsureLut();
         int escCount = 0;
         for (int i = 0; i < len; i = i + 1) {
-            if ((lut[path[i] & 255] & 255) == 0) {
+            if (OssSigner.Rfc3986Class(path[i] & 255) == 0) {
                 escCount = escCount + 1;
             }
         }
@@ -94,7 +83,7 @@ public class OssSigner {
         }
         for (int i = 0; i < len; i = i + 1) {
             int c = path[i] & 255;
-            if ((lut[c] & 255) != 0) {
+            if (OssSigner.Rfc3986Class(c) != 0) {
                 buf[di] = (byte)c;
                 di = di + 1;
             } else {

@@ -113,6 +113,7 @@ public partial class Window {
     private static extern int WinGetMenuStringW(nint hMenu, int item, nint buf, int max, int flags);
 
     // ---- DWM 延迟绑定状态 ----
+    static string dwmLock = "System.Automation.Window.dwmLock";
     static nint dwmModule = 0;
     static DwmGetAttrFn dwmGetAttr;
     #endif
@@ -161,9 +162,10 @@ public partial class Window {
     // 设置窗口标题/文本(WM_SETTEXT)。返回是否成功;目标无响应时
     // 返回 false 而不是卡死。
     public static bool SetText(nint hwnd, string text) {
+        string safeText = text == null ? "" : text;
         #if WINDOWS
         if (!Window.IsWindow(hwnd)) { return false; }
-        nint wtext = Wide.Of(text);
+        nint wtext = Wide.Of(safeText);
         nint res = 0;
         try {
             res = Window.WinSendMessageTimeoutW(hwnd, 0x000C /* WM_SETTEXT */,
@@ -173,7 +175,7 @@ public partial class Window {
         }
         return res != 0;
         #else
-        return Window.PosixSetText(hwnd, text);
+        return Window.PosixSetText(hwnd, safeText);
         #endif
     }
 
@@ -238,20 +240,26 @@ public partial class Window {
     // Dwmapi 缺失时返回 false。
     public static bool IsCloaked(nint hwnd) {
         #if WINDOWS
-        if (Window.dwmModule == 0) {
-            Window.dwmModule = Interop.Load("dwmapi.dll");
-            if (Window.dwmModule != 0) {
-                nint fn = Interop.Symbol(Window.dwmModule, "DwmGetWindowAttribute");
-                if (fn != 0) { Window.dwmGetAttr = (DwmGetAttrFn)fn; }
+        DwmGetAttrFn getAttr = Window.dwmGetAttr;
+        if (getAttr == null) {
+            lock (Window.dwmLock) {
+                if (Window.dwmModule == 0) {
+                    Window.dwmModule = Interop.Load("dwmapi.dll");
+                    if (Window.dwmModule != 0) {
+                        nint fn = Interop.Symbol(Window.dwmModule, "DwmGetWindowAttribute");
+                        if (fn != 0) { Window.dwmGetAttr = (DwmGetAttrFn)fn; }
+                    }
+                }
+                getAttr = Window.dwmGetAttr;
             }
         }
-        if (Window.dwmGetAttr == null) { return false; }
+        if (getAttr == null) { return false; }
         nint buf = NativeMemory.Alloc(4);
         int hr = -1;
         int v = 0;
         try {
             new Span<int>(buf, 1)[0] = 0;
-            hr = Window.dwmGetAttr(hwnd, 14 /* DWMWA_CLOAKED */, buf, 4);
+            hr = getAttr(hwnd, 14 /* DWMWA_CLOAKED */, buf, 4);
             v = new Span<int>(buf, 1)[0];
         } finally {
             NativeMemory.Free(buf);
@@ -503,10 +511,10 @@ public partial class Window {
     // 时须相等。
     public static bool Match(nint hwnd, string cls, string title, int id) {
         #if WINDOWS
-        if (cls != "") {
+        if (cls != null && cls != "") {
             if (!Window.GetClassName(hwnd).Contains(cls)) { return false; }
         }
-        if (title != "") {
+        if (title != null && title != "") {
             if (!Window.GetText(hwnd).Contains(title)) { return false; }
         }
         if (id > 0) {
@@ -540,7 +548,7 @@ public partial class Window {
         #if WINDOWS
         List<nint> out2 = new List<nint>();
         if (recursive) {
-            Window.CollectChildren(parent, out2);
+            Window.CollectChildren(parent, out2, 64);
         } else {
             nint child = Window.WinFindWindowExW(parent, (nint)0, (nint)0, (nint)0);
             while (child != 0) {
@@ -555,11 +563,12 @@ public partial class Window {
     }
 
     #if WINDOWS
-    // 后序收集 parent 的全部子孙窗口(子先于父,左先于右)。
-    private static void CollectChildren(nint parent, List<nint> out2) {
+    // 后序收集 parent 的全部子孙窗口(子先于父,左先于右)，深度上限防栈溢出。
+    private static void CollectChildren(nint parent, List<nint> out2, int depth) {
+        if (depth <= 0) { return; }
         nint child = Window.WinFindWindowExW(parent, (nint)0, (nint)0, (nint)0);
         while (child != 0) {
-            Window.CollectChildren(child, out2);
+            Window.CollectChildren(child, out2, depth - 1);
             out2.Add(child);
             child = Window.WinFindWindowExW(parent, child, (nint)0, (nint)0);
         }
@@ -646,6 +655,7 @@ public partial class Window {
         #if WINDOWS
         long start = Stopwatch.NowTicks();
         long freq = Stopwatch.Frequency() / 1000;
+        if (freq <= 0) { freq = 1; }
         while (true) {
             nint hwnd = Window.FindWindow(cls, title, pid, tid);
             if (hwnd != 0) { return hwnd; }
@@ -662,6 +672,7 @@ public partial class Window {
         #if WINDOWS
         long start = Stopwatch.NowTicks();
         long freq = Stopwatch.Frequency() / 1000;
+        if (freq <= 0) { freq = 1; }
         while (true) {
             nint hwnd = Window.FindEx(parent, cls, title, id, 0);
             if (hwnd != 0) { return hwnd; }
@@ -678,6 +689,7 @@ public partial class Window {
         #if WINDOWS
         long start = Stopwatch.NowTicks();
         long freq = Stopwatch.Frequency() / 1000;
+        if (freq <= 0) { freq = 1; }
         while (Window.IsWindow(hwnd)) {
             if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
             SleepW(100);
@@ -693,6 +705,7 @@ public partial class Window {
         #if WINDOWS
         long start = Stopwatch.NowTicks();
         long freq = Stopwatch.Frequency() / 1000;
+        if (freq <= 0) { freq = 1; }
         while (Window.IsVisible(hwnd) != visible) {
             if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
             SleepW(100);
@@ -708,6 +721,7 @@ public partial class Window {
         #if WINDOWS
         long start = Stopwatch.NowTicks();
         long freq = Stopwatch.Frequency() / 1000;
+        if (freq <= 0) { freq = 1; }
         while (Window.IsEnabled(hwnd) != enabled) {
             if ((Stopwatch.NowTicks() - start) / freq >= (long)timeoutMs) { return false; }
             SleepW(100);
@@ -1075,7 +1089,7 @@ public partial class Window {
     // 返回 -1。`标签` 不含 "&" 时两边都去掉 "&" 再比。
     public static int FindMenuItem(nint hMenu, string label) {
         #if WINDOWS
-        if (hMenu == 0) { return -1; }
+        if (hMenu == 0 || label == null) { return -1; }
         int count = Window.WinGetMenuItemCount(hMenu);
         for (int pos = 0; pos < count; pos = pos + 1) {
             nint buf = NativeMemory.Alloc(1024);
@@ -1118,6 +1132,7 @@ public partial class Window {
     // (子串,忽略 "&")逐层查找后投递 WM_COMMAND。找不到返回 false。
     public static bool ClickMenu(nint hwnd, string path) {
         #if WINDOWS
+        if (path == null || path.Length == 0) { return false; }
         nint hMenu = Window.GetMenu(hwnd);
         if (hMenu == 0) { return false; }
         List<string> parts = path.Split("/");

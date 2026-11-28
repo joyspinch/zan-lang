@@ -32,6 +32,7 @@ public class ProcessList {
             want = want.Substring(0, want.Length - 4);
         }
         for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i] == null || all[i].name == null) { continue; }
             string n = all[i].name.ToLower();
             if (n.EndsWith(".exe")) {
                 n = n.Substring(0, n.Length - 4);
@@ -44,6 +45,7 @@ public class ProcessList {
     // 单个 pid 的详细信息：额外填充 exePath 与 memoryBytes。进程不存在
     // （或拒绝访问）时返回 null。
     public static ProcessEntry ByPid(int pid) {
+        if (pid <= 0) { return null; }
         List<ProcessEntry> all = ProcessList.List();
         for (int i = 0; i < all.Count; i = i + 1) {
             if (all[i].pid == pid) {
@@ -152,17 +154,22 @@ public class ProcessList {
 
     // Windows 实现：GetProcessMemoryInfo 读取工作集；打不开进程返回 -1。
     private static long WinMemory(int pid) {
+        if (pid <= 0) { return -1; }
         nint proc = ProcessList.WinOpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, 0, pid);
         if (proc == 0) { return -1; }
         nint counters = NativeMemory.Alloc(80);
         long mem = -1;
         try {
-            int ok = ProcessList.WinGetProcessMemoryInfo(proc, counters, 80);
-            if (ok != 0) {
-                mem = new Span<long>(counters + 8, 9)[1];  // WorkingSetSize @ 16
+            if (counters != 0) {
+                NativeMemory.Zero(counters, 80);
+                new Span<int>(counters, 1)[0] = 80;
+                int ok = ProcessList.WinGetProcessMemoryInfo(proc, counters, 80);
+                if (ok != 0) {
+                    mem = new Span<long>(counters + 8, 9)[1];  // WorkingSetSize @ 16
+                }
             }
         } finally {
-            NativeMemory.Free(counters);
+            if (counters != 0) { NativeMemory.Free(counters); }
             ProcessList.WinCloseHandle(proc);
         }
         return mem;
@@ -387,26 +394,30 @@ public class ProcessList {
         return path.Substring(at + 1, path.Length - at - 1);
     }
 
-    // 十进制解析为 int；空串/非数字/带符号返回 -1。
+    // 十进制解析为 int；空串/非数字/带符号/溢出返回 -1。
     private static int ParseInt(string s) {
         if (s == null || s.Length == 0) { return -1; }
         int v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
             if (c < 0x30 || c > 0x39) { return -1; }
-            v = v * 10 + (c - 0x30);
+            int d = c - 0x30;
+            if (v > (2147483647 - d) / 10) { return -1; }
+            v = v * 10 + d;
         }
         return v;
     }
 
-    // 十进制解析为 long；空串/非数字/带符号返回 -1。
+    // 十进制解析为 long；空串/非数字/带符号/溢出返回 -1。
     private static long ParseLong(string s) {
         if (s == null || s.Length == 0) { return -1; }
         long v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
             if (c < 0x30 || c > 0x39) { return -1; }
-            v = v * 10 + (c - 0x30);
+            long d = (long)(c - 0x30);
+            if (v > (9223372036854775807L - d) / 10L) { return -1; }
+            v = v * 10L + d;
         }
         return v;
     }

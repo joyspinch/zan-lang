@@ -31,15 +31,19 @@ public class ProcessHost {
 
     // 读取环境变量，未设置时返回 ""。
     public static string Env(string name) {
+        if (name == null || name.Length == 0) { return ""; }
         #if WINDOWS
         // 读实时 Win32 环境块（CRT getenv 仅抓启动快照，会漏掉父进程注入的变量）。
         nint wname = Wide.Of(name);
         nint buf = NativeMemory.Alloc(8192);
-        int n = GetEnvironmentVariableW(wname, buf, 4096);
-        string text = (n > 0 && n < 4096) ? Wide.Read(buf) : "";
-        NativeMemory.Free(buf);
-        Wide.Free(wname);
-        return text;
+        try {
+            if (wname == 0 || buf == 0) { return ""; }
+            int n = GetEnvironmentVariableW(wname, buf, 4096);
+            return (n > 0 && n < 4096) ? Wide.Read(buf) : "";
+        } finally {
+            if (buf != 0) { NativeMemory.Free(buf); }
+            if (wname != 0) { Wide.Free(wname); }
+        }
         #else
         string v = getenv(name);
         return v == null ? "" : v;
@@ -76,7 +80,12 @@ public class ProcessHost {
 
     public static int WorkerId() {
         string v = ProcessHost.Env("ZAN_WORKER_ID");
-        return v == "" ? 0 : Convert.ToInt32(v);
+        if (v == "") { return 0; }
+        try {
+            return Convert.ToInt32(v);
+        } catch (Exception) {
+            return 0;
+        }
     }
 
     public static bool IsWorker() { return ProcessHost.Env("ZAN_WORKER_ID") != ""; }
@@ -94,6 +103,8 @@ public class ProcessHost {
     // Linux 用 setsid、macOS 用 nohup 后台化并重定向输出到 logPath；其余平台或已守护时返回 false。
     public static bool DaemonizeTo(string logPath, string logDir) {
         if (ProcessHost.IsWorker() || ProcessHost.Env("ZAN_DAEMON") != "") { return false; }
+        string safeLogPath = logPath == null ? "" : logPath;
+        string safeLogDir = logDir == null ? "" : logDir;
         string exe = ProcessHost.SelfExe();
         if (exe == "") { return false; }
         #if LINUX || MACOS
@@ -104,16 +115,16 @@ public class ProcessHost {
         #endif
         List<string> shArgs = new List<string>();
         shArgs.Add("-c");
-        if (logPath != "") {
+        if (safeLogPath != "") {
             shArgs.Add("ZAN_DAEMON=1 ZAN_LOG_DIR=\"$1\" " + cmd + " \"$2\" >> \"$3\" 2>&1");
             shArgs.Add("sh");
-            shArgs.Add(logDir);
+            shArgs.Add(safeLogDir);
             shArgs.Add(exe);
-            shArgs.Add(logPath);
+            shArgs.Add(safeLogPath);
         } else {
             shArgs.Add("ZAN_DAEMON=1 ZAN_LOG_DIR=\"$1\" " + cmd + " \"$2\"");
             shArgs.Add("sh");
-            shArgs.Add(logDir);
+            shArgs.Add(safeLogDir);
             shArgs.Add(exe);
         }
         Process.StartDetachedSafe("/bin/sh", shArgs);

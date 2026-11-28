@@ -72,13 +72,65 @@ public class KafkaConnection {
 
     private void ReleaseIoLock() {
         AsyncGate next = null;
+        nint closeSock = -1;
         lock (this) {
             this.ioBusy = false;
+            if (!this.connected && this.sock >= 0) {
+                closeSock = this.sock;
+                this.sock = -1;
+            }
             if (this.ioWaiters != null && this.ioWaiters.Count() > 0) {
                 next = this.ioWaiters.Dequeue();
             }
         }
+        if (closeSock >= 0) {
+            Socket.Close(closeSock);
+        }
         if (next != null) { next.Signal(); }
+    }
+
+    // 仅发送请求帧不等待响应（用于 Produce acks=0）
+    public async bool SendOnlyAsync(int apiKey, int apiVersion, byte[] bodyPayload) {
+        if (!this.connected || this.sock < 0) { return false; }
+        if (!await this.AcquireIoLockAsync()) { return false; }
+        try {
+            nint s = -1;
+            lock (this) {
+                if (!this.connected || this.sock < 0) { return false; }
+                s = this.sock;
+            }
+            int cid = this.nextCorrelationId;
+            this.nextCorrelationId = this.nextCorrelationId + 1;
+
+            KafkaWriter hw = new KafkaWriter(32);
+            hw.WriteInt16(apiKey);
+            hw.WriteInt16(apiVersion);
+            hw.WriteInt32(cid);
+            hw.WriteString(this.clientId);
+            byte[] hdrBytes = hw.ToBytes();
+
+            int bodyLen = bodyPayload != null ? bodyPayload.Length : 0;
+            if (bodyLen < 0 || (long)hdrBytes.Length + (long)bodyLen > 67108864L) {
+                return false;
+            }
+            int totalMsgLen = hdrBytes.Length + bodyLen;
+
+            KafkaWriter pkt = new KafkaWriter(4 + totalMsgLen);
+            pkt.WriteInt32(totalMsgLen);
+            pkt.WriteRaw(hdrBytes, hdrBytes.Length);
+            if (bodyLen > 0) {
+                pkt.WriteRaw(bodyPayload, bodyLen);
+            }
+            byte[] rawPkt = pkt.ToBytes();
+            int sent = await Socket.SendAsync(s, rawPkt, rawPkt.Length);
+            if (sent < rawPkt.Length) {
+                this.Shutdown();
+                return false;
+            }
+            return true;
+        } finally {
+            this.ReleaseIoLock();
+        }
     }
 
     // 发送标准 Kafka 请求并同步等待响应
@@ -86,7 +138,11 @@ public class KafkaConnection {
         if (!this.connected || this.sock < 0) { return null; }
         if (!await this.AcquireIoLockAsync()) { return null; }
         try {
-            if (!this.connected || this.sock < 0) { return null; }
+            nint s = -1;
+            lock (this) {
+                if (!this.connected || this.sock < 0) { return null; }
+                s = this.sock;
+            }
             int cid = this.nextCorrelationId;
             this.nextCorrelationId = this.nextCorrelationId + 1;
 
@@ -112,7 +168,7 @@ public class KafkaConnection {
                 pkt.WriteRaw(bodyPayload, bodyLen);
             }
             byte[] rawPkt = pkt.ToBytes();
-            int sent = await Socket.SendAsync(this.sock, rawPkt, rawPkt.Length);
+            int sent = await Socket.SendAsync(s, rawPkt, rawPkt.Length);
             if (sent < rawPkt.Length) {
                 this.Shutdown();
                 return null;
@@ -120,7 +176,7 @@ public class KafkaConnection {
 
             // 3. 读取 4 字节响应总长度
             byte[] lenBuf = new byte[4];
-            int rLen = await this.ReadExactAsync(lenBuf, 4);
+            int rLen = await this.ReadExactAsync(s, lenBuf, 4);
             if (rLen < 4) {
                 this.Shutdown();
                 return null;
@@ -134,7 +190,7 @@ public class KafkaConnection {
 
             // 4. 读取完整的响应内容体
             byte[] respBuf = new byte[respLen];
-            int rBody = await this.ReadExactAsync(respBuf, respLen);
+            int rBody = await this.ReadExactAsync(s, respBuf, respLen);
             if (rBody < respLen) {
                 this.Shutdown();
                 return null;
@@ -155,12 +211,13 @@ public class KafkaConnection {
         }
     }
 
-    private async int ReadExactAsync(byte[] outBuf, int count) {
-        if (outBuf == null || count <= 0) { return 0; }
+    private async int ReadExactAsync(nint s, byte[] outBuf, int count) {
+        if (s < 0 || outBuf == null || count <= 0) { return 0; }
         int received = 0;
-        while (received < count && this.connected) {
-            nint s = this.sock;
-            if (s < 0) { return -1; }
+        while (received < count) {
+            bool alive = false;
+            lock (this) { alive = this.connected; }
+            if (!alive) { return -1; }
             int n = await Socket.RecvPtrAsync(s, (nint)outBuf + (nint)received, count - received);
             if (n <= 0) { return -1; }
             received = received + n;
@@ -174,12 +231,18 @@ public class KafkaConnection {
     }
 
     public void Close() {
-        nint s = -1;
+        nint shutdownSock = -1;
+        nint closeSock = -1;
         List<AsyncGate> toWake = null;
         lock (this) {
             this.connected = false;
-            s = this.sock;
-            this.sock = -1;
+            if (this.sock >= 0) {
+                shutdownSock = this.sock;
+                if (!this.ioBusy) {
+                    closeSock = this.sock;
+                    this.sock = -1;
+                }
+            }
             if (this.ioWaiters != null && this.ioWaiters.Count() > 0) {
                 toWake = new List<AsyncGate>();
                 while (this.ioWaiters.Count() > 0) {
@@ -187,9 +250,11 @@ public class KafkaConnection {
                 }
             }
         }
-        if (s >= 0) {
-            Socket.ShutdownBoth(s);
-            Socket.Close(s);
+        if (shutdownSock >= 0) {
+            Socket.ShutdownBoth(shutdownSock);
+        }
+        if (closeSock >= 0) {
+            Socket.Close(closeSock);
         }
         if (toWake != null) {
             for (int i = 0; i < toWake.Count; i = i + 1) {

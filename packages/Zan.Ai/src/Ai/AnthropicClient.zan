@@ -160,7 +160,7 @@ public class AnthropicClient : IChat, IDisposable {
         w.WriteStartObject();
         w.WriteProperty("model", this.config.model);
         w.WriteProperty("max_tokens", this.config.maxTokens);
-        if (temperature >= 0.0) {
+        if (temperature >= 0.0 && temperature <= 1.0e308) {
             w.WriteProperty("temperature", temperature);
         }
         w.WriteProperty("stream", true);
@@ -221,7 +221,7 @@ public class AnthropicClient : IChat, IDisposable {
         w.WriteStartObject();
         w.WriteProperty("model", this.config.model);
         w.WriteProperty("max_tokens", this.config.maxTokens);
-        if (temperature >= 0.0) {
+        if (temperature >= 0.0 && temperature <= 1.0e308) {
             w.WriteProperty("temperature", temperature);
         }
         w.WriteProperty("stream", false);
@@ -289,16 +289,18 @@ public class AnthropicClient : IChat, IDisposable {
     // "/v1/messages"。用户如果写了 ".../v1"（有些 SDK 那样写），就只拼
     // "/messages"——否则会变成 "/v1/v1/messages"。
     public static string MessagesPath(AiEndpoint ep) {
+        if (ep == null) { return "/v1/messages"; }
         string p = ep.Path();
+        if (p == null) { p = ""; }
         if (p.EndsWith("/v1")) { return p + "/messages"; }
         return p + "/v1/messages";
     }
 
     // 取（或建）该端点的 `HttpClient`。同一端点复用同一个客户端，连接池
-    // 才能生效；换端点就换客户端（池是按 host/port 建的）。缓存本体在
-    // `AiHttp`，这里只留本协议的鉴权头。
+    // 才能生效；换端点或 apiVersion 就换键。缓存本体在 `AiHttp`，这里只留本协议的鉴权头。
     private HttpClient Client(AiEndpoint ep) {
-        HttpClient http = this.http.CacheGet(ep.Canonical());
+        string key = ep.Canonical() + "|v=" + this.apiVersion;
+        HttpClient http = this.http.CacheGet(key);
         if (http != null) { return http; }
         http = this.http.CreateClient(ep);
         http.SetCallPolicy(AiHttp.BuildPolicy(this.config, ep));
@@ -310,15 +312,14 @@ public class AnthropicClient : IChat, IDisposable {
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("x-api-key", this.config.apiKey);
         }
-        this.http.CachePut(ep.Canonical(), http);
-        return http;
+        return this.http.CacheGetOrPut(key, http);
     }
 
     // 流式专用的客户端：Accept 必须是 text/event-stream，读取超时按
     // **空闲窗口**算（每收到一个分片就重新计时），否则长回答会被读超时
     // 掐断——读超时要的是"对端沉默一段时间"，不是"总共读多久"。
     private HttpClient StreamClient(AiEndpoint ep) {
-        string key = ep.Canonical() + "|sse";
+        string key = ep.Canonical() + "|v=" + this.apiVersion + "|sse";
         HttpClient http = this.http.CacheGet(key);
         if (http != null) { return http; }
         http = this.http.CreateClient(ep);
@@ -338,8 +339,7 @@ public class AnthropicClient : IChat, IDisposable {
         if (this.config.apiKey.Length > 0) {
             http.SetHeader("x-api-key", this.config.apiKey);
         }
-        this.http.CachePut(key, http);
-        return http;
+        return this.http.CacheGetOrPut(key, http);
     }
 
     // ------------------------------------------------------------------

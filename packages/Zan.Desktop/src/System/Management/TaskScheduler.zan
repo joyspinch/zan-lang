@@ -170,6 +170,9 @@ public class TaskScheduler {
     // 不引 Zan.Security，就地定长缓冲区编码）。
     private static string RandomToken() {
         byte[] b = RandomNumberGenerator.GetBytes(16);
+        if (b == null || b.Length < 16) {
+            return Guid.New().Replace("-", "");
+        }
         byte[] hex = new byte[32];
         for (int i = 0; i < 16; i = i + 1) {
             int v = b[i] & 255;
@@ -189,10 +192,12 @@ public class TaskScheduler {
     public static bool Create(string name, string command, string trigger, string time) {
         #if WINDOWS
         // 白名单前置：名字/触发器/时间未过校验一律不拼命令。
-        if (!TaskScheduler.ValidName(name) || !TaskScheduler.ValidTrigger(trigger)) {
+        if (!TaskScheduler.ValidName(name) || !TaskScheduler.ValidTrigger(trigger)
+            || command == null || command.Length == 0) {
             return false;
         }
-        if (time != "" && !TaskScheduler.ValidTime(time)) { return false; }
+        string safeTime = time == null ? "" : time;
+        if (safeTime != "" && !TaskScheduler.ValidTime(safeTime)) { return false; }
         List<string> args = new List<string>();
         args.Add("/create");
         args.Add("/tn");
@@ -201,14 +206,14 @@ public class TaskScheduler {
         args.Add(command);
         args.Add("/sc");
         args.Add(trigger.Trim().ToUpper());
-        if (time != "") {
+        if (safeTime != "") {
             args.Add("/st");
-            args.Add(time.Trim());
+            args.Add(safeTime.Trim());
         }
         args.Add("/f");
         return TaskScheduler.SchtasksOk(args);
         #else
-        if (!TaskScheduler.ValidName(name) || command == "") { return false; }
+        if (!TaskScheduler.ValidName(name) || command == null || command == "") { return false; }
         // command 会整行写进 crontab：换行即注入任意条目，拒绝。
         if (command.IndexOf("\n") >= 0 || command.IndexOf("\r") >= 0) { return false; }
         if (TaskScheduler.MarkerName("# zan-task: " + name) == "") { return false; }
@@ -279,6 +284,7 @@ public class TaskScheduler {
         // pkill 的退出码：0 杀死了进程，1 没有匹配的进程（已经停了）。
         List<string> pkArgs = new List<string>();
         pkArgs.Add("-f");
+        pkArgs.Add("--");
         pkArgs.Add(t.command);
         ProcessResult r = Process.CaptureSafe("pkill", pkArgs);
         return r.exitCode == 0 || r.exitCode == 1;
@@ -328,14 +334,15 @@ public class TaskScheduler {
         if (tmp == "") { return false; }
         try {
             File.WriteAllText(tmp, sb.ToString());
+            List<string> cArgs = new List<string>();
+            cArgs.Add(tmp.StartsWith("-") ? ("./" + tmp) : tmp);
+            ProcessResult r = Process.CaptureSafe("crontab", cArgs);
+            return r.exitCode == 0;
         } catch (IOException e) {
             return false;
+        } finally {
+            if (File.Exists(tmp)) { File.Delete(tmp); }
         }
-        List<string> cArgs = new List<string>();
-        cArgs.Add(tmp);
-        ProcessResult r = Process.CaptureSafe("crontab", cArgs);
-        File.Delete(tmp);
-        return r.exitCode == 0;
     }
 
     // 去掉 `name` 对应的标记行和紧跟在后的 cron 行。
