@@ -272,6 +272,47 @@ partial class Irgen {
         // gets its real type back
         Node vty = SubstRecvTy(fty, recvTy);
         string ft = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
+        string dstTy = IsErasedType(fty) ? MapType(vty) : ft;
+        // Nested struct fields are heap-boxed pointers in gen1. When the
+        // receiver is soft_scratch (from an earlier null guard), scalar stores
+        // to soft_scratch+0 can alias a struct-pointer slot; bypass the load
+        // and stay on soft_scratch rather than dereferencing a scalar as a ptr.
+        if (IsStructTy(vty) && IsPtrLL(dstTy)) {
+            if (!ExternSeen("zan_rt_soft_scratch")) {
+                externDecls.Add("zan_rt_soft_scratch");
+                H("declare i8* @zan_rt_soft_scratch()");
+            }
+            string rawObj = NT();
+            L("  " + rawObj + " = bitcast %" + clsName + "* " + objOp + " to i8*");
+            string sc = NT();
+            L("  " + sc + " = call i8* @zan_rt_soft_scratch()");
+            string isSc = NT();
+            L("  " + isSc + " = icmp eq i8* " + rawObj + ", " + sc);
+            int realBb = NL(); int scBb = NL(); int doneBb = NL();
+            L("  br i1 " + isSc + ", label %L" + scBb + ", label %L" + realBb);
+            Label(realBb);
+            string pReal = EmitFieldPtr(cls, clsName, objOp, field, ft);
+            string loaded = NT();
+            L("  " + loaded + " = load " + ft + ", " + ft + "* " + pReal);
+            string realPtr = loaded;
+            string isNull = NT();
+            if (IsErasedType(fty)) {
+                L("  " + isNull + " = icmp eq i64 " + loaded + ", 0");
+                realPtr = NT();
+                L("  " + realPtr + " = inttoptr i64 " + loaded + " to " + dstTy);
+            } else {
+                L("  " + isNull + " = icmp eq " + ft + " " + loaded + ", null");
+            }
+            L("  br i1 " + isNull + ", label %L" + scBb + ", label %L" + doneBb);
+            Label(scBb);
+            string scCast = NT();
+            L("  " + scCast + " = bitcast i8* " + sc + " to " + dstTy);
+            L("  br label %L" + doneBb);
+            Label(doneBb);
+            string res = NT();
+            L("  " + res + " = phi " + dstTy + " [ " + realPtr + ", %L" + realBb + " ], [ " + scCast + ", %L" + scBb + " ]");
+            return new ExprVal(res, vty);
+        }
         string p = EmitFieldPtr(cls, clsName, objOp, field, ft);
         string t = NT();
         L("  " + t + " = load " + ft + ", " + ft + "* " + p);
