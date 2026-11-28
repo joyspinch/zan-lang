@@ -1,12 +1,20 @@
 using System;
 
 // 奇数行向右错半格，邻接关系与棋盘的六个方向一致。
+// 篱笆用完（闯关预算）也算 Escaped，另由 outOfFences 区分原因。
 public enum TrapCatResult { Playing, Trapped, Escaped }
 
 public class TrapCatBoard {
     const int Size = 9;
     const int Count = 81;
     const int Center = 40;
+    // 猫的聪明程度：0 最短路随机；1 最短路里挑出口最多的；
+    // 2 往前看两步（假设你会堵它最怕的那一格）；3 再加周期性蹦两格。
+    const int SkillGreedy = 0;
+    const int SkillWary = 1;
+    const int SkillLookahead = 2;
+    const int SkillPounce = 3;
+    const int Unreachable = 1000;
 
     bool[] blocked;
     int[] distance;
@@ -18,6 +26,14 @@ public class TrapCatBoard {
     int difficulty;
     long seed;
     TrapCatResult result;
+    int skill;
+    int budget;
+    int pounceEvery;
+    bool outOfFences;
+    int lastLeap;
+    int[] candidates;
+    int[] scratchDistance;
+    bool[] reach;
 
     TrapCatBoard() {
         blocked = new bool[TrapCatBoard.Count];
@@ -25,6 +41,9 @@ public class TrapCatBoard {
         queue = new int[TrapCatBoard.Count];
         moveCells = new int[TrapCatBoard.Count];
         catHistory = new int[TrapCatBoard.Count];
+        candidates = new int[TrapCatBoard.Count];
+        scratchDistance = new int[TrapCatBoard.Count];
+        reach = new bool[TrapCatBoard.Count];
         cat = TrapCatBoard.Center;
         result = TrapCatResult.Playing;
     }
@@ -56,11 +75,42 @@ public class TrapCatBoard {
         return 12;
     }
 
+    // 无尽模式：轻松/经典的猫只走最短路；挑战的猫会在等长路线里挑出口最多的。
     void NewRound(int level, long roundSeed) {
         difficulty = level < 0 ? 0 : (level > 2 ? 2 : level);
+        int roundSkill = difficulty == 2 ? TrapCatBoard.SkillWary : TrapCatBoard.SkillGreedy;
+        this.Configure(roundSeed, roundSkill, 0, 0);
+        this.Scatter(TrapCatBoard.InitialBlocks(difficulty));
+    }
+
+    // 闯关：pattern 为 81 个字符（'#' 障碍，其余空地）时按图摆放，否则按种子随机撒 blocks 个障碍。
+    void NewCustom(long roundSeed, string pattern, int blocks, int catSkill, int fenceBudget, int leapEvery) {
+        difficulty = 1;
+        this.Configure(roundSeed, catSkill, fenceBudget, leapEvery);
+        if (pattern != null && pattern.Length == TrapCatBoard.Count) {
+            for (int cell = 0; cell < TrapCatBoard.Count; cell++) {
+                blocked[cell] = cell != TrapCatBoard.Center && pattern.Substring(cell, 1) == "#";
+            }
+            this.FindRoutes();
+            return;
+        }
+        this.Scatter(blocks);
+    }
+
+    void Configure(long roundSeed, int catSkill, int fenceBudget, int leapEvery) {
         seed = roundSeed;
+        skill = catSkill < 0 ? 0 : (catSkill > 3 ? 3 : catSkill);
+        budget = fenceBudget < 0 ? 0 : fenceBudget;
+        pounceEvery = skill == TrapCatBoard.SkillPounce ? (leapEvery < 2 ? 4 : leapEvery) : 0;
+        cat = TrapCatBoard.Center;
+        moves = 0;
+        result = TrapCatResult.Playing;
+        outOfFences = false;
+        lastLeap = 0;
+    }
+
+    void Scatter(int count) {
         Random random = Random.Seeded(seed);
-        int[] candidates = new int[TrapCatBoard.Count];
         int candidateCount = 0;
         for (int cell = 0; cell < TrapCatBoard.Count; cell++) {
             bool nearCat = cell == TrapCatBoard.Center;
@@ -69,9 +119,6 @@ public class TrapCatBoard {
             }
             if (!nearCat) { candidates[candidateCount] = cell; candidateCount++; }
         }
-        cat = TrapCatBoard.Center;
-        moves = 0;
-        result = TrapCatResult.Playing;
         // 重试只改变初始障碍，避免随机开局已经围住猫。
         for (int attempt = 0; attempt < 64; attempt++) {
             for (int cell = 0; cell < TrapCatBoard.Count; cell++) { blocked[cell] = false; }
@@ -81,7 +128,7 @@ public class TrapCatBoard {
                 candidates[i] = candidates[j];
                 candidates[j] = temp;
             }
-            for (int i = 0; i < TrapCatBoard.InitialBlocks(difficulty); i++) { blocked[candidates[i]] = true; }
+            for (int i = 0; i < count && i < candidateCount; i++) { blocked[candidates[i]] = true; }
             this.FindRoutes();
             if (distance[cat] > 0) { return; }
         }
@@ -115,36 +162,200 @@ public class TrapCatBoard {
         }
     }
 
+    int FencesLeft() { return budget == 0 ? -1 : budget - moves; }
+
+    // 距下一次“蹦两格”还有几回合（1 = 你下一次落子后它就蹦）；不会蹦时返回 0。
+    int PounceIn() {
+        if (pounceEvery <= 0 || result != TrapCatResult.Playing) { return 0; }
+        return pounceEvery - moves % pounceEvery;
+    }
+
+    bool PlacedByPlayer(int cell) {
+        for (int i = 0; i < moves; i++) {
+            if (moveCells[i] == cell) { return true; }
+        }
+        return false;
+    }
+
     bool Block(int cell) {
         if (result != TrapCatResult.Playing || cell < 0 || cell >= TrapCatBoard.Count || cell == cat || blocked[cell]) { return false; }
         moveCells[moves] = cell;
         catHistory[moves] = cat;
         blocked[cell] = true;
         moves++;
+        lastLeap = 0;
         this.FindRoutes();
         if (distance[cat] < 0) { result = TrapCatResult.Trapped; return true; }
-        int bestDistance = TrapCatBoard.Count;
-        int chosen = -1;
-        int ties = 0;
         // 以回合数派生随机源，悔棋后重复落子仍得到同一条猫的路线。
         Random random = Random.Seeded(seed + (long)moves * 104729);
+        int chosen = this.ChooseStep(random);
+        if (chosen < 0) { result = TrapCatResult.Trapped; return true; }
+        cat = chosen;
+        lastLeap = 1;
+        if (TrapCatBoard.IsEdge(cat)) { result = TrapCatResult.Escaped; return true; }
+        if (pounceEvery > 0 && moves % pounceEvery == 0) {
+            int second = this.ChooseStep(random);
+            if (second >= 0) {
+                cat = second;
+                lastLeap = 2;
+                if (TrapCatBoard.IsEdge(cat)) { result = TrapCatResult.Escaped; return true; }
+            }
+        }
+        if (budget > 0 && moves >= budget) {
+            result = TrapCatResult.Escaped;
+            outOfFences = true;
+        }
+        return true;
+    }
+
+    // 猫的一步。调用前 distance 必须是当前棋盘的结果；返回 -1 表示无路可走。
+    int ChooseStep(Random random) {
+        if (skill >= TrapCatBoard.SkillLookahead) { return this.LookaheadStep(random); }
+        int bestDistance = TrapCatBoard.Count;
+        int bestExits = -1;
+        int chosen = -1;
+        int ties = 0;
         for (int dir = 0; dir < 6; dir++) {
             int next = TrapCatBoard.Neighbor(cat, dir);
             if (next >= 0 && !blocked[next] && distance[next] >= 0) {
-                if (distance[next] < bestDistance) {
+                int exits = skill == TrapCatBoard.SkillWary ? this.Downhill(next) : 0;
+                if (distance[next] < bestDistance || (distance[next] == bestDistance && exits > bestExits)) {
                     bestDistance = distance[next];
+                    bestExits = exits;
                     chosen = next;
                     ties = 1;
-                } else if (distance[next] == bestDistance) {
+                } else if (distance[next] == bestDistance && exits == bestExits) {
                     ties++;
                     if (random.NextBelow(ties) == 0) { chosen = next; }
                 }
             }
         }
-        if (chosen < 0) { result = TrapCatResult.Trapped; return true; }
-        cat = chosen;
-        if (TrapCatBoard.IsEdge(cat)) { result = TrapCatResult.Escaped; }
-        return true;
+        return chosen;
+    }
+
+    // 从 cell 出发，有几条“下坡”的相邻格（离出口更近一步）。越多越难一刀切断。
+    int Downhill(int cell) {
+        if (distance[cell] <= 0) { return 6; }
+        int count = 0;
+        for (int dir = 0; dir < 6; dir++) {
+            int next = TrapCatBoard.Neighbor(cell, dir);
+            if (next >= 0 && !blocked[next] && distance[next] == distance[cell] - 1) { count++; }
+        }
+        return count;
+    }
+
+    // 两步前瞻：对每个可去的相邻格，假设玩家随后封住最要命的一格，取最坏距离；
+    // 猫挑最坏情况最好的那一格（同分看当前距离，再随机）。
+    int LookaheadStep(Random random) {
+        int candidateCount = 0;
+        for (int dir = 0; dir < 6; dir++) {
+            int next = TrapCatBoard.Neighbor(cat, dir);
+            if (next >= 0 && !blocked[next] && distance[next] >= 0) {
+                candidates[candidateCount] = next;
+                candidateCount++;
+            }
+        }
+        if (candidateCount == 0) { return -1; }
+        for (int i = 0; i < candidateCount; i++) {
+            if (TrapCatBoard.IsEdge(candidates[i])) { return candidates[i]; }
+        }
+        for (int cell = 0; cell < TrapCatBoard.Count; cell++) { scratchDistance[cell] = distance[cell]; }
+        int bestScore = 0;
+        int chosen = -1;
+        int ties = 0;
+        for (int i = 0; i < candidateCount; i++) {
+            int next = candidates[i];
+            int worst = this.WorstAfterBlock(next);
+            int score = worst * 16 + scratchDistance[next];
+            if (chosen < 0 || score < bestScore) {
+                bestScore = score;
+                chosen = next;
+                ties = 1;
+            } else if (score == bestScore) {
+                ties++;
+                if (random.NextBelow(ties) == 0) { chosen = next; }
+            }
+        }
+        for (int cell = 0; cell < TrapCatBoard.Count; cell++) { distance[cell] = scratchDistance[cell]; }
+        return chosen;
+    }
+
+    // 猫站在 from 时，玩家任封一格后 from 到出口的最远距离（围死记 Unreachable）。
+    // 只有落在 from 的某条最短路上的格子才可能拉长距离，其余格子直接跳过。
+    int WorstAfterBlock(int from) {
+        int worst = scratchDistance[from];
+        for (int cell = 0; cell < TrapCatBoard.Count; cell++) {
+            if (cell == from || blocked[cell] || scratchDistance[cell] < 0 || scratchDistance[cell] >= scratchDistance[from]) { continue; }
+            blocked[cell] = true;
+            this.FindRoutes();
+            int d = distance[from] < 0 ? TrapCatBoard.Unreachable : distance[from];
+            blocked[cell] = false;
+            if (d > worst) { worst = d; }
+            if (worst >= TrapCatBoard.Unreachable) { break; }
+        }
+        return worst;
+    }
+
+    // 提示：逐格试封，用真实规则让猫回应后评估局面，挑分最高的一格；没有可封的格返回 -1。
+    // 试走经由 Block/Undo，悔棋记录与随机派生和真下一步完全一致。
+    int Hint() {
+        if (result != TrapCatResult.Playing) { return -1; }
+        int best = -1;
+        int bestScore = 0;
+        int baseDistance = distance[cat];
+        for (int cell = 0; cell < TrapCatBoard.Count; cell++) {
+            if (cell == cat || blocked[cell]) { continue; }
+            // 离猫所在连通区很远、又不在任何出口通道上的格子不值得试。
+            if (distance[cell] < 0 || distance[cell] > baseDistance + 1) { continue; }
+            this.Block(cell);
+            int score = this.Evaluate();
+            this.Undo();
+            if (best < 0 || score > bestScore) {
+                best = cell;
+                bestScore = score;
+            }
+        }
+        if (best < 0) {
+            for (int cell = 0; cell < TrapCatBoard.Count; cell++) {
+                if (cell != cat && !blocked[cell]) { return cell; }
+            }
+        }
+        return best;
+    }
+
+    // 局面分：围住最好；逃走最差；否则距离越远、下坡越少、可达出口越少越好。
+    int Evaluate() {
+        if (result == TrapCatResult.Trapped) { return 100000 - moves; }
+        if (result == TrapCatResult.Escaped) { return -100000; }
+        this.FindRoutes();
+        int d = distance[cat];
+        int exits = this.ReachableExits();
+        int pounceRisk = this.PounceIn() == 1 ? 1 : 0;
+        return d * 120 - this.Downhill(cat) * 35 - exits * 3 - pounceRisk * 60;
+    }
+
+    // 猫所在连通区里还剩几个开放的边缘格（正向 BFS，不改 distance）。
+    int ReachableExits() {
+        for (int cell = 0; cell < TrapCatBoard.Count; cell++) { reach[cell] = false; }
+        int readIndex = 0;
+        int writeIndex = 1;
+        int exits = 0;
+        queue[0] = cat;
+        reach[cat] = true;
+        while (readIndex < writeIndex) {
+            int current = queue[readIndex];
+            readIndex++;
+            if (TrapCatBoard.IsEdge(current)) { exits++; }
+            for (int dir = 0; dir < 6; dir++) {
+                int next = TrapCatBoard.Neighbor(current, dir);
+                if (next >= 0 && !blocked[next] && !reach[next]) {
+                    reach[next] = true;
+                    queue[writeIndex] = next;
+                    writeIndex++;
+                }
+            }
+        }
+        return exits;
     }
 
     bool Undo() {
@@ -153,6 +364,8 @@ public class TrapCatBoard {
         blocked[moveCells[moves]] = false;
         cat = catHistory[moves];
         result = TrapCatResult.Playing;
+        outOfFences = false;
+        lastLeap = 0;
         this.FindRoutes();
         return true;
     }

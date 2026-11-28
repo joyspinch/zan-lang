@@ -6,16 +6,34 @@ using Gui.Widget;
 using Game.Kit;
 using Game.Foundation;
 
+// 界面层：两种玩法（无尽三档 / 闯关 30 关）、选关页、结算卡、提示、档案与音效。
+// 规则在 TrapCatBoard，关卡表在 TrapCatLevels，场景美术在 TrapCatFx / TrapCatSprite。
 public class {{NAME}} {
+    const int HintsPerRound = 2;
+    const int ResultDelayMs = 900;
     static Form form;
     static Control root;
     static TrapCatBoard board;
     static Button[] cells;
     static Button undo;
     static TrapCatSprite catSprite;
+    static TrapCatGarden garden;
+    static TrapCatProps props;
+    static TrapCatStage stage;
+    static TrapCatConfetti confetti;
     static int level = 1;
     static long nextSeed;
-    // 外壳：档案（按难度记录胜场/连胜/最少步数）与程序化音效。
+    // 闯关：campaign 为当前关卡下标；-1 表示无尽模式。
+    static int campaign = -1;
+    static int hintsLeft;
+    static bool hinted;
+    static int lastStars;
+    static bool showingLevels;
+    static long resultAt;
+    static bool modalOpen;
+    static string[] modalActions;
+    static bool unlockAll;
+    // 外壳：档案（无尽按难度记录胜场/连胜/最少步数；闯关记每关星数与进度）与程序化音效。
     static GameProfile profile;
     static AudioBus audioBus;
     static SfxBank sfx;
@@ -34,9 +52,12 @@ public class {{NAME}} {
     static void Main() {
         board = new TrapCatBoard();
         cells = new Button[TrapCatBoard.Count];
+        modalActions = new string[] { "", "", "" };
         nextSeed = Window.GetTickMs();
         string fixedSeed = Environment.GetEnvironmentVariable("ZAN_TRAP_CAT_SEED");
         if (fixedSeed != "") { nextSeed = Convert.ToInt32(fixedSeed); }
+        // 调试用：解锁全部关卡（默认关闭，便于截图/验收后期关卡）。
+        unlockAll = Environment.GetEnvironmentVariable("ZAN_TRAP_CAT_UNLOCK") == "1";
         form = Form.Create("围住神经猫", 600, 760);
         App app = form.GetApp();
         ThemeSettings.Enable(app);
@@ -52,9 +73,14 @@ public class {{NAME}} {
         HtmlHandlers handlers = new HtmlHandlers();
         handlers.AddArg("cell", (string arg) => {{NAME}}.PickCell(arg));
         handlers.AddArg("difficulty", (string arg) => {{NAME}}.SetDifficulty(arg));
+        handlers.AddArg("pick-level", (string arg) => {{NAME}}.PickLevel(Convert.ToInt32(arg)));
+        handlers.AddArg("modal", (string arg) => {{NAME}}.ModalAction(Convert.ToInt32(arg)));
         handlers.Add("new-round", () => {{NAME}}.StartRound());
         handlers.Add("undo", () => {{NAME}}.Undo());
+        handlers.Add("hint", () => {{NAME}}.UseHint());
         handlers.Add("mute", () => {{NAME}}.ToggleMute());
+        handlers.Add("campaign", () => {{NAME}}.OpenLevels());
+        handlers.Add("levels-back", () => {{NAME}}.CloseLevels());
         string html = HtmlDocs.Read("src/TrapCat.html");
         root = Html.Load(app, html, handlers, "");
         root.Grow();
@@ -62,30 +88,55 @@ public class {{NAME}} {
         for (int i = 0; i < TrapCatBoard.Count; i++) {
             cells[i] = (Button){{NAME}}.RequireControl("Cell" + Convert.ToString(i));
             cells[i].FreeLayout();
-            cells[i].Tip = "封住第 " + Convert.ToString(i / TrapCatBoard.Size + 1) + " 行、第 " + Convert.ToString(i % TrapCatBoard.Size + 1) + " 个圆点";
+            cells[i].Tip = "在第 " + Convert.ToString(i / TrapCatBoard.Size + 1) + " 行、第 " + Convert.ToString(i % TrapCatBoard.Size + 1) + " 个圆点种灌木";
         }
+        Control boardBox = {{NAME}}.RequireControl("Board");
+        // 绘制顺序：木框 → 草坪 → 圆点 → 灌木/道具 → 小猫 → 笼子/爱心/粒子。
+        garden = new TrapCatGarden();
+        boardBox.InsertAt(1, garden);
+        props = new TrapCatProps(cells, board);
+        boardBox.Add(props);
         catSprite = new TrapCatSprite(cells);
-        {{NAME}}.RequireControl("Board").Add(catSprite);
-        {{NAME}}.SetupBoardArt();
+        boardBox.Add(catSprite);
+        stage = new TrapCatStage(cells, board, catSprite);
+        boardBox.Add(stage);
+        confetti = new TrapCatConfetti();
+        root.Add(confetti);
+        {{NAME}}.SetupArt();
         undo = (Button){{NAME}}.RequireControl("Undo");
+        {{NAME}}.RequireControl("Modal").visible = false;
+        {{NAME}}.RequireControl("LevelView").visible = false;
+        // 上次停在闯关就回到闯关当前关；自动化脚本用内存档案，总是从无尽·经典开始。
+        string startLevel = Environment.GetEnvironmentVariable("ZAN_TRAP_CAT_LEVEL");
+        if (startLevel != "") {
+            campaign = Convert.ToInt32(startLevel) - 1;
+        } else if (profile.Flag("camp.active", false)) {
+            campaign = (int)profile.Counter("camp.cursor");
+        }
+        if (campaign >= TrapCatLevels.Count) { campaign = TrapCatLevels.Count - 1; }
         {{NAME}}.NewRound();
         form.FrameHook(() => {{NAME}}.OnFrame());
-        // M 静音：没被控件消费的按键都走应用级出口，不依赖焦点在谁身上
-        // （封掉的圆点会失焦）。
-        form.GetApp().OnUnhandledKey((int code) => { if (code == 77) { {{NAME}}.ToggleMute(); } });
+        // 没被控件消费的按键都走应用级出口，不依赖焦点在谁身上（封掉的圆点会失焦）。
+        form.GetApp().OnUnhandledKey((int code) => {{NAME}}.OnKey(code));
         form.Run();
     }
 
-    // 棋盘底图：assets/cell.png 找不到就把 <img> 藏掉——
-    // 圆点照样是圆点，模板被拷走没带图也不影响玩法。
-    static void SetupBoardArt() {
-        Control bg = {{NAME}}.RequireControl("BoardBg");
-        string path = Assets.Find("assets/cell.png");
+    // 木框底图（assets/cell.png）、标题图标和结算卡头像（assets/icon.png）。
+    // 找不到图就把对应 <img> 藏掉——模板被拷走没带图也不影响玩法。
+    static void SetupArt() {
+        {{NAME}}.BindImage("BoardBg", "assets/cell.png");
+        {{NAME}}.BindImage("Logo", "assets/icon.png");
+        {{NAME}}.BindImage("CardHero", "assets/icon.png");
+    }
+
+    static void BindImage(string id, string asset) {
+        Control img = {{NAME}}.RequireControl(id);
+        string path = Assets.Find(asset);
         if (path != null && File.Exists(path)) {
-            ((Image)bg).Src = path;
+            ((Image)img).Src = path;
             return;
         }
-        bg.visible = false;
+        img.visible = false;
     }
 
     // 档案与音效只在界面层：TrapCatSim/回放不碰文件与音频。
@@ -101,6 +152,16 @@ public class {{NAME}} {
         sfx.AddPresets(new string[] { "select", "error", "click", "success", "fail" });
         // 猫的小跳：比 UI 点按更低更软的“嗒”。
         sfx.AddSynth("hop", SfxPresets.Click().WithFrequency(540.0).WithDuration(0.020).WithGain(0.12));
+        // 种灌木：短促向上的“啵”。
+        sfx.AddSynth("plant", SfxPresets.Select().WithSweep(320.0, 620.0).WithDuration(0.060).WithGain(0.20));
+        // 猫蹦两格：先压低再猛地上扬。
+        sfx.AddSynth("pounce", SfxPresets.Launch().WithSweep(260.0, 900.0).WithDuration(0.140).WithGain(0.18));
+        // 提示：清亮的两音铃。
+        sfx.AddSynth("hint", SfxPresets.Coin().WithSweep(880.0, 1320.0).WithDuration(0.110).WithGain(0.16));
+        // 结算星星，一颗一声，逐颗升高。
+        sfx.AddSynth("star", SfxPresets.Coin().WithSweep(990.0, 1480.0).WithDuration(0.090).WithGain(0.18));
+        // 篱笆用完：下行的“哎呀”。
+        sfx.AddSynth("empty", SfxPresets.Fail().WithSweep(420.0, 220.0).WithDuration(0.220).WithGain(0.20));
         // 开新局：柔和的三角波上扬，和胜利音同一家族但更短。
         sfx.AddSynth("round", SfxPresets.Select().WithSweep(440.0, 660.0).WithDuration(0.080).WithGain(0.22));
         sfx.Warm();
@@ -119,15 +180,49 @@ public class {{NAME}} {
     }
 
     static string Key(string stat) { return stat + "." + Convert.ToString(level); }
+    static string StarKey(int index) { return "camp.stars." + Convert.ToString(index); }
+
+    static int StarsOf(int index) { return (int)profile.Best({{NAME}}.StarKey(index)); }
+
+    static int TotalStars() {
+        int total = 0;
+        for (int i = 0; i < TrapCatLevels.Count; i++) { total += {{NAME}}.StarsOf(i); }
+        return total;
+    }
+
+    // 已解锁到第几关（下标）：通关一关解锁下一关。
+    static int Unlocked() {
+        if (unlockAll) { return TrapCatLevels.Count - 1; }
+        int u = (int)profile.Best("camp.unlocked");
+        return u >= TrapCatLevels.Count ? TrapCatLevels.Count - 1 : u;
+    }
 
     static void OnFrame() {
-        if (hopAt != 0 && Window.GetTickMs() - hopAt >= 0) {
+        long now = Window.GetTickMs();
+        if (hopAt != 0 && now - hopAt >= 0) {
             hopAt = 0;
-            {{NAME}}.Sfx("hop");
+            {{NAME}}.Sfx(board.lastLeap == 2 ? "pounce" : "hop");
+        }
+        if (resultAt != 0 && now - resultAt >= 0) {
+            resultAt = 0;
+            {{NAME}}.OpenModal();
         }
         {{NAME}}.PublishProbes();
     }
 
+    static void OnKey(int code) {
+        if (code == 77) { {{NAME}}.ToggleMute(); return; }
+        if (code == 27) {
+            if (showingLevels) { {{NAME}}.CloseLevels(); }
+            else if (modalOpen) { {{NAME}}.CloseModal(); }
+            return;
+        }
+        if (showingLevels) { return; }
+        if (code == 72) { {{NAME}}.UseHint(); }
+        if (code == 85 || code == 8) { {{NAME}}.Undo(); }
+        if (code == 78) { {{NAME}}.StartRound(); }
+        if (code == 13 && modalOpen) { {{NAME}}.ModalAction(2); }
+    }
 
     static void ToggleMute() {
         bool muted = !profile.Flag("muted", false);
@@ -137,26 +232,43 @@ public class {{NAME}} {
         {{NAME}}.Refresh();
     }
 
-    // 已经开始但没分出胜负就换局，算中途放弃：连胜清零。
+    // 已经开始但没分出胜负就换局，算中途放弃：无尽模式连胜清零。
     static void AbandonRound() {
-        if (board.moves > 0 && !roundSettled) {
+        if (campaign < 0 && board.moves > 0 && !roundSettled) {
             profile.Add({{NAME}}.Key("streak"), 0 - profile.Counter({{NAME}}.Key("streak")));
             profile.Save();
         }
     }
 
     static void NewRound() {
-        board.NewRound(level, nextSeed);
-        nextSeed++;
+        if (campaign >= 0) {
+            TrapCatLevels.Get(campaign).Apply(board);
+            garden.SetChapter(TrapCatLevels.Chapter(campaign));
+            props.SetChapter(TrapCatLevels.Chapter(campaign));
+        } else {
+            board.NewRound(level, nextSeed);
+            nextSeed++;
+            garden.SetChapter(0);
+            props.SetChapter(0);
+        }
         roundSettled = false;
         lastNewBest = false;
+        lastStars = 0;
+        hinted = false;
+        hintsLeft = {{NAME}}.HintsPerRound;
         lastResult = TrapCatResult.Playing;
         hopAt = 0;
+        resultAt = 0;
+        {{NAME}}.HideModal();
         catSprite.Reset(board.cat, board.result);
+        props.Reset();
+        stage.Reset();
+        confetti.Stop();
         {{NAME}}.Refresh();
     }
 
     static void StartRound() {
+        if (showingLevels) { return; }
         {{NAME}}.AbandonRound();
         {{NAME}}.Sfx("round");
         {{NAME}}.NewRound();
@@ -165,22 +277,97 @@ public class {{NAME}} {
     static void SetDifficulty(string arg) {
         {{NAME}}.AbandonRound();
         level = Convert.ToInt32(arg);
+        campaign = -1;
+        profile.SetFlag("camp.active", false);
+        profile.Save();
+        showingLevels = false;
+        {{NAME}}.Sfx("round");
+        {{NAME}}.NewRound();
+    }
+
+    static void OpenLevels() {
+        {{NAME}}.Sfx("click");
+        showingLevels = true;
+        {{NAME}}.HideModal();
+        confetti.Stop();
+        {{NAME}}.Refresh();
+    }
+
+    static void CloseLevels() {
+        showingLevels = false;
+        {{NAME}}.Sfx("click");
+        {{NAME}}.Refresh();
+    }
+
+    static void PickLevel(int index) {
+        if (index < 0 || index > {{NAME}}.Unlocked()) {
+            {{NAME}}.Sfx("error");
+            return;
+        }
+        {{NAME}}.AbandonRound();
+        campaign = index;
+        showingLevels = false;
+        profile.SetFlag("camp.active", true);
+        profile.Add("camp.cursor", index - profile.Counter("camp.cursor"));
+        profile.Save();
         {{NAME}}.Sfx("round");
         {{NAME}}.NewRound();
     }
 
     static void PickCell(string arg) {
-        if (!board.Block(Convert.ToInt32(arg))) {
+        int cell = Convert.ToInt32(arg);
+        if (!board.Block(cell)) {
             {{NAME}}.Sfx("error");
+            if (cell >= 0 && cell < TrapCatBoard.Count) { props.Nope(cell); }
+            form.GetApp().RequestRedraw();
             return;
         }
-        if (board.result == TrapCatResult.Playing) {
-            {{NAME}}.Sfx("select");
+        {{NAME}}.Sfx("plant");
+        if (board.result == TrapCatResult.Playing || board.outOfFences) {
             hopAt = Window.GetTickMs() + 110;
         }
+        props.Sync();
+        props.ClearHint();
         catSprite.WalkTo(board.cat, board.result);
         {{NAME}}.Settle();
         {{NAME}}.Refresh();
+    }
+
+    static void UseHint() {
+        if (showingLevels || board.result != TrapCatResult.Playing || hintsLeft <= 0) {
+            {{NAME}}.Sfx("error");
+            return;
+        }
+        int cell = board.Hint();
+        if (cell < 0) { {{NAME}}.Sfx("error"); return; }
+        hintsLeft--;
+        hinted = true;
+        props.ShowHint(cell);
+        {{NAME}}.Sfx("hint");
+        {{NAME}}.Refresh();
+    }
+
+    // 被关在很小的一块地里（≤4 格）= 落下笼子；被圈在一大片区域里，猫认命冒爱心。
+    static bool Caged() {
+        bool[] seen = new bool[TrapCatBoard.Count];
+        int[] queue = new int[TrapCatBoard.Count];
+        int read = 0;
+        int write = 1;
+        queue[0] = board.cat;
+        seen[board.cat] = true;
+        while (read < write) {
+            int current = queue[read];
+            read++;
+            for (int dir = 0; dir < 6; dir++) {
+                int n = TrapCatBoard.Neighbor(current, dir);
+                if (n >= 0 && !board.blocked[n] && !seen[n]) {
+                    seen[n] = true;
+                    queue[write] = n;
+                    write++;
+                }
+            }
+        }
+        return write <= 4;
     }
 
     // 每局只结算一次：胜负后悔棋可以复盘，但不会重复计分。
@@ -188,11 +375,26 @@ public class {{NAME}} {
         if (board.result == lastResult) { return; }
         lastResult = board.result;
         if (board.result == TrapCatResult.Playing) { return; }
-        if (board.result == TrapCatResult.Trapped) { {{NAME}}.Sfx("success"); }
-        else { {{NAME}}.Sfx("fail"); }
+        if (board.result == TrapCatResult.Trapped) {
+            {{NAME}}.Sfx("success");
+            stage.Play({{NAME}}.Caged() ? 1 : 2);
+        } else {
+            {{NAME}}.Sfx(board.outOfFences ? "empty" : "fail");
+            stage.Play(3);
+        }
+        resultAt = Window.GetTickMs() + {{NAME}}.ResultDelayMs;
         if (roundSettled) { return; }
         roundSettled = true;
         profile.Add("plays", 1);
+        if (campaign >= 0) {
+            {{NAME}}.SettleCampaign();
+        } else {
+            {{NAME}}.SettleEndless();
+        }
+        profile.Save();
+    }
+
+    static void SettleEndless() {
         if (board.result == TrapCatResult.Trapped) {
             profile.Add({{NAME}}.Key("wins"), 1);
             profile.Add({{NAME}}.Key("streak"), 1);
@@ -202,71 +404,253 @@ public class {{NAME}} {
         } else {
             profile.Add({{NAME}}.Key("streak"), 0 - profile.Counter({{NAME}}.Key("streak")));
         }
-        profile.Save();
+    }
+
+    static void SettleCampaign() {
+        if (board.result != TrapCatResult.Trapped) { return; }
+        TrapCatLevel spec = TrapCatLevels.Get(campaign);
+        lastStars = spec.Stars(board.moves, hinted);
+        lastNewBest = profile.SubmitBest({{NAME}}.StarKey(campaign), lastStars) && {{NAME}}.StarsOf(campaign) > 0;
+        profile.SubmitBest("camp.unlocked", campaign + 1);
+        profile.Add("camp.clears", 1);
     }
 
     static void Undo() {
+        if (showingLevels) { return; }
         if (!board.Undo()) {
             {{NAME}}.Sfx("error");
             return;
         }
         {{NAME}}.Sfx("click");
         hopAt = 0;
+        resultAt = 0;
         lastResult = board.result;
+        {{NAME}}.HideModal();
         catSprite.Reset(board.cat, board.result);
+        props.Reset();
+        stage.Reset();
+        confetti.Stop();
         {{NAME}}.Refresh();
     }
 
+    // ---------- 结算卡 ----------
+    static void OpenModal() {
+        if (board.result == TrapCatResult.Playing || showingLevels) { return; }
+        bool won = board.result == TrapCatResult.Trapped;
+        modalOpen = true;
+        {{NAME}}.RequireControl("Modal").visible = true;
+        {{NAME}}.RequireControl("Card").SetClassIn("won lost", won ? "won" : "lost");
+        string title = won ? "围住了！" : (board.outOfFences ? "篱笆用完了" : "猫溜走了");
+        string text;
+        if (campaign >= 0) {
+            TrapCatLevel spec = TrapCatLevels.Get(campaign);
+            if (won) {
+                title = lastStars == 3 ? "完美围捕！" : "围住了！";
+                text = "第 " + Convert.ToString(campaign + 1) + " 关用了 " + Convert.ToString(board.moves) + " 步";
+                if (lastStars < 3) {
+                    text = text + (hinted && board.moves <= spec.star3 ? " · 用过提示最多两星" : " · ≤" + Convert.ToString(spec.star3) + " 步可得三星");
+                }
+                if (lastNewBest) { text = text + " · 新纪录"; }
+            } else {
+                text = board.outOfFences
+                    ? "本关只有 " + Convert.ToString(spec.budget) + " 道篱笆。悔一步换个位置试试。"
+                    : "它跑到了边缘。悔一步，先堵住它最近的出口。";
+            }
+            bool last = campaign >= TrapCatLevels.Count - 1;
+            if (won) {
+                {{NAME}}.SetModal(0, "重玩", "retry");
+                {{NAME}}.SetModal(1, "选关", "levels");
+                {{NAME}}.SetModal(2, last ? "全部通关" : "下一关 ›", last ? "levels" : "next");
+            } else {
+                {{NAME}}.SetModal(0, "选关", "levels");
+                {{NAME}}.SetModal(1, "重玩", "retry");
+                {{NAME}}.SetModal(2, "悔一步", "undo");
+            }
+        } else {
+            if (won) {
+                text = "你用了 " + Convert.ToString(board.moves) + " 步切断所有出口。" + (lastNewBest ? "新纪录！" : "");
+            } else {
+                text = "它到达了边缘。可以悔棋，试试提前堵住远处的路。";
+            }
+            {{NAME}}.SetModal(0, "复盘", "close");
+            {{NAME}}.SetModal(1, won ? "" : "悔一步", won ? "" : "undo");
+            {{NAME}}.SetModal(2, "再来一局", "again");
+        }
+        {{NAME}}.RequireControl("CardTitle").SetProp("text", title);
+        {{NAME}}.RequireControl("CardText").SetProp("text", text);
+        bool showStars = campaign >= 0 && won;
+        {{NAME}}.RequireControl("Stars").visible = showStars;
+        for (int i = 0; i < 3; i++) {
+            {{NAME}}.RequireControl("Star" + Convert.ToString(i)).SetClassIn("on", showStars && i < lastStars ? "on" : "");
+        }
+        if (won) {
+            confetti.Launch(Window.GetTickMs());
+            if (showStars) { {{NAME}}.Sfx("star"); }
+        }
+        {{NAME}}.Refresh();
+    }
+
+    static void SetModal(int slot, string label, string action) {
+        Button b = (Button){{NAME}}.RequireControl(slot == 0 ? "ModalA" : (slot == 1 ? "ModalB" : "ModalC"));
+        b.Text = label;
+        b.visible = label != "";
+        modalActions[slot] = action;
+    }
+
+    static void HideModal() {
+        modalOpen = false;
+        {{NAME}}.RequireControl("Modal").visible = false;
+    }
+
+    static void CloseModal() {
+        {{NAME}}.HideModal();
+        {{NAME}}.Refresh();
+    }
+
+    static void ModalAction(int slot) {
+        if (!modalOpen || slot < 0 || slot > 2) { return; }
+        string action = modalActions[slot];
+        if (action == "undo") { {{NAME}}.Undo(); }
+        else if (action == "retry" || action == "again") { {{NAME}}.StartRound(); }
+        else if (action == "next") { {{NAME}}.PickLevel(campaign + 1); }
+        else if (action == "levels") { {{NAME}}.OpenLevels(); }
+        else if (action == "close") { {{NAME}}.CloseModal(); }
+    }
+
+    // ---------- 刷新 ----------
     static void Refresh() {
+        {{NAME}}.RequireControl("PlayView").visible = !showingLevels;
+        {{NAME}}.RequireControl("LevelView").visible = showingLevels;
+        if (showingLevels) { {{NAME}}.RefreshLevels(); }
+        bool playing = board.result == TrapCatResult.Playing;
+        int hintCell = playing ? props.hintCell : -1;
         for (int i = 0; i < TrapCatBoard.Count; i++) {
             Button cell = cells[i];
             string state = board.blocked[i] ? "blocked" : "open";
             if (i == board.cat) { state = "cat"; }
-            cell.SetClassIn("open blocked cat", state);
+            if (i == hintCell && state == "open") { state = "open hinted"; }
+            cell.SetClassIn("open blocked cat hinted", state);
             cell.Text = "";
             // 对局中已封点/猫所在点仍可点，点了给“不行”的提示音；分出胜负后整盘锁定。
-            cell.Disabled = board.result != TrapCatResult.Playing;
+            cell.Disabled = !playing;
         }
         for (int i = 0; i < 3; i++) {
             Control mode = {{NAME}}.RequireControl("Level" + Convert.ToString(i));
-            mode.SetClassIn("selected", i == level ? "selected" : "");
+            mode.SetClassIn("selected", campaign < 0 && !showingLevels && i == level ? "selected" : "");
         }
+        Button camp = (Button){{NAME}}.RequireControl("Campaign");
+        camp.Text = "闯关 ★" + Convert.ToString({{NAME}}.TotalStars());
+        camp.SetClassIn("selected", campaign >= 0 || showingLevels ? "selected" : "");
         undo.Disabled = board.moves == 0;
-        {{NAME}}.RefreshRecords();
+        Button hintBtn = (Button){{NAME}}.RequireControl("HintBtn");
+        hintBtn.Text = "提示 " + Convert.ToString(hintsLeft);
+        hintBtn.Disabled = !playing || hintsLeft <= 0;
+        Button again = (Button){{NAME}}.RequireControl("NewRound");
+        again.Text = campaign >= 0 ? "重玩本关" : "再来一局";
+        {{NAME}}.RefreshHud();
+        {{NAME}}.RefreshStatus();
+        form.GetApp().RequestRedraw();
+    }
+
+    static void RefreshHud() {
+        Control fences = {{NAME}}.RequireControl("Fences");
+        Control target = {{NAME}}.RequireControl("Target");
         {{NAME}}.RequireControl("Moves").SetProp("text", Convert.ToString(board.moves) + " 步");
+        if (campaign >= 0) {
+            TrapCatLevel spec = TrapCatLevels.Get(campaign);
+            int chapter = TrapCatLevels.Chapter(campaign);
+            {{NAME}}.RequireControl("HudTitle").SetProp("text", "第 " + Convert.ToString(campaign + 1) + " 关 · " + TrapCatLevels.ChapterName(chapter));
+            string best = {{NAME}}.StarsOf(campaign) > 0 ? " · 最佳 " + {{NAME}}.StarText({{NAME}}.StarsOf(campaign)) : "";
+            {{NAME}}.RequireControl("Records").SetProp("text", "猫" + TrapCatLevels.SkillText(spec.skill) + best);
+            int left = board.FencesLeft();
+            fences.visible = true;
+            fences.SetProp("text", "篱笆 " + Convert.ToString(left < 0 ? 0 : left));
+            fences.SetClassIn("low", left <= 2 ? "low" : "");
+            target.visible = true;
+            target.SetProp("text", "★★★ ≤" + Convert.ToString(spec.star3) + " · ★★ ≤" + Convert.ToString(spec.star2));
+        } else {
+            string[] names = new string[] { "轻松", "经典", "挑战" };
+            {{NAME}}.RequireControl("HudTitle").SetProp("text", "无尽 · " + names[level]);
+            fences.visible = false;
+            target.visible = false;
+            {{NAME}}.RefreshRecords();
+        }
+        {{NAME}}.RequireControl("NewBest").visible = board.result == TrapCatResult.Trapped && lastNewBest;
+        bool muted = profile.Flag("muted", false);
+        Button mute = (Button){{NAME}}.RequireControl("Mute");
+        mute.Text = muted ? "♪ 音效关" : "♪ 音效开";
+        mute.SetClassIn("selected", muted ? "" : "selected");
+    }
+
+    static string StarText(int stars) {
+        string s = "";
+        for (int i = 0; i < 3; i++) { s = s + (i < stars ? "★" : "☆"); }
+        return s;
+    }
+
+    static void RefreshStatus() {
         string headline = "猫还在寻找出口";
-        string hint = "点击空圆点封路，它会沿最短路线走一步。";
+        string hint = "点击空圆点种一丛灌木，它会沿最短路线走一步。";
         string resultClass = "playing";
+        if (campaign >= 0 && board.moves == 0 && board.result == TrapCatResult.Playing) {
+            TrapCatLevel spec = TrapCatLevels.Get(campaign);
+            headline = "第 " + Convert.ToString(campaign + 1) + " 关：猫" + TrapCatLevels.SkillText(spec.skill);
+            hint = "篱笆 " + Convert.ToString(spec.budget) + " 道；≤" + Convert.ToString(spec.star3) + " 步围住拿三星。";
+            if (spec.leap > 0) { hint = "它每 " + Convert.ToString(spec.leap) + " 回合会蹦两格，头顶冒“!”时当心。"; }
+        }
+        if (board.result == TrapCatResult.Playing && board.lastLeap == 2) {
+            headline = "猫一口气蹦了两格！";
+            resultClass = "warn";
+        } else if (board.PounceIn() == 1) {
+            headline = "当心：它下回合要蹦两格";
+            hint = "把它两步之内能到的出口一起堵上。";
+            resultClass = "warn";
+        } else if (board.result == TrapCatResult.Playing && board.FencesLeft() >= 0 && board.FencesLeft() <= 2 && board.moves > 0) {
+            headline = "篱笆只剩 " + Convert.ToString(board.FencesLeft()) + " 道";
+            hint = "每一道都要堵在它的必经之路上。";
+            resultClass = "warn";
+        }
+        if (props.hintCell >= 0 && board.result == TrapCatResult.Playing && !board.blocked[props.hintCell]) {
+            hint = "提示：试试闪光的那一格。";
+        }
         if (board.result == TrapCatResult.Trapped) {
-            headline = "围住了！这只猫服气了";
-            hint = "你用了 " + Convert.ToString(board.moves) + " 步切断所有出口，再来一局？";
-            if (lastNewBest) { headline = "围住了！新纪录"; }
+            headline = lastNewBest ? "围住了！新纪录" : "围住了！这只猫服气了";
+            hint = "你用了 " + Convert.ToString(board.moves) + " 步切断所有出口。";
             resultClass = "won";
         } else if (board.result == TrapCatResult.Escaped) {
-            headline = "哎呀，猫溜走了";
-            hint = "它已经到达边缘。可以悔棋，试试提前堵住远处的路。";
+            headline = board.outOfFences ? "篱笆用完，猫大摇大摆走了" : "哎呀，猫溜走了";
+            hint = "可以悔棋，试试提前堵住远处的路。";
             resultClass = "lost";
         }
         {{NAME}}.RequireControl("Status").SetProp("text", headline);
         {{NAME}}.RequireControl("Hint").SetProp("text", hint);
-        {{NAME}}.RequireControl("Result").SetClassIn("playing won lost", resultClass);
-        form.GetApp().RequestRedraw();
+        {{NAME}}.RequireControl("Result").SetClassIn("playing won lost warn", resultClass);
     }
 
     static void RefreshRecords() {
         long wins = profile.Counter({{NAME}}.Key("wins"));
         long streak = profile.Counter({{NAME}}.Key("streak"));
         string text = "胜 " + Convert.ToString(wins)
-            + " · 连胜 " + Convert.ToString(streak) + "（最佳 " + Convert.ToString(profile.Best({{NAME}}.Key("beststreak"))) + "）";
+            + " · 连胜 " + Convert.ToString(streak) + "/" + Convert.ToString(profile.Best({{NAME}}.Key("beststreak")));
         if (profile.HasBest({{NAME}}.Key("fewest"))) {
-            text = text + " · 最少 " + Convert.ToString(profile.Best({{NAME}}.Key("fewest"))) + " 步";
+            text = text + " · 最少" + Convert.ToString(profile.Best({{NAME}}.Key("fewest"))) + "步";
         }
         {{NAME}}.RequireControl("Records").SetProp("text", text);
-        {{NAME}}.RequireControl("NewBest").visible = board.result == TrapCatResult.Trapped && lastNewBest;
-        bool muted = profile.Flag("muted", false);
-        Button mute = (Button){{NAME}}.RequireControl("Mute");
-        mute.Text = muted ? "音效 关" : "音效 开";
-        mute.SetClassIn("selected", muted ? "" : "selected");
+    }
+
+    static void RefreshLevels() {
+        int unlocked = {{NAME}}.Unlocked();
+        {{NAME}}.RequireControl("StarTotal").SetProp("text", "★ " + Convert.ToString({{NAME}}.TotalStars()) + " / " + Convert.ToString(TrapCatLevels.Count * 3));
+        for (int i = 0; i < TrapCatLevels.Count; i++) {
+            Button b = (Button){{NAME}}.RequireControl("Lv" + Convert.ToString(i));
+            int stars = {{NAME}}.StarsOf(i);
+            bool open = i <= unlocked;
+            b.Disabled = !open;
+            b.Text = open ? Convert.ToString(i + 1) + " " + {{NAME}}.StarText(stars) : Convert.ToString(i + 1) + " ·  锁";
+            string cls = stars == 3 ? "s3" : "";
+            if (i == campaign) { cls = cls + " current"; }
+            b.SetClassIn("s3 current", cls);
+        }
     }
 
     static void PublishProbes() {
@@ -278,6 +662,13 @@ public class {{NAME}} {
         UiDriver.SetProbe("trap.result", result);
         UiDriver.SetProbe("trap.muted", profile.Flag("muted", false) ? "true" : "false");
         UiDriver.SetProbe("trap.wins", Convert.ToString(profile.Counter({{NAME}}.Key("wins"))));
+        UiDriver.SetProbe("trap.campaign", Convert.ToString(campaign));
+        UiDriver.SetProbe("trap.stars", Convert.ToString(lastStars));
+        UiDriver.SetProbe("trap.hints", Convert.ToString(hintsLeft));
+        UiDriver.SetProbe("trap.hintcell", Convert.ToString(props.hintCell));
+        UiDriver.SetProbe("trap.view", showingLevels ? "levels" : "play");
+        UiDriver.SetProbe("trap.modal", modalOpen ? "true" : "false");
+        UiDriver.SetProbe("trap.fences", Convert.ToString(board.FencesLeft()));
         for (int i = 0; i < TrapCatBoard.Count; i++) {
             UiDriver.SetProbe("id.Cell" + Convert.ToString(i), Convert.ToString(cells[i].wid));
         }
@@ -285,8 +676,12 @@ public class {{NAME}} {
             Button mode = (Button){{NAME}}.RequireControl("Level" + Convert.ToString(i));
             UiDriver.SetProbe("id.Level" + Convert.ToString(i), Convert.ToString(mode.wid));
         }
-        UiDriver.SetProbe("id.Undo", Convert.ToString(undo.wid));
-        Button restart = (Button){{NAME}}.RequireControl("NewRound");
-        UiDriver.SetProbe("id.NewRound", Convert.ToString(restart.wid));
+        for (int i = 0; i < TrapCatLevels.Count; i++) {
+            UiDriver.SetProbe("id.Lv" + Convert.ToString(i), Convert.ToString(((Button){{NAME}}.RequireControl("Lv" + Convert.ToString(i))).wid));
+        }
+        string[] named = new string[] { "Undo", "NewRound", "HintBtn", "Campaign", "LevelsBack", "ModalA", "ModalB", "ModalC", "Mute" };
+        for (int i = 0; i < named.Length; i++) {
+            UiDriver.SetProbe("id." + named[i], Convert.ToString(((Button){{NAME}}.RequireControl(named[i])).wid));
+        }
     }
 }
