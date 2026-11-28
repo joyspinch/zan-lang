@@ -242,7 +242,7 @@ public partial class Checker {
             if (callee != null && callee.kind == AK.Ident()) {
                 if (callee.sval == "sizeof") { return MkType("int"); }
                 Node receiver = CallReceiverType(e, curClass, null);
-                Node m = MethodUpCall(curClass, callee.sval, e, receiver);
+                Node m = MethodUpCallForType(curClass, callee.sval, e, receiver);
                 if (m != null) { return SubstMethodTypeParams(m.type, m, e); }
                 return null;
             }
@@ -339,10 +339,9 @@ public partial class Checker {
                 if (cls == null) { cls = StaticRecv(callee.a); }
                 if (cls != null) {
                     Node receiver = CallReceiverType(e, cls, ot);
-                    Node m = MethodUpCall(cls, callee.sval, e, receiver);
+                    Node m = MethodUpCallForType(cls, callee.sval, e, receiver);
                     if (m != null) {
-                        Node ret = SubstTypeParams(m.type, cls, ot);
-                        ret = SubstMethodTypeParams(ret, m, e);
+                        Node ret = SubstCallReturnType(m.type, cls, ot, m, e);
                         return LiftNullCondType(e, ret);
                     }
                 }
@@ -362,6 +361,150 @@ public partial class Checker {
             return InferType(e.a);
         }
         return null;
+    }
+
+    int MethodTypeParamCount(Node m) {
+        if (m == null) { return 0; }
+        int cnt = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.TypeParam()) { cnt = cnt + 1; }
+            i = i + 1;
+        }
+        return cnt;
+    }
+
+    // Overload resolution aware of explicit generic method type arguments:
+    // when `call.d` supplies `<T1, ...>`, only candidates whose method-level
+    // TypeParam arity matches are eligible (avoiding e.g. `LRangeAsync<User>`
+    // binding to the non-generic `LRangeAsync` overload returning `List<string>`).
+    Node MethodUpCallForType(Node cls, string name, Node call, Node receiver) {
+        if (cls == null) { return null; }
+        int wantTp = 0;
+        if (call != null && call.d != null && call.d.kind == AK.TypeRef()
+            && call.d.sval == "__typeargs") {
+            wantTp = call.d.kids.Count;
+        }
+        if (wantTp == 0) { return MethodUpCall(cls, name, call, receiver); }
+        int argc = call != null ? call.kids.Count : 0;
+        List<Node> fit = new List<Node>();
+        Node c = cls;
+        int depth = 0;
+        while (c != null && depth < 512) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name
+                    && MethodTypeParamCount(m) == wantTp
+                    && AcceptsArgcOf(m, argc)
+                    && MethodGroupArgsFit(m, call, receiver)) {
+                    fit.Add(m);
+                }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            depth = depth + 1;
+        }
+        if (fit.Count > 0) {
+            if (fit.Count == 1) { return fit[0]; }
+            Node pick = fit[0];
+            int best = CallScore(fit[0], call, receiver);
+            int k = 1;
+            while (k < fit.Count) {
+                int s = CallScore(fit[k], call, receiver);
+                if (s > best) { best = s; pick = fit[k]; }
+                k = k + 1;
+            }
+            return pick;
+        }
+        if (cls.interfaces != null) {
+            int ii = 0;
+            while (ii < cls.interfaces.Count) {
+                string iname = cls.interfaces[ii];
+                int ilt = iname.IndexOf("<");
+                string baseIf = ilt > 0 ? iname.Substring(0, ilt) : iname;
+                Node iface = binder.FindType(baseIf);
+                if (iface != null) {
+                    Node im = MethodUpCallForType(iface, name, call, receiver);
+                    if (im != null && MethodTypeParamCount(im) == wantTp && AcceptsArgcOf(im, argc)) {
+                        return im;
+                    }
+                }
+                ii = ii + 1;
+            }
+        }
+        List<Node> extMs = new List<Node>();
+        List<string> extOwners = new List<string>();
+        binder.FindExtensionAll(cls.sval, name, extMs, extOwners);
+        int ei = 0;
+        while (ei < extMs.Count) {
+            if (MethodTypeParamCount(extMs[ei]) == wantTp && AcceptsArgcOf(extMs[ei], argc)) {
+                fit.Add(extMs[ei]);
+            }
+            ei = ei + 1;
+        }
+        if (fit.Count > 0) {
+            if (fit.Count == 1) { return fit[0]; }
+            Node pick = fit[0];
+            int best = CallScore(fit[0], call, receiver);
+            int k = 1;
+            while (k < fit.Count) {
+                int s = CallScore(fit[k], call, receiver);
+                if (s > best) { best = s; pick = fit[k]; }
+                k = k + 1;
+            }
+            return pick;
+        }
+        return MethodUpCall(cls, name, call, receiver);
+    }
+
+    // Simultaneous class + method type-parameter substitution with lexical
+    // shadowing: method type parameters shadow same-named class type parameters
+    // (e.g. `Box<string>.Wrap<int>` substitutes `T -> int`, not `T -> string`).
+    Node SubstCallReturnType(Node t, Node cls, Node ot, Node m, Node call) {
+        if (t == null) { return null; }
+        List<string> names = new List<string>();
+        List<Node> reps = new List<Node>();
+        if (m != null && call != null && call.d != null
+            && call.d.kind == AK.TypeRef() && call.d.sval == "__typeargs") {
+            int mpi = 0;
+            int mi = 0;
+            while (mi < m.kids.Count) {
+                if (m.kids[mi].kind == AK.TypeParam()) {
+                    if (mpi < call.d.kids.Count) {
+                        names.Add(m.kids[mi].sval);
+                        reps.Add(call.d.kids[mpi]);
+                        mpi = mpi + 1;
+                    }
+                }
+                mi = mi + 1;
+            }
+        }
+        if (cls != null && ot != null && ot.kids.Count > 0) {
+            int cpi = 0;
+            int ci = 0;
+            while (ci < cls.kids.Count) {
+                if (cls.kids[ci].kind == AK.TypeParam()) {
+                    if (cpi < ot.kids.Count) {
+                        string cname = cls.kids[ci].sval;
+                        bool shadowed = false;
+                        int si = 0;
+                        while (si < names.Count) {
+                            if (names[si] == cname) { shadowed = true; break; }
+                            si = si + 1;
+                        }
+                        if (!shadowed) {
+                            names.Add(cname);
+                            reps.Add(ot.kids[cpi]);
+                        }
+                        cpi = cpi + 1;
+                    }
+                }
+                ci = ci + 1;
+            }
+        }
+        if (names.Count == 0) { return t; }
+        return SubstType(t, names, reps);
     }
 
     bool IsStr(Node t) { return t != null && t.sval == "string"; }
