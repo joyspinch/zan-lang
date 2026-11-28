@@ -24,7 +24,8 @@
   "calibers": ["9mm", "5.8mm"],
   "items": [
     {"id": 1, "name": "手枪", "short": "P", "w": 2, "h": 1, "cat": "weapon",
-     "value": 400, "weapon": 1, "sidearm": true, "mag": 13, "caliber": 0},
+     "value": 400, "weapon": 1, "sidearm": true, "mag": 13, "caliber": 0,
+     "icon": "icons/1.png", "model": "service_pistol"},
     {"id": 10, "name": "9mm 普通弹", "cat": "ammo", "stack": 60, "caliber": 0, "tier": 0, "pen": 14},
     {"id": 20, "name": "警用防弹衣", "w": 3, "h": 3, "cat": "armor", "tier": 2, "durability": 45},
     {"id": 33, "name": "帆布挎包", "w": 2, "h": 2, "cat": "bag", "gridW": 3, "gridH": 3},
@@ -36,6 +37,8 @@
 ```
 
 - `cat`：weapon / ammo / armor / helmet / rig / bag / med / loot / key。
+- `icon` 图标图片路径、`model` 3D 模型名（都可省略，由游戏决定怎么用：常见做法是
+  用 `Game.Render3D.ModelThumbnail` 把模型离线烘成图标）。
 - 武器 `weapon` 是游戏侧武器表索引；`sidearm` 决定能否进副武器槽。
 - `lootTables` 每项 `[物品 id, 权重]`；`Fill(grid, 容器key, rng, tierBoost)` 中
   `tierBoost` 按稀有度放大权重（高价值区用）。新掉落物 `Found = false`，需要搜索。

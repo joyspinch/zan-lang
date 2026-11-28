@@ -1,0 +1,84 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+
+namespace Game.Render3D;
+
+// 模型缩略图：正交相机按旋转后的包围盒自动取景（等比、留边），三点布光画单个模型。
+// 用途：背包/商店图标离线烘焙、编辑器预览。画布可以是离屏 Canvas(w, h)。
+// 透明底的常见做法：同一模型分别在黑底、白底各画一次，alpha = 1 - (白 - 黑)。
+public static class ModelThumbnail {
+    // 视图旋转：先绕 y 转 yaw，再绕 x 转 pitch（正 pitch = 从上往下看）；相机在 +z 看向 -z。
+    public static Mat4 ViewRotation(float yaw, float pitch) {
+        return Mat4.Mul(Mat4.RotateAxis(1.0f, 0.0f, 0.0f, pitch), Mat4.RotateAxis(0.0f, 1.0f, 0.0f, yaw));
+    }
+
+    // 包围盒（模型空间）经 model 与视图旋转后的屏幕范围，按 aspect（宽/高）扩成等比并留 margin 比例边。
+    // 输出正交半宽/半高与中心、深度范围；返回 false 表示包围盒无效。
+    public static bool FitBounds(float minX, float minY, float minZ, float maxX, float maxY, float maxZ, Mat4 model,
+                                 float yaw, float pitch, float aspect, float margin,
+                                 out float centerX, out float centerY, out float halfW, out float halfH, out float minDepth, out float maxDepth) {
+        centerX = 0.0f; centerY = 0.0f; halfW = 1.0f; halfH = 1.0f; minDepth = -1.0f; maxDepth = 1.0f;
+        if (minX > maxX || minY > maxY || minZ > maxZ) { return false; }
+        float[] m = Mat4.Mul(ViewRotation(yaw, pitch), model).m;
+        float x0 = 1e30f; float x1 = -1e30f; float y0 = 1e30f; float y1 = -1e30f; float z0 = 1e30f; float z1 = -1e30f;
+        for (int i = 0; i < 8; i = i + 1) {
+            float px = (i & 1) == 0 ? minX : maxX; float py = (i & 2) == 0 ? minY : maxY; float pz = (i & 4) == 0 ? minZ : maxZ;
+            float vx = m[0] * px + m[1] * py + m[2] * pz + m[3];
+            float vy = m[4] * px + m[5] * py + m[6] * pz + m[7];
+            float vz = m[8] * px + m[9] * py + m[10] * pz + m[11];
+            if (vx < x0) { x0 = vx; } if (vx > x1) { x1 = vx; }
+            if (vy < y0) { y0 = vy; } if (vy > y1) { y1 = vy; }
+            if (vz < z0) { z0 = vz; } if (vz > z1) { z1 = vz; }
+        }
+        centerX = (x0 + x1) * 0.5f; centerY = (y0 + y1) * 0.5f;
+        float hw = MathF.Max(1e-4f, (x1 - x0) * 0.5f); float hh = MathF.Max(1e-4f, (y1 - y0) * 0.5f);
+        float a = aspect > 0.0f ? aspect : 1.0f;
+        if (hw / hh > a) { hh = hw / a; } else { hw = hh * a; }
+        float k = 1.0f + MathF.Max(0.0f, margin);
+        halfW = hw * k; halfH = hh * k; minDepth = z0; maxDepth = z1;
+        return true;
+    }
+
+    // 视图投影矩阵（正交，按 FitBounds 取景）。
+    public static Mat4 ViewProjection(PropAsset p, Mat4 model, float yaw, float pitch, float aspect, float margin) {
+        float cx; float cy; float hw; float hh; float z0; float z1;
+        FitBounds(p.MinX, p.MinY, p.MinZ, p.MaxX, p.MaxY, p.MaxZ, model, yaw, pitch, aspect, margin, out cx, out cy, out hw, out hh, out z0, out z1);
+        float pad = MathF.Max(0.01f, (z1 - z0) * 0.1f);
+        // 相机放在最近面之前：视空间 z' = z - (z1 + pad)，可见范围 [-(z1 - z0 + 2pad), 0)
+        Mat4 view = Mat4.Mul(Mat4.Translate(-cx, -cy, -(z1 + pad)), ViewRotation(yaw, pitch));
+        Mat4 proj = Mat4.Ortho(-hw, hw, -hh, hh, 0.001f, z1 - z0 + pad * 2.0f);
+        return Mat4.Mul(proj, view);
+    }
+
+    // 画一张缩略图：先用 bg 铺底，再三点布光画模型（不投影、不雾化）。
+    public static void Draw(Canvas c, PropLibrary lib, PropAsset p, Mat4 model, float yaw, float pitch, float margin, int bg) {
+        if (c == null || p == null) { return; }
+        int w = c.Width(); int h = c.Height();
+        c.FillRect(0, 0, w, h, bg);
+        lib.Upload(c, p);
+        Mat4 vp = ViewProjection(p, model, yaw, pitch, (float)w / (float)Math.Max(1, h), margin);
+        // 相机在世界空间的方向（视图旋转的逆作用在 +z 上）
+        float[] r = ViewRotation(yaw, pitch).m;
+        float ex = r[8] * 50.0f; float ey = r[9] * 50.0f; float ez = r[10] * 50.0f;
+        c.ShadowClear();
+        c.SetLights3D(new float[] { r[0] * 0.5f + r[4] * 0.8f + r[8] * 0.6f, r[1] * 0.5f + r[5] * 0.8f + r[9] * 0.6f, r[2] * 0.5f + r[6] * 0.8f + r[10] * 0.6f,
+                                    -r[0] * 0.7f + r[4] * 0.2f + r[8] * 0.3f, -r[1] * 0.7f + r[5] * 0.2f + r[9] * 0.3f, -r[2] * 0.7f + r[6] * 0.2f + r[10] * 0.3f },
+                      new float[] { 1.35f, 1.3f, 1.25f, 0.45f, 0.5f, 0.6f },
+                      new float[] { 0.32f, 0.33f, 0.36f });
+        c.SetHemisphereAmbient3D(true, 0.42f, 0.44f, 0.48f, 0.18f, 0.17f, 0.16f);
+        c.SetCamera3D(ex, ey, ez);
+        c.SetFog3D(false, 0.0f, 0.0f, 0.0f, 1000.0f, 2000.0f);
+        c.SetPointLights3D(null, null);
+        c.SetCull3D(0);
+        c.BeginFrame3D();
+        for (int k = 0; k < p.MeshIds.Count; k = k + 1) {
+            PbrMaterial mat = p.Materials[k];
+            mat.Bind(c);
+            c.DrawMesh3DEx(p.MeshIds[k], Mat4.Mul(vp, model), model, unchecked((int)0xFFFFFFFF), mat.Albedo);
+        }
+        PbrMaterial.Unbind(c);
+        c.EndFrame3D();
+    }
+}
