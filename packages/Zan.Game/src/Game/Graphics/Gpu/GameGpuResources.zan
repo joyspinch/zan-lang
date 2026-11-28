@@ -121,6 +121,12 @@ internal sealed class GpuScreenLightProgram {
     public int UVol = -1; public int UAo = -1; public int UShadowOn = -1;
 }
 
+internal sealed class GpuBloomProgram {
+    public uint Program;
+    public int USrc = -1; public int USrcTexel = -1; public int UThresh = -1; public int URadius = -1;
+    public int UScene = -1; public int UBloom = -1; public int UIntensity = -1;
+}
+
 internal sealed class GpuPostProgram {
     public uint Program;
     public int UScene = -1;
@@ -218,6 +224,16 @@ internal static class GameGpuResources {
     private static GpuPostProgram postProg;
     private static GpuSkyboxProgram skyboxProg;
     private static GpuScreenLightProgram screenLightProg;
+    private static GpuBloomProgram bloomDown;
+    private static GpuBloomProgram bloomUp;
+    private static GpuBloomProgram bloomComposite;
+    public const int BloomLevels = 6;
+    public static uint[] BloomTex = new uint[6];
+    public static uint[] BloomFbo = new uint[6];
+    public static int[] BloomW = new int[6];
+    public static int[] BloomH = new int[6];
+    public static int BloomBaseW;
+    public static int BloomBaseH;
     public static uint PostDepthTex;
     public static uint PostDepthFbo;
     public static int PostDepthW;
@@ -649,6 +665,57 @@ internal static class GameGpuResources {
         }
         shadowSkinProg = p;
         return p;
+    }
+
+    private static GpuBloomProgram MakeBloom(string fs) {
+        GlApi gl = GameGpuState.Gl;
+        string head = GameGpuShaders.GlslHeader(gl);
+        uint prog = GlBridge.GpuProgram(head + GameGpuPostShaders.PostVs(), head + fs);
+        if (prog == 0u) { return null; }
+        GpuBloomProgram p = new GpuBloomProgram();
+        p.Program = prog;
+        p.USrc = GlBridge.UniformLoc(gl, prog, "uSrc");
+        p.USrcTexel = GlBridge.UniformLoc(gl, prog, "uSrcTexel");
+        p.UThresh = GlBridge.UniformLoc(gl, prog, "uThresh");
+        p.URadius = GlBridge.UniformLoc(gl, prog, "uRadius");
+        p.UScene = GlBridge.UniformLoc(gl, prog, "uScene");
+        p.UBloom = GlBridge.UniformLoc(gl, prog, "uBloom");
+        p.UIntensity = GlBridge.UniformLoc(gl, prog, "uIntensity");
+        return p;
+    }
+
+    public static GpuBloomProgram GetBloomDown() { EnsureResInit(); if (bloomDown == null) { bloomDown = MakeBloom(GameGpuPostShaders.BloomDownFs()); } return bloomDown; }
+    public static GpuBloomProgram GetBloomUp() { EnsureResInit(); if (bloomUp == null) { bloomUp = MakeBloom(GameGpuPostShaders.BloomUpFs()); } return bloomUp; }
+    public static GpuBloomProgram GetBloomComposite() { EnsureResInit(); if (bloomComposite == null) { bloomComposite = MakeBloom(GameGpuPostShaders.BloomCompositeFs()); } return bloomComposite; }
+
+    // 泛光金字塔：第 0 级为半分辨率，逐级减半（RGBA8 线性存储，够用于 LDR 场景的辉光）。
+    public static bool BloomTargetsReady(GpuFrameInfo frame) {
+        GlApi gl = GameGpuState.Gl;
+        if (BloomFbo[0] != 0u && BloomBaseW == frame.Width && BloomBaseH == frame.Height) { return true; }
+        for (int i = 0; i < BloomLevels; i = i + 1) {
+            if (BloomFbo[i] != 0u) { GlBridge.DeleteOne(gl.DeleteFramebuffers, BloomFbo[i]); BloomFbo[i] = 0u; }
+            if (BloomTex[i] != 0u) { GlBridge.DeleteOne(gl.DeleteTextures, BloomTex[i]); BloomTex[i] = 0u; }
+        }
+        int w = frame.Width; int h = frame.Height;
+        for (int i = 0; i < BloomLevels; i = i + 1) {
+            w = Math.Max(1, w / 2); h = Math.Max(1, h / 2);
+            uint tex = GlBridge.GenOne(gl.GenTextures);
+            if (tex == 0u) { return false; }
+            gl.BindTexture(GlBridge.TEXTURE_2D, tex);
+            gl.TexImage2D(GlBridge.TEXTURE_2D, 0, (int)GlBridge.RGBA8, w, h, 0, GlBridge.RGBA, GlBridge.UNSIGNED_BYTE, 0);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MIN_FILTER, (int)GlBridge.LINEAR);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MAG_FILTER, (int)GlBridge.LINEAR);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_S, (int)GlBridge.CLAMP_TO_EDGE);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_T, (int)GlBridge.CLAMP_TO_EDGE);
+            uint fbo = GlBridge.GenOne(gl.GenFramebuffers);
+            if (fbo == 0u) { GlBridge.DeleteOne(gl.DeleteTextures, tex); return false; }
+            gl.BindFramebuffer(GlBridge.FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(GlBridge.FRAMEBUFFER, GlBridge.COLOR_ATTACHMENT0, GlBridge.TEXTURE_2D, tex, 0);
+            if (gl.CheckFramebufferStatus(GlBridge.FRAMEBUFFER) != GlBridge.FRAMEBUFFER_COMPLETE) { return false; }
+            BloomTex[i] = tex; BloomFbo[i] = fbo; BloomW[i] = w; BloomH[i] = h;
+        }
+        BloomBaseW = frame.Width; BloomBaseH = frame.Height;
+        return true;
     }
 
     public static GpuScreenLightProgram GetScreenLightProgram() {

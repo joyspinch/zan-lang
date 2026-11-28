@@ -834,6 +834,82 @@ internal static class GameGpuRenderer {
         GameGpuState.Gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
     }
 
+    // 多级泛光（独立通道，可在 PostProcess3D 之前调用）。threshold 为线性亮度阈值（0.6~1.0），
+    // knee 为软阈值宽度，intensity 叠加强度，radius 升采样扩散（1 左右）。
+    public static int Bloom3D(int surfaceId, float threshold, float knee, float intensity, float radius) {
+        GameGpuState.EnsureInit();
+        if (surfaceId < 0 || surfaceId >= GameGpuState.SurfaceCap || intensity <= 0.0f) { return 0; }
+        if (GameGpuState.FrameSurface == surfaceId) { EndFrame3D(); }
+        GpuFrameInfo frame;
+        if (!GlBridge.GpuBegin(surfaceId, out frame)) { return 0; }
+        int result = 0;
+        GpuBloomProgram down = GameGpuResources.Prepare(frame) ? GameGpuResources.GetBloomDown() : null;
+        GlApi gl = GameGpuState.Gl;
+        GpuBloomProgram up = down != null ? GameGpuResources.GetBloomUp() : null;
+        GpuBloomProgram comp = up != null ? GameGpuResources.GetBloomComposite() : null;
+        if (comp != null && GameGpuResources.PostTargetReady(frame) && GameGpuResources.BloomTargetsReady(frame)) {
+            int cx; int cy; int cw; int ch;
+            ComputeClip(frame, out cx, out cy, out cw, out ch);
+            if (cw > 0 && ch > 0) {
+                gl.Disable(GlBridge.SCISSOR_TEST);
+                gl.Disable(GlBridge.DEPTH_TEST);
+                gl.Disable(GlBridge.BLEND);
+                gl.BindFramebuffer(GlBridge.READ_FRAMEBUFFER, frame.Framebuffer);
+                gl.BindFramebuffer(GlBridge.DRAW_FRAMEBUFFER, GameGpuResources.PostFbo);
+                gl.BlitFramebuffer(0, 0, frame.Width, frame.Height, 0, 0, frame.Width, frame.Height, GlBridge.COLOR_BUFFER_BIT, GlBridge.NEAREST);
+                gl.BindVertexArray(GameGpuResources.PostVao);
+                gl.ActiveTexture(GlBridge.TEXTURE0);
+                // 降采样
+                gl.UseProgram(down.Program);
+                if (down.USrc >= 0) { gl.Uniform1i(down.USrc, 0); }
+                int srcW = frame.Width; int srcH = frame.Height;
+                for (int i = 0; i < GameGpuResources.BloomLevels; i = i + 1) {
+                    gl.BindFramebuffer(GlBridge.FRAMEBUFFER, GameGpuResources.BloomFbo[i]);
+                    gl.Viewport(0, 0, GameGpuResources.BloomW[i], GameGpuResources.BloomH[i]);
+                    gl.BindTexture(GlBridge.TEXTURE_2D, i == 0 ? GameGpuResources.PostTex : GameGpuResources.BloomTex[i - 1]);
+                    if (down.USrcTexel >= 0) { gl.Uniform2f(down.USrcTexel, 1.0f / (float)srcW, 1.0f / (float)srcH); }
+                    if (down.UThresh >= 0) { gl.Uniform4f(down.UThresh, threshold, MathF.Max(knee, 0.001f), i == 0 ? 1.0f : 0.0f, 0.0f); }
+                    gl.DrawArrays(GlBridge.TRIANGLES, 0, 3);
+                    srcW = GameGpuResources.BloomW[i]; srcH = GameGpuResources.BloomH[i];
+                }
+                // 升采样（加法混合）
+                gl.UseProgram(up.Program);
+                if (up.USrc >= 0) { gl.Uniform1i(up.USrc, 0); }
+                if (up.URadius >= 0 && gl.HasUniform1f) { gl.Uniform1f(up.URadius, radius > 0.0f ? radius : 1.0f); }
+                gl.Enable(GlBridge.BLEND);
+                gl.BlendFunc(GlBridge.ONE, GlBridge.ONE);
+                for (int i = GameGpuResources.BloomLevels - 1; i > 0; i = i - 1) {
+                    gl.BindFramebuffer(GlBridge.FRAMEBUFFER, GameGpuResources.BloomFbo[i - 1]);
+                    gl.Viewport(0, 0, GameGpuResources.BloomW[i - 1], GameGpuResources.BloomH[i - 1]);
+                    gl.BindTexture(GlBridge.TEXTURE_2D, GameGpuResources.BloomTex[i]);
+                    if (up.USrcTexel >= 0) { gl.Uniform2f(up.USrcTexel, 1.0f / (float)GameGpuResources.BloomW[i], 1.0f / (float)GameGpuResources.BloomH[i]); }
+                    gl.DrawArrays(GlBridge.TRIANGLES, 0, 3);
+                }
+                gl.Disable(GlBridge.BLEND);
+                // 合成
+                gl.BindFramebuffer(GlBridge.FRAMEBUFFER, frame.Framebuffer);
+                gl.Viewport(0, 0, frame.Width, frame.Height);
+                gl.Enable(GlBridge.SCISSOR_TEST);
+                gl.Scissor(cx, cy, cw, ch);
+                gl.UseProgram(comp.Program);
+                gl.ActiveTexture(GlBridge.TEXTURE0);
+                gl.BindTexture(GlBridge.TEXTURE_2D, GameGpuResources.PostTex);
+                gl.ActiveTexture(GlBridge.TEXTURE0 + 1u);
+                gl.BindTexture(GlBridge.TEXTURE_2D, GameGpuResources.BloomTex[0]);
+                if (comp.UScene >= 0) { gl.Uniform1i(comp.UScene, 0); }
+                if (comp.UBloom >= 0) { gl.Uniform1i(comp.UBloom, 1); }
+                if (comp.UIntensity >= 0 && gl.HasUniform1f) { gl.Uniform1f(comp.UIntensity, intensity); }
+                gl.DrawArrays(GlBridge.TRIANGLES, 0, 3);
+                gl.BindVertexArray(0u);
+                gl.ActiveTexture(GlBridge.TEXTURE0);
+                result = 1;
+            }
+        }
+        GameGpuState.InvalidateGlCache();
+        GlBridge.GpuEnd(surfaceId);
+        return result;
+    }
+
     // 屏幕空间光照（SSAO + 体积光），在世界几何画完、第一人称层清深度之前调用。
     // vp / invVp 为列主序 4x4；太阳方向与颜色取第 0 盏方向光，阴影取最近一次 ShadowBegin/End 的结果。
     public static int ScreenLighting3D(int surfaceId, nint vp, nint invVp, float camX, float camY, float camZ,
