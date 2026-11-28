@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
 using Game.Animation;
 using Game.Combat3D;
 
@@ -323,12 +324,118 @@ public class FpsCombat3DTests {
         Check("lagcomp.wall_occluded", !hitThroughCover);
     }
 
+    private static void TestOptimizationInvariantsAndConcurrency() {
+        // 1. 验证 QBVH 图元重排后原始 TriangleIndex 严格保序 + 轴对齐擦边射线零 NaN
+        StaticMeshBvh3D triMap = new StaticMeshBvh3D();
+        int t0 = triMap.AddTriangle(new Vector3(-6.0f, 0.0f, 5.0f), new Vector3(-4.0f, 0.0f, 5.0f), new Vector3(-5.0f, 2.0f, 5.0f), SurfaceMaterial3D.Wood);
+        int t1 = triMap.AddTriangle(new Vector3(4.0f, 0.0f, 8.0f), new Vector3(6.0f, 0.0f, 8.0f), new Vector3(5.0f, 2.0f, 8.0f), SurfaceMaterial3D.Metal);
+        int t2 = triMap.AddTriangle(new Vector3(-1.0f, 0.0f, 3.0f), new Vector3(1.0f, 0.0f, 3.0f), new Vector3(0.0f, 2.0f, 3.0f), SurfaceMaterial3D.Glass);
+        for (int pad = 0; pad < 12; pad = pad + 1) {
+            float px = -20.0f + (float)pad * 3.2f;
+            triMap.AddSolidBox(new Vector3(px, -4.0f, 15.0f), new Vector3(px + 1.0f, -2.0f, 16.0f), SurfaceMaterial3D.Concrete);
+        }
+        triMap.Build();
+
+        MeshRayHit3D h0;
+        MeshRayHit3D h1;
+        MeshRayHit3D h2;
+        bool ok0 = triMap.Raycast(new Vector3(-5.0f, 0.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, out h0);
+        bool ok1 = triMap.Raycast(new Vector3(5.0f, 0.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, out h1);
+        bool ok2 = triMap.Raycast(new Vector3(0.0f, 0.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, out h2);
+        Check("qbvh.orig_tri_id", ok0 && h0.TriangleIndex == t0 && ok1 && h1.TriangleIndex == t1 && ok2 && h2.TriangleIndex == t2);
+
+        // 轴对齐且起点恰好贴在包围盒边界平面 x = -20.0f 上的擦边射线（验证 (b - o) * invDir 无 0*Inf NaN）
+        MeshRayHit3D edgeHit;
+        bool okEdge = triMap.Raycast(new Vector3(-19.5f, -3.0f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 30.0f, out edgeHit);
+        Check("qbvh.axis_aligned_ray", okEdge && Near(edgeHit.Distance, 15.0f, 0.005f));
+
+        // 2. 验证多线程无锁并发 QBVH 查询（4 个后台线程共享同一个 StaticMeshBvh3D，零锁、零外部 Scratch）
+        AtomicInt workerDone = new AtomicInt(0);
+        AtomicInt workerPass = new AtomicInt(0);
+        for (int w = 0; w < 4; w = w + 1) {
+            Thread.Start(() => {
+                bool localOk = true;
+                for (int iter = 0; iter < 150; iter = iter + 1) {
+                    MeshRayHit3D rh;
+                    if (!triMap.Raycast(new Vector3(5.0f, 0.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, out rh) ||
+                        rh.TriangleIndex != 1 || !Near(rh.Distance, 8.0f, 0.005f)) {
+                        localOk = false;
+                    }
+                    SweepHit3D sh;
+                    if (!triMap.SweepCapsule(new Vector3(0.0f, 0.2f, 1.0f), new Vector3(0.0f, 1.0f, 1.0f), 0.3f, new Vector3(0.0f, 0.0f, 4.0f), out sh) ||
+                        !Near(sh.Distance, 1.7f, 0.01f)) {
+                        localOk = false;
+                    }
+                }
+                if (localOk) { workerPass.Add(1); }
+                workerDone.Add(1);
+            });
+        }
+        while (workerDone.Load() < 4) {
+            Thread.Sleep(1);
+        }
+        Thread.Sleep(30);
+        Check("qbvh.lockfree_multithread", workerPass.Load() == 4);
+
+        // 3. 验证单分支解析射线-胶囊体求交全几何分支（柱身、上下球帽、平行轴向、内部起点、背离快退）
+        Vector3 capA = new Vector3(0.0f, 1.0f, 5.0f);
+        Vector3 capB = new Vector3(0.0f, 2.0f, 5.0f);
+        float capR = 0.25f;
+        float tCap;
+        Vector3 nCap;
+        // 柱身正中命中：z = 5.0 - 0.25 = 4.75
+        bool hitBody = LagCompensatedHitboxWorld3D.IntersectRayCapsule(
+            new Vector3(0.0f, 1.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, capA, capB, capR, out tCap, out nCap);
+        Check("raycap.cylinder_body", hitBody && Near(tCap, 4.75f, 0.002f) && Near(nCap.Z, -1.0f, 0.002f));
+
+        // 平行轴线从正上方垂直向下命中上球帽顶 (y = 2.25)：从 y = 4.0 向下，t = 1.75
+        bool hitTopParallel = LagCompensatedHitboxWorld3D.IntersectRayCapsule(
+            new Vector3(0.0f, 4.0f, 5.0f), new Vector3(0.0f, -1.0f, 0.0f), 20.0f, capA, capB, capR, out tCap, out nCap);
+        Check("raycap.parallel_top_cap", hitTopParallel && Near(tCap, 1.75f, 0.002f) && Near(nCap.Y, 1.0f, 0.002f));
+
+        // 斜向擦下球帽命中 + 背离快退
+        Vector3 diagDir = Vector3.Normalize(new Vector3(0.0f, 0.5f, 1.0f));
+        bool hitBottomCap = LagCompensatedHitboxWorld3D.IntersectRayCapsule(
+            new Vector3(0.0f, -1.5f, 0.0f), diagDir, 20.0f, capA, capB, capR, out tCap, out nCap);
+        bool missReceding = LagCompensatedHitboxWorld3D.IntersectRayCapsule(
+            new Vector3(0.0f, 1.5f, 0.0f), new Vector3(0.0f, 0.0f, -1.0f), 20.0f, capA, capB, capR, out tCap, out nCap);
+        Check("raycap.cap_and_receding", hitBottomCap && !missReceding);
+
+        // 4. 验证 Kapoulkine FastSlerp 与精确三角函数 AnimMath.Slerp 全角度高精度一致性
+        Quaternion qa = Quaternion.Normalize(Quaternion.FromAxisAngle(new Vector3(0.3f, 0.8f, -0.5f), 0.4f));
+        Quaternion qb90 = Quaternion.Normalize(Quaternion.Multiply(qa, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), 1.55f)));
+        Quaternion qbNeg = new Quaternion(-qb90.X, -qb90.Y, -qb90.Z, -qb90.W); // 对跖负点积翻转测试
+        bool slerpAccurate = true;
+        for (int step = 0; step <= 10; step = step + 1) {
+            float kt = (float)step * 0.1f;
+            Quaternion exactQ = AnimMath.Slerp(qa, qbNeg, kt);
+            Quaternion fastQ = LayeredAnimator3D.FastSlerp(qa, qbNeg, kt);
+            float dot = Math.Abs(Quaternion.Dot(exactQ, fastQ));
+            if (dot < 0.999995f) { slerpAccurate = false; }
+        }
+        Check("anim.fast_slerp_precision", slerpAccurate);
+
+        // 5. 验证角色控制器脏位追踪：外部瞬移陷入地面后自动唤醒解穿插推回地面
+        StaticMeshBvh3D flatFloor = new StaticMeshBvh3D();
+        flatFloor.AddSolidBox(new Vector3(-10.0f, -2.0f, -10.0f), new Vector3(10.0f, 0.0f, 10.0f), SurfaceMaterial3D.Concrete);
+        flatFloor.Build();
+        KinematicCapsuleController3D lazyCc = new KinematicCapsuleController3D();
+        lazyCc.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        lazyCc.IsGrounded = true;
+        CharacterMoveInput3D idleIn = new CharacterMoveInput3D();
+        lazyCc.Simulate(flatFloor, idleIn, 1.0f / 60.0f); // 进入干净静止态
+        lazyCc.Position = new Vector3(0.0f, -0.18f, 0.0f); // 外部直接修改坐标陷入地下 18cm
+        lazyCc.Simulate(flatFloor, idleIn, 1.0f / 60.0f);
+        Check("cc.dirty_teleport_depenetrate", lazyCc.Position.Y > -0.02f);
+    }
+
     public static void Main() {
         TestMatrixDecomposeAndBindInverse();
         TestTwoBoneIkNoDislocationAndLayeredAnim();
         TestBvhRaycastPenetrationAndSweep();
         TestKinematicControllerMechanics();
         TestLagCompensatedHitboxes();
+        TestOptimizationInvariantsAndConcurrency();
         if (failures == 0) {
             Console.WriteLine("ALL FPS COMBAT 3D TESTS PASSED");
         } else {

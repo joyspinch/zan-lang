@@ -14,12 +14,10 @@ public struct CharacterMoveInput3D {
 
 // 工业级 FPS/TPS 运动学胶囊体角色控制器（对标 Quake PM_StepSlideMove / Source / Jolt CharacterVirtual）：
 // - 坐标约定：Position 为胶囊体脚底中心 (x, footY, z)
+// - 脏位追踪惰性解穿插（Lazy Depenetration）与静止贴地零查询快速通道（Stationary Grounded Fast-Path）
 // - 多平面折痕速度裁剪（Multi-Plane Crease Slide）：锐角墙角丝滑滑出、三面死角零抖动归零
-// - 陡坡防冲浪（Steep Wall Flatten）：不可行走陡坡水平投影阻挡，杜绝蹭上悬崖
-// - 三段式自动登阶（Up -> Forward -> Down）与可行走坡度校验
-// - 下坡/下楼梯贴地吸附（Ground Snap），消除斜坡微弹跳
-// - 战术下蹲高度切换 + 顶盖净空扫掠防穿模（管道内松开蹲键保持下蹲，出管道自动起身）
-// - 内置土狼时间（Coyote Time）与跳跃预输入缓冲（Jump Buffer）
+// - 陡坡防冲浪（Steep Wall Flatten）+ 三段式自动登阶（Step-Up）+ 下坡贴地吸附（Ground Snap）
+// - 战术下蹲高度切换 + 顶盖净空扫掠防穿模 + 土狼时间（Coyote Time）与跳跃预输入缓冲（Jump Buffer）
 public class KinematicCapsuleController3D {
     // 几何与物理参数
     public float Radius;
@@ -55,9 +53,13 @@ public class KinematicCapsuleController3D {
     private float timeSinceGrounded;
     private float jumpBufferTimer;
 
-    // 预分配碰撞平面缓冲与 BVH 遍历工作栈（全程零 GC 分配）
+    // 脏位缓存：仅当首次出生、外部改写 Position、站起增高、场景重建或上帧发生微穿透时执行整树解穿插
+    private Vector3 lastResolvedPos;
+    private float lastResolvedHeight;
+    private int lastWorldNodeCount;
+    private bool needsDepenetration;
+
     private Vector3[] clipPlanes;
-    private BvhQueryScratch queryScratch;
 
     public KinematicCapsuleController3D() {
         this.Radius = 0.35f;
@@ -90,8 +92,11 @@ public class KinematicCapsuleController3D {
 
         this.timeSinceGrounded = 99.0f;
         this.jumpBufferTimer = 0.0f;
+        this.lastResolvedPos = new Vector3(1e30f, 1e30f, 1e30f);
+        this.lastResolvedHeight = -1.0f;
+        this.lastWorldNodeCount = -1;
+        this.needsDepenetration = true;
         this.clipPlanes = new Vector3[6];
-        this.queryScratch = new BvhQueryScratch();
     }
 
     // 获取当前摄像机第一人称眼睛世界坐标（含平滑蹲起过渡）。
@@ -101,8 +106,7 @@ public class KinematicCapsuleController3D {
 
     // 计算给定脚底位置与胶囊总高度对应的上下球心线段端点 (p0, p1)。
     public void GetCapsuleSegmentAt(Vector3 footPos, float height, out Vector3 p0, out Vector3 p1) {
-        float minH = this.Radius * 2.0f + 0.02f;
-        float h = height > minH ? height : minH;
+        float h = Math.Max(height, this.Radius * 2.0f + 0.02f);
         p0 = new Vector3(footPos.X, footPos.Y + this.Radius, footPos.Z);
         p1 = new Vector3(footPos.X, footPos.Y + (h - this.Radius), footPos.Z);
     }
@@ -126,11 +130,9 @@ public class KinematicCapsuleController3D {
         Vector3 c0;
         Vector3 c1;
         this.GetCapsuleSegmentAt(this.Position, crouchH, out c0, out c1);
-        float grow = standH - crouchH;
         SweepHit3D hit;
-        // 将顶球从下蹲顶心向上扫掠 grow 距离，检验头顶净空
         if (world.SweepCapsuleEx(c1, c1, this.Radius - this.SkinWidth * 0.5f,
-                                 new Vector3(0.0f, grow, 0.0f), this.queryScratch, out hit)) {
+                                 new Vector3(0.0f, standH - crouchH, 0.0f), null, out hit)) {
             return false;
         }
         return true;
@@ -166,16 +168,19 @@ public class KinematicCapsuleController3D {
         if (input.JumpPressed) {
             this.jumpBufferTimer = this.JumpBufferWindow;
         } else if (this.jumpBufferTimer > 0.0f) {
-            this.jumpBufferTimer = this.jumpBufferTimer - dt;
-            if (this.jumpBufferTimer < 0.0f) { this.jumpBufferTimer = 0.0f; }
+            this.jumpBufferTimer = Math.Max(0.0f, this.jumpBufferTimer - dt);
         }
 
         // 3. 计算水平期望速度并施加地面摩擦/加减速
-        Vector3 wishHoriz = new Vector3(input.WishDirection.X, 0.0f, input.WishDirection.Z);
-        float wishMag = wishHoriz.Length();
+        float wx = input.WishDirection.X;
+        float wz = input.WishDirection.Z;
+        float wishMagSq = wx * wx + wz * wz;
         Vector3 wishDir = Vector3.Zero;
-        if (wishMag > 1e-5f) {
-            wishDir = Vector3.Multiply(wishHoriz, 1.0f / wishMag);
+        float wishMag = 0.0f;
+        if (wishMagSq > 1e-10f) {
+            wishMag = MathF.Sqrt(wishMagSq);
+            float invWish = 1.0f / wishMag;
+            wishDir = new Vector3(wx * invWish, 0.0f, wz * invWish);
             if (wishMag > 1.0f) { wishMag = 1.0f; }
         }
 
@@ -211,24 +216,31 @@ public class KinematicCapsuleController3D {
         }
         this.Move(world, dt);
 
-        // 6. 平滑插值第一人称眼高
+        // 6. 平滑插值第一人称眼高（三阶有理指数衰减，零超越函数调用，收敛后直接吸附）
         float targetEye = this.CurrentHeight * 0.90f;
-        float lerpAlpha = 1.0f - (float)Math.Exp((double)(-16.0f * dt));
-        this.CurrentEyeHeight = this.CurrentEyeHeight + (targetEye - this.CurrentEyeHeight) * lerpAlpha;
+        float eyeDiff = targetEye - this.CurrentEyeHeight;
+        if (Math.Abs(eyeDiff) > 1e-5f) {
+            float x = 16.0f * dt;
+            float invExp = 1.0f / (1.0f + x + 0.5f * x * x + 0.16666667f * x * x * x);
+            this.CurrentEyeHeight = this.CurrentEyeHeight + eyeDiff * (1.0f - invExp);
+        } else {
+            this.CurrentEyeHeight = targetEye;
+        }
     }
 
     private void ApplyGroundFriction(float dt) {
         float vx = this.Velocity.X;
         float vz = this.Velocity.Z;
-        float speed = (float)Math.Sqrt((double)(vx * vx + vz * vz));
-        if (speed <= 0.0005f) {
-            this.Velocity = new Vector3(0.0f, this.Velocity.Y, 0.0f);
+        float speedSq = vx * vx + vz * vz;
+        if (speedSq <= 2.5e-7f) {
+            if (vx != 0.0f || vz != 0.0f) {
+                this.Velocity = new Vector3(0.0f, this.Velocity.Y, 0.0f);
+            }
             return;
         }
-        float control = speed < 1.5f ? 1.5f : speed;
-        float drop = control * this.GroundFriction * dt;
-        float newSpeed = speed - drop;
-        if (newSpeed < 0.0f) { newSpeed = 0.0f; }
+        float speed = MathF.Sqrt(speedSq);
+        float control = Math.Max(speed, 1.5f);
+        float newSpeed = Math.Max(0.0f, speed - control * this.GroundFriction * dt);
         float ratio = newSpeed / speed;
         this.Velocity = new Vector3(vx * ratio, this.Velocity.Y, vz * ratio);
     }
@@ -238,8 +250,7 @@ public class KinematicCapsuleController3D {
         float curProj = this.Velocity.X * wishDir.X + this.Velocity.Z * wishDir.Z;
         float addSpeed = wishSpeed - curProj;
         if (addSpeed <= 0.0f) { return; }
-        float accelStep = accel * wishSpeed * dt;
-        if (accelStep > addSpeed) { accelStep = addSpeed; }
+        float accelStep = Math.Min(accel * wishSpeed * dt, addSpeed);
         this.Velocity = new Vector3(
             this.Velocity.X + wishDir.X * accelStep,
             this.Velocity.Y,
@@ -255,26 +266,43 @@ public class KinematicCapsuleController3D {
             return;
         }
 
-        // 0. 穿透自愈保护：若因外部推动或动态生成物轻微嵌入，先推出表面
-        Vector3 seg0;
-        Vector3 seg1;
-        this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out seg0, out seg1);
-        Vector3 pushOut;
-        if (world.OverlapCapsuleDepenetrate(seg0, seg1, this.Radius - this.SkinWidth * 0.25f, this.queryScratch, out pushOut)) {
-            this.Position = Vector3.Add(this.Position, pushOut);
+        if (!world.IsBuilt()) { world.Build(); }
+        int worldNodes = world.NodeCount();
+        bool posChangedExternally = Vector3.DistanceSquared(this.Position, this.lastResolvedPos) > 1e-10f;
+        bool grewTaller = this.CurrentHeight > this.lastResolvedHeight + 1e-4f;
+        bool worldChanged = worldNodes != this.lastWorldNodeCount;
+
+        // 0. 惰性穿透自愈保护：仅在出生/外部改写坐标/站起增高/场景重建或上帧微穿透时执行整树重叠检测
+        if (this.needsDepenetration || posChangedExternally || grewTaller || worldChanged) {
+            Vector3 seg0;
+            Vector3 seg1;
+            this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out seg0, out seg1);
+            Vector3 pushOut;
+            if (world.OverlapCapsuleDepenetrate(seg0, seg1, this.Radius - this.SkinWidth * 0.25f, null, out pushOut)) {
+                this.Position = Vector3.Add(this.Position, pushOut);
+            }
+            this.needsDepenetration = false;
+            this.lastWorldNodeCount = worldNodes;
         }
 
         bool wasGrounded = this.IsGrounded;
 
+        // 静止贴地零查询快速通道：站立瞄准不动且无外部扰动时 0 次 BVH 扫掠
+        if (wasGrounded && !posChangedExternally && !worldChanged && this.Velocity.LengthSquared() <= 1e-12f) {
+            this.lastResolvedPos = this.Position;
+            this.lastResolvedHeight = this.CurrentHeight;
+            return;
+        }
+
         // 地面行走时先将水平速度顺着当前可行走坡面切向投影，保证上坡不减速磕绊
         Vector3 moveVel = this.Velocity;
         if (wasGrounded && moveVel.Y <= 0.0f && this.GroundNormal.Y >= this.MinWalkableNormalY && this.GroundNormal.Y < 0.9995f) {
-            float horizMag = (float)Math.Sqrt((double)(moveVel.X * moveVel.X + moveVel.Z * moveVel.Z));
-            if (horizMag > 1e-5f) {
+            float horizSq = moveVel.X * moveVel.X + moveVel.Z * moveVel.Z;
+            if (horizSq > 1e-10f) {
                 Vector3 clippedSlope = KinematicCapsuleController3D.ClipVelocity(moveVel, this.GroundNormal, 1.0f);
-                float cLen = clippedSlope.Length();
-                if (cLen > 1e-5f) {
-                    moveVel = Vector3.Multiply(clippedSlope, horizMag / cLen);
+                float cLenSq = clippedSlope.LengthSquared();
+                if (cLenSq > 1e-10f) {
+                    moveVel = Vector3.Multiply(clippedSlope, MathF.Sqrt(horizSq / cLenSq));
                 }
             }
         }
@@ -308,6 +336,9 @@ public class KinematicCapsuleController3D {
 
         // 3. 落地探测与下坡/下楼梯贴地吸附（Ground Snap）
         this.UpdateGroundStateAndSnap(world, wasGrounded);
+
+        this.lastResolvedPos = this.Position;
+        this.lastResolvedHeight = this.CurrentHeight;
     }
 
     private static float HorizontalDistanceSq(Vector3 a, Vector3 b) {
@@ -316,27 +347,23 @@ public class KinematicCapsuleController3D {
         return dx * dx + dz * dz;
     }
 
-    // 判定胶囊扫掠接触点是否处于可行走支撑面上：
-    // 兼顾胶囊底半球搭在水平踏面 90° 棱边（接触法线外倾、但真实三角面法线平坦）的几何情形，同时严拒真实陡崖面。
     private bool IsHitWalkable(SweepHit3D hit) {
         if (hit.Normal.Y >= this.MinWalkableNormalY) { return true; }
         if (hit.SurfaceNormal.Y >= this.MinWalkableNormalY && hit.Normal.Y > 0.15f) { return true; }
         return false;
     }
 
-    // 尝试三段式跨上台阶（Up -> Slide Forward -> Sweep Down 并检验台面坡度可行走）。
     private bool TryStepMove(StaticMeshBvh3D world, Vector3 startPos, Vector3 horizVel, float dt,
                              out Vector3 outPos, out Vector3 outVel) {
         outPos = startPos;
         outVel = horizVel;
 
-        // Phase A: 向上扫掠抬高 MaxStepHeight
         Vector3 p0;
         Vector3 p1;
         this.GetCapsuleSegmentAt(startPos, this.CurrentHeight, out p0, out p1);
         SweepHit3D upHit;
         float upDist = this.MaxStepHeight;
-        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, this.MaxStepHeight, 0.0f), this.queryScratch, out upHit)) {
+        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, this.MaxStepHeight, 0.0f), null, out upHit)) {
             if (upHit.StartedPenetrating) { return false; }
             upDist = upHit.Distance - this.SkinWidth;
         }
@@ -344,7 +371,6 @@ public class KinematicCapsuleController3D {
 
         Vector3 raisedPos = new Vector3(startPos.X, startPos.Y + upDist, startPos.Z);
 
-        // Phase B: 在抬高高度处水平滑行推进
         Vector3 fwdPos;
         Vector3 fwdVel;
         bool dummyBlocked;
@@ -354,19 +380,17 @@ public class KinematicCapsuleController3D {
             return false;
         }
 
-        // Phase C: 向下压回台面并验证落脚点必须为可行走平面（防止踏上陡峭刀刃斜面）
         this.GetCapsuleSegmentAt(fwdPos, this.CurrentHeight, out p0, out p1);
         float maxDown = upDist + this.SkinWidth * 2.0f;
         SweepHit3D downHit;
-        if (!world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -maxDown, 0.0f), this.queryScratch, out downHit)) {
+        if (!world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -maxDown, 0.0f), null, out downHit)) {
             return false;
         }
         if (downHit.StartedPenetrating || !this.IsHitWalkable(downHit)) {
             return false;
         }
 
-        float safeDrop = downHit.Distance - this.SkinWidth;
-        if (safeDrop < 0.0f) { safeDrop = 0.0f; }
+        float safeDrop = Math.Max(0.0f, downHit.Distance - this.SkinWidth);
         Vector3 landedPos = new Vector3(fwdPos.X, fwdPos.Y - safeDrop, fwdPos.Z);
         float netStepUp = landedPos.Y - startPos.Y;
         if (netStepUp < -0.02f || netStepUp > this.MaxStepHeight + 0.01f) {
@@ -378,7 +402,6 @@ public class KinematicCapsuleController3D {
         return true;
     }
 
-    // 多平面折痕速度裁剪连续扫掠循环（最多 4 次碰撞反弹投影）。
     private void SlideMove(StaticMeshBvh3D world, Vector3 startPos, Vector3 initialVel, float dt,
                            bool preventSteepClimb, out Vector3 endPos, out Vector3 endVel, out bool hitWallOrStep) {
         Vector3 curPos = startPos;
@@ -388,59 +411,57 @@ public class KinematicCapsuleController3D {
 
         float timeLeft = dt;
         int numPlanes = 0;
+        Vector3[] planes = this.clipPlanes;
 
         for (int bump = 0; bump < 4; bump = bump + 1) {
             Vector3 delta = Vector3.Multiply(vel, timeLeft);
-            float moveLen = delta.Length();
-            if (moveLen <= 1e-6f) { break; }
+            float moveLenSq = delta.LengthSquared();
+            if (moveLenSq <= 1e-12f) { break; }
+            float moveLen = MathF.Sqrt(moveLenSq);
 
             Vector3 p0;
             Vector3 p1;
             this.GetCapsuleSegmentAt(curPos, this.CurrentHeight, out p0, out p1);
 
             SweepHit3D hit;
-            if (!world.SweepCapsuleEx(p0, p1, this.Radius, delta, this.queryScratch, out hit)) {
+            if (!world.SweepCapsuleEx(p0, p1, this.Radius, delta, null, out hit)) {
                 curPos = Vector3.Add(curPos, delta);
                 break;
             }
 
-            // 安全推进至表面前 SkinWidth 处
             if (hit.Distance > this.SkinWidth) {
-                float safeDist = hit.Distance - this.SkinWidth;
-                float safeFrac = safeDist / moveLen;
+                float safeFrac = (hit.Distance - this.SkinWidth) / moveLen;
                 curPos = new Vector3(
                     curPos.X + delta.X * safeFrac,
                     curPos.Y + delta.Y * safeFrac,
                     curPos.Z + delta.Z * safeFrac);
                 timeLeft = timeLeft * (1.0f - safeFrac);
             } else if (hit.StartedPenetrating) {
-                // 紧贴微穿透退避
+                this.needsDepenetration = true;
                 curPos = Vector3.Add(curPos, Vector3.Multiply(hit.Normal, this.SkinWidth * 0.5f));
             }
 
             Vector3 planeNormal = hit.Normal;
             if (planeNormal.Y < this.MinWalkableNormalY) {
                 hitWallOrStep = true;
-                // 陡坡防冲浪：贴地或未主动高跳时撞上不可行走陡坡，将其法线拍平为水平墙面阻挡，禁止蹭上陡崖
                 if (preventSteepClimb && planeNormal.Y > -0.05f && vel.Y <= 0.5f) {
                     float hx = planeNormal.X;
                     float hz = planeNormal.Z;
-                    float hLen = (float)Math.Sqrt((double)(hx * hx + hz * hz));
-                    if (hLen > 1e-5f) {
-                        planeNormal = new Vector3(hx / hLen, 0.0f, hz / hLen);
+                    float hLenSq = hx * hx + hz * hz;
+                    if (hLenSq > 1e-10f) {
+                        float invH = 1.0f / MathF.Sqrt(hLenSq);
+                        planeNormal = new Vector3(hx * invH, 0.0f, hz * invH);
                     }
                 }
             }
 
-            // 撞顶天花板时立即清零向上冲量
             if (hit.Normal.Y < -0.7f && vel.Y > 0.0f) {
                 vel = new Vector3(vel.X, 0.0f, vel.Z);
             }
 
-            // 去重近似平行平面
             bool duplicate = false;
             for (int i = 0; i < numPlanes; i = i + 1) {
-                if (Vector3.Dot(planeNormal, this.clipPlanes[i]) > 0.99f) {
+                if (Vector3.Dot(planeNormal, planes[i]) > 0.99f) {
                     vel = Vector3.Add(vel, Vector3.Multiply(planeNormal, 0.01f));
                     duplicate = true;
                     break;
@@ -448,39 +469,33 @@ public class KinematicCapsuleController3D {
             }
             if (duplicate) { continue; }
 
-            if (numPlanes >= this.clipPlanes.Length) {
+            if (numPlanes >= planes.Length) {
                 vel = Vector3.Zero;
                 break;
             }
-            this.clipPlanes[numPlanes] = planeNormal;
+            planes[numPlanes] = planeNormal;
             numPlanes = numPlanes + 1;
 
-            // 多平面折痕投影求解（1 面切向投影 / 2 面交线折痕滑出 / 3 面死角归零）
             bool resolved = false;
             for (int i = 0; i < numPlanes; i = i + 1) {
-                if (Vector3.Dot(vel, this.clipPlanes[i]) >= 0.0f) { continue; }
+                if (Vector3.Dot(vel, planes[i]) >= 0.0f) { continue; }
 
-                Vector3 clipped = KinematicCapsuleController3D.ClipVelocity(vel, this.clipPlanes[i], 1.001f);
-                bool entersSecond = false;
+                Vector3 clipped = KinematicCapsuleController3D.ClipVelocity(vel, planes[i], 1.001f);
                 for (int j = 0; j < numPlanes; j = j + 1) {
                     if (j == i) { continue; }
-                    if (Vector3.Dot(clipped, this.clipPlanes[j]) < 0.0f) {
-                        entersSecond = true;
-                        // 沿两平面交线（Crease = n_i × n_j）方向投影
-                        Vector3 crease = Vector3.Cross(this.clipPlanes[i], this.clipPlanes[j]);
+                    if (Vector3.Dot(clipped, planes[j]) < 0.0f) {
+                        Vector3 crease = Vector3.Cross(planes[i], planes[j]);
                         float cLenSq = crease.LengthSquared();
                         if (cLenSq <= 1e-8f) {
                             clipped = Vector3.Zero;
                             break;
                         }
-                        crease = Vector3.Multiply(crease, 1.0f / (float)Math.Sqrt((double)cLenSq));
-                        float along = Vector3.Dot(vel, crease);
-                        clipped = Vector3.Multiply(crease, along);
+                        crease = Vector3.Multiply(crease, 1.0f / MathF.Sqrt(cLenSq));
+                        clipped = Vector3.Multiply(crease, Vector3.Dot(vel, crease));
 
-                        // 若仍刺入第三个平面，判定为三面夹角死点，彻底刹停防震荡
                         for (int k = 0; k < numPlanes; k = k + 1) {
                             if (k == i || k == j) { continue; }
-                            if (Vector3.Dot(clipped, this.clipPlanes[k]) < 0.0f) {
+                            if (Vector3.Dot(clipped, planes[k]) < 0.0f) {
                                 clipped = Vector3.Zero;
                                 break;
                             }
@@ -495,9 +510,7 @@ public class KinematicCapsuleController3D {
 
             if (!resolved) { continue; }
 
-            // 防止锐角墙缝把玩家反向弹出产生高频抖动
-            float horizDot = vel.X * primalVel.X + vel.Z * primalVel.Z;
-            if (horizDot < -1e-5f) {
+            if (vel.X * primalVel.X + vel.Z * primalVel.Z < -1e-5f) {
                 vel = new Vector3(0.0f, vel.Y, 0.0f);
             }
         }
@@ -506,9 +519,7 @@ public class KinematicCapsuleController3D {
         endVel = vel;
     }
 
-    // 落地检测与下坡贴地吸附：消除斜坡奔跑离地微跳。
     private void UpdateGroundStateAndSnap(StaticMeshBvh3D world, bool wasGrounded) {
-        // 正在向上起跳阶段不吸附地面
         if (this.Velocity.Y > 0.5f) {
             this.IsGrounded = false;
             return;
@@ -523,8 +534,9 @@ public class KinematicCapsuleController3D {
         this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out p0, out p1);
 
         SweepHit3D groundHit;
-        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -probeDist, 0.0f), this.queryScratch, out groundHit)) {
+        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -probeDist, 0.0f), null, out groundHit)) {
             if (this.IsHitWalkable(groundHit)) {
+                if (groundHit.StartedPenetrating) { this.needsDepenetration = true; }
                 float snapDrop = groundHit.Distance - this.SkinWidth;
                 if (snapDrop > 0.0f) {
                     this.Position = new Vector3(this.Position.X, this.Position.Y - snapDrop, this.Position.Z);
@@ -543,14 +555,9 @@ public class KinematicCapsuleController3D {
         this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
     }
 
-    // Quake 经典平面速度裁剪算子（overbounce >= 1.0 保证浮点舍入后不会残留在平面内侧）。
     public static Vector3 ClipVelocity(Vector3 vel, Vector3 normal, float overbounce) {
         float backoff = Vector3.Dot(vel, normal);
-        if (backoff < 0.0f) {
-            backoff = backoff * overbounce;
-        } else {
-            backoff = backoff / overbounce;
-        }
+        backoff = backoff < 0.0f ? (backoff * overbounce) : (backoff / overbounce);
         return new Vector3(
             vel.X - normal.X * backoff,
             vel.Y - normal.Y * backoff,

@@ -44,31 +44,42 @@ public struct HitboxRayHit3D {
     public double RewoundTimestamp;
 }
 
-// 可复用的角色骨骼受击盒配置模板（同体型角色共享同一份 Rig 定义）。
+// 可复用的角色骨骼受击盒配置模板（内部采用连续值数组存储，内层求交零集合包装开销）。
 public class SkeletalHitboxRig3D {
-    private List<HitboxCapsuleDef3D> capsules;
+    internal HitboxCapsuleDef3D[] Defs;
+    internal int DefCount;
 
     public SkeletalHitboxRig3D() {
-        this.capsules = new List<HitboxCapsuleDef3D>();
+        this.Defs = new HitboxCapsuleDef3D[12];
+        this.DefCount = 0;
     }
 
-    public int Count() { return this.capsules.Count; }
+    public int Count() { return this.DefCount; }
 
     public HitboxCapsuleDef3D At(int index) {
-        return this.capsules[index];
+        return this.Defs[index];
     }
 
     public int AddCapsule(int boneIndex, int regionId, Vector3 localA, Vector3 localB,
                           float radius, float damageMultiplier) {
+        if (this.DefCount >= this.Defs.Length) {
+            HitboxCapsuleDef3D[] grown = new HitboxCapsuleDef3D[this.Defs.Length * 2];
+            for (int i = 0; i < this.DefCount; i = i + 1) {
+                grown[i] = this.Defs[i];
+            }
+            this.Defs = grown;
+        }
         HitboxCapsuleDef3D def = new HitboxCapsuleDef3D();
         def.BoneIndex = boneIndex;
         def.RegionId = regionId;
         def.LocalPointA = localA;
         def.LocalPointB = localB;
-        def.Radius = radius > 0.001f ? radius : 0.001f;
+        def.Radius = Math.Max(radius, 0.001f);
         def.DamageMultiplier = damageMultiplier;
-        this.capsules.Add(def);
-        return this.capsules.Count - 1;
+        int idx = this.DefCount;
+        this.Defs[idx] = def;
+        this.DefCount = idx + 1;
+        return idx;
     }
 
     // 按骨骼名称挂接胶囊体（若骨骼不存在返回 -1）。
@@ -81,34 +92,39 @@ public class SkeletalHitboxRig3D {
     }
 }
 
-// 单个战斗实体的预分配扁平历史姿势环形缓冲槽位（Tick 写入与回溯插值全程 0 字节堆分配）。
+// 单个战斗实体的预分配 2 的幂扁平历史姿势环形缓冲槽位（位掩码寻址，Tick 写入与回溯插值全程零堆分配）。
 internal class ActorHitboxHistorySlot {
     public int ActorId;
     public int TeamId;
     public bool Active;
     public SkeletalHitboxRig3D Rig;
 
-    public int HistoryCapacity;
+    public int HistoryCapacity; // 严格为 2 的幂
+    public int CapacityMask;    // HistoryCapacity - 1
     public int CapsuleCount;
-    public int Head;   // 下一次写入的环下标
-    public int Count;  // 已记录的有效帧数 (<= HistoryCapacity)
+    public int Head;            // 下一次写入的环下标
+    public int Count;           // 已记录的有效帧数 (<= HistoryCapacity)
 
     public double[] Timestamps;   // [HistoryCapacity]
     public float[] ActorBounds;   // [HistoryCapacity * 6] minX,minY,minZ, maxX,maxY,maxZ
     public float[] CapsuleWorld;  // [HistoryCapacity * CapsuleCount * 7] ax,ay,az, bx,by,bz, worldRadius
 
-    public ActorHitboxHistorySlot(int actorId, int teamId, SkeletalHitboxRig3D rig, int historyCapacity) {
+    public ActorHitboxHistorySlot(int actorId, int teamId, SkeletalHitboxRig3D rig, int minHistoryCapacity) {
         this.ActorId = actorId;
         this.TeamId = teamId;
         this.Active = true;
         this.Rig = rig;
-        this.HistoryCapacity = historyCapacity > 2 ? historyCapacity : 2;
-        this.CapsuleCount = rig.Count();
+
+        int pow2 = 4;
+        while (pow2 < minHistoryCapacity) { pow2 = pow2 * 2; }
+        this.HistoryCapacity = pow2;
+        this.CapacityMask = pow2 - 1;
+        this.CapsuleCount = rig.DefCount;
         this.Head = 0;
         this.Count = 0;
-        this.Timestamps = new double[this.HistoryCapacity];
-        this.ActorBounds = new float[this.HistoryCapacity * 6];
-        this.CapsuleWorld = new float[this.HistoryCapacity * this.CapsuleCount * 7];
+        this.Timestamps = new double[pow2];
+        this.ActorBounds = new float[pow2 * 6];
+        this.CapsuleWorld = new float[pow2 * this.CapsuleCount * 7];
     }
 
     public void ClearHistory() {
@@ -118,17 +134,15 @@ internal class ActorHitboxHistorySlot {
 }
 
 // 权威服务端延迟补偿（Server-Side Rewind Lag Compensation）与全身骨骼受击盒判定世界：
-// - 对标 Source / Valorant / Overwatch 权威命中架构：每 Tick 记录所有存活角色世界骨骼受击盒快照至扁平环形数组
-// - 开火判定时按 (serverNow - clampedRewind) 定位前后两帧历史快照并做亚帧线性插值（Sub-Tick Lerp）
-// - 先与静态场景 BVH 求交截断掩体遮挡距离，再经插值角色 AABB 粗筛，最后执行精确解析式射线-胶囊体求交
+// - 2 的幂环形历史快照 + O(1) Tick 步长直测帧定位 + 象限符号无分支角色 AABB 粗筛
+// - 单分支解析式射线-胶囊体求交（Inigo Quilez 无限圆柱包络淘汰：未命中 0 次开方，命中柱面仅 1 次 MathF.Sqrt）
 // - 支持同角色躯体穿透高倍率优先（防止角色抬枪手臂遮挡后方近距离头部导致爆头被吞）
 public class LagCompensatedHitboxWorld3D {
-    // 反作弊最大允许回溯时间窗（默认 0.30 秒 = 300ms，阻止恶意高延迟外挂回溯过久历史）
     public double MaxRewindSeconds;
-    // 同角色躯体内部高伤害部位穿透优先深度（米，>0 时手臂挡在脸前 28cm 内仍判爆头）
     public float IntraActorPriorityDepth;
 
-    private List<ActorHitboxHistorySlot> slots;
+    private ActorHitboxHistorySlot[] slotArray;
+    private int slotCount;
     private Dictionary<int, int> actorToSlot;
     private int defaultHistoryCapacity;
 
@@ -139,16 +153,16 @@ public class LagCompensatedHitboxWorld3D {
         this.MaxRewindSeconds = 0.30;
         this.IntraActorPriorityDepth = 0.28f;
         this.defaultHistoryCapacity = historyTicksPerActor > 4 ? historyTicksPerActor : 4;
-        this.slots = new List<ActorHitboxHistorySlot>();
+        this.slotArray = new ActorHitboxHistorySlot[16];
+        this.slotCount = 0;
         this.actorToSlot = new Dictionary<int, int>();
     }
 
-    // 注册或重置一名参战角色及其骨骼受击盒模板。
     public void RegisterActor(int actorId, int teamId, SkeletalHitboxRig3D rig) {
         if (rig == null || rig.Count() <= 0) { return; }
         int existingIdx;
         if (this.actorToSlot.TryGetValue(actorId, out existingIdx)) {
-            ActorHitboxHistorySlot existing = this.slots[existingIdx];
+            ActorHitboxHistorySlot existing = this.slotArray[existingIdx];
             if (existing.CapsuleCount == rig.Count()) {
                 existing.TeamId = teamId;
                 existing.Rig = rig;
@@ -156,20 +170,30 @@ public class LagCompensatedHitboxWorld3D {
                 existing.ClearHistory();
                 return;
             }
-            this.slots[existingIdx] = new ActorHitboxHistorySlot(actorId, teamId, rig, this.defaultHistoryCapacity);
+            this.slotArray[existingIdx] = new ActorHitboxHistorySlot(actorId, teamId, rig, this.defaultHistoryCapacity);
             return;
         }
+        if (this.slotCount >= this.slotArray.Length) {
+            ActorHitboxHistorySlot[] grown = new ActorHitboxHistorySlot[this.slotArray.Length * 2];
+            for (int i = 0; i < this.slotCount; i = i + 1) {
+                grown[i] = this.slotArray[i];
+            }
+            this.slotArray = grown;
+        }
         ActorHitboxHistorySlot slot = new ActorHitboxHistorySlot(actorId, teamId, rig, this.defaultHistoryCapacity);
-        this.slots.Add(slot);
-        this.actorToSlot.Add(actorId, this.slots.Count - 1);
+        int newIdx = this.slotCount;
+        this.slotArray[newIdx] = slot;
+        this.slotCount = newIdx + 1;
+        this.actorToSlot.Add(actorId, newIdx);
     }
 
     public void SetActorActive(int actorId, bool active) {
         int idx;
         if (this.actorToSlot.TryGetValue(actorId, out idx)) {
-            this.slots[idx].Active = active;
+            ActorHitboxHistorySlot slot = this.slotArray[idx];
+            slot.Active = active;
             if (!active) {
-                this.slots[idx].ClearHistory();
+                slot.ClearHistory();
             }
         }
     }
@@ -184,8 +208,9 @@ public class LagCompensatedHitboxWorld3D {
         if (posedSkeleton == null) { return; }
         int slotIdx;
         if (!this.actorToSlot.TryGetValue(actorId, out slotIdx)) { return; }
-        ActorHitboxHistorySlot slot = this.slots[slotIdx];
-        if (!slot.Active || slot.CapsuleCount <= 0) { return; }
+        ActorHitboxHistorySlot slot = this.slotArray[slotIdx];
+        int capCount = slot.CapsuleCount;
+        if (!slot.Active || capCount <= 0) { return; }
 
         posedSkeleton.ComputeWorldPoses();
         int writeIdx = slot.Head;
@@ -194,57 +219,47 @@ public class LagCompensatedHitboxWorld3D {
         float minX = 1e30f; float minY = 1e30f; float minZ = 1e30f;
         float maxX = -1e30f; float maxY = -1e30f; float maxZ = -1e30f;
 
-        int capBase = writeIdx * slot.CapsuleCount * 7;
+        float[] cw = slot.CapsuleWorld;
+        HitboxCapsuleDef3D[] defs = slot.Rig.Defs;
+        int capBase = writeIdx * capCount * 7;
         int skelCount = posedSkeleton.Count();
 
-        for (int c = 0; c < slot.CapsuleCount; c = c + 1) {
-            HitboxCapsuleDef3D def = slot.Rig.At(c);
+        for (int c = 0; c < capCount; c = c + 1) {
+            HitboxCapsuleDef3D def = defs[c];
             Transform3D boneWorld = actorWorldTransform;
             if (def.BoneIndex >= 0 && def.BoneIndex < skelCount) {
                 boneWorld = Transform3D.Compose(actorWorldTransform, posedSkeleton.WorldPose(def.BoneIndex));
             }
             Vector3 wa = boneWorld.TransformPoint(def.LocalPointA);
             Vector3 wb = boneWorld.TransformPoint(def.LocalPointB);
-            float maxScale = boneWorld.Scale.X;
-            if (boneWorld.Scale.Y > maxScale) { maxScale = boneWorld.Scale.Y; }
-            if (boneWorld.Scale.Z > maxScale) { maxScale = boneWorld.Scale.Z; }
-            if (maxScale < 0.0f) { maxScale = -maxScale; }
+            float maxScale = Math.Max(Math.Abs(boneWorld.Scale.X), Math.Max(Math.Abs(boneWorld.Scale.Y), Math.Abs(boneWorld.Scale.Z)));
             float wr = def.Radius * (maxScale > 1e-4f ? maxScale : 1.0f);
 
             int o = capBase + c * 7;
-            slot.CapsuleWorld[o + 0] = wa.X; slot.CapsuleWorld[o + 1] = wa.Y; slot.CapsuleWorld[o + 2] = wa.Z;
-            slot.CapsuleWorld[o + 3] = wb.X; slot.CapsuleWorld[o + 4] = wb.Y; slot.CapsuleWorld[o + 5] = wb.Z;
-            slot.CapsuleWorld[o + 6] = wr;
+            cw[o + 0] = wa.X; cw[o + 1] = wa.Y; cw[o + 2] = wa.Z;
+            cw[o + 3] = wb.X; cw[o + 4] = wb.Y; cw[o + 5] = wb.Z;
+            cw[o + 6] = wr;
 
-            float cMinX = (wa.X < wb.X ? wa.X : wb.X) - wr;
-            float cMinY = (wa.Y < wb.Y ? wa.Y : wb.Y) - wr;
-            float cMinZ = (wa.Z < wb.Z ? wa.Z : wb.Z) - wr;
-            float cMaxX = (wa.X > wb.X ? wa.X : wb.X) + wr;
-            float cMaxY = (wa.Y > wb.Y ? wa.Y : wb.Y) + wr;
-            float cMaxZ = (wa.Z > wb.Z ? wa.Z : wb.Z) + wr;
-
-            if (cMinX < minX) { minX = cMinX; }
-            if (cMinY < minY) { minY = cMinY; }
-            if (cMinZ < minZ) { minZ = cMinZ; }
-            if (cMaxX > maxX) { maxX = cMaxX; }
-            if (cMaxY > maxY) { maxY = cMaxY; }
-            if (cMaxZ > maxZ) { maxZ = cMaxZ; }
+            minX = Math.Min(minX, Math.Min(wa.X, wb.X) - wr);
+            minY = Math.Min(minY, Math.Min(wa.Y, wb.Y) - wr);
+            minZ = Math.Min(minZ, Math.Min(wa.Z, wb.Z) - wr);
+            maxX = Math.Max(maxX, Math.Max(wa.X, wb.X) + wr);
+            maxY = Math.Max(maxY, Math.Max(wa.Y, wb.Y) + wr);
+            maxZ = Math.Max(maxZ, Math.Max(wa.Z, wb.Z) + wr);
         }
 
+        float[] ab = slot.ActorBounds;
         int bOff = writeIdx * 6;
-        slot.ActorBounds[bOff + 0] = minX; slot.ActorBounds[bOff + 1] = minY; slot.ActorBounds[bOff + 2] = minZ;
-        slot.ActorBounds[bOff + 3] = maxX; slot.ActorBounds[bOff + 4] = maxY; slot.ActorBounds[bOff + 5] = maxZ;
+        ab[bOff + 0] = minX; ab[bOff + 1] = minY; ab[bOff + 2] = minZ;
+        ab[bOff + 3] = maxX; ab[bOff + 4] = maxY; ab[bOff + 5] = maxZ;
 
-        slot.Head = (writeIdx + 1) % slot.HistoryCapacity;
+        slot.Head = (writeIdx + 1) & slot.CapacityMask;
         if (slot.Count < slot.HistoryCapacity) {
             slot.Count = slot.Count + 1;
         }
     }
 
-    // 执行延迟补偿亚帧回溯射击判定：
-    // - serverCurrentTime: 服务端当前权威时间（秒）
-    // - requestedTargetTime: 客户端上报的视野渲染历史时刻（如 serverCurrentTime - rtt*0.5 - clientInterpDelay）
-    // - staticWorld: 若不为 null，先用静态地图 BVH 截断射线射程，防止隔着实心掩体命中后方历史残影
+    // 执行延迟补偿亚帧回溯射击判定。
     public bool RaycastLagCompensated(Vector3 origin, Vector3 direction, float maxRange,
                                       int shooterActorId, int shooterTeamId, bool ignoreTeammates,
                                       double serverCurrentTime, double requestedTargetTime,
@@ -255,43 +270,50 @@ public class LagCompensatedHitboxWorld3D {
         hit.ActorId = -1;
         hit.CapsuleIndex = -1;
         hit.BoneIndex = -1;
-        if (maxRange <= 0.0f) { return false; }
+        if (maxRange <= 0.0f || this.slotCount <= 0) { return false; }
 
         float dLenSq = direction.LengthSquared();
         if (dLenSq <= 1e-12f) { return false; }
-        float invLen = 1.0f / (float)Math.Sqrt((double)dLenSq);
-        Vector3 dir = new Vector3(direction.X * invLen, direction.Y * invLen, direction.Z * invLen);
+        float invLen = Math.Abs(dLenSq - 1.0f) > 1e-5f ? (1.0f / MathF.Sqrt(dLenSq)) : 1.0f;
+        float dx = direction.X * invLen;
+        float dy = direction.Y * invLen;
+        float dz = direction.Z * invLen;
+        Vector3 dir = new Vector3(dx, dy, dz);
 
-        // 1. 反作弊回溯窗口钳制：[serverCurrentTime - MaxRewindSeconds, serverCurrentTime]
-        double targetTime = requestedTargetTime;
-        if (targetTime > serverCurrentTime) {
-            targetTime = serverCurrentTime;
-        }
+        // 1. 反作弊回溯窗口钳制
         double minAllowed = serverCurrentTime - this.MaxRewindSeconds;
-        if (targetTime < minAllowed) {
-            targetTime = minAllowed;
-        }
+        double targetTime = requestedTargetTime;
+        if (targetTime > serverCurrentTime) { targetTime = serverCurrentTime; }
+        if (targetTime < minAllowed) { targetTime = minAllowed; }
 
-        // 2. 静态世界墙壁遮挡截断
+        // 2. 静态世界墙壁遮挡截断（直接走已归一化方向快速通道）
         float effectiveMaxDist = maxRange;
         if (staticWorld != null) {
             MeshRayHit3D wallHit;
-            if (staticWorld.Raycast(origin, dir, maxRange, out wallHit)) {
+            if (staticWorld.RaycastUnitDir(origin, dx, dy, dz, maxRange, false, out wallHit)) {
                 effectiveMaxDist = wallHit.Distance;
             }
         }
         if (effectiveMaxDist <= 1e-5f) { return false; }
 
-        float invDx = dir.X > -1e-9f && dir.X < 1e-9f ? (dir.X >= 0.0f ? 1e9f : -1e9f) : (1.0f / dir.X);
-        float invDy = dir.Y > -1e-9f && dir.Y < 1e-9f ? (dir.Y >= 0.0f ? 1e9f : -1e9f) : (1.0f / dir.Y);
-        float invDz = dir.Z > -1e-9f && dir.Z < 1e-9f ? (dir.Z >= 0.0f ? 1e9f : -1e9f) : (1.0f / dir.Z);
+        float invDx = StaticMeshBvh3D.SafeInvDir(dx);
+        float invDy = StaticMeshBvh3D.SafeInvDir(dy);
+        float invDz = StaticMeshBvh3D.SafeInvDir(dz);
+        int nearX = invDx >= 0.0f ? 0 : 3; int farX = 3 - nearX;
+        int nearY = invDy >= 0.0f ? 1 : 4; int farY = 5 - nearY;
+        int nearZ = invDz >= 0.0f ? 2 : 5; int farZ = 7 - nearZ;
 
         float bestDist = effectiveMaxDist;
         bool foundAny = false;
+        float prioDepth = this.IntraActorPriorityDepth;
 
-        // 3. 遍历存活敌方槽位，亚帧插值 AABB 粗筛 + 胶囊体精测
-        for (int s = 0; s < this.slots.Count; s = s + 1) {
-            ActorHitboxHistorySlot slot = this.slots[s];
+        ActorHitboxHistorySlot[] slots = this.slotArray;
+        int nSlots = this.slotCount;
+        float ox = origin.X; float oy = origin.Y; float oz = origin.Z;
+
+        // 3. 遍历存活敌方槽位：O(1) 历史帧定位 + 无分支象限 AABB 粗筛 + 单分支胶囊求交
+        for (int s = 0; s < nSlots; s = s + 1) {
+            ActorHitboxHistorySlot slot = slots[s];
             if (!slot.Active || slot.Count <= 0) { continue; }
             if (slot.ActorId == shooterActorId) { continue; }
             if (ignoreTeammates && shooterTeamId != 0 && slot.TeamId == shooterTeamId) { continue; }
@@ -302,72 +324,119 @@ public class LagCompensatedHitboxWorld3D {
             double actualSampleTime;
             LagCompensatedHitboxWorld3D.FindBracketingSnapshots(slot, targetTime, out idxOld, out idxNew, out alpha, out actualSampleTime);
 
-            // 粗筛：插值角色历史包围盒
+            float[] ab = slot.ActorBounds;
             int b0 = idxOld * 6;
-            int b1 = idxNew * 6;
-            float aMinX = slot.ActorBounds[b0 + 0] + (slot.ActorBounds[b1 + 0] - slot.ActorBounds[b0 + 0]) * alpha;
-            float aMinY = slot.ActorBounds[b0 + 1] + (slot.ActorBounds[b1 + 1] - slot.ActorBounds[b0 + 1]) * alpha;
-            float aMinZ = slot.ActorBounds[b0 + 2] + (slot.ActorBounds[b1 + 2] - slot.ActorBounds[b0 + 2]) * alpha;
-            float aMaxX = slot.ActorBounds[b0 + 3] + (slot.ActorBounds[b1 + 3] - slot.ActorBounds[b0 + 3]) * alpha;
-            float aMaxY = slot.ActorBounds[b0 + 4] + (slot.ActorBounds[b1 + 4] - slot.ActorBounds[b0 + 4]) * alpha;
-            float aMaxZ = slot.ActorBounds[b0 + 5] + (slot.ActorBounds[b1 + 5] - slot.ActorBounds[b0 + 5]) * alpha;
+            float aBounds0; float aBounds1; float aBounds2;
+            float aBounds3; float aBounds4; float aBounds5;
 
-            if (!LagCompensatedHitboxWorld3D.RayIntersectsAabb(origin, invDx, invDy, invDz, bestDist,
-                                                               aMinX, aMinY, aMinZ, aMaxX, aMaxY, aMaxZ)) {
-                continue;
+            if (idxOld == idxNew || alpha <= 1e-6f) {
+                aBounds0 = ab[b0 + 0]; aBounds1 = ab[b0 + 1]; aBounds2 = ab[b0 + 2];
+                aBounds3 = ab[b0 + 3]; aBounds4 = ab[b0 + 4]; aBounds5 = ab[b0 + 5];
+                alpha = 0.0f;
+            } else {
+                int b1 = idxNew * 6;
+                aBounds0 = ab[b0 + 0] + (ab[b1 + 0] - ab[b0 + 0]) * alpha;
+                aBounds1 = ab[b0 + 1] + (ab[b1 + 1] - ab[b0 + 1]) * alpha;
+                aBounds2 = ab[b0 + 2] + (ab[b1 + 2] - ab[b0 + 2]) * alpha;
+                aBounds3 = ab[b0 + 3] + (ab[b1 + 3] - ab[b0 + 3]) * alpha;
+                aBounds4 = ab[b0 + 4] + (ab[b1 + 4] - ab[b0 + 4]) * alpha;
+                aBounds5 = ab[b0 + 5] + (ab[b1 + 5] - ab[b0 + 5]) * alpha;
             }
 
-            // 精测该角色全身骨骼胶囊体
+            float bxNear = nearX == 0 ? aBounds0 : aBounds3;
+            float bxFar  = nearX == 0 ? aBounds3 : aBounds0;
+            float byNear = nearY == 1 ? aBounds1 : aBounds4;
+            float byFar  = nearY == 1 ? aBounds4 : aBounds1;
+            float bzNear = nearZ == 2 ? aBounds2 : aBounds5;
+            float bzFar  = nearZ == 2 ? aBounds5 : aBounds2;
+
+            float tMin = Math.Max(0.0f, Math.Max((bxNear - ox) * invDx, Math.Max((byNear - oy) * invDy, (bzNear - oz) * invDz)));
+            float tMax = Math.Min(bestDist, Math.Min((bxFar - ox) * invDx, Math.Min((byFar - oy) * invDy, (bzFar - oz) * invDz)));
+            if (tMin > tMax) { continue; }
+
             float actorEntryDist = bestDist;
             int actorBestCap = -1;
             float actorBestMult = -1.0f;
             Vector3 actorBestPt = Vector3.Zero;
             Vector3 actorBestNrm = Vector3.Zero;
 
-            int cBase0 = idxOld * slot.CapsuleCount * 7;
-            int cBase1 = idxNew * slot.CapsuleCount * 7;
+            int capCount = slot.CapsuleCount;
+            float[] cw = slot.CapsuleWorld;
+            HitboxCapsuleDef3D[] defs = slot.Rig.Defs;
+            int cBase0 = idxOld * capCount * 7;
 
-            // 第一遍求该角色最早入体距离 actorEntryDist，并在 [entry, entry + IntraActorPriorityDepth] 内优选最高倍率部位
-            for (int c = 0; c < slot.CapsuleCount; c = c + 1) {
-                int o0 = cBase0 + c * 7;
-                int o1 = cBase1 + c * 7;
-                Vector3 ca = new Vector3(
-                    slot.CapsuleWorld[o0 + 0] + (slot.CapsuleWorld[o1 + 0] - slot.CapsuleWorld[o0 + 0]) * alpha,
-                    slot.CapsuleWorld[o0 + 1] + (slot.CapsuleWorld[o1 + 1] - slot.CapsuleWorld[o0 + 1]) * alpha,
-                    slot.CapsuleWorld[o0 + 2] + (slot.CapsuleWorld[o1 + 2] - slot.CapsuleWorld[o0 + 2]) * alpha);
-                Vector3 cb = new Vector3(
-                    slot.CapsuleWorld[o0 + 3] + (slot.CapsuleWorld[o1 + 3] - slot.CapsuleWorld[o0 + 3]) * alpha,
-                    slot.CapsuleWorld[o0 + 4] + (slot.CapsuleWorld[o1 + 4] - slot.CapsuleWorld[o0 + 4]) * alpha,
-                    slot.CapsuleWorld[o0 + 5] + (slot.CapsuleWorld[o1 + 5] - slot.CapsuleWorld[o0 + 5]) * alpha);
-                float cr = slot.CapsuleWorld[o0 + 6] + (slot.CapsuleWorld[o1 + 6] - slot.CapsuleWorld[o0 + 6]) * alpha;
+            if (alpha == 0.0f) {
+                for (int c = 0; c < capCount; c = c + 1) {
+                    int o0 = cBase0 + c * 7;
+                    Vector3 ca = new Vector3(cw[o0 + 0], cw[o0 + 1], cw[o0 + 2]);
+                    Vector3 cb = new Vector3(cw[o0 + 3], cw[o0 + 4], cw[o0 + 5]);
+                    float cr = cw[o0 + 6];
 
-                float capT;
-                Vector3 capNrm;
-                if (LagCompensatedHitboxWorld3D.IntersectRayCapsule(origin, dir, bestDist, ca, cb, cr, out capT, out capNrm)) {
-                    HitboxCapsuleDef3D def = slot.Rig.At(c);
-                    if (actorBestCap < 0) {
-                        actorEntryDist = capT;
-                        actorBestCap = c;
-                        actorBestMult = def.DamageMultiplier;
-                        actorBestPt = Vector3.Add(origin, Vector3.Multiply(dir, capT));
-                        actorBestNrm = capNrm;
-                    } else {
-                        if (capT < actorEntryDist) {
-                            // 若新命中更靠前，检查先前命中是否仍在优先穿透深度内且倍率更高
-                            bool keepHigherBehind = (actorEntryDist - capT) <= this.IntraActorPriorityDepth
-                                                 && actorBestMult > def.DamageMultiplier;
+                    float capT;
+                    Vector3 capNrm;
+                    if (LagCompensatedHitboxWorld3D.IntersectRayCapsule(origin, dir, bestDist, ca, cb, cr, out capT, out capNrm)) {
+                        float mult = defs[c].DamageMultiplier;
+                        if (actorBestCap < 0) {
+                            actorEntryDist = capT;
+                            actorBestCap = c;
+                            actorBestMult = mult;
+                            actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
+                            actorBestNrm = capNrm;
+                        } else if (capT < actorEntryDist) {
+                            bool keepHigherBehind = (actorEntryDist - capT) <= prioDepth && actorBestMult > mult;
                             actorEntryDist = capT;
                             if (!keepHigherBehind) {
                                 actorBestCap = c;
-                                actorBestMult = def.DamageMultiplier;
-                                actorBestPt = Vector3.Add(origin, Vector3.Multiply(dir, capT));
+                                actorBestMult = mult;
+                                actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
                                 actorBestNrm = capNrm;
                             }
-                        } else if ((capT - actorEntryDist) <= this.IntraActorPriorityDepth && def.DamageMultiplier > actorBestMult) {
-                            // 手臂/肩膀后方紧邻的头部高倍率胶囊：晋升受击部位为高倍率部位
+                        } else if ((capT - actorEntryDist) <= prioDepth && mult > actorBestMult) {
                             actorBestCap = c;
-                            actorBestMult = def.DamageMultiplier;
-                            actorBestPt = Vector3.Add(origin, Vector3.Multiply(dir, capT));
+                            actorBestMult = mult;
+                            actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
+                            actorBestNrm = capNrm;
+                        }
+                    }
+                }
+            } else {
+                int cBase1 = idxNew * capCount * 7;
+                for (int c = 0; c < capCount; c = c + 1) {
+                    int o0 = cBase0 + c * 7;
+                    int o1 = cBase1 + c * 7;
+                    Vector3 ca = new Vector3(
+                        cw[o0 + 0] + (cw[o1 + 0] - cw[o0 + 0]) * alpha,
+                        cw[o0 + 1] + (cw[o1 + 1] - cw[o0 + 1]) * alpha,
+                        cw[o0 + 2] + (cw[o1 + 2] - cw[o0 + 2]) * alpha);
+                    Vector3 cb = new Vector3(
+                        cw[o0 + 3] + (cw[o1 + 3] - cw[o0 + 3]) * alpha,
+                        cw[o0 + 4] + (cw[o1 + 4] - cw[o0 + 4]) * alpha,
+                        cw[o0 + 5] + (cw[o1 + 5] - cw[o0 + 5]) * alpha);
+                    float cr = cw[o0 + 6] + (cw[o1 + 6] - cw[o0 + 6]) * alpha;
+
+                    float capT;
+                    Vector3 capNrm;
+                    if (LagCompensatedHitboxWorld3D.IntersectRayCapsule(origin, dir, bestDist, ca, cb, cr, out capT, out capNrm)) {
+                        float mult = defs[c].DamageMultiplier;
+                        if (actorBestCap < 0) {
+                            actorEntryDist = capT;
+                            actorBestCap = c;
+                            actorBestMult = mult;
+                            actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
+                            actorBestNrm = capNrm;
+                        } else if (capT < actorEntryDist) {
+                            bool keepHigherBehind = (actorEntryDist - capT) <= prioDepth && actorBestMult > mult;
+                            actorEntryDist = capT;
+                            if (!keepHigherBehind) {
+                                actorBestCap = c;
+                                actorBestMult = mult;
+                                actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
+                                actorBestNrm = capNrm;
+                            }
+                        } else if ((capT - actorEntryDist) <= prioDepth && mult > actorBestMult) {
+                            actorBestCap = c;
+                            actorBestMult = mult;
+                            actorBestPt = new Vector3(ox + dx * capT, oy + dy * capT, oz + dz * capT);
                             actorBestNrm = capNrm;
                         }
                     }
@@ -376,7 +445,7 @@ public class LagCompensatedHitboxWorld3D {
 
             if (actorBestCap >= 0 && actorEntryDist <= bestDist) {
                 bestDist = actorEntryDist;
-                HitboxCapsuleDef3D chosenDef = slot.Rig.At(actorBestCap);
+                HitboxCapsuleDef3D chosenDef = defs[actorBestCap];
                 hit.Hit = true;
                 hit.ActorId = slot.ActorId;
                 hit.TeamId = slot.TeamId;
@@ -395,35 +464,56 @@ public class LagCompensatedHitboxWorld3D {
         return foundAny;
     }
 
-    // 在环形缓冲中定位包围 targetTime 的前后两帧快照下标与插值权重 alpha。
+    // O(1) 步长预测环形缓冲帧定位（固定 Tickrate 下 0 次循环直达，抖动帧率下微调 1~2 步收敛）。
     private static void FindBracketingSnapshots(ActorHitboxHistorySlot slot, double targetTime,
                                                 out int outOlder, out int outNewer, out float outAlpha,
                                                 out double outSampleTime) {
-        int newestIdx = (slot.Head - 1 + slot.HistoryCapacity) % slot.HistoryCapacity;
-        if (slot.Count == 1 || targetTime >= slot.Timestamps[newestIdx]) {
+        int cap = slot.HistoryCapacity;
+        int mask = slot.CapacityMask;
+        int count = slot.Count;
+        double[] ts = slot.Timestamps;
+
+        int newestIdx = (slot.Head - 1 + cap) & mask;
+        double tNewest = ts[newestIdx];
+        if (count == 1 || targetTime >= tNewest) {
             outOlder = newestIdx;
             outNewer = newestIdx;
             outAlpha = 0.0f;
-            outSampleTime = slot.Timestamps[newestIdx];
+            outSampleTime = tNewest;
             return;
         }
 
-        int oldestIdx = (slot.Head - slot.Count + slot.HistoryCapacity) % slot.HistoryCapacity;
-        if (targetTime <= slot.Timestamps[oldestIdx]) {
+        int oldestIdx = (slot.Head - count + cap) & mask;
+        double tOldest = ts[oldestIdx];
+        if (targetTime <= tOldest) {
             outOlder = oldestIdx;
             outNewer = oldestIdx;
             outAlpha = 0.0f;
-            outSampleTime = slot.Timestamps[oldestIdx];
+            outSampleTime = tOldest;
             return;
         }
 
-        // 从最新帧向前线性回扫（通常延迟仅跨越 2~15 个 Tick，顺序扫描极快且零分支预测惩罚）
-        int curNew = newestIdx;
-        for (int step = 1; step < slot.Count; step = step + 1) {
-            int curOld = (curNew - 1 + slot.HistoryCapacity) % slot.HistoryCapacity;
-            double t0 = slot.Timestamps[curOld];
-            double t1 = slot.Timestamps[curNew];
-            if (targetTime >= t0 && targetTime <= t1) {
+        // 按首尾总跨度直接估算回退步数，瞬间落到包围区间附近
+        double totalSpan = tNewest - tOldest;
+        int estBack = 0;
+        if (totalSpan > 1e-9 && count > 2) {
+            estBack = (int)(((tNewest - targetTime) / totalSpan) * (double)(count - 1));
+            if (estBack < 0) { estBack = 0; }
+            if (estBack > count - 2) { estBack = count - 2; }
+        }
+
+        int curNew = (newestIdx - estBack + cap) & mask;
+        for (int guard = 0; guard < count; guard = guard + 1) {
+            int curOld = (curNew - 1 + cap) & mask;
+            double t0 = ts[curOld];
+            double t1 = ts[curNew];
+            if (targetTime < t0) {
+                if (curOld == oldestIdx) { break; }
+                curNew = curOld;
+            } else if (targetTime > t1) {
+                if (curNew == newestIdx) { break; }
+                curNew = (curNew + 1) & mask;
+            } else {
                 outOlder = curOld;
                 outNewer = curNew;
                 double span = t1 - t0;
@@ -431,37 +521,12 @@ public class LagCompensatedHitboxWorld3D {
                 outSampleTime = targetTime;
                 return;
             }
-            curNew = curOld;
         }
 
         outOlder = oldestIdx;
         outNewer = oldestIdx;
         outAlpha = 0.0f;
-        outSampleTime = slot.Timestamps[oldestIdx];
-    }
-
-    private static bool RayIntersectsAabb(Vector3 origin, float invDx, float invDy, float invDz, float maxDist,
-                                          float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
-        float tx1 = (minX - origin.X) * invDx;
-        float tx2 = (maxX - origin.X) * invDx;
-        float tMin = tx1 < tx2 ? tx1 : tx2;
-        float tMax = tx1 > tx2 ? tx1 : tx2;
-
-        float ty1 = (minY - origin.Y) * invDy;
-        float ty2 = (maxY - origin.Y) * invDy;
-        float tyMin = ty1 < ty2 ? ty1 : ty2;
-        float tyMax = ty1 > ty2 ? ty1 : ty2;
-        if (tyMin > tMin) { tMin = tyMin; }
-        if (tyMax < tMax) { tMax = tyMax; }
-
-        float tz1 = (minZ - origin.Z) * invDz;
-        float tz2 = (maxZ - origin.Z) * invDz;
-        float tzMin = tz1 < tz2 ? tz1 : tz2;
-        float tzMax = tz1 > tz2 ? tz1 : tz2;
-        if (tzMin > tMin) { tMin = tzMin; }
-        if (tzMax < tMax) { tMax = tzMax; }
-
-        return tMax >= 0.0f && tMin <= tMax && tMin <= maxDist;
+        outSampleTime = tOldest;
     }
 
     private static bool IntersectRaySphere(Vector3 origin, Vector3 dir, Vector3 center, float radius,
@@ -471,10 +536,11 @@ public class LagCompensatedHitboxWorld3D {
         float ocx = origin.X - center.X;
         float ocy = origin.Y - center.Y;
         float ocz = origin.Z - center.Z;
-        float c = ocx * ocx + ocy * ocy + ocz * ocz - radius * radius;
+        float ocLenSq = ocx * ocx + ocy * ocy + ocz * ocz;
+        float c = ocLenSq - radius * radius;
         if (c <= 0.0f) {
             outT = 0.0f;
-            float dLen = (float)Math.Sqrt((double)(ocx * ocx + ocy * ocy + ocz * ocz));
+            float dLen = MathF.Sqrt(ocLenSq);
             outNormal = dLen > 1e-5f
                 ? new Vector3(ocx / dLen, ocy / dLen, ocz / dLen)
                 : Vector3.Negate(dir);
@@ -484,7 +550,7 @@ public class LagCompensatedHitboxWorld3D {
         if (b > 0.0f) { return false; }
         float disc = b * b - c;
         if (disc < 0.0f) { return false; }
-        float t = -b - (float)Math.Sqrt((double)disc);
+        float t = -b - MathF.Sqrt(disc);
         if (t < 0.0f || t > maxDist) { return false; }
         outT = t;
         float invR = 1.0f / radius;
@@ -495,7 +561,7 @@ public class LagCompensatedHitboxWorld3D {
         return true;
     }
 
-    // 精确解析式射线-有限胶囊体求交（柱面截断 + 双端半球并集求最小正根，涵盖平行轴向奇异情形，零近似误差）。
+    // 单分支解析式射线-有限胶囊体求交（Inigo Quilez 无限圆柱包络定理：未命中 0 次开方，柱面命中 1 次 MathF.Sqrt）。
     public static bool IntersectRayCapsule(Vector3 origin, Vector3 unitDir, float maxDist,
                                            Vector3 capA, Vector3 capB, float radius,
                                            out float outT, out Vector3 outNormal) {
@@ -508,7 +574,6 @@ public class LagCompensatedHitboxWorld3D {
         float baz = capB.Z - capA.Z;
         float baba = bax * bax + bay * bay + baz * baz;
 
-        // 退化为单球体
         if (baba <= 1e-10f) {
             return LagCompensatedHitboxWorld3D.IntersectRaySphere(origin, unitDir, capA, radius, maxDist, out outT, out outNormal);
         }
@@ -516,74 +581,65 @@ public class LagCompensatedHitboxWorld3D {
         float oax = origin.X - capA.X;
         float oay = origin.Y - capA.Y;
         float oaz = origin.Z - capA.Z;
+        float baoa = bax * oax + bay * oay + baz * oaz;
+        float rSq = radius * radius;
 
-        // 起点已在胶囊体内部检测
-        float projStart = (oax * bax + oay * bay + oaz * baz) / baba;
-        if (projStart < 0.0f) { projStart = 0.0f; } else if (projStart > 1.0f) { projStart = 1.0f; }
+        // 1. 起点已在有限胶囊体内部快速检测
+        float projStart = Math.Clamp(baoa / baba, 0.0f, 1.0f);
         float dx0 = oax - bax * projStart;
         float dy0 = oay - bay * projStart;
         float dz0 = oaz - baz * projStart;
-        if (dx0 * dx0 + dy0 * dy0 + dz0 * dz0 <= radius * radius) {
+        float d0Sq = dx0 * dx0 + dy0 * dy0 + dz0 * dz0;
+        if (d0Sq <= rSq) {
             outT = 0.0f;
-            float d0 = (float)Math.Sqrt((double)(dx0 * dx0 + dy0 * dy0 + dz0 * dz0));
+            float d0 = MathF.Sqrt(d0Sq);
             outNormal = d0 > 1e-5f ? new Vector3(dx0 / d0, dy0 / d0, dz0 / d0) : Vector3.Negate(unitDir);
             return true;
         }
 
-        bool anyHit = false;
-        float bestT = maxDist;
-        Vector3 bestN = Vector3.Zero;
-
-        // 1. 截断有限圆柱侧面解析根
+        // 2. 无限圆柱包络二次方程：胶囊体严格包含于无限圆柱，不交无限圆柱则绝不可能碰任何端球帽
         float bard = bax * unitDir.X + bay * unitDir.Y + baz * unitDir.Z;
-        float baoa = bax * oax + bay * oay + baz * oaz;
         float rdoa = unitDir.X * oax + unitDir.Y * oay + unitDir.Z * oaz;
         float oaoa = oax * oax + oay * oay + oaz * oaz;
 
         float k2 = baba - bard * bard;
         float k1 = baba * rdoa - baoa * bard;
-        float k0 = baba * oaoa - baoa * baoa - radius * radius * baba;
+        float k0 = baba * (oaoa - rSq) - baoa * baoa;
+
+        // 起点在无限圆柱外部且射线背离圆柱轴线：0 次开方直接淘汰
+        if (k0 > 0.0f && k1 >= 0.0f) {
+            return false;
+        }
 
         if (k2 > 1e-9f) {
             float h = k1 * k1 - k2 * k0;
-            if (h >= 0.0f) {
-                float tCyl = (-k1 - (float)Math.Sqrt((double)h)) / k2;
-                if (tCyl >= 0.0f && tCyl <= bestT) {
-                    float y = baoa + tCyl * bard;
-                    if (y >= 0.0f && y <= baba) {
-                        bestT = tCyl;
-                        float s = y / baba;
-                        float hitPx = oax + unitDir.X * tCyl - bax * s;
-                        float hitPy = oay + unitDir.Y * tCyl - bay * s;
-                        float hitPz = oaz + unitDir.Z * tCyl - baz * s;
-                        float invR = 1.0f / radius;
-                        bestN = new Vector3(hitPx * invR, hitPy * invR, hitPz * invR);
-                        anyHit = true;
-                    }
-                }
+            if (h < 0.0f) {
+                return false;
             }
+            float tCyl = (-k1 - MathF.Sqrt(h)) / k2;
+            if (tCyl > maxDist) {
+                return false;
+            }
+            float y = baoa + tCyl * bard;
+            if (y >= 0.0f && y <= baba) {
+                if (tCyl < 0.0f) { return false; }
+                outT = tCyl;
+                float s = y / baba;
+                float invR = 1.0f / radius;
+                outNormal = new Vector3(
+                    (oax + unitDir.X * tCyl - bax * s) * invR,
+                    (oay + unitDir.Y * tCyl - bay * s) * invR,
+                    (oaz + unitDir.Z * tCyl - baz * s) * invR);
+                return true;
+            }
+            // 仅与射线迎向的那一端球帽求交（绝不重复测另一端）
+            Vector3 capCenter = y < 0.0f ? capA : capB;
+            return LagCompensatedHitboxWorld3D.IntersectRaySphere(origin, unitDir, capCenter, radius, maxDist, out outT, out outNormal);
         }
 
-        // 2. 两端半球帽解析根（取全局最小进入时间）
-        float tCapA;
-        Vector3 nCapA;
-        if (LagCompensatedHitboxWorld3D.IntersectRaySphere(origin, unitDir, capA, radius, bestT, out tCapA, out nCapA)) {
-            bestT = tCapA;
-            bestN = nCapA;
-            anyHit = true;
-        }
-
-        float tCapB;
-        Vector3 nCapB;
-        if (LagCompensatedHitboxWorld3D.IntersectRaySphere(origin, unitDir, capB, radius, bestT, out tCapB, out nCapB)) {
-            bestT = tCapB;
-            bestN = nCapB;
-            anyHit = true;
-        }
-
-        if (!anyHit) { return false; }
-        outT = bestT;
-        outNormal = bestN;
-        return true;
+        // 射线严格平行于胶囊轴线奇异情形
+        if (k0 > 0.0f) { return false; }
+        Vector3 parallelCap = bard > 0.0f ? capA : capB;
+        return LagCompensatedHitboxWorld3D.IntersectRaySphere(origin, unitDir, parallelCap, radius, maxDist, out outT, out outNormal);
     }
 }
