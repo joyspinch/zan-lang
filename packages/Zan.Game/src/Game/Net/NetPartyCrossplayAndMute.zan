@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 联机终端平台类型。
+public enum CrossplayPlatformKind {
+    PcDesktop = 0,
+    Console = 1,
+    Mobile = 2
+}
+
+// 商业跨平台与输入设备匹配隔离过滤器：同时校验双方跨平台开关与竞技键鼠/手柄输入公平池规则。
+public class NetCrossplayMatchFilter {
+    public bool RequireSameInputInRanked;
+
+    public NetCrossplayMatchFilter(bool requireSameInputInRanked) {
+        this.RequireSameInputInRanked = requireSameInputInRanked;
+    }
+
+    public bool CanMatchTogether(CrossplayPlatformKind platA, bool optInCrossplayA, bool controllerA,
+    CrossplayPlatformKind platB, bool optInCrossplayB, bool controllerB, bool isRankedMatch) {
+        if (platA != platB) {
+            if (!optInCrossplayA || !optInCrossplayB) { return false; }
+        }
+        if (isRankedMatch && this.RequireSameInputInRanked && controllerA != controllerB) {
+            return false;
+        }
+        return true;
+    }
+}
+
+// 商业专用服动态仿真降频防雪崩调控器：CPU 连续过载自动阶梯降频（128 -> 64 -> 30 Hz），负载稳定回落后滞回升频。
+public class NetServerTickRateScaler {
+    public int CurrentTickHz;
+    public float OverloadThresholdPct;
+    public float RecoveryThresholdPct;
+    public int OverloadStreakRequired;
+    public int RecoveryStreakRequired;
+    private int overloadStreak;
+    private int recoveryStreak;
+
+    public NetServerTickRateScaler(int initialTickHz, float overloadThresholdPct,
+    float recoveryThresholdPct, int overloadStreakRequired, int recoveryStreakRequired) {
+        this.CurrentTickHz = initialTickHz > 0 ? initialTickHz : 128;
+        this.OverloadThresholdPct = overloadThresholdPct > 0.0f ? overloadThresholdPct : 85.0f;
+        this.RecoveryThresholdPct = recoveryThresholdPct > 0.0f ? recoveryThresholdPct : 55.0f;
+        this.OverloadStreakRequired = overloadStreakRequired > 0 ? overloadStreakRequired : 3;
+        this.RecoveryStreakRequired = recoveryStreakRequired > 0 ? recoveryStreakRequired : 5;
+        this.overloadStreak = 0;
+        this.recoveryStreak = 0;
+    }
+
+    public int SampleCpuUtilization(float cpuBudgetPct) {
+        if (cpuBudgetPct >= this.OverloadThresholdPct) {
+            this.overloadStreak = this.overloadStreak + 1;
+            this.recoveryStreak = 0;
+            if (this.overloadStreak >= this.OverloadStreakRequired) {
+                this.overloadStreak = 0;
+                if (this.CurrentTickHz > 64) { this.CurrentTickHz = 64; }
+                else if (this.CurrentTickHz > 30) { this.CurrentTickHz = 30; }
+            }
+        } else if (cpuBudgetPct <= this.RecoveryThresholdPct) {
+            this.recoveryStreak = this.recoveryStreak + 1;
+            this.overloadStreak = 0;
+            if (this.recoveryStreak >= this.RecoveryStreakRequired) {
+                this.recoveryStreak = 0;
+                if (this.CurrentTickHz < 64) { this.CurrentTickHz = 64; }
+                else if (this.CurrentTickHz < 128) { this.CurrentTickHz = 128; }
+            }
+        } else {
+            this.overloadStreak = 0;
+            this.recoveryStreak = 0;
+        }
+        return this.CurrentTickHz;
+    }
+}
+
+// 商业实时聊天防刷屏与指数级禁言盾：滑动窗口频控 + 重复刷屏检测 + 屡犯指数级延长禁言时长。
+public class NetChatFloodMuteShield {
+    private List<long> recentMsgTimesMs;
+    public long WindowMs;
+    public int MaxMsgsPerWindow;
+    public long BaseMuteMs;
+    public long MutedUntilMs;
+    public int OffenseCount;
+    private string lastMessage;
+
+    public NetChatFloodMuteShield(long windowMs, int maxMsgsPerWindow, long baseMuteMs) {
+        this.recentMsgTimesMs = new List<long>();
+        this.WindowMs = windowMs > 0L ? windowMs : 5000L;
+        this.MaxMsgsPerWindow = maxMsgsPerWindow > 0 ? maxMsgsPerWindow : 4;
+        this.BaseMuteMs = baseMuteMs > 0L ? baseMuteMs : 15000L;
+        this.MutedUntilMs = 0L;
+        this.OffenseCount = 0;
+        this.lastMessage = "";
+    }
+
+    public bool IsMutedAt(long nowMs) {
+        return nowMs < this.MutedUntilMs;
+    }
+
+    private void EscalateMute(long nowMs) {
+        this.OffenseCount = this.OffenseCount + 1;
+        long mul = 1L;
+        for (int i = 1; i < this.OffenseCount && i < 4; i = i + 1) {
+            mul = mul * 4L;
+        }
+        this.MutedUntilMs = nowMs + this.BaseMuteMs * mul;
+    }
+
+    public bool TrySendMessage(long nowMs, string text) {
+        if (this.IsMutedAt(nowMs)) { return false; }
+        // 清理滑窗之外的历史记录
+        List<long> kept = new List<long>();
+        for (int i = 0; i < this.recentMsgTimesMs.Count; i = i + 1) {
+            if (nowMs - this.recentMsgTimesMs[i] < this.WindowMs) {
+                kept.Add(this.recentMsgTimesMs[i]);
+            }
+        }
+        this.recentMsgTimesMs = kept;
+
+        bool dupSpam = text == this.lastMessage && this.recentMsgTimesMs.Count >= 2;
+        if (dupSpam || this.recentMsgTimesMs.Count >= this.MaxMsgsPerWindow) {
+            this.EscalateMute(nowMs);
+            return false;
+        }
+        this.recentMsgTimesMs.Add(nowMs);
+        this.lastMessage = text;
+        return true;
+    }
+}

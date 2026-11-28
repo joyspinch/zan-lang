@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 单个 3D 光照探针的烘焙间接光辐射样本（半球天空光 + 地面漫反射反弹光）。
+public class LightProbeSample3D {
+    public float SkyRed;
+    public float SkyGreen;
+    public float SkyBlue;
+    public float BounceRed;
+    public float BounceGreen;
+    public float BounceBlue;
+
+    public LightProbeSample3D(float sr, float sg, float sb, float br, float bg, float bb) {
+        this.SkyRed = sr;
+        this.SkyGreen = sg;
+        this.SkyBlue = sb;
+        this.BounceRed = br;
+        this.BounceGreen = bg;
+        this.BounceBlue = bb;
+    }
+}
+
+// 商业 3D 光照探针三线性插值体（Volumetric Light Probe Grid）：让动态角色平滑继承房间烘焙间接光。
+public class LightProbeVolume3D {
+    public int DimX;
+    public int DimY;
+    public int DimZ;
+    public float MinX;
+    public float MinY;
+    public float MinZ;
+    public float MaxX;
+    public float MaxY;
+    public float MaxZ;
+    private List<LightProbeSample3D> grid;
+
+    public LightProbeVolume3D(int dimX, int dimY, int dimZ,
+    float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        this.DimX = dimX >= 2 ? dimX : 2;
+        this.DimY = dimY >= 2 ? dimY : 2;
+        this.DimZ = dimZ >= 2 ? dimZ : 2;
+        this.MinX = minX; this.MinY = minY; this.MinZ = minZ;
+        this.MaxX = maxX > minX ? maxX : minX + 1.0f;
+        this.MaxY = maxY > minY ? maxY : minY + 1.0f;
+        this.MaxZ = maxZ > minZ ? maxZ : minZ + 1.0f;
+        this.grid = new List<LightProbeSample3D>();
+        int total = this.DimX * this.DimY * this.DimZ;
+        for (int i = 0; i < total; i = i + 1) {
+            this.grid.Add(new LightProbeSample3D(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f));
+        }
+    }
+
+    private int IndexOf(int ix, int iy, int iz) {
+        return (iz * this.DimY + iy) * this.DimX + ix;
+    }
+
+    public void SetProbe(int ix, int iy, int iz, LightProbeSample3D sample) {
+        if (ix < 0 || ix >= this.DimX || iy < 0 || iy >= this.DimY || iz < 0 || iz >= this.DimZ) { return; }
+        this.grid[this.IndexOf(ix, iy, iz)] = sample;
+    }
+
+    private static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+    private static LightProbeSample3D LerpSample(LightProbeSample3D a, LightProbeSample3D b, float t) {
+        return new LightProbeSample3D(
+            Lerp(a.SkyRed, b.SkyRed, t),
+            Lerp(a.SkyGreen, b.SkyGreen, t),
+            Lerp(a.SkyBlue, b.SkyBlue, t),
+            Lerp(a.BounceRed, b.BounceRed, t),
+            Lerp(a.BounceGreen, b.BounceGreen, t),
+            Lerp(a.BounceBlue, b.BounceBlue, t));
+    }
+
+    // 在世界坐标 (wx, wy, wz) 处执行 8 角点三线性插值（越界自动钳位到体边界）。
+    public LightProbeSample3D SampleTrilinear(float wx, float wy, float wz) {
+        float ux = (wx - this.MinX) / (this.MaxX - this.MinX);
+        float uy = (wy - this.MinY) / (this.MaxY - this.MinY);
+        float uz = (wz - this.MinZ) / (this.MaxZ - this.MinZ);
+        if (ux < 0.0f) { ux = 0.0f; } if (ux > 1.0f) { ux = 1.0f; }
+        if (uy < 0.0f) { uy = 0.0f; } if (uy > 1.0f) { uy = 1.0f; }
+        if (uz < 0.0f) { uz = 0.0f; } if (uz > 1.0f) { uz = 1.0f; }
+
+        float fx = ux * (float)(this.DimX - 1);
+        float fy = uy * (float)(this.DimY - 1);
+        float fz = uz * (float)(this.DimZ - 1);
+        int x0 = (int)fx; int x1 = x0 + 1 < this.DimX ? x0 + 1 : x0;
+        int y0 = (int)fy; int y1 = y0 + 1 < this.DimY ? y0 + 1 : y0;
+        int z0 = (int)fz; int z1 = z0 + 1 < this.DimZ ? z0 + 1 : z0;
+        float tx = fx - (float)x0;
+        float ty = fy - (float)y0;
+        float tz = fz - (float)z0;
+
+        LightProbeSample3D c00 = LerpSample(this.grid[this.IndexOf(x0, y0, z0)], this.grid[this.IndexOf(x1, y0, z0)], tx);
+        LightProbeSample3D c10 = LerpSample(this.grid[this.IndexOf(x0, y1, z0)], this.grid[this.IndexOf(x1, y1, z0)], tx);
+        LightProbeSample3D c01 = LerpSample(this.grid[this.IndexOf(x0, y0, z1)], this.grid[this.IndexOf(x1, y0, z1)], tx);
+        LightProbeSample3D c11 = LerpSample(this.grid[this.IndexOf(x0, y1, z1)], this.grid[this.IndexOf(x1, y1, z1)], tx);
+        LightProbeSample3D c0 = LerpSample(c00, c10, ty);
+        LightProbeSample3D c1 = LerpSample(c01, c11, ty);
+        return LerpSample(c0, c1, tz);
+    }
+}

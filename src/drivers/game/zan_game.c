@@ -163,6 +163,7 @@ typedef struct {
     zgl_int u_blueprint_wire_params, u_blueprint_wire_color;
     zgl_int u_heat_haze_params, u_heat_haze_color;
     zgl_int u_pixel_dither_params;
+    zgl_int u_crosshatch_params, u_crosshatch_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -268,6 +269,8 @@ static float g_game_blueprint_wire_color[3] = { 0.15f, 0.78f, 1.0f };
 static float g_game_heat_haze_params[4] = { 0.0f, 4.0f, 0.0f, 0.0f }; /* enabled, freq, phase, strength */
 static float g_game_heat_haze_color[3] = { 1.0f, 0.55f, 0.18f };
 static float g_game_pixel_dither_params[3] = { 0.0f, 1.0f, 1.0f }; /* enabled, opacity, pixel_scale */
+static float g_game_crosshatch_params[3] = { 0.0f, 8.0f, 0.0f }; /* enabled, density, ink_strength */
+static float g_game_crosshatch_color[3] = { 0.05f, 0.05f, 0.08f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -296,6 +299,7 @@ static float g_game_post_split_params[2] = { 0.0f, 0.0f }; /* strength, balance 
 static float g_game_post_split_shadow[3] = { 0.05f, 0.35f, 0.95f };
 static float g_game_post_split_high[3] = { 1.0f, 0.58f, 0.15f };
 static float g_game_post_oil_paint[2] = { 0.0f, 2.0f }; /* strength, radius */
+static float g_game_post_scope_blur[2] = { 0.0f, 0.45f }; /* strength, clear_radius */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -617,6 +621,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uHeatHazeParams;\n" \
 "uniform vec3 uHeatHazeColor;\n" \
 "uniform vec3 uPixelDitherParams;\n" \
+"uniform vec3 uCrosshatchParams;\n" \
+"uniform vec3 uCrosshatchColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -924,6 +930,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "            discard;\n" \
     "        }\n" \
     "    }\n" \
+    "    if (uCrosshatchParams.x > 0.5 && uCrosshatchParams.z > 0.0005) {\n" \
+    "        float chLum = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n" \
+    "        float chStep = max(uCrosshatchParams.y, 2.0);\n" \
+    "        float chD1 = abs(fract((gl_FragCoord.x + gl_FragCoord.y) / chStep) - 0.5);\n" \
+    "        float chD2 = abs(fract((gl_FragCoord.x - gl_FragCoord.y) / chStep) - 0.5);\n" \
+    "        float chInk = 0.0;\n" \
+    "        if (chLum < 0.65) { chInk = max(chInk, smoothstep(0.18, 0.06, chD1)); }\n" \
+    "        if (chLum < 0.35) { chInk = max(chInk, smoothstep(0.18, 0.06, chD2)); }\n" \
+    "        rgb = mix(rgb, uCrosshatchColor, chInk * clamp(uCrosshatchParams.z, 0.0, 1.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
@@ -1082,6 +1098,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostSplitShadow;\n"
 "uniform vec3 uPostSplitHigh;\n"
 "uniform vec2 uPostOilPaint;\n"
+"uniform vec2 uPostScopeBlur;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1134,6 +1151,23 @@ static const char *const ZAN_GAME_POST_FS =
     "            }\n"
     "        }\n"
     "        col = mix(col, opBestMean, clamp(uPostOilPaint.x, 0.0, 1.0));\n"
+    "    }\n"
+    "    if (uPostScopeBlur.x > 0.0005) {\n"
+    "        float sbRad = length((uv - vec2(0.5)) * 2.0);\n"
+    "        float sbAmt = smoothstep(clamp(uPostScopeBlur.y, 0.1, 1.0), 1.15, sbRad) * clamp(uPostScopeBlur.x, 0.0, 1.0);\n"
+    "        if (sbAmt > 0.001) {\n"
+    "            vec2 sbStep = uTexelSize * (sbAmt * 4.0);\n"
+    "            vec3 sbAcc = col * 2.0;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( 0.0,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( 0.0, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            col = mix(col, sbAcc * 0.1, sbAmt);\n"
+    "        }\n"
     "    }\n"
     "    if (uPostGlitch.x > 0.0005) {\n"
     "        float gBand = floor(uv.y * max(uPostGlitch.y, 4.0));\n"
@@ -1411,6 +1445,7 @@ typedef struct {
     zgl_int u_post_split_shadow;
     zgl_int u_post_split_high;
     zgl_int u_post_oil_paint;
+    zgl_int u_post_scope_blur;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1590,7 +1625,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
         : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
     char vs_src[4096];
-    char fs_src[24576];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, vs);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, fs);
@@ -1712,6 +1747,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uHeatHazeColor");
     zgl_int pixel_dither_params = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
+    zgl_int crosshatch_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
+    zgl_int crosshatch_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1813,6 +1852,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_heat_haze_params = heat_haze_params;
     prog->u_heat_haze_color = heat_haze_color;
     prog->u_pixel_dither_params = pixel_dither_params;
+    prog->u_crosshatch_params = crosshatch_params;
+    prog->u_crosshatch_color = crosshatch_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1842,7 +1883,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
 static zan_game_program *zan_game_skin_program_get(void) {
     if (g_game_skin_prog.program) return &g_game_skin_prog;
     char vs_src[4096];
-    char fs_src[24576];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SKINNED);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_PLAIN);
@@ -1911,6 +1952,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int heat_haze_params = g_game_gl->GetUniformLocation(program, "uHeatHazeParams");
     zgl_int heat_haze_color = g_game_gl->GetUniformLocation(program, "uHeatHazeColor");
     zgl_int pixel_dither_params = g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
+    zgl_int crosshatch_params = g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
+    zgl_int crosshatch_color = g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -2000,6 +2043,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_heat_haze_params = heat_haze_params;
     g_game_skin_prog.u_heat_haze_color = heat_haze_color;
     g_game_skin_prog.u_pixel_dither_params = pixel_dither_params;
+    g_game_skin_prog.u_crosshatch_params = crosshatch_params;
+    g_game_skin_prog.u_crosshatch_color = crosshatch_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2580,6 +2625,12 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_pixel_dither_params >= 0) {
         gl->Uniform3fv(prog->u_pixel_dither_params, 1, g_game_pixel_dither_params);
     }
+    if (prog->u_crosshatch_params >= 0) {
+        gl->Uniform3fv(prog->u_crosshatch_params, 1, g_game_crosshatch_params);
+    }
+    if (prog->u_crosshatch_color >= 0) {
+        gl->Uniform3fv(prog->u_crosshatch_color, 1, g_game_crosshatch_color);
+    }
 }
 
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
@@ -3134,7 +3185,7 @@ done:
 static zan_game_post_program *zan_game_post_program_get(void) {
     if (g_game_post_prog.program) return &g_game_post_prog;
     char vs_src[1024];
-    char fs_src[24576];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_POST_FS);
@@ -3175,6 +3226,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_split_shadow = g_game_gl->GetUniformLocation(prog, "uPostSplitShadow");
     g_game_post_prog.u_post_split_high = g_game_gl->GetUniformLocation(prog, "uPostSplitHigh");
     g_game_post_prog.u_post_oil_paint = g_game_gl->GetUniformLocation(prog, "uPostOilPaint");
+    g_game_post_prog.u_post_scope_blur = g_game_gl->GetUniformLocation(prog, "uPostScopeBlur");
     return &g_game_post_prog;
 }
 
@@ -3366,6 +3418,10 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     if (prog->u_post_oil_paint >= 0) {
         gl->Uniform2f(prog->u_post_oil_paint,
             g_game_post_oil_paint[0], g_game_post_oil_paint[1]);
+    }
+    if (prog->u_post_scope_blur >= 0) {
+        gl->Uniform2f(prog->u_post_scope_blur,
+            g_game_post_scope_blur[0], g_game_post_scope_blur[1]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -4088,4 +4144,26 @@ ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius) {
     if (radius > 4.0f) radius = 4.0f;
     g_game_post_oil_paint[0] = strength;
     g_game_post_oil_paint[1] = radius;
+}
+
+ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
+    float ink_strength, float r, float g, float b) {
+    g_game_crosshatch_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_crosshatch_params[1] = density > 2.0f ? density : 8.0f;
+    if (ink_strength < 0.0f) ink_strength = 0.0f;
+    if (ink_strength > 1.0f) ink_strength = 1.0f;
+    g_game_crosshatch_params[2] = ink_strength;
+    g_game_crosshatch_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_crosshatch_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_crosshatch_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
+    float clear_radius) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (clear_radius < 0.1f) clear_radius = 0.1f;
+    if (clear_radius > 1.0f) clear_radius = 1.0f;
+    g_game_post_scope_blur[0] = strength;
+    g_game_post_scope_blur[1] = clear_radius;
 }

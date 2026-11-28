@@ -392,6 +392,16 @@ ZAN_GAME_API void zan_game_set_pixel_dither_fade3d(int32_t enabled,
  * strength [0..1] 控制风格化混合强度，radius [1..4] 控制笔触采样半径（保边去噪）。 */
 ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius);
 
+/* GPU 3D 屏幕空间漫画/钢笔交叉排线着色（Comic Cross-Hatching Ink，零贴图零额外 Pass）：
+ * enabled != 0 时按片段亮度分级叠加 +45/-45 度手绘排线笔触，亮部高光保持纯净。 */
+ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
+    float ink_strength, float r, float g, float b);
+
+/* GPU 后处理瞄准镜/专注外围景深虚化（Peripheral Scope Edge Blur，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制外围虚化强度，clear_radius [0.1..1.0] 控制中心绝对清晰区半径。 */
+ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
+    float clear_radius);
+
 #ifdef __cplusplus
 }
 #endif
