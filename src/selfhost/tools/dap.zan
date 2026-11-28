@@ -1,0 +1,1070 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Zan;
+
+/// 纯 Zan Debug Adapter Protocol (DAP) 服务端（B-ID201）。
+/// 协议面与 C 宿主 src/dap/dap_main.c 对齐：Content-Length 二进制帧、
+/// 22 条 DAP 请求、运行期非阻塞 stdin 探测（pause 中断 + parked 队列）、
+/// 条件/命中次数/日志点/异常断点、DWARF 变量展开及 zan/heapSnapshot。
+public class DapServer {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetStdHandle")]
+    private static extern nint WinGetStdHandle(int which);
+    [DllImport("kernel32", EntryPoint = "PeekNamedPipe")]
+    private static extern int WinPeekNamedPipe(nint handle, nint buf, int bufSize,
+        nint numRead, byte[] totalAvail, nint left);
+    [DllImport("kernel32", EntryPoint = "ReadFile")]
+    private static extern int WinReadFile(nint handle, byte[] buf, int count,
+        byte[] numRead, nint overlapped);
+    [DllImport("kernel32", EntryPoint = "WriteFile")]
+    private static extern int WinWriteFile(nint handle, byte[] buf, int count,
+        byte[] numWritten, nint overlapped);
+    #elif LINUX || MACOS
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_available")]
+    private static extern int PosixAvailable(int fd);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_read")]
+    private static extern int PosixRead(int fd, byte[] buf, int count);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_write")]
+    private static extern int PosixWrite(int fd, byte[] buf, int count);
+    #endif
+
+    static DapDebugger dbg;
+    static int outSeq;
+    static string program;
+    static string progArgs;
+    static string sourceFile;
+    static bool terminated;
+    static bool launched;
+    static int attachPid;
+    static List<string> parked;
+    #if WINDOWS
+    static nint stdinHandle;
+    static nint stdoutHandle;
+    #endif
+
+    static void ResetState() {
+        dbg = new DapDebugger();
+        outSeq = 1;
+        program = "";
+        progArgs = "";
+        sourceFile = "";
+        terminated = false;
+        launched = false;
+        attachPid = 0;
+        parked = new List<string>();
+        #if WINDOWS
+        stdinHandle = WinGetStdHandle(0 - 10);  // STD_INPUT_HANDLE
+        stdoutHandle = WinGetStdHandle(0 - 11); // STD_OUTPUT_HANDLE
+        #endif
+    }
+
+    static int ReadIntLE(byte[] b, int off) {
+        return (b[off] & 255)
+            | ((b[off + 1] & 255) << 8)
+            | ((b[off + 2] & 255) << 16)
+            | ((b[off + 3] & 255) << 24);
+    }
+
+    static bool InputPending() {
+        #if WINDOWS
+        if (stdinHandle == 0 || stdinHandle == (nint)(0 - 1)) { return false; }
+        byte[] avail = new byte[4];
+        if (WinPeekNamedPipe(stdinHandle, 0, 0, 0, avail, 0) == 0) { return false; }
+        return ReadIntLE(avail, 0) > 0;
+        #elif LINUX || MACOS
+        return PosixAvailable(0) > 0;
+        #else
+        return false;
+        #endif
+    }
+
+    static int ReadStdinByte() {
+        byte[] b = new byte[1];
+        #if WINDOWS
+        if (stdinHandle == 0 || stdinHandle == (nint)(0 - 1)) { return -1; }
+        byte[] got = new byte[4];
+        if (WinReadFile(stdinHandle, b, 1, got, 0) == 0 || ReadIntLE(got, 0) <= 0) { return -1; }
+        return b[0] & 255;
+        #elif LINUX || MACOS
+        int r = PosixRead(0, b, 1);
+        if (r <= 0) { return -1; }
+        return b[0] & 255;
+        #else
+        return -1;
+        #endif
+    }
+
+    static bool ReadExactBytes(byte[] dst, int len) {
+        int got = 0;
+        while (got < len) {
+            int ch = ReadStdinByte();
+            if (ch < 0) { return false; }
+            dst[got] = (byte)ch;
+            got = got + 1;
+        }
+        return true;
+    }
+
+    static string ReadFrame() {
+        int contentLen = -1;
+        while (true) {
+            StringBuilder hdr = new StringBuilder();
+            while (true) {
+                int ch = ReadStdinByte();
+                if (ch < 0) { return null; }
+                if (ch == 10) { break; }
+                if (ch != 13) { hdr.Append((char)ch); }
+            }
+            string line = hdr.ToString();
+            if (line == "") {
+                if (contentLen >= 0) { break; }
+                continue;
+            }
+            if (line.StartsWith("Content-Length:") || line.StartsWith("content-length:")) {
+                contentLen = ParseIntDecimal(line.Substring(15).Trim(), -1);
+            }
+        }
+        if (contentLen <= 0 || contentLen > 67108864) { return null; }
+        byte[] buf = new byte[contentLen];
+        if (!ReadExactBytes(buf, contentLen)) { return null; }
+        return buf.ToStr(0, contentLen);
+    }
+
+    static void WriteAllStdout(byte[] data) {
+        if (data == null || data.Length == 0) { return; }
+        #if WINDOWS
+        if (stdoutHandle == 0 || stdoutHandle == (nint)(0 - 1)) { return; }
+        byte[] written = new byte[4];
+        WinWriteFile(stdoutHandle, data, data.Length, written, 0);
+        #elif LINUX || MACOS
+        PosixWrite(1, data, data.Length);
+        #endif
+    }
+
+    static void SendRawJson(string payload) {
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(payload);
+        string header = "Content-Length: " + Convert.ToString(bodyBytes.Length) + "\r\n\r\n";
+        byte[] hdrBytes = Encoding.UTF8.GetBytes(header);
+        byte[] frame = new byte[hdrBytes.Length + bodyBytes.Length];
+        int i = 0;
+        while (i < hdrBytes.Length) {
+            frame[i] = hdrBytes[i];
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < bodyBytes.Length) {
+            frame[hdrBytes.Length + j] = bodyBytes[j];
+            j = j + 1;
+        }
+        WriteAllStdout(frame);
+    }
+
+    // ============================ JSON 层 ============================
+
+    public static string EncodeJsonString(string s) {
+        if (s == null) { return "\"\""; }
+        List<byte> outp = new List<byte>();
+        outp.Add(34);
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 34) { outp.Add(92); outp.Add(34); }
+            else if (c == 92) { outp.Add(92); outp.Add(92); }
+            else if (c == 10) { outp.Add(92); outp.Add(110); }
+            else if (c == 13) { outp.Add(92); outp.Add(114); }
+            else if (c == 9) { outp.Add(92); outp.Add(116); }
+            else if (c < 32) {
+                outp.Add(92); outp.Add(117); outp.Add(48); outp.Add(48);
+                int hi = c / 16;
+                int lo = c % 16;
+                outp.Add((byte)(hi < 10 ? 48 + hi : 87 + hi));
+                outp.Add((byte)(lo < 10 ? 48 + lo : 87 + lo));
+            } else {
+                outp.Add((byte)c);
+            }
+            i = i + 1;
+        }
+        outp.Add(34);
+        byte[] arr = new byte[outp.Count];
+        int k = 0;
+        while (k < outp.Count) { arr[k] = outp[k]; k = k + 1; }
+        return arr.ToStr(0, arr.Length);
+    }
+
+    static int SkipJsonString(string json, int qStart) {
+        int i = qStart + 1;
+        while (i < json.Length) {
+            char c = json[i];
+            if (c == '\\' && i + 1 < json.Length) { i = i + 2; continue; }
+            if (c == '"') { return i + 1; }
+            i = i + 1;
+        }
+        return json.Length;
+    }
+
+    static int SkipJsonValue(string json, int pos) {
+        int n = json.Length;
+        while (pos < n && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) {
+            pos = pos + 1;
+        }
+        if (pos >= n) { return n; }
+        char c = json[pos];
+        if (c == '"') { return SkipJsonString(json, pos); }
+        if (c == '{' || c == '[') {
+            char open = c;
+            char close = c == '{' ? '}' : ']';
+            int depth = 1;
+            int i = pos + 1;
+            while (i < n && depth > 0) {
+                if (json[i] == '"') { i = SkipJsonString(json, i); continue; }
+                if (json[i] == open) { depth = depth + 1; }
+                else if (json[i] == close) { depth = depth - 1; }
+                i = i + 1;
+            }
+            return i;
+        }
+        while (pos < n && json[pos] != ',' && json[pos] != '}' && json[pos] != ']'
+                && json[pos] != ' ' && json[pos] != '\t' && json[pos] != '\r' && json[pos] != '\n') {
+            pos = pos + 1;
+        }
+        return pos;
+    }
+
+    // 查找当前顶层 JSON 对象内的 key 值起始下标（不误命中嵌套子对象同名字段）。
+    static int FindTopLevelJsonValueStart(string json, string key) {
+        if (json == null || key == null || key == "") { return -1; }
+        int n = json.Length;
+        int i = 0;
+        while (i < n && json[i] != '{') { i = i + 1; }
+        if (i >= n) { return -1; }
+        i = i + 1;
+        while (i < n) {
+            while (i < n && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n' || json[i] == ',')) {
+                i = i + 1;
+            }
+            if (i >= n || json[i] == '}') { break; }
+            if (json[i] != '"') { break; }
+            int keyEnd = SkipJsonString(json, i);
+            string k = UnescapeJsonString(json.Substring(i + 1, keyEnd - i - 2));
+            i = keyEnd;
+            while (i < n && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) {
+                i = i + 1;
+            }
+            if (i >= n || json[i] != ':') { break; }
+            i = i + 1;
+            while (i < n && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) {
+                i = i + 1;
+            }
+            if (k == key) { return i; }
+            i = SkipJsonValue(json, i);
+        }
+        return -1;
+    }
+
+    static string UnescapeJsonString(string raw) {
+        if (raw == null || raw == "") { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = raw.Length;
+        while (i < n) {
+            char c = raw[i];
+            if (c == '\\' && i + 1 < n) {
+                i = i + 1;
+                char nx = raw[i];
+                if (nx == 'n') { sb.Append('\n'); }
+                else if (nx == 'r') { sb.Append('\r'); }
+                else if (nx == 't') { sb.Append('\t'); }
+                else if (nx == '"') { sb.Append('"'); }
+                else if (nx == '\\') { sb.Append('\\'); }
+                else if (nx == '/') { sb.Append('/'); }
+                else if (nx == 'u' && i + 4 < n) {
+                    int code = 0;
+                    int k = 1;
+                    while (k <= 4) {
+                        char h = raw[i + k];
+                        int d = 0;
+                        if (h >= '0' && h <= '9') { d = (int)(h - '0'); }
+                        else if (h >= 'a' && h <= 'f') { d = 10 + (int)(h - 'a'); }
+                        else if (h >= 'A' && h <= 'F') { d = 10 + (int)(h - 'A'); }
+                        code = code * 16 + d;
+                        k = k + 1;
+                    }
+                    if (code >= 0 && code < 128) { sb.Append((char)code); }
+                    i = i + 4;
+                } else {
+                    sb.Append(nx);
+                }
+            } else {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string JsonGetString(string json, string key) {
+        int p = FindTopLevelJsonValueStart(json, key);
+        if (p < 0 || p >= json.Length || json[p] != '"') { return ""; }
+        int end = SkipJsonString(json, p);
+        if (end < p + 2) { return ""; }
+        return UnescapeJsonString(json.Substring(p + 1, end - p - 2));
+    }
+
+    static string JsonGetContainer(string json, string key) {
+        int p = FindTopLevelJsonValueStart(json, key);
+        if (p < 0 || p >= json.Length) { return ""; }
+        if (json[p] != '{' && json[p] != '[') { return ""; }
+        int end = SkipJsonValue(json, p);
+        if (end <= p) { return ""; }
+        return json.Substring(p, end - p);
+    }
+
+    static int ParseIntDecimal(string s, int fallback) {
+        if (s == null || s == "") { return fallback; }
+        int i = 0;
+        while (i < s.Length && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+        bool neg = false;
+        if (i < s.Length && s[i] == '-') { neg = true; i = i + 1; }
+        else if (i < s.Length && s[i] == '+') { i = i + 1; }
+        int val = 0;
+        bool any = false;
+        while (i < s.Length && s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + (int)(s[i] - '0');
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return fallback; }
+        return neg ? (0 - val) : val;
+    }
+
+    static int JsonGetInt(string json, string key, int fallback) {
+        int p = FindTopLevelJsonValueStart(json, key);
+        if (p < 0 || p >= json.Length) { return fallback; }
+        int end = SkipJsonValue(json, p);
+        string tok = json.Substring(p, end - p).Trim();
+        if (tok == "true") { return 1; }
+        if (tok == "false") { return 0; }
+        return ParseIntDecimal(tok, fallback);
+    }
+
+    static bool JsonGetBool(string json, string key, bool fallback) {
+        int p = FindTopLevelJsonValueStart(json, key);
+        if (p < 0 || p >= json.Length) { return fallback; }
+        int end = SkipJsonValue(json, p);
+        string tok = json.Substring(p, end - p).Trim();
+        if (tok == "true" || tok == "1") { return true; }
+        if (tok == "false" || tok == "0") { return false; }
+        return fallback;
+    }
+
+    static List<string> JsonSplitArrayElements(string arrJson) {
+        List<string> items = new List<string>();
+        if (arrJson == null || arrJson == "") { return items; }
+        int n = arrJson.Length;
+        int i = 0;
+        while (i < n && arrJson[i] != '[') { i = i + 1; }
+        if (i >= n) { return items; }
+        i = i + 1;
+        while (i < n) {
+            while (i < n && (arrJson[i] == ' ' || arrJson[i] == '\t' || arrJson[i] == '\r' || arrJson[i] == '\n' || arrJson[i] == ',')) {
+                i = i + 1;
+            }
+            if (i >= n || arrJson[i] == ']') { break; }
+            int end = SkipJsonValue(arrJson, i);
+            if (end <= i) { break; }
+            items.Add(arrJson.Substring(i, end - i));
+            i = end;
+        }
+        return items;
+    }
+
+    // ============================ DAP 协议出站 ============================
+
+    static void SendResponse(int reqSeq, string command, bool success, string bodyJson) {
+        int seq = outSeq;
+        outSeq = outSeq + 1;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"seq\":");
+        sb.Append(seq);
+        sb.Append(",\"type\":\"response\",\"request_seq\":");
+        sb.Append(reqSeq);
+        sb.Append(",\"success\":");
+        sb.Append(success ? "true" : "false");
+        sb.Append(",\"command\":");
+        sb.Append(EncodeJsonString(command != null ? command : ""));
+        if (bodyJson != null && bodyJson != "") {
+            sb.Append(",\"body\":");
+            sb.Append(bodyJson);
+        }
+        sb.Append("}");
+        SendRawJson(sb.ToString());
+    }
+
+    static void SendEvent(string eventName, string bodyJson) {
+        int seq = outSeq;
+        outSeq = outSeq + 1;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"seq\":");
+        sb.Append(seq);
+        sb.Append(",\"type\":\"event\",\"event\":");
+        sb.Append(EncodeJsonString(eventName));
+        if (bodyJson != null && bodyJson != "") {
+            sb.Append(",\"body\":");
+            sb.Append(bodyJson);
+        }
+        sb.Append("}");
+        SendRawJson(sb.ToString());
+    }
+
+    static void SendOutput(string category, string text) {
+        if (text == null || text == "") { return; }
+        string body = "{\"category\":" + EncodeJsonString(category)
+            + ",\"output\":" + EncodeJsonString(text) + "}";
+        SendEvent("output", body);
+    }
+
+    static void FlushOutput() {
+        string text = dbg.DrainOutput();
+        if (text != "") { SendOutput("stdout", text); }
+    }
+
+    static void SendStopped(string reason) {
+        string body = "{\"reason\":" + EncodeJsonString(reason)
+            + ",\"threadId\":1,\"allThreadsStopped\":true}";
+        SendEvent("stopped", body);
+    }
+
+    static void TerminateWithCode(int exitCode) {
+        if (terminated) { return; }
+        terminated = true;
+        SendEvent("terminated", "");
+        SendEvent("exited", "{\"exitCode\":" + Convert.ToString(exitCode) + "}");
+    }
+
+    static string MapStopReason(string mi) {
+        if (mi == null || mi == "") { return "breakpoint"; }
+        if (mi == "pause" || mi == "signal-received") { return "pause"; }
+        if (mi.StartsWith("breakpoint")) { return "breakpoint"; }
+        if (mi.Contains("stepping-range") || mi.Contains("finished")) { return "step"; }
+        if (mi.Contains("watchpoint")) { return "data breakpoint"; }
+        if (mi.Contains("exception") || mi.Contains("signal")) { return "exception"; }
+        return "breakpoint";
+    }
+
+    static DapBreakpoint LogpointHere() {
+        if (dbg.State != DapState.Paused()) { return null; }
+        DapBreakpoint found = null;
+        string curBase = DapDebugger.BaseName(dbg.CurrentFile);
+        int i = 0;
+        while (i < dbg.Breakpoints.Count) {
+            DapBreakpoint bp = dbg.Breakpoints[i];
+            if (bp.Enabled && bp.Line == dbg.CurrentLine
+                    && DapDebugger.BaseName(bp.FilePath) == curBase) {
+                if (bp.Kind == DapBpKind.Logpoint()) { found = bp; }
+                else { return null; }
+            }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    static string FormatLogMessage(string tmpl) {
+        if (tmpl == null) { return "\n"; }
+        StringBuilder sb = new StringBuilder();
+        List<string> evalBox = new List<string>();
+        int i = 0;
+        while (i < tmpl.Length) {
+            if (tmpl[i] != '{') {
+                sb.Append(tmpl[i]);
+                i = i + 1;
+                continue;
+            }
+            int close = tmpl.IndexOf("}", i + 1);
+            if (close < 0) {
+                sb.Append(tmpl[i]);
+                i = i + 1;
+                continue;
+            }
+            string expr = tmpl.Substring(i + 1, close - i - 1);
+            i = close + 1;
+            if (expr != "" && dbg.Evaluate(expr, evalBox) && evalBox.Count > 0) {
+                sb.Append(evalBox[0]);
+            } else {
+                sb.Append("<");
+                sb.Append(expr != "" ? expr : "?");
+                sb.Append(">");
+            }
+        }
+        string outStr = sb.ToString();
+        if (outStr == "" || !outStr.EndsWith("\n")) {
+            outStr = outStr + "\n";
+        }
+        return outStr;
+    }
+
+    static void ReportStop() {
+        FlushOutput();
+        int guard = 0;
+        while (dbg.State == DapState.Paused() && guard < 64) {
+            guard = guard + 1;
+            DapBreakpoint lp = LogpointHere();
+            if (lp == null) { break; }
+            SendOutput("stdout", FormatLogMessage(lp.LogMessage));
+            dbg.Continue();
+            FlushOutput();
+        }
+        if (dbg.State == DapState.Paused()) {
+            SendStopped(MapStopReason(dbg.StopReason));
+        } else {
+            TerminateWithCode(dbg.LastExitCode);
+        }
+    }
+
+    // 运行期非阻塞探测：收到 pause 立即应答并中断被调试进程，其余消息暂存 parked 队列。
+    static void PollStdinDuringRun() {
+        if (!InputPending()) { return; }
+        string body = ReadFrame();
+        if (body == null || body == "") { return; }
+        string cmd = JsonGetString(body, "command");
+        if (cmd == "pause") {
+            int reqSeq = JsonGetInt(body, "seq", 0);
+            SendResponse(reqSeq, "pause", true, "");
+            dbg.Interrupt();
+        } else if (parked.Count < 64) {
+            parked.Add(body);
+        }
+    }
+
+    // ============================ DAP 请求处理 ============================
+
+    static void HandleInitialize(int reqSeq) {
+        string caps = "{"
+            + "\"supportsConfigurationDoneRequest\":true,"
+            + "\"supportsFunctionBreakpoints\":false,"
+            + "\"supportsConditionalBreakpoints\":true,"
+            + "\"supportsHitConditionalBreakpoints\":true,"
+            + "\"supportsLogPoints\":true,"
+            + "\"supportsEvaluateForHovers\":true,"
+            + "\"supportsSetVariable\":true,"
+            + "\"supportsStepBack\":false,"
+            + "\"supportsTerminateRequest\":true,"
+            + "\"supportsRunInTerminalRequest\":false,"
+            + "\"supportsExceptionInfoRequest\":true,"
+            + "\"supportsExceptionFilterOptions\":true,"
+            + "\"exceptionBreakpointFilters\":["
+            + "{\"filter\":\"throw\",\"label\":\"Thrown exceptions\",\"default\":false},"
+            + "{\"filter\":\"unhandled\",\"label\":\"Unhandled exceptions\",\"default\":true}"
+            + "]}";
+        SendResponse(reqSeq, "initialize", true, caps);
+        SendEvent("initialized", "");
+    }
+
+    static void HandleSetBreakpoints(int reqSeq, string argsJson) {
+        string srcJson = JsonGetContainer(argsJson, "source");
+        string path = JsonGetString(srcJson, "path");
+        string bpsArr = JsonGetContainer(argsJson, "breakpoints");
+        if (path != "") {
+            dbg.RemoveBreakpointsForFile(path);
+            sourceFile = path;
+        }
+        List<string> items = JsonSplitArrayElements(bpsArr);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"breakpoints\":[");
+        int i = 0;
+        while (i < items.Count) {
+            if (i > 0) { sb.Append(','); }
+            string item = items[i];
+            int line = JsonGetInt(item, "line", 0);
+            string cond = JsonGetString(item, "condition");
+            string hitCond = JsonGetString(item, "hitCondition");
+            string logMsg = JsonGetString(item, "logMessage");
+            string reject = "";
+            int id = -1;
+            if (path != "") {
+                if (logMsg != "") {
+                    id = dbg.AddLogpoint(path, line, logMsg);
+                } else if (hitCond != "") {
+                    string h = hitCond.Trim();
+                    bool modulo = h.StartsWith("%");
+                    if (h.StartsWith("==") || h.StartsWith(">=")) {
+                        h = h.Substring(2).Trim();
+                    }
+                    int count = ParseIntDecimal(h, 0);
+                    if (count > 0 && !modulo) {
+                        id = dbg.AddHitCountBp(path, line, count);
+                    } else {
+                        reject = "unsupported hitCondition '" + hitCond + "' (use K, ==K or >=K)";
+                    }
+                } else if (cond != "") {
+                    id = dbg.AddConditionalBp(path, line, cond);
+                } else {
+                    id = dbg.AddBreakpoint(path, line);
+                }
+            }
+            sb.Append("{\"id\":");
+            sb.Append(id >= 0 ? id : i);
+            sb.Append(",\"verified\":");
+            sb.Append(id >= 0 ? "true" : "false");
+            sb.Append(",\"line\":");
+            sb.Append(line);
+            if (cond != "") {
+                sb.Append(",\"message\":");
+                sb.Append(EncodeJsonString(cond));
+            } else if (reject != "") {
+                sb.Append(",\"message\":");
+                sb.Append(EncodeJsonString(reject));
+            }
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("]}");
+        SendResponse(reqSeq, "setBreakpoints", true, sb.ToString());
+    }
+
+    static void HandleSetExceptionBreakpoints(int reqSeq, string argsJson) {
+        string filtersArr = JsonGetContainer(argsJson, "filters");
+        List<string> items = JsonSplitArrayElements(filtersArr);
+        bool onThrow = false;
+        bool onUnhandled = false;
+        int i = 0;
+        while (i < items.Count) {
+            string raw = items[i].Trim();
+            if (raw.StartsWith("\"") && raw.EndsWith("\"") && raw.Length >= 2) {
+                string f = UnescapeJsonString(raw.Substring(1, raw.Length - 2));
+                if (f == "throw" || f == "all") { onThrow = true; }
+                else if (f == "unhandled" || f == "uncaught") { onUnhandled = true; }
+            }
+            i = i + 1;
+        }
+        dbg.SetExceptionBreakpoints(onThrow, onUnhandled);
+        SendResponse(reqSeq, "setExceptionBreakpoints", true, "");
+    }
+
+    static void HandleLaunch(int reqSeq, string argsJson) {
+        string prog = JsonGetString(argsJson, "program");
+        string pArgs = JsonGetString(argsJson, "args");
+        bool stopOnEntry = JsonGetBool(argsJson, "stopOnEntry", false);
+        string gPath = JsonGetString(argsJson, "gdbPath");
+        if (prog != "") { program = prog; }
+        if (pArgs != "") { progArgs = pArgs; }
+        if (gPath != "") { dbg.SetGdbPath(gPath); }
+        dbg.BreakOnEntry = stopOnEntry;
+        launched = true;
+        SendOutput("console", "Launching Zan program under gdb...\n");
+        SendResponse(reqSeq, "launch", true, "");
+    }
+
+    static void HandleAttach(int reqSeq, string argsJson) {
+        string prog = JsonGetString(argsJson, "program");
+        string gPath = JsonGetString(argsJson, "gdbPath");
+        int pid = JsonGetInt(argsJson, "processId", 0);
+        if (prog != "") { program = prog; }
+        if (gPath != "") { dbg.SetGdbPath(gPath); }
+        if (pid <= 0) {
+            SendResponse(reqSeq, "attach", false, "");
+            SendOutput("console", "attach needs a processId.\n");
+            return;
+        }
+        attachPid = pid;
+        launched = true;
+        SendResponse(reqSeq, "attach", true, "");
+    }
+
+    static void HandleConfigurationDone(int reqSeq) {
+        SendResponse(reqSeq, "configurationDone", true, "");
+        if (attachPid > 0) {
+            dbg.Attach(program, attachPid);
+        } else {
+            dbg.Start(program, progArgs);
+        }
+        ReportStop();
+    }
+
+    static void HandleThreads(int reqSeq) {
+        dbg.RefreshThreads();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"threads\":[");
+        if (dbg.Threads.Count == 0) {
+            sb.Append("{\"id\":1,\"name\":\"main\"}");
+        } else {
+            int i = 0;
+            while (i < dbg.Threads.Count) {
+                if (i > 0) { sb.Append(','); }
+                DapThread t = dbg.Threads[i];
+                sb.Append("{\"id\":");
+                sb.Append(t.Id);
+                sb.Append(",\"name\":");
+                sb.Append(EncodeJsonString(t.Name));
+                sb.Append("}");
+                i = i + 1;
+            }
+        }
+        sb.Append("]}");
+        SendResponse(reqSeq, "threads", true, sb.ToString());
+    }
+
+    static void HandleSelectThread(int reqSeq, string argsJson) {
+        int tid = JsonGetInt(argsJson, "threadId", 0);
+        if (tid > 0) { dbg.SelectThread(tid); }
+        SendResponse(reqSeq, "selectThread", true, "");
+    }
+
+    static void HandleStackTrace(int reqSeq) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"stackFrames\":[");
+        int i = 0;
+        while (i < dbg.Callstack.Count) {
+            if (i > 0) { sb.Append(','); }
+            DapFrame f = dbg.Callstack[i];
+            sb.Append("{\"id\":");
+            sb.Append(f.FrameId);
+            sb.Append(",\"name\":");
+            sb.Append(EncodeJsonString(f.FunctionName != "" ? f.FunctionName : "Main"));
+            sb.Append(",\"line\":");
+            sb.Append(f.Line);
+            sb.Append(",\"column\":");
+            sb.Append(f.Column > 0 ? f.Column : 1);
+            string fp = f.FilePath != "" ? f.FilePath : sourceFile;
+            if (fp != "") {
+                sb.Append(",\"source\":{\"path\":");
+                sb.Append(EncodeJsonString(fp));
+                sb.Append("}");
+            }
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("],\"totalFrames\":");
+        sb.Append(dbg.Callstack.Count);
+        sb.Append("}");
+        SendResponse(reqSeq, "stackTrace", true, sb.ToString());
+    }
+
+    static void HandleScopes(int reqSeq) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"scopes\":[");
+        sb.Append("{\"name\":\"Locals\",\"variablesReference\":");
+        sb.Append(DapDebugger.VarRefLocals);
+        sb.Append(",\"expensive\":false,\"presentationHint\":\"locals\"}");
+        if (dbg.Watches.Count > 0) {
+            sb.Append(",{\"name\":\"Watch\",\"variablesReference\":");
+            sb.Append(DapDebugger.VarRefWatches);
+            sb.Append(",\"expensive\":false}");
+        }
+        sb.Append("]}");
+        SendResponse(reqSeq, "scopes", true, sb.ToString());
+    }
+
+    static void AppendVarJson(StringBuilder sb, string name, string val, string ty,
+            int varRef, string evalName) {
+        sb.Append("{\"name\":");
+        sb.Append(EncodeJsonString(name));
+        sb.Append(",\"value\":");
+        sb.Append(EncodeJsonString(val));
+        sb.Append(",\"type\":");
+        sb.Append(EncodeJsonString(ty));
+        sb.Append(",\"variablesReference\":");
+        sb.Append(varRef);
+        if (evalName != "") {
+            sb.Append(",\"evaluateName\":");
+            sb.Append(EncodeJsonString(evalName));
+        }
+        sb.Append("}");
+    }
+
+    static void HandleVariables(int reqSeq, string argsJson) {
+        int varRef = JsonGetInt(argsJson, "variablesReference", 0);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"variables\":[");
+        bool first = true;
+        if (varRef == DapDebugger.VarRefLocals) {
+            int i = 0;
+            while (i < dbg.Locals.Count) {
+                DapLocal v = dbg.Locals[i];
+                if (!first) { sb.Append(','); }
+                first = false;
+                int childRef = v.HasChildren ? (DapDebugger.VarRefLocalBase + i) : 0;
+                AppendVarJson(sb, v.Name, v.Value, v.TypeName, childRef, "");
+                i = i + 1;
+            }
+        } else if (varRef >= DapDebugger.VarRefLocalBase) {
+            List<DapVarChild> kids = dbg.ExpandVariables(varRef);
+            int i = 0;
+            while (i < kids.Count) {
+                if (!first) { sb.Append(','); }
+                first = false;
+                DapVarChild c = kids[i];
+                AppendVarJson(sb, c.Name, c.Value, c.TypeName, c.ExpandRef, "");
+                i = i + 1;
+            }
+        } else if (varRef == DapDebugger.VarRefWatches) {
+            dbg.EvaluateWatches();
+            int i = 0;
+            while (i < dbg.Watches.Count) {
+                if (!first) { sb.Append(','); }
+                first = false;
+                DapWatch w = dbg.Watches[i];
+                string ty = w.TypeName != "" ? w.TypeName : "unknown";
+                AppendVarJson(sb, w.Expression, w.Value, ty, 0, w.Expression);
+                i = i + 1;
+            }
+        }
+        sb.Append("]}");
+        SendResponse(reqSeq, "variables", true, sb.ToString());
+    }
+
+    static void HandleEvaluate(int reqSeq, string argsJson) {
+        string expr = JsonGetString(argsJson, "expression");
+        string ctx = JsonGetString(argsJson, "context");
+        if (expr == "") {
+            SendResponse(reqSeq, "evaluate", false, "");
+            return;
+        }
+        List<string> box = new List<string>();
+        bool ok = dbg.Evaluate(expr, box);
+        string val = box.Count > 0 ? box[0] : "";
+        if (ctx == "watch") {
+            dbg.AddWatch(expr);
+        }
+        string body = "{\"result\":" + EncodeJsonString(val) + ",\"variablesReference\":0}";
+        SendResponse(reqSeq, "evaluate", ok, body);
+    }
+
+    static void HandleSetVariable(int reqSeq, string argsJson) {
+        string name = JsonGetString(argsJson, "name");
+        string val = JsonGetString(argsJson, "value");
+        if (name == "" || val == "") {
+            SendResponse(reqSeq, "setVariable", false, "");
+            return;
+        }
+        bool ok = dbg.SetVariable(name, val);
+        string body = "{\"value\":" + EncodeJsonString(val) + ",\"variablesReference\":0}";
+        SendResponse(reqSeq, "setVariable", ok, body);
+    }
+
+    static void HandleExceptionInfo(int reqSeq) {
+        string info = dbg.GetExceptionInfo();
+        string body = "{\"exceptionId\":" + EncodeJsonString(info)
+            + ",\"breakMode\":\"always\"}";
+        SendResponse(reqSeq, "exceptionInfo", true, body);
+    }
+
+    static string StateName(int st) {
+        if (st == DapState.Running()) { return "running"; }
+        if (st == DapState.Paused()) { return "paused"; }
+        if (st == DapState.Stepping()) { return "stepping"; }
+        if (st == DapState.Terminated()) { return "terminated"; }
+        return "idle";
+    }
+
+    static void HandleHeapSnapshot(int reqSeq, string cmd) {
+        if (dbg.State == DapState.Paused() || dbg.State == DapState.Running()) {
+            dbg.RefreshLocals();
+            dbg.RefreshCallstack();
+        }
+        StringBuilder nodes = new StringBuilder();
+        StringBuilder edges = new StringBuilder();
+        nodes.Append('[');
+        edges.Append('[');
+        int nextId = 1;
+        int rootCount = 0;
+        int edgeCount = 0;
+        bool firstNode = true;
+        bool firstEdge = true;
+
+        int i = 0;
+        while (i < dbg.Locals.Count) {
+            DapLocal loc = dbg.Locals[i];
+            int nodeId = nextId;
+            nextId = nextId + 1;
+            rootCount = rootCount + 1;
+            if (!firstNode) { nodes.Append(','); }
+            firstNode = false;
+            nodes.Append("{\"id\":");
+            nodes.Append(nodeId);
+            nodes.Append(",\"name\":");
+            nodes.Append(EncodeJsonString(loc.Name));
+            nodes.Append(",\"type\":");
+            nodes.Append(EncodeJsonString(loc.TypeName));
+            nodes.Append(",\"value\":");
+            nodes.Append(EncodeJsonString(loc.Value));
+            nodes.Append(",\"kind\":\"local\",\"hasChildren\":");
+            nodes.Append(loc.HasChildren ? "true" : "false");
+            nodes.Append("}");
+
+            if (loc.HasChildren) {
+                List<DapVarChild> kids = dbg.ExpandVariables(DapDebugger.VarRefLocalBase + i);
+                int k = 0;
+                while (k < kids.Count) {
+                    DapVarChild c = kids[k];
+                    int childId = nextId;
+                    nextId = nextId + 1;
+                    if (!firstNode) { nodes.Append(','); }
+                    firstNode = false;
+                    nodes.Append("{\"id\":");
+                    nodes.Append(childId);
+                    nodes.Append(",\"name\":");
+                    nodes.Append(EncodeJsonString(c.Name));
+                    nodes.Append(",\"type\":");
+                    nodes.Append(EncodeJsonString(c.TypeName));
+                    nodes.Append(",\"value\":");
+                    nodes.Append(EncodeJsonString(c.Value));
+                    nodes.Append(",\"kind\":\"field\",\"hasChildren\":");
+                    nodes.Append(c.ExpandRef != 0 ? "true" : "false");
+                    nodes.Append("}");
+
+                    if (!firstEdge) { edges.Append(','); }
+                    firstEdge = false;
+                    edges.Append("{\"source\":");
+                    edges.Append(nodeId);
+                    edges.Append(",\"target\":");
+                    edges.Append(childId);
+                    edges.Append(",\"field\":");
+                    edges.Append(EncodeJsonString(c.Name));
+                    edges.Append("}");
+                    edgeCount = edgeCount + 1;
+                    k = k + 1;
+                }
+            }
+            i = i + 1;
+        }
+
+        if (dbg.Watches.Count > 0) {
+            dbg.EvaluateWatches();
+            int wi = 0;
+            while (wi < dbg.Watches.Count) {
+                DapWatch w = dbg.Watches[wi];
+                int nodeId = nextId;
+                nextId = nextId + 1;
+                if (!firstNode) { nodes.Append(','); }
+                firstNode = false;
+                nodes.Append("{\"id\":");
+                nodes.Append(nodeId);
+                nodes.Append(",\"name\":");
+                nodes.Append(EncodeJsonString(w.Expression));
+                nodes.Append(",\"type\":");
+                nodes.Append(EncodeJsonString(w.TypeName != "" ? w.TypeName : "unknown"));
+                nodes.Append(",\"value\":");
+                nodes.Append(EncodeJsonString(w.Value));
+                nodes.Append(",\"kind\":\"watch\",\"hasChildren\":");
+                nodes.Append(w.HasChildren ? "true" : "false");
+                nodes.Append("}");
+                wi = wi + 1;
+            }
+        }
+        nodes.Append(']');
+        edges.Append(']');
+
+        StringBuilder body = new StringBuilder();
+        body.Append("{\"summary\":{\"state\":");
+        body.Append(EncodeJsonString(StateName(dbg.State)));
+        body.Append(",\"nodeCount\":");
+        body.Append(nextId - 1);
+        body.Append(",\"edgeCount\":");
+        body.Append(edgeCount);
+        body.Append(",\"rootCount\":");
+        body.Append(rootCount);
+        body.Append(",\"callstackDepth\":");
+        body.Append(dbg.Callstack.Count);
+        body.Append(",\"threadId\":");
+        body.Append(dbg.CurrentThread);
+        body.Append("},\"nodes\":");
+        body.Append(nodes.ToString());
+        body.Append(",\"edges\":");
+        body.Append(edges.ToString());
+        body.Append("}");
+        SendResponse(reqSeq, cmd, true, body.ToString());
+    }
+
+    static void HandleContinue(int reqSeq) {
+        SendResponse(reqSeq, "continue", true, "{\"allThreadsContinued\":true}");
+        dbg.Continue();
+        ReportStop();
+    }
+
+    static void HandleNext(int reqSeq) {
+        SendResponse(reqSeq, "next", true, "");
+        dbg.StepOver();
+        ReportStop();
+    }
+
+    static void HandleStepIn(int reqSeq) {
+        SendResponse(reqSeq, "stepIn", true, "");
+        dbg.StepInto();
+        ReportStop();
+    }
+
+    static void HandleStepOut(int reqSeq) {
+        SendResponse(reqSeq, "stepOut", true, "");
+        dbg.StepOut();
+        ReportStop();
+    }
+
+    static void HandlePause(int reqSeq) {
+        if (dbg.State != DapState.Running()) {
+            SendResponse(reqSeq, "pause", false, "{\"error\":\"target is not running\"}");
+            return;
+        }
+        SendResponse(reqSeq, "pause", true, "");
+        if (dbg.Interrupt()) {
+            dbg.WaitStop();
+        }
+        ReportStop();
+    }
+
+    static void HandleDisconnect(int reqSeq, string cmd) {
+        dbg.Stop();
+        SendResponse(reqSeq, cmd, true, "");
+        TerminateWithCode(dbg.LastExitCode);
+    }
+
+    static bool Dispatch(string body) {
+        string cmd = JsonGetString(body, "command");
+        if (cmd == "") { return false; }
+        int reqSeq = JsonGetInt(body, "seq", 0);
+        string args = JsonGetContainer(body, "arguments");
+
+        if (cmd == "initialize") { HandleInitialize(reqSeq); }
+        else if (cmd == "setBreakpoints") { HandleSetBreakpoints(reqSeq, args); }
+        else if (cmd == "setExceptionBreakpoints") { HandleSetExceptionBreakpoints(reqSeq, args); }
+        else if (cmd == "launch") { HandleLaunch(reqSeq, args); }
+        else if (cmd == "attach") { HandleAttach(reqSeq, args); }
+        else if (cmd == "configurationDone") { HandleConfigurationDone(reqSeq); }
+        else if (cmd == "threads") { HandleThreads(reqSeq); }
+        else if (cmd == "selectThread") { HandleSelectThread(reqSeq, args); }
+        else if (cmd == "stackTrace") { HandleStackTrace(reqSeq); }
+        else if (cmd == "scopes") { HandleScopes(reqSeq); }
+        else if (cmd == "variables") { HandleVariables(reqSeq, args); }
+        else if (cmd == "evaluate") { HandleEvaluate(reqSeq, args); }
+        else if (cmd == "setVariable") { HandleSetVariable(reqSeq, args); }
+        else if (cmd == "exceptionInfo") { HandleExceptionInfo(reqSeq); }
+        else if (cmd == "continue") { HandleContinue(reqSeq); }
+        else if (cmd == "next") { HandleNext(reqSeq); }
+        else if (cmd == "stepIn") { HandleStepIn(reqSeq); }
+        else if (cmd == "stepOut") { HandleStepOut(reqSeq); }
+        else if (cmd == "pause") { HandlePause(reqSeq); }
+        else if (cmd == "zan/heapSnapshot" || cmd == "heapSnapshot") { HandleHeapSnapshot(reqSeq, cmd); }
+        else if (cmd == "terminate") { HandleDisconnect(reqSeq, "terminate"); }
+        else if (cmd == "disconnect") { HandleDisconnect(reqSeq, "disconnect"); return true; }
+        else { SendResponse(reqSeq, cmd, true, ""); }
+        return false;
+    }
+
+    public static void Run() {
+        ResetState();
+        dbg.SetWaitHook(PollStdinDuringRun);
+        while (true) {
+            string body = null;
+            if (parked.Count > 0) {
+                body = parked[0];
+                parked.RemoveAt(0);
+            } else {
+                body = ReadFrame();
+            }
+            if (body == null) { break; }
+            if (Dispatch(body)) { break; }
+        }
+        dbg.Stop();
+    }
+}

@@ -1,0 +1,1180 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+namespace Zan;
+
+public delegate void DapWaitHook();
+
+public class DapState {
+    public static int Idle() { return 0; }
+    public static int Running() { return 1; }
+    public static int Paused() { return 2; }
+    public static int Stepping() { return 3; }
+    public static int Terminated() { return 4; }
+}
+
+public class DapBpKind {
+    public static int Normal() { return 0; }
+    public static int Conditional() { return 1; }
+    public static int HitCount() { return 2; }
+    public static int Logpoint() { return 3; }
+}
+
+public class DapBreakpoint {
+    public string FilePath;
+    public int Line;
+    public bool Enabled;
+    public bool Verified;
+    public int Id;
+    public int Kind;
+    public string Condition;
+    public int HitCountTarget;
+    public string LogMessage;
+
+    public DapBreakpoint(string filePath, int line, int id) {
+        FilePath = filePath; Line = line; Id = id;
+        Enabled = true; Verified = false; Kind = DapBpKind.Normal();
+        Condition = ""; HitCountTarget = 0; LogMessage = "";
+    }
+}
+
+public class DapWatch {
+    public string Expression;
+    public string Value;
+    public string TypeName;
+    public bool Valid;
+    public bool HasChildren;
+
+    public DapWatch(string expression) {
+        Expression = expression; Value = "<not evaluated>"; TypeName = "";
+        Valid = false; HasChildren = false;
+    }
+}
+
+public class DapLocal {
+    public string Name;
+    public string Value;
+    public string TypeName;
+    public bool HasChildren;
+    public bool VarCreated;
+
+    public DapLocal(string name, string value, string typeName, bool hasChildren) {
+        Name = name; Value = value; TypeName = typeName;
+        HasChildren = hasChildren; VarCreated = false;
+    }
+}
+
+public class DapVarChild {
+    public string Name;
+    public string Value;
+    public string TypeName;
+    public int ExpandRef;
+
+    public DapVarChild(string name, string value, string typeName, int expandRef) {
+        Name = name; Value = value; TypeName = typeName; ExpandRef = expandRef;
+    }
+}
+
+public class DapThread {
+    public int Id;
+    public string Name;
+    public bool Running;
+
+    public DapThread(int id, string name, bool running) {
+        Id = id; Name = name; Running = running;
+    }
+}
+
+public class DapFrame {
+    public int FrameId;
+    public string FunctionName;
+    public string FilePath;
+    public int Line;
+    public int Column;
+
+    public DapFrame(int frameId, string functionName, string filePath, int line, int column) {
+        FrameId = frameId; FunctionName = functionName;
+        FilePath = filePath; Line = line; Column = column;
+    }
+}
+
+/// 纯 Zan GDB/MI2 调试器驱动（复用 stdlib ProcessSpawn 活进程管道原语）。
+public class DapDebugger {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "OpenProcess")]
+    private static extern nint WinOpenProcess(int access, int inherit, int pid);
+    [DllImport("kernel32", EntryPoint = "DebugBreakProcess")]
+    private static extern int WinDebugBreakProcess(nint handle);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    private static extern int WinCloseHandle(nint handle);
+    #elif LINUX || MACOS
+    [DllImport("crt", EntryPoint = "kill")]
+    private static extern int PosixKillSignal(int pid, int sig);
+    #endif
+
+    public const int VarRefLocals = 1000;
+    public const int VarRefWatches = 2000;
+    public const int VarRefLocalBase = 3000;
+    public const int VarRefDynamicBase = 4000;
+
+    public int State;
+    public List<DapBreakpoint> Breakpoints;
+    public List<DapWatch> Watches;
+    public List<DapLocal> Locals;
+    public List<DapThread> Threads;
+    public List<DapFrame> Callstack;
+    public int CurrentThread;
+    public int ActiveFrame;
+    public string CurrentFile;
+    public int CurrentLine;
+    public int CurrentCol;
+    public string StopReason;
+    public int LastExitCode;
+    public bool BreakOnEntry;
+    public bool BreakOnException;
+    public bool BreakOnThrow;
+    public bool Attached;
+    public int InferiorPid;
+
+    private int bpNextId;
+    private int miToken;
+    private long varGen;
+    private List<string> varRefs;
+    private string gdbPath;
+    private string programPath;
+    private ProcessSpawn gdb;
+    private string miPending;
+    private StringBuilder outputBuf;
+    private bool interruptRequested;
+    private int excBpThrow;
+    private int excBpUnhandled;
+    private DapWaitHook waitHook;
+
+    public DapDebugger() {
+        State = DapState.Idle();
+        Breakpoints = new List<DapBreakpoint>();
+        Watches = new List<DapWatch>();
+        Locals = new List<DapLocal>();
+        Threads = new List<DapThread>();
+        Callstack = new List<DapFrame>();
+        varRefs = new List<string>();
+        CurrentThread = 1; ActiveFrame = 0;
+        CurrentFile = ""; CurrentLine = 0; CurrentCol = 1;
+        StopReason = ""; LastExitCode = 0;
+        BreakOnEntry = false; BreakOnException = true; BreakOnThrow = false;
+        Attached = false; InferiorPid = 0;
+        bpNextId = 1; miToken = 0; varGen = 0;
+        gdbPath = ""; programPath = ""; gdb = null; miPending = "";
+        outputBuf = new StringBuilder();
+        interruptRequested = false; excBpThrow = -1; excBpUnhandled = -1;
+        waitHook = null;
+    }
+
+    public void SetGdbPath(string path) {
+        if (path != null && path != "") { gdbPath = path; }
+    }
+
+    public void SetWaitHook(DapWaitHook hook) {
+        waitHook = hook;
+    }
+
+    public bool IsActive() {
+        return gdb != null;
+    }
+
+    public string DrainOutput() {
+        if (outputBuf.Length == 0) { return ""; }
+        string s = outputBuf.ToString();
+        outputBuf = new StringBuilder();
+        return s;
+    }
+
+    public void AppendOutput(string text) {
+        if (text == null || text == "") { return; }
+        if (outputBuf.Length + text.Length > 16384) {
+            string cur = outputBuf.ToString();
+            int keep = cur.Length / 2;
+            outputBuf = new StringBuilder();
+            if (keep > 0) { outputBuf.Append(cur.Substring(cur.Length - keep)); }
+        }
+        outputBuf.Append(text);
+    }
+
+    public static string BaseName(string path) {
+        if (path == null) { return ""; }
+        int slash = -1;
+        int i = path.Length - 1;
+        while (i >= 0) {
+            if (path[i] == '/' || path[i] == '\\') { slash = i; break; }
+            i = i - 1;
+        }
+        if (slash >= 0 && slash + 1 < path.Length) {
+            return path.Substring(slash + 1);
+        }
+        return path;
+    }
+
+    static bool IsMiKeyBoundary(string rec, int pos) {
+        if (pos <= 0) { return true; }
+        char c = rec[pos - 1];
+        return c == ',' || c == '{' || c == '[' || c == ' ' || c == '\t';
+    }
+
+    public static bool HasMiField(string rec, string key) {
+        if (rec == null || key == null || key == "") { return false; }
+        string pat = key + "=\"";
+        int from = 0;
+        while (from < rec.Length) {
+            int idx = rec.IndexOf(pat, from);
+            if (idx < 0) { return false; }
+            if (IsMiKeyBoundary(rec, idx)) { return true; }
+            from = idx + 1;
+        }
+        return false;
+    }
+
+    static string UnescapeMiString(string raw, int start) {
+        StringBuilder sb = new StringBuilder();
+        int i = start;
+        while (i < raw.Length && raw[i] != '"') {
+            char c = raw[i];
+            if (c == '\\' && i + 1 < raw.Length) {
+                i = i + 1;
+                char nx = raw[i];
+                if (nx == 'n') { sb.Append('\n'); }
+                else if (nx == 'r') { sb.Append('\r'); }
+                else if (nx == 't') { sb.Append('\t'); }
+                else { sb.Append(nx); }
+            } else {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    public static string MiField(string rec, string key) {
+        if (rec == null || key == null || key == "") { return ""; }
+        string pat = key + "=\"";
+        int from = 0;
+        int idx = -1;
+        while (from < rec.Length) {
+            int p = rec.IndexOf(pat, from);
+            if (p < 0) { break; }
+            if (IsMiKeyBoundary(rec, p)) { idx = p; break; }
+            from = p + 1;
+        }
+        if (idx < 0) { return ""; }
+        return UnescapeMiString(rec, idx + pat.Length);
+    }
+
+    static int ParseIntSafe(string s, int fallback) {
+        if (s == null || s == "") { return fallback; }
+        string t = s.Trim();
+        if (t == "") { return fallback; }
+        bool neg = false;
+        int i = 0;
+        if (t[0] == '-') { neg = true; i = 1; }
+        else if (t[0] == '+') { i = 1; }
+        if (i >= t.Length) { return fallback; }
+        // Handle octal exit codes like "0377" or hex "0x..." if emitted by gdb.
+        int radix = 10;
+        if (t[i] == '0' && i + 1 < t.Length) {
+            if (t[i + 1] == 'x' || t[i + 1] == 'X') { radix = 16; i = i + 2; }
+            else if (t[i + 1] >= '0' && t[i + 1] <= '7') { radix = 8; i = i + 1; }
+        }
+        int val = 0;
+        bool any = false;
+        while (i < t.Length) {
+            char ch = t[i];
+            int d = -1;
+            if (ch >= '0' && ch <= '9') { d = (int)(ch - '0'); }
+            else if (radix == 16 && ch >= 'a' && ch <= 'f') { d = 10 + (int)(ch - 'a'); }
+            else if (radix == 16 && ch >= 'A' && ch <= 'F') { d = 10 + (int)(ch - 'A'); }
+            if (d < 0 || d >= radix) { break; }
+            val = val * radix + d;
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return fallback; }
+        return neg ? (0 - val) : val;
+    }
+
+    static string EscapeMiArg(string s) {
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            char c = s[i];
+            if (c == '\\' || c == '"') { sb.Append('\\'); }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static List<string> ExtractBalancedObjects(string text, string marker, int startAt) {
+        List<string> items = new List<string>();
+        if (text == null || startAt < 0 || startAt >= text.Length) { return items; }
+        int pos = startAt;
+        while (pos < text.Length) {
+            int hit = text.IndexOf(marker, pos);
+            if (hit < 0) { break; }
+            int braceStart = text.IndexOf("{", hit);
+            if (braceStart < 0) { break; }
+            int depth = 0;
+            bool inStr = false;
+            int q = braceStart;
+            while (q < text.Length) {
+                char c = text[q];
+                if (inStr) {
+                    if (c == '\\' && q + 1 < text.Length) { q = q + 2; continue; }
+                    if (c == '"') { inStr = false; }
+                } else if (c == '"') {
+                    inStr = true;
+                } else if (c == '{') {
+                    depth = depth + 1;
+                } else if (c == '}') {
+                    depth = depth - 1;
+                    if (depth == 0) { break; }
+                }
+                q = q + 1;
+            }
+            if (depth != 0 || q >= text.Length) { break; }
+            items.Add(text.Substring(braceStart + 1, q - braceStart - 1));
+            pos = q + 1;
+        }
+        return items;
+    }
+
+    static string TryExistingFile(string candidate) {
+        if (candidate != null && candidate != "" && File.Exists(candidate)) { return candidate; }
+        return "";
+    }
+
+    string ResolveGdbPath() {
+        if (gdbPath != "") { return gdbPath; }
+        string env = Environment.GetEnvironmentVariable("ZAN_GDB");
+        if (env == null || env == "") { env = Environment.GetEnvironmentVariable("ZAN_GDB_EXE"); }
+        if (env != null && env != "") { return env; }
+
+        string exe = Environment.ProcessPath;
+        #if WINDOWS
+        string gdbName = "gdb.exe";
+        #else
+        string gdbName = "gdb";
+        #endif
+        if (exe != null && exe != "") {
+            string dir = Path.GetDirectoryName(exe);
+            if (dir != null && dir != "") {
+                string c1 = TryExistingFile(Path.Combine(dir, gdbName));
+                if (c1 != "") { return c1; }
+                string c2 = TryExistingFile(Path.Combine(Path.Combine(dir, "debugger"), Path.Combine("bin", gdbName)));
+                if (c2 != "") { return c2; }
+                string c3 = TryExistingFile(Path.Combine(Path.Combine(dir, "debugger"), gdbName));
+                if (c3 != "") { return c3; }
+            }
+        }
+
+        #if WINDOWS
+        List<string> rootVars = new List<string>();
+        rootVars.Add("ZAN_GDB_DIR");
+        rootVars.Add("MINGW_ROOT");
+        rootVars.Add("MINGW_HOME");
+        int ri = 0;
+        while (ri < rootVars.Count) {
+            string root = Environment.GetEnvironmentVariable(rootVars[ri]);
+            if (root != null && root != "") {
+                string d1 = TryExistingFile(Path.Combine(root, "gdb.exe"));
+                if (d1 != "") { return d1; }
+                string d2 = TryExistingFile(Path.Combine(Path.Combine(root, "bin"), "gdb.exe"));
+                if (d2 != "") { return d2; }
+            }
+            ri = ri + 1;
+        }
+
+        string pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (pathEnv != null && pathEnv != "") {
+            List<string> dirs = pathEnv.Split(";");
+            int pi = 0;
+            while (pi < dirs.Count) {
+                string d = dirs[pi].Trim();
+                if (d.StartsWith("\"") && d.EndsWith("\"") && d.Length >= 2) {
+                    d = d.Substring(1, d.Length - 2);
+                }
+                if (d != "") {
+                    string cand = TryExistingFile(Path.Combine(d, "gdb.exe"));
+                    if (cand != "") { return cand; }
+                }
+                pi = pi + 1;
+            }
+        }
+
+        List<string> baseVars = new List<string>();
+        baseVars.Add("SystemDrive");
+        baseVars.Add("ProgramFiles");
+        baseVars.Add("ProgramW6432");
+        baseVars.Add("LOCALAPPDATA");
+        baseVars.Add("USERPROFILE");
+        List<string> subs = new List<string>();
+        subs.Add("msys64\\mingw64");
+        subs.Add("msys64\\ucrt64");
+        subs.Add("msys64\\clang64");
+        subs.Add("TDM-GCC-64");
+        subs.Add("mingw64");
+        subs.Add("mingw32");
+        subs.Add("mingw");
+        subs.Add("scoop\\apps\\mingw\\current");
+        int bi = 0;
+        while (bi < baseVars.Count) {
+            string b = Environment.GetEnvironmentVariable(baseVars[bi]);
+            if (b != null && b != "") {
+                int si = 0;
+                while (si < subs.Count) {
+                    string cand = TryExistingFile(b + "\\" + subs[si] + "\\bin\\gdb.exe");
+                    if (cand != "") { return cand; }
+                    si = si + 1;
+                }
+            }
+            bi = bi + 1;
+        }
+        return "gdb.exe";
+        #else
+        return "gdb";
+        #endif
+    }
+
+    bool MiSpawn(string program) {
+        string gdbExe = ResolveGdbPath();
+        miPending = "";
+        miToken = 0;
+        List<string> args = new List<string>();
+        args.Add("--interpreter=mi2");
+        args.Add("-q");
+        args.Add("-nx");
+        if (program != null && program != "") {
+            args.Add(program);
+        }
+        gdb = ProcessSpawn.Spawn(gdbExe, args);
+        return gdb != null;
+    }
+
+    void MiClose() {
+        if (gdb == null) { return; }
+        gdb.WriteLine("-gdb-exit");
+        gdb.WaitExitCode(2000);
+        gdb.Kill();
+        gdb.Close();
+        gdb = null;
+        miPending = "";
+    }
+
+    string MiReadLine(bool poll) {
+        if (gdb == null) { return null; }
+        while (true) {
+            int nl = miPending.IndexOf("\n");
+            if (nl >= 0) {
+                int end = nl;
+                if (end > 0 && miPending[end - 1] == '\r') { end = end - 1; }
+                string line = miPending.Substring(0, end);
+                miPending = nl + 1 < miPending.Length ? miPending.Substring(nl + 1) : "";
+                return line;
+            }
+            string chunk = gdb.ReadAvailable();
+            if (chunk != null && chunk != "") {
+                miPending = miPending + chunk;
+                continue;
+            }
+            if (poll && waitHook != null) {
+                waitHook();
+            }
+            int st = gdb.WaitExitCode(poll ? 5 : 2);
+            if (st != (0 - 258)) {
+                string tail = gdb.ReadAvailable();
+                if (tail != null && tail != "") {
+                    miPending = miPending + tail;
+                    continue;
+                }
+                if (miPending != "") {
+                    string last = miPending;
+                    miPending = "";
+                    return last;
+                }
+                return null;
+            }
+        }
+    }
+
+    void MiForwardStream(string body) {
+        if (body == null || body == "") { return; }
+        int start = body[0] == '"' ? 1 : 0;
+        string s = UnescapeMiString(body, start);
+        if (s != "") { AppendOutput(s); }
+    }
+
+    void MiHandleStopped(string rec) {
+        string reason = MiField(rec, "reason");
+        if (reason.StartsWith("exited")) {
+            string ec = MiField(rec, "exit-code");
+            LastExitCode = ec != "" ? ParseIntSafe(ec, 0) : 0;
+            interruptRequested = false;
+            State = DapState.Terminated();
+            return;
+        }
+        State = DapState.Paused();
+        StopReason = reason != "" ? reason : "signal-received";
+        if (interruptRequested) {
+            StopReason = "pause";
+            interruptRequested = false;
+        }
+        string file = MiField(rec, "fullname");
+        if (file == "") { file = MiField(rec, "file"); }
+        if (file != "") { CurrentFile = file; }
+        string ln = MiField(rec, "line");
+        if (ln != "") { CurrentLine = ParseIntSafe(ln, CurrentLine); }
+    }
+
+    void MiDispatchAsync(string line) {
+        if (line.StartsWith("*stopped")) {
+            MiHandleStopped(line);
+        } else if (line.StartsWith("@")) {
+            MiForwardStream(line.Substring(1));
+        } else if (line.StartsWith("=thread-group-started")) {
+            string pidStr = MiField(line, "pid");
+            if (pidStr != "") { InferiorPid = ParseIntSafe(pidStr, InferiorPid); }
+        }
+    }
+
+    string MiCommand(string cmd) {
+        if (gdb == null) { return null; }
+        miToken = miToken + 1;
+        int tok = miToken;
+        if (!gdb.WriteLine(Convert.ToString(tok) + cmd)) { return null; }
+        while (true) {
+            string line = MiReadLine(false);
+            if (line == null) { return null; }
+            if (line == "") { continue; }
+            int i = 0;
+            int num = 0;
+            bool hasTok = false;
+            while (i < line.Length && line[i] >= '0' && line[i] <= '9') {
+                num = num * 10 + (int)(line[i] - '0');
+                hasTok = true;
+                i = i + 1;
+            }
+            if (i < line.Length && line[i] == '^') {
+                if (hasTok && num != tok) { continue; }
+                return line;
+            }
+            char c0 = line[0];
+            if (c0 == '*' || c0 == '@' || c0 == '=') {
+                MiDispatchAsync(line);
+                continue;
+            }
+            if (c0 == '~' || c0 == '&' || c0 == '+' || c0 == '^' || line.StartsWith("(gdb)")) {
+                continue;
+            }
+            AppendOutput(line + "\n");
+        }
+    }
+
+    bool MiWaitStopped() {
+        while (true) {
+            string line = MiReadLine(true);
+            if (line == null) {
+                State = DapState.Terminated();
+                return false;
+            }
+            if (line == "") { continue; }
+            char c0 = line[0];
+            if (c0 == '*' || c0 == '@' || c0 == '=') {
+                MiDispatchAsync(line);
+                if (line.StartsWith("*stopped")) { return true; }
+            } else if (c0 == '~' || c0 == '&' || c0 == '+' || c0 == '^' || line.StartsWith("(gdb)")) {
+                // ignore MI console/log/status noise
+            } else {
+                AppendOutput(line + "\n");
+            }
+            if (State == DapState.Terminated()) { return true; }
+        }
+    }
+
+    bool HasZanFrame() {
+        int i = 0;
+        while (i < Callstack.Count) {
+            string f = Callstack[i].FilePath;
+            if (f != null && f.Length >= 4) {
+                string ext = f.Substring(f.Length - 4).ToLower();
+                if (ext == ".zan") { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void PickZanThread() {
+        if (HasZanFrame()) { return; }
+        int saved = CurrentThread;
+        int i = 0;
+        while (i < Threads.Count) {
+            int tid = Threads[i].Id;
+            if (tid != CurrentThread && tid > 0) {
+                string res = MiCommand("-thread-select " + Convert.ToString(tid));
+                if (res != null && !res.Contains("^error")) {
+                    CurrentThread = tid;
+                    RefreshCallstack();
+                    if (HasZanFrame()) { return; }
+                }
+            }
+            i = i + 1;
+        }
+        CurrentThread = saved;
+    }
+
+    void AfterStop() {
+        RefreshThreads();
+        RefreshCallstack();
+        if (Threads.Count > 1) { PickZanThread(); }
+        ActiveFrame = 0;
+        string ehPrefix = "_" + "_zan_eh_";
+        if (Callstack.Count > 0 && Callstack[0].FunctionName.StartsWith(ehPrefix)) {
+            bool unhandled = Callstack[0].FunctionName.Contains("unhandled");
+            StopReason = unhandled ? "unhandled exception" : "exception thrown";
+            Callstack.RemoveAt(0);
+            if (Callstack.Count > 0) {
+                CurrentFile = Callstack[0].FilePath;
+                CurrentLine = Callstack[0].Line;
+            }
+            MiCommand("-stack-select-frame 1");
+        }
+        RefreshLocals();
+        EvaluateWatches();
+    }
+
+    void MiExec(string cmd) {
+        if (gdb == null || State == DapState.Terminated()) { return; }
+        State = DapState.Running();
+        string res = MiCommand(cmd);
+        if (res == null) {
+            State = DapState.Terminated();
+            return;
+        }
+        if (res.Contains("^error")) {
+            string msg = MiField(res, "msg");
+            if (msg != "") { AppendOutput("[DBG] " + msg + "\n"); }
+            State = DapState.Paused();
+            return;
+        }
+        MiWaitStopped();
+        if (State == DapState.Paused()) {
+            AfterStop();
+        }
+    }
+
+    // ---- Breakpoints ----
+
+    public int AddBreakpoint(string filePath, int line) {
+        int i = 0;
+        while (i < Breakpoints.Count) {
+            if (Breakpoints[i].Line == line && Breakpoints[i].FilePath == filePath) {
+                return Breakpoints[i].Id;
+            }
+            i = i + 1;
+        }
+        int id = bpNextId;
+        bpNextId = bpNextId + 1;
+        DapBreakpoint bp = new DapBreakpoint(filePath, line, id);
+        Breakpoints.Add(bp);
+        AppendOutput("[DBG] Breakpoint set at line " + Convert.ToString(line + 1) + "\n");
+        return id;
+    }
+
+    public int AddConditionalBp(string filePath, int line, string condition) {
+        int id = AddBreakpoint(filePath, line);
+        DapBreakpoint bp = FindBreakpoint(id);
+        if (bp != null) {
+            bp.Kind = DapBpKind.Conditional();
+            bp.Condition = condition;
+            AppendOutput("[DBG] Conditional breakpoint at line " + Convert.ToString(line + 1) + ": " + condition + "\n");
+        }
+        return id;
+    }
+
+    public int AddHitCountBp(string filePath, int line, int count) {
+        int id = AddBreakpoint(filePath, line);
+        DapBreakpoint bp = FindBreakpoint(id);
+        if (bp != null) {
+            bp.Kind = DapBpKind.HitCount();
+            bp.HitCountTarget = count;
+            AppendOutput("[DBG] Hit-count breakpoint at line " + Convert.ToString(line + 1) + " (count: " + Convert.ToString(count) + ")\n");
+        }
+        return id;
+    }
+
+    public int AddLogpoint(string filePath, int line, string message) {
+        int id = AddBreakpoint(filePath, line);
+        DapBreakpoint bp = FindBreakpoint(id);
+        if (bp != null) {
+            bp.Kind = DapBpKind.Logpoint();
+            bp.LogMessage = message;
+            AppendOutput("[DBG] Logpoint at line " + Convert.ToString(line + 1) + ": \"" + message + "\"\n");
+        }
+        return id;
+    }
+
+    public DapBreakpoint FindBreakpoint(int id) {
+        int i = 0;
+        while (i < Breakpoints.Count) {
+            if (Breakpoints[i].Id == id) { return Breakpoints[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    public void RemoveBreakpointsForFile(string filePath) {
+        int i = Breakpoints.Count - 1;
+        while (i >= 0) {
+            if (Breakpoints[i].FilePath == filePath) {
+                Breakpoints.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+
+    void InstallBreakpoints(bool pendingFlag) {
+        string flag = pendingFlag ? "-f " : "";
+        int i = 0;
+        while (i < Breakpoints.Count) {
+            DapBreakpoint bp = Breakpoints[i];
+            if (bp.Enabled) {
+                string baseName = BaseName(bp.FilePath);
+                string cmd;
+                if (bp.Kind == DapBpKind.Conditional() && bp.Condition != "") {
+                    cmd = "-break-insert " + flag + "-c \"" + EscapeMiArg(bp.Condition)
+                        + "\" \"" + EscapeMiArg(baseName) + ":" + Convert.ToString(bp.Line) + "\"";
+                } else {
+                    cmd = "-break-insert " + flag + "\"" + EscapeMiArg(baseName)
+                        + ":" + Convert.ToString(bp.Line) + "\"";
+                }
+                string r = MiCommand(cmd);
+                bp.Verified = r != null && r.Contains("^done");
+                if (bp.Verified && bp.Kind == DapBpKind.HitCount() && bp.HitCountTarget > 1) {
+                    string num = MiField(r, "number");
+                    if (num != "") {
+                        MiCommand("-break-after " + num + " " + Convert.ToString(bp.HitCountTarget - 1));
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    int BreakFunction(string funcName) {
+        string res = MiCommand("-break-insert -f " + funcName);
+        if (res == null || res.Contains("^error")) { return -1; }
+        string num = MiField(res, "number");
+        if (num == "") { return -1; }
+        return ParseIntSafe(num, -1);
+    }
+
+    void DeleteMiBp(int num) {
+        if (num >= 0) {
+            MiCommand("-break-delete " + Convert.ToString(num));
+        }
+    }
+
+    public int SetExceptionBreakpoints(bool onThrow, bool onUnhandled) {
+        BreakOnThrow = onThrow;
+        BreakOnException = onUnhandled;
+        if (gdb == null) { return 0; }
+        int placed = 0;
+        string ehThrow = "_" + "_zan_eh_throw";
+        string ehUnhandled = "_" + "_zan_eh_unhandled";
+        if (onThrow) {
+            if (excBpThrow < 0) { excBpThrow = BreakFunction(ehThrow); }
+            if (excBpThrow >= 0) { placed = placed + 1; }
+        } else {
+            DeleteMiBp(excBpThrow);
+            excBpThrow = -1;
+        }
+        if (onUnhandled) {
+            if (excBpUnhandled < 0) { excBpUnhandled = BreakFunction(ehUnhandled); }
+            if (excBpUnhandled >= 0) { placed = placed + 1; }
+        } else {
+            DeleteMiBp(excBpUnhandled);
+            excBpUnhandled = -1;
+        }
+        return placed;
+    }
+
+    // ---- Session Lifecycle ----
+
+    public bool Start(string program, string progArgs) {
+        if (gdb != null) { Stop(); }
+        if (program == null || program == "") { return false; }
+        programPath = program;
+        if (!MiSpawn(program)) {
+            AppendOutput("[DBG] Failed to launch gdb for " + program + "\n");
+            State = DapState.Terminated();
+            return false;
+        }
+        InferiorPid = 0;
+        interruptRequested = false;
+        MiCommand("-gdb-set mi-async off");
+        MiCommand("-gdb-set confirm off");
+        MiCommand("-gdb-set print pretty off");
+        MiCommand("-gdb-set startup-with-shell off");
+        if (progArgs != null && progArgs != "") {
+            MiCommand("-exec-arguments " + progArgs);
+        }
+        InstallBreakpoints(false);
+        State = DapState.Running();
+        LastExitCode = 0;
+        AppendOutput("[DBG] Launched under gdb: " + program + "\n");
+        excBpThrow = -1;
+        excBpUnhandled = -1;
+        if (BreakOnThrow || BreakOnException) {
+            SetExceptionBreakpoints(BreakOnThrow, BreakOnException);
+        }
+        MiExec(BreakOnEntry ? "-exec-run --start" : "-exec-run");
+        return true;
+    }
+
+    public bool Attach(string program, int pid) {
+        if (pid <= 0) { return false; }
+        if (gdb != null) { Stop(); }
+        programPath = program != null ? program : "";
+        if (!MiSpawn(programPath)) {
+            AppendOutput("[DBG] Failed to launch gdb for attach\n");
+            State = DapState.Terminated();
+            return false;
+        }
+        InferiorPid = pid;
+        interruptRequested = false;
+        MiCommand("-gdb-set mi-async off");
+        MiCommand("-gdb-set confirm off");
+        MiCommand("-gdb-set print pretty off");
+        string res = MiCommand("-target-attach " + Convert.ToString(pid));
+        if (res == null || res.Contains("^error")) {
+            string msg = res != null ? MiField(res, "msg") : "";
+            AppendOutput("[DBG] Attach to pid " + Convert.ToString(pid) + " failed: "
+                + (msg != "" ? msg : "unknown error") + "\n");
+            MiClose();
+            State = DapState.Terminated();
+            return false;
+        }
+        Attached = true;
+        State = DapState.Paused();
+        LastExitCode = 0;
+        InstallBreakpoints(true);
+        excBpThrow = -1;
+        excBpUnhandled = -1;
+        if (BreakOnThrow || BreakOnException) {
+            SetExceptionBreakpoints(BreakOnThrow, BreakOnException);
+        }
+        AppendOutput("[DBG] Attached to pid " + Convert.ToString(pid) + " under gdb.\n");
+        RefreshThreads();
+        RefreshCallstack();
+        ActiveFrame = 0;
+        RefreshLocals();
+        return true;
+    }
+
+    public void Stop() {
+        if (gdb != null) {
+            MiClose();
+            AppendOutput("[DBG] Debugging session terminated.\n");
+        }
+        State = DapState.Terminated();
+        Locals.Clear();
+        Callstack.Clear();
+    }
+
+    public void Continue() {
+        if (State != DapState.Paused()) { return; }
+        AppendOutput("[DBG] Continuing...\n");
+        MiExec("-exec-continue");
+    }
+
+    public void StepOver() {
+        if (State != DapState.Paused()) { return; }
+        MiExec("-exec-next");
+    }
+
+    public void StepInto() {
+        if (State != DapState.Paused()) { return; }
+        MiExec("-exec-step");
+    }
+
+    public void StepOut() {
+        if (State != DapState.Paused()) { return; }
+        MiExec("-exec-finish");
+    }
+
+    public bool Interrupt() {
+        if (gdb == null || State != DapState.Running() || InferiorPid <= 0) {
+            return false;
+        }
+        interruptRequested = true;
+        AppendOutput("[DBG] Interrupt requested\n");
+        #if WINDOWS
+        // PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE
+        nint h = WinOpenProcess(0x043A, 0, InferiorPid);
+        if (h == 0) {
+            interruptRequested = false;
+            AppendOutput("[DBG] Interrupt failed: cannot open process\n");
+            return false;
+        }
+        bool ok = WinDebugBreakProcess(h) != 0;
+        WinCloseHandle(h);
+        if (!ok) {
+            interruptRequested = false;
+            AppendOutput("[DBG] Interrupt failed: DebugBreakProcess\n");
+        }
+        return ok;
+        #elif LINUX || MACOS
+        if (PosixKillSignal(InferiorPid, 2) != 0) {
+            interruptRequested = false;
+            AppendOutput("[DBG] Interrupt failed: kill\n");
+            return false;
+        }
+        return true;
+        #else
+        interruptRequested = false;
+        return false;
+        #endif
+    }
+
+    public void WaitStop() {
+        if (State != DapState.Running()) { return; }
+        MiWaitStopped();
+        if (State == DapState.Paused()) {
+            AfterStop();
+        }
+    }
+
+    // ---- Inspection ----
+
+    public void RefreshThreads() {
+        Threads.Clear();
+        if (gdb == null || State != DapState.Paused()) { return; }
+        string res = MiCommand("-thread-info");
+        if (res == null) { return; }
+        string cur = MiField(res, "current-thread-id");
+        if (cur != "") { CurrentThread = ParseIntSafe(cur, CurrentThread); }
+        int tIdx = res.IndexOf("threads=[");
+        if (tIdx < 0) { return; }
+        List<string> blocks = ExtractBalancedObjects(res, "{id=", tIdx);
+        int i = 0;
+        while (i < blocks.Count && Threads.Count < 64) {
+            string blk = blocks[i];
+            int id = ParseIntSafe(MiField(blk, "id"), 0);
+            string nm = MiField(blk, "name");
+            string target = MiField(blk, "target-id");
+            string st = MiField(blk, "state");
+            string label = nm != "" ? nm : (target != "" ? target : "Thread " + Convert.ToString(id));
+            if (id > 0) {
+                Threads.Add(new DapThread(id, label, st == "running"));
+            }
+            i = i + 1;
+        }
+    }
+
+    public bool SelectThread(int threadId) {
+        if (gdb == null || threadId <= 0) { return false; }
+        string res = MiCommand("-thread-select " + Convert.ToString(threadId));
+        if (res == null || res.Contains("^error")) { return false; }
+        CurrentThread = threadId;
+        ActiveFrame = 0;
+        RefreshCallstack();
+        RefreshLocals();
+        return true;
+    }
+
+    public void RefreshCallstack() {
+        Callstack.Clear();
+        if (gdb == null || State != DapState.Paused()) { return; }
+        string res = MiCommand("-stack-list-frames");
+        if (res == null) { return; }
+        List<string> blocks = ExtractBalancedObjects(res, "frame={", 0);
+        int i = 0;
+        while (i < blocks.Count && Callstack.Count < 64) {
+            string blk = blocks[i];
+            int lvl = ParseIntSafe(MiField(blk, "level"), i);
+            string func = MiField(blk, "func");
+            if (func == "") { func = "??"; }
+            string file = MiField(blk, "fullname");
+            if (file == "") { file = MiField(blk, "file"); }
+            int line = ParseIntSafe(MiField(blk, "line"), 0);
+            Callstack.Add(new DapFrame(lvl, func, file, line, 1));
+            i = i + 1;
+        }
+    }
+
+    public static bool TypeExpandable(string ty) {
+        if (ty == null || ty == "") { return false; }
+        bool isStruct = ty.StartsWith("struct ");
+        bool isPtr = ty.EndsWith("*");
+        if (!isStruct && !isPtr) { return false; }
+        if (ty == "byte *" || ty == "char *" || ty == "unsigned char *" || ty.Contains("char *")) {
+            return false;
+        }
+        return true;
+    }
+
+    public void RefreshLocals() {
+        Locals.Clear();
+        varGen = varGen + 1;
+        varRefs.Clear();
+        if (gdb == null || State != DapState.Paused()) { return; }
+        MiCommand("-stack-select-frame " + Convert.ToString(ActiveFrame));
+        string res = MiCommand("-stack-list-variables --simple-values");
+        if (res == null) { return; }
+        int vIdx = res.IndexOf("variables=[");
+        if (vIdx < 0) { return; }
+        List<string> blocks = ExtractBalancedObjects(res, "{", vIdx + 11);
+        int i = 0;
+        while (i < blocks.Count && Locals.Count < 256) {
+            string blk = blocks[i];
+            string nm = MiField(blk, "name");
+            string ty = MiField(blk, "type");
+            string val = HasMiField(blk, "value") ? MiField(blk, "value") : "{...}";
+            Locals.Add(new DapLocal(nm, val, ty, TypeExpandable(ty)));
+            i = i + 1;
+        }
+    }
+
+    List<DapVarChild> VarListChildren(string varObjName, int depth) {
+        List<DapVarChild> outp = new List<DapVarChild>();
+        if (depth > 3 || varObjName == null || varObjName == "") { return outp; }
+        string res = MiCommand("-var-list-children --all-values \"" + EscapeMiArg(varObjName) + "\"");
+        if (res == null || !res.Contains("^done")) { return outp; }
+        List<string> blocks = ExtractBalancedObjects(res, "child={", 0);
+        string firstChildMiName = "";
+        int i = 0;
+        while (i < blocks.Count && outp.Count < 64) {
+            string blk = blocks[i];
+            string nm = MiField(blk, "name");
+            string exp = MiField(blk, "exp");
+            string ty = MiField(blk, "type");
+            string val = MiField(blk, "value");
+            if (i == 0) { firstChildMiName = nm; }
+            outp.Add(new DapVarChild(exp != "" ? exp : nm, val, ty, 0));
+            i = i + 1;
+        }
+        if (outp.Count == 1 && outp[0].Name.StartsWith("*") && firstChildMiName != "" && depth < 3) {
+            List<DapVarChild> inner = VarListChildren(firstChildMiName, depth + 1);
+            if (inner.Count > 0) { return inner; }
+        }
+        return outp;
+    }
+
+    string EnsureLocalVarObj(int idx) {
+        if (idx < 0 || idx >= Locals.Count) { return ""; }
+        DapLocal loc = Locals[idx];
+        string varName = "z" + Convert.ToString(varGen) + "_" + Convert.ToString(idx);
+        if (!loc.VarCreated) {
+            bool isPtr = loc.TypeName.Contains("*") && loc.TypeName != "string";
+            string expr = isPtr ? ("*" + loc.Name) : loc.Name;
+            string res = MiCommand("-var-create " + varName + " * \"" + EscapeMiArg(expr) + "\"");
+            if (res == null || !res.Contains("^done")) { return ""; }
+            loc.VarCreated = true;
+        }
+        return varName;
+    }
+
+    public List<DapVarChild> ExpandVariables(int varRef) {
+        List<DapVarChild> empty = new List<DapVarChild>();
+        if (gdb == null || State != DapState.Paused()) { return empty; }
+        string node = "";
+        if (varRef >= VarRefLocalBase && varRef < VarRefLocalBase + Locals.Count) {
+            node = EnsureLocalVarObj(varRef - VarRefLocalBase);
+        } else if (varRef >= VarRefDynamicBase && varRef < VarRefDynamicBase + varRefs.Count) {
+            node = varRefs[varRef - VarRefDynamicBase];
+        }
+        if (node == "") { return empty; }
+        List<DapVarChild> kids = VarListChildren(node, 0);
+        int i = 0;
+        while (i < kids.Count) {
+            kids[i].ExpandRef = 0;
+            if (TypeExpandable(kids[i].TypeName) && varRefs.Count < 128) {
+                int dynIdx = varRefs.Count;
+                varRefs.Add(node + "." + kids[i].Name);
+                kids[i].ExpandRef = VarRefDynamicBase + dynIdx;
+            }
+            i = i + 1;
+        }
+        return kids;
+    }
+
+    public void AddWatch(string expression) {
+        if (Watches.Count >= 32) { return; }
+        int i = 0;
+        while (i < Watches.Count) {
+            if (Watches[i].Expression == expression) { return; }
+            i = i + 1;
+        }
+        Watches.Add(new DapWatch(expression));
+        AppendOutput("[DBG] Watch added: " + expression + "\n");
+    }
+
+    public bool Evaluate(string expression, List<string> outResult) {
+        outResult.Clear();
+        if (State != DapState.Paused()) {
+            outResult.Add("<not paused>");
+            return false;
+        }
+        if (gdb != null) {
+            string res = MiCommand("-data-evaluate-expression \"" + EscapeMiArg(expression) + "\"");
+            if (res != null && res.Contains("^done") && HasMiField(res, "value")) {
+                outResult.Add(MiField(res, "value"));
+                return true;
+            }
+            string msg = res != null ? MiField(res, "msg") : "";
+            outResult.Add(msg != "" ? msg : "<cannot evaluate '" + expression + "'>");
+            return false;
+        }
+        int i = 0;
+        while (i < Locals.Count) {
+            if (Locals[i].Name == expression) {
+                outResult.Add(Locals[i].Value);
+                return true;
+            }
+            i = i + 1;
+        }
+        outResult.Add("<cannot evaluate '" + expression + "'>");
+        return false;
+    }
+
+    public void EvaluateWatches() {
+        List<string> box = new List<string>();
+        int i = 0;
+        while (i < Watches.Count) {
+            Watches[i].Valid = Evaluate(Watches[i].Expression, box);
+            Watches[i].Value = box.Count > 0 ? box[0] : "";
+            i = i + 1;
+        }
+    }
+
+    public bool SetVariable(string name, string value) {
+        if (State != DapState.Paused() || gdb == null) { return false; }
+        string res = MiCommand("-gdb-set var " + name + "=" + value);
+        bool ok = res != null && res.Contains("^done");
+        if (ok) {
+            RefreshLocals();
+            EvaluateWatches();
+        }
+        return ok;
+    }
+
+    public string GetExceptionInfo() {
+        if (StopReason != null && (StopReason.Contains("exception") || StopReason.Contains("signal"))) {
+            return StopReason;
+        }
+        return "unknown";
+    }
+}
