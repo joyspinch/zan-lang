@@ -15,7 +15,8 @@ public class Validator {
 
     // 值为空记一条 "<field> is required"（可链式）。
     public Validator Require(string val, string field) {
-        if (val.Length == 0) { this.errors.Add(field + " is required"); }
+        string f = field != null ? field : "field";
+        if (val == null || val.Length == 0) { this.errors.Add(f + " is required"); }
         return this;
     }
 
@@ -24,30 +25,33 @@ public class Validator {
 
     // 长度超过 max 记错误（可链式）。
     public Validator MaxLen(string val, int max, string field) {
-        if (val.Length > max) {
-            this.errors.Add(field + " exceeds " + Convert.ToString(max) + " chars");
+        string f = field != null ? field : "field";
+        if (val != null && val.Length > max) {
+            this.errors.Add(f + " exceeds " + Convert.ToString(max) + " chars");
         }
         return this;
     }
 
     // 非空且长度不足 min 记错误；空值跳过（可链式）。
     public Validator MinLen(string val, int min, string field) {
-        if (val.Length > 0 && val.Length < min) {
-            this.errors.Add(field + " is shorter than " + Convert.ToString(min) + " chars");
+        string f = field != null ? field : "field";
+        if (val != null && val.Length > 0 && val.Length < min) {
+            this.errors.Add(f + " is shorter than " + Convert.ToString(min) + " chars");
         }
         return this;
     }
 
     public Validator IsInt(string val, string field) {
+        if (val == null || val.Length == 0) { return this; }
+        string f = field != null ? field : "field";
         int n = val.Length;
-        if (n == 0) { return this; }
         int i = 0;
         if ((val[0] & 255) == 45) { i = 1; }
-        if (i >= n) { this.errors.Add(field + " must be an integer"); return this; }
+        if (i >= n) { this.errors.Add(f + " must be an integer"); return this; }
         while (i < n) {
             int c = val[i] & 255;
             if (c < 48 || c > 57) {
-                this.errors.Add(field + " must be an integer");
+                this.errors.Add(f + " must be an integer");
                 return this;
             }
             i = i + 1;
@@ -115,7 +119,29 @@ public class Validator {
         return sb.ToString();
     }
 
-    // 客户端上传文件名路径遍历防御净化：剥离目录分隔符、相对路径及前导点隐藏文件。
+    private static bool IsReservedWindowsName(string name) {
+        if (name == null || name.Length < 3) { return false; }
+        int stemEnd = name.IndexOf(".");
+        if (stemEnd < 0) { stemEnd = name.Length; }
+        if (stemEnd != 3 && stemEnd != 4) { return false; }
+        int c0 = name[0] & 255; if (c0 >= 97 && c0 <= 122) { c0 = c0 - 32; }
+        int c1 = name[1] & 255; if (c1 >= 97 && c1 <= 122) { c1 = c1 - 32; }
+        int c2 = name[2] & 255; if (c2 >= 97 && c2 <= 122) { c2 = c2 - 32; }
+        if (stemEnd == 3) {
+            if (c0 == 67 && c1 == 79 && c2 == 78) { return true; } // CON
+            if (c0 == 80 && c1 == 82 && c2 == 78) { return true; } // PRN
+            if (c0 == 65 && c1 == 85 && c2 == 88) { return true; } // AUX
+            if (c0 == 78 && c1 == 85 && c2 == 76) { return true; } // NUL
+            return false;
+        }
+        int c3 = name[3] & 255;
+        if (c3 < 49 || c3 > 57) { return false; } // '1'..'9'
+        if (c0 == 67 && c1 == 79 && c2 == 77) { return true; } // COM1..9
+        if (c0 == 76 && c1 == 80 && c2 == 84) { return true; } // LPT1..9
+        return false;
+    }
+
+    // 客户端上传文件名路径遍历防御净化：剥离目录分隔符、相对路径、前导点及 Windows 保留设备名。
     public static string SafeFileName(string name) {
         if (name == null) { return "file"; }
         int n = name.Length;
@@ -159,13 +185,17 @@ public class Validator {
                 prev = c;
             }
         }
+        string result;
         if (buf == null) {
-            return baseStart == 0 ? name : name.Substring(baseStart, blen);
+            result = baseStart == 0 ? name : name.Substring(baseStart, blen);
+        } else {
+            int start = 0;
+            while (start < outLen && buf[start] == 46) { start = start + 1; }
+            if (start >= outLen) { return "file"; }
+            result = NativeMemory.GetString((nint)buf, start, outLen - start);
         }
-        int start = 0;
-        while (start < outLen && buf[start] == 46) { start = start + 1; }
-        if (start >= outLen) { return "file"; }
-        return NativeMemory.GetString((nint)buf, start, outLen - start);
+        if (Validator.IsReservedWindowsName(result)) { return "file"; }
+        return result;
     }
 
     // 校验文件扩展名是否属于逗号分隔的安全白名单。

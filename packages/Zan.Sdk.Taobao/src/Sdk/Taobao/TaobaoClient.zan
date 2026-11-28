@@ -27,6 +27,7 @@ public class TaobaoClient {
     private string batchPathOverride;
     private bool simplify;
     private int timeoutMs;
+    private bool timeoutCustomized;
     private int maxRetries;
     private int tzOffsetMinutes;
     private bool plainHttp;
@@ -46,6 +47,7 @@ public class TaobaoClient {
         this.signMethod = TaobaoSign.SignMethodHmacSha256;
         this.simplify = true;
         this.timeoutMs = 30000;
+        this.timeoutCustomized = false;
         this.maxRetries = 2;
         this.tzOffsetMinutes = 480;
         this.plainHttp = false;
@@ -78,6 +80,7 @@ public class TaobaoClient {
         copy.batchPathOverride = this.batchPathOverride;
         copy.simplify = this.simplify;
         copy.timeoutMs = this.timeoutMs;
+        copy.timeoutCustomized = this.timeoutCustomized;
         copy.maxRetries = this.maxRetries;
         copy.tzOffsetMinutes = this.tzOffsetMinutes;
         copy.plainHttp = this.plainHttp;
@@ -103,7 +106,17 @@ public class TaobaoClient {
 
     public TaobaoClient BatchPath(string batchPath) {
         if (batchPath != null && batchPath.Length > 0) {
-            this.batchPathOverride = batchPath.StartsWith("/") ? batchPath : "/" + batchPath;
+            string p = batchPath.StartsWith("/") ? batchPath : "/" + batchPath;
+            if (p.Contains("?") || p.Contains("#") || p.Contains("..") || p.Contains("\\")) {
+                throw new TaobaoException("client.invalidArguments", "批量路径不能包含查询、片段或路径穿越", 0, "");
+            }
+            for (int i = 0; i < p.Length; i = i + 1) {
+                int c = p[i] & 255;
+                if (c <= 32 || c == 127) {
+                    throw new TaobaoException("client.invalidArguments", "批量路径包含非法空白或控制字符", 0, "");
+                }
+            }
+            this.batchPathOverride = p;
         }
         return this;
     }
@@ -143,7 +156,10 @@ public class TaobaoClient {
     }
 
     public TaobaoClient Timeout(int ms) {
-        if (ms > 0) { this.timeoutMs = ms; }
+        if (ms > 0) {
+            this.timeoutMs = ms;
+            this.timeoutCustomized = true;
+        }
         return this;
     }
 
@@ -157,9 +173,14 @@ public class TaobaoClient {
         return this;
     }
 
+    private static bool IsReservedSystemKey(string key) {
+        return key == "sign" || key == "sign_method" || key == "app_key"
+            || key == "method" || key == "timestamp";
+    }
+
     public TaobaoClient AddSystemParam(string key, string value) {
-        if (key == "sign") {
-            throw new TaobaoException("client.invalidArguments", "系统参数不能覆盖 sign", 0, "");
+        if (TaobaoClient.IsReservedSystemKey(key)) {
+            throw new TaobaoException("client.invalidArguments", "系统参数不能覆盖保留签名字段: " + key, 0, "");
         }
         if (key != null && key.Length > 0 && value != null) {
             if (this.sharedSystemParams.ContainsKey(key)) {
@@ -208,6 +229,12 @@ public class TaobaoClient {
         while (true) {
             Dictionary<string, string> sysParams = this.BuildSystemParams(apiMethod, effectiveSession, effectiveTarget);
             Dictionary<string, string> bizParams = TaobaoClient.CleanDict(parameters);
+            List<string> checkKeys = bizParams.Keys;
+            for (int ci = 0; ci < checkKeys.Count; ci = ci + 1) {
+                if (TaobaoClient.IsReservedSystemKey(checkKeys[ci])) {
+                    throw new TaobaoException("client.invalidArguments", "业务参数不能与系统保留字段冲突: " + checkKeys[ci], 0, "");
+                }
+            }
 
             Dictionary<string, string> signParams = TaobaoClient.CopyDict(sysParams);
             TaobaoClient.PutAll(signParams, bizParams);
@@ -231,7 +258,9 @@ public class TaobaoClient {
                             string fk = fKeys[i];
                             mp.AddFile(fk, files[fk]);
                         }
-                        byte[] bodyBytes = mp.Body(64 * 1024 * 1024);
+                        int maxReq = this.policy.MaxRequestBytes();
+                        int mpLimit = (maxReq > 0 && maxReq < 64 * 1024 * 1024) ? maxReq : (64 * 1024 * 1024);
+                        byte[] bodyBytes = mp.Body(mpLimit);
                         http.SetHeader("Content-Type", mp.ContentType());
                         try {
                             response = await http.SendBytesAsync("POST", reqPath, bodyBytes, bodyBytes.Length);
@@ -281,9 +310,14 @@ public class TaobaoClient {
         if (separator != TaobaoClient.DefaultBatchSplit) {
             for (int si = 0; si < separator.Length; si = si + 1) {
                 int sc = separator[si] & 255;
-                if (sc == 13 || sc == 10 || sc == 0) {
-                    throw new TaobaoException("client.invalidArguments", "批量分隔符不能包含 CR/LF/NUL 字符", 0, "");
+                if (sc < 32 || sc == 127) {
+                    throw new TaobaoException("client.invalidArguments", "批量分隔符不能包含控制字符", 0, "");
                 }
+            }
+        }
+        for (int vi = 0; vi < batch.Items.Count; vi = vi + 1) {
+            if (batch.Items[vi] == null) {
+                throw new TaobaoException("client.invalidArguments", "批量请求项不能为空", 0, "");
             }
         }
 
@@ -392,8 +426,32 @@ public class TaobaoClient {
         HttpClient http = new HttpClient(this.serverHost, this.serverPort);
         if (this.useTls && !this.plainHttp) { http.UseTls(); }
         http.SetTimeout(this.timeoutMs);
-        http.SetCallPolicy(this.policy);
+        ExternalCallPolicy effectivePolicy = this.timeoutCustomized
+            ? TaobaoClient.ClonePolicyWithTimeout(this.policy, this.timeoutMs)
+            : this.policy;
+        http.SetCallPolicy(effectivePolicy);
         return http;
+    }
+
+    private static ExternalCallPolicy ClonePolicyWithTimeout(ExternalCallPolicy src, int totalMs) {
+        ExternalCallPolicy dst = ExternalCallPolicy.Default()
+            .ConnectTimeout(src.ConnectTimeoutMs())
+            .WriteTimeout(src.WriteTimeoutMs())
+            .ReadTimeout(src.ReadTimeoutMs())
+            .IdleTimeout(src.IdleTimeoutMs())
+            .TotalTimeout(totalMs)
+            .RequestLimit(src.MaxRequestBytes())
+            .ResponseLimit(src.MaxResponseBytes())
+            .ErrorLimit(src.MaxErrorBytes())
+            .StreamLimit(src.MaxStreamBytes())
+            .Redirects(src.MaxRedirects())
+            .RetryAttempts(src.RetryAttempts())
+            .RetryBackoff(src.RetryBackoffMs());
+        if (src.AllowsHttp() && src.AllowsLoopback()) { dst.AllowLocalHttp(); }
+        else if (src.AllowsLoopback()) { dst.AllowLoopback(); }
+        if (src.AllowsPrivate()) { dst.AllowPrivate(); }
+        if (src.IsIdempotent()) { dst.Idempotent(src.IdempotencyKey()); }
+        return dst;
     }
 
     private void ApplyHeaders(HttpClient http, Dictionary<string, string>? headers) {

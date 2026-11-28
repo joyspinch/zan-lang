@@ -14,6 +14,7 @@ public class OceanEngineTransport {
     private int serverPort;
     private bool useTls;
     private int timeoutMs;
+    private bool timeoutCustomized;
     private int maxRetries;
     private string accessToken;
     private string appAccessToken;
@@ -28,6 +29,7 @@ public class OceanEngineTransport {
         this.serverPort = 443;
         this.useTls = true;
         this.timeoutMs = 30000;
+        this.timeoutCustomized = false;
         this.maxRetries = 0;
         this.accessToken = "";
         this.appAccessToken = "";
@@ -47,6 +49,7 @@ public class OceanEngineTransport {
         copy.serverPort = this.serverPort;
         copy.useTls = this.useTls;
         copy.timeoutMs = this.timeoutMs;
+        copy.timeoutCustomized = this.timeoutCustomized;
         copy.maxRetries = this.maxRetries;
         copy.accessToken = newAccessToken == null ? "" : newAccessToken;
         copy.appAccessToken = newAppAccessToken == null ? "" : newAppAccessToken;
@@ -84,7 +87,10 @@ public class OceanEngineTransport {
     }
 
     public void Timeout(int ms) {
-        if (ms > 0) { this.timeoutMs = ms; }
+        if (ms > 0) {
+            this.timeoutMs = ms;
+            this.timeoutCustomized = true;
+        }
     }
 
     public void MaxRetries(int n) {
@@ -139,6 +145,7 @@ public class OceanEngineTransport {
         OceanEngineMultipart form, OceanEngineCredential credential, string tokenOverride = "",
         string directArray = "") {
         OceanEngineTransport.ValidatePath(path);
+        if (form == null) { throw new ArgumentException("multipart 表单不能为空"); }
         byte[] payload = form.Body(this.callPolicy.MaxRequestBytes());
         return await this.SendWithRetryAsync(gateway, "POST", path, form.ContentType(), "",
             credential, tokenOverride, directArray, payload);
@@ -162,6 +169,12 @@ public class OceanEngineTransport {
     private static string CredentialHeader(OceanEngineCredential credential, string token) {
         if (credential == OceanEngineCredential.None && token.Length == 0) { return ""; }
         if (token.Length > 0) {
+            for (int i = 0; i < token.Length; i = i + 1) {
+                int c = token[i] & 255;
+                if (c < 32 || c == 127) {
+                    throw new ArgumentException("令牌包含非法控制字符");
+                }
+            }
             if (credential == OceanEngineCredential.AccessToken) { return "Access-Token"; }
             if (credential == OceanEngineCredential.AppAccessToken) { return "App-Access-Token"; }
         }
@@ -169,8 +182,15 @@ public class OceanEngineTransport {
     }
 
     private static void ValidatePath(string path) {
-        if (path == null || !path.StartsWith("/open_api/") || path.IndexOf("?") >= 0 || path.IndexOf("#") >= 0) {
+        if (path == null || !path.StartsWith("/open_api/") || path.IndexOf("?") >= 0 || path.IndexOf("#") >= 0
+            || path.IndexOf("..") >= 0 || path.IndexOf("\\") >= 0) {
             throw new ArgumentException("path 须为 /open_api/ 下的路径，查询参数请单独传入");
+        }
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int c = path[i] & 255;
+            if (c <= 32 || c == 127) {
+                throw new ArgumentException("path 包含非法控制或空白字符");
+            }
         }
     }
 
@@ -235,7 +255,10 @@ public class OceanEngineTransport {
                     }
                 }
                 http.SetTimeout(this.timeoutMs);
-                http.SetCallPolicy(this.callPolicy);
+                ExternalCallPolicy effectivePolicy = this.timeoutCustomized
+                    ? OceanEngineTransport.ClonePolicyWithTimeout(this.callPolicy, this.timeoutMs)
+                    : this.callPolicy;
+                http.SetCallPolicy(effectivePolicy);
                 if (http.CallPolicy().MaxRedirects() > 0) {
                     throw new ArgumentException("巨量引擎请求不允许重定向");
                 }
@@ -263,5 +286,26 @@ public class OceanEngineTransport {
             throw new OceanEngineException("client.networkError", "巨量引擎请求未完成", 0, "");
         }
         return OceanEngineResponse.Parse(status, responseBody, requestId, directArray);
+    }
+
+    private static ExternalCallPolicy ClonePolicyWithTimeout(ExternalCallPolicy src, int totalMs) {
+        ExternalCallPolicy dst = ExternalCallPolicy.Default()
+            .ConnectTimeout(src.ConnectTimeoutMs())
+            .WriteTimeout(src.WriteTimeoutMs())
+            .ReadTimeout(src.ReadTimeoutMs())
+            .IdleTimeout(src.IdleTimeoutMs())
+            .TotalTimeout(totalMs)
+            .RequestLimit(src.MaxRequestBytes())
+            .ResponseLimit(src.MaxResponseBytes())
+            .ErrorLimit(src.MaxErrorBytes())
+            .StreamLimit(src.MaxStreamBytes())
+            .Redirects(src.MaxRedirects())
+            .RetryAttempts(src.RetryAttempts())
+            .RetryBackoff(src.RetryBackoffMs());
+        if (src.AllowsHttp() && src.AllowsLoopback()) { dst.AllowLocalHttp(); }
+        else if (src.AllowsLoopback()) { dst.AllowLoopback(); }
+        if (src.AllowsPrivate()) { dst.AllowPrivate(); }
+        if (src.IsIdempotent()) { dst.Idempotent(src.IdempotencyKey()); }
+        return dst;
     }
 }

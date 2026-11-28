@@ -12,14 +12,22 @@ public class HttpSseStreamer {
 
     // 开启 SSE 流式连接通道：发送标准响应头，接管底层 TCP/TLS 连接并标记统计指标。
     public static async bool Open(HttpContext ctx) {
-        if (ctx == null || (ctx.Conn() == null && ctx.Tls() == null)) { return false; }
+        if (ctx == null || ctx.Hijacked() || ctx.Ended()
+            || (ctx.Conn() == null && ctx.Tls() == null)) {
+            return false;
+        }
         string head = "HTTP/1.1 200 OK\r\n"
             + "Content-Type: " + HttpLimits.MimeEventStream + "\r\n"
             + "Cache-Control: no-cache, no-transform\r\n"
             + "Connection: keep-alive\r\n"
             + "X-Accel-Buffering: no\r\n\r\n";
         bool ok = await ctx.SendAllTcp(head);
-        if (!ok) { return false; }
+        if (!ok) {
+            // 响应头可能已部分落网，标记已接管并关闭以避免上层再写出 500 破坏字节流。
+            ctx.Hijack();
+            ctx.CloseHijack();
+            return false;
+        }
         ctx.Hijack();
         ctx.MarkEnded();
         ServerMetrics.Global().StreamOpened();
@@ -28,13 +36,14 @@ public class HttpSseStreamer {
 
     // 循环发送全部 TCP 字节。在客户端高背压或慢订阅者场景下处理短写，直到全部写入或连接中断。
     public static async bool SendAllTcp(TcpClient conn, string data) {
-        if (conn == null) { return false; }
+        if (conn == null || data == null) { return false; }
         int total = data.Length;
         if (total == 0) { return true; }
+        nint basePtr = (nint)data;
         int sent = 0;
         while (sent < total) {
-            string rest = data.Substring(sent, total - sent);
-            int n = await conn.SendAsync(rest);
+            StringView rest = new StringView(basePtr + (nint)sent, total - sent);
+            int n = await conn.SendViewAsync(rest);
             if (n <= 0) { return false; }
             sent = sent + n;
         }
@@ -43,7 +52,7 @@ public class HttpSseStreamer {
 
     // 循环发送全部 TLS 字节（HTTPS 下 SSE/WebSocket 握手及帧写出路径）。
     public static async bool SendAllTls(TlsStream stream, string data) {
-        if (stream == null) { return false; }
+        if (stream == null || data == null) { return false; }
         int total = data.Length;
         if (total == 0) { return true; }
         byte[] raw = data.ToBytes();

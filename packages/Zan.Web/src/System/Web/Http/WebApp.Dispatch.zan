@@ -8,21 +8,24 @@ namespace System.Web;
 
 // WebApp 路由匹配、鉴权/限流门控与同步/异步请求派发部分。
 public partial class WebApp {
+    private static string err401 = "{\"code\":\"401\",\"msg\":\"authentication required\"}";
+    private static string err403 = "{\"code\":\"403\",\"msg\":\"insufficient permission\"}";
+    private static string err404 = "{\"code\":\"404\",\"msg\":\"not found\"}";
+    private static string err405 = "{\"code\":\"405\",\"msg\":\"method not allowed\"}";
+    private static string err429 = "{\"code\":\"429\",\"msg\":\"request already in progress\"}";
+    private static string err500 = "{\"code\":\"500\",\"msg\":\"internal server error\"}";
+    private static string err503 = "{\"code\":\"503\",\"msg\":\"service unavailable\"}";
     private static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
 
-    private static string[] EnsureDefaultErrorBodies() {
-        if (WebApp.defaultErrorBodies == null) {
-            string[] arr = new string[120];
-            arr[401 - 400] = WebApp.BuildErrorJson("401", "authentication required");
-            arr[403 - 400] = WebApp.BuildErrorJson("403", "insufficient permission");
-            arr[404 - 400] = WebApp.BuildErrorJson("404", "not found");
-            arr[405 - 400] = WebApp.BuildErrorJson("405", "method not allowed");
-            arr[429 - 400] = WebApp.BuildErrorJson("429", "request already in progress");
-            arr[500 - 400] = WebApp.BuildErrorJson("500", "internal server error");
-            arr[503 - 400] = WebApp.BuildErrorJson("503", "service unavailable");
-            WebApp.defaultErrorBodies = arr;
-        }
-        return WebApp.defaultErrorBodies;
+    private static string DefaultErrorBody(int status) {
+        if (status == 401) { return WebApp.err401; }
+        if (status == 403) { return WebApp.err403; }
+        if (status == 404) { return WebApp.err404; }
+        if (status == 405) { return WebApp.err405; }
+        if (status == 429) { return WebApp.err429; }
+        if (status == 500) { return WebApp.err500; }
+        if (status == 503) { return WebApp.err503; }
+        return null;
     }
 
     private string ErrorBody(int status, string code, string msg) {
@@ -34,9 +37,9 @@ public partial class WebApp {
             if (status == 500 && msg == "handler produced no response") {
                 return WebApp.err500noResp;
             }
-            string[] defs = WebApp.EnsureDefaultErrorBodies();
-            if (defs[idx] != null && (msg.Length == 0 || status != 429 || msg == "request already in progress")) {
-                return defs[idx];
+            string defBody = WebApp.DefaultErrorBody(status);
+            if (defBody != null && (msg.Length == 0 || status != 429 || msg == "request already in progress")) {
+                return defBody;
             }
         }
         return WebApp.BuildErrorJson(code, msg);
@@ -140,10 +143,12 @@ public partial class WebApp {
 
     // 纯同步请求派发快路径（零协程分配、零协程调度切换）：
     // 若门控及处理器均可同步完成则直接完成并构建响应返回 true；
-    // 若处理器需要 await 或门控需异步解析则安全回退返回 false（且绝不重复执行 Before 钩子）。
+    // 若处理器需要 await 或门控需异步解析则安全回退返回 false（且绝不重复执行 Before 钩子或 syncHandler）。
     private bool TryDispatchSync(HttpContext ctx, Route route, bool keepAlive,
-                                 bool gatePassed, bool gateRejected, out bool gateAlreadyPassed) {
+                                 bool gatePassed, bool gateRejected,
+                                 out bool gateAlreadyPassed, out bool syncHandlerTried) {
         gateAlreadyPassed = gatePassed;
+        syncHandlerTried = false;
         if (!gateRejected && !gatePassed && !this.CanGateSync(ctx, route)) {
             return false;
         }
@@ -177,8 +182,11 @@ public partial class WebApp {
                         try {
                             if (syncAction != null) {
                                 syncAction(ctx);
-                            } else if (!syncH(ctx)) {
-                                needAsyncFallback = true;
+                            } else {
+                                syncHandlerTried = true;
+                                if (!syncH(ctx)) {
+                                    needAsyncFallback = true;
+                                }
                             }
                         } catch (Exception failure) {
                             if (trace != null) { trace.Fail(handlerStage, WebApp.RequestFailureCode(failure)); }
@@ -204,7 +212,8 @@ public partial class WebApp {
     }
 
     private async void Dispatch(HttpContext ctx, Route route, bool keepAlive,
-                                bool gatePassed = false, bool gateRejected = false) {
+                                bool gatePassed = false, bool gateRejected = false,
+                                bool skipSync = false) {
         long startUs = ServerMetrics.MonoMicros();
         RequestTrace trace = ctx.Trace;
         int dispatchStage = trace != null ? trace.BeginAt("dispatch", startUs, true) : -1;
@@ -229,10 +238,10 @@ public partial class WebApp {
                         bool errLogged = false;
                         int handlerStage = trace != null ? trace.Begin("handler") : -1;
                         try {
-                            if (syncAction != null) {
+                            if (!skipSync && syncAction != null) {
                                 syncAction(ctx);
-                            } else if (syncH == null || !syncH(ctx)) {
-                                await h(ctx);
+                            } else if (skipSync || syncH == null || !syncH(ctx)) {
+                                if (h != null) { await h(ctx); }
                             }
                         } catch (Exception failure) {
                             if (trace != null) { trace.Fail(handlerStage, WebApp.RequestFailureCode(failure)); }
@@ -323,9 +332,10 @@ public partial class WebApp {
         if (route == null || route.RateLimit() <= 0) { return false; }
         string rateKey = route.Key();
         if (route.RateScope() == "uid") {
-            rateKey = rateKey + ":uid:" + uid;
+            rateKey = rateKey + ":uid:" + principal;
         } else if (route.RateScope() == "ip") {
-            rateKey = rateKey + ":ip:" + ctx.ClientIp();
+            string ip = ctx.ClientIp();
+            rateKey = rateKey + ":ip:" + (ip.Length > 0 ? ip : "_unknown_");
         }
         return !this.Limiter().Allow(rateKey, route.RateLimit());
     }

@@ -19,9 +19,11 @@ public class LockManager : IDisposable {
     }
 
     public void Dispose() {
-        if (this.table != null) {
-            this.table.Close();
-            this.table = null;
+        lock (this) {
+            if (this.table != null) {
+                this.table.Close();
+                this.table = null;
+            }
         }
     }
 
@@ -55,8 +57,9 @@ public class LockManager : IDisposable {
     }
 
     public long OsHandle() {
-        if (this.table == null) { return 0; }
-        return this.table.OsHandle();
+        SharedTable tbl = this.table;
+        if (tbl == null) { return 0; }
+        return tbl.OsHandle();
     }
 
     // 依 [Lock] 维度构锁键：
@@ -65,12 +68,13 @@ public class LockManager : IDisposable {
     // - 其他自定义维度 <scope> → "<scope>:<principal>:<路由键>"
     // 未声明锁维度返回空串。
     public static string KeyFor(Route route, string principal) {
+        if (route == null) { return ""; }
         string scope = route.LockScope();
-        if (scope.Length == 0) { return ""; }
+        if (scope == null || scope.Length == 0) { return ""; }
         if (scope == "global") {
             return "g:" + route.Key();
         }
-        string who = principal;
+        string who = principal != null ? principal : "";
         if (who.Length == 0) { who = "_anon_"; }
         if (scope == "user") {
             return "u:" + who + ":" + route.Key();
@@ -80,14 +84,15 @@ public class LockManager : IDisposable {
 
     // 取租约：键为空、表未就绪或键已被持有都返回 null。
     public LockLease TryAcquire(string key) {
-        if (key.Length == 0) { return null; }
-        if (this.table == null) { return null; }
+        if (key == null || key.Length == 0) { return null; }
+        SharedTable tbl = this.table;
+        if (tbl == null) { return null; }
         long owner = 0;
         lock (this) {
             this.ownerSequence = this.ownerSequence + 1;
             owner = this.ownerPrefix | (this.ownerSequence & 0xFFFFFFFFFFL);
         }
-        if (!this.table.TryAcquireLease(key, owner, -1, this.leaseMs)) {
+        if (!tbl.TryAcquireLease(key, owner, -1, this.leaseMs)) {
             return null;
         }
         return new LockLease(key, owner);
@@ -95,7 +100,8 @@ public class LockManager : IDisposable {
 
     // 释放租约（须为本持有者）；lease 为 null 或表未就绪时静默返回。
     public void Release(LockLease lease) {
-        if (lease == null || this.table == null) { return; }
-        this.table.ReleaseLease(lease.Key(), lease.Owner());
+        SharedTable tbl = this.table;
+        if (lease == null || tbl == null) { return; }
+        tbl.ReleaseLease(lease.Key(), lease.Owner());
     }
 }

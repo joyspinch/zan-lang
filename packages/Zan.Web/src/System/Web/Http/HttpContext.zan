@@ -113,6 +113,7 @@ public partial class HttpContext : IDisposable {
 
     // 长连接复用上下文：原地重置所有请求级字段与集合（保留底层连接与已分配 Map/List 容器）。
     public void ResetForRequest(HttpRequest req, string remoteIp) {
+        this.CleanupUpload();
         this.ReleaseResponseBuf();
         this.Trace = null;
         this.request = req;
@@ -157,12 +158,12 @@ public partial class HttpContext : IDisposable {
             HttpFormParser.ParsePairs(req.queryString, this.query);
         }
         if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
-            if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
+            if (HttpContext.MediaTypeMatches(req.contentType, "application/x-www-form-urlencoded")) {
                 if (req.body.Length > 0) {
                     this.form = new StrMap();
                     HttpFormParser.ParsePairs(req.body, this.form);
                 }
-            } else if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
+            } else if (HttpContext.MediaTypeMatches(req.contentType, "multipart/form-data")) {
                 HttpFormParser.ParseMultipartFields(req, this);
             }
         }
@@ -391,6 +392,7 @@ public partial class HttpContext : IDisposable {
     public string Header(string name) { return this.request.GetHeader(name); }
 
     public string Cookie(string name) {
+        if (name == null || name.Length == 0) { return ""; }
         string all = this.request.GetHeader("Cookie");
         int allLen = all.Length;
         if (allLen == 0) { return ""; }
@@ -404,7 +406,7 @@ public partial class HttpContext : IDisposable {
             }
             int e = i;
             while (e < allLen && (all[e] & 255) != 59) { e = e + 1; }
-            if (e - i > nameLen + 1 && (all[i + nameLen] & 255) == 61) {
+            if (e - i >= nameLen + 1 && (all[i + nameLen] & 255) == 61) {
                 bool same = true;
                 for (int k = 0; k < nameLen; k = k + 1) {
                     if ((all[i + k] & 255) != (name[k] & 255)) { same = false; break; }
@@ -460,6 +462,28 @@ public partial class HttpContext : IDisposable {
             if (s[i] != prefix[i]) { return false; }
         }
         return true;
+    }
+
+    // 大小写不敏感匹配媒体类型（如 "application/x-www-form-urlencoded"），
+    // 要求类型后紧跟串尾、分号 ';' 或空白，防止前缀伪造。
+    public static bool MediaTypeMatches(string contentType, string expectedLower) {
+        if (contentType == null || expectedLower == null) { return false; }
+        int n = contentType.Length;
+        int start = 0;
+        while (start < n && ((contentType[start] & 255) == 32 || (contentType[start] & 255) == 9)) {
+            start = start + 1;
+        }
+        int m = expectedLower.Length;
+        if (n - start < m) { return false; }
+        for (int i = 0; i < m; i = i + 1) {
+            int c = contentType[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (expectedLower[i] & 255)) { return false; }
+        }
+        int after = start + m;
+        if (after == n) { return true; }
+        int next = contentType[after] & 255;
+        return next == 59 || next == 32 || next == 9;
     }
 
     public static void ParsePairs(string s, StrMap into) {

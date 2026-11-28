@@ -5,39 +5,38 @@ namespace System.Web;
 
 // 静态资源文件服务中间件：提供 CSS/JS/字体/图片的高性能流式分发与缓存控制。
 public class StaticFiles {
+    private static string stateLock = "System.Web.StaticFiles.stateLock";
     private static string prefix = "";
     private static string root = "";
     private static int maxAge = HttpLimits.DefaultTtlSeconds;
     public static const int MaxFileBytes = HttpLimits.MaxStaticFileBytes;
-    private static List<StaticMount> mounts = new List<StaticMount>();
+    private static List<StaticMount> mounts = null;
     private static Dict<string, string> mimeTypes = null;
     private static bool customMimeRegistered = false;
 
-    private static Dict<string, string> EnsureMimes() {
-        lock (StaticFiles.mounts) {
-            if (StaticFiles.mimeTypes == null) {
-                Dict<string, string> m = new Dict<string, string>();
-                m.Add("css", "text/css; charset=utf-8");
-                m.Add("js", "application/javascript; charset=utf-8");
-                m.Add("mjs", "application/javascript; charset=utf-8");
-                m.Add("json", "application/json; charset=utf-8");
-                m.Add("map", "application/json; charset=utf-8");
-                m.Add("html", "text/html; charset=utf-8");
-                m.Add("txt", "text/plain; charset=utf-8");
-                m.Add("svg", "image/svg+xml");
-                m.Add("png", "image/png");
-                m.Add("jpg", "image/jpeg");
-                m.Add("jpeg", "image/jpeg");
-                m.Add("gif", "image/gif");
-                m.Add("webp", "image/webp");
-                m.Add("ico", "image/x-icon");
-                m.Add("woff", "font/woff");
-                m.Add("woff2", "font/woff2");
-                m.Add("ttf", "font/ttf");
-                StaticFiles.mimeTypes = m;
-            }
-            return StaticFiles.mimeTypes;
+    private static Dict<string, string> EnsureMimesLocked() {
+        if (StaticFiles.mimeTypes == null) {
+            Dict<string, string> m = new Dict<string, string>();
+            m.Add("css", "text/css; charset=utf-8");
+            m.Add("js", "application/javascript; charset=utf-8");
+            m.Add("mjs", "application/javascript; charset=utf-8");
+            m.Add("json", "application/json; charset=utf-8");
+            m.Add("map", "application/json; charset=utf-8");
+            m.Add("html", "text/html; charset=utf-8");
+            m.Add("txt", "text/plain; charset=utf-8");
+            m.Add("svg", "image/svg+xml");
+            m.Add("png", "image/png");
+            m.Add("jpg", "image/jpeg");
+            m.Add("jpeg", "image/jpeg");
+            m.Add("gif", "image/gif");
+            m.Add("webp", "image/webp");
+            m.Add("ico", "image/x-icon");
+            m.Add("woff", "font/woff");
+            m.Add("woff2", "font/woff2");
+            m.Add("ttf", "font/ttf");
+            StaticFiles.mimeTypes = m;
         }
+        return StaticFiles.mimeTypes;
     }
 
     // 注册或覆盖扩展名对应的 Content-Type（ext 可带或不带前导点；拒绝含 CR/LF/控制字符的值防头注入）。
@@ -50,8 +49,8 @@ public class StaticFiles {
             int c = contentType[i] & 255;
             if (c < 32 || c == 127) { return; }
         }
-        lock (StaticFiles.mounts) {
-            Dict<string, string> m = StaticFiles.EnsureMimes();
+        lock (StaticFiles.stateLock) {
+            Dict<string, string> m = StaticFiles.EnsureMimesLocked();
             if (m.ContainsKey(key)) {
                 m[key] = contentType;
             } else {
@@ -63,49 +62,78 @@ public class StaticFiles {
 
     // 将本地目录挂载至指定 URL 前缀路由中间件。
     public static void Mount(WebApp app, string urlPrefix, string dir) {
-        StaticFiles.prefix = urlPrefix;
-        StaticFiles.root = dir;
-        StaticMount m = new StaticMount(urlPrefix, dir, StaticFiles.maxAge);
-        StaticFiles.mounts.Add(m);
+        if (urlPrefix == null || urlPrefix.Length == 0 || dir == null || dir.Length == 0) { return; }
+        int age = HttpLimits.DefaultTtlSeconds;
+        lock (StaticFiles.stateLock) {
+            StaticFiles.prefix = urlPrefix;
+            StaticFiles.root = dir;
+            age = StaticFiles.maxAge;
+            if (StaticFiles.mounts == null) { StaticFiles.mounts = new List<StaticMount>(); }
+            StaticFiles.mounts.Add(new StaticMount(urlPrefix, dir, age));
+        }
         if (app != null) {
-            app.Mount(urlPrefix, dir, StaticFiles.maxAge);
+            app.Mount(urlPrefix, dir, age);
         }
     }
 
     // 浏览器客户端资源缓存时长（秒，开发环境可配置为 0）。
     public static void MaxAge(int seconds) {
-        StaticFiles.maxAge = seconds;
-        for (int i = 0; i < StaticFiles.mounts.Count; i = i + 1) {
-            StaticMount m = StaticFiles.mounts[i];
-            m.SetMaxAge(seconds);
+        int clamped = seconds < 0 ? 0 : seconds;
+        lock (StaticFiles.stateLock) {
+            StaticFiles.maxAge = clamped;
+            if (StaticFiles.mounts != null) {
+                for (int i = 0; i < StaticFiles.mounts.Count; i = i + 1) {
+                    StaticFiles.mounts[i].SetMaxAge(clamped);
+                }
+            }
         }
     }
 
     // 请求前置中间件：匹配静态资源直接响应，未匹配放行后续路由。
     public static bool Serve(HttpContext ctx) {
+        if (ctx == null) { return true; }
         if (ctx.Method() != "GET" && ctx.Method() != "HEAD") { return true; }
-        WebApp app = ctx != null ? ctx.App() : null;
+        WebApp app = ctx.App();
         if (app != null && app.StaticMounts().Count > 0) {
             bool handled = !app.ServeStatic(ctx);
             if (handled) { return false; }
         }
-        if (StaticFiles.mounts.Count > 0) {
-            for (int i = 0; i < StaticFiles.mounts.Count; i = i + 1) {
-                StaticMount m = StaticFiles.mounts[i];
-                string rel = StaticFiles.RelativeTo(ctx.Path(), m.Prefix());
-                if (rel != null) {
-                    return StaticFiles.ServeFile(ctx, rel, m.Root(), m.Prefix(), m.MaxAge());
+        string reqPath = ctx.Path();
+        string matchedRel = null;
+        string matchedRoot = "";
+        string matchedPrefix = "";
+        int matchedAge = HttpLimits.DefaultTtlSeconds;
+        lock (StaticFiles.stateLock) {
+            if (StaticFiles.mounts != null && StaticFiles.mounts.Count > 0) {
+                for (int i = 0; i < StaticFiles.mounts.Count; i = i + 1) {
+                    StaticMount m = StaticFiles.mounts[i];
+                    string rel = StaticFiles.RelativeTo(reqPath, m.Prefix());
+                    if (rel != null) {
+                        matchedRel = rel;
+                        matchedRoot = m.Root();
+                        matchedPrefix = m.Prefix();
+                        matchedAge = m.MaxAge();
+                        break;
+                    }
+                }
+            }
+            if (matchedRel == null && StaticFiles.root.Length > 0) {
+                string relLegacy = StaticFiles.RelativeTo(reqPath, StaticFiles.prefix);
+                if (relLegacy != null) {
+                    matchedRel = relLegacy;
+                    matchedRoot = StaticFiles.root;
+                    matchedPrefix = StaticFiles.prefix;
+                    matchedAge = StaticFiles.maxAge;
                 }
             }
         }
-        if (StaticFiles.root.Length == 0) { return true; }
-        string relLegacy = StaticFiles.Relative(ctx.Path());
-        if (relLegacy == null) { return true; }
-        return StaticFiles.ServeFile(ctx, relLegacy, StaticFiles.root, StaticFiles.prefix, StaticFiles.maxAge);
+        if (matchedRel == null) { return true; }
+        return StaticFiles.ServeFile(ctx, matchedRel, matchedRoot, matchedPrefix, matchedAge);
     }
 
     public static bool ServeFile(HttpContext ctx, string rel, string rootDir, string urlPrefix, int ageSeconds) {
-        if (rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
+        if (ctx == null) { return true; }
+        if (rootDir == null || rootDir.Length == 0 || rel == null || rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
             ctx.Status(404, "Not Found").Text("not found");
             return false;
         }
@@ -200,11 +228,13 @@ public class StaticFiles {
     }
 
     public static string Relative(string path) {
-        return StaticFiles.RelativeTo(path, StaticFiles.prefix);
+        string p = "";
+        lock (StaticFiles.stateLock) { p = StaticFiles.prefix; }
+        return StaticFiles.RelativeTo(path, p);
     }
 
     public static string RelativeTo(string path, string urlPrefix) {
-        if (path == null || urlPrefix == null) { return null; }
+        if (path == null || urlPrefix == null || urlPrefix.Length == 0) { return null; }
         int pn = urlPrefix.Length;
         if (pn == 1 && (urlPrefix[0] & 255) == 47) {
             if (path.Length <= 1 || (path[0] & 255) != 47) { return null; }
@@ -217,14 +247,47 @@ public class StaticFiles {
         return path.Substring(pn + 1);
     }
 
+    private static bool IsReservedDeviceSegment(string rel, int start, int end) {
+        int stemEnd = start;
+        while (stemEnd < end && (rel[stemEnd] & 255) != 46) { stemEnd = stemEnd + 1; }
+        int len = stemEnd - start;
+        if (len == 3) {
+            int c0 = StaticFiles.LowerAscii(rel[start] & 255);
+            int c1 = StaticFiles.LowerAscii(rel[start + 1] & 255);
+            int c2 = StaticFiles.LowerAscii(rel[start + 2] & 255);
+            if ((c0 == 99 && c1 == 111 && c2 == 110)   // con
+                || (c0 == 112 && c1 == 114 && c2 == 110) // prn
+                || (c0 == 97 && c1 == 117 && c2 == 120)  // aux
+                || (c0 == 110 && c1 == 117 && c2 == 108)) { // nul
+                return true;
+            }
+        } else if (len == 4) {
+            int c0 = StaticFiles.LowerAscii(rel[start] & 255);
+            int c1 = StaticFiles.LowerAscii(rel[start + 1] & 255);
+            int c2 = StaticFiles.LowerAscii(rel[start + 2] & 255);
+            int c3 = rel[start + 3] & 255;
+            if (c3 >= 49 && c3 <= 57) {
+                if ((c0 == 99 && c1 == 111 && c2 == 109)   // com1..9
+                    || (c0 == 108 && c1 == 112 && c2 == 116)) { // lpt1..9
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     public static bool IsSafe(string rel) {
+        if (rel == null || rel.Length == 0) { return false; }
         int n = rel.Length;
+        int segBegin = 0;
         bool segStart = true;
         for (int i = 0; i < n; i = i + 1) {
             int c = rel[i] & 255;
             if (c == 47) {  // '/'
                 if (segStart) { return false; }  // "//" or leading
+                if (StaticFiles.IsReservedDeviceSegment(rel, segBegin, i)) { return false; }
                 segStart = true;
+                segBegin = i + 1;
                 continue;
             }
             if (segStart && c == 46) { return false; }  // ".." / dotfile
@@ -235,7 +298,9 @@ public class StaticFiles {
                 || c == 46 || c == 45 || c == 95;  // . - _
             if (!ok) { return false; }
         }
-        return !segStart;
+        if (segStart) { return false; }
+        if (StaticFiles.IsReservedDeviceSegment(rel, segBegin, n)) { return false; }
+        return true;
     }
 
     private static int LowerAscii(int c) {
@@ -305,6 +370,7 @@ public class StaticFiles {
     // 按扩展名（小写化后）查询可扩展 MIME 表；未知类型为
     // application/octet-stream。
     public static string ContentType(string rel) {
+        if (rel == null || rel.Length == 0) { return "application/octet-stream"; }
         if (!StaticFiles.customMimeRegistered) {
             int n = rel.Length;
             int dot = -1;
@@ -318,8 +384,10 @@ public class StaticFiles {
         }
         string ext = StaticFiles.Extension(rel);
         if (ext.Length == 0) { return "application/octet-stream"; }
-        string mime = "";
-        if (StaticFiles.EnsureMimes().TryGetValue(ext, out mime)) { return mime; }
+        lock (StaticFiles.stateLock) {
+            string mime = "";
+            if (StaticFiles.EnsureMimesLocked().TryGetValue(ext, out mime)) { return mime; }
+        }
         return "application/octet-stream";
     }
 

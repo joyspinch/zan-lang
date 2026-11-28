@@ -4,7 +4,8 @@ using System.Security.Cryptography;
 
 namespace System.Web;
 
-public class Sessions : ISessionStorage {
+public class Sessions : ISessionStorage, IDisposable {
+    private static const int MaxPrunePerIssue = 256;
     private Dictionary<string, SessionEntry> map;
     private SessionEntry head;
     private SessionEntry tail;
@@ -77,7 +78,12 @@ public class Sessions : ISessionStorage {
                 p = p + 2;
             }
             string token = outb.ToStr(0, 64);
-            SessionEntry entry = new SessionEntry(token, uid, expiresAt);
+            string safeUid = uid != null ? uid : "";
+            SessionEntry existing;
+            if (this.map.TryGetValue(token, out existing) && existing != null) {
+                this.RemoveNodeInternal(existing);
+            }
+            SessionEntry entry = new SessionEntry(token, safeUid, expiresAt);
             this.map[token] = entry;
             this.AddToHeadInternal(entry);
             return token;
@@ -125,8 +131,19 @@ public class Sessions : ISessionStorage {
         }
     }
 
+    public void Dispose() {
+        this.Clear();
+    }
+
     public void Clear() {
         lock (this) {
+            SessionEntry curr = this.head;
+            while (curr != null) {
+                SessionEntry next = curr.next;
+                curr.prev = null;
+                curr.next = null;
+                curr = next;
+            }
             this.map.Clear();
             this.head = null;
             this.tail = null;
@@ -175,13 +192,15 @@ public class Sessions : ISessionStorage {
 
     private void PruneExpiredInternal(long nowSeconds) {
         SessionEntry curr = this.tail;
-        while (curr != null) {
+        int budget = Sessions.MaxPrunePerIssue;
+        while (curr != null && budget > 0) {
             SessionEntry prevNode = curr.prev;
             if (curr.expiresAt > 0L && curr.expiresAt <= nowSeconds) {
                 this.RemoveNodeInternal(curr);
                 this.map.Remove(curr.token);
             }
             curr = prevNode;
+            budget = budget - 1;
         }
     }
 }

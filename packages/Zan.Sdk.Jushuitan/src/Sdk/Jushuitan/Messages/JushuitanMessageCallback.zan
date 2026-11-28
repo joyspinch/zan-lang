@@ -18,6 +18,7 @@ public static class JushuitanMessageCallback {
     private const string Utf8 = "utf-8";
     private const string ProtocolVersion = "2";
     private const int TimestampDigits = 10;
+    private const int MaxCallbackFields = 256;
     private const string AppKeyField = "app_key";
     private const string ActionCodeField = "action_code";
     private const string TimestampField = "timestamp";
@@ -106,6 +107,9 @@ public static class JushuitanMessageCallback {
 
     // maxAgeSeconds > 0 时额外校验回调 timestamp 与本机 UTC 时间差，防止重放。
     public static JushuitanMessage Parse(HttpRequest request, string appKey, string appSecret, long maxAgeSeconds) {
+        if (maxAgeSeconds < 0L) {
+            throw new JushuitanException("client.invalidArguments", "maxAgeSeconds 不能为负数", 0, "");
+        }
         if (request == null || !request.IsPost()) {
             throw new JushuitanException("callback.invalidMethod", "消息回调要求 POST 请求", 0, "");
         }
@@ -124,7 +128,7 @@ public static class JushuitanMessageCallback {
         string[] signKeys = new string[cap];
         string[] signVals = new string[cap];
         int signCnt = 0;
-        int signPayloadLen = 0;
+        long signPayloadLen = 0L;
         bool missingEq = false;
         bool hasDuplicate = false;
 
@@ -181,6 +185,9 @@ public static class JushuitanMessageCallback {
             if (hasDuplicate) { continue; }
 
             string v = JushuitanMessageCallback.DecodeFormSlice(body, eq + 1, pairEnd, valSpecial);
+            if (signCnt >= JushuitanMessageCallback.MaxCallbackFields) {
+                throw new JushuitanException("callback.invalidForm", "消息回调表单字段数量超出上限", 0, "");
+            }
             if (signCnt >= cap) {
                 int nextCap = cap * 2;
                 string[] nsk = new string[nextCap];
@@ -191,7 +198,7 @@ public static class JushuitanMessageCallback {
             signKeys[signCnt] = k;
             signVals[signCnt] = v;
             signCnt = signCnt + 1;
-            signPayloadLen = signPayloadLen + k.Length + v.Length;
+            signPayloadLen = signPayloadLen + (long)k.Length + (long)v.Length;
             if (k == JushuitanMessageCallback.AppKeyField) { receivedAppKey = v; }
             else if (k == JushuitanMessageCallback.ActionCodeField) { actionCode = v; }
             else if (k == JushuitanMessageCallback.TimestampField) { timestamp = v; }
@@ -217,7 +224,7 @@ public static class JushuitanMessageCallback {
         JushuitanMessageCallback.EnsurePresent(biz, JushuitanMessageCallback.BizField);
         JushuitanMessageCallback.EnsurePresent(actualSign, JushuitanMessageCallback.SignField);
 
-        if (receivedAppKey != appKey) {
+        if (!JushuitanMessageCallback.FixedEquals(receivedAppKey, appKey)) {
             throw new JushuitanException("callback.invalidAppKey", "消息回调 app_key 与当前应用不一致", 0, "");
         }
         if (version != JushuitanMessageCallback.ProtocolVersion || !JushuitanMessageCallback.IsUtf8(charset)) {
@@ -264,6 +271,9 @@ public static class JushuitanMessageCallback {
 
     public static JushuitanMessage ParseFields(Dictionary<string, string> fields, string appKey,
                                                string appSecret, long maxAgeSeconds) {
+        if (maxAgeSeconds < 0L) {
+            throw new JushuitanException("client.invalidArguments", "maxAgeSeconds 不能为负数", 0, "");
+        }
         if (String.IsNullOrEmpty(appKey) || String.IsNullOrEmpty(appSecret)) {
             throw new JushuitanException("callback.invalidCredentials", "消息回调需要应用 app_key 和 app_secret", 0, "");
         }
@@ -277,7 +287,7 @@ public static class JushuitanMessageCallback {
         string charset = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.CharsetField);
         string biz = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.BizField);
         JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.SignField);
-        if (receivedAppKey != appKey) {
+        if (!JushuitanMessageCallback.FixedEquals(receivedAppKey, appKey)) {
             throw new JushuitanException("callback.invalidAppKey", "消息回调 app_key 与当前应用不一致", 0, "");
         }
         if (version != JushuitanMessageCallback.ProtocolVersion || !JushuitanMessageCallback.IsUtf8(charset)) {
@@ -316,6 +326,16 @@ public static class JushuitanMessageCallback {
 
     public static string FailureResponse() {
         return JushuitanMessageCallback.FailureJson;
+    }
+
+    private static bool FixedEquals(string a, string b) {
+        if (a == null || b == null) { return false; }
+        int diff = a.Length ^ b.Length;
+        int n = a.Length < b.Length ? a.Length : b.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            diff = diff | ((a[i] & 255) ^ (b[i] & 255));
+        }
+        return diff == 0;
     }
 
     private static bool IsBlank(string value) {

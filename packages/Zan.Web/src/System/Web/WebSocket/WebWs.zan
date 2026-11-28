@@ -12,6 +12,7 @@ namespace System.Web;
 // 拉进每一个纯 HTTP 服务。应用调用 <c>WebWs.Upgrade(ctx)</c> 即 opt-in，
 // 升级前路由/权限已生效的语义不变（ctx 的握手/劫持状态经公开成员操作）。
 public class WebWs {
+    private static string originLock = "System.Web.WebWs.originLock";
     // 跨域部署的升级白名单：同源之外还允许发起 WS 握手的 Origin
     // （原样串比较）。应用在装配期经 <see cref="AllowOrigin"/> 登记。
     private static List<string> extraOrigins;
@@ -19,11 +20,13 @@ public class WebWs {
     // 登记一个允许升级的跨域 Origin（如 "https://app.example.com"，
     // 与 CORS allowOrigin 同形）。同源本身始终放行，无需登记。
     public static void AllowOrigin(string origin) {
-        if (origin.Length == 0) { return; }
-        if (WebWs.extraOrigins == null) {
-            WebWs.extraOrigins = new List<string>();
+        if (origin == null || origin.Length == 0) { return; }
+        lock (WebWs.originLock) {
+            if (WebWs.extraOrigins == null) {
+                WebWs.extraOrigins = new List<string>();
+            }
+            WebWs.extraOrigins.Add(origin);
         }
-        WebWs.extraOrigins.Add(origin);
     }
 
     // 极简升级并将连接自动登记到集群枢纽 WsHub（绑定业务 uid）
@@ -37,7 +40,7 @@ public class WebWs {
 
     // pushes.
     public static async WsSession Upgrade(HttpContext ctx) {
-        if (ctx == null || !WsHandshake.Valid(ctx.Request())) { return null; }
+        if (ctx == null || ctx.Hijacked() || ctx.Ended() || !WsHandshake.Valid(ctx.Request())) { return null; }
         if (!WebWs.OriginOk(ctx)) {
             ctx.Status(403, "Forbidden");
             ctx.Text("websocket origin rejected");
@@ -53,7 +56,11 @@ public class WebWs {
         sb.Append("\r\n\r\n");
         if (ctx.Conn() == null && ctx.Tls() == null) { return null; }
         bool ok = await ctx.SendAllTcp(sb.ToString());
-        if (!ok) { return null; }
+        if (!ok) {
+            ctx.Hijack();
+            ctx.CloseHijack();
+            return null;
+        }
         ctx.Hijack();
         ctx.MarkEnded();
         ServerMetrics.Global().StreamOpened();
@@ -80,17 +87,20 @@ public class WebWs {
     // 两样皆缺或无 Origin 的客户端（非浏览器）没有可被借用的跨站页，
     // 放行。白名单命中视同同源。
     public static bool OriginOk(HttpContext ctx) {
+        if (ctx == null) { return false; }
         if (ctx.Header("Sec-Fetch-Site") == "cross-site") { return false; }
         string origin = ctx.Header("Origin");
         if (origin.Length == 0) { return true; }
-        if (Csrf.SameAuthorityForScheme(origin, ctx.Header("Host"), ctx.Tls() != null)) { return true; }
-        if (ctx != null && ctx.App() != null && ctx.App().HasWsOrigin(origin)) {
+        if (Csrf.SameAuthorityForScheme(origin, ctx.Header("Host"), ctx.IsSecure())) { return true; }
+        if (ctx.App() != null && ctx.App().HasWsOrigin(origin)) {
             return true;
         }
-        if (WebWs.extraOrigins != null) {
-            int n = WebWs.extraOrigins.Count;
-            for (int i = 0; i < n; i = i + 1) {
-                if (WebWs.extraOrigins[i] == origin) { return true; }
+        lock (WebWs.originLock) {
+            if (WebWs.extraOrigins != null) {
+                int n = WebWs.extraOrigins.Count;
+                for (int i = 0; i < n; i = i + 1) {
+                    if (WebWs.extraOrigins[i] == origin) { return true; }
+                }
             }
         }
         return false;

@@ -77,7 +77,6 @@ public partial class WebApp : IDisposable {
     private bool reusePort;
 
     private static WebApp active;
-    private static string[] defaultErrorBodies;
 
     private static const string ShareRate = "WEB_RATE";
     private static const string ShareLock = "WEB_LOCK";
@@ -421,12 +420,17 @@ public partial class WebApp : IDisposable {
         while (this.running) {
             nint clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
-                if (await this.RefuseOverCapacity(clientSock)) { continue; }
+                if (!this.TryReserveConnection()) {
+                    Task.Spawn(RejectOverCapacity(clientSock));
+                    continue;
+                }
                 if (this.tls != null) {
                     Task.Spawn(HandleTlsConnection(clientSock));
                 } else {
                     Task.Spawn(HandleConnection(clientSock));
                 }
+            } else if (this.running) {
+                await Task.Delay(50);
             }
         }
         return 0;
@@ -439,10 +443,14 @@ public partial class WebApp : IDisposable {
 
     public void Dispose() {
         this.Stop();
+        if (WebApp.active == this) { WebApp.active = null; }
         if (this.hooks != null) { this.hooks.Clear(); }
         if (this.staticMounts != null) { this.staticMounts.Clear(); }
         if (this.csrfSkips != null) { this.csrfSkips.Clear(); }
         if (this.wsOrigins != null) { this.wsOrigins.Clear(); }
+        if (this.sessions != null) {
+            this.sessions.Clear();
+        }
         if (this.limiter != null) {
             this.limiter.Dispose();
             this.limiter = null;
@@ -470,7 +478,7 @@ public partial class WebApp : IDisposable {
         for (int i = 0; i < 16; i = i + 1) {
             totalReq = totalReq + this.totalRequestsShards[i].Load();
         }
-        o.total_requests = (int)totalReq;
+        o.total_requests = totalReq > 2147483647L ? 2147483647 : (int)totalReq;
         o.active_connections = (int)this.activeConnections.Load();
         o.routes = this.router.Stats();
         return Json.Serialize<WebAppStatusDoc>(o);

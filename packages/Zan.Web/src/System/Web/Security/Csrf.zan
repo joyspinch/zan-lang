@@ -20,20 +20,26 @@ public class Csrf {
     public static string CookieName = "csrf_token";
     public static string HeaderName = "X-CSRF-Token";
     public static string FormName = "_csrf";
+    private static string stateLock = "System.Web.Csrf.stateLock";
     private static List<string> skips;
 
     // 统一配置 CSRF Cookie、请求头与表单字段名；空串保持当前值不变。
     public static void Configure(string cookieName, string headerName, string formName) {
-        if (cookieName != null && cookieName.Length > 0) { Csrf.CookieName = cookieName; }
-        if (headerName != null && headerName.Length > 0) { Csrf.HeaderName = headerName; }
-        if (formName != null && formName.Length > 0) { Csrf.FormName = formName; }
+        lock (Csrf.stateLock) {
+            if (cookieName != null && cookieName.Length > 0) { Csrf.CookieName = cookieName; }
+            if (headerName != null && headerName.Length > 0) { Csrf.HeaderName = headerName; }
+            if (formName != null && formName.Length > 0) { Csrf.FormName = formName; }
+        }
     }
 
     // 登记豁免前缀：路径以其开头即不拦截。用于支付回调、
     // webhook 等自带签名校验、调用方不可能持有 cookie 的路由。
     public static void Skip(string prefix) {
-        if (Csrf.skips == null) { Csrf.skips = new List<string>(); }
-        Csrf.skips.Add(prefix);
+        if (prefix == null || prefix.Length == 0) { return; }
+        lock (Csrf.stateLock) {
+            if (Csrf.skips == null) { Csrf.skips = new List<string>(); }
+            Csrf.skips.Add(prefix);
+        }
     }
 
     // 路径是否命中任一豁免前缀（优先检查上下文绑定的应用级配置，回退全局配置）。
@@ -59,18 +65,22 @@ public class Csrf {
 
     // 路径是否命中任一全局豁免前缀。
     public static bool Skipped(string path) {
-        if (Csrf.skips == null) { return false; }
-        int n = Csrf.skips.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (Csrf.MatchesPrefix(path, Csrf.skips[i])) { return true; }
+        if (path == null) { return false; }
+        lock (Csrf.stateLock) {
+            if (Csrf.skips == null) { return false; }
+            int n = Csrf.skips.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                if (Csrf.MatchesPrefix(path, Csrf.skips[i])) { return true; }
+            }
+            return false;
         }
-        return false;
     }
 
     // Before 钩子本体。返回 false 表示已写好 403 响应，
     // 管线短路。前哨先做 Origin/Sec-Fetch-Site 站点校验（浏览器自动
     // 附带、免客户端配合），double-submit token 是第二道闸。
     public static bool Guard(HttpContext ctx) {
+        if (ctx == null) { return false; }
         bool safe = ctx.Method() == "GET" || ctx.Method() == "HEAD"
             || ctx.Method() == "OPTIONS";
         if (safe) {
@@ -105,6 +115,7 @@ public class Csrf {
     // 常时比较：按较长一方的长度累积异或，长度不等直接计入差异位，
     // 不因首个差异字节提前返回。
     public static bool ConstantTimeEquals(string a, string b) {
+        if (a == null || b == null) { return false; }
         int la = a.Length;
         int lb = b.Length;
         if (la == lb) {
@@ -130,6 +141,7 @@ public class Csrf {
     // 与 Host 不符也拒。两样都缺（老浏览器、非浏览器客户端）放行，
     // 此时 SameSite=Lax 会话 cookie 仍是底线。安全方法一律放行。
     public static bool OriginGuard(HttpContext ctx) {
+        if (ctx == null) { return false; }
         if (ctx.Method() == "GET" || ctx.Method() == "HEAD"
             || ctx.Method() == "OPTIONS") { return true; }
         if (Csrf.OriginCheck(ctx)) { return true; }
@@ -140,13 +152,14 @@ public class Csrf {
 
     // 前哨的纯校验半口：true 放行，false 跨站（应答由钩子写）。
     public static bool OriginCheck(HttpContext ctx) {
+        if (ctx == null) { return false; }
         if (ctx.Method() == "GET" || ctx.Method() == "HEAD"
             || ctx.Method() == "OPTIONS") { return true; }
         string site = ctx.Header("Sec-Fetch-Site");
         if (site == "cross-site") { return false; }
         string origin = ctx.Header("Origin");
         if (origin.Length > 0 && !Csrf.SameAuthorityForScheme(origin,
-            ctx.Header("Host"), ctx.Tls() != null)) { return false; }
+            ctx.Header("Host"), ctx.IsSecure())) { return false; }
         return true;
     }
 
@@ -237,6 +250,7 @@ public class Csrf {
     // 去掉明确的默认端口后缀（https 的 :443 / 明文的 :80）；
     // 其余端口保留参与比较。
     public static string TrimDefaultPort(string auth, bool isHttps) {
+        if (auth == null) { return ""; }
         int n = auth.Length;
         int end = Csrf.TrimDefaultPortEnd(auth, 0, n, isHttps);
         if (end < n) {

@@ -5,6 +5,7 @@ namespace System.Web;
 
 // WebSocket 集群会话枢纽：管理本地长连接、组/用户映射，并驱动跨节点背板 (IWsBackplane)
 public class WsHub {
+    private static string defaultLock = "System.Web.WsHub.defaultLock";
     private static WsHub defaultHub;
     private Dictionary<string, List<WsSession>> userMap;
     private Dictionary<string, List<WsSession>> groupMap;
@@ -28,7 +29,11 @@ public class WsHub {
 
     public static WsHub Default() {
         if (WsHub.defaultHub == null) {
-            WsHub.defaultHub = new WsHub();
+            lock (WsHub.defaultLock) {
+                if (WsHub.defaultHub == null) {
+                    WsHub.defaultHub = new WsHub();
+                }
+            }
         }
         return WsHub.defaultHub;
     }
@@ -163,8 +168,9 @@ public class WsHub {
         this.DeliverUserLocal(uid, message);
 
         // 2. 集群背板广播
-        if (this.backplane != null) {
-            this.backplane.Publish("user", uid, message);
+        IWsBackplane bp = this.backplane;
+        if (bp != null) {
+            bp.Publish("user", uid, message);
         }
     }
 
@@ -175,8 +181,9 @@ public class WsHub {
         this.DeliverGroupLocal(group, message);
 
         // 2. 集群背板广播
-        if (this.backplane != null) {
-            this.backplane.Publish("group", group, message);
+        IWsBackplane bp = this.backplane;
+        if (bp != null) {
+            bp.Publish("group", group, message);
         }
     }
 
@@ -187,23 +194,26 @@ public class WsHub {
         this.DeliverAllLocal(message);
 
         // 2. 集群背板广播
-        if (this.backplane != null) {
-            this.backplane.Publish("broadcast", "", message);
+        IWsBackplane bp = this.backplane;
+        if (bp != null) {
+            bp.Publish("broadcast", "", message);
         }
     }
 
     // 收到来自跨节点背板的消息时（仅向本地会话分发，避免重入广播死循环）
     public void OnBackplaneMessage(string action, string target, string payload) {
+        if (action == null || payload == null) { return; }
         if (action == "user") {
-            this.DeliverUserLocal(target, payload);
+            if (target != null && target.Length > 0) { this.DeliverUserLocal(target, payload); }
         } else if (action == "group") {
-            this.DeliverGroupLocal(target, payload);
+            if (target != null && target.Length > 0) { this.DeliverGroupLocal(target, payload); }
         } else if (action == "broadcast") {
             this.DeliverAllLocal(payload);
         }
     }
 
     private void DeliverUserLocal(string uid, string message) {
+        if (uid == null || uid.Length == 0 || message == null) { return; }
         List<WsSession> targets = null;
         lock (this) {
             List<WsSession> src;
@@ -216,12 +226,16 @@ public class WsHub {
         }
         if (targets != null) {
             for (int i = 0; i < targets.Count; i = i + 1) {
-                targets[i].SendText(message);
+                WsSession s = targets[i];
+                if (s == null) { continue; }
+                if (!s.Open()) { this.Unregister(s); continue; }
+                s.SendText(message);
             }
         }
     }
 
     private void DeliverGroupLocal(string group, string message) {
+        if (group == null || group.Length == 0 || message == null) { return; }
         List<WsSession> targets = null;
         lock (this) {
             List<WsSession> src;
@@ -234,12 +248,16 @@ public class WsHub {
         }
         if (targets != null) {
             for (int i = 0; i < targets.Count; i = i + 1) {
-                targets[i].SendText(message);
+                WsSession s = targets[i];
+                if (s == null) { continue; }
+                if (!s.Open()) { this.Unregister(s); continue; }
+                s.SendText(message);
             }
         }
     }
 
     private void DeliverAllLocal(string message) {
+        if (message == null) { return; }
         List<WsSession> targets = new List<WsSession>();
         lock (this) {
             for (int i = 0; i < this.allSessions.Count; i = i + 1) {
@@ -247,7 +265,10 @@ public class WsHub {
             }
         }
         for (int i = 0; i < targets.Count; i = i + 1) {
-            targets[i].SendText(message);
+            WsSession s = targets[i];
+            if (s == null) { continue; }
+            if (!s.Open()) { this.Unregister(s); continue; }
+            s.SendText(message);
         }
     }
 

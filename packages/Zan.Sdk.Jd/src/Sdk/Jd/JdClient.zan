@@ -27,6 +27,7 @@ public class JdClient {
     bool useTls;
 
     int timeoutMs;
+    bool timeoutCustomized;
     int maxRetries;
     int tzOffsetMinutes;
     ExternalCallPolicy callPolicy;
@@ -40,6 +41,7 @@ public class JdClient {
         this.path = "/routerjson";
         this.useTls = true;
         this.timeoutMs = 30000;
+        this.timeoutCustomized = false;
         this.maxRetries = 3;
         this.tzOffsetMinutes = 480;
         this.callPolicy = null;
@@ -61,6 +63,7 @@ public class JdClient {
         copy.path = this.path;
         copy.useTls = this.useTls;
         copy.timeoutMs = this.timeoutMs;
+        copy.timeoutCustomized = this.timeoutCustomized;
         copy.maxRetries = this.maxRetries;
         copy.tzOffsetMinutes = this.tzOffsetMinutes;
         copy.callPolicy = this.callPolicy;
@@ -68,6 +71,19 @@ public class JdClient {
     }
 
     public JdClient Server(string host, int port, string path, bool useTls) {
+        if (host == null || host.Length == 0 || !JdClient.IsSafeToken(host)) {
+            throw new JdException("client.paramError", "网关 host 无效", "");
+        }
+        if (port < 1 || port > 65535) {
+            throw new JdException("client.paramError", "网关 port 必须在 1..65535 范围内", "");
+        }
+        if (path == null || !path.StartsWith("/") || path.Contains("?") || path.Contains("#")
+            || path.Contains("..") || path.Contains("\\") || !JdClient.IsSafeToken(path)) {
+            throw new JdException("client.paramError", "网关 path 格式无效", "");
+        }
+        if (!useTls && !ExternalTargetPolicy.IsLoopback(host)) {
+            throw new JdException("client.invalidGateway", "非环回地址必须使用 HTTPS 网关", "");
+        }
         this.host = host;
         this.port = port;
         this.path = path;
@@ -77,12 +93,18 @@ public class JdClient {
 
     // 时间戳时区偏移（分钟），默认 480（+0800）。
     public JdClient TimeZoneOffset(int minutes) {
+        if (minutes < -1439 || minutes > 1439) {
+            throw new JdException("client.paramError", "时区偏移超出 [-1439, 1439] 范围", "");
+        }
         this.tzOffsetMinutes = minutes;
         return this;
     }
 
     public JdClient Timeout(int ms) {
-        this.timeoutMs = ms;
+        if (ms > 0) {
+            this.timeoutMs = ms;
+            this.timeoutCustomized = true;
+        }
         return this;
     }
 
@@ -94,6 +116,9 @@ public class JdClient {
     }
 
     public JdClient WithCallPolicy(ExternalCallPolicy policy) {
+        if (policy != null && (policy.MaxRedirects() != 0 || policy.RetryAttempts() != 0)) {
+            throw new JdException("client.invalidPolicy", "京东请求需要关闭重定向和传输层自动重试", "");
+        }
         this.callPolicy = policy;
         return this;
     }
@@ -164,16 +189,67 @@ public class JdClient {
         HttpClient http = new HttpClient(this.host, this.port);
         if (this.useTls) { http.UseTls(); }
         http.SetTimeout(this.timeoutMs);
-        if (this.callPolicy != null) { http.SetCallPolicy(this.callPolicy); }
+        ExternalCallPolicy effectivePolicy;
+        if (this.callPolicy != null) {
+            if (this.callPolicy.MaxRedirects() != 0 || this.callPolicy.RetryAttempts() != 0) {
+                throw new JdException("client.invalidPolicy", "京东请求需要关闭重定向和传输层自动重试", "");
+            }
+            effectivePolicy = this.timeoutCustomized
+                ? JdClient.ClonePolicyWithTimeout(this.callPolicy, this.timeoutMs)
+                : this.callPolicy;
+        } else {
+            effectivePolicy = ExternalCallPolicy.Default();
+            if (ExternalTargetPolicy.IsLoopback(this.host)) {
+                if (!this.useTls) {
+                    effectivePolicy.AllowLocalHttp();
+                } else {
+                    effectivePolicy.AllowLoopback();
+                }
+            }
+            if (this.timeoutCustomized) {
+                effectivePolicy.TotalTimeout(this.timeoutMs);
+            }
+        }
+        http.SetCallPolicy(effectivePolicy);
         return http;
+    }
+
+    private static bool IsSafeToken(string s) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c <= 32 || c == 127) { return false; }
+        }
+        return true;
+    }
+
+    private static ExternalCallPolicy ClonePolicyWithTimeout(ExternalCallPolicy src, int totalMs) {
+        ExternalCallPolicy dst = ExternalCallPolicy.Default()
+            .ConnectTimeout(src.ConnectTimeoutMs())
+            .WriteTimeout(src.WriteTimeoutMs())
+            .ReadTimeout(src.ReadTimeoutMs())
+            .IdleTimeout(src.IdleTimeoutMs())
+            .TotalTimeout(totalMs)
+            .RequestLimit(src.MaxRequestBytes())
+            .ResponseLimit(src.MaxResponseBytes())
+            .ErrorLimit(src.MaxErrorBytes())
+            .StreamLimit(src.MaxStreamBytes())
+            .Redirects(src.MaxRedirects())
+            .RetryAttempts(src.RetryAttempts())
+            .RetryBackoff(src.RetryBackoffMs());
+        if (src.AllowsHttp() && src.AllowsLoopback()) { dst.AllowLocalHttp(); }
+        else if (src.AllowsLoopback()) { dst.AllowLoopback(); }
+        if (src.AllowsPrivate()) { dst.AllowPrivate(); }
+        if (src.IsIdempotent()) { dst.Idempotent(src.IdempotencyKey()); }
+        return dst;
     }
 
     private string BuildBody(JdRequest request) {
         Dictionary<string, string> p = new Dictionary<string, string>();
+        string apiVer = (request.ApiVersion == null || request.ApiVersion.Length == 0) ? "2.0" : request.ApiVersion;
         p.Add(PARAM_JSON, request.ParamJson());
         p.Add(PARAM_METHOD, request.ApiName);
         p.Add(PARAM_APP_KEY, this.appKey);
-        p.Add(PARAM_VERSION, request.ApiVersion);
+        p.Add(PARAM_VERSION, apiVer);
         p.Add(PARAM_TIMESTAMP, this.Timestamp());
         if (this.accessToken.Length > 0) {
             p.Add(PARAM_TOKEN, this.accessToken);
@@ -188,12 +264,12 @@ public class JdClient {
     }
 
     public static string FormatTimestamp(long unixSeconds, int offsetMinutes) {
-        DateTime wall = DateTime.FromUnixSeconds(unixSeconds + offsetMinutes * 60);
+        DateTime wall = DateTime.FromUnixSeconds(unixSeconds + (long)offsetMinutes * 60L);
         string sign = "+";
-        int mins = offsetMinutes;
-        if (mins < 0) { sign = "-"; mins = 0 - mins; }
-        string hh = JdClient.Pad2(mins / 60);
-        string mm = JdClient.Pad2(mins % 60);
+        long mins = (long)offsetMinutes;
+        if (mins < 0L) { sign = "-"; mins = 0L - mins; }
+        string hh = JdClient.Pad2((int)(mins / 60L));
+        string mm = JdClient.Pad2((int)(mins % 60L));
         return wall.ToString() + sign + hh + mm;
     }
 

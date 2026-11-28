@@ -19,6 +19,7 @@ public partial class JushuitanClient {
     private ExternalTarget gatewayOverride;
     private ExternalCallPolicy policy;
     private int timeoutMs;
+    private bool timeoutCustomized;
     private int maxRetries;
     private bool plainHttp;
 
@@ -32,6 +33,7 @@ public partial class JushuitanClient {
         this.appSecret = appSecret;
         this.accessToken = "";
         this.timeoutMs = 30000;
+        this.timeoutCustomized = false;
         this.maxRetries = 2;
         this.plainHttp = false;
         this.WithCallPolicy(policy);
@@ -56,6 +58,7 @@ public partial class JushuitanClient {
         session.gatewayOverride = this.gatewayOverride;
         session.policy = this.policy;
         session.timeoutMs = this.timeoutMs;
+        session.timeoutCustomized = this.timeoutCustomized;
         session.maxRetries = this.maxRetries;
         session.plainHttp = this.plainHttp;
         session.accessToken = token;
@@ -83,7 +86,10 @@ public partial class JushuitanClient {
     }
 
     public JushuitanClient Timeout(int ms) {
-        if (ms > 0) { this.timeoutMs = ms; }
+        if (ms > 0) {
+            this.timeoutMs = ms;
+            this.timeoutCustomized = true;
+        }
         return this;
     }
 
@@ -120,7 +126,7 @@ public partial class JushuitanClient {
     public async JushuitanResponse CallAsync(string gateway, string path, JsonValue biz,
                                              string accessToken, JushuitanResponseMode mode) {
         if ((gateway != JushuitanClient.ProductionGateway && gateway != JushuitanClient.HangzhouGateway)
-            || path == null || !path.StartsWith("/open/") || path.Contains("?") || path.Contains("#")) {
+            || !JushuitanClient.IsSafePath(path) || !path.StartsWith("/open/")) {
             throw new JushuitanException("client.invalidEndpoint", "请使用聚水潭开放平台业务接口路径", 0, "");
         }
         JushuitanClient.RequireValue(accessToken, "access_token");
@@ -152,6 +158,9 @@ public partial class JushuitanClient {
         if (this.policy.MaxRedirects() != 0 || this.policy.RetryAttempts() != 0) {
             throw new JushuitanException("client.invalidPolicy", "聚水潭请求需要关闭重定向和传输层自动重试", 0, "");
         }
+        if (!JushuitanClient.IsSafePath(path)) {
+            throw new JushuitanException("client.invalidEndpoint", "聚水潭请求路径格式无效", 0, "");
+        }
         ExternalTarget target = this.gatewayOverride != null ? this.gatewayOverride : ExternalTarget.Parse(gateway);
         if (target == null || target.Path() != "/" || target.Query() != ""
             || ExternalTarget.Parse(target.Canonical() + path.Substring(1)) == null) {
@@ -161,6 +170,9 @@ public partial class JushuitanClient {
         if (!effectiveTls && (!target.IsLoopback() || !this.policy.AllowsLoopback() || (!this.plainHttp && !this.policy.AllowsHttp()))) {
             throw new JushuitanException("client.invalidGateway", "请提供 HTTPS 网关地址，或使用 PlainHttpMode 并放行环回策略", 0, "");
         }
+        ExternalCallPolicy effectivePolicy = this.timeoutCustomized
+            ? JushuitanClient.ClonePolicyWithTimeout(this.policy, this.timeoutMs)
+            : this.policy;
 
         int attempt = 0;
         while (true) {
@@ -178,7 +190,7 @@ public partial class JushuitanClient {
                 using (HttpClient http = new HttpClient(target.Host(), target.Port())) {
                     if (target.IsTls() && !this.plainHttp) { http.UseTls(); }
                     http.SetTimeout(this.timeoutMs);
-                    http.SetCallPolicy(this.policy);
+                    http.SetCallPolicy(effectivePolicy);
                     http.SetHeader("Content-Type", JushuitanClient.FormContentType);
                     HttpResponse response;
                     try {
@@ -204,6 +216,39 @@ public partial class JushuitanClient {
             attempt = attempt + 1;
             await Task.Delay(attempt * 500);
         }
+    }
+
+    private static bool IsSafePath(string path) {
+        if (path == null || path.Length == 0 || !path.StartsWith("/")
+            || path.Contains("?") || path.Contains("#") || path.Contains("..") || path.Contains("\\")) {
+            return false;
+        }
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int c = path[i] & 255;
+            if (c <= 32 || c == 127) { return false; }
+        }
+        return true;
+    }
+
+    private static ExternalCallPolicy ClonePolicyWithTimeout(ExternalCallPolicy src, int totalMs) {
+        ExternalCallPolicy dst = ExternalCallPolicy.Default()
+            .ConnectTimeout(src.ConnectTimeoutMs())
+            .WriteTimeout(src.WriteTimeoutMs())
+            .ReadTimeout(src.ReadTimeoutMs())
+            .IdleTimeout(src.IdleTimeoutMs())
+            .TotalTimeout(totalMs)
+            .RequestLimit(src.MaxRequestBytes())
+            .ResponseLimit(src.MaxResponseBytes())
+            .ErrorLimit(src.MaxErrorBytes())
+            .StreamLimit(src.MaxStreamBytes())
+            .Redirects(src.MaxRedirects())
+            .RetryAttempts(src.RetryAttempts())
+            .RetryBackoff(src.RetryBackoffMs());
+        if (src.AllowsHttp() && src.AllowsLoopback()) { dst.AllowLocalHttp(); }
+        else if (src.AllowsLoopback()) { dst.AllowLoopback(); }
+        if (src.AllowsPrivate()) { dst.AllowPrivate(); }
+        if (src.IsIdempotent()) { dst.Idempotent(src.IdempotencyKey()); }
+        return dst;
     }
 
     private static void RequireValue(string value, string field) {

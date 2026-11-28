@@ -6,6 +6,8 @@ namespace System.Web;
 // (for {{#each}} blocks).
 // 具名行集合：一个 {{#each}} 列表的数据源。
 public class View {
+    private static const int MaxTemplateDepth = 64;
+    private static const int MaxDirDepth = 32;
     private Dictionary<string, List<VNode>> compiled;  // name -> parsed template
     private string dir;
     private bool devReload;  // dev only: re-read templates on each render
@@ -23,7 +25,7 @@ public class View {
     // 递归加载视图目录下所有 .html 模板至内存字典中缓存。
     public static View LoadDir(string dir) {
         View v = new View();
-        v.dir = dir;
+        v.dir = dir != null ? dir : "";
         v.LoadAll();
         return v;
     }
@@ -32,20 +34,29 @@ public class View {
     // 先构建新字典再原子切换，避免并发渲染读到半加载字典。
     public void LoadAll() {
         Dictionary<string, List<VNode>> next = new Dictionary<string, List<VNode>>();
-        this.LoadRecInto(next, this.dir, "");
+        this.LoadRecInto(next, this.dir, "", 0);
         lock (this) {
             this.compiled = next;
         }
     }
 
+    // Copy-on-write 替换整个字典，保证并发 Render/RenderPage 在锁外读快照绝不产生字典读写竞争。
     public void Put(string key, string body) {
+        if (key == null) { return; }
         List<VNode> nodes = View.Compile(body);
         lock (this) {
-            if (this.compiled.ContainsKey(key)) {
-                this.compiled[key] = nodes;
-            } else {
-                this.compiled.Add(key, nodes);
+            Dictionary<string, List<VNode>> next = new Dictionary<string, List<VNode>>();
+            List<string> existingKeys = this.compiled.Keys;
+            for (int i = 0; i < existingKeys.Count; i = i + 1) {
+                string k = existingKeys[i];
+                next.Add(k, this.compiled[k]);
             }
+            if (next.ContainsKey(key)) {
+                next[key] = nodes;
+            } else {
+                next.Add(key, nodes);
+            }
+            this.compiled = next;
         }
     }
 
@@ -58,8 +69,8 @@ public class View {
         }
     }
 
-    private void LoadRecInto(Dictionary<string, List<VNode>> map, string d, string prefix) {
-        if (!Directory.Exists(d)) { return; }
+    private void LoadRecInto(Dictionary<string, List<VNode>> map, string d, string prefix, int depth) {
+        if (depth >= View.MaxDirDepth || d == null || d.Length == 0 || !Directory.Exists(d)) { return; }
         List<string> files = Directory.GetFileNames(d);
         for (int i = 0; i < files.Count; i = i + 1) {
             string fn = files[i];
@@ -74,9 +85,9 @@ public class View {
         for (int j = 0; j < dirs.Count; j = j + 1) {
             string sub = dirs[j];
             if (sub == "View") {
-                this.LoadRecInto(map, d + "/" + sub, prefix);
+                this.LoadRecInto(map, d + "/" + sub, prefix, depth + 1);
             } else {
-                this.LoadRecInto(map, d + "/" + sub, prefix + sub + ".");
+                this.LoadRecInto(map, d + "/" + sub, prefix + sub + ".", depth + 1);
             }
         }
     }
@@ -135,17 +146,23 @@ public class View {
         int[] state = new int[2];
         state[0] = 0;
         state[1] = 0;
-        View.CompileFlat(tpl, tpl.Length, state, 0, ops, argA, argB, keys);
+        View.CompileFlat(tpl, tpl.Length, state, 0, ops, argA, argB, keys, 0);
         StringBuilder sb = new StringBuilder(tpl.Length + 128);
         StrMap vars = data != null ? data.Vars() : null;
-        View.ExecFlat(tpl, (nint)tpl, ops, argA, argB, keys, 0, ops.Count, data, vars, row, sb);
+        View.ExecFlat(tpl, (nint)tpl, ops, argA, argB, keys, 0, ops.Count, data, vars, row, sb, 0);
         return sb.ToString();
     }
 
     // 扁平指令集：0=Lit(a=start,b=len), 1=EscVar(key), 2=RawVar(key),
     // 3=If(key, a=elsePc or endPc, b=endPc), 4=Each(key, a=endPc), 5=ContentSlot。
     private static void CompileFlat(string tpl, int n, int[] state, int mode,
-                                    List<int> ops, List<int> argA, List<int> argB, List<string> keys) {
+                                    List<int> ops, List<int> argA, List<int> argB, List<string> keys,
+                                    int depth) {
+        if (depth >= View.MaxTemplateDepth) {
+            state[0] = n;
+            state[1] = 0;
+            return;
+        }
         int i = state[0];
         while (i < n) {
             int open = tpl.IndexOf("{{", i);
@@ -209,7 +226,7 @@ public class View {
                 int ifPc = ops.Count;
                 ops.Add(3); argA.Add(0); argB.Add(0); keys.Add(View.TrimSlice(tpl, ts + 4, te));
                 state[0] = close2 + 2;
-                View.CompileFlat(tpl, n, state, 1, ops, argA, argB, keys);
+                View.CompileFlat(tpl, n, state, 1, ops, argA, argB, keys, depth + 1);
                 if (state[1] == 0) {
                     while (ops.Count > ifPc) {
                         ops.RemoveAt(ops.Count - 1);
@@ -221,7 +238,7 @@ public class View {
                 }
                 int elsePc = ops.Count;
                 if (state[1] == 1) {
-                    View.CompileFlat(tpl, n, state, 2, ops, argA, argB, keys);
+                    View.CompileFlat(tpl, n, state, 2, ops, argA, argB, keys, depth + 1);
                     if (state[1] != 2) {
                         while (ops.Count > ifPc) {
                             ops.RemoveAt(ops.Count - 1);
@@ -241,7 +258,7 @@ public class View {
                 int eachPc = ops.Count;
                 ops.Add(4); argA.Add(0); argB.Add(0); keys.Add(View.TrimSlice(tpl, ts + 6, te));
                 state[0] = close2 + 2;
-                View.CompileFlat(tpl, n, state, 3, ops, argA, argB, keys);
+                View.CompileFlat(tpl, n, state, 3, ops, argA, argB, keys, depth + 1);
                 if (state[1] != 3) {
                     while (ops.Count > eachPc) {
                         ops.RemoveAt(ops.Count - 1);
@@ -272,7 +289,8 @@ public class View {
     private static void ExecFlat(string tpl, nint tp,
                                  List<int> ops, List<int> argA, List<int> argB, List<string> keys,
                                  int pc, int endPc, ViewData data, StrMap vars, StrMap row,
-                                 StringBuilder sb) {
+                                 StringBuilder sb, int depth) {
+        if (depth >= View.MaxTemplateDepth) { return; }
         while (pc < endPc) {
             int op = ops[pc];
             if (op == 0) {
@@ -291,9 +309,9 @@ public class View {
                 int nextPc = argB[pc];
                 if (vlen > 0 && !(vlen == 1 && (val[0] & 255) == 48)
                     && !(vlen == 5 && val == "false")) {
-                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, elsePc, data, vars, row, sb);
+                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, elsePc, data, vars, row, sb, depth + 1);
                 } else if (elsePc < nextPc) {
-                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, elsePc, nextPc, data, vars, row, sb);
+                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, elsePc, nextPc, data, vars, row, sb, depth + 1);
                 }
                 pc = nextPc;
             } else if (op == 4) {
@@ -302,7 +320,7 @@ public class View {
                 if (rows != null) {
                     int rcount = rows.Count;
                     for (int r = 0; r < rcount; r = r + 1) {
-                        View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, nextPc, data, vars, rows[r], sb);
+                        View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, nextPc, data, vars, rows[r], sb, depth + 1);
                     }
                 }
                 pc = nextPc;
@@ -327,8 +345,13 @@ public class View {
     // 单遍 O(N) 区间递归下降编译：彻底消除 FindTag/FindElse 的 O(N^2) 尾部重扫与嵌套 Substring 拷贝。
     // state[0] = 当前游标，state[1] = 停止原因（0=EOF, 1={{else}}, 2={{/if}}, 3={{/each}}）。
     // mode: 0=顶层, 1=#if 真分支, 2=#if 假分支, 3=#each 循环体。
-    private static List<VNode> CompileBlock(string tpl, int n, int[] state, int mode) {
+    private static List<VNode> CompileBlock(string tpl, int n, int[] state, int mode, int depth) {
         List<VNode> nodes = new List<VNode>();
+        if (depth >= View.MaxTemplateDepth) {
+            state[0] = n;
+            state[1] = 0;
+            return nodes;
+        }
         int i = state[0];
         while (i < n) {
             int open = tpl.IndexOf("{{", i);
@@ -393,14 +416,14 @@ public class View {
                 && (tpl[ts + 2] & 255) == 102 && (tpl[ts + 3] & 255) == 32) {
                 string condName = View.TrimSlice(tpl, ts + 4, te);
                 state[0] = close2 + 2;
-                List<VNode> thenBody = View.CompileBlock(tpl, n, state, 1);
+                List<VNode> thenBody = View.CompileBlock(tpl, n, state, 1, depth + 1);
                 if (state[1] == 0) {
                     return nodes;
                 }
                 VNode node = new VNode(VNodeKind.If, condName);
                 node.SetBody(thenBody);
                 if (state[1] == 1) {
-                    List<VNode> elseBody = View.CompileBlock(tpl, n, state, 2);
+                    List<VNode> elseBody = View.CompileBlock(tpl, n, state, 2, depth + 1);
                     if (state[1] != 2) {
                         return nodes;
                     }
@@ -413,7 +436,7 @@ public class View {
                 && (tpl[ts + 4] & 255) == 104 && (tpl[ts + 5] & 255) == 32) {
                 string listName = View.TrimSlice(tpl, ts + 6, te);
                 state[0] = close2 + 2;
-                List<VNode> eachBody = View.CompileBlock(tpl, n, state, 3);
+                List<VNode> eachBody = View.CompileBlock(tpl, n, state, 3, depth + 1);
                 if (state[1] != 3) {
                     return nodes;
                 }
@@ -442,17 +465,18 @@ public class View {
         int[] state = new int[2];
         state[0] = 0;
         state[1] = 0;
-        return View.CompileBlock(tpl, tpl.Length, state, 0);
+        return View.CompileBlock(tpl, tpl.Length, state, 0, 0);
     }
 
     private static void Emit(List<VNode> nodes, ViewData data, StrMap row,
                              List<VNode> content, StringBuilder sb) {
         StrMap vars = data != null ? data.Vars() : null;
-        View.EmitFast(nodes, data, vars, row, content, sb);
+        View.EmitFast(nodes, data, vars, row, content, sb, 0);
     }
 
     private static void EmitFast(List<VNode> nodes, ViewData data, StrMap vars, StrMap row,
-                                 List<VNode> content, StringBuilder sb) {
+                                 List<VNode> content, StringBuilder sb, int depth) {
+        if (nodes == null || depth >= View.MaxTemplateDepth) { return; }
         int count = nodes.Count;
         for (int i = 0; i < count; i = i + 1) {
             VNode nd = nodes[i];
@@ -468,9 +492,9 @@ public class View {
                 int vlen = val.Length;
                 if (vlen > 0 && !(vlen == 1 && (val[0] & 255) == 48)
                     && !(vlen == 5 && val == "false")) {
-                    View.EmitFast(nd.Body(), data, vars, row, content, sb);
+                    View.EmitFast(nd.Body(), data, vars, row, content, sb, depth + 1);
                 } else if (nd.ElseBody() != null) {
-                    View.EmitFast(nd.ElseBody(), data, vars, row, content, sb);
+                    View.EmitFast(nd.ElseBody(), data, vars, row, content, sb, depth + 1);
                 }
             } else if (kind == VNodeKind.Each) {
                 List<StrMap> rows = null;
@@ -479,14 +503,14 @@ public class View {
                     List<VNode> body = nd.Body();
                     int rcount = rows.Count;
                     for (int r = 0; r < rcount; r = r + 1) {
-                        View.EmitFast(body, data, vars, rows[r], content, sb);
+                        View.EmitFast(body, data, vars, rows[r], content, sb, depth + 1);
                     }
                 }
             } else {
                 /* {{content}} 双语义（Bug#2）：layout 填洞优先；否则单次探测解析同名变量；
                    都不满足才回落字面量占位。 */
                 if (content != null) {
-                    View.EmitFast(content, data, vars, row, null, sb);
+                    View.EmitFast(content, data, vars, row, null, sb, depth + 1);
                 } else {
                     string cval = "";
                     if (View.TryLookupFast("content", vars, row, out cval)) {

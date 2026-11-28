@@ -23,43 +23,55 @@ public partial class WebApp {
         }
     }
 
-    private async bool RefuseOverCapacity(nint clientSock) {
+    private bool TryReserveConnection() {
         long live = this.activeConnections.Increment();
         if (this.maxConnections <= 0 || live <= (long)this.maxConnections) {
-            return false;
-        }
-        long _back = this.activeConnections.Decrement();
-        if (this.IsHttps()) {
-            Socket.Close(clientSock);
             return true;
         }
+        long _back = this.activeConnections.Decrement();
+        return false;
+    }
+
+    private async void RejectOverCapacity(nint clientSock) {
+        if (this.IsHttps()) {
+            Socket.Close(clientSock);
+            return;
+        }
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, 2000);
         TcpClient c = TcpClient.FromSocket(clientSock);
         try {
             int _s = await c.SendAsync(WebApp.SimpleResponse(503,
                 "Service Unavailable", "server is at capacity"));
+        } catch (Exception _ignored) {
         } finally {
+            HttpDeadline.Disarm(watch);
             c.Close();
         }
+    }
+
+    private async bool RefuseOverCapacity(nint clientSock) {
+        if (this.TryReserveConnection()) { return false; }
+        await this.RejectOverCapacity(clientSock);
         return true;
     }
 
     public async void HandleTlsConnection(nint clientSock) {
+        TlsStream stream = null;
+        HttpDeadlineToken watch = null;
+        HttpFramer framer = null;
         try {
             Socket.SetNoDelay(clientSock);
-            TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
+            stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
             if (stream == null) { return; }
-            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-            HttpFramer framer = HttpFramerTls.Create(stream);
-            try {
-                Http1Writer writer = HttpFramerTls.CreateWriter(stream);
-                string remoteIp = Socket.RemoteIp(clientSock);
-                await this.ServeHttp1(framer, writer, remoteIp, watch, null, stream);
-            } finally {
-                HttpDeadline.Disarm(watch);
-                framer.Dispose();
-                stream.Close();
-            }
+            watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            framer = HttpFramerTls.Create(stream);
+            Http1Writer writer = HttpFramerTls.CreateWriter(stream);
+            string remoteIp = Socket.RemoteIp(clientSock);
+            await this.ServeHttp1(framer, writer, remoteIp, watch, null, stream);
         } finally {
+            if (watch != null) { HttpDeadline.Disarm(watch); }
+            if (framer != null) { framer.Dispose(); }
+            if (stream != null) { stream.Close(); }
             Socket.Close(clientSock);
             long _live = this.activeConnections.Decrement();
         }
@@ -79,8 +91,9 @@ public partial class WebApp {
         }
         bool resources = trace != null && this.profileRequestResources
             && trace.BeginResources(this.profileRequestExecution, this.profileRequestStages);
+        HttpContext ctx = null;
         try {
-            HttpContext ctx = new HttpContext(req, remoteIp);
+            ctx = new HttpContext(req, remoteIp);
             if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
                 ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
             }
@@ -94,7 +107,7 @@ public partial class WebApp {
             }
             if (admitted && req.bodyLength > 0) {
                 int formStage = trace != null ? trace.Begin("parse_form") : -1;
-                if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
+                if (HttpContext.MediaTypeMatches(req.contentType, "multipart/form-data")) {
                     HttpContext.ParseMultipartFields(req, ctx);
                 } else {
                     HttpContext.ParseFormBody(req, ctx);
@@ -119,31 +132,33 @@ public partial class WebApp {
             } else if (ctx.ResponseBody() != null) {
                 resp.body = ctx.ResponseBody();
             }
-            ctx.ReleaseResponseBuf();
             if (trace != null) { trace.End(responseStage); }
             Worker.BumpSent();
             return resp;
         } finally {
+            if (ctx != null) {
+                ctx.CleanupUpload();
+                ctx.ReleaseResponseBuf();
+            }
             if (resources) { trace.EndResources(); }
         }
     }
 
     public async void HandleConnection(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
+        HttpFramer framer = null;
+        HttpDeadlineToken watch = null;
         try {
             client.EnsureNonBlocking();
             Socket.SetNoDelay(clientSock);
-            HttpFramer framer = HttpFramer.Create(clientSock);
-            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-            try {
-                Http1Writer writer = new Http1Writer(client.SendViewAsync, 0, clientSock);
-                string remoteIp = Socket.RemoteIp(clientSock);
-                await this.ServeHttp1(framer, writer, remoteIp, watch, client, null);
-            } finally {
-                HttpDeadline.Disarm(watch);
-                framer.Dispose();
-            }
+            framer = HttpFramer.Create(clientSock);
+            watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            Http1Writer writer = new Http1Writer(client.SendViewAsync, 0, clientSock);
+            string remoteIp = Socket.RemoteIp(clientSock);
+            await this.ServeHttp1(framer, writer, remoteIp, watch, client, null);
         } finally {
+            if (watch != null) { HttpDeadline.Disarm(watch); }
+            if (framer != null) { framer.Dispose(); }
             client.Close();
             long _live = this.activeConnections.Decrement();
         }
@@ -252,7 +267,7 @@ public partial class WebApp {
                 }
 
                 try {
-                    keepAlive = await this.ServeHttp1Request(framer, writer, request, ctx, trace);
+                    keepAlive = await this.ServeHttp1Request(framer, writer, request, ctx, trace, watch);
                 } finally {
                     if (trace != null) {
                         if (resources) { trace.EndResources(); }
@@ -311,7 +326,7 @@ public partial class WebApp {
     }
 
     private async bool ServeHttp1Request(HttpFramer framer, Http1Writer writer, HttpRequest request,
-                                         HttpContext ctx, RequestTrace trace) {
+                                         HttpContext ctx, RequestTrace trace, HttpDeadlineToken watch) {
         bool keepAlive = request.keepAlive;
         string outcome = "aborted";
         try {
@@ -324,8 +339,9 @@ public partial class WebApp {
                 Worker.BumpStat();
                 ctx.BuildResponseDirect(false);
                 bool _gateIgn;
-                if (!this.TryDispatchSync(ctx, route, false, false, true, out _gateIgn)) {
-                    await this.Dispatch(ctx, route, false, false, true);
+                bool _syncIgn;
+                if (!this.TryDispatchSync(ctx, route, false, false, true, out _gateIgn, out _syncIgn)) {
+                    await this.Dispatch(ctx, route, false, false, true, _syncIgn);
                 }
                 outcome = "rejected";
                 StringView rejWire = ctx.ResponseWireView();
@@ -356,7 +372,7 @@ public partial class WebApp {
                     return false;
                 }
                 gatePassed = true;
-                okBody = await this.ReceiveStreamUpload(framer, writer, request, ctx, trace);
+                okBody = await this.ReceiveStreamUpload(framer, writer, request, ctx, trace, watch);
                 if (!okBody) { outcome = "rejected"; return false; }
             } else {
                 int bodyErrStatus;
@@ -369,8 +385,9 @@ public partial class WebApp {
 
             Worker.BumpStat();
             bool gateAlreadyPassed;
-            if (!this.TryDispatchSync(ctx, route, keepAlive, gatePassed, false, out gateAlreadyPassed)) {
-                await this.Dispatch(ctx, route, keepAlive, gateAlreadyPassed, false);
+            bool syncHandlerTried;
+            if (!this.TryDispatchSync(ctx, route, keepAlive, gatePassed, false, out gateAlreadyPassed, out syncHandlerTried)) {
+                await this.Dispatch(ctx, route, keepAlive, gateAlreadyPassed, false, syncHandlerTried);
             }
             if (ctx.MetricsExcluded()) { outcome = "stream_handled"; return false; }
 
@@ -420,14 +437,16 @@ public partial class WebApp {
     }
 
     private async bool ReceiveStreamUpload(HttpFramer framer, Http1Writer writer,
-                                           HttpRequest request, HttpContext ctx, RequestTrace trace) {
+                                           HttpRequest request, HttpContext ctx, RequestTrace trace,
+                                           HttpDeadlineToken watch) {
         if (request.contentLength > this.maxUploadBytes) {
             ctx.Status(413, "Payload Too Large");
             string _r = await this.SendSimpleProfiled(writer, trace, 413, "Payload Too Large", "upload exceeds limit");
             return false;
         }
         int uploadStage = trace != null ? trace.Begin("spool_upload") : -1;
-        string tmp = await HttpUploadStreamer.StreamToFile(framer, request, this.uploadDir, this.uploadSeq);
+        string tmp = await HttpUploadStreamer.StreamToFile(framer, request, this.uploadDir, this.uploadSeq,
+            watch, this.requestTimeoutMs);
         if (trace != null) { trace.End(uploadStage); }
         if (tmp.Length == 0) {
             if (trace != null) { trace.Fail(uploadStage, "upload_failed"); }
@@ -464,7 +483,7 @@ public partial class WebApp {
         framer.Consume(framer.RequestBytes());
         if (request.bodyLength > 0) {
             int formStage = trace != null ? trace.Begin("parse_form") : -1;
-            if (HttpContext.StartsWith(request.contentType, "multipart/form-data")) {
+            if (HttpContext.MediaTypeMatches(request.contentType, "multipart/form-data")) {
                 HttpContext.ParseMultipartFields(request, ctx);
             } else {
                 HttpContext.ParseFormBody(request, ctx);

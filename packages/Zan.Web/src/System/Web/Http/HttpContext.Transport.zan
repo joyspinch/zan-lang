@@ -23,10 +23,60 @@ public partial class HttpContext {
     public void MarkTransportSecure() { this.transportSecure = true; }
     public bool IsSecure() {
         if (this.tlsStream != null || this.transportSecure) { return true; }
+        if (this.request == null || this.request.parseStatus != 0) { return false; }
         if (this.app != null && this.app.IsTrustedProxy(this.RemoteIp())) {
-            return this.Header("X-Forwarded-Proto").ToLower() == "https";
+            return HttpContext.SingleForwardedProtoIsHttps(this.request.rawHeaders);
         }
         return false;
+    }
+
+    private static bool SingleForwardedProtoIsHttps(string rawHeaders) {
+        if (rawHeaders == null || rawHeaders.Length == 0) { return false; }
+        int n = rawHeaders.Length;
+        int pos = 0;
+        bool matched = false;
+        int count = 0;
+        while (pos < n) {
+            int lineEnd = pos;
+            while (lineEnd < n && (rawHeaders[lineEnd] & 255) != 10) { lineEnd = lineEnd + 1; }
+            int stop = lineEnd;
+            if (stop > pos && (rawHeaders[stop - 1] & 255) == 13) { stop = stop - 1; }
+            if (stop > pos) {
+                int first = rawHeaders[pos] & 255;
+                if (first == 32 || first == 9) { return false; }  // obs-fold rejected
+                int colon = pos;
+                while (colon < stop && (rawHeaders[colon] & 255) != 58) { colon = colon + 1; }
+                if (colon < stop) {
+                    int nameLen = colon - pos;
+                    if (nameLen == 17 && HttpContext.AsciiSliceEq(rawHeaders, pos, 17, "x-forwarded-proto")) {
+                        count = count + 1;
+                        if (count > 1) { return false; }
+                        int vs = colon + 1;
+                        while (vs < stop && ((rawHeaders[vs] & 255) == 32 || (rawHeaders[vs] & 255) == 9)) {
+                            vs = vs + 1;
+                        }
+                        int ve = stop;
+                        while (ve > vs && ((rawHeaders[ve - 1] & 255) == 32 || (rawHeaders[ve - 1] & 255) == 9)) {
+                            ve = ve - 1;
+                        }
+                        matched = (ve - vs == 5)
+                            && HttpContext.AsciiSliceEq(rawHeaders, vs, 5, "https");
+                    }
+                }
+            }
+            pos = lineEnd + 1;
+        }
+        return count == 1 && matched;
+    }
+
+    private static bool AsciiSliceEq(string s, int offset, int len, string lowerTarget) {
+        if (len != lowerTarget.Length || offset + len > s.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[offset + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lowerTarget[i] & 255)) { return false; }
+        }
+        return true;
     }
 
     public nint ClientSock() {

@@ -14,10 +14,12 @@ public class HttpFormParser {
         HttpFormParser.ParsePairs(body, form);
     }
 
+    private static const int MaxMultipartParts = 1024;
+
     // 解析请求体中的表单内容（支持 urlencoded 与 multipart/form-data）。
     public static void ParseFormBody(HttpRequest req, HttpContext ctx) {
         if (req == null || ctx == null) { return; }
-        if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
+        if (HttpContext.MediaTypeMatches(req.contentType, "application/x-www-form-urlencoded")) {
             StrMap form = ctx.EnsureForm();
             if (req.body.Length > 0) {
                 HttpFormParser.ParsePairs(req.body, form);
@@ -32,20 +34,56 @@ public class HttpFormParser {
         HttpFormParser.ParseMultipartInto(req.contentType, req.body, form);
     }
 
+    private static int FindBoundaryParam(string contentType) {
+        int ctLen = contentType.Length;
+        int from = 0;
+        while (from < ctLen) {
+            int idx = HttpFormParser.FindNoCaseFrom(contentType, "boundary=", from);
+            if (idx < 0) { return -1; }
+            if (idx > 0) {
+                int prev = contentType[idx - 1] & 255;
+                if (prev == 59 || prev == 32 || prev == 9) { return idx; }
+            }
+            from = idx + 1;
+        }
+        return -1;
+    }
+
+    private static bool IsBoundaryLineAnchored(string body, int pos) {
+        if (pos == 0) { return true; }
+        return (body[pos - 1] & 255) == 10;
+    }
+
+    private static int FindNextAnchoredBoundary(string body, string delim, int from) {
+        int p = from;
+        int n = body.Length;
+        while (p <= n) {
+            int hit = body.IndexOf(delim, p);
+            if (hit < 0) { return -1; }
+            if (HttpFormParser.IsBoundaryLineAnchored(body, hit)) { return hit; }
+            p = hit + 1;
+        }
+        return -1;
+    }
+
     // 将 multipart 文本字段解析进指定 StrMap。
     public static void ParseMultipartInto(string contentType, string body, StrMap form) {
         if (contentType == null || body == null || form == null) { return; }
-        int bIdx = HttpFormParser.FindNoCaseFrom(contentType, "boundary=", 0);
+        int bIdx = HttpFormParser.FindBoundaryParam(contentType);
         if (bIdx < 0) { return; }
         int bs = bIdx + 9;
         int ctLen = contentType.Length;
-        int be = NativeMemory.Find((nint)contentType, bs, 59, ctLen - bs);
-        if (be < 0) { be = ctLen; }
-        // boundary 参数可带引号，切片原地去引号并校验，避免中间 raw Substring。
-        if (be - bs >= 2 && (contentType[bs] & 255) == 34
-            && (contentType[be - 1] & 255) == 34) {
+        int be;
+        if (bs < ctLen && (contentType[bs] & 255) == 34) {
             bs = bs + 1;
-            be = be - 1;
+            be = NativeMemory.Find((nint)contentType, bs, 34, ctLen - bs);
+            if (be < 0) { return; }
+        } else {
+            be = NativeMemory.Find((nint)contentType, bs, 59, ctLen - bs);
+            if (be < 0) { be = ctLen; }
+            while (be > bs && ((contentType[be - 1] & 255) == 32 || (contentType[be - 1] & 255) == 9)) {
+                be = be - 1;
+            }
         }
         int rlen = be - bs;
         if (rlen <= 0 || rlen > 70) { return; }
@@ -69,8 +107,9 @@ public class HttpFormParser {
         int n = body.Length;
         int dlen = rlen + 2;
         nint bp = n > 0 ? (nint)body : 0;
-        int pos = body.IndexOf(delim, 0);
-        while (pos >= 0) {
+        int pos = HttpFormParser.FindNextAnchoredBoundary(body, delim, 0);
+        int parts = 0;
+        while (pos >= 0 && parts < HttpFormParser.MaxMultipartParts) {
             int after = pos + dlen;
             if (after + 1 < n && (body[after] & 255) == 45
                 && (body[after + 1] & 255) == 45) {
@@ -84,9 +123,10 @@ public class HttpFormParser {
             }
             int hb = body.IndexOf("\r\n\r\n", after);
             if (hb < 0 || hb + 4 > n) { break; }
+            parts = parts + 1;
             int vStart = hb + 4;
             string name = HttpFormParser.DispositionNameSlice(body, bp, after, vStart);
-            int next = body.IndexOf(delim, vStart);
+            int next = HttpFormParser.FindNextAnchoredBoundary(body, delim, vStart);
             if (name.Length > 0 && next > vStart) {
                 int vEnd = next;
                 if (vEnd > vStart && (body[vEnd - 1] & 255) == 10) { vEnd = vEnd - 1; }
@@ -114,19 +154,57 @@ public class HttpFormParser {
         return a3 == c3;
     }
 
-    // 锚定 '=' 单遍扫描头部切片：彻底消除 "Content-Disposition: form-data" 上的 'f'/'n' 误命中。
+    private static bool IsParamBoundary(int c) {
+        return c == 59 || c == 32 || c == 9;
+    }
+
+    // 仅在 Content-Disposition 行内解析 name 参数，跳过 filename= 与 filename*= 文件段。
     private static string DispositionNameSlice(string s, nint sp, int start, int end) {
+        int dispStart = start;
+        int dispEnd = end;
+        int line = start;
+        bool hasColon = false;
+        bool foundDisp = false;
+        while (line < end) {
+            int nl = NativeMemory.Find(sp, line, 10, end - line);
+            int lEnd = nl < 0 ? end : nl;
+            if (lEnd > line && (s[lEnd - 1] & 255) == 13) { lEnd = lEnd - 1; }
+            int colon = NativeMemory.Find(sp, line, 58, lEnd - line);
+            if (colon >= 0) {
+                hasColon = true;
+                if (colon - line == 19
+                    && HttpFormParser.FindNoCaseRange(s, line, colon, "content-disposition") == line) {
+                    dispStart = colon + 1;
+                    dispEnd = lEnd;
+                    foundDisp = true;
+                    break;
+                }
+            }
+            if (nl < 0) { break; }
+            line = nl + 1;
+        }
+        if (hasColon && !foundDisp) { return ""; }
+
         int firstNameVal = -1;
-        int p = start;
-        while (p < end) {
-            int eq = NativeMemory.Find(sp, p, 61, end - p);  // '='
+        int p = dispStart;
+        while (p < dispEnd) {
+            int eq = NativeMemory.Find(sp, p, 61, dispEnd - p);  // '='
             if (eq < 0) { break; }
-            if (eq >= start + 4 && HttpFormParser.MatchLower4(s, eq - 4, 110, 97, 109, 101)) {
+            // RFC 5987 filename*= 检测
+            if (eq >= dispStart + 9 && (s[eq - 1] & 255) == 42
+                && HttpFormParser.MatchLower4(s, eq - 9, 102, 105, 108, 101)
+                && HttpFormParser.MatchLower4(s, eq - 5, 110, 97, 109, 101)
+                && (eq - 9 == dispStart || HttpFormParser.IsParamBoundary(s[eq - 10] & 255))) {
+                return "";
+            }
+            if (eq >= dispStart + 4 && HttpFormParser.MatchLower4(s, eq - 4, 110, 97, 109, 101)) {
                 // "...name="：检查前面是否 "file"（即 "filename="）
-                if (eq >= start + 8 && HttpFormParser.MatchLower4(s, eq - 8, 102, 105, 108, 101)) {
+                if (eq >= dispStart + 8 && HttpFormParser.MatchLower4(s, eq - 8, 102, 105, 108, 101)
+                    && (eq - 8 == dispStart || HttpFormParser.IsParamBoundary(s[eq - 9] & 255))) {
                     return "";
                 }
-                if (firstNameVal < 0) {
+                if (firstNameVal < 0
+                    && (eq - 4 == dispStart || HttpFormParser.IsParamBoundary(s[eq - 5] & 255))) {
                     firstNameVal = eq + 1;
                 }
             }
@@ -134,13 +212,13 @@ public class HttpFormParser {
         }
         if (firstNameVal < 0) { return ""; }
         int qs = firstNameVal;
-        if (qs < end && (s[qs] & 255) == 34) {
-            int qe = NativeMemory.Find(sp, qs + 1, 34, end - (qs + 1));
+        if (qs < dispEnd && (s[qs] & 255) == 34) {
+            int qe = NativeMemory.Find(sp, qs + 1, 34, dispEnd - (qs + 1));
             if (qe < 0) { return ""; }
             return s.Substring(qs + 1, qe - qs - 1);
         }
         int e = qs;
-        while (e < end) {
+        while (e < dispEnd) {
             int c = s[e] & 255;
             if (c == 59 || c == 13 || c == 10) { break; }  // ';' CR LF
             e = e + 1;
@@ -245,6 +323,7 @@ public class HttpFormParser {
         int n = s.Length;
         nint sp = n > 0 ? (nint)s : 0;
         int pairCount = 0;
+        Dictionary<string, StringBuilder> arrayAcc = null;
         while (i < n && pairCount < 4096) {
             int amp = NativeMemory.Find(sp, i, 38, n - i);  // '&'
             int e = amp < 0 ? n : amp;
@@ -262,18 +341,46 @@ public class HttpFormParser {
                     }
                 }
                 if (isArr) {
-                    string prev = "";
-                    if (into.TryGet(k, out prev) && prev != null && prev.Length > 0) {
-                        if (prev.Length >= 65536 || v.Length > 65536 - prev.Length) {
-                            i = e + 1;
-                            continue;
+                    if (arrayAcc == null) { arrayAcc = new Dictionary<string, StringBuilder>(); }
+                    StringBuilder sb = null;
+                    if (arrayAcc.TryGetValue(k, out sb) && sb != null) {
+                        if (sb.Length > 0) {
+                            if (sb.Length < 65536 && v.Length <= 65536 - sb.Length) {
+                                sb.Append(",");
+                                sb.Append(v);
+                            }
+                        } else if (v.Length <= 65536) {
+                            sb.Append(v);
                         }
-                        v = prev + "," + v;
+                    } else {
+                        StringBuilder next = new StringBuilder();
+                        string prev = "";
+                        if (into.TryGet(k, out prev) && prev != null && prev.Length > 0) {
+                            next.Append(prev);
+                            if (next.Length < 65536 && v.Length <= 65536 - next.Length) {
+                                next.Append(",");
+                                next.Append(v);
+                            }
+                        } else if (v.Length <= 65536) {
+                            next.Append(v);
+                        }
+                        arrayAcc.Add(k, next);
                     }
+                } else {
+                    if (arrayAcc != null && arrayAcc.ContainsKey(k)) {
+                        arrayAcc.Remove(k);
+                    }
+                    into.Set(k, v);
                 }
-                into.Set(k, v);
             }
             i = e + 1;
+        }
+        if (arrayAcc != null) {
+            List<string> keys = arrayAcc.Keys;
+            for (int ki = 0; ki < keys.Count; ki = ki + 1) {
+                string key = keys[ki];
+                into.Set(key, arrayAcc[key].ToString());
+            }
         }
     }
 }

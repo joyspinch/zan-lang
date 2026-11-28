@@ -71,7 +71,7 @@ public partial class HttpContext {
         int i = 0;
         while (i < n) {
             int c = s[i] & 255;
-            if (c == 13 || c == 10 || c == 0) { break; }
+            if ((c < 32 && c != 9) || c == 127) { break; }
             i = i + 1;
         }
         if (i == n) { return s; }
@@ -80,7 +80,7 @@ public partial class HttpContext {
         int k = 0;
         while (k < n) {
             int c = s[k] & 255;
-            if (c == 13 || c == 10 || c == 0) {
+            if ((c < 32 && c != 9) || c == 127) {
                 if (k > flush) { sb.Append(s.Substring(flush, k - flush)); }
                 flush = k + 1;
             }
@@ -90,14 +90,29 @@ public partial class HttpContext {
         return sb.ToString();
     }
 
+    private static bool IsValidHeaderName(string name) {
+        if (name == null || name.Length == 0) { return false; }
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            bool ok = (c >= 48 && c <= 57)
+                || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122)
+                || c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39
+                || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95
+                || c == 96 || c == 124 || c == 126;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
     private static string CookieSafe(string s, bool isName) {
         if (s == null) { return ""; }
         int n = s.Length;
         int i = 0;
         while (i < n) {
             int c = s[i] & 255;
-            if (c == 13 || c == 10 || c == 0 || c == 59
-                || (isName && (c == 61 || c == 32 || c == 9))) { break; }
+            if (c < 32 || c == 127 || c == 59
+                || (isName && (c == 61 || c == 32))) { break; }
             i = i + 1;
         }
         if (i == n) { return s; }
@@ -106,8 +121,8 @@ public partial class HttpContext {
         int k = 0;
         while (k < n) {
             int c = s[k] & 255;
-            if (c == 13 || c == 10 || c == 0 || c == 59
-                || (isName && (c == 61 || c == 32 || c == 9))) {
+            if (c < 32 || c == 127 || c == 59
+                || (isName && (c == 61 || c == 32))) {
                 if (k > flush) { sb.Append(s.Substring(flush, k - flush)); }
                 flush = k + 1;
             }
@@ -118,15 +133,17 @@ public partial class HttpContext {
     }
 
     public HttpContext SetHeader(string name, string val) {
+        if (!HttpContext.IsValidHeaderName(name)) { return this; }
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add(HttpContext.HeaderSafe(name) + ": "
-            + HttpContext.HeaderSafe(val));
+        this.headers.Add(name + ": " + HttpContext.HeaderSafe(val));
         return this;
     }
 
     public HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
+        string safeName = HttpContext.CookieSafe(name, true);
+        if (safeName.Length == 0) { return this; }
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Set-Cookie: " + HttpContext.CookieSafe(name, true) + "="
+        this.headers.Add("Set-Cookie: " + safeName + "="
             + HttpContext.CookieSafe(val, false)
             + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
             + "; Path=/; HttpOnly; SameSite=Lax"
@@ -135,8 +152,10 @@ public partial class HttpContext {
     }
 
     public HttpContext SetCookieJs(string name, string val, int maxAgeSeconds) {
+        string safeName = HttpContext.CookieSafe(name, true);
+        if (safeName.Length == 0) { return this; }
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Set-Cookie: " + HttpContext.CookieSafe(name, true) + "="
+        this.headers.Add("Set-Cookie: " + safeName + "="
             + HttpContext.CookieSafe(val, false)
             + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
             + "; Path=/; SameSite=Lax"
@@ -184,7 +203,13 @@ public partial class HttpContext {
     public void Binary(string mime, byte[] data, int len) {
         this.contentType = HttpContext.HeaderSafe(mime);
         this.bodyBytes = data;
-        this.bodyBytesLen = len;
+        int safeLen = len < 0 ? 0 : len;
+        if (data == null) {
+            safeLen = 0;
+        } else if (this.method != "HEAD" && safeLen > data.Length) {
+            safeLen = data.Length;
+        }
+        this.bodyBytesLen = safeLen;
         this.body = "";
         this.ended = true;
     }
@@ -201,8 +226,8 @@ public partial class HttpContext {
 
     public int BodyLength() {
         if (this.StatusForbidsBody()) { return 0; }
-        if (this.bodyBytes != null) { return this.bodyBytesLen; }
-        return this.body.Length;
+        if (this.bodyBytes != null) { return this.bodyBytesLen > 0 ? this.bodyBytesLen : 0; }
+        return this.body != null ? this.body.Length : 0;
     }
 
     public void Json(string json) {
@@ -311,14 +336,15 @@ public partial class HttpContext {
         if (this.headers != null) { hn = this.headers.Count; }
         for (int i = 0; i < hn; i = i + 1) {
             string header = this.headers[i];
-            if (forbidFraming) {
-                int colon = header.IndexOf(":");
-                if (colon >= 0) {
-                    string name = header.Substring(0, colon).Trim();
-                    if (HttpContext.AsciiEq(name, "Content-Length")
-                        || HttpContext.AsciiEq(name, "Transfer-Encoding")) {
-                        continue;
-                    }
+            int colon = header.IndexOf(":");
+            if (colon >= 0) {
+                string name = header.Substring(0, colon).Trim();
+                if (HttpContext.AsciiEq(name, "Transfer-Encoding")) {
+                    continue;
+                }
+                if ((forbidFraming || !statusBodyless)
+                    && HttpContext.AsciiEq(name, "Content-Length")) {
+                    continue;
                 }
             }
             sb.Append("\r\n");
@@ -329,6 +355,9 @@ public partial class HttpContext {
         if (this.bodyBytes != null) {
             int headLen = sb.Length;
             int bodyLen = omitBody ? 0 : this.BodyLength();
+            if (bodyLen < 0) { bodyLen = 0; }
+            if (bodyLen > this.bodyBytes.Length) { bodyLen = this.bodyBytes.Length; }
+            if (bodyLen > 2147483591 - headLen) { bodyLen = 2147483591 - headLen; }
             int total = headLen + bodyLen;
             byte[] buf = HttpBufferPool.RentBytes(total);
             NativeMemory.Copy((nint)buf, sb.BufferPtr(), headLen);
