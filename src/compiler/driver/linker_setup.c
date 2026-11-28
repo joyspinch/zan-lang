@@ -36,7 +36,9 @@ char rt_decimal_buf[1200];
 char rt_embed_buf[1200];
 char rt_inflate_buf[1200];
 char rt_timer_buf[1200];
+char rt_timer_ar_buf[1200];
 char rt_crash_buf[1200];
+char rt_crash_ar_buf[1200];
 char rt_crypto_buf[1200];
 char rt_mem_buf[1200];
 
@@ -98,8 +100,17 @@ if (irgen.uses_inflate) {
 }
 #endif
 const char *rt_timer_obj = NULL;
-#ifdef ZAN_RT_TIMER_OBJ
+const char *rt_timer_archive = NULL;
+#ifdef ZAN_RT_TIMER_ARCHIVE
 if (!cross_compiling) {
+  snprintf(rt_timer_ar_buf, sizeof(rt_timer_ar_buf), "%s/%s", link_exe_dir,
+           zan_path_basename(ZAN_RT_TIMER_ARCHIVE));
+  if (zan_file_exists(rt_timer_ar_buf))
+    rt_timer_archive = rt_timer_ar_buf;
+}
+#endif
+#ifdef ZAN_RT_TIMER_OBJ
+if (!cross_compiling && !rt_timer_archive) {
   snprintf(rt_timer_buf, sizeof(rt_timer_buf), "%s/%s", link_exe_dir,
            zan_path_basename(ZAN_RT_TIMER_OBJ));
   rt_timer_obj = rt_timer_buf;
@@ -107,12 +118,21 @@ if (!cross_compiling) {
 #endif
 /* Crash reporter（B-ID106 自 rt_crash.h 拆出）：rt_io.o 引
  * zan__crash_install、gui 引 guard_call，凡链这些对象的目标都需要
- * zanrt_crash.o；拆分前它随 rt_timer.o 的头内联构造器无条件在场，
- * 这里保持等效的无条件注入。老部署缺此文件时静默跳过——丢的只是
- * 崩溃报告能力，不阻塞正常链接。 */
+ * zanrt_crash.o；非 -Oz 保持裸对象注入使 .ctors 始终安装崩溃报告器，
+ * -Oz 走按需归档 libzancrash.a：仅在程序或驱动真正引用其符号时拉入，
+ * 纯 CLI -Oz 省掉 26 KB。老部署缺此文件时静默跳过。 */
 const char *rt_crash_obj = NULL;
+const char *rt_crash_archive = NULL;
+#ifdef ZAN_RT_CRASH_ARCHIVE
+if (!cross_compiling && opt_level == ZAN_OPT_SIZE_MIN) {
+  snprintf(rt_crash_ar_buf, sizeof(rt_crash_ar_buf), "%s/%s", link_exe_dir,
+           zan_path_basename(ZAN_RT_CRASH_ARCHIVE));
+  if (zan_file_exists(rt_crash_ar_buf))
+    rt_crash_archive = rt_crash_ar_buf;
+}
+#endif
 #ifdef ZAN_RT_CRASH_OBJ
-if (!cross_compiling) {
+if (!cross_compiling && !rt_crash_archive) {
   snprintf(rt_crash_buf, sizeof(rt_crash_buf), "%s/%s", link_exe_dir,
            zan_path_basename(ZAN_RT_CRASH_OBJ));
   if (zan_file_exists(rt_crash_buf))
@@ -134,8 +154,10 @@ if (!cross_compiling) {
     rt_crypto_archive = rt_crypto_buf;
 }
 #endif
-/* 小对象内存分配器管理池 */
-bool fast_alloc = fast_alloc_opt >= 0;
+/* 小对象内存分配器管理池（-Oz 默认跳过，与 main_frontend.c 同判） */
+bool fast_alloc =
+    fast_alloc_opt > 0 ||
+    (fast_alloc_opt == 0 && opt_level != ZAN_OPT_SIZE_MIN);
 const char *rt_mem_obj = NULL;
 #ifdef ZAN_RT_MEM_OBJ
 /* Apple 没有 --wrap：只在发射期已把分配调用改指 zan_mem_* 时才链

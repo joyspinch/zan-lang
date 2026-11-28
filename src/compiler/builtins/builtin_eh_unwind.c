@@ -660,16 +660,26 @@ void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
   zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &tagged, 1, "");
 }
-void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value) {
-  if (!value || LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind)
-    return;
-  g->eh_tmp_push_seq++;
-  /* Erased delegates carry a closure tag, not EH kind bits. Encode closure
-   * tags branchlessly via select so each call site adds 0 basic blocks. */
+static LLVMValueRef get_eh_tmp_push_obj_fn(zan_irgen_t *g) {
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_push_obj");
+  if (fn)
+    return fn;
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  if (LLVMTypeOf(value) != i8ptr)
-    value = LLVMBuildBitCast(g->builder, value, i8ptr, "eh.objp");
+  LLVMTypeRef fnty =
+      LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+  fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_push_obj", fnty);
+  LLVMSetLinkage(fn, LLVMInternalLinkage);
+  /* Defer inlining past shrink/eh-tmp-opt/escape so balanced nounwind pairs
+   * cancel cleanly; optimizer restores alwaysinline on -O2/-O3 and keeps
+   * outlined on -Os/-Oz to avoid duplicating the closure-tag select at every
+   * call site. */
+  add_enum_attr(g, fn, NULL, "inlinehint");
+  add_enum_attr(g, fn, NULL, "nounwind");
+  LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+  LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+  LLVMValueRef value = LLVMGetParam(fn, 0);
   LLVMValueRef is_dlg = emit_closure_is_tagged(g, value);
   uint64_t tag = 1u | ((uint64_t)ZAN_EH_SLOT_DLG << 1);
   LLVMValueRef dlg_tagged = LLVMBuildIntToPtr(
@@ -679,9 +689,24 @@ void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value) {
       i8ptr, "eh.dlg.slot");
   LLVMValueRef pushed =
       LLVMBuildSelect(g->builder, is_dlg, dlg_tagged, value, "eh.push.sel");
+  LLVMValueRef call =
+      zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &pushed, 1, "");
+  LLVMSetTailCall(call, 1);
+  LLVMBuildRetVoid(g->builder);
+  if (saved)
+    LLVMPositionBuilderAtEnd(g->builder, saved);
+  return fn;
+}
+void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value) {
+  if (!value || LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind)
+    return;
+  g->eh_tmp_push_seq++;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (LLVMTypeOf(value) != i8ptr)
+    value = LLVMBuildBitCast(g->builder, value, i8ptr, "eh.objp");
   LLVMTypeRef fnty =
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
-  zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &pushed, 1, "");
+  zan_call2(g->builder, fnty, get_eh_tmp_push_obj_fn(g), &value, 1, "");
 }
 void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top) {
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);

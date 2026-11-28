@@ -442,6 +442,10 @@ else {
         link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
       argv[a++] = static_driver_libs[li];
     }
+    if (rt_timer_archive)
+      argv[a++] = rt_timer_archive;
+    if (rt_crash_archive)
+      argv[a++] = rt_crash_archive;
     argv[a++] = "--end-group";
     argv[a++] = crtend;
     argv[a] = NULL;
@@ -523,6 +527,12 @@ else {
     }
     for (int li = 0; li < static_driver_lib_count; li++) {
       cmd_appendf(link_cmd, sizeof(link_cmd), " %s", static_driver_libs[li]);
+    }
+    if (rt_timer_archive) {
+      cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_timer_archive);
+    }
+    if (rt_crash_archive) {
+      cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crash_archive);
     }
     if (getenv("ZAN_LINK_ECHO"))
       fprintf(stderr, "[link] %s\n", link_cmd);
@@ -662,6 +672,18 @@ else {
   }
   for (int ei = 0; ei < extra_link_lib_count; ei++) {
     cmd_appendf(link_cmd, sizeof(link_cmd), " -l%s", extra_link_libs[ei]);
+  }
+  if (rt_timer_archive) {
+#ifdef __APPLE__
+    cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\" -pthread",
+                rt_timer_archive);
+#else
+    cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\" -pthread -lrt",
+                rt_timer_archive);
+#endif
+  }
+  if (rt_crash_archive) {
+    cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crash_archive);
   }
   if (rt_crypto_archive) {
     cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);

@@ -430,8 +430,11 @@ endif()
 # Compiled with the same compiler as the reactor so the object matches the
 # ABI of zanc's emitted objects.
 set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}")
+set(ZAN_RT_TIMER_CORE_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer_core${CMAKE_C_OUTPUT_EXTENSION}")
+set(ZAN_RT_TIMER_DBL_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer_dbl${CMAKE_C_OUTPUT_EXTENSION}")
+set(ZAN_RT_TIMER_ARCHIVE "${CMAKE_BINARY_DIR}/libzantimer.a")
 if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
-    set(ZAN_RT_TIMER_ZAN_SRCS
+    set(ZAN_RT_TIMER_CORE_ZAN_SRCS
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_plat.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_defer.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_diag.zan
@@ -442,24 +445,45 @@ if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_gc.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_gc_collect.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_leak.zan)
+    set(ZAN_RT_TIMER_DBL_ZAN_SRC
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_dbl.zan)
+    set(ZAN_RT_TIMER_ZAN_SRCS
+        ${ZAN_RT_TIMER_CORE_ZAN_SRCS}
+        ${ZAN_RT_TIMER_DBL_ZAN_SRC})
     add_custom_command(
-        OUTPUT ${ZAN_RT_TIMER_OBJ}
-        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+        OUTPUT ${ZAN_RT_TIMER_OBJ} ${ZAN_RT_TIMER_CORE_OBJ} ${ZAN_RT_TIMER_DBL_OBJ} ${ZAN_RT_TIMER_ARCHIVE}
+        COMMAND $<TARGET_FILE:zanc> -c -Os --no-runtime-checks
                 ${ZAN_RT_TIMER_ZAN_SRCS}
                 -o ${ZAN_RT_TIMER_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -Os --no-runtime-checks
+                ${ZAN_RT_TIMER_CORE_ZAN_SRCS}
+                -o ${ZAN_RT_TIMER_CORE_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -Os --no-runtime-checks
+                ${ZAN_RT_TIMER_DBL_ZAN_SRC}
+                -o ${ZAN_RT_TIMER_DBL_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_TIMER_ARCHIVE}
+        COMMAND ${CMAKE_AR} rc ${ZAN_RT_TIMER_ARCHIVE} ${ZAN_RT_TIMER_CORE_OBJ} ${ZAN_RT_TIMER_DBL_OBJ}
+        COMMAND ${CMAKE_RANLIB} ${ZAN_RT_TIMER_ARCHIVE}
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_TIMER_ARCHIVE} $<TARGET_FILE_DIR:zanc>/libzantimer.a
         DEPENDS zanc ${ZAN_RT_TIMER_ZAN_SRCS}
-        COMMENT "Building unified timer runtime object in pure Zan (zanrt_timer)"
+        COMMENT "Building split timer runtime object/archive in pure Zan (zanrt_timer)"
         VERBATIM)
-    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
-    target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
+    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ} ${ZAN_RT_TIMER_ARCHIVE})
+    target_compile_definitions(zanc PRIVATE
+        ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}"
+        ZAN_RT_TIMER_ARCHIVE="${ZAN_RT_TIMER_ARCHIVE}")
 else()
     add_custom_command(
-        OUTPUT ${ZAN_RT_TIMER_OBJ}
+        OUTPUT ${ZAN_RT_TIMER_OBJ} ${ZAN_RT_TIMER_ARCHIVE}
         COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
                 -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
                 -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_TIMER_ARCHIVE}
+        COMMAND ${CMAKE_AR} rc ${ZAN_RT_TIMER_ARCHIVE} ${ZAN_RT_TIMER_OBJ}
+        COMMAND ${CMAKE_RANLIB} ${ZAN_RT_TIMER_ARCHIVE}
         DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
                 ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
@@ -473,14 +497,18 @@ else()
                 ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_leak.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
-        COMMENT "Building unified timer runtime object (zanrt_timer)"
+        COMMENT "Building unified timer runtime object/archive (zanrt_timer)"
         VERBATIM)
-    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
+    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ} ${ZAN_RT_TIMER_ARCHIVE})
     add_dependencies(zanc zanrt_timer)
-    target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
+    target_compile_definitions(zanc PRIVATE
+        ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}"
+        ZAN_RT_TIMER_ARCHIVE="${ZAN_RT_TIMER_ARCHIVE}")
     add_custom_command(TARGET zanc POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_TIMER_ARCHIVE} $<TARGET_FILE_DIR:zanc>/libzantimer.a
         VERBATIM)
 endif()
 
@@ -490,43 +518,58 @@ endif()
 # builds) and every zan_gui consumer needs this object next to zanrt_timer.o.
 # Compiled with the same compiler/flags as the reactor for ABI match.
 set(ZAN_RT_CRASH_OBJ "${CMAKE_BINARY_DIR}/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}")
+set(ZAN_RT_CRASH_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrash.a")
 if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
     set(ZAN_RT_CRASH_ZAN_SRCS
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_win_io.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_win_guard.zan
         ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_posix.zan)
     add_custom_command(
-        OUTPUT ${ZAN_RT_CRASH_OBJ}
+        OUTPUT ${ZAN_RT_CRASH_OBJ} ${ZAN_RT_CRASH_ARCHIVE}
         COMMAND $<TARGET_FILE:zanc> -c -Os --no-runtime-checks
                 ${ZAN_RT_CRASH_ZAN_SRCS}
                 -o ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_CRASH_ARCHIVE}
+        COMMAND ${CMAKE_AR} rc ${ZAN_RT_CRASH_ARCHIVE} ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${CMAKE_RANLIB} ${ZAN_RT_CRASH_ARCHIVE}
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_CRASH_ARCHIVE} $<TARGET_FILE_DIR:zanc>/libzancrash.a
         DEPENDS zanc ${ZAN_RT_CRASH_ZAN_SRCS}
-        COMMENT "Building crash reporter runtime object in pure Zan (zanrt_crash)"
+        COMMENT "Building crash reporter runtime object/archive in pure Zan (zanrt_crash)"
         VERBATIM)
-    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
-    target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
+    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ} ${ZAN_RT_CRASH_ARCHIVE})
+    target_compile_definitions(zanc PRIVATE
+        ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}"
+        ZAN_RT_CRASH_ARCHIVE="${ZAN_RT_CRASH_ARCHIVE}")
 else()
     add_custom_command(
-        OUTPUT ${ZAN_RT_CRASH_OBJ}
+        OUTPUT ${ZAN_RT_CRASH_OBJ} ${ZAN_RT_CRASH_ARCHIVE}
         COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
                 -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
                 -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_CRASH_ARCHIVE}
+        COMMAND ${CMAKE_AR} rc ${ZAN_RT_CRASH_ARCHIVE} ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${CMAKE_RANLIB} ${ZAN_RT_CRASH_ARCHIVE}
         DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
                 ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_io.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_sym.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_guard.c
                 ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_posix.c
-        COMMENT "Building crash reporter runtime object (zanrt_crash)"
+        COMMENT "Building crash reporter runtime object/archive (zanrt_crash)"
         VERBATIM)
-    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
+    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ} ${ZAN_RT_CRASH_ARCHIVE})
     add_dependencies(zanc zanrt_crash)
-    target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
+    target_compile_definitions(zanc PRIVATE
+        ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}"
+        ZAN_RT_CRASH_ARCHIVE="${ZAN_RT_CRASH_ARCHIVE}")
     add_custom_command(TARGET zanc POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_CRASH_ARCHIVE} $<TARGET_FILE_DIR:zanc>/libzancrash.a
         VERBATIM)
 endif()
 

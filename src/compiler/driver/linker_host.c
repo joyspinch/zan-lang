@@ -153,6 +153,10 @@ if (target.os == ZAN_OS_WINDOWS) {
       link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
     argv[a++] = static_driver_libs[li];
   }
+  if (rt_timer_archive)
+    argv[a++] = rt_timer_archive;
+  if (rt_crash_archive)
+    argv[a++] = rt_crash_archive;
   if (rt_crypto_archive)
     argv[a++] = rt_crypto_archive;
   argv[a++] = "--end-group";
@@ -198,6 +202,12 @@ if (target.os == ZAN_OS_WINDOWS) {
   }
   for (int li = 0; li < static_driver_lib_count; li++) {
     cmd_appendf(cmd, sizeof(cmd), " %s", static_driver_libs[li]);
+  }
+  if (rt_timer_archive) {
+    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_archive);
+  }
+  if (rt_crash_archive) {
+    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_archive);
   }
   if (rt_crypto_archive) {
     cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);

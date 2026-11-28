@@ -712,7 +712,11 @@ if (!ir_arena) {
  * 12 字节头串页（zan_mem_str_malloc），也决定 Apple 的分配调用改指 */
 bool have_rt_mem = false, apple_route_fast_alloc = false;
 #ifdef ZAN_RT_MEM_OBJ
-if (fast_alloc_opt >= 0 && !emit_lib) {
+/* -Oz 默认跳过自研 slab 分配器（--fast-alloc 可显式强制开启），与 linker_setup.c 同判。 */
+bool want_fast_alloc =
+    fast_alloc_opt > 0 ||
+    (fast_alloc_opt == 0 && opt_level != ZAN_OPT_SIZE_MIN);
+if (want_fast_alloc && !emit_lib) {
   char fa_obj[1200];
   if (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS) {
     apple_route_fast_alloc =
