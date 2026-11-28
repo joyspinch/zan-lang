@@ -464,7 +464,10 @@ partial class Irgen {
         return p;
     }
 
-    // 等帧跑完：泵协作调度器直到 done 标志置位（宿主的 tk.test/tk.pump 循环）
+    // 等帧跑完：在 async 协程内（M:N worker 协程步）借用非消费 pin 拿到帧的
+    // done 地址，调 zan_co_sched_run_until(done) 安全泵调度器，避免重入
+    // zan_co_sched_run 等待全池 idle 死锁；同步调用方沿用 zan_co_sched_run()
+    // 以与宿主 emit_task_member 保持一致（顺带排空 Task.Spawn 脱钩任务）。
     void EmitTaskWait(string fp) {
         string token = TaskTokenBits(fp);
         int lt = NL(); int lw = NL(); int ld = NL();
@@ -475,7 +478,18 @@ partial class Irgen {
         string c = NT(); L("  " + c + " = icmp ne i32 " + dn + ", 0");
         L("  br i1 " + c + ", label %L" + ld + ", label %L" + lw);
         Label(lw);
-        L("  call void @zan_co_sched_run()");
+        if (curAsync) {
+            int lpin = NL();
+            string pinned = NT(); L("  " + pinned + " = call i8* @zan_task_acquire(i64 " + token + ", i32 0)");
+            string hasPin = NT(); L("  " + hasPin + " = icmp ne i8* " + pinned + ", null");
+            L("  br i1 " + hasPin + ", label %L" + lpin + ", label %L" + ld);
+            Label(lpin);
+            string donePtr = FrameDonePtr(TaskFrameHeader(pinned));
+            L("  call void @zan_co_sched_run_until(i32* " + donePtr + ")");
+            L("  call void @zan_task_unpin(i8* " + pinned + ")");
+        } else {
+            L("  call void @zan_co_sched_run()");
+        }
         L("  br label %L" + lt);
         Label(ld);
     }

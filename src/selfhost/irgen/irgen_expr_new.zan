@@ -137,6 +137,7 @@ partial class Irgen {
             Label(ldone);
             string res = NT();
             L("  " + res + " = phi " + rty + " [ " + loaded + ", %" + doLbl + " ], [ " + zval + ", %" + badLbl + " ]");
+            if (IsStructTy(el)) { AddTemp(res, el); }
             return new ExprVal(res, el);
         }
         if (IsDictType(obj.ty)) {
@@ -353,10 +354,17 @@ partial class Irgen {
                     L("  " + more + " = icmp slt i64 " + curi + ", " + alen);
                     L("  br i1 " + more + ", label %L" + lbody + ", label %L" + lskip);
                     Label(lbody);
+                    List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+                    List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+                    stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+                    stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
                     string aplace = ArrayPlace(sv.op, curi, astorage);
                     ExprVal aval = LoadArrayElement(aplace, arrElem, astorage);
                     string aslot = StructElemSlot(aval, le);
                     L("  call void @zlist_add(i8* " + t + ", i64 " + aslot + ")");
+                    EmitTempReleases();
+                    stmtTemps = svT; stmtTempValues = svTV;
+                    stmtTempOwners = svTO; stmtTempTypes = svTT;
                     string nexti = NT();
                     L("  " + nexti + " = add i64 " + curi + ", 1");
                     L("  store i64 " + nexti + ", i64* " + aidx);
@@ -436,8 +444,9 @@ partial class Irgen {
         L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
         string szi = NT();
         L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+        string dtorSym = SpecDtorSym(cls, ty);
         string raw = NT();
-        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + dtorSym + " to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
         // a struct-typed field points at a nested instance: allocate it
@@ -457,6 +466,21 @@ partial class Irgen {
             L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
             L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + vtSym + " to i8*), i8** " + vtp0);
         }
+        // Protect the freshly allocated object with a dedicated construction
+        // guard slot (NOT stmtTemps — ApplyObjInit property getters/setters
+        // would treat a stmtTemps receiver as stealable via TakeOwnedTemp and
+        // drop it mid-construction) and bracket ctor/init calls with
+        // EnterCallArm so throwing arguments or constructors unwind cleanly.
+        string objGuard = "";
+        string objLt = "%" + cn + "*";
+        if (eaActive) {
+            objGuard = NTS();
+            entryAllocas.Append("  " + objGuard + " = alloca " + objLt + "\n");
+            entryAllocas.Append("  store " + objLt + " null, " + objLt + "* " + objGuard + "\n");
+            L("  store " + objLt + " " + obj + ", " + objLt + "* " + objGuard);
+            ArmLocalSlot(objGuard, ty, false);
+        }
+        EnterCallArm();
         // The constructor: with an object initializer (ival == 2) the kids are
         // `Field = value` pairs, not ctor args, so only a parameterless ctor
         // is invoked and the field stores follow. Otherwise the arguments
@@ -599,8 +623,13 @@ partial class Irgen {
         }
         // object initializer: store each `Field = value` into the instance
         if (e.ival == 2) { ApplyObjInit(e, obj, ty, cls, cn); }
-        // preserve generic type arguments (ty may carry <...>) for the result
+        LeaveCallArm();
+        if (objGuard != "") {
+            RetireLocalSlot(objGuard, objLt);
+            L("  store " + objLt + " null, " + objLt + "* " + objGuard);
+        }
         AddTemp(obj, ty);
+        // preserve generic type arguments (ty may carry <...>) for the result
         return new ExprVal(obj, ty);
     }
 

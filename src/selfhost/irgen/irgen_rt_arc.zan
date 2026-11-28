@@ -828,11 +828,98 @@ partial class Irgen {
         locOpaque = nop;
     }
 
+    // Collect effective field types in the same flattened order as
+    // CollectFields, substituting generic type arguments along the base chain
+    // starting from `curTy` (e.g. Concrete -> Validator<Pos> -> Plan<Pos>).
+    void CollectFieldEffTypes(Node curCls, Node curTy, List<Node> effTypes) {
+        if (curCls == null) { return; }
+        Node baseCls = BaseClassOf(curCls);
+        Node baseTy = curTy != null ? binder.BaseType(curTy) : null;
+        if (baseTy == null && baseCls != null) { baseTy = MkType(baseCls.sval); }
+        CollectFieldEffTypes(baseCls, baseTy, effTypes);
+        List<string> tps = TParams(curCls);
+        bool hasArgs = curTy != null && tps.Count > 0 && curTy.kids.Count == tps.Count;
+        int i = 0;
+        while (i < curCls.kids.Count) {
+            Node m = curCls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) {
+                Node ft = m.type;
+                if (hasArgs) { ft = SubstTP(ft, tps, curTy.kids); }
+                effTypes.Add(ft);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Per-instantiation destructor symbol for a generic class whose erased
+    // type-parameter fields are instantiated with ARC-managed or array types.
+    // Returns the shared `<Class>_dtor` when no erased field needs ARC cleanup.
+    string SpecDtorSym(Node cls, Node instTy) {
+        string baseSym = cls.sval + "_dtor";
+        if (cls.kind == AK.StructDecl() && cls.layoutExplicit) { return baseSym; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || instTy == null || instTy.kids.Count != tps.Count) { return baseSym; }
+        int ti = 0;
+        while (ti < instTy.kids.Count) {
+            if (instTy.kids[ti] == null || MentionsTypeParam(instTy.kids[ti])) { return baseSym; }
+            ti = ti + 1;
+        }
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        List<Node> effTypes = new List<Node>();
+        CollectFieldEffTypes(cls, instTy, effTypes);
+        string savedScope = typeScopeCls;
+        string savedCur = curClass;
+        typeScopeCls = cls.sval;
+        int borrowed = BorrowedBindingFieldSlot(cls);
+        bool needs = false;
+        int fi = 0;
+        while (fi < names.Count) {
+            if (fi != borrowed && !WeakTy(types[fi]) && IsErasedType(types[fi])) {
+                Node fty = effTypes[fi];
+                if (fty != null && fty != types[fi] && !IsErasedType(fty)) {
+                    typeScopeCls = "";
+                    curClass = "";
+                    bool managed = ArcManaged(fty) || fty.ival >= 1;
+                    typeScopeCls = cls.sval;
+                    curClass = savedCur;
+                    if (managed) { needs = true; break; }
+                }
+            }
+            fi = fi + 1;
+        }
+        typeScopeCls = savedScope;
+        curClass = savedCur;
+        if (!needs) { return baseSym; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(cls.sval);
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        sb.Append("_dtor");
+        string sym = sb.ToString();
+        if (IndexOfStr(specDtorSyms, sym) < 0) {
+            specDtorSyms.Add(sym);
+            specDtorCls.Add(cls);
+            specDtorArgs.Add(instTy);
+        }
+        return sym;
+    }
+
     // per-class destructor: release every ARC-managed field, then return (the
     // object storage itself is freed by zrelease after this runs).
     void EmitClassDtor(Node cls) {
+        EmitClassDtorAs(cls, null, cls.sval + "_dtor");
+    }
+
+    void EmitClassDtorAs(Node cls, Node instTy, string sym) {
         string cn = cls.sval;
-        H("define void @" + cn + "_dtor(i8* %p) {");
+        H("define void @" + sym + "(i8* %p) {");
         if (cls.kind == AK.StructDecl() && cls.layoutExplicit) {
             H("  ret void");
             H("}");
@@ -842,22 +929,27 @@ partial class Irgen {
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(cls, names, types);
+        Node rootTy = instTy != null ? instTy : MkType(cls.sval);
+        List<Node> effTypes = new List<Node>();
+        CollectFieldEffTypes(cls, rootTy, effTypes);
         int fb = FieldBase(cls);
         int i = 0;
         int seq = 0;
-        // the field types are written in THIS class's scope: a type parameter
-        // of the class erases there (an i64 slot, not an ARC-managed
-        // pointer -- releasing it would corrupt the slot)
+        // the physical struct slot types are in THIS class's scope (type params
+        // erase to i64); when instTy or a concrete generic base instantiates an
+        // erased field to an ARC/array type, release it via its effective type.
         string savedScope = typeScopeCls;
+        string savedCur = curClass;
         typeScopeCls = cls.sval;
         int borrowed = BorrowedBindingFieldSlot(cls);
         while (i < names.Count) {
             if (i == borrowed) { i = i + 1; continue; }
-            if (WeakTy(types[i])) {
+            Node rawTy = types[i];
+            if (WeakTy(rawTy)) {
                 // a weak field leaves the registry when its holder dies: the
                 // registry must not keep a pointer into freed memory, and the
                 // slot itself is cleared
-                string lt = MapType(types[i]);
+                string lt = MapType(rawTy);
                 if (lt == "i64" || lt.EndsWith("*")) {
                     int idx = fb + i;
                     string fp = "%f" + seq;
@@ -867,52 +959,66 @@ partial class Irgen {
                     EmitWeakClear(ws);
                     seq = seq + 1;
                 }
-            } else if (ArcManaged(types[i]) || (types[i] != null && types[i].ival >= 1)) {
-                int idx = fb + i;
-                string lt = MapType(types[i]);
-                string fp = "%f" + seq;
-                string fv = "%v" + seq;
-                H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
-                H("  " + fv + " = load " + lt + ", " + lt + "* " + fp);
-                if (types[i].ival >= 1) {
-                    if (lt == "i64*") {
-                        if (ArrRankOf(types[i]) > 1) {
+            } else {
+                string slotLt = MapType(rawTy);
+                Node effTy = rawTy;
+                bool isManaged = false;
+                if (IsErasedType(rawTy)) {
+                    Node cand = effTypes[i];
+                    if (cand != null && cand != rawTy && !IsErasedType(cand)) {
+                        effTy = cand;
+                        typeScopeCls = "";
+                        curClass = "";
+                        isManaged = ArcManaged(effTy) || effTy.ival >= 1;
+                        typeScopeCls = cls.sval;
+                        curClass = savedCur;
+                    }
+                } else {
+                    isManaged = ArcManaged(rawTy) || (rawTy != null && rawTy.ival >= 1);
+                }
+                if (isManaged) {
+                    int idx = fb + i;
+                    string fp = "%f" + seq;
+                    string fv = "%v" + seq;
+                    H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
+                    H("  " + fv + " = load " + slotLt + ", " + slotLt + "* " + fp);
+                    if (effTy.ival >= 1) {
+                        string arrPtr = fv;
+                        if (slotLt == "i64") {
+                            arrPtr = "%c" + seq;
+                            H("  " + arrPtr + " = inttoptr i64 " + fv + " to i64*");
+                        } else if (slotLt != "i64*") {
+                            arrPtr = "%c" + seq;
+                            H("  " + arrPtr + " = bitcast " + slotLt + " " + fv + " to i64*");
+                        }
+                        if (ArrRankOf(effTy) > 1) {
                             string owner = "%ao" + seq;
-                            H("  " + owner + " = call i64* @zarr_owner(i64* " + fv + ", i64 " + ArrRankOf(types[i]) + ")");
+                            H("  " + owner + " = call i64* @zarr_owner(i64* " + arrPtr + ", i64 " + ArrRankOf(effTy) + ")");
                             H("  call void @zarr_release(i64* " + owner + ")");
                         } else {
-                            H("  call void @zarr_release(i64* " + fv + ")");
+                            H("  call void @zarr_release(i64* " + arrPtr + ")");
                         }
                     } else {
-                        string fc = "%c" + seq;
-                        H("  " + fc + " = bitcast " + lt + " " + fv + " to i64*");
-                        if (ArrRankOf(types[i]) > 1) {
-                            string owner = "%ao" + seq;
-                            H("  " + owner + " = call i64* @zarr_owner(i64* " + fc + ", i64 " + ArrRankOf(types[i]) + ")");
-                            H("  call void @zarr_release(i64* " + owner + ")");
+                        string ptrVal = fv;
+                        if (slotLt == "i64") {
+                            ptrVal = "%c" + seq;
+                            H("  " + ptrVal + " = inttoptr i64 " + fv + " to i8*");
+                        } else if (slotLt != "i8*") {
+                            ptrVal = "%c" + seq;
+                            H("  " + ptrVal + " = bitcast " + slotLt + " " + fv + " to i8*");
+                        }
+                        if (DynamicReferenceType(effTy)) {
+                            H("  call void @zref_release(i8* " + ptrVal + ")");
+                        } else if (IsDelegate(effTy)) {
+                            H("  call void @zdelegate_release(i8* " + ptrVal + ")");
+                        } else if (IsStr(effTy)) {
+                            H("  call void @zstr_slot_release(i8* " + ptrVal + ")");
                         } else {
-                            H("  call void @zarr_release(i64* " + fc + ")");
+                            H("  call void @zrelease(i8* " + ptrVal + ")");
                         }
                     }
-                } else if (DynamicReferenceType(types[i])) {
-                    string dynamicValue = fv;
-                    if (lt != "i8*") {
-                        dynamicValue = "%c" + seq;
-                        H("  " + dynamicValue + " = bitcast " + lt + " " + fv + " to i8*");
-                    }
-                    H("  call void @zref_release(i8* " + dynamicValue + ")");
-                } else if (IsDelegate(types[i])) {
-                    H("  call void @zdelegate_release(i8* " + fv + ")");
-                } else if (IsStr(types[i])) {
-                    H("  call void @zstr_slot_release(i8* " + fv + ")");
-                } else if (lt == "i8*") {
-                    H("  call void @zrelease(i8* " + fv + ")");
-                } else {
-                    string fc = "%c" + seq;
-                    H("  " + fc + " = bitcast " + lt + " " + fv + " to i8*");
-                    H("  call void @zrelease(i8* " + fc + ")");
+                    seq = seq + 1;
                 }
-                seq = seq + 1;
             }
             i = i + 1;
         }

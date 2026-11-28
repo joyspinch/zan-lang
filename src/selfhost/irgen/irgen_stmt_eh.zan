@@ -15,24 +15,41 @@ partial class Irgen {
         if (!ExternSeen("malloc")) { externDecls.Add("malloc"); H("declare i8* @malloc(i64)"); }
         if (!ExternSeen("free")) { externDecls.Add("free"); H("declare void @free(i8*)"); }
         if (!ExternSeen("memcpy")) { externDecls.Add("memcpy"); H("declare i8* @memcpy(i8*, i8*, i64)"); }
-        // aligned_alloc is not exported by the MSVC UCRT (LNK2019), so the
-        // 32-aligned jmp_buf store over-allocates with malloc and aligns
-        // the pointer up by hand; the RAW pointer is kept beside it for
-        // free (the aligned pointer itself must not be freed).
+        // Small-buffer optimization (B-ID199 round4 + zero-leak TLS fast path):
+        // The first 64 handler frames live in inline thread_local storage so
+        // ordinary threads and M:N async workers never heap-allocate (avoiding
+        // a permanent 17.4 KB/thread leak when threads exit and keeping
+        // allocation balance exact). Only nesting deeper than 64 promotes to
+        // heap arrays, freeing previous heap buffers on further growth.
+        H("@__exc_bufs_inline = internal thread_local global [64 x [32 x i64]] zeroinitializer, align 32");
+        H("@zpending_marks_inline = internal thread_local global [64 x i8*] zeroinitializer");
+        H("@zexc_marks_inline = internal thread_local global [64 x i8*] zeroinitializer");
         H("@__exc_bufs_raw = thread_local global i8* null");
         // Grow the handler frame store so slot index need-1 exists: no-op
-        // once @__exc_cap >= need, otherwise double (floor 64) and copy the
-        // live prefix. The jmp_buf bytes move with the memcpy, and nothing
-        // caches frame addresses across the swap (the @__exc_stack pointer
-        // array is retired -- frame addresses are re-derived from the
-        // depth, see EmitFrameBuf), so a growth is transparent to armed
-        // handlers. Frames are never freed back: the arrays stay at the
-        // peak depth, like any growable stack.
+        // once @__exc_cap >= need. For initial cap==0 and need<=64, bind the
+        // inline 64-slot TLS buffers with zero mallocs. Otherwise double
+        // (floor 64) on the heap, copy the live prefix, and free old buffers
+        // only when they came from the heap (@__exc_bufs_raw != null).
         H("define internal void @__exc_grow(i64 %need) {");
         H("entry:");
         H("  %cap = load i64, i64* @__exc_cap");
         H("  %enough = icmp sge i64 %cap, %need");
-        H("  br i1 %enough, label %ret, label %grow");
+        H("  br i1 %enough, label %ret, label %check_inline");
+        H("check_inline:");
+        H("  %uninit = icmp eq i64 %cap, 0");
+        H("  %fits = icmp sle i64 %need, 64");
+        H("  %use_inline = and i1 %uninit, %fits");
+        H("  br i1 %use_inline, label %init_inline, label %grow");
+        H("init_inline:");
+        H("  %ibufs = bitcast [64 x [32 x i64]]* @__exc_bufs_inline to i8*");
+        H("  %ipm = bitcast [64 x i8*]* @zpending_marks_inline to i8*");
+        H("  %ixm = bitcast [64 x i8*]* @zexc_marks_inline to i8*");
+        H("  store i8* %ibufs, i8** @__exc_bufs");
+        H("  store i8* null, i8** @__exc_bufs_raw");
+        H("  store i8* %ipm, i8** @zpending_marks");
+        H("  store i8* %ixm, i8** @zexc_marks");
+        H("  store i64 64, i64* @__exc_cap");
+        H("  ret void");
         H("grow:");
         H("  %dbl = mul i64 %cap, 2");
         H("  %d64 = icmp sge i64 %dbl, 64");
@@ -71,6 +88,9 @@ partial class Irgen {
         H("  store i8* %npm, i8** @zpending_marks");
         H("  store i8* %nxm, i8** @zexc_marks");
         H("  store i64 %newcap, i64* @__exc_cap");
+        H("  %was_heap = icmp ne i8* %oraw, null");
+        H("  br i1 %was_heap, label %free_old, label %ret");
+        H("free_old:");
         H("  call void @free(i8* %oraw)");
         H("  call void @free(i8* %opm)");
         H("  call void @free(i8* %oxm)");

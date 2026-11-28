@@ -863,6 +863,8 @@ partial class Irgen {
         } else {
             L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
         }
+        List<string> savedQTemps = stmtTemps; List<Node> savedQTempTypes = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         int wi = 0;
         while (wi < e.kids.Count) {
             string wc = GenCond(e.kids[wi]);
@@ -876,6 +878,8 @@ partial class Irgen {
         L("  call void @zlist_add(i8* " + list + ", i64 " + sv + ")");
         L("  br label %L" + linc);
         Label(linc);
+        EmitTempReleases();
+        stmtTemps = savedQTemps; stmtTempTypes = savedQTempTypes;
         string iv2 = NT();
         L("  " + iv2 + " = load i64, i64* " + idx);
         string inc = NT();
@@ -896,6 +900,7 @@ partial class Irgen {
     // the loop: a dropped loop compiles but computes the wrong answer.
     void GenForeach(Node s) {
         int feScope = locName.Count;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal coll = GenExpr(s.b);
         bool feDict = coll.ty != null && (coll.ty.sval == "Dictionary" || coll.ty.sval.IndexOf("Dictionary<") == 0
                                           || coll.ty.sval == "Dict" || coll.ty.sval.IndexOf("Dict<") == 0);
@@ -917,6 +922,7 @@ partial class Irgen {
         if (!feList && !feArr && !feStr) {
             // the duck-typed enumerable protocol (GetEnumerator/MoveNext/Current)
             if (GenForeachEnumerable(s, coll)) { return; }
+            EmitTempReleases();
             string cn = "?"; if (coll.ty != null) { cn = coll.ty.sval; }
             diags.Error("foreach over '" + cn + "' is not supported by the self-hosted compiler yet (List<T>, T[] and string are)", s.line, s.col);
             return;
@@ -947,12 +953,44 @@ partial class Irgen {
             MaterializeAsyncLoopLocal(creg, cty, s.ival);
             L("  store " + cty + " " + coll.op + ", " + cty + "* " + creg);
             asyncSlotReg.Add(creg); asyncSlotTy.Add(coll.ty); asyncSlotIdx.Add(s.ival);
+            if (ArcManaged(coll.ty) || (coll.ty != null && coll.ty.ival >= 1)) {
+                if (!TransferTempOwner(coll)) { EmitArcRetain(coll.op, coll.ty); }
+                locName.Add(".fe.coll"); locType.Add(coll.ty); locReg.Add(creg);
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false); locOpaque.Add(false);
+                ArmAsyncLocal(creg, coll.ty, false);
+            }
             if (feDict && dictOrig != null) {
                 string dp0 = NT();
-                L("  " + dp0 + " = bitcast i64* " + FrameGep("%ff", s.ival + 5) + " to i8**");
+                MaterializeAsyncLoopLocal(dp0, "i8*", s.ival + 5);
                 L("  store i8* " + dictOrig.op + ", i8** " + dp0);
+                if (ArcManaged(dictOrig.ty) || (dictOrig.ty != null && dictOrig.ty.ival >= 1)) {
+                    if (!TransferTempOwner(dictOrig)) { EmitArcRetain(dictOrig.op, dictOrig.ty); }
+                    locName.Add(".fe.dict"); locType.Add(dictOrig.ty); locReg.Add(dp0);
+                    locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false); locOpaque.Add(false);
+                    ArmAsyncLocal(dp0, dictOrig.ty, false);
+                }
+            }
+        } else {
+            // Keep the iterable expression owned for the loop's lifetime (in
+            // feScope) so intermediate sub-expression temps (e.g. LINQ lambdas
+            // and Where lists) can be released immediately before loop entry,
+            // and the iterable itself is dropped on loop exit / break / unwind.
+            // EA() already zero-initializes and arms %v.* locals via ArmMaterializedLocal.
+            if (ArcManaged(coll.ty) || (coll.ty != null && coll.ty.ival >= 1)) {
+                string collOwnerReg = AddLocal(".fe.coll", coll.ty);
+                EA(collOwnerReg, cty);
+                L("  store " + cty + " " + coll.op + ", " + cty + "* " + collOwnerReg);
+                if (!TransferTempOwner(coll)) { EmitArcRetain(coll.op, coll.ty); }
+            }
+            if (feDict && dictOrig != null && (ArcManaged(dictOrig.ty) || (dictOrig.ty != null && dictOrig.ty.ival >= 1))) {
+                string dictOwnerReg = AddLocal(".fe.dict", dictOrig.ty);
+                string dty = MapType(dictOrig.ty);
+                EA(dictOwnerReg, dty);
+                L("  store " + dty + " " + dictOrig.op + ", " + dty + "* " + dictOwnerReg);
+                if (!TransferTempOwner(dictOrig)) { EmitArcRetain(dictOrig.op, dictOrig.ty); }
             }
         }
+        EmitTempReleases();
         string idx = NT();
         if (!curAsync) {
             EA(idx, "i64");
@@ -1186,6 +1224,7 @@ partial class Irgen {
         L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
         TransferTempOwner(en);
         if (curAsync) { ArmAsyncLocal(enReg, enumTy, false); }
+        EmitTempReleases();
         string elt = MapType(elemTy);
         string ereg = AddLocal(s.sval, elemTy);
         // the element variable is a per-iteration capture: every closure made
