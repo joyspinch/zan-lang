@@ -40,12 +40,13 @@ public class JsonReader {
 
     // 创建宽松模式游标。
     public static JsonReader Of(string src) {
+        string safe = src != null ? src : "";
         JsonReader r = new JsonReader();
-        r.s = src;
-        r.ptr = (nint)src;
+        r.s = safe;
+        r.ptr = safe.Length > 0 ? (nint)safe : (nint)0;
         r.buf = null;
         r.pos = 0;
-        r.len = src.Length;
+        r.len = safe.Length;
         r.strict = false;
         r.errPos = -1;
         return r;
@@ -394,13 +395,34 @@ public class JsonReader {
         if (this.ptr != (nint)0) {
             int scan = JsonScan.StringEnd(this.ptr, pos, len);
             if (scan >= 0L && scan < (long)len) {
-                string plain = s.Substring(start, (int)scan - start);
-                pos = (int)scan + 1;
+                int endIdx = (int)scan;
+                if (strict) {
+                    Span<byte> sp = new Span<byte>(this.ptr, len);
+                    for (int ci = start; ci < endIdx; ci = ci + 1) {
+                        if ((sp[ci] & 255) < 32) {
+                            pos = ci;
+                            Fail();
+                            return "";
+                        }
+                    }
+                }
+                string plain = s.Substring(start, endIdx - start);
+                pos = endIdx + 1;
                 return plain;
             } else if (scan < 0L) {
                 pos = (int)(-scan - 1L);
             } else {
                 pos = len;
+            }
+            if (strict && pos > start) {
+                Span<byte> sp = new Span<byte>(this.ptr, len);
+                for (int ci = start; ci < pos; ci = ci + 1) {
+                    if ((sp[ci] & 255) < 32) {
+                        pos = ci;
+                        Fail();
+                        return "";
+                    }
+                }
             }
         } else {
             while (pos < len) {
@@ -412,6 +434,10 @@ public class JsonReader {
                 }
                 if (c == 92) {
                     break;
+                }
+                if (strict && c < 32) {
+                    Fail();
+                    return "";
                 }
                 pos = pos + 1;
             }
@@ -426,6 +452,7 @@ public class JsonReader {
         while (pos < len) {
             int c = s[pos] & 255;
             if (c == 34) { pos = pos + 1; return this.FinishEscapedString(sb); }
+            if (strict && c < 32) { Fail(); return this.FinishEscapedString(sb); }
             if (c == 92 && pos + 1 < len) {
                 int n = s[pos + 1] & 255;
                 if (n == 110) { sb.Append("\n"); }
@@ -499,12 +526,27 @@ public class JsonReader {
                     } else if (scan2 < 0L) {
                         stop2 = (int)(-scan2 - 1L);
                     }
+                    if (strict) {
+                        Span<byte> sp2 = new Span<byte>(this.ptr, len);
+                        for (int ci = pos; ci < stop2; ci = ci + 1) {
+                            if ((sp2[ci] & 255) < 32) {
+                                pos = ci;
+                                Fail();
+                                return this.FinishEscapedString(sb);
+                            }
+                        }
+                    }
                     sb.Append(new StringView(this.ptr + (nint)pos, stop2 - pos));
                 } else {
                     stop2 = pos;
                     while (stop2 < len) {
                         int sc = s[stop2] & 255;
                         if (sc == 34 || sc == 92) { break; }
+                        if (strict && sc < 32) {
+                            pos = stop2;
+                            Fail();
+                            return this.FinishEscapedString(sb);
+                        }
                         stop2 = stop2 + 1;
                     }
                     sb.Append(s.Substring(pos, stop2 - pos));
@@ -619,9 +661,10 @@ public class JsonReader {
     // 校验游标处是字面量 `lit`（"true"/"false"/"null"）并推进；
     // 不匹配时不推进返回 false。
     public bool ValidLiteral(string lit) {
+        if (lit == null) { return false; }
         int n = lit.Length;
         int p = this.pos;
-        if (p + n > this.len) { return false; }
+        if ((long)p + (long)n > (long)this.len) { return false; }
         if (this.ptr != (nint)0 && n > 0) {
             Span<byte> sp = new Span<byte>(this.ptr, this.len);
             Span<byte> lb = new Span<byte>((nint)lit, n);

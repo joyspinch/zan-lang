@@ -1,23 +1,39 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Json;
 using System.Text.RegularExpressions;
 
 namespace System.Web;
 
+// 静态路由不可变哈希索引快照（一次原子发布，消除读/写撕裂）。
+internal class StaticRouteIndex {
+    internal int[] hashSlots;
+    internal int hashMask;
+    internal Route[] staticArr;
+    internal bool hasWildcardStatic;
+    internal int minStaticLen;
+    internal int maxStaticLen;
+
+    internal StaticRouteIndex(int[] slots, int mask, Route[] sarr, bool hasWild, int minLen, int maxLen) {
+        this.hashSlots = slots;
+        this.hashMask = mask;
+        this.staticArr = sarr;
+        this.hasWildcardStatic = hasWild;
+        this.minStaticLen = minLen;
+        this.maxStaticLen = maxLen;
+    }
+}
+
 // 单个路由端点共享内存性能指标（路由、调用次数、平均微秒耗时）。
 public class Router {
     private List<Route> statics;  // no {param} segments: matched by full-path compare
     private List<Route> dynamics;  // contain {param} segments: matched per-segment
     private List<Route> regexes;   // regex patterns: matched by Regex.Find / IsMatch
-    // 静态路由开放寻址哈希索引。
-    private int[] hashSlots;
-    private int hashMask;
-    private bool hasWildcardStatic;
-    private int minStaticLen;
-    private int maxStaticLen;
-    private Route[] staticArr;
+    // 不可变索引快照（Add/AddRegex 在锁内置空，Match/PathExists 懒构建后无锁只读）。
+    private StaticRouteIndex staticIndex;
     private Route[] dynArr;
+    private Route[] regexArr;
     private List<Route> flat;
     // 路由统计键元数据实体列表（结构化管理，消除平行列表）。
     private List<RouteStatEntry> statEntries;
@@ -30,20 +46,18 @@ public class Router {
         this.statics = new List<Route>();
         this.dynamics = new List<Route>();
         this.regexes = new List<Route>();
-        this.hashSlots = null;
-        this.hashMask = 0;
-        this.hasWildcardStatic = false;
-        this.minStaticLen = 2147483647;
-        this.maxStaticLen = -1;
-        this.staticArr = null;
+        this.staticIndex = null;
         this.dynArr = null;
+        this.regexArr = null;
         this.flat = new List<Route>();
         this.statEntries = new List<RouteStatEntry>();
         this.routeStats = null;
         this.routeTable = null;
     }
 
-    public int Count() { return this.flat.Count; }
+    public int Count() {
+        lock (this) { return this.flat.Count; }
+    }
 
     // 注册一条路由并返回 Route（可继续 fluent 配置）。
     // 无 {param} 段的路由进静态桶并建哈希索引，其余进动态桶。
@@ -54,12 +68,7 @@ public class Router {
         lock (this) {
             if (Router.IsStatic(p)) {
                 this.statics.Add(r);
-                if (m == "*") { this.hasWildcardStatic = true; }
-                int plen = r.pattern.Length;
-                if (plen < this.minStaticLen) { this.minStaticLen = plen; }
-                if (plen > this.maxStaticLen) { this.maxStaticLen = plen; }
-                this.hashSlots = null;
-                this.staticArr = null;
+                this.staticIndex = null;
             } else {
                 this.dynamics.Add(r);
                 this.dynArr = null;
@@ -77,6 +86,7 @@ public class Router {
         Route r = new Route(m, p, handler, true);
         lock (this) {
             this.regexes.Add(r);
+            this.regexArr = null;
             r.SetIdx(this.flat.Count);
             this.flat.Add(r);
         }
@@ -135,18 +145,24 @@ public class Router {
     }
 
     public void InitRouteTableShared() {
-        if (this.flat.Count == 0) { return; }
-        if (this.routeTable != null) { return; }
-        RouteTable rt = RouteTable.Create("", this.flat.Count + 16);
-        if (rt == null) { return; }
-        for (int i = 0; i < this.statics.Count; i = i + 1) {
-            Route r = this.statics[i];
-            int auth = (r.NeedsLogin() || r.NeedsAuth()) ? 1 : 0;
-            int perm = 0;
-            int menu = r.InMenu() ? 1 : 0;
-            rt.Add(r.Method(), r.Pattern(), auth, perm, menu, r.Action(), r.Idx());
+        lock (this) {
+            if (this.flat.Count == 0) { return; }
+            if (this.routeTable != null) { return; }
+            RouteTable rt = RouteTable.Create("", this.flat.Count + 16);
+            if (rt == null) { return; }
+            HashSet<string> seen = new HashSet<string>();
+            for (int i = 0; i < this.statics.Count; i = i + 1) {
+                Route r = this.statics[i];
+                string dedupKey = r.Method() + " " + r.Pattern();
+                if (seen.Contains(dedupKey)) { continue; }
+                seen.Add(dedupKey);
+                int auth = (r.NeedsLogin() || r.NeedsAuth()) ? 1 : 0;
+                int perm = 0;
+                int menu = r.InMenu() ? 1 : 0;
+                rt.Add(r.Method(), r.Pattern(), auth, perm, menu, r.Action(), r.Idx());
+            }
+            this.routeTable = rt;
         }
-        this.routeTable = rt;
     }
 
     public long RouteTableOsHandle() {
@@ -251,10 +267,20 @@ public class Router {
         return h;
     }
 
-    private void RebuildIndex() {
+    private StaticRouteIndex BuildStaticIndexLocked() {
         int statCnt = this.statics.Count;
         Route[] sarr = new Route[statCnt];
-        for (int i = 0; i < statCnt; i = i + 1) { sarr[i] = this.statics[i]; }
+        bool hasWild = false;
+        int minLen = 2147483647;
+        int maxLen = -1;
+        for (int i = 0; i < statCnt; i = i + 1) {
+            Route r = this.statics[i];
+            sarr[i] = r;
+            if (r.method == "*") { hasWild = true; }
+            int plen = r.pattern.Length;
+            if (plen < minLen) { minLen = plen; }
+            if (plen > maxLen) { maxLen = plen; }
+        }
         int cap = 16;
         while (cap < statCnt * 4) { cap = cap * 2; }
         int[] slots = new int[cap];
@@ -282,9 +308,18 @@ public class Router {
                 }
             }
         }
-        this.staticArr = sarr;
-        this.hashMask = mask;
-        this.hashSlots = slots;
+        return new StaticRouteIndex(slots, mask, sarr, hasWild, minLen, maxLen);
+    }
+
+    private StaticRouteIndex EnsureStaticIndex() {
+        StaticRouteIndex idx = this.staticIndex;
+        if (idx != null) { return idx; }
+        lock (this) {
+            if (this.staticIndex == null) {
+                this.staticIndex = this.BuildStaticIndexLocked();
+            }
+            return this.staticIndex;
+        }
     }
 
     private Route[] EnsureDynArr() {
@@ -301,18 +336,67 @@ public class Router {
         }
     }
 
-    private Route FindStatic(string method, string path) {
-        int[] slots = this.hashSlots;
-        Route[] sarr = this.staticArr;
-        if (slots == null || sarr == null) {
-            lock (this) {
-                if (this.hashSlots == null || this.staticArr == null) { this.RebuildIndex(); }
-                slots = this.hashSlots;
-                sarr = this.staticArr;
+    private Route[] EnsureRegexArr() {
+        Route[] arr = this.regexArr;
+        if (arr != null) { return arr; }
+        lock (this) {
+            if (this.regexArr == null) {
+                int n = this.regexes.Count;
+                Route[] d = new Route[n];
+                for (int i = 0; i < n; i = i + 1) { d[i] = this.regexes[i]; }
+                this.regexArr = d;
+            }
+            return this.regexArr;
+        }
+    }
+
+    // 规范化路径斜杠（合并连续 '/' 并去除非根尾随 '/'），用于消除静态与动态路由斜杠口径不一致导致的策略绕过。
+    private static string NormalizeStaticPath(string path) {
+        if (path == null) { return ""; }
+        int n = path.Length;
+        if (n <= 1) { return path; }
+        Span<byte> pb = new Span<byte>((nint)path, n);
+        bool hasTrail = (pb[n - 1] & 255) == 47;
+        bool hasDup = false;
+        for (int i = 1; i < n; i = i + 1) {
+            if ((pb[i] & 255) == 47 && (pb[i - 1] & 255) == 47) {
+                hasDup = true;
+                break;
             }
         }
+        if (!hasDup) {
+            if (!hasTrail) { return path; }
+            return path.Substring(0, n - 1);
+        }
+        byte[] buf = new byte[n];
+        Span<byte> dst = new Span<byte>((nint)buf, n);
+        int outLen = 0;
+        bool prevSlash = false;
+        for (int i = 0; i < n; i = i + 1) {
+            byte b = pb[i];
+            if ((b & 255) == 47) {
+                if (!prevSlash) {
+                    dst[outLen] = 47;
+                    outLen = outLen + 1;
+                    prevSlash = true;
+                }
+            } else {
+                dst[outLen] = b;
+                outLen = outLen + 1;
+                prevSlash = false;
+            }
+        }
+        if (outLen > 1 && (dst[outLen - 1] & 255) == 47) {
+            outLen = outLen - 1;
+        }
+        return NativeMemory.GetString((nint)buf, 0, outLen);
+    }
+
+    private static Route LookupStatic(StaticRouteIndex idx, string method, string path) {
+        int[] slots = idx.hashSlots;
+        Route[] sarr = idx.staticArr;
         int cap = slots.Length;
-        int mask = cap - 1;
+        int mask = idx.hashMask;
         Span<int> slotSpan = new Span<int>((nint)slots, cap);
         int h = Router.HashKey(method, path) & mask;
         for (int guard = 0; guard <= mask; guard = guard + 1) {
@@ -434,29 +518,32 @@ public class Router {
     }
 
     public Route Match(HttpContext ctx) {
+        if (ctx == null) { return null; }
         string method = ctx.Method();
         string path = ctx.Path();
+        if (method == null) { method = ""; }
+        if (path == null) { path = ""; }
 
-        // 静态路由直接查本地哈希索引；按已注册静态路径长度上下界快滤，动态长路径免算哈希。
-        if (this.statics.Count > 0) {
+        // 静态路由直接查不可变哈希索引快照；按路径长度上下界快滤，并对重复/尾随斜杠做规范化回查。
+        StaticRouteIndex sidx = this.EnsureStaticIndex();
+        if (sidx.staticArr.Length > 0) {
             int plen = path.Length;
-            if (plen >= this.minStaticLen && plen <= this.maxStaticLen) {
-                Route hit = this.FindStatic(method, path);
+            if (plen >= sidx.minStaticLen && plen <= sidx.maxStaticLen) {
+                Route hit = Router.LookupStatic(sidx, method, path);
                 if (hit != null) { return hit; }
-                if (this.hasWildcardStatic) {
-                    hit = this.FindStatic("*", path);
+                if (sidx.hasWildcardStatic) {
+                    hit = Router.LookupStatic(sidx, "*", path);
                     if (hit != null) { return hit; }
                 }
             }
-            // 自动尾部斜杠容错：/about/company/ -> /about/company
-            if (plen > 1 && (path[plen - 1] & 255) == 47) {
-                int altLen = plen - 1;
-                if (altLen >= this.minStaticLen && altLen <= this.maxStaticLen) {
-                    string altPath = path.Substring(0, altLen);
-                    Route hit = this.FindStatic(method, altPath);
+            string normPath = Router.NormalizeStaticPath(path);
+            if (normPath != path) {
+                int nlen = normPath.Length;
+                if (nlen >= sidx.minStaticLen && nlen <= sidx.maxStaticLen) {
+                    Route hit = Router.LookupStatic(sidx, method, normPath);
                     if (hit != null) { return hit; }
-                    if (this.hasWildcardStatic) {
-                        hit = this.FindStatic("*", altPath);
+                    if (sidx.hasWildcardStatic) {
+                        hit = Router.LookupStatic(sidx, "*", normPath);
                         if (hit != null) { return hit; }
                     }
                 }
@@ -464,9 +551,9 @@ public class Router {
         }
 
         // 动态分段路由（零 SplitPath 预分配，单趟验证静态段 + 栈记录前 4 参数位置）
-        if (this.dynamics.Count > 0) {
-            Route[] darr = this.EnsureDynArr();
-            int dynCount = darr.Length;
+        Route[] darr = this.EnsureDynArr();
+        int dynCount = darr.Length;
+        if (dynCount > 0) {
             int segCount = Router.CountPathSegs(path);
             for (int i = 0; i < dynCount; i = i + 1) {
                 Route r = darr[i];
@@ -478,14 +565,20 @@ public class Router {
             }
         }
 
-        // 正则路由（支持命名捕获组及数字捕获组自动写入 ctx.routeParams）
-        int regCount = this.regexes.Count;
+        // 正则路由（支持命名捕获组及数字捕获组自动写入 ctx.routeParams；预算耗尽安全跳过不崩溃）
+        Route[] rarr = this.EnsureRegexArr();
+        int regCount = rarr.Length;
         if (regCount > 0) {
             for (int ri = 0; ri < regCount; ri = ri + 1) {
-                Route r = this.regexes[ri];
+                Route r = rarr[ri];
                 if (r.Method() == method || r.Method() == "*") {
-                    Match m = r.Regex().Find(path);
-                    if (m.Success()) {
+                    Match m = null;
+                    try {
+                        m = r.Regex().Find(path);
+                    } catch (RegexBudgetException) {
+                        continue;
+                    }
+                    if (m != null && m.Success()) {
                         StrMap routeParams = ctx.EnsureRouteParams();
                         if (r.RegexGroupNames() != null) {
                             for (int gi = 0; gi < r.RegexGroupNames().Count; gi = gi + 1) {
@@ -513,30 +606,38 @@ public class Router {
 
     public bool PathExists(string path) {
         if (path == null) { return false; }
-        int statCnt = this.statics.Count;
-        for (int i = 0; i < statCnt; i = i + 1) {
-            if (this.statics[i].Pattern() == path) { return true; }
-        }
-        int plen = path.Length;
-        if (plen > 1 && (path[plen - 1] & 255) == 47) {
-            string altPath = path.Substring(0, plen - 1);
+        StaticRouteIndex sidx = this.EnsureStaticIndex();
+        Route[] sarr = sidx.staticArr;
+        int statCnt = sarr.Length;
+        if (statCnt > 0) {
             for (int i = 0; i < statCnt; i = i + 1) {
-                if (this.statics[i].Pattern() == altPath) { return true; }
+                if (sarr[i].pattern == path) { return true; }
+            }
+            string normPath = Router.NormalizeStaticPath(path);
+            if (normPath != path) {
+                for (int i = 0; i < statCnt; i = i + 1) {
+                    if (sarr[i].pattern == normPath) { return true; }
+                }
             }
         }
-        int dynCount = this.dynamics.Count;
+        Route[] darr = this.EnsureDynArr();
+        int dynCount = darr.Length;
         if (dynCount > 0) {
-            Route[] darr = this.EnsureDynArr();
             int segCount = Router.CountPathSegs(path);
             for (int i = 0; i < dynCount; i = i + 1) {
                 Route r = darr[i];
                 if (r.segCount == segCount && Router.MatchRouteStaticOnly(r, path)) { return true; }
             }
         }
-        int regCount = this.regexes.Count;
+        Route[] rarr = this.EnsureRegexArr();
+        int regCount = rarr.Length;
         if (regCount > 0) {
             for (int ri = 0; ri < regCount; ri = ri + 1) {
-                if (this.regexes[ri].Regex().IsMatch(path)) { return true; }
+                try {
+                    if (rarr[ri].Regex().IsMatch(path)) { return true; }
+                } catch (RegexBudgetException) {
+                    continue;
+                }
             }
         }
         return false;
@@ -550,6 +651,7 @@ public class Router {
 
     // 段数相等且逐段相等；利用预编译的 paramNames 零分配写入 into。
     public static bool MatchRoute(Route r, List<string> segs, StrMap into) {
+        if (r == null || segs == null) { return false; }
         int count = r.segCount;
         if (count != segs.Count) { return false; }
         string[] pat = r.segArr;
@@ -561,10 +663,12 @@ public class Router {
             }
         }
         // 2. 全部匹配后才写入提取的参数
-        for (int i = 0; i < count; i = i + 1) {
-            string pname = pnames[i];
-            if (pname.Length > 0) {
-                into.Set(pname, segs[i]);
+        if (into != null) {
+            for (int i = 0; i < count; i = i + 1) {
+                string pname = pnames[i];
+                if (pname.Length > 0) {
+                    into.Set(pname, segs[i]);
+                }
             }
         }
         return true;
@@ -572,22 +676,26 @@ public class Router {
 
     // 段数相等且逐段相等；{param} 段匹配任意段并把值写入 into。
     public static bool MatchSegs(List<string> pat, List<string> segs, StrMap into) {
+        if (pat == null || segs == null) { return false; }
         int count = pat.Count;
         if (count != segs.Count) { return false; }
         // 1. 先验证非参数段是否完全吻合
         for (int i = 0; i < count; i = i + 1) {
             string p = pat[i];
+            if (p == null) { return false; }
             if (!(p.Length > 2 && (p[0] & 255) == 123
                 && (p[p.Length - 1] & 255) == 125)) {  // '{' '}'
                 if (p != segs[i]) { return false; }
             }
         }
         // 2. 确认全部匹配后才写入参数
-        for (int i = 0; i < count; i = i + 1) {
-            string p = pat[i];
-            if (p.Length > 2 && (p[0] & 255) == 123
-                && (p[p.Length - 1] & 255) == 125) {  // '{' '}'
-                into.Set(p.Substring(1, p.Length - 2), segs[i]);
+        if (into != null) {
+            for (int i = 0; i < count; i = i + 1) {
+                string p = pat[i];
+                if (p.Length > 2 && (p[0] & 255) == 123
+                    && (p[p.Length - 1] & 255) == 125) {  // '{' '}'
+                    into.Set(p.Substring(1, p.Length - 2), segs[i]);
+                }
             }
         }
         return true;

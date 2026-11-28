@@ -123,6 +123,9 @@ public class CssSelector {
         this.pos = 0;
     }
 
+    private static int MaxTraversalDepth = 512;
+    private static int MaxComplexCompounds = 62;
+
     // 在 scope 的子树里查询（文档顺序，不含 scope 本身）。
     public static List<HtmlNode> Query(HtmlNode scope, string selector) {
         if (scope == null) { return new List<HtmlNode>(); }
@@ -133,9 +136,9 @@ public class CssSelector {
         List<HtmlNode> hits = new List<HtmlNode>();
         bool needCount = CssSelector.ListNeedsElemCount(list);
         if (list.Count == 1) {
-            CssSelector.CollectSingle(scope, list[0], hits, needCount);
+            CssSelector.CollectSingle(scope, list[0], hits, needCount, 0);
         } else {
-            p.Collect(scope, list, hits, needCount);
+            p.Collect(scope, list, hits, needCount, 0);
         }
         return hits;
     }
@@ -149,12 +152,13 @@ public class CssSelector {
         List<CssComplex> list = p.ParseList();
         bool needCount = CssSelector.ListNeedsElemCount(list);
         if (list.Count == 1) {
-            return CssSelector.FindFirstSingle(scope, list[0], needCount);
+            return CssSelector.FindFirstSingle(scope, list[0], needCount, 0);
         }
-        return p.FindFirst(scope, list, needCount);
+        return p.FindFirst(scope, list, needCount, 0);
     }
 
-    private static void CollectSingle(HtmlNode scope, CssComplex cx, List<HtmlNode> hits, bool needCount) {
+    private static void CollectSingle(HtmlNode scope, CssComplex cx, List<HtmlNode> hits, bool needCount, int depth) {
+        if (depth >= CssSelector.MaxTraversalDepth) { return; }
         List<HtmlNode> children = scope.childList;
         if (children == null) { return; }
         int cnt = children.Count;
@@ -172,13 +176,14 @@ public class CssSelector {
                 if (CssSelector.MatchComplexAt(c, cx, elemIdx, elemTotal)) { hits.Add(c); }
                 elemIdx = elemIdx + 1;
                 if (c.childList != null && c.childList.Count > 0) {
-                    CssSelector.CollectSingle(c, cx, hits, needCount);
+                    CssSelector.CollectSingle(c, cx, hits, needCount, depth + 1);
                 }
             }
         }
     }
 
-    private static HtmlNode FindFirstSingle(HtmlNode scope, CssComplex cx, bool needCount) {
+    private static HtmlNode FindFirstSingle(HtmlNode scope, CssComplex cx, bool needCount, int depth) {
+        if (depth >= CssSelector.MaxTraversalDepth) { return null; }
         List<HtmlNode> children = scope.childList;
         if (children == null) { return null; }
         int cnt = children.Count;
@@ -196,7 +201,7 @@ public class CssSelector {
                 if (CssSelector.MatchComplexAt(c, cx, elemIdx, elemTotal)) { return c; }
                 elemIdx = elemIdx + 1;
                 if (c.childList != null && c.childList.Count > 0) {
-                    HtmlNode found = CssSelector.FindFirstSingle(c, cx, needCount);
+                    HtmlNode found = CssSelector.FindFirstSingle(c, cx, needCount, depth + 1);
                     if (found != null) { return found; }
                 }
             }
@@ -217,7 +222,8 @@ public class CssSelector {
         return false;
     }
 
-    void Collect(HtmlNode scope, List<CssComplex> list, List<HtmlNode> hits, bool needCount) {
+    void Collect(HtmlNode scope, List<CssComplex> list, List<HtmlNode> hits, bool needCount, int depth) {
+        if (depth >= CssSelector.MaxTraversalDepth) { return; }
         List<HtmlNode> children = scope.childList;
         if (children == null) { return; }
         int cnt = children.Count;
@@ -238,7 +244,7 @@ public class CssSelector {
                     if (CssSelector.MatchComplexAt(c, cx0, elemIdx, elemTotal)) { hits.Add(c); }
                     elemIdx = elemIdx + 1;
                     if (c.childList != null && c.childList.Count > 0) {
-                        this.Collect(c, list, hits, needCount);
+                        this.Collect(c, list, hits, needCount, depth + 1);
                     }
                 }
             }
@@ -252,13 +258,14 @@ public class CssSelector {
                 }
                 elemIdx = elemIdx + 1;
                 if (c.childList != null && c.childList.Count > 0) {
-                    this.Collect(c, list, hits, needCount);
+                    this.Collect(c, list, hits, needCount, depth + 1);
                 }
             }
         }
     }
 
-    HtmlNode FindFirst(HtmlNode scope, List<CssComplex> list, bool needCount) {
+    HtmlNode FindFirst(HtmlNode scope, List<CssComplex> list, bool needCount, int depth) {
+        if (depth >= CssSelector.MaxTraversalDepth) { return null; }
         List<HtmlNode> children = scope.childList;
         if (children == null) { return null; }
         int cnt = children.Count;
@@ -279,7 +286,7 @@ public class CssSelector {
                     if (CssSelector.MatchComplexAt(c, cx0, elemIdx, elemTotal)) { return c; }
                     elemIdx = elemIdx + 1;
                     if (c.childList != null && c.childList.Count > 0) {
-                        HtmlNode found = this.FindFirst(c, list, needCount);
+                        HtmlNode found = this.FindFirst(c, list, needCount, depth + 1);
                         if (found != null) { return found; }
                     }
                 }
@@ -294,7 +301,7 @@ public class CssSelector {
                 }
                 elemIdx = elemIdx + 1;
                 if (c.childList != null && c.childList.Count > 0) {
-                    HtmlNode found = this.FindFirst(c, list, needCount);
+                    HtmlNode found = this.FindFirst(c, list, needCount, depth + 1);
                     if (found != null) { return found; }
                 }
             }
@@ -347,6 +354,9 @@ public class CssSelector {
                 && comp.attrs.Count == 0 && comp.pseudos.Count == 0) {
                 // 空复合选择器：说明写错了（少了选择器主体）。
                 throw new ArgumentException("invalid CSS selector at " + Convert.ToString(this.pos));
+            }
+            if (cx.compounds.Count >= CssSelector.MaxComplexCompounds) {
+                throw new ArgumentException("CSS selector exceeds maximum compound depth");
             }
             cx.compounds.Add(comp);
             if (first) {
@@ -673,10 +683,12 @@ public class CssSelector {
         // adjacent（紧邻, 3）/ sibling（任意前序, 4）
         HtmlNode parent = node.Parent();
         if (parent == null || parent.childList == null) { return false; }
-        int limit = (comb == 3) ? 1 : node.index;
-        int seen = 0;
         List<HtmlNode> sibs = parent.childList;
-        for (int i = node.index - 1; i >= 0 && seen < limit; i = i - 1) {
+        int startIdx = node.index;
+        if (startIdx > sibs.Count) { startIdx = sibs.Count; }
+        int limit = (comb == 3) ? 1 : startIdx;
+        int seen = 0;
+        for (int i = startIdx - 1; i >= 0 && seen < limit; i = i - 1) {
             HtmlNode sib = sibs[i];
             if (!sib.IsElement()) { continue; }
             seen = seen + 1;
@@ -805,7 +817,9 @@ public class CssSelector {
         HtmlNode parent = node.Parent();
         if (parent == null || parent.childList == null) { return false; }
         int cnt = parent.childList.Count;
-        for (int i = node.index + 1; i < cnt; i = i + 1) {
+        int start = node.index + 1;
+        if (start < 0) { start = 0; }
+        for (int i = start; i < cnt; i = i + 1) {
             if (parent.childList[i].IsElement()) { return true; }
         }
         return false;

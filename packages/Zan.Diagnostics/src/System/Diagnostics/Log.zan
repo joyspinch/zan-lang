@@ -28,24 +28,32 @@ public class Log {
     static FileLogSink fileSink;
     static ConsoleLogSink consoleSink;
 
-    public static void SetFormat(int fmt) { Log.format = fmt; }
-    public static int Format() { return Log.format; }
-    public static void SetMinLevel(int level) { Log.minLevel = level; }
+    public static void SetFormat(int fmt) { lock (Log.sinkLock) { Log.format = fmt; } }
+    public static int Format() { lock (Log.sinkLock) { return Log.format; } }
+    public static void SetMinLevel(int level) { lock (Log.sinkLock) { Log.minLevel = level; } }
 
     public static void Configure(string dir, string pattern, int minLevel) {
-        Log.dir = dir;
-        if (pattern != "") { Log.pattern = pattern; }
-        Log.minLevel = minLevel;
-        Log.enabled = true;
-        if (dir != "" && !Directory.Exists(dir)) {
-            Directory.CreateDirectoryRecursive(dir);
+        string safeDir = dir != null ? dir : "";
+        if (safeDir.Length > 0 && !Directory.Exists(safeDir)) {
+            Directory.CreateDirectoryRecursive(safeDir);
+        }
+        lock (Log.sinkLock) {
+            Log.dir = safeDir;
+            if (pattern != null && pattern.Length > 0) { Log.pattern = pattern; }
+            Log.minLevel = minLevel;
+            Log.enabled = true;
         }
     }
 
-    public static bool IsEnabled() { return Log.enabled; }
-    public static void MaxFileSize(long bytes) { Log.maxBytes = bytes; }
-    public static void EchoToConsole(bool on) { Log.toConsole = on; }
-    public static string CurrentPath() { return LogPaths.CurrentPath(Log.dir, Log.pattern); }
+    public static bool IsEnabled() { lock (Log.sinkLock) { return Log.enabled; } }
+    public static void MaxFileSize(long bytes) { lock (Log.sinkLock) { Log.maxBytes = bytes; } }
+    public static void EchoToConsole(bool on) { lock (Log.sinkLock) { Log.toConsole = on; } }
+    public static string CurrentPath() {
+        string d = "";
+        string p = "";
+        lock (Log.sinkLock) { d = Log.dir; p = Log.pattern; }
+        return LogPaths.CurrentPath(d, p);
+    }
 
     public static void Trace(string msg) { Log.Write(Log.TRACE, msg); }
     public static void Debug(string msg) { Log.Write(Log.DEBUG, msg); }
@@ -56,7 +64,9 @@ public class Log {
 
     // 日志为诊断旁路，文件写入失败绝不向上抛（失败时清 lastPath 并降级控制台）。
     public static void Write(int level, string msg) {
-        if (level < Log.minLevel) { return; }
+        int minLvl = 0;
+        lock (Log.sinkLock) { minLvl = Log.minLevel; }
+        if (level < minLvl) { return; }
         LogEvent e = new LogEvent(level, "", msg);
         Activity act = Activity.Current;
         if (act != null) {
@@ -70,12 +80,26 @@ public class Log {
 
     public static void EmitProcess(LogEvent e) {
         if (e == null) { return; }
-        if (Log.toConsole || !Log.enabled) {
-            Log.ConsoleSink().WriteWithFormat(e, Log.format);
+        bool echo = false;
+        bool en = false;
+        int fmt = 0;
+        string d = "";
+        string pat = "";
+        long maxB = 0L;
+        lock (Log.sinkLock) {
+            echo = Log.toConsole;
+            en = Log.enabled;
+            fmt = Log.format;
+            d = Log.dir;
+            pat = Log.pattern;
+            maxB = Log.maxBytes;
         }
-        if (Log.enabled) {
+        if (echo || !en) {
+            Log.ConsoleSink().WriteWithFormat(e, fmt);
+        }
+        if (en) {
             FileLogSink fs = Log.FileSink();
-            fs.WriteConfigured(e, Log.dir, Log.pattern, Log.maxBytes, Log.format);
+            fs.WriteConfigured(e, d, pat, maxB, fmt);
         }
     }
 

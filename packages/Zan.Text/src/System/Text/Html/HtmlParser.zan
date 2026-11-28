@@ -27,6 +27,9 @@ public class HtmlParser {
     List<HtmlNode> open;
     string[] nameCache;
     HtmlPolicy sanitizePolicy;
+    // 超过 MaxNestingDepth 后进入 dropContentTags（如 svg/iframe/template）时抑制其子树，防深度截断逃逸。
+    int deepDropDepth;
+    string deepDropTag;
 
     public HtmlParser() {
         this.src = "";
@@ -36,6 +39,8 @@ public class HtmlParser {
         this.open = new List<HtmlNode>();
         this.nameCache = new string[64];
         this.sanitizePolicy = null;
+        this.deepDropDepth = 0;
+        this.deepDropTag = "";
     }
 
     private static string[] GetIndentCache() {
@@ -185,7 +190,7 @@ public class HtmlParser {
     }
 
     void AddText(string text) {
-        if (text.Length == 0) { return; }
+        if (text.Length == 0 || this.deepDropDepth > 0) { return; }
         this.Current().AppendChild(HtmlNode.TextNode(text));
     }
 
@@ -234,16 +239,48 @@ public class HtmlParser {
     }
 
     void ParseComment() {
-        int end = this.src.IndexOf("-->", this.pos + 4);
+        int start = this.pos + 4;
+        // HTML5 §13.2.5.42: 提前闭合空注释 "<!-->" 与 "<!--->"。
+        if (start < this.len && (this.src[start] & 255) == 62) {
+            this.pos = start + 1;
+            if (this.deepDropDepth == 0) { this.Current().AppendChild(HtmlNode.CommentNode("")); }
+            return;
+        }
+        if (start + 1 < this.len && (this.src[start] & 255) == 45 && (this.src[start + 1] & 255) == 62) {
+            this.pos = start + 2;
+            if (this.deepDropDepth == 0) { this.Current().AppendChild(HtmlNode.CommentNode("")); }
+            return;
+        }
+        int end = -1;
+        int closeLen = 0;
+        int search = start;
+        while (search < this.len) {
+            int dd = this.src.IndexOf("--", search);
+            if (dd < 0) { break; }
+            if (dd + 2 < this.len && (this.src[dd + 2] & 255) == 62) {
+                end = dd;
+                closeLen = 3;
+                break;
+            }
+            // HTML5 §13.2.5.50: "--!>" 同样闭合注释，防浏览器与解析器注释边界差异。
+            if (dd + 3 < this.len && (this.src[dd + 2] & 255) == 33 && (this.src[dd + 3] & 255) == 62) {
+                end = dd;
+                closeLen = 4;
+                break;
+            }
+            search = dd + 1;
+        }
         string body;
         if (end < 0) {
-            body = this.src.Substring(this.pos + 4, this.len - this.pos - 4);
+            body = this.src.Substring(start, this.len - start);
             this.pos = this.len;
         } else {
-            body = this.src.Substring(this.pos + 4, end - this.pos - 4);
-            this.pos = end + 3;
+            body = this.src.Substring(start, end - start);
+            this.pos = end + closeLen;
         }
-        this.Current().AppendChild(HtmlNode.CommentNode(body));
+        if (this.deepDropDepth == 0) {
+            this.Current().AppendChild(HtmlNode.CommentNode(body));
+        }
     }
 
     // doctype 之类的声明：整段丢掉。
@@ -282,6 +319,23 @@ public class HtmlParser {
         this.pos = gt < 0 ? this.len : gt + 1;
         int nlen = j - nameStart;
         if (nlen <= 0) { return; }
+        if (this.deepDropDepth > 0) {
+            string dropName = this.InternLower(nameStart, j);
+            if (dropName == this.deepDropTag) {
+                this.deepDropDepth = this.deepDropDepth - 1;
+                if (this.deepDropDepth == 0) { this.deepDropTag = ""; }
+                return;
+            }
+            for (int i = this.open.Count - 1; i >= 1; i = i - 1) {
+                if (this.open[i].tag == dropName) {
+                    while (this.open.Count > i) { this.open.RemoveAt(this.open.Count - 1); }
+                    this.deepDropDepth = 0;
+                    this.deepDropTag = "";
+                    return;
+                }
+            }
+            return;
+        }
         int cnt = this.open.Count;
         if (cnt > 1) {
             string topTag = this.open[cnt - 1].tag;
@@ -394,7 +448,30 @@ public class HtmlParser {
         }
         this.pos = j;
 
+        if (this.deepDropDepth > 0) {
+            if (HtmlUtil.IsRawTextTag(name) || HtmlUtil.IsEscapableRawTextTag(name)) {
+                this.ReadRawText(node, name);
+                return;
+            }
+            if (!HtmlUtil.IsVoidTag(name) && name == this.deepDropTag) {
+                this.deepDropDepth = this.deepDropDepth + 1;
+            }
+            return;
+        }
+
         this.ApplyImpliedEndTags(name);
+        if (this.open.Count >= HtmlParser.MaxNestingDepth
+            && sp != null && !sp.TagAllowed(name) && sp.dropContentTags.Contains(name)) {
+            if (HtmlUtil.IsRawTextTag(name) || HtmlUtil.IsEscapableRawTextTag(name)) {
+                this.ReadRawText(node, name);
+                return;
+            }
+            if (!HtmlUtil.IsVoidTag(name)) {
+                this.deepDropTag = name;
+                this.deepDropDepth = 1;
+            }
+            return;
+        }
         this.Current().AppendChild(node);
         if (HtmlUtil.IsVoidTag(name)) { return; }
         if (HtmlUtil.IsRawTextTag(name) || HtmlUtil.IsEscapableRawTextTag(name)) {
@@ -406,11 +483,27 @@ public class HtmlParser {
         }
     }
 
-    // 原始文本元素的内容：到对应的结束标签为止。
+    // 原始文本元素的内容：到对应的结束标签为止（HTML5 §13.2.5.13 要求结束标签名后紧跟空白、'/' 或 '>'）。
     void ReadRawText(HtmlNode node, string name) {
         string closeTag = "</" + name;
-        int at = this.FindIgnoreCase(closeTag, this.pos);
         int rawStart = this.pos;
+        int searchFrom = this.pos;
+        int at = -1;
+        while (searchFrom < this.len) {
+            int cand = this.FindIgnoreCase(closeTag, searchFrom);
+            if (cand < 0) { break; }
+            int after = cand + closeTag.Length;
+            if (after >= this.len) {
+                at = cand;
+                break;
+            }
+            int dc = this.src[after] & 255;
+            if (dc == 62 || dc == 47 || HtmlUtil.IsSpace(dc)) {
+                at = cand;
+                break;
+            }
+            searchFrom = cand + 1;
+        }
         int rawEnd;
         if (at < 0) {
             rawEnd = this.len;
@@ -425,7 +518,7 @@ public class HtmlParser {
                 : this.src.Substring(rawStart, rawEnd - rawStart);
             node.AppendChild(HtmlNode.TextNode(text));
         }
-        if (this.Has(closeTag)) {
+        if (at >= 0) {
             int j = this.pos + closeTag.Length;
             int rem = this.len - j;
             int gt = rem > 0 ? NativeMemory.Find(this.srcPtr, j, 62, rem) : -1;

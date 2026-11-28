@@ -19,15 +19,22 @@ public class LogFormatter {
         return LogFormatter.Text(e);
     }
 
-    private static byte[] EnsureCap(byte[] buf, int used, int need, out nint bp) {
-        if (need <= buf.Length) {
+    private static byte[] EnsureCap(byte[] buf, int used, long need, out nint bp) {
+        if (need <= (long)buf.Length) {
             bp = (nint)buf;
             return buf;
         }
-        int cap = buf.Length * 2;
-        if (cap < 128) { cap = 128; }
-        while (cap < need) { cap = cap * 2; }
-        byte[] grown = new byte[cap];
+        if (need > 2147483591L) {
+            throw new InvalidOperationException("LogFormatter buffer capacity overflow");
+        }
+        long capL = (long)buf.Length * 2L;
+        if (capL < 128L) { capL = 128L; }
+        while (capL < need) {
+            capL = capL * 2L;
+            if (capL > 2147483591L) { capL = 2147483591L; break; }
+        }
+        if (capL > 2147483591L) { capL = 2147483591L; }
+        byte[] grown = new byte[(int)capL];
         nint gp = (nint)grown;
         if (used > 0) { NativeMemory.Copy(gp, (nint)buf, used); }
         bp = gp;
@@ -74,9 +81,13 @@ public class LogFormatter {
         int catLen = cat != null ? cat.Length : 0;
         string msg = e.message != null ? e.message : "";
         int msgLen = msg.Length;
-        int est = 64 + catLen + msgLen;
-        if (e.scopes != null) { est = est + e.scopes.Count * 24; }
-        if (e.fields != null) { est = est + e.fields.Count * 32; }
+        long estL = 64L + (long)catLen + (long)msgLen;
+        if (e.scopes != null) { estL = estL + (long)e.scopes.Count * 24L; }
+        if (e.fields != null) { estL = estL + (long)e.fields.Count * 32L; }
+        if (estL > 2147483591L) {
+            throw new InvalidOperationException("LogFormatter.Text: log event exceeds maximum length");
+        }
+        int est = (int)estL;
 
         byte[] buf = new byte[est];
         nint bp = (nint)buf;
@@ -140,8 +151,9 @@ public class LogFormatter {
             for (int i = 0; i < sn; i = i + 1) {
                 string sc = e.scopes[i];
                 int sl = sc != null ? sc.Length : 0;
-                if (pos + 4 + sl > cap) {
-                    buf = LogFormatter.EnsureCap(buf, pos, pos + 4 + sl, out bp);
+                long needScope = (long)pos + 4L + (long)sl;
+                if (needScope > (long)cap) {
+                    buf = LogFormatter.EnsureCap(buf, pos, needScope, out bp);
                     cap = buf.Length;
                 }
                 buf[pos] = 32; buf[pos + 1] = 61; buf[pos + 2] = 62; buf[pos + 3] = 32;
@@ -157,12 +169,14 @@ public class LogFormatter {
             int n = keys.Count;
             for (int i = 0; i < n; i = i + 1) {
                 string k = keys[i];
+                if (k == null) { continue; }
                 string v = "";
                 if (!e.fields.TryGetValue(k, out v)) { continue; }
                 int kl = k.Length;
                 int vl = v != null ? v.Length : 0;
-                if (pos + 2 + kl + vl > cap) {
-                    buf = LogFormatter.EnsureCap(buf, pos, pos + 2 + kl + vl, out bp);
+                long needField = (long)pos + 2L + (long)kl + (long)vl;
+                if (needField > (long)cap) {
+                    buf = LogFormatter.EnsureCap(buf, pos, needField, out bp);
                     cap = buf.Length;
                 }
                 buf[pos] = 32;
@@ -179,8 +193,8 @@ public class LogFormatter {
                 }
             }
         }
-        if (pos + 1 > cap) {
-            buf = LogFormatter.EnsureCap(buf, pos, pos + 1, out bp);
+        if ((long)pos + 1L > (long)cap) {
+            buf = LogFormatter.EnsureCap(buf, pos, (long)pos + 1L, out bp);
         }
         buf[pos] = 10;
         return NativeMemory.GetString(bp, 0, pos + 1);

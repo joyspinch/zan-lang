@@ -37,15 +37,21 @@ public class CborWriter {
         if (extra < 0) {
             throw new CborException("negative buffer growth request");
         }
+        long limit = CborWriter.MaxTotalBytes;
+        if (limit < 0L || limit > 2147483591L) { limit = 2147483591L; }
         long need = (long)len + (long)extra;
-        if (need > CborWriter.MaxTotalBytes) {
+        if (need > limit) {
             throw new CborException("encoded size "
-                + Convert.ToString(need) + " exceeds 512MB write limit");
+                + Convert.ToString(need) + " exceeds write limit");
         }
-        if (need <= buf.Length) { return; }
-        long c = (long)buf.Length * 2;
-        if (c < 16) { c = 16; }
-        while (c < need) { c = c * 2; }
+        if (need <= (long)buf.Length) { return; }
+        long c = (long)buf.Length * 2L;
+        if (c < 16L) { c = 16L; }
+        while (c < need) {
+            c = c * 2L;
+            if (c > limit) { c = limit; break; }
+        }
+        if (c > limit) { c = limit; }
         byte[] grown = new byte[(int)c];
         NativeMemory.Copy((nint)grown, (nint)buf, len);
         buf = grown;
@@ -146,10 +152,14 @@ public class CborWriter {
     public void WriteUint(long v) { Head(0, v); }
 
     // 负整数（major 1，值 = -1 - n；n = ~v 对 long.MinValue 也不溢出）。
-    public void WriteNeg(long v) { Head(1, ~v); }
+    public void WriteNeg(long v) {
+        if (v >= 0L) { throw new ArgumentOutOfRangeException("v", "WriteNeg requires a negative value"); }
+        Head(1, ~v);
+    }
 
     // text string（major 3）；超过 ChunkBytes 写 indefinite 分片。头+载荷单次扩容直写。
     public void WriteString(string s) {
+        if (s == null) { throw new ArgumentNullException("s"); }
         int n = s.Length;
         if (n > CborWriter.ChunkBytes) {
             ChunkedStr(s);
@@ -157,7 +167,7 @@ public class CborWriter {
         }
         int hdr = n < 24 ? 1 : (n < 256 ? 2 : (n < 65536 ? 3 : 5));
         int p = len;
-        if (p + hdr + n > buf.Length) { EnsureRoom(hdr + n); }
+        if ((long)p + (long)hdr + (long)n > (long)buf.Length) { EnsureRoom(hdr + n); }
         Span<byte> dst = new Span<byte>((nint)buf, buf.Length);
         if (hdr == 1) {
             dst[p] = (byte)(96 | n);
@@ -209,6 +219,7 @@ public class CborWriter {
 
     // byte string（major 2）；超过 ChunkBytes 写 indefinite 分片。头+载荷单次扩容直写。
     public void WriteBytes(byte[] b) {
+        if (b == null) { throw new ArgumentNullException("b"); }
         int n = b.Length;
         if (n > CborWriter.ChunkBytes) {
             Chunked(2, b);
@@ -216,7 +227,7 @@ public class CborWriter {
         }
         int hdr = n < 24 ? 1 : (n < 256 ? 2 : (n < 65536 ? 3 : 5));
         int p = len;
-        if (p + hdr + n > buf.Length) { EnsureRoom(hdr + n); }
+        if ((long)p + (long)hdr + (long)n > (long)buf.Length) { EnsureRoom(hdr + n); }
         Span<byte> dst = new Span<byte>((nint)buf, buf.Length);
         if (hdr == 1) {
             dst[p] = (byte)(64 | n);
@@ -244,6 +255,7 @@ public class CborWriter {
     // indefinite 分片主体：起始字节（major|31）、逐块定长编码、
     // break（0xFF）。等长分块，仅末块可短。
     public void Chunked(int major, byte[] b) {
+        if (b == null) { throw new ArgumentNullException("b"); }
         int m = major << 5;
         RawU8(m | 31);
         int off = 0;
