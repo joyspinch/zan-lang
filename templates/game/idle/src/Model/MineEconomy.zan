@@ -1,0 +1,457 @@
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+using Game.Idle;
+
+// 这座矿场的完整经济规则（界面、无头回放与平衡探针共用同一份）。
+//
+// 底层的金币 / 本轮累计 / 点击数 / 矿机等级仍在 Game.Idle.IdleState 里；这里叠上
+// 本游戏的规则：
+//   - 里程碑：矿机到 Lv25 / 50 / 100、之后每 100 级，该矿机产出 ×2；
+//   - 批量购买：×1 / ×10 / 最大（买得起多少买多少）；
+//   - 金矿石：每 45~90 秒在矿洞里冒出一块，13 秒内敲开 → 65% "金矿脉"（一笔横财）
+//     或 35% "淘金狂潮"（12 秒内手动开采 ×7）；
+//   - 熔炉超载：手动开启，30 秒内全部产出 ×2，之后冷却 240 秒；
+//   - 成就：16 个，每个全局产出永久 +2%；
+//   - 地心转生：本轮累计开采满 2B 可转生，得 floor(√(本轮累计 / 10M)) 枚地心晶（门槛处 14 枚），
+//     每枚全局产出永久 +10%；金币、矿机、增益清零，地心晶 / 成就 / 统计保留。
+//
+// 只认"经过了多少秒"与玩家动作，不碰时钟、窗口、音效、存档；随机数只来自种子。
+public class MineEconomy {
+    public const double OverdriveSeconds = 30.0;
+    public const double OverdriveCooldown = 240.0;
+    public const double OverdriveMult = 2.0;
+    public const double GoldenLife = 13.0;
+    public const int GoldenMinGap = 45;
+    public const int GoldenMaxGap = 90;
+    public const double RushSeconds = 12.0;
+    public const double RushMult = 7.0;
+    public const double PrestigeGate = 2000000000.0;
+    public const double CrystalUnit = 10000000.0;
+    public const double CrystalBonus = 0.10;
+    public const double AchievementBonus = 0.02;
+    public const double ClickDpsShare = 0.05;
+
+    // 事件种类（界面排空做反馈，回放忽略）。
+    public const int EvMilestone = 1;
+    public const int EvAchievement = 2;
+    public const int EvGoldenSpawn = 3;
+    public const int EvGoldenLost = 4;
+    public const int EvOverdriveReady = 5;
+    public const int EvOverdriveEnd = 6;
+    public const int EvRushEnd = 7;
+
+    public IdleState state;
+    public DeterministicRandom rng;
+
+    // 转生层与永久进度
+    public long crystals;
+    public long prestiges;
+    public double lifetimeEarned;
+    public long achieved;          // 成就位图（第 i 位 = 第 i 个成就）
+    public long goldenClicks;
+    public long overdriveUses;
+
+    // 临时增益与随机事件（秒）
+    public double overdriveLeft;
+    public double overdriveCooldown;
+    public double rushLeft;
+    public double goldenTimer;     // 距下一块金矿石冒出
+    public double goldenLeft;      // >0：金矿石正在矿洞里，剩余秒数
+
+    // 购买模式：1 = ×1，10 = ×10，0 = 最大
+    public int buyMode;
+
+    // 最近一次结果（界面飘字用）
+    public double lastGain;
+    public int lastGoldenOutcome;  // 1 金矿脉 2 淘金狂潮
+
+    List<int> evKinds;
+    List<int> evArgs;
+
+    public MineEconomy(long seed) {
+        this.state = new IdleState(MineCatalog.Create());
+        this.rng = new DeterministicRandom(seed);
+        this.crystals = 0;
+        this.prestiges = 0;
+        this.lifetimeEarned = 0.0;
+        this.achieved = 0;
+        this.goldenClicks = 0;
+        this.overdriveUses = 0;
+        this.overdriveLeft = 0.0;
+        this.overdriveCooldown = 0.0;
+        this.rushLeft = 0.0;
+        this.goldenLeft = 0.0;
+        this.buyMode = 1;
+        this.lastGain = 0.0;
+        this.lastGoldenOutcome = 0;
+        this.evKinds = new List<int>();
+        this.evArgs = new List<int>();
+        this.goldenTimer = (double)this.rng.Between(GoldenMinGap, GoldenMaxGap + 1);
+    }
+
+    // ---- 读数 -------------------------------------------------------------
+
+    public double Gold { get { return this.state.gold; } }
+    public double RunEarned { get { return this.state.totalEarned; } }
+    public long Clicks { get { return this.state.clicks; } }
+    public List<IdleBuilding> Buildings { get { return this.state.buildings; } }
+    public bool OverdriveActive { get { return this.overdriveLeft > 0.0; } }
+    public bool OverdriveReady { get { return this.overdriveLeft <= 0.0 && this.overdriveCooldown <= 0.0; } }
+    public bool RushActive { get { return this.rushLeft > 0.0; } }
+    public bool GoldenVisible { get { return this.goldenLeft > 0.0; } }
+
+    public int AchievementCount {
+        get {
+            int n = 0;
+            for (int i = 0; i < MineAchievements.Count; i = i + 1) {
+                if (this.HasAchievement(i)) { n = n + 1; }
+            }
+            return n;
+        }
+    }
+
+    public bool HasAchievement(int id) { return (this.achieved & (1L << id)) != 0; }
+
+    public int TotalLevels {
+        get {
+            int n = 0;
+            for (int i = 0; i < this.state.buildings.Count; i = i + 1) { n = n + this.state.buildings[i].level; }
+            return n;
+        }
+    }
+
+    public int BestLevel {
+        get {
+            int n = 0;
+            for (int i = 0; i < this.state.buildings.Count; i = i + 1) {
+                if (this.state.buildings[i].level > n) { n = this.state.buildings[i].level; }
+            }
+            return n;
+        }
+    }
+
+    // 永久倍率：地心晶 × 成就（转生不清零）。
+    public double PermanentMult {
+        get {
+            return (1.0 + CrystalBonus * (double)this.crystals)
+                * (1.0 + AchievementBonus * (double)this.AchievementCount);
+        }
+    }
+
+    public double BoostMult { get { return this.OverdriveActive ? OverdriveMult : 1.0; } }
+
+    // ---- 里程碑 -----------------------------------------------------------
+
+    // 已越过的里程碑个数：25 / 50 / 100，之后每 100 级一个。
+    public static int MilestonesAt(int level) {
+        int n = 0;
+        if (level >= 25) { n = n + 1; }
+        if (level >= 50) { n = n + 1; }
+        if (level >= 100) { n = n + 1 + (level - 100) / 100; }
+        return n;
+    }
+
+    // 下一个里程碑等级。
+    public static int NextMilestone(int level) {
+        if (level < 25) { return 25; }
+        if (level < 50) { return 50; }
+        if (level < 100) { return 100; }
+        return (level / 100 + 1) * 100;
+    }
+
+    // 上一个里程碑等级（进度条起点）。
+    public static int PrevMilestone(int level) {
+        if (level < 25) { return 0; }
+        if (level < 50) { return 25; }
+        if (level < 100) { return 50; }
+        return (level / 100) * 100;
+    }
+
+    public static double MilestoneMult(int level) {
+        double m = 1.0;
+        int n = MilestonesAt(level);
+        for (int i = 0; i < n; i = i + 1) { m = m * 2.0; }
+        return m;
+    }
+
+    // 某座矿机在给定等级下的基础产出（未乘全局倍率）。
+    public static double RawDpsAt(IdleBuilding b, int level) {
+        if (level <= 0) { return 0.0; }
+        return (double)b.baseDps * (double)level * MilestoneMult(level);
+    }
+
+    public double RawDps {
+        get {
+            double sum = 0.0;
+            for (int i = 0; i < this.state.buildings.Count; i = i + 1) {
+                IdleBuilding b = this.state.buildings[i];
+                sum = sum + RawDpsAt(b, b.level);
+            }
+            return sum;
+        }
+    }
+
+    // 第 i 座矿机当前的实际秒产（含全部倍率）。
+    public double BuildingDps(int i) {
+        IdleBuilding b = this.state.buildings[i];
+        return RawDpsAt(b, b.level) * this.PermanentMult * this.BoostMult;
+    }
+
+    // 实时秒产（含超载）。
+    public double Dps { get { return this.RawDps * this.PermanentMult * this.BoostMult; } }
+
+    // 稳态秒产（不含临时增益）：离线收益按它结算。
+    public double SteadyDps { get { return this.RawDps * this.PermanentMult; } }
+
+    // 单次手动开采：(1 + 矿机总等级 + 5% 基础秒产) × 永久倍率 × 超载 × 淘金狂潮。
+    public double ClickPower {
+        get {
+            double p = (1.0 + (double)this.TotalLevels + ClickDpsShare * this.RawDps) * this.PermanentMult * this.BoostMult;
+            if (this.RushActive) { p = p * RushMult; }
+            return Math.Floor(p);
+        }
+    }
+
+    // ---- 批量购买 ---------------------------------------------------------
+
+    public static double CostAt(IdleBuilding b, int level) {
+        return Math.Floor((double)b.baseCost * Math.Pow(b.costMult, (double)level));
+    }
+
+    // 从当前等级起连买 n 级的总价。
+    public double CostFor(int i, int n) {
+        IdleBuilding b = this.state.buildings[i];
+        double sum = 0.0;
+        for (int k = 0; k < n; k = k + 1) { sum = sum + CostAt(b, b.level + k); }
+        return sum;
+    }
+
+    // 现有金币最多能连买几级（上限 1000）。
+    public int MaxAffordable(int i) {
+        IdleBuilding b = this.state.buildings[i];
+        double left = this.state.gold;
+        int n = 0;
+        while (n < 1000) {
+            double c = CostAt(b, b.level + n);
+            if (c > left) { break; }
+            left = left - c;
+            n = n + 1;
+        }
+        return n;
+    }
+
+    // 按当前购买模式，这次点"购买"会买几级（最大模式下买不起也显示 1 级的价）。
+    public int BuyCount(int i) {
+        if (this.buyMode == 0) {
+            int n = this.MaxAffordable(i);
+            return n > 0 ? n : 1;
+        }
+        return this.buyMode;
+    }
+
+    public double BuyCost(int i) { return this.CostFor(i, this.BuyCount(i)); }
+
+    public bool CanBuy(int i) { return this.state.gold >= this.BuyCost(i); }
+
+    public void SetBuyMode(int mode) {
+        if (mode == 1 || mode == 10 || mode == 0) { this.buyMode = mode; }
+    }
+
+    // 按当前模式购买；钱不够整批就一级也不买，返回买到的级数。
+    public int Buy(int i) {
+        if (i < 0 || i >= this.state.buildings.Count) { return 0; }
+        int n = this.BuyCount(i);
+        double cost = this.CostFor(i, n);
+        if (this.state.gold < cost) { return 0; }
+        IdleBuilding b = this.state.buildings[i];
+        int before = b.level;
+        this.state.gold = this.state.gold - cost;
+        if (this.state.gold < 0.0) { this.state.gold = 0.0; }
+        b.level = b.level + n;
+        if (MilestonesAt(b.level) > MilestonesAt(before)) {
+            this.Emit(EvMilestone, i * 10000 + PrevMilestone(b.level));
+        }
+        this.CheckAchievements();
+        return n;
+    }
+
+    // ---- 动作 -------------------------------------------------------------
+
+    // 手动开采一次，返回入账金币。
+    public double Mine() {
+        double gain = this.ClickPower;
+        this.state.clicks = this.state.clicks + 1;
+        this.Earn(gain);
+        this.lastGain = gain;
+        this.CheckAchievements();
+        return gain;
+    }
+
+    // 敲开金矿石：返回 0 没有矿石；1 金矿脉（lastGain 为横财）；2 淘金狂潮。
+    public int ClickGolden() {
+        if (this.goldenLeft <= 0.0) { return 0; }
+        this.goldenLeft = 0.0;
+        this.goldenTimer = (double)this.rng.Between(GoldenMinGap, GoldenMaxGap + 1);
+        this.goldenClicks = this.goldenClicks + 1;
+        if (this.rng.NextBelow(100) < 65) {
+            double lump = this.Dps * 60.0;
+            double floor = this.ClickPower * 25.0;
+            if (lump < floor) { lump = floor; }
+            lump = Math.Floor(lump);
+            this.Earn(lump);
+            this.lastGain = lump;
+            this.lastGoldenOutcome = 1;
+        } else {
+            this.rushLeft = RushSeconds;
+            this.lastGain = 0.0;
+            this.lastGoldenOutcome = 2;
+        }
+        this.CheckAchievements();
+        return this.lastGoldenOutcome;
+    }
+
+    // 熔炉超载：就绪时开启，返回是否开启成功。
+    public bool ActivateOverdrive() {
+        if (!this.OverdriveReady) { return false; }
+        this.overdriveLeft = OverdriveSeconds;
+        this.overdriveCooldown = OverdriveCooldown;
+        this.overdriveUses = this.overdriveUses + 1;
+        this.CheckAchievements();
+        return true;
+    }
+
+    // ---- 地心转生 ---------------------------------------------------------
+
+    public bool CanPrestige { get { return this.state.totalEarned >= PrestigeGate; } }
+
+    // 现在转生能拿到的地心晶。
+    public long PendingCrystals {
+        get {
+            double r = this.state.totalEarned / CrystalUnit;
+            if (!(r > 0.0)) { return 0; }
+            return (long)Math.Floor(Math.Sqrt(r));
+        }
+    }
+
+    // 转生：返回获得的地心晶（不满门槛返回 0、什么都不变）。
+    public long Prestige() {
+        if (!this.CanPrestige) { return 0; }
+        long gain = this.PendingCrystals;
+        long clicks = this.state.clicks;
+        this.crystals = this.crystals + gain;
+        this.prestiges = this.prestiges + 1;
+        this.state = new IdleState(MineCatalog.Create());
+        this.state.clicks = clicks;
+        this.overdriveLeft = 0.0;
+        this.overdriveCooldown = 0.0;
+        this.rushLeft = 0.0;
+        this.goldenLeft = 0.0;
+        this.goldenTimer = (double)this.rng.Between(GoldenMinGap, GoldenMaxGap + 1);
+        this.CheckAchievements();
+        return gain;
+    }
+
+    // ---- 时间推进 ---------------------------------------------------------
+
+    // 推进 dt 秒：结算产出、增益倒计时、金矿石刷新。
+    public void Step(double dt) {
+        if (!(dt > 0.0)) { return; }
+        double dps = this.Dps;
+        if (dps > 0.0) { this.Earn(dps * dt); }
+
+        if (this.overdriveLeft > 0.0) {
+            this.overdriveLeft = this.overdriveLeft - dt;
+            if (this.overdriveLeft <= 0.0) { this.overdriveLeft = 0.0; this.Emit(EvOverdriveEnd, 0); }
+        }
+        if (this.overdriveCooldown > 0.0) {
+            this.overdriveCooldown = this.overdriveCooldown - dt;
+            if (this.overdriveCooldown <= 0.0) { this.overdriveCooldown = 0.0; this.Emit(EvOverdriveReady, 0); }
+        }
+        if (this.rushLeft > 0.0) {
+            this.rushLeft = this.rushLeft - dt;
+            if (this.rushLeft <= 0.0) { this.rushLeft = 0.0; this.Emit(EvRushEnd, 0); }
+        }
+        if (this.goldenLeft > 0.0) {
+            this.goldenLeft = this.goldenLeft - dt;
+            if (this.goldenLeft <= 0.0) {
+                this.goldenLeft = 0.0;
+                this.goldenTimer = (double)this.rng.Between(GoldenMinGap, GoldenMaxGap + 1);
+                this.Emit(EvGoldenLost, 0);
+            }
+        } else if (this.state.clicks > 0) {
+            // 第一次手动开采之后才开始刷金矿石（新手先学会点矿晶）。
+            this.goldenTimer = this.goldenTimer - dt;
+            if (this.goldenTimer <= 0.0) {
+                this.goldenTimer = 0.0;
+                this.goldenLeft = GoldenLife;
+                this.Emit(EvGoldenSpawn, 0);
+            }
+        }
+        this.CheckAchievements();
+    }
+
+    // 外部收益入账（离线结算）：计入本轮与终身累计。
+    public void AddGold(double amount) { this.Earn(amount); }
+
+    void Earn(double amount) {
+        if (!(amount > 0.0)) { return; }
+        this.state.AddGold(amount);
+        this.lifetimeEarned = this.lifetimeEarned + amount;
+    }
+
+    // ---- 成就 -------------------------------------------------------------
+
+    double AchievementValue(int kind) {
+        if (kind == 0) { return (double)this.state.clicks; }
+        if (kind == 1) { return (double)this.TotalLevels; }
+        if (kind == 2) { return this.SteadyDps; }
+        if (kind == 3) { return this.lifetimeEarned; }
+        if (kind == 4) { return (double)this.BestLevel; }
+        if (kind == 5) { return (double)this.goldenClicks; }
+        if (kind == 6) { return (double)this.overdriveUses; }
+        if (kind == 7) { return (double)this.prestiges; }
+        return (double)this.crystals;
+    }
+
+    // 成就进度 0..1（成就面板用）。
+    public double AchievementProgress(int id) {
+        if (this.HasAchievement(id)) { return 1.0; }
+        double v = this.AchievementValue(MineAchievements.Kind(id)) / MineAchievements.Goal(id);
+        if (v < 0.0) { return 0.0; }
+        if (v > 1.0) { return 1.0; }
+        return v;
+    }
+
+    public void CheckAchievements() {
+        for (int i = 0; i < MineAchievements.Count; i = i + 1) {
+            if (this.HasAchievement(i)) { continue; }
+            if (this.AchievementValue(MineAchievements.Kind(i)) >= MineAchievements.Goal(i)) {
+                this.achieved = this.achieved | (1L << i);
+                this.Emit(EvAchievement, i);
+            }
+        }
+    }
+
+    // ---- 事件队列 ---------------------------------------------------------
+
+    void Emit(int kind, int arg) {
+        // 没人排空时（回放 / 平衡探针）不让队列无限长。
+        if (this.evKinds.Count >= 64) {
+            this.evKinds.RemoveAt(0);
+            this.evArgs.RemoveAt(0);
+        }
+        this.evKinds.Add(kind);
+        this.evArgs.Add(arg);
+    }
+
+    // 取出最早的事件；没有返回 0。
+    public int PollEvent(out int arg) {
+        if (this.evKinds.Count == 0) { arg = 0; return 0; }
+        int k = this.evKinds[0];
+        arg = this.evArgs[0];
+        this.evKinds.RemoveAt(0);
+        this.evArgs.RemoveAt(0);
+        return k;
+    }
+}
