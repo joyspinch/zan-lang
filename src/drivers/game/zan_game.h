@@ -350,6 +350,16 @@ ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
 ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
     float radius, float r, float g, float b);
 
+/* GPU 3D 传送门螺旋能量漩涡（Portal Vortex Swirl，零贴图零额外 Pass）：
+ * enabled != 0 时按 UV 极坐标生成带旋臂旋转与径向环罩的传送门能量发光，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_portal_vortex3d(int32_t enabled,
+    float swirl_turns, float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理复古怀旧棕褐色调与胶片划痕（Vintage Sepia Film，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制怀旧棕褐混合强度，scratch_amount [0..1] 控制竖向老胶片划痕密度，seed 控制帧随机。 */
+ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
+    float scratch_amount, float seed);
+
 #ifdef __cplusplus
 }
 #endif
