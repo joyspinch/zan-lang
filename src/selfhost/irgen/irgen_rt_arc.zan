@@ -3,6 +3,18 @@ using System.Collections.Generic;
 using System.Text;
 namespace Zan;
 
+class BranchTempScope {
+    public List<string> temps;
+    public List<string> vals;
+    public List<string> owners;
+    public List<Node> types;
+    public List<List<string>> armStack;
+    public List<Dictionary<string, bool>> armSets;
+    public List<List<string>> armPending;
+    public List<StringBuilder> armFn;
+    public bool hasPend;
+}
+
 partial class Irgen {
     void EmitArcRuntime() {
         EmitDelegateOwnershipRuntime();
@@ -635,6 +647,48 @@ partial class Irgen {
         }
         hasPendingCallArm = AnyPendingCallArm();
         if (!term) { RetireArgTemps(top); }
+    }
+
+    // Isolate temporaries and exception-owner call-arm state inside a conditional
+    // or short-circuit branch (`?.`, `?:`, `&&`, `||`, `??`) so armed slots are
+    // retired strictly on the path that armed them and never leak on unwind.
+    BranchTempScope EnterBranchTempScope() {
+        if (hasPendingCallArm) { FlushPendingCallArms(); }
+        BranchTempScope s = new BranchTempScope();
+        s.temps = stmtTemps;
+        s.vals = stmtTempValues;
+        s.owners = stmtTempOwners;
+        s.types = stmtTempTypes;
+        s.armStack = callArmStack;
+        s.armSets = callArmSets;
+        s.armPending = callArmPending;
+        s.armFn = callArmFn;
+        s.hasPend = hasPendingCallArm;
+        stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
+        stmtTempTypes = new List<Node>();
+        callArmStack = null;
+        callArmSets = null;
+        callArmPending = null;
+        callArmFn = null;
+        hasPendingCallArm = false;
+        EnterCallArm();
+        return s;
+    }
+
+    void LeaveBranchTempScope(BranchTempScope s) {
+        LeaveCallArm();
+        EmitTempReleases();
+        stmtTemps = s.temps;
+        stmtTempValues = s.vals;
+        stmtTempOwners = s.owners;
+        stmtTempTypes = s.types;
+        callArmStack = s.armStack;
+        callArmSets = s.armSets;
+        callArmPending = s.armPending;
+        callArmFn = s.armFn;
+        hasPendingCallArm = s.hasPend;
     }
 
     // Is this slot already armed by a pending call of the current function?

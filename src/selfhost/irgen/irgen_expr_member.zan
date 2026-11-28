@@ -10,12 +10,14 @@ partial class Irgen {
     // member node is temporarily rewired to read the synthetic local so the
     // ordinary member/call codegen applies unchanged, then restored.
     ExprVal GenNullCond(Node full, Node qmem) {
+        EnterCallArm();
         ExprVal obj = GenExpr(qmem.a);
         string ot = MapType(obj.ty);
         if (!IsPtrLL(ot)) {
             qmem.ival = 0;
             ExprVal pv = GenExpr(full);
             qmem.ival = 1;
+            LeaveCallArm();
             return pv;
         }
         qdotSeq = qdotSeq + 1;
@@ -33,12 +35,10 @@ partial class Irgen {
         string bpre = curLbl;
         L("  br i1 " + isn + ", label %L" + lend + ", label %L" + lthen);
         Label(lthen);
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        BranchTempScope bts = EnterBranchTempScope();
         ExprVal v = GenExpr(full);
         EmitArcRetain(v.op, v.ty);
-        EmitTempReleases();
-        stmtTemps = svT; stmtTempTypes = svTT;
+        LeaveBranchTempScope(bts);
         qmem.a = saved; qmem.ival = 1;
         string valOp = v.op;
         bool isValPrim = (v.ty != null && IsPrimValue(v.ty) && !IsNullable(v.ty));
@@ -53,16 +53,21 @@ partial class Irgen {
             nty.op = 1;
             string r = NT();
             L("  " + r + " = phi i8* [ null, %" + bpre + " ], [ " + valOp + ", %" + bthen + " ]");
+            LeaveCallArm();
             AddTemp(r, nty);
             return new ExprVal(r, nty);
         }
         string vt = MapType(v.ty);
-        if (vt == "void") { return new ExprVal("0", MkType("int")); }
+        if (vt == "void") {
+            LeaveCallArm();
+            return new ExprVal("0", MkType("int"));
+        }
         string dflt = "0";
         if (IsPtrLL(vt)) { dflt = "null"; }
         if (vt == "double") { dflt = "0.0"; }
         string r = NT();
         L("  " + r + " = phi " + vt + " [ " + dflt + ", %" + bpre + " ], [ " + v.op + ", %" + bthen + " ]");
+        LeaveCallArm();
         AddTemp(r, v.ty);
         return new ExprVal(r, v.ty);
     }
