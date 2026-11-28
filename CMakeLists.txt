@@ -3635,6 +3635,21 @@ add_test(NAME conformance_gui_button_round_caption
 set_tests_properties(conformance_gui_button_round_caption PROPERTIES
     TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# Render3D GPU 路径上下方向：视线上方的方块必须落在画面上半部。3D 顶点着色器
+# 曾对 clip.y 取反（误把画布 FBO 当顶朝下），整幅 3D 世界上下颠倒而 HUD 正常。
+# 无 GPU 后端时测试自身记 SKIP（stderr），golden 不变。
+add_test(NAME conformance_gui_render3d_orientation
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/render3d_orientation_test.zan
+    "-DZANC_ARGS=--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_render3d_orientation.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_render3d_orientation${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_render3d_orientation PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 set(_cw_publish_doc "${CMAKE_SOURCE_DIR}/tests/gui/cwpublish")
 set(_cw_publish_cwd "${CMAKE_BINARY_DIR}/cases/cwpublish_cwd")
 file(MAKE_DIRECTORY "${_cw_publish_cwd}")

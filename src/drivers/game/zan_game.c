@@ -283,7 +283,10 @@ static const char *zan_game_glsl_head(void) {
 }
 
 /* 属性位置常量与 VAO 配置一一对应（ZAN_GAME_LOC_*），四种变体共享同一
- * 网格 VAO。Y 翻转：3D 画进画布 FBO（顶朝下表面），clip 空间先翻 Y。 */
+ * 网格 VAO。不翻 Y：画布 FBO 是标准 GL 底朝上布局（2D 着色器
+ * ndc.y = 1 - y/H*2、回读逐行倒序、present 原样 blit、天空盒与 scissor
+ * 都按此约定），clip 直接输出即可。曾在这里对 clip.y 取反，整幅 3D
+ * 世界上下颠倒而 HUD 正常（macOS 上 fps-3d 可见）。 */
 
 static const char *const ZAN_GAME_3D_VS_PLAIN =
 "layout(location = 0) in vec3 a_pos;\n"
@@ -304,7 +307,7 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
 "    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"    gl_Position = clip;\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_COLOR =
@@ -329,7 +332,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "    v_color = a_color;\n"
 "    v_light_pos = uLightVP * wp;\n"
 "    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"    gl_Position = clip;\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_SKINNED =
@@ -362,7 +365,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
 "    vec4 clip = uMVP * sp;\n"
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"    gl_Position = clip;\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_SHADOW =
@@ -408,7 +411,7 @@ static const char *const ZAN_GAME_3D_VS_INST =
 "    v_normal = a_normal;\n"
 "    v_tint = i_tint;\n"
 "    vec4 clip = i_mvp * vec4(a_pos, 1.0);\n"
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"    gl_Position = clip;\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_INST_COLOR =
@@ -428,7 +431,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    v_color = a_color;\n"
 "    v_tint = i_tint;\n"
 "    vec4 clip = i_mvp * vec4(a_pos, 1.0);\n"
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"    gl_Position = clip;\n"
 "}\n";
 
 /* 光照 uniform（A489）：四份片元着色器共享同一段光照计算——环境光 +
@@ -1536,7 +1539,6 @@ static void zan_game_clip(const zan_gpu_frame *frame, int *x, int *y,
 }
 
 #define ZAN_GAME_GL_FRONT 0x0404
-#define ZAN_GAME_GL_CW    0x0900
 
 static void zan_game_apply_blend_state(const zan_gl_api *gl) {
     if (g_game_blend_enabled == 2) {
@@ -1563,8 +1565,8 @@ static void zan_game_apply_blend_state(const zan_gl_api *gl) {
     }
     if (g_game_cull_mode != 0 && gl->CullFace) {
         gl->Enable(ZGL_CULL_FACE);
-        /* Canvas FBO 顶点着色器对 clip.y 取反，标准 CCW 正面在 FBO 空间变为 CW */
-        if (gl->FrontFace) gl->FrontFace(ZAN_GAME_GL_CW);
+        /* clip 不翻 Y，标准 CCW 即正面 */
+        if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
         gl->CullFace(g_game_cull_mode == 2 ? ZAN_GAME_GL_FRONT : ZGL_BACK);
     } else {
         gl->Disable(ZGL_CULL_FACE);
