@@ -1,0 +1,213 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 赛季段位枚举。
+public enum SeasonRankTier {
+    Bronze = 0,
+    Silver = 1,
+    Gold = 2,
+    Platinum = 3,
+    Diamond = 4,
+    Grandmaster = 5
+}
+
+// 排位天梯玩家记录。
+public class LeaderboardRecord {
+    public int PlayerId;
+    public int Score;
+    public long AchievedAtSec;
+
+    public LeaderboardRecord(int playerId, int score, long achievedAtSec) {
+        this.PlayerId = playerId;
+        this.Score = score;
+        this.AchievedAtSec = achievedAtSec;
+    }
+}
+
+// 商业多人排位天梯榜（Ranked Leaderboard with Tie-Break & Pagination）：
+// - 分数降序排列；同分按先达成时间（AchievedAtSec 升序）、再按 PlayerId 升序稳定裁决
+// - 支持单玩家实时排名查询、分页截取与赛季段位映射
+public class NetRankedLeaderboard {
+    private List<LeaderboardRecord> records;
+
+    public NetRankedLeaderboard() {
+        this.records = new List<LeaderboardRecord>();
+    }
+
+    public int Count() {
+        return this.records.Count;
+    }
+
+    private static bool ComesBefore(LeaderboardRecord a, LeaderboardRecord b) {
+        if (a.Score != b.Score) { return a.Score > b.Score; }
+        if (a.AchievedAtSec != b.AchievedAtSec) { return a.AchievedAtSec < b.AchievedAtSec; }
+        return a.PlayerId < b.PlayerId;
+    }
+
+    public void UpsertScore(int playerId, int score, long achievedAtSec) {
+        if (playerId <= 0) { return; }
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].PlayerId == playerId) {
+                this.records[i].Score = score;
+                this.records[i].AchievedAtSec = achievedAtSec;
+                this.SortRecords();
+                return;
+            }
+        }
+        this.records.Add(new LeaderboardRecord(playerId, score, achievedAtSec));
+        this.SortRecords();
+    }
+
+    private void SortRecords() {
+        for (int i = 1; i < this.records.Count; i = i + 1) {
+            LeaderboardRecord key = this.records[i];
+            int j = i - 1;
+            while (j >= 0 && ComesBefore(key, this.records[j])) {
+                this.records[j + 1] = this.records[j];
+                j = j - 1;
+            }
+            this.records[j + 1] = key;
+        }
+    }
+
+    // 返回 1-based 排名，未上榜返回 0。
+    public int GetRank(int playerId) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].PlayerId == playerId) { return i + 1; }
+        }
+        return 0;
+    }
+
+    public List<LeaderboardRecord> GetPage(int offset, int limit) {
+        List<LeaderboardRecord> page = new List<LeaderboardRecord>();
+        if (offset < 0 || limit <= 0 || offset >= this.records.Count) { return page; }
+        int end = offset + limit;
+        if (end > this.records.Count) { end = this.records.Count; }
+        for (int i = offset; i < end; i = i + 1) {
+            page.Add(this.records[i]);
+        }
+        return page;
+    }
+
+    public static SeasonRankTier ResolveTier(int score) {
+        if (score >= 3000) { return SeasonRankTier.Grandmaster; }
+        if (score >= 2400) { return SeasonRankTier.Diamond; }
+        if (score >= 1900) { return SeasonRankTier.Platinum; }
+        if (score >= 1500) { return SeasonRankTier.Gold; }
+        if (score >= 1100) { return SeasonRankTier.Silver; }
+        return SeasonRankTier.Bronze;
+    }
+}
+
+// 商业竞技赛季 MMR 软重置与高分段不活跃衰减计算器（Season Soft Reset & Elo Decay）：
+// - 新赛季按 baseline + (oldMmr - baseline) * compressFactor 向中位分收拢并限制在定级区间
+// - 高分段超过宽限天数未排位按日衰减，但永不跌破保护底线（DecayFloorMmr）
+public class NetSeasonSoftResetCalculator {
+    public int BaselineMmr;
+    public double CompressFactor;
+    public int MinPlacementMmr;
+    public int MaxPlacementMmr;
+    public int DecayStartMmr;
+    public int DecayFloorMmr;
+    public int GraceDays;
+    public int DecayPerDay;
+
+    public NetSeasonSoftResetCalculator(int baselineMmr, double compressFactor,
+                                        int minPlacementMmr, int maxPlacementMmr,
+                                        int decayStartMmr, int decayFloorMmr,
+                                        int graceDays, int decayPerDay) {
+        this.BaselineMmr = baselineMmr;
+        this.CompressFactor = compressFactor > 0.0 && compressFactor <= 1.0 ? compressFactor : 0.6;
+        this.MinPlacementMmr = minPlacementMmr;
+        this.MaxPlacementMmr = maxPlacementMmr >= minPlacementMmr ? maxPlacementMmr : minPlacementMmr;
+        this.DecayStartMmr = decayStartMmr;
+        this.DecayFloorMmr = decayFloorMmr;
+        this.GraceDays = graceDays >= 0 ? graceDays : 7;
+        this.DecayPerDay = decayPerDay >= 0 ? decayPerDay : 25;
+    }
+
+    public int ComputeSoftReset(int previousSeasonMmr) {
+        double shifted = (double)this.BaselineMmr
+            + ((double)(previousSeasonMmr - this.BaselineMmr)) * this.CompressFactor;
+        int next = (int)(shifted >= 0.0 ? (shifted + 0.5) : (shifted - 0.5));
+        if (next < this.MinPlacementMmr) { next = this.MinPlacementMmr; }
+        if (next > this.MaxPlacementMmr) { next = this.MaxPlacementMmr; }
+        return next;
+    }
+
+    public int ComputeInactivityDecay(int currentMmr, int inactiveDays) {
+        if (currentMmr < this.DecayStartMmr || inactiveDays <= this.GraceDays) {
+            return currentMmr;
+        }
+        int overdue = inactiveDays - this.GraceDays;
+        int decayed = currentMmr - overdue * this.DecayPerDay;
+        if (decayed < this.DecayFloorMmr) { decayed = this.DecayFloorMmr; }
+        return decayed;
+    }
+}
+
+// 确定性输入录像单帧记录。
+public class ReplayInputFrame {
+    public int Tick;
+    public int PlayerId;
+    public int InputBits;
+    public int AimXQuantized;
+    public int AimYQuantized;
+
+    public ReplayInputFrame(int tick, int playerId, int inputBits, int aimXQuantized, int aimYQuantized) {
+        this.Tick = tick;
+        this.PlayerId = playerId;
+        this.InputBits = inputBits;
+        this.AimXQuantized = aimXQuantized;
+        this.AimYQuantized = aimYQuantized;
+    }
+}
+
+// 商业多人确定性帧录像与不同步校验器（Deterministic Input Replay Recorder & Desync Digest）：
+// - 强制 Tick 非递减顺序录制，拒绝乱序/倒退帧
+// - 增量维护 FNV-1a 确定性输入流摘要，支持按 [fromTick..toTick] 区间切片回放与双端一致性比对
+public class NetMatchReplayRecorder {
+    public int LastTick;
+    public long StreamDigest;
+    private List<ReplayInputFrame> frames;
+
+    public NetMatchReplayRecorder() {
+        this.LastTick = -1;
+        this.StreamDigest = 2166136261L;
+        this.frames = new List<ReplayInputFrame>();
+    }
+
+    public int FrameCount() {
+        return this.frames.Count;
+    }
+
+    private void MixDigest(long v) {
+        this.StreamDigest = ((this.StreamDigest ^ v) * 16777619L) & 2147483647L;
+    }
+
+    public bool RecordFrame(int tick, int playerId, int inputBits, int aimXQuantized, int aimYQuantized) {
+        if (tick < 0 || tick < this.LastTick || playerId <= 0) { return false; }
+        this.LastTick = tick;
+        this.frames.Add(new ReplayInputFrame(tick, playerId, inputBits, aimXQuantized, aimYQuantized));
+        this.MixDigest((long)tick);
+        this.MixDigest((long)playerId);
+        this.MixDigest((long)inputBits);
+        this.MixDigest((long)aimXQuantized);
+        this.MixDigest((long)aimYQuantized);
+        return true;
+    }
+
+    public List<ReplayInputFrame> SliceTicks(int fromTick, int toTick) {
+        List<ReplayInputFrame> res = new List<ReplayInputFrame>();
+        if (toTick < fromTick) { return res; }
+        for (int i = 0; i < this.frames.Count; i = i + 1) {
+            ReplayInputFrame f = this.frames[i];
+            if (f.Tick >= fromTick && f.Tick <= toTick) {
+                res.Add(f);
+            }
+        }
+        return res;
+    }
+}

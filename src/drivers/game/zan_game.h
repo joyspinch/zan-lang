@@ -225,6 +225,16 @@ ZAN_GAME_API void zan_game_set_holo_scan3d(int32_t enabled, float freq,
 ZAN_GAME_API void zan_game_set_post_cinema3d(float letterbox_ratio,
     float distort_amp, float distort_freq, float distort_phase);
 
+/* GPU 世界法线朝上积雪/青苔/落灰材质覆层（World-Aligned Top-Down Snow/Moss Cover）：
+ * enabled != 0 时按 smoothstep(threshold, threshold + sharpness, worldNormal.y) * amount 混入顶面覆色并参与光照与阴影。 */
+ZAN_GAME_API void zan_game_set_top_cover3d(int32_t enabled, float threshold,
+    float sharpness, float amount, float r, float g, float b);
+
+/* GPU 后处理径向冲刺/受击缩放模糊（Radial Speed/Zoom Blur，单 Pass 5 采样零额外 Pass）：
+ * strength [0..0.15] 控制模糊拖尾幅度，(center_x, center_y) 为屏幕 UV 聚焦中心 [0..1]。 */
+ZAN_GAME_API void zan_game_set_post_radial_blur3d(float strength,
+    float center_x, float center_y);
+
 #ifdef __cplusplus
 }
 #endif

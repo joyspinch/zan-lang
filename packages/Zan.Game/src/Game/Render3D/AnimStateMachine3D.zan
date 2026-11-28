@@ -1,0 +1,181 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 3D 动画片段状态节点。
+public class AnimClipState {
+    public string Name;
+    public float DurationSec;
+    public bool Loop;
+    public float Speed;
+
+    public AnimClipState(string name, float durationSec, bool loop, float speed) {
+        this.Name = name != null ? name : "";
+        this.DurationSec = durationSec > 0.001f ? durationSec : 1.0f;
+        this.Loop = loop;
+        this.Speed = speed > 0.0f ? speed : 1.0f;
+    }
+}
+
+// 动画状态跳转规则（支持触发条件名或非循环片段播完自动跳转 ExitOnComplete）。
+public class AnimTransitionRule {
+    public string FromState;
+    public string ToState;
+    public string TriggerName;
+    public float BlendDurationSec;
+    public bool ExitOnComplete;
+
+    public AnimTransitionRule(string fromState, string toState, string triggerName,
+                              float blendDurationSec, bool exitOnComplete) {
+        this.FromState = fromState != null ? fromState : "";
+        this.ToState = toState != null ? toState : "";
+        this.TriggerName = triggerName != null ? triggerName : "";
+        this.BlendDurationSec = blendDurationSec >= 0.0f ? blendDurationSec : 0.0f;
+        this.ExitOnComplete = exitOnComplete;
+    }
+}
+
+// 商业 3D 动画状态机与平滑交叉淡入淡出混合器（Animator State Machine & Crossfade）：
+// - 支持循环/单次播放时间规范化、触发器驱动状态切换、Hermite 平滑交叉混合权重（0..1）
+// - 支持非循环动作（如攻击/受击/翻滚）播完自动衔接回默认状态（ExitOnComplete）
+public class AnimStateMachine3D {
+    public string CurrentState;
+    public float CurrentTimeSec;
+    public string BlendFromState;
+    public float BlendFromTimeSec;
+    public float BlendElapsedSec;
+    public float BlendDurationSec;
+    public bool IsBlending;
+    private List<AnimClipState> states;
+    private List<AnimTransitionRule> transitions;
+
+    public AnimStateMachine3D() {
+        this.CurrentState = "";
+        this.CurrentTimeSec = 0.0f;
+        this.BlendFromState = "";
+        this.BlendFromTimeSec = 0.0f;
+        this.BlendElapsedSec = 0.0f;
+        this.BlendDurationSec = 0.0f;
+        this.IsBlending = false;
+        this.states = new List<AnimClipState>();
+        this.transitions = new List<AnimTransitionRule>();
+    }
+
+    public void AddState(string name, float durationSec, bool loop, float speed) {
+        this.states.Add(new AnimClipState(name, durationSec, loop, speed));
+        if (this.CurrentState == "") {
+            this.CurrentState = name != null ? name : "";
+        }
+    }
+
+    public void AddTransition(string fromState, string toState, string triggerName,
+                              float blendDurationSec, bool exitOnComplete) {
+        this.transitions.Add(new AnimTransitionRule(fromState, toState, triggerName,
+            blendDurationSec, exitOnComplete));
+    }
+
+    private AnimClipState FindState(string name) {
+        if (name == null) { return null; }
+        for (int i = 0; i < this.states.Count; i = i + 1) {
+            if (this.states[i].Name == name) { return this.states[i]; }
+        }
+        return null;
+    }
+
+    private void BeginTransition(string toState, float blendDurationSec) {
+        if (toState == null || toState == "" || toState == this.CurrentState) { return; }
+        if (this.FindState(toState) == null) { return; }
+        if (blendDurationSec > 0.0001f) {
+            this.BlendFromState = this.CurrentState;
+            this.BlendFromTimeSec = this.CurrentTimeSec;
+            this.BlendDurationSec = blendDurationSec;
+            this.BlendElapsedSec = 0.0f;
+            this.IsBlending = true;
+        } else {
+            this.BlendFromState = "";
+            this.BlendFromTimeSec = 0.0f;
+            this.BlendDurationSec = 0.0f;
+            this.BlendElapsedSec = 0.0f;
+            this.IsBlending = false;
+        }
+        this.CurrentState = toState;
+        this.CurrentTimeSec = 0.0f;
+    }
+
+    public bool Trigger(string triggerName) {
+        if (triggerName == null || triggerName == "") { return false; }
+        for (int i = 0; i < this.transitions.Count; i = i + 1) {
+            AnimTransitionRule tr = this.transitions[i];
+            if ((tr.FromState == this.CurrentState || tr.FromState == "*")
+                && !tr.ExitOnComplete && tr.TriggerName == triggerName) {
+                this.BeginTransition(tr.ToState, tr.BlendDurationSec);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 返回当前目标状态混合权重（Hermite Smoothstep 0..1；非混合态为 1.0）。
+    public float BlendWeight() {
+        if (!this.IsBlending || this.BlendDurationSec <= 0.0001f) { return 1.0f; }
+        float t = this.BlendElapsedSec / this.BlendDurationSec;
+        if (t < 0.0f) { t = 0.0f; }
+        if (t > 1.0f) { t = 1.0f; }
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    public float CurrentNormalizedTime() {
+        AnimClipState st = this.FindState(this.CurrentState);
+        if (st == null) { return 0.0f; }
+        float u = this.CurrentTimeSec / st.DurationSec;
+        if (u < 0.0f) { u = 0.0f; }
+        if (u > 1.0f) { u = 1.0f; }
+        return u;
+    }
+
+    private static float AdvanceClipTime(AnimClipState st, float cur, float dt, out bool finished) {
+        finished = false;
+        if (st == null) { return cur; }
+        float next = cur + dt * st.Speed;
+        if (st.Loop) {
+            while (next >= st.DurationSec) { next = next - st.DurationSec; }
+            return next;
+        }
+        if (next >= st.DurationSec) {
+            finished = true;
+            return st.DurationSec;
+        }
+        return next;
+    }
+
+    public void Update(float dt) {
+        if (dt <= 0.0f) { return; }
+        AnimClipState cur = this.FindState(this.CurrentState);
+        bool finished;
+        this.CurrentTimeSec = AdvanceClipTime(cur, this.CurrentTimeSec, dt, out finished);
+
+        if (this.IsBlending) {
+            AnimClipState fromSt = this.FindState(this.BlendFromState);
+            bool fromFin;
+            this.BlendFromTimeSec = AdvanceClipTime(fromSt, this.BlendFromTimeSec, dt, out fromFin);
+            this.BlendElapsedSec = this.BlendElapsedSec + dt;
+            if (this.BlendElapsedSec >= this.BlendDurationSec) {
+                this.IsBlending = false;
+                this.BlendFromState = "";
+                this.BlendElapsedSec = 0.0f;
+                this.BlendDurationSec = 0.0f;
+            }
+        }
+
+        if (finished) {
+            for (int i = 0; i < this.transitions.Count; i = i + 1) {
+                AnimTransitionRule tr = this.transitions[i];
+                if (tr.FromState == this.CurrentState && tr.ExitOnComplete) {
+                    this.BeginTransition(tr.ToState, tr.BlendDurationSec);
+                    break;
+                }
+            }
+        }
+    }
+}

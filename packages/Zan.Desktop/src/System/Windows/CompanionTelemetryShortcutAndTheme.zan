@@ -1,0 +1,248 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌面陪伴基于系统资源遥测的实时情绪状态。
+public enum CompanionResourceMood {
+    Calm = 0,
+    Busy = 1,
+    Overheated = 2,
+    LowBattery = 3,
+    Charging = 4
+}
+
+// 商业桌面陪伴系统遥测情绪感应器（System Resource Mood Sensor with Hysteresis）：
+// - 将 CPU/内存占用、电量百分比与电源接入状态映射为桌宠实时情绪动作
+// - 带滞回带宽（HysteresisMargin）防止指标在阈值附近抖动导致动画高频闪烁
+public class CompanionSystemResourceMoodSensor {
+    public CompanionResourceMood CurrentMood;
+    public int BusyThreshold;
+    public int OverheatThreshold;
+    public int LowBatteryThreshold;
+    public int HysteresisMargin;
+
+    public CompanionSystemResourceMoodSensor(int busyThreshold, int overheatThreshold,
+                                             int lowBatteryThreshold, int hysteresisMargin) {
+        this.CurrentMood = CompanionResourceMood.Calm;
+        this.BusyThreshold = busyThreshold > 0 ? busyThreshold : 60;
+        this.OverheatThreshold = overheatThreshold > this.BusyThreshold ? overheatThreshold : 85;
+        this.LowBatteryThreshold = lowBatteryThreshold > 0 ? lowBatteryThreshold : 20;
+        this.HysteresisMargin = hysteresisMargin >= 0 ? hysteresisMargin : 8;
+    }
+
+    public CompanionResourceMood Evaluate(int cpuPercent, int memPercent,
+                                          int batteryPercent, bool onAcPower) {
+        int load = cpuPercent > memPercent ? cpuPercent : memPercent;
+
+        // 1. 低电量优先告警（未插电且低于阈值，退出需高于阈值 + 滞回）
+        if (!onAcPower) {
+            if (batteryPercent <= this.LowBatteryThreshold) {
+                this.CurrentMood = CompanionResourceMood.LowBattery;
+                return this.CurrentMood;
+            }
+            if (this.CurrentMood == CompanionResourceMood.LowBattery
+                && batteryPercent < this.LowBatteryThreshold + this.HysteresisMargin) {
+                return this.CurrentMood;
+            }
+        }
+
+        // 2. 高负载过热检测（退出需回落至 OverheatThreshold - HysteresisMargin 以下）
+        if (load >= this.OverheatThreshold) {
+            this.CurrentMood = CompanionResourceMood.Overheated;
+            return this.CurrentMood;
+        }
+        if (this.CurrentMood == CompanionResourceMood.Overheated
+            && load > this.OverheatThreshold - this.HysteresisMargin) {
+            return this.CurrentMood;
+        }
+
+        // 3. 忙碌状态检测
+        if (load >= this.BusyThreshold) {
+            this.CurrentMood = CompanionResourceMood.Busy;
+            return this.CurrentMood;
+        }
+        if (this.CurrentMood == CompanionResourceMood.Busy
+            && load > this.BusyThreshold - this.HysteresisMargin) {
+            return this.CurrentMood;
+        }
+
+        // 4. 插电低/中电量充电态 vs 平静待机
+        if (onAcPower && batteryPercent < 95) {
+            this.CurrentMood = CompanionResourceMood.Charging;
+        } else {
+            this.CurrentMood = CompanionResourceMood.Calm;
+        }
+        return this.CurrentMood;
+    }
+}
+
+// 全局热键绑定条目。
+public class ShortcutBinding {
+    public string ActionId;
+    public string NormalizedChord;
+
+    public ShortcutBinding(string actionId, string normalizedChord) {
+        this.ActionId = actionId;
+        this.NormalizedChord = normalizedChord;
+    }
+}
+
+// 商业桌面陪伴全局热键绑定器（Normalized Hotkey Registry & Conflict Detector）：
+// - 将任意大小写/修饰键乱序组合规范化为标准序（CTRL+ALT+SHIFT+META+KEY）
+// - 严格拦截跨动作快捷键冲突，支持原子改绑与按键分发查询
+public class CompanionGlobalShortcutBinder {
+    private List<ShortcutBinding> bindings;
+
+    public CompanionGlobalShortcutBinder() {
+        this.bindings = new List<ShortcutBinding>();
+    }
+
+    public int BindingCount() {
+        return this.bindings.Count;
+    }
+
+    public static string NormalizeChord(string rawChord) {
+        if (rawChord == null || rawChord == "") { return ""; }
+        string upper = rawChord.ToUpper();
+        bool hasCtrl = false;
+        bool hasAlt = false;
+        bool hasShift = false;
+        bool hasMeta = false;
+        string mainKey = "";
+
+        int start = 0;
+        for (int i = 0; i <= upper.Length; i = i + 1) {
+            if (i == upper.Length || upper[i] == '+') {
+                string part = upper.Substring(start, i - start).Trim();
+                start = i + 1;
+                if (part == "") { continue; }
+                if (part == "CTRL" || part == "CONTROL") { hasCtrl = true; }
+                else if (part == "ALT") { hasAlt = true; }
+                else if (part == "SHIFT") { hasShift = true; }
+                else if (part == "META" || part == "WIN" || part == "CMD") { hasMeta = true; }
+                else { mainKey = part; }
+            }
+        }
+        if (mainKey == "") { return ""; }
+
+        string res = "";
+        if (hasCtrl) { res = res + "CTRL+"; }
+        if (hasAlt) { res = res + "ALT+"; }
+        if (hasShift) { res = res + "SHIFT+"; }
+        if (hasMeta) { res = res + "META+"; }
+        return res + mainKey;
+    }
+
+    public bool Bind(string actionId, string rawChord) {
+        if (actionId == null || actionId == "") { return false; }
+        string norm = NormalizeChord(rawChord);
+        if (norm == "") { return false; }
+
+        int existingActionIdx = -1;
+        for (int i = 0; i < this.bindings.Count; i = i + 1) {
+            ShortcutBinding b = this.bindings[i];
+            if (b.NormalizedChord == norm && b.ActionId != actionId) {
+                return false; // 跨动作热键冲突
+            }
+            if (b.ActionId == actionId) {
+                existingActionIdx = i;
+            }
+        }
+        if (existingActionIdx >= 0) {
+            this.bindings[existingActionIdx].NormalizedChord = norm;
+            return true;
+        }
+        this.bindings.Add(new ShortcutBinding(actionId, norm));
+        return true;
+    }
+
+    public string ResolveAction(string rawChord) {
+        string norm = NormalizeChord(rawChord);
+        if (norm == "") { return ""; }
+        for (int i = 0; i < this.bindings.Count; i = i + 1) {
+            if (this.bindings[i].NormalizedChord == norm) {
+                return this.bindings[i].ActionId;
+            }
+        }
+        return "";
+    }
+}
+
+// 桌宠主题包清单。
+public class ThemePackManifest {
+    public string ThemeId;
+    public bool IsDark;
+    public bool Unlocked;
+    public int AccentArgb;
+
+    public ThemePackManifest(string themeId, bool isDark, bool unlocked, int accentArgb) {
+        this.ThemeId = themeId != null ? themeId : "";
+        this.IsDark = isDark;
+        this.Unlocked = unlocked;
+        this.AccentArgb = accentArgb;
+    }
+}
+
+// 商业桌面陪伴皮肤/主题包管理器（Unlock-Gated Theme Pack & OS Auto-Switch）：
+// - 管理多套明暗主题清单，未解锁主题禁止装备，解锁后方可切换
+// - 支持 FollowSystemMode 根据操作系统深浅色自动解析当前生效主题
+public class CompanionThemePackManager {
+    public string EquippedLightThemeId;
+    public string EquippedDarkThemeId;
+    public bool FollowSystemMode;
+    private List<ThemePackManifest> themes;
+
+    public CompanionThemePackManager() {
+        this.EquippedLightThemeId = "";
+        this.EquippedDarkThemeId = "";
+        this.FollowSystemMode = true;
+        this.themes = new List<ThemePackManifest>();
+    }
+
+    public void RegisterTheme(string themeId, bool isDark, bool unlocked, int accentArgb) {
+        this.themes.Add(new ThemePackManifest(themeId, isDark, unlocked, accentArgb));
+        if (unlocked) {
+            if (isDark && this.EquippedDarkThemeId == "") { this.EquippedDarkThemeId = themeId; }
+            if (!isDark && this.EquippedLightThemeId == "") { this.EquippedLightThemeId = themeId; }
+        }
+    }
+
+    private ThemePackManifest FindTheme(string themeId) {
+        if (themeId == null) { return null; }
+        for (int i = 0; i < this.themes.Count; i = i + 1) {
+            if (this.themes[i].ThemeId == themeId) { return this.themes[i]; }
+        }
+        return null;
+    }
+
+    public bool UnlockTheme(string themeId) {
+        ThemePackManifest t = this.FindTheme(themeId);
+        if (t == null) { return false; }
+        t.Unlocked = true;
+        return true;
+    }
+
+    public bool EquipTheme(string themeId) {
+        ThemePackManifest t = this.FindTheme(themeId);
+        if (t == null || !t.Unlocked) { return false; }
+        if (t.IsDark) {
+            this.EquippedDarkThemeId = t.ThemeId;
+        } else {
+            this.EquippedLightThemeId = t.ThemeId;
+        }
+        return true;
+    }
+
+    public ThemePackManifest ResolveActiveTheme(bool osDarkMode) {
+        string targetId = (this.FollowSystemMode && osDarkMode)
+            ? this.EquippedDarkThemeId
+            : this.EquippedLightThemeId;
+        ThemePackManifest found = this.FindTheme(targetId);
+        if (found != null && found.Unlocked) { return found; }
+        for (int i = 0; i < this.themes.Count; i = i + 1) {
+            if (this.themes[i].Unlocked) { return this.themes[i]; }
+        }
+        return null;
+    }
+}

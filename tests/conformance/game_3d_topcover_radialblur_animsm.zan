@@ -1,0 +1,124 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DTopCoverRadialBlurAnimSmTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeNormalQuad(float halfSize, float nx, float ny, float nz) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, nx, ny, nz, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, nx, ny, nz, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, nx, ny, nz, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, nx, ny, nz, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int c) { return (c >> 16) & 255; }
+    private static int GOf(int c) { return (c >> 8) & 255; }
+    private static int BOf(int c) { return c & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        // 左侧面片法线朝上 (0,1,0) 模拟雪覆盖屋顶；右侧面片法线朝前 (0,0,1) 模拟垂直崖壁
+        int upQuadH = cv.MeshUpload(MakeNormalQuad(0.7f, 0.0f, 1.0f, 0.0f));
+        int sideQuadH = cv.MeshUpload(MakeNormalQuad(0.7f, 0.0f, 0.0f, 1.0f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        SceneNode root = new SceneNode("root");
+        Material mat = Material.Solid(0.75f, 0.15f, 0.12f); // 砖红色基础材质
+        mat.TopCoverEnabled = true;
+        mat.TopCoverThreshold = 0.5f;
+        mat.TopCoverSharpness = 0.2f;
+        mat.TopCoverAmount = 1.0f;
+        mat.TopCoverRed = 0.95f;
+        mat.TopCoverGreen = 0.98f;
+        mat.TopCoverBlue = 1.0f; // 纯白积雪
+
+        SceneNode nLeft = new SceneNode("roof");
+        nLeft.MeshKey = upQuadH;
+        nLeft.BoundsRadius = 2.0f;
+        nLeft.Material = mat;
+        nLeft.Local.Position = new Vector3(-0.85f, 0.0f, 0.0f);
+        root.AddChild(nLeft);
+
+        SceneNode nRight = new SceneNode("wall");
+        nRight.MeshKey = sideQuadH;
+        nRight.BoundsRadius = 2.0f;
+        nRight.Material = mat;
+        nRight.Local.Position = new Vector3(0.85f, 0.0f, 0.0f);
+        root.AddChild(nRight);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 1.0f; plan.AmbientGreen = 1.0f; plan.AmbientBlue = 1.0f;
+
+        // 1. GPU 世界法线朝上积雪覆层（Top-Cover）：
+        // 左侧法线朝上被纯白积雪覆盖（R/G/B 均 > 220），右侧法线水平保持砖红（R > G + 100）
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int roofPix = zan_gui_read_pixel(cv.SurfaceId(), 32, 64);
+        int wallPix = zan_gui_read_pixel(cv.SurfaceId(), 96, 64);
+
+        bool topCoverOk = ROf(roofPix) > 220 && GOf(roofPix) > 220 && BOf(roofPix) > 220
+            && ROf(wallPix) > 150 && ROf(wallPix) > GOf(wallPix) + 100 && ROf(wallPix) > BOf(wallPix) + 100;
+        Console.WriteLine("gpu-world-top-cover: " + Convert.ToString(topCoverOk ? 1 : 0));
+
+        // 2. GPU 后处理径向冲刺缩放模糊（Radial Speed/Zoom Blur）：
+        // 黑底中央画亮绿方块 [40..88)，开径向缩放模糊后，方块外缘邻域 (x=89, y=64) 应捕获向外拖尾的绿色辉光
+        cv.Clear(unchecked((int)0xFF000000));
+        cv.FillRect(40, 40, 48, 48, unchecked((int)0xFF00FF00));
+        int beforeEdge = zan_gui_read_pixel(cv.SurfaceId(), 89, 64); // 模糊前纯黑
+
+        PostProcess post = new PostProcess();
+        post.RadialBlurStrength = 0.14f;
+        post.RadialBlurCenterX = 0.5f;
+        post.RadialBlurCenterY = 0.5f;
+        cv.PostProcess3D(post);
+        int afterEdge = zan_gui_read_pixel(cv.SurfaceId(), 89, 64);
+        int centerPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        bool radialOk = GOf(beforeEdge) == 0 && GOf(afterEdge) > 80 && GOf(centerPix) > 240;
+        Console.WriteLine("gpu-post-radial-blur: " + Convert.ToString(radialOk ? 1 : 0));
+
+        // 3. 3D 动画状态机与平滑交叉混合：Idle -> Run 跨淡混合权重 -> 触发单次 Attack -> 播完自动回 Idle
+        AnimStateMachine3D sm = new AnimStateMachine3D();
+        sm.AddState("Idle", 1.0f, true, 1.0f);
+        sm.AddState("Run", 0.8f, true, 1.0f);
+        sm.AddState("Attack", 0.5f, false, 1.0f);
+        sm.AddTransition("Idle", "Run", "StartRun", 0.2f, false);
+        sm.AddTransition("*", "Attack", "DoAttack", 0.1f, false);
+        sm.AddTransition("Attack", "Idle", "", 0.15f, true);
+
+        bool trigRun = sm.Trigger("StartRun") && sm.CurrentState == "Run" && sm.IsBlending;
+        sm.Update(0.1f); // 过渡过半 -> BlendWeight == 0.5
+        float midW = sm.BlendWeight();
+        sm.Update(0.15f); // 过渡完成
+        bool runSettled = !sm.IsBlending && sm.BlendWeight() > 0.999f;
+
+        bool trigAtk = sm.Trigger("DoAttack") && sm.CurrentState == "Attack";
+        sm.Update(0.55f); // Attack 0.5s 播完自动触发 ExitOnComplete -> 正在向 Idle 交叉混合
+        bool autoReturned = sm.CurrentState == "Idle" && sm.IsBlending && sm.BlendFromState == "Attack";
+        sm.Update(0.2f);  // 回 Idle 混合完毕
+        bool finalIdle = sm.CurrentState == "Idle" && !sm.IsBlending;
+
+        bool smOk = trigRun && midW > 0.48f && midW < 0.52f && runSettled
+            && trigAtk && autoReturned && finalIdle;
+        Console.WriteLine("anim-state-machine-3d: " + Convert.ToString(smOk ? 1 : 0));
+    }
+}

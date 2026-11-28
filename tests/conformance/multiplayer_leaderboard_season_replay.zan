@@ -1,0 +1,68 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerLeaderboardSeasonReplayTest {
+    static void Main() {
+        // 1. 排位天梯：同分按先达成时间裁决、分页查询与赛季段位映射
+        NetRankedLeaderboard lb = new NetRankedLeaderboard();
+        lb.UpsertScore(10, 2500, 200L);
+        lb.UpsertScore(20, 2500, 100L); // 与 10 同分但更早达成 -> 排第 1
+        lb.UpsertScore(30, 3100, 300L); // 最高分 -> 排第 1，20 退第 2，10 退第 3
+        lb.UpsertScore(40, 1200, 50L);
+
+        List<LeaderboardRecord> top2 = lb.GetPage(0, 2);
+        List<LeaderboardRecord> page2 = lb.GetPage(2, 2);
+        bool lbOk = lb.Count() == 4
+            && lb.GetRank(30) == 1 && lb.GetRank(20) == 2 && lb.GetRank(10) == 3 && lb.GetRank(40) == 4
+            && top2.Count == 2 && top2[0].PlayerId == 30 && top2[1].PlayerId == 20
+            && page2.Count == 2 && page2[0].PlayerId == 10 && page2[1].PlayerId == 40
+            && NetRankedLeaderboard.ResolveTier(3100) == SeasonRankTier.Grandmaster
+            && NetRankedLeaderboard.ResolveTier(2500) == SeasonRankTier.Diamond
+            && NetRankedLeaderboard.ResolveTier(1200) == SeasonRankTier.Silver;
+        Console.WriteLine("net-ranked-leaderboard: " + Convert.ToString(lbOk ? 1 : 0));
+
+        // 2. 赛季软重置与高分段不活跃衰减
+        NetSeasonSoftResetCalculator calc = new NetSeasonSoftResetCalculator(
+            1500, 0.5, 800, 2600, 2400, 2200, 7, 25);
+        int resetHigh = calc.ComputeSoftReset(3100);  // 1500 + 1600*0.5 = 2300
+        int resetCap = calc.ComputeSoftReset(4500);   // 3000 -> 封顶 2600
+        int resetLow = calc.ComputeSoftReset(1100);   // 1500 - 200 = 1300
+        int noDecayLow = calc.ComputeInactivityDecay(2000, 30);    // 低于 2400 不衰减
+        int graceOk = calc.ComputeInactivityDecay(2600, 7);        // 7 天宽限期内不衰减
+        int decayMid = calc.ComputeInactivityDecay(2600, 11);      // 超 4 天 -> -100 = 2500
+        int decayFloor = calc.ComputeInactivityDecay(2600, 100);   // 不跌破底线 2200
+
+        bool seasonOk = resetHigh == 2300 && resetCap == 2600 && resetLow == 1300
+            && noDecayLow == 2000 && graceOk == 2600 && decayMid == 2500 && decayFloor == 2200;
+        Console.WriteLine("net-season-reset-decay: " + Convert.ToString(seasonOk ? 1 : 0));
+
+        // 3. 确定性帧录像回放器：非递减拦截、双端摘要一致、篡改摘要突变、区间切片回放
+        NetMatchReplayRecorder recA = new NetMatchReplayRecorder();
+        NetMatchReplayRecorder recB = new NetMatchReplayRecorder();
+        NetMatchReplayRecorder recDesync = new NetMatchReplayRecorder();
+
+        bool a1 = recA.RecordFrame(10, 1, 5, 120, -40);
+        bool a2 = recA.RecordFrame(10, 2, 1, -10, 20);
+        bool backBlocked = !recA.RecordFrame(9, 1, 0, 0, 0); // 倒退 Tick 拦截
+        bool a3 = recA.RecordFrame(15, 1, 9, 200, 0);
+
+        recB.RecordFrame(10, 1, 5, 120, -40);
+        recB.RecordFrame(10, 2, 1, -10, 20);
+        recB.RecordFrame(15, 1, 9, 200, 0);
+
+        recDesync.RecordFrame(10, 1, 5, 120, -40);
+        recDesync.RecordFrame(10, 2, 3, -10, 20); // InputBits 篡改 1->3
+        recDesync.RecordFrame(15, 1, 9, 200, 0);
+
+        List<ReplayInputFrame> slice = recA.SliceTicks(10, 12);
+        bool replayOk = a1 && a2 && backBlocked && a3
+            && recA.FrameCount() == 3
+            && recA.StreamDigest == recB.StreamDigest
+            && recA.StreamDigest != recDesync.StreamDigest
+            && slice.Count == 2 && slice[0].PlayerId == 1 && slice[1].PlayerId == 2;
+        Console.WriteLine("net-match-replay-recorder: " + Convert.ToString(replayOk ? 1 : 0));
+    }
+}
