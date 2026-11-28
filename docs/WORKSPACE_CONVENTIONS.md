@@ -43,7 +43,7 @@ hooks 管不住的部分（untracked 堆积、stash 纪律、路径限定 add）
 - `_scratch` 涨过几个 GB 就跑 `scripts/clean_scratch.ps1`：默认 dry-run 只列清单，`-Apply` 才真删；默认清 7 天前的条目（按条目内最新文件时间算，别按目录自身时间），`-KeepDays N` 可调。
 
 ## 3. 构建产物只进 build/
-使用 CMake 的 out-of-source 构建：`cmake -B build && cmake --build build`。产物留在 `build/`（已忽略），绝不手动拷到根目录或提交。并发时构建走 `scripts/build.ps1`（§8a）。
+使用 CMake 的 out-of-source 构建：`cmake -B build && cmake --build build`。产物留在 `build/`（已忽略），绝不手动拷到根目录或提交。并发时构建走 `scripts/build.ps1`（§8a）。没有 pwsh 的平台（macOS/Linux）允许直接 `cmake --build build --target <目标>` 与锚定的 `ctest -R "^case_<name>$"`，自觉保证同一时间只有一个构建/测试在跑。
 
 ## 4. 测试放对位置
 真实测试进 `tests/` 并纳入版本控制；一次性内存/泄漏探针进 `_scratch/` 或 `tests/leakprobe/`（后者已被忽略），不要混在正式测试里。
@@ -237,7 +237,8 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
   僵尸规则，宁缺毋滥。
 - 每条规则带"为什么"（踩过的坑）；没有坑出处的新增不予合入。
 - 动手前先查 skill：同类的坑别人踩过就不要再踩一遍。
-- **三份副本，同一提交走完全程**（只改工作区 = 用户项目永远收不到教训）：
+- **三份副本都要走到**（只改工作区 = 用户项目永远收不到教训）；2026-11-28 起允许
+  先只提交工作区 ①，②③ 在紧随其后的单独提交里同步，不必与功能同一提交：
   ① 工作区 `.agents/skills/`（活源，LF）→ ② `tools/ai_pack/skills/`
   （发布变体：剥离"在 zan-lang 仓库内工作"节、仓库内路径改写成通用说法）→
   ③ `C:\Users\<user>\.agents\skills\`（②的字节副本，zcode 在仓库外使用）。
@@ -325,7 +326,7 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
 3. **公开 API 强制 PascalCase（大驼峰且无下划线）**：
    `.zan` 代码中的 `public class`、`struct`、`interface`、`enum` 以及 `public` 方法名首字母必须大写，且禁止使用下划线（如 `Get_Data`、`get_data` 均会被拦截）。
 4. **增量防膨胀熔断**：
-   新增加的文件行数严格限制在 1200 行以内；单函数控制在 120 行以内。禁止制造新的巨石单体文件。
+   新增加的文件行数限制在 3000 行以内；单函数控制在 400 行以内（2026-11-28 由 1200/120 放宽：引擎与玩法包的大块迁移按功能完整成文件，硬切反而制造跨文件耦合）。仍禁止制造新的巨石单体文件。
 5. **Zan.Gui 分层棘轮（只减不增）**：
    `scripts/gui_layer_rules.py` 逐文件比对暂存版内容与 `scripts/gui_layers_baseline.json`，计数超出基线即拦截：
    Zan.Gui 包内向上依赖（按目录判层，含引用兄弟包命名空间）、Widget/Component 新增即时模式入口

@@ -47,8 +47,8 @@ UNDERSCORE_EXEMPT_DIRS = (
 # looked up on the base chain, checker_decl.c).
 COMPILER_CONTRACT_NAMES = ("__AttrRoutes", "__ZanControlCatalog", "__Conn")
 
-MAX_NEW_FILE_LINES = 1200
-MAX_FUNCTION_LINES = 120
+MAX_NEW_FILE_LINES = 3000
+MAX_FUNCTION_LINES = 400
 
 def strip_comments_and_strings(line: str) -> str:
     """Remove string literals and line comments from a single line of source code."""

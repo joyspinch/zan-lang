@@ -134,7 +134,7 @@ gate_check_blob_size() {
 #   1. No hand-written '__' double underscore identifiers in userland .zan sources.
 #   2. Strict unidirectional dependencies: stdlib/ must never depend on packages/.
 #   3. PascalCase naming for public types and methods in .zan.
-#   4. Newly added files must not exceed 1200 lines.
+#   4. Newly added files must not exceed 3000 lines (functions 400).
 #   5. Zan.Gui layering ratchet (scripts/gui_layer_rules.py, baseline only goes down).
 gate_check_code_standards() {
     _gcs_mode="$1"

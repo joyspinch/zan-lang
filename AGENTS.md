@@ -29,7 +29,7 @@ git hooks（`core.hooksPath`，`cmake -B build` 自动配置）每次 commit/mer
 
 1. **根目录只放长期受控内容**；产物、日志、探针、PR 草稿不进根目录。— §1
 2. **一次性文件全进 `_scratch/`**，收尾清理是任务的一部分；长驻大件带一行 README。— §2
-3. **只做 out-of-source 构建进 `build/`**；并发构建走 `scripts/build.ps1`，不裸跑 `cmake --build`。— §3
+3. **只做 out-of-source 构建进 `build/`**；Windows 并发构建走 `scripts/build.ps1`；没有 pwsh 的平台（macOS/Linux）可直接 `cmake --build build --target <目标>`，同一时间只跑一个。— §3
 4. **测试进 `tests/` 并提交**；一次性内存/泄漏探针不是测试，进 `_scratch/`。— §4
 5. **PR 用 `gh` / 模板**；不在仓库生成 PR 脚本、正文 md、diff 文件。— §5
 6. **`.gitignore` 是兜底不是借口**，忽略的文件也不许在源码树堆积。— §6
@@ -40,11 +40,11 @@ git hooks（`core.hooksPath`，`cmake -B build` 自动配置）每次 commit/mer
 10. **编译器有缺陷修编译器，禁止绕行写法**：探针 → 修根因 → 补 conformance 单跑 → 再用自然写法。— §10
 11. **并发会话验证过即提交**；stash 前 git status、路径限定；冲突逐文件手工合并、UU 清零，禁止一切单边回退。— §11
 12. **回退是决定不是调试手段**，默认向前修；仅限用户点名或有证据的陈旧重复。— §12
-13. **验证过的教训当天进 skills，三副本同一提交同步**：`.agents/skills/` → `tools/ai_pack/skills/` → `~/.agents/skills/`（`sync_skills.ps1 -SyncGlobal`）。— §13
+13. **验证过的教训进 skills**：先进工作区 `.agents/skills/`；发布副本 `tools/ai_pack/skills/` 与全局副本可在紧随其后的单独提交里同步（`sync_skills.ps1 -SyncGlobal`）。— §13
 14. **公共机制进 `packages/`，模板只放"这个游戏"本身**（判据：换个游戏还成立吗）。— §14
 15. **测试产物收口**：一用例 = 一条 ctest = 一个 exe，只进 `build\cases\`；日志归 `build\test-out\`；清扫用 `scripts/clean_build.ps1`。— §15
 16. **多任务并行走调度器**：`scripts/sched.ps1 register/heartbeat/finish`，同题拒重、超限排队；裸 ctest 也自动排队。— §16
-17. **代码规范机器硬拦截**：增量提交由 pre-commit 自动机检（禁手写 `__` 标识符、禁 stdlib 反向依赖 packages、公开 API 统一 PascalCase、新建文件 ≤1200 行）。— §17
+17. **代码规范机器硬拦截**：增量提交由 pre-commit 自动机检（禁手写 `__` 标识符、禁 stdlib 反向依赖 packages、公开 API 统一 PascalCase、新建文件 ≤3000 行、单函数 ≤400 行）。— §17
 
 ## Build / dev quickstart
 
