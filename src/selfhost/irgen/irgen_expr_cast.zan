@@ -214,10 +214,11 @@ partial class Irgen {
                 return new ExprVal(t, tgt);
             }
         }
-        // B-ID163③ / B-ID168 A3: a reference -> reference downcast or struct unbox
-        // whose static types cannot prove safety gets runtime type check.
-        // Failing cast throws InvalidCastException (catchable in try; outside try
-        // unhandled exception exits 70).
+        // B-ID163③ / B-ID168 A3 / B-ID186 Wave 5: a reference -> reference
+        // downcast or struct unbox whose static types cannot prove safety gets
+        // a runtime type check. Failing cast always throws InvalidCastException
+        // (catchable in local or caller try; unhandled outside try exits non-zero),
+        // matching C host construct_cast.c.
         if (tgt != null && v.ty != null && tgt.ival < 1 && IsPtrLL(MapType(v.ty)) && IsPtrLL(MapType(tgt))) {
             string tn = tgt.sval;
             Node tc = binder.FindType(tn);
@@ -227,45 +228,24 @@ partial class Irgen {
             if (refTarget && !HasStaticReferenceConversion(v.ty, tgt)) {
                 int lok = NL();
                 int lbad = NL();
-                string nullLbl = "";
                 if (!isStruct) {
                     // A null reference converts successfully. A struct unbox
                     // still requires a matching runtime object.
                     int lcheck = NL();
                     string nil = NT();
                     L("  " + nil + " = icmp eq " + MapType(v.ty) + " " + v.op + ", null");
-                    nullLbl = curLbl;
                     L("  br i1 " + nil + ", label %L" + lok + ", label %L" + lcheck);
                     Label(lcheck);
                 }
                 string ok = EmitReferenceTypeTest(v, tgt);
-                if (isStruct) {
-                    L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
-                    Label(lbad);
-                    EmitCastThrow("InvalidCastException: object is not an instance of the target struct type");
-                    Label(lok);
-                    term = false;
-                    ExprVal converted = new ExprVal(Coerce(v, MapType(tgt)), tgt);
-                    converted.ownerTemp = v.ownerTemp;
-                    return converted;
-                }
-                // A509 dual-track reference downcast: throws InvalidCastException
-                // inside try, exits 70 under --strict-runtime, and reports a soft
-                // diagnostic + falls back to null outside try.
-                string bad = NT();
-                L("  " + bad + " = xor i1 " + ok + ", true");
-                EmitRuntimeCheckIf(e, bad, "InvalidCastException: object is not an instance of the target type");
-                string tll = MapType(tgt);
-                string cv = Coerce(v, tll);
-                string res = NT();
-                L("  " + res + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
-                string fromChk = curLbl;
-                L("  br label %L" + lok);
+                L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
+                Label(lbad);
+                EmitCastThrow(isStruct
+                    ? "InvalidCastException: object is not an instance of the target struct type"
+                    : "InvalidCastException: object is not an instance of the target type");
                 Label(lok);
                 term = false;
-                string fin = NT();
-                L("  " + fin + " = phi " + tll + " [ null, %" + nullLbl + " ], [ " + res + ", %" + fromChk + " ]");
-                ExprVal converted = new ExprVal(fin, tgt);
+                ExprVal converted = new ExprVal(Coerce(v, MapType(tgt)), tgt);
                 converted.ownerTemp = v.ownerTemp;
                 return converted;
             }
