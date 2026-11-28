@@ -1061,6 +1061,35 @@ partial class Irgen {
         return null;
     }
 
+    // Concrete field type resolved on the declaring class along `recvTy`'s
+    // inheritance chain (handles multi-level generic inheritance and concrete
+    // subclasses of generic bases, e.g. GenLeaf<Box> -> GenMid<string, Box> -> GenBase<Box>).
+    Node SubstFieldTy(Node recvTy, string field) {
+        if (recvTy == null || field == "") { return null; }
+        Node cur = recvTy;
+        int depth = 0;
+        while (cur != null && depth < 64) {
+            Node cls = binder.FindType(cur.sval);
+            if (cls == null) { break; }
+            int i = 0;
+            while (i < cls.kids.Count) {
+                Node k = cls.kids[i];
+                if (k.kind == AK.FieldDecl() && k.sval == field) {
+                    Node ft = k.type;
+                    List<string> tps = TParams(cls);
+                    if (tps.Count > 0 && cur.kids.Count == tps.Count) {
+                        return SubstTP(ft, tps, cur.kids);
+                    }
+                    return ft;
+                }
+                i = i + 1;
+            }
+            cur = binder.BaseType(cur);
+            depth = depth + 1;
+        }
+        return null;
+    }
+
     // The concrete type of a member whose declared type mentions the
     // enclosing class's type parameters: `Box<double>.values` is
     // `List<double>`, not `List<T>`. The self-hosted backend erases the
@@ -1069,11 +1098,20 @@ partial class Irgen {
     // element of a `List<double>` is a double, not an opaque slot).
     Node SubstRecvTy(Node fty, Node recvTy) {
         if (fty == null || recvTy == null) { return fty; }
-        Node cls = binder.FindType(recvTy.sval);
-        if (cls == null) { return fty; }
-        List<string> tps = TParams(cls);
-        if (tps.Count == 0 || recvTy.kids.Count == 0) { return fty; }
-        return SubstTP(fty, tps, recvTy.kids);
+        Node cur = recvTy;
+        Node res = fty;
+        int depth = 0;
+        while (cur != null && depth < 64 && MentionsTypeParam(res)) {
+            Node cls = binder.FindType(cur.sval);
+            if (cls == null) { break; }
+            List<string> tps = TParams(cls);
+            if (tps.Count > 0 && cur.kids.Count == tps.Count) {
+                res = SubstTP(res, tps, cur.kids);
+            }
+            cur = binder.BaseType(cur);
+            depth = depth + 1;
+        }
+        return res;
     }
 
 }

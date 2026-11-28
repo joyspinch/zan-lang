@@ -56,9 +56,77 @@ class NatStrGetImpl : INatDummy, INatGet<string> {
     public void Ping() { }
     public string Get(int x) { return this.Prefix + "_" + x.ToString(); }
 }
+struct NatArcPair {
+    public NaturalBox A;
+    public string S;
+    public NatArcPair(NaturalBox a, string s) { this.A = a; this.S = s; }
+}
+struct NatGenPair<T> {
+    public T First;
+    public T Second;
+    public NatGenPair(T a, T b) { this.First = a; this.Second = b; }
+}
+struct NatOuterHolder {
+    public NatGenPair<NaturalBox> P;
+    public int Tag;
+}
+class NatGenBase<T> {
+    public T Seed;
+    public NaturalBox Fixed;
+    public NatGenBase(T s) { this.Seed = s; this.Fixed = new NaturalBox(100); }
+    public virtual T Pick(T alt, bool useAlt) { return useAlt ? alt : this.Seed; }
+}
+class NatGenSub<T> : NatGenBase<T> {
+    public T Extra;
+    public NatGenSub(T s, T e) : base(s) { this.Extra = e; }
+    public NatGenSub(T s) : this(s, s) { }
+    public NatGenSub(T s, bool boom) : base(s) {
+        this.Extra = s;
+        if (boom) { throw new Exception("nat_sub_boom"); }
+    }
+    public override T Pick(T alt, bool useAlt) { return useAlt ? this.Seed : alt; }
+}
+class NatConcreteSub : NatGenBase<NaturalBox> {
+    public NaturalBox Own;
+    public NatConcreteSub(NaturalBox s, NaturalBox o) : base(s) { this.Own = o; }
+    public NatConcreteSub(NaturalBox s, bool boom) : base(s) {
+        if (boom) { throw new Exception("nat_conc_boom"); }
+        this.Own = s;
+    }
+    public override NaturalBox Pick(NaturalBox alt, bool useAlt) { return useAlt ? this.Seed : this.Own; }
+}
+class NatConcretePass : NatGenBase<NaturalBox> {
+    public NatConcretePass(NaturalBox s) : base(s) { }
+}
+class NatConcreteStructSub : NatGenBase<NatArcPair> {
+    public NatConcreteStructSub(NatArcPair s) : base(s) { }
+}
+class NatGenMid<A, B> : NatGenBase<B> {
+    public A First;
+    public NatGenMid(A a, B b) : base(b) { this.First = a; }
+}
+class NatGenLeaf<U> : NatGenMid<string, U> {
+    public U Leaf;
+    public NatGenLeaf(string k, U u, U l) : base(k, u) { this.Leaf = l; }
+}
+class NatSwapMid<A, B> : NatGenMid<B, A> {
+    public A OwnA;
+    public NatSwapMid(A a, B b) : base(b, a) { this.OwnA = a; }
+}
+class NatGenDefInit<T> {
+    public T Item;
+    public T[] Buf;
+    public NatGenDefInit() { this.Buf = new T[2]; }
+}
+class NatGenArrBase<T> {
+    public T[] Items = new T[2];
+}
+class NatConcreteArrSub : NatGenArrBase<NaturalBox> {
+}
 class Program {
     static NaturalOriginal original;
     static NaturalReplacement replacement;
+    static NatGenPair<NaturalBox> sGenPair;
     static NaturalBox MakeBox(int v) { return new NaturalBox(v); }
     static object MakeObjBox(int v) { return new NaturalBox(v); }
     static NaturalRec MakeRec(int v) { return new NaturalRec("a" + v.ToString(), "b" + v.ToString()); }
@@ -333,6 +401,95 @@ class Program {
             catch (NaturalReplacement nested) { await Task.Yield(); throw; }
         }
     }
+    static NatArcPair MakeArcPair(int v) { return new NatArcPair(MakeBox(v), "p_" + v.ToString()); }
+    static int GenericInheritanceAndStructOwnership() {
+        int acc = 0;
+        NatGenBase<NaturalBox> gb = new NatGenSub<NaturalBox>(MakeBox(30));
+        NaturalBox c1 = MakeBox(3);
+        acc = acc + gb.Pick(c1, true).Val; // 30
+        NatGenSub<NaturalBox> gs2 = new NatGenSub<NaturalBox>(MakeBox(40), MakeBox(50));
+        acc = acc + gs2.Seed.Val + gs2.Extra.Val; // 90
+        try {
+            NatGenSub<NaturalBox> bad = new NatGenSub<NaturalBox>(MakeBox(60), true);
+            acc = acc + bad.Seed.Val;
+        } catch (Exception e) { acc = acc + e.Message.Length; } // 12
+        NatGenSub<NatArcPair> gsp = new NatGenSub<NatArcPair>(MakeArcPair(8), MakeArcPair(9));
+        acc = acc + gsp.Seed.A.Val + gsp.Extra.A.Val; // 17
+        NatGenBase<NaturalBox> cb = new NatConcreteSub(MakeBox(70), MakeBox(80));
+        acc = acc + cb.Pick(c1, true).Val + cb.Pick(c1, false).Val; // 150
+        try {
+            NatConcreteSub bad2 = new NatConcreteSub(MakeBox(71), true);
+            acc = acc + bad2.Seed.Val;
+        } catch (Exception e) { acc = acc + e.Message.Length; } // 13
+        NatConcretePass cp = new NatConcretePass(MakeBox(11));
+        NatGenBase<NaturalBox> cpb = cp;
+        acc = acc + cp.Pick(c1, false).Val + cpb.Pick(MakeBox(12), true).Val; // 23
+        cp.Seed = MakeBox(15);
+        acc = acc + cp.Seed.Val; // 15
+        NatConcreteStructSub cs = new NatConcreteStructSub(MakeArcPair(20));
+        acc = acc + cs.Seed.A.Val + cs.Seed.S.Length; // 24
+        NatGenLeaf<NaturalBox> gl = new NatGenLeaf<NaturalBox>("k_" + MakeBox(1).Name, MakeBox(21), MakeBox(22));
+        acc = acc + gl.First.Length + gl.Seed.Val + gl.Leaf.Val; // 6+21+22 = 49
+        NatSwapMid<NaturalBox, string> sw = new NatSwapMid<NaturalBox, string>(MakeBox(31), "s_" + MakeBox(2).Name);
+        acc = acc + sw.OwnA.Val + sw.Seed.Val + sw.First.Length; // 31+31+6 = 68
+        NatGenPair<NaturalBox> p1 = new NatGenPair<NaturalBox>(MakeBox(10), MakeBox(20));
+        NatGenPair<NaturalBox> p2 = p1;
+        p2 = new NatGenPair<NaturalBox>(MakeBox(30), MakeBox(40));
+        acc = acc + p1.First.Val + p2.Second.Val; // 50
+        NatGenPair<NaturalBox> u;
+        u.First = MakeBox(10);
+        NatGenPair<NaturalBox> uCopy = u;
+        uCopy.First = MakeBox(99);
+        acc = acc + u.First.Val + uCopy.First.Val; // 109
+        NatGenPair<NaturalBox>[] a1 = new NatGenPair<NaturalBox>[2];
+        a1[0].First = MakeBox(5);
+        a1[1] = new NatGenPair<NaturalBox>(MakeBox(6), MakeBox(7));
+        acc = acc + a1[0].First.Val + a1[1].First.Val + a1[1].Second.Val; // 18
+        NatGenPair<NaturalBox>[,] a2 = new NatGenPair<NaturalBox>[2, 2];
+        a2[0, 1] = new NatGenPair<NaturalBox>(MakeBox(8), MakeBox(9));
+        acc = acc + a2[0, 1].First.Val + a2[0, 1].Second.Val; // 17
+        sGenPair.First = MakeBox(13);
+        sGenPair.Second = MakeBox(14);
+        acc = acc + sGenPair.First.Val + sGenPair.Second.Val; // 27
+        sGenPair = new NatGenPair<NaturalBox>(MakeBox(1), MakeBox(2));
+        NatGenPair<NatArcPair> gp1 = new NatGenPair<NatArcPair>(MakeArcPair(21), MakeArcPair(22));
+        NatGenPair<NatArcPair> gp2 = gp1;
+        gp2.First = MakeArcPair(88);
+        acc = acc + gp1.First.A.Val + gp2.First.A.Val; // 109
+        NatGenPair<NatGenPair<NaturalBox>> ng1 = new NatGenPair<NatGenPair<NaturalBox>>(
+            new NatGenPair<NaturalBox>(MakeBox(3), MakeBox(4)),
+            new NatGenPair<NaturalBox>(MakeBox(5), MakeBox(6)));
+        NatGenPair<NatGenPair<NaturalBox>> ng2 = ng1;
+        ng2.First = new NatGenPair<NaturalBox>(MakeBox(70), MakeBox(80));
+        acc = acc + ng1.First.First.Val + ng2.First.Second.Val; // 83
+        NatGenPair<string> ps1 = new NatGenPair<string>("a_" + MakeBox(1).Name, "b_" + MakeBox(2).Name);
+        NatGenPair<string> ps2 = ps1;
+        ps2 = new NatGenPair<string>("c_" + MakeBox(3).Name, "d_" + MakeBox(4).Name);
+        acc = acc + ps1.First.Length + ps2.Second.Length; // 6+6 = 12
+        NatGenPair<NaturalBox[]> pa1 = new NatGenPair<NaturalBox[]>(new NaturalBox[] { MakeBox(11) }, new NaturalBox[] { MakeBox(12) });
+        NatGenPair<NaturalBox[]> pa2 = pa1;
+        pa2 = new NatGenPair<NaturalBox[]>(new NaturalBox[] { MakeBox(13) }, new NaturalBox[] { MakeBox(14) });
+        acc = acc + pa1.First[0].Val + pa2.Second[0].Val; // 25
+        List<NatGenPair<NaturalBox>> lp = new List<NatGenPair<NaturalBox>>();
+        lp.Add(new NatGenPair<NaturalBox>(MakeBox(15), MakeBox(16)));
+        lp[0] = new NatGenPair<NaturalBox>(MakeBox(17), MakeBox(18));
+        acc = acc + lp[0].First.Val + lp[0].Second.Val; // 35
+        NatOuterHolder[] oh = new NatOuterHolder[2];
+        oh[0].P.First = MakeBox(19);
+        oh[0].Tag = 2;
+        NatOuterHolder ohCopy = oh[0];
+        ohCopy.P.First = MakeBox(20);
+        acc = acc + oh[0].P.First.Val + ohCopy.P.First.Val + oh[0].Tag; // 41
+        NatGenDefInit<NaturalBox> di = new NatGenDefInit<NaturalBox> { Item = MakeBox(25) };
+        di.Buf[0] = MakeBox(26);
+        di.Buf[1] = MakeBox(27);
+        acc = acc + di.Item.Val + di.Buf[0].Val + di.Buf[1].Val; // 78
+        NatConcreteArrSub cas = new NatConcreteArrSub();
+        cas.Items[0] = MakeBox(30);
+        cas.Items[1] = MakeBox(31);
+        acc = acc + cas.Items[0].Val + cas.Items[1].Val; // 61
+        return acc; // 1156
+    }
     static void Main() {
         // Natural external owners are reused, without extra keep-alive retains.
         // Every named catch binding must release only its own reference.
@@ -354,5 +511,6 @@ class Program {
         Console.WriteLine(await AsyncWithDeconSwitch());
         Console.WriteLine(await AsyncCtorAndCollectionInit());
         Console.WriteLine(await AsyncDeconThrowLock());
+        Console.WriteLine(GenericInheritanceAndStructOwnership());
     }
 }

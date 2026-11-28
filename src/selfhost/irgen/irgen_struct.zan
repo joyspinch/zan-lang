@@ -46,13 +46,50 @@ partial class Irgen {
         return d != null && d.kind == AK.StructDecl() && d.layoutExplicit;
     }
 
-    // Lazily emit `@<cn>_clone(i8* %src) -> i8*` for reflection value-copy semantics.
-    string EnsureStructCloneHelper(Node decl) {
+    // Build the `__SPI_<tags>` suffix for a concrete generic struct instantiation,
+    // or `""` when the type is not a fully concrete generic instantiation.
+    string ConcreteStructSpecSuffix(Node decl, Node instTy) {
+        if (decl == null || instTy == null) { return ""; }
+        List<string> tps = TParams(decl);
+        if (tps.Count == 0 || instTy.kids.Count != tps.Count) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            if (instTy.kids[i] == null || MentionsTypeParam(instTy.kids[i])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // True when a concrete generic struct instantiation needs specialized
+    // allocation/copy helpers (specialized dtor or nested struct fields).
+    bool StructInstNeedsSpec(Node decl, Node instTy) {
+        if (decl == null || decl.kind != AK.StructDecl() || decl.layoutExplicit) { return false; }
+        if (ConcreteStructSpecSuffix(decl, instTy) == "") { return false; }
+        if (SpecDtorSym(decl, instTy) != decl.sval + "_dtor") { return true; }
+        List<Node> effTypes = new List<Node>();
+        CollectFieldEffTypes(decl, instTy, effTypes);
+        int i = 0;
+        while (i < effTypes.Count) {
+            if (IsStructTy(effTypes[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Lazily emit `@<cn>[__SPI_<tags>]_clone(i8* %src) -> i8*` for reflection value-copy semantics.
+    string EnsureStructCloneHelper(Node decl, Node instTy = null) {
         if (decl == null || decl.kind != AK.StructDecl() || decl.layoutExplicit) { return "null"; }
         string cn = decl.sval;
-        string sym = "@" + cn + "_clone";
-        if (structCloneEmitted.ContainsKey(cn)) { return sym; }
-        structCloneEmitted[cn] = true;
+        Node effInst = StructInstNeedsSpec(decl, instTy) ? instTy : null;
+        string suffix = effInst != null ? ConcreteStructSpecSuffix(decl, effInst) : "";
+        string key = cn + suffix;
+        string sym = "@" + key + "_clone";
+        if (structCloneEmitted.ContainsKey(key)) { return sym; }
+        structCloneEmitted[key] = true;
         StringBuilder saved = body;
         int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
         body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
@@ -68,9 +105,9 @@ partial class Irgen {
         Label(lcopy);
         string srcTyped = NT();
         L("  " + srcTyped + " = bitcast i8* %src to %" + cn + "*");
-        string dst = AllocStructObj(cn);
-        InitNestedFields(dst, decl);
-        CopyStructInto(dst, srcTyped, decl);
+        string dst = AllocStructObj(cn, effInst);
+        InitNestedFields(dst, decl, effInst);
+        CopyStructInto(dst, srcTyped, decl, effInst);
         string res = NT();
         L("  " + res + " = bitcast %" + cn + "* " + dst + " to i8*");
         L("  ret i8* " + res);
@@ -91,13 +128,16 @@ partial class Irgen {
     }
 
     // allocate a zeroed struct instance; returns the object pointer
-    string AllocStructObj(string cn) {
+    string AllocStructObj(string cn, Node instTy = null) {
+        string dtorSym = cn + "_dtor";
+        Node decl = binder.FindType(cn);
+        if (decl != null && instTy != null) { dtorSym = SpecDtorSym(decl, instTy); }
         string szp = NT();
         L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
         string szi = NT();
         L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
         string raw = NT();
-        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + dtorSym + " to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
         return obj;
@@ -174,23 +214,19 @@ partial class Irgen {
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(decl, names, types);
+        Node rootTy = instTy != null ? instTy : MkType(decl.sval);
+        List<Node> effTypes = new List<Node>();
+        CollectFieldEffTypes(decl, rootTy, effTypes);
         int fb = FieldBase(decl);
         int i = 0;
         while (i < types.Count) {
             Node rawTy = types[i];
-            Node fty = rawTy;
-            bool erasedSlot = false;
-            if (instTy != null && instTy.kids.Count > 0 && rawTy != null && MentionsTypeParam(rawTy)) {
-                fty = SubstRecvTy(rawTy, instTy);
-                string savedScope = typeScopeCls;
-                typeScopeCls = decl.sval;
-                string physLt = MapType(rawTy);
-                typeScopeCls = savedScope;
-                if (physLt == "i64") { erasedSlot = true; }
-            }
+            Node fty = (i < effTypes.Count && effTypes[i] != null) ? effTypes[i] : rawTy;
+            string physLt = decl.kind == AK.StructDecl() ? MapFieldTypeDecl(rawTy, decl.sval) : MapTypeDecl(rawTy, decl.sval);
+            bool erasedSlot = (physLt == "i64") && rawTy != null && IsErasedTypeDecl(rawTy, decl.sval);
             if (IsStructTy(fty)) {
                 string cn = fty.sval;
-                string sub = AllocStructObj(cn);
+                string sub = AllocStructObj(cn, fty);
                 string lt = MapType(fty);
                 string p = NT();
                 L("  " + p + " = getelementptr %" + decl.sval + ", %" + decl.sval + "* " + obj + ", i32 0, i32 " + (fb + i));
@@ -206,6 +242,68 @@ partial class Irgen {
             }
             i = i + 1;
         }
+    }
+
+    // Specialized `@<cn>__SPI_<tags>_newobj()` for concrete generic struct
+    // instantiations whose dtor or nested struct fields depend on type args.
+    string SpecStructNewObjSym(Node decl, Node instTy) {
+        if (decl == null) { return ""; }
+        string cn = decl.sval;
+        if (!StructInstNeedsSpec(decl, instTy)) { return "@" + cn + "_newobj"; }
+        string suffix = ConcreteStructSpecSuffix(decl, instTy);
+        string sym = "@" + cn + suffix + "_newobj";
+        string key = "newobj:" + sym;
+        if (structCloneEmitted.ContainsKey(key)) { return sym; }
+        structCloneEmitted[key] = true;
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        L("define internal i8* " + sym + "() {");
+        L("entry:");
+        string obj = AllocStructObj(cn, instTy);
+        InitNestedFields(obj, decl, instTy);
+        string raw = NT();
+        L("  " + raw + " = bitcast %" + cn + "* " + obj + " to i8*");
+        L("  ret i8* " + raw);
+        L("}");
+        string text = body.ToString();
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        deferred.Append(text);
+        return sym;
+    }
+
+    // Specialized `@<cn>__SPI_<tags>_initarr(i64* %arr, i64 %n)` for arrays
+    // of concrete generic structs.
+    string SpecStructInitArrSym(Node decl, Node instTy) {
+        if (decl == null) { return ""; }
+        string cn = decl.sval;
+        string newObjSym = SpecStructNewObjSym(decl, instTy);
+        if (newObjSym == "@" + cn + "_newobj") { return "@" + cn + "_initarr"; }
+        string suffix = ConcreteStructSpecSuffix(decl, instTy);
+        string sym = "@" + cn + suffix + "_initarr";
+        string key = "initarr:" + sym;
+        if (structCloneEmitted.ContainsKey(key)) { return sym; }
+        structCloneEmitted[key] = true;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("define internal void " + sym + "(i64* %arr, i64 %n) {\n");
+        sb.Append("entry:\n");
+        sb.Append("  br label %loop\n");
+        sb.Append("loop:\n");
+        sb.Append("  %i = phi i64 [ 0, %entry ], [ %i2, %body ]\n");
+        sb.Append("  %c = icmp ult i64 %i, %n\n");
+        sb.Append("  br i1 %c, label %body, label %done\n");
+        sb.Append("body:\n");
+        sb.Append("  %slot = getelementptr i64, i64* %arr, i64 %i\n");
+        sb.Append("  %obj = call i8* " + newObjSym + "()\n");
+        sb.Append("  %pi = ptrtoint i8* %obj to i64\n");
+        sb.Append("  store i64 %pi, i64* %slot\n");
+        sb.Append("  %i2 = add i64 %i, 1\n");
+        sb.Append("  br label %loop\n");
+        sb.Append("done:\n");
+        sb.Append("  ret void\n");
+        sb.Append("}\n");
+        deferred.Append(sb.ToString());
+        return sym;
     }
 
     // A struct instance constructor: a zeroed instance whose struct-typed
@@ -233,8 +331,9 @@ partial class Irgen {
             Node fty = types[i];
             if (IsStructTy(fty)) {
                 string slt = MapType(fty);
+                string newSym = SpecStructNewObjSym(binder.FindType(fty.sval), fty);
                 H("  %nf" + seq + " = getelementptr %" + cn + ", %" + cn + "* %obj, i32 0, i32 " + (fb + i));
-                H("  %ns" + seq + " = call i8* @" + fty.sval + "_newobj()");
+                H("  %ns" + seq + " = call i8* " + newSym + "()");
                 H("  %nb" + seq + " = bitcast i8* %ns" + seq + " to " + slt);
                 H("  store " + slt + " %nb" + seq + ", " + slt + "* %nf" + seq);
                 seq = seq + 1;
@@ -274,7 +373,7 @@ partial class Irgen {
     // Copy the contents of the struct instance `src` into the instance `dst`.
     // Class fields are shared with the source (the copy retains them), struct
     // fields are copied recursively.
-    void CopyStructInto(string dst, string src, Node decl) {
+    void CopyStructInto(string dst, string src, Node decl, Node instTy = null) {
         if (decl == null) { return; }
         if (decl.kind == AK.StructDecl() && decl.layoutExplicit) {
             string cn0 = decl.sval;
@@ -289,11 +388,17 @@ partial class Irgen {
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(decl, names, types);
+        Node rootTy = instTy != null ? instTy : MkType(decl.sval);
+        List<Node> effTypes = new List<Node>();
+        CollectFieldEffTypes(decl, rootTy, effTypes);
         string cn = decl.sval;
         int fb = FieldBase(decl);
         int i = 0;
         while (i < types.Count) {
-            Node fty = types[i];
+            Node rawTy = types[i];
+            Node fty = (i < effTypes.Count && effTypes[i] != null) ? effTypes[i] : rawTy;
+            string physLt = decl.kind == AK.StructDecl() ? MapFieldTypeDecl(rawTy, cn) : MapTypeDecl(rawTy, cn);
+            bool erasedSlot = (physLt == "i64") && rawTy != null && IsErasedTypeDecl(rawTy, cn);
             int idx = fb + i;
             string sp = NT();
             L("  " + sp + " = getelementptr %" + cn + ", %" + cn + "* " + src + ", i32 0, i32 " + idx);
@@ -302,9 +407,18 @@ partial class Irgen {
             if (IsStructTy(fty)) {
                 string slt = MapType(fty);
                 string sv = NT();
-                L("  " + sv + " = load " + slt + ", " + slt + "* " + sp);
                 string dv = NT();
-                L("  " + dv + " = load " + slt + ", " + slt + "* " + dp);
+                if (erasedSlot) {
+                    string sraw = NT();
+                    L("  " + sraw + " = load i64, i64* " + sp);
+                    L("  " + sv + " = inttoptr i64 " + sraw + " to " + slt);
+                    string draw = NT();
+                    L("  " + draw + " = load i64, i64* " + dp);
+                    L("  " + dv + " = inttoptr i64 " + draw + " to " + slt);
+                } else {
+                    L("  " + sv + " = load " + slt + ", " + slt + "* " + sp);
+                    L("  " + dv + " = load " + slt + ", " + slt + "* " + dp);
+                }
                 // A null source field has nothing to copy: read the (zeroed)
                 // destination instead. That keeps the copy branch-free -- a
                 // branch here would have to duplicate the nested copy.
@@ -313,15 +427,20 @@ partial class Irgen {
                 string safe = NT();
                 L("  " + safe + " = select i1 " + isnull + ", " + slt + " " + dv + ", " + slt + " " + sv);
                 Node ndecl = binder.FindType(fty.sval);
-                CopyStructInto(dv, safe, ndecl);
+                CopyStructInto(dv, safe, ndecl, fty);
             } else {
-                string lt = decl.kind == AK.StructDecl() ? MapFieldType(fty) : MapType(fty);
                 string sv = NT();
-                L("  " + sv + " = load " + lt + ", " + lt + "* " + sp);
-                L("  store " + lt + " " + sv + ", " + lt + "* " + dp);
+                L("  " + sv + " = load " + physLt + ", " + physLt + "* " + sp);
+                L("  store " + physLt + " " + sv + ", " + physLt + "* " + dp);
                 // a class field is shared with the source: the copy holds a
                 // reference of its own
-                if (fty != null && (ArcManaged(fty) || fty.ival >= 1) && !WeakTy(fty)) { EmitArcRetain(sv, fty); }
+                if (fty != null && !IsErasedType(fty) && (ArcManaged(fty) || fty.ival >= 1) && !WeakTy(fty)) {
+                    string rval = sv;
+                    if (erasedSlot) {
+                        rval = FromSlot(sv, fty).op;
+                    }
+                    EmitArcRetain(rval, fty);
+                }
             }
             i = i + 1;
         }
@@ -333,9 +452,9 @@ partial class Irgen {
         string cn = v.ty.sval;
         Node decl = binder.FindType(cn);
         if (decl == null) { return v; }
-        string dst = AllocStructObj(cn);
-        InitNestedFields(dst, decl);
-        if (v.op != "null") { CopyStructInto(dst, v.op, decl); }
+        string dst = AllocStructObj(cn, v.ty);
+        InitNestedFields(dst, decl, v.ty);
+        if (v.op != "null") { CopyStructInto(dst, v.op, decl, v.ty); }
         return new ExprVal(dst, v.ty);
     }
 
